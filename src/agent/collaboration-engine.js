@@ -15,6 +15,7 @@ class CollaborationEngine {
   constructor(options = {}) {
     this.store = options.store || getSharedStore();
     this.mode = options.mode || 'shared_store';
+    this.readFile = typeof options.readFile === 'function' ? options.readFile : null;
     this.config = {
       broadcastThreshold: 5, // 每 N 条 findings 广播一次
       maxContextSize: 8000,  // 最大上下文大小 (bytes)
@@ -26,6 +27,7 @@ class CollaborationEngine {
     
     this.activeCollaborations = new Map();
     this.eventSubscriptions = new Map();
+    this.sessionUnsubscribers = new Map();
     this.tokenTracking = new Map();
     
     console.log(`[CollaborationEngine] Initialized with mode: ${this.mode}`);
@@ -71,14 +73,27 @@ class CollaborationEngine {
    */
   setupSharedStoreCollaboration(sessionId, jobIds) {
     console.log(`[SharedStore] Setting up collaboration for ${jobIds.length} jobs`);
+    const seenCounts = new Map(jobIds.map((jobId) => [
+      jobId,
+      Array.isArray(this.store.get(`jobs.${jobId}`)?.findings)
+        ? this.store.get(`jobs.${jobId}`).findings.length
+        : 0,
+    ]));
     
     jobIds.forEach(sourceJobId => {
       // 监听每个 job 的 findings 更新
-      this.store.on(`jobs.${sourceJobId}.findings`, (findings) => {
+      const unsubscribe = this.store.on(`jobs.${sourceJobId}.findings`, (findings) => {
         if (!Array.isArray(findings) || findings.length === 0) return;
-        
-        // 只广播最新的关键信息
-        const latestFindings = findings.slice(-this.config.broadcastThreshold);
+
+        // SharedStore notifies with the complete findings array. Broadcast only
+        // newly appended local findings; rebroadcasting the external copies would
+        // bounce them between peers recursively until the stack overflowed.
+        const previousCount = Math.min(seenCounts.get(sourceJobId) || 0, findings.length);
+        seenCounts.set(sourceJobId, findings.length);
+        const latestFindings = findings
+          .slice(previousCount)
+          .filter((finding) => !finding?.isExternal)
+          .slice(-this.config.broadcastThreshold);
         
         if (!latestFindings.length) return;
         
@@ -102,6 +117,7 @@ class CollaborationEngine {
         // 跟踪 token 使用
         this.trackTokenUsage(sessionId, latestFindings.length * 50);
       });
+      this._trackSessionSubscription(sessionId, unsubscribe);
     });
   }
   
@@ -110,33 +126,20 @@ class CollaborationEngine {
    */
   setupEventBusCollaboration(sessionId, jobIds) {
     console.log(`[EventBus] Setting up collaboration for ${jobIds.length} jobs`);
-    
-    // 为每个 job 创建独立的频道
-    jobIds.forEach(jobId => {
-      const channel = `collab:${sessionId}:${jobId}`;
-      
-      // 订阅该频道的所有事件
-      this.eventSubscriptions.set(channel, (event) => {
-        // 广播给其他 jobs
-        jobIds.forEach(otherJobId => {
-          if (otherJobId !== jobId) {
-            const otherChannel = `collab:${sessionId}:${otherJobId}`;
-            
-            this.store.publish(otherChannel, {
-              type: event.type,
-              payload: event.payload,
-              sourceJobId: jobId,
-              timestamp: Date.now()
-            });
-          }
+
+    // Publish directly to every peer inbox. The old implementation only put
+    // callbacks in a Map and never subscribed them to SharedStore, so no event
+    // could ever leave its source job.
+    this.activeCollaborations.get(sessionId).publish = (jobId, eventType, payload) => {
+      jobIds.forEach(otherJobId => {
+        if (otherJobId === jobId) return;
+        this.store.publish(`collab:${sessionId}:${otherJobId}`, {
+          type: eventType,
+          payload,
+          sourceJobId: jobId,
+          timestamp: Date.now(),
         });
       });
-    });
-    
-    // 提供发布 API
-    this.activeCollaborations.get(sessionId).publish = (jobId, eventType, payload) => {
-      const channel = `collab:${sessionId}:${jobId}`;
-      this.store.publish(channel, { type: eventType, payload, timestamp: Date.now() });
     };
   }
   
@@ -154,7 +157,7 @@ class CollaborationEngine {
     console.log(`[Lead-Follower] Lead: ${leadJobId}, Followers: ${followerJobIds.length}`);
     
     // 监听 lead job 的决策和状态变化
-    this.store.on(`jobs.${leadJobId}.status`, (status) => {
+    const unsubscribe = this.store.on(`jobs.${leadJobId}.status`, (status) => {
       // 当 lead job 完成某个关键阶段时，通知 followers
       if (status === 'phase_complete' || status === 'completed') {
         const decision = this.store.get(`jobs.${leadJobId}.decision`);
@@ -179,6 +182,7 @@ class CollaborationEngine {
         }
       }
     });
+    this._trackSessionSubscription(sessionId, unsubscribe);
     
     // Follower 可以向 Lead 请求指导
     this.registerFollowerRequestHandler(sessionId, leadJobId, followerJobIds);
@@ -187,7 +191,7 @@ class CollaborationEngine {
   registerFollowerRequestHandler(sessionId, leadJobId, followerJobIds) {
     // 监听 follower 的请求
     followerJobIds.forEach(followerId => {
-      this.store.on(`jobs.${followerId}.request_guidance`, (request) => {
+      const unsubscribe = this.store.on(`jobs.${followerId}.request_guidance`, (request) => {
         // Lead job 接收请求并提供指导
         this.store.appendFinding(leadJobId, {
           type: 'guidance_request',
@@ -196,6 +200,7 @@ class CollaborationEngine {
           timestamp: Date.now()
         });
       });
+      this._trackSessionSubscription(sessionId, unsubscribe);
     });
   }
   
@@ -225,7 +230,12 @@ class CollaborationEngine {
     enhanced.relatedFindings = relatedFindings.slice(-10); // 最新 10 条
     
     // 添加共享知识
-    const sharedKnowledge = this.store.get(`collab_sessions.*.knowledge`, {});
+    const sharedKnowledge = {};
+    for (const [activeSessionId, session] of this.activeCollaborations.entries()) {
+      if (session?.knowledge && Object.keys(session.knowledge).length) {
+        sharedKnowledge[activeSessionId] = session.knowledge;
+      }
+    }
     if (Object.keys(sharedKnowledge).length > 0) {
       enhanced.sharedKnowledge = sharedKnowledge;
     }
@@ -236,6 +246,24 @@ class CollaborationEngine {
       console.warn(`[CollaborationEngine] Context too large (${totalSize} bytes), truncating`);
       enhanced._truncated = true;
       enhanced._originalSize = totalSize;
+      if (Array.isArray(enhanced.fileSnippets)) {
+        enhanced.fileSnippets = enhanced.fileSnippets.map((snippet) => ({
+          ...snippet,
+          content: String(snippet.content || '').slice(0, 800),
+        }));
+      }
+      if (Array.isArray(enhanced.relatedFindings)) {
+        enhanced.relatedFindings = enhanced.relatedFindings.slice(-5).map((finding) => ({
+          sourceJobId: finding.sourceJobId,
+          type: finding.type,
+          channel: finding.channel,
+          content: String(finding.content || finding.data || '').slice(0, 300),
+          timestamp: finding.timestamp,
+        }));
+      }
+      if (JSON.stringify(enhanced).length > this.config.maxContextSize) {
+        delete enhanced.sharedKnowledge;
+      }
     }
     
     return enhanced;
@@ -282,9 +310,8 @@ class CollaborationEngine {
   }
   
   async readFileSync(path) {
-    // 在实际应用中，这里应该调用 Tauri/Backend API
-    // 为了演示，返回 mock 数据
-    return null;
+    if (!this.readFile) throw new Error('CollaborationEngine requires an injected workspace reader');
+    return this.readFile(path);
   }
   
   /**
@@ -297,13 +324,10 @@ class CollaborationEngine {
     const relatedJobs = this.store.query('jobs.*');
     
     for (const { key, value } of relatedJobs) {
-      if (key.includes('.findings.') && key !== `jobs.${currentJobId}.findings`) {
-        const findings = Array.isArray(value) ? value : [];
-        allFindings.push(...findings.map(f => ({
-          ...f,
-          sourceJobId: key.split('.')[1]
-        })));
-      }
+      const match = /^jobs\.([^.]+)$/.exec(key);
+      if (!match || match[1] === String(currentJobId)) continue;
+      const findings = Array.isArray(value?.findings) ? value.findings : [];
+      allFindings.push(...findings.map(f => ({ ...f, sourceJobId: match[1] })));
     }
     
     return allFindings.sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0));
@@ -455,6 +479,10 @@ class CollaborationEngine {
     };
     
     this.store.set(`collab_sessions.${sessionId}`, session);
+    for (const unsubscribe of this.sessionUnsubscribers.get(sessionId) || []) {
+      try { unsubscribe(); } catch {}
+    }
+    this.sessionUnsubscribers.delete(sessionId);
     this.activeCollaborations.delete(sessionId);
     
     return true;
@@ -464,14 +492,15 @@ class CollaborationEngine {
    * 获取所有活跃会话
    */
   getActiveSessions() {
-    return Array.from(this.activeCollaborations.values())
-      .filter(s => s.status === 'active')
-      .map(s => ({
-        sessionId: Object.keys(this.activeCollaborations).find(key => 
-          this.activeCollaborations.get(key) === s
-        ),
-        ...s
-      }));
+    return Array.from(this.activeCollaborations.entries())
+      .filter(([, session]) => session.status === 'active')
+      .map(([sessionId, session]) => ({ sessionId, ...session }));
+  }
+
+  _trackSessionSubscription(sessionId, unsubscribe) {
+    if (typeof unsubscribe !== 'function') return;
+    if (!this.sessionUnsubscribers.has(sessionId)) this.sessionUnsubscribers.set(sessionId, []);
+    this.sessionUnsubscribers.get(sessionId).push(unsubscribe);
   }
   
   /**

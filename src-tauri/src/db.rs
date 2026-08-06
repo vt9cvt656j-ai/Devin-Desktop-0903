@@ -472,10 +472,11 @@ async fn sql_query(
             .map_err(ct)?
             .map_err(|e| format!("连接失败: {e}"))?;
             let out = if is_read {
-                let rows = tokio::time::timeout(QUERY_TIMEOUT, sqlx::query(sql()).fetch_all(&mut c))
-                    .await
-                    .map_err(qt)?
-                    .map_err(|e| format!("查询出错: {e}"))?;
+                let rows =
+                    tokio::time::timeout(QUERY_TIMEOUT, sqlx::query(sql()).fetch_all(&mut c))
+                        .await
+                        .map_err(qt)?
+                        .map_err(|e| format!("查询出错: {e}"))?;
                 Ok(rows_to_json(&rows, "sqlite", cap, ms(started)))
             } else {
                 let res = tokio::time::timeout(QUERY_TIMEOUT, sqlx::query(sql()).execute(&mut c))
@@ -493,10 +494,11 @@ async fn sql_query(
                 .map_err(ct)?
                 .map_err(|e| format!("连接失败: {e}"))?;
             let out = if is_read {
-                let rows = tokio::time::timeout(QUERY_TIMEOUT, sqlx::query(sql()).fetch_all(&mut c))
-                    .await
-                    .map_err(qt)?
-                    .map_err(|e| format!("查询出错: {e}"))?;
+                let rows =
+                    tokio::time::timeout(QUERY_TIMEOUT, sqlx::query(sql()).fetch_all(&mut c))
+                        .await
+                        .map_err(qt)?
+                        .map_err(|e| format!("查询出错: {e}"))?;
                 Ok(rows_to_json(&rows, "mysql", cap, ms(started)))
             } else {
                 let res = tokio::time::timeout(QUERY_TIMEOUT, sqlx::query(sql()).execute(&mut c))
@@ -514,10 +516,11 @@ async fn sql_query(
                 .map_err(ct)?
                 .map_err(|e| format!("连接失败: {e}"))?;
             let out = if is_read {
-                let rows = tokio::time::timeout(QUERY_TIMEOUT, sqlx::query(sql()).fetch_all(&mut c))
-                    .await
-                    .map_err(qt)?
-                    .map_err(|e| format!("查询出错: {e}"))?;
+                let rows =
+                    tokio::time::timeout(QUERY_TIMEOUT, sqlx::query(sql()).fetch_all(&mut c))
+                        .await
+                        .map_err(qt)?
+                        .map_err(|e| format!("查询出错: {e}"))?;
                 Ok(rows_to_json(&rows, "postgres", cap, ms(started)))
             } else {
                 let res = tokio::time::timeout(QUERY_TIMEOUT, sqlx::query(sql()).execute(&mut c))

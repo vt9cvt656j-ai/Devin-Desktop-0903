@@ -178,7 +178,11 @@ pub async fn web_scaffold(
         // collide with the semantic tokens, so order among :root blocks is moot).
         // The Michael Design (react) arm writes src/index.css; vue/material/tdesign still
         // write src/style.css. Use whichever this run actually produced.
-        let style_rel = if dir.join("src/index.css").exists() { "src/index.css" } else { "src/style.css" };
+        let style_rel = if dir.join("src/index.css").exists() {
+            "src/index.css"
+        } else {
+            "src/style.css"
+        };
         let style_path = dir.join(style_rel);
         let base = fs::read_to_string(&style_path)
             .await
@@ -209,28 +213,94 @@ pub async fn web_scaffold(
 /// include_str! bakes each file in at compile time, so the scaffold works offline and the
 /// templates stay real, editable, lintable files rather than Rust string literals.
 const MD_TEMPLATES: &[(&str, &str)] = &[
-    ("package.json", include_str!("../templates/michael-design/package.json")),
-    ("tsconfig.json", include_str!("../templates/michael-design/tsconfig.json")),
-    ("vite.config.ts", include_str!("../templates/michael-design/vite.config.ts")),
-    ("index.html", include_str!("../templates/michael-design/index.html")),
-    ("src/App.tsx", include_str!("../templates/michael-design/src/App.tsx")),
-    ("src/components/motion/section-reveal.tsx", include_str!("../templates/michael-design/src/components/motion/section-reveal.tsx")),
-    ("src/components/ui/accordion.tsx", include_str!("../templates/michael-design/src/components/ui/accordion.tsx")),
-    ("src/components/ui/aspect-ratio.tsx", include_str!("../templates/michael-design/src/components/ui/aspect-ratio.tsx")),
-    ("src/components/ui/avatar.tsx", include_str!("../templates/michael-design/src/components/ui/avatar.tsx")),
-    ("src/components/ui/badge.tsx", include_str!("../templates/michael-design/src/components/ui/badge.tsx")),
-    ("src/components/ui/button.tsx", include_str!("../templates/michael-design/src/components/ui/button.tsx")),
-    ("src/components/ui/card.tsx", include_str!("../templates/michael-design/src/components/ui/card.tsx")),
-    ("src/components/ui/dialog.tsx", include_str!("../templates/michael-design/src/components/ui/dialog.tsx")),
-    ("src/components/ui/input.tsx", include_str!("../templates/michael-design/src/components/ui/input.tsx")),
-    ("src/components/ui/separator.tsx", include_str!("../templates/michael-design/src/components/ui/separator.tsx")),
-    ("src/components/ui/sheet.tsx", include_str!("../templates/michael-design/src/components/ui/sheet.tsx")),
-    ("src/components/ui/table.tsx", include_str!("../templates/michael-design/src/components/ui/table.tsx")),
-    ("src/components/ui/tabs.tsx", include_str!("../templates/michael-design/src/components/ui/tabs.tsx")),
-    ("src/components/ui/tooltip.tsx", include_str!("../templates/michael-design/src/components/ui/tooltip.tsx")),
-    ("src/index.css", include_str!("../templates/michael-design/src/index.css")),
-    ("src/lib/utils.ts", include_str!("../templates/michael-design/src/lib/utils.ts")),
-    ("src/main.tsx", include_str!("../templates/michael-design/src/main.tsx")),
+    (
+        "package.json",
+        include_str!("../templates/michael-design/package.json"),
+    ),
+    (
+        "tsconfig.json",
+        include_str!("../templates/michael-design/tsconfig.json"),
+    ),
+    (
+        "vite.config.ts",
+        include_str!("../templates/michael-design/vite.config.ts"),
+    ),
+    (
+        "index.html",
+        include_str!("../templates/michael-design/index.html"),
+    ),
+    (
+        "src/App.tsx",
+        include_str!("../templates/michael-design/src/App.tsx"),
+    ),
+    (
+        "src/components/motion/section-reveal.tsx",
+        include_str!("../templates/michael-design/src/components/motion/section-reveal.tsx"),
+    ),
+    (
+        "src/components/ui/accordion.tsx",
+        include_str!("../templates/michael-design/src/components/ui/accordion.tsx"),
+    ),
+    (
+        "src/components/ui/aspect-ratio.tsx",
+        include_str!("../templates/michael-design/src/components/ui/aspect-ratio.tsx"),
+    ),
+    (
+        "src/components/ui/avatar.tsx",
+        include_str!("../templates/michael-design/src/components/ui/avatar.tsx"),
+    ),
+    (
+        "src/components/ui/badge.tsx",
+        include_str!("../templates/michael-design/src/components/ui/badge.tsx"),
+    ),
+    (
+        "src/components/ui/button.tsx",
+        include_str!("../templates/michael-design/src/components/ui/button.tsx"),
+    ),
+    (
+        "src/components/ui/card.tsx",
+        include_str!("../templates/michael-design/src/components/ui/card.tsx"),
+    ),
+    (
+        "src/components/ui/dialog.tsx",
+        include_str!("../templates/michael-design/src/components/ui/dialog.tsx"),
+    ),
+    (
+        "src/components/ui/input.tsx",
+        include_str!("../templates/michael-design/src/components/ui/input.tsx"),
+    ),
+    (
+        "src/components/ui/separator.tsx",
+        include_str!("../templates/michael-design/src/components/ui/separator.tsx"),
+    ),
+    (
+        "src/components/ui/sheet.tsx",
+        include_str!("../templates/michael-design/src/components/ui/sheet.tsx"),
+    ),
+    (
+        "src/components/ui/table.tsx",
+        include_str!("../templates/michael-design/src/components/ui/table.tsx"),
+    ),
+    (
+        "src/components/ui/tabs.tsx",
+        include_str!("../templates/michael-design/src/components/ui/tabs.tsx"),
+    ),
+    (
+        "src/components/ui/tooltip.tsx",
+        include_str!("../templates/michael-design/src/components/ui/tooltip.tsx"),
+    ),
+    (
+        "src/index.css",
+        include_str!("../templates/michael-design/src/index.css"),
+    ),
+    (
+        "src/lib/utils.ts",
+        include_str!("../templates/michael-design/src/lib/utils.ts"),
+    ),
+    (
+        "src/main.tsx",
+        include_str!("../templates/michael-design/src/main.tsx"),
+    ),
 ];
 
 fn pkg_json(proj: &str, react: bool) -> String {
@@ -819,7 +889,8 @@ mod tests {
         )
         .await
         .unwrap();
-        let css = std::fs::read_to_string(ws.join("site/src/style.css")).unwrap();
+        // The default scaffold is React and writes its stylesheet to index.css.
+        let css = std::fs::read_to_string(ws.join("site/src/index.css")).unwrap();
         assert!(css.starts_with("@import './reference-tokens.css';"));
         let learned = std::fs::read_to_string(ws.join("site/src/reference-tokens.css")).unwrap();
         assert!(learned.contains("--learned-1"));

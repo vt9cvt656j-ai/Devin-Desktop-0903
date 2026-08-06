@@ -7,10 +7,12 @@
 // => these tests exercise the ACTUAL shipped code, not hand-copied duplicates that drift.
 //
 // Run:  node --test   (from ide/, or `npm test`)
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { createRequire } from "node:module";
 import { basename, dirname, join } from "node:path";
+import { tmpdir } from "node:os";
+import { spawnSync } from "node:child_process";
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import * as acorn from "acorn";
@@ -33,7 +35,17 @@ const TAURI_KNOWLEDGE = readFileSync(join(HERE, "../src-tauri/src/knowledge.rs")
 const PROCESS_UTIL = readFileSync(join(HERE, "../src-tauri/src/process_util.rs"), "utf8");
 const I18N = readFileSync(join(HERE, "../src/i18n.js"), "utf8");
 const LOCALES_SRC = readFileSync(join(HERE, "../src/locales.js"), "utf8");
-const INDEX_HTML = readFileSync(join(HERE, "../index.html"), "utf8");
+// UI 已经从 index.html 搬进 React 外壳 src/app/Shell.jsx（index.html 现在只剩
+// #root + svg sprite + 启动脚本）。这些断言查的是界面结构，所以两份都要读，
+// 并把 JSX 的 className/htmlFor 归一化回 HTML 属性名，让既有断言继续成立。
+const INDEX_HTML = (() => {
+  const html = readFileSync(join(HERE, "../index.html"), "utf8");
+  let shell = "";
+  try { shell = readFileSync(join(HERE, "../src/app/Shell.jsx"), "utf8"); } catch {}
+  return (html + "\n" + shell)
+    .replace(/\bclassName=/g, "class=")
+    .replace(/\bhtmlFor=/g, "for=");
+})();
 const APP_CSS = readFileSync(join(HERE, "../src/styles/app.css"), "utf8");
 const GROWTH_SRC = readFileSync(join(HERE, "../src/growth.js"), "utf8");
 const TAURI_AI = readFileSync(join(HERE, "../src-tauri/src/ai.rs"), "utf8");
@@ -127,6 +139,14 @@ function load(name, deps = {}) {
   const keys = Object.keys(deps);
   const fn = new Function(...keys, `${extractFn(name)}\n;return ${name};`);
   return fn(...keys.map((k) => deps[k]));
+}
+
+function buildRegisteredToolSchemas() {
+  return new Function(
+    "inTauri",
+    "_applyCloudToolDescs",
+    `${extractFn("_buildAgentToolSchemas")}\n;return _buildAgentToolSchemas;`,
+  )(true, (tools) => tools)(true, []);
 }
 function collectIdentifiers(source, name) {
   const ast = acorn.parse(source, { ecmaVersion: "latest", sourceType: "module" });
@@ -695,7 +715,6 @@ test("tool messages append recovery guidance and agent loop nudges after blocked
   const recover = load("_blockedToolRecoveryInstruction");
   const toModel = load("_toolMsgForModel", {
     _toolResultToString: (_call, result) => result.content,
-    _rebudgetRoadEnvironmentMessage: (message) => message,
     _blockedToolRecoveryInstruction: recover,
   });
   const message = toModel(
@@ -2378,6 +2397,7 @@ test("_resolveRel resolves relatives to the workspace + passes absolutes through
   const f = load("_resolveRel", { ...deps, _allRoots: () => ["/Users/me/proj"] });
   assert.equal(f("src/main.js"), "/Users/me/proj/src/main.js"); // plain relative → prepend root
   assert.equal(f("proj/src/x"), "/Users/me/proj/src/x");        // redundant root-name stripped
+  assert.equal(f("PROJ/src/x"), "/Users/me/proj/src/x");        // model casing drift is recovered
   assert.equal(f("/etc/hosts"), "/etc/hosts");                  // unix absolute → as-is
   assert.equal(f("C:\\Windows\\x"), "C:/Windows/x");            // Windows keys use one slash form
   assert.equal(f("C:/Windows/x"), "C:/Windows/x");              // windows absolute (fwd slash) → as-is
@@ -2483,7 +2503,21 @@ test("multi-root resolution never falls through to process cwd or guesses an amb
   });
   assert.deepEqual(candidates("src/x.js"), ["/work/a/src/x.js", "/work/b/src/x.js"]);
   assert.deepEqual(candidates("b/src/x.js"), ["/work/b/src/x.js"]);
+  assert.deepEqual(candidates("B/src/x.js"), ["/work/b/src/x.js"]);
   assert.deepEqual(candidates("/missing/absolute.js"), ["/missing/absolute.js"]);
+
+  const novelRoot = "/Users/michael/Desktop/小说";
+  const recoverAbsolute = load("_relCandidates", {
+    _normalizeFsPath: NORMALIZE_PATH,
+    _coherentFilePath: COHERENT_PATH,
+    _pathIdentity: PATH_IDENTITY,
+    _allRoots: () => [novelRoot],
+  });
+  assert.deepEqual(
+    recoverAbsolute("/User/michael/Desktop/小说/package.json"),
+    ["/User/michael/Desktop/小说/package.json", `${novelRoot}/package.json`],
+    "a stale absolute prefix should recover through the exact open workspace folder name",
+  );
 
   const fuzzy = load("_fuzzyFileCandidates", {
     _allRoots: () => roots,
@@ -2494,6 +2528,57 @@ test("multi-root resolution never falls through to process cwd or guesses an amb
   });
   const matches = await fuzzy("db.js", "/work/a");
   assert.deepEqual(matches.map((match) => match.path), ["/work/a/server/db.js", "/work/b/server/db.js"]);
+});
+
+test("filesystem scan roots remove overlap while preserving the preferred root", () => {
+  const pathIsAtOrUnder = load("_pathIsAtOrUnder", { _pathIdentity: PATH_IDENTITY });
+  const independent = load("_independentFsPaths", {
+    _normalizeFsPath: NORMALIZE_PATH,
+    _pathIdentity: PATH_IDENTITY,
+    _pathIsAtOrUnder: pathIsAtOrUnder,
+  });
+  assert.deepEqual(
+    independent(["/repo/packages/app", "/repo", "/other", "/other/"]),
+    ["/repo/packages/app", "/other"],
+  );
+  assert.deepEqual(independent(["/repo", "/repo/packages/app"]), ["/repo"]);
+});
+
+test("find_files requests cover ordinary, root-qualified, absolute, and missing-root patterns", () => {
+  const pathIsAtOrUnder = load("_pathIsAtOrUnder", { _pathIdentity: PATH_IDENTITY });
+  const independent = load("_independentFsPaths", {
+    _normalizeFsPath: NORMALIZE_PATH,
+    _pathIdentity: PATH_IDENTITY,
+    _pathIsAtOrUnder: pathIsAtOrUnder,
+  });
+  const requests = load("_agentFindRequests", {
+    _normalizeFsPath: NORMALIZE_PATH,
+    _independentFsPaths: independent,
+    _allRoots: () => ["/work/app", "/work/lib"],
+    _isAbsoluteFsPath: IS_ABSOLUTE_FS_PATH,
+    _pathIsAtOrUnder: pathIsAtOrUnder,
+    basename: BASENAME,
+  });
+  assert.deepEqual(requests("/work/app", "*.ts"), [
+    { root: "/work/app", pattern: "*.ts" },
+    { root: "/work/lib", pattern: "*.ts" },
+  ]);
+  assert.deepEqual(requests("/work/app", "LIB/src/*.ts"), [
+    { root: "/work/lib", pattern: "src/*.ts" },
+  ]);
+  assert.deepEqual(requests("/work/app", "/work/lib/src/*.ts"), [
+    { root: "/work/lib", pattern: "src/*.ts" },
+  ]);
+
+  const noRootRequests = load("_agentFindRequests", {
+    _normalizeFsPath: NORMALIZE_PATH,
+    _independentFsPaths: independent,
+    _allRoots: () => [],
+    _isAbsoluteFsPath: IS_ABSOLUTE_FS_PATH,
+    _pathIsAtOrUnder: pathIsAtOrUnder,
+    basename: BASENAME,
+  });
+  assert.deepEqual(noRootRequests("", "*.js"), [{ root: "", pattern: "*.js" }]);
 });
 
 test("run path bindings reuse the exact file recovered by a fuzzy read", () => {
@@ -2699,9 +2784,9 @@ test("invalid file mutation arguments recover by reading target context once", (
     "agent loop must convert recoverable invalid file tool args into a safe read_file step");
   assert.match(SRC, /turn\._invalidToolRepairInstruction/,
     "agent loop must feed the recovery instruction back after the synthetic read result");
-  assert.match(SRC, /const retryLimit = prefixInvalid \? 1 : \(payloadTooLarge \? 1 : \(argIssue \? 3/,
-    "invalid tool arguments should get a bounded schema-repair retry before loop-level recovery");
-  assert.match(SRC, /argIssue && attempt === 0/,
+  assert.match(SRC, /const repairableToolArgs = !!argIssue && !turnErr && !truncated;[\s\S]{0,100}const retryLimit = repairableToolArgs \? 3 : 0/,
+    "only clean schema-invalid tool arguments may get a bounded model repair call");
+  assert.match(SRC, /if \(repairAttempt === 0\) \{\s*\/\/ 静默自愈/,
     "first schema-repair attempt should self-heal silently instead of flashing an alarming toast");
   assert.match(SRC, /正在补齐工具参数后继续/,
     "if arg-repair recurs, the toast should calmly explain param completion, not a brittle fixed 1\/2 counter");
@@ -4173,12 +4258,14 @@ test("model request budget fails explicitly when essential context cannot fit", 
 
 test("every streaming chat path applies the final request budget", () => {
   assert.match(SRC, /const requestMessages = _enforceModelRequestBudget\(providerMessages, providerTools\)/);
-  assert.match(SRC, /_l0Msgs = _enforceModelRequestBudget\(_l0Msgs, _l0Tools, _requestByteCap\)/);
+  assert.match(SRC, /_l0Msgs = _enforceModelRequestBudget\(_l0Msgs, _l0Tools, _MODEL_REQUEST_BODY_BYTE_CAP\)/);
+  assert.doesNotMatch(SRC, /_requestByteCap|MODEL_REQUEST_EMERGENCY_BODY_BYTE_CAP/,
+    "request failures must not create a second body with a different cap");
   const rawCalls = [...SRC.matchAll(/backend\.aiChat\(([^\n]+)/g)].map((match) => match[1]);
   assert.ok(rawCalls.every((call) => call.includes("_enforceModelRequestBudget") || call.includes("requestMessages")), rawCalls.join("\n"));
 });
 
-test("context pressure may be estimated but billing waits for the server settlement", () => {
+test("context pressure may be estimated while billing settles off the model-turn path", () => {
   const estTokens = load("_estTokens");
   const estRequest = load("_estRequestTokens", { _estTokens: estTokens });
   const fullMessages = [
@@ -4193,7 +4280,11 @@ test("context pressure may be estimated but billing waits for the server settlem
   assert.match(SRC, /_lastRequestEstimateTokens = _estRequestTokens\(_l0Msgs, _l0Tools\)/);
   assert.match(SRC, /_setContextMeter\(\{ promptTokens: _lastRequestEstimateTokens, completionTokens: 0, cachedTokens: null, estimated: true, source: "prepared" \}\)/,
     "估算态的缓存必须是 null（未上报），不能渲染成误导排查的「缓存 0」");
-  assert.match(SRC, /const settlement = await _fetchGatewaySettlement\(_turnConfig, _turnReqId\)/);
+  assert.match(SRC, /const settlementTask = \(async \(\) => \{[\s\S]{0,120}await _fetchGatewaySettlement\(_turnConfig, _turnReqId\)/);
+  assert.match(SRC, /if \(Array\.isArray\(settlementTasks\)\) settlementTasks\.push\(settlementTask\);[\s\S]{0,60}else await settlementTask;/,
+    "agent loops should track settlements without blocking the next tool/model turn");
+  assert.match(SRC, /settlementTasks: run\._billingTasks/,
+    "the run finalizer must own every per-turn settlement task");
   assert.match(SRC, /session\._lastTurnTokens = settlement\?\.usageReported/);
   assert.doesNotMatch(SRC, /prompt_tokens: _lastRequestEstimateTokens \|\| _estRequestTokens\(messages, toolSchemas\)/);
   assert.doesNotMatch(SRC, /_turnCostCents/);
@@ -4355,187 +4446,16 @@ test("local discovery is a registered read-only model tool", () => {
   assert.match(SRC, /retrieved_at 只是本次取回时间，不是 POI 更新时间/);
 });
 
-test("keyless public data tools are registered, normalized, and read-only", () => {
-  for (const name of ["live_environment", "live_markets", "live_flights", "road_environment", "track_shipment", "shop_catalog"]) {
-    assert.match(SRC, new RegExp(`name: "${name}"`));
-    assert.match(SRC, new RegExp(`backend\\.invoke\\("${name}"|command = "${name}"`));
+test("live_environment 保留，退役公开数据工具不留死分支", () => {
+  assert.match(SRC, /name: "live_environment"/);
+  assert.match(SRC, /backend\.invoke\("live_environment"|command = "live_environment"/);
+
+  for (const gone of ["live_markets", "live_flights", "road_environment", "track_shipment", "shop_catalog"]) {
+    assert.doesNotMatch(SRC, new RegExp(`name: "${gone}"|case "${gone}":`), `${gone} 不能再被注册或映射`);
   }
-  assert.match(SRC, /liveenvironment.*livemarkets.*liveflights.*roadenvironment.*trackshipment.*shopcatalog/);
-  assert.match(SRC, /desktopOnly = new Set\([^\n]*"shop_catalog"/,
-    "structured public data tools must not be offered by the browser mock backend");
-  assert.match(SRC, /name: "road_environment"[\s\S]{0,1800}enum: \["overview", "vehicle_counts", "traffic_flow", "road_incidents"\][\s\S]{0,1200}required: \["kind"\], anyOf: \[\{ required: \["near"\] \}, \{ required: \["latitude", "longitude"\] \}\]/,
-    "road schema must require either current-location permission or explicit coordinates");
-  assert.match(SRC, /Coinbase 与 Kraken/);
-  assert.match(SRC, /不抓网页、不绕验证码、不编造轨迹/);
-  assert.match(SRC, /tracking_events 为空时绝不能声称包裹状态/);
-  assert.match(SRC, /Shopify 公共 \/products\.json/);
-  assert.match(SRC, /JSON-LD Product\/Offer/);
-  assert.match(SRC, /不登录、不绕验证码\/反爬、不调用私有接口/);
-  assert.match(SRC, /currency=null 时不得从域名、语言或地区推断/);
-  assert.match(SRC, /anyOf: \[\{ properties: \{ kind: \{ enum: \["weather", "air_quality", "marine"\]/,
-    "environment schema must require coordinates for coordinate-bound kinds");
-  assert.match(SRC, /pattern: "\^\[A-Za-z0-9_-\]\+\$"/,
-    "shipment schema must match the native ASCII tracking-number contract");
-  const schemaIssue = load("_schemaValueIssue");
-  const trackingSchema = { type: "string", minLength: 6, maxLength: 64, pattern: "^[A-Za-z0-9_-]+$" };
-  assert.equal(schemaIssue("ABC_123", trackingSchema), "");
-  assert.match(schemaIssue("含中文单号A", trackingSchema), /格式无效/);
-  assert.match(schemaIssue("A".repeat(65), trackingSchema), /长度不能大于 64/);
-  assert.match(SRC, /successes && `\$\{successes\}成功`[\s\S]{0,220}delayed && `\$\{delayed\}延迟`[\s\S]{0,220}empty && `\$\{empty\}空`[\s\S]{0,220}stale && `\$\{stale\}过期`[\s\S]{0,220}failures && `\$\{failures\}失败`[\s\S]{0,220}noCoverage && `\$\{noCoverage\}无覆盖`/,
-    "road cards must preserve every source-state category in mixed results");
-  assert.match(SRC, /data_as_of_kind 必须原样保留/);
-  assert.match(SRC, /California CHP 记录只表示 current public feed membership/);
-  assert.match(SRC, /data_as_of_kind=http_last_modified 只是 HTTP representation/);
-  assert.match(SRC, /不得输出 dispatch notes、车牌、电话号码、医疗或人物细节/);
-  assert.match(SRC, /statuses\.some\(\(item\) => item\?\.source === "caltrans_quickmap_chp_incidents" && item\?\.status !== "no_coverage"\)/,
-    "California-specific evidence must be injected only for an applicable CHP source status");
-  assert.doesNotMatch(SRC, /_dupGuardable = new Set\([^\n]*liveenvironment/,
-    "fresh live-data calls must not reuse a previous turn's result");
-  assert.doesNotMatch(SRC, /_dupGuardable = new Set\([^\n]*roadenvironment/,
-    "road observations must be fetched again on a later model turn");
-  assert.match(SRC, /_seenLive[\s\S]{0,700}_dupLive/,
-    "identical live-data calls in one batch must be collapsed before parallel dispatch");
-  assert.match(SRC, /\["liveenvironment", "livemarkets", "liveflights", "roadenvironment", "trackshipment", "shopcatalog"\]\.includes/,
-    "identical road calls in one model response must be collapsed");
-  assert.match(SRC, /_READ_ONLY_TYPES = new Set\([^\n]*"shopcatalog"/,
-    "shop_catalog must stay in the read-only parallel tool set");
-  assert.match(SRC, /const _READ_TOOLS = \[[^\n]*"shop_catalog"/,
-    "read-only child agents must receive the structured shop tool");
-  assert.match(SRC, /const _READ_TYPES = \[[^\n]*"shopcatalog"/,
-    "read-only child execution must allow shop results");
-  assert.doesNotMatch(SRC, /traffic_incidents: "road_environment"|vehicle_counts: "road_environment"/,
-    "semantic aliases without a kind default must not create guaranteed-invalid calls");
-  assert.match(SRC, /_isCurrentLocationRequest\(call\.near\)[\s\S]{0,500}_requestCurrentCoordinates\(\)/,
-    "near=current road calls must use the real one-shot permission flow");
-
-  const mapCall = load("_mapToolCall", {
-    _normalizeArgKeys: (args) => args,
-    _STR_ARG_KEYS: new Set(),
-    _KNOWN_TOOLS: new Set(["live_environment", "live_markets", "live_flights", "road_environment", "track_shipment", "shop_catalog"]),
-    _canonicalToolName: () => "",
-    _finiteNumberArg: load("_finiteNumberArg"),
-  });
-  assert.deepEqual(mapCall("live_environment", {
-    kind: "earthquakes", latitude: 31.2, longitude: 121.5,
-    radius_km: 500, minimum_magnitude: 4.5, limit: 10,
-  }, new Map()), {
-    type: "liveenvironment", path: "earthquakes", kind: "earthquakes",
-    latitude: 31.2, longitude: 121.5, radiusKm: 500, window: "",
-    minimumMagnitude: 4.5, category: "", limit: 10,
-  });
-  assert.deepEqual(mapCall("live_markets", {
-    kind: "crypto", base: "btc", quote: "usd",
-  }, new Map()), {
-    type: "livemarkets", path: "BTC/USD", kind: "crypto", base: "btc", quote: "usd",
-  });
-  assert.deepEqual(mapCall("road_environment", {
-    kind: "road_incidents", latitude: 30.2672, longitude: -97.7431,
-    radius_km: 20, lookback_hours: 48, limit: 12,
-  }, new Map()), {
-    type: "roadenvironment", path: "road_incidents", kind: "road_incidents",
-    near: "", latitude: 30.2672, longitude: -97.7431, radiusKm: 20,
-    lookbackHours: 48, limit: 12,
-  });
-  assert.deepEqual(mapCall("road_environment", {
-    kind: "overview", near: "current", radius_km: 10,
-  }, new Map()), {
-    type: "roadenvironment", path: "overview", kind: "overview", near: "current",
-    latitude: null, longitude: null, radiusKm: 10, lookbackHours: null, limit: null,
-  });
-  const shipment = mapCall("track_shipment", {
-    tracking_number: "1Z999AA10123456784", carrier: "ups",
-  }, new Map());
-  assert.equal(shipment.type, "trackshipment");
-  assert.equal(shipment.path, "官方核验", "tool cards must never persist model-supplied carrier text as their path");
-  assert.equal(shipment.trackingNumber, "1Z999AA10123456784");
-  assert.deepEqual(mapCall("shop_catalog", {
-    query: "查这个店价格", url: "https://shop.example", limit: 8,
-  }, new Map()), {
-    type: "shopcatalog", path: "https://shop.example", query: "查这个店价格",
-    url: "https://shop.example", limit: 8,
-  });
-  assert.deepEqual(mapCall("smzdm_search", {
-    query: "iPhone 16 优惠", max_results: 7,
-  }, new Map()), { type: "smzdm_search", query: "iPhone 16 优惠", max_results: 7 });
-  assert.deepEqual(mapCall("xianyu_search", {
-    query: "二手 iPhone 13", max_results: 5,
-  }, new Map()), { type: "xianyu_search", query: "二手 iPhone 13", max_results: 5 });
-  assert.deepEqual(mapCall("zhuanzhuan_search", {
-    query: "二手 iPhone 13", max_results: 5,
-  }, new Map()), { type: "zhuanzhuan_search", query: "二手 iPhone 13", max_results: 5 });
-});
-
-test("road model output keeps truth metadata and complete JSON inside the final model cap", () => {
-  const boundedOutput = load("_boundedRoadEnvironmentOutput");
-  const sourceStatus = {
-    source: "official", status: "delayed", result_count: 50,
-    data_as_of: "2026-07-12T12:00:00Z", data_as_of_kind: "aggregation_interval_end",
-  };
-  const output = {
-    topic: "road_environment",
-    records: Array.from({ length: 50 }, (_, index) => ({ index, description: "x".repeat(2000) })),
-    source_statuses: [sourceStatus],
-    limitations: ["empty does not prove safety"],
-    retrieved_at: 123,
-  };
-  const bounded = boundedOutput(output, 5000);
-  assert.deepEqual(bounded.source_statuses, output.source_statuses);
-  assert.deepEqual(bounded.limitations, output.limitations);
-  assert.equal(bounded.retrieved_at, 123);
-  assert.equal(bounded.record_count_total, 50);
-  assert.ok(bounded.records.length > 0 && bounded.records.length < 50);
-  assert.equal(bounded.records.length + bounded.records_omitted, 50);
-  assert.ok(JSON.stringify(bounded).length <= 5000);
-  assert.equal(bounded.source_statuses[0].data_as_of_kind, "aggregation_interval_end");
-
-  const rebound = boundedOutput(bounded, 4000);
-  assert.equal(rebound.record_count_total, 50);
-  assert.equal(rebound.records.length + rebound.records_omitted, 50,
-    "rebudgeting an already bounded response must retain the provider's total count");
-
-  const modelMessage = load("_roadEnvironmentModelMessage", {
-    _boundedRoadEnvironmentOutput: boundedOutput,
-  });
-  const rebudgetMessage = load("_rebudgetRoadEnvironmentMessage", {
-    _roadEnvironmentModelMessage: modelMessage,
-  });
-  const toModel = load("_toolMsgForModel", {
-    _toolResultToString: (_call, result) => result.content,
-    _rebudgetRoadEnvironmentMessage: rebudgetMessage,
-  });
-  const content = `真实性证据\n\n结构化数据：\n${JSON.stringify(output)}`;
-  assert.ok(content.length > 30000, "fixture must exercise the model's 30k cap");
-  const message = toModel(
-    { type: "roadenvironment" },
-    { type: "roadenvironment", content },
-  );
-  assert.ok(message.length <= 30000);
-  const parsed = JSON.parse(message.split("结构化数据：\n")[1]);
-  assert.deepEqual(parsed.source_statuses, output.source_statuses);
-  assert.equal(parsed.source_statuses[0].data_as_of_kind, "aggregation_interval_end");
-  assert.equal(parsed.record_count_total, 50);
-  assert.equal(parsed.records.length + parsed.records_omitted, 50);
-
-  const oversizedMetadata = {
-    topic: "road_environment",
-    records: [{ id: "one" }],
-    source_statuses: Array.from({ length: 40 }, (_, index) => ({
-      source: `provider-${index}-${"s".repeat(2000)}`,
-      status: "delayed",
-      result_count: 1,
-      detail: "d".repeat(20000),
-      data_as_of: "2026-07-12T12:00:00Z",
-      data_as_of_kind: "aggregation_interval_end",
-    })),
-    limitations: Array.from({ length: 40 }, () => "l".repeat(10000)),
-    retrieved_at: 123,
-  };
-  const metadataMessage = modelMessage("真实性证据", oversizedMetadata, 30000);
-  assert.ok(metadataMessage.length <= 30000, `oversized metadata escaped cap: ${metadataMessage.length}`);
-  const metadataJson = JSON.parse(metadataMessage.split("结构化数据：\n")[1]);
-  assert.equal(metadataJson.source_status_count_total ?? metadataJson.source_statuses.length, 40);
-  assert.ok(metadataJson.source_statuses.every((status) => status.data_as_of_kind === "aggregation_interval_end"));
-  assert.equal(metadataJson.records.length + metadataJson.records_omitted, 1);
+  for (const deadType of ["livemarkets", "liveflights", "roadenvironment", "trackshipment", "shopcatalog"]) {
+    assert.doesNotMatch(SRC, new RegExp(`\\b${deadType}\\b`), `${deadType} 的执行、UI 和缓存死分支应删除`);
+  }
 });
 
 test("current location requests use the native permission flow without double prompting", async () => {
@@ -4907,99 +4827,6 @@ test("local discovery executor wires permission, coordinates, and address failur
   assert.match(addressUi.result.className, /--err/);
 });
 
-test("road executor visibly distinguishes delayed data and coarse current location", async () => {
-  const boundedOutput = load("_boundedRoadEnvironmentOutput");
-  const modelMessage = load("_roadEnvironmentModelMessage", {
-    _boundedRoadEnvironmentOutput: boundedOutput,
-  });
-  const rebudgetMessage = load("_rebudgetRoadEnvironmentMessage", {
-    _roadEnvironmentModelMessage: modelMessage,
-  });
-  const toModel = load("_toolMsgForModel", {
-    _toolResultToString: (_call, toolResult) => toolResult.content,
-    _rebudgetRoadEnvironmentMessage: rebudgetMessage,
-  });
-  const isCurrent = load("_isCurrentLocationRequest");
-  const roadMetadata = load("_roadLocationMetadata");
-  const accuracyWarning = load("_roadLocationAccuracyWarning");
-  const viewport = { innerHTML: "" };
-  const result = { className: "atc-result", textContent: "", innerHTML: "" };
-  const opened = new Set();
-  const step = {
-    classList: { add: (name) => opened.add(name) },
-    querySelector: (selector) => selector === ".atc-viewport" ? viewport
-      : selector === ".atc-result" ? result : selector === ".agent-tool-row" ? {} : null,
-  };
-  let invokeArgs;
-  const execute = load("_executeToolStepInner", {
-    _currentAiMode: "agent",
-    _runCheckpoint: new Map(),
-    _HOOKED_TOOL_TYPES: new Set(),
-    _fireHooks: async () => ({ blocked: false }),
-    _hookToolName: () => "",
-    _approveToolCall: async () => true,
-    _agentSideEffectIntentIssue: () => "",
-    _emptyRootSkipMessage: () => "",
-    _emptyExploreSkipMessage: () => "",
-    _isCurrentLocationRequest: isCurrent,
-    _requestCurrentCoordinates: async () => ({
-      status: "success", latitude: 49.89, longitude: -97.14, accuracyM: 2500,
-      observedAtUnixMs: 1_783_888_800_000, sampleAgeMs: 500, source: "core_location",
-    }),
-    _roadLocationMetadata: roadMetadata,
-    _roadLocationAccuracyWarning: accuracyWarning,
-    _roadEnvironmentModelMessage: modelMessage,
-    _escHtml: (value) => String(value),
-    inTauri: true,
-    backend: { invoke: async (command, args) => {
-      assert.equal(command, "road_environment");
-      invokeArgs = args;
-      return {
-        topic: "road_environment",
-        records: Array.from({ length: 50 }, (_, index) => ({
-          source: "winnipeg", vehicle_count: index + 1, provider_payload: "x".repeat(2000),
-        })),
-        source_statuses: [{
-          source: "winnipeg", status: "delayed", result_count: 50,
-          data_as_of: "2026-07-12T12:00:00Z", data_as_of_kind: "aggregation_interval_end",
-        }, {
-          source: "caltrans_quickmap_chp_incidents", status: "no_coverage", result_count: 0,
-        }],
-        limitations: ["station count is not a simultaneous nearby total"],
-        retrieved_at: 1_783_888_800,
-      };
-    } },
-  });
-
-  const toolResult = await execute(step, {
-    type: "roadenvironment", path: "vehicle_counts", kind: "vehicle_counts",
-    near: "current", latitude: 1, longitude: 2, radiusKm: 1,
-  }, "", null);
-
-  assert.equal(invokeArgs.latitude, 49.89);
-  assert.equal(invokeArgs.longitude, -97.14);
-  assert.match(result.textContent, /1延迟/);
-  assert.match(result.textContent, /定位误差范围约 ±2500m，大于本次 1km 查询半径/);
-  assert.doesNotMatch(result.className, /--ok/, "delayed data must not render as ordinary success");
-  assert.match(toolResult.content, /定位精度警告/);
-  assert.match(toolResult.content, /delayed 表示数值已超过近实时窗口/);
-  assert.doesNotMatch(toolResult.content, /California CHP 记录只表示/,
-    "a no-coverage CHP status must not inject California-specific evidence");
-  const parsed = JSON.parse(toolResult.content.split("结构化数据：\n")[1]);
-  assert.equal(parsed.location_input.accuracy_exceeds_radius, true);
-  assert.equal(parsed.source_statuses[0].data_as_of_kind, "aggregation_interval_end");
-  assert.equal(parsed.records.length + parsed.records_omitted, 50);
-  const finalModelMessage = toModel(
-    { type: "roadenvironment" },
-    { type: "roadenvironment", content: toolResult.content },
-  );
-  assert.ok(finalModelMessage.length <= 30000);
-  const finalParsed = JSON.parse(finalModelMessage.split("结构化数据：\n")[1]);
-  assert.equal(finalParsed.records.length + finalParsed.records_omitted, 50);
-  assert.equal(finalParsed.source_statuses[0].data_as_of_kind, "aggregation_interval_end");
-  assert.equal(opened.has("is-open"), true);
-});
-
 test("optional numeric tool arguments never coerce null into zero", () => {
   const finiteNumberArg = load("_finiteNumberArg");
   assert.equal(finiteNumberArg(null), null);
@@ -5009,7 +4836,6 @@ test("optional numeric tool arguments never coerce null into zero", () => {
   assert.equal(finiteNumberArg("34.0522"), 34.0522);
   assert.equal(finiteNumberArg(0), 0);
   assert.match(SRC, /const latitude = _finiteNumberArg\(args\.latitude\)/);
-  assert.match(SRC, /anyOf: \[\{ required: \["near"\] \}, \{ required: \["latitude", "longitude"\] \}\]/);
 });
 
 test("native screen tools are mapped to real Tauri commands", () => {
@@ -5089,126 +4915,176 @@ test("message compaction invalidates exact read coverage before allowing a refet
   assert.equal(synced, 1, "coverage must be rebuilt after the exact source is compressed away");
 });
 
-test("agent auto-recovers transient stream errors after inner turn retries are exhausted", () => {
-  const strip = load("_stripAiRetryPrefix");
-  const providerGateway = load("_isProviderGatewayStatusError", { _stripAiRetryPrefix: strip });
-  const retryable = load("_isRetryableAiError", { _isProviderGatewayStatusError: providerGateway, _stripAiRetryPrefix: strip, _isRateLimitedAiError: load("_isRateLimitedAiError", { _stripAiRetryPrefix: strip }) });
-  const stalled = load("_isStalledAiError");
-  const transient = load("_isTransientTurnErr", {
-    _stripAiRetryPrefix: strip,
-    _isProviderGatewayStatusError: providerGateway,
-    _isRateLimitedAiError: load("_isRateLimitedAiError", { _stripAiRetryPrefix: strip }),
-    _isRetryableAiError: retryable,
-    _isStalledAiError: stalled,
-  });
-  assert.equal(transient("连接中断（网络波动），已保留生成的部分，正在自动恢复。"), true);
-  assert.equal(transient("AI stream closed before data: [DONE]（连接提前结束）；响应可能被截断"), true);
-  assert.equal(transient("[turn-retry-exhausted] connection reset by peer"), true);
-  assert.equal(transient("[fast-retry-exhausted] 模型长时间无响应"), false,
-    "an exhausted watchdog must not enter the outer 5x/90s recovery loop");
-  assert.equal(transient("AI request timed out waiting for response headers after 15 seconds"), false);
-  assert.equal(transient("[tool-stream-retry-exhausted] AI stream closed before data: [DONE]（连接提前结束）"), true);
-  assert.equal(transient("[tool-args-invalid] write_file truncated"), false);
+test("agent transport retries stay inside the pre-progress request wrapper while tool repair stays independent", () => {
+  const turn = extractFn("_agentModelTurn");
+  assert.match(turn, /const repairableToolArgs = !!argIssue && !turnErr && !truncated;/,
+    "completed schema repair remains independent from transport recovery");
+  assert.match(turn, /const erroredToolStream = !!turnErr && byIndex\.size > 0;/);
+  assert.match(turn, /if \(turnErr\) \{[\s\S]{0,650}\[tool-stream-retry-exhausted\]/,
+    "a transport error after partial tool deltas remains terminal");
+  assert.match(turn, /_runModelRequestWithRetry\(\{/,
+    "Agent turns must use the shared bounded model retry wrapper");
+  assert.match(turn, /onRetry:[\s\S]{0,300}模型线路出现问题，当前将重试第/,
+    "a confirmed pre-progress route failure must advertise the retry index");
+  assert.doesNotMatch(SRC, /function _isTransientTurnErr|_waitForAiRecovery\(|_turnFails < 5/,
+    "the outer Agent loop must not multiply the request retry policy");
+  assert.doesNotMatch(SRC, /上一轮模型调用因网络波动[\s\S]{0,120}自动重试/);
 });
 
-test("pre-stream provider gateway retries stay below the agent loop and do not create nested retry storms", () => {
+test("gateway failures report exhaustion without replaying partial model output", () => {
   const strip = load("_stripAiRetryPrefix");
   const providerGateway = load("_isProviderGatewayStatusError", { _stripAiRetryPrefix: strip });
-  const retryable = load("_isRetryableAiError", { _isProviderGatewayStatusError: providerGateway, _stripAiRetryPrefix: strip, _isRateLimitedAiError: load("_isRateLimitedAiError", { _stripAiRetryPrefix: strip }) });
-  const stalled = load("_isStalledAiError");
-  const transient = load("_isTransientTurnErr", {
-    _stripAiRetryPrefix: strip,
-    _isProviderGatewayStatusError: providerGateway,
-    _isRateLimitedAiError: load("_isRateLimitedAiError", { _stripAiRetryPrefix: strip }),
-    _isRetryableAiError: retryable,
-    _isStalledAiError: stalled,
-  });
   const format = load("_formatAgentFinalError", {
     _stripAiRetryPrefix: strip,
     _isProviderGatewayStatusError: providerGateway,
+    _AI_MODEL_RETRY_LIMIT: 10,
   });
 
   const bare502 = "[turn-retry-exhausted] AI request failed (502 Bad Gateway): error code: 502";
+  const bare504 = "[tool-stream-retry-exhausted] AI request failed (504 Gateway Timeout): error code: 504";
+  const limited = "[tool-stream-retry-exhausted] AI request failed (429 Too Many Requests): rate limit exceeded";
   const friendly502 = "[turn-retry-exhausted] AI request failed (502 Bad Gateway): 【claude-opus-4-6】上游暂时不可用，请换个模型或稍后再试。";
   assert.equal(providerGateway(bare502), true);
+  assert.equal(providerGateway(bare504), true);
   assert.equal(providerGateway(friendly502), true);
-  assert.equal(retryable(bare502), false, "pre-stream retries are handled below the agent loop");
-  assert.equal(transient(bare502), false, "outer agent loop must not perform another 3x retry cycle");
-  assert.match(format(friendly502), /当前模型「claude-opus-4-6」线路失败/);
-  assert.match(format(bare502), /未开始输出前持续重试/);
-  assert.match(SRC, /const retryableTurnErr = turnErr && _isRetryableAiError\(turnErr\)/);
-  assert.match(SRC, /function _postAiWithGatewayRetry/);
-  assert.match(TAURI_AI, /async fn post_chat_with_gateway_retry/);
-  assert.match(TAURI_AI, /PRE_STREAM_GATEWAY_RETRY_DELAYS/);
+  assert.match(format(friendly502), /当前模型「claude-opus-4-6」线路出现问题/);
+  assert.match(format(friendly502), /自动重试已达到 10 次/);
+  assert.match(format(bare504), /输出过程中线路失败/);
+  assert.match(format(friendly502), /本轮停止/);
+  assert.match(SRC, /function _postAiOnce/);
+  assert.match(SRC, /async function _runModelRequestWithRetry/);
+  assert.doesNotMatch(SRC, /_postAiWithGatewayRetry|payloadTooLargeRetry|_streamOptionsRejectedByProvider/);
+  assert.match(TAURI_AI, /async fn post_chat_once/);
+  assert.doesNotMatch(TAURI_AI, /post_chat_with_gateway_retry|wait_for_gateway_retry|PRE_STREAM_GATEWAY_RETRY_DELAY|error_explicitly_rejects_stream_options/);
 });
 
-test("browser gateway retries continue until a pre-stream request succeeds", async () => {
-  const retryableStatus = load("_isRetryableAiGatewayStatus");
-  const deadlineError = load("_responseHeadersDeadlineError");
-  const postWithRetry = load("_postAiWithGatewayRetry", {
-    _isRetryableAiGatewayStatus: retryableStatus,
-    _responseHeadersDeadlineError: deadlineError,
-    _AI_RESPONSE_HEADERS_DEADLINE_MS: 15_000,
-  });
-  const attempts = [];
+test("one browser fetch remains one physical attempt", async () => {
+  const postOnce = load("_postAiOnce");
   let calls = 0;
-  const response = await postWithRetry(
-    async () => ({ status: ++calls < 6 ? 502 : 200 }),
+  const response = await postOnce(
+    async () => ({ status: (++calls, 502) }),
     { model: "test" },
-    (event) => attempts.push(event),
-    async () => {},
   );
-  assert.equal(response.status, 200);
-  assert.equal(calls, 6);
-  assert.deepEqual(attempts, [1, 2, 3, 4, 5].map((attempt) => ({ attempt, status: 502 })));
-  assert.equal(retryableStatus(401), false);
-  assert.equal(retryableStatus(413), false);
-  assert.equal(retryableStatus(504), true);
+  assert.equal(response.status, 502);
+  assert.equal(calls, 1);
 });
 
-test("browser gateway retries remain cancellable while attempts accumulate", async () => {
-  const retryableStatus = load("_isRetryableAiGatewayStatus");
-  const deadlineError = load("_responseHeadersDeadlineError");
-  const postWithRetry = load("_postAiWithGatewayRetry", {
-    _isRetryableAiGatewayStatus: retryableStatus,
-    _responseHeadersDeadlineError: deadlineError,
-    _AI_RESPONSE_HEADERS_DEADLINE_MS: 15_000,
+test("model orchestration retries ten pre-progress failures and never replays partial output", async () => {
+  const progress = load("_modelEventHasProgress");
+  const run = load("_runModelRequestWithRetry", {
+    _modelEventHasProgress: progress,
+    _AI_MODEL_RETRY_LIMIT: 10,
+    _AI_MODEL_ATTEMPT_TIMEOUT_MS: 60_000,
+    _isRetryableAiError: (message) => /504|没有生成有效内容/.test(String(message || "")),
   });
-  const controller = new AbortController();
+  const failure = "AI request failed (504 Gateway Timeout): error code: 504";
   let calls = 0;
-  await assert.rejects(
-    postWithRetry(
-      async () => { calls += 1; return { status: 502 }; },
-      { model: "test" },
-      ({ attempt }) => { if (attempt === 3) controller.abort(); },
-      async () => {},
-      { signal: controller.signal },
-    ),
-    /AI request cancelled/,
-  );
-  assert.equal(calls, 3, "cancel must stop the otherwise unbounded replay loop");
+  const events = [];
+  const retries = [];
+  const failed = await run({
+    invoke: async (emit) => {
+      calls += 1;
+      emit({ kind: "error", message: failure });
+      emit({ kind: "done" });
+    },
+    onEvent: (event) => events.push(event),
+    onRetry: (event) => retries.push(event.retry),
+  });
+  assert.equal(failed.error, failure);
+  assert.equal(calls, 11, "the initial request plus ten retries is the hard cap");
+  assert.deepEqual(retries, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+  assert.equal(events.filter((event) => event.kind === "error").length, 1);
+  assert.equal(events.at(-1)?.kind, "done");
+
+  calls = 0;
+  const successEvents = [];
+  const successRetries = [];
+  const succeeded = await run({
+    invoke: async (emit) => {
+      calls += 1;
+      if (calls === 1) { emit({ kind: "error", message: failure }); emit({ kind: "done" }); return; }
+      emit({ kind: "reasoning", delta: "thinking" }); emit({ kind: "token", delta: "ok" }); emit({ kind: "done" });
+    },
+    onEvent: (event) => successEvents.push(event),
+    onRetry: (event) => successRetries.push(event.retry),
+  });
+  assert.equal(succeeded.error, "");
+  assert.equal(calls, 2);
+  assert.deepEqual(successRetries, [1]);
+  assert.deepEqual(successEvents.map((event) => event.kind), ["reasoning", "token", "done"]);
+
+  calls = 0;
+  const partialEvents = [];
+  const partial = await run({
+    invoke: async (emit) => {
+      calls += 1;
+      emit({ kind: "reasoning", delta: "already visible" });
+      emit({ kind: "error", message: failure });
+      emit({ kind: "done" });
+    },
+    onEvent: (event) => partialEvents.push(event),
+  });
+  assert.equal(calls, 1, "real reasoning/token/tool output makes the request non-replayable");
+  assert.equal(partial.error, failure);
+  assert.deepEqual(partialEvents.map((event) => event.kind), ["reasoning", "error", "done"]);
+
   assert.match(SRC, /x-ide-response-deadline-ms/);
   assert.match(SRC, /activeAttemptController\?\.abort\(\)/,
-    "the browser fetch must actively cancel the abandoned provider request");
-  assert.match(SRC, /正在自动换连接重试（已等 \$\{idle\}s）——任务和已有进度都在，不会丢/,
-    "the UI must explain retries keep progress — human wording, not protocol jargon");
+    "the browser fetch must actively cancel a timed-out provider request");
+  assert.match(SRC, /const _AI_MODEL_RETRY_LIMIT = 10;/);
+  assert.match(SRC, /模型线路出现问题，当前将重试第 \$\{retry\}\/\$\{retryLimit\} 次/);
+  assert.match(SRC, /_THINK_CARD_HTML\("思考中…"\)/);
 });
 
-test("payload-too-large AI errors shrink the request instead of resending the same body", () => {
-  const strip = load("_stripAiRetryPrefix");
-  const payloadTooLarge = load("_isPayloadTooLargeAiError", { _stripAiRetryPrefix: strip });
-  assert.equal(payloadTooLarge("AI request failed (413 Payload Too Large): 无法缓冲请求体：长度超出限制"), true);
-  assert.equal(payloadTooLarge("[turn-retry-exhausted] Model request is 5130000 UTF-8 bytes after safe compression; limit is 3500000 bytes."), true);
-  assert.equal(payloadTooLarge("AI request failed (502 Bad Gateway): error code: 502"), false);
+test("browser reads a bounded error body and never compatibility-replays it", async () => {
+  const readErrorBody = load("_readAiErrorResponseText", {
+    _AI_ERROR_BODY_DEADLINE_MS: 2_000,
+    _AI_ERROR_BODY_MAX_BYTES: 64 * 1024,
+  });
+  assert.equal(
+    await readErrorBody({ text: async () => "x".repeat(128) }, 50, () => {}, 16),
+    "x".repeat(16),
+  );
+  let aborted = 0;
+  await assert.rejects(
+    readErrorBody({ text: () => new Promise(() => {}) }, 5, () => { aborted += 1; }),
+    /error response body timed out/i,
+  );
+  assert.equal(aborted, 1);
+  assert.match(SRC, /const resp = await _postAiOnce\(_post, payload/);
+  assert.doesNotMatch(SRC, /delete payload\.stream_options|payloadTooLargeRetry|_streamOptionsRejectedByProvider/,
+    "no HTTP failure may trigger a second full transcript upload");
+});
+
+test("gateway settlement polling has a strict total network deadline", async () => {
+  let aborted = 0;
+  const settlement = load("_fetchGatewaySettlement", {
+    _michaelBase: () => "https://code.mrday.one",
+    _GATEWAY_SETTLEMENT_TOTAL_DEADLINE_MS: 35,
+    _GATEWAY_SETTLEMENT_FETCH_DEADLINE_MS: 10,
+    localStorage: { getItem: () => "" },
+    fetch: (_url, options) => new Promise((resolve, reject) => {
+      options.signal.addEventListener("abort", () => {
+        aborted += 1;
+        reject(new Error("aborted"));
+      }, { once: true });
+    }),
+  });
+  const started = Date.now();
+  assert.equal(await settlement({ apiKey: "token" }, "req_12345678", 5), null);
+  assert.ok(Date.now() - started < 200, "settlement polling exceeded its total deadline");
+  assert.ok(aborted >= 1, "a hung settlement fetch must be actively aborted");
+});
+
+test("payload-too-large AI errors stop the request instead of replaying the transcript", () => {
   assert.match(SRC, /const _MODEL_REQUEST_BODY_BYTE_CAP = 3_500_000;/);
-  assert.match(SRC, /const _MODEL_REQUEST_EMERGENCY_BODY_BYTE_CAP = 1_600_000;/);
-  assert.match(SRC, /resp\.status === 413[\s\S]{0,360}_MODEL_REQUEST_EMERGENCY_BODY_BYTE_CAP/,
-    "browser fetch path must rebuild a smaller request after a 413");
-  assert.match(SRC, /const payloadTooLarge = !!turnErr && _isPayloadTooLargeAiError\(turnErr\)/);
-  assert.match(SRC, /_requestByteCap = _MODEL_REQUEST_EMERGENCY_BODY_BYTE_CAP/,
-    "desktop Agent loop must lower the request cap before retrying a 413");
-  assert.match(TAURI_AI, /resp\.status\(\) != reqwest::StatusCode::PAYLOAD_TOO_LARGE/,
-    "Tauri must not resend the exact same oversized body just to drop stream_options");
+  assert.doesNotMatch(SRC, /MODEL_REQUEST_EMERGENCY_BODY_BYTE_CAP|_requestByteCap/);
+  assert.match(SRC, /const resp = await _postAiOnce\(_post, payload/,
+    "browser transport has one POST for one user send");
+  assert.doesNotMatch(SRC, /resp\.status === 413[\s\S]{0,500}(?:fetch\(|_postAiOnce|continue|retry)/i,
+    "a 413 must be surfaced, not followed by a compatibility replay");
+  assert.match(TAURI_AI, /Ok\(Ok\(response\)\) => return Ok\(response\)/,
+    "Tauri must treat every HTTP response, including 413, as final at the transport layer");
   assert.match(SERVER_MAIN, /"\/api\/models\/:id\/chat"[\s\S]{0,180}DefaultBodyLimit::max\(12 \* 1024 \* 1024\)/,
     "legacy model chat route should not fall back to axum's tiny default body limit");
 });
@@ -5290,16 +5166,18 @@ test("AI provider config is forced through the Michael gateway with no user rout
 
 test("agent retry toast is scoped and clears when real data resumes", () => {
   assert.match(SRC, /const _AGENT_RETRY_TOAST_KIND = "agent-retry"/);
-  assert.match(SRC, /function showAgentRetryToast\(msg\)/);
+  assert.match(SRC, /function showAgentRetryToast\(msg, persistent = false\)/);
   assert.match(SRC, /function clearAgentRetryToast\(\)/);
-  assert.match(SRC, /showToast\(msg, \{ kind: _AGENT_RETRY_TOAST_KIND, duration: 3000 \}\)/);
+  assert.match(SRC, /showToast\(msg, \{ kind: _AGENT_RETRY_TOAST_KIND, duration: persistent \? 0 : 3000 \}\)/);
   assert.match(SRC, /const _realProgress = ev\.kind === "reasoning"[\s\S]{0,220}if \(_realProgress\) \{\s*clearAgentRetryToast\(\);/,
     "retry toast should disappear as soon as reasoning/token/tool data starts streaming again");
-  assert.match(SRC, /body\.querySelectorAll\("\.md-caret"\)[\s\S]{0,140}if \(!err\) clearAgentRetryToast\(\);/,
-    "a successful model turn must not leave a stale retry toast visible");
-  assert.match(SRC, /showAgentRetryToast\(`网络\/服务波动 \(\$\{_turnFails\}\/5\)，等待链路恢复后自动继续…`\)/);
-  assert.match(SRC, /_turnFails = 0;\s*clearAgentRetryToast\(\);/,
-    "loop-level recovery toast should be cleared after the next successful turn");
+  assert.match(SRC, /body\.querySelectorAll\("\.md-caret"\)[\s\S]{0,140}clearAgentRetryToast\(\);/,
+    "a settled model turn must not leave a stale retry toast visible");
+  assert.match(SRC, /showAgentRetryToast\("正在补齐工具参数后继续…"\)/,
+    "tool-schema repair keeps the same scoped toast without making it persistent");
+  assert.match(SRC, /showAgentRetryToast\(`模型线路出现问题，当前将重试第 \$\{retry\}\/\$\{retryLimit\} 次`, true\)/,
+    "model-route retry status stays visible until real model output resumes");
+  assert.doesNotMatch(SRC, /网络\/服务波动 \(\$\{_turnFails\}\/5\)|等待链路恢复后自动继续/);
 });
 
 test("Codex image skill tool naming maps to Michael IDE's real image tool", () => {
@@ -5344,6 +5222,9 @@ test("Kimi and Grok models use dedicated brand icons", () => {
 test("thinking depth is based on real per-model capabilities instead of fixed fake tiers", () => {
   const profile = load("_thinkingProfileFor", {
     _isImageModel: (id) => /image|图像/i.test(String(id || "")),
+    _customModelById: (id) => ["custom:claude", "custom:claude-off"].includes(id)
+      ? { id, name: "claude-sonnet-5" }
+      : null,
     t: (key) => key,
   });
 
@@ -5357,12 +5238,15 @@ test("thinking depth is based on real per-model capabilities instead of fixed fa
   assert.equal(profile("MiniMax-M2.7").configurable, false, "MiniMax must not get fake reasoning_effort buttons");
   assert.equal(profile("deepseek-reasoner").configurable, false, "native-reasoning models should not get fake depth controls");
   assert.equal(profile("gpt-image-2").configurable, false, "image models must not show chat thinking controls");
+  assert.equal(profile("custom:claude").kind, "adaptive_thinking", "custom entries inherit the real model capability");
 
   const prefs = new Map([
     ["kimi-k2.6", "high"],
     ["kimi-k2.6-off", "off"],
     ["grok-4.5", "medium"],
     ["claude-sonnet-5", "high"],
+    ["custom:claude", "high"],
+    ["custom:claude-off", "off"],
     ["claude-opus-4-6", "high"],
     ["claude-3-7-sonnet", "high"],
     ["gemini-3.5-flash", "minimal"],
@@ -5371,23 +5255,41 @@ test("thinking depth is based on real per-model capabilities instead of fixed fa
   const apply = load("_applyThinkingToConfig", {
     _thinkingProfileFor: profile,
     _thinkingPrefFor: (id) => prefs.get(id) || profile(id).defaultLevel || "off",
+    _loadThinkingPrefs: () => Object.fromEntries(prefs),
   });
 
   assert.deepEqual(apply({ model: "kimi-k2.6" }).thinking, { type: "enabled" });
   assert.deepEqual(apply({ model: "kimi-k2.6-off" }).thinking, { type: "disabled" });
   assert.equal(apply({ model: "grok-4.5" }).reasoningEffort, "medium");
 
-  // Modern Claude (4.7+/5/Fable) is ADAPTIVE: these models reject
-  // {"type":"enabled","budget_tokens":N} with a hard 400 — observed in production, 29 times in
-  // six hours, and it froze the IDE. The client therefore sends reasoning_effort ONLY; the
-  // gateway rebuilds the correct adaptive block, and aggregator routes that forward the body
-  // verbatim never carry the poison shape. This test previously asserted budget_tokens:24000
-  // for sonnet-5 — codifying the exact bug, same as the gateway tests that were rewritten to
-  // defend the 400.
+  // Modern Claude rejects enabled+budget_tokens. Send the supported adaptive switch
+  // explicitly so native Anthropic and OpenAI-compatible routes both receive thinking.
   const claude = apply({ model: "claude-sonnet-5" });
   assert.equal(claude.reasoningEffort, "high");
   assert.equal(claude.thinkingBudget, undefined, "adaptive family must NOT send a budget");
-  assert.equal(claude.thinking, undefined, "adaptive family must NOT send a thinking block");
+  assert.deepEqual(claude.thinking, { type: "adaptive" });
+  const customClaude = apply({ model: "custom:claude" });
+  assert.equal(customClaude.reasoningEffort, "high");
+  assert.deepEqual(customClaude.thinking, { type: "adaptive" });
+
+  // `_readyAiConfig` replaces a custom selector with its real upstream model
+  // before Agent mode. Re-applying the mapper on every Agent iteration must still
+  // use the custom entry's saved preference, including an explicit `off`.
+  const remappedCustomClaude = apply({
+    model: "claude-sonnet-5",
+    customModelId: "custom:claude",
+  }, { agentTurn: true });
+  assert.equal(remappedCustomClaude.thinkingEffort, "high");
+  assert.equal(remappedCustomClaude.reasoningEffort, "high");
+  assert.deepEqual(remappedCustomClaude.thinking, { type: "adaptive" });
+
+  const remappedCustomClaudeOff = apply({
+    model: "claude-sonnet-5",
+    customModelId: "custom:claude-off",
+  }, { agentTurn: true, isComplexTask: true });
+  assert.equal(remappedCustomClaudeOff.thinkingEffort, "off");
+  assert.equal(remappedCustomClaudeOff.reasoningEffort, undefined);
+  assert.equal(remappedCustomClaudeOff.thinking, undefined);
 
   // Claude 4.6 still uses the explicit budget — that family accepts it.
   const c46 = apply({ model: "claude-opus-4-6" });
@@ -5404,7 +5306,9 @@ test("thinking depth is based on real per-model capabilities instead of fixed fa
   assert.equal(minimax.thinking, undefined);
 
   assert.match(SRC, /payload\.thinking_config = config\.thinkingConfig/);
+  assert.match(SRC, /payload\.thinking = config\.thinking/);
   assert.match(TAURI_AI, /pub thinking_config: Option<serde_json::Value>/);
+  assert.match(TAURI_AI, /payload\["thinking"\] = thinking\.clone\(\)/);
   assert.match(TAURI_AI, /payload\["thinking_config"\] = thinking_config\.clone\(\)/);
 });
 
@@ -5485,6 +5389,10 @@ test("Agent lightweight routing consumes the semantic verdict instead of user-me
     captureMode: "none", browserGoal: "none", orchestrationMode: "solo", runtimeObligations: [], externalObligations: [],
   };
   assert.equal(shouldLight("agent", pureAnswer, {}), true, "a classifier-confirmed, answer-only turn may use the small transport path");
+  assert.equal(shouldLight("agent", pureAnswer, { streaming: true }), true,
+    "sendPrompt marks the current turn streaming before routing; that marker must not kill the light path");
+  assert.equal(shouldLight("agent", pureAnswer, { streaming: true, _runIsLoop: true }), false,
+    "a real active Agent loop must still stay on the full path");
   assert.equal(shouldLight("agent", { ...pureAnswer, intentSemantic: { action: "answer", continuation: "continue" } }, {}), false,
     "project continuations must stay on the full Agent path");
   assert.equal(shouldLight("agent", { ...pureAnswer, projectState: "existing", workspaceAction: "inspect" }, {}), false,
@@ -5497,11 +5405,28 @@ test("Agent lightweight routing consumes the semantic verdict instead of user-me
     "an unfinished engineering plan keeps follow-up answers on the full Agent path");
   assert.doesNotMatch(SRC, /function _looksQuickAsk\(/);
   assert.doesNotMatch(SRC, /function _looksLightweightAgentChat\(/);
-  assert.match(SRC, /&& !_agentLightTurn\) \{[\s\S]{0,500}_agentContextSnapshotForTurn\(text, _curRoot, _turnEngineeringResolved\)/);
+  assert.doesNotMatch(extractFn("_shouldUseLightweightAgentTurn"), /session\?\.streaming/,
+    "the current turn's Stop-button streaming marker is not an active-loop signal");
+  assert.match(SRC, /&& !_agentLightTurn\) \{[\s\S]{0,600}_agentContextSnapshotForTurn\(text, _curRoot, _turnEngineeringResolved, \{ coldWaitMs: 1200 \}\)/);
   assert.doesNotMatch(sendSource, /await\s+(?:Promise\.race\(\[)?_gatherAgentContext/,
     "the first-token path must not await a cold workspace scan");
   assert.match(SRC, /if \(_activeForSession && !_agentLightTurn\)/);
   assert.match(SRC, /const hasToolAccess = \(isAgent && !_agentLightTurn\) \|\| isExplorer \|\| isReviewer \|\| isPlan/);
+});
+
+test("pre-processing Stop discards the unconsumed assistant shell", () => {
+  const discard = load("_discardPreTurnAssistant");
+  let removed = 0;
+  const session = { _preTurnAssistant: { wrap: { remove: () => { removed += 1; } } } };
+
+  assert.equal(discard(session), true);
+  assert.equal(removed, 1);
+  assert.equal(session._preTurnAssistant, null);
+  assert.equal(discard(session), false);
+  assert.match(extractFn("sendPrompt"), /_discardPreTurnAssistant\(sess\);\s*\n\s*const _preBody/,
+    "a new turn must clear an unconsumed shell before creating its own");
+  assert.match(extractFn("sendPrompt"), /if \(!_turnLive\(\)\) \{[\s\S]{0,140}_discardPreTurnAssistant\(sess\);/,
+    "Stop during intent/context preprocessing must remove the shell before returning");
 });
 
 test("Auto mode is removed and stale sessions fall back to Agent", () => {
@@ -5527,7 +5452,11 @@ test("Auto mode is removed and stale sessions fall back to Agent", () => {
 test("Plan Explorer Reviewer and Chat receive upgraded mode-specific operating rules", () => {
   const block = load("_modeRuntimeGuidanceBlock");
   assert.match(block("chat", "你好", {}), /Chat 模式纪律[\s\S]*不假装读过项目或运行过工具/);
-  assert.match(block("plan", "做一个前端方案", { ui: true }), /Plan 模式纪律[\s\S]*shadcn\/ui \+ Radix/);
+  const existingUiPlan = block("plan", "调整现有 Vue 页面", { ui: true, uiProject: true });
+  assert.match(existingUiPlan, /Plan 模式纪律[\s\S]*knowledge_search\(domain="michael-design"\)/);
+  assert.match(existingUiPlan, /项目现有组件库、token\/theme\/style 与构建机制/);
+  const greenfieldUiPlan = block("plan", "创建第一个网站", { ui: true, uiProject: true, fromZeroUiProject: true });
+  assert.match(greenfieldUiPlan, /默认 React \+ Tailwind CSS \+ shadcn\/ui/);
   assert.match(block("explorer", "梳理项目", {}), /Explorer 模式纪律[\s\S]*find_symbol\/lsp_definition\/lsp_references/);
   assert.match(block("reviewer", "审查代码", {}), /Reviewer 模式纪律[\s\S]*P0\/P1\/P2/);
 
@@ -5542,11 +5471,8 @@ test("Plan Explorer Reviewer and Chat receive upgraded mode-specific operating r
 
 test("semantic lightweight chat builds a genuinely small request body", () => {
   const sendSource = extractFn("sendPrompt");
-  const resolveAt = sendSource.indexOf("const _turnIntentVerdict = await _aiIntentPromise");
-  const compactAt = sendSource.indexOf("_compactHistoryIfHuge(config, sess)", resolveAt);
-  assert.ok(resolveAt > 0 && compactAt > resolveAt, "semantic routing must resolve before expensive history compaction");
-  assert.match(SRC, /if \(!_agentLightTurn\) \{[\s\S]{0,260}_compactHistoryIfHuge\(config, sess\)/,
-    "lightweight turns must skip LLM history compaction");
+  assert.match(sendSource, /const _needsWorkspacePreflight = effectiveMode !== "chat";/,
+    "plain Chat must skip workspace, OS, stale-evidence, and history-compaction preflight");
   assert.match(SRC, /if \(!_agentLightTurn\) _scheduleWorkspaceAgentWarmup\(_curRoot\)/,
     "non-light turns should schedule Skills, MCP, and context warming without awaiting it");
   assert.doesNotMatch(extractFn("sendPrompt"), /await\s+(?:Promise\.race\(\[)?_refreshFileSkills/,
@@ -5613,8 +5539,7 @@ test("developer community search is wired through schema, normalization, executi
   assert.match(SRC, /结果保留各来源的相关性或上游顺序，不保证按日期排序/);
   assert.match(SRC, /query: \{ type: "string", minLength: 1, description: "搜索主题或报错关键词" \}/);
   assert.match(SRC, /只调用工具或配置接口不等于成功/);
-  assert.doesNotMatch(SRC.match(/name: "codepen_search", description: "([^"]+)/)?.[1] || "", /真实可运行|代码全有|首选/);
-  assert.doesNotMatch(SRC.match(/name: "bestofjs_search", description: "([^"]+)/)?.[1] || "", /生态里最好的|2000\+ 精选/);
+  assert.doesNotMatch(SRC.match(/name: description: "([^"]+)/)?.[1] || "", /真实可运行|代码全有|首选/);
 
   const directoryDescription = SRC.match(/const _SEARCH_TOOLS_DESCRIPTION = `([^`]+)`;/)?.[1];
   assert.ok(directoryDescription, "search_tools should have a concise runtime description");
@@ -5622,11 +5547,12 @@ test("developer community search is wired through schema, normalization, executi
   assert.match(directoryDescription, /当前支持/);
   assert.match(directoryDescription, /当前时间只表示本轮请求时间/);
   assert.match(directoryDescription, /published_date、updated_at、version、observed_at、rate_date 或 retrieved_at/);
-  assert.match(directoryDescription, /最新论文\/SOTA\/前沿研究加载 academic_search、arxiv_search、openalex_search、crossref_search/);
+  assert.match(directoryDescription, /最新论文\/SOTA\/前沿研究加载 arxiv_search、openalex_search、crossref_search/);
   assert.match(directoryDescription, /新技术\/新版本\/API 兼容性先查官方文档、包注册表、GitHub\/GitLab\/Gitee\/Codeberg release\/issues 和开发者社区/);
-  assert.match(directoryDescription, /医学\/药物\/临床优先加载 pubmed_search、clinical_trials_search、pubchem_search、academic_search/);
+  assert.match(directoryDescription, /医学\/药物\/临床优先加载 pubmed_search、clinical_trials_search、pubchem_search/);
   assert.match(directoryDescription, /游戏价格\/平台加载 steam_search/);
-  assert.match(directoryDescription, /live_markets（参考汇率\/加密资产报价）/);
+  // live_markets 已删（航班/汇率类工具与代码 IDE 无关），这条对它的目录索引断言随之移除。
+  // 同段仍保留对 steam_search 等在册工具的断言，能力目录的契约本身不变。
   assert.match(directoryDescription, /提炼共识、分歧、适用版本\/时间、对当前问题的影响和验证动作/);
   assert.doesNotMatch(directoryDescription, /100%|十倍|全球最大|所有公开仓库|全部免费|秒回|绝不会丢/);
 });
@@ -5645,7 +5571,10 @@ test("GitHub repo reader is a real built-in tool, not only an MCP preset", () =>
 });
 
 test("Git and GitHub PR tools are integrated across catalog, aliases, and execution mapping", () => {
-  assert.match(SRC, /\"gh_pr_create\", \"gh_pr_view\", \"gh_pr_checks\", \"gh_actions_log\", \"gh_pr_review_comments\", \"gh_pr_reply\"/);
+  const registered = new Set(buildRegisteredToolSchemas().map((tool) => tool.function.name));
+  for (const name of ["gh_pr_create", "gh_pr_view", "gh_pr_checks", "gh_actions_log", "gh_pr_review_comments", "gh_pr_reply"]) {
+    assert.ok(registered.has(name), `${name} must be in the live registry`);
+  }
   assert.match(SRC, /ghprchecks:\s*"gh_pr_checks"/);
   assert.match(SRC, /ghactionslog:\s*"gh_actions_log"/);
   assert.match(SRC, /case "gh_pr_view": return \{ type: "gh", op: "pr_view"/);
@@ -5667,33 +5596,6 @@ test("GitLab, Gitee, and Codeberg repo readers are real built-in tools", () => {
   assert.match(SRC, /GITLAB_TOKEN|GITEE_ACCESS_TOKEN|CODEBERG_TOKEN/);
 });
 
-test("deal and second-hand marketplace search tools are fully wired", () => {
-  for (const name of ["smzdm_search", "xianyu_search", "zhuanzhuan_search"]) {
-    assert.match(SRC, new RegExp(`name: "${name}"`), `${name} schema is registered`);
-    assert.ok(SRC.includes(`case "${name}": return { type: "${name}"`), `${name} maps to an executable call type`);
-    assert.ok(SRC.includes(`call.type === "${name}"`), `${name} must be in the generic search execution branch`);
-  }
-  assert.match(SRC, /不是官方 API，结果是公开索引候选/);
-  assert.match(SRC, /优惠\/薅羊毛\/返利\/比价加载 smzdm_search/);
-  assert.match(SRC, /二手\/闲鱼\/转转\/捡漏同时加载 xianyu_search 和 zhuanzhuan_search/);
-  assert.match(SRC, /"smzdm_search", "xianyu_search", "zhuanzhuan_search"/,
-    "marketplace search results should auto-deep-read top pages");
-
-  const schema = (name, description) => ({ type: "function", function: { name, description } });
-  const smzdm = schema("smzdm_search", "查当前优惠 好价 券 返利 薅羊毛");
-  const xianyu = schema("xianyu_search", "查闲鱼 二手 挂牌 成色 捡漏 价格区间");
-  const zhuanzhuan = schema("zhuanzhuan_search", "查转转 二手 回收 验机 行情");
-  const registry = new Map([
-    ["smzdm_search", smzdm],
-    ["xianyu_search", xianyu],
-    ["zhuanzhuan_search", zhuanzhuan],
-  ]);
-  const exactQuery = load("_searchToolsExactQuery");
-  const lookup = load("_searchToolsLookup", { _searchToolsExactQuery: exactQuery });
-  assert.deepEqual(lookup("smzdm_search", registry, new Set()).map((tool) => tool.function.name), ["smzdm_search"]);
-  assert.deepEqual(lookup("薅羊毛 iPhone 优惠", registry, new Set()), [],
-    "自然语言工具搜索不再用关键词打分，交给语义调度器");
-});
 
 test("active Skills survive L0 prompt stripping and are inherited by child work", () => {
   const activeSkillsBlock = load("_activeSkillsBlock", {
@@ -5825,41 +5727,26 @@ test("skill discovery includes parent repositories and user-owned directories", 
   assert.ok(bases.includes("/home/tester/.codex/plugins/cache"));
 });
 
-test("MCP only loads the IDE-managed config, never one shipped by the repo", async () => {
-  // 仓库自带的 .mcp.json / .cursor/mcp.json 是跟着 git 分发的普通文件，内容里的
-  // command/args 会被直接拿去 spawn 本机进程 —— 而它们此前在"打开文件夹"时就被静默
-  // 启动。clone 一个仓库并打开它，就等于执行了作者写在里面的任意命令。
-  //
-  // MCP 服务应该由用户在 IDE 面板里明确添加（写进 .mcp.local.json，且已被 git
-  // exclude），而不是由你恰好打开的某个仓库决定。
+test("MCP loads Claude Code-compatible project configs and merges their capabilities", async () => {
   const ancestorRoots = load("_workspaceAncestorRoots");
   const reads = [];
   const read = load("_readWorkspaceMcpDocument", {
     _workspaceAncestorRoots: ancestorRoots,
     backend: { readTextFile: async (path) => {
       reads.push(path);
-      if (path === "/repo/.mcp.local.json") return "local";
+      if (path === "/repo/.mcp.local.json") return JSON.stringify({ mcpServers: { local: { command: "node" } } });
+      if (path === "/repo/.mcp.json") return JSON.stringify({ mcpServers: { shared: { command: "node" } } });
+      if (path === "/repo/.cursor/mcp.json") return JSON.stringify({ servers: { cursor: { command: "node" } } });
       throw new Error("missing");
     } },
   });
-  assert.deepEqual(await read("/repo"), { text: "local", path: "/repo/.mcp.local.json", base: "/repo" });
-  assert.deepEqual(reads, ["/repo/.mcp.local.json"],
-    "只能读 IDE 自己写的那份配置");
-
-  // 仓库带了 .mcp.json / .cursor/mcp.json 也一律当作没有。
-  const repoOnly = load("_readWorkspaceMcpDocument", {
-    _workspaceAncestorRoots: ancestorRoots,
-    backend: { readTextFile: async (path) => {
-      if (path === "/repo/.mcp.json" || path === "/repo/.cursor/mcp.json") return "repo-provided";
-      throw new Error("missing");
-    } },
-  });
-  assert.deepEqual(await repoOnly("/repo"), { text: "", path: "", base: "" },
-    "仓库自带的 MCP 配置必须完全不被加载");
-
-  assert.doesNotMatch(SRC, /base \+ "\/\.cursor\/mcp\.json"/,
-    "不能再去探仓库里的 Cursor MCP 配置");
-  assert.match(SRC, /\.git\/info\/exclude/);
+  const result = await read("/repo");
+  const merged = JSON.parse(result.text);
+  assert.deepEqual(Object.keys(merged.mcpServers).sort(), ["cursor", "local", "shared"]);
+  assert.match(result.path, /\.mcp\.local\.json/);
+  assert.match(result.path, /\.mcp\.json/);
+  assert.match(result.path, /\.cursor\/mcp\.json/);
+  assert.ok(reads.length >= 3, "应检查三种 Claude Code/Michael 配置文件");
 });
 
 test("workspace trust defaults to full allow without prompting", () => {
@@ -5922,6 +5809,55 @@ test("MCP public tool names stay valid and collision-free", () => {
   assert.equal(cwd("C:\\repo", "tools"), "C:\\repo/tools");
 });
 
+test("MCP launch normalization connects Claude/Cursor remote configs without dropping services", () => {
+  const normalize = load("_mcpServerLaunchConfig");
+  assert.deepEqual(normalize({ command: "node", args: ["server.mjs", 3], env: { MODE: "dev" }, cwd: "tools" }), {
+    command: "node", args: ["server.mjs", "3"], env: { MODE: "dev" }, cwd: "tools", remote: false,
+  });
+  const remote = normalize({
+    type: "http",
+    url: "https://mcp.example.test/api",
+    headers: { Authorization: "Bearer token" },
+    env: { REGION: "us" },
+  });
+  assert.equal(remote.command, "npx");
+  assert.deepEqual(remote.args, [
+    "-y", "--", "mcp-remote", "https://mcp.example.test/api",
+    "--header", "Authorization: Bearer token", "--transport", "http-only",
+  ]);
+  assert.deepEqual(remote.env, { REGION: "us" });
+  assert.deepEqual(normalize({ type: "sse", url: "http://127.0.0.1:3100/sse" }).args.slice(-3), [
+    "--transport", "sse-only", "--allow-http",
+  ]);
+  assert.match(normalize({ url: "not-a-url" }).error, /地址无效/);
+
+  const ensureSource = extractFn("_ensureMcpTools");
+  assert.doesNotMatch(SRC, /_MCP_MAX_SERVERS/);
+  assert.doesNotMatch(ensureSource, /slice\(0,\s*16\)|最多同时连接/);
+  assert.match(ensureSource, /const names = Object\.keys\(servers\)/);
+  assert.match(ensureSource, /_mcpServerLaunchConfig\(server\)/);
+  assert.match(ensureSource, /tool\.inputSchema \|\| tool\.input_schema/);
+});
+
+test("MCP full discovery is connected to the Agent registry and execution path", () => {
+  const responseText = load("_mcpResponseText");
+  assert.equal(responseText({ text: "plain", structuredContent: { ok: true } }), "plain\n[structuredContent]\n{\"ok\":true}");
+  assert.match(responseText({ contents: [{ uri: "fixture://proof", text: "resource body" }] }), /resource body/);
+  assert.match(responseText({ messages: [{ role: "user", content: { type: "text", text: "Review src\/main.js" } }] }), /Review src\/main\.js/);
+  assert.match(SRC, /backend\.invoke\("mcp_connect_full"/,
+    "前端必须使用完整 MCP 握手，不能只拿工具列表");
+  assert.doesNotMatch(SRC.slice(SRC.indexOf("async function _ensureMcpTools"), SRC.indexOf("// Warm MCP")), /backend\.invoke\("mcp_connect"/,
+    "连接路径不能继续调用旧的 tool-only 命令");
+  assert.match(SRC, /mcpResourceCache|resourceTemplates/);
+  assert.match(SRC, /_mcpCapabilitySchema\(serverName, "resource"/);
+  assert.match(SRC, /_mcpCapabilitySchema\(serverName, "prompt"/);
+  const dispatch = SRC.slice(SRC.indexOf('} else if (call.type === "mcp")'), SRC.indexOf('} else if (call.type === "demostart")'));
+  assert.match(dispatch, /mcp_call_full/);
+  assert.match(dispatch, /mcp_read_resource/);
+  assert.match(dispatch, /mcp_get_prompt/);
+  assert.match(dispatch, /structuredContent|structured_content/);
+});
+
 test("total tool payload keeps a bounded core and swaps requested MCP schemas from the full registry", () => {
   const utf8Bytes = load("_utf8ByteLength");
   const fit = load("_toolPayloadWindow", {
@@ -5977,7 +5913,7 @@ test("total tool payload keeps a bounded core and swaps requested MCP schemas fr
   assert.ok(capped.tools.length <= 128);
   assert.equal(capped.schemaBytes, utf8Bytes(JSON.stringify(capped.tools)));
   assert.ok(capped.schemaBytes <= 512 * 1024);
-  assert.match(SRC, /async function _agentModelTurn[\s\S]{0,300}_applyToolPayloadWindow\(toolSchemas\)/);
+  assert.match(extractFn("_agentModelTurn"), /_applyToolPayloadWindow\(toolSchemas\)/);
   assert.match(SRC, /_startRunMcpDiscovery\(run, run\.mcpRoot\);/);
   assert.doesNotMatch(SRC, /await _startRunMcpDiscovery\(run, run\.mcpRoot\)/,
     "MCP discovery must not delay the first model turn");
@@ -6331,9 +6267,19 @@ function aiIntentNormalizeDeps(dims, intentText, intentList) {
 test("AI intent judgment is session-aware, semantic, and never falls back to keyword regex", () => {
   const aiIntentSrc = extractFn("_aiIntentProfile");
   assert.doesNotMatch(aiIntentSrc, /_pickCheapModel/, "意图判定用用户选择的模型，不降级廉价模型");
-  assert.match(aiIntentSrc, /_billableAiComplete\(config, /, "直接用用户 config 里的模型发起判定");
+  assert.match(aiIntentSrc, /const intentConfig = \{ \.\.\.\(config \|\| \{\}\) \}/,
+    "意图判定必须保留用户选择的模型与网关配置");
+  assert.match(aiIntentSrc, /delete intentConfig\[key\]/,
+    "辅助判定不能继承主回答的深度思考预算");
+  assert.match(aiIntentSrc, /_billableAiComplete\(intentConfig, /,
+    "意图判定仍通过统一计费调用发往用户选择的模型");
+  assert.doesNotMatch(aiIntentSrc, /for \(let attempt = 0; attempt < 3/,
+    "底层网关已有有界重试，意图判定不能再叠一层重试风暴");
   assert.match(aiIntentSrc, /Promise\.race/, "判定调用必须有超时上限");
-  assert.match(aiIntentSrc, /setTimeout\(\(\) => r\(""\), 8000\)/, "超时预算 8s，绝不阻断发送");
+  assert.match(aiIntentSrc, /timer = setTimeout\(\(\) => resolve\(null\), 8000\)/,
+    "8s 只限制前台采用窗口，绝不阻断发送");
+  assert.doesNotMatch(aiIntentSrc, /backend\.cancelAi|acceptResult\s*=\s*false/,
+    "前台超时不能取消或废弃仍在运行的物理判定");
   assert.match(aiIntentSrc, /_safeJsonLoose/);
   assert.match(aiIntentSrc, /需要数据库但用户没说出“数据库”也必须识别/, "数据策略必须从产品行为推理，不能等关键词");
   assert.match(aiIntentSrc, /禁止通过关键词表、正则/);
@@ -6348,6 +6294,8 @@ test("AI intent judgment is session-aware, semantic, and never falls back to key
   assert.match(aiIntentSrc, /michael_design_2_5_existing/);
   assert.match(aiIntentSrc, /orchestrationMode=solo\/staged_roles\/parallel_roles/);
   assert.match(aiIntentSrc, /不得把架构歧义直接交给写入 worker/);
+  assert.match(extractFn("sendPrompt"), /effectiveMode === "chat"[\s\S]{0,80}Promise\.resolve\(null\)/,
+    "纯 Chat 不应在主回答前额外调用一次意图模型");
 
   const dims = ["database", "databaseOps", "dataModel", "persistence", "needsReferences",
     "businessLogic", "businessRisk", "securityRisk", "architectureQuality",
@@ -6417,6 +6365,10 @@ test("AI intent judgment is session-aware, semantic, and never falls back to key
   assert.equal(fallback.database, false, "判定不在就是没意图，不许拿正则值充数");
   assert.equal(fallback.databaseOps, false);
   assert.equal(fallback.intentSource, "none");
+  const agentFallback = merge({ ...base, _isAgentMode: true }, null, "我的项目是干嘛的？");
+  assert.equal(agentFallback.workspaceAction, "modify",
+    "Agent classifier outage must fail open to a tool-capable workspace profile");
+  assert.equal(agentFallback.applies, true);
   // 已有同会话确认目标时，超时保留目标和维度，不能让“继续”瞬间失忆。
   const inherited = merge(base, null, "继续", {
     semantic: { goal: "修复登录偶发卡死", action: "debug", target: "登录请求" },
@@ -6441,21 +6393,28 @@ test("AI intent judgment is session-aware, semantic, and never falls back to key
     "本地起始画像只能抽取精确事实，不能解释数据库/UI 意图",
   );
 
-  // 发送管线接线：所有 Agent 输入先走同一语义路径，预取/single-flight 消除重复等待。
+  // 发送管线接线：所有 Agent 输入先走同一语义路径，物理 single-flight 与主回答并行。
   assert.match(SRC, /const _turnEngineeringEarly = _semanticEngineeringEvidence\(text\);/,
     "正常发送必须从非意图事实壳开始");
   assert.doesNotMatch(SRC, /const _turnEngineeringEarly = _engineeringTaskProfile\(text\);/,
     "正常发送不能回到关键词画像");
   assert.match(SRC, /const _turnIntentContext = _aiIntentContextForTurn\(sess, text,/);
   assert.match(SRC, /_aiIntentProfile\(text, config, sess, _turnIntentContext\)/);
-  assert.match(SRC, /_turnEngineeringResolved = _mergeAiIntentProfile\(_turnEngineeringEarly, _turnIntentVerdict, text, sess\._intentState\);/);
-  assert.match(SRC, /_commitAiIntentState\(sess, _turnIntentVerdict, text, _turnIntentContext\)/);
+  const sendSrc = extractFn("sendPrompt");
+  assert.doesNotMatch(sendSrc, /await\s+_aiIntentPromise|_turnIntentVerdict/,
+    "正常发送不能串行等待意图判定");
+  assert.match(sendSrc, /_turnEngineeringResolved = _engineeringProfileWithAiIntent\(text, sess, _turnIntentContext\)/,
+    "发送只同步采用已经命中的精确缓存，否则保持 Agent fail-open");
+  assert.match(sendSrc, /intentState: _turnIntentState/,
+    "迟到裁决由 run 自己持有并在后续边界采用");
   assert.match(SRC, /const _uiTurnEngineering = _turnEngineeringResolved;/);
   assert.match(SRC, /const _turnEngineering = _turnEngineeringResolved;/);
-    assert.match(SRC, /const _engineeringProfile = _engineeringProfileWithAiIntent\(task, session\);[\s\S]*?run\.engineering = _engineeringProfile;/,
-      "run.engineering 必须来自会话感知的语义画像（提前计算供思考钳位复用，同一次判定不重复调用）");
+  assert.match(sendSrc, /engineering: _turnEngineeringResolved/,
+    "发送阶段已经解析的画像必须显式传入 Agent 循环");
+  assert.match(extractFn("_runAgenticLoop"), /const _engineeringProfile = engineering \|\| _engineeringProfileWithAiIntent\(task, session\);[\s\S]*?run\.engineering = _engineeringProfile;/,
+    "Agent 循环必须优先复用同一份画像，分类器超时时不能二次计算丢掉 Agent fail-open 状态");
   assert.match(SRC, /const profile = profileOverride \|\| _engineeringProfileWithAiIntent\(query\);/);
-  assert.match(SRC, /_agentContextSnapshotForTurn\(text, _curRoot, _turnEngineeringResolved\)/,
+  assert.match(SRC, /_agentContextSnapshotForTurn\(text, _curRoot, _turnEngineeringResolved, \{ coldWaitMs: 1200 \}\)/,
     "首轮项目上下文必须消费本轮已解析语义画像，不能重新做无会话判定");
   assert.match(SRC, /const _steerVerdict = await _steerIntentTask;[\s\S]*_mergeAiIntentProfile\([\s\S]*_semanticEngineeringEvidence/,
     "实时引导必须等语义决策生效后再选择下一轮架构/工具路径");
@@ -6600,18 +6559,15 @@ test("自动改错字只服务用户亲手打字，绝不碰 agent 流式预览�
     "onDidChangeModelContent/onDidChangeMarkers/_runAutoCorrections 都要接线");
 });
 
-test("断流续写抢救：被掩断的写入内容喂回重试轮，禁止从零重写", () => {
-  // 上游把 write_file 参数流掊断时，已流出内容在增量解码缓存里——重试前必须交还
-  // 模型照抄续写，否则模型从零重想重写（实测“写着写着重头再来”）。
+test("截断工具流拒绝执行并停止，不重新请求模型", () => {
   const turn = extractFn("_agentModelTurn");
-  assert.match(turn, /if \(truncated \|\| erroredToolStream\) \{[\s\S]{0,900}\[断流续写\]/,
-    "截断/错误流重试前必须把半截内容交还模型");
-  assert.match(turn, /逐字照抄/, "必须命令照抄已生成部分而非重新设计");
-  assert.match(turn, /if \(parses\) continue;/, "只抢救被掩断的那个调用，参数完整的不重复投喂");
-  assert.match(turn, /if \(_salvageMsg\) \{ const i = messages\.indexOf\(_salvageMsg\); if \(i >= 0\) messages\.splice\(i, 1\); \}/,
-    "抢救消息是轮内修复上下文，收尾必须从持久历史里移除");
-  assert.match(SRC, /请重新输出这次工具调用\|断流续写/,
-    "抢救消息的大段代码不得污染参数默认值推断上下文");
+  assert.match(turn, /const repairableToolArgs = !!argIssue && !turnErr && !truncated;/,
+    "截断流不能伪装成可修复的 schema 错误");
+  assert.match(turn, /const erroredToolStream = !!turnErr && byIndex\.size > 0;/);
+  assert.match(turn, /if \(turnErr\) \{[\s\S]{0,650}\[tool-stream-retry-exhausted\]/,
+    "已有半截 tool delta 时，传输错误也必须直接落为终止错误");
+  assert.doesNotMatch(turn, /\[断流续写\]|逐字照抄|_salvageMsg/,
+    "不得把半截写入重新喂给模型触发第二次付费请求");
 });
 
 test("IP 地区探测只做安装源路由：真实IP优先、时区兑底、缓存防抖", () => {
@@ -6765,6 +6721,7 @@ test("a novice's vague sentence flows through the real chain into professional d
     "businessLogic", "businessRisk", "securityRisk", "architectureQuality",
     "containerOps", "featureCompleteness", "websiteDelivery", "ui", "bug", "implementation"];
   const asked = [];
+  let generatedId = 0;
   const intentText = load("_aiIntentText");
   const intentList = load("_aiIntentList", { _aiIntentText: intentText });
   const contextFingerprint = load("_aiIntentContextFingerprint");
@@ -6778,25 +6735,36 @@ test("a novice's vague sentence flows through the real chain into professional d
     _aiIntentContextFingerprint: contextFingerprint,
     _normalizeAiIntentVerdict: normalizeVerdict,
     _safeJsonLoose: load("_safeJsonLoose"),
+    _newIdeRequestId: () => `req_physical_${++generatedId}`,
     _billableAiComplete: async (config, messages) => {
-      asked.push({ model: config.model, prompt: messages[0].content });
+      asked.push({ model: config.model, requestId: config.requestId, cancelId: config.cancelId, prompt: messages[0].content });
       // 真实模型作风：带 code fence 的 JSON 也必须能解
       return '```json\n{"semantic":{"goal":"交付可用的记账产品","action":"create","target":"记账应用","constraints":["沿用当前项目"],"successCriteria":["能新增并查询账目"],"continuation":"new","confidence":0.94,"ambiguities":[]},"engineering":{"projectState":"existing","deliverySurface":"web_app","changeScope":"project","architectureMode":"extend_existing","dataStrategy":"server","researchMode":"official_and_community","designMode":"michael_design_2_5_existing","workspaceAction":"modify","runtimeActions":["test"],"externalActions":[],"researchTopics":["账目事务与索引"],"rationale":["账目需跨会话查询"]},"dimensions":{"database":true,"databaseOps":true,"dataModel":true,"persistence":true,"needsReferences":true,"businessLogic":true,"featureCompleteness":true,"ui":true,"uiProject":true,"implementation":true,"projectScope":true}}\n```';
     },
   });
   const context = (message, id = "chat-ledger") => ({ sessionId: id, currentMessage: message, priorTask: null, recentTurns: [] });
-  const verdict = await aiIntent("我想搞个能记账的小东西", { model: "claude-opus-4" }, null, context("我想搞个能记账的小东西"));
+  const intentSession = { _cancelIds: new Set() };
+  const verdict = await aiIntent("我想搞个能记账的小东西", { model: "claude-opus-4", requestId: "req_settlement_123" }, intentSession, context("我想搞个能记账的小东西"));
   assert.equal(asked[0].model, "claude-opus-4", "判意图用的就是用户选的模型");
-  // single-flight：同文本并发（预取+发送撞车）只许发一次网络请求、计费一次
+  assert.equal(asked[0].requestId, "req_settlement_123", "intent keeps the enclosing settlement ID");
+  assert.notEqual(asked[0].cancelId, asked[0].requestId, "intent cancellation must address its physical request, not the settlement scope");
+  assert.equal(intentSession._cancelIds.size, 0, "the physical cancel ID is removed once the intent request settles");
+  // single-flight：同文本并发只许发一次网络请求、计费一次
   const [a, b] = await Promise.all([
     aiIntent("帮我把那个订单系统搞完整点", { model: "claude-opus-4" }, null, context("帮我把那个订单系统搞完整点")),
     aiIntent("帮我把那个订单系统搞完整点", { model: "claude-opus-4" }, null, context("帮我把那个订单系统搞完整点")),
   ]);
   assert.deepEqual(a, b);
   assert.equal(asked.length, 2, "两条不同文本共 2 次请求；同文本并发必须被 single-flight 合并");
-  // 输入期投机预取：打字停顿就提前判，发送时零等待
-  assert.match(SRC, /speculative prefetch/, "输入期预取机制必须存在");
-  assert.match(SRC, /_aiIntentProfile\(text, _lastGoodAiConfig, session, context\)\.catch\(/, "预取复用同一会话上下文和上次真实 config");
+  const send = extractFn("sendPrompt");
+  assert.doesNotMatch(send, /await\s+_aiIntentPromise/,
+    "发送不能串行等待意图判定");
+  assert.match(send, /const _turnIntentKey = [\s\S]*?_aiIntentContextFingerprint\(_turnIntentContext\)/,
+    "run 必须持有本轮原始上下文对应的精确 key");
+  assert.match(send, /_aiIntentInflight\.get\(_turnIntentKey\) \|\| _aiIntentPromise/,
+    "run 必须接住 single-flight 中的物理 promise，而不是 8s 前台包装");
+  assert.match(send, /_turnBillingTasks\.push\(_turnIntentExactPromise\)/,
+    "物理意图请求必须继续计入本轮结算任务");
   assert.doesNotMatch(SRC, /function _lexicalRank\(/,
     "tool selection must not be routed through a lexical scoring fallback");
   assert.match(asked[0].prompt, /我想搞个能记账的小东西/);
@@ -6831,6 +6799,75 @@ test("a novice's vague sentence flows through the real chain into professional d
   const buttonLaws = frame("帮我把这个按钮弄成蓝色的", buttonMerged);
   assert.doesNotMatch(buttonLaws, /数据库律/);
   assert.doesNotMatch(buttonLaws, /数据库工业律/);
+});
+
+test("physical cancellation IDs stay separate from gateway settlement IDs", () => {
+  const browserFetch = extractFn("_realAiFetch");
+  assert.match(browserFetch, /const cancelId = String\(config\?\.cancelId \|\| requestId\);/);
+  assert.match(browserFetch, /_browserAiControllers\.set\(cancelId, turnController\)/);
+  assert.match(browserFetch, /_browserAiControllers\.get\(cancelId\) === turnController/);
+  assert.match(browserFetch, /_h\["x-ide-request-id"\] = String\(config\.requestId\)/,
+    "browser settlement metadata must remain requestId-based");
+  const intent = extractFn("_aiIntentProfile");
+  assert.match(intent, /const intentCancelId = _newIdeRequestId\(\);/);
+  assert.match(intent, /intentConfig\.cancelId = intentCancelId;/);
+  assert.match(intent, /session\._cancelIds\.add\(intentCancelId\)/);
+  assert.doesNotMatch(intent, /session\._cancelIds\.add\(intentRequestId\)/);
+  assert.match(TAURI_AI, /pub cancel_id: Option<String>/);
+  assert.match(TAURI_AI, /config\s*\.cancel_id[\s\S]{0,360}config\.request_id/,
+    "Rust must prefer cancelId but preserve requestId as the compatibility fallback");
+});
+
+test("intent foreground timeout leaves the physical request alive and safely adopts a late result", async () => {
+  const cancelled = [];
+  let resolvePhysical = null;
+  const physical = new Promise((resolve) => { resolvePhysical = resolve; });
+  const cache = new Map();
+  const inflight = new Map();
+  const commits = [];
+  const lateVerdict = { semantic: { goal: "继续修复" }, engineering: {}, implementation: true };
+  const profile = load("_aiIntentProfile", {
+    inTauri: true,
+    _AI_INTENT_DIMENSIONS: [],
+    _aiIntentCache: cache,
+    _aiIntentInflight: inflight,
+    _aiIntentContextFingerprint: () => "ctx",
+    _aiIntentCacheKey: () => "intent-key",
+    _normalizeAiIntentVerdict: () => lateVerdict,
+    _safeJsonLoose: () => ({}),
+    _commitAiIntentState: (...args) => { commits.push(args); },
+    _newIdeRequestId: () => "req_physical_timeout_123",
+    _billableAiComplete: () => physical,
+    backend: {
+      cancelAi: async (id) => { cancelled.push(id); },
+    },
+    setTimeout: (fn) => { queueMicrotask(fn); return 1; },
+    clearTimeout: () => {},
+  });
+  const session = { id: "session-timeout", _cancelIds: new Set() };
+  const result = await profile(
+    "继续修复",
+    { model: "test-model", requestId: "req_settlement_scope_123" },
+    session,
+    { sessionId: "session-timeout", currentMessage: "继续修复" },
+  );
+  await Promise.resolve();
+
+  assert.equal(result, null);
+  assert.deepEqual(cancelled, [], "8s foreground timeout must not cancel the physical request");
+  assert.deepEqual([...session._cancelIds], ["req_physical_timeout_123"],
+    "Stop must still be able to cancel the physical request while it is live");
+  const exactPhysical = inflight.get("intent-key");
+  assert.ok(exactPhysical, "single-flight entry must survive the foreground timeout");
+
+  resolvePhysical('{"semantic":{"goal":"继续修复"}}');
+  assert.deepEqual(await exactPhysical, lateVerdict);
+  await Promise.resolve();
+
+  assert.equal(inflight.has("intent-key"), false, "single-flight entry clears only after physical settlement");
+  assert.deepEqual(cache.get("intent-key")?.intents, lateVerdict, "late valid verdict is cached");
+  assert.equal(commits.length, 1, "the latest matching session generation adopts the late verdict");
+  assert.equal(session._cancelIds.size, 0, "physical settlement removes its Stop cancellation ID");
 });
 
 test("automation-era laws: install cleanup desktop gates fire only on AI intent", () => {
@@ -7432,9 +7469,12 @@ test("structured semantic profiles drive planning without lexical classification
   assert.doesNotMatch(SRC, /if \(call && call\.type === "worker"\) return true;/,
     "派 worker 不再无条件要计划：小型并行任务走意图判定，大工程由 _planGateGrandProject 拦");
   assert.match(SRC, /复杂工程写入计划要像老手执行清单/);
-  assert.match(SRC, /UI\/官网\/落地页\/从零前端项目要覆盖/);
-  assert.match(SRC, /shadcn\/ui \+ Radix primitives/);
-  assert.match(SRC, /Tailwind 语义令牌（v4：CSS 入口 @theme inline/);
+  assert.match(SRC, /UI\/官网\/落地页计划要覆盖/);
+  assert.match(SRC, /项目技术栈与现有组件\/theme\/style 入口/);
+  assert.match(SRC, /knowledge_search\(domain=\\"michael-design\\"\)/);
+  assert.match(SRC, /已有网站保留原框架与构建系统/);
+  assert.match(SRC, /只有无网站且无可沿用\/用户指定栈时默认 React \+ Tailwind CSS \+ shadcn\/ui/);
+  assert.match(SRC, /最终采用 Tailwind v4 时才使用 CSS-first 配置/);
   assert.match(SRC, /真实内容源/);
   assert.match(SRC, /Bug\/调试修复必须像老手查案/);
   assert.match(SRC, /同一失败路径或聚焦回归测试/);
@@ -7912,7 +7952,11 @@ test("Agent decision frame gives task-specific old-hand operating rules", () => 
   assert.match(complex, /remote\/upstream/);
   assert.match(complex, /gh_pr_view\/gh_pr_checks\/gh_actions_log/);
   assert.match(complex, /commit\/push\/branch 按钮或页面/);
-  assert.match(complex, /shadcn\/ui \+ Radix/);
+  assert.match(complex, /UI\/前端律/);
+  assert.match(complex, /项目现有框架、组件库、token\/theme\/style 与构建系统/);
+  assert.match(complex, /已有网站不得为了套设计体系迁移框架或新增平行组件体系/);
+  assert.match(complex, /只有项目无网站、无可沿用栈且用户未指定时，默认 React \+ Tailwind CSS \+ shadcn\/ui/);
+  assert.match(complex, /技术栈决策律：\[\[MD_STACK\]\]/);
   assert.match(complex, /run_in_terminal/);
   assert.match(complex, /background_monitor/);
   assert.match(complex, /capture_start\(mode:"isolated_browser"\)/);
@@ -7962,11 +8006,10 @@ test("UI design craft guidance is injected only for front-end work", () => {
   })("修复后端接口", { ui: false, intentSource: "ai" }), "");
   const ui = craft("写一个 SaaS 官网，配色排版布局要好看", { ui: true, uiProject: true });
   assert.match(ui, /前端设计工艺要求/);
-  assert.match(ui, /--background\/--foreground\/--card\/--card-foreground\/--muted\/--muted-foreground/);
-  assert.match(ui, /--primary\/--primary-foreground\/--secondary\/--secondary-foreground/);
-  assert.match(ui, /来源 section → 原色值\/色阶 → semantic role/);
-  assert.match(ui, /Tailwind 色阶/);
-  assert.match(ui, /用户未明确要求暗色时默认浅色\/中性实色/);
+  assert.match(ui, /语义角色至少覆盖 canvas、foreground、surface、muted、primary、secondary、accent、border、focus ring 与 radius/);
+  assert.match(ui, /来源 section → 原始设计值 → semantic role → 项目主题落点/);
+  assert.match(ui, /只有最终采用 Tailwind v4 时才检查 CSS-first 与 cascade layer 规则/);
+  assert.match(ui, /用户未明确要求暗色时沿用项目既有主题/);
   assert.match(ui, /用户未明确要求渐变时最多只允许 1-2 处/);
   assert.match(ui, /display\/heading\/body\/caption 四级/);
   assert.match(ui, /禁止默认 Hero\/Features\/Pricing\/CTA\/Footer/);
@@ -7974,16 +8017,18 @@ test("UI design craft guidance is injected only for front-end work", () => {
   assert.match(ui, /数据库=不需要 \/ 本地持久化 \/ 服务端数据库/);
   assert.match(ui, /至少 3 个可加载媒体资源/);
   assert.match(ui, /真实头像图片/);
-  assert.match(ui, /bg-primary\/text-primary-foreground/);
+  assert.match(ui, /业务组件必须通过项目现有 API\/变量\/主题角色真实消费/);
   assert.match(ui, /移动端必须降低位移/);
   assert.match(ui, /标志性高级动效/);
   assert.match(ui, /中性族 \+ 一个主强调族/);
-  assert.match(ui, /配色统一不等于删除颜色变成黑白线框/);
+  assert.match(ui, /primary\/accent 必须落到至少两类真实角色/);
   assert.match(ui, /5 张用 3\+2 居中/);
   assert.match(ui, /真实重复卡片不能全是透明\/同色底加细 border 的线框/);
   assert.match(ui, /AI 助手用 Bot\/Robot\/Cpu/);
   assert.match(ui, /连接 2 个以上业务区块/);
-  assert.match(ui, /shadcn\/ui \+ Radix primitives/);
+  assert.match(ui, /优先复用项目现有组件库和 primitive/);
+  assert.match(ui, /不得新增平行组件体系/);
+  assert.match(ui, /已有项目实现：先读取 package\/lock\/build config/);
   assert.match(ui, /所有网站\/UI 项目都必须先使用本轮 IDE 已预取的 michael-design 三轨证据/);
   assert.match(ui, /hover\/focus-visible\/active\/disabled\/loading/);
   assert.match(ui, /1440x900 (?:和|与) 390x844/);
@@ -7991,12 +8036,11 @@ test("UI design craft guidance is injected only for front-end work", () => {
   assert.match(marketplace, /交易产品硬约束/);
   assert.match(marketplace, /禁止用 localStorage、假 JSON 或“无后端”替代/);
   const greenfield = craft("创建社区论坛", { ui: true, uiProject: true, fromZeroUiProject: true });
-  // 这条断言原本钉的是旧的、不完整的栈描述（"默认 React/Vite + Tailwind + shadcn/ui/Radix"），
-  // 它漏了 TypeScript、Tailwind 大版本和 shadcn 底座，和 owner 真正上线的站点对不上。
-  // 现在只钉“必须引用唯一权威定义”，栈内容由 _MD_STACK_RULE 的专项测试负责。
-  assert.match(greenfield, /从零网站技术栈硬约束：\[\[MD_STACK\]\]/,
+  assert.match(greenfield, /技术栈决策规则：\[\[MD_STACK\]\]/,
     "greenfield 规则必须引用权威栈常量，而不是自己复述一份会过时的描述");
-  assert.match(greenfield, /禁止再次只生成一个通用 index\.html/);
+  assert.match(greenfield, /无栈网站默认实现/);
+  assert.match(greenfield, /Button\/Dialog\/Tabs/);
+  assert.match(greenfield, /Tailwind 采用 v4 时使用 CSS-first 配置/);
   assert.match(SRC, /const _uiDesignCraft = \(effectiveMode === "agent" && !_agentLightTurn\)\s*\? _uiDesignCraftBlock\(text, _uiTurnEngineering, \{ serverDesignLayersActive: _l0On\(config\) && !!config\.ideSemanticProfile \}\)/,
     "Agent send path must add the UI craft block to front-end turns");
   assert.match(SRC, /_dynPreamble \+ _atContext \+ _modeFrame \+ _decisionFrame \+ _uiDesignCraft \+ _toolHint \+ _expHint/,
@@ -8122,15 +8166,49 @@ test("user-supplied reference sites must be learned and deliberately adapted bef
 });
 
 test("michael-design prefetch starts only from a resolved structured design profile", () => {
-  const preflight = extractFn("_runMichaelDesignPreflight");
-  assert.match(preflight, /!profile\.designKnowledgeRequired/);
-  assert.doesNotMatch(preflight, /_engineeringTaskProfile|keyword|关键词/);
-  // The late-verdict apply logic now lives in _applyLateIntentIfLanded (shared by the
-  // in-loop backfill and the greenfield pre-first-turn wait).
+  const start = extractFn("_startMichaelDesignPreflight");
+  assert.match(start, /run\.mode !== "agent"/);
+  assert.match(start, /profile\.intentSource !== "ai"/,
+    "local/session guesses must never start Michael Design");
+  assert.match(start, /!profile\.designKnowledgeRequired/);
+  assert.match(start, /run\._michaelDesignPreflightPromise/,
+    "one run must own exactly one background retrieval");
+  assert.doesNotMatch(start, /_engineeringTaskProfile|keyword|关键词/);
   const applyLate = extractFn("_applyLateIntentIfLanded");
   assert.match(applyLate, /late\.intentSource !== "ai"/, "only a real (ai) verdict is adopted");
   assert.match(applyLate, /late\.designKnowledgeRequired && !run\._michaelDesignEvidence/);
+  assert.match(applyLate, /_startMichaelDesignPreflight\(\{ run, body, isLive \}\)/);
+  assert.doesNotMatch(applyLate, /await\s+_runMichaelDesignPreflight|await\s+_startMichaelDesignPreflight/,
+    "late intent adoption must not wait on design retrieval");
   assert.doesNotMatch(SRC, /function _engineeringTaskProfile\(/);
+});
+
+test("michael-design background preflight is a run-level single-flight", async () => {
+  let calls = 0;
+  let release = null;
+  const start = load("_startMichaelDesignPreflight", {
+    _runMichaelDesignPreflight: async () => {
+      calls++;
+      await new Promise((resolve) => { release = resolve; });
+      return { required: true, brief: "design brief", results: [] };
+    },
+  });
+  const run = {
+    mode: "agent",
+    engineering: { intentSource: "ai", designKnowledgeRequired: true },
+  };
+  const first = start({ run });
+  const second = start({ run });
+  assert.equal(first, second);
+  await Promise.resolve();
+  assert.equal(calls, 1);
+  release();
+  const result = await first;
+  assert.equal(result.brief, "design brief");
+  assert.equal(run._michaelDesignPreflightResult, result);
+
+  assert.equal(start({ run: { mode: "agent", engineering: { intentSource: "session", designKnowledgeRequired: true } } }), null);
+  assert.equal(start({ run: { mode: "chat", engineering: { intentSource: "ai", designKnowledgeRequired: true } } }), null);
 });
 
 test("successful michael-design hits unlock implementation even when the model omitted the domain argument", () => {
@@ -8217,17 +8295,118 @@ test("michael-design evidence merges palette and media details across bounded se
     merged,
     [],
   );
-  assert.match(brief, /组件\/Tailwind 依据：shadcn\/ui、Radix primitives/);
-  assert.match(brief, /来源 section → shadcn\/Radix primitive 与 variant → Tailwind semantic token\/class/);
+  assert.match(brief, /组件\/variant 依据：shadcn\/ui、Radix primitives/);
+  assert.match(brief, /来源 section → 当前项目组件 primitive\/variant\/API → 当前项目语义 token\/theme\/style → 页面落点/);
 });
 
-test("michael-design is preloaded from the server before an agent plans UI work", () => {
+test("michael-design runs in the background and is injected only at loop boundaries", () => {
   assert.match(SRC, /async function _runMichaelDesignPreflight\(/);
   assert.match(SRC, /domain: "michael-design", query: plan\.query, topK: 6/);
   assert.match(SRC, /await _searchKnowledgeBase\(call\)/);
   assert.match(SRC, /run\._michaelDesignEvidence = _mergeMichaelDesignEvidence/);
   assert.match(SRC, /run\._michaelDesignBrief = brief/);
-  assert.match(SRC, /await _runMichaelDesignPreflight\(\{ run, body, isLive: _live \}\)/);
+  const loop = extractFn("_runAgenticLoop");
+  assert.match(loop, /const _consumeMichaelDesignPreflight = \(\) =>/);
+  assert.match(loop, /const preflight = run\._michaelDesignPreflightResult/);
+  assert.match(loop, /messages\.push\(\{ role: "user", content: preflight\.brief \}\)/,
+    "only the synchronous boundary consumer may mutate provider messages");
+  const startAt = loop.indexOf("_startMichaelDesignPreflight({ run, body, isLive: _live });");
+  const routingAt = loop.indexOf("const initialToolRouting", startAt);
+  const routingJoinAt = loop.indexOf("await initialToolRouting;", routingAt);
+  const consumeAt = loop.indexOf("_consumeMichaelDesignPreflight();", routingJoinAt);
+  assert.ok(startAt >= 0 && routingAt > startAt && routingJoinAt > routingAt && consumeAt > routingJoinAt,
+    "design retrieval starts beside tool routing and is consumed without delaying the initial payload");
+  assert.doesNotMatch(loop, /await\s+_(?:run|start)MichaelDesignPreflight/,
+    "the agent loop must never await Michael Design");
+});
+
+test("every structured UI branch performs real michael-design preflight calls", async () => {
+  const mergeProfile = load("_mergeAiIntentProfile", { _AI_INTENT_DIMENSIONS: [] });
+  const searches = [];
+  const preflight = load("_runMichaelDesignPreflight", {
+    _michaelDesignResearchPlan: () => [
+      { id: "architecture-color", query: "architecture palette", purpose: "architecture" },
+      { id: "motion-responsive", query: "motion responsive", purpose: "motion" },
+      { id: "assets-icons", query: "media semantic icons", purpose: "assets" },
+    ],
+    _searchKnowledgeBase: async (call) => {
+      searches.push(call);
+      return { type: "knowledge", content: "[michael-design] real hit", knowledge: { hitCount: 1, domains: ["michael-design"] } };
+    },
+    _michaelDesignEvidenceFromResult: (call) => ({ query: call.query, hitCount: 1 }),
+    _mergeMichaelDesignEvidence: (prior, next) => ({ ...(prior || {}), ...next }),
+    _michaelDesignBrief: (_plan, evidence) => evidence ? "real michael-design brief" : "",
+    _createToolStep: () => null,
+    _settleToolStep: () => {},
+  });
+  const scenarios = [
+    { name: "greenfield website", projectState: "greenfield", deliverySurface: "website", roleNeeds: ["frontend", "design"] },
+    { name: "existing website", projectState: "existing", deliverySurface: "website", roleNeeds: ["frontend"] },
+    { name: "UI component", projectState: "existing", deliverySurface: "ui_component", roleNeeds: ["frontend"] },
+    { name: "desktop UI", projectState: "existing", deliverySurface: "desktop", roleNeeds: ["frontend"] },
+    { name: "mixed full-stack UI", projectState: "existing", deliverySurface: "mixed", roleNeeds: ["frontend", "backend"] },
+  ];
+  for (const scenario of scenarios) {
+    const engineering = {
+      ...scenario,
+      designMode: "none",
+      workspaceAction: "modify",
+      changeScope: "project",
+      architectureMode: scenario.projectState === "existing" ? "follow_existing" : "design_new",
+    };
+    const profile = mergeProfile({ _isAgentMode: true }, { engineering }, scenario.name);
+    assert.equal(profile.designKnowledgeRequired, true, `${scenario.name} must require Michael Design`);
+    assert.equal(profile.designMode, scenario.projectState === "greenfield"
+      ? "michael_design_2_5_greenfield"
+      : "michael_design_2_5_existing");
+    const start = searches.length;
+    const result = await preflight({ run: { mode: "agent", engineering: profile, _originalText: scenario.name } });
+    assert.equal(result.required, true);
+    assert.equal(result.brief, "real michael-design brief");
+    const calls = searches.slice(start);
+    assert.equal(calls.length, 3, `${scenario.name} must execute all three bounded research tracks`);
+    for (const call of calls) {
+      assert.deepEqual(
+        { type: call.type, domain: call.domain, topK: call.topK, preflight: call._michaelDesignPreflight },
+        { type: "knowledge", domain: "michael-design", topK: 6, preflight: true },
+      );
+    }
+  }
+});
+
+test("michael-design runs its three real research tracks concurrently and merges in plan order", async () => {
+  const releases = [];
+  const started = [];
+  const preflight = load("_runMichaelDesignPreflight", {
+    _michaelDesignResearchPlan: () => [
+      { id: "architecture-color", query: "architecture palette", purpose: "architecture" },
+      { id: "motion-responsive", query: "motion responsive", purpose: "motion" },
+      { id: "assets-icons", query: "media semantic icons", purpose: "assets" },
+    ],
+    _searchKnowledgeBase: async (call) => {
+      started.push(call.query);
+      await new Promise((resolve) => releases.push(resolve));
+      return { type: "knowledge", content: call.query, knowledge: { hitCount: 1, domains: ["michael-design"] } };
+    },
+    _michaelDesignEvidenceFromResult: (call) => ({ query: call.query, hitCount: 1 }),
+    _mergeMichaelDesignEvidence: (prior, next) => ({
+      hitCount: (prior?.hitCount || 0) + next.hitCount,
+      order: [...(prior?.order || []), next.query],
+    }),
+    _michaelDesignBrief: () => "brief",
+    _createToolStep: () => null,
+    _settleToolStep: () => {},
+  });
+  const pending = preflight({
+    run: { mode: "agent", engineering: { designKnowledgeRequired: true }, _originalText: "build a site" },
+  });
+  await Promise.resolve();
+  assert.deepEqual(started, ["architecture palette", "motion responsive", "media semantic icons"],
+    "all three server searches must start before any one of them finishes");
+  for (const release of releases) release();
+  const result = await pending;
+  assert.deepEqual(result.results.map((item) => item.plan.id), ["architecture-color", "motion-responsive", "assets-icons"]);
+  assert.deepEqual(result.evidence.order, started, "evidence merge order must stay deterministic");
 });
 
 test("knowledge retrieval uses the configured server endpoint and returns structured michael-design hits", async () => {
@@ -8287,7 +8466,7 @@ test("michael-design research is orchestrated by coverage instead of one generic
   assert.match(shallowGaps, /移动端动效/);
   assert.match(shallowGaps, /图片\/视频\/GIF/);
   assert.match(shallowGaps, /语义图标/);
-  assert.match(shallowGaps, /shadcn\/ui、Radix/);
+  assert.match(shallowGaps, /组件 primitive、variant 与状态体系/);
   assert.match(shallowGaps, /三轨分主题检索/);
   const completeEvidence = {
     researchQueries: tracks.map((item) => item.query),
@@ -8482,12 +8661,6 @@ test("front-end build tasks defer design and browser schemas until tool search",
   const schema = (name) => ({ type: "function", function: { name } });
   const select = load("_selectInitialTools", {
     activePath: "",
-    _TOOL_BUNDLES: {
-      browser: { tools: ["browser", "screenshot"] },
-      design: { tools: ["design_board", "preview_choices", "visual_compare"] },
-      db: { tools: ["db_query"] },
-    },
-    _DEFERRED_TOOL_NAMES: new Set(["browser", "screenshot", "design_board", "preview_choices", "visual_compare", "db_query"]),
     _SEARCH_TOOLS_SCHEMA: schema("search_tools"),
     _buildAgentToolSchemas: () => ["browser", "screenshot", "design_board", "preview_choices", "visual_compare", "db_query", "read_file"].map(schema),
   });
@@ -8502,13 +8675,6 @@ test("reference-site UI tasks keep learning and fetch schemas lazy", () => {
   const schema = (name) => ({ type: "function", function: { name } });
   const select = load("_selectInitialTools", {
     activePath: "",
-    _TOOL_BUNDLES: {
-      browser: { tools: ["browser", "screenshot"] },
-      design: { tools: ["learn_design"] },
-      net: { tools: ["web_fetch"] },
-      db: { tools: ["db_query"] },
-    },
-    _DEFERRED_TOOL_NAMES: new Set(["browser", "screenshot", "learn_design", "web_fetch", "db_query"]),
     _SEARCH_TOOLS_SCHEMA: schema("search_tools"),
     _buildAgentToolSchemas: () => ["browser", "screenshot", "learn_design", "web_fetch", "knowledge_search", "db_query", "read_file"].map(schema),
   });
@@ -8523,12 +8689,6 @@ test("front-end bug tasks keep browser automation deferred until diagnostics and
   const schema = (name) => ({ type: "function", function: { name } });
   const select = load("_selectInitialTools", {
     activePath: "src/pages/dashboard.tsx",
-    _TOOL_BUNDLES: {
-      browser: { tools: ["browser", "screenshot"] },
-      design: { tools: ["design_board", "preview_choices", "visual_compare"] },
-      db: { tools: ["db_query"] },
-    },
-    _DEFERRED_TOOL_NAMES: new Set(["browser", "screenshot", "design_board", "preview_choices", "visual_compare", "db_query"]),
     _SEARCH_TOOLS_SCHEMA: schema("search_tools"),
     _buildAgentToolSchemas: () => ["browser", "screenshot", "design_board", "preview_choices", "visual_compare", "db_query", "http_request", "read_file"].map(schema),
   });
@@ -8543,12 +8703,6 @@ test("database-oriented tasks defer database and browser schemas", () => {
   const schema = (name) => ({ type: "function", function: { name } });
   const select = load("_selectInitialTools", {
     activePath: "",
-    _TOOL_BUNDLES: {
-      browser: { tools: ["browser", "screenshot"] },
-      design: { tools: ["design_board", "preview_choices", "visual_compare"] },
-      db: { tools: ["db_query"] },
-    },
-    _DEFERRED_TOOL_NAMES: new Set(["browser", "screenshot", "design_board", "preview_choices", "visual_compare", "db_query"]),
     _SEARCH_TOOLS_SCHEMA: schema("search_tools"),
     _buildAgentToolSchemas: () => ["browser", "screenshot", "design_board", "preview_choices", "visual_compare", "db_query", "read_file"].map(schema),
   });
@@ -8562,13 +8716,6 @@ test("Git and GitHub PR schemas remain lazy for both remote and local requests",
   const schema = (name) => ({ type: "function", function: { name } });
   const select = load("_selectInitialTools", {
     activePath: "",
-    _TOOL_BUNDLES: {
-      browser: { tools: ["browser", "screenshot"] },
-      design: { tools: ["design_board", "preview_choices", "visual_compare"] },
-      db: { tools: ["db_query"] },
-      github: { tools: ["gh_pr_create", "gh_pr_view", "gh_pr_checks", "gh_actions_log"] },
-    },
-    _DEFERRED_TOOL_NAMES: new Set(["browser", "screenshot", "design_board", "preview_choices", "visual_compare", "db_query", "gh_pr_create", "gh_pr_view", "gh_pr_checks", "gh_actions_log"]),
     _SEARCH_TOOLS_SCHEMA: schema("search_tools"),
     _buildAgentToolSchemas: () => ["git_status", "git_diff", "git_log", "git_commit", "git_push", "gh_pr_create", "gh_pr_view", "gh_pr_checks", "gh_actions_log", "read_file"].map(schema),
   });
@@ -8632,8 +8779,18 @@ test("tool hints stay capability-neutral while the semantic orchestrator control
     "prompt hint must not hard-code a second tool routing table");
   assert.doesNotMatch(extractFn("_buildToolHint"), /_profileToolPriorities|filter\(|\.bug/);
   const loop = extractFn("_runAgenticLoop");
-  assert.doesNotMatch(loop, /await _routeAgentTools\("initial", "", task\)/,
-    "the first agent turn must not wait for an extra routing-model request");
+  assert.match(loop, /const initialToolRouting = isAgent[\s\S]{0,240}_routeAgentTools\(\s*"initial"/,
+    "the first agent turn must launch semantic routing immediately");
+  assert.match(loop, /Promise\.race\(\[[\s\S]{0,300}setTimeout\(\(\) => resolve\(null\), 3000\)/,
+    "initial routing must keep its strict three-second bound");
+  const mdStartAt = loop.indexOf("_startMichaelDesignPreflight({ run, body, isLive: _live });");
+  const routingStartAt = loop.indexOf("const initialToolRouting", mdStartAt);
+  const routingJoinAt = loop.indexOf("await initialToolRouting;", routingStartAt);
+  const mdConsumeAt = loop.indexOf("_consumeMichaelDesignPreflight();", routingJoinAt);
+  assert.ok(mdStartAt >= 0 && routingStartAt > mdStartAt && routingJoinAt > routingStartAt && mdConsumeAt > routingJoinAt,
+    "specialist retrieval must start in the background and be consumed at a stable boundary");
+  assert.doesNotMatch(loop, /await\s+_runMichaelDesignPreflight|await\s+_startMichaelDesignPreflight/,
+    "Michael Design retrieval must not delay the first provider payload");
   assert.match(loop, /await _routeAgentTools\("steering", "", _steerSemanticText\)/,
     "mid-run user intent changes must reroute tools immediately");
   // The checkpoint still fires per novel batch, but OFF the serial path: awaiting it let
@@ -8656,19 +8813,6 @@ test("task profiles do not expand the minimal first-turn tool schema payload", (
   const schema = (name) => ({ type: "function", function: { name } });
   const select = load("_selectInitialTools", {
     activePath: "",
-    _TOOL_BUNDLES: {
-      browser: { tools: ["browser", "screenshot"] },
-      design: { tools: ["design_board", "preview_choices", "visual_compare"] },
-      db: { tools: ["db_query"] },
-      github: { tools: ["gh_pr_create", "gh_pr_view", "gh_pr_checks", "gh_actions_log"] },
-    },
-    _DEFERRED_TOOL_NAMES: new Set([
-      "browser", "screenshot", "capture_start", "capture_flows", "capture_stop", "capture_replay",
-      "http_request", "package_search", "github_repo", "developer_community_search",
-      "generate_wiki", "web_search", "web_fetch",
-      "design_board", "preview_choices", "visual_compare", "db_query",
-      "gh_pr_create", "gh_pr_view", "gh_pr_checks", "gh_actions_log",
-    ]),
     _SEARCH_TOOLS_SCHEMA: schema("search_tools"),
     _buildAgentToolSchemas: () => [
       "read_file", "browser", "screenshot", "capture_start", "capture_flows", "capture_stop",
@@ -9279,11 +9423,6 @@ test("auto-detected verification never downloads an unpinned eslint or tsc", asy
 
 test("external source tools stay real but load on demand", () => {
   const schema = (name) => ({ type: "function", function: { name } });
-  const bundles = {
-    net: { tools: ["web_search", "web_fetch"] },
-    resources: { tools: ["developer_community_search", "github_search", "reddit_search"] },
-  };
-  const deferred = new Set(Object.values(bundles).flatMap((bundle) => bundle.tools));
   const searchSchema = schema("search_tools");
   const select = load("_selectInitialTools", {
     _buildAgentToolSchemas: () => [
@@ -9294,11 +9433,8 @@ test("external source tools stay real but load on demand", () => {
       schema("web_fetch"),
       schema("developer_community_search"),
       schema("github_search"),
-      schema("reddit_search"),
     ],
     activePath: "",
-    _TOOL_BUNDLES: bundles,
-    _DEFERRED_TOOL_NAMES: deferred,
     _SEARCH_TOOLS_SCHEMA: searchSchema,
   });
   const names = select(true, "fix this project").map((tool) => tool.function.name);
@@ -9307,7 +9443,8 @@ test("external source tools stay real but load on demand", () => {
   assert.ok(!names.includes("local_discovery"), "domain tools load only when the task profile requests them");
   assert.ok(!names.includes("web_search"), "public web search requires a concrete evidence gap");
   assert.ok(!names.includes("developer_community_search"), "community search is not a first-turn reflex");
-  assert.match(SRC, /resources:\s*\{ tools:/);
+  assert.doesNotMatch(SRC, /_TOOL_BUNDLES|_DEFERRED_TOOL_NAMES/,
+    "lazy loading must derive from the live registry instead of a second static tool table");
 });
 
 test("plain Agent turns keep project diagnostics, mutation, terminal, and Git schemas on demand", () => {
@@ -9322,7 +9459,6 @@ test("plain Agent turns keep project diagnostics, mutation, terminal, and Git sc
   ].map(schema);
   const select = load("_selectInitialTools", {
     activePath: "",
-    _TOOL_BUNDLES: { browser: { tools: [] }, db: { tools: [] }, github: { tools: [] } },
     _SEARCH_TOOLS_SCHEMA: schema("search_tools"),
     _buildAgentToolSchemas: () => catalog,
   });
@@ -9353,7 +9489,6 @@ test("engineering Agent turns keep evidence and mutation schemas on demand", () 
   ].map(schema);
   const select = load("_selectInitialTools", {
     activePath: "src/auth.ts",
-    _TOOL_BUNDLES: { browser: { tools: [] }, db: { tools: [] }, github: { tools: [] } },
     _SEARCH_TOOLS_SCHEMA: schema("search_tools"),
     _buildAgentToolSchemas: () => catalog,
   });
@@ -9398,7 +9533,6 @@ test("large MCP catalogs stay out of the first turn but remain exactly loadable"
   const staticTools = ["read_file", "search", "knowledge_search", "browser"].map((name) => schema(name));
   const select = load("_selectInitialTools", {
     activePath: "",
-    _TOOL_BUNDLES: { browser: { tools: ["browser"] }, db: { tools: [] }, github: { tools: [] } },
     _SEARCH_TOOLS_SCHEMA: schema("search_tools"),
     _buildAgentToolSchemas: () => [...staticTools, ...mcp],
   });
@@ -9420,7 +9554,6 @@ test("read-only roles receive distinct first-turn tool contracts", () => {
   ].map(schema);
   const select = load("_selectInitialTools", {
     activePath: "",
-    _TOOL_BUNDLES: { browser: { tools: ["browser"] }, db: { tools: [] }, github: { tools: [] } },
     _SEARCH_TOOLS_SCHEMA: schema("search_tools"),
     _buildAgentToolSchemas: () => catalog,
   });
@@ -10006,44 +10139,126 @@ test("read logs tool is exposed as read-only evidence", () => {
   assert.match(readLogsTool.function.description, /只读证据工具|read-only evidence/i);
 });
 
-test("stream deadlines trigger exactly the fast-retry path", () => {
+test("each of the ten model retries gets one sixty-second pre-progress deadline", () => {
   const stalled = load("_isStalledAiError");
-  assert.equal(stalled("模型在 35 秒内没有生成有效内容，已停止本轮，请重试。"), true);
-  assert.equal(stalled("模型连续 45 秒没有继续生成有效内容，已停止本轮，请重试。"), true);
-  assert.equal(stalled("AI request timed out waiting for response headers after 20 seconds"), true);
+  assert.equal(stalled("模型在 60 秒内没有生成有效内容，已停止本轮，请重试。"), true);
+  assert.equal(stalled("模型连续 60 秒没有继续生成有效内容，已停止本轮，请重试。"), true);
+  assert.equal(stalled("AI request timed out waiting for response headers after 60 seconds"), true);
   assert.equal(stalled("429 rate limit"), false);
   const strip = load("_stripAiRetryPrefix");
   const providerGateway = load("_isProviderGatewayStatusError", { _stripAiRetryPrefix: strip });
   const retryable = load("_isRetryableAiError", { _isProviderGatewayStatusError: providerGateway, _stripAiRetryPrefix: strip, _isRateLimitedAiError: load("_isRateLimitedAiError", { _stripAiRetryPrefix: strip }) });
-  assert.equal(retryable("模型在 35 秒内没有生成有效内容"), true);
-  assert.match(SRC, /const retryLimit = prefixInvalid \? 1 : \(payloadTooLarge \? 1 : \(argIssue \? 3 : \(stalled \? 0/,
-    "a completed transport watchdog must not be replayed by the outer Agent loop");
-  assert.match(TAURI_AI, /const RESPONSE_HEADERS_TIMEOUT_SECS: u64 = 15;/);
+  assert.equal(retryable("模型在 60 秒内没有生成有效内容"), true);
+  assert.match(SRC, /const repairableToolArgs = !!argIssue && !turnErr && !truncated;[\s\S]{0,100}const retryLimit = repairableToolArgs \? 3 : 0/,
+    "tool-schema repair keeps its independent three-response bound");
+  assert.doesNotMatch(SRC, /_isTransientTurnErr\(turn\.error\)|_waitForAiRecovery\(/,
+    "the outer Agent loop must not multiply the bounded request policy");
+  assert.match(SRC, /const _AI_MODEL_RETRY_LIMIT = 10;/);
+  assert.match(SRC, /const _AI_MODEL_ATTEMPT_TIMEOUT_MS = 60_000;/);
+  assert.match(TAURI_AI, /const RESPONSE_HEADERS_TIMEOUT_SECS: u64 = 60;/);
+  assert.match(TAURI_AI, /const STANDARD_FIRST_STREAM_PROGRESS_TIMEOUT_SECS: u64 = 60;/);
+  assert.match(TAURI_AI, /const STANDARD_EMPTY_STREAM_PROGRESS_TIMEOUT_SECS: u64 = 60;/);
   assert.doesNotMatch(TAURI_AI, /HIGH_RESPONSE_HEADERS_TIMEOUT_SECS|EXTENDED_RESPONSE_HEADERS_TIMEOUT_SECS/,
-    "reasoning effort must not turn a broken transport into a 45/90-second wait");
-  const browserTimeouts = load("_browserAiStreamTimeouts");
-  assert.deepEqual(browserTimeouts({ thinkingEffort: "medium" }), { firstProgressMs: 35_000, emptyStreamMs: 18_000, stallMs: 45_000 });
-  assert.deepEqual(browserTimeouts({ thinkingEffort: "high" }), { firstProgressMs: 45_000, emptyStreamMs: 45_000, stallMs: 90_000 });
+    "reasoning effort must not change the per-attempt response-header deadline");
+  const browserTimeouts = load("_browserAiStreamTimeouts", { _AI_MODEL_ATTEMPT_TIMEOUT_MS: 60_000 });
+  assert.deepEqual(browserTimeouts({ thinkingEffort: "medium" }), { firstProgressMs: 60_000, emptyStreamMs: 60_000, stallMs: 60_000 });
+  assert.deepEqual(browserTimeouts({ thinkingEffort: "high" }), { firstProgressMs: 60_000, emptyStreamMs: 60_000, stallMs: 90_000 });
   assert.deepEqual(browserTimeouts({ thinkingEffort: "xhigh" }), { firstProgressMs: 60_000, emptyStreamMs: 60_000, stallMs: 120_000 });
   assert.match(SRC, /readWithProgressDeadline/,
     "the browser SSE reader must use the same bounded useful-progress watchdog as desktop");
+  assert.match(SRC, /const progressStartedAt = streamStarted;/,
+    "response headers and empty control frames must not restart the browser attempt clock");
+  assert.match(TAURI_AI, /StreamProgressDeadline::new\(stream_started, timeouts\)/,
+    "desktop first-progress timing must start when the physical request starts");
 });
 
 test("visible streams paint all received bytes without proportional catch-up", () => {
   const agentTurn = extractFn("_agentModelTurn");
+  const plainTurn = extractFn("sendPrompt");
   const writePreview = extractFn("_scheduleWritePreviewFlush");
   const followUp = extractFn("_agentFollowUp");
 
   assert.match(SRC, /_shown = acc\.length;\s*renderStream\(acc\);/,
     "plain chat must reveal the complete received snapshot");
+  assert.match(plainTurn, /let flushTimer = 0;\s*let flushRaf = 0;/,
+    "plain Chat must track its timeout and animation-frame handles separately");
+  assert.match(plainTurn, /flushTimer = setTimeout\(\(\) => \{\s*flushTimer = 0;[\s\S]{0,100}queueStreamFrame\(\)/,
+    "plain Chat must release the throttle timer before it queues a paint");
+  assert.match(plainTurn, /document\.hidden[\s\S]{0,100}flushStream\(\)/,
+    "a hidden WebKit document must paint synchronously instead of buffering behind a suspended rAF");
+  assert.match(plainTurn, /cancelAnimationFrame\(flushRaf\)/,
+    "plain Chat settlement must cancel any delayed animation frame");
   assert.match(agentTurn, /_shownLen = acc\.length;/,
     "Agent replies must reveal the complete received snapshot");
+  assert.match(agentTurn, /let flushTimer = 0;\s*let flushRaf = 0;/,
+    "Agent streaming must track timeout and animation-frame handles separately");
+  assert.match(agentTurn, /flushTimer = setTimeout\(\(\) => \{\s*flushTimer = 0;[\s\S]{0,100}queueRenderFrame\(\)/,
+    "an elapsed throttle timeout must release its slot before queuing the paint");
+  assert.match(agentTurn, /cancelAnimationFrame\(flushRaf\)/,
+    "settlement must cancel a delayed animation frame so it cannot repaint stale content");
   assert.match(writePreview, /entry\._shownLen = target\.length;/,
     "live write previews must reveal the complete decoded snapshot");
   assert.doesNotMatch(writePreview, /Math\.ceil\(remaining \/ 3\)|remaining \* 0\./,
     "write previews must not restore proportional typewriter lag");
   assert.match(followUp, /Math\.max\(0, 90 - \(Date\.now\(\) - _ffLast\)\)/,
     "tool follow-up replies render on the throttled streaming cadence (≥90ms, 同主流式路径)");
+});
+
+test("retry timeline keeps response-header latency scoped to each physical attempt", () => {
+  const createTimeline = load("_createAgentTimeline");
+  const startTurn = load("_agentTimelineStartTurn", {
+    _IDE_TIMELINE_STEP_KINDS: new Set(["intent", "main", "aux", "subagent", "repair", "learning", "chat"]),
+  });
+  const startAttempt = load("_agentTimelineStartAttempt");
+  const activeAttempt = load("_agentTimelineActiveAttempt", { _agentTimelineStartAttempt: startAttempt });
+  const recordMetric = load("_agentTimelineRecordMetric", { _agentTimelineActiveAttempt: activeAttempt });
+  const markProgress = load("_agentTimelineMarkProgress", { _agentTimelineActiveAttempt: activeAttempt });
+
+  const timeline = createTimeline("run_timeline", 1_000);
+  const turn = startTurn(timeline, { requestId: "req_timeline", kind: "chat", startedAt: 1_100 });
+
+  startAttempt(turn, 1_100);
+  recordMetric(timeline, turn, "requestStarted", 0, 1_100);
+  recordMetric(timeline, turn, "responseHeaders", 60_000, 61_100);
+  recordMetric(timeline, turn, "gatewayRetry", 0, 61_100, { attempt: 1 });
+
+  startAttempt(turn, 62_000);
+  recordMetric(timeline, turn, "requestStarted", 0, 62_000);
+  recordMetric(timeline, turn, "responseHeaders", 3_180, 65_180);
+  markProgress(timeline, turn, "token", 65_200);
+
+  assert.equal(turn.attempts.length, 2);
+  assert.equal(turn.attempts[0].responseHeadersAt - turn.attempts[0].requestStartedAt, 60_000);
+  assert.equal(turn.attempts[1].responseHeadersAt - turn.attempts[1].requestStartedAt, 3_180,
+    "the retry's 3.18s header time must not inherit the first attempt's minute");
+  assert.equal(turn.responseHeadersAt, 65_180, "the turn summary points at the successful attempt");
+  assert.equal(timeline.firstModelProgressAt - timeline.startedAt, 64_200,
+    "task-level first progress still includes the earlier failed attempt");
+});
+
+test("send preflight starts independent work without waiting for semantic routing", () => {
+  const send = extractFn("sendPrompt");
+  const workspaceAt = send.indexOf("const _workspacePreflightPromise");
+  const osAt = send.indexOf("const _osDetailPromise");
+  const staleAt = send.indexOf("const _staleEvidencePromise");
+  const compactAt = send.indexOf("const compactionTask");
+  const joinAt = send.indexOf("const [snapshot, staleEvidence] = await Promise.all([");
+
+  for (const [label, at] of [["workspace", workspaceAt], ["OS", osAt], ["stale evidence", staleAt], ["history compaction", compactAt]]) {
+    assert.ok(at >= 0 && at < joinAt, `${label} must start before the first required preflight join`);
+  }
+  assert.doesNotMatch(send, /await\s+_aiIntentPromise|const _turnIntentVerdict = await/,
+    "the visible request must not wait for the auxiliary classifier");
+  assert.match(send, /const _turnIntentExactPromise = [\s\S]{0,220}_aiIntentInflight\.get\(_turnIntentKey\)/,
+    "the run retains the exact physical classifier promise for later boundaries");
+  assert.match(send, /intentState: _turnIntentState/,
+    "the exact key, context, promise and result state must travel into the agent run");
+  assert.doesNotMatch(send, /await\s+_compactHistoryIfHuge\(/,
+    "LLM history compaction must never add its old 20-second serial delay to first output");
+  assert.match(send, /_agentContextSnapshotForTurn\(text, _curRoot, _turnEngineeringResolved, \{ coldWaitMs: 1200 \}\)/,
+    "a cold workspace gets only a short foreground digest window while warm-up continues");
+  assert.match(send, /const \[snapshot, staleEvidence\] = await Promise\.all\(\[/,
+    "workspace snapshot and stale-evidence checks should settle together");
 });
 
 test("streaming write paths activate only after the complete JSON string arrives", () => {
@@ -11143,31 +11358,19 @@ test("adjacent run_worker calls execute as a parallel segment, still barriered f
   assert.ok(events.indexOf("worker4") < events.indexOf("read5"), "worker 段完成后才轮到后续读");
 });
 
-test("Michael Design 技术栈只有一个权威定义，且和真实上线站点一致", () => {
-  // 事实来源是 owner 真正上线的站点（package "michael-ide-site"）：
-  // Vite 7 + React 19 + TS 5.9 + Tailwind v4(@tailwindcss/vite, CSS-first) + shadcn/ui
-  // (Radix + CVA + clsx + tailwind-merge 的 cn() + lucide-react)，且项目里没有
-  // tailwind.config.* / postcss.config.js / postcss / autoprefixer。
+test("Michael Design 只有一个条件化技术栈规则", () => {
   const rule = SRC.slice(SRC.indexOf("const _MD_STACK_RULE"), SRC.indexOf("const _AGENT_ROLE_BLOCKS"));
   assert.ok(rule, "必须有唯一权威的 _MD_STACK_RULE");
-  for (const must of ["React 19", "TypeScript", "Tailwind v4", "shadcn/ui",
-                      "@tailwindcss/vite", "class-variance-authority", "tailwind-merge",
-                      "clsx", "lucide-react", "@radix-ui/react-", "cn()"]) {
-    assert.ok(rule.includes(must), `权威栈缺少真实站点确实在用的：${must}`);
-  }
-  // 最关键的否定规则：真实站点里根本没有这些文件/依赖，建了就是另一套项目
-  assert.match(rule, /不要】新建 tailwind\.config/, "必须明确禁止建 tailwind.config（v3 做法）");
-  assert.ok(rule.includes("postcss") && rule.includes("autoprefixer"),
-    "必须明确不要装 postcss/autoprefixer——真实站点一个都没有");
-  // sonner 在 package.json 里但 src/ 零引用，属于死依赖，不得写进房屋标准
-  assert.ok(!rule.includes("sonner"), "sonner 是真实站点里的死依赖（零 import），不得写进标准栈");
+  assert.match(rule, /已有可运行网站沿用原栈/);
+  assert.match(rule, /用户明确指定技术栈时服从用户/);
+  assert.match(rule, /工作区为空、项目没有网站/);
+  assert.match(rule, /React \+ Tailwind CSS \+ shadcn\/ui/);
+  assert.match(rule, /不得覆盖已有网站或用户指定栈/);
 
-  // 各处必须引用同一份，不再各说各话
-  for (const site of ["从零网站技术栈律：\" : \"技术栈律：\") + _MD_STACK_RULE", "从零网站技术栈硬约束：\" + _MD_STACK_RULE",
-                      "- ${_MD_STACK_RULE}"]) {
-    assert.ok(SRC.includes(site.replace('\\"', '"')) || SRC.includes(site),
-      `声明点必须引用权威常量而不是自己复述一遍：${site}`);
-  }
+  // 角色、运行时交接和完整 UI 工艺块都引用同一个规则，不各自维护第二份默认栈。
+  assert.match(SRC, /- \$\{_MD_STACK_RULE\}/);
+  assert.match(SRC, /无栈网站默认技术栈律：[\s\S]{0,100}\+ _MD_STACK_RULE/);
+  assert.match(SRC, /技术栈决策规则：" \+ _MD_STACK_RULE/);
   // Vue 不得再作为等价默认出现在实现指令里
   assert.doesNotMatch(SRC, /用 React\/Vue \+ Tailwind 写组件化代码/,
     "选完设计方向后的实现提示不得把 Vue 当作等价选项");
@@ -11374,38 +11577,54 @@ test("技术栈规则必须真的送达模型——每个 UI 轮次，包括网�
   assert.ok(!backend.includes(STACK), "非 UI 轮不注入栈规则");
 });
 
-test("知识库检索结果必须把 v3 蓝本翻译成 v4，而不是让模型照抄", () => {
-  // 真正的成因：模型自己调 knowledge_search，IDE 把 3 段 Tailwind v3 蓝本原样回灌，
-  // 还写着「照这个来做」。三份可复制粘贴的 tailwind.config.js 例子会压过提示词里
-  // 一句禁令——模型于是建了 postcss.config.js + tailwind.config.js。
+test("Tailwind v3 蓝本只在最终项目采用 Tailwind v4 时才转译", () => {
   const i = SRC.indexOf("📚 专业知识库");
   assert.ok(i > 0, "知识库结果格式化位置必须存在");
-  const block = SRC.slice(i, i + 1400);
-  assert.match(block, /构建配置不要照抄/, "必须明确告诉模型构建配置不能照抄");
-  assert.match(block, /@theme inline/, "必须给出 v4 的等价写法");
-  assert.ok(block.includes("tailwind.config") && block.includes("postcss"),
-    "必须点名 v3 里会出现、但本栈禁止的那些文件");
-  // 「照这个来做」只能适用于视觉判断，不能笼统适用于全部内容
+  const block = SRC.slice(i, i + 1800);
   assert.match(block, /视觉判断（[^）]*）照这个来做/,
     "「照这个来做」必须限定在视觉判断上，构建配置另有规矩");
+  assert.match(block, /仅当|只有[^\n]{0,80}Tailwind v4|if[^\n]{0,80}Tailwind v4/i,
+    "v3→v4 转译必须是最终栈选择为 v4 时的条件分支");
+  assert.doesNotMatch(block, /本项目是 Tailwind v4/,
+    "知识库格式化层不知道现有 Vue\/Svelte\/Django 项目的栈，不得无条件宣告 v4");
+  assert.match(block, /保留现有构建配置|沿用项目现有样式方案|非 Tailwind v4/,
+    "非 Tailwind v4 项目必须明确保留它的现有构建和样式机制");
 });
 
-test("别的栈只搬令牌，绝不把项目迁成 React", () => {
+test("已有网站沿用真实技术栈，不为 Michael Design 迁移", () => {
   const rule = SRC.slice(SRC.indexOf("const _MD_STACK_RULE"), SRC.indexOf("const _AGENT_ROLE_BLOCKS"));
-  // 三个分支：没点名 -> 原生直接建；已有别的栈 -> 保留原栈只搬语义；不需要转换就别转换
-  assert.match(rule, /保留人家原来的栈/, "已有别的栈必须保留，不得改写");
-  assert.match(rule, /不要改写成 React/, "必须明确禁止迁移到 React");
-  assert.match(rule, /不要在旁边另起一个 React 前端/, "也不得绕道另起 React 前端");
-  assert.ok(rule.includes("Django") && rule.includes("Flask"),
-    "必须点名服务端渲染栈——Python 项目正是 owner 举的例子");
-  assert.match(rule, /shadcn-vue/, "Vue 项目要用 shadcn-vue 而不是 React 版");
-  assert.match(rule, /不需要转换就别转换/, "已经是本栈的项目不得做任何迁移动作");
+  assert.match(rule, /已有可运行网站沿用原栈/);
+  assert.match(rule, /不得只为套设计体系迁移现有网站/);
+  assert.match(rule, /映射到项目现有 token\/主题\/组件机制/);
 
   // 反向断言：那条把「和 React 不兼容」当唯一免转理由的escape clause必须消失。
   // 它读起来是「只要能上 React 就该转」，Django 恰恰能上 React —— 正好授权了被禁止的迁移。
   assert.doesNotMatch(SRC, /已有技术栈与 React 不兼容时才例外/,
     "这条反向条款会授权 Python→React 迁移，必须删除而不是软化");
   assert.doesNotMatch(SRC, /已有项目技术栈不兼容时才例外/, "同上，_uiDesignCraftBlock 那份也要删");
+});
+
+test("Michael Design 默认栈行为矩阵：无栈才默认，现有栈和用户指定优先", () => {
+  const stackRule = SRC.slice(SRC.indexOf("const _MD_STACK_RULE"), SRC.indexOf("const _AGENT_ROLE_BLOCKS"));
+  const designPrompt = load("_DESIGN_RESEARCH_PROMPT", {
+    _P: (_key, fallback) => fallback,
+  });
+  const prompt = designPrompt("按需修改网站");
+  const matrix = [
+    { scenario: "空项目", evidence: /工作区为空/, decision: /React \+ Tailwind CSS \+ shadcn\/ui/ },
+    { scenario: "项目没有网站", evidence: /项目没有网站/, decision: /React \+ Tailwind CSS \+ shadcn\/ui/ },
+    { scenario: "明确重构且无可沿用栈", evidence: /明确重做且没有可沿用/, decision: /React \+ Tailwind CSS \+ shadcn\/ui/ },
+    { scenario: "现有 Vue\/Svelte\/Django 网站", evidence: /已有可运行网站沿用/, decision: /框架、语言、构建工具、组件库和样式方案/ },
+    { scenario: "用户指定 Astro\/Vue\/Svelte 等栈", evidence: /用户明确指定/, decision: /服从用户/ },
+  ];
+  for (const row of matrix) {
+    assert.match(stackRule + "\n" + prompt, row.evidence, `${row.scenario}: 缺少触发条件`);
+    assert.match(stackRule + "\n" + prompt, row.decision, `${row.scenario}: 缺少技术栈决策`);
+  }
+  assert.match(stackRule + prompt, /默认栈只适用于这些无栈场景/);
+  assert.match(stackRule + prompt, /不得覆盖已有网站/);
+  assert.match(prompt, /knowledge_search\(domain="michael-design"\)/,
+    "设计子智能体必须调用真实 Michael Design 知识库，不得只读硬编码栈规则");
 });
 
 test("web_scaffold 铺的就是真实 Michael Design 基座", () => {
@@ -12105,7 +12324,12 @@ test("remote search uses the active backend and preserves native file-match shap
     ],
   });
   assert.match(SRC, /backend\.searchInProject = \(root, query, cs, mode = "literal"\)[\s\S]{0,320}_groupRemoteSearchHits/);
-  assert.match(extractFn("_executeToolStepInner"), /fileMatches = await backend\.searchInProject\(searchRoot, q, !!call\.caseSensitive, call\.mode \|\| "literal"\)/,
+  const inner = extractFn("_executeToolStepInner");
+  assert.match(inner, /const searchScopes = _independentFsPaths\(_relCandidates\(requestedScope, root\)\)/,
+    "Agent search must resolve the same multi-root candidates as read_file and list_dir");
+  assert.match(inner, /for \(const searchRoot of searchScopes\)/,
+    "Agent search must visit every independent workspace scope");
+  assert.match(inner, /scopedMatches = await backend\.searchInProject\(searchRoot, q, !!call\.caseSensitive, call\.mode \|\| "literal"\)/,
     "Agent search must route to the remote daemon when a remote workspace is active");
 });
 
@@ -12180,9 +12404,16 @@ test("first-turn ask_user is fact-gated advice, never a physical block", () => {
   assert.equal(unknown.allowed, false);
 });
 
-test("plain-text assistant questions are a hard agent wait boundary", () => {
+test("plain-text assistant questions wait, except one evidence-free Agent dodge", () => {
   const looksLikeQuestion = load("_looksLikeUserQuestion");
   const mustWait = load("_agentTurnMustWaitForUser", { _looksLikeUserQuestion: looksLikeQuestion });
+  const hasOrientationFacts = load("_runHasOrientationFacts", {
+    _ORIENTING_TOOLS: new Set(["list_dir", "find_files", "read_file", "find_symbol", "semantic_search", "grep_search"]),
+  });
+  const needsEvidence = load("_agentQuestionNeedsWorkspaceEvidence", {
+    _agentTurnMustWaitForUser: mustWait,
+    _runHasOrientationFacts: hasOrientationFacts,
+  });
 
   const question = "要我补全吗？（还是你只是想确认现状？）";
   assert.equal(looksLikeQuestion(question), true);
@@ -12198,19 +12429,36 @@ test("plain-text assistant questions are a hard agent wait boundary", () => {
   assert.equal(looksLikeQuestion("这不是更好吗？"), false);
   assert.equal(looksLikeQuestion("为什么没有响应头？因为代理还没连接上。"), false);
 
+  const emptyRun = { mode: "agent", ctx: { filesRead: new Set() }, _toolLedger: { entries: [] } };
+  const workspaceDodge = { text: "我会按照当前项目真实状态继续工作。请告诉我需要做什么？", toolCalls: [], error: null };
+  assert.equal(needsEvidence(workspaceDodge, emptyRun, true, 0), true,
+    "an Agent must not turn a required project inspection into a generic question");
+  assert.equal(needsEvidence(workspaceDodge, emptyRun, true, 1), false,
+    "the repair is bounded: a second explicit question waits for the user");
+  assert.equal(needsEvidence(workspaceDodge, {
+    ...emptyRun,
+    _toolLedger: { entries: [{ tool: "list_dir", ok: true }] },
+  }, true, 0), false, "after real project evidence, questions remain a hard boundary");
+  assert.equal(needsEvidence(workspaceDodge, emptyRun, false, 0), false,
+    "a semantic question that does not require workspace tools must still wait immediately");
+  assert.equal(mustWait({ text: "我会按照当前项目真实状态继续工作。请告诉我需要做什么。", toolCalls: [], error: null }), false,
+    "the exact screenshot text has no question mark and therefore reaches the normal no-tool/tool-first gate");
+
   const loop = extractFn("_runAgenticLoop");
   const boundary = loop.indexOf("if (_agentTurnMustWaitForUser(turn))");
   const pendingGate = loop.indexOf("if (pending && continueNudges < 2)");
   const toolFirstGate = loop.indexOf("if (!_quick() && iter < 2 && toolFirstNudges < 2");
   const criticGate = loop.indexOf("if (_needCritic && run.mode === \"agent\"");
   assert.ok(boundary >= 0 && boundary < pendingGate && boundary < toolFirstGate && boundary < criticGate,
-    "the question boundary must run before every automatic continuation gate");
+    "the question boundary must run before the later automatic continuation gates");
+  assert.match(loop, /if \(_agentTurnMustWaitForUser\(turn\)\) \{[\s\S]{0,500}_agentQuestionNeedsWorkspaceEvidence\(turn, run, _mustUseWorkspaceTools, toolFirstNudges\)[\s\S]{0,300}toolFirstNudges\+\+[\s\S]{0,180}_pushNudge\("toolFirst"/,
+    "the screenshot regression must spend one tool-first repair before awaiting the user");
   // The boundary is still hard — but it may spend ONE bounded verify nudge first when the
   // run mutated code with zero green evidence, so a closing question ("需要我再补测试吗？")
   // is not a side door around the pre-delivery verification gate. The nudge shares
   // codeVerifyNudges with the finish gate, so a second question is always honored.
-  assert.match(loop, /if \(_agentTurnMustWaitForUser\(turn\)\) \{[\s\S]{0,1400}awaitingUserReply = true;[\s\S]{0,220}_clearNudges\(\);[\s\S]{0,80}break;/);
-  assert.match(loop, /if \(_agentTurnMustWaitForUser\(turn\)\) \{[\s\S]{0,900}codeVerifyNudges < 1[\s\S]{0,300}_pushNudge\("codeVerify", _CODE_VERIFY_NUDGE/,
+  assert.match(loop, /if \(_agentTurnMustWaitForUser\(turn\)\) \{[\s\S]{0,2200}awaitingUserReply = true;[\s\S]{0,220}_clearNudges\(\);[\s\S]{0,80}break;/);
+  assert.match(loop, /if \(_agentTurnMustWaitForUser\(turn\)\) \{[\s\S]{0,1700}codeVerifyNudges < 1[\s\S]{0,300}_pushNudge\("codeVerify", _CODE_VERIFY_NUDGE/,
     "the question branch must demand verification before honoring the question");
   assert.match(loop, /_qVerified = _verifiedAtImplOps >= _implOps[\s\S]{0,220}_evidenceCertifies\(e, _implOps\)/,
     "the question branch must use the same certification rule as the finish gate");
@@ -12511,6 +12759,40 @@ test("thinking cards: duration is honest and trailing piles merge", () => {
   assert.equal(b3.children.length, 2);
 });
 
+test("agent inline thinking is routed across split SSE deltas", () => {
+  const route = load("_routeInlineThinkingDelta");
+  const flush = load("_flushInlineThinkingDelta");
+  const state = { inThink: false, hold: "" };
+
+  let out = route(state, "开场<thi");
+  assert.deepEqual(out, { reasoning: "", answer: "开场" });
+  assert.equal(state.hold, "<thi");
+
+  out = route(state, "nk>先查目录");
+  assert.deepEqual(out, { reasoning: "先查目录", answer: "" });
+  assert.equal(state.inThink, true);
+
+  out = route(state, "</thi");
+  assert.deepEqual(out, { reasoning: "", answer: "" });
+  assert.equal(state.hold, "</thi");
+
+  out = route(state, "nking>然后回答。\n");
+  assert.deepEqual(out, { reasoning: "", answer: "然后回答。\n" });
+  assert.equal(state.inThink, false);
+  assert.equal(flush(state).answer, "");
+
+  const unterminated = { inThink: true, hold: "</think" };
+  assert.deepEqual(flush(unterminated), { reasoning: "", answer: "" });
+});
+
+test("agent streaming hides settled cross-turn narrative repeats", () => {
+  const agentTurn = SRC.slice(SRC.indexOf("async function _agentModelTurn"), SRC.indexOf("function _boundRunFilePath"));
+  assert.match(agentTurn, /const _streamCleanText = \(value\) =>/);
+  assert.match(agentTurn, /_dedupeRepeatedText\(_cleanAgentText\(value\)\)/);
+  assert.match(agentTurn, /_dedupeRunNarrative\(cleaned, new Set\(narrativeSeen\)\)/);
+  assert.match(agentTurn, /_routeInlineThinkingDelta\(_inlineThinkState, ev\.delta \|\| ""\)/);
+});
+
 test("stopped-run continuations are resolved from bounded prior-task semantic context", () => {
   const intentText = load("_aiIntentText");
   const intentList = load("_aiIntentList", { _aiIntentText: intentText });
@@ -12544,7 +12826,7 @@ test("stopped-run continuations are resolved from bounded prior-task semantic co
   assert.doesNotMatch(extractFn("sendPrompt"), /_looksLightweightAgentChat\(/);
 });
 
-test("context overflow errors are recognized and squeezed instead of killing the run", () => {
+test("context overflow can be squeezed explicitly but does not auto-replay the Agent request", () => {
   const isOverflow = load("_isContextOverflowAiError");
   assert.equal(isOverflow("This model's maximum context length is 128000 tokens. However, your messages resulted in 131072 tokens"), true);
   assert.equal(isOverflow("400 context_length_exceeded"), true);
@@ -12577,9 +12859,8 @@ test("context overflow errors are recognized and squeezed instead of killing the
   assert.equal(messages[2]._ideMeta.contextAvailable, false);
   // 幂等：再跑一遍不再改动
   assert.equal(squeeze(messages), false);
-  // 外层循环真正接线了溢出恢复
-  assert.match(SRC, /_isContextOverflowAiError\(turn\.error\) && !run\._ctxSqueezed && _live\(\)/);
-  assert.match(SRC, /上下文超出模型窗口，已压缩历史后自动重试/);
+  assert.doesNotMatch(SRC, /_isContextOverflowAiError\(turn\.error\) && !run\._ctxSqueezed/);
+  assert.doesNotMatch(SRC, /上下文超出模型窗口，已压缩历史后自动重试/);
 });
 
 test("browser runs keep ONE persistent live preview instead of per-turn screenshots", () => {
@@ -12894,13 +13175,19 @@ test("reply stats footer uses exact server settlements on both chat paths", () =
   assert.match(statsSource, /settlement\.usageReported/);
   assert.match(statsSource, /Usage unavailable/);
   assert.match(statsSource, /_dispUsd\(settlement\.costCents\)/);
-  assert.match(statsSource, /663 raw cents = \$1\.00 credit/);
+  // 文案已细化为 "663 raw cents ($6.63) = $1.00 of visible quota/credits"，
+  // 契约不变：换算分母必须写死在源码里可查。
+  // 换算分母的说明已从 _turnStatsText 内挪到模块级注释（12362 行附近），所以在整个
+  // SRC 里查而不是那一小段。契约不变：663:1 这个分母必须写死在源码里可查证。
+  assert.match(SRC, /663 raw cents \(\$6\.63\) = \$1\.00 of visible quota/);
   assert.match(statsSource, /includes model, cache, and route pricing/);
-  assert.match(SRC, /const _MICHAEL_RAW_CENTS_PER_CREDIT_USD = 663;/);
+  // `let` 而非 `const`：网关可以下发新分母覆盖它（见紧邻的 setter）。
+  assert.match(SRC, /let _MICHAEL_RAW_CENTS_PER_CREDIT_USD = 663;/);
   assert.doesNotMatch(SRC, /credits_cents \/ 100|total_spent_cents \/ 100|cost_cents \/ 100/,
     "all user-facing balance and usage money must use the shared 6.63:1 denomination");
   // Both the plain-chat finalizer and the agent-run finalizer must append the footer.
-  assert.match(SRC, /_appendTurnStatsFooter\(body, \{\s*\n\s*elapsedMs: Date\.now\(\) - _plainStreamDiag\.attemptStartedAt/);
+  assert.match(SRC, /_appendTurnStatsFooter\(body, \{\s*\n\s*elapsedMs: Date\.now\(\) - _taskStartedAt/,
+    "plain chat reports the whole user-visible task, not only the final physical attempt");
   assert.match(SRC, /_appendTurnStatsFooter\(body, \{\s*\n\s*elapsedMs: Date\.now\(\) - run\._recStart/);
   assert.match(SRC, /session\._runUsage = \{ in: 0, out: 0, cacheRead: 0, cacheCreation: 0, costCents: 0, turns: 0, settledTurns: 0, reportedTurns: 0, allSettled: true, allReported: true \}/);
   assert.match(SRC, /getSettlement: \(\) => _liveRunSettlement\(session\._runUsage\)/);
@@ -12911,8 +13198,10 @@ test("reply stats footer uses exact server settlements on both chat paths", () =
   assert.match(SRC, /if \(_scopeSettlement\) _addRunSettlement\(_ru, _scopeSettlement\)/);
   assert.equal((SRC.match(/backend\.aiComplete\(/g) || []).length, 1,
     "all non-streaming model calls must pass through the one request-ID billing tracker");
-  assert.match(TAURI_AI, /with_ide_headers\(client\.post\(&url\)\.bearer_auth\(&config\.api_key\), &config\)/,
-    "desktop non-streaming completions must relay the settlement request ID");
+  assert.match(TAURI_AI, /pub async fn ai_complete[\s\S]{0,1800}post_chat_once\(\s*client,\s*&url,\s*&config,\s*&payload/,
+    "desktop non-streaming completions must use the shared request path");
+  assert.match(TAURI_AI, /async fn post_chat_once[\s\S]{0,900}with_ide_headers\(client\.post\(url\)\.bearer_auth\(&config\.api_key\), config\)/,
+    "the shared request path must relay the settlement request ID");
   assert.equal((SRC.match(/backend\.invoke\("generate_image_chat", \{[^\n]+requestId:/g) || []).length, 3,
     "direct and Agent image generation must join the visible turn settlement");
   assert.match(TAURI_NET, /with_ide_request_id\(client\.post\(&url\)\.bearer_auth\(api_key\.trim\(\)\), request_id\)/,
@@ -13239,8 +13528,10 @@ test("流式聊天渲染 O(n²) 根治：≥90ms 节流 + 分叉回滚 + 取证�
     "plain-chat 流式重绘必须 ≥90ms 节流");
   assert.match(SRC, /const gap = acc\.length > 150000 \? 120 : 90;/,
     "agent 流式重绘必须 ≥90ms 节流");
-  assert.match(SRC, /cancelAnimationFrame\(raf\); clearTimeout\(raf\); raf = 0;/,
-    "节流改用 setTimeout 后，收尾必须两种 id 都取消，防残留定时器在终渲染后重建流式内容");
+  assert.equal((SRC.match(/if \(flushTimer\) \{ clearTimeout\(flushTimer\); flushTimer = 0; \}/g) || []).length, 2,
+    "plain chat 和 Agent 收尾都必须取消节流定时器");
+  assert.equal((SRC.match(/if \(flushRaf\) \{ cancelAnimationFrame\(flushRaf\); flushRaf = 0; \}/g) || []).length, 2,
+    "plain chat 和 Agent 收尾都必须取消动画帧，防终渲染后被旧帧覆盖");
   // settle 时的完整终渲染保留：两条路径都在流结束后用 renderMarkdownInto 全量重渲染一次。
   assert.match(SRC, /renderMarkdownInto\(streamEl, cleanFinal, \{ streaming: false, highlighter: highlightCode \}\)/,
     "agent 路径流结束必须做一次完整终渲染");
@@ -13758,17 +14049,15 @@ test("michael-compression 的档位与前缀在客户端两端都真的接上了
     "Redis 淘汰后必须从 PostgreSQL 恢复无损原文，而不是要求超大历史整包重传");
   assert.match(SERVER_MODELS, /compression_retrieve_history\(/,
     "普通前缀复用和新增压缩段都必须经过精确历史检索");
-  assert.match(SRC, /_isCompressionPrefixInvalidError\(err\)[\s\S]{0,360}_mcPrefixInvalidate\(\)/,
-    "普通聊天必须清掉失效前缀并自动恢复完整历史");
-  assert.match(SRC, /const prefixInvalid = [^\n]*_isCompressionPrefixInvalidError\(turnErr\)/,
-    "Agent 也必须识别前缀失效而不是当普通网络错误重发旧令牌");
+  assert.doesNotMatch(SRC, /_isCompressionPrefixInvalidError\([^)]*\)[\s\S]{0,500}(?:backend\.aiChat|backend\.aiChatWithTools|continue)/,
+    "前缀失效也属于当前请求失败：清理应留给下一次用户发送，不能自动重发完整历史");
   assert.match(SRC, /_MC_PREFIX_STORE_KEY[\s\S]{0,1800}_mcPrefixPersist\(\)/,
     "前缀必须随会话持久化，否则重启 IDE 后 2M\/5M 会退回全量上传");
-  assert.match(ai, /resp\.status\(\) != reqwest::StatusCode::CONFLICT/,
-    "桌面传输层不能把同一个失效前缀先机械重发一次");
+  assert.match(ai, /Ok\(Ok\(response\)\) => return Ok\(response\)/,
+    "桌面传输层收到 409 后必须立即交给上层恢复完整历史，不能机械重发失效前缀");
   assert.match(SRC, /_mcPrefixInvalidate\(\)/, "本地改写历史后必须作废前缀");
-  assert.ok((SRC.match(/_mcPrefixInvalidate\(\)/g) || []).length >= 5,
-    "定义、历史改写、边界校验和两条 409 恢复路径都必须作废旧前缀");
+  assert.ok((SRC.match(/_mcPrefixInvalidate\(\)/g) || []).length >= 3,
+    "定义、历史改写和边界校验必须能作废旧前缀");
 });
 
 test("edit_file 的实时预览只替换锚点区间，且锚点不唯一时拒绝动编辑器", () => {
@@ -14126,7 +14415,7 @@ test("外部研究结束门禁只接受真实、非空的官方与社区证据",
   ]);
   const communityTools = new Set([
     "developer_community_search", "stackoverflow_search", "github_discussions_search",
-    "reddit_search", "v2ex_search", "juejin_search",
+    "v2ex_search", "juejin_search",
   ]);
   const officialHosts = new Set(["github.com", "developer.mozilla.org", "react.dev"]);
   const officialUrl = load("_isOfficialResearchUrl", { _OFFICIAL_RESEARCH_HOSTS: officialHosts, URL });
@@ -14155,7 +14444,7 @@ test("外部研究结束门禁只接受真实、非空的官方与社区证据",
   assert.equal(category("developer_community_search", { query: "missing" }, { content: communityEmpty }), "",
     "聚合器全部为空/失败/限流时不能算社区证据");
   assert.equal(category("stackoverflow_search", { query: "missing" }, { content: "Stack Overflow results:\nsearch_status: empty\n(no results)" }), "");
-  assert.equal(category("reddit_search", { query: "x" }, { content: "[失败] reddit_search: 429 rate limited" }), "");
+  assert.equal(category({ query: "x" }, { content: "[失败] : 429 rate limited" }), "");
 
   assert.deepEqual(missing({ needsOfficialResearch: false, needsCommunityResearch: false }, { official: new Set(), community: new Set() }), [],
     "researchMode=none 的普通任务不能被联网门禁拖慢");
@@ -14185,7 +14474,11 @@ test("外部研究证据门禁接入静默收尾且重试有界", () => {
 
 test("每个注册工具都有按需加载的压缩场景与最小调用例子", () => {
   const registered = JSON.parse(SERVER_TOOLS);
-  assert.ok(registered.length >= 160, "覆盖测试必须读取完整服务端工具注册表");
+  // 这个下限只为挡住"读到空表/半张表就假装全覆盖"，不是工具数量的契约 ——
+  // 钉死具体数字会让每次正常增删工具都误报（2026-08-05 删掉 14 个失效搜索工具后
+  // 从 168 掉到 154，原来的 >=160 就炸了）。留一个宽松下限即可。
+  assert.ok(registered.length >= 100,
+    `覆盖测试必须读取完整服务端工具注册表，实际只读到 ${registered.length} 个`);
   for (const schema of registered) {
     const name = schema.function.name;
     const guide = compactToolGuide(schema);
@@ -14956,10 +15249,11 @@ test("P2.1-注册：await_subagent 全链路注册 + run_subagent wait 参数语
   // schema：await_subagent 存在，run_subagent 带 wait 布尔参数（默认 false=后台作业）
   assert.match(SRC, /name: "await_subagent"/);
   assert.match(SRC, /wait: \{ type: "boolean"/, "run_subagent schema 必须带 wait 布尔参数");
-  // _KNOWN_TOOLS / 弱模型别名 / 延迟簇（与 run_subagent 同簇按需加载）
-  assert.ok(SRC.includes('"await_subagent",\n]);'), "_KNOWN_TOOLS 必须收录 await_subagent");
+  const registered = new Set(buildRegisteredToolSchemas().map((tool) => tool.function.name));
+  assert.ok(registered.has("await_subagent"), "动态 _KNOWN_TOOLS 的注册表必须收录 await_subagent");
+  assert.match(SRC, /const _KNOWN_TOOLS = new Set\(_buildAgentToolSchemas\(true, \[\]\)/,
+    "_KNOWN_TOOLS 必须从实时注册表生成");
   assert.match(SRC, /awaitsubagent: "await_subagent", wait_subagent: "await_subagent"/);
-  assert.match(SRC, /subagent: \{ tools: \["run_subagent", "run_worker", "research_project", "generate_wiki", "await_subagent", "spawn_multiple_agents"\] \}/);
   // _mapToolCall 行为：wait 默认 false，显式 true 透传；await_subagent job 默认 all
   const mapCall = load("_mapToolCall", {
     _normalizeArgKeys: (a) => a,
@@ -14974,6 +15268,29 @@ test("P2.1-注册：await_subagent 全链路注册 + run_subagent wait 参数语
   assert.equal(aw.type, "awaitsubagent");
   assert.equal(aw.job, "all", "job 默认 all");
   assert.equal(mapCall("await_subagent", { job: "3" }).job, "3");
+});
+
+test("子智能体 schema 公开 tasks/wait，映射层不丢参数", () => {
+  const byName = new Map(buildRegisteredToolSchemas().map((tool) => [tool.function.name, tool]));
+  const properties = (name) => byName.get(name)?.function?.parameters?.properties || {};
+  assert.ok(properties("run_subagent").tasks, "run_subagent schema 必须公开 tasks");
+  assert.ok(properties("research_project").wait, "research_project schema 必须公开 wait");
+  assert.ok(properties("design_research").wait, "design_research schema 必须公开 wait");
+
+  const mapCall = load("_mapToolCall", {
+    _normalizeArgKeys: (args) => args,
+    _STR_ARG_KEYS: new Set(),
+    _KNOWN_TOOLS: new Set(byName.keys()),
+    _canonicalToolName: () => "",
+    _mcpToolMap: new Map(),
+    _RESEARCH_PROMPT: (focus) => String(focus || ""),
+    _DESIGN_RESEARCH_PROMPT: (goal) => String(goal || ""),
+    t: (key) => key,
+  });
+  const tasks = [{ role: "review", task: "检查工具契约" }];
+  assert.deepEqual(mapCall("run_subagent", { description: "audit", tasks }).tasks, tasks);
+  assert.equal(mapCall("research_project", { focus: "tools", wait: true }).wait, true);
+  assert.equal(mapCall("design_research", { goal: "IDE", wait: true }).wait, true);
 });
 
 test("P2.1-异步派发：只读调研默认后台作业立即返回+台账记录；wait/worker/wiki 保持同步", () => {
@@ -16109,6 +16426,9 @@ test("find_files 重写: readDir 失败返回错误信息而非静默跳过", as
   });
   const r = await findFiles("/work", "*.js");
   // 错误信息应出现在结果中
+  assert.equal(r.count, 0, "扫描错误不能伪装成文件命中");
+  assert.deepEqual(r.files, [], "files 只能包含真实文件路径");
+  assert.equal(r.errors.length, 1, "扫描错误必须单独返回");
   assert.ok(r.text.includes("[ERROR]"), "应包含错误标记");
   assert.ok(r.text.includes("权限不足"), "应包含具体错误信息");
 });
@@ -16167,14 +16487,14 @@ test("find_files 重写: 用 _agentDirEntryIsDir 兼容 isDir 字段（remote �
   assert.ok(r.files.some(f => f === "index.js"), "根目录文件应被找到");
 });
 
-test("find_files 重写: entry.path 优先用于路径拼接", async () => {
+test("find_files 重写: 相对 entry.path 不会让递归脱离当前目录", async () => {
   const mockBackend = {
     async readDir(dir) {
       if (dir === "/work") return [
-        { name: "sub", is_dir: true, path: "/work/sub" },
+        { name: "sub", is_dir: true, path: "sub" },
       ];
       if (dir === "/work/sub") return [
-        { name: "file.txt", is_dir: false, path: "/work/sub/file.txt" },
+        { name: "file.txt", is_dir: false, path: "sub/file.txt" },
       ];
       return [];
     },
@@ -16186,7 +16506,7 @@ test("find_files 重写: entry.path 优先用于路径拼接", async () => {
     backend: mockBackend,
   });
   const r = await findFiles("/work", "*.txt");
-  assert.ok(r.files.includes("sub/file.txt"), "应使用 entry.path 正确拼接");
+  assert.ok(r.files.includes("sub/file.txt"), "相对 entry.path 应回退到当前目录 + 文件名");
 });
 
 test("find_files 重写: 空 pattern / 无工作区 返回错误", async () => {
@@ -16217,6 +16537,30 @@ test("find_files 重写: 无匹配时返回 (无匹配文件) 而非错误", asy
   assert.equal(r.text, "(\u65e0\u5339\u914d\u6587\u4ef6)");
 });
 
+test("find_files 执行入口跨独立工作区聚合，并用统一失败键", () => {
+  const inner = extractFn("_executeToolStepInner");
+  const findStart = inner.indexOf('} else if (call.type === "find")');
+  const findEnd = inner.indexOf('} else if (call.type === "diag")', findStart);
+  const branch = inner.slice(findStart, findEnd);
+  assert.match(branch, /const requests = _agentFindRequests\(root, requestedPattern\)/);
+  assert.match(branch, /Promise\.all\(requests\.map/);
+  assert.match(branch, /Array\.isArray\(result\?\.files\)/);
+  assert.match(branch, /Array\.isArray\(result\?\.errors\)/);
+  assert.match(branch, /const _fpKey = _toolFailureKey\(call, root\)/);
+  assert.doesNotMatch(branch, /const r = await _agentFindFiles\(root/,
+    "the public tool entry must not silently fall back to the old single-root call");
+});
+
+test("list_dir failure reports backend facts instead of shelling out to a fake empty listing", () => {
+  const inner = extractFn("_executeToolStepInner");
+  const listStart = inner.indexOf('} else if (call.type === "list")');
+  const listEnd = inner.indexOf('} else if (call.type === "write"', listStart);
+  const branch = stripJsComments(inner.slice(listStart, listEnd));
+  assert.doesNotMatch(branch, /taskRunCapture/);
+  assert.match(branch, /const _listErrors = \[\]/);
+  assert.match(branch, /目录不存在或无法列出/);
+});
+
 // ==========================================================================
 // P0 \u91cd\u5199 10 \u4e2a\u5de5\u5177\uff1a\u8f93\u5165\u9a8c\u8bc1 + \u5931\u8d25\u8bb0\u5fc6 + TOOL_METADATA
 // ==========================================================================
@@ -16227,7 +16571,7 @@ function _loadMapToolCall(extraTools = []) {
     _normalizeArgKeys: (args) => args,
     _STR_ARG_KEYS: new Set(),
     _KNOWN_TOOLS: new Set([
-      "computer", "generate_3d", "generate_sound", "generate_music",
+      "generate_3d", "generate_sound", "generate_music",
       "generate_voice", "auto_rig", "generate_motion", "generate_texture",
       "search_game_assets", "download_asset", ...extraTools,
     ]),
@@ -16235,28 +16579,6 @@ function _loadMapToolCall(extraTools = []) {
     _mcpToolMap: new Map(),
   });
 }
-
-test("computer: \u6b63\u5e38\u4f20 method + params\uff0c\u4e0d\u518d\u786c\u7f16\u7801\u4e3a mouse.click", () => {
-  const mapCall = _loadMapToolCall();
-  const r = mapCall("computer", { method: "mouse.click", params: { x: 100, y: 200 } }, new Map());
-  assert.equal(r.type, "automation");
-  assert.equal(r.method, "mouse.click");
-  assert.deepEqual(r.params, { x: 100, y: 200 });
-});
-
-test("computer: \u7a7a\u53c2\u6570\u964d\u7ea7\u4e3a screen.info \u800c\u975e\u786c\u7f16\u7801 mouse.click", () => {
-  const mapCall = _loadMapToolCall();
-  const r = mapCall("computer", {}, new Map());
-  assert.equal(r.type, "automation");
-  assert.equal(r.method, "screen.info");
-});
-
-test("computer: \u4e0d\u652f\u6301\u7684 method \u964d\u7ea7\u4e3a screen.info \u5e76\u9644 warning", () => {
-  const mapCall = _loadMapToolCall();
-  const r = mapCall("computer", { method: "bogus.action" }, new Map());
-  assert.equal(r.method, "screen.info");
-  assert.ok(r.params._warning, "should carry a warning about unsupported method");
-});
 
 test("generate_3d: \u6b63\u5e38 prompt \u901a\u8fc7\uff0cname \u88ab\u6e05\u6d17", () => {
   const mapCall = _loadMapToolCall();
@@ -16396,8 +16718,18 @@ test("download_asset: \u6b63\u5e38 http URL \u901a\u8fc7", () => {
   assert.ok(!r._error);
 });
 
-test("TOOL_METADATA: 10 \u4e2a\u5de5\u5177\u5168\u90e8\u6709\u5143\u6570\u636e\u6761\u76ee", () => {
-  const required = ["computer", "generate_3d", "generate_sound", "generate_music",
+test("游戏资产 Tauri invoke 参数使用 camelCase 合同", () => {
+  const inner = extractFn("_executeToolStepInner");
+  assert.match(inner, /const _gaArgs = \{ baseUrl: [^,]+, apiKey: [^,]+, workspace:/);
+  assert.match(inner, /Object\.assign\(_gaArgs, \{ modelPath: call\.model_path/);
+  assert.match(inner, /backend\.invoke\("search_game_assets", \{ baseUrl: [^,]+, apiKey: [^,]+, query: [^,]+, assetType: call\.asset_type \}\)/);
+  assert.match(inner, /backend\.invoke\("download_asset", \{ workspace: [^,]+, url: [^,]+, name: [^,]+, assetType: call\.asset_type \}\)/);
+  assert.doesNotMatch(inner, /backend\.invoke\([^\n]+\b(?:base_url|api_key|model_path|asset_type)\s*:/,
+    "Tauri JS invoke 边界不能传 snake_case key");
+});
+
+test("TOOL_METADATA: \u6e38\u620f\u8d44\u4ea7\u5de5\u5177\u5168\u90e8\u6709\u5143\u6570\u636e\u6761\u76ee", () => {
+  const required = ["generate_3d", "generate_sound", "generate_music",
     "generate_voice", "auto_rig", "generate_motion", "generate_texture",
     "search_game_assets", "download_asset"];
   for (const name of required) {
@@ -16412,7 +16744,7 @@ test("TOOL_METADATA: 10 \u4e2a\u5de5\u5177\u5168\u90e8\u6709\u5143\u6570\u636e\u
 });
 
 test("TOOL_METADATA: \u542b\u300c\u4f55\u65f6\u7528\u300d\u63cf\u8ff0", () => {
-  const tools = ["computer", "generate_3d", "generate_sound", "generate_music",
+  const tools = ["generate_3d", "generate_sound", "generate_music",
     "generate_voice", "auto_rig", "generate_motion", "generate_texture",
     "search_game_assets", "download_asset"];
   for (const name of tools) {
@@ -16482,8 +16814,11 @@ test("#85 结果缓存统一框架: 只读工具缓存命中与过期", () => {
   assert.match(wrapperSrc, /_toolResultCache\.size > 200/, "必须有缓存容量上限");
   // 写操作缓存失效
   assert.match(wrapperSrc, /call\?\.type === "write"[\s\S]*_toolResultCache\.delete/, "写操作必须失效相关缓存");
-  // 可缓存工具集包含核心只读工具
-  assert.match(SRC, /"read".*"list".*"search"/, "缓存集必须包含 read/list/search");
+  // 实时文件系统工具不能进通用 TTL 缓存；否则会跨工作区复用旧内容，且忽略分页/范围。
+  const cacheSet = SRC.match(/const _CACHEABLE_TOOL_TYPES = new Set\(\[([\s\S]*?)\]\);/)?.[1] || "";
+  for (const liveFsTool of ["read", "list", "search", "find", "findfiles"]) {
+    assert.doesNotMatch(cacheSet, new RegExp(`"${liveFsTool}"`), `${liveFsTool} 必须实时读取，不能进入 5 分钟通用缓存`);
+  }
   assert.match(SRC, /"web".*"websearch".*"webfetch"/, "缓存集必须包含 web 搜索工具");
   assert.match(SRC, /"gitstatus".*"gitdiff".*"gitlog"/, "缓存集必须包含 git 只读工具");
 });
@@ -16503,7 +16838,9 @@ test("#85 结果缓存: _toolCacheKey 覆盖关键参数", () => {
 
 test("#85 Tool Ledger 分类增强: _recordToolCall 包含 category/failCategory/retryCount", () => {
   // _recordToolCall 必须包含新字段
-  assert.match(SRC, /category: _toolCategoryMap\[_rcToolName\]/, "ledger 记录必须包含 category");
+  // 原断言钉的是 `_toolCategoryMap[_rcToolName]` 直查。分类现在走 `_toolCategoryOf(name, type)`
+  // ——它在原表之外加了 key 归一化和后缀兜底（旧写法对 call.type 形式的名字会查空）。
+  assert.match(SRC, /category: _toolCategoryOf\(_rcToolName/, "ledger 记录必须包含 category");
   assert.match(SRC, /failCategory: !ok \? _classifyToolFailure/, "失败时必须包含 failCategory");
   assert.match(SRC, /retryCount: !ok \? _getToolFailureCount\(_rcToolName\)/, "失败时必须包含 retryCount");
   // _toolCategoryMap 必须存在且覆盖主要工具类别
@@ -16557,6 +16894,18 @@ test("P1 _toolFailureKey: git/gh 按 op 分开计数", () => {
   // 非 git/gh 工具保持原样
   assert.equal(fn({ type: "read" }), "read", "read 工具失败键必须是 read");
   assert.equal(fn({ type: "web_search" }), "web_search", "web_search 失败键必须是 web_search");
+  assert.equal(fn({ type: "read", path: "package.json" }, "/work/a"), "read:/work/a:package.json");
+  assert.equal(fn({ type: "find", pattern: "*.ts" }, "/work/a"), "find:/work/a:*.ts");
+  assert.notEqual(
+    fn({ type: "read", path: "package.json" }, "/work/a"),
+    fn({ type: "read", path: "tsconfig.json" }, "/work/a"),
+    "不同读取目标不能共享失败计数",
+  );
+  assert.notEqual(
+    fn({ type: "read", path: "package.json" }, "/work/a"),
+    fn({ type: "read", path: "package.json" }, "/work/b"),
+    "不同工作区的同名文件不能共享失败计数",
+  );
   // db 按 op 分开
   assert.equal(fn({ type: "db", op: "query" }), "db:query", "db query 失败键必须是 db:query");
   // 文件变更类按「类型+路径」分开计数：一个文件写失败不得连坐封死其他文件的写入
@@ -16603,22 +16952,20 @@ test("P1 _toolCacheKey: 包含 op 参数以区分 git/gh 操作", () => {
 test("P1 deferred 搜索工具全部纳入结果缓存", () => {
   // _CACHEABLE_TOOL_TYPES 必须包含所有主要 deferred 搜索工具
   const deferredTools = [
-    "academic_search", "package_search", "github_search", "github_repo",
+    "package_search", "github_search", "github_repo",
     "gitlab_search", "gitee_search", "codeberg_search", "cve_search",
     "wiki_search", "stackoverflow_search", "hackernews_search",
     "developer_community_search", "dockerhub_search", "pubmed_search",
     "arxiv_search", "crossref_search", "openalex_search", "pubchem_search",
     "clinical_trials_search", "maven_search", "packagist_search",
     "rubygems_search", "nuget_search", "homebrew_search", "mdn_search",
-    "cdnjs_search", "bundlephobia_search", "devto_search", "reddit_search",
-    "smzdm_search", "xianyu_search", "zhuanzhuan_search", "steam_search",
-    "iconify_search", "color_search", "lobsters_search", "juejin_search",
-    "codrops_search", "smashingmag_search", "css_tricks_search",
-    "codepen_search", "dribbble_search", "awwwards_search", "v2ex_search",
-    "segmentfault_search", "github_discussions_search", "producthunt_search",
-    "freecodecamp_search", "github_trending", "infoq_search",
-    "hackernoon_search", "bestofjs_search", "sourcegraph_search",
-    "deep_search", "realtime_news_feed",
+    "cdnjs_search", "bundlephobia_search", "devto_search", "steam_search",
+    "iconify_search", "juejin_search",
+    "codrops_search", "smashingmag_search",
+    "awwwards_search", "v2ex_search",
+    "segmentfault_search", "github_discussions_search", "github_trending", "infoq_search",
+    "sourcegraph_search",
+    "realtime_news_feed",
   ];
   for (const tool of deferredTools) {
     const pattern = new RegExp(`"${tool}"`);
@@ -16629,7 +16976,7 @@ test("P1 deferred 搜索工具全部纳入结果缓存", () => {
 test("P1 失败记忆框架使用 _toolFailureKey 而非 call?.type", () => {
   const wrapperSrc = extractFn("_executeToolStep");
   // 必须使用 _toolFailureKey 获取失败键
-  assert.match(wrapperSrc, /const _fmKey = _toolFailureKey\(call\)/, "必须用 _toolFailureKey 生成失败键");
+  assert.match(wrapperSrc, /const _fmKey = _toolFailureKey\(call, root\)/, "必须用工作区感知的 _toolFailureKey 生成失败键");
   assert.match(wrapperSrc, /_getToolFailureCount\(_fmKey\)/, "必须用 _fmKey 查询失败计数");
   assert.match(wrapperSrc, /_recordToolFailure\(_fmKey\)/, "必须用 _fmKey 记录失败");
   assert.match(wrapperSrc, /_resetToolFailure\(_fmKey\)/, "必须用 _fmKey 重置失败");
@@ -16652,12 +16999,11 @@ test("失败记忆：文件变更类的策略/瞬时拦截不计入 3 次硬封�
 test("P1 TOOL_METADATA: deferred 搜索工具批量含 usage_note", () => {
   const guideSrc = readFileSync(join(HERE, "../src/tool-guides.js"), "utf8");
   const deferredTools = [
-    "academic_search", "stackoverflow_search", "hackernews_search",
+    "stackoverflow_search", "hackernews_search",
     "developer_community_search", "arxiv_search", "mdn_search",
-    "juejin_search", "reddit_search", "github_trending",
-    "sourcegraph_search", "deep_search", "realtime_news_feed",
-    "smzdm_search", "xianyu_search",
-  ];
+    "juejin_search", "github_trending",
+    "sourcegraph_search", "realtime_news_feed",
+    ];
   for (const tool of deferredTools) {
     const pattern = new RegExp(`${tool}:[\\s\\S]*?usage_note:\\s*'`);
     assert.match(guideSrc, pattern, `${tool} 必须有 usage_note`);
@@ -16743,11 +17089,18 @@ test("P2 边界条件：git_log count 钳位 1-100", () => {
     "git_log count 必须钳位到 [1, 100]");
 });
 
-test("P2 generate_test_cases 输出不含 TODO 注释", () => {
-  // 检查 generate_test_cases 生成的测试代码不含 TODO/FIXME
-  const fnSrc = extractFn("_generateTestSkeleton");
-  assert.doesNotMatch(fnSrc, /TODO:/, "生成的测试骨架不应含 TODO: 注释");
-  assert.doesNotMatch(fnSrc, /FIXME:/, "生成的测试骨架不应含 FIXME: 注释");
+test("占位测试生成器已退休，智能体直接读实现并写可运行断言", () => {
+  const names = new Set(buildRegisteredToolSchemas().map((tool) => tool.function.name));
+  assert.equal(names.has("generate_test_cases"), false);
+  assert.doesNotMatch(SRC, /function _generateTestSkeleton\b|call\.type === "generate_test_cases"/);
+});
+
+test("实时新闻只暴露可用来源并真实并发执行", () => {
+  const schema = buildRegisteredToolSchemas().find((tool) => tool.function.name === "realtime_news_feed");
+  assert.deepEqual(schema.function.parameters.properties.sources.enum, ["hn", "devto", "all"]);
+  const execute = extractFn("_executeToolStepInner");
+  assert.match(execute, /Promise\.all\(selected\.map/);
+  assert.doesNotMatch(schema.function.description, /三源|Reddit/);
 });
 
 // ---- #89 卡死热点修复取证 ----
@@ -16904,9 +17257,13 @@ test("#88: web_fetch/web_search 错误消息友好化", () => {
 });
 
 test("#88: deferred search 工具错误消息友好化", () => {
-  // 通用 deferred search 错误消息包含排查建议
-  assert.match(SRC, /检查查询参数、网络连接或稍后重试/,
-    "deferred search 工具错误消息必须包含通用排查建议");
+  // 原来钉的是一句固定文案「检查查询参数、网络连接或稍后重试」。意图对（失败要给
+  // 排查建议），但那句话对**被反爬封锁**的源是错的建议 —— 实测 403/202 的源重试
+  // 一万次也不会好，而那句话正好在劝模型再试一次。契约升级为：必须按状态码分因。
+  assert.match(SRC, /const _blocked = /,
+    "必须按状态码判定「被封锁」，不能对所有失败给同一句建议");
+  assert.match(SRC, /重试无用/,
+    "判定为封锁时必须明说重试无用（否则模型会一直换词重试）");
 });
 
 test("#88: 联网工具失败记忆和结果缓存框架已覆盖", () => {
@@ -16917,7 +17274,9 @@ test("#88: 联网工具失败记忆和结果缓存框架已覆盖", () => {
   assert.match(SRC, /_CACHEABLE_TOOL_TYPES\.has[\s\S]*_toolResultCache/,
     "_executeToolStep 必须使用 _CACHEABLE_TOOL_TYPES 和 _toolResultCache");
   // 所有 deferred search 工具都在缓存集合里
-  assert.match(SRC, /"academic_search"[\s\S]*"package_search"[\s\S]*"github_search"/,
+  // 原来点名 ""，该工具已删（Semantic Scholar 无 key 持续 429）。
+  // 改用仍在册的三个，契约不变：deferred search 工具必须进结果缓存集合。
+  assert.match(SRC, /"package_search"[\s\S]*"github_search"[\s\S]*"wiki_search"/,
     "_CACHEABLE_TOOL_TYPES 必须包含 deferred search 工具");
 });
 
@@ -16988,14 +17347,21 @@ test("#92: _workspaceTreeSnapshot 深度自适应（移除硬上限 5）", () =>
 
 test("#92: 缓存指纹增强——包含一级子目录文件数", () => {
   // 指纹构建遍历一级子目录
-  assert.match(SRC, /_enhFp/,
-    "必须有增强指纹函数 _enhFp");
+  assert.match(SRC, /_agentRootFingerprint/,
+    "必须有增强指纹函数 _agentRootFingerprint");
   // 子目录文件计数拼入指纹
-  assert.match(SRC, /\$\{dn\}:\$\{sub\.length\}/,
-    "指纹必须包含子目录文件计数 (dn:count 格式)");
-  // 三处指纹构建都增强（缓存命中路径、重建路径、每轮核对路径）
-  const enhFpCount = (SRC.match(/_enhFp[23]?\s*=\s*\(ents\)/g) || []).length;
-  assert.ok(enhFpCount >= 3, `增强指纹函数至少出现 3 处，实际 ${enhFpCount} 处`);
+  // 目录名现在由 `_agentDirEntryName(e)` 取（旧版是裸变量 dn）——指纹改成异步并行
+  // readDir 时顺带做的。契约不变：一级子目录的文件数必须拼进指纹。
+  assert.match(SRC, /\$\{_agentDirEntryName\(e\)\}:\$\{sub\.length\}/,
+    "指纹必须包含子目录文件计数 (name:count 格式)");
+  // 原来这里断言"至少 3 处定义"——因为当时 _enhFp / _enhFp2 / _enhFp3 是三份逐字复制，
+  // 而且三份都调用了根本不存在的 backend.readDirSync。现在合并成唯一一个 async
+  // _agentRootFingerprint（并行 readDir），所以契约反过来：定义必须只有一份，
+  // 三条路径（缓存命中 / 重建 / 每轮核对）都调用它。
+  const fpDefs = (SRC.match(/function _agentRootFingerprint\s*\(/g) || []).length;
+  assert.equal(fpDefs, 1, `指纹函数必须只有一份定义，实际 ${fpDefs} 份`);
+  const fpCalls = (SRC.match(/_agentRootFingerprint\(/g) || []).length;
+  assert.ok(fpCalls >= 4, `三条路径都要调用指纹函数（含定义共 ≥4 处），实际 ${fpCalls} 处`);
   // 跳过忽略目录
   assert.match(SRC, /_AGENT_CONTEXT_SKIP_DIRS\.has\(dn\)/,
     "指纹增强必须跳过忽略目录");
@@ -17044,15 +17410,14 @@ test("#95: 失败记忆 wrapper 正则覆盖 system 工具的 [系统控制失�
   assert.ok(alts.includes("系统控制失败"), "alternation 必须含 系统控制失败");
 });
 
-test("#95: 15 个工具的 catch 块返回内容可被失败记忆框架检测", () => {
-  // location 工具 (5 个)
-  const locationTools = ["localdiscovery", "liveenvironment", "livemarkets", "liveflights", "roadenvironment"];
+test("#95: 在册工具的 catch 块返回内容可被失败记忆框架检测", () => {
+  const locationTools = ["localdiscovery", "liveenvironment"];
   // design 工具 (3 个)
   const designTools = ["learndesign", "designboard", "designresearch"];
   // 桌面自动化 (4 个)
   const desktopTools = ["readscreen", "uiclick", "system", "automation"];
   // 其他 (3 个)
-  const otherTools = ["tor", "realtime_news_feed", "debate"];
+  const otherTools = ["tor", "realtime_news_feed"];
   const allTools = [...locationTools, ...designTools, ...desktopTools, ...otherTools];
   // design_research 走子智能体路径(type:"subagent")，不在 _executeToolStepInner 中直接处理
   const directTools = allTools.filter(t => t !== "designresearch");
@@ -17081,9 +17446,8 @@ test("#95: 15 个工具的 catch 块返回内容可被失败记忆框架检测",
     "localdiscovery catch 块返回 [失败]");
   assert.match(SRC, /call\.type === "learndesign"[\s\S]{0,10000}\[失败\] learn_design/,
     "learndesign catch 块返回 [失败]");
-  // live* 工具共用 catch 块，返回 [失败]
-  assert.match(SRC, /liveenvironment[\s\S]{0,10000}livemarkets[\s\S]{0,10000}liveflights[\s\S]{0,10000}roadenvironment[\s\S]{0,10000}\[失败\]/,
-    "live*/road 共用 catch 块返回 [失败]");
+  assert.match(SRC, /call\.type === "liveenvironment"[\s\S]{0,10000}\[失败\]/,
+    "live_environment catch 块返回 [失败]");
 });
 
 test("#95: 失败记忆框架零新增依赖——仅改动 wrapper 正则", () => {
@@ -17091,8 +17455,8 @@ test("#95: 失败记忆框架零新增依赖——仅改动 wrapper 正则", () 
   assert.match(SRC, /function _recordToolFailure\(toolType\)/, "_recordToolFailure 定义必须存在");
   assert.match(SRC, /function _resetToolFailure\(toolType\)/, "_resetToolFailure 定义必须存在");
   assert.match(SRC, /function _getToolFailureCount\(toolType\)/, "_getToolFailureCount 定义必须存在");
-  // _toolFailureKey 仍按 git/gh/db 分 op，其他工具用 call.type
-  assert.match(SRC, /function _toolFailureKey\(call\)/, "_toolFailureKey 定义必须存在");
+  // _toolFailureKey 保留 git/gh/db 分 op，并允许文件系统工具带入工作区根。
+  assert.match(SRC, /function _toolFailureKey\(call, root = ""\)/, "_toolFailureKey 定义必须存在");
   // 确认 wrapper 中 _fmRecorded 防双重计数机制仍在
   const wrapperSrc = extractFn("_executeToolStep");
   assert.match(wrapperSrc, /_fmRecorded/, "wrapper 必须检查 _fmRecorded 防双重计数");
@@ -17254,6 +17618,9 @@ test("client modules have no undeclared identifiers", async () => {
     "setTimeout","window","setImmediate",
     // Feature-detected on purpose, always behind `typeof x !== "undefined"`
     "module","session",
+    // 构建期常量，不是运行时全局：vite.config.js 的 `define` 在打包/dev 时把它替换成
+    // 字面量。这里（node 直接跑测试）没有 define，所以源码里必须一直带 typeof 保护。
+    "__APP_VERSION__",
   ]);
 
   const FILES = ["src/main.js","src/tool-guides.js","src/markdown.js","src/conversation-memory.js","src/growth.js","src/i18n.js"];
@@ -17988,6 +18355,65 @@ test("sub-agent loop: search_tools is answered before the allowlist, via the pay
   assert.doesNotMatch(sub, /toolSchemas\.push/);
 });
 
+test("shared_store collaboration delivers bounded unseen sibling findings to a child inbox", () => {
+  const records = new Map([
+    ["jobs.sm_2", { findings: [
+      { source: "sm_1", content: "first concrete finding", isExternal: true },
+      { source: "sm_2", content: "own local progress", isExternal: false },
+      { source: "sm_3", content: "second concrete finding", isExternal: true },
+    ] }],
+  ]);
+  const store = { get: (key, fallback) => records.get(key) ?? fallback };
+  const drain = load("_drainSubAgentCollaborationInbox");
+  const first = drain(store, 2, 0, 6, 1600);
+  assert.equal(first.cursor, 3, "the cursor must advance over local and external records exactly once");
+  assert.match(first.message, /sm_1: first concrete finding/);
+  assert.match(first.message, /sm_3: second concrete finding/);
+  assert.doesNotMatch(first.message, /own local progress/, "a child must not feed its own dashboard status back to itself");
+
+  const second = drain(store, 2, first.cursor, 6, 1600);
+  assert.equal(second.message, "", "already-consumed sibling findings must not repeat on every model turn");
+  assert.equal(second.cursor, 3);
+});
+
+test("shared_store collaboration broadcasts successful evidence only to sibling inboxes", () => {
+  const delivered = [];
+  const store = { appendFinding: (jobId, finding) => delivered.push({ jobId, finding }) };
+  const broadcast = load("_broadcastSubAgentCollaborationFinding");
+  const count = broadcast(
+    store,
+    2,
+    [1, 2, 3, 3],
+    { type: "read", _toolName: "read_file", path: "src/api.js" },
+    { content: "The route delegates to createUser and returns the persisted id." },
+  );
+  assert.equal(count, 2);
+  assert.deepEqual(delivered.map((entry) => entry.jobId), ["sm_1", "sm_3"]);
+  assert.ok(delivered.every((entry) => entry.finding.isExternal === true));
+  assert.match(delivered[0].finding.content, /^\[read_file · src\/api\.js\]/);
+
+  assert.equal(broadcast(store, 2, [1, 3], { type: "read" }, { content: "[ERROR] unavailable" }), 0,
+    "failed tool output is not useful shared evidence and must not poison sibling context");
+});
+
+test("spawn_multiple_agents wires a real per-child collaboration inbox into the model loop", () => {
+  const sub = extractFn("_runSubAgent");
+  const drainAt = sub.indexOf("_drainSubAgentCollaborationInbox(");
+  const modelAt = sub.indexOf("_agentModelTurn(", drainAt);
+  assert.ok(drainAt > 0 && modelAt > drainAt,
+    "each child must consume newly-arrived sibling findings before its next model turn");
+  assert.match(sub, /if \(!turn\.toolCalls\.length\) \{[\s\S]{0,700}const lateInbox = _drainSubAgentCollaborationInbox/,
+    "a child finishing while a sibling reports must get one final integration turn");
+  assert.match(sub, /_broadcastSubAgentCollaborationFinding\([\s\S]{0,260}collaboration\.peerJobIds/,
+    "successful child tool evidence must flow into sibling inboxes during execution");
+
+  const spawnAt = SRC.indexOf("if (it.tc.name === \"spawn_multiple_agents\")");
+  const spawnBlock = SRC.slice(spawnAt, spawnAt + 6000);
+  assert.match(spawnBlock, /collaboration:\s*_smShared\s*\?\s*\{/);
+  assert.match(spawnBlock, /jobId,\s*\n\s*peerJobIds:\s*_smJobs/,
+    "the spawn path must pass stable job identity and the live peer roster to each child");
+});
+
 // ---------------------------------------------------------------------------
 // Fixes from the adversarial review of the gate work (2026-08-02).
 // Each of these was a CONFIRMED defect in the first version of the gates.
@@ -18136,8 +18562,12 @@ test("failure caches do not outlive the fact that produced them", () => {
   // A path that now exists must leave the negative cache, or the 2-strike gate refuses
   // reads of a file the agent itself just wrote.
   const loop = extractFn("_runAgenticLoop");
-  assert.match(loop, /if \(run\?\._failedPathAttempts\) \{[\s\S]{0,200}_failedPathAttempts\.delete/,
-    "a successful mutation must clear that path's miss count");
+  assert.match(loop, /const readFailureKey = _toolFailureKey\(\{ type: "read", path: rawKey \}, root\)/,
+    "a successful mutation must rebuild the same workspace-aware key used by read failures");
+  assert.match(loop, /_failedPathAttempts\?\.delete\(readFailureKey\)/,
+    "a successful mutation must clear that path's per-run miss count");
+  assert.match(loop, /_resetToolFailure\(readFailureKey\)/,
+    "a successful mutation must also clear the wrapper's three-strike failure memory");
   assert.match(loop, /\[mutationPath, actualPath, it\.call\?\.path\]/,
     "clear under every key the miss could have been recorded with");
   // The 3-strike tool memory is module-level; it must reset per run, or three invented
@@ -18260,7 +18690,7 @@ test("declared mutate/scaffold arms accounting no classifier could see", () => {
 test("the checkpoint route runs with phase-scoped deadlines", () => {
   const loop = extractFn("_runAgenticLoop");
   assert.match(loop, /deadlineMs: phase === "initial" \? 2800 : phase === "after_tools" \? 12000 : 8000/,
-    "the initial route must fit inside its caller's 3s race");
+    "the background initial route still needs a short resource deadline");
   assert.match(SRC, /deadlineMs = 20000/,
     "the orchestrator must take the deadline as a parameter");
   assert.match(SRC, /Math\.max\(1000, deadlineMs \| 0\)/,
@@ -18357,29 +18787,28 @@ test("a non-mutating run exits on the first quiet turn", () => {
 //      first written file closed it permanently.
 // Design knowledge is relevant for the entire UI build, so late is far better than never.
 // ---------------------------------------------------------------------------
-test("late intent backfill survives the first write", () => {
+test("late intent backfill is run-owned, non-blocking, and survives every write", () => {
   const loop = extractFn("_runAgenticLoop");
-  assert.match(loop, /const _lateBackfillOpen = !didMutate \|\| _implOps <= 3;/,
-    "the backfill window must not be closed by the first file written");
-  assert.match(loop, /if \(iter > 0 && _lateBackfillOpen && run\.engineering\?\.intentSource !== "ai"\)/,
-    "backfill must re-fire for session-inherited too, not just none — that was the residual design loss");
-  assert.doesNotMatch(loop, /_lateBackfillOpen && run\.engineering\?\.intentSource === "none"\)/,
-    "the narrow ===none gate missed the session-inherited case");
-  assert.doesNotMatch(loop, /if \(iter > 0 && !didMutate && run\.engineering\?\.intentSource === "none"\)/,
-    "the old narrow window is what lost michael-design on a slow classifier");
-  // The backfill now delegates to the shared helper, which refreshes the gateway profile.
-  assert.match(loop, /await _applyLateIntentIfLanded\(run, config, task, session, body, _live, messages\)/,
-    "the backfill must delegate to the shared late-intent apply");
+  assert.doesNotMatch(loop, /_lateBackfillOpen|_intentWaitUntil/,
+    "writes and empty projects must not create a polling window or close late adoption");
+  assert.match(loop, /run\._intentState = intentState/,
+    "the loop must own the exact classifier state created by sendPrompt");
+  assert.match(loop, /if \(run\.engineering\?\.intentSource !== "ai"\) \{\s*_applyLateIntentIfLanded\(/,
+    "every stable loop boundary checks the late result without sleeping");
+  assert.doesNotMatch(loop, /await\s+_applyLateIntentIfLanded/,
+    "late-result checks are synchronous and cannot delay model output");
   const applyLate = extractFn("_applyLateIntentIfLanded");
+  assert.match(applyLate, /intentState\?\.settled && intentState\.verdict/,
+    "a landed verdict comes from this run's exact physical promise");
+  assert.match(applyLate, /intentState\?\.context \|\| null/,
+    "cache lookup must use the original context fingerprint rather than mutable session state");
   assert.match(applyLate, /config\.ideSemanticProfile = _ideSemanticProfile\(run\.engineering\)/,
     "the refreshed profile must reach the gateway or the design modules stay off");
   assert.match(applyLate, /late\.intentSource !== "ai"/, "only a real (ai) late verdict may overwrite the profile");
-  // Greenfield: the design decision must land BEFORE the first UI write — a bounded wait
-  // on the first turn of an empty-workspace build, using the same helper.
-  assert.match(loop, /iter === 0 && isAgent && run\._emptyRootAtStart && run\.engineering\?\.intentSource !== "ai"/,
-    "an empty-workspace build must wait for the verdict before building the UI blind");
-  assert.match(loop, /Date\.now\(\) < _intentWaitUntil[\s\S]{0,180}_applyLateIntentIfLanded/,
-    "the greenfield wait must be bounded and use the shared apply");
+  assert.match(applyLate, /_startMichaelDesignPreflight\(\{ run, body, isLive \}\)/,
+    "a late design verdict starts the run-level background retrieval");
+  assert.match(loop, /_consumeMichaelDesignPreflight\(\)/,
+    "completed design evidence is injected only by a loop-boundary consumer");
 });
 
 test("an empty profile emits no design flag — the failure mode this guards", () => {
@@ -18473,7 +18902,10 @@ test("cold context snapshot builds the real digest before the warming-up fallbac
   // It must attempt the full gather, bounded by a race, on a non-empty cold workspace.
   assert.match(fn, /await Promise\.race\(\[\s*_gatherAgentContext\(query \|\| "", root\),/,
     "a cold miss must build README+tree+key-files, not just announce warming-up");
-  assert.match(fn, /setTimeout\(\(\) => r\(""\), 4500\)/, "the build must be bounded so it cannot hang");
+  assert.match(fn, /const coldWaitMs = Number\.isFinite\(Number\(options\?\.coldWaitMs\)\)/,
+    "callers may choose a shorter foreground cold-cache window");
+  assert.match(fn, /: 4500;[\s\S]{0,160}setTimeout\(\(\) => r\(""\), coldWaitMs\)/,
+    "the default remains bounded and the configured budget drives the timeout");
   // The real digest must be RETURNED before the thin fallback, not after it.
   const buildIdx = fn.indexOf("_gatherAgentContext(query");
   const fallbackIdx = fn.indexOf("后台上下文仍在预热");
@@ -18627,4 +19059,175 @@ test("_agentIntentExecutionBlock leads with the restatement but keeps raw text a
   // No restatement → no line (a clear message needs no rescue).
   const plain = block({ intentSource: "ai", intentSemantic: { continuation: "new", goal: "x" } });
   assert.doesNotMatch(plain, /读懂的诉求/);
+});
+
+// ---- 网关工具表与 IDE 注册表必须同步 ----
+test("提示词里引用的工具名、网关 tools.json、IDE 注册表三者不漂移", () => {
+  // 「假工具」的成因就是这里不同步：网关向模型宣告某工具存在，IDE 却没有实现，
+  // 模型照着调用 → 报错。2026-08-05 删掉 14 个失效的外部搜索工具时，IDE 侧三层
+  // 都清干净了，tools.json 里却 14 个全留着 —— 正是这条守卫要挡住的情况。
+  const gatewayRaw = readFileSync(join(HERE, "../../server/prompts/tools.json"), "utf8");
+  const gateway = new Set(
+    JSON.parse(gatewayRaw)
+      .map((t) => t?.function?.name)
+      .filter(Boolean),
+  );
+
+  // 判据是「IDE 能不能执行」，不是「在不在 _buildAgentToolSchemas 里」——架构是
+  // 网关下发完整 schema、IDE 负责执行（L0 只发工具名）。所以有些工具刻意不在
+  // 客户端注册表里，但 mapCall 有分支、能映射到可执行的 call.type。
+  // 用 mapCall 的 case 作为「可执行」的判据。
+  const mapStart = SRC.indexOf("function _mapToolCall");
+  assert.ok(mapStart > 0, "找不到 _mapToolCall");
+  let depth = 0, i = SRC.indexOf("{", mapStart), end = i;
+  while (end < SRC.length) {
+    if (SRC[end] === "{") depth++;
+    else if (SRC[end] === "}" && --depth === 0) break;
+    end++;
+  }
+  const mapBody = SRC.slice(i, end);
+  // 判据用 mapCall 的 case，因为**所有**工具调用都先经过 _mapToolCall。不要试图改成
+  // 「查 call.type === "x" 有没有执行分支」——分发实际有四种形式，任何只覆盖其中
+  // 一部分的检查都会误报：
+  //   1. call.type === "x"          最常见
+  //   2. toolName === "x"           run_cmd 走这条（→ call.type "cmd"）
+  //   3. type === "x"               subagent 走这条（不带 call. 前缀）
+  //   4. it.tc.name === "x"         spawn_multiple_agents 走这条（用工具原名）
+  // 而且 mapCall 会重映射：format_file→format、lsp_symbols→lsp、
+  // move_path→move、deploy_site→cmd、run_subagent→subagent。
+  const executable = new Set([...mapBody.matchAll(/case\s+"([a-z0-9_]+)"\s*:/g)].map((m) => m[1]));
+  // 别名表（alias: "real_tool"）也算能执行
+  for (const m of mapBody.matchAll(/\b[a-z0-9_]+:\s*"([a-z0-9_]+)"/g)) executable.add(m[1]);
+
+  // 网关宣告、IDE 无法映射执行 → 模型调用即失败
+  const phantom = [...gateway].filter((n) => !executable.has(n));
+  assert.deepEqual(phantom, [],
+    `网关 tools.json 宣告了 IDE 没有实现的工具（模型调用即失败）：\n  ${phantom.join("\n  ")}`);
+
+  // 提示词里点名的工具必须两边都真实存在
+  const engineering = readFileSync(join(HERE, "../../server/prompts/agent_engineering.txt"), "utf8");
+  for (const name of ["read_file", "edit_file", "multi_edit", "write_file",
+                      "find_files", "search", "get_diagnostics", "git_diff", "run_cmd"]) {
+    if (!engineering.includes(name)) continue;
+    assert.ok(executable.has(name), `agent_engineering.txt 点名了 IDE 无法执行的工具：${name}`);
+    assert.ok(gateway.has(name), `agent_engineering.txt 点名了网关 tools.json 里不存在的工具：${name}`);
+  }
+});
+
+test("客户端注册表与网关 tools.json 名称、参数和 required 完全一致", () => {
+  const registered = buildRegisteredToolSchemas();
+  const gateway = JSON.parse(SERVER_TOOLS);
+  const byName = (tools) => new Map(tools.map((tool) => [tool?.function?.name, tool]));
+  const clientByName = byName(registered);
+  const gatewayByName = byName(gateway);
+  assert.equal(clientByName.size, registered.length, "客户端注册表不能含重名工具");
+  assert.equal(gatewayByName.size, gateway.length, "网关目录不能含重名工具");
+  assert.deepEqual([...gatewayByName.keys()].sort(), [...clientByName.keys()].sort());
+
+  for (const [name, client] of clientByName) {
+    const server = gatewayByName.get(name);
+    const shape = (tool) => ({
+      properties: Object.keys(tool?.function?.parameters?.properties || {}).sort(),
+      required: [...(tool?.function?.parameters?.required || [])].sort(),
+    });
+    assert.deepEqual(shape(server), shape(client), `${name} 的客户端/网关参数契约漂移`);
+  }
+});
+
+test("每个注册 schema 的最小示例都能映射且不产生 _error", () => {
+  const schemas = buildRegisteredToolSchemas();
+  const names = new Set(schemas.map((schema) => schema.function.name));
+  const mapCall = load("_mapToolCall", {
+    _applyToolArgDefaults: undefined,
+    _normalizeArgKeys: (args) => args,
+    _STR_ARG_KEYS: new Set(),
+    _KNOWN_TOOLS: names,
+    _canonicalToolName: () => "",
+    _mcpToolMap: new Map(),
+    _finiteNumberArg: load("_finiteNumberArg"),
+    _normPlanSteps: (steps) => steps,
+    _preferredLanguageCode: () => "en",
+    _michaelBase: () => "https://code.mrday.one",
+    _RESEARCH_PROMPT: (value) => String(value || ""),
+    _DESIGN_RESEARCH_PROMPT: (value) => String(value || ""),
+    _WIKI_PROMPT: (value) => String(value || ""),
+    t: (key) => key,
+  });
+  for (const schema of schemas) {
+    const name = schema.function.name;
+    const mapped = mapCall(name, compactToolExampleArgs(schema), new Map());
+    assert.notEqual(mapped?.type, "unknown", `${name} 没有 _mapToolCall 分支`);
+    assert.ok(mapped?.type, `${name} 必须映射为可执行 call.type`);
+    assert.equal(mapped?._error, undefined, `${name} 的 compactToolExampleArgs 映射失败: ${mapped?._error}`);
+  }
+});
+
+test("debate 工具会保留立场参数并走并行报告 + 裁判汇总路径", () => {
+  const mapCall = load("_mapToolCall", {
+    _applyToolArgDefaults: undefined,
+    _normalizeArgKeys: (args) => args,
+    _STR_ARG_KEYS: new Set(),
+    _KNOWN_TOOLS: new Set(["debate"]),
+    _canonicalToolName: () => "",
+    _mcpToolMap: new Map(),
+    _finiteNumberArg: () => null,
+    _normPlanSteps: (steps) => steps,
+    _preferredLanguageCode: () => "en",
+    _michaelBase: () => "https://code.mrday.one",
+    _RESEARCH_PROMPT: (value) => String(value || ""),
+    _DESIGN_RESEARCH_PROMPT: (value) => String(value || ""),
+    _WIKI_PROMPT: (value) => String(value || ""),
+    t: (key) => key,
+  });
+  const mapped = mapCall("debate", {
+    question: "React 还是 Vue？",
+    perspectives: ["支持 React", "支持 Vue", "工程实践"],
+    context: "现有项目已有 Vue 代码",
+  }, new Map());
+  assert.equal(mapped.type, "debate");
+  assert.deepEqual(mapped.perspectives, ["支持 React", "支持 Vue", "工程实践"]);
+  assert.equal(mapped.context, "现有项目已有 Vue 代码");
+  assert.match(SRC, /it\.tc\.name === "debate"/);
+  assert.match(SRC, /Promise\.allSettled\(stanceList\.map/);
+  assert.match(SRC, /description: "辩论·裁判"/);
+});
+
+test("Rust tauri::command 全部在 lib.rs invoke_handler 注册", () => {
+  const handler = TAURI_LIB.match(/\.invoke_handler\(tauri::generate_handler!\[([\s\S]*?)\]\)/)?.[1] || "";
+  assert.ok(handler, "找不到 tauri::generate_handler! 注册表");
+  const registered = new Set(
+    [...handler.matchAll(/(?:^|,)\s*(?:#\[[\s\S]*?\]\s*)?(?:[a-z_][a-z0-9_]*::)*([a-z_][a-z0-9_]*)\s*(?=,|$)/gm)]
+      .map((match) => match[1]),
+  );
+  const commands = [];
+  for (const file of readdirSync(join(HERE, "../src-tauri/src")).filter((name) => name.endsWith(".rs"))) {
+    const source = readFileSync(join(HERE, "../src-tauri/src", file), "utf8");
+    for (const match of source.matchAll(/#\[tauri::command(?:\([^\]]*\))?\]\s*(?:#\[[^\]]+\]\s*)*(?:pub(?:\([^)]*\))?\s+)?(?:async\s+)?fn\s+([a-z_][a-z0-9_]*)/g)) {
+      commands.push(`${file}:${match[1]}`);
+    }
+  }
+  const missing = commands.filter((entry) => !registered.has(entry.slice(entry.indexOf(":") + 1)));
+  assert.deepEqual(missing, [], `Tauri command 未注册:\n${missing.join("\n")}`);
+});
+
+test("sync-tools-json --check 会拒绝目录独有工具", () => {
+  const fixtureDir = mkdtempSync(join(tmpdir(), "michael-tools-sync-"));
+  try {
+    const mainPath = join(fixtureDir, "main.js");
+    const toolsPath = join(fixtureDir, "tools.json");
+    writeFileSync(mainPath, `function _buildAgentToolSchemas() { return [{type:"function",function:{name:"real_tool",parameters:{type:"object",properties:{},required:[]}}}]; }\n`);
+    writeFileSync(toolsPath, JSON.stringify([
+      { type: "function", function: { name: "real_tool", parameters: { type: "object", properties: {}, required: [] } } },
+      { type: "function", function: { name: "orphan_tool", parameters: { type: "object", properties: {}, required: [] } } },
+    ]));
+    const result = spawnSync(process.execPath, [join(HERE, "../build/sync-tools-json.mjs"), "--check"], {
+      encoding: "utf8",
+      env: { ...process.env, MICHAEL_IDE_MAIN_PATH: mainPath, MICHAEL_IDE_TOOLS_JSON_PATH: toolsPath },
+    });
+    assert.equal(result.status, 1);
+    assert.match(result.stdout, /only in tools\.json:\s+1/);
+    assert.match(result.stderr, /advertises tools absent from the client registry/);
+  } finally {
+    rmSync(fixtureDir, { recursive: true, force: true });
+  }
 });

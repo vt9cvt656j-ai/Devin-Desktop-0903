@@ -795,7 +795,9 @@ const OCR_HELPER_LEGACY_ABS: &[&str] = &[
 fn ocr_helper_dir() -> Option<std::path::PathBuf> {
     use std::os::unix::fs::PermissionsExt;
     let home = std::env::var("HOME").ok()?;
-    let dir = std::path::PathBuf::from(home).join(".michael-ide").join("bin");
+    let dir = std::path::PathBuf::from(home)
+        .join(".michael-ide")
+        .join("bin");
     std::fs::create_dir_all(&dir).ok()?;
     // 只有自己能进：即使别人猜到路径也放不进文件。
     let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
@@ -1152,10 +1154,7 @@ return JSON.stringify({operated:operated,changed:changed});
             src.contains("frontmostApplication"),
             "必须按前台 App 挑窗口，否则又变回整屏 OCR（会读到背景窗口内容）"
         );
-        assert!(
-            src.contains("optionIncludingWindow"),
-            "必须只截目标窗口"
-        );
+        assert!(src.contains("optionIncludingWindow"), "必须只截目标窗口");
         assert!(
             src.contains("boundsIgnoreFraming"),
             "少了它截图会带窗口阴影，比例推导和坐标偏移全部偏掉"

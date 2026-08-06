@@ -45,12 +45,11 @@ class SharedStore {
     // 深拷贝避免引用泄漏
     const clonedValue = JSON.parse(JSON.stringify(value));
     
-    // 替换旧数据
+    // Replacing a value must not remove subscribers. The old implementation
+    // dropped listeners on every update, so a collaboration channel silently
+    // stopped receiving findings after its first message.
     const oldValue = this.memory.get(fullPath);
-    if (oldValue !== undefined) {
-      this._removeListeners(fullPath);
-      this._updateLRU(fullPath, -1); // 从 LRU 移除
-    }
+    if (oldValue !== undefined) this._updateLRU(fullPath, -1); // 从 LRU 移除
     
     // 插入新数据
     this.memory.set(fullPath, clonedValue);
@@ -107,12 +106,17 @@ class SharedStore {
     
     for (const key of keyList) {
       const fullPath = this._normalizeKey(key);
-      
-      if (this.memory.has(fullPath)) {
-        this._removeListeners(fullPath);
-        this.ttlMap.delete(fullPath);
-        this._updateLRU(fullPath, -1);
-        this.memory.delete(fullPath);
+
+      // A record may have been written using either `jobs.id` or
+      // `jobs.id.status`. Deleting the record must remove both forms so stale
+      // child fields cannot resurrect an old status on the next read.
+      const keysToDelete = [...this.memory.keys()].filter((candidate) =>
+        candidate === fullPath || candidate.startsWith(`${fullPath}.`));
+      for (const candidate of keysToDelete) {
+        this._removeListeners(candidate);
+        this.ttlMap.delete(candidate);
+        this._updateLRU(candidate, -1);
+        this.memory.delete(candidate);
         deletedCount++;
       }
     }
@@ -207,23 +211,20 @@ class SharedStore {
    * 获取活跃 job 列表
    */
   getActiveJobs() {
-    const jobs = this.query('jobs.*');
-    return jobs
-      .filter(({ key, value }) => {
-        const status = this._getValueAtPath(value, 'status');
-        return status === 'running' || status === 'pending';
-      })
-      .map(({ key, value }) => ({
-        jobId: key.split('.').pop(),
-        ...value
-      }));
+    const ids = new Set();
+    for (const key of this.memory.keys()) {
+      const match = /^jobs\.([^.]+)/.exec(key);
+      if (match) ids.add(match[1]);
+    }
+    return [...ids].map((jobId) => ({ jobId, ...this._readRecord(`jobs.${jobId}`) }))
+      .filter((job) => job.status === 'running' || job.status === 'pending');
   }
 
   /**
    * 创建新的 job 记录
    */
-  createJob(jobMeta) {
-    const jobId = `job_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+  createJob(jobMeta, requestedJobId = '') {
+    const jobId = String(requestedJobId || `job_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`);
     
     this.set(`jobs.${jobId}`, {
       ...jobMeta,
@@ -244,11 +245,15 @@ class SharedStore {
    * 更新 job 状态
    */
   updateJobStatus(jobId, status, progress) {
-    this.set(`jobs.${jobId}.status`, status);
-    if (progress !== undefined) {
-      this.set(`jobs.${jobId}.progress`, progress);
-    }
-    this.set(`jobs.${jobId}.updatedAt`, Date.now());
+    const key = `jobs.${jobId}`;
+    const record = this._readRecord(key) || {};
+    const next = { ...record, status, updatedAt: Date.now() };
+    if (progress !== undefined) next.progress = progress;
+    this.set(key, next);
+    // Keep path-level subscriptions working while storing one coherent record.
+    this._notifyListeners(`${key}.status`, status);
+    if (progress !== undefined) this._notifyListeners(`${key}.progress`, progress);
+    this._notifyListeners(`${key}.updatedAt`, next.updatedAt);
     
     // 触发事件
     this.publish('jobs.statusChanged', { jobId, status, progress });
@@ -260,7 +265,9 @@ class SharedStore {
    * 添加 finding 到指定 job
    */
   appendFinding(jobId, finding) {
-    const findings = this.get(`jobs.${jobId}.findings`, []);
+    const key = `jobs.${jobId}`;
+    const record = this._readRecord(key) || {};
+    const findings = Array.isArray(record.findings) ? [...record.findings] : [];
     
     // 添加 timestamp 和元数据
     const enrichedFinding = {
@@ -276,7 +283,9 @@ class SharedStore {
       findings.shift();
     }
     
-    this.set(`jobs.${jobId}.findings`, findings);
+    const next = { ...record, findings, updatedAt: Date.now() };
+    this.set(key, next);
+    this._notifyListeners(`${key}.findings`, findings);
     
     // 每 10 条 triggering 一次聚合事件
     if (findings.length % 10 === 0) {
@@ -367,6 +376,39 @@ class SharedStore {
     }, obj);
   }
 
+  // Read a record written as one object and transparently merge legacy
+  // path-style entries (`jobs.id.status`) that may still exist in memory.
+  // The object entry wins over legacy children, so an update cannot be
+  // overwritten by a stale field left by an older build.
+  _readRecord(prefix) {
+    const prefixDot = `${prefix}.`;
+    const record = {};
+    let found = false;
+    for (const [key, value] of this.memory.entries()) {
+      if (!key.startsWith(prefixDot)) continue;
+      const path = key.slice(prefixDot.length).split('.');
+      this._setValueAtPath(record, path, value);
+      found = true;
+    }
+    const base = this.memory.get(prefix);
+    if (base !== undefined) {
+      if (base && typeof base === 'object' && !Array.isArray(base)) Object.assign(record, base);
+      else return base;
+      found = true;
+    }
+    return found ? record : undefined;
+  }
+
+  _setValueAtPath(target, path, value) {
+    if (!path.length) return;
+    let cursor = target;
+    for (const part of path.slice(0, -1)) {
+      if (!cursor[part] || typeof cursor[part] !== 'object') cursor[part] = {};
+      cursor = cursor[part];
+    }
+    cursor[path[path.length - 1]] = value;
+  }
+
   _notifyListeners(key, value) {
     const callbacks = this.listeners.get(key) || new Set();
     
@@ -414,9 +456,11 @@ class SharedStore {
   }
 
   _startCleanupTicker() {
-    setInterval(() => {
+    const timer = setInterval(() => {
       this.cleanupExpired();
     }, this.cleanupInterval);
+    // A store used by tests or a short-lived preview must not keep Node alive.
+    if (typeof timer?.unref === 'function') timer.unref();
   }
 
   _patternToRegex(pattern) {

@@ -1,9 +1,9 @@
 /**
- * Reads the IDE's real tool catalog out of src/main.js and writes public/tools.json.
+ * Reads the IDE's real runtime tool catalog and writes public/tools.json.
  *
- * The site renders whatever this emits, so adding a tool to `_buildAgentToolSchemas`
- * and rebuilding is all it takes for the gallery to pick it up — there is no second
- * list to keep in sync.
+ * Evaluate `_buildAgentToolSchemas(true, [])` instead of scanning every schema
+ * literal in main.js: retired helpers and the separately defined search_tools meta
+ * schema are not part of the runtime catalog and must not leak into the gallery.
  */
 import { readFileSync, writeFileSync, mkdirSync } from "node:fs";
 import { dirname, resolve } from "node:path";
@@ -15,15 +15,96 @@ const OUT = resolve(here, "../public/tools.json");
 
 const src = readFileSync(SOURCE, "utf8");
 
-// Tool schemas are declared as `{ type: "function", function: { name: "…" } }`.
-const names = [];
-for (const m of src.matchAll(/function:\s*\{\s*name:\s*"([a-z_0-9]+)"/g)) {
-  if (!names.includes(m[1])) names.push(m[1]);
+function skipString(source, index, quote) {
+  for (index++; index < source.length; index++) {
+    if (source[index] === "\\") index++;
+    else if (source[index] === quote) return index;
+  }
+  return index;
 }
-if (names.length < 50) {
-  throw new Error(
-    `extract-tools: only found ${names.length} tools — the schema shape in src/main.js probably changed.`,
+
+function skipRegex(source, index) {
+  let characterClass = false;
+  for (index++; index < source.length; index++) {
+    if (source[index] === "\\") index++;
+    else if (source[index] === "[") characterClass = true;
+    else if (source[index] === "]") characterClass = false;
+    else if (source[index] === "/" && !characterClass) return index;
+  }
+  return index;
+}
+
+function skipTemplate(source, index) {
+  for (index++; index < source.length; index++) {
+    if (source[index] === "\\") index++;
+    else if (source[index] === "`") return index;
+    else if (source[index] === "$" && source[index + 1] === "{") {
+      index += 2;
+      let depth = 1;
+      for (; index < source.length && depth > 0; index++) {
+        const char = source[index];
+        if (char === "\\") index++;
+        else if (char === "'" || char === '"') index = skipString(source, index, char);
+        else if (char === "`") index = skipTemplate(source, index);
+        else if (char === "{") depth++;
+        else if (char === "}") depth--;
+      }
+      index--;
+    }
+  }
+  return index;
+}
+
+function isRegexPosition(source, index) {
+  let previous = index - 1;
+  while (previous >= 0 && /\s/.test(source[previous])) previous--;
+  if (previous < 0 || "=([,{;:!&|?+-*%<>~^".includes(source[previous])) return true;
+  return /(?:^|[^\w$])(return|typeof|case|in|of|do|else|void|delete|instanceof|yield|await)$/.test(
+    source.slice(Math.max(0, previous - 12), previous + 1),
   );
+}
+
+function extractFunction(name) {
+  const match = new RegExp(`(?:async\\s+)?function\\s+${name}\\s*\\(`).exec(src);
+  if (!match) throw new Error(`extract-tools: function ${name} not found in main.js.`);
+  let index = src.indexOf("{", match.index);
+  let depth = 0;
+  for (; index < src.length; index++) {
+    const char = src[index];
+    const next = src[index + 1];
+    if (char === "/" && next === "/") {
+      index = src.indexOf("\n", index);
+      if (index < 0) index = src.length;
+    } else if (char === "/" && next === "*") {
+      index = src.indexOf("*/", index + 2) + 1;
+    } else if (char === "'" || char === '"') {
+      index = skipString(src, index, char);
+    } else if (char === "`") {
+      index = skipTemplate(src, index);
+    } else if (char === "/" && isRegexPosition(src, index)) {
+      index = skipRegex(src, index);
+    } else if (char === "{") {
+      depth++;
+    } else if (char === "}" && --depth === 0) {
+      return src.slice(match.index, index + 1);
+    }
+  }
+  throw new Error(`extract-tools: unbalanced braces in ${name}.`);
+}
+
+const buildCatalog = new Function(
+  "inTauri",
+  "_applyCloudToolDescs",
+  `${extractFunction("_buildAgentToolSchemas")}\n;return _buildAgentToolSchemas;`,
+)(true, (tools) => tools);
+const names = buildCatalog(true, [])
+  .map((tool) => tool?.function?.name)
+  .filter(Boolean);
+if (names.length < 50) {
+  throw new Error(`extract-tools: only found ${names.length} runtime tools.`);
+}
+if (new Set(names).size !== names.length) {
+  throw new Error("extract-tools: runtime catalog contains duplicate tool names.");
 }
 
 /** Group by what the tool actually touches. Order matters: first match wins. */
@@ -31,13 +112,13 @@ const GROUPS = [
   ["Files", /^(read_file|write_file|edit_file|multi_edit|list_dir|create_dir|copy_path|move_path|delete_path|format_file|read_logs|download_file)$/],
   // Searching YOUR repository, kept apart from the research lookups below.
   ["Code search", /^(search|find_files|semantic_search|find_symbol|search_tools|deep_search|sourcegraph_search)$/],
-  ["Code intelligence", /^(lsp_|get_diagnostics|generate_test_cases|visual_explain)/],
+  ["Code intelligence", /^(lsp_|get_diagnostics|visual_explain)/],
   ["Git & GitHub", /^(git_|gh_|gitlab_|gitee_|codeberg_)/],
   ["Terminal & system", /^(run_cmd|run_in_terminal|read_terminal|list_terminals|stop_terminal|system|worktree|docker_compose_up|background_monitor)$/],
-  ["Agents", /^(run_subagent|await_subagent|spawn_multiple_agents|run_worker|debate|research_project|generate_wiki|update_plan|ask_user|recall_conversation|remember)$/],
-  ["Web & browser", /^(browser|web_fetch|web_search|http_request|tor_request|screenshot|read_screen|ui_click|automation|capture_|decode_qr|remote|start_demo|stop_demo)/],
-  ["Design & media", /^(design_|learn_design|generate_image|visual_compare|preview_choices|iconify_search|color_search)/],
-  ["Data", /^(db_query|openapi_parser|performance_profile|live_|road_environment|track_shipment|shop_catalog|realtime_news_feed|current_time|local_discovery)/],
+  ["Agents", /^(run_subagent|await_subagent|spawn_multiple_agents|run_worker|research_project|generate_wiki|update_plan|ask_user|recall_conversation|remember)$/],
+  ["Web & browser", /^(browser|web_fetch|web_search|http_request|tor_request|screenshot|read_screen|ui_click|automation|computer|capture_|decode_qr|remote|start_demo|stop_demo)/],
+  ["Design & media", /^(design_|learn_design|generate_(image|3d|sound|music|voice|motion|texture)|auto_rig|search_game_assets|download_asset|game_scaffold|web_scaffold|visual_compare|preview_choices|iconify_search|color_search)/],
+  ["Data", /^(db_query|openapi_parser|performance_profile|live_environment|realtime_news_feed|current_time|local_discovery)/],
   ["Deploy", /^(deploy_site)$/],
   // Everything else ending in _search is a research lookup against a public corpus.
   ["Research", /_search$|^github_repo$|^github_trending$|^gitlab_repo$|^gitee_repo$|^codeberg_repo$/],

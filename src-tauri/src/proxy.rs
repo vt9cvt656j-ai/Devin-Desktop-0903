@@ -163,8 +163,8 @@ impl Drop for Running {
         let _ = self.child.kill();
         let _ = self.child.wait();
         set_active_port(None); // capture stopped → browser stops routing through it
-        // 代理进程没了，系统代理就必须跟着还原 —— 否则整机流量继续指向一个死端口。
-        // 这里覆盖所有退出路径：正常停止、应用退出、以及 panic 时的栈展开。
+                               // 代理进程没了，系统代理就必须跟着还原 —— 否则整机流量继续指向一个死端口。
+                               // 这里覆盖所有退出路径：正常停止、应用退出、以及 panic 时的栈展开。
         restore_system_proxy();
     }
 }
@@ -334,8 +334,12 @@ pub fn proxy_set_system_proxy(enable: bool, port: u16) -> Result<(), String> {
                     let (s_on, s_srv, s_port) = parse_proxy_readout(&https);
                     *g = Some(SystemProxyBackup {
                         service: svc.clone(),
-                        http_on: h_on, http_server: h_srv, http_port: h_port,
-                        https_on: s_on, https_server: s_srv, https_port: s_port,
+                        http_on: h_on,
+                        http_server: h_srv,
+                        http_port: h_port,
+                        https_on: s_on,
+                        https_server: s_srv,
+                        https_port: s_port,
                     });
                 }
             }
@@ -432,7 +436,13 @@ mod proxy_backup_tests {
 
     #[test]
     fn missing_fields_do_not_panic() {
-        assert_eq!(parse_proxy_readout(""), (false, String::new(), String::new()));
-        assert_eq!(parse_proxy_readout("garbage"), (false, String::new(), String::new()));
+        assert_eq!(
+            parse_proxy_readout(""),
+            (false, String::new(), String::new())
+        );
+        assert_eq!(
+            parse_proxy_readout("garbage"),
+            (false, String::new(), String::new())
+        );
     }
 }

@@ -5,6 +5,10 @@
  * 1. 解析参数中的 agents 数组
  * 2. 每个 agent 派发独立的 JobQueue job
  * 3. 可选启用 SharedStore 协同模式
+ *
+ * This compatibility module is only usable when the host injects the real
+ * Agent runner into `context.jobQueue`. It deliberately does not fall back to
+ * the old simulated runner.
  */
 
 export function createSpawnMultipleAgentsTool() {
@@ -99,6 +103,13 @@ export async function executeSpawnMultipleAgents(args, context) {
   
   const _globalJobQueue = context.jobQueue;
   const _globalSharedStore = context.sharedStore;
+
+  if (!_globalJobQueue || typeof _globalJobQueue.submit !== 'function' || typeof _globalJobQueue.runner !== 'function') {
+    throw new Error("spawn_multiple_agents requires a JobQueue with an injected Agent runner");
+  }
+  if (!_globalSharedStore || typeof _globalSharedStore.on !== 'function') {
+    throw new Error("spawn_multiple_agents requires a SharedStore collaboration context");
+  }
   
   if (!agents || !Array.isArray(agents) || agents.length === 0) {
     throw new Error("必须提供至少一个 agent");

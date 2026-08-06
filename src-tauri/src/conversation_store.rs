@@ -1746,7 +1746,11 @@ mod tests {
             .iter()
             .map(|s| s["id"].as_str().unwrap())
             .collect();
-        assert_eq!(open, ["kept_open"], "hydration must not add tabs the snapshot omitted");
+        assert_eq!(
+            open,
+            ["kept_open"],
+            "hydration must not add tabs the snapshot omitted"
+        );
 
         // ...but the conversation itself is preserved, just closed — never silently dropped.
         let closed: Vec<&str> = snapshot["closedSessions"]
@@ -1755,7 +1759,11 @@ mod tests {
             .iter()
             .map(|s| s["id"].as_str().unwrap())
             .collect();
-        assert_eq!(closed, ["user_closed_it"], "the omitted session must survive as closed");
+        assert_eq!(
+            closed,
+            ["user_closed_it"],
+            "the omitted session must survive as closed"
+        );
     }
 
     #[tokio::test]

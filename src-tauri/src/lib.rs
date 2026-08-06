@@ -15,6 +15,7 @@ mod files;
 mod game;
 mod game_assets;
 mod git;
+mod handoff;
 mod image_location;
 mod knowledge;
 mod local_discovery;
@@ -29,7 +30,6 @@ mod public_data;
 mod qr;
 #[macro_use]
 mod safelog;
-mod shop_catalog;
 mod sysctl;
 mod tasks;
 mod terminal;
@@ -107,10 +107,8 @@ fn install_panic_logger() {
             // macOS 标准日志位置再落一份，方便用户直接在 Console.app 里找到尸检记录。
             #[cfg(target_os = "macos")]
             {
-                let logs = std::path::PathBuf::from(
-                    std::env::var("HOME").unwrap_or_default(),
-                )
-                .join("Library/Logs");
+                let logs = std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default())
+                    .join("Library/Logs");
                 if let Ok(mut f) = std::fs::OpenOptions::new()
                     .create(true)
                     .append(true)
@@ -162,6 +160,15 @@ pub fn run() {
             }
 
             files::bootstrap_home_root();
+
+            // Loopback listener the web sign-in page uses to adopt this app's session.
+            // It starts signed-out; the frontend fills it in via handoff_set_session.
+            handoff::start();
+
+            // WebKit fetches do not share the Rust AI client's connection pool. Warm
+            // that pool in the background so the first model turn does not pay a cold
+            // gateway TCP+TLS handshake, then retain it across idle agent/tool work.
+            ai::start_gateway_transport_warmup();
 
             tauri::async_runtime::spawn(async {
                 if let Err(e) = auth::init_db().await {
@@ -250,7 +257,11 @@ pub fn run() {
             location::request_current_location,
             db::db_query,
             mcp::mcp_connect,
+            mcp::mcp_connect_full,
             mcp::mcp_call,
+            mcp::mcp_call_full,
+            mcp::mcp_read_resource,
+            mcp::mcp_get_prompt,
             mcp::mcp_status,
             mcp::mcp_disconnect,
             capture::capture_url,
@@ -317,12 +328,12 @@ pub fn run() {
             auth::auth_check_email,
             auth::auth_send_code,
             auth::auth_verify_code,
+            handoff::handoff_set_session,
             auth::db_marketplace_list,
             auth::db_marketplace_upsert,
             accessibility::read_screen,
             accessibility::ui_click,
             automation::automation_call,
-            knowledge::academic_search,
             knowledge::package_search,
             knowledge::github_search,
             knowledge::github_repo,
@@ -352,40 +363,21 @@ pub fn run() {
             knowledge::cdnjs_search,
             knowledge::bundlephobia_search,
             knowledge::devto_search,
-            knowledge::reddit_search,
-            knowledge::smzdm_search,
-            knowledge::xianyu_search,
-            knowledge::zhuanzhuan_search,
             knowledge::steam_search,
             knowledge::iconify_search,
-            knowledge::color_search,
-            knowledge::lobsters_search,
             knowledge::juejin_search,
             knowledge::codrops_search,
             knowledge::smashingmag_search,
-            knowledge::css_tricks_search,
-            knowledge::codepen_search,
-            knowledge::dribbble_search,
             knowledge::awwwards_search,
             knowledge::v2ex_search,
             knowledge::segmentfault_search,
             knowledge::github_discussions_search,
-            knowledge::producthunt_search,
-            knowledge::freecodecamp_search,
             knowledge::github_trending,
             knowledge::infoq_search,
-            knowledge::hackernoon_search,
             knowledge::codeberg_search,
-            knowledge::bestofjs_search,
             knowledge::sourcegraph_search,
-            knowledge::deep_search,
             local_discovery::local_discovery,
             public_data::live_environment,
-            public_data::live_markets,
-            public_data::live_flights,
-            public_data::road_environment,
-            public_data::track_shipment,
-            shop_catalog::shop_catalog,
             game::game_scaffold,
             web_scaffold::web_scaffold,
             game_assets::generate_3d,
