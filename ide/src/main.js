@@ -40554,7 +40554,13 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
             run._subAgentJobSeq = (run._subAgentJobSeq || 0) + 1;
             const jobId = run._subAgentJobSeq;
             const desc = `${spec.role}·${String(spec.focus).slice(0, 16)}`;
-            const job = { id: jobId, desc, status: "running", startedAt: Date.now(), result: "", consumed: false, promise: null, dispatchLedgerLen: _smLedgerLen };
+            // role 存进作业本身：会诊归总要按角色署名（"后端说 X、安全说 Y"），
+            // 只有 desc 的话归总里全是任务描述，看不出这是谁的意见。
+            const job = { id: jobId, desc, role: spec.role, status: "running", startedAt: Date.now(), result: "", consumed: false, promise: null, dispatchLedgerLen: _smLedgerLen };
+            // 会诊归总在 await_subagent 里做，而那个执行器只拿得到 (step, call, root, run)。
+            // 派发时把归总要用的 config 和渲染容器挂到 run 上，别在那边硬凑。
+            run._panelConfig = config;
+            run._panelBody = body;
             run._subAgentJobs.set(jobId, job);
             run._parallelDispatches = (run._parallelDispatches || 0) + 1;
             // 控制台可见性：同步登记到 SharedStore（面板/仪表盘读这里）
@@ -40585,7 +40591,11 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
                     if (other !== jobId) _globalSharedStore.appendFinding(`sm_${other}`, { source: `sm_${jobId}`, channel: "collaboration", content: digest, isExternal: true });
                   }
                 }
-                if (window.collaborationEngine) window.collaborationEngine.trackTokenUsage("main_session", Math.ceil(job.result.length / 4));
+                // 这里原本调 collaborationEngine.trackTokenUsage：它把用量记进一个
+                // 写死的 100k 预算，超了就 console.warn。那个预算和真实上下文窗口没有
+                // 任何关系，IDE 自己的上下文计量在别处（_setContextMeter），所以这条
+                // 只会在长会话里反复报一个假警。CollaborationEngine 其余能力至今没有
+                // 接进主流程，协同实际走的是共享黑板那条路。模块和它的测试保留原样。
               } catch {}
               return job.result;
             }).catch((error) => {
@@ -47504,7 +47514,44 @@ return { type: call.type, path: call.query || "", content: `[失败] ${call.type
       }
       res.className = "atc-result atc-result--ok"; res.textContent = t("subagent.jobsSettled", { count: _targets.length });
       const _factHead = _idleWait ? "[事实] 派发后未做任何其他工作就开始等待 = 同步阻塞，异步失去意义。下次：单个聚焦调研直接自己读；派了后台作业就先推进其他步骤，结果会自动送达。\n" : "";
-      return { type: "awaitsubagent", path: _want, content: (_factHead + _parts.join("\n")).slice(0, 3200) };
+
+      // 多角色专家会诊的最后一环：把 N 份报告**收敛成一份**，而不是原样丢给主智能体。
+      //
+      // 在此之前，spawn_multiple_agents 有角色、有实时互通（共享黑板），却没有归总；
+      // debate 有归总（裁判）却没有角色和互通。两个工具各有一半，谁都不完整——主智能体
+      // 拿到的是几份彼此独立、可能互相矛盾的报告，要自己在正文里边读边调和，这就是
+      // "多角色但对不上"的由来。这里补的正是缺的那一半，形状照搬 debate 里已经跑通的
+      // 裁判：先分歧后共识，并且明说哪些还没验证。
+      //
+      // 只有真的凑够两份**有内容的**报告才做——一份报告没有什么可调和的，
+      // 报错也不值得再花一次模型调用去"综合"。
+      const _settled = _targets.filter((j) => j.status !== "running"
+        && String(j.result || "").trim().length > 80
+        && !/^\[(?:ERROR|BLOCKED|interrupted)/i.test(String(j.result || "").trim()));
+      let _panel = "";
+      if (_settled.length >= 2 && run._panelConfig && run._panelBody) {
+        const _blocks = _settled
+          .map((j) => `【${j.role || "专家"}·${j.desc}】\n${String(j.result || "").slice(0, 4000)}`)
+          .join("\n\n---\n\n");
+        try {
+          const _verdict = await _runSubAgent({
+            config: run._panelConfig, description: "会诊归总", root, container: run._panelBody,
+            run, write: false, scope: [], role: "architect",
+            prompt: `你是多角色专家会诊的归总人。下面是同一任务下各角色**各自独立**给出的报告。`
+              + `只依据这些报告归总，不要另外派子智能体、不要改文件、不要把没人验证过的话写成事实。\n\n`
+              + `输出四段，尽量短：\n`
+              + `1. 各方一致的结论（可以直接照做的）\n`
+              + `2. 互相冲突的地方——写清谁和谁冲突、分别的依据，以及要用什么证据才能判定\n`
+              + `3. 没人覆盖到的缺口\n`
+              + `4. 下一步：具体做什么、先验证哪一条\n\n【各角色报告】\n${_blocks.slice(0, 14000)}`,
+          });
+          const _txt = String(_verdict || "").trim();
+          if (_txt && !/^\[(?:ERROR|BLOCKED|interrupted)/i.test(_txt)) {
+            _panel = `\n\n【会诊归总（${_settled.length} 位角色）】\n${_clipPreservingErrors(_txt.replace(/\s+/g, " "), 1600)}\n（以上是归总，不是新证据；与下面原始报告冲突时以原始报告里的证据为准。）`;
+          }
+        } catch {}
+      }
+      return { type: "awaitsubagent", path: _want, content: (_factHead + _parts.join("\n")).slice(0, 3200) + _panel };
 
     } else if (call.type === "openapi_parser") {
       // OpenAPI/Swagger 规范解析器：支持本地文件和公网 URL
