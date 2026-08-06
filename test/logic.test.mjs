@@ -19245,3 +19245,31 @@ test("sync-tools-json --check 会拒绝目录独有工具", () => {
     rmSync(fixtureDir, { recursive: true, force: true });
   }
 });
+
+test("写文件前的预备打开不弹「文件不存在」——新建文件此刻本来就还不存在", () => {
+  // 真实 bug：写入 avatar.tsx 成功（卡片显示 ✓ +48），屏幕底部却弹出
+  // "文件不存在: /Users/…/src/components/ui/avatar.tsx" 盖住终端。
+  //
+  // 原因不在写入，而在写入**之前**：_liveStage 会先把目标文件打开到编辑器里做预备，
+  // 而 write_file 新建的文件那一刻当然还不存在，openFile 就把 Rust 的 NotFound 原样
+  // 弹成 toast。openFile 早就有 silentMissing 选项正是为此，只是这里没传。
+  const stage = SRC.slice(SRC.indexOf('if (t === "write" || t === "edit" || t === "multiedit") {'));
+  const body = stage.slice(0, stage.indexOf('} else if (t === "read")'));
+  assert.match(body, /await openFile\(/, "预备阶段确实会打开目标文件");
+  assert.match(body, /\{ silentMissing: true \}/,
+    "预备打开必须静默处理「文件还不存在」，否则每次新建文件都会弹一次假报错");
+
+  // 静默的只是给人看的 toast；模型仍然要从工具结果里拿到真报错，否则路径写错就没人告诉它了。
+  assert.match(SRC, /\[ERROR\] 文件不存在: \$\{call\.path\}/,
+    "edit 的工具结果必须仍然告诉模型文件不存在");
+  assert.match(SRC, /新建文件请用 write_file/,
+    "模型侧的提示要保留：这才是它该收到的那条");
+
+  // silentMissing 只在缺文件时生效，别顺手把权限、越界这类真错误也吞掉。
+  const openFn = SRC.slice(SRC.indexOf("async function openFile("));
+  const guard = openFn.slice(0, openFn.indexOf("// A known write may have completed"));
+  assert.match(guard, /options\.silentMissing && _isMissingFileError\(e\)/,
+    "silentMissing 必须与「确实是缺文件」同时成立才吞");
+  assert.match(guard, /_isOutsideWorkspaceError\(e\)/,
+    "越界路径仍要提示");
+});

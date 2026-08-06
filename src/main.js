@@ -36852,7 +36852,13 @@ async function _stageForTool(call, root, session, run = null) {
     if (!fp || fp === _lastStagedPath) return;
     if (t === "write" || t === "edit" || t === "multiedit") {
       _lastStagedPath = fp;
-      try { await openFile(fp, String(rel).split("/").pop()); } catch {}
+      // silentMissing：这一步是**写之前**先把目标文件摆到编辑器里，纯属预备动作。
+      // write_file 新建文件时，此刻磁盘上当然还没有它——openFile 会把 Rust 层的
+      // "文件不存在：/abs/path" 原样弹成 toast，盖在终端上，而紧接着文件就被成功
+      // 创建了。用户看到的是"写成功了却报文件不存在"，纯噪音。
+      // 路径真写错时模型仍会从工具结果里收到报错（那条带"新建文件请用 write_file"
+      // 的提示），那是给模型的通道；这个 toast 是给人看的，人不该被预备动作打扰。
+      try { await openFile(fp, String(rel).split("/").pop(), true, { silentMissing: true }); } catch {}
       try { revealInTree(fp); } catch {}
     } else if (t === "read") {
       _lastStagedPath = fp;
