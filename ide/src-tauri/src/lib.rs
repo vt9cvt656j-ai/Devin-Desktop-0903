@@ -301,6 +301,7 @@ pub fn run() {
             terminal::term_write,
             terminal::term_resize,
             terminal::term_close,
+            terminal::term_running_ids,
             terminal::term_list_commands,
             terminal::term_history,
             lsp::lsp_start,

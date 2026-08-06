@@ -445,6 +445,7 @@ async function tauriBackend() {
     termWrite: (id, data) => core.invoke("term_write", { id, data }),
     termResize: (id, cols, rows) => core.invoke("term_resize", { id, cols, rows }),
     termClose: (id) => core.invoke("term_close", { id }),
+    termRunningIds: () => core.invoke("term_running_ids"),
     termListCommands: () => core.invoke("term_list_commands"),
     termHistory: () => core.invoke("term_history"),
     fsWatch: (paths) => core.invoke("fs_watch", { paths }),
@@ -57943,6 +57944,53 @@ let activeTermTab = -1;
 let termSeq = 0;
 let _termSplitActive = false;
 
+/**
+ * 哪些终端里真的有命令在跑。
+ *
+ * 标签上的 `▶` 是**出身**不是**状态**：它只说明这个终端是智能体为某个任务开的，任务
+ * 跑完了它还在，所以一排终端里根本看不出谁还在动。真状态问 PTY 的前台进程组
+ * （term_running_ids），用户自己敲的 npm run dev 一样算得上。
+ *
+ * 只在终端面板可见时轮询；面板收起来就停，不给后台白烧。
+ */
+const _TERM_RUNNING_POLL_MS = 900;
+let _termRunningIds = new Set();
+let _termRunningTimer = 0;
+
+function _applyTermRunningState() {
+  if (!termTabBar) return;
+  const buttons = termTabBar.querySelectorAll(".term-tab:not(.term-tab--debug)");
+  termTabs.forEach((tab, i) => {
+    const btn = buttons[i];
+    if (btn) btn.classList.toggle("is-running", tab.backendId != null && _termRunningIds.has(tab.backendId));
+  });
+}
+
+async function _pollTermRunning() {
+  try {
+    const ids = await backend.termRunningIds?.();
+    const next = new Set(Array.isArray(ids) ? ids : []);
+    // 只有集合真的变了才动 DOM——每秒无谓地改 class 会让 CSS 动画不停重启。
+    let changed = next.size !== _termRunningIds.size;
+    if (!changed) for (const id of next) if (!_termRunningIds.has(id)) { changed = true; break; }
+    _termRunningIds = next;
+    if (changed) _applyTermRunningState();
+  } catch {}
+}
+
+function _startTermRunningPoll() {
+  if (_termRunningTimer) return;
+  _pollTermRunning();
+  _termRunningTimer = setInterval(_pollTermRunning, _TERM_RUNNING_POLL_MS);
+}
+
+function _stopTermRunningPoll() {
+  if (!_termRunningTimer) return;
+  clearInterval(_termRunningTimer);
+  _termRunningTimer = 0;
+  if (_termRunningIds.size) { _termRunningIds = new Set(); _applyTermRunningState(); }
+}
+
 function renderTermTabs() {
   if (!termTabBar) return;
   termTabBar.innerHTML = "";
@@ -57953,6 +58001,7 @@ function renderTermTabs() {
     btn.title = tab.cwd ? `${tab.label} — ${tab.cwd}` : tab.label;
     btn.innerHTML =
       `<svg class="term-tab__icon" viewBox="0 0 24 24" aria-hidden="true"><use href="#i-terminal" /></svg>` +
+      `<span class="term-tab__live" aria-hidden="true"></span>` +
       `<span class="term-tab__label"></span>` +
       `<span class="term-tab__x" title="Close" aria-label="Close terminal">` +
       `<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"><path d="M4.5 4.5l7 7M11.5 4.5l-7 7"/></svg>` +
@@ -57964,6 +58013,12 @@ function renderTermTabs() {
     });
     termTabBar.appendChild(btn);
   });
+  _applyTermRunningState();   // 重建标签后立刻把运行态贴回去，避免闪一下没有指示
+  // 轮询的开关挂在这里而不是各个"打开面板"的调用点：面板有三条打开路径，其中智能体
+  // 派任务那条（_runTaskInNewTerminal）刻意绕开 openTerminal，正好是最需要看运行态的
+  // 那条。挂在渲染出口上，哪条路进来都覆盖得到。
+  if (termIsOpen() && termTabs.length) _startTermRunningPoll();
+  else _stopTermRunningPoll();
   // The debug console lives here too, as a peer tab of the terminals (present while its container exists).
   if (_dbgConsoleEl) {
     const btn = document.createElement("button");
@@ -58327,6 +58382,7 @@ async function openTerminal() {
   buildMenubar();
   editorwrapEl?.classList.add("has-terminal");
   monacoEditor.layout();
+  _startTermRunningPoll();
   loadTermData();
   refreshTermPathCache().catch(() => {});
 
@@ -58341,6 +58397,7 @@ function closeTerminal() {
   if (!termIsOpen()) return;
   clearTermGhost(termTabs[activeTermTab]);
   termPanel.hidden = true;
+  _stopTermRunningPoll();
   buildMenubar();
   editorwrapEl?.classList.remove("has-terminal");
   monacoEditor.layout();

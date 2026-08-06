@@ -315,6 +315,38 @@ pub fn term_close(state: State<TerminalState>, id: u32) -> Result<(), String> {
 /// Powers terminal autosuggestions so completion covers all installed tools,
 /// not just a hand-written list. Uses augmented PATH to find tools installed
 /// in ~/.local/bin, ~/.cargo/bin, etc. even from a Finder-launched app.
+/// 哪些终端里**真的有命令在跑**（返回终端 id 列表）。
+///
+/// 标签页上那个 `▶` 只是"这个终端是智能体开的"，是**出身**不是**状态**：任务早就跑完了
+/// 它还在，用户根本分不出哪个还在动。真状态得问 PTY。
+///
+/// Unix 上判据很直接：PTY 的前台进程组 != shell 自己的 pid，就说明 shell 让出了前台、
+/// 有别的进程在跑。这个信号对谁敲的命令一视同仁——智能体派的任务和用户自己敲的 npm run
+/// dev 都算，也不需要往用户命令里塞探针。dev server 这种"没有输出但确实在跑"的进程也能
+/// 正确识别，靠输出活跃度猜是猜不出来的。
+///
+/// 一次返回全部，而不是一个终端一次调用：这是要按秒轮询的，N 次 IPC 没必要。
+#[tauri::command]
+pub fn term_running_ids(state: State<TerminalState>) -> Vec<u32> {
+    let Ok(inner) = state.inner.lock() else {
+        return Vec::new();
+    };
+    inner
+        .terms
+        .iter()
+        .filter_map(|(id, term)| {
+            let shell = term.child.process_id()?;
+            let fg = term.master.process_group_leader()?;
+            // fg <= 0 表示拿不到（PTY 已经没有前台进程组），按"没在跑"处理。
+            if fg > 0 && fg as u32 != shell {
+                Some(*id)
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
 #[tauri::command]
 pub fn term_list_commands() -> Vec<String> {
     use std::collections::BTreeSet;
