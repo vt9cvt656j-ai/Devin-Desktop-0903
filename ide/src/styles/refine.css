@@ -91,8 +91,18 @@
 }
 .seg::-webkit-scrollbar { display: none; }
 
+/* 侧栏可以被拖宽拖窄，页签数量也会变（调试会话期间多一个），所以这里按容器宽度自适应，
+   而不是按固定宽度摆放。以前是 flex: 0 0 auto（"窄了就横向滚动"）—— 那是四个页签时的
+   取舍；剩两个之后它们不再撑开，右边留出一大片空白。现在改成均分可用宽度。 */
+.explorer { container-type: inline-size; }
+
+/* .panel__head 是 justify-content: space-between 的 flex 容器，所以这条页签栏默认
+   按内容宽度摆放，右边留白。显式让它吃满整行，页签才谈得上"均分"。 */
+#sideTabs.seg { flex: 1 1 auto; width: 100%; min-width: 0; }
+
 .seg__btn {
-  flex: 0 0 auto;               /* 窄的时候滚动，不压扁 */
+  flex: 1 1 auto;               /* 均分整条宽度，窄了一起收 */
+  min-width: 0;
   height: 26px;
   padding: 0 10px;
   font-size: var(--t-small);
@@ -247,4 +257,128 @@
   font-size: var(--t-body);
   line-height: 1.6;
   color: var(--text-dim);
+}
+
+
+/* ---------------------------------------------------------------------------
+ * 侧栏页签的自适应收缩
+ *
+ * 三档：正常显示图标+文字；窄了先让文字省略；再窄就只留图标（此时 title 仍在，
+ * 悬停能看到名字）。隐藏的页签必须显式 display:none —— .seg__btn 自己设了
+ * display:inline-flex，会盖掉浏览器对 [hidden] 的默认处理，否则调试页签在非调试
+ * 状态下也会占位。
+ * ------------------------------------------------------------------------ */
+.seg__btn[hidden] { display: none !important; }
+
+.seg__btn span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+@container (max-width: 168px) {
+  .seg__btn { padding: 0 6px; gap: 3px; }
+}
+
+/* 两个页签在最窄的侧栏（140px 下限）里也放得开，所以不必为它们藏文字。
+   只有调试会话期间挤进第三个页签、侧栏又偏窄时才退到纯图标——名字仍在 title 里。
+   写成 :has()，这样规则的触发条件就是"确实挤了"，而不是一个猜出来的宽度。 */
+@container (max-width: 200px) {
+  .seg:has(#tabDebug:not([hidden])) .seg__btn span { display: none; }
+  .seg:has(#tabDebug:not([hidden])) .seg__btn { padding: 0; }
+}
+
+
+/* ---------------------------------------------------------------------------
+ * Git 时间线 —— 当前文件的提交历史
+ *
+ * 一条竖线串起若干节点，是"这个文件的时间轴"最直接的读法。行本身是按钮：点开就是
+ * 那次提交对这个文件的 diff。整块按容器宽度自适应，侧栏拖窄时先收元信息、再收哈希，
+ * 消息永远保留——那是唯一不能丢的信息。
+ * ------------------------------------------------------------------------ */
+.git-timeline { padding: 2px 0 6px; }
+
+.git-timeline__empty {
+  padding: 10px 12px;
+  color: var(--text-dim);
+  font-size: var(--t-small, 11px);
+}
+
+.git-timeline__row {
+  position: relative;
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  width: 100%;
+  padding: 5px 10px 5px 12px;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+.git-timeline__row:hover { background: var(--hover); }
+
+/* 贯穿的时间轴竖线：画在行上而不是容器上，最后一行自然收口 */
+.git-timeline__row::before {
+  content: "";
+  position: absolute;
+  left: 16px;
+  top: 0;
+  bottom: 0;
+  width: 1px;
+  background: var(--border, rgba(128, 128, 128, 0.28));
+}
+.git-timeline__row:first-child::before { top: 12px; }
+.git-timeline__row:last-child::before { bottom: calc(100% - 12px); }
+
+.git-timeline__dot {
+  position: relative;
+  z-index: 1;
+  flex: 0 0 auto;
+  width: 7px;
+  height: 7px;
+  margin: 5px 0 0 1px;
+  border-radius: 50%;
+  background: var(--accent, #4c8eff);
+  box-shadow: 0 0 0 2px var(--panel, #1e1e1e);
+}
+
+.git-timeline__main { display: flex; flex-direction: column; gap: 1px; min-width: 0; flex: 1 1 auto; }
+
+.git-timeline__msg {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: var(--t-small, 11px);
+  color: var(--text);
+}
+
+.git-timeline__meta {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 10px;
+  color: var(--text-dim);
+}
+
+.git-timeline__hash {
+  flex: 0 0 auto;
+  margin-top: 1px;
+  font-family: var(--font-mono, ui-monospace, monospace);
+  font-size: 10px;
+  color: var(--text-dim);
+}
+
+/* 侧栏拖窄：先丢哈希，再丢作者/时间，消息始终留着 */
+@container (max-width: 210px) {
+  .git-timeline__hash { display: none; }
+}
+@container (max-width: 150px) {
+  .git-timeline__meta { display: none; }
+  .git-timeline__row { padding-right: 6px; }
 }

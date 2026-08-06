@@ -357,6 +357,8 @@ async function tauriBackend() {
     gitCheckout: (root, branch, create) => core.invoke("git_checkout", { root, branch, create }),
     gitPull: (root) => core.invoke("git_pull", { root }),
     gitLog: (root, count) => core.invoke("git_log", { root, count }),
+    gitFileLog: (root, rel, count) => core.invoke("git_file_log", { root, rel, count }),
+    gitFileAt: (root, rel, rev) => core.invoke("git_file_at", { root, rel, rev }),
     gitConflicts: (root) => core.invoke("git_conflicts", { root }),
     gitMergeVersions: (root, rel) => core.invoke("git_merge_versions", { root, rel }),
     gitResolveConflict: (root, rel, resolution) =>
@@ -4127,6 +4129,8 @@ function activate(path) {
   activePath = path;
   scheduleSaveSession();   // keep the persisted session's tabs/active file current
   _refreshChatHintIfEmpty(); // switched file → recompute the context-aware chat starters
+  // 时间线跟着编辑器走。只在 Git 面板真的可见时刷新——切文件很频繁，面板没开就别打 git。
+  try { if ($("viewGit")?.hidden === false) refreshGitTimeline(); } catch {}
   const f = openFiles.get(path);
 
   if (f.isImage) {
@@ -10299,23 +10303,18 @@ async function openFileAt(path, name, line, column, endColumn) {
 }
 
 function showSide(which) {
-  // After a debug session ENDS, the 调试 tab is kept so results stay visible; it flips back to 测试
-  // only when the user clicks one of the first 3 tabs (文件 / Git / 大纲). During an ACTIVE session we
-  // keep 调试 regardless (navigating to files then back must not lose the debug view).
-  if (_debugEnded && _debugSidebarMode && (which === "explorer" || which === "git" || which === "outline")) {
+  // 调试会话结束后保留「调试」页签，好让结果留在屏幕上；用户主动点 文件/Git 才收起它。
+  // 会话进行中一律保留（切去看文件再切回来不能丢掉调试视图）。
+  if (_debugEnded && _debugSidebarMode && (which === "explorer" || which === "git")) {
     exitDebugSidebar();
   }
   $("viewExplorer").hidden = which !== "explorer";
   $("viewSearch").hidden = which !== "search";
   $("viewGit").hidden = which !== "git";
-  $("viewOutline").hidden = which !== "outline";
-  $("viewTest").hidden = which !== "test";
   const vd = $("viewDebug"); if (vd) vd.hidden = which !== "debug";
   $("tabExplorer").classList.toggle("is-active", which === "explorer" || which === "search");
   $("tabGit").classList.toggle("is-active", which === "git");
-  $("tabOutline").classList.toggle("is-active", which === "outline");
-  // The 测试 tab hosts both the Test view and (while debugging) the 调试 view.
-  $("tabTest").classList.toggle("is-active", which === "test" || which === "debug");
+  const td = $("tabDebug"); if (td) td.classList.toggle("is-active", which === "debug");
   const layout = document.querySelector(".layout");
   if (layout) {
     const wasHidden = layout.classList.contains("hide-explorer");
@@ -10328,10 +10327,8 @@ function showSide(which) {
     si.select();
   } else if (which === "git") {
     refreshGitStatus();
-  } else if (which === "outline") {
-    refreshOutline();
-  } else if (which === "test") {
-    refreshTestExplorer();
+    // 时间线跟随当前编辑器里的文件，切到 Git 面板时补一次。
+    refreshGitTimeline();
   } else if (which === "debug") {
     renderDebugSidebar();
   }
@@ -10407,7 +10404,7 @@ async function refreshGitStatus() {
     renderGitFiles(status.files);
     // await so a throw in any sub-refresher surfaces (and can't leave a half-refreshed panel
     // via an unhandled rejection); allSettled never rejects itself.
-    await Promise.allSettled([refreshGutter(), refreshGitLog(), refreshStashList()]);
+    await Promise.allSettled([refreshGutter(), refreshGitLog(), refreshStashList(), refreshGitTimeline()]);
   } finally {
     _gitRefreshing = false;
   }
@@ -10533,6 +10530,116 @@ function renderGitGraphSvg(rows, container) {
   return { svg, svgW, ROW_H };
 }
 
+/**
+ * 时间线 —— 当前编辑器里这个文件的提交历史。
+ *
+ * 和上面的「历史」不是一回事：那个是整个仓库的提交图，回答"仓库发生了什么"；
+ * 这里回答"我正在看的这个文件都经历了什么"，用 --follow，所以文件改过名也接得上。
+ *
+ * 空状态分三种，必须分清楚，否则用户看到空白只会以为坏了：
+ *   没打开文件夹 / 不是 git 仓库 → 这一栏整体不出现
+ *   打开了文件但没在编辑器里    → "打开一个文件查看它的历史"
+ *   文件在仓库里但还没被提交过  → "尚未提交过"
+ */
+let _gitTimelineRel = null;      // 当前渲染的是哪个文件，避免慢请求覆盖新点击
+let _gitTimelineCollapsed = false;
+
+function _timelineRelForActiveFile() {
+  if (!rootPath || !activePath) return null;
+  const root = _normalizeFsPath(rootPath).replace(/\/+$/, "");
+  const file = _normalizeFsPath(activePath);
+  if (!file.startsWith(root + "/")) return null;   // 打开的文件不在这个仓库里
+  return file.slice(root.length + 1);
+}
+
+async function refreshGitTimeline() {
+  const title = $("gitTimelineTitle");
+  const el = $("gitTimeline");
+  if (!title || !el) return;
+
+  if (!rootPath || !gitIsRepo) { title.style.display = "none"; el.hidden = true; return; }
+  title.style.display = "";
+  el.hidden = _gitTimelineCollapsed;
+
+  const rel = _timelineRelForActiveFile();
+  _gitTimelineRel = rel;
+  if (!rel) {
+    el.innerHTML = '';
+    const p = document.createElement("div");
+    p.className = "git-timeline__empty";
+    p.textContent = "打开一个文件查看它的历史";
+    el.appendChild(p);
+    return;
+  }
+
+  let entries = [];
+  try {
+    entries = await backend.gitFileLog(rootPath, rel, 40) || [];
+  } catch {
+    entries = [];
+  }
+  if (_gitTimelineRel !== rel) return;   // 期间切了文件，别把旧结果盖上去
+
+  el.innerHTML = '';
+  if (!entries.length) {
+    const p = document.createElement("div");
+    p.className = "git-timeline__empty";
+    p.textContent = "尚未提交过";
+    el.appendChild(p);
+    return;
+  }
+
+  for (const e of entries) {
+    const row = document.createElement("button");
+    row.type = "button";
+    row.className = "git-timeline__row";
+    row.title = `${e.short_hash} · ${e.author}\n${e.message}`;
+
+    const dot = document.createElement("span");
+    dot.className = "git-timeline__dot";
+
+    const main = document.createElement("span");
+    main.className = "git-timeline__main";
+    const msg = document.createElement("span");
+    msg.className = "git-timeline__msg";
+    msg.textContent = e.message;
+    const meta = document.createElement("span");
+    meta.className = "git-timeline__meta";
+    meta.textContent = `${e.date} · ${e.author}`;
+    main.appendChild(msg);
+    main.appendChild(meta);
+
+    const hash = document.createElement("span");
+    hash.className = "git-timeline__hash";
+    hash.textContent = e.short_hash;
+
+    row.appendChild(dot);
+    row.appendChild(main);
+    row.appendChild(hash);
+    row.addEventListener("click", () => openTimelineDiff(rel, e));
+    el.appendChild(row);
+  }
+}
+
+/** 点一条提交 → 在 diff 编辑器里看这次提交对这个文件改了什么（父版本 ↔ 该版本）。 */
+async function openTimelineDiff(rel, entry) {
+  if (!rootPath || !entry) return;
+  const parent = (entry.parents && entry.parents[0]) ? entry.parents[0] : `${entry.hash}^`;
+  let before = "", after = "";
+  try { before = await backend.gitFileAt(rootPath, rel, parent) || ""; } catch { before = ""; }
+  try { after = await backend.gitFileAt(rootPath, rel, entry.hash) || ""; } catch { after = ""; }
+
+  const ed = ensureDiffEditor();
+  const lang = extLang(rel.split("/").pop() || rel);
+  const original = monaco.editor.createModel(before, lang);
+  const modified = monaco.editor.createModel(after, lang);
+  const prev = ed.getModel();
+  ed.setModel({ original, modified });
+  if (prev) { prev.original?.dispose(); prev.modified?.dispose(); }
+  const t = $("diffTitle");
+  if (t) t.textContent = `${rel} · ${entry.short_hash}`;
+}
+
 async function refreshGitLog() {
   const logTitle = $("gitLogTitle");
   const logEl = $("gitLog");
@@ -10604,6 +10711,13 @@ async function refreshGitLog() {
 $("gitLogToggle")?.addEventListener("click", () => {
   const logEl = $("gitLog");
   if (logEl) logEl.hidden = !logEl.hidden;
+});
+
+$("gitTimelineToggle")?.addEventListener("click", () => {
+  const el = $("gitTimeline");
+  if (!el) return;
+  _gitTimelineCollapsed = !_gitTimelineCollapsed;
+  el.hidden = _gitTimelineCollapsed;
 });
 
 // ---- stash ----
@@ -51502,8 +51616,6 @@ const ACTION_LABELS = {
   "view.explorer": "显示资源管理器",
   "view.search": "显示搜索",
   "view.git": "显示源代码管理",
-  "view.outline": "显示大纲",
-  "view.test": "显示测试",
   "view.output": "显示输出",
   "view.problems": "切换问题面板",
   "memory.manage": "管理项目记忆",
@@ -51567,8 +51679,6 @@ function applyPlatformShortcutLabels() {
   setShortcutTitle("runBtn", "运行当前文件", "mod+r");
   setShortcutTitle("tabExplorer", "文件", "shift+mod+e");
   setShortcutTitle("tabGit", "Git", "ctrl+shift+g");
-  setShortcutTitle("tabOutline", "大纲", "shift+mod+o");
-  setShortcutTitle("tabTest", "测试", "shift+mod+t");
   setShortcutTitle("paletteBtn", "命令面板", "shift+mod+p");
   setShortcutTitle("termNewBtn", "新建终端", "ctrl+shift+`");
   setShortcutTitle("terminalClose", "关闭终端", "ctrl+`");
@@ -53165,12 +53275,8 @@ let _debugConsoleMounted = false; // console shell built for the current session
 function enterDebugSidebar() {
   _debugSidebarMode = true;
   _debugEnded = false;
-  const tab = $("tabTest");
-  if (tab) {
-    const span = tab.querySelector("span"); if (span) span.textContent = "调试";
-    const use = tab.querySelector("use"); if (use) use.setAttribute("href", "#i-bug");
-    tab.title = `调试 (${shortcutLabel("shift+mod+t")})`;
-  }
+  const tab = $("tabDebug");
+  if (tab) { tab.hidden = false; tab.title = "调试"; }
   showSide("debug");
 }
 // Restore the 测试 tab. Only the caller (a click on 文件/Git/大纲) decides where to navigate — we do
@@ -53178,12 +53284,9 @@ function enterDebugSidebar() {
 function exitDebugSidebar() {
   _debugSidebarMode = false;
   _debugEnded = false;
-  const tab = $("tabTest");
-  if (tab) {
-    const span = tab.querySelector("span"); if (span) span.textContent = "测试";
-    const use = tab.querySelector("use"); if (use) use.setAttribute("href", "#i-beaker");
-    tab.title = `测试 (${shortcutLabel("shift+mod+t")})`;
-  }
+  // 页签只在调试期间存在：会话结束就收起来，侧栏回到 文件 / Git 两项。
+  const tab = $("tabDebug");
+  if (tab) tab.hidden = true;
 }
 
 function renderDebugSidebar() {
@@ -53847,8 +53950,6 @@ function getMenus() {
         { label: t("menu.explorer"), icon: "i-files", hint: shortcutLabel("shift+mod+e"), action: () => showSide("explorer") },
         { label: t("menu.search"), icon: "i-search", hint: shortcutLabel("shift+mod+f"), action: () => showSide("search") },
         { label: t("menu.sourceControl"), icon: "i-git", hint: shortcutLabel("ctrl+shift+g"), action: () => showSide("git") },
-        { label: t("menu.outline"), icon: "i-outline", hint: shortcutLabel("shift+mod+o"), action: () => showSide("outline") },
-        { label: t("menu.tests"), icon: "i-beaker", hint: shortcutLabel("shift+mod+t"), action: () => showSide("test") },
         { label: t("menu.output"), icon: "i-output", hint: shortcutLabel("ctrl+shift+u"), action: () => toggleOutputPanel() },
         { sep: true },
         { label: panelToggleLabel("explorer"), icon: "i-sidebar-left", action: () => togglePane("explorer") },
@@ -54498,8 +54599,7 @@ $("loginUseCodeBtn")?.addEventListener("click", async () => {
 const _sideTabWhich = (btn) =>
   btn.id === "tabExplorer" ? "explorer"
   : btn.id === "tabGit" ? "git"
-  : btn.id === "tabOutline" ? "outline"
-  : (_debugSidebarMode ? "debug" : "test");
+  : "debug";
 const _sideTabsEl = $("sideTabs");
 _sideTabsEl.addEventListener("pointerdown", (e) => {
   if (e.button !== 0) return;
@@ -57311,8 +57411,6 @@ const DEFAULT_KEYBINDINGS = {
   "mod+shift+e": "view.explorer",
   "mod+shift+f": "view.search",
   "ctrl+shift+g": "view.git",
-  "mod+shift+o": "view.outline",
-  "mod+shift+t": "view.test",
   "ctrl+shift+u": "view.output",
   "mod+shift+m": "view.problems",
   "mod+shift+p": "commandPalette",
@@ -57352,8 +57450,6 @@ const KB_ACTIONS = {
   "view.explorer": () => showSide("explorer"),
   "view.search": () => showSide("search"),
   "view.git": () => showSide("git"),
-  "view.outline": () => showSide("outline"),
-  "view.test": () => showSide("test"),
   "view.output": () => toggleOutputPanel(),
   "view.bookmarks": () => toggleBookmarksPanel(),
   "view.problems": () => toggleProblems(),
@@ -59292,9 +59388,7 @@ function _escHtml(s) {
 
 $("outlineSortBtn")?.addEventListener("click", () => {
   _outlineSortByName = !_outlineSortByName;
-  refreshOutline();
 });
-$("outlineRefreshBtn")?.addEventListener("click", () => refreshOutline());
 $("outlineFilter")?.addEventListener("input", () => {
   const tree = $("outlineTree");
   renderOutlineTree(_outlineSymbols, tree);
@@ -59303,7 +59397,6 @@ $("outlineFilter")?.addEventListener("input", () => {
 monacoEditor.onDidChangeModel(() => {
   // 只在大纲可见时刷新。旧写法 `!hidden === false` 运算符优先级写反：隐藏时白烧
   // 解析、可见时反而不刷——切到大纲页看到的是上个文件的旧结构（"点了没效果"之一）。
-  if ($("viewOutline")?.hidden === false) refreshOutline();
 });
 
 // ---- File Timeline ----
@@ -59547,7 +59640,6 @@ async function runAllTests() {
   }
 }
 $("testRunAllBtn")?.addEventListener("click", () => runAllTests());
-$("testRefreshBtn")?.addEventListener("click", () => refreshTestExplorer());
 
 // ---- Terminal Split ----
 $("termSplitBtn")?.addEventListener("click", async () => {

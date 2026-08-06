@@ -744,6 +744,14 @@ pub fn git_log(root: String, count: Option<usize>) -> Result<Vec<GitLogEntry>, S
             &format!("--format={format}"),
         ],
     )?;
+    Ok(parse_log_entries(&out))
+}
+
+/// Parse `--format=%H%n%h%n%an%n%ar%n%s%n%P%n%D` output into entries.
+///
+/// Shared by `git_log` and `git_file_log` so the timeline and the history list can
+/// never disagree about how a commit is read.
+fn parse_log_entries(out: &str) -> Vec<GitLogEntry> {
     let lines: Vec<&str> = out.lines().collect();
     let mut entries = Vec::new();
     let mut i = 0;
@@ -782,7 +790,69 @@ pub fn git_log(root: String, count: Option<usize>) -> Result<Vec<GitLogEntry>, S
         });
         i += 7;
     }
-    Ok(entries)
+    entries
+}
+
+/// The contents of one file at one revision — what the Timeline opens when a commit
+/// is clicked.
+///
+/// `git_file_head` only ever reads HEAD, so it cannot show an older version. A path
+/// that did not exist at that revision is not an error here: it is how an "added"
+/// commit looks, and the diff pane renders it as an empty left-hand side.
+#[tauri::command]
+pub fn git_file_at(root: String, rel: String, rev: String) -> Result<String, String> {
+    if rel.trim().is_empty() || rev.trim().is_empty() {
+        return Ok(String::new());
+    }
+    // `rev` comes from a commit hash we ourselves printed, but treat it as untrusted
+    // anyway: anything outside hex/^~ can't be a revision we produced, and refusing
+    // early keeps shell-ish surprises out of the argument list.
+    if !rev
+        .chars()
+        .all(|c| c.is_ascii_hexdigit() || c == '^' || c == '~' || c.is_ascii_digit())
+    {
+        return Err("非法的版本号".into());
+    }
+    let out = run_git(&root, &["show", &format!("{rev}:{rel}")])?;
+    if out.status.success() {
+        Ok(String::from_utf8_lossy(&out.stdout).to_string())
+    } else {
+        Ok(String::new())
+    }
+}
+
+/// History of ONE file — what the Timeline shows for whatever is open in the editor.
+///
+/// `git_log` is repo-wide and cannot answer "what happened to this file"; passing a
+/// pathspec to it would also lose renames. `--follow` keeps the trail across renames,
+/// which is the whole point of a per-file timeline: a file that was moved still shows
+/// the commits it carried under its old name.
+///
+/// `--` separates the pathspec from revisions. Without it a file whose name also
+/// matches a branch or tag makes git fail with "ambiguous argument".
+#[tauri::command]
+pub fn git_file_log(
+    root: String,
+    rel: String,
+    count: Option<usize>,
+) -> Result<Vec<GitLogEntry>, String> {
+    if rel.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+    let n = count.unwrap_or(30).min(200);
+    let format = "%H%n%h%n%an%n%ar%n%s%n%P%n%D";
+    let out = run_git_checked(
+        &root,
+        &[
+            "log",
+            "--follow",
+            &format!("-{n}"),
+            &format!("--format={format}"),
+            "--",
+            &rel,
+        ],
+    )?;
+    Ok(parse_log_entries(&out))
 }
 
 /// List files with merge conflicts (unmerged entries in `git status`).

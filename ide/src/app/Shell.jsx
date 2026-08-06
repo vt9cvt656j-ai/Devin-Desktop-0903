@@ -131,11 +131,10 @@ export function Shell() {
                 <button className="seg__btn" id="tabGit" type="button" role="tab" title="Git">
                   <svg className="ic"><use href="#i-git" /></svg><span data-i18n="sidebar.source">Source</span>
                 </button>
-                <button className="seg__btn" id="tabOutline" type="button" role="tab" data-i18n-title="sidebar.outline" title="大纲">
-                  <svg className="ic"><use href="#i-outline" /></svg><span data-i18n="sidebar.outline">大纲</span>
-                </button>
-                <button className="seg__btn" id="tabTest" type="button" role="tab" data-i18n-title="sidebar.tests" title="测试">
-                  <svg className="ic"><use href="#i-beaker" /></svg><span data-i18n="sidebar.tests">测试</span>
+                {/* 调试会话期间才出现。以前调试侧栏是借「测试」页签显示的，
+                    测试页签移除后它需要自己的落脚点，否则调试变量/调用栈/断点都没地方放。 */}
+                <button className="seg__btn" id="tabDebug" type="button" role="tab" title="调试" hidden>
+                  <svg className="ic"><use href="#i-bug" /></svg><span data-i18n="sidebar.debug">调试</span>
                 </button>
               </div>
             </header>
@@ -207,49 +206,20 @@ export function Shell() {
                 </button>
               </div>
               <div className="git-log" id="gitLog" hidden></div>
+
+              {/* 时间线：当前编辑器里这个文件的提交历史（--follow，改过名也接得上）。
+                  上面的「历史」是整个仓库的，这里回答的是"这个文件都经历了什么"。 */}
+              <div className="git-section-title git-timeline-title" id="gitTimelineTitle">
+                <span data-i18n="git.timeline">时间线</span>
+                <button className="git-section-act" id="gitTimelineToggle" type="button" data-i18n-title="git.toggleTimeline" title="折叠时间线">
+                  <svg className="ic"><use href="#i-chevron" /></svg>
+                </button>
+              </div>
+              <div className="git-timeline" id="gitTimeline"></div>
             </div>
 
-            {/* Outline view */}
-            <div className="side-view" id="viewOutline" hidden>
-              <div className="outline-bar">
-                <span className="outline-title" data-i18n="sidebar.outline">大纲</span>
-                <span className="outline-tools">
-                  <button className="iconbtn" id="outlineSortBtn" type="button" title="Sort by position"><svg className="ic"><use href="#i-outline" /></svg></button>
-                  <button className="iconbtn" id="outlineRefreshBtn" type="button" title="Refresh"><svg className="ic"><use href="#i-refresh" /></svg></button>
-                </span>
-              </div>
-              <div className="outline-filter">
-                <input id="outlineFilter" type="text" data-i18n-placeholder="outline.filter" placeholder="Filter symbols…" spellCheck="false" autoComplete="off" />
-              </div>
-              <div className="outline-tree" id="outlineTree">
-                <div className="empty"><p data-i18n="outline.empty">Open a file to see its outline.</p></div>
-              </div>
-              <div className="outline-timeline" id="outlineTimeline" hidden>
-                <div className="outline-section-title">
-                  <svg className="ic"><use href="#i-history" /></svg>
-                  <span data-i18n="outline.timeline">时间线</span>
-                  <button className="iconbtn" id="timelineToggle" type="button" title="Toggle Timeline">
-                    <svg className="ic"><use href="#i-chevron" /></svg>
-                  </button>
-                </div>
-                <div className="timeline-list" id="timelineList"></div>
-              </div>
-            </div>
-
-            {/* Test Explorer view */}
-            <div className="side-view" id="viewTest" hidden>
-              <div className="test-bar">
-                <span className="test-title" data-i18n="sidebar.tests">测试</span>
-                <span className="test-tools">
-                  <button className="iconbtn" id="testRunAllBtn" type="button" data-i18n-title="test.runAll" title="Run All Tests"><svg className="ic"><use href="#i-play" /></svg></button>
-                  <button className="iconbtn" id="testRefreshBtn" type="button" data-i18n-title="explorer.refresh" title="Refresh"><svg className="ic"><use href="#i-refresh" /></svg></button>
-                </span>
-              </div>
-              <div className="test-tree" id="testTree">
-                <div className="empty"><p data-i18n="test.empty">No tests detected. Open a project with test files.</p></div>
-              </div>
-              <div className="test-output" id="testOutput" hidden></div>
-            </div>
+            {/* 大纲 / 测试 两个面板已移除（页签也一并去掉）。大纲里那块时间线
+                原本是没有任何代码填充的空壳，现在真正实现了，位置在上面的 Git 面板里。 */}
 
             {/* Debug view — the 测试 tab turns into this while a debug session is active */}
             <div className="side-view dbg-side" id="viewDebug" hidden>
