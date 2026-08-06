@@ -87,6 +87,20 @@ pub struct LivePrice {
     /// Minor units in the price's own currency (fen for cny, cents for usd).
     pub cny_minor: Option<i64>,
     pub usd_minor: Option<i64>,
+    /// The price's base currency. What Checkout charges when the buyer's currency has no
+    /// entry in `currency_options` — so it decides what the card is honest to display.
+    pub currency: String,
+    /// The product's name and description. These are what the operator edits in Stripe,
+    /// and the card shows them verbatim rather than keeping a second copy in the database
+    /// that nobody remembers to update.
+    pub name: Option<String>,
+    pub description: Option<String>,
+    /// Per-language overrides read from the Stripe product's metadata, keyed by BCP-47
+    /// tag. The operator adds `name_ja` / `description_de` there and the console picks
+    /// them up on the next cache refresh — no deploy, and Stripe stays the one place a
+    /// product is described.
+    pub names: serde_json::Map<String, serde_json::Value>,
+    pub descriptions: serde_json::Map<String, serde_json::Value>,
     /// Stripe's `recurring` is null on a one-time price. This decides the checkout mode,
     /// and getting it wrong is a hard 400 from Stripe, not a cosmetic slip.
     pub recurring: bool,
@@ -120,8 +134,9 @@ async fn live_prices(state: &AppState) -> HashMap<String, LivePrice> {
         return HashMap::new();
     };
 
-    // `currency_options` carries the per-currency amounts of a multi-currency price and
-    // is not returned unless expanded.
+    // `currency_options` carries the per-currency amounts of a multi-currency price, and
+    // `product` the name and description shown on the card. Neither is returned unless
+    // expanded.
     let res = state
         .update_http
         .get(format!("{STRIPE_API}/prices"))
@@ -130,6 +145,7 @@ async fn live_prices(state: &AppState) -> HashMap<String, LivePrice> {
             ("limit", "100"),
             ("active", "true"),
             ("expand[]", "data.currency_options"),
+            ("expand[]", "data.product"),
         ])
         .send()
         .await;
@@ -141,30 +157,107 @@ async fn live_prices(state: &AppState) -> HashMap<String, LivePrice> {
 
     let mut out: HashMap<String, LivePrice> = HashMap::new();
     for p in list {
-        let Some(lookup) = p.get("lookup_key").and_then(|v| v.as_str()) else {
-            continue;
-        };
-        let base_ccy = p.get("currency").and_then(|v| v.as_str()).unwrap_or("");
-        let base_amount = p.get("unit_amount").and_then(|v| v.as_i64());
-        let opt = |c: &str| {
-            p.pointer(&format!("/currency_options/{c}/unit_amount"))
-                .and_then(|v| v.as_i64())
-        };
-        out.insert(
-            lookup.to_owned(),
-            LivePrice {
-                id: p.get("id").and_then(|v| v.as_str()).unwrap_or_default().to_owned(),
-                cny_minor: opt("cny").or(if base_ccy == "cny" { base_amount } else { None }),
-                usd_minor: opt("usd").or(if base_ccy == "usd" { base_amount } else { None }),
-                recurring: p.get("recurring").map(|v| !v.is_null()).unwrap_or(false),
-            },
-        );
+        if let Some((lookup, live)) = parse_price(p) {
+            out.insert(lookup, live);
+        }
     }
 
     if let Ok(mut g) = PRICE_CACHE.write() {
         *g = Some((Instant::now(), out.clone()));
     }
     out
+}
+
+/// One entry of Stripe's `/v1/prices` list. Split out from the fetch so the shape it
+/// expects can be tested against real Stripe payloads without a network call.
+///
+/// Returns None for a price with no `lookup_key`: the catalogue is keyed by it, and a
+/// price that has none is one this gateway was never told to sell.
+fn parse_price(p: &serde_json::Value) -> Option<(String, LivePrice)> {
+    let lookup = p.get("lookup_key").and_then(|v| v.as_str())?;
+    let base_ccy = p.get("currency").and_then(|v| v.as_str()).unwrap_or("");
+    let base_amount = p.get("unit_amount").and_then(|v| v.as_i64());
+    // A multi-currency price lists its other currencies here; the base one is not
+    // repeated, so it has to be folded in by hand.
+    let opt = |c: &str| {
+        p.pointer(&format!("/currency_options/{c}/unit_amount"))
+            .and_then(|v| v.as_i64())
+    };
+    // Blank strings are Stripe's "unset", not a name — treat them as absent so the card
+    // falls back to the stored label instead of rendering an empty heading.
+    let text = |path: &str| {
+        p.pointer(path)
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+    };
+    Some((
+        lookup.to_owned(),
+        LivePrice {
+            id: p.get("id").and_then(|v| v.as_str()).unwrap_or_default().to_owned(),
+            cny_minor: opt("cny").or(if base_ccy == "cny" { base_amount } else { None }),
+            usd_minor: opt("usd").or(if base_ccy == "usd" { base_amount } else { None }),
+            currency: base_ccy.to_owned(),
+            name: text("/product/name"),
+            description: text("/product/description"),
+            names: localized(p, "name"),
+            descriptions: localized(p, "description"),
+            recurring: p.get("recurring").map(|v| !v.is_null()).unwrap_or(false),
+        },
+    ))
+}
+
+/// Pull `name_xx` / `description_xx` out of a Stripe product's metadata.
+///
+/// Stripe metadata keys cannot contain a hyphen in practice for these, so `zh_CN` and
+/// `zh-CN` are both accepted and normalised to the BCP-47 form the client asks for.
+/// Blank values are dropped so an empty metadata field falls back rather than rendering
+/// an empty product name.
+fn localized(price: &serde_json::Value, field: &str) -> serde_json::Map<String, serde_json::Value> {
+    let mut out = serde_json::Map::new();
+    let Some(meta) = price.pointer("/product/metadata").and_then(|v| v.as_object()) else {
+        return out;
+    };
+    let prefix = format!("{field}_");
+    for (k, v) in meta {
+        let Some(tag) = k.strip_prefix(&prefix) else { continue };
+        let Some(text) = v.as_str().map(str::trim).filter(|s| !s.is_empty()) else {
+            continue;
+        };
+        out.insert(tag.replace('_', "-"), json!(text));
+    }
+    out
+}
+
+/// What a card should print: the amount, and the currency it is honest to print it in.
+///
+/// Checkout charges a price's base currency unless the buyer's currency has an entry in
+/// `currency_options`, so quoting USD is only truthful when Stripe actually carries a USD
+/// amount. Falling back to the stored USD column field-by-field is what produced a card
+/// reading "¥4 · $0.15": Stripe had moved that price to ¥4 while the column still held the
+/// $0.15 from when it was ¥1.
+///
+/// `stored` is (cny_minor, usd_minor) from the database, used only when Stripe said
+/// nothing at all about this price.
+fn display_amount(
+    live: Option<&LivePrice>,
+    stored: (i64, Option<i64>),
+) -> (Option<i64>, Option<i64>, String, Option<i64>) {
+    let (cny, usd, currency) = match live {
+        Some(p) => (
+            p.cny_minor,
+            p.usd_minor,
+            if p.usd_minor.is_some() { "usd".to_owned() } else { p.currency.clone() },
+        ),
+        None => (Some(stored.0), stored.1, "usd".to_owned()),
+    };
+    let minor = match currency.as_str() {
+        "usd" => usd,
+        "cny" => cny,
+        _ => None,
+    };
+    (cny, usd, currency, minor)
 }
 
 /// Which currency to show first, from where the request came from.
@@ -230,9 +323,15 @@ pub async fn catalog(
             // card can say "$49.77 included" instead of only quoting a price, and can
             // never drift from what the purchase really delivers.
             let spec = r.plan.as_deref().and_then(crate::settings::plan_spec);
+
+            let (cny_minor, usd_minor, display_currency, display_minor) =
+                display_amount(lp, (r.amount_cents, r.amount_usd_cents));
+
             json!({
                 "lookup_key": key,
-                "label": r.label,
+                // Stripe's product name and description win: they are what the operator
+                // edits, and the stored copies are only there for when Stripe is silent.
+                "label": lp.and_then(|p| p.name.clone()).unwrap_or_else(|| r.label.clone()),
                 "kind": r.kind,
                 "plan": r.plan,
                 "included_cents": spec.map(|s| s.0),
@@ -240,12 +339,21 @@ pub async fn catalog(
                 "weekly_cap_cents": spec.map(|s| s.2),
                 "duration_days": r.duration_days,
                 "credits_cents": r.credits_cents,
-                "amount_cents": lp.and_then(|p| p.cny_minor).unwrap_or(r.amount_cents),
-                "amount_usd_cents": lp.and_then(|p| p.usd_minor).or(r.amount_usd_cents),
+                "amount_cents": cny_minor,
+                "amount_usd_cents": usd_minor,
+                // What the card should print, and in which currency — decided here so the
+                // page never has to guess which of the two amounts Stripe will honour.
+                "display_currency": display_currency,
+                "display_minor": display_minor,
                 "recurring": lp.map(|p| p.recurring).unwrap_or(r.recurring),
                 "once_per_account": r.once_per_account,
                 "unit_credits_cents": r.unit_credits_cents,
-                "blurb": r.blurb,
+                "blurb": lp.and_then(|p| p.description.clone()).unwrap_or_else(|| r.blurb.clone()),
+                // Whole maps, not a pre-picked language: the catalogue is cached for two
+                // minutes and shared by every reader, so the language has to be chosen
+                // per request — which the client does anyway, from its own setting.
+                "labels": lp.map(|p| p.names.clone()).unwrap_or_default(),
+                "blurbs": lp.map(|p| p.descriptions.clone()).unwrap_or_default(),
                 "already_purchased": spent_once.contains(&key),
             })
         })
@@ -415,11 +523,11 @@ pub async fn checkout(
         .unit_credits_cents
         .map(|u| u.saturating_mul(quantity))
         .or(row.credits_cents);
-    let _ = sqlx::query(
+    sqlx::query(
         "INSERT INTO orders (user_id, email, price_id, kind, plan, duration_days, credits_cents, \
          amount_cents, method, status, stripe_session_id, quantity) \
          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'stripe','pending',$9,$10) \
-         ON CONFLICT (stripe_session_id) DO NOTHING",
+         ON CONFLICT (stripe_session_id) WHERE stripe_session_id IS NOT NULL DO NOTHING",
     )
     .bind(uid)
     .bind(&claims.email)
@@ -432,7 +540,7 @@ pub async fn checkout(
     .bind(session_id)
     .bind(quantity as i32)
     .execute(&state.db)
-    .await;
+    .await?;
 
     Ok(Json(json!({ "url": url, "session_id": session_id })))
 }
@@ -808,7 +916,7 @@ async fn fulfil_session(
              credits_cents, amount_cents, method, status, stripe_session_id, \
              stripe_subscription_id, quantity, paid_at) \
              VALUES ($1,'',$2,$3,$4,$5,$6,$7,'stripe','paid',$8,$9,$10, now()) \
-             ON CONFLICT (stripe_session_id) DO NOTHING",
+             ON CONFLICT (stripe_session_id) WHERE stripe_session_id IS NOT NULL DO NOTHING",
         )
         .bind(uid)
         .bind(row.id)
@@ -973,6 +1081,48 @@ mod tests {
         );
     }
 
+    /// `idx_orders_stripe_session` is intentionally partial so legacy rows with no
+    /// Stripe session remain valid. PostgreSQL can only infer that index when the
+    /// conflict target repeats its predicate; omitting it causes every checkout
+    /// pre-write and webhook fallback to fail with 42P10.
+    #[test]
+    fn stripe_session_conflicts_match_the_partial_unique_index() {
+        let src = include_str!("stripe.rs");
+        let conflict_target =
+            "ON CONFLICT (stripe_session_id) WHERE stripe_session_id IS NOT NULL DO NOTHING";
+        let production = src
+            .split_once("#[cfg(test)]")
+            .expect("the test module must follow the Stripe SQL")
+            .0;
+        assert_eq!(
+            production.matches(conflict_target).count(),
+            2,
+            "both Stripe order INSERTs must infer the partial session index"
+        );
+
+        let migration = include_str!("../migrations/20260808_stripe_billing.sql");
+        assert!(
+            migration.contains("ON orders (stripe_session_id) WHERE stripe_session_id IS NOT NULL"),
+            "the regression test must stay aligned with the already-applied partial index"
+        );
+
+        let checkout_write = production
+            .split_once("// Record the intent now")
+            .expect("checkout pending-order write")
+            .1
+            .split_once("Ok(Json")
+            .expect("checkout response follows the pending-order write")
+            .0;
+        assert!(
+            checkout_write.contains(".await?;"),
+            "checkout must surface a failed pending-order write"
+        );
+        assert!(
+            !checkout_write.contains("let _ = sqlx::query"),
+            "checkout must not silently discard a pending-order write failure"
+        );
+    }
+
     /// Only genuinely dead subscriptions revoke. `past_due` means Stripe is still
     /// retrying the card — cutting that customer off would be taking away a period
     /// they may yet pay for.
@@ -1091,6 +1241,166 @@ mod tests {
         let ts = chrono::Utc::now().timestamp();
         let header = format!("t={ts},v1=deadbeef,v1={}", sign(secret, ts, body));
         assert!(verify_signature(secret, &header, body).is_ok());
+    }
+
+    /// Shaped like a real `/v1/prices` entry with `currency_options` and `product`
+    /// expanded, which is how the gateway asks for them.
+    fn stripe_price(extra: serde_json::Value) -> serde_json::Value {
+        let mut base = json!({
+            "id": "price_123",
+            "lookup_key": "starter_monthly",
+            "currency": "cny",
+            "unit_amount": 8800,
+            "recurring": { "interval": "month" },
+            "product": { "name": "Starter", "description": "For everyday work." }
+        });
+        let (serde_json::Value::Object(b), serde_json::Value::Object(e)) = (&mut base, extra) else {
+            unreachable!()
+        };
+        for (k, v) in e {
+            b.insert(k, v);
+        }
+        base
+    }
+
+    #[test]
+    fn product_metadata_supplies_per_language_names() {
+        let (_, live) = parse_price(&stripe_price(json!({
+            "product": {
+                "name": "Starter",
+                "description": "For everyday work.",
+                "metadata": {
+                    "name_ja": "スターター",
+                    "name_zh_CN": "入门版",
+                    "description_de": "Für die tägliche Arbeit.",
+                    // Blank must not shadow the English original with an empty heading.
+                    "name_es": "   ",
+                    // Not one of ours; must not be mistaken for a language.
+                    "internal_note": "do not ship"
+                }
+            }
+        })))
+        .unwrap();
+        assert_eq!(live.names.get("ja").and_then(|v| v.as_str()), Some("スターター"));
+        // Stripe metadata keys use underscores; the client asks in BCP-47.
+        assert_eq!(live.names.get("zh-CN").and_then(|v| v.as_str()), Some("入门版"));
+        assert_eq!(live.descriptions.get("de").and_then(|v| v.as_str()), Some("Für die tägliche Arbeit."));
+        assert!(!live.names.contains_key("es"), "a blank override must fall back");
+        assert!(!live.names.contains_key("internal-note"));
+        assert_eq!(live.name.as_deref(), Some("Starter"), "English is still the base");
+    }
+
+    #[test]
+    fn a_product_with_no_metadata_yields_no_overrides() {
+        let (_, live) = parse_price(&stripe_price(json!({}))).unwrap();
+        assert!(live.names.is_empty());
+        assert!(live.descriptions.is_empty());
+    }
+
+    #[test]
+    fn a_price_without_a_lookup_key_is_not_ours_to_sell() {
+        let mut p = stripe_price(json!({}));
+        p.as_object_mut().unwrap().remove("lookup_key");
+        assert!(parse_price(&p).is_none());
+    }
+
+    #[test]
+    fn the_base_currency_amount_is_folded_in() {
+        // Stripe does not repeat the base currency inside currency_options, so a CNY-only
+        // price would otherwise parse as having no amount at all.
+        let (key, live) = parse_price(&stripe_price(json!({}))).unwrap();
+        assert_eq!(key, "starter_monthly");
+        assert_eq!(live.cny_minor, Some(8800));
+        assert_eq!(live.usd_minor, None);
+        assert_eq!(live.currency, "cny");
+        assert!(live.recurring);
+    }
+
+    #[test]
+    fn a_multi_currency_price_reports_both() {
+        let (_, live) = parse_price(&stripe_price(json!({
+            "currency_options": { "usd": { "unit_amount": 1299 } }
+        })))
+        .unwrap();
+        assert_eq!(live.cny_minor, Some(8800));
+        assert_eq!(live.usd_minor, Some(1299));
+    }
+
+    #[test]
+    fn a_one_time_price_is_not_recurring() {
+        // Stripe sends `recurring: null`, and mistaking it for a subscription is a hard
+        // 400 at checkout, not a cosmetic slip.
+        let (_, live) = parse_price(&stripe_price(json!({ "recurring": serde_json::Value::Null }))).unwrap();
+        assert!(!live.recurring);
+    }
+
+    #[test]
+    fn a_blank_product_name_falls_back_rather_than_rendering_empty() {
+        let (_, live) = parse_price(&stripe_price(json!({
+            "product": { "name": "   ", "description": "" }
+        })))
+        .unwrap();
+        assert_eq!(live.name, None);
+        assert_eq!(live.description, None);
+    }
+
+    #[test]
+    fn the_product_name_and_description_come_through() {
+        let (_, live) = parse_price(&stripe_price(json!({}))).unwrap();
+        assert_eq!(live.name.as_deref(), Some("Starter"));
+        assert_eq!(live.description.as_deref(), Some("For everyday work."));
+    }
+
+    #[test]
+    fn dollars_are_quoted_only_when_stripe_carries_them() {
+        let live = LivePrice {
+            cny_minor: Some(400),
+            usd_minor: None,
+            currency: "cny".into(),
+            ..Default::default()
+        };
+        // The stored column still says $0.15 from when this price was ¥1. Quoting it
+        // would advertise a figure nobody is charged.
+        let (_, _, currency, minor) = display_amount(Some(&live), (100, Some(15)));
+        assert_eq!(currency, "cny");
+        assert_eq!(minor, Some(400), "must quote Stripe's ¥4, not the stale ¥1");
+    }
+
+    #[test]
+    fn dollars_win_when_stripe_has_a_usd_amount() {
+        let live = LivePrice {
+            cny_minor: Some(8800),
+            usd_minor: Some(1299),
+            currency: "cny".into(),
+            ..Default::default()
+        };
+        let (_, _, currency, minor) = display_amount(Some(&live), (8800, Some(9999)));
+        assert_eq!(currency, "usd");
+        assert_eq!(minor, Some(1299), "Stripe's USD, never the stored column");
+    }
+
+    #[test]
+    fn the_stored_columns_are_used_only_when_stripe_said_nothing() {
+        // No key configured, or Stripe unreachable: the shop degrades to its old
+        // behaviour rather than emptying itself.
+        let (cny, usd, currency, minor) = display_amount(None, (8800, Some(1299)));
+        assert_eq!(cny, Some(8800));
+        assert_eq!(usd, Some(1299));
+        assert_eq!(currency, "usd");
+        assert_eq!(minor, Some(1299));
+    }
+
+    #[test]
+    fn an_unsupported_currency_quotes_nothing_rather_than_a_wrong_number() {
+        let live = LivePrice {
+            cny_minor: None,
+            usd_minor: None,
+            currency: "eur".into(),
+            ..Default::default()
+        };
+        let (_, _, currency, minor) = display_amount(Some(&live), (8800, Some(1299)));
+        assert_eq!(currency, "eur");
+        assert_eq!(minor, None, "no EUR amount was parsed, so there is nothing honest to print");
     }
 
     fn hdr(country: Option<&str>) -> HeaderMap {

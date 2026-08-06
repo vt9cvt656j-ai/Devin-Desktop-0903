@@ -1,0 +1,362 @@
+/* ============================================================================
+ * shadcn/ui 组件语汇层
+ *
+ * 目标：把 shadcn 的**组件观感**搬到 IDE 上，配色一个都不动。
+ *
+ * ## 为什么是一层 CSS，而不是把 shadcn 装进来
+ *
+ * shadcn/ui 不是样式库，是一组 React 组件（底下是 Radix primitives）。这个前端没有
+ * React、没有 Tailwind、没有 Radix：59,731 行原生 JS 直接操作 DOM，855 行手写 HTML，
+ * 22 个对话框，Monaco / xterm / three.js / globe.gl 全是命令式挂载的。把 shadcn 装进来
+ * 等于把整个外壳改写成 React。
+ *
+ * 但 shadcn 的「好看」其实不在 React 里 —— 它是一套很具体的视觉语汇：
+ *   · 6px 的控件圆角 / 12px 的卡片圆角（一套 --radius 派生的比例）
+ *   · focus-visible 时 3px、50% 不透明度的 ring，而不是 1px 描边
+ *   · outline 变体处处带 1px 边框
+ *   · 控件上极轻的 shadow-xs
+ *   · disabled 用 opacity .5 + pointer-events none
+ *   · 统一的 150ms 过渡
+ * 这一层就是这套语汇，重写在现有 class 上。
+ *
+ * ## 两条硬约束
+ *
+ * 1) **不改配色。** 每个组件保留它现在的颜色（.btn 仍是 #1a73e8、hover 仍是 #e8f0fe，
+ *    .welcome__btn 仍走 token）。ring 的颜色从各自的强调色 color-mix 出来，所以连
+ *    focus 态都不会引入新色相。
+ *
+ * 2) **不改类名、不改结构。** 全部是对现有选择器的重写，index.html 和 main.js 一行不用动。
+ *    在 59k 行命令式 DOM 代码上，这是唯一风险可控的做法。
+ *
+ * 布局尺寸也刻意不动：标题栏 44px、状态栏 26px、.tbtn 28px 都是布局关键值，shadcn 的
+ * h-9(36px) 套上去会把标题栏挤变形。shadcn 的辨识度主要来自圆角 / ring / 边框 / 阴影，
+ * 不来自那几个像素高度，所以只搬前者。
+ * ========================================================================== */
+
+:root {
+  /* shadcn 的 --radius 比例。基准取现有的 --radius(10px)，派生出 sm/md/lg/xl，
+     控件用 md(6px)、卡片用 xl(14px) —— 和 shadcn 默认主题的观感一致。 */
+  --ui-radius-sm: calc(var(--radius) - 6px); /*  4px */
+  --ui-radius-md: calc(var(--radius) - 4px); /*  6px */
+  --ui-radius-lg: calc(var(--radius) - 2px); /*  8px */
+  --ui-radius-xl: calc(var(--radius) + 4px); /* 14px */
+
+  /* focus ring：shadcn v4 的写法是 3px + 50% 不透明。颜色不写死，由各组件用自己的
+     强调色 color-mix 出来，这样 ring 永远和它所属的组件同色系。 */
+  --ui-ring-width: 3px;
+  --ui-ring-alpha: 50%;
+
+  --ui-shadow-xs: 0 1px 2px rgba(0, 0, 0, 0.05);
+  --ui-shadow-sm: 0 1px 3px rgba(0, 0, 0, 0.09), 0 1px 2px -1px rgba(0, 0, 0, 0.09);
+  --ui-shadow-lg: 0 10px 15px -3px rgba(0, 0, 0, 0.1), 0 4px 6px -4px rgba(0, 0, 0, 0.1);
+
+  --ui-transition: 150ms cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+/* 深色下阴影要更重才看得出层次，否则卡片和背景糊成一片。 */
+:root[data-theme="dark"] {
+  --ui-shadow-xs: 0 1px 2px rgba(0, 0, 0, 0.3);
+  --ui-shadow-sm: 0 1px 3px rgba(0, 0, 0, 0.5), 0 1px 2px -1px rgba(0, 0, 0, 0.5);
+  --ui-shadow-lg: 0 10px 15px -3px rgba(0, 0, 0, 0.6), 0 4px 6px -4px rgba(0, 0, 0, 0.6);
+}
+
+/* ---------------------------------------------------------------------------
+ * Button —— .btn / .btn--primary
+ * 圆角 18px(胶囊) → 6px，补 focus ring 和 disabled 态。颜色原样。
+ * ------------------------------------------------------------------------- */
+.btn {
+  gap: 8px;
+  border-radius: var(--ui-radius-md);
+  font-weight: 500;
+  transition: background var(--ui-transition), color var(--ui-transition),
+    box-shadow var(--ui-transition), border-color var(--ui-transition);
+}
+.btn:focus-visible {
+  outline: none;
+  /* #1a73e8 是这个按钮本来的颜色，ring 从它派生 —— 不引入新色。 */
+  box-shadow: 0 0 0 var(--ui-ring-width)
+    color-mix(in srgb, #1a73e8 var(--ui-ring-alpha), transparent);
+}
+.btn:disabled,
+.btn[disabled] {
+  opacity: 0.5;
+  pointer-events: none;
+}
+.btn--primary {
+  box-shadow: var(--ui-shadow-xs);
+}
+.btn--primary:hover {
+  box-shadow: var(--ui-shadow-sm);
+}
+
+/* ---------------------------------------------------------------------------
+ * Icon / toolbar button —— .tbtn
+ * 高度 28px 是标题栏布局关键值，保留；只改圆角与 focus。
+ * ------------------------------------------------------------------------- */
+.tbtn {
+  border-radius: var(--ui-radius-md);
+  transition: background var(--ui-transition), color var(--ui-transition),
+    box-shadow var(--ui-transition);
+}
+.tbtn:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 var(--ui-ring-width)
+    color-mix(in srgb, var(--accent) var(--ui-ring-alpha), transparent);
+}
+.tbtn:disabled,
+.tbtn[disabled] {
+  opacity: 0.5;
+  pointer-events: none;
+}
+
+/* ---------------------------------------------------------------------------
+ * Input —— .login-input
+ * 8px → 6px；focus 从 1px 描边换成 3px ring（shadcn 最好认的一处）。
+ * 边框色 #dadce0、focus 色 #1a73e8 原样保留。
+ * ------------------------------------------------------------------------- */
+.login-input {
+  border-radius: var(--ui-radius-md);
+  box-shadow: var(--ui-shadow-xs);
+  transition: border-color var(--ui-transition), box-shadow var(--ui-transition);
+}
+.login-input:focus {
+  border-color: #1a73e8;
+  box-shadow: 0 0 0 var(--ui-ring-width)
+    color-mix(in srgb, #1a73e8 var(--ui-ring-alpha), transparent);
+}
+.login-input:disabled {
+  opacity: 0.5;
+  pointer-events: none;
+}
+
+/* Primary button —— .login-btn。颜色不动，补圆角、ring 和轻阴影。 */
+.login-btn {
+  border-radius: var(--ui-radius-md);
+  box-shadow: var(--ui-shadow-xs);
+  transition: background var(--ui-transition), box-shadow var(--ui-transition);
+}
+.login-btn:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 var(--ui-ring-width)
+    color-mix(in srgb, #1a73e8 var(--ui-ring-alpha), transparent);
+}
+.login-btn:disabled {
+  opacity: 0.5;
+  pointer-events: none;
+  box-shadow: none;
+}
+
+/* Link 按钮 —— shadcn 的 link 变体：无背景，hover 出下划线。 */
+.login-link {
+  border-radius: var(--ui-radius-sm);
+  transition: background var(--ui-transition), text-decoration-color var(--ui-transition);
+}
+.login-link:hover {
+  text-decoration: underline;
+  text-underline-offset: 4px;
+}
+.login-link:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 var(--ui-ring-width)
+    color-mix(in srgb, #1a73e8 var(--ui-ring-alpha), transparent);
+}
+
+/* ---------------------------------------------------------------------------
+ * Dialog —— .sheet
+ * 16px → 14px（shadcn 卡片/对话框那一档），阴影换成 shadow-lg 的分层写法。
+ * 背景 #fff、文字 #202124 原样。
+ * ------------------------------------------------------------------------- */
+.sheet {
+  border-radius: var(--ui-radius-xl);
+  box-shadow: var(--ui-shadow-lg);
+}
+/* ::backdrop 刻意不写。shadcn 的 overlay 是 50% 纯黑，这里现在是 rgba(0,0,0,.28)
+   —— 改过去是实打实的观感变化，不属于「只换组件语汇、不动配色」的范围。
+   哪天想统一 overlay 深度，那是配色决定，单独做。 */
+
+/* ---------------------------------------------------------------------------
+ * Outline button —— .welcome__btn
+ * shadcn 的 outline 变体：1px 边框 + 背景色 + 极轻阴影。这个组件本来就走 token，
+ * 所以这里连 color-mix 都不用换源。
+ * ------------------------------------------------------------------------- */
+.welcome__btn {
+  border-radius: var(--ui-radius-md);
+  box-shadow: var(--ui-shadow-xs);
+  transition: background var(--ui-transition), border-color var(--ui-transition),
+    box-shadow var(--ui-transition);
+}
+.welcome__btn:hover {
+  box-shadow: var(--ui-shadow-sm);
+}
+.welcome__btn:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 var(--ui-ring-width)
+    color-mix(in srgb, var(--accent) var(--ui-ring-alpha), transparent);
+}
+.welcome__btn:disabled,
+.welcome__btn[disabled] {
+  opacity: 0.5;
+  pointer-events: none;
+}
+
+/* ============================================================================
+ * 新增的 shadcn 组件类
+ *
+ * 上面是把现有组件换成 shadcn 语汇；下面这些是 IDE 现在还没有、但 shadcn 有的，
+ * 直接可用。全部走 token，深浅色自动跟随。
+ * ========================================================================== */
+
+/* Card —— rounded-xl + 1px 边框 + shadow-sm */
+.ui-card {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  padding: 20px;
+  background: var(--panel-2);
+  border: 1px solid var(--line);
+  border-radius: var(--ui-radius-xl);
+  box-shadow: var(--ui-shadow-sm);
+  color: var(--text);
+}
+.ui-card__title {
+  font-size: 15px;
+  font-weight: 600;
+  line-height: 1.3;
+  margin: 0;
+}
+.ui-card__desc {
+  font-size: 13px;
+  color: var(--text-dim);
+  margin: 0;
+  line-height: 1.5;
+}
+
+/* Badge —— rounded-md，小号，边框 + 弱背景 */
+.ui-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 8px;
+  font-size: 11.5px;
+  font-weight: 500;
+  line-height: 1.45;
+  white-space: nowrap;
+  border: 1px solid var(--line);
+  border-radius: var(--ui-radius-md);
+  background: var(--hover);
+  color: var(--text);
+}
+.ui-badge--accent {
+  border-color: color-mix(in srgb, var(--accent) 35%, transparent);
+  background: color-mix(in srgb, var(--accent) 12%, transparent);
+  color: var(--accent);
+}
+
+/* Separator */
+.ui-separator {
+  flex: none;
+  border: none;
+  background: var(--line);
+  height: 1px;
+  width: 100%;
+  margin: 0;
+}
+.ui-separator[data-orientation="vertical"] {
+  height: auto;
+  width: 1px;
+  align-self: stretch;
+}
+
+/* Tabs —— shadcn 的写法是 muted 底 + 内嵌 3px padding，选中项浮起来 */
+.ui-tabs {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  padding: 3px;
+  background: var(--hover);
+  border-radius: var(--ui-radius-lg);
+}
+.ui-tabs__trigger {
+  appearance: none;
+  border: none;
+  background: transparent;
+  color: var(--text-dim);
+  font: inherit;
+  font-size: 12.5px;
+  font-weight: 500;
+  padding: 5px 12px;
+  border-radius: var(--ui-radius-md);
+  cursor: pointer;
+  transition: background var(--ui-transition), color var(--ui-transition),
+    box-shadow var(--ui-transition);
+}
+.ui-tabs__trigger:hover {
+  color: var(--text);
+}
+.ui-tabs__trigger[aria-selected="true"],
+.ui-tabs__trigger.is-active {
+  background: var(--panel-solid);
+  color: var(--text);
+  box-shadow: var(--ui-shadow-xs);
+}
+.ui-tabs__trigger:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 var(--ui-ring-width)
+    color-mix(in srgb, var(--accent) var(--ui-ring-alpha), transparent);
+}
+
+/* Tooltip —— 反色小气泡，shadcn 的默认样子 */
+.ui-tooltip {
+  position: absolute;
+  z-index: 60;
+  padding: 5px 10px;
+  font-size: 11.5px;
+  line-height: 1.4;
+  border-radius: var(--ui-radius-md);
+  background: var(--text);
+  color: var(--editor-bg);
+  box-shadow: var(--ui-shadow-lg);
+  pointer-events: none;
+  white-space: nowrap;
+}
+
+/* Switch */
+.ui-switch {
+  appearance: none;
+  position: relative;
+  flex: none;
+  width: 34px;
+  height: 20px;
+  border-radius: 999px;
+  border: 1px solid transparent;
+  background: var(--line-strong);
+  cursor: pointer;
+  transition: background var(--ui-transition), box-shadow var(--ui-transition);
+}
+.ui-switch::after {
+  content: "";
+  position: absolute;
+  top: 1px;
+  left: 1px;
+  width: 16px;
+  height: 16px;
+  border-radius: 999px;
+  background: #fff;
+  box-shadow: var(--ui-shadow-xs);
+  transition: transform var(--ui-transition);
+}
+.ui-switch:checked {
+  background: var(--accent);
+}
+.ui-switch:checked::after {
+  transform: translateX(14px);
+}
+.ui-switch:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 var(--ui-ring-width)
+    color-mix(in srgb, var(--accent) var(--ui-ring-alpha), transparent);
+}
+.ui-switch:disabled {
+  opacity: 0.5;
+  pointer-events: none;
+}

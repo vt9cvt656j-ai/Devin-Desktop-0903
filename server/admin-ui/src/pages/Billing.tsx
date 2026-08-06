@@ -30,6 +30,7 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Textarea } from "@/components/ui/textarea";
 import { Panel } from "@/components/Panel";
 import { api } from "@/lib/api";
+import { creditCentsFromRaw, rawCentsFromCreditDollars, useSettings } from "@/lib/settings";
 import { useRowFlash } from "@/lib/flash";
 import { cents, num, when } from "@/lib/format";
 
@@ -92,16 +93,23 @@ type Ask = { title: string; desc: string; label: string; danger?: boolean; act: 
 const PLANS = ["trial", "basic", "pro", "power", "ultra"] as const;
 
 /**
- * User-facing credit balances are denominated at 663 real billing cents = $1.00 of visible
- * credit (admin.html:703). Prices and revenue are real money and never take this conversion —
+ * User-facing credit balances are denominated at N real billing cents = $1.00 of visible
+ * credit (default 663). Prices and revenue are real money and never take this conversion —
  * only credits_cents does. The formatting itself still goes through cents(); only the unit
  * conversion lives here.
+ *
+ * 分母来自服务端（lib/settings.ts → app_settings），不再在本文件写死。toCredits 是**写路径**：
+ * 运营输入的美元乘以分母后作为 credits_cents 存库，服务端不做二次换算，所以这个数一旦
+ * 和服务端不一致，商品和兑换码发出去的额度就会直接错掉。
+ *
+ * 注意：商品价格和兑换码里的额度在创建时就按当时的分母折算成真实分存下来了。之后修改
+ * 分母**不会**追改已存在的商品、订单和未兑换的码——它们的真实分是冻结的，变的只是这些
+ * 数字在页面上显示成多少面值美元。
  */
-const CREDIT_RAW_PER_USD = 663;
 const creditUsd = (raw: number | null | undefined) =>
-  raw == null ? cents(null) : cents(Math.round((raw / CREDIT_RAW_PER_USD) * 100));
+  raw == null ? cents(null) : cents(creditCentsFromRaw(raw));
 const toCents = (v: string) => Math.round((parseFloat(v) || 0) * 100);
-const toCredits = (v: string) => Math.round((parseFloat(v) || 0) * CREDIT_RAW_PER_USD);
+const toCredits = rawCentsFromCreditDollars;
 const reason = (e: unknown, fallback: string) => (e instanceof Error ? e.message : fallback);
 
 
@@ -135,6 +143,8 @@ function orderStatus(s?: string) {
 }
 
 export function Billing() {
+  // 订阅面值分母：设置到货后金额要重算一次。
+  useSettings();
   const [prices, setPrices] = useState<Price[]>([]);
   const [orders, setOrders] = useState<Order[]>([]);
   const [codes, setCodes] = useState<Code[]>([]);

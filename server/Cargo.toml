@@ -31,6 +31,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 dotenvy = "0.15"
 anyhow = "1"
 sha2 = "0.10"   # per-user gateway cache key (DefaultHasher is not collision resistant)
+hmac = "0.12"   # Stripe webhook signature (HMAC-SHA256 over the raw request body)
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream", "multipart"] }
 
 [profile.release]

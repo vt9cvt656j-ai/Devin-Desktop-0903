@@ -15,6 +15,8 @@ export type Me = {
   last_name: string;
   /** A `data:` URL the account holder uploaded, or null. */
   avatar: string | null;
+  /** BCP-47 interface language, or "" when never chosen. */
+  language: string;
   plan: string;
   plan_expires_at: string | null;
   credits_cents: number;
@@ -58,10 +60,20 @@ export type CatalogItem = {
   credits_cents: number | null;
   amount_cents: number;
   amount_usd_cents: number | null;
+  /**
+   * Which currency the card should print, and the figure in that currency's minor units.
+   * Both are decided server-side from what Stripe will actually charge, so the page never
+   * picks between two amounts or applies a rate of its own.
+   */
+  display_currency: string;
+  display_minor: number | null;
   recurring: boolean;
   once_per_account: boolean;
   unit_credits_cents: number | null;
   blurb: string;
+  /** Per-language product text from Stripe metadata, keyed by BCP-47 tag. */
+  labels: Record<string, string>;
+  blurbs: Record<string, string>;
   already_purchased: boolean;
   included_cents: number | null;
   window_cap_cents: number | null;
@@ -125,7 +137,7 @@ export const api = {
    * Partial update: only the keys present are written, so the picture can be changed
    * without resending the names. `avatar: ""` clears it; omitting it leaves it alone.
    */
-  updateProfile: (body: { first_name?: string; last_name?: string; avatar?: string }) =>
+  updateProfile: (body: { first_name?: string; last_name?: string; avatar?: string; language?: string }) =>
     request<{ ok: boolean }>("/api/me/profile", { method: "POST", body }),
   integrations: () => request<{ providers: Integration[] }>("/api/integrations"),
   /** Returns the provider's authorize URL; the caller navigates to it. */
@@ -143,6 +155,9 @@ export const api = {
     }),
   redeem: (code: string) => request<unknown>("/api/redeem", { method: "POST", body: { code } }),
   models: () => request<unknown[]>("/api/models"),
+  sessions: () => request<SessionList>("/api/sessions"),
+  revokeSession: (id: string) =>
+    request<{ ok: boolean }>(`/api/sessions/${id}`, { method: "DELETE" }),
 };
 
 export function signOut(): void {
@@ -161,6 +176,32 @@ export function signOut(): void {
  * network stack and cannot be caught away, so the common case should make one request.
  */
 const HANDOFF_PORTS = [47821, 47822, 47823];
+
+export type DeviceSession = {
+  id: string;
+  /** 'web' | 'desktop' | 'mobile' — picks the icon. */
+  kind: string;
+  /** Server-composed English. Kept for reference; the console builds its own. */
+  label: string;
+  /** Proper nouns from the User-Agent, or null. Never translated — "Chrome" is Chrome. */
+  browser: string | null;
+  platform: string | null;
+  ip: string;
+  created_at: string;
+  last_seen_at: string;
+  /** The session this page is being read from. */
+  current: boolean;
+};
+
+export type SessionList = {
+  sessions: DeviceSession[];
+  /**
+   * False when this browser's token predates session tracking. Such a token still works
+   * but is not in the list and cannot be revoked on its own, so the page says so rather
+   * than presenting a list that looks complete.
+   */
+  current_tracked: boolean;
+};
 
 export type Integration = {
   provider: string;

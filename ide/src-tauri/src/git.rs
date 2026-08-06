@@ -96,15 +96,42 @@ fn unquote_git_path(raw: &str) -> String {
             break;
         }
         match bytes[i] {
-            b'a' => { out.push(0x07); i += 1; }
-            b'b' => { out.push(0x08); i += 1; }
-            b'f' => { out.push(0x0c); i += 1; }
-            b'n' => { out.push(b'\n'); i += 1; }
-            b'r' => { out.push(b'\r'); i += 1; }
-            b't' => { out.push(b'\t'); i += 1; }
-            b'v' => { out.push(0x0b); i += 1; }
-            b'"' => { out.push(b'"'); i += 1; }
-            b'\\' => { out.push(b'\\'); i += 1; }
+            b'a' => {
+                out.push(0x07);
+                i += 1;
+            }
+            b'b' => {
+                out.push(0x08);
+                i += 1;
+            }
+            b'f' => {
+                out.push(0x0c);
+                i += 1;
+            }
+            b'n' => {
+                out.push(b'\n');
+                i += 1;
+            }
+            b'r' => {
+                out.push(b'\r');
+                i += 1;
+            }
+            b't' => {
+                out.push(b'\t');
+                i += 1;
+            }
+            b'v' => {
+                out.push(0x0b);
+                i += 1;
+            }
+            b'"' => {
+                out.push(b'"');
+                i += 1;
+            }
+            b'\\' => {
+                out.push(b'\\');
+                i += 1;
+            }
             b'0'..=b'7' => {
                 // 三位八进制，逐字节还原后整体按 UTF-8 解释。
                 let mut v = 0u32;
@@ -116,7 +143,10 @@ fn unquote_git_path(raw: &str) -> String {
                 }
                 out.push((v & 0xff) as u8);
             }
-            other => { out.push(other); i += 1; }
+            other => {
+                out.push(other);
+                i += 1;
+            }
         }
     }
     String::from_utf8_lossy(&out).into_owned()
@@ -188,7 +218,10 @@ pub fn git_status(root: String) -> Result<GitStatus, String> {
     // `core.quotepath=false` 让 git 直接输出 UTF-8 路径，而不是 `"\344\270\255..."`
     // 这种八进制转义形式。含引号/反斜杠/控制字符的路径仍会被引号包起来，由下面的
     // unquote_git_path 兜底。
-    let status_out = run_git(&root, &["-c", "core.quotepath=false", "status", "--porcelain=v1"])?;
+    let status_out = run_git(
+        &root,
+        &["-c", "core.quotepath=false", "status", "--porcelain=v1"],
+    )?;
     if !status_out.status.success() {
         let err = String::from_utf8_lossy(&status_out.stderr)
             .trim()
@@ -1246,7 +1279,10 @@ mod git_path_tests {
     /// 的绝对路径不存在 → 被判成"已删除"，而且暂存/看 diff 一律失败。
     #[test]
     fn octal_escaped_utf8_paths_round_trip() {
-        assert_eq!(unquote_git_path("\"\\344\\270\\255\\346\\226\\207.txt\""), "中文.txt");
+        assert_eq!(
+            unquote_git_path("\"\\344\\270\\255\\346\\226\\207.txt\""),
+            "中文.txt"
+        );
         assert_eq!(unquote_git_path("\"src/\\344\\270\\255.rs\""), "src/中.rs");
     }
 

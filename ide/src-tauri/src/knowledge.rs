@@ -5,9 +5,6 @@ use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
-type DeepSearchHit = (String, String, String, &'static str);
-type DeepSearchFuture =
-    std::pin::Pin<Box<dyn std::future::Future<Output = Vec<DeepSearchHit>> + Send>>;
 type CommunityAdapterOutput = (&'static str, &'static str, Result<String, String>);
 type CommunityAdapterFuture =
     std::pin::Pin<Box<dyn std::future::Future<Output = CommunityAdapterOutput> + Send>>;
@@ -71,7 +68,9 @@ async fn read_capped(resp: reqwest::Response) -> Result<Vec<u8>, String> {
     let mut buf: Vec<u8> = Vec::new();
     while let Some(chunk) = resp.chunk().await.map_err(|e| e.to_string())? {
         if buf.len() + chunk.len() > MAX_RESPONSE_BYTES {
-            return Err(format!("响应体超过上限 {MAX_RESPONSE_BYTES} 字节，已中止读取"));
+            return Err(format!(
+                "响应体超过上限 {MAX_RESPONSE_BYTES} 字节，已中止读取"
+            ));
         }
         buf.extend_from_slice(&chunk);
     }
@@ -142,8 +141,6 @@ const DEVELOPER_COMMUNITY_SOURCES: &[(&str, &str)] = &[
     ("github_discussions", "GitHub Discussions"),
     ("stackoverflow", "Stack Overflow"),
     ("hackernews", "Hacker News"),
-    ("reddit", "Reddit"),
-    ("lobsters", "Lobsters"),
     ("devto", "DEV Community"),
     ("juejin", "掘金"),
     ("v2ex", "V2EX"),
@@ -156,12 +153,8 @@ const DEVELOPER_COMMUNITY_SOURCES: &[(&str, &str)] = &[
     ("gitee", "Gitee"),
     ("codeberg", "Codeberg"),
     ("sourcegraph", "Sourcegraph"),
-    ("bestofjs", "Best of JS"),
     ("github_trending", "GitHub Trending"),
-    ("producthunt", "Product Hunt"),
-    ("freecodecamp", "freeCodeCamp"),
     ("infoq", "InfoQ"),
-    ("hackernoon", "HackerNoon"),
 ];
 
 /// 把字节长度收敛到不超过 `max` 的**字符边界**。
@@ -183,8 +176,6 @@ fn canonical_community_source(source: &str) -> Option<&'static str> {
         "github_discussions" | "gh_discussions" | "discussions" => Some("github_discussions"),
         "stackoverflow" | "stack_overflow" | "so" => Some("stackoverflow"),
         "hackernews" | "hacker_news" | "hn" => Some("hackernews"),
-        "reddit" => Some("reddit"),
-        "lobsters" => Some("lobsters"),
         "devto" | "dev_to" | "dev" => Some("devto"),
         "juejin" | "掘金" => Some("juejin"),
         "v2ex" => Some("v2ex"),
@@ -201,12 +192,8 @@ fn canonical_community_source(source: &str) -> Option<&'static str> {
         "gitee" | "码云" => Some("gitee"),
         "codeberg" => Some("codeberg"),
         "sourcegraph" => Some("sourcegraph"),
-        "bestofjs" | "best_of_js" => Some("bestofjs"),
         "github_trending" | "trending" => Some("github_trending"),
-        "producthunt" | "product_hunt" => Some("producthunt"),
-        "freecodecamp" | "free_code_camp" => Some("freecodecamp"),
         "infoq" => Some("infoq"),
-        "hackernoon" | "hacker_noon" => Some("hackernoon"),
         _ => None,
     }
 }
@@ -251,14 +238,11 @@ fn select_developer_sources(
             "gitee",
             "codeberg",
             "sourcegraph",
-            "bestofjs",
             "github_trending",
         ],
         "forums" | "forum" | "qa" => vec![
             "stackoverflow",
             "hackernews",
-            "reddit",
-            "lobsters",
             "github_discussions",
             "v2ex",
             "segmentfault",
@@ -270,13 +254,7 @@ fn select_developer_sources(
         "chinese" | "zh" | "cn" => {
             vec!["gitee", "juejin", "v2ex", "segmentfault", "infoq"]
         }
-        "articles" | "article" | "media" => vec![
-            "devto",
-            "freecodecamp",
-            "infoq",
-            "hackernoon",
-            "producthunt",
-        ],
+        "articles" | "article" | "media" => vec!["devto", "infoq"],
         other => {
             return Err(format!(
                 "Unsupported scope '{other}'. Use all, code, forums, chinese, or articles"
@@ -284,49 +262,6 @@ fn select_developer_sources(
         }
     };
     Ok(selected)
-}
-
-async fn public_site_search(
-    query: &str,
-    site: &str,
-    required_path: Option<&str>,
-    label: &str,
-    max_results: u32,
-    direct_search_url: &str,
-) -> Result<String, String> {
-    let search_query = format!("site:{site} {query}");
-    let hits = ddg_surface_checked(&search_query)
-        .await
-        .map_err(|error| format!("{label} public search: {error}"))?;
-    let retrieved = retrieved_at();
-    let mut out = format!(
-        "{label} pages for '{query}' (via public web search, not an official {label} API):\nretrieved_at: {retrieved}\n\n"
-    );
-    let mut count = 0usize;
-    for (title, url, snippet, _) in hits {
-        if !url.contains(site) || required_path.is_some_and(|path| !url.contains(path)) {
-            continue;
-        }
-        count += 1;
-        out.push_str(&format!(
-            "{}. {}\n   {}\n   published_date: unknown\n   updated_date: unknown\n   last_activity_date: unknown\n   retrieved_at: {}\n   {}\n\n",
-            count,
-            title,
-            trunc(&snippet, 180),
-            retrieved,
-            url,
-        ));
-        if count >= max_results as usize {
-            break;
-        }
-    }
-    if count == 0 {
-        out.push_str(
-            "search_status: empty\nThe public-search response contained no usable matching page. This can mean no match, an index coverage gap, or an unrecognized result layout; it does not prove the site has no matching content.\n\n",
-        );
-    }
-    out.push_str(&format!("Direct search: {direct_search_url}\n"));
-    Ok(out)
 }
 
 fn url_query_component(value: &str) -> String {
@@ -346,9 +281,21 @@ fn url_query_component(value: &str) -> String {
 fn kclient() -> Result<Client, String> {
     Client::builder()
         .timeout(Duration::from_secs(30))
-        .user_agent("Michael-IDE/1.0")
+        // 浏览器 UA。实测（2026-08-05）：codeberg.org 对 "Michael-IDE/1.0" 直接拒连（000），
+        // 换成下面这个 UA 即 200。多个公开 API 会按 UA 拦非浏览器客户端，自报家门在这里
+        // 没有收益，只有被拒的风险。
+        .user_agent("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
         .build()
         .map_err(|e| format!("HTTP client: {e}"))
+}
+
+fn required_search_term(value: &str) -> Result<&str, String> {
+    let value = value.trim();
+    if value.is_empty() {
+        Err("搜索词不能为空，请输入关键词".into())
+    } else {
+        Ok(value)
+    }
 }
 
 fn trunc(s: &str, max: usize) -> &str {
@@ -484,18 +431,6 @@ fn provider_date_lines(
     )
 }
 
-fn freecodecamp_published_date(hit: &Value) -> Option<(String, &'static str)> {
-    hit.get("publishedAt")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(|value| (value.to_string(), "publishedAt"))
-        .or_else(|| {
-            unix_time_rfc3339(hit.get("publishedAtTimestamp"))
-                .map(|value| (value, "publishedAtTimestamp"))
-        })
-}
-
 fn repository_date_lines(
     provider: &str,
     item: &Value,
@@ -625,78 +560,6 @@ fn github_trending_url(language: &str) -> Result<String, String> {
 }
 
 // ── Academic papers (Semantic Scholar) ──────────────────────────────
-
-#[tauri::command]
-pub async fn academic_search(query: String, max_results: Option<u32>) -> Result<String, String> {
-    if query.trim().is_empty() {
-        return Err("搜索词不能为空，请输入关键词".into());
-    }
-    let c = kclient()?;
-    let limit = max_results.unwrap_or(8).min(20);
-
-    let resp = c
-        .get("https://api.semanticscholar.org/graph/v1/paper/search")
-        .query(&[
-            ("query", query.as_str()),
-            ("limit", &limit.to_string()),
-            (
-                "fields",
-                "title,abstract,year,citationCount,url,authors,externalIds",
-            ),
-        ])
-        .send()
-        .await
-        .map_err(|e| format!("Semantic Scholar: {e}"))?;
-
-    if !resp.status().is_success() {
-        return Err(format!("Semantic Scholar returned {}", resp.status()));
-    }
-
-    let json: Value = resp.json_capped().await.map_err(|e| format!("JSON: {e}"))?;
-    let total = json["total"].as_u64().unwrap_or(0);
-    let mut out = format!("Found {total} papers (showing top {limit}):\n\n");
-
-    if let Some(papers) = json["data"].as_array() {
-        for (i, p) in papers.iter().enumerate() {
-            let title = p["title"].as_str().unwrap_or("?");
-            let year = p["year"]
-                .as_u64()
-                .map(|y| y.to_string())
-                .unwrap_or_default();
-            let cites = p["citationCount"].as_u64().unwrap_or(0);
-            let url = p["url"].as_str().unwrap_or("");
-            let abs = p["abstract"].as_str().unwrap_or("(no abstract)");
-
-            let authors: Vec<&str> = p["authors"]
-                .as_array()
-                .map(|a| a.iter().filter_map(|x| x["name"].as_str()).collect())
-                .unwrap_or_default();
-            let auth_str = if authors.len() > 3 {
-                format!("{}, {} et al.", authors[0], authors[1])
-            } else {
-                authors.join(", ")
-            };
-
-            let arxiv = p["externalIds"]["ArXiv"]
-                .as_str()
-                .map(|id| format!(" | arXiv: https://arxiv.org/abs/{id}"))
-                .unwrap_or_default();
-
-            out.push_str(&format!(
-                "{}. {} ({})\n   Authors: {}\n   Citations: {}{}\n   {}\n   {}\n\n",
-                i + 1,
-                title,
-                year,
-                auth_str,
-                cites,
-                arxiv,
-                url,
-                trunc(abs, 300)
-            ));
-        }
-    }
-    Ok(out)
-}
 
 // ── Package registries (npm / crates.io / PyPI / HuggingFace / pub.dev / Conda / CocoaPods / Hex) ──
 
@@ -949,7 +812,10 @@ async fn search_pypi(c: &Client, q: &str) -> Result<String, String> {
              Try the exact package name, or use web_search to discover Python packages."
         ));
     }
-    let json: Value = resp.json_capped().await.map_err(|e| format!("PyPI JSON: {e}"))?;
+    let json: Value = resp
+        .json_capped()
+        .await
+        .map_err(|e| format!("PyPI JSON: {e}"))?;
     let info = &json["info"];
     Ok(format!(
         "PyPI package:\n\n{} v{}\n{}\nAuthor: {}\nLicense: {}\nPython: {}\nhttps://pypi.org/project/{}/\n",
@@ -974,7 +840,10 @@ async fn search_crates(c: &Client, q: &str, limit: u32) -> Result<String, String
         .send()
         .await
         .map_err(|e| format!("crates.io: {e}"))?;
-    let json: Value = resp.json_capped().await.map_err(|e| format!("crates JSON: {e}"))?;
+    let json: Value = resp
+        .json_capped()
+        .await
+        .map_err(|e| format!("crates JSON: {e}"))?;
     let mut out = String::from("crates.io packages:\n\n");
     if let Some(crates) = json["crates"].as_array() {
         for (i, cr) in crates.iter().enumerate() {
@@ -1005,7 +874,10 @@ async fn search_hf(c: &Client, q: &str, limit: u32) -> Result<String, String> {
         .send()
         .await
         .map_err(|e| format!("HuggingFace: {e}"))?;
-    let json: Value = resp.json_capped().await.map_err(|e| format!("HF JSON: {e}"))?;
+    let json: Value = resp
+        .json_capped()
+        .await
+        .map_err(|e| format!("HF JSON: {e}"))?;
     let mut out = String::from("HuggingFace models:\n\n");
     if let Some(models) = json.as_array() {
         for (i, m) in models.iter().enumerate() {
@@ -1150,7 +1022,10 @@ async fn search_hex(c: &Client, q: &str, limit: u32) -> Result<String, String> {
     if !resp.status().is_success() {
         return Err(format!("Hex.pm returned {}", resp.status()));
     }
-    let json: Value = resp.json_capped().await.map_err(|e| format!("Hex JSON: {e}"))?;
+    let json: Value = resp
+        .json_capped()
+        .await
+        .map_err(|e| format!("Hex JSON: {e}"))?;
     let mut out = String::from("Hex.pm (Elixir/Erlang) packages:\n\n");
     if let Some(pkgs) = json.as_array() {
         for (i, p) in pkgs.iter().take(limit as usize).enumerate() {
@@ -1252,7 +1127,10 @@ pub async fn github_search(
         return Err(format!("GitHub error: {body}"));
     }
 
-    let json: Value = resp.json_capped().await.map_err(|e| format!("GitHub JSON: {e}"))?;
+    let json: Value = resp
+        .json_capped()
+        .await
+        .map_err(|e| format!("GitHub JSON: {e}"))?;
     let total = json["total_count"].as_u64().unwrap_or(0);
     let retrieved = retrieved_at();
     let mut out = format!("GitHub {stype}: {total} results\nretrieved_at: {retrieved}\n\n");
@@ -1400,7 +1278,9 @@ async fn api_get_json(
         let body = resp.text_capped().await.unwrap_or_default();
         return Err(format!("{label} returned {status}: {}", trunc(&body, 800)));
     }
-    resp.json_capped().await.map_err(|e| format!("{label} JSON: {e}"))
+    resp.json_capped()
+        .await
+        .map_err(|e| format!("{label} JSON: {e}"))
 }
 
 async fn api_get_text(
@@ -1418,7 +1298,9 @@ async fn api_get_text(
         let body = resp.text_capped().await.unwrap_or_default();
         return Err(format!("{label} returned {status}: {}", trunc(&body, 800)));
     }
-    resp.text_capped().await.map_err(|e| format!("{label} text: {e}"))
+    resp.text_capped()
+        .await
+        .map_err(|e| format!("{label} text: {e}"))
 }
 
 async fn github_get_json(c: &Client, url: &str) -> Result<Value, String> {
@@ -2463,7 +2345,10 @@ pub async fn cve_search(query: String, max_results: Option<u32>) -> Result<Strin
         return Err(format!("NVD returned {}", resp.status()));
     }
 
-    let json: Value = resp.json_capped().await.map_err(|e| format!("NVD JSON: {e}"))?;
+    let json: Value = resp
+        .json_capped()
+        .await
+        .map_err(|e| format!("NVD JSON: {e}"))?;
     let total = json["totalResults"].as_u64().unwrap_or(0);
     let mut out = format!("NVD CVE: {total} results\n\n");
 
@@ -2541,7 +2426,10 @@ pub async fn wiki_search(
         .await
         .map_err(|e| format!("Wikipedia: {e}"))?;
 
-    let json: Value = resp.json_capped().await.map_err(|e| format!("Wiki JSON: {e}"))?;
+    let json: Value = resp
+        .json_capped()
+        .await
+        .map_err(|e| format!("Wiki JSON: {e}"))?;
     let total = json["query"]["searchinfo"]["totalhits"]
         .as_u64()
         .unwrap_or(0);
@@ -2635,7 +2523,10 @@ pub async fn stackoverflow_search(
         return Err(format!("StackOverflow returned {}", resp.status()));
     }
 
-    let json: Value = resp.json_capped().await.map_err(|e| format!("SO JSON: {e}"))?;
+    let json: Value = resp
+        .json_capped()
+        .await
+        .map_err(|e| format!("SO JSON: {e}"))?;
     let retrieved = retrieved_at();
     let mut out = format!("Stack Overflow results:\nretrieved_at: {retrieved}\n\n");
 
@@ -2718,7 +2609,10 @@ pub async fn hackernews_search(
         return Err(format!("HN returned {}", resp.status()));
     }
 
-    let json: Value = resp.json_capped().await.map_err(|e| format!("HN JSON: {e}"))?;
+    let json: Value = resp
+        .json_capped()
+        .await
+        .map_err(|e| format!("HN JSON: {e}"))?;
     let total = json["nbHits"].as_u64().unwrap_or(0);
     let retrieved = retrieved_at();
     let mut out = format!("Hacker News: {total} results\nretrieved_at: {retrieved}\n\n");
@@ -2880,16 +2774,14 @@ async fn discourse_search(
     )
 }
 
-#[tauri::command]
-pub async fn rust_users_search(query: String, max_results: Option<u32>) -> Result<String, String> {
+async fn rust_users_search(query: String, max_results: Option<u32>) -> Result<String, String> {
     if query.trim().is_empty() {
         return Err("搜索词不能为空，请输入关键词".into());
     }
     discourse_search(query, max_results, RUST_USERS_DISCOURSE).await
 }
 
-#[tauri::command]
-pub async fn python_discussions_search(
+async fn python_discussions_search(
     query: String,
     max_results: Option<u32>,
 ) -> Result<String, String> {
@@ -2899,19 +2791,14 @@ pub async fn python_discussions_search(
     discourse_search(query, max_results, PYTHON_DISCOURSE).await
 }
 
-#[tauri::command]
-pub async fn swift_forums_search(
-    query: String,
-    max_results: Option<u32>,
-) -> Result<String, String> {
+async fn swift_forums_search(query: String, max_results: Option<u32>) -> Result<String, String> {
     if query.trim().is_empty() {
         return Err("搜索词不能为空，请输入关键词".into());
     }
     discourse_search(query, max_results, SWIFT_DISCOURSE).await
 }
 
-#[tauri::command]
-pub async fn kotlin_discussions_search(
+async fn kotlin_discussions_search(
     query: String,
     max_results: Option<u32>,
 ) -> Result<String, String> {
@@ -2948,7 +2835,7 @@ pub async fn developer_community_search(
         let source_label = DEVELOPER_COMMUNITY_SOURCES
             .iter()
             .find_map(|(key, label)| (*key == source_key).then_some(*label))
-            .expect("selected developer source must have a label");
+            .ok_or_else(|| format!("Developer source '{source_key}' has no display label"))?;
         let q = query.clone();
         let adapter: CommunityAdapterFuture = match source_key {
             "github" => Box::pin(async move {
@@ -2977,20 +2864,6 @@ pub async fn developer_community_search(
                     "hackernews",
                     "Hacker News",
                     hackernews_search(q, Some(limit), None).await,
-                )
-            }),
-            "reddit" => Box::pin(async move {
-                (
-                    "reddit",
-                    "Reddit",
-                    reddit_search(q, None, Some(limit)).await,
-                )
-            }),
-            "lobsters" => Box::pin(async move {
-                (
-                    "lobsters",
-                    "Lobsters",
-                    lobsters_search(q, Some(limit)).await,
                 )
             }),
             "devto" => {
@@ -3057,13 +2930,6 @@ pub async fn developer_community_search(
                     sourcegraph_search(q, Some(limit)).await,
                 )
             }),
-            "bestofjs" => Box::pin(async move {
-                (
-                    "bestofjs",
-                    "Best of JS",
-                    bestofjs_search(q, Some(limit)).await,
-                )
-            }),
             "github_trending" => Box::pin(async move {
                 let result = match aggregate_trending_language(&q) {
                     Some(language) => github_trending(language.to_string(), Some(limit)).await,
@@ -3074,31 +2940,14 @@ pub async fn developer_community_search(
                 };
                 ("github_trending", "GitHub Trending", result)
             }),
-            "producthunt" => Box::pin(async move {
-                (
-                    "producthunt",
-                    "Product Hunt",
-                    producthunt_search(q, Some(limit)).await,
-                )
-            }),
-            "freecodecamp" => Box::pin(async move {
-                (
-                    "freecodecamp",
-                    "freeCodeCamp",
-                    freecodecamp_search(q, Some(limit)).await,
-                )
-            }),
             "infoq" => {
                 Box::pin(async move { ("infoq", "InfoQ", infoq_search(q, Some(limit)).await) })
             }
-            "hackernoon" => Box::pin(async move {
-                (
-                    "hackernoon",
-                    "HackerNoon",
-                    hackernoon_search(q, Some(limit)).await,
-                )
-            }),
-            _ => continue,
+            _ => {
+                return Err(format!(
+                    "Developer source '{source_key}' is listed but has no executable adapter"
+                ))
+            }
         };
         pending.push(Box::pin(community_source_with_timeout(
             source_key,
@@ -3328,7 +3177,7 @@ pub async fn arxiv_search(
     };
 
     let resp = c
-        .get("http://export.arxiv.org/api/query")
+        .get("https://export.arxiv.org/api/query")
         .query(&[
             ("search_query", search_q.as_str()),
             ("start", "0"),
@@ -3340,7 +3189,10 @@ pub async fn arxiv_search(
         .await
         .map_err(|e| format!("arXiv: {e}"))?;
 
-    let xml = resp.text_capped().await.map_err(|e| format!("arXiv text: {e}"))?;
+    let xml = resp
+        .text_capped()
+        .await
+        .map_err(|e| format!("arXiv text: {e}"))?;
     let total_str = xml_tag_value(&xml, "opensearch:totalResults");
     let mut out = format!("arXiv: {total_str} results\n\n");
 
@@ -3483,15 +3335,29 @@ pub async fn openalex_search(
     entity_type: Option<String>,
     max_results: Option<u32>,
 ) -> Result<String, String> {
+    let query = required_search_term(&query)?;
     let c = kclient()?;
     let limit = max_results.unwrap_or(10).min(25);
-    let etype = entity_type.as_deref().unwrap_or("works");
+    let etype = entity_type
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("works")
+        .to_ascii_lowercase();
+    if !matches!(
+        etype.as_str(),
+        "works" | "authors" | "institutions" | "topics" | "sources"
+    ) {
+        return Err(
+            "OpenAlex entity_type must be works, authors, institutions, topics, or sources".into(),
+        );
+    }
 
     let url = format!("https://api.openalex.org/{etype}");
     let resp = c
         .get(&url)
         .query(&[
-            ("search", query.as_str()),
+            ("search", query),
             ("per_page", &limit.to_string()),
             ("mailto", "contact@michaelide.xyz"),
         ])
@@ -3511,7 +3377,7 @@ pub async fn openalex_search(
     let mut out = format!("OpenAlex ({etype}): {total} results\n\n");
 
     if let Some(results) = json["results"].as_array() {
-        match etype {
+        match etype.as_str() {
             "works" => {
                 for (i, w) in results.iter().enumerate() {
                     let title = w["title"].as_str().unwrap_or("?");
@@ -3676,11 +3542,12 @@ pub async fn clinical_trials_search(
     status: Option<String>,
     max_results: Option<u32>,
 ) -> Result<String, String> {
+    let query = required_search_term(&query)?;
     let c = kclient()?;
     let limit = max_results.unwrap_or(10).min(20);
 
     let mut params: Vec<(&str, String)> = vec![
-        ("query.term", query.clone()),
+        ("query.term", query.to_string()),
         ("pageSize", limit.to_string()),
         ("format", "json".into()),
         ("sort", "LastUpdatePostDate:desc".into()),
@@ -3700,7 +3567,10 @@ pub async fn clinical_trials_search(
         return Err(format!("ClinicalTrials returned {}", resp.status()));
     }
 
-    let json: Value = resp.json_capped().await.map_err(|e| format!("CT JSON: {e}"))?;
+    let json: Value = resp
+        .json_capped()
+        .await
+        .map_err(|e| format!("CT JSON: {e}"))?;
     let total = json["totalCount"].as_u64().unwrap_or(0);
     let mut out = format!("ClinicalTrials.gov: {total} studies\n\n");
 
@@ -3778,7 +3648,10 @@ pub async fn dockerhub_search(query: String, max_results: Option<u32>) -> Result
         .await
         .map_err(|e| format!("Docker Hub: {e}"))?;
 
-    let json: Value = resp.json_capped().await.map_err(|e| format!("DH JSON: {e}"))?;
+    let json: Value = resp
+        .json_capped()
+        .await
+        .map_err(|e| format!("DH JSON: {e}"))?;
     let total = json["count"].as_u64().unwrap_or(0);
     let mut out = format!("Docker Hub: {total} images\n\n");
 
@@ -3928,7 +3801,10 @@ pub async fn gitee_search(query: String, max_results: Option<u32>) -> Result<Str
     if !status.is_success() {
         return Err(format!("Gitee returned HTTP {status}"));
     }
-    let data: Value = resp.json_capped().await.map_err(|e| format!("Gitee parse: {e}"))?;
+    let data: Value = resp
+        .json_capped()
+        .await
+        .map_err(|e| format!("Gitee parse: {e}"))?;
     let arr = data.as_array().ok_or("Gitee: unexpected response")?;
     let retrieved = retrieved_at();
     if arr.is_empty() {
@@ -3962,7 +3838,10 @@ pub async fn maven_search(query: String, max_results: Option<u32>) -> Result<Str
         .send()
         .await
         .map_err(|e| format!("Maven: {e}"))?;
-    let data: Value = resp.json_capped().await.map_err(|e| format!("Maven parse: {e}"))?;
+    let data: Value = resp
+        .json_capped()
+        .await
+        .map_err(|e| format!("Maven parse: {e}"))?;
     let docs = data["response"]["docs"]
         .as_array()
         .ok_or("Maven: no docs")?;
@@ -4095,7 +3974,10 @@ pub async fn nuget_search(query: String, max_results: Option<u32>) -> Result<Str
         .send()
         .await
         .map_err(|e| format!("NuGet: {e}"))?;
-    let data: Value = resp.json_capped().await.map_err(|e| format!("NuGet parse: {e}"))?;
+    let data: Value = resp
+        .json_capped()
+        .await
+        .map_err(|e| format!("NuGet parse: {e}"))?;
     let items = data["data"].as_array().ok_or("NuGet: no data")?;
     if items.is_empty() {
         return Ok(format!("No NuGet packages found for '{query}'"));
@@ -4206,7 +4088,11 @@ pub async fn mdn_search(query: String, max_results: Option<u32>) -> Result<Strin
         .send()
         .await
         .map_err(|e| format!("MDN: {e}"))?;
-    let data: Value = resp.json_capped().await.map_err(|e| format!("MDN parse: {e}"))?;
+    ensure_provider_http_success("MDN", resp.status())?;
+    let data: Value = resp
+        .json_capped()
+        .await
+        .map_err(|e| format!("MDN parse: {e}"))?;
     let docs = data["documents"].as_array().ok_or("MDN: no documents")?;
     if docs.is_empty() {
         return Ok(format!("No MDN docs found for '{query}'"));
@@ -4242,13 +4128,17 @@ pub async fn cdnjs_search(query: String, max_results: Option<u32>) -> Result<Str
         .get("https://api.cdnjs.com/libraries")
         .query(&[
             ("search", query.as_str()),
-            ("fields", "description,version,homepage,keywords"),
+            ("fields", "description,version,homepage,keywords,latest"),
             ("limit", &n.to_string()),
         ])
         .send()
         .await
         .map_err(|e| format!("cdnjs: {e}"))?;
-    let data: Value = resp.json_capped().await.map_err(|e| format!("cdnjs parse: {e}"))?;
+    ensure_provider_http_success("cdnjs", resp.status())?;
+    let data: Value = resp
+        .json_capped()
+        .await
+        .map_err(|e| format!("cdnjs parse: {e}"))?;
     let results = data["results"].as_array().ok_or("cdnjs: no results")?;
     if results.is_empty() {
         return Ok(format!("No cdnjs libraries found for '{query}'"));
@@ -4259,9 +4149,19 @@ pub async fn cdnjs_search(query: String, max_results: Option<u32>) -> Result<Str
         let version = r["version"].as_str().unwrap_or("?");
         let desc = r["description"].as_str().unwrap_or("");
         let homepage = r["homepage"].as_str().unwrap_or("");
+        let latest = r["latest"]
+            .as_str()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("not provided by cdnjs");
         out.push_str(&format!(
-            "{}. {} (v{})\n   {}\n   CDN: https://cdnjs.cloudflare.com/ajax/libs/{}/{}/{}.min.js\n   {}\n\n",
-            i + 1, name, version, trunc(desc, 150), name, version, name, homepage
+            "{}. {} (v{})\n   {}\n   CDN: {}\n   {}\n\n",
+            i + 1,
+            name,
+            version,
+            trunc(desc, 150),
+            latest,
+            homepage
         ));
     }
     Ok(out)
@@ -4271,22 +4171,22 @@ pub async fn cdnjs_search(query: String, max_results: Option<u32>) -> Result<Str
 
 #[tauri::command]
 pub async fn bundlephobia_search(package: String) -> Result<String, String> {
+    let package = required_search_term(&package)?;
     let client = kclient()?;
-    let url = format!(
-        "https://bundlephobia.com/api/size?package={}",
-        package.trim()
-    );
+    let url = format!("https://bundlephobia.com/api/size?package={package}");
     let resp = client
         .get(&url)
         .send()
         .await
         .map_err(|e| format!("Bundlephobia: {e}"))?;
-    if !resp.status().is_success() {
+    let status = resp.status();
+    if status == reqwest::StatusCode::NOT_FOUND {
         return Ok(format!(
             "Package '{}' not found on Bundlephobia. Try exact npm package name.",
             package
         ));
     }
+    ensure_provider_http_success("Bundlephobia", status)?;
     let d: Value = resp
         .json_capped()
         .await
@@ -4327,143 +4227,128 @@ pub async fn bundlephobia_search(package: String) -> Result<String, String> {
 
 // ── Dev.to (developer articles) ───────────────────────────────────
 
-#[tauri::command]
-pub async fn devto_search(query: String, max_results: Option<u32>) -> Result<String, String> {
-    let n = max_results.unwrap_or(10).min(20);
-    let direct = format!("https://dev.to/search?q={}", query.replace(' ', "%20"));
-    public_site_search(&query, "dev.to", None, "DEV Community", n, &direct).await
+fn devto_article_matches(article: &Value, terms: &[String]) -> bool {
+    if terms.is_empty() {
+        return true;
+    }
+    let mut searchable = String::new();
+    for field in ["title", "description"] {
+        if let Some(value) = article.get(field).and_then(Value::as_str) {
+            searchable.push_str(value);
+            searchable.push(' ');
+        }
+    }
+    if let Some(tags) = article.get("tag_list") {
+        match tags {
+            Value::Array(values) => {
+                for value in values.iter().filter_map(Value::as_str) {
+                    searchable.push_str(value);
+                    searchable.push(' ');
+                }
+            }
+            Value::String(value) => searchable.push_str(value),
+            _ => {}
+        }
+    }
+    let searchable = searchable.to_lowercase();
+    terms.iter().all(|term| searchable.contains(term))
 }
 
-// ── Reddit (discussions) ──────────────────────────────────────────
-
 #[tauri::command]
-pub async fn reddit_search(
-    query: String,
-    subreddit: Option<String>,
-    max_results: Option<u32>,
-) -> Result<String, String> {
-    let client = kclient()?;
-    let n = max_results.unwrap_or(10).min(25);
-    let url = match &subreddit {
-        Some(sub) => format!("https://www.reddit.com/r/{}/search.json", sub),
-        None => "https://www.reddit.com/search.json".to_string(),
-    };
-    let mut params: Vec<(&str, String)> = vec![
-        ("q", query.clone()),
-        ("limit", n.to_string()),
-        ("sort", "relevance".to_string()),
-    ];
-    if subreddit.is_some() {
-        params.push(("restrict_sr", "1".to_string()));
-    }
-    let resp = client
-        .get(&url)
-        .query(&params)
+pub async fn devto_search(query: String, max_results: Option<u32>) -> Result<String, String> {
+    // 官方 API，不再走 public_site_search —— 那条路依赖 DuckDuckGo，已被反爬拦死
+    // （实测 HTTP 202 挑战页，0 条结果）。dev.to 自己提供无需 key 的 REST：
+    //   https://dev.to/api/articles?tag=<t>&per_page=<n>   实测 200 / 5 条。
+    let query = required_search_term(&query)?;
+    let c = kclient()?;
+    let n = max_results.unwrap_or(10).clamp(1, 30);
+    // 关键词里第一个词当 tag（dev.to 按 tag 检索），整串再做本地标题过滤。
+    let tag = query.split_whitespace().next().unwrap_or("").to_lowercase();
+    let filter_terms = query
+        .split_whitespace()
+        .skip(1)
+        .map(str::to_lowercase)
+        .collect::<Vec<_>>();
+    let fetch_limit = n.saturating_mul(3).min(100);
+    let resp = c
+        .get("https://dev.to/api/articles")
+        .query(&[
+            ("tag", tag.as_str()),
+            ("per_page", &fetch_limit.to_string()),
+        ])
         .send()
         .await
-        .map_err(|e| format!("Reddit: {e}"))?;
+        .map_err(|e| format!("Dev.to request: {e}"))?;
     if !resp.status().is_success() {
-        return Err(format!("Reddit returned {}", resp.status()));
+        return Err(format!("Dev.to API returned HTTP {}", resp.status()));
     }
-    let data: Value = resp
+    let items: Value = resp
         .json_capped()
         .await
-        .map_err(|e| format!("Reddit parse: {e}"))?;
-    let posts = data["data"]["children"]
+        .map_err(|e| format!("Dev.to JSON: {e}"))?;
+    let arr = items
         .as_array()
-        .ok_or("Reddit: no data")?;
-    if posts.is_empty() {
-        return Ok(format!("No Reddit posts found for '{query}'"));
-    }
+        .ok_or_else(|| "Dev.to response did not contain an article array".to_string())?;
     let retrieved = retrieved_at();
-    let mut out = format!("Reddit results for '{query}':\nretrieved_at: {retrieved}\n\n");
-    for (i, p) in posts.iter().enumerate() {
-        let d = &p["data"];
-        let title = d["title"].as_str().unwrap_or("?");
-        let sub = d["subreddit"].as_str().unwrap_or("?");
-        let score = d["score"].as_i64().unwrap_or(0);
-        let comments = d["num_comments"].as_u64().unwrap_or(0);
-        let author = d["author"].as_str().unwrap_or("?");
-        let selftext = d["selftext"].as_str().unwrap_or("");
-        let permalink = d["permalink"].as_str().unwrap_or("");
-        let published =
-            unix_time_rfc3339(d.get("created_utc")).unwrap_or_else(|| "unknown".to_string());
-        let updated = unix_time_rfc3339(d.get("edited")).unwrap_or_else(|| "unknown".to_string());
+    let mut out = format!(
+        "DEV Community articles tagged '{tag}' for '{query}' (dev.to official API)\nretrieved_at: {retrieved}\n\n"
+    );
+    let mut count = 0usize;
+    for it in arr {
+        if !devto_article_matches(it, &filter_terms) {
+            continue;
+        }
+        let title = it.get("title").and_then(|v| v.as_str()).unwrap_or("");
+        let url_s = it.get("url").and_then(|v| v.as_str()).unwrap_or("");
+        if title.is_empty() || url_s.is_empty() {
+            continue;
+        }
+        count += 1;
         out.push_str(&format!(
-            "{}. [r/{}] {}\n   by u/{} | ⬆️{} | 💬{}\n   {}\n   published_date: {}\n   updated_date: {}\n   last_activity_date: unknown\n   retrieved_at: {}\n   https://reddit.com{}\n\n",
-            i + 1,
-            sub,
+            "{}. {}\n   published_date: {}\n   reactions: {}\n   retrieved_at: {}\n   {}\n\n",
+            count,
             title,
-            author,
-            score,
-            comments,
-            trunc(selftext, 150),
-            published,
-            updated,
+            it.get("published_at")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown"),
+            it.get("public_reactions_count")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0),
             retrieved,
-            permalink
+            url_s,
         ));
+        if count >= n as usize {
+            break;
+        }
+    }
+    if count == 0 {
+        out.push_str("search_status: empty\nThe official tag feed returned no articles matching the remaining query terms. Try a common first-word tag such as rust, react, or python.\n");
     }
     Ok(out)
 }
 
+// ── Reddit (discussions) ──────────────────────────────────────────
+
 // ── Deal / second-hand marketplace public searches ───────────────
-
-#[tauri::command]
-pub async fn smzdm_search(query: String, max_results: Option<u32>) -> Result<String, String> {
-    let q = query.trim();
-    if q.is_empty() {
-        return Err("搜索词不能为空，请输入关键词，请输入关键词进行搜索".into());
-    }
-    let n = max_results.unwrap_or(10).min(20);
-    let direct = format!(
-        "https://search.smzdm.com/?c=home&s={}",
-        url_query_component(q)
-    );
-    public_site_search(q, "smzdm.com", None, "什么值得买/SMZDM", n, &direct).await
-}
-
-#[tauri::command]
-pub async fn xianyu_search(query: String, max_results: Option<u32>) -> Result<String, String> {
-    let q = query.trim();
-    if q.is_empty() {
-        return Err("搜索词不能为空，请输入关键词，请输入关键词进行搜索".into());
-    }
-    let n = max_results.unwrap_or(10).min(20);
-    let direct = format!(
-        "https://www.goofish.com/search?q={}",
-        url_query_component(q)
-    );
-    public_site_search(q, "goofish.com", None, "闲鱼/Goofish", n, &direct).await
-}
-
-#[tauri::command]
-pub async fn zhuanzhuan_search(query: String, max_results: Option<u32>) -> Result<String, String> {
-    let q = query.trim();
-    if q.is_empty() {
-        return Err("搜索词不能为空，请输入关键词，请输入关键词进行搜索".into());
-    }
-    let n = max_results.unwrap_or(10).min(20);
-    let direct = format!(
-        "https://www.zhuanzhuan.com/search?keyword={}",
-        url_query_component(q)
-    );
-    public_site_search(q, "zhuanzhuan.com", None, "转转/Zhuanzhuan", n, &direct).await
-}
 
 // ── Steam (game search) ──────────────────────────────────────────
 
 #[tauri::command]
 pub async fn steam_search(query: String, max_results: Option<u32>) -> Result<String, String> {
+    let query = required_search_term(&query)?;
     let client = kclient()?;
     let n = max_results.unwrap_or(10).min(20);
     let resp = client
         .get("https://store.steampowered.com/api/storesearch/")
-        .query(&[("term", query.as_str()), ("l", "schinese"), ("cc", "CN")])
+        .query(&[("term", query), ("l", "schinese"), ("cc", "CN")])
         .send()
         .await
         .map_err(|e| format!("Steam: {e}"))?;
-    let data: Value = resp.json_capped().await.map_err(|e| format!("Steam parse: {e}"))?;
+    ensure_provider_http_success("Steam", resp.status())?;
+    let data: Value = resp
+        .json_capped()
+        .await
+        .map_err(|e| format!("Steam parse: {e}"))?;
     let items = data["items"].as_array().ok_or("Steam: no items")?;
     if items.is_empty() {
         return Ok(format!("No Steam games found for '{query}'"));
@@ -4472,17 +4357,7 @@ pub async fn steam_search(query: String, max_results: Option<u32>) -> Result<Str
     for (i, g) in items.iter().take(n as usize).enumerate() {
         let name = g["name"].as_str().unwrap_or("?");
         let appid = g["id"].as_u64().unwrap_or(0);
-        let price = g["price"]
-            .as_object()
-            .map(|p| {
-                let final_price = p.get("final").and_then(|v| v.as_u64()).unwrap_or(0);
-                if final_price == 0 {
-                    "Free".to_string()
-                } else {
-                    format!("¥{:.2}", final_price as f64 / 100.0)
-                }
-            })
-            .unwrap_or_else(|| "N/A".to_string());
+        let price = steam_price(g.get("price"));
         let platforms = {
             let mut pl = Vec::new();
             if g["platforms"]["windows"].as_bool().unwrap_or(false) {
@@ -4504,18 +4379,39 @@ pub async fn steam_search(query: String, max_results: Option<u32>) -> Result<Str
     Ok(out)
 }
 
+fn steam_price(price: Option<&Value>) -> String {
+    let Some(price) = price.and_then(Value::as_object) else {
+        return "N/A".to_string();
+    };
+    let Some(final_price) = price.get("final").and_then(Value::as_u64) else {
+        return "N/A".to_string();
+    };
+    if final_price == 0 {
+        return "Free".to_string();
+    }
+    let currency = price
+        .get("currency")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("unknown currency");
+    format!("{currency} {:.2}", final_price as f64 / 100.0)
+}
+
 // ── Iconify (icon search across 200+ sets) ───────────────────────
 
 #[tauri::command]
 pub async fn iconify_search(query: String, max_results: Option<u32>) -> Result<String, String> {
+    let query = required_search_term(&query)?;
     let client = kclient()?;
     let n = max_results.unwrap_or(20).min(50);
     let resp = client
         .get("https://api.iconify.design/search")
-        .query(&[("query", &query), ("limit", &n.to_string())])
+        .query(&[("query", query), ("limit", &n.to_string())])
         .send()
         .await
         .map_err(|e| format!("Iconify: {e}"))?;
+    ensure_provider_http_success("Iconify", resp.status())?;
     let data: Value = resp
         .json_capped()
         .await
@@ -4544,72 +4440,13 @@ pub async fn iconify_search(query: String, max_results: Option<u32>) -> Result<S
 
 // ── Color palettes (ColourLovers) ─────────────────────────────────
 
-#[tauri::command]
-pub async fn color_search(query: String, max_results: Option<u32>) -> Result<String, String> {
-    let client = kclient()?;
-    let n = max_results.unwrap_or(10).min(20);
-    let resp = client
-        .get("https://www.colourlovers.com/api/palettes")
-        .query(&[
-            ("keywords", &query),
-            ("format", &"json".to_string()),
-            ("numResults", &n.to_string()),
-            ("orderCol", &"numVotes".to_string()),
-            ("sortBy", &"DESC".to_string()),
-        ])
-        .send()
-        .await
-        .map_err(|e| format!("ColourLovers: {e}"))?;
-    let data: Value = resp
-        .json_capped()
-        .await
-        .map_err(|e| format!("ColourLovers parse: {e}"))?;
-    let palettes = data.as_array().ok_or("ColourLovers: unexpected response")?;
-    if palettes.is_empty() {
-        return Ok(format!("No color palettes found for '{query}'"));
-    }
-    let mut out = format!("Color palettes for '{query}':\n\n");
-    for (i, p) in palettes.iter().enumerate() {
-        let title = p["title"].as_str().unwrap_or("?");
-        let user = p["userName"].as_str().unwrap_or("?");
-        let votes = p["numVotes"].as_u64().unwrap_or(0);
-        let colors = p["colors"]
-            .as_array()
-            .map(|c| {
-                c.iter()
-                    .filter_map(|v| v.as_str())
-                    .map(|s| format!("#{s}"))
-                    .collect::<Vec<_>>()
-                    .join(" ")
-            })
-            .unwrap_or_default();
-        let url = p["url"].as_str().unwrap_or("");
-        out.push_str(&format!(
-            "{}. {} (by {})\n   Colors: {}\n   Votes: {} | {}\n\n",
-            i + 1,
-            title,
-            user,
-            colors,
-            votes,
-            url
-        ));
-    }
-    Ok(out)
-}
-
 // ── Lobsters (curated tech community) ─────────────────────────────
-
-#[tauri::command]
-pub async fn lobsters_search(query: String, max_results: Option<u32>) -> Result<String, String> {
-    let limit = max_results.unwrap_or(10).min(25);
-    let direct = format!("https://lobste.rs/search?q={}", query.replace(' ', "+"));
-    public_site_search(&query, "lobste.rs", Some("/s/"), "Lobsters", limit, &direct).await
-}
 
 // ── 掘金 / Juejin (Chinese developer community) ──────────────────
 
 #[tauri::command]
 pub async fn juejin_search(query: String, max_results: Option<u32>) -> Result<String, String> {
+    let query = required_search_term(&query)?;
     let c = kclient()?;
     let limit = max_results.unwrap_or(10).min(20);
     let body = serde_json::json!({
@@ -4629,7 +4466,10 @@ pub async fn juejin_search(query: String, max_results: Option<u32>) -> Result<St
     if !resp.status().is_success() {
         return Err(format!("掘金 returned {}", resp.status()));
     }
-    let json: Value = resp.json_capped().await.map_err(|e| format!("掘金 JSON: {e}"))?;
+    let json: Value = resp
+        .json_capped()
+        .await
+        .map_err(|e| format!("掘金 JSON: {e}"))?;
     let data = json["data"]
         .as_array()
         .ok_or("掘金: response did not contain a data array")?;
@@ -4712,7 +4552,11 @@ async fn wp_search(
         .send()
         .await
         .map_err(|e| format!("{label}: {e}"))?;
-    let items: Vec<Value> = resp.json_capped().await.unwrap_or_default();
+    ensure_provider_http_success(label, resp.status())?;
+    let items: Vec<Value> = resp
+        .json_capped()
+        .await
+        .map_err(|error| format!("{label} returned invalid JSON: {error}"))?;
     if items.is_empty() {
         return Ok(format!("No {label} articles found for '{query}'"));
     }
@@ -4738,15 +4582,17 @@ async fn wp_search(
 
 #[tauri::command]
 pub async fn codrops_search(query: String, max_results: Option<u32>) -> Result<String, String> {
+    let query = required_search_term(&query)?;
     let c = kclient()?;
     let n = max_results.unwrap_or(10).min(20);
-    wp_search(&c, "https://tympanus.net/codrops", &query, n, "Codrops").await
+    wp_search(&c, "https://tympanus.net/codrops", query, n, "Codrops").await
 }
 
 // ── Smashing Magazine (web design & UX articles) ────────────────────
 
 #[tauri::command]
 pub async fn smashingmag_search(query: String, max_results: Option<u32>) -> Result<String, String> {
+    let query = required_search_term(&query)?;
     let c = kclient()?;
     let n = max_results.unwrap_or(10).min(20) as usize;
     let resp = c
@@ -4754,6 +4600,7 @@ pub async fn smashingmag_search(query: String, max_results: Option<u32>) -> Resu
         .send()
         .await
         .map_err(|e| format!("SmashingMag RSS: {e}"))?;
+    ensure_provider_http_success("Smashing Magazine", resp.status())?;
     let xml = resp
         .text_capped()
         .await
@@ -4817,63 +4664,29 @@ fn extract_xml_tag(xml: &str, tag: &str) -> String {
     String::new()
 }
 
-// ── CSS-Tricks (CSS tutorials & techniques) ─────────────────────────
-
-#[tauri::command]
-pub async fn css_tricks_search(query: String, max_results: Option<u32>) -> Result<String, String> {
-    let c = kclient()?;
-    let n = max_results.unwrap_or(10).min(20);
-    match wp_search(&c, "https://css-tricks.com", &query, n, "CSS-Tricks").await {
-        Ok(r) => Ok(r),
-        Err(_) => {
-            Ok("CSS-Tricks search unavailable. Try web_search for CSS-Tricks content.".into())
-        }
-    }
-}
-
 // ── CodePen (real UI component implementations) ─────────────────────
 
-#[tauri::command]
-pub async fn codepen_search(query: String, max_results: Option<u32>) -> Result<String, String> {
-    let n = max_results.unwrap_or(10).min(20);
-    let direct = format!(
-        "https://codepen.io/search/pens?q={}",
-        query.replace(' ', "+")
-    );
-    public_site_search(&query, "codepen.io", Some("/pen/"), "CodePen", n, &direct).await
-}
-
 // ── Dribbble (professional UI design inspiration) ───────────────────
-
-#[tauri::command]
-pub async fn dribbble_search(query: String, max_results: Option<u32>) -> Result<String, String> {
-    let n = max_results.unwrap_or(10).min(20);
-    let direct = format!("https://dribbble.com/search/{}", query.replace(' ', "-"));
-    public_site_search(
-        &query,
-        "dribbble.com",
-        Some("/shots/"),
-        "Dribbble",
-        n,
-        &direct,
-    )
-    .await
-}
 
 // ── Awwwards (award-winning website designs) ────────────────────────
 
 #[tauri::command]
 pub async fn awwwards_search(query: String, max_results: Option<u32>) -> Result<String, String> {
+    let query = required_search_term(&query)?;
     let c = kclient()?;
     let n = max_results.unwrap_or(10).min(20) as usize;
     let resp = c
         .get("https://www.awwwards.com/websites/")
-        .query(&[("q", query.as_str())])
+        .query(&[("q", query)])
         .header("Accept", "text/html")
         .send()
         .await
         .map_err(|e| format!("Awwwards: {e}"))?;
-    let html = resp.text_capped().await.map_err(|e| format!("Awwwards: {e}"))?;
+    ensure_provider_http_success("Awwwards", resp.status())?;
+    let html = resp
+        .text_capped()
+        .await
+        .map_err(|e| format!("Awwwards: {e}"))?;
     let mut out = format!("Awwwards sites for '{query}':\n\n");
     let mut count = 0;
     let mut pos = 0;
@@ -4966,15 +4779,12 @@ fn v2ex_hit_matches_language_anchor(query: &str, source: &Value) -> bool {
 
 #[tauri::command]
 pub async fn v2ex_search(query: String, max_results: Option<u32>) -> Result<String, String> {
+    let query = required_search_term(&query)?;
     let c = kclient()?;
     let n = max_results.unwrap_or(10).min(20);
     let resp = c
         .get("https://www.sov2ex.com/api/search")
-        .query(&[
-            ("q", query.as_str()),
-            ("size", &n.to_string()),
-            ("sort", "sumup"),
-        ])
+        .query(&[("q", query), ("size", &n.to_string()), ("sort", "sumup")])
         .send()
         .await
         .map_err(|e| format!("V2EX (SOV2EX): {e}"))?;
@@ -4985,7 +4795,10 @@ pub async fn v2ex_search(query: String, max_results: Option<u32>) -> Result<Stri
     if !status.is_success() {
         return Err(format!("V2EX (SOV2EX) returned HTTP {status}"));
     }
-    let data: Value = resp.json_capped().await.map_err(|e| format!("V2EX parse: {e}"))?;
+    let data: Value = resp
+        .json_capped()
+        .await
+        .map_err(|e| format!("V2EX parse: {e}"))?;
     let total = data["total"].as_u64().unwrap_or(0);
     let hits = data["hits"].as_array();
     if total == 0 || hits.is_none() {
@@ -4999,7 +4812,7 @@ pub async fn v2ex_search(query: String, max_results: Option<u32>) -> Result<Stri
     let relevant_hits = hits
         .unwrap()
         .iter()
-        .filter(|hit| v2ex_hit_matches_language_anchor(&query, &hit["_source"]))
+        .filter(|hit| v2ex_hit_matches_language_anchor(query, &hit["_source"]))
         .take(n as usize)
         .collect::<Vec<_>>();
     if relevant_hits.is_empty() {
@@ -5036,11 +4849,12 @@ pub async fn segmentfault_search(
     query: String,
     max_results: Option<u32>,
 ) -> Result<String, String> {
+    let query = required_search_term(&query)?;
     let c = kclient()?;
     let n = max_results.unwrap_or(10).min(20) as usize;
     let resp = c
         .get("https://api.segmentfault.com/search")
-        .query(&[("q", query.as_str()), ("page", "1")])
+        .query(&[("q", query), ("page", "1")])
         .send()
         .await
         .map_err(|e| format!("SegmentFault: {e}"))?;
@@ -5117,110 +4931,60 @@ pub async fn github_discussions_search(
     query: String,
     max_results: Option<u32>,
 ) -> Result<String, String> {
-    let n = max_results.unwrap_or(10).min(20);
-    let direct = format!(
-        "https://github.com/search?q={}&type=discussions",
-        query.replace(' ', "+")
-    );
-    public_site_search(
-        &query,
-        "github.com",
-        Some("/discussions/"),
-        "GitHub Discussions",
-        n,
-        &direct,
-    )
-    .await
-}
-
-// ── ProductHunt (discover developer tools & products) ─────────────
-
-#[tauri::command]
-pub async fn producthunt_search(query: String, max_results: Option<u32>) -> Result<String, String> {
-    let n = max_results.unwrap_or(10).min(20);
-    let direct = format!(
-        "https://www.producthunt.com/search?q={}",
-        query.replace(' ', "+")
-    );
-    public_site_search(
-        &query,
-        "producthunt.com",
-        Some("/posts/"),
-        "Product Hunt",
-        n,
-        &direct,
-    )
-    .await
-}
-
-#[tauri::command]
-pub async fn freecodecamp_search(
-    query: String,
-    max_results: Option<u32>,
-) -> Result<String, String> {
+    // 官方 API，不再走 public_site_search（依赖 DuckDuckGo，已被反爬拦死）。
+    // GitHub 的搜索接口可直接筛 discussion：实测 200 / total_count 2204。
+    let query = required_search_term(&query)?;
     let c = kclient()?;
-    let n = max_results.unwrap_or(10).min(20);
-    let body = serde_json::json!({
-        "query": query,
-        "hitsPerPage": n,
-    });
-    let resp = c
-        .post("https://QMJYL5WYTI-dsn.algolia.net/1/indexes/news/query")
-        .header("X-Algolia-Application-Id", "QMJYL5WYTI")
-        .header("X-Algolia-API-Key", "89770b24481654192d7a5c402c6ad9a0")
-        .json(&body)
-        .send()
+    let n = max_results.unwrap_or(10).min(30);
+    let q_full = format!("{query} is:discussion");
+    let resp = github_auth_header(
+        c.get("https://api.github.com/search/issues")
+            .query(&[("q", q_full.as_str()), ("per_page", &n.to_string())])
+            .header("Accept", "application/vnd.github+json"),
+    )
+    .send()
+    .await
+    .map_err(|e| format!("GitHub Discussions request: {e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!("GitHub API returned HTTP {}", resp.status()));
+    }
+    let body: Value = resp
+        .json_capped()
         .await
-        .map_err(|e| e.to_string())?;
-    ensure_provider_http_success("freeCodeCamp", resp.status())?;
-    let data: Value = resp.json_capped().await.map_err(|e| e.to_string())?;
+        .map_err(|e| format!("GitHub JSON: {e}"))?;
+    let items = body
+        .get("items")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "GitHub Discussions response did not contain an items array".to_string())?;
     let retrieved = retrieved_at();
-    let mut out = format!("FreeCodeCamp articles for '{query}':\nretrieved_at: {retrieved}\n\n");
+    let mut out = format!("GitHub Discussions for '{query}' (GitHub official search API)\nretrieved_at: {retrieved}\n\n");
     let mut count = 0usize;
-    if let Some(hits) = data["hits"].as_array() {
-        for (i, h) in hits.iter().take(n as usize).enumerate() {
-            let title = h["title"].as_str().unwrap_or("");
-            let url = h["url"].as_str().unwrap_or("");
-            let author = h["author"]["name"]
-                .as_str()
-                .or_else(|| h["author"].as_str())
-                .unwrap_or("?");
-            let tags: Vec<&str> = h["tags"]
-                .as_array()
-                .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
-                .unwrap_or_default();
-            let tag_str = if tags.is_empty() {
-                String::new()
-            } else {
-                format!(" [{}]", tags.join(", "))
-            };
-            let published = freecodecamp_published_date(h);
-            let dates = provider_date_lines(
-                published
-                    .as_ref()
-                    .map(|(value, field)| (value.as_str(), *field)),
-                None,
-                None,
-                None,
-                &retrieved,
-            );
-            count += 1;
-            out.push_str(&format!(
-                "{}. {} (by {}){}\n{}   {}\n\n",
-                i + 1,
-                title,
-                author,
-                tag_str,
-                dates,
-                url
-            ));
+    for it in items {
+        let title = it.get("title").and_then(|v| v.as_str()).unwrap_or("");
+        let url_s = it.get("html_url").and_then(|v| v.as_str()).unwrap_or("");
+        if title.is_empty() || url_s.is_empty() {
+            continue;
+        }
+        count += 1;
+        out.push_str(&format!(
+            "{}. {}\n   state: {}\n   comments: {}\n   updated_date: {}\n   retrieved_at: {}\n   {}\n\n",
+            count, title,
+            it.get("state").and_then(|v| v.as_str()).unwrap_or("unknown"),
+            it.get("comments").and_then(|v| v.as_i64()).unwrap_or(0),
+            it.get("updated_at").and_then(|v| v.as_str()).unwrap_or("unknown"),
+            retrieved, url_s,
+        ));
+        if count >= n as usize {
+            break;
         }
     }
     if count == 0 {
-        out.push_str("search_status: empty\nNo results found.\n");
+        out.push_str("search_status: empty\n没有匹配的 discussion。\n");
     }
     Ok(out)
 }
+
+// ── ProductHunt (discover developer tools & products) ─────────────
 
 #[tauri::command]
 pub async fn github_trending(query: String, max_results: Option<u32>) -> Result<String, String> {
@@ -5381,12 +5145,13 @@ pub async fn github_trending(query: String, max_results: Option<u32>) -> Result<
 
 #[tauri::command]
 pub async fn infoq_search(query: String, max_results: Option<u32>) -> Result<String, String> {
+    let query = required_search_term(&query)?;
     let c = kclient()?;
     let n = max_results.unwrap_or(10).min(20) as usize;
     let resp = c
         .get("https://www.infoq.com/search.action")
         .query(&[
-            ("queryString", query.as_str()),
+            ("queryString", query),
             ("page", "0"),
             ("searchOrder", "relevance"),
         ])
@@ -5484,47 +5249,6 @@ fn html_decode(s: &str) -> String {
         .replace("&nbsp;", " ")
 }
 
-#[tauri::command]
-pub async fn hackernoon_search(query: String, max_results: Option<u32>) -> Result<String, String> {
-    let n = max_results.unwrap_or(10).min(20);
-    let search_query = format!("site:hackernoon.com {query}");
-    let hits = ddg_surface_checked(&search_query)
-        .await
-        .map_err(|error| format!("HackerNoon public search: {error}"))?;
-    let retrieved = retrieved_at();
-    let mut out = format!(
-        "HackerNoon pages for '{query}' (via public web search, not a HackerNoon API):\nretrieved_at: {retrieved}\n\n"
-    );
-    let mut count = 0usize;
-    for (title, url, snippet, _) in hits {
-        if !url.contains("hackernoon.com") {
-            continue;
-        }
-        count += 1;
-        out.push_str(&format!(
-            "{}. {}\n   {}\n   published_date: unknown\n   updated_date: unknown\n   last_activity_date: unknown\n   retrieved_at: {}\n   {}\n\n",
-            count,
-            title,
-            trunc(&snippet, 180),
-            retrieved,
-            url,
-        ));
-        if count >= n as usize {
-            break;
-        }
-    }
-    if count == 0 {
-        out.push_str(
-            "search_status: empty\nThe public-search response contained no usable matching page. This can mean no match, an index coverage gap, or an unrecognized result layout; it does not prove HackerNoon has no matching content.\n\n",
-        );
-    }
-    out.push_str(&format!(
-        "HackerNoon search page: https://hackernoon.com/search?query={}\n",
-        query.replace(' ', "+"),
-    ));
-    Ok(out)
-}
-
 fn format_codeberg_repository_item(item: &Value, index: usize, retrieved: &str) -> String {
     let name = item["full_name"].as_str().unwrap_or("?");
     let description = item["description"].as_str().unwrap_or("");
@@ -5560,15 +5284,12 @@ fn format_codeberg_repository_item(item: &Value, index: usize, retrieved: &str) 
 
 #[tauri::command]
 pub async fn codeberg_search(query: String, max_results: Option<u32>) -> Result<String, String> {
+    let query = required_search_term(&query)?;
     let c = kclient()?;
     let n = max_results.unwrap_or(10).min(25) as usize;
     let resp = c
         .get("https://codeberg.org/api/v1/repos/search")
-        .query(&[
-            ("q", query.as_str()),
-            ("sort", "stars"),
-            ("limit", &n.to_string()),
-        ])
+        .query(&[("q", query), ("sort", "stars"), ("limit", &n.to_string())])
         .send()
         .await
         .map_err(|e| e.to_string())?;
@@ -5598,90 +5319,8 @@ pub async fn codeberg_search(query: String, max_results: Option<u32>) -> Result<
 }
 
 #[tauri::command]
-pub async fn bestofjs_search(query: String, max_results: Option<u32>) -> Result<String, String> {
-    let c = kclient()?;
-    let n = max_results.unwrap_or(10).min(30) as usize;
-    let resp = c
-        .get("https://bestofjs-static-api.vercel.app/projects.json")
-        .send()
-        .await
-        .map_err(|e| e.to_string())?;
-    ensure_provider_http_success("Best of JS", resp.status())?;
-    let data: Value = resp.json_capped().await.map_err(|e| e.to_string())?;
-    let retrieved = retrieved_at();
-    let query_lower = query.to_lowercase();
-    let keywords: Vec<&str> = query_lower.split_whitespace().collect();
-    let mut out = format!("Best of JS projects for '{query}':\nretrieved_at: {retrieved}\n\n");
-    let mut count = 0;
-    if let Some(projects) = data["projects"].as_array() {
-        for p in projects {
-            if count >= n {
-                break;
-            }
-            let name = p["name"].as_str().unwrap_or("");
-            let desc = p["description"].as_str().unwrap_or("");
-            let full_name = p["full_name"].as_str().unwrap_or("");
-            let tags: Vec<&str> = p["tags"]
-                .as_array()
-                .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
-                .unwrap_or_default();
-            let haystack =
-                format!("{} {} {} {}", name, desc, full_name, tags.join(" ")).to_lowercase();
-            if !keywords.is_empty() && !keywords.iter().all(|k| haystack.contains(k)) {
-                continue;
-            }
-            count += 1;
-            let stars = p["stars"].as_u64().unwrap_or(0);
-            let url = if full_name.is_empty() {
-                p["url"].as_str().unwrap_or("").to_string()
-            } else {
-                format!("https://github.com/{}", full_name)
-            };
-            let tag_str = if tags.is_empty() {
-                String::new()
-            } else {
-                format!(" [{}]", tags.join(", "))
-            };
-            let created = p
-                .get("created_at")
-                .and_then(Value::as_str)
-                .map(str::trim)
-                .filter(|value| !value.is_empty());
-            let pushed = p
-                .get("pushed_at")
-                .and_then(Value::as_str)
-                .map(str::trim)
-                .filter(|value| !value.is_empty());
-            out.push_str(&format!(
-                "{}. {} ★{}{}\n   {}\n{}   {}\n\n",
-                count,
-                name,
-                stars,
-                tag_str,
-                trunc(desc, 150),
-                provider_date_lines(
-                    None,
-                    created.map(|value| (value, "created_at")),
-                    None,
-                    pushed.map(|value| (value, "pushed_at")),
-                    &retrieved,
-                ),
-                url,
-            ));
-        }
-    }
-    if count == 0 {
-        out.push_str("search_status: empty\nNo matching projects.\n");
-    }
-    out.push_str(&format!(
-        "Best of JS: https://bestofjs.org/projects?query={}\n",
-        query.replace(' ', "+")
-    ));
-    Ok(out)
-}
-
-#[tauri::command]
 pub async fn sourcegraph_search(query: String, max_results: Option<u32>) -> Result<String, String> {
+    let query = required_search_term(&query)?;
     let c = kclient()?;
     let n = max_results.unwrap_or(10).min(20);
     let gql = format!(
@@ -5791,510 +5430,6 @@ fn sourcegraph_graphql_results(data: &Value) -> Result<(u64, &[Value]), String> 
     Ok((result_count, items))
 }
 
-// ── Deep search (surface + Tor + onion engines) ───────────────────
-
-fn tor_client(timeout_secs: u64) -> Result<Client, String> {
-    let proxy =
-        reqwest::Proxy::all("socks5h://127.0.0.1:9050").map_err(|e| format!("Tor proxy: {e}"))?;
-    Client::builder()
-        .proxy(proxy)
-        .timeout(Duration::from_secs(timeout_secs))
-        .redirect(reqwest::redirect::Policy::limited(5))
-        .user_agent("Mozilla/5.0 (Windows NT 10.0; rv:128.0) Gecko/20100101 Firefox/128.0")
-        .build()
-        .map_err(|e| format!("Tor client: {e}"))
-}
-
-async fn ddg_surface_checked(
-    q: &str,
-) -> Result<Vec<(String, String, String, &'static str)>, String> {
-    let client = kclient()?;
-    let resp = client
-        .post("https://html.duckduckgo.com/html/")
-        .header(reqwest::header::USER_AGENT, "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
-        .form(&[("q", q), ("kl", "wt-wt")])
-        .send()
-        .await
-        .map_err(|error| format!("DuckDuckGo request: {error}"))?;
-    let status = resp.status();
-    if !status.is_success() {
-        return Err(format!("DuckDuckGo returned HTTP {status}"));
-    }
-    let html = resp
-        .text_capped()
-        .await
-        .map_err(|error| format!("DuckDuckGo response body: {error}"))?;
-    Ok(parse_ddg_html(&html, "明网"))
-}
-
-async fn ddg_surface(q: &str) -> Vec<(String, String, String, &'static str)> {
-    ddg_surface_checked(q).await.unwrap_or_default()
-}
-
-async fn ddg_onion(q: &str) -> Vec<(String, String, String, &'static str)> {
-    let client = match tor_client(20) {
-        Ok(c) => c,
-        Err(_) => return vec![],
-    };
-    let resp = client
-        .post("https://duckduckgogg42xjoc72x3sjasowoarfbgcmvfimaftt6twagswzczad.onion/html/")
-        .form(&[("q", q), ("kl", "wt-wt")])
-        .send()
-        .await;
-    let html = match resp {
-        Ok(r) => r.text_capped().await.unwrap_or_default(),
-        Err(_) => return vec![],
-    };
-    parse_ddg_html(&html, "Tor匿名")
-}
-
-async fn ahmia_search_layer(q: &str) -> Vec<(String, String, String, &'static str)> {
-    let client = match kclient() {
-        Ok(c) => c,
-        Err(_) => return vec![],
-    };
-    let url = format!("https://ahmia.fi/search/?q={}", q.replace(' ', "+"));
-    let resp = match client.get(&url).send().await {
-        Ok(r) => r.text_capped().await.unwrap_or_default(),
-        Err(_) => return vec![],
-    };
-    let mut results = Vec::new();
-    for chunk in resp.split("search-result") {
-        let url = match chunk.find("href=\"") {
-            Some(i) => {
-                let s = &chunk[i + 6..];
-                match s.find('"') {
-                    Some(j) => s[..j].to_string(),
-                    None => continue,
-                }
-            }
-            None => continue,
-        };
-        if !url.contains(".onion") && !url.starts_with("http") {
-            continue;
-        }
-        let title = chunk
-            .find("<h4")
-            .and_then(|i| chunk[i..].find('>').map(|j| i + j + 1))
-            .and_then(|start| {
-                chunk[start..]
-                    .find("</")
-                    .map(|end| html_decode(&chunk[start..start + end]).trim().to_string())
-            })
-            .unwrap_or_default();
-        let snippet = chunk
-            .find("<p")
-            .and_then(|i| chunk[i..].find('>').map(|j| i + j + 1))
-            .and_then(|start| {
-                chunk[start..]
-                    .find("</p")
-                    .map(|end| html_decode(&chunk[start..start + end]).trim().to_string())
-            })
-            .unwrap_or_default();
-        if !title.is_empty() || !snippet.is_empty() {
-            results.push((title, url, trunc(&snippet, 200).to_string(), "暗网(Ahmia)"));
-        }
-    }
-    results
-}
-
-async fn torch_search_layer(q: &str) -> Vec<(String, String, String, &'static str)> {
-    let client = match tor_client(25) {
-        Ok(c) => c,
-        Err(_) => return vec![],
-    };
-    let url = format!(
-        "http://xmh57jrknzkhv6y3ls3ubitzfqnkrwxhopf5aygthi7d6rplyvk3noyd.onion/cgi-bin/omega/omega?P={}&DEFAULTOP=and",
-        q.replace(' ', "+")
-    );
-    let resp = match client.get(&url).send().await {
-        Ok(r) => r.text_capped().await.unwrap_or_default(),
-        Err(_) => return vec![],
-    };
-    let mut results = Vec::new();
-    for chunk in resp.split("<b>") {
-        if !chunk.contains(".onion") {
-            continue;
-        }
-        let url = chunk
-            .find("href=\"")
-            .and_then(|i| {
-                let s = &chunk[i + 6..];
-                s.find('"').map(|j| s[..j].to_string())
-            })
-            .unwrap_or_default();
-        if url.is_empty() {
-            continue;
-        }
-        let title = match chunk.find("</b>") {
-            Some(i) => html_decode(&chunk[..i]).trim().to_string(),
-            None => continue,
-        };
-        results.push((title, url, String::new(), "暗网(Torch)"));
-    }
-    results.truncate(8);
-    results
-}
-
-fn parse_ddg_html(html: &str, source: &'static str) -> Vec<(String, String, String, &'static str)> {
-    let mut results = Vec::new();
-    for chunk in html.split("result__body") {
-        let url = chunk
-            .find("result__url")
-            .and_then(|i| chunk[i..].find("href=\"").map(|j| i + j + 6))
-            .and_then(|start| {
-                chunk[start..].find('"').map(|end| {
-                    let raw = &chunk[start..start + end];
-                    if raw.starts_with("//") {
-                        format!("https:{raw}")
-                    } else {
-                        raw.to_string()
-                    }
-                })
-            })
-            .unwrap_or_default();
-        let title = chunk
-            .find("result__a")
-            .and_then(|i| chunk[i..].find('>').map(|j| i + j + 1))
-            .and_then(|start| {
-                chunk[start..]
-                    .find("</a")
-                    .map(|end| html_decode(&chunk[start..start + end]).trim().to_string())
-            })
-            .unwrap_or_default();
-        let snippet = chunk
-            .find("result__snippet")
-            .and_then(|i| chunk[i..].find('>').map(|j| i + j + 1))
-            .and_then(|start| {
-                chunk[start..]
-                    .find("</a")
-                    .or_else(|| chunk[start..].find("</td"))
-                    .map(|end| html_decode(&chunk[start..start + end]).trim().to_string())
-            })
-            .unwrap_or_default();
-        if !url.is_empty() && !title.is_empty() {
-            results.push((title, url, trunc(&snippet, 200).to_string(), source));
-        }
-    }
-    results
-}
-
-// ── Extra intelligence layers (reach content the surface web hides) ───────
-
-/// True (with the bare host) when the query looks like a domain or URL, so we can
-/// fire the domain-oriented OSINT layers (subdomains, deleted-page archives).
-fn looks_like_domain(q: &str) -> Option<String> {
-    let s = q
-        .trim()
-        .trim_start_matches("https://")
-        .trim_start_matches("http://")
-        .trim_end_matches('/');
-    let host = s.split('/').next().unwrap_or(s);
-    if host.is_empty() || host.contains(' ') || !host.contains('.') {
-        return None;
-    }
-    let tld_ok = host
-        .rsplit('.')
-        .next()
-        .is_some_and(|t| t.len() >= 2 && t.chars().all(|c| c.is_ascii_alphabetic()));
-    if host.split('.').count() >= 2
-        && tld_ok
-        && host
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-')
-    {
-        Some(host.to_lowercase())
-    } else {
-        None
-    }
-}
-
-/// A DuckDuckGo HTML query with an arbitrary source label — used for dork variants.
-async fn ddg_query(q: &str, label: &'static str) -> Vec<(String, String, String, &'static str)> {
-    let client = match kclient() {
-        Ok(c) => c,
-        Err(_) => return vec![],
-    };
-    let resp = client
-        .post("https://html.duckduckgo.com/html/")
-        .header(reqwest::header::USER_AGENT, "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
-        .form(&[("q", q), ("kl", "wt-wt")])
-        .send()
-        .await;
-    match resp {
-        Ok(r) => parse_ddg_html(&r.text_capped().await.unwrap_or_default(), label),
-        Err(_) => vec![],
-    }
-}
-
-/// Dork the surface web for where hidden content actually lives: paste sites, code
-/// hosts, and sensitive file types. DuckDuckGo honours `site:` / `filetype:`.
-async fn dork_layer(q: &str) -> Vec<(String, String, String, &'static str)> {
-    let dorks = [
-        format!("{q} site:pastebin.com OR site:ghostbin.com OR site:rentry.co OR site:justpaste.it OR site:controlc.com"),
-        format!("{q} site:gist.github.com OR site:github.com OR site:gitlab.com"),
-        format!("{q} filetype:log OR filetype:sql OR filetype:env OR filetype:json OR filetype:txt"),
-    ];
-    let (mut paste, mut code, mut files) = tokio::join!(
-        ddg_query(&dorks[0], "定向(dork)"),
-        ddg_query(&dorks[1], "定向(dork)"),
-        ddg_query(&dorks[2], "定向(dork)"),
-    );
-    paste.append(&mut code);
-    paste.append(&mut files);
-    paste
-}
-
-/// Wayback CDX: every archived URL under a domain — including pages DELETED from the
-/// live web. The archived snapshot is still readable, so this reaches "removed" content.
-async fn wayback_layer(domain: &str) -> Vec<(String, String, String, &'static str)> {
-    let client = match kclient() {
-        Ok(c) => c,
-        Err(_) => return vec![],
-    };
-    let url = format!(
-        "http://web.archive.org/cdx/search/cdx?url={domain}*&output=json&fl=original,timestamp&collapse=urlkey&limit=50"
-    );
-    let txt = match client.get(&url).send().await {
-        Ok(r) => r.text_capped().await.unwrap_or_default(),
-        Err(_) => return vec![],
-    };
-    let rows: Vec<Vec<String>> = serde_json::from_str(&txt).unwrap_or_default();
-    let mut out = Vec::new();
-    for row in rows.into_iter().skip(1) {
-        if row.len() < 2 {
-            continue;
-        }
-        let orig = row[0].clone();
-        let ts = row[1].clone();
-        out.push((
-            orig.clone(),
-            format!("https://web.archive.org/web/{ts}/{orig}"),
-            format!("存档于 {ts}——原页面即使已被删除，这个快照仍可 web_fetch 读到"),
-            "存档(Wayback)",
-        ));
-    }
-    out
-}
-
-/// crt.sh certificate transparency: enumerate subdomains / internal hosts of a domain
-/// that normal search never surfaces (dev, staging, admin, api-internal, …).
-async fn crtsh_layer(domain: &str) -> Vec<(String, String, String, &'static str)> {
-    let client = match kclient() {
-        Ok(c) => c,
-        Err(_) => return vec![],
-    };
-    let url = format!("https://crt.sh/?q=%25.{domain}&output=json");
-    let txt = match client
-        .get(&url)
-        .timeout(Duration::from_secs(20))
-        .send()
-        .await
-    {
-        Ok(r) => r.text_capped().await.unwrap_or_default(),
-        Err(_) => return vec![],
-    };
-    let arr: Value = serde_json::from_str(&txt).unwrap_or(Value::Null);
-    let mut seen = std::collections::HashSet::new();
-    let mut out = Vec::new();
-    if let Some(items) = arr.as_array() {
-        for it in items {
-            if let Some(nv) = it.get("name_value").and_then(|v| v.as_str()) {
-                for host in nv.split('\n') {
-                    let h = host.trim().trim_start_matches("*.").to_lowercase();
-                    if h.is_empty() || h.contains(' ') || h.contains('*') || seen.contains(&h) {
-                        continue;
-                    }
-                    seen.insert(h.clone());
-                    out.push((
-                        h.clone(),
-                        format!("https://{h}"),
-                        "证书透明记录里发现的主机".into(),
-                        "子域名(crt.sh)",
-                    ));
-                    if out.len() >= 40 {
-                        return out;
-                    }
-                }
-            }
-        }
-    }
-    out
-}
-
-/// Pull every distinct `.onion` link (+ anchor text) out of a dark-web engine's HTML.
-/// Parser-agnostic on purpose so it survives the frequent layout churn of onion engines.
-fn extract_onion_links(
-    html: &str,
-    label: &'static str,
-) -> Vec<(String, String, String, &'static str)> {
-    let mut out = Vec::new();
-    let mut seen = std::collections::HashSet::new();
-    for part in html.split("href=\"").skip(1) {
-        let end = match part.find('"') {
-            Some(e) => e,
-            None => continue,
-        };
-        let href = &part[..end];
-        if !href.contains(".onion") || !href.starts_with("http") {
-            continue;
-        }
-        let url = href.to_string();
-        if seen.contains(&url) {
-            continue;
-        }
-        seen.insert(url.clone());
-        let title = part[end..]
-            .find('>')
-            .and_then(|g| {
-                let s = &part[end + g + 1..];
-                s.find("</a")
-                    .map(|e2| html_decode(&s[..e2]).trim().to_string())
-            })
-            .unwrap_or_default();
-        out.push((
-            if title.is_empty() { url.clone() } else { title },
-            url,
-            String::new(),
-            label,
-        ));
-        if out.len() >= 12 {
-            break;
-        }
-    }
-    out
-}
-
-/// Haystak — a 4th dark-web engine (over Tor) on top of DDG-onion / Ahmia / Torch.
-async fn haystak_layer(q: &str) -> Vec<(String, String, String, &'static str)> {
-    let client = match tor_client(25) {
-        Ok(c) => c,
-        Err(_) => return vec![],
-    };
-    let url = format!(
-        "http://haystak5njsmn2hqkewecpaxetahtwhsbsa64jom2k22z5afxhnpxfid.onion/?q={}",
-        q.replace(' ', "+")
-    );
-    match client.get(&url).send().await {
-        Ok(r) => extract_onion_links(&r.text_capped().await.unwrap_or_default(), "暗网(Haystak)"),
-        Err(_) => vec![],
-    }
-}
-
-async fn tor_search_layers(q: &str) -> Vec<(String, String, String, &'static str)> {
-    // Fast paths must not wait through a full cold Tor bootstrap. Six seconds
-    // is enough when Tor is already running or nearly ready; ensure_tor starts
-    // the detached process, so a later search can use it if bootstrap is slower.
-    match tokio::time::timeout(Duration::from_secs(6), crate::net::ensure_tor()).await {
-        Ok(Ok(())) => {}
-        _ => return Vec::new(),
-    }
-    let mut racing: FuturesUnordered<DeepSearchFuture> = FuturesUnordered::new();
-    for source in 0..3 {
-        let query = q.to_string();
-        racing.push(Box::pin(async move {
-            match source {
-                0 => ddg_onion(&query).await,
-                1 => torch_search_layer(&query).await,
-                _ => haystak_layer(&query).await,
-            }
-        }));
-    }
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
-    let mut results = Vec::new();
-    while let Ok(Some(mut batch)) = tokio::time::timeout_at(deadline, racing.next()).await {
-        results.append(&mut batch);
-    }
-    results
-}
-
-#[tauri::command]
-pub async fn deep_search(query: String, max_results: Option<usize>) -> Result<String, String> {
-    let q = query.trim();
-    if q.is_empty() {
-        return Err("空搜索词".into());
-    }
-    let limit = max_results.unwrap_or(24).min(60);
-    let domain = looks_like_domain(q);
-
-    let mut racing: FuturesUnordered<DeepSearchFuture> = FuturesUnordered::new();
-    // Keyword layers run concurrently. Tor-backed engines share one readiness
-    // gate so a cold bootstrap cannot hold every public source for 30-40s.
-    {
-        let q = q.to_string();
-        racing.push(Box::pin(async move { ddg_surface(&q).await }));
-    }
-    {
-        let q = q.to_string();
-        racing.push(Box::pin(async move { dork_layer(&q).await }));
-    }
-    {
-        let q = q.to_string();
-        racing.push(Box::pin(async move { ahmia_search_layer(&q).await }));
-    }
-    {
-        let q = q.to_string();
-        racing.push(Box::pin(async move { tor_search_layers(&q).await }));
-    }
-    // Domain/OSINT layers — only when the query is a domain or URL: hidden subdomains + deleted-page archives.
-    if let Some(d) = domain.clone() {
-        {
-            let d = d.clone();
-            racing.push(Box::pin(async move { crtsh_layer(&d).await }));
-        }
-        {
-            let d = d.clone();
-            racing.push(Box::pin(async move { wayback_layer(&d).await }));
-        }
-    }
-
-    let source_tasks = racing.len();
-    let mut completed_tasks = 0usize;
-    let mut all: Vec<(String, String, String, &str)> = Vec::new();
-    let mut seen_urls = std::collections::HashSet::new();
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
-
-    while let Ok(Some(batch)) = tokio::time::timeout_at(deadline, racing.next()).await {
-        completed_tasks += 1;
-        for item in batch {
-            let norm = item.1.trim_end_matches('/').to_lowercase();
-            if seen_urls.contains(&norm) {
-                continue;
-            }
-            seen_urls.insert(norm);
-            all.push(item);
-        }
-    }
-
-    if all.is_empty() {
-        return Ok(format!(
-            "深层搜索「{q}」未找到结果；本轮完成 {completed_tasks}/{source_tasks} 个来源任务。空结果可能表示无匹配、来源拒绝/超时，或 Tor 尚在冷启动。"
-        ));
-    }
-
-    let mut out = format!(
-        "🔍 深层情报搜索「{q}」— {} 条结果；本轮完成 {completed_tasks}/{source_tasks} 个来源任务（明网+定向dork+存档+子域名+暗网多引擎）：\n",
-        all.len().min(limit),
-    );
-    for (i, (title, url, snippet, source)) in all.iter().take(limit).enumerate() {
-        out.push_str(&format!(
-            "\n{}. [{}] {}\n   {}\n",
-            i + 1,
-            source,
-            title,
-            url,
-        ));
-        if !snippet.is_empty() {
-            out.push_str(&format!("   {}\n", trunc(snippet, 240)));
-        }
-    }
-    out.push_str(
-        "\n来源层：明网(DuckDuckGo) + 定向dork(paste/leak/filetype) + 存档(Wayback,含已删除页) + 子域名(crt.sh) + 暗网四引擎(DDG-onion/Ahmia/Torch/Haystak)\n\
-         完成来源任务只表示请求已结束，不等于该层返回了结果；空层可能是无匹配、被拒绝、超时或 Tor 尚未就绪。明网/存档 URL 用 web_fetch 读，.onion URL 用 tor_request 读。",
-    );
-    Ok(out)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -6312,21 +5447,85 @@ mod tests {
     }
 
     #[test]
+    fn search_terms_and_provider_prices_are_not_hard_coded() {
+        assert_eq!(
+            required_search_term("  rust async  ").unwrap(),
+            "rust async"
+        );
+        assert!(required_search_term(" \n\t ").is_err());
+        assert_eq!(
+            steam_price(Some(&serde_json::json!({
+                "currency": "USD",
+                "final": 999
+            }))),
+            "USD 9.99"
+        );
+        assert_eq!(
+            steam_price(Some(&serde_json::json!({
+                "currency": "CNY",
+                "final": 4200
+            }))),
+            "CNY 42.00"
+        );
+        assert_eq!(steam_price(None), "N/A");
+
+        let article = serde_json::json!({
+            "title": "Async error handling in Rust",
+            "description": "Structured concurrency with Tokio",
+            "tag_list": ["rust", "async"]
+        });
+        assert!(devto_article_matches(
+            &article,
+            &["async".into(), "tokio".into()]
+        ));
+        assert!(!devto_article_matches(&article, &["react".into()]));
+    }
+
+    #[tokio::test]
+    async fn registered_searches_reject_blank_terms_before_network_access() {
+        assert!(bundlephobia_search("  ".into()).await.is_err());
+        assert!(devto_search("\n".into(), None).await.is_err());
+        assert!(steam_search("\t".into(), None).await.is_err());
+        assert!(codrops_search(" ".into(), None).await.is_err());
+        assert!(github_discussions_search(" ".into(), None).await.is_err());
+        assert!(sourcegraph_search(" ".into(), None).await.is_err());
+
+        let error = openalex_search("rust".into(), Some("users".into()), None)
+            .await
+            .unwrap_err();
+        assert!(error.contains("entity_type"));
+    }
+
+    #[test]
     fn developer_source_scopes_are_explicit_and_bounded() {
         let all = select_developer_sources(Some("all"), None).unwrap();
         assert_eq!(all.len(), DEVELOPER_COMMUNITY_SOURCES.len());
         assert!(all.contains(&"github"));
         assert!(all.contains(&"stackoverflow"));
         assert!(all.contains(&"v2ex"));
+        for retired in [
+            "reddit",
+            "lobsters",
+            "bestofjs",
+            "producthunt",
+            "freecodecamp",
+            "hackernoon",
+        ] {
+            assert!(!all.contains(&retired));
+        }
 
         let forums = select_developer_sources(Some("forums"), None).unwrap();
-        assert!(forums.contains(&"reddit"));
         assert!(forums.contains(&"github_discussions"));
         assert!(forums.contains(&"rust_users"));
         assert!(forums.contains(&"python_discussions"));
         assert!(forums.contains(&"swift_forums"));
         assert!(forums.contains(&"kotlin_discussions"));
         assert!(!forums.contains(&"gitlab"));
+
+        assert_eq!(
+            select_developer_sources(Some("articles"), None).unwrap(),
+            vec!["devto", "infoq"]
+        );
     }
 
     #[test]
@@ -6342,6 +5541,10 @@ mod tests {
 
         let invalid = vec!["a-community-without-an-adapter".to_string()];
         let error = select_developer_sources(None, Some(&invalid)).unwrap_err();
+        assert!(error.contains("Unsupported developer sources"));
+
+        let retired = vec!["reddit".to_string()];
+        let error = select_developer_sources(None, Some(&retired)).unwrap_err();
         assert!(error.contains("Unsupported developer sources"));
     }
 
@@ -6529,27 +5732,8 @@ mod tests {
     }
 
     #[test]
-    fn freecodecamp_publication_uses_provider_field_and_timestamp_fallback() {
-        let explicit = serde_json::json!({
-            "publishedAt": "2026-02-20T15:10:00.015Z",
-            "publishedAtTimestamp": 1
-        });
-        assert_eq!(
-            freecodecamp_published_date(&explicit),
-            Some(("2026-02-20T15:10:00.015Z".to_string(), "publishedAt"))
-        );
-
-        let timestamp_only = serde_json::json!({ "publishedAtTimestamp": 1_771_600_200 });
-        assert_eq!(
-            freecodecamp_published_date(&timestamp_only),
-            Some(("2026-02-20T15:10:00Z".to_string(), "publishedAtTimestamp"))
-        );
-        assert_eq!(freecodecamp_published_date(&serde_json::json!({})), None);
-    }
-
-    #[test]
     fn provider_http_statuses_and_trending_empty_status_are_explicit() {
-        for provider in ["InfoQ", "freeCodeCamp", "Best of JS", "Sourcegraph"] {
+        for provider in ["InfoQ", "Bundlephobia", "Codrops", "Sourcegraph"] {
             assert_eq!(
                 ensure_provider_http_success(provider, reqwest::StatusCode::OK),
                 Ok(())
@@ -6971,18 +6155,6 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    #[ignore = "calls live surface, archive, certificate, and Tor search sources"]
-    async fn deep_search_live_smoke_is_bounded_and_reports_coverage() {
-        let started = std::time::Instant::now();
-        let out = deep_search("rust async error handling".into(), Some(5))
-            .await
-            .unwrap();
-        println!("{out}");
-        assert!(out.contains("本轮完成"));
-        assert!(started.elapsed() < Duration::from_secs(20));
-    }
-
     /// 上限保护必须建立在**实际读到的字节**上，不能只信对端自报的 Content-Length。
     /// 这里用 http::Response 直接造 reqwest::Response，不起网络。
     fn resp_with_body(body: Vec<u8>) -> reqwest::Response {
@@ -7010,7 +6182,10 @@ mod tests {
     async fn capped_read_keeps_body_exactly_at_limit() {
         // 边界：正好等于上限不该被拒（用 > 而不是 >=）。
         let exact = vec![b'a'; MAX_RESPONSE_BYTES];
-        let out = resp_with_body(exact).text_capped().await.expect("正好等于上限应通过");
+        let out = resp_with_body(exact)
+            .text_capped()
+            .await
+            .expect("正好等于上限应通过");
         assert_eq!(out.len(), MAX_RESPONSE_BYTES);
     }
 

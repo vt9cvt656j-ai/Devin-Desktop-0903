@@ -1,8 +1,34 @@
 import type { ReactNode } from "react";
-import { ChevronLeft, CreditCard, Home, LineChart, Settings, Workflow } from "lucide-react";
+import {
+  ChevronLeft,
+  CreditCard,
+  Download,
+  Globe,
+  Home,
+  LineChart,
+  LogOut,
+  MonitorSmartphone,
+  MoreHorizontal,
+  Settings,
+  Workflow,
+} from "lucide-react";
 
 import { Avatar, AvatarFallback, AvatarImage } from "@/components/ui/avatar";
-import { DICTS, type Lang } from "@/lib/i18n";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuLabel,
+  DropdownMenuRadioGroup,
+  DropdownMenuRadioItem,
+  DropdownMenuSeparator,
+  DropdownMenuSub,
+  DropdownMenuSubContent,
+  DropdownMenuSubTrigger,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
+import { signOut } from "@/lib/api";
+import { DICTS, LANGS, type Lang } from "@/lib/i18n";
 import { cn } from "@/lib/utils";
 
 /**
@@ -12,6 +38,9 @@ import { cn } from "@/lib/utils";
  * lost two entries — clicking "Plans & billing" made Settings and Integrations vanish.
  * A module cannot drift from itself.
  */
+/** The marketing site's download section, which reports what has actually shipped. */
+const RELEASES = "https://www.michaelide.xyz/#download";
+
 export const NAV = [
   { href: "/dashboard#overview", key: "navOverview", icon: Home },
   { href: "/dashboard#usage", key: "navUsage", icon: LineChart },
@@ -19,6 +48,7 @@ export const NAV = [
   { href: "/billing", key: "navBilling", icon: CreditCard },
   { separator: true },
   { href: "/dashboard#integrations", key: "navIntegrations", icon: Workflow },
+  { href: "/dashboard#devices", key: "navDevices", icon: MonitorSmartphone },
 ] as const;
 
 type ShellProps = {
@@ -31,7 +61,8 @@ type ShellProps = {
   /** `data:` URL, or undefined for the lettered fallback. */
   avatar?: string | null;
   planLabel?: string;
-  footer?: ReactNode;
+  /** Switches the console; the choice is persisted by the caller. */
+  onLangChange: (lang: Lang) => void;
   children: ReactNode;
 };
 
@@ -42,7 +73,7 @@ export function Shell({
   name,
   avatar,
   planLabel,
-  footer,
+  onLangChange,
   children,
 }: ShellProps) {
   const t = DICTS[lang];
@@ -95,7 +126,6 @@ export function Shell({
         </nav>
 
         <div className="mt-auto flex flex-none flex-col gap-2.5 border-t border-border/60 pt-3">
-          {footer}
           <div className="flex items-center gap-2.5 px-1 py-1.5">
             <Avatar className="size-8">
               {avatar ? <AvatarImage src={avatar} alt="" /> : null}
@@ -112,6 +142,106 @@ export function Shell({
                 {name ? email : planLabel}
               </div>
             </div>
+
+            <DropdownMenu>
+              <DropdownMenuTrigger
+                aria-label={t.accountMenu}
+                className="grid size-7 shrink-0 cursor-pointer place-items-center rounded-lg text-muted-foreground outline-none transition-colors hover:text-foreground focus-visible:text-foreground data-[state=open]:text-foreground"
+              >
+                <MoreHorizontal className="size-4" />
+              </DropdownMenuTrigger>
+              {/*
+                * Upward, and right-aligned to the trigger.
+                *
+                * Upward because the trigger sits in the bottom-left corner and a menu
+                * anchored below it would run off the window. Right-aligned because
+                * `align="start"` hung the panel off the trigger's left edge and out over
+                * the page content, which read as belonging to neither the sidebar nor the
+                * page; ending it at the same edge as the dots keeps it inside the column
+                * it belongs to.
+                */}
+              <DropdownMenuContent side="top" align="end" className="w-56">
+                <DropdownMenuLabel className="truncate">{email}</DropdownMenuLabel>
+                <DropdownMenuSeparator />
+                {/*
+                  * Only destinations that exist. The reference menu carries a changelog,
+                  * a help centre and a language switcher; this product has none of the
+                  * first two, and the console is English-only by decision — a menu item
+                  * that leads nowhere is worse than a shorter menu.
+                  */}
+                <DropdownMenuItem asChild>
+                  <a href="/dashboard#settings">
+                    <Settings />
+                    {t.navSettings}
+                  </a>
+                </DropdownMenuItem>
+                <DropdownMenuItem asChild>
+                  <a href="/billing">
+                    <CreditCard />
+                    {t.navBilling}
+                  </a>
+                </DropdownMenuItem>
+                <DropdownMenuItem asChild>
+                  <a href="/dashboard#devices">
+                    <MonitorSmartphone />
+                    {t.navDevices}
+                  </a>
+                </DropdownMenuItem>
+                {/*
+                  * A submenu rather than a jump to Settings: changing language is a
+                  * two-second decision, and sending someone to a page to make it — then
+                  * leaving them there — is a worse trade than one extra hover.
+                  */}
+                <DropdownMenuSub>
+                  <DropdownMenuSubTrigger>
+                    <Globe />
+                    {t.language}
+                  </DropdownMenuSubTrigger>
+                  {/*
+                    * `sideOffset` puts a gap between the two panels — flush against each
+                    * other they read as one torn sheet rather than two surfaces.
+                    *
+                    * `alignOffset` centres the submenu against the parent instead of
+                    * hanging it from the row that opened it, which is where Radix puts it
+                    * by default and which left it sitting low and lopsided. Measured, not
+                    * guessed: the parent is 297px tall, the submenu 266, and the Language
+                    * row starts 156px down — so centring means lifting it 156 and pushing
+                    * it back down (297-266)/2 = 16, which is -140.
+                    *
+                    * Both numbers depend on the rows in these two menus. Add a language or
+                    * a menu item and it needs re-measuring; the harness that produced these
+                    * is a page of the same markup with the built stylesheet.
+                    */}
+                  <DropdownMenuSubContent sideOffset={8} alignOffset={-140}>
+                    <DropdownMenuRadioGroup
+                      value={lang}
+                      onValueChange={(v) => onLangChange(v as Lang)}
+                    >
+                      {LANGS.map((l) => (
+                        <DropdownMenuRadioItem key={l.value} value={l.value}>
+                          {l.label}
+                        </DropdownMenuRadioItem>
+                      ))}
+                    </DropdownMenuRadioGroup>
+                  </DropdownMenuSubContent>
+                </DropdownMenuSub>
+                <DropdownMenuSeparator />
+                <DropdownMenuItem asChild>
+                  <a href={RELEASES} target="_blank" rel="noreferrer">
+                    <Download />
+                    {t.getTheApp}
+                  </a>
+                </DropdownMenuItem>
+                <DropdownMenuSeparator />
+                <DropdownMenuItem
+                  onSelect={() => signOut()}
+                  className="text-destructive focus:bg-destructive/10 focus:text-destructive [&_svg]:text-destructive"
+                >
+                  <LogOut />
+                  {t.signOut}
+                </DropdownMenuItem>
+              </DropdownMenuContent>
+            </DropdownMenu>
           </div>
         </div>
       </aside>

@@ -88,6 +88,9 @@ struct Session {
     rx: Receiver<String>,
     stderr_log: Arc<Mutex<VecDeque<String>>>,
     next_id: u64,
+    workspace_root: String,
+    capabilities: Value,
+    server_info: Value,
 }
 
 impl Drop for Session {
@@ -143,7 +146,57 @@ pub struct McpTool {
     name: String,
     description: String,
     input_schema: Value,
+    output_schema: Value,
     annotations: Value,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct McpResource {
+    uri: String,
+    name: String,
+    description: String,
+    mime_type: String,
+    annotations: Value,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct McpResourceTemplate {
+    uri_template: String,
+    name: String,
+    description: String,
+    mime_type: String,
+    annotations: Value,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct McpPrompt {
+    name: String,
+    description: String,
+    arguments: Value,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct McpDiscovery {
+    tools: Vec<McpTool>,
+    resources: Vec<McpResource>,
+    resource_templates: Vec<McpResourceTemplate>,
+    prompts: Vec<McpPrompt>,
+    capabilities: Value,
+    server_info: Value,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct McpCallResult {
+    text: String,
+    content: Value,
+    structured_content: Value,
+    is_error: bool,
+    meta: Value,
 }
 
 impl Session {
@@ -168,7 +221,11 @@ impl Session {
         let method = request.get("method").and_then(Value::as_str).unwrap_or("");
         let response = match method {
             "ping" => json!({"jsonrpc":"2.0","id":id,"result":{}}),
-            "roots/list" => json!({"jsonrpc":"2.0","id":id,"result":{"roots":[]}}),
+            "roots/list" => json!({
+                "jsonrpc":"2.0",
+                "id":id,
+                "result":{"roots": workspace_roots(&self.workspace_root)}
+            }),
             _ => json!({
                 "jsonrpc":"2.0",
                 "id":id,
@@ -248,6 +305,23 @@ impl Session {
             let _ = self.stdin.flush();
         }
     }
+}
+
+fn workspace_roots(root: &str) -> Vec<Value> {
+    let root = root.trim();
+    if root.is_empty() {
+        return Vec::new();
+    }
+    let path = std::path::Path::new(root);
+    let Ok(uri) = url::Url::from_directory_path(path) else {
+        return Vec::new();
+    };
+    let name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .filter(|value| !value.is_empty())
+        .unwrap_or(root);
+    vec![json!({"uri": uri.as_str(), "name": name})]
 }
 
 fn spawn_session(
@@ -335,11 +409,325 @@ fn spawn_session(
         rx,
         stderr_log,
         next_id: 1,
+        workspace_root: cwd.to_string(),
+        capabilities: json!({}),
+        server_info: json!({}),
     })
 }
 
-/// Launch an MCP server, run the initialize handshake, and return its tool list.
-/// Replaces any existing session of the same name.
+fn list_capability_pages(
+    session: &mut Session,
+    method: &str,
+    field: &str,
+    deadline: Instant,
+    max_items: usize,
+) -> Result<Vec<Value>, String> {
+    let mut items = Vec::new();
+    let mut cursor: Option<String> = None;
+    let mut seen_cursors = HashSet::new();
+    for page_index in 0..MAX_TOOL_PAGES {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(format!("MCP 连接超时（{method}）"));
+        }
+        let params = cursor
+            .as_ref()
+            .map(|value| json!({"cursor": value}))
+            .unwrap_or_else(|| json!({}));
+        let result = session.request(method, params, remaining.as_secs().clamp(1, 15))?;
+        let page = result
+            .get(field)
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        if items.len().saturating_add(page.len()) > max_items {
+            let label = if field == "tools" { "工具" } else { field };
+            return Err(format!(
+                "MCP {label}数量超过安全上限（最多 {max_items} 个）"
+            ));
+        }
+        items.extend(page);
+        let next = result
+            .get("nextCursor")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string);
+        match next {
+            Some(next) if seen_cursors.insert(next.clone()) => {
+                if page_index + 1 == MAX_TOOL_PAGES {
+                    return Err(format!(
+                        "MCP {field} 分页超过上限（最多 {MAX_TOOL_PAGES} 页）"
+                    ));
+                }
+                cursor = Some(next);
+            }
+            _ => break,
+        }
+    }
+    Ok(items)
+}
+
+fn parse_tools(values: Vec<Value>) -> Result<Vec<McpTool>, String> {
+    let mut metadata_bytes = 0usize;
+    let mut out = Vec::new();
+    for tool in values {
+        metadata_bytes = metadata_bytes.saturating_add(
+            serde_json::to_vec(&tool)
+                .map_err(|error| format!("MCP 工具定义无法序列化: {error}"))?
+                .len(),
+        );
+        if metadata_bytes > MAX_TOOL_METADATA_BYTES {
+            return Err(format!(
+                "MCP 工具定义超过安全上限（每个服务最多 {MAX_TOOL_METADATA_BYTES} 字节）"
+            ));
+        }
+        let name = tool
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        if name.is_empty() {
+            continue;
+        }
+        out.push(McpTool {
+            name,
+            description: tool
+                .get("description")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string(),
+            input_schema: tool
+                .get("inputSchema")
+                .cloned()
+                .unwrap_or_else(|| json!({"type":"object","properties":{}})),
+            output_schema: tool
+                .get("outputSchema")
+                .cloned()
+                .unwrap_or_else(|| json!({})),
+            annotations: tool
+                .get("annotations")
+                .cloned()
+                .unwrap_or_else(|| json!({})),
+        });
+    }
+    Ok(out)
+}
+
+fn parse_resources(values: Vec<Value>) -> Vec<McpResource> {
+    values
+        .into_iter()
+        .filter_map(|resource| {
+            let uri = resource.get("uri")?.as_str()?.trim().to_string();
+            if uri.is_empty() {
+                return None;
+            }
+            Some(McpResource {
+                name: resource
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or(&uri)
+                    .to_string(),
+                uri,
+                description: resource
+                    .get("description")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+                mime_type: resource
+                    .get("mimeType")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+                annotations: resource
+                    .get("annotations")
+                    .cloned()
+                    .unwrap_or_else(|| json!({})),
+            })
+        })
+        .collect()
+}
+
+fn parse_resource_templates(values: Vec<Value>) -> Vec<McpResourceTemplate> {
+    values
+        .into_iter()
+        .filter_map(|resource| {
+            let uri_template = resource.get("uriTemplate")?.as_str()?.trim().to_string();
+            if uri_template.is_empty() {
+                return None;
+            }
+            Some(McpResourceTemplate {
+                name: resource
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or(&uri_template)
+                    .to_string(),
+                uri_template,
+                description: resource
+                    .get("description")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+                mime_type: resource
+                    .get("mimeType")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+                annotations: resource
+                    .get("annotations")
+                    .cloned()
+                    .unwrap_or_else(|| json!({})),
+            })
+        })
+        .collect()
+}
+
+fn parse_prompts(values: Vec<Value>) -> Vec<McpPrompt> {
+    values
+        .into_iter()
+        .filter_map(|prompt| {
+            let name = prompt.get("name")?.as_str()?.trim().to_string();
+            if name.is_empty() {
+                return None;
+            }
+            Some(McpPrompt {
+                name,
+                description: prompt
+                    .get("description")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+                arguments: prompt
+                    .get("arguments")
+                    .cloned()
+                    .unwrap_or_else(|| json!([])),
+            })
+        })
+        .collect()
+}
+
+fn connect_full_blocking(
+    name: String,
+    command: String,
+    args: Option<Vec<String>>,
+    env: Option<HashMap<String, String>>,
+    cwd: Option<String>,
+) -> Result<McpDiscovery, String> {
+    // The global map lock is held only long enough to clone this name's slot. Holding the
+    // per-name lock through spawn + handshake serializes connect/call/disconnect for one
+    // service while unrelated MCP services continue independently.
+    let slot = get_or_create_session_slot(&name)?;
+    let mut active = slot.lock().map_err(|_| "MCP session state poisoned")?;
+    let args = args.unwrap_or_default();
+    let env = env.unwrap_or_default();
+    let cwd = cwd.unwrap_or_default();
+    let mut session = spawn_session(&command, &args, &env, &cwd)?;
+    let connect_deadline = Instant::now() + Duration::from_secs(60);
+
+    // Handshake.
+    let initialized = session.request(
+        "initialize",
+        json!({
+            "protocolVersion": PROTOCOL_VERSION,
+            "capabilities": {
+                "roots": {"listChanged": false}
+            },
+            "clientInfo": { "name": "Michael-IDE", "version": "1.0" }
+        }),
+        45,
+    )?;
+    session.capabilities = initialized
+        .get("capabilities")
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    session.server_info = initialized
+        .get("serverInfo")
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    session.notify("notifications/initialized", json!({}));
+
+    let has_tools = session.capabilities.get("tools").is_some();
+    let has_resources = session.capabilities.get("resources").is_some();
+    let has_prompts = session.capabilities.get("prompts").is_some();
+    let tools = if has_tools {
+        parse_tools(list_capability_pages(
+            &mut session,
+            "tools/list",
+            "tools",
+            connect_deadline,
+            MAX_TOOLS_PER_SESSION,
+        )?)?
+    } else {
+        Vec::new()
+    };
+    let resources = if has_resources {
+        parse_resources(list_capability_pages(
+            &mut session,
+            "resources/list",
+            "resources",
+            connect_deadline,
+            MAX_TOOLS_PER_SESSION,
+        )?)
+    } else {
+        Vec::new()
+    };
+    let resource_templates = if has_resources {
+        parse_resource_templates(list_capability_pages(
+            &mut session,
+            "resources/templates/list",
+            "resourceTemplates",
+            connect_deadline,
+            MAX_TOOLS_PER_SESSION,
+        )?)
+    } else {
+        Vec::new()
+    };
+    let prompts = if has_prompts {
+        parse_prompts(list_capability_pages(
+            &mut session,
+            "prompts/list",
+            "prompts",
+            connect_deadline,
+            MAX_TOOLS_PER_SESSION,
+        )?)
+    } else {
+        Vec::new()
+    };
+    let capabilities = session.capabilities.clone();
+    let server_info = session.server_info.clone();
+
+    // Keep the stable per-name slot in the map. In particular, disconnect never removes this
+    // slot, so an in-flight call cannot resurrect an older session after a reconnect.
+    let old = active.replace(session);
+    drop(active);
+    drop(old);
+    Ok(McpDiscovery {
+        tools,
+        resources,
+        resource_templates,
+        prompts,
+        capabilities,
+        server_info,
+    })
+}
+
+/// Launch an MCP server and return complete negotiated capabilities.
+#[tauri::command]
+pub async fn mcp_connect_full(
+    name: String,
+    command: String,
+    args: Option<Vec<String>>,
+    env: Option<HashMap<String, String>>,
+    cwd: Option<String>,
+) -> Result<McpDiscovery, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        connect_full_blocking(name, command, args, env, cwd)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Backward-compatible tool-only discovery used by older clients and tests.
 #[tauri::command]
 pub async fn mcp_connect(
     name: String,
@@ -348,120 +736,7 @@ pub async fn mcp_connect(
     env: Option<HashMap<String, String>>,
     cwd: Option<String>,
 ) -> Result<Vec<McpTool>, String> {
-    tauri::async_runtime::spawn_blocking(move || -> Result<Vec<McpTool>, String> {
-        // The global map lock is held only long enough to clone this name's slot. Holding the
-        // per-name lock through spawn + handshake serializes connect/call/disconnect for one
-        // service while unrelated MCP services continue independently.
-        let slot = get_or_create_session_slot(&name)?;
-        let mut active = slot.lock().map_err(|_| "MCP session state poisoned")?;
-        let args = args.unwrap_or_default();
-        let env = env.unwrap_or_default();
-        let cwd = cwd.unwrap_or_default();
-        let mut session = spawn_session(&command, &args, &env, &cwd)?;
-        let connect_deadline = Instant::now() + Duration::from_secs(60);
-
-        // Handshake.
-        session.request(
-            "initialize",
-            json!({
-                "protocolVersion": PROTOCOL_VERSION,
-                "capabilities": {},
-                "clientInfo": { "name": "Michael-IDE", "version": "1.0" }
-            }),
-            45,
-        )?;
-        session.notify("notifications/initialized", json!({}));
-
-        // Discover every page. Some MCP servers paginate large tool registries; silently reading
-        // only page one makes the missing tools impossible for the model to call.
-        let mut tools = Vec::new();
-        let mut tool_metadata_bytes = 0usize;
-        let mut cursor: Option<String> = None;
-        let mut seen_cursors = HashSet::new();
-        for page_index in 0..MAX_TOOL_PAGES {
-            let remaining = connect_deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                return Err("MCP 连接超时（initialize + tools/list 超过 60s）".into());
-            }
-            let params = cursor
-                .as_ref()
-                .map(|value| json!({"cursor": value}))
-                .unwrap_or_else(|| json!({}));
-            let timeout = remaining.as_secs().clamp(1, 15);
-            let result = session.request("tools/list", params, timeout)?;
-            let page_tools = result
-                .get("tools")
-                .and_then(Value::as_array)
-                .cloned()
-                .unwrap_or_default();
-            if tools.len().saturating_add(page_tools.len()) > MAX_TOOLS_PER_SESSION {
-                return Err(format!(
-                    "MCP 工具数量超过安全上限（每个服务最多 {MAX_TOOLS_PER_SESSION} 个）"
-                ));
-            }
-            for tool in &page_tools {
-                let bytes = serde_json::to_vec(tool)
-                    .map_err(|error| format!("MCP 工具定义无法序列化: {error}"))?
-                    .len();
-                tool_metadata_bytes = tool_metadata_bytes.saturating_add(bytes);
-                if tool_metadata_bytes > MAX_TOOL_METADATA_BYTES {
-                    return Err(format!(
-                        "MCP 工具定义超过安全上限（每个服务最多 {MAX_TOOL_METADATA_BYTES} 字节）"
-                    ));
-                }
-            }
-            tools.extend(page_tools);
-            let next = result
-                .get("nextCursor")
-                .and_then(Value::as_str)
-                .filter(|value| !value.is_empty())
-                .map(str::to_string);
-            match next {
-                Some(next) if seen_cursors.insert(next.clone()) => {
-                    if page_index + 1 == MAX_TOOL_PAGES {
-                        return Err(format!(
-                            "MCP 工具分页超过安全上限（每个服务最多 {MAX_TOOL_PAGES} 页）"
-                        ));
-                    }
-                    cursor = Some(next);
-                }
-                _ => break,
-            }
-        }
-        let mut out = Vec::new();
-        for t in tools {
-            let tname = t
-                .get("name")
-                .and_then(|n| n.as_str())
-                .unwrap_or("")
-                .to_string();
-            if tname.is_empty() {
-                continue;
-            }
-            out.push(McpTool {
-                name: tname,
-                description: t
-                    .get("description")
-                    .and_then(|d| d.as_str())
-                    .unwrap_or("")
-                    .to_string(),
-                input_schema: t
-                    .get("inputSchema")
-                    .cloned()
-                    .unwrap_or_else(|| json!({"type":"object","properties":{}})),
-                annotations: t.get("annotations").cloned().unwrap_or_else(|| json!({})),
-            });
-        }
-
-        // Keep the stable per-name slot in the map. In particular, disconnect never removes this
-        // slot, so an in-flight call cannot resurrect an older session after a reconnect.
-        let old = active.replace(session);
-        drop(active);
-        drop(old);
-        Ok(out)
-    })
-    .await
-    .map_err(|e| e.to_string())?
+    Ok(mcp_connect_full(name, command, args, env, cwd).await?.tools)
 }
 
 fn append_content(text: &mut String, value: &str) {
@@ -601,50 +876,107 @@ fn flatten_tool_content(result: &Value) -> String {
     }
 }
 
-/// Call a tool on a connected MCP server. Returns text plus readable embedded-resource metadata.
+fn structured_call_result(result: Value) -> McpCallResult {
+    McpCallResult {
+        text: flatten_tool_content(&result),
+        content: result.get("content").cloned().unwrap_or_else(|| json!([])),
+        structured_content: result
+            .get("structuredContent")
+            .cloned()
+            .unwrap_or(Value::Null),
+        is_error: result
+            .get("isError")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        meta: result.get("_meta").cloned().unwrap_or_else(|| json!({})),
+    }
+}
+
+fn transport_session_error(error: &str) -> bool {
+    error.starts_with("MCP 请求超时")
+        || error.starts_with("MCP stdout protocol frame rejected:")
+        || error.starts_with("MCP 服务已退出")
+        || error.starts_with("写入 MCP 服务失败")
+}
+
+fn request_on_session(
+    name: &str,
+    method: &str,
+    params: Value,
+    timeout_secs: u64,
+) -> Result<Value, String> {
+    let slot = find_session_slot(name)?.ok_or_else(|| format!("MCP 服务「{name}」未连接"))?;
+    let mut active = slot.lock().map_err(|_| "MCP session state poisoned")?;
+    let session = active
+        .as_mut()
+        .ok_or_else(|| format!("MCP 服务「{name}」未连接"))?;
+    let response = session.request(method, params, timeout_secs);
+    let dead_process = response.is_err() && matches!(session.child.try_wait(), Ok(Some(_)));
+    let unhealthy = response
+        .as_ref()
+        .err()
+        .is_some_and(|error| transport_session_error(error));
+    if dead_process || unhealthy {
+        active.take();
+    }
+    response
+}
+
 #[tauri::command]
-pub async fn mcp_call(name: String, tool: String, args: Option<Value>) -> Result<String, String> {
-    tauri::async_runtime::spawn_blocking(move || -> Result<String, String> {
-        let slot = find_session_slot(&name)?.ok_or_else(|| format!("MCP 服务「{name}」未连接"))?;
-        let mut active = slot.lock().map_err(|_| "MCP session state poisoned")?;
-        let session = active
-            .as_mut()
-            .ok_or_else(|| format!("MCP 服务「{name}」未连接"))?;
-        let req = session.request(
+pub async fn mcp_call_full(
+    name: String,
+    tool: String,
+    args: Option<Value>,
+) -> Result<McpCallResult, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        request_on_session(
+            &name,
             "tools/call",
             json!({ "name": tool, "arguments": args.unwrap_or(json!({})) }),
             60,
-        );
-        // If the process exited or violated the bounded transport protocol, evict
-        // the session so Drop kills/reaps it. A mere timeout keeps a live server.
-        let protocol_violation = req
-            .as_ref()
-            .err()
-            .is_some_and(|error| error.starts_with("MCP stdout protocol frame rejected:"));
-        let dead =
-            req.is_err() && (protocol_violation || matches!(session.child.try_wait(), Ok(Some(_))));
-        let result = match req {
-            Ok(r) => r,
-            Err(e) => {
-                if dead {
-                    active.take();
-                }
-                return Err(e);
-            }
-        };
-
-        let text = flatten_tool_content(&result);
-        let is_error = result
-            .get("isError")
-            .and_then(|e| e.as_bool())
-            .unwrap_or(false);
-        if is_error {
-            return Err(format!("[工具报错] {text}"));
-        }
-        Ok(text)
+        )
+        .map(structured_call_result)
     })
     .await
     .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+pub async fn mcp_read_resource(name: String, uri: String) -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        request_on_session(&name, "resources/read", json!({"uri": uri}), 60)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+pub async fn mcp_get_prompt(
+    name: String,
+    prompt: String,
+    args: Option<Value>,
+) -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        request_on_session(
+            &name,
+            "prompts/get",
+            json!({"name": prompt, "arguments": args.unwrap_or(json!({}))}),
+            60,
+        )
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Call a tool on a connected MCP server. Returns text plus readable embedded-resource metadata.
+#[tauri::command]
+pub async fn mcp_call(name: String, tool: String, args: Option<Value>) -> Result<String, String> {
+    let result = mcp_call_full(name, tool, args).await?;
+    if result.is_error {
+        Err(format!("[工具报错] {}", result.text))
+    } else {
+        Ok(result.text)
+    }
 }
 
 /// Report whether a named session still has a live child process. Dead sessions are evicted so
@@ -665,6 +997,14 @@ pub async fn mcp_status(name: String) -> Result<bool, String> {
             None => return Ok(false),
         };
         if dead {
+            active.take();
+            return Ok(false);
+        }
+        let ping = active
+            .as_mut()
+            .expect("checked above")
+            .request("ping", json!({}), 3);
+        if ping.is_err() {
             active.take();
             return Ok(false);
         }
@@ -718,6 +1058,17 @@ mod tests {
         .await
     }
 
+    async fn connect_fixture_full(session_name: &str) -> Result<McpDiscovery, String> {
+        mcp_connect_full(
+            session_name.to_string(),
+            "node".into(),
+            Some(vec![fixture_path()]),
+            None,
+            Some(env!("CARGO_MANIFEST_DIR").into()),
+        )
+        .await
+    }
+
     #[test]
     fn media_content_keeps_bounded_data_for_the_ide_renderer() {
         let image = flatten_tool_content(&json!({
@@ -730,6 +1081,14 @@ mod tests {
             "content": [{"type": "resource", "resource": {"uri": "fixture://clip", "mimeType": "video/mp4", "blob": "AAAA"}}]
         }));
         assert!(video.contains("[MCP_MEDIA video video/mp4]"));
+    }
+
+    #[test]
+    fn roots_list_exposes_the_real_workspace_uri() {
+        let roots = workspace_roots(env!("CARGO_MANIFEST_DIR"));
+        assert_eq!(roots.len(), 1);
+        assert!(roots[0]["uri"].as_str().unwrap().starts_with("file://"));
+        assert_eq!(roots[0]["name"], "src-tauri");
     }
 
     #[test]
@@ -819,6 +1178,49 @@ mod tests {
 
         mcp_disconnect(session_name.clone()).await.unwrap();
         assert!(!mcp_status(session_name).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn full_discovery_keeps_tools_resources_prompts_and_structured_results() {
+        let session_name = format!("fixture-full-{}", std::process::id());
+        let discovery = connect_fixture_full(&session_name)
+            .await
+            .expect("full MCP discovery should connect");
+        assert_eq!(discovery.tools.len(), 2);
+        assert_eq!(discovery.resources.len(), 1);
+        assert_eq!(discovery.resource_templates.len(), 1);
+        assert_eq!(discovery.prompts.len(), 1);
+        assert!(discovery.capabilities.get("resources").is_some());
+        assert_eq!(discovery.server_info["name"], "michael-ide-test-fixture");
+
+        let result = mcp_call_full(
+            session_name.clone(),
+            "echo".into(),
+            Some(json!({"text":"structured"})),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.text, "structured");
+        assert_eq!(result.content[0]["type"], "text");
+        assert!(!result.is_error);
+
+        let resource = mcp_read_resource(session_name.clone(), "fixture://proof".into())
+            .await
+            .unwrap();
+        assert_eq!(resource["contents"][0]["text"], "resource body");
+        let prompt = mcp_get_prompt(
+            session_name.clone(),
+            "review".into(),
+            Some(json!({"target":"src/main.js"})),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            prompt["messages"][0]["content"]["text"],
+            "Review src/main.js"
+        );
+
+        mcp_disconnect(session_name).await.unwrap();
     }
 
     #[tokio::test]

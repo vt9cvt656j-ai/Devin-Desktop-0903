@@ -4,12 +4,16 @@ import { Shell } from "@/components/Shell";
 import { Billing } from "@/pages/Billing";
 import { Dashboard, type Tab } from "@/pages/Dashboard";
 import { api, type Catalog, type Me } from "@/lib/api";
-import { planIsActive, planLabel, setCreditDivisor } from "@/lib/format";
-import { DICTS, type Currency, type Lang } from "@/lib/i18n";
-import { cn } from "@/lib/utils";
+import { planIsActive, planLabel, setCreditDivisor, setMoneyLocale } from "@/lib/format";
+import { DICTS, LANGS, type Lang } from "@/lib/i18n";
 
-const TABS: Tab[] = ["overview", "usage", "settings", "integrations"];
-const CURRENCY_KEY = "mrday.currency";
+const LANG_KEY = "mrday.lang";
+const TABS: Tab[] = ["overview", "usage", "settings", "integrations", "devices"];
+
+/** Narrows an unknown stored or server value to a language this build actually has. */
+function isLang(v: unknown): v is Lang {
+  return typeof v === "string" && LANGS.some((l) => l.value === v);
+}
 
 function readTab(): Tab {
   const h = location.hash.replace("#", "") as Tab;
@@ -23,13 +27,60 @@ export default function App() {
   const [catalog, setCatalog] = useState<Catalog | null>(null);
   const [tab, setTab] = useState<Tab>(readTab);
   const [failed, setFailed] = useState(false);
-  const [currency, setCurrency] = useState<Currency>("usd");
-  /** True while the currency is the one the gateway inferred, not one the user picked. */
-  const [autoCurrency, setAutoCurrency] = useState(true);
+  /*
+   * Interface language.
+   *
+   * English is the default and the fallback: an unrecognised stored value (a locale that
+   * was removed, or a corrupted key) falls back rather than rendering a blank console.
+   * Held here, at the root, so switching it re-renders every page at once — the sidebar,
+   * the tables and the dates all read the same `lang`.
+   */
+  const [lang, setLang] = useState<Lang>(() => {
+    // Only the opening frame. The account's own choice arrives with /api/me a moment
+    // later and wins; this is here so the first paint is not English for someone who
+    // has already chosen otherwise on this machine.
+    try {
+      const saved = localStorage.getItem(LANG_KEY);
+      if (isLang(saved)) return saved;
+    } catch {
+      /* storage can be blocked; English is the answer either way */
+    }
+    return "en";
+  });
 
-  // Language follows the currency: someone paying in yuan is reading Chinese.
-  const lang: Lang = currency === "cny" ? "zh" : "en";
+  /*
+   * Written to the account, not just this browser.
+   *
+   * localStorage is updated first so the change is instant and survives a reload even
+   * if the request fails; the account write is what makes the choice follow the person
+   * to their next machine. A failed save is deliberately silent — the language has
+   * already changed on screen, and an error toast about a preference would be noise.
+   */
+  function pickLang(next: Lang) {
+    setLang(next);
+    try {
+      localStorage.setItem(LANG_KEY, next);
+    } catch {
+      /* a rejected write only means the choice is not remembered locally */
+    }
+    void api.updateProfile({ language: next }).catch(() => undefined);
+  }
+
   const t = DICTS[lang];
+
+  /*
+   * Set during render, not in an effect.
+   *
+   * Money is formatted from a module-level locale, and an effect runs *after* the render
+   * that already formatted it — and mutating module state does not schedule a re-render,
+   * so nothing corrected it afterwards either. Prices were left one language behind:
+   * switching English → German → Traditional Chinese printed "19,99 $" on a Chinese page.
+   *
+   * Doing it here is a side effect during render, which is normally worth avoiding. It is
+   * safe in this one case because it is idempotent, depends only on `lang`, and App is the
+   * root — so it has already run before any child formats a number.
+   */
+  setMoneyLocale(lang);
 
   const load = useCallback(async () => {
     try {
@@ -42,27 +93,12 @@ export default function App() {
       ]);
       setCreditDivisor(profile.raw_cents_per_credit_usd);
       setMe(profile);
+      // The account's language wins over whatever this browser remembered, so signing
+      // in on a new machine brings your language with you.
+      if (isLang(profile.language)) setLang(profile.language);
       if (cat) {
         setCreditDivisor(cat.raw_cents_per_credit_usd);
         setCatalog(cat);
-        // Currency still gets decided on the billing page alone. It also selects the
-        // interface language, so adopting the geo-inferred default here would swing a
-        // CN visitor's whole dashboard into Chinese without them asking for it.
-        if (onBilling) {
-          let saved: string | null = null;
-          try {
-            saved = localStorage.getItem(CURRENCY_KEY);
-          } catch {
-            /* storage may be blocked */
-          }
-          if (saved === "cny" || saved === "usd") {
-            setCurrency(saved);
-            setAutoCurrency(false);
-          } else {
-            setCurrency(cat.currency === "cny" ? "cny" : "usd");
-            setAutoCurrency(true);
-          }
-        }
       }
     } catch {
       setFailed(true);
@@ -84,40 +120,8 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    document.documentElement.lang = lang === "zh" ? "zh-CN" : "en";
+    document.documentElement.lang = lang;
   }, [lang]);
-
-  function pickCurrency(c: Currency) {
-    setCurrency(c);
-    setAutoCurrency(false);
-    try {
-      localStorage.setItem(CURRENCY_KEY, c);
-    } catch {
-      /* a rejected write only means the choice is not remembered */
-    }
-  }
-
-  /*
-   * Which currency to price the plan in — a different question from which language to
-   * render, even though `currency` state answers both on the billing page.
-   *
-   * Money should read the way the account actually transacts: a buyer charged in yuan
-   * wants to see ¥488, not a dollar figure they never paid. Language should not be
-   * dragged along with it — deriving `lang` from this would swing the whole dashboard
-   * into Chinese for anyone billed in CNY, which is not what "show me the price I paid"
-   * asked for. So this reads the buyer's saved choice, falls back to the country the
-   * gateway inferred, and stops there.
-   */
-  const priceCurrency: Currency = (() => {
-    let saved: string | null = null;
-    try {
-      saved = localStorage.getItem(CURRENCY_KEY);
-    } catch {
-      /* storage may be blocked; the inferred default still applies */
-    }
-    if (saved === "cny" || saved === "usd") return saved;
-    return catalog?.currency === "cny" ? "cny" : "usd";
-  })();
 
   if (failed) {
     return <div className="p-16 text-center text-muted-foreground">{t.loadFailed}</div>;
@@ -127,7 +131,7 @@ export default function App() {
   }
 
   const active = onBilling ? "/billing" : `/dashboard#${tab}`;
-  const planText = planIsActive(me.plan, me.plan_expires_at) ? planLabel(me.plan) : "Free";
+  const planText = planIsActive(me.plan, me.plan_expires_at) ? planLabel(me.plan, lang) : "Free";
 
   return (
     <Shell
@@ -138,39 +142,13 @@ export default function App() {
       name={[me.first_name, me.last_name].filter(Boolean).join(" ").trim()}
       avatar={me.avatar}
       planLabel={planText}
-      footer={
-        onBilling ? (
-          <div className="flex items-center justify-between gap-2 px-1">
-            <span className="text-[11px] text-muted-foreground">
-              {autoCurrency
-                ? `${t.autoCurrency}${catalog?.country ? ` (${catalog.country})` : ""}`
-                : t.manualCurrency}
-            </span>
-            <div className="flex gap-0.5 rounded-lg bg-muted p-0.5">
-              {(["cny", "usd"] as const).map((c) => (
-                <button
-                  key={c}
-                  type="button"
-                  onClick={() => pickCurrency(c)}
-                  className={cn(
-                    "rounded-md px-2.5 py-1 text-[11.5px] font-semibold transition-colors",
-                    currency === c ? "bg-card text-foreground" : "text-muted-foreground hover:text-foreground",
-                  )}
-                >
-                  {c.toUpperCase()}
-                </button>
-              ))}
-            </div>
-          </div>
-        ) : null
-      }
+      onLangChange={pickLang}
     >
       {onBilling && catalog ? (
         <Billing
           catalog={catalog}
           me={me}
           lang={lang}
-          currency={currency}
           onRedeemed={() => void load()}
         />
       ) : (
@@ -179,8 +157,8 @@ export default function App() {
           tab={tab}
           lang={lang}
           catalog={catalog}
-          currency={priceCurrency}
           onProfileSaved={() => void load()}
+          onLangChange={pickLang}
         />
       )}
     </Shell>

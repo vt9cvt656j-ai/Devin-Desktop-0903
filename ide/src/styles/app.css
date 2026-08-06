@@ -68,6 +68,18 @@
   box-sizing: border-box;
 }
 
+/* React 的挂载点。
+ *
+ * markup 现在渲染在 #root 里，而不是直接挂在 <body> 下。.layout 用的是
+ * `height: calc(100% - var(--titlebar-h) - var(--statusbar-h))` —— 百分比按**父元素**
+ * 解析，所以 #root 必须撑满 body，否则三栏区域算出来是 0，整个界面塌掉。
+ *
+ * 只给高度，不给 display/flex：原来的 <body> 也不是 flex 容器，加了反而会改变
+ * titlebar / .layout / statusbar 三者的排布。 */
+#root {
+  height: 100%;
+}
+
 html,
 body {
   margin: 0;
@@ -5509,8 +5521,7 @@ body.zen-mode .editor {
 .agent-tool-step--download .atc-type-icon { background: #e8f0fe; color: #1565c0; }
 .agent-tool-step--current_time .atc-type-icon { background: #fff3e0; color: #e65100; }
 .agent-tool-step--game_scaffold .atc-type-icon { background: #e8f5e9; color: #2e7d32; }
-.agent-tool-step--game_asset .atc-type-icon { background: #e3f2fd; color: #1565c0; }
-.agent-tool-step--deep_search .atc-type-icon { background: #ede7f6; color: #4527a0; }
+.agent-tool-step--game_asset .atc-type-icon { background: #e3f2fd; color: #1565c0; } .atc-type-icon { background: #ede7f6; color: #4527a0; }
 .agent-tool-step--ksearch .atc-type-icon { background: #e0f2f1; color: #00897b; }
 .agent-tool-step--mcp .atc-type-icon { background: #fce4ec; color: #c62828; }
 .agent-tool-step--computer .atc-type-icon,
@@ -6538,8 +6549,8 @@ button.agent-plan__fold--toggle:focus-visible { outline: 2px solid #1a73e8; outl
 .dark .agent-tool-step--game_scaffold .atc-type-icon { background: #4caf501a; }
 [data-theme="dark"] .agent-tool-step--game_asset .atc-type-icon,
 .dark .agent-tool-step--game_asset .atc-type-icon { background: #42a5f51a; }
-[data-theme="dark"] .agent-tool-step--deep_search .atc-type-icon,
-.dark .agent-tool-step--deep_search .atc-type-icon { background: #7c4dff1a; }
+[data-theme="dark"] .atc-type-icon,
+.dark .atc-type-icon { background: #7c4dff1a; }
 [data-theme="dark"] .agent-tool-step--ksearch .atc-type-icon,
 .dark .agent-tool-step--ksearch .atc-type-icon { background: #26a69a1a; }
 [data-theme="dark"] .agent-tool-step--mcp .atc-type-icon,

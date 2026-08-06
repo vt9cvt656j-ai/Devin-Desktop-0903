@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { Camera, ChevronLeft, ChevronRight } from "lucide-react";
+import { Camera, ChevronLeft, ChevronRight, Globe, Monitor, Smartphone } from "lucide-react";
 
 import { Avatar, AvatarFallback, AvatarImage } from "@/components/ui/avatar";
 import { BRAND_MARKS } from "@/components/BrandMarks";
@@ -8,6 +8,7 @@ import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { Select } from "@/components/ui/select";
 import { Separator } from "@/components/ui/separator";
 import {
   Table,
@@ -23,12 +24,15 @@ import {
   signOut,
   type Catalog,
   type DesktopProbe,
+  type DeviceSession,
   type Integration,
+  type SessionList,
   type Me,
   type Usage,
 } from "@/lib/api";
 import {
   formatDate,
+  num,
   formatDateTime,
   planIsActive,
   planLabel,
@@ -36,7 +40,7 @@ import {
   timeUntil,
   usd,
 } from "@/lib/format";
-import { DICTS, type Currency, type Lang } from "@/lib/i18n";
+import { DICTS, LANGS, type Lang } from "@/lib/i18n";
 import { ACCEPTED, AvatarError, fileToAvatarDataUrl } from "@/lib/avatar";
 import { cn } from "@/lib/utils";
 
@@ -48,7 +52,7 @@ import { cn } from "@/lib/utils";
  */
 const RELEASES = "https://www.michaelide.xyz/#download";
 
-export type Tab = "overview" | "usage" | "settings" | "integrations";
+export type Tab = "overview" | "usage" | "settings" | "integrations" | "devices";
 
 /**
  * Centred, not left-aligned. These sit in a row of three: ragged left-aligned blocks of
@@ -566,10 +570,10 @@ function UsageTable({
                 ) : null}
               </TableCell>
               <TableCell className="text-right tabular-nums">
-                {r.prompt_tokens == null ? "—" : r.prompt_tokens.toLocaleString()}
+                {r.prompt_tokens == null ? "—" : num(r.prompt_tokens)}
               </TableCell>
               <TableCell className="text-right tabular-nums">
-                {r.completion_tokens == null ? "—" : r.completion_tokens.toLocaleString()}
+                {r.completion_tokens == null ? "—" : num(r.completion_tokens)}
               </TableCell>
               <TableCell className="text-right tabular-nums">
                 {r.free_points_spent > 0
@@ -649,22 +653,308 @@ function UsageTable({
   );
 }
 
+/**
+ * Where the account is signed in, one card per kind of client.
+ *
+ * Split into three rather than listed together because the question people actually ask
+ * is "what is signed in on my phone?" — and because an empty group is worth showing: a
+ * Mobile app card reading "not signed in on any device of this kind" is an answer, where
+ * a device simply missing from one long list is not.
+ *
+ * A revoke takes effect on that device's very next request — the gateway checks the
+ * session on every authenticated call — so there is no pending state. The row just goes.
+ */
+/** Devices per page, per group. Matches the reference: a short list, not a log. */
+const DEVICE_PAGE_SIZE = 5;
+
+/**
+ * The device's name, in the reader's language.
+ *
+ * Composed here rather than taken from the server's `label`, which is finished English —
+ * so "Desktop app on macOS" stayed exactly that in Japanese. The browser and platform are
+ * proper nouns and stay as they are; only the connector and the fallback nouns translate.
+ */
+function deviceLabel(row: DeviceSession, lang: Lang): string {
+  const t = DICTS[lang];
+  const what =
+    row.browser ??
+    (row.kind === "desktop" ? t.desktopGroup : row.kind === "mobile" ? t.mobileGroup : t.browserGroup);
+  return row.platform ? `${what} ${t.deviceOn} ${row.platform}` : what;
+}
+
+function DeviceGroup({
+  title,
+  rows,
+  icon: Icon,
+  lang,
+  busy,
+  onRevoke,
+}: {
+  title: string;
+  rows: DeviceSession[];
+  icon: typeof Globe;
+  lang: Lang;
+  busy: string | null;
+  onRevoke: (row: DeviceSession) => void;
+}) {
+  const t = DICTS[lang];
+  const [page, setPage] = useState(1);
+
+  const total = rows.length;
+  const pageCount = Math.max(1, Math.ceil(total / DEVICE_PAGE_SIZE));
+  // Derived, not stored: revoking the last row of the last page would otherwise strand
+  // the reader on a page that no longer exists.
+  const current = Math.min(page, pageCount);
+  const from = (current - 1) * DEVICE_PAGE_SIZE;
+  const visible = rows.slice(from, from + DEVICE_PAGE_SIZE);
+  const empty = total === 0;
+
+  const columns = [t.deviceCol, t.ipCol, t.createdCol, t.lastActiveCol];
+
+  return (
+    <Card className="overflow-hidden p-0">
+      <div className="flex items-center gap-3.5 px-6 pb-4 pt-5">
+        {/* The icon carries the category, so the rows below do not repeat it. */}
+        <span className="grid size-9 shrink-0 place-items-center rounded-[10px] bg-muted text-muted-foreground">
+          <Icon className="size-[18px]" />
+        </span>
+        <div className="min-w-0">
+          <div className="text-[15px] font-semibold tracking-tight">{title}</div>
+          <div className="mt-0.5 text-[12.5px] text-muted-foreground">
+            {fill(t.signedInCount, { n: total })}
+          </div>
+        </div>
+      </div>
+
+      {/*
+       * The header row is rendered whether or not there is anything under it. An empty
+       * group that also dropped its column headings changed shape from its neighbours,
+       * so the three cards stopped reading as one set — and "nothing here" is easier to
+       * trust when you can still see what would have been listed.
+       */}
+      <div className="overflow-x-auto border-t border-border">
+        <Table>
+          <TableHeader>
+            <TableRow className="hover:bg-transparent">
+              {columns.map((h) => (
+                <TableHead
+                  key={h}
+                  className="h-10 px-6 text-[11.5px] font-medium normal-case tracking-normal"
+                >
+                  {h}
+                </TableHead>
+              ))}
+              <TableHead className="px-6" />
+            </TableRow>
+          </TableHeader>
+          <TableBody>
+            {empty ? (
+              <TableRow className="hover:bg-transparent">
+                <TableCell
+                  colSpan={columns.length + 1}
+                  className="px-6 py-6 text-center text-[13px] text-muted-foreground"
+                >
+                  {t.noneSignedIn}
+                </TableCell>
+              </TableRow>
+            ) : (
+              visible.map((row) => (
+                <TableRow key={row.id}>
+                  <TableCell className="px-6 py-3.5">
+                    <div className="flex items-center gap-2.5">
+                      <span className="font-medium">{deviceLabel(row, lang)}</span>
+                      {row.current ? (
+                        <Badge variant="outline" className="whitespace-nowrap font-normal">
+                          {t.thisDevice}
+                        </Badge>
+                      ) : null}
+                    </div>
+                  </TableCell>
+                  {/* Monospaced so addresses line up down the column and an unfamiliar
+                      one is obvious at a glance — the entire point of showing it. */}
+                  <TableCell className="whitespace-nowrap px-6 py-3.5 font-mono text-[12.5px] text-muted-foreground">
+                    {row.ip || "—"}
+                  </TableCell>
+                  <TableCell className="whitespace-nowrap px-6 py-3.5 text-[13px] text-muted-foreground">
+                    {formatDateTime(row.created_at, lang)}
+                  </TableCell>
+                  <TableCell className="whitespace-nowrap px-6 py-3.5 text-[13px] text-muted-foreground">
+                    {formatDateTime(row.last_seen_at, lang)}
+                  </TableCell>
+                  <TableCell className="px-6 py-3.5 text-right">
+                    {/* Bordered, not a ghost. Signing a device out is the only thing
+                        this page does, and a control you have to hunt for is not one
+                        people trust — it still turns red on hover to mark it as the
+                        destructive option. */}
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      className="h-8 px-3.5 hover:border-destructive/40 hover:bg-destructive/10 hover:text-destructive"
+                      disabled={busy === row.id}
+                      onClick={() => onRevoke(row)}
+                    >
+                      {busy === row.id ? t.revoking : t.revoke}
+                    </Button>
+                  </TableCell>
+                </TableRow>
+              ))
+            )}
+          </TableBody>
+        </Table>
+      </div>
+
+      {pageCount > 1 ? (
+        <div className="flex flex-col-reverse items-center justify-between gap-3 border-t border-border px-6 py-3 sm:flex-row">
+          <p className="text-xs tabular-nums text-muted-foreground">
+            {fill(t.showingRange, { from: from + 1, to: from + visible.length, total })}
+          </p>
+          <nav className="flex items-center gap-1" aria-label={title}>
+            <Button
+              variant="outline"
+              size="sm"
+              className="px-2.5"
+              disabled={current === 1}
+              onClick={() => setPage(current - 1)}
+              aria-label={t.pagePrev}
+            >
+              <ChevronLeft />
+              <span className="hidden sm:inline">{t.pagePrev}</span>
+            </Button>
+            <div className="hidden items-center gap-1 sm:flex">
+              {pageWindow(current, pageCount).map((p, i) =>
+                p === "gap" ? (
+                  <span key={`gap-${i}`} aria-hidden className="px-1 text-sm text-muted-foreground">
+                    …
+                  </span>
+                ) : (
+                  <Button
+                    key={p}
+                    size="sm"
+                    variant={p === current ? "default" : "ghost"}
+                    className="w-9 px-0 tabular-nums"
+                    aria-current={p === current ? "page" : undefined}
+                    aria-label={fill(t.goToPage, { page: p })}
+                    onClick={() => setPage(p)}
+                  >
+                    {p}
+                  </Button>
+                ),
+              )}
+            </div>
+            <span className="px-2 text-sm tabular-nums text-muted-foreground sm:hidden">
+              {current} / {pageCount}
+            </span>
+            <Button
+              variant="outline"
+              size="sm"
+              className="px-2.5"
+              disabled={current === pageCount}
+              onClick={() => setPage(current + 1)}
+              aria-label={t.pageNext}
+            >
+              <span className="hidden sm:inline">{t.pageNext}</span>
+              <ChevronRight />
+            </Button>
+          </nav>
+        </div>
+      ) : null}
+    </Card>
+  );
+}
+
+function Devices({ lang }: { lang: Lang }) {
+  const t = DICTS[lang];
+  const [data, setData] = useState<SessionList | null>(null);
+  const [busy, setBusy] = useState<string | null>(null);
+  const [note, setNote] = useState<{ text: string; ok: boolean } | null>(null);
+
+  const load = () => {
+    void api
+      .sessions()
+      .then(setData)
+      .catch(() => setData({ sessions: [], current_tracked: true }));
+  };
+  useEffect(load, []);
+
+  async function revoke(row: DeviceSession) {
+    // Revoking the session you are reading from logs this browser out, so it is the one
+    // case worth stopping for. Every other row is another device and needs no ceremony.
+    if (row.current && !window.confirm(t.revokeSelfWarning)) return;
+    setBusy(row.id);
+    setNote(null);
+    try {
+      await api.revokeSession(row.id);
+      if (row.current) {
+        // The token in this tab is dead from here on; anything else it tried would only
+        // bounce off the gate.
+        signOut();
+        return;
+      }
+      setNote({ text: t.deviceRevoked, ok: true });
+      load();
+    } catch (e) {
+      setNote({ text: e instanceof Error ? e.message : t.integrationError, ok: false });
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  const all = data?.sessions ?? [];
+  const groups = [
+    { title: t.browserGroup, icon: Globe, rows: all.filter((r) => r.kind === "web") },
+    { title: t.desktopGroup, icon: Monitor, rows: all.filter((r) => r.kind === "desktop") },
+    { title: t.mobileGroup, icon: Smartphone, rows: all.filter((r) => r.kind === "mobile") },
+  ];
+
+  return (
+    <div className="max-w-[1080px]">
+      <h1 className="text-xl font-semibold tracking-tight">{t.devices}</h1>
+      <p className="mb-6 mt-0.5 text-[13.5px] text-muted-foreground">{t.devicesLede}</p>
+
+      {data && !data.current_tracked ? (
+        <p className="mb-4 rounded-xl border border-border bg-muted px-4 py-3 text-[13px] text-muted-foreground">
+          {t.untrackedSession}
+        </p>
+      ) : null}
+      {note ? (
+        <p className={cn("mb-4 text-[13px]", note.ok ? "text-success" : "text-destructive")}>
+          {note.text}
+        </p>
+      ) : null}
+
+      <div className="flex flex-col gap-4">
+        {groups.map((g) => (
+          <DeviceGroup
+            key={g.title}
+            title={g.title}
+            icon={g.icon}
+            rows={g.rows}
+            lang={lang}
+            busy={busy}
+            onRevoke={(row) => void revoke(row)}
+          />
+        ))}
+      </div>
+    </div>
+  );
+}
+
 export function Dashboard({
   me,
   tab,
   lang,
   catalog,
-  currency,
   onProfileSaved,
+  onLangChange,
 }: {
   me: Me;
   tab: Tab;
   lang: Lang;
-  /** null when the catalogue could not be loaded; the plan card just omits the price. */
   catalog: Catalog | null;
-  currency: Currency;
   /** Re-reads the profile so the sidebar picks up a new name or picture immediately. */
   onProfileSaved: () => void;
+  /** Switches the whole console; the choice is persisted by the caller. */
+  onLangChange: (lang: Lang) => void;
 }) {
   const t = DICTS[lang];
   const [usage, setUsage] = useState<Usage | null>(null);
@@ -741,13 +1031,40 @@ export function Dashboard({
 
         <h2 className="mb-3 mt-8 text-sm font-semibold">{t.plan}</h2>
         <Card className="bg-muted px-6 py-1">
-          <Row k={t.currentPlan} v={planLabel(me.plan)} />
+          <Row k={t.currentPlan} v={planLabel(me.plan, lang)} />
           <Row k={t.expires} v={me.plan_expires_at ? formatDate(me.plan_expires_at, lang) : "—"} />
           <Row k={t.includedQuota} v={cap > 0 ? `${usd(cap)} ${t.perWindow}` : t.notIncluded} />
           <Row
             k={t.weeklyCap}
             v={me.quota_weekly_cap_cents > 0 ? `${usd(me.quota_weekly_cap_cents)} ${t.perWeek}` : t.noWeeklyCap}
           />
+        </Card>
+
+        <h2 className="mb-3 mt-8 text-sm font-semibold">{t.language}</h2>
+        <Card className="bg-muted p-6">
+          <p className="mb-4 text-[13.5px] leading-relaxed text-muted-foreground">
+            {t.languageNote}
+          </p>
+          <div className="max-w-xs">
+            <Label htmlFor="lang" className="mb-1.5 text-xs text-muted-foreground">
+              {t.interfaceLanguage}
+            </Label>
+            {/* Each option is written in its own language: someone looking for Japanese
+                is looking for 日本語, not for the word "Japanese" in a language they
+                cannot currently read. */}
+            <Select
+              id="lang"
+              className="h-11"
+              value={lang}
+              onChange={(e) => onLangChange(e.target.value as Lang)}
+            >
+              {LANGS.map((l) => (
+                <option key={l.value} value={l.value}>
+                  {l.label}
+                </option>
+              ))}
+            </Select>
+          </div>
         </Card>
 
         <h2 className="mb-3 mt-8 text-sm font-semibold">{t.session}</h2>
@@ -759,6 +1076,10 @@ export function Dashboard({
         </Card>
       </div>
     );
+  }
+
+  if (tab === "devices") {
+    return <Devices lang={lang} />;
   }
 
   if (tab === "integrations") {
@@ -886,14 +1207,14 @@ export function Dashboard({
 
         <Card className="items-center bg-muted p-6 text-center">
           <div className="mb-2.5 flex items-baseline justify-center gap-2.5">
-            <span className="text-lg font-semibold">{planLabel(me.plan)}</span>
+            <span className="text-lg font-semibold">{planLabel(me.plan, lang)}</span>
           </div>
           {/* What this plan costs, in the currency this console is showing. It is the
               catalogue price, not a receipt: an account can also be put on a plan by an
               operator grant or a redemption code, and those leave no order to quote. */}
           {planPrice ? (
             <p className="mb-1.5 text-2xl font-semibold tracking-tight tabular-nums">
-              {price(planPrice, currency)}
+              {price(planPrice)}
               {planPrice.duration_days ? (
                 <span className="ml-1.5 text-[13.5px] font-medium text-muted-foreground">
                   {fill(t.everyDays, { days: planPrice.duration_days })}

@@ -57,7 +57,9 @@ static SESSION: Mutex<Option<Session>> = Mutex::new(None);
 #[command]
 pub fn handoff_set_session(token: Option<String>, email: Option<String>) {
     let next = match (token, email) {
-        (Some(t), Some(e)) if !t.is_empty() && !e.is_empty() => Some(Session { token: t, email: e }),
+        (Some(t), Some(e)) if !t.is_empty() && !e.is_empty() => {
+            Some(Session { token: t, email: e })
+        }
         _ => None,
     };
     if let Ok(mut guard) = SESSION.lock() {
@@ -108,13 +110,24 @@ fn handle(mut stream: TcpStream) {
     let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
     let _ = stream.set_write_timeout(Some(Duration::from_secs(2)));
 
-    let Some(req) = read_request(&mut stream) else { return };
+    let Some(req) = read_request(&mut stream) else {
+        return;
+    };
     let origin = header(&req.headers, "origin").unwrap_or_default();
 
-    if !ALLOWED_ORIGINS.iter().chain(DEV_ORIGINS).any(|o| *o == origin) {
+    if !ALLOWED_ORIGINS
+        .iter()
+        .chain(DEV_ORIGINS)
+        .any(|o| *o == origin)
+    {
         // No CORS headers on this path: an unrecognised caller learns nothing, not
         // even whether anyone is signed in.
-        respond(&mut stream, "403 Forbidden", None, r#"{"error":"origin not allowed"}"#);
+        respond(
+            &mut stream,
+            "403 Forbidden",
+            None,
+            r#"{"error":"origin not allowed"}"#,
+        );
         return;
     }
 
@@ -126,7 +139,12 @@ fn handle(mut stream: TcpStream) {
     // Present on every real request. Its absence means the caller skipped the
     // preflight the browser would have forced, so it is not the sign-in page.
     if header(&req.headers, "x-mrday-handoff").is_none() {
-        respond(&mut stream, "400 Bad Request", Some(&origin), r#"{"error":"missing handoff header"}"#);
+        respond(
+            &mut stream,
+            "400 Bad Request",
+            Some(&origin),
+            r#"{"error":"missing handoff header"}"#,
+        );
         return;
     }
 
@@ -160,7 +178,12 @@ fn handle(mut stream: TcpStream) {
                 ),
             }
         }
-        _ => respond(&mut stream, "404 Not Found", Some(&origin), r#"{"error":"no such route"}"#),
+        _ => respond(
+            &mut stream,
+            "404 Not Found",
+            Some(&origin),
+            r#"{"error":"no such route"}"#,
+        ),
     }
 }
 
@@ -188,7 +211,12 @@ fn read_request(stream: &mut TcpStream) -> Option<Request> {
     let mut start = lines.next()?.split_whitespace();
     let method = start.next()?.to_string();
     // Ignore any query string: routes here take no parameters.
-    let path = start.next()?.split('?').next().unwrap_or_default().to_string();
+    let path = start
+        .next()?
+        .split('?')
+        .next()
+        .unwrap_or_default()
+        .to_string();
 
     let mut headers = Vec::new();
     for line in lines {
@@ -200,7 +228,11 @@ fn read_request(stream: &mut TcpStream) -> Option<Request> {
         }
     }
 
-    Some(Request { method, path, headers })
+    Some(Request {
+        method,
+        path,
+        headers,
+    })
 }
 
 fn header(headers: &[(String, String)], name: &str) -> Option<String> {
@@ -273,13 +305,19 @@ mod tests {
         let res = get_session(port, GOOD);
         assert!(res.starts_with("HTTP/1.1 200"), "{res}");
         assert!(res.contains(r#""signedIn":false"#), "{res}");
-        assert!(res.contains("Access-Control-Allow-Origin: https://code.mrday.one"), "{res}");
+        assert!(
+            res.contains("Access-Control-Allow-Origin: https://code.mrday.one"),
+            "{res}"
+        );
 
         let res = request(
             port,
             &format!("POST /handoff HTTP/1.1\r\nHost: 127.0.0.1\r\nOrigin: {GOOD}\r\nX-MrDay-Handoff: 1\r\n\r\n"),
         );
-        assert!(res.starts_with("HTTP/1.1 409"), "signed out means no token to hand over: {res}");
+        assert!(
+            res.starts_with("HTTP/1.1 409"),
+            "signed out means no token to hand over: {res}"
+        );
         assert!(!res.contains("secret-token"), "{res}");
 
         // --- half a session is not a session --------------------------------
@@ -288,14 +326,20 @@ mod tests {
         handoff_set_session(None, Some("dev@example.com".into()));
         assert!(get_session(port, GOOD).contains(r#""signedIn":false"#));
         handoff_set_session(Some(String::new()), Some("dev@example.com".into()));
-        assert!(get_session(port, GOOD).contains(r#""signedIn":false"#), "an empty token is not a session");
+        assert!(
+            get_session(port, GOOD).contains(r#""signedIn":false"#),
+            "an empty token is not a session"
+        );
 
         // --- signed in ------------------------------------------------------
         handoff_set_session(Some("secret-token".into()), Some("dev@example.com".into()));
         let res = get_session(port, GOOD);
         assert!(res.contains(r#""signedIn":true"#), "{res}");
         assert!(res.contains("dev@example.com"), "{res}");
-        assert!(!res.contains("secret-token"), "/session reports who, never the token: {res}");
+        assert!(
+            !res.contains("secret-token"),
+            "/session reports who, never the token: {res}"
+        );
 
         let res = request(
             port,
@@ -307,27 +351,45 @@ mod tests {
         // --- a page from anywhere else gets nothing --------------------------
         for hostile in ["https://evil.example", "null", "http://code.mrday.one"] {
             let res = get_session(port, hostile);
-            assert!(res.starts_with("HTTP/1.1 403"), "{hostile} must be refused: {res}");
+            assert!(
+                res.starts_with("HTTP/1.1 403"),
+                "{hostile} must be refused: {res}"
+            );
             assert!(
                 !res.contains("Access-Control-Allow-Origin"),
                 "a refused origin must not be handed a CORS grant: {res}"
             );
-            assert!(!res.contains("dev@example.com"), "{hostile} learned who is signed in: {res}");
+            assert!(
+                !res.contains("dev@example.com"),
+                "{hostile} learned who is signed in: {res}"
+            );
 
             let res = request(
                 port,
                 &format!("POST /handoff HTTP/1.1\r\nHost: 127.0.0.1\r\nOrigin: {hostile}\r\nX-MrDay-Handoff: 1\r\n\r\n"),
             );
-            assert!(!res.contains("secret-token"), "{hostile} lifted the session token: {res}");
+            assert!(
+                !res.contains("secret-token"),
+                "{hostile} lifted the session token: {res}"
+            );
         }
 
         // A request with no Origin at all is not the sign-in page either.
-        let res = request(port, "GET /session HTTP/1.1\r\nHost: 127.0.0.1\r\nX-MrDay-Handoff: 1\r\n\r\n");
+        let res = request(
+            port,
+            "GET /session HTTP/1.1\r\nHost: 127.0.0.1\r\nX-MrDay-Handoff: 1\r\n\r\n",
+        );
         assert!(res.starts_with("HTTP/1.1 403"), "{res}");
 
         // --- the header that forces the preflight ---------------------------
-        let res = request(port, &format!("GET /session HTTP/1.1\r\nHost: 127.0.0.1\r\nOrigin: {GOOD}\r\n\r\n"));
-        assert!(res.starts_with("HTTP/1.1 400"), "the handoff header is required: {res}");
+        let res = request(
+            port,
+            &format!("GET /session HTTP/1.1\r\nHost: 127.0.0.1\r\nOrigin: {GOOD}\r\n\r\n"),
+        );
+        assert!(
+            res.starts_with("HTTP/1.1 400"),
+            "the handoff header is required: {res}"
+        );
 
         // --- preflight ------------------------------------------------------
         let res = request(
@@ -339,7 +401,10 @@ mod tests {
             res.contains("Access-Control-Allow-Private-Network: true"),
             "without this Chrome refuses a public page reaching loopback: {res}"
         );
-        assert!(res.contains("Access-Control-Allow-Headers: content-type, x-mrday-handoff"), "{res}");
+        assert!(
+            res.contains("Access-Control-Allow-Headers: content-type, x-mrday-handoff"),
+            "{res}"
+        );
 
         // --- everything else --------------------------------------------------
         let res = request(
@@ -355,14 +420,20 @@ mod tests {
             &format!("POST /handoff HTTP/1.1\r\nHost: 127.0.0.1\r\nOrigin: {GOOD}\r\nX-MrDay-Handoff: 1\r\n\r\n"),
         );
         assert!(res.starts_with("HTTP/1.1 409"), "{res}");
-        assert!(!res.contains("secret-token"), "a logged-out app still handed over the token: {res}");
+        assert!(
+            !res.contains("secret-token"),
+            "a logged-out app still handed over the token: {res}"
+        );
     }
 
     #[test]
     fn a_release_build_trusts_only_the_sign_in_page() {
         assert_eq!(ALLOWED_ORIGINS, &["https://code.mrday.one"]);
         #[cfg(not(debug_assertions))]
-        assert!(DEV_ORIGINS.is_empty(), "a shipped app must not trust a local dev server");
+        assert!(
+            DEV_ORIGINS.is_empty(),
+            "a shipped app must not trust a local dev server"
+        );
     }
 
     /// Not part of the suite. Run it to hold the real listener open on the real ports
@@ -373,7 +444,10 @@ mod tests {
     #[ignore]
     fn live_listener_for_browser_testing() {
         start();
-        handoff_set_session(Some("live-test-token".into()), Some("dev@example.com".into()));
+        handoff_set_session(
+            Some("live-test-token".into()),
+            Some("dev@example.com".into()),
+        );
         println!("handoff listening; signed in as dev@example.com");
         std::thread::sleep(Duration::from_secs(120));
     }

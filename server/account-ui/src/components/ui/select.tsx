@@ -25,7 +25,7 @@ export function Select({ className, children, ...props }: ComponentProps<"select
       <select
         data-slot="select"
         className={cn(
-          "h-full w-full appearance-none rounded-lg border border-input bg-card pl-4 pr-10 text-base text-foreground transition-colors outline-none focus-visible:border-ring focus-visible:ring-2 focus-visible:ring-ring/25 disabled:cursor-not-allowed disabled:opacity-50 aria-[invalid=true]:border-destructive",
+          "h-full w-full cursor-pointer appearance-none rounded-lg border border-input bg-card pl-4 pr-10 text-base text-foreground transition-colors outline-none focus-visible:border-ring focus-visible:ring-2 focus-visible:ring-ring/25 disabled:cursor-not-allowed disabled:opacity-50 aria-[invalid=true]:border-destructive",
           className,
         )}
         {...props}

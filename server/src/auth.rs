@@ -29,6 +29,10 @@ pub struct User {
     pub first_name: String,
     #[serde(default)]
     pub last_name: String,
+    /// Interface language as a BCP-47 tag, or empty when never chosen. Clients treat an
+    /// unrecognised value as "not set" and fall back to English.
+    #[serde(default)]
+    pub language: String,
     pub plan: String,
     pub plan_expires_at: Option<chrono::DateTime<chrono::Utc>>,
     pub credits_cents: i64,
@@ -53,6 +57,14 @@ pub struct Claims {
     pub email: String,
     pub role: String,
     pub exp: i64,
+    /// The `sessions` row this token was issued for, so a single device can be signed
+    /// out without rotating the signing secret and ending everyone's session.
+    ///
+    /// Optional because tokens issued before sessions existed carry no `sid`, and those
+    /// people should not be logged out by a deploy. Such a token still authenticates but
+    /// cannot be listed or revoked individually; it ages out with the 30-day expiry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sid: Option<String>,
 }
 
 // ---- JWT extractor: any handler taking `claims: Claims` requires a valid token
@@ -91,21 +103,105 @@ impl FromRequestParts<AppState> for Claims {
         // immediately; a missing row (deleted user) now fails closed.
         let uid = uuid::Uuid::parse_str(&claims.sub)
             .map_err(|_| AppError::unauthorized("令牌主体无效"))?;
-        let role: Option<String> = sqlx::query_scalar("SELECT role FROM users WHERE id = $1")
-            .bind(uid)
-            .fetch_optional(&state.db)
-            .await?;
-        claims.role = role.ok_or_else(|| AppError::unauthorized("账号不存在或已注销"))?;
+        let sid = claims.sid.as_deref().and_then(|s| uuid::Uuid::parse_str(s).ok());
+
+        // One statement, because this runs on every authenticated request:
+        //   * read the role from the row (see above),
+        //   * confirm the session behind this token has not been revoked,
+        //   * and bump last_seen_at, but only when it is already stale.
+        //
+        // The `$2 IS NULL` arm is what keeps pre-sessions tokens working: they carry no
+        // sid, so there is no session to check and the request is judged on the user row
+        // alone — exactly as it was before.
+        let row: Option<(String, bool)> = sqlx::query_as(
+            "WITH live AS ( \
+                 SELECT id FROM sessions \
+                 WHERE id = $2 AND user_id = $1 AND revoked_at IS NULL \
+             ), touched AS ( \
+                 UPDATE sessions SET last_seen_at = now() \
+                 WHERE id IN (SELECT id FROM live) \
+                   AND last_seen_at < now() - interval '5 minutes' \
+                 RETURNING 1 \
+             ) \
+             SELECT u.role, ($2::uuid IS NULL OR EXISTS (SELECT 1 FROM live)) AS session_ok \
+             FROM users u WHERE u.id = $1",
+        )
+        .bind(uid)
+        .bind(sid)
+        .fetch_optional(&state.db)
+        .await?;
+
+        let (role, session_ok) = row.ok_or_else(|| AppError::unauthorized("账号不存在或已注销"))?;
+        if !session_ok {
+            return Err(AppError::unauthorized("该设备的登录已被移除，请重新登录"));
+        }
+        claims.role = role;
         Ok(claims)
     }
 }
 
-fn issue_token(cfg: &Config, user: &User) -> ApiResult<String> {
+/// Which kind of client signed in.
+///
+/// The hint the client sends wins because a Tauri window reports the system webview's
+/// User-Agent — indistinguishable from Safari — so sniffing alone would file every
+/// desktop sign-in as a browser. Anything unrecognised is called "web": guessing wrong
+/// in the direction of the least specific answer is better than inventing a device.
+pub(crate) fn device_kind(hint: Option<&str>, user_agent: &str) -> &'static str {
+    match hint.map(str::trim).unwrap_or("").to_ascii_lowercase().as_str() {
+        "desktop" => return "desktop",
+        "mobile" => return "mobile",
+        "web" => return "web",
+        _ => {}
+    }
+    let ua = user_agent.to_ascii_lowercase();
+    if ua.contains("tauri") || ua.contains("mrday") || ua.contains("electron") {
+        "desktop"
+    } else if ua.contains("iphone") || ua.contains("ipad") || ua.contains("android") || ua.contains("mobile") {
+        "mobile"
+    } else {
+        "web"
+    }
+}
+
+/// Open a `sessions` row for a sign-in and hand back a token that names it.
+///
+/// Every path that mints a token goes through here, so there is no way to end up with a
+/// token that has no session behind it and therefore cannot be revoked.
+async fn start_session(
+    state: &AppState,
+    user: &User,
+    headers: &axum::http::HeaderMap,
+    hint: Option<&str>,
+) -> ApiResult<String> {
+    let user_agent: String = headers
+        .get(axum::http::header::USER_AGENT)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .chars()
+        .take(200)
+        .collect();
+    let kind = device_kind(hint, &user_agent);
+
+    let sid: uuid::Uuid = sqlx::query_scalar(
+        "INSERT INTO sessions (user_id, kind, user_agent, ip) VALUES ($1,$2,$3,$4) RETURNING id",
+    )
+    .bind(user.id)
+    .bind(kind)
+    .bind(&user_agent)
+    .bind(client_ip(headers))
+    .fetch_one(&state.db)
+    .await?;
+
+    issue_token(&state.cfg, user, sid)
+}
+
+fn issue_token(cfg: &Config, user: &User, sid: uuid::Uuid) -> ApiResult<String> {
     let claims = Claims {
         sub: user.id.to_string(),
         email: user.email.clone(),
         role: user.role.clone(),
         exp: chrono::Utc::now().timestamp() + cfg.jwt_ttl_secs,
+        sid: Some(sid.to_string()),
     };
     Ok(encode(
         &Header::default(),
@@ -397,17 +493,32 @@ pub struct EmailReq {
 pub struct LoginReq {
     pub email: String,
     pub password: String,
+    /// What kind of client this is: "web", "desktop" or "mobile". Display only — it
+    /// grants nothing, so a client that lies about it gains nothing. Absent from older
+    /// clients, in which case the User-Agent decides.
+    #[serde(default)]
+    pub device: Option<String>,
 }
 #[derive(Deserialize)]
 pub struct RegisterReq {
     pub email: String,
     pub password: String,
     pub code: String,
+    /// What kind of client this is: "web", "desktop" or "mobile". Display only — it
+    /// grants nothing, so a client that lies about it gains nothing. Absent from older
+    /// clients, in which case the User-Agent decides.
+    #[serde(default)]
+    pub device: Option<String>,
 }
 #[derive(Deserialize)]
 pub struct CodeReq {
     pub email: String,
     pub code: String,
+    /// What kind of client this is: "web", "desktop" or "mobile". Display only — it
+    /// grants nothing, so a client that lies about it gains nothing. Absent from older
+    /// clients, in which case the User-Agent decides.
+    #[serde(default)]
+    pub device: Option<String>,
 }
 
 // ---- handlers --------------------------------------------------------------
@@ -489,6 +600,7 @@ pub async fn send_code(
 
 pub async fn register(
     State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
     Json(req): Json<RegisterReq>,
 ) -> ApiResult<Json<serde_json::Value>> {
     if !valid_email(&req.email) {
@@ -520,7 +632,7 @@ pub async fn register(
     .fetch_optional(&state.db)
     .await?
     .ok_or_else(|| AppError::bad("该邮箱已注册，请直接登录"))?;
-    let token = issue_token(&state.cfg, &user)?;
+    let token = start_session(&state, &user, &headers, req.device.as_deref()).await?;
     crate::realtime::record_event(
         &state,
         Some(user.id),
@@ -562,7 +674,7 @@ pub async fn login(
         .bind(user.id)
         .execute(&state.db)
         .await?;
-    let token = issue_token(&state.cfg, &user)?;
+    let token = start_session(&state, &user, &headers, req.device.as_deref()).await?;
     crate::realtime::record_event(
         &state,
         Some(user.id),
@@ -575,6 +687,7 @@ pub async fn login(
 
 pub async fn verify_code(
     State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
     Json(req): Json<CodeReq>,
 ) -> ApiResult<Json<serde_json::Value>> {
     if !take_code(&state, &req.email, &req.code).await? {
@@ -587,7 +700,7 @@ pub async fn verify_code(
         .bind(user.id)
         .execute(&state.db)
         .await?;
-    let token = issue_token(&state.cfg, &user)?;
+    let token = start_session(&state, &user, &headers, req.device.as_deref()).await?;
     crate::realtime::record_event(
         &state,
         Some(user.id),
@@ -778,6 +891,10 @@ pub struct ProfileReq {
     pub last_name: Option<String>,
     /// A `data:` URL, or "" to remove the current picture.
     pub avatar: Option<String>,
+    /// BCP-47 tag. Length-capped and character-restricted below rather than checked
+    /// against a list: the list of offered languages belongs to the client.
+    #[serde(default)]
+    pub language: Option<String>,
 }
 
 /// `POST /api/me/profile` — the account holder edits their own display name and picture.
@@ -796,6 +913,16 @@ pub async fn update_profile(
     // Flattened deliberately: "not sent" and "sent an explicit clear" both collapse to
     // None here, and the boolean bound to $4 below is what tells them apart.
     let avatar: Option<String> = req.avatar.as_deref().map(clean_avatar).transpose()?.flatten();
+    // A tag, not free text: letters and hyphens only, and short enough that no amount of
+    // it can bloat the row. Nothing here decides behaviour on the server — it is handed
+    // straight back to clients — but it is still stored input, so it is bounded.
+    let language: Option<String> = req.language.as_deref().map(|v| {
+        v.trim()
+            .chars()
+            .filter(|c| c.is_ascii_alphabetic() || *c == '-')
+            .take(16)
+            .collect::<String>()
+    });
 
     // COALESCE keeps the stored value when the client sent no opinion. The avatar needs
     // the extra flag because "sent nothing" and "sent an explicit clear" both arrive as
@@ -805,6 +932,7 @@ pub async fn update_profile(
            first_name = COALESCE($2, first_name), \
            last_name  = COALESCE($3, last_name), \
            avatar     = CASE WHEN $4 THEN $5 ELSE avatar END, \
+           language   = COALESCE($6, language), \
            updated_at = now() \
          WHERE id = $1",
     )
@@ -813,6 +941,7 @@ pub async fn update_profile(
     .bind(last.as_deref())
     .bind(req.avatar.is_some())
     .bind(avatar.as_deref())
+    .bind(language.as_deref())
     .execute(&state.db)
     .await?;
 
@@ -908,7 +1037,9 @@ mod privilege_source_tests {
             .expect("Claims extractor impl");
         let extractor = &extractor[..extractor.find("\nfn issue_token").unwrap_or(extractor.len())];
         assert!(
-            extractor.contains("SELECT role FROM users WHERE id = $1"),
+            extractor.contains("SELECT u.role")
+                && extractor.contains("FROM users u WHERE u.id = $1")
+                && extractor.contains("claims.role = role"),
             "the extractor must re-read role from the users row, never trust the JWT claim"
         );
         assert!(

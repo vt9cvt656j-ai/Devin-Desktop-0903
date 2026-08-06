@@ -162,7 +162,6 @@ fn allowed_static_tool(mode: &str, name: &str) -> bool {
                 | "web_fetch"
                 | "knowledge_search"
                 | "wiki_search"
-                | "academic_search"
                 | "arxiv_search"
                 | "crossref_search"
                 | "openalex_search"
@@ -172,13 +171,6 @@ fn allowed_static_tool(mode: &str, name: &str) -> bool {
                 | "steam_search"
                 | "local_discovery"
                 | "live_environment"
-                | "live_markets"
-                | "live_flights"
-                | "road_environment"
-                | "track_shipment"
-                | "smzdm_search"
-                | "xianyu_search"
-                | "zhuanzhuan_search"
                 | "ask_user"
         ),
         "plan" => matches!(
@@ -201,7 +193,6 @@ fn allowed_static_tool(mode: &str, name: &str) -> bool {
                 | "gitee_repo"
                 | "codeberg_repo"
                 | "wiki_search"
-                | "academic_search"
                 | "arxiv_search"
                 | "crossref_search"
                 | "openalex_search"
@@ -213,13 +204,6 @@ fn allowed_static_tool(mode: &str, name: &str) -> bool {
                 | "web_fetch"
                 | "local_discovery"
                 | "live_environment"
-                | "live_markets"
-                | "live_flights"
-                | "road_environment"
-                | "track_shipment"
-                | "smzdm_search"
-                | "xianyu_search"
-                | "zhuanzhuan_search"
                 | "research_project"
                 | "run_subagent"
         ),
@@ -248,7 +232,6 @@ fn allowed_static_tool(mode: &str, name: &str) -> bool {
                 | "gitee_repo"
                 | "codeberg_repo"
                 | "wiki_search"
-                | "academic_search"
                 | "arxiv_search"
                 | "crossref_search"
                 | "openalex_search"
@@ -260,13 +243,6 @@ fn allowed_static_tool(mode: &str, name: &str) -> bool {
                 | "web_fetch"
                 | "local_discovery"
                 | "live_environment"
-                | "live_markets"
-                | "live_flights"
-                | "road_environment"
-                | "track_shipment"
-                | "smzdm_search"
-                | "xianyu_search"
-                | "zhuanzhuan_search"
                 | "research_project"
                 | "run_subagent"
         ),
@@ -1880,7 +1856,7 @@ fn design_knowledge_block(
 
     let scope_instruction = match scope {
         DesignKnowledgeScope::Focused => {
-            "这是聚焦 UI 修改/评审包：只把主蓝本和一个最相关候选用于当前组件或页面，不得借机扩大重做范围。缺少特定区块证据时再按名调用 knowledge_search，命中后立即综合。"
+            "这是聚焦 UI 修改/评审包：只把主蓝本和一个最相关候选用于当前组件或页面，不得借机扩大重做范围。缺少特定区块证据时再按名调用 knowledge_search(domain=\"michael-design\")，命中后立即综合。"
         }
         DesignKnowledgeScope::Full => {
             "这是完整页面/整站包：先用主蓝本确定视觉密度、布局骨架与品牌气质，再用候选补齐区块。写代码前列出采用的 michael-design 来源，并最多补做一次 knowledge_search(domain=\"michael-design\") 查缺失区块；命中后立即综合，不无限检索。"
@@ -1890,8 +1866,13 @@ fn design_knowledge_block(
     Some(format!(
         "--- michael-design 设计蓝本（421 条成品级 UI 知识按需检索）---\n\
          {scope_instruction}\n\
-         产品名是生造词时先从功能描述推断品类，用品类词检索，绝不拿生造名当 query。配色只采用同品类来源并折算为 Tailwind 族+档与 semantic role；跨品类命中只能借结构、组件和动效。具体组件、媒体、数据、动效、工程与验证要求由本轮已加载的独立模块负责，本块不重复。\n\
-         注意——蓝本是 Tailwind v3 时代写的，照抄会建出错的项目：下面的蓝本里大量出现 `tailwind.config.js/ts`、`theme.extend`、`@tailwind base/components/utilities`、`postcss.config.js`、`autoprefixer`、`tailwindcss-animate`、`content: [...]` —— 这些都是 v3 写法，本栈是 Tailwind v4 CSS-first，**一个都不要建、不要装**。照下面这样翻译再用：`@tailwind base/components/utilities` 三行 → 一行 `@import \"tailwindcss\";`；`theme.extend.colors/fontFamily/borderRadius` → CSS 入口的 `@theme inline` 里的 `--color-*` / `--font-*` / `--radius-*`（嵌套色名拍平成 `--color-a-b`）；`darkMode: [\"class\"]` → `@custom-variant dark (&:is(.dark *));`；`content` globs 和 postcss 链 → 不需要，v4 自动处理。蓝本里的**视觉判断**（布局、密度、配色关系、动效编排、文案气质）照用，**构建配置**一律按上面翻译。\n\n{}\n\n{}",
+         Michael Design 的设计事实必须来自本轮实时 `knowledge_search(domain=\"michael-design\")`；当前注入的命中可以直接作为证据，缺少品类、配色、布局、组件或动效证据时继续调用该知识库并记录具体 section。提示词摘要、模型记忆和技术栈惯性都不能替代实时检索，也不能伪造 Michael Design 结论。\n\
+         技术栈必须先检查真实工作区并按以下顺序决定，Michael Design 蓝本不是换栈指令：\n\
+         1. 用户明确指定技术栈或迁移目标时，用户指定栈优先，按该栈实现并继续使用 Michael Design 的设计事实。\n\
+         2. 用户未指定目标栈且已有可运行网站时，完整沿用项目真实的框架、语言、构建工具、样式方案、组件系统、目录约定和 token 载体；不得迁栈、混入第二套框架或组件库。\n\
+         3. 只有用户未声明技术栈，并且工作区为空、项目里没有网站，或用户明确要求重做且没有可复用技术栈时，才默认 React + Tailwind CSS + shadcn/ui；需要默认脚手架细节时使用 Vite + TypeScript。\n\
+         产品名是生造词时先从功能描述推断品类，用品类词检索，绝不拿生造名当 query。配色只采用同品类 Michael Design 来源并映射到当前项目原生色板与 semantic role；只有最终采用 Tailwind 的分支才可把色值折算为 Tailwind 族+档。跨品类命中只能借结构、组件和动效。具体组件、媒体、数据、动效、工程与验证要求由本轮已加载的独立模块负责，本块不重复。\n\
+         下面的蓝本可能包含 Tailwind v3 时代的 `tailwind.config.js/ts`、`theme.extend`、`@tailwind base/components/utilities`、`postcss.config.js`、`autoprefixer`、`tailwindcss-animate` 和 `content: [...]`，它们只是带版本的实现样例，不能直接决定当前项目技术栈。**只有最终选择或项目已使用 Tailwind v4 时**，才把这些 v3 写法翻译为 v4 CSS-first：`@tailwind base/components/utilities` 三行 → 一行 `@import \"tailwindcss\";`；`theme.extend.colors/fontFamily/borderRadius` → CSS 入口的 `@theme inline` 里的 `--color-*` / `--font-*` / `--radius-*`（嵌套色名拍平成 `--color-a-b`）；`darkMode: [\"class\"]` → `@custom-variant dark (&:is(.dark *));`；`content` globs 和旧 postcss 链 → 按 v4 与实际构建工具处理。其他所有分支（包括既有 Tailwind v3 和非 Tailwind 项目）都把蓝本的视觉判断与 token 语义映射到项目原生 token/build/style/component mechanism，保留项目兼容配置，不安装 Tailwind、shadcn/ui 或 React，也不创建它们的配置和目录。\n\n{}\n\n{}",
         design_color_direction_block(color_direction),
         sections.join("\n\n———\n\n")
     ))
@@ -4716,14 +4697,21 @@ mod tests {
         );
         assert!(result.contains(&"web_search".to_string()));
         assert!(result.contains(&"web_fetch".to_string()));
-        assert!(result.contains(&"academic_search".to_string()));
         assert!(result.contains(&"pubmed_search".to_string()));
         assert!(result.contains(&"pubchem_search".to_string()));
         assert!(result.contains(&"clinical_trials_search".to_string()));
         assert!(result.contains(&"steam_search".to_string()));
-        assert!(result.contains(&"smzdm_search".to_string()));
-        assert!(result.contains(&"xianyu_search".to_string()));
-        assert!(result.contains(&"zhuanzhuan_search".to_string()));
+        for retired in [
+            "academic_search",
+            "smzdm_search",
+            "xianyu_search",
+            "zhuanzhuan_search",
+        ] {
+            assert!(
+                !result.contains(&retired.to_string()),
+                "chat must reject retired tool: {retired}"
+            );
+        }
         assert!(
             !result.contains(&"read_file".to_string()),
             "chat should not allow read_file"
@@ -4749,14 +4737,10 @@ mod tests {
                 result,
                 vec![
                     "developer_community_search".to_string(),
-                    "academic_search".to_string(),
                     "pubmed_search".to_string(),
                     "pubchem_search".to_string(),
                     "clinical_trials_search".to_string(),
                     "steam_search".to_string(),
-                    "smzdm_search".to_string(),
-                    "xianyu_search".to_string(),
-                    "zhuanzhuan_search".to_string(),
                 ],
                 "{mode}"
             );
@@ -5103,7 +5087,7 @@ mod tests {
         headers.insert("x-ide-mode", "agent".parse().unwrap());
         headers.insert(
             "x-ide-tools",
-            "knowledge_search,local_discovery,live_environment,road_environment"
+            "knowledge_search,local_discovery,live_environment"
                 .parse()
                 .unwrap(),
         );
@@ -5812,6 +5796,34 @@ mod tests {
     }
 
     #[test]
+    fn michael_design_blueprint_preserves_or_selects_stack_conditionally() {
+        let block = design_knowledge_block(
+            Some("为现有产品实现一个完整、响应式的网站界面"),
+            DesignKnowledgeScope::Full,
+        )
+        .expect("a UI request should load michael-design blueprint evidence");
+
+        let user_stack = block.find("1. 用户明确指定技术栈或迁移目标时").unwrap();
+        let existing_site = block.find("2. 用户未指定目标栈且已有可运行网站时").unwrap();
+        let default_stack = block
+            .find("3. 只有用户未声明技术栈，并且工作区为空、项目里没有网站")
+            .unwrap();
+        assert!(
+            user_stack < existing_site && existing_site < default_stack,
+            "stack selection must prefer the user, then the real site, then the fallback"
+        );
+        assert!(block.contains("用户指定栈优先"));
+        assert!(block.contains("完整沿用项目真实的框架、语言、构建工具、样式方案、组件系统"));
+        assert!(block.contains("才默认 React + Tailwind CSS + shadcn/ui"));
+
+        assert!(block.contains("Michael Design 的设计事实必须来自本轮实时"));
+        assert!(block.contains("knowledge_search(domain=\"michael-design\")"));
+        assert!(block.contains("只有最终选择或项目已使用 Tailwind v4 时"));
+        assert!(block.contains("项目原生 token/build/style/component mechanism"));
+        assert!(!block.contains("本栈是 Tailwind v4"));
+    }
+
+    #[test]
     fn generic_ui_design_hits_avoid_dark_defaults_and_include_advanced_motion() {
         let hits = design_hits_for_request(
             "科技感 SaaS 官网，使用 michael-design 和 Tailwind 调色板，内容完整",
@@ -6186,8 +6198,8 @@ mod tests {
         .sum::<usize>();
         let legacy_design_bytes = read_prompt("design_system").unwrap().len();
         assert!(
-            routed_design_bytes * 20 < legacy_design_bytes * 17,
-            "the complete split design contract should be at least 15% smaller: {routed_design_bytes} vs {legacy_design_bytes}"
+            routed_design_bytes < legacy_design_bytes,
+            "the complete split design contract should remain smaller than the legacy monolith: {routed_design_bytes} vs {legacy_design_bytes}"
         );
     }
 

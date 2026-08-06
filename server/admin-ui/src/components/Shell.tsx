@@ -1,7 +1,7 @@
 import type { ReactNode } from "react";
-import { BarChart3, Users, Receipt, Route, Calculator, Package, LogOut } from "lucide-react";
+import { BarChart3, Calculator, LogOut, Package, Receipt, Route, SlidersHorizontal, Users } from "lucide-react";
 import { cn } from "@/lib/utils";
-import { auth } from "@/lib/api";
+import { endConsoleSession } from "@/lib/api";
 
 /**
  * Six destinations, organised by what an operator DOES, not by database table. The old console
@@ -12,6 +12,7 @@ export const NAV = [
   { key: "overview", label: "总览", icon: BarChart3 },
   { key: "customers", label: "客户", icon: Users },
   { key: "billing", label: "收款", icon: Receipt },
+  { key: "settings", label: "设置", icon: SlidersHorizontal },
   { key: "routing", label: "模型线路", icon: Route },
   { key: "pricing", label: "定价试算", icon: Calculator },
   { key: "releases", label: "版本发布", icon: Package },
@@ -53,7 +54,7 @@ export function Shell({
         <div className="mt-auto shrink-0 border-t border-border p-3">
           <div className="truncate px-2 pb-2 text-xs text-muted-foreground">{email || "—"}</div>
           <button
-            onClick={() => { auth.clear(); onLogout(); }}
+            onClick={() => { onLogout(); void endConsoleSession(); }}
             className="flex w-full items-center gap-2 rounded-lg px-2 py-2 text-sm text-muted-foreground transition-colors hover:bg-secondary/60 hover:text-foreground"
           >
             <LogOut className="size-4" /> 退出登录

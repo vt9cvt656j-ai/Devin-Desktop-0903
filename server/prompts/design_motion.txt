@@ -2,9 +2,9 @@
 
 这段只在整站重设计、沉浸式页面、动效、滚动叙事、3D/WebGL 或明确需要高表现力时出现。先从 composition-repertoire 的 Motion & Effects Repertoire 选互相兼容的组合，禁止把所有效果堆在一页，也禁止只复制统一 fade-up 就声称高级动画。
 
-1. 标志性滚动叙事：GSAP 方案使用 GSAP + ScrollTrigger，并落实 scrub、pin 与触发区间；Motion 方案使用 useScroll + useTransform。标志性效果至少连接两个业务区块，说明进度、时间线和视觉目的。
+1. 标志性滚动叙事：优先沿用项目现有动画库；采用 GSAP + ScrollTrigger 方案时落实 scrub、pin 与触发区间，采用 Motion for React 时使用 useScroll + useTransform，其他框架使用其等价 API。标志性效果至少连接两个业务区块，说明进度、时间线和视觉目的。
 2. 可复用分区入场：用 SectionReveal/ScrollSection 与 IntersectionObserver 统一多区块入场，不在每处重复手写。
 3. 控件微交互：按钮、卡片、tab 和表单状态使用 150-250ms、ease-out 的克制反馈，如轻微抬升、阴影或状态过渡。
-4. 响应式编排：移动端用 matchMedia/useMediaQuery 调整 reveal 距离、duration、stagger 和并发上限，取消 pin、重型 canvas 或改成静态/短距离版本。
+4. 响应式编排：移动端用当前框架的 media-query API 或原生 matchMedia 调整 reveal 距离、duration、stagger 和并发上限，取消 pin、重型 canvas 或改成静态/短距离版本。
 
 所有动效必须支持 `prefers-reduced-motion` 静态兜底。平滑滚动可用 Lenis，富矢量动画用 Lottie；Three.js/WebGL 场景需要性能预算、加载态、降级路径和真实画布验证。

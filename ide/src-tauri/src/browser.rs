@@ -433,7 +433,9 @@ fn get_cdp_ws_url(port: u16) -> Option<String> {
     // 真实 Chrome/Edge 返回的就是 ws://127.0.0.1:<同一端口>/devtools/browser/<uuid>，
     // 所以只取 path 重新拼是无损的。
     let raw = json.get("webSocketDebuggerUrl")?.as_str()?;
-    let after_scheme = raw.strip_prefix("ws://").or_else(|| raw.strip_prefix("wss://"))?;
+    let after_scheme = raw
+        .strip_prefix("ws://")
+        .or_else(|| raw.strip_prefix("wss://"))?;
     let path = after_scheme.find('/').map(|i| &after_scheme[i..])?;
     if !path.starts_with("/devtools/") {
         return None;

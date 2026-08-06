@@ -51,6 +51,24 @@ export const api = {
   del: <T,>(p: string) => request<T>(p, { method: "DELETE" }),
 };
 
+/**
+ * 服务端注销。/console/ 的门禁是一张 HttpOnly cookie，JS 删不掉它 —— 只有服务端能，
+ * 而且服务端还要把 Redis 里的会话一起删掉，否则那张 cookie 到期前一直有效。
+ * 这是这套系统第一次有真正的注销，而不是"前端把 token 丢了"。
+ */
+export async function endConsoleSession() {
+  try {
+    await fetch("/api/admin/session/logout", {
+      method: "POST",
+      credentials: "same-origin",
+    });
+  } catch {
+    // 网络断了也要继续走本地清理和跳转：注销不能因为一个失败的请求就卡住。
+  }
+  auth.clear();
+  window.location.replace("/console/login");
+}
+
 export async function login(identity: string, password: string) {
   // The WIRE field is still `email` — auth.rs LoginReq { email, password } — but the server now
   // resolves it as an email OR a username (find_user tries email first, then username). Keep

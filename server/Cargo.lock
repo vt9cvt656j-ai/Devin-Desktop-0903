@@ -1229,6 +1229,7 @@ dependencies = [
  "dotenvy",
  "flate2",
  "futures-util",
+ "hmac",
  "jsonwebtoken",
  "lettre",
  "rand 0.8.6",

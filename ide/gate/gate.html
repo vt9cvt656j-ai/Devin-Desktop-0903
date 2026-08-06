@@ -1,103 +1,412 @@
 <!doctype html>
-<html lang="zh-CN">
+<html lang="en">
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <meta name="robots" content="noindex, nofollow" />
-<title>Michael IDE · 登录</title>
+<title>Mr.day One · Sign in</title>
+<link rel="icon" type="image/png" href="/console/logo.png" />
 <style>
-  :root { color-scheme: light dark; }
+  :root {
+    color-scheme: light dark;
+    --bg: #fafafa; --card: #fff; --ink: #09090b; --muted: #71717a;
+    --line: #e4e4e7; --field: #fff; --brand: #2563eb; --brand-ink: #fff;
+    --soft: #f4f4f5; --err: #dc2626; --ok: #059669;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #09090b; --card: #131316; --ink: #fafafa; --muted: #a1a1aa;
+      --line: #27272a; --field: #18181b; --soft: #1f1f23;
+    }
+  }
   * { box-sizing: border-box; }
   body {
     margin: 0; min-height: 100vh; display: flex; align-items: center; justify-content: center;
-    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
-    background: #f5f6f8; color: #1c1e21;
+    padding: 24px; background: var(--bg); color: var(--ink);
+    font-family: Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", sans-serif;
+    -webkit-font-smoothing: antialiased;
   }
-  @media (prefers-color-scheme: dark) { body { background: #16181c; color: #e7e9ee; } }
-  .card {
-    width: 360px; max-width: calc(100vw - 32px);
-    background: #fff; border-radius: 16px; padding: 28px 26px 24px;
-    box-shadow: 0 10px 40px rgba(0,0,0,.12);
-  }
-  @media (prefers-color-scheme: dark) { .card { background: #22252b; box-shadow: 0 10px 40px rgba(0,0,0,.5); } }
-  .brand { display: flex; align-items: center; gap: 10px; margin-bottom: 4px; }
-  .brand__logo { width: 30px; height: 30px; border-radius: 8px; background: #2f6bff; color: #fff; font-weight: 800; display: grid; place-items: center; font-size: 17px; }
-  .brand__name { font-size: 18px; font-weight: 700; }
-  .sub { font-size: 13px; opacity: .62; margin: 6px 0 20px; }
-  label { display: block; font-size: 12px; opacity: .7; margin: 12px 0 6px; }
+  .wrap { width: 100%; max-width: 400px; text-align: center; }
+  .logo { width: 56px; height: 56px; margin: 0 auto 22px; display: block; }
+  h1 { font-size: 26px; line-height: 1.25; letter-spacing: -0.02em; margin: 0 0 6px; font-weight: 650; }
+  .sub { margin: 0 0 28px; font-size: 15px; color: var(--muted); }
+  form { text-align: left; }
+  label { display: block; font-size: 12.5px; font-weight: 500; color: var(--muted); margin: 0 0 6px; }
   input {
-    width: 100%; padding: 11px 12px; font-size: 14px; border-radius: 10px;
-    border: 1px solid rgba(128,128,128,.32); background: transparent; color: inherit; outline: none;
+    width: 100%; padding: 13px 14px; font-size: 15px; border-radius: 10px; margin-bottom: 14px;
+    border: 1px solid var(--line); background: var(--field); color: inherit; outline: none;
+    transition: border-color .15s, box-shadow .15s;
   }
-  input:focus { border-color: #2f6bff; }
-  button {
-    width: 100%; margin-top: 20px; padding: 12px; font-size: 15px; font-weight: 600;
-    border: 0; border-radius: 10px; background: #2f6bff; color: #fff; cursor: pointer;
+  input:focus { border-color: var(--brand); box-shadow: 0 0 0 3px color-mix(in srgb, var(--brand) 18%, transparent); }
+  button.primary {
+    width: 100%; padding: 13px; font-size: 15px; font-weight: 600; cursor: pointer;
+    border: 0; border-radius: 10px; background: var(--brand); color: var(--brand-ink);
+    transition: opacity .15s, transform .08s;
   }
-  button:disabled { opacity: .6; cursor: default; }
-  .msg { min-height: 18px; margin-top: 12px; font-size: 12.5px; text-align: center; }
-  .msg.err { color: #e5484d; }
-  .msg.ok { color: #30a46c; }
+  button.primary:hover { opacity: .93; }
+  button.primary:active { transform: scale(.99); }
+  button.primary:disabled { opacity: .55; cursor: default; transform: none; }
+  /* No reserved height: an empty status row was pushing the providers ~50px down the
+     page. It collapses when there is nothing to say and takes its margin with it. */
+  .msg { margin-top: 12px; font-size: 13px; text-align: center; color: var(--muted); }
+  .msg:empty { display: none; }
+  .msg.err { color: var(--err); }
+  .msg.ok { color: var(--ok); }
+  .foot { margin-top: 20px; font-size: 14px; color: var(--muted); }
+  .link {
+    background: none; border: 0; padding: 0; font: inherit; font-weight: 600;
+    color: var(--brand); cursor: pointer;
+  }
+  .link:hover { text-decoration: underline; }
+  .back { margin-bottom: 12px; font-size: 13px; color: var(--muted); }
+  .hint { font-size: 12.5px; color: var(--muted); margin: -6px 0 14px; }
+  .or {
+    display: flex; align-items: center; gap: 12px;
+    margin: 20px 0 12px; font-size: 12px; color: var(--muted);
+  }
+  .or::before, .or::after { content: ""; flex: 1; height: 1px; background: var(--line); }
+  .providers { display: flex; flex-direction: column; gap: 10px; }
+  .pv {
+    display: flex; align-items: center; gap: 10px; width: 100%;
+    padding: 12px 14px; font: inherit; font-size: 14.5px; font-weight: 550;
+    border: 1px solid var(--line); border-radius: 10px;
+    background: var(--card); color: inherit; cursor: pointer;
+    transition: background .15s, border-color .15s;
+  }
+  .pv:hover:not(:disabled) { background: var(--soft); border-color: color-mix(in srgb, var(--ink) 22%, var(--line)); }
+  .pv:disabled { cursor: not-allowed; opacity: .5; }
+  .pv .mark { width: 18px; height: 18px; flex: none; }
+  .pv .txt { flex: 1; text-align: left; }
+  /* GitHub and Google are labelled "soon" because the gateway has no OAuth yet —
+     a button that looks live but cannot sign anyone in is worse than an honest one. */
+  .soon {
+    flex: none; font-size: 10px; font-weight: 600; letter-spacing: .04em;
+    text-transform: uppercase; color: var(--muted);
+    border: 1px solid var(--line); border-radius: 999px; padding: 2px 7px;
+  }
+  /* Applied only once the desktop app has actually answered on loopback, so the
+     promoted button never promises a handoff that cannot happen. */
+  .pv.is-live {
+    border-color: color-mix(in srgb, var(--brand) 45%, var(--line));
+    background: color-mix(in srgb, var(--brand) 6%, var(--card));
+  }
+  .pv.is-live:hover:not(:disabled) { background: color-mix(in srgb, var(--brand) 11%, var(--card)); }
+  .tag {
+    flex: none; font-size: 10px; font-weight: 600; letter-spacing: .04em;
+    text-transform: uppercase; color: var(--brand);
+    border: 1px solid color-mix(in srgb, var(--brand) 40%, transparent);
+    border-radius: 999px; padding: 2px 7px;
+  }
+  [hidden] { display: none !important; }
 </style>
 </head>
 <body>
-  <div class="card">
-    <div class="brand"><div class="brand__logo">M</div><div class="brand__name">Michael IDE</div></div>
-    <div class="sub">登录后进入网页版工作台。</div>
-    <form id="f" autocomplete="on">
-      <label for="email">邮箱</label>
-      <input id="email" type="email" required autocomplete="username" placeholder="you@example.com" />
-      <label for="pw">密码</label>
-      <input id="pw" type="password" required autocomplete="current-password" placeholder="••••••••" />
-      <button id="btn" type="submit">登录</button>
-      <div id="msg" class="msg"></div>
+  <main class="wrap">
+    <img class="logo" src="/console/logo.png" alt="" />
+    <h1 id="title">Welcome to Mr.day One</h1>
+    <p class="sub" id="subtitle">Create an account or sign in to continue</p>
+
+    <!-- step 1: which email -->
+    <form id="emailForm" autocomplete="on">
+      <label for="email">Email address</label>
+      <input id="email" type="email" required autocomplete="username" placeholder="you@company.com" />
+      <button class="primary" id="emailBtn" type="submit">Continue</button>
     </form>
-  </div>
+
+    <!-- step 2a: returning user -->
+    <form id="loginForm" autocomplete="on" hidden>
+      <p class="back"><button type="button" class="link" data-back>← <span id="loginEmail"></span></button></p>
+      <label for="pw">Password</label>
+      <input id="pw" type="password" required autocomplete="current-password" placeholder="••••••••" />
+      <button class="primary" id="loginBtn" type="submit">Log in</button>
+    </form>
+
+    <!-- step 2b: new user — register needs an emailed code -->
+    <form id="signupForm" autocomplete="on" hidden>
+      <p class="back"><button type="button" class="link" data-back>← <span id="signupEmail"></span></button></p>
+      <label for="code">Verification code</label>
+      <input id="code" type="text" inputmode="numeric" autocomplete="one-time-code" required placeholder="6-digit code" />
+      <p class="hint">We emailed you a code. It expires shortly.</p>
+      <label for="newpw">Choose a password</label>
+      <input id="newpw" type="password" required autocomplete="new-password" placeholder="At least 8 characters" minlength="8" />
+      <button class="primary" id="signupBtn" type="submit">Create account</button>
+    </form>
+
+    <div class="msg" id="msg"></div>
+
+    <div id="providers">
+      <div class="or">or</div>
+      <div class="providers">
+        <button class="pv" type="button" disabled aria-label="Continue with GitHub — not available yet">
+          <svg class="mark" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.012 8.012 0 0 0 16 8c0-4.42-3.58-8-8-8z"/></svg>
+          <span class="txt">Continue with GitHub</span>
+          <span class="soon">Soon</span>
+        </button>
+        <button class="pv" type="button" disabled aria-label="Continue with Google — not available yet">
+          <svg class="mark" viewBox="0 0 18 18" aria-hidden="true"><path fill="#4285F4" d="M17.64 9.2c0-.637-.057-1.251-.164-1.84H9v3.481h4.844a4.14 4.14 0 0 1-1.796 2.716v2.259h2.908c1.702-1.567 2.684-3.875 2.684-6.615z"/><path fill="#34A853" d="M9 18c2.43 0 4.467-.806 5.956-2.18l-2.908-2.259c-.806.54-1.837.86-3.048.86-2.344 0-4.328-1.584-5.036-3.711H.957v2.332A8.997 8.997 0 0 0 9 18z"/><path fill="#FBBC05" d="M3.964 10.71A5.41 5.41 0 0 1 3.682 9c0-.593.102-1.17.282-1.71V4.958H.957A8.996 8.996 0 0 0 0 9c0 1.452.348 2.827.957 4.042l3.007-2.332z"/><path fill="#EA4335" d="M9 3.58c1.321 0 2.508.454 3.44 1.345l2.582-2.58C13.463.891 11.426 0 9 0A8.997 8.997 0 0 0 .957 4.958L3.964 7.29C4.672 5.163 6.656 3.58 9 3.58z"/></svg>
+          <span class="txt">Continue with Google</span>
+          <span class="soon">Soon</span>
+        </button>
+        <button class="pv" type="button" id="pvMrday" aria-label="Continue with Mr.day One">
+          <img class="mark" id="pvLogo" alt="" />
+          <span class="txt">Continue with Mr.day One</span>
+          <span class="tag" id="pvTag" hidden>Desktop</span>
+        </button>
+      </div>
+    </div>
+
+    <p class="foot">New here? Enter your email and we will send a code.</p>
+  </main>
+
 <script>
 (function () {
-  var f = document.getElementById("f"), btn = document.getElementById("btn"), msg = document.getElementById("msg");
-  // Where to go after login (default the app). Only same-origin app paths are allowed
-  // so an attacker can't turn this into an open redirect via ?next=.
+  var $ = function (id) { return document.getElementById(id); };
+  var msg = $("msg");
+  var forms = { email: $("emailForm"), login: $("loginForm"), signup: $("signupForm") };
+  var state = { email: "" };
+
+  // Only same-origin app paths may be redirected to, so ?next= can never become an
+  // open redirect.
+  var HOME = "/dashboard";
+  var ALLOWED = ["/dashboard", "/billing", "/app"];
   function nextTarget() {
     try {
-      var n = new URLSearchParams(location.search).get("next") || "/app/";
-      if (n.charAt(0) === "/" && n.charAt(1) !== "/" && n.indexOf("/app") === 0) return n;
+      var n = new URLSearchParams(location.search).get("next") || HOME;
+      // Still only same-origin app paths: a leading "//" would be another host, and
+      // anything outside these two prefixes is not ours to redirect to.
+      if (n.charAt(0) === "/" && n.charAt(1) !== "/") {
+        for (var i = 0; i < ALLOWED.length; i++) {
+          if (n.indexOf(ALLOWED[i]) === 0) return n;
+        }
+      }
     } catch (e) {}
-    return "/app/";
+    return HOME;
   }
   function setMsg(t, cls) { msg.textContent = t || ""; msg.className = "msg" + (cls ? " " + cls : ""); }
-  f.addEventListener("submit", async function (e) {
+  function show(which) {
+    Object.keys(forms).forEach(function (k) { forms[k].hidden = k !== which; });
+    $("title").textContent =
+      which === "signup" ? "Create your account"
+      : which === "login" ? "Welcome back"
+      : "Welcome to Mr.day One";
+    $("subtitle").textContent =
+      which === "signup" ? "Confirm your email and pick a password"
+      : which === "login" ? "Enter your password to continue"
+      : "Create an account or sign in to continue";
+    var foot = document.querySelector(".foot");
+    if (foot) foot.hidden = which !== "email";
+    var pv = $("providers");
+    if (pv) pv.hidden = which !== "email";
+    setMsg("");
+  }
+  async function post(path, body) {
+    var r = await fetch(path, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    var j = await r.json().catch(function () { return {}; });
+    return { ok: r.ok, data: j };
+  }
+  function finish(token) {
+    // The cookie nginx checks before serving the app shell. Real API calls still carry
+    // the Bearer token and are authorized per request.
+    // Lax, not Strict. Strict withholds the cookie on EVERY cross-site navigation —
+    // including the one where Stripe returns the buyer to /billing after paying. The gate
+    // then saw no cookie, decided nobody was signed in, and bounced them back here: from
+    // the buyer's side, paying logged them out and the payment appeared to vanish.
+    //
+    // Lax still withholds it from cross-site subresources and cross-site POSTs, which is
+    // where CSRF lives. It only adds it back on top-level GET navigation — exactly the
+    // return-from-checkout case, and nothing that can be triggered silently.
+    document.cookie = "mide_token=" + encodeURIComponent(token) + "; Path=/; Secure; SameSite=Lax; Max-Age=" + (7 * 24 * 3600);
+    try { localStorage.setItem("michael_token", token); } catch (e) {}
+    setMsg("Signed in — taking you through…", "ok");
+    location.replace(nextTarget());
+  }
+
+  // Step 1 — does this address already have an account?
+  forms.email.addEventListener("submit", async function (e) {
     e.preventDefault();
-    btn.disabled = true; setMsg("登录中…");
+    var btn = $("emailBtn");
+    btn.disabled = true; setMsg("Checking…");
+    state.email = $("email").value.trim();
     try {
-      var r = await fetch("/api/auth/login", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ email: document.getElementById("email").value.trim(), password: document.getElementById("pw").value }),
-      });
-      var j = await r.json().catch(function () { return {}; });
-      if (!r.ok || !j.token) { setMsg(j.error || "邮箱或密码错误", "err"); btn.disabled = false; return; }
-      // The gate cookie nginx checks. Not HttpOnly by necessity (set from JS), but Secure
-      // + short-lived; it only gates static-asset delivery, real API calls still carry the
-      // Bearer token and are authorized server-side per request.
-      //
-      // Lax, not Strict. Strict withholds the cookie on EVERY cross-site navigation —
-      // including the one where Stripe returns the buyer to /billing after paying. The
-      // gate then saw no cookie, decided nobody was signed in, and bounced them to the
-      // login page: from the buyer's side, paying logged them out and the payment appeared
-      // to vanish.
-      //
-      // Lax still withholds it from cross-site subresources and cross-site POSTs, which is
-      // where CSRF lives. It only adds it back on top-level GET navigation — exactly the
-      // return-from-checkout case, and nothing that can be triggered silently.
-      document.cookie = "mide_token=" + encodeURIComponent(j.token) + "; Path=/; Secure; SameSite=Lax; Max-Age=" + (7 * 24 * 3600);
-      try { localStorage.setItem("michael_token", j.token); } catch (e) {}
-      setMsg("登录成功，进入中…", "ok");
-      location.replace(nextTarget());
+      var res = await post("/api/auth/check-email", { email: state.email });
+      var exists = !!(res.data && (res.data.exists || res.data.registered));
+      $("loginEmail").textContent = state.email;
+      $("signupEmail").textContent = state.email;
+      if (exists) {
+        show("login");
+        setTimeout(function () { $("pw").focus(); }, 30);
+      } else {
+        var sent = await post("/api/auth/send-code", { email: state.email });
+        if (!sent.ok) { setMsg((sent.data && sent.data.error) || "Could not send the code. Try again.", "err"); btn.disabled = false; return; }
+        show("signup");
+        setMsg("Code sent to " + state.email, "ok");
+        setTimeout(function () { $("code").focus(); }, 30);
+      }
     } catch (err) {
-      setMsg("网络错误，请重试", "err"); btn.disabled = false;
+      setMsg("Network error. Please try again.", "err");
+    }
+    btn.disabled = false;
+  });
+
+  // Step 2a — existing account
+  forms.login.addEventListener("submit", async function (e) {
+    e.preventDefault();
+    var btn = $("loginBtn");
+    btn.disabled = true; setMsg("Signing in…");
+    try {
+      var res = await post("/api/auth/login", { email: state.email, password: $("pw").value });
+      if (!res.ok || !res.data.token) { setMsg(res.data.error || "That email and password do not match.", "err"); btn.disabled = false; return; }
+      finish(res.data.token);
+    } catch (err) {
+      setMsg("Network error. Please try again.", "err"); btn.disabled = false;
     }
   });
+
+  // Step 2b — new account
+  forms.signup.addEventListener("submit", async function (e) {
+    e.preventDefault();
+    var btn = $("signupBtn");
+    btn.disabled = true; setMsg("Creating your account…");
+    try {
+      var res = await post("/api/auth/register", {
+        email: state.email,
+        password: $("newpw").value,
+        code: $("code").value.trim(),
+      });
+      if (!res.ok) { setMsg(res.data.error || "That code did not work. Check it and try again.", "err"); btn.disabled = false; return; }
+      if (res.data.token) return finish(res.data.token);
+      var login = await post("/api/auth/login", { email: state.email, password: $("newpw").value });
+      if (login.ok && login.data.token) return finish(login.data.token);
+      setMsg("Account created. Please sign in.", "ok");
+      show("login");
+      btn.disabled = false;
+    } catch (err) {
+      setMsg("Network error. Please try again.", "err"); btn.disabled = false;
+    }
+  });
+
+  Array.prototype.forEach.call(document.querySelectorAll("[data-back]"), function (b) {
+    b.addEventListener("click", function () { show("email"); $("email").focus(); });
+  });
+
+  // The Mr.day One provider is this page's own email flow, so reuse the header logo
+  // rather than shipping the data URI a second time.
+  var headerLogo = document.querySelector("img.logo");
+  if (headerLogo) $("pvLogo").src = headerLogo.src;
+
+  // ---- Desktop handoff -----------------------------------------------------
+  // If the desktop app is running and signed in, it answers on one of these
+  // loopback ports and will hand this page its session. The custom header is what
+  // forces a CORS preflight, which is how the app gets to refuse other origins
+  // before they ever reach its handler.
+  var HANDOFF_PORTS = [47821, 47822, 47823];
+  var HANDOFF_HEADERS = { "X-MrDay-Handoff": "1" };
+  var desktop = null;
+
+  function probePort(port) {
+    var ctl = new AbortController();
+    var timer = setTimeout(function () { ctl.abort(); }, 700);
+    return fetch("http://127.0.0.1:" + port + "/session", {
+      headers: HANDOFF_HEADERS, mode: "cors", cache: "no-store", signal: ctl.signal,
+    })
+      .then(function (r) { return r.ok ? r.json() : Promise.reject(new Error("status " + r.status)); })
+      .then(function (j) {
+        if (!j || j.app !== "mrday-one" || !j.signedIn) throw new Error("no session");
+        return { port: port, email: j.email || "" };
+      })
+      .finally(function () { clearTimeout(timer); });
+  }
+
+  // Sequential, not Promise.any: a refused connection is logged to the console by the
+  // network stack itself and cannot be caught away. Probing in order means the normal
+  // case — app listening on the first port — makes exactly one request and leaves a
+  // clean console, instead of one success plus a handful of visible failures.
+  function findDesktop(i) {
+    if (i >= HANDOFF_PORTS.length) return Promise.reject(new Error("no desktop app"));
+    return probePort(HANDOFF_PORTS[i]).catch(function () { return findDesktop(i + 1); });
+  }
+
+  findDesktop(0)
+    .then(function (found) {
+      desktop = found;
+      $("pvMrday").classList.add("is-live");
+      $("pvTag").hidden = false;
+      if (found.email) {
+        $("pvMrday").querySelector(".txt").textContent = "Continue as " + found.email;
+        $("pvMrday").setAttribute("aria-label", "Continue as " + found.email + ", already signed in on the desktop app");
+      }
+    })
+    .catch(function () { /* app not running, or signed out — the email flow stands */ });
+
+  async function useDesktopSession() {
+    setMsg("Signing you in from the desktop app…");
+    try {
+      var r = await fetch("http://127.0.0.1:" + desktop.port + "/handoff", {
+        method: "POST", headers: HANDOFF_HEADERS, mode: "cors", cache: "no-store",
+      });
+      var j = await r.json().catch(function () { return {}; });
+      if (!r.ok || !j.token) {
+        // Most likely the app was signed out between the probe and the click.
+        setMsg(j.error === "no desktop session"
+          ? "The desktop app is signed out. Use your email instead."
+          : "The desktop app declined the handoff.", "err");
+        desktop = null;
+        $("pvMrday").classList.remove("is-live");
+        $("pvTag").hidden = true;
+        $("pvMrday").querySelector(".txt").textContent = "Continue with Mr.day One";
+        $("pvMrday").setAttribute("aria-label", "Continue with Mr.day One");
+        return;
+      }
+      finish(j.token);
+    } catch (e) {
+      setMsg("Could not reach the desktop app. Sign in with your email instead.", "err");
+    }
+  }
+
+  $("pvMrday").addEventListener("click", function () {
+    if (desktop) return useDesktopSession();
+    var email = $("email");
+    if (email.value.trim()) forms.email.requestSubmit();
+    else { email.focus(); setMsg("Enter your email above to continue with Mr.day One."); }
+  });
+
+  function storedToken() {
+    try {
+      var v = localStorage.getItem("michael_token");
+      if (v) return v;
+    } catch (e) {}
+    var m = document.cookie.match(/(?:^|;\s*)mide_token=([^;]*)/);
+    return m ? decodeURIComponent(m[1]) : "";
+  }
+
+  /*
+   * Clicking "Log in" on the marketing site while holding a perfectly good session used
+   * to land on this form, which reads as having been signed out. The token is verified
+   * against /api/me rather than trusted for merely existing, so an expired or revoked one
+   * falls through to the form instead of bouncing the person into a console that would
+   * immediately throw them back here.
+   */
+  (async function resume() {
+    show("email");
+    var token = storedToken();
+    if (!token) { $("email").focus(); return; }
+    // Hidden, not shown-then-replaced: a login form that flashes up and vanishes looks
+    // like a glitch even when the redirect is instant.
+    var wrap = document.querySelector("main.wrap");
+    wrap.style.visibility = "hidden";
+    try {
+      var r = await fetch("/api/me", { headers: { Authorization: "Bearer " + token }, cache: "no-store" });
+      if (r.ok) { location.replace(nextTarget()); return; }
+    } catch (e) {
+      /* offline, or the gateway is down — fall through and let them use the form */
+    }
+    wrap.style.visibility = "";
+    $("email").focus();
+  })();
 })();
 </script>
 </body>

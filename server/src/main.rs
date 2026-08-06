@@ -20,6 +20,7 @@ mod prompts;
 mod realtime;
 mod receipt;
 mod repo_sync;
+mod sessions;
 mod settings;
 mod skills;
 mod stripe;
@@ -132,6 +133,9 @@ async fn main() -> anyhow::Result<()> {
         )
         // Body limit covers the inline avatar data URL, which the browser has already
         // resized; the handler caps it far lower still.
+        // Where this account is signed in, and signing one of those devices out.
+        .route("/api/sessions", get(sessions::list))
+        .route("/api/sessions/:id", axum::routing::delete(sessions::revoke))
         .route(
             "/api/me/profile",
             post(auth::update_profile).layer(axum::extract::DefaultBodyLimit::max(1024 * 1024)),

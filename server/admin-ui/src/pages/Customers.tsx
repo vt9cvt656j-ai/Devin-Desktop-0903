@@ -16,6 +16,12 @@ import { Select } from "@/components/ui/select";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow, Truncate } from "@/components/ui/table";
 import { api } from "@/lib/api";
+import {
+  creditCentsFromRaw,
+  creditDenominator,
+  rawCentsFromCreditDollars,
+  useSettings,
+} from "@/lib/settings";
 import { cn } from "@/lib/utils";
 import { cents, num, when } from "@/lib/format";
 
@@ -43,23 +49,25 @@ import { cents, num, when } from "@/lib/format";
 const PLANS = ["trial", "basic", "pro", "power", "ultra"] as const;
 
 /**
- * 余额的面值换算，沿用旧后台（admin.html:703 CREDIT_RAW_CENTS_PER_VISIBLE_USD）和
- * models.rs:3584 的口径：663 个真实计费分 = 客户看到的 $1.00 额度。
+ * 余额的面值换算：N 个真实计费分 = 客户看到的 $1.00 额度（默认 663）。
  * 运营填的、客户看的都是这个面值；写进 credits_cents 的是真实分。
- * 注意 quota_* 不走这层换算 —— plan_spec()（codes.rs:167）里它们本来就是真实美分。
+ *
+ * 分母不再写死在这里 —— 它是服务端 app_settings 的值，由 lib/settings.ts 下发。
+ * 之前这个数在四个文件里各有一份副本（这里、Billing.tsx、static/admin.html、
+ * ide/src/main.js），其中三份在写路径上，改一处不改其余就会「发出去多少」和
+ * 「显示多少」当场对不上，且不报错。
+ *
+ * quota_* 与 credits_cents **是同一个单位**（真实计费分），所以一样要走这层换算：
+ * 结算时 split_fused_charge 把同一笔 requested_cost 拆成 quota_cents 和 wallet_cents，
+ * 分别扣在 quota_total_cents 和 credits_cents 上（models.rs 的结算 UPDATE）。
  *
  * 这层换算是有损的：1 个面值分 ≈ 6.63 个真实分，raw → 两位小数 → raw 不一定回到原值
  * （1000 → "1.51" → 1001）。所以「改写余额」只在输入框真的被改过时才可提交，
  * 见下面的 balanceDirty —— 否则光是开弹窗再点一下保存，就会无声地动一次账。
  */
-const RAW_CENTS_PER_CREDIT_DOLLAR = 663;
-const creditCents = (raw?: number) => Math.round(((raw || 0) / RAW_CENTS_PER_CREDIT_DOLLAR) * 100);
-const creditInput = (raw?: number) => ((raw || 0) / RAW_CENTS_PER_CREDIT_DOLLAR).toFixed(2);
-const toRawCents = (dollars: string) =>
-  Math.round((Number.parseFloat(dollars) || 0) * RAW_CENTS_PER_CREDIT_DOLLAR);
-
-/** models.rs:3554 —— 每日免费点数；池子存的是毫点（MILLI = 1000，models.rs:3556-3560）。 */
-const FREE_POINTS_DAILY = 40;
+const creditCents = creditCentsFromRaw;
+const creditInput = (raw?: number) => ((raw || 0) / creditDenominator()).toFixed(2);
+const toRawCents = rawCentsFromCreditDollars;
 const MILLI = 1000;
 
 type User = {
@@ -127,6 +135,8 @@ function toLocalInput(iso?: string | null) {
 }
 
 export function Customers() {
+  // 订阅面值分母：设置到货后金额要重算一次，否则表格会停在兜底面值上。
+  useSettings();
   const [users, setUsers] = useState<User[]>([]);
   const [meId, setMeId] = useState("");
   const [q, setQ] = useState("");
@@ -298,8 +308,8 @@ export function Customers() {
                     ) : (
                       <div className="w-44">
                         <div className="flex items-center gap-1.5 whitespace-nowrap text-xs tabular-nums">
-                          <span className="font-medium">{cents(w.used)}</span>
-                          <span className="text-muted-foreground">/ {cents(w.cap)}</span>
+                          <span className="font-medium">{cents(creditCents(w.used))}</span>
+                          <span className="text-muted-foreground">/ {cents(creditCents(w.cap))}</span>
                           {w.left <= 0 && (
                             <Badge variant="outline" className="border-destructive/40 text-destructive">
                               已用完
@@ -397,6 +407,7 @@ function CustomerDialog({
   const [busy, setBusy] = useState("");
   const [msg, setMsg] = useState<{ text: string; ok: boolean } | null>(null);
 
+  const settings = useSettings();
   const w = windowUse(user);
   const weeklyCap = user.quota_weekly_cap_cents || 0;
 
@@ -521,13 +532,14 @@ function CustomerDialog({
       <div className="grid grid-cols-2 gap-x-6 gap-y-4 rounded-xl border border-border bg-secondary/40 p-4 sm:grid-cols-4">
         <Fact
           label="本时段"
-          value={w ? `${cents(w.used)} / ${cents(w.cap)}` : "—"}
-          hint={w ? (w.left <= 0 ? "已用完，等待刷新" : `剩 ${cents(w.left)} · 每 5.5 小时刷新`) : "无会员额度"}
+          value={w ? `${cents(creditCents(w.used))} / ${cents(creditCents(w.cap))}` : "—"}
+          hint={w ? (w.left <= 0 ? "已用完，等待刷新" : `剩 ${cents(creditCents(w.left))} · 每 5.5 小时刷新`) : "无会员额度"}
         />
         <Fact
           label="本周"
-          value={weeklyCap > 0 ? `${cents(creditCents(user.quota_week_used_cents))} / ${cents(weeklyCap)}` : cents(creditCents(user.quota_week_used_cents))}
-          hint={weeklyCap > 0 ? undefined : "无周上限"}
+          // 用量已折面值，上限必须一起折 —— 否则同一个 "已用 / 上限" 里两个数差 6.63 倍。
+          value={weeklyCap > 0 ? `${cents(creditCents(user.quota_week_used_cents))} / ${cents(creditCents(weeklyCap))}` : cents(creditCents(user.quota_week_used_cents))}
+          hint={weeklyCap > 0 ? `真实计费上限 ${cents(weeklyCap)}` : "无周上限（0 = 不限）"}
         />
         <Fact label="总额度余量" value={cents(creditCents(user.quota_total_cents))} />
         <Fact
@@ -538,7 +550,7 @@ function CustomerDialog({
         <Fact
           label="免费点数"
           value={`${num(Math.round((user.free_points ?? 0) / MILLI))} 点`}
-          hint={`每日 ${FREE_POINTS_DAILY} 点`}
+          hint={`每日 ${settings.free_points_daily} 点`}
         />
         <Fact
           label="套餐"

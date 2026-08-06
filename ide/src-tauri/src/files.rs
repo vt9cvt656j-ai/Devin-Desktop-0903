@@ -463,10 +463,9 @@ fn friendly_write_error(op: &str, path: &str, e: &std::io::Error) -> String {
         std::io::ErrorKind::PermissionDenied => format!("{}失败：没有写入权限：{}", op, path),
         std::io::ErrorKind::AlreadyExists => format!("{}失败：目标已存在：{}", op, path),
         std::io::ErrorKind::IsADirectory => format!("{}失败：{} 是目录", op, path),
-        std::io::ErrorKind::NotADirectory => format!(
-            "{}失败：路径中间有一段不是目录：{}",
-            op, path
-        ),
+        std::io::ErrorKind::NotADirectory => {
+            format!("{}失败：路径中间有一段不是目录：{}", op, path)
+        }
         std::io::ErrorKind::DirectoryNotEmpty => format!("{}失败：目录不为空：{}", op, path),
         kind => format!("{}失败：{}（{}）", op, path, kind),
     }
@@ -541,8 +540,7 @@ pub fn read_log_tail(
         .clamp(4 * 1024, 2 * 1024 * 1024) as u64;
     let file_len = meta.len();
     let start = file_len.saturating_sub(byte_limit);
-    let mut file =
-        std::fs::File::open(&resolved).map_err(|e| friendly_read_error(&path, &e))?;
+    let mut file = std::fs::File::open(&resolved).map_err(|e| friendly_read_error(&path, &e))?;
     file.seek(SeekFrom::Start(start))
         .map_err(|e| e.to_string())?;
     let mut bytes = Vec::with_capacity((file_len - start).min(byte_limit) as usize);
@@ -1576,9 +1574,11 @@ pub fn copy_path(from: String, to: String) -> Result<(), String> {
     if let Some(parent) = to_path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| friendly_write_error("创建目录", &to, &e))?;
     }
-    let meta = std::fs::symlink_metadata(from_p).map_err(|e| friendly_write_error("读取源文件", &from, &e))?;
+    let meta = std::fs::symlink_metadata(from_p)
+        .map_err(|e| friendly_write_error("读取源文件", &from, &e))?;
     if meta.is_dir() {
-        copy_dir_recursive(from_p, &to_path).map_err(|e| friendly_write_error("复制目录", &from, &e))
+        copy_dir_recursive(from_p, &to_path)
+            .map_err(|e| friendly_write_error("复制目录", &from, &e))
     } else {
         std::fs::copy(from_p, &to_path)
             .map(|_| ())
@@ -2481,8 +2481,7 @@ mod tests {
         std::fs::write(root.join("low.txt"), "needle here\nnothing\n").unwrap();
         std::fs::write(root.join("zzz.txt"), "needle\nneedle\nneedle\n").unwrap();
 
-        let ranked =
-            search_project_scope(&root.to_string_lossy(), "needle", false, None).unwrap();
+        let ranked = search_project_scope(&root.to_string_lossy(), "needle", false, None).unwrap();
         assert_eq!(ranked.files.len(), 2);
         assert_eq!(
             ranked.files[0].rel, "zzz.txt",

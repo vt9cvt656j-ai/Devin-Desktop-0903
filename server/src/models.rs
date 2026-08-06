@@ -52,35 +52,27 @@ fn build_chat_http_client(pool_idle_per_host: usize) -> reqwest::Client {
 
 static GW_CHAT_HTTP: LazyLock<reqwest::Client> = LazyLock::new(|| build_chat_http_client(8));
 
-const CHAT_UPSTREAM_MAX_ATTEMPTS_PER_ROUTE: u32 = 2;
+const CHAT_UPSTREAM_MAX_ATTEMPTS_PER_ROUTE: u32 = 1;
+const CHAT_UPSTREAM_MAX_ROUTES_PER_REQUEST: usize = 1;
 const CHAT_UPSTREAM_ROUTE_COOLDOWN: Duration = Duration::from_secs(20);
 
-/// What the IDE waits for response headers before it gives up. Reasoning effort
-/// never changes this transport-health deadline; deeper thinking gets extra time
-/// only after the HTTP response has opened.
+/// What the IDE waits for response headers before it gives up. The upstream relay
+/// holds the HTTP response until its first SSE event, so this includes provider
+/// prefill time. After headers open, the stream has its own long idle deadline.
 /// Only read by the test that enforces the coupling — the value's job is to make the
 /// client's deadline visible here so nobody widens the gateway budget past it.
 #[cfg_attr(not(test), allow(dead_code))]
-const CLIENT_HEADER_TIMEOUT: Duration = Duration::from_secs(15);
+const CLIENT_HEADER_TIMEOUT: Duration = Duration::from_secs(60);
 /// This supplier does not flush HTTP headers until its first SSE event, so response-header
-/// latency includes model prefill. Production measurements put small chat near 2.3-3.9s and a
-/// normal Agent/tool request at 5.5s. Use request-aware ceilings instead of treating 4s as a
-/// transport failure and cancelling healthy Agent turns.
-/// 5s 太紧：实测小聊天最慢就到 3.9s，只剩 1.1s 余量，一次比平常慢一点的 prefill 就
-/// 会被当成传输故障掐掉。7s 给到约 1.8 倍余量，而总时长仍由 ROUTE_BUDGET(12s) 兜住，
-/// 所以"动不动等 47s"那个问题不会因此回来。
-const STANDARD_MAX_HEADER_WAIT: Duration = Duration::from_secs(7);
-const AGENT_MAX_HEADER_WAIT: Duration = Duration::from_secs(8);
-const DEEP_MAX_HEADER_WAIT: Duration = Duration::from_secs(10);
-/// 对冲式首次等待：zyz 类中转的【第一条连接】经常拒 headers，换新连接后立刻就通
-///（实测每次白等 7-8s，用户体感"卡半天→唰一下全出来"）。首次尝试只等 4s 就果断
-/// 换连接；重试给满额，健康但慢的供应商由第二次兜底，不会误杀。仅在同路线还有
-/// 重试机会时启用（多路线单尝试场景不压缩，避免慢供应商被连环跳过）。
-const FIRST_ATTEMPT_HEADER_WAIT: Duration = Duration::from_secs(4);
+/// latency includes model prefill. Production logs show healthy Claude headers beyond 8s
+/// (p95 ~8.2s, max ~8.5s on the current route). The old 8/10/11s ceilings sat inside the
+/// normal latency tail and generated self-inflicted 504s before the provider had failed.
+const STANDARD_MAX_HEADER_WAIT: Duration = Duration::from_secs(57);
+const AGENT_MAX_HEADER_WAIT: Duration = Duration::from_secs(57);
+const DEEP_MAX_HEADER_WAIT: Duration = Duration::from_secs(57);
 const MAX_ERROR_BODY_WAIT: Duration = Duration::from_secs(2);
-const ROUTE_BUDGET: Duration = Duration::from_secs(12);
+const ROUTE_BUDGET: Duration = Duration::from_secs(58);
 const CLIENT_DEADLINE_MARGIN: Duration = Duration::from_millis(750);
-const FAST_HEADER_RETRY_DELAY: Duration = Duration::from_millis(120);
 const RESPONSE_DEADLINE_HEADER: &str = "x-ide-response-deadline-ms";
 
 /// Total time the gateway may spend hunting for a working upstream route before it
@@ -90,6 +82,15 @@ const RESPONSE_DEADLINE_HEADER: &str = "x-ide-response-deadline-ms";
 /// didn't, the client gave up first and fast-retried, and each retry opened a fresh
 /// gateway request with its own set of upstream calls — a multiplying storm of
 /// `/v1/messages` requests rather than one failure the user could read.
+/// 线路总预算。**刻意不按尝试次数放大**：这是运输层健康的判定窗口，由客户端的
+/// 耐心决定（CLIENT_HEADER_TIMEOUT = 60s，镜像自 IDE 的
+/// `_AI_RESPONSE_HEADERS_DEADLINE_MS`）。深思考请求在这个总预算内拿到更长的单次表头
+/// 上限，响应打开之后再由流空闲窗口接管。
+///
+/// 把它改成按 "尝试次数 × 表头上限" 放大是错的 —— 两次完整窗口会超过客户端 60s 的
+/// 耐心，网关等得再久，用户那边也早就断了，只会把一个有错误信息的 504 换成一个
+/// 什么都没有的客户端超时。`route_budget_fits_inside_the_client_header_timeout`
+/// 就是钉这件事的。
 fn route_budget_for(_deep_thinking: bool) -> Duration {
     ROUTE_BUDGET
 }
@@ -131,7 +132,7 @@ fn route_budget_for_headers(headers: &HeaderMap, deep_thinking: bool) -> Duratio
 ///
 /// All three wire shapes have to be recognised, because they are not interchangeable
 /// across models and the gateway emits different ones for different families:
-///   * `reasoning_effort: max|xhigh`   — OpenAI-shaped request, deepest dials
+///   * `reasoning_effort: low+`        — OpenAI-shaped request with thinking enabled
 ///   * `thinking.budget_tokens > 0`    — Claude 3.7 / 4.6 explicit-budget form
 ///   * `thinking.type: adaptive`       — Claude 4.7+ / 5 / Fable / Mythos (NO budget field)
 ///
@@ -142,7 +143,9 @@ fn request_is_deep_thinking(body: &serde_json::Value) -> bool {
     let effort_is_deep = body
         .get("reasoning_effort")
         .and_then(|v| v.as_str())
-        .is_some_and(|e| e.eq_ignore_ascii_case("max") || e.eq_ignore_ascii_case("xhigh"));
+        .is_some_and(|e| {
+            !matches!(e.to_ascii_lowercase().as_str(), "" | "off" | "none" | "disabled")
+        });
     let explicit_budget = body
         .get("thinking")
         .and_then(|t| t.get("budget_tokens"))
@@ -155,6 +158,97 @@ fn request_is_deep_thinking(body: &serde_json::Value) -> bool {
         .and_then(|v| v.as_str())
         .is_some_and(|t| t == "adaptive" || t == "enabled");
     effort_is_deep || explicit_budget || thinking_on
+}
+
+/// Return only a stable category for telemetry. Never log a caller-provided value
+/// directly: the field is meant to be an enum, but an untrusted client can send
+/// arbitrary JSON.
+fn telemetry_reasoning_effort(body: &serde_json::Value) -> &'static str {
+    match body
+        .get("reasoning_effort")
+        .and_then(|value| value.as_str())
+        .map(|value| value.to_ascii_lowercase())
+        .as_deref()
+    {
+        None => "absent",
+        Some("") | Some("off") | Some("none") | Some("disabled") => "off",
+        Some("low") => "low",
+        Some("medium") => "medium",
+        Some("high") => "high",
+        Some("xhigh") => "xhigh",
+        Some("max") => "max",
+        Some(_) => "other",
+    }
+}
+
+/// As above, preserve only the known wire-shape category rather than arbitrary
+/// request content. This keeps the diagnostic useful without retaining prompts.
+fn telemetry_thinking_type(body: &serde_json::Value) -> &'static str {
+    match body
+        .pointer("/thinking/type")
+        .and_then(|value| value.as_str())
+        .map(|value| value.to_ascii_lowercase())
+        .as_deref()
+    {
+        None => "absent",
+        Some("adaptive") => "adaptive",
+        Some("enabled") => "enabled",
+        Some("disabled") => "disabled",
+        Some(_) => "other",
+    }
+}
+
+fn telemetry_output_config_effort(body: &serde_json::Value) -> &'static str {
+    match body
+        .pointer("/output_config/effort")
+        .and_then(|value| value.as_str())
+        .map(|value| value.to_ascii_lowercase())
+        .as_deref()
+    {
+        None => "absent",
+        Some("low") => "low",
+        Some("medium") => "medium",
+        Some("high") => "high",
+        Some(_) => "other",
+    }
+}
+
+const ANTHROPIC_CONTEXT_1M_BETA: &str = "context-1m-2025-08-07";
+const ANTHROPIC_INTERLEAVED_THINKING_BETA: &str = "interleaved-thinking-2025-05-14";
+const ANTHROPIC_EFFORT_BETA: &str = "effort-2025-11-24";
+
+/// Build the single Anthropic capability header sent to native `/v1/messages` routes.
+///
+/// Sub2API treats this as a comma-separated capability set. Sending `context-1m` in a
+/// standalone header used to omit the two capabilities its API-key path needs in order
+/// to preserve adaptive/interleaved thinking and `output_config.effort`. Never include
+/// `redact-thinking`: that capability intentionally removes visible thinking text.
+fn anthropic_beta_header(body: &serde_json::Value, wants_1m: bool) -> Option<String> {
+    let mut betas = Vec::with_capacity(3);
+    if wants_1m {
+        betas.push(ANTHROPIC_CONTEXT_1M_BETA);
+    }
+    if body.pointer("/thinking/type").and_then(|value| value.as_str()) == Some("adaptive") {
+        betas.push(ANTHROPIC_INTERLEAVED_THINKING_BETA);
+        betas.push(ANTHROPIC_EFFORT_BETA);
+    }
+    (!betas.is_empty()).then(|| betas.join(","))
+}
+
+/// Collapse an untrusted native event type into a fixed telemetry enum.
+fn telemetry_anthropic_event_kind(event_type: Option<&str>) -> &'static str {
+    match event_type {
+        Some("message_start") => "message_start",
+        Some("content_block_start") => "content_block_start",
+        Some("content_block_delta") => "content_block_delta",
+        Some("content_block_stop") => "content_block_stop",
+        Some("message_delta") => "message_delta",
+        Some("message_stop") => "message_stop",
+        Some("ping") => "ping",
+        Some("error") => "error",
+        Some(_) => "other",
+        None => "absent",
+    }
 }
 
 fn max_header_wait_for_request(deep_thinking: bool, agentic: bool) -> Duration {
@@ -184,76 +278,6 @@ static CHAT_UPSTREAM_ROUTE_COOLDOWNS: LazyLock<Mutex<HashMap<uuid::Uuid, Instant
 // 30 分钟"思考钳位"，期间 budget_tokens 压到实测安全值；健康线路不受影响，到期自动解除。
 const THINKING_CLIP_COOLDOWN: Duration = Duration::from_secs(30 * 60);
 const THINKING_CLIP_SAFE_BUDGET: i64 = 6000;
-/// Learned header latency per upstream route, so the first-attempt cutover is measured
-/// against how THIS route actually behaves instead of one global guess.
-///
-/// The fixed 4s first-attempt wait taxes every request on a reliably-slow route: the
-/// route needs ~2s, we wait 4s, cut over, and pay again. Meanwhile a genuinely healthy
-/// route that occasionally takes 5s gets killed for no reason. Both are the same bug —
-/// a constant standing in for a measurement.
-///
-/// Stores an exponentially-weighted mean of SUCCESSFUL header latencies plus a count of
-/// consecutive stalls. Bounded: one small entry per route id, no growth with traffic.
-#[derive(Clone, Copy, Debug)]
-struct RouteHeaderStats {
-    /// EWMA of successful header latency, milliseconds.
-    mean_ms: f64,
-    /// Successful observations folded in so far (saturating).
-    samples: u32,
-    /// Consecutive first-attempt stalls; resets on any success.
-    stall_streak: u32,
-}
-
-static ROUTE_HEADER_STATS: LazyLock<Mutex<HashMap<uuid::Uuid, RouteHeaderStats>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
-
-/// Fold a successful header latency into the route's memory.
-fn record_header_success(route: uuid::Uuid, header_ms: u128) {
-    let Ok(mut map) = ROUTE_HEADER_STATS.lock() else { return };
-    let entry = map.entry(route).or_insert(RouteHeaderStats {
-        mean_ms: header_ms as f64,
-        samples: 0,
-        stall_streak: 0,
-    });
-    // 0.3 weight: adapts within a handful of requests when a provider degrades, without
-    // letting one outlier swing the cutover.
-    entry.mean_ms = entry.mean_ms * 0.7 + (header_ms as f64) * 0.3;
-    entry.samples = entry.samples.saturating_add(1);
-    entry.stall_streak = 0;
-}
-
-/// Record that this route stalled before sending headers.
-fn record_header_stall(route: uuid::Uuid) {
-    let Ok(mut map) = ROUTE_HEADER_STATS.lock() else { return };
-    let entry = map.entry(route).or_insert(RouteHeaderStats {
-        mean_ms: 0.0,
-        samples: 0,
-        stall_streak: 0,
-    });
-    entry.stall_streak = entry.stall_streak.saturating_add(1);
-}
-
-/// How long to wait for headers on the FIRST attempt of a route that still has retries.
-///
-/// Unknown routes keep the previous fixed behaviour. Once a route has a real baseline,
-/// wait a multiple of its own mean — slow-but-honest providers stop being killed, and
-/// routes that habitually hang get cut over well before the old flat 4s.
-fn adaptive_first_attempt_wait(route: uuid::Uuid, fallback: Duration) -> Duration {
-    const MIN_WAIT: Duration = Duration::from_millis(900);
-    const MAX_WAIT: Duration = Duration::from_secs(9);
-    let Ok(map) = ROUTE_HEADER_STATS.lock() else { return fallback };
-    let Some(stats) = map.get(&route) else { return fallback };
-    // Need a few observations before trusting the mean.
-    if stats.samples < 3 {
-        return fallback;
-    }
-    // A route that just stalled repeatedly gets a shorter leash, so the cutover to a
-    // fresh connection — which is what actually works on these relays — happens sooner.
-    let multiplier = if stats.stall_streak >= 2 { 1.5 } else { 2.5 };
-    let target_ms = (stats.mean_ms * multiplier).round().max(0.0) as u64;
-    Duration::from_millis(target_ms).clamp(MIN_WAIT, MAX_WAIT)
-}
-
 static THINKING_CLIP_ROUTES: LazyLock<Mutex<HashMap<uuid::Uuid, Instant>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 /// The i18n pack cache is bounded because each entry holds a full ~630KB response
@@ -418,6 +442,79 @@ fn chat_upstream_attempt_suffix(route_count: usize, attempts: u32, last_status: 
     } else {
         format!("（已请求 {attempts} 次 / {route_count} 条同模型线路；最后状态 {last_status}）")
     }
+}
+
+/// 把上游错误映射成对用户有用的中文。模块级函数，测试可直接调用。
+fn upstream_friendly_message(status: u16, low: &str) -> String {
+    // 余额不足。**中英文都要认**：这里原来只匹配 insufficient_balance /
+    // insufficient account balance 两个英文串，而国内中转普遍用中文报这件事。
+    //
+    // 线上实测（2026-08-05，claude-sonnet-5 走 changhuai.ai）：上游返回
+    //   {"error":{"type":"new_api_error","message":
+    //    "预扣费额度失败, 用户剩余额度: ＄0.055828, 需要预扣费额度: ＄0.134302"}}
+    // 一个字都没命中上面两个英文串，于是一路落到最后那句"上游暂时不可用，请换个
+    // 模型或稍后再试" —— 用户看到的是"线路坏了"，真实原因是账户只剩五分钱。
+    // 上游把余额、需要多少、请求 id 全说清楚了，全被这层映射丢掉。
+    //
+    // 顺带把上游原话带上：余额这种事，"还剩多少、需要多少"比任何转述都有用。
+    if low.contains("insufficient_balance")
+        || low.contains("insufficient account balance")
+        || low.contains("余额不足")
+        || low.contains("额度不足")
+        || low.contains("预扣费")
+        || low.contains("剩余额度")
+        || low.contains("quota exceeded")
+    {
+        let detail = safe_upstream_error_excerpt(low);
+        if detail.is_empty() {
+            "上游供应商账户余额不足。请在后台为该模型线路充值，或切换到其他可用线路。".into()
+        } else {
+            format!(
+                "上游供应商账户余额不足，请为该模型线路充值或切换线路。上游原话：{detail}"
+            )
+        }
+    } else if low.contains("forbidden") || low.contains("未授权") {
+        "上游暂不可用（供应商未授权 / 账户异常）。请换个模型，或联系模型供应商开通 / 续费。"
+            .into()
+    } else if low.contains("no available") || low.contains("没有可用") {
+        "上游暂无可用账号。请换个模型，或稍后再试。".into()
+    } else if status == 429
+        || low.contains("rate")
+        || low.contains("frequent")
+        || low.contains("过于频繁")
+    {
+        "请求过于频繁，请稍后再试。".into()
+    } else if status == 401 || low.contains("unauthorized") || low.contains("invalid api key") {
+        "上游密钥无效。请在后台「模型系统」更新该连接的 API Key。".into()
+    } else if status == 400 {
+        let detail = safe_upstream_error_excerpt(low);
+        if detail.is_empty() {
+            "上游拒绝了请求（400），但没有返回更细原因。".into()
+        } else {
+            format!("上游拒绝了请求（400）：{detail}")
+        }
+    } else {
+        // 兜底分支**必须带上上游原话**。
+        //
+        // 原来这里是一句光秃秃的"上游暂时不可用，请换个模型或稍后再试"。任何没被
+        // 上面分支认出来的错误，都会被压成这一句 —— 上游说了什么全部丢掉。余额那次
+        // 就是这么被埋掉的：上游明明写着"剩余 ＄0.0558，需要 ＄0.1343"，用户看到的
+        // 却是"线路坏了，换个模型"，于是去查 IDE、查网络、查线路，唯独查不到真因。
+        //
+        // 加一条分支只能修一种已知错误；把原话带出来，才是让**下一种**没见过的
+        // 上游错误也能被看懂。excerpt 已经做了 key 脱敏和 220 字截断。
+        let detail = safe_upstream_error_excerpt(low);
+        if detail.is_empty() {
+            format!("上游暂时不可用（HTTP {status}），且没有返回原因。请换个模型或稍后再试。")
+        } else {
+            format!("上游暂时不可用（HTTP {status}）：{detail}")
+        }
+    }
+}
+
+#[cfg(test)]
+fn friendly_upstream_for_test(status: u16, raw: &str) -> String {
+    upstream_friendly_message(status, &raw.to_lowercase())
 }
 
 fn safe_upstream_error_excerpt(low: &str) -> String {
@@ -4295,10 +4392,16 @@ fn anthropic_usage_merged(au: &serde_json::Value) -> serde_json::Value {
 /// Anthropic non-streaming response → OpenAI /chat/completions response.
 fn anthropic_to_oai(av: &serde_json::Value, model: &str) -> serde_json::Value {
     let mut text = String::new();
+    let mut reasoning = String::new();
     let mut tool_calls: Vec<serde_json::Value> = Vec::new();
     if let Some(content) = av.get("content").and_then(|c| c.as_array()) {
         for b in content {
             match b.get("type").and_then(|t| t.as_str()) {
+                Some("thinking") => {
+                    if let Some(t) = b.get("thinking").and_then(|v| v.as_str()) {
+                        reasoning.push_str(t);
+                    }
+                }
                 Some("text") => {
                     if let Some(t) = b.get("text").and_then(|v| v.as_str()) {
                         text.push_str(t);
@@ -4331,6 +4434,9 @@ fn anthropic_to_oai(av: &serde_json::Value, model: &str) -> serde_json::Value {
             json!(text)
         },
     );
+    if !reasoning.is_empty() {
+        message.insert("reasoning_content".into(), json!(reasoning));
+    }
     if !tool_calls.is_empty() {
         message.insert("tool_calls".into(), json!(tool_calls));
     }
@@ -4393,8 +4499,53 @@ struct AnthToolStream {
     stopped: bool,
 }
 
+/// Aggregate-only thinking telemetry. The converter never retains thinking text
+/// beyond the already-required SSE forwarding path; these counters are solely
+/// for diagnosing whether an upstream actually sent visible reasoning.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ThinkingStreamTelemetry {
+    nonempty_thinking_deltas: u64,
+    thinking_utf8_chars: usize,
+    first_native_event_kind: &'static str,
+    first_native_event_ms: Option<u64>,
+    first_nonempty_thinking_delta_ms: Option<u64>,
+    first_nonempty_text_delta_ms: Option<u64>,
+    first_tool_use_start_ms: Option<u64>,
+    first_nonempty_tool_delta_ms: Option<u64>,
+}
+
+impl Default for ThinkingStreamTelemetry {
+    fn default() -> Self {
+        Self {
+            nonempty_thinking_deltas: 0,
+            thinking_utf8_chars: 0,
+            first_native_event_kind: "absent",
+            first_native_event_ms: None,
+            first_nonempty_thinking_delta_ms: None,
+            first_nonempty_text_delta_ms: None,
+            first_tool_use_start_ms: None,
+            first_nonempty_tool_delta_ms: None,
+        }
+    }
+}
+
+impl ThinkingStreamTelemetry {
+    fn first_model_progress_ms(&self) -> Option<u64> {
+        [
+            self.first_nonempty_thinking_delta_ms,
+            self.first_nonempty_text_delta_ms,
+            self.first_tool_use_start_ms,
+            self.first_nonempty_tool_delta_ms,
+        ]
+        .into_iter()
+        .flatten()
+        .min()
+    }
+}
+
 struct AnthSse {
     buf: Vec<u8>,
+    started_at: Instant,
     model: String,
     role_sent: bool,
     next_tool_idx: i64,
@@ -4411,6 +4562,7 @@ struct AnthSse {
     cache_read: i64,
     cache_create: i64,
     stop_reason: String,
+    thinking_telemetry: ThinkingStreamTelemetry,
 }
 impl AnthSse {
     #[cfg(test)]
@@ -4442,8 +4594,17 @@ impl AnthSse {
         model: &str,
         tool_argument_rules: std::collections::HashMap<String, ToolArgumentRules>,
     ) -> Self {
+        Self::with_tool_argument_rules_started_at(model, tool_argument_rules, Instant::now())
+    }
+
+    fn with_tool_argument_rules_started_at(
+        model: &str,
+        tool_argument_rules: std::collections::HashMap<String, ToolArgumentRules>,
+        started_at: Instant,
+    ) -> Self {
         AnthSse {
             buf: Vec::new(),
+            started_at,
             model: model.to_string(),
             role_sent: false,
             next_tool_idx: 0,
@@ -4459,6 +4620,7 @@ impl AnthSse {
             cache_read: 0,
             cache_create: 0,
             stop_reason: "stop".into(),
+            thinking_telemetry: ThinkingStreamTelemetry::default(),
         }
     }
 
@@ -4466,6 +4628,10 @@ impl AnthSse {
     /// end_turn（映射后为 "stop"）。官方 API 不会这样收尾——这是中转深思考超限丢块。
     fn thinking_only_end_turn(&self) -> bool {
         self.saw_thinking_block && !self.saw_answer_block && self.stop_reason == "stop"
+    }
+
+    fn thinking_telemetry(&self) -> ThinkingStreamTelemetry {
+        self.thinking_telemetry
     }
 
     fn validated_tool_arguments(&self, block: &AnthToolStream) -> Result<String, String> {
@@ -4544,6 +4710,16 @@ impl AnthSse {
             }
             let ev: serde_json::Value = serde_json::from_str(data)
                 .map_err(|err| format!("invalid Anthropic SSE JSON: {err}"))?;
+            let event_elapsed_ms = self
+                .started_at
+                .elapsed()
+                .as_millis()
+                .min(u64::MAX as u128) as u64;
+            if self.thinking_telemetry.first_native_event_ms.is_none() {
+                self.thinking_telemetry.first_native_event_kind =
+                    telemetry_anthropic_event_kind(ev.get("type").and_then(|t| t.as_str()));
+                self.thinking_telemetry.first_native_event_ms = Some(event_elapsed_ms);
+            }
             // Harvest usage from WHEREVER it appears, before the per-type handling.
             //
             // Anthropic's own spec carries final token counts in `message_delta`, and
@@ -4576,6 +4752,9 @@ impl AnthSse {
                         _ => {}
                     }
                     if cb.and_then(|c| c.get("type")).and_then(|t| t.as_str()) == Some("tool_use") {
+                        self.thinking_telemetry
+                            .first_tool_use_start_ms
+                            .get_or_insert(event_elapsed_ms);
                         if self.tool_blocks.contains_key(&idx) {
                             return Err(format!(
                                 "Anthropic tool_use reused content block index {idx}"
@@ -4625,6 +4804,11 @@ impl AnthSse {
                     match ev.pointer("/delta/type").and_then(|t| t.as_str()) {
                         Some("text_delta") => {
                             if let Some(t) = ev.pointer("/delta/text").and_then(|v| v.as_str()) {
+                                if !t.is_empty() {
+                                    self.thinking_telemetry
+                                        .first_nonempty_text_delta_ms
+                                        .get_or_insert(event_elapsed_ms);
+                                }
                                 self.saw_answer_block = true;
                                 self.ensure_role(&mut out);
                                 out.extend(self.chunk(json!({"content": t}), None));
@@ -4634,6 +4818,13 @@ impl AnthSse {
                             if let Some(t) = ev.pointer("/delta/thinking").and_then(|v| v.as_str())
                             {
                                 self.saw_thinking_block = true;
+                                if !t.is_empty() {
+                                    self.thinking_telemetry.nonempty_thinking_deltas += 1;
+                                    self.thinking_telemetry.thinking_utf8_chars += t.chars().count();
+                                    self.thinking_telemetry
+                                        .first_nonempty_thinking_delta_ms
+                                        .get_or_insert(event_elapsed_ms);
+                                }
                                 self.ensure_role(&mut out);
                                 out.extend(self.chunk(json!({"reasoning_content": t}), None));
                             }
@@ -4651,6 +4842,11 @@ impl AnthSse {
                                         "Anthropic input_json_delta for index {idx} is missing partial_json"
                                     )
                                 })?;
+                            if !pj.is_empty() {
+                                self.thinking_telemetry
+                                    .first_nonempty_tool_delta_ms
+                                    .get_or_insert(event_elapsed_ms);
+                            }
                             let block = self.tool_blocks.get_mut(&idx).ok_or_else(|| {
                                 format!(
                                     "Anthropic input_json_delta references unknown content block index {idx}"
@@ -4875,6 +5071,7 @@ pub async fn chat_completions(
     headers: HeaderMap,
     Json(mut body): Json<serde_json::Value>,
 ) -> Result<Response, AppError> {
+    let gateway_request_started_at = Instant::now();
     let request_id = ide_request_id(&headers)?;
     let token = headers
         .get(axum::http::header::AUTHORIZATION)
@@ -4918,6 +5115,15 @@ pub async fn chat_completions(
         .and_then(|v| v.as_str())
         .map(String::from)
         .ok_or_else(|| AppError::bad("缺少 model"))?;
+    // Deliberately metadata-only: this records the requested thinking wire shape
+    // without retaining prompts, messages, thinking text, or credentials.
+    tracing::info!(
+        request_id = request_id.as_deref().unwrap_or(""),
+        model = %model_id,
+        reasoning_effort = telemetry_reasoning_effort(&body),
+        inbound_thinking_type = telemetry_thinking_type(&body),
+        "thinking telemetry: inbound chat request"
+    );
 
     let conns = sqlx::query_as::<_, Model>(
         "SELECT * FROM models WHERE active = true ORDER BY sort, created_at",
@@ -5169,47 +5375,19 @@ pub async fn chat_completions(
     // Pooled client (warm keep-alive connections) instead of a fresh handshake
     // per request. Streaming stays open-ended; non-streaming gets a sane cap.
     //
-    // Upstream providers (zyz et al.) intermittently return 502/503/504/429 or
-    // drop a kept-alive connection mid-flight — the user just sees "网关又出问题".
-    // Retry such *transient* failures with bounded exponential backoff so a
-    // short provider flap is absorbed instead of surfaced. We only retry BEFORE
-    // streaming the body has started (a send error or a bad status line), so no
-    // half-streamed response is ever double-sent, and billing still happens once,
-    // after success. Failed routes get a short in-memory cooldown so the next
-    // request prefers another same-model route when the admin has configured one.
+    // A user send maps to exactly one upstream model request. A 502/503/504/429,
+    // response-header timeout, or transport error is returned to the IDE immediately;
+    // the gateway never replays the same billed prompt on another connection or route.
+    // Failed routes still enter the short cooldown so the NEXT user send can prefer a
+    // healthier same-model route when the admin has configured one.
     let model_name = body
         .get("model")
         .and_then(|m| m.as_str())
         .unwrap_or("该模型")
         .to_string();
-    // Map an upstream error to a friendly, actionable Chinese message.
-    fn friendly_upstream(status: u16, low: &str) -> String {
-        if low.contains("insufficient_balance") || low.contains("insufficient account balance") {
-            "上游供应商账户余额不足。请在后台为该模型线路充值，或切换到其他可用线路。".into()
-        } else if low.contains("forbidden") || low.contains("未授权") {
-            "上游暂不可用（供应商未授权 / 账户异常）。请换个模型，或联系模型供应商开通 / 续费。"
-                .into()
-        } else if low.contains("no available") || low.contains("没有可用") {
-            "上游暂无可用账号。请换个模型，或稍后再试。".into()
-        } else if status == 429
-            || low.contains("rate")
-            || low.contains("frequent")
-            || low.contains("过于频繁")
-        {
-            "请求过于频繁，请稍后再试。".into()
-        } else if status == 401 || low.contains("unauthorized") || low.contains("invalid api key") {
-            "上游密钥无效。请在后台「模型系统」更新该连接的 API Key。".into()
-        } else if status == 400 {
-            let detail = safe_upstream_error_excerpt(low);
-            if detail.is_empty() {
-                "上游拒绝了请求（400），但没有返回更细原因。".into()
-            } else {
-                format!("上游拒绝了请求（400）：{detail}")
-            }
-        } else {
-            "上游暂时不可用，请换个模型或稍后再试。".into()
-        }
-    }
+    // 映射逻辑已提到模块级 `upstream_friendly_message`（测试要能直接调它）。
+    let friendly_upstream = upstream_friendly_message;
+
     // 深思考只放宽响应头之后的首个有效 token / stream idle 窗口。响应头代表线路健康，
     // 在它出现前，普通与深思请求共用同一个短 transport deadline。
     let deep_thinking = request_is_deep_thinking(&body);
@@ -5222,10 +5400,7 @@ pub async fn chat_completions(
             .and_then(|tools| tools.as_array())
             .is_some_and(|tools| !tools.is_empty());
     let max_header_wait = max_header_wait_for_request(deep_thinking, agentic_request);
-    // Send with retry — but ONLY retry *transient* failures (502/503/504/429 or a
-    // dropped connection). "forbidden / unauthorized / no available account" is
-    // PERSISTENT: retrying just makes the user wait ~15s for the same error, so we
-    // fail FAST with a friendly message. Billing only happens after a success.
+    // Single-shot send. Billing only happens after a successful upstream response.
     let (resp, conn) = {
         let mut success = None;
         let mut err_status = 502u16;
@@ -5244,7 +5419,7 @@ pub async fn chat_completions(
         // the gateway forever. (2) Even when attempts did fail, 6 tries plus backoff
         // could burn 40s+ before the client heard anything.
         //
-        // Either way the IDE hit its own header timeout (20s, 45s for deep thinking),
+        // Either way the IDE hit its own header timeout before the gateway answered,
         // gave up, and fast-retried — which starts a *fresh* gateway request and a
         // fresh set of upstream calls while the abandoned ones are still open upstream.
         // That is the "extra /v1/messages calls keep coming" storm. The gateway must
@@ -5268,11 +5443,13 @@ pub async fn chat_completions(
         }
         ordered_candidates.extend(cooled_candidates);
 
-        'routes: for candidate in ordered_candidates {
+        'routes: for candidate in ordered_candidates
+            .into_iter()
+            .take(CHAT_UPSTREAM_MAX_ROUTES_PER_REQUEST)
+        {
             // protocol="anthropic" → native /v1/messages with translated OpenAI⇄Anthropic body;
-            // else OpenAI-compat /chat/completions passthrough. Multiple active connections may
-            // expose the same model id; try the next line when the current one is dead instead of
-            // failing the whole IDE request on the first 502.
+            // else OpenAI-compat /chat/completions passthrough. Route ordering still prefers a
+            // non-cooled line, but one inbound chat request selects exactly one line and sends once.
             let candidate_anthropic = candidate.protocol == "anthropic";
             let candidate_url = if candidate_anthropic {
                 format!("{}/messages", api_base(&candidate.base_url))
@@ -5303,16 +5480,38 @@ pub async fn chat_completions(
                     "route recently dropped post-thinking blocks; thinking budget clipped for this request"
                 );
             }
+            let wants_1m = candidate_anthropic
+                && official_contexts(&model_id)
+                    .iter()
+                    .any(|(tokens, _)| *tokens >= 1_000_000);
+            let candidate_anthropic_beta = candidate_anthropic
+                .then(|| anthropic_beta_header(&candidate_upstream_body, wants_1m))
+                .flatten();
+            if candidate_anthropic {
+                // The body has already been normalized to the native Anthropic contract.
+                // Keep this to protocol and enum categories only; do not log the body.
+                tracing::info!(
+                    request_id = request_id.as_deref().unwrap_or(""),
+                    model = %model_id,
+                    protocol = "anthropic",
+                    thinking_type = telemetry_thinking_type(&candidate_upstream_body),
+                    output_config_effort = telemetry_output_config_effort(&candidate_upstream_body),
+                    beta_context_1m = wants_1m,
+                    beta_interleaved_thinking = candidate_anthropic_beta
+                        .as_deref()
+                        .is_some_and(|value| value.contains(ANTHROPIC_INTERLEAVED_THINKING_BETA)),
+                    beta_effort = candidate_anthropic_beta
+                        .as_deref()
+                        .is_some_and(|value| value.contains(ANTHROPIC_EFFORT_BETA)),
+                    "thinking telemetry: native Anthropic request"
+                );
+            }
             let mut route_attempts = 0u32;
             let mut route_failed_transient = false;
-            // With several equivalent routes, probe each route once before spending time on a
-            // duplicate attempt. With the single Claude route currently configured, permit one
-            // fast retry on a fresh HTTP/1.1 connection even while the route is cooling.
-            let candidate_max_attempts = if route_count > 1 {
-                1
-            } else {
-                CHAT_UPSTREAM_MAX_ATTEMPTS_PER_ROUTE
-            };
+            // Never replay a chat prompt inside one user request. Even a transport error can
+            // happen after the supplier accepted the body, so a fresh send is not reliably
+            // idempotent and may duplicate both model work and billing.
+            let candidate_max_attempts = CHAT_UPSTREAM_MAX_ATTEMPTS_PER_ROUTE;
             for attempt in 0u32..candidate_max_attempts {
                 // Out of budget: stop probing and let the caller report the last error,
                 // so the client gets a real response instead of timing out and retrying.
@@ -5326,8 +5525,9 @@ pub async fn chat_completions(
                     );
                     break 'routes;
                 }
-                // The first attempt uses the warm HTTP/1.1 pool. Every retry owns a client with
-                // no idle pool, guaranteeing it cannot reuse the connection that just stalled.
+                // The first attempt uses the warm HTTP/1.1 pool. A retry after an actual
+                // send/status failure owns a client with no idle pool, so it cannot reuse the
+                // transport that just failed. Header stalls leave this loop without replaying.
                 let chat_client = if attempt == 0 {
                     GW_CHAT_HTTP.clone()
                 } else {
@@ -5342,14 +5542,11 @@ pub async fn chat_completions(
                     // So: whenever this model's native window is >= 1M, or it has a beta-gated
                     // 1M entry, send the flag. It is a no-op where 1M is already default, and it
                     // is the difference between working and a hard 400 where it is not.
-                    let wants_1m = official_contexts(&model_id)
-                        .iter()
-                        .any(|(tokens, _)| *tokens >= 1_000_000);
                     let mut r = req0
                         .header("x-api-key", &candidate.api_key)
                         .header("anthropic-version", "2023-06-01");
-                    if wants_1m {
-                        r = r.header("anthropic-beta", "context-1m-2025-08-07");
+                    if let Some(beta) = candidate_anthropic_beta.as_deref() {
+                        r = r.header("anthropic-beta", beta);
                     }
                     r.json(&candidate_upstream_body)
                 } else {
@@ -5365,40 +5562,33 @@ pub async fn chat_completions(
                 // `send()` resolves as soon as the status line and headers arrive, so the
                 // response body/stream that follows is untouched. That is the piece
                 // reqwest's own `.timeout()` cannot express for a streaming response.
-                let header_wait = if attempt == 0 && candidate_max_attempts > 1 {
-                    // Measured, not guessed: a route with a known baseline is judged
-                    // against itself; an unknown one keeps FIRST_ATTEMPT_HEADER_WAIT.
-                    let adaptive =
-                        adaptive_first_attempt_wait(candidate.id, FIRST_ATTEMPT_HEADER_WAIT);
-                    remaining.min(max_header_wait).min(adaptive)
-                } else {
-                    remaining.min(max_header_wait)
-                };
+                let header_wait = remaining.min(max_header_wait);
                 let send_started = Instant::now();
                 let sent = match tokio::time::timeout(header_wait, req.send()).await {
                     Ok(result) => {
                         let header_ms = send_started.elapsed().as_millis();
                         match &result {
                             Ok(response) => {
-                                // Feed the route's own baseline so the next first-attempt
-                                // cutover is judged against measured behaviour.
-                                record_header_success(candidate.id, header_ms);
                                 tracing::info!(
+                                    request_id = request_id.as_deref().unwrap_or(""),
                                     model = %model_id,
                                     route_id = %candidate.id,
                                     attempt = attempt + 1,
                                     fresh_connection = attempt > 0,
                                     upstream_status = response.status().as_u16(),
                                     upstream_header_ms = header_ms,
+                                    gateway_request_elapsed_ms = gateway_request_started_at.elapsed().as_millis(),
                                     "upstream response headers received"
                                 )
                             }
                             Err(error) => tracing::warn!(
+                                request_id = request_id.as_deref().unwrap_or(""),
                                 model = %model_id,
                                 route_id = %candidate.id,
                                 attempt = attempt + 1,
                                 fresh_connection = attempt > 0,
                                 upstream_header_ms = header_ms,
+                                gateway_request_elapsed_ms = gateway_request_started_at.elapsed().as_millis(),
                                 error = %error,
                                 "upstream request failed before response headers"
                             ),
@@ -5413,28 +5603,17 @@ pub async fn chat_completions(
                             "upstream sent no response headers within {}s",
                             header_wait.as_secs()
                         );
-                        record_header_stall(candidate.id);
                         tracing::warn!(
+                            request_id = request_id.as_deref().unwrap_or(""),
                             model = %model_id,
                             url = %candidate_url,
                             attempt = attempt + 1,
                             waited_ms = header_wait.as_millis(),
+                            gateway_request_elapsed_ms = gateway_request_started_at.elapsed().as_millis(),
                             "upstream stalled before response headers"
                         );
                         route_failed_transient = true;
-                        if attempt + 1 >= candidate_max_attempts {
-                            break;
-                        }
-                        if !wait_for_upstream_retry(FAST_HEADER_RETRY_DELAY, route_deadline).await {
-                            break 'routes;
-                        }
-                        tracing::info!(
-                            model = %model_id,
-                            route_id = %candidate.id,
-                            next_attempt = attempt + 2,
-                            "retrying header-stalled route on a fresh connection"
-                        );
-                        continue;
+                        break;
                     }
                 };
                 match sent {
@@ -5609,6 +5788,7 @@ pub async fn chat_completions(
         let req_model = model_id.clone();
         let (bmode, percall, free_pool, free_micro) = effective_billing_micro(&conn, &model_id);
         let request_id_task = request_id.clone();
+        let gateway_request_started_at_task = gateway_request_started_at;
         // 思考钳位探测：只对"开了思考的 Anthropic 原生请求"检测丢块签名。
         let thinking_clip_probe = anthropic
             && (body.get("thinking").is_some()
@@ -5649,9 +5829,10 @@ pub async fn chat_completions(
             let mut stream_failure: Option<String> = None;
             // anthropic connections: translate the upstream Anthropic SSE → OpenAI SSE on the fly.
             let mut conv = if anthropic {
-                Some(AnthSse::with_tool_argument_rules(
+                Some(AnthSse::with_tool_argument_rules_started_at(
                     &req_model,
                     tool_argument_rules.clone(),
+                    gateway_request_started_at_task,
                 ))
             } else {
                 None
@@ -5698,7 +5879,8 @@ pub async fn chat_completions(
                             tracing::info!(
                                 model = %req_model,
                                 request_id = request_id_task.as_deref().unwrap_or(""),
-                                first_upstream_chunk_ms = response_opened_at.elapsed().as_millis(),
+                                first_upstream_chunk_after_headers_ms = response_opened_at.elapsed().as_millis(),
+                                first_upstream_chunk_total_ms = gateway_request_started_at_task.elapsed().as_millis(),
                                 chunk_bytes = chunk.len(),
                                 "first upstream stream chunk received"
                             );
@@ -5853,8 +6035,33 @@ pub async fn chat_completions(
                             std::io::ErrorKind::InvalidData,
                             err,
                         )))
-                        .await;
+                    .await;
                 }
+            }
+            if let Some(converter) = conv.as_ref() {
+                let thinking = converter.thinking_telemetry();
+                // reasoning_content is emitted one-for-one for non-empty
+                // thinking_delta payloads, so these forwarded counters are the same
+                // aggregate. No reasoning text is retained or logged here.
+                tracing::info!(
+                    request_id = request_id_task.as_deref().unwrap_or(""),
+                    model = %req_model,
+                    protocol = "anthropic",
+                    stream_result = if complete { "completed" } else { "failed" },
+                    nonempty_thinking_delta_chunks = thinking.nonempty_thinking_deltas,
+                    thinking_utf8_chars = thinking.thinking_utf8_chars,
+                    forwarded_reasoning_content_chunks = thinking.nonempty_thinking_deltas,
+                    forwarded_reasoning_content_utf8_chars = thinking.thinking_utf8_chars,
+                    first_native_event_kind = thinking.first_native_event_kind,
+                    first_native_event_total_ms = thinking.first_native_event_ms,
+                    first_model_progress_total_ms = thinking.first_model_progress_ms(),
+                    first_nonempty_thinking_delta_total_ms = thinking.first_nonempty_thinking_delta_ms,
+                    first_nonempty_text_delta_total_ms = thinking.first_nonempty_text_delta_ms,
+                    first_tool_use_start_total_ms = thinking.first_tool_use_start_ms,
+                    first_nonempty_tool_delta_total_ms = thinking.first_nonempty_tool_delta_ms,
+                    stream_total_ms = gateway_request_started_at_task.elapsed().as_millis(),
+                    "thinking telemetry: Anthropic stream outcome"
+                );
             }
             let cost = resolve_cost(
                 &bmode,
@@ -6553,13 +6760,16 @@ pub async fn image_generations(
 #[cfg(test)]
 mod billing_tests {
     use super::{
-        anthropic_thinking, anthropic_to_oai, chat_upstream_attempt_suffix,
+        anthropic_beta_header, anthropic_thinking, anthropic_to_oai, chat_upstream_attempt_suffix,
         chat_upstream_retry_base_delay_ms, clip_thinking_budget, compute_cost, is_image_gen_model,
         mark_thinking_clip, model_price_override, oai_to_anthropic, official_price,
         parse_usage_from_sse, project_quota_package, projected_provider_usd, resolve_cost,
         response_cache_safe, round_multiplier_up, split_fused_charge, thinking_clip_active,
+        telemetry_anthropic_event_kind, telemetry_output_config_effort, telemetry_reasoning_effort,
+        telemetry_thinking_type,
         tool_argument_rules, upstream_failure_status, validate_openai_sse_eof,
         validate_openai_sse_with_rules, AnthSse, FusedCharge, OpenAiSseValidator,
+        CHAT_UPSTREAM_MAX_ATTEMPTS_PER_ROUTE, CHAT_UPSTREAM_MAX_ROUTES_PER_REQUEST,
         THINKING_CLIP_ROUTES, THINKING_CLIP_SAFE_BUDGET,
     };
     use std::time::{Duration as ClipDuration, Instant as ClipInstant};
@@ -6703,6 +6913,12 @@ mod billing_tests {
     }
 
     #[test]
+    fn chat_gateway_opens_at_most_one_upstream_send_per_request() {
+        assert_eq!(CHAT_UPSTREAM_MAX_ROUTES_PER_REQUEST, 1);
+        assert_eq!(CHAT_UPSTREAM_MAX_ATTEMPTS_PER_ROUTE, 1);
+    }
+
+    #[test]
     fn chat_gateway_error_suffix_reports_single_route_retries() {
         assert_eq!(
             chat_upstream_attempt_suffix(1, 6, 502),
@@ -6782,7 +6998,6 @@ mod billing_tests {
     }
 
     // per_call mode bills the flat fee, ignoring token usage entirely.
-    #[test]
     /// A `models` row is a CONNECTION holding many enabled_models, so billing_mode /
     /// per_call_cents alone could only switch a WHOLE channel — "make this one model per-call"
     /// was impossible, which is exactly what the operator hit. model_billing overrides per id.
@@ -7665,13 +7880,17 @@ mod billing_tests {
     fn anthropic_to_oai_maps_content_tools_usage() {
         let av = json!({
             "id": "msg_1",
-            "content": [{"type": "text", "text": "Hello"}, {"type": "tool_use", "id": "t1", "name": "get_time", "input": {"tz": "Asia/Tokyo"}}],
+            "content": [{"type": "thinking", "thinking": "Check the request."}, {"type": "text", "text": "Hello"}, {"type": "tool_use", "id": "t1", "name": "get_time", "input": {"tz": "Asia/Tokyo"}}],
             "stop_reason": "tool_use",
             "usage": {"input_tokens": 10, "output_tokens": 5, "cache_read_input_tokens": 3, "cache_creation_input_tokens": 0}
         });
         let o = anthropic_to_oai(&av, "claude-opus-4-8");
         assert_eq!(o["choices"][0]["finish_reason"], "tool_calls");
         assert_eq!(o["choices"][0]["message"]["content"], "Hello");
+        assert_eq!(
+            o["choices"][0]["message"]["reasoning_content"],
+            "Check the request."
+        );
         assert_eq!(o["choices"][0]["message"]["tool_calls"][0]["id"], "t1");
         assert_eq!(
             o["choices"][0]["message"]["tool_calls"][0]["function"]["name"],
@@ -7686,6 +7905,21 @@ mod billing_tests {
         assert_eq!(o["usage"]["input_tokens"], 10); // Anthropic name (compute_cost reads this)
         assert_eq!(o["usage"]["prompt_tokens"], 10); // OpenAI name (clients read this)
         assert_eq!(o["usage"]["cache_read_input_tokens"], 3);
+    }
+
+    #[test]
+    fn anthropic_to_oai_ignores_redacted_thinking() {
+        let av = json!({
+            "content": [
+                {"type": "redacted_thinking", "data": "opaque"},
+                {"type": "text", "text": "Hello"}
+            ]
+        });
+        let o = anthropic_to_oai(&av, "claude-opus-4-8");
+        assert_eq!(o["choices"][0]["message"]["content"], "Hello");
+        assert!(o["choices"][0]["message"]
+            .get("reasoning_content")
+            .is_none());
     }
 
     #[test]
@@ -7718,6 +7952,86 @@ mod billing_tests {
         let _ = plain.push(b"data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n\n").unwrap();
         let _ = plain.push(b"data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n\n").unwrap();
         assert!(!plain.thinking_only_end_turn());
+    }
+
+    #[test]
+    fn thinking_telemetry_classifies_only_known_values_and_counts_visible_deltas() {
+        let inbound = json!({
+            "reasoning_effort": "HIGH",
+            "thinking": {"type": "adaptive"}
+        });
+        assert_eq!(telemetry_reasoning_effort(&inbound), "high");
+        assert_eq!(telemetry_thinking_type(&inbound), "adaptive");
+        assert_eq!(telemetry_output_config_effort(&json!({"output_config":{"effort":"medium"}})), "medium");
+
+        // Arbitrary caller strings are collapsed to a category rather than retained.
+        let untrusted = json!({
+            "reasoning_effort": "do not retain this input",
+            "thinking": {"type": "unrecognised"},
+            "output_config": {"effort": "unrecognised"}
+        });
+        assert_eq!(telemetry_reasoning_effort(&untrusted), "other");
+        assert_eq!(telemetry_thinking_type(&untrusted), "other");
+        assert_eq!(telemetry_output_config_effort(&untrusted), "other");
+
+        let mut stream = AnthSse::new("claude-opus-4-8");
+        stream
+            .push(b"data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"\"}}\n\n")
+            .unwrap();
+        stream
+            .push("data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"a中\"}}\n\n".as_bytes())
+            .unwrap();
+        let telemetry = stream.thinking_telemetry();
+        assert_eq!(telemetry.nonempty_thinking_deltas, 1);
+        assert_eq!(telemetry.thinking_utf8_chars, 2);
+    }
+
+    #[test]
+    fn anthropic_beta_header_keeps_context_and_adaptive_thinking_capabilities() {
+        let adaptive = json!({"thinking": {"type": "adaptive"}});
+        let beta = anthropic_beta_header(&adaptive, true)
+            .expect("adaptive request needs beta capabilities");
+        assert_eq!(
+            beta,
+            "context-1m-2025-08-07,interleaved-thinking-2025-05-14,effort-2025-11-24"
+        );
+        assert!(!beta.contains("redact-thinking"));
+
+        let no_context = anthropic_beta_header(&adaptive, false)
+            .expect("adaptive request needs thinking capabilities");
+        assert_eq!(
+            no_context,
+            "interleaved-thinking-2025-05-14,effort-2025-11-24"
+        );
+        assert_eq!(anthropic_beta_header(&json!({}), false), None);
+        assert_eq!(
+            telemetry_anthropic_event_kind(Some("message_start")),
+            "message_start"
+        );
+        assert_eq!(telemetry_anthropic_event_kind(Some("provider_private")), "other");
+    }
+
+    #[test]
+    fn anthropic_stream_telemetry_separates_control_frame_from_real_progress() {
+        let mut stream = AnthSse::new("claude-opus-4-8");
+        stream
+            .push(b"data: {\"type\":\"message_start\",\"message\":{}}\n\n")
+            .unwrap();
+        let control = stream.thinking_telemetry();
+        assert_eq!(control.first_native_event_kind, "message_start");
+        assert!(control.first_native_event_ms.is_some());
+        assert!(control.first_model_progress_ms().is_none());
+
+        stream
+            .push(b"data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"plan\"}}\n\n")
+            .unwrap();
+        let progress = stream.thinking_telemetry();
+        assert_eq!(progress.first_native_event_kind, "message_start");
+        assert!(progress.first_nonempty_thinking_delta_ms.is_some());
+        assert_eq!(
+            progress.first_model_progress_ms(),
+            progress.first_nonempty_thinking_delta_ms
+        );
     }
 
     #[test]
@@ -8766,12 +9080,10 @@ mod upstream_timeout_tests {
         }
     }
 
-    /// Thinking effort must never widen a broken transport's response-header window.
-    #[test]
     /// Regression (2026-08-01): the deep-thinking budget must recognise EVERY wire shape
     /// that turns thinking on. It used to key off `budget_tokens > 0` alone, so when the
     /// gateway switched modern Claude to `{"type":"adaptive"}` — which has no budget field —
-    /// thinking requests silently fell back to the standard 7s header / 180s idle budget and
+    /// thinking requests silently fell back to the standard header / 180s idle budget and
     /// died as 504s. The bug was invisible: nothing errored, the deadline was just wrong.
     #[test]
     fn adaptive_thinking_still_counts_as_deep_thinking() {
@@ -8783,14 +9095,17 @@ mod upstream_timeout_tests {
         assert!(request_is_deep_thinking(
             &json!({"thinking": {"type": "enabled", "budget_tokens": 12000}})
         ));
-        // Deepest OpenAI-shaped dials.
+        // Every enabled OpenAI-shaped dial turns thinking on. This is the only wire
+        // signal the adaptive Claude family carries before gateway translation.
+        assert!(request_is_deep_thinking(&json!({"reasoning_effort": "low"})));
+        assert!(request_is_deep_thinking(&json!({"reasoning_effort": "high"})));
         assert!(request_is_deep_thinking(&json!({"reasoning_effort": "max"})));
         assert!(request_is_deep_thinking(&json!({"reasoning_effort": "xhigh"})));
 
         // ...and a request with no thinking at all must NOT get the deep budget, or every
         // ordinary chat inherits a 600s idle window and a hung route stops looking hung.
         assert!(!request_is_deep_thinking(&json!({"messages": []})));
-        assert!(!request_is_deep_thinking(&json!({"reasoning_effort": "low"})));
+        assert!(!request_is_deep_thinking(&json!({"reasoning_effort": "off"})));
         assert!(!request_is_deep_thinking(
             &json!({"thinking": {"type": "disabled"}})
         ));
@@ -8801,23 +9116,21 @@ mod upstream_timeout_tests {
         assert_eq!(route_budget_for(true), route_budget_for(false));
     }
 
-    /// A single stalled route must not be allowed to consume a whole budget on its own
-    /// when the budget is the smaller of the two.
+    /// Header wait includes provider prefill, so it must cover the measured 5.7-8.5s
+    /// first-event latency without consuming the client's full 60s deadline.
     #[test]
     fn per_attempt_header_wait_is_request_aware_and_capped() {
-        // 7s 而不是 5s：实测小聊天最慢 3.9s，5s 只剩 1.1s 余量，一次偏慢的 prefill
-        // 就会被当成传输故障掐掉。总时长仍由 ROUTE_BUDGET 兜住。
         assert_eq!(
             max_header_wait_for_request(false, false),
-            Duration::from_secs(7)
+            Duration::from_secs(57)
         );
         assert_eq!(
             max_header_wait_for_request(false, true),
-            Duration::from_secs(8)
+            Duration::from_secs(57)
         );
         assert_eq!(
             max_header_wait_for_request(true, true),
-            Duration::from_secs(10)
+            Duration::from_secs(57)
         );
         assert!(DEEP_MAX_HEADER_WAIT < ROUTE_BUDGET);
     }
@@ -10459,107 +10772,6 @@ mod step_kind_tests {
 }
 
 #[cfg(test)]
-mod adaptive_header_wait_tests {
-    use super::*;
-
-    fn fresh_route() -> uuid::Uuid {
-        let id = uuid::Uuid::new_v4();
-        if let Ok(mut m) = ROUTE_HEADER_STATS.lock() {
-            m.remove(&id);
-        }
-        id
-    }
-
-    /// An unknown route must behave exactly as before — no measurement, no opinion.
-    #[test]
-    fn unknown_route_keeps_the_fixed_fallback() {
-        let id = fresh_route();
-        assert_eq!(
-            adaptive_first_attempt_wait(id, FIRST_ATTEMPT_HEADER_WAIT),
-            FIRST_ATTEMPT_HEADER_WAIT
-        );
-        // Two samples is still not a baseline worth trusting.
-        record_header_success(id, 300);
-        record_header_success(id, 300);
-        assert_eq!(
-            adaptive_first_attempt_wait(id, FIRST_ATTEMPT_HEADER_WAIT),
-            FIRST_ATTEMPT_HEADER_WAIT
-        );
-    }
-
-    /// A fast route gets a TIGHT leash — the old flat 4s was pure tax on these.
-    #[test]
-    fn fast_route_cuts_over_far_sooner_than_the_flat_wait() {
-        let id = fresh_route();
-        for _ in 0..6 {
-            record_header_success(id, 200);
-        }
-        let wait = adaptive_first_attempt_wait(id, FIRST_ATTEMPT_HEADER_WAIT);
-        assert!(
-            wait < FIRST_ATTEMPT_HEADER_WAIT,
-            "a 200ms route must not be given 4s: got {wait:?}"
-        );
-        // …but never so tight that ordinary jitter kills it.
-        assert!(wait >= Duration::from_millis(900), "floor must hold: {wait:?}");
-    }
-
-    /// A slow-but-HONEST route must stop being killed at 4s — this is the regression
-    /// that made the gateway abandon working upstreams and pay the cost twice.
-    #[test]
-    fn slow_but_healthy_route_is_given_more_than_the_flat_wait() {
-        let id = fresh_route();
-        for _ in 0..6 {
-            record_header_success(id, 3_000);
-        }
-        let wait = adaptive_first_attempt_wait(id, FIRST_ATTEMPT_HEADER_WAIT);
-        assert!(
-            wait > FIRST_ATTEMPT_HEADER_WAIT,
-            "a consistently-3s route needs room to answer: got {wait:?}"
-        );
-        assert!(wait <= Duration::from_secs(9), "ceiling must hold: {wait:?}");
-    }
-
-    /// Consecutive stalls shorten the leash: on these relays a FRESH CONNECTION is what
-    /// actually works, so reaching it sooner is the whole point.
-    #[test]
-    fn repeated_stalls_shorten_the_leash_and_success_restores_it() {
-        let id = fresh_route();
-        for _ in 0..6 {
-            record_header_success(id, 2_000);
-        }
-        let calm = adaptive_first_attempt_wait(id, FIRST_ATTEMPT_HEADER_WAIT);
-        record_header_stall(id);
-        record_header_stall(id);
-        let stalling = adaptive_first_attempt_wait(id, FIRST_ATTEMPT_HEADER_WAIT);
-        assert!(
-            stalling < calm,
-            "a habitual staller must cut over sooner: {stalling:?} !< {calm:?}"
-        );
-        // One success clears the streak — a transient blip must not permanently bias it.
-        record_header_success(id, 2_000);
-        assert!(
-            adaptive_first_attempt_wait(id, FIRST_ATTEMPT_HEADER_WAIT) > stalling,
-            "the shorter leash must relax once the route answers again"
-        );
-    }
-
-    /// The EWMA has to actually track a provider that degrades, within a few requests.
-    #[test]
-    fn baseline_follows_a_degrading_provider() {
-        let id = fresh_route();
-        for _ in 0..6 {
-            record_header_success(id, 200);
-        }
-        let before = adaptive_first_attempt_wait(id, FIRST_ATTEMPT_HEADER_WAIT);
-        for _ in 0..6 {
-            record_header_success(id, 4_000);
-        }
-        let after = adaptive_first_attempt_wait(id, FIRST_ATTEMPT_HEADER_WAIT);
-        assert!(after > before, "the baseline must follow reality: {after:?} !> {before:?}");
-    }
-}
-
-#[cfg(test)]
 mod route_disable_tests {
     /// A broken per-call route with unpriced models MUST still be disableable. The zero-fee guard
     /// exists to stop unbilled traffic; a route with active=false serves no traffic, so applying
@@ -10577,5 +10789,51 @@ mod route_disable_tests {
             window.contains("per_call_cents == 0") && window.contains("per_call_micro_usd == 0"),
             "the `active &&` gate must be on the zero-fee guard, not on an unrelated condition"
         );
+    }
+}
+
+
+#[cfg(test)]
+mod upstream_message_tests {
+    use super::*;
+
+    /// 上游用中文报余额不足时，必须被认出来 —— 而不是压成"上游暂时不可用"。
+    ///
+    /// 线上真实报文（2026-08-05，claude-sonnet-5 → changhuai.ai）：
+    ///   {"error":{"type":"new_api_error","message":
+    ///    "预扣费额度失败, 用户剩余额度: ＄0.055828, 需要预扣费额度: ＄0.134302"}}
+    /// 旧代码只匹配 insufficient_balance / insufficient account balance 两个英文串，
+    /// 于是用户看到的是"线路失败，请换个模型"，真实原因是账户只剩五分钱 —— 排查方向
+    /// 被完全带偏。
+    #[test]
+    fn chinese_balance_errors_are_recognised() {
+        let real = r#"{"error":{"type":"new_api_error","message":"预扣费额度失败, 用户剩余额度: ＄0.055828, 需要预扣费额度: ＄0.134302"}}"#;
+        let msg = friendly_upstream_for_test(403, real);
+        assert!(msg.contains("余额不足"), "必须点名余额不足，实际：{msg}");
+        assert!(
+            msg.contains("0.055828") && msg.contains("0.134302"),
+            "必须把上游说的「还剩多少 / 需要多少」带给用户，实际：{msg}",
+        );
+        assert!(
+            !msg.contains("上游暂时不可用，请换个模型或稍后再试。"),
+            "不能再退回那句什么都没说的兜底：{msg}",
+        );
+    }
+
+    /// 没被任何分支认出来的错误，也必须带上上游原话，而不是一句泛泛的"不可用"。
+    #[test]
+    fn unmapped_errors_still_carry_the_upstream_text() {
+        let msg = friendly_upstream_for_test(418, r#"{"error":{"message":"teapot overheated"}}"#);
+        assert!(msg.contains("teapot overheated"), "上游原话必须带出来：{msg}");
+        assert!(msg.contains("418"), "状态码要带上，方便对日志：{msg}");
+    }
+
+    /// 脱敏不能因为改了兜底而失效。
+    #[test]
+    fn upstream_text_is_still_key_redacted() {
+        let leaked = r#"{"error":{"message":"bad key sk-proj-AAAABBBBCCCCDDDDEEEEFFFFGGGGHHHHIIIIJJJJKKKKLLLL"}}"#;
+        let msg = friendly_upstream_for_test(500, leaked);
+        assert!(!msg.contains("sk-proj-AAAA"), "密钥不能进用户可见的报错：{msg}");
+        assert!(msg.contains("[redacted-key]"), "应留下脱敏标记：{msg}");
     }
 }

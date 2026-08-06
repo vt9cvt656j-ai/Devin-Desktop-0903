@@ -1,19 +1,20 @@
 # michael-design 设计体系（UI/建站任务的唯一设计真源——配色/布局/动效/组件/内容/验证全在这里，别处不重复）
 
-做界面/网站/产品 UI 时按本体系执行。核心方法：**michael-design 知识库选蓝本与 Tailwind 调色板 → 映射语义令牌 → 官方 primitive 组合 → 真机验证**。先有来源，再有体系，再有像素——不背默认 Hex，不把"科技感/高级感"翻译成暗色紫蓝渐变，不凭印象配色猜间距。
+做界面/网站/产品 UI 时按本体系执行。核心方法：**实时查询 michael-design 知识库选蓝本 → 映射到项目现有视觉令牌与组件 primitive → 真机验证**。先有来源，再有体系，再有像素——不背默认 Hex，不把"科技感/高级感"翻译成暗色紫蓝渐变，不凭印象配色猜间距。
 
 ## 0 意图与品类（先判断，再动手）
 - **建站/界面意图无条件适用本体系**，不管用户措辞是否含"网站/网页"字样；只要交付物是页面/界面就按这套来。
 - **产品名是生造词/随便起的**（Zorvex/sora2 这类）→ 先从功能描述推断业务品类（聊天→chat/SaaS、卖货→电商、发布内容→社区/媒体、工具→SaaS），用品类词检索，绝不拿生造名当 query。
-- **已有项目永远优先**：先读 package.json/样式入口/组件目录/主题 token，复用现有设计语言与组件，无缝融入，绝不写死颜色或硬塞突兀新风格。"与众不同"用在新东西上，"无缝融入"用在旧系统里。
+- **技术栈决策顺序**：用户明确指定的技术栈优先；已有可运行网站必须沿用其真实框架、语言、构建工具、样式方案与组件系统；只有空工作区、项目中没有网站，或用户明确要求重做且没有可复用/已声明技术栈时，才默认 React + Tailwind CSS + shadcn/ui（需要默认脚手架细节时使用 Vite + TypeScript）。
+- **已有项目永远优先**：先读 package.json/构建配置/样式入口/组件目录/主题 token，复用现有设计语言与组件，无缝融入；不得因为本体系提到 Tailwind、shadcn/ui 或 React 就迁移现有网站、混入第二套组件库或另起前端。"与众不同"用在新东西上，"无缝融入"用在旧系统里。
 - **力度分流**：从零整站/重设计走全流程；往已有项目加一块/改样式/做单组件，读现有栈跟着做那一小块，不摆方案选择器、不新起脚手架。
 
 ## 1 配色决策链（色相判断唯一来源是知识库，提示词不写死任何色相）
-决策链只有一条：① `knowledge_search(domain="michael-design")` 命中**本品类**蓝图/配色 → ② 成套采用命中配色；没命中品类就取 enterprise-standard 的 **Curated Palette Library** 最接近的一套并写明取了哪套 → ③ 再没有才按 design-judgment 的 Category Palette Harmony 从 Tailwind 调色板推导——**绝不凭模型记忆编色**。
-- **词汇表只有两层**：Tailwind 族+档（如 stone-950/amber-300）与语义 token（bg-primary/bg-card）。命中给的是 Hex/OKLCH 就先折算成最接近的 Tailwind 族+档（如 #17130d→stone-950）再用；**方案叙述、计划、业务代码一律用族档名或 token，禁止裸 hex**（hex 只允许留在 tokens 定义文件并注明折算来源）。
+决策链只有一条：① 每次任务真实调用 `knowledge_search(domain="michael-design")`，命中**本品类**蓝图/配色 → ② 成套采用命中配色；没命中品类就继续从该知识库查 enterprise-standard 的 **Curated Palette Library** 并写明具体命中 → ③ 再没有才依据检索到的 design-judgment/Category Palette Harmony，用项目现有色板或默认栈的 Tailwind 色板推导——**绝不把提示词中的摘要当作知识库调用，也绝不凭模型记忆编色**。
+- **词汇表跟随项目**：已有网站沿用其原有颜色变量、主题对象、CSS classes 或 design token 命名，再映射到 background/foreground/card/muted/primary/secondary/accent 等语义角色；默认 React + Tailwind CSS + shadcn/ui 分支才使用 Tailwind 族+档与语义 utility。**方案叙述、计划、业务代码一律优先使用项目 token，禁止散落裸 hex**（hex 只允许留在 token 定义文件并注明知识库来源）。
 - **品类闸门**：跨品类命中只借布局/动效/组件，**绝不借它的配色**；说"采用命中蓝图的 X 色调"必须指得出是哪个 section，命中里没有的配色不许假托知识库之名。
-- **结构**：锁定 1 个中性族（slate/zinc/stone/neutral 定冷暖）+ 1 个主强调族 + 至多 1 个有明确角色的辅助族，映射成 background/foreground/card/muted/primary/secondary/accent/section-* 语义 token；业务组件只消费 `bg-primary/text-muted-foreground/bg-secondary` 等语义类。
-- **浅色默认**：用户未明确要求暗色，根背景必须是浅色中性档（深色 hero 大图压暗不许蔓延成整页暗底）；选了暗色按知识库 enterprise-standard 的 Dark Theme Execution Standard 执行。未明确要求渐变只允许 1-2 处小面积功能强调，禁满屏渐变背景/渐变字/渐变卡片/发光。
+- **结构**：锁定 1 个中性族 + 1 个主强调族 + 至多 1 个有明确角色的辅助族，映射成 background/foreground/card/muted/primary/secondary/accent/section-* 语义 token；业务组件消费项目原有 token API，只有 Tailwind 项目才使用 `bg-primary/text-muted-foreground/bg-secondary` 等语义类。
+- **主题默认**：已有网站沿用其当前主题策略；只有建立新体系且用户未明确要求暗色时，根背景才默认浅色中性档（深色 hero 大图压暗不许蔓延成整页暗底）。选择暗色时按本轮从知识库检索到的 Dark Theme Execution Standard 执行。未明确要求渐变只允许 1-2 处小面积功能强调，禁满屏渐变背景/渐变字/渐变卡片/发光。
 - **禁模板惯性色**：凭惯性而非品类证据选色相 = 缺陷（默认蓝紫 indigo/violet、黑底霓虹、满屏 amber/黄都一样）。"温暖/公益/自然"不等于黄色。额外红黄绿只用于真实 error/warning/success。
 - **用色克制律（高级感第一定律，来自知识库 design-judgment）**：页面 ≥90% 面积必须是中性色（白/浅灰/近黑文字），强调色只出现在少数高价值角色——主 CTA、链接、选中态、焦点环、每屏至多一处重点标记；section 底色只做白/最浅中性交替，**绝不做整段彩色底**；每个 section 至多一种装饰手段，层级靠字重/字号/留白先行，颜色永远最后上。**拿不准就少用色：近黑白 + 一个利落主色 CTA 的页面永远比满页彩色高级。**
 - **统一 ≠ 黑白线框**：除非用户明确单色，primary/accent 必须实际落到至少两类角色（CTA、重点卡/标签、链接/图标、选中态、边框/焦点环），不能只定义 token 后全部 `border-white`/透明底——克制是"少而准"，不是"没有"。
@@ -23,36 +24,36 @@
 - **卡片先数数量再定网格**（唯一规则）：2=2 等分/split，3=3 等分，4=2×2，5=3+2 居中或主卡跨列，6=3×2，7=4+3 居中或 1 主卡+3×2；动态数量用 auto-fit/minmax 并显式处理末行。手机单列/横向 rail，平板重排，禁止最后一张孤立左下，也不为填满拉伸一张到不同尺寸。
 - **排列构图多样化**：从知识库 composition-repertoire 的 Layout Composition Repertoire 选（bento/zigzag/editorial/masonry/snap rail/sticky story/timeline/full-bleed/table/overlap），相邻区块不得同构图，别全站同款卡片。
 - **卡片不是线框占位**：重复 Card 从 surface 色阶、elevation/内高光、重点卡 tint、媒体、hover 变体中至少组合两层，不能只靠透明/同色底 + border；暗色卡片必须比画布更亮。Card 只用于真实卡片/面板/重复项，hero/全宽 section/沉浸式背景/营销叙事区写业务组件。
-- **留白与节奏**：8px 网格（4/8/12/16/24/32/48），靠留白与分组建立结构而非到处加边框；section 间 `py-24 md:py-32`，正文 `max-w-2xl`/`max-w-prose`；非对称节奏（文左图右交替、full-bleed 与受限宽文字交替），别从头居中一柱。
+- **留白与节奏**：优先沿用项目已有 spacing scale；没有时采用 8px 网格（4/8/12/16/24/32/48）。靠留白与分组建立结构而非到处加边框；section 间距和正文宽度用项目原生样式表达，默认 Tailwind 分支可用 `py-24 md:py-32`、`max-w-2xl`/`max-w-prose`；别从头居中一柱。
 
 ## 3 动效编排（采用知识库分层编排，不是统一淡入）
 从知识库 composition-repertoire 的 Motion & Effects Repertoire 选彼此兼容的组合，**禁止把所有特效硬堆一页**。动效形成四层系统：
-1. **标志性滚动叙事**：GSAP 方案必须是 GSAP+ScrollTrigger 并落实 scrub/pin/触发区间；Motion 滚动方案必须是 useScroll+useTransform，不是只 import 一个 hook。标志性效果至少连接两个业务区块，写明进度/时间线/视觉目的。
+1. **标志性滚动叙事**：优先沿用项目现有动画方案；采用 GSAP 时配合 ScrollTrigger 并落实 scrub/pin/触发区间，采用 Motion for React 时使用 useScroll+useTransform，其他框架使用其等价 API。标志性效果至少连接两个业务区块，写明进度/时间线/视觉目的。
 2. **可复用分区入场**：用 SectionReveal/ScrollSection（IntersectionObserver）统一多个内容区入场，不用每处手写。
 3. **控件/状态微交互**：按钮/卡片/tab/表单状态补 150-250ms 克制微交互（hover 抬升+阴影、ease-out），点到为止不喧宾夺主。
-4. **响应式/移动端编排**：移动端用 useMediaQuery/matchMedia 单独配 reveal distance/duration/stagger/并发上限，取消 pin/重型 canvas 或改静态/短距离版本。
+4. **响应式/移动端编排**：移动端用当前框架的 media-query API 或原生 matchMedia 单独配 reveal distance/duration/stagger/并发上限，取消 pin/重型 canvas 或改静态/短距离版本。
 - **必须 reduced-motion**：遵守 prefers-reduced-motion，给关动效用户静态兜底。
 - 孤立 useScroll/clip-path、只复制 fade-up/stagger 就声称"高级动画" = 不合格。平滑滚动用 Lenis，富矢量动画用 Lottie。
 
-## 4 组件覆盖（shadcn/ui + Tailwind v4，官方 primitive 组合，不造平行轮子）
-- **框架铁律**：用户没点名框架 → 一律 React + Vite + TS + Tailwind v4 + shadcn/ui，不要问、不要用别的；用户点名 Vue 用 shadcn-vue（别混 React 版），点名其它框架就把同一套语义令牌体系搬过去，绝不退化成随手内联样式。
-- **接线**：`npm i tailwindcss @tailwindcss/vite`；vite.config 加 `tailwindcss()` 插件 + `resolve.alias {"@": path.resolve(__dirname,"./src")}`；tsconfig 配 `paths {"@/*":["./src/*"]}`；CSS 入口 `@import "tailwindcss";` + `@custom-variant dark (&:is(.dark *));` + 令牌块；`npx shadcn@latest init` 后按需 `add` 页面真用到的组件，**禁止全量安装**；`cn()=twMerge(clsx(...))` 合并 className。
-- **语义令牌基线**（OKLCH，是起点不是终点）：`:root` 定义 --background/--foreground/--card/--popover/--primary/--secondary/--muted/--accent/--destructive/--border/--input/--ring + --radius，`@theme inline` 映射成 --color-* 与 --radius-*；`.dark` 覆盖同组名切不同值。**业务里绝不写 `bg-[#4f46e5]`/`text-gray-500` 散色**，一律走语义类。
-- **从基线到品牌**：① 选 base 中性定冷暖；② 定 primary + radius + 字体（承担 90% 品牌辨识度，标题挑有性格的展示体别默认 Inter）；③ 语义色微调保 WCAG AA。一次改这几个令牌全站统一。要多方向让用户拍板时做 2-3 套**只有 primary/radius/字体不同**的令牌预览，不生成三张 AI mockup 猜。
-- **primitive 目录**（按需 add）：表单 button/input/textarea/label/checkbox/radio-group/select/switch/slider/form/input-otp/toggle/combobox/calendar；展示 card/badge/avatar/alert/skeleton/separator/aspect-ratio/table/data-table/chart/carousel/typography；导航 navigation-menu/dropdown-menu/breadcrumb/pagination/tabs/sidebar/command；浮层 dialog/drawer/sheet/popover/hover-card/tooltip/sonner/progress；布局 accordion/collapsible/scroll-area/resizable。**有 primitive 就组合它，不另造 Button/Input/Card**；Button variant（default/secondary/outline/ghost/link/destructive）每个都有 hover/focus-visible/active/disabled。
-- **图标语义映射**（唯一规则）：先写"业务概念 → 对象/动作/状态 → 图标名"，再从项目图标库/Lucide/iconify_search 选统一风格：AI→Bot/Robot/Cpu，自动化→Workflow，订阅→Mail/Inbox，安全→ShieldCheck/Lock，分析→Chart/Gauge，游戏→Gamepad2。Sparkles/Wand 只表示真的闪光/魔法，禁万能代替；仅吉祥物/插画 pictogram 才 generate_image，按钮/工具栏图标不用位图。**绝不用 emoji 当图标**（连成功/失败/警告也用 SVG）。
-- **字体**：正文高可读无衬线（system-ui 兜底），标题挑展示体（Fraunces/Space Grotesk/Sora/Instrument Serif 配非 Inter 正文），Google Fonts 真加载；字号阶 12/14/16/20/24/30/36，正文行高 ~1.5、行宽 ≤70 字、数字 tabular-nums。
+## 4 组件覆盖（沿用项目 primitive，不造平行轮子）
+- **框架铁律**：用户指定栈优先；已有可运行网站完整保留实际框架、语言、构建、样式和组件系统，并优先组合项目已有 primitive。只有空工作区、没有网站，或明确重做且没有可复用/已声明栈时，默认 React + Tailwind CSS + shadcn/ui；需要脚手架默认细节时使用 Vite + TypeScript。
+- **默认栈接线仅限默认分支**：安装 Tailwind 并按当前稳定版及项目构建工具正确接线，初始化 shadcn/ui 后只添加页面真实使用的组件，**禁止全量安装**。已有项目不执行这套接线，使用其既有依赖、目录、工具函数和样式入口。
+- **语义令牌基线**：沿用现有项目的 token 载体与命名（CSS variables、主题对象、预处理器变量或 design-system API），覆盖 background/foreground/card/popover/primary/secondary/muted/accent/destructive/border/input/ring/radius 等角色；不存在时才建立一组。默认 Tailwind 分支可用 `@theme inline` 映射。**业务里不写散色**，一律走项目语义 token。
+- **从基线到品牌**：已有网站先保留品牌 token、radius 与字体，仅在用户要求的范围内调整；建立新体系时再选 base 中性、primary、radius 与字体，并微调语义色保证 WCAG AA。要多方向让用户拍板时做 2-3 套**只有 primary/radius/字体不同**的令牌预览，不生成三张 AI mockup 猜。
+- **primitive 目录**：表单、展示、导航、浮层与布局组件优先从项目现有组件库按需组合；默认分支才按需添加对应 shadcn/ui primitive，禁止全量安装。**有 primitive 就组合它，不另造平行 Button/Input/Card**；所有真实控件都覆盖 hover/focus-visible/active/disabled。
+- **图标语义映射**（唯一规则）：先写"业务概念 → 对象/动作/状态 → 图标名"，再从项目现有图标库或 `iconify_search` 选统一风格；默认分支可使用 Lucide。Sparkles/Wand 只表示真的闪光/魔法，禁万能代替；仅吉祥物/插画 pictogram 才 generate_image，按钮/工具栏图标不用位图。**绝不用 emoji 当图标**（连成功/失败/警告也用 SVG）。
+- **字体**：已有网站沿用其字体载入方式与 type scale；没有体系时，正文使用高可读字体与 system-ui 兜底，标题选择与知识库蓝本和品类相符的展示体并真实加载。字号、行高和行宽优先复用项目 token；新体系可从 12/14/16/20/24/30/36、正文行高约 1.5、行宽不超过 70 字开始，数字使用 tabular-nums。
 
 ## 5 内容与真实媒体（绝不留灰色占位框）
 - **信息密度来自真实信息量**：每个区块写清这个产品独有的对象、用户动作、限制、场景和结果，文案具体到这个产品；禁"赋能/一站式/重新定义未来/开启无限可能/无缝体验/Unlock the power/Elevate your/Next generation"套话，禁空 section 或同款卡片凑数。
 - **素材必须落地**：michael-design 蓝本里的 `Asset:`/`Preview:`/`Video URL:`/`<video>`/`<img>`/`backgroundImage`/`.mp4/.gif/.webp/.m3u8` 都是可用交付素材，完整网站至少 3 个可加载素材、重要区块至少一个视频或 GIF；`.m3u8` 接 hls.js 或换同蓝本更稳的 `.mp4/.gif/.webp`；坏资源就换，别留灰盒占位。
-- **人物头像一律真实图片**：优先蓝本 portrait/headshot URL 或项目肖像，其次 Pexels 人像/`https://i.pravatar.cc/150?u=稳定ID`，品牌一致用 generate_image 生成方形肖像存 public/。团队/作者/客户/评价/社区/玩家都渲染 `<img>`/AvatarImage + object-cover + 描边；AvatarFallback 只做加载失败备用，**禁首字母/渐变圆/灰圆/User 图标当最终头像**。
+- **人物头像一律真实图片**：优先蓝本 portrait/headshot URL 或项目肖像，其次可靠人像源；需要品牌一致时用 generate_image 生成方形肖像并存入项目实际静态资源目录。团队/作者/客户/评价/社区/玩家都用当前栈的图片或 Avatar primitive 渲染，固定裁切并加合适描边；fallback 只做加载失败备用，**禁首字母/渐变圆/灰圆/User 图标当最终头像**。
 - **配图**：占位真实照片 `https://picsum.photos/seed/词/1200/800`（seed 固定图稳定）；hero/产品图/定制插画用 generate_image；图标/装饰优先 SVG。图片处理：容器 aspect-ratio + object-fit:cover，loading="lazy"，压文字铺渐变遮罩，每张图带 alt。
 - **generate_image 出 UI 设计稿**（仅用户要先看效果图时）：当作"已上线真实产品截图"描述，严禁 concept art/illustration/sketch；5 段式（Scene→Subject→Important details→Use case→Constraints）；尺寸桌面 1792×1024/移动 1024×1536/组件 1024×1024；迭代复述不变量防漂移。它是参考稿，最终 UI 仍用真实代码实现。
 - **数据库决策**（编码前明确）：`不需要`（静态/构建期数据）/ `localStorage或IndexedDB`（单机草稿/偏好）/ `服务端数据库`（账户、跨设备同步、后台管理、订单/预约/评论/收藏），并说明业务理由；不能所有站硬塞数据库，也不能把需要真实数据的产品做成静态假按钮。
 
 ## 6 工程（好看也要扛得住）
-- **Tailwind v4 陷阱**：Preflight 已提供 reset，`@import "tailwindcss";` 后**禁止追加未分层的 `* { margin:0; padding:0 }`**（会覆盖 mx-auto/px-*/py-*），确需基础样式放 `@layer base`。full-bleed section 用"全宽外层 + `w-full max-w-* mx-auto px-*` 内层"，检查超宽屏左右对称与文字裁切。
+- **样式工程跟随现有栈**：不替换项目 reset、layer 或构建配置。Tailwind 项目中，Preflight 后不要追加未分层的全局 reset，确需基础样式放 `@layer base`；full-bleed section 用项目原生样式实现"全宽外层 + 受限宽内层"并检查超宽屏对称与文字裁切。
 - **状态做全**：hover/focus-visible/active/disabled/loading/空/错误/选中，别只做正常态。
 - **可访问性与性能**：语义标签 + aria + 键盘可达 + 对比度 WCAG AA（≥4.5:1）；响应式不溢出（移动端同样精致）；懒加载/虚拟列表/60fps；深浅主题都用变量，动效尊重 reduced-motion。
 - **统一色调**：来源不一的图加一致 CSS filter（轻调 saturate(1.05) contrast(1.03)，冷淡用 saturate(.9)），duotone 用 grayscale + 主色遮罩。
@@ -63,4 +64,4 @@
 - **设计自查清单**（截图后一次性逐条对照，只定位具体修复，不触发无休止重测）：① 对齐 ② 间距节奏 ③ 排版层级 ④ 配色与对比 ⑤ 视觉焦点 ⑥ 留白 ⑦ 一致性（圆角/阴影/按钮/图标）⑧ 状态齐全 ⑨ 细节质感 ⑩ 整体观感。
 - **对标**：和采用的 michael-design 蓝本及参考产品比，只修可命名的问题，不用模糊"不满意"驱动无限打磨。
 
-一句话：**知识库选蓝本 → 配色走决策链折 Tailwind 族档 → 语义令牌驱动 → 官方 primitive 组合 → 真人旅程定结构 → 分层动效 → 真机验证后停。**
+一句话：**实时调用知识库选蓝本 → 映射到项目现有配色与语义令牌 → 组合项目 primitive → 真人旅程定结构 → 分层动效 → 真机验证后停；仅无可沿用栈时进入 React + Tailwind CSS + shadcn/ui 默认分支。**

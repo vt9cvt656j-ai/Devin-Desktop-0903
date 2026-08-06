@@ -77,9 +77,14 @@ input.on("line", (line) => {
   if (message.method === "initialize") {
     reply(message.id, {
       protocolVersion: "2025-06-18",
-      capabilities: { tools: {} },
+      capabilities: { tools: {}, resources: {}, prompts: {} },
       serverInfo: { name: "michael-ide-test-fixture", version: "1.0.0" },
     });
+    return;
+  }
+
+  if (message.method === "ping") {
+    reply(message.id, {});
     return;
   }
 
@@ -111,5 +116,55 @@ input.on("line", (line) => {
     } else {
       send({ jsonrpc: "2.0", id: message.id, error: { code: -32602, message: "unknown tool" } });
     }
+    return;
+  }
+
+  if (message.method === "resources/list") {
+    reply(message.id, {
+      resources: [{
+        uri: "fixture://proof",
+        name: "Fixture proof",
+        description: "A readable fixture resource",
+        mimeType: "text/plain",
+      }],
+    });
+    return;
+  }
+
+  if (message.method === "resources/templates/list") {
+    reply(message.id, {
+      resourceTemplates: [{
+        uriTemplate: "fixture://items/{id}",
+        name: "Fixture item",
+        description: "A parameterized fixture resource",
+        mimeType: "application/json",
+      }],
+    });
+    return;
+  }
+
+  if (message.method === "resources/read") {
+    reply(message.id, {
+      contents: [{ uri: message.params?.uri || "fixture://proof", mimeType: "text/plain", text: "resource body" }],
+    });
+    return;
+  }
+
+  if (message.method === "prompts/list") {
+    reply(message.id, {
+      prompts: [{
+        name: "review",
+        description: "Review a target",
+        arguments: [{ name: "target", required: true }],
+      }],
+    });
+    return;
+  }
+
+  if (message.method === "prompts/get") {
+    reply(message.id, {
+      description: "Fixture review prompt",
+      messages: [{ role: "user", content: { type: "text", text: `Review ${message.params?.arguments?.target || "target"}` } }],
+    });
   }
 });

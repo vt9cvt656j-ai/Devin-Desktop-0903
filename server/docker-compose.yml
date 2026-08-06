@@ -45,6 +45,11 @@ services:
   backend:
     build: .
     restart: unless-stopped
+    # The server does not currently expose a graceful shutdown hook. Keep
+    # replacement downtime bounded instead of waiting Docker's 10s default;
+    # this also keeps nginx's loopback upstream from returning a long burst of
+    # 502s during routine image updates.
+    stop_grace_period: 2s
     # Hardest containment on the only public-facing service: no privilege escalation,
     # and drop ALL Linux capabilities (a Rust/axum HTTP server on :8080 needs none —
     # no <1024 bind, no chown/setuid). If this is ever RCE'd, the shell is unprivileged
@@ -57,6 +62,9 @@ services:
     environment:
       DATABASE_URL: postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
       REDIS_URL: redis://redis:6379
+      # 默认是 true —— 每个注册用户都会自动拿到往宿主机磁盘写文件、并占一个二级域名的
+      # 权限。关掉，改成按名单发放（DEPLOY_ALLOWLIST）。
+      DEPLOY_AUTO_GRANT: "0"
       BIND_ADDR: 0.0.0.0:8080
       DEPLOY_MAX_MB: "30"
       # DEPLOY_ALLOWLIST: 逗号分隔的账号 id；admin 永远可部署，其他账号须在此白名单里（在 .env 配）。

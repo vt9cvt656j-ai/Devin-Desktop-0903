@@ -1,9 +1,9 @@
 # michael-design 组件层：令牌、primitive、图标与排版
 
-- `:root` 定义 background/foreground/card/popover/primary/secondary/muted/accent/destructive/border/input/ring/radius，`@theme inline` 映射 `--color-*` 和 `--radius-*`，`.dark` 覆盖同名 token。一次确定 base 中性、primary、radius 与标题字体；业务组件只使用语义类，不写散色。
-- 栈与底座（本层唯一权威）：React + TypeScript + Tailwind v4 + **shadcn/ui**（@radix-ui/react-* primitive + class-variance-authority 写 variant + clsx/tailwind-merge 组成 `cn()`(src/lib/utils.ts) + lucide-react 图标）。原件放 src/components/ui/，业务区块放 src/components/sections/。Tailwind v4 是 CSS-first：令牌写在 CSS 的 `@theme inline`，**不建 tailwind.config/postcss.config，不装 postcss/autoprefixer/tailwindcss-animate**。
-- 「官方 primitive」= 上面这套 shadcn/ui + Radix。有官方 primitive 就组合，不另造平行 Button/Input/Card。表单/展示/导航/浮层各按需 add，禁止全量安装。
+- 栈与底座按这个顺序决定：用户明确指定的栈优先；已有可运行网站沿用实际框架、语言、构建工具、样式方案、组件库、目录约定和工具函数；只有空工作区、项目里没有网站，或明确重做且没有可复用/已声明栈时，默认 React + Tailwind CSS + shadcn/ui（需要默认脚手架细节时使用 Vite + TypeScript）。不得向现有网站混入第二套框架或组件库。
+- 沿用项目现有 token 载体与命名；没有时才建立 background/foreground/card/popover/primary/secondary/muted/accent/destructive/border/input/ring/radius 等语义角色。业务组件只消费当前项目的语义 token 或语义类，不写散色。默认 Tailwind 分支可用 CSS-first 的 `@theme inline`，shadcn/ui primitive 按需添加，并用 `cn()=twMerge(clsx(...))` 合并 className；其他技术栈用其原生主题 API、CSS variables、预处理器变量或组件系统表达同一语义，不强行移植 Tailwind class 或 React 目录结构。
+- 「官方 primitive」指当前项目已经采用的组件库原件；默认分支才指 shadcn/ui + Radix。已有 primitive 就组合，不另造平行 Button/Input/Card；表单、展示、导航和浮层按需引入，禁止全量安装。
 - Button 的 default/secondary/outline/ghost/link/destructive 都要有 hover、focus-visible、active、disabled；同一要求适用于真实可交互控件。
-- 图标先做“业务概念 → 对象/动作/状态 → 图标名”映射，再从项目图标库、Lucide 或 iconify_search 选统一风格。语义要对（AI=Bot/Cpu，安全=ShieldCheck，分析=Chart）；Sparkles/Wand 只表示真实闪光或魔法；按钮和工具栏不用位图、emoji 或临时手写 SVG。
-- 正文使用高可读无衬线与 system-ui 兜底，标题选有辨识度的展示体（Fraunces/Space Grotesk/Sora 等），避免整页默认 Inter。真实加载字体；字号按 12/14/16/20/24/30/36 建立阶梯，正文行高约 1.5、行宽不超过 70 字，数字使用 tabular-nums。
+- 图标先做“业务概念 → 对象/动作/状态 → 图标名”映射，再从项目现有图标库或 iconify_search 选统一风格；默认分支可使用 Lucide。语义要对（AI=Bot/Cpu，安全=ShieldCheck，分析=Chart）；Sparkles/Wand 只表示真实闪光或魔法；按钮和工具栏不用位图、emoji 或临时手写 SVG。
+- 已有网站沿用其字体载入方式、字体族和 type scale，除非用户要求重做排版。没有现有体系时，正文使用高可读字体与 system-ui 兜底，标题选择与实时检索的 michael-design 蓝本和品类相符的展示体并真实加载；可按 12/14/16/20/24/30/36 建立字号阶梯，正文行高约 1.5、行宽不超过 70 字，数字使用 tabular-nums。
 - 需要给用户比较方向时，只做 2-3 套 primary/radius/字体不同的令牌预览，不生成多张无依据 AI mockup 猜风格。

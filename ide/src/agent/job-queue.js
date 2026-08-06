@@ -13,11 +13,14 @@ import getSharedStore from './shared-store.js';
 class JobQueue {
   constructor(options = {}) {
     this.jobs = new Map(); // jobId -> JobConfig
-    this.pendingPromises = new Map(); // jobId -> Promise + resolve/reject
+    this.pendingPromises = new Map(); // jobId -> Set<{resolve,reject}>
     this.maxConcurrent = options.maxConcurrent || parseInt(import.meta.env?.MAX_SUBAGENTS_CONCURRENT || '5');
+    this.tokenBudget = Math.max(1, Number(options.tokenBudget || 100000));
     this.tokenWarningThreshold = options.tokenWarningThreshold || 80;
+    this.runner = typeof options.runner === 'function' ? options.runner : null;
+    this.historyTTL = Math.max(0, Number(options.historyTTL ?? 3600000));
     
-    this.sharedStore = getSharedStore();
+    this.sharedStore = options.sharedStore || getSharedStore();
     
     this.activeCount = 0;
     this.totalExecuted = 0;
@@ -48,6 +51,8 @@ class JobQueue {
       onComplete,
       tools: agentTools,
       sharedContext,
+      runner: jobRunner,
+      runnerConfig: explicitRunnerConfig,
       ...runnerConfig
     } = config;
     
@@ -62,7 +67,7 @@ class JobQueue {
       args: JSON.stringify(args),
       agentTools,
       sharedContext: sharedContext ? Object.keys(sharedContext).slice(0, 10).join(', ') : 'none'
-    });
+    }, jobId);
     
     const jobConfig = {
       id: jobId,
@@ -73,12 +78,15 @@ class JobQueue {
       onProgress,
       onComplete,
       agentTools,
-      runnerConfig,
+      runner: typeof jobRunner === 'function' ? jobRunner : this.runner,
+      runnerConfig: { ...(runnerConfig || {}), ...(explicitRunnerConfig || {}) },
       submittedAt: Date.now(),
       startedAt: null,
       completedAt: null,
       tokensUsed: 0,
-      status: 'pending'
+      status: 'pending',
+      abortController: typeof AbortController === 'function' ? new AbortController() : null,
+      waiters: new Set()
     };
     
     this.jobs.set(jobId, jobConfig);
@@ -95,17 +103,13 @@ class JobQueue {
   async abort(jobId) {
     const job = this.jobs.get(jobId);
     if (!job) return false;
-    
+    if (['completed', 'failed', 'aborted'].includes(job.status)) return false;
     job.abort = true;
-    this.sharedStore.updateJobStatus(jobId, 'aborted');
-    
-    // 解析 pending promise
-    const pending = this.pendingPromises.get(jobId);
-    if (pending) {
-      pending.reject?.(new Error('Job aborted by user'));
-      this.pendingPromises.delete(jobId);
-    }
-    
+    try { job.abortController?.abort(); } catch {}
+    // Queued jobs have not entered the runner yet and can settle immediately.
+    // Running jobs settle after the injected runner returns so the concurrency
+    // counter remains truthful while it releases resources.
+    if (job.status === 'pending') this._settleJob(job, 'aborted', null, new Error('Job aborted by user'));
     return true;
   }
 
@@ -151,16 +155,20 @@ class JobQueue {
         resolve(job.result);
         return;
       }
-      
-      const timeoutId = timeout ? setTimeout(() => {
-        reject(new Error(`Job ${jobId} timed out after ${timeout}ms`));
-      }, timeout) : null;
-      
-      // 注册一次性回调
-      this._onCompleteOnce(jobId, (result) => {
-        clearTimeout(timeoutId);
-        resolve(result);
-      }, reject);
+      if (['failed', 'aborted'].includes(job.status)) {
+        reject(job.error instanceof Error ? job.error : new Error(String(job.error || `Job ${jobId} ${job.status}`)));
+        return;
+      }
+
+      const waiter = { resolve, reject, timer: null };
+      if (timeout) {
+        waiter.timer = setTimeout(() => {
+          job.waiters.delete(waiter);
+          reject(new Error(`Job ${jobId} timed out after ${timeout}ms`));
+        }, Math.max(1, Number(timeout)));
+      }
+      job.waiters.add(waiter);
+      this.pendingPromises.set(jobId, job.waiters);
     });
   }
 
@@ -175,6 +183,7 @@ class JobQueue {
       currentConcurrency: this.activeCount,
       maxConcurrency: this.maxConcurrent,
       totalTokens: this.totalTokens,
+      tokenBudget: this.tokenBudget,
       tokenWarningThreshold: this.tokenWarningThreshold + '%'
     };
   }
@@ -195,12 +204,17 @@ class JobQueue {
    * 清空历史数据
    */
   clearHistory() {
-    const active = this.getActiveJobs();
-    const toDelete = Array.from(this.jobs.keys())
-      .filter(id => !active.find(j => j.jobId === id));
-    
-    this.delete(toDelete);
-    return toDelete.length;
+    const active = new Set(this.getActiveJobs().map((job) => job.id));
+    let removed = 0;
+    for (const [jobId] of this.jobs.entries()) {
+      if (!active.has(jobId)) {
+        this.jobs.delete(jobId);
+        this.pendingPromises.delete(jobId);
+        this.sharedStore.delete(`jobs.${jobId}`);
+        removed++;
+      }
+    }
+    return removed;
   }
 
   // ==================== 私有方法 ====================
@@ -235,6 +249,10 @@ class JobQueue {
   }
 
   async _executeJob(jobConfig) {
+    if (jobConfig.abort) {
+      this._settleJob(jobConfig, 'aborted', null, new Error('Job aborted before start'));
+      return;
+    }
     this.activeCount++;
     jobConfig.status = 'running';
     jobConfig.startedAt = Date.now();
@@ -243,144 +261,109 @@ class JobQueue {
     this.publish('job_started', jobConfig);
     
     try {
-      // 这里应该调用实际的 agent runner
-      // 由于是纯 JS 实现，我们先模拟一个流程
       const result = await this._runAgent(jobConfig);
-      
-      jobConfig.status = 'completed';
-      jobConfig.completedAt = Date.now();
+      if (jobConfig.abort) {
+        this._settleJob(jobConfig, 'aborted', null, new Error('Job aborted by user'));
+      } else {
+        this._settleJob(jobConfig, 'completed', result);
+        if (jobConfig.onComplete) {
+          try { await jobConfig.onComplete(result); }
+          catch (err) { console.error('[JobQueue] onComplete callback error:', err); }
+        }
+      }
+    } catch (error) {
+      console.error('[JobQueue] Job failed:', jobConfig.id, error);
+      this._settleJob(jobConfig, 'failed', null, error);
+    } finally {
+      this.activeCount--;
+    }
+  }
+
+  async _runAgent(jobConfig) {
+    const runner = jobConfig.runner;
+    if (typeof runner !== 'function') {
+      throw new Error('JobQueue requires an injected runner; refusing to simulate an agent job');
+    }
+    const reportProgress = (update = {}) => {
+      const progress = Number.isFinite(Number(update.progress))
+        ? Math.max(0, Math.min(100, Number(update.progress)))
+        : undefined;
+      if (progress !== undefined) this.sharedStore.updateJobStatus(jobConfig.id, 'running', progress);
+      if (update.finding) this.sharedStore.appendFinding(jobConfig.id, update.finding);
+      if (typeof jobConfig.onProgress === 'function') {
+        try { jobConfig.onProgress(update); }
+        catch (error) { console.error('[JobQueue] onProgress callback error:', error); }
+      }
+    };
+    const result = await runner(jobConfig, {
+      args: jobConfig.args,
+      config: jobConfig.runnerConfig,
+      signal: jobConfig.abortController?.signal,
+      isAborted: () => !!jobConfig.abort,
+      reportProgress,
+    });
+    const used = Number(result?.tokensUsed);
+    if (Number.isFinite(used) && used >= 0) {
+      jobConfig.tokensUsed = used;
+      this.totalTokens += used;
+      if (this.totalTokens >= this.tokenBudget * this.tokenWarningThreshold / 100) {
+        this.publish('token_warning', { total: this.totalTokens, threshold: this.tokenWarningThreshold });
+      }
+    }
+    return result;
+  }
+
+  _settleJob(jobConfig, status, result = null, error = null) {
+    if (!jobConfig || ['completed', 'failed', 'aborted'].includes(jobConfig.status)) return;
+    jobConfig.status = status;
+    jobConfig.completedAt = Date.now();
+    if (status === 'completed') {
       jobConfig.result = result;
-      jobConfig.tokensUsed = this.totalTokens;
-      
+      this.totalExecuted++;
       this.sharedStore.updateJobStatus(jobConfig.id, 'completed', 100);
       this.sharedStore.appendFinding(jobConfig.id, {
-        source: 'agent',
-        type: 'completion',
-        data: { summary: result.summary, findingsCount: result.findings?.length || 0 }
+        source: 'agent', type: 'completion',
+        data: { summary: result?.summary || '', findingsCount: result?.findings?.length || 0 }
       });
-      
-      this.totalExecuted++;
-      
       this.publish('job_completed', {
         id: jobConfig.id,
         duration: jobConfig.completedAt - jobConfig.startedAt,
         result
       });
-      
-      // 触发回调
-      if (jobConfig.onComplete) {
-        try {
-          await jobConfig.onComplete(result);
-        } catch (err) {
-          console.error('[JobQueue] onComplete callback error:', err);
-        }
-      }
-      
-      // 通知等待该 job 的 promise
-      const pending = this.pendingPromises.get(jobConfig.id);
-      if (pending && pending.resolve) {
-        pending.resolve(result);
-        this.pendingPromises.delete(jobConfig.id);
-      }
-      
-    } catch (error) {
-      jobConfig.status = 'failed';
-      jobConfig.error = error.message;
-      
-      this.sharedStore.updateJobStatus(jobConfig.id, 'failed');
+    } else {
+      jobConfig.error = error instanceof Error ? error : new Error(String(error || status));
+      this.sharedStore.updateJobStatus(jobConfig.id, status);
       this.sharedStore.appendFinding(jobConfig.id, {
-        source: 'agent',
-        type: 'error',
-        data: error.message
+        source: 'agent', type: 'error', data: jobConfig.error.message
       });
-      
-      console.error('[JobQueue] Job failed:', jobConfig.id, error);
-      
-      const pending = this.pendingPromises.get(jobConfig.id);
-      if (pending && pending.reject) {
-        pending.reject(error);
-        this.pendingPromises.delete(jobConfig.id);
-      }
-      
-    } finally {
-      this.activeCount--;
-      this.jobs.delete(jobConfig.id); // 完成后删除，避免内存泄漏
+      this.publish(status === 'aborted' ? 'job_aborted' : 'job_failed', {
+        id: jobConfig.id, error: jobConfig.error.message
+      });
     }
-  }
-
-  async _runAgent(jobConfig) {
-    /**
-     * ⚠️ 这是一个 stub 实现
-     * 真实逻辑需要从 Rust 端调用 AgentRunner
-     * 
-     * 简化模拟流程:
-     * 1. 每步更新进度
-     * 2. 收集 findings
-     * 3. 最后汇总报告
-     */
-    
-    const maxSteps = jobConfig.runnerConfig.maxSteps || 20;
-    let findings = [];
-    
-    for (let step = 1; step <= maxSteps; step++) {
-      // 检查是否取消
-      if (jobConfig.abort) {
-        throw new Error('Job aborted');
-      }
-      
-      // 模拟进度
-      const progress = Math.round((step / maxSteps) * 100);
-      this.sharedStore.updateJobStatus(jobConfig.id, 'running', progress);
-      
-      // 模拟生成一些 findings
-      if (step % 2 === 0) {
-        const finding = {
-          step,
-          type: 'discovery',
-          content: `Analyzing ${jobConfig.role} task at step ${step}...`,
-          confidence: 0.7 + Math.random() * 0.3
-        };
-        
-        findings.push(finding);
-        this.sharedStore.appendFinding(jobConfig.id, finding);
-        
-        if (jobConfig.onProgress) {
-          jobConfig.onProgress({
-            step,
-            progress,
-            findings: [finding]
-          });
-        }
-      }
-      
-      // 模拟 token 消耗
-      this.totalTokens += Math.floor(Math.random() * 100) + 50;
-      jobConfig.tokensUsed = this.totalTokens;
-      
-      // 检查 token 阈值
-      if (this.totalTokens > 100000 && this.totalTokens / 100000 >= this.tokenWarningThreshold / 100) {
-        console.warn(`[JobQueue] Token warning: ${this.totalTokens.toLocaleString()} tokens used`);
-        this.publish('token_warning', { total: this.totalTokens, threshold: this.tokenWarningThreshold });
-      }
-      
-      // 模拟延迟 (实际应该更快)
-      await new Promise(resolve => setTimeout(resolve, 500));
+    const waiters = jobConfig.waiters || this.pendingPromises.get(jobConfig.id) || [];
+    for (const waiter of waiters) {
+      if (waiter.timer) clearTimeout(waiter.timer);
+      if (status === 'completed') waiter.resolve(result);
+      else waiter.reject(jobConfig.error || new Error(`Job ${jobConfig.id} ${status}`));
     }
-    
-    return {
-      summary: `Completed ${jobConfig.role} task after ${maxSteps} steps`,
-      findings: findings.slice(-20), // 返回最后 20 条
-      stepsExecuted: maxSteps,
-      tokensUsed: jobConfig.tokensUsed
-    };
+    jobConfig.waiters?.clear();
+    this.pendingPromises.delete(jobConfig.id);
+    if (this.historyTTL > 0) {
+      const timer = setTimeout(() => {
+        const current = this.jobs.get(jobConfig.id);
+        if (current === jobConfig && ['completed', 'failed', 'aborted'].includes(current.status)) this.jobs.delete(jobConfig.id);
+      }, this.historyTTL);
+      if (typeof timer?.unref === 'function') timer.unref();
+    }
   }
 
   _startMonitoring() {
     // 每分钟输出统计
-    setInterval(() => {
+    const timer = setInterval(() => {
       const stats = this.stats();
       console.log('[JobQueue] Stats:', stats);
     }, 60000);
+    if (typeof timer?.unref === 'function') timer.unref();
   }
 
   // 事件系统
@@ -410,24 +393,6 @@ class JobQueue {
     });
   }
 
-  _onCompleteOnce(jobId, resolve, reject) {
-    const handler = (data) => {
-      if (data.id === jobId) {
-        this._off('job_completed', handler);
-        resolve(data.result);
-      }
-    };
-    
-    const errorHandler = (data) => {
-      if (data.id === jobId) {
-        this._off('job_error', errorHandler);
-        reject(new Error(data.error));
-      }
-    };
-    
-    this._on('job_completed', handler);
-    this._on('job_failed', errorHandler);
-  }
 }
 
 // ==================== 全局实例 ====================

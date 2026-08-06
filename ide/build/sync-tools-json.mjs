@@ -11,8 +11,10 @@
 // `_applyCloudToolDescs` (identity: cloud descriptions come FROM this file, so there
 // is nothing to overlay when generating it). The result is the exact runtime array.
 //
-// Merge policy is ADDITIVE: existing entries keep their position and content; only
-// tools absent from tools.json are appended. This cannot silently drop a capability.
+// Name membership is strict: the desktop registry is authoritative. Entries that
+// exist only in tools.json are removed because the gateway would otherwise advertise
+// a tool the desktop cannot discover or execute. Existing entries keep their order
+// and descriptions; newly registered tools are appended.
 //
 // Run: node build/sync-tools-json.mjs         (writes tools.json, prints a summary)
 //      node build/sync-tools-json.mjs --check  (exit 1 if out of sync, writes nothing)
@@ -21,8 +23,10 @@ import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
-const MAIN = join(HERE, "../src/main.js");
-const TOOLS_JSON = join(HERE, "../../server/prompts/tools.json");
+// Tests may point the synchronizer at isolated fixtures. Production calls leave
+// both variables unset and continue to use the repository paths below.
+const MAIN = process.env.MICHAEL_IDE_MAIN_PATH || join(HERE, "../src/main.js");
+const TOOLS_JSON = process.env.MICHAEL_IDE_TOOLS_JSON_PATH || join(HERE, "../../server/prompts/tools.json");
 const SRC = readFileSync(MAIN, "utf8");
 
 // ---- source scanner (skip strings / templates / regex / comments) ----
@@ -90,60 +94,191 @@ const currentNames = new Set(current.map((t) => t?.function?.name).filter(Boolea
 const missing = [...registryByName.keys()].filter((name) => !currentNames.has(name));
 const onlyInCatalog = [...currentNames].filter((name) => !registryByName.has(name));
 
-// 光比工具**名**是不够的。
-//
-// 网关是按名字注入 schema 的：名字对上、参数却对不上，模型就会照客户端的定义去传参，
-// 而网关拿着一份旧 schema 去校验/转发 —— 表现是那个工具一用就报错或参数被丢掉。历史上
-// 已经踩过一次（线上 109 工具 vs 客户端 137，43 个工具一旦用就无 schema）。
-//
-// 只比**参数名集合**和 **required 集合**：描述文字本来就以目录为准（构建期还会被
-// strip-tool-ip 清空），拿它做判据只会制造噪音。
+// 光比工具**名**或者顶层参数成员是不够的。网关按名字注入完整 schema；嵌套对象、数组、
+// enum/union 或边界约束漂移，同样会让合法调用被拒绝或让无效参数漏过校验。
 const currentByName = new Map();
 for (const tool of current) {
   const name = tool?.function?.name;
   if (name) currentByName.set(name, tool);
 }
 
-const paramShape = (tool) => {
-  const params = tool?.function?.parameters || {};
-  const props = Object.keys(params.properties || {}).sort();
-  const required = [...(Array.isArray(params.required) ? params.required : [])].sort();
-  return { props, required };
-};
+const SCHEMA_ANNOTATIONS = new Set(["description", "title"]);
+const SCHEMA_MAP_KEYWORDS = new Set([
+  "properties",
+  "patternProperties",
+  "dependentSchemas",
+  "definitions",
+  "$defs",
+]);
+const SCHEMA_ARRAY_KEYWORDS = new Set(["allOf", "anyOf", "oneOf", "prefixItems"]);
+const SCHEMA_SINGLE_KEYWORDS = new Set([
+  "additionalProperties",
+  "contains",
+  "contentSchema",
+  "else",
+  "if",
+  "items",
+  "not",
+  "propertyNames",
+  "then",
+  "unevaluatedItems",
+  "unevaluatedProperties",
+]);
+const hasOwn = (value, key) => Object.prototype.hasOwnProperty.call(value, key);
+const isObject = (value) => value !== null && typeof value === "object" && !Array.isArray(value);
+
+// Return the validation-relevant schema only. Object key order is normalized so
+// hand-edited JSON formatting cannot create false drift; array order remains exact
+// because it can be meaningful for tuple items and union branch precedence.
+function schemaShape(node) {
+  if (!isObject(node)) return node;
+  const shaped = {};
+  for (const key of Object.keys(node).filter((key) => !SCHEMA_ANNOTATIONS.has(key)).sort()) {
+    const value = node[key];
+    if (SCHEMA_MAP_KEYWORDS.has(key) && isObject(value)) {
+      shaped[key] = Object.fromEntries(
+        Object.keys(value).sort().map((name) => [name, schemaShape(value[name])]),
+      );
+    } else if (SCHEMA_ARRAY_KEYWORDS.has(key) && Array.isArray(value)) {
+      shaped[key] = value.map(schemaShape);
+    } else if (SCHEMA_SINGLE_KEYWORDS.has(key)) {
+      shaped[key] = Array.isArray(value) ? value.map(schemaShape) : schemaShape(value);
+    } else if (key === "dependencies" && isObject(value)) {
+      shaped[key] = Object.fromEntries(
+        Object.keys(value).sort().map((name) => [
+          name,
+          isObject(value[name]) ? schemaShape(value[name]) : value[name],
+        ]),
+      );
+    } else {
+      shaped[key] = value;
+    }
+  }
+  return shaped;
+}
+
+// Produce reviewable paths rather than a single opaque "schema changed" flag.
+// This walks every JSON-schema keyword, including type/default/required, unions,
+// items, ranges, patterns and additionalProperties, without maintaining a brittle
+// allow-list that would miss a newly introduced constraint.
+function collectSchemaDiffs(expected, actual, path = "parameters", diffs = []) {
+  if (Object.is(expected, actual)) return diffs;
+  if (Array.isArray(expected) || Array.isArray(actual)) {
+    if (!Array.isArray(expected) || !Array.isArray(actual)) {
+      diffs.push(`${path}: ${JSON.stringify(actual)} -> ${JSON.stringify(expected)}`);
+      return diffs;
+    }
+    if (expected.length !== actual.length) {
+      diffs.push(`${path}.length: ${actual.length} -> ${expected.length}`);
+    }
+    const commonLength = Math.min(expected.length, actual.length);
+    for (let i = 0; i < commonLength; i++) {
+      collectSchemaDiffs(expected[i], actual[i], `${path}[${i}]`, diffs);
+    }
+    return diffs;
+  }
+  if (isObject(expected) || isObject(actual)) {
+    if (!isObject(expected) || !isObject(actual)) {
+      diffs.push(`${path}: ${JSON.stringify(actual)} -> ${JSON.stringify(expected)}`);
+      return diffs;
+    }
+    const keys = [...new Set([...Object.keys(expected), ...Object.keys(actual)])].sort();
+    for (const key of keys) {
+      const childPath = `${path}.${key}`;
+      if (!hasOwn(expected, key)) diffs.push(`${childPath}: remove`);
+      else if (!hasOwn(actual, key)) diffs.push(`${childPath}: add ${JSON.stringify(expected[key])}`);
+      else collectSchemaDiffs(expected[key], actual[key], childPath, diffs);
+    }
+    return diffs;
+  }
+  diffs.push(`${path}: ${JSON.stringify(actual)} -> ${JSON.stringify(expected)}`);
+  return diffs;
+}
+
+// Clone the registry schema (the structural source of truth) while carrying over
+// catalog prose at the corresponding node. Generic recursion handles properties,
+// items, anyOf/oneOf/allOf and future schema keywords uniformly.
+function mergeSchemaAnnotations(registryNode, catalogNode) {
+  if (!isObject(registryNode)) return registryNode;
+
+  const mergedNode = {};
+  for (const [key, value] of Object.entries(registryNode)) {
+    const catalogValue = isObject(catalogNode) ? catalogNode[key] : undefined;
+    if (SCHEMA_MAP_KEYWORDS.has(key) && isObject(value)) {
+      mergedNode[key] = Object.fromEntries(
+        Object.entries(value).map(([name, childSchema]) => [
+          name,
+          mergeSchemaAnnotations(childSchema, isObject(catalogValue) ? catalogValue[name] : undefined),
+        ]),
+      );
+    } else if (SCHEMA_ARRAY_KEYWORDS.has(key) && Array.isArray(value)) {
+      mergedNode[key] = value.map((childSchema, index) =>
+        mergeSchemaAnnotations(childSchema, Array.isArray(catalogValue) ? catalogValue[index] : undefined),
+      );
+    } else if (SCHEMA_SINGLE_KEYWORDS.has(key)) {
+      mergedNode[key] = Array.isArray(value)
+        ? value.map((childSchema, index) =>
+            mergeSchemaAnnotations(childSchema, Array.isArray(catalogValue) ? catalogValue[index] : undefined),
+          )
+        : mergeSchemaAnnotations(value, catalogValue);
+    } else if (key === "dependencies" && isObject(value)) {
+      mergedNode[key] = Object.fromEntries(
+        Object.entries(value).map(([name, dependency]) => [
+          name,
+          isObject(dependency)
+            ? mergeSchemaAnnotations(dependency, isObject(catalogValue) ? catalogValue[name] : undefined)
+            : dependency,
+        ]),
+      );
+    } else {
+      mergedNode[key] = value;
+    }
+  }
+  if (isObject(catalogNode)) {
+    for (const key of SCHEMA_ANNOTATIONS) {
+      if (hasOwn(catalogNode, key)) mergedNode[key] = catalogNode[key];
+    }
+  }
+  return mergedNode;
+}
 
 const drifted = [];
 for (const [name, regTool] of registryByName) {
   const cur = currentByName.get(name);
   if (!cur) continue; // 缺失的由 missing 那条管
-  const a = paramShape(regTool);
-  const b = paramShape(cur);
-  const diffs = [];
-  // 方向是**单向**的：注册表有而目录没有的参数 = 真漂移（模型会发一个网关不认识的
-  // 参数，被丢掉或直接报错）。反过来目录比注册表多是**正常的**——目录刻意暴露了更多
-  // 动作/参数（browser 就是 51 vs 24），把它当漂移然后"修掉"等于把目录削成客户端的
-  // 子集，那是数据丢失，不是同步。
-  const added = a.props.filter((k) => !b.props.includes(k));
-  if (added.length) diffs.push(`+${added.join("/")}`);
-  if (a.required.join(",") !== b.required.join(",")) {
-    diffs.push(`required: [${b.required.join(",")}] → [${a.required.join(",")}]`);
-  }
-  if (diffs.length) drifted.push(`${name} (${diffs.join("; ")})`);
+  const diffs = collectSchemaDiffs(
+    schemaShape(regTool.function?.parameters || {}),
+    schemaShape(cur.function?.parameters || {}),
+  );
+  if (diffs.length) drifted.push({ name, diffs });
 }
 
-const merged = current.concat(missing.map((name) => registryByName.get(name)));
+const merged = current
+  .filter((tool) => registryByName.has(tool?.function?.name))
+  .concat(missing.map((name) => registryByName.get(name)));
 
 const check = process.argv.includes("--check");
 console.log(`registry tools:        ${registryByName.size}`);
 console.log(`tools.json (before):   ${current.length}`);
 console.log(`missing (to append):   ${missing.length}${missing.length ? "  -> " + missing.join(", ") : ""}`);
-console.log(`only in tools.json:    ${onlyInCatalog.length}${onlyInCatalog.length ? "  -> " + onlyInCatalog.join(", ") : ""}`);
+console.log(`only in tools.json:    ${onlyInCatalog.length}${onlyInCatalog.length ? "  -> remove " + onlyInCatalog.join(", ") : ""}`);
 console.log(`tools.json (after):    ${merged.length}`);
-console.log(`schema drift:          ${drifted.length}${drifted.length ? "\n  - " + drifted.join("\n  - ") : ""}`);
+console.log(
+  `schema drift:          ${drifted.length}${
+    drifted.length
+      ? "\n  - " + drifted.map(({ name, diffs }) => `${name} (${diffs.join("; ")})`).join("\n  - ")
+      : ""
+  }`,
+);
 
 if (check) {
   let bad = false;
   if (missing.length) {
     console.error("tools.json is missing client-registry tools; run without --check to sync.");
+    bad = true;
+  }
+  if (onlyInCatalog.length) {
+    console.error("tools.json advertises tools absent from the client registry; run without --check to remove them.");
     bad = true;
   }
   if (drifted.length) {
@@ -155,12 +290,12 @@ if (check) {
   process.exit(0);
 }
 
-// 修复漂移时**只补参数，不碰任何描述文字**。
+// 修复漂移时以客户端注册表的参数成员为准，不碰工具描述文字。
 //
 // 上一版是整条 `return reg` 替换，结果把目录里更丰富的描述（browser 那条讲了 Shadow
 // DOM / iframe 穿透）换成了客户端注册表里那条短的——测试当场抓到。描述以目录为准，
 // 这在上面判据里就写着；修复路径也必须守同一条规矩，否则判据写了等于没写。
-const driftedNames = new Set(drifted.map((d) => d.slice(0, d.indexOf(" ("))));
+const driftedNames = new Set(drifted.map(({ name }) => name));
 const synced = merged.map((tool) => {
   const name = tool?.function?.name;
   if (!name || !driftedNames.has(name)) return tool;
@@ -168,15 +303,7 @@ const synced = merged.map((tool) => {
   if (!reg) return tool;
   const regParams = reg.function?.parameters || {};
   const fn = tool.function;
-  const params = fn.parameters || (fn.parameters = { type: "object", properties: {} });
-  params.properties = params.properties || {};
-  // 只补目录里没有的参数；两边都有的保留目录版本（它的描述更细）。
-  for (const [key, def] of Object.entries(regParams.properties || {})) {
-    if (!(key in params.properties)) params.properties[key] = def;
-  }
-  // required 必须听注册表的：客户端真正会发什么由它决定，目录多要一个参数就会
-  // 把合法调用判成非法。
-  if (Array.isArray(regParams.required)) params.required = regParams.required;
+  fn.parameters = mergeSchemaAnnotations(regParams, fn.parameters);
   return tool;
 });
 

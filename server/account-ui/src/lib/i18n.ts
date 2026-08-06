@@ -1,9 +1,41 @@
 /**
- * Two languages, chosen by the same country signal that chooses the currency: a buyer
- * paying in yuan is reading Chinese. An explicit currency choice switches both.
+ * Interface language.
+ *
+ * English is the source of truth: every other locale is a `Partial<Dict>` merged over it,
+ * so a key added to EN and not yet translated shows English rather than a raw key name or
+ * a type error across five files. That also means a half-finished locale is shippable.
  */
-export type Lang = "en" | "zh";
+import { de } from "@/lib/locales/de";
+import { es } from "@/lib/locales/es";
+import { ja } from "@/lib/locales/ja";
+import { ko } from "@/lib/locales/ko";
+import { zhCN } from "@/lib/locales/zh-CN";
+import { zhTW } from "@/lib/locales/zh-TW";
+
+export type Lang = "en" | "ja" | "ko" | "zh-CN" | "zh-TW" | "de" | "es";
 export type Currency = "cny" | "usd";
+
+/** Offered in Settings, in the order shown there. Each label is in its own language. */
+export const LANGS: { value: Lang; label: string }[] = [
+  { value: "en", label: "English" },
+  { value: "ja", label: "日本語" },
+  { value: "ko", label: "한국어" },
+  { value: "zh-CN", label: "简体中文" },
+  { value: "zh-TW", label: "繁體中文" },
+  { value: "de", label: "Deutsch" },
+  { value: "es", label: "Español" },
+];
+
+/** BCP-47 tag for date and number formatting. */
+export const LOCALE_TAG: Record<Lang, string> = {
+  en: "en-US",
+  ja: "ja-JP",
+  ko: "ko-KR",
+  "zh-CN": "zh-CN",
+  "zh-TW": "zh-TW",
+  de: "de-DE",
+  es: "es-ES",
+};
 
 const EN = {
   openEditor: "Open the editor",
@@ -12,6 +44,9 @@ const EN = {
   navSettings: "Settings",
   navBilling: "Plans & billing",
   navIntegrations: "Integrations",
+  navDevices: "Devices",
+  accountMenu: "Account menu",
+  getTheApp: "Get the desktop app",
 
   overview: "Overview",
   overviewLede: "Your plan, quota and recent activity.",
@@ -77,6 +112,15 @@ const EN = {
   memberSince: "Member since",
   lastSignIn: "Last sign-in",
   plan: "Plan",
+  planFree: "Free",
+  planTrial: "Trial",
+  planBasic: "Basic",
+  planPro: "Pro",
+  planPower: "Power",
+  planUltra: "Ultra",
+  /** Joins a browser to its platform: "Chrome on macOS". */
+  deviceOn: "on",
+  checkoutNoUrl: "Stripe did not return a checkout link.",
   currentPlan: "Current plan",
   expires: "Renews or expires",
   includedQuota: "Included quota",
@@ -89,6 +133,33 @@ const EN = {
   signOutNote: "Signing out clears this browser's session. The desktop app keeps its own.",
   signOut: "Sign out",
 
+  language: "Language",
+  languageNote: "Saved to your account, so everywhere you sign in uses the same language.",
+  interfaceLanguage: "Interface language",
+
+  devices: "Devices",
+  devicesLede: "Where this account is signed in. Sign out anything you do not recognise.",
+  deviceCol: "Device",
+  ipCol: "IP address",
+  browserGroup: "Browser",
+  desktopGroup: "Desktop app",
+  mobileGroup: "Mobile app",
+  /** {n} is the number of signed-in devices in that group. */
+  signedInCount: "{n} signed in",
+  noneSignedIn: "Not signed in on any device of this kind.",
+  createdCol: "Signed in",
+  lastActiveCol: "Last active",
+  revoke: "Revoke",
+  revoking: "Revoking…",
+  thisDevice: "This device",
+  noDevices: "No signed-in devices to show.",
+  revokeSelfWarning:
+    "This is the session you are using. Revoking it signs this browser out immediately.",
+  deviceRevoked: "Signed out. That device will be asked to log in again on its next request.",
+  // Said plainly rather than hidden, because a list that silently omits sessions is
+  // worse than one that admits what it cannot see.
+  untrackedSession:
+    "This browser signed in before device tracking existed, so it is not in the list below and cannot be signed out individually. Signing out and back in adds it.",
   integrations: "Integrations",
   integrationsLede: "How this account connects to the desktop app and the API.",
   desktopApp: "Mr.day One for desktop",
@@ -160,9 +231,24 @@ const EN = {
   perDay: "/day",
   credits: "credits",
   neverExpires: "Never expires",
-  perYuan: "per ¥1",
+  per: "per",
+  monthlyPlans: "Monthly plans",
+  dayPassSet: "Day pass",
+  creditPacks: "Credit packs",
   customAmount: "Custom amount",
   activationCode: "Activation code",
+  redeemTitle: "Redeem a code",
+  accountNow: "Your account right now",
+  planCodeTitle: "Plan codes",
+  // Both descriptions state what apply_plan and apply_credits actually do — grants add
+  // to what is already there rather than replacing it — so nobody redeems a code fearing
+  // it will wipe the time they have left.
+  planCodeBody:
+    "Grant a plan for a set number of days. If your plan still has time left, the days are added on top and the included quota is added to what you already have — nothing is replaced.",
+  creditCodeTitle: "Credit codes",
+  creditCodeBody:
+    "Add credits to your balance. Credits never expire and are spent only once a plan's included quota runs out, so they keep working on any plan.",
+  noPlan: "No plan",
   redeem: "Redeem",
   redeemNote:
     "Codes are issued by the operator. Redeeming adds the plan or credits to this account immediately.",
@@ -172,8 +258,6 @@ const EN = {
   extends: "Buying again extends it — nothing is lost.",
   freePlanBalance: "You are on the free plan, with a credit balance of",
   notEnabled: "Card payments are not switched on yet — the gateway has no Stripe key configured.",
-  autoCurrency: "Currency chosen for your location",
-  manualCurrency: "Currency saved on this device",
   secure: "Payments are handled by Stripe. Card details never reach this server.",
   paidOk: "Payment received. Your account updates within a few seconds.",
   canceled: "Checkout canceled. Nothing was charged.",
@@ -182,180 +266,23 @@ const EN = {
   loading: "Loading…",
 } as const;
 
-type Dict = Record<keyof typeof EN, string>;
+export type Dict = Record<keyof typeof EN, string>;
 
-const ZH: Dict = {
-  openEditor: "打开编辑器",
-  navOverview: "总览",
-  navUsage: "用量",
-  navSettings: "设置",
-  navBilling: "套餐与账单",
-  navIntegrations: "集成",
+const BASE = EN as unknown as Dict;
 
-  overview: "总览",
-  overviewLede: "你的套餐、额度与最近调用。",
-  includedUsage: "套餐包含额度",
-  used: "已使用",
-  ofQuota: "/",
-  refillsIn: "距回满",
-  refillsNow: "下次请求时回满",
-  noneIncluded: "无包含额度",
-  onFreePlan: "（免费套餐）",
-  freeFallback: "调用将从钱包余额和每日免费点数中扣除。",
-  creditBalance: "钱包余额",
-  creditBalanceSub: "不受套餐限制，随时可用",
-  dailyFree: "每日免费额度",
-  dailyFreeSub: "每天重置",
-  thisWeek: "本周",
-  resets: "重置于",
-  recentActivity: "最近调用",
-  noRequests: "还没有调用记录。",
-  everyDays: "每 {days} 天",
-  planGranted: "由运营方发放，非购买",
-  when: "时间",
-  model: "模型",
-  tokensIn: "输入",
-  tokensOut: "输出",
-  cost: "花费",
-  estimated: "估算",
-
-  usage: "用量",
-  usageLede: "该账号的全部计费调用，按时间倒序。",
-  spentAllTime: "累计花费",
-  requestsShown: "显示条数",
-  requestsShownSub: "网关保留最近 200 条",
-  requests: "调用记录",
-  pagePrev: "上一页",
-  pageNext: "下一页",
-  showingRange: "显示第 {from}–{to} 条，共 {total} 条",
-  goToPage: "跳到第 {page} 页",
-
-  settings: "设置",
-  settingsLede: "网关中保存的账号信息。",
-  profile: "个人资料",
-  profileNote: "姓名与头像会显示在侧边栏和账号信息里。",
-  firstName: "名",
-  lastName: "姓",
-  profilePicture: "头像",
-  changePicture: "更换",
-  removePicture: "移除",
-  pictureHint: "点击头像即可上传新图片，支持 PNG、JPEG、WebP、GIF，会裁成正方形。",
-  saveProfile: "保存修改",
-  saving: "保存中…",
-  profileSaved: "资料已保存。",
-  pictureTooLarge: "图片太大了，请选择 12 MB 以内的。",
-  pictureUnreadable: "这个文件无法作为图片读取。",
-  account: "账号",
-  email: "邮箱",
-  accountId: "账号 ID",
-  role: "角色",
-  administrator: "管理员",
-  member: "普通用户",
-  memberSince: "注册于",
-  lastSignIn: "最近登录",
-  plan: "套餐",
-  currentPlan: "当前套餐",
-  expires: "到期时间",
-  includedQuota: "包含额度",
-  perWindow: "每时段",
-  weeklyCap: "每周上限",
-  perWeek: "每周",
-  notIncluded: "该套餐不含额度",
-  noWeeklyCap: "无每周上限",
-  session: "登录状态",
-  signOutNote: "退出只会清除当前浏览器的登录，桌面端不受影响。",
-  signOut: "退出登录",
-
-  integrations: "集成",
-  integrationsLede: "该账号与桌面端、API 的连接情况。",
-  desktopApp: "Mr.day One 桌面端",
-  connected: "已连接",
-  signedOut: "未登录",
-  notDetected: "未检测到",
-  desktopConnected: "正在本机运行，账号",
-  desktopOnline: "已登录并正在运行，最近一次上报",
-  desktopSecondsAgo: "秒前。",
-  desktopVersion: "版本",
-  desktopReuse: "登录页会直接复用这个会话，无需再次输入密码。",
-  desktopSignedOut: "桌面端正在本机运行，但没有登录账号，无法把会话交给浏览器。",
-  desktopUnreachable: "页面无法连接到桌面端。如果它正在运行，那就是浏览器拦下了这次连接 —— 下面是浏览器给出的原因。",
-  desktopDetail: "浏览器报告",
-  codeHosts: "代码托管",
-  codeHostsLede: "连接账号后，仓库会直接出现在编辑器里 —— 输入 @github: 或 @gitlab: 即可选择。",
-  connect: "连接",
-  connecting: "正在打开…",
-  disconnect: "断开",
-  connectedAs: "已连接",
-  useToken: "使用令牌",
-  connectWithToken: "用令牌连接",
-  oauthUnavailable: "一键登录需要服务器上先注册 OAuth 应用。",
-  cancel: "取消",
-  tokenPlaceholder: "粘贴个人访问令牌",
-  tokenScopes: "需要权限：",
-  tokenCreate: "去创建",
-  integrationConnected: "已连接。仓库现在可以在编辑器里使用了。",
-  integrationCancelled: "已取消，没有连接任何账号。",
-  integrationError: "连接失败，没有绑定任何账号，请重试。",
-  disconnectedNote: "已断开。如需同时在平台侧撤销授权，请前往",
-  desktopNeedsPermission: "需要授权",
-  desktopPermissionAsk:
-    "浏览器还没有获得访问本机应用的权限，因此这个页面无法判断 Mr.day One 是否在运行。Chrome 只在你点击时才会询问。",
-  desktopConnectButton: "检测桌面端",
-  desktopChecking: "检测中…",
-  desktopPermissionBlocked: "已被浏览器阻止",
-  desktopPermissionBlockedHelp:
-    "本站的本地网络访问已被阻止。在 Chrome 中重新开启：点击地址栏左侧的图标，允许本地网络访问，然后再次检测。",
-  download: "下载桌面端",
-  apiHeading: "API",
-  baseUrl: "接口地址",
-  auth: "鉴权方式",
-  authValue: "Bearer 令牌，与本页同一会话",
-  modelsAvailable: "可用模型",
-  available: "个可用",
-
-  billing: "套餐与账单",
-  billingLede: "订阅可获得按时段自动回满的额度；点数永不过期，可随时充值；也可以直接兑换激活码。",
-  tabSubscription: "订阅",
-  tabCredits: "点数",
-  tabRedeem: "兑换",
-  includedEachMonth: "每月包含额度",
-  per55: "每 5.5 小时窗口",
-  weeklyCapSuffix: "每周上限",
-  allModels: "可使用全部模型",
-  fullDayQuota: "24 小时内享受完整付费额度",
-  onePerAccount: "每账号限一次，不自动续费",
-  subscribe: "订阅",
-  buy: "购买",
-  topUp: "充值",
-  alreadyUsed: "已使用",
-  current: "当前",
-  bestRate: "最划算",
-  perMonth: "/月",
-  perDay: "/天",
-  credits: "点",
-  neverExpires: "永不过期",
-  perYuan: "点 / ¥1",
-  customAmount: "自定义金额",
-  activationCode: "激活码",
-  redeem: "立即兑换",
-  redeemNote: "激活码由运营方发放。兑换后套餐或点数会立即计入当前账号。",
-  redeemOk: "兑换成功，账户已更新。",
-  youAreOn: "你的套餐是",
-  until: "有效期至",
-  extends: "再次购买将顺延，不会覆盖剩余时间。",
-  freePlanBalance: "你正在使用免费套餐，钱包余额",
-  notEnabled: "尚未开启银行卡支付 —— 网关还没有配置 Stripe 密钥。",
-  autoCurrency: "已根据你的所在地选择货币",
-  manualCurrency: "货币选择已保存在本设备",
-  secure: "支付由 Stripe 处理，银行卡信息不会经过本服务器。",
-  paidOk: "支付已收到，账户将在几秒内更新。",
-  canceled: "已取消支付，未产生任何扣款。",
-  opening: "正在打开 Stripe…",
-  loadFailed: "加载失败，请刷新重试。",
-  loading: "加载中…",
+/**
+ * Every locale is complete at runtime because each one is spread over English first.
+ * Nothing in the app has to handle a missing string.
+ */
+export const DICTS: Record<Lang, Dict> = {
+  en: BASE,
+  ja: { ...BASE, ...ja },
+  ko: { ...BASE, ...ko },
+  "zh-CN": { ...BASE, ...zhCN },
+  "zh-TW": { ...BASE, ...zhTW },
+  de: { ...BASE, ...de },
+  es: { ...BASE, ...es },
 };
-
-export const DICTS: Record<Lang, Dict> = { en: EN as unknown as Dict, zh: ZH };
 
 /** The gateway answers in Chinese; translate what a buyer can actually trigger. */
 const SERVER_MSG: Record<string, string> = {
@@ -371,5 +298,5 @@ const SERVER_MSG: Record<string, string> = {
 /** Unrecognised messages pass through untouched so nothing is ever swallowed. */
 export function serverMessage(error: unknown, lang: Lang): string {
   const raw = error instanceof Error ? error.message : String(error);
-  return lang === "zh" ? raw : (SERVER_MSG[raw] ?? raw);
+  return lang.startsWith("zh") ? raw : (SERVER_MSG[raw] ?? raw);
 }

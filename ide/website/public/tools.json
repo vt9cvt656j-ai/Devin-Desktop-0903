@@ -1,7 +1,7 @@
 {
   "generatedFrom": "ide/src/main.js · _buildAgentToolSchemas",
   "generatedAt": null,
-  "count": 157,
+  "count": 147,
   "groups": [
     "Agents",
     "Code intelligence",
@@ -23,23 +23,8 @@
       "desktopOnly": false
     },
     {
-      "name": "read_logs",
-      "group": "Files",
-      "desktopOnly": false
-    },
-    {
       "name": "list_dir",
       "group": "Files",
-      "desktopOnly": false
-    },
-    {
-      "name": "write_file",
-      "group": "Files",
-      "desktopOnly": false
-    },
-    {
-      "name": "run_cmd",
-      "group": "Terminal & system",
       "desktopOnly": false
     },
     {
@@ -73,11 +58,6 @@
       "desktopOnly": true
     },
     {
-      "name": "live_markets",
-      "group": "Data",
-      "desktopOnly": true
-    },
-    {
       "name": "performance_profile",
       "group": "Data",
       "desktopOnly": false
@@ -86,26 +66,6 @@
       "name": "openapi_parser",
       "group": "Data",
       "desktopOnly": false
-    },
-    {
-      "name": "live_flights",
-      "group": "Data",
-      "desktopOnly": true
-    },
-    {
-      "name": "road_environment",
-      "group": "Data",
-      "desktopOnly": true
-    },
-    {
-      "name": "track_shipment",
-      "group": "Data",
-      "desktopOnly": true
-    },
-    {
-      "name": "shop_catalog",
-      "group": "Data",
-      "desktopOnly": true
     },
     {
       "name": "read_screen",
@@ -195,6 +155,11 @@
     {
       "name": "get_diagnostics",
       "group": "Code intelligence",
+      "desktopOnly": false
+    },
+    {
+      "name": "read_logs",
+      "group": "Files",
       "desktopOnly": false
     },
     {
@@ -318,6 +283,16 @@
       "desktopOnly": false
     },
     {
+      "name": "write_file",
+      "group": "Files",
+      "desktopOnly": false
+    },
+    {
+      "name": "run_cmd",
+      "group": "Terminal & system",
+      "desktopOnly": false
+    },
+    {
       "name": "deploy_site",
       "group": "Deploy",
       "desktopOnly": false
@@ -410,11 +385,6 @@
     {
       "name": "tor_request",
       "group": "Web & browser",
-      "desktopOnly": false
-    },
-    {
-      "name": "academic_search",
-      "group": "Research",
       "desktopOnly": false
     },
     {
@@ -563,11 +533,6 @@
       "desktopOnly": false
     },
     {
-      "name": "reddit_search",
-      "group": "Research",
-      "desktopOnly": false
-    },
-    {
       "name": "steam_search",
       "group": "Research",
       "desktopOnly": false
@@ -575,16 +540,6 @@
     {
       "name": "iconify_search",
       "group": "Design & media",
-      "desktopOnly": false
-    },
-    {
-      "name": "color_search",
-      "group": "Design & media",
-      "desktopOnly": false
-    },
-    {
-      "name": "lobsters_search",
-      "group": "Research",
       "desktopOnly": false
     },
     {
@@ -599,21 +554,6 @@
     },
     {
       "name": "smashingmag_search",
-      "group": "Research",
-      "desktopOnly": false
-    },
-    {
-      "name": "css_tricks_search",
-      "group": "Research",
-      "desktopOnly": false
-    },
-    {
-      "name": "codepen_search",
-      "group": "Research",
-      "desktopOnly": false
-    },
-    {
-      "name": "dribbble_search",
       "group": "Research",
       "desktopOnly": false
     },
@@ -638,16 +578,6 @@
       "desktopOnly": false
     },
     {
-      "name": "producthunt_search",
-      "group": "Research",
-      "desktopOnly": false
-    },
-    {
-      "name": "freecodecamp_search",
-      "group": "Research",
-      "desktopOnly": false
-    },
-    {
       "name": "github_trending",
       "group": "Research",
       "desktopOnly": false
@@ -658,43 +588,13 @@
       "desktopOnly": false
     },
     {
-      "name": "hackernoon_search",
-      "group": "Research",
-      "desktopOnly": false
-    },
-    {
       "name": "codeberg_search",
       "group": "Git & GitHub",
       "desktopOnly": false
     },
     {
-      "name": "bestofjs_search",
-      "group": "Research",
-      "desktopOnly": false
-    },
-    {
       "name": "sourcegraph_search",
       "group": "Code search",
-      "desktopOnly": false
-    },
-    {
-      "name": "deep_search",
-      "group": "Code search",
-      "desktopOnly": false
-    },
-    {
-      "name": "smzdm_search",
-      "group": "Research",
-      "desktopOnly": false
-    },
-    {
-      "name": "xianyu_search",
-      "group": "Research",
-      "desktopOnly": false
-    },
-    {
-      "name": "zhuanzhuan_search",
-      "group": "Research",
       "desktopOnly": false
     },
     {
@@ -714,6 +614,11 @@
     },
     {
       "name": "automation",
+      "group": "Web & browser",
+      "desktopOnly": true
+    },
+    {
+      "name": "computer",
       "group": "Web & browser",
       "desktopOnly": true
     },
@@ -748,9 +653,59 @@
       "desktopOnly": false
     },
     {
-      "name": "generate_test_cases",
-      "group": "Code intelligence",
-      "desktopOnly": false
+      "name": "game_scaffold",
+      "group": "Design & media",
+      "desktopOnly": true
+    },
+    {
+      "name": "web_scaffold",
+      "group": "Design & media",
+      "desktopOnly": true
+    },
+    {
+      "name": "generate_3d",
+      "group": "Design & media",
+      "desktopOnly": true
+    },
+    {
+      "name": "generate_sound",
+      "group": "Design & media",
+      "desktopOnly": true
+    },
+    {
+      "name": "generate_music",
+      "group": "Design & media",
+      "desktopOnly": true
+    },
+    {
+      "name": "generate_voice",
+      "group": "Design & media",
+      "desktopOnly": true
+    },
+    {
+      "name": "auto_rig",
+      "group": "Design & media",
+      "desktopOnly": true
+    },
+    {
+      "name": "generate_motion",
+      "group": "Design & media",
+      "desktopOnly": true
+    },
+    {
+      "name": "generate_texture",
+      "group": "Design & media",
+      "desktopOnly": true
+    },
+    {
+      "name": "search_game_assets",
+      "group": "Design & media",
+      "desktopOnly": true
+    },
+    {
+      "name": "download_asset",
+      "group": "Design & media",
+      "desktopOnly": true
     },
     {
       "name": "docker_compose_up",
@@ -795,11 +750,6 @@
     {
       "name": "visual_explain",
       "group": "Code intelligence",
-      "desktopOnly": false
-    },
-    {
-      "name": "search_tools",
-      "group": "Code search",
       "desktopOnly": false
     }
   ]
