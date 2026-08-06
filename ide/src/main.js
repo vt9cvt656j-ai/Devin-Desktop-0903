@@ -482,6 +482,9 @@ async function tauriBackend() {
 }
 
 const _AI_MODEL_RETRY_LIMIT = 10;
+// 一轮里最多从断点续几次。给得少是故意的：连着断三次说明线路真的不通，
+// 这时候继续续传只是把同一个失败拖长，不如把话说清楚交还给用户。
+const _AI_MODEL_RESUME_LIMIT = 3;
 const _AI_MODEL_ATTEMPT_TIMEOUT_MS = 60_000;
 const _AI_RESPONSE_HEADERS_DEADLINE_MS = _AI_MODEL_ATTEMPT_TIMEOUT_MS;
 const _AI_ERROR_BODY_DEADLINE_MS = 2_000;
@@ -32964,24 +32967,43 @@ async function _runModelRequestWithRetry({
   isLive = () => true,
   onAttempt = () => {},
   onRetry = () => {},
+  onResume = () => {},
+  /**
+   * 断点续传。连接在**已经产出内容之后**断掉时调用：返回一个新的 invoke，它带着
+   * "到目前为止已经生成的内容"去请求模型接着写，而不是把同一个提示重放一遍。
+   *
+   * 为什么不能重放：下面的 canRetry 特意规定"只要有任何模型事件已经出到界面上就不再重试"，
+   * 因为重放会把散文、工具调用、写文件和计费全部再来一遍。那条规则是对的，但它把
+   * "连接断了"和"这一轮报废了"划上了等号——用户的正文和已落盘的改动都在，却只能整轮重来。
+   * 续传绕开了那个矛盾：它不重放提示，而是延长对话。
+   *
+   * 返回 null / 未提供该回调 → 维持原来的行为（报错收尾）。
+   */
+  buildResumeInvoke = null,
+  resumeLimit = _AI_MODEL_RESUME_LIMIT,
   retryLimit = _AI_MODEL_RETRY_LIMIT,
 } = {}) {
-  if (!isLive()) return { attempts: 0, cancelled: true, error: "", hadModelProgress: false };
+  if (!isLive()) return { attempts: 0, cancelled: true, error: "", hadModelProgress: false, resumes: 0 };
   const boundedRetryLimit = Math.max(0, Math.min(10, Math.floor(Number(retryLimit) || 0)));
+  const boundedResumeLimit = Math.max(0, Math.min(6, Math.floor(Number(resumeLimit) || 0)));
   const maxAttempts = boundedRetryLimit + 1;
   let hadModelProgress = false;
   let lastError = "";
   let attemptsRun = 0;
+  let currentInvoke = invoke;
+  let resumesUsed = 0;
 
-  for (let attemptIndex = 0; attemptIndex < maxAttempts; attemptIndex++) {
-    if (!isLive()) return { attempts: attemptIndex, cancelled: true, error: "", hadModelProgress };
-    const attempt = attemptIndex + 1;
+  // 续传不消耗重试配额：重试是"这次请求没能开始"，续传是"请求好好地开始了、中途断了"，
+  // 两者的预算不该互相挤占。用 while + 手动推进，才能让续传原地重开一次尝试。
+  for (let attemptIndex = 0; attemptIndex < maxAttempts; ) {
+    if (!isLive()) return { attempts: attemptIndex, cancelled: true, error: "", hadModelProgress, resumes: resumesUsed };
+    const attempt = attemptsRun + 1;
     attemptsRun = attempt;
     try { onAttempt({ attempt, maxAttempts, retry: attemptIndex, retryLimit: boundedRetryLimit }); } catch {}
     let attemptError = "";
     let attemptProgress = false;
     try {
-      await invoke((ev) => {
+      await currentInvoke((ev) => {
         if (ev?.kind === "error") {
           attemptError = String(ev.message || "模型线路出现问题");
           return;
@@ -32996,13 +33018,13 @@ async function _runModelRequestWithRetry({
     } catch (error) {
       if (!attemptError) attemptError = String(error?.message || error || "模型线路出现问题");
     }
-    if (!isLive()) return { attempts: attempt, cancelled: true, error: "", hadModelProgress };
+    if (!isLive()) return { attempts: attempt, cancelled: true, error: "", hadModelProgress, resumes: resumesUsed };
     if (!attemptError && !attemptProgress) {
       attemptError = `模型在 ${Math.round(_AI_MODEL_ATTEMPT_TIMEOUT_MS / 1000)} 秒内没有生成有效内容。`;
     }
     if (!attemptError) {
       onEvent({ kind: "done" });
-      return { attempts: attempt, cancelled: false, error: "", hadModelProgress };
+      return { attempts: attempt, cancelled: false, error: "", hadModelProgress, resumes: resumesUsed };
     }
 
     lastError = attemptError;
@@ -33014,14 +33036,42 @@ async function _runModelRequestWithRetry({
       && !hadModelProgress
       && retriesUsed < boundedRetryLimit
       && _isRetryableAiError(attemptError);
-    if (!canRetry) break;
-    const retry = retriesUsed + 1;
-    try { onRetry({ retry, retryLimit: boundedRetryLimit, nextAttempt: attempt + 1, error: attemptError }); } catch {}
+    if (canRetry) {
+      const retry = retriesUsed + 1;
+      try { onRetry({ retry, retryLimit: boundedRetryLimit, nextAttempt: attempt + 1, error: attemptError }); } catch {}
+      attemptIndex += 1;
+      continue;
+    }
+
+    // 已经产出过内容 + 断的是连接 → 从断点接着写。不重放提示，因此不会重复正文、
+    // 不会重复执行工具、也不会把这一轮的钱再花一遍（提示走缓存）。
+    const canResume = hadModelProgress
+      && typeof buildResumeInvoke === "function"
+      && resumesUsed < boundedResumeLimit
+      && _isRetryableAiError(attemptError);
+    if (canResume) {
+      let next = null;
+      try {
+        next = await buildResumeInvoke({
+          error: attemptError,
+          resume: resumesUsed + 1,
+          resumeLimit: boundedResumeLimit,
+        });
+      } catch { next = null; }
+      if (!isLive()) return { attempts: attempt, cancelled: true, error: "", hadModelProgress, resumes: resumesUsed };
+      if (typeof next === "function") {
+        resumesUsed += 1;
+        currentInvoke = next;
+        try { onResume({ resume: resumesUsed, resumeLimit: boundedResumeLimit, error: attemptError }); } catch {}
+        continue;   // 不推进 attemptIndex：续传不占重试配额
+      }
+    }
+    break;
   }
 
   onEvent({ kind: "error", message: lastError || "模型线路出现问题" });
   onEvent({ kind: "done" });
-  return { attempts: attemptsRun, cancelled: false, error: lastError || "模型线路出现问题", hadModelProgress };
+  return { attempts: attemptsRun, cancelled: false, error: lastError || "模型线路出现问题", hadModelProgress, resumes: resumesUsed };
 }
 
 function _formatAgentFinalError(err) {
@@ -34542,6 +34592,33 @@ async function _agentModelTurn({ config, messages, toolSchemas, toolRegistry = n
         onRetry: ({ retry, retryLimit }) => {
           _agentTimelineRecordMetric(timeline, _timelineTurn, "modelRetry", 0, Date.now(), { attempt: retry });
           showAgentRetryToast(`模型线路出现问题，当前将重试第 ${retry}/${retryLimit} 次`, true);
+        },
+        /**
+         * 连接在出字过程中断掉 → 带着"已经写出来的部分"接着写，而不是报错收场。
+         *
+         * 做法是把已生成的正文作为**最后一条 assistant 消息**附在对话末尾。对 Anthropic
+         * 来说这就是续写（prefill）：模型从这段话的末尾继续，不会重新打招呼、不会重复
+         * 已经出过的内容。提示本身没变，走的是缓存，所以续一次远比重跑一轮便宜。
+         *
+         * 只在**没有任何工具调用在途**时续传。工具参数一旦流到一半，"能被 JSON.parse
+         * 解析"也不代表完整——它可能只是完整参数的一个合法前缀（下面 truncated 那段
+         * 注释说的就是这件事）。拿半截写文件参数去续，比整轮重来危险得多，所以那种情况
+         * 仍然按原样停下，把决定权交回用户。
+         */
+        buildResumeInvoke: async ({ resume, resumeLimit }) => {
+          if (byIndex.size > 0) return null;
+          // prefill 不允许结尾有空白，否则上游会直接 400。
+          const partial = String(acc || "").replace(/\s+$/, "");
+          if (!partial) return null;
+          const resumeMsgs = [..._l0Msgs, { role: "assistant", content: partial }];
+          showAgentRetryToast(
+            `连接中断，正在从断点继续（${resume}/${resumeLimit}）——已生成的内容会保留，不重跑本轮`,
+            true,
+          );
+          return (cb) => backend.aiChatWithTools(_turnConfig, resumeMsgs, _l0Tools, cb);
+        },
+        onResume: ({ resume }) => {
+          _agentTimelineRecordMetric(timeline, _timelineTurn, "modelResume", 0, Date.now(), { attempt: resume });
         },
         onEvent: (ev) => {
         if (ev && ev.kind === "compressionPrefix") { _mcPrefixSet(ev.token, ev.covered, _mcSourceMessages); return; }
@@ -42416,9 +42493,11 @@ function _createToolStep(call) {
     screenshot: `<svg viewBox="0 0 16 16" fill="currentColor"><path d="M8 5.5a2.5 2.5 0 100 5 2.5 2.5 0 000-5zM6.5 8a1.5 1.5 0 113 0 1.5 1.5 0 01-3 0z"/><path d="M5.05 1.5a1.75 1.75 0 00-1.4.7l-.6.8a.25.25 0 01-.2.1H1.75A1.75 1.75 0 000 4.85v7.4C0 13.216.784 14 1.75 14h12.5A1.75 1.75 0 0016 12.25v-7.4a1.75 1.75 0 00-1.75-1.75h-1.1a.25.25 0 01-.2-.1l-.6-.8a1.75 1.75 0 00-1.4-.7H5.05zM1.5 4.85a.25.25 0 01.25-.25h1.1c.55 0 1.07-.26 1.4-.7l.6-.8a.25.25 0 01.2-.1h3.9a.25.25 0 01.2.1l.6.8c.33.44.85.7 1.4.7h1.1a.25.25 0 01.25.25v7.4a.25.25 0 01-.25.25H1.75a.25.25 0 01-.25-.25v-7.4z"/></svg>`,
     browser: `<svg viewBox="0 0 16 16" fill="currentColor"><path d="M8 0a8 8 0 100 16A8 8 0 008 0zM1.5 8a6.47 6.47 0 01.34-2.07c.2.66.74 1.1 1.66 1.1.6 0 .76.36.76 1.18 0 .63.18 1.13.78 1.4.32.14.5.46.5 1.04 0 .9.42 1.46 1.16 1.66A6.5 6.5 0 011.5 8zm6.5 6.5c-.3 0-.6-.02-.88-.06.2-.3.38-.66.38-1.04 0-.86-.5-1.3-1.18-1.6-.5-.22-.82-.5-.82-1.14 0-.9-.5-1.43-1.34-1.43H4.4c-.46 0-.66-.3-.66-.74 0-.5.3-.76.86-.76.74 0 1.04-.4 1.04-1.04 0-.5.26-.78.78-.78.74 0 1.1-.4 1.1-1.12V4.4c0-.5.28-.74.7-.86A6.5 6.5 0 0114.46 7H13c-.74 0-1.16.42-1.16 1.16 0 .9.5 1.34 1.34 1.34h.36A6.51 6.51 0 018 14.5z"/></svg>`,
     computer: `<svg viewBox="0 0 16 16" fill="currentColor"><path d="M1.75 2A1.75 1.75 0 000 3.75v7.5C0 12.216.784 13 1.75 13h4.5l-.5 1.5H4.25a.75.75 0 000 1.5h7.5a.75.75 0 000-1.5h-1.5L9.75 13h4.5A1.75 1.75 0 0016 11.25v-7.5A1.75 1.75 0 0014.25 2H1.75zM1.5 3.75a.25.25 0 01.25-.25h12.5a.25.25 0 01.25.25v6.5a.25.25 0 01-.25.25H1.75a.25.25 0 01-.25-.25v-6.5z"/></svg>`,
-    askuser: `<svg viewBox="0 0 16 16" fill="currentColor"><path d="M8 0a8 8 0 100 16A8 8 0 008 0zM6.05 5.18c.3-.74.99-1.18 1.95-1.18 1.2 0 2.1.78 2.1 1.86 0 .77-.4 1.27-1.06 1.7-.6.38-.79.62-.79 1.04v.27a.5.5 0 01-.5.5h-.5a.5.5 0 01-.5-.5v-.36c0-.78.36-1.27 1.06-1.72.55-.36.74-.58.74-.97 0-.43-.34-.74-.85-.74-.45 0-.77.22-.94.62a.6.6 0 01-.77.32l-.3-.12a.55.55 0 01-.3-.72zM8 12.25a.9.9 0 110-1.8.9.9 0 010 1.8z"/></svg>`,
+    // 需要你确认：对话气泡里挖空一个问号。原来是一个实心圆里放问号，像个通用的"帮助/说明"标记；气泡才说得清这是**在问你**、并且等你回话。
+    askuser: `<svg viewBox="0 0 16 16" fill="currentColor" fill-rule="evenodd" clip-rule="evenodd"><path d="M8 1.25c-3.87 0-7 2.46-7 5.5 0 1.77 1.07 3.34 2.73 4.35-.15.9-.6 1.73-1.3 2.4a.45.45 0 00.36.77c1.5-.13 2.86-.7 3.94-1.55.42.05.84.08 1.27.08 3.87 0 7-2.46 7-5.5s-3.13-5.5-7-5.5zM6.35 5.32c.33-.66 1-1.06 1.87-1.06 1.15 0 2.05.74 2.05 1.77 0 .73-.4 1.2-1.03 1.6-.5.32-.66.5-.66.85v.1a.55.55 0 01-.55.55h-.32a.55.55 0 01-.55-.55v-.2c0-.72.35-1.17 1-1.58.47-.3.62-.48.62-.79 0-.34-.28-.58-.68-.58-.36 0-.6.16-.74.45a.55.55 0 01-.7.27l-.03-.01a.55.55 0 01-.28-.72zm1.7 4.66a.8.8 0 100 1.6.8.8 0 000-1.6z"/></svg>`,
     current_time: `<svg viewBox="0 0 16 16" fill="currentColor"><path d="M8 0a8 8 0 100 16A8 8 0 008 0zm0 1.5a6.5 6.5 0 110 13 6.5 6.5 0 010-13z"/><path d="M8.75 4a.75.75 0 00-1.5 0v4.2c0 .26.13.5.35.63l2.6 1.56a.75.75 0 10.77-1.28L8.75 7.7V4z"/></svg>`,
-    _ksearch: `<svg viewBox="0 0 16 16" fill="currentColor"><path d="M3 1.75C3 .784 3.784 0 4.75 0h6.5c.966 0 1.75.784 1.75 1.75v12.5A1.75 1.75 0 0111.25 16h-6.5A1.75 1.75 0 013 14.25V1.75zm1.75-.25a.25.25 0 00-.25.25v12.5c0 .138.112.25.25.25h6.5a.25.25 0 00.25-.25V1.75a.25.25 0 00-.25-.25h-6.5z"/><path d="M6 4h4M6 6.5h4M6 9h2.5" fill="none" stroke="currentColor" stroke-width="1.1" stroke-linecap="round" opacity=".55"/></svg>`,
+    // 知识检索：摊开的书 + 书签带。原来是一张画了三条横线的普通文档，和「读文件」几乎一样，16px 下更是糊成一个空白圆角块——看不出这是"去知识库里查"。
+    _ksearch: `<svg viewBox="0 0 16 16" fill="currentColor"><path d="M7.4 4.42C6.3 3.5 4.72 3.02 2.7 3.02c-.63 0-1.15.5-1.18 1.13v7.24c0 .64.52 1.16 1.16 1.16 1.85 0 3.3.42 4.4 1.2a.5.5 0 00.32.11V4.6a.5.5 0 00-.2-.18z"/><path d="M8.6 4.42c1.02-.85 2.44-1.33 4.25-1.4v4.3a.4.4 0 01-.63.32l-.86-.62a.4.4 0 00-.47 0l-.86.62a.4.4 0 01-.63-.32V3.2c-.28.05-.55.11-.8.19v10.45a.5.5 0 00.32-.11c1.1-.78 2.55-1.2 4.4-1.2.64 0 1.16-.52 1.16-1.16V4.15c-.03-.63-.55-1.13-1.18-1.13-2.02 0-3.6.48-4.7 1.4z"/></svg>`,
     genimage: `<svg viewBox="0 0 16 16" fill="currentColor"><path d="M1.75 2A1.75 1.75 0 000 3.75v8.5C0 13.216.784 14 1.75 14h12.5A1.75 1.75 0 0016 12.25v-8.5A1.75 1.75 0 0014.25 2H1.75zM1.5 3.75a.25.25 0 01.25-.25h12.5a.25.25 0 01.25.25v5.69l-3.22-3.22a.75.75 0 00-1.06 0L6.44 9.94 4.78 8.28a.75.75 0 00-1.06 0L1.5 10.5V3.75zM5 6.5a1 1 0 11-2 0 1 1 0 012 0z"/></svg>`,
     db: `<svg viewBox="0 0 16 16" fill="currentColor"><ellipse cx="8" cy="3.5" rx="5.5" ry="2"/><path d="M2.5 3.5v9c0 1.1 2.46 2 5.5 2s5.5-.9 5.5-2v-9"/><path d="M2.5 7c0 1.1 2.46 2 5.5 2s5.5-.9 5.5-2" fill="none" stroke="currentColor" stroke-width=".6" opacity=".3"/><path d="M2.5 10.5c0 1.1 2.46 2 5.5 2s5.5-.9 5.5-2" fill="none" stroke="currentColor" stroke-width=".6" opacity=".3"/></svg>`,
     qr: `<svg viewBox="0 0 16 16" fill="currentColor"><path d="M0 1.75C0 .784.784 0 1.75 0H5v1.5H1.75a.25.25 0 00-.25.25V5H0V1.75zM14.25 0H11v1.5h3.25a.25.25 0 01.25.25V5H16V1.75A1.75 1.75 0 0014.25 0zM0 11v3.25C0 15.216.784 16 1.75 16H5v-1.5H1.75a.25.25 0 01-.25-.25V11H0zM14.5 11v3.25a.25.25 0 01-.25.25H11V16h3.25A1.75 1.75 0 0016 14.25V11h-1.5zM4 4h3v3H4V4zm5 0h3v3H9V4zM4 9h3v3H4V9z"/></svg>`,

@@ -4974,6 +4974,7 @@ test("model orchestration retries ten pre-progress failures and never replays pa
   const run = load("_runModelRequestWithRetry", {
     _modelEventHasProgress: progress,
     _AI_MODEL_RETRY_LIMIT: 10,
+    _AI_MODEL_RESUME_LIMIT: 3,
     _AI_MODEL_ATTEMPT_TIMEOUT_MS: 60_000,
     _isRetryableAiError: (message) => /504|没有生成有效内容/.test(String(message || "")),
   });
