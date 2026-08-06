@@ -11782,8 +11782,15 @@ test("worker with no scope recovers to a serialized whole-workspace run, not a h
   // the claim must be atomic: push immediately follows the no-conflict check, no await between
   assert.match(src, /if \(!conflict\) \{ run\._activeWorkerScopes\.push\(scopeRel\); break; \}/,
     "the scope claim must be atomic (no await between check and push)");
-  // two EXPLICIT overlapping scopes are still surfaced as a real modelling error
-  assert.match(src, /scope 重叠/, "explicit overlapping scopes still error to teach a disjoint split");
+  // 两个明确重叠的 scope：以前直接报错、这个 worker 当场被拒，整次并行派发塌成一个
+  // 错误，模型只能改成串行——这正是"一个在动、其它干等"的来源。现在改成排队：活儿
+  // 照做，只是错开时间。教学效果保留（报告里带调度提示），代价从"白跑一趟"降到"晚一点"。
+  assert.doesNotMatch(src, /return `\[ERROR\] 这个 worker 的 scope/,
+    "重叠不该再让 worker 直接失败——那会把整次并行派发浪费掉");
+  assert.match(src, /_serializedBehind = conflict\.filter/,
+    "重叠必须被记下来，才能在报告里告诉模型下次切开 scope");
+  assert.match(src, /【调度提示】[^\n]*重叠/,
+    "报告里要说清楚它是排队跑的、以及撞在哪，否则模型学不会切分");
 });
 
 test("delivery standard forbids self-downgrading a real deliverable to an MVP (beginner ≠ smaller build)", () => {

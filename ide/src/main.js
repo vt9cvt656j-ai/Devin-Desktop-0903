@@ -35877,6 +35877,9 @@ async function _runSubAgent({ config, description, prompt, root, container, run,
   // recoverable slip, not a dead end: grant the whole workspace and run exclusively (below).
   if (write && !scopeRel.length) scopeRel.push(WORKER_SCOPE_ALL);
   const _scopeIsWholeWs = write && scopeRel.includes(WORKER_SCOPE_ALL);
+  // 记录这个 worker 是不是因为 scope 撞车被迫排队。声明在函数级：抢占循环在 if (write)
+  // 块里写它，而下面拼装报告时在块外读它。
+  let _serializedBehind = null;
   const card = document.createElement("div");
   card.className = "agent-tool-step agent-tool-step--subagent is-open";
   card.innerHTML =
@@ -35942,12 +35945,18 @@ async function _runSubAgent({ config, description, prompt, root, container, run,
       }
       const conflict = run._activeWorkerScopes.find((s) => _scopesOverlap(s, scopeRel));
       if (!conflict) { run._activeWorkerScopes.push(scopeRel); break; }
+      // scope 重叠以前是**直接报错**：这个 worker 当场被拒，整次并行派发就塌成一个错误，
+      // 模型只好改成一个一个串行地派——用户看到的"一个在动、其它干等"就是这么来的。
+      //
+      // 但重叠并不是错误，它只是"不能同时写同一批文件"。排队机制这里本来就有（原先只
+      // 服务于整工作区独占那一种情况），直接复用即可：等前一个 worker 释放 scope，再
+      // 重新抢占。活儿照做，只是错开时间，没有任何一次派发被浪费。
+      //
+      // 仍然把这件事告诉模型（下面的 _serializedBehind），否则它学不会把 scope 切开，
+      // 下次还是会撞。以前那条错误文案的教学作用保留了，代价从"白跑一趟"降到"晚一点"。
       if (!_scopeIsWholeWs && !conflict.includes(WORKER_SCOPE_ALL)) {
-        res.className = "atc-result atc-result--err"; res.textContent = "scope 重叠"; card.classList.remove("is-open");
-        return `[ERROR] 这个 worker 的 scope（${scopeRel.join(", ")}）与另一个正在运行的 worker 重叠。并行 worker 的 scope 必须**互不重叠**——把这块拆成不相交的文件 / 目录，或改为串行（等上一个 worker 结束再派）。`;
+        _serializedBehind = conflict.filter((c) => c !== WORKER_SCOPE_ALL);
       }
-      // Whole-workspace worker on either side → serialize: wait for a sibling to release,
-      // then re-check. _workerScopeWaiters is drained in the finally that unregisters scope.
       res.textContent = t("subagent.queued");
       await new Promise((resolve) => { (run._workerScopeWaiters ||= []).push(resolve); setTimeout(resolve, 15000); });
       res.innerHTML = '<span class="atc-spin"></span>';
@@ -36045,7 +36054,7 @@ async function _runSubAgent({ config, description, prompt, root, container, run,
   for (const t of _roleCaps.tools) if (!_allow.includes(t)) _allow.push(t);
   // 嵌套派发硬边界①②（#53）：深度 <2 的子体可再派一层——run_subagent/run_worker/await_subagent
   // 进白名单；嵌套启动仍走 _runSubAgent 里同一个 _sess._subAgentsActive 计数与
-  // MAX_SUBAGENTS_PARALLEL(2) 排队逻辑，并发预算全会话共享、不因层级翻倍。
+  // MAX_SUBAGENTS_PARALLEL 排队逻辑，并发预算全会话共享、不因层级翻倍。
   // 深度 ≥2（孙子体）强制剔除这三件——schema 不装载、模型看不见，物理上第三层无法再派。
   const _canNest = _childDepth < 2;
   if (_canNest) for (const t of ["run_subagent", "run_worker", "await_subagent"]) if (!_allow.includes(t)) _allow.push(t);
@@ -36315,6 +36324,12 @@ async function _runSubAgent({ config, description, prompt, root, container, run,
 
   // 编排核对腿（五步纪律④「返回后抽查」的机制化）：worker 简报是模型自述，可能虚报
   // “已完成”；把实际写盘清单以系统口径钉进简报，主智能体比对自述与事实后再采信/重派。
+  if (write && _serializedBehind && _serializedBehind.length) {
+    // 让父智能体知道这次并行没能真的并行，以及具体撞在哪。以前这是一条错误、这个
+    // worker 根本不会跑；现在活儿照做，只是排了队——但仍要把原因说清楚，否则下一次
+    // 还是同样的切法、同样撞车。
+    report = (report || "") + `\n\n【调度提示】这个 worker 的 scope 与另一个同时在跑的 worker 重叠（${_serializedBehind.join("、")}），因此它是**排队等对方写完之后**才开始的，没有和对方真正并行。下次派并行 worker 时把这几块切成互不相交的文件 / 目录，才能真正同时进行。`;
+  }
   if (write) {
     const wrote = [...new Set(_writesDone)];
     report = (report || "") + (wrote.length
@@ -40573,7 +40588,7 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
         it._workerMutationPaths = [];
         // P1 多子智能体并发：run_subagent 传入 tasks 数组（每项 {role, task}）时并行派发；
         // worker / wiki / 单任务仍走下方原路径。并发度受 _runSubAgent 内部的
-        // MAX_SUBAGENTS_PARALLEL(2) 约束，各自独立卡片渲染，全部落定后合并 findings。
+        // MAX_SUBAGENTS_PARALLEL 约束，各自独立卡片渲染，全部落定后合并 findings。
         const _multiTasks = !isWorker && it.tc.name === "run_subagent" && Array.isArray(it.call.tasks) && it.call.tasks.length > 1
           ? it.call.tasks.filter((t) => t && (typeof t === "string" ? t.trim() : String(t.task || "").trim())).slice(0, 4)
           : null;
