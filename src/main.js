@@ -15524,6 +15524,9 @@ async function _persistChatHistoryOnce(freshSnapshots, lightweightOnly = false) 
   } catch (e) { console.warn("[chat] store save failed (localStorage fallback kept):", e); }
 }
 
+// 上一次 persistChatHistory 的真实耗时，喂给下面的自适应节流。
+let _lastPersistMs = 0;
+
 function saveChatHistory(options) {
   options = options || {};
   const immediate = !!options.immediate;
@@ -15543,7 +15546,17 @@ function saveChatHistory(options) {
         // 空闲/收尾仍然 500ms/立即。
         const anyStreaming = typeof _chatSessions !== "undefined" && Array.isArray(_chatSessions) && _chatSessions.some((s) => s && s.streaming);
         await new Promise((resolve) => {
-          const timer = setTimeout(resolve, anyStreaming ? 5000 : 500);
+          // 自适应节流：等待时间至少是上一次存盘耗时的两倍。
+          //
+          // 原来是固定 5s（流式期间）。日志实测存盘耗时随会话变长一路涨到 21s→45s→105s，
+          // 于是变成"存完 5 秒又存"，几乎连续占着主线程，而且每次都更贵——21→28→45→67→105
+          // 那条递增曲线就是这么来的，最长一次冻结 132 秒。
+          //
+          // 按上次耗时反馈，代价越高就退得越远：贵的存盘自己把频率压下去，
+          // 主线程一定拿得回时间。封顶 60s，保证再慢也不会久到丢数据。
+          const _base = anyStreaming ? 5000 : 500;
+          const _wait = Math.min(60000, Math.max(_base, _lastPersistMs * 2));
+          const timer = setTimeout(resolve, _wait);
           _chatSaveWake = () => { clearTimeout(timer); resolve(); };
         });
       }
@@ -15553,7 +15566,10 @@ function saveChatHistory(options) {
         const freshSnapshots = _chatSaveImmediate;
         _chatSaveImmediate = false;
         const anyStreaming = _chatSessions.some((session) => session?.streaming);
+        const _t0 = Date.now();
         await _persistChatHistoryOnce(freshSnapshots, anyStreaming);
+        // 记下这次真实耗时，供下面的自适应节流用。
+        _lastPersistMs = Date.now() - _t0;
         if (anyStreaming && _chatSessions.some((session) => session?.streaming)) break;
       } while (_chatSaveDirty);
     } catch (e) { console.warn("[chat] save failed:", e); }
