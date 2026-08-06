@@ -14679,9 +14679,39 @@ function _historyPageButton(kind, session) {
   });
   return button;
 }
+/**
+ * 滚到顶部就自动把更早的一页接上，不用去点那个「更早的 N 条」按钮。
+ *
+ * 分页本身早就有了（_RENDER_LIMIT / _RENDER_PAGE），但只有按钮能触发——长会话往回翻
+ * 是一路点上去的。按钮保留（它同时是"还剩多少条"的说明），这里只是在快到顶时替用户
+ * 按一下。用 200px 的提前量：等真的贴到顶再加载，用户已经先看到一次空白了。
+ *
+ * 加载期间用 _autoPaging 上锁：滚动事件一秒能来几十次，不锁会同时发起好几页。
+ */
+const _AUTO_PAGE_TRIGGER_PX = 200;
+function _wireHistoryAutoPaging() {
+  const scroller = chatEl;
+  if (!scroller || scroller._autoPageWired) return;
+  scroller._autoPageWired = true;
+  scroller.addEventListener("scroll", () => {
+    if (scroller.scrollTop > _AUTO_PAGE_TRIGGER_PX) return;
+    const session = _currentSession?.();
+    const container = session?.container;
+    if (!container || container._autoPaging) return;
+    const earlier = container.querySelector(":scope > .chat-history-page--earlier");
+    if (!earlier || earlier.disabled) return;
+    container._autoPaging = true;
+    // 按钮自己已经处理好"加载后保持视觉位置不跳"，直接复用，不另写一套。
+    try { earlier.click(); } finally {
+      setTimeout(() => { container._autoPaging = false; }, 120);
+    }
+  }, { passive: true });
+}
+
 function _updateHistoryControls(session) {
   const container = session?.container;
   if (!container) return;
+  _wireHistoryAutoPaging();   // 幂等：内部有 _autoPageWired 保护，只会真的绑一次
   const { length, start, end } = _historyWindow(session);
   let earlier = container.querySelector(":scope > .chat-history-page--earlier");
   let newer = container.querySelector(":scope > .chat-history-page--newer");
@@ -16394,6 +16424,37 @@ function _renderTokenMeter() {
 let _highlightActive = 0;
 const _highlightQueue = [];
 const _HIGHLIGHT_MAX_CONCURRENT = 2;
+/**
+ * 代码卡的展开/收起，用事件委托挂在 document 上。
+ *
+ * 为什么不在 markdown.js 里绑内联监听器（原来就是那么做的）：会话是靠 innerHTML 快照
+ * 恢复的，恢复之后所有内联监听器都没了——重开一个对话，里面的折叠代码卡点了没反应。
+ * 委托挂在 document 上还顺带覆盖了聊天区之外的地方（文件预览也渲染 markdown）。
+ *
+ * 展开时才把正文建进 DOM 并着色：折叠卡的正文存在 data-code 上，没人看的代码不占
+ * 节点、也不烧 CPU 去着色。
+ */
+document.addEventListener("click", (e) => {
+  const head = e.target?.closest?.(".code-card__head");
+  if (!head) return;
+  if (e.target.closest(".code-card__copy")) return;   // 复制按钮不该顺手把卡折起来
+  const card = head.closest(".code-card");
+  if (!card || !card.classList.contains("is-foldable")) return;
+  const wasFolded = card.classList.contains("is-folded");
+  card.classList.toggle("is-folded");
+  if (!wasFolded) return;                              // 收起：什么都不用建
+  const pending = card.dataset.code;
+  if (pending == null) return;                         // 已经建过了
+  const codeEl = card.querySelector(".code-card__body code");
+  if (!codeEl) return;
+  codeEl.textContent = pending;
+  delete card.dataset.code;                            // 建完就把字符串还回去
+  const mono = card.dataset.lang || "plaintext";
+  if (mono !== "plaintext" && pending.trim()) {
+    highlightCode(pending, mono).then((html) => { if (html) codeEl.innerHTML = html; }).catch(() => {});
+  }
+});
+
 async function highlightCode(code, lang) {
   // 取证维度：块长/行数进相位名，冻结时能直接看出是哪种量级的块在 tokenize。
   try { _perfPhase(`highlightCode len=${code ? code.length : 0} lines=${code ? code.split("\n").length : 0}`); } catch {}

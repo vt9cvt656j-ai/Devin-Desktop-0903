@@ -653,13 +653,17 @@ function codeCard(code, lang, filename, ctx) {
     label.appendChild(meta);
   }
   head.appendChild(label);
+  const startsFolded = foldable && !(ctx && ctx.streaming);
   if (foldable) {
     card.classList.add("is-foldable");
     // Auto-fold only a COMPLETE block. While the model is still writing the code you must be
     // able to watch it arrive, so a card built during streaming starts open; the final render
     // (streaming:false) rebuilds it folded. Restored history renders folded for the same reason.
-    if (!ctx || !ctx.streaming) card.classList.add("is-folded");
-    head.addEventListener("click", () => card.classList.toggle("is-folded"));
+    if (startsFolded) card.classList.add("is-folded");
+    // 展开/收起由 main.js 里的**事件委托**处理，不在这里绑。两个原因：
+    //   1) 会话是靠 innerHTML 快照恢复的，内联监听器在恢复后全部丢失——原来的折叠卡
+    //      重开对话后根本点不动（这是个一直存在的老毛病）。
+    //   2) 折叠卡的正文是懒加载的，展开时需要拿到 highlightCode，那在 main.js 里。
   }
 
   const copy = el("button", "code-card__copy");
@@ -697,18 +701,31 @@ function codeCard(code, lang, filename, ctx) {
 
   const pre = el("pre", "code-card__body");
   const codeEl = el("code");
-  codeEl.textContent = code;
   pre.appendChild(codeEl);
   card.appendChild(pre);
 
-  if (ctx && typeof ctx.highlighter === "function" && code.trim()) {
-    const mono = monacoLang(lang);
-    if (mono !== "plaintext") {
-      ctx.highlighter(code, mono)
-        .then((html) => {
-          if (html) codeEl.innerHTML = html;
-        })
-        .catch(() => {});
+  // 折叠态**不把正文放进 DOM**，也不做语法高亮。
+  //
+  // 折叠原本只是 `display: none`：卡片看不见了，但它的每一行仍然完整挂在 DOM 上，
+  // 而且照样跑一遍 Monaco 着色，把一行拆成几十个 span。也就是说"折叠"省的是屏幕，
+  // 不是内存——一段长对话里几十张这样的卡加起来，正是内容一多就卡的来源之一。
+  //
+  // 现在正文先留在 data-code 上（一个字符串，比几万个节点便宜得多），第一次展开时
+  // 才建 DOM、才着色。放在 attribute 上而不是闭包里，是因为会话靠 innerHTML 快照
+  // 持久化：闭包活不过一次重启，attribute 可以，重开对话后照样能展开。
+  if (startsFolded) {
+    card.dataset.code = code;
+  } else {
+    codeEl.textContent = code;
+    if (ctx && typeof ctx.highlighter === "function" && code.trim()) {
+      const mono = monacoLang(lang);
+      if (mono !== "plaintext") {
+        ctx.highlighter(code, mono)
+          .then((html) => {
+            if (html) codeEl.innerHTML = html;
+          })
+          .catch(() => {});
+      }
     }
   }
   return card;

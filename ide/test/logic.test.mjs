@@ -13488,9 +13488,15 @@ test("流式Markdown增量渲染：settle 前缀不重建，divergence 只回滚
     assert.ok(longCard.classList.contains("is-foldable"), "超过阈值的代码卡必须可折叠");
     assert.ok(longCard.classList.contains("is-folded"), "完成的长代码卡默认折叠");
     assert.match(longCard.textContent, /40 行/, "折叠态必须显示行数，用户才知道里面有多少");
-    assert.match(longCard.textContent, /const line0 = 0;/, "正文仍在 DOM 里（靠 CSS 收起），展开无需重渲染");
-    longCard.childNodes[0]._fire("click"); // childNodes[0] 是 .code-card__head
-    assert.equal(longCard.classList.contains("is-folded"), false, "点标题必须展开");
+    // 折叠态**不把正文放进 DOM**：原来是 textContent 照写、只用 CSS 收起，等于
+    // "看不见但一分钱内存都没省"，长会话里几十张这样的卡就是内容一多就卡的来源之一。
+    // 正文改存在 data-code 上（一个字符串，比几万个节点便宜），展开时才建、才着色。
+    assert.doesNotMatch(longCard.textContent, /const line0 = 0;/,
+      "折叠态的正文不该出现在 DOM 里——那正是要省掉的东西");
+    assert.equal(longCard.dataset.code.includes("const line0 = 0;"), true,
+      "正文必须完整保留在 data-code 上，展开时才建（放 attribute 而不是闭包：会话靠 innerHTML 快照恢复）");
+    assert.match(longCard.textContent, /40 行/, "折叠态仍要显示行数，用户才知道里面有多少");
+    // 展开由 main.js 的事件委托负责（内联监听器活不过快照恢复），这里只验证渲染层的契约。
 
     // 短代码块不折叠，也不该多出折叠装饰
     const short = new _N("div");
