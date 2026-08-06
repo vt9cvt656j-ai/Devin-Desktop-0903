@@ -382,3 +382,42 @@
   .git-timeline__meta { display: none; }
   .git-timeline__row { padding-right: 6px; }
 }
+
+
+/* ---------------------------------------------------------------------------
+ * 终端标签的「正在运行」指示
+ *
+ * 标签上原本那个 `▶` 是写死在标题字符串里的，只说明"这个终端是智能体开的"——任务
+ * 早跑完了它还在，一排终端里看不出谁还在动。这里显示的是真状态：PTY 的前台进程组
+ * 不是 shell 自己时才亮（用户自己敲的 npm run dev 一样算）。
+ *
+ * 做成一个会呼吸的小圆点而不是转圈：圆点在 22px 高的标签里不抖动、不抢视线，
+ * 静止的标签和跳动的标签放在一起，一眼就分得出来。不跑的时候整个点不占位。
+ * ------------------------------------------------------------------------ */
+.term-tab__live {
+  display: none;
+  flex: none;
+  width: 6px;
+  height: 6px;
+  margin-right: 1px;
+  border-radius: 50%;
+  background: var(--ok, #22c55e);
+}
+
+.term-tab.is-running .term-tab__live {
+  display: block;
+  animation: term-live-pulse 1.6s ease-in-out infinite;
+}
+
+/* 运行中的标签标题给一点重量，收起面板前扫一眼也能看出来 */
+.term-tab.is-running .term-tab__label { font-weight: 600; }
+
+@keyframes term-live-pulse {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50%      { opacity: 0.45; transform: scale(0.82); }
+}
+
+/* 跟随系统「减少动态效果」：留颜色和位置，去掉呼吸 */
+@media (prefers-reduced-motion: reduce) {
+  .term-tab.is-running .term-tab__live { animation: none; }
+}
