@@ -3658,6 +3658,8 @@ test("an immediate chat save wakes the debounce and close waits for disk persist
     _chatSaveWake: null,
     _chatSavePending: false,
     _chatSavePromise: Promise.resolve(),
+    // 自适应节流会读上一次存盘耗时；注入的作用域里必须有它，否则读到未声明变量直接抛。
+    _lastPersistMs: 0,
     _persistChatHistoryOnce: async (...args) => { persisted.push(args); },
   });
   const started = Date.now();
@@ -19272,4 +19274,15 @@ test("写文件前的预备打开不弹「文件不存在」——新建文件�
     "silentMissing 必须与「确实是缺文件」同时成立才吞");
   assert.match(guard, /_isOutsideWorkspaceError\(e\)/,
     "越界路径仍要提示");
+});
+
+test("存盘节流按上一次真实耗时退避——贵的存盘必须自己把频率压下来", () => {
+  // 日志实测：persistChatHistory 随会话变长涨到 21s→28s→45s→67s→105s，
+  // 而节流固定 5s，等于存完立刻再存，主线程一直被占，最长一次冻结 132 秒。
+  const seg = SRC.slice(SRC.indexOf("function saveChatHistory("), SRC.indexOf("function _scrollChatBottom"));
+  assert.match(seg, /_lastPersistMs = Date\.now\(\) - _t0/, "必须量出每次存盘的真实耗时");
+  assert.match(seg, /Math\.max\(_base, _lastPersistMs \* 2\)/,
+    "下一次等待至少是上一次耗时的两倍，代价越高退得越远");
+  assert.match(seg, /Math\.min\(60000,/, "退避要封顶，再慢也不能久到丢数据");
+  assert.match(seg, /anyStreaming \? 5000 : 500/, "基础节流保持不变，只在更贵时才拉长");
 });
