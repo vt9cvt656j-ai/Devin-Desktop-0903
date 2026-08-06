@@ -4414,6 +4414,45 @@ mod tests {
     }
 
     #[test]
+    /// 主次纪律：先跑能决定方向的那一步，别把没验证的原因先讲成事实。
+    ///
+    /// 真实案例：项目 36 个编译错误，助手开口就断言"根本原因是依赖未安装"，然后去读
+    /// tsconfig.json、读 scraper.ts、再跑 `test -d node_modules`（这才是唯一能决定
+    /// 方向的一步）、最后还做了一次知识检索——而那时项目根本跑不起来。结论先于证据、
+    /// 外围动作先于阻塞项，用户看到的就是"话说得满、事做得虚"。
+    #[test]
+    fn agent_prompt_orders_the_decisive_check_before_the_conclusion() {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert("x-ide-mode", "agent".parse().unwrap());
+        let mut body = serde_json::json!({
+            "model": "claude-opus-4-8",
+            "messages": [{"role": "user", "content": "帮我继续写网站"}]
+        });
+        assemble_into(&headers, &mut body);
+        let system = body["messages"][0]["content"].as_str().unwrap_or_default();
+
+        assert!(
+            system.contains("分主次"),
+            "agent 提示词必须要求分清主次，否则外围取证会排在阻塞项前面"
+        );
+        assert!(
+            system.contains("先跑再下结论"),
+            "决定性的那一步必须排在结论之前，不能先断言再回头找证据"
+        );
+        assert!(
+            system.contains("读源码查知识库都是白做"),
+            "阻塞项没解除时（依赖没装、构建起不来），外围取证必须让路"
+        );
+        assert!(
+            system.contains("没验证的原因不当结论"),
+            "没验证的因果不能写成事实"
+        );
+        assert!(
+            system.contains("已在屏幕上的事实不复述"),
+            "用户屏幕上已经显示的东西不该再复述一遍"
+        );
+    }
+
     fn server_assembly_injects_truthfulness_and_community_tools() {
         let mut headers = axum::http::HeaderMap::new();
         headers.insert("x-ide-mode", "agent".parse().unwrap());
@@ -6069,8 +6108,17 @@ mod tests {
             let system = body["messages"][0]["content"].as_str().unwrap();
             assert!(system.contains("自主执行智能体"), "{model}");
             assert!(system.contains("真实性与证据纪律"), "{model}");
+            // 9_000 -> 9_200：为"分主次"那条规则腾的位置（真实失败催生的：项目 36 个
+            // 编译错误，助手先断言"根本原因是依赖未安装"，再去读 tsconfig/源码、再跑那条
+            // 唯一决定方向的 node_modules 检查、最后还查了一次知识库）。已经先把能删的
+            // 重复删掉抵掉一部分——agent_core 里"最终回复先给结果，再给证据/风险"和
+            // answer_quality 开头那句几乎逐字重复，两块永远一起加载，只留了独有的
+            // "文件和行号"。净增约 137 字节。
+            //
+            // 这条上限是防提示词无声膨胀的闸门，不是禁止改动：抬它要像这样写清楚
+            // 换来了什么、又删掉了什么，而不是顺手加个零。
             assert!(
-                system.len() < 9_000,
+                system.len() < 9_200,
                 "{model} ordinary system prompt is {} bytes",
                 system.len()
             );
