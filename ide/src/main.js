@@ -35779,9 +35779,43 @@ function _drainSubAgentCollaborationInbox(store, jobId, cursor = 0, maxItems = 6
     lines.push(`· ${source}: ${content.slice(0, 420)}`);
   }
   if (!lines.length) return next;
-  const head = "〔并行子智能体共享发现——来自同批其他角色；作为线索复用，并结合自己的证据核验〕\n";
+  const head = "〔共享发现——来自主智能体或同批其他角色；作为线索复用，并结合自己的证据核验〕\n";
   next.message = (head + lines.join("\n")).slice(0, Math.max(head.length, maxChars));
   return next;
+}
+
+/**
+ * 主智能体 → 正在跑的子智能体。
+ *
+ * 之前这条线是**单向**的：子智能体在派发那一刻拿到一份很厚的上下文快照（共享摘要、
+ * 文件片段、验收契约、工具成败账本…），然后就再也听不到主智能体的任何消息。可子智能体
+ * 一跑就是几分钟，这期间主智能体读了文件、改了文件、撞了坑、换了方向——子智能体全然
+ * 不知情，照着一份过期快照干活。同伴之间反而是通的（完成即广播），主↔子这条最重要的
+ * 反而断着，"完全对不上"就是从这儿来的。
+ *
+ * 实现上不需要新机制：子智能体本来就在每步之间按游标拉自己的 findings 收件箱
+ * （_drainSubAgentCollaborationInbox 只认 isExternal 的条目）。这里只是让主智能体也
+ * 成为黑板上的一个参与者，往每个还在跑的子作业里投递。已经落定的作业不投——它读不到了。
+ */
+function _broadcastMainAgentFinding(run, text, store = _globalSharedStore) {
+  const body = String(text || "").replace(/\s+/g, " ").trim();
+  if (!run || !body || !store || typeof store.appendFinding !== "function") return 0;
+  const jobs = run._subAgentJobs;
+  if (!(jobs instanceof Map) || jobs.size === 0) return 0;
+  let sent = 0;
+  for (const [jobId, job] of jobs) {
+    if (job && job.status && job.status !== "running") continue;
+    try {
+      store.appendFinding(`sm_${jobId}`, {
+        source: "主智能体",
+        channel: "collaboration",
+        content: body.slice(0, 420),
+        isExternal: true,
+      });
+      sent++;
+    } catch {}
+  }
+  return sent;
 }
 
 function _broadcastSubAgentCollaborationFinding(store, sourceJobId, peerJobIds, call, result, maxChars = 420) {
@@ -38665,6 +38699,16 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
     };
     run._toolLedger.entries.push(rec);
     if (run._toolLedger.entries.length > 400) run._toolLedger.entries.shift();
+    // 只同步"会改变子智能体下一步"的两类：主智能体动过的文件（它可能正读着旧内容），
+    // 以及踩到的坑（同一条路别再走一遍）。读取、列目录这类不投——那只是噪音。
+    try {
+      const _mutated = _MUTATING_FILE_TOOL_TYPES?.has?.(it.call?.type);
+      if (_mutated && ok) {
+        _broadcastMainAgentFinding(run, `主智能体刚改了 ${rec.args}（${rec.tool}）；你若要读这个文件，请重新读取，别用派发时的旧内容。`);
+      } else if (!ok && rec.reason) {
+        _broadcastMainAgentFinding(run, `主智能体这条路走不通：${rec.tool} ${rec.args} —— ${String(rec.reason).slice(0, 160)}。别重复同一条。`);
+      }
+    } catch {}
     // 跨会话经验记录：从 run.engineering 提取签名写入 localStorage（用于下一次编排器检索）；
     // 失败时把原因文本一并传入，供分类记账（failCategory/failDetail）
     try { _toolExpRecord(run.engineering, rec.tool, ok, rec.reason); } catch {}
