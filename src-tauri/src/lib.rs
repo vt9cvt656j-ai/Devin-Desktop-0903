@@ -7,6 +7,7 @@ mod auth;
 mod automation;
 mod browser;
 mod capture;
+mod content_length_frame;
 mod conversation_store;
 mod db;
 mod debug;
@@ -30,6 +31,7 @@ mod public_data;
 mod qr;
 #[macro_use]
 mod safelog;
+mod sandbox;
 mod sysctl;
 mod tasks;
 mod terminal;
@@ -275,6 +277,7 @@ pub fn run() {
             browser::browser_press,
             browser::browser_upload_file,
             browser::browser_eval,
+            browser::browser_performance_sample,
             browser::browser_screenshot,
             browser::browser_set_viewport,
             browser::browser_set_marks,
