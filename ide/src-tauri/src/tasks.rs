@@ -204,6 +204,14 @@ pub struct TaskRunResult {
     combined: String,
     truncated: bool,
     timed_out: bool,
+    /// Which confinement actually applied: `seatbelt`, `bubblewrap`, or `none`. Reported so
+    /// the UI states what happened instead of implying protection the command never got —
+    /// an unavailable sandbox degrades to running unconfined, it never blocks the command.
+    sandbox: String,
+    /// The command failed AND the output looks like the sandbox refusing a write. Lets the
+    /// caller offer "re-run this one unconfined" instead of leaving the model to thrash on
+    /// what reads like a mysterious permissions bug.
+    sandbox_denied: bool,
 }
 
 const MAX_TASK_OUTPUT: usize = 2 * 1024 * 1024;
@@ -234,24 +242,31 @@ fn task_shell() -> String {
 /// frontend can feed it through a problem matcher into the Problems panel.
 /// This is the non-interactive complement to running a task in the terminal.
 #[tauri::command]
+/// `sandbox` confines the command to the workspace at the OS level and defaults to ON: an
+/// agent-run command is the one place a prompt injection turns into persistence. The caller
+/// passes `false` only for an explicit, user-approved escape (see `sandbox_denied`).
 pub async fn task_run_capture(
     cwd: String,
     command: String,
     timeout_secs: Option<u64>,
+    sandbox: Option<bool>,
 ) -> Result<TaskRunResult, String> {
     // Run the blocking spawn + wait loop on the blocking pool, NOT the Tauri
     // event-loop thread. A sync command here blocks that thread for the command's
     // whole duration (up to the command timeout), freezing the whole IDE — the cause
     // of "调用终端容易卡死一会". spawn_blocking keeps the UI responsive throughout.
-    tauri::async_runtime::spawn_blocking(move || task_run_capture_inner(cwd, command, timeout_secs))
-        .await
-        .map_err(|e| format!("task thread join failed: {e}"))?
+    tauri::async_runtime::spawn_blocking(move || {
+        task_run_capture_inner(cwd, command, timeout_secs, sandbox.unwrap_or(true))
+    })
+    .await
+    .map_err(|e| format!("task thread join failed: {e}"))?
 }
 
 fn task_run_capture_inner(
     cwd: String,
     command: String,
     timeout_secs: Option<u64>,
+    sandbox: bool,
 ) -> Result<TaskRunResult, String> {
     let dir = PathBuf::from(&cwd);
     if !dir.is_dir() {
@@ -280,16 +295,40 @@ fn task_run_capture_inner(
             .env("PYTHONIOENCODING", "utf-8");
         c
     };
+    #[cfg(windows)]
+    let sandbox_kind = "none";
+
     #[cfg(not(windows))]
-    let mut cmd = {
+    let (mut cmd, sandbox_kind) = {
         // A login shell loads the user's profile so cargo/npm/go resolve. Use the SHARED
         // process_util::augmented_path(cwd) — it prepends the workspace's `.venv/bin` + `venv/bin` +
         // node_modules/.bin and the user's real login-shell PATH. (A private helper here used to omit
         // all of those, so an AI-installed venv was invisible → "环境丢失、重装" loop.)
-        let mut c = crate::process_util::command(task_shell());
-        c.arg("-lc")
-            .arg(&command)
-            .current_dir(&dir)
+        //
+        // When confinement is available the same shell invocation runs under it instead. The
+        // plan is `None` on an unsupported platform or an unresolvable workspace, and then
+        // this behaves exactly as it did before the sandbox existed — degrade to unconfined,
+        // never to "command refused".
+        let shell = task_shell();
+        let plan = if sandbox {
+            crate::sandbox::wrap(&shell, &["-lc"], &command, &dir, &[])
+        } else {
+            None
+        };
+        let kind = plan.as_ref().map(|p| p.kind).unwrap_or("none");
+        let mut c = match &plan {
+            Some(p) => {
+                let mut c = crate::process_util::command(&p.program);
+                c.args(&p.args);
+                c
+            }
+            None => {
+                let mut c = crate::process_util::command(&shell);
+                c.arg("-lc").arg(&command);
+                c
+            }
+        };
+        c.current_dir(&dir)
             .env("PATH", crate::process_util::augmented_path(Some(&cwd)))
             .env("CI", "1")
             .env("TERM", "dumb");
@@ -303,7 +342,7 @@ fn task_run_capture_inner(
                 break;
             }
         }
-        c
+        (c, kind)
     };
     cmd.stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
@@ -392,6 +431,12 @@ fn task_run_capture_inner(
         ));
     }
     let combined = format!("{stdout}{stderr}");
+    // Only claim a denial when the command actually FAILED and ran confined. A successful
+    // command whose output happens to mention "operation not permitted" (a test asserting an
+    // error message, a log replay) must not be reported as sandbox-blocked — that would send
+    // the model chasing a permission problem that does not exist.
+    let sandbox_denied =
+        code != 0 && sandbox_kind != "none" && crate::sandbox::looks_like_denial(&combined);
     Ok(TaskRunResult {
         code,
         stdout,
@@ -399,6 +444,8 @@ fn task_run_capture_inner(
         combined,
         truncated,
         timed_out,
+        sandbox: sandbox_kind.to_string(),
+        sandbox_denied,
     })
 }
 
@@ -521,6 +568,9 @@ mod tests {
         assert_eq!(s, "hello");
     }
 
+    // Every capture test runs WITH the sandbox on — the default path, so ordinary commands
+    // must keep working under confinement. A regression that breaks normal execution inside
+    // the sandbox fails these rather than surfacing later as "the terminal stopped working".
     #[cfg(not(windows))]
     #[test]
     fn capture_runs_command_and_collects_output() {
@@ -529,10 +579,12 @@ mod tests {
             root.to_string_lossy().to_string(),
             "echo michael-ide".into(),
             None,
+            true,
         )
         .expect("task should run");
         assert_eq!(result.code, 0);
         assert!(result.combined.contains("michael-ide"));
+        assert!(!result.sandbox_denied);
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -541,9 +593,12 @@ mod tests {
     fn capture_reports_nonzero_exit() {
         let root = temp_root("capture-fail");
         let result =
-            task_run_capture_inner(root.to_string_lossy().to_string(), "exit 3".into(), None)
+            task_run_capture_inner(root.to_string_lossy().to_string(), "exit 3".into(), None, true)
                 .expect("task should run");
         assert_eq!(result.code, 3);
+        // A plain nonzero exit is not a sandbox denial; mislabelling it would send the model
+        // hunting for a permissions problem that does not exist.
+        assert!(!result.sandbox_denied);
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -553,6 +608,7 @@ mod tests {
             "/nonexistent-michael-ide-dir-xyz".into(),
             "echo hi".into(),
             None,
+            true,
         );
         assert!(err.is_err());
     }
@@ -566,11 +622,64 @@ mod tests {
             root.to_string_lossy().to_string(),
             "sleep 10 & wait".into(),
             Some(1),
+            true,
         )
         .expect("timed command should return a result");
         assert_eq!(result.code, -1);
         assert!(result.timed_out);
         assert!(started.elapsed() < std::time::Duration::from_secs(4));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    // The whole point, end to end through the real command path: a write inside the
+    // workspace lands, the same write to HOME does not, and the refusal is reported as a
+    // sandbox denial so the caller can offer an explicit escape instead of leaving the model
+    // to retry a command that can never succeed.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_sandboxed_command_cannot_write_outside_the_workspace() {
+        if !crate::sandbox::available() {
+            return;
+        }
+        let root = temp_root("capture-sandbox");
+        let inside = task_run_capture_inner(
+            root.to_string_lossy().to_string(),
+            "echo ok > inside.txt".into(),
+            None,
+            true,
+        )
+        .expect("task should run");
+        assert_eq!(inside.code, 0, "writes inside the workspace must still work");
+        assert_eq!(inside.sandbox, "seatbelt");
+
+        let home = std::env::var("HOME").expect("HOME");
+        let probe = std::path::PathBuf::from(&home).join(".michael-tasks-sbtest-probe");
+        let _ = std::fs::remove_file(&probe);
+        let escaped = task_run_capture_inner(
+            root.to_string_lossy().to_string(),
+            format!("echo pwned > {}", probe.display()),
+            None,
+            true,
+        )
+        .expect("task should run");
+        assert_ne!(escaped.code, 0, "a write to HOME must fail");
+        assert!(!probe.exists(), "and must not have landed");
+        assert!(escaped.sandbox_denied, "and must be reported as a sandbox denial");
+
+        // The explicit escape hatch still works, so a legitimate outside-write is one
+        // approval away rather than impossible.
+        let allowed = task_run_capture_inner(
+            root.to_string_lossy().to_string(),
+            format!("echo ok > {}", probe.display()),
+            None,
+            false,
+        )
+        .expect("task should run");
+        assert_eq!(allowed.code, 0);
+        assert_eq!(allowed.sandbox, "none");
+        assert!(probe.exists());
+
+        let _ = std::fs::remove_file(&probe);
         let _ = std::fs::remove_dir_all(root);
     }
 }
