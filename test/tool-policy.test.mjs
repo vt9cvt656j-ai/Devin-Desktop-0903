@@ -1,0 +1,172 @@
+// Tests for the tool policy registry.
+//
+// Note what these DON'T do: no `extractFn`, no `assert.match(SRC, /regex/)`. The module is
+// pure, so it is imported and called like ordinary code. That is the whole point of moving it
+// out of main.js — 1,221 assertions in logic.test.mjs are welded to the SHAPE of the source
+// and break whenever the code is improved. Nothing here can break for that reason.
+import test from "node:test";
+import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+import { dirname, join } from "node:path";
+import {
+  DEFAULT_POLICY,
+  allPolicies,
+  approvalTypes,
+  blockedInReadOnlyMode,
+  defineTool,
+  fileEditTypes,
+  fileMutationTypes,
+  hookedTypes,
+  isFileEdit,
+  isFileMutation,
+  mutatesWorkspace,
+  needsApproval,
+  readOnlyBlockedTypes,
+  toolPolicy,
+  workerScopeField,
+  workerScopeTarget,
+  workspaceMutatingTypes,
+} from "../src/agent/tool-policy.js";
+
+const HERE = dirname(fileURLToPath(import.meta.url));
+const MAIN = readFileSync(join(HERE, "../src/main.js"), "utf8");
+
+const sorted = (set) => [...set].sort();
+
+// ── The pinning tests ───────────────────────────────────────────────────────
+//
+// These encode "this refactor changed nothing". Each asserts the derived set has EXACTLY the
+// membership the hand-written literal had before the registry existed. Without them, a
+// migration like this is a leap of faith; with them it is verifiable.
+//
+// The expected lists are transcribed from the pre-refactor source and must never be "fixed"
+// to match the code — if one fails, either the registry is wrong or a deliberate behaviour
+// change is being made, and the second case belongs in its own commit with this list updated
+// as part of it.
+
+test("workspace-mutating set matches the pre-refactor literal exactly", () => {
+  assert.deepEqual(sorted(workspaceMutatingTypes()), sorted(new Set([
+    "write", "edit", "multiedit", "delete", "move", "mkdir", "copy", "format",
+    "game_scaffold", "web_scaffold", "download", "download_asset", "genimage", "generate_3d",
+    "generate_sound", "generate_music", "generate_voice", "auto_rig", "generate_motion",
+    "generate_texture",
+  ])));
+  // The subtle one: a shell command may change the workspace but never REPORTS it, so it is
+  // not in this set. Adding it would make `mutated === false` look like proof of a no-op.
+  assert.equal(mutatesWorkspace("cmd"), false);
+  assert.equal(mutatesWorkspace("termtask"), false);
+});
+
+test("approval set matches the pre-refactor literal exactly", () => {
+  assert.deepEqual(sorted(approvalTypes()), sorted(new Set([
+    "write", "edit", "multiedit", "delete", "move", "mkdir", "copy", "format",
+    "cmd", "termtask", "automation", "uiclick", "download", "db", "mcp",
+  ])));
+});
+
+test("hooked set matches the pre-refactor literal exactly, including format's absence", () => {
+  assert.deepEqual(sorted(hookedTypes()), sorted(new Set([
+    "write", "edit", "multiedit", "cmd", "termtask", "delete", "move", "mkdir", "copy",
+  ])));
+  // `format` writes content but is intentionally NOT hooked. It is the single element that
+  // makes this set differ from the file-mutation family, and it was easy to lose.
+  assert.equal(isFileEdit("format"), true);
+  assert.equal(toolPolicy("format").hooked, false);
+});
+
+test("read-only-mode block matches the pre-refactor chain, gap included", () => {
+  assert.deepEqual(sorted(readOnlyBlockedTypes()), sorted(new Set([
+    "write", "edit", "multiedit", "cmd", "delete", "move", "mkdir", "copy", "format",
+    "uiclick", "mcp",
+  ])));
+  // Documented gap, preserved deliberately: run_in_terminal is NOT blocked in the read-only
+  // modes, so Explorer/Plan/Reviewer can start a terminal task today. This assertion exists
+  // to make the gap loud — when it is closed, this line flips to `true` in the same commit.
+  assert.equal(blockedInReadOnlyMode("termtask"), false,
+    "known gap: closing it is a one-word policy change, and should be its own commit");
+});
+
+test("file-mutation and file-edit families match their pre-refactor literals", () => {
+  assert.deepEqual(sorted(fileMutationTypes()), sorted(new Set([
+    "write", "edit", "multiedit", "delete", "move", "mkdir", "copy", "format",
+  ])));
+  assert.deepEqual(sorted(fileEditTypes()), sorted(new Set([
+    "write", "edit", "multiedit", "format",
+  ])));
+  // A generator lands files in the workspace but is not a structured file operation — the
+  // distinction the flat lists kept blurring.
+  assert.equal(mutatesWorkspace("genimage"), true);
+  assert.equal(isFileMutation("genimage"), false);
+});
+
+test("worker scope targets match the pre-refactor list", () => {
+  const scoped = sorted(new Set(Object.keys(allPolicies()).filter((t) => workerScopeField(t))));
+  assert.deepEqual(scoped, sorted(new Set([
+    "write", "edit", "multiedit", "mkdir", "copy", "format",
+  ])));
+  // delete/move are refused for workers outright rather than scope-checked.
+  assert.equal(workerScopeField("delete"), "");
+  assert.equal(workerScopeField("move"), "");
+  // The helper returns the concrete path, so the executor never re-derives "which field".
+  assert.equal(workerScopeTarget({ type: "write", path: "src/a.ts" }), "src/a.ts");
+  assert.equal(workerScopeTarget({ type: "copy", path: "", to: "src/b.ts" }), "src/b.ts");
+  assert.equal(workerScopeTarget({ type: "read", path: "src/a.ts" }), "", "reads are unscoped");
+  assert.equal(workerScopeTarget(null), "");
+});
+
+// ── Behaviour of the registry itself ────────────────────────────────────────
+
+test("an unregistered tool gets the safe default, so read-only tools need no declaration", () => {
+  // The large majority of the 126 call types are read-only lookups. Requiring a declaration
+  // for each would be a list that rots; the default IS their policy.
+  for (const t of ["npm_search", "arxiv_search", "read", "list", "current_time", "think", ""]) {
+    assert.deepEqual(toolPolicy(t), DEFAULT_POLICY, `${t || "(empty)"} should default`);
+  }
+  assert.equal(needsApproval("some_tool_invented_tomorrow"), false);
+  assert.equal(blockedInReadOnlyMode("some_tool_invented_tomorrow"), false);
+});
+
+test("adding a tool is one call, and it is reflected in every derived set at once", () => {
+  // This is the property the whole module exists for: one declaration, not eleven edits.
+  defineTool("__test_tool__", { mutatesWorkspace: true, needsApproval: true, readOnlyModeBlocked: true });
+  assert.ok(workspaceMutatingTypes().has("__test_tool__"));
+  assert.ok(approvalTypes().has("__test_tool__"));
+  assert.ok(readOnlyBlockedTypes().has("__test_tool__"));
+  assert.equal(hookedTypes().has("__test_tool__"), false, "unspecified flags stay at the default");
+  // Re-declaring replaces cleanly, so a plugin can override a built-in.
+  defineTool("__test_tool__", { needsApproval: true });
+  assert.equal(mutatesWorkspace("__test_tool__"), false);
+});
+
+test("a typo'd policy field is rejected at declaration instead of silently doing nothing", () => {
+  // A misspelled flag would be the exact bug class this module removes — a policy that looks
+  // set and isn't. Fail loudly, at startup, where it is cheap to notice.
+  assert.throws(() => defineTool("__bad__", { mutatesWorkspce: true }), /unknown tool policy field/);
+  assert.throws(() => defineTool("", {}), /requires a tool type/);
+});
+
+test("policies are frozen so a call site cannot mutate shared policy by accident", () => {
+  const p = toolPolicy("write");
+  assert.throws(() => { "use strict"; p.needsApproval = false; }, TypeError);
+  // allPolicies hands out copies, so diagnostics can't corrupt the registry either.
+  const snapshot = allPolicies();
+  snapshot.write.needsApproval = false;
+  assert.equal(needsApproval("write"), true);
+});
+
+// ── The anti-drift test ─────────────────────────────────────────────────────
+
+test("main.js no longer hand-maintains the tool family lists", () => {
+  // The literal that appeared ELEVEN times. Once the call sites are derived, a new copy
+  // appearing is a regression toward the thing this module replaced — so fail on it.
+  const literalCopies = (MAIN.match(/"write",\s*"edit",\s*"multiedit",\s*"delete",\s*"move",\s*"mkdir",\s*"copy",\s*"format"/g) || []).length;
+  assert.equal(literalCopies, 0,
+    "the mutation-family list must come from tool-policy.js, not be re-typed at the call site");
+  // The eleven-term read-only chain likewise.
+  assert.doesNotMatch(MAIN, /readOnlyMode && \(call\.type === "write" \|\| call\.type === "edit"/,
+    "the read-only-mode rule must come from blockedInReadOnlyMode()");
+  // And main.js must actually be importing the module rather than keeping a parallel copy.
+  assert.match(MAIN, /import \{[^}]*\} from "\.\/agent\/tool-policy\.js"/,
+    "main.js must consume the registry");
+});
