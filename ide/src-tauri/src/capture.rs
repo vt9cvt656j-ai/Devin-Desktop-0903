@@ -304,8 +304,18 @@ pub async fn capture_url_frames(
     let browser = find_headless_browser().ok_or_else(|| {
         "未找到无头浏览器。装上 Google Chrome / Chromium / Edge 后才能截图。".to_string()
     })?;
-    let w = width.unwrap_or(1280).clamp(320, 3840);
-    let h = height.unwrap_or(800).clamp(240, 4000);
+    let mut w = width.unwrap_or(1280).clamp(320, 3840);
+    let mut h = height.unwrap_or(800).clamp(240, 4000);
+    // The filmstrip retains every decoded frame before composing it. Keep each
+    // frame to a bounded pixel budget so a max-size five-frame request cannot
+    // turn into several hundred megabytes of live image buffers.
+    const MAX_FRAME_PIXELS: u64 = 4_000_000;
+    let pixels = u64::from(w) * u64::from(h);
+    if pixels > MAX_FRAME_PIXELS {
+        let ratio = (MAX_FRAME_PIXELS as f64 / pixels as f64).sqrt();
+        w = ((w as f64 * ratio).floor() as u32).max(1);
+        h = ((h as f64 * ratio).floor() as u32).max(1);
+    }
     let n = frames.unwrap_or(4).clamp(2, 5);
     let total = duration_ms.unwrap_or(2400).clamp(400, 8000);
 

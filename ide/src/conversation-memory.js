@@ -219,6 +219,9 @@ function serializeMessageText(message, textBudget) {
     }
     message.content = content;
   }
+  if (typeof message.reasoning === 'string') {
+    message.reasoning = serializeTextWithBudget(message.reasoning, textBudget);
+  }
   if (Array.isArray(message.tool_calls)) {
     const calls = new Array(message.tool_calls.length);
     for (let index = message.tool_calls.length - 1; index >= 0; index--) {

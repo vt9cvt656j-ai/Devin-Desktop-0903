@@ -15,8 +15,37 @@ use std::str::FromStr;
 use std::time::Duration;
 
 const MAX_ROWS: usize = 500;
+const MAX_DB_HTTP_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const QUERY_TIMEOUT: Duration = Duration::from_secs(20);
+
+async fn read_db_http_response(
+    mut response: reqwest::Response,
+    source: &str,
+) -> Result<Vec<u8>, String> {
+    if let Some(length) = response.content_length() {
+        if length > MAX_DB_HTTP_RESPONSE_BYTES as u64 {
+            return Err(format!(
+                "{source} 响应过大（{length} 字节，上限 {MAX_DB_HTTP_RESPONSE_BYTES} 字节），请缩小查询范围"
+            ));
+        }
+    }
+
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|e| format!("{source} 响应读取失败: {e}"))?
+    {
+        if bytes.len().saturating_add(chunk.len()) > MAX_DB_HTTP_RESPONSE_BYTES {
+            return Err(format!(
+                "{source} 响应超过 {MAX_DB_HTTP_RESPONSE_BYTES} 字节，请缩小查询范围"
+            ));
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(bytes)
+}
 
 /// Normalize driver names / wire-compatible aliases onto the concrete backends.
 fn normalize_driver(d: &str) -> String {
@@ -159,31 +188,41 @@ async fn mssql_query(url: &str, q: &str, cap: usize) -> Result<serde_json::Value
     let ms = started.elapsed().as_millis() as u64;
     let _ = ms;
     if is_read {
+        use futures_util::{StreamExt, TryStreamExt};
+
         let stream = tokio::time::timeout(QUERY_TIMEOUT, client.simple_query(q))
             .await
             .map_err(|_| "查询超时（20s）".to_string())?
             .map_err(|e| format!("查询出错: {e}"))?;
-        let results = tokio::time::timeout(QUERY_TIMEOUT, stream.into_results())
-            .await
-            .map_err(|_| "查询超时（20s）".to_string())?
-            .map_err(|e| format!("查询出错: {e}"))?;
-        let rows: Vec<tiberius::Row> = results.into_iter().flatten().collect();
+        // Stop polling the wire as soon as one row beyond the display cap arrives. The
+        // extra row only proves that more data exists; it is never retained or rendered.
+        let rows: Vec<tiberius::Row> = tokio::time::timeout(
+            QUERY_TIMEOUT,
+            stream
+                .into_row_stream()
+                .take(cap.saturating_add(1))
+                .try_collect(),
+        )
+        .await
+        .map_err(|_| "查询超时（20s）".to_string())?
+        .map_err(|e| format!("查询出错: {e}"))?;
         let mut columns: Vec<String> = Vec::new();
         if let Some(r0) = rows.first() {
             columns = r0.columns().iter().map(|c| c.name().to_string()).collect();
         }
-        let total = rows.len();
+        let truncated = rows.len() > cap;
         let out_rows: Vec<Vec<serde_json::Value>> = rows
             .iter()
             .take(cap)
             .map(|row| row.cells().map(|(_, d)| mssql_cell_json(d)).collect())
             .collect();
+        let row_count = out_rows.len();
         Ok(json!({
             "driver": "mssql",
             "columns": columns,
             "rows": out_rows,
-            "row_count": total,
-            "truncated": total > cap,
+            "row_count": row_count,
+            "truncated": truncated,
             "elapsed_ms": started.elapsed().as_millis() as u64,
         }))
     } else {
@@ -272,7 +311,8 @@ async fn clickhouse_query(url: &str, q: &str, cap: usize) -> Result<serde_json::
         || head.starts_with("desc ")
         || head.starts_with("exists")
         || head.starts_with("explain");
-    let body = if is_read && !head.contains(" format ") {
+    let structured_read = is_read && !head.contains(" format ");
+    let body = if structured_read {
         format!("{} FORMAT JSON", q.trim_end_matches(';').trim_end())
     } else {
         q.to_string()
@@ -282,6 +322,13 @@ async fn clickhouse_query(url: &str, q: &str, cap: usize) -> Result<serde_json::
         .timeout(QUERY_TIMEOUT)
         .build()
         .map_err(|e| format!("HTTP 客户端初始化失败: {e}"))?;
+    if is_read {
+        // Ask ClickHouse to stop producing rows as soon as the sentinel row arrives.
+        // Client-side truncation alone still lets the server build and transmit the full result.
+        u.query_pairs_mut()
+            .append_pair("max_result_rows", &cap.saturating_add(1).to_string())
+            .append_pair("result_overflow_mode", "break");
+    }
     let mut req = client.post(u.clone()).body(body);
     if !user.is_empty() {
         req = req.basic_auth(&user, pass.as_deref());
@@ -291,10 +338,8 @@ async fn clickhouse_query(url: &str, q: &str, cap: usize) -> Result<serde_json::
         .await
         .map_err(|e| format!("clickhouse 请求失败: {e}"))?;
     let status = resp.status();
-    let text = resp
-        .text()
-        .await
-        .map_err(|e| format!("clickhouse 响应读取失败: {e}"))?;
+    let bytes = read_db_http_response(resp, "clickhouse").await?;
+    let text = String::from_utf8_lossy(&bytes);
     if !status.is_success() {
         return Err(format!(
             "clickhouse 出错（HTTP {}）: {}",
@@ -302,9 +347,9 @@ async fn clickhouse_query(url: &str, q: &str, cap: usize) -> Result<serde_json::
             text.chars().take(500).collect::<String>()
         ));
     }
-    if is_read {
+    if structured_read {
         let parsed: serde_json::Value =
-            serde_json::from_str(&text).map_err(|e| format!("clickhouse JSON 解析失败: {e}"))?;
+            serde_json::from_slice(&bytes).map_err(|e| format!("clickhouse JSON 解析失败: {e}"))?;
         let columns: Vec<String> = parsed["meta"]
             .as_array()
             .map(|a| {
@@ -314,18 +359,19 @@ async fn clickhouse_query(url: &str, q: &str, cap: usize) -> Result<serde_json::
             })
             .unwrap_or_default();
         let data = parsed["data"].as_array().cloned().unwrap_or_default();
-        let total = data.len();
+        let truncated = data.len() > cap;
         let rows: Vec<Vec<serde_json::Value>> = data
             .iter()
             .take(cap)
             .map(|row| columns.iter().map(|c| row[c].clone()).collect())
             .collect();
+        let row_count = rows.len();
         Ok(json!({
             "driver": "clickhouse",
             "columns": columns,
             "rows": rows,
-            "row_count": total,
-            "truncated": total > cap,
+            "row_count": row_count,
+            "truncated": truncated,
             "elapsed_ms": started.elapsed().as_millis() as u64,
         }))
     } else {
@@ -400,10 +446,8 @@ async fn elastic_query(url: &str, q: &str) -> Result<serde_json::Value, String> 
         .await
         .map_err(|e| format!("elasticsearch 请求失败: {e}"))?;
     let status = resp.status();
-    let text = resp
-        .text()
-        .await
-        .map_err(|e| format!("elasticsearch 响应读取失败: {e}"))?;
+    let bytes = read_db_http_response(resp, "elasticsearch").await?;
+    let text = String::from_utf8_lossy(&bytes);
     let result: serde_json::Value = serde_json::from_str(&text).unwrap_or(json!(text.trim()));
     if !status.is_success() {
         return Err(format!(
@@ -472,11 +516,17 @@ async fn sql_query(
             .map_err(ct)?
             .map_err(|e| format!("连接失败: {e}"))?;
             let out = if is_read {
-                let rows =
-                    tokio::time::timeout(QUERY_TIMEOUT, sqlx::query(sql()).fetch_all(&mut c))
+                use futures_util::{StreamExt, TryStreamExt};
+                let rows = tokio::time::timeout(QUERY_TIMEOUT, async {
+                    sqlx::query(sql())
+                        .fetch(&mut c)
+                        .take(cap.saturating_add(1))
+                        .try_collect::<Vec<_>>()
                         .await
-                        .map_err(qt)?
-                        .map_err(|e| format!("查询出错: {e}"))?;
+                })
+                .await
+                .map_err(qt)?
+                .map_err(|e| format!("查询出错: {e}"))?;
                 Ok(rows_to_json(&rows, "sqlite", cap, ms(started)))
             } else {
                 let res = tokio::time::timeout(QUERY_TIMEOUT, sqlx::query(sql()).execute(&mut c))
@@ -494,11 +544,17 @@ async fn sql_query(
                 .map_err(ct)?
                 .map_err(|e| format!("连接失败: {e}"))?;
             let out = if is_read {
-                let rows =
-                    tokio::time::timeout(QUERY_TIMEOUT, sqlx::query(sql()).fetch_all(&mut c))
+                use futures_util::{StreamExt, TryStreamExt};
+                let rows = tokio::time::timeout(QUERY_TIMEOUT, async {
+                    sqlx::query(sql())
+                        .fetch(&mut c)
+                        .take(cap.saturating_add(1))
+                        .try_collect::<Vec<_>>()
                         .await
-                        .map_err(qt)?
-                        .map_err(|e| format!("查询出错: {e}"))?;
+                })
+                .await
+                .map_err(qt)?
+                .map_err(|e| format!("查询出错: {e}"))?;
                 Ok(rows_to_json(&rows, "mysql", cap, ms(started)))
             } else {
                 let res = tokio::time::timeout(QUERY_TIMEOUT, sqlx::query(sql()).execute(&mut c))
@@ -516,11 +572,17 @@ async fn sql_query(
                 .map_err(ct)?
                 .map_err(|e| format!("连接失败: {e}"))?;
             let out = if is_read {
-                let rows =
-                    tokio::time::timeout(QUERY_TIMEOUT, sqlx::query(sql()).fetch_all(&mut c))
+                use futures_util::{StreamExt, TryStreamExt};
+                let rows = tokio::time::timeout(QUERY_TIMEOUT, async {
+                    sqlx::query(sql())
+                        .fetch(&mut c)
+                        .take(cap.saturating_add(1))
+                        .try_collect::<Vec<_>>()
                         .await
-                        .map_err(qt)?
-                        .map_err(|e| format!("查询出错: {e}"))?;
+                })
+                .await
+                .map_err(qt)?
+                .map_err(|e| format!("查询出错: {e}"))?;
                 Ok(rows_to_json(&rows, "postgres", cap, ms(started)))
             } else {
                 let res = tokio::time::timeout(QUERY_TIMEOUT, sqlx::query(sql()).execute(&mut c))
@@ -547,7 +609,10 @@ fn rows_to_json<R>(rows: &[R], driver: &str, cap: usize, elapsed_ms: u64) -> ser
 where
     R: sqlx::Row,
     usize: sqlx::ColumnIndex<R>,
+    for<'r> i16: sqlx::Decode<'r, R::Database> + sqlx::Type<R::Database>,
+    for<'r> i32: sqlx::Decode<'r, R::Database> + sqlx::Type<R::Database>,
     for<'r> i64: sqlx::Decode<'r, R::Database> + sqlx::Type<R::Database>,
+    for<'r> f32: sqlx::Decode<'r, R::Database> + sqlx::Type<R::Database>,
     for<'r> f64: sqlx::Decode<'r, R::Database> + sqlx::Type<R::Database>,
     for<'r> bool: sqlx::Decode<'r, R::Database> + sqlx::Type<R::Database>,
     for<'r> String: sqlx::Decode<'r, R::Database> + sqlx::Type<R::Database>,
@@ -563,7 +628,7 @@ where
             columns.push(c.name().to_string());
         }
     }
-    let total = rows.len();
+    let truncated = rows.len() > cap;
     let mut out_rows: Vec<Vec<serde_json::Value>> = Vec::with_capacity(rows.len().min(cap));
     for row in rows.iter().take(cap) {
         let mut cells: Vec<serde_json::Value> = Vec::with_capacity(columns.len());
@@ -573,7 +638,13 @@ where
                 serde_json::Value::Null
             } else if let Ok(v) = row.try_get::<i64, _>(i) {
                 json!(v)
+            } else if let Ok(v) = row.try_get::<i32, _>(i) {
+                json!(v)
+            } else if let Ok(v) = row.try_get::<i16, _>(i) {
+                json!(v)
             } else if let Ok(v) = row.try_get::<f64, _>(i) {
+                json!(v)
+            } else if let Ok(v) = row.try_get::<f32, _>(i) {
                 json!(v)
             } else if let Ok(v) = row.try_get::<bool, _>(i) {
                 json!(v)
@@ -603,12 +674,13 @@ where
         }
         out_rows.push(cells);
     }
+    let row_count = out_rows.len();
     json!({
         "driver": driver,
         "columns": columns,
         "rows": out_rows,
-        "row_count": total,
-        "truncated": total > cap,
+        "row_count": row_count,
+        "truncated": truncated,
         "elapsed_ms": elapsed_ms,
     })
 }
@@ -755,6 +827,18 @@ mod tests {
         // row 1: NULL score must decode to json null
         assert_eq!(rows[1][1], json!("bob"));
         assert_eq!(rows[1][2], serde_json::Value::Null, "NULL → json null");
+
+        let capped = db_query(
+            "sqlite".into(),
+            url.clone(),
+            "SELECT id,name FROM t ORDER BY id".into(),
+            Some(1),
+        )
+        .await
+        .expect("capped select");
+        assert_eq!(capped["rows"].as_array().unwrap().len(), 1);
+        assert_eq!(capped["row_count"].as_u64(), Some(1));
+        assert_eq!(capped["truncated"].as_bool(), Some(true));
 
         let _ = std::fs::remove_file(&path);
     }

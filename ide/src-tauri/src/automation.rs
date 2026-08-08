@@ -10,6 +10,7 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 const PORT: u16 = 3037;
+const MAX_RPC_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 
 /// spawn 出来的服务进程句柄，进程内唯一。
 static CHILD: Mutex<Option<Child>> = Mutex::new(None);
@@ -103,12 +104,19 @@ async fn ensure_server() -> Result<(), String> {
                  或用环境变量 MICHAEL_AUTOMATION_BIN 指定其路径。"
                     .to_string()
             })?;
-            let child = crate::process_util::command(bin.to_string_lossy().as_ref())
+            let mut command = crate::process_util::command(bin.to_string_lossy().as_ref());
+            command
                 .arg(PORT.to_string())
                 .env("MICHAEL_AUTOMATION_TOKEN", AUTOMATION_TOKEN.as_str())
                 .env("PATH", crate::process_util::augmented_path(None))
                 .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null());
+            #[cfg(unix)]
+            {
+                use std::os::unix::process::CommandExt;
+                command.process_group(0);
+            }
+            let child = command
                 .spawn()
                 .map_err(|e| format!("启动 automation-server 失败: {e}"))?;
             *guard = Some(child);
@@ -120,7 +128,82 @@ async fn ensure_server() -> Result<(), String> {
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
+    // A process that never becomes healthy must not stay cached forever. Without
+    // this cleanup every later call waits another four seconds on the same wedged
+    // child, and the IDE also leaves that process behind on exit.
+    if let Some(mut child) = take_child() {
+        terminate_child(&mut child);
+    }
     Err("automation-server 启动后未就绪（健康检查超时）".into())
+}
+
+fn take_child() -> Option<Child> {
+    CHILD.lock().ok()?.take()
+}
+
+fn terminate_child(child: &mut Child) {
+    #[cfg(unix)]
+    unsafe {
+        // The sidecar is a process-group leader, so this also stops browser and
+        // recorder children it created instead of orphaning them on IDE exit.
+        let _ = libc::kill(-(child.id() as i32), libc::SIGKILL);
+    }
+    #[cfg(windows)]
+    {
+        let _ = crate::process_util::command("taskkill")
+            .args(["/PID", &child.id().to_string(), "/T", "/F"])
+            .status();
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+fn parse_rpc_response(
+    status: reqwest::StatusCode,
+    value: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    if let Some(error) = value.get("error") {
+        return Err(error
+            .get("message")
+            .and_then(|message| message.as_str())
+            .unwrap_or("automation error")
+            .to_string());
+    }
+    if !status.is_success() {
+        return Err(format!("自动化服务返回 HTTP {}", status.as_u16()));
+    }
+    value
+        .get("result")
+        .cloned()
+        .ok_or_else(|| "自动化服务响应缺少 result/error".to_string())
+}
+
+async fn read_rpc_response(mut response: reqwest::Response) -> Result<serde_json::Value, String> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_RPC_RESPONSE_BYTES as u64)
+    {
+        return Err(format!(
+            "自动化服务响应超过 {} 字节上限",
+            MAX_RPC_RESPONSE_BYTES
+        ));
+    }
+
+    let mut body = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|error| format!("读取自动化服务响应失败: {error}"))?
+    {
+        if body.len().saturating_add(chunk.len()) > MAX_RPC_RESPONSE_BYTES {
+            return Err(format!(
+                "自动化服务响应超过 {} 字节上限",
+                MAX_RPC_RESPONSE_BYTES
+            ));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    serde_json::from_slice(&body).map_err(|error| format!("解析自动化服务响应失败: {error}"))
 }
 
 /// 智能体驱动桌面自动化框架的统一入口。method 例：
@@ -149,32 +232,21 @@ pub async fn automation_call(
         .send()
         .await
         .map_err(|e| format!("调用自动化服务失败: {e}"))?;
-    let v: serde_json::Value = resp
-        .json()
-        .await
-        .map_err(|e| format!("解析自动化服务响应失败: {e}"))?;
-    if let Some(err) = v.get("error") {
-        return Err(err
-            .get("message")
-            .and_then(|m| m.as_str())
-            .unwrap_or("automation error")
-            .to_string());
-    }
-    Ok(v.get("result").cloned().unwrap_or(serde_json::Value::Null))
+    let status = resp.status();
+    let v = read_rpc_response(resp).await?;
+    parse_rpc_response(status, v)
 }
 
 /// 停掉服务（IDE 退出时调，别留孤儿进程）。
 pub fn stop() {
-    if let Ok(mut guard) = CHILD.lock() {
-        if let Some(mut ch) = guard.take() {
-            let _ = ch.kill();
-        }
+    if let Some(mut child) = take_child() {
+        terminate_child(&mut child);
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::packaged_server_filename;
+    use super::{packaged_server_filename, parse_rpc_response, terminate_child};
 
     #[test]
     fn packaged_server_filename_uses_unix_executable_name() {
@@ -184,5 +256,34 @@ mod tests {
     #[test]
     fn packaged_server_filename_uses_windows_executable_name() {
         assert_eq!(packaged_server_filename(".exe"), "automation-server.exe");
+    }
+
+    #[test]
+    fn malformed_rpc_response_is_not_reported_as_success() {
+        let error = parse_rpc_response(reqwest::StatusCode::OK, serde_json::json!({}))
+            .expect_err("missing result/error must fail");
+        assert!(error.contains("缺少 result/error"));
+    }
+
+    #[test]
+    fn rpc_error_message_is_preserved() {
+        let error = parse_rpc_response(
+            reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+            serde_json::json!({"error": {"message": "sidecar failed"}}),
+        )
+        .expect_err("RPC error must fail");
+        assert_eq!(error, "sidecar failed");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn terminate_child_reaps_process() {
+        use std::os::unix::process::CommandExt;
+
+        let mut command = std::process::Command::new("/bin/sh");
+        command.args(["-c", "sleep 30 & wait"]).process_group(0);
+        let mut child = command.spawn().expect("test child should start");
+        terminate_child(&mut child);
+        assert!(child.try_wait().unwrap().is_some());
     }
 }

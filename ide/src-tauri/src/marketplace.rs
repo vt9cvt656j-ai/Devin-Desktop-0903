@@ -11,6 +11,7 @@ use tauri::{AppHandle, Manager};
 const REGISTRY_URL: &str =
     "https://raw.githubusercontent.com/fendoushaonian/Devin-Desktop/main/marketplace/registry.json";
 const MAX_MARKETPLACE_ARCHIVE: usize = 64 * 1024 * 1024;
+const MAX_REGISTRY_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
 const REGISTRY_CACHE_TTL: Duration = Duration::from_secs(300);
 
 type RegistryCache = Option<(Instant, Vec<MarketplaceEntry>)>;
@@ -99,23 +100,31 @@ fn validate_download_url(url: &str) -> Result<reqwest::Url, String> {
     Ok(parsed)
 }
 
-async fn download_archive_with_limit(resp: reqwest::Response) -> Result<Vec<u8>, String> {
+async fn response_bytes_with_limit(
+    resp: reqwest::Response,
+    limit: usize,
+    label: &str,
+) -> Result<Vec<u8>, String> {
     if let Some(len) = resp.content_length() {
-        if len > MAX_MARKETPLACE_ARCHIVE as u64 {
-            return Err("download is too large".into());
+        if len > limit as u64 {
+            return Err(format!("{label} is too large"));
         }
     }
 
     let mut bytes = Vec::new();
     let mut stream = resp.bytes_stream();
     while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|e| format!("failed to read download: {e}"))?;
-        if bytes.len().saturating_add(chunk.len()) > MAX_MARKETPLACE_ARCHIVE {
-            return Err("download is too large".into());
+        let chunk = chunk.map_err(|e| format!("failed to read {label}: {e}"))?;
+        if bytes.len().saturating_add(chunk.len()) > limit {
+            return Err(format!("{label} is too large"));
         }
         bytes.extend_from_slice(&chunk);
     }
     Ok(bytes)
+}
+
+async fn download_archive_with_limit(resp: reqwest::Response) -> Result<Vec<u8>, String> {
+    response_bytes_with_limit(resp, MAX_MARKETPLACE_ARCHIVE, "download").await
 }
 
 #[tauri::command]
@@ -144,10 +153,9 @@ pub async fn marketplace_list() -> Result<Vec<MarketplaceEntry>, String> {
         return Err(format!("registry returned status {}", resp.status()));
     }
 
-    let registry: RegistryResponse = resp
-        .json()
-        .await
-        .map_err(|e| format!("invalid registry format: {e}"))?;
+    let bytes = response_bytes_with_limit(resp, MAX_REGISTRY_RESPONSE_BYTES, "registry").await?;
+    let registry: RegistryResponse =
+        serde_json::from_slice(&bytes).map_err(|e| format!("invalid registry format: {e}"))?;
 
     let entries = registry.extensions;
     if let Ok(mut cache) = REGISTRY_CACHE.lock() {
@@ -190,10 +198,12 @@ pub async fn marketplace_install(
 
     let dir = extensions_dir(&app)?;
     let archive_path = dir.join(format!("{}.zip", entry.id));
-    std::fs::write(&archive_path, &bytes).map_err(|e| e.to_string())?;
+    tokio::fs::write(&archive_path, &bytes)
+        .await
+        .map_err(|e| e.to_string())?;
 
     let archive_str = archive_path.to_string_lossy().to_string();
-    let result = crate::extensions::ext_install_from_path(app.clone(), archive_str)?;
+    let result = crate::extensions::ext_install_from_path(app.clone(), archive_str).await?;
     if result.manifest.id != entry.id {
         let _ = crate::extensions::ext_uninstall(app, result.manifest.id.clone());
         let _ = std::fs::remove_file(&archive_path);

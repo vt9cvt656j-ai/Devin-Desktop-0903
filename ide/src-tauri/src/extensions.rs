@@ -380,13 +380,13 @@ fn read_zip_manifest(
     serde_json::from_str(&s).map_err(|e| format!("invalid extension.json: {e}"))
 }
 
-/// Install an extension from a `.zip` archive chosen by the user.
-#[tauri::command]
-pub fn ext_install_from_path(
-    app: AppHandle,
+/// Perform the complete archive read, validation, replacement and extraction on
+/// a blocking thread. The caller supplies the already-resolved extensions root
+/// so this helper remains independently testable without a Tauri AppHandle.
+fn install_from_path_blocking(
+    dir: PathBuf,
     archive_path: String,
 ) -> Result<InstalledExtension, String> {
-    let dir = extensions_dir(&app)?;
     let file = fs::File::open(&archive_path).map_err(|e| e.to_string())?;
     let mut archive = zip::ZipArchive::new(file).map_err(|e| format!("not a valid .zip: {e}"))?;
 
@@ -471,4 +471,105 @@ pub fn ext_install_from_path(
         manifest,
         enabled: true,
     })
+}
+
+/// Install an extension from a `.zip` archive chosen by the user.
+///
+/// ZIP enumeration, filesystem replacement and decompression can all block on
+/// large archives or slow storage. Keep that work off Tauri's event thread so
+/// the rest of the IDE remains responsive while an extension installs.
+#[tauri::command]
+pub async fn ext_install_from_path(
+    app: AppHandle,
+    archive_path: String,
+) -> Result<InstalledExtension, String> {
+    let dir = extensions_dir(&app)?;
+    tauri::async_runtime::spawn_blocking(move || install_from_path_blocking(dir, archive_path))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+    use std::time::{SystemTime, UNIX_EPOCH};
+    use zip::write::SimpleFileOptions;
+    use zip::ZipWriter;
+
+    struct TempExtensionRoot(PathBuf);
+
+    impl TempExtensionRoot {
+        fn new() -> Self {
+            let suffix = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let path = std::env::temp_dir().join(format!(
+                "michael-ide-extension-install-{}-{suffix}",
+                std::process::id()
+            ));
+            fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+    }
+
+    impl Drop for TempExtensionRoot {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn write_archive(path: &Path, entries: &[(&str, &str)]) {
+        let file = fs::File::create(path).unwrap();
+        let mut zip = ZipWriter::new(file);
+        for (name, contents) in entries {
+            zip.start_file(name, SimpleFileOptions::default()).unwrap();
+            zip.write_all(contents.as_bytes()).unwrap();
+        }
+        zip.finish().unwrap();
+    }
+
+    #[test]
+    fn zip_install_extracts_nested_files_and_replaces_the_previous_install() {
+        let temp = TempExtensionRoot::new();
+        let archive = temp.0.join("nested-extension.zip");
+        write_archive(
+            &archive,
+            &[
+                (
+                    "bundle/extension.json",
+                    r#"{"id":"nested.extension","name":"Nested","main":"assets/scripts/main.js"}"#,
+                ),
+                (
+                    "bundle/assets/scripts/main.js",
+                    "export const nested = true;\n",
+                ),
+                ("bundle/assets/styles/theme.css", ".root { color: red; }\n"),
+            ],
+        );
+
+        let old = temp.0.join("nested.extension");
+        fs::create_dir_all(old.join("obsolete")).unwrap();
+        fs::write(old.join("obsolete/stale.js"), "stale").unwrap();
+
+        let installed =
+            install_from_path_blocking(temp.0.clone(), archive.to_string_lossy().into_owned())
+                .unwrap();
+
+        assert_eq!(installed.manifest.id, "nested.extension");
+        assert_eq!(
+            fs::read_to_string(temp.0.join("nested.extension/assets/scripts/main.js")).unwrap(),
+            "export const nested = true;\n"
+        );
+        assert_eq!(
+            fs::read_to_string(temp.0.join("nested.extension/assets/styles/theme.css")).unwrap(),
+            ".root { color: red; }\n"
+        );
+        assert!(
+            !temp.0.join("nested.extension/obsolete/stale.js").exists(),
+            "reinstall must clear files absent from the new archive"
+        );
+        assert!(temp.0.join("state.json").is_file());
+    }
 }

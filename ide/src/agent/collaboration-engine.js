@@ -30,41 +30,41 @@ class CollaborationEngine {
     this.sessionUnsubscribers = new Map();
     this.tokenTracking = new Map();
     
-    console.log(`[CollaborationEngine] Initialized with mode: ${this.mode}`);
   }
   
   /**
    * 初始化协作会话
    */
   startSession(sessionId, jobIds, config = {}) {
+    const mode = config.mode || this.mode;
     const sessionConfig = {
-      mode: this.mode,
+      mode,
       createdAt: Date.now(),
       jobIds,
       status: 'active',
       tokensUsed: 0,
       contextData: {},
+      knowledge: {},
       ...config
     };
-    
+
     this.store.set(`collab_sessions.${sessionId}`, sessionConfig);
     this.activeCollaborations.set(sessionId, sessionConfig);
-    
-    // 根据模式设置对应的协作规则
-    switch (this.mode) {
+
+    switch (mode) {
       case 'shared_store':
         this.setupSharedStoreCollaboration(sessionId, jobIds);
         break;
-        
+
       case 'eventbus':
         this.setupEventBusCollaboration(sessionId, jobIds);
         break;
-        
+
       case 'lead_follower':
         this.setupLeadFollowerCollaboration(sessionId, jobIds, config);
         break;
     }
-    
+
     return sessionId;
   }
   
@@ -72,7 +72,6 @@ class CollaborationEngine {
    * ========== 模式 1: SharedStore (数据共享) ==========
    */
   setupSharedStoreCollaboration(sessionId, jobIds) {
-    console.log(`[SharedStore] Setting up collaboration for ${jobIds.length} jobs`);
     const seenCounts = new Map(jobIds.map((jobId) => [
       jobId,
       Array.isArray(this.store.get(`jobs.${jobId}`)?.findings)
@@ -125,7 +124,6 @@ class CollaborationEngine {
    * ========== 模式 2: EventBus (事件驱动) ==========
    */
   setupEventBusCollaboration(sessionId, jobIds) {
-    console.log(`[EventBus] Setting up collaboration for ${jobIds.length} jobs`);
 
     // Publish directly to every peer inbox. The old implementation only put
     // callbacks in a Map and never subscribed them to SharedStore, so no event
@@ -154,22 +152,20 @@ class CollaborationEngine {
     const leadJobId = config.leadJobId;
     const followerJobIds = jobIds.filter(id => id !== leadJobId);
     
-    console.log(`[Lead-Follower] Lead: ${leadJobId}, Followers: ${followerJobIds.length}`);
     
-    // 监听 lead job 的决策和状态变化
-    const unsubscribe = this.store.on(`jobs.${leadJobId}.status`, (status) => {
-      // 当 lead job 完成某个关键阶段时，通知 followers
+    const unsubscribe = this.store.on(`jobs.${leadJobId}`, (jobData) => {
+      const status = jobData?.status;
       if (status === 'phase_complete' || status === 'completed') {
-        const decision = this.store.get(`jobs.${leadJobId}.decision`);
+        const decision = this.store.get(`jobs.${leadJobId}`)?.decision || this.store.get(`jobs.${leadJobId}.decision`);
         
         if (decision) {
           followerJobIds.forEach(followerId => {
             // 继承 lead 的决策
-            this.store.updateJobContext(followerId, {
-              parentDecision: decision,
-              inheritFrom: leadJobId,
-              updatedAt: Date.now()
-            });
+            const followerJob = this.store.get(`jobs.${followerId}`) || {};
+            followerJob.parentDecision = decision;
+            followerJob.inheritFrom = leadJobId;
+            followerJob.updatedAt = Date.now();
+            this.store.set(`jobs.${followerId}`, followerJob);
             
             // 发送通知
             this.store.appendFinding(followerId, {
@@ -400,7 +396,7 @@ class CollaborationEngine {
     const percentage = (usage.used / limit * 100).toFixed(1);
     let status = 'normal';
     
-    if (percentage >= 90) status = 'critical';
+    if (percentage >= (this.config.criticalThreshold || 90)) status = 'critical';
     else if (percentage >= this.config.warningThreshold) status = 'warning';
     
     return {
@@ -420,7 +416,6 @@ class CollaborationEngine {
     
     if (stats.status === 'normal') return;
     
-    console.log(`[TokenOptimization] Session ${sessionId} at ${stats.percentage}, mode: ${aggressive ? 'aggressive' : 'conservative'}`);
     
     // 采取行动减少后续 token 消耗
     const optimizations = [
@@ -434,7 +429,6 @@ class CollaborationEngine {
     );
     
     applicableOptimizations.forEach(opt => {
-      console.log(`[TokenOptimization] Applying: ${opt.action}`);
       this.applyOptimization(sessionId, opt.action, opt.aggressive);
     });
   }

@@ -2368,17 +2368,28 @@ const I18N_MARKER_SELECTOR =
 /// Apply the explicit `data-i18n*` markers on one element.
 function applyI18nMarkers(el) {
   const key = el.getAttribute("data-i18n");
-  if (key) el.textContent = t(key);
+  if (key) {
+    const text = t(key);
+    if (el.textContent !== text) el.textContent = text;
+  }
   const phKey = el.getAttribute("data-i18n-placeholder");
   if (phKey) {
     const text = t(phKey);
-    el.placeholder = text;
-    if (el.hasAttribute("data-placeholder")) el.setAttribute("data-placeholder", text);
+    if (el.placeholder !== text) el.placeholder = text;
+    if (el.hasAttribute("data-placeholder") && el.getAttribute("data-placeholder") !== text) {
+      el.setAttribute("data-placeholder", text);
+    }
   }
   const titleKey = el.getAttribute("data-i18n-title");
-  if (titleKey) el.title = t(titleKey);
+  if (titleKey) {
+    const text = t(titleKey);
+    if (el.title !== text) el.title = text;
+  }
   const ariaKey = el.getAttribute("data-i18n-aria-label");
-  if (ariaKey) el.setAttribute("aria-label", t(ariaKey));
+  if (ariaKey) {
+    const text = t(ariaKey);
+    if (el.getAttribute("aria-label") !== text) el.setAttribute("aria-label", text);
+  }
 }
 
 export function applyToDOM(root) {

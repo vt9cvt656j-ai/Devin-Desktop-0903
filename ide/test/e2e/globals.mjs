@@ -1,8 +1,39 @@
 import { readFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { makeDom, Ev, Element_ } from "./dom.mjs";
 
-const IDE = "/Users/michael/Desktop/Michael-IDE/Devin-Desktop/ide";
-const doc = makeDom(readFileSync(IDE + "/index.html", "utf8"));
+const IDE = join(dirname(fileURLToPath(import.meta.url)), "..", "..");
+const doc = makeDom(readFileSync(join(IDE, "index.html"), "utf8"));
+
+// The production shell is React now, so index.html intentionally contains only
+// #root. main.js still queries its controls synchronously at module load. This
+// harness exercises the executor, not React rendering, therefore provide the
+// shell's declared ID contract before importing main.js. Keeping this derived
+// from Shell.jsx prevents the fixture from drifting whenever a control moves.
+const shellSource = readFileSync(join(IDE, "src", "app", "Shell.jsx"), "utf8");
+for (const match of shellSource.matchAll(/\bid="([^"]+)"/g)) {
+  const id = match[1];
+  if (doc.getElementById(id)) continue;
+  const element = doc.createElement("div");
+  element.id = id;
+  doc.body.appendChild(element);
+}
+
+// `main.js` synchronously reads the model glyph through
+// `modelPickerBtn.querySelector("use")`.  The generic ID loop above only
+// creates an empty host, while Shell.jsx declares an SVG/use pair inside this
+// button. Keep the fixture to that observable shell contract rather than
+// duplicating the full composer tree.
+const modelPickerBtn = doc.getElementById("modelPickerBtn");
+if (modelPickerBtn && !modelPickerBtn.querySelector("use")) {
+  const icon = doc.createElement("svg");
+  icon.className = "ic";
+  const use = doc.createElement("use");
+  use.setAttribute("href", "#i-cpu");
+  icon.appendChild(use);
+  modelPickerBtn.appendChild(icon);
+}
 
 class Store { constructor(){ this.m=new Map(); }
   getItem(k){ return this.m.has(String(k)) ? this.m.get(String(k)) : null; }

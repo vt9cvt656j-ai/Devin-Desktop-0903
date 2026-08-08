@@ -260,7 +260,7 @@ const TOOL_METADATA = Object.freeze({
     category: 'game_asset_generation',
     use_cases: ['为 3D 模型添加骨骼', '角色绑定', '模型动画准备'],
     triggers: ['需要给模型加骨骼', '角色绑定', '准备动画'],
-    example_call: "auto_rig(model_path='assets/character.glb', name='hero-rig')",
+    example_call: "auto_rig(task_id='generate_3d returned task_id', name='hero-rig')",
     priority: 'low',
     usage_note: '【何时用】已有 3D 模型需要添加骨骼绑定时。【vs 替代】不需要骨骼就用 generate_3d。【何时不用】模型不需要动画时。需要外部服务支持。'
   },
@@ -268,7 +268,7 @@ const TOOL_METADATA = Object.freeze({
     category: 'game_asset_generation',
     use_cases: ['生成动画/动作', '角色动作', '运动循环'],
     triggers: ['需要动画', '角色动作', '运动效果'],
-    example_call: "generate_motion(prompt='Natural walk cycle', name='walk')",
+    example_call: "generate_motion(prompt='Natural walk cycle', task_id='auto_rig returned task_id', name='walk')",
     priority: 'medium',
     usage_note: '【何时用】需要为已绑定骨骼的角色生成动画时。【vs 替代】没有骨骼先 auto_rig；静态模型用 generate_3d。【何时不用】不需要动画时。需要外部服务支持。'
   },
@@ -512,8 +512,8 @@ const TOOL_EXAMPLES = Object.freeze({
   generate_sound: { prompt: "Short metallic UI confirmation", name: "confirm" },
   generate_music: { prompt: "Looping calm strategy-game theme", name: "strategy-loop" },
   generate_voice: { text: "Mission complete.", name: "mission-complete" },
-  auto_rig: { model_path: "assets/character.glb", name: "hero-rig" },
-  generate_motion: { prompt: "Natural walk cycle", name: "walk" },
+  auto_rig: { task_id: "tripo-model-task-id", name: "hero-rig" },
+  generate_motion: { prompt: "Natural walk cycle", task_id: "tripo-rig-task-id", name: "walk" },
   generate_texture: { prompt: "Seamless worn steel", name: "worn-steel" },
   search_game_assets: { query: "CC0 low-poly spaceship" },
   download_asset: { url: "https://example.com/asset.glb", name: "spaceship.glb" },

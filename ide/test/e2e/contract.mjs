@@ -1,5 +1,10 @@
 import { readFileSync } from "node:fs";
-import * as acorn from "/Users/michael/Desktop/Michael-IDE/Devin-Desktop/ide/node_modules/acorn/dist/acorn.mjs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+import * as acorn from "../../node_modules/acorn/dist/acorn.mjs";
+
+const __HERE = dirname(fileURLToPath(import.meta.url));
+const __IDE = join(__HERE, "..", "..");
 const src = readFileSync(join(__IDE, "src", "main.js"),"utf8");
 const ast = acorn.parse(src, { ecmaVersion:"latest", sourceType:"module", locations:true, allowAwaitOutsideFunction:true });
 let fn=null;

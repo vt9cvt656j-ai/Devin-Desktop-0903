@@ -15,6 +15,7 @@ static DRAW_MARKS: AtomicBool = AtomicBool::new(true);
 use headless_chrome::protocol::cdp::{
     Emulation::SetDeviceMetricsOverride,
     Page::{AddScriptToEvaluateOnNewDocument, CaptureScreenshotFormatOption},
+    Performance::{Enable as EnablePerformanceMetrics, GetMetrics},
 };
 use headless_chrome::{Browser, LaunchOptionsBuilder, Tab};
 use serde::{Deserialize, Serialize};
@@ -24,9 +25,33 @@ struct Session {
     tab: Arc<Tab>,
 }
 
-// One shared browser session for the agent. A Mutex is fine — the agent drives it
-// one action at a time.
-static BROWSER: LazyLock<Mutex<Option<Session>>> = LazyLock::new(|| Mutex::new(None));
+/// The state lock protects only which browser session is current. It must never
+/// cover CDP calls, screenshots, or process teardown: all of those can block for
+/// seconds. `generation` prevents a launch that began before a concurrent close
+/// from installing a session after that close has already completed.
+#[derive(Default)]
+struct BrowserStore {
+    session: Option<Session>,
+    generation: u64,
+}
+
+impl BrowserStore {
+    fn invalidate(&mut self) -> Option<Session> {
+        self.generation = self.generation.wrapping_add(1);
+        self.session.take()
+    }
+
+    fn launch_is_current(&self, generation: u64) -> bool {
+        self.generation == generation
+    }
+}
+
+static BROWSER: LazyLock<Mutex<BrowserStore>> =
+    LazyLock::new(|| Mutex::new(BrowserStore::default()));
+
+// CDP actions mutate one persistent tab and therefore need serialization, but
+// this separate mutex lets close/reload take the browser state immediately.
+static BROWSER_OPERATION: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
 // Installed before any page script runs. The frontend's browser check reads these
 // two arrays, so recording at document creation time preserves boot-time failures
@@ -564,37 +589,94 @@ fn snapshot(tab: &Tab, result: Option<String>) -> Result<BrowserState, String> {
     })
 }
 
+fn current_or_launch_tab() -> Result<Arc<Tab>, String> {
+    let generation = {
+        let state = BROWSER.lock().map_err(|_| "browser state poisoned")?;
+        if let Some(session) = state.session.as_ref() {
+            return Ok(session.tab.clone());
+        }
+        state.generation
+    };
+
+    // Launching Chrome can be slow. Keep the state lock free so close/reload can
+    // invalidate this attempt while the browser process is coming up.
+    let launched = match try_connect_existing() {
+        Some(session) => session,
+        None => launch()?,
+    };
+    let mut launched = Some(launched);
+    let tab = {
+        let mut state = BROWSER.lock().map_err(|_| "browser state poisoned")?;
+        if !state.launch_is_current(generation) {
+            None
+        } else if let Some(session) = state.session.as_ref() {
+            Some(session.tab.clone())
+        } else {
+            state.session = launched.take();
+            state.session.as_ref().map(|session| session.tab.clone())
+        }
+    };
+
+    // A close won the race or another session was installed. The unused browser
+    // is intentionally dropped after releasing the state lock.
+    drop(launched);
+    tab.ok_or_else(|| "browser was closed while starting".to_string())
+}
+
+/// Remove a dead session only when it still owns the tab that failed. A newer
+/// launch or a concurrent close must not be torn down by an older request.
+fn take_current_session_for_tab(tab: &Arc<Tab>) -> Result<Option<Session>, String> {
+    let mut state = BROWSER.lock().map_err(|_| "browser state poisoned")?;
+    if state
+        .session
+        .as_ref()
+        .is_some_and(|session| Arc::ptr_eq(&session.tab, tab))
+    {
+        Ok(state.session.take())
+    } else {
+        Ok(None)
+    }
+}
+
+/// Remove the visible session and invalidate in-flight launches. The caller must
+/// drop the returned session outside `BROWSER` and preferably under the operation
+/// lock so an active CDP request is allowed to finish first.
+fn take_browser_session() -> Option<Session> {
+    let mut state = BROWSER.lock().ok()?;
+    state.invalidate()
+}
+
 /// Run a closure against the (lazily-launched) shared tab, on a blocking thread.
 async fn with_tab<F>(f: F) -> Result<BrowserState, String>
 where
     F: Fn(&Tab) -> Result<Option<String>, String> + Send + 'static,
 {
     tauri::async_runtime::spawn_blocking(move || -> Result<BrowserState, String> {
+        // The operation lock preserves the single-tab action order without making
+        // close/reload wait on the browser-state mutex.
+        let _operation = BROWSER_OPERATION
+            .lock()
+            .map_err(|_| "browser operation state poisoned")?;
         // Run against the shared tab. If the cached browser's CDP connection is DEAD
         // (it timed out / crashed / was closed — "underlying connection is closed"),
         // toss the stale session, relaunch a fresh browser, and retry ONCE. Without
         // this, a single navigation timeout bricks the browser for the whole session.
         let mut last_err = String::new();
         for attempt in 0..2 {
-            let outcome = {
-                let mut guard = BROWSER.lock().map_err(|_| "browser state poisoned")?;
-                if guard.is_none() {
-                    *guard = Some(match try_connect_existing() {
-                        Some(s) => s,
-                        None => launch()?,
-                    });
-                }
-                let tab = guard.as_ref().unwrap().tab.clone();
-                f(&tab).and_then(|result| snapshot(&tab, result))
-            };
+            let tab = current_or_launch_tab()?;
+            // CDP calls, the performance-sampling sleep, and screenshots run
+            // without BROWSER locked. The operation lock above still serializes
+            // mutations of the persistent tab.
+            let outcome = f(&tab).and_then(|result| snapshot(&tab, result));
             match outcome {
                 Ok(state) => return Ok(state),
                 Err(e) => {
                     last_err = e;
                     if attempt == 0 && is_dead_browser(&last_err) {
-                        if let Ok(mut g) = BROWSER.lock() {
-                            *g = None; // drop the dead session → next attempt relaunches
-                        }
+                        // Do not tear down a replacement session that was installed
+                        // after this tab failed. Drop the stale process outside the
+                        // state lock while the operation remains serialized.
+                        drop(take_current_session_for_tab(&tab)?);
                         continue;
                     }
                     return Err(last_err);
@@ -632,30 +714,35 @@ fn is_navigation_wait_timeout(e: &str) -> bool {
         || s.contains("navigation timeout")
 }
 
-/// Open a URL (launches the browser on first use).
-#[tauri::command]
-pub async fn browser_navigate(url: String) -> Result<BrowserState, String> {
-    let url = url.trim().to_string();
-    // Don't mangle URLs that already carry a scheme — the old code did `https://{url}` for anything
-    // not http(s), turning `file:///D:/x.html` into `https://file:///D:/x.html` (看本地 html 就废了).
-    let url = if url.starts_with("http://")
+fn normalize_navigation_url(url: &str) -> String {
+    let url = url.trim();
+    // Preserve URLs that already carry a scheme. Local HTML and data documents
+    // are first-class preview targets for the IDE, so they must reach Chrome
+    // unchanged instead of being rewritten as https://file:///... .
+    if url.starts_with("http://")
         || url.starts_with("https://")
         || url.starts_with("file://")
         || url.starts_with("about:")
         || url.starts_with("data:")
     {
-        url
+        url.to_string()
     } else if url.len() >= 2 && url.as_bytes()[1] == b':' && url.as_bytes()[0].is_ascii_alphabetic()
     {
-        // Windows drive path (D:\… or D:/…) → open as a local file
+        // Windows drive path (D:\... or D:/...) -> local file URL.
         format!("file:///{}", url.replace('\\', "/"))
     } else if url.starts_with('/') {
-        // Unix absolute path (/Users/…/x.html) → local file
+        // Unix absolute path (/Users/.../index.html) -> local file URL.
         format!("file://{url}")
     } else {
-        // bare host / domain → default to https
+        // Bare host / domain defaults to HTTPS.
         format!("https://{url}")
-    };
+    }
+}
+
+/// Open a URL (launches the browser on first use).
+#[tauri::command]
+pub async fn browser_navigate(url: String) -> Result<BrowserState, String> {
+    let url = normalize_navigation_url(&url);
     with_tab(move |tab| {
         tab.navigate_to(&url).map_err(|e| e.to_string())?;
         match tab.wait_until_navigated() {
@@ -901,6 +988,75 @@ pub async fn browser_eval(script: String) -> Result<BrowserState, String> {
     .await
 }
 
+fn metric_values(
+    metrics: &[headless_chrome::protocol::cdp::Performance::Metric],
+) -> std::collections::HashMap<&str, f64> {
+    metrics
+        .iter()
+        .filter(|metric| metric.value.is_finite())
+        .map(|metric| (metric.name.as_str(), metric.value))
+        .collect()
+}
+
+fn non_negative_delta(
+    before: &std::collections::HashMap<&str, f64>,
+    after: &std::collections::HashMap<&str, f64>,
+    name: &str,
+) -> Option<f64> {
+    let delta = after.get(name)? - before.get(name)?;
+    (delta >= 0.0 && delta.is_finite()).then_some(delta)
+}
+
+/// Sample Chrome's CDP Performance domain over a bounded interval. `TaskDuration`
+/// and `Timestamp` are cumulative seconds, so their delta gives real main-thread
+/// busy time rather than an event-loop-delay approximation.
+#[tauri::command]
+pub async fn browser_performance_sample(sample_ms: Option<u64>) -> Result<BrowserState, String> {
+    let sample_ms = sample_ms.unwrap_or(750).clamp(250, 5_000);
+    with_tab(move |tab| {
+        tab.call_method(EnablePerformanceMetrics { time_domain: None })
+            .map_err(|e| format!("启用 Chrome 性能指标失败: {e}"))?;
+        let first = tab
+            .call_method(GetMetrics(None))
+            .map_err(|e| format!("读取第一次 Chrome 性能指标失败: {e}"))?;
+        std::thread::sleep(Duration::from_millis(sample_ms));
+        let second = tab
+            .call_method(GetMetrics(None))
+            .map_err(|e| format!("读取第二次 Chrome 性能指标失败: {e}"))?;
+
+        let before = metric_values(&first.metrics);
+        let after = metric_values(&second.metrics);
+        let timestamp_seconds = non_negative_delta(&before, &after, "Timestamp");
+        let task_seconds = non_negative_delta(&before, &after, "TaskDuration");
+        let busy_percent = match (task_seconds, timestamp_seconds) {
+            (Some(task), Some(elapsed)) if elapsed > 0.0 => {
+                Some((task / elapsed * 100.0).min(100.0))
+            }
+            _ => None,
+        };
+        let milliseconds =
+            |name: &str| non_negative_delta(&before, &after, name).map(|seconds| seconds * 1_000.0);
+        let count = |name: &str| non_negative_delta(&before, &after, name);
+        let value = serde_json::json!({
+            "sampleWindowMs": sample_ms,
+            "cpu": {
+                "source": "Chrome CDP Performance.getMetrics",
+                "metric": "TaskDuration / Timestamp",
+                "busyPercent": busy_percent,
+                "elapsedMs": timestamp_seconds.map(|seconds| seconds * 1_000.0),
+                "taskDurationMs": task_seconds.map(|seconds| seconds * 1_000.0),
+                "scriptDurationMs": milliseconds("ScriptDuration"),
+                "layoutDurationMs": milliseconds("LayoutDuration"),
+                "recalcStyleDurationMs": milliseconds("RecalcStyleDuration"),
+                "layoutCount": count("LayoutCount"),
+                "recalcStyleCount": count("RecalcStyleCount"),
+            }
+        });
+        Ok(Some(value.to_string()))
+    })
+    .await
+}
+
 /// Re-screenshot the current page (no action) — just look again.
 #[tauri::command]
 pub async fn browser_screenshot() -> Result<BrowserState, String> {
@@ -919,6 +1075,14 @@ fn validate_viewport(
     let scale = device_scale_factor.unwrap_or(1.0);
     if !scale.is_finite() || !(0.5..=4.0).contains(&scale) {
         return Err("device_scale_factor 必须是 0.5..=4.0 的有限数值".into());
+    }
+    // CDP screenshots are rendered at device pixels. A legal CSS viewport such
+    // as 7680x7680 at scale 4 needs nearly 1 GiB for one RGBA frame and can
+    // freeze the entire desktop process while it is encoded and sent over IPC.
+    const MAX_VIEWPORT_DEVICE_PIXELS: f64 = 24_000_000.0;
+    let device_pixels = width as f64 * height as f64 * scale * scale;
+    if device_pixels > MAX_VIEWPORT_DEVICE_PIXELS {
+        return Err("viewport 与 device_scale_factor 的组合过大（最多 2400 万设备像素）".into());
     }
     Ok((width, height, scale, mobile.unwrap_or(false)))
 }
@@ -1080,18 +1244,34 @@ pub async fn browser_storage(storage_type: Option<String>) -> Result<BrowserStat
 #[tauri::command]
 pub async fn browser_close() -> Result<(), String> {
     tauri::async_runtime::spawn_blocking(|| {
-        if let Ok(mut g) = BROWSER.lock() {
-            *g = None; // dropping Session kills the Chrome process
+        let session = take_browser_session();
+        if let Some(session) = session {
+            // Let an in-flight CDP call finish before tearing down its Browser.
+            // The state has already been cleared, so new close/reload calls do
+            // not wait for Chrome's process tree to exit.
+            let _operation = BROWSER_OPERATION
+                .lock()
+                .map_err(|_| "browser operation state poisoned")?;
+            drop(session);
         }
+        Ok::<(), String>(())
     })
     .await
-    .map_err(|e| e.to_string())
+    .map_err(|e| e.to_string())??;
+    Ok(())
 }
 
 /// Synchronous close — called from cleanup_stale on webview reload / app exit.
 pub fn close_all() {
-    if let Ok(mut g) = BROWSER.lock() {
-        *g = None;
+    let session = take_browser_session();
+    if let Some(session) = session {
+        // Dropping a headless Chrome session can wait for its process tree.
+        // cleanup_stale calls this from the Tauri event thread, so take state
+        // synchronously then wait for any current CDP operation in the background.
+        std::thread::spawn(move || {
+            let _operation = BROWSER_OPERATION.lock();
+            drop(session);
+        });
     }
 }
 
@@ -1166,6 +1346,7 @@ mod tests {
         assert!(validate_viewport(390, 9000, None, None).is_err());
         assert!(validate_viewport(390, 844, Some(f64::NAN), None).is_err());
         assert!(validate_viewport(390, 844, Some(4.1), None).is_err());
+        assert!(validate_viewport(7680, 7680, Some(4.0), None).is_err());
     }
 
     #[test]
@@ -1201,5 +1382,63 @@ mod tests {
             "navigation timeout after 30000 ms"
         ));
         assert!(!is_navigation_wait_timeout("DNS resolution failed"));
+    }
+
+    #[test]
+    fn navigation_url_preserves_preview_targets_and_normalizes_paths() {
+        assert_eq!(
+            normalize_navigation_url(" file:///tmp/site/index.html "),
+            "file:///tmp/site/index.html"
+        );
+        assert_eq!(
+            normalize_navigation_url("/tmp/site/index.html"),
+            "file:///tmp/site/index.html"
+        );
+        assert_eq!(
+            normalize_navigation_url(r"C:\site\index.html"),
+            "file:///C:/site/index.html"
+        );
+        assert_eq!(
+            normalize_navigation_url("data:text/html,<h1>Preview</h1>"),
+            "data:text/html,<h1>Preview</h1>"
+        );
+        assert_eq!(
+            normalize_navigation_url("localhost:5174"),
+            "https://localhost:5174"
+        );
+    }
+
+    #[test]
+    fn cdp_metric_delta_rejects_missing_and_regressing_counters() {
+        let before =
+            std::collections::HashMap::from([("Timestamp", 100.0), ("TaskDuration", 42.0)]);
+        let after =
+            std::collections::HashMap::from([("Timestamp", 100.75), ("TaskDuration", 42.15)]);
+        assert!(
+            (non_negative_delta(&before, &after, "Timestamp").unwrap() - 0.75).abs() < f64::EPSILON
+        );
+        assert!((non_negative_delta(&before, &after, "TaskDuration").unwrap() - 0.15).abs() < 1e-9);
+        assert_eq!(non_negative_delta(&before, &after, "LayoutDuration"), None);
+
+        let regressed = std::collections::HashMap::from([("TaskDuration", 41.9)]);
+        assert_eq!(
+            non_negative_delta(&before, &regressed, "TaskDuration"),
+            None
+        );
+    }
+
+    #[test]
+    fn close_invalidates_a_concurrent_browser_launch_generation() {
+        let store = Arc::new(Mutex::new(BrowserStore::default()));
+        let launch_generation = store.lock().unwrap().generation;
+        let closer = Arc::clone(&store);
+
+        std::thread::spawn(move || {
+            closer.lock().unwrap().invalidate();
+        })
+        .join()
+        .unwrap();
+
+        assert!(!store.lock().unwrap().launch_is_current(launch_generation));
     }
 }

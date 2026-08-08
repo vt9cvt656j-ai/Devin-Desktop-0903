@@ -84,6 +84,7 @@ input.on("line", (line) => {
   }
 
   if (message.method === "ping") {
+    if (process.env.MCP_FIXTURE_IGNORE_PING === "1") return;
     reply(message.id, {});
     return;
   }
@@ -97,6 +98,9 @@ input.on("line", (line) => {
 
   if (message.method === "tools/call") {
     send({ jsonrpc: "2.0", method: "notifications/progress", params: { progress: 1 } });
+    if (message.params?.name === "exit") {
+      process.exit(0);
+    }
     if (message.params?.name === "delay_echo") {
       const delay = Math.max(0, Math.min(5000, Number(message.params?.arguments?.delay_ms) || 0));
       const startedPath = String(message.params?.arguments?.started_path || "");

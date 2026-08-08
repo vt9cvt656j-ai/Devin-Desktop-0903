@@ -95,3 +95,124 @@ test("JobQueue uses the injected runner and preserves completed history for wait
   assert.equal(store.get("jobs.real-1").status, "completed");
   assert.equal(store.get("jobs.real-1").findings.length, 2);
 });
+
+test("JobQueue enforces maxConcurrent without polling races and starts queued jobs FIFO", async () => {
+  const store = makeStore();
+  const releases = new Map();
+  const started = [];
+  let running = 0;
+  let peak = 0;
+  const queue = new JobQueue({
+    maxConcurrent: 2,
+    historyTTL: 0,
+    sharedStore: store,
+    runner: async (job) => {
+      started.push(job.id);
+      running++;
+      peak = Math.max(peak, running);
+      await new Promise((resolve) => releases.set(job.id, resolve));
+      running--;
+      return { summary: job.id };
+    },
+  });
+
+  for (let i = 1; i <= 5; i++) {
+    await queue.submit({ id: `queued-${i}`, tool: "run_subagent", role: "test" });
+  }
+  await Promise.resolve();
+  assert.deepEqual(started, ["queued-1", "queued-2"]);
+
+  releases.get("queued-1")();
+  await queue.waitForJob("queued-1", 1_000);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(started, ["queued-1", "queued-2", "queued-3"]);
+
+  releases.get("queued-2")();
+  releases.get("queued-3")();
+  await Promise.all([queue.waitForJob("queued-2", 1_000), queue.waitForJob("queued-3", 1_000)]);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(started, ["queued-1", "queued-2", "queued-3", "queued-4", "queued-5"]);
+  assert.equal(peak, 2);
+
+  releases.get("queued-4")();
+  releases.get("queued-5")();
+  await Promise.all([queue.waitForJob("queued-4", 1_000), queue.waitForJob("queued-5", 1_000)]);
+  await queue.stopAll();
+});
+
+test("JobQueue stopAll aborts queued jobs without leaving slot polling timers", async () => {
+  const store = makeStore();
+  let releaseRunning;
+  let executions = 0;
+  const queue = new JobQueue({
+    maxConcurrent: 1,
+    historyTTL: 0,
+    sharedStore: store,
+    runner: async () => {
+      executions++;
+      await new Promise((resolve) => { releaseRunning = resolve; });
+      return { summary: "finished" };
+    },
+  });
+  await queue.submit({ id: "running", tool: "run_subagent", role: "test" });
+  await queue.submit({ id: "never-started", tool: "run_subagent", role: "test" });
+
+  await queue.stopAll();
+  assert.equal(queue.jobs.get("never-started").status, "aborted");
+  assert.equal(queue.pendingJobs.length, 0);
+  assert.equal(queue.monitorTimer, null);
+  assert.equal(executions, 1);
+
+  releaseRunning();
+  await assert.rejects(queue.waitForJob("running", 1_000), /aborted/);
+  assert.equal(queue.activeCount, 0);
+});
+
+test("JobQueue abort releases a slot even when the runner ignores AbortSignal", async () => {
+  const store = makeStore();
+  const started = [];
+  const queue = new JobQueue({
+    maxConcurrent: 1,
+    historyTTL: 0,
+    sharedStore: store,
+    runner: async (job) => {
+      started.push(job.id);
+      if (job.id === "stuck") return new Promise(() => {});
+      return { summary: "next completed" };
+    },
+  });
+
+  await queue.submit({ id: "stuck", tool: "run_subagent", role: "test" });
+  await queue.submit({ id: "next", tool: "run_subagent", role: "test" });
+  await Promise.resolve();
+  assert.deepEqual(started, ["stuck"]);
+
+  assert.equal(await queue.abort("stuck"), true);
+  await assert.rejects(queue.waitForJob("stuck", 1_000), /aborted/);
+  assert.equal((await queue.waitForJob("next", 1_000)).summary, "next completed");
+  assert.deepEqual(started, ["stuck", "next"]);
+  assert.equal(queue.activeCount, 0);
+  await queue.stopAll();
+});
+
+test("JobQueue stopAll completes when every running runner ignores cancellation", async () => {
+  const store = makeStore();
+  const queue = new JobQueue({
+    maxConcurrent: 2,
+    historyTTL: 0,
+    sharedStore: store,
+    runner: async () => new Promise(() => {}),
+  });
+  await queue.submit({ id: "stuck-a", tool: "run_subagent", role: "test" });
+  await queue.submit({ id: "stuck-b", tool: "run_subagent", role: "test" });
+  await Promise.resolve();
+
+  await Promise.race([
+    queue.stopAll(),
+    new Promise((_, reject) => setTimeout(() => reject(new Error("stopAll hung")), 250)),
+  ]);
+
+  assert.equal(queue.activeCount, 0);
+  assert.equal(queue.jobs.get("stuck-a").status, "aborted");
+  assert.equal(queue.jobs.get("stuck-b").status, "aborted");
+});

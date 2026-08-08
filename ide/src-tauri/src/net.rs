@@ -11,13 +11,22 @@
 
 use std::collections::HashMap;
 use std::net::{IpAddr, ToSocketAddrs};
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use futures_util::StreamExt;
 use serde::Serialize;
+use tokio::io::AsyncWriteExt;
 
 const MAX_BODY: usize = 5 * 1024 * 1024; // cap on the response body we buffer
 const MAX_DOWNLOAD: usize = 200 * 1024 * 1024; // cap on a downloaded file
+const DNS_RESOLUTION_TIMEOUT: Duration = Duration::from_secs(5);
+// Generated images are sent back through IPC as data URLs. Keep their raw size
+// aligned with the file-to-data-URL tool rather than allowing a 200 MiB image to
+// turn into a roughly 267 MiB renderer payload.
+const MAX_IMAGE_BYTES: usize = 25 * 1024 * 1024;
+const MAX_IMAGE_API_JSON_BYTES: usize = MAX_IMAGE_BYTES * 4 / 3 + 64 * 1024;
+const MAX_IMAGE_ERROR_BYTES: usize = 64 * 1024;
 
 #[derive(Serialize)]
 pub struct HttpResponse {
@@ -52,7 +61,7 @@ fn addr_blocked(ip: IpAddr) -> bool {
 
 /// Validate a URL for both tools: http/https only, host resolvable, and no
 /// resolved address is a blocked (link-local/metadata) one.
-fn validate(url: &str) -> Result<reqwest::Url, String> {
+async fn validate(url: &str) -> Result<reqwest::Url, String> {
     let parsed = reqwest::Url::parse(url.trim()).map_err(|_| "无效的 URL".to_string())?;
     match parsed.scheme() {
         "http" | "https" => {}
@@ -60,10 +69,19 @@ fn validate(url: &str) -> Result<reqwest::Url, String> {
     }
     let host = parsed.host_str().ok_or("URL 缺少主机名")?.to_string();
     let port = parsed.port_or_known_default().unwrap_or(80);
-    let addrs: Vec<_> = (host.as_str(), port)
-        .to_socket_addrs()
-        .map_err(|e| format!("DNS 解析失败: {e}"))?
-        .collect();
+    // `ToSocketAddrs` uses the platform's blocking resolver. Running it directly
+    // in a Tauri async command can pin a runtime worker behind a stalled DNS
+    // lookup, so isolate it and put an IPC-visible deadline around the wait.
+    let lookup = tauri::async_runtime::spawn_blocking(move || {
+        (host.as_str(), port)
+            .to_socket_addrs()
+            .map(|addrs| addrs.collect::<Vec<_>>())
+            .map_err(|error| format!("DNS 解析失败: {error}"))
+    });
+    let lookup = tokio::time::timeout(DNS_RESOLUTION_TIMEOUT, lookup)
+        .await
+        .map_err(|_| format!("DNS 解析超时（{} 秒）", DNS_RESOLUTION_TIMEOUT.as_secs()))?;
+    let addrs = lookup.map_err(|error| format!("DNS 解析任务失败: {error}"))??;
     if addrs.is_empty() {
         return Err("无法解析主机".into());
     }
@@ -73,6 +91,147 @@ fn validate(url: &str) -> Result<reqwest::Url, String> {
         }
     }
     Ok(parsed)
+}
+
+async fn response_bytes_limited(
+    mut response: reqwest::Response,
+    limit: usize,
+    label: &str,
+) -> Result<Vec<u8>, String> {
+    if let Some(length) = response.content_length() {
+        if length > limit as u64 {
+            return Err(format!(
+                "{label}响应过大（{length} 字节，上限 {limit} 字节）"
+            ));
+        }
+    }
+
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|error| format!("读取{label}响应失败: {error}"))?
+    {
+        if bytes.len().saturating_add(chunk.len()) > limit {
+            return Err(format!("{label}响应超过 {limit} 字节上限"));
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(bytes)
+}
+
+async fn response_text_limited(
+    response: reqwest::Response,
+    limit: usize,
+    label: &str,
+) -> Result<String, String> {
+    let bytes = response_bytes_limited(response, limit, label).await?;
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+async fn response_json_limited<T: serde::de::DeserializeOwned>(
+    response: reqwest::Response,
+    limit: usize,
+    label: &str,
+) -> Result<T, String> {
+    let bytes = response_bytes_limited(response, limit, label).await?;
+    serde_json::from_slice(&bytes).map_err(|error| format!("解析{label}响应失败: {error}"))
+}
+
+async fn generated_image_response(
+    response: reqwest::Response,
+    label: &str,
+) -> Result<(Vec<u8>, String), String> {
+    let content_type = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("image/png")
+        .to_string();
+    let bytes = response_bytes_limited(response, MAX_IMAGE_BYTES, label).await?;
+    Ok((
+        bytes,
+        if content_type.starts_with("image/") {
+            content_type
+        } else {
+            "image/png".into()
+        },
+    ))
+}
+
+fn download_temporary_path(target: &Path) -> Result<PathBuf, String> {
+    let parent = target
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let file_name = target
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .ok_or_else(|| "目标路径缺少文件名".to_string())?;
+    Ok(parent.join(format!(
+        ".{file_name}.michael-download-{}.part",
+        uuid::Uuid::new_v4()
+    )))
+}
+
+async fn stream_response_to_path(
+    mut response: reqwest::Response,
+    target: &Path,
+    limit: usize,
+    too_large_message: &str,
+) -> Result<u64, String> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > limit as u64)
+    {
+        return Err(too_large_message.to_string());
+    }
+
+    let parent = target
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    tokio::fs::create_dir_all(parent)
+        .await
+        .map_err(|error| format!("建目录失败: {error}"))?;
+    let temporary = download_temporary_path(target)?;
+    let download = async {
+        let mut file = tokio::fs::File::create(&temporary)
+            .await
+            .map_err(|error| format!("创建临时文件失败: {error}"))?;
+        let mut written = 0_u64;
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .map_err(|error| format!("下载读取失败: {error}"))?
+        {
+            let next = written.saturating_add(chunk.len() as u64);
+            if next > limit as u64 {
+                return Err(too_large_message.to_string());
+            }
+            file.write_all(&chunk)
+                .await
+                .map_err(|error| format!("写入临时文件失败: {error}"))?;
+            written = next;
+        }
+        file.flush()
+            .await
+            .map_err(|error| format!("刷新临时文件失败: {error}"))?;
+        drop(file);
+        // The temporary file is in the target directory, so rename replaces the
+        // prior file atomically on the project's supported filesystems.
+        tokio::fs::rename(&temporary, target)
+            .await
+            .map_err(|error| format!("保存下载文件失败: {error}"))?;
+        Ok(written)
+    }
+    .await;
+
+    if download.is_err() {
+        let _ = tokio::fs::remove_file(&temporary).await;
+    }
+    download
 }
 
 fn header_value(
@@ -182,7 +341,7 @@ pub async fn http_request(
     body: Option<String>,
     timeout_secs: Option<u64>,
 ) -> Result<HttpResponse, String> {
-    let parsed = validate(&url)?;
+    let parsed = validate(&url).await?;
     let m = method.trim().to_uppercase();
     let method = reqwest::Method::from_bytes(m.as_bytes())
         .map_err(|_| format!("不支持的 HTTP 方法: {m}"))?;
@@ -257,7 +416,7 @@ pub async fn http_request(
 /// `root` (or absolute) and MUST stay inside `root`. Bounded to 200 MB.
 #[tauri::command]
 pub async fn download_file(root: String, url: String, dest: String) -> Result<String, String> {
-    let parsed = validate(&url)?;
+    let parsed = validate(&url).await?;
 
     // Contain the write to the workspace.
     let base = std::path::Path::new(&root);
@@ -292,27 +451,7 @@ pub async fn download_file(root: String, url: String, dest: String) -> Result<St
     if !resp.status().is_success() {
         return Err(format!("HTTP {}", resp.status().as_u16()));
     }
-    if let Some(len) = resp.content_length() {
-        if len > MAX_DOWNLOAD as u64 {
-            return Err("文件过大(>200MB)".into());
-        }
-    }
-
-    let mut buf: Vec<u8> = Vec::new();
-    let mut stream = resp.bytes_stream();
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|e| e.to_string())?;
-        if buf.len() + chunk.len() > MAX_DOWNLOAD {
-            return Err("文件过大(>200MB)".into());
-        }
-        buf.extend_from_slice(&chunk);
-    }
-
-    if let Some(parent) = target.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| format!("建目录失败: {e}"))?;
-    }
-    let n = buf.len();
-    std::fs::write(&target, &buf).map_err(|e| format!("写入失败: {e}"))?;
+    let n = stream_response_to_path(resp, &target, MAX_DOWNLOAD, "文件过大(>200MB)").await?;
     Ok(format!("已下载 {n} 字节到 {}", target.display()))
 }
 
@@ -561,7 +700,7 @@ pub async fn generate_image_chat(
     if bytes.is_empty() {
         return Err("生成结果为空".into());
     }
-    if bytes.len() > MAX_DOWNLOAD {
+    if bytes.len() > MAX_IMAGE_BYTES {
         return Err("生成的图过大".into());
     }
     let basep = std::path::Path::new(&root);
@@ -641,7 +780,16 @@ async fn try_responses_api(
         .await
         .map_err(|e| format!("responses 请求失败: {e}"))?;
     let status = resp.status();
-    let text = resp.text().await.unwrap_or_default();
+    let text = response_text_limited(
+        resp,
+        if status.is_success() {
+            MAX_IMAGE_API_JSON_BYTES
+        } else {
+            MAX_IMAGE_ERROR_BYTES
+        },
+        "responses",
+    )
+    .await?;
     if !status.is_success() {
         return Err(format!(
             "responses HTTP {}: {}",
@@ -672,7 +820,8 @@ async fn try_responses_api(
                     } else {
                         b64
                     };
-                    let bytes = b64_decode(raw).ok_or("responses base64 解码失败")?;
+                    let bytes = b64_decode_limited(raw, MAX_IMAGE_BYTES)
+                        .map_err(|error| format!("responses base64 解码失败: {error}"))?;
                     return Ok((bytes, "image/png".into()));
                 }
                 if let Some(raw_url) = item["url"].as_str() {
@@ -690,21 +839,7 @@ async fn try_responses_api(
                     if !r.status().is_success() {
                         return Err(format!("下载生成图 HTTP {}", r.status().as_u16()));
                     }
-                    let ct = r
-                        .headers()
-                        .get(reqwest::header::CONTENT_TYPE)
-                        .and_then(|x| x.to_str().ok())
-                        .unwrap_or("image/png")
-                        .to_string();
-                    let bb = r.bytes().await.map_err(|e| e.to_string())?;
-                    return Ok((
-                        bb.to_vec(),
-                        if ct.starts_with("image/") {
-                            ct
-                        } else {
-                            "image/png".into()
-                        },
-                    ));
+                    return generated_image_response(r, "下载生成图").await;
                 }
             }
             // Some relays return image as a message-content image_url instead.
@@ -719,7 +854,10 @@ async fn try_responses_api(
                                 } else {
                                     b64
                                 };
-                                let bytes = b64_decode(raw).ok_or("responses base64 解码失败")?;
+                                let bytes =
+                                    b64_decode_limited(raw, MAX_IMAGE_BYTES).map_err(|error| {
+                                        format!("responses base64 解码失败: {error}")
+                                    })?;
                                 return Ok((bytes, "image/png".into()));
                             }
                         }
@@ -794,7 +932,16 @@ async fn try_images_api(
         .await
         .map_err(|e| format!("images-api 请求失败: {e}"))?;
     let status = resp.status();
-    let text = resp.text().await.unwrap_or_default();
+    let text = response_text_limited(
+        resp,
+        if status.is_success() {
+            MAX_IMAGE_API_JSON_BYTES
+        } else {
+            MAX_IMAGE_ERROR_BYTES
+        },
+        "images-api",
+    )
+    .await?;
     if !status.is_success() {
         return Err(format!(
             "images-api HTTP {}: {}",
@@ -821,7 +968,8 @@ async fn try_images_api(
         } else {
             b64
         };
-        let bytes = b64_decode(raw).ok_or("images-api base64 解码失败")?;
+        let bytes = b64_decode_limited(raw, MAX_IMAGE_BYTES)
+            .map_err(|error| format!("images-api base64 解码失败: {error}"))?;
         Ok((bytes, "image/png".into()))
     } else if let Some(raw_url) = item["url"].as_str() {
         let img_url = if raw_url.starts_with('/') {
@@ -838,21 +986,7 @@ async fn try_images_api(
         if !r.status().is_success() {
             return Err(format!("下载生成图 HTTP {}", r.status().as_u16()));
         }
-        let ct = r
-            .headers()
-            .get(reqwest::header::CONTENT_TYPE)
-            .and_then(|x| x.to_str().ok())
-            .unwrap_or("image/png")
-            .to_string();
-        let bb = r.bytes().await.map_err(|e| e.to_string())?;
-        Ok((
-            bb.to_vec(),
-            if ct.starts_with("image/") {
-                ct
-            } else {
-                "image/png".into()
-            },
-        ))
+        generated_image_response(r, "下载生成图").await
     } else if let Some(task_id) = v.get("task_id").and_then(|t| t.as_str()) {
         // Async task (custom sizes) — poll until completed.
         let poll_url = if b.ends_with("/v1") {
@@ -871,7 +1005,8 @@ async fn try_images_api(
             if !pr.status().is_success() {
                 continue;
             }
-            let pt: serde_json::Value = pr.json().await.unwrap_or_default();
+            let pt: serde_json::Value =
+                response_json_limited(pr, MAX_IMAGE_API_JSON_BYTES, "生图轮询").await?;
             let status = pt["status"].as_str().unwrap_or("");
             if status == "failed" {
                 return Err(format!(
@@ -899,21 +1034,7 @@ async fn try_images_api(
                         if !dr.status().is_success() {
                             return Err(format!("下载生成图 HTTP {}", dr.status().as_u16()));
                         }
-                        let ct = dr
-                            .headers()
-                            .get(reqwest::header::CONTENT_TYPE)
-                            .and_then(|x| x.to_str().ok())
-                            .unwrap_or("image/png")
-                            .to_string();
-                        let bb = dr.bytes().await.map_err(|e| e.to_string())?;
-                        return Ok((
-                            bb.to_vec(),
-                            if ct.starts_with("image/") {
-                                ct
-                            } else {
-                                "image/png".into()
-                            },
-                        ));
+                        return generated_image_response(dr, "下载生成图").await;
                     }
                 }
             }
@@ -955,7 +1076,16 @@ async fn try_chat_image_api(
         .await
         .map_err(|e| format!("chat 请求失败: {e}"))?;
     let status = resp.status();
-    let text = resp.text().await.unwrap_or_default();
+    let text = response_text_limited(
+        resp,
+        if status.is_success() {
+            MAX_IMAGE_API_JSON_BYTES
+        } else {
+            MAX_IMAGE_ERROR_BYTES
+        },
+        "chat",
+    )
+    .await?;
     if !status.is_success() {
         return Err(format!(
             "chat HTTP {}: {}",
@@ -979,7 +1109,11 @@ async fn try_chat_image_api(
         let meta = &img[5..comma];
         let m = meta.split(';').next().unwrap_or("image/png").to_string();
         let data = &img[comma + 1..];
-        Ok((b64_decode(data).ok_or("base64 解码失败")?, m))
+        Ok((
+            b64_decode_limited(data, MAX_IMAGE_BYTES)
+                .map_err(|error| format!("base64 解码失败: {error}"))?,
+            m,
+        ))
     } else if img.starts_with("http://") || img.starts_with("https://") {
         let r = client
             .get(&img)
@@ -990,21 +1124,7 @@ async fn try_chat_image_api(
         if !r.status().is_success() {
             return Err(format!("下载生成图 HTTP {}", r.status().as_u16()));
         }
-        let ct = r
-            .headers()
-            .get(reqwest::header::CONTENT_TYPE)
-            .and_then(|x| x.to_str().ok())
-            .unwrap_or("image/png")
-            .to_string();
-        let bb = r.bytes().await.map_err(|e| e.to_string())?;
-        Ok((
-            bb.to_vec(),
-            if ct.starts_with("image/") {
-                ct
-            } else {
-                "image/png".into()
-            },
-        ))
+        generated_image_response(r, "下载生成图").await
     } else {
         Err("无法识别模型返回的图片引用".into())
     }
@@ -1087,7 +1207,9 @@ fn find_image_in_text(s: &str) -> Option<String> {
 }
 
 /// Minimal standard-base64 decoder (no external crate; capture.rs only has an encoder).
-fn b64_decode(s: &str) -> Option<Vec<u8>> {
+/// The permissive handling of non-base64 characters matches the prior decoder, but
+/// the output limit prevents a large data URL from allocating without bound.
+fn b64_decode_limited(s: &str, limit: usize) -> Result<Vec<u8>, String> {
     fn val(c: u8) -> i16 {
         match c {
             b'A'..=b'Z' => (c - b'A') as i16,
@@ -1113,13 +1235,16 @@ fn b64_decode(s: &str) -> Option<Vec<u8>> {
         bits += 6;
         if bits >= 8 {
             bits -= 8;
+            if out.len() >= limit {
+                return Err(format!("解码结果超过 {limit} 字节上限"));
+            }
             out.push((buf >> bits) as u8);
         }
     }
     if out.is_empty() {
-        None
+        Err("解码结果为空".into())
     } else {
-        Some(out)
+        Ok(out)
     }
 }
 
@@ -1127,6 +1252,101 @@ fn b64_decode(s: &str) -> Option<Vec<u8>> {
 mod img_tests {
     use super::*;
     use serde_json::json;
+
+    fn response_with_body(body: Vec<u8>) -> reqwest::Response {
+        reqwest::Response::from(http::Response::new(body))
+    }
+
+    fn response_with_streamed_body(body: Vec<u8>) -> reqwest::Response {
+        let stream = futures_util::stream::iter([Ok::<Vec<u8>, std::io::Error>(body)]);
+        reqwest::Response::from(http::Response::new(reqwest::Body::wrap_stream(stream)))
+    }
+
+    fn test_directory(name: &str) -> PathBuf {
+        let directory =
+            std::env::temp_dir().join(format!("michael-ide-net-{name}-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&directory).unwrap();
+        directory
+    }
+
+    #[tokio::test]
+    async fn response_bytes_limited_reads_normal_body_and_rejects_oversized_body() {
+        let body = b"normal body".to_vec();
+        assert_eq!(
+            response_bytes_limited(response_with_body(body.clone()), body.len(), "测试")
+                .await
+                .unwrap(),
+            body
+        );
+
+        let response = response_with_streamed_body(vec![7; 17]);
+        assert_eq!(response.content_length(), None);
+        let error = response_bytes_limited(response, 16, "测试")
+            .await
+            .unwrap_err();
+        assert!(error.contains("16 字节"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn streaming_download_replaces_target_after_complete_body() {
+        let directory = test_directory("replace");
+        let target = directory.join("download.bin");
+        std::fs::write(&target, b"old").unwrap();
+        let body = b"new download".to_vec();
+
+        let written =
+            stream_response_to_path(response_with_body(body.clone()), &target, 1024, "too large")
+                .await
+                .unwrap();
+
+        assert_eq!(written, body.len() as u64);
+        assert_eq!(std::fs::read(&target).unwrap(), body);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn streaming_download_preserves_existing_target_and_cleans_temp_on_overflow() {
+        let directory = test_directory("overflow");
+        let target = directory.join("download.bin");
+        std::fs::write(&target, b"old").unwrap();
+
+        let error = stream_response_to_path(
+            response_with_streamed_body(vec![9; 17]),
+            &target,
+            16,
+            "too large",
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(error, "too large");
+        assert_eq!(std::fs::read(&target).unwrap(), b"old");
+        let has_temporary_file = std::fs::read_dir(&directory)
+            .unwrap()
+            .filter_map(Result::ok)
+            .any(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .contains(".michael-download-")
+            });
+        assert!(!has_temporary_file);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn b64_decode_limited_rejects_output_over_limit() {
+        assert_eq!(b64_decode_limited("TWFu", 3).unwrap(), b"Man");
+        assert!(b64_decode_limited("TWFu", 2)
+            .unwrap_err()
+            .contains("超过 2 字节上限"));
+    }
+
+    #[tokio::test]
+    async fn validate_accepts_loopback_without_blocking_the_async_command() {
+        let url = validate("http://127.0.0.1:3000").await.unwrap();
+        assert_eq!(url.host_str(), Some("127.0.0.1"));
+    }
 
     #[test]
     fn image_size_snaps_to_supported_set_for_gpt_image() {
@@ -1202,8 +1422,8 @@ mod img_tests {
     #[test]
     fn b64_roundtrip() {
         // "Man" → "TWFu"
-        assert_eq!(b64_decode("TWFu"), Some(b"Man".to_vec()));
-        assert_eq!(b64_decode("aGVsbG8="), Some(b"hello".to_vec()));
+        assert_eq!(b64_decode_limited("TWFu", 3).unwrap(), b"Man");
+        assert_eq!(b64_decode_limited("aGVsbG8=", 5).unwrap(), b"hello");
     }
 
     #[test]

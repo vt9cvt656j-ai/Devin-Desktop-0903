@@ -84,7 +84,7 @@ fn default_shell() -> String {
 
 /// Spawn a new shell in a PTY and start streaming its output to `on_event`.
 /// Returns an id used by the other `term_*` commands.
-#[tauri::command]
+#[tauri::command(async)]
 pub fn term_open(
     state: State<TerminalState>,
     cwd: Option<String>,
@@ -262,16 +262,22 @@ pub fn term_open(
         let _ = on_event.send(TermEvent::Exit);
         // shell 已经结束：摘掉条目，让 Term::drop 回收子进程（避免僵尸）和 PTY 主端 fd。
         // 前端收到 Exit 只是把页签标成"已退出"，Rust 侧的资源必须在这里自己释放。
-        if let Ok(mut inner) = terms_for_reader.lock() {
-            drop(inner.terms.remove(&id));
-        }
+        // Never run Term::drop while holding the table lock: Drop performs a
+        // blocking child.wait(), and every UI terminal command needs this lock.
+        // A slow shell shutdown used to make term_write/resize/close block the
+        // Tauri event thread until the child finally exited.
+        let finished = terms_for_reader
+            .lock()
+            .ok()
+            .and_then(|mut inner| inner.terms.remove(&id));
+        drop(finished);
     });
 
     Ok(id)
 }
 
 /// Forward keystrokes (or pasted text) to the shell.
-#[tauri::command]
+#[tauri::command(async)]
 pub fn term_write(state: State<TerminalState>, id: u32, data: String) -> Result<(), String> {
     let mut inner = state.inner.lock().map_err(|_| "terminal state poisoned")?;
     let term = inner.terms.get_mut(&id).ok_or("no such terminal")?;
@@ -282,7 +288,7 @@ pub fn term_write(state: State<TerminalState>, id: u32, data: String) -> Result<
 }
 
 /// Resize the PTY so the shell wraps output at the right width.
-#[tauri::command]
+#[tauri::command(async)]
 pub fn term_resize(
     state: State<TerminalState>,
     id: u32,
@@ -302,11 +308,17 @@ pub fn term_resize(
 }
 
 /// Kill the shell and drop the session.
-#[tauri::command]
+#[tauri::command(async)]
 pub fn term_close(state: State<TerminalState>, id: u32) -> Result<(), String> {
-    let mut inner = state.inner.lock().map_err(|_| "terminal state poisoned")?;
-    if let Some(mut term) = inner.terms.remove(&id) {
+    let removed = {
+        let mut inner = state.inner.lock().map_err(|_| "terminal state poisoned")?;
+        inner.terms.remove(&id)
+    };
+    if let Some(mut term) = removed {
         let _ = term.child.kill();
+        // Term::drop waits for the child, but the table is already unlocked and
+        // this command is dispatched away from the Tauri event thread.
+        drop(term);
     }
     Ok(())
 }
@@ -326,7 +338,7 @@ pub fn term_close(state: State<TerminalState>, id: u32) -> Result<(), String> {
 /// 正确识别，靠输出活跃度猜是猜不出来的。
 ///
 /// 一次返回全部，而不是一个终端一次调用：这是要按秒轮询的，N 次 IPC 没必要。
-#[tauri::command]
+#[tauri::command(async)]
 pub fn term_running_ids(state: State<TerminalState>) -> Vec<u32> {
     let Ok(inner) = state.inner.lock() else {
         return Vec::new();
@@ -347,7 +359,7 @@ pub fn term_running_ids(state: State<TerminalState>) -> Vec<u32> {
         .collect()
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn term_list_commands() -> Vec<String> {
     use std::collections::BTreeSet;
     let mut set: BTreeSet<String> = BTreeSet::new();
@@ -390,7 +402,7 @@ pub fn term_list_commands() -> Vec<String> {
 
 /// Read the user's shell history (zsh or bash), returning recent commands
 /// most-recent-first and deduped. Powers history-aware autosuggestions.
-#[tauri::command]
+#[tauri::command(async)]
 pub fn term_history() -> Vec<String> {
     let home = match std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" }) {
         Some(h) => std::path::PathBuf::from(h),

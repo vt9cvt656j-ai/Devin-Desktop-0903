@@ -3,7 +3,9 @@ import { register } from "node:module";
 import { pathToFileURL } from "node:url";
 import * as fs from "node:fs";
 import * as fsp from "node:fs/promises";
+import { spawn } from "node:child_process";
 import { mkdtempSync } from "node:fs";
+import assert from "node:assert/strict";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 const __HERE = dirname(__f2u(import.meta.url));
@@ -41,6 +43,26 @@ B.createFile = async (p) => { await fsp.mkdir(join(p,".."),{recursive:true}); aw
 B.createDir = async (p) => { await fsp.mkdir(p, { recursive:true }); return true; };
 B.readDir = async (p) => (await fsp.readdir(p, { withFileTypes:true })).map(d=>({ name:d.name, path:join(p,d.name), isDir:d.isDirectory(), is_dir:d.isDirectory() }));
 B.inspectFile = async (p) => { try { const st=await fsp.stat(p); return { exists:true, isDir:st.isDirectory(), size:st.size }; } catch { return { exists:false }; } };
+// Mirror the captured-command contract exposed by Tauri while keeping this
+// harness inside its temporary workspace and using only short-lived shells.
+B.taskRunCapture = (cwd, command, options = {}) => new Promise((resolve, reject) => {
+  const child = spawn("/bin/sh", ["-lc", String(command)], {
+    cwd,
+    env: { ...process.env, CI: "1", TERM: "dumb" },
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  let stdout = "", stderr = "", timedOut = false;
+  child.stdout.setEncoding("utf8");
+  child.stderr.setEncoding("utf8");
+  child.stdout.on("data", (chunk) => { stdout += chunk; });
+  child.stderr.on("data", (chunk) => { stderr += chunk; });
+  const timeout = setTimeout(() => { timedOut = true; child.kill("SIGKILL"); }, Math.max(1, Number(options.timeoutSecs) || 15) * 1000);
+  child.once("error", (error) => { clearTimeout(timeout); reject(error); });
+  child.once("close", (code) => {
+    clearTimeout(timeout);
+    resolve({ code: timedOut ? -1 : (code ?? -1), stdout, stderr, combined: stdout + stderr, truncated: false, timed_out: timedOut });
+  });
+});
 console.log("backend patched, methods:", before, "->", Object.keys(B).length);
 
 
@@ -58,13 +80,18 @@ function newRun(){ return { mode:"agent", session:{}, _toolStep:0, _failedPathAt
 const run = newRun();
 async function exec(call){
   const out = await H._executeToolStepInner(makeStep(), call, ROOT, run);
-  // Replicate the agent loop's POST-MUTATION accounting. Driving the executor in isolation is
-  // not the same as driving the product: several guarantees (clearing the negative path cache
-  // after a successful write, advancing the tool batch) live in the loop, not the executor.
-  // Omitting them makes the harness invent failures the user would never see — the exact way a
-  // harness turns into a meaningless signal.
+  // Replicate the production loop's POST-MUTATION accounting exactly enough for
+  // direct executor calls. A miss is stored under its workspace-normalized
+  // _toolFailureKey, not the raw relative path.
   if (out?.mutated) {
-    for (const k of [call.path, out.path]) if (k) run._failedPathAttempts.delete(String(k).trim());
+    for (const k of [call.path, out.path]) {
+      if (!k) continue;
+      const rawKey = String(k).trim();
+      const failureKey = H._toolFailureKey({ type: "read", path: rawKey }, ROOT);
+      run._failedPathAttempts.delete(rawKey);
+      run._failedPathAttempts.delete(failureKey);
+      H._resetToolFailure(failureKey);
+    }
   }
   run._toolBatch = (run._toolBatch || 0) + 1;   // each exec() stands for one completed tool batch
   return out;
@@ -108,6 +135,45 @@ show("write ghost.txt",   await exec({ type:"write", path:"ghost.txt", content:"
 const r6 = await exec({ type:"read", path:"ghost.txt" });
 show("read ghost.txt #3", r6);
 console.log("  negative cache cleared:", /now i exist/.test(String(r6?.content||"")));
+assert.match(String(r6?.content || ""), /now i exist/, "a successful write must clear the normalized read miss key");
+
+console.log("\n===== SCENARIO 8: OpenAPI local spec only exposes HTTP operations =====");
+fs.writeFileSync(join(ROOT, "openapi.json"), JSON.stringify({
+  openapi: "3.0.3",
+  info: { title: "Harness API" },
+  paths: {
+    "/widgets": {
+      parameters: [{ name: "trace", in: "header" }],
+      get: { summary: "List widgets" },
+      post: { summary: "Create widget" },
+      "x-path-metadata": { owner: "platform" },
+      "$ref": "#/components/pathItems/widgets"
+    }
+  }
+}));
+const r8 = await exec({ type:"openapi_parser", url:"openapi.json", outputFormat:"list" });
+show("openapi_parser list", r8);
+assert.match(String(r8?.content || ""), /GET \/widgets/);
+assert.match(String(r8?.content || ""), /POST \/widgets/);
+assert.doesNotMatch(String(r8?.content || ""), /X-PATH-METADATA/, "OpenAPI extensions are not HTTP methods");
+
+console.log("\n===== SCENARIO 9: run_cmd captures real short-lived commands =====");
+const cmdOk = await exec({ type:"cmd", command:"printf 'cmd-stdout-ok\n'", purpose:"verify" });
+show("run_cmd stdout", cmdOk);
+assert.equal(cmdOk.code, 0, "successful command keeps its exit code");
+assert.match(String(cmdOk.stdout || ""), /cmd-stdout-ok/, "successful command returns stdout");
+
+const cmdFail = await exec({ type:"cmd", command:"printf 'cmd-stderr-failure\n' >&2; exit 7", purpose:"verify" });
+show("run_cmd stderr + exit 7", cmdFail);
+assert.equal(cmdFail.code, 7, "failed command keeps its nonzero exit code");
+assert.match(String(cmdFail.stderr || ""), /cmd-stderr-failure/, "failed command returns stderr");
+
+const cmdCwd = await exec({ type:"cmd", command:"pwd; mkdir -p 'command dir'; printf 'created by command\n' > 'command dir/result file.txt'", purpose:"mutate" });
+show("run_cmd cwd + spaced path", cmdCwd);
+assert.equal(cmdCwd.code, 0, "workspace command exits successfully");
+assert.ok(String(cmdCwd.stdout || "").includes(ROOT), "taskRunCapture runs in the supplied workspace cwd");
+assert.equal(fs.readFileSync(join(ROOT, "command dir", "result file.txt"), "utf8"), "created by command\n",
+  "quoted paths with spaces are passed to the real shell and mutate only the temporary workspace");
 
 console.log("\nFINAL dir:", fs.readdirSync(ROOT).sort().join(", "));
 process.exit(0);

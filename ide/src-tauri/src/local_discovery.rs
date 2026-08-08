@@ -395,7 +395,7 @@ async fn response_json<T: DeserializeOwned>(
     let mut response = request
         .send()
         .await
-        .map_err(|error| format!("{source} request failed: {error}"))?;
+        .map_err(|error| format!("{source} request failed: {}", error.without_url()))?;
     let status = response.status();
     if !status.is_success() {
         return Err(format!("{source} returned HTTP {status}"));
@@ -1606,18 +1606,8 @@ async fn fetch_baidu_places(
         limit.min(20),
         ak,
     );
-    let resp: serde_json::Value = HTTP
-        .get(&url)
-        .timeout(SOURCE_TIMEOUT)
-        .send()
-        .await
-        // reqwest 的错误 Display **会带上完整 URL**，而这些请求把 API Key 拼在 query 里 ——
-        // 一次失败就把 Key 原样写进错误串，随后进 AI 上下文、发往网关、落进日志。
-        // `without_url()` 是本仓库其它模块（public_data.rs / shop_catalog.rs）已经在用的写法。
-        .map_err(|e| format!("baidu: {}", e.without_url()))?
-        .json()
-        .await
-        .map_err(|e| format!("baidu json: {}", e.without_url()))?;
+    let resp: serde_json::Value =
+        response_json("baidu", HTTP.get(&url).timeout(SOURCE_TIMEOUT)).await?;
     if resp.get("status").and_then(|v| v.as_i64()) != Some(0) {
         let msg = resp
             .get("message")
@@ -1744,15 +1734,8 @@ async fn fetch_amap_places(
         limit.min(25),
         key,
     );
-    let resp: serde_json::Value = HTTP
-        .get(&url)
-        .timeout(SOURCE_TIMEOUT)
-        .send()
-        .await
-        .map_err(|e| format!("amap: {}", e.without_url()))?
-        .json()
-        .await
-        .map_err(|e| format!("amap json: {}", e.without_url()))?;
+    let resp: serde_json::Value =
+        response_json("amap", HTTP.get(&url).timeout(SOURCE_TIMEOUT)).await?;
     if resp.get("status").and_then(|v| v.as_str()) != Some("1") {
         let msg = resp
             .get("info")

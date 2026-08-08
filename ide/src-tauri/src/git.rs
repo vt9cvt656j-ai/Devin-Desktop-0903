@@ -4,8 +4,54 @@
 //! executable. This keeps the dependency surface small and matches whatever
 //! Git the user already has configured (hooks, includes, credentials, etc.).
 
+use crate::files::require_inside_workspace;
 use serde::Serialize;
 use std::path::{Component, Path, PathBuf};
+
+/// Verify that joining `root` and `rel` stays inside `root` after resolving
+/// `..` and other components.  Prevents path-traversal writes via crafted `rel`.
+fn require_rel_inside_root(root: &Path, rel: &str) -> Result<PathBuf, String> {
+    let joined = root.join(rel);
+    let mut resolved = root.to_path_buf();
+    for component in joined
+        .strip_prefix(root)
+        .unwrap_or(Path::new(rel))
+        .components()
+    {
+        match component {
+            Component::Normal(s) => resolved.push(s),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !resolved.starts_with(root) || resolved == root.to_path_buf() {
+                    return Err(format!(
+                        "path traversal denied: '{rel}' escapes repository root"
+                    ));
+                }
+                resolved.pop();
+                if !resolved.starts_with(root) {
+                    return Err(format!(
+                        "path traversal denied: '{rel}' escapes repository root"
+                    ));
+                }
+            }
+            _ => return Err(format!("disallowed path component in '{rel}'")),
+        }
+    }
+    if !resolved.starts_with(root) {
+        return Err(format!(
+            "path traversal denied: '{rel}' escapes repository root"
+        ));
+    }
+    Ok(resolved)
+}
+
+/// Reject a `root` that is not inside ALLOWED_ROOTS before any Git operation
+/// runs. This prevents the frontend from pointing `git -C` at an arbitrary
+/// directory on the user's machine.
+fn require_git_root(root: &str, is_write: bool) -> Result<(), String> {
+    require_inside_workspace(root, is_write)?;
+    Ok(())
+}
 
 /// A single changed path reported by `git status`.
 #[derive(Serialize)]
@@ -182,8 +228,12 @@ fn label_for(code: &str) -> &'static str {
 ///
 /// Returns `is_repo: false` (rather than an error) when `root` is not inside a
 /// Git work tree, so the frontend can show a tidy empty state.
-#[tauri::command]
+// Every Git command below launches the synchronous git executable. Force Tauri's
+// async dispatch so filesystem scans, hooks, credential prompts, and network
+// operations never run on the window event thread.
+#[tauri::command(async)]
 pub fn git_status(root: String) -> Result<GitStatus, String> {
+    require_git_root(&root, false)?;
     let inside = run_git(&root, &["rev-parse", "--is-inside-work-tree"])?;
     if !inside.status.success() {
         return Ok(GitStatus {
@@ -282,8 +332,9 @@ pub fn git_status(root: String) -> Result<GitStatus, String> {
 ///
 /// Used as the "original" side of a diff. Returns an empty string when the
 /// file does not exist at HEAD (e.g. a newly added or untracked file).
-#[tauri::command]
+#[tauri::command(async)]
 pub fn git_file_head(root: String, rel: String) -> Result<String, String> {
+    require_git_root(&root, false)?;
     let spec = format!("HEAD:{rel}");
     let out = run_git(&root, &["show", &spec])?;
     if out.status.success() {
@@ -299,8 +350,9 @@ pub fn git_file_head(root: String, rel: String) -> Result<String, String> {
 /// text — empty when there are no changes. Output is capped so a huge diff can't
 /// blow up the IPC payload; note that `git diff` never lists *untracked* files
 /// (use `git_status` for those).
-#[tauri::command]
+#[tauri::command(async)]
 pub fn git_diff(root: String, rel: Option<String>, staged: Option<bool>) -> Result<String, String> {
+    require_git_root(&root, false)?;
     let mut args: Vec<&str> = vec!["diff"];
     if staged.unwrap_or(false) {
         args.push("--cached");
@@ -451,8 +503,9 @@ fn ensure_clone_target_absent(target: &Path) -> Result<(), String> {
 /// The parent must already exist and the target itself must not. Sources are
 /// limited to normal Git network URLs, SCP-style SSH paths, and existing absolute
 /// local paths; dangerous remote-helper schemes are rejected before Git runs.
-#[tauri::command]
+#[tauri::command(async)]
 pub fn git_clone(source: String, target: String) -> Result<String, String> {
+    require_inside_workspace(&target, true)?;
     let source = validated_clone_source(&source)?;
     let target = validated_clone_target(&target)?;
     let parent = target
@@ -497,8 +550,9 @@ fn select_push_remote(remotes: &[String]) -> Result<String, String> {
 /// `michael/bon-<name>`（HEAD 派生）。同名残留先强制清掉。**撤销该候选 = git_worktree_remove。**
 /// 注意：worktree 不含被 gitignore 的依赖（如 node_modules）——上层若要在里面跑测试，需自行
 /// symlink/复用主仓库的依赖（前端 flow 已写明）。
-#[tauri::command]
+#[tauri::command(async)]
 pub fn git_worktree_add(root: String, name: String) -> Result<String, String> {
+    require_git_root(&root, true)?;
     let safe: String = name
         .chars()
         .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
@@ -520,14 +574,16 @@ pub fn git_worktree_add(root: String, name: String) -> Result<String, String> {
 }
 
 /// 列出当前所有 worktree（porcelain 文本）。
-#[tauri::command]
+#[tauri::command(async)]
 pub fn git_worktree_list(root: String) -> Result<String, String> {
+    require_git_root(&root, false)?;
     run_git_checked(&root, &["worktree", "list", "--porcelain"])
 }
 
 /// 移除一个 worktree（并尽力删掉它的临时分支）= 丢弃这个候选。
-#[tauri::command]
+#[tauri::command(async)]
 pub fn git_worktree_remove(root: String, path: String) -> Result<String, String> {
+    require_git_root(&root, true)?;
     run_git_checked(&root, &["worktree", "remove", "--force", &path])?;
     // 临时分支名从路径末段推回，best-effort 删除（删不掉不算错）。
     if let Some(seg) = path.rsplit('/').next() {
@@ -548,8 +604,9 @@ fn has_head(root: &str) -> bool {
 
 /// Stage a single path (`git add -- <rel>`). Works for new, modified, and
 /// deleted files alike.
-#[tauri::command]
+#[tauri::command(async)]
 pub fn git_stage(root: String, rel: String) -> Result<(), String> {
+    require_git_root(&root, true)?;
     run_git_checked(&root, &["add", "--", &rel]).map(|_| ())
 }
 
@@ -557,8 +614,9 @@ pub fn git_stage(root: String, rel: String) -> Result<(), String> {
 ///
 /// Uses `git restore --staged` normally, but `git rm --cached` when the repo
 /// has no commits yet (there is no HEAD to restore from).
-#[tauri::command]
+#[tauri::command(async)]
 pub fn git_unstage(root: String, rel: String) -> Result<(), String> {
+    require_git_root(&root, true)?;
     if has_head(&root) {
         run_git_checked(&root, &["restore", "--staged", "--", &rel]).map(|_| ())
     } else {
@@ -567,8 +625,9 @@ pub fn git_unstage(root: String, rel: String) -> Result<(), String> {
 }
 
 /// Stage every change in the worktree (`git add -A`).
-#[tauri::command]
+#[tauri::command(async)]
 pub fn git_stage_all(root: String) -> Result<(), String> {
+    require_git_root(&root, true)?;
     run_git_checked(&root, &["add", "-A"]).map(|_| ())
 }
 
@@ -576,8 +635,9 @@ pub fn git_stage_all(root: String) -> Result<(), String> {
 ///
 /// Uses `git reset` normally, falling back to `git rm -r --cached .` for a repo
 /// with no commits (no HEAD to reset to).
-#[tauri::command]
+#[tauri::command(async)]
 pub fn git_unstage_all(root: String) -> Result<(), String> {
+    require_git_root(&root, true)?;
     if has_head(&root) {
         run_git_checked(&root, &["reset", "--quiet"]).map(|_| ())
     } else {
@@ -586,8 +646,9 @@ pub fn git_unstage_all(root: String) -> Result<(), String> {
 }
 
 /// Commit the staged changes with `message`. Returns the short hash + subject.
-#[tauri::command]
+#[tauri::command(async)]
 pub fn git_commit(root: String, message: String) -> Result<String, String> {
+    require_git_root(&root, true)?;
     let msg = message.trim();
     if msg.is_empty() {
         return Err("Commit message is empty.".into());
@@ -603,8 +664,9 @@ pub fn git_commit(root: String, message: String) -> Result<String, String> {
 ///
 /// Returns combined stdout/stderr because git writes its progress to stderr
 /// even on success.
-#[tauri::command]
+#[tauri::command(async)]
 pub fn git_push(root: String) -> Result<String, String> {
+    require_git_root(&root, true)?;
     let symbolic = run_git(&root, &["symbolic-ref", "--quiet", "--short", "HEAD"])?;
     let branch = String::from_utf8_lossy(&symbolic.stdout).trim().to_string();
     if !symbolic.status.success() || branch.is_empty() {
@@ -673,8 +735,9 @@ pub struct GitBranches {
 }
 
 /// List local branches and report which one is checked out.
-#[tauri::command]
+#[tauri::command(async)]
 pub fn git_branches(root: String) -> Result<GitBranches, String> {
+    require_git_root(&root, false)?;
     let head = run_git(&root, &["rev-parse", "--abbrev-ref", "HEAD"])?;
     let mut current = String::from_utf8_lossy(&head.stdout).trim().to_string();
     if current == "HEAD" {
@@ -699,8 +762,9 @@ pub fn git_branches(root: String) -> Result<GitBranches, String> {
 }
 
 /// Switch to `branch`, optionally creating it first (`git checkout [-b]`).
-#[tauri::command]
+#[tauri::command(async)]
 pub fn git_checkout(root: String, branch: String, create: bool) -> Result<(), String> {
+    require_git_root(&root, true)?;
     let branch = branch.trim();
     if branch.is_empty() {
         return Err("Branch name is empty.".into());
@@ -730,8 +794,9 @@ pub struct GitLogEntry {
 }
 
 /// Return the last N commits (default 50) from all branches.
-#[tauri::command]
+#[tauri::command(async)]
 pub fn git_log(root: String, count: Option<usize>) -> Result<Vec<GitLogEntry>, String> {
+    require_git_root(&root, false)?;
     let n = count.unwrap_or(50).min(200);
     // %P = parent hashes (space-separated), %D = ref names
     let format = "%H%n%h%n%an%n%ar%n%s%n%P%n%D";
@@ -799,8 +864,9 @@ fn parse_log_entries(out: &str) -> Vec<GitLogEntry> {
 /// `git_file_head` only ever reads HEAD, so it cannot show an older version. A path
 /// that did not exist at that revision is not an error here: it is how an "added"
 /// commit looks, and the diff pane renders it as an empty left-hand side.
-#[tauri::command]
+#[tauri::command(async)]
 pub fn git_file_at(root: String, rel: String, rev: String) -> Result<String, String> {
+    require_git_root(&root, false)?;
     if rel.trim().is_empty() || rev.trim().is_empty() {
         return Ok(String::new());
     }
@@ -830,12 +896,13 @@ pub fn git_file_at(root: String, rel: String, rev: String) -> Result<String, Str
 ///
 /// `--` separates the pathspec from revisions. Without it a file whose name also
 /// matches a branch or tag makes git fail with "ambiguous argument".
-#[tauri::command]
+#[tauri::command(async)]
 pub fn git_file_log(
     root: String,
     rel: String,
     count: Option<usize>,
 ) -> Result<Vec<GitLogEntry>, String> {
+    require_git_root(&root, false)?;
     if rel.trim().is_empty() {
         return Ok(Vec::new());
     }
@@ -863,8 +930,9 @@ pub struct ConflictFile {
     name: String,
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn git_conflicts(root: String) -> Result<Vec<ConflictFile>, String> {
+    require_git_root(&root, false)?;
     let out = run_git(&root, &["diff", "--name-only", "--diff-filter=U"])?;
     if !out.status.success() {
         return Ok(Vec::new());
@@ -898,8 +966,11 @@ pub struct MergeVersions {
     merged: String,
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn git_merge_versions(root: String, rel: String) -> Result<MergeVersions, String> {
+    require_git_root(&root, false)?;
+    let root_path = PathBuf::from(&root);
+    let safe_path = require_rel_inside_root(&root_path, &rel)?;
     let base = run_git(&root, &["show", &format!(":1:{rel}")])
         .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
         .unwrap_or_default();
@@ -909,8 +980,7 @@ pub fn git_merge_versions(root: String, rel: String) -> Result<MergeVersions, St
     let theirs = run_git(&root, &["show", &format!(":3:{rel}")])
         .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
         .unwrap_or_default();
-    let root_path = PathBuf::from(&root);
-    let merged = std::fs::read_to_string(root_path.join(&rel)).unwrap_or_default();
+    let merged = std::fs::read_to_string(&safe_path).unwrap_or_default();
     Ok(MergeVersions {
         base,
         ours,
@@ -920,10 +990,11 @@ pub fn git_merge_versions(root: String, rel: String) -> Result<MergeVersions, St
 }
 
 /// Accept one side of a merge conflict for a file.
-#[tauri::command]
+#[tauri::command(async)]
 pub fn git_resolve_conflict(root: String, rel: String, resolution: String) -> Result<(), String> {
+    require_git_root(&root, true)?;
     let root_path = PathBuf::from(&root);
-    let file_path = root_path.join(&rel);
+    let file_path = require_rel_inside_root(&root_path, &rel)?;
     match resolution.as_str() {
         "ours" => {
             let ours = run_git(&root, &["show", &format!(":2:{rel}")])
@@ -946,8 +1017,9 @@ pub fn git_resolve_conflict(root: String, rel: String, resolution: String) -> Re
 }
 
 /// Stash the current working directory changes.
-#[tauri::command]
+#[tauri::command(async)]
 pub fn git_stash(root: String) -> Result<String, String> {
+    require_git_root(&root, true)?;
     let out = run_git(&root, &["stash", "push", "-m", "Michael IDE stash"])?;
     let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
     if out.status.success() {
@@ -964,8 +1036,9 @@ pub fn git_stash(root: String) -> Result<String, String> {
 /// Pop a stash entry, applying it and removing it from the stash list.
 ///
 /// Defaults to the most recent stash (`stash@{0}`) when no index is given.
-#[tauri::command]
+#[tauri::command(async)]
 pub fn git_stash_pop(root: String, index: Option<usize>) -> Result<String, String> {
+    require_git_root(&root, true)?;
     let spec = index.map(|i| format!("stash@{{{i}}}"));
     let mut args: Vec<&str> = vec!["stash", "pop"];
     if let Some(ref s) = spec {
@@ -990,8 +1063,9 @@ pub fn git_stash_pop(root: String, index: Option<usize>) -> Result<String, Strin
 }
 
 /// Apply a stash entry without removing it from the stash list.
-#[tauri::command]
+#[tauri::command(async)]
 pub fn git_stash_apply(root: String, index: usize) -> Result<String, String> {
+    require_git_root(&root, true)?;
     let spec = format!("stash@{{{index}}}");
     let out = run_git(&root, &["stash", "apply", &spec])?;
     let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
@@ -1012,8 +1086,9 @@ pub fn git_stash_apply(root: String, index: usize) -> Result<String, String> {
 }
 
 /// Drop (delete) a stash entry without applying it.
-#[tauri::command]
+#[tauri::command(async)]
 pub fn git_stash_drop(root: String, index: usize) -> Result<String, String> {
+    require_git_root(&root, true)?;
     let spec = format!("stash@{{{index}}}");
     let out = run_git(&root, &["stash", "drop", &spec])?;
     let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
@@ -1034,8 +1109,9 @@ pub fn git_stash_drop(root: String, index: usize) -> Result<String, String> {
 }
 
 /// List stash entries.
-#[tauri::command]
+#[tauri::command(async)]
 pub fn git_stash_list(root: String) -> Result<Vec<String>, String> {
+    require_git_root(&root, false)?;
     let out = run_git(&root, &["stash", "list"])?;
     if !out.status.success() {
         return Ok(Vec::new());
@@ -1057,8 +1133,9 @@ pub struct BlameLine {
     pub line: usize,
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn git_blame(root: String, rel: String) -> Result<Vec<BlameLine>, String> {
+    require_git_root(&root, false)?;
     let out = run_git(&root, &["blame", "--porcelain", "--", &rel])?;
     if !out.status.success() {
         return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
@@ -1096,8 +1173,9 @@ pub fn git_blame(root: String, rel: String) -> Result<Vec<BlameLine>, String> {
 ///
 /// Returns combined stdout/stderr because git reports progress on stderr even
 /// on success.
-#[tauri::command]
+#[tauri::command(async)]
 pub fn git_pull(root: String) -> Result<String, String> {
+    require_git_root(&root, true)?;
     // Newer Git versions refuse a divergent pull unless the user configured a
     // reconciliation strategy. The IDE's button is explicitly “拉取并合并”, so
     // pass the strategy every time and disable the merge-message editor.

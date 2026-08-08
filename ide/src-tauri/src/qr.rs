@@ -41,7 +41,16 @@ fn b64_decode(s: &str) -> Result<Vec<u8>, String> {
 /// Decode QR code(s) from an image. Provide `path` (a file on disk) OR `data_url`
 /// (base64 data URL). Returns every QR payload found in the image.
 #[tauri::command]
-pub fn decode_qr(path: Option<String>, data_url: Option<String>) -> Result<Vec<String>, String> {
+pub async fn decode_qr(
+    path: Option<String>,
+    data_url: Option<String>,
+) -> Result<Vec<String>, String> {
+    tauri::async_runtime::spawn_blocking(move || decode_qr_inner(path, data_url))
+        .await
+        .map_err(|error| format!("二维码解码任务失败: {error}"))?
+}
+
+fn decode_qr_inner(path: Option<String>, data_url: Option<String>) -> Result<Vec<String>, String> {
     let img = if let Some(p) = path.as_deref().filter(|p| !p.is_empty()) {
         image::open(p).map_err(|e| format!("打不开图片 {p}: {e}"))?
     } else if let Some(d) = data_url.as_deref().filter(|d| !d.is_empty()) {
@@ -70,4 +79,19 @@ pub fn decode_qr(path: Option<String>, data_url: Option<String>) -> Result<Vec<S
         );
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{b64_decode, decode_qr_inner};
+
+    #[test]
+    fn base64_decoder_handles_standard_payload() {
+        assert_eq!(b64_decode("aGVsbG8=").unwrap(), b"hello");
+    }
+
+    #[test]
+    fn missing_qr_input_is_an_error() {
+        assert!(decode_qr_inner(None, None).is_err());
+    }
 }
