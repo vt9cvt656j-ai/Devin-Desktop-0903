@@ -71,6 +71,15 @@ fn relay(status: u16, ct: &str, body: axum::body::Bytes) -> Response {
         .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
 }
 
+fn relay_with_task_id(status: u16, ct: &str, body: axum::body::Bytes, task_id: &str) -> Response {
+    axum::http::Response::builder()
+        .status(StatusCode::from_u16(status).unwrap_or(StatusCode::OK))
+        .header(axum::http::header::CONTENT_TYPE, ct)
+        .header("x-michael-task-id", task_id)
+        .body(axum::body::Body::from(body))
+        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+}
+
 // ── Replicate helper (poll until complete) ────────────────────────────
 async fn replicate_run(
     model: &str,
@@ -531,6 +540,12 @@ pub async fn generate_3d(
     // 2. Tripo key → pro quality. On any failure, fall through to free paths.
     if !tripo_key().is_empty() {
         if let Ok(result) = tripo_task(json!({"type":"text_to_model","prompt":prompt})).await {
+            let task_id = result
+                .get("data")
+                .and_then(|d| d.get("task_id"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
             let model_url = result
                 .get("data")
                 .and_then(|d| d.get("output"))
@@ -547,7 +562,7 @@ pub async fn generate_3d(
                         .unwrap_or("model/gltf-binary")
                         .to_string();
                     if let Ok(bytes) = dl.bytes().await {
-                        return Ok(relay(200, &ct, bytes));
+                        return Ok(relay_with_task_id(200, &ct, bytes, &task_id));
                     }
                 }
             }
@@ -856,6 +871,12 @@ pub async fn auto_rig(
         "original_model_task_id": original_task_id
     }))
     .await?;
+    let task_id = result
+        .get("data")
+        .and_then(|d| d.get("task_id"))
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| AppError::internal("Tripo 未返回绑定 task_id"))?
+        .to_string();
     let model_url = result
         .get("data")
         .and_then(|d| d.get("output"))
@@ -874,7 +895,7 @@ pub async fn auto_rig(
         .bytes()
         .await
         .map_err(|e| AppError::internal(e.to_string()))?;
-    Ok(relay(200, "model/gltf-binary", bytes))
+    Ok(relay_with_task_id(200, "model/gltf-binary", bytes, &task_id))
 }
 
 // ── POST /v1/game/generate-motion ─ Tripo3D animation ─────────────────
@@ -901,6 +922,12 @@ pub async fn generate_motion(
         "animation": prompt
     }))
     .await?;
+    let task_id = result
+        .get("data")
+        .and_then(|d| d.get("task_id"))
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| AppError::internal("Tripo 未返回动画 task_id"))?
+        .to_string();
     let model_url = result
         .get("data")
         .and_then(|d| d.get("output"))
@@ -919,7 +946,7 @@ pub async fn generate_motion(
         .bytes()
         .await
         .map_err(|e| AppError::internal(e.to_string()))?;
-    Ok(relay(200, "model/gltf-binary", bytes))
+    Ok(relay_with_task_id(200, "model/gltf-binary", bytes, &task_id))
 }
 
 // ── POST /v1/game/generate-texture ─ HF FLUX ─────────────────────────
