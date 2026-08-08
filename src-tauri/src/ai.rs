@@ -265,6 +265,19 @@ pub enum AiEvent {
         #[serde(skip_serializing_if = "Option::is_none")]
         status: Option<u16>,
     },
+    /// Why the model stopped generating, normalized onto the OpenAI vocabulary
+    /// (`stop` | `length` | `tool_calls` | `content_filter` | …).
+    ///
+    /// This is the ONLY authoritative signal that a response was cut off by the
+    /// output-token limit. It was previously never parsed at all, which left the
+    /// client's truncation guard with nothing but a JSON-shape heuristic — and that
+    /// heuristic cannot tell a tool-call argument object that was cut mid-stream from
+    /// one that is genuinely complete, because a truncated object can still be a valid
+    /// JSON *prefix*. A `write_file` whose `content` was severed by `max_tokens` is
+    /// exactly the case that must never reach execution.
+    FinishReason {
+        reason: String,
+    },
     Done,
     /// Token accounting from the final stream chunk — lets the UI show how much of
     /// the prompt was served from cache (the payoff of the prompt-cache work).
@@ -935,6 +948,19 @@ fn native_anthropic_event_has_real_progress(event: &serde_json::Value) -> bool {
             _ => false,
         },
         _ => false,
+    }
+}
+
+/// Map each provider's "why generation stopped" vocabulary onto the OpenAI spelling
+/// so the client has exactly one set of values to reason about. Anthropic's native
+/// stream reports `max_tokens` / `end_turn` / `tool_use` / `stop_sequence`; everything
+/// OpenAI-compatible already uses the target vocabulary and passes through unchanged.
+fn normalize_finish_reason(raw: &str) -> &str {
+    match raw {
+        "max_tokens" => "length",
+        "end_turn" | "stop_sequence" => "stop",
+        "tool_use" => "tool_calls",
+        other => other,
     }
 }
 
@@ -1832,6 +1858,72 @@ mod stream_timeout_tests {
         assert_eq!(tool_calls[1]["arguments"], "{\"path\":\"src/main.js\"}");
     }
 
+    #[test]
+    fn finish_reasons_are_normalized_onto_one_vocabulary() {
+        // Anthropic native -> OpenAI spelling
+        assert_eq!(normalize_finish_reason("max_tokens"), "length");
+        assert_eq!(normalize_finish_reason("end_turn"), "stop");
+        assert_eq!(normalize_finish_reason("stop_sequence"), "stop");
+        assert_eq!(normalize_finish_reason("tool_use"), "tool_calls");
+        // Already-OpenAI values pass through untouched
+        assert_eq!(normalize_finish_reason("length"), "length");
+        assert_eq!(normalize_finish_reason("tool_calls"), "tool_calls");
+        assert_eq!(normalize_finish_reason("content_filter"), "content_filter");
+    }
+
+    // `finish_reason` was never parsed at all, so a response cut off by the output-token
+    // limit looked identical to a complete one. That left the client's truncation guard
+    // with only a JSON-shape heuristic — which cannot detect a tool-call argument object
+    // that was severed at a point where it is still a valid JSON *prefix*.
+    #[tokio::test]
+    async fn openai_stream_reports_a_length_cutoff_to_the_client() {
+        let body = concat!(
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",",
+            "\"function\":{\"name\":\"write_file\",\"arguments\":\"{\\\"path\\\":\\\"a.js\\\"}\"}}]}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"length\"}]}\n\n",
+            "data: [DONE]\n\n",
+        )
+        .as_bytes()
+        .to_vec();
+
+        let (result, events) = run_raw_sse_body(body).await;
+
+        result.unwrap();
+        let finish = events
+            .iter()
+            .find(|event| event["kind"] == "finishReason")
+            .expect("a length cutoff must reach the client");
+        assert_eq!(finish["reason"], "length");
+    }
+
+    #[tokio::test]
+    async fn anthropic_stream_reports_a_max_tokens_cutoff_to_the_client() {
+        let frames = [
+            serde_json::json!({"type": "message_start", "message": {"id": "m", "type": "message"}}),
+            serde_json::json!({
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": {"type": "text_delta", "text": "partial"}
+            }),
+            serde_json::json!({"type": "message_delta", "delta": {"stop_reason": "max_tokens"}}),
+            serde_json::json!({"type": "message_stop"}),
+        ];
+        let body = frames
+            .iter()
+            .map(|frame| format!("event: {}\ndata: {}\n\n", frame["type"].as_str().unwrap(), frame))
+            .collect::<String>()
+            .into_bytes();
+
+        let (result, events) = run_raw_sse_body(body).await;
+
+        result.unwrap();
+        let finish = events
+            .iter()
+            .find(|event| event["kind"] == "finishReason")
+            .expect("Anthropic's max_tokens must reach the client");
+        assert_eq!(finish["reason"], "length", "normalized to the OpenAI spelling");
+    }
+
     #[tokio::test]
     async fn explicit_stream_options_rejection_is_not_replayed() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -2615,6 +2707,18 @@ async fn ai_chat_inner(
                     }
                     _ => {}
                 },
+                // Anthropic reports why it stopped on `message_delta`, using its own
+                // vocabulary (`max_tokens` / `end_turn` / `tool_use` / `stop_sequence`).
+                Some("message_delta") => {
+                    if let Some(reason) = v["delta"]["stop_reason"]
+                        .as_str()
+                        .filter(|reason| !reason.is_empty())
+                    {
+                        let _ = on_event.send(AiEvent::FinishReason {
+                            reason: normalize_finish_reason(reason).to_string(),
+                        });
+                    }
+                }
                 _ => {}
             }
             let delta = &v["choices"][0]["delta"];
@@ -2670,6 +2774,17 @@ async fn ai_chat_inner(
                         });
                     }
                 }
+            }
+            // Sibling of `delta`, not part of it: it arrives on the final chunk, where
+            // `delta` is typically `{}`. `length` here is the provider telling us the
+            // response was cut off — the client rejects any tool call in that turn.
+            if let Some(reason) = v["choices"][0]["finish_reason"]
+                .as_str()
+                .filter(|reason| !reason.is_empty())
+            {
+                let _ = on_event.send(AiEvent::FinishReason {
+                    reason: normalize_finish_reason(reason).to_string(),
+                });
             }
         }
         if consumed > 0 {
@@ -2880,10 +2995,21 @@ pub async fn web_fetch(url: String) -> Result<String, String> {
         .and_then(|v| v.to_str().ok())
         .unwrap_or("")
         .to_lowercase();
-    let bytes = resp.bytes().await.map_err(|e| e.to_string())?;
     let max = 800_000usize;
-    let slice = &bytes[..bytes.len().min(max)];
-    let raw = String::from_utf8_lossy(slice).to_string();
+    let mut response = resp;
+    let mut bytes =
+        Vec::with_capacity(response.content_length().unwrap_or(0).min(max as u64) as usize);
+    while bytes.len() < max {
+        let Some(chunk) = response.chunk().await.map_err(|e| e.to_string())? else {
+            break;
+        };
+        let remaining = max - bytes.len();
+        bytes.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
+        if chunk.len() >= remaining {
+            break;
+        }
+    }
+    let raw = String::from_utf8_lossy(&bytes).to_string();
 
     let text = if ct.contains("html") || raw.trim_start().starts_with('<') {
         html_to_text(&raw)
@@ -3037,6 +3163,7 @@ async fn ddg_search_multi(q: &str) -> Vec<(String, String, String)> {
 }
 
 const SEARCH_UA: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
+const MAX_SEARCH_RESPONSE_BYTES: usize = 800_000;
 
 /// A search should be fast; bound it much tighter than a page fetch. A source that hasn't
 /// answered in 8s is treated as blocked/dead so the race can settle on a working one.
@@ -3046,6 +3173,33 @@ fn search_client() -> Option<reqwest::Client> {
         .timeout(Duration::from_secs(8))
         .build()
         .ok()
+}
+
+/// Search result pages are only parsed for a few short result cards. Do not let
+/// an upstream error page or an accidentally unbounded response consume the
+/// process heap before the 8-second search deadline can take effect.
+async fn read_search_response_text(response: reqwest::Response) -> Result<String, reqwest::Error> {
+    if !response.status().is_success() {
+        return Ok(String::new());
+    }
+
+    let mut response = response;
+    let capacity = response
+        .content_length()
+        .unwrap_or_default()
+        .min(MAX_SEARCH_RESPONSE_BYTES as u64) as usize;
+    let mut bytes = Vec::with_capacity(capacity);
+    while bytes.len() < MAX_SEARCH_RESPONSE_BYTES {
+        let Some(chunk) = response.chunk().await? else {
+            break;
+        };
+        let remaining = MAX_SEARCH_RESPONSE_BYTES - bytes.len();
+        bytes.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
+        if chunk.len() >= remaining {
+            break;
+        }
+    }
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 
 async fn scrape_ddg_html(q: String) -> Vec<(String, String, String)> {
@@ -3060,8 +3214,7 @@ async fn scrape_ddg_html(q: String) -> Vec<(String, String, String)> {
         .send()
         .await;
     match resp {
-        Ok(r) => r
-            .text()
+        Ok(r) => read_search_response_text(r)
             .await
             .map(|h| parse_ddg_results(&h))
             .unwrap_or_default(),
@@ -3092,7 +3245,10 @@ async fn scrape_bing(q: String) -> Vec<(String, String, String)> {
         .send()
         .await;
     match resp {
-        Ok(r) => r.text().await.map(|h| parse_bing(&h)).unwrap_or_default(),
+        Ok(r) => read_search_response_text(r)
+            .await
+            .map(|h| parse_bing(&h))
+            .unwrap_or_default(),
         Err(_) => Vec::new(),
     }
 }
@@ -3117,7 +3273,10 @@ async fn scrape_google(q: String) -> Vec<(String, String, String)> {
         .send()
         .await;
     match resp {
-        Ok(r) => r.text().await.map(|h| parse_google(&h)).unwrap_or_default(),
+        Ok(r) => read_search_response_text(r)
+            .await
+            .map(|h| parse_google(&h))
+            .unwrap_or_default(),
         Err(_) => Vec::new(),
     }
 }
@@ -3217,8 +3376,7 @@ async fn scrape_ddg_lite(q: String) -> Vec<(String, String, String)> {
         .send()
         .await;
     match resp {
-        Ok(r) => r
-            .text()
+        Ok(r) => read_search_response_text(r)
             .await
             .map(|h| parse_ddg_lite(&h))
             .unwrap_or_default(),
@@ -3322,24 +3480,13 @@ fn parse_bing(html: &str) -> Vec<(String, String, String)> {
     while let Some(rel) = html[from..].find("b_algo") {
         let abs = from + rel;
         from = abs + 6;
-        let max_end = (abs + 4000).min(html.len());
-        // Safety: ensure end byte index is a valid UTF-8 char boundary
-        let end = if max_end < html.len() {
-            match html[max_end..].find(|c: char| c.is_ascii()) {
-                Some(off) => max_end + off,
-                None => {
-                    // No ASCII found → walk backward until we hit a char boundary
-                    let mut fallback = max_end;
-                    while fallback > abs && !html[..fallback].is_char_boundary(fallback) {
-                        fallback -= 1;
-                    }
-                    fallback
-                }
-            }
-        } else {
-            max_end
-        };
-        let region = &html[abs..end]; // bound the per-result scan, safe char boundaries
+        let mut end = (abs + 4000).min(html.len());
+        // A byte limit can land in the middle of a multi-byte character. Check
+        // the original string before slicing; slicing first is itself a panic.
+        while end > abs && !html.is_char_boundary(end) {
+            end -= 1;
+        }
+        let region = &html[abs..end];
         let (href, title) = region
             .find("<a ")
             .and_then(|a| {
@@ -3374,6 +3521,57 @@ fn parse_bing(html: &str) -> Vec<(String, String, String)> {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod search_result_parser_tests {
+    use super::{parse_bing, read_search_response_text, MAX_SEARCH_RESPONSE_BYTES};
+    use std::io::{Read, Write};
+
+    #[test]
+    fn bing_region_limit_never_slices_inside_utf8() {
+        let mut html = String::from(
+            r#"<li class="b_algo"><h2><a href="https://example.com">中文标题</a></h2><p>中文摘要</p>"#,
+        );
+        let result_start = html.find("b_algo").unwrap();
+        let byte_limit = result_start + 4000;
+        html.push_str(&"x".repeat(byte_limit - 1 - html.len()));
+        html.push('中');
+        html.push_str("</li>");
+
+        assert!(!html.is_char_boundary(byte_limit));
+        let results = parse_bing(&html);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].0, "中文标题");
+        assert_eq!(results[0].1, "https://example.com");
+        assert_eq!(results[0].2, "中文摘要");
+    }
+
+    #[tokio::test]
+    async fn search_response_read_stops_at_the_page_cap() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let _ = socket.read(&mut [0_u8; 4096]);
+            let body = "x".repeat(MAX_SEARCH_RESPONSE_BYTES + 64);
+            let header = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            let _ = socket.write_all(header.as_bytes());
+            let _ = socket.write_all(body.as_bytes());
+        });
+
+        let response = reqwest::Client::new()
+            .get(format!("http://{address}/"))
+            .send()
+            .await
+            .unwrap();
+        let body = read_search_response_text(response).await.unwrap();
+        assert_eq!(body.len(), MAX_SEARCH_RESPONSE_BYTES);
+        server.join().unwrap();
+    }
 }
 
 /// Parse the simple `lite.duckduckgo.com/lite/` results table.
