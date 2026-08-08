@@ -122,6 +122,15 @@ fn find_session_slot(name: &str) -> Result<Option<SessionSlot>, String> {
     Ok(guard.get(name).map(Arc::clone))
 }
 
+/// Remove a session from its per-server slot, but return it to the caller so
+/// `Session::drop` (kill + wait) happens after the slot mutex is released.
+/// Requests for one MCP server remain serialized by that mutex; only teardown
+/// no longer makes a later request wait behind process reaping.
+fn take_slot_value<T>(slot: &Mutex<Option<T>>) -> Result<Option<T>, String> {
+    let mut active = slot.lock().map_err(|_| "MCP session state poisoned")?;
+    Ok(active.take())
+}
+
 /// Kill + reap ALL connected MCP servers. Wired into `cleanup_stale` (webview reload) and the app
 /// Exit handler in lib.rs — same as LSP/DAP/Terminal — so MCP children never survive a reload or a
 /// quit. Drains + drops on a detached thread (each `Session::drop` does kill()+blocking wait()) so a
@@ -906,19 +915,23 @@ fn request_on_session(
     timeout_secs: u64,
 ) -> Result<Value, String> {
     let slot = find_session_slot(name)?.ok_or_else(|| format!("MCP 服务「{name}」未连接"))?;
-    let mut active = slot.lock().map_err(|_| "MCP session state poisoned")?;
-    let session = active
-        .as_mut()
-        .ok_or_else(|| format!("MCP 服务「{name}」未连接"))?;
-    let response = session.request(method, params, timeout_secs);
-    let dead_process = response.is_err() && matches!(session.child.try_wait(), Ok(Some(_)));
-    let unhealthy = response
-        .as_ref()
-        .err()
-        .is_some_and(|error| transport_session_error(error));
-    if dead_process || unhealthy {
-        active.take();
-    }
+    let (response, retired) = {
+        let mut active = slot.lock().map_err(|_| "MCP session state poisoned")?;
+        let session = active
+            .as_mut()
+            .ok_or_else(|| format!("MCP 服务「{name}」未连接"))?;
+        let response = session.request(method, params, timeout_secs);
+        let dead_process = response.is_err() && matches!(session.child.try_wait(), Ok(Some(_)));
+        let unhealthy = response
+            .as_ref()
+            .err()
+            .is_some_and(|error| transport_session_error(error));
+        let retired = (dead_process || unhealthy).then(|| active.take()).flatten();
+        (response, retired)
+    };
+    // Session::drop kills and waits for the child. It must never run under the
+    // per-server lock, otherwise same-name reconnect/status/calls queue behind it.
+    drop(retired);
     response
 }
 
@@ -987,28 +1000,29 @@ pub async fn mcp_status(name: String) -> Result<bool, String> {
         let Some(slot) = find_session_slot(&name)? else {
             return Ok(false);
         };
-        let mut active = slot.lock().map_err(|_| "MCP session state poisoned")?;
-        let dead = match active.as_mut() {
-            Some(session) => session
+        let (running, retired) = {
+            let mut active = slot.lock().map_err(|_| "MCP session state poisoned")?;
+            let Some(session) = active.as_mut() else {
+                return Ok(false);
+            };
+            let dead = session
                 .child
                 .try_wait()
                 .map(|status| status.is_some())
-                .map_err(|e| format!("无法检查 MCP 服务状态: {e}"))?,
-            None => return Ok(false),
+                .map_err(|e| format!("无法检查 MCP 服务状态: {e}"))?;
+            if dead {
+                (false, active.take())
+            } else {
+                let ping = session.request("ping", json!({}), 3);
+                if ping.is_err() {
+                    (false, active.take())
+                } else {
+                    (true, None)
+                }
+            }
         };
-        if dead {
-            active.take();
-            return Ok(false);
-        }
-        let ping = active
-            .as_mut()
-            .expect("checked above")
-            .request("ping", json!({}), 3);
-        if ping.is_err() {
-            active.take();
-            return Ok(false);
-        }
-        Ok(true)
+        drop(retired);
+        Ok(running)
     })
     .await
     .map_err(|e| e.to_string())?
@@ -1021,10 +1035,7 @@ pub async fn mcp_disconnect(name: String) -> Result<(), String> {
         let Some(slot) = find_session_slot(&name)? else {
             return Ok(());
         };
-        let session = slot
-            .lock()
-            .map_err(|_| "MCP session state poisoned")?
-            .take();
+        let session = take_slot_value(&slot)?;
         drop(session);
         Ok(())
     })
@@ -1035,6 +1046,22 @@ pub async fn mcp_disconnect(name: String) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    struct SlotDropProbe {
+        slot: std::sync::Weak<Mutex<Option<SlotDropProbe>>>,
+        dropped_after_unlock: Arc<AtomicBool>,
+    }
+
+    impl Drop for SlotDropProbe {
+        fn drop(&mut self) {
+            let unlocked = self
+                .slot
+                .upgrade()
+                .is_some_and(|slot| slot.try_lock().is_ok());
+            self.dropped_after_unlock.store(unlocked, Ordering::SeqCst);
+        }
+    }
 
     fn fixture_path() -> String {
         std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -1116,6 +1143,21 @@ mod tests {
     }
 
     #[test]
+    fn slot_value_is_destroyed_only_after_its_mutex_is_released() {
+        let slot: Arc<Mutex<Option<SlotDropProbe>>> = Arc::new(Mutex::new(None));
+        let dropped_after_unlock = Arc::new(AtomicBool::new(false));
+        *slot.lock().unwrap() = Some(SlotDropProbe {
+            slot: Arc::downgrade(&slot),
+            dropped_after_unlock: Arc::clone(&dropped_after_unlock),
+        });
+
+        let retired = take_slot_value(slot.as_ref()).unwrap();
+        assert!(slot.lock().unwrap().is_none());
+        drop(retired);
+        assert!(dropped_after_unlock.load(Ordering::SeqCst));
+    }
+
+    #[test]
     fn media_content_enforces_a_total_inline_budget() {
         let first = "A".repeat(MAX_INLINE_MCP_MEDIA_BASE64);
         let second = "B".repeat(MAX_TOTAL_INLINE_MCP_MEDIA_BASE64 - MAX_INLINE_MCP_MEDIA_BASE64);
@@ -1178,6 +1220,40 @@ mod tests {
 
         mcp_disconnect(session_name.clone()).await.unwrap();
         assert!(!mcp_status(session_name).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn transport_failure_evicts_a_request_session_before_reaping_it() {
+        let session_name = format!("fixture-request-failure-{}", std::process::id());
+        connect_fixture(&session_name, None).await.unwrap();
+
+        let error = mcp_call(session_name.clone(), "exit".into(), None)
+            .await
+            .expect_err("exiting fixture must fail the pending request");
+        assert!(
+            error.contains("MCP 服务已退出") || error.contains("工具报错"),
+            "{error}"
+        );
+        let slot = find_session_slot(&session_name).unwrap().unwrap();
+        assert!(slot.lock().unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn failed_status_ping_evicts_the_session_before_reaping_it() {
+        let session_name = format!("fixture-status-failure-{}", std::process::id());
+        connect_fixture(
+            &session_name,
+            Some(HashMap::from([(
+                "MCP_FIXTURE_IGNORE_PING".to_string(),
+                "1".to_string(),
+            )])),
+        )
+        .await
+        .unwrap();
+
+        assert!(!mcp_status(session_name.clone()).await.unwrap());
+        let slot = find_session_slot(&session_name).unwrap().unwrap();
+        assert!(slot.lock().unwrap().is_none());
     }
 
     #[tokio::test]

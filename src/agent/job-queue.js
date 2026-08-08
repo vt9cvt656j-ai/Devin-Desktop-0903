@@ -14,7 +14,10 @@ class JobQueue {
   constructor(options = {}) {
     this.jobs = new Map(); // jobId -> JobConfig
     this.pendingPromises = new Map(); // jobId -> Set<{resolve,reject}>
-    this.maxConcurrent = options.maxConcurrent || parseInt(import.meta.env?.MAX_SUBAGENTS_CONCURRENT || '5');
+    const configuredConcurrency = Number(options.maxConcurrent ?? import.meta.env?.MAX_SUBAGENTS_CONCURRENT ?? 5);
+    this.maxConcurrent = Number.isFinite(configuredConcurrency)
+      ? Math.max(1, Math.floor(configuredConcurrency))
+      : 5;
     this.tokenBudget = Math.max(1, Number(options.tokenBudget || 100000));
     this.tokenWarningThreshold = options.tokenWarningThreshold || 80;
     this.runner = typeof options.runner === 'function' ? options.runner : null;
@@ -23,8 +26,10 @@ class JobQueue {
     this.sharedStore = options.sharedStore || getSharedStore();
     
     this.activeCount = 0;
+    this.pendingJobs = [];
     this.totalExecuted = 0;
     this.totalTokens = 0;
+    this.stopped = false;
     
     // 事件总线
     this.eventHandlers = new Map();
@@ -41,6 +46,9 @@ class JobQueue {
    * @returns {string} jobId
    */
   async submit(config) {
+    if (this.stopped) {
+      throw new Error('JobQueue is stopped; no new submissions accepted');
+    }
     const {
       id: providedId,
       tool,
@@ -106,10 +114,15 @@ class JobQueue {
     if (['completed', 'failed', 'aborted'].includes(job.status)) return false;
     job.abort = true;
     try { job.abortController?.abort(); } catch {}
-    // Queued jobs have not entered the runner yet and can settle immediately.
-    // Running jobs settle after the injected runner returns so the concurrency
-    // counter remains truthful while it releases resources.
-    if (job.status === 'pending') this._settleJob(job, 'aborted', null, new Error('Job aborted by user'));
+    if (job.status === 'pending') {
+      const pendingIndex = this.pendingJobs.indexOf(job);
+      if (pendingIndex >= 0) this.pendingJobs.splice(pendingIndex, 1);
+      this._settleJob(job, 'aborted', null, new Error('Job aborted by user'));
+    } else if (job.executionPromise) {
+      // A third-party runner may ignore AbortSignal forever. _runAgent races the
+      // signal, so this waits only for our queue wrapper to release its slot.
+      await job.executionPromise;
+    }
     return true;
   }
 
@@ -192,11 +205,17 @@ class JobQueue {
    * 停止所有 jobs
    */
   async stopAll() {
+    this.stopped = true;
+    if (this.monitorTimer) {
+      clearInterval(this.monitorTimer);
+      this.monitorTimer = null;
+    }
     const promises = [];
     for (const [jobId] of this.jobs.entries()) {
       promises.push(this.abort(jobId));
     }
     await Promise.all(promises);
+    this.pendingJobs.length = 0;
     return true;
   }
 
@@ -220,40 +239,32 @@ class JobQueue {
   // ==================== 私有方法 ====================
 
   _scheduleJob(jobConfig) {
-    // 检查是否需要等待
-    if (this.activeCount >= this.maxConcurrent) {
-      console.log(`[JobQueue] Queue full (${this.activeCount}/${this.maxConcurrent}), waiting...`);
-      
-      // 等待有空闲槽位
-      this._waitForSlot().then(() => {
-        this._executeJob(jobConfig);
-      });
-      return;
-    }
-    
-    // 立即执行
-    this._executeJob(jobConfig);
+    this.pendingJobs.push(jobConfig);
+    this._drainQueue();
   }
 
-  async _waitForSlot() {
-    return new Promise(resolve => {
-      const check = () => {
-        if (this.activeCount < this.maxConcurrent) {
-          resolve();
-        } else {
-          setTimeout(check, 100);
-        }
-      };
-      check();
-    });
+  _drainQueue() {
+    while (!this.stopped && this.activeCount < this.maxConcurrent && this.pendingJobs.length) {
+      const jobConfig = this.pendingJobs.shift();
+      if (!jobConfig || jobConfig.abort || jobConfig.status !== 'pending') continue;
+      // Reserve the slot synchronously. If several jobs are queued, no two
+      // continuations can observe the same free slot and oversubscribe it.
+      this.activeCount++;
+      const execution = this._executeJob(jobConfig);
+      jobConfig.executionPromise = execution;
+      void execution.finally(() => {
+        if (jobConfig.executionPromise === execution) jobConfig.executionPromise = null;
+      });
+    }
   }
 
   async _executeJob(jobConfig) {
     if (jobConfig.abort) {
       this._settleJob(jobConfig, 'aborted', null, new Error('Job aborted before start'));
+      this.activeCount--;
+      this._drainQueue();
       return;
     }
-    this.activeCount++;
     jobConfig.status = 'running';
     jobConfig.startedAt = Date.now();
     
@@ -267,15 +278,20 @@ class JobQueue {
       } else {
         this._settleJob(jobConfig, 'completed', result);
         if (jobConfig.onComplete) {
-          try { await jobConfig.onComplete(result); }
-          catch (err) { console.error('[JobQueue] onComplete callback error:', err); }
+          Promise.resolve().then(() => jobConfig.onComplete(result))
+            .catch((err) => console.error('[JobQueue] onComplete callback error:', err));
         }
       }
     } catch (error) {
-      console.error('[JobQueue] Job failed:', jobConfig.id, error);
-      this._settleJob(jobConfig, 'failed', null, error);
+      if (jobConfig.abort) {
+        this._settleJob(jobConfig, 'aborted', null, error);
+      } else {
+        console.error('[JobQueue] Job failed:', jobConfig.id, error);
+        this._settleJob(jobConfig, 'failed', null, error);
+      }
     } finally {
       this.activeCount--;
+      this._drainQueue();
     }
   }
 
@@ -285,6 +301,7 @@ class JobQueue {
       throw new Error('JobQueue requires an injected runner; refusing to simulate an agent job');
     }
     const reportProgress = (update = {}) => {
+      if (jobConfig.abort || ['completed', 'failed', 'aborted'].includes(jobConfig.status)) return;
       const progress = Number.isFinite(Number(update.progress))
         ? Math.max(0, Math.min(100, Number(update.progress)))
         : undefined;
@@ -295,13 +312,31 @@ class JobQueue {
         catch (error) { console.error('[JobQueue] onProgress callback error:', error); }
       }
     };
-    const result = await runner(jobConfig, {
+    const runnerPromise = Promise.resolve().then(() => runner(jobConfig, {
       args: jobConfig.args,
       config: jobConfig.runnerConfig,
       signal: jobConfig.abortController?.signal,
       isAborted: () => !!jobConfig.abort,
       reportProgress,
-    });
+    }));
+    const signal = jobConfig.abortController?.signal;
+    let result;
+    if (!signal) {
+      result = await runnerPromise;
+    } else if (signal.aborted) {
+      throw new Error('Job aborted by user');
+    } else {
+      let onAbort;
+      const aborted = new Promise((_, reject) => {
+        onAbort = () => reject(new Error('Job aborted by user'));
+        signal.addEventListener('abort', onAbort, { once: true });
+      });
+      try {
+        result = await Promise.race([runnerPromise, aborted]);
+      } finally {
+        signal.removeEventListener('abort', onAbort);
+      }
+    }
     const used = Number(result?.tokensUsed);
     if (Number.isFinite(used) && used >= 0) {
       jobConfig.tokensUsed = used;
@@ -359,11 +394,11 @@ class JobQueue {
 
   _startMonitoring() {
     // 每分钟输出统计
-    const timer = setInterval(() => {
+    this.monitorTimer = setInterval(() => {
       const stats = this.stats();
       console.log('[JobQueue] Stats:', stats);
     }, 60000);
-    if (typeof timer?.unref === 'function') timer.unref();
+    if (typeof this.monitorTimer?.unref === 'function') this.monitorTimer.unref();
   }
 
   // 事件系统

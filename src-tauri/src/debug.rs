@@ -94,7 +94,7 @@ fn encode_dap_message(content: &str) -> String {
     format!("Content-Length: {}\r\n\r\n{}", content.len(), content)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn dap_start(
     state: State<DebugManager>,
     config: DapConfig,
@@ -180,39 +180,18 @@ pub fn dap_start(
     let evt = on_event.clone();
     std::thread::spawn(move || {
         let mut reader = BufReader::new(stdout);
-        let mut header_buf = String::new();
         loop {
-            header_buf.clear();
-            match reader.read_line(&mut header_buf) {
-                Ok(0) => break,
-                Err(_) => break,
-                _ => {}
-            }
-            let trimmed = header_buf.trim();
-            if trimmed.is_empty() {
-                continue;
-            }
-            if let Some(len_str) = trimmed.strip_prefix("Content-Length:") {
-                let content_len: usize = match len_str.trim().parse() {
-                    Ok(n) => n,
-                    Err(_) => continue,
-                };
-                // Cap up-front allocation against a huge/garbage Content-Length so
-                // a misbehaving debug adapter can't OOM us.
-                if content_len > 64 * 1024 * 1024 {
+            let body = match crate::content_length_frame::read_frame(&mut reader) {
+                Ok(Some(body)) => body,
+                Ok(None) => break,
+                Err(error) => {
+                    tracing::warn!("[dap-{adapter}] invalid protocol frame: {error}");
                     break;
                 }
-                let mut sep = String::new();
-                let _ = reader.read_line(&mut sep);
-
-                let mut body = vec![0u8; content_len];
-                if std::io::Read::read_exact(&mut reader, &mut body).is_err() {
-                    break;
-                }
-                let data = String::from_utf8_lossy(&body).to_string();
-                if evt.send(DapEvent::Message { data }).is_err() {
-                    break;
-                }
+            };
+            let data = String::from_utf8_lossy(&body).to_string();
+            if evt.send(DapEvent::Message { data }).is_err() {
+                break;
             }
         }
         let _ = evt.send(DapEvent::Stopped { adapter });
@@ -237,7 +216,7 @@ pub fn dap_start(
     Ok(())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn dap_send(
     state: State<DebugManager>,
     adapter_id: String,
@@ -252,11 +231,17 @@ pub fn dap_send(
         .map_err(|e| format!("failed to send to DAP: {e}"))
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn dap_stop(state: State<DebugManager>, adapter_id: String) -> Result<(), String> {
-    let mut inner = state.inner.lock().map_err(|e| e.to_string())?;
-    if let Some(mut proc) = inner.remove(&adapter_id) {
+    let removed = {
+        let mut inner = state.inner.lock().map_err(|e| e.to_string())?;
+        inner.remove(&adapter_id)
+    };
+    if let Some(mut proc) = removed {
         let _ = proc.child.kill();
+        // DapProcess::drop waits for the adapter. Do that after releasing the
+        // manager lock so dap_send/list never queue behind process shutdown.
+        drop(proc);
     }
     Ok(())
 }
@@ -267,7 +252,7 @@ pub struct DapInfo {
     running: bool,
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn dap_list(state: State<DebugManager>) -> Result<Vec<DapInfo>, String> {
     let mut inner = state.inner.lock().map_err(|e| e.to_string())?;
     prune_stopped(&mut inner);

@@ -9,7 +9,10 @@
 use serde::Serialize;
 use std::io::{BufRead, BufReader};
 use std::process::{Child, Stdio};
-use std::sync::Mutex;
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc, Mutex,
+};
 use tauri::ipc::Channel;
 
 const FLOW_MARKER: &str = "__MFLOW__";
@@ -98,6 +101,12 @@ struct SystemProxyBackup {
 static SYSTEM_PROXY_BACKUP: std::sync::Mutex<Option<SystemProxyBackup>> =
     std::sync::Mutex::new(None);
 
+// Proxy-setting commands must not overlap, but they must never hold the backup
+// mutex while invoking networksetup.
+#[cfg(target_os = "macos")]
+static SYSTEM_PROXY_OPERATION: once_cell::sync::Lazy<Mutex<()>> =
+    once_cell::sync::Lazy::new(|| Mutex::new(()));
+
 #[cfg(target_os = "macos")]
 fn networksetup(args: &[&str]) -> Result<String, String> {
     let out = crate::process_util::command("networksetup")
@@ -127,14 +136,15 @@ fn parse_proxy_readout(text: &str) -> (bool, String, String) {
     )
 }
 
-/// 把系统代理恢复成我们改动之前的样子。没有备份（不是我们开的）就什么都不做。
+/// Restore the saved proxy while the caller owns SYSTEM_PROXY_OPERATION.
+/// The backup lock is held only long enough to take the saved state.
 #[cfg(target_os = "macos")]
-fn restore_system_proxy() {
+fn restore_system_proxy_locked() -> bool {
     let backup = match SYSTEM_PROXY_BACKUP.lock() {
         Ok(mut g) => g.take(),
         Err(_) => None,
     };
-    let Some(b) = backup else { return };
+    let Some(b) = backup else { return false };
     let svc = b.service.as_str();
     if b.http_on && !b.http_server.is_empty() {
         let _ = networksetup(&["-setwebproxy", svc, &b.http_server, &b.http_port]);
@@ -148,6 +158,16 @@ fn restore_system_proxy() {
     } else {
         let _ = networksetup(&["-setsecurewebproxystate", svc, "off"]);
     }
+    true
+}
+
+/// 把系统代理恢复成我们改动之前的样子。没有备份（不是我们开的）就什么都不做。
+#[cfg(target_os = "macos")]
+fn restore_system_proxy() {
+    let Ok(_operation) = SYSTEM_PROXY_OPERATION.lock() else {
+        return;
+    };
+    let _ = restore_system_proxy_locked();
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -156,22 +176,88 @@ fn restore_system_proxy() {}
 struct Running {
     child: Child,
     port: u16,
+    generation: u64,
+    // A process that lost the start race was never published as the active
+    // proxy. Its cleanup must therefore only terminate the child: it must not
+    // clear a newer port or restore a proxy owned by another lifecycle.
+    owns_lifecycle: bool,
 }
 
 impl Drop for Running {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
-        set_active_port(None); // capture stopped → browser stops routing through it
-                               // 代理进程没了，系统代理就必须跟着还原 —— 否则整机流量继续指向一个死端口。
-                               // 这里覆盖所有退出路径：正常停止、应用退出、以及 panic 时的栈展开。
-        restore_system_proxy();
+        if self.owns_lifecycle {
+            set_active_port(None); // capture stopped → browser stops routing through it
+                                   // 代理进程没了，系统代理就必须跟着还原 —— 否则整机流量继续指向一个死端口。
+                                   // 这里覆盖所有退出路径：正常停止、应用退出、以及 panic 时的栈展开。
+            restore_system_proxy();
+        }
     }
 }
 
-#[derive(Default)]
+enum ProxySlot {
+    Idle,
+    Starting { generation: u64 },
+    Stopping { generation: u64 },
+    Running(Running),
+}
+
+impl ProxySlot {
+    fn reserve_start(&mut self, generation: u64) -> bool {
+        if matches!(self, Self::Idle) {
+            *self = Self::Starting { generation };
+            true
+        } else {
+            false
+        }
+    }
+
+    fn accepts_start(&self, generation: u64) -> bool {
+        matches!(self, Self::Starting { generation: current } if *current == generation)
+    }
+
+    fn finish_stop(&mut self, generation: u64) {
+        if matches!(self, Self::Stopping { generation: current } if *current == generation) {
+            *self = Self::Idle;
+        }
+    }
+
+    /// Reserve teardown before returning a child. A start that is still doing
+    /// blocking setup also becomes Stopping, so a new start cannot overlap it.
+    fn stop(&mut self) -> Option<Running> {
+        match std::mem::replace(self, Self::Idle) {
+            Self::Running(running) => {
+                *self = Self::Stopping {
+                    generation: running.generation,
+                };
+                Some(running)
+            }
+            Self::Starting { generation } => {
+                *self = Self::Stopping { generation };
+                None
+            }
+            Self::Stopping { generation } => {
+                *self = Self::Stopping { generation };
+                None
+            }
+            Self::Idle => None,
+        }
+    }
+}
+
 pub struct ProxyState {
-    inner: Mutex<Option<Running>>,
+    inner: Arc<Mutex<ProxySlot>>,
+    next_generation: AtomicU64,
+}
+
+impl Default for ProxyState {
+    fn default() -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(ProxySlot::Idle)),
+            next_generation: AtomicU64::new(0),
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -205,10 +291,9 @@ pub fn proxy_available() -> bool {
 
 #[tauri::command]
 pub fn proxy_status(state: tauri::State<ProxyState>) -> ProxyStatus {
-    let guard = state.inner.lock().unwrap();
-    let (running, port) = match guard.as_ref() {
-        Some(r) => (true, r.port),
-        None => (false, 0),
+    let (running, port) = match &*state.inner.lock().unwrap() {
+        ProxySlot::Running(running) => (true, running.port),
+        ProxySlot::Idle | ProxySlot::Starting { .. } | ProxySlot::Stopping { .. } => (false, 0),
     };
     let mitm = {
         let r = crate::process_util::resolve_command("mitmdump", None);
@@ -227,18 +312,11 @@ pub fn proxy_status(state: tauri::State<ProxyState>) -> ProxyStatus {
     }
 }
 
-/// Start capturing: spawn mitmdump with the bridge addon and stream each flow to `on_flow`.
-#[tauri::command]
-pub fn proxy_start(
-    state: tauri::State<ProxyState>,
+fn start_proxy_process(
     port: u16,
+    generation: u64,
     on_flow: Channel<serde_json::Value>,
-) -> Result<(), String> {
-    let mut guard = state.inner.lock().map_err(|e| e.to_string())?;
-    if guard.is_some() {
-        return Err("抓包代理已在运行".into());
-    }
-
+) -> Result<Running, String> {
     // Write the bridge addon to a stable temp path.
     let script = std::env::temp_dir().join("michael_ide_mitm_bridge.py");
     std::fs::write(&script, BRIDGE_ADDON).map_err(|e| format!("写入桥接脚本失败: {e}"))?;
@@ -284,15 +362,89 @@ pub fn proxy_start(
         }
     });
 
-    *guard = Some(Running { child, port });
-    set_active_port(Some(port)); // browser.rs routes the automation browser through this port
-    Ok(())
+    Ok(Running {
+        child,
+        port,
+        generation,
+        owns_lifecycle: false,
+    })
+}
+
+/// Start capturing: spawn mitmdump with the bridge addon and stream each flow to `on_flow`.
+#[tauri::command]
+pub async fn proxy_start(
+    state: tauri::State<'_, ProxyState>,
+    port: u16,
+    on_flow: Channel<serde_json::Value>,
+) -> Result<(), String> {
+    let generation = state
+        .next_generation
+        .fetch_add(1, Ordering::Relaxed)
+        .wrapping_add(1);
+    {
+        let mut slot = state.inner.lock().map_err(|e| e.to_string())?;
+        if !slot.reserve_start(generation) {
+            return Err("抓包代理已在运行".into());
+        }
+    }
+
+    let inner = Arc::clone(&state.inner);
+    tauri::async_runtime::spawn_blocking(move || {
+        let running = match start_proxy_process(port, generation, on_flow) {
+            Ok(running) => running,
+            Err(error) => {
+                if let Ok(mut slot) = inner.lock() {
+                    // A cancelled start is represented as Stopping until this
+                    // worker has actually finished its blocking setup path.
+                    slot.finish_stop(generation);
+                    if slot.accepts_start(generation) {
+                        *slot = ProxySlot::Idle;
+                    }
+                }
+                return Err(error);
+            }
+        };
+
+        let stale = {
+            let mut slot = inner.lock().map_err(|e| e.to_string())?;
+            if slot.accepts_start(generation) {
+                let mut running = running;
+                running.owns_lifecycle = true;
+                *slot = ProxySlot::Running(running);
+                set_active_port(Some(port));
+                None
+            } else {
+                Some(running)
+            }
+        };
+        if let Some(running) = stale {
+            drop(running);
+            if let Ok(mut slot) = inner.lock() {
+                slot.finish_stop(generation);
+            }
+            Err("抓包代理启动已取消".into())
+        } else {
+            Ok(())
+        }
+    })
+    .await
+    .map_err(|e| format!("抓包代理启动任务失败: {e}"))?
 }
 
 #[tauri::command]
-pub fn proxy_stop(state: tauri::State<ProxyState>) -> Result<(), String> {
-    let mut guard = state.inner.lock().map_err(|e| e.to_string())?;
-    *guard = None; // Drop kills + reaps mitmdump
+pub async fn proxy_stop(state: tauri::State<'_, ProxyState>) -> Result<(), String> {
+    let running = {
+        let mut slot = state.inner.lock().map_err(|e| e.to_string())?;
+        slot.stop()
+    };
+    if let Some(running) = running {
+        let generation = running.generation;
+        tauri::async_runtime::spawn_blocking(move || drop(running))
+            .await
+            .map_err(|e| format!("抓包代理停止任务失败: {e}"))?;
+        let mut slot = state.inner.lock().map_err(|e| e.to_string())?;
+        slot.finish_stop(generation);
+    }
     Ok(())
 }
 
@@ -306,54 +458,61 @@ pub fn proxy_ca_path() -> Option<String> {
 /// macOS: point the active network service's HTTP+HTTPS proxy at 127.0.0.1:<port> (or turn it off),
 /// so ALL apps route through the capture proxy — the "真·小黄鸟" whole-system capture.
 #[tauri::command]
-pub fn proxy_set_system_proxy(enable: bool, port: u16) -> Result<(), String> {
+pub async fn proxy_set_system_proxy(enable: bool, port: u16) -> Result<(), String> {
     #[cfg(target_os = "macos")]
     {
-        // Find the primary active network service (the one with a default route).
-        let svc = macos_primary_service()?;
-        let run = |args: &[&str]| -> Result<(), String> {
-            let out = crate::process_util::command("networksetup")
-                .args(args)
-                .output()
-                .map_err(|e| format!("networksetup 失败: {e}"))?;
-            if out.status.success() {
-                Ok(())
-            } else {
-                Err(String::from_utf8_lossy(&out.stderr).to_string())
+        tauri::async_runtime::spawn_blocking(move || {
+            // Serialize complete transactions, while keeping SYSTEM_PROXY_BACKUP
+            // free during route/networksetup subprocess calls.
+            let _operation = SYSTEM_PROXY_OPERATION.lock().map_err(|e| e.to_string())?;
+            if !enable {
+                if restore_system_proxy_locked() {
+                    return Ok(());
+                }
+                let svc = macos_primary_service()?;
+                let _ = networksetup(&["-setwebproxystate", &svc, "off"]);
+                let _ = networksetup(&["-setsecurewebproxystate", &svc, "off"]);
+                return Ok(());
             }
-        };
-        let p = port.to_string();
-        if enable {
-            // 先记下原状态再改。只在第一次开启时记，避免重复开启把我们自己写的值当成
-            // "用户原本的设置"存下来。
-            if let Ok(mut g) = SYSTEM_PROXY_BACKUP.lock() {
-                if g.is_none() {
-                    let http = networksetup(&["-getwebproxy", &svc]).unwrap_or_default();
-                    let https = networksetup(&["-getsecurewebproxy", &svc]).unwrap_or_default();
-                    let (h_on, h_srv, h_port) = parse_proxy_readout(&http);
-                    let (s_on, s_srv, s_port) = parse_proxy_readout(&https);
-                    *g = Some(SystemProxyBackup {
-                        service: svc.clone(),
-                        http_on: h_on,
-                        http_server: h_srv,
-                        http_port: h_port,
-                        https_on: s_on,
-                        https_server: s_srv,
-                        https_port: s_port,
-                    });
+
+            let svc = macos_primary_service()?;
+            let backup_needed = SYSTEM_PROXY_BACKUP
+                .lock()
+                .map_err(|e| e.to_string())?
+                .is_none();
+            let backup = if backup_needed {
+                let http = networksetup(&["-getwebproxy", &svc]).unwrap_or_default();
+                let https = networksetup(&["-getsecurewebproxy", &svc]).unwrap_or_default();
+                let (http_on, http_server, http_port) = parse_proxy_readout(&http);
+                let (https_on, https_server, https_port) = parse_proxy_readout(&https);
+                Some(SystemProxyBackup {
+                    service: svc.clone(),
+                    http_on,
+                    http_server,
+                    http_port,
+                    https_on,
+                    https_server,
+                    https_port,
+                })
+            } else {
+                None
+            };
+            if let Some(backup) = backup {
+                let mut saved = SYSTEM_PROXY_BACKUP.lock().map_err(|e| e.to_string())?;
+                if saved.is_none() {
+                    *saved = Some(backup);
                 }
             }
-            run(&["-setwebproxy", &svc, "127.0.0.1", &p])?;
-            run(&["-setsecurewebproxy", &svc, "127.0.0.1", &p])?;
-            run(&["-setwebproxystate", &svc, "on"])?;
-            run(&["-setsecurewebproxystate", &svc, "on"])?;
-        } else {
-            // 还原用户原本的设置，而不是一律关掉 —— 他可能本来就配着公司代理。
-            restore_system_proxy();
-            run(&["-setwebproxystate", &svc, "off"]).ok();
-            run(&["-setsecurewebproxystate", &svc, "off"]).ok();
-        }
-        Ok(())
+
+            let port = port.to_string();
+            networksetup(&["-setwebproxy", &svc, "127.0.0.1", &port])?;
+            networksetup(&["-setsecurewebproxy", &svc, "127.0.0.1", &port])?;
+            networksetup(&["-setwebproxystate", &svc, "on"])?;
+            networksetup(&["-setsecurewebproxystate", &svc, "on"])?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| format!("系统代理设置任务失败: {e}"))?
     }
     #[cfg(not(target_os = "macos"))]
     {
@@ -404,11 +563,71 @@ fn macos_primary_service() -> Result<String, String> {
 }
 
 pub fn stop_all(state: &ProxyState) {
-    if let Ok(mut g) = state.inner.lock() {
-        *g = None; // Running::drop 会顺带还原系统代理
-    }
+    let running = state.inner.lock().ok().and_then(|mut slot| slot.stop());
+    // Release lifecycle state before Running::drop kills/waits and restores the
+    // system proxy. Shutdown is off the interactive path, so no async handoff.
+    drop(running);
     // 即使当时没有在跑的 Running（比如只开了系统代理没起 mitmdump），也要还原。
     restore_system_proxy();
+}
+
+#[cfg(test)]
+mod proxy_lifecycle_tests {
+    use super::*;
+
+    #[test]
+    fn cancelled_start_blocks_a_new_generation_until_its_worker_finishes() {
+        let mut slot = ProxySlot::Idle;
+        assert!(slot.reserve_start(1));
+        assert!(slot.accepts_start(1));
+
+        // Stop can arrive while mitmdump resolution/spawn is still blocking.
+        // It invalidates that start, but reserves cleanup before another start
+        // is admitted, so the stale worker cannot affect a new generation.
+        assert!(slot.stop().is_none());
+        assert!(matches!(slot, ProxySlot::Stopping { generation: 1 }));
+        assert!(!slot.accepts_start(1));
+        assert!(!slot.reserve_start(2));
+
+        // This models the old worker finishing after cancellation. Only then
+        // can the next generation become the current owner.
+        slot.finish_stop(1);
+        assert!(matches!(slot, ProxySlot::Idle));
+        assert!(slot.reserve_start(2));
+        assert!(slot.accepts_start(2));
+        assert!(!slot.accepts_start(1));
+    }
+
+    #[test]
+    fn stale_cleanup_cannot_finish_a_newer_lifecycle() {
+        let mut slot = ProxySlot::Stopping { generation: 7 };
+        slot.finish_stop(6);
+        assert!(matches!(slot, ProxySlot::Stopping { generation: 7 }));
+
+        slot.finish_stop(7);
+        assert!(matches!(slot, ProxySlot::Idle));
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn unpublished_old_teardown_cannot_clear_a_new_active_port() {
+        // This is the side effect that used to make a newly started proxy
+        // disappear from browser routing: an old, cancelled start dropped its
+        // child after the new owner had published its port.
+        let child = crate::process_util::command("sh")
+            .args(["-c", "sleep 30"])
+            .spawn()
+            .expect("start disposable child");
+        set_active_port(Some(18443)); // generation 2 is already active
+        drop(Running {
+            child,
+            port: 18442,
+            generation: 1,
+            owns_lifecycle: false,
+        });
+        assert_eq!(active_proxy_port(), Some(18443));
+        set_active_port(None);
+    }
 }
 
 #[cfg(all(test, target_os = "macos"))]

@@ -54,6 +54,18 @@ fn run_cmd_bounded(program: &str, args: &[&str], timeout_ms: u64) -> Result<Stri
     Ok(out)
 }
 
+/// System control is implemented with synchronous OS subprocesses. Keep those
+/// waits off Tokio's worker threads so several slow apps cannot stall unrelated
+/// Tauri commands that share the async runtime.
+async fn run_system_call<F>(call: F) -> Result<String, String>
+where
+    F: FnOnce() -> Result<String, String> + Send + 'static,
+{
+    tauri::async_runtime::spawn_blocking(call)
+        .await
+        .map_err(|error| format!("系统控制任务失败: {error}"))?
+}
+
 /// Run a UI-automation script on the host: JXA via osascript on macOS, PowerShell on
 /// Windows. Each caller supplies BOTH; the platform picks one. (cfg confined here so the
 /// command bodies below stay platform-agnostic and compile-check on every OS.)
@@ -263,6 +275,10 @@ fn do_open(_name: &str, _bg: bool) -> Result<String, String> {
 /// Launch an app, or bring it to the front if already running — instant app switching.
 #[tauri::command]
 pub async fn system_open_app(name: String, background: Option<bool>) -> Result<String, String> {
+    run_system_call(move || system_open_app_inner(name, background)).await
+}
+
+fn system_open_app_inner(name: String, background: Option<bool>) -> Result<String, String> {
     let name = name.trim().to_string();
     if name.is_empty() {
         return Err("system open 需要 name（App 名，如 \"Finder\"/\"Safari\"/\"Notepad\"）".into());
@@ -272,8 +288,12 @@ pub async fn system_open_app(name: String, background: Option<bool>) -> Result<S
 
 /// List running (non-background) apps + the current frontmost one.
 #[tauri::command]
-#[cfg_attr(target_os = "linux", allow(unreachable_code))]
 pub async fn system_list_apps() -> Result<String, String> {
+    run_system_call(system_list_apps_inner).await
+}
+
+#[cfg_attr(target_os = "linux", allow(unreachable_code))]
+fn system_list_apps_inner() -> Result<String, String> {
     #[cfg(target_os = "linux")]
     return lx::list_apps();
     let macos = r##"(function(){
@@ -300,8 +320,12 @@ pub async fn system_list_apps() -> Result<String, String> {
 
 /// List an app's open windows (index + title), so the agent can jump to a specific one.
 #[tauri::command]
-#[cfg_attr(target_os = "linux", allow(unreachable_code))]
 pub async fn system_app_windows(name: String) -> Result<String, String> {
+    run_system_call(move || system_app_windows_inner(name)).await
+}
+
+#[cfg_attr(target_os = "linux", allow(unreachable_code))]
+fn system_app_windows_inner(name: String) -> Result<String, String> {
     #[cfg(target_os = "linux")]
     return lx::windows(&name);
     let njs = serde_json::to_string(&name).map_err(|e| e.to_string())?;
@@ -328,8 +352,12 @@ pub async fn system_app_windows(name: String) -> Result<String, String> {
 
 /// Activate an app and raise the window whose title contains `title` (or the first one).
 #[tauri::command]
-#[cfg_attr(target_os = "linux", allow(unreachable_code))]
 pub async fn system_focus_window(name: String, title: Option<String>) -> Result<String, String> {
+    run_system_call(move || system_focus_window_inner(name, title)).await
+}
+
+#[cfg_attr(target_os = "linux", allow(unreachable_code))]
+fn system_focus_window_inner(name: String, title: Option<String>) -> Result<String, String> {
     #[cfg(target_os = "linux")]
     return lx::focus(&name, title.as_deref().unwrap_or(""));
     let njs = serde_json::to_string(&name).map_err(|e| e.to_string())?;
@@ -372,8 +400,12 @@ const PS_UIA_HEAD: &str = "$ErrorActionPreference='SilentlyContinue';Add-Type -A
 /// Trigger a menu item by PATH, e.g. ["File","New Tab"] or ["Format","Font","Bold"].
 /// app=None → the current frontmost app. A 1-element path opens that top menu.
 #[tauri::command]
-#[cfg_attr(target_os = "linux", allow(unreachable_code, unused_variables))]
 pub async fn system_menu(app: Option<String>, path: Vec<String>) -> Result<String, String> {
+    run_system_call(move || system_menu_inner(app, path)).await
+}
+
+#[cfg_attr(target_os = "linux", allow(unreachable_code, unused_variables))]
+fn system_menu_inner(app: Option<String>, path: Vec<String>) -> Result<String, String> {
     #[cfg(target_os = "linux")]
     return lx::menu_unsupported();
     if path.is_empty() {
@@ -432,8 +464,12 @@ pub async fn system_menu(app: Option<String>, path: Vec<String>) -> Result<Strin
 /// List the item names under a menu path (path=[] → top-level menu titles), so the agent
 /// can discover the EXACT names to feed system_menu.
 #[tauri::command]
-#[cfg_attr(target_os = "linux", allow(unreachable_code, unused_variables))]
 pub async fn system_menu_items(app: Option<String>, path: Vec<String>) -> Result<String, String> {
+    run_system_call(move || system_menu_items_inner(app, path)).await
+}
+
+#[cfg_attr(target_os = "linux", allow(unreachable_code, unused_variables))]
+fn system_menu_items_inner(app: Option<String>, path: Vec<String>) -> Result<String, String> {
     #[cfg(target_os = "linux")]
     return lx::menu_unsupported();
     let ajs = match &app {
@@ -486,8 +522,12 @@ pub async fn system_menu_items(app: Option<String>, path: Vec<String>) -> Result
 
 /// What's frontmost right now (app + its front window title).
 #[tauri::command]
-#[cfg_attr(target_os = "linux", allow(unreachable_code))]
 pub async fn system_frontmost() -> Result<String, String> {
+    run_system_call(system_frontmost_inner).await
+}
+
+#[cfg_attr(target_os = "linux", allow(unreachable_code))]
+fn system_frontmost_inner() -> Result<String, String> {
     #[cfg(target_os = "linux")]
     return lx::frontmost();
     let macos = r##"(function(){
@@ -503,4 +543,26 @@ pub async fn system_frontmost() -> Result<String, String> {
         fg = PS_FG
     );
     run_native(macos, &windows, 3000)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::run_system_call;
+    use std::time::{Duration, Instant};
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn system_subprocess_wait_does_not_block_async_runtime() {
+        let started = Instant::now();
+        let blocking = tokio::spawn(run_system_call(|| {
+            std::thread::sleep(Duration::from_millis(400));
+            Ok("done".to_string())
+        }));
+
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        assert!(
+            started.elapsed() < Duration::from_millis(250),
+            "blocking system work stalled the current-thread async runtime"
+        );
+        assert_eq!(blocking.await.unwrap().unwrap(), "done");
+    }
 }

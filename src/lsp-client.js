@@ -200,7 +200,7 @@ class LspClient {
         break;
       case "stopped":
         this.log(`[stopped] ${ev.lang}`);
-        this.manager._handleStopped(this.lang);
+        this.manager._handleStopped(this.lang, this);
         break;
       default:
         break;
@@ -643,12 +643,13 @@ export function createLspManager(options) {
     return clients.get(model.getLanguageId()) || null;
   }
 
-  function _handleStopped(langId) {
+  function _handleStopped(langId, stoppedClient) {
     const client = clients.get(langId);
-    if (client) {
-      client.shutdown();
-      clients.delete(langId);
-    }
+    // The event belongs to the channel that emitted it. A final stopped event
+    // from a manually replaced server must not remove the new client.
+    if (!client || (stoppedClient && client !== stoppedClient)) return;
+    client.shutdown();
+    clients.delete(langId);
     // Drop any debounced didChange still queued for this language: firing it after
     // the server died would push a document version to a dead client (and, once a
     // fresh server starts, arrive out of order before its didOpen). refreshWorkspace
@@ -707,7 +708,7 @@ export function createLspManager(options) {
       onStatus?.();
       return client;
     } catch (e) {
-      clients.delete(langId);
+      if (clients.get(langId) === client) clients.delete(langId);
       const msg = String(e && e.message ? e.message : e);
       const alreadyRunning = /already running/i.test(msg);
       if (alreadyRunning) { onLog?.(`[lsp] ${langId}: ${msg}`); return null; }

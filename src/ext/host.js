@@ -71,10 +71,9 @@ export class ExtensionHost {
    */
   constructor(ctx) {
     this.ctx = ctx;
-    /** id -> { manifest, worker, commands:Set<string>, ready:Promise } */
+    /** id -> { manifest, worker, commands:Set<string>, pendingInvocations:Map } */
     this.active = new Map();
     this.rpcSeq = 0;
-    this.pending = new Map(); // reqId -> { resolve, reject }
   }
 
   notifyChange() {
@@ -93,7 +92,7 @@ export class ExtensionHost {
       return;
     }
     const worker = new SandboxWorker();
-    const entry = { manifest, worker, commands: new Set() };
+    const entry = { manifest, worker, commands: new Set(), pendingInvocations: new Map() };
     this.active.set(manifest.id, entry);
     worker.onmessage = (event) => this.handleMessage(manifest.id, event.data);
     worker.onerror = (err) =>
@@ -110,6 +109,11 @@ export class ExtensionHost {
   deactivate(id) {
     const entry = this.active.get(id);
     if (!entry) return;
+    // A terminated Worker never returns invokeResult. Settle all callers now so
+    // disabling/uninstalling an extension cannot leave listeners and 30s timers alive.
+    for (const reqId of [...entry.pendingInvocations.keys()]) {
+      this.settleInvocation(entry, reqId, false);
+    }
     try {
       entry.worker.postMessage({ t: "deactivate" });
     } catch {
@@ -118,6 +122,7 @@ export class ExtensionHost {
     // Give the worker a moment to run deactivate(), then terminate.
     setTimeout(() => entry.worker.terminate(), 60);
     for (const key of [...this.statusKeysFor(id)]) this.ctx.removeStatusBarItem(key);
+    this._statusKeys?.delete(id);
     this.active.delete(id);
     this.notifyChange();
   }
@@ -148,6 +153,25 @@ export class ExtensionHost {
     this._statusKeys = this._statusKeys || new Map();
     if (!this._statusKeys.has(id)) this._statusKeys.set(id, new Set());
     this._statusKeys.get(id).add(key);
+  }
+
+  forgetStatusKey(id, key) {
+    const keys = this._statusKeys?.get(id);
+    if (!keys) return;
+    keys.delete(key);
+    if (!keys.size) this._statusKeys.delete(id);
+  }
+
+  settleInvocation(entry, reqId, ok, message = "") {
+    const pending = entry?.pendingInvocations?.get(reqId);
+    if (!pending || pending.settled) return false;
+    pending.settled = true;
+    entry.pendingInvocations.delete(reqId);
+    entry.worker.removeEventListener("message", pending.onMessage);
+    clearTimeout(pending.timer);
+    if (message) this.ctx.showInformationMessage?.(message);
+    pending.resolve(ok);
+    return true;
   }
 
   handleMessage(extId, msg) {
@@ -209,6 +233,7 @@ export class ExtensionHost {
       case "window.removeStatusBarItem": {
         const key = `${entry.manifest.id}::${args[0]}`;
         this.ctx.removeStatusBarItem(key);
+        this.forgetStatusKey(entry.manifest.id, key);
         return null;
       }
       case "editor.getText":
@@ -268,28 +293,24 @@ export class ExtensionHost {
       if (entry.commands.has(commandId)) {
         const reqId = `i${this.rpcSeq++}`;
         return new Promise((resolve) => {
-          // Time-box the wait so a worker that crashes / is terminated before it
-          // replies can't leak this listener and Promise forever.
-          let timer = 0;
-          const cleanup = () => {
-            entry.worker.removeEventListener("message", onMsg);
-            if (timer) clearTimeout(timer);
-          };
-          const onMsg = (event) => {
+          const onMessage = (event) => {
             const m = event.data;
             if (m && m.t === "invokeResult" && m.reqId === reqId) {
-              cleanup();
-              if (!m.ok) this.ctx.showInformationMessage?.(`Command failed: ${m.error}`);
-              resolve(m.ok);
+              this.settleInvocation(entry, reqId, !!m.ok,
+                m.ok ? "" : `Command failed: ${m.error}`);
             }
           };
-          entry.worker.addEventListener("message", onMsg);
-          timer = setTimeout(() => {
-            cleanup();
-            this.ctx.showInformationMessage?.(`Command timed out: ${commandId}`);
-            resolve(false);
+          const pending = { resolve, onMessage, timer: 0, settled: false };
+          entry.pendingInvocations.set(reqId, pending);
+          entry.worker.addEventListener("message", onMessage);
+          pending.timer = setTimeout(() => {
+            this.settleInvocation(entry, reqId, false, `Command timed out: ${commandId}`);
           }, 30000);
-          entry.worker.postMessage({ t: "invoke", id: commandId, reqId, args: [] });
+          try {
+            entry.worker.postMessage({ t: "invoke", id: commandId, reqId, args: [] });
+          } catch {
+            this.settleInvocation(entry, reqId, false);
+          }
         });
       }
     }

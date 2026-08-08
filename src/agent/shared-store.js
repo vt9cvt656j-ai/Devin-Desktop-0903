@@ -97,6 +97,22 @@ class SharedStore {
   }
 
   /**
+   * 判断键是否存在，并与 get() 使用相同的 TTL 语义。
+   * 直接暴露 Map.has 会把已经过期、但尚未等到后台清理的记录误报为存在。
+   */
+  has(key) {
+    const fullPath = this._normalizeKey(key);
+    if (!this.memory.has(fullPath)) return false;
+    const expiry = this.ttlMap.get(fullPath);
+    if (expiry && Date.now() > expiry) {
+      this.delete(fullPath);
+      return false;
+    }
+    this._updateLRU(fullPath, 1);
+    return true;
+  }
+
+  /**
    * 删除键
    * @param {string|Array<string>} keys 
    */
@@ -113,11 +129,21 @@ class SharedStore {
       const keysToDelete = [...this.memory.keys()].filter((candidate) =>
         candidate === fullPath || candidate.startsWith(`${fullPath}.`));
       for (const candidate of keysToDelete) {
-        this._removeListeners(candidate);
         this.ttlMap.delete(candidate);
         this._updateLRU(candidate, -1);
         this.memory.delete(candidate);
         deletedCount++;
+      }
+
+      // Subscribers commonly listen to a child path such as
+      // `jobs.<id>.findings` while the coherent job record itself is stored only
+      // at `jobs.<id>`. Deriving listener cleanup from memory keys therefore
+      // leaves those callbacks alive after TTL/history cleanup, retaining the
+      // whole collaboration closure. Clear the listener namespace directly.
+      for (const listenerKey of [...this.listeners.keys()]) {
+        if (listenerKey === fullPath || listenerKey.startsWith(`${fullPath}.`)) {
+          this._removeListeners(listenerKey);
+        }
       }
     }
     
@@ -272,6 +298,7 @@ class SharedStore {
     // 添加 timestamp 和元数据
     const enrichedFinding = {
       ...finding,
+      source: finding.source === jobId ? jobId : (finding.isExternal ? String(finding.source || '') : jobId),
       timestamp: Date.now(),
       jobId // 反溯来源
     };
@@ -450,7 +477,11 @@ class SharedStore {
       const oldestKey = this.accessOrder.shift();
       this.memory.delete(oldestKey);
       this.ttlMap.delete(oldestKey);
-      this._removeListeners(oldestKey);
+      for (const listenerKey of [...this.listeners.keys()]) {
+        if (listenerKey === oldestKey || listenerKey.startsWith(`${oldestKey}.`)) {
+          this._removeListeners(listenerKey);
+        }
+      }
       console.log('[SharedStore] Evicted oldest entry:', oldestKey);
     }
   }

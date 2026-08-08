@@ -1,6 +1,9 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+const MAX_GATEWAY_JSON_BYTES: usize = 8 * 1024 * 1024;
+const MAX_GATEWAY_ERROR_BYTES: usize = 64 * 1024;
+
 fn asset_client() -> Result<reqwest::Client, String> {
     reqwest::Client::builder()
         .timeout(Duration::from_secs(300))
@@ -38,6 +41,87 @@ fn safe_dest(root: &str, sub: &str, name: &str, ext: &str) -> Result<PathBuf, St
     Ok(target)
 }
 
+async fn response_bytes_limited(
+    mut response: reqwest::Response,
+    limit: usize,
+    label: &str,
+) -> Result<Vec<u8>, String> {
+    if let Some(length) = response.content_length() {
+        if length > limit as u64 {
+            return Err(format!(
+                "{label}响应过大（{length} 字节，上限 {limit} 字节）"
+            ));
+        }
+    }
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(|e| e.to_string())? {
+        if bytes.len().saturating_add(chunk.len()) > limit {
+            return Err(format!("{label}响应超过 {limit} 字节"));
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(bytes)
+}
+
+async fn stream_asset_to_path(
+    mut response: reqwest::Response,
+    target: &Path,
+) -> Result<u64, String> {
+    use tokio::io::AsyncWriteExt;
+
+    let extension = target
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or("asset");
+    let temporary = target.with_extension(format!(
+        "{extension}.michael-download-{}.part",
+        uuid::Uuid::new_v4()
+    ));
+    let download = async {
+        let mut file = tokio::fs::File::create(&temporary)
+            .await
+            .map_err(|e| format!("创建临时文件失败: {e}"))?;
+        let mut written = 0_u64;
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .map_err(|e| format!("下载读取失败: {e}"))?
+        {
+            file.write_all(&chunk)
+                .await
+                .map_err(|e| format!("写入临时文件失败: {e}"))?;
+            written = written.saturating_add(chunk.len() as u64);
+        }
+        file.flush()
+            .await
+            .map_err(|e| format!("刷新临时文件失败: {e}"))?;
+        drop(file);
+        if written == 0 {
+            return Err("下载结果为空".to_string());
+        }
+
+        match tokio::fs::rename(&temporary, target).await {
+            Ok(()) => Ok(written),
+            Err(first_error) if target.exists() => {
+                tokio::fs::remove_file(target)
+                    .await
+                    .map_err(|e| format!("替换旧资产失败: {e}"))?;
+                tokio::fs::rename(&temporary, target)
+                    .await
+                    .map_err(|e| format!("保存资产失败（{first_error}; {e}）"))?;
+                Ok(written)
+            }
+            Err(error) => Err(format!("保存资产失败: {error}")),
+        }
+    }
+    .await;
+
+    if download.is_err() {
+        let _ = tokio::fs::remove_file(&temporary).await;
+    }
+    download
+}
+
 async fn gateway_post(
     base_url: &str,
     api_key: &str,
@@ -52,10 +136,11 @@ async fn gateway_post(
         .send()
         .await
         .map_err(|e| format!("请求失败: {e}"))?;
-    let status = resp.status().as_u16();
-    if status != 200 {
-        let text = resp.text().await.unwrap_or_default();
-        return Err(format!("网关返回 {status}: {text}"));
+    let status = resp.status();
+    if !status.is_success() {
+        let bytes = response_bytes_limited(resp, MAX_GATEWAY_ERROR_BYTES, "网关错误").await?;
+        let text = String::from_utf8_lossy(&bytes);
+        return Err(format!("网关返回 {}: {text}", status.as_u16()));
     }
     Ok(resp)
 }
@@ -74,6 +159,12 @@ async fn gateway_download(
     ext: &str,
 ) -> Result<serde_json::Value, String> {
     let resp = gateway_post(base_url, api_key, action, body).await?;
+    let task_id = resp
+        .headers()
+        .get("x-michael-task-id")
+        .and_then(|v| v.to_str().ok())
+        .filter(|v| !v.trim().is_empty())
+        .map(str::to_owned);
 
     let ct = resp
         .headers()
@@ -82,45 +173,109 @@ async fn gateway_download(
         .unwrap_or("")
         .to_string();
 
-    let bytes = resp.bytes().await.map_err(|e| format!("下载失败: {e}"))?;
-    if bytes.is_empty() {
-        return Err("生成结果为空".into());
-    }
-
     if ct.contains("application/json") {
-        let j: serde_json::Value =
+        let bytes = response_bytes_limited(resp, MAX_GATEWAY_JSON_BYTES, "网关 JSON").await?;
+        if bytes.is_empty() {
+            return Err("生成结果为空".into());
+        }
+        let mut j: serde_json::Value =
             serde_json::from_slice(&bytes).map_err(|e| format!("JSON 解析失败: {e}"))?;
         if let Some(err) = j.get("error").and_then(|v| v.as_str()) {
             return Err(err.to_string());
         }
-        if let Some(url) = j.get("download_url").and_then(|v| v.as_str()) {
-            let file_bytes = asset_client()?
+        if let Some(task_id) = task_id.as_ref() {
+            if let Some(object) = j.as_object_mut() {
+                object
+                    .entry("task_id")
+                    .or_insert_with(|| serde_json::Value::String(task_id.clone()));
+            }
+        }
+        if let Some(url) = j
+            .get("download_url")
+            .and_then(|v| v.as_str())
+            .map(str::to_owned)
+        {
+            let response = asset_client()?
                 .get(url)
                 .timeout(Duration::from_secs(120))
                 .send()
                 .await
-                .map_err(|e| format!("下载文件失败: {e}"))?
-                .bytes()
-                .await
-                .map_err(|e| e.to_string())?;
+                .map_err(|e| format!("下载文件失败: {e}"))?;
+            let status = response.status();
+            if !status.is_success() {
+                let bytes =
+                    response_bytes_limited(response, MAX_GATEWAY_ERROR_BYTES, "资产下载错误")
+                        .await?;
+                return Err(format!(
+                    "下载文件 HTTP {}: {}",
+                    status.as_u16(),
+                    String::from_utf8_lossy(&bytes)
+                ));
+            }
+            let content_type = response
+                .headers()
+                .get(reqwest::header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or("")
+                .to_string();
+            if !downloadable_asset_content_type(ext, &content_type) {
+                return Err(format!("下载文件失败: 不接受的响应类型 {content_type}"));
+            }
             let target = safe_dest(root, sub_dir, name, ext)?;
-            std::fs::write(&target, &file_bytes).map_err(|e| format!("写入失败: {e}"))?;
+            let written = stream_asset_to_path(response, &target).await?;
             let rel = target.strip_prefix(root).unwrap_or(&target);
-            return Ok(serde_json::json!({
+            let mut output = serde_json::json!({
                 "path": rel.to_string_lossy(),
-                "bytes": file_bytes.len(),
-            }));
+                "bytes": written,
+            });
+            if let Some(task_id) = task_id {
+                output["task_id"] = serde_json::Value::String(task_id);
+            }
+            return Ok(output);
         }
         return Ok(j);
     }
 
+    if !downloadable_asset_content_type(ext, &ct) {
+        return Err(format!("生成失败: 不接受的响应类型 {ct}"));
+    }
     let target = safe_dest(root, sub_dir, name, ext)?;
-    std::fs::write(&target, &bytes).map_err(|e| format!("写入失败: {e}"))?;
+    let written = stream_asset_to_path(resp, &target).await?;
     let rel = target.strip_prefix(root).unwrap_or(&target);
-    Ok(serde_json::json!({
+    let mut output = serde_json::json!({
         "path": rel.to_string_lossy(),
-        "bytes": bytes.len(),
-    }))
+        "bytes": written,
+    });
+    if let Some(task_id) = task_id {
+        output["task_id"] = serde_json::Value::String(task_id);
+    }
+    Ok(output)
+}
+
+fn downloadable_asset_content_type(ext: &str, content_type: &str) -> bool {
+    let media_type = content_type
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    if media_type.is_empty() {
+        return true;
+    }
+    if media_type == "text/html" || media_type == "application/xhtml+xml" {
+        return false;
+    }
+    if media_type == "application/json" {
+        return ext == "gltf";
+    }
+    media_type.starts_with("image/")
+        || media_type.starts_with("audio/")
+        || media_type.starts_with("model/")
+        || media_type == "application/octet-stream"
+        || media_type == "application/gltf-buffer"
+        || media_type == "application/gltf+json"
+        || media_type == "application/zip"
+        || media_type.starts_with("application/x-")
 }
 
 // ── 1. 3D Model Generation ─────────────────────────────────────────
@@ -256,20 +411,13 @@ pub async fn auto_rig(
     base_url: String,
     api_key: String,
     workspace: String,
-    model_path: String,
+    task_id: String,
     name: String,
 ) -> Result<serde_json::Value, String> {
-    let abs = Path::new(&workspace).join(&model_path);
-    if !abs.exists() {
-        return Err(format!("模型文件不存在: {model_path}"));
+    if task_id.trim().is_empty() {
+        return Err("auto_rig 需要 generate_3d 返回的 task_id".into());
     }
-    let model_bytes = std::fs::read(&abs).map_err(|e| format!("读取模型失败: {e}"))?;
-    let b64 = crate::capture::b64(&model_bytes);
-    let ext = abs.extension().and_then(|e| e.to_str()).unwrap_or("glb");
-    let body = serde_json::json!({
-        "model_data": b64,
-        "format": ext,
-    });
+    let body = serde_json::json!({ "task_id": task_id.trim() });
     gateway_download(
         &base_url, &api_key, "auto-rig", &body, &workspace, "models", &name, "glb",
     )
@@ -285,15 +433,15 @@ pub async fn generate_motion(
     workspace: String,
     prompt: String,
     name: String,
-    duration: Option<f32>,
+    task_id: String,
 ) -> Result<serde_json::Value, String> {
     if prompt.trim().is_empty() {
         return Err("缺少动作描述".into());
     }
-    let body = serde_json::json!({
-        "prompt": prompt.trim(),
-        "duration": duration.unwrap_or(3.0),
-    });
+    if task_id.trim().is_empty() {
+        return Err("generate_motion 需要 auto_rig 返回的 task_id".into());
+    }
+    let body = serde_json::json!({ "prompt": prompt.trim(), "task_id": task_id.trim() });
     gateway_download(
         &base_url,
         &api_key,
@@ -355,7 +503,8 @@ pub async fn search_game_assets(
         "type": asset_type.unwrap_or_else(|| "all".into()),
     });
     let resp = gateway_post(&base_url, &api_key, "search-assets", &body).await?;
-    let j: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
+    let bytes = response_bytes_limited(resp, MAX_GATEWAY_JSON_BYTES, "资产搜索").await?;
+    let j: serde_json::Value = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
     Ok(j)
 }
 
@@ -393,22 +542,83 @@ pub async fn download_asset(
         "bvh" => ext_guess,
         _ => "bin",
     };
-    let bytes = asset_client()?
+    let response = asset_client()?
         .get(url.trim())
         .send()
         .await
-        .map_err(|e| format!("下载失败: {e}"))?
-        .bytes()
-        .await
-        .map_err(|e| e.to_string())?;
-    if bytes.is_empty() {
-        return Err("下载结果为空".into());
+        .map_err(|e| format!("下载失败: {e}"))?;
+    let status = response.status();
+    let content_type = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    if !status.is_success() {
+        let bytes = response_bytes_limited(response, MAX_GATEWAY_ERROR_BYTES, "下载错误").await?;
+        let body = String::from_utf8_lossy(&bytes);
+        return Err(format!(
+            "下载失败: HTTP {}: {}",
+            status.as_u16(),
+            body.chars().take(300).collect::<String>()
+        ));
+    }
+    if !downloadable_asset_content_type(ext, &content_type) {
+        return Err(format!("下载失败: 不接受的响应类型 {content_type}"));
     }
     let target = safe_dest(&workspace, sub, &name, ext)?;
-    std::fs::write(&target, &bytes).map_err(|e| format!("写入失败: {e}"))?;
+    let written = stream_asset_to_path(response, &target).await?;
     let rel = target.strip_prefix(&workspace).unwrap_or(&target);
     Ok(serde_json::json!({
         "path": rel.to_string_lossy(),
-        "bytes": bytes.len(),
+        "bytes": written,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{downloadable_asset_content_type, gateway_post};
+    use std::io::{Read, Write};
+
+    #[test]
+    fn rejects_html_error_pages_as_assets() {
+        assert!(!downloadable_asset_content_type(
+            "glb",
+            "text/html; charset=utf-8"
+        ));
+        assert!(!downloadable_asset_content_type("png", "application/json"));
+    }
+
+    #[test]
+    fn accepts_expected_binary_asset_content_types() {
+        assert!(downloadable_asset_content_type("glb", "model/gltf-binary"));
+        assert!(downloadable_asset_content_type("png", "image/png"));
+        assert!(downloadable_asset_content_type("gltf", "application/json"));
+    }
+
+    #[tokio::test]
+    async fn gateway_post_accepts_any_success_status() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let _ = socket.read(&mut [0_u8; 4096]);
+            socket
+                .write_all(
+                    b"HTTP/1.1 202 Accepted\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+                )
+                .unwrap();
+        });
+
+        let response = gateway_post(
+            &format!("http://{address}"),
+            "test-key",
+            "generate-3d",
+            &serde_json::json!({}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::ACCEPTED);
+        server.join().unwrap();
+    }
 }

@@ -22,6 +22,7 @@ export function createDapManager(options) {
   } = options;
 
   let session = null;
+  let previousStop = Promise.resolve();
 
   function isActive() {
     return !!session;
@@ -49,28 +50,28 @@ export function createDapManager(options) {
     try { callbacks[name]?.(...args); } catch { /* never let UI callbacks break the session */ }
   }
 
-  function pushConsole(category, text) {
-    if (!session) return;
-    session.console.push({ category, text, ts: Date.now() });
-    if (session.console.length > 1000) session.console.shift();
+  function pushConsole(category, text, target = session) {
+    if (!target || session !== target) return;
+    target.console.push({ category, text, ts: Date.now() });
+    if (target.console.length > 1000) target.console.shift();
     emit("onOutput", category, text);
   }
 
   // ---- raw protocol I/O ----
-  function sendRequest(command, args) {
-    if (!session) return Promise.reject(new Error("DAP session not connected"));
-    const seq = session.seq++;
+  function sendRequest(command, args, target = session) {
+    if (!target || session !== target) return Promise.resolve(null);
+    const seq = target.seq++;
     const msg = { seq, type: "request", command, arguments: args || {} };
     return new Promise((resolve) => {
       const timer = setTimeout(() => {
-        session?.pending.delete(seq);
+        target.pending.delete(seq);
         resolve(null);
       }, 20000);
-      session.pending.set(seq, { resolve, timer, command });
-      backend.dapSend(session.adapterId, JSON.stringify(msg)).catch(() => {
-        const p = session?.pending.get(seq);
+      target.pending.set(seq, { resolve, timer, command });
+      backend.dapSend(target.adapterId, JSON.stringify(msg)).catch(() => {
+        const p = target.pending.get(seq);
         if (p) {
-          session.pending.delete(seq);
+          target.pending.delete(seq);
           clearTimeout(p.timer);
           resolve(null);
         }
@@ -78,10 +79,10 @@ export function createDapManager(options) {
     });
   }
 
-  function sendResponse(request, body, success = true, message) {
-    if (!session) return;
+  function sendResponse(request, body, success = true, message, target = session) {
+    if (!target || session !== target) return;
     const msg = {
-      seq: session.seq++,
+      seq: target.seq++,
       type: "response",
       request_seq: request.seq,
       success,
@@ -89,57 +90,61 @@ export function createDapManager(options) {
       body,
       message,
     };
-    backend.dapSend(session.adapterId, JSON.stringify(msg)).catch(() => {});
+    backend.dapSend(target.adapterId, JSON.stringify(msg)).catch(() => {});
   }
 
-  function onEvent(ev) {
-    if (!session) return;
+  function onEvent(target, ev) {
+    if (!target || session !== target) return;
     if (ev?.kind === "message") {
       let msg;
       try { msg = JSON.parse(ev.data); } catch { return; }
-      routeMessage(msg);
+      routeMessage(target, msg);
     } else if (ev?.kind === "stopped" || ev?.kind === "error") {
       // Adapter process died.
-      if (ev.kind === "error" && ev.message) pushConsole("stderr", ev.message + "\n");
-      endSession(ev.kind === "error" ? "adapter error" : "adapter exited");
+      if (ev.kind === "error" && ev.message) pushConsole("stderr", ev.message + "\n", target);
+      endSession(ev.kind === "error" ? "adapter error" : "adapter exited", target);
     }
   }
 
-  function routeMessage(msg) {
+  function routeMessage(target, msg) {
+    if (session !== target) return;
     if (msg.type === "response") {
-      const pending = session.pending.get(msg.request_seq);
+      const pending = target.pending.get(msg.request_seq);
       if (pending) {
-        session.pending.delete(msg.request_seq);
+        target.pending.delete(msg.request_seq);
         clearTimeout(pending.timer);
         pending.resolve(msg.success ? (msg.body ?? {}) : null);
-        if (!msg.success && msg.message) pushConsole("stderr", `[${pending.command}] ${msg.message}\n`);
+        if (!msg.success && msg.message) pushConsole("stderr", `[${pending.command}] ${msg.message}\n`, target);
       }
       return;
     }
     if (msg.type === "event") {
-      handleAdapterEvent(msg.event, msg.body || {});
+      void handleAdapterEvent(target, msg.event, msg.body || {}).catch((error) => {
+        if (session === target) pushConsole("stderr", `[adapter event] ${String(error?.message || error)}\n`, target);
+      });
       return;
     }
     if (msg.type === "request") {
-      handleReverseRequest(msg);
+      handleReverseRequest(target, msg);
     }
   }
 
-  async function handleAdapterEvent(event, body) {
+  async function handleAdapterEvent(target, event, body) {
+    if (session !== target) return;
     switch (event) {
       case "initialized":
-        await onInitialized();
+        await onInitialized(target);
         break;
       case "output":
-        pushConsole(body.category || "console", body.output || "");
+        pushConsole(body.category || "console", body.output || "", target);
         break;
       case "stopped":
-        await onStopped(body);
+        await onStopped(target, body);
         break;
       case "continued":
-        session.stopped = false;
-        session.frames = [];
-        session.activeFrameId = null;
+        target.stopped = false;
+        target.frames = [];
+        target.activeFrameId = null;
         emit("onContinued");
         emit("onState");
         break;
@@ -147,10 +152,10 @@ export function createDapManager(options) {
         emit("onState");
         break;
       case "terminated":
-        endSession("terminated");
+        endSession("terminated", target);
         break;
       case "exited":
-        pushConsole("console", `\nProgram exited with code ${body.exitCode ?? 0}.\n`);
+        pushConsole("console", `\nProgram exited with code ${body.exitCode ?? 0}.\n`, target);
         break;
       case "breakpoint":
         emit("onState");
@@ -160,85 +165,94 @@ export function createDapManager(options) {
     }
   }
 
-  function handleReverseRequest(req) {
+  function handleReverseRequest(target, req) {
+    if (session !== target) return;
     switch (req.command) {
       case "runInTerminal": {
         const args = req.arguments || {};
         if (runInTerminal) {
           try { runInTerminal(args); } catch { /* ignore */ }
         }
-        sendResponse(req, { processId: null, shellProcessId: null });
+        sendResponse(req, { processId: null, shellProcessId: null }, true, undefined, target);
         break;
       }
       case "startDebugging":
         // Child-session debugging is out of scope; acknowledge so the adapter
         // does not stall.
-        sendResponse(req, {});
+        sendResponse(req, {}, true, undefined, target);
         break;
       default:
-        sendResponse(req, {}, false, `Unsupported reverse request: ${req.command}`);
+        sendResponse(req, {}, false, `Unsupported reverse request: ${req.command}`, target);
         break;
     }
   }
 
   // ---- handshake ----
-  async function onInitialized() {
+  async function onInitialized(target) {
     // Now that the adapter is ready, push every breakpoint then signal done.
     const all = getAllBreakpoints() || new Map();
     for (const [path, linesSet] of all.entries()) {
+      if (session !== target) return;
       const lines = [...linesSet];
-      if (lines.length) await sendBreakpoints(path, lines);
+      if (lines.length) await sendBreakpoints(path, lines, target);
     }
-    const filters = (session.capabilities.exceptionBreakpointFilters || [])
+    if (session !== target) return;
+    const filters = (target.capabilities.exceptionBreakpointFilters || [])
       .filter((f) => f.default)
       .map((f) => f.filter);
-    await sendRequest("setExceptionBreakpoints", { filters });
-    await sendRequest("configurationDone", {});
-    session.configured = true;
+    await sendRequest("setExceptionBreakpoints", { filters }, target);
+    if (session !== target) return;
+    await sendRequest("configurationDone", {}, target);
+    if (session !== target) return;
+    target.configured = true;
     emit("onState");
   }
 
-  async function onStopped(body) {
-    session.stopped = true;
-    session.threadId = body.threadId ?? session.threadId;
-    session.stopReason = body.reason || "paused";
+  async function onStopped(target, body) {
+    if (session !== target) return;
+    target.stopped = true;
+    target.threadId = body.threadId ?? target.threadId;
+    target.stopReason = body.reason || "paused";
     if (body.text || body.description) {
-      pushConsole("console", `Paused: ${body.description || body.reason}${body.text ? ` — ${body.text}` : ""}\n`);
+      pushConsole("console", `Paused: ${body.description || body.reason}${body.text ? ` — ${body.text}` : ""}\n`, target);
     }
-    await refreshStack();
-    const top = session.frames[0];
+    await refreshStack(target);
+    if (session !== target) return;
+    const top = target.frames[0];
     if (top && top.source?.path) {
       emit("onShowLocation", top.source.path, top.line, top.column || 1);
     }
-    emit("onStopped", { reason: session.stopReason, threadId: session.threadId });
+    emit("onStopped", { reason: target.stopReason, threadId: target.threadId });
     emit("onState");
   }
 
-  async function refreshStack() {
-    if (!session) return;
-    if (session.threadId == null) {
-      session.frames = [];
+  async function refreshStack(target = session) {
+    if (!target || session !== target) return;
+    if (target.threadId == null) {
+      target.frames = [];
       return;
     }
-    const body = await sendRequest("stackTrace", { threadId: session.threadId, startFrame: 0, levels: 50 });
-    session.frames = (body?.stackFrames || []).map((f) => ({
+    const body = await sendRequest("stackTrace", { threadId: target.threadId, startFrame: 0, levels: 50 }, target);
+    if (session !== target) return;
+    target.frames = (body?.stackFrames || []).map((f) => ({
       id: f.id,
       name: f.name,
       line: f.line,
       column: f.column,
       source: f.source || null,
     }));
-    session.activeFrameId = session.frames[0]?.id ?? null;
+    target.activeFrameId = target.frames[0]?.id ?? null;
   }
 
   // ---- public: lifecycle ----
   async function start(config) {
+    await previousStop.catch(() => {});
     if (session) {
       showToast("A debug session is already running.");
       return false;
     }
     const adapterId = config.adapterId || config.type;
-    session = {
+    const target = {
       adapterId,
       seq: 1,
       pending: new Map(),
@@ -251,23 +265,26 @@ export function createDapManager(options) {
       configured: false,
       config,
     };
+    session = target;
     emit("onState");
     pushConsole("console", `Starting debug adapter "${adapterId}"…\n`);
 
     try {
       await backend.dapStart(
         { adapterId, command: config.command || "", args: config.args || [], cwd: config.cwd || getWorkspaceRoots()[0] || null },
-        onEvent,
+        (event) => onEvent(target, event),
       );
     } catch (e) {
+      if (session !== target) return false;
       const msg = String(e && e.message ? e.message : e);
-      pushConsole("stderr", `Failed to start adapter: ${msg}\n`);
+      pushConsole("stderr", `Failed to start adapter: ${msg}\n`, target);
       session = null;
       emit("onState");
       showToast(`Debug adapter failed: ${msg}`);
       return false;
     }
 
+    if (session !== target) return false;
     const initBody = await sendRequest("initialize", {
       clientID: "michael-ide",
       clientName: "Michael IDE",
@@ -281,15 +298,15 @@ export function createDapManager(options) {
       supportsRunInTerminalRequest: true,
       supportsProgressReporting: true,
       supportsInvalidatedEvent: true,
-    });
-    if (!session) return false; // could have died
+    }, target);
+    if (session !== target) return false; // could have died
     if (initBody === null) {
       pushConsole("stderr", "The initialize request timed out or was rejected by the adapter.\n");
       showToast("Debug 初始化失败：调试器没有响应");
-      endSession("initialize failed");
+      await endSession("initialize failed", target);
       return false;
     }
-    session.capabilities = initBody || {};
+    target.capabilities = initBody || {};
 
     // Kick off launch/attach; the adapter replies with an `initialized` event
     // that triggers breakpoint registration + configurationDone.
@@ -299,11 +316,12 @@ export function createDapManager(options) {
       config.launchArgs || {},
     );
     delete launchArgs.__sessionId;
-    const ok = await sendRequest(request, launchArgs);
+    const ok = await sendRequest(request, launchArgs, target);
+    if (session !== target) return false;
     if (ok === null) {
       pushConsole("stderr", `The ${request} request was rejected by the adapter.\n`);
       showToast(`Debug ${request} failed — check the configuration.`);
-      endSession(`${request} failed`);
+      await endSession(`${request} failed`, target);
       return false;
     } else {
       showToast(`Debugging started: ${config.name || adapterId}`);
@@ -312,19 +330,22 @@ export function createDapManager(options) {
     return true;
   }
 
-  function endSession(reason) {
-    if (!session) return;
-    const adapterId = session.adapterId;
-    for (const { timer, resolve } of session.pending.values()) {
+  function endSession(reason, target = session) {
+    if (!target || session !== target) return previousStop;
+    const adapterId = target.adapterId;
+    for (const { timer, resolve } of target.pending.values()) {
       clearTimeout(timer);
       resolve(null);
     }
-    pushConsole("console", `\nDebug session ended (${reason}).\n`);
-    const finalConsole = session.console.slice();
+    target.pending.clear();
+    pushConsole("console", `\nDebug session ended (${reason}).\n`, target);
+    const finalConsole = target.console.slice();
     session = null;
-    backend.dapStop(adapterId).catch(() => {});
+    const stopPromise = Promise.resolve(backend.dapStop(adapterId)).catch(() => {});
+    previousStop = stopPromise;
     emit("onTerminated", { reason, console: finalConsole });
     emit("onState");
+    return stopPromise;
   }
 
   // ---- public: run control ----
@@ -361,17 +382,19 @@ export function createDapManager(options) {
     }
   }
   async function stop() {
-    if (!session) return;
-    if (session.capabilities.supportsTerminateRequest) {
-      await sendRequest("terminate", {});
+    const target = session;
+    if (!target) return;
+    if (target.capabilities.supportsTerminateRequest) {
+      await sendRequest("terminate", {}, target);
     }
-    await sendRequest("disconnect", { terminateDebuggee: true });
-    endSession("disconnected");
+    if (session !== target) return;
+    await sendRequest("disconnect", { terminateDebuggee: true }, target);
+    await endSession("disconnected", target);
   }
 
   // ---- public: breakpoints ----
-  async function sendBreakpoints(path, breakpoints) {
-    if (!session) return [];
+  async function sendBreakpoints(path, breakpoints, target = session) {
+    if (!target || session !== target) return [];
     const bps = Array.isArray(breakpoints) ? breakpoints : [];
     const normalized = bps.map((bp) => {
       if (typeof bp === "number") return { line: bp };
@@ -387,7 +410,7 @@ export function createDapManager(options) {
       breakpoints: normalized,
       lines: normalized.map((bp) => bp.line),
       sourceModified: false,
-    });
+    }, target);
     return body?.breakpoints || [];
   }
 

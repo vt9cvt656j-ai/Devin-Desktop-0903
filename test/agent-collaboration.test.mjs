@@ -60,3 +60,60 @@ test("eventbus collaboration delivers events to peer inboxes and reports the ses
   assert.deepEqual(received[0].payload, { value: 42 });
   assert.equal(engine.getActiveSessions()[0].sessionId, "session-2");
 });
+
+test("per-session mode: shared_store engine can start a lead_follower session", () => {
+  const store = makeStore();
+  store.createJob({ role: "main" }, "lead");
+  store.createJob({ role: "research" }, "f1");
+  store.createJob({ role: "security" }, "f2");
+  const engine = new CollaborationEngine({ store, mode: "shared_store" });
+  engine.startSession("lf-1", ["lead", "f1", "f2"], { mode: "lead_follower", leadJobId: "lead" });
+
+  const session = engine.activeCollaborations.get("lf-1");
+  assert.equal(session.mode, "lead_follower");
+
+  const leadJob = store.get("jobs.lead");
+  leadJob.decision = "use pattern X";
+  leadJob.status = "phase_complete";
+  leadJob.progress = 50;
+  store.set("jobs.lead", leadJob);
+
+  const f1 = store.get("jobs.f1");
+  const f2 = store.get("jobs.f2");
+  assert.ok(f1.findings.some((f) => f.channel === "lead_decision"), "follower f1 should receive lead decision");
+  assert.ok(f2.findings.some((f) => f.channel === "lead_decision"), "follower f2 should receive lead decision");
+  assert.equal(engine.endSession("lf-1"), true);
+});
+
+test("addSharedKnowledge propagates to all jobs in the session", () => {
+  const store = makeStore();
+  store.createJob({ role: "main" }, "m1");
+  store.createJob({ role: "backend" }, "w1");
+  const engine = new CollaborationEngine({ store, mode: "shared_store" });
+  engine.startSession("sk-1", ["m1", "w1"]);
+
+  const ok = engine.addSharedKnowledge("sk-1", "db_schema", "users table has role column");
+  assert.equal(ok, true);
+
+  const session = engine.activeCollaborations.get("sk-1");
+  assert.equal(session.knowledge.db_schema, "users table has role column");
+
+  const w1 = store.get("jobs.w1");
+  assert.ok(w1.findings.some((f) => f.channel === "knowledge_update" && f.data?.key === "db_schema"));
+  engine.endSession("sk-1");
+});
+
+test("enhanceContext includes shared knowledge from active sessions", async () => {
+  const store = makeStore();
+  store.createJob({ role: "main" }, "ctx_m");
+  store.createJob({ role: "research" }, "ctx_r");
+  const engine = new CollaborationEngine({ store, mode: "shared_store" });
+  engine.startSession("ctx-1", ["ctx_m", "ctx_r"]);
+  engine.addSharedKnowledge("ctx-1", "api_url", "https://example.com/api");
+
+  const enhanced = await engine.enhanceContext("ctx_r", { task: "investigate" }, []);
+  assert.ok(enhanced.sharedKnowledge, "enhanced context should include shared knowledge");
+  const flat = JSON.stringify(enhanced.sharedKnowledge);
+  assert.ok(flat.includes("https://example.com/api"));
+  engine.endSession("ctx-1");
+});

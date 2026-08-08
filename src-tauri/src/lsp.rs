@@ -185,7 +185,7 @@ fn hex_val(b: u8) -> Option<u8> {
     }
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn lsp_start(
     state: State<LspManager>,
     config: LspServerConfig,
@@ -314,43 +314,21 @@ pub fn lsp_start(
     let evt = on_event.clone();
     std::thread::spawn(move || {
         let mut reader = BufReader::new(stdout);
-        let mut header_buf = String::new();
         loop {
-            header_buf.clear();
-            match reader.read_line(&mut header_buf) {
-                Ok(0) => break,
-                Err(_) => break,
-                _ => {}
-            }
-            let trimmed = header_buf.trim();
-            if trimmed.is_empty() {
-                continue;
-            }
-            if let Some(len_str) = trimmed.strip_prefix("Content-Length:") {
-                let content_len: usize = match len_str.trim().parse() {
-                    Ok(n) => n,
-                    Err(_) => continue,
-                };
-                // Cap up-front allocation: a buggy/malicious server sending a huge
-                // Content-Length must not OOM us via `vec![0u8; content_len]`.
-                if content_len > 64 * 1024 * 1024 {
-                    tracing::warn!("[lsp-{lang}] Content-Length {content_len} too large; dropping");
+            let body = match crate::content_length_frame::read_frame(&mut reader) {
+                Ok(Some(body)) => body,
+                Ok(None) => break,
+                Err(error) => {
+                    tracing::warn!("[lsp-{lang}] invalid protocol frame: {error}");
                     break;
                 }
-                let mut sep = String::new();
-                let _ = reader.read_line(&mut sep);
-
-                let mut body = vec![0u8; content_len];
-                if std::io::Read::read_exact(&mut reader, &mut body).is_err() {
-                    break;
-                }
-                let data = String::from_utf8_lossy(&body).to_string();
-                let recv_method = extract_method(&data);
-                tracing::debug!("[lsp-{lang}] ← {recv_method}");
-                if evt.send(LspEvent::Message { data }).is_err() {
-                    tracing::warn!("[lsp-{lang}] channel send failed");
-                    break;
-                }
+            };
+            let data = String::from_utf8_lossy(&body).to_string();
+            let recv_method = extract_method(&data);
+            tracing::debug!("[lsp-{lang}] ← {recv_method}");
+            if evt.send(LspEvent::Message { data }).is_err() {
+                tracing::warn!("[lsp-{lang}] channel send failed");
+                break;
             }
         }
         let _ = evt.send(LspEvent::Stopped { lang });
@@ -375,7 +353,7 @@ pub fn lsp_start(
     Ok(())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn lsp_send(state: State<LspManager>, lang: String, message: String) -> Result<(), String> {
     let inner = state.inner.lock().map_err(|e| e.to_string())?;
     let proc = inner
@@ -386,16 +364,22 @@ pub fn lsp_send(state: State<LspManager>, lang: String, message: String) -> Resu
         .map_err(|e| format!("failed to send to LSP: {e}"))
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn lsp_stop(state: State<LspManager>, lang: String) -> Result<(), String> {
-    let mut inner = state.inner.lock().map_err(|e| e.to_string())?;
-    if let Some(mut proc) = inner.remove(&lang) {
+    let removed = {
+        let mut inner = state.inner.lock().map_err(|e| e.to_string())?;
+        inner.remove(&lang)
+    };
+    if let Some(mut proc) = removed {
         let _ = proc.child.kill();
+        // LspProcess::drop performs a blocking wait; release the manager lock
+        // first so diagnostics and editor requests are not serialized behind it.
+        drop(proc);
     }
     Ok(())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn lsp_check_available(lang: String) -> bool {
     let (cmd, _) = match find_server(&lang) {
         Some(pair) => pair,
@@ -451,7 +435,7 @@ fn pick_python(workspace: Option<&str>) -> String {
     process_util::resolve_command("python3", workspace)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn lsp_detect_python(workspace: Option<String>) -> Result<PythonEnvInfo, String> {
     let ws = workspace.as_deref();
     let python = pick_python(ws);
@@ -528,7 +512,7 @@ fn run_python_script(script: &str, extra_args: &[&str]) -> Option<String> {
     Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn lsp_python_env_symbols(modules: Vec<String>) -> Result<PythonModuleSymbols, String> {
     let mut guard = py_cache().lock().map_err(|e| e.to_string())?;
     let now = Instant::now();
@@ -614,7 +598,7 @@ pub struct NodeEnvSymbols {
     pub exports: HashMap<String, Vec<String>>,
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn lsp_node_env_symbols(
     project_dir: String,
     modules: Vec<String>,
@@ -693,7 +677,7 @@ pub struct GoEnvSymbols {
     pub packages: Vec<String>,
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn lsp_go_env_symbols(project_dir: String) -> Result<GoEnvSymbols, String> {
     let go_cmd = process_util::resolve_command("go", None);
     let aug_path = process_util::augmented_path(None);
@@ -773,7 +757,7 @@ fn run_cmd_collect(cmd_name: &str, args: &[&str], cwd: Option<&str>) -> Vec<Stri
     }
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn lsp_lang_env_symbols(
     lang: String,
     project_dir: String,
@@ -1023,7 +1007,7 @@ pub struct LspInfo {
     running: bool,
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn lsp_list(state: State<LspManager>) -> Result<Vec<LspInfo>, String> {
     let mut inner = state.inner.lock().map_err(|e| e.to_string())?;
     prune_stopped(&mut inner);
