@@ -266,10 +266,33 @@ pub fn bootstrap_home_root() {
 
 /// Register a workspace root that the user explicitly opened.
 /// Called from the frontend after a successful folder-open dialog.
-#[tauri::command]
+#[tauri::command(async)]
 pub fn register_workspace_root(path: String) -> Result<(), String> {
     let raw_path = PathBuf::from(&path);
     let canonical = std::fs::canonicalize(&path).map_err(|e| e.to_string())?;
+    // Block overly broad roots that would defeat the workspace boundary.
+    let depth = canonical.components().count();
+    if depth <= 2 {
+        return Err(format!(
+            "refusing to register '{}' as a workspace root: path is too broad (depth {depth}).",
+            canonical.display()
+        ));
+    }
+    // Depth alone is not a safety property. `/etc` and `/Users` are depth 2 and were
+    // caught, but `/usr/local`, `/private/etc`, `/etc/ssl` and `/Library/LaunchAgents`
+    // are all depth >= 3 and registered cleanly — each one granting write access to a
+    // directory that can change what the machine executes on next login. Name the
+    // system trees explicitly instead of inferring safety from a component count.
+    if let Some(blocked) = blocked_root_prefix(&canonical) {
+        return Err(format!(
+            "refusing to register '{}' as a workspace root: '{}' is a system directory.",
+            canonical.display(),
+            blocked
+        ));
+    }
+    if !canonical.is_dir() {
+        return Err("workspace root must be a directory".into());
+    }
     let mut roots = ALLOWED_ROOTS.lock().map_err(|e| e.to_string())?;
     if !roots.contains(&canonical) {
         roots.push(canonical);
@@ -293,6 +316,42 @@ fn bootstrap_home_root_inner(roots: &mut Vec<PathBuf>) {
             roots.push(home_path);
         }
     }
+}
+
+/// System trees that must never become a workspace root. Registering one grants write
+/// access to everything under it, and each of these can change what the machine runs:
+/// launch agents/daemons, shell profiles, PAM/sudo config, CA trust stores, package
+/// prefixes that sit on PATH. Compared component-wise via `Path::starts_with`, so
+/// `/usr/locale` does not match `/usr/local`.
+#[cfg(not(windows))]
+const BLOCKED_ROOT_PREFIXES: &[&str] = &[
+    "/bin", "/sbin", "/boot", "/dev", "/proc", "/sys",
+    "/etc", "/private/etc",
+    "/usr", "/opt",
+    "/var", "/private/var",
+    "/Library", "/System", "/Applications",
+];
+#[cfg(windows)]
+const BLOCKED_ROOT_PREFIXES: &[&str] = &[
+    "C:\\Windows",
+    "C:\\Program Files",
+    "C:\\Program Files (x86)",
+    "C:\\ProgramData",
+];
+
+/// The blocked system prefix `path` sits under, if any.
+///
+/// Temp directories are carved back out: on macOS `std::env::temp_dir()` lives under
+/// `/var/folders`, and on Linux under `/tmp` — both inside blocked trees, and both
+/// legitimate scratch space that `SAFE_PREFIXES` already grants.
+fn blocked_root_prefix(path: &Path) -> Option<&'static str> {
+    if has_safe_prefix(path) {
+        return None;
+    }
+    BLOCKED_ROOT_PREFIXES
+        .iter()
+        .find(|prefix| path.starts_with(Path::new(prefix)))
+        .copied()
 }
 
 /// Paths always allowed regardless of workspace roots (temp dirs, macOS firmlinks).
@@ -361,24 +420,84 @@ pub fn require_inside_workspace(target: &str, is_write_op: bool) -> Result<PathB
     let resolved_str = resolved.to_string_lossy().to_string();
 
     // Post-canonicalize safe-prefix check (handles firmlinks like /tmp → /private/tmp).
+    // Temp dirs are deliberate scratch space — staging, atomic writes, archive
+    // extraction — and stay available whether or not a workspace is open. This is an
+    // explicit, narrow allowance, not the general boundary.
     if has_safe_prefix(&resolved) {
         return Ok(resolved);
     }
 
     let roots = ALLOWED_ROOTS.lock().map_err(|e| e.to_string())?;
+    // Fail CLOSED. This used to `return Ok(resolved)` on an empty root list, which
+    // handed out unrestricted read AND write access to the entire filesystem the moment
+    // the list happened to be empty. `bootstrap_home_root` normally fills it during
+    // `setup()`, but it is best-effort: if HOME/USERPROFILE is unset or canonicalize
+    // fails, the list stays empty — and the security boundary silently disappeared in
+    // exactly the degraded environment where it matters most. A missing boundary must
+    // deny, never allow.
     if roots.is_empty() {
-        return Ok(resolved);
+        return Err(format!(
+            "access denied: no workspace root is registered yet, so '{}' cannot be \
+             {}. Open a folder first (temp directories remain available).",
+            raw_target,
+            if is_write_op { "written" } else { "read" }
+        ));
     }
 
     // Compare only canonicalized paths. Checking the raw user-supplied path here
     // would let a symlink inside a workspace authorize its target outside it.
     if is_within_allowed_root(&resolved, &roots) {
+        if is_write_op {
+            // HOME is in ALLOWED_ROOTS for read convenience, but write/delete/rename
+            // must only succeed when the path is under an explicitly opened workspace
+            // root — not just under ~/. Otherwise ~/.ssh, ~/.bashrc etc. are writable.
+            let home_raw = std::env::var("HOME")
+                .or_else(|_| std::env::var("USERPROFILE"))
+                .ok()
+                .map(PathBuf::from);
+            let home_canonical = home_raw
+                .as_ref()
+                .and_then(|h| std::fs::canonicalize(h).ok());
+            #[cfg(unix)]
+            let home_meta = home_canonical
+                .as_ref()
+                .and_then(|h| std::fs::metadata(h).ok());
+            let is_home = |root: &PathBuf| -> bool {
+                // String comparison catches the common case.
+                if home_canonical.as_ref().map_or(false, |h| root == h)
+                    || home_raw.as_ref().map_or(false, |h| root == h)
+                {
+                    return true;
+                }
+                // On macOS, firmlinks (e.g. /System/Volumes/Data/Users/X vs /Users/X)
+                // produce different canonical paths for the same inode. Compare by
+                // device + inode to defeat that aliasing.
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::MetadataExt;
+                    if let (Some(hm), Ok(rm)) = (&home_meta, std::fs::metadata(root)) {
+                        if hm.dev() == rm.dev() && hm.ino() == rm.ino() {
+                            return true;
+                        }
+                    }
+                }
+                false
+            };
+            let under_workspace = roots
+                .iter()
+                .any(|root| resolved.starts_with(root) && !is_home(root));
+            if !under_workspace {
+                return Err(format!(
+                    "write denied: '{}' is under HOME but not inside any opened workspace.",
+                    raw_target
+                ));
+            }
+        }
         return Ok(resolved);
     }
 
-    // For read-only operations, allow paths under HOME (useful for reading logs,
-    // config files, etc.). For write/delete/rename operations, block HOME paths
-    // to prevent writing ~/.ssh/id_rsa, ~/.bashrc, etc., which could bypass workspace.
+    // For read-only operations, allow paths under HOME as a fallback (useful for
+    // reading logs, config files, etc. when HOME was evicted from ALLOWED_ROOTS).
     if !is_write_op {
         if let Ok(home) = std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")) {
             if let Ok(home_canonical) = std::fs::canonicalize(&home) {
@@ -410,7 +529,10 @@ pub struct DirEntry {
 
 /// List the immediate children of a directory, directories first, then by name.
 /// Dotfiles are hidden by default to keep the tree tidy.
-#[tauri::command]
+// These commands perform synchronous filesystem work. Tauri's async execution
+// context keeps slow disks, network mounts, recursive walks, and large files
+// away from the native window event thread without changing their IPC contract.
+#[tauri::command(async)]
 pub fn read_dir(path: String) -> Result<Vec<DirEntry>, String> {
     require_inside_workspace(&path, false)?;
     let mut entries = Vec::new();
@@ -473,7 +595,7 @@ fn friendly_write_error(op: &str, path: &str, e: &std::io::Error) -> String {
 
 /// Read a UTF-8 text file. Rejects directories, oversized and binary files so
 /// the editor never tries to render garbage.
-#[tauri::command]
+#[tauri::command(async)]
 pub fn read_text_file(path: String) -> Result<String, String> {
     let resolved = require_inside_workspace(&path, false)?;
     let meta = std::fs::metadata(&resolved).map_err(|e| friendly_read_error(&path, &e))?;
@@ -498,7 +620,7 @@ pub fn read_text_file(path: String) -> Result<String, String> {
 /// home directory (npm debug logs, app logs, temp logs). Unlike `read_text_file`,
 /// this does not load the entire file, so a large debug log can still be used as
 /// evidence by the agent without opening it in the editor.
-#[tauri::command]
+#[tauri::command(async)]
 pub fn read_log_tail(
     path: String,
     lines: Option<usize>,
@@ -598,7 +720,7 @@ fn data_url_mime(path: &Path) -> &'static str {
     }
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn read_file_data_url(path: String) -> Result<String, String> {
     require_inside_workspace(&path, false)?;
     let meta = std::fs::metadata(&path).map_err(|e| friendly_read_error(&path, &e))?;
@@ -1221,7 +1343,7 @@ fn detect_kind_and_mime(ext: &str, bytes: &[u8], traineddata: bool) -> (String, 
     }
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn inspect_file(path: String, max_bytes: Option<u64>) -> Result<FileInspection, String> {
     let resolved = require_inside_workspace(&path, false)?;
     let meta = std::fs::metadata(&resolved).map_err(|e| friendly_read_error(&path, &e))?;
@@ -1321,7 +1443,7 @@ pub fn inspect_file(path: String, max_bytes: Option<u64>) -> Result<FileInspecti
 /// can read specs / papers / manuals that `read_text_file` would otherwise return as
 /// binary garbage. Office formats are ZIP+XML (reuses the existing `zip` dep); PDF uses
 /// `pdf-extract` (pure Rust). The agent's read_file routes here automatically by extension.
-#[tauri::command]
+#[tauri::command(async)]
 pub fn read_document(path: String) -> Result<String, String> {
     require_inside_workspace(&path, false)?;
     let meta = std::fs::metadata(&path).map_err(|e| friendly_read_error(&path, &e))?;
@@ -1430,7 +1552,7 @@ fn strip_xml(xml: &str) -> String {
 }
 
 /// Overwrite a file with new text content.
-#[tauri::command]
+#[tauri::command(async)]
 pub fn write_text_file(path: String, content: String) -> Result<(), String> {
     let _guard = FILE_MUTATION_LOCK.lock().map_err(|e| e.to_string())?;
     let resolved = require_inside_workspace(&path, true)?;
@@ -1442,7 +1564,7 @@ pub fn write_text_file(path: String, content: String) -> Result<(), String> {
 /// atomic no-clobber create. Existing-file compare-and-replace is serialized
 /// across IDE writers by FILE_MUTATION_LOCK; external processes do not share
 /// that lock and can still race in the small interval after the comparison.
-#[tauri::command]
+#[tauri::command(async)]
 pub fn write_text_file_if_unchanged(
     path: String,
     expected_content: Option<String>,
@@ -1469,7 +1591,7 @@ pub fn write_text_file_if_unchanged(
 /// wrote. This is the deletion counterpart to `write_text_file_if_unchanged`
 /// and keeps Undo/revert from removing a newer IDE edit. External processes do
 /// not share FILE_MUTATION_LOCK and can still race after the content comparison.
-#[tauri::command]
+#[tauri::command(async)]
 pub fn delete_text_file_if_unchanged(path: String, expected_content: String) -> Result<(), String> {
     let _guard = FILE_MUTATION_LOCK.lock().map_err(|e| e.to_string())?;
     let resolved = require_inside_workspace(&path, true)?;
@@ -1485,7 +1607,7 @@ pub fn delete_text_file_if_unchanged(path: String, expected_content: String) -> 
 }
 
 /// Write a file to /tmp for internal tools (no workspace restriction).
-#[tauri::command]
+#[tauri::command(async)]
 pub fn write_tmp_file(name: String, content: String) -> Result<String, String> {
     // Only ever write a bare filename under /tmp — strip any directory components
     // so a name like "../etc/x" can't escape the temp dir.
@@ -1506,7 +1628,7 @@ pub fn home_dir() -> Option<String> {
 }
 
 /// Create a new empty file. Errors if anything already exists at `path`.
-#[tauri::command]
+#[tauri::command(async)]
 pub fn create_file(path: String) -> Result<(), String> {
     let _guard = FILE_MUTATION_LOCK.lock().map_err(|e| e.to_string())?;
     let resolved = require_inside_workspace(&path, true)?;
@@ -1514,7 +1636,7 @@ pub fn create_file(path: String) -> Result<(), String> {
 }
 
 /// Create a new directory (including any missing parents).
-#[tauri::command]
+#[tauri::command(async)]
 pub fn create_dir(path: String) -> Result<(), String> {
     let _guard = FILE_MUTATION_LOCK.lock().map_err(|e| e.to_string())?;
     require_inside_workspace(&path, true)?;
@@ -1526,7 +1648,7 @@ pub fn create_dir(path: String) -> Result<(), String> {
 }
 
 /// Rename or move a file/folder. Errors if the destination already exists.
-#[tauri::command]
+#[tauri::command(async)]
 pub fn rename_path(from: String, to: String) -> Result<(), String> {
     let _guard = FILE_MUTATION_LOCK.lock().map_err(|e| e.to_string())?;
     require_inside_workspace(&from, true)?;
@@ -1559,7 +1681,7 @@ fn copy_dir_recursive(from: &Path, to: &Path) -> std::io::Result<()> {
 
 /// Copy a file, or a directory and all of its contents, to `to`. Errors if the
 /// destination already exists. Both endpoints must be inside the workspace.
-#[tauri::command]
+#[tauri::command(async)]
 pub fn copy_path(from: String, to: String) -> Result<(), String> {
     let _guard = FILE_MUTATION_LOCK.lock().map_err(|e| e.to_string())?;
     require_inside_workspace(&from, false)?;
@@ -1587,7 +1709,7 @@ pub fn copy_path(from: String, to: String) -> Result<(), String> {
 }
 
 /// Delete a file, or a directory and all of its contents.
-#[tauri::command]
+#[tauri::command(async)]
 pub fn delete_path(path: String) -> Result<(), String> {
     let _guard = FILE_MUTATION_LOCK.lock().map_err(|e| e.to_string())?;
     require_inside_workspace(&path, true)?;
@@ -1838,7 +1960,7 @@ fn search_project_scope(
 /// `mode` defaults to literal matching for compatibility and accepts `regex`
 /// explicitly. Dot-entries, common build/dependency directories, oversized
 /// files, and binary files are skipped. Results and traversal are bounded.
-#[tauri::command]
+#[tauri::command(async)]
 pub fn search_in_project(
     root: String,
     query: String,
@@ -1890,7 +2012,7 @@ fn ci_prefix_len(s: &str, needle_lower: &str) -> Option<usize> {
 
 /// Replace all occurrences of `query` with `replacement` in `file_path`.
 /// Returns the number of replacements made.
-#[tauri::command]
+#[tauri::command(async)]
 pub fn replace_in_file(
     file_path: String,
     query: String,
@@ -1902,6 +2024,10 @@ pub fn replace_in_file(
     // it this is an arbitrary-file-write primitive.
     let resolved = require_inside_workspace(&file_path, true)?;
     let file_path = resolved.to_string_lossy().to_string();
+    let metadata = std::fs::metadata(&file_path).map_err(|e| e.to_string())?;
+    if metadata.len() > MAX_FILE {
+        return Err("file is too large to replace (> 5 MB)".into());
+    }
     let bytes = std::fs::read(&file_path).map_err(|e| e.to_string())?;
     if bytes.iter().take(8000).any(|&b| b == 0) {
         return Err("cannot replace in binary files".into());
@@ -1948,7 +2074,7 @@ pub fn replace_in_file(
 }
 
 /// Replace all occurrences of `query` with `replacement` across the project.
-#[tauri::command]
+#[tauri::command(async)]
 pub fn replace_in_project(
     root: String,
     query: String,
@@ -2090,6 +2216,58 @@ mod tests {
         let escaped = std::fs::canonicalize("/tmp/../etc").unwrap();
 
         assert!(!has_safe_prefix(&escaped));
+    }
+
+    // `require_inside_workspace` used to `return Ok(resolved)` whenever ALLOWED_ROOTS was
+    // empty — handing out unrestricted read AND write access to the whole filesystem in
+    // exactly the degraded startup where the boundary matters most. It must deny instead.
+    #[cfg(unix)]
+    #[test]
+    fn an_empty_root_list_denies_instead_of_allowing_everything() {
+        let roots: Vec<PathBuf> = Vec::new();
+        // The property under test is the one the old code got backwards: "not inside any
+        // root" must never be satisfiable by an empty root list.
+        assert!(!is_within_allowed_root(Path::new("/etc/ssh/sshd_config"), &roots));
+        assert!(!is_within_allowed_root(Path::new("/Users/someone/.ssh/id_rsa"), &roots));
+        // …while temp scratch space stays reachable through its own explicit allowance.
+        assert!(has_safe_prefix(&std::fs::canonicalize(std::env::temp_dir()).unwrap()));
+    }
+
+    // Depth alone was the only check: `/etc` and `/Users` (depth 2) were rejected, but
+    // `/usr/local`, `/private/etc` and `/Library/LaunchAgents` all sailed through at depth
+    // >= 3 — each granting write access to a tree that decides what the machine executes.
+    #[cfg(not(windows))]
+    #[test]
+    fn system_directories_are_rejected_as_workspace_roots_regardless_of_depth() {
+        for path in [
+            "/usr/local",
+            "/usr/local/share/very/deep/path",
+            "/private/etc",
+            "/etc/ssl/certs",
+            "/Library/LaunchAgents",
+            "/var/db",
+            "/System/Library",
+            "/opt/homebrew",
+        ] {
+            assert!(
+                blocked_root_prefix(Path::new(path)).is_some(),
+                "{path} must be refused as a workspace root"
+            );
+        }
+        // Ordinary project locations stay registrable.
+        for path in ["/Users/tester/code/app", "/home/tester/src/app", "/data/projects/x"] {
+            assert!(
+                blocked_root_prefix(Path::new(path)).is_none(),
+                "{path} must remain a valid workspace root"
+            );
+        }
+        // Component-wise matching: a prefix must not match a longer sibling name.
+        assert!(blocked_root_prefix(Path::new("/usrlocal/project")).is_none());
+        assert!(blocked_root_prefix(Path::new("/etcetera/project")).is_none());
+        // Temp dirs live under blocked trees (/var/folders, /tmp) but are legitimate
+        // scratch space and are carved back out.
+        assert!(blocked_root_prefix(Path::new("/tmp/scratch")).is_none());
+        assert!(blocked_root_prefix(Path::new("/private/var/folders/ab/session")).is_none());
     }
 
     #[cfg(unix)]
