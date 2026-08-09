@@ -17726,6 +17726,34 @@ function _callIsDangerousCommand(call) {
   if (call.type !== "cmd" && call.type !== "termtask") return false;
   return _isDangerousCmd(call.command);
 }
+/// SQL/Redis 里"错了就回不来"的那一类。
+///
+/// 不是所有写操作 —— INSERT / 带 WHERE 的 UPDATE 是日常开发，每条都弹窗只会让用户把
+/// 整道门关掉（和只读命令免打扰是同一个道理）。这里只挑**毁掉结构、成片删数据、或者
+/// 改权限**的：DROP / TRUNCATE / ALTER / GRANT / REVOKE，以及**不带 WHERE 的**
+/// DELETE / UPDATE —— `DELETE FROM users WHERE id=1` 是日常，`DELETE FROM users` 是清表。
+/// Redis 侧就是 FLUSHDB / FLUSHALL / SWAPDB。
+function _dbCallIsDestructive(call) {
+  if (!call || call.type !== "db") return false;
+  const raw = String(call.query || "");
+  if (String(call.driver || "").trim().toLowerCase() === "redis") {
+    return /^(?:flushdb|flushall|swapdb)$/i.test(_redisCommandVerb(raw) || "");
+  }
+  const value = _sqlWithoutLeadingTrivia(raw);
+  if (/^(?:drop|truncate|alter|grant|revoke)\b/i.test(value)) return true;
+  // 成片改动：DELETE/UPDATE 没有 WHERE 就是整表。
+  if (/^(?:delete|update)\b/i.test(value) && !/\bwhere\b/i.test(value)) return true;
+  return false;
+}
+/// 门永远要问的那一层：不分模式、不受"改动前审批"开关影响。
+///
+/// 以前这一层只认 shell。于是 `rm -rf /` 会弹窗，`DROP TABLE users` 直接执行 —— 而
+/// db_query 用的是 `execute()`、SQLite 还是 `read_only(false)`，DDL/DML 全都真的会跑。
+/// 对注入来说这两条路是等价的：一段仓库文本让模型发 run_cmd，和让它发 db_query，
+/// 破坏力没有区别，没理由只拦其中一条。
+function _callIsDestructive(call) {
+  return _callIsDangerousCommand(call) || _dbCallIsDestructive(call);
+}
 /// 纯读命令永远不问。Claude Code 对 grep/find/cat/git diff 同样从不弹窗，理由很实际：
 /// 一个每次读文件都要点一下的门，用户会直接关掉它 —— 那才是真正的安全损失。
 /// 判据复用已有的 `_looksLikeReadOnlyCommand`（它已在超时与证据分类里用了很久）。
@@ -17736,7 +17764,7 @@ function _callIsReadOnlyCommand(call) {
 }
 async function _approveToolCall(call, run) {
   if (!call) return true;
-  const dangerous = _callIsDangerousCommand(call);
+  const dangerous = _callIsDestructive(call);
 
   // ① 事先写下的规则最优先。deny 是全系统唯一的静默否决 —— 用户已经表过态，不该再问一遍。
   let ruleVerdict = "";
@@ -17758,11 +17786,13 @@ async function _approveToolCall(call, run) {
   if (typeof document === "undefined" || !document?.body) return !dangerous;
   const label = _approvalLabel(call);
   const decision = await _toolApprovalDialog({
-    title: dangerous ? "⚠️ 高风险命令，确认执行？" : label.title,
+    title: dangerous ? (_dbCallIsDestructive(call) ? "⚠️ 破坏性数据库操作，确认执行？" : "⚠️ 高风险命令，确认执行？") : label.title,
     detail: dangerous
-      ? `${label.detail}\n\n这条命令被判定为高风险（可能删除数据或破坏系统）。\n`
+      ? `${label.detail}\n\n${_dbCallIsDestructive(call)
+          ? "这条语句会**毁掉结构或成片删数据**（DROP / TRUNCATE / ALTER / 不带 WHERE 的 DELETE·UPDATE / FLUSHALL），执行后通常无法恢复。"
+          : "这条命令被判定为高风险（可能删除数据或破坏系统）。"}\n`
         + `如果不是你自己要求的，请拒绝 —— 仓库文件、网页内容和命令输出都可能\n`
-        + `诱导模型发出这类命令。`
+        + `诱导模型发出这类操作。`
       : ruleVerdict === "ask"
         ? `${label.detail}\n\n（工作区权限规则要求这一步必须由你确认。）`
         : label.detail,
