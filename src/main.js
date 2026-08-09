@@ -29889,13 +29889,27 @@ function _buildAgentOutcomeSummary(run, opts) {
   if (opts.didMutate) {
     // AI 自主控制：只在 AI 真的主动跑了验证并通过时如实陈述一句。
     // 不再因为“没验证”就往总结里塞“未通过/未运行/交付门未通过”这类像“没干完”的门禁结论。
-    if (opts.verificationPassed) lines.push(opts.didVerify ? "验证：已通过真实命令/检查。" : "验证：改动已落盘。");
+    //
+    // 这两条以前是分开的两行，于是每个绿色收尾都会先说「验证：已通过真实命令/检查」，
+    // 紧接着再说一句「运行时行为的语义核验未完全完成……建议再确认一次」——自相矛盾，
+    // 而且每次都出现。读者要么把整段当噪音跳过，要么以为验证其实没过。合成一句：
+    // 事实不变（静态检查过了、运行时没实测），但只说一次，不打自己的脸。
+    if (opts.verificationPassed) {
+      lines.push(opts.didVerify
+        ? (_softSemanticCaveat
+          ? "验证：已通过真实命令/检查（静态层面；运行时行为未实测）。"
+          : "验证：已通过真实命令/检查。")
+        : "验证：改动已落盘。");
+    }
     // 环境事实的平静措辞（曾被重构误删成死变量）：验证器缺失/无可识别命令对代码
     // 零断言，不是失败，不能写成像代码有问题的措辞。
     else if (verifierUnavailable) lines.push("验证：本机没有可运行的自动验证器（命令不存在/退出 127），对代码零断言；装上工具后可再验。");
     else if (noAutoVerify) lines.push("验证：项目未提供可自动识别的验证命令，未强行瞎跑。");
   }
-  if (_softSemanticCaveat) lines.push("运行时行为的语义核验未完全完成——语法/命令检查已通过，建议对照你的目标再确认一次实际效果。");
+  // 已经在上面那句里说过的，就不再单独占一行；没有验证行可挂靠时仍如实单说。
+  if (_softSemanticCaveat && !(opts.didMutate && opts.verificationPassed && opts.didVerify)) {
+    lines.push("运行时行为的语义核验未完全完成——语法/命令检查已通过，建议对照你的目标再确认一次实际效果。");
+  }
   if (pending.length) lines.push(`剩余/待确认：${pending.join("；")}`);
   if (!lines.length) return "";
   return lines.map((line) => `- ${line}`).join("\n");

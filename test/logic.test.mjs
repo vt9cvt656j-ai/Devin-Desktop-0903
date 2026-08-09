@@ -2272,6 +2272,38 @@ test("dangerous commands are gated in auto mode; ordinary tools are not", async 
   assert.equal(asked.length, 1, "approve mode asks before a write");
 });
 
+// Every green run ended with two adjacent lines that contradicted each other:
+//   - 验证：已通过真实命令/检查。
+//   - 运行时行为的语义核验未完全完成——…建议对照你的目标再确认一次实际效果。
+// Read together that says "verified" and "not verified". It appeared on EVERY successful
+// run, which is how a summary footer trains people to skip it. The facts are unchanged;
+// they are now stated once.
+test("a green run states verification once instead of contradicting itself", () => {
+  const summary = (opts, run) => load("_buildAgentOutcomeSummary", {
+    _agentIncompleteLabel: () => "",
+    effectKindLabel: (k) => k,
+  })(run, opts);
+
+  const verified = { didMutate: true, verificationPassed: true, didVerify: true };
+  const semanticPending = { _incompleteReason: "semantic_runtime_review_missing" };
+
+  const folded = summary({ ...verified, mutatedFiles: ["a.go"] }, semanticPending);
+  assert.match(folded, /验证：已通过真实命令\/检查（静态层面；运行时行为未实测）。/,
+    "one line carrying both facts");
+  assert.doesNotMatch(folded, /语义核验未完全完成/,
+    "…and not a second line saying the opposite of the first");
+  assert.equal((folded.match(/验证[：:]/g) || []).length, 1, "exactly one verification line");
+
+  // With no semantic caveat outstanding, the plain wording is unchanged.
+  assert.match(summary({ ...verified }, {}), /验证：已通过真实命令\/检查。/);
+  assert.doesNotMatch(summary({ ...verified }, {}), /静态层面/);
+
+  // When there is no verification line to fold into, the caveat must still be stated —
+  // dropping it would trade noise for a missing fact.
+  const noVerifyRun = summary({ didMutate: true, verificationPassed: true, didVerify: false }, semanticPending);
+  assert.match(noVerifyRun, /语义核验未完全完成/, "the caveat survives when it has nowhere to fold");
+});
+
 // Go emits `file.go:line:col: message` with NO severity keyword, so the gcc matcher — which
 // requires an explicit `error:`/`warning:` — matched none of it. A Go project reported
 // "0 problems" in the status bar while `go build` was failing, and every error-aware path
