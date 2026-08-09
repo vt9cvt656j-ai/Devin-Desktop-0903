@@ -14143,7 +14143,25 @@ async function _recentProjectRootByName(projectName) {
 async function _verifiedWorkspaceRoot(root) {
   root = _normalizeFsPath(String(root || "")).replace(/\/+$/, "");
   if (!root || !_isAbsoluteFsPath(root)) return "";
-  if (inTauri) { try { await backend.registerWorkspaceRoot(root); } catch {} }
+  // 注册失败不阻止打开文件夹（只读浏览仍然成立），但**绝不能吞掉原因**。
+  //
+  // 这里以前是 `catch {}`。在"根列表为空 = 全部放行"的年代那没什么代价；现在
+  // require_inside_workspace 已经改成 fail closed，而且 register_workspace_root 还会
+  // 拒绝系统目录（/usr、/opt、/var…），于是"注册悄悄失败"会变成：用户打开了文件夹、
+  // 看起来一切正常、随后每一次写入都报 "not inside any opened workspace"，而真正的
+  // 原因在这一行被丢掉了，谁也查不出来。
+  if (inTauri) {
+    try {
+      await backend.registerWorkspaceRoot(root);
+    } catch (error) {
+      const reason = String(error?.message || error || "").slice(0, 300);
+      console.warn("[michael-ide] registerWorkspaceRoot failed:", root, reason);
+      // 只对"这个目录不能作为工作区"这类**结论性**拒绝提示用户——瞬时错误不打扰。
+      if (/system directory|too broad|must be a directory/i.test(reason)) {
+        try { showToast(`无法把「${root}」设为工作区：${reason}。可以浏览，但写入会被拒绝。`, 8000); } catch {}
+      }
+    }
+  }
   try { await backend.readDir(root); return root; } catch { return ""; }
 }
 
