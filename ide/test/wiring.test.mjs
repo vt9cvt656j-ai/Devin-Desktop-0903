@@ -311,3 +311,78 @@ function bodyOf(source, name) {
   }
   return "";
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 6. No NEW unreachable modules
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// The mirror image of a severed connection: a whole FILE nothing imports. It compiles, its
+// tests pass, and it is never loaded — so the tests are measuring code the product does not
+// run. `src/agent/job-queue.js` is 446 lines with a 218-line green test suite that main.js
+// has never imported; the live `spawn_multiple_agents` is implemented inline instead. Two
+// implementations, and the suite exercises the dead one.
+//
+// Baselined, like the write-only fields: the existing four may be deleted or wired up, but
+// the set must never grow.
+test("no NEW unreachable module appears under src/", async () => {
+  const { readdirSync, statSync, existsSync } = await import("node:fs");
+  const path = await import("node:path");
+  const SRC_DIR = join(HERE, "../src");
+
+  const all = [];
+  (function walk(dir) {
+    for (const e of readdirSync(dir, { withFileTypes: true })) {
+      const p = path.join(dir, e.name);
+      if (e.isDirectory()) { if (!/node_modules|dist/.test(p)) walk(p); }
+      else if (/\.(js|jsx|mjs)$/.test(e.name)) all.push(p);
+    }
+  })(SRC_DIR);
+
+  const resolve = (from, spec) => {
+    if (!spec.startsWith(".")) return null;
+    // Vite suffixes (`./x.js?worker`, `?url`, `?raw`) are real imports — stripping the query
+    // is what stops this check from calling live web workers dead, which the first scan did.
+    const clean = spec.split("?")[0];
+    const base = path.normalize(path.join(path.dirname(from), clean));
+    for (const c of [base, `${base}.js`, `${base}.jsx`, `${base}.mjs`,
+      path.join(base, "index.js"), path.join(base, "index.jsx")]) {
+      if (existsSync(c) && statSync(c).isFile()) return c;
+    }
+    return null;
+  };
+  const seen = new Set();
+  const visit = (f) => {
+    if (seen.has(f) || !existsSync(f)) return;
+    seen.add(f);
+    const s = readFileSync(f, "utf8");
+    for (const re of [/(?:import|from)\s+["']([^"']+)["']/g, /import\(\s*["']([^"']+)["']/g,
+      /new Worker\(\s*new URL\(\s*["']([^"']+)["']/g]) {
+      for (const m of s.matchAll(re)) { const r = resolve(f, m[1]); if (r) visit(r); }
+    }
+  };
+  for (const entry of ["boot.jsx", "main.js"]) {
+    const p = join(SRC_DIR, entry);
+    if (existsSync(p)) visit(p);
+  }
+
+  // `_serve.mjs` is a standalone dev script, launched by hand rather than imported.
+  const INTENTIONALLY_STANDALONE = new Set(["src/_serve.mjs"]);
+  const KNOWN_DEAD = new Set([
+    "src/agent/job-queue.js",        // 446 lines; live spawn_multiple_agents is inline in main.js
+    "src/tools/spawn-multiple-agents.js", // 193 lines; imported by nothing at all
+    "src/search-enhanced.js",        // 377 lines; none of its exports appear in main.js
+    "src/terminal.js",               // 335 lines; main.js carries its own terminal implementation
+  ]);
+
+  const rel = (f) => path.relative(join(HERE, ".."), f).split(path.sep).join("/");
+  const fresh = all.map(rel).filter((f) =>
+    !seen.has(join(HERE, "..", f)) && !KNOWN_DEAD.has(f) && !INTENTIONALLY_STANDALONE.has(f));
+  assert.deepEqual(fresh, [],
+    `these modules are unreachable from the entry points — wire them up or delete them: ${fresh.join(", ")}`);
+
+  // And the baseline must stay honest: if one gets wired up or deleted, shrink the list.
+  for (const f of KNOWN_DEAD) {
+    assert.ok(all.map(rel).includes(f) && !seen.has(join(HERE, "..", f)),
+      `${f} is no longer dead — remove it from KNOWN_DEAD so the baseline keeps shrinking`);
+  }
+});
