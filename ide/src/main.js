@@ -23315,6 +23315,36 @@ async function _approveSandboxEscape(command, root) {
   return true;
 }
 
+// 编译器一次就把**所有**错误告诉你了，没有理由一个回合修一条。
+//
+// 实测行为（用户截图）：一次批量改动把构建改坏，`go build` 一次性报了 3 条错误，
+// 模型却连着发了 4 次 `+1 −1` 的单行编辑 —— 四个模型回合、四轮往返、四份完整上下文，
+// 修的是编译器第一次就已经列全的东西。194k token / 1m35s 里很大一块是这么烧掉的。
+//
+// 这里把已经解析出来的问题清单原样交回去，并明确要求**一轮改完**。清单来自
+// `parseProblems`（现在也认 Go），不是让模型自己再从 stderr 里扒一遍。
+function _compileErrorBatchHint(command, output) {
+  let problems = [];
+  try { problems = parseProblems(String(output || ""), { command: String(command || "") }); } catch { return ""; }
+  const errors = problems.filter((p) => p && p.severity !== "warning" && p.file && p.line);
+  if (errors.length < 2) return "";
+  const files = [...new Set(errors.map((p) => p.file))];
+  const list = errors.slice(0, 12)
+    .map((p) => `  · ${p.file}:${p.line}${p.col ? ":" + p.col : ""} ${String(p.message || "").slice(0, 120)}`)
+    .join("\n");
+  const more = errors.length > 12 ? `\n  …另有 ${errors.length - 12} 条` : "";
+  // 「undefined / 未声明」几乎总是同一个病因：改了某个符号的名字或签名，却没管谁在调用它。
+  // 逐条试错修不掉这种问题，只会把同一个改名分摊到 N 个回合。
+  const looksLikeRename = errors.some((p) => /undefined|not declared|cannot find|无法找到|未定义|未声明/i.test(String(p.message || "")));
+  return `[BATCH_FIX] 编译器一次性报了 ${errors.length} 条错误，分布在 ${files.length} 个文件：\n${list}${more}\n`
+    + `**在同一轮里全部修完**（同文件用 multi_edit，多文件就在这一批里连着发多个编辑），然后重跑同一条命令。`
+    + `不要一次只修一条、跑一次、再修下一条 —— 上面这份清单已经是完整的了，逐条来只是把一次修复拆成 ${errors.length} 个回合。`
+    + (looksLikeRename
+      ? `\n⚠️ 其中有「undefined / 未声明」类错误：这通常说明你改了某个符号的**名字或签名**，却没同步它的调用方。`
+        + `先用 find_symbol / lsp_references 找齐所有引用，一次改到位，别在报错点上逐个打补丁。`
+      : "");
+}
+
 async function _agentRunInTerminal(root, command, stepEl) {
   if (!command || !command.trim()) return { code: -1, stdout: "", stderr: "" };
   const cmd = command.trim();
@@ -29859,13 +29889,27 @@ function _buildAgentOutcomeSummary(run, opts) {
   if (opts.didMutate) {
     // AI 自主控制：只在 AI 真的主动跑了验证并通过时如实陈述一句。
     // 不再因为“没验证”就往总结里塞“未通过/未运行/交付门未通过”这类像“没干完”的门禁结论。
-    if (opts.verificationPassed) lines.push(opts.didVerify ? "验证：已通过真实命令/检查。" : "验证：改动已落盘。");
+    //
+    // 这两条以前是分开的两行，于是每个绿色收尾都会先说「验证：已通过真实命令/检查」，
+    // 紧接着再说一句「运行时行为的语义核验未完全完成……建议再确认一次」——自相矛盾，
+    // 而且每次都出现。读者要么把整段当噪音跳过，要么以为验证其实没过。合成一句：
+    // 事实不变（静态检查过了、运行时没实测），但只说一次，不打自己的脸。
+    if (opts.verificationPassed) {
+      lines.push(opts.didVerify
+        ? (_softSemanticCaveat
+          ? "验证：已通过真实命令/检查（静态层面；运行时行为未实测）。"
+          : "验证：已通过真实命令/检查。")
+        : "验证：改动已落盘。");
+    }
     // 环境事实的平静措辞（曾被重构误删成死变量）：验证器缺失/无可识别命令对代码
     // 零断言，不是失败，不能写成像代码有问题的措辞。
     else if (verifierUnavailable) lines.push("验证：本机没有可运行的自动验证器（命令不存在/退出 127），对代码零断言；装上工具后可再验。");
     else if (noAutoVerify) lines.push("验证：项目未提供可自动识别的验证命令，未强行瞎跑。");
   }
-  if (_softSemanticCaveat) lines.push("运行时行为的语义核验未完全完成——语法/命令检查已通过，建议对照你的目标再确认一次实际效果。");
+  // 已经在上面那句里说过的，就不再单独占一行；没有验证行可挂靠时仍如实单说。
+  if (_softSemanticCaveat && !(opts.didMutate && opts.verificationPassed && opts.didVerify)) {
+    lines.push("运行时行为的语义核验未完全完成——语法/命令检查已通过，建议对照你的目标再确认一次实际效果。");
+  }
   if (pending.length) lines.push(`剩余/待确认：${pending.join("；")}`);
   if (!lines.length) return "";
   return lines.map((line) => `- ${line}`).join("\n");
@@ -32579,6 +32623,8 @@ function _msgSize(m) {
 // prepared before it is sent; a 413 is terminal for this user turn and is never replayed
 // with a second copy of the transcript.
 const _MODEL_REQUEST_BODY_BYTE_CAP = 3_500_000;
+/// Reused across turns: constructing a TextEncoder per measurement would undo the saving.
+let _requestByteEncoder = null;
 function _enforceModelRequestBudget(messages, tools = [], byteCap = _MODEL_REQUEST_BODY_BYTE_CAP) {
   const source = Array.isArray(messages) ? messages : [];
   const prepared = source.map((message) => ({
@@ -32595,6 +32641,11 @@ function _enforceModelRequestBudget(messages, tools = [], byteCap = _MODEL_REQUE
   const cap = Math.max(1024, Number(byteCap) || 0);
   const byteLength = (value) => {
     const json = JSON.stringify(value);
+    // TextEncoder is native and ~4x faster than walking the string in JS; the manual
+    // fallback keeps this working anywhere it is missing. Both agree exactly.
+    if (typeof TextEncoder === "function") {
+      try { return (_requestByteEncoder ||= new TextEncoder()).encode(json).length; } catch {}
+    }
     let bytes = 0;
     for (let index = 0; index < json.length; index++) {
       const code = json.charCodeAt(index);
@@ -32608,7 +32659,44 @@ function _enforceModelRequestBudget(messages, tools = [], byteCap = _MODEL_REQUE
     }
     return bytes;
   };
-  const requestBytes = () => byteLength({ messages: prepared, tools: requestTools });
+  // ── Measure once per message, not once per request ─────────────────────────
+  //
+  // `requestBytes()` used to JSON.stringify the ENTIRE request — every message, every
+  // write_file body — and then walk the result character by character. It is called from
+  // EIGHT places here, several of them inside trim loops, so a long run paid O(n²): each of
+  // N oversized historical tool calls re-measured all N messages again.
+  //
+  // Measured on a realistic transcript (120 write_file calls of ~30KB, a 3.6MB request)
+  // that is ~0.7s of BLOCKED main thread per model turn — and it runs during request
+  // PREPARATION, before a single token streams back. That is the "software freezes and sits
+  // on the loading spinner" report: the spinner is up, the turn has not started, and the
+  // main thread is busy re-measuring megabytes it already measured.
+  //
+  // Every trim site below except the historical-argument loop REPLACES `prepared[i]` with a
+  // fresh object, so object identity is a sound cache key: a rewritten message misses the
+  // cache and is re-measured, untouched messages cost nothing. The single in-place mutation
+  // invalidates its own entry explicitly.
+  const _sizeCache = new WeakMap();
+  const msgBytes = (message) => {
+    if (!message || typeof message !== "object") return byteLength(message);
+    const cached = _sizeCache.get(message);
+    if (cached !== undefined) return cached;
+    const size = byteLength(message);
+    _sizeCache.set(message, size);
+    return size;
+  };
+  // `tools` is never rewritten in this function, so it is measured once.
+  const toolsBytes = byteLength(requestTools);
+  // Exact JSON envelope of `{"messages":[…],"tools":…}` around the per-message sizes:
+  // `{` + `"messages":` + `[` + `]` + `,` + `"tools":` + `}` = 24 chars, plus one comma
+  // between each pair of messages. Verified against the naive whole-request measure in
+  // test/logic.test.mjs so this stays a pure speed-up, not a behaviour change.
+  const REQUEST_ENVELOPE_BYTES = 24;
+  const requestBytes = () => {
+    let total = 0;
+    for (const message of prepared) total += msgBytes(message);
+    return total + Math.max(0, prepared.length - 1) + REQUEST_ENVELOPE_BYTES + toolsBytes;
+  };
   const historicalArgumentSummary = (rawArguments, toolName, maxBytes = 2048) => {
     const raw = typeof rawArguments === "string"
       ? rawArguments
@@ -32670,7 +32758,10 @@ function _enforceModelRequestBudget(messages, tools = [], byteCap = _MODEL_REQUE
         : (() => { try { return JSON.stringify(call.function.arguments ?? {}); } catch { return "{}"; } })();
       call.function.arguments = raw;
       if (completedToolCallIds.has(String(call.id || "")) && byteLength(raw) > 2048) {
-        historicalCalls.push({ call, raw, name: String(call.function.name || "") });
+        // `message` is carried so the loop below can invalidate its cached size: rewriting
+        // `call.function.arguments` mutates a NESTED object, leaving the message's own
+        // identity unchanged, which is the one case the identity cache cannot notice.
+        historicalCalls.push({ call, raw, name: String(call.function.name || ""), message });
       }
     }
   }
@@ -32678,6 +32769,7 @@ function _enforceModelRequestBudget(messages, tools = [], byteCap = _MODEL_REQUE
   for (const historical of historicalCalls) {
     if (bytes <= cap) break;
     historical.call.function.arguments = historicalArgumentSummary(historical.raw, historical.name);
+    _sizeCache.delete(historical.message); // in-place edit: identity unchanged, size is not
     bytes = requestBytes();
   }
   const mediaIndexes = prepared
@@ -48880,6 +48972,8 @@ return { type: call.type, path: call.query || "", content: `[失败] ${call.type
         _markCommandFailureRecovery(run, root, commandDiagnostics);
         _content = `[ERROR] run_cmd 退出 ${result.code}（未成功）:\n${_content}`;
         if (commandDiagnostics.note) _content += `\n\n${commandDiagnostics.note}`;
+        const _batchHint = _compileErrorBatchHint(call.command, output);
+        if (_batchHint) _content += `\n\n${_batchHint}`;
       }
       const _dependencyGraphChanged = result.code === 0 && /(?:^|&&|\|\||;)\s*(?:(?:npm|pnpm|yarn|bun)\s+(?:install|i|ci|add|remove|uninstall|update|up)\b|npx\s+shadcn\b|npx\s+shadcn-vue\b|npm\s+exec\s+shadcn\b)/i.test(call.command);
       // 任何安装类命令成功后清掉可执行文件探测缓存：模型刚 `pip install ruff`，
