@@ -8120,7 +8120,6 @@ test("mutation effect routing consumes only the structured semantic contract", (
     _EXTERNAL_OBLIGATION_ORDER: EXTERNAL_OBLIGATION_ORDER,
     _runEffectTarget: runTarget,
   });
-  const missing = load("_missingRequiredEffects", { _requiredEffectContract: contract });
 
   assert.equal(required({ mode: "agent", engineering: { applies: true } }), "mutate");
   assert.equal(required({ mode: "agent", engineering: { explicitMutation: true } }), "mutate");
@@ -8130,6 +8129,10 @@ test("mutation effect routing consumes only the structured semantic contract", (
   assert.equal(target("build words are ignored", { externalObligations: ["push"] }), "external");
   assert.equal(target("修复并部署", {}), "none");
 
+  // `_requiredEffectContract` survives — it feeds the steer effect-diff and plan-quality — so
+  // its structured-only derivation is still under test. What it FED (`_missingRequiredEffects`,
+  // which labelled a run incomplete against this predicted contract) is deleted in stage 2b, so
+  // the reconciliation + `required_effect_missing:` label assertions moved out with it.
   const run = {
     mode: "agent",
     engineering: {
@@ -8141,22 +8144,16 @@ test("mutation effect routing consumes only the structured semantic contract", (
     },
   };
   assert.deepEqual(contract(run), { workspace: true, runtime: ["build", "test"], external: ["push"] });
-  assert.deepEqual(missing(run, {
-    workspaceOps: 1,
-    runtimeEffects: ["build"],
-    externalEffects: ["commit"],
-  }), ["runtime:test", "external:push"]);
-  assert.deepEqual(missing(run, {
-    workspaceOps: 1,
-    runtimeEffects: ["build", "test"],
-    externalEffects: ["push"],
-  }), []);
 
   assert.doesNotMatch(SRC, /function _runtimeObligationsForTask\(/);
   assert.doesNotMatch(SRC, /function _externalObligationsForTask\(/);
   assert.doesNotMatch(SRC, /function _negatedEffectKindsForTask\(/);
   assert.doesNotMatch(SRC, /run\._incompleteReason = "pending_plan"/);
-  assert.match(SRC, /run\._incompleteReason = `required_effect_missing:\$\{_missingEffects\.join\(","\)\}`/);
+  // The prediction-derived incomplete label is gone: nothing SETS it, and the function that
+  // computed it is deleted. (Comments may still name it in prose; the guard is on the setter.)
+  assert.doesNotMatch(SRC, /run\._incompleteReason\s*(?:=|\|\|=)\s*`required_effect_missing/);
+  assert.doesNotMatch(SRC, /run\._incompleteReason\s*(?:=|\|\|=)\s*`research_evidence_missing/);
+  assert.doesNotMatch(SRC, /function _missingRequiredEffects\(/);
 });
 
 test("compound obligations and later cancellations reconcile by exact structured effect type", () => {
@@ -8169,13 +8166,16 @@ test("compound obligations and later cancellations reconcile by exact structured
     _EXTERNAL_OBLIGATION_ORDER: EXTERNAL_OBLIGATION_ORDER,
     _runEffectTarget: runTarget,
   });
-  const missing = load("_missingRequiredEffects", { _requiredEffectContract: contract });
   const makeRun = (engineering, cancelled = []) => ({
     mode: "agent",
     engineering: { explicitMutation: true, ...engineering },
     _cancelledEffectKinds: new Set(cancelled),
   });
 
+  // Still testing `_requiredEffectContract`'s structured derivation and its exact-type
+  // cancellation — the surviving consumers (steer diff, plan-quality) depend on both. The
+  // `_missingRequiredEffects` reconciliation this used to also assert went out with the
+  // function in stage 2b.
   const compound = makeRun({
     explicitWorkspaceMutation: true,
     workspaceAction: "modify",
@@ -8187,11 +8187,6 @@ test("compound obligations and later cancellations reconcile by exact structured
     runtime: ["build", "run"],
     external: ["commit", "push"],
   });
-  assert.deepEqual(missing(compound, {
-    workspaceOps: 1,
-    runtimeEffects: ["build", "run"],
-    externalEffects: ["commit", "push"],
-  }), []);
 
   const narrowed = makeRun({
     explicitWorkspaceMutation: true,
@@ -8204,7 +8199,6 @@ test("compound obligations and later cancellations reconcile by exact structured
     runtime: ["build"],
     external: ["commit"],
   });
-  assert.deepEqual(missing(narrowed, { workspaceOps: 1, runtimeEffects: ["build"] }), ["external:commit"]);
   assert.deepEqual(contract(makeRun({ externalObligations: ["database"] })), {
     workspace: false,
     runtime: [],
@@ -17631,8 +17625,11 @@ test("P2.1-收尾：模型自己派发的子智能体只记账，不制造阻断
 
 test("P2.1-取消传播：run 结束时 running 作业标 cancelled+consumed，已落定不受影响", () => {
   const start = SRC.indexOf("// === P2.1 取消传播");
-  const end = SRC.indexOf("// 门禁写入腿（诚实记账）", start);
-  assert.ok(start > 0 && end > start, "取消传播必须在 finally 收尾区、门禁写入腿之前");
+  // End anchor moved: the prediction-ledger "门禁写入腿" that used to follow the cancellation
+  // sweep was deleted (AGENT_LOOP_REBUILD.md stage 2b). The invariant is unchanged — cancellation
+  // must still run in the finally cleanup, before the finish-accounting that replaced it.
+  const end = SRC.indexOf("// 这里曾经在收尾出口按分类器预测", start);
+  assert.ok(start > 0 && end > start, "取消传播必须在 finally 收尾区、收尾记账之前");
   const snip = SRC.slice(start, end);
   const calls = [];
   const sweep = new Function("run", "_endRunCollaborationSession", snip);

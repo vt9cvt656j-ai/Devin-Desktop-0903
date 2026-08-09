@@ -29931,8 +29931,11 @@ function _missingResearchEvidence(profile, evidence) {
 }
 
 function _agentIncompleteLabel(reason, hitCap = false) {
+  // Every reason here is grounded in an OBSERVED fact. The `required_effect_missing:` and
+  // `research_evidence_missing:` renderers (and their effect-kind label maps) were removed with
+  // the prediction ledger that set them — AGENT_LOOP_REBUILD.md stage 2b. Nothing produces those
+  // reasons any more, so the parser branches were dead.
   const labels = {
-    required_mutation_missing: "用户要求的真实副作用还没全部发生",
     semantic_runtime_review_missing: "真实运行结果尚未完成语义核验，不能确认用户目标已经实现",
     // Without this entry a run that wrote code and never compiled it rendered an outcome card
     // listing the files with no warning at all — the user had no way to know it was unchecked.
@@ -29941,35 +29944,6 @@ function _agentIncompleteLabel(reason, hitCap = false) {
     // 步数延展/硬顶已拆除：flailing/stalled/extension_limit/ceiling 标签随之删除，
     // 仅剩 token 预算钳位一种 cap 来源（用户自设，收尾文案走 fallback）。
   };
-  const effectLabels = {
-    workspace: "实际修改工作区文件",
-    "runtime:build": "成功完成编译/构建",
-    "runtime:run": "成功启动或运行目标程序",
-    "runtime:test": "成功运行测试",
-    "runtime:install": "成功安装所需依赖",
-    "runtime:package": "成功生成打包产物",
-    "external:commit": "成功创建 Git 提交",
-    "external:push": "成功推送到远程仓库",
-    "external:sync": "成功完成拉取/合并/克隆",
-    "external:pr": "成功创建或回复 PR",
-    "external:deploy": "成功完成部署/发布",
-    "external:upload": "成功上传目标内容",
-    "external:download": "成功下载目标内容",
-    "external:database": "成功执行数据库写操作",
-    "external:automation": "成功执行要求的桌面自动化",
-    "external:external": "成功完成要求的外部副作用",
-  };
-  const effectPrefix = "required_effect_missing:";
-  if (String(reason || "").startsWith(effectPrefix)) {
-    const missing = String(reason).slice(effectPrefix.length).split(",").filter(Boolean);
-    return `仍缺少：${missing.map((kind) => effectLabels[kind] || kind).join("；")}`;
-  }
-  const researchPrefix = "research_evidence_missing:";
-  if (String(reason || "").startsWith(researchPrefix)) {
-    const missing = String(reason).slice(researchPrefix.length).split(",").filter(Boolean);
-    const labels = { official: "官方/维护方", community: "开发者社区" };
-    return `未取得当前${missing.map((kind) => labels[kind] || kind).join("和")}证据，不能确认“最新、热门或维护状态”`;
-  }
   return labels[reason] || (hitCap ? "运行到本轮上限，已停止空转" : "");
 }
 
@@ -39680,19 +39654,12 @@ function _requiredEffectContract(run) {
   return { workspace, runtime, external };
 }
 
-function _missingRequiredEffects(run, evidence) {
-  evidence = evidence || {};
-  const contract = _requiredEffectContract(run);
-  const completedRuntime = new Set(Array.isArray(evidence.runtimeEffects)
-    ? evidence.runtimeEffects : evidence.runtimeEffects instanceof Set ? [...evidence.runtimeEffects] : []);
-  const completedExternal = new Set(Array.isArray(evidence.externalEffects)
-    ? evidence.externalEffects : evidence.externalEffects instanceof Set ? [...evidence.externalEffects] : []);
-  const missing = [];
-  if (contract.workspace && !(Number(evidence.workspaceOps) > 0)) missing.push("workspace");
-  for (const kind of contract.runtime) if (!completedRuntime.has(kind)) missing.push(`runtime:${kind}`);
-  for (const kind of contract.external) if (!completedExternal.has(kind)) missing.push(`external:${kind}`);
-  return missing;
-}
+// `_missingRequiredEffects` removed (AGENT_LOOP_REBUILD.md stage 2b). It compared the
+// classifier's predicted effect contract against observed evidence to label a run incomplete —
+// the "the task should have done X" prediction the rebuild removes. Its two call sites (quiet
+// finish, cap/exception finish) now label only on observed facts. `_requiredEffectContract`
+// survives: it still feeds the steer-message effect diff and plan-quality (stage 2c untangles
+// those).
 
 function _planEffectForRun(run) {
   if (_runRequiredEffect(run) !== "mutate") return "inspect";
@@ -42447,18 +42414,12 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
     // exception bypasses await_subagent. Jobs are marked above first so followers
     // never receive another decision from a terminal main-agent session.
     _endRunCollaborationSession(run, _cancelledSubagents ? "cancelled" : "completed");
-    // 门禁写入腿（诚实记账）：cap/异常等没走静默收尾的出口也不能绕过义务与证据门——
-    // 有界补救耗尽后仍缺的项以未完成状态入账；等待用户回复的轮次不算未完成。
-    if (!awaitingUserReply && !finalErr && !run._incompleteReason) {
-      const _missingEffects = _missingRequiredEffects(run, {
-        workspaceOps: _implOps,
-        runtimeEffects: _runtimeEffects,
-        externalEffects: _externalEffects,
-      });
-      if (_missingEffects.length) run._incompleteReason = `required_effect_missing:${_missingEffects.join(",")}`;
-      const _finalMissingResearch = _missingResearchEvidence(run.engineering, _researchEvidence);
-      if (!run._incompleteReason && _finalMissingResearch.length) run._incompleteReason = `research_evidence_missing:${_finalMissingResearch.join(",")}`;
-    }
+    // 这里曾经在收尾出口按分类器预测的义务/研究要求补 `required_effect_missing:` /
+    // `research_evidence_missing:` —— 已删除（AGENT_LOOP_REBUILD.md 阶段 2b）。原注释说它只管
+    // cap/异常出口，但静默收尾的 `break` 也落到这里，于是"模型自愿收尾、什么都没写"这种情况
+    // 会被预测标签重新盖上未完成——正是阶段 2a 在静默收尾腿删掉的那层，从这里漏了回来。
+    // 收尾出口的诚实记账现在只认执行事实：改了代码没验证 → `code_delivered_unverified`（下方），
+    // 撞上限 → `iteration_limit`（各有独立 _capReason），谁都不需要分类器的预测。
     // Final truth pass: a model narrative or a `purpose=verify` declaration is not a
     // result. Code verification must certify this exact implementation version with a
     // structured exit 0 record; UI work must have a browser pass stamped at this version.
