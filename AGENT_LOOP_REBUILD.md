@@ -90,9 +90,24 @@ equal, and the whole rebuild rests on separating them:
    - The pre-write research gate (`_missingResearchEvidence` at the write site) is a
      non-blocking nudge + tool-loading, not a finish obligation — it belongs to stage 3's
      "inject context / rank tools" question, evaluated there, not rushed here.
-3. **Collapse the 27 intent functions.** Separate the two jobs they do today: (a)
-   drive behaviour/obligations — remove; (b) rank tools + inject prompt context —
-   keep, as a single small profile with no control-flow authority.
+3. **Collapse the intent functions (done — with a correction).** On audit, the "27
+   functions" were mostly the RIGHT pattern, not the disease: the AI intent classifier IS
+   the model making the judgment; the plan-quality grader is a fail-open fallback (AI
+   review primary, keyword scorecard only when it is unavailable, output non-blocking);
+   the rest rank tools / inject prompt context. Deleting those would remove correct code.
+   The one genuinely anti-thesis piece was the orchestration subsystem — the harness
+   *acting* on a prediction rather than informing. Removed in full (Michael's call):
+   - the IDE auto-spawning up to four file-writing sub-agents the model never requested
+     when a plan crossed ≥2 domains (parallel writers on one tree — the conflict class the
+     worker guard exists to prevent, created automatically);
+   - the three profile-driven nudges pushing the model to split/parallelize/not-single-
+     dispatch (`_splitGateNudgeMessage`, `_inferOrchestrationFromPlan`,
+     `_shouldDispatchSubagent`), plus the dead `_soloExecutionFactLine`;
+   - the finish-time auto-integration leg and its bounded wait, which only ever served the
+     auto-dispatched children (dead once they were gone).
+   The "when to parallelize" decision moved to `agent_collaboration.txt` (the model owns it,
+   with the tools named). Net −199 lines in the loop; 6 tests migrated (5 deleted with the
+   machinery, 1 added asserting the capability lives in the prompt now).
 4. **Loop skeleton.** With the machinery gone, express the loop as the five-step
    skeleton above around the existing (good) partitioned tool executor, permission
    layer, and untrusted-content tagging.
