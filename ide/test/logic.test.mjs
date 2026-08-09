@@ -2347,45 +2347,116 @@ test("Go compiler and vet output is parsed into real problems", async () => {
   assert.equal(pickMatcher("", "tsc -p ."), "tsc");
 });
 
-// The observed churn: one batch edit broke the build, `go build` reported all 3 errors at
-// once, and the agent then spent FOUR separate turns applying +1/−1 edits. Four round-trips
-// and four full contexts to fix what the compiler had already enumerated in one shot.
-test("a multi-error build failure demands one batched fix, not one turn per error", async () => {
+// Agents spend ~18.5 turns — 48% of all interaction, 320k+ tokens — just LOCATING the fault
+// before their first patch (SHERLOC, arXiv 2606.24820). It is the single largest cost in a
+// coding agent, and the observed session matches: 194k tokens, 1m35s, 6.5s of model time.
+//
+// The point of this plan is that the compiler ALREADY did the localization. These tests use
+// the exact failure from that session: ui.go was edited (root cause) and main.go then failed
+// with `undefined: newModel` (downstream) — and the agent treated them as two separate bugs,
+// spending four turns on +1/−1 patches.
+test("a failing build is localized from compiler signals, root cause ranked first", async () => {
   const { parseProblems } = await import("../src/problem-matchers.js");
-  const withParser = (out, cmd) => load("_compileErrorBatchHint", { parseProblems })(cmd, out);
+  const plan = (out, cmd, run) => load("_localizationPlan", { parseProblems })(cmd, out, run);
   const build = [
     "cmd/githuh/main.go:15:22: undefined: newModel",
     "internal/ui/ui.go:159:12: cannot use err (variable of type error) as string value",
     "internal/ui/ui.go:170:12: cannot use err (variable of type error) as string value",
   ].join("\n");
+  // The run edited ui.go — the signal that makes it the prime suspect.
+  const run = { _mutatedFiles: new Set(["internal/ui/ui.go"]) };
 
-  const text = withParser(build, "go build ./...");
-  assert.match(text, /\[BATCH_FIX\]/);
-  assert.match(text, /3 条错误/, "the count comes from the parsed list, not a guess");
-  assert.match(text, /2 个文件/);
-  assert.match(text, /cmd\/githuh\/main\.go:15:22/, "each location is named so no second lookup is needed");
-  assert.match(text, /在同一轮里全部修完/);
-  assert.match(text, /不要一次只修一条/, "the anti-pattern is called out explicitly");
-  // `undefined:` is the rename fingerprint — patching the error site treats the symptom.
-  assert.match(text, /find_symbol \/ lsp_references/, "an undefined symbol means call sites, not a local patch");
+  const text = plan(build, "go build ./...", run);
+  assert.match(text, /\[LOCALIZED\]/);
+  assert.match(text, /3 条错误，2 个文件/, "counts come from the parsed list, not a guess");
+  assert.match(text, /不要再 grep/, "the whole point is to stop free-form exploration");
 
-  // A single error needs no batching advice — the hint must stay silent rather than nag.
-  assert.equal(withParser("cmd/githuh/main.go:15:22: undefined: newModel", "go build ./..."), "");
-  // Clean output, or output with no parseable locations, is silent too.
-  assert.equal(withParser("", "go build ./..."), "");
-  assert.equal(withParser("panic: something went wrong", "go run ."), "");
-  // Type errors without a rename must not claim a rename happened.
-  const noRename = withParser([
+  // Tiering: the edited file is the root cause, the untouched `undefined:` file is downstream.
+  const rootIdx = text.indexOf("根因优先");
+  const cascadeIdx = text.indexOf("很可能是下游");
+  assert.ok(rootIdx >= 0 && cascadeIdx > rootIdx, "root cause must be ranked ABOVE the cascade");
+  assert.match(text.slice(rootIdx, cascadeIdx), /internal\/ui\/ui\.go/, "the edited file is the root");
+  assert.match(text.slice(cascadeIdx), /cmd\/githuh\/main\.go/, "the untouched undefined-symbol file is cascade");
+  assert.match(text, /newModel/, "the missing symbol is named");
+  assert.match(text, /先把根因文件改对、然后重跑/, "fix the root and re-run BEFORE patching the cascade");
+
+  // Error lines are grouped per file rather than repeated per error.
+  assert.match(text, /internal\/ui\/ui\.go（第 159、170 行）/, "lines are collected per file");
+
+  // read_file takes only `path` — the plan must NOT invent a line-range parameter, which is
+  // how invalid tool arguments got produced in the first place.
+  assert.match(text, /read_file 只接受 path/);
+
+  // Batching survives from the previous behaviour.
+  assert.match(text, /同一轮/);
+  assert.match(text, /摊成 3 个回合/);
+});
+
+test("localization degrades sensibly when its signals are absent", async () => {
+  const { parseProblems } = await import("../src/problem-matchers.js");
+  const plan = (out, cmd, run) => load("_localizationPlan", { parseProblems })(cmd, out, run || {});
+
+  // Nothing parseable → silent. A plan with no locations is worse than no plan.
+  assert.equal(plan("", "go build ./...", {}), "");
+  assert.equal(plan("panic: something went wrong", "go run .", {}), "");
+
+  // No file was edited this run → no root-cause claim, but symbols still get resolved properly
+  // instead of being patched at the error site.
+  const cold = plan("cmd/githuh/main.go:15:22: undefined: newModel", "go build ./...", {});
+  assert.match(cold, /\[LOCALIZED\]/);
+  assert.doesNotMatch(cold, /根因优先/, "without the edit signal there is no root-cause claim to make");
+  assert.match(cold, /find_symbol \/ lsp_references/, "an undefined symbol is resolved, not patched blind");
+
+  // A single error still gets localized — one error is exactly when the location matters most.
+  assert.match(plan("internal/ui/ui.go:159:12: cannot use err as string", "go build ./...", {}), /\[LOCALIZED\]/);
+
+  // Type errors with no missing symbol must not claim a rename happened.
+  const noRename = plan([
     "internal/ui/ui.go:159:12: cannot use err as string value",
     "internal/ui/ui.go:170:12: cannot use err as string value",
-  ].join("\n"), "go build ./...");
-  assert.match(noRename, /\[BATCH_FIX\]/);
-  assert.doesNotMatch(noRename, /lsp_references/, "no undefined symbol → no rename claim");
+  ].join("\n"), "go build ./...", { _mutatedFiles: new Set(["internal/ui/ui.go"]) });
+  assert.doesNotMatch(noRename, /很可能是下游/, "no undefined symbol → no cascade claim");
 
-  // It must reach the model: the hint is appended to the failing command's result.
+  // Path shapes differ between the compiler and the write ledger (./ prefixes, package-relative
+  // vs workspace-relative). If matching were strict equality the root-cause tier would never
+  // fire and the whole ranking would be dead code.
+  const prefixed = plan("cmd/githuh/main.go:15:22: undefined: newModel", "go build ./...",
+    { _mutatedFiles: new Set(["./cmd/githuh/main.go"]) });
+  assert.match(prefixed, /根因优先/, "./ prefixes must still match the edit ledger");
+
+  // It has to reach the model.
   const executor = extractFn("_executeToolStepInner");
-  assert.match(executor, /const _batchHint = _compileErrorBatchHint\(call\.command, output\);[\s\S]{0,120}_content \+= /,
-    "the batched-fix instruction must be attached to the failing run_cmd result");
+  assert.match(executor, /const _locPlan = _localizationPlan\(call\.command, output, run\);[\s\S]{0,120}_content \+= /,
+    "the plan must be attached to the failing run_cmd result");
+});
+
+// Without a number, "it feels faster" is the only available verdict — and that has already
+// been wrong twice in this codebase. `_callLog` is a 12-entry window for loop detection and
+// cannot answer "how much did this run wander", so the counters are cumulative and separate.
+test("step efficiency counts wasted calls so localization changes can be measured", () => {
+  const eff = load("_stepEfficiency");
+  assert.equal(eff({}), null, "no calls yet → nothing to report, not a fake 100%");
+  assert.equal(eff({ _stepStats: { calls: 0, failed: 0, repeated: 0, dupReads: 0, seen: new Set() } }), null);
+
+  // A clean run: every call brought back something new.
+  assert.deepEqual(eff({ _stepStats: { calls: 10, failed: 0, repeated: 0, dupReads: 0, seen: new Set() } }),
+    { calls: 10, failed: 0, repeated: 0, dupReads: 0, productive: 10, ratio: 1 });
+
+  // The thrashing shape: half the calls failed, repeated or re-read what was already known.
+  assert.deepEqual(eff({ _stepStats: { calls: 20, failed: 4, repeated: 4, dupReads: 2, seen: new Set() } }),
+    { calls: 20, failed: 4, repeated: 4, dupReads: 2, productive: 10, ratio: 0.5 });
+
+  // Overlapping categories must never drive productive below zero.
+  const degenerate = eff({ _stepStats: { calls: 3, failed: 3, repeated: 3, dupReads: 3, seen: new Set() } });
+  assert.equal(degenerate.productive, 0);
+  assert.equal(degenerate.ratio, 0);
+
+  // The counters are fed from the real call-log site, and land on the run record.
+  const loop = extractFn("_runAgenticLoop");
+  assert.match(loop, /const st = \(run\._stepStats \|\|= \{ calls: 0/, "counters accumulate on the run");
+  assert.match(loop, /if \(st\.seen\.has\(sig\)\) st\.repeated\+\+; else st\.seen\.add\(sig\);/,
+    "repetition is counted against the whole run, not the 12-entry window");
+  assert.match(loop, /stepEfficiency: _stepEfficiency\(run\)/, "…and is reported in the run record");
 });
 
 // `_enforceModelRequestBudget` measured the request by JSON.stringify-ing the WHOLE thing —
@@ -20974,6 +21045,44 @@ test("the agent loop keeps fixing a red build, bounded, then finishes honestly",
 // Claude Code stops on the first end_turn. Every obligation the extra turn was standing
 // in for is already an explicit clause of the same exit condition.
 // ---------------------------------------------------------------------------
+// The reported failure, exactly: "if there's an error I didn't ask about, it points out the
+// error and ends the conversation there." A quiet turn is treated as "done", so when the user
+// asked for a CHANGE and the model read a few files, mentioned an incidental error and went
+// quiet, the harness recorded `required_effect_missing:workspace` — and then broke out of the
+// loop anyway. It only ever accounted for the failure; it never sent the model back to do the
+// work. The deployed system prompt calls this the worst failure mode there is; the harness
+// permitted it.
+test("a run that was asked to change something does not end having changed nothing", () => {
+  const loop = extractFn("_runAgenticLoop");
+  const quietStart = loop.indexOf("if (!turn.toolCalls.length)");
+  const quietEnd = loop.indexOf("// Render every tool step up front", quietStart);
+  const quiet = loop.slice(quietStart, quietEnd);
+
+  // Fires only on the HARD signal. `_missingEffects` contains "workspace" only when
+  // _requiredEffectContract says so, and that requires explicitWorkspaceMutation or a
+  // steered requirement — the user actually asking, not the classifier guessing.
+  assert.match(quiet, /_missingEffects\.includes\("workspace"\) && !didMutate && _implOps === 0/,
+    "gate on an explicit change request that produced literally no change");
+  assert.match(quiet, /_pushNudge\("noWorkDone"[\s\S]{0,900}?continue;/,
+    "…and send the model back to actually do it, rather than only recording the miss");
+
+  // Bounded to ONE retry. Without the latch this becomes an infinite loop against a model
+  // that has decided not to act — turning "didn't do it" into "didn't do it, slowly".
+  assert.match(quiet, /!run\._noWorkNudged/, "guarded by a once-per-run latch");
+  assert.match(quiet, /run\._noWorkNudged = true;/, "…which must be set before continuing");
+  assert.ok(
+    quiet.indexOf("run._noWorkNudged = true;") < quiet.indexOf('_pushNudge("noWorkDone"'),
+    "the latch is set BEFORE the continue, so a second quiet turn falls through to the honest incomplete",
+  );
+
+  // The instruction has to name the actual mistake, or the model repeats it: an error it
+  // noticed in passing is not the task it was given.
+  assert.match(quiet, /顺带发现/, "an incidental error must be named as incidental, not as the goal");
+
+  // And it must not fire when work DID happen — that would nag every successful run.
+  assert.match(quiet, /&& !didMutate &&/);
+});
+
 test("a quiet turn is the model's completion decision except for real bounded work", () => {
   const loop = extractFn("_runAgenticLoop");
   const quietStart = loop.indexOf("if (!turn.toolCalls.length)");

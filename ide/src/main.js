@@ -23315,34 +23315,107 @@ async function _approveSandboxEscape(command, root) {
   return true;
 }
 
-// 编译器一次就把**所有**错误告诉你了，没有理由一个回合修一条。
+// ── 定位 → 修复 → 验证：用确定性信号代替满仓乱翻 ──────────────────────────────
 //
-// 实测行为（用户截图）：一次批量改动把构建改坏，`go build` 一次性报了 3 条错误，
-// 模型却连着发了 4 次 `+1 −1` 的单行编辑 —— 四个模型回合、四轮往返、四份完整上下文，
-// 修的是编译器第一次就已经列全的东西。194k token / 1m35s 里很大一块是这么烧掉的。
+// 实测数据（SHERLOC, arXiv 2606.24820）：编码智能体平均要花 18.5 个回合、约占全部交互的
+// **48%**、每个任务 320k+ token，只是为了**找到出错的地方**——这是所有编码智能体最大的
+// 单项开销。用户截图里 194k token / 1m35s、模型只占 6.5s，就是同一件事。
 //
-// 这里把已经解析出来的问题清单原样交回去，并明确要求**一轮改完**。清单来自
-// `parseProblems`（现在也认 Go），不是让模型自己再从 stderr 里扒一遍。
-function _compileErrorBatchHint(command, output) {
+// 而这里的关键事实是：**编译器已经把定位做完了**。file:line:col 是确定性的、免费的、
+// 比任何 grep 都准。让模型再去"探索"一遍，等于把已经算好的答案扔掉重算。
+//
+// 所以这份计划按 SHERLOC 的四步来：信号 → 假设排序 → 分层收窄 → 交给模型验证。
+// 排序用的是两个真实信号，不是猜：
+//   ① **这一轮改过的文件**（run._mutatedFiles）——刚被你改过、现在编译不过的文件，
+//      就是根因首选；
+//   ② **undefined / 未声明** 类错误——这类几乎总是"改了符号名或签名、没同步调用方"
+//      的**下游**表现，而不是独立的 bug。
+//
+// 用户截图正是这个形状：ui.go 被改（根因），main.go 报 `undefined: newModel`（下游）。
+// 模型把两者当成两个 bug，分四个回合逐个打补丁。先修根因再重跑，下游那条通常自己就没了。
+/// 把累计的步数账算成一个可比较的效率数。
+///
+/// productive = 总调用 − 失败 − 重复签名 − 重复读取，即"真正带回新信息"的调用数。
+/// 这不是什么精确的科学量，但它对**同一类任务的前后对比**是够用的，而这正是需要它的
+/// 场景：定位改造上线前后，同一个 bug 修下来多花了还是少花了多少步。
+function _stepEfficiency(run) {
+  const st = run?._stepStats;
+  if (!st || !st.calls) return null;
+  const wasted = Math.min(st.calls, st.failed + st.repeated + st.dupReads);
+  return {
+    calls: st.calls,
+    failed: st.failed,
+    repeated: st.repeated,
+    dupReads: st.dupReads,
+    productive: st.calls - wasted,
+    ratio: Math.round(((st.calls - wasted) / st.calls) * 100) / 100,
+  };
+}
+
+function _localizationPlan(command, output, run) {
   let problems = [];
   try { problems = parseProblems(String(output || ""), { command: String(command || "") }); } catch { return ""; }
   const errors = problems.filter((p) => p && p.severity !== "warning" && p.file && p.line);
-  if (errors.length < 2) return "";
-  const files = [...new Set(errors.map((p) => p.file))];
-  const list = errors.slice(0, 12)
-    .map((p) => `  · ${p.file}:${p.line}${p.col ? ":" + p.col : ""} ${String(p.message || "").slice(0, 120)}`)
-    .join("\n");
-  const more = errors.length > 12 ? `\n  …另有 ${errors.length - 12} 条` : "";
-  // 「undefined / 未声明」几乎总是同一个病因：改了某个符号的名字或签名，却没管谁在调用它。
-  // 逐条试错修不掉这种问题，只会把同一个改名分摊到 N 个回合。
-  const looksLikeRename = errors.some((p) => /undefined|not declared|cannot find|无法找到|未定义|未声明/i.test(String(p.message || "")));
-  return `[BATCH_FIX] 编译器一次性报了 ${errors.length} 条错误，分布在 ${files.length} 个文件：\n${list}${more}\n`
-    + `**在同一轮里全部修完**（同文件用 multi_edit，多文件就在这一批里连着发多个编辑），然后重跑同一条命令。`
-    + `不要一次只修一条、跑一次、再修下一条 —— 上面这份清单已经是完整的了，逐条来只是把一次修复拆成 ${errors.length} 个回合。`
-    + (looksLikeRename
-      ? `\n⚠️ 其中有「undefined / 未声明」类错误：这通常说明你改了某个符号的**名字或签名**，却没同步它的调用方。`
-        + `先用 find_symbol / lsp_references 找齐所有引用，一次改到位，别在报错点上逐个打补丁。`
-      : "");
+  if (!errors.length) return "";
+
+  // ── 分层收窄：先按文件归并，把每个文件的出错行收成一份阅读清单 ──
+  const byFile = new Map();
+  for (const p of errors) {
+    const file = String(p.file);
+    if (!byFile.has(file)) byFile.set(file, { file, lines: [], items: [] });
+    const group = byFile.get(file);
+    group.lines.push(p.line);
+    group.items.push(p);
+  }
+
+  // ── 信号①：这一轮自己改过的文件 ──
+  // 路径两侧都可能带 ./ 或不同前缀（编译器给的是相对包路径，写入记的是工作区相对路径），
+  // 所以用尾部匹配而不是全等——否则这个信号永远命中不了，分层等于没做。
+  const touched = run?._mutatedFiles instanceof Set ? [...run._mutatedFiles].map(String) : [];
+  const sameFile = (a, b) => {
+    const x = String(a).replace(/^\.\//, ""), y = String(b).replace(/^\.\//, "");
+    return x === y || x.endsWith("/" + y) || y.endsWith("/" + x);
+  };
+  const editedThisRun = (file) => touched.some((t) => sameFile(t, file));
+
+  // ── 信号②：undefined / 未声明 —— 改名没同步调用方的下游症状 ──
+  const CASCADE_RE = /undefined|not declared|cannot find|no such|未定义|未声明|无法找到/i;
+  const cascadeSymbols = [...new Set(errors
+    .map((p) => /(?:undefined|not declared|cannot find)\s*:?\s*([A-Za-z_][A-Za-z0-9_]*)/i.exec(String(p.message || ""))?.[1])
+    .filter(Boolean))];
+
+  const root = [], cascade = [], rest = [];
+  for (const group of byFile.values()) {
+    if (editedThisRun(group.file)) root.push(group);
+    else if (group.items.every((p) => CASCADE_RE.test(String(p.message || "")))) cascade.push(group);
+    else rest.push(group);
+  }
+
+  const render = (group) => {
+    const lines = [...new Set(group.lines)].sort((a, b) => a - b);
+    const shown = lines.slice(0, 8).join("、") + (lines.length > 8 ? ` …共 ${lines.length} 处` : "");
+    const first = String(group.items[0].message || "").slice(0, 110);
+    return `  · ${group.file}（第 ${shown} 行）${group.items.length > 1 ? ` ${group.items.length} 条，首条：` : "："}${first}`;
+  };
+
+  const out = [`[LOCALIZED] 编译器已经把位置算好了 —— ${errors.length} 条错误，${byFile.size} 个文件。不要再 grep / 满仓找，直接按下面走。`];
+
+  if (root.length) {
+    out.push(`\n【根因优先】这些文件**是你这一轮改过的**，最可能是病灶：\n${root.map(render).join("\n")}`);
+    if (cascade.length) {
+      out.push(`\n【很可能是下游】这些文件你没动过，报的却是「未定义/找不到」${cascadeSymbols.length ? `（${cascadeSymbols.slice(0, 4).join("、")}）` : ""}：\n${cascade.map(render).join("\n")}`
+        + `\n→ 这通常**不是独立的 bug**，而是上面那次改名/改签名没同步调用方。`
+        + `**先把根因文件改对、然后重跑同一条命令**；这一组很可能自己就消失了。真要动它们之前，先用 find_symbol / lsp_references 把引用找齐，别在报错点逐个打补丁。`);
+    }
+  } else if (cascade.length) {
+    out.push(`\n【符号找不到】${cascade.map(render).join("\n")}\n→ 先用 find_symbol / lsp_references 确认这些符号现在的真实定义位置和签名，再改调用方。`);
+  }
+  if (rest.length) out.push(`\n【其余】\n${rest.map(render).join("\n")}`);
+
+  out.push(`\n【怎么做】① 只读上面点名的文件（read_file 只接受 path，没有行号参数——出错行是给你定位用的，读进来自己找）；`
+    + `② 在**同一轮**里把能修的全部修完（同文件用 multi_edit，多文件就连着发多个编辑）；`
+    + `③ 重跑同一条命令验证。不要一次只修一条、跑一次、再修下一条——上面这份清单已经完整，逐条来只是把一次修复摊成 ${errors.length} 个回合。`);
+  return out.join("\n");
 }
 
 async function _agentRunInTerminal(root, command, stepEl) {
@@ -39921,6 +39994,10 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
   // chamber); only confirmed real issues are fed back to fix. Runs once.
   // reviewer/goal/memory gates removed (2026-07-05)
   const _mutatedFiles = new Set();
+  // Exposed on the run so the executor can use "did THIS run touch this file?" as a
+  // localization signal — a file the agent just edited and that now fails to compile is the
+  // prime root-cause suspect, and errors elsewhere are usually its downstream cascade.
+  run._mutatedFiles = _mutatedFiles;
   run._narrativeSeen = new Set();
   const _editCounts = new Map();   // path → how many times edited this run (churn detector)
   const _churnNudged = new Set();  // files we've already churn-warned (once each)
@@ -40777,6 +40854,33 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
         }
         if (_codeDeliveredUnverified && !run._incompleteReason) {
           run._incompleteReason = "code_delivered_unverified";
+        }
+        // ── 「读完就停」：用户要的是改动，这一轮却一个改动都没有 ──────────────
+        //
+        // 观察到的真实行为：用户让它做 X，它读了几个文件，顺手指出某处有个错误，然后
+        // 就收尾了 —— 用户既没让它盯着那个错误，X 也根本没做。部署中的系统提示词把这个
+        // 称作"最让用户崩溃的失败模式"，而 harness 一直允许它：上面那句
+        // `_incompleteReason = required_effect_missing:…` **只记账**，记完就直接 break。
+        // 模型安静了一轮 = 结束，哪怕它明摆着什么都没干。
+        //
+        // 这里只在最硬的信号上催、而且只催一次：
+        //   · `_missingEffects` 含 workspace ⇒ `_requiredEffectContract` 要求改动，而它
+        //     只在 `explicitWorkspaceMutation` / 被引导追加要求时为真 —— 是**用户明说
+        //     要改**，不是分类器猜"这活儿大概该动点东西"（当年把这类 nudge 整批删掉，
+        //     针对的正是那种猜测）；
+        //   · 本轮真的零改动（!didMutate && _implOps === 0）。
+        // 催过一次仍然零改动，就按诚实的 incomplete 收尾，不再纠缠 —— 反复催一个决定
+        // 不动手的模型，只会把体验从"没做"变成"没做还很慢"。
+        if (_missingEffects.includes("workspace") && !didMutate && _implOps === 0
+            && !run._noWorkNudged && _live()) {
+          run._noWorkNudged = true;
+          _pushNudge("noWorkDone",
+            "[还没有开始执行] 用户这轮明确要求的是**改动**，但到现在为止一次 write_file / edit_file / run_cmd 都没有发生。"
+            + "只读文件、只描述现状、只指出某处有问题——都不算做完，用户要的那件事一步都没推进。\n"
+            + "如果你在路上发现了别的错误：那是**顺带发现**，不是用户交给你的任务。除非它正好挡住你要做的事，"
+            + "否则不要把它当成本轮目标、更不要报告完它就收尾；把它记在最后一句提一下即可。\n"
+            + "现在直接动手做用户要求的那件事：定位到要改的文件，用 write_file / edit_file 真正改出来，再验证。");
+          continue;
         }
         // New-diagnostics → fix → re-check. Same shape as the red-build gate below, and
         // for the same reason: the agent introduced errors that are not in the baseline,
@@ -42185,6 +42289,19 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
         // already has. Two of those = spinning, a stuck signal on par with repeated failures.
         const dupRead = /\[别重读\]|\[停止·你在死循环\]/.test(_tmsg) && !/命令失败后的当前磁盘版本复核|失败后的当前磁盘\/日志复核/.test(_tmsg);
         _callLog.push({ sig, failed, dupRead });
+        // ── 步数效率（step efficiency）──────────────────────────────────────
+        // `_callLog` 是给死循环检测用的 12 条滑动窗口，问不出"这个 run 整体绕了多少路"。
+        // 这里另记一份**累计**账：总调用、失败、重复签名、重复读取。
+        //
+        // 存在的理由很直接：定位改造到底有没有用，必须能量出来。研究里的标准指标就是
+        // step efficiency（实际步数 vs 最优步数，重复调用和失败调用要扣分），而这些数
+        // `_callLog` 早就在算了，只是算完就丢。没有这个数，任何"感觉快了"都是错觉——
+        // 这一整轮里我已经凭感觉判断错过两次了。
+        const st = (run._stepStats ||= { calls: 0, failed: 0, repeated: 0, dupReads: 0, seen: new Set() });
+        st.calls++;
+        if (failed) st.failed++;
+        if (dupRead) st.dupReads++;
+        if (st.seen.has(sig)) st.repeated++; else st.seen.add(sig);
       }
       if (_callLog.length > 12) _callLog.splice(0, _callLog.length - 12);
       let _stuckNudgedNow = false; // 同批已触发 stuck 提醒时，探测循环检测让行，不叠加同类干预
@@ -42443,6 +42560,9 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
       incompleteReason: String(run._incompleteReason || (hitCap ? "iteration_limit" : "")).slice(0, 260),
       mutated: !!didMutate, // 「接下来」建议据此区分干活轮和纯问答轮
       toolStats: _toolLedgerStats(run._toolLedger?.entries || []),
+      // 步数效率：这一轮总共调了多少次工具、其中多少是失败/重复/重读。是"定位改造有没有
+      // 用"的唯一可量化判据；不落在这里就只能靠感觉，而感觉是不可靠的。
+      stepEfficiency: _stepEfficiency(run),
       failureCategory: lastTurnHadFailure ? (() => { const lastFailed = (run._toolLedger?.entries || []).reverse().find(e => !e.ok); return lastFailed ? _classifyToolFailure(lastFailed.reason || "") : ""; })() : "",
       lastError: finalErr ? String(finalErr).slice(0, 300) : "",
       mutatedFileCount: _mutatedFiles.size,
@@ -48972,8 +49092,8 @@ return { type: call.type, path: call.query || "", content: `[失败] ${call.type
         _markCommandFailureRecovery(run, root, commandDiagnostics);
         _content = `[ERROR] run_cmd 退出 ${result.code}（未成功）:\n${_content}`;
         if (commandDiagnostics.note) _content += `\n\n${commandDiagnostics.note}`;
-        const _batchHint = _compileErrorBatchHint(call.command, output);
-        if (_batchHint) _content += `\n\n${_batchHint}`;
+        const _locPlan = _localizationPlan(call.command, output, run);
+        if (_locPlan) _content += `\n\n${_locPlan}`;
       }
       const _dependencyGraphChanged = result.code === 0 && /(?:^|&&|\|\||;)\s*(?:(?:npm|pnpm|yarn|bun)\s+(?:install|i|ci|add|remove|uninstall|update|up)\b|npx\s+shadcn\b|npx\s+shadcn-vue\b|npm\s+exec\s+shadcn\b)/i.test(call.command);
       // 任何安装类命令成功后清掉可执行文件探测缓存：模型刚 `pip install ruff`，
