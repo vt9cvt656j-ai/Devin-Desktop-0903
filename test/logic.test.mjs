@@ -2236,7 +2236,8 @@ test("the approval gate is real, reachable, and exposed in settings", () => {
 test("dangerous commands are gated in auto mode; ordinary tools are not", async () => {
   const asked = [];
   const mk = (decision, perm) => load("_approveToolCall", {
-    _callIsDangerousCommand: load("_callIsDangerousCommand", {
+    _dbCallIsDestructive: () => false,
+    _callIsDestructive: load("_callIsDangerousCommand", {
       _isDangerousCmd: (cmd) => /rm\s+-rf\s+\//.test(String(cmd || "")),
     }),
     _callIsReadOnlyCommand: () => false,
@@ -2636,7 +2637,8 @@ test("permission scopes merge rather than override", async () => {
 test("configured rules run ahead of every other check in the gate", async () => {
   let asked = 0;
   const gate = (rules) => load("_approveToolCall", {
-    _callIsDangerousCommand: (c) => /rm -rf \//.test(c?.command || ""),
+    _dbCallIsDestructive: () => false,
+    _callIsDestructive: (c) => /rm -rf \//.test(c?.command || ""),
     _callIsReadOnlyCommand: () => false,
     _loadPermissionRules: async () => rules,
     _permissionRuleVerdict: load("_permissionRuleVerdict", {
@@ -2679,7 +2681,8 @@ test("configured rules run ahead of every other check in the gate", async () => 
   // a broken rules load must fail OPEN to the normal policy, not lock the IDE up
   asked = 0;
   const broken = load("_approveToolCall", {
-    _callIsDangerousCommand: () => false,
+    _dbCallIsDestructive: () => false,
+    _callIsDestructive: () => false,
     _callIsReadOnlyCommand: () => false,
     _loadPermissionRules: async () => { throw new Error("disk on fire"); },
     _permissionRuleVerdict: () => "",
@@ -2698,6 +2701,8 @@ test("configured rules run ahead of every other check in the gate", async () => 
 // read is a gate users switch off, and that is the larger security loss.
 test("read-only commands never prompt, but a dangerous one still does", async () => {
   const readOnly = load("_callIsReadOnlyCommand", {
+    // Deliberately the SHELL-only predicate: this decides whether a *command* is a pure read.
+    // The combined `_callIsDestructive` also covers SQL, which has no bearing on that question.
     _callIsDangerousCommand: load("_callIsDangerousCommand", {
       _isDangerousCmd: (cmd) => /rm\s+-rf\s+\//.test(String(cmd || "")),
     }),
@@ -2719,7 +2724,8 @@ test("read-only commands never prompt, but a dangerous one still does", async ()
   // …and the gate honours it: no dialog for a read-only command in approve mode.
   let asked = 0;
   const gate = load("_approveToolCall", {
-    _callIsDangerousCommand: () => false,
+    _dbCallIsDestructive: () => false,
+    _callIsDestructive: () => false,
     _callIsReadOnlyCommand: readOnly,
     _loadPermissionRules: async () => ({ allow: [], ask: [], deny: [] }),
     _permissionRuleVerdict: () => "",
@@ -2737,13 +2743,62 @@ test("read-only commands never prompt, but a dangerous one still does", async ()
   assert.equal(asked, 1, "…but a mutating command still asks");
 });
 
+// The always-ask tier only ever understood shell. So `rm -rf /` prompted while
+// `DROP TABLE users` executed silently in auto mode — even though db_query runs DDL/DML via
+// `execute()` (and opens SQLite with `read_only(false)`). For a prompt injection the two
+// paths are equivalent: a line in a repo file that makes the model emit run_cmd and one that
+// makes it emit db_query do the same amount of damage.
+test("destructive database statements are gated like destructive shell commands", () => {
+  const destructive = load("_dbCallIsDestructive", {
+    _sqlWithoutLeadingTrivia: load("_sqlWithoutLeadingTrivia"),
+    _redisCommandVerb: load("_redisCommandVerb"),
+  });
+  const sql = (query) => ({ type: "db", driver: "postgres", query });
+
+  // Schema destruction and privilege changes: unrecoverable, always ask.
+  for (const q of [
+    "DROP TABLE users", "drop table if exists t", "TRUNCATE users",
+    "ALTER TABLE users DROP COLUMN email", "GRANT ALL ON db TO bob", "REVOKE SELECT ON t FROM bob",
+  ]) assert.equal(destructive(sql(q)), true, `${q} must always ask`);
+
+  // Mass mutation — no WHERE means the whole table.
+  assert.equal(destructive(sql("DELETE FROM users")), true);
+  assert.equal(destructive(sql("UPDATE users SET admin = true")), true);
+
+  // …but routine scoped work must NOT prompt, or the gate becomes the thing users switch off
+  // (the same reasoning that keeps read-only commands silent).
+  assert.equal(destructive(sql("DELETE FROM users WHERE id = 1")), false);
+  assert.equal(destructive(sql("UPDATE users SET name = 'x' WHERE id = 1")), false);
+  assert.equal(destructive(sql("INSERT INTO users (name) VALUES ('x')")), false);
+  assert.equal(destructive(sql("SELECT * FROM users")), false);
+
+  // Redis: only the flush/swap family wipes data.
+  const redis = (query) => ({ type: "db", driver: "redis", query });
+  assert.equal(destructive(redis("FLUSHALL")), true);
+  assert.equal(destructive(redis("flushdb")), true);
+  assert.equal(destructive(redis("SET k v")), false);
+  assert.equal(destructive(redis("GET k")), false);
+
+  // Non-db calls are not this predicate's business.
+  assert.equal(destructive({ type: "cmd", command: "rm -rf /" }), false);
+  assert.equal(destructive(null), false);
+
+  // And the gate must consult the combined predicate, not the shell-only one.
+  const gate = extractFn("_approveToolCall");
+  assert.match(gate, /const dangerous = _callIsDestructive\(call\);/,
+    "the always-ask tier must cover destructive DB work, not just shell");
+  const combined = extractFn("_callIsDestructive");
+  assert.match(combined, /_callIsDangerousCommand\(call\) \|\| _dbCallIsDestructive\(call\)/);
+});
+
 // "本会话总是允许" is scoped to the exact normalized command, so allowing one command
 // never authorizes a different one.
 test("session approval is remembered per exact call, not per tool", async () => {
   const approved = new Set();
   let asks = 0;
   const gate = load("_approveToolCall", {
-    _callIsDangerousCommand: () => false,
+    _dbCallIsDestructive: () => false,
+    _callIsDestructive: () => false,
     _callIsReadOnlyCommand: () => false,
     _loadPermissionRules: async () => ({ allow: [], ask: [], deny: [] }),
     _permissionRuleVerdict: () => "",
@@ -2766,7 +2821,8 @@ test("session approval is remembered per exact call, not per tool", async () => 
 // No DOM means nobody can answer. A dangerous command must not slip through by default.
 test("with no dialog available the gate denies dangerous commands and allows the rest", async () => {
   const gate = (dangerous) => load("_approveToolCall", {
-    _callIsDangerousCommand: () => dangerous,
+    _dbCallIsDestructive: () => false,
+    _callIsDestructive: () => dangerous,
     _callIsReadOnlyCommand: () => false,
     _loadPermissionRules: async () => ({ allow: [], ask: [], deny: [] }),
     _permissionRuleVerdict: () => "",
