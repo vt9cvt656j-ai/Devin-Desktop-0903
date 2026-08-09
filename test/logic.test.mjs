@@ -21160,41 +21160,35 @@ test("the agent loop keeps fixing a red build, bounded, then finishes honestly",
 // in for is already an explicit clause of the same exit condition.
 // ---------------------------------------------------------------------------
 // The reported failure, exactly: "if there's an error I didn't ask about, it points out the
-// error and ends the conversation there." A quiet turn is treated as "done", so when the user
-// asked for a CHANGE and the model read a few files, mentioned an incidental error and went
-// quiet, the harness recorded `required_effect_missing:workspace` — and then broke out of the
-// loop anyway. It only ever accounted for the failure; it never sent the model back to do the
-// work. The deployed system prompt calls this the worst failure mode there is; the harness
-// permitted it.
-test("a run that was asked to change something does not end having changed nothing", () => {
+// error and ends the conversation there." This used to be defended by a harness gate
+// (`_noWorkNudged`) that read a profile guess — `_missingEffects.includes("workspace")` — and
+// forced another turn. The loop rebuild removed it: a quiet turn is the model's end-turn
+// decision, and the harness does not override that decision with a classifier's guess about
+// what the task "should" have changed (AGENT_LOOP_REBUILD.md stage 1). The behaviour did not
+// disappear — it moved to where behaviour belongs, the prompt. This test now guards THAT:
+//   1. the gate is gone from the loop, and
+//   2. agent_core.txt carries the instruction it used to force.
+test("read-it-and-stop is prevented by the prompt, not by a profile-derived harness gate", () => {
   const loop = extractFn("_runAgenticLoop");
   const quietStart = loop.indexOf("if (!turn.toolCalls.length)");
   const quietEnd = loop.indexOf("// Render every tool step up front", quietStart);
   const quiet = loop.slice(quietStart, quietEnd);
 
-  // Fires only on the HARD signal. `_missingEffects` contains "workspace" only when
-  // _requiredEffectContract says so, and that requires explicitWorkspaceMutation or a
-  // steered requirement — the user actually asking, not the classifier guessing.
-  assert.match(quiet, /_missingEffects\.includes\("workspace"\) && !didMutate && _implOps === 0/,
-    "gate on an explicit change request that produced literally no change");
-  assert.match(quiet, /_pushNudge\("noWorkDone"[\s\S]{0,900}?continue;/,
-    "…and send the model back to actually do it, rather than only recording the miss");
+  // 1. The profile-derived forcing gate is gone. No classifier guess ("workspace") may drive a
+  //    re-entry — that is the exact machinery this rebuild exists to remove.
+  assert.doesNotMatch(quiet, /_noWorkNudged/,
+    "the profile-derived no-work gate must be gone from the loop");
+  assert.doesNotMatch(quiet, /_missingEffects\.includes\("workspace"\)[\s\S]{0,400}?continue;/,
+    "a 'you owe a change' guess must never force another turn");
 
-  // Bounded to ONE retry. Without the latch this becomes an infinite loop against a model
-  // that has decided not to act — turning "didn't do it" into "didn't do it, slowly".
-  assert.match(quiet, /!run\._noWorkNudged/, "guarded by a once-per-run latch");
-  assert.match(quiet, /run\._noWorkNudged = true;/, "…which must be set before continuing");
-  assert.ok(
-    quiet.indexOf("run._noWorkNudged = true;") < quiet.indexOf('_pushNudge("noWorkDone"'),
-    "the latch is set BEFORE the continue, so a second quiet turn falls through to the honest incomplete",
-  );
-
-  // The instruction has to name the actual mistake, or the model repeats it: an error it
-  // noticed in passing is not the task it was given.
-  assert.match(quiet, /顺带发现/, "an incidental error must be named as incidental, not as the goal");
-
-  // And it must not fire when work DID happen — that would nag every successful run.
-  assert.match(quiet, /&& !didMutate &&/);
+  // 2. The behaviour lives in the prompt now. agent_core.txt must still tell the model that
+  //    do/change/run intents must produce a real result, and that an error spotted in passing
+  //    is incidental — not the task, not a reason to stop.
+  const prompt = readFileSync(join(HERE, "../../server/prompts/agent_core.txt"), "utf8");
+  assert.match(prompt, /做\/修\/改\/搭\/跑\/运行\/部署必须产生用户要求的真实变更或外部结果/,
+    "the must-produce-a-real-result rule (incl. 运行) must be in the prompt");
+  assert.match(prompt, /顺带发现的问题不是你的任务/,
+    "the incidental-error instruction must be in the prompt, where behaviour now lives");
 });
 
 test("a quiet turn is the model's completion decision except for real bounded work", () => {
