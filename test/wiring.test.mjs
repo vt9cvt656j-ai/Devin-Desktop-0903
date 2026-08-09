@@ -56,6 +56,35 @@ function fnBody(name) {
   }
   throw new Error(`unbalanced braces in ${name}`);
 }
+/**
+ * Evaluate a module-level `const NAME = <expr>;` out of main.js.
+ *
+ * The linker's whole point is checking the shipped literals rather than a copy of them, so a
+ * table a test needs is read from source instead of restated here — a restatement is exactly the
+ * kind of second copy that drifts. Brace/paren/bracket depth is tracked so the terminating `;`
+ * is the declaration's own, not one inside the initialiser.
+ */
+function loadConst(name) {
+  const m = new RegExp(`\\bconst\\s+${name}\\s*=`).exec(SRC);
+  if (!m) throw new Error(`const ${name} not found in main.js`);
+  let i = SRC.indexOf("=", m.index) + 1, depth = 0;
+  for (; i < SRC.length; i++) {
+    const c = SRC[i], d = SRC[i + 1];
+    if (c === "/" && d === "/") { i = SRC.indexOf("\n", i); if (i < 0) i = SRC.length; continue; }
+    if (c === "/" && d === "*") { i = SRC.indexOf("*/", i + 2) + 1; continue; }
+    if (c === '"' || c === "'" || c === "`") {
+      const q = c; i++;
+      while (i < SRC.length && SRC[i] !== q) i += SRC[i] === "\\" ? 2 : 1;
+      continue;
+    }
+    if (c === "(" || c === "[" || c === "{") depth++;
+    else if (c === ")" || c === "]" || c === "}") depth--;
+    else if (c === ";" && depth === 0) {
+      return new Function(`${SRC.slice(m.index, i + 1)}\n;return ${name};`)();
+    }
+  }
+  throw new Error(`unterminated declaration extracting ${name}`);
+}
 const uniq = (xs) => [...new Set(xs)];
 const grab = (text, re) => uniq([...text.matchAll(re)].map((m) => m[1]));
 const count = (text, re) => (text.match(re) || []).length;
@@ -136,10 +165,91 @@ test("the tool catalog has not silently shrunk", () => {
   // Dropping a whole family during a refactor is easy to do and impossible to notice —
   // nothing fails, the model just quietly loses capability. A floor, not a target: raise it
   // deliberately, never lower it to make a red test green.
-  assert.ok(schemaNames.length >= 140,
+  //
+  // Lowered ONCE, on purpose, from 140 → 128: eighteen single-site search tools were folded into
+  // the two aggregators that already covered them (`developer_community_search` sources and
+  // `package_search` ecosystems). The count is the weaker half of this test — the half that
+  // actually protects capability is `retired search capability survives the fold` below, which
+  // checks each retired name still reaches its replacement. Count guards accidents; that one
+  // guards the thing the count was standing in for.
+  assert.ok(schemaNames.length >= 128,
     `only ${schemaNames.length} tools registered — the catalog has lost capability`);
   for (const required of ["read_file", "write_file", "edit_file", "run_cmd", "search_tools", "update_plan"]) {
     assert.ok(schemaNames.includes(required), `nucleus tool ${required} is missing`);
+  }
+});
+
+test("retired search capability survives the fold", () => {
+  // Removing a tool from the catalogue is only safe while its capability is still reachable.
+  // Each retired name must (a) be gone from the catalogue — otherwise the fold did nothing —
+  // and (b) still resolve to the aggregator argument that reproduces it, so a mid-session
+  // repeat of the old name executes instead of erroring.
+  const EXPECTED = {
+    devto_search: ["developer_community_search", "devto"],
+    juejin_search: ["developer_community_search", "juejin"],
+    v2ex_search: ["developer_community_search", "v2ex"],
+    segmentfault_search: ["developer_community_search", "segmentfault"],
+    gitlab_search: ["developer_community_search", "gitlab"],
+    gitee_search: ["developer_community_search", "gitee"],
+    codeberg_search: ["developer_community_search", "codeberg"],
+    sourcegraph_search: ["developer_community_search", "sourcegraph"],
+    infoq_search: ["developer_community_search", "infoq"],
+    github_discussions_search: ["developer_community_search", "github_discussions"],
+    github_trending: ["developer_community_search", "github_trending"],
+    maven_search: ["package_search", "maven"],
+    nuget_search: ["package_search", "nuget"],
+    packagist_search: ["package_search", "packagist"],
+    rubygems_search: ["package_search", "rubygems"],
+    homebrew_search: ["package_search", "homebrew"],
+    dockerhub_search: ["package_search", "dockerhub"],
+    cdnjs_search: ["package_search", "cdnjs"],
+  };
+  const aliases = loadConst("_RETIRED_SEARCH_ALIASES");
+  for (const [retired, [target, selector]] of Object.entries(EXPECTED)) {
+    assert.ok(!schemaNames.includes(retired),
+      `${retired} is still in the catalogue — the fold did not actually remove it`);
+    const alias = aliases[retired];
+    assert.ok(typeof alias === "function", `${retired} has no alias — an old call would fail hard`);
+    const call = alias({ query: "q" });
+    assert.equal(call.type, target, `${retired} must resolve to ${target}`);
+    const got = target === "package_search" ? call.ecosystem : (call.sources || [])[0];
+    assert.equal(got, selector, `${retired} must select the "${selector}" source/ecosystem`);
+    assert.equal(call.query, "q", `${retired} must carry the query through`);
+  }
+  // Both aggregators must still be there — folding into a tool that is itself gone would
+  // pass every assertion above and lose all 18 capabilities at once.
+  for (const target of ["developer_community_search", "package_search"]) {
+    assert.ok(schemaNames.includes(target), `${target} absorbed retired tools but is not registered`);
+  }
+});
+
+test("every ecosystem the catalog advertises is one the backend actually dispatches", () => {
+  // The fold moved seven registries from "their own tool" to "a value of package_search.ecosystem".
+  // That turns a compile-time wiring into a STRING agreement across two languages: the enum the
+  // model is shown lives in main.js, the match arms that serve it live in knowledge.rs. Drift is
+  // silent in both directions — an enum value with no arm answers "Unknown ecosystem", an arm with
+  // no enum value is a capability the model is never told about. So compare them directly.
+  const rust = readFileSync(join(HERE, "../src-tauri/src/knowledge.rs"), "utf8");
+  const declared = /pub const PACKAGE_ECOSYSTEMS: &\[&str\] = &\[([\s\S]*?)\];/.exec(rust);
+  assert.ok(declared, "PACKAGE_ECOSYSTEMS has moved or been renamed in knowledge.rs");
+  const canonical = new Set([...declared[1].matchAll(/"([a-z0-9_]+)"/g)].map((m) => m[1]));
+
+  const body = /pub async fn package_search\([\s\S]*?\n\}/.exec(rust);
+  assert.ok(body, "package_search has moved or been renamed in knowledge.rs");
+  const served = new Set([...body[0].matchAll(/^\s*"([a-z0-9_" |]+)"?\s*=>/gm)]
+    .flatMap((m) => [...m[1].matchAll(/([a-z0-9_]+)/g)].map((x) => x[1])));
+
+  const line = /name:\s*"package_search"[\s\S]*?ecosystem:\s*\{[^}]*?enum:\s*\[([^\]]*)\]/.exec(SRC);
+  const advertised = line ? [...line[1].matchAll(/"([a-z0-9_]+)"/g)].map((m) => m[1]) : null;
+  assert.ok(Array.isArray(advertised) && advertised.length,
+    "package_search must advertise its ecosystems as an enum — a free-text hint lets the model guess");
+
+  for (const eco of advertised) {
+    assert.ok(served.has(eco), `catalog offers ecosystem "${eco}" but package_search has no match arm for it`);
+    assert.ok(canonical.has(eco), `ecosystem "${eco}" is advertised but missing from PACKAGE_ECOSYSTEMS`);
+  }
+  for (const eco of canonical) {
+    assert.ok(advertised.includes(eco), `PACKAGE_ECOSYSTEMS lists "${eco}" but the model is never shown it`);
   }
 });
 

@@ -561,7 +561,14 @@ fn github_trending_url(language: &str) -> Result<String, String> {
 
 // ── Academic papers (Semantic Scholar) ──────────────────────────────
 
-// ── Package registries (npm / crates.io / PyPI / HuggingFace / pub.dev / Conda / CocoaPods / Hex) ──
+// ── Package registries (npm / crates.io / PyPI / HuggingFace / pub.dev / Conda / CocoaPods / Hex
+//    / Maven / NuGet / Packagist / RubyGems / Homebrew / Docker Hub / cdnjs) ──
+
+/// 每个 ecosystem 的规范名，供错误信息和目录描述共用一份事实——加一个生态只改这里。
+pub const PACKAGE_ECOSYSTEMS: &[&str] = &[
+    "npm", "pypi", "crates", "huggingface", "dart", "conda", "cocoapods", "hex", "maven", "nuget",
+    "packagist", "rubygems", "homebrew", "dockerhub", "cdnjs",
+];
 
 #[tauri::command]
 pub async fn package_search(
@@ -585,8 +592,21 @@ pub async fn package_search(
         "conda" | "anaconda" => search_conda(&c, &query, limit).await,
         "swift" | "cocoapods" | "ios" => search_cocoapods(&c, &query, limit).await,
         "elixir" | "hex" | "erlang" => search_hex(&c, &query, limit).await,
+        // 下面七个生态原本各有一个顶层工具（maven_search / nuget_search / …）。问的是同一个
+        // 问题（「在注册表 X 里找这个包」）、收同样的参数、回同样形状的结果，却各占一个目录
+        // 槽位——40 个 *_search 占掉目录的四分之一，而工具选择准确率在候选数上是有悬崖的。
+        // 命令本身保留（它们就是这里的实现），只是不再单独出现在模型看到的目录里。
+        "maven" | "java" | "gradle" => maven_search(query.clone(), Some(limit)).await,
+        "nuget" | "dotnet" | "csharp" => nuget_search(query.clone(), Some(limit)).await,
+        "packagist" | "composer" | "php" => packagist_search(query.clone(), Some(limit)).await,
+        "rubygems" | "gem" | "ruby" => rubygems_search(query.clone(), Some(limit)).await,
+        // homebrew 的实现不收数量参数（上游接口一次给全量后本地截断），传了也无处可用。
+        "homebrew" | "brew" | "cask" => homebrew_search(query.clone()).await,
+        "dockerhub" | "docker" | "image" => dockerhub_search(query.clone(), Some(limit)).await,
+        "cdnjs" | "cdn" => cdnjs_search(query.clone(), Some(limit)).await,
         _ => Err(format!(
-            "Unknown ecosystem '{eco}'. Use: npm, pypi, crates, huggingface, dart, conda, cocoapods, hex"
+            "Unknown ecosystem '{eco}'. Use: {}",
+            PACKAGE_ECOSYSTEMS.join(", ")
         )),
     }
 }

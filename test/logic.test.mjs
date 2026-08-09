@@ -115,6 +115,31 @@ function isRegexPos(s, i) {
   if ("=([,{;:!&|?+-*%<>~^".includes(s[j])) return true;
   return /(?:^|[^\w$])(return|typeof|case|in|of|do|else|void|delete|instanceof|yield|await)$/.test(s.slice(Math.max(0, j - 12), j + 1));
 }
+// Extract a module-level `const NAME = <expr>;` declaration. extractFn only reaches `function`
+// declarations, so a table a function depends on used to have no way into the harness except a
+// hand-written stub — and a stub is free to drift from the literal it stands in for. This slices
+// the real declaration, matching the same rule the tool-policy deps follow: tests run against the
+// real thing or they are not testing it.
+function extractConstDecl(name) {
+  const m = new RegExp(`\\bconst\\s+${name}\\s*=`).exec(SRC);
+  if (!m) throw new Error(`const ${name} not found in main.js`);
+  let i = SRC.indexOf("=", m.index) + 1, depth = 0;
+  for (; i < SRC.length; i++) {
+    const c = SRC[i], d = SRC[i + 1];
+    if (c === "/" && d === "/") { i = SRC.indexOf("\n", i); if (i < 0) i = SRC.length; continue; }
+    if (c === "/" && d === "*") { i = SRC.indexOf("*/", i + 2) + 1; continue; }
+    if (c === "'" || c === '"') { i = skipString(SRC, i, c); continue; }
+    if (c === "`") { i = skipTemplate(SRC, i); continue; }
+    if (c === "/" && isRegexPos(SRC, i)) { i = skipRegex(SRC, i); continue; }
+    if (c === "(" || c === "[" || c === "{") depth++;
+    else if (c === ")" || c === "]" || c === "}") depth--;
+    else if (c === ";" && depth === 0) return SRC.slice(m.index, i + 1);
+  }
+  throw new Error(`unterminated declaration extracting ${name}`);
+}
+function loadConst(name) {
+  return new Function(`${extractConstDecl(name)}\n;return ${name};`)();
+}
 function extractFn(name) {
   const m = new RegExp(`(?:async\\s+)?function\\s+${name}\\s*\\(`).exec(SRC);
   if (!m) throw new Error(`function ${name} not found in main.js`);
@@ -253,6 +278,10 @@ AUTO_LOAD_DEPS = {
   // tests used to hand-roll a fake mutation-family set, which could (and did) drift from the
   // literal main.js actually used. See test/tool-policy.test.mjs for the policy's own tests.
   ...TOOL_POLICY_DEPS,
+  // The retired single-site search tools resolve through this table inside _mapToolCall.
+  // Injecting the REAL table (not a stub) is what makes "gitlab_search still maps" a genuine
+  // assertion about shipped behaviour.
+  _RETIRED_SEARCH_ALIASES: loadConst("_RETIRED_SEARCH_ALIASES"),
 };
 // _selectInitialTools is loaded in many isolated tests. Keep its resolved
 // intent-boundary helpers available in the shared harness rather than making
@@ -6572,7 +6601,11 @@ test("developer community search is wired through schema, normalization, executi
   assert.match(SRC, /success、empty、rate-limited、failed 或 timeout/);
   assert.match(SRC, /timeout 表示该来源超过独立硬时限/);
   assert.match(SRC, /empty 只表示适配器完成但没有可用命中/);
-  assert.match(SRC, /rust_users、python_discussions、swift_forums、kotlin_discussions/);
+  // 官方语言论坛必须在 sources 描述里点名（模型不知道能传就等于没有）。分隔符用什么无所谓，
+  // 原来写死顿号，换成斜杠列举就会假红——守的是"这四个名字都出现"，不是标点。
+  for (const forum of ["rust_users", "python_discussions", "swift_forums", "kotlin_discussions"]) {
+    assert.match(SRC, new RegExp(forum), `官方论坛来源 ${forum} 必须在 sources 描述里点名`);
+  }
   assert.match(SRC, /published_date、created_date、updated_date、last_activity_date 与 retrieved_at 不得互相代替/);
   assert.match(SRC, /缺失保持 unknown/);
   assert.match(SRC, /结果保留各来源的相关性或上游顺序，不保证按日期排序/);
@@ -19184,23 +19217,36 @@ test("P1 _toolFailureKey: git/gh 按 op 分开计数", () => {
 test("P1 deferred 搜索工具每次显式调用都保持实时", () => {
   // 这些工具仍须在真实注册表中，但不能因为参数相同而跨轮复用旧结果。
   const deferredTools = [
-    "package_search", "github_search", "github_repo",
-    "gitlab_search", "gitee_search", "codeberg_search", "cve_search",
+    "package_search", "github_search", "github_repo", "cve_search",
     "wiki_search", "stackoverflow_search", "hackernews_search",
-    "developer_community_search", "dockerhub_search", "pubmed_search",
+    "developer_community_search", "pubmed_search",
     "arxiv_search", "crossref_search", "openalex_search", "pubchem_search",
-    "clinical_trials_search", "maven_search", "packagist_search",
-    "rubygems_search", "nuget_search", "homebrew_search", "mdn_search",
-    "cdnjs_search", "bundlephobia_search", "devto_search", "steam_search",
-    "iconify_search", "juejin_search",
+    "clinical_trials_search", "mdn_search",
+    "bundlephobia_search", "steam_search",
+    "iconify_search",
     "codrops_search", "smashingmag_search",
-    "awwwards_search", "v2ex_search",
-    "segmentfault_search", "github_discussions_search", "github_trending", "infoq_search",
-    "sourcegraph_search",
+    "awwwards_search",
   ];
   for (const tool of deferredTools) {
     const pattern = new RegExp(`"${tool}"`);
     assert.match(SRC, pattern, `${tool} 必须保留在真实工具注册表`);
+  }
+  // 这 18 个已折进上面两个聚合工具，不再单独注册。要守的不是"名字还在"，而是**能力还在**：
+  // 旧名字仍能解析成对应的 sources / ecosystem，会话中途重复旧调用不会硬失败。
+  // （逐条断言在 test/wiring.test.mjs 的 "retired search capability survives the fold"。）
+  const foldedTools = [
+    "gitlab_search", "gitee_search", "codeberg_search", "sourcegraph_search",
+    "devto_search", "juejin_search", "v2ex_search", "segmentfault_search",
+    "github_discussions_search", "github_trending", "infoq_search",
+    "dockerhub_search", "maven_search", "packagist_search",
+    "rubygems_search", "nuget_search", "homebrew_search", "cdnjs_search",
+  ];
+  const aliasTable = loadConst("_RETIRED_SEARCH_ALIASES");
+  for (const tool of foldedTools) {
+    assert.equal(typeof aliasTable[tool], "function", `${tool} 折叠后必须仍能解析，不能变成未知工具`);
+    const mapped = aliasTable[tool]({ query: "x" });
+    assert.ok(["developer_community_search", "package_search"].includes(mapped.type),
+      `${tool} 必须落到聚合工具上，实际是 ${mapped.type}`);
   }
   const wrapperSrc = extractFn("_executeToolStep");
   assert.doesNotMatch(wrapperSrc, /_toolResultCache|_CACHEABLE_TOOL_TYPES|_TOOL_CACHE_TTL|_cached/,
@@ -19243,12 +19289,24 @@ test("P1 TOOL_METADATA: deferred 搜索工具批量含 usage_note", () => {
   const deferredTools = [
     "stackoverflow_search", "hackernews_search",
     "developer_community_search", "arxiv_search", "mdn_search",
-    "juejin_search", "github_trending",
-    "sourcegraph_search", "realtime_news_feed",
+    "package_search", "realtime_news_feed",
     ];
   for (const tool of deferredTools) {
     const pattern = new RegExp(`${tool}:[\\s\\S]*?usage_note:\\s*'`);
     assert.match(guideSrc, pattern, `${tool} 必须有 usage_note`);
+  }
+  // 折叠掉的站点原本各有一条 usage_note。指引不能随工具一起消失，否则模型只知道"有个聚合
+  // 工具"，不知道"只搜掘金要传 sources:['juejin']"——那就是把能力藏起来了。
+  const communityNote = /developer_community_search:[\s\S]*?usage_note:\s*'([^']*)'/.exec(guideSrc);
+  assert.ok(communityNote, "developer_community_search 必须有 usage_note");
+  for (const source of ["gitlab", "gitee", "juejin", "v2ex", "segmentfault", "infoq", "devto",
+                        "codeberg", "sourcegraph", "github_discussions", "github_trending"]) {
+    assert.ok(communityNote[1].includes(source), `折叠后的来源 ${source} 必须在聚合工具的 usage_note 里点名`);
+  }
+  const packageNote = /package_search:[\s\S]*?usage_note:\s*'([^']*)'/.exec(guideSrc);
+  assert.ok(packageNote, "package_search 必须有 usage_note");
+  for (const eco of ["maven", "nuget", "packagist", "rubygems", "homebrew", "dockerhub", "cdnjs"]) {
+    assert.ok(packageNote[1].includes(eco), `折叠后的注册表 ${eco} 必须在 package_search 的 usage_note 里点名`);
   }
 });
 
@@ -21630,8 +21688,13 @@ test("工具注册表只宣告可发现且语义明确的能力", () => {
   assert.deepEqual(think.parameters.required, ["thought"]);
   assert.equal(think.parameters.properties.thought.minLength, 1);
 
-  const trending = byName.get("github_trending");
-  assert.deepEqual(trending.parameters.required, [], "GitHub Trending 的语言筛选是可选项");
+  // github_trending 现在是 developer_community_search 的一个 source，不再是独立工具。
+  // 原断言守的是"语言筛选可选"，等价的守法是：聚合工具只强制 query，来源本身可选。
+  assert.equal(byName.get("github_trending"), undefined, "github_trending 已折进聚合工具，不该再单独注册");
+  const community = byName.get("developer_community_search");
+  assert.deepEqual(community.parameters.required, ["query"], "聚合工具只该强制 query，来源是可选项");
+  assert.ok(community.parameters.properties.sources.items.enum.includes("github_trending"),
+    "github_trending 必须仍是聚合工具可选的来源之一");
 
   const openapi = byName.get("openapi_parser");
   assert.deepEqual(openapi.parameters.properties.outputFormat.enum, ["list", "schema", "client"]);
