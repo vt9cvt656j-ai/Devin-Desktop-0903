@@ -71,12 +71,25 @@ equal, and the whole rebuild rests on separating them:
    reconciliation, or a steer message. Remove the `_noWorkNudged` profile gate — the
    only place a profile guess still *forces* a turn. After this, the model stops when
    it stops. ← this commit.
-2. **Demote the ledger to labeling, then delete it.** `_missingRequiredEffects` /
-   `_missingResearchEvidence` / `_requiredEffectContract` / `_runRequiredEffect` /
-   `_runEffectTarget` only record `_incompleteReason` after stage 1. Move honest final
-   accounting to observed facts (did any mutation happen; did any declared verification
-   run) and delete the functions. Untangle their secondary consumers (plan-quality,
-   effect-cancel diff) first.
+2. **Demote the ledger to labeling, then delete it.**
+   - **2a (done).** Removed the ledger from the FINISH path: the quiet-turn accounting no
+     longer sets the prediction-derived `required_effect_missing:` /
+     `research_evidence_missing:` labels (only execution-fact labels remain:
+     `code_delivered_unverified`, `semantic_runtime_review_missing`, `build_failing`,
+     `new_diagnostics_unresolved`). Fact-grounded the "keeps searching, never acts" churn
+     breaker: it triggered on `_requiredEffectContract` (which metric the classifier
+     predicted mattered); now it triggers on total observed progress being zero
+     (`_implOps + _runtimeEffects + _externalEffects === 0`), which needs no prediction and
+     fires strictly less often. Dropped two ledger consumers.
+   - **2b (todo).** Remove the same two prediction labels from the cap/exception
+     final-accounting path, then delete `_missingRequiredEffects` (its last consumer).
+   - **2c (todo).** Untangle `_requiredEffectContract`'s remaining consumers — the
+     steer-message effect diff (sets `requiresPlan`) and plan-quality (`_planEffectForRun`)
+     — then delete it and its feeders (`_runRequiredEffect`, `_runEffectTarget`,
+     `_effectTargetForTask`).
+   - The pre-write research gate (`_missingResearchEvidence` at the write site) is a
+     non-blocking nudge + tool-loading, not a finish obligation — it belongs to stage 3's
+     "inject context / rank tools" question, evaluated there, not rushed here.
 3. **Collapse the 27 intent functions.** Separate the two jobs they do today: (a)
    drive behaviour/obligations — remove; (b) rank tools + inject prompt context —
    keep, as a single small profile with no control-flow authority.

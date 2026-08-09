@@ -16671,20 +16671,22 @@ test("外部研究结束门禁只接受真实、非空的官方与社区证据",
   assert.deepEqual(missing({ needsOfficialResearch: true, needsCommunityResearch: true }, { official: new Set(["github_repo"]), community: new Set(["developer_community_search"]) }), []);
 });
 
-test("外部研究证据在静默收尾中只记账，不强制重呼", () => {
+test("推断出的外部研究偏好永远不会让静默收尾多补一个回合", () => {
   const loop = extractFn("_runAgenticLoop");
   assert.match(loop, /const _researchEvidence = \{ official: new Set\(\), community: new Set\(\) \}/,
     "每个 run 必须有独立证据账本");
-  assert.match(loop, /const _missingResearch = _missingResearchEvidence\(run\.engineering, _researchEvidence\)/,
-    "静默收尾必须读取语义研究要求和真实证据");
-  assert.match(loop, /research_evidence_missing:\$\{_missingResearch\.join\(","\)\}/,
-    "缺少研究证据时必须显式记账");
+  // 研究证据是分类器**预测**的（"这活儿该查查同类实现"）。循环重构后，静默收尾不再基于这个
+  // 预测记账——`research_evidence_missing` 的静默收尾腿已删除（AGENT_LOOP_REBUILD.md 阶段 2）。
+  // 关键不变量是它从来不 force：绝不存在 researchEvidence 的 _pushNudge 去逼模型再来一轮。
+  const quietStart = loop.indexOf("if (!turn.toolCalls.length)");
+  const quietEnd = loop.indexOf("// Render every tool step up front", quietStart);
+  const quiet = loop.slice(quietStart, quietEnd);
+  assert.doesNotMatch(quiet, /_missingResearchEvidence/,
+    "静默收尾不能再基于分类器预测的研究要求记账");
   assert.doesNotMatch(loop, /_pushNudge\("researchEvidence"/,
     "inferred research preferences must not force another model request");
   assert.match(loop, /_researchEvidenceCategory\(it\.tc\.name, it\.call, it\.rawResult\)/,
     "证据必须来自实际完成的工具结果");
-  assert.match(loop, /const _finalMissingResearch = _missingResearchEvidence/,
-    "步数上限和异常收尾也不能绕过研究证据门");
 });
 
 test("每个注册工具都有按需加载的压缩场景与最小调用例子", () => {

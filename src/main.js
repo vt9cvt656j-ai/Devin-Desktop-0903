@@ -40888,44 +40888,30 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
             run._incompleteReason = run._incompleteReason || `subagent_results_pending:${_openIds}`;
           }
         }
-        // A quiet model turn is an end-turn decision. Classifier/profile output can
-        // describe desirable research, runtime effects, UI checks, or plan state, but
-        // it is context rather than authority for the harness to ask the model again.
-        // Preserve those facts for final accounting; only an already-observed red
-        // build/test below gets a small, strictly bounded recovery opportunity.
-        const _missingEffects = _missingRequiredEffects(run, {
-          workspaceOps: _implOps,
-          runtimeEffects: _runtimeEffects,
-          externalEffects: _externalEffects,
-        });
-        const _missingRequiredEffect = _missingEffects.length > 0;
-        // 交付前自验证门：改了源码却整轮零验证证据（没跑构建/类型检查/测试/运行，
-        // 也没跑诊断）= “交付即报错”的直接根因。这里只管“完全没验证过”；有正式运行时
-        // 义务（_missingRequiredEffect）或已有诊断阻断（_diagnosticBlock）时交给那两道门，不重复催。
+        // A quiet model turn is an end-turn decision. The harness no longer labels it incomplete
+        // on a classifier PREDICTION of what the task needed — the required-effect and
+        // research-evidence ledger set `required_effect_missing:` / `research_evidence_missing:`
+        // here, both derived from the intent profile's guess, and both are removed (stage 2,
+        // AGENT_LOOP_REBUILD.md). Every label set here is now grounded in an OBSERVED fact: the
+        // model wrote code and ran no verification, or a declared semantic review is still open.
+        // The red-build and new-diagnostics facts below still get their bounded recovery turn.
+        //
+        // 交付前自验证门（纯执行事实）：改了源码 + 整轮零验证证据（没跑构建/类型检查/测试/运行）
+        // + 无诊断阻断 = “交付即报错”的直接根因。Freshness, not existence: `_verifiedAtImplOps
+        // >= _implOps` means the verification is newer than the last edit — one `npm test` after
+        // edit #1 must NOT certify edits #2–#12 (that monotonic bug certified the edit that broke
+        // the build).
         const _mutatedCode = didMutate && ([..._mutatedFiles].some((p) => _CODE_FILE_RE.test(String(p)))
           || run._codeWrittenByCommand === true);
-        // Freshness, not existence. This used to read `verificationPassed || didVerify ||
-        // _verifiedAtImplOps >= 0` — three credentials that are monotonic for the life of the
-        // run, so one `npm test` after edit #1 certified edits #2-#12 as well, including the
-        // one that broke the build. The comment two lines above already specified the right
-        // rule (`_verifiedAtImplOps >= _implOps`); the code compared against 0.
-        // `implementationVersion` is stamped onto every evidence record and was read nowhere.
         const _hasVerifyEvidence = _verifiedAtImplOps >= _implOps
           || (Array.isArray(run._executionEvidence)
               && run._executionEvidence.some((e) => _evidenceCertifies(e, _implOps)));
         const _codeDeliveredUnverified = run.mode === "agent" && _mutatedCode && !_hasVerifyEvidence
-          && !run._diagnosticBlock && !_missingRequiredEffect;
-        const _missingResearch = _missingResearchEvidence(run.engineering, _researchEvidence);
+          && !run._diagnosticBlock;
         // Browser operation dedup ledger: track recent actions to prevent repeated same operations
         if (!run._browserOpLog) run._browserOpLog = [];
         if (_semanticRuntimeAtImplOps >= 0 && _semanticReviewBlocked && !run._incompleteReason) {
           run._incompleteReason = "semantic_runtime_review_missing";
-        }
-        if (_missingRequiredEffect && !run._incompleteReason) {
-          run._incompleteReason = `required_effect_missing:${_missingEffects.join(",")}`;
-        }
-        if (_missingResearch.length && !run._incompleteReason) {
-          run._incompleteReason = `research_evidence_missing:${_missingResearch.join(",")}`;
         }
         if (_codeDeliveredUnverified && !run._incompleteReason) {
           run._incompleteReason = "code_delivered_unverified";
@@ -42292,14 +42278,14 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
 
       // ── 调查死循环断路器：「一直查/读，就是不实现」──────────────────────────
       // churn 的反面：智能体把 search/read 当成了任务本身，查了一大堆却一行不写。
-      // agent 模式下，读类操作攒到一定量、却零实现 → 强推它动手。每个 run 顶 2 次。
-      const _effectContract = _requiredEffectContract(run);
-      const _requiredProgressOps = _effectContract.workspace
-        ? _implOps
-        : _effectContract.runtime.length
-        ? _runtimeEffects.size
-        : _externalEffects.size;
-      if (run.mode === "agent" && _live() && _requiredProgressOps === 0 && _novelEvidenceCount >= 6 && _implNudges < 2) {
+      //
+      // 触发信号是**纯执行事实**，不再问画像"这活儿该产出哪种效果"：读了 ≥6 份新证据，
+      // 却**任何一种产出都没有**（没写文件、没跑命令、没有外部副作用）。此前这里用
+      // `_requiredEffectContract` 挑"该看哪个计数"——那是分类器的预测，正是本次重构在拆的
+      // 那一层。真正的死循环是"读一堆、零产出"，和分类器猜的任务类型无关；改用"任一产出
+      // 为零"更保守：跑了命令但没写文件的 run 不会再被误催。每个 run 顶 2 次。
+      const _anyProgressOps = _implOps + _runtimeEffects.size + _externalEffects.size;
+      if (run.mode === "agent" && _live() && _anyProgressOps === 0 && _novelEvidenceCount >= 6 && _implNudges < 2) {
         _implNudges++;
         runHadTrouble = true;
         _pushNudge("implLoop", `⚠️ 你已经取得 ${_novelEvidenceCount} 份新的读取/搜索证据，**仍没有实际改动**。调查是手段，不是产出；如果这是修复/实现任务，现在基于已掌握内容直接 write_file / edit_file，别继续追加相似搜索。只有纯查询/解释任务才应直接给结论收尾。`);
