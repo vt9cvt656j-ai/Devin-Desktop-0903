@@ -282,6 +282,12 @@ AUTO_LOAD_DEPS = {
   // Injecting the REAL table (not a stub) is what makes "gitlab_search still maps" a genuine
   // assertion about shipped behaviour.
   _RETIRED_SEARCH_ALIASES: loadConst("_RETIRED_SEARCH_ALIASES"),
+  // The runtime-obligation floor is read by _mergeAiIntentProfile. Injecting the REAL one
+  // keeps "用户说了要跑就必须跑" an assertion about shipped behaviour rather than a stub.
+  _requestedRuntimeObligations: load("_requestedRuntimeObligations", {
+    _RUNTIME_REQUEST_FLOOR: loadConst("_RUNTIME_REQUEST_FLOOR"),
+    _RUNTIME_FLOOR_VETO: loadConst("_RUNTIME_FLOOR_VETO"),
+  }),
 };
 // _selectInitialTools is loaded in many isolated tests. Keep its resolved
 // intent-boundary helpers available in the shared harness rather than making
@@ -21920,4 +21926,94 @@ test("存盘节流按上一次真实耗时退避——贵的存盘必须自己�
     "下一次等待至少是上一次耗时的两倍，代价越高退得越远");
   assert.match(seg, /Math\.min\(60000,/, "退避要封顶，再慢也不能久到丢数据");
   assert.match(seg, /anyStreaming \? 5000 : 500/, "基础节流保持不变，只在更贵时才拉长");
+});
+
+test("用户明说要跑，就必须真的跑——不受判定器是否 declare 影响", () => {
+  // 复现自实测（deepseek-v4-pro，2026-08-09）：用户发「请你运行我的项目」，整个
+  // thinking 块都在斟酌"回复应该短""要不要补一句那要不要现在就跑起来看看效果"，
+  // 一个工具都没调。根因不是模型懒，是系统根本没给它义务：运行义务的唯一来源是
+  // 判定器填 runtimeActions，判定器没填 → _requiredEffectContract 第一行 return
+  // empty → 收尾时没有任何东西检查"用户要的运行做了没"。
+  const floor = AUTO_LOAD_DEPS._requestedRuntimeObligations;
+
+  // 必须建立义务的祈使句
+  for (const [msg, kind] of [
+    ["请你运行我的项目", "run"],            // 截图里的原话
+    ["帮我跑一下", "run"],
+    ["运行一下", "run"],
+    ["启动这个程序", "run"],
+    ["把项目跑起来", "run"],
+    ["please run it", "run"],
+    ["run my project", "run"],
+    ["start the server", "run"],
+    ["帮我编译一下", "build"],
+    ["build the project", "build"],
+    ["跑一下测试", "test"],
+    ["run the tests", "test"],
+  ]) {
+    assert.ok(floor(msg).includes(kind), `「${msg}」必须建立 ${kind} 义务，实际 ${JSON.stringify(floor(msg))}`);
+  }
+
+  // 「跑测试」只算 test，不该顺带要求把程序也启动起来
+  assert.deepEqual(floor("跑一下测试"), ["test"], "测试请求不该升级成额外的运行义务");
+
+  // 绝不能误触发：问句、否定、以及只是提到"运行"的陈述
+  for (const msg of [
+    "怎么运行这个项目",
+    "如何启动服务",
+    "运行的时候报错了，看看是什么原因",
+    "先别跑，我还没写完",
+    "不用运行，我自己看",
+    "how do I run this",
+    "why does it crash when I run it",
+    "don't run it yet",
+    "explain the build process without running anything",
+  ]) {
+    assert.deepEqual(floor(msg), [], `「${msg}」不是运行请求，地板不该触发`);
+  }
+
+  // 地板是并集，不是替代：判定器给的义务必须原样保留
+  const merge = extractFn("_mergeAiIntentProfile");
+  assert.match(merge, /\.\.\.\(Array\.isArray\(engineering\?\.runtimeActions\) \? engineering\.runtimeActions : \[\]\)/,
+    "判定器声明的 runtimeActions 必须仍在并集里——地板只能加，不能顶替判定");
+  assert.match(merge, /\.\.\._requestedRuntimeObligations\(text\)/,
+    "用户原话的地板必须并进 runtimeObligations，否则整条义务链依旧断在第一步");
+});
+
+test("「运行我的项目」一路走到收尾检查，缺了运行就是缺了", () => {
+  // 上一条测的是地板本身认不认得这句话；这条测的是**认出来之后有没有用**。
+  // 光有地板没有意义——这条链上任何一环断掉，行为都跟修之前一模一样：
+  //   runtimeObligations → explicitRuntimeAction → explicitMutation
+  //   → _runRequiredEffect() === "mutate" → 契约里有 runtime:run
+  //   → 收尾时没跑过就报 missing。
+  // 之前断的正是第一环，于是后面四环全是死代码。
+  const required = load("_runRequiredEffect");
+  const contract = load("_requiredEffectContract", {
+    _runRequiredEffect: required,
+    _RUNTIME_OBLIGATION_ORDER: RUNTIME_OBLIGATION_ORDER,
+    _EXTERNAL_OBLIGATION_ORDER: EXTERNAL_OBLIGATION_ORDER,
+    _runEffectTarget: () => "runtime",
+  });
+  const missing = load("_missingRequiredEffects", { _requiredEffectContract: contract });
+
+  // 判定器什么都没 declare，只有用户那句「请你运行我的项目」建立的地板
+  const engineering = {
+    runtimeObligations: AUTO_LOAD_DEPS._requestedRuntimeObligations("请你运行我的项目"),
+    externalObligations: [],
+  };
+  engineering.explicitRuntimeAction = engineering.runtimeObligations.length > 0;
+  engineering.explicitMutation = engineering.explicitRuntimeAction;
+  const run = { mode: "agent", engineering };
+
+  assert.deepEqual(engineering.runtimeObligations, ["run"], "地板必须先认出这是运行请求");
+  assert.equal(required(run), "mutate",
+    "有运行义务的一轮必须算 mutate——否则 _requiredEffectContract 第一行就 return empty，后面全部失效");
+  assert.deepEqual(contract(run).runtime, ["run"], "契约里必须真的带上 run");
+
+  // 一个工具都没调 → 收尾必须报缺失（这正是截图里那一轮的情形）
+  assert.deepEqual(missing(run, { runtimeEffects: [], workspaceOps: 0 }), ["runtime:run"],
+    "只回了一段话、没跑过，收尾必须认定义务未完成");
+  // 真跑过了 → 不再报缺失，不能变成永远满足不了的门
+  assert.deepEqual(missing(run, { runtimeEffects: ["run"], workspaceOps: 0 }), [],
+    "跑过之后义务必须能销账，否则智能体会被困在收不了尾的循环里");
 });
