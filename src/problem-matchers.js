@@ -154,7 +154,38 @@ function matchPython(text) {
   return out;
 }
 
-const MATCHERS = { tsc: matchTsc, rustc: matchRustc, gcc: matchGcc, eslint: matchEslint, python: matchPython };
+// Go's toolchain emits `file.go:line:col: message` with NO severity keyword, so the gcc
+// matcher — which requires an explicit `error:` / `warning:` — matched none of it. A Go
+// project therefore reported "0 problems" in the status bar while `go build` was failing,
+// and every error-aware path downstream (the Problems panel, the agent's build gate) was
+// looking at an empty list.
+//
+// Requiring the path to end in `.go` is what keeps this from stealing lines belonging to the
+// other matchers, and it is a strong enough discriminator that `auto` mode stays safe.
+function matchGo(text) {
+  const out = [];
+  // `vet:` prefixes go vet findings; `#` lines are package headers with no location.
+  const re = /^(?:vet:\s*)?(\.{0,2}[^\s:][^:]*\.go):(\d+):(?:(\d+):)?\s+(.*)$/;
+  for (const line of lines(text)) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith("#")) continue;
+    const m = re.exec(trimmed);
+    if (!m) continue;
+    const message = m[4].trim();
+    if (!message) continue;
+    out.push({
+      file: m[1], line: +m[2], col: m[3] ? +m[3] : 1,
+      // The Go toolchain only prints locations for real failures; `go vet` findings are
+      // advisory but still the thing that must be fixed before the build is trusted.
+      severity: /^warning\b/i.test(message) ? "warning" : "error",
+      message: message.replace(/^(?:error|warning):\s*/i, ""),
+      source: "go",
+    });
+  }
+  return out;
+}
+
+const MATCHERS = { tsc: matchTsc, rustc: matchRustc, gcc: matchGcc, eslint: matchEslint, python: matchPython, go: matchGo };
 
 // Choose a matcher from an explicit hint (e.g. "$tsc") or, failing that, by
 // sniffing the command. Returns "auto" to run every matcher and merge.
@@ -165,8 +196,13 @@ export function pickMatcher(name, command) {
   if (n.includes("eslint")) return "eslint";
   if (n.includes("gcc") || n.includes("clang") || n.includes("cpp")) return "gcc";
   if (/python|flake|mypy|pyright|ruff/.test(n)) return "python";
+  if (/^\$?go(lang)?$|gopls|staticcheck|golangci/.test(n)) return "go";
 
   const c = String(command || "").toLowerCase();
+  // Anchored to the `go` SUBCOMMAND, not the bare word: "django", "mongo" and "logo" all
+  // contain it, and mis-sniffing would hand their output to the wrong matcher.
+  if (/(^|[;&|]\s*)go\s+(build|vet|test|run|install|generate)\b/.test(c)
+    || /\bgolangci-lint\b|\bstaticcheck\b/.test(c)) return "go";
   if (/\bcargo\b|\brustc\b/.test(c)) return "rustc";
   if (/\btsc\b|vue-tsc|tspc/.test(c)) return "tsc";
   if (/eslint/.test(c)) return "eslint";

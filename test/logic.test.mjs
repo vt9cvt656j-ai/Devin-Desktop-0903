@@ -2272,6 +2272,166 @@ test("dangerous commands are gated in auto mode; ordinary tools are not", async 
   assert.equal(asked.length, 1, "approve mode asks before a write");
 });
 
+// Go emits `file.go:line:col: message` with NO severity keyword, so the gcc matcher — which
+// requires an explicit `error:`/`warning:` — matched none of it. A Go project reported
+// "0 problems" in the status bar while `go build` was failing, and every error-aware path
+// downstream was reading an empty list.
+test("Go compiler and vet output is parsed into real problems", async () => {
+  const { parseProblems, pickMatcher } = await import("../src/problem-matchers.js");
+  // Verbatim from a real failing build.
+  const build = [
+    "# githuh/cmd/githuh",
+    "cmd/githuh/main.go:15:22: undefined: newModel",
+    "# githuh/internal/ui",
+    "internal/ui/ui.go:159:12: cannot use err (variable of type error) as string value in argument",
+    "internal/ui/ui.go:170:12: cannot use err (variable of type error) as string value in return statement",
+  ].join("\n");
+  const problems = parseProblems(build, { command: "go build ./..." });
+  assert.equal(problems.length, 3, "all three errors must be seen — this used to be 0");
+  assert.deepEqual(problems.map((p) => `${p.file}:${p.line}:${p.col}`), [
+    "cmd/githuh/main.go:15:22", "internal/ui/ui.go:159:12", "internal/ui/ui.go:170:12",
+  ]);
+  assert.ok(problems.every((p) => p.severity === "error" && p.source === "go"));
+  // `# package` headers carry no location and must not become phantom problems.
+  assert.ok(!problems.some((p) => String(p.file).startsWith("#")));
+
+  // go vet prefixes its findings, and relative paths keep their ./ prefix.
+  const vet = parseProblems("vet: ./main.go:10:2: unreachable code", { command: "go vet ./..." });
+  assert.equal(vet.length, 1);
+  assert.equal(vet[0].file, "./main.go", "the ./ prefix is part of the path Go reports");
+  assert.equal(vet[0].line, 10);
+  assert.equal(vet[0].col, 2);
+  assert.equal(vet[0].message, "unreachable code", "the `vet:` prefix is stripped, the message is not");
+
+  // Sniffing is anchored to the go SUBCOMMAND — "django", "mongo" and "logo" all contain
+  // "go", and mis-sniffing would hand their output to the wrong matcher.
+  assert.equal(pickMatcher("", "go build ./..."), "go");
+  assert.equal(pickMatcher("", "go test ./... -run TestX"), "go");
+  assert.equal(pickMatcher("", "golangci-lint run"), "go");
+  for (const c of ["django-admin check", "mongo --eval x", "npm run logo", "echo going"]) {
+    assert.notEqual(pickMatcher("", c), "go", `${c} must not be sniffed as Go`);
+  }
+  assert.equal(pickMatcher("", "cargo build"), "rustc", "existing matchers keep priority");
+  assert.equal(pickMatcher("", "tsc -p ."), "tsc");
+});
+
+// The observed churn: one batch edit broke the build, `go build` reported all 3 errors at
+// once, and the agent then spent FOUR separate turns applying +1/−1 edits. Four round-trips
+// and four full contexts to fix what the compiler had already enumerated in one shot.
+test("a multi-error build failure demands one batched fix, not one turn per error", async () => {
+  const { parseProblems } = await import("../src/problem-matchers.js");
+  const withParser = (out, cmd) => load("_compileErrorBatchHint", { parseProblems })(cmd, out);
+  const build = [
+    "cmd/githuh/main.go:15:22: undefined: newModel",
+    "internal/ui/ui.go:159:12: cannot use err (variable of type error) as string value",
+    "internal/ui/ui.go:170:12: cannot use err (variable of type error) as string value",
+  ].join("\n");
+
+  const text = withParser(build, "go build ./...");
+  assert.match(text, /\[BATCH_FIX\]/);
+  assert.match(text, /3 条错误/, "the count comes from the parsed list, not a guess");
+  assert.match(text, /2 个文件/);
+  assert.match(text, /cmd\/githuh\/main\.go:15:22/, "each location is named so no second lookup is needed");
+  assert.match(text, /在同一轮里全部修完/);
+  assert.match(text, /不要一次只修一条/, "the anti-pattern is called out explicitly");
+  // `undefined:` is the rename fingerprint — patching the error site treats the symptom.
+  assert.match(text, /find_symbol \/ lsp_references/, "an undefined symbol means call sites, not a local patch");
+
+  // A single error needs no batching advice — the hint must stay silent rather than nag.
+  assert.equal(withParser("cmd/githuh/main.go:15:22: undefined: newModel", "go build ./..."), "");
+  // Clean output, or output with no parseable locations, is silent too.
+  assert.equal(withParser("", "go build ./..."), "");
+  assert.equal(withParser("panic: something went wrong", "go run ."), "");
+  // Type errors without a rename must not claim a rename happened.
+  const noRename = withParser([
+    "internal/ui/ui.go:159:12: cannot use err as string value",
+    "internal/ui/ui.go:170:12: cannot use err as string value",
+  ].join("\n"), "go build ./...");
+  assert.match(noRename, /\[BATCH_FIX\]/);
+  assert.doesNotMatch(noRename, /lsp_references/, "no undefined symbol → no rename claim");
+
+  // It must reach the model: the hint is appended to the failing command's result.
+  const executor = extractFn("_executeToolStepInner");
+  assert.match(executor, /const _batchHint = _compileErrorBatchHint\(call\.command, output\);[\s\S]{0,120}_content \+= /,
+    "the batched-fix instruction must be attached to the failing run_cmd result");
+});
+
+// `_enforceModelRequestBudget` measured the request by JSON.stringify-ing the WHOLE thing —
+// every message, every write_file body — then walking the result character by character. It
+// does that from eight places, several inside trim loops, so a long run was O(n²): each of N
+// oversized historical calls re-measured all N messages. On a 3.6MB transcript that is ~0.7s
+// of blocked main thread PER MODEL TURN, during request preparation — before any token
+// streams. That is the "freezes and sits on the loading spinner" report.
+//
+// The fix memoises per-message sizes by object identity. These tests pin the two properties
+// that make it a pure speed-up: the total must be byte-IDENTICAL to the naive measure, and
+// the cache must notice the one in-place mutation that does not change identity.
+test("the request-size measure is byte-identical to stringifying the whole request", () => {
+  const naive = (messages, tools) => {
+    const json = JSON.stringify({ messages, tools });
+    return new TextEncoder().encode(json).length;
+  };
+  const budget = (messages, tools) => {
+    // Drive the real function and read the size it computed off the error it throws when the
+    // cap cannot be met — the only place it surfaces its own number. The cap is floored at
+    // 1024 internally, so each case is padded past that; and every case is shaped so NO trim
+    // path fires (see below), which is what makes the thrown number comparable to the naive
+    // measure of the same input.
+    try {
+      load("_enforceModelRequestBudget", {
+        _clipPreservingErrors: (s, n) => String(s).slice(0, n),
+        _requestByteEncoder: null,
+      })(messages, tools, 1);
+    } catch (e) { return e.requestBytes; }
+    return null;
+  };
+
+  // Untrimmable by construction:
+  //   * `system` messages are skipped by the mid-transcript fold loop;
+  //   * the pad is under its 1600-char threshold anyway;
+  //   * the trailing user message is the newest, and at 2 chars the final while-loop breaks
+  //     immediately instead of shrinking it;
+  //   * the assistant tool_call has no matching `role:"tool"` reply, so it never enters
+  //     `completedToolCallIds` and the historical-argument loop ignores it;
+  //   * no message carries an image, so the media loops are inert.
+  const pad = { role: "system", content: "p".repeat(1500) };
+  const tail = { role: "user", content: "go" };
+  const wrap = (...middle) => [pad, ...middle, tail];
+
+  for (const [label, messages, tools] of [
+    ["baseline", wrap(), []],
+    ["several messages (comma count)", wrap({ role: "system", content: "a" }, { role: "system", content: "b" }), []],
+    ["CJK content", wrap({ role: "system", content: "把这些问题都解决掉，不要漏。" }), []],
+    ["emoji / surrogate pairs", wrap({ role: "system", content: "📌🚀 boundary 中文 mixed 🇨🇳" }), []],
+    ["strings needing JSON escapes", wrap({ role: "system", content: 'quote " backslash \\ newline \n tab \t' }), []],
+    ["with tools", wrap(), [{ type: "function", function: { name: "read_file", description: "读取文件" } }]],
+    ["assistant tool_calls", wrap({
+      role: "assistant",
+      tool_calls: [{ id: "c1", function: { name: "write_file", arguments: JSON.stringify({ path: "a.ts", content: "y".repeat(400) }) } }],
+    }), []],
+  ]) {
+    const got = budget(messages, tools);
+    assert.notEqual(got, null, `case must actually reach the size check: ${label}`);
+    assert.equal(got, naive(messages, tools), `envelope arithmetic must be exact: ${label}`);
+  }
+});
+
+test("the size cache notices the one mutation that does not change object identity", () => {
+  // Rewriting `call.function.arguments` edits a NESTED object; the message's own identity is
+  // unchanged, so an identity-keyed cache would happily return the pre-shrink size and the
+  // trim loop would keep shrinking things that are already small enough.
+  const src = extractFn("_enforceModelRequestBudget");
+  assert.match(src, /_sizeCache\.delete\(historical\.message\)/,
+    "the in-place historical-argument rewrite must invalidate its message's cached size");
+  assert.match(src, /historicalCalls\.push\(\{ call, raw, name: [^}]*, message \}\)/,
+    "…which requires carrying the owning message when the call is collected");
+  // And the cache must be keyed on the message object, not an index — every other trim site
+  // REPLACES prepared[i], and identity is what makes those free.
+  assert.match(src, /const _sizeCache = new WeakMap\(\)/);
+  assert.doesNotMatch(src, /const requestBytes = \(\) => byteLength\(\{ messages: prepared/,
+    "must not regress to measuring the whole request on every call");
+});
+
 // Permission rules were two booleans plus a hardcoded regex — nothing a team could express
 // or check into git. This is the `Tool(pattern)` grammar, deliberately the same shape Claude
 // Code uses so anyone already writing those rules does not have to relearn them.
