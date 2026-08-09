@@ -334,16 +334,22 @@ test("every quiet-turn re-entry is latched or counted", () => {
   const quiet = loop.slice(start, end);
   const continues = count(quiet, /\bcontinue;/g);
   assert.ok(continues > 0, "the quiet-turn branch should retain bounded recovery paths");
+  // Every remaining re-entry is grounded in an OBSERVED fact or paid-for work, never in a
+  // profile guess. The `_noWorkNudged` gate — the one place a classifier guess ("this task
+  // should have changed something") still forced a turn — was removed in the loop rebuild
+  // (AGENT_LOOP_REBUILD.md stage 1); its behaviour moved into agent_core.txt. If it comes
+  // back as a `continue`, this list and the count below must stay honest.
   for (const [latch, why] of [
     [/run\._subAgentFinishIntercepted/, "sub-agent integration, once per run"],
-    [/run\._noWorkNudged/, "asked to change something and changed nothing, once per run"],
     [/run\._diagnosticNudges/, "new diagnostics, bounded"],
     [/buildFixAttempts/, "red build, bounded"],
     [/session\._steerQueue/, "user steering drains before the run ends"],
   ]) {
     assert.match(quiet, latch, `a bounded re-entry lost its guard (${why})`);
   }
-  assert.ok(continues <= 5,
+  assert.doesNotMatch(quiet, /_missingEffects\.includes\("workspace"\)[\s\S]{0,400}?continue;/,
+    "a profile-derived 'you owe a change' guess must never force a re-entry again");
+  assert.ok(continues <= 4,
     `${continues} re-entry points in the quiet-turn branch — every one needs a latch listed above`);
 });
 

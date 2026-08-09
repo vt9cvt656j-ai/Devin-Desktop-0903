@@ -40930,33 +40930,16 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
         if (_codeDeliveredUnverified && !run._incompleteReason) {
           run._incompleteReason = "code_delivered_unverified";
         }
-        // ── 「读完就停」：用户要的是改动，这一轮却一个改动都没有 ──────────────
+        // ── 「读完就停」曾经在这里由 harness 画像门强制补一回合——已移除 ──
         //
-        // 观察到的真实行为：用户让它做 X，它读了几个文件，顺手指出某处有个错误，然后
-        // 就收尾了 —— 用户既没让它盯着那个错误，X 也根本没做。部署中的系统提示词把这个
-        // 称作"最让用户崩溃的失败模式"，而 harness 一直允许它：上面那句
-        // `_incompleteReason = required_effect_missing:…` **只记账**，记完就直接 break。
-        // 模型安静了一轮 = 结束，哪怕它明摆着什么都没干。
+        // 那道门读的是 `_missingEffects.includes("workspace")`，也就是**分类器/画像猜**
+        // 这活儿"本该动点东西"。这正是本次重构要根除的那一类：模型安静一轮就是它的收尾
+        // 判断，harness 不拿一个意图猜测去覆盖它。「读了几个文件、顺手指出个无关错误就
+        // 收尾」这个失败模式，现在由**提示词**承担（agent_core.txt 规则 2：做/改/跑必须
+        // 产出真实结果、顺带发现的问题不是任务），而不是由这里的画像门补回合——参见
+        // AGENT_LOOP_REBUILD.md 阶段 1。下面保留的两道门只认**已观测到的执行事实**
+        // （新增诊断、红构建），不认画像。
         //
-        // 这里只在最硬的信号上催、而且只催一次：
-        //   · `_missingEffects` 含 workspace ⇒ `_requiredEffectContract` 要求改动，而它
-        //     只在 `explicitWorkspaceMutation` / 被引导追加要求时为真 —— 是**用户明说
-        //     要改**，不是分类器猜"这活儿大概该动点东西"（当年把这类 nudge 整批删掉，
-        //     针对的正是那种猜测）；
-        //   · 本轮真的零改动（!didMutate && _implOps === 0）。
-        // 催过一次仍然零改动，就按诚实的 incomplete 收尾，不再纠缠 —— 反复催一个决定
-        // 不动手的模型，只会把体验从"没做"变成"没做还很慢"。
-        if (_missingEffects.includes("workspace") && !didMutate && _implOps === 0
-            && !run._noWorkNudged && _live()) {
-          run._noWorkNudged = true;
-          _pushNudge("noWorkDone",
-            "[还没有开始执行] 用户这轮明确要求的是**改动**，但到现在为止一次 write_file / edit_file / run_cmd 都没有发生。"
-            + "只读文件、只描述现状、只指出某处有问题——都不算做完，用户要的那件事一步都没推进。\n"
-            + "如果你在路上发现了别的错误：那是**顺带发现**，不是用户交给你的任务。除非它正好挡住你要做的事，"
-            + "否则不要把它当成本轮目标、更不要报告完它就收尾；把它记在最后一句提一下即可。\n"
-            + "现在直接动手做用户要求的那件事：定位到要改的文件，用 write_file / edit_file 真正改出来，再验证。");
-          continue;
-        }
         // New-diagnostics → fix → re-check. Same shape as the red-build gate below, and
         // for the same reason: the agent introduced errors that are not in the baseline,
         // so "done" is not true yet. `run._diagnosticBlock` is cleared as soon as the
