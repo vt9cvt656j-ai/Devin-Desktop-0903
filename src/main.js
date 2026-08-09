@@ -18749,69 +18749,6 @@ async function _aiIntentProfile(text, config, session = null, context = null) {
   return adoptWithinForegroundWindow(physicalFlight);
 }
 
-/**
- * 用户**原话**直接建立的运行义务——不管判定器declare了什么。
- *
- * # 这条地板补的是什么洞
- *
- * 整条运行义务链的入口只有一个：判定器在 verdict 里填 `runtimeActions`。填了，
- * `explicitRuntimeAction` → `explicitMutation` → `_runRequiredEffect` 返回 "mutate" →
- * `_requiredEffectContract` 才会建契约 → 收尾时缺失的 `runtime:run` 才拦得住。没填，
- * `_requiredEffectContract` **第一行就 return empty**，整条链一个字都不执行。
- *
- * 于是「请你运行我的项目」这种毫无歧义的祈使句，只要判定器没把它归成运行动作，
- * 这一轮就没有任何义务：模型写一段"要不要现在跑起来看看效果？"就可以收工，而系统
- * 认为一切正常——用户要的是**跑**，拿到的是**聊**。实测复现（deepseek-v4-pro，
- * 2026-08-09）：整个 thinking 块都在斟酌怎么措辞回复，一个工具都没调。
- *
- * 判定器越弱，漏得越多，而这恰恰是弱模型最需要被兜住的地方。
- *
- * # 为什么这里可以用正则
- *
- * 声明优先架构里，判断留给模型、正则只做**权限和地板**。这就是地板：它只做并集、
- * 从不删除判定器给出的义务，也从不改变别的判断。判定器说要跑 → 跑；判定器没说而
- * 用户明说了要跑 → 也跑。两者都没有 → 维持原状。
- *
- * 命中条件刻意收窄：必须是祈使（请/帮/一下/起来）或带明确宾语（项目/程序/it/the app）。
- * 「运行的时候报错」「怎么运行」「先别跑」都不算——地板误触发会让智能体去跑用户
- * 没让它跑的东西，比漏触发更糟。
- */
-const _RUNTIME_REQUEST_FLOOR = [
-  ["run", [
-    /(?:请(?:你)?|帮(?:我|忙)|麻烦(?:你)?)\s*(?:把\s*\S{0,12}?\s*)?(?:运行|跑|启动|执行)/,
-    /(?:运行|跑|启动|执行)\s*(?:一下|一下下|下|起来|一遍)/,
-    /(?:运行|跑|启动)\s*(?:我的|这个|那个|本|该)?\s*(?:项目|程序|应用|代码|服务|demo)/,
-    /\b(?:please\s+)?(?:run|start|launch|boot)\s+(?:it|this|that|mine)\b/i,
-    /\b(?:run|start|launch|boot)\s+(?:the|my|our)\s+(?:app|application|project|program|code|server|demo|thing)\b/i,
-  ]],
-  ["build", [
-    /(?:请(?:你)?|帮(?:我|忙)|麻烦(?:你)?)\s*(?:编译|构建|打包)/,
-    /(?:编译|构建|打包)\s*(?:一下|下|起来|一遍)/,
-    /\b(?:please\s+)?(?:build|compile)\s+(?:it|this|the|my|our)\b/i,
-  ]],
-  ["test", [
-    /(?:请(?:你)?|帮(?:我|忙)|麻烦(?:你)?)\s*(?:跑|运行|执行)\s*(?:一下|下)?\s*(?:单元)?测试/,
-    /(?:跑|运行|执行)\s*(?:一下|下)?\s*(?:单元)?测试/,
-    /\b(?:please\s+)?run\s+(?:the\s+)?tests?\b/i,
-  ]],
-];
-/** 问句和否定：命中任何一条就整句放弃，不做逐条抵消——宁可漏，不可误。 */
-const _RUNTIME_FLOOR_VETO = /怎么|如何|怎样|为什么|为啥|能不能|可不可以|是不是|该不该|吗\s*[?？]?\s*$|别|不要|不用|无需|先不|暂时不|\bhow\s+(?:do|to|can)\b|\bwhy\b|\bshould\s+i\b|\bdon'?t\s+(?:run|build|test)\b|\bdo\s+not\s+(?:run|build|test)\b|\bwithout\s+running\b/i;
-
-/** 用户原话里明确要求的运行义务；判断不了就返回空数组（地板不猜）。 */
-function _requestedRuntimeObligations(text) {
-  const raw = String(text || "").trim();
-  if (!raw || raw.length > 2000) return [];      // 超长文本里出现动词不代表这是祈使
-  if (_RUNTIME_FLOOR_VETO.test(raw)) return [];
-  const out = [];
-  for (const [kind, patterns] of _RUNTIME_REQUEST_FLOOR) {
-    if (patterns.some((re) => re.test(raw))) out.push(kind);
-  }
-  // 「跑一下测试」同时像 run 也像 test；测试更具体，按更具体的那个算，避免把
-  // 「跑测试」升级成「还得把程序也启动起来」这种用户没要求的义务。
-  return out.includes("test") ? out.filter((k) => k !== "run") : out;
-}
-
 // AI 判定是唯一的新意图来源。判定不可用时不跳回关键词正则，也绝不把上一轮的
 // 修改/运行义务带进当前消息。真正的 continue/correct 由判定器在 verdict 内补全。
 function _mergeAiIntentProfile(base, intents, text, priorState = null) {
@@ -18914,12 +18851,7 @@ function _mergeAiIntentProfile(base, intents, text, priorState = null) {
   m.implementation = !!(m.implementation || workspaceAction === "modify");
   m.explicitWorkspaceMutation = !!(m.explicitWorkspaceMutation || workspaceAction === "modify");
   m.explicitReadOnly = !!(m.explicitReadOnly || (workspaceAction === "inspect" && !m.implementation));
-  // 判定器的 runtimeActions ∪ 用户原话建立的地板。并集：判定器只能加义务，不能靠
-  // 「没提到」把用户明说的运行要求消掉（见 _requestedRuntimeObligations）。
-  m.runtimeObligations = Array.from(new Set([
-    ...(Array.isArray(engineering?.runtimeActions) ? engineering.runtimeActions : []),
-    ..._requestedRuntimeObligations(text),
-  ]));
+  m.runtimeObligations = Array.isArray(engineering?.runtimeActions) ? [...engineering.runtimeActions] : [];
   m.externalObligations = Array.isArray(engineering?.externalActions) ? [...engineering.externalActions] : [];
   m.explicitRuntimeAction = !!(m.explicitRuntimeAction || m.runtimeObligations.length > 0);
   m.explicitExternalAction = !!(m.explicitExternalAction || m.externalObligations.length > 0);
