@@ -679,13 +679,20 @@ export function renderPanel(body, ctx = {}) {
 }
 
 // ===== ADAPTIVE RUNTIME POLICY =====
-// 根据 avgMastery 输出工具加载策略
-
+// 根据 avgMastery 输出工具加载策略。
+//
+// ⚠️ 目前**没有调用方**：策略算出来了，工具装载路径谁也没读它，所以三档档位从未生效过。
+// 要接的话，接的是工具目录的 initialToolCount / criticMaxTools。
+//
+// 顺带修掉的实现 bug：原来写的是 `growthState || state`，再去问这个对象有没有
+// `avgMastery()` 方法或 `avg_mastery` 字段——而模块内的 `state` 两者都没有（avgMastery 是
+// 模块级函数，不是 state 的方法）。于是 avgP 恒等于 0.5 的兜底值，永远落在「进阶」档，
+// 就算接上去也不会随熟练度变化。现在默认走模块自己的 getAvgMastery()。
 export function getRuntimePolicy(growthState = null) {
-    const g = growthState || state || {};
-    const avgP = typeof g.avgMastery === 'function' ? g.avgMastery() : 
-                  (g.avg_mastery ?? 0.5); // fallback to medium
-    
+    const g = growthState || {};
+    const avgP = typeof g.avgMastery === 'function' ? g.avgMastery()
+               : (typeof g.avg_mastery === 'number' ? g.avg_mastery : getAvgMastery());
+
     // 三档策略：新手/进阶/专家
     if (avgP > 0.7) {
         // 专家模式：开放更多工具窗口

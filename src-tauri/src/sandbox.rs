@@ -204,21 +204,10 @@ pub fn available() -> bool {
     }
 }
 
-/// Human-readable name of the active mechanism, for the UI and for tool results.
-pub fn mechanism() -> &'static str {
-    #[cfg(target_os = "macos")]
-    {
-        if seatbelt_available() { "seatbelt" } else { "none" }
-    }
-    #[cfg(target_os = "linux")]
-    {
-        if bubblewrap_available() { "bubblewrap" } else { "none" }
-    }
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-    {
-        "none"
-    }
-}
+// NOTE: there is deliberately no `mechanism()` accessor here. Callers that need to report the
+// confinement in effect read `Plan::kind` off the plan they actually ran (see `tasks.rs`), which
+// is what happened rather than what is merely available — the two differ whenever a caller passes
+// `sandbox: false`, and an accessor that re-probes would quietly contradict the result it labels.
 
 /// Rewrite `shell -lc <command>` into a confined invocation.
 ///

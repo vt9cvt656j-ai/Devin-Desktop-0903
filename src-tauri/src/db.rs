@@ -383,9 +383,51 @@ async fn clickhouse_query(url: &str, q: &str, cap: usize) -> Result<serde_json::
 
 // ---- Elasticsearch / OpenSearch（REST）----
 
+/// 把 ES 连接串拆成「请求用的 base」和「调用方是否显式放弃证书校验」。
+///
+/// 这里原本无条件 `danger_accept_invalid_certs(true)`：**每一个** https 集群的证书校验都被
+/// 关掉了，而连接串的 userinfo 里就带着账号密码——链路上任何人换一张自签证书即可同时拿到
+/// 凭据和查询结果，且没有任何提示。现在默认校验；内网自签集群按连接逐个用
+/// `?insecure_tls=true` opt-out（与 mssql 的 `?encrypt=off` 同一套写法），风险只留在主动
+/// 声明的那条连接上。
+///
+/// 只消费 TLS 这一个参数，其余 query 原样留在 base 里——不替调用方猜别的参数是什么意思。
+fn elastic_base_and_tls(url: &str) -> (String, bool) {
+    let trimmed = url.trim().trim_end_matches('/');
+    let Ok(mut u) = url::Url::parse(trimmed) else {
+        return (trimmed.to_string(), false);
+    };
+    if u.query().is_none() {
+        return (trimmed.to_string(), false);
+    }
+    let mut insecure = false;
+    let kept: Vec<(String, String)> = u
+        .query_pairs()
+        .filter(|(k, v)| {
+            let is_tls_optout = match k.as_ref() {
+                "insecure_tls" | "tls_insecure" | "insecure" => {
+                    matches!(v.as_ref(), "1" | "true" | "yes" | "on")
+                }
+                "sslmode" => v.as_ref() == "no-verify",
+                _ => false,
+            };
+            insecure |= is_tls_optout;
+            !is_tls_optout
+        })
+        .map(|(k, v)| (k.into_owned(), v.into_owned()))
+        .collect();
+    if kept.is_empty() {
+        u.set_query(None);
+    } else {
+        u.query_pairs_mut().clear().extend_pairs(kept);
+    }
+    (u.as_str().trim_end_matches('/').to_string(), insecure)
+}
+
 async fn elastic_query(url: &str, q: &str) -> Result<serde_json::Value, String> {
     let started = std::time::Instant::now();
-    let base = url.trim_end_matches('/');
+    let (base, insecure_tls) = elastic_base_and_tls(url);
+    let base = base.as_str();
     // query 格式：`GET /_cat/indices?format=json` 或 `POST /idx/_search {json}`；裸 JSON 默认 POST /_search。
     let t = q.trim();
     let (method, rest) = if let Some(r) = t.strip_prefix("GET ") {
@@ -424,7 +466,7 @@ async fn elastic_query(url: &str, q: &str) -> Result<serde_json::Value, String> 
     let client = reqwest::Client::builder()
         .connect_timeout(CONNECT_TIMEOUT)
         .timeout(QUERY_TIMEOUT)
-        .danger_accept_invalid_certs(true)
+        .danger_accept_invalid_certs(insecure_tls)
         .build()
         .map_err(|e| format!("HTTP 客户端初始化失败: {e}"))?;
     let mut req = match method {
@@ -767,6 +809,36 @@ fn redis_value_to_json(v: &redis::Value) -> serde_json::Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Certificate verification is the DEFAULT for Elasticsearch, and turning it off has to be
+    // asked for by the connection string. This driver shipped with an unconditional
+    // `danger_accept_invalid_certs(true)`, so every https cluster — credentials included — was
+    // MITM-able. The assertion that matters is the first one: a plain https base is verified.
+    #[test]
+    fn elastic_verifies_certificates_unless_the_url_opts_out() {
+        assert_eq!(
+            elastic_base_and_tls("https://user:pw@es.example.com:9200"),
+            ("https://user:pw@es.example.com:9200".to_string(), false),
+        );
+        // opt-out is consumed, not forwarded to the cluster as a query parameter
+        assert_eq!(
+            elastic_base_and_tls("https://es.internal:9200?insecure_tls=true"),
+            ("https://es.internal:9200".to_string(), true),
+        );
+        assert_eq!(
+            elastic_base_and_tls("https://es.internal:9200/?sslmode=no-verify"),
+            ("https://es.internal:9200".to_string(), true),
+        );
+        // a non-affirmative value is not an opt-out, and unrelated params survive untouched
+        let (base, insecure) = elastic_base_and_tls("https://es:9200?insecure_tls=false&x=1");
+        assert!(!insecure);
+        assert!(base.contains("x=1"), "unrelated query params must survive: {base}");
+        // an unparseable string still reaches the existing "地址无效" error path, verified
+        assert_eq!(
+            elastic_base_and_tls("not a url"),
+            ("not a url".to_string(), false),
+        );
+    }
 
     #[test]
     fn redis_args_split() {

@@ -146,8 +146,9 @@ export function toolPolicy(type) {
   return REGISTRY.get(String(type || "")) || DEFAULT_POLICY;
 }
 
-/** Every registered type whose policy satisfies `predicate`. */
-export function typesWhere(predicate) {
+/** Every registered type whose policy satisfies `predicate`. Internal: the derived
+ *  views below are the public surface. */
+function typesWhere(predicate) {
   const out = new Set();
   for (const [type, policy] of REGISTRY) if (predicate(policy, type)) out.add(type);
   return out;
@@ -169,9 +170,7 @@ export const mutatesWorkspace = (type) => toolPolicy(type).mutatesWorkspace;
 export const isFileMutation = (type) => toolPolicy(type).fileMutation;
 export const isFileEdit = (type) => toolPolicy(type).fileEdit;
 export const needsApproval = (type) => toolPolicy(type).needsApproval;
-export const isHooked = (type) => toolPolicy(type).hooked;
 export const blockedInReadOnlyMode = (type) => toolPolicy(type).readOnlyModeBlocked;
-export const hasRecoverableBlock = (type) => toolPolicy(type).recoverableBlock;
 
 /**
  * Which argument of `call` a worker sub-agent's scope is checked against, or "" when the tool
