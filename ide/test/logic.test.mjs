@@ -1504,113 +1504,6 @@ test("probe-loop detection: blind guess-and-check probing triggers a root-cause 
     "zero-mutation fact must come from the real mutation ticks");
 });
 
-test("split gate: relaxed to all task types, adaptive text, one-shot (#46/#48)", () => {
-  const planStepActionKind = load("_planStepActionKind");
-  const planStepDomain = load("_planStepDomain");
-  const splitGate = load("_splitGateNudgeMessage", {
-    _planStepActionKind: planStepActionKind,
-    _planStepDomain: planStepDomain,
-    _countExistingModules: load("_countExistingModules"),
-  });
-
-  // 领域归类是纯事实罗列（域词归档，不做决策）
-  assert.equal(planStepDomain({ content: "实现商品列表页面组件" }), "前端");
-  assert.equal(planStepDomain({ content: "实现订单接口与鉴权中间件" }), "后端");
-  assert.equal(planStepDomain({ content: "创建订单表结构与迁移脚本" }), "数据库");
-  assert.equal(planStepDomain({ content: "编写端到端回归测试" }), "测试");
-  assert.equal(planStepDomain({ content: "部署到 Docker 并配置流水线" }), "部署");
-  assert.equal(planStepDomain({ content: "梳理需求与技术选型" }), "", "无域词的步骤不硬归类");
-
-  const crossPlan = [
-    { content: "梳理需求与技术选型", status: "completed" },
-    { content: "实现商品列表页面组件", status: "pending" },
-    { content: "实现订单接口与鉴权中间件", status: "pending" },
-    { content: "创建订单表结构与迁移脚本", status: "pending" },
-    { content: "编写端到端回归测试", status: "pending" },
-    { content: "部署到 Docker 并配置流水线", status: "pending" },
-  ];
-  const bigProfile = { substantial: true, projectScope: true };
-
-  // ① 大任务（≥5 步跨 ≥2 域）+ 零并行派发 → 触发一次，完整事实与能力清单
-  const run = { engineering: bigProfile, _planSteps: crossPlan };
-  const msg = splitGate(run);
-  assert.match(msg, /并行机会·事实清单/);
-  assert.match(msg, /计划 6 步/);
-  assert.match(msg, /前端×1/);
-  assert.match(msg, /后端×1/);
-  assert.match(msg, /步骤2\(前端\)↔步骤3\(后端\)/, "相邻实现步跨域列为可能独立");
-  assert.match(msg, /run_worker/);
-  assert.match(msg, /run_subagent/);
-  assert.match(msg, /await_subagent/);
-  assert.match(msg, /你判断/, "判断权留给模型，不做硬拦截");
-  assert.ok(msg.length <= 400, `nudge 文本需精炼，实际 ${msg.length} 字`);
-  assert.equal(run._splitGateNudged, true);
-  assert.equal(splitGate(run), "", "严格一次性，不重复催");
-
-  // ② 静默保底：单领域纯实现计划（全前端、无调研步）→ 不触发（多角色规范红线）
-  const monoPlan = ["登录页面组件", "商品页面布局", "购物车组件", "结算页面样式", "首页响应式布局"]
-    .map((piece) => ({ content: "实现" + piece, status: "pending" }));
-  const monoRun = { engineering: bigProfile, _planSteps: monoPlan };
-  assert.equal(splitGate(monoRun), "");
-  assert.ok(!monoRun._splitGateNudged, "静默路径不能烧掉一次性额度，计划后续变跨域时还能触发");
-
-  // ③ 硬门槛已拆：无大工程字段甚至无 engineering profile，跨域计划照样触发（全任务类型）
-  assert.match(splitGate({ engineering: { substantial: true }, _planSteps: crossPlan }), /并行机会/);
-  assert.match(splitGate({ _planSteps: crossPlan }), /并行机会/, "改内容类无 profile 任务也适用");
-
-  // ④ 小任务：3 步跨域 → 精简版（≤120 字），如实说明 run_worker 对小任务负收益
-  const smallCross = {
-    _planSteps: [
-      { content: "实现商品列表页面组件", status: "pending" },
-      { content: "实现订单接口与鉴权中间件", status: "pending" },
-      { content: "编写端到端回归测试", status: "pending" },
-    ],
-  };
-  const smallMsg = splitGate(smallCross);
-  assert.match(smallMsg, /^\[并行机会\]/);
-  assert.match(smallMsg, /run_subagent/);
-  assert.match(smallMsg, /await_subagent/);
-  assert.match(smallMsg, /run_worker 不建议/, "小任务拆写入负收益的事实必须说明");
-  assert.match(smallMsg, /你判断/);
-  assert.ok(smallMsg.length <= 120, `精简版需 ≤120 字，实际 ${smallMsg.length} 字`);
-  assert.equal(smallCross._splitGateNudged, true);
-
-  // ⑤ investigate+implement 共存（单域也算：调研可后台化的事实）→ 精简版点名调研步
-  const bugPlan = {
-    engineering: { debugProject: true },
-    _planSteps: [
-      { content: "调查报错根因与调用链", status: "pending" },
-      { content: "修复商品页面组件报错", status: "pending" },
-      { content: "验证修复效果", status: "pending" },
-    ],
-  };
-  const bugMsg = splitGate(bugPlan);
-  assert.match(bugMsg, /步骤1\(调研\)/, "点名可后台化的调研步；debugProject 不再被排除");
-  assert.ok(bugMsg.length <= 120, `精简版需 ≤120 字，实际 ${bugMsg.length} 字`);
-
-  // ⑥ bugEvidence 让行：调试任务且取证门事实已成熟（账本 ≥2 次失败、尚未触发）→
-  //    本轮静默且不烧额度；bugEvidence 触发后下轮再出
-  const yieldRun = {
-    engineering: { debugProject: true },
-    _planSteps: bugPlan._planSteps,
-    _probeBatchLog: [{ fails: 1 }, { fails: 1 }],
-  };
-  assert.equal(splitGate(yieldRun), "", "同轮让行给 bugEvidence");
-  assert.ok(!yieldRun._splitGateNudged, "让行不烧一次性额度");
-  yieldRun._bugEvidenceGateNudged = true; // 取证门已出 → 下轮拆分门正常出
-  assert.match(splitGate(yieldRun), /并行机会/);
-
-  // ⑦ 计划不足 3 步 → 不触发（计划未建立/太小）
-  assert.equal(splitGate({ _planSteps: crossPlan.slice(0, 2) }), "");
-
-  // ⑧ 已有 worker/后台作业派发记录 → 不触发（已在并行推进）
-  assert.equal(splitGate({ engineering: bigProfile, _planSteps: crossPlan, _parallelDispatches: 1 }), "");
-  assert.equal(splitGate({ engineering: bigProfile, _planSteps: crossPlan, _subAgentJobs: new Map([[1, { id: 1 }]]) }), "");
-
-  // 接线自查：门挂在主循环、专用 nudge 键；只有真派发才记并行账本（被拦截的不算）
-  assert.match(SRC, /_pushNudge\("splitGate", _splitMsg\)/);
-  assert.match(SRC, /if \(isWorker \|\| it\.tc\.name === "run_subagent"\) run\._parallelDispatches = \(run\._parallelDispatches \|\| 0\) \+ 1;/);
-});
 
 test("bug-fix async evidence gate: fires once on unresolved root cause, yields to probeLoop (#46)", () => {
   const bugGate = load("_bugEvidenceGateNudgeMessage");
@@ -1659,22 +1552,6 @@ test("orchestrator metadata: parallel split/evidence tooling is selectable (#46)
   }
 });
 
-test("wrap-up honesty ledger: solo execution fact goes to critic material only (#46)", () => {
-  const soloFact = load("_soloExecutionFactLine");
-  // 拆分门提示过 + 全程零 worker/后台作业 → 一行事实
-  assert.equal(soloFact({ _splitGateNudged: true }), "[事实] 本任务全程单线程执行，拆分建议未采纳。");
-  // 没提示过 / 实际派发过 → 不记
-  assert.equal(soloFact({}), "");
-  assert.equal(soloFact({ _splitGateNudged: true, _parallelDispatches: 2 }), "");
-  assert.equal(soloFact({ _splitGateNudged: true, _subAgentJobs: new Map([[1, {}]]) }), "");
-  // The line is a pure run fact. It must not mutate the run or become a
-  // synthetic completion/permission result when the critic is unavailable.
-  const run = { _splitGateNudged: true };
-  const before = JSON.stringify(run);
-  assert.equal(soloFact(run), "[事实] 本任务全程单线程执行，拆分建议未采纳。");
-  assert.equal(JSON.stringify(run), before, "solo accounting is telemetry only");
-  assert.doesNotMatch(extractFn("_soloExecutionFactLine"), /BLOCKED|hard_blocked|continue\s*;/);
-});
 
 test("slow install/download commands get a factual duration note (no interception)", () => {
   const slowNote = load("_slowInstallCmdNote");
@@ -17613,12 +17490,12 @@ test("P2.1-收尾：模型自己派发的子智能体只记账，不制造阻断
   assert.match(quiet, /_subAgentJobs/);
   assert.match(quiet, /subagent_results_pending/,
     "unfinished jobs remain a truthful outcome fact");
-  // The integration chance is gated on `autoDispatched` — so a model-dispatched child can
-  // never trigger it, and the accounting leg stays unconditional.
-  assert.match(quiet, /const _openAuto = _openJobs\.filter\(\(j\) => j\.autoDispatched\)/,
-    "only IDE-dispatched children may be integrated");
-  assert.match(quiet, /if \(_openAuto\.length && !run\._subAgentFinishIntercepted && _live\(\)\)/,
-    "…and at most once per run");
+  // Accounting only, unconditionally. The IDE-dispatched integration leg (gated on
+  // `autoDispatched`) was removed with auto-dispatch itself (AGENT_LOOP_REBUILD.md stage 3), so a
+  // model's quiet finish is NEVER turned into another turn over its open children — it is only
+  // recorded. That is the invariant this test always defended; now it is the whole behaviour.
+  assert.doesNotMatch(quiet, /autoDispatched|_subAgentFinishIntercepted/,
+    "no auto-dispatch integration leg may remain — the model's finish is only accounted, never re-entered");
   assert.doesNotMatch(quiet, /\[收尾拦截\]/,
     "a model finish must not be replaced by a blocking gate");
 });
@@ -18076,149 +17953,8 @@ test("#53-5 结果链路：嵌套报告只进父子体消息流/简报，不直�
   assert.match(sub, /run\.ctx\.findings\.push/);
 });
 
-test("#56-1 拆分门规模启发：现有项目改多模块照常触发，与 fromZero/substantial 解耦", () => {
-  const countModules = load("_countExistingModules");
-  // 模块计数是纯路径事实：文件名段 pop 掉、generic 容器取两段、URL 剥除
-  assert.equal(countModules([{ content: "修改 src/components/Cart.vue 与 src/api/order.js" }]), 2, "src 下两个子目录 = 2 个模块");
-  assert.equal(countModules([{ content: "改 server/routes/pay.js" }, { content: "改 web/pages/checkout.tsx" }]), 2, "server 与 web = 2 个模块");
-  assert.equal(countModules([{ content: "改 src/utils/a.js 和 src/utils/b.js" }]), 1, "同目录多文件 = 1 个模块");
-  assert.equal(countModules([{ content: "参考 https://a.com/b/c 的文档" }]), 0, "URL 不算路径");
-  assert.equal(countModules([{ content: "梳理需求与技术选型" }]), 0, "无路径 = 0");
-  assert.equal(countModules([]), 0);
 
-  const splitGate = load("_splitGateNudgeMessage", {
-    _planStepActionKind: load("_planStepActionKind"),
-    _planStepDomain: load("_planStepDomain"),
-    _countExistingModules: countModules,
-  });
-  // 现有项目「加功能」：AI 把 changeScope 判成 module → substantial=false，旧逻辑 2 步计划直接静默；
-  // 现在跨 2 个模块的路径事实独立成立触发条件——拆分权与项目新旧/AI 规模评级解耦。
-  const existingRun = {
-    engineering: { substantial: false, projectScope: false, fromZeroUiProject: false, changeScope: "module" },
-    _planSteps: [
-      { content: "修改 server/routes/order.js 增加拆单接口", status: "pending" },
-      { content: "修改 web/pages/checkout.tsx 接入新接口", status: "pending" },
-    ],
-  };
-  const msg = splitGate(existingRun);
-  assert.match(msg, /^\[并行机会\]/, "现有项目 2 步跨 2 模块必须触发（旧逻辑 <3 步一刀切静默）");
-  assert.match(msg, /跨 2 个模块/);
-  assert.match(msg, /计划路径事实/, "触发依据是路径事实而非 AI 评级");
-  assert.match(msg, /你判断/, "判断权仍留给模型");
-  assert.equal(existingRun._splitGateNudged, true);
-  assert.equal(splitGate(existingRun), "", "一次性");
-  // 单模块 2 步小改动仍静默（拆分没有事实基础，不打扰）
-  const monoModule = { _planSteps: [
-    { content: "修改 src/utils/date.js 时区处理", status: "pending" },
-    { content: "修改 src/utils/format.js 千分位", status: "pending" },
-  ] };
-  assert.equal(splitGate(monoModule), "");
-  assert.ok(!monoModule._splitGateNudged, "静默不烧一次性额度");
-  // 大项目多模块：完整清单里带模块事实
-  const bigRun = { _planSteps: [
-    { content: "实现 web/pages 商品列表页面组件", status: "pending" },
-    { content: "实现 server/routes 订单接口与鉴权中间件", status: "pending" },
-    { content: "创建 db/migrations 订单表结构与迁移脚本", status: "pending" },
-    { content: "编写 tests/e2e 端到端回归测试", status: "pending" },
-    { content: "部署 Docker 并配置流水线", status: "pending" },
-  ] };
-  const bigMsg = splitGate(bigRun);
-  assert.match(bigMsg, /并行机会·事实清单/);
-  assert.match(bigMsg, /改动跨 4 个模块/);
-  // 解耦源码自查：拆分门与模块计数的函数体不读任何项目新旧/规模评级/空目录字段
-  for (const fnName of ["_splitGateNudgeMessage", "_countExistingModules"]) {
-    const src = extractFn(fnName);
-    for (const field of ["fromZeroUiProject", "substantial", "projectScope", "_emptyRootAtStart", "greenfield", "changeScope", "uiProject"]) {
-      assert.ok(!src.includes(field), `${fnName} 不得读 ${field}`);
-    }
-  }
-});
 
-test("#56-2 单点派发前置判断：一次性事实提示不硬拦，与 #49 傻等检测一前一后协同", () => {
-  const shouldDispatch = load("_shouldDispatchSubagent");
-  // ① 无计划（单点聚焦任务）→ 返回派发成本事实，一次性
-  const run = {};
-  const msg = shouldDispatch(run, { description: "调查配置文件" });
-  assert.match(msg, /^\[派发判断\]/);
-  assert.match(msg, /直接读\/查更快/);
-  assert.match(msg, /额外进程开销/, "成本事实必须如实罗列");
-  assert.match(msg, /再次调用/, "不硬拦：模型坚持可再次调用");
-  assert.equal(run._singleDispatchNudged, true);
-  assert.equal(shouldDispatch(run, { description: "调查配置文件" }), "", "第二次调用放行 = 判断权留给模型");
-  // ② tasks 多派 = 真并发 → 直接放行，不烧额度
-  const multiRun = {};
-  assert.equal(shouldDispatch(multiRun, { tasks: [{ task: "a" }, { task: "b" }] }), "");
-  assert.ok(!multiRun._singleDispatchNudged, "放行不烧一次性额度");
-  // ③ 计划里还有 ≥2 个待做步骤（派发后主智能体有事可干 = 真并行空间）→ 放行
-  const busyRun = { _planSteps: [
-    { content: "实现前端页面", status: "pending" },
-    { content: "实现后端接口", status: "in_progress" },
-    { content: "已完成的准备工作", status: "completed" },
-  ] };
-  assert.equal(shouldDispatch(busyRun, { description: "调研鉴权方案" }), "");
-  assert.ok(!busyRun._singleDispatchNudged);
-  // ④ 只剩 1 个待做步骤 → 派完只能干等，属单点，提示
-  const soloRun = { _planSteps: [
-    { content: "调查报错根因", status: "pending" },
-    { content: "已完成", status: "completed" },
-  ] };
-  assert.match(shouldDispatch(soloRun, {}), /派发判断/);
-  // 接线自查：只管 run_subagent；前置判断在并行账本记账与异步派发之前（被拦的不算真派发）
-  assert.match(SRC, /const dispatchIssue = !isWorker && !it\.call\._wiki && !it\.call\.wait && it\.tc\.name === "run_subagent"/);
-  const gateAt = SRC.indexOf('? _shouldDispatchSubagent(run, it.call) : ""');
-  const ledgerAt = SRC.indexOf('if (isWorker || it.tc.name === "run_subagent") run._parallelDispatches');
-  const spawnAt = SRC.indexOf('const _asyncSpawnNames = new Set(["run_subagent"');
-  assert.ok(gateAt > 0 && ledgerAt > 0 && spawnAt > 0);
-  assert.ok(gateAt < ledgerAt && ledgerAt < spawnAt, "前置判断必须在 _parallelDispatches 记账与异步派发之前");
-  // 文案已进 i18n（zh 值不变，en 为新增）
-  assert.match(SRC, /_settleToolStep\(it\.step, it\.rawResult, t\("subagent\.singleTaskNotDispatched"\)\)/);
-  assert.match(I18N, /"subagent\.singleTaskNotDispatched": "单点任务 · 未派发"/);
-  // #49 傻等事后兜底原样保留（事前提示 + 事后兜底各一次，不重复轰炸）
-  assert.match(SRC, /dispatchLedgerLen: run\._toolLedger && Array\.isArray\(run\._toolLedger\.entries\)/);
-  assert.match(SRC, /⚠️ 不要立即 await/);
-});
-
-test("#56-3 多角色/并行引导：拆分门后跨域零派发 → tasks 多派示例，单领域静默", () => {
-  const inferOrch = load("_inferOrchestrationFromPlan", {
-    _planStepActionKind: load("_planStepActionKind"),
-    _planStepDomain: load("_planStepDomain"),
-  });
-  const crossSteps = [
-    { content: "调查商品页面组件渲染瓶颈", status: "pending" },
-    { content: "实现订单接口限流中间件", status: "pending" },
-  ];
-  // ① 不抢跑：拆分门事实清单未给过 → 静默（本引导只做升级）
-  const early = { _planSteps: crossSteps };
-  assert.equal(inferOrch(early), "");
-  assert.ok(!early._parallelGuideNudged);
-  // ② 拆分门已给过 + 零派发 + 待做跨 2 域可独立 → 极简 tasks 多派示例
-  const run = { _splitGateNudged: true, _planSteps: crossSteps };
-  const msg = inferOrch(run);
-  assert.match(msg, /^\[并行引导\]/);
-  assert.match(msg, /前端、后端/);
-  assert.match(msg, /run_subagent\(tasks=\[\{role:"frontend"/, "角色映射到 frontend");
-  assert.match(msg, /role:"backend"/, "角色映射到 backend");
-  assert.match(msg, /await_subagent 汇合/);
-  assert.match(msg, /run_worker\(scope 隔离\)/, "独立写入模块的并行路径也点到");
-  assert.match(msg, /你判断/, "拆不拆判断权留给模型");
-  assert.equal(run._parallelGuideNudged, true);
-  assert.equal(inferOrch(run), "", "严格一次性");
-  // ③ 已有派发/后台作业 → 静默（已在并行推进）
-  assert.equal(inferOrch({ _splitGateNudged: true, _planSteps: crossSteps, _parallelDispatches: 1 }), "");
-  assert.equal(inferOrch({ _splitGateNudged: true, _planSteps: crossSteps, _subAgentJobs: new Map([[1, {}]]) }), "");
-  // ④ 单领域 → 静默不烧额度（多角色触发规范红线：跨领域且 scope 清晰才拆）
-  const mono = { _splitGateNudged: true, _planSteps: [
-    { content: "实现登录页面组件", status: "pending" },
-    { content: "实现商品页面布局", status: "pending" },
-  ] };
-  assert.equal(inferOrch(mono), "");
-  assert.ok(!mono._parallelGuideNudged, "静默不烧一次性额度");
-  // ⑤ 待做不足 2 步 → 没有并行标的，静默
-  assert.equal(inferOrch({ _splitGateNudged: true, _planSteps: [crossSteps[0], { content: "已完成", status: "completed" }] }), "");
-  // 接线自查：挂在 splitGate 的 else 分支（不同轮出现，不重复轰炸），专用 nudge 键
-  assert.match(SRC, /if \(_splitMsg\) _pushNudge\("splitGate", _splitMsg\);\s*else \{/);
-  assert.match(SRC, /_pushNudge\("parallelGuide", _orchMsg\)/);
-});
 
 test("#56-4 空目录与历史事实不阻断显式工具调用", () => {
   // Empty-root state is useful telemetry for the model, but every explicit
@@ -18245,13 +17981,41 @@ test("#56-4 空目录与历史事实不阻断显式工具调用", () => {
     "explicit reads must call the live backend");
   assert.doesNotMatch(executor, /_emptyExploreSkipMessage\(|_emptyRootSkipMessage\(/,
     "empty-root helpers must not be called from the executor");
-  // 规划/编排函数仍然只看计划和领域事实，与空目录字段解耦。
-  for (const fnName of ["_countExistingModules", "_splitGateNudgeMessage", "_inferOrchestrationFromPlan", "_shouldDispatchSubagent"]) {
+  // 计划的模块计数仍然只看计划路径事实，与空目录字段解耦。(The three orchestration-nudge
+  // functions this loop also checked — _splitGateNudgeMessage / _inferOrchestrationFromPlan /
+  // _shouldDispatchSubagent — were deleted in AGENT_LOOP_REBUILD.md stage 3.)
+  for (const fnName of ["_countExistingModules"]) {
     const src = extractFn(fnName);
     for (const field of ["_emptyRootAtStart", "fromZeroUiProject", "substantial", "projectScope", "greenfield", "changeScope", "uiProject"]) {
       assert.ok(!src.includes(field), `${fnName} 不得读 ${field}`);
     }
   }
+});
+
+// The IDE used to auto-spawn up to four file-writing sub-agents the model never requested when a
+// plan crossed ≥2 domains, plus three profile-driven nudges pushing the model to parallelize.
+// That was the one place the harness ACTED on a prediction instead of the model deciding — and
+// the auto-spawned children were parallel writers on the same tree (the conflict class the worker
+// guard exists to prevent). All removed (AGENT_LOOP_REBUILD.md stage 3); the "when to parallelize"
+// decision moved to the prompt, where the model owns it. This is a capability MIGRATION — the test
+// pins that the harness machinery is gone AND the prompt carries the guidance.
+test("orchestration is the model's decision (harness no longer auto-dispatches or nags)", () => {
+  // 1. The harness-driven machinery is gone from the source entirely.
+  for (const fn of ["_splitGateNudgeMessage", "_inferOrchestrationFromPlan", "_shouldDispatchSubagent", "_soloExecutionFactLine"]) {
+    assert.doesNotMatch(SRC, new RegExp(`function ${fn}\\b`), `${fn} must be deleted`);
+  }
+  const loop = stripJsComments(extractFn("_runAgenticLoop"));
+  assert.doesNotMatch(loop, /autoDispatched:\s*true/,
+    "the IDE must not spawn sub-agents the model did not request");
+  assert.doesNotMatch(loop, /_pushNudge\("autoDispatch"|_pushNudge\("splitGate"|_pushNudge\("parallelGuide"/,
+    "the profile-driven orchestration nudges must be gone");
+
+  // 2. The capability is not lost — the parallelize-yourself decision lives in the prompt.
+  const collab = readFileSync(join(HERE, "../../server/prompts/agent_collaboration.txt"), "utf8");
+  assert.match(collab, /并行是你自己的决定/,
+    "agent_collaboration.txt must put the parallelization decision on the model");
+  assert.match(collab, /run_subagent|run_worker/,
+    "…and name the tools the model uses to do it");
 });
 
 // ==================== ANTI-HALLUCINATION Protocol-C：证据分级 ====================
@@ -21199,13 +20963,11 @@ test("a quiet turn is the model's completion decision except for real bounded wo
   for (const name of ["planPending", "researchEvidence", "toolFirst", "semanticReview", "effect", "codeVerify", "reconcile", "uiDeliveryAudit", "uiVerify"]) {
     assert.equal(quiet.includes(`_pushNudge("${name}"`), false, `${name} must not force another quiet-turn request`);
   }
-  // A child the IDE dispatched on its own may be integrated exactly once (bounded wait,
-  // then the results are injected at the top of the loop). A child the MODEL dispatched is
+  // The IDE no longer dispatches subagents on its own, so there is no auto-integration re-entry
+  // (removed with auto-dispatch, AGENT_LOOP_REBUILD.md stage 3). A child the MODEL dispatched is
   // only accounted for — see "P2.1-收尾：模型自己派发的子智能体只记账" for that side.
-  assert.match(quiet, /_openAuto\.length && !run\._subAgentFinishIntercepted[\s\S]{0,700}continue;/,
-    "an IDE-dispatched subagent may be integrated once");
-  assert.match(quiet, /Promise\.race\(\[[\s\S]{0,200}_SUBAGENT_FINISH_WAIT_MS/,
-    "…and that wait must be bounded");
+  assert.doesNotMatch(quiet, /_openAuto|_subAgentFinishIntercepted|_SUBAGENT_FINISH_WAIT_MS/,
+    "no IDE-dispatched-subagent integration re-entry may remain");
   assert.match(quiet, /_pushNudge\("buildFix"[\s\S]{0,400}continue;/,
     "a real red verifier result retains bounded recovery");
   assert.match(quiet, /if \(Array\.isArray\(session\._steerQueue\)[\s\S]{0,140}continue;[\s\S]{0,80}break; \/\/ truly done/,

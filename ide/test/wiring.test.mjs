@@ -340,7 +340,6 @@ test("every quiet-turn re-entry is latched or counted", () => {
   // (AGENT_LOOP_REBUILD.md stage 1); its behaviour moved into agent_core.txt. If it comes
   // back as a `continue`, this list and the count below must stay honest.
   for (const [latch, why] of [
-    [/run\._subAgentFinishIntercepted/, "sub-agent integration, once per run"],
     [/run\._diagnosticNudges/, "new diagnostics, bounded"],
     [/buildFixAttempts/, "red build, bounded"],
     [/session\._steerQueue/, "user steering drains before the run ends"],
@@ -349,7 +348,11 @@ test("every quiet-turn re-entry is latched or counted", () => {
   }
   assert.doesNotMatch(quiet, /_missingEffects\.includes\("workspace"\)[\s\S]{0,400}?continue;/,
     "a profile-derived 'you owe a change' guess must never force a re-entry again");
-  assert.ok(continues <= 4,
+  // The IDE-dispatched sub-agent integration re-entry was removed with auto-dispatch itself
+  // (AGENT_LOOP_REBUILD.md stage 3), dropping the quiet-turn re-entry ceiling from 4 to 3.
+  assert.doesNotMatch(quiet, /_subAgentFinishIntercepted/,
+    "the auto-dispatch integration leg must be gone — the IDE no longer spawns sub-agents");
+  assert.ok(continues <= 3,
     `${continues} re-entry points in the quiet-turn branch — every one needs a latch listed above`);
 });
 
