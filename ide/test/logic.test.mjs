@@ -65,6 +65,7 @@ const INDEX_HTML = (() => {
 const APP_CSS = readFileSync(join(HERE, "../src/styles/app.css"), "utf8");
 const GROWTH_SRC = readFileSync(join(HERE, "../src/growth.js"), "utf8");
 const PICKER_SRC = readFileSync(join(HERE, "../src/ui/session-picker.jsx"), "utf8");
+const MEMORY_SRC = readFileSync(join(HERE, "../src/ui/memory-center.jsx"), "utf8");
 const TAURI_AI = readFileSync(join(HERE, "../src-tauri/src/ai.rs"), "utf8");
 const TAURI_NET = readFileSync(join(HERE, "../src-tauri/src/net.rs"), "utf8");
 const REMOTE_AGENT = readFileSync(join(HERE, "../remote-agent/michael-remote-agent.py"), "utf8");
@@ -4373,24 +4374,36 @@ test("memory center uses Michael-owned labels and hides competitor implementatio
     /Windsurf|Claude|Copilot|AGENTS\.md|CLAUDE\.md|\.cursorrules|copilot-instructions/i,
     "memory center cards must not expose competitor names or underlying compatibility filenames");
 
+  // The panel is a React island (src/ui/memory-center.jsx) using shadcn Dialog/Tabs/Button.
+  // main.js keeps ownership of the data and of the globe's imperative WebGL lifecycle.
   const panel = extractFn("openMemoryPanel");
-  assert.match(panel, /className = "memory-center-overlay"/);
-  assert.match(panel, /className = "memory-center"/);
-  assert.match(panel, /mem-project/);
-  assert.match(panel, /mem-global/);
-  assert.match(panel, /统一管理会话上下文、项目长期记忆、全局偏好和项目规则/);
-  assert.match(panel, /mc-globe-3d/,
+  assert.match(panel, /openMemoryCenterIsland\(\{/,
+    "the memory center should render through its island");
+  assert.match(MEMORY_SRC, /Project memory/);
+  assert.match(MEMORY_SRC, /Global preferences/);
+  assert.match(MEMORY_SRC, /One entry per line/,
+    "the panel must still say how entries are written");
+  assert.match(MEMORY_SRC, /ref=\{attachGlobe\}/,
     "memory center should mount the 3D network-globe container");
-  assert.match(panel, /_mcGlobeInit\(wrap, container/,
+  assert.match(panel, /_mcGlobeInit\(host, host/,
     "the globe must be initialized with real memory data");
+  assert.match(panel, /globe\.rebuild\(\)|_memoryGlobe\?\.rebuild\(\)/,
+    "editing must still rebuild the graph");
+  // Clicking a node selecting its source line is the reason the graph earns its space.
+  assert.match(panel, /ta\.setSelectionRange\(pos, pos \+ len\)/,
+    "clicking a graph node must still select that line in the editor");
+  assert.doesNotMatch(MEMORY_SRC, /Windsurf|Claude Code|Copilot|AGENTS\.md|CLAUDE\.md|\.cursorrules|copilot-instructions/i,
+    "the island must not expose competitor names either");
   assert.doesNotMatch(panel, /Windsurf|Claude Code|Copilot|AGENTS\.md|CLAUDE\.md|\.cursorrules|copilot-instructions/i,
     "the visible memory dialog markup should keep Michael IDE branding instead of showing implementation lineage");
-  assert.match(panel, /_saveKgText\(root, projectTa\.value\)/);
-  assert.match(panel, /_saveKgText\("", globalTa\.value\)/);
+  // Saving takes the island's current text rather than reading a textarea by class.
+  assert.match(panel, /_saveKgText\(root, project\)/);
+  assert.match(panel, /_saveKgText\("", global\)/);
   assert.match(panel, /_clearKgMemory\(""\)/);
-
-  assert.match(APP_CSS, /\.memory-center\s*\{[\s\S]*background:\s*#fff;[\s\S]*border:\s*1px solid #dadce0;/,
-    "memory center should use the same Google-light surface as session picker");
+  // The surface comes from the shadcn theme bridge now, as it does for the session picker —
+  // there is no hardcoded .memory-center rule left to drift from it.
+  assert.match(MEMORY_SRC, /<DialogContent/,
+    "the memory center should use the shared dialog surface");
   assert.match(APP_CSS, /\.mc-globe-3d\s*\{[\s\S]*position:\s*absolute;/,
     "the memory center should host a full-bleed 3D network globe");
   assert.match(APP_CSS, /\.mc-edit-grid\s*\{[\s\S]*grid-template-columns:\s*repeat\(2, minmax\(0, 1fr\)\);/,

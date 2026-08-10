@@ -71,6 +71,7 @@ import {
 import getSharedStore from "./agent/shared-store.js";
 import { renderSlashMenu, destroySlashMenu } from "./ui/mount-slash-menu.jsx";
 import { openSessionPickerIsland } from "./ui/mount-session-picker.jsx";
+import { openMemoryCenterIsland } from "./ui/mount-memory-center.jsx";
 import { getCollaborationEngine } from "./agent/collaboration-engine.js";
 
 // Global shared state store for sub-agent collaboration
@@ -32368,127 +32369,74 @@ function _memoryChoiceModel(root, session) {
 // workspace. Opened via the "Manage Project Memory" command (⌘⇧P).
 function openMemoryPanel() {
   const root = rootPath || workspaceRoots[0] || "";
-  const overlay = document.createElement("div");
-  overlay.className = "memory-center-overlay";
-  const modal = document.createElement("div");
-  modal.className = "memory-center";
-  const cards = _memoryChoiceModel(root, _currentSession?.()).map((card) => (
-    `<article class="mc-card mc-card--${_escHtml(card.id)}">` +
-      `<div class="mc-card__top"><span>${_escHtml(card.title)}</span><b>${_escHtml(card.badge)}</b></div>` +
-      `<div class="mc-card__source">${_escHtml(card.source)}</div>` +
-      `<p>${_escHtml(card.desc)}</p>` +
-      `<small>${_escHtml(card.inject)}</small>` +
-    `</article>`
-  )).join("");
-  const rootLabel = root || "(未打开项目，只能编辑全局偏好)";
-  modal.innerHTML =
-    `<div class="mc-head">` +
-      `<div class="mc-titleblock">` +
-        `<div class="mc-title"><span class="mc-brain" aria-hidden="true">` +
-          `<svg viewBox="0 0 24 24"><defs><linearGradient id="mcBrainG" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#7c5cff"/><stop offset="1" stop-color="#0a84ff"/></linearGradient></defs>` +
-          `<path d="M9 4.2a3 3 0 0 0-3 3v.3a3 3 0 0 0-1.6 5A3.2 3.2 0 0 0 6 18.4a2.8 2.8 0 0 0 3 1.4V4.2Z" fill="url(#mcBrainG)" fill-opacity=".16" stroke="url(#mcBrainG)" stroke-width="1.5" stroke-linejoin="round"/>` +
-          `<path d="M15 4.2a3 3 0 0 1 3 3v.3a3 3 0 0 1 1.6 5A3.2 3.2 0 0 1 18 18.4a2.8 2.8 0 0 1-3 1.4V4.2Z" fill="url(#mcBrainG)" fill-opacity=".16" stroke="url(#mcBrainG)" stroke-width="1.5" stroke-linejoin="round"/>` +
-          `<circle cx="9.3" cy="9" r="1.1" fill="#7c5cff"/><circle cx="14.7" cy="8.4" r="1.1" fill="#0a84ff"/><circle cx="8.6" cy="14.4" r="1.1" fill="#30d158"/><circle cx="15.4" cy="14" r="1.1" fill="#ff9f0a"/><circle cx="12" cy="11.6" r="1.2" fill="#fff"/>` +
-          `<path d="M9.3 9 12 11.6M14.7 8.4 12 11.6M8.6 14.4 12 11.6M15.4 14 12 11.6" stroke="url(#mcBrainG)" stroke-width="1.1" stroke-opacity=".65"/>` +
-          `</svg></span>记忆中心</div>` +
-        `<div class="mc-subtitle">统一管理会话上下文、项目长期记忆、全局偏好和项目规则，让用户一眼知道该放在哪里。</div>` +
-      `</div>` +
-      `<span class="mc-root">${_escHtml(rootLabel)}</span>` +
-      `<button class="mem-close mc-close" type="button" aria-label="关闭">✕</button>` +
-    `</div>` +
-    `<div class="mc-globe-wrap">` +
-      `<div class="mc-globe-3d"></div>` +
-      `<div class="mc-globe-legend">` +
-        Object.entries(_MC_GLOBE_CATS).map(([k, c]) => `<span class="mc-globe-chip"><i style="background:${c.color}"></i>${_escHtml(c.label)}</span>`).join("") +
-      `</div>` +
-      `<div class="mc-globe-hint">记忆知识图谱 · 拖拽旋转 · 悬停查看 · 点击定位</div>` +
-    `</div>` +
-    `<div class="mc-body">` +
-      `<div class="mc-edit-grid">` +
-        `<section class="mc-editor">` +
-          `<div class="mc-editor__head"><b>项目长期记忆</b><span>一行一条 · 只属于当前项目</span></div>` +
-          `<textarea class="mem-project" spellcheck="false" ${root ? "" : "disabled"} placeholder="例如：本项目用 pnpm；UI 必须走 shadcn/ui；后端入口是 server/index.js"></textarea>` +
-        `</section>` +
-        `<section class="mc-editor">` +
-          `<div class="mc-editor__head"><b>全局用户偏好</b><span>一行一条 · 所有项目都会带上</span></div>` +
-          `<textarea class="mem-global" spellcheck="false" placeholder="例如：回答要讲真话；前端默认浅色 Google 风格；修 bug 必须先找根因"></textarea>` +
-        `</section>` +
-      `</div>` +
-    `</div>` +
-    `<div class="mc-actions">` +
-      `<button class="mem-clear-project" type="button" ${root ? "" : "disabled"}>清空项目记忆</button>` +
-      `<button class="mem-clear-global" type="button">清空全局偏好</button>` +
-      `<button class="mem-save" type="button">保存记忆中心</button>` +
-    `</div>`;
-  overlay.appendChild(modal);
-  document.body.appendChild(overlay);
-  const projectTa = modal.querySelector(".mem-project");
-  const globalTa = modal.querySelector(".mem-global");
-  if (root) projectTa.value = _kgText(root);
-  else projectTa.value = "未打开项目：项目长期记忆会绑定到工作区，请先打开项目文件夹。";
-  globalTa.value = _kgText("");
-  let _globe = null;
-  // —— 记忆知识图谱星球：真实数据驱动，编辑时实时重建 ——
-  {
-    const wrap = modal.querySelector(".mc-globe-wrap");
-    const container = modal.querySelector(".mc-globe-3d");
-    const parseLines = (v) => String(v || "").split("\n").map((x) => x.trim()).filter(Boolean);
-    const globeData = () => {
-      const stats = typeof _sessionMemoryStats === "function" ? _sessionMemoryStats(_currentSession?.() || {}) : null;
-      const session = [];
-      if (stats?.recentCount) session.push(`最近对话 ${stats.recentCount} 条`);
-      if (stats?.summaryCount) session.push(`历史摘要 ${stats.summaryCount} 段`);
-      if (stats?.milestoneCount) session.push(`里程碑 ${stats.milestoneCount} 个`);
-      if (stats?.correctionCount) session.push(`有效纠正 ${stats.correctionCount} 条`);
-      if (!session.length) session.push("当前会话暂无摘要");
-      return {
-        session,
-        project: root ? parseLines(projectTa.value) : [],
-        global: parseLines(globalTa.value),
-        rules: ["项目根目录规则文件（自动识别注入）"],
+  const parseLines = (v) => String(v || "").split("\n").map((x) => x.trim()).filter(Boolean);
+  // Latest text lives here, not in React state: the globe rebuilds from it on a debounce and
+  // must see what the user typed a moment ago, not a stale render.
+  const text = { project: root ? _kgText(root) : "", global: _kgText("") };
+
+  openMemoryCenterIsland({
+    rootLabel: root || "No folder open — global preferences only",
+    hasRoot: !!root,
+    initialProject: text.project,
+    initialGlobal: text.global,
+
+    // The graph stays imperative: _mcGlobeInit owns a WebGL context and its own animation loop,
+    // which React should not be re-running on every keystroke. The island hands over a container
+    // and the two textareas, and gets back a handle it destroys on unmount.
+    onGlobeMount: ({ host, projectEl, globalEl }) => {
+      const globeData = () => {
+        const stats = typeof _sessionMemoryStats === "function" ? _sessionMemoryStats(_currentSession?.() || {}) : null;
+        const session = [];
+        if (stats?.recentCount) session.push(`最近对话 ${stats.recentCount} 条`);
+        if (stats?.summaryCount) session.push(`历史摘要 ${stats.summaryCount} 段`);
+        if (stats?.milestoneCount) session.push(`里程碑 ${stats.milestoneCount} 个`);
+        if (stats?.correctionCount) session.push(`有效纠正 ${stats.correctionCount} 条`);
+        if (!session.length) session.push("当前会话暂无摘要");
+        return {
+          session,
+          project: root ? parseLines(text.project) : [],
+          global: parseLines(text.global),
+          rules: ["项目根目录规则文件（自动识别注入）"],
+        };
       };
-    };
-    _globe = _mcGlobeInit(wrap, container, null, globeData, (n) => {
-      const ta = n.cat === "project" ? (root ? projectTa : null) : n.cat === "global" ? globalTa : null;
-      if (!ta) return;
-      const raw = ta.value.split("\n");
-      let count = -1, pos = 0, len = 0;
-      for (let i = 0; i < raw.length; i++) {
-        if (raw[i].trim()) count++;
-        if (count === n.idx) { len = raw[i].length; break; }
-        pos += raw[i].length + 1;
-      }
-      ta.focus();
-      try { ta.setSelectionRange(pos, pos + len); } catch {}
-    });
-    let _gt = null;
-    const queueRebuild = () => { clearTimeout(_gt); _gt = setTimeout(() => _globe?.rebuild(), 400); };
-    projectTa.addEventListener("input", queueRebuild);
-    globalTa.addEventListener("input", queueRebuild);
-  }
-  const close = () => { try { _globe?.destroy(); } catch {} overlay.remove(); };
-  modal.querySelector(".mem-close").addEventListener("click", close);
-  overlay.addEventListener("click", (e) => { if (e.target === overlay) close(); });
-  modal.querySelector(".mem-save").addEventListener("click", () => {
-    const projectCount = root ? _saveKgText(root, projectTa.value) : 0;
-    const globalCount = _saveKgText("", globalTa.value);
-    showToast(root
-      ? `记忆中心已保存：项目 ${projectCount} 条，全局 ${globalCount} 条`
-      : `全局偏好已保存：${globalCount} 条`);
-    close();
-  });
-  modal.querySelector(".mem-clear-project").addEventListener("click", () => {
-    if (!root) return;
-    projectTa.value = "";
-    _clearKgMemory(root);
-    showToast("项目记忆已清空");
-  });
-  modal.querySelector(".mem-clear-global").addEventListener("click", () => {
-    globalTa.value = "";
-    _clearKgMemory("");
-    showToast("全局偏好已清空");
+      const globe = _mcGlobeInit(host, host, null, globeData, (n) => {
+        // Clicking a node selects the line it came from — the reason the graph is worth keeping.
+        const ta = n.cat === "project" ? (root ? projectEl : null) : n.cat === "global" ? globalEl : null;
+        if (!ta) return;
+        const raw = ta.value.split("\n");
+        let count = -1, pos = 0, len = 0;
+        for (let i = 0; i < raw.length; i++) {
+          if (raw[i].trim()) count++;
+          if (count === n.idx) { len = raw[i].length; break; }
+          pos += raw[i].length + 1;
+        }
+        ta.focus();
+        try { ta.setSelectionRange(pos, pos + len); } catch {}
+      });
+      _memoryGlobe = globe;
+      return globe;
+    },
+
+    onTextChange: (which, value) => {
+      text[which] = value;
+      clearTimeout(_memoryGlobeRebuild);
+      _memoryGlobeRebuild = setTimeout(() => { try { _memoryGlobe?.rebuild(); } catch {} }, 400);
+    },
+
+    onSave: (project, global) => {
+      const projectCount = root ? _saveKgText(root, project) : 0;
+      const globalCount = _saveKgText("", global);
+      showToast(root
+        ? `记忆中心已保存：项目 ${projectCount} 条，全局 ${globalCount} 条`
+        : `全局偏好已保存：${globalCount} 条`);
+    },
+    onClearProject: () => { if (!root) return; text.project = ""; _clearKgMemory(root); showToast("项目记忆已清空"); },
+    onClearGlobal: () => { text.global = ""; _clearKgMemory(""); showToast("全局偏好已清空"); },
+    onClose: () => { clearTimeout(_memoryGlobeRebuild); _memoryGlobe = null; },
   });
 }
+let _memoryGlobe = null;
+let _memoryGlobeRebuild = null;
 
 /**
  * Keep the running `messages` array from blowing past the context window on long
