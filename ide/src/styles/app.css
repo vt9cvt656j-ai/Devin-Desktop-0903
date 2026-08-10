@@ -10335,7 +10335,7 @@ button.agent-plan__fold--toggle:focus-visible { outline: 2px solid #1a73e8; outl
 
 /* ---- advanced feature panel ---- */
 .feature-panel {
-  --feature-backdrop: rgba(255, 255, 255, 0.82);
+  --feature-backdrop: rgba(255, 255, 255, 0.55);
   --feature-sheet: #fff;
   --feature-header: #fff;
   --feature-bg: #fff;
@@ -10357,11 +10357,14 @@ button.agent-plan__fold--toggle:focus-visible { outline: 2px solid #1a73e8; outl
   justify-content: center;
   padding: 28px;
   background: var(--feature-backdrop);
-  backdrop-filter: blur(8px);
-  -webkit-backdrop-filter: blur(8px);
+  /* The workspace behind the sheet should still read as the workspace. At 0.82 white over an
+     8px blur the editor was washed to a flat pane, which loses the sense of the panel sitting
+     on top of your project rather than replacing it. */
+  backdrop-filter: blur(4px);
+  -webkit-backdrop-filter: blur(4px);
 }
 :root[data-theme="dark"] .feature-panel {
-  --feature-backdrop: rgba(0, 0, 0, 0.56);
+  --feature-backdrop: rgba(0, 0, 0, 0.40);
   --feature-sheet: #18181b;
   --feature-header: #18181b;
   --feature-bg: #101011;

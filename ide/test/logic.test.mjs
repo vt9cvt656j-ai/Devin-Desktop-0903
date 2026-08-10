@@ -2067,7 +2067,7 @@ test("advanced tools panel exposes Settings Growth Adaptive and Shortcuts", () =
   assert.match(renderersBlock, /shortcuts:\s*renderShortcutsTool/);
   assert.doesNotMatch(renderersBlock, /workspace|tasks|remote|marketplace|conflicts|debugger|lsp/,
     "removed Advanced Tools pages should not be reachable through the panel renderer");
-  assert.match(APP_CSS, /\.feature-panel\s*\{[\s\S]{0,260}--feature-backdrop:\s*rgba\(255,\s*255,\s*255,\s*0\.82\);[\s\S]{0,260}--feature-sheet:\s*#fff;[\s\S]{0,260}--feature-bg:\s*#fff;[\s\S]{0,260}--feature-rail:\s*#fff;[\s\S]{0,260}--feature-blue:\s*#1a73e8;/,
+  assert.match(APP_CSS, /\.feature-panel\s*\{[\s\S]{0,260}--feature-backdrop:\s*rgba\(255,\s*255,\s*255,\s*0\.55\);[\s\S]{0,260}--feature-sheet:\s*#fff;[\s\S]{0,260}--feature-bg:\s*#fff;[\s\S]{0,260}--feature-rail:\s*#fff;[\s\S]{0,260}--feature-blue:\s*#1a73e8;/,
     "Advanced Tools light theme should use white Google-style backdrop, sheet, body, and rail surfaces with blue tokens only for accents");
   assert.match(APP_CSS, /:root\[data-theme="dark"\] \.feature-panel\s*\{[\s\S]{0,260}--feature-sheet:\s*#18181b;[\s\S]{0,260}--feature-header:\s*#18181b;[\s\S]{0,260}--feature-blue:\s*#8ab4f8;/,
     "Advanced Tools needs explicit dark-mode tokens");
