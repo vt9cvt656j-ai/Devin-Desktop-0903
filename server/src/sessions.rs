@@ -69,18 +69,31 @@ pub(crate) fn label_for(kind: &str, ua: &str) -> String {
 
 /// Which rows are the same machine.
 ///
-/// The client's own id when it sent one. Otherwise the shape of the request it arrived
-/// on, which is the best available guess for anything that signed in before device ids
-/// existed. That fallback is imperfect in both directions — two laptops behind one office
-/// NAT running the same browser version look identical, and a phone that changes networks
-/// looks like two devices — but it only ever applies to rows old enough to predate the
-/// id, and it is much closer to the truth than listing one laptop once per sign-in.
+/// The client's own id when it sent one. Otherwise what the row *displays* — browser,
+/// platform and address — which is the best available guess for anything that signed in
+/// before device ids existed.
 ///
-/// NUL separates the parts so a User-Agent containing the separator cannot be crafted to
-/// collide with a different (kind, ip) pair.
+/// The fallback deliberately ignores the version numbers in the User-Agent. Grouping on
+/// the raw string looks stricter but produces exactly the bug it is meant to fix: this
+/// account had four live sessions at one address and two User-Agents, because Chrome
+/// updated itself between sign-ins. Two rows that both read "Chrome · macOS" at the same
+/// IP are one laptop as far as anyone reading the page is concerned, and showing them
+/// separately is the page contradicting itself.
+///
+/// It is imperfect in both directions — two laptops behind one office NAT running the
+/// same browser look identical, and a phone that changes networks looks like two devices
+/// — but it only ever applies to rows old enough to predate the id, and it is much closer
+/// to the truth than listing one laptop once per sign-in.
+///
+/// NUL separates the parts so a value containing the separator cannot be crafted to
+/// collide with a different combination.
 fn device_group(device_id: &str, kind: &str, user_agent: &str, ip: &str) -> String {
     if device_id.is_empty() {
-        format!("ua\u{0}{kind}\u{0}{user_agent}\u{0}{ip}")
+        format!(
+            "ua\u{0}{kind}\u{0}{}\u{0}{}\u{0}{ip}",
+            browser_of(user_agent).unwrap_or(""),
+            platform_of(user_agent).unwrap_or(""),
+        )
     } else {
         format!("id\u{0}{device_id}")
     }
@@ -200,45 +213,46 @@ pub async fn revoke(
 ) -> ApiResult<Json<serde_json::Value>> {
     let uid = uuid::Uuid::parse_str(&claims.sub).map_err(|_| AppError::unauthorized("令牌损坏"))?;
 
-    // Scoped to the caller. Someone else's session id matches no row and gets the same
-    // "not found" as an id that never existed, which is also what stops this being a
+    // Scoped to the caller. Someone else's session id matches no row, so it gets the same
+    // "not found" as an id that never existed — which is also what stops this being a
     // probe for whether a given session exists.
-    let target: Option<(String, String, String, String)> = sqlx::query_as(
-        "SELECT device_id, kind, user_agent, ip FROM sessions \
-         WHERE id = $1 AND user_id = $2 AND revoked_at IS NULL",
+    //
+    // The whole live set is read rather than the one row, because which rows belong to
+    // this device is decided by `device_group`, and half of that answer comes from parsing
+    // a User-Agent. Expressing it in SQL would mean a second, hand-maintained copy of the
+    // rule that could disagree with the list — and a disagreement here means the page
+    // shows a device gone while one of its tokens is still working.
+    type Row = (uuid::Uuid, String, String, String, String);
+    // Ordered like the list, so the bound takes the same rows the page showed rather than
+    // an arbitrary 500 — otherwise a row could be visible and still not be revocable.
+    let rows: Vec<Row> = sqlx::query_as(
+        "SELECT id, kind, user_agent, ip, device_id FROM sessions \
+         WHERE user_id = $1 AND revoked_at IS NULL \
+         ORDER BY created_at DESC LIMIT 500",
     )
-    .bind(id)
     .bind(uid)
-    .fetch_optional(&state.db)
+    .fetch_all(&state.db)
     .await?;
-    let Some((device_id, kind, user_agent, ip)) = target else {
-        return Err(AppError::bad("该登录不存在或已失效"));
-    };
 
-    // Same two cases as the list groups on, so what disappears from the page is exactly
-    // what stopped working.
-    let done = if device_id.is_empty() {
-        sqlx::query(
-            "UPDATE sessions SET revoked_at = now() \
-             WHERE user_id = $1 AND revoked_at IS NULL AND device_id = '' \
-               AND kind = $2 AND user_agent = $3 AND ip = $4",
-        )
-        .bind(uid)
-        .bind(&kind)
-        .bind(&user_agent)
-        .bind(&ip)
-        .execute(&state.db)
-        .await?
-    } else {
-        sqlx::query(
-            "UPDATE sessions SET revoked_at = now() \
-             WHERE user_id = $1 AND revoked_at IS NULL AND device_id = $2",
-        )
-        .bind(uid)
-        .bind(&device_id)
-        .execute(&state.db)
-        .await?
-    };
+    let target = rows
+        .iter()
+        .find(|r| r.0 == id)
+        .ok_or_else(|| AppError::bad("该登录不存在或已失效"))?;
+    let wanted = device_group(&target.4, &target.1, &target.2, &target.3);
+    let doomed: Vec<uuid::Uuid> = rows
+        .iter()
+        .filter(|r| device_group(&r.4, &r.1, &r.2, &r.3) == wanted)
+        .map(|r| r.0)
+        .collect();
+
+    let done = sqlx::query(
+        "UPDATE sessions SET revoked_at = now() \
+         WHERE id = ANY($1) AND user_id = $2 AND revoked_at IS NULL",
+    )
+    .bind(&doomed)
+    .bind(uid)
+    .execute(&state.db)
+    .await?;
 
     if done.rows_affected() == 0 {
         return Err(AppError::bad("该登录不存在或已失效"));
@@ -317,8 +331,9 @@ mod tests {
 
     #[test]
     fn rows_without_an_id_fall_back_to_the_shape_of_the_request() {
-        // The three "Chrome · macOS" rows at one IP that started all this: same browser,
-        // same address, three sign-ins, and nothing but this to tie them together.
+        // The repeated "Chrome · macOS" rows at one IP that started all this: same
+        // browser, same address, several sign-ins, and nothing but this to tie them
+        // together.
         let first = device_group("", "web", CHROME_MAC, "165.254.118.214");
         let again = device_group("", "web", CHROME_MAC, "165.254.118.214");
         assert_eq!(first, again);
@@ -327,6 +342,38 @@ mod tests {
         assert_ne!(first, device_group("", "web", CHROME_MAC, "10.0.0.1"));
         assert_ne!(first, device_group("", "web", EDGE_WIN, "165.254.118.214"));
         assert_ne!(first, device_group("", "desktop", CHROME_MAC, "165.254.118.214"));
+    }
+
+    #[test]
+    fn a_browser_that_updated_itself_is_still_one_device() {
+        // Live data from the account that reported this: four sessions at one address,
+        // two User-Agents, because Chrome updated between sign-ins. Grouping on the raw
+        // string would leave two rows on screen that print identical text — which is the
+        // complaint, not the fix.
+        let older = CHROME_MAC.replace("140.0.0.0", "139.0.0.0");
+        assert_eq!(
+            device_group("", "web", CHROME_MAC, "165.254.118.214"),
+            device_group("", "web", &older, "165.254.118.214")
+        );
+    }
+
+    #[test]
+    fn two_rows_that_read_the_same_group_together() {
+        // The rule the fallback actually follows: rows group exactly when the page would
+        // render them the same way. Anything else puts a visible contradiction on screen.
+        let rows = [
+            ("web", CHROME_MAC, "1.1.1.1"),
+            ("web", &CHROME_MAC.replace("140.0.0.0", "138.0.1.2")[..], "1.1.1.1"),
+            ("web", EDGE_WIN, "1.1.1.1"),
+        ];
+        for (kind, ua, ip) in rows {
+            for (kind2, ua2, ip2) in rows {
+                let same_text = label_for(kind, ua) == label_for(kind2, ua2) && ip == ip2;
+                let same_group =
+                    device_group("", kind, ua, ip) == device_group("", kind2, ua2, ip2);
+                assert_eq!(same_text, same_group, "{ua} vs {ua2}");
+            }
+        }
     }
 
     #[test]
