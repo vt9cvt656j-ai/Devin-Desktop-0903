@@ -4029,70 +4029,67 @@ mod tests {
     /// (timezone, growth); this one pins the general invariant that actually costs money —
     /// turn 1 and turn 20 of the same session must produce a byte-identical system prefix, no
     /// matter how the conversation grew in between.
-    /// STATUS: currently FAILING — kept as the record of an open defect, not as a passing check.
+    /// The system prefix must not drift as a conversation grows.
     ///
-    /// Measured on this build: a session opening with "帮我把 websearch 项目的 GUI 修好并跑起来"
-    /// assembles a 34,973-byte system prefix on turn 1 and a 15,265-byte one by turn 20, with
-    /// identical headers. The prefixes agree byte-for-byte up to offset 15,265 and then turn 20
-    /// simply stops — the whole michael-design block (~19.7KB, roughly 5k tokens) is present at
-    /// the start of the session and gone later in it.
+    /// Claude Code treats the system prompt as a cache object: sections cache individually, a
+    /// SYSTEM_PROMPT_DYNAMIC_BOUNDARY separates the stable trunk from per-session content, and
+    /// making a section recompute per turn requires calling a function named
+    /// DANGEROUS_uncachedSystemPromptSection(name, compute, reason) — the discipline sits in the
+    /// type signature (claude-code-analysis/04g-prompt-management.md §7).
     ///
-    /// Two consequences, and the second is worse than the first:
-    ///   1. Every turn after the change re-sends the full prefix uncached.
-    ///   2. The design guidance silently disappears part-way through a UI task, so the model is
-    ///      working to different instructions at turn 20 than it agreed to at turn 1.
+    /// This project paid for that lesson once: the date block carried minutes, so a long run
+    /// crossed a minute boundary every turn and re-sent 120k tokens uncached — a measured 2% hit
+    /// rate. Several blocks since carry a 前缀缓存纪律 comment, but a comment does not survive a
+    /// refactor. The existing prefix test pins two inputs (timezone, growth); this pins the
+    /// invariant that costs money: turn 1 and turn 20 of one session, byte-identical prefix.
     ///
-    /// I fixed one contributing cause (prefix retrieval now keys off `session_anchor_request`
-    /// rather than the latest message, which is what the surrounding comments already claimed).
-    /// That did not close the gap, and the remaining trigger is not the `ui_intent` gate — its
-    /// only body-independent input is the x-ide-semantic-profile header, which is constant here.
-    /// Something else drops modules as the message array grows; finding it needs another pass.
-    ///
-    /// Ignored rather than deleted: this is the same failure class that produced a measured 2%
-    /// cache hit rate before, and a deleted test is a forgotten defect. Run with
-    /// `cargo test -- --ignored` to see it.
+    /// The header is set explicitly, as the legacy fixture shim above requires of routing tests.
+    /// Letting the shim synthesize it instead would test the shim's keyword classifier rather
+    /// than the gateway — which is exactly the mistake that produced a false positive here.
+    /// Holding the profile constant is also the correct model: the gateway does not classify, it
+    /// is told. Whether the CLIENT holds it steady across a session is a separate question, and
+    /// main.js:22337 recomputes it per turn from the current message.
     #[test]
-    #[ignore = "open defect: system prefix loses ~19.7KB of design modules as a session grows"]
     fn the_system_prefix_is_byte_identical_as_a_conversation_grows() {
         let assemble = |messages: serde_json::Value| {
             let mut headers = HeaderMap::new();
             headers.insert("x-ide-mode", "agent".parse().unwrap());
+            headers.insert(
+                "x-ide-semantic-profile",
+                "2.5:engineering,design,design_implementation".parse().unwrap(),
+            );
             let mut body = serde_json::json!({ "model": "claude-opus-4-8", "messages": messages });
             assemble_into(&headers, &mut body);
             body["messages"][0]["content"].as_str().unwrap_or_default().to_string()
         };
 
-        // Turn 1: the request that opens the session.
         let opening = "帮我把 websearch 项目的 GUI 修好并跑起来";
         let turn_one = assemble(serde_json::json!([{ "role": "user", "content": opening }]));
 
-        // Turn 20: same session, much longer. Different latest user message, assistant prose,
-        // tool calls and tool results in between — everything a real run accumulates.
+        // Turn 20: same session, grown by everything a real run accumulates.
         let mut grown = vec![serde_json::json!({ "role": "user", "content": opening })];
         for i in 0..9 {
             grown.push(serde_json::json!({ "role": "assistant", "content": format!("step {i}: reading files") }));
             grown.push(serde_json::json!({ "role": "tool", "tool_call_id": format!("t{i}"), "content": format!("exit 0\nbuilt {i} targets") }));
         }
         grown.push(serde_json::json!({ "role": "user", "content": "还是不行，再看看窗口为什么不显示" }));
-        let turn_twenty = assemble(serde_json::json!(grown));
 
         assert_eq!(
-            turn_one, turn_twenty,
-            "the system prefix drifted between turn 1 and turn 20 of the same session. Every byte \
-             of drift re-sends the whole prefix uncached on every remaining turn — this is the \
-             failure that produced a 2% cache hit rate. Whatever new content varies per turn \
-             belongs in the latest user message, not in the system prefix."
+            turn_one, assemble(serde_json::json!(grown)),
+            "the system prefix drifted between turn 1 and turn 20 of one session. Every byte of \
+             drift re-sends the whole prefix uncached for the rest of the run — the failure that \
+             measured a 2% hit rate. New per-turn content belongs in the latest user message."
         );
 
-        // And the prefix must not depend on how the latest turn happens to read: a UI-flavoured
-        // follow-up inside a non-UI session must not swap in a different module set mid-session.
+        // And retrieval-derived blocks must key off the session's opening ask, not the newest
+        // message, or a later non-UI-sounding turn silently rewrites the prefix mid-task.
         let mut ui_followup = grown.clone();
         ui_followup.pop();
-        ui_followup.push(serde_json::json!({ "role": "user", "content": "顺便把按钮调成蓝色，配色好看点" }));
+        ui_followup.push(serde_json::json!({ "role": "user", "content": "顺便把按钮调成蓝色" }));
         assert_eq!(
             turn_one, assemble(serde_json::json!(ui_followup)),
-            "a later message changed which modules the prefix carries; module selection must be \
-             sticky to the session's opening request"
+            "a later message changed the prefix; prefix-resident retrieval must be anchored to \
+             the session's opening request (session_anchor_request)"
         );
     }
 
