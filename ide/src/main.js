@@ -22580,7 +22580,6 @@ async function sendPrompt(text, attachments = [], readyConfig = null) {
   }
 
   // ── 提示词缓存: system = 纯静态前缀(跨轮复用), 动态内容下沉到 user 消息末尾 ──
-  const _growthBlock = _agentLightTurn ? "" : growth.promptBlock(effectiveMode);
   if (!_agentLightTurn) _scheduleWorkspaceAgentWarmup(_curRoot);
   // Append the model-family style corrective (GPT → strong anti-verbosity; weaker
   // models → terse). Static per model, so the prompt prefix still caches.
@@ -22679,7 +22678,6 @@ async function sendPrompt(text, attachments = [], readyConfig = null) {
     (_timeBlock ? _timeBlock + "\n\n" : "") +
     _demandLedgerBlock +
     _thinkLedgerBlock +
-    (_growthBlock ? _growthBlock + "\n\n" : "") +
     (_adaptiveMemory ? _adaptiveMemory + "\n\n" : "") +
     (_imgHint ? _imgHint + "\n\n" : "") +
     (contextBlock ? `--- 项目上下文 ---\n${contextBlock}\n\n` : "");

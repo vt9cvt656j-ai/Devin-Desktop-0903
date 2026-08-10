@@ -26,44 +26,38 @@
 const STORE_KEY = "michael-ide.learner-model.v1";
 
 // The skill graph. Each skill is fed by real, captured behavioural signals
-// (see applyEvent below) — no padded/dead bars. `coach` is the instruction the
-// AI receives while this skill is still WEAK; it fades away once mastered.
+// (see applyEvent below) — no padded/dead bars. These feed the Open Learner Model
+// panel only; the model is never handed a per-skill coaching instruction.
 const SKILLS = [
   {
     id: "reviewing",
     label: "审查 AI 产出",
     blurb: "看懂并判断 AI 改了什么、对不对",
-    coach: "做完每个关键改动后，用一句话说清「改了什么 / 为什么」，并提示一个值得检查的点；不要让用户闭眼接受。",
   },
   {
     id: "authoring",
     label: "独立投入",
     blurb: "自己思考、不把活全外包给 AI",
-    coach: "适当留白：对不太难的部分，鼓励用户自己动手，而不是直接把完整代码端上来。",
   },
   {
     id: "prompting",
     label: "表达需求",
     blurb: "把想要的东西讲清楚",
-    coach: "当用户的需求含糊时，先用一句话复述你的理解、并补一个澄清问题，再动手。",
   },
   {
     id: "planning",
     label: "任务规划",
     blurb: "把复杂任务拆成步骤",
-    coach: "面对多步任务，先给出简短的分步计划再实现，帮助用户建立拆解的习惯。",
   },
   {
     id: "tooling",
     label: "掌握 IDE 能力",
     blurb: "用上 plan / agent / @文件 等高级能力",
-    coach: "在合适时机，顺带点出一个能更快完成此类任务的 IDE 功能（如 plan 模式、@文件）。",
   },
   {
     id: "verifying",
     label: "验证习惯",
     blurb: "改完会跑测试/诊断确认，而不是直接信",
-    coach: "改完主动用 run_cmd 跑构建/测试/类型检查、或用 get_diagnostics 自检；没验证过的「做完了」别当完成。",
   },
 ];
 const SKILL_IDS = SKILLS.map((s) => s.id);
@@ -340,57 +334,21 @@ export function predictGate(viewportEl, opts = {}) {
 
 function levelLabel(p) { return p >= 0.7 ? "熟练" : p >= 0.4 ? "进阶" : "新手"; }
 
-export function promptBlock(mode) {
-  try {
-    load();
-    const explain = state.prefs.explain;
-    const overall = avgMastery();
-    const weak = SKILLS.filter((s) => state.skills[s.id].p < 0.45);
-    const strong = SKILLS.filter((s) => state.skills[s.id].p >= 0.7);
-
-    // Agent / tool modes: teaching must NOT pollute the DOING (telling it to
-    // "explain every step" makes it ramble + under-deliver). So we give it a TIGHT
-    // directive scoped to the WRAP-UP only — adaptive by skill level. This is the
-    // "把新手提拔成高手 / 把高手伺候得更爽" lever, finally active in the mode the
-    // user actually uses most (before, agent mode got zero adaptive teaching).
-    if (mode === "agent" || mode === "explorer" || mode === "reviewer") {
-      const al = ["--- 因人而教（**只作用于收尾总结**，干活过程照常高效、绝不啰嗦；据该用户能力画像自适应）---"];
-      if (overall < 0.45) {
-        al.push("该用户偏**新手**：干活时照常麻利、别中途解释；但**收尾**用大白话讲清「做了什么 / 为什么这么做 / 怎么用 / 改了哪些文件」，第一次出现的术语顺手一句话点破，并**额外给一个可迁移的原理 + 一个他自己能上手试的小下一步**——目标是把他一步步带成「会用、会判断、会自己写」，越用越长本事。别居高临下。");
-      } else if (overall < 0.7) {
-        al.push("该用户**进阶**：收尾简明说清改动与关键决策，点一个值得注意的点或更优做法；少铺垫、别从头讲基础。");
-      } else {
-        al.push("该用户是**高手**：对等、精简、直给——跳过一切基础讲解，收尾只点深层取舍 / 边界 / 风险 / 你做的关键假设；把他当资深同行，别教学、别复述显然的东西，能省则省。");
-      }
-      if (weak.length && overall < 0.7) al.push(`可顺带培养的弱项（**仅收尾点到为止**，绝不打断干活）：${weak.map((s) => s.label).join("、")}。`);
-      if (strong.length) al.push(`其强项（${strong.map((s) => s.label).join("、")}）：直接给结论，别赘述。`);
-      return "\n\n" + al.join("\n");
-    }
-
-    // base verbosity: pref override, else derived from overall mastery
-    let density;
-    if (explain === "min") density = "极简：只给改动与结论，几乎不解释。";
-    else if (explain === "rich") density = "详尽：每步都讲清原理与坑。";
-    else density = overall >= 0.7
-      ? "精简：默认少解释、直接给改动；仅在不显然处补一句。"
-      : overall >= 0.45
-        ? "适中：关键处给简短的「为什么」，其余从简。"
-        : "充分：把每个关键步骤讲清楚，多给「为什么」和示例。";
-
-    const lines = [];
-    lines.push("--- 成长性教学（依据对该用户的能力画像自适应，请据此调整讲解粒度）---");
-    lines.push(`用户总体水平：${levelLabel(overall)}。讲解密度：${density}`);
-    if (strong.length) lines.push(`其强项（${strong.map((s) => s.label).join("、")}）：别赘述，直接给结论。`);
-    for (const s of weak) lines.push(`其弱项「${s.label}」：${s.coach}`);
-    lines.push("通用：每次完成后用一句话点出一个可迁移的原理，让用户真正学到，而不是只复制结果（避免养成依赖）。务必简洁。");
-    if (state.prefs.challenge) {
-      lines.push("挑战模式：对有一定难度的改动，先别直接给完整答案——用一两句话引导用户先自己想/写，再给出你的实现并对比（合意difficulty，利于长期掌握）。");
-    }
-    return "\n\n" + lines.join("\n");
-  } catch {
-    return "";   // never block a chat send
-  }
-}
+// The adaptive teaching block used to live here. It scored the user with the learner
+// model and, below a mastery threshold, dictated the exact shape of every wrap-up:
+// "what was done / why / how to use it / which files changed", gloss each new term in
+// one sentence, then a transferable principle and a small next step to try. The model
+// followed it literally, so every single reply came out as the same six-section lecture
+// regardless of what had actually been asked — and a fresh install starts below that
+// threshold, so it was the default experience.
+//
+// It also contradicted answer_quality.txt, which already tells the model to let depth
+// follow whether the reader can use the answer, and says plainly: no templates, no
+// reciting rules. A prompt that prescribes section headings cannot coexist with that.
+//
+// Adaptation is the model's job from the conversation in front of it, not a template
+// chosen by a mastery score. The learner model keeps its panel and its signals; it no
+// longer writes the endings.
 
 // --- public: the Open Learner Model panel -------------------------------------
 
