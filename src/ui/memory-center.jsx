@@ -21,6 +21,7 @@ import { cn } from "./lib/cn.js";
 // Listed here rather than inline so the rail stays a list of sections, not markup.
 const SECTIONS = [
   { value: "memory", label: "Memory" },
+  { value: "preferences", label: "Preferences" },
   { value: "graph", label: "Graph" },
 ];
 
@@ -116,35 +117,34 @@ export function MemoryCenter({
             ))}
           </TabsList>
 
-          <TabsContent value="memory" className="mt-0 flex min-h-0 min-w-0 flex-1 gap-4 px-5 py-4">
-            <section className="flex min-h-0 min-w-0 flex-1 flex-col gap-1.5">
-              <h3 className="text-[12px] font-medium text-foreground">
-                Project memory
-                {!hasRoot ? (
-                  <span className="ml-2 font-normal text-muted-foreground">no folder open</span>
-                ) : null}
-              </h3>
-              <textarea
-                ref={projectRef}
-                className={editorClass}
-                spellCheck={false}
-                disabled={!hasRoot}
-                value={project}
-                onChange={(e) => edit("project", e.target.value)}
-                placeholder="This project uses pnpm&#10;UI goes through shadcn/ui"
-              />
-            </section>
-            <section className="flex min-h-0 min-w-0 flex-1 flex-col gap-1.5">
-              <h3 className="text-[12px] font-medium text-foreground">Global preferences</h3>
-              <textarea
-                ref={globalRef}
-                className={editorClass}
-                spellCheck={false}
-                value={global}
-                onChange={(e) => edit("global", e.target.value)}
-                placeholder="Answer truthfully&#10;Verify a fix before calling it done"
-              />
-            </section>
+          <TabsContent value="memory" className="mt-0 flex min-h-0 min-w-0 flex-1 flex-col gap-1.5 px-5 py-4">
+            <h3 className="text-[12px] font-medium text-foreground">
+              Project memory
+              {!hasRoot ? (
+                <span className="ml-2 font-normal text-muted-foreground">no folder open</span>
+              ) : null}
+            </h3>
+            <textarea
+              ref={projectRef}
+              className={editorClass}
+              spellCheck={false}
+              disabled={!hasRoot}
+              value={project}
+              onChange={(e) => edit("project", e.target.value)}
+              placeholder="This project uses pnpm&#10;UI goes through shadcn/ui"
+            />
+          </TabsContent>
+
+          <TabsContent value="preferences" className="mt-0 flex min-h-0 min-w-0 flex-1 flex-col gap-1.5 px-5 py-4">
+            <h3 className="text-[12px] font-medium text-foreground">Global preferences</h3>
+            <textarea
+              ref={globalRef}
+              className={editorClass}
+              spellCheck={false}
+              value={global}
+              onChange={(e) => edit("global", e.target.value)}
+              placeholder="Answer truthfully&#10;Verify a fix before calling it done"
+            />
           </TabsContent>
 
           {/* forceMount: Radix otherwise unmounts the inactive tab, so the graph's host node does
@@ -166,25 +166,30 @@ export function MemoryCenter({
         </Tabs>
 
         <div className="flex shrink-0 items-center justify-end gap-2 border-t border-border px-5 py-3">
-          {/* Destructive actions are quiet ghosts, not two red outlines competing with Save.
-              Google puts weight on the affirmative action and leaves the rest as text. */}
-          <Button
-            variant="ghost"
-            size="sm"
-            disabled={!hasRoot}
-            className="text-muted-foreground hover:text-destructive"
-            onClick={() => { setProject(""); onClearProject?.(); }}
-          >
-            Clear project
-          </Button>
-          <Button
-            variant="ghost"
-            size="sm"
-            className="text-muted-foreground hover:text-destructive"
-            onClick={() => { setGlobal(""); onClearGlobal?.(); }}
-          >
-            Clear preferences
-          </Button>
+          {/* Only the clear action for the section you are looking at. With Memory and
+              Preferences now separate places, showing both destructive buttons at all times
+              invites clearing the one you are not in. */}
+          {tab === "memory" ? (
+            <Button
+              variant="ghost"
+              size="sm"
+              disabled={!hasRoot}
+              className="text-muted-foreground hover:text-destructive"
+              onClick={() => { setProject(""); onClearProject?.(); }}
+            >
+              Clear project memory
+            </Button>
+          ) : null}
+          {tab === "preferences" ? (
+            <Button
+              variant="ghost"
+              size="sm"
+              className="text-muted-foreground hover:text-destructive"
+              onClick={() => { setGlobal(""); onClearGlobal?.(); }}
+            >
+              Clear preferences
+            </Button>
+          ) : null}
           <Button size="sm" onClick={() => onSave?.(project, global)}>Save</Button>
         </div>
       </DialogContent>
