@@ -18956,6 +18956,35 @@ function _semanticProfileHeaderFor(resolved, text) {
   return _ideSemanticProfile(resolved || {});
 }
 
+// The profile is what the gateway assembles its cacheable system prefix from, so it belongs to
+// the SESSION, not to one message. Recomputing it per turn made a long run flap: "fix the login
+// page" routes the design blocks in, "still broken, check the console" routes them back out, and
+// each flip rewrites byte 0 of the request — which invalidates the cached prefix AND the entire
+// conversation behind it, not only the block that changed. Same failure as the date block that
+// carried minutes: a measured 2% cache hit rate on 120k-token requests.
+//
+// So a session's flags are sticky. Once a session has needed a capability, later turns keep it:
+// widening costs one miss and then settles, against a miss on every single turn.
+//
+// Sticky, not a blanket union — the full flag set assembles an 84KB prefix where a focused one is
+// 35KB, and blocks the model does not need are not free, they are more instructions competing
+// with the ones that matter. This keeps only what THIS session actually asked for.
+//
+// Flags are appended in first-seen order and never re-sorted. The gateway reads the profile as a
+// set (pinned by semantic_profile_flag_order_does_not_change_the_prefix), so appending is safe
+// and there is no second ordering table to fall out of step with _ideSemanticProfile.
+function _sessionStableSemanticProfile(session, header) {
+  const raw = String(header || "");
+  if (!session) return raw;
+  const colon = raw.indexOf(":");
+  const version = colon >= 0 ? raw.slice(0, colon + 1) : "2.5:";
+  const turn = (colon >= 0 ? raw.slice(colon + 1) : raw).split(",").map((f) => f.trim()).filter(Boolean);
+  const merged = Array.isArray(session._semanticProfileFlags) ? session._semanticProfileFlags.slice() : [];
+  for (const flag of turn) if (!merged.includes(flag)) merged.push(flag);
+  session._semanticProfileFlags = merged;
+  return `${version}${merged.join(",")}`;
+}
+
 // 下游同步画像入口：优先使用本会话刚确认的语义帧，其次才查同会话+上下文缓存。
 function _engineeringProfileWithAiIntent(text, session = null, context = null) {
   const base = _semanticEngineeringEvidence(text);
@@ -22334,7 +22363,7 @@ async function sendPrompt(text, attachments = [], readyConfig = null) {
     _turnRoot = preparedWorkspace.turnRoot || "";
     _curRoot = preparedWorkspace.currentRoot || String(_turnRoot || _knownWorkspaceRoots()[0] || "").replace(/\/+$/, "");
   }
-  config.ideSemanticProfile = _semanticProfileHeaderFor(_turnEngineeringResolved, text);
+  config.ideSemanticProfile = _sessionStableSemanticProfile(sess, _semanticProfileHeaderFor(_turnEngineeringResolved, text));
 
   // Selected model is an IMAGE model → generate the image directly from this message,
   // instead of feeding it to the agent loop (an image model can't handle the tools +
@@ -39510,7 +39539,8 @@ function _applyLateIntentIfLanded(run, config, task, session, body, isLive, mess
   }
   if (!late || late.intentSource !== "ai") return false;
   run.engineering = late;
-  config.ideSemanticProfile = _ideSemanticProfile(run.engineering);
+  // Sticky: a late verdict may classify this turn more narrowly than the session already is.
+  config.ideSemanticProfile = _sessionStableSemanticProfile(session, _ideSemanticProfile(run.engineering));
   run._cancelledEffectKinds = run._cancelledEffectKinds instanceof Set ? run._cancelledEffectKinds : new Set(run._cancelledEffectKinds || []);
   run._addedRuntimeObligations = run._addedRuntimeObligations instanceof Set ? run._addedRuntimeObligations : new Set(run._addedRuntimeObligations || []);
   run._addedExternalObligations = run._addedExternalObligations instanceof Set ? run._addedExternalObligations : new Set(run._addedExternalObligations || []);
@@ -40277,7 +40307,7 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
               session._intentState,
             );
             if (_steerVerdict) _commitAiIntentState(session, _steerVerdict, _steerSemanticText, _steerIntentContext);
-            config.ideSemanticProfile = _ideSemanticProfile(run.engineering);
+            config.ideSemanticProfile = _sessionStableSemanticProfile(session, _ideSemanticProfile(run.engineering));
             run._cancelledEffectKinds.clear();
             run._addedRuntimeObligations.clear();
             run._addedExternalObligations.clear();

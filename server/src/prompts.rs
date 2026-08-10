@@ -4011,6 +4011,33 @@ mod tests {
         assert!(detailed_user.contains("explain in depth"));
     }
 
+    /// Flag ORDER in the semantic profile must not change the assembled prefix.
+    ///
+    /// The client accumulates a session's flags in first-seen order rather than re-deriving a
+    /// canonical order every turn — a second ordering table would be one more thing that can
+    /// drift out of step with the one that builds the profile. That is only safe if the gateway
+    /// treats the profile as a set, so pin it here rather than assuming it.
+    #[test]
+    fn semantic_profile_flag_order_does_not_change_the_prefix() {
+        let assemble = |profile: &str| {
+            let mut headers = HeaderMap::new();
+            headers.insert("x-ide-mode", "agent".parse().unwrap());
+            headers.insert("x-ide-semantic-profile", profile.parse().unwrap());
+            let mut body = serde_json::json!({
+                "model": "claude-opus-4-8",
+                "messages": [{ "role": "user", "content": "把登录页修好" }],
+            });
+            assemble_into(&headers, &mut body);
+            body["messages"][0]["content"].as_str().unwrap_or_default().to_string()
+        };
+        assert_eq!(
+            assemble("2.5:engineering,design,design_implementation,git"),
+            assemble("2.5:git,design_implementation,design,engineering"),
+            "flag order changed the prefix — the client's first-seen ordering would then cause \
+             cache misses, and it must adopt a canonical order instead"
+        );
+    }
+
     /// The system prefix must not drift as a conversation grows.
     ///
     /// Claude Code treats the prompt as a cache object: sections are cached individually, a

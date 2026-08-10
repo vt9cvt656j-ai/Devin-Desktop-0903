@@ -7488,7 +7488,10 @@ test("classifier outages remain uncertain and never invoke a lexical intent fall
   assert.doesNotMatch(SRC, /function _localSemanticFallbackProfile\(/);
   assert.doesNotMatch(SRC, /function _engineeringTaskProfile\(/);
   assert.match(SRC, /classifier is[\s\S]{0,100}unavailable[\s\S]{0,140}empty profile/i);
-  assert.match(SRC, /config\.ideSemanticProfile = _semanticProfileHeaderFor\(_turnEngineeringResolved, text\);/);
+  // The turn's profile still comes from the classifier and nothing else — but it is merged into
+  // the session's flags before it goes out, so a turn the classifier reads more narrowly cannot
+  // rewrite the gateway's cached prefix mid-session.
+  assert.match(SRC, /config\.ideSemanticProfile = _sessionStableSemanticProfile\(sess, _semanticProfileHeaderFor\(_turnEngineeringResolved, text\)\);/);
 });
 
 test("planning gates consume structured semantic fields and do not infer intent after a classifier outage", () => {
@@ -20708,8 +20711,10 @@ test("late intent backfill is run-owned, non-blocking, and survives every write"
     "a landed verdict comes from this run's exact physical promise");
   assert.match(applyLate, /intentState\?\.context \|\| null/,
     "cache lookup must use the original context fingerprint rather than mutable session state");
-  assert.match(applyLate, /config\.ideSemanticProfile = _ideSemanticProfile\(run\.engineering\)/,
-    "the refreshed profile must reach the gateway or the design modules stay off");
+  assert.match(applyLate, /config\.ideSemanticProfile = _sessionStableSemanticProfile\(session, _ideSemanticProfile\(run\.engineering\)\)/,
+    "the refreshed profile must reach the gateway (or the design modules stay off), and go " +
+    "through the session merge (or a late verdict narrower than the session rewrites the " +
+    "cached prefix mid-run)");
   assert.match(applyLate, /late\.intentSource !== "ai"/, "only a real (ai) late verdict may overwrite the profile");
   assert.match(applyLate, /_startMichaelDesignPreflight\(\{ run, body, isLive \}\)/,
     "a late design verdict starts the run-level background retrieval");
@@ -20727,6 +20732,9 @@ test("late and steering intent adoption immediately reconcile the live tool wind
     _mergeAiIntentProfile: () => lateProfile,
     _engineeringProfileWithAiIntent: () => null,
     _ideSemanticProfile: (profile) => `semantic:${profile.workspaceAction}`,
+    // The real merge, not a stub: with session=null it passes the header straight through, and
+    // injecting a stub here would hide it if that ever stopped being true.
+    _sessionStableSemanticProfile: load("_sessionStableSemanticProfile"),
     _startMichaelDesignPreflight: () => { throw new Error("design preflight must not run"); },
   });
   let syncs = 0;
