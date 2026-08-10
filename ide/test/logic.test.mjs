@@ -12940,13 +12940,14 @@ test("验证事实由真实命令/诊断提供，不由 IDE 收尾门强行代�
   assert.match(rav, /stderr: result\.stderr \?\? result\.report \?\? ""/,
     "verification failures must expose the real stderr/report");
 
-  // Unverified delivery remains visible in the outcome instead of triggering
-  // another model turn.
-  const label = extractFn("_agentIncompleteLabel");
-  assert.match(label, /code_delivered_unverified:/,
-    "unverified delivery needs a truthful user-visible reason");
-  assert.match(label, /ui_verification_missing:/,
-    "missing UI verification needs a truthful user-visible reason");
+  // Unverified delivery is recorded rather than acted on: it must not spin up another model
+  // turn, and it must not write a line under the model's answer either. The user-visible labels
+  // this used to assert were removed — see "nothing is appended to what the model wrote when a
+  // run ends". What has to survive is the state, which is what stops the loop re-triggering.
+  assert.match(SRC, /run\._incompleteReason \|\|= "code_delivered_unverified"/,
+    "unverified delivery must still be recorded");
+  assert.match(SRC, /run\._incompleteReason \|\|= "ui_verification_missing"/,
+    "missing UI verification must still be recorded");
 });
 
 test("技术栈规则必须真的送达模型——每个 UI 轮次，包括网关设计层在场时", () => {
@@ -14287,7 +14288,7 @@ test("provider payloads omit IDE-only reasoning fields without mutating conversa
 test("reasoning persists once and restored history renders exactly one thought card", async () => {
   const stripLegacy = load("_withoutLegacyReasoningSummary");
   const loop = extractFn("_runAgenticLoop");
-  const finalizeStart = loop.indexOf("const _parts = []");
+  const finalizeStart = loop.indexOf("const _record = String(summaryText");
   const finalizeEnd = loop.indexOf("_thinkLedgerPush", finalizeStart);
   const finalize = loop.slice(finalizeStart, finalizeEnd);
   assert.doesNotMatch(finalize, /_parts\.push\(`〔推理摘要〕/);
@@ -21575,12 +21576,28 @@ test("a model-run verifier that exits 0 earns verification credit", () => {
   }
 });
 
-test("the unverified label states the fact without telling the user to run the build", () => {
-  // The agent runs verification; it is not homework handed back to the user. The old label ended
-  // with "请先跑一次构建/测试再当作可用".
-  const label = load("_agentIncompleteLabel")("code_delivered_unverified", false);
-  assert.match(label, /没有拿到通过的编译\/测试证据/, "states the fact");
-  assert.doesNotMatch(label, /请先跑|请自行|你先跑|自己跑/, "must not delegate the build back to the user");
+test("nothing is appended to what the model wrote when a run ends", () => {
+  // The harness used to add its own lines under the model's answer, in the model's voice:
+  // 〔本轮改动的文件：…〕, 〔本轮未完成：ui_verification_missing〕 — which leaked a raw internal
+  // key into the reply as if it were a sentence — and a "未验证：…" note. They went into history
+  // as well as onto the screen, so the model read them back and imitated the shape. Michael has
+  // asked for this class of thing gone four separate times now.
+  //
+  // Nothing is lost by removing them: every fact they carried already lives in
+  // session._lastRunState (outcome, incompleteReason, mutated, result) as structured state the
+  // next turn reads directly, instead of prose pretending the assistant wrote it.
+  const loop = extractFn("_runAgenticLoop");
+  const finalize = loop.slice(loop.indexOf("const _record = String(summaryText"), loop.indexOf("_thinkLedgerPush"));
+  assert.match(finalize, /const _record = String\(summaryText \|\| ""\)\.trim\(\)/,
+    "what gets persisted is the model's own prose and nothing else");
+  assert.doesNotMatch(loop, /〔本轮/, "no harness annotation may be appended to the answer");
+  assert.equal((SRC.match(/未验证：/g) || []).length, 0, "the canned unverified notes are gone");
+  assert.doesNotMatch(SRC, /function _agentIncompleteLabel/, "and the label table that fed them");
+
+  // The state itself must survive — it is how the next turn knows the run was incomplete
+  // without any of this appearing as text.
+  assert.match(SRC, /incompleteReason: String\(run\._incompleteReason/,
+    "the reason is still recorded as state for the next turn");
 });
 
 test("no prompt prescribes the shape of the model's closing summary", () => {
