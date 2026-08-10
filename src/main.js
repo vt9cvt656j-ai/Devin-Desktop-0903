@@ -29984,6 +29984,27 @@ function _agentIncompleteLabel(reason, hitCap = false) {
 
 function _buildAgentOutcomeSummary(run, opts) {
   opts = opts || {};
+  // ── The model's own closing wins ──────────────────────────────────────────────
+  //
+  // When the model has written its own wrap-up, everything it CAN narrate — what changed, what
+  // ran, what was verified, what is left — is its job, in its own words, phrased for this
+  // particular task. Restating the same facts underneath as fixed template lines ("改动文件：…",
+  // "运行结果：…", "验证：…") is duplication in a robotic register, and the user rejected it
+  // outright: let the AI improvise the ending; canned lines about what it just did read as
+  // machine noise.
+  //
+  // What survives is only what the model genuinely could NOT know, because it never got to speak
+  // about it: its own turn erroring out mid-flight, or being cut off at the step cap. Those are
+  // harness facts, and staying silent about them would be the dishonest kind of quiet.
+  //
+  // The full card still renders when the model said NOTHING (see the caller's
+  // `!_hasFinalNarrative` branch) — then it is the only record the user has, not a duplicate.
+  if (opts.narrativePresent) {
+    const err = String(opts.finalErr || "").trim();
+    if (err) return `- 本轮报错：${err.slice(0, 180)}`;
+    if (opts.hitCap) return "- 运行到本轮上限，已停止空转。";
+    return "";
+  }
   // Internal effect-kind tokens ("run"/"install"/"push"…) read like machine flags —
   // translate them before they reach the user-facing wrap-up.
   const effectKindLabels = {
@@ -42449,13 +42470,19 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
     let _outcomeSummary = "";
     const _hasFinalNarrative = !!(summaryText && summaryText.trim());
     const _hasPlanWork = Array.isArray(planSteps) && planSteps.length;
+    // Render the card when the model said NOTHING but work happened (it is then the only record),
+    // or when the run broke in a way the model could not narrate (its turn errored, or it was cut
+    // off at the cap). A model that wrote its own wrap-up keeps the last word: `narrativePresent`
+    // reduces the card to those harness-only facts, so its ending is not followed by canned
+    // "改动文件 / 运行结果 / 验证" lines restating what it just said.
     const _shouldRenderOutcome = run.mode === "agent" && (
-      finalErr || _verificationAlertText || hitCap || run._incompleteReason
+      finalErr || hitCap
       || (!_hasFinalNarrative && (didMutate || _runtimeEffects.size || _externalEffects.size
         || (run.recording && run.recording.length >= 2) || _hasPlanWork))
     );
     if (_shouldRenderOutcome) {
       _outcomeSummary = _buildAgentOutcomeSummary(run, {
+        narrativePresent: _hasFinalNarrative,
         planSteps,
         mutatedFiles: [..._mutatedFiles],
         runtimeEffects: [..._runtimeEffects],
@@ -42469,10 +42496,14 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
         verificationPassed,
         uiVerificationPassed,
       });
-      const summary = document.createElement("div");
-      summary.className = "agent-seg";
-      renderMarkdownInto(summary, _outcomeSummary, { highlighter: highlightCode });
-      body.appendChild(summary);
+      // May be empty now: with a narrative present and no harness-only fact to report, the card
+      // has nothing left to say — append nothing rather than an empty block under the answer.
+      if (_outcomeSummary && _outcomeSummary.trim()) {
+        const summary = document.createElement("div");
+        summary.className = "agent-seg";
+        renderMarkdownInto(summary, _outcomeSummary, { highlighter: highlightCode });
+        body.appendChild(summary);
+      }
     }
     // Persist this run's assistant narrative + WHAT IT DID (files changed), ALWAYS — even on
     // error / cap — so the next send continues with real context instead of restarting cold
