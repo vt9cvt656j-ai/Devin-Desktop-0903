@@ -14251,6 +14251,10 @@ function _conversationSessionMetadata(session) {
     thinks: Array.isArray(session?._thinkLedger) && session._thinkLedger.length
       ? session._thinkLedger.slice(-6) : undefined, // 方案A：思考结论账本跨重启存活
     intentState: session?._intentState && typeof session._intentState === "object" ? session._intentState : undefined,
+    // The gateway builds its cached system prefix from these, so losing them on restart makes a
+    // resumed session pay a full prefix miss on its first turn for no reason.
+    semanticFlags: Array.isArray(session?._semanticProfileFlags) && session._semanticProfileFlags.length
+      ? session._semanticProfileFlags.slice() : undefined,
     lastRun: session?._lastRunState && typeof session._lastRunState === "object" ? session._lastRunState : undefined,
     pendingSends: Array.isArray(session?._pendingSends) ? session._pendingSends.slice(-20) : undefined,
     created: session?.created,
@@ -15208,6 +15212,7 @@ function _restoreClosedChatSession(closedIndex) {
   session.id = sData.id || session.id;
   session.created = sData.created || Date.now();
   if (sData.intentState && typeof sData.intentState === "object") session._intentState = sData.intentState;
+  if (Array.isArray(sData.semanticFlags)) session._semanticProfileFlags = sData.semanticFlags.slice();
   if (sData.lastRun && typeof sData.lastRun === "object") session._lastRunState = sData.lastRun;
   if (typeof sData.html === "string" && sData.html) session._htmlSnapshot = sData.html;
   if (sData.memory) {
@@ -15439,6 +15444,8 @@ function _chatSessionDataForStorage(s, mediaBudget, includeHtml = false, options
     demands: Array.isArray(s?._demandLedger) && s._demandLedger.length ? s._demandLedger.slice(-40) : undefined,
     thinks: Array.isArray(s?._thinkLedger) && s._thinkLedger.length ? s._thinkLedger.slice(-6) : undefined, // 方案A：思考结论账本跨重启存活
     intentState: s?._intentState && typeof s._intentState === "object" ? s._intentState : undefined,
+    semanticFlags: Array.isArray(s?._semanticProfileFlags) && s._semanticProfileFlags.length
+      ? s._semanticProfileFlags.slice() : undefined,
     lastRun: s?._lastRunState && typeof s._lastRunState === "object" ? s._lastRunState : undefined,
     created: s?.created,
   };
@@ -15881,6 +15888,7 @@ async function restoreChatHistory() {
         session.created = sData.created || Date.now();
         if (sData.anchorRoot) session._anchorRoot = sData.anchorRoot; // 恢复工作区锚点：重开后换文件夹能触发"忘掉旧路径"提示
         if (sData.intentState && typeof sData.intentState === "object") session._intentState = sData.intentState;
+        if (Array.isArray(sData.semanticFlags)) session._semanticProfileFlags = sData.semanticFlags.slice();
         if (sData.lastRun && typeof sData.lastRun === "object") session._lastRunState = sData.lastRun;
         // Rendered-transcript snapshot (disk store only) — consumed lazily by
         // _renderSessionHistory when this tab is first shown, restoring the full
@@ -16901,7 +16909,9 @@ async function _truncateFromUserMessage(sess, wrap) {
   await _restorePromptTailAfterTruncate(sess, sess._historyTotal);
   // 这条之后的对话已经作废，对应的已解析目标和上轮结果也必须作废；下一次发送会从
   // 保留下来的真实历史重新建立语义帧，不能拿被删掉的未来状态继续推理。
-  try { sess._intentState = null; sess._lastRunState = null; } catch {}
+  // 语义标志是"这个会话到目前为止需要过什么能力"的累积，被删掉的那部分对话不再算数；
+  // 而且截断本来就已经让缓存失效，这里重建前缀是免费的。
+  try { sess._intentState = null; sess._lastRunState = null; sess._semanticProfileFlags = null; } catch {}
   // 界面：这条气泡和它之后的全部移除
   try {
     const doomed = [];

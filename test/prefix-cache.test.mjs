@@ -70,6 +70,22 @@ test("no session (background/one-shot request) passes through unchanged", () => 
   assert.equal(stable(undefined, ""), "");
 });
 
+test("the session's flags survive a restart and are dropped on a rewind", () => {
+  // Session persistence is an explicit whitelist, so a field nobody lists silently does not
+  // survive — and a resumed session would then pay a full prefix miss on its first turn for
+  // nothing. Two serializers and two rehydrators, matching how _intentState is handled.
+  assert.equal((SRC.match(/semanticFlags: Array\.isArray\(/g) || []).length, 2,
+    "both session serializers must write the flags");
+  assert.equal((SRC.match(/if \(Array\.isArray\(sData\.semanticFlags\)\)/g) || []).length, 2,
+    "both rehydrators must read them back");
+
+  // Rewinding deletes a message and everything after it, so whatever capabilities that stretch
+  // of the conversation needed stop counting. It is also the one free moment to re-derive:
+  // truncation has already invalidated the cache, so nothing is lost by starting over.
+  assert.match(SRC, /sess\._intentState = null; sess\._lastRunState = null; sess\._semanticProfileFlags = null;/,
+    "a rewind must drop the accumulated flags with the conversation it discarded");
+});
+
 test("every profile write goes through the sticky merge", () => {
   // Three places assign config.ideSemanticProfile: the turn itself, a late intent verdict, and
   // steering mid-run. The last two also narrow, so a raw assignment anywhere reopens the bug.
