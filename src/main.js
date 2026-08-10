@@ -29936,7 +29936,6 @@ function _agentIncompleteLabel(reason, hitCap = false) {
   // the prediction ledger that set them — AGENT_LOOP_REBUILD.md stage 2b. Nothing produces those
   // reasons any more, so the parser branches were dead.
   const labels = {
-    semantic_runtime_review_missing: "真实运行结果尚未完成语义核验，不能确认用户目标已经实现",
     // Without this entry a run that wrote code and never compiled it rendered an outcome card
     // listing the files with no warning at all — the user had no way to know it was unchecked.
     code_delivered_unverified: "代码已写入但**没有通过编译/测试验证**（本项目没探测到可用的检查命令，或检查没跑成功）——请先跑一次构建/测试再当作可用",
@@ -29981,15 +29980,10 @@ function _buildAgentOutcomeSummary(run, opts) {
   // "验证：未完全通过或未运行"这种像代码有问题的措辞。
   const verifierUnavailable = /^验证器不可用|^验证未完成/m.test(note);
   const incomplete = _agentIncompleteLabel(run?._incompleteReason || run?._capReason, !!opts.hitCap);
-  // 收尾一致性修复：语义运行核验未完成 + 真实命令/检查已通过 = 不是"未完成/失败"，
-  // 而是"语法/命令已验、运行时行为待你对照目标再确认"。若两条同时以"本轮未完全收尾"
-  // 抬头 + "验证：已通过"并列出现，就会自打脸——此情形改为末尾一句软提醒，不写失败抬头。
-  const _semanticReviewOnly = run?._incompleteReason === "semantic_runtime_review_missing" && !run?._capReason;
-  const _softSemanticCaveat = _semanticReviewOnly && !!opts.verificationPassed;
   const lines = [];
 
   if (finalErr) lines.push(`本轮报错：${finalErr.slice(0, 180)}`);
-  else if (incomplete && !_softSemanticCaveat) lines.push(`本轮未完全收尾：${incomplete}`);
+  else if (incomplete) lines.push(`本轮未完全收尾：${incomplete}`);
   else if (!completed.length && !mutatedFiles.length && !runtimeEffects.length && !externalEffects.length && !opts.didMutate) lines.push("已处理。");
 
   if (completed.length) lines.push(`已完成：${completed.join("；")}`);
@@ -30015,25 +30009,13 @@ function _buildAgentOutcomeSummary(run, opts) {
     // AI 自主控制：只在 AI 真的主动跑了验证并通过时如实陈述一句。
     // 不再因为“没验证”就往总结里塞“未通过/未运行/交付门未通过”这类像“没干完”的门禁结论。
     //
-    // 这两条以前是分开的两行，于是每个绿色收尾都会先说「验证：已通过真实命令/检查」，
-    // 紧接着再说一句「运行时行为的语义核验未完全完成……建议再确认一次」——自相矛盾，
-    // 而且每次都出现。读者要么把整段当噪音跳过，要么以为验证其实没过。合成一句：
-    // 事实不变（静态检查过了、运行时没实测），但只说一次，不打自己的脸。
     if (opts.verificationPassed) {
-      lines.push(opts.didVerify
-        ? (_softSemanticCaveat
-          ? "验证：已通过真实命令/检查（静态层面；运行时行为未实测）。"
-          : "验证：已通过真实命令/检查。")
-        : "验证：改动已落盘。");
+      lines.push(opts.didVerify ? "验证：已通过真实命令/检查。" : "验证：改动已落盘。");
     }
     // 环境事实的平静措辞（曾被重构误删成死变量）：验证器缺失/无可识别命令对代码
     // 零断言，不是失败，不能写成像代码有问题的措辞。
     else if (verifierUnavailable) lines.push("验证：本机没有可运行的自动验证器（命令不存在/退出 127），对代码零断言；装上工具后可再验。");
     else if (noAutoVerify) lines.push("验证：项目未提供可自动识别的验证命令，未强行瞎跑。");
-  }
-  // 已经在上面那句里说过的，就不再单独占一行；没有验证行可挂靠时仍如实单说。
-  if (_softSemanticCaveat && !(opts.didMutate && opts.verificationPassed && opts.didVerify)) {
-    lines.push("运行时行为的语义核验未完全完成——语法/命令检查已通过，建议对照你的目标再确认一次实际效果。");
   }
   if (pending.length) lines.push(`剩余/待确认：${pending.join("；")}`);
   if (!lines.length) return "";
@@ -35393,32 +35375,6 @@ function _runtimeEvidenceKinds(call, result) {
   return [];
 }
 
-// A completed process is evidence, not a conclusion. Build/test commands have a
-// deterministic contract through their exit status; an arbitrary application
-// or script can return 0 while its requested work is still incomplete. Those
-// results go through the model's semantic review with the raw structured output.
-function _runtimeNeedsSemanticReview(call, result) {
-  // Verification collected by the IDE has an explicit structural tag. Do not put
-  // a successful syntax/build/test check back behind the "application output needs
-  // semantic review" gate: that used to produce the contradictory UI state
-  // "automatic verification passed" + "runtime result not verified".
-  if (call?.verification === true || result?.verification === true) return false;
-  // A deterministic check that FAILED is still deterministic. The stamp above became
-  // success-gated (a red build must not CERTIFY code), which un-exempted red checks
-  // from this gate — routing "npm test went red, wrap up honestly" into the paid
-  // semantic-critic loop and labelling the run semantic_runtime_review_missing. The
-  // exemption's rationale is the command CLASS's exit-status contract, not its
-  // outcome: a red build needs fixing (the codeVerify gate demands exactly that),
-  // never semantic review. Command shape is the right test here for the same reason
-  // it is the wrong test for granting verification credit.
-  // A declared verification has an exit-status contract: red means fix it (the codeVerify
-  // gate demands exactly that), never "have a critic interpret the output".
-  if (call?.purpose === "verify") return false;
-  // Do not classify application success from command names or output words. If a
-  // terminal tool produced observable execution state, the reviewer must inspect
-  // that state in the context of the user's requested outcome.
-  return _executionEvidenceFromTool(call, result, "") !== null;
-}
 
 // Source-code file extensions for the pre-delivery verification gate: editing one of
 // these carries an implicit "prove it at least parses/builds" obligation. Docs, config
@@ -39969,10 +39925,9 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
   // not considered functionally verified until the model reviews that evidence
   // against the user's requested outcome.
   run._executionEvidence = Array.isArray(run._executionEvidence) ? run._executionEvidence : [];
-  let _semanticRuntimeAtImplOps = -1;
-  let _semanticReviewAtImplOps = -1;
-  let _semanticReviewBlocked = false;
-  let _semanticReviewInstruction = "";
+  // The "runtime not semantically verified, can't confirm the goal" hedge (and its dead
+  // _semanticReview* leftovers) were removed — it added an unactionable caveat to every green
+  // build and the user asked for it gone. Verification reporting is now execution facts only.
   let _criticEvidenceSignature = "";
   let _semanticReviewRuns = 0;
   let _semanticReviewNudges = 0;
@@ -40795,9 +40750,6 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
           && !run._diagnosticBlock;
         // Browser operation dedup ledger: track recent actions to prevent repeated same operations
         if (!run._browserOpLog) run._browserOpLog = [];
-        if (_semanticRuntimeAtImplOps >= 0 && _semanticReviewBlocked && !run._incompleteReason) {
-          run._incompleteReason = "semantic_runtime_review_missing";
-        }
         if (_codeDeliveredUnverified && !run._incompleteReason) {
           run._incompleteReason = "code_delivered_unverified";
         }
@@ -41221,11 +41173,6 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
           run._executionEvidence.push(_executionEvidenceRecord);
           it._executionEvidence = _executionEvidenceRecord;
           if (run._executionEvidence.length > 12) run._executionEvidence.shift();
-          if (_runtimeNeedsSemanticReview(call, result)) {
-            _semanticRuntimeAtImplOps = _implOps;
-            _semanticReviewBlocked = true;
-            _semanticReviewInstruction = "";
-          }
         }
         _settleToolStep(step, result);
         // Live plan tracking: advance the plan the moment each tool settles, so the
@@ -41910,16 +41857,12 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
           if (!_docOnlyMutation) {
                         _implOps++;
             // Verification credit expires with the artifact it certified — the same rule
-            // already applied to _semanticReviewAtImplOps / _uiVerifiedAtImplOps below.
-            // Leaving it sticky was the outlier. `didVerify` is deliberately NOT cleared:
-            // it means "a check was attempted this run", not "current state is proven".
+            // already applied to _uiVerifiedAtImplOps below. Leaving it sticky was the outlier.
+            // `didVerify` is deliberately NOT cleared: it means "a check was attempted this run",
+            // not "current state is proven".
             _verifiedAtImplOps = -1;
             verificationPassed = false;
             for (const kind of ["build", "test", "run", "package"]) _runtimeEffects.delete(kind);
-            _semanticRuntimeAtImplOps = -1;
-            _semanticReviewAtImplOps = -1;
-            _semanticReviewBlocked = false;
-            _semanticReviewInstruction = "";
             if (run.engineering.ui) {
               const _hadVerifiedUi = _uiVerifiedAtImplOps >= 0;
               // Only clear "verification credentials", not browser runtime state: editing files doesn't close browser or change viewport—
@@ -41982,16 +41925,12 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
           run._didMutate = true; // 同上：worker 的写操作也算本 run 已有写操作
           _implOps++;
           // Verification credit expires with the artifact it certified — the same rule
-          // already applied to _semanticReviewAtImplOps / _uiVerifiedAtImplOps below.
-          // Leaving it sticky was the outlier. `didVerify` is deliberately NOT cleared:
-          // it means "a check was attempted this run", not "current state is proven".
+          // already applied to _uiVerifiedAtImplOps below. Leaving it sticky was the outlier.
+          // `didVerify` is deliberately NOT cleared: it means "a check was attempted this run",
+          // not "current state is proven".
           _verifiedAtImplOps = -1;
           verificationPassed = false;
           for (const kind of ["build", "test", "run", "package"]) _runtimeEffects.delete(kind);
-          _semanticRuntimeAtImplOps = -1;
-          _semanticReviewAtImplOps = -1;
-          _semanticReviewBlocked = false;
-          _semanticReviewInstruction = "";
           if (run.engineering.ui) {
             const _hadVerifiedUi = _uiVerifiedAtImplOps >= 0;
             // Only clear "verification credentials", not browser runtime state: editing files doesn't close browser or change viewport—
