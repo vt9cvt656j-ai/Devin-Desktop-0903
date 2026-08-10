@@ -70,6 +70,7 @@ import {
 } from "./agent/tool-policy.js";
 import getSharedStore from "./agent/shared-store.js";
 import { renderSlashMenu, destroySlashMenu } from "./ui/mount-slash-menu.jsx";
+import { openSessionPickerIsland } from "./ui/mount-session-picker.jsx";
 import { getCollaborationEngine } from "./agent/collaboration-engine.js";
 
 // Global shared state store for sub-agent collaboration
@@ -56902,9 +56903,9 @@ if (typeof window !== "undefined") {
 }
 
 const _SLASH = [
-  { cmd: "sessions", desc: "查看 / 切换所有会话", action: () => _openSessionPicker() },
-  { cmd: "memory", desc: "管理项目记忆（知识图谱）", action: () => openMemoryPanel() },
-  { cmd: "remote", desc: "连接远程机器（在别的电脑/服务器上写代码跑命令）", action: () => openRemoteDialog() },
+  { cmd: "sessions", desc: "Browse and switch conversations", action: () => _openSessionPicker() },
+  { cmd: "memory", desc: "Manage project memory", action: () => openMemoryPanel() },
+  { cmd: "remote", desc: "Connect to a remote machine", action: () => openRemoteDialog() },
 ];
 
 function _sessionMemoryStats(session) {
@@ -56936,13 +56937,18 @@ function _sessionMemoryStats(session) {
 function _sessionMemoryLabel(stats) {
   const s = stats || {};
   const total = Number(s.totalTurns) || Number(s.recentCount) || 0;
+  // Terse, like Claude Code's resume list: the counts that tell two sessions apart, and
+  // nothing that reads the same on every row. Zero-valued extras are dropped rather than
+  // printed as "0 summaries · 0 milestones", which was most of the old line's width.
   const parts = [];
-  if (total) parts.push(`${total} 轮`);
-  parts.push(`近期 ${Number(s.recentCount) || 0} 条`);
-  parts.push(`历史摘要 ${Number(s.summaryCount) || 0} 段`);
-  if (Number(s.milestoneCount) > 0) parts.push(`关键节点 ${Number(s.milestoneCount)} 个`);
-  if (Number(s.fileEvidenceCount) > 0) parts.push(`文件证据 ${Number(s.fileEvidenceCount)} 个`);
-  if (Number(s.correctionCount) > 0) parts.push(`有效纠正 ${Number(s.correctionCount)} 条`);
+  if (total) parts.push(`${total} turn${total === 1 ? "" : "s"}`);
+  const recent = Number(s.recentCount) || 0;
+  if (recent) parts.push(`${recent} msg${recent === 1 ? "" : "s"}`);
+  const summaries = Number(s.summaryCount) || 0;
+  if (summaries) parts.push(`${summaries} summar${summaries === 1 ? "y" : "ies"}`);
+  if (Number(s.milestoneCount) > 0) parts.push(`${Number(s.milestoneCount)} milestones`);
+  if (Number(s.fileEvidenceCount) > 0) parts.push(`${Number(s.fileEvidenceCount)} files`);
+  if (Number(s.correctionCount) > 0) parts.push(`${Number(s.correctionCount)} corrections`);
   return parts.join(" · ");
 }
 
@@ -56978,7 +56984,7 @@ function _sessionLastPreview(session) {
     const text = String(summaries[i]?.text || "").replace(/\s+/g, " ").trim();
     if (text) return `历史摘要：${text.slice(0, 100)}`;
   }
-  return "(空会话)";
+  return "Empty session";
 }
 
 function _sessionHasRecoverableMemory(session) {
@@ -57022,80 +57028,42 @@ function _sessionLibraryTotals(entries) {
 // Session picker (/sessions): browse every conversation in this workspace — name,
 // project, mode, message count, last-message preview — and jump into one to continue.
 function _openSessionPicker() {
-  const overlay = document.createElement("div");
-  overlay.className = "session-picker-overlay";
-  const modal = document.createElement("div");
-  modal.className = "session-picker";
-  modal.innerHTML =
-    `<div class="sp-head">` +
-      `<div class="sp-titleblock">` +
-        `<div class="sp-title">会话与长期记忆</div>` +
-        `<div class="sp-subtitle">旧聊天会压缩成历史摘要继续带入上下文，不是只保留当前列表里的近期消息。</div>` +
-      `</div>` +
-      `<span class="sp-count"></span>` +
-      `<button class="sp-close" type="button" aria-label="关闭">✕</button>` +
-    `</div>` +
-    `<div class="sp-memory-summary"></div>` +
-    `<input class="sp-search" type="text" placeholder="搜索会话、历史摘要、项目路径、文件证据…">` +
-    `<div class="sp-list"></div>`;
-  overlay.appendChild(modal);
-  document.body.appendChild(overlay);
-  const close = () => overlay.remove();
-  modal.querySelector(".sp-close").addEventListener("click", close);
-  overlay.addEventListener("click", (e) => { if (e.target === overlay) close(); });
-  const listEl = modal.querySelector(".sp-list");
-  const searchEl = modal.querySelector(".sp-search");
+  // Data prep only — the panel is a React island (src/ui/session-picker.jsx). Everything the
+  // island needs is flattened to plain values here so it stays presentational and main.js keeps
+  // ownership of session state.
   const entries = _sessionPickerEntries();
-  const openCount = entries.filter((entry) => entry.state === "open").length;
-  const closedCount = entries.length - openCount;
-  modal.querySelector(".sp-count").textContent = `${entries.length} 个会话`;
-  const totals = _sessionLibraryTotals(entries);
-  modal.querySelector(".sp-memory-summary").textContent =
-    entries.length
-      ? `已打开 ${openCount} 个 · 可恢复 ${closedCount} 个 · 总计 ${totals.totalTurns} 轮 · 近期 ${totals.recentCount} 条 · 历史摘要 ${totals.summaryCount} 段 · 文件证据 ${totals.fileEvidenceCount} 个 · 有效纠正 ${totals.correctionCount} 条`
-      : "还没有会话记忆";
-
-  const render = (q) => {
-    q = (q || "").trim().toLowerCase();
-    listEl.innerHTML = "";
-    const rows = entries.filter(({ session }) => {
-      if (!q) return true;
-      return _sessionSearchText(session).includes(q);
-    });
-    if (!rows.length) { listEl.innerHTML = `<div style="padding:20px;text-align:center;opacity:.5;font-size:13px">没有匹配的会话</div>`; return; }
-    for (const { session: s, index: i, state } of rows) {
-      const preview = _sessionLastPreview(s);
-      const proj = s.project ? (s.project.split("/").filter(Boolean).pop() || "") : "";
-      const modeObj = _AI_MODES.find((m) => m.id === s.mode);
-      const active = state === "open" && i === _activeChatIdx;
-      const stats = _sessionMemoryStats(s);
-      const row = document.createElement("button");
-      row.type = "button";
-      row.className = "sp-row" + (active ? " is-active" : "") + (state === "closed" ? " is-closed" : "");
-      row.innerHTML =
-        `<div class="sp-row-main">` +
-          `<span class="sp-dot" style="background:${modeObj?.color || "#1a73e8"}"></span>` +
-          `<span class="sp-name"></span>` +
-          (proj ? `<span class="sp-proj"></span>` : "") +
-          `<span class="sp-meta"></span>` +
-        `</div>` +
-        `<div class="sp-prev"></div>`;
-      row.querySelector(".sp-name").textContent = s.name;
-      if (proj) row.querySelector(".sp-proj").textContent = proj;
-      row.querySelector(".sp-meta").textContent = `${_sessionMemoryLabel(stats)} · ${modeObj?.label || s.mode}${active ? " · 当前" : state === "closed" ? " · 已关闭，点击恢复" : ""}`;
-      row.querySelector(".sp-prev").textContent = preview;
-      row.addEventListener("click", () => {
-        if (state === "closed") _restoreClosedChatSession(i);
-        else void _switchChatSession(i);
-        close();
-        promptEl.focus();
-      });
-      listEl.appendChild(row);
-    }
-  };
-  render("");
-  searchEl.addEventListener("input", () => render(searchEl.value));
-  setTimeout(() => searchEl.focus(), 30);
+  const resumable = entries.filter((entry) => entry.state === "closed").length;
+  const rows = entries.map(({ session: s, index: i, state }) => {
+    const modeObj = _AI_MODES.find((m) => m.id === s.mode);
+    const active = state === "open" && i === _activeChatIdx;
+    return {
+      key: `${state}:${i}`,
+      index: i,
+      state,
+      active,
+      name: s.name,
+      project: s.project ? (s.project.split("/").filter(Boolean).pop() || "") : "",
+      dot: modeObj?.color || "#1a73e8",
+      // Join non-empty parts: an empty session has no counts, and " · Agent" with a leading
+      // separator is the kind of detail that makes a panel look unfinished.
+      meta: [_sessionMemoryLabel(_sessionMemoryStats(s)), modeObj?.label || s.mode]
+        .filter(Boolean).join(" · "),
+      // Which session you are in, and which are closed but restorable, is the distinction the
+      // list exists to make — a row you cannot tell apart from the current one is a trap.
+      tag: active ? "current" : state === "closed" ? "resume" : "",
+      preview: _sessionLastPreview(s),
+      search: _sessionSearchText(s),
+    };
+  });
+  openSessionPickerIsland({
+    entries: rows,
+    resumableCount: resumable,
+    onPick: (row) => {
+      if (row.state === "closed") _restoreClosedChatSession(row.index);
+      else void _switchChatSession(row.index);
+      promptEl.focus();
+    },
+  });
 }
 let _slashMatches = [];
 let _slashActive = -1;
