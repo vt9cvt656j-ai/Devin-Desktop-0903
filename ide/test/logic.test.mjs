@@ -21735,3 +21735,27 @@ test("a session is identified by its first user prompt, not a sequential name", 
   assert.match(SRC, /name: _sessionFirstPrompt\(s\) \|\| s\.name/,
     "the row title must prefer the first prompt and fall back to the name");
 });
+
+test("typed literals are exempt from the auto-localizer", () => {
+  // i18n.js runs a MutationObserver over the DOM and sends unrecognised text to a translation
+  // pack, which is why `sessions` rendered as 会话 even though the source string is English.
+  // A slash command is a literal you TYPE — 会话 cannot be typed to run anything. The same
+  // exemption already exists for the model picker, whose comment records why: model names are
+  // product identifiers, and translating them produced hallucinated renames (opus→sonnet).
+  //
+  // The user's own prompt and the project directory name are the same category: content and
+  // identifiers, not UI copy. Descriptions beside them are copy and must keep translating.
+  const SLASH = readFileSync(join(HERE, "../src/ui/slash-menu.jsx"), "utf8");
+  assert.match(SLASH, /data-i18n-skip>\{item\.cmd\}/,
+    "the slash command name must be exempt from auto-translation");
+  assert.doesNotMatch(SLASH, /data-i18n-skip[^>]*>\{item\.desc\}/,
+    "the description is UI copy and should still localize");
+
+  assert.match(PICKER_SRC, /data-i18n-skip>\{e\.name\}/,
+    "a session's title is the user's own prompt and must not be translated");
+
+  // And the mechanism must still be the one i18n.js honours.
+  const I18N = readFileSync(join(HERE, "../src/i18n.js"), "utf8");
+  assert.match(I18N, /"\[data-i18n-skip\]"/,
+    "i18n.js must keep [data-i18n-skip] in AUTO_I18N_SKIP_SELECTOR");
+});

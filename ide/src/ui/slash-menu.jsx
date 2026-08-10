@@ -40,7 +40,11 @@ export function SlashMenu({ items = [], activeIndex = 0, onPick, onHover }) {
               active ? "bg-accent text-accent-foreground" : "text-foreground",
             )}
           >
-            <span className="shrink-0 font-medium">{item.cmd}</span>
+            {/* The command name is a literal you TYPE, not UI copy. The auto-localizer would
+                otherwise render `sessions` as 会话 — which cannot be typed to run anything.
+                Same category as the model picker's entries in AUTO_I18N_SKIP_SELECTOR, and
+                excluded the same way. The description beside it is copy and still translates. */}
+            <span className="shrink-0 font-medium" data-i18n-skip>{item.cmd}</span>
             <span className="min-w-0 truncate text-[12px] text-muted-foreground">{item.desc}</span>
           </div>
         );
