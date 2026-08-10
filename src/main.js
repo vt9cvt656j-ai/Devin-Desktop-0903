@@ -38530,7 +38530,7 @@ function _buildToolHint(text, profile = _engineeringProfileWithAiIntent(text)) {
 // (B) Keep this reminder catalog-free. A hand-written list makes the agent overfit to
 // yesterday's tools and hides newly discovered MCP capabilities.
 function _toolReminderBlock() {
-  return "📋（提醒）工具窗口会随用户目标、新证据与 MCP 发现动态更换。继续根据目标和真实结果选择下一步，不要被早先见过的工具列表限制；需要的能力会由语义编排检查点装入，精确名称也可通过 search_tools 请求。";
+  return "📋 (reminder) The tool window changes as the user's goal, new evidence and MCP discovery change. Keep choosing the next step from the goal and the real results — do not treat a tool list you saw earlier as the limit. The capability you need will be loaded by the semantic orchestration checkpoint, and you can also ask for an exact name with search_tools.";
 }
 
 // Per-turn "old hand" operating frame. This is deliberately dynamic and compact:
@@ -38542,50 +38542,50 @@ function _agentIntentExecutionBlock(profile) {
   const semantic = profile?.intentSemantic;
   if (!semantic || typeof semantic !== "object") return "";
   const relationLabels = {
-    new: "新任务",
-    continue: "延续上一目标",
-    correct: "纠正上一轮理解/结果",
-    replace: "替换旧目标",
-    clarify: "补充或澄清约束",
+    new: "a new task",
+    continue: "continuing the previous goal",
+    correct: "correcting the previous round's understanding or result",
+    replace: "replacing the previous goal",
+    clarify: "adding to or clarifying a constraint",
   };
   const lines = [
-    "🎯 **本轮意图执行契约（内部使用，不要向用户复述分类）**",
-    `关系: ${relationLabels[semantic.continuation] || "待核对"}${profile.intentSource === "session-inherited" ? "（判定超时，继承同会话已确认目标；当前用户原话仍是最高优先级）" : ""}`,
+    "🎯 **This turn's intent contract (internal — do not recite the classification back to the user)**",
+    `Relation: ${relationLabels[semantic.continuation] || "to be confirmed"}${profile.intentSource === "session-inherited" ? " (classification timed out; inherited from a confirmed goal in this session — the user's own words this turn still take precedence)" : ""}`,
   ];
   // Automatic prompt optimization: lead with the clarified restatement so the model acts on
   // an understood, complete version of a terse/ambiguous message — while the user's raw
   // words remain verbatim in the request that follows this block (this never replaces them).
-  if (semantic.restatedTask) lines.push(`读懂的诉求（据此执行，但以用户原话为准）: ${semantic.restatedTask}`);
-  if (semantic.goal) lines.push(`目标: ${semantic.goal}`);
-  if (semantic.action || semantic.target) lines.push(`动作/对象: ${semantic.action || "处理"}${semantic.target ? ` → ${semantic.target}` : ""}`);
-  if (semantic.constraints?.length) lines.push(`约束: ${semantic.constraints.join("；")}`);
-  if (semantic.successCriteria?.length) lines.push(`成功条件: ${semantic.successCriteria.join("；")}`);
-  if (semantic.ambiguities?.length) lines.push(`仍存歧义: ${semantic.ambiguities.join("；")}。先用项目/对话证据消除；只有会实质改变结果且查不出来才问用户。`);
+  if (semantic.restatedTask) lines.push(`The request as understood (act on this, but the user's own words govern): ${semantic.restatedTask}`);
+  if (semantic.goal) lines.push(`Goal: ${semantic.goal}`);
+  if (semantic.action || semantic.target) lines.push(`Action/object: ${semantic.action || "handle"}${semantic.target ? ` → ${semantic.target}` : ""}`);
+  if (semantic.constraints?.length) lines.push(`Constraints: ${semantic.constraints.join("; ")}`);
+  if (semantic.successCriteria?.length) lines.push(`Success criteria: ${semantic.successCriteria.join("; ")}`);
+  if (semantic.ambiguities?.length) lines.push(`Still ambiguous: ${semantic.ambiguities.join("; ")}. Resolve it from project or conversation evidence first; ask the user only when it would materially change the result and cannot be established.`);
   const engineering = profile?.intentEngineering;
   if (engineering && typeof engineering === "object") {
-    const projectLabel = { existing: "已有项目", greenfield: "绿地新项目", none: "无项目", unknown: "先检查项目" }[engineering.projectState] || engineering.projectState;
-    lines.push(`工程路径: ${projectLabel}；${engineering.architectureMode}；范围 ${engineering.changeScope}；工作区 ${engineering.workspaceAction}`);
-    lines.push(`数据策略: ${engineering.dataStrategy}；调研: ${engineering.researchMode}；设计: ${engineering.designMode}`);
-    if (engineering.researchTopics?.length) lines.push(`需核验: ${engineering.researchTopics.join("；")}`);
-    if (engineering.rationale?.length) lines.push(`决策依据: ${engineering.rationale.join("；")}`);
+    const projectLabel = { existing: "an existing project", greenfield: "a greenfield project", none: "no project", unknown: "inspect the project first" }[engineering.projectState] || engineering.projectState;
+    lines.push(`Engineering path: ${projectLabel}; ${engineering.architectureMode}; scope ${engineering.changeScope}; workspace ${engineering.workspaceAction}`);
+    lines.push(`Data strategy: ${engineering.dataStrategy}; research: ${engineering.researchMode}; design: ${engineering.designMode}`);
+    if (engineering.researchTopics?.length) lines.push(`To verify: ${engineering.researchTopics.join("; ")}`);
+    if (engineering.rationale?.length) lines.push(`Grounds for the decision: ${engineering.rationale.join("; ")}`);
     const orchestrationLabel = {
-      solo: "单智能体直接完成",
-      staged_roles: "分阶段多角色：先收敛契约，再实施",
-      parallel_roles: "并行多角色：按互不重叠 scope 同时实施",
-    }[engineering.orchestrationMode] || "单智能体直接完成";
-    lines.push(`协作模式: ${orchestrationLabel}${engineering.orchestrationMode === "solo" ? "（这是建议不是禁令：任务展开后发现真需要分角色/并行，直接按名调用 run_subagent（只读调研）/run_worker（分 scope 写入）即可自主升级，schema 未装载会自动装载）" : ""}`);
-    if (engineering.roleNeeds?.length) lines.push(`必要角色: ${engineering.roleNeeds.join("、")}`);
-    if (engineering.coordinationRisks?.length) lines.push(`协作风险: ${engineering.coordinationRisks.join("；")}`);
+      solo: "a single agent completes it directly",
+      staged_roles: "staged multi-role: converge the contract first, then implement",
+      parallel_roles: "parallel multi-role: implement simultaneously across non-overlapping scopes",
+    }[engineering.orchestrationMode] || "a single agent completes it directly";
+    lines.push(`Collaboration mode: ${orchestrationLabel}${engineering.orchestrationMode === "solo" ? " (a suggestion, not a prohibition: if the task turns out to genuinely need separate roles or parallelism, escalate on your own by calling run_subagent (read-only research) or run_worker (scoped writes) by name — an unloaded schema loads automatically)" : ""}`);
+    if (engineering.roleNeeds?.length) lines.push(`Required roles: ${engineering.roleNeeds.join(", ")}`);
+    if (engineering.coordinationRisks?.length) lines.push(`Coordination risks: ${engineering.coordinationRisks.join("; ")}`);
     if (engineering.orchestrationMode === "staged_roles") {
-      lines.push("分阶段纪律: 先让只读角色用证据确定架构/产品/数据/API/安全契约；契约未定前禁止派写入 worker。契约稳定后再按文件所有权分 scope 实施。");
+      lines.push("Staged discipline: have read-only roles establish the architecture, product, data, API and security contracts from evidence first; dispatching a writing worker before the contract is settled is forbidden. Once the contract is stable, split the scopes by file ownership and implement.");
     } else if (engineering.orchestrationMode === "parallel_roles") {
-      lines.push("并行纪律: 只并行契约已知且 scope 互不重叠的实现块；相邻调用 run_worker 以真正并发，主智能体统一集成并跑跨模块验证。");
+      lines.push("Parallel discipline: parallelize only implementation blocks whose contract is known and whose scopes do not overlap; place the run_worker calls adjacently so they genuinely run concurrently, and have the main agent integrate them and run the cross-module verification.");
     }
     if (engineering.designMode === "michael_design_2_5_existing") {
-      lines.push("现有 UI 纪律: 使用 michael-design 2.5 增强现有网站，但继承品牌、技术栈、组件和页面信息架构；先读项目证据，禁止当成绿地脚手架重建。");
+      lines.push("Existing-UI discipline: use michael-design 2.5 to enhance the existing site while inheriting its brand, stack, components and page information architecture; read the project evidence first, and never rebuild it as if it were greenfield scaffolding.");
     }
   }
-  lines.push("执行前先核对：当前原话是否纠正、撤销或替换了旧目标；不得把历史助手建议、分类结果或推测扩张成用户授权。没有用户明确要的工作区改动、运行、安装、部署、浏览器或外部操作，就不要做对应动作；对完成当前目标非必要的动作一律跳过。");
+  lines.push("Check before acting: does what the user just said correct, withdraw or replace the earlier goal? Never inflate an earlier assistant suggestion, a classification result or a guess into user authorization. Without the user explicitly asking for it, do not change the workspace, run, install, deploy, drive the browser or take any external action; skip anything not necessary to complete the current goal.");
   return lines.join("\n");
 }
 
