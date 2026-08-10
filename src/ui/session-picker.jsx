@@ -72,7 +72,9 @@ export function SessionPicker({ entries = [], resumableCount = 0, onPick, onClos
                     style={{ background: e.dot }}
                   />
                   {/* The first prompt is the identity, so it gets the line to itself. */}
-                  <span className="truncate text-[13px] text-foreground">{e.name}</span>
+                  {/* The user's own prompt, and the project directory name — content and
+                      identifiers, not UI copy. Translating what someone typed is never right. */}
+                  <span className="truncate text-[13px] text-foreground" data-i18n-skip>{e.name}</span>
                   {e.tag ? (
                     <span
                       className={cn(
@@ -87,7 +89,7 @@ export function SessionPicker({ entries = [], resumableCount = 0, onPick, onClos
                   ) : null}
                 </span>
                 {e.meta ? (
-                  <span className="truncate pl-3.5 text-[11px] tabular-nums text-muted-foreground">
+                  <span className="truncate pl-3.5 text-[11px] tabular-nums text-muted-foreground" data-i18n-skip>
                     {e.meta}
                   </span>
                 ) : null}
