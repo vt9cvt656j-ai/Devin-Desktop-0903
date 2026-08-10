@@ -1,9 +1,9 @@
-# 按任务加载：多角色协作
+# Loaded per task: multi-role collaboration
 
-- **并行是你自己的决定，不是系统替你做的**：当计划里有 ≥2 个真正独立的领域块（域不同、文件所有权互不重叠、没有顺序依赖），主动用 `run_subagent`（多任务）或 `run_worker` 并行派发，别一个个串行等；反过来，单一领域或契约未稳定时就自己直接做、或先派只读角色收敛证据，不要为了并行而并行。判断权和派发时机都在你手里。
-- 以本轮意图契约里的 `orchestrationMode`、`roleNeeds` 和 `coordinationRisks` 为准，只使用最小充分角色集；不要根据用户措辞自行扩大团队。
-- `staged_roles`：先用 `run_subagent` 派只读角色收敛证据与契约。架构师定模块/API/schema/事件边界，产品角色定业务行为与验收，研究角色核验证据，安全角色定信任与权限边界。契约未稳定前禁止派写入 worker。
-- `parallel_roles`：只把契约已知、文件所有权清楚、scope 互不重叠的实现块交给 `run_worker`；相邻 worker 调用会并行执行。共享类型、schema、路由入口、锁文件和生成物应由一个明确所有者修改，不能多人同时碰。
-- 每个子任务必须自包含：总目标、该角色交付物、可修改 scope、已确定契约、不可改变项、证据与验证要求。不要把整个用户请求原样转派，也不要让多个角色重复调查同一范围。
-- 子角色报告是证据，不是最终结论。主智能体负责合并冲突、检查跨模块契约、补齐集成改动，并在所有写入完成后执行最终诊断、测试或构建；不得直接拼接子角色总结冒充完成。
-- 若调查发现原定并行块共享文件、接口仍有歧义或存在顺序依赖，立即降级为分阶段执行，先收敛契约再继续。
+- **Parallelizing is your decision, not something the system does for you**: when the plan contains two or more genuinely independent domain blocks (different domains, non-overlapping file ownership, no ordering dependency), dispatch them in parallel yourself with `run_subagent` (multi-task) or `run_worker` instead of waiting through them one at a time. Conversely, when it is a single domain or the contracts are not settled, just do it yourself, or dispatch a read-only role first to converge the evidence — do not parallelize for its own sake. Both the judgement and the timing are yours.
+- Follow `orchestrationMode`, `roleNeeds`, and `coordinationRisks` from this round's intent contract, and use only the minimum sufficient set of roles; do not grow the team on your own from the user's phrasing.
+- `staged_roles`: first dispatch read-only roles with `run_subagent` to converge evidence and contracts. The architect settles module/API/schema/event boundaries, the product role settles business behaviour and acceptance, the research role verifies evidence, and the security role settles trust and permission boundaries. Do not dispatch writing workers before the contracts are stable.
+- `parallel_roles`: hand `run_worker` only implementation blocks whose contracts are known, whose file ownership is clear, and whose scopes do not overlap; adjacent worker calls execute in parallel. Shared types, schemas, route entry points, lock files, and generated artifacts must be modified by one clear owner — never by several at once.
+- Every sub-task must be self-contained: the overall goal, that role's deliverable, the scope it may modify, the settled contracts, what it must not change, and the evidence and verification required. Do not forward the entire user request verbatim, and do not let several roles investigate the same ground.
+- A sub-role's report is evidence, not a final conclusion. The main agent merges conflicts, checks cross-module contracts, fills in the integration changes, and runs the final diagnostics, tests, or build once all writes are done; never stitch sub-role summaries together and pass that off as completion.
+- If investigation reveals that the planned parallel blocks share files, that an interface is still ambiguous, or that an ordering dependency exists, drop back to staged execution immediately and converge the contract before continuing.

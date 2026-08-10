@@ -18003,7 +18003,7 @@ test("orchestration is the model's decision (harness no longer auto-dispatches o
 
   // 2. The capability is not lost — the parallelize-yourself decision lives in the prompt.
   const collab = readFileSync(join(HERE, "../../server/prompts/agent_collaboration.txt"), "utf8");
-  assert.match(collab, /并行是你自己的决定/,
+  assert.match(collab, /Parallelizing is your decision/,
     "agent_collaboration.txt must put the parallelization decision on the model");
   assert.match(collab, /run_subagent|run_worker/,
     "…and name the tools the model uses to do it");

@@ -4846,7 +4846,7 @@ mod tests {
         assert!(core.contains("autonomous execution agent"));
         assert!(core.contains("Choose tools by need"));
         assert!(!core.contains("# michael-design 核心"));
-        assert!(!core.contains("# 按任务加载：工程实现、调试与验证"));
+        assert!(!core.contains("# Loaded per task: engineering implementation, debugging, and verification"));
 
         let mut sys = String::new();
         let mut blocks = Vec::new();
@@ -4874,13 +4874,13 @@ mod tests {
             assemble_into(&headers, &mut body);
             let system = body["messages"][0]["content"].as_str().unwrap();
             assert!(
-                system.contains("# 按任务加载：研究、社区与当前事实"),
+                system.contains("# Loaded per task: research, community, and current facts"),
                 "{model}"
             );
             assert!(system.contains("published_date"), "{model}");
-            assert!(system.contains("最新性巡检"), "{model}");
+            assert!(system.contains("Freshness sweep"), "{model}");
             assert!(system.contains("SOTA"), "{model}");
-            assert!(system.contains("权威机器字段或可复现命令即可"), "{model}");
+            assert!(system.contains("authoritative machine-readable field or a reproducible command is enough"), "{model}");
             assert!(!system.contains("# 九、领域任务"), "{model}");
             assert!(!system.contains("开发者资源与专业数据源"), "{model}");
 
@@ -4891,7 +4891,7 @@ mod tests {
             assemble_into(&headers, &mut frontier_body);
             let frontier_system = frontier_body["messages"][0]["content"].as_str().unwrap();
             assert!(
-                frontier_system.contains("# 按任务加载：研究、社区与当前事实"),
+                frontier_system.contains("# Loaded per task: research, community, and current facts"),
                 "{model}"
             );
             assert!(frontier_system.contains("arxiv_search"), "{model}");
@@ -4909,7 +4909,7 @@ mod tests {
                 github_body["messages"][0]["content"]
                     .as_str()
                     .unwrap()
-                    .contains("# 按任务加载：研究、社区与当前事实"),
+                    .contains("# Loaded per task: research, community, and current facts"),
                 "standalone Chinese GitHub request should route research for {model}"
             );
 
@@ -4920,7 +4920,7 @@ mod tests {
             assemble_into(&headers, &mut local_body);
             let local_system = local_body["messages"][0]["content"].as_str().unwrap();
             assert!(
-                local_system.contains("# 按任务加载：研究、社区与当前事实"),
+                local_system.contains("# Loaded per task: research, community, and current facts"),
                 "{model}"
             );
             assert!(local_system.contains("local_discovery"), "{model}");
@@ -4934,7 +4934,7 @@ mod tests {
             assemble_into(&headers, &mut medical_body);
             let medical_system = medical_body["messages"][0]["content"].as_str().unwrap();
             assert!(
-                medical_system.contains("# 按任务加载：研究、社区与当前事实"),
+                medical_system.contains("# Loaded per task: research, community, and current facts"),
                 "{model}"
             );
             assert!(medical_system.contains("pubmed_search"), "{model}");
@@ -4947,7 +4947,7 @@ mod tests {
             assemble_into(&headers, &mut game_body);
             let game_system = game_body["messages"][0]["content"].as_str().unwrap();
             assert!(
-                game_system.contains("# 按任务加载：研究、社区与当前事实"),
+                game_system.contains("# Loaded per task: research, community, and current facts"),
                 "{model}"
             );
             assert!(game_system.contains("steam_search"), "{model}");
@@ -4963,7 +4963,7 @@ mod tests {
         assert!(!ordinary["messages"][0]["content"]
             .as_str()
             .unwrap()
-            .contains("# 按任务加载：研究、社区与当前事实"));
+            .contains("# Loaded per task: research, community, and current facts"));
 
         for implementation_request in ["修复社区页面按钮", "fix the community page button"]
         {
@@ -4980,7 +4980,7 @@ mod tests {
                 !body["messages"][0]["content"]
                     .as_str()
                     .unwrap()
-                    .contains("# 按任务加载：研究、社区与当前事实"),
+                    .contains("# Loaded per task: research, community, and current facts"),
                 "community UI wording must not inject research: {implementation_request}"
             );
         }
@@ -5025,7 +5025,7 @@ mod tests {
 
         assemble_into(&headers, &mut body);
         let system = body["messages"][0]["content"].as_str().unwrap();
-        assert!(!system.contains("# 按任务加载：研究、社区与当前事实"));
+        assert!(!system.contains("# Loaded per task: research, community, and current facts"));
     }
 
     #[test]
@@ -5043,7 +5043,7 @@ mod tests {
 
         assemble_into(&headers, &mut body);
         let system = body["messages"][0]["content"].as_str().unwrap();
-        assert!(system.contains("# 按任务加载：研究、社区与当前事实"));
+        assert!(system.contains("# Loaded per task: research, community, and current facts"));
     }
 
     #[test]
@@ -5057,8 +5057,8 @@ mod tests {
         super::assemble_into(&headers, &mut without_profile).unwrap();
         let base_only = without_profile["messages"][0]["content"].as_str().unwrap();
         assert!(!base_only.contains("# michael-design 核心"));
-        assert!(!base_only.contains("# 按任务加载：研究、社区与当前事实"));
-        assert!(!base_only.contains("# 按任务加载：多角色协作"));
+        assert!(!base_only.contains("# Loaded per task: research, community, and current facts"));
+        assert!(!base_only.contains("# Loaded per task: multi-role collaboration"));
 
         headers.insert(
             "x-ide-semantic-profile",
@@ -5072,9 +5072,9 @@ mod tests {
         });
         super::assemble_into(&headers, &mut routed).unwrap();
         let system = routed["messages"][0]["content"].as_str().unwrap();
-        assert!(system.contains("# 按任务加载：工程实现"));
-        assert!(system.contains("# 按任务加载：多角色协作"));
-        assert!(system.contains("# 按任务加载：研究、社区与当前事实"));
+        assert!(system.contains("# Loaded per task: engineering implementation"));
+        assert!(system.contains("# Loaded per task: multi-role collaboration"));
+        assert!(system.contains("# Loaded per task: research, community, and current facts"));
         assert!(system.contains("# michael-design 核心"));
         assert!(system.contains("# michael-design 实现入口"));
         assert!(system.contains("# michael-design 数据与业务状态层"));
@@ -5151,7 +5151,7 @@ mod tests {
         assert!(body["messages"][0]["content"]
             .as_str()
             .unwrap()
-            .contains("# 按任务加载：研究、社区与当前事实"));
+            .contains("# Loaded per task: research, community, and current facts"));
     }
 
     #[test]
@@ -5169,11 +5169,11 @@ mod tests {
             assemble_into(&headers, &mut body);
             let system = body["messages"][0]["content"].as_str().unwrap();
             assert!(
-                system.contains("# 按任务加载：浏览器与桌面自动化"),
+                system.contains("# Loaded per task: browser and desktop automation"),
                 "{model}"
             );
-            assert!(system.contains("自动化任务按小状态机执行"), "{model}");
-            assert!(system.contains("失败恢复要换策略而不是原样重试"), "{model}");
+            assert!(system.contains("Run an automation task as a small state machine"), "{model}");
+            assert!(system.contains("Recover from failure by changing strategy"), "{model}");
             assert!(!system.contains("# 十、自动化"), "{model}");
             // UI 设计体系改为意图门控：纯桌面自动化任务不含界面/前端/视觉关键词，
             // 不应再被前端设计宪法污染。
@@ -5191,8 +5191,8 @@ mod tests {
         });
         assemble_into(&headers, &mut browser_action);
         let system = browser_action["messages"][0]["content"].as_str().unwrap();
-        assert!(system.contains("# 按任务加载：浏览器与桌面自动化"));
-        assert!(system.contains("不要把“点击了/输入了/发起了请求”当成功"));
+        assert!(system.contains("# Loaded per task: browser and desktop automation"));
+        assert!(system.contains("Never treat \"I clicked / I typed / I sent the request\" as success"));
         assert!(
             !system.contains("michael-design 核心"),
             "logging into a website is automation, not a UI design task"
@@ -5297,7 +5297,7 @@ mod tests {
 
         assemble_into(&headers, &mut body);
         let system = body["messages"][0]["content"].as_str().unwrap();
-        assert!(!system.contains("# 按任务加载：研究、社区与当前事实"));
+        assert!(!system.contains("# Loaded per task: research, community, and current facts"));
         assert!(!system.contains("# michael-design 设计体系（"));
         assert!(!system.contains("michael-design 设计蓝本"));
         assert!(system.contains("# Reasoning discipline"));
@@ -6126,7 +6126,7 @@ mod tests {
                 "{model} ordinary system prompt is ~{est_tokens} tokens ({} bytes)",
                 system.len()
             );
-            assert!(!system.contains("按任务加载：工程实现、调试与验证"));
+            assert!(!system.contains("Loaded per task: engineering implementation, debugging, and verification"));
             assert!(
                 !system.contains("# 一、最高准则"),
                 "{model} unexpectedly received the legacy prompt"
@@ -6145,7 +6145,7 @@ mod tests {
         });
         assemble_into(&headers, &mut automation);
         let automation_system = automation["messages"][0]["content"].as_str().unwrap();
-        assert!(automation_system.contains("按任务加载：浏览器与桌面自动化"));
+        assert!(automation_system.contains("Loaded per task: browser and desktop automation"));
         assert!(!automation_system.contains("# michael-design 核心"));
         // Token estimate, not bytes — see the ordinary-assembly guard for why the unit changed
         // when the prompts were rewritten in English (CJK ≈ 3 bytes but ~1 token per char;
@@ -6237,7 +6237,7 @@ mod tests {
         }
         assert!(build_system.contains("完整页面/整站包"));
         assert!(
-            !build_system.contains("# 按任务加载：研究、社区与当前事实"),
+            !build_system.contains("# Loaded per task: research, community, and current facts"),
             "a product category inside a UI build must not load the research module"
         );
         assert!(
