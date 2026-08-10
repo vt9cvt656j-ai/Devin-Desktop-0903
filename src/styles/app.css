@@ -2120,6 +2120,18 @@ body.zen-mode .editor {
   background: linear-gradient(180deg, rgba(52,168,83,.08), transparent 120px),
     color-mix(in srgb, var(--bg) 54%, var(--panel-solid, var(--panel)) 46%);
 }
+/* Why a listing is short, empty, or approximate — a RAR we cannot decode, a stream we stopped
+   counting, a damaged tail. Without this the panel just looks broken. */
+.file-inspector__note {
+  margin: 0 0 12px;
+  padding: 8px 10px;
+  border-radius: 8px;
+  background: var(--hover);
+  color: var(--text-dim);
+  font-size: 12px;
+  line-height: 1.55;
+}
+
 .file-inspector__section h4 {
   display: flex;
   align-items: center;

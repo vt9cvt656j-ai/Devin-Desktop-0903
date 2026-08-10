@@ -2,6 +2,7 @@
 // automation bridge; not every target currently wires each helper into a command.
 #[allow(dead_code)]
 mod accessibility;
+mod archive;
 mod ai;
 mod auth;
 mod automation;

@@ -1479,7 +1479,7 @@ function mockBackend() {
         hex_rows: [],
         strings: raw ? [raw.slice(0, 160)] : [],
         traineddata: null,
-        archive_entries: [],
+        archive: null,
         sqlite: null,
         image: null,
       };
@@ -4568,7 +4568,7 @@ function _isPlainHexInspection(info) {
   const kind = String(info.kind || "").toLowerCase();
   if (!["binary", "model_or_binary", "executable", "tesseract_traineddata"].includes(kind)) return false;
   if (info.sqlite || info.image) return false;
-  if (Array.isArray(info.archive_entries) && info.archive_entries.length) return false;
+  if (info.archive?.entries?.length) return false;
   return true;
 }
 
@@ -4623,12 +4623,24 @@ function _inspectionStringsHtml(strings) {
     </section>`;
 }
 
-function _inspectionArchiveHtml(entries) {
-  const list = Array.isArray(entries) ? entries : [];
-  if (!list.length) return "";
+function _inspectionArchiveHtml(archive) {
+  const list = Array.isArray(archive?.entries) ? archive.entries : [];
+  const note = archive?.note ? `<p class="file-inspector__note">${_escHtml(archive.note)}</p>` : "";
+  // A format we cannot open still has something to say — an empty panel reads as a broken file.
+  if (!list.length) return note ? `<section class="file-inspector__section">${note}</section>` : "";
+  // The header states the archive's own count. Showing the rendered row count there is what let
+  // a 2GB zip of fifty thousand files announce itself as "200 items".
+  const total = Number(archive?.total ?? list.length);
+  const atLeast = archive?.count_is_partial ? "至少 " : "";
+  const shown = archive?.truncated ? `，显示前 ${list.length} 个` : "";
+  const totalSize = Number(archive?.total_size || 0);
+  const sizeText = totalSize > 0 ? ` · 解压后 ${_formatInspectBytes(totalSize)}` : "";
+  const lock = archive?.encrypted ? ` · <span title="文件名可读，内容需要密码">🔒 含加密条目</span>` : "";
   return `
     <section class="file-inspector__section">
-      <h4>压缩包内容 <span>${list.length} 项</span></h4>
+      <h4>${_escHtml(String(archive?.format || "压缩包"))} 内容
+        <span>${atLeast}${total.toLocaleString()} 项${shown}${sizeText}${lock}</span></h4>
+      ${note}
       <div class="file-inspector__table-wrap">
         <table class="file-inspector__table">
           <thead><tr><th>名称</th><th>类型</th><th>大小</th><th>压缩后</th></tr></thead>
@@ -5192,7 +5204,7 @@ function _renderFileInspection(path, info, reason = "", error = "") {
         ${summary.length ? `<div class="file-inspector__summary">${summary.map((item) => `<span>${_escHtml(item)}</span>`).join("")}</div>` : ""}
         ${_inspectionTrainedDataHtml(info.traineddata)}
         ${_inspectionStructuredHtml(info)}
-        ${_inspectionArchiveHtml(info.archive_entries)}
+        ${_inspectionArchiveHtml(info.archive)}
         ${info.text_preview ? `
           <section class="file-inspector__section">
             <h4>文本预览</h4>

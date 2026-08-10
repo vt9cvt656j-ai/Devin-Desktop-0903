@@ -750,14 +750,6 @@ pub struct HexRow {
 }
 
 #[derive(Serialize)]
-pub struct ArchiveEntryPreview {
-    name: String,
-    size: u64,
-    compressed_size: u64,
-    is_dir: bool,
-}
-
-#[derive(Serialize)]
 pub struct SqlitePreview {
     page_size: u32,
     page_count: u32,
@@ -824,7 +816,7 @@ pub struct FileInspection {
     hex_rows: Vec<HexRow>,
     strings: Vec<String>,
     traineddata: Option<TrainedDataPreview>,
-    archive_entries: Vec<ArchiveEntryPreview>,
+    archive: Option<crate::archive::ArchiveListing>,
     sqlite: Option<SqlitePreview>,
     image: Option<ImagePreviewInfo>,
 }
@@ -1130,29 +1122,6 @@ fn sqlite_preview(bytes: &[u8], path: &Path) -> Option<SqlitePreview> {
     })
 }
 
-fn inspect_zip_entries(path: &Path) -> Vec<ArchiveEntryPreview> {
-    let file = match std::fs::File::open(path) {
-        Ok(file) => file,
-        Err(_) => return Vec::new(),
-    };
-    let mut zip = match zip::ZipArchive::new(file) {
-        Ok(zip) => zip,
-        Err(_) => return Vec::new(),
-    };
-    let mut entries = Vec::new();
-    for i in 0..zip.len().min(200) {
-        if let Ok(file) = zip.by_index(i) {
-            entries.push(ArchiveEntryPreview {
-                name: file.name().to_string(),
-                size: file.size(),
-                compressed_size: file.compressed_size(),
-                is_dir: file.is_dir(),
-            });
-        }
-    }
-    entries
-}
-
 fn traineddata_component_name(index: usize) -> &'static str {
     match index {
         0 => "lang_config",
@@ -1359,14 +1328,24 @@ pub fn inspect_file(path: String, max_bytes: Option<u64>) -> Result<FileInspecti
     let ext = file_extension(&resolved);
     let traineddata = inspect_traineddata(&bytes, meta.len());
     let (kind, mime) = detect_kind_and_mime(&ext, &bytes, traineddata.is_some());
-    let archive_entries = if matches!(kind.as_str(), "archive")
+    // Every container format goes through one reader, which sniffs the real bytes rather than
+    // trusting the extension. It is given the path, not the sampled prefix: ZIP and 7z keep their
+    // index in a footer, so reading only the head of a 2 GB archive can never find it.
+    let archive = if matches!(kind.as_str(), "archive")
         || matches!(
             ext.as_str(),
-            "zip" | "jar" | "war" | "apk" | "docx" | "pptx" | "xlsx" | "odt"
-        ) {
-        inspect_zip_entries(&resolved)
+            "zip" | "jar" | "war" | "apk" | "aar" | "ipa" | "whl" | "egg" | "nupkg"
+                | "docx" | "pptx" | "xlsx" | "odt" | "ods" | "odp" | "epub" | "crx" | "vsix"
+                | "xpi" | "tar" | "tgz" | "tbz" | "tbz2" | "txz" | "tzst" | "gz" | "bz2"
+                | "xz" | "zst" | "zstd" | "7z" | "rar"
+        )
+        || crate::archive::looks_like_compressed_tar(&resolved)
+    {
+        let listing = crate::archive::read_listing(&resolved);
+        // Nothing found and nothing to say means it was not a container after all.
+        (!listing.entries.is_empty() || listing.note.is_some()).then_some(listing)
     } else {
-        Vec::new()
+        None
     };
     let sqlite = sqlite_preview(&bytes, &resolved);
     let image = if kind == "image" {
@@ -1401,11 +1380,32 @@ pub fn inspect_file(path: String, max_bytes: Option<u64>) -> Result<FileInspecti
             summary.push(format!("版本：{}", version));
         }
     }
-    if !archive_entries.is_empty() {
+    if let Some(listing) = &archive {
+        // The count is the archive's, never the preview's. Saying "200 (max 200 shown)" for an
+        // archive of fifty thousand files is the bug this whole path was rewritten for.
+        let approx = if listing.count_is_partial { "至少 " } else { "" };
         summary.push(format!(
-            "压缩包条目：{} 个（最多显示 200 个）",
-            archive_entries.len()
+            "{} 压缩包：{}{} 个条目",
+            listing.format, approx, listing.total
         ));
+        if listing.truncated && !listing.entries.is_empty() {
+            summary.push(format!("列表只显示前 {} 个", listing.entries.len()));
+        }
+        if listing.total_size > 0 {
+            summary.push(format!("解压后共 {} bytes", listing.total_size));
+        }
+        if listing.metadata_entries > 0 {
+            summary.push(format!(
+                "另有 {} 个 macOS 扩展属性附属条目（._* / __MACOSX），未计入上面的数量",
+                listing.metadata_entries
+            ));
+        }
+        if listing.encrypted {
+            summary.push("包含加密条目：文件名可读，内容需要密码".into());
+        }
+        if let Some(note) = &listing.note {
+            summary.push(note.clone());
+        }
     }
     if let Some(sqlite) = &sqlite {
         summary.push(format!(
@@ -1433,7 +1433,7 @@ pub fn inspect_file(path: String, max_bytes: Option<u64>) -> Result<FileInspecti
         hex_rows: build_hex_rows(&bytes),
         strings: extract_ascii_strings(&bytes),
         traineddata,
-        archive_entries,
+        archive,
         sqlite,
         image,
     })
