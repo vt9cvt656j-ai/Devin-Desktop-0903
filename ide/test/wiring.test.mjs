@@ -505,3 +505,40 @@ test("no NEW unreachable module appears under src/", async () => {
       `${f} is no longer dead — remove it from KNOWN_DEAD so the baseline keeps shrinking`);
   }
 });
+
+test("the request-boundary markers the client emits are exactly the ones the gateway parses", () => {
+  // The 📌 boundary is a wire protocol, not prompt text: main.js wraps the user's real request in
+  // it, and prompts.rs slices the request back out of the surrounding project context. They are
+  // two files in two languages agreeing on a literal string, so drift is silent — the gateway
+  // stops finding the boundary, extract_marked_user_request fails closed, and the user's actual
+  // ask silently stops being isolated from the context wrapped around it.
+  //
+  // The set is deliberately larger than one entry: a desktop build older than the English prompt
+  // rewrite still emits the Chinese marker, and stored conversations still contain it, so both
+  // spellings must stay parseable on the gateway side.
+  const clientList = /const _REQUEST_MARKERS = \[([^\]]*)\];/.exec(SRC);
+  assert.ok(clientList, "_REQUEST_MARKERS has moved or been renamed in main.js");
+  const clientMarkers = [...clientList[1].matchAll(/"([^"]+)"/g)].map((m) => m[1]);
+  assert.ok(clientMarkers.length >= 2,
+    "the client must still recognize the pre-rewrite marker, or old conversations lose their boundary");
+
+  const rust = readFileSync(join(HERE, "../../server/src/prompts.rs"), "utf8");
+  const gatewayMarkers = [...rust.matchAll(
+    /const (?:LEGACY_(?:CN_)?)?USER_REQUEST_MARKER: &str = "([^"]+)";/g)].map((m) => m[1]);
+  assert.ok(gatewayMarkers.length >= 2, "the gateway's USER_REQUEST_MARKER constants have moved");
+
+  // Rust escapes are not JS escapes, so compare on the marker's stable, escape-free core.
+  const core = (s) => s.replace(/\\n/g, "").replace(/[━\s]+$/g, "").trim();
+  for (const marker of clientMarkers) {
+    assert.ok(gatewayMarkers.some((g) => core(g) === core(marker)),
+      `main.js emits/recognizes ${JSON.stringify(marker)} but prompts.rs parses no such marker`);
+  }
+
+  // And the one it actually emits must be the gateway's current (non-legacy) marker, so a new
+  // conversation is never routed down the compatibility path.
+  const emitted = /📌 \*\*This turn's user request\*\*/.test(SRC);
+  assert.ok(emitted, "main.js must emit the English request marker");
+  const current = /\nconst USER_REQUEST_MARKER: &str = "([^"]+)";/.exec(rust);
+  assert.ok(current && core(current[1]) === core(clientMarkers[0]),
+    "the first entry of _REQUEST_MARKERS must be the gateway's current USER_REQUEST_MARKER");
+});

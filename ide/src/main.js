@@ -21057,6 +21057,11 @@ async function _agentContextForQuery(baseContext, query, root, referenceTimeoutM
 }
 
 /** 指纹里最多纳入多少个一级子目录。见 `_agentRootFingerprint`。 */
+// Every request-boundary marker the gateway recognizes: the English one this build emits, plus
+// the Chinese spelling still present in conversations stored before the prompt rewrite. Keep in
+// sync with USER_REQUEST_MARKER / LEGACY_CN_USER_REQUEST_MARKER in server/src/prompts.rs.
+const _REQUEST_MARKERS = ["📌 **This turn's user request**: ", "📌 **用户本次请求**："];
+
 const _AGENT_FP_MAX_SUBDIRS = 40;
 
 /**
@@ -22705,11 +22710,12 @@ async function sendPrompt(text, attachments = [], readyConfig = null) {
   const _uiVisualEvidenceHint = (effectiveMode === "agent" && (_uiTurnEngineering.ui || _uiTurnEngineering.uiProject) && _hasVisualAttachment)
     ? "\n\n📎 **前端/UI 附件证据**：本轮图片/视频/截图是目标视觉或缺陷证据，不是装饰。先按图中真实布局、文字、裁切、溢出、间距、素材内容和移动/桌面差异修；不要套行业模板。若重写 UI，优先使用用户附图、项目 `assets/`、`public/`、`screenshots/` 里的真实图片/截图/设计稿；缺真实素材时才用 generate_image 或 picsum 等占位，并明确说明占位。"
     : "";
-  // 请求框只做结构分隔（背景在上、请求在下），不注入任何话术/关键词判定/说教——
-  // 关键词式对话定制已被用户明确否决，理解与回应交给模型本身。
+  // The request frame is structural separation only (context above, request below); it injects no
+  // scripted wording, keyword judgement or lecturing — keyword-driven conversation shaping was
+  // explicitly rejected, and understanding and responding are left to the model itself.
   const _requestFrame = _agentLightTurn
     ? "\n\n━━━━━━━━━━━━━━━━━━━━━━━━\n📌 **用户这次是轻量对话/闲聊**：直接回答，不要声称已经读取项目、文件或运行工具；除非用户明确要求项目/文件/报错/运行/修改，否则不要主动进入工程任务。\n\n"
-    : "\n\n━━━━━━━━━━━━━━━━━━━━━━━━\n📌 **用户本次请求**：\n\n";
+    : "\n\n━━━━━━━━━━━━━━━━━━━━━━━━\n📌 **This turn's user request**: \n\n";
   const _userText = _contextPreamble
     + _requestFrame
     + text
@@ -33000,9 +33006,13 @@ function _enforceModelRequestBudget(messages, tools = [], byteCap = _MODEL_REQUE
     // 带 📌 请求边界的消息必须整段保住边界起的正文：头 600+尾 600 的对折会把边界切掉，
     // 网关 latest_user_request 找不到标记就漂移到编排 nudge——推理检查点/知识块/意图门控
     // 全部跟着抖（真实用户请求通常只有几 KB，不是超预算的元凶）。只折叠边界之前的动态前导。
-    if (content.includes("📌 **用户本次请求**：")) {
-      const _bm = content.search(/━{8,}\s*\n\s*📌/); // 完整边界 = ━━━ 行 + 📌 行，缺一网关就认不出
-      const _bk = _bm >= 0 ? _bm : content.indexOf("📌 **用户本次请求**：");
+    // Both spellings: the English marker this build emits, and the Chinese one that is still
+    // sitting in conversations stored before the prompt rewrite. Missing either one folds the
+    // boundary away and the gateway loses the request.
+    const _reqMarker = _REQUEST_MARKERS.find((marker) => content.includes(marker));
+    if (_reqMarker) {
+      const _bm = content.search(/━{8,}\s*\n\s*📌/); // a complete boundary = the ━━━ line + the 📌 line; without both the gateway cannot recognize it
+      const _bk = _bm >= 0 ? _bm : content.indexOf(_reqMarker);
       if (_bk > 1200) {
         prepared[index] = { ...prepared[index], content: `${content.slice(0, 400)}\n…（较早的动态前导已压缩以满足请求上限）…\n${content.slice(_bk)}` };
         bytes = requestBytes();

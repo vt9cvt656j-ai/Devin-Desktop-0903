@@ -344,9 +344,17 @@ fn enforce_final_tool_budget(body: &mut serde_json::Value) -> (usize, usize) {
     (candidate_count, serialized_bytes)
 }
 
-const USER_REQUEST_MARKER: &str = "📌 **用户本次请求**：";
+const USER_REQUEST_MARKER: &str = "📌 **This turn's user request**: ";
 const USER_STEERING_MARKER: &str = "[MICHAEL_USER_STEERING]";
-const USER_REQUEST_BOUNDARY_PREFIX: &str = "━━━━━━━━━━━━━━━━━━━━━━━━\n📌 **用户本次请求**：";
+const USER_REQUEST_BOUNDARY_PREFIX: &str =
+    "━━━━━━━━━━━━━━━━━━━━━━━━\n📌 **This turn's user request**: ";
+// The markers below are wire-protocol history, not prompt text: a desktop build older than the
+// English rewrite still emits them, and stored conversations still contain them. They must stay
+// byte-identical to what those clients send, or extract_marked_user_request fails closed and the
+// whole request is treated as unmarked.
+const LEGACY_CN_USER_REQUEST_MARKER: &str = "📌 **用户本次请求**：";
+const LEGACY_CN_USER_REQUEST_BOUNDARY_PREFIX: &str =
+    "━━━━━━━━━━━━━━━━━━━━━━━━\n📌 **用户本次请求**：";
 const LEGACY_USER_REQUEST_MARKER: &str = "📌 **用户这次的请求（请正面、直接回应这一条本身）**：";
 const LEGACY_USER_REQUEST_BOUNDARY_PREFIX: &str = "━━━━━━━━━━━━━━━━━━━━━━━━\n📌 **用户这次的请求（请正面、直接回应这一条本身）**：上面的项目上下文只是背景参考，别被它带跑";
 #[cfg(test)]
@@ -780,11 +788,11 @@ fn design_color_direction_block(direction: DesignColorDirection) -> String {
             "accent / secondary highlight = none (keep the page monochrome)".to_string()
         });
     format!(
-        "--- michael-design 运行时锁定配色方向（必须执行，不是建议）---\n\
-         品类：{}（route: {}）\n\
-         证据来源：{}。同品类检索优先词：`{}`。\n\
-         定义 token 时采用：background = {}；foreground = {}；primary = {}；{}；muted / card-alt = {}。\n\
-         字体气质：{}。根画布、卡片、CTA、链接、active、focus ring、icon tint 都必须从这 5 个角色派生；除真实状态色外不准另起色相。页面至少 90% 保持 background/foreground/muted 中性色面积。不要因“高级/科技”自行换成 violet/indigo、黑底霓虹或满屏渐变；跨品类命中只能借布局和动效，不能改这套配色。源码先定义语义 token，业务组件只消费 token。",
+        "--- michael-design runtime-locked colour direction (mandatory, not a suggestion) ---\n\
+         Category: {} (route: {})\n\
+         Evidence source: {}. Preferred search term within this category: `{}`.\n\
+         When defining tokens use: background = {}; foreground = {}; primary = {}; {}; muted / card-alt = {}.\n\
+         Type character: {}. The root canvas, cards, CTAs, links, active, focus ring and icon tint must all derive from these 5 roles; no hue other than a genuine status colour may be introduced. Keep at least 90% of the page as neutral background/foreground/muted area. Do not switch to violet/indigo, neon-on-black or full-page gradients on your own because something should feel \"premium\" or \"high-tech\"; a cross-category hit may lend layout and motion only, and must not change this palette. Define the semantic tokens in source first, and have feature components consume only tokens.",
         direction.category,
         direction.id,
         direction.source,
@@ -993,6 +1001,7 @@ fn truncate_at_embedded_request_marker(request: &str) -> &str {
     let nested_index = [
         format!("\n{USER_STEERING_MARKER}"),
         format!("\n{USER_REQUEST_MARKER}"),
+        format!("\n{LEGACY_CN_USER_REQUEST_MARKER}"),
         format!("\n{LEGACY_USER_REQUEST_MARKER}"),
     ]
     .into_iter()
@@ -1022,6 +1031,7 @@ fn extract_marked_user_request(text: &str) -> Option<String> {
     // project/user content copies the entire reserved framing sequence.
     let mut boundaries = [
         USER_REQUEST_BOUNDARY_PREFIX,
+        LEGACY_CN_USER_REQUEST_BOUNDARY_PREFIX,
         LEGACY_USER_REQUEST_BOUNDARY_PREFIX,
     ]
     .into_iter()
@@ -1053,8 +1063,10 @@ fn extract_real_user_request(text: &str) -> Option<String> {
     }
     if text.contains(USER_STEERING_MARKER)
         || text.contains(USER_REQUEST_MARKER)
+        || text.contains(LEGACY_CN_USER_REQUEST_MARKER)
         || text.contains(LEGACY_USER_REQUEST_MARKER)
         || text.contains(USER_REQUEST_BOUNDARY_PREFIX)
+        || text.contains(LEGACY_CN_USER_REQUEST_BOUNDARY_PREFIX)
         || text.contains(LEGACY_USER_REQUEST_BOUNDARY_PREFIX)
     {
         return None;
@@ -1716,13 +1728,13 @@ fn user_local_time_block_at(headers: &HeaderMap, now_utc: chrono::DateTime<chron
         _ => ("UTC", chrono_tz::UTC, 0),
     };
     let local = now_utc.with_timezone(&timezone);
-    let weekday = ["周日", "周一", "周二", "周三", "周四", "周五", "周六"]
+    let weekday = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"]
         [local.weekday().num_days_from_sunday() as usize];
     let sign = if offset_minutes < 0 { '-' } else { '+' };
     let absolute_offset = offset_minutes.abs();
 
     format!(
-        "【当前真实日期·用户本地】今天是 {}-{:02}-{:02} {}（{}，UTC{}{:02}:{:02}）。日期、星期和日期差用此日历计算；**写进代码/文档/README/版权栏/示例数据里的任何日期与年份也一律以此为准**——训练记忆里的年份是过去，不是今天。需要精确到时分的当前时刻时，以对话中注入的时间信息或时间类工具为准。它只表示本轮请求日期，不是任何来源的发布时间或更新时间，也不能证明某项内容\"最新\"。最新版本或现状仍需本轮来源核验。",
+        "【Current real date · the user's local time】Today is {}-{:02}-{:02} {} ({}, UTC{}{:02}:{:02}). Compute dates, weekdays and date differences from this calendar; **any date or year you write into code, documentation, a README, a copyright line or sample data must also follow it** — the year in your training memory is the past, not today. When you need the current moment to the minute, go by the time information injected into the conversation or by a time tool. It states only the date of this request; it is not any source's publication or update time, and it does not prove that something is \"current\". The latest version, or the present state of things, still needs verifying against sources this round.",
         local.year(),
         local.month(),
         local.day(),
@@ -1856,23 +1868,23 @@ fn design_knowledge_block(
 
     let scope_instruction = match scope {
         DesignKnowledgeScope::Focused => {
-            "这是聚焦 UI 修改/评审包：只把主蓝本和一个最相关候选用于当前组件或页面，不得借机扩大重做范围。缺少特定区块证据时再按名调用 knowledge_search(domain=\"michael-design\")，命中后立即综合。"
+            "This is a focused UI change / review packet: apply the main blueprint and one most-relevant candidate to the current component or page only, and do not use it as an excuse to widen the rewrite. When evidence for a specific section is missing, call knowledge_search(domain=\"michael-design\") by name, and synthesize as soon as it hits."
         }
         DesignKnowledgeScope::Full => {
-            "这是完整页面/整站包：先用主蓝本确定视觉密度、布局骨架与品牌气质，再用候选补齐区块。写代码前列出采用的 michael-design 来源，并最多补做一次 knowledge_search(domain=\"michael-design\") 查缺失区块；命中后立即综合，不无限检索。"
+            "This is a full page / whole-site packet: use the main blueprint first to fix the visual density, layout skeleton and brand character, then fill the sections in from the candidates. Before writing code, list the michael-design sources you are using, and do at most one further knowledge_search(domain=\"michael-design\") for a missing section; synthesize as soon as it hits rather than searching indefinitely."
         }
     };
 
     Some(format!(
-        "--- michael-design 设计蓝本（421 条成品级 UI 知识按需检索）---\n\
+        "--- michael-design blueprint (421 pieces of production-grade UI knowledge, retrieved on demand) ---\n\
          {scope_instruction}\n\
-         Michael Design 的设计事实必须来自本轮实时 `knowledge_search(domain=\"michael-design\")`；当前注入的命中可以直接作为证据，缺少品类、配色、布局、组件或动效证据时继续调用该知识库并记录具体 section。提示词摘要、模型记忆和技术栈惯性都不能替代实时检索，也不能伪造 Michael Design 结论。\n\
-         技术栈必须先检查真实工作区并按以下顺序决定，Michael Design 蓝本不是换栈指令：\n\
-         1. 用户明确指定技术栈或迁移目标时，用户指定栈优先，按该栈实现并继续使用 Michael Design 的设计事实。\n\
-         2. 用户未指定目标栈且已有可运行网站时，完整沿用项目真实的框架、语言、构建工具、样式方案、组件系统、目录约定和 token 载体；不得迁栈、混入第二套框架或组件库。\n\
-         3. 只有用户未声明技术栈，并且工作区为空、项目里没有网站，或用户明确要求重做且没有可复用技术栈时，才默认 React + Tailwind CSS + shadcn/ui；需要默认脚手架细节时使用 Vite + TypeScript。\n\
-         产品名是生造词时先从功能描述推断品类，用品类词检索，绝不拿生造名当 query。配色只采用同品类 Michael Design 来源并映射到当前项目原生色板与 semantic role；只有最终采用 Tailwind 的分支才可把色值折算为 Tailwind 族+档。跨品类命中只能借结构、组件和动效。具体组件、媒体、数据、动效、工程与验证要求由本轮已加载的独立模块负责，本块不重复。\n\
-         下面的蓝本可能包含 Tailwind v3 时代的 `tailwind.config.js/ts`、`theme.extend`、`@tailwind base/components/utilities`、`postcss.config.js`、`autoprefixer`、`tailwindcss-animate` 和 `content: [...]`，它们只是带版本的实现样例，不能直接决定当前项目技术栈。**只有最终选择或项目已使用 Tailwind v4 时**，才把这些 v3 写法翻译为 v4 CSS-first：`@tailwind base/components/utilities` 三行 → 一行 `@import \"tailwindcss\";`；`theme.extend.colors/fontFamily/borderRadius` → CSS 入口的 `@theme inline` 里的 `--color-*` / `--font-*` / `--radius-*`（嵌套色名拍平成 `--color-a-b`）；`darkMode: [\"class\"]` → `@custom-variant dark (&:is(.dark *));`；`content` globs 和旧 postcss 链 → 按 v4 与实际构建工具处理。其他所有分支（包括既有 Tailwind v3 和非 Tailwind 项目）都把蓝本的视觉判断与 token 语义映射到项目原生 token/build/style/component mechanism，保留项目兼容配置，不安装 Tailwind、shadcn/ui 或 React，也不创建它们的配置和目录。\n\n{}\n\n{}",
+         Michael Design facts must come from a live `knowledge_search(domain=\"michael-design\")` this round; the hits injected here can be used as evidence directly, and when evidence for a category, palette, layout, component or motion is missing, keep calling that knowledge base and record the specific section. A prompt summary, the model's memory, and stack habit are none of them a substitute for live retrieval, and Michael Design conclusions must never be fabricated.\n\
+         The stack must be decided by inspecting the real workspace first, in this order — a Michael Design blueprint is not an instruction to change stacks:\n\
+         1. When the user names a stack or a migration target, the user's stack wins: implement in that stack and go on using the Michael Design facts.\n\
+         2. When the user names no target stack and a working site already exists, follow the project's real framework, language, build tool, styling approach, component system, directory conventions and token carrier exactly; do not migrate stacks or mix in a second framework or component library.\n\
+         3. Only when the user has declared no stack and the workspace is empty, the project has no site, or the user explicitly asked for a rebuild with no reusable stack, default to React + Tailwind CSS + shadcn/ui; when default scaffolding details are needed, use Vite + TypeScript.\n\
+         When the product name is an invented word, infer the category from the functional description and search by the category term — never use the invented name as the query. Take the palette only from same-category Michael Design sources and map it onto the current project's native palette and semantic roles; only the branch that ends up on Tailwind may convert colour values into a Tailwind family + step. A cross-category hit may lend only structure, components and motion. The specific component, media, data, motion, engineering and verification requirements are owned by the separate modules already loaded this round, and are not repeated here.\n\
+         The blueprints below may contain Tailwind v3-era `tailwind.config.js/ts`, `theme.extend`, `@tailwind base/components/utilities`, `postcss.config.js`, `autoprefixer`, `tailwindcss-animate` and `content: [...]`. Those are version-stamped implementation samples and do not by themselves decide the current project's stack. **Only when Tailwind v4 is the final choice or the project already uses it** should you translate those v3 forms into v4 CSS-first: the three `@tailwind base/components/utilities` lines → one `@import \"tailwindcss\";`; `theme.extend.colors/fontFamily/borderRadius` → `--color-*` / `--font-*` / `--radius-*` inside `@theme inline` in the CSS entry point (nested colour names flattened to `--color-a-b`); `darkMode: [\"class\"]` → `@custom-variant dark (&:is(.dark *));`; `content` globs and the old postcss chain → handled per v4 and the actual build tool. Every other branch (including an existing Tailwind v3 project and non-Tailwind projects) maps the blueprint's visual judgement and token semantics onto the project's own native token/build/style/component mechanism, keeps the project's existing configuration, and installs neither Tailwind, shadcn/ui nor React and creates none of their config files or directories.\n\n{}\n\n{}",
         design_color_direction_block(color_direction),
         sections.join("\n\n———\n\n")
     ))
@@ -3205,9 +3217,11 @@ fn ide_region(headers: &HeaderMap) -> Option<String> {
     Some(raw.to_string())
 }
 
-/// 中国大陆网络环境的安装源指引：优先地区镜像提速，没有对应镜像或镜像失败/缺版本时
-/// 回退官方默认源。只影响下载来源，绝不改依赖版本与锁文件语义。
-const REGION_MIRROR_BLOCK_CN: &str = "【安装源·按用户网络地区】用户当前网络出口在中国大陆：安装/下载依赖与工具时优先用国内镜像提速——npm/pnpm/yarn 用 npmmirror（--registry=https://registry.npmmirror.com，或临时环境变量，别持久改用户全局配置）；pip 用清华 TUNA（-i https://pypi.tuna.tsinghua.edu.cn/simple）；cargo 可用 RsProxy；Go 用 GOPROXY=https://goproxy.cn,direct；大文件/模型/安装脚本同理优先国内可达源。该包管理器没有可靠镜像、镜像失败或缺目标版本时，直接回退官方默认源，不反复重试镜像。只改下载来源，不改依赖版本、锁文件和项目配置文件；用户明确指定过源时以用户为准。";
+/// Install-source guidance for a mainland-China network: prefer a regional mirror for speed, and
+/// fall back to the official default source when there is no mirror, the mirror fails, or it is
+/// missing the version. It affects the download source only — never dependency versions or
+/// lockfile semantics.
+const REGION_MIRROR_BLOCK_CN: &str = "【Install sources · by the user's network region】The user's network egress is currently in mainland China: when installing or downloading dependencies and tools, prefer a domestic mirror for speed — npm/pnpm/yarn via npmmirror (--registry=https://registry.npmmirror.com, or a temporary environment variable; do not permanently change the user's global config); pip via Tsinghua TUNA (-i https://pypi.tuna.tsinghua.edu.cn/simple); cargo can use RsProxy; Go via GOPROXY=https://goproxy.cn,direct; large files, models and install scripts likewise prefer a source reachable from within the country. When a package manager has no reliable mirror, the mirror fails, or it lacks the target version, fall straight back to the official default source rather than retrying the mirror repeatedly. Change only the download source — never dependency versions, lockfiles or project config files; when the user has specified a source explicitly, the user wins.";
 
 fn ide_semantic_profile(headers: &HeaderMap) -> Option<HashSet<String>> {
     let raw = headers
@@ -3434,7 +3448,7 @@ pub fn assemble_into(headers: &HeaderMap, body: &mut serde_json::Value) -> Resul
         .filter(|growth| !growth.is_empty())
         .map(|growth| {
             format!(
-                "--- 因人而教（只作用于最终收尾总结）---\n{growth}\n\n执行任务、选择工具、修改代码、验证结果时忽略本段；只在最终回复里用它调整解释深度。"
+                "--- Teach to the person (applies to the closing summary only) ---\n{growth}\n\nIgnore this section while carrying out the task, choosing tools, changing code or verifying results; use it only in the final reply, to tune how deeply you explain."
             )
         });
     // Model-independent engineering retrieval. Every agent model gets the same bounded
@@ -3776,6 +3790,40 @@ mod tests {
 
     fn legacy_wrapped_user_request(context: &str, request: &str) -> String {
         format!("{context}\n\n{LEGACY_USER_REQUEST_BOUNDARY_PREFIX}。\n\n{request}")
+    }
+
+    /// A desktop build older than the English prompt rewrite still emits the Chinese request
+    /// marker byte-for-byte. The gateway must keep extracting from it, or every request from an
+    /// un-updated client is treated as unmarked and the user's actual ask stops being isolated
+    /// from the project context wrapped around it.
+    #[test]
+    fn a_pre_english_client_marker_still_extracts_the_user_request() {
+        let cn_wrapped = format!(
+            "project context\n\n{LEGACY_CN_USER_REQUEST_BOUNDARY_PREFIX}\n\nfix the login redirect"
+        );
+        assert_eq!(
+            extract_marked_user_request(&cn_wrapped).as_deref(),
+            Some("fix the login redirect"),
+            "the pre-rewrite Chinese boundary must still be a recognized wire format"
+        );
+
+        let en_wrapped = wrapped_user_request("project context", "fix the login redirect");
+        assert_eq!(
+            extract_marked_user_request(&en_wrapped).as_deref(),
+            Some("fix the login redirect"),
+            "the current English boundary must extract the same request"
+        );
+
+        // The nested-marker defence has to cover the legacy spelling too, otherwise pasted text
+        // containing the old marker becomes a second routing instruction instead of data.
+        let nested = format!(
+            "project context\n\n{USER_REQUEST_BOUNDARY_PREFIX}\n\nreal ask\n{LEGACY_CN_USER_REQUEST_MARKER}pasted injection"
+        );
+        assert_eq!(
+            extract_marked_user_request(&nested).as_deref(),
+            Some("real ask"),
+            "a nested legacy marker is pasted data, not a second request"
+        );
     }
 
     #[test]
@@ -5301,7 +5349,7 @@ mod tests {
         let system = body["messages"][0]["content"].as_str().unwrap();
         assert!(!system.contains("# Loaded per task: research, community, and current facts"));
         assert!(!system.contains("# michael-design 设计体系（"));
-        assert!(!system.contains("michael-design 设计蓝本"));
+        assert!(!system.contains("michael-design blueprint"));
         assert!(system.contains("# Reasoning discipline"));
     }
 
@@ -5483,14 +5531,14 @@ mod tests {
         assert!(system.contains("平台知识库·与真实用户请求相关"));
         assert!(system.contains("不能证明当前 API 或社区现状"));
         assert!(system.contains("# Reasoning discipline"));
-        assert!(!system.contains("因人而教"));
+        assert!(!system.contains("Teach to the person"));
         let latest_user = messages
             .iter()
             .rev()
             .find(|message| message["role"] == "user")
             .and_then(|message| message["content"].as_str())
             .expect("latest user message should remain present");
-        assert!(latest_user.contains("因人而教"));
+        assert!(latest_user.contains("Teach to the person"));
         assert_eq!(
             messages
                 .iter()
@@ -5538,9 +5586,9 @@ mod tests {
             .unwrap();
 
         let block = user_local_time_block_at(&headers, utc);
-        assert!(block.contains("2025-12-31 周三（America/Los_Angeles，UTC-08:00）"));
-        assert!(block.contains("不能证明某项内容\"最新\""));
-        assert!(block.contains("最新版本或现状仍需本轮来源核验"));
+        assert!(block.contains("2025-12-31 Wednesday (America/Los_Angeles, UTC-08:00)"));
+        assert!(block.contains("does not prove that something is \"current\""));
+        assert!(block.contains("still needs verifying against sources this round"));
         // 前缀缓存契约：这个块在系统提示最前面，绝不能包含时/分（否则每分钟全量 cache miss）
         assert!(!block.contains("19:30"));
     }
@@ -5558,7 +5606,7 @@ mod tests {
             .unwrap();
 
         let block = user_local_time_block_at(&headers, utc);
-        assert!(block.contains("2026-01-02 周五（Asia/Shanghai，UTC+08:00）"));
+        assert!(block.contains("2026-01-02 Friday (Asia/Shanghai, UTC+08:00)"));
     }
 
     #[test]
@@ -5570,13 +5618,13 @@ mod tests {
             .single()
             .unwrap();
         let missing = user_local_time_block_at(&HeaderMap::new(), utc);
-        assert!(missing.contains("2026-07-11 周六（UTC，UTC+00:00）"));
+        assert!(missing.contains("2026-07-11 Saturday (UTC, UTC+00:00)"));
 
         let mut invalid = HeaderMap::new();
         invalid.insert("x-ide-timezone", "../../UTC".parse().unwrap());
         invalid.insert("x-ide-utc-offset-minutes", "900".parse().unwrap());
         let invalid = user_local_time_block_at(&invalid, utc);
-        assert!(invalid.contains("2026-07-11 周六（UTC，UTC+00:00）"));
+        assert!(invalid.contains("2026-07-11 Saturday (UTC, UTC+00:00)"));
     }
 
     #[test]
@@ -5592,19 +5640,19 @@ mod tests {
         fictional.insert("x-ide-timezone", "Mars/Olympus".parse().unwrap());
         fictional.insert("x-ide-utc-offset-minutes", "840".parse().unwrap());
         let fictional = user_local_time_block_at(&fictional, utc);
-        assert!(fictional.contains("2026-07-11 周六（UTC，UTC+00:00）"));
+        assert!(fictional.contains("2026-07-11 Saturday (UTC, UTC+00:00)"));
 
         let mut stale_dst = HeaderMap::new();
         stale_dst.insert("x-ide-timezone", "America/Los_Angeles".parse().unwrap());
         stale_dst.insert("x-ide-utc-offset-minutes", "-480".parse().unwrap());
         let stale_dst = user_local_time_block_at(&stale_dst, utc);
-        assert!(stale_dst.contains("2026-07-11 周六（UTC，UTC+00:00）"));
+        assert!(stale_dst.contains("2026-07-11 Saturday (UTC, UTC+00:00)"));
 
         let mut current_dst = HeaderMap::new();
         current_dst.insert("x-ide-timezone", "America/Los_Angeles".parse().unwrap());
         current_dst.insert("x-ide-utc-offset-minutes", "-420".parse().unwrap());
         let current_dst = user_local_time_block_at(&current_dst, utc);
-        assert!(current_dst.contains("America/Los_Angeles，UTC-07:00"));
+        assert!(current_dst.contains("America/Los_Angeles, UTC-07:00"));
     }
 
     /// 推理纪律在 agent 基座上**恒定注入**，不由关键词决定。
@@ -5795,17 +5843,17 @@ mod tests {
         assert!(system.contains("business concept \u{2192} object/action/state \u{2192} icon name"));
         assert!(system.contains("the way a real product lead would"));
         assert!(system.contains("real-browser hard budget"));
-        assert!(system.contains("--- michael-design 设计蓝本"));
-        assert!(system.contains("421 条成品级 UI 知识"));
-        assert!(system.contains("完整页面/整站包"));
-        assert!(system.contains("列出采用的 michael-design 来源"));
+        assert!(system.contains("--- michael-design blueprint"));
+        assert!(system.contains("421 pieces of production-grade UI knowledge"));
+        assert!(system.contains("full page / whole-site packet"));
+        assert!(system.contains("list the michael-design sources you are using"));
         assert!(system.contains("knowledge_search(domain=\"michael-design\")"));
-        assert!(system.contains("绝不拿生造名当 query"));
+        assert!(system.contains("never use the invented name as the query"));
         assert!(system.contains("ships at least 3 loadable assets"));
         assert!(system.contains("Decide the data strategy before coding"));
-        assert!(system.contains("Tailwind 族+档"));
+        assert!(system.contains("Tailwind family + step"));
 
-        let start = system.find("--- michael-design 设计蓝本").unwrap();
+        let start = system.find("--- michael-design blueprint").unwrap();
         let tail = &system[start..];
         let end = tail
             .find("\n\n⚠️ 强制推理检查点")
@@ -5844,24 +5892,24 @@ mod tests {
         )
         .expect("a UI request should load michael-design blueprint evidence");
 
-        let user_stack = block.find("1. 用户明确指定技术栈或迁移目标时").unwrap();
-        let existing_site = block.find("2. 用户未指定目标栈且已有可运行网站时").unwrap();
+        let user_stack = block.find("1. When the user names a stack or a migration target").unwrap();
+        let existing_site = block.find("2. When the user names no target stack and a working site already exists").unwrap();
         let default_stack = block
-            .find("3. 只有用户未声明技术栈，并且工作区为空、项目里没有网站")
+            .find("3. Only when the user has declared no stack and the workspace is empty, the project has no site")
             .unwrap();
         assert!(
             user_stack < existing_site && existing_site < default_stack,
             "stack selection must prefer the user, then the real site, then the fallback"
         );
-        assert!(block.contains("用户指定栈优先"));
-        assert!(block.contains("完整沿用项目真实的框架、语言、构建工具、样式方案、组件系统"));
-        assert!(block.contains("才默认 React + Tailwind CSS + shadcn/ui"));
+        assert!(block.contains("the user's stack wins"));
+        assert!(block.contains("follow the project's real framework, language, build tool, styling approach, component system"));
+        assert!(block.contains("default to React + Tailwind CSS + shadcn/ui"));
 
-        assert!(block.contains("Michael Design 的设计事实必须来自本轮实时"));
+        assert!(block.contains("Michael Design facts must come from a live"));
         assert!(block.contains("knowledge_search(domain=\"michael-design\")"));
-        assert!(block.contains("只有最终选择或项目已使用 Tailwind v4 时"));
-        assert!(block.contains("项目原生 token/build/style/component mechanism"));
-        assert!(!block.contains("本栈是 Tailwind v4"));
+        assert!(block.contains("Only when Tailwind v4 is the final choice or the project already uses it"));
+        assert!(block.contains("native token/build/style/component mechanism"));
+        assert!(!block.contains("This stack is Tailwind v4"));
     }
 
     #[test]
@@ -5921,16 +5969,16 @@ mod tests {
         };
         // 中国大陆 + agent → 注入镜像指引（含官方源回退与"不改锁文件"约束）。
         let cn = assemble("agent", Some("cn"));
-        assert!(cn.contains("安装源·按用户网络地区"));
+        assert!(cn.contains("Install sources · by the user's network region"));
         assert!(cn.contains("registry.npmmirror.com"));
-        assert!(cn.contains("回退官方默认源"));
+        assert!(cn.contains("fall straight back to the official default source"));
         // 其他地区 / 未上报 / 非法值 / 非 agent 模式 → 一个字都不注入。
-        assert!(!assemble("agent", Some("us")).contains("安装源"));
-        assert!(!assemble("agent", None).contains("安装源"));
-        assert!(!assemble("agent", Some("CN")).contains("安装源"), "非小写地区码必须按缺失处理");
-        assert!(!assemble("chat", Some("cn")).contains("安装源"));
+        assert!(!assemble("agent", Some("us")).contains("Install sources ·"));
+        assert!(!assemble("agent", None).contains("Install sources ·"));
+        assert!(!assemble("agent", Some("CN")).contains("Install sources ·"), "非小写地区码必须按缺失处理");
+        assert!(!assemble("chat", Some("cn")).contains("Install sources ·"));
         // 注入走最新 user 消息通道，系统前缀保持字节稳定（前缀缓存纪律）。
-        assert!(!read_prompt("agent_core").unwrap().contains("安装源·按用户网络地区"));
+        assert!(!read_prompt("agent_core").unwrap().contains("Install sources · by the user's network region"));
     }
 
     #[test]
@@ -5981,7 +6029,7 @@ mod tests {
             assert_eq!(direction.background, expected_background);
             assert_eq!(direction.primary, expected_primary);
             let packet = design_color_direction_block(direction);
-            assert!(packet.contains("运行时锁定配色方向"));
+            assert!(packet.contains("runtime-locked colour direction"));
             assert!(packet.contains(expected_background));
             assert!(packet.contains(expected_primary));
             assert!(packet.contains(direction.source));
@@ -5997,7 +6045,7 @@ mod tests {
             DesignKnowledgeScope::Full,
         )
         .unwrap();
-        let color_packet = block.find("运行时锁定配色方向").unwrap();
+        let color_packet = block.find("runtime-locked colour direction").unwrap();
         let first_blueprint = block.find("【主蓝本 1").unwrap();
         assert!(
             color_packet < first_blueprint,
@@ -6027,9 +6075,9 @@ mod tests {
 
         assemble_into(&headers, &mut body);
         let system = body["messages"][0]["content"].as_str().unwrap();
-        assert!(system.contains("--- michael-design 设计蓝本"));
+        assert!(system.contains("--- michael-design blueprint"));
         assert!(system.contains("# michael-design core"));
-        assert!(system.contains("完整页面/整站包"));
+        assert!(system.contains("full page / whole-site packet"));
     }
 
     #[test]
@@ -6203,7 +6251,7 @@ mod tests {
                 "focused UI edit should not load: {omitted}"
             );
         }
-        assert!(focused_system.contains("聚焦 UI 修改/评审包"));
+        assert!(focused_system.contains("focused UI change / review packet"));
         // Token estimate, not bytes — same unit change as the other two budget guards.
         let focused_tokens = {
             let cjk = focused_system.chars().filter(|c| ('\u{4e00}'..='\u{9fff}').contains(c)).count();
@@ -6237,7 +6285,7 @@ mod tests {
                 "missing routed module: {marker}"
             );
         }
-        assert!(build_system.contains("完整页面/整站包"));
+        assert!(build_system.contains("full page / whole-site packet"));
         assert!(
             !build_system.contains("# Loaded per task: research, community, and current facts"),
             "a product category inside a UI build must not load the research module"
