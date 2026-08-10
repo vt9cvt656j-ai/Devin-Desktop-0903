@@ -21717,4 +21717,19 @@ test("run_cmd / run_in_terminal descriptions carry the TTY split (the model read
   assert.match(by.get("run_cmd"), /没有真实终端|没有.{0,2}TTY|\/dev\/tty/, "run_cmd must say it has no TTY");
   assert.match(by.get("run_cmd"), /run_in_terminal/, "run_cmd must point TUI/interactive programs at run_in_terminal");
   assert.match(by.get("run_in_terminal"), /真 PTY|真实终端.*TTY|TUI/, "run_in_terminal must advertise the real terminal for TUIs");
+  // The behavioural core: the agent RUNS the program in the real terminal itself; it must not
+  // hand the user a command to type. (Reproduced live: the agent correctly diagnosed "needs a
+  // real terminal" yet still told the user to run it in Terminal 1.)
+  assert.match(by.get("run_in_terminal"), /你自己|不是把命令给用户/, "run_in_terminal must say the agent launches it, not the user");
+  assert.match(by.get("run_in_terminal"), /甩给用户|就是真终端/, "run_in_terminal must forbid handing off to the user's own terminal");
+});
+
+test("the prompt makes running a program the agent's own action, not a hand-off", () => {
+  // The behaviour lives in the prompt, not a harness gate. agent_core.txt must say that running a
+  // program means the agent launches it in the real terminal (run_in_terminal), an interactive
+  // TUI rendering IS delivery, and it must never hand the user a command to run themselves.
+  const prompt = readFileSync(join(HERE, "../../server/prompts/agent_core.txt"), "utf8");
+  assert.match(prompt, /run_in_terminal/, "the prompt must name the real-terminal tool");
+  assert.match(prompt, /自己把它跑起来|自己在真终端里/, "running a program is the agent's own action");
+  assert.match(prompt, /绝不要.{0,20}自己去终端敲|甩回给用户/, "the prompt must forbid handing the user a command to type");
 });
