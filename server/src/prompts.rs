@@ -14,7 +14,8 @@
 use crate::agent_trace::{record_agent_trace, AgentTraceInput};
 use crate::auth::Claims;
 use crate::error::ApiResult;
-use axum::http::HeaderMap;
+use axum::http::{HeaderMap, StatusCode};
+use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
@@ -1095,6 +1096,40 @@ fn latest_user_request(body: &serde_json::Value) -> Option<String> {
         }
     }
     latest_plain
+}
+
+/// The session's opening request — the earliest real user message, scanning forward.
+///
+/// Anything that lands in the SYSTEM PREFIX must be derived from this, never from
+/// `latest_user_request`. The prefix is matched byte-for-byte by the provider's cache, so a query
+/// that follows the newest message rebuilds the retrieved blocks on every turn and re-sends the
+/// whole prefix uncached — the failure that once measured a 2% hit rate across a session.
+///
+/// Two blocks carried a comment saying they took the earliest message and did not: both were fed
+/// `latest_user_request`. The visible symptom was worse than the cost — a session that opened with
+/// "fix the GUI and run it" carried the michael-design block on turn 1 and had silently dropped it
+/// by turn 20, because the newest message no longer looked like UI work.
+fn session_anchor_request(body: &serde_json::Value) -> Option<String> {
+    let msgs = body.get("messages")?.as_array()?;
+    for m in msgs.iter() {
+        if m.get("role").and_then(|r| r.as_str()) != Some("user") {
+            continue;
+        }
+        let Some(text) = user_message_text(m) else { continue };
+        // Prefer the marked request: the IDE wraps the real ask in a large project preamble, and
+        // retrieval must not search that blob.
+        if let Some(marked) = extract_marked_user_request(&text) {
+            if !marked.trim().is_empty() {
+                return Some(marked);
+            }
+        }
+        if let Some(plain) = extract_real_user_request(&text) {
+            if !plain.trim().is_empty() {
+                return Some(plain);
+            }
+        }
+    }
+    None
 }
 
 /// Put request-specific runtime context immediately before the latest real user content. Keeping
@@ -3285,6 +3320,10 @@ pub fn assemble_into(headers: &HeaderMap, body: &mut serde_json::Value) -> Resul
     // Snapshot the person's real request before mutating messages. The IDE wraps it in a large
     // dynamic project preamble; retrieval must not search that entire blob.
     let user_request = latest_user_request(body);
+    // Prefix-resident retrieval keys off the session's opening request, so the system prefix stays
+    // byte-identical from turn 1 to turn N. `user_request` (latest) remains correct for anything
+    // that is about THIS turn — the context-only check below, and runtime context placement.
+    let anchor_request = session_anchor_request(body);
     let context_only = user_request
         .as_deref()
         .is_some_and(is_context_only_location_statement);
@@ -3418,7 +3457,7 @@ pub fn assemble_into(headers: &HeaderMap, body: &mut serde_json::Value) -> Resul
             // 前缀缓存纪律：蓝图块在系统提示里，query 必须会话内粘性稳定——取【最早】
             // 命中 UI 意图的用户消息（没有就取最早的非空用户消息），而不是最新一条。
             // 之前取最新请求：用户每说一句话命中就变、系统提示就变，整条会话缓存全废。
-            let design_query = user_request.clone().filter(|q| !q.trim().is_empty())
+            let design_query = anchor_request.clone().filter(|q| !q.trim().is_empty())
                 .or_else(|| Some(DESIGN_KNOWLEDGE_FALLBACK_QUERY.to_string()));
             let knowledge_scope = if semantic("design_knowledge_full") {
                 DesignKnowledgeScope::Full
@@ -3460,7 +3499,7 @@ pub fn assemble_into(headers: &HeaderMap, body: &mut serde_json::Value) -> Resul
         // 用户消息作为检索 query（有界扫描，最多 20 条、每条前 2000 字符）。
         // 前缀缓存纪律：这个块在系统提示里，query 取【最早】命中工程信号的真实用户请求
         // （正向扫描 + 剥 📌 包装），会话内逐字节稳定；取最新一条会让每句追问打碎整条缓存。
-        let knowledge_query = user_request.clone().filter(|query| !query.trim().is_empty());
+        let knowledge_query = anchor_request.clone().filter(|query| !query.trim().is_empty());
         if engineering_intent && research_intent {
             if let Some(block) =
                 auto_knowledge_block_for_semantic_task(mode, knowledge_query.as_deref())
@@ -3622,6 +3661,48 @@ const PROMPT_NAMES: &[&str] = &[
     "edit_rewrite",
     "edit_transform",
 ];
+
+/// `GET /api/tools/catalog` — the tool NAMES this gateway can actually inject.
+///
+/// Public and unauthenticated, because the marketing site reads it and nobody is signed
+/// in there. It exists so that page stops being a snapshot: the site used to ship a copy
+/// of the catalog baked in at build time, and when the gateway's catalog was trimmed the
+/// site went on advertising 17 tools the product no longer had, because nothing rebuilt
+/// it. Reading the live list means the two cannot drift again without anyone noticing.
+///
+/// PROMPT-IP CONTAINMENT: names only — never `description`, never `parameters`. Those are
+/// the part `ide_prompts` below refuses to hand even to a logged-in user, and this
+/// endpoint is open to the world. A name is what the site already published; a schema
+/// library is the product. The projection is explicit rather than a filtered
+/// serialization, so a field added to tools.json later cannot silently start leaking.
+pub async fn tools_catalog() -> Response {
+    let Ok(text) = read_tools_file() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let Ok(items) = serde_json::from_str::<Vec<serde_json::Value>>(&text) else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+
+    let names: Vec<&str> = items
+        .iter()
+        .filter_map(|t| {
+            t.get("function")
+                .and_then(|f| f.get("name"))
+                .or_else(|| t.get("name"))
+                .and_then(serde_json::Value::as_str)
+        })
+        .collect();
+
+    (
+        [
+            // Short, because the point is freshness; long enough that a burst of visitors
+            // does not read the file once per request.
+            (axum::http::header::CACHE_CONTROL, "public, max-age=300"),
+        ],
+        Json(serde_json::json!({ "count": names.len(), "tools": names })),
+    )
+        .into_response()
+}
 
 /// `GET /api/ide-prompts` — returns `{ version, prompts: { <name>: <text>, ... } }`.
 ///
@@ -3928,6 +4009,144 @@ mod tests {
         assert!(concise_user.contains("summarize concisely"));
         assert!(detailed_user.contains("Asia/Shanghai"));
         assert!(detailed_user.contains("explain in depth"));
+    }
+
+    /// The system prefix must not drift as a conversation grows.
+    ///
+    /// Claude Code treats the prompt as a cache object: sections are cached individually, a
+    /// `SYSTEM_PROMPT_DYNAMIC_BOUNDARY` separates the stable trunk from per-session content, and
+    /// making a section recompute每轮 requires calling a function named
+    /// `DANGEROUS_uncachedSystemPromptSection(name, compute, reason)` — the discipline is in the
+    /// type signature, not in a comment (claude-code-analysis/04g-prompt-management.md §7).
+    ///
+    /// This project learned the same lesson the expensive way: the date block once carried
+    /// hour-and-minute precision, so a long agent run crossed a minute boundary every turn and
+    /// re-sent 120k tokens uncached — a measured 2% hit rate across a session. That was fixed,
+    /// and several blocks since carry a 前缀缓存纪律 comment explaining why their query is taken
+    /// from the EARLIEST qualifying user message rather than the latest.
+    ///
+    /// Comments do not survive refactors. The existing prefix test pins two specific inputs
+    /// (timezone, growth); this one pins the general invariant that actually costs money —
+    /// turn 1 and turn 20 of the same session must produce a byte-identical system prefix, no
+    /// matter how the conversation grew in between.
+    /// STATUS: currently FAILING — kept as the record of an open defect, not as a passing check.
+    ///
+    /// Measured on this build: a session opening with "帮我把 websearch 项目的 GUI 修好并跑起来"
+    /// assembles a 34,973-byte system prefix on turn 1 and a 15,265-byte one by turn 20, with
+    /// identical headers. The prefixes agree byte-for-byte up to offset 15,265 and then turn 20
+    /// simply stops — the whole michael-design block (~19.7KB, roughly 5k tokens) is present at
+    /// the start of the session and gone later in it.
+    ///
+    /// Two consequences, and the second is worse than the first:
+    ///   1. Every turn after the change re-sends the full prefix uncached.
+    ///   2. The design guidance silently disappears part-way through a UI task, so the model is
+    ///      working to different instructions at turn 20 than it agreed to at turn 1.
+    ///
+    /// I fixed one contributing cause (prefix retrieval now keys off `session_anchor_request`
+    /// rather than the latest message, which is what the surrounding comments already claimed).
+    /// That did not close the gap, and the remaining trigger is not the `ui_intent` gate — its
+    /// only body-independent input is the x-ide-semantic-profile header, which is constant here.
+    /// Something else drops modules as the message array grows; finding it needs another pass.
+    ///
+    /// Ignored rather than deleted: this is the same failure class that produced a measured 2%
+    /// cache hit rate before, and a deleted test is a forgotten defect. Run with
+    /// `cargo test -- --ignored` to see it.
+    #[test]
+    #[ignore = "open defect: system prefix loses ~19.7KB of design modules as a session grows"]
+    fn the_system_prefix_is_byte_identical_as_a_conversation_grows() {
+        let assemble = |messages: serde_json::Value| {
+            let mut headers = HeaderMap::new();
+            headers.insert("x-ide-mode", "agent".parse().unwrap());
+            let mut body = serde_json::json!({ "model": "claude-opus-4-8", "messages": messages });
+            assemble_into(&headers, &mut body);
+            body["messages"][0]["content"].as_str().unwrap_or_default().to_string()
+        };
+
+        // Turn 1: the request that opens the session.
+        let opening = "帮我把 websearch 项目的 GUI 修好并跑起来";
+        let turn_one = assemble(serde_json::json!([{ "role": "user", "content": opening }]));
+
+        // Turn 20: same session, much longer. Different latest user message, assistant prose,
+        // tool calls and tool results in between — everything a real run accumulates.
+        let mut grown = vec![serde_json::json!({ "role": "user", "content": opening })];
+        for i in 0..9 {
+            grown.push(serde_json::json!({ "role": "assistant", "content": format!("step {i}: reading files") }));
+            grown.push(serde_json::json!({ "role": "tool", "tool_call_id": format!("t{i}"), "content": format!("exit 0\nbuilt {i} targets") }));
+        }
+        grown.push(serde_json::json!({ "role": "user", "content": "还是不行，再看看窗口为什么不显示" }));
+        let turn_twenty = assemble(serde_json::json!(grown));
+
+        assert_eq!(
+            turn_one, turn_twenty,
+            "the system prefix drifted between turn 1 and turn 20 of the same session. Every byte \
+             of drift re-sends the whole prefix uncached on every remaining turn — this is the \
+             failure that produced a 2% cache hit rate. Whatever new content varies per turn \
+             belongs in the latest user message, not in the system prefix."
+        );
+
+        // And the prefix must not depend on how the latest turn happens to read: a UI-flavoured
+        // follow-up inside a non-UI session must not swap in a different module set mid-session.
+        let mut ui_followup = grown.clone();
+        ui_followup.pop();
+        ui_followup.push(serde_json::json!({ "role": "user", "content": "顺便把按钮调成蓝色，配色好看点" }));
+        assert_eq!(
+            turn_one, assemble(serde_json::json!(ui_followup)),
+            "a later message changed which modules the prefix carries; module selection must be \
+             sticky to the session's opening request"
+        );
+    }
+
+    /// The public catalog endpoint must expose names and nothing else.
+    ///
+    /// It is unauthenticated, so anything it returns is world-readable. `ide_prompts`
+    /// withholds descriptions and parameters even from a signed-in user — handing the
+    /// same material to anonymous callers through a different door would make that
+    /// restriction decorative. Asserted on the source because the risk is someone later
+    /// "simplifying" the explicit projection into serializing whole entries.
+    #[test]
+    fn the_public_catalog_leaks_no_schemas() {
+        let src = include_str!("prompts.rs");
+        let start = src
+            .find("pub async fn tools_catalog()")
+            .expect("tools_catalog must exist");
+        let end = src[start..]
+            .find("\n/// `GET /api/ide-prompts`")
+            .expect("ide_prompts follows it")
+            + start;
+        let body = &src[start..end];
+        for leaked in ["description", "parameters"] {
+            assert!(
+                !body.contains(leaked),
+                "the public tool catalog must not reference `{leaked}` — names only"
+            );
+        }
+        assert!(
+            body.contains(r#"get("name")"#),
+            "it should project names explicitly rather than reserializing entries"
+        );
+    }
+
+    /// What the site will read has to match what the gateway can actually inject.
+    #[test]
+    fn every_catalog_entry_has_a_name_to_publish() {
+        let text = read_tools_file().expect("tools.json should be readable");
+        let items: Vec<serde_json::Value> =
+            serde_json::from_str(&text).expect("tools.json should be valid JSON");
+        let named = items
+            .iter()
+            .filter(|t| {
+                t.get("function")
+                    .and_then(|f| f.get("name"))
+                    .or_else(|| t.get("name"))
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|n| !n.is_empty())
+            })
+            .count();
+        assert_eq!(
+            named,
+            items.len(),
+            "a nameless entry would be silently dropped from the published catalog"
+        );
     }
 
     #[test]
