@@ -77,8 +77,9 @@
   .pv:disabled { cursor: not-allowed; opacity: .5; }
   .pv .mark { width: 18px; height: 18px; flex: none; }
   .pv .txt { flex: 1; text-align: left; }
-  /* GitHub and Google are labelled "soon" because the gateway has no OAuth yet —
-     a button that looks live but cannot sign anyone in is worse than an honest one. */
+  /* "Soon" is the starting state, not the permanent one: the page asks the gateway which
+     providers have credentials and takes the badge off those that do. A button that looks
+     live but cannot sign anyone in is worse than an honest one. */
   .soon {
     flex: none; font-size: 10px; font-weight: 600; letter-spacing: .04em;
     text-transform: uppercase; color: var(--muted);
@@ -137,15 +138,15 @@
     <div id="providers">
       <div class="or">or</div>
       <div class="providers">
-        <button class="pv" type="button" disabled aria-label="Continue with GitHub — not available yet">
+        <button class="pv" type="button" id="pvGithub" disabled aria-label="Continue with GitHub — not available yet">
           <svg class="mark" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.012 8.012 0 0 0 16 8c0-4.42-3.58-8-8-8z"/></svg>
           <span class="txt">Continue with GitHub</span>
-          <span class="soon">Soon</span>
+          <span class="soon" id="pvGithubSoon">Soon</span>
         </button>
-        <button class="pv" type="button" disabled aria-label="Continue with Google — not available yet">
+        <button class="pv" type="button" id="pvGoogle" disabled aria-label="Continue with Google — not available yet">
           <svg class="mark" viewBox="0 0 18 18" aria-hidden="true"><path fill="#4285F4" d="M17.64 9.2c0-.637-.057-1.251-.164-1.84H9v3.481h4.844a4.14 4.14 0 0 1-1.796 2.716v2.259h2.908c1.702-1.567 2.684-3.875 2.684-6.615z"/><path fill="#34A853" d="M9 18c2.43 0 4.467-.806 5.956-2.18l-2.908-2.259c-.806.54-1.837.86-3.048.86-2.344 0-4.328-1.584-5.036-3.711H.957v2.332A8.997 8.997 0 0 0 9 18z"/><path fill="#FBBC05" d="M3.964 10.71A5.41 5.41 0 0 1 3.682 9c0-.593.102-1.17.282-1.71V4.958H.957A8.996 8.996 0 0 0 0 9c0 1.452.348 2.827.957 4.042l3.007-2.332z"/><path fill="#EA4335" d="M9 3.58c1.321 0 2.508.454 3.44 1.345l2.582-2.58C13.463.891 11.426 0 9 0A8.997 8.997 0 0 0 .957 4.958L3.964 7.29C4.672 5.163 6.656 3.58 9 3.58z"/></svg>
           <span class="txt">Continue with Google</span>
-          <span class="soon">Soon</span>
+          <span class="soon" id="pvGoogleSoon">Soon</span>
         </button>
         <button class="pv" type="button" id="pvMrday" aria-label="Continue with Mr.day One">
           <img class="mark" id="pvLogo" alt="" />
@@ -243,6 +244,71 @@
     try { localStorage.setItem(KEY, id); } catch (e) {}
     return id;
   }
+
+  // ---- Signing in with GitHub or Google -------------------------------------
+  //
+  // The buttons ship disabled and are switched on by asking the gateway which providers
+  // have credentials. Doing it this way means adding the keys to the server lights the
+  // button up with no change here, and — more to the point — a provider that is not set
+  // up cannot present a button that sends someone to a broken authorize screen.
+  var OAUTH = { github: $("pvGithub"), google: $("pvGoogle") };
+
+  function startOauth(provider) {
+    // device_id rides along so an OAuth sign-in joins this browser's existing device row
+    // instead of opening a second one. The callback is a fresh navigation and cannot read
+    // storage, so this is the only chance to send it.
+    var url = "/api/auth/oauth/" + provider + "/start"
+      + "?next=" + encodeURIComponent(nextTarget())
+      + "&device_id=" + encodeURIComponent(deviceId());
+    location.href = url;
+  }
+
+  (async function offerProviders() {
+    var live;
+    try {
+      var r = await fetch("/api/auth/oauth/providers", { cache: "no-store" });
+      if (!r.ok) return;
+      live = await r.json();
+    } catch (e) {
+      // Offline or an older gateway. The buttons stay as they are — honestly disabled.
+      return;
+    }
+    Object.keys(OAUTH).forEach(function (name) {
+      var btn = OAUTH[name];
+      if (!btn || !live[name]) return;
+      btn.disabled = false;
+      btn.setAttribute("aria-label", "Continue with " + (name === "github" ? "GitHub" : "Google"));
+      var badge = $("pv" + (name === "github" ? "Github" : "Google") + "Soon");
+      if (badge) badge.remove();
+      btn.addEventListener("click", function () { startOauth(name); });
+    });
+  })();
+
+  // How a failed or abandoned provider sign-in comes back. The server sends a keyword,
+  // never provider text — that can carry someone else's address or a message we would be
+  // rendering into this page sight unseen.
+  var OAUTH_SAID = {
+    cancelled: ["Sign-in was cancelled.", "muted"],
+    unverified: ["That account's email address is not verified. Confirm it with your provider, then try again.", "err"],
+    noemail: ["That provider did not release an email address, so there is nothing to create an account with.", "err"],
+    unconfigured: ["That sign-in method is not enabled on this server yet.", "err"],
+    unknown: ["Unknown sign-in method.", "err"],
+    error: ["Sign-in failed. Please try again.", "err"]
+  };
+
+  (function reportOauth() {
+    var said;
+    try { said = new URLSearchParams(location.search).get("oauth"); } catch (e) { return; }
+    if (!said) return;
+    var m = OAUTH_SAID[said] || OAUTH_SAID.error;
+    setMsg(m[0], m[1] === "err" ? "err" : "");
+    // Take it out of the address bar so a reload does not re-accuse.
+    try {
+      var url = new URL(location.href);
+      url.searchParams.delete("oauth");
+      history.replaceState({}, "", url.toString());
+    } catch (e) {}
+  })();
   function finish(token) {
     // The cookie nginx checks before serving the app shell. Real API calls still carry
     // the Bearer token and are authorized per request.

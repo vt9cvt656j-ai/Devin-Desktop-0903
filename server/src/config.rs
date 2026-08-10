@@ -44,6 +44,22 @@ pub struct Config {
     pub github_client_secret: String,
     pub gitlab_client_id: String,
     pub gitlab_client_secret: String,
+
+    /// OAuth apps for *signing in*, which are deliberately not the ones above.
+    ///
+    /// Two reasons they cannot be shared. A GitHub OAuth app has one registered callback
+    /// URL, and these flows land on different paths. More importantly the linking app asks
+    /// for `repo` — full read/write to every private repository — because that is what
+    /// browsing your own repositories needs. Reusing it here would put that consent screen
+    /// in front of someone who only wants to log in, which is both alarming and far more
+    /// access than signing in requires.
+    ///
+    /// Empty means the provider button stays off. There are no defaults: the app belongs
+    /// to the operator's identity and the secret is theirs.
+    pub github_login_client_id: String,
+    pub github_login_client_secret: String,
+    pub google_client_id: String,
+    pub google_client_secret: String,
 }
 
 /// JWT 密钥是整套鉴权的根：拿到它就能签一张 `role: "admin"` 的令牌，而 Claims 提取器
@@ -129,6 +145,11 @@ impl Config {
             github_client_secret: std::env::var("GITHUB_CLIENT_SECRET").unwrap_or_default(),
             gitlab_client_id: std::env::var("GITLAB_CLIENT_ID").unwrap_or_default(),
             gitlab_client_secret: std::env::var("GITLAB_CLIENT_SECRET").unwrap_or_default(),
+            github_login_client_id: std::env::var("GITHUB_LOGIN_CLIENT_ID").unwrap_or_default(),
+            github_login_client_secret: std::env::var("GITHUB_LOGIN_CLIENT_SECRET")
+                .unwrap_or_default(),
+            google_client_id: std::env::var("GOOGLE_CLIENT_ID").unwrap_or_default(),
+            google_client_secret: std::env::var("GOOGLE_CLIENT_SECRET").unwrap_or_default(),
         })
     }
 

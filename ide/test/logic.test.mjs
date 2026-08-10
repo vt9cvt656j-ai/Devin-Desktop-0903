@@ -21745,15 +21745,15 @@ test("a mid-stream connection drop resumes instead of abandoning the round", () 
   const mode = load("_streamResumeMode");
 
   // an eager write already hit disk → stop (re-emitting risks a second write)
-  assert.equal(mode({ eagerExecuted: true, hasProse: true, hadToolFragment: true }), "stop");
-  assert.equal(mode({ eagerExecuted: true, hasProse: false, hadToolFragment: true }), "stop");
+  assert.equal(mode({ eagerExecuted: true, hasProse: true }), "stop");
+  assert.equal(mode({ eagerExecuted: true, hasProse: false }), "stop");
   // prose reached the user, nothing executed → continue from the prefill (no replay)
-  assert.equal(mode({ eagerExecuted: false, hasProse: true, hadToolFragment: false }), "continue");
-  // a half-streamed tool call whose JSON never closed (so it never ran), no prose → re-run cleanly
-  assert.equal(mode({ eagerExecuted: false, hasProse: false, hadToolFragment: true }), "rerequest");
-  // reasoning-only drop (still thinking, no prose, no tool call) → stop. Re-requesting would make a
-  // reasoning model re-think from scratch and stack a doubled "思考中" that reads as "never acts".
-  assert.equal(mode({ eagerExecuted: false, hasProse: false, hadToolFragment: false }), "stop");
+  assert.equal(mode({ eagerExecuted: false, hasProse: true }), "continue");
+  // NOTHING delivered and nothing executed → retry the turn. Covers both a drop mid a
+  // half-streamed tool call AND — the commonest case with a reasoning model — a drop during the
+  // thinking phase. An earlier revision routed the reasoning-only case to "stop", which turned the
+  // most frequent recoverable drop into the abandoned round the user reported. It must retry.
+  assert.equal(mode({ eagerExecuted: false, hasProse: false }), "rerequest");
 
   // The resume builder must key its safety on execution, not on "were there tool calls", and must
   // discard the unexecuted fragments before continuing.
@@ -21762,13 +21762,26 @@ test("a mid-stream connection drop resumes instead of abandoning the round", () 
     "the blanket 'any tool call → give up' bail must be gone");
   assert.match(turn, /const eagerExecuted = \[\.\.\.byIndex\.values\(\)\]\.some\(\(e\) => e && e\._eagerNotified\)/,
     "the stop decision must be gated on an eager write having actually executed");
-  assert.match(turn, /const hadToolFragment = byIndex\.size > 0;/,
-    "whether a tool call was mid-stream must be captured before byIndex is cleared");
-  assert.match(turn, /_streamResumeMode\(\{ eagerExecuted, hasProse: !!partial, hadToolFragment \}\)/,
+  assert.match(turn, /_streamResumeMode\(\{ eagerExecuted, hasProse: !!partial \}\)/,
     "the resume builder must route through the pure decision helper");
   assert.match(turn, /if \(mode === "stop"\) return null;/, "the stop mode bails");
   assert.match(turn, /byIndex\.clear\(\);/,
     "unexecuted tool-call fragments are discarded before the continuation re-emits them");
+  // A retry must start from a clean slate, or the fresh attempt stacks a second thinking card and
+  // duplicate prose — the very fear that (wrongly) motivated abandoning the round instead.
+  // Bound the slice to the resume builder. Sliced open-ended it ran on into the tool-arg repair
+  // path, whose reset line is byte-identical — so deleting the retry's own reset still "matched"
+  // and the guard silently passed (caught by mutation testing).
+  const rrStart = turn.indexOf('mode === "rerequest"');
+  const rerequest = turn.slice(rrStart, turn.indexOf("onResume:", rrStart));
+  for (const [pattern, why] of [
+    [/acc = ""; reasoningAcc = ""; reasoningAll = "";/, "prose and reasoning accumulators"],
+    [/_turnThinkCards\.length = 0;/, "every think card from the failed attempt"],
+    [/_inlineThinkState\.answerStarted = false;/, "the inline think-tag parser state"],
+    [/if \(streamEl\) \{ streamEl\.remove\(\); streamEl = null; \}/, "the partial answer element"],
+  ]) {
+    assert.match(rerequest, pattern, `a retry must reset ${why}`);
+  }
 });
 
 test("the always-injected prompt demands real, working delivery — no mocks or fake URLs", () => {

@@ -182,7 +182,7 @@ pub(crate) fn clean_device_id(raw: Option<&str>) -> String {
 ///
 /// Every path that mints a token goes through here, so there is no way to end up with a
 /// token that has no session behind it and therefore cannot be revoked.
-async fn start_session(
+pub(crate) async fn start_session(
     state: &AppState,
     user: &User,
     headers: &axum::http::HeaderMap,
@@ -506,7 +506,7 @@ pub fn normalize_email(email: &str) -> String {
 /// normalized string keeps mixed-case rows created before normalization loginable.
 /// `LIMIT 1` (oldest first) because such rows may already collide pairwise, and a
 /// bare `fetch_optional` would error out instead of resolving to the original account.
-async fn find_user(state: &AppState, identity: &str) -> ApiResult<Option<User>> {
+pub(crate) async fn find_user(state: &AppState, identity: &str) -> ApiResult<Option<User>> {
     // Matches on `email`, which in this deployment is really an IDENTITY column — the admin
     // account's stored email is literally "fendoushaonian", not an address. A username therefore
     // already works and no username column is needed; what blocked login was a `type="email"` on
@@ -578,9 +578,25 @@ pub async fn check_email(
     if !valid_email(&req.email) {
         return Err(AppError::bad("邮箱格式不正确"));
     }
-    Ok(Json(
-        json!({ "exists": find_user(&state, &req.email).await?.is_some() }),
-    ))
+    let Some(user) = find_user(&state, &req.email).await? else {
+        return Ok(Json(json!({ "exists": false, "password": false, "providers": [] })));
+    };
+
+    // How this account signs in, so the page can ask for the right thing. Without it,
+    // someone who created their account with Google is shown a password box that no
+    // password will ever satisfy.
+    let providers: Vec<String> = sqlx::query_scalar(
+        "SELECT provider FROM auth_identities WHERE user_id = $1 ORDER BY provider",
+    )
+    .bind(user.id)
+    .fetch_all(&state.db)
+    .await?;
+
+    Ok(Json(json!({
+        "exists": true,
+        "password": !user.password_hash.is_empty(),
+        "providers": providers,
+    })))
 }
 
 /// Per-address daily send ceiling. A 30s cooldown alone still allows 2880 mails a
@@ -713,6 +729,23 @@ pub async fn login(
             return Err(AppError::unauthorized("账号或密码错误"));
         }
     };
+    // An account created by signing in with a provider has no password. bcrypt::verify
+    // against '' is an *error*, not a false, so without this the person gets a 500 for
+    // doing something entirely reasonable.
+    //
+    // This says which account it is, unlike the message above. That is not a new leak:
+    // /api/auth/check-email already answers whether an address is registered — the sign-in
+    // page is built on it — so the existence of the account is not what is being protected
+    // here. Being told "use Google" is the difference between signing in and being stuck.
+    if user.password_hash.is_empty() {
+        // Same cost as the real path, so the timing does not become the oracle the
+        // message is not.
+        let _ = bcrypt::verify(&req.password, &DUMMY_HASH);
+        login_fail(&state, &ekey, &ikey).await;
+        return Err(AppError::bad(
+            "该账号使用第三方登录创建，请用下方的 GitHub 或 Google 按钮登录",
+        ));
+    }
     if !bcrypt::verify(&req.password, &user.password_hash)? {
         login_fail(&state, &ekey, &ikey).await;
         return Err(AppError::unauthorized("账号或密码错误"));

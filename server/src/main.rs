@@ -14,6 +14,7 @@ mod game;
 mod integrations;
 mod knowledge;
 mod models;
+mod oauth;
 mod pay;
 mod procedural_3d;
 mod prompts;
@@ -104,6 +105,12 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/auth/register", post(auth::register))
         .route("/api/auth/login", post(auth::login))
         .route("/api/auth/verify-code", post(auth::verify_code))
+        // Signing in with a provider. All three are public: they are reached before
+        // anyone has a session, and the callback arrives as a bare browser redirect
+        // from GitHub or Google with no header of ours on it (see oauth.rs).
+        .route("/api/auth/oauth/providers", get(oauth::providers))
+        .route("/api/auth/oauth/:provider/start", get(oauth::start))
+        .route("/api/auth/oauth/:provider/callback", get(oauth::callback))
         .route("/api/me", get(auth::me))
         // 只读门禁：nginx 的 auth_request 打这里，而不是 /api/me。
         // /api/me 每次跑两条 UPDATE，而 auth_request 是每个静态资源都触发一次。
