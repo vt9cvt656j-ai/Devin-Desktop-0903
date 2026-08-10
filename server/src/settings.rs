@@ -363,6 +363,12 @@ mod tests {
 
     /// 兜底值必须逐字等于改造前 models.rs / codes.rs 里的常量，否则"迁移前后行为不变"
     /// 这句话就是假的。
+    ///
+    /// weekly_cents 是迁移之后才加的周上限，不在"行为不变"这句话的范围里，所以它钉的是
+    /// 这一列自己该有的值。这个测试之前一直红着：周上限上线时没有人回来改这里，于是
+    /// 它从"迁移守卫"变成了"套餐表被人动过就报错"的噪音——两个失败的测试摆在那里，
+    /// 只会教人把整个套件的红色当背景。走库里的 plans 表时这些值用不上；它们是查库
+    /// 失败时的兜底，所以必须是真能收费的数字，不能是 0。
     #[test]
     fn defaults_match_the_constants_they_replaced() {
         assert_eq!(DEFAULT_RAW_CENTS_PER_CREDIT_USD, 663);
@@ -373,11 +379,11 @@ mod tests {
                 .map(|p| (p.plan, p.total_cents, p.window_cents, p.weekly_cents, p.days))
                 .collect::<Vec<_>>(),
             vec![
-                ("trial".to_string(), 5_000, 5_000, 0, 1),
-                ("basic".to_string(), 33_000, 3_000, 0, 30),
-                ("pro".to_string(), 65_000, 6_000, 0, 30),
-                ("power".to_string(), 180_000, 15_000, 0, 30),
-                ("ultra".to_string(), 500_000, 30_000, 0, 30),
+                ("trial".to_string(), 5_000, 5_000, 500, 1),
+                ("basic".to_string(), 33_000, 3_000, 5_000, 30),
+                ("pro".to_string(), 65_000, 6_000, 10_000, 30),
+                ("power".to_string(), 180_000, 15_000, 30_000, 30),
+                ("ultra".to_string(), 500_000, 30_000, 80_000, 30),
             ]
         );
     }
@@ -463,6 +469,8 @@ mod tests {
         assert!(plan_spec("no-such-plan").is_none());
         assert_eq!(plan_rank("no-such-plan"), 0);
         assert_eq!(plan_rank("basic"), 2);
-        assert_eq!(plan_spec("basic"), Some((33_000, 3_000, 0, 30)));
+        // 第三位是周上限，0 表示不限；basic 是 5_000。codes.rs 的 0 == 不限那条规则，
+        // 意味着把它写回 0 不会让测试失败，只会悄悄给所有 basic 用户解除周上限。
+        assert_eq!(plan_spec("basic"), Some((33_000, 3_000, 5_000, 30)));
     }
 }
