@@ -1582,9 +1582,9 @@ test("slow install/download commands get a factual duration note (no interceptio
 });
 
 test("remote prompt bundles carry the empty-workspace stop rule", () => {
-  assert.match(SERVER_PROMPT_SUBAGENT, /空目录[\s\S]{0,140}停止本地 read_file \/ search \/ find_files/,
+  assert.match(SERVER_PROMPT_SUBAGENT, /empty[\s\S]{0,200}stop local read_file \/ search \/ find_files/i,
     "subagent prompt should stop local probing in empty workspaces");
-  assert.match(SERVER_PROMPT_WORKER, /空目录[\s\S]{0,160}停止本地 read_file \/ search \/ find_files/,
+  assert.match(SERVER_PROMPT_WORKER, /empty[\s\S]{0,240}stop local read_file \/ search \/ find_files/i,
     "worker prompt should stop local probing in empty workspaces");
   assert.match(SERVER_PROMPT_RESEARCH, /(空目录|根目录为空)[\s\S]{0,220}停止本地 read_file \/ search \/ find_files/,
     "research prompt should stop local probing in empty workspaces");
@@ -8534,15 +8534,15 @@ test("server prompts preserve prompt rescue and maintainability baselines", () =
     ["agent", SERVER_PROMPT_AGENT],
     ["agent_lite", SERVER_PROMPT_AGENT_LITE],
   ]) {
-    assert.match(body, /烂提示词救援默认开启/, `${name} must rescue vague or bad user prompts by default`);
-    assert.match(body, /项目工程级默认值/, `${name} must default project work to maintainable engineering`);
-    assert.match(body, /默认假设.*可反悔选择/s, `${name} must turn weak prompts into reversible assumptions`);
-    assert.match(body, /模块边界.*集中配置.*类型\/schema\/API 契约/s, `${name} must spell out maintainable architecture primitives`);
-    assert.match(body, /禁止把业务规则、颜色、端口、密钥、路径和魔法值散落硬编码/, `${name} must reject scattered hardcoding`);
+    assert.match(body, /Prompt-rescue is on by default/i, `${name} must rescue vague or bad user prompts by default`);
+    assert.match(body, /Project engineering defaults/i, `${name} must default project work to maintainable engineering`);
+    assert.match(body, /default assumptions[\s\S]{0,40}reversible choices/i, `${name} must turn weak prompts into reversible assumptions`);
+    assert.match(body, /module boundaries[\s\S]{0,80}centralized config[\s\S]{0,80}type\/schema\/API contracts/i, `${name} must spell out maintainable architecture primitives`);
+    assert.match(body, /never scatter business rules, colours, ports, keys, paths, or magic values as hard-coded/i, `${name} must reject scattered hardcoding`);
   }
-  assert.match(SERVER_PROMPT_PLAN, /用户描述模糊、提示词很差/, "Plan mode must normalize vague prompts instead of pushing the problem back to the user");
-  assert.match(SERVER_PROMPT_PLAN, /维护与升级底线/, "Plan mode must include maintainability and upgrade coverage");
-  assert.match(SERVER_PROMPT_PLAN, /清晰目录\/模块边界、集中配置\/env、类型\/schema\/API 契约/, "Plan mode must specify concrete engineering defaults");
+  assert.match(SERVER_PROMPT_PLAN, /description is vague, the prompt is poor/i, "Plan mode must normalize vague prompts instead of pushing the problem back to the user");
+  assert.match(SERVER_PROMPT_PLAN, /Maintainability and upgrade floor/i, "Plan mode must include maintainability and upgrade coverage");
+  assert.match(SERVER_PROMPT_PLAN, /clear directory\/module boundaries, centralized config\/env, type\/schema\/API contracts/i, "Plan mode must specify concrete engineering defaults");
   assert.match(SERVER_PROMPT_REASONING, /goal, action, object, constraints, success conditions/i,
     "reasoning must reconstruct the task contract before acting");
   assert.match(SERVER_PROMPT_REASONING, /continues, corrects, replaces, or clarifies/i,
