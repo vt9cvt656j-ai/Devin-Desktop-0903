@@ -64,6 +64,7 @@ const INDEX_HTML = (() => {
 })();
 const APP_CSS = readFileSync(join(HERE, "../src/styles/app.css"), "utf8");
 const GROWTH_SRC = readFileSync(join(HERE, "../src/growth.js"), "utf8");
+const PICKER_SRC = readFileSync(join(HERE, "../src/ui/session-picker.jsx"), "utf8");
 const TAURI_AI = readFileSync(join(HERE, "../src-tauri/src/ai.rs"), "utf8");
 const TAURI_NET = readFileSync(join(HERE, "../src-tauri/src/net.rs"), "utf8");
 const REMOTE_AGENT = readFileSync(join(HERE, "../remote-agent/michael-remote-agent.py"), "utf8");
@@ -3059,8 +3060,12 @@ test("explicit dark theme covers legacy light chat cards and popup surfaces", ()
     "Agent/Chat mode pill should not remain white in explicit dark mode");
   assert.match(APP_CSS, /\[data-theme="dark"\] \.mode-menu,[\s\S]{0,180}background:\s*#18181b/,
     "mode dropdown should follow the app dark theme instead of system-only media queries");
-  assert.match(APP_CSS, /\[data-theme="dark"\] \.session-picker,[\s\S]{0,220}\[data-theme="dark"\] \.memory-center,[\s\S]{0,220}\[data-theme="dark"\] \.atmenu/,
-    "memory/session/@-mention popups need explicit dark-theme coverage");
+  // The session picker moved to a React island and takes its dark surface from the shadcn theme
+  // bridge, so it is no longer in this hand-written group — the remaining popups still are.
+  assert.match(APP_CSS, /\[data-theme="dark"\] \.memory-center,[\s\S]{0,220}\[data-theme="dark"\] \.atmenu/,
+    "memory/@-mention popups need explicit dark-theme coverage");
+  assert.doesNotMatch(APP_CSS, /\.session-picker/,
+    "the picker's surface belongs to the island now, not a hardcoded rule");
   assert.match(APP_CSS, /\[data-theme="dark"\] \.pv-picker,[\s\S]{0,160}\[data-theme="dark"\] \.ex,[\s\S]{0,160}\[data-theme="dark"\] \.wr/,
     "chat-generated preview/explainer cards should have a dark-mode surface");
 });
@@ -4267,20 +4272,28 @@ test("session picker shows true memory stats and searches historical summaries",
     fileEvidenceCount: 1,
     correctionCount: 1,
   });
-  assert.equal(label(st), "145 轮 · 近期 1 条 · 历史摘要 1 段 · 关键节点 1 个 · 文件证据 1 个 · 有效纠正 1 条");
+  assert.equal(label(st), "145 turns · 1 msg · 1 summary · 1 milestones · 1 files · 1 corrections");
+  // Zero-valued extras are dropped rather than printed — "0 summaries · 0 milestones" repeated
+  // on every row was most of the old line's width and distinguished nothing.
+  assert.equal(label({ totalTurns: 3, recentCount: 3, summaryCount: 0, milestoneCount: 0 }),
+    "3 turns · 3 msgs");
   assert.match(searchText(session), /会话记忆不能丢/);
   assert.match(searchText(session), /浅色 google 风格/i);
   assert.equal(preview(session), "最新回答：已经修好弹窗");
-  assert.match(SRC, /旧聊天会压缩成历史摘要继续带入上下文/,
+  // The picker is now a React island (src/ui/session-picker.jsx) styled with shadcn + Tailwind,
+  // so its surface comes from the theme bridge rather than a hardcoded .session-picker rule.
+  assert.match(PICKER_SRC, /stay in context as summaries/,
     "picker subtitle must explain that older chat is summarized rather than lost");
-  assert.match(SRC, /_sessionSearchText\(session\)\.includes\(q\)/,
+  assert.match(SRC, /search: _sessionSearchText\(s\)/,
     "picker search must cover summaries/milestones/file evidence, not only recent messages");
-  assert.match(APP_CSS, /\.session-picker\s*\{[\s\S]*background:\s*#fff;[\s\S]*border:\s*1px solid #dadce0;/,
-    "session picker should use a clean Google-light surface");
-  assert.match(APP_CSS, /\.sp-count\s*\{[\s\S]*color:\s*#1967d2;/,
-    "session count should use Google blue text");
-  assert.match(APP_CSS, /\.sp-count\s*\{[\s\S]*background:\s*#e8f0fe;/,
-    "session count should use a Google light-blue chip");
+  assert.match(PICKER_SRC, /\(e\.search \|\| ""\)\.includes\(q\)/,
+    "the island must filter on that full search text");
+  // The count chip became a per-row CURRENT/RESUME tag plus a resumable total in the footer —
+  // both themed from the token bridge rather than hardcoded Google blue.
+  assert.match(PICKER_SRC, /bg-primary\/10 text-primary/,
+    "the current-session tag should use the theme's primary tint");
+  assert.match(PICKER_SRC, /\{resumableCount\} resumable/,
+    "the picker should still say how many sessions can be restored");
   // The slash popup is now a React island (src/ui/slash-menu.jsx) rather than .atmenu markup
   // shared with the @-file picker — that sharing is what forced the file-row proportions onto
   // three words of text. Same intent as the old .atmenu__item--slash assertion, stronger form:
@@ -4329,11 +4342,12 @@ test("closed chat tabs stay in the session library and can be restored", () => {
 
   const picker = extractFn("_openSessionPicker");
   assert.match(picker, /const entries = _sessionPickerEntries\(\)/);
-  assert.match(picker, /已关闭，点击恢复/);
-  assert.match(picker, /_restoreClosedChatSession\(i\)/,
+  assert.match(picker, /tag: active \? "current" : state === "closed" \? "resume" : ""/,
+    "each row must say whether it is the current session or a restorable one");
+  assert.match(picker, /_restoreClosedChatSession\(row\.index\)/,
     "clicking a closed session row should reopen it as a real chat tab");
-  assert.match(APP_CSS, /\.sp-row\.is-closed\s*\{/,
-    "closed/recoverable rows need a visible state instead of looking like the active tab");
+  assert.match(PICKER_SRC, /\{e\.tag\}/,
+    "closed/recoverable rows need a visible state instead of looking like the active one");
 });
 
 test("memory center uses Michael-owned labels and hides competitor implementation details", () => {
@@ -4342,12 +4356,12 @@ test("memory center uses Michael-owned labels and hides competitor implementatio
     _kgSupersededIds: () => new Set(),
     _kgActiveCorrections: (root) => root ? [{ id: "project-correction" }] : [],
     _sessionMemoryStats: () => ({ totalTurns: 42, recentCount: 8, summaryCount: 2, milestoneCount: 1, fileEvidenceCount: 3 }),
-    _sessionMemoryLabel: () => "42 轮 · 近期 8 条 · 历史摘要 2 段",
+    _sessionMemoryLabel: () => "42 turns · 8 msgs · 2 summaries",
   });
   const cards = model("/repo", {});
   assert.deepEqual(cards.map((card) => card.id), ["session", "project", "global", "rules"]);
   assert.match(cards[0].title, /当前会话记忆/);
-  assert.match(cards[0].badge, /42 轮/);
+  assert.match(cards[0].badge, /42 turns/);
   assert.match(cards[1].source, /Michael 项目知识图谱/);
   assert.match(cards[1].badge, /1 次纠正/);
   assert.match(cards[1].inject, /当前项目/);
