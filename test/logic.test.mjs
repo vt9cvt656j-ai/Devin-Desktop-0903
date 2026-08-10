@@ -299,6 +299,9 @@ const AGENT_TOOL_NAME_ALLOWED = load("_agentToolNameAllowedByProfile", {
 Object.assign(AUTO_LOAD_DEPS, {
   _agentAnswerOnlyInspection: AGENT_ANSWER_ONLY_INSPECTION,
   _agentToolNameAllowedByProfile: AGENT_TOOL_NAME_ALLOWED,
+  // Read from source rather than restated here, so a marker change in main.js cannot silently
+  // diverge from what the budget tests exercise.
+  _REQUEST_MARKERS: loadConst("_REQUEST_MARKERS"),
 });
 const BASENAME = load("basename");
 const FILE_WATCHER_ROOT_PLAN = load("_fileWatcherRootPlan");
