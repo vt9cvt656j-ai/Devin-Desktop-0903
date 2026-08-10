@@ -1988,8 +1988,13 @@ test("remote connection dialog defaults to simple SSH and hides agent setup", ()
     "Sunlogin should be available from the remote desktop launcher");
   assert.match(SRC, /name:\s*"UU 远程"[\s\S]*url:\s*"https:\/\/uuyc\.163\.com\/"/,
     "UU Remote should be available from the remote desktop launcher");
-  assert.match(getMenusSrc, /menu\.remoteDesktop[\s\S]*openRemoteDesktopDialog\(\)/,
-    "Remote desktop should live in the Tools menu instead of the remote machine dialog");
+  // The Tools menu no longer carries it (removed by request). The launcher itself is untouched
+  // and still reachable — window.openRemoteDesktopDialog, and /remote for the machine dialog,
+  // which is a different function.
+  assert.doesNotMatch(getMenusSrc, /menu\.remoteDesktop/,
+    "Remote desktop was removed from the Tools menu and should not reappear there");
+  assert.match(SRC, /window\.openRemoteDesktopDialog = openRemoteDesktopDialog/,
+    "removing the menu entry must not orphan the launcher itself");
   assert.match(remoteDesktopDialogSrc, /remote-dialog__desktop/,
     "Remote desktop should render through its own simple launcher dialog");
   assert.match(remoteDesktopDialogSrc, /class="_rmDeskProvider"[\s\S]*class="_rmDeskDevice"/,
@@ -4276,8 +4281,17 @@ test("session picker shows true memory stats and searches historical summaries",
     "session count should use Google blue text");
   assert.match(APP_CSS, /\.sp-count\s*\{[\s\S]*background:\s*#e8f0fe;/,
     "session count should use a Google light-blue chip");
-  assert.match(APP_CSS, /\.atmenu__item--slash/,
-    "slash command popup needs dedicated, themeable structure instead of inline text styling");
+  // The slash popup is now a React island (src/ui/slash-menu.jsx) rather than .atmenu markup
+  // shared with the @-file picker — that sharing is what forced the file-row proportions onto
+  // three words of text. Same intent as the old .atmenu__item--slash assertion, stronger form:
+  // it must have its own component and its own positioning host, and must not fall back to the
+  // @-menu's surface.
+  assert.match(APP_CSS, /\.slashmenu-host\s*\{[^}]*position:\s*fixed/,
+    "the slash popup needs its own positioning host");
+  assert.doesNotMatch(APP_CSS, /\.atmenu__item--slash|\.atmenu__cmd/,
+    "the slash popup must not be styled through the @-file picker's rules again");
+  assert.match(SRC, /renderSlashMenu\(_slashMenu, \{/,
+    "the slash popup should render through its own island, not innerHTML");
 });
 
 test("closed chat tabs stay in the session library and can be restored", () => {

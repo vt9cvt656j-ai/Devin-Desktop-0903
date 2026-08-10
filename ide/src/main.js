@@ -69,6 +69,7 @@ import {
   isFileMutation, fileMutationTypes, workerScopeField, workerScopeTarget, workspaceMutatingTypes,
 } from "./agent/tool-policy.js";
 import getSharedStore from "./agent/shared-store.js";
+import { renderSlashMenu, destroySlashMenu } from "./ui/mount-slash-menu.jsx";
 import { getCollaborationEngine } from "./agent/collaboration-engine.js";
 
 // Global shared state store for sub-agent collaboration
@@ -54861,7 +54862,6 @@ function getMenus() {
       label: t("menu.tools"),
       items: [
         { label: t("menu.runCurrentFile"), icon: "i-terminal", hint: shortcutLabel("mod+r"), action: () => runCurrentFile() },
-        { label: t("menu.remoteDesktop"), icon: "i-remote", action: () => openRemoteDesktopDialog() },
         { label: t("premiumDb.menu"), icon: "i-premiumdb", action: () => openMichaelPremium() },
         { sep: true },
         { label: t("menu.featureSettings"), icon: "i-gear", action: () => openFeaturePanel("settings") },
@@ -57099,32 +57099,42 @@ function _openSessionPicker() {
 }
 let _slashMatches = [];
 let _slashActive = -1;
+// Host node only — the menu itself is a React island (src/ui/slash-menu.jsx). No .atmenu class:
+// those proportions belong to the @-file picker this used to share markup with.
 const _slashMenu = document.createElement("div");
-_slashMenu.className = "atmenu";
+_slashMenu.className = "slashmenu-host";
 _slashMenu.hidden = true;
 document.body.appendChild(_slashMenu);
-function _hideSlash() { _slashMenu.hidden = true; _slashActive = -1; _slashMatches = []; }
-function _renderSlashActive() { [..._slashMenu.children].forEach((c, i) => c.classList.toggle("is-active", i === _slashActive)); }
+function _hideSlash() {
+  _slashMenu.hidden = true;
+  _slashActive = -1;
+  _slashMatches = [];
+  destroySlashMenu(_slashMenu);
+}
+function _renderSlashActive() {
+  if (_slashMenu.hidden || !_slashMatches.length) return;
+  renderSlashMenu(_slashMenu, {
+    items: _slashMatches,
+    activeIndex: _slashActive,
+    onPick: (i) => _pickSlash(i),
+    onHover: (i) => { _slashActive = i; _renderSlashActive(); },
+  });
+}
 function _updateSlashMenu() {
   const m = /^\/(\w*)$/.exec(promptEl.value);
   if (!m) return _hideSlash();
   const q = m[1].toLowerCase();
   _slashMatches = _SLASH.filter((s) => s.cmd.startsWith(q));
   if (!_slashMatches.length) return _hideSlash();
-  _slashMenu.innerHTML = "";
-  _slashMatches.forEach((s, i) => {
-    const item = document.createElement("div");
-    item.className = "atmenu__item atmenu__item--slash" + (i === 0 ? " is-active" : "");
-    item.innerHTML = `<b class="atmenu__cmd">/${_escHtml(s.cmd)}</b><span class="atmenu__desc">${_escHtml(s.desc)}</span>`;
-    item.addEventListener("mousedown", (e) => { e.preventDefault(); _pickSlash(i); });
-    _slashMenu.appendChild(item);
-  });
   _slashActive = 0;
   const r = promptEl.getBoundingClientRect();
   _slashMenu.style.left = r.left + "px";
-  _slashMenu.style.width = Math.min(r.width, 520) + "px";
+  // Narrower than the prompt: two short columns of text do not need its full width, and the
+  // old 520px cap made three commands look like a dialog.
+  _slashMenu.style.width = Math.min(r.width, 380) + "px";
   _slashMenu.style.bottom = window.innerHeight - r.top + 6 + "px";
   _slashMenu.hidden = false;
+  _renderSlashActive();
 }
 function _pickSlash(i) {
   const s = _slashMatches[i];

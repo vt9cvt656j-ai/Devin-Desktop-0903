@@ -12970,7 +12970,15 @@ select.settings-input { cursor: pointer; padding-right: 8px; }
   .mc-root { display: none; }
 }
 
-/* @file mention + slash-command dropdown in the chat composer. */
+/* Host for the `/` command palette. Positioning only — the menu itself is a React island
+   (src/ui/slash-menu.jsx) styled with Tailwind against the shadcn theme bridge, so there is no
+   surface, radius or colour here that could drift from it. It deliberately does not use .atmenu:
+   those proportions belong to the @-file picker (icons, directory column) and were why three
+   short commands rendered at the size of a dialog. */
+.slashmenu-host { position: fixed; z-index: 9999; }
+.slashmenu-host .ui-island { max-height: 280px; overflow-y: auto; }
+
+/* @file mention dropdown in the chat composer. */
 .atmenu {
   position: fixed; z-index: 9999;
   max-height: 320px; overflow-y: auto;
@@ -12993,12 +13001,6 @@ select.settings-input { cursor: pointer; padding-right: 8px; }
 .atmenu__item img { width: 16px; height: 16px; flex: 0 0 16px; }
 .atmenu__item .at-name { font-weight: 500; }
 .atmenu__item .at-dir { font-size: 11px; color: #5f6368; margin-left: auto; padding-left: 12px; }
-.atmenu__item--slash { gap: 12px; }
-.atmenu__cmd {
-  flex: 0 0 auto;
-  color: #1a73e8;
-  font-weight: 750;
-}
 .atmenu__desc {
   min-width: 0;
   color: #5f6368;
