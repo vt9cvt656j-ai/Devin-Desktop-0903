@@ -32375,7 +32375,6 @@ function openMemoryPanel() {
   const text = { project: root ? _kgText(root) : "", global: _kgText("") };
 
   openMemoryCenterIsland({
-    rootLabel: root || "No folder open — global preferences only",
     hasRoot: !!root,
     initialProject: text.project,
     initialGlobal: text.global,

@@ -28,7 +28,7 @@ export function SessionPicker({ entries = [], resumableCount = 0, onPick, onClos
 
   return (
     <Dialog defaultOpen onOpenChange={(open) => { if (!open) onClose?.(); }}>
-      <DialogContent className="max-w-2xl gap-0 overflow-hidden rounded-2xl p-0 shadow-xl [&>[data-slot=dialog-close]]:right-3 [&>[data-slot=dialog-close]]:top-3 [&>[data-slot=dialog-close]]:grid [&>[data-slot=dialog-close]]:size-8 [&>[data-slot=dialog-close]]:place-items-center [&>[data-slot=dialog-close]]:rounded-full [&>[data-slot=dialog-close]]:text-muted-foreground [&>[data-slot=dialog-close]]:opacity-100 [&>[data-slot=dialog-close]]:hover:bg-accent">
+      <DialogContent className="sm:max-w-2xl gap-0 overflow-hidden rounded-2xl p-0 shadow-xl [&>[data-slot=dialog-close]]:right-3 [&>[data-slot=dialog-close]]:top-3 [&>[data-slot=dialog-close]]:grid [&>[data-slot=dialog-close]]:size-8 [&>[data-slot=dialog-close]]:place-items-center [&>[data-slot=dialog-close]]:rounded-full [&>[data-slot=dialog-close]]:text-muted-foreground [&>[data-slot=dialog-close]]:opacity-100 [&>[data-slot=dialog-close]]:hover:bg-accent">
         <DialogHeader className="space-y-1 px-5 pt-5 pb-3">
           <DialogTitle className="text-base">Sessions</DialogTitle>
           <DialogDescription className="text-[12px]">
