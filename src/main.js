@@ -29846,24 +29846,6 @@ function _missingResearchEvidence(profile, evidence) {
   return missing;
 }
 
-function _agentIncompleteLabel(reason, hitCap = false) {
-  // Every reason here is grounded in an OBSERVED fact. The `required_effect_missing:` and
-  // `research_evidence_missing:` renderers (and their effect-kind label maps) were removed with
-  // the prediction ledger that set them — AGENT_LOOP_REBUILD.md stage 2b. Nothing produces those
-  // reasons any more, so the parser branches were dead.
-  const labels = {
-    // Without this entry a run that wrote code and never compiled it rendered an outcome card
-    // listing the files with no warning at all — the user had no way to know it was unchecked.
-    // 只陈述事实，不把活儿甩回给用户（"请先跑一次构建/测试再当作可用"已删除：跑验证是
-    // 智能体自己的事，不是让用户去补的作业）。
-    code_delivered_unverified: "代码已写入，但本轮没有拿到通过的编译/测试证据（没探测到可用的检查命令，或检查没通过）",
-    ui_verification_missing: "界面改动尚未完成当前版本的浏览器检查，不能确认页面实际效果",
-    // 步数延展/硬顶已拆除：flailing/stalled/extension_limit/ceiling 标签随之删除，
-    // 仅剩 token 预算钳位一种 cap 来源（用户自设，收尾文案走 fallback）。
-  };
-  return labels[reason] || (hitCap ? "运行到本轮上限，已停止空转" : "");
-}
-
 // _buildAgentOutcomeSummary was deleted with the outcome card it rendered.
 
 /** Create or update the live plan panel pinned at the top of the agent message. */
@@ -39732,7 +39714,6 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
   let finalErr = null;
   let summaryText = "";
   let reasoningAll = "";
-  let finalVerificationNote = "";
   let uiVerificationPassed = false;
   let hitCap = false;
   let awaitingUserReply = false;
@@ -42090,23 +42071,9 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
     if (!awaitingUserReply && _codeNeedsVerification && !_currentCodeVerified) {
       verificationPassed = false;
       run._incompleteReason ||= "code_delivered_unverified";
-      const _currentVerifyRecords = (Array.isArray(run._executionEvidence) ? run._executionEvidence : [])
-        .filter((e) => e && e.purpose === "verify" && e.verifierRecognized === true && e.implementationVersion === _implOps);
-      const _lastVerify = _currentVerifyRecords[_currentVerifyRecords.length - 1];
-      if (_lastVerify?.timedOut === true) {
-        finalVerificationNote = "未验证：验证命令超时，未得到通过结论。";
-      } else if (_lastVerify && Number.isFinite(Number(_lastVerify.exitCode)) && Number(_lastVerify.exitCode) !== 0) {
-        finalVerificationNote = `未验证：${String(_lastVerify.command || "验证命令").trim()} 退出 ${Number(_lastVerify.exitCode)}。`;
-      } else if (_verifyExhausted && !_currentVerifyRecords.length) {
-        finalVerificationNote = "未验证：项目没有可运行的自动验证命令。";
-      } else {
-        finalVerificationNote = "未验证：本轮没有获得当前代码版本的有效验证证据。";
-      }
     }
     if (!awaitingUserReply && run.engineering?.ui && didMutate && !uiVerificationPassed) {
       run._incompleteReason ||= "ui_verification_missing";
-      const _uiNote = "未验证：界面改动尚未完成当前版本浏览器检查。";
-      finalVerificationNote = finalVerificationNote ? `${finalVerificationNote}\n${_uiNote}` : _uiNote;
     }
     _setStreaming(session, false);
     _hideControlGlow(); // 灭掉红光：自动化结束（正常/报错/到顶/用户停止 都走这里）
@@ -42141,15 +42108,6 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
       note.textContent = "⚠️ " + _formatAgentFinalError(finalErr);
       body.appendChild(note);
     }
-    const _verificationAlertText = String(finalVerificationNote || "")
-      .replace(/[〔〕]/g, "")
-      .split(/\n+/)
-      .map((line) => line.trim())
-      // Concrete unverified reasons are user-facing evidence, not an internal nudge.
-      // Do not discard timeout / unavailable / UI notes: hiding them made a partial
-      // delivery look like a successful completion.
-      .filter(Boolean)
-      .join("\n");
     // The outcome card used to be appended here: a harness-generated footer restating
     // "构建通过 / 已完成 / 改动文件 / 运行结果 / 验证" underneath whatever the model had just
     // written. The user asked for it gone three separate times — it repeats in a robotic
@@ -42161,18 +42119,7 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
     // (see line ~13309). Text-only (no tool_calls / tool-role messages) so history stays safe
     // for compaction + replay. The triggering user turn was already persisted before the run.
     try {
-      const _parts = [];
-      if (summaryText && summaryText.trim()) _parts.push(summaryText.trim());
-      if (_mutatedFiles && _mutatedFiles.size) _parts.push(`〔本轮改动的文件：${[..._mutatedFiles].join("、")}〕`);
-      if (run._incompleteReason) {
-        const pendingItems = Array.isArray(planSteps)
-          ? planSteps.filter((step) => step.status === "pending" || step.status === "in_progress").map((step) => step.content).filter(Boolean).slice(0, 8)
-          : [];
-        _parts.push(`〔本轮未完成：${run._incompleteReason}${pendingItems.length ? `；剩余计划：${pendingItems.join("、")}` : ""}〕`);
-      }
-      if (finalErr) _parts.push(`〔本轮中断/报错：${_formatAgentFinalError(finalErr)}〕`);
-      if (finalVerificationNote) _parts.push(finalVerificationNote);
-      const _record = _parts.join("\n\n").trim();
+      const _record = String(summaryText || "").trim();
       if (_record) { const _msg = { role: "assistant", content: _record }; if (reasoningAll && reasoningAll.trim()) _msg.reasoning = reasoningAll; session.memory.push(_msg); }
     } catch {
       if (!finalErr && summaryText) { try { session.memory.push({ role: "assistant", content: summaryText }); } catch {} }
