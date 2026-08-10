@@ -61,22 +61,31 @@ echo "syncing source (excluding build output, dev dependencies and .env)"
 # aborted the whole deploy with `unexpected end of file` — after the pre-deploy backup
 # had already run, so it looked like a real failure rather than a flaky connection.
 # rsync resumes from where it got to, so a retry is cheap and idempotent.
+# `status=$?` used to sit AFTER an `if rsync …; then return 0; fi`, where `$?` is the exit status
+# of the *if statement* — which is 0 when the condition failed and there is no else branch. So
+# every failed attempt logged "failed (exit 0)" and, worse, the function returned 0 after all five
+# attempts: the deploy carried on, rebuilt the container from the OLD files, health-checked green,
+# and printed "deployment healthy" having shipped nothing. Observed for real (2026-08-10): five
+# consecutive "unexpected end of file" rsync failures reported as a successful deploy. Capture the
+# real exit code with `|| status=$?`, which is also safe under `set -e`.
 rsync_run() {
-  local attempt status=0
+  local attempt status
   for attempt in 1 2 3 4 5; do
-    if rsync -az --delete-delay -e "$RSYNC_RSH" \
+    status=0
+    rsync -az --delete-delay -e "$RSYNC_RSH" \
       --exclude target --exclude .env --exclude .git \
       --exclude .DS_Store --exclude node_modules \
       --exclude '*.tsbuildinfo' \
       --filter 'protect backups' \
       --exclude '*.bak' --exclude '*.bak.*' --exclude '*.bak-*' --exclude '*.pre-*' \
-      ./ "$REMOTE:$REMOTE_DIR/"; then
+      ./ "$REMOTE:$REMOTE_DIR/" || status=$?
+    if [ "$status" -eq 0 ]; then
       return 0
     fi
-    status=$?
     echo "  sync attempt ${attempt} failed (exit ${status}); retrying"
     sleep $((attempt * 3))
   done
+  echo "source sync failed after 5 attempts (last exit ${status}) — NOT deploying stale files" >&2
   return "$status"
 }
 rsync_run
