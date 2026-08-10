@@ -4201,9 +4201,9 @@ mod tests {
         assert!(web.contains("不能把摘要或本轮 retrieved_at 当成最新事实"));
 
         let current_time = description_for("current_time");
-        assert!(current_time.contains("当前时间只表示本轮请求时间"));
-        assert!(current_time.contains("不证明网页、论文、价格、版本、行情或规则是最新"));
-        assert!(current_time.contains("观测时间或报价时间"));
+        assert!(current_time.contains("only tells you when this request was made"));
+        assert!(current_time.contains("does not prove that a web page, paper, price, version, market quote, or rule is current"));
+        assert!(current_time.contains("observation time, or quote time"));
     }
 
     #[test]
@@ -4223,10 +4223,10 @@ mod tests {
             .pointer("/function/description")
             .and_then(|value| value.as_str())
             .unwrap();
-        assert!(description.contains("简单一步修改不要套仪式"));
-        assert!(description.contains("调查/理解现状、实现改动、真实验证"));
-        assert!(description.contains("复杂只读调查"));
-        assert!(description.contains("不虚构实现步骤"));
+        assert!(description.contains("a simple one-step change does not need the ceremony"));
+        assert!(description.contains("investigating and understanding the current state, making the change, and real verification"));
+        assert!(description.contains("a complex read-only investigation"));
+        assert!(description.contains("without inventing implementation steps"));
     }
 
     #[test]
@@ -4413,13 +4413,15 @@ mod tests {
         );
     }
 
-    #[test]
-    /// 主次纪律：先跑能决定方向的那一步，别把没验证的原因先讲成事实。
+    /// Priority discipline: run the step that decides the direction first, and do not
+    /// state an unverified cause as fact.
     ///
-    /// 真实案例：项目 36 个编译错误，助手开口就断言"根本原因是依赖未安装"，然后去读
-    /// tsconfig.json、读 scraper.ts、再跑 `test -d node_modules`（这才是唯一能决定
-    /// 方向的一步）、最后还做了一次知识检索——而那时项目根本跑不起来。结论先于证据、
-    /// 外围动作先于阻塞项，用户看到的就是"话说得满、事做得虚"。
+    /// Real case: a project had 36 compile errors and the assistant opened by asserting
+    /// "the root cause is that dependencies are not installed", then read tsconfig.json,
+    /// read scraper.ts, then ran `test -d node_modules` (the one step that could actually
+    /// decide the direction), and finally did a knowledge lookup — while the project could
+    /// not run at all. Conclusion before evidence, peripheral moves before the blocker: what
+    /// the user sees is big talk and thin work.
     #[test]
     fn agent_prompt_orders_the_decisive_check_before_the_conclusion() {
         let mut headers = axum::http::HeaderMap::new();
@@ -4453,6 +4455,7 @@ mod tests {
         );
     }
 
+    #[test]
     fn server_assembly_injects_truthfulness_and_community_tools() {
         let mut headers = axum::http::HeaderMap::new();
         headers.insert("x-ide-mode", "agent".parse().unwrap());
@@ -4473,14 +4476,13 @@ mod tests {
             .as_str()
             .expect("assembled request should start with a system prompt");
         assert!(system.contains("Truthfulness and evidence discipline"));
-        assert!(system.contains("专业回答合成层"));
-        assert!(system.contains("低道德化表达"));
-        assert!(system.contains("输入/输出/状态/错误/调用方契约"));
-        assert!(system.contains("时间锚点与最新性"));
-        assert!(system.contains("时间锚点与最新性"));
-        assert!(system.contains("共识是什么"));
-        assert!(system.contains("当前项目事实"));
-        assert!(!system.contains("按任务加载：研究、社区与当前事实"));
+        assert!(system.contains("Professional answer synthesis"));
+        assert!(system.contains("low-moralizing and abuse-boundary rules"));
+        assert!(system.contains("input/output/state/error/caller contract"));
+        assert!(system.contains("Time anchoring and freshness"));
+        assert!(system.contains("what the consensus is"));
+        assert!(system.contains("current project facts"));
+        assert!(!system.contains("# Loaded per task: research, community, and current facts"));
         assert_eq!(
             body["messages"].as_array().map_or(0, Vec::len),
             2,
