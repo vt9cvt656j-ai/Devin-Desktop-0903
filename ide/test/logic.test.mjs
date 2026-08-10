@@ -21680,3 +21680,58 @@ test("the island element reset cannot outrank Tailwind utilities", () => {
   assert.match(TW, /@layer theme,\s*base,\s*components,\s*utilities;/,
     "base must be declared before utilities in the layer order");
 });
+
+test("a session is identified by its first user prompt, not a sequential name", () => {
+  // Claude Code's resume list titles each session with its first user prompt, extracted by a
+  // reader that deliberately skips machinery the user never typed
+  // (claude-code-analysis/04i-session-storage-resume.md §6.1, extractFirstPromptFromHead).
+  // Ours named every row "Chat 1", which identifies nothing — a list where each entry carries
+  // the same label cannot be scanned, which is exactly what was reported.
+  const firstPrompt = load("_sessionFirstPrompt", {
+    _REQUEST_MARKERS: loadConst("_REQUEST_MARKERS"),
+    _SESSION_TITLE_SKIP: loadConst("_SESSION_TITLE_SKIP"),
+  });
+
+  assert.equal(
+    firstPrompt({ memory: { transcript: [
+      { role: "user", content: "fix the login redirect" },
+      { role: "assistant", content: "done" },
+    ] } }),
+    "fix the login redirect",
+    "the first user message is the session's identity");
+
+  // Assistant output is not the ask.
+  assert.equal(
+    firstPrompt({ memory: { transcript: [
+      { role: "assistant", content: "I have finished the refactor" },
+      { role: "user", content: "now add tests" },
+    ] } }),
+    "now add tests");
+
+  // The exclusions, each one a thing that would otherwise become the title.
+  assert.equal(
+    firstPrompt({ memory: { transcript: [
+      { role: "user", content: "<command-name>/sessions</command-name>" },
+      { role: "user", content: "[PLAN_REVIEW] gaps found" },
+      { role: "user", isMeta: true, content: "system reminder" },
+      { role: "user", isCompactSummary: true, content: "earlier conversation summary" },
+      { role: "user", content: [{ type: "tool_result", content: "ok" }] },
+      { role: "user", content: "the actual question" },
+    ] } }),
+    "the actual question",
+    "command wrappers, orchestrator tags, meta, compact summaries and tool_result blocks are all skipped");
+
+  // The orchestrator wraps the real request in the 📌 boundary; the title is the ask, not the wrapper.
+  const marker = loadConst("_REQUEST_MARKERS")[0];
+  assert.equal(
+    firstPrompt({ memory: { transcript: [
+      { role: "user", content: `project context here\n${marker}\n\nbuild the parser` },
+    ] } }),
+    "build the parser",
+    "the request marker is unwrapped so the title is what the user actually typed");
+
+  // A brand-new session has no prompt yet, so the caller can fall back to the sequential name.
+  assert.equal(firstPrompt({ memory: { transcript: [] } }), "");
+  assert.match(SRC, /name: _sessionFirstPrompt\(s\) \|\| s\.name/,
+    "the row title must prefer the first prompt and fall back to the name");
+});
