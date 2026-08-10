@@ -34296,20 +34296,22 @@ function _modelEventHasProgress(ev) {
  *   - "continue": prose already reached the user → prefill it and continue. The text is not
  *     replayed (prompt-cached), and a tool call that was only half-streamed (its JSON never closed,
  *     so it never ran) is re-issued cleanly as the model keeps going.
- *   - "rerequest": a tool call was mid-stream with no preceding prose. It never ran (its JSON
- *     never closed), and nothing visible reached the user, so re-run the turn cleanly — the model
- *     re-issues the tool call. This is the case that used to abandon the round with "本轮不会重放".
+ *   - "rerequest": NOTHING was delivered to the user and nothing executed — the drop landed during
+ *     reasoning, or mid a tool call whose JSON never closed (so it never ran). Re-run the turn
+ *     cleanly after a full state reset. This is the case that abandoned the round with
+ *     "本轮不会重放", and with a reasoning model (long thinking phase = the widest window for a
+ *     transient drop) it is BY FAR the most common one.
  *
- * A reasoning-only drop (the model was still thinking, no prose and no tool call yet) deliberately
- * falls through to "stop": re-requesting would make a reasoning model re-think from scratch and
- * stack a doubled, ever-growing "思考中" — which reads as "keeps thinking, never acts". The
- * reasoning is not user-facing deliverable, so abandoning honestly beats looping.
+ * A previous revision routed the reasoning-only drop to "stop", on the theory that re-requesting
+ * would stack a second "思考中" card. That was wrong twice over: it turned the commonest
+ * recoverable drop into an abandoned round, and the duplicate-thinking problem was already solved
+ * here — the tool-arg repair retry does a full clean-slate reset (prose, reasoning, think cards,
+ * write previews) before its fresh attempt. The caller does the same reset before re-requesting,
+ * so a retry cannot duplicate anything.
  */
-function _streamResumeMode({ eagerExecuted, hasProse, hadToolFragment }) {
+function _streamResumeMode({ eagerExecuted, hasProse }) {
   if (eagerExecuted) return "stop";
-  if (hasProse) return "continue";
-  if (hadToolFragment) return "rerequest";
-  return "stop";
+  return hasProse ? "continue" : "rerequest";
 }
 
 async function _runModelRequestWithRetry({
@@ -35970,15 +35972,16 @@ async function _agentModelTurn({ config, messages, toolSchemas, toolRegistry = n
          */
         buildResumeInvoke: async ({ resume, resumeLimit }) => {
           const eagerExecuted = [...byIndex.values()].some((e) => e && e._eagerNotified);
-          const hadToolFragment = byIndex.size > 0; // captured before the clear below
           // prefill 不允许结尾有空白，否则上游会直接 400。
           const partial = String(acc || "").replace(/\s+$/, "");
-          const mode = _streamResumeMode({ eagerExecuted, hasProse: !!partial, hadToolFragment });
+          const mode = _streamResumeMode({ eagerExecuted, hasProse: !!partial });
           if (mode === "stop") return null; // an eager write already landed — do not risk a re-write
-          // Nothing executed → the half-streamed, unclosed tool call never ran. Drop the fragments
-          // so they cannot leak into the resumed turn's collection; the continuation re-emits them.
-          byIndex.clear();
           if (mode === "continue") {
+            // The half-streamed, unclosed tool call never ran. Drop the fragments so they cannot
+            // leak into the resumed turn; the continuation re-emits them. The prose stays — it is
+            // the prefill the model continues from.
+            for (const [, e] of byIndex) { try { _removeWritePreview(e, "resume"); } catch {} }
+            byIndex.clear();
             const resumeMsgs = [..._l0Msgs, { role: "assistant", content: partial }];
             showAgentRetryToast(
               `连接中断，正在从断点继续（${resume}/${resumeLimit}）——已生成的内容会保留，不重跑本轮`,
@@ -35986,9 +35989,24 @@ async function _agentModelTurn({ config, messages, toolSchemas, toolRegistry = n
             );
             return (cb) => backend.aiChatWithTools(_turnConfig, resumeMsgs, _l0Tools, cb);
           }
-          // mode === "rerequest": nothing visible streamed yet → re-run the turn cleanly.
+          // mode === "rerequest": nothing reached the user and nothing executed (a reasoning-phase
+          // drop, or a tool call whose JSON never closed). Full clean slate, then re-run the turn.
+          // This mirrors the tool-arg repair retry reset below — without it a fresh attempt would
+          // stack a second thinking card / duplicate prose, which is precisely why an earlier
+          // revision wrongly abandoned this case instead of retrying it.
+          for (const [, e] of byIndex) { try { _removeWritePreview(e, "resume"); } catch {} }
+          byIndex.clear();
+          acc = ""; reasoningAcc = ""; reasoningAll = "";
+          _inlineThinkState.inThink = false;
+          _inlineThinkState.hold = "";
+          _inlineThinkState.answerStarted = false;
+          cancelPendingRender();
+          if (streamEl) { streamEl.remove(); streamEl = null; }
+          for (const el of _turnThinkCards) { try { el.remove(); } catch {} }
+          _turnThinkCards.length = 0;
+          reasoningEl = null;
           showAgentRetryToast(
-            `连接中断，正在重新发起本轮（${resume}/${resumeLimit}）——尚无内容产出，不会重复`,
+            `连接中断，正在重试本轮（${resume}/${resumeLimit}）——尚无内容产出，不会重复`,
             true,
           );
           return (cb) => backend.aiChatWithTools(_turnConfig, _l0Msgs, _l0Tools, cb);
