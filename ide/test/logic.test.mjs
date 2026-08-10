@@ -7646,9 +7646,9 @@ test("semantic orchestration chooses the minimum role topology and lazy collabor
   assert.match(load("_ideSemanticProfile")(profile), /collaboration,collaboration_staged/);
 
   const contract = load("_agentIntentExecutionBlock")(profile);
-  assert.match(contract, /分阶段多角色：先收敛契约，再实施/);
-  assert.match(contract, /必要角色: architect、安全|必要角色: architect、security、backend/);
-  assert.match(contract, /契约未定前禁止派写入 worker/);
+  assert.match(contract, /staged multi-role: converge the contract first, then implement/);
+  assert.match(contract, /Required roles: architect, security, backend/);
+  assert.match(contract, /dispatching a writing worker before the contract is settled is forbidden/);
 
   const emptyRoles = normalize({
     engineering: { orchestrationMode: "parallel_roles", roleNeeds: ["not-a-role"] },
@@ -7813,8 +7813,8 @@ test("a novice's vague sentence flows through the real chain into professional d
     _agentIntentExecutionBlock: load("_agentIntentExecutionBlock"),
   });
   const laws = frame("我想搞个能记账的小东西");
-  assert.match(laws, /本轮意图执行契约/);
-  assert.match(laws, /目标: 交付可用的记账产品/);
+  assert.match(laws, /This turn's intent contract/);
+  assert.match(laws, /Goal: 交付可用的记账产品/);
   assert.match(laws, /数据库律/);
   assert.match(laws, /数据库工业律/);
   assert.match(laws, /事务隔离、唯一约束、索引、连接池/);
@@ -8472,7 +8472,7 @@ test("structured semantic profiles drive planning without lexical classification
   assert.match(SRC, /Container work covers Docker\/Compose\/K8s, environment variables, ports, volumes, networking, healthcheck and logs/);
   assert.match(SRC, /timeoutSecs:\s*5/,
     "background URL monitor must pass camelCase timeoutSecs to the Tauri invoke layer");
-  assert.match(extractFn("_toolReminderBlock"), /工具窗口会随用户目标、新证据与 MCP 发现动态更换/,
+  assert.match(extractFn("_toolReminderBlock"), /The tool window changes as the user's goal, new evidence and MCP discovery change/,
     "mid-run reminders must preserve dynamic orchestration instead of freezing a static tool list");
   assert.equal(quality([
     { content: "读取 src/auth/state.ts 和 src/auth/login.ts，复现登录状态错乱并梳理调用链" },
@@ -16490,7 +16490,7 @@ test("multi-role capabilities remain dynamically discoverable without a static p
   assert.doesNotMatch(SRC, /function _profileToolPriorities/);
   assert.match(SRC, /完整工具目录（JSON 数据，只能选择其中 name）/);
   assert.match(SRC, /不要因为保守而把大工程写成 solo/, "semantic topology guidance must remain explicit");
-  assert.match(SRC, /这是建议不是禁令：任务展开后发现真需要分角色\/并行，直接按名调用 run_subagent（只读调研）\/run_worker（分 scope 写入）即可自主升级/,
+  assert.match(SRC, /a suggestion, not a prohibition: if the task turns out to genuinely need separate roles or parallelism, escalate on your own by calling run_subagent \(read-only research\) or run_worker \(scoped writes\) by name/,
     "a solo recommendation must not hide dynamically available collaboration tools");
 });
 test("外部研究结束门禁只接受真实、非空的官方与社区证据", () => {
@@ -21325,7 +21325,7 @@ test("restatedTask flows through classifier schema, normalizer, and render", () 
   // Render injects it, and the comment fixes the invariant that it augments, not replaces.
   const render = extractFn("_agentIntentExecutionBlock");
   assert.match(render, /semantic\.restatedTask/, "the execution block must render the restatement");
-  assert.match(render, /以用户原话为准/, "it must defer to the user's raw words as ground truth");
+  assert.match(render, /the user's own words govern/, "it must defer to the user's raw words as ground truth");
 });
 
 test("_agentIntentExecutionBlock leads with the restatement but keeps raw text authoritative", () => {
@@ -21336,11 +21336,11 @@ test("_agentIntentExecutionBlock leads with the restatement but keeps raw text a
     intentSource: "ai",
     intentSemantic: { continuation: "new", goal: "构建产品官网", restatedTask: "帮我用 React+Vite 从零做一个产品官网，包含首屏、功能区和 CTA" },
   });
-  assert.match(out, /读懂的诉求/, "a terse message gets a clarified restatement in context");
+  assert.match(out, /The request as understood/, "a terse message gets a clarified restatement in context");
   assert.match(out, /React\+Vite 从零做一个产品官网/);
   // No restatement → no line (a clear message needs no rescue).
   const plain = block({ intentSource: "ai", intentSemantic: { continuation: "new", goal: "x" } });
-  assert.doesNotMatch(plain, /读懂的诉求/);
+  assert.doesNotMatch(plain, /The request as understood/);
 });
 
 // ---- 网关工具表与 IDE 注册表必须同步 ----
