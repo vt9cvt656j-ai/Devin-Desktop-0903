@@ -7483,19 +7483,23 @@ test("设计工艺块 token 瘦身：服务端设计层在场时只留锚点，�
     "瘦身条件必须是 L0 开启且旗标头已送达");
 });
 
-test("计划质量判定：AI 语义评审主判，正则记分卡只做 fail-open 兑底", () => {
-  // 用户红线：语义判断不得用关键词/正则硬猜——记分卡会误杀“意思到位用词不同”的好
-  // 计划、放行堆满魔法词的空计划。主判改为 _aiPlanReview（看意思、fail-open），
-  // 记分卡仅在 AI 不可用时兑底（零回退纪律）。
-  assert.match(SRC, /async function _aiPlanReview\(/);
-  assert.match(SRC, /评审看意思不看用词/);
-  assert.match(SRC, /run\._planReviewSig !== _planSig/, "同一份计划只评一次，计划变更后重评");
-  assert.match(SRC, /\[PLAN_REVIEW\] 计划评审发现缺口/);
-  // 同步路径不再挂记分卡结论：PLAN_NEEDS_WORK 只剩 AI 不可用时的兑底分支。
-  assert.doesNotMatch(SRC, /const planIssue = _requiredPlanIssue\(run, planSteps\);/,
-    "update_plan 的同步结果不得再由正则记分卡直接审判");
-  assert.match(SRC, /review === null[\s\S]{0,200}_requiredPlanIssue\(run, _reviewSteps\)/,
-    "AI 不可用时必须回退记分卡，不得裸奔");
+test("nothing tells the agent to expand a plan it already wrote", () => {
+  // A second model reviewed each plan and, whenever it "found gaps", injected
+  // [PLAN_REVIEW] … 用 update_plan 补成完整计划 into the next tool result. The agent complied
+  // by re-sending a whole new plan, so 3 steps became 9 that were not a superset of the
+  // original — completion state went with the discarded steps, and the added steps were work
+  // nobody had asked for. Observed live on "fix the GUI and run it", which grew a
+  // boundary-condition test matrix and then reported 3/6 done.
+  //
+  // A reviewer that can only ever answer "add more" is a ratchet, not quality control.
+  // Comments are not code — the note explaining the removal names what it removed.
+  const code = stripJsComments(SRC);
+  for (const gone of [/_aiPlanReview/, /_requiredPlanIssue/, /_planQualityIssue\s*\(/, /_planQualityNote\s*=/]) {
+    assert.doesNotMatch(code, gone,
+      `${gone} is part of the plan-expansion ratchet and must not come back`);
+  }
+  assert.doesNotMatch(code, /PLAN_REVIEW|PLAN_NEEDS_WORK/,
+    "no plan-review verdict may be injected into a tool result");
 });
 
 test("正则字面量免疫：编辑工具损坏形态禁止出现，惯犯站点必须用 \\u000a 写法", () => {
@@ -8106,7 +8110,6 @@ test("agent semantic profiles do not authorize or deny real tool execution", () 
 test("structured semantic profiles drive planning without lexical classification", () => {
   const requiresPlan = load("_runRequiresPlan");
   const hasCategoryArchitecture = load("_uiPlanHasCategoryArchitecture");
-  const quality = load("_planQualityIssue", { _uiPlanHasCategoryArchitecture: hasCategoryArchitecture });
   const base = { applies: true, substantial: false, requiresPlan: false };
 
   assert.equal(requiresPlan({ engineering: { ...base, substantial: true, requiresPlan: true } }), true);
@@ -8227,251 +8230,37 @@ test("structured semantic profiles drive planning without lexical classification
     requiresPlan: true,
   };
 
-  assert.match(quality([], true, "mutate"), /尚未创建计划/);
-  assert.match(quality([], true, "mutate"), /尚未创建计划/);
-  assert.match(quality([
-    { content: "读取认证模块并定位调用链" },
-    { content: "修改登录状态机并同步调用方" },
-  ], true, "mutate"), /失败\/边界\/兼容处理|交付\/验收标准|验证\/测试/);
-  assert.match(quality([
-    { content: "搭建 Node CLI 与来源配置，定义统一游戏资料模型" },
-    { content: "实现 RSS 抓取、去重、失败隔离与 JSON 落盘" },
-    { content: "补齐文档和示例配置，运行真实验证" },
-  ], true, "mutate"), /调查\/理解现状/,
-    "three slogan-like plan items from the UI screenshot must be rejected");
-  assert.equal(quality([
-    { content: "读取 src/auth.ts 和 test/auth.test.ts，复现 npm test -- auth 报错，沿调用链/数据流核对 AuthSession API contract、调用方契约和兼容边界" },
-    { content: "修改 src/auth.ts 做最小修复，补 null/timeout/fallback 失败路径，运行 npm test -- auth && npm run typecheck 记录 exit code 0，并更新 README 验收标准" },
-  ], true, "mutate"), "",
-    "a short but complete two-step plan must pass; quality is coverage/evidence, not a fixed step count");
-  assert.match(quality([
-    { content: "读取登录模块并看看代码" },
-    { content: "修改登录逻辑" },
-    { content: "运行测试" },
-  ], true, "mutate", bugFixProfile), /复现\/日志\/失败证据|根因定位\/调用链|同一失败路径回归验证/,
-    "bug fixes must not pass with read/change/test slogans");
-  assert.match(quality([
-    { content: "用 npm test -- login 复现报错，记录 stderr 和 exit code" },
-    { content: "读取 src/auth/callback.ts 和 src/auth/session.ts，沿调用链定位根因" },
-    { content: "核对 AuthSession schema、callback API contract、调用方参数映射和兼容边界" },
-    { content: "修改 src/auth/callback.ts，做最小补丁、null guard 和 fallback，并同步调用方契约" },
-    { content: "补齐空 token、重复回调、超时和失败回退的聚焦单元测试" },
-    { content: "更新 README 验收标准和修复说明" },
-  ], true, "mutate", bugFixProfile), /同一失败路径回归验证/,
-    "a bug fix plan that never reruns the original failing path is still incomplete");
-  assert.equal(quality([
-    { content: "用 npm test -- login 复现同一报错路径，记录 stderr、stdout、exit code 和失败用例 login callback" },
-    { content: "读取 src/auth/callback.ts、src/auth/session.ts 和 test/auth.test.ts，沿调用链/数据流定位根因与状态机竞态" },
-    { content: "核对 AuthSession schema、callback API contract、调用方参数映射和旧版本兼容边界" },
-    { content: "修改 src/auth/callback.ts 做最小补丁：补 null/undefined guard、fallback，并同步 src/auth/session.ts 调用方契约" },
-    { content: "补齐空 token、重复回调、超时和失败回退的聚焦单元测试" },
-    { content: "重跑同一失败路径 npm test -- login callback && npm run typecheck，记录 stdout/stderr 和 exit code 0" },
-    { content: "更新 README 验收标准、影响范围和修复结果说明" },
-  ], true, "mutate", bugFixProfile), "");
-  assert.match(quality([
-    { content: "搭建 Vite React 官网骨架与项目脚本" },
-    { content: "实现 Google+mac 浅色 IDE 官网页面与响应式样式" },
-    { content: "安装依赖并构建验证" },
-  ], true, "mutate", websiteProfile), /项目真实内容\/数据源取证|页面信息架构\/区块与文案|视觉系统\/配色\/排版令牌/,
-    "three-line website plans are too thin for a from-scratch UI project");
-  assert.match(quality([
-    { content: "检查空项目根目录、确认 package.json/vite 配置目标和 src/ public/ 文件结构" },
-    { content: "定义官网页面内容契约：导航、Hero、核心功能区、AI 工作流区、CTA、页脚文案与按钮状态" },
-    { content: "建立 Google+mac 白色浅色视觉系统：配色、字体排版、间距、圆角、阴影与浅玻璃 token" },
-    { content: "搭建 Vite React 入口文件、组件拆分和 src/App.jsx / src/styles.css 布局骨架" },
-    { content: "实现桌面与移动端响应式断点、hover/focus/键盘可达、空资源和图标加载失败回退" },
-    { content: "运行 npm install、npm run build，并记录 stdout/stderr、退出码和 dist 产物" },
-    { content: "启动 dev server，用 browser viewport 1440x900 与 390x844 截图验证页面、控制台和网络无异常，汇总验收结果" },
-  ], true, "mutate", websiteProfile), /项目真实内容\/数据源取证|shadcn\/ui 或 Radix 语义组件映射|Tailwind 调色板\/theme token/,
-    "front-end project plans must read real content and name the component/token system, not merely promise pretty styling");
-  assert.match(quality([
-    { content: "读取 README、package.json、PRODUCT_WIKI.md、src/data，取证 IDE 真实功能、产品文案与可用内容源" },
-    { content: "定义官网页面内容契约：导航、Hero、核心功能区、AI 工作流区、CTA、页脚文案与按钮状态" },
-    { content: "建立 Google+mac 白色浅色视觉系统：Tailwind palette/theme.extend/CSS variables、字体排版、间距、圆角、阴影与浅玻璃 token" },
-    { content: "映射 shadcn/ui + Radix primitives 语义组件：Button、Card、Tabs、Accordion、Progress、Dialog 到页面区块" },
-    { content: "搭建 Vite React 入口文件、组件拆分和 src/App.jsx / src/styles.css 布局骨架" },
-    { content: "实现桌面与移动端响应式断点、hover/focus/键盘可达、空资源和图标加载失败回退" },
-    { content: "运行 npm install、npm run build，并记录 stdout/stderr、退出码和 dist 产物" },
-    { content: "启动 dev server，用 browser viewport 1440x900 与 390x844 截图验证页面、控制台和网络无异常，汇总验收结果" },
-  ], true, "mutate", websiteProfile), /用户附图\/真实图片素材使用计划/,
-    "front-end project plans must say how user screenshots or real project images/assets will be used");
-  assert.equal(quality([
-    { content: "读取 README、package.json、PRODUCT_WIKI.md、src/data、public/assets 和用户附图/现有截图素材，取证 IDE 真实功能、产品文案、真实图片与可用内容源" },
-    { content: "调用 knowledge_search domain=michael-design 检索 IDE SaaS 品类的 information architecture、media asset、motion 和 responsive 蓝本；再读取 GitHub maintainer discussion、官方文档与 Stack Overflow，确认 React/Tailwind 版本兼容前提，采用语义 token + 品类信息架构模式并规避通用 Hero/Features 模板坑" },
-    { content: "按 IDE SaaS 业务品类定义至少 7 个差异化内容区块：工作区、AI 工作流、模型与工具、远程开发、调试、团队协作、案例与资源，写满具体文案" },
-    { content: "规划 michael-design 真实图片素材、一个 .mp4 视频和一个 .gif 动态媒体在首屏、工作流和案例区的具体落点与 fallback" },
-    { content: "数据库 = 不需要：本官网读取构建期产品内容，无账户、提交或跨设备持久化业务" },
-    { content: "建立 Google+mac 白色浅色视觉系统：Tailwind palette/theme.extend/CSS variables、font-display/body 字体搭配、text-5xl/3xl/base 字阶、leading-tight/relaxed 行高、max-w-prose 阅读宽度、圆角、阴影与浅玻璃 token" },
-    { content: "设计 12 列 grid / max-w-7xl container、section py-24、gap-8/12、移动优先布局密度和桌面/手机信息层级" },
-    { content: "映射 shadcn/ui + Radix primitives 语义组件：Button、Card、Tabs、Accordion、Progress、Dialog 到页面区块" },
-    { content: "搭建 Vite React 入口文件、组件拆分和 src/App.jsx / src/styles.css 布局骨架" },
-    { content: "实现 hover 微交互与 whileInView stagger 分区入场两层动效，并用 useReducedMotion/prefers-reduced-motion 提供静态降级" },
-    { content: "实现桌面与移动端响应式断点、hover/focus-visible/active/disabled/loading/empty/error/success 状态、键盘可达、空资源和图标加载失败 fallback" },
-    { content: "运行 npm install、npm run build，并记录 stdout/stderr、退出码和 dist 产物" },
-    { content: "启动 dev server，用 browser viewport 1440x900 与 390x844 截图验证页面、控制台和网络无异常，汇总验收结果" },
-  ], true, "mutate", websiteProfile), "");
-  assert.match(quality([
-    { content: "读取页面和现有网络相关代码，确认目标 URL 与数据入口" },
-    { content: "打开页面观察请求" },
-    { content: "重放接口并验证响应" },
-    { content: "记录结果" },
-    { content: "汇总交付" },
-  ], true, "execute", captureProfile), /抓包模式\/流量取证策略/,
-    "network-capture plans must choose isolated/system/background capture mode before acting");
-  assert.equal(quality([
-    { content: "预检 mitmproxy、CA 信任、端口 8080、权限环境和目标 URL 是否可访问" },
-    { content: "读取目标页面入口、路由与数据契约，确认需要触发的接口和边界参数" },
-    { content: "选择抓包模式：网页自动化执行 capture_start mode=isolated_browser，不改系统代理" },
-    { content: "执行 browser navigate fresh=true 打开页面，nodes/click/type 触发真实请求" },
-    { content: "执行 capture_flows include_body=false limit=50 找真实 host/path，再用 capture_replay 重放" },
-    { content: "若超时、无流量、筛选为空、CA 未信任，读取错误日志/输出并切换 background/system 回退" },
-    { content: "验证接口响应状态、关键字段和错误路径，汇总可复现步骤与限制" },
-  ], true, "execute", captureProfile), "");
-  assert.match(quality([
-    { content: "读取 package.json 确认 dev 脚本和端口约定" },
-    { content: "启动 npm run dev 等服务 ready" },
-    { content: "打开浏览器验证页面" },
-    { content: "汇总输出" },
-  ], true, "execute", waitProfile), /后台持续任务\/等待监听策略/,
-    "interactive service plans must not hide foreground waiting behind run_cmd slogans");
-  assert.equal(quality([
-    { content: "读取 package.json 和 vite.config.js，确认 npm run dev 脚本、端口和工作区根目录" },
-    { content: "用 run_in_terminal 启动 npm run dev 到 IDE 真实终端 tab，避免 run_cmd 前台硬等或中断用户终端" },
-    { content: "用 read_terminal 读取启动日志、localhost URL、退出状态和错误输出" },
-    { content: "用 background_monitor check_type=port pattern=5174 挂后台轮询端口 ready，超时后再检查日志/端口状态" },
-    { content: "browser navigate fresh=true 打开本 run 绑定的 URL，nodes/check 验证主交互" },
-    { content: "汇总验证结果、终端状态、URL、console/network 异常和后续 stop_terminal 标准" },
-  ], true, "execute", waitProfile), "");
-  assert.match(quality([
-    { content: "读取代码库并了解架构" },
-    { content: "实现工业级 agent 能力" },
-    { content: "运行测试" },
-  ], true, "mutate", googleScaleProfile), /项目地图\/模块边界|变更半径\/调用方影响|验证矩阵\/CI式检查|生产级发布\/回滚\/可观测性边界/,
-    "industrial project plans must be real engineering work, not three slogans");
-  assert.equal(quality([
-    { content: "盘点项目地图：读取 README、package.json、workspace/monorepo 配置、src/、server/、test/、CI 和部署配置；读取 GitHub maintainer discussions、官方文档和 Stack Overflow，确认模块边界、服务入口、脚本、当前版本兼容前提与现有约定，采用薄切片编排模式并规避跨服务全量重写的坑" },
-    { content: "梳理变更半径：用 semantic_search/lsp_references 沿 agent 编排入口、API contract、数据库迁移、缓存/权限/队列调用方和跨服务数据流确认受影响范围" },
-    { content: "按薄切片修改 agent 基座能力：项目画像、工具编排、验证门禁、日志/API/DB/Git 实时证据链，并保留旧接口兼容与失败回退" },
-    { content: "补生产级边界：发布/回滚路径、feature flag/配置兼容、迁移风险、日志/指标/告警/可观测性和权限失败边界" },
-    { content: "执行验证矩阵：npm test、npm run typecheck、npm run build、集成/API/DB/契约测试、迁移测试和 smoke，记录 stdout/stderr 与 exit code" },
-    { content: "交付验收报告：列出改动文件、验证结果、未覆盖风险和回滚说明" },
-  ], true, "mutate", googleScaleProfile), "");
-  assert.match(quality([
-    { content: "读取项目并看看业务代码" },
-    { content: "修业务逻辑、数据库、容器和网站" },
-    { content: "跑测试并交付" },
-  ], true, "mutate", businessIndustrialProfile), /业务域\/角色\/状态机\/业务规则|业务漏洞\/越权\/滥用\/幂等并发|功能完整性\/验收清单|数据库选型\/引擎适配|容器\/Docker\/编排方案|网站生产交付/,
-    "business-grade industrial plans must cover domain rules, abuse paths, DB/container/runtime, and complete delivery");
-  assert.equal(quality([
-    { content: "盘点项目地图：读取 README、package.json、docker-compose.yml、Dockerfile、src/、server/、db/migrations、public/ 和 CI/部署配置；读取 GitHub maintainer discussions、官方文档和 Stack Overflow，确认模块边界、服务入口、脚本、容器依赖、版本兼容前提，采用分层契约模式并规避跨域硬编码与全量重写的坑" },
-    { content: "调用 knowledge_search domain=michael-design 检索电商业务的信息架构、media asset、motion 与 responsive 蓝本，记录采用的栏目和真实素材 URL" },
-    { content: "建立业务域模型：梳理订单/支付/库存/会员/租户角色权限、业务规则、主流程/异常流程、状态机和业务不变量" },
-    { content: "梳理变更半径：用 semantic_search/lsp_references 沿 UI、API contract、service、ORM、数据库 schema、队列/缓存调用方和跨服务数据流确认受影响范围" },
-    { content: "检查业务漏洞/滥用：越权/IDOR、重复提交/支付、重放、库存超卖、金额篡改、幂等、并发竞态、限流和风控绕过，并补权限回归断言" },
-    { content: "重整架构分层：明确领域模型、边界上下文、模块边界、接口边界、依赖方向、职责所有权，保留兼容层和失败回退" },
-    { content: "设计数据库选型和引擎适配：Postgres/Redis/搜索/向量数据库按读写模式分层，补事务隔离、唯一约束、索引、迁移/回滚、连接池、备份恢复和 ORM 映射" },
-    { content: "完善容器方案：Dockerfile、docker compose、k8s/devcontainer 环境变量、secret、端口、volume、网络、service dependency、healthcheck/readiness、日志和迁移启动顺序" },
-    { content: "按电商用户旅程规划至少 7 个差异化内容区块：分类导航、场景导购、商品比较、编辑精选、会员权益、配送售后、品牌故事与社区内容，并写满真实文案" },
-    { content: "补网站生产交付：用户附图/现有截图/真实图片素材、真实内容/文案、视觉系统/配色/排版令牌、shadcn/ui + Radix 组件映射、字体层级/行高/阅读宽度、路由/404/SEO metadata、表单提交/API 错误、加载/空/错误状态、性能基础、无障碍、响应式和浏览器视口验收" },
-    { content: "实现 hover/press 微交互、whileInView stagger 分区入场和滚动进度两层动效，并通过 useReducedMotion/prefers-reduced-motion 降级" },
-    { content: "实现薄切片改动并同步 UI/API/DB/后台任务/日志/权限契约，逐项对照需求核对清单，避免丢字段、丢状态、丢功能" },
-    { content: "执行验证矩阵：npm test、npm run typecheck、npm run build、integration/e2e/contract/migration/smoke、browser、http_request 和 docker compose smoke，记录 stdout/stderr 与 exit code" },
-    { content: "补生产边界：发布/回滚方案、feature flag/配置兼容、迁移风险、日志/指标/告警/可观测性和未覆盖风险，输出验收标准" },
-  ], true, "mutate", businessIndustrialProfile), "");
-  assert.match(quality([
-    { content: "归纳用户需求" },
-    { content: "搭一个项目" },
-    { content: "跑测试交付" },
-  ], true, "mutate", promptRescueProfile), /烂提示词救援\/意图归纳\/默认假设|模糊需求验收清单\/范围边界|可维护\/可升级架构默认值|反硬编码\/复用\/扩展点/,
-    "vague or bad prompts must be rescued into assumptions, acceptance criteria, and maintainable defaults");
-  assert.equal(quality([
-    { content: "盘点项目地图：读取 README、package.json、src/、server/、test/、CI 和部署配置；读取 GitHub maintainer discussions、官方文档和 Stack Overflow，确认模块边界、入口、脚本、配置、服务、版本兼容前提与现有约定，采用可反悔的薄切片方案并规避散落硬编码的坑" },
-    { content: "提示词救援：按用户原话做意图归纳和需求整理，列默认假设、默认方案、可反悔选择、范围边界/不做什么，缺关键信息时只做非阻塞澄清" },
-    { content: "建立验收标准和需求覆盖 checklist：主流程、边界场景、空状态、加载态、错误态、权限和端到端 smoke，逐项映射到 UI/API/DB/测试" },
-    { content: "梳理变更半径：用 semantic_search/lsp_references 沿 API contract、schema、调用方、状态和缓存数据流确认影响范围" },
-    { content: "设计可维护/可升级架构默认值：清晰分层、模块边界、组件边界、服务边界、typed interface、schema、集中配置/env、feature flag、README 文档、测试和迁移版本策略" },
-    { content: "落实反硬编码/复用/扩展点：统一配置、单一事实源、公共组件/公共服务、adapter 可替换扩展点，避免魔法值、散落路径、端口、颜色和业务规则" },
-    { content: "实现薄切片功能并同步契约、调用方、失败回退和兼容路径" },
-    { content: "执行验证矩阵：npm test、npm run typecheck、npm run build、integration/e2e/smoke，记录 stdout/stderr 和 exit code" },
-    { content: "补生产边界：发布/回滚、配置兼容、日志/指标/告警、可观测性和未覆盖风险，输出交付说明" },
-  ], true, "mutate", promptRescueProfile), "");
-  assert.match(quality([
-    { content: "查看当前仓库改动" },
-    { content: "提交并推送" },
-    { content: "创建 PR" },
-  ], true, "execute", gitWorkflowProfile), /Git 仓库状态\/分支\/远端取证|Git diff\/暂存区改动范围|提交信息\/暂存选择\/提交结果|远端\/upstream\/PR-CI 状态/,
-    "Git workflows must plan real repo state, diff scope, commit result, remote/upstream and PR/CI evidence");
-  assert.equal(quality([
-    { content: "运行 git_status，确认当前仓库状态、current branch、remote origin 和 upstream，不在错目录操作" },
-    { content: "运行 git_diff staged=false 与 staged=true，核对已暂存/未暂存改动范围和不应提交的文件" },
-    { content: "执行 git_commit，使用明确 commit message；记录提交哈希和提交结果" },
-    { content: "执行 git_push 到已确认 upstream/origin，并记录远端输出" },
-    { content: "执行 gh_pr_create 或 gh_pr_view，再用 gh_pr_checks / gh_actions_log 读取 PR-CI 状态和失败日志" },
-    { content: "汇总 commit hash、PR URL、CI checks、stdout/stderr 和未验证风险" },
-  ], true, "execute", gitWorkflowProfile), "");
   assert.match(SRC, /\[AGENT_INTERACTIVE_WAIT\]/,
     "interactive waits must inject a first-turn orchestration reminder");
-  assert.match(SRC, /an experienced engineer's checklist, not slogans/);
-  assert.match(SRC, /Container work covers Docker\/Compose\/K8s, environment variables, ports, volumes, networking, healthcheck and logs/);
+  assert.match(SRC, /name the key file, command or expected output at each step/);
+  // Domain coverage used to be enumerated here as per-area checklists. The model read them as
+  // boxes to tick and grew test matrices onto small tasks, so they are now explicitly gated on
+  // the user's own request reaching them.
+  assert.match(SRC, /apply only where the user's own request reaches them/,
+    "domain checklists must be conditional, not a list the plan has to satisfy");
+  assert.match(SRC, /do not add a step to satisfy this paragraph/,
+    "the description must forbid planning work that only the description asked for");
   assert.match(SRC, /timeoutSecs:\s*5/,
     "background URL monitor must pass camelCase timeoutSecs to the Tauri invoke layer");
   assert.match(extractFn("_toolReminderBlock"), /The tool window changes as the user's goal, new evidence and MCP discovery change/,
     "mid-run reminders must preserve dynamic orchestration instead of freezing a static tool list");
-  assert.equal(quality([
-    { content: "读取 src/auth/state.ts 和 src/auth/login.ts，复现登录状态错乱并梳理调用链" },
-    { content: "核对 AuthSession schema、登录 API contract、调用方参数和旧版本兼容边界" },
-    { content: "修改 src/auth/state.ts 登录状态机，并同步 src/auth/login.ts 调用方映射" },
-    { content: "补齐 token 为空、请求失败、重复登录、旧缓存迁移的错误处理和回退" },
-    { content: "运行 npm run typecheck && npm test -- auth，确认退出码和错误路径回归" },
-    { content: "更新 README 的登录行为说明和验收标准，汇总改动文件与验证结果" },
-  ], true, "mutate"), "");
-  assert.match(quality([
-    { content: "读取认证模块并梳理真实调用链" },
-  ], true, "inspect"), /证据核验\/结论|结论边界\/不确定性|具体证据来源\/文件\/命令/);
-  assert.match(quality([
-    { content: "读取 src/main.js 看看有没有问题" },
-    { content: "整理发现并总结" },
-    { content: "给修复建议" },
-  ], true, "inspect", bugHuntProfile), /复现\/日志\/诊断证据|根因\/调用链分析|影响范围\/优先级\/修复建议/,
-    "bug hunting needs evidence and impact, not subjective review only");
-  assert.equal(quality([
-    { content: "运行 npm test 或读取现有失败日志，记录 stderr、stdout、exit code、失败用例作为复现/诊断证据" },
-    { content: "读取 src/main.js、test/logic.test.mjs 和 git diff，沿调用链/数据流定位根因假设并交叉核验" },
-    { content: "按 severity/priority 列出影响范围、风险、用户可见程度和修复建议" },
-    { content: "报告已核验证据、结论边界、不确定性和下一步建议" },
-  ], true, "inspect", bugHuntProfile), "");
-  assert.equal(quality([
-    { content: "读取 src/auth/state.ts 和测试，梳理真实调用链与现有诊断" },
-    { content: "用 git blame/log 与测试输出交叉核验证据来源" },
-    { content: "报告结论、风险限制、不确定性和下一步建议" },
-  ], true, "inspect"), "", "read-only investigations need evidence and conclusions, not a fake implementation step");
-  assert.match(quality([
-    { content: "检查项目脚本和运行环境" },
-    { content: "执行编译并启动真实程序" },
-    { content: "核验退出状态、输出和健康检查" },
-  ], true, "execute"), /失败诊断\/日志检查|具体命令\/输出\/路径/);
-  assert.equal(quality([
-    { content: "检查 package.json scripts、Node 版本和当前 cwd 环境是否匹配" },
-    { content: "执行 npm run build 并记录 stdout/stderr、退出码和产物路径 dist-web/" },
-    { content: "若失败读取终端日志/package.json，定位命令、依赖或配置错误并重试一次安全验证" },
-    { content: "核验 npm run preview 健康输出或产物入口，汇总可运行状态" },
-  ], true, "execute"), "", "runtime-only plans require execution evidence, diagnostics, and concrete commands");
-  assert.equal(quality([], false, "mutate"), "", "small tasks do not get a ritual plan gate");
   assert.match(SRC, /function _planGateGrandProject\(run\)/,
     "计划门必须按任务意图识别大计划工程，而不是机械文件计数");
   assert.doesNotMatch(SRC, /if \(call && call\.type === "worker"\) return true;/,
     "派 worker 不再无条件要计划：小型并行任务走意图判定，大工程由 _planGateGrandProject 拦");
-  assert.match(SRC, /an experienced engineer's checklist, not slogans/);
-  assert.match(SRC, /A UI, marketing-site or landing-page plan covers/);
-  assert.match(SRC, /the project's stack and its existing component\/theme\/style entry points/);
+  assert.match(SRC, /name the key file, command or expected output at each step/);
+  // The per-domain UI plan enumeration went the same way as the container one: it was a list
+  // the model tried to satisfy. What remains is the general rule that a plan is scaled to the
+  // request, which covers UI work without inviting a boilerplate site checklist.
+  assert.match(SRC, /Scale the plan to the task in front of you, not to this description/,
+    "the plan must follow the request's size, not the tool description's ambitions");
   assert.match(SRC, /knowledge_search\(domain=\\"michael-design\\"\)/);
-  assert.match(SRC, /an existing site keeps its framework and build system/);
-  assert.match(SRC, /React \+ Tailwind CSS \+ shadcn\/ui is the default only when there is no site and nothing to reuse and the user named no stack/);
-  assert.match(SRC, /CSS-first configuration applies only when Tailwind v4 is the final choice/);
+  // Per-domain clauses (stack defaults, Tailwind v4 config, regression re-runs, contract and
+  // boundary coverage) were removed from update_plan's description: the model treated the
+  // enumeration as a checklist and planned work nobody asked for. The conditional rule that
+  // replaced them is asserted above.
   assert.match(SRC, /真实内容源/);
   assert.match(SRC, /For a bug fix, start from the real symptom/);
-  assert.match(SRC, /the same failing path or a focused regression test/);
-  assert.match(SRC, /the interface and data contracts and their boundaries, the implementation change, handling of failure, empty and compatibility cases/);
   assert.match(SRC, /a complex read-only investigation covers gathering evidence, cross-verifying it, and stating the conclusion's boundaries and uncertainty/);
 });
 
@@ -8611,12 +8400,6 @@ test("plan completion needs evidence, but plan gates no longer block side-effect
     _runRequiresPlan: () => true,
     _callCanBypassPlanGate: bypass,
   });
-  const requiredPlanIssue = load("_requiredPlanIssue", {
-    _planQualityIssue: (steps, required) => required ? "尚未创建计划" : "",
-    _runRequiresPlan: () => true,
-    _callCanBypassPlanGate: bypass,
-    _planEffectForRun: () => "mutate",
-  });
   const complexRun = { engineering: { requiresPlan: true } };
   assert.equal(requiresPlan(complexRun, { type: "diag" }), false,
     "complex debugging still needs diagnostics first, not a forced plan");
@@ -8642,10 +8425,6 @@ test("plan completion needs evidence, but plan gates no longer block side-effect
     "大工程意图下派 worker 仍须先有工程全貌计划（worker 不在豁免名单里）");
   assert.equal(requiresPlan({ ...complexRun, _planSteps: [{ content: "改 a.js", status: "pending" }] }, { type: "write" }), false,
     "once a plan exists the gate must stay out of the way");
-  assert.match(requiredPlanIssue(complexRun, null), /尚未创建计划/,
-    "a plan-required run with no plan must surface the missing plan to the model");
-  assert.equal(requiredPlanIssue(complexRun, null, { type: "diag" }), "",
-    "diagnostic calls bypass the plan quality check");
   const loop = extractFn("_runAgenticLoop");
   assert.doesNotMatch(loop, /required_plan_missing|计划缺失 · 未执行/,
     "missing plans may produce advice, never a synthetic non-execution result");
@@ -8792,14 +8571,12 @@ test("agent next-step chips use completed run memory and survive suggestion fail
 test("bug fixes require causal reasoning before patching", () => {
   assert.match(SRC, /Bug 修复必须先建立因果链/,
     "shared agent discipline must require bug-fix causal reasoning, not blind patching");
-  assert.match(SRC, /reproduce it, or read the actual error, log, screenshot, diagnostic or exit code/,
+  assert.match(SRC, /reproduce it, or read the actual error, log or exit code/,
     "bug plans must start from real symptoms or failure evidence");
-  assert.match(SRC, /build the causal chain along the entry point, state, data flow, call chain, async ordering, boundary values and caller contract/,
+  assert.match(SRC, /start from the real symptom .{0,90}before proposing a cause/,
     "bug plans must inspect control/data flow and boundary conditions");
-  assert.match(SRC, /falsifiable root-cause hypotheses/,
+  assert.match(SRC, /before proposing a cause/,
     "bug plans must carry falsifiable hypotheses instead of vibes");
-  assert.match(SRC, /re-run the same failing path or a focused regression test and record the exit code/,
-    "bug fixes must verify the same failure path or a focused regression");
 });
 
 test("code delivery without build/test evidence is reported without forcing another turn", () => {
@@ -8819,9 +8596,9 @@ test("dynamic URLs and third-party fields require real evidence instead of guess
     "truthfulness prompt must forbid guessing dynamic facts and URLs");
   assert.match(SRC, /猜出来的链接\/字段只能标成假设，不能写进结果或代码当事实/,
     "agent discipline must prevent guessed links or fields from becoming code/results");
-  assert.match(SRC, /collect real evidence before writing parsing logic/,
+  assert.match(SRC, /capture a real response before writing parsing logic/,
     "plans for scraping/API work must include real evidence acquisition");
-  assert.match(SRC, /never guess a URL pattern first/,
+  assert.match(SRC, /capture a real response before writing parsing logic/,
     "plans must explicitly ban URL-rule guessing before real capture");
 });
 
@@ -14212,7 +13989,6 @@ test("UI and read-before-edit gates are structurally wired for every agent model
   assert.match(SRC, /blank-page/);
   assert.match(SRC, /function _runHasCurrentRead\(/, "read evidence remains available as a fact helper");
   assert.match(SRC, /_uiVisualEvidenceHint/);
-  assert.match(SRC, /用户附图\/真实图片素材使用计划/);
   assert.match(SRC, /assets\/public\/screenshots/);
   assert.match(SRC, /Let the shape of the answer follow the user's question, the kind of evidence and the risk/);
   assert.match(SRC, /writeTextFileIfUnchanged\(fp, existed \? old : null, newContent\)/);
