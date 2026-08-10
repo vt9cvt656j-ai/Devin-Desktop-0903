@@ -2185,30 +2185,24 @@ test("dangerous commands are gated in auto mode; ordinary tools are not", async 
 // Read together that says "verified" and "not verified". It appeared on EVERY successful
 // run, which is how a summary footer trains people to skip it. The facts are unchanged;
 // they are now stated once.
-test("a green run states verification once instead of contradicting itself", () => {
+test("a green run states verification once, with no runtime-hedge caveat", () => {
   const summary = (opts, run) => load("_buildAgentOutcomeSummary", {
     _agentIncompleteLabel: () => "",
     effectKindLabel: (k) => k,
   })(run, opts);
 
+  // The "runtime not semantically verified, can't confirm the goal" hedge was removed — it
+  // appended an unactionable caveat to every green build, and the user asked for it gone. A
+  // verified run now states the fact plainly, once, with no caveat and no "本轮未完成" hedge.
   const verified = { didMutate: true, verificationPassed: true, didVerify: true };
-  const semanticPending = { _incompleteReason: "semantic_runtime_review_missing" };
+  const out = summary({ ...verified, mutatedFiles: ["a.go"] }, {});
+  assert.match(out, /验证：已通过真实命令\/检查。/, "plain verification line");
+  assert.doesNotMatch(out, /静态层面|运行时行为未实测|语义核验/, "no runtime-hedge caveat anywhere");
+  assert.equal((out.match(/验证[：:]/g) || []).length, 1, "exactly one verification line");
 
-  const folded = summary({ ...verified, mutatedFiles: ["a.go"] }, semanticPending);
-  assert.match(folded, /验证：已通过真实命令\/检查（静态层面；运行时行为未实测）。/,
-    "one line carrying both facts");
-  assert.doesNotMatch(folded, /语义核验未完全完成/,
-    "…and not a second line saying the opposite of the first");
-  assert.equal((folded.match(/验证[：:]/g) || []).length, 1, "exactly one verification line");
-
-  // With no semantic caveat outstanding, the plain wording is unchanged.
-  assert.match(summary({ ...verified }, {}), /验证：已通过真实命令\/检查。/);
-  assert.doesNotMatch(summary({ ...verified }, {}), /静态层面/);
-
-  // When there is no verification line to fold into, the caveat must still be stated —
-  // dropping it would trade noise for a missing fact.
-  const noVerifyRun = summary({ didMutate: true, verificationPassed: true, didVerify: false }, semanticPending);
-  assert.match(noVerifyRun, /语义核验未完全完成/, "the caveat survives when it has nowhere to fold");
+  // The removed hedge must never resurface even if a stale reason string is present.
+  const out2 = summary({ ...verified }, { _incompleteReason: "semantic_runtime_review_missing" });
+  assert.doesNotMatch(out2, /静态层面|语义核验未完全完成/, "the deleted caveat can never render again");
 });
 
 // Go emits `file.go:line:col: message` with NO severity keyword, so the gcc matcher — which
@@ -11085,10 +11079,8 @@ test("typed runtime and external evidence stays separate from workspace mutation
       _hasErrorLine: load("_hasErrorLine"),
     }),
   });
-  const needsSemanticReview = load("_runtimeNeedsSemanticReview", {
-    _looksLikeVerificationCommand: load("_looksLikeVerificationCommand", { _stripHarmlessRedirects: load("_stripHarmlessRedirects") }),
-    _executionEvidenceFromTool: executionEvidence,
-  });
+  // _runtimeNeedsSemanticReview was removed with the semantic-review hedge (it only ever armed the
+  // "runtime not verified" caveat). The evidence-typing this test really covers is unaffected.
   const sqlWithoutLeadingTrivia = load("_sqlWithoutLeadingTrivia");
   const sqlMutates = load("_sqlExplicitlyMutates", { _sqlWithoutLeadingTrivia: sqlWithoutLeadingTrivia });
   const sqlMayMutate = load("_sqlMayMutate", { _sqlWithoutLeadingTrivia: sqlWithoutLeadingTrivia });
@@ -11120,15 +11112,6 @@ test("typed runtime and external evidence stays separate from workspace mutation
     _EXTERNAL_OBLIGATION_ORDER: EXTERNAL_OBLIGATION_ORDER,
   });
   const ok = { code: 0, content: "ok" };
-
-  assert.equal(needsSemanticReview(
-    { type: "cmd", command: "python -m compileall src", verification: true },
-    { code: 0, verification: true },
-  ), false, "structurally tagged checks must not re-arm semantic runtime review");
-  assert.equal(needsSemanticReview(
-    { type: "cmd", command: "python worker.py" },
-    { code: 0, stdout: "finished" },
-  ), true, "ordinary application execution still requires semantic postcondition review");
 
   assert.equal(commandMutates("ls -la"), false);
   assert.equal(commandMutates("npm test"), false);
@@ -11162,8 +11145,7 @@ test("typed runtime and external evidence stays separate from workspace mutation
   assert.equal(crawlerEvidence.exitCode, 0);
   assert.equal(crawlerEvidence.completed, true);
   assert.equal(crawlerEvidence.cwd, "/repo");
-  assert.equal(crawlerEvidence.stdout, crawlerResult.stdout, "原始业务输出必须完整进入语义评审");
-  assert.equal(needsSemanticReview({ type: "cmd", command: ".venv/bin/python3 crawler.py" }, crawlerResult), true);
+  assert.equal(crawlerEvidence.stdout, crawlerResult.stdout, "原始业务输出必须完整保留在执行证据里");
   assert.deepEqual(runtimeKinds("npm run package"), ["package"]);
   assert.deepEqual(runtimeKinds("node --version"), []);
   assert.deepEqual(runtimeKinds("test -d node_modules && echo ok"), []);
@@ -16352,7 +16334,7 @@ test("terminal evidence preserves structured status and the final log state with
     "the final tool-message cap must preserve the evidence tail too");
 });
 
-test("项目入口退出 0 保留原始证据并进入语义验收，不直接记业务成功", () => {
+test("项目入口退出 0 不直接记业务成功（原始证据保留）", () => {
   const VERIFY = load("_looksLikeVerificationCommand", { _stripHarmlessRedirects: load("_stripHarmlessRedirects") });
   const execLike = load("_looksLikeProjectExecutionCommand", { _looksLikeVerificationCommand: VERIFY });
   // 这项旧分类仍供只读/副作用路由复用，但不能再直接给 verificationPassed 学分。
@@ -16376,17 +16358,11 @@ test("项目入口退出 0 保留原始证据并进入语义验收，不直接�
     "任意项目入口退出 0 不能直接记成验证通过");
   assert.match(SRC, /\(call\.type === "cmd" \|\| call\.type === "termtask"\)[\s\S]{0,260}call\.purpose === "verify"[\s\S]{0,260}_isRecognizedVerifierCommand/,
     "只有模型声明 verify 且命令被 IDE 认可、退出码为 0 才能记验证学分");
-
-  const semanticGate = extractFn("_runtimeNeedsSemanticReview");
-  assert.match(semanticGate, /_executionEvidenceFromTool\(call, result, ""\)/);
-  assert.doesNotMatch(semanticGate, /_runtimeCommandKinds|RegExp|\.test\(/,
-    "语义验收不能靠命令名或输出关键词分类");
-  const critic = extractFn("_wrapUpCritic");
-  assert.match(critic, /executionEvidence/);
-  assert.match(critic, /exitCode=0 只表示进程正常退出，不证明业务目标完成/);
-  assert.match(critic, /typeof j\.verified !== "boolean"/);
-  assert.match(SRC, /run\._incompleteReason = "semantic_runtime_review_missing"/,
-    "语义核验缺失时必须以未完成状态收尾");
+  // The semantic-review hedge (_runtimeNeedsSemanticReview → semantic_runtime_review_missing) was
+  // removed — an exit-0 project entry simply doesn't get verification credit (asserted above); it
+  // no longer arms an unactionable "runtime not verified" caveat at finish.
+  assert.doesNotMatch(SRC, /function _runtimeNeedsSemanticReview/, "the semantic-review gate is gone");
+  assert.doesNotMatch(SRC, /semantic_runtime_review_missing/, "the runtime-hedge reason is gone");
 });
 
 test("语义收尾评审工具仍可独立使用，但 quiet turn 不会被评审器重呼", async () => {
@@ -16456,8 +16432,8 @@ test("语义收尾评审工具仍可独立使用，但 quiet turn 不会被评�
     "classifier-derived semantic review must not schedule another model turn");
   assert.doesNotMatch(loop, /_pushNudge\("semanticReview"/,
     "semantic review gaps belong in final accounting, not a completion gate");
-  assert.match(loop, /run\._incompleteReason = "semantic_runtime_review_missing"/,
-    "the unresolved semantic state remains honestly recorded");
+  assert.doesNotMatch(loop, /semantic_runtime_review_missing/,
+    "the runtime-hedge reason was removed — a green build no longer records an unactionable caveat");
 });
 
 test("收尾验收契约开局告知，与收尾门禁同源而非突袭", () => {
@@ -20581,17 +20557,10 @@ test("review: evidence with a non-zero exitCode never certifies, even when ok=tr
   assert.equal(certifies({ command: "npm run build", implementationVersion: 3, ok: true, exitCode: null, purpose: "verify", verification: true }, 3), false);
 });
 
-test("review: a declared verification never arms the semantic-review gate", () => {
-  // Red or green, a declared verification has an exit-status contract: fix it, never
-  // "have a paid critic interpret the output". Application runs still need review.
-  const needs = load("_runtimeNeedsSemanticReview", {
-    _executionEvidenceFromTool: () => ({ command: "npm run build", exitCode: 1 }),
-  });
-  assert.equal(needs({ type: "cmd", command: "npm run build", purpose: "verify" }, { code: 1 }), false);
-  assert.equal(needs({ type: "cmd", command: "python app.py", purpose: "run" }, { code: 0 }), true,
-    "application runs still require semantic postcondition review");
-  assert.doesNotMatch(extractFn("_runtimeNeedsSemanticReview"), /_looksLikeVerificationCommand/);
-});
+// (removed) "a declared verification never arms the semantic-review gate" — the whole
+// semantic-review hedge (_runtimeNeedsSemanticReview → semantic_runtime_review_missing) was
+// deleted; a declared verification's exit-status contract is enforced by the build/diagnostics
+// gates, and an exit-0 app run simply gets no verification credit rather than a hedge caveat.
 
 test("review: files whose read coverage is mechanically impossible bypass the write gate", () => {
   const impossible = load("_readCoverageImpossible", { _READ_SLICE_CHAR_CAP: 55000 });
