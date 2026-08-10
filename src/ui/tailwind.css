@@ -91,3 +91,51 @@
   font-family: var(--font);
   -webkit-font-smoothing: antialiased;
 }
+
+/* Scoped element reset for islands.
+ *
+ * Preflight is deliberately not imported (see the top of this file), which is right for the
+ * 14,111 lines of hand-written CSS outside the islands — but it also means a bare <button> or
+ * <input> inside an island keeps the browser's own chrome. shadcn components assume preflight
+ * already stripped that, so they never set background/border/padding themselves. It showed:
+ * the dialog's close button rendered as a grey UA square, and every row in the session picker
+ * looked like a raised push-button.
+ *
+ * Two things make this behave like preflight rather than fighting it:
+ *
+ *   1. **@layer base.** Unlayered CSS beats every layer, so outside a layer this would win
+ *      against `@layer utilities` regardless of specificity. The first attempt did exactly
+ *      that and flattened rounded-lg / px-3 on the very rows it was meant to fix.
+ *   2. **:where() around the scope.** Keeps the whole rule at the specificity of a bare
+ *      `button` (0,0,1), as preflight has. `.ui-island button` would be (0,1,1) and would
+ *      again outrank utilities.
+ *
+ * The portal slots are listed because Radix renders Dialog/Tooltip content into <body>,
+ * outside .ui-island. Nothing here can reach the rest of the app. */
+@layer base {
+  :where(.ui-island, [data-radix-popper-content-wrapper], [data-slot="dialog-content"]) button {
+    appearance: none;
+    background: none;
+    border: 0;
+    margin: 0;
+    padding: 0;
+    color: inherit;
+    font: inherit;
+    text-align: inherit;
+    border-radius: 0;
+  }
+
+  :where(.ui-island, [data-radix-popper-content-wrapper], [data-slot="dialog-content"]) input {
+    appearance: none;
+    font: inherit;
+    color: inherit;
+  }
+
+  /* Google-style focus, as in the advanced-settings panel: an accent border rather than
+     shadcn's translucent 3px halo, which read as a heavy glow on these light surfaces. */
+  :where(.ui-island, [data-slot="dialog-content"]) input:focus {
+    border-color: var(--accent);
+    box-shadow: 0 0 0 1px var(--accent);
+    outline: none;
+  }
+}

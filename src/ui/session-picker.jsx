@@ -28,7 +28,7 @@ export function SessionPicker({ entries = [], resumableCount = 0, onPick, onClos
 
   return (
     <Dialog defaultOpen onOpenChange={(open) => { if (!open) onClose?.(); }}>
-      <DialogContent className="max-w-2xl gap-0 p-0">
+      <DialogContent className="max-w-2xl gap-0 overflow-hidden rounded-2xl p-0 shadow-xl [&>[data-slot=dialog-close]]:right-3 [&>[data-slot=dialog-close]]:top-3 [&>[data-slot=dialog-close]]:grid [&>[data-slot=dialog-close]]:size-8 [&>[data-slot=dialog-close]]:place-items-center [&>[data-slot=dialog-close]]:rounded-full [&>[data-slot=dialog-close]]:text-muted-foreground [&>[data-slot=dialog-close]]:opacity-100 [&>[data-slot=dialog-close]]:hover:bg-accent">
         <DialogHeader className="space-y-1 px-5 pt-5 pb-3">
           <DialogTitle className="text-base">Sessions</DialogTitle>
           <DialogDescription className="text-[12px]">
@@ -42,7 +42,7 @@ export function SessionPicker({ entries = [], resumableCount = 0, onPick, onClos
             value={query}
             onChange={(e) => setQuery(e.target.value)}
             placeholder="Search sessions, projects, file evidence…"
-            className="h-8 text-[13px]"
+            className="h-9 rounded-lg text-[13px]"
           />
         </div>
 
@@ -58,9 +58,11 @@ export function SessionPicker({ entries = [], resumableCount = 0, onPick, onClos
                 type="button"
                 onClick={() => onPick?.(e)}
                 className={cn(
-                  "group flex w-full flex-col gap-0.5 rounded-md px-3 py-2 text-left transition-colors",
+                  "group flex w-full cursor-pointer flex-col gap-0.5 rounded-lg px-3 py-2 text-left transition-colors",
                   "hover:bg-accent focus-visible:bg-accent focus-visible:outline-none",
-                  e.active && "bg-accent",
+                  // Google marks the current item with the light-blue tint, not the neutral hover
+                  // wash — otherwise "selected" and "the pointer happens to be here" look alike.
+                  e.active && "bg-primary/10",
                 )}
               >
                 <span className="flex items-baseline gap-2">

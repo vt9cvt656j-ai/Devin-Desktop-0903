@@ -21658,3 +21658,25 @@ test("every advanced-settings rail icon follows the tab's colour state", () => {
   assert.ok(!iconIds.includes("i-theme-light"),
     "the rail must not borrow the light-theme preview glyph as its Appearance icon");
 });
+
+test("the island element reset cannot outrank Tailwind utilities", () => {
+  // Preflight is deliberately not imported, so islands need their own button/input reset or
+  // shadcn components keep the browser's chrome (the dialog close button rendered as a grey UA
+  // square; picker rows looked like raised push-buttons).
+  //
+  // Getting that reset to lose to utilities is the subtle part, and it failed silently twice:
+  //   · unlayered, it beats `@layer utilities` no matter the specificity;
+  //   · written as `.ui-island button` it is (0,1,1) and outranks utilities on specificity.
+  // Either way `rounded-lg` and `px-3` vanish from the rows the reset was added to fix, and
+  // nothing errors — it just looks wrong. Pin both properties.
+  const TW = readFileSync(join(HERE, "../src/ui/tailwind.css"), "utf8");
+  const reset = /@layer base\s*\{[\s\S]*?\n\}/.exec(TW);
+  assert.ok(reset, "the island reset must live inside @layer base, not unlayered");
+  assert.match(reset[0], /:where\([^)]*\.ui-island[^)]*\)\s+button/,
+    "the scope must sit in :where() so the rule keeps bare-element specificity");
+  assert.match(reset[0], /:where\([^)]*\[data-slot="dialog-content"\][^)]*\)\s+button/,
+    "Radix portals render outside .ui-island, so dialog content needs the reset too");
+  // The layer order must actually declare base before utilities for any of this to hold.
+  assert.match(TW, /@layer theme,\s*base,\s*components,\s*utilities;/,
+    "base must be declared before utilities in the layer order");
+});
