@@ -21733,3 +21733,37 @@ test("the prompt makes running a program the agent's own action, not a hand-off"
   assert.match(prompt, /自己把它跑起来|自己在真终端里/, "running a program is the agent's own action");
   assert.match(prompt, /绝不要.{0,20}自己去终端敲|甩回给用户/, "the prompt must forbid handing the user a command to type");
 });
+
+test("run_in_terminal reuses the same task's terminal instead of stacking a new tab", () => {
+  // Reported live: running the same task (go run ./cmd/githuh) opened a new terminal tab every
+  // time. _findReusableTaskTerminal keys on command+cwd of agent-created tabs: an exited match is
+  // reused for an in-place re-run; a still-running match is reported (refocus, no duplicate).
+  const make = (o) => ({ closed: false, agentCreated: true, backendId: 1, exited: false, cwd: "/w", taskCommand: "", ...o });
+  const find = (tabs, cmd, cwd) => load("_findReusableTaskTerminal", { termTabs: tabs })(cmd, cwd);
+
+  let tabs = [make({ taskCommand: "go run ./cmd/githuh", exited: true })];
+  let r = find(tabs, "go run ./cmd/githuh", "/w");
+  assert.ok(r && !r.alreadyRunning && r.entry === tabs[0], "an exited same-command tab is reused for the re-run");
+
+  r = find([make({ taskCommand: "npm run dev", exited: false })], "npm run dev", "/w");
+  assert.ok(r && r.alreadyRunning, "a still-running same-command tab is reused as already-running (no duplicate)");
+
+  assert.equal(find([make({ taskCommand: "npm run dev", exited: true })], "go run .", "/w"), null, "different command → new tab");
+  assert.equal(find([make({ taskCommand: "go run .", exited: true, cwd: "/other" })], "go run .", "/w"), null, "different cwd → new tab");
+  assert.equal(find([make({ taskCommand: "go run .", exited: true, agentCreated: false })], "go run .", "/w"), null, "a user-opened terminal is never hijacked");
+  assert.equal(find([make({ taskCommand: "go run .", exited: true, closed: true })], "go run .", "/w"), null, "a closed tab is not reused");
+
+  // Exited is preferred over running regardless of order, so the re-run replaces cleanly in place.
+  r = find([make({ taskCommand: "x", exited: false }), make({ taskCommand: "x", exited: true })], "x", "/w");
+  assert.ok(r && !r.alreadyRunning, "an exited match wins over a running one");
+});
+
+test("run_cmd (captured) must not pop the terminal panel; only run_in_terminal does", () => {
+  // Reported live: the terminal panel popped open "even when it isn't actively using it". Cause:
+  // _stageForTool opened the panel for cmd too, but run_cmd is pipe-captured — its output goes to
+  // the tool card, nothing appears in the terminal. Only termtask uses a visible terminal tab.
+  const src = extractFn("_stageForTool");
+  assert.match(src, /if \(t === "termtask"\)[\s\S]{0,240}openTerminal\(\)/, "termtask stages the visible terminal");
+  assert.match(src, /if \(t === "cmd"\) return;/, "cmd must return without opening the terminal");
+  assert.doesNotMatch(src, /t === "cmd" \|\| t === "termtask"/, "cmd must no longer share the terminal-open path");
+});

@@ -38306,10 +38306,15 @@ async function _stageForTool(call, root, session, run = null) {
     if (!call || !_liveStageOn()) return;
     if (session && typeof _currentSession === "function" && session !== _currentSession()) return; // don't hijack another tab
     const t = call.type;
-    if (t === "cmd" || t === "termtask") {
+    // Only run_in_terminal (termtask) actually runs in a VISIBLE terminal tab. run_cmd (cmd) is
+    // pipe-captured — its output goes to the tool card, nothing ever appears in the terminal — so
+    // popping the panel open for it showed an empty/unrelated terminal "even when it isn't using
+    // it." Stage the terminal only for the tool that genuinely uses it.
+    if (t === "termtask") {
       if (typeof termIsOpen === "function" && !termIsOpen() && typeof openTerminal === "function") await openTerminal();
       return;
     }
+    if (t === "cmd") return; // captured, not shown in a terminal tab — don't surface the panel
     const rel = call.path || call.dest || "";
     if (!rel) return;
     const fp = _boundRunFilePath(run, root, rel) || _resolveRel(rel, root);
@@ -47222,6 +47227,18 @@ async function _executeToolStepInner(step, call, root, run) {
       // 创建时就打标记，回收器据此区分「agent 建的」和「用户自己开的」。不能依赖下面的
       // agentRunId —— 那个只在 run 存在时才设，独立调用建的终端会永远漏掉。
       r.entry.agentCreated = true;
+      // Same command already running in its own tab → reused, not duplicated. Report and stop;
+      // don't wait for a fresh "startup" that already happened, and don't stack a second process.
+      if (r.alreadyRunning) {
+        const _cur = (r.entry.recentOut || "").trim().slice(-3000);
+        res.className = "atc-result atc-result--ok"; res.textContent = "已在运行";
+        if (vp) vp.innerHTML = `<pre>${_escHtml(_cur || "(运行中)")}</pre>`;
+        return {
+          type: "termtask", path: label, command: cmd, cwd: r.entry.cwd || root || "",
+          running: true, completed: false, stdout: _cur, stderr: "",
+          content: `该命令已经在 IDE 终端 tab「${label}」里运行中——**已复用现有终端，没有重复开新终端**。要看它当前输出用 read_terminal；确需重跑先 stop_terminal 停掉再启动。\n$ ${cmd}\n\n当前输出:\n${_cur || "(暂无输出)"}`,
+        };
+      }
       await new Promise((res2) => setTimeout(res2, 3500)); // let it print startup output
       let out = (r.entry.recentOut || "").trim().slice(-3000);
       let exited = !!r.entry.exited;
@@ -47271,9 +47288,9 @@ async function _executeToolStepInner(step, call, root, run) {
         exitCode: exited && Number.isFinite(Number(r.entry.exitCode)) ? Number(r.entry.exitCode) : null,
         stdout: out,
         stderr: "",
-        content: exited
+        content: (r.reused ? "（已复用现有终端 tab 原地重跑，未新开）\n" : "") + (exited
         ? `[ERROR] 命令在 IDE 终端「${label}」启动后很快退出，未形成持续运行任务。一次性命令应改用 run_cmd 取得真实退出码；持续服务请根据下面输出修复后重启：\n$ ${cmd}\n输出:\n${out || "(无)"}${_readyNote}`
-        : `已在 IDE 终端 tab「${label}」启动持续任务并保持运行：\n$ ${cmd}\n\n启动后输出（前几秒）:\n${out || "(暂无输出)"}\n\n该任务在 IDE 终端里持续运行、用户可见可手动停止。${devServerUrl ? `本 run 检测到的 dev server：${devServerUrl}` : "尚未从该终端识别出本地 URL；用 read_logs/read_terminal 读取后续日志。"}${_readyNote}`,
+        : `已在 IDE 终端 tab「${label}」启动持续任务并保持运行：\n$ ${cmd}\n\n启动后输出（前几秒）:\n${out || "(暂无输出)"}\n\n该任务在 IDE 终端里持续运行、用户可见可手动停止。${devServerUrl ? `本 run 检测到的 dev server：${devServerUrl}` : "尚未从该终端识别出本地 URL；用 read_logs/read_terminal 读取后续日志。"}${_readyNote}`),
       };
 
     } else if (call.type === "termread") {
@@ -59322,6 +59339,25 @@ function _reapExitedAgentTerminals() {
   } catch { /* 回收失败不能影响正在跑的任务 */ }
 }
 
+// An agent task terminal that already ran THIS command in THIS cwd. Reusing it instead of
+// stacking a new tab is the fix for "the AI opens a new terminal for the same task every time":
+// re-running `go run ./cmd/foo` three times used to leave three tabs. Prefer an exited tab (safe
+// to re-run in place); fall back to one still running the same command (refocus, don't duplicate
+// and don't stack a second process into its PTY).
+function _findReusableTaskTerminal(command, cwd) {
+  const norm = (s) => String(s || "").trim();
+  const cmd = norm(command), dir = norm(cwd);
+  if (!cmd) return null;
+  let running = null;
+  for (const t of termTabs) {
+    if (!t || t.closed || !t.agentCreated || t.backendId == null) continue;
+    if (norm(t.taskCommand) !== cmd || norm(t.cwd) !== dir) continue;
+    if (t.exited) return { entry: t, alreadyRunning: false }; // re-run in place
+    running = running || { entry: t, alreadyRunning: true };  // same command already up
+  }
+  return running;
+}
+
 async function _runTaskInNewTerminal(command, label, cwd = "") {
   // Show the panel WITHOUT openTerminal's auto-create (which would add a stray
   // empty default tab); we create exactly one dedicated tab for this task.
@@ -59330,7 +59366,28 @@ async function _runTaskInNewTerminal(command, label, cwd = "") {
     editorwrapEl?.classList.add("has-terminal");
     try { monacoEditor.layout(); } catch {}
   }
+  // Reuse before creating: the same task should re-run in its own tab, not spawn a new one.
+  const _reuse = _findReusableTaskTerminal(command, cwd);
+  if (_reuse) {
+    const entry = _reuse.entry;
+    const idx = termTabs.indexOf(entry);
+    if (idx >= 0) { try { switchTermTab(idx); } catch {} }   // bring the existing tab to front
+    entry.lastActivityAt = Date.now();
+    if (_reuse.alreadyRunning) {
+      // Same command already running here — don't duplicate, don't stack a second process.
+      return { ok: true, entry, reused: true, alreadyRunning: true };
+    }
+    // Exited → re-run in place: clear the old output, then send the command again.
+    entry.recentOut = "";
+    entry.exited = false;
+    entry.lastCommand = command;
+    try { backend.termWrite(entry.backendId, " " + _clearCmd + "\n"); } catch {}
+    backend.termWrite(entry.backendId, command + "\n");
+    return { ok: true, entry, reused: true };
+  }
   const entry = await createTermTab(label, cwd);
+  entry.agentCreated = true;   // mark now so reuse works even before the caller stamps it
+  entry.taskCommand = command; // the reuse key for the next run of the same task
   // Wait for the PTY to be up AND past finishInit's `clear`, so the command isn't
   // wiped. finishInit fires ~1.5s after open; cap the wait at 6s.
   const start = Date.now();
