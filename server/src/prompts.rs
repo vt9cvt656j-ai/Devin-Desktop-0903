@@ -4845,7 +4845,7 @@ mod tests {
         let core = read_prompt("agent_core").unwrap();
         assert!(core.contains("autonomous execution agent"));
         assert!(core.contains("Choose tools by need"));
-        assert!(!core.contains("# michael-design 核心"));
+        assert!(!core.contains("# michael-design core"));
         assert!(!core.contains("# Loaded per task: engineering implementation, debugging, and verification"));
 
         let mut sys = String::new();
@@ -5056,7 +5056,7 @@ mod tests {
         });
         super::assemble_into(&headers, &mut without_profile).unwrap();
         let base_only = without_profile["messages"][0]["content"].as_str().unwrap();
-        assert!(!base_only.contains("# michael-design 核心"));
+        assert!(!base_only.contains("# michael-design core"));
         assert!(!base_only.contains("# Loaded per task: research, community, and current facts"));
         assert!(!base_only.contains("# Loaded per task: multi-role collaboration"));
 
@@ -5075,11 +5075,11 @@ mod tests {
         assert!(system.contains("# Loaded per task: engineering implementation"));
         assert!(system.contains("# Loaded per task: multi-role collaboration"));
         assert!(system.contains("# Loaded per task: research, community, and current facts"));
-        assert!(system.contains("# michael-design 核心"));
-        assert!(system.contains("# michael-design 实现入口"));
-        assert!(system.contains("# michael-design 数据与业务状态层"));
-        assert!(system.contains("# michael-design 验证层"));
-        assert!(!system.contains("# michael-design 脚手架层"));
+        assert!(system.contains("# michael-design core"));
+        assert!(system.contains("# michael-design implementation entry"));
+        assert!(system.contains("# michael-design data and business state layer"));
+        assert!(system.contains("# michael-design verification layer"));
+        assert!(!system.contains("# michael-design scaffold layer"));
     }
 
     #[test]
@@ -5194,7 +5194,7 @@ mod tests {
         assert!(system.contains("# Loaded per task: browser and desktop automation"));
         assert!(system.contains("Never treat \"I clicked / I typed / I sent the request\" as success"));
         assert!(
-            !system.contains("michael-design 核心"),
+            !system.contains("michael-design core"),
             "logging into a website is automation, not a UI design task"
         );
     }
@@ -5216,10 +5216,10 @@ mod tests {
         let core = read_prompt("design_core").unwrap();
         let components = read_prompt("design_components").unwrap();
         let verification = read_prompt("design_verification").unwrap();
-        assert!(core.contains("配色决策链"));
+        assert!(core.contains("Colour decision chain"));
         assert!(core.contains("michael-design"));
         assert!(components.contains("Lucide"));
-        assert!(components.contains("语义类"));
+        assert!(components.contains("semantic classes"));
         assert!(verification.contains("1440x900"));
         assert!(verification.contains("390x844"));
     }
@@ -5787,20 +5787,20 @@ mod tests {
         assemble_into(&headers, &mut body);
         let system = body["messages"][0]["content"].as_str().unwrap();
         // 完整建站会把精炼职责模块组合回来；legacy design_system.txt 仍保留作语义真源。
-        assert!(system.contains("# michael-design 核心"));
-        assert!(system.contains("配色决策链"));
-        assert!(system.contains("卡片先数数量再定网格"));
-        assert!(system.contains("业务概念 → 对象/动作/状态 → 图标名"));
-        assert!(system.contains("结构像真人产品负责人推导"));
-        assert!(system.contains("浏览器硬预算"));
+        assert!(system.contains("# michael-design core"));
+        assert!(system.contains("Colour decision chain"));
+        assert!(system.contains("Count the cards before choosing the grid"));
+        assert!(system.contains("business concept \u{2192} object/action/state \u{2192} icon name"));
+        assert!(system.contains("the way a real product lead would"));
+        assert!(system.contains("real-browser hard budget"));
         assert!(system.contains("--- michael-design 设计蓝本"));
         assert!(system.contains("421 条成品级 UI 知识"));
         assert!(system.contains("完整页面/整站包"));
         assert!(system.contains("列出采用的 michael-design 来源"));
         assert!(system.contains("knowledge_search(domain=\"michael-design\")"));
         assert!(system.contains("绝不拿生造名当 query"));
-        assert!(system.contains("至少落地 3 个可加载素材"));
-        assert!(system.contains("编码前明确数据策略"));
+        assert!(system.contains("ships at least 3 loadable assets"));
+        assert!(system.contains("Decide the data strategy before coding"));
         assert!(system.contains("Tailwind 族+档"));
 
         let start = system.find("--- michael-design 设计蓝本").unwrap();
@@ -6026,7 +6026,7 @@ mod tests {
         assemble_into(&headers, &mut body);
         let system = body["messages"][0]["content"].as_str().unwrap();
         assert!(system.contains("--- michael-design 设计蓝本"));
-        assert!(system.contains("# michael-design 核心"));
+        assert!(system.contains("# michael-design core"));
         assert!(system.contains("完整页面/整站包"));
     }
 
@@ -6146,7 +6146,7 @@ mod tests {
         assemble_into(&headers, &mut automation);
         let automation_system = automation["messages"][0]["content"].as_str().unwrap();
         assert!(automation_system.contains("Loaded per task: browser and desktop automation"));
-        assert!(!automation_system.contains("# michael-design 核心"));
+        assert!(!automation_system.contains("# michael-design core"));
         // Token estimate, not bytes — see the ordinary-assembly guard for why the unit changed
         // when the prompts were rewritten in English (CJK ≈ 3 bytes but ~1 token per char;
         // ASCII ≈ 1 byte but ~0.25 token per char, so bytes stop tracking attention cost).
@@ -6166,11 +6166,11 @@ mod tests {
         });
         assemble_into(&headers, &mut review);
         let review_system = review["messages"][0]["content"].as_str().unwrap();
-        assert!(review_system.contains("# michael-design 核心"));
-        assert!(review_system.contains("# michael-design 验证层"));
-        assert!(!review_system.contains("# michael-design 实现入口"));
-        assert!(!review_system.contains("# michael-design 内容与真实媒体层"));
-        assert!(!review_system.contains("# michael-design 动效层"));
+        assert!(review_system.contains("# michael-design core"));
+        assert!(review_system.contains("# michael-design verification layer"));
+        assert!(!review_system.contains("# michael-design implementation entry"));
+        assert!(!review_system.contains("# michael-design content and real-media layer"));
+        assert!(!review_system.contains("# michael-design motion layer"));
 
         let mut focused_change = serde_json::json!({
             "model": "gpt-5.6-sol",
@@ -6179,11 +6179,11 @@ mod tests {
         assemble_into(&headers, &mut focused_change);
         let focused_system = focused_change["messages"][0]["content"].as_str().unwrap();
         for marker in [
-            "# michael-design 核心",
-            "# michael-design 实现入口",
-            "# michael-design 组件层",
-            "# michael-design UI 工程层",
-            "# michael-design 验证层",
+            "# michael-design core",
+            "# michael-design implementation entry",
+            "# michael-design component layer",
+            "# michael-design UI engineering layer",
+            "# michael-design verification layer",
         ] {
             assert!(
                 focused_system.contains(marker),
@@ -6191,10 +6191,10 @@ mod tests {
             );
         }
         for omitted in [
-            "# michael-design 脚手架层",
-            "# michael-design 内容与真实媒体层",
-            "# michael-design 数据与业务状态层",
-            "# michael-design 动效层",
+            "# michael-design scaffold layer",
+            "# michael-design content and real-media layer",
+            "# michael-design data and business state layer",
+            "# michael-design motion layer",
         ] {
             assert!(
                 !focused_system.contains(omitted),
@@ -6220,15 +6220,15 @@ mod tests {
         assemble_into(&headers, &mut full_build);
         let build_system = full_build["messages"][0]["content"].as_str().unwrap();
         for marker in [
-            "# michael-design 核心",
-            "# michael-design 实现入口",
-            "# michael-design 组件层",
-            "# michael-design 脚手架层",
-            "# michael-design 内容与真实媒体层",
-            "# michael-design 数据与业务状态层",
-            "# michael-design UI 工程层",
-            "# michael-design 验证层",
-            "# michael-design 动效层",
+            "# michael-design core",
+            "# michael-design implementation entry",
+            "# michael-design component layer",
+            "# michael-design scaffold layer",
+            "# michael-design content and real-media layer",
+            "# michael-design data and business state layer",
+            "# michael-design UI engineering layer",
+            "# michael-design verification layer",
+            "# michael-design motion layer",
         ] {
             assert!(
                 build_system.contains(marker),
@@ -6258,13 +6258,29 @@ mod tests {
             "design_verification",
         ]
         .iter()
-        .map(|name| read_prompt(name).unwrap().len())
+        .map(|name| est_prompt_tokens(&read_prompt(name).unwrap()))
         .sum::<usize>();
-        let legacy_design_bytes = read_prompt("design_system").unwrap().len();
+        // Token estimate, not bytes: the split modules were rewritten in English while
+        // design_system.txt stays Chinese (it is a frozen rollback artifact, never injected), so a
+        // byte comparison is measuring UTF-8 encoding rather than prompt weight — CJK is 3 bytes
+        // but ~1 token per char, ASCII 1 byte but ~0.25. Tokens compare the two fairly.
+        let legacy_design_bytes = est_prompt_tokens(&read_prompt("design_system").unwrap());
         assert!(
             routed_design_bytes < legacy_design_bytes,
             "the complete split design contract should remain smaller than the legacy monolith: {routed_design_bytes} vs {legacy_design_bytes}"
         );
+    }
+
+
+    /// Rough token estimate that stays meaningful across languages: CJK ≈ 1 token per character,
+    /// everything else ≈ 4 characters per token. Prompt budget guards use this instead of
+    /// `len()`, whose byte count stops tracking attention cost the moment the language changes.
+    fn est_prompt_tokens(text: &str) -> usize {
+        let cjk = text
+            .chars()
+            .filter(|c| ('\u{4e00}'..='\u{9fff}').contains(c))
+            .count();
+        cjk + (text.chars().count() - cjk) / 4
     }
 
     #[test]
@@ -6280,6 +6296,9 @@ mod tests {
             "动效形成四层系统",
             "组件覆盖",
             "内容与真实媒体",
+            // design_system.txt is a FROZEN rollback artifact, not an injected prompt (it is absent
+            // from prompt_graph.json and never reaches a model), so it stays in Chinese while the
+            // live design modules were rewritten in English. Its markers must stay Chinese too.
             "浏览器硬预算",
         ] {
             assert!(
@@ -6304,19 +6323,19 @@ mod tests {
         .collect::<Vec<_>>()
         .join("\n\n");
         for marker in [
-            "配色决策链",
+            "Colour decision chain",
             "Dark Theme Execution Standard",
-            "每个 section 至多一种装饰手段",
-            "卡片先数数量再定网格",
-            "业务概念 → 对象/动作/状态 → 图标名",
+            "each section uses at most one decorative device",
+            "Count the cards before choosing the grid",
+            "business concept \u{2192} object/action/state \u{2192} icon name",
             "twMerge(clsx(...))",
-            "至少落地 3 个可加载素材",
+            "ships at least 3 loadable assets",
             "1792x1024",
-            "编码前明确数据策略",
+            "Decide the data strategy before coding",
             "GSAP + ScrollTrigger",
             "4.5:1",
-            "不超过 15 次 browser 调用",
-            "连续两次观察没有新增错误",
+            "stays within 15 browser calls",
+            "two consecutive observations show no new errors",
         ] {
             assert!(
                 runtime.contains(marker),

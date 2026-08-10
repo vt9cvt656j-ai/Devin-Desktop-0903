@@ -1586,9 +1586,9 @@ test("remote prompt bundles carry the empty-workspace stop rule", () => {
     "subagent prompt should stop local probing in empty workspaces");
   assert.match(SERVER_PROMPT_WORKER, /empty[\s\S]{0,240}stop local read_file \/ search \/ find_files/i,
     "worker prompt should stop local probing in empty workspaces");
-  assert.match(SERVER_PROMPT_RESEARCH, /(空目录|根目录为空)[\s\S]{0,220}停止本地 read_file \/ search \/ find_files/,
+  assert.match(SERVER_PROMPT_RESEARCH, /(empty|root is empty)[\s\S]{0,260}stop local read_file \/ search \/ find_files/i,
     "research prompt should stop local probing in empty workspaces");
-  assert.match(SERVER_PROMPT_DESIGN, /根目录为空[\s\S]{0,220}停止本地 read_file \/ search \/ find_files/,
+  assert.match(SERVER_PROMPT_DESIGN, /root is empty[\s\S]{0,260}stop local read_file \/ search \/ find_files/i,
     "design research prompt should stop local probing in empty workspaces");
 });
 

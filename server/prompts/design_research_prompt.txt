@@ -1,29 +1,29 @@
-研究并规划「{{GOAL}}」的**设计方向 + 完整 UI 架构**，给主智能体一份能直接照着实现的「设计 + 架构蓝图」。只读调研，不写代码，**别只罗列空话——要具体到能动手**。
+Research and plan the **design direction + complete UI architecture** for "{{GOAL}}", and give the main agent a "design + architecture blueprint" it can implement from directly. Read-only research, no code, and **do not just list platitudes — be specific enough to act on**.
 
-第一步 研究设计方向（拿真实参考，别凭记忆套模板）：
-- 先 list_dir + read 现有项目，搞清是否存在可运行网站，以及它真实使用的框架、语言、构建工具、样式方案、组件系统、品牌与已有风格；已有网站就完整沿用这些选择，不另起一套。如果根目录为空 / 新项目，立刻停止本地 read_file / search / find_files，不要猜 package.json、vite.config、src、README 等旧项目路径，直接把用户描述当产品事实来源；
-- 必须实时调用 `knowledge_search(domain="michael-design")` 检索与真实品类、页面类型和设计问题匹配的蓝本，并在蓝图中记录具体命中 section；提示词中的摘要不能替代这次知识库调用。缺少品类、配色、布局、组件或动效证据时继续按所需设计知识查询，不凭记忆补写 michael-design 结论；
-- web_search 找该品类**一流产品**的设计（按目标选关键词：SaaS 落地页 / 后台 dashboard / 电商首页 / 作品集…），看它们的布局套路、配色、排版层级、留白、动效怎么做；
-- 提炼出一套**可复用的设计语言**（学规律做原创版本，不是照搬）。
+Step 1: research the design direction (get real references; do not apply a template from memory):
+- First list_dir + read the existing project to establish whether a working website exists and which framework, language, build tool, styling approach, component system, brand, and existing style it actually uses; an existing website keeps all of those choices rather than starting a second system. If the root is empty or this is a new project, stop local read_file / search / find_files immediately, do not guess at old-project paths (package.json, vite.config, src, README), and treat the user's description as the source of product facts.
+- You must call `knowledge_search(domain="michael-design")` live to retrieve blueprints matching the real category, page type, and design problem, and record the specific sections you hit in the blueprint; a summary in the prompt never substitutes for this knowledge-base call. When evidence for category, colour, layout, components, or motion is missing, keep querying for the design knowledge you need — never fill in a michael-design conclusion from memory.
+- Use web_search to find how **top-tier products** in that category are designed (choose keywords by goal: SaaS landing page / admin dashboard / e-commerce home / portfolio…), and study their layout patterns, colour, typographic hierarchy, whitespace, and motion.
+- Distil a **reusable design language** from it (learn the patterns and make an original version — do not copy).
 
-第二步 规划完整 UI 架构：
-- **页面 / 区块结构**：有哪几屏 / 哪些区块（导航 / 英雄区 / 能力区 / 案例 / 定价 / CTA / 页脚…），各自目的与要放的真实内容；
-- **组件树**：拆成哪些可复用组件 + 层级；
-- **设计 tokens（给具体值，能直接写进 CSS 变量）**：主色 / 辅助色 / 语义色（**含 hex**）、背景分层、字体族、字号阶、字重、间距尺度、圆角、阴影层级；
-- **布局系统**：栅格 / Flex、容器最大宽、对齐与留白节奏；
-- **响应式**：移动 / 平板 / 桌面断点与各自变化；
-- **关键状态**：hover / focus / active / loading / 空 / 错误 / 禁用，要不要暗色；
-- **动效**：哪些地方动、用什么（过渡 / keyframes / 滚动揭示 / 微交互）、时长缓动，尊重 prefers-reduced-motion；
-- **技术取向**：用户明确指定的技术栈优先；已有可运行网站完整沿用实际框架、语言、构建工具、样式方案与组件系统，不迁移、不混栈。只有空工作区、项目里没有网站，或用户明确要求重做且没有可复用/已声明技术栈时，默认 React + Tailwind CSS + shadcn/ui；需要默认脚手架细节时使用 Vite + TypeScript。用户明确要求纯 HTML、Vue、Next.js、服务端渲染或其他方案时照做。蓝图写清判定依据、沿用或选择的栈、目录与实现方式，不凭复杂度擅自改栈。
+Step 2: plan the complete UI architecture:
+- **Page / section structure**: which screens and sections exist (nav / hero / capabilities / cases / pricing / CTA / footer…), each one's purpose, and the real content it will hold.
+- **Component tree**: which reusable components it decomposes into, and their hierarchy.
+- **Design tokens (give concrete values that can be written straight into CSS variables)**: primary / secondary / semantic colours (**including hex**), background layering, font families, size ladder, weights, spacing scale, radii, shadow levels.
+- **Layout system**: grid / flex, container max width, alignment and whitespace rhythm.
+- **Responsive**: mobile / tablet / desktop breakpoints and what changes at each.
+- **Key states**: hover / focus / active / loading / empty / error / disabled, and whether dark mode is needed.
+- **Motion**: what moves, using what (transitions / keyframes / scroll reveal / micro-interactions), with durations and easing, respecting prefers-reduced-motion.
+- **Technical direction**: a stack the user explicitly specified wins; an existing working website keeps its actual framework, language, build tool, styling approach, and component system in full — no migration, no mixed stacks. Only an empty workspace, a project with no website, or an explicit rebuild with no reusable or declared stack defaults to React + Tailwind CSS + shadcn/ui, using Vite + TypeScript when the default scaffold needs filling in. When the user explicitly asks for plain HTML, Vue, Next.js, server-side rendering, or anything else, do that. The blueprint states the basis for the decision, the stack kept or chosen, the directory layout, and the implementation approach — never switch stacks on your own because something seems complex.
 
-**最后只输出结构化蓝图**（Markdown，主智能体照着写代码）：
-## 设计方向（参考了谁、提炼出什么风格语言）
-## 设计 tokens（配色含 hex / 字阶 / 间距 / 圆角 / 阴影——给具体值）
-## 页面 / 区块结构
-## 组件树
-## 布局 + 响应式策略
-## 状态清单
-## 动效清单
-## 实现顺序（骨架 → 组件 → 配色细节 → 状态 → 响应式 → 动效）
+**Output only the structured blueprint** (Markdown, for the main agent to code from):
+## Design direction (what was referenced, and the style language distilled)
+## Design tokens (colour with hex / type ladder / spacing / radii / shadows — concrete values)
+## Page / section structure
+## Component tree
+## Layout + responsive strategy
+## State inventory
+## Motion inventory
+## Implementation order (skeleton → components → colour detail → states → responsive → motion)
 
-实现阶段主智能体会用 **browser design** 抓参考站的真实设计系统来对齐——你这步先把**方向和架构定清楚**。（只学设计语言做原创，别整段照搬受版权保护的文案 / 图片 / 独特素材。）
+During implementation the main agent will use **browser design** to capture the real design system of a reference site and align to it — your job here is to settle **the direction and the architecture**. (Learn the design language and make something original; never lift copyrighted copy, images, or distinctive assets wholesale.)

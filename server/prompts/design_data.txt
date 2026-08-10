@@ -1,5 +1,5 @@
-# michael-design 数据与业务状态层
+# michael-design data and business state layer
 
-- 编码前明确数据策略并说明业务理由：静态/构建期数据、localStorage/IndexedDB，或服务端数据库。不能给所有展示站硬塞数据库，也不能把需要真实持久化的产品做成静态假按钮。
-- 账户、跨设备同步、后台管理、订单、预约、评论、收藏、支付、库存或多人协作需要真实服务端数据，并设计 API/schema/权限/迁移以及 loading/empty/error/selected 状态。
-- 表单与数据操作必须有真实提交结果、校验、失败反馈和重复提交处理；仪表盘、表格与列表必须使用可信数据结构，不用随意数字伪装完成。
+- Decide the data strategy before coding and state the business reason: static/build-time data, localStorage/IndexedDB, or a server-side database. Do not force a database onto every display site, and do not build a product that needs real persistence as a static set of fake buttons.
+- Accounts, cross-device sync, admin backends, orders, bookings, comments, favourites, payments, inventory, and multi-user collaboration need real server-side data, with API/schema/permissions/migrations designed alongside the loading/empty/error/selected states.
+- Forms and data operations must have a real submission result, validation, failure feedback, and duplicate-submission handling; dashboards, tables, and lists must use a credible data structure — never dress up arbitrary numbers as completion.

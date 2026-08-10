@@ -1,5 +1,5 @@
-# michael-design 脚手架层：只在从零 UI 项目需要时加载
+# michael-design scaffold layer: loaded only when a UI project genuinely starts from zero
 
-- 先检查现有 package.json、构建配置、样式入口、组件目录和主题 token。已有项目沿用当前框架与设计系统，本模块不能成为换栈或重建脚手架的理由。
-- 用户明确指定技术栈时直接采用。已有可运行网站必须保留其实际框架、语言、构建工具、样式方案与组件系统（包括 Django/Flask/Jinja、Rails、PHP 等服务端渲染），不能改写成 React、混入第二套框架或另起前端。
-- 只有空工作区、项目里没有网站，或用户明确要求重做且没有可复用/已声明技术栈时，默认 React + Tailwind CSS + shadcn/ui；需要补齐默认脚手架细节时使用 Vite + TypeScript。默认分支只添加页面真实使用的 shadcn/ui 组件，并按当前稳定版 Tailwind 与实际构建工具接线；不要把这套接线应用到其他分支。
+- Check the existing package.json, build config, style entry point, component directory, and theme tokens first. An existing project keeps its current framework and design system — this module is never a reason to switch stacks or rebuild the scaffold.
+- When the user specifies a stack, use it. An existing working site keeps its actual framework, language, build tool, styling approach, and component system (including server-rendered stacks such as Django/Flask/Jinja, Rails, and PHP) — do not rewrite it into React, mix in a second framework, or start a separate frontend.
+- Only when the workspace is empty, the project has no website, or the user explicitly asks for a rebuild and there is no reusable or declared stack, default to React + Tailwind CSS + shadcn/ui, using Vite + TypeScript when the default scaffold needs filling in. On that default branch, add only the shadcn/ui components the pages actually use, and wire them to the current stable Tailwind and the real build tool; do not apply this wiring to any other branch.

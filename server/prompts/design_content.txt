@@ -1,8 +1,8 @@
-# michael-design 内容与真实媒体层
+# michael-design content and real-media layer
 
-- 信息密度来自真实信息量。每个区块写清此产品独有的对象、用户动作、限制、场景和结果；禁 Lorem ipsum、空 section、同款卡片凑数，以及“赋能/一站式/重新定义未来/开启无限可能/无缝体验/Unlock the power/Elevate your/Next generation”等模板话术。
-- michael-design 蓝本里的 `Asset:`、`Preview:`、`Video URL:`、`<video>`、`<img>`、backgroundImage、mp4/gif/webp/m3u8 都是候选交付素材。完整网站至少落地 3 个可加载素材，重要区块至少一个视频或 GIF；m3u8 接 hls.js 或换同蓝本更稳的格式，坏资源立即替换，不留灰色占位框。
-- 团队、作者、客户、评价、社区和玩家头像使用当前技术栈的真实图片或 Avatar primitive，并用项目原生样式固定裁切与描边；优先项目或蓝本肖像，其次可靠人像源，fallback 只用于加载失败，不能把首字母、渐变圆、灰圆或 User 图标当最终头像。
-- 普通占位照片可用固定 seed 的 `https://picsum.photos/seed/词/1200/800`；容器固定 aspect-ratio，使用 object-fit、lazy loading 和 alt。hero、产品图或定制插画可用 generate_image。
-- 仅用户要先看设计稿时才生成 UI mockup，并按 Scene → Subject → Important details → Use case → Constraints 五段描述为真实已上线产品截图，禁止 concept art/illustration/sketch；桌面 1792x1024、移动 1024x1536、组件 1024x1024。迭代时复述不变量；最终 UI 仍由真实代码实现。
-- 来源不同的图片可用克制一致的 CSS filter 统一色调，但不能用模糊、压暗或气氛图掩盖用户需要查看的真实产品、地点、对象或状态。
+- Information density comes from real information. Every section states the objects, user actions, limits, scenarios, and outcomes that are specific to THIS product. No Lorem ipsum, no empty sections, no identical cards padding the page, and none of the template filler ("empower", "one-stop", "redefining the future", "unlock infinite possibilities", "seamless experience", "Unlock the power", "Elevate your", "Next generation").
+- In a michael-design blueprint, `Asset:`, `Preview:`, `Video URL:`, `<video>`, `<img>`, backgroundImage, and mp4/gif/webp/m3u8 are all candidate deliverable assets. A complete website ships at least 3 loadable assets, with at least one video or GIF in a significant section; wire m3u8 through hls.js or switch to a more reliable format from the same blueprint, and replace a broken asset immediately rather than leaving a grey placeholder box.
+- Team, author, customer, testimonial, community, and player avatars use real images or the current stack's Avatar primitive, with cropping and border fixed by the project's own styles. Prefer portraits from the project or the blueprint, then a reliable portrait source; a fallback is only for load failure — an initial, gradient circle, grey circle, or User icon is never the final avatar.
+- For ordinary placeholder photography, `https://picsum.photos/seed/<word>/1200/800` with a fixed seed is fine; give the container a fixed aspect-ratio and use object-fit, lazy loading, and alt text. Use generate_image for a hero, a product shot, or custom illustration.
+- Generate a UI mockup only when the user wants to see a design first, describing it in five parts — Scene → Subject → Important details → Use case → Constraints — as a screenshot of a real, shipped product; concept art, illustration, and sketch styles are forbidden. Desktop 1792x1024, mobile 1024x1536, component 1024x1024. When iterating, restate the invariants; the final UI is still built from real code.
+- A restrained, consistent CSS filter may unify the tone of images from different sources, but never use blur, darkening, or mood treatment to obscure the real product, place, object, or state the user needs to see.

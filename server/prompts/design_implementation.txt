@@ -1,5 +1,5 @@
-# michael-design 实现入口
+# michael-design implementation entry
 
-这段只在用户要创建或修改真实 UI 时出现。实现必须以当前项目源码、现有设计语言、已采用的 michael-design 蓝本和核心层确定的语义令牌为准；只改请求涉及的范围，不因加载了设计规则就擅自重做整个产品。
+This block appears only when the user wants to create or modify real UI. Implementation follows the current project's source, its existing design language, the michael-design blueprint already adopted, and the semantic tokens fixed by the core layer; change only the scope the request covers — loading design rules is never licence to redo the whole product.
 
-先读相关入口、组件、样式、token 和素材，再实现完整状态与真实交互。具体规则由本轮按需组合的组件、脚手架、内容媒体、数据、动效、工程和验证模块提供；未加载的重型模块不代表可以臆造其要求，需要时用 `knowledge_search(domain="michael-design")` 或 `search_tools` 补取。
+Read the relevant entry points, components, styles, tokens, and assets first, then implement complete states and real interactions. The specific rules come from the component, scaffold, content/media, data, motion, engineering, and verification modules combined for this round as needed; a heavy module that was not loaded does not mean you may invent its requirements — fetch them with `knowledge_search(domain="michael-design")` or `search_tools` when you need them.
