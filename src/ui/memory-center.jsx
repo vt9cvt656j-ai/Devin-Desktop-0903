@@ -18,8 +18,13 @@ import { cn } from "./lib/cn.js";
  * component just hands over a container node and tells main.js when the text changed so it can
  * rebuild. React owns layout; the widget owns itself.
  */
+// Listed here rather than inline so the rail stays a list of sections, not markup.
+const SECTIONS = [
+  { value: "memory", label: "Memory" },
+  { value: "graph", label: "Graph" },
+];
+
 export function MemoryCenter({
-  rootLabel,
   hasRoot,
   initialProject,
   initialGlobal,
@@ -75,31 +80,44 @@ export function MemoryCenter({
 
   return (
     <Dialog defaultOpen onOpenChange={(open) => { if (!open) onClose?.(); }}>
-      <DialogContent className="flex h-[78vh] max-w-4xl flex-col gap-0 overflow-hidden rounded-2xl p-0 shadow-xl">
+      <DialogContent className="flex h-[78vh] sm:max-w-4xl flex-col gap-0 overflow-hidden rounded-2xl p-0 shadow-xl">
         <DialogHeader className="shrink-0 space-y-1 border-b border-border px-5 pt-5 pb-4">
-          <div className="flex items-baseline gap-3">
-            <DialogTitle className="text-base">Memory</DialogTitle>
-            <span
-              className="truncate font-mono text-[11px] text-muted-foreground"
-              data-i18n-skip
-              title={rootLabel}
-            >
-              {rootLabel}
-            </span>
-          </div>
+          <DialogTitle className="text-base">Memory</DialogTitle>
           <DialogDescription className="text-[12px]">
             One entry per line. Project memory applies here; preferences travel with you.
           </DialogDescription>
         </DialogHeader>
 
-        <Tabs value={tab} onValueChange={setTab} className="flex min-h-0 flex-1 flex-col">
-          <TabsList className="mx-5 mt-4 w-fit shrink-0">
-            <TabsTrigger value="memory">Memory</TabsTrigger>
-            <TabsTrigger value="graph">Graph</TabsTrigger>
+        {/* A rail listing every section rather than a two-tab switcher: the point of this panel
+            is to show what the assistant remembers and where each kind lives, so the sections
+            should be visible at once instead of one being hidden behind the other. Text only —
+            these are short, unambiguous words that an icon can only make vaguer. Same shape as
+            the advanced-settings rail. */}
+        <Tabs
+          value={tab}
+          onValueChange={setTab}
+          orientation="vertical"
+          className="flex min-h-0 flex-1 flex-row gap-0"
+        >
+          <TabsList className="h-auto w-40 shrink-0 flex-col items-stretch justify-start gap-0.5 rounded-none border-r border-border bg-transparent p-3">
+            {SECTIONS.map((s) => (
+              <TabsTrigger
+                key={s.value}
+                value={s.value}
+                className={cn(
+                  // flex-none: TabsTrigger ships flex-1 for a horizontal bar, which in a
+                  // vertical rail makes every item stretch to fill the column height.
+                  "h-9 flex-none justify-start rounded-lg px-3 text-[13px] font-normal",
+                  "data-[state=active]:bg-primary/10 data-[state=active]:font-medium data-[state=active]:text-primary data-[state=active]:shadow-none",
+                )}
+              >
+                {s.label}
+              </TabsTrigger>
+            ))}
           </TabsList>
 
-          <TabsContent value="memory" className="mt-0 flex min-h-0 flex-1 gap-4 px-5 pt-4 pb-4">
-            <section className="flex min-h-0 flex-1 flex-col gap-1.5">
+          <TabsContent value="memory" className="mt-0 flex min-h-0 min-w-0 flex-1 gap-4 px-5 py-4">
+            <section className="flex min-h-0 min-w-0 flex-1 flex-col gap-1.5">
               <h3 className="text-[12px] font-medium text-foreground">
                 Project memory
                 {!hasRoot ? (
@@ -116,7 +134,7 @@ export function MemoryCenter({
                 placeholder="This project uses pnpm&#10;UI goes through shadcn/ui"
               />
             </section>
-            <section className="flex min-h-0 flex-1 flex-col gap-1.5">
+            <section className="flex min-h-0 min-w-0 flex-1 flex-col gap-1.5">
               <h3 className="text-[12px] font-medium text-foreground">Global preferences</h3>
               <textarea
                 ref={globalRef}
@@ -136,7 +154,7 @@ export function MemoryCenter({
           <TabsContent
             value="graph"
             forceMount
-            className="mt-0 min-h-0 flex-1 px-5 pt-4 pb-4 data-[state=inactive]:hidden"
+            className="mt-0 min-h-0 flex-1 px-5 py-4 data-[state=inactive]:hidden"
           >
             <div className="relative h-full overflow-hidden rounded-xl border border-border bg-muted/30">
               <div ref={attachGlobe} className="h-full w-full" />
