@@ -226,6 +226,18 @@ pub async fn admin_confirm_order(
     if order.status != "pending" {
         return Err(AppError::bad("订单状态不是待支付"));
     }
+    // Manual confirmation is for orders settled outside Stripe. A Stripe order is a
+    // checkout session, and Stripe decides whether it was paid — the webhook grants it.
+    //
+    // Without this guard the console showed a 确认收款 button beside every abandoned
+    // checkout, and pressing it granted the plan for money that was never taken. Of the
+    // five pending Stripe rows on the console right now, Stripe reports all five as
+    // expired and unpaid.
+    if order.method == "stripe" {
+        return Err(AppError::bad(
+            "这是 Stripe 订单，付款状态由 Stripe 决定，不能手动确认。已付款的订单会由 webhook 自动发放。",
+        ));
+    }
     let uid = order
         .user_id
         .ok_or_else(|| AppError::bad("订单无关联用户，无法发放"))?;
@@ -271,4 +283,23 @@ pub async fn admin_cancel_order(
         return Err(AppError::bad("订单不存在或状态不可取消"));
     }
     Ok(Json(json!({ "ok": true })))
+}
+
+#[cfg(test)]
+mod tests {
+    /// The guard is a string comparison on `orders.method`, so the test that matters is
+    /// that the source still refuses "stripe" before reaching the grant. Asserting on the
+    /// shipped text keeps a future edit from quietly dropping it: without this guard the
+    /// console grants a plan for an abandoned checkout, which is free product.
+    #[test]
+    fn manual_confirmation_refuses_stripe_orders() {
+        let src = include_str!("pay.rs");
+        let body = src
+            .split("pub async fn admin_confirm_order")
+            .nth(1)
+            .expect("admin_confirm_order must exist");
+        let guard = body.find(r#"order.method == "stripe""#).expect("stripe orders must be refused");
+        let grant = body.find("apply_plan").expect("the grant call must exist");
+        assert!(guard < grant, "the method guard must come before anything is granted");
+    }
 }

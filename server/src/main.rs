@@ -176,6 +176,8 @@ async fn main() -> anyhow::Result<()> {
             get(pay::admin_list_prices).post(pay::admin_create_price),
         )
         .route("/api/admin/prices/:id", delete(pay::admin_delete_price))
+        // What Stripe says happened, for the console's payments page.
+        .route("/api/admin/stripe/payments", get(stripe::admin_payments))
         .route("/api/billing/catalog", get(stripe::catalog))
         .route("/api/billing/checkout", post(stripe::checkout))
         // Unauthenticated by design: Stripe proves itself with the signature.

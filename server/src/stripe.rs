@@ -260,6 +260,97 @@ fn display_amount(
     (cny, usd, currency, minor)
 }
 
+/// `GET /api/admin/stripe/payments` — what Stripe says happened, for the console.
+///
+/// The console used to list the local `orders` table and offer a "confirm payment" button
+/// beside each pending row. That table records checkout sessions we *created*, not money
+/// that *arrived*, so an abandoned checkout sat there looking like an invoice awaiting
+/// approval. Stripe is the only thing that knows whether a card was charged, so the
+/// console asks Stripe.
+///
+/// Each row is reconciled against the local order so the operator can see the case that
+/// actually matters: Stripe took the money and this gateway granted nothing.
+pub async fn admin_payments(
+    State(state): State<AppState>,
+    claims: Claims,
+) -> ApiResult<Json<serde_json::Value>> {
+    if claims.role != "admin" {
+        return Err(AppError::forbidden("需要管理员权限"));
+    }
+    let Some(key) = secret_key() else {
+        return Ok(Json(json!({ "configured": false, "payments": [], "unfulfilled": 0 })));
+    };
+
+    // Sessions rather than payment intents: a session carries the buyer's email, the
+    // amount, the payment status and the id this gateway stored on its own order, so one
+    // list answers every column the console shows.
+    let res = state
+        .update_http
+        .get(format!("{STRIPE_API}/checkout/sessions"))
+        .bearer_auth(&key)
+        .query(&[("limit", "100")])
+        .send()
+        .await
+        .map_err(|e| AppError::internal(format!("Stripe 无法访问：{e}")))?;
+    let body: serde_json::Value = res.json().await.unwrap_or_else(|_| json!({}));
+    if let Some(err) = body.get("error").and_then(|e| e.get("message")).and_then(|m| m.as_str()) {
+        return Err(AppError::internal(format!("Stripe 返回错误：{err}")));
+    }
+    let sessions = body.get("data").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+
+    // One query for every session on the page, not one per row.
+    let ids: Vec<String> = sessions
+        .iter()
+        .filter_map(|s| s.get("id").and_then(|v| v.as_str()).map(str::to_owned))
+        .collect();
+    let local: std::collections::HashMap<String, String> = sqlx::query_as::<_, (String, String)>(
+        "SELECT stripe_session_id, status FROM orders WHERE stripe_session_id = ANY($1)",
+    )
+    .bind(&ids)
+    .fetch_all(&state.db)
+    .await
+    .unwrap_or_default()
+    .into_iter()
+    .collect();
+
+    let mut unfulfilled = 0;
+    let payments: Vec<serde_json::Value> = sessions
+        .iter()
+        .map(|s| {
+            let id = s.get("id").and_then(|v| v.as_str()).unwrap_or_default();
+            let payment_status = s.get("payment_status").and_then(|v| v.as_str()).unwrap_or("");
+            let paid = payment_status == "paid" || payment_status == "no_payment_required";
+            let order_status = local.get(id).cloned();
+            // The case worth alarming about: Stripe took the money, the local order never
+            // reached 'paid'. Everything else is an abandoned checkout, which is normal.
+            let needs_attention = paid && order_status.as_deref() != Some("paid");
+            if needs_attention {
+                unfulfilled += 1;
+            }
+            json!({
+                "session_id": id,
+                "created": s.get("created").and_then(|v| v.as_i64()),
+                "amount": s.get("amount_total").and_then(|v| v.as_i64()),
+                "currency": s.get("currency").and_then(|v| v.as_str()),
+                "email": s.pointer("/customer_details/email").and_then(|v| v.as_str()),
+                "status": s.get("status").and_then(|v| v.as_str()),
+                "payment_status": payment_status,
+                "paid": paid,
+                "payment_intent": s.get("payment_intent").and_then(|v| v.as_str()),
+                // None when Stripe knows about a session this gateway never recorded.
+                "order_status": order_status,
+                "needs_attention": needs_attention,
+            })
+        })
+        .collect();
+
+    Ok(Json(json!({
+        "configured": true,
+        "payments": payments,
+        "unfulfilled": unfulfilled,
+    })))
+}
+
 /// Which currency to show first, from where the request came from.
 ///
 /// Cloudflare sits in front of this origin and stamps `CF-IPCountry` on every request,

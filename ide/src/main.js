@@ -34246,6 +34246,29 @@ function _modelEventHasProgress(ev) {
   return false;
 }
 
+/**
+ * How to resume a turn whose model stream dropped mid-output, decided from what actually happened
+ * so far. Pure, so it is unit-tested without the streaming closure.
+ *
+ * The subtlety this encodes: a turn's tool calls normally run only after the whole turn settles,
+ * but an EAGER write (write_file lands the moment its arguments finish streaming) is the exception.
+ *
+ *   - "stop": an eager write already executed — re-issuing that call on a fresh attempt would write
+ *     the file twice. The old code bailed on *any* streamed tool call; this narrows the stop to the
+ *     one genuinely unsafe case. (Folding the completed call + its result into history to continue
+ *     even here is a follow-up.)
+ *   - "continue": prose already reached the user → prefill it and continue. The text is not
+ *     replayed (prompt-cached), and a tool call that was only half-streamed (its JSON never closed,
+ *     so it never ran) is re-issued cleanly as the model keeps going.
+ *   - "rerequest": nothing visible streamed and nothing executed (a pure reasoning drop, or a
+ *     mid-tool-call drop with no preceding prose) → re-run the original turn cleanly. This is the
+ *     exact case that used to abandon the round with "本轮不会重放".
+ */
+function _streamResumeMode({ eagerExecuted, hasProse }) {
+  if (eagerExecuted) return "stop";
+  return hasProse ? "continue" : "rerequest";
+}
+
 async function _runModelRequestWithRetry({
   invoke,
   onEvent = () => {},
@@ -35903,16 +35926,28 @@ async function _agentModelTurn({ config, messages, toolSchemas, toolRegistry = n
          * 仍然按原样停下，把决定权交回用户。
          */
         buildResumeInvoke: async ({ resume, resumeLimit }) => {
-          if (byIndex.size > 0) return null;
+          const eagerExecuted = [...byIndex.values()].some((e) => e && e._eagerNotified);
           // prefill 不允许结尾有空白，否则上游会直接 400。
           const partial = String(acc || "").replace(/\s+$/, "");
-          if (!partial) return null;
-          const resumeMsgs = [..._l0Msgs, { role: "assistant", content: partial }];
+          const mode = _streamResumeMode({ eagerExecuted, hasProse: !!partial });
+          if (mode === "stop") return null; // an eager write already landed — do not risk a re-write
+          // Nothing executed → the half-streamed, unclosed tool call never ran. Drop the fragments
+          // so they cannot leak into the resumed turn's collection; the continuation re-emits them.
+          byIndex.clear();
+          if (mode === "continue") {
+            const resumeMsgs = [..._l0Msgs, { role: "assistant", content: partial }];
+            showAgentRetryToast(
+              `连接中断，正在从断点继续（${resume}/${resumeLimit}）——已生成的内容会保留，不重跑本轮`,
+              true,
+            );
+            return (cb) => backend.aiChatWithTools(_turnConfig, resumeMsgs, _l0Tools, cb);
+          }
+          // mode === "rerequest": nothing visible streamed yet → re-run the turn cleanly.
           showAgentRetryToast(
-            `连接中断，正在从断点继续（${resume}/${resumeLimit}）——已生成的内容会保留，不重跑本轮`,
+            `连接中断，正在重新发起本轮（${resume}/${resumeLimit}）——尚无内容产出，不会重复`,
             true,
           );
-          return (cb) => backend.aiChatWithTools(_turnConfig, resumeMsgs, _l0Tools, cb);
+          return (cb) => backend.aiChatWithTools(_turnConfig, _l0Msgs, _l0Tools, cb);
         },
         onResume: ({ resume }) => {
           _agentTimelineRecordMetric(timeline, _timelineTurn, "modelResume", 0, Date.now(), { attempt: resume });
