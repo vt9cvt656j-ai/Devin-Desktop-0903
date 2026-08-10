@@ -881,38 +881,58 @@ body.is-tauri.is-mac.is-fullscreen .titlebar {
 .tree {
   flex: 1;
   overflow: auto;
-  padding: 6px 8px;
+  /* No horizontal padding: rows run edge to edge so their highlight does too. */
+  padding: 4px 0;
   user-select: none;
   -webkit-user-select: none;
 }
 .row {
+  position: relative;
+  isolation: isolate;
   display: flex;
   align-items: center;
   gap: 6px;
-  height: 27px;
-  padding: 0 6px;
-  border-radius: 7px;
+  /* 22px, the height VS Code uses. At 27px with a rounded pill inset from both edges,
+     two adjacent highlighted rows read as one block instead of a list of files. */
+  height: 22px;
+  padding: 0 8px;
   font-size: 13px;
   cursor: pointer;
   white-space: nowrap;
-  transition: background 0.1s ease;
   user-select: none;
   -webkit-user-select: none;
 }
-.row:hover {
-  background: var(--hover);
+/* The highlight spans the whole panel rather than sitting in a pill. Indentation here
+   comes from nested wrappers, so a background on .row would start at the indent; this
+   pseudo-element stretches far past the left edge instead. Safe in LTR: content to the
+   left of the origin never becomes scrollable, so it cannot add a horizontal scrollbar,
+   and .tree clips it. */
+.row::before {
+  content: "";
+  position: absolute;
+  z-index: -1;
+  top: 0;
+  bottom: 0;
+  right: 0;
+  left: -1000px;
+  background: transparent;
+  transition: background 0.1s ease;
 }
-.row.is-active {
-  background: var(--sel);
-  color: var(--accent);
-  font-weight: 550;
+.row:hover::before { background: var(--hover); }
+/* revealInTree() flashes the row for a file the agent just touched. It fades out on its own,
+   so it never becomes a second, competing selection state. */
+@keyframes tree-flash {
+  from { background: color-mix(in srgb, var(--accent) 34%, transparent); }
+  to   { background: transparent; }
 }
+.row.flash::before { animation: tree-flash 900ms ease-out; }
+.row.is-active::before { background: var(--sel); }
+/* Colour only — no weight change. Reweighting the selected row shifts its glyphs and
+   makes the whole list twitch as you arrow through it. */
+.row.is-active { color: var(--accent); }
 /* multi-selection highlight (Shift/Cmd-click) — distinct from the active file */
-.row.is-selected {
-  background: rgba(124, 92, 255, 0.16);
-  box-shadow: inset 0 0 0 1px rgba(124, 92, 255, 0.4);
-}
-.row.is-selected.is-active { background: rgba(124, 92, 255, 0.26); }
+.row.is-selected::before { background: rgba(124, 92, 255, 0.18); }
+.row.is-selected.is-active::before { background: rgba(124, 92, 255, 0.28); }
 .row .chev,
 .row .chev-spacer {
   width: 14px;
@@ -933,9 +953,22 @@ body.is-tauri.is-mac.is-fullscreen .titlebar {
   -webkit-user-select: none;
 }
 .children {
+  position: relative;
   margin-left: 13px;
-  border-left: 1px solid var(--line);
   padding-left: 3px;
+}
+/* Indent guide. As a border on this wrapper it sat *under* the row highlight and
+   disappeared on exactly the row you were looking at; VS Code draws it over the top. */
+.children::after {
+  content: "";
+  position: absolute;
+  z-index: 1;
+  top: 0;
+  bottom: 0;
+  left: 0;
+  width: 1px;
+  background: var(--line);
+  pointer-events: none;
 }
 
 /* file-type icon tints */
@@ -10746,8 +10779,16 @@ button.agent-plan__fold--toggle:focus-visible { outline: 2px solid #1a73e8; outl
 }
 .workspace-root__row {
   position: relative;
-  font-weight: 650;
+  font-weight: 600;
 }
+/* A root is a heading, not a file. It carries .is-active whenever it is the current
+   workspace, so it wore the same filled selection as the open file directly beneath it —
+   two solid rows stacked with nothing between them, which is what made this look like a
+   single clump rather than a tree. Which root is current now reads from the name. */
+.workspace-root__row.is-active::before { background: transparent; }
+.workspace-root__row:hover::before { background: var(--hover); }
+.workspace-root__row .name { color: var(--text-dim); }
+.workspace-root__row.is-active .name { color: var(--text); }
 .workspace-root__toggle,
 .workspace-root__close {
   display: inline-flex;

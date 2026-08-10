@@ -95,3 +95,49 @@ test("every profile write goes through the sticky merge", () => {
     assert.match(line, /_sessionStableSemanticProfile\(/, `unmerged profile write: ${line}`);
   }
 });
+
+// ---------------------------------------------------------------------------
+// File tree — the explorer rows.
+// ---------------------------------------------------------------------------
+const APP_CSS = fs.readFileSync("src/styles/app.css", "utf8");
+const REFINE_CSS = fs.readFileSync("src/styles/refine.css", "utf8");
+
+test("a workspace root does not wear the file selection", () => {
+  // The root row carries .is-active whenever it is the current workspace, so it rendered the
+  // same filled highlight as the open file directly beneath it — two solid rows touching, which
+  // is what made the explorer read as one clump instead of a tree.
+  assert.match(APP_CSS, /\.workspace-root__row\.is-active::before \{ background: transparent; \}/,
+    "the root must not paint the active-file highlight");
+  assert.match(APP_CSS, /\.workspace-root__row\.is-active \.name \{ color: var\(--text\); \}/,
+    "which root is current has to remain readable some other way");
+});
+
+test("the row highlight spans the panel instead of sitting in a pill", () => {
+  // Indentation comes from nested .children wrappers, so a background on .row itself starts at
+  // the indent. The highlight is a pseudo-element stretched past the left edge instead.
+  assert.match(APP_CSS, /\.row::before \{[^}]*left: -1000px;/s, "the highlight must extend past the indent");
+  assert.match(APP_CSS, /\.row:hover::before \{ background: var\(--hover\); \}/);
+  assert.match(APP_CSS, /\.row\.is-active::before \{ background: var\(--sel\); \}/);
+  // A background on .row would be drawn at the indented width and defeat the whole thing.
+  const rowBlock = APP_CSS.slice(APP_CSS.indexOf("\n.row {"), APP_CSS.indexOf("\n.row::before"));
+  assert.doesNotMatch(rowBlock, /background:/, ".row itself must stay transparent");
+  assert.doesNotMatch(rowBlock, /border-radius:/, "no pill");
+  assert.match(rowBlock, /height: 22px;/, "VS Code's row height");
+});
+
+test("the tree stylesheet has no selectors that match nothing", () => {
+  // refine.css carried a .tree-item / .tree__row / #tree [role="treeitem"] block whose comment
+  // claimed to have fixed the row spacing. None of those three exist in this DOM, so it never
+  // applied — the comment described a fix that was not happening, which is worse than no comment.
+  // Compare rules only; the note left in its place naturally mentions the dead names.
+  const rules = REFINE_CSS.replace(/\/\*[\s\S]*?\*\//g, "");
+  for (const dead of [".tree-item", ".tree__row", 'role="treeitem"']) {
+    assert.ok(!rules.includes(dead), `${dead} matches no element and must not be styled`);
+  }
+
+  assert.match(SRC, /document\.querySelector\(`\.row\[data-path=/,
+    "revealInTree must query the class the rows actually have — `.tree-item` matched nothing, so " +
+    "every caller, including the agent marking each file it touches, silently did nothing");
+  assert.match(APP_CSS, /\.row\.flash::before \{ animation: tree-flash/,
+    "and .flash needs a style behind it, which it never had either");
+});

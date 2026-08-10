@@ -203,17 +203,10 @@
   box-shadow: var(--elev-1);
 }
 
-/* 文件树行距：原来行高挤在一起，给到 26px 并加圆角 hover，指哪块亮哪块 */
-.tree-item,
-.tree__row,
-#tree [role="treeitem"] {
-  min-height: 26px;
-  padding: 0 var(--sp-2);
-  margin: 0 var(--sp-2);
-  font-size: var(--t-body);
-  border-radius: var(--ui-radius-md, 6px);
-  transition: background 120ms ease;
-}
+/* 文件树行距不在这里。这块原本写的是 .tree-item / .tree__row / #tree [role="treeitem"]，
+   三个选择器在这套 DOM 里一个都不存在——真正的行是 app.css 里的 .row，所以这段从写下
+   那天起就没生效过，而注释还写着"原来行高挤在一起"，读起来像是已经修好了。行的度量、
+   整幅高亮和缩进导轨都在 app.css 的 .row / .children 上。 */
 
 /* ---------------------------------------------------------------------------
  * 6. 标题栏标题 —— 窄窗口下会折成三行，把整条标题栏顶高

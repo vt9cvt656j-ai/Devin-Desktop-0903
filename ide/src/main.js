@@ -7581,12 +7581,18 @@ document.addEventListener("keydown", (e) => {
 // 面包屑路径条已整体移除（只显示文件名没信息量还占一行，用户反馈无用）。
 
 function revealInTree(path) {
-  const item = document.querySelector(`.tree-item[data-path="${CSS.escape(path)}"]`);
-  if (item) {
-    item.scrollIntoView({ block: "center" });
-    item.classList.add("flash");
-    setTimeout(() => item.classList.remove("flash"), 600);
-  }
+  // Rows are `.row` (app.css). The old `.tree-item` selector matched nothing in this DOM, so
+  // every caller — including the agent marking each file it touches — silently did nothing;
+  // `.flash` had no style behind it either.
+  const item = document.querySelector(`.row[data-path="${CSS.escape(path)}"]`);
+  if (!item) return;
+  // "nearest", not "center": scrolling a row that is already on screen into the middle of the
+  // list makes the tree jump under the cursor for no reason.
+  item.scrollIntoView({ block: "nearest" });
+  item.classList.remove("flash");
+  void item.offsetWidth; // restart the animation when the same file is touched twice
+  item.classList.add("flash");
+  setTimeout(() => item.classList.remove("flash"), 900);
 }
 
 const pinnedTabs = new Set();
