@@ -4146,8 +4146,8 @@ mod tests {
             "updated_date",
             "last_activity_date",
             "retrieved_at",
-            "新技术讨论",
-            "不代表互联网全部社区",
+            "discussion of new technology",
+            "not every community on the internet",
         ] {
             assert!(
                 description.contains(required),
@@ -4196,9 +4196,9 @@ mod tests {
                 .to_string()
         };
         let web = description_for("web_search");
-        assert!(web.contains("通用联网搜索兜底"));
-        assert!(web.contains("专业数据库"));
-        assert!(web.contains("不能把摘要或本轮 retrieved_at 当成最新事实"));
+        assert!(web.contains("General web-search fallback"));
+        assert!(web.contains("specialist databases"));
+        assert!(web.contains("never treat a snippet, or this round's retrieved_at, as a current fact"));
 
         let current_time = description_for("current_time");
         assert!(current_time.contains("only tells you when this request was made"));
@@ -4305,15 +4305,15 @@ mod tests {
             .and_then(|value| value.as_str())
             .expect("local_discovery should describe its real data contract");
         for expected in [
-            "先使用 Nominatim，无法接受时才后备到 ArcGIS World Geocoding",
+            "resolved with Nominatim first, falling back to ArcGIS World Geocoding only when that is not acceptable",
             "OpenStreetMap Overpass",
             "Open-Meteo",
-            "Haversine 直线距离",
+            "Haversine straight-line distance",
             "source_statuses[].status=success",
-            "retrieved_at 是 IDE 本次请求完成时间",
-            "source_statuses[].data_as_of（存在时）只是提供方暴露的数据集/快照时间",
-            "weather.observed_at 是提供方报告的天气观测时间",
-            "缺失的 rating、price、open_now 必须保持未知",
+            "retrieved_at is when the IDE finished this request",
+            "source_statuses[].data_as_of, when present, is only the dataset/snapshot time the provider exposes",
+            "weather.observed_at is the observation time the provider reports",
+            "a missing rating, price or open_now must stay unknown",
         ] {
             assert!(
                 description.contains(expected),

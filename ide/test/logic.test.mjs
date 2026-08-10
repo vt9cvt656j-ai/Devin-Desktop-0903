@@ -7683,9 +7683,9 @@ test("semantic orchestration chooses the minimum role topology and lazy collabor
     ["frontend", "backend", "database", "security", "test", "devops", "design", "docs"],
     "the lazy server worker schema must expose the settled implementation roles");
   const cloudDescription = (name) => cloudTools.find((tool) => tool?.function?.name === name)?.function?.description || "";
-  assert.match(cloudDescription("run_subagent"), /staged_roles.*只读角色/,
+  assert.match(cloudDescription("run_subagent"), /staged_roles.*read-only roles/,
     "the lazy read-only schema must explain contract-first collaboration");
-  assert.match(cloudDescription("run_worker"), /parallel_roles.*scope 必须互不重叠/,
+  assert.match(cloudDescription("run_worker"), /parallel_roles.*scopes must not overlap/,
     "the lazy worker schema must explain real parallel ownership boundaries");
 });
 
@@ -11937,9 +11937,9 @@ test("browser automation keeps the browser alive and has a semantic autofill act
   assert.ok(browserTool, "browser tool schema must be present");
   assert.ok(browserTool.parameters.properties.action.enum.includes("autofill"),
     "browser schema should expose autofill as a first-class form action");
-  assert.match(browserTool.description, /sticky 复用/,
+  assert.match(browserTool.description, /sticky and reused by default/,
     "tool description should tell the model to reuse the browser instead of repeatedly closing it");
-  assert.match(browserTool.description, /真实 pointer\/mouse 事件/,
+  assert.match(browserTool.description, /real pointer\/mouse events/,
     "tool description should advertise the stronger browser action layer");
   assert.match(browserTool.description, /drag|slide|swipe|wheel/,
     "tool description should advertise complex gesture support");
@@ -11963,19 +11963,19 @@ test("browser automation keeps the browser alive and has a semantic autofill act
     "browser schema should expose slider percent control");
   assert.match(JSON.stringify(browserTool.parameters.properties.dx), /drag|swipe|wheel/,
     "browser schema should expose gesture deltas");
-  assert.match(JSON.stringify(browserTool.parameters.properties.toTarget), /拖拽终点/,
+  assert.match(JSON.stringify(browserTool.parameters.properties.toTarget), /drop target/,
     "browser schema should expose semantic drag destinations");
   assert.match(JSON.stringify(browserTool.parameters.properties.modifiers), /Meta.*Control|Control.*Meta/,
     "browser schema should expose keyboard and mouse modifiers");
-  assert.match(JSON.stringify(browserTool.parameters.properties.absent), /消失|不存在/,
+  assert.match(JSON.stringify(browserTool.parameters.properties.absent), /disappear|not exist/,
     "browser schema should expose wait-until-absent");
-  assert.match(JSON.stringify(browserTool.parameters.properties.expectText), /动作后验收/,
+  assert.match(JSON.stringify(browserTool.parameters.properties.expectText), /Acceptance check after the action/,
     "browser schema should expose post-action text expectations");
   assert.match(JSON.stringify(browserTool.parameters.properties.expectSelector), /expectAbsent/,
     "browser schema should expose post-action selector expectations");
   assert.match(browserTool.description, /Shadow DOM|iframe/,
     "browser schema should advertise deeper browser observation, not only keyword actions");
-  assert.match(JSON.stringify(browserTool.parameters.properties.force), /真正关闭浏览器/,
+  assert.match(JSON.stringify(browserTool.parameters.properties.force), /actually shuts the browser down/,
     "browser close must require an explicit force flag to kill the session");
 
   const autofill = load("_browserAutofillJS");
@@ -21698,14 +21698,14 @@ test("run_cmd / run_in_terminal descriptions carry the TTY split (the model read
   // terminal — otherwise the model has no way to know which tool a bubbletea program needs.
   const registered = JSON.parse(SERVER_TOOLS);
   const by = new Map(registered.map((t) => [t.function.name, t.function.description || ""]));
-  assert.match(by.get("run_cmd"), /没有真实终端|没有.{0,2}TTY|\/dev\/tty/, "run_cmd must say it has no TTY");
+  assert.match(by.get("run_cmd"), /no real terminal \(TTY\)|\/dev\/tty/, "run_cmd must say it has no TTY");
   assert.match(by.get("run_cmd"), /run_in_terminal/, "run_cmd must point TUI/interactive programs at run_in_terminal");
-  assert.match(by.get("run_in_terminal"), /真 PTY|真实终端.*TTY|TUI/, "run_in_terminal must advertise the real terminal for TUIs");
+  assert.match(by.get("run_in_terminal"), /real terminal tab \(a true PTY \/ TTY\)|TUI/, "run_in_terminal must advertise the real terminal for TUIs");
   // The behavioural core: the agent RUNS the program in the real terminal itself; it must not
   // hand the user a command to type. (Reproduced live: the agent correctly diagnosed "needs a
   // real terminal" yet still told the user to run it in Terminal 1.)
-  assert.match(by.get("run_in_terminal"), /你自己|不是把命令给用户/, "run_in_terminal must say the agent launches it, not the user");
-  assert.match(by.get("run_in_terminal"), /甩给用户|就是真终端/, "run_in_terminal must forbid handing off to the user's own terminal");
+  assert.match(by.get("run_in_terminal"), /you start the user's program yourself|do not hand them a command to type/, "run_in_terminal must say the agent launches it, not the user");
+  assert.match(by.get("run_in_terminal"), /push the command onto the user's own terminal|this IDE terminal is a real terminal/, "run_in_terminal must forbid handing off to the user's own terminal");
 });
 
 test("the prompt makes running a program the agent's own action, not a hand-off", () => {
