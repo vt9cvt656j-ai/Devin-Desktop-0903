@@ -296,12 +296,46 @@ let _launchConfigsCache = null;
 function _michaelBase() {
   return (localStorage.getItem("michael_api") || (inTauri ? "https://code.mrday.one" : window.location.origin)).replace(/\/+$/, "");
 }
+/*
+ * A stable name for this install, so Devices lists machines rather than sign-ins.
+ *
+ * Random, stored once, and not derived from anything about the computer. The server uses
+ * it only to group rows and to replace this device's previous session when you sign in
+ * again; it grants nothing.
+ */
+function _michaelDeviceId() {
+  const KEY = "mrday.device_id";
+  try {
+    const saved = localStorage.getItem(KEY);
+    if (saved) return saved;
+  } catch (_) {}
+  let id;
+  try {
+    id = crypto.randomUUID();
+  } catch (_) {
+    const b = new Uint8Array(16);
+    crypto.getRandomValues(b);
+    id = Array.from(b, (x) => x.toString(16).padStart(2, "0")).join("");
+  }
+  try { localStorage.setItem(KEY, id); } catch (_) {}
+  return id;
+}
+
 // POST to the central auth API; returns a _finishLogin-shaped result.
+//
+// `device` is sent because the server cannot work this out on its own: a Tauri window
+// reports the system webview's User-Agent, which is indistinguishable from Safari, so
+// without the hint every desktop sign-in was filed as a browser. The same bundle also
+// runs in a plain browser during development, and there it is honestly "web".
 async function _michaelAuth(path, body) {
   const r = await fetch(_michaelBase() + "/api/auth/" + path, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
+    body: JSON.stringify({
+      ...body,
+      device: inTauri ? "desktop" : "web",
+      device_id: _michaelDeviceId(),
+    }),
   });
   const j = await r.json().catch(() => ({}));
   if (!r.ok) throw new Error(j.error || "操作失败");
