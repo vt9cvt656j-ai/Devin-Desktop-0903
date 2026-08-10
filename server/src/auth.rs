@@ -163,6 +163,21 @@ pub(crate) fn device_kind(hint: Option<&str>, user_agent: &str) -> &'static str 
     }
 }
 
+/// The client's device id, reduced to something safe to store and compare.
+///
+/// Clients are asked for a UUID. Anything else is accepted as long as it survives this —
+/// the value is only ever compared for equality and rendered nowhere — but it is bounded
+/// and stripped so a hostile client cannot use it to smuggle length or punctuation into a
+/// column the console later reads. Empty out means "no id", which falls back to the old
+/// User-Agent grouping.
+pub(crate) fn clean_device_id(raw: Option<&str>) -> String {
+    raw.unwrap_or("")
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'))
+        .take(64)
+        .collect()
+}
+
 /// Open a `sessions` row for a sign-in and hand back a token that names it.
 ///
 /// Every path that mints a token goes through here, so there is no way to end up with a
@@ -172,6 +187,7 @@ async fn start_session(
     user: &User,
     headers: &axum::http::HeaderMap,
     hint: Option<&str>,
+    device_id: Option<&str>,
 ) -> ApiResult<String> {
     let user_agent: String = headers
         .get(axum::http::header::USER_AGENT)
@@ -181,14 +197,35 @@ async fn start_session(
         .take(200)
         .collect();
     let kind = device_kind(hint, &user_agent);
+    let device_id = clean_device_id(device_id);
+
+    // Signing in again on a device that already has a live session replaces it. Without
+    // this the table grows a row per sign-in and the console lists the same laptop three
+    // times — each row a genuinely valid token, which is why it cannot just be hidden at
+    // display time: the old tokens have to actually stop working.
+    //
+    // Scoped to this account, so signing in here never touches anybody else's session on
+    // a shared computer.
+    if !device_id.is_empty() {
+        sqlx::query(
+            "UPDATE sessions SET revoked_at = now() \
+             WHERE user_id = $1 AND device_id = $2 AND revoked_at IS NULL",
+        )
+        .bind(user.id)
+        .bind(&device_id)
+        .execute(&state.db)
+        .await?;
+    }
 
     let sid: uuid::Uuid = sqlx::query_scalar(
-        "INSERT INTO sessions (user_id, kind, user_agent, ip) VALUES ($1,$2,$3,$4) RETURNING id",
+        "INSERT INTO sessions (user_id, kind, user_agent, ip, device_id) \
+         VALUES ($1,$2,$3,$4,$5) RETURNING id",
     )
     .bind(user.id)
     .bind(kind)
     .bind(&user_agent)
     .bind(client_ip(headers))
+    .bind(&device_id)
     .fetch_one(&state.db)
     .await?;
 
@@ -498,6 +535,11 @@ pub struct LoginReq {
     /// clients, in which case the User-Agent decides.
     #[serde(default)]
     pub device: Option<String>,
+    /// Which machine, so a second sign-in replaces this device's row instead of adding
+    /// one. Also display only, and also safe to lie about: the worst a made-up value
+    /// does is give that client a row of its own.
+    #[serde(default)]
+    pub device_id: Option<String>,
 }
 #[derive(Deserialize)]
 pub struct RegisterReq {
@@ -509,6 +551,9 @@ pub struct RegisterReq {
     /// clients, in which case the User-Agent decides.
     #[serde(default)]
     pub device: Option<String>,
+    /// See `LoginReq::device_id`.
+    #[serde(default)]
+    pub device_id: Option<String>,
 }
 #[derive(Deserialize)]
 pub struct CodeReq {
@@ -519,6 +564,9 @@ pub struct CodeReq {
     /// clients, in which case the User-Agent decides.
     #[serde(default)]
     pub device: Option<String>,
+    /// See `LoginReq::device_id`.
+    #[serde(default)]
+    pub device_id: Option<String>,
 }
 
 // ---- handlers --------------------------------------------------------------
@@ -632,7 +680,7 @@ pub async fn register(
     .fetch_optional(&state.db)
     .await?
     .ok_or_else(|| AppError::bad("该邮箱已注册，请直接登录"))?;
-    let token = start_session(&state, &user, &headers, req.device.as_deref()).await?;
+    let token = start_session(&state, &user, &headers, req.device.as_deref(), req.device_id.as_deref()).await?;
     crate::realtime::record_event(
         &state,
         Some(user.id),
@@ -674,7 +722,7 @@ pub async fn login(
         .bind(user.id)
         .execute(&state.db)
         .await?;
-    let token = start_session(&state, &user, &headers, req.device.as_deref()).await?;
+    let token = start_session(&state, &user, &headers, req.device.as_deref(), req.device_id.as_deref()).await?;
     crate::realtime::record_event(
         &state,
         Some(user.id),
@@ -700,7 +748,7 @@ pub async fn verify_code(
         .bind(user.id)
         .execute(&state.db)
         .await?;
-    let token = start_session(&state, &user, &headers, req.device.as_deref()).await?;
+    let token = start_session(&state, &user, &headers, req.device.as_deref(), req.device_id.as_deref()).await?;
     crate::realtime::record_event(
         &state,
         Some(user.id),
@@ -1028,6 +1076,50 @@ mod privilege_source_tests {
     /// back for good. There is no integration harness for the extractor here, so this
     /// asserts on the source: if someone "optimizes away" the lookup to save a query,
     /// this fails and explains why it exists.
+    #[test]
+    fn a_device_id_is_bounded_and_stripped() {
+        use super::clean_device_id;
+
+        assert_eq!(clean_device_id(Some("9f3a-4b1c_d2")), "9f3a-4b1c_d2");
+        assert_eq!(clean_device_id(None), "");
+        assert_eq!(clean_device_id(Some("   ")), "");
+        // Anything that is not id-shaped is dropped rather than rejected: the value is
+        // compared for equality and nothing else, so a client sending junk just gets a
+        // group of its own instead of an error it cannot act on.
+        assert_eq!(clean_device_id(Some("a'; DROP TABLE sessions; --")), "aDROPTABLEsessions--");
+        assert_eq!(clean_device_id(Some(&"x".repeat(500))).len(), 64);
+    }
+
+    /// Signing in twice on one device must leave one live session, not two.
+    ///
+    /// This is the whole reason the column exists: the console showed the same laptop
+    /// three times because three sign-ins wrote three rows and every token still worked.
+    /// Hiding the duplicates at display time would not have been enough — the older
+    /// tokens have to actually stop working — so the revoke has to happen here, before
+    /// the insert, and it has to be scoped to this account.
+    #[test]
+    fn signing_in_again_on_a_device_replaces_that_devices_session() {
+        let src = include_str!("auth.rs");
+        let body = src
+            .split("async fn start_session")
+            .nth(1)
+            .expect("start_session");
+        let body = &body[..body.find("\nfn issue_token").unwrap_or(body.len())];
+        let revoke = body
+            .find("UPDATE sessions SET revoked_at")
+            .expect("a prior session on the same device must be revoked");
+        let insert = body.find("INSERT INTO sessions").expect("the new session row");
+        assert!(revoke < insert, "the revoke has to run before the insert");
+        assert!(
+            body[revoke..insert].contains("user_id = $1") && body[revoke..insert].contains("device_id = $2"),
+            "scoped to this account and this device, or a shared computer signs someone else out"
+        );
+        assert!(
+            body.contains("if !device_id.is_empty()"),
+            "an absent id must not match every legacy row and revoke them all"
+        );
+    }
+
     #[test]
     fn claims_extractor_resolves_role_from_the_database() {
         let src = include_str!("auth.rs");

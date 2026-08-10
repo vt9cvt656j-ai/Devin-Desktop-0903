@@ -21770,3 +21770,22 @@ test("a mid-stream connection drop resumes instead of abandoning the round", () 
   assert.match(turn, /byIndex\.clear\(\);/,
     "unexecuted tool-call fragments are discarded before the continuation re-emits them");
 });
+
+test("the always-injected prompt demands real, working delivery — no mocks or fake URLs", () => {
+  // Reported: the agent keeps producing demos / fake URLs / mock implementations instead of real,
+  // ready-to-use code. Root cause: the strong "no mocks, real endpoints" directive lived only in
+  // the client fallback (_HUMAN_EVIDENCE_FALLBACK), never in the gateway prompts the model reads.
+  // agent.base = [agent_core, reasoning, truthfulness, answer_quality] — answer_quality carries it
+  // now, so it reaches EVERY agent task, not just detected-engineering ones.
+  const aq = readFileSync(join(HERE, "../../server/prompts/answer_quality.txt"), "utf8");
+  assert.match(aq, /mock/i, "must forbid mock implementations by name");
+  assert.match(aq, /example\.com/, "must forbid fabricated placeholder URLs by name");
+  assert.match(aq, /真实.{0,4}(接口|端点|URL)/, "must require real endpoints/URLs");
+  assert.match(aq, /demo.{0,6}冒充|冒充完成/, "must forbid passing a demo off as done");
+  assert.match(aq, /只有.{0,20}(demo|占位|最简版)/, "must scope the exception to an explicit user request for one");
+
+  // And it is on the always-injected base, not a task block that may or may not fire.
+  const graph = JSON.parse(readFileSync(join(HERE, "../../server/prompts/prompt_graph.json"), "utf8"));
+  assert.ok(graph.agent.base.includes("answer_quality"),
+    "answer_quality must be in agent.base so the real-delivery directive is always injected");
+});

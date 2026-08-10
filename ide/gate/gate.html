@@ -208,6 +208,41 @@
     var j = await r.json().catch(function () { return {}; });
     return { ok: r.ok, data: j };
   }
+
+  /*
+   * A name for this browser, so Devices lists machines instead of sign-ins.
+   *
+   * Random and stored once. It is not a fingerprint: nothing is derived from the machine,
+   * clearing site data forgets it, and it identifies a browser profile rather than a
+   * person. The server treats it as display grouping only and grants nothing on it.
+   *
+   * Without one, signing in three times on this browser wrote three rows and the console
+   * showed the same laptop three times at the same IP. With one, the second sign-in
+   * replaces the first.
+   */
+  function deviceId() {
+    var KEY = "mrday.device_id";
+    try {
+      var saved = localStorage.getItem(KEY);
+      if (saved) return saved;
+    } catch (e) {
+      // Storage blocked — fall through and send a fresh id. Grouping degrades to the
+      // server's User-Agent fallback, which is what happened before this existed.
+    }
+    var id;
+    try {
+      id = crypto.randomUUID();
+    } catch (e) {
+      // randomUUID is unavailable on http:// origins and in older browsers.
+      var bytes = new Uint8Array(16);
+      crypto.getRandomValues(bytes);
+      id = Array.prototype.map.call(bytes, function (b) {
+        return ("0" + b.toString(16)).slice(-2);
+      }).join("");
+    }
+    try { localStorage.setItem(KEY, id); } catch (e) {}
+    return id;
+  }
   function finish(token) {
     // The cookie nginx checks before serving the app shell. Real API calls still carry
     // the Bearer token and are authorized per request.
@@ -258,7 +293,7 @@
     var btn = $("loginBtn");
     btn.disabled = true; setMsg("Signing in…");
     try {
-      var res = await post("/api/auth/login", { email: state.email, password: $("pw").value });
+      var res = await post("/api/auth/login", { email: state.email, password: $("pw").value, device: "web", device_id: deviceId() });
       if (!res.ok || !res.data.token) { setMsg(res.data.error || "That email and password do not match.", "err"); btn.disabled = false; return; }
       finish(res.data.token);
     } catch (err) {
@@ -276,10 +311,12 @@
         email: state.email,
         password: $("newpw").value,
         code: $("code").value.trim(),
+        device: "web",
+        device_id: deviceId(),
       });
       if (!res.ok) { setMsg(res.data.error || "That code did not work. Check it and try again.", "err"); btn.disabled = false; return; }
       if (res.data.token) return finish(res.data.token);
-      var login = await post("/api/auth/login", { email: state.email, password: $("newpw").value });
+      var login = await post("/api/auth/login", { email: state.email, password: $("newpw").value, device: "web", device_id: deviceId() });
       if (login.ok && login.data.token) return finish(login.data.token);
       setMsg("Account created. Please sign in.", "ok");
       show("login");
