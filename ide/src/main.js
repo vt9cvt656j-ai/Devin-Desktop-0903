@@ -20228,170 +20228,6 @@ async function _uiDeliveryBrowserPreflightIssue(options) {
   return "";
 }
 
-function _planQualityIssue(steps, required = true, effect = "mutate", profile = null) {
-  if (!required) return "";
-  const active = (Array.isArray(steps) ? steps : []).filter((step) => step?.status !== "cancelled");
-  if (!active.length) return "尚未创建计划";
-  const texts = active.map((step) => String(step?.content || "").trim()).filter(Boolean);
-  const text = texts.join("\n").toLowerCase();
-  const missing = [];
-  const has = (pattern) => pattern.test(text);
-  const strictConcreteSteps = texts.filter((value) =>
-    /(?:^|[\s`"'（(])(?:\.?\/?[\w.@-]+\/[\w.@/-]+|[\w.@-]+\.(?:[cm]?[jt]sx?|vue|svelte|rs|py|go|java|kt|swift|json|ya?ml|toml|md|css|scss|html|sql|sh|lock)|(?:npm|pnpm|yarn|bun|node|python\d*|pytest|ruff|cargo|go|git|gh|docker|tauri|vite|tsc)\s+[^\n，。；]*)/i.test(value)
-    || /\b(?:read_file|list_dir|search|find_files|get_diagnostics|read_logs|read_terminal|list_terminals|run_cmd|run_in_terminal|background_monitor|browser|http_request|capture_start|capture_flows|capture_replay|db_query|git_status|git_diff|git_log|git_blame|git_branch|git_commit|git_push|git_pull|gh_pr_create|gh_pr_checks|gh_actions_log)\b/i.test(value)
-    || /(?:\/api\/[\w./:-]+|https?:\/\/\S+|\b[A-Z][A-Za-z0-9]*(?:API|Api|Service|Controller|Store|Schema|Model|Client|Provider|Hook|Router|Config|State)\b)/.test(value)
-  ).length;
-  const debuggingEvidence = has(/(?:repro(?:duce|duction)?|failing\s*(?:case|path|test)|failure|error\s*(?:message|output)|stack\s*trace|traceback|stderr|stdout|console|log|exit\s*code|diagnostic|crash\s*dump|screenshot|recording|minimal\s*case|复现|重现|最小复现|失败路径|失败用例|报错信息|错误信息|错误输出|堆栈|调用栈|日志|控制台|退出码|诊断|崩溃|截图|录屏)/i);
-  const rootCauseEvidence = has(/(?:root\s*cause|cause|why|trace|call\s*(?:chain|graph|stack)|data\s*flow|state\s*(?:flow|machine|transition)|lifecycle|race|deadlock|loop|regression\s*source|bisect|blame|定位根因|根因|原因|为什么|调用链|调用图|数据流|状态流|状态机|生命周期|竞态|死锁|死循环|回归来源|责任提交)/i);
-  const scopedDebugFix = has(/(?:minimal|targeted|surgical|smallest|precise|patch|fix\s*point|guard|null|undefined|fallback|compat|caller|mapping|contract|no\s*(?:rewrite|workaround)|最小|精确|小范围|定点|补丁|修复点|防护|判空|回退|兼容|同步调用方|映射|契约|不重写|不绕过|不大改)/i);
-  const regressionEvidence = has(/(?:regression|same\s*failing\s*path|same\s*error|re-?run|rerun|replay|focused\s*regression|original\s*failing\s*(?:case|path)|verify\s+(?:the\s+)?fix|回归|同一失败路径|原失败路径|同一报错|复测|重跑|再跑|重新运行|复查原报错|验证修复)/i);
-  const impactEvidence = has(/(?:severity|priority|impact|risk|scope|affected|frequency|user\s*visible|recommend|fix\s*suggestion|remediation|优先级|严重|影响|风险|范围|受影响|频率|用户可见|修复建议|处理建议|建议修法|缓解)/i);
-  const projectEngineeringPlan = !!(profile?.projectEngineering || profile?.engineeringGrade || profile?.allProjectsEngineering || profile?.industrialProject || profile?.largeProject || profile?.multiService || profile?.productionReadiness);
-  const strictProjectEngineeringPlan = projectEngineeringPlan && !!(profile?.requiresPlan || profile?.substantial || profile?.projectScope || profile?.architecture || profile?.debugProject || profile?.uiProject || profile?.databaseArchitecture || profile?.backendApi || profile?.git || profile?.longRunningRuntime || profile?.industrialProject || profile?.largeProject || profile?.multiService || profile?.productionReadiness || profile?.allProjectsEngineering);
-  const needsBusinessCoverage = !!(profile?.businessLogic || profile?.businessRisk || profile?.securityRisk || profile?.featureCompleteness || profile?.websiteDelivery);
-  const needsContainerCoverage = !!profile?.containerOps;
-  const needsDatabaseOpsCoverage = !!(profile?.databaseOps || profile?.databaseArchitecture || profile?.dataModel || profile?.persistence);
-  const needsArchitectureQualityCoverage = !!(profile?.architectureQuality || profile?.largeProject || profile?.multiService);
-  const needsPromptRescueCoverage = !!(profile?.promptRescue || profile?.vagueProjectRequest);
-  const needsMaintainabilityCoverage = !!(profile?.maintainabilityUpgrade || profile?.promptRescue || profile?.vagueProjectRequest || profile?.qualityFloor || profile?.allProjectsEngineering);
-  const needsAuthoritativeReferenceCoverage = !!profile?.authoritativeReferencesRequired;
-  const needsObservationStrategy = !!(profile?.ui || profile?.uiProject || profile?.browserAutomation || profile?.capture);
-  const needsBackgroundWaitStrategy = !!(profile?.interactiveWait || profile?.longRunningRuntime);
-  const requireGitWorkflowEvidence = () => {
-    if (!(profile?.git || profile?.gitCommit || profile?.gitPublish || profile?.gitSync || profile?.gitReview || profile?.gitBranching)) return;
-    if (!has(/(?:git[_\s-]?status|git\s+status|仓库状态|工作区状态|current\s+branch|当前分支|upstream|remote|远端|origin|branch|分支)/i)) missing.push("Git 仓库状态/分支/远端取证");
-    if (!has(/(?:git[_\s-]?diff|git\s+diff|diff|staged|unstaged|已暂存|未暂存|改动范围|变更范围)/i)) missing.push("Git diff/暂存区改动范围");
-    if ((profile.gitCommit || profile.gitPublish || profile.gitReview) && !has(/(?:commit\s+message|提交信息|staged|已暂存|git\s+commit|git_commit|commit\s+hash|提交哈希)/i)) missing.push("提交信息/暂存选择/提交结果");
-    if ((profile.gitPublish || profile.gitSync || profile.gitReview) && !has(/(?:upstream|remote|origin|GitHub|GitLab|Gitee|远端|上游|git\s+push|git_push|git\s+pull|git_pull|gh\s+pr|pull\s+request|PR|CI|checks?)/i)) missing.push("远端/upstream/PR-CI 状态");
-  };
-  const requireProjectEngineeringCoverage = () => {
-    if (!strictProjectEngineeringPlan || effect === "inspect") return;
-    if (!has(/(?:project\s*map|workspace|package\.json|readme|monorepo|module\s*boundar|entry(?:point)?|scripts?|service\s*(?:map|entry)|config|CI|deploy|src\/|test\/|app\/|server\/|client\/|list_dir|find_files|项目地图|项目结构|目录结构|工作区|模块边界|入口|脚本|服务|配置|部署|代码根|源码目录|测试目录)/i)) missing.push("项目地图/模块边界");
-    if (!has(/(?:change\s*radius|blast\s*radius|affected|impact|caller|references?|call\s*(?:chain|graph)|data\s*flow|contract|api|schema|migration|permission|cache|queue|state|跨服务|变更半径|影响范围|受影响|调用方|引用|调用链|调用图|数据流|契约|接口|迁移|权限|缓存|队列|状态)/i)) missing.push("变更半径/调用方影响");
-    if (!has(/(?:verification\s*matrix|test\s*matrix|verify|validat|assert|unit|type.?check|lint|build|integration|e2e|contract\s*test|migration\s*test|smoke|CI|checks?|status|response|exit\s*code|stdout|stderr|验证矩阵|测试矩阵|验证|校验|确认|断言|单元|类型检查|构建|集成|端到端|契约测试|迁移测试|冒烟|状态|响应|退出码|命令输出)/i)) missing.push("验证矩阵/CI式检查");
-    if ((profile?.industrialProject || profile?.largeProject || profile?.multiService || profile?.productionReadiness || profile?.allProjectsEngineering)
-      && !has(/(?:rollback|rollout|release|deploy|feature\s*flag|config|compat|migration|observability|monitoring|metric|log|alert|SRE|security|permission|failure\s*boundary|回滚|发布|部署|灰度|特性开关|配置|兼容|迁移|可观测|监控|指标|日志|告警|安全|权限|失败边界|生产风险)/i)) missing.push("生产级发布/回滚/可观测性边界");
-  };
-  const requireBusinessEngineeringCoverage = () => {
-    if (effect === "inspect") return;
-    if (needsPromptRescueCoverage) {
-      if (!has(/(?:intent\s*(?:summary|rescue)|requirement\s*(?:summary|normalization)|assumption|default\s*(?:choice|plan|stack)|fallback\s*choice|non[-\s]?blocking|澄清|意图归纳|需求归纳|需求整理|需求补全|提示词救援|默认假设|默认方案|可反悔|可调整|不阻塞|不追问|少问|缺省选择)/i)) missing.push("烂提示词救援/意图归纳/默认假设");
-      if (!has(/(?:acceptance\s*criteria|requirements?\s*(?:check|coverage)|checklist|traceability|scope|out\s*of\s*scope|验收标准|需求核对|需求覆盖|功能清单|范围边界|不做什么|交付清单|可验收)/i)) missing.push("模糊需求验收清单/范围边界");
-    }
-    if (needsMaintainabilityCoverage) {
-      if (!has(/(?:maintainab|upgradab|extensib|future[-\s]?proof|module\s*boundary|layer(?:ing)?|component\s*boundary|service\s*boundary|config|env|feature\s*flag|adapter|interface|typed|schema|test|docs?|readme|migration|version|可维护|可升级|可扩展|长期维护|模块边界|分层|组件边界|服务边界|配置|环境变量|特性开关|适配器|接口|类型|schema|测试|文档|README|迁移|版本)/i)) missing.push("可维护/可升级架构默认值");
-      if (!has(/(?:no\s*hardcode|avoid\s*hardcode|magic\s*(?:number|string)|central(?:ized)?\s*config|reuse|shared|dedupe|single\s*source|硬编码|魔法值|统一配置|复用|公共组件|公共服务|去重|单一事实源|可替换|扩展点)/i)) missing.push("反硬编码/复用/扩展点");
-    }
-    if (needsBusinessCoverage) {
-      if (!has(/(?:business\s*(?:object|domain|rule|flow|process|invariant)|domain\s*model|role|actor|permission|state\s*machine|workflow|user\s*story|业务(?:对象|域|规则|流程|闭环|不变量|状态)|角色|权限|状态机|主流程|异常流程|用户故事|订单|支付|库存|退款|审批|租户|会员|计费|佣金)/i)) missing.push("业务域/角色/状态机/业务规则");
-      if (!has(/(?:abuse|fraud|business\s*risk|logic\s*(?:bug|flaw)|IDOR|authz|authorization|permission|privilege|replay|idempot|double\s*(?:submit|spend|charge)|race|concurrency|oversell|quota|rate\s*limit|业务漏洞|逻辑漏洞|越权|权限绕过|重放|幂等|重复提交|重复支付|重复扣款|刷单|薅羊毛|库存超卖|并发|竞态|风控|套利|欺诈|滥用|限流)/i)) missing.push("业务漏洞/越权/滥用/幂等并发");
-      if (!has(/(?:acceptance\s*criteria|requirements?\s*(?:check|coverage)|checklist|traceability|happy\s*path|edge\s*case|empty\s*state|loading|error\s*state|e2e|smoke|验收标准|需求核对|需求覆盖|功能清单|不丢功能|主流程|边界场景|空状态|加载态|错误态|端到端|冒烟)/i)) missing.push("功能完整性/验收清单");
-    }
-    if (needsArchitectureQualityCoverage) {
-      if (!has(/(?:layer(?:ing)?|bounded\s*context|ddd|domain[-\s]?driven|dependency\s*direction|module\s*boundary|coupling|cohesion|interface\s*boundary|ownership|分层|领域模型|边界上下文|依赖方向|模块边界|接口边界|耦合|内聚|职责|所有权)/i)) missing.push("架构分层/模块边界/依赖方向");
-    }
-    if (needsDatabaseOpsCoverage) {
-      if (!has(/(?:database\s*(?:choice|engine)|postgres|mysql|sqlite|redis|mongo|elastic|opensearch|clickhouse|vector|pgvector|ORM|prisma|drizzle|typeorm|sequelize|knex|数据库选型|关系型|文档型|键值|缓存|搜索|向量数据库|ORM)/i)) missing.push("数据库选型/引擎适配");
-      if (!has(/(?:transaction|isolation|lock|index|constraint|unique|foreign\s*key|migration|rollback|seed|backfill|pool|connection|backup|restore|事务|隔离级别|锁|索引|约束|唯一|外键|迁移|回滚|种子|回填|连接池|备份|恢复)/i)) missing.push("数据库事务/索引/迁移/连接池边界");
-    }
-    if (needsContainerCoverage) {
-      if (!has(/(?:dockerfile|docker\s*compose|compose\.ya?ml|container|image|kubernetes|k8s|helm|devcontainer|容器|镜像|编排|docker|compose|k8s)/i)) missing.push("容器/Docker/编排方案");
-      if (!has(/(?:env|environment|secret|port|volume|network|healthcheck|readiness|liveness|log|migration|service\s*dependency|环境变量|密钥|端口|数据卷|卷挂载|网络|健康检查|就绪检查|存活检查|日志|迁移|服务依赖)/i)) missing.push("容器运行边界/环境变量/端口/卷/健康检查");
-    }
-    if (profile?.websiteDelivery) {
-      if (!has(/(?:route|routing|404|seo|metadata|form|submit|cms|content|copy|asset|performance|accessib|responsive|browser|viewport|network|console|路由|SEO|元数据|表单|提交|内容|文案|素材|性能|无障碍|响应式|浏览器|视口|控制台|网络)/i)) missing.push("网站生产交付/路由SEO表单内容与真实浏览器验收");
-    }
-  };
-  const requireAuthoritativeReferenceCoverage = () => {
-    if (effect === "inspect" || !needsAuthoritativeReferenceCoverage) return;
-    if (!has(/(?:official|maintainer|github(?:\s*(?:issue|discussion|release|source))?|stackoverflow|sourcegraph|forum|community|权威来源|官方文档|维护者|开发者社区|论坛|公开实现)/i)) missing.push("维护者/官方/开发者社区依据");
-    if (!has(/(?:version|compatib|runtime|framework|dependency|constraint|assumption|版本|兼容|运行时|框架|依赖|约束|前提|假设)/i)) missing.push("版本/兼容前提");
-    if (!has(/(?:adopt|pattern|approach|reject|pitfall|trade-?off|选择|采用|模式|规避|踩坑|取舍|不采用)/i)) missing.push("采纳模式与规避的坑");
-    if (!has(/(?:verify|validat|test|build|type.?check|smoke|回归|验证|测试|构建|类型检查|冒烟)/i)) missing.push("项目内验证动作");
-  };
-  if (!has(/(?:investigat|inspect|analy[sz]|reproduc|locat|trace|read|review|understand|diagnos|audit|map|inventory|\u8c03\u67e5|\u68c0\u67e5|\u5206\u6790|\u590d\u73b0|\u5b9a\u4f4d|\u8ffd\u8e2a|\u9605\u8bfb|\u5ba1\u67e5|\u68b3\u7406|\u6478\u6e05|\u786e\u8ba4|\u76d8\u70b9|\u53d6\u8bc1)/i)) missing.push("调查/理解现状");
-  if (effect === "inspect") {
-    if (!has(/(?:evidence|validat|cross.?check|corroborat|conclu|finding|report|recommend|summar|source|limit|confidence|\u8bc1\u636e|\u6838\u9a8c|\u4ea4\u53c9\u68c0\u67e5|\u7ed3\u8bba|\u53d1\u73b0|\u62a5\u544a|\u5efa\u8bae|\u6c47\u603b|\u6765\u6e90|\u9650\u5236|\u53ef\u4fe1|\u628a\u63e1)/i)) missing.push("证据核验/结论");
-    if (!has(/(?:limit|risk|unknown|uncertain|assumption|confidence|trade.?off|\u9650\u5236|\u98ce\u9669|\u672a\u77e5|\u4e0d\u786e\u5b9a|\u5047\u8bbe|\u628a\u63e1|\u53d6\u820d)/i)) missing.push("结论边界/不确定性");
-    if (strictConcreteSteps < 1) missing.push("具体证据来源/文件/命令");
-    if (profile?.bug || profile?.debugProject) {
-      if (!debuggingEvidence) missing.push("复现/日志/诊断证据");
-      if (!rootCauseEvidence) missing.push("根因/调用链分析");
-      if (!impactEvidence) missing.push("影响范围/优先级/修复建议");
-    }
-  } else {
-    requireProjectEngineeringCoverage();
-    requireBusinessEngineeringCoverage();
-    requireAuthoritativeReferenceCoverage();
-    if (effect === "mutate") {
-      if (!has(/(?:schema|contract|interface|api|endpoint|route|model|type|config|mapping|caller|dependency|boundary|compat|migration|\u5951\u7ea6|\u63a5\u53e3|\u8def\u7531|\u6a21\u578b|\u5b57\u6bb5|\u7c7b\u578b|\u914d\u7f6e|\u6620\u5c04|\u8c03\u7528\u65b9|\u4f9d\u8d56|\u8fb9\u754c|\u517c\u5bb9|\u8fc1\u79fb|\u6570\u636e\u7ed3\u6784)/i)) missing.push("接口/数据契约与边界");
-      if (!has(/(?:implement|edit|change|fix|add|refactor|write|updat|integrat|migrat|wire|remove|replace|\u5b9e\u73b0|\u4fee\u6539|\u4fee\u590d|\u65b0\u589e|\u7f16\u8f91|\u91cd\u6784|\u7f16\u5199|\u63a5\u5165|\u8fc1\u79fb|\u6539\u9020|\u66ff\u6362|\u5220\u9664|\u843d\u5730)/i)) missing.push("实现改动");
-      if (!has(/(?:edge|error|fail|fallback|retry|timeout|null|empty|dedupe|idempot|race|rollback|compat|permission|guard|boundary|\u8fb9\u754c|\u9519\u8bef|\u5931\u8d25|\u5f02\u5e38|\u56de\u9000|\u91cd\u8bd5|\u8d85\u65f6|\u7a7a\u503c|\u7a7a\u5185\u5bb9|\u53bb\u91cd|\u5e42\u7b49|\u7ade\u6001|\u56de\u6eda|\u517c\u5bb9|\u6743\u9650|\u9632\u62a4)/i)) missing.push("失败/边界/兼容处理");
-      if (!has(/(?:acceptance|handoff|deliver|document|readme|example|report|summary|result|criterion|\u9a8c\u6536|\u4ea4\u4ed8|\u6587\u6863|\u793a\u4f8b|\u62a5\u544a|\u603b\u7ed3|\u7ed3\u679c|\u6807\u51c6|\u8bf4\u660e)/i)) missing.push("交付/验收标准");
-      if (strictConcreteSteps < 1) missing.push("具体文件/目录/命令/接口对象");
-      if (profile?.bug || profile?.debugProject) {
-        if (!debuggingEvidence) missing.push("复现/日志/失败证据");
-        if (!rootCauseEvidence) missing.push("根因定位/调用链");
-        if (!scopedDebugFix) missing.push("最小补丁/同步调用方");
-        if (!regressionEvidence) missing.push("同一失败路径回归验证");
-      }
-      if (profile?.databaseArchitecture || profile?.dataModel || profile?.persistence) {
-        if (!has(/(?:schema|data\s*model|table\s*structure|数据模型|表结构|字段设计|关系设计|索引设计|migration|migrate|迁移|seed|backfill|rollback|落库|持久化|存储|缓存)/i)) missing.push("数据库模型/表结构/迁移方案");
-        if (!has(/(?:caller|api|contract|mapping|service|repository|dao|query|select|insert|update|delete|upsert|orm|prisma|drizzle|typeorm|sequelize|redis|sqlite|postgres|mysql)/i)) missing.push("数据库调用层/API契约");
-        if (!has(/(?:index|索引|unique|constraint|foreign\s*key|primary\s*key|transaction|lock|retry|idempot|race|concurrency|rollback|backfill|seed|cache|session|null|empty|fallback)/i)) missing.push("索引/事务/并发/回滚边界");
-      }
-      if (profile?.ui || profile?.uiProject) {
-        const uiProjectContentEvidence = has(/(?:read|inspect|inventory|audit|review|map|list_dir|find_files|generate_wiki|confirm|understand|readme|package\.json|product[_\s-]*wiki|docs?|screenshots?|assets?|\u8bfb\u53d6|\u68c0\u67e5|\u5ba1\u67e5|\u76d8\u70b9|\u53d6\u8bc1|\u786e\u8ba4|\u68b3\u7406|\u6478\u6e05)/i)
-          && has(/(?:readme|package\.json|product[_\s-]*wiki|docs?|screenshots?|assets?|cms|fixture|seed|data\s*source|content\s*source|existing\s+(?:content|data|copy|docs?|screenshots?|assets?)|real\s+(?:content|data|copy|features?|product)|actual\s+(?:content|data|copy|features?)|\u5185\u5bb9\u6e90|\u6570\u636e\u6e90|\u771f\u5b9e(?:\u5185\u5bb9|\u6570\u636e|\u6587\u6848|\u529f\u80fd|\u4ea7\u54c1)|\u73b0\u6709(?:\u5185\u5bb9|\u6570\u636e|\u6587\u6848|\u8d44\u6599|\u6587\u6863|\u622a\u56fe|\u7d20\u6750|\u6e90\u7801)|\u9879\u76ee\u7ed3\u6784|\u4ea7\u54c1|\u529f\u80fd|\u8d44\u6599|\u6587\u6863|\u622a\u56fe|\u7d20\u6750)/i);
-        if (profile?.uiProject && !uiProjectContentEvidence) missing.push("项目真实内容/数据源取证");
-        if (profile?.uiProject && !has(/(?:attached\s*(?:image|screenshot|mockup)|user\s*(?:image|screenshot|mockup)|real\s*(?:image|photo|screenshot|asset|media)|(?:assets?|screenshots?|images?|media|public\/assets?)\/|design\s*(?:file|reference|mockup)|picsum|generate_image|\u7528\u6237(?:\u9644\u56fe|\u622a\u56fe|\u8bbe\u8ba1\u7a3f|\u56fe\u7247)|\u9644\u4ef6|\u9644\u56fe|\u8bbe\u8ba1\u7a3f|\u622a\u56fe(?:\u7d20\u6750|\u8bbe\u8ba1|\u53c2\u8003)|\u771f\u5b9e(?:\u56fe\u7247|\u7167\u7247|\u622a\u56fe|\u7d20\u6750)|\u9879\u76ee(?:\u7d20\u6750|\u56fe\u7247)|\u5360\u4f4d\u56fe|\u751f\u56fe)/i)) missing.push("用户附图/真实图片素材使用计划");
-        if (!has(/(?:information\s*architecture|section|feature|faq|copy|content|导航|区块|模块|栏目|文案|卖点|功能区|信息架构)/i)) missing.push("页面信息架构/区块与文案");
-        if (profile?.designKnowledgeRequired && !has(/(?:michael-design|knowledge_search|设计蓝本|知识库素材|知识库设计)/i)) missing.push("michael-design 检索与采用来源");
-        if (profile?.fullWebsite && !_uiPlanHasCategoryArchitecture(text)) missing.push("按业务品类推导信息架构与差异化内容区块（真实用户旅程决定结构）");
-        if (profile?.richMediaRequired && !has(/(?:视频|gif|动态媒体|图片素材|媒体资产|video|animated\s*media|media\s*asset|\.mp4|\.webm|\.gif)/i)) missing.push("知识库图片 + 视频/GIF 的具体落点");
-        if (profile?.motionDesignRequired && !has(/(?:微交互|入场|滚动叙事|状态转场|页面转场|stagger|whileInView|useScroll|ScrollTrigger|spring|prefers-reduced-motion|useReducedMotion|motion-reduce)/i)) missing.push("多层动效与 reduced-motion 降级");
-        if (profile?.databaseDecisionRequired) {
-          const databaseChoice = has(/(?:数据库|持久化|数据层|database|persistence|storage).{0,80}(?:不需要|不用|不使用|静态|无后端|none|localStorage|IndexedDB|SQLite|Postgres|MySQL|Supabase|Firebase|服务端|server)/i)
-            || has(/(?:不需要|不用|不使用|静态|无后端|none|localStorage|IndexedDB|SQLite|Postgres|MySQL|Supabase|Firebase|服务端|server).{0,80}(?:数据库|持久化|数据层|database|persistence|storage)/i);
-          if (!databaseChoice) missing.push("数据库决策（不用/本地/服务端）与理由");
-        }
-        if (!has(/(?:design\s*system|token|palette|color|typography|spacing|shadow|radius|glass|mac|google|brand|visual|theme|tailwind|radix|shadcn|设计系统|设计令牌|配色|色板|字体|字号|间距|圆角|阴影|毛玻璃|浅色|白色|品牌|视觉系统|主题)/i)) missing.push("视觉系统/配色/排版令牌");
-        if (profile?.uiProject && !has(/(?:shadcn(?:\/ui)?|radix|mui|material\s*(?:ui|3)|antd|ant\s*design|tdesign|arco|chakra|mantine|headless\s*ui|primitive|button|card|dialog|tabs|accordion|progress|badge|sheet|popover|toast|dropdown|select|tooltip|avatar|separator|skeleton|semantic\s*component|component\s*library|\u7ec4\u4ef6\u5e93|\u7ec4\u4ef6\u539f\u8bed|\u8bed\u4e49\u7ec4\u4ef6|\u53ef\u8bbf\u95ee\u7ec4\u4ef6|\u6309\u94ae|\u5361\u7247|\u5bf9\u8bdd\u6846|\u6807\u7b7e\u9875|\u624b\u98ce\u7434|\u8fdb\u5ea6\u6761|\u5fbd\u7ae0|\u62bd\u5c49|\u5f39\u5c42|\u4e0b\u62c9|\u9009\u62e9\u5668|\u63d0\u793a|\u9aa8\u67b6\u5c4f|\u5206\u9694\u7ebf)/i)) missing.push("项目组件库/primitive/variant 语义映射");
-        if (profile?.uiProject && !has(/(?:tailwind(?:\s*css)?|theme(?:\.extend)?|palette|color\s*scale|design\s*tokens?|css\s*variables?|css\s*modules?|styled-components|emotion|--(?:background|foreground|primary|secondary|muted|accent|border|input|ring|radius)|zinc|slate|neutral|stone|gray|blue|sky|indigo|violet|purple|emerald|teal|amber|orange|rose|red|\u8bbe\u8ba1\u4ee4\u724c|\u8c03\u8272\u677f|\u8272\u677f|\u8272\u9636|\u4e3b\u9898\u53d8\u91cf|css\s*\u53d8\u91cf|\u989c\u8272\u53d8\u91cf|\u989c\u8272\u7cfb\u7edf|\u6837\u5f0f\u673a\u5236|tailwind\s*\u4e3b\u9898)/i)) missing.push(profile?.fromZeroUiProject ? "Tailwind 调色板/theme token（无栈默认场景）" : "项目语义 token/theme/style 映射");
-        if (profile?.uiProject && !has(/(?:type\s*scale|font\s*(?:pair|family)|font-display|heading|body|caption|line-height|leading|letter-spacing|read(?:ing)?\s*width|max-w-prose|measure|text-(?:5xl|4xl|3xl|2xl)|\u5b57\u4f53(?:\u642d\u914d|\u5c42\u7ea7)|\u5b57\u9636|\u6807\u9898|\u6b63\u6587|\u884c\u9ad8|\u5b57\u8ddd|\u9605\u8bfb\u5bbd\u5ea6|\u6392\u7248\u5c42\u7ea7)/i)) missing.push("字体层级/行高/阅读宽度");
-        if (profile?.uiProject && !has(/(?:grid(?:-cols)?|12\s*col|container|max-w-7xl|section|py-(?:16|20|24)|gap-(?:6|8|10|12)|auto-fit|whitespace|density|spacing\s*scale|mobile\s*first|\u6805\u683c|\u5341\u4e8c\u5217|12\s*\u5217|\u5bb9\u5668|\u533a\u5757|\u7559\u767d|\u5bc6\u5ea6|\u95f4\u8ddd\u5c42\u7ea7|\u79fb\u52a8\u4f18\u5148)/i)) missing.push("布局栅格/留白/密度");
-        if (profile?.uiProject && !has(/(?:hover|focus-visible|active|disabled|loading|empty|error|success|skeleton|fallback|state|interaction\s*state|\u60ac\u505c|\u7126\u70b9|\u6309\u4e0b|\u7981\u7528|\u52a0\u8f7d|\u7a7a\u72b6\u6001|\u9519\u8bef\u72b6\u6001|\u6210\u529f\u72b6\u6001|\u9aa8\u67b6\u5c4f|\u56de\u9000|\u4ea4\u4e92\u72b6\u6001)/i)) missing.push("组件交互状态/空错加载态");
-        if (!has(/(?:component|layout|css|tsx|jsx|vite|react|vue|src\/|app\.|index\.|style|tailwind|组件|布局|样式|文件|入口|页面文件|项目脚本|脚手架)/i)) missing.push("组件/布局文件与项目脚手架");
-        if (!has(/(?:responsive|mobile|desktop|breakpoint|accessib|a11y|keyboard|hover|focus|viewport|响应式|移动端|桌面端|断点|无障碍|键盘|悬停|焦点|视口)/i)) missing.push("响应式/交互/无障碍状态");
-        if (!has(/(?:browser|screenshot|viewport|preview|dev\s*server|localhost|npm\s+run\s+(?:dev|build|preview)|build|lighthouse|console|network|浏览器|截图|真机|预览|开发服务器|控制台|网络|构建验证|页面验证)/i)) missing.push("真实浏览器渲染/桌面手机验证");
-      }
-    } else if (!has(/(?:execute|run|build|compile|start|test|install|package|deploy|push|commit|upload|download|\u6267\u884c|\u8fd0\u884c|\u6784\u5efa|\u7f16\u8bd1|\u542f\u52a8|\u6d4b\u8bd5|\u5b89\u88c5|\u6253\u5305|\u90e8\u7f72|\u63a8\u9001|\u63d0\u4ea4|\u4e0a\u4f20|\u4e0b\u8f7d)/i)) {
-      missing.push("执行真实动作");
-    }
-    if (effect !== "mutate") {
-      if (!has(/(?:env|script|cwd|version|dependency|permission|preflight|config|repo\s*root|repository\s*root|current\s+branch|upstream|remote|origin|git\s+status|仓库根|仓库状态|当前分支|远端|上游|\u73af\u5883|\u811a\u672c|\u5f53\u524d\u76ee\u5f55|\u7248\u672c|\u4f9d\u8d56|\u6743\u9650|\u9884\u68c0|\u914d\u7f6e)/i)) missing.push("环境/脚本预检");
-      if (!has(/(?:error|stderr|stdout|log|exit|retry|diagnos|fallback|\u9519\u8bef|\u65e5\u5fd7|\u8f93\u51fa|\u9000\u51fa|\u91cd\u8bd5|\u8bca\u65ad|\u56de\u9000)/i)) missing.push("失败诊断/日志检查");
-      if (strictConcreteSteps < 1) missing.push("具体命令/输出/路径");
-    }
-    if (!has(/(?:test|check|verify|validat|confirm|status|output|exit|health|smoke|build|lint|type.?check|diagnostic|regression|\u6d4b\u8bd5|\u68c0\u67e5|\u9a8c\u8bc1|\u786e\u8ba4|\u72b6\u6001|\u8f93\u51fa|\u9000\u51fa|\u5065\u5eb7|\u5192\u70df|\u6784\u5efa|\u8bca\u65ad|\u56de\u5f52|\u6821\u9a8c)/i)) missing.push("验证/测试");
-  }
-  if (effect !== "inspect") requireGitWorkflowEvidence();
-  if (needsObservationStrategy) {
-    const hasBrowserOrScreenshotStrategy = has(/(?:browser|screenshot|viewport|nodes|assert|check|headed|headless|fresh|有头|无头|浏览器|截图|视口|节点|断言|真实渲染|交互验证|观察策略|自动化策略|模式选择)/i);
-    const hasCaptureStrategy = !profile?.capture || (
-      has(/(?:capture_start|capture_flows|capture_replay|抓包|抓请求|抓接口|真实流量|真实请求|流量取证|接口取证)/i)
-      && has(/(?:isolated_browser|无痕|隐身|隔离|system|系统级|系统代理|background|后台|手动代理|fresh|mode)/i)
-    );
-    if (!hasBrowserOrScreenshotStrategy) missing.push("浏览器有头/无头观察策略");
-    if (!hasCaptureStrategy) missing.push("抓包模式/流量取证策略");
-  }
-  if (needsBackgroundWaitStrategy) {
-    const hasTerminalStrategy = has(/(?:run_in_terminal|read_logs|read_terminal|list_terminals|stop_terminal|真实终端|终端\s*tab|持续任务|任务终端|终端日志|服务日志|错误日志|dev\s*server|watch|daemon|守护进程|长时间运行|持续运行|后台任务)/i);
-    const hasMonitorStrategy = has(/(?:background_monitor|后台监控|挂后台|自动继续|轮询|poll|等待条件|条件满足|等端口|端口监听|等\s*URL|URL\s*可达|等文件|文件出现|等命令|命令成功|等抓包|capture|port|url|file|command|manual)/i);
-    if (!(hasTerminalStrategy || hasMonitorStrategy)) missing.push("后台持续任务/等待监听策略");
-  }
-  return missing.length ? `计划缺少：${missing.join("、")}` : "";
-}
 
 function _unprovenPlanCompletionIssue(steps, evidenceCount = 0) {
   const active = Array.isArray(steps) ? steps.filter((step) => step?.status !== "cancelled") : [];
@@ -28051,7 +27887,7 @@ function _buildAgentToolSchemas(includeWrite, mcpTools = []) {
       type: "function",
       function: {
         name: "update_plan",
-        description: "Before you draft a plan you must already have looked at the real workspace contents (list_dir / read them), and any ambiguity about direction must already be settled with ask_user — never write \"read the directory/files to see what's there\" as step one, and never draft a plan while the user has not yet chosen a direction. Create or update a task's step-by-step plan — only for complex, multi-file, architecture-level work or outward side effects; a simple one-step change does not need the ceremony. Reading diagnostics, checking terminal logs, ls/find/cat/git status, restoring already-declared dependencies, and test/build verification also do not need a plan first. The number of steps follows the task's real complexity, with no fixed floor or ceiling; a complex write task covers verifiable work such as investigating and understanding the current state, making the change, and real verification, while a complex read-only investigation covers gathering evidence, cross-verifying it, and stating the conclusion's boundaries and uncertainty, without inventing implementation steps. Each step is specific but short, naming the action and the key file or command; mark a step in_progress before starting it and completed only once you hold real evidence, and add necessary work to the plan as you discover it. A step the user cancelled in the panel stays cancelled — never re-add it on your own. A plan must be an experienced engineer's checklist, not slogans: name the key files, directories, commands and expected output at each step. A complex write plan covers investigating the current state, the interface and data contracts and their boundaries, the implementation change, handling of failure, empty and compatibility cases, verification by real command, and delivery acceptance. For a bug fix, start from the real symptom — reproduce it, or read the actual error, log, screenshot, diagnostic or exit code — then build the causal chain along the entry point, state, data flow, call chain, async ordering, boundary values and caller contract; list falsifiable root-cause hypotheses and eliminate them with the cheapest evidence first; make the minimal patch, update the callers, cover the failure, empty and race boundaries, and re-run the same failing path or a focused regression test and record the exit code. For scraping, API, capture or third-party-page work, collect real evidence before writing parsing logic: open the real page or endpoint, capture the network response, DOM or file sample, and confirm the links and fields are reachable — never guess a URL pattern first. Container work covers Docker/Compose/K8s, environment variables, ports, volumes, networking, healthcheck and logs. A UI, marketing-site or landing-page plan covers sourcing the real content, the project's stack and its existing component/theme/style entry points, real design evidence from knowledge_search(domain=\"michael-design\"), the page's information architecture and section copy, the mapping from those design facts onto the current components' primitives/variants/API and the semantic token/theme/style layer, responsive, interaction and accessibility states, and verification in a real browser on both desktop and mobile; an existing site keeps its framework and build system, React + Tailwind CSS + shadcn/ui is the default only when there is no site and nothing to reuse and the user named no stack, and CSS-first configuration applies only when Tailwind v4 is the final choice. Website delivery covers routing, 404s, SEO, forms, content, performance, accessibility and acceptance in a real browser. Database work covers the engine choice and the transaction, index, migration and connection-pool boundaries.",
+        description: "Before you draft a plan you must already have looked at the real workspace contents (list_dir / read them), and any ambiguity about direction must already be settled with ask_user — never write \"read the directory/files to see what's there\" as step one, and never draft a plan while the user has not yet chosen a direction. Create or update a task's step-by-step plan — only for complex, multi-file, architecture-level work or outward side effects; a simple one-step change does not need the ceremony. Reading diagnostics, checking terminal logs, ls/find/cat/git status, restoring already-declared dependencies, and test/build verification also do not need a plan first. The number of steps follows the task's real complexity, with no fixed floor or ceiling; a complex write task covers verifiable work such as investigating and understanding the current state, making the change, and real verification, while a complex read-only investigation covers gathering evidence, cross-verifying it, and stating the conclusion's boundaries and uncertainty, without inventing implementation steps. Each step is specific but short, naming the action and the key file or command; mark a step in_progress before starting it and completed only once you hold real evidence, and add necessary work to the plan as you discover it. A step the user cancelled in the panel stays cancelled — never re-add it on your own. Scale the plan to the task in front of you, not to this description: most requests need no plan at all, and a plan that lists work the user did not ask for is worse than no plan. When a plan is warranted, name the key file, command or expected output at each step rather than a category of work. For a bug fix, start from the real symptom — reproduce it, or read the actual error, log or exit code — before proposing a cause. For scraping or API work, open the real page or endpoint and capture a real response before writing parsing logic. Domain checklists (containers, deployment, SEO, accessibility, boundary cases) apply only where the user's own request reaches them; do not add a step to satisfy this paragraph.",
         parameters: {
           type: "object",
           properties: {
@@ -39702,45 +39538,10 @@ function _runNeedsPlanGateNow(run, call = null) {
   return !_callCanBypassPlanGate(call);
 }
 
-// 计划质量的【AI 语义评审】：不看关键词看意思——正则记分卡对“意思到位但用词不同”的好计划
-// 误杀、对堆满魔法词的空计划放行（用户痛点：该用智能判断的地方在用正则）。异步、
-// fail-open：AI 不可用时回退到确定性记分卡兼底（零回退纪律，同意图判定架构）。
-// 结果走现成的 _planQualityNote 通道，随下一条成功工具结果送达一次，不拦截不阻塞。
-async function _aiPlanReview({ config, task, planSteps, profile }) {
-  if (!config || !config.baseUrl || !config.apiKey) return null;
-  const dims = [];
-  const p = profile || {};
-  if (p.bug || p.debugProject) dims.push("复现/失败证据、根因定位、最小修复、同一失败路径回归");
-  if (p.fullWebsite || p.websiteDelivery || p.uiProject) dims.push("真实内容/素材取证、信息架构与区块、视觉系统/组件体系、响应式与状态、真实验证");
-  if (p.databaseOps || p.databaseArchitecture || p.dataModel || p.persistence) dims.push("数据模型/库表设计或明确不需要数据库的理由");
-  if (p.multiService || p.largeProject || p.industrialProject) dims.push("模块边界/服务拆分与集成验证");
-  const sys = '你是编码智能体的任务计划评审。判断计划作为【该任务的完整工程计划】是否有重大缺口，只输出严格 JSON：{"ok":true|false,"gaps":"<不合格时列出最多3个具体缺口，具体到模块/文件/验证，一两句>"}。'
-    + '评审看意思不看用词：覆盖了就算，不要因为没用某个术语扣分；也不要被堂皇的措辞骗过——只有口号没有具体文件/动作/验证的计划不合格。'
-    + '拿不准就放行(ok=true)，别把小任务的短计划判死。只输出 JSON。';
-  const user = `用户任务：${String(task || "").slice(0, 1000)}\n\n任务类型要求重点覆盖：${dims.length ? dims.join("；") : "（无特殊维度，按通用工程完整性判断）"}\n\n计划步骤：\n${(Array.isArray(planSteps) ? planSteps : []).filter((s) => s?.status !== "cancelled").map((s, i) => `${i + 1}. ${String(s?.content || "").slice(0, 200)}`).join("\n").slice(0, 3200)}`;
-  try {
-    const ctrl = typeof AbortController !== "undefined" ? new AbortController() : null;
-    const to = ctrl ? setTimeout(() => ctrl.abort(), 15000) : null;
-    const res = await fetch(_chatCompletionsUrl(config.baseUrl), {
-      method: "POST",
-      headers: { "Content-Type": "application/json", Authorization: "Bearer " + (config.apiKey || ""), "x-ide-request-id": String(config.requestId || "").slice(0, 128) },
-      // 计划评审同样是认知腿：用用户模型，max_tokens 留够推理型模型的思考余量。
-      body: JSON.stringify({ model: config.model, messages: [{ role: "system", content: sys }, { role: "user", content: user }], max_tokens: 1200, temperature: 0, stream: false }),
-      signal: ctrl ? ctrl.signal : undefined,
-    });
-    if (to) clearTimeout(to);
-    if (!res.ok) return null;
-    const data = await res.json();
-    const j = _safeJsonLoose(data?.choices?.[0]?.message?.content || "");
-    if (!j || typeof j.ok !== "boolean") return null;
-    return { ok: j.ok, gaps: String(j.gaps || "").slice(0, 500) };
-  } catch { return null; }
-}
-
-function _requiredPlanIssue(run, steps, call = null) {
-  if (call && _callCanBypassPlanGate(call)) return "";
-  return _planQualityIssue(steps, _runRequiresPlan(run), _planEffectForRun(run), run?.engineering || null);
-}
+// The AI plan reviewer and its deterministic scorecard fallback lived here. Both existed
+// only to write run._planQualityNote, which was injected into the next tool result telling
+// the agent to re-send an expanded plan. Removed with that injection — see the note at the
+// update_plan handler.
 
 // Apply a late AI intent verdict to a run, if one has landed since the run started.
 //
@@ -40951,7 +40752,6 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
               _advancePlanFromTool(run, er.call, er.result);
             }
             let _m = _toolMsgForModel(er.call, er.result);
-            if (run && run._planQualityNote) { _m += run._planQualityNote; run._planQualityNote = ""; }
             if (it._eagerEntry._mutationAdvice) {
               _m += it._eagerEntry._mutationAdvice;
               it._eagerEntry._mutationAdvice = "";
@@ -41215,7 +41015,6 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
         if (run) { run._recentSigs = run._recentSigs || []; run._recentSigs.push(_sig); if (run._recentSigs.length > 8) run._recentSigs.shift(); }
         let _resultMsg = _toolMsgForModel(call, result);
         // 计划质检降级提示：只随本 run 第一条成功工具结果带给模型一次（见 plan gate 处）。
-        if (run && run._planQualityNote) { _resultMsg += run._planQualityNote; run._planQualityNote = ""; }
         // ask_user 首轮软建议（仅非空工作区）：随用户回答一并带回，提醒后续能自查的信息自查。
         if (it._auAdvice) { _resultMsg += it._auAdvice; it._auAdvice = ""; }
         // 计划提示与 ask_user 软建议同通道：附在真实工具结果后，不替代结果。
@@ -41235,26 +41034,15 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
         it.call.steps = _planPrimeCurrentStep(it.call.steps);
         planEl = _renderPlan(body, it.call.steps, run._planEl || planEl, run);
         planSteps = run._planSteps || it.call.steps;
-        // 计划质量判定交给 AI 语义评审（异步、不阻塞、fail-open 回退记分卡）：
-        // 结果走 _planQualityNote 通道随下一条成功工具结果送达一次。同一份计划只评一次。
-        {
-          const _planSig = (planSteps || []).map((s) => String(s?.content || "").slice(0, 60)).join("|").slice(0, 1200);
-          if (run._planReviewSig !== _planSig) {
-            run._planReviewSig = _planSig;
-            const _reviewSteps = planSteps;
-            void _aiPlanReview({ config, task: run._originalText || "", planSteps: _reviewSteps, profile: run.engineering })
-              .then((review) => {
-                if (!run || run._planReviewSig !== _planSig) return; // 计划又变了，过期评审作废
-                if (review && review.ok === false && review.gaps) {
-                  run._planQualityNote = `\n[PLAN_REVIEW] 计划评审发现缺口：${review.gaps}。用 update_plan 补成完整计划后继续；已在做的事不必停。`;
-                } else if (review === null) {
-                  // AI 评审不可用 → 确定性记分卡兑底（零回退：宁可粗糙不可缺席）。
-                  const fallback = _requiredPlanIssue(run, _reviewSteps);
-                  if (fallback) run._planQualityNote = `\n[PLAN_NEEDS_WORK] ${fallback}。把计划补成可执行工程清单（具体文件/接口/边界/验证/验收），再开始修改。`;
-                }
-              }).catch(() => {});
-          }
-        }
+        // A second model used to review this plan here and, on "finding gaps", inject
+        // [PLAN_REVIEW] … "用 update_plan 补成完整计划" into the next tool result. The agent
+        // complied by sending a wholly new plan, so 3 steps became 9 that were not a superset
+        // of the original — the earlier steps' completion went with them, and the invented
+        // steps were work nobody asked for. Observed live: "fix the GUI and run it" grew a
+        // boundary-condition test matrix and then reported 3/6 done.
+        //
+        // A reviewer whose only possible verdict is "add more" is not quality control, it is a
+        // ratchet. The plan belongs to the agent doing the task.
         toolMsgs[i] = { role: "tool", tool_call_id: it.tc.id, content: _planSummary(planSteps)
           + (completionIssue ? `\n[PLAN_NEEDS_EVIDENCE] ${completionIssue}；completed 已退回 pending，取得真实证据后再更新。` : "") };
       }
@@ -41607,13 +41395,6 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
         break;
       }
 
-      // 计划质检提示兜底：若本批没有任何工具结果消费掉 _planQualityNote（例如首个调用
-      // 被门禁 [BLOCKED] 早退、后续再无 settle），追加到本批最后一条 tool 消息上，
-      // 保证评审反馈不会永久丢失。
-      if (run && run._planQualityNote && toolMsgs.length) {
-        const _lastTm = toolMsgs[toolMsgs.length - 1];
-        if (_lastTm && typeof _lastTm.content === "string") { _lastTm.content += run._planQualityNote; run._planQualityNote = ""; }
-      }
       for (const m of toolMsgs) messages.push(m);
       if (turn._invalidToolRepairInstruction && _live()) {
         _pushNudge("toolRepair", turn._invalidToolRepairInstruction + "\n现在基于上方真实工具结果继续执行，不要再重复同一个残缺工具调用。");
