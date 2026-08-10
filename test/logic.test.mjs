@@ -21856,3 +21856,48 @@ test("the unverified label states the fact without telling the user to run the b
   assert.match(label, /没有拿到通过的编译\/测试证据/, "states the fact");
   assert.doesNotMatch(label, /请先跑|请自行|你先跑|自己跑/, "must not delegate the build back to the user");
 });
+
+test("no prompt prescribes the shape of the model's closing summary", () => {
+  // growth.js used to score the user with the learner model and, below a mastery
+  // threshold, dictate the wrap-up section by section: what was done / why / how to use
+  // it / which files changed, gloss each new term, then a "transferable principle" and a
+  // "small next step to try". The model obeyed literally, so every reply — for a one-line
+  // compile-and-run as much as for a refactor — came out as the same six-section lecture.
+  // A fresh install starts below the threshold, so that was the default experience.
+  //
+  // The ending is the model's to write from the conversation in front of it. Anything that
+  // hands it a fixed set of headings produces the template again, so nothing may.
+  assert.doesNotMatch(GROWTH_SRC, /export function promptBlock/,
+    "growth.js must not export a prompt block again — it is what dictated the endings");
+  assert.doesNotMatch(SRC, /growth\.promptBlock/,
+    "main.js must not inject a learner-model teaching block into the prompt");
+  assert.doesNotMatch(GROWTH_SRC, /coach:/,
+    "per-skill coaching instructions are for the panel's eyes only, never the model's");
+
+  // And no prompt anywhere may prescribe the closing structure. These are the phrasings
+  // that produced the observed template; a paraphrase would too, but pinning the known
+  // ones keeps the specific regression from silently returning.
+  const PRESCRIPTIVE = [
+    /transferable principle/i,
+    /remember this one thing/i,
+    /可迁移的?原理/,
+    /小?下一步.{0,12}自己.{0,6}试/,
+    /第一次出现的术语/,
+  ];
+  const promptDir = join(HERE, "../../server/prompts");
+  // Comments are not prompts — the note explaining why this was removed names the very
+  // phrases it removed, so scan code and prompt text only.
+  const sources = [
+    ["src/main.js", stripJsComments(SRC)],
+    ["src/growth.js", stripJsComments(GROWTH_SRC)],
+  ];
+  for (const f of readdirSync(promptDir).filter((n) => n.endsWith(".txt"))) {
+    sources.push([`server/prompts/${f}`, readFileSync(join(promptDir, f), "utf8")]);
+  }
+  for (const [name, text] of sources) {
+    for (const re of PRESCRIPTIVE) {
+      assert.doesNotMatch(text, re,
+        `${name} prescribes a closing-summary section (${re}) — the model must write its own ending`);
+    }
+  }
+});
