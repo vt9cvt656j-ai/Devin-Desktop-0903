@@ -51695,7 +51695,7 @@ function renderSkillsTool(body) {
 
 const FEATURE_TABS = [
   { id: "settings", titleKey: "feature.tab.settings", icon: "i-gear" },
-  { id: "appearance", titleKey: "feature.tab.appearance", icon: "i-theme-light" },
+  { id: "appearance", titleKey: "feature.tab.appearance", icon: "i-appearance" },
   { id: "growth", titleKey: "feature.tab.growth", icon: "i-growth" },
   { id: "adaptive", titleKey: "feature.tab.adaptive", icon: "i-adaptive" },
   { id: "shortcuts", titleKey: "feature.tab.shortcuts", icon: "i-command" },

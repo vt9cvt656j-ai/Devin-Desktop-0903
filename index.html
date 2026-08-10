@@ -304,6 +304,16 @@
         <rect x="3" y="3" width="18" height="18" rx="2" fill="none" stroke="currentColor" stroke-width="1.7"/>
         <line x1="12" y1="3" x2="12" y2="21" stroke="currentColor" stroke-width="1.7"/>
       </symbol>
+      <!-- Appearance (advanced-settings rail). Its own symbol rather than borrowing
+           i-theme-light: that one is the light-THEME preview card, and its hardcoded
+           #f2c94c/#ffd166 fills made this the only rail icon that ignored the tab's
+           dim → text → blue colour states. Pure currentColor, 1.7 stroke to match the
+           rest of the family. The filled semicircle sits 1.15 inside the ring so the
+           mass and the stroke stay legibly separate at the 21px it actually renders at. -->
+      <symbol id="i-appearance" viewBox="0 0 24 24">
+        <circle cx="12" cy="12" r="8.6" fill="none" stroke="currentColor" stroke-width="1.7"/>
+        <path d="M12 5.4a6.6 6.6 0 0 1 0 13.2z" fill="currentColor"/>
+      </symbol>
       <symbol id="i-theme-light" viewBox="0 0 24 24">
         <rect x="3" y="4" width="18" height="16" rx="4" fill="#fffaf0" stroke="#f2c94c" stroke-width="1.2"/>
         <path d="M6.8 8.2h5.8M6.8 11.6h9.8M6.8 15h6.4" stroke="#8a6d1d" stroke-width="1.35" stroke-linecap="round"/>
