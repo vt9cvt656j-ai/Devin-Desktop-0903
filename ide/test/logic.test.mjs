@@ -21603,3 +21603,30 @@ test("no harness-generated footer is appended under the model's answer", () => {
   assert.match(SRC, /note\.textContent = "⚠️ " \+ _formatAgentFinalError\(finalErr\)/,
     "a run error must still surface to the user on its own");
 });
+
+test("every advanced-settings rail icon follows the tab's colour state", () => {
+  // .feature-tab drives `color` from --feature-dim → --feature-text → --feature-blue as the tab
+  // goes rest → hover → active, and the icons are meant to inherit it. The Appearance tab used to
+  // point at i-theme-light, which is the light-THEME preview card: its hardcoded #f2c94c/#ffd166
+  // fills made it the one icon in the rail that stayed yellow while its own tab was active blue.
+  // Any hardcoded colour in a rail symbol reproduces that, so check the whole set.
+  const INDEX = readFileSync(join(HERE, "../index.html"), "utf8");
+  const tabs = /const FEATURE_TABS = \[([\s\S]*?)\];/.exec(SRC);
+  assert.ok(tabs, "FEATURE_TABS has moved or been renamed");
+  const iconIds = [...tabs[1].matchAll(/icon:\s*"([\w-]+)"/g)].map((m) => m[1]);
+  assert.ok(iconIds.length >= 7, `expected the full rail, found ${iconIds.length}`);
+
+  for (const id of iconIds) {
+    const sym = new RegExp(`<symbol id="${id}"[\\s\\S]*?</symbol>`).exec(INDEX);
+    assert.ok(sym, `rail icon ${id} has no <symbol> in index.html`);
+    const hardcoded = sym[0].match(/(?:fill|stroke)="(#[0-9a-fA-F]{3,8}|rgb[a]?\([^)]*\))"/g) || [];
+    assert.deepEqual(hardcoded, [],
+      `${id} hardcodes ${hardcoded.join(", ")} — it will ignore the tab's dim/hover/active colour`);
+  }
+
+  // And the theme preview cards keep the coloured symbols, which is where colour is correct.
+  assert.match(SRC, /i-theme-dark" : "i-theme-light"/,
+    "the appearance page's theme cards should still use the coloured preview symbols");
+  assert.ok(!iconIds.includes("i-theme-light"),
+    "the rail must not borrow the light-theme preview glyph as its Appearance icon");
+});
