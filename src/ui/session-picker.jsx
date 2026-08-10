@@ -42,7 +42,7 @@ export function SessionPicker({ entries = [], resumableCount = 0, onPick, onClos
             value={query}
             onChange={(e) => setQuery(e.target.value)}
             placeholder="Search sessions, projects, file evidence…"
-            className="h-9 rounded-lg text-[13px]"
+            className="h-9 rounded-lg text-[13px] shadow-none focus-visible:ring-0"
           />
         </div>
 
@@ -71,28 +71,25 @@ export function SessionPicker({ entries = [], resumableCount = 0, onPick, onClos
                     className="size-1.5 shrink-0 self-center rounded-full"
                     style={{ background: e.dot }}
                   />
-                  <span className="truncate text-[13px] font-medium text-foreground">{e.name}</span>
-                  {e.project ? (
-                    <span className="truncate font-mono text-[11px] text-muted-foreground">{e.project}</span>
+                  {/* The first prompt is the identity, so it gets the line to itself. */}
+                  <span className="truncate text-[13px] text-foreground">{e.name}</span>
+                  {e.tag ? (
+                    <span
+                      className={cn(
+                        "ml-auto shrink-0 rounded px-1.5 py-px text-[10px] font-medium uppercase tracking-wide",
+                        e.tag === "current"
+                          ? "bg-primary/10 text-primary"
+                          : "bg-muted text-muted-foreground",
+                      )}
+                    >
+                      {e.tag}
+                    </span>
                   ) : null}
-                  <span className="ml-auto flex shrink-0 items-baseline gap-2">
-                    {e.tag ? (
-                      <span
-                        className={cn(
-                          "rounded px-1.5 py-px text-[10px] font-medium uppercase tracking-wide",
-                          e.tag === "current"
-                            ? "bg-primary/10 text-primary"
-                            : "bg-muted text-muted-foreground",
-                        )}
-                      >
-                        {e.tag}
-                      </span>
-                    ) : null}
-                    <span className="text-[11px] tabular-nums text-muted-foreground">{e.meta}</span>
-                  </span>
                 </span>
-                {e.preview ? (
-                  <span className="truncate pl-3.5 text-[12px] text-muted-foreground">{e.preview}</span>
+                {e.meta ? (
+                  <span className="truncate pl-3.5 text-[11px] tabular-nums text-muted-foreground">
+                    {e.meta}
+                  </span>
                 ) : null}
               </button>
             ))

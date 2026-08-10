@@ -131,11 +131,14 @@
     color: inherit;
   }
 
-  /* Google-style focus, as in the advanced-settings panel: an accent border rather than
-     shadcn's translucent 3px halo, which read as a heavy glow on these light surfaces. */
-  :where(.ui-island, [data-slot="dialog-content"]) input:focus {
+  /* Focus is the border going accent-coloured and nothing else. shadcn ships a translucent
+     3px ring; replacing it with a 1px ring of the same colour just made a thinner glow. On a
+     light surface Google marks focus by recolouring the existing border, so there is no added
+     halo to read as a highlight. */
+  :where(.ui-island, [data-slot="dialog-content"]) input:focus,
+  :where(.ui-island, [data-slot="dialog-content"]) input:focus-visible {
     border-color: var(--accent);
-    box-shadow: 0 0 0 1px var(--accent);
+    box-shadow: none;
     outline: none;
   }
 }

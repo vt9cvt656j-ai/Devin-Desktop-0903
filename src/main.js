@@ -56968,6 +56968,37 @@ function _sessionSearchText(session) {
   return parts.filter(Boolean).join(" ").toLowerCase();
 }
 
+// A session is identified by its FIRST USER PROMPT, the way Claude Code's resume list does it
+// (analysis/04i-session-storage-resume.md §6.1, extractFirstPromptFromHead). Its sequential name
+// — "Chat 1" for almost every row — identifies nothing, which is exactly the complaint: a list
+// where every entry carries the same label cannot be scanned.
+//
+// The exclusions are the interesting part and are taken from that reader rather than invented:
+// tool results, meta entries, compact summaries and <command-name> wrappers are all skipped,
+// because each of them is machinery the user never typed and would otherwise become the title.
+const _SESSION_TITLE_SKIP = /^(?:<command-(?:name|message|args)>|<local-command|\[PLAN_|\[AGENT_|\[BLOCKED\]|📌|━{4,})/;
+function _sessionFirstPrompt(session) {
+  const memory = session?.memory;
+  const messages = Array.isArray(memory?.transcript) && memory.transcript.length
+    ? memory.transcript
+    : Array.isArray(memory?.recent) ? memory.recent
+    : Array.isArray(session?.history) ? session.history : [];
+  for (const m of messages) {
+    if (m?.role !== "user") continue;              // assistant/tool output is not the ask
+    if (m?.isMeta || m?.isCompactSummary) continue;
+    if (typeof m?.content !== "string") continue;   // tool_result blocks arrive as arrays
+    // The orchestrator wraps the real request in a 📌 boundary; unwrap to the ask itself.
+    const unwrapped = _REQUEST_MARKERS.reduce((acc, marker) => {
+      const at = acc.indexOf(marker);
+      return at >= 0 ? acc.slice(at + marker.length) : acc;
+    }, m.content);
+    const text = unwrapped.replace(/\s+/g, " ").trim();
+    if (!text || _SESSION_TITLE_SKIP.test(text)) continue;
+    return text.slice(0, 90);
+  }
+  return "";
+}
+
 function _sessionLastPreview(session) {
   const memory = session?.memory;
   const recent = Array.isArray(memory?.transcript) && memory.transcript.length
@@ -57041,12 +57072,15 @@ function _openSessionPicker() {
       index: i,
       state,
       active,
-      name: s.name,
+      // Claude Code's identity order: custom title, else the first prompt, else the sequential
+      // name as a last resort (a brand-new session has no prompt yet).
+      name: _sessionFirstPrompt(s) || s.name,
       project: s.project ? (s.project.split("/").filter(Boolean).pop() || "") : "",
       dot: modeObj?.color || "#1a73e8",
-      // Join non-empty parts: an empty session has no counts, and " · Agent" with a leading
-      // separator is the kind of detail that makes a panel look unfinished.
-      meta: [_sessionMemoryLabel(_sessionMemoryStats(s)), modeObj?.label || s.mode]
+      // One compact secondary line, not five competing fields. The mode, the file-evidence and
+      // correction counts were on every row and never decided which session you wanted; the
+      // turn count and the project do.
+      meta: [_sessionMemoryLabel(_sessionMemoryStats(s)), s.project ? (s.project.split("/").filter(Boolean).pop() || "") : ""]
         .filter(Boolean).join(" · "),
       // Which session you are in, and which are closed but restorable, is the distinction the
       // list exists to make — a row you cannot tell apart from the current one is a trap.
