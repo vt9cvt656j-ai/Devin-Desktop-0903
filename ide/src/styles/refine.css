@@ -82,18 +82,24 @@
  * 层次一出来就立刻像产品。窄的时候整体横向滚动，而不是把字压扁。
  * ------------------------------------------------------------------------- */
 .seg {
-  gap: 2px;
-  padding: 3px;
-  background: var(--hover);
-  border-radius: var(--ui-radius-lg, 8px);
+  /* No pill. The segmented container was a grey bar with a raised white chip inside it, and at
+     a wide sidebar that reads as two big empty boxes with a two-character label floating in the
+     middle of each — which is what was reported. Underlined tabs carry the same information with
+     no box to look empty, and match the assistant panel's chat tabs on the other side of the
+     window. */
+  gap: 0;
+  padding: 0;
+  background: transparent;
+  border-radius: 0;
   overflow-x: auto;
   scrollbar-width: none;
+  /* Sit on the header's bottom border so the active underline meets it. */
+  margin-bottom: -1px;
 }
 .seg::-webkit-scrollbar { display: none; }
 
 /* 侧栏可以被拖宽拖窄，页签数量也会变（调试会话期间多一个），所以这里按容器宽度自适应，
-   而不是按固定宽度摆放。以前是 flex: 0 0 auto（"窄了就横向滚动"）—— 那是四个页签时的
-   取舍；剩两个之后它们不再撑开，右边留出一大片空白。现在改成均分可用宽度。 */
+   而不是按固定宽度摆放。 */
 .explorer { container-type: inline-size; }
 
 /* .panel__head 是 justify-content: space-between 的 flex 容器，所以这条页签栏默认
@@ -101,26 +107,30 @@
 #sideTabs.seg { flex: 1 1 auto; width: 100%; min-width: 0; }
 
 .seg__btn {
-  flex: 1 1 auto;               /* 均分整条宽度，窄了一起收 */
+  /* Still 均分 the full width. This was already changed from `flex: 0 0 auto` once, because with
+     only two tabs left content-width sizing left a large blank on the right — do not go back. */
+  flex: 1 1 auto;
   min-width: 0;
-  height: 26px;
-  padding: 0 10px;
+  height: 30px;
+  padding: 0 8px;
   font-size: var(--t-small);
   font-weight: 500;
   line-height: 1;
   color: var(--text-dim);
-  border-radius: var(--ui-radius-md, 6px);
+  border-radius: 0;
+  border-bottom: 2px solid transparent;
   white-space: nowrap;
   overflow: visible;
   text-overflow: unset;
-  transition: background 150ms ease, color 150ms ease, box-shadow 150ms ease;
+  transition: color 150ms ease, border-color 150ms ease;
 }
 .seg__btn:hover { color: var(--text); }
 .seg__btn.is-active,
 .seg__btn[aria-selected="true"] {
-  color: var(--text);
-  background: var(--panel-2);
-  box-shadow: var(--elev-1);
+  color: var(--accent);
+  background: transparent;
+  box-shadow: none;
+  border-bottom-color: var(--accent);
 }
 
 /* ---------------------------------------------------------------------------

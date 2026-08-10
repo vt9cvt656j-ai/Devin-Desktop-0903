@@ -7957,14 +7957,12 @@ button.agent-plan__fold--toggle:focus-visible { outline: 2px solid #1a73e8; outl
   transition: width .3s ease;
 }
 
-/* ---- explorer: segmented tabs ---- */
+/* ---- explorer: view tabs ----
+   Structure only. The visual treatment lives in styles/refine.css, which loads after this and
+   owns this control; duplicating colour or state here just creates two places to disagree. */
 .seg {
   display: flex;
-  align-items: center;
-  gap: 2px;
-  padding: 2px;
-  background: var(--hover);
-  border-radius: 9px;
+  align-items: stretch;
   width: 100%;
   box-sizing: border-box;
 }
@@ -7972,41 +7970,15 @@ button.agent-plan__fold--toggle:focus-visible { outline: 2px solid #1a73e8; outl
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  gap: 4px;
-  flex: 1;
+  gap: 5px;
   min-width: 0;
-  height: 24px;
-  padding: 0 6px;
   border: none;
-  border-radius: 7px;
   background: transparent;
-  color: var(--text-dim);
   font-family: var(--font);
-  font-size: 11px;
-  font-weight: 650;
-  letter-spacing: 0.02em;
   cursor: pointer;
   white-space: nowrap;
-  overflow: hidden;
-  transition: background 0.13s ease, color 0.13s ease;
 }
-.seg__btn span {
-  overflow: hidden;
-  text-overflow: ellipsis;
-  min-width: 0;
-}
-.seg__btn .ic {
-  width: 14px;
-  height: 14px;
-}
-.seg__btn:hover {
-  color: var(--text);
-}
-.seg__btn.is-active {
-  background: var(--editor-bg);
-  color: var(--text);
-  box-shadow: var(--shadow-sm);
-}
+.seg__btn .ic { width: 14px; height: 14px; }
 
 /* ---- explorer: side views ---- */
 .side-view {
