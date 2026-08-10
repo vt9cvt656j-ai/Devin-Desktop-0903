@@ -29986,102 +29986,7 @@ function _agentIncompleteLabel(reason, hitCap = false) {
   return labels[reason] || (hitCap ? "运行到本轮上限，已停止空转" : "");
 }
 
-function _buildAgentOutcomeSummary(run, opts) {
-  opts = opts || {};
-  // ── The model's own closing wins ──────────────────────────────────────────────
-  //
-  // When the model has written its own wrap-up, everything it CAN narrate — what changed, what
-  // ran, what was verified, what is left — is its job, in its own words, phrased for this
-  // particular task. Restating the same facts underneath as fixed template lines ("改动文件：…",
-  // "运行结果：…", "验证：…") is duplication in a robotic register, and the user rejected it
-  // outright: let the AI improvise the ending; canned lines about what it just did read as
-  // machine noise.
-  //
-  // What survives is only what the model genuinely could NOT know, because it never got to speak
-  // about it: its own turn erroring out mid-flight, or being cut off at the step cap. Those are
-  // harness facts, and staying silent about them would be the dishonest kind of quiet.
-  //
-  // The full card still renders when the model said NOTHING (see the caller's
-  // `!_hasFinalNarrative` branch) — then it is the only record the user has, not a duplicate.
-  if (opts.narrativePresent) {
-    const err = String(opts.finalErr || "").trim();
-    if (err) return `- 本轮报错：${err.slice(0, 180)}`;
-    if (opts.hitCap) return "- 运行到本轮上限，已停止空转。";
-    return "";
-  }
-  // Internal effect-kind tokens ("run"/"install"/"push"…) read like machine flags —
-  // translate them before they reach the user-facing wrap-up.
-  const effectKindLabels = {
-    build: "构建通过", run: "已实际运行", test: "测试通过", install: "依赖已安装", package: "已打包",
-    commit: "已提交", push: "已推送", sync: "已同步远端", pr: "已建 PR", deploy: "已部署",
-    upload: "已上传", download: "已下载", database: "已写数据库", automation: "已执行自动化", external: "已调用外部服务",
-  };
-  const effectKindLabel = (kind) => effectKindLabels[kind] || kind;
-  const planSteps = Array.isArray(opts.planSteps) ? opts.planSteps : [];
-  const completed = planSteps
-    .filter((step) => step?.status === "completed")
-    .map((step) => String(step.content || step.title || step.description || "").trim())
-    .filter(Boolean)
-    .slice(0, 8);
-  const pending = planSteps
-    .filter((step) => step?.status === "pending" || step?.status === "in_progress")
-    .map((step) => String(step.content || step.title || step.description || "").trim())
-    .filter(Boolean)
-    .slice(0, 6);
-  const mutatedFiles = Array.isArray(opts.mutatedFiles) ? opts.mutatedFiles.filter(Boolean) : [];
-  const runtimeEffects = Array.isArray(opts.runtimeEffects) ? opts.runtimeEffects.filter(Boolean) : [];
-  const externalEffects = Array.isArray(opts.externalEffects) ? opts.externalEffects.filter(Boolean) : [];
-  const researchEvidence = opts.researchEvidence || {};
-  const officialEvidence = researchEvidence.official instanceof Set ? [...researchEvidence.official] : [];
-  const communityEvidence = researchEvidence.community instanceof Set ? [...researchEvidence.community] : [];
-  const finalErr = String(opts.finalErr || "").trim();
-  const note = String(opts.finalVerificationNote || "").replace(/[〔〕]/g, "").trim();
-  const noAutoVerify = /本项目没有可自动识别的验证命令/.test(note);
-  // 验证器缺失（退出 127）/超预算：对代码零断言，不是失败——收尾总结不能写成
-  // "验证：未完全通过或未运行"这种像代码有问题的措辞。
-  const verifierUnavailable = /^验证器不可用|^验证未完成/m.test(note);
-  const incomplete = _agentIncompleteLabel(run?._incompleteReason || run?._capReason, !!opts.hitCap);
-  const lines = [];
-
-  if (finalErr) lines.push(`本轮报错：${finalErr.slice(0, 180)}`);
-  else if (incomplete) lines.push(`本轮未完全收尾：${incomplete}`);
-  else if (!completed.length && !mutatedFiles.length && !runtimeEffects.length && !externalEffects.length && !opts.didMutate) lines.push("已处理。");
-
-  if (completed.length) lines.push(`已完成：${completed.join("；")}`);
-  if (mutatedFiles.length) lines.push(`改动文件：${mutatedFiles.join("、")}`);
-  if (!mutatedFiles.length && opts.didMutate) lines.push("改动文件：本轮有工作区改动，但未拿到明确文件列表");
-  if (runtimeEffects.length) lines.push(`运行结果：${runtimeEffects.map(effectKindLabel).join("、")}`);
-  if (externalEffects.length) lines.push(`外部操作：${externalEffects.map(effectKindLabel).join("、")}`);
-  if (officialEvidence.length || communityEvidence.length) {
-    const sources = [];
-    if (officialEvidence.length) sources.push(`官方/维护方 ${officialEvidence.join("、")}`);
-    if (communityEvidence.length) sources.push(`开发者社区 ${communityEvidence.join("、")}`);
-    lines.push(`外部取证：${sources.join("；")}`);
-  }
-
-  // Keep concrete verification gaps visible in the user-facing outcome. The note is
-  // generated from settled evidence in finally; it must not be filtered into a generic
-  // success sentence or silently dropped when the model also supplied a narrative.
-  for (const line of note.split(/\n+/).map((value) => value.trim()).filter(Boolean)) {
-    if (/^未验证[：:]/.test(line) && !lines.includes(line)) lines.push(line);
-  }
-
-  if (opts.didMutate) {
-    // AI 自主控制：只在 AI 真的主动跑了验证并通过时如实陈述一句。
-    // 不再因为“没验证”就往总结里塞“未通过/未运行/交付门未通过”这类像“没干完”的门禁结论。
-    //
-    if (opts.verificationPassed) {
-      lines.push(opts.didVerify ? "验证：已通过真实命令/检查。" : "验证：改动已落盘。");
-    }
-    // 环境事实的平静措辞（曾被重构误删成死变量）：验证器缺失/无可识别命令对代码
-    // 零断言，不是失败，不能写成像代码有问题的措辞。
-    else if (verifierUnavailable) lines.push("验证：本机没有可运行的自动验证器（命令不存在/退出 127），对代码零断言；装上工具后可再验。");
-    else if (noAutoVerify) lines.push("验证：项目未提供可自动识别的验证命令，未强行瞎跑。");
-  }
-  if (pending.length) lines.push(`剩余/待确认：${pending.join("；")}`);
-  if (!lines.length) return "";
-  return lines.map((line) => `- ${line}`).join("\n");
-}
+// _buildAgentOutcomeSummary was deleted with the outcome card it rendered.
 
 /** Create or update the live plan panel pinned at the top of the agent message. */
 const _PLAN_ICON = `<svg viewBox="0 0 16 16" width="13" height="13" fill="currentColor"><path d="M2 2.75C2 1.78 2.78 1 3.75 1h8.5c.97 0 1.75.78 1.75 1.75v10.5c0 .97-.78 1.75-1.75 1.75h-8.5C2.78 15 2 14.22 2 13.25V2.75zM5 4.5a.75.75 0 000 1.5h6a.75.75 0 000-1.5H5zm0 3a.75.75 0 000 1.5h6a.75.75 0 000-1.5H5zm0 3a.75.75 0 000 1.5h3.5a.75.75 0 000-1.5H5z"/></svg>`;
@@ -42475,44 +42380,11 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
       // delivery look like a successful completion.
       .filter(Boolean)
       .join("\n");
-    let _outcomeSummary = "";
-    const _hasFinalNarrative = !!(summaryText && summaryText.trim());
-    const _hasPlanWork = Array.isArray(planSteps) && planSteps.length;
-    // Render the card when the model said NOTHING but work happened (it is then the only record),
-    // or when the run broke in a way the model could not narrate (its turn errored, or it was cut
-    // off at the cap). A model that wrote its own wrap-up keeps the last word: `narrativePresent`
-    // reduces the card to those harness-only facts, so its ending is not followed by canned
-    // "改动文件 / 运行结果 / 验证" lines restating what it just said.
-    const _shouldRenderOutcome = run.mode === "agent" && (
-      finalErr || hitCap
-      || (!_hasFinalNarrative && (didMutate || _runtimeEffects.size || _externalEffects.size
-        || (run.recording && run.recording.length >= 2) || _hasPlanWork))
-    );
-    if (_shouldRenderOutcome) {
-      _outcomeSummary = _buildAgentOutcomeSummary(run, {
-        narrativePresent: _hasFinalNarrative,
-        planSteps,
-        mutatedFiles: [..._mutatedFiles],
-        runtimeEffects: [..._runtimeEffects],
-        externalEffects: [..._externalEffects],
-        researchEvidence: _researchEvidence,
-        finalErr: _formatAgentFinalError(finalErr),
-        finalVerificationNote,
-        hitCap,
-        didMutate,
-        didVerify,
-        verificationPassed,
-        uiVerificationPassed,
-      });
-      // May be empty now: with a narrative present and no harness-only fact to report, the card
-      // has nothing left to say — append nothing rather than an empty block under the answer.
-      if (_outcomeSummary && _outcomeSummary.trim()) {
-        const summary = document.createElement("div");
-        summary.className = "agent-seg";
-        renderMarkdownInto(summary, _outcomeSummary, { highlighter: highlightCode });
-        body.appendChild(summary);
-      }
-    }
+    // The outcome card used to be appended here: a harness-generated footer restating
+    // "构建通过 / 已完成 / 改动文件 / 运行结果 / 验证" underneath whatever the model had just
+    // written. The user asked for it gone three separate times — it repeats in a robotic
+    // register what they can already see, and calls a run successful in the one register that
+    // reads as filler. Run errors are unaffected: they render on their own above (the ⚠️ note).
     // Persist this run's assistant narrative + WHAT IT DID (files changed), ALWAYS — even on
     // error / cap — so the next send continues with real context instead of restarting cold
     // ("上下文挂不上、一直从头走"). summaryText already accumulates every assistant prose turn
@@ -42521,7 +42393,6 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
     try {
       const _parts = [];
       if (summaryText && summaryText.trim()) _parts.push(summaryText.trim());
-      if (_outcomeSummary) _parts.push(_outcomeSummary);
       if (_mutatedFiles && _mutatedFiles.size) _parts.push(`〔本轮改动的文件：${[..._mutatedFiles].join("、")}〕`);
       if (run._incompleteReason) {
         const pendingItems = Array.isArray(planSteps)
@@ -42545,7 +42416,7 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
     session._lastRunState = {
       outcome: _runOutcome,
       task: String(task || "").replace(/\s+/g, " ").trim().slice(0, 700),
-      result: String(_outcomeSummary || summaryText || finalErr || "").replace(/\s+/g, " ").trim().slice(0, 1000),
+      result: String(summaryText || finalErr || "").replace(/\s+/g, " ").trim().slice(0, 1000),
       incompleteReason: String(run._incompleteReason || (hitCap ? "iteration_limit" : "")).slice(0, 260),
       mutated: !!didMutate, // 「接下来」建议据此区分干活轮和纯问答轮
       toolStats: _toolLedgerStats(run._toolLedger?.entries || []),

@@ -1507,7 +1507,6 @@ test("probe-loop detection: blind guess-and-check probing triggers a root-cause 
     "zero-mutation fact must come from the real mutation ticks");
 });
 
-
 test("bug-fix async evidence gate: fires once on unresolved root cause, yields to probeLoop (#46)", () => {
   const bugGate = load("_bugEvidenceGateNudgeMessage");
 
@@ -1554,7 +1553,6 @@ test("orchestrator metadata: parallel split/evidence tooling is selectable (#46)
     assert.match(line, /【触发器】/);
   }
 });
-
 
 test("slow install/download commands get a factual duration note (no interception)", () => {
   const slowNote = load("_slowInstallCmdNote");
@@ -2188,25 +2186,6 @@ test("dangerous commands are gated in auto mode; ordinary tools are not", async 
 // Read together that says "verified" and "not verified". It appeared on EVERY successful
 // run, which is how a summary footer trains people to skip it. The facts are unchanged;
 // they are now stated once.
-test("a green run states verification once, with no runtime-hedge caveat", () => {
-  const summary = (opts, run) => load("_buildAgentOutcomeSummary", {
-    _agentIncompleteLabel: () => "",
-    effectKindLabel: (k) => k,
-  })(run, opts);
-
-  // The "runtime not semantically verified, can't confirm the goal" hedge was removed — it
-  // appended an unactionable caveat to every green build, and the user asked for it gone. A
-  // verified run now states the fact plainly, once, with no caveat and no "本轮未完成" hedge.
-  const verified = { didMutate: true, verificationPassed: true, didVerify: true };
-  const out = summary({ ...verified, mutatedFiles: ["a.go"] }, {});
-  assert.match(out, /验证：已通过真实命令\/检查。/, "plain verification line");
-  assert.doesNotMatch(out, /静态层面|运行时行为未实测|语义核验/, "no runtime-hedge caveat anywhere");
-  assert.equal((out.match(/验证[：:]/g) || []).length, 1, "exactly one verification line");
-
-  // The removed hedge must never resurface even if a stale reason string is present.
-  const out2 = summary({ ...verified }, { _incompleteReason: "semantic_runtime_review_missing" });
-  assert.doesNotMatch(out2, /静态层面|语义核验未完全完成/, "the deleted caveat can never render again");
-});
 
 // Go emits `file.go:line:col: message` with NO severity keyword, so the gcc matcher — which
 // requires an explicit `error:`/`warning:` — matched none of it. A Go project reported
@@ -6561,7 +6540,6 @@ test("GitLab, Gitee, and Codeberg repo readers are real built-in tools", () => {
   assert.match(SRC, /GITLAB_TOKEN|GITEE_ACCESS_TOKEN|CODEBERG_TOKEN/);
 });
 
-
 test("active Skills survive L0 prompt stripping and are inherited by child work", () => {
   const activeSkillsBlock = load("_activeSkillsBlock", {
     _activeSkillIds: new Set(["review"]),
@@ -8125,41 +8103,6 @@ test("agent semantic profiles do not authorize or deny real tool execution", () 
   assert.equal(issue({ type: "cmd", command: "npm run dev" }, structured), "");
 });
 
-test("agent completion avoids duplicate outcome summaries and caps automatic continuation", () => {
-  // Same intent as before, now enforced end to end: a model that wrote its own wrap-up keeps the
-  // last word. The trigger no longer fires on `_verificationAlertText` / `_incompleteReason`
-  // (facts the model narrates itself), and when a narrative IS present the card is reduced to
-  // harness-only facts — so canned "改动文件 / 运行结果 / 验证" lines never follow the answer.
-  assert.match(SRC, /const _shouldRenderOutcome = run\.mode === "agent" && \(\s*finalErr \|\| hitCap/s,
-    "only harness-only facts (its turn erroring, or the cap) may force a card over a narrative");
-  assert.doesNotMatch(SRC, /const _shouldRenderOutcome = run\.mode === "agent" && \(\s*didMutate \|\| finalErr/s,
-    "mutating successfully should not by itself force a duplicate outcome summary");
-  assert.match(SRC, /narrativePresent: _hasFinalNarrative/,
-    "the card must know whether the model already spoke");
-  const outcome = extractFn("_buildAgentOutcomeSummary");
-  assert.match(outcome, /if \(opts\.narrativePresent\)[\s\S]{0,400}return "";/,
-    "with a narrative and no harness-only fact, the card must render nothing at all");
-  // Its own words must never be followed by a templated restatement of the same facts.
-  const narrativeBranch = outcome.slice(outcome.indexOf("if (opts.narrativePresent)"), outcome.indexOf("// Internal effect-kind tokens"));
-  for (const canned of [/改动文件/, /运行结果/, /验证：/, /已完成：/, /剩余\/待确认/]) {
-    assert.doesNotMatch(narrativeBranch, canned,
-      `a canned "${canned.source}" line must not be appended under the model's own ending`);
-  }
-  // 步数预算已整体拆除（用户决策）：结束由 AI 自主判定，不设任何步数天花板/延展审批；
-  // 唯一剩余的 cap 来源是用户自设的 token 预算钳位。
-  assert.match(SRC, /let budget = Infinity;/);
-  assert.doesNotMatch(SRC, /function _initialBudget/,
-    "步数起步预算函数必须随机制一起拆除，不留死代码");
-  assert.doesNotMatch(SRC, /_AGENT_HARD_CEIL|_AGENT_MAX_EXTENSIONS|_AGENT_EXT_STEP/,
-    "步数硬顶/延展常量必须全部拆除");
-  assert.match(SRC, /协作边界/);
-  assert.match(SRC, /Agent 模式不是无条件全自动/);
-  const suggestionSource = SRC.slice(SRC.indexOf("async function _maybeSuggestNext"), SRC.indexOf("function _steerRunningAgent"));
-  assert.match(suggestionSource, /_runStateNextActionSuggestions\(sess\)/);
-  assert.doesNotMatch(suggestionSource, /aiComplete|chat\/completions/,
-    "next-step chips must not start a paid request after the visible run has settled");
-});
-
 test("structured semantic profiles drive planning without lexical classification", () => {
   const requiresPlan = load("_runRequiresPlan");
   const hasCategoryArchitecture = load("_uiPlanHasCategoryArchitecture");
@@ -8799,32 +8742,6 @@ test("plan fold expands via delegated toggle and the expanded state survives re-
   assert.doesNotMatch(extractFn("_advancePlanFromTool"), /_planExpanded\s*=/);
 });
 
-test("agent outcome summary is rendered after plan settlement", () => {
-  const summary = load("_buildAgentOutcomeSummary", {
-    _agentIncompleteLabel: load("_agentIncompleteLabel"),
-  });
-  const text = summary({}, {
-    planSteps: [
-      { content: "读取真实项目结构", status: "completed" },
-      { content: "运行测试", status: "completed" },
-    ],
-    mutatedFiles: ["src/main.js"],
-    runtimeEffects: ["test"],
-    didMutate: true,
-    didVerify: true,
-    verificationPassed: true,
-    uiVerificationPassed: true,
-  });
-  assert.ok(!/^### 本轮结果/m.test(text), "outcome summary should not add a rigid '本轮结果' heading");
-  assert.match(text, /已完成：读取真实项目结构；运行测试/);
-  assert.match(text, /改动文件：src\/main\.js/);
-  assert.match(text, /验证：已通过真实命令\/检查/);
-  const settleIdx = SRC.indexOf("planSteps = _settleRunPlan(run)");
-  const summaryIdx = SRC.indexOf("_buildAgentOutcomeSummary(run", settleIdx);
-  assert.ok(settleIdx >= 0 && summaryIdx > settleIdx,
-    "final outcome card must be appended after the plan is settled, so it appears below the final plan card");
-});
-
 test("agent next-step chips use completed run memory and survive suggestion failures", () => {
   const gen = load("_runStateNextActionSuggestions");
   const now = Date.now();
@@ -8870,20 +8787,6 @@ test("agent next-step chips use completed run memory and survive suggestion fail
   assert.deepEqual(gen({}), []);
   assert.match(SRC, /const postRunMessages = Array\.isArray\(sess\.memory\)[\s\S]{0,260}_maybeSuggestNext\(sess, postRunMessages, config\)/,
     "Agent completion suggestions must be grounded in the post-run memory, not the pre-run messages");
-});
-
-test("missing or incomplete verification remains visible in the outcome", () => {
-  assert.match(SRC, /\.filter\(Boolean\)\s*\.join\("\\n"\)/,
-    "concrete verification notes must remain visible instead of being filtered out");
-  assert.match(SRC, /验证：项目未提供可自动识别的验证命令，未强行瞎跑/,
-    "if a mutation happened, no-auto-verification should remain a calm summary note, not a warning");
-  // 验证器缺失（127）的收尾总结也必须是平静措辞，不许写成"未完全通过或未运行"。
-  assert.match(SRC, /const verifierUnavailable = \/\^验证器不可用\|\^验证未完成\/m\.test\(note\)/,
-    "outcome summary must classify verifier-unavailable notes separately");
-  assert.match(SRC, /未验证：验证命令超时，未得到通过结论/,
-    "timeouts must produce a concrete user-visible note");
-  assert.match(SRC, /未验证：界面改动尚未完成当前版本浏览器检查/,
-    "UI verification gaps must remain user-visible");
 });
 
 test("bug fixes require causal reasoning before patching", () => {
@@ -16237,7 +16140,9 @@ test("验证器不可用（退出 127）不能被当成验证失败", () => {
     "验证器不存在必须与验证失败区分，否则就是当初拆除强制验证的那个 bug");
   assert.match(SRC, /return _filterVerifyCmdSteps\(root, await _detectVerifyCmdRaw\(root, stack\)\)/,
     "任何显式验证命令都必须经过存在性过滤");
-  assert.match(SRC, /验证：本机没有可运行的自动验证器/);
+  // The outcome card that carried this wording is gone (the user asked for the canned
+  // footer to be deleted). The 126/127 distinction it displayed is still enforced above,
+  // at the classification site — which is where it actually matters.
 
   // 源头：不能只因为存在 requirements.txt 就断定 ruff/pytest 可用。
   assert.doesNotMatch(SRC, /return "ruff check \. && pytest"/,
@@ -17768,7 +17673,6 @@ test("#47-5 恢复懒渲染：同步只渲最近 30 条，其余 idle 补渲，�
   assert.match(snap, /\(c\.textContent \|\| ""\)\.length > _SNAPSHOT_MAX_CHARS\) return ""/);
 });
 
-
 test("#51-1 九个专用工具 description 含「何时用」引导段", () => {
   const schemas = extractFn("_buildAgentToolSchemas");
   for (const tool of ["find_symbol", "lsp_references", "lsp_definition", "semantic_search", "git_blame", "git_log", "db_query", "developer_community_search", "performance_profile"]) {
@@ -17946,9 +17850,6 @@ test("#53-5 结果链路：嵌套报告只进父子体消息流/简报，不直�
   // 父子体收尾仍把自己的简报（含嵌套结果）折进 findings——既有机制承接，不另建链路
   assert.match(sub, /run\.ctx\.findings\.push/);
 });
-
-
-
 
 test("#56-4 空目录与历史事实不阻断显式工具调用", () => {
   // Empty-root state is useful telemetry for the model, but every explicit
@@ -21900,4 +21801,29 @@ test("no prompt prescribes the shape of the model's closing summary", () => {
         `${name} prescribes a closing-summary section (${re}) — the model must write its own ending`);
     }
   }
+});
+
+test("no harness-generated footer is appended under the model's answer", () => {
+  // A card used to be rendered beneath every agent run restating, in a robotic register,
+  // what the model had just written: 已完成 / 改动文件 / 运行结果 / 验证, with effect labels
+  // like 构建通过 and 测试通过. The user asked for it removed three separate times — the last
+  // time after watching it announce a successful build under an answer that had already shown
+  // the build succeeding. Whatever needs saying about an outcome is the model's to say, in its
+  // own words, once.
+  assert.doesNotMatch(SRC, /_buildAgentOutcomeSummary\s*\(/,
+    "the outcome-summary builder must not be reintroduced");
+  assert.doesNotMatch(SRC, /_outcomeSummary/,
+    "nothing may reassemble a harness outcome summary under another name");
+
+  // The effect-label vocabulary that fed it. These are fine as *acceptance criteria* handed to
+  // the model up front (_finishEffectLabels does exactly that, and stays); what must not return
+  // is a label map whose output is rendered into the transcript.
+  const rendered = /renderMarkdownInto\([^)]*(?:outcome|summary)[^)]*\)/i;
+  assert.doesNotMatch(SRC, rendered,
+    "no outcome/summary string may be rendered into the conversation by the harness");
+
+  // Run errors are deliberately exempt — they render on their own and must keep doing so,
+  // otherwise deleting the card would silently hide failures.
+  assert.match(SRC, /note\.textContent = "⚠️ " \+ _formatAgentFinalError\(finalErr\)/,
+    "a run error must still surface to the user on its own");
 });
