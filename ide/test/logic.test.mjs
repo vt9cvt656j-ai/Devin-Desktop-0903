@@ -21676,3 +21676,45 @@ test("存盘节流按上一次真实耗时退避——贵的存盘必须自己�
   assert.match(seg, /Math\.min\(60000,/, "退避要封顶，再慢也不能久到丢数据");
   assert.match(seg, /anyStreaming \? 5000 : 500/, "基础节流保持不变，只在更贵时才拉长");
 });
+
+test("a real TTY error routes to the interactive terminal, not a hand-off to the user", () => {
+  // Reproduced live (deepseek-v4-pro, 2026-08-09): the agent built a bubbletea TUI, ran it via
+  // run_cmd (pipe capture, no TTY), hit "open /dev/tty: device not configured", concluded "this
+  // is a non-interactive environment, can't run the TUI" and told the user to run it in their own
+  // terminal. But run_in_terminal is a REAL PTY tab where the TUI works. The recovery hint fires
+  // on the OBSERVED error (execution fact), never on the user's words.
+  const hint = load("_needsRealTtyHint", { _TTY_REQUIRED_RE: loadConst("_TTY_REQUIRED_RE") });
+
+  // fires on genuine TTY failures (nonzero exit + a real TTY-error signature in the output)
+  for (const out of [
+    "could not open a new TTY: open /dev/tty: device not configured",
+    "error: /dev/tty: no such device",
+    "inappropriate ioctl for device",
+    "this program must be run in a terminal",
+    "reading from stdin: not a tty",
+  ]) {
+    const h = hint(out, 1);
+    assert.ok(h, `must fire on: ${out}`);
+    assert.match(h, /run_in_terminal/, "…and must name the real-terminal tool");
+    assert.match(h, /真实终端|真 PTY/, "…and explain it is a real terminal");
+    assert.match(h, /别.{0,8}甩给用户|不是.{0,6}非交互环境/,
+      "…and must explicitly tell the model NOT to hand off to the user's own terminal");
+  }
+
+  // must NOT fire when the command succeeded, or on unrelated failures — no false positives that
+  // would push the model to the terminal when run_cmd was the right tool.
+  assert.equal(hint("open /dev/tty: device not configured", 0), "", "exit 0 is not a failure");
+  assert.equal(hint("error: cannot find module 'foo'", 1), "", "unrelated failure must not fire");
+  assert.equal(hint("2 passed, 0 failed", 0), "", "a normal successful run must not fire");
+});
+
+test("run_cmd / run_in_terminal descriptions carry the TTY split (the model reads the gateway copy)", () => {
+  // The model sees the GATEWAY tools.json descriptions, authored separately from the client
+  // registry. Both must state that run_cmd has no TTY and interactive/TUI programs use the real
+  // terminal — otherwise the model has no way to know which tool a bubbletea program needs.
+  const registered = JSON.parse(SERVER_TOOLS);
+  const by = new Map(registered.map((t) => [t.function.name, t.function.description || ""]));
+  assert.match(by.get("run_cmd"), /没有真实终端|没有.{0,2}TTY|\/dev\/tty/, "run_cmd must say it has no TTY");
+  assert.match(by.get("run_cmd"), /run_in_terminal/, "run_cmd must point TUI/interactive programs at run_in_terminal");
+  assert.match(by.get("run_in_terminal"), /真 PTY|真实终端.*TTY|TUI/, "run_in_terminal must advertise the real terminal for TUIs");
+});
