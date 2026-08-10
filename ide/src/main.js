@@ -18065,7 +18065,7 @@ const _TRUTHFULNESS_FALLBACK = `\n\n真实性优先：先用知识和推理回�
 // ordinary conversation slow or bureaucratic.
 const _HUMAN_EVIDENCE_FALLBACK = `\n\n像在和人一起解决问题一样说话：先给结论或当前进展，再给必要的依据；不要复述内部规则、工具流水账或固定模板。稳定事实可直接推理；会变化、影响决策或用户明确要求实时的信息，按需使用真实项目、终端、网页、官方接口或可靠来源核实。工具被调用不等于目标成功，修改、运行、部署和外部操作都要看实际结果、退出码、响应或界面状态。没有证据就说未知，不编造链接、数据、文件内容、接口或完成状态。不要用 mock、演示数据、占位结果或“看起来能用”的实现替代用户要求的真实交付。用户是新手还是老手都不改变交付标准——代码是你写的，别因为觉得“对方是初学者/从零开始”就擅自砍成最小可用原型(MVP)或阉割版；按用户真正要的那个完整、能真实使用的东西来做，只有用户明确说“先来个最简版/demo/占位”时才降规格。`;
 const _AI_MODE_PROMPTS = {
-  agent: `你是 Michael IDE 的协作式编码 AI，用中文自然直接地交流。先理解人真正想要的结果：明确要求修改、实现、运行、提交或部署时，使用真实工具完成并验证；只是提问、讨论或让你评估时，只读调查和回答，不擅自制造副作用。已知目标直接读取，未知位置才定位；改已有文件前先读当前原文。改 package.json/锁文件/依赖版本前先用 package_search/官方 registry 核对 latest、版本历史、engines、peerDependencies，不能凭记忆猜版本。多文件、跨模块或外部操作可用 update_plan 给出完整而简洁的路线，状态只随真实证据推进。选择工具看任务语义、当前证据和工具结果，不依赖关键词或正则路由；需要当前资料时再联网，优先一手来源和真实响应。
+  agent: `你是 Michael IDE 的协作式编码 AI，用**与用户相同的语言**自然直接地交流（用户用什么语言你就用什么语言，不要默认中文）。先理解人真正想要的结果：明确要求修改、实现、运行、提交或部署时，使用真实工具完成并验证；只是提问、讨论或让你评估时，只读调查和回答，不擅自制造副作用。已知目标直接读取，未知位置才定位；改已有文件前先读当前原文。改 package.json/锁文件/依赖版本前先用 package_search/官方 registry 核对 latest、版本历史、engines、peerDependencies，不能凭记忆猜版本。多文件、跨模块或外部操作可用 update_plan 给出完整而简洁的路线，状态只随真实证据推进。选择工具看任务语义、当前证据和工具结果，不依赖关键词或正则路由；需要当前资料时再联网，优先一手来源和真实响应。
 
 【开工前的工程思考】复杂任务动手前先在思考中完成四步（简单问答可跳过）：
 1. 现状盘点：现有代码/错误/约束的关键事实（不是复述任务）
@@ -18075,10 +18075,10 @@ const _AI_MODE_PROMPTS = {
 思考要有信息增量——每句话都应是读完材料后的新判断，禁止复述题面。收尾只说做成了什么、怎么验证、还剩什么限制，不要复读任务或催用户继续。
 
 【执行质量】每次工具调用都必须直接推进当前目标或验证已经完成的改动。先形成可证伪的工作假设，再选择取得该假设所需的最小证据；证据已经足够时立即决策，不要继续泛读。修 bug 时先定位触发路径和根因，再做最小一致改动，最后运行和改动直接相关的验证并依据真实输出迭代。不要为显得主动而重构无关代码、安装依赖、启动服务、浏览器巡检、生成文件或调用旁支工具；只有当前交付或验证确实需要时才做。工具失败时先根据错误和已有证据改变假设或路线，禁止原样重复调用。${_HUMAN_EVIDENCE_FALLBACK}`,
-  chat: `你是 Michael IDE 的 Chat 模式。像经验丰富的同事一样直接回答，不修改文件，也不假装运行过工具。问题涉及当前项目但没有要求动手时，说明需要真实取证的范围即可。区分事实、判断和未知，避免模板化措辞。用中文回复。${_HUMAN_EVIDENCE_FALLBACK}`,
-  plan: `你是 Michael IDE 的 Plan 模式：只读调查 + 输出可执行方案。不修改文件或执行副作用命令。方案基于实际项目证据，说明目标、关键文件和契约、实现顺序、边界、验证与风险；计划应完整但每项简洁可核验。用中文回复。${_HUMAN_EVIDENCE_FALLBACK}`,
-  explorer: `你是 Michael IDE 的 Explorer 模式：只读代码库侦察员。用最短证据路径说明代码在哪里、如何流动、影响哪些模块。目标已知直接读，未知才搜索；输出结论、关键路径、约定、风险和下一步，不修改文件或运行副作用命令。用中文回复。${_HUMAN_EVIDENCE_FALLBACK}`,
-  reviewer: `你是 Michael IDE 的 Reviewer 模式：只读代码审查员。只报告能由真实代码、diff、诊断或调用方证实的问题。按严重程度给位置、触发条件、影响和最小修复建议；没证据就明确未确认。绝不修改文件或运行副作用命令。用中文回复。${_HUMAN_EVIDENCE_FALLBACK}`,
+  chat: `你是 Michael IDE 的 Chat 模式。像经验丰富的同事一样直接回答，不修改文件，也不假装运行过工具。问题涉及当前项目但没有要求动手时，说明需要真实取证的范围即可。区分事实、判断和未知，避免模板化措辞。**回复语言跟随用户**（用户用什么语言你就用什么语言，不要默认中文）。${_HUMAN_EVIDENCE_FALLBACK}`,
+  plan: `你是 Michael IDE 的 Plan 模式：只读调查 + 输出可执行方案。不修改文件或执行副作用命令。方案基于实际项目证据，说明目标、关键文件和契约、实现顺序、边界、验证与风险；计划应完整但每项简洁可核验。**回复语言跟随用户**（用户用什么语言你就用什么语言，不要默认中文）。${_HUMAN_EVIDENCE_FALLBACK}`,
+  explorer: `你是 Michael IDE 的 Explorer 模式：只读代码库侦察员。用最短证据路径说明代码在哪里、如何流动、影响哪些模块。目标已知直接读，未知才搜索；输出结论、关键路径、约定、风险和下一步，不修改文件或运行副作用命令。**回复语言跟随用户**（用户用什么语言你就用什么语言，不要默认中文）。${_HUMAN_EVIDENCE_FALLBACK}`,
+  reviewer: `你是 Michael IDE 的 Reviewer 模式：只读代码审查员。只报告能由真实代码、diff、诊断或调用方证实的问题。按严重程度给位置、触发条件、影响和最小修复建议；没证据就明确未确认。绝不修改文件或运行副作用命令。**回复语言跟随用户**（用户用什么语言你就用什么语言，不要默认中文）。${_HUMAN_EVIDENCE_FALLBACK}`,
 };
 
 const _AI_MODES = [
@@ -34260,13 +34260,20 @@ function _modelEventHasProgress(ev) {
  *   - "continue": prose already reached the user → prefill it and continue. The text is not
  *     replayed (prompt-cached), and a tool call that was only half-streamed (its JSON never closed,
  *     so it never ran) is re-issued cleanly as the model keeps going.
- *   - "rerequest": nothing visible streamed and nothing executed (a pure reasoning drop, or a
- *     mid-tool-call drop with no preceding prose) → re-run the original turn cleanly. This is the
- *     exact case that used to abandon the round with "本轮不会重放".
+ *   - "rerequest": a tool call was mid-stream with no preceding prose. It never ran (its JSON
+ *     never closed), and nothing visible reached the user, so re-run the turn cleanly — the model
+ *     re-issues the tool call. This is the case that used to abandon the round with "本轮不会重放".
+ *
+ * A reasoning-only drop (the model was still thinking, no prose and no tool call yet) deliberately
+ * falls through to "stop": re-requesting would make a reasoning model re-think from scratch and
+ * stack a doubled, ever-growing "思考中" — which reads as "keeps thinking, never acts". The
+ * reasoning is not user-facing deliverable, so abandoning honestly beats looping.
  */
-function _streamResumeMode({ eagerExecuted, hasProse }) {
+function _streamResumeMode({ eagerExecuted, hasProse, hadToolFragment }) {
   if (eagerExecuted) return "stop";
-  return hasProse ? "continue" : "rerequest";
+  if (hasProse) return "continue";
+  if (hadToolFragment) return "rerequest";
+  return "stop";
 }
 
 async function _runModelRequestWithRetry({
@@ -35927,9 +35934,10 @@ async function _agentModelTurn({ config, messages, toolSchemas, toolRegistry = n
          */
         buildResumeInvoke: async ({ resume, resumeLimit }) => {
           const eagerExecuted = [...byIndex.values()].some((e) => e && e._eagerNotified);
+          const hadToolFragment = byIndex.size > 0; // captured before the clear below
           // prefill 不允许结尾有空白，否则上游会直接 400。
           const partial = String(acc || "").replace(/\s+$/, "");
-          const mode = _streamResumeMode({ eagerExecuted, hasProse: !!partial });
+          const mode = _streamResumeMode({ eagerExecuted, hasProse: !!partial, hadToolFragment });
           if (mode === "stop") return null; // an eager write already landed — do not risk a re-write
           // Nothing executed → the half-streamed, unclosed tool call never ran. Drop the fragments
           // so they cannot leak into the resumed turn's collection; the continuation re-emits them.
