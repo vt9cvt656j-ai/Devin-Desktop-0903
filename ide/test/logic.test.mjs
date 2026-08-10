@@ -8543,17 +8543,17 @@ test("server prompts preserve prompt rescue and maintainability baselines", () =
   assert.match(SERVER_PROMPT_PLAN, /用户描述模糊、提示词很差/, "Plan mode must normalize vague prompts instead of pushing the problem back to the user");
   assert.match(SERVER_PROMPT_PLAN, /维护与升级底线/, "Plan mode must include maintainability and upgrade coverage");
   assert.match(SERVER_PROMPT_PLAN, /清晰目录\/模块边界、集中配置\/env、类型\/schema\/API 契约/, "Plan mode must specify concrete engineering defaults");
-  assert.match(SERVER_PROMPT_REASONING, /目标、动作、对象、约束、成功条件/,
+  assert.match(SERVER_PROMPT_REASONING, /goal, action, object, constraints, success conditions/i,
     "reasoning must reconstruct the task contract before acting");
-  assert.match(SERVER_PROMPT_REASONING, /延续、纠正、替换还是澄清/,
+  assert.match(SERVER_PROMPT_REASONING, /continues, corrects, replaces, or clarifies/i,
     "reasoning must resolve short follow-ups against the prior task");
-  assert.match(SERVER_PROMPT_REASONING, /已证实事实、待验证假设、用户硬约束/,
+  assert.match(SERVER_PROMPT_REASONING, /verified facts, assumptions still to be tested, hard user constraints/i,
     "reasoning must keep facts, hypotheses, and constraints separate");
-  assert.match(SERVER_PROMPT_ANSWER_QUALITY, /发出任何可见正文前.*决定本轮回复策略/s,
+  assert.match(SERVER_PROMPT_ANSWER_QUALITY, /Before any visible text, decide this round's reply strategy/is,
     "the production prompt graph must require response planning before visible prose");
-  assert.match(SERVER_PROMPT_ANSWER_QUALITY, /最终正文或工具调用一旦开始.*不得再回到 reasoning/s,
+  assert.match(SERVER_PROMPT_ANSWER_QUALITY, /Once the final text or a tool call begins[\s\S]*must not return to reasoning/i,
     "a model turn must not resume reasoning after answer or tool output starts");
-  assert.match(SERVER_PROMPT_ANSWER_QUALITY, /简单问候、身份或常识问题.*一次答完.*不套固定话术/s,
+  assert.match(SERVER_PROMPT_ANSWER_QUALITY, /simple greeting, identity, or general-knowledge question[\s\S]*in one pass/i,
     "simple questions need one considered answer rather than a canned or repeated turn");
   assert.ok(SERVER_PROMPT_GRAPH.modes.chat.includes("answer_quality"),
     "gateway-routed lightweight chat must receive response ordering from the Prompt Graph");
@@ -20932,9 +20932,9 @@ test("read-it-and-stop is prevented by the prompt, not by a profile-derived harn
   //    do/change/run intents must produce a real result, and that an error spotted in passing
   //    is incidental — not the task, not a reason to stop.
   const prompt = readFileSync(join(HERE, "../../server/prompts/agent_core.txt"), "utf8");
-  assert.match(prompt, /做\/修\/改\/搭\/跑\/运行\/部署必须产生用户要求的真实变更或外部结果/,
-    "the must-produce-a-real-result rule (incl. 运行) must be in the prompt");
-  assert.match(prompt, /顺带发现的问题不是你的任务/,
+  assert.match(prompt, /do\/fix\/change\/build\/run\/deploy must produce the real change or external result/i,
+    "the must-produce-a-real-result rule (incl. run) must be in the prompt");
+  assert.match(prompt, /A problem you notice in passing is not your task/i,
     "the incidental-error instruction must be in the prompt, where behaviour now lives");
 });
 
@@ -21714,8 +21714,9 @@ test("the prompt makes running a program the agent's own action, not a hand-off"
   // TUI rendering IS delivery, and it must never hand the user a command to run themselves.
   const prompt = readFileSync(join(HERE, "../../server/prompts/agent_core.txt"), "utf8");
   assert.match(prompt, /run_in_terminal/, "the prompt must name the real-terminal tool");
-  assert.match(prompt, /自己把它跑起来|自己在真终端里/, "running a program is the agent's own action");
-  assert.match(prompt, /绝不要.{0,20}自己去终端敲|甩回给用户/, "the prompt must forbid handing the user a command to type");
+  assert.match(prompt, /"Run\/start a program" means YOU start it/i, "running a program is the agent's own action");
+  assert.match(prompt, /Never\*\* paste a command for the user|hands your work back to them/i,
+    "the prompt must forbid handing the user a command to type");
 });
 
 test("run_in_terminal reuses the same task's terminal instead of stacking a new tab", () => {
@@ -21808,9 +21809,10 @@ test("the always-injected prompt demands real, working delivery — no mocks or 
   const aq = readFileSync(join(HERE, "../../server/prompts/answer_quality.txt"), "utf8");
   assert.match(aq, /mock/i, "must forbid mock implementations by name");
   assert.match(aq, /example\.com/, "must forbid fabricated placeholder URLs by name");
-  assert.match(aq, /真实.{0,4}(接口|端点|URL)/, "must require real endpoints/URLs");
-  assert.match(aq, /demo.{0,6}冒充|冒充完成/, "must forbid passing a demo off as done");
-  assert.match(aq, /只有.{0,20}(demo|占位|最简版)/, "must scope the exception to an explicit user request for one");
+  assert.match(aq, /real interfaces\/endpoints\/URLs/i, "must require real endpoints/URLs");
+  assert.match(aq, /never pass a demo or fake implementation off as done/i, "must forbid passing a demo off as done");
+  assert.match(aq, /Only\*\* when the user explicitly asks for a demo/i,
+    "must scope the exception to an explicit user request for one");
 
   // And it is on the always-injected base, not a task block that may or may not fire.
   const graph = JSON.parse(readFileSync(join(HERE, "../../server/prompts/prompt_graph.json"), "utf8"));

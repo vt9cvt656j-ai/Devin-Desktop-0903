@@ -284,31 +284,6 @@
     });
   })();
 
-  // How a failed or abandoned provider sign-in comes back. The server sends a keyword,
-  // never provider text — that can carry someone else's address or a message we would be
-  // rendering into this page sight unseen.
-  var OAUTH_SAID = {
-    cancelled: ["Sign-in was cancelled.", "muted"],
-    unverified: ["That account's email address is not verified. Confirm it with your provider, then try again.", "err"],
-    noemail: ["That provider did not release an email address, so there is nothing to create an account with.", "err"],
-    unconfigured: ["That sign-in method is not enabled on this server yet.", "err"],
-    unknown: ["Unknown sign-in method.", "err"],
-    error: ["Sign-in failed. Please try again.", "err"]
-  };
-
-  (function reportOauth() {
-    var said;
-    try { said = new URLSearchParams(location.search).get("oauth"); } catch (e) { return; }
-    if (!said) return;
-    var m = OAUTH_SAID[said] || OAUTH_SAID.error;
-    setMsg(m[0], m[1] === "err" ? "err" : "");
-    // Take it out of the address bar so a reload does not re-accuse.
-    try {
-      var url = new URL(location.href);
-      url.searchParams.delete("oauth");
-      history.replaceState({}, "", url.toString());
-    } catch (e) {}
-  })();
   function finish(token) {
     // The cookie nginx checks before serving the app shell. Real API calls still carry
     // the Bearer token and are authorized per request.
@@ -519,6 +494,41 @@
     }
     wrap.style.visibility = "";
     $("email").focus();
+  })();
+
+  /*
+   * How a failed or abandoned provider sign-in comes back.
+   *
+   * After resume(), and inside this wrapper, for two separate reasons. show() ends with
+   * setMsg(""), and resume() calls show("email") on load — so a message written before it
+   * is wiped a moment later, which showed up as the redirect working and the page coming
+   * up blank. And everything here is scoped to the enclosing function, so a block moved
+   * past its closing brace loses setMsg entirely.
+   *
+   * The server sends a fixed keyword, never provider text: that can carry someone else's
+   * address, or a message we would be rendering into this page sight unseen.
+   */
+  var OAUTH_SAID = {
+    cancelled: ["Sign-in was cancelled.", "muted"],
+    unverified: ["That account's email address is not verified. Confirm it with your provider, then try again.", "err"],
+    noemail: ["That provider did not release an email address, so there is nothing to create an account with.", "err"],
+    unconfigured: ["That sign-in method is not enabled on this server yet.", "err"],
+    unknown: ["Unknown sign-in method.", "err"],
+    error: ["Sign-in failed. Please try again.", "err"]
+  };
+
+  (function reportOauth() {
+    var said;
+    try { said = new URLSearchParams(location.search).get("oauth"); } catch (e) { return; }
+    if (!said) return;
+    var m = OAUTH_SAID[said] || OAUTH_SAID.error;
+    setMsg(m[0], m[1] === "err" ? "err" : "");
+    // Take it out of the address bar so a reload does not re-accuse.
+    try {
+      var url = new URL(location.href);
+      url.searchParams.delete("oauth");
+      history.replaceState({}, "", url.toString());
+    } catch (e) {}
   })();
 })();
 </script>

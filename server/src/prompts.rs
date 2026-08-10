@@ -4114,9 +4114,9 @@ mod tests {
             "codeberg_repo",
             "stackoverflow_search",
             "hackernews_search",
-            "devto_search",
-            "gitlab_search",
-            "gitee_search",
+            // devto/gitlab/gitee search were folded into developer_community_search's
+            // `sources` (they were duplicate doors onto the same Rust commands). They are
+            // reachable via the aggregator above, so they no longer carry their own schema.
         ] {
             assert!(
                 names.contains(required),
@@ -4260,21 +4260,21 @@ mod tests {
     fn truthfulness_policy_rejects_partial_success_claims() {
         let policy = read_prompt("truthfulness").expect("truthfulness prompt should load");
         for required in [
-            "已验证事实",
-            "不等于“接入成功”",
-            "搜索是取证手段，不是思考的替代品",
+            "verified fact",
+            "does NOT mean \"the integration works\"",
+            "Search is a way to gather evidence, not a substitute for thinking",
             "published_date",
             "retrieved_at",
-            "这些时间不得互相代替",
-            "不可信数据",
-            "绝不执行",
-            "逐项报告",
-            "一轮没有带来新的独立来源",
+            "are not interchangeable",
+            "UNTRUSTED DATA",
+            "never executed",
+            "report that per source",
+            "adds no new independent source",
             "source_statuses[].status == success",
             "derived",
-            "不评价用户人格、动机或道德高低",
-            "不得提供可直接用于入侵第三方",
-            "授权测试、防御检测、合规实现或风险降低路径",
+            "Do not judge the user's character, motives, or morality",
+            "do not provide an executable recipe for breaking into third parties",
+            "authorized-testing, defensive-detection, compliant-implementation, or risk-reduction path",
         ] {
             assert!(
                 policy.contains(required),
@@ -4432,23 +4432,23 @@ mod tests {
         let system = body["messages"][0]["content"].as_str().unwrap_or_default();
 
         assert!(
-            system.contains("分主次"),
+            system.contains("Sort out what matters first"),
             "agent 提示词必须要求分清主次，否则外围取证会排在阻塞项前面"
         );
         assert!(
-            system.contains("先跑再下结论"),
+            system.contains("run it before concluding"),
             "决定性的那一步必须排在结论之前，不能先断言再回头找证据"
         );
         assert!(
-            system.contains("读源码查知识库都是白做"),
+            system.contains("reading source and searching the knowledge base is wasted effort"),
             "阻塞项没解除时（依赖没装、构建起不来），外围取证必须让路"
         );
         assert!(
-            system.contains("没验证的原因不当结论"),
+            system.contains("an unverified cause is not a conclusion"),
             "没验证的因果不能写成事实"
         );
         assert!(
-            system.contains("已在屏幕上的事实不复述"),
+            system.contains("facts already on screen do not need repeating"),
             "用户屏幕上已经显示的东西不该再复述一遍"
         );
     }
@@ -4472,7 +4472,7 @@ mod tests {
         let system = body["messages"][0]["content"]
             .as_str()
             .expect("assembled request should start with a system prompt");
-        assert!(system.contains("真实性与证据纪律"));
+        assert!(system.contains("Truthfulness and evidence discipline"));
         assert!(system.contains("专业回答合成层"));
         assert!(system.contains("低道德化表达"));
         assert!(system.contains("输入/输出/状态/错误/调用方契约"));
@@ -4843,8 +4843,8 @@ mod tests {
         assert_eq!(graph.agent.git, vec!["git_guide"]);
 
         let core = read_prompt("agent_core").unwrap();
-        assert!(core.contains("自主执行智能体"));
-        assert!(core.contains("工具按需选择"));
+        assert!(core.contains("autonomous execution agent"));
+        assert!(core.contains("Choose tools by need"));
         assert!(!core.contains("# michael-design 核心"));
         assert!(!core.contains("# 按任务加载：工程实现、调试与验证"));
 
@@ -5300,7 +5300,7 @@ mod tests {
         assert!(!system.contains("# 按任务加载：研究、社区与当前事实"));
         assert!(!system.contains("# michael-design 设计体系（"));
         assert!(!system.contains("michael-design 设计蓝本"));
-        assert!(system.contains("# 推理纪律"));
+        assert!(system.contains("# Reasoning discipline"));
     }
 
     #[test]
@@ -5480,7 +5480,7 @@ mod tests {
         let system = messages[0]["content"].as_str().unwrap();
         assert!(system.contains("平台知识库·与真实用户请求相关"));
         assert!(system.contains("不能证明当前 API 或社区现状"));
-        assert!(system.contains("# 推理纪律"));
+        assert!(system.contains("# Reasoning discipline"));
         assert!(!system.contains("因人而教"));
         let latest_user = messages
             .iter()
@@ -5633,13 +5633,13 @@ mod tests {
             });
             assemble_into(&agent_headers, &mut body);
             let system = body["messages"][0]["content"].as_str().unwrap();
-            assert!(system.contains("# 推理纪律"), "缺推理纪律: {content}");
+            assert!(system.contains("# Reasoning discipline"), "缺推理纪律: {content}");
             // 关键内容：可证伪、版本记忆会过期、报错先看字面。
-            assert!(system.contains("证明当前理解或根因假设是错的"), "{content}");
+            assert!(system.contains("prove your current understanding or root-cause hypothesis WRONG"), "{content}");
             // 可证伪是这一块的核心，也是它唯一不与其它块重复的内容。
             // 「版本记忆会过期」「报错先看字面」按审查建议归并到了 agent_engineering
             // （那边有 lock 文件、本地类型定义这些可执行细节），此处不再重复断言。
-            assert!(system.contains("最便宜的能推翻假设的观察"), "{content}");
+            assert!(system.contains("cheapest observation that could refute the hypothesis"), "{content}");
         }
 
         // 长闲聊历史同样不该改变结论（原门控在这里会漏判）。
@@ -5654,7 +5654,7 @@ mod tests {
         assert!(long_chat["messages"][0]["content"]
             .as_str()
             .unwrap()
-            .contains("# 推理纪律"));
+            .contains("# Reasoning discipline"));
 
         // 但它属于 agent 基座：plan 等只读模式走 modes.*，不注入。
         for mode in ["plan", "chat", "explorer", "reviewer"] {
@@ -5666,7 +5666,7 @@ mod tests {
             });
             assemble_into(&headers, &mut body);
             assert!(
-                !body["messages"][0]["content"].as_str().unwrap().contains("# 推理纪律"),
+                !body["messages"][0]["content"].as_str().unwrap().contains("# Reasoning discipline"),
                 "{mode} 模式不该注入 agent 基座"
             );
         }
@@ -5715,7 +5715,7 @@ mod tests {
             });
             assemble_into(&headers, &mut body);
             let system = body["messages"][0]["content"].as_str().unwrap();
-            assert!(system.contains("# 推理纪律"), "{request}");
+            assert!(system.contains("# Reasoning discipline"), "{request}");
             assert!(
                 !system.contains("平台知识库·与真实用户请求相关"),
                 "{request}"
@@ -5737,7 +5737,7 @@ mod tests {
             });
             assemble_into(&headers, &mut body);
             let system = body["messages"][0]["content"].as_str().unwrap();
-            assert!(system.contains("# 推理纪律"), "{request}");
+            assert!(system.contains("# Reasoning discipline"), "{request}");
             assert!(!system.contains("平台知识库·与真实用户请求相关"));
         }
 
@@ -6083,7 +6083,7 @@ mod tests {
             });
             assemble_into(&headers, &mut body);
             let system = body["messages"][0]["content"].as_str().unwrap().to_string();
-            assert!(system.contains("自主执行智能体"), "{m}");
+            assert!(system.contains("autonomous execution agent"), "{m}");
             if let Some(expected) = &expected {
                 assert_eq!(
                     &system, expected,
@@ -6106,20 +6106,24 @@ mod tests {
             });
             assemble_into(&headers, &mut body);
             let system = body["messages"][0]["content"].as_str().unwrap();
-            assert!(system.contains("自主执行智能体"), "{model}");
-            assert!(system.contains("真实性与证据纪律"), "{model}");
-            // 9_000 -> 9_200：为"分主次"那条规则腾的位置（真实失败催生的：项目 36 个
-            // 编译错误，助手先断言"根本原因是依赖未安装"，再去读 tsconfig/源码、再跑那条
-            // 唯一决定方向的 node_modules 检查、最后还查了一次知识库）。已经先把能删的
-            // 重复删掉抵掉一部分——agent_core 里"最终回复先给结果，再给证据/风险"和
-            // answer_quality 开头那句几乎逐字重复，两块永远一起加载，只留了独有的
-            // "文件和行号"。净增约 137 字节。
+            assert!(system.contains("autonomous execution agent"), "{model}");
+            assert!(system.contains("Truthfulness and evidence discipline"), "{model}");
+            // 这条上限是防提示词无声膨胀的闸门，不是禁止改动：抬它要写清楚换来了什么、
+            // 又删掉了什么，而不是顺手加个零。
             //
-            // 这条上限是防提示词无声膨胀的闸门，不是禁止改动：抬它要像这样写清楚
-            // 换来了什么、又删掉了什么，而不是顺手加个零。
+            // 单位从字节改成 token 估算（提示词从中文改写为英文时暴露的问题）：`len()` 数的是
+            // **字节**，而字节数在跨语言时和"注意力成本"完全脱钩——UTF-8 里中文一个字 3 字节
+            // 但约 1 token，英文一个字符 1 字节但约 0.25 token。同一份内容改写成英文，字节数
+            // 涨了约 40%，实际 token 只涨约 7%。继续用字节会把一次几乎中性的改写误报成 66%
+            // 的膨胀，也会让真正的中文膨胀被低估。估算法：CJK 按 1 token/字，其余按 4 字符/token。
+            let est_tokens = {
+                let cjk = system.chars().filter(|c| ('\u{4e00}'..='\u{9fff}').contains(c)).count();
+                let rest = system.chars().count() - cjk;
+                cjk + rest / 4
+            };
             assert!(
-                system.len() < 9_200,
-                "{model} ordinary system prompt is {} bytes",
+                est_tokens < 4_200,
+                "{model} ordinary system prompt is ~{est_tokens} tokens ({} bytes)",
                 system.len()
             );
             assert!(!system.contains("按任务加载：工程实现、调试与验证"));
@@ -6143,9 +6147,16 @@ mod tests {
         let automation_system = automation["messages"][0]["content"].as_str().unwrap();
         assert!(automation_system.contains("按任务加载：浏览器与桌面自动化"));
         assert!(!automation_system.contains("# michael-design 核心"));
+        // Token estimate, not bytes — see the ordinary-assembly guard for why the unit changed
+        // when the prompts were rewritten in English (CJK ≈ 3 bytes but ~1 token per char;
+        // ASCII ≈ 1 byte but ~0.25 token per char, so bytes stop tracking attention cost).
+        let automation_tokens = {
+            let cjk = automation_system.chars().filter(|c| ('\u{4e00}'..='\u{9fff}').contains(c)).count();
+            cjk + (automation_system.chars().count() - cjk) / 4
+        };
         assert!(
-            automation_system.len() < 15_000,
-            "automation prompt should not pay the UI tax: {} bytes",
+            automation_tokens < 5_600,
+            "automation prompt should not pay the UI tax: ~{automation_tokens} tokens ({} bytes)",
             automation_system.len()
         );
 
@@ -6191,9 +6202,14 @@ mod tests {
             );
         }
         assert!(focused_system.contains("聚焦 UI 修改/评审包"));
+        // Token estimate, not bytes — same unit change as the other two budget guards.
+        let focused_tokens = {
+            let cjk = focused_system.chars().filter(|c| ('\u{4e00}'..='\u{9fff}').contains(c)).count();
+            cjk + (focused_system.chars().count() - cjk) / 4
+        };
         assert!(
-            focused_system.len() < 28_000,
-            "focused UI prompt should remain compact: {} bytes",
+            focused_tokens < 10_500,
+            "focused UI prompt should remain compact: ~{focused_tokens} tokens ({} bytes)",
             focused_system.len()
         );
 
