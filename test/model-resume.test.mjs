@@ -127,17 +127,24 @@ test("不可重试的错误不触发续传", async () => {
   assert.match(r.error, /invalid api key/);
 });
 
-test("工具参数在途时绝不续传（源码级守卫）", () => {
+test("续传的安全线是「是否已执行」，而非「是否有工具在途」（源码级守卫）", () => {
   // 这条守卫在 _agentModelTurn 里，那个函数太大没法抽出来单独跑，所以钉源码。
-  // 为什么非钉不可：write_file 是“参数流完立刻落盘”的，而一段能被 JSON.parse 解析的
-  // 参数仍可能只是完整参数的前缀。拿半截参数去续写，等于让模型猜它自己刚才想写什么，
-  // 可能覆盖用户的文件。宁可停下来把决定权交回用户。
+  // 旧行为：只要 byIndex.size>0（有任何工具调用在途）就拒绝续传——于是流式写大文件中途断线
+  // 会把整轮报废（就是用户报的“输出中断，本轮不重放”）。真正危险的只有一种：eager write
+  // （write_file 参数流完立刻落盘）**已经执行**——重发那次调用会二次写盘。而半截参数的调用
+  // 其实没执行（JSON 没闭合、eager 没触发），丢弃即可，不必弃疗整轮。判据从此看“执行没执行”。
   const turn = SRC.slice(SRC.indexOf("buildResumeInvoke: async ({ resume, resumeLimit })"));
   const body = turn.slice(0, turn.indexOf("onResume:"));
-  assert.match(body, /if \(byIndex\.size > 0\) return null;/,
-    "有任何工具调用在途就必须拒绝续传");
+  assert.doesNotMatch(body, /if \(byIndex\.size > 0\) return null;/,
+    "不再因为「有工具在途」就整轮弃疗");
+  assert.match(body, /const eagerExecuted = \[\.\.\.byIndex\.values\(\)\]\.some\(\(e\) => e && e\._eagerNotified\)/,
+    "停的判据是 eager write 真的执行过（_eagerNotified），不是有没有工具调用");
+  assert.match(body, /if \(mode === "stop"\) return null;/,
+    "只有 eager write 已落盘这一种情况才停下把决定权交回用户");
+  assert.match(body, /byIndex\.clear\(\);/,
+    "没执行过的半截工具调用直接丢弃，续传时由模型重新干净发出，不拿半截参数猜");
   assert.match(body, /\.\.\._l0Msgs, \{ role: "assistant", content: partial \}/,
-    "续传靠的是把已生成内容作为最后一条 assistant 消息（prefill），不是重放提示");
+    "有正文时靠 prefill 续写，不重放提示");
   assert.match(body, /replace\(\/\\s\+\$\/, ""\)/,
     "prefill 结尾不能留空白，否则上游直接 400");
 });

@@ -21736,3 +21736,33 @@ test("run_cmd (captured) must not pop the terminal panel; only run_in_terminal d
   assert.match(src, /if \(t === "cmd"\) return;/, "cmd must return without opening the terminal");
   assert.doesNotMatch(src, /t === "cmd" \|\| t === "termtask"/, "cmd must no longer share the terminal-open path");
 });
+
+test("a mid-stream connection drop resumes instead of abandoning the round", () => {
+  // Reported: "Model connection interrupted during output generation … this round will not be
+  // replayed." The old resume bailed on ANY streamed tool call (byIndex.size > 0), so a drop mid a
+  // big write_file — the common case — abandoned the whole turn. _streamResumeMode narrows the only
+  // unsafe case to "an eager write already executed" (re-issuing it would double-write).
+  const mode = load("_streamResumeMode");
+
+  // an eager write already hit disk → stop (re-emitting risks a second write)
+  assert.equal(mode({ eagerExecuted: true, hasProse: true }), "stop");
+  assert.equal(mode({ eagerExecuted: true, hasProse: false }), "stop");
+  // prose reached the user, nothing executed → continue from the prefill (no replay)
+  assert.equal(mode({ eagerExecuted: false, hasProse: true }), "continue");
+  // nothing visible streamed, nothing executed → re-run the turn cleanly (the case that used to
+  // abandon: a drop mid a half-streamed tool call whose JSON never closed, so it never ran)
+  assert.equal(mode({ eagerExecuted: false, hasProse: false }), "rerequest");
+
+  // The resume builder must key its safety on execution, not on "were there tool calls", and must
+  // discard the unexecuted fragments before continuing.
+  const turn = extractFn("_agentModelTurn");
+  assert.doesNotMatch(turn, /if \(byIndex\.size > 0\) return null;/,
+    "the blanket 'any tool call → give up' bail must be gone");
+  assert.match(turn, /const eagerExecuted = \[\.\.\.byIndex\.values\(\)\]\.some\(\(e\) => e && e\._eagerNotified\)/,
+    "the stop decision must be gated on an eager write having actually executed");
+  assert.match(turn, /_streamResumeMode\(\{ eagerExecuted, hasProse: !!partial \}\)/,
+    "the resume builder must route through the pure decision helper");
+  assert.match(turn, /if \(mode === "stop"\) return null;/, "the stop mode bails");
+  assert.match(turn, /byIndex\.clear\(\);/,
+    "unexecuted tool-call fragments are discarded before the continuation re-emits them");
+});
