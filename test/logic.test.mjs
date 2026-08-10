@@ -3757,9 +3757,9 @@ test("runtime tool schemas reject missing required parameters for native and tex
   assert.equal(parseText('{"name":"made_up_tool","args":{}}', registry, unknownIssues, unknownRejected).length, 0);
   assert.match(unknownIssues[0], /未知工具/);
   assert.equal(unknownRejected[0].name, "made_up_tool");
-  assert.match(SRC, /name: "http_request"[\s\S]{0,900}required: \["url"\]/,
+  assert.match(SRC, /name: "http_request"[\s\S]{0,1600}required: \["url"\]/,
     "http_request schema should match the executor's GET default");
-  assert.match(SRC, /name: "tor_request"[\s\S]{0,900}required: \["url"\]/,
+  assert.match(SRC, /name: "tor_request"[\s\S]{0,1200}required: \["url"\]/,
     "tor_request schema should match the executor's GET default");
 });
 
@@ -5230,8 +5230,8 @@ test("local discovery is a registered read-only model tool", () => {
   assert.match(SRC, /_requestCurrentCoordinates/);
   assert.match(SRC, /open_now=null 时不得说现在营业/);
   assert.match(SRC, /opening_hours 是 OSM 标注的排班原文/);
-  assert.match(SRC, /Nominatim 与 ArcGIS 地理编码/);
-  assert.match(SRC, /retrieved_at 只是本次取回时间，不是 POI 更新时间/);
+  assert.match(SRC, /Nominatim first, falling back to ArcGIS World Geocoding/);
+  assert.match(SRC, /retrieved_at is when the IDE finished this request, not when the map, POI, address or encyclopedia data was updated/);
 });
 
 test("live_environment 保留，退役公开数据工具不留死分支", () => {
@@ -5700,12 +5700,12 @@ test("native screen tools are mapped to real Tauri commands", () => {
 
 test("automation schema requires state verification and recovery", () => {
   const description = SRC.match(/name: "automation", description: "([^"]+)"/)?.[1] || "";
-  assert.match(description, /按状态机用/);
-  assert.match(description, /前置状态/);
-  assert.match(description, /验证后置状态/);
-  assert.match(description, /发起点击或输入不等于成功/);
-  assert.match(description, /selector 失效要重新读取页面\/节点/);
-  assert.match(description, /登录\/验证码\/系统权限阻塞/);
+  assert.match(description, /Use it as a state machine/);
+  assert.match(description, /confirm the precondition first/);
+  assert.match(description, /then verify the postcondition/);
+  assert.match(description, /issuing a click or some typing is not the same as succeeding/);
+  assert.match(description, /When a selector goes stale, re-read the page\/nodes/);
+  assert.match(description, /when sign-in, a captcha or a system permission blocks you/);
 });
 
 test("read ranges deduplicate only exact source still available in the current run context", () => {
@@ -6472,18 +6472,18 @@ test("developer community search is wired through schema, normalization, executi
   assert.match(SRC, /name: "developer_community_search"/);
   assert.match(SRC, /case "developer_community_search": return \{ type: "developer_community_search"/);
   assert.match(SRC, /backend\.invoke\(call\.type, _args\)/);
-  assert.match(SRC, /success、empty、rate-limited、failed 或 timeout/);
-  assert.match(SRC, /timeout 表示该来源超过独立硬时限/);
-  assert.match(SRC, /empty 只表示适配器完成但没有可用命中/);
+  assert.match(SRC, /success, empty, rate-limited, failed or timeout/);
+  assert.match(SRC, /timeout means that source exceeded this round's hard limit/);
+  assert.match(SRC, /empty only means the adapter finished with no usable hits/);
   // 官方语言论坛必须在 sources 描述里点名（模型不知道能传就等于没有）。分隔符用什么无所谓，
   // 原来写死顿号，换成斜杠列举就会假红——守的是"这四个名字都出现"，不是标点。
   for (const forum of ["rust_users", "python_discussions", "swift_forums", "kotlin_discussions"]) {
     assert.match(SRC, new RegExp(forum), `官方论坛来源 ${forum} 必须在 sources 描述里点名`);
   }
-  assert.match(SRC, /published_date、created_date、updated_date、last_activity_date 与 retrieved_at 不得互相代替/);
-  assert.match(SRC, /缺失保持 unknown/);
-  assert.match(SRC, /结果保留各来源的相关性或上游顺序，不保证按日期排序/);
-  assert.match(SRC, /query: \{ type: "string", minLength: 1, description: "搜索主题或报错关键词" \}/);
+  assert.match(SRC, /published_date, created_date, updated_date, last_activity_date and retrieved_at, and these must never stand in for one another/);
+  assert.match(SRC, /a missing one stays unknown/);
+  assert.match(SRC, /Results keep each source's own relevance or upstream ordering — they are not guaranteed to be sorted by date/);
+  assert.match(SRC, /query: \{ type: "string", minLength: 1, description: "The topic or error keyword to search for" \}/);
   assert.match(SRC, /Calling a tool or configuring an endpoint is not success/);
   assert.doesNotMatch(SRC.match(/name: description: "([^"]+)/)?.[1] || "", /真实可运行|代码全有|首选/);
 
@@ -6508,7 +6508,7 @@ test("GitHub repo reader is a real built-in tool, not only an MCP preset", () =>
   assert.ok(schema, "github_repo must be in the live built-in registry");
   assert.deepEqual(schema.function.parameters.required, ["owner", "repo"]);
   assert.ok(schema.function.parameters.properties.action.enum.includes("file"));
-  assert.match(schema.function.description, /真实内容/);
+  assert.match(schema.function.description, /real contents/);
 
   // `_mapToolCall(name, args, mcpToolMap = _mcpToolMap)` — the third parameter's DEFAULT
   // dereferences a module-level binding, so omitting it here threw a ReferenceError inside
@@ -8468,8 +8468,8 @@ test("structured semantic profiles drive planning without lexical classification
   ], true, "execute", gitWorkflowProfile), "");
   assert.match(SRC, /\[AGENT_INTERACTIVE_WAIT\]/,
     "interactive waits must inject a first-turn orchestration reminder");
-  assert.match(SRC, /所有项目默认工程级/);
-  assert.match(SRC, /项目地图\/模块边界、变更半径\/调用方影响、验证矩阵\/CI式检查/);
+  assert.match(SRC, /an experienced engineer's checklist, not slogans/);
+  assert.match(SRC, /Container work covers Docker\/Compose\/K8s, environment variables, ports, volumes, networking, healthcheck and logs/);
   assert.match(SRC, /timeoutSecs:\s*5/,
     "background URL monitor must pass camelCase timeoutSecs to the Tauri invoke layer");
   assert.match(extractFn("_toolReminderBlock"), /工具窗口会随用户目标、新证据与 MCP 发现动态更换/,
@@ -8518,18 +8518,18 @@ test("structured semantic profiles drive planning without lexical classification
     "计划门必须按任务意图识别大计划工程，而不是机械文件计数");
   assert.doesNotMatch(SRC, /if \(call && call\.type === "worker"\) return true;/,
     "派 worker 不再无条件要计划：小型并行任务走意图判定，大工程由 _planGateGrandProject 拦");
-  assert.match(SRC, /复杂工程写入计划要像老手执行清单/);
-  assert.match(SRC, /UI\/官网\/落地页计划要覆盖/);
-  assert.match(SRC, /项目技术栈与现有组件\/theme\/style 入口/);
+  assert.match(SRC, /an experienced engineer's checklist, not slogans/);
+  assert.match(SRC, /A UI, marketing-site or landing-page plan covers/);
+  assert.match(SRC, /the project's stack and its existing component\/theme\/style entry points/);
   assert.match(SRC, /knowledge_search\(domain=\\"michael-design\\"\)/);
-  assert.match(SRC, /已有网站保留原框架与构建系统/);
-  assert.match(SRC, /只有无网站且无可沿用\/用户指定栈时默认 React \+ Tailwind CSS \+ shadcn\/ui/);
-  assert.match(SRC, /最终采用 Tailwind v4 时才使用 CSS-first 配置/);
+  assert.match(SRC, /an existing site keeps its framework and build system/);
+  assert.match(SRC, /React \+ Tailwind CSS \+ shadcn\/ui is the default only when there is no site and nothing to reuse and the user named no stack/);
+  assert.match(SRC, /CSS-first configuration applies only when Tailwind v4 is the final choice/);
   assert.match(SRC, /真实内容源/);
-  assert.match(SRC, /Bug\/调试修复必须像老手查案/);
-  assert.match(SRC, /同一失败路径或聚焦回归测试/);
-  assert.match(SRC, /接口\/数据契约与边界、实现改动、失败\/空值\/兼容处理/);
-  assert.match(SRC, /复杂只读调查覆盖取证、交叉核验、结论边界\/不确定性/);
+  assert.match(SRC, /For a bug fix, start from the real symptom/);
+  assert.match(SRC, /the same failing path or a focused regression test/);
+  assert.match(SRC, /the interface and data contracts and their boundaries, the implementation change, handling of failure, empty and compatibility cases/);
+  assert.match(SRC, /a complex read-only investigation covers gathering evidence, cross-verifying it, and stating the conclusion's boundaries and uncertainty/);
 });
 
 test("server prompts preserve prompt rescue and maintainability baselines", () => {
@@ -8889,13 +8889,13 @@ test("missing or incomplete verification remains visible in the outcome", () => 
 test("bug fixes require causal reasoning before patching", () => {
   assert.match(SRC, /Bug 修复必须先建立因果链/,
     "shared agent discipline must require bug-fix causal reasoning, not blind patching");
-  assert.match(SRC, /复现或读取真实报错\/日志\/截图\/诊断\/exit code/,
+  assert.match(SRC, /reproduce it, or read the actual error, log, screenshot, diagnostic or exit code/,
     "bug plans must start from real symptoms or failure evidence");
-  assert.match(SRC, /沿入口、状态、数据流、调用链、异步时序、边界值和调用方契约建立因果链/,
+  assert.match(SRC, /build the causal chain along the entry point, state, data flow, call chain, async ordering, boundary values and caller contract/,
     "bug plans must inspect control/data flow and boundary conditions");
-  assert.match(SRC, /可证伪根因假设/,
+  assert.match(SRC, /falsifiable root-cause hypotheses/,
     "bug plans must carry falsifiable hypotheses instead of vibes");
-  assert.match(SRC, /重跑同一失败路径或聚焦回归测试/,
+  assert.match(SRC, /re-run the same failing path or a focused regression test and record the exit code/,
     "bug fixes must verify the same failure path or a focused regression");
 });
 
@@ -8916,9 +8916,9 @@ test("dynamic URLs and third-party fields require real evidence instead of guess
     "truthfulness prompt must forbid guessing dynamic facts and URLs");
   assert.match(SRC, /猜出来的链接\/字段只能标成假设，不能写进结果或代码当事实/,
     "agent discipline must prevent guessed links or fields from becoming code/results");
-  assert.match(SRC, /动态数据\/URL\/接口\/抓包\/爬虫\/第三方页面任务必须列真实证据采集步骤/,
+  assert.match(SRC, /collect real evidence before writing parsing logic/,
     "plans for scraping/API work must include real evidence acquisition");
-  assert.match(SRC, /不得先猜 URL 规则/,
+  assert.match(SRC, /never guess a URL pattern first/,
     "plans must explicitly ban URL-rule guessing before real capture");
 });
 
@@ -17772,9 +17772,9 @@ test("#47-5 恢复懒渲染：同步只渲最近 30 条，其余 idle 补渲，�
 test("#51-1 九个专用工具 description 含「何时用」引导段", () => {
   const schemas = extractFn("_buildAgentToolSchemas");
   for (const tool of ["find_symbol", "lsp_references", "lsp_definition", "semantic_search", "git_blame", "git_log", "db_query", "developer_community_search", "performance_profile"]) {
-    const m = schemas.match(new RegExp(`name: "${tool}", description: "([^"]+)"`));
+    const m = schemas.match(new RegExp(`name: "${tool}", description: "((?:[^"\\\\]|\\\\.)+)"`));
     assert.ok(m, `${tool} 的 schema 定义必须存在`);
-    assert.match(m[1], /【何时用】/, `${tool} 的 description 必须含「何时用」段`);
+    assert.match(m[1], /【When to use】/, `${tool} 的 description 必须含「何时用」段`);
   }
 });
 
@@ -19096,7 +19096,7 @@ test("P2 剩余工具 Schema Description 含【何时用】", () => {
     "delete_path", "move_path", "copy_path", "create_dir", "format_file",
   ];
   for (const tool of tools) {
-    const pattern = new RegExp(`name:\\s*"${tool}"[\\s\\S]*?description:\\s*"[^"]*【何时用】`);
+    const pattern = new RegExp(`name:\\s*"${tool}"[\\s\\S]*?description:\\s*"[^"]*【When to use】`);
     assert.match(SRC, pattern, `${tool} 的 schema description 必须含【何时用】`);
   }
 });
@@ -19312,7 +19312,7 @@ test("#92: list_dir tool schema 包含 depth 参数", () => {
   assert.match(SRC, /name:\s*"list_dir"[\s\S]*?Recursion depth/,
     "英文 list_dir schema 必须描述 depth 为递归深度");
   // 中文 schema 描述 0=无限
-  assert.match(SRC, /0\s*=\s*无限递归/,
+  assert.match(SRC, /0 = recurse all the way down/,
     "depth 参数描述必须说明 0=无限递归");
 });
 
