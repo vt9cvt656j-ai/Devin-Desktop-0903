@@ -337,6 +337,16 @@
       var exists = !!(res.data && (res.data.exists || res.data.registered));
       $("loginEmail").textContent = state.email;
       $("signupEmail").textContent = state.email;
+      // An account created through a provider has no password, so the password step would
+      // be a box nothing can satisfy. Stay here instead — this is the step the provider
+      // buttons are visible on — and say which one to press.
+      var providers = (res.data && res.data.providers) || [];
+      if (exists && res.data && res.data.password === false && providers.length) {
+        var names = providers.map(function (p) { return p === "github" ? "GitHub" : p === "google" ? "Google" : p; });
+        setMsg("This account signs in with " + names.join(" or ") + ". Use the button below.", "");
+        btn.disabled = false;
+        return;
+      }
       if (exists) {
         show("login");
         setTimeout(function () { $("pw").focus(); }, 30);

@@ -8123,10 +8123,25 @@ test("agent semantic profiles do not authorize or deny real tool execution", () 
 });
 
 test("agent completion avoids duplicate outcome summaries and caps automatic continuation", () => {
-  assert.match(SRC, /const _shouldRenderOutcome = run\.mode === "agent" && \(\s*finalErr \|\| _verificationAlertText \|\| hitCap \|\| run\._incompleteReason/s,
-    "normal agent narratives should not always get a second automatic recap underneath");
+  // Same intent as before, now enforced end to end: a model that wrote its own wrap-up keeps the
+  // last word. The trigger no longer fires on `_verificationAlertText` / `_incompleteReason`
+  // (facts the model narrates itself), and when a narrative IS present the card is reduced to
+  // harness-only facts — so canned "改动文件 / 运行结果 / 验证" lines never follow the answer.
+  assert.match(SRC, /const _shouldRenderOutcome = run\.mode === "agent" && \(\s*finalErr \|\| hitCap/s,
+    "only harness-only facts (its turn erroring, or the cap) may force a card over a narrative");
   assert.doesNotMatch(SRC, /const _shouldRenderOutcome = run\.mode === "agent" && \(\s*didMutate \|\| finalErr/s,
     "mutating successfully should not by itself force a duplicate outcome summary");
+  assert.match(SRC, /narrativePresent: _hasFinalNarrative/,
+    "the card must know whether the model already spoke");
+  const outcome = extractFn("_buildAgentOutcomeSummary");
+  assert.match(outcome, /if \(opts\.narrativePresent\)[\s\S]{0,400}return "";/,
+    "with a narrative and no harness-only fact, the card must render nothing at all");
+  // Its own words must never be followed by a templated restatement of the same facts.
+  const narrativeBranch = outcome.slice(outcome.indexOf("if (opts.narrativePresent)"), outcome.indexOf("// Internal effect-kind tokens"));
+  for (const canned of [/改动文件/, /运行结果/, /验证：/, /已完成：/, /剩余\/待确认/]) {
+    assert.doesNotMatch(narrativeBranch, canned,
+      `a canned "${canned.source}" line must not be appended under the model's own ending`);
+  }
   // 步数预算已整体拆除（用户决策）：结束由 AI 自主判定，不设任何步数天花板/延展审批；
   // 唯一剩余的 cap 来源是用户自设的 token 预算钳位。
   assert.match(SRC, /let budget = Infinity;/);

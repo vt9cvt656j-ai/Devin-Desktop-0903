@@ -376,7 +376,6 @@ struct Identity {
     email: String,
     email_verified: bool,
     name: String,
-    avatar: String,
 }
 
 async fn finish(
@@ -538,11 +537,6 @@ async fn fetch_identity(
                     .or_else(|| profile.get("login").and_then(|v| v.as_str()))
                     .unwrap_or_default()
                     .to_owned(),
-                avatar: profile
-                    .get("avatar_url")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or_default()
-                    .to_owned(),
             })
         }
         Provider::Google => {
@@ -574,11 +568,6 @@ async fn fetch_identity(
                     .unwrap_or(false),
                 name: profile
                     .get("name")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or_default()
-                    .to_owned(),
-                avatar: profile
-                    .get("picture")
                     .and_then(|v| v.as_str())
                     .unwrap_or_default()
                     .to_owned(),
@@ -665,16 +654,14 @@ async fn resolve_account(
         .execute(&state.db)
         .await?;
     }
-    if !who.avatar.trim().is_empty() {
-        sqlx::query(
-            "UPDATE users SET avatar = $2, updated_at = now() \
-             WHERE id = $1 AND (avatar IS NULL OR avatar = '')",
-        )
-        .bind(user.id)
-        .bind(&who.avatar)
-        .execute(&state.db)
-        .await?;
-    }
+    // The provider's profile picture is deliberately NOT taken.
+    //
+    // It arrives as a URL on the provider's CDN, and the console is served under
+    // `img-src 'self' data:` — so that URL can never render, in any browser, no matter
+    // what. The column's own contract agrees: `clean_avatar` accepts only a base64 `data:`
+    // image. Storing a link that is guaranteed not to display would put a value in the
+    // row that looks like a picture and behaves like a broken one; the initials the
+    // console falls back to are a better answer, and Settings already takes an upload.
 
     // Re-read so the caller sees the row as it now stands rather than as it was inserted.
     Ok(
@@ -752,6 +739,42 @@ mod tests {
         // One word stays one word: a blank surname beats a made-up one.
         assert_eq!(split_name("Prince"), ("Prince".into(), "".into()));
         assert_eq!(split_name("  "), ("".into(), "".into()));
+    }
+
+    /// The provider callback must not sit behind the bcrypt rate limit.
+    ///
+    /// nginx picks the first *regex* location that matches, in file order — not the
+    /// longest. So `^/api/auth/oauth/` only takes effect while it appears above
+    /// `^/api/auth/`. Move it below and the limiter silently reverts to 10 requests a
+    /// minute, which mostly shows up as people being unable to finish signing in *after*
+    /// approving at GitHub — the one failure that costs them the whole flow.
+    #[test]
+    fn oauth_is_matched_before_the_bcrypt_rate_limit() {
+        let conf = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/nginx/michael-backend.conf"
+        ))
+        .expect("read nginx conf");
+        let oauth = conf
+            .find("location ~ ^/api/auth/oauth/")
+            .expect("the oauth location must exist");
+        let auth = conf
+            .find("location ~ ^/api/auth/ {")
+            .expect("the auth location must exist");
+        assert!(
+            oauth < auth,
+            "^/api/auth/oauth/ must come first or nginx never reaches it"
+        );
+
+        let limits = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/nginx/michael-limits.conf"
+        ))
+        .expect("read nginx limits");
+        assert!(
+            limits.contains("zone=mdo_oauth"),
+            "the zone the block above references has to be defined"
+        );
     }
 
     #[test]
