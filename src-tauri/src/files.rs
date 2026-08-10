@@ -1364,10 +1364,22 @@ pub fn inspect_file(path: String, max_bytes: Option<u64>) -> Result<FileInspecti
     let mut summary = Vec::new();
     summary.push(format!("类型：{}", kind));
     summary.push(format!("大小：{} bytes", meta.len()));
-    if sampled {
+    // The sample bound applies to the RAW-BYTES views — hex, strings, text preview. It says
+    // nothing about an archive, whose index is read in full from the file itself however large it
+    // is. Printing it beside "1652 entries" read as "and it gave up after 1 MB", which is exactly
+    // backwards: those 1652 entries are the complete listing of a 2 GB archive.
+    let archive_read_in_full = archive
+        .as_ref()
+        .is_some_and(|listing| !listing.count_is_partial && !listing.entries.is_empty());
+    if sampled && !archive_read_in_full {
         summary.push(format!(
             "文件超过 {}MB，当前只解析前 {} bytes",
             INSPECT_FULL_PARSE_MAX / 1024 / 1024,
+            bytes.len()
+        ));
+    } else if sampled {
+        summary.push(format!(
+            "压缩包目录已完整读取；下面的十六进制/字符串预览只取了前 {} bytes",
             bytes.len()
         ));
     }
@@ -2137,6 +2149,46 @@ pub fn replace_in_project(
         files_changed,
         replacements,
     })
+}
+
+#[cfg(test)]
+mod archive_summary_tests {
+    use super::*;
+    use std::io::Write;
+
+    /// The sample bound describes the hex/strings preview, not the archive. Shown next to the
+    /// entry count it read as "it only got through 1 MB of your zip", which is the opposite of
+    /// what happened — and it is why a working build looked like an old one.
+    #[test]
+    fn a_fully_read_archive_is_not_labelled_as_truncated() {
+        let dir = std::env::temp_dir().join("michael-inspect-tests");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("big.zip");
+
+        // Comfortably past the sampling threshold, so `sampled` is true.
+        let file = std::fs::File::create(&path).unwrap();
+        let mut zip = zip::ZipWriter::new(file);
+        let opts: zip::write::FileOptions<()> =
+            zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Stored);
+        let blob = vec![b'x'; 256 * 1024];
+        for i in 0..8 {
+            zip.start_file(format!("payload{i}.bin"), opts).unwrap();
+            zip.write_all(&blob).unwrap();
+        }
+        zip.finish().unwrap();
+
+        let inspection = inspect_file(path.to_string_lossy().into_owned(), Some(64 * 1024)).unwrap();
+        let summary = inspection.summary.join("\n");
+        assert!(
+            !summary.contains("当前只解析前"),
+            "a complete archive listing must not carry the raw-bytes truncation notice:\n{summary}"
+        );
+        assert!(
+            summary.contains("8 个条目"),
+            "and it must still report the real entry count:\n{summary}"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
 }
 
 #[cfg(test)]
