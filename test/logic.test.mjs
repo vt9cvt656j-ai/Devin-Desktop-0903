@@ -6484,7 +6484,7 @@ test("developer community search is wired through schema, normalization, executi
   assert.match(SRC, /缺失保持 unknown/);
   assert.match(SRC, /结果保留各来源的相关性或上游顺序，不保证按日期排序/);
   assert.match(SRC, /query: \{ type: "string", minLength: 1, description: "搜索主题或报错关键词" \}/);
-  assert.match(SRC, /只调用工具或配置接口不等于成功/);
+  assert.match(SRC, /Calling a tool or configuring an endpoint is not success/);
   assert.doesNotMatch(SRC.match(/name: description: "([^"]+)/)?.[1] || "", /真实可运行|代码全有|首选/);
 
   const directoryDescription = SRC.match(/const _SEARCH_TOOLS_DESCRIPTION = `([^`]+)`;/)?.[1];
@@ -8912,7 +8912,7 @@ test("code delivery without build/test evidence is reported without forcing anot
 });
 
 test("dynamic URLs and third-party fields require real evidence instead of guessing", () => {
-  assert.match(SRC, /URL、接口、跳转、字段含义、商品\/价格\/库存\/直播间\/播放地址\/榜单\/实时状态这类动态事实，必须来自真实页面、真实 HTTP\/网络响应、真实文件样本、官方\/结构化接口或用户授权数据/,
+  assert.match(SRC, /Dynamic facts — URLs, endpoints, redirects, field meanings, products, prices, stock, stream or playback addresses, rankings, live status — must come from a real page, a real HTTP\/network response, a real file sample, an official or structured API, or data the user authorized/,
     "truthfulness prompt must forbid guessing dynamic facts and URLs");
   assert.match(SRC, /猜出来的链接\/字段只能标成假设，不能写进结果或代码当事实/,
     "agent discipline must prevent guessed links or fields from becoming code/results");
@@ -13490,8 +13490,8 @@ test("worker with no scope recovers to a serialized whole-workspace run, not a h
 });
 
 test("delivery standard forbids self-downgrading a real deliverable to an MVP (beginner ≠ smaller build)", () => {
-  assert.match(SRC, /用户是新手还是老手都不改变交付标准/, "user skill level must not change the delivery bar");
-  assert.match(SRC, /擅自砍成最小可用原型\(MVP\)/, "must explicitly forbid auto-downgrading a real build to an MVP");
+  assert.match(SRC, /Whether the user is a beginner or an expert does not change the delivery standard/, "user skill level must not change the delivery bar");
+  assert.match(SRC, /quietly cut it down to a minimum viable prototype/, "must explicitly forbid auto-downgrading a real build to an MVP");
 });
 
 test("same-batch duplicate stubs keep zero-index merge semantics without editing auto-merge", () => {
@@ -14089,8 +14089,8 @@ test("substantial worker tasks process parent plans first and count only real wr
     "child exceptions and interruptions must settle their spinner immediately");
   assert.match(subagentSrc, /_sessionFileEvidenceBlock\(_sess, root, 12\)/,
     "child agents must receive the session evidence ledger instead of re-searching from scratch");
-  assert.match(SRC, /输出必须像老手简报/);
-  assert.match(SRC, /可以运行会结束的短验证命令/);
+  assert.match(SRC, /Your output must read like an experienced engineer's brief/);
+  assert.match(SRC, /You may run short verification commands that terminate/);
   assert.doesNotMatch(extractFn("_executeToolStepInner"), /worker 的 run_cmd 只允许测试\/构建\/只读诊断/);
   assert.doesNotMatch(extractFn("_executeToolStepInner"), /worker 子智能体不能运行命令/);
   assert.match(extractFn("_executeToolStepInner"), /Only mode boundaries and file-integrity checks above can stop execution/);
@@ -14311,7 +14311,7 @@ test("UI and read-before-edit gates are structurally wired for every agent model
   assert.match(SRC, /_uiVisualEvidenceHint/);
   assert.match(SRC, /用户附图\/真实图片素材使用计划/);
   assert.match(SRC, /assets\/public\/screenshots/);
-  assert.match(SRC, /回答结构由用户问题、证据类型和风险决定/);
+  assert.match(SRC, /Let the shape of the answer follow the user's question, the kind of evidence and the risk/);
   assert.match(SRC, /writeTextFileIfUnchanged\(fp, existed \? old : null, newContent\)/);
   assert.match(SRC, /ideMode: run\.mode/);
   // UI/readiness guidance and read coverage must not become an executor veto.
@@ -21683,8 +21683,8 @@ test("a real TTY error routes to the interactive terminal, not a hand-off to the
     const h = hint(out, 1);
     assert.ok(h, `must fire on: ${out}`);
     assert.match(h, /run_in_terminal/, "…and must name the real-terminal tool");
-    assert.match(h, /真实终端|真 PTY/, "…and explain it is a real terminal");
-    assert.match(h, /别.{0,8}甩给用户|不是.{0,6}非交互环境/,
+    assert.match(h, /real terminal \(TTY\)|true PTY/, "…and explain it is a real terminal");
+    assert.match(h, /must not be handed off to the user's own terminal|not \*\*"it cannot run in a non-interactive environment"/,
       "…and must explicitly tell the model NOT to hand off to the user's own terminal");
   }
 
