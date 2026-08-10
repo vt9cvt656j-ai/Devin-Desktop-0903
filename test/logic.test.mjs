@@ -21789,3 +21789,37 @@ test("the always-injected prompt demands real, working delivery — no mocks or 
   assert.ok(graph.agent.base.includes("answer_quality"),
     "answer_quality must be in agent.base so the real-delivery directive is always injected");
 });
+
+test("a model-run verifier that exits 0 earns verification credit", () => {
+  // Reported: the outcome card said "Build passed, tests passed" AND "no valid verification
+  // evidence … please run a build/test" in the same footer. Cause: _evidenceCertifies only
+  // honoured `verification` (the IDE's own auto-verify). A model-run `go build` / `go test ./...`
+  // is stamped `verifierRecognized: true` at settle time — computed on every record and read by
+  // nothing — so a genuinely green check earned no credit and the run was labelled unverified.
+  const certifies = load("_evidenceCertifies");
+  const green = { ok: true, exitCode: 0, implementationVersion: 3, command: "go test ./..." };
+
+  // the model ran a recognised verifier, exit 0, at the current edit count → credited
+  assert.equal(certifies({ ...green, verifierRecognized: true }, 3), true);
+  // the IDE's own auto-verify still credits, unchanged
+  assert.equal(certifies({ ...green, verification: true }, 3), true);
+  // neither flag → not certification (an arbitrary command exiting 0 proves nothing)
+  assert.equal(certifies(green, 3), false);
+
+  // Every existing safety condition still revokes credit, for BOTH sources.
+  for (const src of [{ verifierRecognized: true }, { verification: true }]) {
+    assert.equal(certifies({ ...green, ...src, exitCode: 1, ok: false }, 3), false, "a red check certifies nothing");
+    assert.equal(certifies({ ...green, ...src, ok: false }, 3), false, "a failed tool certifies nothing");
+    assert.equal(certifies({ ...green, ...src, timedOut: true }, 3), false, "a timed-out check certifies nothing");
+    assert.equal(certifies({ ...green, ...src }, 4), false, "stale evidence (code changed since) certifies nothing");
+    assert.equal(certifies({ ...green, ...src, command: "" }, 3), false, "a record with no command certifies nothing");
+  }
+});
+
+test("the unverified label states the fact without telling the user to run the build", () => {
+  // The agent runs verification; it is not homework handed back to the user. The old label ended
+  // with "请先跑一次构建/测试再当作可用".
+  const label = load("_agentIncompleteLabel")("code_delivered_unverified", false);
+  assert.match(label, /没有拿到通过的编译\/测试证据/, "states the fact");
+  assert.doesNotMatch(label, /请先跑|请自行|你先跑|自己跑/, "must not delegate the build back to the user");
+});

@@ -29972,7 +29972,9 @@ function _agentIncompleteLabel(reason, hitCap = false) {
   const labels = {
     // Without this entry a run that wrote code and never compiled it rendered an outcome card
     // listing the files with no warning at all — the user had no way to know it was unchecked.
-    code_delivered_unverified: "代码已写入但**没有通过编译/测试验证**（本项目没探测到可用的检查命令，或检查没跑成功）——请先跑一次构建/测试再当作可用",
+    // 只陈述事实，不把活儿甩回给用户（"请先跑一次构建/测试再当作可用"已删除：跑验证是
+    // 智能体自己的事，不是让用户去补的作业）。
+    code_delivered_unverified: "代码已写入，但本轮没有拿到通过的编译/测试证据（没探测到可用的检查命令，或检查没通过）",
     ui_verification_missing: "界面改动尚未完成当前版本的浏览器检查，不能确认页面实际效果",
     // 步数延展/硬顶已拆除：flailing/stalled/extension_limit/ceiling 标签随之删除，
     // 仅剩 token 预算钳位一种 cap 来源（用户自设，收尾文案走 fallback）。
@@ -44439,7 +44441,20 @@ function _reindentReplacement(newStr, indent) {
  * restored history must be re-run instead of being treated as a green build.
  */
 function _evidenceCertifies(e, implOps) {
-  if (!e || e.verification !== true || e.ok !== true) return false;
+  if (!e || e.ok !== true) return false;
+  // Two independent sources of certification, both grounded in OBSERVED execution:
+  //   - `verification`: the IDE ran its own auto-verify pipeline.
+  //   - `verifierRecognized`: the MODEL ran a command the IDE recognises as a verifier
+  //     (`go test ./...`, `npm run build`, `cargo check`, …), stamped at settle time.
+  // Only the first was honoured, so a model-run `go build` + `go test ./...` that genuinely
+  // exited 0 earned NO credit: the outcome card said "build passed, tests passed" and
+  // "no valid verification evidence" in the same breath, then told the user to go run a build
+  // themselves. `verifierRecognized` was computed and stamped on every record and read by
+  // nothing — while the code that grants credit already documented crediting exactly this
+  // ("settlement stamped a recognized verifier and its structured evidence proves an explicit
+  // exit 0"). This is that intent, implemented. Both paths still require a real exit 0 at the
+  // current edit count, so a red or stale check certifies nothing.
+  if (e.verification !== true && e.verifierRecognized !== true) return false;
   if (e.exitCode !== 0 || e.timedOut === true) return false;
   if (e.implementationVersion !== implOps) return false;
   return String(e.command || "").trim().length > 0;
