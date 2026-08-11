@@ -21566,7 +21566,7 @@ test("a mid-stream connection drop resumes instead of abandoning the round", () 
   const turn = extractFn("_agentModelTurn");
   assert.doesNotMatch(turn, /if \(byIndex\.size > 0\) return null;/,
     "the blanket 'any tool call → give up' bail must be gone");
-  assert.match(turn, /const eagerExecuted = \[\.\.\.byIndex\.values\(\)\]\.some\(\(e\) => e && e\._eagerNotified\)/,
+  assert.match(turn, /const eagerExecuted = \[\.\.\.byIndex\.values\(\)\]\.some\(\(e\) => e && e\._eagerDone\)/,
     "the stop decision must be gated on an eager write having actually executed");
   assert.match(turn, /_streamResumeMode\(\{ eagerExecuted, hasProse: !!partial \}\)/,
     "the resume builder must route through the pure decision helper");

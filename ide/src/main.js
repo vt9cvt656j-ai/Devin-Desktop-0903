@@ -344,12 +344,34 @@ function _michaelDeviceId() {
 // reports the system webview's User-Agent, which is indistinguishable from Safari, so
 // without the hint every desktop sign-in was filed as a browser. The same bundle also
 // runs in a plain browser during development, and there it is honestly "web".
+/**
+ * 从本地取出待用的邀请码。
+ *
+ * 「点邀请链接 → 下载 App → 在 App 里注册」这条路以前整条丢失推荐关系：注册接口不收邀请码，
+ * App 也从没读过这个键，而事后绑定那条路只存在于网页控制台里。桌面端和 gate 共用同一个域，
+ * 所以 gate 存下的那份在这里读得到。
+ */
+function _michaelPendingRef() {
+  let v = "";
+  try { v = localStorage.getItem("mide_ref") || ""; } catch (_) {}
+  if (!v) {
+    try {
+      const m = document.cookie.match(/(?:^|;\s*)mide_ref=([^;]+)/);
+      v = m ? decodeURIComponent(m[1]) : "";
+    } catch (_) {}
+  }
+  return /^[2-9A-HJ-NP-Z]{6,12}$/.test(v) ? v : "";
+}
+
 async function _michaelAuth(path, body) {
+  // 只在注册时带上：登录不该改变一个已有账号的推荐关系，那正是产品规则要挡的事。
+  const ref = path === "register" ? _michaelPendingRef() : "";
   const r = await fetch(_michaelBase() + "/api/auth/" + path, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
       ...body,
+      ...(ref ? { referral_code: ref } : {}),
       device: inTauri ? "desktop" : "web",
       device_id: _michaelDeviceId(),
     }),
@@ -357,6 +379,11 @@ async function _michaelAuth(path, body) {
   const j = await r.json().catch(() => ({}));
   if (!r.ok) throw new Error(j.error || "操作失败");
   try { if (j.token) localStorage.setItem("michael_token", j.token); } catch (_) {}
+  // 绑上了就把码清掉，别在下一个账号上再用一次。
+  if (j.referred_by) {
+    try { localStorage.removeItem("mide_ref"); } catch (_) {}
+    try { document.cookie = "mide_ref=; Path=/; Max-Age=0; SameSite=Lax; Secure"; } catch (_) {}
+  }
   return { success: true, message: "成功", email: body.email, token: j.token, user: j.user };
 }
 
@@ -21734,7 +21761,7 @@ async function _gatherAgentContext(query, sessionRoot) {
     parts.unshift(_sizeDeltaWarning);
   }
   if (_emptyRootTop) {
-    parts.unshift("🚫 现场已替你实探：当前工作区是**空目录**，没有任何文件。不要发任何 read_file / list_dir / search / find_files（结果必然为空，IDE 会直接拦截）；第一步就按用户需求规划并 write_file/脚手架开建。");
+    parts.unshift("🚫 现场已替你实探：当前工作区是**空目录**，没有任何文件。任何 read_file / list_dir / search / find_files 都只会失败并白白烧掉一轮——没有文件可读，也没有名字可猜；第一步就按用户需求规划并 write_file/脚手架开建。");
   }
   const baseContext = parts.join("\n");
   let rootFp;
@@ -21777,7 +21804,7 @@ async function _agentContextSnapshotForTurn(query, sessionRoot, profile = null, 
     const top = (Array.isArray(freshEntries) ? freshEntries : [])
       .map((e) => (e?.name || "") + (e?.isDirectory || e?.is_dir ? "/" : ""))
       .filter(Boolean).sort().slice(0, 60);
-    return `⚠️ 工作区内容刚发生外部变化（旧快照已作废，正在重建）。当前根目录 ${root} 顶层实况：${top.length ? top.join("、") : "（空目录）"}。\n${top.length ? "以此实况为准——历史对话里的目录结构/文件可能已不存在，需要时先 list_dir 重新确认。" : "🚫 现场已替你实探：这是**空目录**，没有任何文件。不要发任何 read_file / list_dir / search / find_files（结果必然为空，IDE 会直接拦截）；第一步就按用户需求规划并 write_file/脚手架开建。"}`
+    return `⚠️ 工作区内容刚发生外部变化（旧快照已作废，正在重建）。当前根目录 ${root} 顶层实况：${top.length ? top.join("、") : "（空目录）"}。\n${top.length ? "以此实况为准——历史对话里的目录结构/文件可能已不存在，需要时先 list_dir 重新确认。" : "🚫 现场已替你实探：这是**空目录**，没有任何文件。任何 read_file / list_dir / search / find_files 都只会失败并白白烧掉一轮——没有文件可读，也没有名字可猜；第一步就按用户需求规划并 write_file/脚手架开建。"}`
       + _memoryBlocks(root, query || "", { isEmpty: !top.length })
       + _projectJournalBlock(root);
   }
@@ -21802,7 +21829,7 @@ async function _agentContextSnapshotForTurn(query, sessionRoot, profile = null, 
     _topEmpty = _top.length === 0;
     _topLine = _top.length
       ? `\n根目录顶层实况（以此为准）：${_top.join("、")}`
-      : "\n🚫 现场已替你实探：当前工作区是**空目录**，没有任何文件。不要发任何 read_file / list_dir / search / find_files（结果必然为空，IDE 会直接拦截）；第一步就按用户需求规划并 write_file/脚手架开建。";
+      : "\n🚫 现场已替你实探：当前工作区是**空目录**，没有任何文件。任何 read_file / list_dir / search / find_files 都只会失败并白白烧掉一轮——没有文件可读，也没有名字可猜；第一步就按用户需求规划并 write_file/脚手架开建。";
   } catch {}
   // Cold cache used to return ONLY this "warming up" line + the top-level file list — no
   // README, no tree, no source. So the first question after opening a project ("这个项目
@@ -31968,15 +31995,6 @@ function _implementationMutationCandidate(call) {
       || (typeof _commandRiskKind === "function" && _commandRiskKind(call.command) === "workspace-write"));
 }
 
-function _runEagerMutationCount(run) {
-  return Math.max(0, Number(run?._eagerMutationCount) || 0);
-}
-
-function _setRunEagerMutationCount(run, value) {
-  if (run) run._eagerMutationCount = Math.max(0, Number(value) || 0);
-  return _runEagerMutationCount(run);
-}
-
 function _implementationGroundingFilePath(path) {
   const value = String(path || "").replace(/\\/g, "/").toLowerCase();
   const base = value.split("/").pop() || "";
@@ -36369,7 +36387,11 @@ async function _agentModelTurn({ config, messages, toolSchemas, toolRegistry = n
          * 仍然按原样停下，把决定权交回用户。
          */
         buildResumeInvoke: async ({ resume, resumeLimit }) => {
-          const eagerExecuted = [...byIndex.values()].some((e) => e && e._eagerNotified);
+          // _eagerNotified 只代表"钩子被叫过一次"，钩子内部有一串前置条件（意图未落定、
+          // 有排队的用户插话、参数 parse 不过、闸门未放行……）任何一条不满足都会直接 return，
+          // 一个字节都没写。真正代表"已经落盘"的是 _eagerDone。用错这个标记会让一轮明明什么
+          // 都没写的续传被当成"写过了"而拒绝重放——恢复能力白白变窄。
+          const eagerExecuted = [...byIndex.values()].some((e) => e && e._eagerDone);
           // prefill 不允许结尾有空白，否则上游会直接 400。
           const partial = String(acc || "").replace(/\s+$/, "");
           const mode = _streamResumeMode({ eagerExecuted, hasProse: !!partial });
@@ -36500,7 +36522,26 @@ async function _agentModelTurn({ config, messages, toolSchemas, toolRegistry = n
     // 流结束：把最后一个（以及所有参数完整的）工具预览也定格，并同样通知外层。
     // （注：除 onStreamToolReady 接走的“流完即写”外，其余工具仍由外层主循环对
     // turn.toolCalls 统一调度；已即时执行的条目批量阶段只复用结果，绝不二次写盘。）
-    if (!turnErr) { for (const [, e] of byIndex) {
+    let truncatedByLimit = finishReason === "length" && byIndex.size > 0;
+    let truncated = truncatedByLimit;
+    if (!truncated) {
+      for (const [, e] of byIndex) {
+        const a = (e.args || "").trim();
+        if (!a || a === "{}") continue;
+        let okJson = false; try { JSON.parse(a); okJson = true; } catch {}
+        if (!okJson && !a.endsWith("}")) { truncated = true; break; }
+      }
+    }
+
+    // 流末的"流完即写"：只有在这一轮既没报错、也没被判定为截断时才放行。
+    //
+    // 原来这里只挡 turnErr。上游按 max_tokens 砍断的一轮（finish_reason=length）不算错误——
+    // 流"正常"结束了，只是内容没写完——于是最后那个参数被切一半的 write_file 照样走即时写盘，
+    // 而下面几行代码马上就会把同一轮判定为 truncated 并拒绝执行它。判定跑在写盘后面，
+    // 等于先写再问该不该写。形状判据（parse 失败且不以 } 结尾）对这种情况还有个盲区：
+    // 被切断的 JSON 也可能是合法前缀（`{"path":"a.js"}`，content 根本没开始流），
+    // 既 parse 得过又以 } 结尾——finish_reason 是唯一能识破它的证据。
+    if (!turnErr && !truncated) { for (const [, e] of byIndex) {
       _settleWritePreview(e);
       if (onStreamToolReady && e._previewSettled && !e._eagerNotified) { e._eagerNotified = true; try { onStreamToolReady(e); } catch {} }
     } }
@@ -36522,16 +36563,8 @@ async function _agentModelTurn({ config, messages, toolSchemas, toolRegistry = n
     // content 还没开始流就被切了），既 parse 得过又以 "}" 结尾，两个条件全部失效。
     // 一个 content 被 max_tokens 砍掉的 write_file 正是绝不能落盘的那种。以前这个
     // 信号在 Rust 侧根本没解析，白白丢掉了唯一权威的截断证据。
-    let truncatedByLimit = finishReason === "length" && byIndex.size > 0;
-    let truncated = truncatedByLimit;
-    if (!truncated) {
-      for (const [, e] of byIndex) {
-        const a = (e.args || "").trim();
-        if (!a || a === "{}") continue;
-        let okJson = false; try { JSON.parse(a); okJson = true; } catch {}
-        if (!okJson && !a.endsWith("}")) { truncated = true; break; }
-      }
-    }
+    // （截断判定已上移到"流完即写"通知循环之前——它是那个循环的前置条件，
+    //   放在后面等于先写盘再判断该不该写。）
     let argIssue = "";
     let rejectedToolAttempts = [];
     const argDefaultContext = [
@@ -40836,10 +40869,8 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
   try {
     for (let iter = 0; iter < budget; iter++) {
       _pad._iter = iter;
-      // Eager writes are scoped to one model response. The settled batch gate
-      // sees the same count through its item list; reset it at the turn boundary
-      // so a successful write never throttles the next response.
-      _setRunEagerMutationCount(run, 0);
+      // （这里原来每轮把 _eagerMutationCount 清零，注释说"批处理闸门通过它的 item list
+      //   看到同一个计数"。没有那个闸门，计数器也没有别的读者，随钩子里的上限一起删了。）
       if (!_live()) break;
       // No polling and no sleep: inspect the exact run-owned result once per boundary.
       // If it landed, semantic headers/effect obligations update immediately and the real
@@ -41075,17 +41106,22 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
         call._runRoot = root;
         call._toolName = "write_file";
         call._liveWritePreview = entry._editorPreview || null;
-        // Keep the streamed fast path subject to the same one-write-per-model
-        // turn rule as the settled batch path. Once one write is queued, leave
-        // later write_file calls for the normal structured block result instead
-        // of allowing eager execution to bypass the cadence gate.
-        if ((_runEagerMutationCount(run) || 0) > 0) return;
+        // 这里原来有一道"一轮只即时写一个文件"的闸门，理由写着"和批处理那条路的
+        // one-write-per-model-turn 规则保持一致"。那条规则不存在：_runEagerMutationCount
+        // 全文件只有两个读点，都在这个钩子自己内部；批处理路径从来没查过它。批处理唯一会
+        // 停下来的条件是"前面已经有 mutation 失败了"，其余 write 一个不落全都执行。
+        //
+        // 所以这道闸门挡的不是节奏，是它自己：一轮里第一个文件流完即写，第二、第三个只能
+        // 挂着「等待执行」到整段流结束——用户看到 207 行的 main.py 内容俱全，磁盘上什么都
+        // 没有。成功轮里它们几百毫秒后会补上，出错轮里就一起没了。
+        //
+        // 拆掉之前先修好了两件事，顺序不能反：截断判定移到了流末通知之前（否则被 max_tokens
+        // 砍断的参数会先落盘再被判定拒绝），以及 eagerExecuted 改读真正的执行标记。
         // Evidence quality is advisory, not an execution permission. Streaming writes
         // still land immediately; any missing grounding is attached to the real result.
         run._eagerTurnBias = 1;
         entry._mutationAdvice = _debugMutationBlockResult(run, call, root);
         entry._eagerDone = true;
-        _setRunEagerMutationCount(run, (_runEagerMutationCount(run) || 0) + 1);
         // An eager write belongs to the IN-FLIGHT model turn, but run._toolBatch is not
         // incremented until the turn returns — so the read-gate's "read must be from a
         // prior turn" comparison saw completedBatch N < N and spuriously blocked
@@ -45434,9 +45470,17 @@ async function _executeToolStepInner(step, call, root, run) {
                     const names = siblings.slice(0, 20).map(e => (e.is_dir ? e.name + "/" : e.name)).join(", ");
                     helpHint = `\n你给的路径里的父目录 ${parentDir.replace(root, ".")} 根本不存在！项目根目录 ${root} 里实际有: ${names}\n——这个项目的目录结构和你想象的不一样。先 list_dir 看实际结构，再决定要创建什么目录/文件。`;
                   }
-                } else if (siblings) {
+                } else if (Array.isArray(siblings)) {
                   const names = siblings.slice(0, 12).map(e => (e.is_dir ? e.name + "/" : e.name)).join(", ");
-                  if (names) helpHint = `\n${parentDir} 里实际有: ${names}\n（别再猜路径——用 find_files 按名字搜，或 list_dir 看目录，确认真实路径再读）`;
+                  helpHint = names
+                    ? `\n${parentDir} 里实际有: ${names}\n（别再猜路径——用 find_files 按名字搜，或 list_dir 看目录，确认真实路径再读）`
+                    // 空目录以前落在这里什么都不说：[] 是真值，进得来这个分支，但 names 是空串，
+                    // 于是 if (names) 把它跳过了 —— 唯一重要的那个事实，恰好在它就是全部答案的
+                    // 时候被漏掉。模型看到的只有一句"文件不存在"，于是接着猜下一个名字。
+                    // 用户实测：空文件夹里 list_dir 拿到 0 项，下一步就去读一个自己编的
+                    // demo_crawler。这句话就是拦住第二次、第三次编造的那句话。
+                    : `\n${parentDir} 是空目录（0 个文件夹 · 0 个文件）。这个文件从来没存在过，`
+                      + `继续 read/search/find 都会失败——直接 write_file 创建你需要的文件。`;
                 }
               } catch {}
             }
@@ -45761,7 +45805,20 @@ async function _executeToolStepInner(step, call, root, run) {
       res.innerHTML = `<span class="atc-result__t">${_dirsE.length} 个文件夹 · ${_filesE.length} 个文件${_depth !== 1 ? ` · depth=${_depth || "∞"}` : ""}</span>`;
       vp.innerHTML = _lsRowsHtml(_dirsE.map((e) => _annot(_entryRel(e), true)), _filesE.map((e) => _annot(_entryRel(e), false)));
       const _listPath = fp !== call.path ? `${call.path} (${fp})` : call.path;
-      return { type: "list", path: _listPath, content: listing || "(空目录——没有任何文件或子文件夹。这是新/空项目，直接基于用户描述开始工作，不要猜测文件名去 read_file。)" };
+      // 空目录哨兵必须以"顶层真的读到 0 项"为准，不能以 listing 是不是空串为准。
+      // 递归模式下 _listWalk 中途 readDir 抛错就直接 return，listLines 一条都没有，listing
+      // 于是是空串——一个**有内容**的工作区会被宣布成"新/空项目，直接开建"，而"开建"就是
+      // 往里写文件。entries 是顶层 readDir 的结果，此刻就在手上，它才是权威。
+      const _reallyEmpty = Array.isArray(entries) && entries.length === 0;
+      const _hitCap = _depth !== 1 && listing && listing.split("\n").length >= 500;
+      const _content = _reallyEmpty
+        ? "(空目录——没有任何文件或子文件夹。这是新/空项目，直接基于用户描述开始工作，不要猜测文件名去 read_file。)"
+        : (listing
+            ? listing + (_hitCap ? "\n…（已达 500 行上限，列表被截断——下面还有内容没列出来，需要完整结构就对具体子目录再 list_dir）" : "")
+            // 顶层有东西、递归却什么都没走出来 = 走查失败，不是空目录。说清楚是失败，
+            // 让模型退回逐层 list_dir，而不是以为这里没东西。
+            : `[ERROR] 递归列目录失败：顶层有 ${entries.length} 项，但递归走查没有返回任何内容（子目录读取出错或权限不足）。改用 depth=1 逐层查看。`);
+      return { type: "list", path: _listPath, content: _content };
 
     } else if (call.type === "write" || call.type === "edit") {
       // Multi-root: `edit` requires an existing file, so find it in whichever open

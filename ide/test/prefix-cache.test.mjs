@@ -1030,3 +1030,52 @@ test("表格文件有自己的图标，而不是通用文档图", () => {
     assert.match(SRC, new RegExp(`\\b${ext}: "csv"`), `${ext} 会打开成表格，图标要跟上`);
   }
 });
+
+test("一轮里每个写完的文件都立刻落盘，而不是只放行第一个", () => {
+  // 用户看到的：一轮发了三个 write_file，requirements.txt 写进去了，main.py（207 行内容俱全）
+  // 和 crawler.py 挂着「等待执行」，磁盘上什么都没有。原因是即时写盘路径给自己设了
+  // 「一轮只写一个」的上限，理由写着"和批处理那条路的同款规则保持一致"——而那条规则不存在：
+  // 计数器全文件只有它自己两个读点，批处理从来没查过。
+  // 只查代码，不查注释：记录这次删除的那句注释本身就写着这个名字，按裸出现次数断言会被
+  // 自己的说明文字判死 —— 今天已经在另外两处踩过同一个坑。
+  assert.doesNotMatch(SRC, /(?:function|let|const|var)[^\n;]*_(?:run|set)?EagerMutationCount/,
+    "闸门的计数器不能还有定义");
+  assert.doesNotMatch(SRC, /_runEagerMutationCount\s*\(|_setRunEagerMutationCount\s*\(/,
+    "也不能还有调用点，否则下一个人照着注释又把上限加回来");
+  assert.match(SRC, /entry\._eagerDone = true;/, "真正的执行标记留着");
+
+  // 拆闸门有前置条件，顺序不能反 —— 否则把一个文件的风险放大成一整轮的。
+  const turn = grab("_agentModelTurn");
+  // ① 截断判定必须跑在流末即时写盘之前。上游按 max_tokens 砍断的一轮不算 error，
+  //    流"正常"结束，于是半截参数会先落盘、几行之后才被判定为 truncated 并拒绝执行。
+  // 断言的是顺序本身，不是两段之间隔了多少字符 —— 固定字宽的窗口会被后来人改一句注释就
+  // 判死，而要守的从来是"先判断，再写盘"。
+  const _truncAt = turn.indexOf('let truncatedByLimit = finishReason === "length"');
+  const _notifyAt = turn.indexOf("if (!turnErr && !truncated) { for (const [, e] of byIndex)");
+  assert.ok(_truncAt >= 0 && _notifyAt >= 0, "两段都要还在");
+  assert.ok(_truncAt < _notifyAt,
+    "截断判定必须跑在流末即时写盘之前，否则是先写盘再判断该不该写");
+  // ② 判断"这一轮是不是真写过盘"要看真的执行标记。_eagerNotified 只表示钩子被叫过。
+  assert.match(turn, /const eagerExecuted = \[\.\.\.byIndex\.values\(\)\]\.some\(\(e\) => e && e\._eagerDone\)/);
+});
+
+test("读取失败时说得出「这个目录是空的」", () => {
+  // 空文件夹里，模型 list_dir 拿到 0 项，下一步就去读一个自己编的 demo_crawler。
+  // 提示本来该在这时候说话，却因为 [] 是真值、names 是空串，被 if (names) 静静跳过了 ——
+  // 唯一重要的那个事实，恰好在它就是全部答案的时候缺席。
+  assert.match(SRC, /\} else if \(Array\.isArray\(siblings\)\) \{/,
+    "空数组要走进来，不能靠真值判断");
+  assert.match(SRC, /是空目录（0 个文件夹 · 0 个文件）。这个文件从来没存在过/);
+  assert.doesNotMatch(SRC, /if \(names\) helpHint = `\\n\$\{parentDir\} 里实际有/,
+    "旧的真值守卫会把空目录这一支吃掉");
+
+  // 递归列目录走查失败时，绝不能宣布成空目录 —— 那句话会让模型在一个有内容的工作区里
+  // 从零开建，而"开建"就是写文件。
+  assert.match(SRC, /const _reallyEmpty = Array\.isArray\(entries\) && entries\.length === 0;/);
+  assert.match(SRC, /\[ERROR\] 递归列目录失败：顶层有 \$\{entries\.length\} 项/);
+  assert.match(SRC, /已达 500 行上限，列表被截断/, "截断要说出来，不能默默停");
+
+  // 三处提示曾经承诺"IDE 会直接拦截"，而那个拦截早被删了 —— 模型一试就知道这句话是假的。
+  assert.doesNotMatch(SRC, /IDE 会直接拦截/);
+  assert.equal((SRC.match(/都只会失败并白白烧掉一轮/g) || []).length, 3);
+});
