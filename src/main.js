@@ -13533,6 +13533,25 @@ function _saveThinkingPrefs(map) {
   try { localStorage.setItem(_THINK_KEY, JSON.stringify(map || {})); } catch {}
 }
 
+/**
+ * The Claude generation in a model id, as a number: `claude-opus-4-8` → 4.8, `claude-sonnet-5` → 5.
+ *
+ * The thinking switch changed shape at 4.7 — everything from there on rejects `budget_tokens` and
+ * everything before it requires one — so the split has to be a comparison, not a list of version
+ * strings. Matching versions one at a time is what left Sonnet 4.5, Opus 4.5 and Opus 4.1 being
+ * sent a wire shape none of them accept: only 4.6 was named, and the rest fell through to the
+ * modern branch. An unrecognised id returns 0, which reads as "newer than the table" and lands on
+ * the adaptive shape — the direction the API has been moving, and the safer guess for a model
+ * released after this line was written.
+ */
+function _claudeGeneration(id = "") {
+  const m = String(id).toLowerCase()
+    .match(/(?:opus|sonnet|haiku|fable|mythos|claude)[-_.]?(\d{1,2})(?:[-_.](\d{1,2}))?(?![\d.])/);
+  if (!m) return 0;
+  const minor = m[2] == null ? 0 : Number(m[2]) || 0;
+  return (Number(m[1]) || 0) + minor / 10;
+}
+
 function _thinkingProfileFor(id) {
   // Custom entries use an internal selector id, but thinking capability belongs
   // to the real upstream model name. Preferences remain keyed by the selector id.
@@ -13661,7 +13680,12 @@ function _thinkingProfileFor(id) {
         hint: "Claude 3.7 使用显式 thinking budget_tokens：低/中/高分别发送 4000/8000/12000。",
       };
     }
-    if (/4[-_.]?6(?!\d)/.test(s)) {
+    // 4.6 及更早（4.0–4.6）：仍然接受、并且**需要**显式 budget_tokens。以前这里只认 4.6，
+    // 于是 Sonnet 4.5 / Opus 4.5 / 4.1 / 4.0 全都掉进了下面的 adaptive 分支——给一族根本
+    // 不支持 adaptive 的模型发 {"type":"adaptive"}，而它们真正的开关是 budget_tokens；
+    // Sonnet 4.5 连 effort 都直接报错。按代次分流而不是按单个版本号匹配。
+    const _gen = _claudeGeneration(s);
+    if (_gen > 0 && _gen <= 4.6) {
       return {
         kind: "thinking_budget",
         configurable: true,
@@ -13669,28 +13693,36 @@ function _thinkingProfileFor(id) {
         // 默认 high：用户没选过档位时不拿 medium 偷深度；显式选择永远优先。
         defaultLevel: "high",
         budgets: { low: 4096, medium: 12000, high: 24000, max: 32000 },
-        hint: "Claude 4.6 使用显式 thinking budget_tokens：低/中/高/极限分别发送 4096/12000/24000/32000。",
+        hint: "Claude 4.6 及更早使用显式 thinking budget_tokens：低/中/高/极限分别发送 4096/12000/24000/32000。",
       };
     }
     // 4.7 / 4.8 / Opus 5 / Sonnet 5 / Fable / Mythos: adaptive thinking. These models REFUSE
     // budget_tokens outright, so send the native adaptive switch plus reasoning_effort. The
     // explicit switch keeps thinking enabled on both native and OpenAI-compatible routes.
-    // `low` is omitted deliberately: on the
-    // wire low and medium are identical for this family (both → adaptive + 32k headroom), and
-    // rendering two buttons that do the same thing is the fake-tier dishonesty this table
-    // exists to prevent.
+    //
+    // Fable/Mythos have no off switch at all — thinking is always on there, and an explicit
+    // {"type":"disabled"} is a 400. Offering the button would be a tier that cannot exist.
+    const _alwaysThinks = /fable|mythos/.test(s);
     return {
       kind: "adaptive_thinking",
       configurable: true,
-      levels: ["off", "medium", "high", "max"],
+      // `low` is a real tier and reaches the model as effort=low — it was dropped back when the
+      // client sent no effort at all and every level below `high` collapsed to the same request.
+      // Anthropic's ladder also has `xhigh` between high and max, and it is deliberately absent:
+      // this route is a reseller, and an effort word it does not accept returns an EMPTY
+      // completion rather than a clean error. Adding the button means first probing the live
+      // route with effort=xhigh and confirming real content comes back.
+      levels: _alwaysThinks ? ["low", "medium", "high", "max"] : ["off", "low", "medium", "high", "max"],
       defaultLevel: "high",
-      labels: { medium: "自适应" },
       levelTips: {
-        medium: "Adaptive thinking：思考深度由模型按需决定；该系列不接受 budget_tokens。",
-        high: "自适应思考 + 更大输出余量（max_tokens ≥ 40k）与更宽的流式超时。",
+        low: "自适应思考 · effort=low：短任务与低延迟场景，深度仍由模型按需决定。",
+        medium: "自适应思考 · effort=medium：日常任务的性价比档。",
+        high: "自适应思考 · effort=high + 更大输出余量（max_tokens ≥ 40k）与更宽的流式超时。",
         max: "自适应思考 + 最大输出余量（64k）+ 深思考超时档。慢且贵。",
       },
-      hint: "Claude 4.7+/5/Fable 为 adaptive thinking：不发送 budget_tokens（该系列会直接拒绝），思考深度由模型自行决定；档位只影响输出余量与超时分级。",
+      hint: _alwaysThinks
+        ? "Fable/Mythos 5 的思考常开且无法关闭；档位通过 output_config.effort 控制深度，不发送 budget_tokens（该系列会直接拒绝）。"
+        : "Claude 4.7+/5 为 adaptive thinking：不发送 budget_tokens（该系列会直接拒绝），档位通过 output_config.effort 送到模型，同时决定输出余量与超时分级。",
     };
   }
 
