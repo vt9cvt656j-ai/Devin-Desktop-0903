@@ -19,7 +19,7 @@
 
 use serde::Serialize;
 use std::fs::File;
-use std::io::{BufReader, Read, Seek, SeekFrom};
+use std::io::{BufReader, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 use std::time::{Duration, Instant};
 
@@ -519,6 +519,389 @@ fn budget_note() -> String {
     )
 }
 
+// ---------------------------------------------------------------------------
+// Unpacking. Listing an archive tells you what is inside; this gets it out.
+//
+// Two attacks decide the shape of this code, and both are ordinary in archives found in the wild:
+//
+//   * path traversal ("zip-slip") — an entry named ../../.ssh/authorized_keys writes outside the
+//     directory the user chose. Every path is resolved against the destination and anything that
+//     escapes aborts the whole operation.
+//   * decompression bombs — a few hundred KB that expand to terabytes. Extraction runs against a
+//     byte budget and stops rather than filling the disk.
+//
+// Where the format lets us see the whole index first (zip, 7z), every entry is checked BEFORE a
+// single byte is written, so a malicious archive cannot get halfway through. Streaming formats
+// cannot offer that, so they are checked per entry as they arrive.
+// ---------------------------------------------------------------------------
+
+/// Refuse to write more than this in one extraction unless the caller raises it. A bomb is
+/// usually orders of magnitude past any real archive, so a generous ceiling still catches them.
+const EXTRACT_BYTE_BUDGET: u64 = 32 * 1024 * 1024 * 1024;
+
+#[derive(Serialize, Debug)]
+pub struct ExtractOutcome {
+    pub format: String,
+    pub files: u64,
+    pub directories: u64,
+    pub bytes: u64,
+    pub destination: String,
+    /// Entries deliberately not written — macOS sidecars, and anything the format calls a symlink
+    /// or device node. Reported so the count reconciles with the listing.
+    pub skipped: u64,
+}
+
+/// Resolve `name` inside `dest`, or return None when it escapes. Rejects absolute paths, drive
+/// letters, `..` at any depth, and anything that resolves outside the destination.
+fn safe_join(dest: &Path, name: &str) -> Option<std::path::PathBuf> {
+    let name = name.replace('\\', "/");
+    if name.is_empty() || name.starts_with('/') || name.contains(":\\") || name.contains("://") {
+        return None;
+    }
+    let mut out = dest.to_path_buf();
+    for part in name.split('/') {
+        match part {
+            "" | "." => continue,
+            ".." => return None, // never resolve upwards, even if it would stay inside
+            _ => {
+                if part.contains('\0') {
+                    return None;
+                }
+                out.push(part);
+            }
+        }
+    }
+    // Belt and braces: the assembled path must still be under dest.
+    out.starts_with(dest).then_some(out)
+}
+
+fn ensure_parent(path: &Path) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    Ok(())
+}
+
+/// Unpack `path` into `dest`. Creates `dest` if absent.
+pub fn extract(path: &Path, dest: &Path, budget: Option<u64>) -> Result<ExtractOutcome, String> {
+    let budget = budget.unwrap_or(EXTRACT_BYTE_BUDGET);
+    std::fs::create_dir_all(dest).map_err(|e| format!("无法创建目标目录：{e}"))?;
+    let dest = dest
+        .canonicalize()
+        .map_err(|e| format!("无法解析目标目录：{e}"))?;
+
+    match sniff(path) {
+        Format::Zip => extract_zip(path, &dest, budget),
+        Format::SevenZ => extract_7z(path, &dest, budget),
+        Format::Tar => extract_tar_reader(
+            BufReader::new(File::open(path).map_err(|e| e.to_string())?),
+            &dest,
+            budget,
+            "tar",
+        ),
+        Format::Gzip | Format::Bzip2 | Format::Xz | Format::Zstd => {
+            extract_compressed(path, &dest, budget)
+        }
+        Format::Rar => Err("RAR 解码器是闭源的，本机没有可用实现，无法解压。".into()),
+        Format::Unknown => Err("这不是可识别的压缩包格式。".into()),
+    }
+}
+
+fn extract_zip(path: &Path, dest: &Path, budget: u64) -> Result<ExtractOutcome, String> {
+    let file = File::open(path).map_err(|e| e.to_string())?;
+    let mut zip = zip::ZipArchive::new(BufReader::new(file)).map_err(|e| e.to_string())?;
+
+    // Pass one: validate everything. A zip carries its whole index in the footer, so there is no
+    // excuse for discovering a hostile path halfway through writing.
+    let mut declared: u64 = 0;
+    for i in 0..zip.len() {
+        let entry = zip.by_index_raw(i).map_err(|e| e.to_string())?;
+        let name = entry.name().to_string();
+        if is_platform_metadata(&name) {
+            continue;
+        }
+        if safe_join(dest, name.trim_end_matches('/')).is_none() {
+            return Err(format!("压缩包里有越界路径，已中止：{name}"));
+        }
+        declared = declared.saturating_add(entry.size());
+        if declared > budget {
+            return Err(format!(
+                "解压后体积超过上限（声明 {declared} bytes，上限 {budget}）。可能是压缩炸弹，已中止。"
+            ));
+        }
+    }
+
+    // Pass two: write.
+    let (mut files, mut dirs, mut bytes, mut skipped) = (0u64, 0u64, 0u64, 0u64);
+    for i in 0..zip.len() {
+        let mut entry = zip.by_index(i).map_err(|e| e.to_string())?;
+        let name = entry.name().to_string();
+        if is_platform_metadata(&name) {
+            skipped += 1;
+            continue;
+        }
+        let Some(target) = safe_join(dest, name.trim_end_matches('/')) else {
+            return Err(format!("压缩包里有越界路径，已中止：{name}"));
+        };
+        if entry.is_dir() {
+            std::fs::create_dir_all(&target).map_err(|e| e.to_string())?;
+            dirs += 1;
+            continue;
+        }
+        ensure_parent(&target).map_err(|e| e.to_string())?;
+        let mut out = File::create(&target).map_err(|e| format!("{}: {e}", target.display()))?;
+        let written = std::io::copy(&mut entry, &mut out).map_err(|e| e.to_string())?;
+        bytes = bytes.saturating_add(written);
+        if bytes > budget {
+            return Err("解压超过体积上限，已中止。".into());
+        }
+        files += 1;
+    }
+    Ok(ExtractOutcome {
+        format: "zip".into(),
+        files,
+        directories: dirs,
+        bytes,
+        destination: dest.to_string_lossy().into_owned(),
+        skipped,
+    })
+}
+
+fn extract_7z(path: &Path, dest: &Path, budget: u64) -> Result<ExtractOutcome, String> {
+    let reader = sevenz_rust2::ArchiveReader::open(path, sevenz_rust2::Password::empty())
+        .map_err(|e| format!("7z 无法打开（头部可能加密）：{e}"))?;
+    let mut declared: u64 = 0;
+    for entry in &reader.archive().files {
+        if is_platform_metadata(&entry.name) {
+            continue;
+        }
+        if safe_join(dest, &entry.name).is_none() {
+            return Err(format!("压缩包里有越界路径，已中止：{}", entry.name));
+        }
+        declared = declared.saturating_add(entry.size);
+        if declared > budget {
+            return Err("解压后体积超过上限，可能是压缩炸弹，已中止。".into());
+        }
+    }
+    let files = reader.archive().files.len() as u64;
+    sevenz_rust2::decompress_file(path, dest).map_err(|e| format!("7z 解压失败：{e}"))?;
+    Ok(ExtractOutcome {
+        format: "7z".into(),
+        files,
+        directories: 0,
+        bytes: declared,
+        destination: dest.to_string_lossy().into_owned(),
+        skipped: 0,
+    })
+}
+
+fn extract_tar_reader<R: Read>(
+    reader: R,
+    dest: &Path,
+    budget: u64,
+    label: &str,
+) -> Result<ExtractOutcome, String> {
+    let mut archive = tar::Archive::new(reader);
+    // A tar is a stream: there is no index to validate first, so each entry is checked as it
+    // arrives and the first bad one aborts.
+    archive.set_overwrite(true);
+    let (mut files, mut dirs, mut bytes, mut skipped) = (0u64, 0u64, 0u64, 0u64);
+    for item in archive.entries().map_err(|e| e.to_string())? {
+        let mut entry = item.map_err(|e| e.to_string())?;
+        let name = entry
+            .path()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        if name.is_empty() || is_platform_metadata(&name) {
+            skipped += 1;
+            continue;
+        }
+        // Links and devices are not unpacked: a symlink is the other half of a traversal attack,
+        // and a device node has no business coming out of a downloaded archive.
+        let kind = entry.header().entry_type();
+        if !(kind.is_file() || kind.is_dir()) {
+            skipped += 1;
+            continue;
+        }
+        let Some(target) = safe_join(dest, name.trim_end_matches('/')) else {
+            return Err(format!("压缩包里有越界路径，已中止：{name}"));
+        };
+        if kind.is_dir() {
+            std::fs::create_dir_all(&target).map_err(|e| e.to_string())?;
+            dirs += 1;
+            continue;
+        }
+        bytes = bytes.saturating_add(entry.header().size().unwrap_or(0));
+        if bytes > budget {
+            return Err("解压超过体积上限，已中止。".into());
+        }
+        ensure_parent(&target).map_err(|e| e.to_string())?;
+        let mut out = File::create(&target).map_err(|e| format!("{}: {e}", target.display()))?;
+        std::io::copy(&mut entry, &mut out).map_err(|e| e.to_string())?;
+        files += 1;
+    }
+    Ok(ExtractOutcome {
+        format: label.into(),
+        files,
+        directories: dirs,
+        bytes,
+        destination: dest.to_string_lossy().into_owned(),
+        skipped,
+    })
+}
+
+fn extract_compressed(path: &Path, dest: &Path, budget: u64) -> Result<ExtractOutcome, String> {
+    let format = sniff(path);
+    let label = match format {
+        Format::Gzip => "gzip",
+        Format::Bzip2 => "bzip2",
+        Format::Xz => "xz",
+        Format::Zstd => "zstd",
+        _ => "unknown",
+    };
+    let open = || File::open(path).map(BufReader::new).map_err(|e| e.to_string());
+
+    if wraps_a_tar(path) {
+        let tar_label = format!("tar.{label}");
+        return match format {
+            Format::Gzip => extract_tar_reader(
+                flate2::read::MultiGzDecoder::new(open()?),
+                dest,
+                budget,
+                &tar_label,
+            ),
+            Format::Bzip2 => extract_tar_reader(
+                bzip2::read::MultiBzDecoder::new(open()?),
+                dest,
+                budget,
+                &tar_label,
+            ),
+            Format::Zstd => {
+                let dec = ruzstd::decoding::StreamingDecoder::new(open()?)
+                    .map_err(|e| format!("zstd 解码失败：{e}"))?;
+                extract_tar_reader(dec, dest, budget, &tar_label)
+            }
+            Format::Xz => {
+                let (buf, _) = decode_xz_bounded(path).map_err(|e| format!("xz 解码失败：{e}"))?;
+                extract_tar_reader(std::io::Cursor::new(buf), dest, budget, &tar_label)
+            }
+            _ => Err("不支持的压缩格式".into()),
+        };
+    }
+
+    // A single compressed member: write it out under its recorded or derived name.
+    let name = if format == Format::Gzip {
+        gzip_member_info(path).0
+    } else {
+        None
+    }
+    .unwrap_or_else(|| {
+        path.file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("payload")
+            .to_string()
+    });
+    let Some(target) = safe_join(dest, &name) else {
+        return Err(format!("压缩包内的文件名越界，已中止：{name}"));
+    };
+    ensure_parent(&target).map_err(|e| e.to_string())?;
+    let mut out = File::create(&target).map_err(|e| e.to_string())?;
+    let written = match format {
+        Format::Gzip => std::io::copy(&mut flate2::read::MultiGzDecoder::new(open()?), &mut out),
+        Format::Bzip2 => std::io::copy(&mut bzip2::read::MultiBzDecoder::new(open()?), &mut out),
+        Format::Zstd => {
+            let mut dec = ruzstd::decoding::StreamingDecoder::new(open()?)
+                .map_err(|e| std::io::Error::other(e.to_string()))
+                .map_err(|e| e.to_string())?;
+            std::io::copy(&mut dec, &mut out)
+        }
+        Format::Xz => {
+            let (buf, _) = decode_xz_bounded(path).map_err(|e| e.to_string())?;
+            out.write_all(&buf).map(|_| buf.len() as u64)
+        }
+        _ => return Err("不支持的压缩格式".into()),
+    }
+    .map_err(|e| e.to_string())?;
+    if written > budget {
+        return Err("解压超过体积上限，已中止。".into());
+    }
+    Ok(ExtractOutcome {
+        format: label.into(),
+        files: 1,
+        directories: 0,
+        bytes: written,
+        destination: dest.to_string_lossy().into_owned(),
+        skipped: 0,
+    })
+}
+
+/// Read one entry's bytes without unpacking the rest — what "open the file inside the archive"
+/// needs. Bounded, because an entry can be arbitrarily large.
+pub fn read_entry(path: &Path, entry: &str, max_bytes: u64) -> Result<Vec<u8>, String> {
+    let mut out = Vec::new();
+    match sniff(path) {
+        Format::Zip => {
+            let file = File::open(path).map_err(|e| e.to_string())?;
+            let mut zip = zip::ZipArchive::new(BufReader::new(file)).map_err(|e| e.to_string())?;
+            let mut found = zip
+                .by_name(entry)
+                .map_err(|_| format!("压缩包里没有这个条目：{entry}"))?;
+            std::io::copy(&mut found.by_ref().take(max_bytes), &mut out).map_err(|e| e.to_string())?;
+        }
+        Format::SevenZ => {
+            let mut reader = sevenz_rust2::ArchiveReader::open(path, sevenz_rust2::Password::empty())
+                .map_err(|e| e.to_string())?;
+            out = reader
+                .read_file(entry)
+                .map_err(|_| format!("压缩包里没有这个条目：{entry}"))?;
+            out.truncate(max_bytes as usize);
+        }
+        Format::Tar | Format::Gzip | Format::Bzip2 | Format::Xz | Format::Zstd => {
+            let found = walk_for_entry(path, entry, max_bytes)?;
+            out = found;
+        }
+        Format::Rar => return Err("RAR 无法读取。".into()),
+        Format::Unknown => return Err("不是可识别的压缩包。".into()),
+    }
+    Ok(out)
+}
+
+fn walk_for_entry(path: &Path, entry: &str, max_bytes: u64) -> Result<Vec<u8>, String> {
+    fn scan<R: Read>(reader: R, entry: &str, max_bytes: u64) -> Result<Vec<u8>, String> {
+        let mut archive = tar::Archive::new(reader);
+        for item in archive.entries().map_err(|e| e.to_string())? {
+            let mut member = item.map_err(|e| e.to_string())?;
+            let name = member
+                .path()
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            if name == entry {
+                let mut out = Vec::new();
+                std::io::copy(&mut member.by_ref().take(max_bytes), &mut out)
+                    .map_err(|e| e.to_string())?;
+                return Ok(out);
+            }
+        }
+        Err(format!("压缩包里没有这个条目：{entry}"))
+    }
+    let open = || File::open(path).map(BufReader::new).map_err(|e| e.to_string());
+    match sniff(path) {
+        Format::Tar => scan(open()?, entry, max_bytes),
+        Format::Gzip => scan(flate2::read::MultiGzDecoder::new(open()?), entry, max_bytes),
+        Format::Bzip2 => scan(bzip2::read::MultiBzDecoder::new(open()?), entry, max_bytes),
+        Format::Zstd => scan(
+            ruzstd::decoding::StreamingDecoder::new(open()?).map_err(|e| e.to_string())?,
+            entry,
+            max_bytes,
+        ),
+        Format::Xz => {
+            let (buf, _) = decode_xz_bounded(path).map_err(|e| e.to_string())?;
+            scan(std::io::Cursor::new(buf), entry, max_bytes)
+        }
+        _ => Err("不支持在这种格式里按条目读取。".into()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -658,6 +1041,135 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    fn scratch(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join("michael-extract-tests").join(name);
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// zip-slip: an entry that climbs out of the destination. The classic archive attack, and the
+    /// reason extraction validates before it writes.
+    #[test]
+    fn an_entry_that_escapes_the_destination_aborts_before_anything_is_written() {
+        let root = scratch("slip");
+        let archive = root.join("evil.zip");
+        let dest = root.join("out");
+        let sentinel = root.join("PWNED.txt");
+
+        let file = File::create(&archive).unwrap();
+        let mut zip = zip::ZipWriter::new(file);
+        let opts: zip::write::FileOptions<()> = zip::write::FileOptions::default();
+        zip.start_file("harmless.txt", opts).unwrap();
+        zip.write_all(b"fine").unwrap();
+        zip.start_file("../PWNED.txt", opts).unwrap();
+        zip.write_all(b"owned").unwrap();
+        zip.finish().unwrap();
+
+        let err = extract(&archive, &dest, None).unwrap_err();
+        assert!(err.contains("越界"), "must refuse the traversal, said: {err}");
+        assert!(!sentinel.exists(), "a file was written OUTSIDE the destination");
+        // Validation happens first, so the harmless entry is not written either — an aborted
+        // extraction should not leave half an archive behind.
+        assert!(!dest.join("harmless.txt").exists(), "aborted extraction still wrote files");
+    }
+
+    /// A decompression bomb: small on disk, enormous when expanded.
+    #[test]
+    fn an_archive_that_expands_past_the_budget_is_refused() {
+        let root = scratch("bomb");
+        let archive = root.join("bomb.zip");
+        let dest = root.join("out");
+
+        let file = File::create(&archive).unwrap();
+        let mut zip = zip::ZipWriter::new(file);
+        let opts: zip::write::FileOptions<()> =
+            zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+        // 8 MB of zeroes compresses to almost nothing, which is the whole trick.
+        zip.start_file("zeros.bin", opts).unwrap();
+        zip.write_all(&vec![0u8; 8 * 1024 * 1024]).unwrap();
+        zip.finish().unwrap();
+
+        let on_disk = std::fs::metadata(&archive).unwrap().len();
+        assert!(on_disk < 128 * 1024, "fixture should be tiny on disk, was {on_disk}");
+
+        let err = extract(&archive, &dest, Some(1024 * 1024)).unwrap_err();
+        assert!(err.contains("上限") || err.contains("炸弹"), "said: {err}");
+        assert!(!dest.join("zeros.bin").exists(), "the bomb was written anyway");
+    }
+
+    #[test]
+    fn a_gzipped_tar_round_trips_through_extraction() {
+        let root = scratch("roundtrip");
+        let archive = root.join("bundle.tar.gz");
+        let dest = root.join("out");
+        {
+            let enc = flate2::write::GzEncoder::new(
+                File::create(&archive).unwrap(),
+                flate2::Compression::fast(),
+            );
+            let mut builder = tar::Builder::new(enc);
+            for (name, body) in [("src/main.rs", &b"fn main() {}"[..]), ("README.md", &b"# hi"[..])] {
+                let mut header = tar::Header::new_gnu();
+                header.set_size(body.len() as u64);
+                header.set_mode(0o644);
+                header.set_cksum();
+                builder.append_data(&mut header, name, body).unwrap();
+            }
+            builder.into_inner().unwrap().finish().unwrap();
+        }
+
+        let out = extract(&archive, &dest, None).unwrap();
+        assert_eq!(out.format, "tar.gzip");
+        assert_eq!(out.files, 2);
+        assert_eq!(std::fs::read_to_string(dest.join("src/main.rs")).unwrap(), "fn main() {}");
+        assert_eq!(std::fs::read_to_string(dest.join("README.md")).unwrap(), "# hi");
+    }
+
+    /// Opening one file inside an archive should not unpack the archive.
+    #[test]
+    fn a_single_entry_can_be_read_without_extracting_the_rest() {
+        let root = scratch("single");
+        let archive = root.join("many.zip");
+        let file = File::create(&archive).unwrap();
+        let mut zip = zip::ZipWriter::new(file);
+        let opts: zip::write::FileOptions<()> = zip::write::FileOptions::default();
+        for i in 0..50 {
+            zip.start_file(format!("f{i}.txt"), opts).unwrap();
+            zip.write_all(format!("contents of {i}").as_bytes()).unwrap();
+        }
+        zip.finish().unwrap();
+
+        let bytes = read_entry(&archive, "f37.txt", 1024).unwrap();
+        assert_eq!(String::from_utf8_lossy(&bytes), "contents of 37");
+        assert!(read_entry(&archive, "nope.txt", 1024).is_err());
+
+        // And it is bounded, so a huge entry cannot be pulled into memory whole.
+        let clipped = read_entry(&archive, "f37.txt", 7).unwrap();
+        assert_eq!(clipped.len(), 7);
+    }
+
+    #[test]
+    fn extraction_skips_the_macos_sidecars_rather_than_littering_them() {
+        let root = scratch("sidecars");
+        let archive = root.join("mac.zip");
+        let dest = root.join("out");
+        let file = File::create(&archive).unwrap();
+        let mut zip = zip::ZipWriter::new(file);
+        let opts: zip::write::FileOptions<()> = zip::write::FileOptions::default();
+        for name in ["a.txt", "._a.txt", "__MACOSX/x", "b.txt"] {
+            zip.start_file(name, opts).unwrap();
+            zip.write_all(b"x").unwrap();
+        }
+        zip.finish().unwrap();
+
+        let out = extract(&archive, &dest, None).unwrap();
+        assert_eq!(out.files, 2);
+        assert_eq!(out.skipped, 2);
+        assert!(!dest.join("._a.txt").exists());
+        assert!(!dest.join("__MACOSX").exists());
+    }
+
     #[test]
     fn a_rar_says_why_it_cannot_be_listed_instead_of_looking_empty() {
         let path = temp("archive.rar");
@@ -717,6 +1229,71 @@ mod probe {
         if let Some(note) = &listing.note { eprintln!("note: {note}"); }
         for e in listing.entries.iter().take(6) {
             eprintln!("  {:>12}  {}", e.size, e.name);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tauri commands — the seam the UI calls.
+// ---------------------------------------------------------------------------
+
+#[derive(Serialize)]
+pub struct ArchiveEntryContent {
+    /// Decoded text when the entry looks like text; None for binary.
+    pub text: Option<String>,
+    pub bytes: usize,
+    pub truncated: bool,
+    pub is_binary: bool,
+}
+
+#[tauri::command]
+pub fn extract_archive(
+    path: String,
+    dest: String,
+    budget: Option<u64>,
+) -> Result<ExtractOutcome, String> {
+    extract(Path::new(&path), Path::new(&dest), budget)
+}
+
+/// Read one entry for preview. Bounded, and reports whether it had to stop early so the panel can
+/// say "showing the first N bytes" rather than implying it showed everything.
+#[tauri::command]
+pub fn read_archive_entry(
+    path: String,
+    entry: String,
+    max_bytes: Option<u64>,
+) -> Result<ArchiveEntryContent, String> {
+    let cap = max_bytes.unwrap_or(1024 * 1024);
+    let bytes = read_entry(Path::new(&path), &entry, cap)?;
+    let truncated = bytes.len() as u64 >= cap;
+    // A NUL in the first few KB is the usual signal; decoding a binary as text produces noise.
+    let is_binary = bytes.iter().take(8192).any(|b| *b == 0);
+    let text = (!is_binary).then(|| String::from_utf8_lossy(&bytes).into_owned());
+    Ok(ArchiveEntryContent {
+        bytes: bytes.len(),
+        truncated,
+        is_binary,
+        text,
+    })
+}
+
+#[cfg(test)]
+mod probe_extract {
+    /// MICHAEL_EXTRACT_SRC=<archive> MICHAEL_EXTRACT_DEST=<dir> cargo test --lib probe_extract -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn probe_extract_a_real_archive() {
+        let (Ok(src), Ok(dest)) = (
+            std::env::var("MICHAEL_EXTRACT_SRC"),
+            std::env::var("MICHAEL_EXTRACT_DEST"),
+        ) else { return };
+        let started = std::time::Instant::now();
+        match super::extract(std::path::Path::new(&src), std::path::Path::new(&dest), None) {
+            Ok(o) => eprintln!(
+                "OK format={} files={} dirs={} bytes={} skipped={} in {:?}",
+                o.format, o.files, o.directories, o.bytes, o.skipped, started.elapsed()
+            ),
+            Err(e) => eprintln!("ERR {e}"),
         }
     }
 }

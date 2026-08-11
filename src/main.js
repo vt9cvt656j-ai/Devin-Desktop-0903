@@ -457,6 +457,9 @@ async function tauriBackend() {
     pickFolder: () => dialog.open({ directory: true, multiple: false }),
     openUrl: (url) => opener.openUrl(url),
     revealItemInDir: (path) => opener.revealItemInDir(path),
+    extractArchive: (path, dest, budget) => core.invoke("extract_archive", { path, dest, budget: budget ?? null }),
+    readArchiveEntry: (path, entry, maxBytes) =>
+      core.invoke("read_archive_entry", { path, entry, maxBytes: maxBytes ?? null }),
     aiChat: (config, messages, onEvent) => {
       const channel = new core.Channel();
       channel.onmessage = onEvent;
@@ -1751,6 +1754,8 @@ function mockBackend() {
       try { window.open(url, "_blank", "noopener,noreferrer"); } catch {}
     },
     revealItemInDir: async () => {},
+    extractArchive: async () => { throw new Error("解压需要桌面版应用。"); },
+    readArchiveEntry: async () => { throw new Error("读取压缩包条目需要桌面版应用。"); },
     // Answer per command instead of one canned failure: a preview that reports a
     // TypeScript warning for `pytest` teaches the wrong thing about the product.
     taskRunCapture: async (_cwd, command, _options = {}) => {
@@ -4623,6 +4628,32 @@ function _inspectionStringsHtml(strings) {
     </section>`;
 }
 
+/// Show one entry's text without unpacking the archive. Escape or a click outside closes it;
+/// there is nothing to save, so it needs no more chrome than that.
+function _showArchiveEntryPreview(name, content) {
+  document.getElementById("archive-entry-preview")?.remove();
+  const wrap = document.createElement("div");
+  wrap.id = "archive-entry-preview";
+  wrap.className = "archive-preview";
+  const truncated = content?.truncated ? ` · 只显示前 ${_formatInspectBytes(content.bytes)}` : "";
+  wrap.innerHTML = `
+    <div class="archive-preview__panel" role="dialog" aria-label="${_escAttr(name)}">
+      <header>
+        <strong title="${_escAttr(name)}">${_escHtml(name)}</strong>
+        <span>${_formatInspectBytes(content?.bytes || 0)}${truncated}</span>
+        <button type="button" aria-label="关闭">×</button>
+      </header>
+      <pre></pre>
+    </div>`;
+  // textContent, not innerHTML: this is file content out of an untrusted archive.
+  wrap.querySelector("pre").textContent = String(content?.text || "");
+  const close = () => { wrap.remove(); document.removeEventListener("keydown", onKey); };
+  const onKey = (e) => { if (e.key === "Escape") close(); };
+  wrap.addEventListener("click", (e) => { if (e.target === wrap || e.target.tagName === "BUTTON") close(); });
+  document.addEventListener("keydown", onKey);
+  document.body.appendChild(wrap);
+}
+
 function _inspectionArchiveHtml(archive) {
   const list = Array.isArray(archive?.entries) ? archive.entries : [];
   const note = archive?.note ? `<p class="file-inspector__note">${_escHtml(archive.note)}</p>` : "";
@@ -4645,7 +4676,7 @@ function _inspectionArchiveHtml(archive) {
         <table class="file-inspector__table">
           <thead><tr><th>名称</th><th>类型</th><th>大小</th><th>压缩后</th></tr></thead>
           <tbody>${list.map((entry) => `
-            <tr>
+            <tr${entry?.is_dir ? "" : ` data-archive-entry="${_escAttr(entry?.name || "")}" title="点击预览"`}>
               <td title="${_escAttr(entry?.name || "")}">${_escHtml(entry?.name || "")}</td>
               <td>${entry?.is_dir ? "目录" : "文件"}</td>
               <td>${_formatInspectBytes(entry?.size)}</td>
@@ -5188,6 +5219,7 @@ function _renderFileInspection(path, info, reason = "", error = "") {
           <button type="button" data-inspector-action="refresh">重新解析</button>
           <button type="button" data-inspector-action="copy">复制路径</button>
           <button type="button" data-inspector-action="reveal">在系统中显示</button>
+          ${info?.archive?.entries?.length ? `<button type="button" data-inspector-action="extract">解压到…</button>` : ""}
         </div>
       </header>
       ${reason ? `<div class="file-inspector__notice">文本编辑器打不开：${_escHtml(reason)}；已改用真实文件解析器读取。</div>` : ""}
@@ -5514,6 +5546,22 @@ async function _mpHandleClick(event) {
     return;
   }
 
+  const entryRow = event.target?.closest?.("[data-archive-entry]");
+  if (entryRow && activePath) {
+    const name = entryRow.getAttribute("data-archive-entry");
+    try {
+      const content = await backend.readArchiveEntry(activePath, name, 256 * 1024);
+      if (content?.is_binary) {
+        showToast(`${name} 是二进制文件（${_formatInspectBytes(content.bytes)}）`);
+      } else {
+        _showArchiveEntryPreview(name, content);
+      }
+    } catch (e) {
+      showToast(String(e?.message || e || "无法读取该条目"));
+    }
+    return;
+  }
+
   const action = event.target?.closest?.("[data-inspector-action]")?.getAttribute("data-inspector-action");
   if (!action) return;
   const current = activePath;
@@ -5529,6 +5577,22 @@ async function _mpHandleClick(event) {
     try { await navigator.clipboard?.writeText(current); showToast("已复制路径"); } catch { showToast(current); }
   } else if (action === "reveal") {
     try { await backend.revealItemInDir(current); } catch (e) { showToast(String(e?.message || e || "无法在系统中显示")); }
+  } else if (action === "extract") {
+    let dest = null;
+    try { dest = await backend.pickFolder(); } catch { /* cancelled */ }
+    if (!dest) return;
+    showToast("正在解压…");
+    try {
+      const out = await backend.extractArchive(current, String(dest));
+      // Say what actually happened, including what was skipped, so the file count in the
+      // destination matching the listing is explainable rather than surprising.
+      const skipped = out?.skipped ? `，跳过 ${out.skipped} 个附属条目` : "";
+      showToast(`已解压 ${out?.files ?? 0} 个文件到 ${String(dest).split("/").pop()}${skipped}`);
+      // Show the unpacked files without making the user hunt for a refresh.
+      try { await renderWorkspaceRoots(); } catch {}
+    } catch (e) {
+      showToast(String(e?.message || e || "解压失败"));
+    }
   }
 }
 

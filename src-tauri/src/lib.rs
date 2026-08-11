@@ -193,6 +193,8 @@ pub fn run() {
             files::read_log_tail,
             files::read_file_data_url,
             files::inspect_file,
+            archive::extract_archive,
+            archive::read_archive_entry,
             files::write_text_file,
             files::write_text_file_if_unchanged,
             files::delete_text_file_if_unchanged,
