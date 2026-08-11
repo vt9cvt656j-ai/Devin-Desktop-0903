@@ -12298,6 +12298,19 @@ function _parseTokenWindowValue(value) {
   return Math.max(0, Math.round(n * (unit === "m" ? 1_000_000 : unit === "k" ? 1_000 : 1)));
 }
 
+/** The most output tokens this model will write in one response — the second half of a model's
+ *  shape, and the one the catalogue never carried. 0 means the route did not say, and callers
+ *  must fall back rather than invent a number: a blanket ceiling is what sent 128,000 to a model
+ *  that caps at 64,000, and an invented 8,192 to one that can write 128,000. */
+function _modelMaxOutput(modelId = "") {
+  const entry = _modelCatalogEntry(modelId);
+  if (!entry) return 0;
+  const direct = _firstFiniteNumber(entry, [
+    "maxOutput", "max_output_tokens", "maxOutputTokens", "output_token_limit",
+  ]);
+  return direct > 0 ? Math.round(direct) : 0;
+}
+
 function _catalogModelContextLimit(it) {
   it = it || {};
   const direct = _firstFiniteNumber(it, [
@@ -12364,7 +12377,13 @@ function _modelContextRows(m) {
     return { kind: o.kind || (o.native ? "native" : "modified"),
       html: `<button type="button" class="${cls}" data-ctx="${o.value}" data-ctx-kind="${o.kind || (o.native ? "native" : "modified")}"${o.locked ? ' data-locked="1"' : ""} title="${_escAttr(tip)}">${_escHtml(o.label)}</button>` };
   });
-  const hint = `当前生效：${_tokenShort(eff)}（${_tokenExact(eff)} tokens）`;
+  // Two numbers, not one. The window is how much the model READS; the ceiling is how much it
+  // WRITES, and the catalogue carried only the first — which is how a blanket ceiling ended up
+  // being sent to every model regardless of what each one can actually produce. A route that does
+  // not report the ceiling says nothing rather than having one invented for it.
+  const out = _modelMaxOutput(id);
+  const hint = `当前生效：${_tokenShort(eff)}（${_tokenExact(eff)} tokens）`
+    + (out > 0 ? ` · 单次输出上限 ${_tokenShort(out)}` : "");
   const nativeBtns = btns.filter((b) => b.kind === "native").map((b) => b.html).join("");
   const modBtns = btns.filter((b) => b.kind !== "native").map((b) => b.html).join("");
   return '<div class="mic-plabel">原生上下文</div>' +
@@ -12452,6 +12471,9 @@ async function loadBackendModels() {
         // pricing + blurb for the hover info card (input/output = USD per 1M tokens)
         inPrice: pricing.inPrice, outPrice: pricing.outPrice, flatPrice: pricing.flatPrice, rate: pricing.rate,
         contextLimit, contextWindows,
+        // How much the model will WRITE. Null from the gateway means unknown for this route, and
+        // 0 here carries that through — nothing downstream may substitute a number for it.
+        maxOutput: Math.max(0, Math.round(Number(it.max_output_tokens ?? it.maxOutputTokens) || 0)),
         priceSource: it.price_source || it.priceSource || "",
         desc: it.description || "", group: label,
       });
@@ -12791,17 +12813,36 @@ function _ctxChoiceRecord(modelId) {
     return map[String(modelId || "")] || null;
   } catch { return null; }
 }
+/** Every native window this model genuinely offers, largest first. Most models have one; Sonnet 4
+ *  and 4.5 have two (200K by default, 1M behind the context-1m beta) and Gemini 1.5 Pro has 1M/2M. */
+function _nativeWindowsFor(modelId) {
+  const listed = (_modelCatalogEntry(modelId)?.contextWindows || [])
+    .map((w) => Math.round(Number(w?.tokens) || 0))
+    .filter((n) => n > 0);
+  const fallback = Math.max(0, Math.round(_modelContextLimit(modelId) || 0));
+  const all = listed.length ? listed : (fallback ? [fallback] : []);
+  return [...new Set(all)].sort((a, b) => b - a);
+}
 function _ctxChoiceFor(modelId) {
   const rec = _ctxChoiceRecord(modelId);
   if (!rec) return 0;
-  if (rec.kind === "native") return Math.max(0, Math.round(_modelContextLimit(modelId) || 0));
+  if (rec.kind === "native") {
+    // Which native window was clicked used to be thrown away — the record stored only the kind,
+    // so a model with two of them (Sonnet 4.5: 200K default, 1M behind the beta) always resolved
+    // back to the default and the 1M button could never take effect. Honour the stored figure,
+    // but only while the catalogue still offers it: a window the route has withdrawn must not
+    // strand a value nothing can deliver.
+    const stored = Math.max(0, Math.round(Number(rec.tokens) || 0));
+    if (stored > 0 && _nativeWindowsFor(modelId).includes(stored)) return stored;
+    return Math.max(0, Math.round(_modelContextLimit(modelId) || 0));
+  }
   return Math.max(0, Math.round(Number(rec.tokens) || 0));
 }
 function _setCtxChoice(modelId, tokens, kind = "modified") {
   try {
     const map = JSON.parse(localStorage.getItem(_CTX_CHOICE_KEY) || "{}") || {};
     const key = String(modelId || "");
-    if (kind === "native") map[key] = { kind: "native" };
+    if (kind === "native") map[key] = { kind: "native", tokens: Math.max(0, Math.round(tokens) || 0) };
     else if (tokens > 0) map[key] = { kind: "modified", tokens: Math.round(tokens) };
     else delete map[key];
     localStorage.setItem(_CTX_CHOICE_KEY, JSON.stringify(map));
@@ -12841,9 +12882,13 @@ function _ctxChoiceOptions(modelId) {
 }
 
 function _effectiveContextLimit(modelId) {
-  const native = _modelContextLimit(modelId);
+  // The ceiling the gateway actually enforces is `capacity_for_native` — native PLUS the tier,
+  // not the larger of the two (server/src/compression.rs). Taking the max here contradicted the
+  // buttons, which have always been priced additively: on any 1M-native model every tier resolved
+  // back to 1M, so the whole row was a no-op and the tier the user pays for could never light up.
+  const native = Math.max(_modelContextLimit(modelId), _nativeWindowsFor(modelId)[0] || 0);
   const tierMax = Number(_michaelUser?.michael_compression?.max_input_tokens) || 0;
-  const avail = _gatewayHandlesCompression() && tierMax ? Math.max(native, tierMax) : native;
+  const avail = _gatewayHandlesCompression() && tierMax ? native + tierMax : native;
   const choice = _ctxChoiceFor(modelId);
   // The choice may narrow the window below entitlement (a cost dial) but never widen it past
   // what native-or-membership actually delivers — budgeting against a fictional window is how
@@ -13862,6 +13907,12 @@ function _applyThinkingToConfig(cfg, opts = {}) {
     else if (profile.kind === "gemini_budget") {
       out.thinkingBudget = 0;
       out.thinkingConfig = { thinkingBudget: 0 };
+    } else if (profile.kind === "adaptive_thinking") {
+      // Dropping the field is not the same as asking for off here. Opus 5 and Sonnet 5 run
+      // adaptive thinking when nothing is said, so silence made the cheapest setting the deepest
+      // and most expensive one — and the gateway's output headroom is granted only to turns that
+      // announce thinking, so that turn also ran on the bare default and truncated mid-answer.
+      out.thinking = { type: "disabled" };
     }
     return out;
   }
@@ -16484,7 +16535,8 @@ function _tokenExact(n) {
  * choice is a real narrowing and still counts, but it cannot exceed what the model can read.
  */
 function _contextMeterLimit(modelId) {
-  const native = Math.max(1, Number(_modelContextLimit(modelId)) || 0);
+  // The widest window the model offers, so that picking Sonnet 4.5's 1M actually moves the gauge.
+  const native = Math.max(1, Number(_modelContextLimit(modelId)) || 0, _nativeWindowsFor(modelId)[0] || 0);
   const choice = _ctxChoiceFor(modelId);
   return choice > 0 ? Math.max(1, Math.min(choice, native)) : native;
 }
@@ -60882,7 +60934,7 @@ async function restoreSession() {
             label: "Anthropic",
             models: [{
               id: "claude-opus-4-6", name: "Claude Opus 4.6", brand: "Anthropic", meta: "",
-              inPrice: 0, outPrice: 0, contextLimit: 200000, contextWindows: [],
+              inPrice: 0, outPrice: 0, contextLimit: 1000000, contextWindows: [{ tokens: 1000000, beta: null }],
               desc: "Preview", group: "Anthropic",
             }],
           }];
@@ -60912,7 +60964,7 @@ async function restoreSession() {
             label: "Anthropic",
             models: [{
               id: "claude-opus-4-6", name: "Claude Opus 4.6", brand: "Anthropic", meta: "",
-              inPrice: 0, outPrice: 0, contextLimit: 200000, contextWindows: [],
+              inPrice: 0, outPrice: 0, contextLimit: 1000000, contextWindows: [{ tokens: 1000000, beta: null }],
               desc: "Preview", group: "Anthropic",
             }],
           }];

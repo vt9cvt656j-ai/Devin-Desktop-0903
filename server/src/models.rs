@@ -2039,6 +2039,10 @@ pub async fn list_for_client(State(state): State<AppState>) -> ApiResult<Json<se
                 "context_window": official_context(&mid),
                 // Full native list so the client can show every window a model really offers,
                 // instead of collapsing a genuine choice down to the default.
+                // Output is the second half of a model's shape and was never sent, so the client
+                // had no ceiling to budget against and the gateway clamped every model to one
+                // number. null means unknown for this route — the client must not invent one.
+                "max_output_tokens": official_max_output(&mid),
                 "context_windows": official_contexts(&mid)
                     .into_iter()
                     .map(|(tokens, beta)| serde_json::json!({ "tokens": tokens, "beta": beta }))
@@ -2703,6 +2707,33 @@ fn official_contexts(model_id: &str) -> Vec<(i64, Option<&'static str>)> {
         return vec![(128_000, None)];
     }
     vec![]
+}
+
+/// The most output tokens a model will produce in one response.
+///
+/// The catalogue carried a context window and nothing else, so every part of the pipeline guessed:
+/// a flat 128000 clamp with no model in scope (Haiku 4.5 caps at 64,000 and rejects it) and an
+/// invented 8192 default. Context and output are different kinds of number — one is a budget
+/// denominator, the other a wire parameter — and conflating them is what let both guesses stand.
+///
+/// None means "not known for this route", and every caller must fall back rather than invent one.
+fn official_max_output(model_id: &str) -> Option<i64> {
+    let m = model_id.to_lowercase();
+    if m.contains("claude") || m.contains("fable") || m.contains("mythos") {
+        if m.contains("haiku") {
+            return Some(64_000);
+        }
+        // The 1M families write 128K; everything older writes 64K.
+        return Some(if claude_generation(&m) >= 4.6 {
+            128_000
+        } else {
+            64_000
+        });
+    }
+    if m.contains("gpt-5") || m.contains("codex") {
+        return Some(128_000);
+    }
+    None
 }
 
 /// The DEFAULT native window — the first entry of official_contexts. Kept as the single number
@@ -4147,11 +4178,30 @@ fn anthropic_thinking(model: &str, effort: Option<&str>) -> Option<serde_json::V
     if std::env::var("MICHAEL_ANTHROPIC_THINKING").ok().as_deref() == Some("0") {
         return None;
     }
+    let m = model.to_lowercase();
     let eff = match effort {
         Some(e) if !e.is_empty() && e != "off" => e,
-        _ => return None,
+        // Absent is not the same as off: a caller that names no effort is asking for the model's
+        // own default, and silently disabling thinking for them would be a different bug in the
+        // opposite direction. Only an explicit "off" reaches the arm below.
+        None => return None,
+        // "off" is not the absence of a thinking key on every model. Opus 5 and Sonnet 5 run
+        // ADAPTIVE thinking when `thinking` is omitted, so returning None here meant the cheapest
+        // dial setting silently became the deepest one — and because the max_tokens floor below
+        // is gated on a thinking key being sent, that turn also kept the bare 8192 default while
+        // adaptive thinking ate it, truncating the visible answer. Say disabled out loud there.
+        //
+        // Only where the default is genuinely off (4.6/4.7/4.8, Sonnet 4.6 and older) is silence
+        // the same as off. Fable and Mythos cannot be disabled at all — an explicit disable is a
+        // 400 — so they keep returning None and the client hides the button.
+        _ => {
+            let default_is_on = claude_generation(&m) >= 5.0
+                && (m.contains("opus") || m.contains("sonnet"))
+                && !m.contains("fable")
+                && !m.contains("mythos");
+            return default_is_on.then(|| json!({"type":"disabled"}));
+        }
     };
-    let m = model.to_lowercase();
     if m.contains("haiku") {
         return None;
     } // fast tier → keep it fast
@@ -4354,6 +4404,11 @@ fn oai_to_anthropic_with_cache(
             // low/medium/max 全被压平成 high，max 的 64K 输出余量也永远打不中。
             // 档位边界与 IDE budgets{low:4096, medium:12000, high:24000, max:32000} 对齐。
             body.get("thinking").map(|t| {
+                // An explicit disable is the one thinking shape that means LESS, not more. It
+                // used to fall through to the bare-toggle arm and come out as "high".
+                if t.get("type").and_then(|v| v.as_str()) == Some("disabled") {
+                    return "off";
+                }
                 match t.get("budget_tokens").and_then(|v| v.as_i64()).unwrap_or(0) {
                     b if b > 24000 => "max",
                     b if b > 12000 => "high",
@@ -4364,14 +4419,22 @@ fn oai_to_anthropic_with_cache(
             })
         });
     let thinking = anthropic_thinking(model_str, effort);
-    let thinking_on = thinking.is_some();
+    // An explicit `{"type":"disabled"}` IS a thinking key, and it means the opposite of on. The
+    // headroom floor below exists to give adaptive thinking room to stretch; handing it to a turn
+    // that will not think just inflates the ceiling.
+    let thinking_on = thinking
+        .as_ref()
+        .is_some_and(|t| t.get("type").and_then(|v| v.as_str()) != Some("disabled"));
     // Anthropic REQUIRES max_tokens. Map from OpenAI, else a generous default.
     let mut max_tokens = body
         .get("max_tokens")
         .and_then(|v| v.as_i64())
         .or_else(|| body.get("max_completion_tokens").and_then(|v| v.as_i64()))
         .filter(|n| *n > 0)
-        .unwrap_or(8192);
+        // 8192 was invented, and it is what a thinking-off turn shipped to a model that can write
+        // 128,000 — long answers came back cut in half with no error. Fall back to a real fraction
+        // of the model's own ceiling; a client that names max_tokens still wins.
+        .unwrap_or_else(|| official_max_output(model_str).map_or(8192, |cap| cap.min(32000)));
     // For adaptive thinking: no budget_tokens, just ensure a generous max_tokens.
     // For budget-based (3.7): ensure max_tokens > budget_tokens.
     if thinking_on {
@@ -4399,7 +4462,8 @@ fn oai_to_anthropic_with_cache(
             max_tokens = min_mt;
         }
     }
-    let max_tokens = max_tokens.clamp(1, 128000);
+    // Per model, not a blanket 128000 — Haiku 4.5 caps at 64,000 and would reject the flat value.
+    let max_tokens = max_tokens.clamp(1, official_max_output(model_str).unwrap_or(128000));
     out.insert("max_tokens".into(), json!(max_tokens));
     if let Some(t) = &thinking {
         out.insert("thinking".into(), t.clone());
@@ -6916,7 +6980,7 @@ mod billing_tests {
     use super::{
         anthropic_beta_header, anthropic_thinking, anthropic_to_oai, chat_upstream_attempt_suffix,
         chat_upstream_retry_base_delay_ms, claude_generation, clip_thinking_budget, compute_cost,
-        is_image_gen_model,
+        is_image_gen_model, official_max_output,
         mark_thinking_clip, model_price_override, oai_to_anthropic, official_price,
         parse_usage_from_sse, project_quota_package, projected_provider_usd, resolve_cost,
         response_cache_safe, round_multiplier_up, split_fused_charge, thinking_clip_active,
@@ -7993,6 +8057,79 @@ mod billing_tests {
             h.get("thinking").is_none(),
             "haiku should not have thinking"
         );
+    }
+
+    #[test]
+    fn off_means_off_on_the_models_whose_default_is_on() {
+        // Opus 5 and Sonnet 5 run ADAPTIVE thinking when the thinking key is absent, so returning
+        // None for "off" made the cheapest dial the deepest one. Worse, the max_tokens headroom
+        // floor is granted only to turns that announce thinking, so that same turn also ran on the
+        // bare default while adaptive thinking consumed it — the answer came back truncated.
+        for id in ["claude-opus-5", "claude-sonnet-5"] {
+            assert_eq!(
+                anthropic_thinking(id, Some("off")),
+                Some(json!({"type":"disabled"})),
+                "{id} must be told to stop, not merely not told to start"
+            );
+        }
+        // Where the default is genuinely off, silence already says it.
+        for id in ["claude-opus-4-8", "claude-opus-4-7", "claude-opus-4-6", "claude-sonnet-4-6"] {
+            assert_eq!(anthropic_thinking(id, Some("off")), None, "{id}");
+        }
+        // Fable and Mythos reject an explicit disable outright; there is no off to offer.
+        for id in ["claude-fable-5", "claude-mythos-5"] {
+            assert_eq!(anthropic_thinking(id, Some("off")), None, "{id}");
+        }
+        // Absent is not off. A caller that names no effort wants the model's own default, and
+        // disabling thinking for them would be the same bug pointed the other way.
+        assert_eq!(anthropic_thinking("claude-opus-5", None), None);
+
+        // A disabled turn must not collect the headroom meant for thinking, and the client's
+        // explicit disable must read as "off" rather than as the bare-toggle "high".
+        let a = oai_to_anthropic(&json!({
+            "model": "claude-opus-5",
+            "thinking": {"type": "disabled"},
+            "messages": []
+        }))
+        .unwrap();
+        assert_eq!(a["thinking"], json!({"type":"disabled"}));
+        assert!(a.get("output_config").is_none(), "a disabled turn has no depth to set");
+        // It gets the ordinary per-model default and none of the depth headroom: the floor exists
+        // to let adaptive thinking stretch, and handing it to a turn that will not think just
+        // inflates the ceiling.
+        let deep = oai_to_anthropic(&json!({
+            "model": "claude-opus-5", "reasoning_effort": "max", "messages": []
+        }))
+        .unwrap();
+        assert!(
+            a["max_tokens"].as_i64().unwrap() < deep["max_tokens"].as_i64().unwrap(),
+            "a disabled turn must not collect the headroom meant for thinking"
+        );
+    }
+
+    #[test]
+    fn output_ceilings_are_per_model_instead_of_one_number_for_everything() {
+        // The catalogue carried a context window and nothing else, so the pipeline guessed twice:
+        // a flat 128000 clamp with no model in scope, and an invented 8192 default.
+        assert_eq!(official_max_output("claude-opus-5"), Some(128_000));
+        assert_eq!(official_max_output("claude-sonnet-5"), Some(128_000));
+        assert_eq!(official_max_output("claude-fable-5"), Some(128_000));
+        assert_eq!(official_max_output("claude-opus-4-6"), Some(128_000));
+        // Haiku caps at 64,000 and rejects the flat value the clamp used to hand it.
+        assert_eq!(official_max_output("claude-haiku-4-5"), Some(64_000));
+        assert_eq!(official_max_output("claude-sonnet-4-5"), Some(64_000));
+        assert_eq!(official_max_output("claude-opus-4-1"), Some(64_000));
+        // Unknown route says nothing rather than having a ceiling invented for it.
+        assert_eq!(official_max_output("some-local-llama"), None);
+
+        // The clamp honours it, and a thinking-off turn no longer ships the invented 8192.
+        let haiku = oai_to_anthropic(&json!({
+            "model": "claude-haiku-4-5", "max_tokens": 128000, "messages": []
+        }))
+        .unwrap();
+        assert_eq!(haiku["max_tokens"], 64_000);
+        let bare = oai_to_anthropic(&json!({"model": "claude-opus-5", "messages": []})).unwrap();
+        assert!(bare["max_tokens"].as_i64().unwrap() > 8192);
     }
 
     #[test]
