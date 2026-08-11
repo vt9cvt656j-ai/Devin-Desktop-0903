@@ -13908,7 +13908,12 @@ test("plain-text assistant questions wait without an automatic follow-up turn", 
   const loop = extractFn("_runAgenticLoop");
   const boundary = loop.indexOf("if (_agentTurnMustWaitForUser(turn))");
   assert.ok(boundary >= 0, "visible questions must have an explicit turn boundary");
-  const boundaryBlock = loop.slice(boundary, boundary + 700);
+  const boundaryBlock = loop.slice(boundary, boundary + 1600);
+  // A rhetorical "shall I continue?" with plan steps still open is not a direction question the
+  // user has to answer — it is the model stopping short of its own list. Intercepted once, then
+  // it is genuinely waiting.
+  assert.match(boundaryBlock, /run\._planQuestionIntercepted[\s\S]{0,400}_pushNudge\("planFinish"[\s\S]{0,300}continue;/,
+    "an unfinished plan must push the question back once before the run waits");
   assert.match(boundaryBlock, /awaitingUserReply = true/);
   assert.match(boundaryBlock, /_clearNudges\(\)/);
   assert.match(boundaryBlock, /break;/);
@@ -20717,8 +20722,16 @@ test("a quiet turn is the model's completion decision except for real bounded wo
     "no IDE-dispatched-subagent integration re-entry may remain");
   assert.match(quiet, /_pushNudge\("buildFix"[\s\S]{0,400}continue;/,
     "a real red verifier result retains bounded recovery");
-  assert.match(quiet, /if \(Array\.isArray\(session\._steerQueue\)[\s\S]{0,140}continue;[\s\S]{0,80}break; \/\/ truly done/,
-    "user steering is drained; otherwise the first quiet completion ends the loop");
+  // Steering still drains, and an unfinished plan is now the one other thing that can outvote a
+  // quiet completion — bounded at three, then the run ends and records why. Before this, the exit
+  // read nothing about the plan at all, so a model that wrote prose after step 2 of 7 simply
+  // stopped: no error, no warning, and the user had to type "continue".
+  assert.match(quiet, /if \(Array\.isArray\(session\._steerQueue\)[\s\S]{0,140}continue;/,
+    "user steering is drained before the run ends");
+  assert.match(quiet, /\(run\._planFinishNudges \|\| 0\) < 3[\s\S]{0,600}continue;[\s\S]{0,400}break; \/\/ truly done/,
+    "an open plan re-enters, boundedly, and then the run ends honestly");
+  assert.match(quiet, /run\._incompleteReason \|\| `plan_steps_pending:/,
+    "a run that gives up on its plan must not be recorded as a clean finish");
 });
 
 // ---------------------------------------------------------------------------

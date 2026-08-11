@@ -13903,13 +13903,20 @@ function _applyThinkingToConfig(cfg, opts = {}) {
   // 但复杂任务（工业级大项目等）要保持深度；钳位逻辑分两层：
   // 1) 显式选择永远优先：用户选过的档位从不改
   // 2) 复杂度感知：复杂任务跳过默认降档
-  if (opts.agentTurn && !opts.isComplexTask && pref === "high" && (profile.levels || []).includes("medium")) {
+  // 这条降档写在客户端还没真正发送 effort 的年代：当时 Claude 走的是 budget_tokens=24000，
+  // 一轮闷头想四分钟不动手是真的（实测）。现在这一族是 adaptive + output_config.effort，
+  // 想多深由模型每轮自己定、并且和工具调用交错展开——原来的前提没有了,留下的只有降档。
+  // Anthropic 自己的迁移指南把 xhigh 列为编码与 agentic 任务的推荐档、也是 Claude Code 的
+  // 默认；本条链路封顶在 high，所以 high 已经是这里能拿到的最深档。把 agent 轮压到 medium
+  // 等于让它比参照实现浅两档，这正是「整体感觉好垃圾」的来源。
+  // 保留的只有上限：max 在 agent 轮降到 high（省的是输出余量 64k→40k，不是思考深度）。
+  if (opts.agentTurn && !opts.isComplexTask && pref === "max" && (profile.levels || []).includes("high")) {
     let explicit = false;
     try {
       const saved = _loadThinkingPrefs()[preferenceId];
       explicit = !!(saved && (profile.levels || []).includes(saved));
     } catch {}
-    if (!explicit) pref = "medium";
+    if (!explicit) pref = "high";
   }
   out.thinkingEffort = pref || "off";
   if (!profile.configurable || !pref) return out;
@@ -40390,7 +40397,12 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
     planSteps = run._planSteps;
   }
   const _shotMsgs = []; // screenshot image messages currently in context (kept lean)
-  let continueNudges = 0, effectNudges = 0, researchNudges = 0, researchGateNudges = 0, planGateNudges = 0, verifyNudges = 0, honestyNudges = 0, toolReminders = 0, toolFirstNudges = 0, recoveryNudges = 0, invalidArgNudges = 0, deepReadNudges = 0, codeVerifyNudges = 0;
+  // continueNudges / effectNudges / researchNudges / verifyNudges / honestyNudges /
+  // deepReadNudges / codeVerifyNudges used to live here too, each appearing exactly once in the
+  // file: its own declaration. They read as a continuation-pressure mechanism that does not
+  // exist, which is why "does anything push the model to keep going?" looked answered when the
+  // real answer was no. The plan gate above is the thing that was missing.
+  let researchGateNudges = 0, planGateNudges = 0, toolReminders = 0, toolFirstNudges = 0, recoveryNudges = 0, invalidArgNudges = 0;
   // More "Claude Code way" discipline: did this run investigate (read/search) before
   // editing existing code; bounded investigate-first / plan-first nudges; and how many
   // times we've AUTO-RUN the project's verify check (so it CONVERGES to green).
@@ -41165,6 +41177,21 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
       // infer an answer or turn classifier-derived workspace/verification preferences into a
       // second model request. Any unfinished verification remains visible in final accounting.
       if (_agentTurnMustWaitForUser(turn)) {
+        // 「第三步做完了，要不要我继续？」会命中这里。方向性问题确实该停下来等用户，但计划
+        // 里还剩 5 步时那不是方向问题，是它自己该往下做的事——而这个分支同样一眼都没看计划，
+        // 还顺手 _clearNudges() 把刚推的提醒抹掉，最后记成 awaiting_user（连"未完成"都不算）。
+        // 拦一次：把问题按回去继续做。第二次再问就是真的在等用户了。
+        const _pendingPlan = (Array.isArray(run._planSteps) ? run._planSteps : [])
+          .filter((step) => step?.status === "pending" || step?.status === "in_progress");
+        if (_pendingPlan.length && _live() && !run._planQuestionIntercepted) {
+          run._planQuestionIntercepted = true;
+          _pushNudge("planFinish", `计划还剩 ${_pendingPlan.length} 步没做完（下一步：${_pendingPlan[0].content}）。`
+            + `\n这不是需要用户拍板的方向问题，直接继续做，别用「要不要我继续」停下来。`);
+          continue;
+        }
+        // Genuinely waiting now — but if steps are still open, say so in the accounting rather
+        // than letting "awaiting_user" read as a clean finish.
+        if (_pendingPlan.length) run._incompleteReason = run._incompleteReason || `plan_steps_pending:${_pendingPlan.length}`;
         awaitingUserReply = true;
         _clearNudges();
         break;
@@ -41256,6 +41283,21 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
         // top-of-loop drain splices it in and the model actually acts on the new message,
         // instead of it being stranded until (maybe never) a future turn.
         if (Array.isArray(session._steerQueue) && session._steerQueue.length && _live()) continue;
+        // 计划没做完就不算 truly done。这个退出点是「模型这一轮没调工具」——也正是它写完
+        // 第 2 步、说两句话、然后停下来的那一轮。它上面所有强制续跑的条件（诊断、构建失败、
+        // 用户插话）没有一条读计划，而唯二读计划的两个提醒都在「本轮有工具调用」的分支里，
+        // 结构上永远到不了这里。于是计划停在 2/7、没有报错、没有提示，用户只能自己打「继续」。
+        //
+        // 有界（3 次）：计划确实做不下去时收敛成一次诚实的「未完成」，而不是无限循环。
+        const _pendingPlan = (Array.isArray(run._planSteps) ? run._planSteps : [])
+          .filter((step) => step?.status === "pending" || step?.status === "in_progress");
+        if (_pendingPlan.length && _live() && (run._planFinishNudges || 0) < 3) {
+          run._planFinishNudges = (run._planFinishNudges || 0) + 1;
+          _pushNudge("planFinish", `[计划未完成] 还有 ${_pendingPlan.length} 步没做完：${_pendingPlan.slice(0, 8).map((step) => step.content).join("、")}。`
+            + `\n继续做下一步。某一步确实不该做，就用 update_plan 标 cancelled 并写明原因——不要在还有未完成步骤时静默收尾，也不要反问「要不要我继续」。`);
+          continue;
+        }
+        if (_pendingPlan.length) run._incompleteReason = run._incompleteReason || `plan_steps_pending:${_pendingPlan.length}`;
         break; // truly done
       }
 
