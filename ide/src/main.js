@@ -14032,7 +14032,11 @@ function hideModelInfoCard() {
 function buildModelMenu() {
   const _mc = loadConfig();
   const current = _mc.model;
-  const currentGroup = _mc.modelGroup || "";
+  // 分组名只用来在「同一个模型 id 出现在两个分组里」时区分该给哪一条打勾。
+  // 后台把线路并到别的名字下、或者改了线路名之后，存在本地的这个名字就不再存在了 ——
+  // 这时忽略它，只按模型 id 打勾，否则选中的模型照常在用，勾却没了。
+  const _saved = _mc.modelGroup || "";
+  const currentGroup = MODEL_GROUPS.some((g) => g.label === _saved) ? _saved : "";
   modelMenu.innerHTML = "";
   if (!modelMenu._hoverBound) {
     modelMenu.addEventListener("mouseleave", hideModelInfoCard);
@@ -56381,6 +56385,12 @@ let _atActive = -1;
 let _atTimer = 0;
 const _atMenu = document.createElement("div");
 _atMenu.className = "atmenu";
+// Exempt the whole menu from the runtime translator (AUTO_I18N_SKIP_SELECTOR in i18n.js honours
+// [data-i18n-skip]). Its rows are command names, model ids, repository paths and filenames —
+// identifiers you type or select, not prose. Translating "Model" to 模型 was the visible symptom;
+// translating a model id or a repo path would be worse, because the translated form cannot be
+// typed to select anything. Set on the container so every branch inherits it.
+_atMenu.setAttribute("data-i18n-skip", "");
 _atMenu.hidden = true;
 document.body.appendChild(_atMenu);
 

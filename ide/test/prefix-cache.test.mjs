@@ -453,3 +453,14 @@ test("Directory is its own @ category, listing folders from the workspace", () =
   assert.match(fn, /_insertAtChip\(\{ kind: "file", value: d/, "picking one inserts it as a reference");
   assert.match(fn, /No matching folder/, "an empty result must say so rather than closing the menu");
 });
+
+test("the @ menu is exempt from the runtime translator", () => {
+  // The categories were authored in English and rendered as 模型 / 文件, because i18n.js translates
+  // DOM text at runtime and caches per string — which is why the strings added in the same build
+  // (Directory, "Reference a file") still showed English while older ones did not.
+  assert.match(SRC, /_atMenu\.setAttribute\("data-i18n-skip", ""\)/,
+    "the menu container must opt out");
+  const I18N = fs.readFileSync("src/i18n.js", "utf8");
+  assert.ok(I18N.includes('"[data-i18n-skip]"'),
+    "and i18n.js must still honour that attribute — the opt-out is only as good as the selector");
+});
