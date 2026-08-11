@@ -484,3 +484,14 @@ test("each model in the @ menu wears its own vendor mark", () => {
   // And the chip keeps the mark after selection.
   assert.match(SRC, /iconSvg\(brandOf\(rel\)\.sym, brandOf\(rel\)\.cls\)/);
 });
+
+test("the profile card shows the account's real avatar when it has one", () => {
+  // /api/me returns an avatar (auth.rs inserts it); the card ignored it and always drew an
+  // initial on a gradient, so the dashboard and the app showed different people.
+  assert.match(SRC, /u\.avatar\s*\n?\s*\?\s*`<img class="pf-av pf-av--img" src="\$\{esc2\(u\.avatar\)\}"/,
+    "the real avatar must be used when present");
+  assert.match(SRC, /onerror=/, "a dead image URL must fall back to the initial, not a broken icon");
+  assert.match(SRC, /referrerpolicy="no-referrer"/,
+    "an avatar is usually third-party hosted; do not leak where it is being rendered");
+  assert.match(SRC, /\.pf-av--img\{object-fit:cover/, "and it must not stretch");
+});
