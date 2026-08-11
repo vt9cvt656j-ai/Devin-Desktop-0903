@@ -343,6 +343,7 @@ test("every quiet-turn re-entry is latched or counted", () => {
     [/run\._diagnosticNudges/, "new diagnostics, bounded"],
     [/buildFixAttempts/, "red build, bounded"],
     [/session\._steerQueue/, "user steering drains before the run ends"],
+    [/run\._planFinishNudges/, "the plan still has open steps, bounded"],
   ]) {
     assert.match(quiet, latch, `a bounded re-entry lost its guard (${why})`);
   }
@@ -352,7 +353,10 @@ test("every quiet-turn re-entry is latched or counted", () => {
   // (AGENT_LOOP_REBUILD.md stage 3), dropping the quiet-turn re-entry ceiling from 4 to 3.
   assert.doesNotMatch(quiet, /_subAgentFinishIntercepted/,
     "the auto-dispatch integration leg must be gone — the IDE no longer spawns sub-agents");
-  assert.ok(continues <= 3,
+  // Four now: the plan gate joined them. Every one of the other three is grounded in an observed
+  // fact; so is this one — an open plan step is a fact the model itself recorded via update_plan,
+  // not a classifier guess about what the task ought to have done.
+  assert.ok(continues <= 4,
     `${continues} re-entry points in the quiet-turn branch — every one needs a latch listed above`);
 });
 

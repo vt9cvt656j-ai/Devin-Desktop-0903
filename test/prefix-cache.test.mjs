@@ -930,3 +930,62 @@ test("an interrupted turn keeps what the model already wrote", () => {
   assert.match(SRC, /被打断的那次工具调用参数不完整，没有执行，也不会重放。/);
   assert.doesNotMatch(SRC, /已生成的内容和文件改动都已保留/);
 });
+
+test("a run does not end while its own plan has open steps", () => {
+  const loop = grab("_runAgenticLoop");
+
+  // The reported bug: the agent plans seven steps, does two, writes a paragraph, and stops.
+  // A turn with no tool calls is the loop's main exit, and every condition that could force
+  // another iteration there — diagnostics, a red build, queued user steering — read something
+  // other than the plan. The two nudges that DO read the plan live in the tool-execution
+  // branch, which a quiet turn never reaches. So nothing in the loop connected "the model
+  // stopped" to "the list is unfinished".
+  const quiet = loop.slice(loop.indexOf("if (!turn.toolCalls.length)"),
+                           loop.indexOf("// Render every tool step up front"));
+  assert.match(quiet, /run\._planSteps[\s\S]{0,300}status === "pending" \|\| step\?\.status === "in_progress"/);
+  assert.match(quiet, /\(run\._planFinishNudges \|\| 0\) < 3/, "bounded, so an unfinishable plan converges");
+  assert.match(quiet, /run\._incompleteReason = run\._incompleteReason \|\| `plan_steps_pending:/);
+
+  // And the other exit: "第三步做完了，要不要我继续？" trips the wait-for-user boundary, which
+  // also read nothing about the plan — and cleared the pending nudges on its way out.
+  const boundary = loop.slice(loop.indexOf("if (_agentTurnMustWaitForUser(turn))"));
+  assert.match(boundary.slice(0, 1600), /run\._planQuestionIntercepted/);
+  assert.ok(boundary.indexOf("_planQuestionIntercepted") < boundary.indexOf("awaitingUserReply = true"),
+    "the interception has to come before the run decides it is waiting");
+});
+
+test("agent turns are not demoted below the depth this route can deliver", () => {
+  // The clamp was written when Claude ran on budget_tokens=24000 and would think for four
+  // minutes without touching a tool — that was measured and the clamp was right. This family is
+  // adaptive now: depth is chosen per turn by the model and interleaved with tool calls, so the
+  // premise is gone and only the demotion was left. Anthropic's migration guide names xhigh as
+  // the setting for coding and agentic work and the default in Claude Code; this route caps at
+  // high, so high is already the deepest thing available here. Sending medium put the agent two
+  // notches under the reference implementation.
+  const apply = grab("_applyThinkingToConfig");
+  assert.doesNotMatch(apply, /pref === "high"[\s\S]{0,400}pref = "medium"/,
+    "an agent turn must not be demoted out of high");
+  assert.match(apply, /opts\.agentTurn && !opts\.isComplexTask && pref === "max"[\s\S]{0,400}pref = "high"/,
+    "only the max→high ceiling remains, and that trades output headroom, not depth");
+  // An explicit choice still wins, which was the one part of the clamp that was never in doubt.
+  assert.match(apply, /const saved = _loadThinkingPrefs\(\)\[preferenceId\];[\s\S]{0,200}if \(!explicit\)/);
+});
+
+test("the loop stops advertising continuation machinery it does not have", () => {
+  // Seven counters were declared and never touched again — continueNudges among them. Reading
+  // the loop, they answer "does anything push the model to keep going?" with a yes that is not
+  // true anywhere in the file.
+  // Declarations and assignments, not every mention: the comment that records this deletion names
+  // them, and a test that counts bare occurrences fails on its own explanation.
+  for (const dead of ["continueNudges", "effectNudges", "researchNudges", "verifyNudges",
+                      "honestyNudges", "deepReadNudges", "codeVerifyNudges"]) {
+    assert.doesNotMatch(SRC, new RegExp("(?:let|const|var)[^\\n;]*\\b" + dead + "\\b"),
+      `${dead} is declared and never used — delete it or wire it`);
+    assert.doesNotMatch(SRC, new RegExp("\\b" + dead + "\\s*(?:\\+\\+|=[^=])"),
+      `${dead} is written to but never read`);
+  }
+  // The ones that survived are the ones that actually fire.
+  for (const live of ["planGateNudges", "toolReminders", "recoveryNudges", "invalidArgNudges"]) {
+    assert.ok((SRC.match(new RegExp("\\b" + live + "\\b", "g")) || []).length > 1, live);
+  }
+});
