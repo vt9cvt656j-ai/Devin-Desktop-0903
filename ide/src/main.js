@@ -4315,7 +4315,11 @@ function activate(path) {
   saveBtn.disabled = !f.dirty;
   if (runBtn) runBtn.disabled = !!(f.isImage || f.isVideo || f.isPdf || f.isInspection);
   const projectLabel = rootPath ? basename(rootPath) : "";
-  $("windowTitle") && _setWindowTitle(f.name + (projectLabel ? " — " + projectLabel : "") + " — Mr.day One");
+  // The title bar sits between the traffic lights and the toolbar buttons; a full filename there
+  // crowds both. CSS can ellipsize it, but only from the end, which drops the extension.
+  $("windowTitle") && _setWindowTitle(
+    _ellipsizeMiddle(f.name) + (projectLabel ? " — " + _ellipsizeMiddle(projectLabel, 24) : "") + " — Mr.day One",
+  );
   if (!f.isImage && !f.isVideo && !f.isPdf && !f.isInspection) {
     // Cheap, in-memory decorations — render synchronously so they paint with the file.
     renderBreakpointDecorations();
@@ -8249,6 +8253,8 @@ function renderTabs() {
       `${iconImg(fileIconUrl(f.name))}<span class="label"></span>` +
       `<span class="x" title="Close"><span class="dot"></span><svg class="ic"><use href="#i-close" /></svg></span>`;
     tab.querySelector(".label").textContent = f.name;
+    // The label is capped at 220px and ellipsised, so the full name has to be reachable somehow.
+    tab.title = f.name;
     // 用户亲手点开 = 认领这个 tab，之后不再自动回收（activate 本身不能挂钩子——
   // agent 展示正在写的文件时也会调它）。
   tab.addEventListener("click", () => { _claimAgentPreviewTab(path); activate(path); });
@@ -16141,6 +16147,19 @@ const _ipcPeers = new Map();
 
 // 统一设置窗口标题：同时更新自绘标题栏 DOM 和原生窗口标题。之前只改 DOM，
 // macOS 的 Dock/调度中心/窗口菜单里所有窗口都叫 "Michael IDE"，多窗口无法按项目区分。
+/**
+ * Shorten from the middle, keeping both ends. For a filename the tail carries the extension and
+ * usually the version or date — exactly what end-truncation throws away first. macOS shortens
+ * paths this way for the same reason.
+ */
+function _ellipsizeMiddle(text, max = 44) {
+  const value = String(text || "");
+  if (value.length <= max) return value;
+  const head = Math.ceil((max - 1) / 2);
+  const tail = Math.floor((max - 1) / 2);
+  return `${value.slice(0, head)}…${value.slice(value.length - tail)}`;
+}
+
 function _setWindowTitle(text) {
   try { $("windowTitle").textContent = text; } catch {}
   if (inTauri) {

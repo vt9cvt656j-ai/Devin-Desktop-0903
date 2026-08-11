@@ -1030,6 +1030,12 @@ body.is-tauri.is-mac.is-fullscreen .titlebar {
   display: inline-flex;
   align-items: center;
   gap: 7px;
+  /* A tab is a label, not a field for the whole filename. Unbounded, one build artefact named
+     庄子视频处理系统V5.0-TS长视频版-Windows-x64-最新版-20260722.zip took ~640px and pushed every
+     other tab off the strip — so the tab bar showed one file and a fragment. VS Code caps at
+     160px; 220 is roomier while still keeping several tabs visible. */
+  max-width: 220px;
+  min-width: 0;
   padding: 0 8px 0 13px;
   font-size: 12.5px;
   color: var(--text-dim);
@@ -1037,6 +1043,16 @@ body.is-tauri.is-mac.is-fullscreen .titlebar {
   cursor: pointer;
   white-space: nowrap;
   transition: background 0.12s ease, color 0.12s ease;
+}
+/* The label is the only part that may shrink; the icon and the close button keep their size, or
+   the close target moves as you switch files. */
+.tab > .ic,
+.tab > .x { flex: none; }
+.tab .label {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 .tab:hover {
   background: var(--hover);

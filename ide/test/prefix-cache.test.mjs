@@ -229,3 +229,27 @@ test("CSV files open in the table window, with a way back to the editor", () => 
   assert.ok((SRC.match(/hideTablePreview\(\);/g) || []).length >= 3,
     "hidden alongside hidePdfPreview in every place that switches views");
 });
+
+test("a long filename does not take over the tab strip or the title bar", () => {
+  // One real build artefact — 庄子视频处理系统V5.0-TS长视频版-Windows-x64-最新版-20260722.zip — made
+  // its tab ~640px wide, pushing every other tab off the strip so the bar showed one file and a
+  // fragment of another. .tab is white-space:nowrap and .tab .label had no rule at all, so the
+  // tab simply grew to whatever the name needed.
+  const tab = APP_CSS.slice(APP_CSS.indexOf("\n.tab {"), APP_CSS.indexOf(".tab:hover"));
+  assert.match(tab, /max-width: 220px;/, "a tab needs a ceiling");
+  assert.match(tab, /\.tab \.label \{[^}]*text-overflow: ellipsis;/s, "and the label must ellipsise");
+  assert.match(tab, /\.tab > \.ic,\s*\.tab > \.x \{ flex: none; \}/,
+    "only the label may shrink — a close button that moves as you switch files is worse");
+  assert.match(SRC, /tab\.title = f\.name;/, "a truncated label needs the full name on hover");
+
+  // The title bar shortens from the middle: end-truncation drops the extension, which is the part
+  // that says what the file is.
+  const fn = SRC.match(/function _ellipsizeMiddle[\s\S]*?\n}/)[0];
+  const ellipsize = new Function(`${fn}; return _ellipsizeMiddle;`)();
+  const long = "庄子视频处理系统V5.0-TS长视频版-Windows-x64-最新版-20260722.zip";
+  const short = ellipsize(long);
+  assert.ok(short.length < long.length, "a long name must actually be shortened");
+  assert.ok(short.endsWith(".zip"), "and must keep the extension");
+  assert.ok(short.includes("…"));
+  assert.equal(ellipsize("main.js"), "main.js", "short names are left alone");
+});
