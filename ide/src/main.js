@@ -56083,7 +56083,7 @@ function _makeComposerChip(rel, kind = "file", labelText = "") {
     const isDir = !/\.[a-zA-Z0-9]{1,8}$/.test(name);
     icon = iconImg(isDir ? folderIconUrl(name, false) : fileIconUrl(name));
   } else {
-    icon = iconSvg(kind === "model" ? "i-sparkles" : "i-git", "ic--doc");
+    icon = iconSvg(kind === "model" ? "i-sparkle" : `i-brand-${kind}`, "ic--doc");
   }
   const nameEl = document.createElement("span");
   nameEl.className = "composer-chip__name";
@@ -56461,6 +56461,7 @@ function _hideAtMenu() {
   _atActive = -1;
   _atRows = [];
   _atMode = null; // next @ starts at the category list again
+  _atDir = "";  // and at the workspace root
 }
 function _renderAtActive() { [..._atMenu.children].forEach((c, i) => c.classList.toggle("is-active", i === _atActive)); }
 /**
@@ -56474,10 +56475,13 @@ function _renderAtActive() { [..._atMenu.children].forEach((c, i) => c.classList
  * because a router that makes the common case slower is a worse router.
  */
 const _AT_CATEGORIES = [
-  { id: "model", label: "模型", hint: "把这条任务交给指定模型", icon: "i-sparkles" },
-  { id: "files", label: "文件", hint: "引用目录或文件", icon: "i-file" },
-  { id: "github", label: "GitHub", hint: "连接仓库进行开发", icon: "i-git" },
-  { id: "gitlab", label: "GitLab", hint: "连接仓库进行开发", icon: "i-git" },
+  // English labels: these name products and capabilities, and sit beside model ids and repo
+  // paths that are English anyway. i-sparkles did not exist, which is why Model rendered with no
+  // icon at all — a missing symbol fails silently, so the names are taken from the real set.
+  { id: "model", label: "Model", hint: "Run this task on a specific model", icon: "i-sparkle" },
+  { id: "files", label: "Files", hint: "Reference a folder or file", icon: "i-folder" },
+  { id: "github", label: "GitHub", hint: "Work in a connected repository", icon: "i-brand-github" },
+  { id: "gitlab", label: "GitLab", hint: "Work in a connected repository", icon: "i-brand-gitlab" },
 ];
 
 /** null = the category list; otherwise the branch being browsed. */
@@ -56531,7 +56535,7 @@ function _atModelRows(query) {
       if (q && !id.toLowerCase().includes(q) && !label.toLowerCase().includes(q)) continue;
       rows.push({
         kind: "model",
-        icon: "i-sparkles",
+        icon: "i-sparkle",
         name: label,
         detail: group?.label ? `${group.label} · ${id}` : id,
         onPick: () => _insertAtChip({ kind: "model", value: id, label }),
@@ -56551,9 +56555,9 @@ function _atRepoRows(kind, query) {
   if (!token) {
     return [{
       kind: "connect",
-      icon: "i-git",
-      name: `连接 ${kind === "github" ? "GitHub" : "GitLab"} 账号`,
-      detail: "填入访问令牌后可直接选择仓库",
+      icon: `i-brand-${kind}`,
+      name: `Connect ${kind === "github" ? "GitHub" : "GitLab"}`,
+      detail: "Add an access token to browse your repositories",
       onPick: () => { _hideAtMenu(); _openIntegrationSettings(kind); },
     }];
   }
@@ -56564,16 +56568,16 @@ function _atRepoRows(kind, query) {
     .slice(0, 20)
     .map((r) => ({
       kind: "repo",
-      icon: "i-git",
+      icon: `i-brand-${kind}`,
       name: r.full_name,
-      detail: r.private ? "私有仓库" : "公开仓库",
+      detail: r.private ? "Private" : "Public",
       onPick: () => _insertAtChip({ kind, value: r.full_name, label: r.full_name }),
     }));
   if (rows.length) return rows;
   return [{
     kind: "hint",
-    icon: "i-git",
-    name: cached.length ? "没有匹配的仓库" : "正在读取仓库列表…",
+    icon: `i-brand-${kind}`,
+    name: cached.length ? "No matching repository" : "Loading repositories…",
     detail: "",
     onPick: () => {},
   }];
@@ -56644,7 +56648,36 @@ async function _renderAtMenu() {
   _atMenu.hidden = false;
 }
 
-/** The original file picker, unchanged in behaviour — it is now one branch of the router. */
+/** Turn workspace-relative paths into menu rows. One definition, so the browse and search paths
+    cannot render the same file two different ways. */
+function _atRowsForPaths(paths) {
+  return paths.map((f) => {
+    const isDir = f.endsWith("/");
+    const clean = isDir ? f.slice(0, -1) : f;
+    const slash = clean.lastIndexOf("/");
+    const baseName = slash >= 0 ? clean.slice(slash + 1) : clean;
+    return {
+      kind: "file",
+      iconUrl: isDir ? folderIconUrl(baseName, false) : fileIconUrl(baseName),
+      name: baseName + (isDir ? "/" : ""),
+      detail: "",
+      onPick: isDir
+        ? () => { _atDir = clean; _renderAtMenu(); }
+        : () => _insertAtChip({ kind: "file", value: clean, label: baseName }),
+    };
+  });
+}
+
+/** Which folder the Files branch is showing. "" = the workspace root. */
+let _atDir = "";
+
+/**
+ * Files, with folders you can walk into.
+ *
+ * Selecting a folder used to insert it and end there, so referencing one file inside a deep
+ * directory meant typing the path. A folder now opens; the row above it goes back up. Inserting
+ * the folder itself is still one keystroke away — the first row of an opened folder is the folder.
+ */
 async function _atFileRows(query) {
   const root = rootPath || workspaceRoots[0] || "";
   if (!root) return [];
@@ -56652,6 +56685,24 @@ async function _atFileRows(query) {
   try { files = await _ensureFileIndex(); } catch { return []; }
   if (!files || !files.length) return [];
   const q = String(query || "").toLowerCase();
+  // Inside a folder the list is that folder's immediate children, not a workspace-wide fuzzy
+  // search — the point of walking in is to narrow, and a global match would undo it.
+  if (_atDir) {
+    const prefix = `${_atDir}/`;
+    const seen = new Set();
+    const children = [];
+    for (const f of files) {
+      if (!f.startsWith(prefix)) continue;
+      const rest = f.slice(prefix.length);
+      const slash = rest.indexOf("/");
+      const label = slash === -1 ? rest : `${rest.slice(0, slash)}/`;
+      if (!label || seen.has(label)) continue;
+      seen.add(label);
+      if (q && !label.toLowerCase().includes(q)) continue;
+      children.push(prefix + label);
+    }
+    return _atRowsForPaths(children.slice(0, 40));
+  }
   let matches;
   if (!q) {
     const open = _openFilesRel(root);
@@ -56666,7 +56717,7 @@ async function _atFileRows(query) {
       .slice(0, 15)
       .map((x) => x.f);
   }
-  return matches.map((f) => {
+  const rows = matches.map((f) => {
     const isDir = f.endsWith("/");
     const clean = isDir ? f.slice(0, -1) : f;
     const slash = clean.lastIndexOf("/");
@@ -56676,9 +56727,34 @@ async function _atFileRows(query) {
       iconUrl: isDir ? folderIconUrl(baseName, false) : fileIconUrl(baseName),
       name: baseName + (isDir ? "/" : ""),
       detail: slash >= 0 ? clean.slice(0, slash) : "",
-      onPick: () => _insertAtChip({ kind: "file", value: clean, label: baseName }),
+      // A folder opens; a file inserts. Opening is the more common intent by far — you reference
+      // a file inside a folder far more often than the folder itself, which is still one row away.
+      onPick: isDir
+        ? () => { _atDir = clean; _renderAtMenu(); }
+        : () => _insertAtChip({ kind: "file", value: clean, label: baseName }),
     };
   });
+
+  if (_atDir) {
+    // Two rows at the top of an opened folder: go back up, and insert this folder as it stands.
+    const here = _atDir.split("/").pop() || _atDir;
+    const parent = _atDir.includes("/") ? _atDir.slice(0, _atDir.lastIndexOf("/")) : "";
+    rows.unshift({
+      kind: "file",
+      iconUrl: folderIconUrl(here, true),
+      name: `Use ${here}/`,
+      detail: "Reference this folder",
+      onPick: () => _insertAtChip({ kind: "file", value: _atDir, label: here }),
+    });
+    rows.unshift({
+      kind: "file",
+      iconUrl: folderIconUrl(parent.split("/").pop() || "", false),
+      name: "..",
+      detail: parent || "workspace root",
+      onPick: () => { _atDir = parent; _renderAtMenu(); },
+    });
+  }
+  return rows;
 }
 
 function _pickAt(i) {
