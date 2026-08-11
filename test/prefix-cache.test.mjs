@@ -680,12 +680,49 @@ test("the percentage measures the window the model reads, so it can actually mov
   // The tier stays visible, in the tooltip. An earlier build divided by the native window and a
   // 5M account saw a permanent "200.0k" — a working feature displayed as if it were off.
   assert.match(SRC, /const tierLimit = Math\.max\(0, Number\(_effectiveContextLimit\(model\)\) \|\| 0\);/);
-  assert.match(SRC, /tierLimit > state\.limit\s*\n\s*\? `\\n会员档位：可留存 \$\{k\(tierLimit\)\} 历史/);
+  assert.match(SRC, /if \(tierLimit > state\.limit\) lines\.push\(`档位 可留存/);
 
   // The ring carries the percentage; the amount is on hover, first line, stated exactly.
   assert.match(SRC, /label\.textContent = pct >= 100 \? "满" : String\(pct\)/);
-  assert.match(SRC, /上下文占用：\$\{_tokenExact\(state\.total\)\} tokens · 窗口 \$\{_tokenExact\(state\.limit\)\}（\$\{pct\}%）/);
+  assert.match(SRC, /const lines = \[`上下文 \$\{_tokenExact\(state\.total\)\} \/ \$\{k\(state\.limit\)\} · \$\{pct\}%`\];/);
   assert.match(APP_CSS, /\.cache-ring::after \{[^}]*content: attr\(data-tooltip\);/);
   assert.match(APP_CSS, /\.cache-ring::after \{[^}]*white-space: pre-line;/,
     "the tooltip is multi-line; without this it collapses into one unreadable run");
+});
+
+test("the hover panel says only what it has to say, on top of the conversation", () => {
+  // Six lines fired unconditionally before this: the same figure in three vocabularies, zeros
+  // where there was nothing to report, and a closing note restating the line above it. The box
+  // ended up wide enough to cover the conversation it was floating over.
+  const render = grab("_renderTokenMeter");
+  const pushes = render.match(/lines\.push\(/g) || [];
+  assert.ok(pushes.length >= 6, "the detail is still available");
+  for (const guard of [
+    /if \(state\.estimated\) \{/,
+    /\} else if \(\(state\.prompt \|\| 0\) > 0 \|\| \(state\.completion \|\| 0\) > 0\) \{/,
+    /if \(_tok\.anyReal\) \{/,
+    /if \(tierLimit > state\.limit\)/,
+    /if \(_activeThinkEffort && _activeThinkEffort !== "off"\)/,
+    /if \(pct >= 100\)/,
+  ]) assert.match(render, guard, "every line past the first is conditional");
+  assert.equal((render.match(/const tooltip = lines\.join\("\\n"\);/g) || []).length, 1);
+
+  // The cache split drops the parts that are zero rather than printing them.
+  assert.match(render, /if \(state\.cached\) split\.push/);
+  assert.match(render, /if \(cacheWrite\) split\.push/);
+  assert.match(render, /if \(uncached\) split\.push/);
+  assert.match(render, /split\.length \? `（\$\{split\.join\(" · "\)\}）` : ""/);
+
+  // Nothing left over from the old string: a dead helper that still computes reads as if it
+  // were displayed somewhere.
+  assert.doesNotMatch(render, /_thinkShort|_thinkDetail|sourceText/,
+    "the retired pieces are gone, not merely unreferenced");
+  assert.doesNotMatch(render, /注：供应商尚未上报真实 usage/);
+
+  // And it paints above the transcript. A message carries content-visibility, which promotes it
+  // to its own stacking context, so DOM order alone did not keep chat text out of the box.
+  assert.match(APP_CSS, /\.composer \{ position: relative; z-index: 60; \}/);
+  assert.match(APP_CSS, /\.cache-ring::after \{[\s\S]*?z-index: 200;/);
+  assert.match(APP_CSS, /\.cache-ring::after \{[\s\S]*?background: var\(--panel-solid, #fff\);/,
+    "a missing custom property degrades to see-through, not to opaque");
 });

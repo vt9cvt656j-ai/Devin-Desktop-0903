@@ -16436,7 +16436,7 @@ function _estRequestTokens(messages, tools = []) {
 }
 function _tokenShort(n) {
   n = Math.max(0, Math.round(Number(n) || 0));
-  if (n >= 1_000_000) return (n / 1_000_000).toFixed(n >= 10_000_000 ? 0 : 1) + "m";
+  if (n >= 1_000_000) return (n / 1_000_000).toFixed(n >= 10_000_000 ? 0 : 1) + "M";
   return n >= 1000 ? (n / 1000).toFixed(1) + "k" : String(n);
 }
 function _tokenExact(n) {
@@ -17078,38 +17078,43 @@ function _renderTokenMeter() {
   const state = _ctxMeter || {};
   // 命中率只按「真实 usage 且上游报了缓存字段」的口径算，估算轮/未上报轮不进分母
   const cumHit = _tok.inWithCacheInfo > 0 ? Math.min(100, Math.round((_tok.cached / _tok.inWithCacheInfo) * 100)) : 0;
-  // Live thinking-depth chip — makes the (otherwise invisible) reasoning VISIBLE: shows
-  // the depth this turn used + how many reasoning tokens the model actually spent.
+  // Makes the (otherwise invisible) reasoning VISIBLE: the depth this turn used, and how many
+  // reasoning tokens the model actually spent proving it.
   const _depthLabel = { off: "关闭", minimal: "Minimal", low: "Low", medium: "Medium", high: "High", xhigh: "XHigh", max: "Max" };
-  const _thinkShort = _activeThinkEffort && _activeThinkEffort !== "off"
-    ? ` · 🧠 ${_depthLabel[_activeThinkEffort] || _activeThinkEffort}`
-    : (_activeThinkEffort === "off" ? " · 🧠关" : "");
-  const _thinkDetail = _activeThinkEffort && _activeThinkEffort !== "off"
-    ? `\n思考深度：${_depthLabel[_activeThinkEffort] || _activeThinkEffort}${_lastReasoningTok ? `；上报推理 token ${k(_lastReasoningTok)}` : ""}`
-    : (_activeThinkEffort === "off" ? "\n思考深度：关闭" : "");
   const pct = Math.max(0, Math.min(999, Math.round(Number(state.pct) || 0)));
   const ringPct = Math.max(0, Math.min(100, pct));
-  const sourceText = state.source === "draft" ? "输入中估算"
-    : state.source === "session" ? "当前会话估算"
-      : state.source || (state.estimated ? "估算" : "真实 usage");
   const cacheWrite = Math.max(0, Number(state.cacheWrite) || 0);
   const uncached = Math.max(0, (state.prompt || 0) - (Number(state.cached) || 0) - cacheWrite);
-  // The ring shows the percentage; the amount belongs on hover, where there is room to state it
-  // exactly. That ordering matters — the first line is the whole answer for most glances.
   const tierLimit = Math.max(0, Number(state.tierLimit) || 0);
-  const tierLine = tierLimit > state.limit
-    ? `\n会员档位：可留存 ${k(tierLimit)} 历史，由网关压缩后送进这个 ${k(state.limit)} 窗口`
-    : "";
-  const text = `上下文 ${k(state.total)} / ${k(state.limit)}（${pct}%）${state.estimated ? "（估算）" : ""}${_thinkShort}`;
-  const tooltip = `上下文占用：${_tokenExact(state.total)} tokens · 窗口 ${_tokenExact(state.limit)}（${pct}%）` + tierLine +
-    `\n来源：${sourceText}${state.model ? ` · 模型 ${state.model}` : ""}` +
-    `\n最近请求：输入 ${_tokenExact(state.prompt || 0)}（${state.cached == null ? "缓存 未上报" : `缓存读取 ${_tokenExact(state.cached)} · 缓存写入 ${_tokenExact(cacheWrite)} · 未缓存 ${_tokenExact(uncached)}`}）· 输出 ${_tokenExact(state.completion || 0)}` +
-    `\n本会话累计 usage：输入 ${_tok.in}（${_tok.anyCacheInfo ? `缓存命中 ${_tok.cached}，约 ${cumHit}%` : "缓存 上游未上报"}）· 输出 ${_tok.out}` +
-    _thinkDetail +
-    (pct >= 100 ? "\n状态：已达到/超过上下文窗口，后续应优先压缩旧上下文或摘要化历史。"
-      : (pct >= _CONTEXT_RING_DANGER_PCT ? "\n状态：上下文接近满载，建议压缩旧上下文。"
-        : (pct >= _CONTEXT_RING_WARN_PCT ? "\n状态：上下文占用偏高。" : ""))) +
-    (_tok.anyReal ? "" : "\n注：供应商尚未上报真实 usage 前，当前值按本地可见上下文估算。");
+  const text = `上下文 ${k(state.total)} / ${k(state.limit)}，${pct}%${state.estimated ? "（估算）" : ""}`;
+  // Every line here is one that would otherwise have to be worked out, and a line that has
+  // nothing to say is left out rather than printed as zeros. The previous version emitted all
+  // six unconditionally — the same figure restated in three vocabularies, a note repeating what
+  // the 来源 line already said, and a box wide enough to cover the conversation behind it.
+  // Line one is the whole answer; everything below it is detail for someone who wants it.
+  const lines = [`上下文 ${_tokenExact(state.total)} / ${k(state.limit)} · ${pct}%`];
+  if (state.estimated) {
+    lines.push("本地估算 · 供应商尚未上报本轮用量");
+  } else if ((state.prompt || 0) > 0 || (state.completion || 0) > 0) {
+    const split = [];
+    if (state.cached) split.push(`缓存 ${k(state.cached)}`);
+    if (cacheWrite) split.push(`新写 ${k(cacheWrite)}`);
+    if (uncached) split.push(`未缓存 ${k(uncached)}`);
+    lines.push(`本轮 输入 ${k(state.prompt || 0)}${split.length ? `（${split.join(" · ")}）` : ""} · 输出 ${k(state.completion || 0)}`);
+  }
+  if (_tok.anyReal) {
+    lines.push(`会话 输入 ${k(_tok.in)} · 输出 ${k(_tok.out)}${_tok.anyCacheInfo ? ` · 缓存命中 ${cumHit}%` : ""}`);
+  }
+  // The tier is the answer to "did my membership actually turn on", so it shows only when it is
+  // actually buying headroom beyond the window.
+  if (tierLimit > state.limit) lines.push(`档位 可留存 ${k(tierLimit)}，压缩后送进 ${k(state.limit)} 窗口`);
+  if (_activeThinkEffort && _activeThinkEffort !== "off") {
+    lines.push(`思考 ${_depthLabel[_activeThinkEffort] || _activeThinkEffort}${_lastReasoningTok ? ` · 推理 ${k(_lastReasoningTok)}` : ""}`);
+  }
+  if (pct >= 100) lines.push("窗口已满，下一轮会先压缩旧上下文");
+  else if (pct >= _CONTEXT_RING_DANGER_PCT) lines.push("接近满载，建议压缩旧上下文");
+  if (state.model) lines.push(state.model);
+  const tooltip = lines.join("\n");
   try {
     let el = document.getElementById("tokenMeter");
     if (!el) {
