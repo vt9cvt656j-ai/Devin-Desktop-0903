@@ -484,6 +484,22 @@ export function Shell() {
               </div>
               <div className="settings-figma__hint" id="figmaTokenHint">figma.com → Settings → Security → Personal access tokens（勾 File content 读权限）。只存在本机，供 <code>figma</code> 工具读取你的设计文件。</div>
             </div>
+            {/* Code hosts, alongside Figma: same shape, same storage, same promise — the token
+                stays on this machine and goes straight to the provider, never to the gateway. */}
+            <div className="settings-figma">
+              <label className="settings-figma__label" htmlFor="githubTokenInput">GitHub 访问令牌 <small>（可选，用于在 @ 里直接选择仓库）</small></label>
+              <div className="settings-figma__row">
+                <input id="githubTokenInput" className="settings-figma__input" type="password" autoComplete="off" autoCapitalize="off" spellCheck="false" placeholder="github_pat_… / ghp_…" />
+              </div>
+              <div className="settings-figma__hint">github.com → Settings → Developer settings → Personal access tokens（只读 repo 权限即可）。只存在本机。</div>
+            </div>
+            <div className="settings-figma">
+              <label className="settings-figma__label" htmlFor="gitlabTokenInput">GitLab 访问令牌 <small>（可选，用于在 @ 里直接选择仓库）</small></label>
+              <div className="settings-figma__row">
+                <input id="gitlabTokenInput" className="settings-figma__input" type="password" autoComplete="off" autoCapitalize="off" spellCheck="false" placeholder="glpat-…" />
+              </div>
+              <div className="settings-figma__hint">gitlab.com → 用户设置 → 访问令牌（read_api 即可）。只存在本机。</div>
+            </div>
             <div className="sheet__actions">
               <Button variant="outline" value="cancel" formNoValidate data-i18n="dialog.cancel">取消</Button>
               <Button id="settingsSaveBtn" value="default" data-i18n="settings.gotIt">知道了</Button>

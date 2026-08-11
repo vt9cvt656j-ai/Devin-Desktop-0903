@@ -461,6 +461,7 @@ async function tauriBackend() {
     revealItemInDir: (path) => opener.revealItemInDir(path),
     extractArchive: (path, dest, budget) => core.invoke("extract_archive", { path, dest, budget: budget ?? null }),
     readTableFile: (path, maxRows) => core.invoke("read_table_file", { path, maxRows: maxRows ?? null }),
+    listRepositories: (kind, token) => core.invoke("list_repositories", { kind, token }),
     readArchiveEntry: (path, entry, maxBytes) =>
       core.invoke("read_archive_entry", { path, entry, maxBytes: maxBytes ?? null }),
     aiChat: (config, messages, onEvent) => {
@@ -1759,6 +1760,7 @@ function mockBackend() {
     revealItemInDir: async () => {},
     extractArchive: async () => { throw new Error("解压需要桌面版应用。"); },
     readTableFile: async () => { throw new Error("表格视图需要桌面版应用。"); },
+    listRepositories: async () => { throw new Error("仓库列表需要桌面版应用。"); },
     readArchiveEntry: async () => { throw new Error("读取压缩包条目需要桌面版应用。"); },
     // Answer per command instead of one canned failure: a preview that reports a
     // TypeScript warning for `pytest` teaches the wrong thing about the product.
@@ -22375,7 +22377,13 @@ function _previewToolArgs(name, root) {
 
 let _previewToolRequest = null;
 
-async function _readyAiConfig() {
+/**
+ * @param {object|null} overrideConfig - use this instead of the stored config. A `@model:` chip
+ *   passes one so the routed model goes through the same membership check, custom-endpoint
+ *   resolution and gateway validation as a model chosen in the picker — routing must not become
+ *   a second, laxer path to the same place.
+ */
+async function _readyAiConfig(overrideConfig = null) {
   // Browser-preview demo: the scripted model answers locally, so there is no gateway to
   // authenticate against and no spend to authorise. Hand back a synthetic config instead
   // of the login gate. `inTauri` short-circuits _previewAgentMode(), so the desktop build
@@ -22393,7 +22401,7 @@ async function _readyAiConfig() {
   if (!(await michaelAccessGate())) return null;
   if (!MODEL_GROUPS.length) await loadBackendModels();
   await _ensureGatewayModelSelected();
-  const _rawCfg = loadConfig();
+  const _rawCfg = overrideConfig || loadConfig();
   // Apply the per-model thinking-effort — EXACTLY what the user picked in the model card
   // (no auto-adaptation). The meter just shows that chosen depth so it's visible.
   const config = _applyThinkingToConfig(_rawCfg);
@@ -22425,10 +22433,44 @@ async function _readyAiConfig() {
   return config;
 }
 
+/**
+ * A `@model:` chip scopes THIS message to that model.
+ *
+ * One message, one model — and the next message may name a different one. Splitting a single turn
+ * across several models sounds tempting but has no coherent meaning: the models would share a
+ * conversation neither of them produced, and tool results from one would arrive as another's
+ * history. Sequential messages give the same outcome with a story that holds together.
+ *
+ * Returns the requested id, or "" when the message names none.
+ */
+function _requestedModelFor(text) {
+  const match = String(text || "").match(/(?:^|\s)@model:([^\s@]+)/);
+  if (!match) return "";
+  const wanted = match[1].trim();
+  // Only a model the catalogue actually has. Typing a name that does not exist should not
+  // silently send the turn to the default and look like it worked.
+  return _modelCatalogEntry(wanted) || _customModelById(wanted) ? wanted : "";
+}
+
+/** Strip the routing token so the model is not asked to interpret its own address. */
+function _withoutModelToken(text) {
+  return String(text || "").replace(/(?:^|\s)@model:[^\s@]+\s*/, " ").replace(/\s{2,}/g, " ").trim();
+}
+
 async function sendPrompt(text, attachments = [], readyConfig = null) {
   const _taskStartedAt = Date.now();
   const config = readyConfig || await _readyAiConfig();
   if (!config) return;
+  const _routedModel = _requestedModelFor(text);
+  if (_routedModel) {
+    // Re-resolve through the same path a picker change would take, so a custom endpoint named in
+    // a chip gets its baseUrl and apiKey too rather than only its name.
+    const routed = await _readyAiConfig({ ...loadConfig(), model: _routedModel });
+    if (!routed) return;
+    Object.assign(config, routed);
+    text = _withoutModelToken(text);
+    showToast(`本轮交给 ${_modelCatalogEntry(_routedModel)?.label || _routedModel}`);
+  }
   // If THIS tab is already running, a sent message becomes a real-time STEER ("引导"):
   // inject it into the live run so the agent adapts mid-task instead of dropping it.
   // (Other tabs still run concurrently — each has its own loop.)
@@ -49821,8 +49863,27 @@ async function _populateSettingsForm() {
 async function openSettings() {
   try { await _populateSettingsForm(); } catch (_) { _setSettingsProviderMode(AI_PROVIDER_GATEWAY); }
   _initFigmaTokenField();
+  _initCodeHostTokenFields();
   if (settingsEl && !settingsEl.open) settingsEl.showModal();
   setTimeout(() => $("settingsSaveBtn")?.focus(), 0);
+}
+
+/** GitHub/GitLab tokens, stored and scoped exactly like the Figma one below. */
+let _codeHostFieldsBound = false;
+function _initCodeHostTokenFields() {
+  for (const kind of ["github", "gitlab"]) {
+    const input = $(`${kind}TokenInput`);
+    if (!input) continue;
+    try { input.value = localStorage.getItem(`michael-ide.${kind}-token`) || ""; } catch {}
+    if (_codeHostFieldsBound) continue;
+    const save = () => {
+      try { localStorage.setItem(`michael-ide.${kind}-token`, input.value.trim()); } catch {}
+      _atRepoCache[kind] = []; // a new token means the cached list is somebody else's
+    };
+    input.addEventListener("change", save);
+    input.addEventListener("blur", save);
+  }
+  _codeHostFieldsBound = true;
 }
 
 // Figma 令牌存本机 localStorage（与 AI 网关配置解耦）；供 figma 工具读取。带「测试」按钮打 /v1/me。
@@ -55740,7 +55801,7 @@ function _ceSerialize(root) {
           // space-delimited — even two chips back-to-back ([chip][chip] → " @a  @b ") or a chip
           // dropped straight after a word ("看这个[chip]" → "看这个 @rel "). Unconditional (not
           // context-dependent) so _ceSetCaret can mirror the exact length below and stay in sync.
-          out += " @" + (c.dataset.rel || "") + " ";
+          out += _chipText(c);
         }
         else if (c.tagName === "BR") out += "\n";
         else { if ((c.tagName === "DIV" || c.tagName === "P") && out && !out.endsWith("\n")) out += "\n"; walk(c); }
@@ -55783,7 +55844,7 @@ function _ceSetCaret(offset) {
           remaining -= len;
         } else if (c.nodeType === 1) {
           if (c.classList && c.classList.contains("composer-chip")) {
-            const len = (" @" + (c.dataset.rel || "") + " ").length; // matches _ceSerialize (leading+trailing space)
+            const len = _chipText(c).length; // same helper as _ceSerialize, so the two cannot drift
             if (remaining <= 0) { range.setStartBefore(c); placed = true; return; }
             if (remaining < len) { range.setStartAfter(c); placed = true; return; }
             remaining -= len;
@@ -55994,15 +56055,41 @@ async function _voiceStart(btn) {
 }
 { const _vb = document.getElementById("voiceBtn"); if (_vb) _vb.addEventListener("click", () => { if (_vb.classList.contains("is-recording")) _voiceStop(_vb); else _voiceStart(_vb); }); }
 // Build a real inline card element for an @-reference (icon + name; contenteditable=false → atomic).
-function _makeComposerChip(rel) {
-  const name = rel.split("/").filter(Boolean).pop() || rel;
-  const isDir = !/\.[a-zA-Z0-9]{1,8}$/.test(name);
+/**
+ * The text a chip contributes to the message. Both the serialiser and the caret arithmetic call
+ * this — they used to build the same string separately, and a chip kind that changed the length
+ * on one side only would put the caret in the wrong place with no visible cause.
+ *
+ * A file keeps its bare "@path" form so nothing downstream that already parses it changes. Other
+ * kinds are prefixed, which is what makes "@model:claude-opus-5" readable in the transcript and
+ * parseable on send.
+ */
+function _chipText(chip) {
+  const kind = chip?.dataset?.kind || "file";
+  const rel = chip?.dataset?.rel || "";
+  return " @" + (kind === "file" ? "" : `${kind}:`) + rel + " ";
+}
+
+function _makeComposerChip(rel, kind = "file", labelText = "") {
+  const name = labelText || rel.split("/").filter(Boolean).pop() || rel;
   const chip = document.createElement("span");
-  chip.className = "composer-chip";
+  chip.className = `composer-chip composer-chip--${kind}`;
   chip.contentEditable = "false";
   chip.dataset.rel = rel;
-  chip.title = rel;
-  chip.innerHTML = `${iconImg(isDir ? folderIconUrl(name, false) : fileIconUrl(name))}<span class="composer-chip__name">${_escHtmlLite(name)}</span>`;
+  chip.dataset.kind = kind;
+  chip.title = kind === "file" ? rel : `${kind}: ${rel}`;
+  let icon;
+  if (kind === "file") {
+    const isDir = !/\.[a-zA-Z0-9]{1,8}$/.test(name);
+    icon = iconImg(isDir ? folderIconUrl(name, false) : fileIconUrl(name));
+  } else {
+    icon = iconSvg(kind === "model" ? "i-sparkles" : "i-git", "ic--doc");
+  }
+  const nameEl = document.createElement("span");
+  nameEl.className = "composer-chip__name";
+  nameEl.textContent = name; // from a catalogue or a remote API — text, never markup
+  chip.innerHTML = icon;
+  chip.appendChild(nameEl);
   return chip;
 }
 promptEl.addEventListener("input", _cePlaceholder);
@@ -56289,7 +56376,7 @@ promptEl.addEventListener("keydown", (e) => {
 });
 
 // ---- @file mentions: type "@" in the chat to pin a workspace file into context ----
-let _atMatches = [];
+
 let _atActive = -1;
 let _atTimer = 0;
 const _atMenu = document.createElement("div");
@@ -56369,63 +56456,246 @@ function _atToken() {
   const m = /(?:^|\s)@([^\s]*)$/.exec(promptEl.value.slice(0, pos));
   return m ? { query: m[1], start: pos - m[1].length - 1, end: pos } : null;
 }
-function _hideAtMenu() { _atMenu.hidden = true; _atActive = -1; _atMatches = []; }
+function _hideAtMenu() {
+  _atMenu.hidden = true;
+  _atActive = -1;
+  _atRows = [];
+  _atMode = null; // next @ starts at the category list again
+}
 function _renderAtActive() { [..._atMenu.children].forEach((c, i) => c.classList.toggle("is-active", i === _atActive)); }
+/**
+ * `@` is a router, not a file picker.
+ *
+ * It used to open straight onto a fuzzy list of every file in the workspace, which meant the only
+ * thing you could reference was a path. The categories below are the things you actually want to
+ * point the assistant at: a model to run the task, files to read, or a repository to work in.
+ *
+ * Typing keeps working as it always did — "@src/main" still lands in Files without a detour —
+ * because a router that makes the common case slower is a worse router.
+ */
+const _AT_CATEGORIES = [
+  { id: "model", label: "模型", hint: "把这条任务交给指定模型", icon: "i-sparkles" },
+  { id: "files", label: "文件", hint: "引用目录或文件", icon: "i-file" },
+  { id: "github", label: "GitHub", hint: "连接仓库进行开发", icon: "i-git" },
+  { id: "gitlab", label: "GitLab", hint: "连接仓库进行开发", icon: "i-git" },
+];
+
+/** null = the category list; otherwise the branch being browsed. */
+let _atMode = null;
+/** What each rendered row does when picked, so the renderer and the picker cannot drift apart. */
+let _atRows = [];
+
+/**
+ * Send the user to the token field in Settings.
+ *
+ * An earlier version used window.prompt, which the project's own linter flagged as undeclared —
+ * and rightly: Tauri's WKWebView need not implement it, so the dialog could return null with no
+ * sign anything happened. The field sits beside the Figma one instead, sharing its storage and
+ * its promise: the token stays on this machine and goes straight to the provider, never through
+ * our gateway.
+ */
+function _openIntegrationSettings(kind) {
+  openSettings();
+  setTimeout(() => {
+    const input = $(`${kind}TokenInput`);
+    if (input) { input.focus(); input.select?.(); }
+  }, 120);
+}
+
+function _atIntegrationToken(kind) {
+  try { return (localStorage.getItem(`michael-ide.${kind}-token`) || "").trim(); } catch { return ""; }
+}
+
+/** Rows for the category list, filtered by whatever has been typed after the @. */
+function _atCategoryRows(query) {
+  const q = String(query || "").toLowerCase();
+  return _AT_CATEGORIES
+    .filter((c) => !q || c.id.includes(q) || c.label.toLowerCase().includes(q))
+    .map((c) => ({
+      kind: "category",
+      icon: c.icon,
+      name: c.label,
+      detail: c.hint,
+      onPick: () => { _atMode = c.id; _renderAtMenu(); },
+    }));
+}
+
+function _atModelRows(query) {
+  const q = String(query || "").toLowerCase();
+  const rows = [];
+  for (const group of MODEL_GROUPS || []) {
+    for (const model of group.models || []) {
+      const id = String(model?.id || "");
+      const label = String(model?.label || model?.name || id);
+      if (!id) continue;
+      if (q && !id.toLowerCase().includes(q) && !label.toLowerCase().includes(q)) continue;
+      rows.push({
+        kind: "model",
+        icon: "i-sparkles",
+        name: label,
+        detail: group?.label ? `${group.label} · ${id}` : id,
+        onPick: () => _insertAtChip({ kind: "model", value: id, label }),
+      });
+    }
+  }
+  return rows.slice(0, 20);
+}
+
+/**
+ * Repositories for a linked account. Without a token there is exactly one row — the one that
+ * links it — rather than an empty list, because "nothing here" and "you have not connected this"
+ * look identical and mean opposite things.
+ */
+function _atRepoRows(kind, query) {
+  const token = _atIntegrationToken(kind);
+  if (!token) {
+    return [{
+      kind: "connect",
+      icon: "i-git",
+      name: `连接 ${kind === "github" ? "GitHub" : "GitLab"} 账号`,
+      detail: "填入访问令牌后可直接选择仓库",
+      onPick: () => { _hideAtMenu(); _openIntegrationSettings(kind); },
+    }];
+  }
+  const q = String(query || "").toLowerCase();
+  const cached = _atRepoCache[kind] || [];
+  const rows = cached
+    .filter((r) => !q || r.full_name.toLowerCase().includes(q))
+    .slice(0, 20)
+    .map((r) => ({
+      kind: "repo",
+      icon: "i-git",
+      name: r.full_name,
+      detail: r.private ? "私有仓库" : "公开仓库",
+      onPick: () => _insertAtChip({ kind, value: r.full_name, label: r.full_name }),
+    }));
+  if (rows.length) return rows;
+  return [{
+    kind: "hint",
+    icon: "i-git",
+    name: cached.length ? "没有匹配的仓库" : "正在读取仓库列表…",
+    detail: "",
+    onPick: () => {},
+  }];
+}
+
+const _atRepoCache = { github: [], gitlab: [] };
+
+/** Fetch the account's repositories once per menu opening. */
+async function _atLoadRepos(kind) {
+  const token = _atIntegrationToken(kind);
+  if (!token || _atRepoCache[kind].length) return;
+  try {
+    const repos = await backend.listRepositories(kind, token);
+    _atRepoCache[kind] = Array.isArray(repos) ? repos : [];
+  } catch {
+    _atRepoCache[kind] = [];
+  }
+  if (_atMode === kind) _renderAtMenu();
+}
+
 function _updateAtMenu() {
   const tok = _atToken();
-  const root = rootPath || workspaceRoots[0] || "";
-  if (!tok || !root) return _hideAtMenu();
+  if (!tok) return _hideAtMenu();
   clearTimeout(_atTimer);
-  _atTimer = setTimeout(async () => {
-    const t2 = _atToken();
-    if (!t2) return _hideAtMenu();
-    let files;
-    try { files = await _ensureFileIndex(); } catch { return _hideAtMenu(); }
-    if (!files || !files.length) return _hideAtMenu();
-    const q = (t2.query || "").toLowerCase();
-    let matches;
-    if (!q) {
-      // No query yet → most useful default: open files first, then a few others.
-      const open = _openFilesRel(root);
-      const seen = new Set(open);
-      matches = [...open, ...files.filter((f) => !seen.has(f)).slice(0, 12)].slice(0, 15);
-    } else {
-      const openSet = new Set(_openFilesRel(root));
-      matches = files
-        .map((f) => ({ f, s: _fuzzyScore(q, f) + (openSet.has(f) ? 60 : 0) }))
-        .filter((x) => x.s > -1)
-        .sort((a, b) => b.s - a.s)
-        .slice(0, 15)
-        .map((x) => x.f);
-    }
-    if (!matches.length) return _hideAtMenu();
-    _atMatches = matches;
-    _atMenu.innerHTML = "";
-    matches.forEach((f, i) => {
-      const item = document.createElement("div");
-      item.className = "atmenu__item" + (i === 0 ? " is-active" : "");
-      const isDir = f.endsWith("/");
-      const clean = isDir ? f.slice(0, -1) : f;
-      const slash = clean.lastIndexOf("/");
-      const baseName = slash >= 0 ? clean.slice(slash + 1) : clean;
-      const dir = slash >= 0 ? clean.slice(0, slash) : "";
-      const ico = isDir ? folderIconUrl(baseName, false) : fileIconUrl(baseName);
-      item.innerHTML = `${iconImg(ico)}<span class="at-name">${_escHtml(baseName)}${isDir ? "/" : ""}</span>` + (dir ? `<span class="at-dir">${_escHtml(dir)}</span>` : "");
-      item.addEventListener("mousedown", (ev) => { ev.preventDefault(); _pickAt(i); });
-      _atMenu.appendChild(item);
-    });
-    _atActive = 0;
-    const r = promptEl.getBoundingClientRect();
-    _atMenu.style.left = r.left + "px";
-    _atMenu.style.width = Math.min(r.width, 520) + "px";
-    _atMenu.style.bottom = window.innerHeight - r.top + 6 + "px";
-    _atMenu.hidden = false;
-  }, 90);
+  _atTimer = setTimeout(() => { if (_atToken()) _renderAtMenu(); else _hideAtMenu(); }, 90);
 }
-function _pickAt(i) {
+
+/** Rows for whichever branch is open, then paint them. */
+async function _renderAtMenu() {
   const tok = _atToken();
-  if (!tok || !_atMatches[i]) return _hideAtMenu();
-  const rel = _atMatches[i].replace(/\/$/, "");
+  if (!tok) return _hideAtMenu();
+  const query = tok.query || "";
+
+  let rows;
+  if (_atMode === "model") rows = _atModelRows(query);
+  else if (_atMode === "github" || _atMode === "gitlab") {
+    rows = _atRepoRows(_atMode, query);
+    _atLoadRepos(_atMode);
+  } else if (_atMode === "files") rows = await _atFileRows(query);
+  else {
+    // No branch chosen yet. A query that looks like a path goes straight to Files — the router
+    // must not add a step to the thing people do most.
+    const categories = _atCategoryRows(query);
+    rows = query && (query.includes("/") || query.includes(".") || !categories.length)
+      ? await _atFileRows(query)
+      : categories;
+  }
+
+  if (!rows.length) return _hideAtMenu();
+  _atRows = rows;
+  _atMenu.innerHTML = "";
+  rows.forEach((row, i) => {
+    const item = document.createElement("div");
+    item.className = "atmenu__item" + (i === 0 ? " is-active" : "");
+    const icon = row.iconUrl ? iconImg(row.iconUrl) : iconSvg(row.icon || "i-file", "ic--doc");
+    item.innerHTML = `${icon}<span class="at-name"></span>` + (row.detail ? `<span class="at-dir"></span>` : "");
+    // textContent: names come from disk, from a model catalogue, and from a remote API.
+    item.querySelector(".at-name").textContent = row.name;
+    if (row.detail) item.querySelector(".at-dir").textContent = row.detail;
+    item.addEventListener("mousedown", (ev) => { ev.preventDefault(); _pickAt(i); });
+    _atMenu.appendChild(item);
+  });
+  _atActive = 0;
+  const r = promptEl.getBoundingClientRect();
+  _atMenu.style.left = r.left + "px";
+  _atMenu.style.width = Math.min(r.width, 520) + "px";
+  _atMenu.style.bottom = window.innerHeight - r.top + 6 + "px";
+  _atMenu.hidden = false;
+}
+
+/** The original file picker, unchanged in behaviour — it is now one branch of the router. */
+async function _atFileRows(query) {
+  const root = rootPath || workspaceRoots[0] || "";
+  if (!root) return [];
+  let files;
+  try { files = await _ensureFileIndex(); } catch { return []; }
+  if (!files || !files.length) return [];
+  const q = String(query || "").toLowerCase();
+  let matches;
+  if (!q) {
+    const open = _openFilesRel(root);
+    const seen = new Set(open);
+    matches = [...open, ...files.filter((f) => !seen.has(f)).slice(0, 12)].slice(0, 15);
+  } else {
+    const openSet = new Set(_openFilesRel(root));
+    matches = files
+      .map((f) => ({ f, s: _fuzzyScore(q, f) + (openSet.has(f) ? 60 : 0) }))
+      .filter((x) => x.s > -1)
+      .sort((a, b) => b.s - a.s)
+      .slice(0, 15)
+      .map((x) => x.f);
+  }
+  return matches.map((f) => {
+    const isDir = f.endsWith("/");
+    const clean = isDir ? f.slice(0, -1) : f;
+    const slash = clean.lastIndexOf("/");
+    const baseName = slash >= 0 ? clean.slice(slash + 1) : clean;
+    return {
+      kind: "file",
+      iconUrl: isDir ? folderIconUrl(baseName, false) : fileIconUrl(baseName),
+      name: baseName + (isDir ? "/" : ""),
+      detail: slash >= 0 ? clean.slice(0, slash) : "",
+      onPick: () => _insertAtChip({ kind: "file", value: clean, label: baseName }),
+    };
+  });
+}
+
+function _pickAt(i) {
+  const row = _atRows[i];
+  if (!row) return _hideAtMenu();
+  // Categories navigate; everything else inserts. Keeping the behaviour on the row means the
+  // renderer and the picker cannot disagree about what row 3 is.
+  row.onPick();
+}
+
+/**
+ * Replace the `@…` token with a chip. The chip carries what it is, so the send path can read the
+ * model off the message rather than re-parsing prose.
+ */
+function _insertAtChip({ kind, value, label }) {
+  const tok = _atToken();
+  if (!tok) return _hideAtMenu();
   try {
     const sel = window.getSelection();
     _ceSetCaret(tok.start);
@@ -56437,7 +56707,7 @@ function _pickAt(i) {
     range.setStart(sc, so);
     range.setEnd(b.startContainer, b.startOffset);
     range.deleteContents();
-    const chip = _makeComposerChip(rel);
+    const chip = _makeComposerChip(value, kind, label);
     range.insertNode(chip);
     let pad = chip.nextSibling;
     if (!pad || pad.nodeType !== 3) {
@@ -56449,20 +56719,32 @@ function _pickAt(i) {
     after.collapse(true);
     sel.removeAllRanges(); sel.addRange(after);
   } catch {
+    const prefix = kind === "file" ? "" : `${kind}:`;
     const v = promptEl.value;
-    promptEl.value = v.slice(0, tok.start) + "@" + rel + " " + v.slice(tok.end);
-    promptEl.setSelectionRange(tok.start + rel.length + 2);
+    promptEl.value = `${v.slice(0, tok.start)}@${prefix}${value} ${v.slice(tok.end)}`;
   }
   _hideAtMenu();
   promptEl.focus();
   promptEl.dispatchEvent(new Event("input", { bubbles: true }));
 }
+
 promptEl.addEventListener("keydown", (e) => {
   if (_atMenu.hidden) return;
-  if (e.key === "ArrowDown") { e.preventDefault(); _atActive = Math.min(_atActive + 1, _atMatches.length - 1); _renderAtActive(); }
+  if (e.key === "ArrowDown") { e.preventDefault(); _atActive = Math.min(_atActive + 1, _atRows.length - 1); _renderAtActive(); }
   else if (e.key === "ArrowUp") { e.preventDefault(); _atActive = Math.max(_atActive - 1, 0); _renderAtActive(); }
   else if (e.key === "Enter" || e.key === "Tab") { e.preventDefault(); e.stopPropagation(); _pickAt(_atActive); }
-  else if (e.key === "Escape") { e.preventDefault(); _hideAtMenu(); }
+  else if (e.key === "Escape") {
+    e.preventDefault();
+    // Escape inside a branch goes back to the categories; only from the top does it close. A
+    // wrong turn should cost one key, not a retype of the whole token.
+    if (_atMode) { _atMode = null; _renderAtMenu(); } else _hideAtMenu();
+  }
+  else if (e.key === "Backspace" && _atMode && !(_atToken()?.query)) {
+    // Backspacing past an empty query also steps back out, the way a path breadcrumb would.
+    e.preventDefault();
+    _atMode = null;
+    _renderAtMenu();
+  }
 });
 promptEl.addEventListener("blur", () => setTimeout(_hideAtMenu, 150));
 // Preload the file index when the composer is focused, so the first "@" is instant.

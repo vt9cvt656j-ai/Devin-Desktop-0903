@@ -7012,10 +7012,12 @@ test("_sharedCtxDigest renders the shared run-context a sub-agent reads (真上�
 });
 
 test("_ceSerialize renders composer chips as space-delimited @refs so MULTIPLE drops all parse", () => {
-  const f = load("_ceSerialize");
+  // _chipText is shared with the caret arithmetic so the two cannot drift; inject the real one
+  // rather than a stand-in, or this stops testing what ships.
+  const f = load("_ceSerialize", { _chipText: load("_chipText") });
   // Fake the minimal DOM the walker touches: text nodes, chip elements, a plain element.
   const T = (v) => ({ nodeType: 3, nodeValue: v });
-  const CHIP = (rel) => ({ nodeType: 1, classList: { contains: (c) => c === "composer-chip" }, dataset: { rel } });
+  const CHIP = (rel, kind = "file") => ({ nodeType: 1, classList: { contains: (c) => c === "composer-chip" }, dataset: { rel, kind } });
   const ROOT = (...kids) => ({ childNodes: kids });
   // The send-path mention regex (must stay identical to main.js line ~8057).
   const refs = (s) => [...s.matchAll(/(?:^|\s)@([^\s]+)/g)].map((m) => m[1]);
@@ -21796,4 +21798,14 @@ test("typed literals are exempt from the auto-localizer", () => {
   const I18N = readFileSync(join(HERE, "../src/i18n.js"), "utf8");
   assert.match(I18N, /"\[data-i18n-skip\]"/,
     "i18n.js must keep [data-i18n-skip] in AUTO_I18N_SKIP_SELECTOR");
+});
+
+test("a model chip serialises with its prefix and a file chip does not", () => {
+  // The file form is load-bearing: the send path's mention regex already parses bare "@path", so
+  // adding a prefix there would silently break every existing file reference.
+  const chipText = load("_chipText");
+  assert.equal(chipText({ dataset: { rel: "src/main.js", kind: "file" } }), " @src/main.js ");
+  assert.equal(chipText({ dataset: { rel: "src/main.js" } }), " @src/main.js ", "kind defaults to file");
+  assert.equal(chipText({ dataset: { rel: "claude-opus-5", kind: "model" } }), " @model:claude-opus-5 ");
+  assert.equal(chipText({ dataset: { rel: "owner/repo", kind: "github" } }), " @github:owner/repo ");
 });
