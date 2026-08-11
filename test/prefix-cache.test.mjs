@@ -495,3 +495,37 @@ test("the profile card shows the account's real avatar when it has one", () => {
     "an avatar is usually third-party hosted; do not leak where it is being rendered");
   assert.match(SRC, /\.pf-av--img\{object-fit:cover/, "and it must not stretch");
 });
+
+test("the account card shows the name when there is one, the email when there is not", () => {
+  const fn = SRC.slice(SRC.indexOf("const displayName = [u.first_name"), SRC.indexOf("const pct = (a, b)"));
+  const pick = new Function(`const u = arguments[0];
+    ${fn.replace(/const av = .*/s, "")} return { identity };`);
+  assert.equal(pick({ first_name: "Michael", last_name: "Chen", email: "a@b.com" }).identity, "Michael Chen");
+  assert.equal(pick({ first_name: "Michael", last_name: "", email: "a@b.com" }).identity, "Michael");
+  // Whitespace-only names are not names — an account with " " set must still show its email.
+  assert.equal(pick({ first_name: " ", last_name: "", email: "a@b.com" }).identity, "a@b.com");
+  assert.equal(pick({ email: "3266986273@qq.com" }).identity, "3266986273@qq.com");
+
+  // The email stays reachable on hover rather than being lost when a name exists.
+  assert.match(SRC, /<div title="\$\{esc2\(u\.email \|\| ""\)\}"/);
+  // And the initial follows the identity, or a named account shows the letter of its address.
+  assert.match(SRC, /const av = \(identity \|\| "\?"\)\.slice\(0, 1\)\.toUpperCase\(\);/);
+});
+
+test("the account avatar matches the dashboard's, rule and appearance", () => {
+  // The console renders <AvatarImage src={avatar}> with a fallback of
+  // (name || email || "?").charAt(0).toUpperCase() on a flat primary fill. The app must be the
+  // same account rendered the same way — a gradient here and a flat fill there is the same
+  // person looking like two different avatars depending on which surface you opened.
+  const SHELL = fs.readFileSync("../server/account-ui/src/components/Shell.tsx", "utf8");
+  assert.match(SHELL, /\(name \|\| email \|\| "\?"\)\.charAt\(0\)\.toUpperCase\(\)/,
+    "this test is only meaningful while the console still uses that rule");
+  assert.match(SRC, /const av = \(identity \|\| "\?"\)\.slice\(0, 1\)\.toUpperCase\(\);/,
+    "the app must use the same rule");
+  assert.match(SRC, /const identity = displayName \|\| u\.email \|\| "";/,
+    "and the same precedence: name, then email");
+  // Flat fill, no gradient, no shadow.
+  assert.match(SRC, /\.pf-av\{[^}]*background:#1a73e8;/);
+  assert.doesNotMatch(SRC.slice(SRC.indexOf('".pf-av{'), SRC.indexOf('".pf-av{') + 260), /linear-gradient|box-shadow/,
+    "the card must not invent its own avatar styling");
+});
