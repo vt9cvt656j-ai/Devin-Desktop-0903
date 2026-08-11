@@ -4578,6 +4578,13 @@ function _isPlainHexInspection(info) {
   return true;
 }
 
+/// An archive gets the archive window, not the generic file report. The hex panel reached the
+/// same conclusion earlier and dropped its own header: for a file whose whole point is what is
+/// inside it, MIME type and a read-only flag are noise in front of the answer.
+function _isArchiveInspection(info) {
+  return !!(info?.archive?.entries?.length || info?.archive?.note);
+}
+
 function _isDatabaseInspection(info) {
   const kind = String(info?.kind || "").toLowerCase();
   return kind === "sqlite_database" || kind === "database_file" || !!info?.sqlite;
@@ -4655,21 +4662,29 @@ function _showArchiveEntryPreview(name, content) {
   document.body.appendChild(wrap);
 }
 
-function _inspectionArchiveHtml(archive) {
-  // Just a host now — the browser itself is a React island (src/ui/archive-browser.jsx), mounted
-  // after this markup lands. The flat table this replaced listed every entry in the archive at
-  // once, full path on each row, which for a real build artefact meant 1,652 undifferentiated
-  // lines and no way to see the shape of what was inside.
-  if (!archive?.entries?.length && !archive?.note) return "";
-  return `<section class="file-inspector__section"><div data-archive-browser-host></div></section>`;
+/** The archive window: title, toolbar, address bar, list, status bar — and nothing else. */
+function _renderArchiveInspection(path, info, error = "") {
+  if (!_fileInspectionPreviewEl) return;
+  _fileInspectionPreviewEl.className = "file-inspector file-inspector--archive";
+  _fileInspectionPreviewEl.innerHTML = `
+    <div class="file-inspector__shell file-inspector__shell--archive">
+      ${error ? `<div class="hex-editor__error">读取失败：${_escHtml(error)}</div>` : ""}
+      <div data-archive-browser-host></div>
+    </div>`;
+  _fileInspectionPreviewEl.hidden = false;
+  _mountArchiveBrowser(path, info.archive, { name: info?.name || basename(path), size: info?.size });
 }
 
 /** Mount the archive browser into whatever host the last render produced. */
-function _mountArchiveBrowser(path, archive) {
+function _mountArchiveBrowser(path, archive, file = null) {
   const host = _fileInspectionPreviewEl?.querySelector("[data-archive-browser-host]");
   if (!host || !archive) return;
   mountArchiveBrowser(host, {
     archive,
+    file,
+    onReveal: async () => {
+      try { await backend.revealItemInDir(path); } catch (e) { showToast(String(e?.message || e || "无法在系统中显示")); }
+    },
     onOpenEntry: async (name) => {
       try {
         const content = await backend.readArchiveEntry(path, name, 256 * 1024);
@@ -5204,6 +5219,10 @@ function _inspectionStructuredHtml(info) {
 
 function _renderFileInspection(path, info, reason = "", error = "") {
   if (!_fileInspectionPreviewEl) return;
+  if (info && _isArchiveInspection(info)) {
+    _renderArchiveInspection(path, info, error);
+    return;
+  }
   if (info && _isDatabaseInspection(info)) {
     _renderDatabaseEditorInspection(path, info, reason, error);
     return;
@@ -5247,7 +5266,6 @@ function _renderFileInspection(path, info, reason = "", error = "") {
         ${summary.length ? `<div class="file-inspector__summary">${summary.map((item) => `<span>${_escHtml(item)}</span>`).join("")}</div>` : ""}
         ${_inspectionTrainedDataHtml(info.traineddata)}
         ${_inspectionStructuredHtml(info)}
-        ${_inspectionArchiveHtml(info.archive)}
         ${info.text_preview ? `
           <section class="file-inspector__section">
             <h4>文本预览</h4>
@@ -5261,7 +5279,6 @@ function _renderFileInspection(path, info, reason = "", error = "") {
       ` : ""}
     </div>`;
   _fileInspectionPreviewEl.hidden = false;
-  if (info?.archive) _mountArchiveBrowser(path, info.archive);
 }
 
 function _renderDatabaseEditorInspection(path, info, reason = "", error = "") {

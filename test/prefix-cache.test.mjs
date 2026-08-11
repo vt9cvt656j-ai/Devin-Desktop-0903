@@ -153,12 +153,17 @@ test("archive handling is reachable from the UI, not just implemented in the bac
   // instead of saying the desktop app is required.
   assert.match(SRC, /extractArchive: async \(\) => \{ throw new Error\("解压需要桌面版应用。"\); \}/);
 
-  // The panel is a React island now; the host and the mount are what make it reachable.
+  // An archive gets its own full panel, routed like the database and hex editors — not a section
+  // appended below a generic file report of MIME type, read-only flag and fact cards.
+  assert.match(SRC, /function _isArchiveInspection\(info\)/, "archives need their own classifier");
+  assert.match(SRC, /if \(info && _isArchiveInspection\(info\)\) \{\s*_renderArchiveInspection/,
+    "and must be routed to their own renderer before the generic path");
+  assert.match(SRC, /_fileInspectionPreviewEl\.className = "file-inspector file-inspector--archive"/);
   assert.match(SRC, /data-archive-browser-host/, "the panel needs a host to mount into");
   assert.match(SRC, /mountArchiveBrowser\(host, \{/, "and something has to mount it");
-  assert.match(SRC, /if \(info\?\.archive\) _mountArchiveBrowser\(path, info\.archive\);/,
-    "mounted after each render — the inspector rebuilds its body with innerHTML, so the previous " +
-    "host is gone every time");
+  // The generic renderer must not also emit an archive section, or it comes back as a second copy.
+  assert.equal((SRC.match(/_inspectionArchiveHtml/g) || []).length, 0,
+    "the old inline archive section must be gone, not merely unused");
 
   // Archive content is untrusted input; it is rendered as text, never as markup.
   const preview = SRC.slice(SRC.indexOf("function _showArchiveEntryPreview"), SRC.indexOf("function _inspectionArchiveHtml"));
