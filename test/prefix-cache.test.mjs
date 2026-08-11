@@ -244,8 +244,9 @@ test("a long filename does not take over the tab strip or the title bar", () => 
   assert.match(tab, /flex: 0 0 auto;/, "tabs must not shrink; the strip scrolls instead");
   assert.doesNotMatch(tab.slice(0, tab.indexOf(".tab .label")), /min-width: 0;/,
     "min-width:0 on the tab itself collapses every label");
-  assert.match(APP_CSS, /\.tab \.label,\s*\.row \.name \{[^}]*text-overflow: ellipsis;/s,
-    "the label keeps a CSS backstop for anything the character budget did not catch");
+  // No ellipsis anywhere on the tab label — the overflow fades instead.
+  assert.doesNotMatch(APP_CSS.slice(APP_CSS.indexOf("\n.tab .label {")).slice(0, 400),
+    /text-overflow: ellipsis;/, "the tab label must not ellipsise");
   assert.match(tab, /\.tab > \.ic,\s*\.tab > \.x \{ flex: none; \}/,
     "only the label may shrink — a close button that moves as you switch files is worse");
   assert.match(SRC, /tab\.title = f\.name;/, "a truncated label needs the full name on hover");
@@ -262,42 +263,33 @@ test("a long filename does not take over the tab strip or the title bar", () => 
   assert.equal(ellipsize("main.js"), "main.js", "short names are left alone");
 });
 
-test("a truncated filename still shows its extension, as one name", () => {
-  // text-overflow can only clip the tail, and the tail is the extension — so a tab reading
-  // 庄子视频处理系统V5.0-T… says nothing about what the file is. An earlier fix put the stem and
-  // extension in separate spans; that kept the extension but rendered a gap between the boxes,
-  // "庄子视频处理系... .sha256", which reads as two truncations. One text node cannot gap.
-  const ctx = SRC.match(/function _splitFileName[\s\S]*?\n}/)[0] + SRC.match(/function _fillFileLabel[\s\S]*?\n}/)[0];
-  const label = new Function(`${ctx}; return (n, b) => { const el = {}; _fillFileLabel(el, n, b); return el; };`)();
-
-  const long = label("庄子视频处理系统V5.0-TS长视频版-Windows-x64-最新版-20260722.zip", 24);
-  assert.ok(long.textContent.endsWith(".zip"), "the extension must survive");
-  assert.equal((long.textContent.match(/…/g) || []).length, 1, "exactly one ellipsis, in the middle");
-  assert.ok(long.textContent.length <= 26);
-  assert.equal(long.title, "庄子视频处理系统V5.0-TS长视频版-Windows-x64-最新版-20260722.zip",
-    "the full name stays reachable on hover");
-
-  // A double extension keeps the real one.
-  assert.ok(label("庄子视频处理系统V5.0-TS长视频版-Windows-x64-最新版-20260722.zip.sha256", 24)
-    .textContent.endsWith(".sha256"));
-
-  // Short names are left exactly alone — no ellipsis where none is needed.
-  for (const n of ["测试用.mp4", "headers0.bin", "V4-Setup.exe", ".mcp.local.json", "Makefile"]) {
-    assert.equal(label(n, 24).textContent, n, `${n} should not be shortened`);
-  }
-
-  // Dotfile edges.
-  const split = new Function(`${SRC.match(/function _splitFileName[\s\S]*?\n}/)[0]}; return _splitFileName;`)();
-  assert.deepEqual(split(".gitignore"), [".gitignore", ""], "a leading dot is the name, not a type");
-  assert.deepEqual(split(".mcp.local.json"), [".mcp.local", ".json"]);
-  assert.deepEqual(split("Makefile"), ["Makefile", ""]);
-
-  assert.match(SRC, /_fillFileLabel\(tab\.querySelector\("\.label"\), f\.name, 24\)/);
-  assert.match(SRC, /_fillFileLabel\(row\.querySelector\("\.name"\), item\.name, 28\)/);
-
-  // Filenames come off disk; they go in as text. Assignments only — the function's own comment
-  // says "markup", and grepping prose checks documentation instead of code.
-  const fill = SRC.slice(SRC.indexOf("function _fillFileLabel"), SRC.indexOf("function _ellipsizeMiddle"));
-  assert.match(fill, /el\.textContent = shortStem \+ ext;/);
+test("a long tab name fades out rather than being cut with an ellipsis", () => {
+  // Three attempts cut characters to fit a width: end-ellipsis ate the extension, middle-ellipsis
+  // made the name unreadable, and a separate extension span left a gap between two boxes. All
+  // three replaced real characters with dots. The label now holds the whole name and the overflow
+  // is faded, so everything visible is true.
+  const fill = SRC.slice(SRC.indexOf("function _fillFileLabel"), SRC.indexOf("function _markClippedTabs"));
+  assert.match(fill, /el\.textContent = String\(name \|\| ""\);/, "the whole name goes in");
+  assert.doesNotMatch(fill, /…|slice\(/, "nothing may be removed from the string");
+  assert.match(fill, /el\.title = String\(name \|\| ""\);/);
   assert.doesNotMatch(fill, /\.innerHTML\s*=/);
+
+  // No ellipsis on the tab label, and a fade in its place.
+  // Slice forward from the rule: ".row .name {" also appears earlier in the file, so searching
+  // from the start finds the wrong end and the slice comes out backwards.
+  const labelStart = APP_CSS.indexOf("\n.tab .label {");
+  const tabLabel = APP_CSS.slice(labelStart, APP_CSS.indexOf(".row .name {", labelStart));
+  assert.doesNotMatch(tabLabel, /text-overflow: ellipsis;/, "the tab label must not ellipsise");
+  assert.match(tabLabel, /mask-image: linear-gradient\(to right/, "it fades instead");
+  assert.match(tabLabel, /-webkit-mask-image:/, "WKWebView needs the prefixed property");
+
+  // The fade is conditional: applied to every label it would soften names that fit.
+  assert.match(APP_CSS, /\.tab \.label\.is-clipped \{/);
+  assert.match(SRC, /label\.classList\.toggle\("is-clipped", label\.scrollWidth > label\.clientWidth \+ 1\)/,
+    "overflow cannot be detected in CSS, so it is measured");
+  assert.match(SRC, /_markClippedTabs\(\);/, "and measured after the strip is built");
+
+  // The tree keeps whole names — it is resizable, so its width is the user's to set.
+  assert.match(SRC, /row\.querySelector\("\.name"\)\.textContent = item\.name;/,
+    "the tree renders the full name, unshortened");
 });

@@ -1053,12 +1053,24 @@ body.is-tauri.is-mac.is-fullscreen .titlebar {
    the close target moves as you switch files. */
 .tab > .ic,
 .tab > .x { flex: none; }
-/* The name arrives already shortened in the middle (_fillFileLabel), so the extension is part of
-   the same text node and cannot be clipped away. This is the backstop for the case the budget did
-   not catch — and it stays a single box, because splitting the stem and extension into two
-   elements put a visible gap between them: "庄子视频处理系... .sha256" reads as two truncations
-   rather than one shortened name. */
-.tab .label,
+/* No ellipsis. The label holds the complete filename and the overflow is faded out instead —
+   the technique Safari and Chrome use on tab titles. Three earlier attempts all cut characters to
+   fit: end-ellipsis ate the extension, middle-ellipsis made the name unreadable, and a separate
+   extension span left a visible gap. A fade removes nothing; it just stops being opaque, so what
+   you can read is true and the rest is plainly continued rather than replaced by dots.
+
+   .is-clipped is set by _markClippedTabs only when the text actually overflows, because the mask
+   would otherwise soften the tail of short names that fit perfectly well. */
+.tab .label {
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+}
+.tab .label.is-clipped {
+  -webkit-mask-image: linear-gradient(to right, #000 calc(100% - 26px), transparent 100%);
+  mask-image: linear-gradient(to right, #000 calc(100% - 26px), transparent 100%);
+}
+/* The tree keeps whole names — it is resizable, so the width is the user's to set. */
 .row .name {
   min-width: 0;
   overflow: hidden;

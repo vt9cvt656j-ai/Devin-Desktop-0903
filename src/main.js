@@ -8252,7 +8252,7 @@ function renderTabs() {
     tab.innerHTML =
       `${iconImg(fileIconUrl(f.name))}<span class="label"></span>` +
       `<span class="x" title="Close"><span class="dot"></span><svg class="ic"><use href="#i-close" /></svg></span>`;
-    _fillFileLabel(tab.querySelector(".label"), f.name, 24);
+    _fillFileLabel(tab.querySelector(".label"), f.name);
     // The label is capped at 220px and ellipsised, so the full name has to be reachable somehow.
     tab.title = f.name;
     // 用户亲手点开 = 认领这个 tab，之后不再自动回收（activate 本身不能挂钩子——
@@ -8298,6 +8298,7 @@ function renderTabs() {
     });
     tabsEl.appendChild(tab);
   }
+  _markClippedTabs();
 }
 
 // 文件页签条：纵向滚轮 → 横向滚动（VS Code 同款）。.tabs 是 overflow-x 容器且隐藏了
@@ -10055,7 +10056,7 @@ async function renderChildren(path, container) {
     } else {
       row.innerHTML = `<span class="chev-spacer"></span>${iconImg(fileIconUrl(item.name))}<span class="name"></span>`;
     }
-    _fillFileLabel(row.querySelector(".name"), item.name, 28);
+    row.querySelector(".name").textContent = item.name;
     row.addEventListener("contextmenu", (e) => {
       e.preventDefault();
       e.stopPropagation();
@@ -16168,22 +16169,31 @@ function _splitFileName(name) {
 }
 
 /**
- * Fill an element with a filename, shortened in the middle so the extension survives.
+ * Put the whole filename in the element. Nothing is removed from the string.
  *
- * The previous version put the stem and the extension in separate spans and let CSS ellipsise the
- * stem. That kept the extension, but the two boxes rendered with a gap between them —
- * "庄子视频处理系... .sha256" — which reads as two truncations rather than one shortened name.
- * A single text node cannot have a gap: one ellipsis, in the middle, and the name stays one thing.
+ * Two earlier attempts cut the text — end-ellipsis ate the extension, middle-ellipsis made the
+ * name unreadable, and splitting stem from extension left a gap between two boxes. All three
+ * shared the same flaw: they destroyed characters to fit a width. The name is now complete and
+ * the overflow is handled visually, by fading the tail (see _markClippedTabs) — no ellipsis
+ * anywhere, and the text under the fade is real text rather than a lie about the name.
  */
-function _fillFileLabel(el, name, budget = 26) {
+function _fillFileLabel(el, name) {
   if (!el) return;
-  const [stem, ext] = _splitFileName(name);
-  const room = Math.max(6, budget - ext.length);
-  const shortStem = stem.length > room
-    ? `${stem.slice(0, Math.ceil((room - 1) / 2))}…${stem.slice(stem.length - Math.floor((room - 1) / 2))}`
-    : stem;
-  el.textContent = shortStem + ext; // textContent, not markup: this is a filename off disk
-  el.title = name;
+  el.textContent = String(name || ""); // textContent, not markup: a filename off disk
+  el.title = String(name || "");
+}
+
+/**
+ * Mark the labels that overflow, so CSS can fade their tail instead of clipping it hard.
+ *
+ * Overflow cannot be detected in CSS, so it is measured once per render. Tabs have a fixed
+ * ceiling and never reflow with the window, so a name's clipped state depends only on the name
+ * and does not need re-measuring.
+ */
+function _markClippedTabs() {
+  for (const label of tabsEl.querySelectorAll(".tab .label")) {
+    label.classList.toggle("is-clipped", label.scrollWidth > label.clientWidth + 1);
+  }
 }
 
 function _ellipsizeMiddle(text, max = 44) {
