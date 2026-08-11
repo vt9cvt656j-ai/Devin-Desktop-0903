@@ -464,3 +464,23 @@ test("the @ menu is exempt from the runtime translator", () => {
   assert.ok(I18N.includes('"[data-i18n-skip]"'),
     "and i18n.js must still honour that attribute — the opt-out is only as good as the selector");
 });
+
+test("each model in the @ menu wears its own vendor mark", () => {
+  // Every row shared one generic glyph, so a list of Claude and GPT models looked identical.
+  const brandOf = new Function(`${SRC.match(/function brandOf[\s\S]*?\n}/)[0]}; return brandOf;`)();
+  assert.equal(brandOf("claude-opus-5").sym, "i-brand-anthropic");
+  assert.equal(brandOf("gpt-5.5").sym, "i-brand-openai");
+  assert.equal(brandOf("deepseek-v3").sym, "i-brand-deepseek");
+
+  // It must be brandOf, not a second map: the picker already uses it, and a local copy would
+  // drift the first time a vendor is added — one glyph in the picker, another in the menu.
+  const rows = SRC.slice(SRC.indexOf("function _atModelRows"), SRC.indexOf("async function _atRepoRows") >= 0 ? SRC.indexOf("async function _atRepoRows") : SRC.indexOf("function _atRepoRows"));
+  assert.match(rows, /const brand = brandOf\(id\);/, "model rows resolve the brand");
+  assert.match(rows, /icon: brand\.sym/);
+  assert.doesNotMatch(rows, /icon: "i-sparkle"/, "no hard-coded fallback glyph");
+
+  // The brand class has to survive to the renderer, or every mark paints the same grey.
+  assert.match(SRC, /iconSvg\(row\.icon \|\| "i-file", row\.iconClass \|\| "ic--doc"\)/);
+  // And the chip keeps the mark after selection.
+  assert.match(SRC, /iconSvg\(brandOf\(rel\)\.sym, brandOf\(rel\)\.cls\)/);
+});

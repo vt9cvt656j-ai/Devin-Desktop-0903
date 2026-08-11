@@ -56087,7 +56087,9 @@ function _makeComposerChip(rel, kind = "file", labelText = "") {
     const isDir = !/\.[a-zA-Z0-9]{1,8}$/.test(name);
     icon = iconImg(isDir ? folderIconUrl(name, false) : fileIconUrl(name));
   } else {
-    icon = iconSvg(kind === "model" ? "i-sparkle" : `i-brand-${kind}`, "ic--doc");
+    icon = kind === "model"
+      ? iconSvg(brandOf(rel).sym, brandOf(rel).cls)
+      : iconSvg(`i-brand-${kind}`, "ic--doc");
   }
   const nameEl = document.createElement("span");
   nameEl.className = "composer-chip__name";
@@ -56547,9 +56549,14 @@ function _atModelRows(query) {
       const label = String(model?.label || model?.name || id);
       if (!id) continue;
       if (q && !id.toLowerCase().includes(q) && !label.toLowerCase().includes(q)) continue;
+      // brandOf is what the model picker uses, including its custom: handling — so a Claude
+      // model shows the Anthropic mark here and in the picker, and never two different glyphs
+      // for the same model. A local map would drift the first time a vendor is added.
+      const brand = brandOf(id);
       rows.push({
         kind: "model",
-        icon: "i-sparkle",
+        icon: brand.sym,
+        iconClass: brand.cls,
         name: label,
         detail: group?.label ? `${group.label} · ${id}` : id,
         onPick: () => _insertAtChip({ kind: "model", value: id, label }),
@@ -56647,7 +56654,9 @@ async function _renderAtMenu() {
   rows.forEach((row, i) => {
     const item = document.createElement("div");
     item.className = "atmenu__item" + (i === 0 ? " is-active" : "");
-    const icon = row.iconUrl ? iconImg(row.iconUrl) : iconSvg(row.icon || "i-file", "ic--doc");
+    const icon = row.iconUrl
+      ? iconImg(row.iconUrl)
+      : iconSvg(row.icon || "i-file", row.iconClass || "ic--doc");
     item.innerHTML = `${icon}<span class="at-name"></span>` + (row.detail ? `<span class="at-dir"></span>` : "");
     // textContent: names come from disk, from a model catalogue, and from a remote API.
     item.querySelector(".at-name").textContent = row.name;
