@@ -13073,7 +13073,13 @@ async function showProfile() {
   const planTotals = { trial: 5000, basic: 33000, pro: 65000, power: 180000, ultra: 500000 };
   const active = u.plan && u.plan !== "none" && (!u.plan_expires_at || new Date(u.plan_expires_at) > new Date());
   const fmtT = (t) => { if (!t) return "—"; const d = new Date(t); return isNaN(d) ? "—" : d.toLocaleString("zh-CN", { hour12: false }); };
-  const av = (u.email || "?").slice(0, 1).toUpperCase();
+  // The dashboard's name fields are the account's own name; the email is the fallback identity
+  // for an account that never set one. Showing the email to someone who did set a name is the
+  // system telling them it did not notice.
+  const displayName = [u.first_name, u.last_name].filter((part) => String(part || "").trim()).join(" ").trim();
+  const identity = displayName || u.email || "";
+  // The initial follows the identity, or a named account still shows the letter of its address.
+  const av = (identity || "?").slice(0, 1).toUpperCase();
   const pct = (a, b) => (b > 0 ? Math.max(0, Math.min(100, (a / b) * 100)) : 0);
 
   // one-time styles (Google light, with entrance + bar animations)
@@ -13086,7 +13092,11 @@ async function showProfile() {
       ".pf-ov{position:fixed;inset:0;background:rgba(32,33,36,.45);backdrop-filter:blur(2px);display:grid;place-items:center;z-index:99999;font-family:'Roboto',-apple-system,'PingFang SC',sans-serif;animation:pf-fade .18s ease both}" +
       ".pf-card{background:#fff;color:#202124;border-radius:18px;width:440px;max-width:92vw;box-shadow:0 24px 70px rgba(60,64,67,.28),0 4px 12px rgba(60,64,67,.14);animation:pf-pop .32s cubic-bezier(.2,.75,.2,1) both;overflow:hidden}" +
       ".pf-head{display:flex;align-items:center;gap:14px;padding:26px 26px 20px}" +
-      ".pf-av{width:52px;height:52px;border-radius:50%;background:linear-gradient(135deg,#1a73e8,#4285f4);color:#fff;display:grid;place-items:center;font-size:23px;font-weight:600;box-shadow:0 4px 12px rgba(26,115,232,.35)}" +
+      // Identical to the account console's Avatar: same source field, same fallback rule
+      // ((name || email).charAt(0).toUpperCase()), and now the same flat primary fill. The
+      // gradient and drop shadow here were this card's own invention, so the same account
+      // looked like two different avatars depending on where you opened it.
+      ".pf-av{width:52px;height:52px;border-radius:50%;background:#1a73e8;color:#fff;display:grid;place-items:center;font-size:23px;font-weight:600}" +
       ".pf-badge{display:inline-flex;align-items:center;justify-content:center;box-sizing:border-box;min-height:24px;border-radius:20px;padding:3px 11px;font-size:12px;font-weight:600;margin-top:5px;line-height:1.25}" +
       ".pf-av--img{object-fit:cover;background:#e8f0fe}" +
       // The plan reads as status, so it keeps the tint and a dot; a star glyph and a 会员 suffix
@@ -13138,7 +13148,10 @@ async function showProfile() {
         ? `<img class="pf-av pf-av--img" src="${esc2(u.avatar)}" alt="" referrerpolicy="no-referrer"
              onerror="this.outerHTML='<span class=\'pf-av\'>${esc2(av)}</span>'">`
         : `<span class="pf-av">${esc2(av)}</span>`}
-      <div style="flex:1;min-width:0"><div style="font-size:16px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${esc2(u.email || "")}</div><div class="pf-meta">${badge}${countryBadge}</div></div>
+      <div style="flex:1;min-width:0">
+        <div title="${esc2(u.email || "")}" style="font-size:16px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${esc2(identity)}</div>
+        <div class="pf-meta">${badge}${countryBadge}</div>
+      </div>
       <span class="pf-close" id="pfClose">&times;</span>
     </div>
     <div class="pf-body">
