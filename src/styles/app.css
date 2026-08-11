@@ -4374,6 +4374,22 @@ body.zen-mode .editor {
   font-size: 12px;
 }
 
+/* The dropdown avatar, drawn like the card's and the console's: flat primary, white initial, or
+   the real image cropped to the circle. The markup swaps <svg> for <img>/<span>, so the shared
+   size and radius live here rather than on either element. */
+.settings-dropdown__avatar--filled {
+  display: grid;
+  place-items: center;
+  overflow: hidden;
+  border-radius: 50%;
+  background: #1a73e8;
+  color: #fff;
+  font-size: 13px;
+  font-weight: 600;
+  line-height: 1;
+}
+img.settings-dropdown__avatar--filled { object-fit: cover; }
+
 .file-inspector--archive {
   overflow: hidden !important;
   /* Flat, and the same surface as the shell — the base rule paints two radial tints over the

@@ -497,14 +497,18 @@ test("the profile card shows the account's real avatar when it has one", () => {
 });
 
 test("the account card shows the name when there is one, the email when there is not", () => {
-  const fn = SRC.slice(SRC.indexOf("const displayName = [u.first_name"), SRC.indexOf("const pct = (a, b)"));
-  const pick = new Function(`const u = arguments[0];
-    ${fn.replace(/const av = .*/s, "")} return { identity };`);
-  assert.equal(pick({ first_name: "Michael", last_name: "Chen", email: "a@b.com" }).identity, "Michael Chen");
-  assert.equal(pick({ first_name: "Michael", last_name: "", email: "a@b.com" }).identity, "Michael");
+  // One rule, shared by the card, the dropdown and the avatar initial. Three copies is how they
+  // drift, which is exactly what happened before this was extracted.
+  const identityOf = new Function(
+    `const _michaelUser = null; ${SRC.match(/function _accountIdentity[\s\S]*?\n}/)[0]}; return _accountIdentity;`,
+  )();
+  assert.equal(identityOf({ first_name: "Michael", last_name: "Chen", email: "a@b.com" }), "Michael Chen");
+  assert.equal(identityOf({ first_name: "Michael", last_name: "", email: "a@b.com" }), "Michael");
   // Whitespace-only names are not names — an account with " " set must still show its email.
-  assert.equal(pick({ first_name: " ", last_name: "", email: "a@b.com" }).identity, "a@b.com");
-  assert.equal(pick({ email: "3266986273@qq.com" }).identity, "3266986273@qq.com");
+  assert.equal(identityOf({ first_name: " ", last_name: "", email: "a@b.com" }), "a@b.com");
+  assert.equal(identityOf({ email: "3266986273@qq.com" }), "3266986273@qq.com");
+  // The dropdown knows the email before /api/me lands, so it may pass one in.
+  assert.equal(identityOf(null, "fallback@x.com"), "fallback@x.com");
 
   // The email stays reachable on hover rather than being lost when a name exists.
   assert.match(SRC, /<div title="\$\{esc2\(u\.email \|\| ""\)\}"/);
@@ -522,10 +526,28 @@ test("the account avatar matches the dashboard's, rule and appearance", () => {
     "this test is only meaningful while the console still uses that rule");
   assert.match(SRC, /const av = \(identity \|\| "\?"\)\.slice\(0, 1\)\.toUpperCase\(\);/,
     "the app must use the same rule");
-  assert.match(SRC, /const identity = displayName \|\| u\.email \|\| "";/,
-    "and the same precedence: name, then email");
+  assert.match(SRC, /const identity = _accountIdentity\(u\);/,
+    "the card uses the shared rule rather than its own copy");
+  assert.match(SRC, /const _identity = _accountIdentity\(_michaelUser, _loggedInEmail\);/,
+    "and so does the dropdown");
   // Flat fill, no gradient, no shadow.
   assert.match(SRC, /\.pf-av\{[^}]*background:#1a73e8;/);
   assert.doesNotMatch(SRC.slice(SRC.indexOf('".pf-av{'), SRC.indexOf('".pf-av{') + 260), /linear-gradient|box-shadow/,
     "the card must not invent its own avatar styling");
+});
+
+test("the account dropdown shows the same identity and avatar as the card", () => {
+  // It showed the raw email and a generic person outline, so the same account looked like two
+  // different accounts depending on whether you opened the menu or the card.
+  assert.match(SRC, /dropName\.textContent = _identity;/, "the dropdown shows the identity");
+  assert.match(SRC, /dropName\.title = _loggedInEmail;/, "with the email still reachable on hover");
+  assert.match(SRC, /_setDropdownAvatar\(_michaelUser, _identity\);/, "and the real avatar");
+
+  const fn = SRC.slice(SRC.indexOf("function _setDropdownAvatar"), SRC.indexOf("function _accountIdentity"));
+  assert.match(fn, /u\?\.avatar \? document\.createElement\("img"\)/, "an image when the account has one");
+  assert.match(fn, /next\.referrerPolicy = "no-referrer";/, "third-party host learns nothing");
+  assert.match(fn, /next\.onerror = \(\) => _setDropdownAvatar\(\{ \.\.\.u, avatar: "" \}, identity\);/,
+    "a dead URL falls back to the letter rather than a broken frame");
+  assert.match(fn, /\(identity \|\| "\?"\)\.slice\(0, 1\)\.toUpperCase\(\)/, "same initial rule as the card");
+  assert.match(APP_CSS, /img\.settings-dropdown__avatar--filled \{ object-fit: cover; \}/);
 });

@@ -13076,8 +13076,7 @@ async function showProfile() {
   // The dashboard's name fields are the account's own name; the email is the fallback identity
   // for an account that never set one. Showing the email to someone who did set a name is the
   // system telling them it did not notice.
-  const displayName = [u.first_name, u.last_name].filter((part) => String(part || "").trim()).join(" ").trim();
-  const identity = displayName || u.email || "";
+  const identity = _accountIdentity(u);
   // The initial follows the identity, or a named account still shows the letter of its address.
   const av = (identity || "?").slice(0, 1).toUpperCase();
   const pct = (a, b) => (b > 0 ? Math.max(0, Math.min(100, (a / b) * 100)) : 0);
@@ -55458,6 +55457,42 @@ function _syncHandoffSession() {
     .catch(() => { /* older backend without the command — handoff just stays off */ });
 }
 
+/**
+ * The account's display identity, matching the console's Shell.tsx: the name when there is one,
+ * the email otherwise. Defined once because it is now needed in three places — the profile card,
+ * this dropdown, and the avatar's initial — and three copies is how they drift apart.
+ */
+/**
+ * Swap the dropdown's placeholder glyph for the account's real avatar, or the same initial-on-blue
+ * the card and the console draw. The generic person outline said nothing about whose account it
+ * was — and showed a different thing from the card for the same account.
+ */
+function _setDropdownAvatar(u, identity) {
+  const host = document.querySelector(".settings-dropdown__header");
+  const current = host?.querySelector(".settings-dropdown__avatar");
+  if (!host || !current) return;
+  const next = u?.avatar ? document.createElement("img") : document.createElement("span");
+  next.className = "settings-dropdown__avatar settings-dropdown__avatar--filled";
+  if (u?.avatar) {
+    next.src = u.avatar;
+    next.alt = "";
+    next.referrerPolicy = "no-referrer";
+    // A dead URL must fall back to the letter, not leave a broken-image frame.
+    next.onerror = () => _setDropdownAvatar({ ...u, avatar: "" }, identity);
+  } else {
+    next.textContent = (identity || "?").slice(0, 1).toUpperCase();
+  }
+  current.replaceWith(next);
+}
+
+function _accountIdentity(u = _michaelUser, fallbackEmail = "") {
+  const name = [u?.first_name, u?.last_name]
+    .filter((part) => String(part || "").trim())
+    .join(" ")
+    .trim();
+  return name || u?.email || fallbackEmail || "";
+}
+
 function _updateLoginUI() {
   _refreshUserLabels(); // relabel already-sent user messages to the current account (or back to 你 on logout)
   const dropName = document.querySelector(".settings-dropdown__name");
@@ -55470,7 +55505,11 @@ function _updateLoginUI() {
   const loginHeader = document.querySelector(".settings-dropdown__header");
   let _tok = ""; try { _tok = localStorage.getItem("michael_token") || ""; } catch (_) {}
   if (_loggedInEmail && _tok) {
-    if (dropName) { dropName.removeAttribute("data-i18n"); dropName.textContent = _loggedInEmail; dropName.title = _loggedInEmail; }
+    // Name when the account has one, email otherwise — the same rule as the card and the console.
+    // The email stays on hover, since it is what identifies the account.
+    const _identity = _accountIdentity(_michaelUser, _loggedInEmail);
+    if (dropName) { dropName.removeAttribute("data-i18n"); dropName.textContent = _identity; dropName.title = _loggedInEmail; }
+    _setDropdownAvatar(_michaelUser, _identity);
     const _pn = { trial: "Trial", basic: "Basic", pro: "Pro", power: "Power", ultra: "Ultra" };
     const _u = _michaelUser;
     const _active = _u && _u.plan && _u.plan !== "none" && (!_u.plan_expires_at || new Date(_u.plan_expires_at) > new Date());
