@@ -903,3 +903,30 @@ test("the paint optimization that blanks WebKit is granted, not assumed", () => 
   assert.match(SRC, /if \(\/AppleWebKit\/\.test\(ua\) && !\/Chrome\|Chromium\|Edg\\\/\/\.test\(ua\)\) document\.body\.classList\.add\("is-webkit"\);\s*\n\s*else document\.body\.classList\.add\("cv-safe"\);/);
   assert.match(SRC, /catch \{ \/\* no navigator \(tests\) → stay on the safe side and skip the optimization \*\/ \}/);
 });
+
+test("an interrupted turn keeps what the model already wrote", () => {
+  // The notice said "已生成的内容...都已保留" and none of it was. Three places threw the prose
+  // away independently, so fixing any one of them alone changed nothing on screen.
+  const turn = grab("_agentModelTurn");
+
+  // 1. The return value blanked it whenever a tool call had started. That rule assumes a tool
+  //    card to state the action and a following turn to write the conclusion — a dead turn
+  //    gets neither.
+  assert.match(turn, /text: \(_hasNonControlToolCall && !err\) \? "" : cleanFinal,/);
+
+  // 2. The DOM element was removed the moment a tool name arrived, and the final render
+  //    refused to put it back.
+  assert.match(turn, /const _keepProse = \(!_hasNonControlToolCall \|\| !!err\) && cleanFinal\.trim\(\);/);
+  assert.doesNotMatch(turn, /\} else if \(!_hasNonControlToolCall && cleanFinal\.trim\(\)\) \{/,
+    "the fallback render path must use the same rule, or the two disagree");
+
+  // 3. The run loop broke on the error BEFORE the line that accumulates the prose into the run
+  //    summary — which is the only thing persisted to history. This is the one that made it
+  //    survive a restart as well as a repaint.
+  assert.match(SRC, /if \(turn\.error\) \{[\s\S]{0,900}summaryText \+= \(summaryText \? "\\n\\n" : ""\) \+ turn\.text\.trim\(\);[\s\S]{0,200}finalErr = turn\.error; break;/);
+
+  // And the notice now describes what actually happened to the interrupted call, instead of
+  // implying every file change landed.
+  assert.match(SRC, /被打断的那次工具调用参数不完整，没有执行，也不会重放。/);
+  assert.doesNotMatch(SRC, /已生成的内容和文件改动都已保留/);
+});
