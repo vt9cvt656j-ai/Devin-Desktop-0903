@@ -73,6 +73,7 @@ import { renderSlashMenu, destroySlashMenu } from "./ui/mount-slash-menu.jsx";
 import { openSessionPickerIsland } from "./ui/mount-session-picker.jsx";
 import { openMemoryCenterIsland } from "./ui/mount-memory-center.jsx";
 import { mountArchiveBrowser } from "./ui/mount-archive-browser.jsx";
+import { mountTableView } from "./ui/mount-table-view.jsx";
 import { getCollaborationEngine } from "./agent/collaboration-engine.js";
 
 // Global shared state store for sub-agent collaboration
@@ -459,6 +460,7 @@ async function tauriBackend() {
     openUrl: (url) => opener.openUrl(url),
     revealItemInDir: (path) => opener.revealItemInDir(path),
     extractArchive: (path, dest, budget) => core.invoke("extract_archive", { path, dest, budget: budget ?? null }),
+    readTableFile: (path, maxRows) => core.invoke("read_table_file", { path, maxRows: maxRows ?? null }),
     readArchiveEntry: (path, entry, maxBytes) =>
       core.invoke("read_archive_entry", { path, entry, maxBytes: maxBytes ?? null }),
     aiChat: (config, messages, onEvent) => {
@@ -1756,6 +1758,7 @@ function mockBackend() {
     },
     revealItemInDir: async () => {},
     extractArchive: async () => { throw new Error("解压需要桌面版应用。"); },
+    readTableFile: async () => { throw new Error("表格视图需要桌面版应用。"); },
     readArchiveEntry: async () => { throw new Error("读取压缩包条目需要桌面版应用。"); },
     // Answer per command instead of one canned failure: a preview that reports a
     // TypeScript warning for `pytest` teaches the wrong thing about the product.
@@ -4110,6 +4113,13 @@ function isVideoFile(name) {
   const ext = (String(name).split(".").pop() || "").toLowerCase();
   return VIDEO_EXTS.has(ext);
 }
+const TABLE_EXTS = new Set(["csv", "tsv", "tab"]);
+function isTableFile(name) {
+  return TABLE_EXTS.has((String(name).split(".").pop() || "").toLowerCase());
+}
+/** Files the user asked to edit as text this session — the table window has a button for it. */
+const _openAsTextPaths = new Set();
+
 function isPdfFile(name) {
   return (String(name).split(".").pop() || "").toLowerCase() === "pdf";
 }
@@ -4186,6 +4196,13 @@ async function openFile(path, name, activateFile = true, options = {}) {
     return true;
   }
 
+  if (isTableFile(name) && !_openAsTextPaths.has(path)) {
+    openFiles.set(path, { model: null, name, dirty: false, viewState: null, isTable: true });
+    renderTabs();
+    if (activateFile) activate(path);
+    return true;
+  }
+
   if (isPdfFile(name)) {
     openFiles.set(path, { model: null, name, dirty: false, viewState: null, isPdf: true });
     renderTabs();
@@ -4247,6 +4264,7 @@ function activate(path) {
   hideImagePreview();
   hideVideoPreview();
   hidePdfPreview();
+  hideTablePreview();
   hideFileInspectionPreview();
   hideMarkdownPreview();
   if (activePath && openFiles.has(activePath)) {
@@ -4267,6 +4285,10 @@ function activate(path) {
   } else if (f.isVideo) {
     _setEditorModelIfChanged(monacoEditor, null);
     showVideoPreview(path);
+    editorEl.style.display = "none";
+  } else if (f.isTable) {
+    _setEditorModelIfChanged(monacoEditor, null);
+    showTablePreview(path);
     editorEl.style.display = "none";
   } else if (f.isPdf) {
     _setEditorModelIfChanged(monacoEditor, null);
@@ -5424,6 +5446,60 @@ function _renderHexEditorInspection(path, info, reason = "", error = "") {
       </div>
     </div>`;
   _fileInspectionPreviewEl.hidden = false;
+}
+
+let _tablePreviewEl = null;
+
+/** The CSV/TSV window. Its own overlay, like the PDF viewer — not part of the file inspector. */
+async function showTablePreview(path) {
+  if (!_tablePreviewEl) {
+    _tablePreviewEl = document.createElement("div");
+    _tablePreviewEl.className = "table-preview";
+    editorContainer.appendChild(_tablePreviewEl);
+  }
+  _tablePreviewEl.hidden = false;
+  _tablePreviewEl.textContent = "";
+  const host = document.createElement("div");
+  host.style.cssText = "display:flex;flex:1 1 auto;min-height:0";
+  _tablePreviewEl.appendChild(host);
+
+  let table = null;
+  let error = "";
+  try {
+    table = await backend.readTableFile(path, null);
+  } catch (e) {
+    error = String(e?.message || e || "无法解析这个表格");
+  }
+  if (activePath !== path) return; // the user moved on while we parsed
+  if (error) {
+    const msg = document.createElement("p");
+    msg.className = "table-preview__error";
+    msg.textContent = `${error} — 已按文本打开。`;
+    _tablePreviewEl.appendChild(msg);
+    _openAsTextAgain(path);
+    return;
+  }
+  mountTableView(host, {
+    table,
+    file: { name: basename(path), size: table?.size },
+    iconFor: (name, isDir) => (isDir ? folderIconUrl(name || "", false) : fileIconUrl(name || "")),
+    onReveal: async () => {
+      try { await backend.revealItemInDir(path); } catch (e) { showToast(String(e?.message || e || "无法在系统中显示")); }
+    },
+    onOpenAsText: () => _openAsTextAgain(path),
+  });
+}
+
+/** Reopen a table file in the code editor. A CSV is still text people legitimately hand-edit. */
+function _openAsTextAgain(path) {
+  _openAsTextPaths.add(path);
+  openFiles.delete(path);
+  hideTablePreview();
+  openFile(path, true);
+}
+
+function hideTablePreview() {
+  if (_tablePreviewEl) { _tablePreviewEl.hidden = true; _tablePreviewEl.textContent = ""; }
 }
 
 function showFileInspectionPreview(path) {
@@ -7733,6 +7809,7 @@ async function closeFile(path, { force = false, discardBuffer = false } = {}) {
       hideImagePreview();
       hideVideoPreview();
       hidePdfPreview();
+      hideTablePreview();
       hideFileInspectionPreview();
       hideMarkdownPreview();
       saveBtn.disabled = true;

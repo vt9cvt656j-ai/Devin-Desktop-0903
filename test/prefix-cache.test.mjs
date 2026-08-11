@@ -204,3 +204,28 @@ test("the archive window fills its frame instead of floating in it", () => {
   assert.match(ARCHIVE_JSX, /iconFor\?\.\(/, "rows take their icon from the tree's icon set");
   assert.match(SRC, /iconFor: \(name, isDir\) => \(isDir \? folderIconUrl/, "which main.js supplies");
 });
+
+test("CSV files open in the table window, with a way back to the editor", () => {
+  const TABLE_JSX = fs.readFileSync("src/ui/table-view.jsx", "utf8");
+  assert.match(SRC, /const TABLE_EXTS = new Set\(\["csv", "tsv", "tab"\]\)/, "csv/tsv route to the table");
+  assert.match(SRC, /readTableFile: \(path, maxRows\) => core\.invoke\("read_table_file"/, "native seam");
+  assert.match(SRC, /readTableFile: async \(\) => \{ throw new Error/, "and a stub for the web build");
+
+  // A CSV is still a text file people hand-edit. Routing it to a read-only grid without an exit
+  // would remove editing, so the escape hatch is part of the feature, not a nicety.
+  assert.match(SRC, /_openAsTextPaths\.add\(path\)/, "opening as text must be possible");
+  assert.match(SRC, /isTableFile\(name\) && !_openAsTextPaths\.has\(path\)/,
+    "and must stick, or the next open bounces back to the grid");
+  assert.match(TABLE_JSX, /onOpenAsText/, "the window needs the control for it");
+
+  // A parse failure must fall back to text rather than leaving an empty panel.
+  assert.match(SRC, /已按文本打开/, "a file that will not parse still has to open");
+
+  // Same surface as its shell, the lesson from the archive panel's seam.
+  assert.match(TABLE_JSX, /bg-\[var\(--panel-solid\)\]/);
+  assert.doesNotMatch(TABLE_JSX, /bg-background/);
+
+  // The overlay has to be hidden wherever its siblings are, or it covers the editor.
+  assert.ok((SRC.match(/hideTablePreview\(\);/g) || []).length >= 3,
+    "hidden alongside hidePdfPreview in every place that switches views");
+});
