@@ -5106,7 +5106,8 @@ test("context pressure may be estimated while billing settles off the model-turn
   assert.doesNotMatch(SRC, /prompt_tokens: _lastRequestEstimateTokens \|\| _estRequestTokens\(messages, toolSchemas\)/);
   assert.doesNotMatch(SRC, /_turnCostCents/);
   assert.doesNotMatch(SRC, /prompt_tokens: _estTokens\(messages\)/);
-  assert.match(SRC, /供应商尚未上报真实 usage/);
+  // The hover says so in one line now, in place of the six-line block that repeated it twice.
+  assert.match(SRC, /lines\.push\("本地估算 · 供应商尚未上报本轮用量"\);/);
 });
 
 test("token cache meter is a persistent context ring beside the composer voice button", () => {
@@ -5125,7 +5126,7 @@ test("token cache meter is a persistent context ring beside the composer voice b
   // the middle rounded a real 125k conversation to "0" against a membership-sized window.
   assert.match(SRC, /label\.textContent = pct >= 100 \? "满" : String\(pct\)/);
   assert.match(SRC, /el\.dataset\.tooltip = tooltip/);
-  assert.match(SRC, /上下文 \$\{k\(state\.total\)\} \/ \$\{k\(state\.limit\)\}（\$\{pct\}%）/,
+  assert.match(SRC, /上下文 \$\{k\(state\.total\)\} \/ \$\{k\(state\.limit\)\}，\$\{pct\}%/,
     "the screen-reader label states the size and the window, not a bare percentage");
   assert.match(APP_CSS, /\.cache-ring\s*\{[^}]*margin-left:\s*auto;[\s\S]*?width:\s*30px;[\s\S]*?height:\s*30px;/);
   assert.match(APP_CSS, /\.cache-ring\s*\{[^}]*background:\s*transparent;/);

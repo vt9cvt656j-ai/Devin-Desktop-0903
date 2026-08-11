@@ -7336,13 +7336,16 @@ button.agent-plan__fold--toggle:focus-visible { outline: 2px solid #1a73e8; outl
   position: absolute;
   right: -10px;
   bottom: calc(100% + 10px);
-  z-index: 120;
+  /* Above the model/mode menus (70) that share this composer, and above anything the chat can
+     promote itself to. The background is stated with a fallback because a missing custom
+     property does not degrade to opaque — it degrades to see-through. */
+  z-index: 200;
   width: max-content;
   max-width: min(320px, 70vw);
   padding: 9px 10px;
   border: 1px solid var(--line-strong);
   border-radius: 10px;
-  background: var(--panel-solid);
+  background: var(--panel-solid, #fff);
   color: var(--text);
   box-shadow: var(--shadow-md);
   font-size: 12px;
@@ -13388,7 +13391,13 @@ select.settings-input { cursor: pointer; padding-right: 8px; }
    the file-explorer (open into the working directory, blue) and the AI composer (@-reference in chat,
    purple). ONLY the region under the cursor lights up (no dimmed twin). JS routes the real drop by
    position. ---- */
-.explorer, .composer { position: relative; }
+/* The composer is chrome sitting over the transcript, so it and its popovers — the model menu,
+   the context tooltip — have to win against whatever chat content happens to be at the same
+   coordinates. DOM order alone did not deliver that: .msg carries content-visibility, which
+   promotes an off-screen message to its own stacking context and let it paint into the tooltip.
+   One positive z-index on the container settles it for every popover inside. */
+.explorer { position: relative; }
+.composer { position: relative; z-index: 60; }
 .explorer-dropzone, .composer-dropzone {
   position: absolute; z-index: 45; pointer-events: none;
   visibility: hidden; opacity: 0;
