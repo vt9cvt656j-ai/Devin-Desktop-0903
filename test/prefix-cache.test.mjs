@@ -244,7 +244,8 @@ test("a long filename does not take over the tab strip or the title bar", () => 
   assert.match(tab, /flex: 0 0 auto;/, "tabs must not shrink; the strip scrolls instead");
   assert.doesNotMatch(tab.slice(0, tab.indexOf(".tab .label")), /min-width: 0;/,
     "min-width:0 on the tab itself collapses every label");
-  assert.match(tab, /\.tab \.label \{[^}]*text-overflow: ellipsis;/s, "and the label must ellipsise");
+  assert.match(APP_CSS, /\.tab \.label \.stem,[^}]*text-overflow: ellipsis;/s,
+    "the stem must ellipsise — it is the part allowed to shrink");
   assert.match(tab, /\.tab > \.ic,\s*\.tab > \.x \{ flex: none; \}/,
     "only the label may shrink — a close button that moves as you switch files is worse");
   assert.match(SRC, /tab\.title = f\.name;/, "a truncated label needs the full name on hover");
@@ -259,4 +260,32 @@ test("a long filename does not take over the tab strip or the title bar", () => 
   assert.ok(short.endsWith(".zip"), "and must keep the extension");
   assert.ok(short.includes("…"));
   assert.equal(ellipsize("main.js"), "main.js", "short names are left alone");
+});
+
+test("a truncated filename still shows its extension", () => {
+  // text-overflow: ellipsis can only clip the tail, and the tail is the extension — so a long
+  // name rendered "庄子视频处理系统V5.0-T…" tells you nothing about what the file is. The stem and
+  // the extension are separate elements: the stem shrinks, the extension never does.
+  const fn = SRC.match(/function _splitFileName[\s\S]*?\n}/)[0];
+  const split = new Function(`${fn}; return _splitFileName;`)();
+  assert.deepEqual(split("庄子视频处理系统V5.0-TS长视频版-Windows-x64-最新版-20260722.zip")[1], ".zip");
+  assert.deepEqual(split("V4-Setup.exe"), ["V4-Setup", ".exe"]);
+  // A leading dot is the whole name of a dotfile, not an extension.
+  assert.deepEqual(split(".gitignore"), [".gitignore", ""]);
+  assert.deepEqual(split(".mcp.local.json"), [".mcp.local", ".json"]);
+  assert.deepEqual(split("Makefile"), ["Makefile", ""]);
+
+  // Both places that render a filename use it — a truncated name in the tree is as unreadable as
+  // one in a tab.
+  assert.match(SRC, /_fillFileLabel\(tab\.querySelector\("\.label"\), f\.name\)/);
+  assert.match(SRC, /_fillFileLabel\(row\.querySelector\("\.name"\), item\.name\)/);
+  // Filenames come off disk; they go in as text, never as markup.
+  const fill = SRC.slice(SRC.indexOf("function _fillFileLabel"), SRC.indexOf("function _ellipsizeMiddle"));
+  assert.match(fill, /stemEl\.textContent = stem;/);
+  // Assignments only: the function's own comment says the word, and grepping prose is how a
+  // test ends up checking documentation instead of code.
+  assert.doesNotMatch(fill, /\.innerHTML\s*=/);
+
+  assert.match(APP_CSS, /\.tab \.label \.ext,\s*\.row \.name \.ext \{\s*flex: none;/s,
+    "the extension must be the part that refuses to shrink");
 });

@@ -8252,7 +8252,7 @@ function renderTabs() {
     tab.innerHTML =
       `${iconImg(fileIconUrl(f.name))}<span class="label"></span>` +
       `<span class="x" title="Close"><span class="dot"></span><svg class="ic"><use href="#i-close" /></svg></span>`;
-    tab.querySelector(".label").textContent = f.name;
+    _fillFileLabel(tab.querySelector(".label"), f.name);
     // The label is capped at 220px and ellipsised, so the full name has to be reachable somehow.
     tab.title = f.name;
     // 用户亲手点开 = 认领这个 tab，之后不再自动回收（activate 本身不能挂钩子——
@@ -10055,7 +10055,7 @@ async function renderChildren(path, container) {
     } else {
       row.innerHTML = `<span class="chev-spacer"></span>${iconImg(fileIconUrl(item.name))}<span class="name"></span>`;
     }
-    row.querySelector(".name").textContent = item.name;
+    _fillFileLabel(row.querySelector(".name"), item.name);
     row.addEventListener("contextmenu", (e) => {
       e.preventDefault();
       e.stopPropagation();
@@ -16152,6 +16152,38 @@ const _ipcPeers = new Map();
  * usually the version or date — exactly what end-truncation throws away first. macOS shortens
  * paths this way for the same reason.
  */
+/**
+ * Split a filename into the part that may be shortened and the part that must not. CSS can only
+ * ellipsise at the end, which eats the extension — the one piece that says what the file is. So
+ * the stem and the extension become separate elements: the stem shrinks, the extension never does.
+ * Pixel-accurate and responsive, where truncating the string by character count is neither.
+ */
+function _splitFileName(name) {
+  const value = String(name || "");
+  const dot = value.lastIndexOf(".");
+  // A leading dot is the whole name of a dotfile (.gitignore), not an extension. An extension
+  // longer than a few characters is usually a version fragment, not a type.
+  if (dot <= 0 || dot === value.length - 1 || value.length - dot > 12) return [value, ""];
+  return [value.slice(0, dot), value.slice(dot)];
+}
+
+/** Fill an element with a filename, keeping the extension in its own non-shrinking span. */
+function _fillFileLabel(el, name) {
+  if (!el) return;
+  const [stem, ext] = _splitFileName(name);
+  el.textContent = "";
+  const stemEl = document.createElement("span");
+  stemEl.className = "stem";
+  stemEl.textContent = stem; // textContent, never innerHTML: this is a filename from disk
+  el.appendChild(stemEl);
+  if (ext) {
+    const extEl = document.createElement("span");
+    extEl.className = "ext";
+    extEl.textContent = ext;
+    el.appendChild(extEl);
+  }
+}
+
 function _ellipsizeMiddle(text, max = 44) {
   const value = String(text || "");
   if (value.length <= max) return value;
