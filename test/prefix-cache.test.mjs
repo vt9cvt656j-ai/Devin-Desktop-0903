@@ -410,3 +410,19 @@ test("the model mark depicts a model, not a sparkle", () => {
   // The spark is what stops a bare graph reading as "network" or "share".
   assert.match(mark, /M17\.9 3\.1c/, "the generative accent must remain");
 });
+
+test("Files can point @ at a folder the workspace does not have yet", () => {
+  const INDEX = fs.readFileSync("index.html", "utf8");
+  assert.match(SRC, /name: "Add folder…"/, "the row must exist");
+  assert.match(SRC, /icon: "i-new-folder"/, "with its own icon");
+  assert.ok(INDEX.includes('id="i-new-folder"'), "and that icon must be a real symbol");
+
+  // It must go through _addWorkspaceRoot, which is what registers the folder with the backend
+  // sandbox. A path this menu knew about but the backend had not granted would list fine and then
+  // fail on the first read with "access denied" — worse than not offering the button.
+  const fn = SRC.slice(SRC.indexOf("async function _atAddFolder"), SRC.indexOf("/** Which folder the Files branch is showing"));
+  assert.match(fn, /await _addWorkspaceRoot\(picked\)/, "registration is not optional");
+  assert.match(fn, /_atMode = "files";/, "and it lands you back in Files, inside the new folder");
+  // The row is offered only at the top level with no query — mid-search it would be noise.
+  assert.match(SRC, /if \(!_atDir && !query\) \{\s*rows\.unshift\(\{\s*kind: "add-folder"/);
+});
