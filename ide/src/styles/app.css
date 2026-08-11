@@ -7327,6 +7327,12 @@ button.agent-plan__fold--toggle:focus-visible { outline: 2px solid #1a73e8; outl
   font-size: 8.5px;
   letter-spacing: -0.08em;
 }
+/* The label is a token count now, so it runs to four characters ("128k", "1.5M") where the
+   old percentage never passed three. Tighten rather than let it touch the ring. */
+.cache-ring.is-compact .cache-ring__label {
+  font-size: 8px;
+  letter-spacing: -0.07em;
+}
 @keyframes cache-ring-full-pulse {
   0%, 100% { transform: scale(1); }
   50% { transform: scale(1.05); }

@@ -861,8 +861,26 @@ async function _realAiFetch(config, messages, tools, onEvent) {
               u.input_tokens_details && u.input_tokens_details.cached_tokens,
             ].find((v) => v != null);
             const cached = _cc != null ? (Number(_cc) || 0) : null;
-            if ((u.prompt_tokens || 0) > 0 || (u.completion_tokens || 0) > 0)
-              onEvent({ kind: "usage", prompt_tokens: u.prompt_tokens || 0, completion_tokens: u.completion_tokens || 0, cached_tokens: cached });
+            // Same shape rule the desktop transport applies (ai.rs) and the gateway bills by.
+            // The presence of `cache_read_input_tokens` is the discriminator: Anthropic reports
+            // input EXCLUDING everything served from (or written to) cache, so the three have to
+            // be added to get the tokens the model actually read. OpenAI/DeepSeek report a
+            // prompt total that already CONTAINS the cached part — adding would double it.
+            const cacheWrite = Number(u.cache_creation_input_tokens) || 0;
+            const promptRaw = Number(u.prompt_tokens ?? u.input_tokens) || 0;
+            const prompt = u.cache_read_input_tokens != null
+              ? promptRaw + (cached || 0) + cacheWrite
+              : promptRaw;
+            const completion = Number(u.completion_tokens ?? u.output_tokens) || 0;
+            if (prompt > 0 || completion > 0) {
+              onEvent({
+                kind: "usage",
+                prompt_tokens: prompt,
+                completion_tokens: completion,
+                cached_tokens: cached,
+                cache_creation_tokens: cacheWrite,
+              });
+            }
           }
           const d = (v.choices && v.choices[0] && v.choices[0].delta) || {};
           const rt = d.reasoning_content || d.reasoning;
@@ -14456,12 +14474,10 @@ function _conversationSessionMetadata(session) {
     // resumed session pay a full prefix miss on its first turn for no reason.
     semanticFlags: Array.isArray(session?._semanticProfileFlags) && session._semanticProfileFlags.length
       ? session._semanticProfileFlags.slice() : undefined,
-    // The meter's floor comes from real reported usage; a local re-estimate cannot see the system
-    // prompt or the tool schemas and reads far lower. Losing it on restart is what made a restored
-    // conversation report an empty context.
-    ctxFloor: Number(session?._ctxRealFloor?.total) > 0
-      ? { total: Number(session._ctxRealFloor.total), at: Number(session._ctxRealFloor.at) || 0 }
-      : undefined,
+    // What the provider said this conversation weighs. Nothing on the client can recompute it —
+    // a local estimate sees neither the system prompt nor the tool schemas nor what the gateway
+    // compressed — so losing it on restart is what made a restored conversation read as empty.
+    ctxFloor: _ctxReadingForStorage(session),
     lastRun: session?._lastRunState && typeof session._lastRunState === "object" ? session._lastRunState : undefined,
     pendingSends: Array.isArray(session?._pendingSends) ? session._pendingSends.slice(-20) : undefined,
     created: session?.created,
@@ -15420,7 +15436,7 @@ function _restoreClosedChatSession(closedIndex) {
   session.created = sData.created || Date.now();
   if (sData.intentState && typeof sData.intentState === "object") session._intentState = sData.intentState;
   if (Array.isArray(sData.semanticFlags)) session._semanticProfileFlags = sData.semanticFlags.slice();
-  if (sData.ctxFloor && Number(sData.ctxFloor.total) > 0) session._ctxRealFloor = { ...sData.ctxFloor };
+  { const _ctxRead = _ctxReadingFromStorage(sData.ctxFloor); if (_ctxRead) session._ctxRealFloor = _ctxRead; }
   if (sData.lastRun && typeof sData.lastRun === "object") session._lastRunState = sData.lastRun;
   if (typeof sData.html === "string" && sData.html) session._htmlSnapshot = sData.html;
   if (sData.memory) {
@@ -15654,9 +15670,7 @@ function _chatSessionDataForStorage(s, mediaBudget, includeHtml = false, options
     intentState: s?._intentState && typeof s._intentState === "object" ? s._intentState : undefined,
     semanticFlags: Array.isArray(s?._semanticProfileFlags) && s._semanticProfileFlags.length
       ? s._semanticProfileFlags.slice() : undefined,
-    ctxFloor: Number(s?._ctxRealFloor?.total) > 0
-      ? { total: Number(s._ctxRealFloor.total), at: Number(s._ctxRealFloor.at) || 0 }
-      : undefined,
+    ctxFloor: _ctxReadingForStorage(s),
     lastRun: s?._lastRunState && typeof s._lastRunState === "object" ? s._lastRunState : undefined,
     created: s?.created,
   };
@@ -16100,7 +16114,7 @@ async function restoreChatHistory() {
         if (sData.anchorRoot) session._anchorRoot = sData.anchorRoot; // 恢复工作区锚点：重开后换文件夹能触发"忘掉旧路径"提示
         if (sData.intentState && typeof sData.intentState === "object") session._intentState = sData.intentState;
         if (Array.isArray(sData.semanticFlags)) session._semanticProfileFlags = sData.semanticFlags.slice();
-        if (sData.ctxFloor && Number(sData.ctxFloor.total) > 0) session._ctxRealFloor = { ...sData.ctxFloor };
+        { const _ctxRead = _ctxReadingFromStorage(sData.ctxFloor); if (_ctxRead) session._ctxRealFloor = _ctxRead; }
         if (sData.lastRun && typeof sData.lastRun === "object") session._lastRunState = sData.lastRun;
         // Rendered-transcript snapshot (disk store only) — consumed lazily by
         // _renderSessionHistory when this tab is first shown, restoring the full
@@ -16428,6 +16442,21 @@ function _tokenShort(n) {
 function _tokenExact(n) {
   return Math.max(0, Math.round(Number(n) || 0)).toLocaleString("en-US");
 }
+/**
+ * The number inside the ring: four characters at most, because the ring is 30px across.
+ *
+ * It used to be the percentage, and that is what the user was looking at when they said the
+ * meter was not showing a real context. Against a membership-sized window a genuine hundred-
+ * thousand-token conversation rounds to "0" — technically true, useless to read. The count is
+ * the thing being asked about; the arc still carries how full the window is.
+ */
+function _tokenRingLabel(n) {
+  const v = Math.max(0, Math.round(Number(n) || 0));
+  if (v >= 1_000_000) return (v / 1_000_000).toFixed(v >= 10_000_000 ? 0 : 1) + "M";
+  if (v >= 10_000) return Math.round(v / 1000) + "k";
+  if (v >= 1_000) return (v / 1000).toFixed(1) + "k";
+  return String(v);
+}
 function _contextMeterSnapshot(input = {}) {
   const cfg = (() => { try { return loadConfig(); } catch { return {}; } })();
   const model = String(input.model || cfg.model || cfg.gatewayModel || "").trim();
@@ -16443,16 +16472,131 @@ function _contextMeterSnapshot(input = {}) {
   // null 穿透 = 上游没报缓存字段（≠ 真 0），仪表按"未上报"渲染
   const _cRaw = input.cachedTokens ?? input.cached_tokens ?? input.cached;
   const cached = _cRaw == null ? null : Math.max(0, Math.round(Number(_cRaw) || 0));
+  const cacheWrite = Math.max(0, Math.round(Number(input.cacheCreationTokens ?? input.cache_creation_tokens) || 0));
   // Prompt tokens are the context sent into this request; completion tokens become
   // part of the next request's context, so show prompt+completion as live pressure.
   const total = Math.max(0, prompt + completion);
   const pct = Math.max(0, Math.min(999, Math.round((total / limit) * 100)));
   return {
-    prompt, completion, cached, total, pct, limit, model,
+    prompt, completion, cached, cacheWrite, total, pct, limit, model,
     estimated: input.estimated !== false,
     source: String(input.source || (input.estimated === false ? "usage" : "estimate")),
     anyReal: input.estimated === false || !!input.anyReal,
   };
+}
+
+/**
+ * The tokens the model actually read this turn — cache included.
+ *
+ * Providers disagree about whether the prompt count already contains the cached part, and
+ * assuming the wrong one is what made the meter look dead. On an Anthropic route a warm turn
+ * reports a few thousand "input" tokens no matter how long the conversation has grown, because
+ * everything else was served from cache and counted under separate names. Reading only the
+ * prompt count there measures the tail of the conversation, which does not grow — so the meter
+ * sat near zero through a hundred-thousand-token session.
+ *
+ * The discriminator is whether the provider reported a cache-read field at all, which only the
+ * transport can see; by the time a reading reaches here it says so with `normalized`. The
+ * fallbacks are for the billing settlement, which merges the two shapes and loses that fact:
+ * a non-zero cache-write count only ever occurs on the shape that excludes cache, and where
+ * even that is absent the larger of the two numbers is right for one shape and short by the
+ * uncached tail for the other — never doubled, which is the failure that matters.
+ */
+function _contextInputTokens({ prompt = 0, cacheRead = null, cacheWrite = 0, normalized = false } = {}) {
+  const p = Math.max(0, Math.round(Number(prompt) || 0));
+  const read = cacheRead == null ? 0 : Math.max(0, Math.round(Number(cacheRead) || 0));
+  const write = Math.max(0, Math.round(Number(cacheWrite) || 0));
+  if (normalized) return p;
+  if (write > 0) return p + read + write;
+  if (read > 0) return Math.max(p, read);
+  return p;
+}
+
+/**
+ * Record what the provider said this turn's context weighed, on the session, where it is saved.
+ *
+ * A reading for the same request can arrive twice — once off the stream, once from the billing
+ * settlement — and only the stream copy knows which provider shape produced it. Keeping the
+ * larger of the two keeps the exact one. Across different requests the newer reading wins even
+ * when it is smaller, because compaction genuinely does shrink the context and a gauge that
+ * only ever climbs would hide the one moment the user most wants to see.
+ */
+function _applyContextReading(session, reading = {}) {
+  const input = Math.max(0, Math.round(Number(reading.input) || 0));
+  const output = Math.max(0, Math.round(Number(reading.output) || 0));
+  const total = input + output;
+  if (!session || total <= 0) return false;
+  const prev = session._ctxRealFloor;
+  const sameRequest = prev && reading.requestId && prev.requestId === reading.requestId;
+  if (sameRequest && Math.max(0, Number(prev.total) || 0) >= total) return false;
+  session._ctxRealFloor = {
+    total,
+    input,
+    output,
+    cacheRead: reading.cacheRead == null ? null : Math.max(0, Math.round(Number(reading.cacheRead) || 0)),
+    cacheWrite: Math.max(0, Math.round(Number(reading.cacheWrite) || 0)),
+    model: String(reading.model || ""),
+    requestId: String(reading.requestId || ""),
+    at: Date.now(),
+  };
+  return true;
+}
+
+/**
+ * The reading in the shape it is written to disk, and back.
+ *
+ * One writer and one reader because there are two serializers and two rehydrators, and the last
+ * three fields the session record gained were each lost in one of the copies before this pair
+ * existed. Round-tripping is what makes the meter survive a restart: it is the only number in
+ * the conversation the client cannot recompute for itself.
+ */
+function _ctxReadingForStorage(session) {
+  const real = session?._ctxRealFloor;
+  const total = Math.max(0, Number(real?.total) || 0);
+  if (total <= 0) return undefined;
+  return {
+    total,
+    input: Math.max(0, Number(real.input) || 0),
+    output: Math.max(0, Number(real.output) || 0),
+    cacheRead: real.cacheRead == null ? null : Math.max(0, Number(real.cacheRead) || 0),
+    cacheWrite: Math.max(0, Number(real.cacheWrite) || 0),
+    model: String(real.model || ""),
+    requestId: String(real.requestId || ""),
+    at: Number(real.at) || 0,
+  };
+}
+function _ctxReadingFromStorage(stored) {
+  const total = Math.max(0, Number(stored?.total) || 0);
+  if (total <= 0) return null;
+  const output = Math.max(0, Number(stored.output) || 0);
+  return {
+    total,
+    // Records written before the breakdown existed carry a total and nothing else. Treating all
+    // of it as input keeps those conversations reading their real size instead of empty.
+    input: Math.max(0, Number(stored.input) || Math.max(0, total - output)),
+    output,
+    cacheRead: stored.cacheRead == null ? null : Math.max(0, Number(stored.cacheRead) || 0),
+    cacheWrite: Math.max(0, Number(stored.cacheWrite) || 0),
+    model: String(stored.model || ""),
+    requestId: String(stored.requestId || ""),
+    at: Number(stored.at) || 0,
+  };
+}
+
+/** Paint the meter from a session's stored reading — the same shape whether it was just
+ *  measured or read back off disk, so a reopened conversation and a live one agree. */
+function _setContextMeterFromReading(real, draftTokens = 0) {
+  const output = Math.max(0, Number(real?.output) || 0);
+  const input = Math.max(0, Number(real?.input) || Math.max(0, (Number(real?.total) || 0) - output));
+  const draft = Math.max(0, Math.round(Number(draftTokens) || 0));
+  _setContextMeter({
+    promptTokens: input + draft,
+    completionTokens: output,
+    cachedTokens: real?.cacheRead == null ? null : Number(real.cacheRead) || 0,
+    cacheCreationTokens: Number(real?.cacheWrite) || 0,
+    estimated: false,
+    source: draft ? "真实 usage + 草稿" : "真实 usage",
+  });
 }
 function _setContextMeter(input = {}) {
   _ctxMeter = { ..._ctxMeter, ..._contextMeterSnapshot(input) };
@@ -16474,17 +16618,26 @@ function _estimateActiveSessionContextTokens(draftText = "") {
     }
     const draft = String(draftText || "");
     const draftTokens = draft.trim() ? Math.max(1, _estRequestTokens([{ role: "user", content: draft }], [])) : 0;
-    // 会话地板：本地 assemble 估算看不见 system prompt/工具 schema/上下文块，常比真实请求
-    // 小得多——若直接用它替换真实 usage 读数，打字瞬间仪表就“每轮归零”。取 max 联合：
-    // 估算只能在真实地板之上叠加，下一次主对话真实 usage 会重新校准地板（含压缩后下降）。
-    const floor = Math.max(0, Number(session?._ctxRealFloor?.total) || 0);
-    return Math.max(_ctxBaseCache.tokens, floor) + draftTokens;
+    return _ctxBaseCache.tokens + draftTokens;
   } catch { return 0; }
 }
 function _refreshContextMeterFromDraft(options = {}) {
   try {
     const force = !!options.force;
     const draft = (typeof promptEl !== "undefined" && promptEl) ? String(promptEl.value || "") : "";
+    const session = (typeof _currentSession === "function") ? _currentSession() : null;
+    const real = session?._ctxRealFloor;
+    // Once the provider has reported on this conversation, that reading IS the context, and the
+    // local estimate stops being consulted at all. It cannot see the system prompt, the tool
+    // schemas or the injected context blocks, so mixing it in could only distort a number that
+    // is already exact — and re-deriving it meant re-assembling the whole transcript on a timer
+    // while the user typed. The draft is added on top because those tokens are real too: they
+    // go up with the next send.
+    if (Math.max(0, Number(real?.total) || 0) > 0) {
+      const draftTokens = draft.trim() ? Math.max(1, _estRequestTokens([{ role: "user", content: draft }], [])) : 0;
+      _setContextMeterFromReading(real, draftTokens);
+      return;
+    }
     // Empty composer after a completed turn keeps the last real/estimated pressure
     // visible. Force is used when switching/closing tabs because the active session changed.
     if (!force && !draft.trim() && _ctxMeter.total > 0) {
@@ -16494,6 +16647,37 @@ function _refreshContextMeterFromDraft(options = {}) {
     const prompt = _estimateActiveSessionContextTokens(draft);
     _setContextMeter({ promptTokens: prompt, completionTokens: 0, cachedTokens: null, estimated: true, source: draft.trim() ? "draft" : "session" });
   } catch { _renderTokenMeter(); }
+}
+
+/**
+ * Usage straight off the stream — the reading the meter actually runs on.
+ *
+ * It arrives with the final chunk of every model turn, so the gauge moves while the run is still
+ * going, and the transport has already normalized it across provider shapes. The billing
+ * settlement is polled separately and lands later; it stays the source of truth for cost, not
+ * for context. Aux and sub-agent turns are excluded: their small prompts would stamp the main
+ * conversation's reading down to their own size, which is the "resets every turn" behaviour the
+ * settlement path already guards against.
+ */
+function _recordStreamUsage(ev, opts = {}) {
+  try {
+    if (!ev || opts.aux) return;
+    const changed = _applyContextReading(opts.session, {
+      input: _contextInputTokens({
+        prompt: ev.promptTokens ?? ev.prompt_tokens ?? 0,
+        cacheRead: ev.cachedTokens ?? ev.cached_tokens,
+        cacheWrite: ev.cacheCreationTokens ?? ev.cache_creation_tokens,
+        normalized: true,
+      }),
+      output: ev.completionTokens ?? ev.completion_tokens ?? 0,
+      cacheRead: ev.cachedTokens ?? ev.cached_tokens,
+      cacheWrite: ev.cacheCreationTokens ?? ev.cache_creation_tokens,
+      model: opts.model || "",
+      requestId: opts.requestId || "",
+    });
+    if (!changed || opts.session !== _currentSession()) return;
+    _setContextMeterFromReading(opts.session._ctxRealFloor, 0);
+  } catch { /* never let accounting break a turn */ }
 }
 function _recordUsage(ev, opts = {}) {
   try {
@@ -16514,9 +16698,24 @@ function _recordUsage(ev, opts = {}) {
     // 子代理/辅助调用（aux）只进累计账，**不得覆写上下文仪表**——它们的小 prompt 会把
     // 主对话几十 k 的读数直接“归零”，用户看到的就是每轮重置。
     if (opts.aux) return;
-    // 主对话真实 usage = 会话上下文地板：打字期的本地估算永不低于它（见 _estimateActiveSessionContextTokens）。
-    if (!est && opts.session) opts.session._ctxRealFloor = { total: Math.max(0, pin + out), at: Date.now() };
-    _setContextMeter({ promptTokens: pin, completionTokens: out, cachedTokens: hasCacheInfo ? cached : null, estimated: est, source: est ? "估算" : "真实 usage" });
+    if (est || !opts.session) {
+      _setContextMeter({ promptTokens: pin, completionTokens: out, cachedTokens: hasCacheInfo ? cached : null, estimated: est, source: est ? "估算" : "真实 usage" });
+      return;
+    }
+    // The settlement merges the two provider shapes into one `cached_tokens` column, so it can
+    // no longer prove which one produced these numbers — see _contextInputTokens. The stream
+    // reading for this same request already landed and is exact; keeping the larger of the two
+    // is what stops this later, blunter copy from walking the meter backwards.
+    const cacheWrite = Number(ev.cacheCreationTokens ?? ev.cache_creation_tokens) || 0;
+    _applyContextReading(opts.session, {
+      input: _contextInputTokens({ prompt: pin, cacheRead: hasCacheInfo ? cached : null, cacheWrite }),
+      output: out,
+      cacheRead: hasCacheInfo ? cached : null,
+      cacheWrite,
+      model: String(ev.model || ""),
+      requestId: String(opts.requestId || ev.requestId || ""),
+    });
+    if (opts.session === _currentSession()) _setContextMeterFromReading(opts.session._ctxRealFloor, 0);
   } catch { /* never let accounting break a turn */ }
 }
 
@@ -16890,10 +17089,12 @@ function _renderTokenMeter() {
   const sourceText = state.source === "draft" ? "输入中估算"
     : state.source === "session" ? "当前会话估算"
       : state.source || (state.estimated ? "估算" : "真实 usage");
-  const text = `上下文缓存 ${pct}% · ${k(state.total)} / ${k(state.limit)}${state.estimated ? "（估算）" : ""}${_thinkShort}`;
-  const tooltip = `上下文缓存：${pct}%（${k(state.total)} / ${k(state.limit)}）` +
+  const cacheWrite = Math.max(0, Number(state.cacheWrite) || 0);
+  const uncached = Math.max(0, (state.prompt || 0) - (Number(state.cached) || 0) - cacheWrite);
+  const text = `上下文 ${k(state.total)} / ${k(state.limit)}（${pct}%）${state.estimated ? "（估算）" : ""}${_thinkShort}`;
+  const tooltip = `上下文占用：${_tokenExact(state.total)} / ${_tokenExact(state.limit)} tokens（${pct}%）` +
     `\n来源：${sourceText}${state.model ? ` · 模型 ${state.model}` : ""}` +
-    `\n最近请求：输入 ${state.prompt || 0}（${state.cached == null ? "缓存 未上报" : `缓存 ${state.cached}，未缓存 ${Math.max(0, (state.prompt || 0) - state.cached)}`}）· 输出 ${state.completion || 0}` +
+    `\n最近请求：输入 ${_tokenExact(state.prompt || 0)}（${state.cached == null ? "缓存 未上报" : `缓存读取 ${_tokenExact(state.cached)} · 缓存写入 ${_tokenExact(cacheWrite)} · 未缓存 ${_tokenExact(uncached)}`}）· 输出 ${_tokenExact(state.completion || 0)}` +
     `\n本会话累计 usage：输入 ${_tok.in}（${_tok.anyCacheInfo ? `缓存命中 ${_tok.cached}，约 ${cumHit}%` : "缓存 上游未上报"}）· 输出 ${_tok.out}` +
     _thinkDetail +
     (pct >= 100 ? "\n状态：已达到/超过上下文窗口，后续应优先压缩旧上下文或摘要化历史。"
@@ -16919,7 +17120,9 @@ function _renderTokenMeter() {
     el.classList.toggle("is-full", pct >= 100);
     el.style.setProperty("--cache-ring-offset", String(Math.max(0, Math.min(100, 100 - ringPct))));
     const label = el.querySelector(".cache-ring__label");
-    if (label) label.textContent = pct >= 100 ? "满" : String(pct);
+    const labelText = _tokenRingLabel(state.total);
+    if (label) label.textContent = labelText;
+    el.classList.toggle("is-compact", labelText.length >= 4);
     el.removeAttribute("title");
     el.dataset.tooltip = tooltip;
     el.setAttribute("aria-label", text);
@@ -23380,6 +23583,11 @@ async function sendPrompt(text, attachments = [], readyConfig = null) {
       // path's `if (!_live()) return`). Without this the callback kept appending to `acc` and
       // kept firing tool calls after Stop, and the finally then rendered the full answer
       // anyway — i.e. Stop didn't actually stop ("停不掉"). 代际校验防新回合把旧回调救活。
+      // Usage is read before the Stop gate: stopping does not un-spend what the model read.
+      if (ev && ev.kind === "usage") {
+        _recordStreamUsage(ev, { session: sess, model: config?.model || "", requestId: sess._reqId });
+        return false;
+      }
       if (!_turnLive()) return false;
       if (ev && ev.kind === "streamMetric") { _plainRecordStreamMetric(ev); return false; }
       if (ev && ev.kind === "compressionPrefix") { _mcPrefixSet(ev.token, ev.covered, _mcSourceMessagesPlain); return false; }
@@ -23471,8 +23679,9 @@ async function sendPrompt(text, attachments = [], readyConfig = null) {
         completion_tokens: _plainSettlement.completionTokens,
         cached_tokens: _plainSettlement.cachedTokens,
         cache_creation_tokens: _plainSettlement.cacheCreationTokens,
+        model: _plainSettlement.model,
         estimated: false,
-      }, { session: sess });
+      }, { session: sess, requestId: sess._reqId });
     }
     // 确保所有悬空的<think>标签都流入思考卡而非答案
     _flushUnfinishedThink();
@@ -36068,6 +36277,12 @@ async function _agentModelTurn({ config, messages, toolSchemas, toolRegistry = n
           _recordStreamMetric(ev);
           return false;
         }
+        // Ahead of the Stop gate below on purpose: stopping the run does not un-spend the
+        // tokens the model already read, and the meter has to keep saying what is in there.
+        if (ev && ev.kind === "usage") {
+          _recordStreamUsage(ev, { session, aux: meterScope !== "main", model: _turnConfig?.model || "", requestId: _turnReqId });
+          return false;
+        }
         // User hit Stop: drop every further streamed event so output halts at once
         // (the backend turn keeps running but we render nothing more, and the loop's
         // `if (!_live()) break` ends the run after this turn settles).
@@ -36315,8 +36530,9 @@ async function _agentModelTurn({ config, messages, toolSchemas, toolRegistry = n
         completion_tokens: settlement.completionTokens,
         cached_tokens: settlement.cachedTokens,
         cache_creation_tokens: settlement.cacheCreationTokens,
+        model: settlement.model,
         estimated: false,
-      }, { aux: meterScope !== "main", session });
+      }, { aux: meterScope !== "main", session, requestId: _turnReqId });
     }
     try {
       if (session) {

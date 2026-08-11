@@ -284,6 +284,10 @@ AUTO_LOAD_DEPS = {
   // Injecting the REAL table (not a stub) is what makes "gitlab_search still maps" a genuine
   // assertion about shipped behaviour.
   _RETIRED_SEARCH_ALIASES: loadConst("_RETIRED_SEARCH_ALIASES"),
+  // Both session serializers call this. Leaving it out does not fail loudly: the sync flush
+  // wraps its write in a catch, so a missing dependency there looks exactly like a quota
+  // rejection and the whole chat store silently goes unwritten.
+  _ctxReadingForStorage: load("_ctxReadingForStorage"),
 };
 // _selectInitialTools is loaded in many isolated tests. Keep its resolved
 // intent-boundary helpers available in the shared harness rather than making
@@ -5110,16 +5114,19 @@ test("token cache meter is a persistent context ring beside the composer voice b
     "cache ring should be placed immediately before the voice button in the composer");
   assert.doesNotMatch(INDEX_HTML, /id="tokenMeter"[^>]*hidden/);
   assert.doesNotMatch(INDEX_HTML, /id="tokenMeter"[^>]*title=/);
-  assert.match(INDEX_HTML, /id="tokenMeter"[^>]*data-tooltip="上下文缓存：0%"/);
+  assert.match(INDEX_HTML, /id="tokenMeter"[^>]*data-tooltip="上下文占用：0 tokens"/);
   assert.match(SRC, /const _CONTEXT_RING_WARN_PCT = 65/);
   assert.match(SRC, /const _CONTEXT_RING_DANGER_PCT = 85/);
   assert.match(SRC, /_refreshContextMeterFromDraft\(\{ force: true \}\)/);
   assert.match(SRC, /_setContextMeter\(\{ promptTokens: pin, completionTokens: out, cachedTokens: hasCacheInfo \? cached : null, estimated: est/,
     "真实 usage 也要区分「上游没报缓存字段」与真 0");
   assert.match(SRC, /el\.style\.setProperty\("--cache-ring-offset", String\(Math\.max\(0, Math\.min\(100, 100 - ringPct\)\)\)\)/);
-  assert.match(SRC, /label\.textContent = pct >= 100 \? "满" : String\(pct\)/);
+  // The ring carries the token count; the arc carries how full the window is. A percentage in
+  // the middle rounded a real 125k conversation to "0" against a membership-sized window.
+  assert.match(SRC, /const labelText = _tokenRingLabel\(state\.total\);/);
   assert.match(SRC, /el\.dataset\.tooltip = tooltip/);
-  assert.match(SRC, /上下文缓存 \$\{pct\}%/);
+  assert.match(SRC, /上下文 \$\{k\(state\.total\)\} \/ \$\{k\(state\.limit\)\}（\$\{pct\}%）/,
+    "the screen-reader label states the size and the window, not a bare percentage");
   assert.match(APP_CSS, /\.cache-ring\s*\{[^}]*margin-left:\s*auto;[\s\S]*?width:\s*30px;[\s\S]*?height:\s*30px;/);
   assert.match(APP_CSS, /\.cache-ring\s*\{[^}]*background:\s*transparent;/);
   assert.match(APP_CSS, /\.cache-ring__progress\s*\{[^}]*stroke-dashoffset:\s*var\(--cache-ring-offset\)/);

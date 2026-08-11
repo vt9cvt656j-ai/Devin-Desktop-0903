@@ -281,10 +281,16 @@ pub enum AiEvent {
     Done,
     /// Token accounting from the final stream chunk — lets the UI show how much of
     /// the prompt was served from cache (the payoff of the prompt-cache work).
+    ///
+    /// `prompt_tokens` is normalized to the tokens the model actually read this turn,
+    /// cache included, so the frontend can use it as the context reading without
+    /// knowing which provider shape produced it. `cached_tokens`/`cache_creation_tokens`
+    /// are the breakdown of that total, not extras to be added to it.
     Usage {
         prompt_tokens: u32,
         completion_tokens: u32,
         cached_tokens: u32,
+        cache_creation_tokens: u32,
     },
     Error {
         message: String,
@@ -2620,6 +2626,7 @@ async fn ai_chat_inner(
                         prompt_tokens: prompt as u32,
                         completion_tokens: completion as u32,
                         cached_tokens: cached as u32,
+                        cache_creation_tokens: cache_creation as u32,
                     });
                 }
             }

@@ -150,10 +150,10 @@ fn classify(samples: &[String]) -> ColumnKind {
     ColumnKind::Text
 }
 
-/// A first row is a header when it is all text, all non-empty, all distinct, and at least one
-/// column below it is not text. A file of strings throughout is ambiguous, and there the answer is
-/// "yes" because a spreadsheet almost always has one.
-fn detect_header(first: &[String], rest: &[Vec<String>]) -> bool {
+/// A first row is a header when it is all text, all non-empty, and all distinct. The rows below
+/// are not consulted: a file of strings throughout is genuinely ambiguous, and there the answer is
+/// "yes" anyway, because a spreadsheet almost always has one.
+fn detect_header(first: &[String]) -> bool {
     if first.is_empty() || first.iter().any(|c| c.trim().is_empty()) {
         return false;
     }
@@ -212,7 +212,7 @@ pub fn read_table(path: &Path, max_rows: Option<usize>) -> Result<TablePreview, 
         return Err("这个文件里没有可解析的表格行。".into());
     }
 
-    let has_header = detect_header(&rows[0], &rows[1..]);
+    let has_header = detect_header(&rows[0]);
     let header = if has_header { rows.remove(0) } else { Vec::new() };
     if has_header {
         total = total.saturating_sub(1);
