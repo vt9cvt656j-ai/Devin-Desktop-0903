@@ -137,8 +137,12 @@ test("续传的安全线是「是否已执行」，而非「是否有工具在�
   const body = turn.slice(0, turn.indexOf("onResume:"));
   assert.doesNotMatch(body, /if \(byIndex\.size > 0\) return null;/,
     "不再因为「有工具在途」就整轮弃疗");
-  assert.match(body, /const eagerExecuted = \[\.\.\.byIndex\.values\(\)\]\.some\(\(e\) => e && e\._eagerNotified\)/,
-    "停的判据是 eager write 真的执行过（_eagerNotified），不是有没有工具调用");
+  // 这条注释本来就写着"真的执行过"，钉住的却是 _eagerNotified —— 那个标记只表示钩子被叫过
+  // 一次。钩子内部一串前置条件（意图未落定、有排队的插话、参数 parse 不过……）任何一条不满足
+  // 就直接 return，一个字节都没写。真正代表落盘的是 _eagerDone，注释说的一直是它。
+  assert.match(body, /const eagerExecuted = \[\.\.\.byIndex\.values\(\)\]\.some\(\(e\) => e && e\._eagerDone\)/,
+    "停的判据是 eager write 真的落了盘（_eagerDone），不是钩子被叫过（_eagerNotified）");
+  assert.match(SRC, /entry\._eagerDone = true;/, "_eagerDone 只在真正进入执行时才置位");
   assert.match(body, /if \(mode === "stop"\) return null;/,
     "只有 eager write 已落盘这一种情况才停下把决定权交回用户");
   assert.match(body, /byIndex\.clear\(\);/,
