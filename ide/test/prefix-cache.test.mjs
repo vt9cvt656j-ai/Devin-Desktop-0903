@@ -423,6 +423,12 @@ test("Files can point @ at a folder the workspace does not have yet", () => {
   const fn = SRC.slice(SRC.indexOf("async function _atAddFolder"), SRC.indexOf("/** Which folder the Files branch is showing"));
   assert.match(fn, /await _addWorkspaceRoot\(picked\)/, "registration is not optional");
   assert.match(fn, /_atMode = "files";/, "and it lands you back in Files, inside the new folder");
+  // The native chooser blurs the composer, and the blur handler hides this menu 150ms later,
+  // clearing _atMode and _atDir. Setting them again after the dialog resolves renders into a menu
+  // whose token is gone — nothing lists. Focus must return before the render.
+  assert.match(fn, /promptEl\.focus\(\);/, "focus has to come back to the composer");
+  assert.match(fn, /requestAnimationFrame/, "and the render must wait for the caret to land");
+  assert.match(fn, /if \(!_atToken\(\)\)/, "a lost token must be reported, not silently ignored");
   // The row is offered only at the top level with no query — mid-search it would be noise.
   assert.match(SRC, /if \(!_atDir && !query\) \{\s*rows\.unshift\(\{\s*kind: "add-folder"/);
 });
