@@ -546,3 +546,49 @@ test("the request-boundary markers the client emits are exactly the ones the gat
   assert.ok(current && core(current[1]) === core(clientMarkers[0]),
     "the first entry of _REQUEST_MARKERS must be the gateway's current USER_REQUEST_MARKER");
 });
+
+test("every semantic flag the client declares is one the gateway accepts and routes", () => {
+  // Same two-files-in-two-languages problem as the request marker, but it fails silently in a
+  // worse way: the gateway filters the profile through an allow-list, so a flag main.js emits
+  // that prompts.rs does not list is not an error anywhere — it is simply dropped, and the
+  // prompt block it was supposed to route never loads. Nothing goes red; the model just stops
+  // being told something. (Measured: the `defects` flag did exactly this until it was allowed.)
+  const emit = /function _ideSemanticProfile\(profile\) \{[\s\S]*?\n\}/.exec(SRC);
+  assert.ok(emit, "_ideSemanticProfile has moved or been renamed in main.js");
+  const clientFlags = [...emit[0].matchAll(/\badd\("([a-z0-9_]+)"/g)].map((m) => m[1]);
+  assert.ok(clientFlags.length >= 15, "the semantic profile's flag list has collapsed");
+
+  const rust = readFileSync(join(HERE, "../../server/src/prompts.rs"), "utf8");
+  const allowList = /const IDE_SEMANTIC_PROFILE_FLAGS: &\[&str\] = &\[([\s\S]*?)\];/.exec(rust);
+  assert.ok(allowList, "IDE_SEMANTIC_PROFILE_FLAGS has moved or been renamed in prompts.rs");
+  const accepted = new Set([...allowList[1].matchAll(/"([a-z0-9_]+)"/g)].map((m) => m[1]));
+
+  for (const flag of clientFlags) {
+    assert.ok(accepted.has(flag),
+      `main.js emits the semantic flag "${flag}" but prompts.rs drops it — its prompt block never loads`);
+  }
+
+  // A flag that is accepted but consumed by nobody is the same defect seen from the other end:
+  // the client spends a declaration on it every turn and the gateway does nothing with it. These
+  // seven are the ones that were already inert when this test was written — protocol surface with
+  // no block behind it yet. The baseline is here so no NEW one joins them unnoticed; shrinking it
+  // is always allowed.
+  const KNOWN_INERT = new Set([
+    "official", "community", "collaboration_staged", "collaboration_parallel",
+    "existing_project", "existing_website", "network_capture",
+  ]);
+  const graph = JSON.parse(readFileSync(join(HERE, "../../server/prompts/prompt_graph.json"), "utf8"));
+  const routed = new Set([
+    ...Object.keys(graph.agent), ...Object.keys(graph.design), ...Object.keys(graph.modes),
+  ]);
+  const consumed = (flag) => routed.has(flag) || new RegExp(`semantic\\("${flag}"\\)`).test(rust);
+  for (const flag of clientFlags) {
+    if (KNOWN_INERT.has(flag)) continue;
+    assert.ok(consumed(flag),
+      `the semantic flag "${flag}" is declared and accepted but selects no prompt module`);
+  }
+  for (const flag of KNOWN_INERT) {
+    assert.ok(clientFlags.includes(flag) && !consumed(flag),
+      `"${flag}" is no longer inert — take it out of KNOWN_INERT instead of leaving the baseline stale`);
+  }
+});

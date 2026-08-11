@@ -4,11 +4,12 @@
     "chat": ["chat", "truthfulness", "answer_quality"],
     "plan": ["plan", "truthfulness", "answer_quality"],
     "explorer": ["explorer", "truthfulness", "answer_quality"],
-    "reviewer": ["reviewer", "truthfulness", "answer_quality"]
+    "reviewer": ["reviewer", "defect_hunting", "truthfulness", "answer_quality"]
   },
   "agent": {
     "base": ["agent_core", "reasoning", "truthfulness", "answer_quality"],
     "engineering": ["agent_engineering"],
+    "defects": ["defect_hunting"],
     "collaboration": ["agent_collaboration"],
     "research": ["agent_research"],
     "automation": ["agent_automation"],

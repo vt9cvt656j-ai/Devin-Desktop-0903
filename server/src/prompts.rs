@@ -45,6 +45,10 @@ struct PromptGraph {
 struct AgentPromptGraph {
     base: Vec<String>,
     engineering: Vec<String>,
+    /// Defaulted so a graph file written before the defect block still parses; an empty
+    /// list simply routes no defect module rather than failing the whole request.
+    #[serde(default)]
+    defects: Vec<String>,
     collaboration: Vec<String>,
     research: Vec<String>,
     automation: Vec<String>,
@@ -1713,7 +1717,7 @@ fn has_explicit_mutation_directive(query: &str) -> bool {
             && (explicit_lead_in || !asks_for_advice))
 }
 
-fn validated_user_timezone(
+pub(crate) fn validated_user_timezone(
     name: &str,
     claimed_offset_minutes: i32,
     now_utc: chrono::DateTime<chrono::Utc>,
@@ -3218,10 +3222,15 @@ fn looks_like_ui_data_task(q: &str) -> bool {
 
 const IDE_SEMANTIC_PROFILE_FLAGS: &[&str] = &[
     "engineering",
+    "defects",
     "research",
     "official",
     "community",
     "automation",
+    // The client has always declared this one and the allow-list has always dropped it, so the
+    // two ends disagreed about what the protocol even contains. Nothing routes on it yet; listing
+    // it makes the wire contract honest and keeps the cross-language check meaningful.
+    "network_capture",
     "git",
     "collaboration",
     "collaboration_staged",
@@ -3392,10 +3401,17 @@ pub fn assemble_into(headers: &HeaderMap, body: &mut serde_json::Value) -> Resul
     let research_intent = mode == "agent" && semantic("research");
     let automation_intent = mode == "agent" && semantic("automation");
     let git_intent = mode == "agent" && semantic("git");
+    // A deep defect hunt needs the class catalogue the reviewer subagent has always had and the
+    // main agent never did. Routed on its own flag rather than folded into `engineering`, because
+    // it is a heavy block and most engineering turns are building something, not auditing it.
+    let defects_intent = mode == "agent" && semantic("defects");
 
     if mode == "agent" {
         if engineering_intent {
             append_prompt_modules(&graph.agent.engineering, &mut sys, &mut prompt_blocks)?;
+        }
+        if defects_intent {
+            append_prompt_modules(&graph.agent.defects, &mut sys, &mut prompt_blocks)?;
         }
         if collaboration_intent {
             append_prompt_modules(&graph.agent.collaboration, &mut sys, &mut prompt_blocks)?;
@@ -3632,6 +3648,7 @@ const PROMPT_NAMES: &[&str] = &[
     "agent_core",
     "reasoning",
     "agent_engineering",
+    "defect_hunting",
     "agent_collaboration",
     "agent_research",
     "agent_automation",
@@ -5594,6 +5611,64 @@ mod tests {
         assert!(!system.contains("# michael-design 设计体系（"));
         assert!(!system.contains("michael-design blueprint"));
         assert!(system.contains("# Reasoning discipline"));
+    }
+
+    /// The class catalogue is what makes a deep hunt find injection, IDOR, and use-after-free
+    /// instead of only whatever the diff touched. It rides its own flag, so an ordinary build
+    /// turn must not pay for it — and a hunt must not silently lose it.
+    #[test]
+    fn defect_hunt_routes_the_class_catalogue_and_ordinary_engineering_does_not() {
+        let assemble = |profile: &str| {
+            let mut headers = HeaderMap::new();
+            headers.insert("x-ide-mode", "agent".parse().unwrap());
+            headers.insert("x-ide-semantic-profile", profile.parse().unwrap());
+            let mut body = serde_json::json!({
+                "model": "claude-opus-5",
+                "messages": [{ "role": "user", "content": "深度找出这个项目的 bug 和漏洞" }]
+            });
+            assemble_into(&headers, &mut body);
+            body["messages"][0]["content"].as_str().unwrap().to_string()
+        };
+
+        let hunting = assemble("2.5:engineering,defects");
+        assert!(hunting.contains("# Loaded when the task is a deep defect hunt"));
+        // The classes that had no home anywhere before this block existed.
+        for class in [
+            "use-after-free",
+            "IDOR / broken object-level authorization",
+            "SSRF",
+            "prototype pollution",
+            "Mass assignment",
+        ] {
+            assert!(hunting.contains(class), "defect catalogue lost: {class}");
+        }
+
+        let building = assemble("2.5:engineering");
+        assert!(building.contains("# Loaded per task: engineering implementation"));
+        assert!(!building.contains("# Loaded when the task is a deep defect hunt"));
+    }
+
+    /// Reviewer mode reports security as a first-class category, and reads the same catalogue
+    /// as the main agent rather than keeping a second copy that drifts.
+    #[test]
+    fn reviewer_mode_carries_the_shared_catalogue_and_reports_security() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-ide-mode", "reviewer".parse().unwrap());
+        let mut body = serde_json::json!({
+            "model": "claude-opus-5",
+            "messages": [{ "role": "user", "content": "审查这个仓库" }]
+        });
+        assemble_into(&headers, &mut body);
+        let system = body["messages"][0]["content"].as_str().unwrap();
+        assert!(system.contains("Report only these three categories"));
+        assert!(system.contains("Exploitable security defects"));
+        assert!(system.contains("# Loaded when the task is a deep defect hunt"));
+        // The sweep lives in exactly one file now; reviewer.txt must not grow its own copy back.
+        assert_eq!(
+            read_prompt("reviewer").unwrap().matches("use-after-free").count(),
+            0,
+            "reviewer.txt is duplicating the shared defect catalogue again"
+        );
     }
 
     #[test]
