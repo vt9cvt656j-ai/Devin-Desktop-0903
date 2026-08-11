@@ -726,3 +726,77 @@ test("the hover panel says only what it has to say, on top of the conversation",
   assert.match(APP_CSS, /\.cache-ring::after \{[\s\S]*?background: var\(--panel-solid, #fff\);/,
     "a missing custom property degrades to see-through, not to opaque");
 });
+
+const claudeGen = load("_claudeGeneration", ["_claudeGeneration"]);
+
+test("the thinking switch splits by generation, not by named version", () => {
+  // Naming versions one at a time is what left Sonnet 4.5, Opus 4.5 and Opus 4.1 on the adaptive
+  // shape: only 4.6 was listed, so everything older fell through to the modern branch and got
+  // sent `{"type":"adaptive"}` — a mode none of them supports, and on Sonnet 4.5 the effort
+  // parameter errors outright.
+  assert.equal(claudeGen("claude-opus-4-8"), 4.8);
+  assert.equal(claudeGen("claude-sonnet-5"), 5);
+  assert.equal(claudeGen("claude-opus-4-1"), 4.1);
+  assert.equal(claudeGen("claude-opus-4-0"), 4);
+  assert.equal(claudeGen("claude-fable-5"), 5);
+
+  // A dated snapshot suffix is not a minor version, wherever the family name sits in the id.
+  assert.equal(claudeGen("claude-3-7-sonnet-20250219"), 3.7);
+  assert.equal(claudeGen("claude-opus-4-5-20251101"), 4.5);
+  assert.equal(claudeGen("claude-sonnet-4-5-20250929"), 4.5);
+
+  // Unrecognised reads as newer than the table — the adaptive shape, which is the direction the
+  // API moved and the one a model released after this line will accept.
+  assert.equal(claudeGen("some-unreleased-claude"), 0);
+  assert.match(SRC, /const _gen = _claudeGeneration\(s\);\s*\n\s*if \(_gen > 0 && _gen <= 4\.6\) \{/,
+    "zero must fall through to adaptive, not into the budget branch");
+
+  // The gateway splits the same way, from the same number — the client's dial and the request
+  // the gateway actually sends have to describe one contract.
+  const RS = fs.readFileSync("../server/src/models.rs", "utf8");
+  assert.match(RS, /if claude_generation\(&m\) > 0\.0 && claude_generation\(&m\) <= 4\.6 \{/);
+  assert.match(RS, /fn claude_generation\(model_lower: &str\) -> f64 \{/);
+});
+
+test("every tier the model card offers is a tier the request can carry", () => {
+  const profile = grab("_thinkingProfileFor");
+
+  // `low` reaches the model as effort=low and always did once the client started sending effort;
+  // it was dropped back when every level below `high` collapsed to the same request.
+  assert.match(profile, /levels: _alwaysThinks \? \["low", "medium", "high", "max"\] : \["off", "low", "medium", "high", "max"\]/);
+
+  // Fable/Mythos cannot be turned off — thinking is always on there and an explicit disable is a
+  // 400. An off button would be a tier that cannot exist.
+  assert.match(profile, /const _alwaysThinks = \/fable\|mythos\/\.test\(s\);/);
+
+  // `xhigh` is absent on purpose, and the reason is the route rather than the model. Whatever the
+  // reason, the gateway must not leave it shallower than the tier below it.
+  const RS = fs.readFileSync("../server/src/models.rs", "utf8");
+  assert.match(RS, /Some\("high"\) \| Some\("xhigh"\) => 40000,/);
+  const claudeLevels = profile.match(/levels: _alwaysThinks \? \[[^\]]*\] : \[[^\]]*\]/)[0];
+  assert.doesNotMatch(claudeLevels, /xhigh/, "no button for a level this route cannot carry");
+
+  // The old hint said the dial only moved output headroom and timeouts. It sends effort.
+  assert.doesNotMatch(profile, /档位只影响输出余量与超时分级/);
+  assert.match(profile, /档位通过 output_config\.effort 送到模型/);
+});
+
+test("the native context window agrees end to end", () => {
+  // 1M on the 4.6-and-later families, 200K before them — the client budgets requests against
+  // this number and the gateway plans compression against its own copy, so a disagreement is a
+  // silent 413 or a discarded three quarters of the window.
+  const RS = fs.readFileSync("../server/src/models.rs", "utf8");
+  const nativeLimit = load("_fallbackModelContextLimit", ["_fallbackModelContextLimit"]);
+  for (const id of ["claude-opus-5", "claude-opus-4-8", "claude-opus-4-7", "claude-opus-4-6",
+                    "claude-sonnet-5", "claude-sonnet-4-6", "claude-fable-5", "claude-mythos-5"]) {
+    assert.equal(nativeLimit(id), 1_000_000, id);
+  }
+  for (const id of ["claude-opus-4-5", "claude-opus-4-1", "claude-haiku-4-5", "claude-sonnet-4-5"]) {
+    assert.equal(nativeLimit(id), 200_000, id);
+  }
+  const table = RS.slice(RS.indexOf("fn official_contexts"), RS.indexOf("fn official_context("));
+  for (const fam of ["opus-4-6", "opus-4-7", "opus-4-8", "opus-5", "sonnet-4-6", "sonnet-5", "fable-5", "mythos-5"]) {
+    assert.ok(table.includes(`"${fam}"`), `the gateway's table must name ${fam} too`);
+  }
+  assert.match(table, /return vec!\[\(1_000_000, None\)\];/);
+});

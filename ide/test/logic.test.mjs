@@ -288,6 +288,9 @@ AUTO_LOAD_DEPS = {
   // wraps its write in a catch, so a missing dependency there looks exactly like a quota
   // rejection and the whole chat store silently goes unwritten.
   _ctxReadingForStorage: load("_ctxReadingForStorage"),
+  // _thinkingProfileFor routes the Claude families by generation now, so every test that loads
+  // it needs the parser too.
+  _claudeGeneration: load("_claudeGeneration"),
 };
 // _selectInitialTools is loaded in many isolated tests. Keep its resolved
 // intent-boundary helpers available in the shared harness rather than making
@@ -16862,8 +16865,13 @@ test("方案D：布尔思考开关模型诚实两态——能力表驱动，不�
   // 真档位模型（Claude/GPT/Gemini）保持现状，不被误伤
   const claude = profileFor("claude-sonnet-5");
   assert.ok(!claude.booleanToggle);
-  // Sonnet 5 is adaptive: no `low` (identical to medium on the wire), no budget dial.
-  assert.deepEqual(claude.levels, ["off", "medium", "high", "max"]);
+  // Sonnet 5 is adaptive: `low` reaches the model as effort=low, and there is no budget dial.
+  assert.deepEqual(claude.levels, ["off", "low", "medium", "high", "max"]);
+  // Fable/Mythos cannot be turned off — thinking is always on and an explicit disable is a 400.
+  assert.deepEqual(profileFor("claude-fable-5").levels, ["low", "medium", "high", "max"]);
+  // 4.5 and older take an explicit budget; they were being sent the adaptive shape.
+  assert.equal(profileFor("claude-sonnet-4-5").kind, "thinking_budget");
+  assert.equal(profileFor("claude-opus-4-1").kind, "thinking_budget");
   const gpt = profileFor("gpt-5.6");
   assert.ok(!gpt.booleanToggle && gpt.levels.includes("medium"));
   const gemini = profileFor("gemini-3-pro");

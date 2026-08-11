@@ -640,6 +640,13 @@ pub struct Model {
     pub sort: i32,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub enabled_models: Vec<String>,
+    /// Show this route's models under another route's label in the IDE picker.
+    ///
+    /// Display only: it feeds the `group` field of `/api/models` and nothing else. Requests
+    /// resolve by model id (chat_completions), which never reads this column — so keys,
+    /// base_url, billing mode, per-model prices and usage attribution all stay with this
+    /// route. See migration 20260825.
+    pub group_into: Option<uuid::Uuid>,
     /// Billing mode: "rate" (token×price×倍率, default) or "per_call" (flat fee/call).
     pub billing_mode: String,
     /// Flat fee per call in cents, used only when billing_mode = "per_call".
@@ -1239,6 +1246,72 @@ fn mask(key: &str) -> String {
 }
 
 // ---------- admin: list / create / delete ----------
+#[derive(serde::Deserialize)]
+pub struct GroupReq {
+    /// The route to file this one under, or null to ungroup.
+    pub group_into: Option<uuid::Uuid>,
+}
+
+/// `POST /api/admin/models/:id/group` — show this route's models under another's name.
+///
+/// Display only. Nothing is copied or moved: the route keeps its own key, base_url,
+/// billing mode and per-model prices, and requests keep resolving by model id exactly as
+/// before (chat_completions never reads this column). Ungrouping is the same call with
+/// null, and it restores the previous display exactly because nothing else was changed.
+pub async fn admin_group(
+    State(state): State<AppState>,
+    claims: Claims,
+    Path(id): Path<uuid::Uuid>,
+    Json(req): Json<GroupReq>,
+) -> ApiResult<Json<serde_json::Value>> {
+    admin_only(&claims)?;
+
+    if let Some(target) = req.group_into {
+        if target == id {
+            return Err(AppError::bad("不能把一条线路分组到它自己"));
+        }
+        let exists: Option<uuid::Uuid> = sqlx::query_scalar("SELECT id FROM models WHERE id = $1")
+            .bind(target)
+            .fetch_optional(&state.db)
+            .await?;
+        if exists.is_none() {
+            return Err(AppError::bad("目标线路不存在"));
+        }
+        // 目标本身已经被分组到别处时拒绝：客户端只解析一跳，允许链式只会让人以为
+        // A 会显示在 C 下面，而实际显示在 B 下面。
+        let target_grouped: Option<Option<uuid::Uuid>> =
+            sqlx::query_scalar("SELECT group_into FROM models WHERE id = $1")
+                .bind(target)
+                .fetch_optional(&state.db)
+                .await?;
+        if matches!(target_grouped, Some(Some(_))) {
+            return Err(AppError::bad("目标线路自己已经分到别的组里了，先把它取消分组"));
+        }
+        // 反过来也一样：把 A 分到 B，而 B 已经分到 A，就成了环。
+        let has_children: i64 = sqlx::query_scalar(
+            "SELECT count(*)::bigint FROM models WHERE group_into = $1",
+        )
+        .bind(id)
+        .fetch_one(&state.db)
+        .await
+        .unwrap_or(0);
+        if has_children > 0 {
+            return Err(AppError::bad("这条线路下面还挂着别的线路，先把它们取消分组"));
+        }
+    }
+
+    let done = sqlx::query("UPDATE models SET group_into = $2 WHERE id = $1")
+        .bind(id)
+        .bind(req.group_into)
+        .execute(&state.db)
+        .await?;
+    if done.rows_affected() == 0 {
+        return Err(AppError::bad("线路不存在"));
+    }
+
+    Ok(Json(json!({ "ok": true, "group_into": req.group_into })))
+}
+
 /// GET /api/admin/models — full list for management (api_key masked).
 pub async fn admin_list(
     State(state): State<AppState>,
@@ -1265,6 +1338,8 @@ pub async fn admin_list(
                 "model_prices": m.model_prices,
                 "model_billing": m.model_billing,
                 "protocol": m.protocol,
+                // Display grouping only — see `group_into` on the struct.
+                "group_into": m.group_into,
             })
         })
         .collect();
@@ -1906,8 +1981,28 @@ pub async fn list_for_client(State(state): State<AppState>) -> ApiResult<Json<se
     )
     .fetch_all(&state.db)
     .await?;
+    /*
+     * Resolve the heading each route's models are filed under.
+     *
+     * One hop only, deliberately not a chain: A grouped into B grouped into C shows A
+     * under B, not under C. Following the chain would need cycle detection, and "grouped
+     * into a route that is itself grouped" is a configuration mistake worth leaving
+     * visible rather than silently flattening.
+     *
+     * A dangling or self-referential target falls back to the route's own label, so a
+     * half-configured grouping can never make a model disappear from the picker.
+     */
+    let label_of: std::collections::HashMap<uuid::Uuid, &str> =
+        rows.iter().map(|m| (m.id, m.label.as_str())).collect();
+
     let mut list = Vec::new();
     for m in &rows {
+        let group = m
+            .group_into
+            .filter(|target| *target != m.id)
+            .and_then(|target| label_of.get(&target).copied())
+            .unwrap_or(m.label.as_str());
+
         for mid in allowed_ids(m) {
             let name = display_name_for(&m.model_names, &mid);
             let (model_in, model_out) = model_price_override(&m.model_prices, &mid);
@@ -1921,8 +2016,12 @@ pub async fn list_for_client(State(state): State<AppState>) -> ApiResult<Json<se
                 (0.0, 0.0, "unset")
             };
             list.push(json!({
+                // Which route this model came from. Requests are resolved by model id
+                // (chat_completions), not by this — it is here so a caller can tell two
+                // routes exposing the same id apart.
                 "conn_id": m.id,
-                "group": m.label,
+                // Only the heading in the picker. Grouping changes this and nothing else.
+                "group": group,
                 "provider": m.provider,
                 "model_id": mid.clone(),
                 "name": name,
@@ -3996,6 +4095,54 @@ fn oai_content_to_anthropic(content: Option<&serde_json::Value>) -> serde_json::
 /// Respects the client's per-model control: `reasoning_effort` present = thinking ON, absent /
 /// "off" = OFF (the IDE defaults Claude to "medium" and drops the field on "off").
 /// Master off-switch: env MICHAEL_ANTHROPIC_THINKING=0.
+/// The Claude generation in a model id: `claude-opus-4-8` → 4.8, `claude-sonnet-5` → 5.0.
+///
+/// The thinking switch changed shape at 4.7 — from there on `budget_tokens` is a hard 400, and
+/// before it `budget_tokens` is the only switch there is — so the split has to be a comparison,
+/// not a list of version strings. 0 means "no recognisable version", which reads as newer than
+/// this table and lands on the adaptive shape. Mirrors `_claudeGeneration` in the IDE client.
+fn claude_generation(model_lower: &str) -> f64 {
+    let bytes = model_lower.as_bytes();
+    // Scan left to right, not family by family. Family-first order reads
+    // `claude-3-7-sonnet-20250219` as sonnet-20250219 and returns the date as a version;
+    // leftmost wins gives 3.7, matching the client's single-regex form. The two-digit caps are
+    // the second guard: no release carries a three-digit major or minor, so a date can never be
+    // mistaken for one wherever it appears.
+    for start in 0..bytes.len() {
+        let Some(family) = ["opus", "sonnet", "haiku", "fable", "mythos", "claude"]
+            .into_iter()
+            .find(|f| model_lower[start..].starts_with(f))
+        else {
+            continue;
+        };
+        let mut i = start + family.len();
+        if matches!(bytes.get(i), Some(b'-' | b'_' | b'.')) {
+            i += 1;
+        }
+        let major_start = i;
+        while matches!(bytes.get(i), Some(c) if c.is_ascii_digit()) {
+            i += 1;
+        }
+        if i == major_start || i - major_start > 2 {
+            continue;
+        }
+        let major: f64 = model_lower[major_start..i].parse().unwrap_or(0.0);
+        let mut minor = 0.0;
+        if matches!(bytes.get(i), Some(b'-' | b'_' | b'.')) {
+            let minor_start = i + 1;
+            let mut j = minor_start;
+            while matches!(bytes.get(j), Some(c) if c.is_ascii_digit()) {
+                j += 1;
+            }
+            if j > minor_start && j - minor_start <= 2 {
+                minor = model_lower[minor_start..j].parse().unwrap_or(0.0);
+            }
+        }
+        return major + minor / 10.0;
+    }
+    0.0
+}
+
 fn anthropic_thinking(model: &str, effort: Option<&str>) -> Option<serde_json::Value> {
     if std::env::var("MICHAEL_ANTHROPIC_THINKING").ok().as_deref() == Some("0") {
         return None;
@@ -4024,8 +4171,11 @@ fn anthropic_thinking(model: &str, effort: Option<&str>) -> Option<serde_json::V
     // 历史背景：早期聚合上游（zyz 等）对 {"type":"adaptive"} 静默忽略——请求 200 但一个
     // thinking_delta 都不回，IDE 的思考卡永远是空的；换成 enabled+budget_tokens 后同一
     // 路线能正常回思考流。那个兜底当时是对的，但它被套用到了**所有** claude 模型上。
-    if m.contains("claude-4-6") || m.contains("claude-opus-4-6") || m.contains("claude-sonnet-4-6")
-    {
+    // 按代次分流，而不是逐个版本号匹配。原来只点名了 4.6，于是 Sonnet 4.5 / Opus 4.5 /
+    // 4.1 / 4.0 全都落到下面的 adaptive 分支——给一族只接受 budget_tokens 的模型发
+    // {"type":"adaptive"}。IDE 侧同样按代次分流（_claudeGeneration），两边必须一致，
+    // 否则客户端画的档位和网关真正发出去的形状对不上。
+    if claude_generation(&m) > 0.0 && claude_generation(&m) <= 4.6 {
         let budget = match eff {
             "low" => 4096,
             "high" => 24000,
@@ -4235,9 +4385,13 @@ fn oai_to_anthropic_with_cache(
         // "max" deeper than "high" is more max_tokens room for adaptive thinking to stretch.
         // Without this the top UI dial is a no-op. Gated by effort so low/medium stay lean;
         // weak/fast models never reach here (thinking is None for haiku/3.5/non-Claude).
+        // `xhigh` sits between high and max on Anthropic's ladder, and the effort mapping below
+        // collapses it to "high" for this route — so it has to land on high's headroom too.
+        // Falling through to the 32000 default made the second-deepest dial shallower than the
+        // one under it, which is the one thing a depth control must never do.
         let floor = match effort {
             Some("max") => 64000,
-            Some("high") => 40000,
+            Some("high") | Some("xhigh") => 40000,
             _ => 32000,
         };
         let min_mt = (budget + 8000).max(floor);
@@ -6761,7 +6915,8 @@ pub async fn image_generations(
 mod billing_tests {
     use super::{
         anthropic_beta_header, anthropic_thinking, anthropic_to_oai, chat_upstream_attempt_suffix,
-        chat_upstream_retry_base_delay_ms, clip_thinking_budget, compute_cost, is_image_gen_model,
+        chat_upstream_retry_base_delay_ms, claude_generation, clip_thinking_budget, compute_cost,
+        is_image_gen_model,
         mark_thinking_clip, model_price_override, oai_to_anthropic, official_price,
         parse_usage_from_sse, project_quota_package, projected_provider_usd, resolve_cost,
         response_cache_safe, round_multiplier_up, split_fused_charge, thinking_clip_active,
@@ -7838,6 +7993,69 @@ mod billing_tests {
             h.get("thinking").is_none(),
             "haiku should not have thinking"
         );
+    }
+
+    #[test]
+    fn the_thinking_switch_splits_by_generation_not_by_named_version() {
+        // Naming versions one at a time is what left Sonnet 4.5, Opus 4.5 and Opus 4.1 on the
+        // adaptive shape: only 4.6 was listed, so everything older fell through to the modern
+        // branch and was sent `{"type":"adaptive"}` — a mode none of them supports, and on
+        // Sonnet 4.5 the effort parameter errors outright.
+        for id in [
+            "claude-sonnet-4-5",
+            "claude-opus-4-5",
+            "claude-opus-4-1",
+            "claude-opus-4-0",
+            "claude-sonnet-4-0",
+            "claude-opus-4-6",
+            "claude-sonnet-4-6",
+        ] {
+            let t = anthropic_thinking(id, Some("high")).expect("thinking is configurable here");
+            assert_eq!(t["type"], "enabled", "{id} takes an explicit budget");
+            assert_eq!(t["budget_tokens"], 24000, "{id}");
+        }
+        for id in [
+            "claude-opus-4-7",
+            "claude-opus-4-8",
+            "claude-opus-5",
+            "claude-sonnet-5",
+            "claude-fable-5",
+            "claude-mythos-5",
+        ] {
+            assert_eq!(
+                anthropic_thinking(id, Some("high")),
+                Some(json!({"type":"adaptive"})),
+                "{id} rejects budget_tokens outright"
+            );
+        }
+
+        // A dated snapshot suffix is not a minor version, and an unrecognised id reads as newer
+        // than this table — the direction the API has moved, and the shape a new model accepts.
+        assert_eq!(claude_generation("claude-opus-4-5-20251101"), 4.5);
+        assert_eq!(claude_generation("claude-3-7-sonnet-20250219"), 3.7);
+        assert_eq!(claude_generation("claude-opus-5"), 5.0);
+        assert_eq!(claude_generation("some-unreleased-claude"), 0.0);
+        assert_eq!(
+            anthropic_thinking("some-unreleased-claude", Some("high")),
+            Some(json!({"type":"adaptive"}))
+        );
+    }
+
+    #[test]
+    fn the_second_deepest_dial_is_not_shallower_than_the_one_below_it() {
+        // `xhigh` collapses to effort=high on this route, so it must land on high's max_tokens
+        // headroom too. It fell through to the 32000 default, making it shallower than `high`.
+        let headroom = |eff: &str| {
+            oai_to_anthropic(&json!({
+                "model": "claude-opus-5", "reasoning_effort": eff, "messages": []
+            }))
+            .unwrap()["max_tokens"]
+                .as_i64()
+                .unwrap()
+        };
+        assert!(headroom("low") <= headroom("high"));
+        assert_eq!(headroom("xhigh"), headroom("high"));
+        assert!(headroom("max") > headroom("high"));
     }
 
     #[test]
@@ -10835,5 +11053,108 @@ mod upstream_message_tests {
         let msg = friendly_upstream_for_test(500, leaked);
         assert!(!msg.contains("sk-proj-AAAA"), "密钥不能进用户可见的报错：{msg}");
         assert!(msg.contains("[redacted-key]"), "应留下脱敏标记：{msg}");
+    }
+}
+
+#[cfg(test)]
+mod model_group_tests {
+    /// 只有这几个地方读得到 `group_into`。
+    ///
+    /// 这个功能的全部承诺是「分组只改 IDE 模型选择器上的标题」—— 不改请求走哪条线路、不改
+    /// 计费、不改用量归属。只要选线路或算钱的代码读到了这一列，那句话就不再成立。所以这里
+    /// 不是检查某一处写法，而是检查它的作用域：出现在别处就是功能变质了。
+    const ALLOWED: &[&str] = &[
+        "Model",           // 结构体字段本身
+        "GroupReq",        // 请求体
+        "admin_group",     // 唯一的写入口
+        "admin_list",      // 后台列表要显示当前分到哪儿
+        "list_for_client", // 唯一的读用途：算 `group` 那个标题
+    ];
+
+    /// `pos` 落在哪个顶层条目里 —— 往前找最近一个顶格的 `fn` / `struct` 声明。
+    ///
+    /// 只认顶格的：函数体里缩进的闭包和内部 fn 不该顶掉外层的名字。长的关键字排在前面，
+    /// 好让 `pub async fn foo` 认出 foo 而不是在 `fn ` 上匹配失败。
+    fn owner(src: &str, pos: usize) -> &str {
+        let mut name = "<file>";
+        for line in src[..pos].lines() {
+            for kw in ["pub async fn ", "pub fn ", "async fn ", "fn ", "pub struct ", "struct "] {
+                if let Some(tail) = line.strip_prefix(kw) {
+                    name = tail
+                        .split(|c: char| !(c.is_alphanumeric() || c == '_'))
+                        .next()
+                        .unwrap_or("<anon>");
+                    break;
+                }
+            }
+        }
+        name
+    }
+
+    #[test]
+    fn grouping_stays_out_of_routing_and_billing() {
+        let src = include_str!("models.rs");
+        // 测试自己这一段当然满篇都是这个词，从源码里切掉再查。
+        let body = &src[..src
+            .find("mod model_group_tests")
+            .expect("这个测试模块自己得在文件里")];
+
+        let mut seen = 0;
+        for (i, _) in body.match_indices("group_into") {
+            let who = owner(body, i);
+            assert!(
+                ALLOWED.contains(&who),
+                "`group_into` 出现在 `{who}` 里。分组是纯展示的：一旦选线路或计费的代码读它，\
+                 「计费和用量还记在原线路上」就成了假话。要么把它挪回去，要么先想清楚再改这份名单。",
+            );
+            seen += 1;
+        }
+        assert!(seen >= 4, "一处都没扫到，说明这个断言其实没在检查什么");
+    }
+
+    /// 配错的分组只能让分组不生效，不能让模型从选择器里消失。
+    ///
+    /// 指向自己、指向已删除的线路、指向一条已停用因而不在这次查询结果里的线路 —— 三种都得
+    /// 退回线路自己的名字。少了这一层兜底，一次手滑就能让一整条线路的模型在 IDE 里凭空不见，
+    /// 而后台看上去一切正常。
+    #[test]
+    fn a_broken_grouping_can_never_hide_a_model() {
+        let src = include_str!("models.rs");
+        let i = src
+            .find("let group = m")
+            .expect("list_for_client 必须先算出显示标题再往下走");
+        let window = &src[i..i + 300];
+        assert!(
+            window.contains(".filter(|target| *target != m.id)"),
+            "指向自己要挡掉，否则 label_of 查到的就是它自己，白绕一圈",
+        );
+        assert!(
+            window.contains("unwrap_or(m.label.as_str())"),
+            "解析不出目标时必须退回线路自己的名字，不能留空、更不能跳过这个模型",
+        );
+    }
+
+    /// 写入口只在三种情况下拒收，每一种都得留在原地。
+    #[test]
+    fn admin_group_refuses_the_three_shapes_that_lie_to_the_operator() {
+        let src = include_str!("models.rs");
+        let i = src.find("pub async fn admin_group(").expect("写入口得在");
+        let body = &src[i..i + 2400];
+        assert!(
+            body.contains("if target == id"),
+            "分到自己名下是个空操作，但界面上看着像生效了",
+        );
+        assert!(
+            body.contains("target_grouped"),
+            "目标自己已经分到别处时要拒收：客户端只解析一跳，链式分组的结果和人想的不一样",
+        );
+        assert!(
+            body.contains("has_children"),
+            "自己名下还挂着线路时要拒收，否则 A→B、B→A 就成了环",
+        );
+        assert!(
+            body.contains("admin_only(&claims)"),
+            "分组改的是所有用户看到的模型列表，必须是管理员",
+        );
     }
 }
