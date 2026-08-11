@@ -350,3 +350,38 @@ test("an unlinked integration offers to connect rather than showing nothing", ()
   assert.equal((SRC.match(/_chipText\(c\)/g) || []).length, 2,
     "both the serialiser and the caret maths must call the same helper");
 });
+
+test("the @ categories use English names and icons that exist", () => {
+  const INDEX = fs.readFileSync("index.html", "utf8");
+  // i-sparkles was referenced and never existed, so Model rendered with no icon at all — a
+  // missing <symbol> fails silently, which is why every icon name here is asserted present.
+  for (const name of ["Model", "Files", "GitHub", "GitLab"]) {
+    assert.match(SRC, new RegExp(`label: "${name}"`), `${name} must be the English label`);
+  }
+  assert.doesNotMatch(SRC, /label: "模型"|label: "文件"/, "no Chinese category labels remain");
+  // As a value, not as a word: the comment explaining this bug necessarily names the icon, and
+  // grepping prose is how a test ends up asserting against documentation. Twice today.
+  assert.doesNotMatch(SRC, /"i-sparkles"/, "the icon that never existed must not be referenced");
+
+  const icons = [...SRC.matchAll(/icon: "(i-[a-z-]+)"/g)].map((m) => m[1]);
+  assert.ok(icons.length >= 4);
+  for (const icon of new Set(icons)) {
+    assert.ok(INDEX.includes(`id="${icon}"`), `${icon} has no <symbol> — it would render blank`);
+  }
+  // Real marks rather than a generic branch glyph for both hosts.
+  assert.ok(INDEX.includes('id="i-brand-github"') && INDEX.includes('id="i-brand-gitlab"'));
+  assert.match(SRC, /icon: "i-brand-github"/);
+  assert.match(SRC, /icon: "i-brand-gitlab"/);
+});
+
+test("a folder in the @ menu opens instead of only inserting", () => {
+  // Selecting a folder used to insert it and stop, so referencing one file deep in a tree meant
+  // typing the path out.
+  assert.match(SRC, /onPick: isDir\s*\? \(\) => \{ _atDir = clean; _renderAtMenu\(\); \}/,
+    "a folder must open");
+  assert.match(SRC, /name: `Use \$\{here\}\/`/, "inserting the folder itself stays one row away");
+  assert.match(SRC, /name: "\.\.",/, "and there must be a way back up");
+  // Inside a folder the list is its children, not a workspace-wide match that would undo the walk.
+  assert.match(SRC, /if \(!f\.startsWith\(prefix\)\) continue;/);
+  assert.match(SRC, /_atDir = "";  \/\/ and at the workspace root/, "reopening @ starts at the root");
+});
