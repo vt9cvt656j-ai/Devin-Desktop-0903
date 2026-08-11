@@ -149,11 +149,16 @@ test("archive handling is reachable from the UI, not just implemented in the bac
     "the native seam must expose extraction");
   assert.match(SRC, /readArchiveEntry: \(path, entry, maxBytes\) =>\s*core\.invoke\("read_archive_entry"/,
     "and single-entry reads");
-  assert.match(SRC, /data-inspector-action="extract"/, "the panel needs an extract control");
-  assert.match(SRC, /data-archive-entry=/, "and entries have to be clickable to be openable");
   // Both stubs must exist too, or the web build throws an obscure undefined-is-not-a-function
   // instead of saying the desktop app is required.
   assert.match(SRC, /extractArchive: async \(\) => \{ throw new Error\("解压需要桌面版应用。"\); \}/);
+
+  // The panel is a React island now; the host and the mount are what make it reachable.
+  assert.match(SRC, /data-archive-browser-host/, "the panel needs a host to mount into");
+  assert.match(SRC, /mountArchiveBrowser\(host, \{/, "and something has to mount it");
+  assert.match(SRC, /if \(info\?\.archive\) _mountArchiveBrowser\(path, info\.archive\);/,
+    "mounted after each render — the inspector rebuilds its body with innerHTML, so the previous " +
+    "host is gone every time");
 
   // Archive content is untrusted input; it is rendered as text, never as markup.
   const preview = SRC.slice(SRC.indexOf("function _showArchiveEntryPreview"), SRC.indexOf("function _inspectionArchiveHtml"));
@@ -163,4 +168,14 @@ test("archive handling is reachable from the UI, not just implemented in the bac
   const template = preview.slice(preview.indexOf("wrap.innerHTML = `"), preview.indexOf("// textContent"));
   assert.doesNotMatch(template, /content[?.]*\.text/,
     "the entry's own bytes must never be interpolated into markup — only its name and size, both escaped");
+});
+
+test("the inspector header cannot be crushed by its own buttons", () => {
+  // A fourth action button squeezed the title column to a few pixels, and CJK — which may break
+  // between any two characters — rendered one character per line. min-width:0 was already there
+  // and is what permitted it: the floor has to come from the basis, with the header wrapping.
+  const header = APP_CSS.slice(APP_CSS.indexOf(".file-inspector__header {"), APP_CSS.indexOf(".file-inspector__icon {"));
+  assert.match(header, /flex-wrap: wrap;/, "the header must wrap rather than compress the title");
+  const heading = APP_CSS.slice(APP_CSS.indexOf(".file-inspector__heading {"), APP_CSS.indexOf(".file-inspector__eyebrow {"));
+  assert.match(heading, /flex: 1 1 260px;/, "and the title needs a real basis, not flex-basis auto");
 });

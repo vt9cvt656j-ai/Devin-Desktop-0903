@@ -72,6 +72,7 @@ import getSharedStore from "./agent/shared-store.js";
 import { renderSlashMenu, destroySlashMenu } from "./ui/mount-slash-menu.jsx";
 import { openSessionPickerIsland } from "./ui/mount-session-picker.jsx";
 import { openMemoryCenterIsland } from "./ui/mount-memory-center.jsx";
+import { mountArchiveBrowser } from "./ui/mount-archive-browser.jsx";
 import { getCollaborationEngine } from "./agent/collaboration-engine.js";
 
 // Global shared state store for sub-agent collaboration
@@ -4655,36 +4656,47 @@ function _showArchiveEntryPreview(name, content) {
 }
 
 function _inspectionArchiveHtml(archive) {
-  const list = Array.isArray(archive?.entries) ? archive.entries : [];
-  const note = archive?.note ? `<p class="file-inspector__note">${_escHtml(archive.note)}</p>` : "";
-  // A format we cannot open still has something to say — an empty panel reads as a broken file.
-  if (!list.length) return note ? `<section class="file-inspector__section">${note}</section>` : "";
-  // The header states the archive's own count. Showing the rendered row count there is what let
-  // a 2GB zip of fifty thousand files announce itself as "200 items".
-  const total = Number(archive?.total ?? list.length);
-  const atLeast = archive?.count_is_partial ? "至少 " : "";
-  const shown = archive?.truncated ? `，显示前 ${list.length} 个` : "";
-  const totalSize = Number(archive?.total_size || 0);
-  const sizeText = totalSize > 0 ? ` · 解压后 ${_formatInspectBytes(totalSize)}` : "";
-  const lock = archive?.encrypted ? ` · <span title="文件名可读，内容需要密码">🔒 含加密条目</span>` : "";
-  return `
-    <section class="file-inspector__section">
-      <h4>${_escHtml(String(archive?.format || "压缩包"))} 内容
-        <span>${atLeast}${total.toLocaleString()} 项${shown}${sizeText}${lock}</span></h4>
-      ${note}
-      <div class="file-inspector__table-wrap">
-        <table class="file-inspector__table">
-          <thead><tr><th>名称</th><th>类型</th><th>大小</th><th>压缩后</th></tr></thead>
-          <tbody>${list.map((entry) => `
-            <tr${entry?.is_dir ? "" : ` data-archive-entry="${_escAttr(entry?.name || "")}" title="点击预览"`}>
-              <td title="${_escAttr(entry?.name || "")}">${_escHtml(entry?.name || "")}</td>
-              <td>${entry?.is_dir ? "目录" : "文件"}</td>
-              <td>${_formatInspectBytes(entry?.size)}</td>
-              <td>${_formatInspectBytes(entry?.compressed_size)}</td>
-            </tr>`).join("")}</tbody>
-        </table>
-      </div>
-    </section>`;
+  // Just a host now — the browser itself is a React island (src/ui/archive-browser.jsx), mounted
+  // after this markup lands. The flat table this replaced listed every entry in the archive at
+  // once, full path on each row, which for a real build artefact meant 1,652 undifferentiated
+  // lines and no way to see the shape of what was inside.
+  if (!archive?.entries?.length && !archive?.note) return "";
+  return `<section class="file-inspector__section"><div data-archive-browser-host></div></section>`;
+}
+
+/** Mount the archive browser into whatever host the last render produced. */
+function _mountArchiveBrowser(path, archive) {
+  const host = _fileInspectionPreviewEl?.querySelector("[data-archive-browser-host]");
+  if (!host || !archive) return;
+  mountArchiveBrowser(host, {
+    archive,
+    onOpenEntry: async (name) => {
+      try {
+        const content = await backend.readArchiveEntry(path, name, 256 * 1024);
+        if (content?.is_binary) showToast(`${name} 是二进制文件（${_formatInspectBytes(content.bytes)}）`);
+        else _showArchiveEntryPreview(name, content);
+      } catch (e) {
+        showToast(String(e?.message || e || "无法读取该条目"));
+      }
+    },
+    onExtract: () => _extractArchiveTo(path),
+  });
+}
+
+/** Ask where, unpack, then show the result in the tree. */
+async function _extractArchiveTo(path) {
+  let dest = null;
+  try { dest = await backend.pickFolder(); } catch { /* cancelled */ }
+  if (!dest) return;
+  showToast("正在解压…");
+  try {
+    const out = await backend.extractArchive(path, String(dest));
+    const skipped = out?.skipped ? `，跳过 ${out.skipped} 个附属条目` : "";
+    showToast(`已解压 ${out?.files ?? 0} 个文件到 ${String(dest).split("/").pop()}${skipped}`);
+    try { await renderWorkspaceRoots(); } catch {}
+  } catch (e) {
+    showToast(String(e?.message || e || "解压失败"));
+  }
 }
 
 function _inspectionTrainedDataHtml(info) {
@@ -5219,7 +5231,6 @@ function _renderFileInspection(path, info, reason = "", error = "") {
           <button type="button" data-inspector-action="refresh">重新解析</button>
           <button type="button" data-inspector-action="copy">复制路径</button>
           <button type="button" data-inspector-action="reveal">在系统中显示</button>
-          ${info?.archive?.entries?.length ? `<button type="button" data-inspector-action="extract">解压到…</button>` : ""}
         </div>
       </header>
       ${reason ? `<div class="file-inspector__notice">文本编辑器打不开：${_escHtml(reason)}；已改用真实文件解析器读取。</div>` : ""}
@@ -5250,6 +5261,7 @@ function _renderFileInspection(path, info, reason = "", error = "") {
       ` : ""}
     </div>`;
   _fileInspectionPreviewEl.hidden = false;
+  if (info?.archive) _mountArchiveBrowser(path, info.archive);
 }
 
 function _renderDatabaseEditorInspection(path, info, reason = "", error = "") {
@@ -5546,22 +5558,6 @@ async function _mpHandleClick(event) {
     return;
   }
 
-  const entryRow = event.target?.closest?.("[data-archive-entry]");
-  if (entryRow && activePath) {
-    const name = entryRow.getAttribute("data-archive-entry");
-    try {
-      const content = await backend.readArchiveEntry(activePath, name, 256 * 1024);
-      if (content?.is_binary) {
-        showToast(`${name} 是二进制文件（${_formatInspectBytes(content.bytes)}）`);
-      } else {
-        _showArchiveEntryPreview(name, content);
-      }
-    } catch (e) {
-      showToast(String(e?.message || e || "无法读取该条目"));
-    }
-    return;
-  }
-
   const action = event.target?.closest?.("[data-inspector-action]")?.getAttribute("data-inspector-action");
   if (!action) return;
   const current = activePath;
@@ -5577,22 +5573,6 @@ async function _mpHandleClick(event) {
     try { await navigator.clipboard?.writeText(current); showToast("已复制路径"); } catch { showToast(current); }
   } else if (action === "reveal") {
     try { await backend.revealItemInDir(current); } catch (e) { showToast(String(e?.message || e || "无法在系统中显示")); }
-  } else if (action === "extract") {
-    let dest = null;
-    try { dest = await backend.pickFolder(); } catch { /* cancelled */ }
-    if (!dest) return;
-    showToast("正在解压…");
-    try {
-      const out = await backend.extractArchive(current, String(dest));
-      // Say what actually happened, including what was skipped, so the file count in the
-      // destination matching the listing is explainable rather than surprising.
-      const skipped = out?.skipped ? `，跳过 ${out.skipped} 个附属条目` : "";
-      showToast(`已解压 ${out?.files ?? 0} 个文件到 ${String(dest).split("/").pop()}${skipped}`);
-      // Show the unpacked files without making the user hunt for a refresh.
-      try { await renderWorkspaceRoots(); } catch {}
-    } catch (e) {
-      showToast(String(e?.message || e || "解压失败"));
-    }
   }
 }
 
