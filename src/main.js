@@ -14456,6 +14456,12 @@ function _conversationSessionMetadata(session) {
     // resumed session pay a full prefix miss on its first turn for no reason.
     semanticFlags: Array.isArray(session?._semanticProfileFlags) && session._semanticProfileFlags.length
       ? session._semanticProfileFlags.slice() : undefined,
+    // The meter's floor comes from real reported usage; a local re-estimate cannot see the system
+    // prompt or the tool schemas and reads far lower. Losing it on restart is what made a restored
+    // conversation report an empty context.
+    ctxFloor: Number(session?._ctxRealFloor?.total) > 0
+      ? { total: Number(session._ctxRealFloor.total), at: Number(session._ctxRealFloor.at) || 0 }
+      : undefined,
     lastRun: session?._lastRunState && typeof session._lastRunState === "object" ? session._lastRunState : undefined,
     pendingSends: Array.isArray(session?._pendingSends) ? session._pendingSends.slice(-20) : undefined,
     created: session?.created,
@@ -15414,6 +15420,7 @@ function _restoreClosedChatSession(closedIndex) {
   session.created = sData.created || Date.now();
   if (sData.intentState && typeof sData.intentState === "object") session._intentState = sData.intentState;
   if (Array.isArray(sData.semanticFlags)) session._semanticProfileFlags = sData.semanticFlags.slice();
+  if (sData.ctxFloor && Number(sData.ctxFloor.total) > 0) session._ctxRealFloor = { ...sData.ctxFloor };
   if (sData.lastRun && typeof sData.lastRun === "object") session._lastRunState = sData.lastRun;
   if (typeof sData.html === "string" && sData.html) session._htmlSnapshot = sData.html;
   if (sData.memory) {
@@ -15647,6 +15654,9 @@ function _chatSessionDataForStorage(s, mediaBudget, includeHtml = false, options
     intentState: s?._intentState && typeof s._intentState === "object" ? s._intentState : undefined,
     semanticFlags: Array.isArray(s?._semanticProfileFlags) && s._semanticProfileFlags.length
       ? s._semanticProfileFlags.slice() : undefined,
+    ctxFloor: Number(s?._ctxRealFloor?.total) > 0
+      ? { total: Number(s._ctxRealFloor.total), at: Number(s._ctxRealFloor.at) || 0 }
+      : undefined,
     lastRun: s?._lastRunState && typeof s._lastRunState === "object" ? s._lastRunState : undefined,
     created: s?.created,
   };
@@ -16090,6 +16100,7 @@ async function restoreChatHistory() {
         if (sData.anchorRoot) session._anchorRoot = sData.anchorRoot; // 恢复工作区锚点：重开后换文件夹能触发"忘掉旧路径"提示
         if (sData.intentState && typeof sData.intentState === "object") session._intentState = sData.intentState;
         if (Array.isArray(sData.semanticFlags)) session._semanticProfileFlags = sData.semanticFlags.slice();
+        if (sData.ctxFloor && Number(sData.ctxFloor.total) > 0) session._ctxRealFloor = { ...sData.ctxFloor };
         if (sData.lastRun && typeof sData.lastRun === "object") session._lastRunState = sData.lastRun;
         // Rendered-transcript snapshot (disk store only) — consumed lazily by
         // _renderSessionHistory when this tab is first shown, restoring the full
@@ -56211,7 +56222,11 @@ promptEl.addEventListener("input", () => {
   _updateSlashMenu();
 });
 let _ctxMeterInputTimer = 0;
+// At module load there is no session yet, so this reads 0. Sessions restore asynchronously after
+// it and nothing recomputed — which is why reopening the app showed an empty context for a
+// conversation that plainly had one. Recompute once the restore has settled.
 _refreshContextMeterFromDraft({ force: true });
+queueMicrotask(() => { try { _refreshContextMeterFromDraft({ force: true }); } catch {} });
 // Force PLAIN-TEXT paste (a contenteditable would otherwise paste rich HTML).
 promptEl.addEventListener("paste", (e) => {
   const txt = e.clipboardData && e.clipboardData.getData("text/plain");
