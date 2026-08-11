@@ -237,6 +237,13 @@ test("a long filename does not take over the tab strip or the title bar", () => 
   // tab simply grew to whatever the name needed.
   const tab = APP_CSS.slice(APP_CSS.indexOf("\n.tab {"), APP_CSS.indexOf(".tab:hover"));
   assert.match(tab, /max-width: 220px;/, "a tab needs a ceiling");
+  // And a floor, which is the subtler half. .tabs is a flex row, so tabs shrink by default and
+  // min-width:auto is the only thing that stops them. Setting min-width:0 to allow the ellipsis
+  // removed that floor and every label collapsed to zero width — a strip of bare icons, worse
+  // than the overflowing tab it replaced. Not shrinking is what lets .tabs scroll instead.
+  assert.match(tab, /flex: 0 0 auto;/, "tabs must not shrink; the strip scrolls instead");
+  assert.doesNotMatch(tab.slice(0, tab.indexOf(".tab .label")), /min-width: 0;/,
+    "min-width:0 on the tab itself collapses every label");
   assert.match(tab, /\.tab \.label \{[^}]*text-overflow: ellipsis;/s, "and the label must ellipsise");
   assert.match(tab, /\.tab > \.ic,\s*\.tab > \.x \{ flex: none; \}/,
     "only the label may shrink — a close button that moves as you switch files is worse");

@@ -1032,10 +1032,15 @@ body.is-tauri.is-mac.is-fullscreen .titlebar {
   gap: 7px;
   /* A tab is a label, not a field for the whole filename. Unbounded, one build artefact named
      庄子视频处理系统V5.0-TS长视频版-Windows-x64-最新版-20260722.zip took ~640px and pushed every
-     other tab off the strip — so the tab bar showed one file and a fragment. VS Code caps at
-     160px; 220 is roomier while still keeping several tabs visible. */
+     other tab off the strip. VS Code caps at 160px; 220 is roomier while keeping several visible.
+
+     flex: 0 0 auto is load-bearing, not tidiness. .tabs is a flex row, so tabs are flex items and
+     shrink by default; min-width:auto is the only thing that normally stops them, and setting
+     min-width:0 here removed that floor — every label collapsed to zero and the strip became a
+     row of bare icons. Refusing to shrink is what makes the container's overflow-x:auto do its
+     job: tabs keep their width and the strip scrolls, which is what VS Code does. */
+  flex: 0 0 auto;
   max-width: 220px;
-  min-width: 0;
   padding: 0 8px 0 13px;
   font-size: 12.5px;
   color: var(--text-dim);
