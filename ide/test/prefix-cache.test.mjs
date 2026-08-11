@@ -551,3 +551,20 @@ test("the account dropdown shows the same identity and avatar as the card", () =
   assert.match(fn, /\(identity \|\| "\?"\)\.slice\(0, 1\)\.toUpperCase\(\)/, "same initial rule as the card");
   assert.match(APP_CSS, /img\.settings-dropdown__avatar--filled \{ object-fit: cover; \}/);
 });
+
+test("a restored conversation reports its real context, not zero", () => {
+  // Reopening the app showed 0 tokens for a conversation that plainly had content. Two causes,
+  // both needed fixing: the real-usage floor was never persisted, and the meter was computed once
+  // at module load — before any session had been restored — and never recomputed.
+  assert.equal((SRC.match(/ctxFloor:/g) || []).length, 2, "both serializers must write the floor");
+  assert.equal((SRC.match(/if \(sData\.ctxFloor && Number\(sData\.ctxFloor\.total\) > 0\)/g) || []).length, 2,
+    "and both rehydrators must read it back");
+  assert.match(SRC, /queueMicrotask\(\(\) => \{ try \{ _refreshContextMeterFromDraft\(\{ force: true \}\); \} catch \{\} \}\);/,
+    "the meter must recompute after the restore, not only at module load");
+
+  // The floor is what the estimator cannot derive locally: an assemble() of the transcript sees
+  // neither the system prompt nor the tool schemas, so it reads far below the truth.
+  assert.match(SRC, /const floor = Math\.max\(0, Number\(session\?\._ctxRealFloor\?\.total\) \|\| 0\);/);
+  assert.match(SRC, /return Math\.max\(_ctxBaseCache\.tokens, floor\) \+ draftTokens;/,
+    "the estimate may only add to the real floor, never replace it");
+});
