@@ -883,3 +883,23 @@ test("the browser preview does not invent a window the model does not have", () 
   assert.equal((SRC.match(/contextLimit: 1000000, contextWindows: \[\{ tokens: 1000000, beta: null \}\]/g) || []).length, 2);
   assert.doesNotMatch(SRC, /contextLimit: 200000, contextWindows: \[\]/);
 });
+
+test("the paint optimization that blanks WebKit is granted, not assumed", () => {
+  // content-visibility: auto is what keeps a long conversation cheap — it skips layout and paint
+  // for everything off-screen. In WebKit it is also what leaves blank regions behind on scroll:
+  // the element is skipped and its placeholder paints empty, so scrolling down can land on a
+  // white page. macOS runs this app in WKWebView and cannot choose otherwise; Windows runs
+  // WebView2, which is Chromium and does not have the defect.
+  // Declarations only. Matching every line that mentions the property would also match the
+  // comment explaining the gate, which is how a source-grep test ends up passing on its own prose.
+  const guarded = APP_CSS.match(/^[^\n/*]*\{[^\n}]*content-visibility: auto[^\n]*$/gm) || [];
+  assert.ok(guarded.length >= 4, "the known content-visibility rules must still be found");
+  for (const rule of guarded) {
+    assert.match(rule, /\.cv-safe /,
+      `every content-visibility rule must be behind the engine gate: ${rule.trim()}`);
+  }
+  // Earned, not assumed: nothing sets the class until the engine has been identified, so a blank
+  // page is never what happens while that line is still loading.
+  assert.match(SRC, /if \(\/AppleWebKit\/\.test\(ua\) && !\/Chrome\|Chromium\|Edg\\\/\/\.test\(ua\)\) document\.body\.classList\.add\("is-webkit"\);\s*\n\s*else document\.body\.classList\.add\("cv-safe"\);/);
+  assert.match(SRC, /catch \{ \/\* no navigator \(tests\) → stay on the safe side and skip the optimization \*\/ \}/);
+});
