@@ -22110,7 +22110,7 @@ const _AGENT_RECOVERY_TUNING = `
 - 动态数据、URL、跳转、接口字段、爬虫/抓包结果和第三方页面行为一律走真实证据：打开真实页面、读真实网络响应、跑真实脚本或读取已有真实样本；猜出来的链接/字段只能标成假设，不能写进结果或代码当事实。
 - 长时间运行 / 交互等待要按真实执行流处理：dev server、watch、守护进程、后台监听不要用 run_cmd 前台硬等；用 run_in_terminal 启动真实 IDE 终端，read_logs/read_terminal 看日志和本地 URL，必要时 background_monitor(check_type:"port"/"url"/"file"/"command"/"capture") 挂后台轮询，条件满足会自动恢复继续。timeout 不是任务结束，先检查当前日志/端口/文件/页面状态再决定下一步。
 - 文件写入被 [BLOCKED]/[ERROR] 后，先按工具结果里的 [RECOVERY:...] 做唯一下一步；不要把 edit_file 被挡改成 sed/perl/tee/重定向/run_cmd 脚本写，也不要整文件盲写绕过。
-- 已有文件整文件覆盖前必须 read_file 读当前完整版本；局部 edit_file/multi_edit 可在当前编辑器/附件/已知上下文给出精确 old_string 且工具能唯一命中时直接改，命中失败或不唯一就从真实内容逐字符复制并补上下文；命令失败就读 exit code/stderr 根因，修完再重跑。`;
+- 已有文件整文件覆盖前必须 read_file 读当前完整版本。局部 edit_file/multi_edit 的 old_string 必须逐字符来自**这一轮看得见的真实文件内容**——当前编辑器里打开的、附件里的、或本轮 read_file 的结果。**"我记得我刚写过这个文件"不算**：那份内容可能已经被折叠出上下文，凭印象重建的 old_string 一定对不上空白、缩进或标点。不确定文件此刻是什么样，就先 read_file 再改，这比一次失败的编辑便宜。命中失败或不唯一时，照工具回执里给出的真实行逐字符复制并补上下文；命令失败就读 exit code/stderr 根因，修完再重跑。`;
 function _modelFamilyTuning(id) {
   let base = "";
   switch (_modelFamilyOf(id)) {
