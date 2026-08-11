@@ -1053,26 +1053,16 @@ body.is-tauri.is-mac.is-fullscreen .titlebar {
    the close target moves as you switch files. */
 .tab > .ic,
 .tab > .x { flex: none; }
-/* The label is two parts, because text-overflow only ever clips the tail — which is the
-   extension, the single most useful token in the name. The stem absorbs the shortening; the
-   extension is a sibling that never shrinks, so ".zip" survives at any tab width. */
+/* The name arrives already shortened in the middle (_fillFileLabel), so the extension is part of
+   the same text node and cannot be clipped away. This is the backstop for the case the budget did
+   not catch — and it stays a single box, because splitting the stem and extension into two
+   elements put a visible gap between them: "庄子视频处理系... .sha256" reads as two truncations
+   rather than one shortened name. */
 .tab .label,
 .row .name {
-  display: inline-flex;
-  align-items: baseline;
-  min-width: 0;
-  overflow: hidden;
-}
-.tab .label .stem,
-.row .name .stem {
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
-  white-space: nowrap;
-}
-.tab .label .ext,
-.row .name .ext {
-  flex: none;
   white-space: nowrap;
 }
 .tab:hover {
