@@ -1972,6 +1972,10 @@ body.zen-mode .editor {
   display: flex;
   align-items: center;
   gap: 14px;
+  /* Wrap rather than crush. The title column is allowed to shrink (it needs min-width:0 for its
+     ellipsis), so without wrapping there is no floor: a fourth action button took its width to
+     almost nothing and the CJK eyebrow became a vertical ribbon, one character per line. */
+  flex-wrap: wrap;
   padding-bottom: 16px;
   border-bottom: 1px solid color-mix(in srgb, var(--line-strong) 82%, transparent);
 }
@@ -1987,8 +1991,14 @@ body.zen-mode .editor {
 }
 .file-inspector__icon svg { width: 25px; height: 25px; }
 .file-inspector__heading {
+  /* min-width:0 was already here — and that is precisely what let this collapse. It permits the
+     column to shrink without limit, so a fourth action button pushed it to a few pixels and CJK,
+     which may break between any two characters, became a one-character-per-line ribbon.
+     min-width:0 is still needed for the ellipsis on the title, so the floor comes from the
+     flex-basis instead: keep 260px, and when the header cannot afford it, wrap the actions onto
+     their own line rather than crushing the name of the file being inspected. */
   min-width: 0;
-  flex: 1 1 auto;
+  flex: 1 1 260px;
 }
 .file-inspector__eyebrow {
   color: var(--text-dim);
@@ -2017,6 +2027,7 @@ body.zen-mode .editor {
 }
 .file-inspector__actions {
   flex: 0 0 auto;
+  margin-left: auto;
   display: flex;
   align-items: center;
   gap: 8px;
