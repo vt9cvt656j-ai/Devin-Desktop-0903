@@ -552,19 +552,129 @@ test("the account dropdown shows the same identity and avatar as the card", () =
   assert.match(APP_CSS, /img\.settings-dropdown__avatar--filled \{ object-fit: cover; \}/);
 });
 
-test("a restored conversation reports its real context, not zero", () => {
-  // Reopening the app showed 0 tokens for a conversation that plainly had content. Two causes,
-  // both needed fixing: the real-usage floor was never persisted, and the meter was computed once
-  // at module load — before any session had been restored — and never recomputed.
-  assert.equal((SRC.match(/ctxFloor:/g) || []).length, 2, "both serializers must write the floor");
-  assert.equal((SRC.match(/if \(sData\.ctxFloor && Number\(sData\.ctxFloor\.total\) > 0\)/g) || []).length, 2,
-    "and both rehydrators must read it back");
-  assert.match(SRC, /queueMicrotask\(\(\) => \{ try \{ _refreshContextMeterFromDraft\(\{ force: true \}\); \} catch \{\} \}\);/,
-    "the meter must recompute after the restore, not only at module load");
+const ctxInput = load("_contextInputTokens", ["_contextInputTokens"]);
+const applyReading = load("_applyContextReading", ["_applyContextReading"]);
+const readingForStorage = load("_ctxReadingForStorage", ["_ctxReadingForStorage"]);
+const readingFromStorage = load("_ctxReadingFromStorage", ["_ctxReadingFromStorage"]);
+const ringLabel = load("_tokenRingLabel", ["_tokenRingLabel"]);
 
-  // The floor is what the estimator cannot derive locally: an assemble() of the transcript sees
-  // neither the system prompt nor the tool schemas, so it reads far below the truth.
-  assert.match(SRC, /const floor = Math\.max\(0, Number\(session\?\._ctxRealFloor\?\.total\) \|\| 0\);/);
-  assert.match(SRC, /return Math\.max\(_ctxBaseCache\.tokens, floor\) \+ draftTokens;/,
-    "the estimate may only add to the real floor, never replace it");
+test("context counts the cached prompt, which is where the whole conversation lives", () => {
+  // This is why the meter looked frozen. Anthropic reports `input_tokens` EXCLUDING everything
+  // served from cache, so a warm turn deep in a long conversation reports a few thousand tokens
+  // no matter how much history is behind it — the uncached tail does not grow. Reading only that
+  // number measured the last message, not the context.
+  const warmTurn = { prompt: 4_600, cacheRead: 120_000, cacheWrite: 0 };
+  assert.equal(ctxInput({ ...warmTurn, normalized: true }), 4_600,
+    "a reading the transport already normalized is taken as-is");
+
+  // A cache-write count only ever occurs on the shape that excludes cache, so the sum is exact.
+  assert.equal(ctxInput({ prompt: 4_600, cacheRead: 90_000, cacheWrite: 30_000 }), 124_600);
+
+  // Without one the two shapes are indistinguishable. Either answer is wrong for the other, but
+  // only one of the two errors compounds: OpenAI's prompt total CONTAINS the cached part, so
+  // adding would report a conversation as twice its real size and drive the gauge to full.
+  assert.equal(ctxInput({ prompt: 120_000, cacheRead: 118_000, cacheWrite: 0 }), 120_000,
+    "OpenAI shape: cached is a subset of prompt, never added to it");
+  assert.equal(ctxInput({ prompt: 4_600, cacheRead: 120_000, cacheWrite: 0 }), 120_000,
+    "Anthropic shape without a write: short by the uncached tail, never doubled");
+
+  assert.equal(ctxInput({ prompt: 9_000, cacheRead: null, cacheWrite: 0 }), 9_000, "no cache reported");
+  assert.equal(ctxInput({}), 0);
+});
+
+test("both transports normalize usage the same way before the meter sees it", () => {
+  // The desktop goes through Rust and the web build through the fetch reader. They have to agree,
+  // because the same conversation can be opened in either and the number must not change.
+  const rust = fs.readFileSync("src-tauri/src/ai.rs", "utf8");
+  assert.match(rust, /let prompt = if cache_read\.is_some\(\) \{\s*\n\s*prompt_raw \+ cached \+ cache_creation/,
+    "Rust adds cache only on the shape that excludes it");
+  assert.match(SRC, /u\.cache_read_input_tokens != null\s*\n\s*\?\s*promptRaw \+ \(cached \|\| 0\) \+ cacheWrite\s*\n\s*:\s*promptRaw/,
+    "the browser transport applies the identical discriminator");
+
+  // Usage is read ahead of the Stop gate in both loops: stopping a run does not un-spend tokens.
+  const usageHandlers = SRC.match(/if \(ev && ev\.kind === "usage"\) \{/g) || [];
+  assert.equal(usageHandlers.length, 2, "the agent loop and plain chat both consume stream usage");
+  const agentTail = SRC.slice(SRC.indexOf('if (ev && ev.kind === "usage") {'));
+  assert.ok(agentTail.indexOf("_recordStreamUsage") < agentTail.indexOf("if (!_live()) return false;"),
+    "usage is recorded before the Stop gate, not after it");
+});
+
+test("a reading for the same request may only be corrected upward; a new one replaces it", () => {
+  const session = {};
+
+  // The stream reading lands first and is exact.
+  assert.equal(applyReading(session, { input: 124_600, output: 900, requestId: "r1" }), true);
+  assert.equal(session._ctxRealFloor.total, 125_500);
+
+  // The billing settlement for that same request arrives later carrying the merged, shape-blind
+  // numbers. It must not walk the meter backwards to the uncached tail.
+  assert.equal(applyReading(session, { input: 4_600, output: 900, requestId: "r1" }), false);
+  assert.equal(session._ctxRealFloor.total, 125_500);
+
+  // The next turn replaces it — including downward. Compaction genuinely shrinks the context, and
+  // a gauge that only ever climbed would hide the one moment the user most wants to see.
+  assert.equal(applyReading(session, { input: 30_000, output: 500, requestId: "r2" }), true);
+  assert.equal(session._ctxRealFloor.total, 30_500);
+
+  assert.equal(applyReading(session, { input: 0, output: 0, requestId: "r3" }), false,
+    "an empty reading is no reading; it must not blank a real one");
+  assert.equal(session._ctxRealFloor.total, 30_500);
+  assert.equal(applyReading(null, { input: 100, output: 1 }), false);
+});
+
+test("the reading survives a restart, including records written before the breakdown existed", () => {
+  const session = { _ctxRealFloor: null };
+  applyReading(session, { input: 124_600, output: 900, cacheRead: 120_000, cacheWrite: 0, model: "claude-opus-5", requestId: "r1" });
+
+  const restored = readingFromStorage(JSON.parse(JSON.stringify(readingForStorage(session))));
+  assert.equal(restored.total, 125_500);
+  assert.equal(restored.input, 124_600);
+  assert.equal(restored.output, 900);
+  assert.equal(restored.cacheRead, 120_000);
+  assert.equal(restored.model, "claude-opus-5");
+
+  // 0.3.74 shipped a total and a timestamp and nothing else. Those conversations must still read
+  // their real size rather than fall back to an estimate that cannot see the system prompt.
+  const legacy = readingFromStorage({ total: 88_000, at: 1 });
+  assert.equal(legacy.total, 88_000);
+  assert.equal(legacy.input, 88_000, "with no breakdown the whole total is input");
+
+  assert.equal(readingFromStorage({ total: 0 }), null);
+  assert.equal(readingFromStorage(undefined), null);
+  assert.equal(readingForStorage({}), undefined, "a session with no reading writes no key");
+
+  // Both serializers and both rehydrators go through that one pair — the session record has lost
+  // a field to a divergent copy twice already.
+  assert.equal((SRC.match(/ctxFloor: _ctxReadingForStorage\(/g) || []).length, 2);
+  assert.equal((SRC.match(/_ctxReadingFromStorage\(sData\.ctxFloor\)/g) || []).length, 2);
+});
+
+test("once the provider has reported, the local estimate is out of the loop", () => {
+  // Mixing them was the earlier design. A local assemble() sees neither the system prompt nor the
+  // tool schemas nor what the gateway compressed away, so it can only distort a number that is
+  // already exact — and it re-derived the whole transcript on a keystroke timer to do it.
+  const refresh = grab("_refreshContextMeterFromDraft");
+  assert.match(refresh, /if \(Math\.max\(0, Number\(real\?\.total\) \|\| 0\) > 0\) \{[\s\S]*?_setContextMeterFromReading\(real, draftTokens\);\s*\n\s*return;/,
+    "a real reading paints the meter and returns before the estimator is consulted");
+  assert.ok(refresh.indexOf("_setContextMeterFromReading") < refresh.indexOf("_estimateActiveSessionContextTokens"),
+    "the estimate is the fallback, not the default");
+  assert.doesNotMatch(grab("_estimateActiveSessionContextTokens"), /_ctxRealFloor/,
+    "the estimator no longer reaches for the real reading at all");
+});
+
+test("the ring shows the context, not a percentage that rounds a real conversation to zero", () => {
+  // What the user was looking at: 125k of real context against a membership-sized window is 0%
+  // to the nearest integer. Technically true, and the reason the gauge read as dead.
+  assert.equal(ringLabel(0), "0");
+  assert.equal(ringLabel(940), "940");
+  assert.equal(ringLabel(5_500), "5.5k");
+  assert.equal(ringLabel(47_000), "47k");
+  assert.equal(ringLabel(125_500), "126k");
+  assert.equal(ringLabel(1_480_000), "1.5M");
+  assert.equal(ringLabel(12_000_000), "12M");
+  for (const n of [0, 940, 5_500, 47_000, 125_500, 1_480_000, 12_000_000]) {
+    assert.ok(ringLabel(n).length <= 4, `"${ringLabel(n)}" must fit a 30px ring`);
+  }
+  assert.match(SRC, /el\.classList\.toggle\("is-compact", labelText\.length >= 4\)/);
+  assert.match(APP_CSS, /\.cache-ring\.is-compact \.cache-ring__label \{[^}]*font-size: 8px;/);
 });
