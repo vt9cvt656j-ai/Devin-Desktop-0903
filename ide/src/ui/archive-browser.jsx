@@ -59,7 +59,13 @@ const COLUMNS = [
   { key: "ratio", label: "压缩率", align: "right", width: "w-20" },
 ];
 
-export function ArchiveBrowser({ archive, file, onOpenEntry, onExtract, onReveal }) {
+/** The tree's own icon for a name, falling back to a glyph if the set has nothing for it. */
+function Icon({ url, isDir }) {
+  if (!url) return <span className="mr-2.5 inline-block w-4 text-center" aria-hidden>{isDir ? "📁" : "📄"}</span>;
+  return <img src={url} alt="" draggable={false} className="mr-2.5 inline-block size-4 shrink-0 align-[-3px]" />;
+}
+
+export function ArchiveBrowser({ archive, file, iconFor, onOpenEntry, onExtract, onReveal }) {
   const [cwd, setCwd] = useState("");
   const [sort, setSort] = useState({ key: "label", dir: 1 });
   const [selected, setSelected] = useState(null);
@@ -96,10 +102,12 @@ export function ArchiveBrowser({ archive, file, onOpenEntry, onExtract, onReveal
   }, []);
 
   return (
-    <div className="ui-island flex h-full min-h-0 flex-col bg-background text-foreground">
+    <div className="ui-island flex h-full min-h-0 flex-col bg-[var(--panel-solid)] text-foreground">
       {/* Title bar: the archive itself. Name, what it weighs, what it unpacks to. */}
       <div className="flex flex-none items-center gap-3 border-b border-border px-4 py-2.5">
-        <span className="text-[15px]" aria-hidden>🗜️</span>
+        {iconFor ? (
+          <img src={iconFor(file?.name || "archive.zip", false)} alt="" draggable={false} className="size-7 shrink-0" />
+        ) : null}
         <div className="min-w-0 flex-1">
           <div className="truncate text-[13px] font-medium" title={file?.name} data-i18n-skip>
             {file?.name || "压缩包"}
@@ -116,7 +124,7 @@ export function ArchiveBrowser({ archive, file, onOpenEntry, onExtract, onReveal
             <button
               type="button"
               onClick={onReveal}
-              className="h-8 rounded-lg border border-border px-3 text-[12px] hover:bg-accent"
+              className="h-9 rounded-full border border-border px-4 text-[13px] font-medium text-primary transition-colors hover:bg-primary/10"
             >
               在系统中显示
             </button>
@@ -124,7 +132,7 @@ export function ArchiveBrowser({ archive, file, onOpenEntry, onExtract, onReveal
           <button
             type="button"
             onClick={() => onExtract?.()}
-            className="h-8 rounded-lg bg-primary px-3.5 text-[12px] font-medium text-primary-foreground hover:opacity-90"
+            className="h-9 rounded-full bg-primary px-5 text-[13px] font-medium text-primary-foreground shadow-sm transition-shadow hover:shadow-md"
           >
             全部解压…
           </button>
@@ -167,14 +175,14 @@ export function ArchiveBrowser({ archive, file, onOpenEntry, onExtract, onReveal
       {/* The list fills whatever is left. */}
       <div className="min-h-0 flex-1 overflow-auto">
         <table className="w-full border-collapse text-[12px]">
-          <thead className="sticky top-0 z-10 bg-background">
+          <thead className="sticky top-0 z-10 bg-[var(--panel-solid)]">
             <tr className="border-b border-border">
               {COLUMNS.map((col) => (
                 <th
                   key={col.key}
                   onClick={() => toggleSort(col.key)}
                   className={cn(
-                    "cursor-pointer select-none px-4 py-1.5 font-medium text-muted-foreground hover:text-foreground",
+                    "cursor-pointer select-none px-4 py-2 text-[12px] font-medium text-muted-foreground transition-colors hover:text-foreground",
                     col.align === "right" ? "text-right" : "text-left",
                     col.width,
                   )}
@@ -197,20 +205,20 @@ export function ArchiveBrowser({ archive, file, onOpenEntry, onExtract, onReveal
                   onClick={() => setSelected(key)}
                   onDoubleClick={() => (row.isDir ? enter(row.label) : onOpenEntry?.(row.name))}
                   className={cn(
-                    "cursor-default border-b border-border/50 last:border-0",
-                    selected === key ? "bg-primary/10" : "hover:bg-accent",
+                    "cursor-default border-b border-border/40 last:border-0 transition-colors",
+                    selected === key ? "bg-primary/10" : "hover:bg-foreground/[0.04]",
                   )}
                   title={row.isDir ? `${row.count} 个文件 · 双击进入` : "双击预览"}
                 >
-                  <td className="max-w-0 truncate px-4 py-1.5">
-                    <span className="mr-2" aria-hidden>{row.isDir ? "📁" : "📄"}</span>
+                  <td className="max-w-0 truncate px-4 py-2">
+                    <Icon url={iconFor?.(row.isDir ? row.label : row.name || row.label, row.isDir)} isDir={row.isDir} />
                     <span data-i18n-skip>{row.label}</span>
                   </td>
-                  <td className="px-4 py-1.5 text-right tabular-nums text-muted-foreground">{formatBytes(row.size)}</td>
-                  <td className="px-4 py-1.5 text-right tabular-nums text-muted-foreground">
+                  <td className="px-4 py-2 text-right tabular-nums text-muted-foreground">{formatBytes(row.size)}</td>
+                  <td className="px-4 py-2 text-right tabular-nums text-muted-foreground">
                     {row.compressed ? formatBytes(row.compressed) : "—"}
                   </td>
-                  <td className="px-4 py-1.5 text-right tabular-nums text-muted-foreground">
+                  <td className="px-4 py-2 text-right tabular-nums text-muted-foreground">
                     {ratio === null ? "—" : `${ratio}%`}
                   </td>
                 </tr>

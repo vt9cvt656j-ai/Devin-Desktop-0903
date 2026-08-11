@@ -4318,6 +4318,8 @@ body.zen-mode .editor {
    sits inside the generic inspector's padding, which is what made it look bolted on. */
 .file-inspector--archive {
   overflow: hidden !important;
+  /* Flat, and the same surface as the shell — the base rule paints two radial tints over the
+     editor background, which is what showed around the card's rounded corners. */
   background: var(--panel-solid, var(--panel));
 }
 .file-inspector__shell--archive {
@@ -4327,8 +4329,16 @@ body.zen-mode .editor {
   height: 100%;
   min-height: 100%;
   max-height: 100%;
+  /* The base shell is a floating card — min(1180px) wide, 24px margins, 24px radius, a shadow —
+     which is right for a report and wrong for a window. Left in place it produced a rounded
+     rectangle hovering over the inspector's tinted gradient, corners and all: the panel looked
+     pasted onto the editor rather than part of it. A window fills its frame. */
   margin: 0;
   padding: 0;
+  border: 0;
+  border-radius: 0;
+  box-shadow: none;
+  background: var(--panel-solid, var(--panel));
   overflow: hidden;
 }
 .file-inspector__shell--archive > [data-archive-browser-host] {
