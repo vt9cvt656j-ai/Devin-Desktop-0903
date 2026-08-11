@@ -184,3 +184,23 @@ test("the inspector header cannot be crushed by its own buttons", () => {
   const heading = APP_CSS.slice(APP_CSS.indexOf(".file-inspector__heading {"), APP_CSS.indexOf(".file-inspector__eyebrow {"));
   assert.match(heading, /flex: 1 1 260px;/, "and the title needs a real basis, not flex-basis auto");
 });
+
+test("the archive window fills its frame instead of floating in it", () => {
+  const ARCHIVE_JSX = fs.readFileSync("src/ui/archive-browser.jsx", "utf8");
+  // The base shell is a floating card: min(1180px) wide, 24px margin, 24px radius, a shadow. Left
+  // inherited, the archive window became a rounded rectangle hovering over the inspector's tinted
+  // gradient — corners and all, which is what read as pasted-on.
+  const shell = APP_CSS.slice(APP_CSS.indexOf(".file-inspector__shell--archive {"), APP_CSS.indexOf(".file-inspector__shell--archive > "));
+  for (const decl of ["margin: 0;", "border-radius: 0;", "box-shadow: none;", "border: 0;"]) {
+    assert.ok(shell.includes(decl), `the archive shell must reset ${decl}`);
+  }
+
+  // One surface, named once. bg-background resolves to --bg; the shell paints --panel-solid. They
+  // are different greys, and the join between them is visible.
+  assert.match(ARCHIVE_JSX, /bg-\[var\(--panel-solid\)\]/, "the island must paint the shell's surface");
+  assert.doesNotMatch(ARCHIVE_JSX, /bg-background/, "and must not paint a second one beside it");
+
+  // Real icons, not emoji: a zip should look like the zip in the tree beside it.
+  assert.match(ARCHIVE_JSX, /iconFor\?\.\(/, "rows take their icon from the tree's icon set");
+  assert.match(SRC, /iconFor: \(name, isDir\) => \(isDir \? folderIconUrl/, "which main.js supplies");
+});

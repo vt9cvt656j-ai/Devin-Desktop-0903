@@ -4682,6 +4682,9 @@ function _mountArchiveBrowser(path, archive, file = null) {
   mountArchiveBrowser(host, {
     archive,
     file,
+    // The real Material icon set the file tree uses, not emoji: a zip should look like the zip
+    // in the tree three inches to the left, and a folder like a folder.
+    iconFor: (name, isDir) => (isDir ? folderIconUrl(name || "", false) : fileIconUrl(name || "")),
     onReveal: async () => {
       try { await backend.revealItemInDir(path); } catch (e) { showToast(String(e?.message || e || "无法在系统中显示")); }
     },
