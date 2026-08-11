@@ -56686,6 +56686,20 @@ async function _atAddFolder() {
   await _addWorkspaceRoot(picked);
   // No cache to clear: _ensureFileIndex keys on the active root, and _addWorkspaceRoot makes the
   // new folder active, so the next call rebuilds against it.
+  //
+  // The focus round-trip is the load-bearing part. Opening the native chooser blurs the composer,
+  // and the blur handler hides this menu 150ms later — which clears _atMode and _atDir. By the
+  // time the dialog resolves, seconds later, setting them again renders into a menu whose token
+  // is gone, so nothing lists. Focus has to come back to the composer first, and the render has
+  // to wait for the caret to actually be there.
+  promptEl.focus();
+  await new Promise((resolve) => requestAnimationFrame(resolve));
+  if (!_atToken()) {
+    // The @ did not survive the trip. The folder is still added and active, which is the part
+    // that matters; say so rather than silently doing nothing.
+    showToast(`${basename(picked)} 已加入工作区，输入 @ 选择其中的文件`);
+    return;
+  }
   _atMode = "files";
   _atDir = "";
   _renderAtMenu();
