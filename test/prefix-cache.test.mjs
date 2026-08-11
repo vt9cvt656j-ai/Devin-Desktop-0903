@@ -385,3 +385,20 @@ test("a folder in the @ menu opens instead of only inserting", () => {
   assert.match(SRC, /if \(!f\.startsWith\(prefix\)\) continue;/);
   assert.match(SRC, /_atDir = "";  \/\/ and at the workspace root/, "reopening @ starts at the root");
 });
+
+test("the model mark carries the same optical weight as the logos beside it", () => {
+  const INDEX = fs.readFileSync("index.html", "utf8");
+  const sparkle = INDEX.slice(INDEX.indexOf('<symbol id="i-sparkle"'), INDEX.indexOf("</symbol>", INDEX.indexOf('<symbol id="i-sparkle"')));
+
+  // The old mark spanned y 2.2–11.8 — under half its box — so next to GitHub and GitLab, which
+  // fill theirs, it read as faint rather than quiet. The primary star must actually use the box.
+  const first = sparkle.match(/d="M([\d.]+) ([\d.]+)/);
+  assert.ok(first, "the primary path must exist");
+  const nums = [...sparkle.matchAll(/[-\d.]+/g)].map((m) => parseFloat(m[0])).filter((n) => n >= 0 && n <= 24);
+  assert.ok(Math.max(...nums) >= 18, `the mark must reach the far side of the box, got ${Math.max(...nums)}`);
+
+  // No opacity: hierarchy comes from size, and a translucent glyph goes muddy on the tinted
+  // selected row.
+  assert.doesNotMatch(sparkle, /opacity=/, "no translucent halves");
+  assert.equal((sparkle.match(/<path/g) || []).length, 2, "a star and its companion — the asymmetry is what makes it read as a sparkle");
+});
