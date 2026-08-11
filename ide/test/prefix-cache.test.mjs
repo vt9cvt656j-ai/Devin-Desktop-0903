@@ -1125,3 +1125,25 @@ test("中断和停止都不能把已经写出来的内容丢掉", () => {
   assert.equal((SRC.match(/（本次回复因上游中断未完成）/g) || []).length, 2,
     "两条路都要存，并且如实标成半截的");
 });
+
+test("凭记忆拼 old_string 的许可不能只发给 Claude", () => {
+  // 用户实测：编辑 sites/example.py 报「未找到 old_string」。文件真实存在、110 行、刚写完，
+  // 所以不是编造文件名，是模型按自己记忆里的内容去改。原因在提示词分家：
+  //   _GPT_TUNING  ：「改前必 read_file 看真内容，绝不凭印象拼 old_string」——只发给 GPT
+  //   _CLAUDE_TUNING：「局部编辑可在已知上下文给出精确 old_string 直接改」——发给 Claude
+  // 于是 claude-opus-5 只拿到宽松那条，严格那条它从来没收到过。而「已知上下文」恰恰是
+  // 长 run 里最先被折叠掉的东西：十轮前自己写的文件早就不在上下文里了。
+  const gpt = SRC.slice(SRC.indexOf("const _GPT_TUNING"), SRC.indexOf("const _DEEPSEEK_TUNING"));
+  const claude = SRC.slice(SRC.indexOf("const _CLAUDE_TUNING"), SRC.indexOf("function _modelFamilyTuning"));
+
+  assert.match(gpt, /绝不凭印象拼 old_string/, "GPT 那条严格规则还在");
+  // Claude 那份现在也必须把这条说清楚，而且要说明白为什么记忆不算数。
+  assert.match(claude, /逐字符来自\*\*这一轮看得见的真实文件内容\*\*/);
+  assert.match(claude, /「我记得我刚写过这个文件」不算|"我记得我刚写过这个文件"不算/);
+  assert.doesNotMatch(claude, /可在当前编辑器\/附件\/已知上下文给出精确 old_string 且工具能唯一命中时直接改/,
+    "旧的宽松措辞不能留着 —— 它正是这次失败的许可来源");
+
+  // 编辑失败的回执本来就很好（近似匹配、压缩产物识别、带行号回传最接近的真实内容），
+  // 这条是防止它一开始就被用上。
+  assert.match(SRC, /文件里\*\*最接近的真实内容\*\*是这几行（带真实行号）/);
+});
