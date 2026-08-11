@@ -293,3 +293,60 @@ test("a long tab name fades out rather than being cut with an ellipsis", () => {
   assert.match(SRC, /row\.querySelector\("\.name"\)\.textContent = item\.name;/,
     "the tree renders the full name, unshortened");
 });
+
+test("@ is a router: model, files, github, gitlab", () => {
+  // It used to open straight onto a fuzzy list of every file, so the only thing you could point
+  // at was a path.
+  assert.match(SRC, /const _AT_CATEGORIES = \[/, "the categories must exist");
+  for (const id of ["model", "files", "github", "gitlab"]) {
+    assert.match(SRC, new RegExp(`id: "${id}"`), `${id} must be a category`);
+  }
+
+  // Typing a path still goes straight to files — a router that slows the common case is worse
+  // than no router.
+  assert.match(SRC, /query\.includes\("\/"\) \|\| query\.includes\("\."\)/,
+    "a path-shaped query must skip the category step");
+
+  // Escape backs out one level rather than closing everything.
+  assert.match(SRC, /if \(_atMode\) \{ _atMode = null; _renderAtMenu\(\); \} else _hideAtMenu\(\);/);
+
+  // Rows carry their own action, so the renderer and the picker cannot disagree about row 3.
+  assert.match(SRC, /function _pickAt\(i\) \{[\s\S]*?row\.onPick\(\);/,
+    "picking must call the row's own handler");
+});
+
+test("a @model: chip actually routes the turn to that model", () => {
+  // The headline risk with this feature is a menu entry that inserts a token nothing reads —
+  // the turn would run on the default model and look like it worked.
+  const fn = SRC.match(/function _requestedModelFor[\s\S]*?\n}/)[0];
+  const requested = new Function(
+    `const _modelCatalogEntry = (id) => (id === "claude-opus-5" ? { id } : null);
+     const _customModelById = () => null;
+     ${fn}; return _requestedModelFor;`,
+  )();
+  assert.equal(requested("@model:claude-opus-5 重构这个模块"), "claude-opus-5");
+  assert.equal(requested("重构这个模块"), "", "no token, no routing");
+  // A model that is not in the catalogue must not silently fall back to the default.
+  assert.equal(requested("@model:not-a-real-model do it"), "",
+    "an unknown model must not quietly become the default");
+
+  const strip = new Function(`${SRC.match(/function _withoutModelToken[\s\S]*?\n}/)[0]}; return _withoutModelToken;`)();
+  assert.equal(strip("@model:claude-opus-5 重构这个模块"), "重构这个模块",
+    "the routing token is an address, not part of the task");
+
+  // Routed models go through the same gate as picked ones — membership, custom endpoints, the lot.
+  assert.match(SRC, /const routed = await _readyAiConfig\(\{ \.\.\.loadConfig\(\), model: _routedModel \}\)/);
+  assert.match(SRC, /async function _readyAiConfig\(overrideConfig = null\)/);
+  assert.match(SRC, /const _rawCfg = overrideConfig \|\| loadConfig\(\);/);
+});
+
+test("an unlinked integration offers to connect rather than showing nothing", () => {
+  // An empty list and "you have not connected this" look identical and mean opposite things.
+  assert.match(SRC, /if \(!token\) \{\s*return \[\{\s*kind: "connect"/,
+    "no token must produce a connect row");
+  assert.match(SRC, /localStorage\.setItem\(`michael-ide\.\$\{kind\}-token`/,
+    "the token is stored locally, like the Figma one");
+  // The chip serialiser and the caret arithmetic must share one definition of a chip's text.
+  assert.equal((SRC.match(/_chipText\(c\)/g) || []).length, 2,
+    "both the serialiser and the caret maths must call the same helper");
+});
