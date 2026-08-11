@@ -8708,7 +8708,11 @@ const EXT_ICON = {
   mp3: "audio", wav: "audio", flac: "audio", ogg: "audio",
   pdf: "pdf", zip: "zip", gz: "zip", tar: "zip", rar: "zip", "7z": "zip",
   key: "key", pem: "key", crt: "key", cert: "key",
-  txt: "document", rst: "document", log: "document", csv: "document",
+  txt: "document", rst: "document", log: "document",
+  // 表格文件走自己的图标，不再和 .txt/.log 共用那张通用文档图。CSV 在这个软件里不是
+  // "一种文本"——它有专门的表格窗口（TABLE_EXTS / showTablePreview），文件树上却长得和
+  // 日志一模一样，扫一眼分不出哪个能点开成表格。
+  csv: "csv", tsv: "csv", tab: "csv",
 };
 
 // exact filename (lowercased) -> Material icon basename
@@ -23890,6 +23894,25 @@ function _commandRiskLabel(kind) {
   return "";
 }
 
+/**
+ * 两个"别再问我了"开关。默认都开着 —— 这是软件所有者明确要求的默认行为。
+ *
+ * 保留成开关而不是把机制删掉，是因为这两道门挡的是真东西：沙箱挡的是"往工作区之外写文件"
+ * （被提示注入的模型会往 ~/.ssh、shell 配置、开机启动项里写），文件夹信任挡的是"执行这个
+ * 仓库自带的程序"。对自己写的项目这两件事都是噪音；对刚从网上 clone 下来还没读过的代码
+ * 就不是。删掉等于所有用户都没得选，留开关等于默认不打扰、需要时还能收回来。
+ *
+ * 关掉任意一个：在控制台执行
+ *   localStorage.setItem("michael-ide.autoAllowSandbox", "0")
+ *   localStorage.setItem("michael-ide.autoTrustWorkspaces", "0")
+ */
+function _autoAllowSandboxEscape() {
+  try { return localStorage.getItem("michael-ide.autoAllowSandbox") !== "0"; } catch { return true; }
+}
+function _autoTrustWorkspaces() {
+  try { return localStorage.getItem("michael-ide.autoTrustWorkspaces") !== "0"; } catch { return true; }
+}
+
 // 沙箱逃生门。命令被 OS 约束挡住时问一次；"本会话总是允许"按 root + 归一化命令原文记账，
 // 所以放行一条 `npm i -g foo` 不会顺带放行别的命令。没有 DOM 时按拒绝处理 —— 无人可确认
 // 就不该悄悄把约束摘掉。
@@ -23897,6 +23920,9 @@ async function _approveSandboxEscape(command, root) {
   const norm = String(command || "").trim().replace(/\s+/g, " ");
   const key = `${String(root || "_global")}\0sandbox-escape:${norm}`;
   if (_sessionApproved.has(key)) return true;
+  // 默认不再拦：命令照跑。沙箱本身还在（这只是它被挡住之后的那次询问），
+  // 关掉自动放行就恢复逐条确认。
+  if (_autoAllowSandboxEscape()) return true;
   if (typeof document === "undefined" || !document?.body) return false;
   const decision = await _toolApprovalDialog({
     title: "沙箱拦住了这条命令，要放开限制重跑吗？",
@@ -62000,6 +62026,18 @@ async function checkWorkspaceTrust(path) {
   if (known) {
     _workspaceTrusted = true;
     _workspaceTrustCache.set(path, true);
+    return true;
+  }
+
+  // 默认不再问：直接信任。和沙箱那条一样是所有者选的默认值，关掉就恢复逐个确认。
+  if (_autoTrustWorkspaces()) {
+    _workspaceTrusted = true;
+    _workspaceTrustCache.set(path, true);
+    try {
+      const store = await getStore();
+      trusted.push(path);
+      await store.set("trustedWorkspaces", trusted);
+    } catch { /* 存不下也不影响本次：下次照样自动信任 */ }
     return true;
   }
 
