@@ -16443,30 +16443,33 @@ function _tokenExact(n) {
   return Math.max(0, Math.round(Number(n) || 0)).toLocaleString("en-US");
 }
 /**
- * The number inside the ring: four characters at most, because the ring is 30px across.
+ * The window the ring measures against: how much the model will actually read this turn.
  *
- * It used to be the percentage, and that is what the user was looking at when they said the
- * meter was not showing a real context. Against a membership-sized window a genuine hundred-
- * thousand-token conversation rounds to "0" — technically true, useless to read. The count is
- * the thing being asked about; the arc still carries how full the window is.
+ * Deliberately NOT _effectiveContextLimit. That one is widened by the michael-compression tier,
+ * which is not a context window — it is how much history the gateway will hold and compress down
+ * to fit. Measuring occupancy against it made a full 200k request read as 4% of a 5M entitlement,
+ * so the gauge never moved off zero no matter how long the conversation ran. An explicit window
+ * choice is a real narrowing and still counts, but it cannot exceed what the model can read.
  */
-function _tokenRingLabel(n) {
-  const v = Math.max(0, Math.round(Number(n) || 0));
-  if (v >= 1_000_000) return (v / 1_000_000).toFixed(v >= 10_000_000 ? 0 : 1) + "M";
-  if (v >= 10_000) return Math.round(v / 1000) + "k";
-  if (v >= 1_000) return (v / 1000).toFixed(1) + "k";
-  return String(v);
+function _contextMeterLimit(modelId) {
+  const native = Math.max(1, Number(_modelContextLimit(modelId)) || 0);
+  const choice = _ctxChoiceFor(modelId);
+  return choice > 0 ? Math.max(1, Math.min(choice, native)) : native;
 }
 function _contextMeterSnapshot(input = {}) {
   const cfg = (() => { try { return loadConfig(); } catch { return {}; } })();
   const model = String(input.model || cfg.model || cfg.gatewayModel || "").trim();
-  // 用 _effectiveContextLimit 而不是 _modelContextLimit：开了 michael-compression
-  // 的账号，实际能塞进去的上下文是档位上限（1M/2M/5M），不是模型原生窗口。
+  // 两个上限，各有各的问题，所以两个都留着。
   //
-  // 之前这里读的是原生窗口，于是 5M 用户的仪表**永远显示 200.0k** —— 不是压缩没生效，
-  // 是这块显示压根不看档位。这个数是用户判断"档位到底有没有开"的唯一可见信号，读错
-  // 等于把一个正常工作的功能显示成没工作。
-  const limit = Math.max(1, Number(input.limit) || _effectiveContextLimit(model));
+  // 百分比按**模型这一轮真正会读多少**算（_contextMeterLimit）。曾经这里用档位上限当分母，
+  // 结果 5M 账号下一个塞满 200k 的请求显示成 4%，指针从头到尾贴着 0 —— 用户看到的就是
+  // "这个数根本不动、不是真的上下文"。
+  //
+  // 但档位本身必须仍然看得见：更早的一版分母写死原生窗口，于是 5M 用户永远只看到 200.0k，
+  // 把一个正常工作的功能显示成没工作。档位现在进 tooltip —— 那才是"我的 5M 到底开没开"
+  // 该被回答的地方，而且旁边就是真实用量，比一个孤零零的大数字有用。
+  const limit = Math.max(1, Number(input.limit) || _contextMeterLimit(model));
+  const tierLimit = Math.max(0, Number(_effectiveContextLimit(model)) || 0);
   const prompt = Math.max(0, Math.round(Number(input.promptTokens ?? input.prompt_tokens ?? input.prompt ?? 0) || 0));
   const completion = Math.max(0, Math.round(Number(input.completionTokens ?? input.completion_tokens ?? input.completion ?? 0) || 0));
   // null 穿透 = 上游没报缓存字段（≠ 真 0），仪表按"未上报"渲染
@@ -16478,7 +16481,7 @@ function _contextMeterSnapshot(input = {}) {
   const total = Math.max(0, prompt + completion);
   const pct = Math.max(0, Math.min(999, Math.round((total / limit) * 100)));
   return {
-    prompt, completion, cached, cacheWrite, total, pct, limit, model,
+    prompt, completion, cached, cacheWrite, total, pct, limit, tierLimit, model,
     estimated: input.estimated !== false,
     source: String(input.source || (input.estimated === false ? "usage" : "estimate")),
     anyReal: input.estimated === false || !!input.anyReal,
@@ -17091,8 +17094,14 @@ function _renderTokenMeter() {
       : state.source || (state.estimated ? "估算" : "真实 usage");
   const cacheWrite = Math.max(0, Number(state.cacheWrite) || 0);
   const uncached = Math.max(0, (state.prompt || 0) - (Number(state.cached) || 0) - cacheWrite);
+  // The ring shows the percentage; the amount belongs on hover, where there is room to state it
+  // exactly. That ordering matters — the first line is the whole answer for most glances.
+  const tierLimit = Math.max(0, Number(state.tierLimit) || 0);
+  const tierLine = tierLimit > state.limit
+    ? `\n会员档位：可留存 ${k(tierLimit)} 历史，由网关压缩后送进这个 ${k(state.limit)} 窗口`
+    : "";
   const text = `上下文 ${k(state.total)} / ${k(state.limit)}（${pct}%）${state.estimated ? "（估算）" : ""}${_thinkShort}`;
-  const tooltip = `上下文占用：${_tokenExact(state.total)} / ${_tokenExact(state.limit)} tokens（${pct}%）` +
+  const tooltip = `上下文占用：${_tokenExact(state.total)} tokens · 窗口 ${_tokenExact(state.limit)}（${pct}%）` + tierLine +
     `\n来源：${sourceText}${state.model ? ` · 模型 ${state.model}` : ""}` +
     `\n最近请求：输入 ${_tokenExact(state.prompt || 0)}（${state.cached == null ? "缓存 未上报" : `缓存读取 ${_tokenExact(state.cached)} · 缓存写入 ${_tokenExact(cacheWrite)} · 未缓存 ${_tokenExact(uncached)}`}）· 输出 ${_tokenExact(state.completion || 0)}` +
     `\n本会话累计 usage：输入 ${_tok.in}（${_tok.anyCacheInfo ? `缓存命中 ${_tok.cached}，约 ${cumHit}%` : "缓存 上游未上报"}）· 输出 ${_tok.out}` +
@@ -17120,9 +17129,7 @@ function _renderTokenMeter() {
     el.classList.toggle("is-full", pct >= 100);
     el.style.setProperty("--cache-ring-offset", String(Math.max(0, Math.min(100, 100 - ringPct))));
     const label = el.querySelector(".cache-ring__label");
-    const labelText = _tokenRingLabel(state.total);
-    if (label) label.textContent = labelText;
-    el.classList.toggle("is-compact", labelText.length >= 4);
+    if (label) label.textContent = pct >= 100 ? "满" : String(pct);
     el.removeAttribute("title");
     el.dataset.tooltip = tooltip;
     el.setAttribute("aria-label", text);
