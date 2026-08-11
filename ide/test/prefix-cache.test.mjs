@@ -432,3 +432,24 @@ test("Files can point @ at a folder the workspace does not have yet", () => {
   // The row is offered only at the top level with no query — mid-search it would be noise.
   assert.match(SRC, /if \(!_atDir && !query\) \{\s*rows\.unshift\(\{\s*kind: "add-folder"/);
 });
+
+test("Directory is its own @ category, listing folders from the workspace", () => {
+  const INDEX = fs.readFileSync("index.html", "utf8");
+  assert.match(SRC, /\{ id: "directory", label: "Directory"/, "the category must exist");
+  // Order matters: it sits below Files, which is where it was asked for.
+  const cats = SRC.slice(SRC.indexOf("const _AT_CATEGORIES = ["), SRC.indexOf("];", SRC.indexOf("const _AT_CATEGORIES = [")));
+  const order = [...cats.matchAll(/id: "(\w+)"/g)].map((m) => m[1]);
+  assert.deepEqual(order, ["model", "files", "directory", "github", "gitlab"]);
+  assert.ok(INDEX.includes('id="i-folder-open"'), "its icon must be a real symbol");
+  assert.match(SRC, /else if \(_atMode === "directory"\) rows = await _atDirectoryRows\(query\)/,
+    "and it must be routed, not just listed");
+
+  // It reads the existing index rather than re-walking the disk — the index already records a
+  // folder as its path plus a trailing slash.
+  const fn = SRC.slice(SRC.indexOf("async function _atDirectoryRows"), SRC.indexOf("/** Turn workspace-relative paths into menu rows."));
+  assert.match(fn, /\.filter\(\(f\) => f\.endsWith\("\/"\)\)/, "folders come from the index");
+  assert.match(fn, /const depth = a\.split\("\/"\)\.length - b\.split\("\/"\)\.length;/,
+    "shallow paths first — the folder you mean is usually near the root");
+  assert.match(fn, /_insertAtChip\(\{ kind: "file", value: d/, "picking one inserts it as a reference");
+  assert.match(fn, /No matching folder/, "an empty result must say so rather than closing the menu");
+});
