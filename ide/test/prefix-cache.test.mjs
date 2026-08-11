@@ -556,7 +556,10 @@ const ctxInput = load("_contextInputTokens", ["_contextInputTokens"]);
 const applyReading = load("_applyContextReading", ["_applyContextReading"]);
 const readingForStorage = load("_ctxReadingForStorage", ["_ctxReadingForStorage"]);
 const readingFromStorage = load("_ctxReadingFromStorage", ["_ctxReadingFromStorage"]);
-const ringLabel = load("_tokenRingLabel", ["_tokenRingLabel"]);
+const meterLimit = (native, choice) => new Function(
+  "_modelContextLimit", "_ctxChoiceFor",
+  `${grab("_contextMeterLimit")}\nreturn _contextMeterLimit("m");`,
+)(() => native, () => choice);
 
 test("context counts the cached prompt, which is where the whole conversation lives", () => {
   // This is why the meter looked frozen. Anthropic reports `input_tokens` EXCLUDING everything
@@ -662,19 +665,27 @@ test("once the provider has reported, the local estimate is out of the loop", ()
     "the estimator no longer reaches for the real reading at all");
 });
 
-test("the ring shows the context, not a percentage that rounds a real conversation to zero", () => {
-  // What the user was looking at: 125k of real context against a membership-sized window is 0%
-  // to the nearest integer. Technically true, and the reason the gauge read as dead.
-  assert.equal(ringLabel(0), "0");
-  assert.equal(ringLabel(940), "940");
-  assert.equal(ringLabel(5_500), "5.5k");
-  assert.equal(ringLabel(47_000), "47k");
-  assert.equal(ringLabel(125_500), "126k");
-  assert.equal(ringLabel(1_480_000), "1.5M");
-  assert.equal(ringLabel(12_000_000), "12M");
-  for (const n of [0, 940, 5_500, 47_000, 125_500, 1_480_000, 12_000_000]) {
-    assert.ok(ringLabel(n).length <= 4, `"${ringLabel(n)}" must fit a 30px ring`);
-  }
-  assert.match(SRC, /el\.classList\.toggle\("is-compact", labelText\.length >= 4\)/);
-  assert.match(APP_CSS, /\.cache-ring\.is-compact \.cache-ring__label \{[^}]*font-size: 8px;/);
+test("the percentage measures the window the model reads, so it can actually move", () => {
+  // The membership tier is not a context window — it is how much history the gateway will hold
+  // and compress down to fit one. Dividing by it put a full 200k request at 4% of a 5M
+  // entitlement, and the ring sat on zero however long the conversation ran.
+  assert.equal(meterLimit(200_000, 0), 200_000);
+  assert.equal(200 * 125_500 / meterLimit(200_000, 0) / 2, 62.75, "125k of a 200k window reads 63%");
+
+  // An explicit window choice is a real narrowing and counts; it cannot exceed what the model reads.
+  assert.equal(meterLimit(200_000, 64_000), 64_000);
+  assert.equal(meterLimit(200_000, 5_000_000), 200_000);
+  assert.equal(meterLimit(0, 0), 1, "an unknown model still divides by something");
+
+  // The tier stays visible, in the tooltip. An earlier build divided by the native window and a
+  // 5M account saw a permanent "200.0k" — a working feature displayed as if it were off.
+  assert.match(SRC, /const tierLimit = Math\.max\(0, Number\(_effectiveContextLimit\(model\)\) \|\| 0\);/);
+  assert.match(SRC, /tierLimit > state\.limit\s*\n\s*\? `\\n会员档位：可留存 \$\{k\(tierLimit\)\} 历史/);
+
+  // The ring carries the percentage; the amount is on hover, first line, stated exactly.
+  assert.match(SRC, /label\.textContent = pct >= 100 \? "满" : String\(pct\)/);
+  assert.match(SRC, /上下文占用：\$\{_tokenExact\(state\.total\)\} tokens · 窗口 \$\{_tokenExact\(state\.limit\)\}（\$\{pct\}%）/);
+  assert.match(APP_CSS, /\.cache-ring::after \{[^}]*content: attr\(data-tooltip\);/);
+  assert.match(APP_CSS, /\.cache-ring::after \{[^}]*white-space: pre-line;/,
+    "the tooltip is multi-line; without this it collapses into one unreadable run");
 });

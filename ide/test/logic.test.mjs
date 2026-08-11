@@ -5123,7 +5123,7 @@ test("token cache meter is a persistent context ring beside the composer voice b
   assert.match(SRC, /el\.style\.setProperty\("--cache-ring-offset", String\(Math\.max\(0, Math\.min\(100, 100 - ringPct\)\)\)\)/);
   // The ring carries the token count; the arc carries how full the window is. A percentage in
   // the middle rounded a real 125k conversation to "0" against a membership-sized window.
-  assert.match(SRC, /const labelText = _tokenRingLabel\(state\.total\);/);
+  assert.match(SRC, /label\.textContent = pct >= 100 \? "满" : String\(pct\)/);
   assert.match(SRC, /el\.dataset\.tooltip = tooltip/);
   assert.match(SRC, /上下文 \$\{k\(state\.total\)\} \/ \$\{k\(state\.limit\)\}（\$\{pct\}%）/,
     "the screen-reader label states the size and the window, not a bare percentage");

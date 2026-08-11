@@ -386,7 +386,7 @@ export function Shell() {
                     </button>
                     <div className="menu" id="modelMenu" role="listbox" hidden></div>
                   </div>
-                  <span className="cache-ring" id="tokenMeter" role="status" aria-label="上下文 0" data-tooltip="上下文占用：0 tokens">
+                  <span className="cache-ring" id="tokenMeter" role="status" aria-label="上下文 0%" data-tooltip="上下文占用：0 tokens">
                     <svg className="cache-ring__svg" viewBox="0 0 36 36" aria-hidden="true">
                       <circle className="cache-ring__track" cx="18" cy="18" r="15.5"></circle>
                       <circle className="cache-ring__progress" cx="18" cy="18" r="15.5" pathLength="100"></circle>
