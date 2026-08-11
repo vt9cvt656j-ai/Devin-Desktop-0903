@@ -4256,16 +4256,29 @@ fn anthropic_thinking(model: &str, effort: Option<&str>) -> Option<serde_json::V
         // the card never appears. Nothing downstream is broken; it is correctly dropping empty
         // strings. Raw chain-of-thought is never returned on this family regardless; summarized
         // is the only visible form there is.
-        // NO display field. I added display:"summarized" believing it was required to make
-        // thinking visible on this family — measured against the real upstream, it does the
-        // OPPOSITE. Four probes to changhuai.ai with the same question:
-        //     adaptive + summarized + effort -> thinking 0 chars
-        //     adaptive + summarized          -> thinking 0 chars
-        //     adaptive (bare)                -> thinking 131 chars
-        // The reseller answers "summarized" by returning no thinking at all. Bare adaptive is
-        // what works, and is what this line was before I touched it. Do not re-add display
-        // without re-running that probe against the live route.
-        return Some(json!({"type":"adaptive"}));
+        // `display` decides whether any thinking TEXT comes back, and the right answer is a
+        // property of the route, not of the docs — so it is measured, and it is switchable
+        // without a deploy.
+        //
+        // History: a probe against changhuai.ai found bare adaptive returning 131 characters and
+        // `summarized` returning 0, so the field was removed and a comment told the next person
+        // not to re-add it without re-running the probe. That probe has now been re-run, against
+        // this route (764fe78b) rather than that one, using the gateway's own stream telemetry:
+        // EVERY completed Opus 5 stream reports thinking_utf8_chars=0 with bare adaptive. Which
+        // is exactly Anthropic's documented default for this family — `display` is "omitted", and
+        // omitted streams thinking blocks whose text is an empty string. The old measurement has
+        // not been contradicted; it was taken on a different upstream and no longer describes
+        // this one.
+        //
+        // The downside is bounded: the failure this replaces is "no thinking text", and the worst
+        // the old measurement predicts is "no thinking text". Set MICHAEL_THINKING_DISPLAY=omitted
+        // to go back without shipping a build, and read thinking_utf8_chars to see which won.
+        let display = std::env::var("MICHAEL_THINKING_DISPLAY")
+            .unwrap_or_else(|_| "summarized".to_string());
+        if display == "omitted" || display.is_empty() {
+            return Some(json!({"type":"adaptive"}));
+        }
+        return Some(json!({"type":"adaptive","display": display}));
     }
     None
 }
@@ -7932,21 +7945,34 @@ mod billing_tests {
         assert!(error.contains("malformed"));
     }
 
-    /// 4.7+/5/Fable must explicitly ask for summarized display, or the thinking text comes
-    /// back as an EMPTY STRING and the 已思考 card never renders. This is the entire reason
-    /// 4.6 showed thinking and 4.7 did not: the two families take different branches whose
-    /// `display` defaults differ, and `display` was never set anywhere in the stack.
+    /// Whether thinking TEXT comes back is a property of the route, not of the docs, so this
+    /// is a measurement rather than a rule — and it has been re-measured. An earlier probe
+    /// against changhuai.ai had bare adaptive returning 131 characters and `summarized`
+    /// returning 0, so `display` was dropped. On the route in service now (764fe78b), the
+    /// gateway's own stream telemetry reports thinking_utf8_chars=0 on EVERY completed Opus 5
+    /// stream with bare adaptive — which is precisely Anthropic's documented default, where
+    /// `display` is "omitted" and omitted streams thinking blocks whose text is empty.
+    ///
+    /// So the field is sent, and MICHAEL_THINKING_DISPLAY=omitted reverts it without a build.
+    /// What must never come back is the situation this test originally guarded: a stack in
+    /// which nothing anywhere decides the question.
     #[test]
-    fn adaptive_thinking_must_not_send_display() {
+    fn adaptive_thinking_display_is_measured_not_assumed() {
         for model in ["claude-opus-4-7", "claude-opus-4-8", "claude-opus-5", "claude-sonnet-5", "claude-fable-5"] {
             let t = anthropic_thinking(model, Some("high")).expect("thinking must be requested");
             assert_eq!(t["type"], "adaptive", "{model} must use adaptive");
-            assert!(
-                t.get("display").is_none(),
-                "{model}: display must NOT be sent — measured against the live upstream, \
-                 display=summarized returns ZERO thinking while bare adaptive returns it"
+            assert_eq!(
+                t["display"], "summarized",
+                "{model}: omitted display streams thinking blocks with EMPTY text, which is the \
+                 zero-character reading the live telemetry shows"
             );
         }
+        // The escape hatch has to work, or the next person measuring is blocked on a deploy.
+        // SAFETY: single-threaded assertion block; no other test reads this variable.
+        unsafe { std::env::set_var("MICHAEL_THINKING_DISPLAY", "omitted") };
+        let reverted = anthropic_thinking("claude-opus-5", Some("high")).unwrap();
+        assert!(reverted.get("display").is_none(), "the kill switch must actually revert");
+        unsafe { std::env::remove_var("MICHAEL_THINKING_DISPLAY") };
         // 4.6 takes the older explicit-budget branch, whose display default is already
         // summarized — it must NOT gain a display field.
         let t46 = anthropic_thinking("claude-opus-4-6", Some("high")).expect("4.6 requests thinking");
@@ -7966,7 +7992,7 @@ mod billing_tests {
             "messages": [{"role": "user", "content": "hi"}]
         });
         let a = oai_to_anthropic(&body).unwrap();
-        assert_eq!(a["thinking"], json!({"type":"adaptive"}));
+        assert_eq!(a["thinking"], json!({"type":"adaptive","display":"summarized"}));
         // The adaptive family REJECTS budget_tokens, so effort is its only depth control —
         // omitting it left the model with no depth signal at all, which is exactly what
         // "the thinking has no substance" looked like. The old "never send effort" rule still
@@ -7991,7 +8017,7 @@ mod billing_tests {
                 &json!({"model":"claude-fable-5","reasoning_effort":"medium","messages":[]})
             )
             .unwrap()["thinking"],
-            json!({"type":"adaptive"})
+            json!({"type":"adaptive","display":"summarized"})
         );
 
         // No reasoning_effort (user chose "off" → IDE drops the field) → NO thinking.
@@ -8018,7 +8044,7 @@ mod billing_tests {
             "messages": [{"role": "user", "content": "hi"}]
         }))
         .unwrap();
-        assert_eq!(a["thinking"], json!({"type":"adaptive"}));
+        assert_eq!(a["thinking"], json!({"type":"adaptive","display":"summarized"}));
         assert!(a["max_tokens"].as_i64().unwrap() >= 32000);
         // 4.8 is the adaptive family: the client's legacy enabled+budget shape is normalized to
         // adaptive above, so effort must ride along as the depth knob. (The "never send effort"
@@ -8033,7 +8059,7 @@ mod billing_tests {
             "messages": []
         }))
         .unwrap();
-        assert_eq!(s5["thinking"], json!({"type":"adaptive"}));
+        assert_eq!(s5["thinking"], json!({"type":"adaptive","display":"summarized"}));
 
         // Claude 3.7: explicit budget is correct (gateway generates it, not client).
         let b = oai_to_anthropic(&json!({
@@ -8161,7 +8187,7 @@ mod billing_tests {
         ] {
             assert_eq!(
                 anthropic_thinking(id, Some("high")),
-                Some(json!({"type":"adaptive"})),
+                Some(json!({"type":"adaptive","display":"summarized"})),
                 "{id} rejects budget_tokens outright"
             );
         }
@@ -8174,7 +8200,7 @@ mod billing_tests {
         assert_eq!(claude_generation("some-unreleased-claude"), 0.0);
         assert_eq!(
             anthropic_thinking("some-unreleased-claude", Some("high")),
-            Some(json!({"type":"adaptive"}))
+            Some(json!({"type":"adaptive","display":"summarized"}))
         );
     }
 
@@ -8205,15 +8231,15 @@ mod billing_tests {
         // (gateway logs, 2026-08-01, claude-sonnet-5 → 400 on every attempt).
         assert_eq!(
             anthropic_thinking("claude-opus-4-8", Some("medium")),
-            Some(json!({"type":"adaptive"}))
+            Some(json!({"type":"adaptive","display":"summarized"}))
         );
         assert_eq!(
             anthropic_thinking("claude-sonnet-5", Some("high")),
-            Some(json!({"type":"adaptive"}))
+            Some(json!({"type":"adaptive","display":"summarized"}))
         );
         assert_eq!(
             anthropic_thinking("claude-fable-5", Some("low")),
-            Some(json!({"type":"adaptive"}))
+            Some(json!({"type":"adaptive","display":"summarized"}))
         );
         // 4.6 still accepts the explicit budget (deprecated but functional there) — it is
         // the one branch the old aggregator workaround is still valid for.
