@@ -135,6 +135,18 @@ if (inTauri) document.body.classList.add("is-tauri");
 if (/Mac/i.test(navigator.platform || navigator.userAgent)) {
   document.body.classList.add("is-mac");
 }
+// `content-visibility: auto` is what keeps a long conversation from getting heavy — it skips
+// layout and paint for everything off-screen. It is also, in WebKit, what leaves BLANK REGIONS
+// behind when you scroll: the element is skipped for rendering and its placeholder is painted
+// empty, so a scroll can land on a white page. On macOS this app runs in WKWebView and cannot
+// avoid that engine; on Windows it runs in WebView2, which is Chromium and does not have the
+// defect. So the optimization is granted rather than assumed — a class the engine has to earn,
+// which also means a blank page is never the default while this line is loading.
+try {
+  const ua = navigator.userAgent || "";
+  if (/AppleWebKit/.test(ua) && !/Chrome|Chromium|Edg\//.test(ua)) document.body.classList.add("is-webkit");
+  else document.body.classList.add("cv-safe");
+} catch { /* no navigator (tests) → stay on the safe side and skip the optimization */ }
 const backend = inTauri ? await tauriBackend() : mockBackend();
 
 // Multi-agent coordination is local to the current IDE run. The previous build

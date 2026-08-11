@@ -4961,19 +4961,23 @@ img.settings-dropdown__avatar--filled { object-fit: cover; }
 .agent-tool-step { overflow: hidden; }
 /* 「Activity (N steps)」抽屉已删除：它把旧卡片搬进另一个容器，等于把内容藏到第二个地方
    让用户再去翻，而不是就地收起。工具卡现在和代码卡一样原地折叠——卡片不挪窝，只收起正文。 */
-/* 长对话性能（跑着跑着就卡的根因）：视口外的消息行/工具卡用 content-visibility: auto
+/* WebKit 会把 content-visibility: auto 的跳过绘制变成「滚动后整片空白」——元素被跳过渲染，
+   占位框按空白绘制，往下滑就可能停在一张白页上。macOS 上本应用跑在 WKWebView，躲不开这个
+   引擎；Windows 上是 WebView2（Chromium），没有这个缺陷。所以这项优化改成"引擎要先挣到"：
+   只有 .cv-safe 才启用（见 main.js 的引擎判定），白屏不会是默认状态。
+   长对话性能（跑着跑着就卡的根因）：视口外的消息行/工具卡用 content-visibility: auto
    完全跳过布局与绘制——DOM 再长每帧也只为可见部分付渲染成本。contain-intrinsic-size
    记住/预估高度，滚动条稳定、锚点不跳；流式尾部消息在视口内，渲染不受影响。
    关键：估值必须接近中位数，避免首滚抖动和锚定跳跃。 */
-.msg { content-visibility: auto; contain-intrinsic-size: auto 420px; }
-.agent-tool-step, .think-card { content-visibility: auto; contain-intrinsic-size: auto 300px; }
+.cv-safe .msg { content-visibility: auto; contain-intrinsic-size: auto 420px; }
+.cv-safe .agent-tool-step, .cv-safe .think-card { content-visibility: auto; contain-intrinsic-size: auto 300px; }
 /* 终端卡此前完全没有容器化：cmd 执行器把 .agent-tool-step 类名整个换成 .agent-term-card，
    于是一整轮里每张命令卡都在视口外仍付全额布局/绘制成本。估高比工具卡大——命令输出 pre
    最多渲染 5000 字符，常远高于 300px；auto 前缀会在首次渲染后记住真实高度，避免回滚跳动。 */
-.agent-term-card { content-visibility: auto; contain-intrinsic-size: auto 420px; }
+.cv-safe .agent-term-card { content-visibility: auto; contain-intrinsic-size: auto 420px; }
 /* 流式中的消息仍保持 content-visibility: auto（视口内本就正常渲染），但把估高提到 800px：
    流式高度持续增长，估值偏小会在用户上滑时与滚动锚定打架、滚动条跳动 */
-.msg.is-streaming, .chat-session-container.is-streaming > .msg { content-visibility: auto; contain-intrinsic-size: auto 800px; }
+.cv-safe .msg.is-streaming, .cv-safe .chat-session-container.is-streaming > .msg { content-visibility: auto; contain-intrinsic-size: auto 800px; }
 .agent-tool-row { min-width: 0; max-width: 100%; overflow: hidden; }
 .agent-tool-row > * { min-width: 0; }
 /* Inline code (incl. while streaming) wraps instead of forcing the line wider. */
