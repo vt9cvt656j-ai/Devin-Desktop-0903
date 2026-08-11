@@ -8252,7 +8252,7 @@ function renderTabs() {
     tab.innerHTML =
       `${iconImg(fileIconUrl(f.name))}<span class="label"></span>` +
       `<span class="x" title="Close"><span class="dot"></span><svg class="ic"><use href="#i-close" /></svg></span>`;
-    _fillFileLabel(tab.querySelector(".label"), f.name);
+    _fillFileLabel(tab.querySelector(".label"), f.name, 24);
     // The label is capped at 220px and ellipsised, so the full name has to be reachable somehow.
     tab.title = f.name;
     // 用户亲手点开 = 认领这个 tab，之后不再自动回收（activate 本身不能挂钩子——
@@ -10055,7 +10055,7 @@ async function renderChildren(path, container) {
     } else {
       row.innerHTML = `<span class="chev-spacer"></span>${iconImg(fileIconUrl(item.name))}<span class="name"></span>`;
     }
-    _fillFileLabel(row.querySelector(".name"), item.name);
+    _fillFileLabel(row.querySelector(".name"), item.name, 28);
     row.addEventListener("contextmenu", (e) => {
       e.preventDefault();
       e.stopPropagation();
@@ -16167,21 +16167,23 @@ function _splitFileName(name) {
   return [value.slice(0, dot), value.slice(dot)];
 }
 
-/** Fill an element with a filename, keeping the extension in its own non-shrinking span. */
-function _fillFileLabel(el, name) {
+/**
+ * Fill an element with a filename, shortened in the middle so the extension survives.
+ *
+ * The previous version put the stem and the extension in separate spans and let CSS ellipsise the
+ * stem. That kept the extension, but the two boxes rendered with a gap between them —
+ * "庄子视频处理系... .sha256" — which reads as two truncations rather than one shortened name.
+ * A single text node cannot have a gap: one ellipsis, in the middle, and the name stays one thing.
+ */
+function _fillFileLabel(el, name, budget = 26) {
   if (!el) return;
   const [stem, ext] = _splitFileName(name);
-  el.textContent = "";
-  const stemEl = document.createElement("span");
-  stemEl.className = "stem";
-  stemEl.textContent = stem; // textContent, never innerHTML: this is a filename from disk
-  el.appendChild(stemEl);
-  if (ext) {
-    const extEl = document.createElement("span");
-    extEl.className = "ext";
-    extEl.textContent = ext;
-    el.appendChild(extEl);
-  }
+  const room = Math.max(6, budget - ext.length);
+  const shortStem = stem.length > room
+    ? `${stem.slice(0, Math.ceil((room - 1) / 2))}…${stem.slice(stem.length - Math.floor((room - 1) / 2))}`
+    : stem;
+  el.textContent = shortStem + ext; // textContent, not markup: this is a filename off disk
+  el.title = name;
 }
 
 function _ellipsizeMiddle(text, max = 44) {

@@ -244,8 +244,8 @@ test("a long filename does not take over the tab strip or the title bar", () => 
   assert.match(tab, /flex: 0 0 auto;/, "tabs must not shrink; the strip scrolls instead");
   assert.doesNotMatch(tab.slice(0, tab.indexOf(".tab .label")), /min-width: 0;/,
     "min-width:0 on the tab itself collapses every label");
-  assert.match(APP_CSS, /\.tab \.label \.stem,[^}]*text-overflow: ellipsis;/s,
-    "the stem must ellipsise — it is the part allowed to shrink");
+  assert.match(APP_CSS, /\.tab \.label,\s*\.row \.name \{[^}]*text-overflow: ellipsis;/s,
+    "the label keeps a CSS backstop for anything the character budget did not catch");
   assert.match(tab, /\.tab > \.ic,\s*\.tab > \.x \{ flex: none; \}/,
     "only the label may shrink — a close button that moves as you switch files is worse");
   assert.match(SRC, /tab\.title = f\.name;/, "a truncated label needs the full name on hover");
@@ -262,30 +262,42 @@ test("a long filename does not take over the tab strip or the title bar", () => 
   assert.equal(ellipsize("main.js"), "main.js", "short names are left alone");
 });
 
-test("a truncated filename still shows its extension", () => {
-  // text-overflow: ellipsis can only clip the tail, and the tail is the extension — so a long
-  // name rendered "庄子视频处理系统V5.0-T…" tells you nothing about what the file is. The stem and
-  // the extension are separate elements: the stem shrinks, the extension never does.
-  const fn = SRC.match(/function _splitFileName[\s\S]*?\n}/)[0];
-  const split = new Function(`${fn}; return _splitFileName;`)();
-  assert.deepEqual(split("庄子视频处理系统V5.0-TS长视频版-Windows-x64-最新版-20260722.zip")[1], ".zip");
-  assert.deepEqual(split("V4-Setup.exe"), ["V4-Setup", ".exe"]);
-  // A leading dot is the whole name of a dotfile, not an extension.
-  assert.deepEqual(split(".gitignore"), [".gitignore", ""]);
+test("a truncated filename still shows its extension, as one name", () => {
+  // text-overflow can only clip the tail, and the tail is the extension — so a tab reading
+  // 庄子视频处理系统V5.0-T… says nothing about what the file is. An earlier fix put the stem and
+  // extension in separate spans; that kept the extension but rendered a gap between the boxes,
+  // "庄子视频处理系... .sha256", which reads as two truncations. One text node cannot gap.
+  const ctx = SRC.match(/function _splitFileName[\s\S]*?\n}/)[0] + SRC.match(/function _fillFileLabel[\s\S]*?\n}/)[0];
+  const label = new Function(`${ctx}; return (n, b) => { const el = {}; _fillFileLabel(el, n, b); return el; };`)();
+
+  const long = label("庄子视频处理系统V5.0-TS长视频版-Windows-x64-最新版-20260722.zip", 24);
+  assert.ok(long.textContent.endsWith(".zip"), "the extension must survive");
+  assert.equal((long.textContent.match(/…/g) || []).length, 1, "exactly one ellipsis, in the middle");
+  assert.ok(long.textContent.length <= 26);
+  assert.equal(long.title, "庄子视频处理系统V5.0-TS长视频版-Windows-x64-最新版-20260722.zip",
+    "the full name stays reachable on hover");
+
+  // A double extension keeps the real one.
+  assert.ok(label("庄子视频处理系统V5.0-TS长视频版-Windows-x64-最新版-20260722.zip.sha256", 24)
+    .textContent.endsWith(".sha256"));
+
+  // Short names are left exactly alone — no ellipsis where none is needed.
+  for (const n of ["测试用.mp4", "headers0.bin", "V4-Setup.exe", ".mcp.local.json", "Makefile"]) {
+    assert.equal(label(n, 24).textContent, n, `${n} should not be shortened`);
+  }
+
+  // Dotfile edges.
+  const split = new Function(`${SRC.match(/function _splitFileName[\s\S]*?\n}/)[0]}; return _splitFileName;`)();
+  assert.deepEqual(split(".gitignore"), [".gitignore", ""], "a leading dot is the name, not a type");
   assert.deepEqual(split(".mcp.local.json"), [".mcp.local", ".json"]);
   assert.deepEqual(split("Makefile"), ["Makefile", ""]);
 
-  // Both places that render a filename use it — a truncated name in the tree is as unreadable as
-  // one in a tab.
-  assert.match(SRC, /_fillFileLabel\(tab\.querySelector\("\.label"\), f\.name\)/);
-  assert.match(SRC, /_fillFileLabel\(row\.querySelector\("\.name"\), item\.name\)/);
-  // Filenames come off disk; they go in as text, never as markup.
-  const fill = SRC.slice(SRC.indexOf("function _fillFileLabel"), SRC.indexOf("function _ellipsizeMiddle"));
-  assert.match(fill, /stemEl\.textContent = stem;/);
-  // Assignments only: the function's own comment says the word, and grepping prose is how a
-  // test ends up checking documentation instead of code.
-  assert.doesNotMatch(fill, /\.innerHTML\s*=/);
+  assert.match(SRC, /_fillFileLabel\(tab\.querySelector\("\.label"\), f\.name, 24\)/);
+  assert.match(SRC, /_fillFileLabel\(row\.querySelector\("\.name"\), item\.name, 28\)/);
 
-  assert.match(APP_CSS, /\.tab \.label \.ext,\s*\.row \.name \.ext \{\s*flex: none;/s,
-    "the extension must be the part that refuses to shrink");
+  // Filenames come off disk; they go in as text. Assignments only — the function's own comment
+  // says "markup", and grepping prose checks documentation instead of code.
+  const fill = SRC.slice(SRC.indexOf("function _fillFileLabel"), SRC.indexOf("function _ellipsizeMiddle"));
+  assert.match(fill, /el\.textContent = shortStem \+ ext;/);
+  assert.doesNotMatch(fill, /\.innerHTML\s*=/);
 });
