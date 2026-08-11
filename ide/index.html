@@ -115,19 +115,29 @@
       <symbol id="i-check" viewBox="0 0 24 24">
         <path fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" d="m5 12.5 4.5 4.5L19 7" />
       </symbol>
-      <!-- The model mark. The previous sparkle occupied roughly the top-left 40% of its box
-           (y 2.2–11.8) with a 0.7-opacity companion, so beside the GitHub and GitLab logos —
-           which fill their boxes solidly — it read as faint and unfinished rather than quiet.
+      <!-- The model mark.
+           A sparkle was the wrong idea, not the wrong size: it means "AI magic" and says nothing
+           about a model. Redrawing it bigger twice was fixing the wrong axis.
 
-           This one is built to the same optical weight: a four-point star centred in the box and
-           spanning 1.5–18.5, with a solid companion at the lower right for the asymmetry that
-           makes a sparkle read as a sparkle rather than a plus sign. Concave sides come from
-           cubic curves whose control points sit at the centre, which is what gives the star its
-           pinched waist instead of straight triangular edges. No opacity anywhere: hierarchy
-           comes from the size difference, and a translucent glyph goes muddy on a tinted row. -->
+           What a model IS, drawn: inputs converging through a core to an output — a network with
+           a centre of mass. That is why the hub is r2.9 while the peripheral nodes are r1.9; the
+           weight sits where the computation does, and at 16px the eye reads that hierarchy before
+           it resolves any individual node. Edges are 1.5 stroke with round caps so they stay
+           visible when the glyph is scaled down and antialiased.
+
+           The spark at the top right is the one borrowed idea, and it earns its place: a bare
+           graph reads as "network" or "share". The spark is what makes it generative. It sits off
+           the axis of symmetry so it reads as an accent rather than a fifth node.
+
+           Three nodes, not five: at menu size every extra circle is mud. -->
       <symbol id="i-sparkle" viewBox="0 0 24 24">
-        <path fill="currentColor" d="M10 1.5c.9 4.7 3.8 7.6 8.5 8.5-4.7.9-7.6 3.8-8.5 8.5-.9-4.7-3.8-7.6-8.5-8.5 4.7-.9 7.6-3.8 8.5-8.5Z"/>
-        <path fill="currentColor" d="M18.6 13.6c.4 2.2 1.6 3.4 3.8 3.8-2.2.4-3.4 1.6-3.8 3.8-.4-2.2-1.6-3.4-3.8-3.8 2.2-.4 3.4-1.6 3.8-3.8Z"/>
+        <path fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"
+              d="M6.4 7.6 11 11.4M6.4 16.4 11 12.6M13.4 12h4"/>
+        <circle cx="4.6" cy="6.6" r="1.9" fill="currentColor"/>
+        <circle cx="4.6" cy="17.4" r="1.9" fill="currentColor"/>
+        <circle cx="19.4" cy="12" r="1.9" fill="currentColor"/>
+        <circle cx="12" cy="12" r="2.9" fill="currentColor"/>
+        <path fill="currentColor" d="M17.9 3.1c.28 1.46.86 2.04 2.32 2.32-1.46.28-2.04.86-2.32 2.32-.28-1.46-.86-2.04-2.32-2.32 1.46-.28 2.04-.86 2.32-2.32Z"/>
       </symbol>
       <symbol id="i-close" viewBox="0 0 24 24">
         <path fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" d="M6 6l12 12M18 6 6 18" />

@@ -386,19 +386,27 @@ test("a folder in the @ menu opens instead of only inserting", () => {
   assert.match(SRC, /_atDir = "";  \/\/ and at the workspace root/, "reopening @ starts at the root");
 });
 
-test("the model mark carries the same optical weight as the logos beside it", () => {
+test("the model mark depicts a model, not a sparkle", () => {
   const INDEX = fs.readFileSync("index.html", "utf8");
-  const sparkle = INDEX.slice(INDEX.indexOf('<symbol id="i-sparkle"'), INDEX.indexOf("</symbol>", INDEX.indexOf('<symbol id="i-sparkle"')));
+  const at = INDEX.indexOf('<symbol id="i-sparkle"');
+  const mark = INDEX.slice(at, INDEX.indexOf("</symbol>", at));
 
-  // The old mark spanned y 2.2–11.8 — under half its box — so next to GitHub and GitLab, which
-  // fill theirs, it read as faint rather than quiet. The primary star must actually use the box.
-  const first = sparkle.match(/d="M([\d.]+) ([\d.]+)/);
-  assert.ok(first, "the primary path must exist");
-  const nums = [...sparkle.matchAll(/[-\d.]+/g)].map((m) => parseFloat(m[0])).filter((n) => n >= 0 && n <= 24);
-  assert.ok(Math.max(...nums) >= 18, `the mark must reach the far side of the box, got ${Math.max(...nums)}`);
+  // Two rounds were spent resizing a sparkle, which is the wrong axis: a sparkle means "AI magic"
+  // and says nothing about a model. The mark is a network converging on a core.
+  assert.equal((mark.match(/<circle/g) || []).length, 4, "three peripheral nodes and a hub");
+  assert.match(mark, /<path fill="none" stroke="currentColor"/, "edges connect them");
 
-  // No opacity: hierarchy comes from size, and a translucent glyph goes muddy on the tinted
-  // selected row.
-  assert.doesNotMatch(sparkle, /opacity=/, "no translucent halves");
-  assert.equal((sparkle.match(/<path/g) || []).length, 2, "a star and its companion — the asymmetry is what makes it read as a sparkle");
+  // The hub must outweigh the peripheral nodes — the weight belongs where the computation is,
+  // and that hierarchy is what the eye reads at 16px before it resolves any single node.
+  const radii = [...mark.matchAll(/r="([\d.]+)"/g)].map((m) => parseFloat(m[1]));
+  const hub = Math.max(...radii);
+  const leaf = Math.min(...radii);
+  assert.ok(hub > leaf * 1.3, `the hub (${hub}) must dominate the nodes (${leaf})`);
+
+  // Round caps, or thin edges break up when the glyph is scaled down and antialiased.
+  assert.match(mark, /stroke-linecap="round"/);
+  // No opacity: it goes muddy on the tinted selected row and on dark.
+  assert.doesNotMatch(mark, /opacity=/);
+  // The spark is what stops a bare graph reading as "network" or "share".
+  assert.match(mark, /M17\.9 3\.1c/, "the generative accent must remain");
 });
