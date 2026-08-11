@@ -2,19 +2,19 @@ import { useCallback, useMemo, useState } from "react";
 import { cn } from "./lib/cn.js";
 
 /**
- * The archive panel, rebuilt as the browser that archive software actually is.
+ * The archive window. Opening a `.zip` gives you this and nothing else.
  *
- * What it replaced: one flat table of every entry in the archive, 1,652 rows deep for a real
- * build artefact, with the full path repeated on every line. Nothing to navigate, nothing to sort,
- * and the directory structure — the thing you open an archive to understand — was left for the
- * reader to reconstruct from slashes.
+ * What it replaced, twice over. First a flat table of every entry — 1,652 rows for a real build
+ * artefact, full path repeated on each, no structure. Then the same table with a browser bolted
+ * beneath a generic file report: MIME type, read-only flag, six fact cards, a row of chips, a hex
+ * dump. None of that is what you opened an archive to find out. The hex panel had already learned
+ * this lesson and dropped its own header for the same reason; archives had not.
  *
- * 7-Zip, Keka and WinRAR all settled on the same shape long ago, and it is the right one: a path
- * bar you can climb, one level of contents at a time, sortable columns, and a status line that
- * totals what you are looking at. Folders aggregate the size of everything beneath them, so the
- * top level answers "what is big in here" without any expanding.
+ * So it is laid out the way archive software has been laid out for thirty years, because that
+ * shape is correct: title, toolbar, address bar, list, status bar. Folders aggregate everything
+ * beneath them, so the first screen answers "what is big in here" without a single expansion.
  *
- * Presentational. main.js owns the listing and both actions.
+ * Presentational — main.js owns the listing and the actions.
  */
 
 function formatBytes(n) {
@@ -27,7 +27,7 @@ function formatBytes(n) {
   return `${value >= 10 || Number.isInteger(value) ? Math.round(value) : value.toFixed(1)} ${units[i]}`;
 }
 
-/** Immediate children of `cwd`, with folders aggregating everything beneath them. */
+/** Immediate children of `cwd`, folders rolling up everything beneath them. */
 function levelAt(entries, cwd) {
   const prefix = cwd ? `${cwd}/` : "";
   const folders = new Map();
@@ -39,9 +39,8 @@ function levelAt(entries, cwd) {
     if (!rest) continue;
     const slash = rest.indexOf("/");
     if (slash === -1) {
-      if (!entry?.is_dir) files.push({ ...entry, label: rest });
+      if (!entry?.is_dir) files.push({ ...entry, label: rest, isDir: false });
     } else {
-      // Anything deeper rolls up into the folder that contains it.
       const label = rest.slice(0, slash);
       const folder = folders.get(label) || { label, isDir: true, size: 0, compressed: 0, count: 0 };
       folder.size += Number(entry?.size) || 0;
@@ -55,27 +54,26 @@ function levelAt(entries, cwd) {
 
 const COLUMNS = [
   { key: "label", label: "名称", align: "left" },
-  { key: "size", label: "大小", align: "right", width: "w-24" },
-  { key: "compressed", label: "压缩后", align: "right", width: "w-24" },
+  { key: "size", label: "大小", align: "right", width: "w-28" },
+  { key: "compressed", label: "压缩后", align: "right", width: "w-28" },
   { key: "ratio", label: "压缩率", align: "right", width: "w-20" },
 ];
 
-export function ArchiveBrowser({ archive, onOpenEntry, onExtract }) {
+export function ArchiveBrowser({ archive, file, onOpenEntry, onExtract, onReveal }) {
   const [cwd, setCwd] = useState("");
   const [sort, setSort] = useState({ key: "label", dir: 1 });
+  const [selected, setSelected] = useState(null);
   const entries = Array.isArray(archive?.entries) ? archive.entries : [];
 
   const rows = useMemo(() => {
     const level = levelAt(entries, cwd).map((row) => ({
       ...row,
-      isDir: !!row.isDir,
       size: Number(row.size) || 0,
       compressed: Number(row.compressed ?? row.compressed_size) || 0,
     }));
     const { key, dir } = sort;
     return level.sort((a, b) => {
-      // Folders first, always — the point of the view is structure.
-      if (a.isDir !== b.isDir) return a.isDir ? -1 : 1;
+      if (a.isDir !== b.isDir) return a.isDir ? -1 : 1; // folders first, always
       if (key === "label") return dir * a.label.localeCompare(b.label, undefined, { numeric: true });
       if (key === "ratio") {
         const ra = a.size ? a.compressed / a.size : 0;
@@ -87,44 +85,70 @@ export function ArchiveBrowser({ archive, onOpenEntry, onExtract }) {
   }, [entries, cwd, sort]);
 
   const crumbs = cwd ? cwd.split("/") : [];
-  const totals = useMemo(() => {
+  const here = useMemo(() => {
     const files = rows.filter((r) => !r.isDir).length;
-    const dirs = rows.length - files;
-    const size = rows.reduce((n, r) => n + r.size, 0);
-    return { files, dirs, size };
+    return { files, dirs: rows.length - files, size: rows.reduce((n, r) => n + r.size, 0) };
   }, [rows]);
 
+  const enter = useCallback((label) => { setCwd((c) => (c ? `${c}/${label}` : label)); setSelected(null); }, []);
   const toggleSort = useCallback((key) => {
     setSort((s) => (s.key === key ? { key, dir: -s.dir } : { key, dir: key === "label" ? 1 : -1 }));
   }, []);
 
-  if (!entries.length) return null;
-
   return (
-    <section className="ui-island flex min-h-0 flex-col rounded-xl border border-border bg-card">
-      {/* Path bar. Climbing back out is one click per level, which is why archive software has
-          always put the path here rather than making you re-open the file. */}
-      <div className="flex items-center gap-1 border-b border-border px-3 py-2 text-[12px]">
+    <div className="ui-island flex h-full min-h-0 flex-col bg-background text-foreground">
+      {/* Title bar: the archive itself. Name, what it weighs, what it unpacks to. */}
+      <div className="flex flex-none items-center gap-3 border-b border-border px-4 py-2.5">
+        <span className="text-[15px]" aria-hidden>🗜️</span>
+        <div className="min-w-0 flex-1">
+          <div className="truncate text-[13px] font-medium" title={file?.name} data-i18n-skip>
+            {file?.name || "压缩包"}
+          </div>
+          <div className="truncate text-[11px] text-muted-foreground tabular-nums">
+            <span className="uppercase" data-i18n-skip>{archive?.format || "archive"}</span>
+            {" · "}{formatBytes(file?.size)}
+            {archive?.total_size ? ` · 解压后 ${formatBytes(archive.total_size)}` : ""}
+            {archive?.encrypted ? " · 🔒 含加密条目" : ""}
+          </div>
+        </div>
+        <div className="flex flex-none items-center gap-2">
+          {onReveal ? (
+            <button
+              type="button"
+              onClick={onReveal}
+              className="h-8 rounded-lg border border-border px-3 text-[12px] hover:bg-accent"
+            >
+              在系统中显示
+            </button>
+          ) : null}
+          <button
+            type="button"
+            onClick={() => onExtract?.()}
+            className="h-8 rounded-lg bg-primary px-3.5 text-[12px] font-medium text-primary-foreground hover:opacity-90"
+          >
+            全部解压…
+          </button>
+        </div>
+      </div>
+
+      {/* Address bar. Climbing back out is one click per level. */}
+      <div className="flex flex-none items-center gap-0.5 overflow-x-auto border-b border-border bg-muted/30 px-3 py-1.5 text-[12px]">
         <button
           type="button"
-          onClick={() => setCwd("")}
-          className={cn(
-            "rounded px-1.5 py-0.5 font-medium hover:bg-accent",
-            cwd ? "text-primary" : "text-foreground",
-          )}
-          data-i18n-skip
+          onClick={() => { setCwd(""); setSelected(null); }}
+          className={cn("flex-none rounded px-1.5 py-0.5 hover:bg-accent", cwd ? "text-primary" : "font-medium")}
         >
-          {archive?.format || "压缩包"}
+          根目录
         </button>
         {crumbs.map((part, i) => (
-          <span key={`${part}-${i}`} className="flex items-center gap-1 min-w-0">
+          <span key={`${part}-${i}`} className="flex flex-none items-center gap-0.5">
             <span className="text-muted-foreground">›</span>
             <button
               type="button"
-              onClick={() => setCwd(crumbs.slice(0, i + 1).join("/"))}
+              onClick={() => { setCwd(crumbs.slice(0, i + 1).join("/")); setSelected(null); }}
               className={cn(
-                "truncate rounded px-1.5 py-0.5 hover:bg-accent",
-                i === crumbs.length - 1 ? "text-foreground" : "text-primary",
+                "max-w-[220px] truncate rounded px-1.5 py-0.5 hover:bg-accent",
+                i === crumbs.length - 1 ? "font-medium" : "text-primary",
               )}
               data-i18n-skip
             >
@@ -132,73 +156,62 @@ export function ArchiveBrowser({ archive, onOpenEntry, onExtract }) {
             </button>
           </span>
         ))}
-        <div className="ml-auto flex items-center gap-2">
-          {archive?.encrypted ? (
-            <span className="rounded bg-muted px-1.5 py-0.5 text-[11px] text-muted-foreground">🔒 含加密条目</span>
-          ) : null}
-          <button
-            type="button"
-            onClick={() => onExtract?.()}
-            className="rounded-md bg-primary px-2.5 py-1 text-[12px] font-medium text-primary-foreground hover:opacity-90"
-          >
-            全部解压…
-          </button>
-        </div>
       </div>
 
       {archive?.note ? (
-        <p className="border-b border-border bg-muted/40 px-3 py-2 text-[12px] leading-relaxed text-muted-foreground">
+        <p className="flex-none border-b border-border bg-muted/40 px-4 py-2 text-[12px] leading-relaxed text-muted-foreground">
           {archive.note}
         </p>
       ) : null}
 
-      <div className="min-h-0 max-h-[420px] overflow-auto">
+      {/* The list fills whatever is left. */}
+      <div className="min-h-0 flex-1 overflow-auto">
         <table className="w-full border-collapse text-[12px]">
-          <thead className="sticky top-0 z-10 bg-card">
+          <thead className="sticky top-0 z-10 bg-background">
             <tr className="border-b border-border">
               {COLUMNS.map((col) => (
                 <th
                   key={col.key}
                   onClick={() => toggleSort(col.key)}
                   className={cn(
-                    "cursor-pointer select-none px-3 py-1.5 font-medium text-muted-foreground hover:text-foreground",
+                    "cursor-pointer select-none px-4 py-1.5 font-medium text-muted-foreground hover:text-foreground",
                     col.align === "right" ? "text-right" : "text-left",
                     col.width,
                   )}
                 >
                   {col.label}
-                  {sort.key === col.key ? <span className="ml-1">{sort.dir > 0 ? "▲" : "▼"}</span> : null}
+                  <span className="ml-1 inline-block w-2">{sort.key === col.key ? (sort.dir > 0 ? "▲" : "▼") : ""}</span>
                 </th>
               ))}
             </tr>
           </thead>
           <tbody>
-            {rows.map((row) => {
-              const ratio = row.size ? Math.round((row.compressed / row.size) * 100) : null;
+            {rows.length === 0 ? (
+              <tr><td colSpan={4} className="px-4 py-10 text-center text-muted-foreground">这一层是空的</td></tr>
+            ) : rows.map((row) => {
+              const key = `${row.isDir ? "d" : "f"}:${row.label}`;
+              const ratio = row.size && row.compressed ? Math.round((row.compressed / row.size) * 100) : null;
               return (
                 <tr
-                  key={`${row.isDir ? "d" : "f"}:${row.label}`}
-                  onDoubleClick={() => row.isDir && setCwd(cwd ? `${cwd}/${row.label}` : row.label)}
-                  onClick={() => {
-                    if (row.isDir) setCwd(cwd ? `${cwd}/${row.label}` : row.label);
-                    else onOpenEntry?.(row.name);
-                  }}
-                  className="cursor-pointer border-b border-border/60 last:border-0 hover:bg-accent"
-                  title={row.isDir ? `${row.count} 个文件` : row.name}
+                  key={key}
+                  onClick={() => setSelected(key)}
+                  onDoubleClick={() => (row.isDir ? enter(row.label) : onOpenEntry?.(row.name))}
+                  className={cn(
+                    "cursor-default border-b border-border/50 last:border-0",
+                    selected === key ? "bg-primary/10" : "hover:bg-accent",
+                  )}
+                  title={row.isDir ? `${row.count} 个文件 · 双击进入` : "双击预览"}
                 >
-                  <td className="max-w-0 truncate px-3 py-1.5">
-                    <span className="mr-1.5" aria-hidden>{row.isDir ? "📁" : "📄"}</span>
+                  <td className="max-w-0 truncate px-4 py-1.5">
+                    <span className="mr-2" aria-hidden>{row.isDir ? "📁" : "📄"}</span>
                     <span data-i18n-skip>{row.label}</span>
-                    {row.isDir ? (
-                      <span className="ml-2 text-[11px] text-muted-foreground">{row.count}</span>
-                    ) : null}
                   </td>
-                  <td className="px-3 py-1.5 text-right tabular-nums text-muted-foreground">{formatBytes(row.size)}</td>
-                  <td className="px-3 py-1.5 text-right tabular-nums text-muted-foreground">
+                  <td className="px-4 py-1.5 text-right tabular-nums text-muted-foreground">{formatBytes(row.size)}</td>
+                  <td className="px-4 py-1.5 text-right tabular-nums text-muted-foreground">
                     {row.compressed ? formatBytes(row.compressed) : "—"}
                   </td>
-                  <td className="px-3 py-1.5 text-right tabular-nums text-muted-foreground">
-                    {ratio === null || !row.compressed ? "—" : `${ratio}%`}
+                  <td className="px-4 py-1.5 text-right tabular-nums text-muted-foreground">
+                    {ratio === null ? "—" : `${ratio}%`}
                   </td>
                 </tr>
               );
@@ -207,17 +220,15 @@ export function ArchiveBrowser({ archive, onOpenEntry, onExtract }) {
         </table>
       </div>
 
-      {/* Status line. The archive's own totals, not this view's — a folder you have navigated into
-          says how many entries the whole archive holds, the way every file manager does. */}
-      <div className="flex items-center gap-3 border-t border-border px-3 py-1.5 text-[11px] text-muted-foreground">
-        <span>{totals.dirs} 个文件夹 · {totals.files} 个文件</span>
-        <span>本层 {formatBytes(totals.size)}</span>
+      {/* Status bar: this level on the left, the archive's own totals on the right. */}
+      <div className="flex flex-none items-center gap-4 border-t border-border bg-muted/30 px-4 py-1.5 text-[11px] text-muted-foreground">
+        <span className="tabular-nums">{here.dirs} 个文件夹 · {here.files} 个文件 · {formatBytes(here.size)}</span>
         <span className="ml-auto tabular-nums" data-i18n-skip>
-          {archive?.count_is_partial ? "至少 " : ""}{Number(archive?.total || 0).toLocaleString()} 项
+          共 {archive?.count_is_partial ? "至少 " : ""}{Number(archive?.total || 0).toLocaleString()} 项
           {archive?.truncated ? `（已载入 ${entries.length}）` : ""}
           {archive?.metadata_entries ? ` · ${archive.metadata_entries} 个附属条目` : ""}
         </span>
       </div>
-    </section>
+    </div>
   );
 }
