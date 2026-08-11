@@ -23847,7 +23847,9 @@ async function sendPrompt(text, attachments = [], readyConfig = null) {
           _segRendered++;
         }
         const historyContent = acc + (_pendingToolCalls.length ? "\n" + _pendingToolCalls.map(c => `[TOOL:${c.type === "read" ? "read_file" : c.type === "list" ? "list_dir" : c.type === "cmd" ? "run_cmd" : "write_file"}] ${c.path || c.command || ""}`).join("\n") : "");
-        if (!err && historyContent.trim()) { const _msg = { role: "assistant", content: historyContent }; if (reasoningAll && reasoningAll.trim()) _msg.reasoning = reasoningAll; sess.memory.push(_msg); saveChatHistory({ immediate: true }); }
+        // 出错也要存。这段答案已经画在屏幕上了，不存进去的结果就是"看得见、下一次渲染就没了"。
+        // 出错时标一句未完成，让下一轮的上下文知道它是半截的。
+        if (historyContent.trim()) { const _msg = { role: "assistant", content: err ? historyContent + "\n\n（本次回复因上游中断未完成）" : historyContent }; if (reasoningAll && reasoningAll.trim()) _msg.reasoning = reasoningAll; sess.memory.push(_msg); saveChatHistory({ immediate: true }); }
         await Promise.allSettled(_toolPromises);
         const readResults = _toolPromises.filter(p => p._result).map(p => p._result);
         if (readResults.length) _agentFollowUp(readResults, body, sess);
@@ -23861,7 +23863,7 @@ async function sendPrompt(text, attachments = [], readyConfig = null) {
           }
           renderMarkdownInto(body._chatStreamEl, _cc, { highlighter: highlightCode });
         }
-        if (!err && _cc) { const _msg = { role: "assistant", content: _cc }; if (reasoningAll && reasoningAll.trim()) _msg.reasoning = reasoningAll; sess.memory.push(_msg); saveChatHistory({ immediate: true }); _maybeRenderChoices(sess, _cc); }
+        if (_cc) { const _msg = { role: "assistant", content: err ? _cc + "\n\n（本次回复因上游中断未完成）" : _cc }; if (reasoningAll && reasoningAll.trim()) _msg.reasoning = reasoningAll; sess.memory.push(_msg); saveChatHistory({ immediate: true }); if (!err) _maybeRenderChoices(sess, _cc); }
       }
     }
     _streamDraftClear(sess); // 回合已落账/已渲染，草稿使命结束（只清本会话的槽，不误伤并发会话）
@@ -34681,7 +34683,15 @@ function _isRetryableAiError(msg) {
   if (_isRateLimitedAiError(msg)) return false;
   if (_isProviderGatewayStatusError(msg)) return true;
   const m = String(msg || "").toLowerCase();
+  // 传输层掉线的中文文案必须在这里认得出来。这条判据决定 canResume 走不走，而两种掉线
+  // 以前落在相反的结论上：上游把已经 200 的响应体中途 abort（网关校验出被截断的工具参数
+  // 时就是这么做的）→ 桌面端发出「连接中断（网络波动）」→ 这个正则里 network /
+  // connection reset 全是英文，一个都不匹配 → 判为不可重试 → 续传那一整套机制根本不会被
+  // 调用；而它的兄弟情况（干净 EOF）发的是含 "stream closed" 的英文串 → 判为可重试。
+  // 同样是断线，一个能续一个不能，中间没有任何理由。用户看到的 ⚠️「重试已达到」是假的：
+  // 三个续传名额一个都没花过，一次都没试。
   return /\b(408|409|425|500|502|503|504)\b/.test(m)   // 429 单独由 _isRateLimitedAiError 处理
+    || /连接中断|连接提前结束|网络波动/.test(String(msg || ""))
     || /rate.?limit|too many requests|overloaded|temporar|timeout|timed out|econn|enotfound|network|connection (reset|refused|closed)|fetch failed|stream (error|closed)|server error|service unavailable|capacity|try again|超时|无有效进度|首个有效输出|没有(?:继续)?生成有效内容/.test(m);
 }
 function _isCompressionPrefixInvalidError(msg) {
@@ -36421,6 +36431,10 @@ async function _agentModelTurn({ config, messages, toolSchemas, toolRegistry = n
           _inlineThinkState.hold = "";
           _inlineThinkState.answerStarted = false;
           cancelPendingRender();
+          // 这一位只被置真、从不复位。重来一次时 acc / byIndex / 思考卡全清了，它还留着 true，
+          // 于是渲染那条路在入口就 return，续传即使成功也一个字都画不出来，turn.text 还返回
+          // 空串。修了续传却不修这一行，等于上线一个看不见的修复。
+          _suppressNarrativeForTools = false;
           if (streamEl) { streamEl.remove(); streamEl = null; }
           for (const el of _turnThinkCards) { try { el.remove(); } catch {} }
           _turnThinkCards.length = 0;
@@ -36495,7 +36509,16 @@ async function _agentModelTurn({ config, messages, toolSchemas, toolRegistry = n
             if (!_agentToolCallIsNarrativeControl(ev.name)) {
               _suppressNarrativeForTools = true;
               cancelPendingRender();
-              if (streamEl) { streamEl.remove(); streamEl = null; }
+              // 原来这里是 streamEl.remove()：模型一开始调真工具，它前面已经写出来、用户
+              // 正在读的那段话当场从界面上消失。对 write_file / edit_file 还说得过去——紧接着
+              // 有张工具卡顶上；但 read_file / search / list_dir / run_cmd 这些**不画卡**，
+              // 于是就是纯粹的"字没了"，一直空到整段流结束。用户报的"明明说了、下一秒内容
+              // 就没了"就是这个。
+              //
+              // 改成就地降级：不删节点，只摘掉流式标记并松手，后续帧会另开一段。已经写出来的
+              // 前言留在原处（它也因此能进 _keepProse 和 turn.text，不再是只存在过一瞬间的
+              // 东西），工具卡照常追加在它后面。
+              if (streamEl) { streamEl.classList.remove("agent-seg--stream"); streamEl = null; }
             }
           }
           if (ev.arguments) e.args += ev.arguments;
@@ -41151,7 +41174,14 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
       // calls (writing files / running commands). Previously the loop only re-checked _live()
       // at the NEXT iteration's top, so a stopped agent still ran a whole turn of tools first
       // — the core "点终止有时候停不掉" bug.
-      if (!_live()) break;
+      if (!_live()) {
+        // 入账那一行在下面几十行之外，这条 break 从它上面走掉，于是"按了停止"的那一轮
+        // 写出来的正文一个字都没进 run 摘要——而 run 摘要是唯一被持久化的东西。和出错那条
+        // 路是同一个洞（那条今天早些时候已经补上），只是触发方式是用户自己点的停止。
+        if (turn.text && turn.text.trim()) summaryText += (summaryText ? "\n\n" : "") + turn.text.trim();
+        if (turn.reasoning && turn.reasoning.trim()) reasoningAll += (reasoningAll ? "\n" : "") + turn.reasoning.trim();
+        break;
+      }
       // The classifier ran in parallel with this visible model turn. Adopt it before any
       // returned tool call executes so newly-known design/effect gates govern the batch.
       if (run.engineering?.intentSource !== "ai") {

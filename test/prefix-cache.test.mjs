@@ -1079,3 +1079,49 @@ test("读取失败时说得出「这个目录是空的」", () => {
   assert.doesNotMatch(SRC, /IDE 会直接拦截/);
   assert.equal((SRC.match(/都只会失败并白白烧掉一轮/g) || []).length, 3);
 });
+
+test("传输层掉线要能被认出来，否则续传那一整套机制根本不会被调用", () => {
+  // 用真函数跑，不是读正则 —— 这条判据决定 canResume 走不走，读错一个字就是整套机制静默失效。
+  const isRetryable = load("_isRetryableAiError",
+    ["_stripAiRetryPrefix", "_isRateLimitedAiError", "_isProviderGatewayStatusError", "_isRetryableAiError"]);
+
+  // 网关校验出被截断的工具参数时，会把已经 200 的响应体中途 abort，桌面端因此发出这一句。
+  // 它以前不匹配任何一条规则：network / connection reset 全是英文。
+  assert.equal(isRetryable("连接中断（网络波动），已保留生成的部分。"), true);
+  // 它的兄弟情况（干净 EOF）一直是可重试的 —— 同样是断线，两个相反的结论，中间没有理由。
+  assert.equal(isRetryable("AI stream closed before data: [DONE]（连接提前结束）；响应可能被截断，已拒绝本轮结果，请重试。"), true);
+  assert.equal(isRetryable("[tool-stream-retry-exhausted] 连接中断（网络波动），已保留生成的部分。"), true);
+  // 真正不该重试的还是不重试：模型名写错重试一百次也是错。
+  assert.equal(isRetryable("AI request failed (400): invalid model name"), false);
+  assert.equal(isRetryable("AI request failed (429): rate limited"), false, "限流单独处理，不走重试");
+});
+
+test("续传成功了要画得出来，正文不能在工具开始时被删掉", () => {
+  const turn = grab("_agentModelTurn");
+
+  // _suppressNarrativeForTools 只被置真、从不复位。重来那条路把 acc / byIndex / 思考卡全清了，
+  // 唯独留下这一位，于是渲染在入口就 return —— 续传即使成功也一个字都画不出来。
+  assert.match(turn, /_suppressNarrativeForTools = false;/,
+    "重来的路径必须把它复位，否则修好的续传是看不见的");
+  assert.ok(turn.indexOf("_suppressNarrativeForTools = false;", turn.indexOf("let _suppressNarrativeForTools")) >
+            turn.indexOf("let _suppressNarrativeForTools"),
+    "复位要发生在重置块里，不只是初始化");
+
+  // 工具一开始就删正文：对 write/edit 还有卡片顶上，对 read/search/list/cmd 就是纯粹的字没了。
+  assert.doesNotMatch(turn, /_suppressNarrativeForTools = true;[\s\S]{0,400}streamEl\.remove\(\); streamEl = null;/,
+    "不能再一见工具名就把已经读到的正文删掉");
+  assert.match(turn, /streamEl\.classList\.remove\("agent-seg--stream"\); streamEl = null;/,
+    "就地降级：留住节点，后续帧另开一段");
+});
+
+test("中断和停止都不能把已经写出来的内容丢掉", () => {
+  // agent：用户点停止那一轮的正文，以前从入账那行上面 break 走了。
+  assert.match(SRC, /if \(!_live\(\)\) \{[\s\S]{0,700}summaryText \+= \(summaryText \? "\\n\\n" : ""\) \+ turn\.text\.trim\(\);[\s\S]{0,300}break;/,
+    "按停止的那一轮也要入账");
+
+  // 普通聊天：两处 push 都挂着 !err —— 答案画在屏幕上却从不落库，下一次渲染就没了。
+  assert.doesNotMatch(SRC, /if \(!err && historyContent\.trim\(\)\)/);
+  assert.doesNotMatch(SRC, /if \(!err && _cc\)/);
+  assert.equal((SRC.match(/（本次回复因上游中断未完成）/g) || []).length, 2,
+    "两条路都要存，并且如实标成半截的");
+});
