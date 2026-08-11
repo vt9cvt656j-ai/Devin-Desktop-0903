@@ -3,6 +3,7 @@
 #[allow(dead_code)]
 mod accessibility;
 mod archive;
+mod tabular;
 mod ai;
 mod auth;
 mod automation;
@@ -195,6 +196,7 @@ pub fn run() {
             files::inspect_file,
             archive::extract_archive,
             archive::read_archive_entry,
+            tabular::read_table_file,
             files::write_text_file,
             files::write_text_file_if_unchanged,
             files::delete_text_file_if_unchanged,
