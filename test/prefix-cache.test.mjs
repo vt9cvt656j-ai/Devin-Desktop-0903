@@ -557,9 +557,9 @@ const applyReading = load("_applyContextReading", ["_applyContextReading"]);
 const readingForStorage = load("_ctxReadingForStorage", ["_ctxReadingForStorage"]);
 const readingFromStorage = load("_ctxReadingFromStorage", ["_ctxReadingFromStorage"]);
 const meterLimit = (native, choice) => new Function(
-  "_modelContextLimit", "_ctxChoiceFor",
+  "_modelContextLimit", "_ctxChoiceFor", "_nativeWindowsFor",
   `${grab("_contextMeterLimit")}\nreturn _contextMeterLimit("m");`,
-)(() => native, () => choice);
+)(() => native, () => choice, () => [native]);
 
 test("context counts the cached prompt, which is where the whole conversation lives", () => {
   // This is why the meter looked frozen. Anthropic reports `input_tokens` EXCLUDING everything
@@ -799,4 +799,87 @@ test("the native context window agrees end to end", () => {
     assert.ok(table.includes(`"${fam}"`), `the gateway's table must name ${fam} too`);
   }
   assert.match(table, /return vec!\[\(1_000_000, None\)\];/);
+});
+
+test("the paid tier stacks on the model's own window, in the client as in the gateway", () => {
+  // The buttons have always been priced additively — native + tier, mirroring capacity_for_native
+  // in the gateway (server/src/compression.rs). The effective limit took the LARGER of the two,
+  // so on any 1M-native model every tier resolved back to 1M: the whole row was a no-op and the
+  // top tier a subscriber pays for could never light up. The two lines disagreed by construction.
+  const eff = (native, tierMax, choice) => new Function(
+    "_modelContextLimit", "_nativeWindowsFor", "_michaelUser", "_gatewayHandlesCompression", "_ctxChoiceFor",
+    `${grab("_effectiveContextLimit")}\nreturn _effectiveContextLimit("m");`,
+  )(() => native, () => [native], { michael_compression: { max_input_tokens: tierMax } }, () => tierMax > 0, () => choice);
+
+  assert.equal(eff(1_000_000, 5_000_000, 0), 6_000_000, "1M native + a 5M tier is 6M, not 5M");
+  assert.equal(eff(1_000_000, 5_000_000, 6_000_000), 6_000_000, "the top tier must be reachable");
+  assert.equal(eff(200_000, 1_000_000, 1_200_000), 1_200_000);
+  assert.equal(eff(1_000_000, 0, 6_000_000), 1_000_000, "no membership → never a fictional window");
+
+  const RS = fs.readFileSync("../server/src/compression.rs", "utf8");
+  assert.match(RS, /pub fn capacity_for_native\(self, native: usize\) -> usize \{\s*\n\s*native\.saturating_add\(self\.max_input_tokens\(\)\)/,
+    "the gateway grants native PLUS the tier; the client must compute the same ceiling");
+});
+
+test("a native window the user picked is the one that takes effect", () => {
+  // The stored record kept only the KIND, so a model with two native windows — Sonnet 4.5 has
+  // 200K by default and 1M behind the context-1m beta — always resolved back to the default and
+  // the 1M button could never do anything.
+  const choiceFor = (rec, windows, dflt) => new Function(
+    "_ctxChoiceRecord", "_modelContextLimit", "_modelCatalogEntry",
+    `${grab("_nativeWindowsFor")}\n${grab("_ctxChoiceFor")}\nreturn _ctxChoiceFor("m");`,
+  )(() => rec, () => dflt, () => ({ contextWindows: windows.map((t) => ({ tokens: t })) }));
+
+  const twoWindows = [200_000, 1_000_000];
+  assert.equal(choiceFor({ kind: "native", tokens: 1_000_000 }, twoWindows, 200_000), 1_000_000);
+  assert.equal(choiceFor({ kind: "native", tokens: 200_000 }, twoWindows, 200_000), 200_000);
+  // A window the route has withdrawn must not strand a value nothing can deliver.
+  assert.equal(choiceFor({ kind: "native", tokens: 1_000_000 }, [200_000], 200_000), 200_000);
+  // Records written before the figure was stored still load.
+  assert.equal(choiceFor({ kind: "native" }, twoWindows, 200_000), 200_000);
+
+  assert.match(SRC, /if \(kind === "native"\) map\[key\] = \{ kind: "native", tokens: Math\.max\(0, Math\.round\(tokens\) \|\| 0\) \};/,
+    "the click has to record WHICH window was clicked");
+});
+
+test("off is said out loud, because silence means the opposite on the 5 series", () => {
+  // Opus 5 and Sonnet 5 run adaptive thinking when no thinking key is sent. Dropping the field
+  // made the cheapest dial the deepest and most expensive one — and because the gateway grants
+  // output headroom only to turns that announce thinking, that turn also ran on the bare default
+  // while adaptive thinking consumed it, cutting the visible answer off mid-sentence.
+  assert.match(grab("_applyThinkingToConfig"),
+    /\} else if \(profile\.kind === "adaptive_thinking"\) \{[\s\S]{0,600}out\.thinking = \{ type: "disabled" \};/);
+
+  const RS = fs.readFileSync("../server/src/models.rs", "utf8");
+  assert.match(RS, /return default_is_on\.then\(\|\| json!\(\{"type":"disabled"\}\)\);/,
+    "and the gateway must forward it rather than dropping the key again");
+  assert.match(RS, /if t\.get\("type"\)\.and_then\(\|v\| v\.as_str\(\)\) == Some\("disabled"\) \{\s*\n\s*return "off";/,
+    "an explicit disable must read as off, not as the bare-toggle high");
+  // Absent stays absent: a caller that names no effort wants the model's own default.
+  assert.match(RS, /None => return None,/);
+});
+
+test("how much a model can WRITE is carried, not guessed", () => {
+  // The catalogue had a context window and nothing else, so the pipeline guessed twice: a flat
+  // 128,000 clamp with no model in scope — which Haiku 4.5, capped at 64,000, rejects — and an
+  // invented 8,192 default that truncated long answers on thinking-off turns.
+  const RS = fs.readFileSync("../server/src/models.rs", "utf8");
+  assert.match(RS, /fn official_max_output\(model_id: &str\) -> Option<i64> \{/);
+  assert.match(RS, /"max_output_tokens": official_max_output\(&mid\),/, "and it must reach the client");
+  assert.match(RS, /max_tokens\.clamp\(1, official_max_output\(model_str\)\.unwrap_or\(128000\)\)/);
+  assert.doesNotMatch(RS, /max_tokens\.clamp\(1, 128000\)/, "no blanket ceiling for every model");
+
+  assert.match(SRC, /function _modelMaxOutput\(modelId = ""\) \{/);
+  assert.match(SRC, /maxOutput: Math\.max\(0, Math\.round\(Number\(it\.max_output_tokens \?\? it\.maxOutputTokens\) \|\| 0\)\),/);
+  // Unknown says nothing rather than having a number invented for it.
+  const helper = grab("_modelMaxOutput");
+  assert.match(helper, /if \(!entry\) return 0;/);
+  assert.match(SRC, /out > 0 \? ` · 单次输出上限 \$\{_tokenShort\(out\)\}` : ""/);
+});
+
+test("the browser preview does not invent a window the model does not have", () => {
+  // Both preview seeds hardcoded 200,000 for Opus 4.6, whose real window is 1M — a fabricated
+  // button in the native row and a context ring inflated five-fold.
+  assert.equal((SRC.match(/contextLimit: 1000000, contextWindows: \[\{ tokens: 1000000, beta: null \}\]/g) || []).length, 2);
+  assert.doesNotMatch(SRC, /contextLimit: 200000, contextWindows: \[\]/);
 });

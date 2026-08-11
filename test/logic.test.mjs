@@ -6267,7 +6267,9 @@ test("thinking depth is based on real per-model capabilities instead of fixed fa
   }, { agentTurn: true, isComplexTask: true });
   assert.equal(remappedCustomClaudeOff.thinkingEffort, "off");
   assert.equal(remappedCustomClaudeOff.reasoningEffort, undefined);
-  assert.equal(remappedCustomClaudeOff.thinking, undefined);
+  // Off has to be SAID, not implied by silence. Opus 5 and Sonnet 5 run adaptive thinking when
+  // nothing is sent, so dropping the field made the cheapest dial the deepest one.
+  assert.deepEqual(remappedCustomClaudeOff.thinking, { type: "disabled" });
 
   // Claude 4.6 still uses the explicit budget — that family accepts it.
   const c46 = apply({ model: "claude-opus-4-6" });
@@ -15333,8 +15335,11 @@ test("gateway compression makes the local LLM compaction stand down", () => {
   }
   assert.match(SRC, /function _compactHistoryIfNeeded\([\s\S]{0,300}if \(_gatewayHandlesCompression\(\)\) return;/,
     "跨轮历史也不能再被 16K 本地阈值提前改写");
-  assert.match(SRC, /function _effectiveContextLimit\(modelId\)[\s\S]{0,420}_gatewayHandlesCompression\(\) && tierMax \? Math\.max\(native, tierMax\) : native/,
-    "网关接管时本地按档位上限裁剪，而不是模型原生窗口");
+  // Additive, matching the gateway's capacity_for_native (server/src/compression.rs): the tier is
+  // granted ON TOP of the model's own window. Taking the larger of the two contradicted the
+  // buttons, which have always been priced additively.
+  assert.match(SRC, /function _effectiveContextLimit\(modelId\)[\s\S]{0,900}_gatewayHandlesCompression\(\) && tierMax \? native \+ tierMax : native/,
+    "网关接管时本地按 原生+档位 裁剪，与 capacity_for_native 一致");
   const callSites = SRC.match(/_trimMessagesIfHuge\(messages, \w+, root, _effectiveContextLimit\(config\?\.model\)\)/g) || [];
   assert.equal(callSites.length, 2,
     `两个调用点都要用有效窗口（找到 ${callSites.length} 个）`);
@@ -19596,18 +19601,24 @@ test("Tier-2 fold invalidates duplicate-read stubs for the same file", () => {
 test("context-window choice clamps to what is actually deliverable", () => {
   const mkEff = (store, user, compress) => load("_effectiveContextLimit", {
     _modelContextLimit: () => 200_000,
+    _nativeWindowsFor: () => [200_000],
     _michaelUser: user,
     _gatewayHandlesCompression: () => compress,
     _ctxChoiceFor: () => store,
   });
   const tier5m = { michael_compression: { tier: "5m", max_input_tokens: 5_000_000 } };
 
-  assert.equal(mkEff(0, tier5m, true)("m"), 5_000_000, "no choice → membership default");
-  assert.equal(mkEff(2_000_000, tier5m, true)("m"), 2_000_000, "choice narrows within membership");
+  // The tier stacks on the model's own window — 200K native + a 5M tier is 5.2M, which is exactly
+  // what the 5M button emits and what the gateway's capacity_for_native enforces. This test used
+  // to assert 5_000_000 and store 2_000_000, neither of which any button can produce; mocking away
+  // the additive half is how the two halves disagreed for so long without a test noticing.
+  assert.equal(mkEff(0, tier5m, true)("m"), 5_200_000, "no choice → membership default");
+  assert.equal(mkEff(1_200_000, tier5m, true)("m"), 1_200_000, "the 1M button narrows within membership");
+  assert.equal(mkEff(5_200_000, tier5m, true)("m"), 5_200_000, "the paid top tier must be reachable");
   assert.equal(mkEff(200_000, tier5m, true)("m"), 200_000, "native is always selectable");
-  assert.equal(mkEff(5_000_000, null, true)("m"), 200_000,
-    "membership gone → stored 5M silently falls back to native, never a fictional window");
-  assert.equal(mkEff(2_000_000, tier5m, false)("m"), 200_000,
+  assert.equal(mkEff(5_200_000, null, true)("m"), 200_000,
+    "membership gone → a stored tier silently falls back to native, never a fictional window");
+  assert.equal(mkEff(1_200_000, tier5m, false)("m"), 200_000,
     "gateway compression off → tiers are not deliverable, clamp to native");
 
   const mkOpts = (user, compress, windows = null) => load("_ctxChoiceOptions", {
