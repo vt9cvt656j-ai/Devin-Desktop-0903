@@ -56479,7 +56479,11 @@ const _AT_CATEGORIES = [
   // paths that are English anyway. i-sparkles did not exist, which is why Model rendered with no
   // icon at all — a missing symbol fails silently, so the names are taken from the real set.
   { id: "model", label: "Model", hint: "Run this task on a specific model", icon: "i-sparkle" },
-  { id: "files", label: "Files", hint: "Reference a folder or file", icon: "i-folder" },
+  { id: "files", label: "Files", hint: "Reference a file", icon: "i-folder" },
+  // Directories are their own category rather than folders mixed into the file list. When you
+  // want to point at a whole folder you know it in advance, and hunting for one among a hundred
+  // files is the wrong shape of search.
+  { id: "directory", label: "Directory", hint: "Pick a folder from this workspace", icon: "i-folder-open" },
   { id: "github", label: "GitHub", hint: "Work in a connected repository", icon: "i-brand-github" },
   { id: "gitlab", label: "GitLab", hint: "Work in a connected repository", icon: "i-brand-gitlab" },
 ];
@@ -56613,6 +56617,7 @@ async function _renderAtMenu() {
 
   let rows;
   if (_atMode === "model") rows = _atModelRows(query);
+  else if (_atMode === "directory") rows = await _atDirectoryRows(query);
   else if (_atMode === "github" || _atMode === "gitlab") {
     rows = _atRepoRows(_atMode, query);
     _atLoadRepos(_atMode);
@@ -56646,6 +56651,44 @@ async function _renderAtMenu() {
   _atMenu.style.width = Math.min(r.width, 520) + "px";
   _atMenu.style.bottom = window.innerHeight - r.top + 6 + "px";
   _atMenu.hidden = false;
+}
+
+/**
+ * Every directory in the workspace, nearest the top first.
+ *
+ * The file index already carries them — it records a folder as its path plus a trailing slash —
+ * so this filters rather than re-walks the disk. Shallow paths sort first because the folder you
+ * mean is usually near the root; a fuzzy score would put a deep exact-ish match above `src/`.
+ */
+async function _atDirectoryRows(query) {
+  const root = rootPath || workspaceRoots[0] || "";
+  if (!root) return [];
+  let files;
+  try { files = await _ensureFileIndex(); } catch { return []; }
+  const q = String(query || "").toLowerCase();
+  const dirs = files
+    .filter((f) => f.endsWith("/"))
+    .map((f) => f.slice(0, -1))
+    .filter((d) => !q || d.toLowerCase().includes(q))
+    .sort((a, b) => {
+      const depth = a.split("/").length - b.split("/").length;
+      return depth !== 0 ? depth : a.localeCompare(b, undefined, { numeric: true });
+    })
+    .slice(0, 30);
+  if (!dirs.length) {
+    return [{ kind: "hint", icon: "i-folder-open", name: q ? "No matching folder" : "No folders in this workspace", detail: "", onPick: () => {} }];
+  }
+  return dirs.map((d) => {
+    const name = d.split("/").pop() || d;
+    const parent = d.includes("/") ? d.slice(0, d.lastIndexOf("/")) : "";
+    return {
+      kind: "directory",
+      iconUrl: folderIconUrl(name, false),
+      name: `${name}/`,
+      detail: parent,
+      onPick: () => _insertAtChip({ kind: "file", value: d, label: name }),
+    };
+  });
 }
 
 /** Turn workspace-relative paths into menu rows. One definition, so the browse and search paths
