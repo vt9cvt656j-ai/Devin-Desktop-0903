@@ -14381,10 +14381,14 @@ test("tool turns suppress provisional narrative until a no-tool final answer", (
     && agentTurn.includes("if (streamEl) { streamEl.remove(); streamEl = null; }"),
   "a real tool call must immediately remove any prose rendered before its function block");
   assert.ok(agentTurn.includes("const _hasNonControlToolCall = _suppressNarrativeForTools")
-    && agentTurn.includes("text: _hasNonControlToolCall ? \"\" : cleanFinal"),
+    && agentTurn.includes("text: (_hasNonControlToolCall && !err) ? \"\" : cleanFinal"),
     "pre-tool prose must not be returned to the loop, history, or final run summary");
-  assert.ok(agentTurn.includes("if (!_hasNonControlToolCall && cleanFinal.trim())"),
-    "only a no-work-tool completion may settle visible final prose");
+  // ...on a turn that SURVIVES. Suppression rests on a tool card stating the action and a
+  // following turn writing the conclusion, and a turn cut off mid-tool-arguments gets neither —
+  // there the discarded prose is the only thing the run produced, under a notice claiming it
+  // was preserved. Both the return value and the render carry the same exemption.
+  assert.ok(agentTurn.includes("const _keepProse = (!_hasNonControlToolCall || !!err) && cleanFinal.trim();"),
+    "only a no-work-tool completion — or a dead turn — may settle visible final prose");
 });
 
 test("stopped-run continuations are resolved from bounded prior-task semantic context", () => {

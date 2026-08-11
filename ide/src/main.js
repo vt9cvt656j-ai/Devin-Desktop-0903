@@ -34807,7 +34807,7 @@ function _formatAgentFinalError(err) {
   const raw = _stripAiRetryPrefix(tagged);
   if (!raw) return "";
   if (/连接中断（网络波动）|网络波动|连接提前结束/.test(raw)) {
-    if (partialStream) return "模型连接在输出过程中中断。已生成的内容和文件改动都已保留；为避免重复执行，本轮不会重放。";
+    if (partialStream) return "模型连接在输出过程中中断。已经写出的内容和已完成的文件改动都保留了；被打断的那次工具调用参数不完整，没有执行，也不会重放。";
     return `模型线路出现问题：${raw}。自动重试已达到 ${_AI_MODEL_RETRY_LIMIT} 次，本轮停止。`;
   }
   if (_isProviderGatewayStatusError(raw)) {
@@ -36661,13 +36661,18 @@ async function _agentModelTurn({ config, messages, toolSchemas, toolRegistry = n
 
   const _cf0 = _cleanAgentText(acc);
   const cleanFinal = _dedupeRunNarrative(_dedupeRepeatedText(_cf0), narrativeSeen);
+  // Prose written before a tool call is provisional and is normally dropped: the tool card
+  // states the action and the next turn writes the conclusion. A turn that DIED gets neither,
+  // so dropping it there erases the only thing the run produced — and the notice shown in its
+  // place says the content was preserved. Put it back on screen when the turn ended in error.
+  const _keepProse = (!_hasNonControlToolCall || !!err) && cleanFinal.trim();
   if (streamEl) {
-    if (!_hasNonControlToolCall && cleanFinal.trim()) {
+    if (_keepProse) {
       renderMarkdownInto(streamEl, cleanFinal, { streaming: false, highlighter: highlightCode });
       _agentTimelineMarkVisible(timeline, _timelineTurn, "text");
     }
     else streamEl.remove();
-  } else if (!_hasNonControlToolCall && cleanFinal.trim()) {
+  } else if (_keepProse) {
     const el = document.createElement("div");
     el.className = "agent-seg";
     renderMarkdownInto(el, cleanFinal, { streaming: false, highlighter: highlightCode });
@@ -36694,7 +36699,15 @@ async function _agentModelTurn({ config, messages, toolSchemas, toolRegistry = n
     // Never carry a pre-tool conclusion into the next model message, summary, or durable
     // history.  Tool cards already state the action; the following no-tool turn owns the
     // one user-facing conclusion.
-    text: _hasNonControlToolCall ? "" : cleanFinal,
+    //
+    // Unless the turn DIED. That rule rests on a following turn existing to own the
+    // conclusion, and on a tool card existing to state the action — neither of which happens
+    // when the stream is cut mid-tool-arguments. There the prose is discarded from the return
+    // value, never reaches the run summary, and is never persisted, while the message on screen
+    // tells the user their content was preserved. It also vanished from the DOM the moment the
+    // tool name arrived. So everything the model wrote disappears and the notice says otherwise.
+    // A dead turn keeps its prose: it is the only thing the user has left of it.
+    text: (_hasNonControlToolCall && !err) ? "" : cleanFinal,
     toolCalls,
     error: err,
     reasoning: _reasoningFinal,
@@ -41097,6 +41110,15 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
         }
       }
       if (turn.error) {
+        // Bank whatever the dying turn managed to write BEFORE leaving. The accumulation that
+        // feeds the run summary — and through it the only durable record of this run — sits
+        // further down this loop body, past this break, so a turn that ended in error
+        // contributed nothing to it. Combined with the prose being dropped from the return
+        // value and removed from the DOM the moment a tool name arrived, that is how an
+        // interrupted turn left the user with an empty screen under a notice promising their
+        // content had been preserved.
+        if (turn.text && turn.text.trim()) summaryText += (summaryText ? "\n\n" : "") + turn.text.trim();
+        if (turn.reasoning && turn.reasoning.trim()) reasoningAll += (reasoningAll ? "\n" : "") + turn.reasoning.trim();
         finalErr = turn.error; break;
       }
       clearAgentRetryToast();
