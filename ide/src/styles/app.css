@@ -2120,6 +2120,78 @@ body.zen-mode .editor {
   background: linear-gradient(180deg, rgba(52,168,83,.08), transparent 120px),
     color-mix(in srgb, var(--bg) 54%, var(--panel-solid, var(--panel)) 46%);
 }
+/* A file read out of an archive, shown without unpacking it. Sits above everything because it is
+   a transient reader, not a panel you arrange things around. */
+.archive-preview {
+  position: fixed;
+  inset: 0;
+  z-index: 9000;
+  display: grid;
+  place-items: center;
+  padding: 40px;
+  background: rgb(0 0 0 / 0.35);
+}
+.archive-preview__panel {
+  display: flex;
+  flex-direction: column;
+  width: min(880px, 100%);
+  max-height: 100%;
+  overflow: hidden;
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  background: var(--panel-solid);
+  box-shadow: 0 24px 64px rgb(0 0 0 / 0.28);
+}
+.archive-preview__panel header {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex: none;
+  padding: 12px 14px;
+  border-bottom: 1px solid var(--line);
+}
+.archive-preview__panel header strong {
+  min-width: 0;
+  overflow: hidden;
+  font-size: 13px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.archive-preview__panel header span {
+  margin-left: auto;
+  flex: none;
+  color: var(--text-dim);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+.archive-preview__panel header button {
+  flex: none;
+  width: 26px;
+  height: 26px;
+  padding: 0;
+  border: 0;
+  border-radius: 7px;
+  background: transparent;
+  color: var(--text-dim);
+  font-size: 17px;
+  cursor: pointer;
+}
+.archive-preview__panel header button:hover { background: var(--hover); color: var(--text); }
+.archive-preview__panel pre {
+  margin: 0;
+  padding: 14px;
+  overflow: auto;
+  font-family: SF Mono, ui-monospace, Menlo, monospace;
+  font-size: 12px;
+  line-height: 1.6;
+  tab-size: 2;
+  white-space: pre;
+}
+
+/* An archive row you can open. Directories get no affordance because there is nothing to show. */
+.file-inspector__table tr[data-archive-entry] { cursor: pointer; }
+.file-inspector__table tr[data-archive-entry]:hover { background: var(--hover); }
+
 /* Why a listing is short, empty, or approximate — a RAR we cannot decode, a stream we stopped
    counting, a damaged tail. Without this the panel just looks broken. */
 .file-inspector__note {

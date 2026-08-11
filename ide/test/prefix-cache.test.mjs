@@ -141,3 +141,26 @@ test("the tree stylesheet has no selectors that match nothing", () => {
   assert.match(APP_CSS, /\.row\.flash::before \{ animation: tree-flash/,
     "and .flash needs a style behind it, which it never had either");
 });
+
+test("archive handling is reachable from the UI, not just implemented in the backend", () => {
+  // The reader existed for a while before anything could call it. A capability nobody can invoke
+  // is indistinguishable from one that does not exist.
+  assert.match(SRC, /extractArchive: \(path, dest, budget\) => core\.invoke\("extract_archive"/,
+    "the native seam must expose extraction");
+  assert.match(SRC, /readArchiveEntry: \(path, entry, maxBytes\) =>\s*core\.invoke\("read_archive_entry"/,
+    "and single-entry reads");
+  assert.match(SRC, /data-inspector-action="extract"/, "the panel needs an extract control");
+  assert.match(SRC, /data-archive-entry=/, "and entries have to be clickable to be openable");
+  // Both stubs must exist too, or the web build throws an obscure undefined-is-not-a-function
+  // instead of saying the desktop app is required.
+  assert.match(SRC, /extractArchive: async \(\) => \{ throw new Error\("解压需要桌面版应用。"\); \}/);
+
+  // Archive content is untrusted input; it is rendered as text, never as markup.
+  const preview = SRC.slice(SRC.indexOf("function _showArchiveEntryPreview"), SRC.indexOf("function _inspectionArchiveHtml"));
+  assert.match(preview, /querySelector\("pre"\)\.textContent = /,
+    "entry content must go in as textContent — innerHTML here is a script-injection path straight " +
+    "out of a downloaded archive");
+  const template = preview.slice(preview.indexOf("wrap.innerHTML = `"), preview.indexOf("// textContent"));
+  assert.doesNotMatch(template, /content[?.]*\.text/,
+    "the entry's own bytes must never be interpolated into markup — only its name and size, both escaped");
+});
