@@ -56668,6 +56668,29 @@ function _atRowsForPaths(paths) {
   });
 }
 
+/**
+ * Point @ at a directory the workspace does not have yet.
+ *
+ * It goes through _addWorkspaceRoot rather than being remembered as a private path, because that
+ * is what registers the folder with the backend sandbox. A path this menu knew about but the
+ * backend had not granted would list fine and then fail on the first read with "access denied",
+ * which is a worse outcome than not offering the button.
+ *
+ * Once added it becomes the browsing root, so the picker lands you inside the folder you just
+ * chose instead of back at the top of the workspace.
+ */
+async function _atAddFolder() {
+  let picked = null;
+  try { picked = await backend.pickFolder(); } catch { /* cancelled */ }
+  if (!picked) return _hideAtMenu();
+  await _addWorkspaceRoot(picked);
+  // No cache to clear: _ensureFileIndex keys on the active root, and _addWorkspaceRoot makes the
+  // new folder active, so the next call rebuilds against it.
+  _atMode = "files";
+  _atDir = "";
+  _renderAtMenu();
+}
+
 /** Which folder the Files branch is showing. "" = the workspace root. */
 let _atDir = "";
 
@@ -56734,6 +56757,19 @@ async function _atFileRows(query) {
         : () => _insertAtChip({ kind: "file", value: clean, label: baseName }),
     };
   });
+
+  // At the top level, one row to point @ at a folder that is not in the workspace yet. Without
+  // it the only reachable files are the ones already open in the project, which is exactly the
+  // case where you reach for a picker.
+  if (!_atDir && !query) {
+    rows.unshift({
+      kind: "add-folder",
+      icon: "i-new-folder",
+      name: "Add folder…",
+      detail: "Pick a directory to browse and reference",
+      onPick: () => _atAddFolder(),
+    });
+  }
 
   if (_atDir) {
     // Two rows at the top of an opened folder: go back up, and insert this folder as it stands.
