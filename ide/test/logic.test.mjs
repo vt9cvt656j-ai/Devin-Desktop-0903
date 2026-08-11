@@ -2908,8 +2908,13 @@ test("country preference is selectable and shown as a flag in the profile card",
     "AI language preference block should include the selected country/region");
   assert.match(SRC, /const country = selectedCountryInfo\(\);/,
     "profile card should read the selected country preference");
-  assert.match(SRC, /const countryBadge = `<span class="pf-country"/,
-    "profile card should build a country flag badge");
+  // The country moved from a pill to quiet text after a divider — two competing badges beside the
+  // email was the thing that read as assembled rather than designed. It still shows flag + name
+  // and still comes from the selected preference, which is what this guards.
+  assert.match(SRC, /const countryBadge = `<span class="pf-loc"/,
+    "profile card should build a country label from the selected country");
+  assert.match(SRC, /\$\{esc2\(country\.flag\)\} \$\{esc2\(country\.name\)\}/,
+    "and it must still carry the flag and the name");
   assert.match(SRC, /<div class="pf-meta">\$\{badge\}\$\{countryBadge\}<\/div>/,
     "profile card should display the country badge next to the membership badge");
   assert.match(SRC, /\.pf-meta \.pf-badge\{margin-top:0\}/,

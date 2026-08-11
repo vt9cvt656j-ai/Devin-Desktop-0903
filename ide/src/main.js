@@ -13088,7 +13088,18 @@ async function showProfile() {
       ".pf-head{display:flex;align-items:center;gap:14px;padding:26px 26px 20px}" +
       ".pf-av{width:52px;height:52px;border-radius:50%;background:linear-gradient(135deg,#1a73e8,#4285f4);color:#fff;display:grid;place-items:center;font-size:23px;font-weight:600;box-shadow:0 4px 12px rgba(26,115,232,.35)}" +
       ".pf-badge{display:inline-flex;align-items:center;justify-content:center;box-sizing:border-box;min-height:24px;border-radius:20px;padding:3px 11px;font-size:12px;font-weight:600;margin-top:5px;line-height:1.25}" +
-      ".pf-meta{display:flex;align-items:center;gap:6px;flex-wrap:wrap;margin-top:5px}" +
+      ".pf-av--img{object-fit:cover;background:#e8f0fe}" +
+      // The plan reads as status, so it keeps the tint and a dot; a star glyph and a 会员 suffix
+      // were both saying the same thing the colour already says.
+      ".pf-plan{display:inline-flex;align-items:center;gap:6px;height:22px;padding:0 10px;border-radius:11px;" +
+      "background:#e8f0fe;color:#1a73e8;font-size:12px;font-weight:600;letter-spacing:.01em}" +
+      ".pf-plan__dot{width:6px;height:6px;border-radius:50%;background:currentColor}" +
+      ".pf-plan--off{background:#f1f3f4;color:#5f6368}" +
+      // The country is context, not status: no chip, no border, just quiet text after a divider.
+      ".pf-loc{color:#5f6368;font-size:12px;white-space:nowrap}" +
+      ".pf-meta{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-top:6px}" +
+      ".pf-meta .pf-loc::before{content:'';display:inline-block;width:1px;height:11px;" +
+      "background:#dadce0;margin-right:10px;vertical-align:-1px}" +
       ".pf-meta .pf-badge{margin-top:0}" +
       ".pf-country{display:inline-flex;align-items:center;justify-content:center;box-sizing:border-box;min-height:24px;gap:5px;border-radius:20px;padding:3px 9px;background:#f8fafd;border:1px solid #e8eaed;color:#3c4043;font-size:12px;font-weight:600;line-height:1.25;max-width:180px}" +
       ".pf-country__name{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}" +
@@ -13105,10 +13116,13 @@ async function showProfile() {
     document.head.appendChild(st);
   }
 
+  // One line of metadata under the email rather than two competing pills. The plan is the only
+  // thing here worth colour — it is the status you check — so it keeps a tinted chip, and the
+  // country becomes plain text behind a separator, which is what it is: context, not a badge.
   const badge = active
-    ? `<span class="pf-badge" style="background:#e8f0fe;color:#1a73e8">★ ${esc2(planNames[u.plan] || u.plan)} 会员</span>`
-    : `<span class="pf-badge" style="background:#f1f3f4;color:#5f6368">未开通会员</span>`;
-  const countryBadge = `<span class="pf-country" title="${esc2(country.name)} (${esc2(country.code)})"><span>${esc2(country.flag)}</span><span class="pf-country__name">${esc2(country.name)}</span></span>`;
+    ? `<span class="pf-plan"><span class="pf-plan__dot"></span>${esc2(planNames[u.plan] || u.plan)}</span>`
+    : `<span class="pf-plan pf-plan--off">未开通会员</span>`;
+  const countryBadge = `<span class="pf-loc" title="${esc2(country.name)} (${esc2(country.code)})">${esc2(country.flag)} ${esc2(country.name)}</span>`;
   // metric row with animated progress bar. wallet=true → green bar (uncapped, show full).
   const metric = (label, valText, p, sub, wallet) =>
     `<div class="pf-row"><div class="pf-rl"><span class="l">${label}</span><span class="v">${valText}</span></div>` +
@@ -13120,7 +13134,10 @@ async function showProfile() {
   ov.className = "pf-ov";
   ov.innerHTML = `<div class="pf-card">
     <div class="pf-head">
-      <span class="pf-av">${esc2(av)}</span>
+      ${u.avatar
+        ? `<img class="pf-av pf-av--img" src="${esc2(u.avatar)}" alt="" referrerpolicy="no-referrer"
+             onerror="this.outerHTML='<span class=\'pf-av\'>${esc2(av)}</span>'">`
+        : `<span class="pf-av">${esc2(av)}</span>`}
       <div style="flex:1;min-width:0"><div style="font-size:16px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${esc2(u.email || "")}</div><div class="pf-meta">${badge}${countryBadge}</div></div>
       <span class="pf-close" id="pfClose">&times;</span>
     </div>
