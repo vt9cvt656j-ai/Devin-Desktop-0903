@@ -989,3 +989,44 @@ test("the loop stops advertising continuation machinery it does not have", () =>
     assert.ok((SRC.match(new RegExp("\\b" + live + "\\b", "g")) || []).length > 1, live);
   }
 });
+
+test("两处确认弹窗默认放行，但机制留着", () => {
+  // 软件所有者 2026-08-11 明确要求：命令都能跑、文件夹始终可用，两个弹窗都不要。
+  // 做成默认开启的开关而不是删掉机制 —— 它们挡的是真东西（沙箱挡"往工作区外写文件"，
+  // 信任挡"执行仓库自带的程序"），对自己的项目是噪音，对刚 clone 下来没读过的代码不是。
+  assert.match(SRC, /if \(_autoAllowSandboxEscape\(\)\) return true;/);
+  assert.match(SRC, /if \(_autoTrustWorkspaces\(\)\) \{/);
+
+  // 默认放行：只有显式写 "0" 才恢复询问，所以全新安装不会弹。
+  for (const fn of ["_autoAllowSandboxEscape", "_autoTrustWorkspaces"]) {
+    const body = grab(fn);
+    assert.match(body, /!== "0"/, `${fn} 必须默认放行`);
+    assert.match(body, /catch \{ return true; \}/, `${fn} 读不到存储时也不该开始弹窗`);
+  }
+
+  // 原来的弹窗路径必须完整保留 —— 关掉开关要能一步回到逐条确认，而不是回到一个残缺版本。
+  assert.match(SRC, /title: "沙箱拦住了这条命令，要放开限制重跑吗？"/);
+  assert.match(SRC, /title: "信任这个文件夹的作者吗？"/);
+  assert.match(SRC, /const ok = decision !== "deny";/, "关掉开关后用户仍然能拒绝");
+  // 沙箱本身没被拆：这两个开关只影响"被挡住之后要不要问"，不影响约束是否存在。
+  assert.match(SRC, /async function _approveSandboxEscape\(command, root\)/);
+});
+
+test("表格文件有自己的图标，而不是通用文档图", () => {
+  // 截图里 big.csv / euro.csv / gbk.csv / messy.csv 和 .txt/.log 长得一模一样，
+  // 但它们在这个软件里会打开成表格窗口 —— 文件树上看不出哪个点开是表格。
+  assert.match(SRC, /csv: "csv", tsv: "csv", tab: "csv",/);
+  assert.doesNotMatch(SRC, /csv: "document"/);
+
+  const svg = fs.readFileSync("src/assets/file-icons/csv.svg", "utf8");
+  assert.match(svg, /<svg[^>]*viewBox="0 0 32 32"/, "与本套其它图标同一画布");
+  assert.match(svg, /#34A853|#188038/, "沿用这套图标的配色语言");
+  assert.doesNotMatch(svg, /<script|onload=/i);
+
+  // 图标映射要覆盖真正会打开成表格的那组扩展名，不能只顺手加 csv。
+  const tableExts = SRC.match(/const TABLE_EXTS = new Set\(\[([^\]]*)\]\)/)[1]
+    .match(/"([a-z]+)"/g).map((q) => q.replace(/"/g, ""));
+  for (const ext of tableExts) {
+    assert.match(SRC, new RegExp(`\\b${ext}: "csv"`), `${ext} 会打开成表格，图标要跟上`);
+  }
+});

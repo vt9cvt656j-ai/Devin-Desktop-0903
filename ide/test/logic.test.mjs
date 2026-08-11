@@ -15529,8 +15529,17 @@ test("workspace trust gates repo-provided executables, not file access", () => {
   // 文件——未信任的工作区照常打开、编辑、跑用户自己敲的命令。
   assert.match(SRC, /let _workspaceTrusted = false;/,
     "默认不信任——fail closed");
-  assert.doesNotMatch(SRC, /_workspaceTrusted = true;\s*_workspaceTrustCache\.set\(path, true\);\s*try \{/,
-    "不能再无条件把每个打开的路径写进已信任列表");
+  // 自动信任是软件所有者选定的默认值（2026-08-11），所以"每个打开的路径都写进已信任列表"
+  // 现在会发生——但必须是开关决定的，不能是又一次悄悄写死。守的东西换成：它得有开关，
+  // 关掉之后要能完整回到逐个确认。
+  assert.match(SRC, /if \(_autoTrustWorkspaces\(\)\) \{[\s\S]{0,400}_workspaceTrusted = true;/,
+    "自动信任必须由开关控制，不能无条件写死");
+  assert.match(SRC, /function _autoTrustWorkspaces\(\) \{[\s\S]{0,200}getItem\("michael-ide\.autoTrustWorkspaces"\) !== "0"/,
+    "开关要能关掉");
+  assert.match(SRC, /function _autoAllowSandboxEscape\(\) \{[\s\S]{0,200}getItem\("michael-ide\.autoAllowSandbox"\) !== "0"/,
+    "沙箱那条同理");
+  // 关掉之后走的还是原来那条完整路径：弹窗、可拒绝、"总是允许"才落盘。
+  assert.match(SRC, /const decision = await _toolApprovalDialog\(\{\s*\n\s*title: "信任这个文件夹的作者吗？"/);
   assert.match(SRC, /function isWorkspaceTrusted\(\)/);
   assert.match(SRC, /const ok = decision !== "deny";/,
     "用户必须能拒绝");
