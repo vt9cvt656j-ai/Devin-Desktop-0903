@@ -35,6 +35,7 @@ mod qr;
 #[macro_use]
 mod safelog;
 mod sandbox;
+mod shell_env;
 mod sysctl;
 mod tasks;
 mod terminal;
@@ -358,6 +359,8 @@ pub fn run() {
             terminal::term_running_ids,
             terminal::term_list_commands,
             terminal::term_history,
+            shell_env::env_refresh,
+            shell_env::shell_plan,
             lsp::lsp_start,
             lsp::lsp_send,
             lsp::lsp_stop,

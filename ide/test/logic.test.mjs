@@ -15794,6 +15794,111 @@ test("closing a terminal before termOpen resolves reaps the late PTY without tou
   assert.deepEqual(entry.term.writes, []);
 });
 
+test("the model is told which interpreter actually runs its commands", () => {
+  const line = load("_platformContextLine", { _envChangedNote: "" });
+
+  const posix = line({ os: "macOS", version: "26.0", arch: "arm64", shell: "zsh", shellKind: "posix" });
+  assert.match(posix, /run_cmd 与终端都由 zsh 执行/);
+  assert.doesNotMatch(posix, /不是命令分隔符/, "POSIX 下不该吓唬模型");
+
+  // cmd 下最危险的不是"命令不存在"（那会报 9009，模型能自纠），而是这四个静默构造：
+  // 退出码 0、结果错、模型收不到任何信号。必须逐个点名，不能只说一句"用 cmd 语法"。
+  const cmd = line({ os: "Windows", version: "11", arch: "x86_64", shell: "cmd", shellKind: "cmd" });
+  for (const bad of [";", "$VAR", "'单引号'", "$(…)"]) {
+    assert.ok(cmd.includes(bad), `cmd 分支必须点名 ${bad}`);
+  }
+  assert.match(cmd, /Git for Windows/, "要给出让它变回 POSIX 的出路");
+});
+
+test("the app's own POSIX pipelines do not get fed to cmd.exe", () => {
+  // deploy_site 是 app 自己拼的纯 POSIX 管线（set -e / for-do-done / tar），模型根本不参与。
+  // cmd 拿到它会把整条当成 `set` 的参数，报一句"Environment variable not defined"退出 1——
+  // 看起来像部署失败，其实是语法压根没被执行。
+  const src = extractFn("_mapToolCall");
+  assert.match(src, /if \(_shellKind\(\) === "cmd"\)[\s\S]{0,400}git-scm\.com\/download\/win/,
+    "cmd 下要响亮地告诉用户缺什么，而不是吐一条注定静默失败的 POSIX 管线");
+
+  const map = load("_mapToolCall", {
+    _applyToolArgDefaults: undefined, _normalizeArgKeys: (a) => a, _STR_ARG_KEYS: new Set(),
+    _KNOWN_TOOLS: new Set(["deploy_site"]), _canonicalToolName: () => "", _mcpToolMap: new Map(),
+    _finiteNumberArg: load("_finiteNumberArg"), _normPlanSteps: (s) => s,
+    _preferredLanguageCode: () => "en", _shellKind: () => "cmd",
+    localStorage: { getItem: () => "" }, _michaelBase: () => "https://x",
+  });
+  const out = map("deploy_site", { name: "site" }, new Map());
+  assert.doesNotMatch(out.command, /set -e|tar czf|for x in/, "cmd 下不许出现 POSIX 管线");
+  assert.match(out.command, /exit \/b 1/, "必须以非零退出，否则智能体会当成部署成功");
+});
+
+test("环境变量在外部改过之后能被重新读到", () => {
+  // 进程的 environment block 是 exec 那一刻的快照。用户在别的终端 export、改 .zshrc、用系统
+  // 属性面板加变量，都不会改写已经在跑的 app：macOS 上那次登录 shell 探测以前是 OnceLock，
+  // 整个进程只跑一次；Windows 上压根没有任何重读通道。
+  assert.match(SRC, /window\.addEventListener\("focus", _refreshShellEnv\)/,
+    "回到窗口正是环境最可能变过的时刻");
+  // _refreshShellEnv 是 const 箭头函数，extractFn 只认 function 声明，所以按源码片段断言。
+  const at = SRC.indexOf("const _refreshShellEnv");
+  assert.ok(at > 0, "_refreshShellEnv 必须存在");
+  const body = SRC.slice(at, at + 900);
+  assert.match(body, /backend\.envRefresh\(\)/);
+  assert.match(body, /_osDetailCache = null/, "这个缓存以前永不失效，会把开机那一刻的 shell 冻到关机");
+  assert.match(body, /_envChangedNote =/, "要告诉模型它此前的「没装/找不到」结论可能已失效");
+});
+
+test("a terminal that fails to start stays on screen with the reason", async () => {
+  // 用户报的"Windows 打不开终端"，在代码层面是"打开了、报错了、错误被吞掉、面板被关掉"：
+  // startError 以前全文件只有写入点没有读取点，closeTermTab 把最后一个标签页关掉后整个终端
+  // 面板会收起来，于是界面上看起来就是点了没反应。失败必须留在屏幕上——那是唯一的线索。
+  const termTabs = [];
+  const container = { hidden: false, remove() {} };
+  class FakeTerminal {
+    constructor() { this.cols = 80; this.rows = 24; this.writes = []; this.disposed = false; }
+    loadAddon() {} open() {} onData() {} onResize() {} attachCustomKeyEventHandler() {}
+    reset() { this.didReset = true; }
+    write(v) { this.writes.push(v); }
+    focus() {} dispose() { this.disposed = true; }
+  }
+  const create = load("createTermTab", {
+    _dbgConsoleActive: false, _dbgConsoleEl: null, termTabs, termSeq: 0, rootPath: "/workspace",
+    document: { createElement: () => container }, termBody: { appendChild() {} },
+    Terminal: FakeTerminal, FitAddon: class { fit() {} },
+    WebglAddon: class { onContextLoss() {} dispose() {} }, WebLinksAddon: class {},
+    termTheme: () => ({}), termResizeObserver: { observe() {} }, activeTermTab: -1,
+    clearTermGhost() {}, trackTermInput() {}, acceptTermGhost() {}, scheduleTermGhost() {},
+    switchTermTab() {}, navigator: { platform: "MacIntel" }, _releaseTauriChannel() {},
+    _detectTerminalChanges() {}, _scheduleTermRefresh() {},
+    backend: {
+      termOpen: async () => { throw new Error("ConPTY 起不来"); },
+      termWrite: async () => {}, termResize: async () => {}, termClose: async () => {},
+    },
+  });
+
+  const entry = await create();
+  assert.equal(termTabs.length, 1, "失败的标签页不能被关掉，否则面板整个收起来");
+  assert.equal(entry.closed, undefined === entry.closed ? undefined : false);
+  assert.match(entry.startError, /终端启动失败/);
+  const shown = entry.term.writes.join("");
+  assert.match(shown, /ConPTY 起不来/, "真实原因必须写进终端本体，用户要能复制发回");
+  assert.match(shown, /crash\.log/, "顺带告诉用户 Windows 崩溃日志在哪");
+});
+
+test("the terminal replays what the shell said while starting, and never injects clear", async () => {
+  // 启动头 1.5 秒的输出以前被攒进 initBuffer 然后 term.reset() 抹掉，initBuffer 从来没有第二个
+  // 读取点——banner、profile 报错、Windows 上 chcp 的失败全部消失。注入的那条 clear 还有独立
+  // 害处：它追加在用户这 1.5 秒里已经敲进去的内容后面再回车，`npm ru` 会变成 `npm ru clear`。
+  const src = extractFn("createTermTab");
+  // 只看真正的调用（行首缩进 + 分号），别被解释这段历史的注释绊到。
+  assert.doesNotMatch(src, /^\s*term\.reset\(\);/m, "reset 会连滚回缓冲一起清掉，启动期证据就没了");
+  assert.match(src, /if \(initBuffer\) \{\s*term\.write\(initBuffer\);/, "启动期输出必须回放");
+  assert.doesNotMatch(src, /termWrite\(entry\.backendId, " " \+ _clearCmd/,
+    "不许再往 PTY 里注入 clear——它会被拼到用户已经敲了一半的命令后面");
+
+  // PTY 是按 await 之前的 term.cols/rows 建的（那时还是默认 80×24），面板的 fit 又发生在
+  // backendId 赋值之前、被 onResize 的 null 判断丢掉，所以必须在拿到 id 之后补发一次。
+  assert.match(src, /entry\.backendId = openedPty\.id;[\s\S]{0,600}?backend\.termResize\(entry\.backendId, term\.cols, term\.rows\)/,
+    "拿到 backendId 之后要补一次 resize，否则 PTY 永远停在 80×24");
+});
+
 test("agent preview tabs are evicted unless the user claims them", () => {
   // agent 每写一个当前未打开的文件就 openFiles.set + 新建 Monaco model +
   // lspManager.didOpen，而只有**回滚**路径会 closeFile —— 写成功的那些永远留着。
@@ -21640,6 +21745,9 @@ test("每个注册 schema 的最小示例都能映射且不产生 _error", () =>
     _STR_ARG_KEYS: new Set(),
     _KNOWN_TOOLS: names,
     _canonicalToolName: () => "",
+    // deploy_site 会按解释器种类分支：cmd 下不再吐那条纯 POSIX 管线（cmd 会把整条当成
+    // `set` 的参数静默失败），改吐一条会响亮退出的提示。这里按 posix 走主路径。
+    _shellKind: () => "posix",
     _mcpToolMap: new Map(),
     _finiteNumberArg: load("_finiteNumberArg"),
     _normPlanSteps: (steps) => steps,
