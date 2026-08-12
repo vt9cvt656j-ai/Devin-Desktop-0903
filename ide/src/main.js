@@ -4264,7 +4264,33 @@ function extLang(name) {
     swift: "swift", kt: "kotlin", vue: "html", svelte: "html", lock: "json",
     conf: "ini", env: "ini", prisma: "graphql", graphql: "graphql", gql: "graphql",
   };
-  return map[ext] ?? "plaintext";
+  // 上面这张表是**刻意的覆盖**（toml 借 ini 的规则、vue/svelte 借 html、lock 当 json），
+  // 所以它优先。
+  if (map[ext]) return map[ext];
+  // 认不出的再问 Monaco 自己的注册表。它随包带了 82 种语言的分词器，而这张手写的表只覆盖了
+  // 其中一半——.lua / .cs / .dart / .ex / .clj / .scala / .tf / .m 全部落进 plaintext，
+  // 打开就是黑白纯文本，而对应的分词器其实一直躺在包里。
+  // 手工补那几行只会在下次再漏一批；问注册表是自维护的。
+  return _monacoLangForExt(ext) || "plaintext";
+}
+
+/** 扩展名 → Monaco 语言 id，取自 Monaco 自己的注册表。首次调用时建表并缓存。 */
+let _monacoExtIndex = null;
+function _monacoLangForExt(ext) {
+  if (!ext) return "";
+  if (!_monacoExtIndex) {
+    _monacoExtIndex = new Map();
+    try {
+      for (const lang of monaco.languages.getLanguages()) {
+        for (const e of lang.extensions || []) {
+          const key = String(e).replace(/^\./, "").toLowerCase();
+          // 先登记的优先，保持和 Monaco 自身的解析顺序一致。
+          if (key && !_monacoExtIndex.has(key)) _monacoExtIndex.set(key, lang.id);
+        }
+      }
+    } catch { /* 注册表还没就绪就下次再建 */ _monacoExtIndex = null; return ""; }
+  }
+  return _monacoExtIndex.get(ext) || "";
 }
 
 function syncWelcome() {
@@ -9542,6 +9568,11 @@ const PRELOAD_MAX_BYTES = 256 * 1024;
 let preloadToken = 0;
 
 async function preloadProjectModels(root) {
+  // 路径别名（@/components/…）要靠项目自己的 tsconfig/jsconfig 才解析得了。不读它，
+  // 现代的 Next.js / Vite-React 模板一打开就是满屏 "Cannot find module" 红波浪线，
+  // F12 跳不动、悬停也没有类型。挂在这里而不是七个打开工作区的入口上：这个函数正是
+  // "这个项目要用了" 的那一刻。
+  _applyProjectTsConfig(root).catch(() => {});
   const token = ++preloadToken;
   // Drop project models from a previously opened folder.
   for (const p of projectModels) {
@@ -9751,6 +9782,96 @@ function _clearJsTsJsonMarkersForRoot(root) {
     try { monaco.editor.setModelMarkers(model, "json", []); } catch {}
   }
 }
+/**
+ * 把 tsconfig.json / jsconfig.json 里的 `baseUrl` + `paths` 灌进 Monaco 的 TS 服务。
+ *
+ * 不灌的后果：`import Button from "@/components/Button"` 这类路径别名解析不了，于是
+ * 满屏 "Cannot find module" 红波浪线，F12 跳不动，悬停也没有类型。而现代的 Next.js /
+ * Vite-React 模板几乎默认就带 `@/*` 别名——打开一个新项目第一眼就是一片红。
+ *
+ * tsconfig 是 JSONC：允许 `//` `/* *\/` 注释和尾逗号。JSON.parse 直接吃会抛，所以先剥。
+ * 剥的时候必须避开字符串字面量里的 `//`（比如 "https://..."），否则会把值截断。
+ */
+function _stripJsonc(text) {
+  let out = "";
+  let inStr = false, esc = false, inLine = false, inBlock = false;
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i], n = text[i + 1];
+    if (inLine) { if (c === "\n") { inLine = false; out += c; } continue; }
+    if (inBlock) { if (c === "*" && n === "/") { inBlock = false; i++; } continue; }
+    if (inStr) {
+      out += c;
+      if (esc) esc = false;
+      else if (c === "\\") esc = true;
+      else if (c === '"') inStr = false;
+      continue;
+    }
+    if (c === '"') { inStr = true; out += c; continue; }
+    if (c === "/" && n === "/") { inLine = true; i++; continue; }
+    if (c === "/" && n === "*") { inBlock = true; i++; continue; }
+    out += c;
+  }
+  // 尾逗号：`,` 后面只跟空白再跟 `}` 或 `]`。
+  return out.replace(/,(\s*[}\]])/g, "$1");
+}
+
+/**
+ * 从 tsconfig 的 compilerOptions 推出要喂给 Monaco 的 baseUrl / paths（都转成绝对路径）。
+ *
+ * `.` 和 `..` 必须归一。`"baseUrl": "."` 是最常见的写法，不归一会得到 `/ws/.`，
+ * 而 paths 目标会变成 `/ws/./src/*` —— TS 的路径匹配是纯字符串前缀比较，多一个 `.`
+ * 就永远匹配不上项目里那些 `/ws/src/...` 的 model URI，别名照样解析不了。
+ */
+function _tsPathsFromConfig(root, configDir, compilerOptions) {
+  const co = compilerOptions || {};
+  const join = (a, b) => {
+    const raw = `${String(a).replace(/\/+$/, "")}/${String(b).replace(/^\/+/, "")}`;
+    const abs = raw.startsWith("/");
+    const out = [];
+    for (const seg of raw.split("/")) {
+      if (!seg || seg === ".") continue;
+      if (seg === ".." && out.length && out[out.length - 1] !== "..") { out.pop(); continue; }
+      out.push(seg);
+    }
+    // 结尾的 `*` 之类通配要保住，split/join 天然保留。
+    return (abs ? "/" : "") + out.join("/");
+  };
+  const baseUrl = co.baseUrl ? join(configDir, co.baseUrl) : configDir;
+  const paths = {};
+  for (const [k, v] of Object.entries(co.paths || {})) {
+    if (!Array.isArray(v)) continue;
+    // paths 的目标是相对 baseUrl 的；Monaco 的 model URI 是绝对路径，所以这里也要绝对化。
+    paths[k] = v.map((t) => (String(t).startsWith("/") ? String(t) : join(baseUrl, t)));
+  }
+  return { baseUrl, paths, hasPaths: Object.keys(paths).length > 0, root };
+}
+
+let _tsConfigRoot = "";
+/** 打开/切换工作区时调用：读项目的 tsconfig 并重配 TS 服务。 */
+async function _applyProjectTsConfig(root) {
+  root = String(root || "").replace(/\/+$/, "");
+  if (!root || root === _tsConfigRoot) return null;
+  for (const name of ["tsconfig.json", "jsconfig.json"]) {
+    let text;
+    try { text = await backend.readTextFile(`${root}/${name}`); } catch { continue; }
+    if (typeof text !== "string" || !text.trim()) continue;
+    let parsed;
+    try { parsed = JSON.parse(_stripJsonc(text)); } catch { continue; }
+    const derived = _tsPathsFromConfig(root, root, parsed.compilerOptions);
+    if (!derived.hasPaths) continue;
+    try {
+      const ts = monaco.languages.typescript;
+      for (const d of [ts.typescriptDefaults, ts.javascriptDefaults]) {
+        d.setCompilerOptions({ ...d.getCompilerOptions(), baseUrl: derived.baseUrl, paths: derived.paths });
+      }
+      _tsConfigRoot = root;
+      return derived;
+    } catch { return null; }
+  }
+  _tsConfigRoot = root; // 没有 tsconfig 也记下来，别每次切文件都重读
+  return null;
+}
+
 function _restartJsTsLanguageService() {
   try {
     configureLanguageService();
