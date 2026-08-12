@@ -13155,8 +13155,17 @@ async function michaelAccessGate() {
   _setMichaelUserProfile(u); _loggedInEmail = u.email || _loggedInEmail; _updateLoginUI();
   const active = u.plan && u.plan !== "none" && (!u.plan_expires_at || new Date(u.plan_expires_at) > new Date());
   const hasCredits = (u.credits_cents || 0) > 0;
-  if (!active && !hasCredits) {
-    alert("你还不是会员，且额度已用完。\n请在后台开通会员或充值后再使用。");
+  // 每日免费点数是第三种支付来源，和会员、钱包并列。漏掉它，这道门就把免费模型变成了
+  // 会员专属：后台明明把模型设成了免费、服务端也照常给每个用户（不分会员）发每日点数、
+  // 计费门也只查点数池——但请求在客户端就被拦下了，根本发不出去。实测 7 天里免费模型
+  // 的非会员调用数是 0。
+  //
+  // 这道门只该拦"三个来源都空"的人。它不该比服务端更严：选了付费模型却没余额时，由
+  // 服务端用它自己那句准确的文案拒绝（额度已用完 / 本时段额度 / 请先开通会员），比在
+  // 这里一刀切成"你还不是会员"要准得多。
+  const hasFreePoints = (Number(u.free_points) || 0) > 0;
+  if (!active && !hasCredits && !hasFreePoints) {
+    alert("你还不是会员，额度和今日免费点数都已用完。\n请开通会员或充值后再使用（免费点数每天 0 点重置）。");
     return false;
   }
   const cur = await loadConfigAsync();

@@ -10195,6 +10195,20 @@ test("long chat transcripts stay bounded while paging both directions", () => {
     "streaming updates should coalesce their layout-affecting scroll write via rAF");
 });
 
+test("the access gate counts free daily points as a payment source", () => {
+  // 后台把模型设成免费、服务端照常给每个用户（不分会员）发每日点数、计费门也只查点数池——
+  // 但这道客户端门只认会员和钱包，非会员在请求发出前就被拦下，于是免费模型事实上成了
+  // 会员专属。生产实测：7 天里免费模型的非会员调用数是 0。
+  const gate = extractFn("michaelAccessGate");
+  assert.match(gate, /const hasFreePoints = \(Number\(u\.free_points\) \|\| 0\) > 0;/,
+    "free points are the third payment source and must be read from /api/me");
+  assert.match(gate, /if \(!active && !hasCredits && !hasFreePoints\)/,
+    "the gate may only block when all three sources are empty");
+  // 这道门不该比服务端更严：选了付费模型却没余额，要由服务端用它自己的准确文案拒绝。
+  assert.doesNotMatch(gate, /if \(!active && !hasCredits\) \{/,
+    "the two-source form is what made free models members-only");
+});
+
 test("content growing under a stationary scroll position cannot unpin the chat", () => {
   // 这是用户报的两个症状的共同根因。某个增长点长高之后没人调 _chatFollow（终端输出展开、
   // diff 视图打开、写入预览收尾都是），滚动监听器只看得到"距底 280px"，把它记成"用户滑走了"，
