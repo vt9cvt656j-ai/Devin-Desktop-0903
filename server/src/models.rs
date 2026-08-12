@@ -6566,7 +6566,18 @@ pub async fn responses_proxy(
         && q_window > 0
         && (q_weekly_cap == 0 || q_week_used < q_weekly_cap);
     let use_quota = quota_ok;
-    if !quota_ok && credits <= 0 {
+    // 免费模型走每日点数池，和会员、钱包并列——这道门必须和 chat_completions 那道一致。
+    // 之前只有 chat_completions 做了豁免，于是同一个免费模型：从 IDE（走 /v1/chat/completions）
+    // 能用，从任何走 /v1/responses 的客户端就被判成"请先开通会员或充值额度"。同一份后台配置，
+    // 两个接口两种结果。
+    let free_here = effective_billing(&conn, &model_id).2;
+    if free_here && free_points_balance(&state, uid).await <= 0 {
+        return Err(AppError {
+            status: StatusCode::PAYMENT_REQUIRED,
+            msg: "今日免费额度已用完，明天 0 点重置（或改用付费模型）".into(),
+        });
+    }
+    if !free_here && !quota_ok && credits <= 0 {
         return Err(AppError {
             status: StatusCode::PAYMENT_REQUIRED,
             msg: "请先开通会员或充值额度".into(),
@@ -7636,6 +7647,30 @@ mod billing_tests {
     /// 同一条连接上还跑着 Opus（$5，应为 6.25）和 Fable（$10，应为 12.5）。缓存写入是单价最贵
     /// 的一类 token，30 天实测仅此一项少收约 $119。连接级两列只在这个模型压根没有输入价时兜底。
     #[test]
+    /// 免费模型的豁免必须每个模型调用入口都有，不能只有 chat_completions 有。
+    ///
+    /// 漏掉的那个接口上，同一份后台配置会给出相反的结果：IDE 走 /v1/chat/completions 能用，
+    /// 任何走 /v1/responses 的客户端（Claude Code、Codex 等）被判"请先开通会员或充值额度"。
+    /// 这里直接对源码断言，因为这两道门是独立写的、天然会漂。
+    #[test]
+    fn every_model_entry_point_exempts_free_models_from_the_paid_gate() {
+        let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/models.rs"))
+            .expect("read models.rs");
+        for entry in ["pub async fn chat_completions(", "pub async fn responses_proxy("] {
+            let start = src.find(entry).unwrap_or_else(|| panic!("{entry} 必须存在"));
+            // 按字符边界截断：源码里有中文，直接切字节会落在多字节字符中间而 panic。
+            let body: String = src[start..].chars().take(14_000).collect();
+            let body = body.as_str();
+            let gate = body
+                .find("if !free_here && !quota_ok && credits <= 0")
+                .unwrap_or_else(|| panic!("{entry} 的付费门没有豁免免费模型"));
+            let pool = body
+                .find("free_here && free_points_balance")
+                .unwrap_or_else(|| panic!("{entry} 没有检查每日点数池"));
+            assert!(pool < gate, "{entry}：点数池检查必须在付费门之前");
+        }
+    }
+
     fn cache_prices_follow_the_model_not_the_connection() {
         // Anthropic 形状：出现 cache_read_input_tokens 才走 Anthropic 分支
         // input_tokens 必须非零：compute_cost 在 prompt 和 completion 同时为 0 时提前返回 0，
