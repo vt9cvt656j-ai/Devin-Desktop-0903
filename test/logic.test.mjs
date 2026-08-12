@@ -15803,6 +15803,75 @@ test("closing a terminal before termOpen resolves reaps the late PTY without tou
   assert.deepEqual(entry.term.writes, []);
 });
 
+test("tsconfig 的路径别名要真的喂给 TS 服务", async () => {
+  // 编译选项里 baseUrl 写死成 "."，而且**根本没有 paths**。于是 `@/components/Button`
+  // 这类别名解析不了：满屏 Cannot find module 红波浪线、F12 跳不动、悬停没有类型。
+  // 而 Next.js / Vite-React 的模板几乎默认就带 @/* 别名——打开一个新项目第一眼就是一片红。
+
+  // tsconfig 是 JSONC：允许注释和尾逗号，JSON.parse 直接吃会抛。
+  const strip = load("_stripJsonc");
+  const jsonc = `{
+  // 行注释
+  "compilerOptions": {
+    /* 块注释 */
+    "baseUrl": ".",
+    "paths": { "@/*": ["src/*"], "~/*": ["./app/*"] },
+  },
+}`;
+  const parsed = JSON.parse(strip(jsonc));
+  assert.deepEqual(parsed.compilerOptions.paths["@/*"], ["src/*"]);
+  // 剥注释不能碰字符串字面量里的 //，否则 URL 之类的值会被截断。
+  assert.equal(JSON.parse(strip('{"u":"https://a.example/b"}')).u, "https://a.example/b");
+
+  const derive = load("_tsPathsFromConfig");
+  const out = derive("/ws", "/ws", parsed.compilerOptions);
+  assert.equal(out.baseUrl, "/ws", "baseUrl 要相对 tsconfig 所在目录解析成绝对路径");
+  // Monaco 的 model URI 是绝对路径，paths 的目标也必须绝对化，否则匹配不上。
+  assert.deepEqual(out.paths["@/*"], ["/ws/src/*"]);
+  assert.deepEqual(out.paths["~/*"], ["/ws/app/*"], "./ 前缀要归一");
+  assert.equal(out.hasPaths, true);
+
+  // 没有 paths 的项目不该白改一次编译选项。
+  assert.equal(derive("/ws", "/ws", { baseUrl: "." }).hasPaths, false);
+
+  // 必须真的被接线：挂在 preloadProjectModels 里，那是"这个项目要用了"的那一刻。
+  assert.match(extractFn("preloadProjectModels"), /_applyProjectTsConfig\(/,
+    "打开项目时要读它的 tsconfig");
+});
+
+test("语言解析问 Monaco 自己的注册表，不再靠一张手抄的表", () => {
+  // Monaco 随包带了 89 种语言的分词器，而这里原来是一张 40 行的手写表。结果是
+  // .lua / .cs / .dart / .ex / .clj / .scala / .tf / .m 打开就是黑白纯文本——
+  // 对应的分词器其实一直躺在包里，只是没人告诉编辑器该用哪个。
+  // 手工补那几行只会在下次再漏一批。
+  const langs = [
+    { id: "lua", extensions: [".lua"] },
+    { id: "csharp", extensions: [".cs"] },
+    { id: "dart", extensions: [".dart"] },
+    { id: "hcl", extensions: [".tf"] },
+    { id: "objective-c", extensions: [".m"] },
+    { id: "typescript", extensions: [".ts", ".tsx"] },
+  ];
+  // 两个函数分别抠出来再拼起来：_monacoExtIndex 是模块级可变缓存，在抠出来的作用域里
+  // 它是个局部绑定，赋值照样成立，缓存行为一致。
+  const forExt = load("_monacoLangForExt", {
+    monaco: { languages: { getLanguages: () => langs } },
+    _monacoExtIndex: null,
+  });
+  const extLang = load("extLang", { _monacoLangForExt: forExt });
+
+  for (const [file, want] of [["a.lua", "lua"], ["a.cs", "csharp"], ["a.dart", "dart"],
+                              ["a.tf", "hcl"], ["a.m", "objective-c"]]) {
+    assert.equal(extLang(file), want, `${file} 应该解析成 ${want}`);
+  }
+  // 刻意的覆盖必须仍然优先：toml 借 ini 的规则、vue 借 html、lock 当 json。
+  assert.equal(extLang("a.toml"), "ini", "toml 是刻意映射到 ini 的，不能被注册表盖掉");
+  assert.equal(extLang("a.vue"), "html");
+  assert.equal(extLang("go.mod"), "ini", "整名映射优先级最高");
+  // Monaco 也不认的还是纯文本——这是诚实的结果，不该编一个语言出来。
+  assert.equal(extLang("a.zzzz"), "plaintext");
+});
+
 test("跨文件编辑必须落盘，而不是只改内存", async () => {
   // 这是唯一一类会**静默损坏用户代码**的缺陷。F2 跨文件重命名走 Monaco 的 standalone 批量
   // 编辑服务，那份实现只做 model.pushEditOperations —— 纯内存、从不写盘；而 App 的自动保存
