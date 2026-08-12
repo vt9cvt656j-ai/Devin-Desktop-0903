@@ -460,6 +460,20 @@ fn default_true() -> bool {
     true
 }
 
+/// 这个用户当前的总额度（真实计费分）。
+///
+/// 单独一个查询是为了让"不重置额度"这条路能先看一眼：没有额度可保持时，
+/// "保持不动"就等于发一个空壳会员。
+async fn quota_total_cents(state: &AppState, uid: uuid::Uuid) -> ApiResult<i64> {
+    Ok(
+        sqlx::query_scalar::<_, i64>("SELECT quota_total_cents FROM users WHERE id = $1")
+            .bind(uid)
+            .fetch_optional(&state.db)
+            .await?
+            .unwrap_or(0),
+    )
+}
+
 pub async fn admin_set_plan(
     State(state): State<AppState>,
     claims: Claims,
@@ -504,6 +518,40 @@ pub async fn admin_set_plan(
             .await?;
         } else {
             // Unknown plan_spec — at least set plan + expiry; quotas left as-is.
+            sqlx::query("UPDATE users SET plan = $1, plan_expires_at = $2, updated_at = now() WHERE id = $3")
+                .bind(plan)
+                .bind(req.expires_at)
+                .bind(id)
+                .execute(&state.db)
+                .await?;
+        }
+    } else if quota_total_cents(&state, id).await? <= 0 {
+        // 不勾"重置额度"本意是"只改标签、别动人家已有的余额"。但用户**本来就没有额度**时，
+        // 这条路会发出一个空壳会员：套餐名在、到期时间在、四个额度字段全是 0——界面显示
+        // "pro 会员 还有 31 天"，实际一次调用都发不出去（付费门看的是 quota_total > 0）。
+        // 线上真出现过一个（gqunzhu@gmail.com：pro / 31 天 / 总额度 0）。
+        //
+        // 所以这里不是"保持不动"，而是"没有可保持的东西"：按套餐规格发一份，和勾了重置、
+        // 也和 Stripe 付款（apply_plan 在 cur=0 时累加出来的正是同一组数）完全一致。
+        // 已经有额度的用户仍然一分不动——那才是这个选项存在的意义。
+        if let Some((total, window, weekly, _)) = plan_spec(plan) {
+            sqlx::query(
+                "UPDATE users SET plan = $1, plan_expires_at = $2, \
+                 quota_total_cents = $3, quota_window_cap_cents = $4, quota_window_cents = LEAST($4, $3), \
+                 quota_window_reset_at = COALESCE(quota_window_reset_at, now() + interval '5 hours 30 minutes'), \
+                 quota_weekly_cap_cents = $5, \
+                 quota_week_reset_at = COALESCE(quota_week_reset_at, now() + interval '7 days'), \
+                 updated_at = now() WHERE id = $6",
+            )
+            .bind(plan)
+            .bind(req.expires_at)
+            .bind(total)
+            .bind(window)
+            .bind(weekly)
+            .bind(id)
+            .execute(&state.db)
+            .await?;
+        } else {
             sqlx::query("UPDATE users SET plan = $1, plan_expires_at = $2, updated_at = now() WHERE id = $3")
                 .bind(plan)
                 .bind(req.expires_at)
@@ -628,6 +676,51 @@ mod plan_spec_tests {
         assert!(!hint.contains("pro"), "提示不该再报已经不存在的套餐");
 
         crate::settings::replace_plans_for_test(restore);
+    }
+
+    /// 有套餐就必须有额度——「保存套餐」不许发出空壳会员。
+    ///
+    /// 不勾"重置额度"本意是"别动人家已有的余额"。可用户本来就没有额度时，这条路只改
+    /// 套餐名和到期时间，结果是界面显示"pro 会员 还有 31 天"、四个额度字段全是 0，
+    /// 一次调用都发不出去（付费门要求 quota_total > 0）。线上真出现过一个。
+    ///
+    /// 这里对源码断言：那条分支必须先查当前总额度，为 0 时按套餐规格发一份。
+    #[test]
+    fn saving_a_plan_never_leaves_a_member_with_zero_quota() {
+        let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/codes.rs"))
+            .expect("read codes.rs");
+        let start = src
+            .find("pub async fn admin_set_plan(")
+            .expect("admin_set_plan 必须存在");
+        let body: String = src[start..].chars().take(6_000).collect();
+
+        let zero_branch = body
+            .find("quota_total_cents(&state, id).await? <= 0")
+            .expect("没有额度时必须走补发分支，否则就是空壳会员");
+        let retag_only = body
+            .find("// Keep existing quotas, just retag the plan + expiry.")
+            .expect("只换标签那条分支必须还在——已有额度的用户不该被动");
+        assert!(
+            zero_branch < retag_only,
+            "零额度判断必须排在'只换标签'之前，否则永远走不到"
+        );
+
+        // 补发用的必须是套餐规格，而不是随手写的数——要和 Stripe 同源。
+        let seg: String = body[zero_branch..].chars().take(1_400).collect();
+        assert!(
+            seg.contains("plan_spec(plan)"),
+            "补发的额度必须来自 plan_spec，才和 Stripe 那条一致"
+        );
+        assert!(
+            seg.contains("quota_total_cents = $3"),
+            "补发必须真的写入总额度"
+        );
+        // 已经有额度的用户，这条路一分都不能动。
+        let tail: String = body[retag_only..].chars().take(500).collect();
+        assert!(
+            !tail.contains("quota_total_cents ="),
+            "只换标签的分支不得改写额度"
+        );
     }
 
     fn plan_spec_window_cap_is_never_zero() {

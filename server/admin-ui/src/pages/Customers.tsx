@@ -742,7 +742,7 @@ function CustomerDialog({
               checked={resetQuotas} disabled={plan === "none"}
               onChange={(e) => setResetQuotas(e.target.checked)}
             />
-            按新套餐重置时段 / 周 / 总额度（留空则只换标签，额度保持不动）
+            按新套餐重置时段 / 周 / 总额度（不勾则保留他现有的额度；他本来就没有额度时，仍按套餐规格发一份，不会发出零额度会员）
           </label>
           {expiry === "" && plan !== "none" && (
             <p className="mt-2 text-xs text-muted-foreground">到期时间留空 = 永不过期。</p>
