@@ -22521,7 +22521,12 @@ function _runStateNextActionSuggestions(sess, { maxAgeMs = 5 * 60_000 } = {}) {
 // call after the footer would keep charging after the visible turn was already settled.
 async function _maybeSuggestNext(sess, messages, config) {
   try {
-    if (!sess || !inTauri) return;
+    if (!sess) return;
+    // 输入框的灰字预测挂在这里，而不是另找一个收尾点：这是智能体轮跑完的**必经之处**，
+    // 而且它和下面的卡片行读的是同一份运行状态——两个界面永远不会各说各话。
+    // 不受 inTauri 限制：网页版同样需要预测，卡片行才是桌面端专属。
+    try { _renderComposerGhost(); } catch {}
+    if (!inTauri) return;
     _renderSuggestionChips(sess, _runStateNextActionSuggestions(sess), t("chat.nextSteps"));
   } catch {}
 }

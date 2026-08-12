@@ -10274,6 +10274,29 @@ test("the composer prediction is grounded in real run state, and costs nothing",
   }
 });
 
+test("every turn-completion path refreshes the composer prediction", () => {
+  // 第一版只接了 sendPrompt 里普通聊天那一段，智能体轮走的是 _maybeSuggestNext，
+  // 结果"回答完就不预测了"——用户当场就撞上了。这条测试盯住每个收尾点。
+  const suggest = stripJsComments(extractFn("_maybeSuggestNext"));
+  assert.match(suggest, /_renderComposerGhost\(\)/,
+    "智能体轮跑完必经 _maybeSuggestNext，预测必须挂在这里");
+  // 灰字不能被桌面端限制挡住：卡片行才是桌面专属，网页版同样要有预测。
+  const ghostAt = suggest.indexOf("_renderComposerGhost()");
+  const tauriAt = suggest.indexOf("inTauri");
+  assert.ok(ghostAt >= 0 && (tauriAt < 0 || ghostAt < tauriAt),
+    "预测必须排在 inTauri 提前返回之前");
+
+  // 其余三个时机：打开软件、切标签、普通聊天轮结束。
+  assert.match(SRC, /restoreChatHistory\(\)\s*\n\s*\.then\(\(\) => \{ try \{ _renderComposerGhost\(\); \}/,
+    "打开软件后必须刷新预测（_lastRunState / _planSteps 在 restore 里才回填）");
+  const switcher = stripJsComments(extractFn("_switchChatSession"));
+  assert.match(switcher, /_renderComposerGhost\(\)/,
+    "输入框是所有标签共用的，切标签不刷新会把 A 的预测挂在 B 上");
+  const send = stripJsComments(extractFn("sendPrompt"));
+  assert.match(send, /_renderComposerGhost\(\)/,
+    "普通聊天轮结束也要刷新");
+});
+
 test("the composer ghost cannot render over content the user already has", () => {
   const ok = load("_composerGhostEligible");
   const base = { isEmpty: true, streaming: false, droppedRefs: false, pastedImages: false,
