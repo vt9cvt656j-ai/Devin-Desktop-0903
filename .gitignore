@@ -26,6 +26,7 @@ yarn-error.log*
 .DS_Store
 .idea/
 .vscode/
+.cursor/
 
 # 构建产物不进版本库。
 #
