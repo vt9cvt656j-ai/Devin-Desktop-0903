@@ -37,6 +37,20 @@
         "--base=/"
       ],
       "port": 5274
+    },
+    {
+      "name": "admin-ui",
+      "runtimeExecutable": "npm",
+      "runtimeArgs": [
+        "run",
+        "dev",
+        "--prefix",
+        "../server/admin-ui",
+        "--",
+        "--port=5177",
+        "--strictPort=false"
+      ],
+      "port": 5177
     }
   ]
 }
