@@ -18399,6 +18399,30 @@ test("#53-2 并发预算共享：嵌套走同一个 _sess._subAgentsActive 上�
   assert.doesNotMatch(sub, /MAX_SUBAGENTS_PARALLEL \* /, "上限不得按层级乘倍放大");
 });
 
+test("get_diagnostics 不许把「没分析」说成「没问题」", () => {
+  // 原来：拿不到 model 就返回 []，然后走「无错误或警告」。而没有任何东西会为"只是读过"的文件
+  // 打开 model —— 读工具只做 revealInTree。系统提示在七处让智能体用 get_diagnostics 验证，
+  // 于是对任何没恰好开着标签页的文件，这个验证会对着一堆坏代码给出全绿，智能体据此报告
+  // "已修复/验证通过"。这是假阴性，比"分析延迟"严重得多：延迟会自己好，这个不会。
+  // 对整个函数断言。之前这里先切一段，起点算成负数——slice 的负起点是从末尾算的，
+  // 于是切出来的是文件尾巴，断言看着在守什么，其实什么都没守。
+  const seg = extractFn("_executeToolStepInner");
+
+  assert.match(seg, /await _modelForPath\(diagnosticPath\)/,
+    "没打开的文件要临时建 model 真分析一遍");
+  assert.match(seg, /_got\.created/, "只对自己建的负责，不能碰用户开着的");
+  assert.match(seg, /setTimeout\(r, 900\)/, "语言服务是异步出结果的，不等就等于换种方式返回空");
+
+  // 临时 model 销毁前必须清标记：Monaco 只替 inMemory/internal/vscode 清，file: 是故意放过的，
+  // 留着会在用户下次打开这个文件时被原样重绘（这正是刚修过的那个陈旧标记 bug）。
+  assert.match(seg, /_clearAllMarkersForModel\(_tempModel\)[\s\S]{0,120}_tempModel\.dispose\(\)/,
+    "先清标记再销毁，否则会给用户留下一份幽灵报错");
+
+  // 「没分析成」和「分析了没问题」必须是两句话。
+  assert.match(seg, /未被语言服务分析[\s\S]{0,80}不能据此认为没有问题/,
+    "读不到内容时要明说不能当成验证通过");
+});
+
 test("多角色派发：被丢掉的角色必须告诉模型，并发上限说明要和真实上限一致", () => {
   const map = load("_mapToolCall", {
     _applyToolArgDefaults: undefined, _normalizeArgKeys: (a) => a, _STR_ARG_KEYS: new Set(),
