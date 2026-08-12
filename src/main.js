@@ -47179,6 +47179,28 @@ async function _executeToolStepInner(step, call, root, run) {
       // A global diagnostics snapshot may span several opened roots, so it is not
       // implementation grounding for any one project. A targeted diagnostic is.
       call._evidenceRoot = diagnosticPath ? _runEvidenceRoot(root, diagnosticPath) : "";
+      // 没打开的文件也要真的分析一遍。
+      //
+      // 原来这里是：拿不到 model 就返回 []，于是下面走「无错误或警告」那条分支。而**没有任何
+      // 东西**会为"模型只是读过"的文件打开 model —— 读工具只做 revealInTree。系统提示在七个
+      // 地方让智能体用 get_diagnostics 验证，于是对任何你没恰好开着标签页的文件，这个验证会
+      // 对着一堆坏代码给出全绿，智能体据此报告"已修复/验证通过"。
+      //
+      // 这是假阴性，比"分析延迟"严重得多：延迟会自己好，这个不会。
+      // 隔壁 _interleavedDiagnostics 早就有正确写法（建 model → 等一下 → 读 → 只销毁自己建的），
+      // 只是自动门在用，模型主动调的工具用不上。
+      let _tempModel = null;
+      let _analyzed = true;
+      if (diagnosticPath && !_modelForExactPath(monaco.editor.getModels(), diagnosticPath)) {
+        const _got = await _modelForPath(diagnosticPath).catch(() => null);
+        if (_got && _got.created) {
+          _tempModel = _got.model;
+          // 语言服务是异步出结果的；不等就等于换一种方式返回空。
+          await new Promise((r) => setTimeout(r, 900));
+        } else if (!_got) {
+          _analyzed = false; // 文件读不到（已删/无权限）——别谎报"无错误"
+        }
+      }
       const collectMarkers = () => {
         try {
           if (diagnosticPath) {
@@ -47205,7 +47227,21 @@ async function _executeToolStepInner(step, call, root, run) {
       res.textContent = probs.length ? `${probs.length} 个问题` : "无错误/警告";
       if (vp) vp.innerHTML = `<pre>${_escHtml(formatted || "(无诊断)")}</pre>`;
       const note = refreshed ? "（已先刷新 IDE/LSP 项目缓存，过滤 package-lock/node_modules 等生成依赖文件噪声）" : "";
-      return { type: "diag", path: call.path, content: probs.length ? `诊断${note}（${probs.length} 个错误/警告，含原因与修法）:\n${formatted}` : `无错误或警告${note}（注意：LSP 分析可能略有延迟，改完稍等再查更准）。` };
+      // 临时 model 用完就销毁，但**销毁前必须清标记**——Monaco 只替 inMemory/internal/vscode
+      // 这几种 scheme 清，file: 是故意放过的，留着会在用户下次打开这个文件时被原样重绘。
+      if (_tempModel) {
+        try { _clearAllMarkersForModel(_tempModel); } catch {}
+        try { _tempModel.dispose(); } catch {}
+      }
+      if (probs.length) {
+        return { type: "diag", path: call.path, content: `诊断${note}（${probs.length} 个错误/警告，含原因与修法）:\n${formatted}` };
+      }
+      // 「没分析成」和「分析了没问题」是两件事，不能都说成"无错误"——前者说成后者就是在骗
+      // 调用方，而调用方正拿它当"已验证"的依据。
+      if (!_analyzed) {
+        return { type: "diag", path: call.path, content: `该文件未被语言服务分析（读不到内容或路径不存在），**不能据此认为没有问题**。请确认路径，或改用 run_cmd 跑项目自带的类型检查/测试。` };
+      }
+      return { type: "diag", path: call.path, content: `无错误或警告${note}（注意：LSP 分析可能略有延迟，改完稍等再查更准）。` };
 
     } else if (call.type === "current_time") {
       const now = new Date();
