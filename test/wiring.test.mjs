@@ -510,6 +510,47 @@ test("no NEW unreachable module appears under src/", async () => {
   }
 });
 
+test("施工请求不许被降级成反问：六处判题链和授权底线都要保持现状", () => {
+  const P = (n) => readFileSync(join(HERE, "../../server/prompts/" + n), "utf8");
+
+  // 「用户说做个 X 就直接做」这句话以前在整套提示里一次都没出现过，模型每轮只读到
+  // 「先判题 → 先调研 → 先问方向」。这六处是同一条链的六个副本，重复本身才是它起作用的原因，
+  // 所以任何一处退回去都要变红。
+  assert.doesNotMatch(P("agent_core.txt"), /physical actions, missing credentials/,
+    "缺密钥不是停下来找人的理由——Telegram bot 第一句话就缺 token");
+  assert.match(P("agent_core.txt"), /A missing key or token is never a reason to stop/);
+
+  assert.doesNotMatch(P("reasoning.txt"), /check whether a usable open-source implementation already exists/,
+    '「build me an X」是施工单，不是调研题');
+  assert.match(P("reasoning.txt"), /pick the mainstream stack from what you already know and start building/);
+
+  assert.doesNotMatch(SRC, /Without the user explicitly asking for it, do not change the workspace/,
+    "每轮契约要界定范围，而不是把装依赖/起服务整体列为未授权");
+  assert.doesNotMatch(SRC, /Agent 模式不是无条件全自动/, "「问一句」不该是并列出口");
+  assert.match(SRC, /用户说「写一个\/做一个\/搭一个\/接上 X」就是施工单/);
+  assert.doesNotMatch(SRC, /只有要引入新包（npm install react\/pnpm add xxx）才需要用户明确要实现\/安装/,
+    "功能需要的依赖属于实现本身");
+
+  // ask_user 的范例决定了它的实际用法：范例的指令密度远高于告诫句。
+  // 两份目录必须同步——运行时生效的是网关那份（见 MEMORY: 两套工具目录）。
+  const gw = JSON.parse(readFileSync(join(HERE, "../../server/prompts/tools.json"), "utf8"));
+  const askGw = gw.find((t) => t.function.name === "ask_user").function.description;
+  for (const [label, text] of [["网关", askGw], ["客户端", SRC]]) {
+    assert.doesNotMatch(text, /user says "build a login page" → ask/,
+      `${label}：ask_user 的范例不能教「收到施工请求就问框架」`);
+  }
+  assert.match(askGw, /A build request whose stack is unspecified is NOT ambiguous/);
+
+  // 授权底线一个字都不许少。放开自由度的同时把这五条一起"顺手简化"掉，才是真正会出事的改动。
+  const truth = P("truthfulness.txt");
+  for (const line of ["breaking into third parties", "stealing accounts",
+                      "bypassing payment/risk controls", "exfiltrating data", "persistent control"]) {
+    assert.ok(truth.includes(line), `授权底线缺失：${line}`);
+  }
+  // 补上的是禁令的对面，不是替代它。
+  assert.match(truth, /is ordinary engineering\. Build it, no preamble/);
+});
+
 test("the request-boundary markers the client emits are exactly the ones the gateway parses", () => {
   // The 📌 boundary is a wire protocol, not prompt text: main.js wraps the user's real request in
   // it, and prompts.rs slices the request back out of the surrounding project context. They are
