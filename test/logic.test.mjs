@@ -18399,6 +18399,74 @@ test("#53-2 并发预算共享：嵌套走同一个 _sess._subAgentsActive 上�
   assert.doesNotMatch(sub, /MAX_SUBAGENTS_PARALLEL \* /, "上限不得按层级乘倍放大");
 });
 
+test("多角色派发：被丢掉的角色必须告诉模型，并发上限说明要和真实上限一致", () => {
+  const map = load("_mapToolCall", {
+    _applyToolArgDefaults: undefined, _normalizeArgKeys: (a) => a, _STR_ARG_KEYS: new Set(),
+    _KNOWN_TOOLS: new Set(["spawn_multiple_agents"]), _canonicalToolName: () => "",
+    _mcpToolMap: new Map(), _finiteNumberArg: () => 0, _normPlanSteps: (x) => x,
+    _preferredLanguageCode: () => "en", _shellKind: () => "posix",
+    t: (k, params) => `${k}:${JSON.stringify(params || {})}`,
+  });
+
+  // 缺 focus 的项会被静默过滤。模型以为四个视角都派出去了，会照着"安全/性能/日志/架构都已
+  // 覆盖"下结论，而实际只跑了两个——这种沉默比派失败更糟。
+  const partial = map("spawn_multiple_agents", { task: "审计", agents: [
+    { role: "security", focus: "看鉴权" }, { role: "perf" },
+    { focus: "读日志" }, { role: "x", focus: "   " },
+  ] }, new Map());
+  assert.equal(partial.agents.length, 2, "缺 focus 的仍然要被过滤掉");
+  assert.equal(partial.dropped.length, 1);
+  assert.match(partial.dropped[0], /2 个.*focus 为空/);
+
+  // 超过单次上限的截断同理，也要说。
+  const many = map("spawn_multiple_agents", { task: "t",
+    agents: Array.from({ length: 8 }, (_, i) => ({ role: `r${i}`, focus: `f${i}` })) }, new Map());
+  assert.equal(many.agents.length, 5);
+  assert.match(many.dropped[0], /3 个.*上限/);
+
+  // 全部合法就不该有噪音。
+  assert.deepEqual(map("spawn_multiple_agents", { task: "t", agents: [{ role: "a", focus: "f" }] }, new Map()).dropped, []);
+
+  // 执行侧要真的把它拼进回执，否则记录了也没人看见。
+  assert.match(SRC, /Array\.isArray\(it\.call\.dropped\) && it\.call\.dropped\.length/,
+    "派发回执要带上丢弃说明");
+
+  // 工具描述里的并发上限必须和 MAX_SUBAGENTS_PARALLEL 一致。以前描述说"至多 2 个并发"而真实
+  // 上限是 4，等于一直在劝模型少扇出一半。
+  const cap = /MAX_SUBAGENTS_PARALLEL = (\d+)/.exec(SRC);
+  assert.ok(cap, "找不到并发上限常量");
+  assert.doesNotMatch(SRC, /at most 2 run concurrently/,
+    `描述与真实上限 ${cap[1]} 不符——这是在劝模型少用并行`);
+});
+
+test("子智能体的超时是真的会停，而且父侧读真值不掐表", () => {
+  const sub = extractFn("_runSubAgent");
+  // 只看真实代码：解释这段历史的注释里必然提到那个坏调用，不能被它绊到。
+  const subCode = sub.split("\n").filter((l) => !/^\s*(\/\/|\*|\/\*)/.test(l)).join("\n");
+
+  // 原来超时回调第一句是 _sess._cancelIds.set("subagent_timeout", true)，而 _cancelIds 两处
+  // 构造都是 new Set() —— Set 没有 .set，所以回调**第一句就抛 TypeError**，后面三行（渲染
+  // 超时状态、断开观察器）一行都不执行。而且那个键全文件零读者，就算调用成功也停不了循环。
+  assert.doesNotMatch(subCode, /_cancelIds\.set\(/, "Set 上没有 .set，这一句会让整个超时回调作废");
+  assert.doesNotMatch(subCode, /"subagent_timeout"/, "这个键从来没有读者");
+
+  // 超时必须能真的中断循环：以前子体的边界只有轮数和"父 run 结束"，没有墙钟。
+  assert.match(sub, /let _subTimedOut = false;/);
+  assert.match(sub, /_subTimedOut = true;/, "回调要置真值");
+  assert.match(sub, /if \(_subTimedOut \|\| Date\.now\(\) > _subDeadlineAt\) break;/,
+    "循环头要检查墙钟，否则陷在慢工具里的子体会一直烧到父轮结束");
+
+  // 子体自报超时，沿用父侧已有的 [ERROR] 前缀约定。
+  assert.match(sub, /_subTimedOut \? `\[TIMEOUT\] \$\{_out\}` : _out/);
+
+  // 父侧不许再按经过时间猜：一个正常跑了 6 分钟、简报完整的子体被打成"超时(部分结果)"，
+  // 主体会重派一遍同样的调研，再烧一份钱。
+  assert.doesNotMatch(SRC, /startedAt >= 5 \* 60 \* 1000/,
+    "不许掐表猜超时");
+  assert.equal((SRC.match(/\[TIMEOUT\\\]\/\.test\(job\.result\)/g) || []).length, 2,
+    "两条派发路径（spawn_multiple_agents 与 run_subagent）都要读真值");
+});
+
 test("并发槽位在每一条退出路径上都要还回去", () => {
   // _sess._subAgentsActive++ 紧挨着等待门（两者必须相邻才有原子性），而归还它的 finally
   // 属于两百多行之后才打开的 try。中间夹着两条没有任何保护的 return：只读模式挡 run_worker，

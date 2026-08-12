@@ -29272,7 +29272,7 @@ function _buildAgentToolSchemas(includeWrite, mcpTools = []) {
     { type: "function", function: { name: "current_time", description: "Get the current real date and time (year, month, day, weekday, hour, minute, second, timezone, Unix timestamp). Call it when you need to know today's date, the weekday, or the current time — do not guess from memory. The current time only tells you when this request was made; it does not prove that a web page, paper, price, version, market quote, or rule is current. A dynamic fact still requires reading the publication date, update time, version number, observation time, or quote time from the corresponding source.", parameters: { type: "object", properties: {} } } },
     { type: "function", function: { name: "think", description: "Record a short internal reasoning conclusion within this round, to clarify the goal, the assumptions and the next step before acting. Write only conclusions directly relevant to the current user request, and do not treat it as a reply addressed to the user.", parameters: { type: "object", properties: { thought: { type: "string", minLength: 1, description: "A short reasoning conclusion for the current decision" } }, required: ["thought"] } } },
     { type: "function", function: { name: "ask_user", description: "**When you genuinely cannot tell what the user wants, ask them with this — do not guess and barrel ahead.** It shows a card in the conversation: the few **predicted options (buttons)** you supply, plus a **free-text box** (the user types their own requirement) and \"let the AI decide\". The user clicks one, types their own, or hands it back to you; you continue once you have their answer.\n**Use it only when the intent is genuinely ambiguous and the different readings would produce very different things** — e.g. user says \"build a login page\" → ask 'Which sign-in method?' with options [email + password / SMS code / third-party OAuth / all of them]; user says \"optimize performance\" → ask 'Which part first?' with options [startup time / render jank / bundle size / memory].\n**Never ask about anything you can reasonably infer, or about mere implementation detail (which variable name, which file) — just do it.** Users hate being stopped for nothing. This tool is for \"what should I build\", not \"may I continue\".\n**Ordering rule: when the ambiguity is about direction, ask_user always comes before update_plan** — settle the direction, then plan. The system will never block your ask_user for \"there is no plan yet\".", parameters: { type: "object", properties: { question: { type: "string", description: "The specific clarifying question to put to the user (one sentence)" }, options: { type: "array", description: "2-4 answers you predict (each a few words), rendered as buttons for the user to pick; they can also skip them and type their own", items: { type: "string" } }, recommended: { type: "integer", description: "Index of the recommended option (0-based); that option is highlighted as recommended" }, multi_select: { type: "boolean", description: "true = multi-select mode (checkboxes; the user can pick several options and submit them together)" }, confirm_text: { type: "string", description: "Confirmation for a dangerous operation: once set, the user must type this text exactly into the box to continue (e.g. DELETE)" } }, required: ["question"] } } },
-    { type: "function", function: { name: "run_subagent", description: "Use only in structured-collaboration mode, for heavyweight research that needs broad coverage or an independent perspective. staged_roles first dispatches read-only roles such as architect/product/research/security to converge the architecture, product, evidence, and security contracts; an ordinary focused investigation is faster and cheaper if the main agent just reads it. A sub-report must give its evidence, the boundaries of its conclusion, the delivery contract, and the next step. 【vs alternatives】For parallel implementation that changes files use run_worker; to dispatch several read-only roles at once use spawn_multiple_agents; for a single focused investigation the main agent reading/searching directly is faster — do not dispatch.", parameters: { type: "object", properties: { description: { type: "string", description: "Short description of the subtask (3-6 words)" }, role: { type: "string", enum: ["architect", "product", "research", "frontend", "backend", "database", "security", "test", "devops", "design", "docs"], description: "A read-only specialist perspective. When the architecture, product, or security boundary is undecided, use architect/product/security first to converge the contract; other roles investigate their domain." }, prompt: { type: "string", description: "The complete, self-contained read-only task statement: the evidence to check, the contract to deliver, the paths/symbols involved, and the next step." }, tasks: { type: "array", minItems: 1, maxItems: 4, description: "Optional · dispatch several at once: send multiple read-only subtasks in one call (up to 4; at most 2 run concurrently and the rest queue, each with its own card, merged into one report on completion). Each entry is {role, task}; when dispatching only one subtask, omit this and use prompt.", items: { anyOf: [{ type: "string" }, { type: "object", properties: { task: { type: "string" }, role: { type: "string", enum: ["architect", "product", "research", "frontend", "backend", "database", "security", "test", "devops", "design", "docs"] } }, required: ["task"] }] } }, wait: { type: "boolean", description: "Optional, default false = background job: returns job#N immediately, the main agent keeps working, and the result is delivered when ready (or await it with await_subagent). true = wait synchronously for the result before continuing." } }, required: ["description"], anyOf: [{ required: ["prompt"] }, { required: ["tasks"] }] } } },
+    { type: "function", function: { name: "run_subagent", description: "Use only in structured-collaboration mode, for heavyweight research that needs broad coverage or an independent perspective. staged_roles first dispatches read-only roles such as architect/product/research/security to converge the architecture, product, evidence, and security contracts; an ordinary focused investigation is faster and cheaper if the main agent just reads it. A sub-report must give its evidence, the boundaries of its conclusion, the delivery contract, and the next step. 【vs alternatives】For parallel implementation that changes files use run_worker; to dispatch several read-only roles at once use spawn_multiple_agents; for a single focused investigation the main agent reading/searching directly is faster — do not dispatch.", parameters: { type: "object", properties: { description: { type: "string", description: "Short description of the subtask (3-6 words)" }, role: { type: "string", enum: ["architect", "product", "research", "frontend", "backend", "database", "security", "test", "devops", "design", "docs"], description: "A read-only specialist perspective. When the architecture, product, or security boundary is undecided, use architect/product/security first to converge the contract; other roles investigate their domain." }, prompt: { type: "string", description: "The complete, self-contained read-only task statement: the evidence to check, the contract to deliver, the paths/symbols involved, and the next step." }, tasks: { type: "array", minItems: 1, maxItems: 4, description: "Optional · dispatch several at once: send multiple read-only subtasks in one call (up to 4; all 4 run concurrently, each with its own card, merged into one report on completion). Each entry is {role, task}; when dispatching only one subtask, omit this and use prompt.", items: { anyOf: [{ type: "string" }, { type: "object", properties: { task: { type: "string" }, role: { type: "string", enum: ["architect", "product", "research", "frontend", "backend", "database", "security", "test", "devops", "design", "docs"] } }, required: ["task"] }] } }, wait: { type: "boolean", description: "Optional, default false = background job: returns job#N immediately, the main agent keeps working, and the result is delivered when ready (or await it with await_subagent). true = wait synchronously for the result before continuing." } }, required: ["description"], anyOf: [{ required: ["prompt"] }, { required: ["tasks"] }] } } },
     { type: "function", function: { name: "await_subagent", description: "Wait for a background subagent job to finish and collect its result. Use it when you cannot continue without the sub-report; with no jobs running it returns a summary of the current job ledger. 【vs alternatives】To dispatch an investigation use run_subagent / spawn_multiple_agents.", parameters: { type: "object", properties: { job: { type: "string", description: "The job number (e.g. 3) or all, default all" } }, required: [] } } },
     { type: "function", function: { name: "spawn_multiple_agents", description: "**Dispatch several role-based subagents concurrently in one call** (asynchronous and in the background, while the main flow continues). Suited to a large task needing several perspectives at once: research-type roles (research/security/architect and so on) gather evidence independently and their results are delivered when ready, or you can join them with await_subagent. With shared_store collaboration enabled, each subagent's findings are broadcast to the others automatically, avoiding duplicated research. ⚠️ Do not use it for a single focused investigation — the main agent reading directly is faster; for parallel implementation that writes files use run_worker.", parameters: { type: "object", properties: { task: { type: "string", description: "The overall task description (shared background for every agent)" }, agents: { type: "array", minItems: 1, maxItems: 5, items: { type: "object", properties: { role: { type: "string", enum: ["architect", "product", "research", "frontend", "backend", "database", "security", "test", "devops", "design", "docs"], description: "A read-only specialist perspective" }, focus: { type: "string", description: "This agent's focused subtask (self-contained — it cannot see the conversation history)" } }, required: ["role", "focus"] }, description: "2-5 parallel subagent definitions" }, collaboration: { type: "string", enum: ["shared_store", "independent"], description: "Default shared_store = findings are broadcast between agents; independent = fully isolated" } }, required: ["task", "agents"] } } },
     { type: "function", function: { name: "research_project", description: "Dispatch a read-only subagent to map the stack, core responsibilities, data flow and change entry points — only when the user explicitly asks for a full codebase onboarding map, or the task genuinely spans several unknown modules and the existing project tree and symbol map cannot pin down the entry point. Do not call it when the target file or module is already clear — read_file the relevant source and its callers directly — and do not treat it as a fixed preamble to every task. Optionally use focus to concentrate on one area (such as the authentication flow, the data layer, or build and release).", parameters: { type: "object", properties: { focus: { type: "string", description: "Optional; the direction to dig into (e.g. \"the authentication flow\", \"the data layer\", \"build and deployment\"); omit = a whole-project overview" }, wait: { type: "boolean", description: "Optional, default false = a background job returning job#N immediately; true = wait synchronously for the result." } }, required: [] } } },
@@ -30519,11 +30519,19 @@ function _mapToolCall(name, args, mcpToolMap = _mcpToolMap) {
     }
         case "spawn_multiple_agents": {
           // 批量并发派发：容错解析 agents 数组（每项 {role, focus}），上限 5 个，缺 focus 的项丢弃。
-          const _agents = (Array.isArray(args.agents) ? args.agents : [])
-            .map((a) => ({ role: String(a?.role || "research"), focus: String(a?.focus || a?.task || a?.prompt || "").trim() }))
-            .filter((a) => a.focus)
-            .slice(0, 5);
-          return { type: "spawnmulti", path: t("subagent.concurrent", { count: _agents.length }), task: String(args.task || ""), agents: _agents, collaboration: args.collaboration === "independent" ? "independent" : "shared_store" };
+          const _rawAgents = (Array.isArray(args.agents) ? args.agents : [])
+            .map((a) => ({ role: String(a?.role || "research"), focus: String(a?.focus || a?.task || a?.prompt || "").trim() }));
+          const _agents = _rawAgents.filter((a) => a.focus).slice(0, 5);
+          // 丢掉的角色必须报回去。缺 focus 的项被静默过滤，模型却以为四个视角都派出去了——
+          // 它会照着"已覆盖安全/性能/日志/架构"去写结论，而实际只跑了其中两个。
+          // 超过 5 个的同理：截断也要说。
+          const _dropped = [
+            ...(_rawAgents.length - _rawAgents.filter((a) => a.focus).length
+              ? [`${_rawAgents.length - _rawAgents.filter((a) => a.focus).length} 个因为 focus 为空被丢弃`] : []),
+            ...(_rawAgents.filter((a) => a.focus).length > 5
+              ? [`${_rawAgents.filter((a) => a.focus).length - 5} 个超出单次 5 个上限被截断`] : []),
+          ];
+          return { type: "spawnmulti", path: t("subagent.concurrent", { count: _agents.length }), task: String(args.task || ""), agents: _agents, dropped: _dropped, collaboration: args.collaboration === "independent" ? "independent" : "shared_store" };
         }
     case "research_project": return { type: "subagent", path: t("subagent.researchProject"), description: (args.focus && String(args.focus).trim()) ? t("subagent.researchFocus", { focus: String(args.focus).trim().slice(0, 12) }) : t("subagent.researchProject"), prompt: _RESEARCH_PROMPT(args.focus || args.area || args.target || ""), wait: !!args.wait };
     case "design_research": return { type: "subagent", path: "设计调研", description: "设计+UI架构调研", prompt: _DESIGN_RESEARCH_PROMPT(args.goal || args.focus || args.target || args.description || ""), wait: !!args.wait };
@@ -38445,8 +38453,20 @@ async function _runSubAgent({ config, description, prompt, root, container, run,
   const _parentRemainMs = (run && Number.isFinite(run._subDeadline)) ? (run._subDeadline - Date.now()) : SUBAGENT_TIMEOUT_MS;
   const _subTimeoutMs = Math.max(1000, Math.min(SUBAGENT_TIMEOUT_MS, _parentRemainMs));
   const _subDeadlineAt = Date.now() + _subTimeoutMs;
+  /**
+   * 子智能体是否已经超时。**这是唯一的真值**——父侧不要再按经过时间去猜。
+   *
+   * 原来第一行是 `_sess._cancelIds.set("subagent_timeout", true)`，而 `_cancelIds` 两处构造
+   * （19839、36816）都是 `new Set()`——Set 没有 `.set`，所以这个回调**第一句就抛 TypeError**，
+   * 后面三行（渲染超时状态、断开观察器）一行都不执行。而且 `"subagent_timeout"` 这个键全文件
+   * 只出现那一次，零读者，就算调用成功也停不了循环。
+   *
+   * 净效果：**子智能体根本没有墙钟上限**。它唯一的边界是 12/18 轮和父 run 结束，而提示词还在
+   * 告诉模型"内部 5 分钟超时会自行终止"。
+   */
+  let _subTimedOut = false;
   const timeoutId = setTimeout(() => {
-    if (_sess && _sess._cancelIds) _sess._cancelIds.set("subagent_timeout", true);
+    _subTimedOut = true;
     res.className = "atc-result atc-result--timeout";
     res.textContent = "⏱ [超时终止·已保留部分结果]";
     if (_vpObserver) { try { _vpObserver.disconnect(); } catch {} }
@@ -38763,6 +38783,10 @@ async function _runSubAgent({ config, description, prompt, root, container, run,
   try {
     for (let i = 0; i < SUB_MAX; i++) {
       if (!_live()) break;
+      // 墙钟上限。以前只有轮数上限（读 12 / 写 18）和"父 run 结束"两道边界，超时回调因为第一句
+      // 抛异常从来没起过作用——一个陷在慢工具里的子体可以一直跑到父轮结束，而父侧最多等 5.5 分钟
+      // 就放弃，于是它变成一个没人收割、还在烧钱的幽灵。
+      if (_subTimedOut || Date.now() > _subDeadlineAt) break;
       if (collaboration?.shared) {
         const inbox = _drainSubAgentCollaborationInbox(
           collaboration.store || _globalSharedStore,
@@ -39008,7 +39032,14 @@ async function _runSubAgent({ config, description, prompt, root, container, run,
     run.ctx.findings.push(`【${write ? "worker" : "子"}:${String(description || "").slice(0, 24)}】${_clipPreservingErrors(report.replace(/\s+/g, " "), 1200)}`);
     if (run.ctx.findings.length > 60) run.ctx.findings.splice(0, run.ctx.findings.length - 60); // P0.1: 从 40 扩大到 60
   }
-  return report || (write ? "（worker 未产出简报）" : "（子智能体未产出简报）");
+  const _out = report || (write ? "（worker 未产出简报）" : "（子智能体未产出简报）");
+  // 真的超时了就在简报前面挂个标记，沿用父侧已有的 `[ERROR]` 前缀约定。
+  //
+  // 父侧原来是按经过时间猜的（`Date.now() - job.startedAt >= 5min` → status = "timeout"），
+  // 而子体的超时回调因为第一句抛异常从来没生效过——于是一个正常跑了 6 分钟、**简报完整**的
+  // 调研子体会被打上"超时(部分结果)"，主智能体据此要么重派一遍同样的调研（再烧一份子体的
+  // 钱），要么在最终答案里含糊其辞。报告没问题，只有标签是错的。
+  return _subTimedOut ? `[TIMEOUT] ${_out}` : _out;
 }
 
 function _verificationCommandsForStack(stack) {
@@ -42568,7 +42599,9 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
             }).then((report) => {
               job.result = String(report || "").slice(0, 12000);
               if (!_smLive()) { job.status = "cancelled"; job.consumed = true; }
-              else if (Date.now() - job.startedAt >= 5 * 60 * 1000) job.status = "timeout";
+              // 读子体自己报的真值，不再按经过时间猜——子体超时会在简报前挂 [TIMEOUT]。猜错的代价是
+              // 把一份完整报告标成「超时(部分结果)」，主体据此重派一遍，再烧一份子体的钱。
+              else if (/^\[TIMEOUT\]/.test(job.result)) job.status = "timeout";
               else if (/^\[ERROR\]/.test(job.result)) job.status = "failed";
               else job.status = "done";
               try {
@@ -42608,7 +42641,12 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
               run._collabMainJobId = _mainJobId;
             } catch {}
           }
-          const message = `[已并发派发 ${_smJobs.length} 个子智能体] ${_smJobs.map((id) => `job#${id}`).join("、")}（协同模式：${_smShared ? "shared_store 发现互相广播 + lead_follower 主从协调" : "independent 完全隔离"}）。它们在后台并行工作，你继续推进当前任务的其他步骤；结果就绪后自动送达，也可用 await_subagent(job="all") 汇合。`;
+          // 被丢掉的角色必须说出来。参数映射会静默过滤 focus 为空的项，而模型这边以为四个视角
+          // 都派出去了——它会照着"安全/性能/日志/架构都已覆盖"去下结论，实际只跑了其中两个。
+          const _dropNote = Array.isArray(it.call.dropped) && it.call.dropped.length
+            ? `\n⚠ 你给的角色里有 ${it.call.dropped.join("；")}——这些视角**没有**被派出去。需要的话补上 focus 重新派一次，不要当成已经覆盖。`
+            : "";
+          const message = `[已并发派发 ${_smJobs.length} 个子智能体] ${_smJobs.map((id) => `job#${id}`).join("、")}（协同模式：${_smShared ? "shared_store 发现互相广播 + lead_follower 主从协调" : "independent 完全隔离"}）。它们在后台并行工作，你继续推进当前任务的其他步骤；结果就绪后自动送达，也可用 await_subagent(job="all") 汇合。${_dropNote}`;
           it.rawResult = { type: "spawnmulti", path: it.call.path || t("subagent.concurrent", { count: _smJobs.length }), content: message };
           return message;
         }
@@ -42669,7 +42707,9 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
           ).then((report) => {
             job.result = String(report || "").slice(0, 12000);
             if (!_jobLive()) { job.status = "cancelled"; job.consumed = true; }
-            else if (Date.now() - job.startedAt >= 5 * 60 * 1000) job.status = "timeout"; // 与 SUBAGENT_TIMEOUT_MS 同窗口：超时终止后带回的是部分结果
+            // 读子体自己报的真值，不再按经过时间猜——子体超时会在简报前挂 [TIMEOUT]。猜错的代价是
+            // 把一份完整报告标成「超时(部分结果)」，主体据此重派一遍，再烧一份子体的钱。
+            else if (/^\[TIMEOUT\]/.test(job.result)) job.status = "timeout";
             else if (/^\[ERROR\]/.test(job.result)) job.status = "failed";
             else job.status = "done";
             return job.result;
