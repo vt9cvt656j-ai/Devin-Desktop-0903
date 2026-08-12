@@ -13525,6 +13525,8 @@ body.tree-selecting, body.tree-selecting * { user-select: none !important; -webk
 
 /* ---- Rich composer (contenteditable): #prompt is now a div, so style it directly ---- */
 #prompt {
+  /* 灰字预测用绝对定位铺在这上面（见下面的 [data-suggest] 规则），需要一个定位上下文。 */
+  position: relative;
   width: 100%; box-sizing: border-box;
   font-family: var(--font); font-size: 13.5px; line-height: 1.5;
   color: var(--text); background: transparent;
@@ -13545,8 +13547,26 @@ body.tree-selecting, body.tree-selecting * { user-select: none !important; -webk
 #prompt.is-empty[data-suggest]::before {
   content: attr(data-suggest);
   color: var(--text-dim); pointer-events: none; cursor: text;
-  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  /* **绝对定位，不占布局流。** 用户还没按 Tab，这段内容并不真实存在——它一旦参与排版，
+     光标就会被挤到灰字**后面**（两行的预测把光标顶到第三行去），看上去像是输入框里
+     已经有了内容。脱离布局流之后，光标始终停在最开头的第 0 位，灰字只是铺在上面。
+     位置和 #prompt 的 padding 对齐，字体排版也照抄本体，Tab 补全后文字不会跳位。 */
+  position: absolute; left: 12px; right: 12px; top: 10px;
+  white-space: pre-wrap; overflow-wrap: break-word; word-break: break-word;
+}
+/* 撑高用的隐藏副本。
+ *
+ * 上面那条脱离了布局流，所以两行的预测会溢出到输入框外面。这条放同样的文字、
+ * 但**不可见**，只负责把输入框撑到刚好放得下的高度。
+ *
+ * 关键在于它是 ::after：生成内容排在元素内容**之后**，而光标停在开头的第 0 位，
+ * 所以它撑得开框、却推不动光标——这正是 ::before 做不到的（它排在内容之前，
+ * 一参与排版就把光标顶到下一行去）。 */
+#prompt.is-empty[data-suggest]::after {
+  content: attr(data-suggest);
+  visibility: hidden; pointer-events: none;
   display: block; max-width: 100%;
+  white-space: pre-wrap; overflow-wrap: break-word; word-break: break-word;
 }
 /* A dragged-in @-reference as a REAL inline card (Google-light pill: icon + name, atomic). */
 .composer-chip {

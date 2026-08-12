@@ -18219,6 +18219,11 @@ function showChatHint() {
 // Recompute the starters when context changes (file switch, git, diagnostics, selection) — only while
 // the active chat has no messages. Touches only the chip row (no logo/title flash); skips if unchanged.
 function _refreshChatHintIfEmpty() {
+  // 输入框的预测必须排在下面那个早退**之前**。那个早退是给"空会话提示卡"用的：容器里
+  // 一有消息就永远返回。而预测恰恰是在有历史、用户盯着空输入框时最有用。
+  // 这里也是启动时的兜底：打开软件那一刻编辑器/诊断/当前文件可能都还没就绪，
+  // 一次性算出 null 之后如果没人再算，用户就会看到"有上下文却没有预测"。
+  try { _renderComposerGhost(); } catch {}
   try {
     const s = (typeof _currentSession === "function") ? _currentSession() : null;
     const container = (s && s.container) || chatEl;
@@ -22543,9 +22548,11 @@ async function _maybeSuggestNext(sess, messages, config) {
 // 而且用户点名的第一个触发时机是"打开软件"——那时候根本没有对话可读。
 // ---------------------------------------------------------------------------
 
-// 灰字最多多长。计划步骤的 content 是模型写的、没有上限，不截断会在
-// max-height:168px 的输入框里换行，让整个框每次刷新都跳一下。
-const _GHOST_MAX_CHARS = 42;
+// 灰字显示的就是 Tab 之后会填进去的**那一段原文**，所见即所得——不再显示短标签。
+// 短标签当初是为了不撑高输入框，但那样用户在按下 Tab 之前不知道会被填进什么，
+// 补全出来的详细内容显得很突兀。输入框本来就有 max-height:168px 加滚动，
+// 撑不坏；这个上限只挡病态长度（计划步骤的 content 是模型写的、没有上限）。
+const _GHOST_MAX_CHARS = 400;
 function _composerGhostText(raw) {
   const one = String(raw || "").replace(/\s+/g, " ").trim();
   return one.length > _GHOST_MAX_CHARS ? one.slice(0, _GHOST_MAX_CHARS - 1) + "…" : one;
@@ -22569,6 +22576,15 @@ function _composerGhostEligible(st) {
 /// 排序理由：构建挂了压过下一个计划步骤；活着的 _planSteps 压过 _lastRunState 里的
 /// 计划快照（快照是一轮结束那一刻的，之后 _planSteps 还在变）；恢复的旧运行状态排在
 /// 最后但必须有，否则"打开软件"这一档永远是空的。
+/// 这条预测是不是用户刚发过的。归一化后比对：Tab 补全填进去的是原文，
+/// 用户偶尔会改两个字再发，所以取前 24 个字比，而不是要求完全相等。
+function _predictionAlreadyUsed(sess, send) {
+  const norm = (x) => String(x || "").replace(/\s+/g, "").slice(0, 24);
+  const key = norm(send);
+  if (!key) return false;
+  return (sess?._recentSent || []).some((prev) => norm(prev) === key);
+}
+
 function _composerPrediction(sess) {
   if (!sess) return null;
   const run = sess._lastRunState || null;
@@ -22579,26 +22595,29 @@ function _composerPrediction(sess) {
   const fresh = _runStateNextActionSuggestions(sess);
   const planShaped = String(run?.incompleteReason || "").startsWith("plan_steps_pending");
   if (fresh.length && (run?.outcome === "failed" || !planShaped)) {
-    return { src: "run", text: fresh[0].label, send: fresh[0].send };
+    if (!_predictionAlreadyUsed(sess, fresh[0].send)) return { src: "run", text: fresh[0].label, send: fresh[0].send };
   }
 
   const steps = Array.isArray(sess._planSteps) ? sess._planSteps : [];
   const step = steps.find((x) => x?.status === "in_progress") || steps.find((x) => x?.status === "pending");
   if (step && step.content) {
     // 只取 in_progress / pending：cancelled 是用户明确否掉的，再提一次比不提更糟。
-    return { src: "plan", text: "继续：" + step.content, send: "继续：" + step.content };
+    const _stepSend = "继续：" + step.content;
+    if (!_predictionAlreadyUsed(sess, _stepSend)) return { src: "plan", text: _stepSend, send: _stepSend };
   }
 
-  if (fresh.length) return { src: "run", text: fresh[0].label, send: fresh[0].send };
+  if (fresh.length && !_predictionAlreadyUsed(sess, fresh[0].send)) return { src: "run", text: fresh[0].label, send: fresh[0].send };
 
   const old = _runStateNextActionSuggestions(sess, { maxAgeMs: Infinity });
   if (old.length) {
-    return { src: "resume", text: "继续上次：" + old[0].label, send: old[0].send };
+    if (!_predictionAlreadyUsed(sess, old[0].send)) return { src: "resume", text: "继续上次：" + old[0].label, send: old[0].send };
   }
 
   try {
-    const ctx = _dynamicChatChips();
-    if (ctx && ctx.length) return { src: "ctx", text: ctx[0].label, send: ctx[0].send };
+    // 上下文预测器给的是一排候选，跳过刚发过的那些，取第一条还没做过的。
+    const ctx = _dynamicChatChips() || [];
+    const fresh = ctx.find((c) => c && c.send && !_predictionAlreadyUsed(sess, c.send));
+    if (fresh) return { src: "ctx", text: fresh.label, send: fresh.send };
   } catch {}
   return null;
 }
@@ -22625,8 +22644,11 @@ function _renderComposerGhost() {
     // _planSteps 在一轮结束后还继续变——快照会变成"陈旧且错误"，比陈旧更糟。
     const p = _composerPrediction(sess);
     if (!p || !p.text || !p.send) return _clearComposerGhost();
-    if (sess._ghostDismissKey === p.text) return _clearComposerGhost(); // 这条被 Esc 关过
-    const text = _composerGhostText(p.text);
+    // 用 send 当键，不用 text：text 只是给卡片行用的短标签，各来源的 label 和 send 本来就不
+    // 相等，拿它比对等于这条静音永远命中不了，Esc 关掉后下一次输入就又弹回来。
+    if (sess._ghostDismissKey === p.send) return _clearComposerGhost(); // 这条被 Esc 关过
+    // 显示 send（Tab 真正填进去的原文），不显示 label（那只是给卡片行用的短名字）。
+    const text = _composerGhostText(p.send);
     _composerGhost = { sid: sess.id, text, send: p.send };
     if (promptEl.getAttribute("data-suggest") !== text) promptEl.setAttribute("data-suggest", text);
   } catch { _clearComposerGhost(); }
@@ -23221,6 +23243,10 @@ async function sendPrompt(text, attachments = [], readyConfig = null) {
   // 用户发了新消息，自己那条都不滚进视野。现在只有一个状态位，改不出不一致。
   // 只对当前标签生效：sendPrompt 也可能被后台标签驱动，那时不该抢用户正在看的这屏。
   if (sess === _currentSession()) _repinChat();
+  // 记下发出去的原话：预测不能再推一遍用户刚做完的事。上下文预测器（打开的文件 /
+  // 诊断 / git）是无状态的，它不知道刚才发生过什么——"解释 database.py" 发完、模型
+  // 答完，它照样把同一句再推一次，看着就像预测从来不更新。
+  try { sess._recentSent = [text, ...(sess._recentSent || [])].slice(0, 5); } catch {}
   addMessage("user", text, sess, attachments);
   // 直接把「真正的助手消息壳」（头像+消息框+思考卡）提前上屏——和流式开始时那张是同一张，
   // 而不是先塞一个裸转圈占位（没有消息框结构、跟上文挤在一起，1-2 秒后又被真卡替换）。
@@ -56884,12 +56910,35 @@ function _makeComposerChip(rel, kind = "file", labelText = "") {
   chip.appendChild(nameEl);
   return chip;
 }
+/// 输入框逻辑上空了、但 DOM 里还留着东西时，把它彻底清干净并把光标放回第 0 位。
+///
+/// contentEditable 的删除不会把节点删净：全选删掉之后浏览器通常留下一个 <br>，
+/// Tab 补全过再删更是如此。序列化出来是空字符串（所以 .is-empty 成立、灰字照常显示），
+/// 可光标停在那个 <br> **后面** —— 于是灰字在第一行、光标在第二行，正是"Tab 之后
+/// 删掉内容，光标又跑到末尾并换行"的成因。
+function _normalizeEmptyComposer() {
+  try {
+    if (_ceSerialize(promptEl).trim()) return;              // 真有内容，别动
+    if (!promptEl.childNodes.length) return;                // 已经是干净的空
+    if (typeof _droppedRefs !== "undefined" && _droppedRefs && _droppedRefs.length) return;
+    promptEl.textContent = "";
+    if (document.activeElement !== promptEl) return;         // 没聚焦就不碰光标
+    const sel = window.getSelection();
+    const range = document.createRange();
+    range.setStart(promptEl, 0);
+    range.collapse(true);
+    sel.removeAllRanges();
+    sel.addRange(range);
+  } catch {}
+}
+
 promptEl.addEventListener("input", () => {
   // 用户一开始打字，预测立刻作废——不能让一条稍晚落地的预测把已输入的内容冲掉。
   // 先清再重算，两步都要：清是同步的，保证这一刻不可能 Tab 到一条陈旧预测；
   // 重算是为了用户把输入框**清空之后**预测能回来（否则清一次就再也不出现了）。
   // _renderComposerGhost 自己会判定资格，输入框非空时它只会再清一次，不会误显示。
   _clearComposerGhost();
+  _normalizeEmptyComposer();
   _cePlaceholder();
   try { _renderComposerGhost(); } catch {}
 });
@@ -58582,6 +58631,10 @@ promptEl.addEventListener("keydown", (e) => {
 });
 promptEl.addEventListener("blur", () => setTimeout(_hideSlash, 150));
 
+// 用户把光标点进输入框，就是他"正要说点什么"的那一刻——此时必须有预测可看。
+// 这也是所有时序问题的兜底：不管启动时算没算出来，聚焦时一定会再算一次。
+promptEl.addEventListener("focus", () => { try { _renderComposerGhost(); } catch {} });
+
 // ---- 预测的接受（Tab）与关闭（Esc）。
 //
 // 必须注册在 @文件菜单（上面第二个 keydown）和斜杠菜单（第三个）**之后**：它们各自
@@ -58592,7 +58645,7 @@ promptEl.addEventListener("keydown", (e) => {
   if (e.key === "Escape") {
     if (!_composerGhost) return; // 没有预测就别抢 Esc，上面还有停止/遮罩要用
     const sess = _currentSession();
-    if (sess) sess._ghostDismissKey = _composerGhost.text; // 只静音这一条，换一条还会出
+    if (sess) sess._ghostDismissKey = _composerGhost.send; // 只静音这一条，换一条还会出
     e.preventDefault();
     _clearComposerGhost();
     return;
@@ -61065,7 +61118,13 @@ Promise.all([
 showChatHint();
 syncWelcome();
 restoreChatHistory()
-  .then(() => { try { _renderComposerGhost(); } catch {} }) // 打开软件 → 接着上次继续
+  // 打开软件 → 接着上次继续。算三次而不是一次：会话历史恢复完的那一刻，编辑器、
+  // 诊断标记、当前文件路径都可能还没就绪，此时算出来是空的，而空了之后没有任何
+  // 东西会再算——用户看到的就是"明明有上下文，却没有预测"。
+  // 后两次是纯本地计算（没有网络、没有模型调用），代价可以忽略。
+  .then(() => {
+    for (const delay of [0, 400, 1500]) setTimeout(() => { try { _renderComposerGhost(); } catch {} }, delay);
+  })
   .catch(console.warn);
 startIdeUpdateChecks();
 
