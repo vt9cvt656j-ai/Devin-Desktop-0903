@@ -6507,6 +6507,9 @@ button.agent-plan__fold--toggle:focus-visible { outline: 2px solid #1a73e8; outl
   margin: 0;
   max-height: 280px;
   overflow: auto;
+  /* 滚到这张卡的尽头时不要把滚动链传给外层 .chat：那会被判成一次真实的
+     人类滚动意图，进而解除钉底。滚动事件本身不冒泡，wheel 链是唯一的耦合。 */
+  overscroll-behavior: contain;
   white-space: pre-wrap;
   word-break: break-word;
   border-top: 1px solid var(--atc-border);
@@ -6607,7 +6610,7 @@ button.agent-plan__fold--toggle:focus-visible { outline: 2px solid #1a73e8; outl
 /* Diff rows — Cursor-style unified diff */
 .atc-diff {
   font-family: var(--atc-mono); font-size: 12px;
-  max-height: 280px; overflow: auto;
+  max-height: 280px; overflow: auto; overscroll-behavior: contain;
   background: var(--atc-bg);
 }
 .atc-diff-header {
@@ -6848,12 +6851,12 @@ button.agent-plan__fold--toggle:focus-visible { outline: 2px solid #1a73e8; outl
   animation: atcSlideUp .2s ease both;
 }
 .code-card--streaming .code-card__body {
-  max-height: 300px; overflow-y: auto;
+  max-height: 300px; overflow-y: auto; overscroll-behavior: contain;
 }
 /* 定格后（已生成 · 等待执行）维持同样的高度上限：摘掉 streaming 类的同时卡体不得
    全高铺成裸代码墙（卡头被顶出屏幕 = 用户感知“没渲染成写入卡片”）。 */
 .code-card--settled .code-card__body {
-  max-height: 300px; overflow-y: auto;
+  max-height: 300px; overflow-y: auto; overscroll-behavior: contain;
 }
 
 /* Same treatment for a code block that is still streaming inside the markdown tail.
@@ -6862,7 +6865,7 @@ button.agent-plan__fold--toggle:focus-visible { outline: 2px solid #1a73e8; outl
    viewport-sized window keeps that cost flat; once streaming ends the tail is removed
    and the settled card renders at full height as before. */
 .md-stream-tail .code-card__body {
-  max-height: 300px; overflow-y: auto;
+  max-height: 300px; overflow-y: auto; overscroll-behavior: contain;
 }
 .code-card__streaming-meta {
   display: flex; align-items: center; gap: 6px;
