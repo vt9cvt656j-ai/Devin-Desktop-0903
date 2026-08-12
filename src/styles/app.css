@@ -10728,6 +10728,14 @@ button.agent-plan__fold--toggle:focus-visible { outline: 2px solid #1a73e8; outl
   border-right: 1px solid var(--feature-border);
   background: var(--feature-rail);
 }
+/* 偏好设置与开发工具之间的分隔。这两组东西性质不同：上面是设置，下面是任务运行器、
+   调试器、合并冲突这类工具面板。 */
+.feature-tab__sep {
+  height: 1px;
+  margin: 6px 10px;
+  background: var(--border, rgba(255, 255, 255, 0.08));
+}
+
 .feature-tab {
   position: relative;
   width: 100%;

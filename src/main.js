@@ -52746,14 +52746,35 @@ function renderSkillsTool(body) {
   loadMarket();
 }
 
+/**
+ * 这个面板承载两类东西：偏好设置，和几个**开发工具**面板。
+ *
+ * 工具那一组（任务运行器、调试器、合并冲突、语言服务、工作区、远程）以前只写了渲染函数，
+ * 却从没登记到这张表里。而 `normalizeFeatureTab` 对认不出的 id 一律回落成 "settings" ——
+ * 于是命令面板里那 6 条命令、以及状态栏那个写着「Click for logs」的语言服务器指示器，
+ * 点下去全部打开「设置」。不报错、不打日志，就是开错面板。
+ *
+ * 压在这条回落分支下面的是已经写完并且后端齐备的能力：700 行的任务发现（npm scripts /
+ * Cargo / Makefile / .vscode/tasks.json，带沙箱和超时）一次都没被执行过；一个三方合并冲突
+ * 解决器（基准/我方/对方 + 可编辑合并区）从来没被打开过；调试器面板里那个「自定义适配器
+ * 命令」是 C/C++/Rust 用户唯一的调试入口。
+ *
+ * `group` 只影响标签条的分隔线，不影响可达性。
+ */
 const FEATURE_TABS = [
-  { id: "settings", titleKey: "feature.tab.settings", icon: "i-gear" },
-  { id: "appearance", titleKey: "feature.tab.appearance", icon: "i-appearance" },
-  { id: "growth", titleKey: "feature.tab.growth", icon: "i-growth" },
-  { id: "adaptive", titleKey: "feature.tab.adaptive", icon: "i-adaptive" },
-  { id: "shortcuts", titleKey: "feature.tab.shortcuts", icon: "i-command" },
-  { id: "mcp", titleKey: "feature.tab.mcp", icon: "i-mcp" },
-  { id: "skills", titleKey: "feature.tab.skills", icon: "i-skills" },
+  { id: "settings", titleKey: "feature.tab.settings", icon: "i-gear", group: "prefs" },
+  { id: "appearance", titleKey: "feature.tab.appearance", icon: "i-appearance", group: "prefs" },
+  { id: "growth", titleKey: "feature.tab.growth", icon: "i-growth", group: "prefs" },
+  { id: "adaptive", titleKey: "feature.tab.adaptive", icon: "i-adaptive", group: "prefs" },
+  { id: "shortcuts", titleKey: "feature.tab.shortcuts", icon: "i-command", group: "prefs" },
+  { id: "mcp", titleKey: "feature.tab.mcp", icon: "i-mcp", group: "prefs" },
+  { id: "skills", titleKey: "feature.tab.skills", icon: "i-skills", group: "prefs" },
+  { id: "tasks", titleKey: "feature.tab.tasks", icon: "i-play", group: "tools" },
+  { id: "debugger", titleKey: "feature.tab.debugger", icon: "i-bug", group: "tools" },
+  { id: "conflicts", titleKey: "feature.tab.conflicts", icon: "i-git", group: "tools" },
+  { id: "lsp", titleKey: "feature.tab.lsp", icon: "i-braces", group: "tools" },
+  { id: "workspace", titleKey: "feature.tab.workspace", icon: "i-folder-open", group: "tools" },
+  { id: "remote", titleKey: "feature.tab.remote", icon: "i-remote", group: "tools" },
 ];
 const FEATURE_TAB_IDS = new Set(FEATURE_TABS.map((tab) => tab.id));
 function normalizeFeatureTab(tab) {
@@ -52807,7 +52828,15 @@ function renderFeaturePanel() {
   tabs.setAttribute("aria-label", t("feature.tabsLabel"));
   const body = featureBody();
   tabs.innerHTML = "";
+  let lastGroup = "";
   for (const tab of FEATURE_TABS) {
+    if (lastGroup && tab.group !== lastGroup) {
+      const sep = document.createElement("div");
+      sep.className = "feature-tab__sep";
+      sep.setAttribute("role", "separator");
+      tabs.appendChild(sep);
+    }
+    lastGroup = tab.group || lastGroup;
     const btn = document.createElement("button");
     btn.type = "button";
     btn.className = "feature-tab" + (tab.id === activeFeatureTab ? " is-active" : "");
@@ -52830,8 +52859,29 @@ function renderFeaturePanel() {
     shortcuts: renderShortcutsTool,
     mcp: renderMcpTool,
     skills: renderSkillsTool,
+    // 这六个的渲染函数一直都在，只是从没被这张表引用过。
+    tasks: renderTasksTool,
+    debugger: renderDebuggerTool,
+    conflicts: renderConflictsTool,
+    lsp: renderLspTool,
+    workspace: renderWorkspaceTool,
+    remote: renderRemoteTool,
   };
-  renderers[activeFeatureTab]?.(body);
+  const render = renderers[activeFeatureTab];
+  if (!render) {
+    // 到不了这里——normalizeFeatureTab 已经把未知 id 拦掉了。留着是因为这两张表必须一一对应，
+    // 而它们隔着 80 行：加了标签忘了渲染器的结果是一块空白面板，比现在的"开错面板"更难查。
+    body.textContent = `面板 "${activeFeatureTab}" 没有渲染器`;
+    return;
+  }
+  try {
+    render(body);
+  } catch (err) {
+    // 这六个面板被孤立了很久，谁也没跑过。一个渲染异常不该让整个模态框变成空白——
+    // 那又会变成一次静默失败。
+    console.error("[feature-panel] render failed:", activeFeatureTab, err);
+    body.textContent = `打开「${t(FEATURE_TABS.find((x) => x.id === activeFeatureTab)?.titleKey || "")}」失败：${err?.message || err}`;
+  }
 }
 
 featureOverlay.querySelector(".feature-panel__close").addEventListener("click", closeFeaturePanel);
