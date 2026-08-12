@@ -243,8 +243,13 @@ class LspClient {
         break;
       }
       case "workspace/applyEdit": {
-        const ok = this.manager.applyWorkspaceEdit(msg.params?.edit);
-        reply({ applied: ok });
+        // applyWorkspaceEdit 现在是 async（它可能要先从磁盘把缺的 model 建出来）。
+        // 不 await 的话 reply 收到的是一个 Promise 对象——恒真，于是无论成败都告诉服务器
+        // "已应用"，服务器据此认为重构完成了。
+        this.manager
+          .applyWorkspaceEdit(msg.params?.edit)
+          .then((ok) => reply({ applied: !!ok }))
+          .catch((e) => reply({ applied: false, failureReason: String(e?.message || e) }));
         break;
       }
       case "client/registerCapability":
@@ -952,7 +957,17 @@ export function createLspManager(options) {
   }
 
   // ---- workspace edits (rename, code actions, server applyEdit) ----
-  function applyWorkspaceEdit(edit) {
+  /**
+   * 应用一份工作区编辑（服务器主动发来的 workspace/applyEdit、跨文件快速修复）。
+   *
+   * 以前遇到没有 model 的文件是 `continue` ——**静默跳过**。于是一次"自动补 import"或
+   * "move to new file" 会只改一半：改到的文件变了，没打开的那个原样不动，而调用方拿到的
+   * 返回值仍是 true。半应用的重构比完全失败更糟，因为没人知道它失败过。
+   *
+   * 现在先给每个目标文件把 model 建出来（lazilyCreateModel 会从磁盘读内容），建不出来的
+   * 单独收集并如实报出去。落盘由 main.js 的后台持久化负责——那边监听 model 的内容变化。
+   */
+  async function applyWorkspaceEdit(edit) {
     if (!edit) return false;
     const byUri = new Map();
     if (edit.changes) {
@@ -963,16 +978,29 @@ export function createLspManager(options) {
         if (dc.textDocument && dc.edits) byUri.set(dc.textDocument.uri, dc.edits);
       }
     }
-    let applied = false;
+    // 先解析出全部 model，再动手改。有一个建不出来就整笔不做——半应用的重构是最坏结果。
+    const resolved = [];
+    const missing = [];
     for (const [uri, edits] of byUri.entries()) {
-      const model = findModelByUri(uri);
-      if (!model) continue;
+      let model = findModelByUri(uri);
+      if (!model) model = await lazilyCreateModel(uri);
+      if (!model) { missing.push(uri); continue; }
+      resolved.push([model, edits]);
+    }
+    if (missing.length) {
+      console.warn("[lsp] workspace edit 放弃：这些文件建不出 model", missing);
+      return false;
+    }
+    let applied = false;
+    for (const [model, edits] of resolved) {
       const ops = edits.map((e) => ({
         range: toMonacoRange(e.range),
         text: e.newText,
         forceMoveMarkers: true,
       }));
+      model.pushStackElement();
       model.pushEditOperations([], ops, () => null);
+      model.pushStackElement();
       applied = true;
     }
     return applied;

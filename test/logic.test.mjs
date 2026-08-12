@@ -15803,6 +15803,89 @@ test("closing a terminal before termOpen resolves reaps the late PTY without tou
   assert.deepEqual(entry.term.writes, []);
 });
 
+test("跨文件编辑必须落盘，而不是只改内存", async () => {
+  // 这是唯一一类会**静默损坏用户代码**的缺陷。F2 跨文件重命名走 Monaco 的 standalone 批量
+  // 编辑服务，那份实现只做 model.pushEditOperations —— 纯内存、从不写盘；而 App 的自动保存
+  // 只挂在活动编辑器的 onDidChangeModelContent 上，够不着后台 model（预加载的 60 个、LSP
+  // 为跨文件分析懒建的那些）。
+  // 结果：当前文件导入新名字并存了盘，另一个文件导出的还是旧名字。项目坏了，一句提示都没有；
+  // 再打开那个文件时它从磁盘重读，改动直接蒸发。
+  const calls = [];
+  const openFiles = new Map();
+  const persist = load("_persistBackgroundModel", {
+    openFiles,
+    _coherentFilePath: (x) => x,
+    _isMissingFileError: () => false,
+    basename: (x) => x.split("/").pop(),
+    showToast: (m) => calls.push(["toast", m]),
+    _pendingEditorWrites: new Map(),
+    backend: {
+      readTextFile: async () => "旧内容",
+      writeTextFileIfUnchanged: async (path, expected, next) => calls.push(["write", path, expected, next]),
+    },
+  });
+  const model = (v) => ({ getValue: () => v, isDisposed: () => false });
+
+  await persist("/ws/format.js", model("新内容"));
+  assert.deepEqual(calls, [["write", "/ws/format.js", "旧内容", "新内容"]],
+    "后台 model 的改动必须以 CAS 方式写回磁盘");
+
+  // 磁盘已经是这个内容就别写——省一次无谓的写，也避免和别的保存互相 CAS 打架。
+  calls.length = 0;
+  await persist("/ws/format.js", model("旧内容"));
+  assert.equal(calls.length, 0, "内容一致时不该写盘");
+
+  // 文件在编辑器里打开了就交还给正常的自动保存，那条路有 dirty 标记和更完整的簿记。
+  calls.length = 0;
+  openFiles.set("/ws/format.js", {});
+  await persist("/ws/format.js", model("新内容"));
+  assert.equal(calls.length, 0, "已打开的文件由自动保存负责，这里不该插手");
+
+  // 内容变化的监听必须真的把后台文件接进来，否则上面这个函数永远不会被调用。
+  const listeners = extractFn("attachModelListeners");
+  assert.match(listeners, /if \(!openFiles\.has\(path\)\) _scheduleBackgroundPersist\(path, model\)/,
+    "后台 model 改动要排一次落盘");
+});
+
+test("跨文件编辑写盘冲突时绝不覆盖，而且要说出来", async () => {
+  // 从读到 expected 到写回之间磁盘被别人改了。这条路径上的失败以前是完全静默的。
+  const toasts = [];
+  const persist = load("_persistBackgroundModel", {
+    openFiles: new Map(),
+    _coherentFilePath: (x) => x,
+    _isMissingFileError: () => false,
+    basename: (x) => x.split("/").pop(),
+    showToast: (m) => toasts.push(m),
+    _pendingEditorWrites: new Map(),
+    backend: {
+      readTextFile: async () => "旧内容",
+      writeTextFileIfUnchanged: async () => { throw new Error("content changed on disk"); },
+    },
+  });
+  await assert.rejects(() => persist("/ws/a.js", { getValue: () => "新", isDisposed: () => false }));
+  assert.equal(toasts.length, 1, "冲突必须让用户看见");
+  assert.match(toasts[0], /a\.js/);
+  assert.match(toasts[0], /磁盘已被其他程序修改/);
+});
+
+test("服务器发来的工作区编辑不再半应用", () => {
+  // 以前遇到没有 model 的文件是 continue —— 静默跳过。于是"自动补 import"这类跨文件快速修复
+  // 会只改一半，而返回值仍然是 true。半应用的重构比完全失败更糟，因为没人知道它失败过。
+  const src = readFileSync(join(HERE, "../src/lsp-client.js"), "utf8");
+  const fn = src.slice(src.indexOf("async function applyWorkspaceEdit"));
+  const body = fn.slice(0, fn.indexOf("\n  }") + 4);
+  assert.match(body, /if \(!model\) model = await lazilyCreateModel\(uri\);/,
+    "缺的 model 要从磁盘建出来");
+  assert.match(body, /if \(missing\.length\)[\s\S]{0,160}return false;/,
+    "有建不出来的就整笔不做，并如实返回 false");
+  assert.doesNotMatch(body, /if \(!model\) continue;/, "不许再静默跳过");
+
+  // 调用方必须 await——不 await 的话 reply 收到的是 Promise 对象，恒真，
+  // 于是无论成败都告诉服务器"已应用"。
+  assert.match(src, /\.applyWorkspaceEdit\(msg\.params\?\.edit\)\s*\n\s*\.then\(\(ok\) => reply\(\{ applied: !!ok \}\)\)/,
+    "workspace/applyEdit 的回复必须等真实结果");
+});
+
 test("命令面板里的工具命令必须打开对应面板，而不是静默回落到设置", () => {
   // 这是本次审计里最贵的一个 bug：FEATURE_TABS 只登记了 7 个 id，normalizeFeatureTab 把认不出的
   // id 一律改写成 "settings"，于是命令面板里 6 条命令（任务运行器/调试器/合并冲突/语言服务/
