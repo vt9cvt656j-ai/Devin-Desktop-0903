@@ -7,39 +7,108 @@
 /// 语言服务器" prompts and installs that "succeed" but still can't be found. Running the login
 /// shell and reading its `$PATH` makes the IDE resolve exactly what the user's terminal does.
 #[cfg(not(windows))]
-fn login_shell_path() -> &'static str {
-    static CACHE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    CACHE.get_or_init(|| {
-        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".into());
-        // Run in a thread with a timeout so a slow/pathological rc file can never wedge the app.
-        // Wrap $PATH in markers so any `.zshrc` echo/MOTD noise is trivially stripped. `-l -i -c`
-        // sources login + interactive rc (where version managers live). `command printf` dodges
-        // aliases/functions named printf.
-        let (tx, rx) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            let out = std::process::Command::new(&shell)
-                .args(["-lic", "command printf '__WP__%s__WP__' \"$PATH\""])
-                .output();
-            let _ = tx.send(
-                out.map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
-                    .unwrap_or_default(),
-            );
-        });
-        let raw = rx
-            .recv_timeout(std::time::Duration::from_millis(4000))
-            .unwrap_or_default();
-        match (raw.find("__WP__"), raw.rfind("__WP__")) {
-            (Some(a), Some(b)) if b > a + 6 => {
-                let p = &raw[a + 6..b];
-                if p.contains('/') {
-                    p.to_string()
-                } else {
-                    String::new()
+struct PathCache {
+    value: String,
+    at: std::time::Instant,
+}
+#[cfg(not(windows))]
+static PATH_CACHE: std::sync::RwLock<Option<PathCache>> = std::sync::RwLock::new(None);
+/// 两次探测之间的最短间隔。alt-tab 连点不该刷出一串 zsh 进程。
+#[cfg(not(windows))]
+const PROBE_FLOOR: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// 从探测输出里抠出 PATH。marker 包裹是为了把 `.zshrc` 里的 echo / MOTD 噪声剥干净。
+///
+/// 抽成纯函数是为了能测：解析失败和探测失败必须是**两件事**，前者返回 `None` 让调用方保留
+/// 上一次的好值，而不是把空串当成"用户的 PATH 就是空的"。
+#[cfg(not(windows))]
+fn parse_probe_output(raw: &str) -> Option<String> {
+    match (raw.find("__WP__"), raw.rfind("__WP__")) {
+        (Some(a), Some(b)) if b > a + 6 => {
+            let p = &raw[a + 6..b];
+            // 一个斜杠都没有的东西不可能是 PATH（多半是 rc 文件打的一行字）。
+            if p.contains('/') { Some(p.to_string()) } else { None }
+        }
+        _ => None,
+    }
+}
+
+/// 真跑一次 `$SHELL -lic` 把用户的真实 PATH 问出来。
+///
+/// **失败返回 `None`，绝不返回空串。** 旧实现把超时（`unwrap_or_default`）和解析失败
+/// （`_ => String::new()`）都写进了 `OnceLock`：开机那一下系统忙、探测超过 4 秒，整个会话的
+/// PATH 就被永久降级成下面那张硬编码目录表，nvm / pyenv / asdf 的 shim 从此全部失踪，而且
+/// 重启 app 之前没有任何办法恢复。
+#[cfg(not(windows))]
+fn probe_login_shell_path(budget_ms: u64) -> Option<String> {
+    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".into());
+    // 放在线程里跑并设预算，这样一个病态的 rc 文件永远卡不死 app。
+    // `-lic` 同时 source login 和 interactive 的 rc（版本管理器就住在那儿）；
+    // `command printf` 绕开被别名/函数改写过的 printf。
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let out = std::process::Command::new(&shell)
+            .args(["-lic", "command printf '__WP__%s__WP__' \"$PATH\""])
+            .output();
+        let _ = tx.send(out.map(|o| String::from_utf8_lossy(&o.stdout).into_owned()).ok());
+    });
+    let raw = rx
+        .recv_timeout(std::time::Duration::from_millis(budget_ms))
+        .ok()
+        .flatten()?;
+    parse_probe_output(&raw)
+}
+
+/// 重新探测用户的登录 shell PATH。`force` 跳过间隔下限。
+///
+/// 返回值表示"这次真的探测了"。探测失败时**保留上一次的好值**——宁可用旧的，也不要退回
+/// 硬编码表。
+#[cfg(not(windows))]
+pub fn refresh_login_shell_path(force: bool) -> bool {
+    if !force {
+        if let Ok(g) = PATH_CACHE.read() {
+            if let Some(c) = g.as_ref() {
+                if c.at.elapsed() < PROBE_FLOOR {
+                    return false;
                 }
             }
-            _ => String::new(),
         }
-    })
+    }
+    // 冷启动给 1.5 秒就够（实测 0.03–0.21s）；刷新时给 4 秒，反正不在关键路径上。
+    let budget = if force { 4000 } else { 2500 };
+    if let Some(p) = probe_login_shell_path(budget) {
+        if let Ok(mut g) = PATH_CACHE.write() {
+            *g = Some(PathCache { value: p, at: std::time::Instant::now() });
+        }
+        return true;
+    }
+    // 探测失败：只更新时间戳，避免每条命令都重试一次慢探测；旧值继续用。
+    if let Ok(mut g) = PATH_CACHE.write() {
+        if let Some(c) = g.as_mut() {
+            c.at = std::time::Instant::now();
+        }
+    }
+    false
+}
+
+#[cfg(not(windows))]
+fn login_shell_path() -> String {
+    if let Ok(g) = PATH_CACHE.read() {
+        if let Some(c) = g.as_ref() {
+            return c.value.clone();
+        }
+    }
+    // 第一次：同步探一次（预算短），失败就返回空串走硬编码表——但**不缓存这个失败**，
+    // 下一次调用还会再试，直到真的问出来为止。
+    match probe_login_shell_path(1500) {
+        Some(p) => {
+            if let Ok(mut g) = PATH_CACHE.write() {
+                *g = Some(PathCache { value: p.clone(), at: std::time::Instant::now() });
+            }
+            p
+        }
+        None => String::new(),
+    }
 }
 
 /// Build a PATH that includes the workspace's `node_modules/.bin` + a Python venv + common

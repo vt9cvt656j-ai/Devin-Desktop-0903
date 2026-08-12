@@ -278,21 +278,36 @@ fn task_run_capture_inner(
 
     #[cfg(windows)]
     let mut cmd = {
-        // run_cmd executes through cmd.exe (COMSPEC). Two Windows-only fixes so
-        // the agent can actually *read* what happened:
-        //   1. `chcp 65001` switches the console to UTF-8 for this child, so
-        //      non-ASCII output (Chinese paths / error text) comes back as UTF-8
-        //      instead of OEM-codepage (GBK/936) mojibake we can't decode.
-        //   2. PYTHONUTF8 / PYTHONIOENCODING make Python tooling emit UTF-8 too.
-        // raw_arg keeps cmd metacharacters (& | > "") intact — std's normal arg
-        // quoting would mangle them for cmd.exe.
-        use std::os::windows::process::CommandExt;
-        let shell = std::env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".into());
-        let mut c = crate::process_util::command(shell);
-        c.raw_arg(format!("/C chcp 65001>nul & {command}"));
+        // 解释器由 shell_env 决定：装了 Git for Windows 就走 bash，模型写的 POSIX 直接是对的；
+        // 没装才降级到 cmd.exe。降级不是静悄悄的——前端会把 kind 告诉模型，也会提示用户。
+        //
+        // 两个 Windows 专属的编码修正保留：
+        //   1. `chcp 65001` 把这个子进程的控制台切到 UTF-8，中文路径 / 报错才不会以
+        //      OEM 代码页（GBK/936）回来变成我们解不了的乱码。
+        //   2. PYTHONUTF8 / PYTHONIOENCODING 让 Python 工具链也吐 UTF-8。
+        let plan = crate::shell_env::plan();
+        let mut c = crate::process_util::command(&plan.program);
+        if plan.kind == "cmd" {
+            // raw_arg 保住 cmd 的元字符（& | > ""）——std 正常的参数引用会把它们改写掉。
+            use std::os::windows::process::CommandExt;
+            c.raw_arg(format!("/C chcp 65001>nul & {command}"));
+        } else {
+            // bash 用普通 argv 传参才是对的，不需要 raw_arg。
+            c.args(&plan.oneshot).arg(&command);
+        }
         c.current_dir(&dir)
+            // 外部改的环境变量在这里当场生效。Windows 永远不会改写运行中进程的环境块，
+            // 只往注册表写再广播一条消息；不主动读注册表，用户 setx 出来的东西这个进程
+            // 到死都看不见。
+            .envs(crate::shell_env::registry_env())
+            // 这个分支以前**从来没有设过 PATH**（设 PATH 那一行在 cfg(not(windows)) 里面），
+            // 于是工作区的 node_modules\.bin、venv\Scripts 一个都进不来。
+            .env("PATH", crate::process_util::augmented_path(Some(&cwd)))
             .env("PYTHONUTF8", "1")
             .env("PYTHONIOENCODING", "utf-8");
+        for (k, v) in crate::shell_env::posix_shim_env(&plan.kind, &plan.program) {
+            c.env(k, v);
+        }
         c
     };
     #[cfg(windows)]

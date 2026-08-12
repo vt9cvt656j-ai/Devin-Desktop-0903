@@ -69,6 +69,12 @@ sevenz-rust2 = "0.21.4"
 csv = "1"
 chardetng = "0.1"
 
+[target.'cfg(windows)'.dependencies]
+# 读 HKLM/HKCU 的 Environment 键。Windows 从不改写运行中进程的环境块，只广播
+# WM_SETTINGCHANGE；注册表是唯一能拿到"用户刚刚改的那个变量"的地方。
+# 0.55 已经作为传递依赖在 Cargo.lock 里，对齐版本不引入新的解析。
+winreg = "0.55"
+
 [target.'cfg(target_os = "macos")'.dependencies]
 tauri-plugin-macos-fps = "0.1.0"
 objc2 = "0.6.4"

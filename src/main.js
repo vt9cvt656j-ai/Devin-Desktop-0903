@@ -546,6 +546,8 @@ async function tauriBackend() {
     termRunningIds: () => core.invoke("term_running_ids"),
     termListCommands: () => core.invoke("term_list_commands"),
     termHistory: () => core.invoke("term_history"),
+    envRefresh: () => core.invoke("env_refresh"),
+    shellPlan: () => core.invoke("shell_plan"),
     fsWatch: (paths) => core.invoke("fs_watch", { paths }),
     fsUnwatch: (paths) => core.invoke("fs_unwatch", { paths }),
     replaceInFile: (filePath, query, replacement, caseSensitive) =>
@@ -1921,6 +1923,9 @@ function mockBackend() {
     },
     termListCommands: async () => [],
     termHistory: async () => [],
+    // 浏览器预览里没有真 shell；报 posix 是因为这个兜底只在开发机上跑。
+    envRefresh: async () => ({ changed: false, path: "", shell: { kind: "posix", label: "sh", program: "/bin/sh" } }),
+    shellPlan: async () => ({ kind: "posix", label: "sh", program: "/bin/sh", oneshot: ["-lc"], interactive: ["-l"] }),
     authLoginOrRegister: async () => ({ success: true, message: "mock login" }),
     authLogin: async (email) => ({ success: true, message: "mock login", email, user_id: "mock", is_new_user: false }),
     authRegister: async (email) => ({ success: true, message: "mock register", email, user_id: "mock", is_new_user: true }),
@@ -19145,10 +19150,46 @@ function _detectOS() {
 }
 
 let _osDetailCache = null;
+/**
+ * run_cmd 与终端真正用的解释器。默认 posix，因为在拿到后端答复之前那是三个平台里两个的真相，
+ * 而且猜错方向的代价不对称：把 Windows 当 posix 会得到响亮的 9009，把 posix 当 cmd 会让
+ * 一堆命令被拼成 cmd 语法然后静默错。
+ */
+let _shellPlanCache = { kind: "posix", label: "sh" };
+/** 环境变过之后要捎给模型的一句话，用掉即清。 */
+let _envChangedNote = "";
+function _shellKind() { return _shellPlanCache.kind || "posix"; }
+
+/**
+ * 告诉模型这台机器上的命令到底由谁执行。
+ *
+ * 这句话必须住在 contextBlock（user 消息）里，不能只放工具描述里——`_applyCloudToolDescs`
+ * 会用网关下发的描述覆盖本地那份，改 main.js 里的工具描述不一定生效。
+ */
+function _platformContextLine(osDetail) {
+  let s = `\n操作系统: ${osDetail.os} ${osDetail.version} | 架构: ${osDetail.arch}`
+    + ` | run_cmd 与终端都由 ${osDetail.shell} 执行（${osDetail.shellKind === "posix" ? "POSIX 语法" : "cmd 批处理语法"}）`;
+  if (osDetail.shellKind === "cmd") {
+    // cmd 下最危险的不是"命令不存在"（那会报 9009，模型能自纠），而是这四个**静默错**：
+    // 退出码 0、结果不对、模型收不到任何信号，于是它会把错误结果当成事实继续往下做。
+    s += `\n⚠ 该 shell 下 \`;\` 不是命令分隔符，\`$VAR\` 不展开，\`'单引号'\` 不是引号，\`$(…)\` 不做替换`
+      + `——它们不报错，只会静默给出错误结果。请用 \`&\` \`&&\` \`||\` 串联、\`%VAR%\` 取变量、\`"双引号"\` 引用。`
+      + `（装上 Git for Windows 后本 IDE 会自动改用 bash，届时照常写 POSIX 即可。）`;
+  }
+  if (_envChangedNote) { s += _envChangedNote; _envChangedNote = ""; }
+  return s;
+}
+async function _refreshShellPlan() {
+  try {
+    const p = await backend.shellPlan();
+    if (p && p.kind) _shellPlanCache = p;
+  } catch {}
+  return _shellPlanCache;
+}
 async function _detectOSDetail() {
   if (_osDetailCache) return _osDetailCache;
   const os = _detectOS();
-  const detail = { os, shell: "unknown", arch: "unknown", version: "" };
+  const detail = { os, shell: "unknown", shellKind: "posix", arch: "unknown", version: "" };
 
   if (os === "macOS") {
     detail.shell = "zsh";
@@ -19164,8 +19205,8 @@ async function _detectOSDetail() {
       if (r?.stdout?.trim()) detail.arch = r.stdout.trim();
     } catch {}
   } else if (os === "Windows") {
-    // run_cmd executes via cmd.exe (COMSPEC) — tell the agent the truth so it
-    // writes cmd syntax, not PowerShell that would silently fail inside cmd.
+    // 别再硬编码 cmd.exe。后端会先找 Git Bash——找到了模型写的 POSIX 就是对的；
+    // 没找到才降级到 cmd，那时必须**明确告诉**模型和用户，而不是静悄悄把 POSIX 喂进去。
     detail.shell = "cmd.exe";
     detail.arch = "x86_64";
     try {
@@ -19177,6 +19218,11 @@ async function _detectOSDetail() {
       if (arch) detail.arch = /ARM64/i.test(arch) ? "arm64" : /AMD64/i.test(arch) ? "x86_64" : "x86";
     } catch {}
   }
+
+  // 后端说了算：三个平台统一在这里把真实解释器覆盖进去。
+  const plan = await _refreshShellPlan();
+  if (plan?.label) detail.shell = plan.label;
+  detail.shellKind = plan?.kind || "posix";
 
   _osDetailCache = detail;
   return detail;
@@ -23403,7 +23449,7 @@ async function sendPrompt(text, attachments = [], readyConfig = null) {
   const _pendingContextEvidence = [];
   if ((effectiveMode === "agent" || effectiveMode === "explorer" || effectiveMode === "reviewer" || effectiveMode === "plan") && !_agentLightTurn) {
     const osDetail = await _osDetailPromise;
-    contextBlock = `\n操作系统: ${osDetail.os} ${osDetail.version} | Shell: ${osDetail.shell} | 架构: ${osDetail.arch}`;
+    contextBlock = _platformContextLine(osDetail);
     if (_curRoot) {
       // Warm snapshots are immediate. A genuinely cold project gets a short foreground
       // digest window; the complete scan keeps running in the warm-up lane and the Agent
@@ -30186,6 +30232,14 @@ function _mapToolCall(name, args, mcpToolMap = _mcpToolMap) {
     case "deploy_site": {
       // 安全部署：构建 → 打包 → 带用户 JWT POST 到网关 /api/deploy（账号绑定 + 白名单 + 限大小 +
       // 防路径穿越安全解压 + 按账号隔离 + 纯静态无执行）。绝不给用户 SSH/root——多租户安全的关键。
+      // 这条命令是 app 自己拼的纯 POSIX 管线（set -e / for-do-done / tar / $() ），
+      // 模型根本不参与。cmd.exe 拿到它会把整条 900 字符当成 `set` 的参数，报一句
+      // "Environment variable ... not defined" 然后退出 1——看起来像部署失败，其实是
+      // 语法根本没被执行。降级要响亮，不能静默错。
+      if (_shellKind() === "cmd") {
+        return { type: "cmd", command:
+          `echo 一键部署需要 POSIX shell。请安装 Git for Windows (https://git-scm.com/download/win) 后重开 IDE 重试。 & exit /b 1` };
+      }
       const _dn = (String(args.name || "site").replace(/[^a-zA-Z0-9_-]/g, "").slice(0, 40)) || "site";
       let _tok = "", _gw = "https://code.mrday.one";
       try { _tok = (typeof localStorage !== "undefined" && localStorage.getItem("michael_token")) || ""; } catch (_e) {}
@@ -60411,6 +60465,25 @@ async function createTermTab(customLabel, cwdOverride = "") {
   let initDone = false;
   let initBuffer = "";
   const now = Date.now();
+  /**
+   * 把启动失败**显示出来**，而不是把标签页关掉。
+   *
+   * 原来两条错误路径都调 `closeTermTab(...)`。而 closeTermTab 发现一个标签页都不剩时会
+   * 顺手把整个终端面板收起来（见 closeTerminal 的调用点），所以用户点了终端按钮之后看到的
+   * 是"什么都没发生"——也就是他报的"打不开终端"。与此同时真正的原因 `entry.startError`
+   * 全文件只有写入点、没有任何一处把它渲染出来，启动期输出也被 initBuffer 吞了。
+   *
+   * 失败必须留在屏幕上：这是 Windows 那台机器上唯一可能拿到的线索。
+   */
+  const _showTermStartError = (e, buffered) => {
+    if (!e || e.closed) return;
+    try {
+      if (buffered) e.term.write("\r\n\x1b[2m--- shell 启动期输出 ---\x1b[0m\r\n" + buffered);
+      e.term.write("\r\n\x1b[31m" + (e.startError || "终端启动失败") + "\x1b[0m\r\n");
+      e.term.write("\x1b[2m终端没能起来。上面这段就是原因，请截图或复制发回。\x1b[0m\r\n");
+      e.term.write("\x1b[2m（Windows 若有崩溃日志，在 %USERPROFILE%\\.michael-ide\\crash.log）\x1b[0m\r\n");
+    } catch { /* xterm 已经被销毁就算了 */ }
+  };
   const entry = { term, fit, container, label, cwd, backendId: null, opening: false, closed: false, startError: "", inputLine: "", ghost: "", suggestion: "", webgl: webglAddon, createdAt: now, lastActivityAt: now, lastCommand: "", initTimer: 0 };
   termTabs.push(entry);
 
@@ -60482,16 +60555,30 @@ async function createTermTab(customLabel, cwdOverride = "") {
     }
     entry.backendId = openedPty.id;
     entry.channel = openedPty.channel; // nulled in closeTermTab so the captured xterm/entry can be GC'd
+    // PTY 是用 term.cols/rows 建的，而那两个值在上面 await 之前就求值了——那时 xterm 还是
+    // 默认的 80×24。面板真正的 fit 发生在 backendId 赋值**之前**，onResize 因为 backendId
+    // 还是 null 被丢弃（见 :60439），于是 PTY 永远停在 80×24：换行位置错、提示符被盖掉、
+    // 退格吃错字符，直到用户手动拖一次面板才自愈。SSH 面板早就补了这一行，这里照做。
+    try { backend.termResize(entry.backendId, term.cols, term.rows); } catch {}
     const finishInit = () => {
       if (initDone || entry.closed) return;
-      term.reset();
-      term.write("\x1b[0m\x1b[?25h");
       initDone = true;
-      if (entry.backendId != null) {
-        const _clearCmd = navigator.platform && navigator.platform.startsWith("Win") ? "cls" : "clear";
-        backend.termWrite(entry.backendId, " " + _clearCmd + "\n");
+      term.write("\x1b[0m\x1b[?25h");
+      // 回放启动期攒下来的输出。
+      //
+      // 这里原来是 `term.reset()` + 往 PTY 里注入一条 `clear`，为的是开局给用户一块干净屏幕。
+      // 代价是：shell 启动头 1.5 秒说的每一句话——banner、profile 里的报错、Windows 上
+      // chcp 的失败——先被攒进 initBuffer，然后 reset 连同滚回缓冲一起抹掉，而 initBuffer
+      // 从来没有第二个读取点。于是"终端打不开"在界面上永远只剩一片空白，没有任何线索。
+      //
+      // 注入的那条 `clear` 还有独立的害处：它是**追加在用户这 1.5 秒里已经敲进去的内容后面
+      // 再回车**的，敲了一半的 `npm ru` 会变成 `npm ru clear` 被真的执行；而 macOS 的 clear
+      // 发的是 ESC[3J，清掉的正是滚回缓冲。
+      if (initBuffer) {
+        term.write(initBuffer);
+        initBuffer = "";
       }
-      entry.ready = true; // past the init clear → safe to inject a command now
+      entry.ready = true; // 启动窗口结束 → 可以安全地往里注入命令了
     };
     // A tab can be closed while its PTY is still in the startup window. Keep the
     // timer on the entry so closeTermTab can cancel it before xterm is disposed.
@@ -60500,22 +60587,20 @@ async function createTermTab(customLabel, cwdOverride = "") {
       try { finishInit(); }
       catch (err) {
         entry.startError = "终端初始化失败: " + String(err?.message || err);
-        const entryIndex = termTabs.indexOf(entry);
-        if (entryIndex >= 0) closeTermTab(entryIndex);
+        _showTermStartError(entry, initBuffer);
       }
     }, 1500);
   } catch (err) {
     entry.startError = "终端启动失败: " + String(err?.message || err);
-    // Use the normal close path. It owns PTY/channel, xterm, WebGL, observer and
-    // DOM teardown, and remains correct if a partial PTY was created before setup failed.
-    if (!entry.closed) {
-      const entryIndex = termTabs.indexOf(entry);
-      if (entryIndex >= 0) closeTermTab(entryIndex);
-      else if (openedPty) {
-        try { _releaseTauriChannel(openedPty.channel); } catch {}
-        try { await backend.termClose(openedPty.id); } catch {}
-      }
+    // 后端资源该收还得收，但**标签页要留着**——见 _showTermStartError 的说明。
+    if (openedPty) {
+      try { _releaseTauriChannel(openedPty.channel); } catch {}
+      try { await backend.termClose(openedPty.id); } catch {}
     }
+    entry.backendId = null;
+    entry.channel = null;
+    _showTermStartError(entry, initBuffer);
+    initBuffer = "";
   } finally {
     entry.opening = false;
   }
@@ -60708,8 +60793,10 @@ async function _runTaskInNewTerminal(command, label, cwd = "") {
   }
   if (entry.backendId == null || !entry.ready) {
     if (!entry.startError) entry.startError = "终端初始化超时（6 秒内未就绪）";
-    const entryIndex = termTabs.indexOf(entry);
-    if (entryIndex >= 0) closeTermTab(entryIndex);
+    // 这里同样不关标签页。智能体拿到 ok:false 就够它换路子了，但用户需要留在屏幕上的证据——
+    // 关掉之后终端面板会整个收起来，看上去就是"点了没反应"。createTermTab 的失败路径已经把
+    // 原因写进终端本体了；这条超时路径补一行，免得屏幕上只有一个空标签页。
+    try { entry.term.write("\r\n\x1b[31m" + entry.startError + "\x1b[0m\r\n"); } catch {}
     return { ok: false, entry, error: entry.startError };
   }
   entry.recentOut = "";
@@ -61860,6 +61947,31 @@ restoreMichaelSession();
 // This is why an admin plan/credit change now shows up without restarting the IDE.
 window.addEventListener("focus", () => refreshMichaelUser());
 document.addEventListener("visibilitychange", () => { if (!document.hidden) refreshMichaelUser(); });
+
+/**
+ * 回到窗口时重新读一遍环境。
+ *
+ * 一个进程的环境块是 exec 那一刻的快照——用户在别的终端 `export`、改 `.zshrc`、用系统属性面板
+ * 加一个变量，都不会改写已经在跑的这个 app。以前 macOS 上那次登录 shell 探测是 `OnceLock`，
+ * **整个进程只跑一次**，所以"刚装的工具找不到"要重启 App 才好；Windows 上更彻底，压根没有
+ * 任何重读通道。
+ *
+ * 用户从别处装完东西切回来，正是环境最可能变过的时刻，所以挂在 focus 上；后端有 5 秒下限防抖，
+ * alt-tab 连点不会刷出一串 shell。
+ */
+const _refreshShellEnv = async () => {
+  try {
+    const r = await backend.envRefresh();
+    if (r?.shell?.kind) _shellPlanCache = r.shell;
+    if (!r?.changed) return;
+    _osDetailCache = null; // 这个缓存以前永不失效，会把开机那一刻的 shell/版本冻到关机
+    // 给模型一句话：它此前得出的"没装 / 找不到命令"结论可能已经不成立了。
+    _envChangedNote = "\n环境已更新：PATH 在上一轮之后发生了变化，此前得出的「找不到命令 / 未安装」结论可能已失效，需要时请重新探测。";
+    try { showToast("🔄 检测到环境变量变化，已刷新", 3000); } catch {}
+  } catch {}
+};
+window.addEventListener("focus", _refreshShellEnv);
+document.addEventListener("visibilitychange", () => { if (!document.hidden) _refreshShellEnv(); });
 // Idempotent: clear any prior timer so a Vite HMR re-run can't stack duplicate
 // pollers (stacked pollers = duplicate account-info refreshes / toast spam).
 if (typeof window !== "undefined" && window.__michaelUserTimer) clearInterval(window.__michaelUserTimer);
