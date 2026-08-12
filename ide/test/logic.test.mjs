@@ -10222,8 +10222,10 @@ test("long chat transcripts stay bounded while paging both directions", () => {
 
 test("the composer prediction is grounded in real run state, and costs nothing", () => {
   const gen = load("_runStateNextActionSuggestions", { _INCOMPLETE_LABELS: loadConst("_INCOMPLETE_LABELS") });
+  const used = load("_predictionAlreadyUsed");
   const pred = load("_composerPrediction", {
     _runStateNextActionSuggestions: gen,
+    _predictionAlreadyUsed: used,
     _dynamicChatChips: () => [{ label: "上下文兜底", send: "ctx" }],
   });
   const now = Date.now();
@@ -10264,6 +10266,28 @@ test("the composer prediction is grounded in real run state, and costs nothing",
   // 什么都没有时，回落到上下文预测器，而不是什么都不显示。
   assert.equal(pred({ id: "s" }).src, "ctx");
 
+  // 刚做过的事不能再推一遍。上下文预测器是无状态的——用户 Tab 补全"解释 database.py"
+  // 发出去、模型答完，它照样把同一句再推一次，看着就像预测从来不更新。
+  assert.equal(pred({ id: "s", _recentSent: ["ctx"] }), null,
+    "唯一的候选刚发过 → 不给预测，而不是再推一遍");
+  // 有多个候选时跳过用过的，取下一条。
+  const multi = load("_composerPrediction", {
+    _runStateNextActionSuggestions: gen,
+    _predictionAlreadyUsed: used,
+    _dynamicChatChips: () => [{ label: "甲", send: "解释这个文件" }, { label: "乙", send: "找出潜在缺陷" }],
+  });
+  assert.equal(multi({ id: "s", _recentSent: ["解释这个文件"] }).send, "找出潜在缺陷");
+  // 只在**空白差异**上宽容（Tab 补全的原文有时带首尾空格），内容本身要精确匹配。
+  assert.equal(multi({ id: "s", _recentSent: ["  解释这个文件  "] }).send, "找出潜在缺陷");
+  // 用户把预测改写过再发，则仍然算"没做过"——这是刻意的：前缀匹配会误伤真正不同的
+  // 建议（"解释这个文件" 会连带压掉 "解释这个文件的并发模型"），宁可多推一次，
+  // 也不要把用户真正需要的那条悄悄吞掉。
+  assert.equal(multi({ id: "s", _recentSent: ["解释这个文件顺便说说数据流"] }).send, "解释这个文件");
+  // 运行状态那几档同样要过滤，不能只管上下文那一档。
+  const runUsed = pred({ id: "s", _recentSent: ["ctx"],
+    _lastRunState: { outcome: "failed", failureCategory: "network", lastError: "E", updatedAt: Date.now() } });
+  assert.equal(runUsed.src, "run", "运行状态没被用过时照常给");
+
   // 钱：这条路在打开软件、切标签、切文件、每次 git 刷新时都会跑，绝不允许发付费调用。
   for (const name of ["_composerPrediction", "_composerGhostEligible", "_composerGhostText",
                       "_runStateNextActionSuggestions", "_renderComposerGhost"]) {
@@ -10287,8 +10311,25 @@ test("every turn-completion path refreshes the composer prediction", () => {
     "预测必须排在 inTauri 提前返回之前");
 
   // 其余三个时机：打开软件、切标签、普通聊天轮结束。
-  assert.match(SRC, /restoreChatHistory\(\)\s*\n\s*\.then\(\(\) => \{ try \{ _renderComposerGhost\(\); \}/,
-    "打开软件后必须刷新预测（_lastRunState / _planSteps 在 restore 里才回填）");
+  // 打开软件那一刻编辑器/诊断/当前文件可能都还没就绪，只算一次会得到空的，
+  // 而空了之后没有任何东西会再算——用户看到的就是"明明有上下文，却没有预测"。
+  // lastIndexOf：第一次出现的是 async function 声明，要的是启动时那个调用点。
+  const boot = SRC.slice(SRC.lastIndexOf("restoreChatHistory()"), SRC.lastIndexOf("restoreChatHistory()") + 700);
+  assert.match(boot, /for \(const delay of \[[^\]]+\]\) setTimeout\(\(\) => \{ try \{ _renderComposerGhost\(\)/,
+    "启动后必须重算多次，一次性算空就再也不出现了");
+  assert.ok((boot.match(/\d+/g) || []).length >= 3, "至少要有一次延迟重算");
+
+  // 上下文变化（切文件 / 诊断 / git / 选区）也要重算，而且必须排在那个
+  // "容器里一有消息就永远返回"的早退**之前**——预测恰恰在有历史时最有用。
+  const hint = stripJsComments(extractFn("_refreshChatHintIfEmpty"));
+  const hintGhostAt = hint.indexOf("_renderComposerGhost()");
+  const bailAt = hint.indexOf('container.querySelector(".msg")');
+  assert.ok(hintGhostAt >= 0 && bailAt > hintGhostAt,
+    "预测必须排在空会话提示卡的 DOM 早退之前");
+
+  // 用户点进输入框是最可靠的一个时机，也是所有时序问题的兜底。
+  assert.match(SRC, /promptEl\.addEventListener\("focus", \(\) => \{ try \{ _renderComposerGhost\(\)/,
+    "聚焦输入框必须重算预测");
   const switcher = stripJsComments(extractFn("_switchChatSession"));
   assert.match(switcher, /_renderComposerGhost\(\)/,
     "输入框是所有标签共用的，切标签不刷新会把 A 的预测挂在 B 上");
@@ -10311,9 +10352,15 @@ test("the composer ghost cannot render over content the user already has", () =>
   assert.equal(ok({ ...base, atMenuHidden: false }), false);
   assert.equal(ok({ ...base, slashMenuHidden: false }), false);
 
-  // 计划步骤的 content 是模型写的、没有长度上限，不截断会让输入框每次刷新都跳一下。
-  const cut = load("_composerGhostText", { _GHOST_MAX_CHARS: loadConst("_GHOST_MAX_CHARS") });
-  assert.ok(cut("修复".repeat(200)).length <= 42);
+  // 灰字显示的是 Tab 会填进去的**原文**，所见即所得。真实内容 100~220 字，
+  // 上限只挡病态长度（计划步骤的 content 是模型写的、没有上限）。
+  const MAX = loadConst("_GHOST_MAX_CHARS");
+  const cut = load("_composerGhostText", { _GHOST_MAX_CHARS: MAX });
+  assert.ok(MAX >= 200, `上限 ${MAX} 太小，真实补全内容有 200 字左右，截了就不是所见即所得`);
+  assert.ok(cut("修复".repeat(500)).length <= MAX);
+  // 一段真实长度的内容必须**原样**显示，一个字都不能少。
+  const real = "当前文件 database.py 有 3 个报错。逐个定位根因并修复，改完重新检查诊断。".repeat(2);
+  assert.equal(cut(real), real);
   assert.equal(cut("  修复   构建  \n 失败 "), "修复 构建 失败");
 });
 
@@ -10337,6 +10384,47 @@ test("the ghost is rendered from an attribute i18n does not own, and Tab is guar
                        "e.isComposing", "_ceSerialize(promptEl).trim()"]) {
     assert.ok(seg.includes(guard), `Tab 处理器丢了 ${guard} 这道守卫`);
   }
+  // 灰字必须显示 Tab 会填进去的那段原文（send），不是给卡片行用的短标签（label）——
+  // 否则用户在按下 Tab 之前不知道会被填进什么，补全出来的详细内容会显得很突兀。
+  const render = stripJsComments(extractFn("_renderComposerGhost"));
+  assert.match(render, /_composerGhostText\(p\.send\)/,
+    "灰字要显示 send（原文），不是 label（短标签）");
+  // 样式上也不能截成一行加省略号，那等于又把内容藏起来了。
+  assert.ok(!/#prompt\.is-empty\[data-suggest\]::before\s*\{[^}]*text-overflow:\s*ellipsis/.test(APP_CSS),
+    "灰字不该省略号截断——用户要求完整显示");
+  assert.match(APP_CSS, /#prompt\.is-empty\[data-suggest\]::before\s*\{[^}]*white-space:\s*pre-wrap/,
+    "灰字要能正常换行");
+
+  // 光标必须停在最开头。用户还没按 Tab，这段内容并不真实存在——它一旦参与排版，
+  // 光标就会被挤到灰字后面（两行的预测把光标顶到第三行），看着像输入框里已经有内容了。
+  assert.match(APP_CSS, /#prompt\.is-empty\[data-suggest\]::before\s*\{[^}]*position:\s*absolute/,
+    "灰字必须脱离布局流，否则会把光标挤走");
+  assert.ok(!/#prompt\.is-empty\[data-suggest\]::before\s*\{[^}]*display:\s*block/.test(APP_CSS),
+    "block 级的 ::before 正是把光标顶到下一行的原因");
+  assert.match(APP_CSS, /#prompt\s*\{[^}]*position:\s*relative/,
+    "输入框要做定位上下文，绝对定位的灰字才对得准");
+  // 但脱离布局流之后框不会自己长高，两行预测会溢出——用一个排在内容**之后**的
+  // 隐藏副本撑高：它撑得开框，却推不动位于开头的光标。
+  assert.match(APP_CSS, /#prompt\.is-empty\[data-suggest\]::after\s*\{[^}]*content:\s*attr\(data-suggest\)/,
+    "需要隐藏副本把输入框撑到放得下预测");
+  assert.match(APP_CSS, /#prompt\.is-empty\[data-suggest\]::after\s*\{[^}]*visibility:\s*hidden/,
+    "撑高的那份必须不可见，否则会和真正的灰字重影");
+
+  // contentEditable 的删除不会把节点删净：全选删掉之后浏览器留下一个 <br>，
+  // Tab 补全过再删更是如此。序列化是空串（.is-empty 成立、灰字照常显示），可光标
+  // 停在那个 <br> **后面**——灰字在第一行、光标在第二行。必须清干净并把光标放回第 0 位。
+  const inputListener = SRC.slice(SRC.indexOf('promptEl.addEventListener("input", () => {'));
+  const inputBody = stripJsComments(inputListener.slice(0, inputListener.indexOf("});")));
+  assert.match(inputBody, /_normalizeEmptyComposer\(\)/,
+    "输入框删空后必须归一化，否则 Tab 过再删光标会留在残留 <br> 之后");
+  const normalize = stripJsComments(extractFn("_normalizeEmptyComposer"));
+  assert.match(normalize, /promptEl\.textContent = ""/, "要把残留节点真的清掉");
+  assert.match(normalize, /range\.setStart\(promptEl, 0\)/, "光标要放回第 0 位");
+  assert.match(normalize, /if \(_ceSerialize\(promptEl\)\.trim\(\)\) return;/,
+    "真有内容时一个字都不能动——这是清空用户输入的最快方式");
+  assert.match(normalize, /document\.activeElement !== promptEl/,
+    "没聚焦时不该去抢光标");
+
   // 打字必须立刻作废预测，否则稍晚落地的预测会把已输入内容冲掉。
   assert.match(SRC, /promptEl\.addEventListener\("input", \(\) => \{\s*\n[^}]*_clearComposerGhost\(\);/,
     "input 监听器必须先清掉预测再更新占位状态");
