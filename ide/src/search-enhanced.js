@@ -328,7 +328,7 @@ export class SearchResultsRenderer {
           <div style="min-width: 50px; font-size: 12px; color: #57606a; text-align: right; user-select: none; line-height: 1.5;">
             ${lineNumber}
           </div>
-          <div style="flex: 1; font-size: 13px; line-height: 1.6; font-family: 'Monaco', 'Courier New', monospace;">
+          <div style="flex: 1; font-size: 13px; line-height: 1.6; font-family: var(--mono);">
             ${matchedText}
           </div>
         </div>

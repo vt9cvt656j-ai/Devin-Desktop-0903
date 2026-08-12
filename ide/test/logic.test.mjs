@@ -291,6 +291,13 @@ AUTO_LOAD_DEPS = {
   // _thinkingProfileFor routes the Claude families by generation now, so every test that loads
   // it needs the parser too.
   _claudeGeneration: load("_claudeGeneration"),
+  // 编辑器和终端的等宽字体栈。真值而不是桩：这些函数把它原样传给 Monaco / xterm，
+  // 而它的全部意义就在于内容本身（拉丁等宽 + 中文黑体，顺序不能错）。漏掉它，
+  // createTermTab 这类函数会以 ReferenceError 收场 —— 表现成"终端没建出来"，
+  // 而不是"字体不对"，排查起来完全不像字体问题。
+  MONO_STACK: load("monoStack", { CJK_FALLBACK: loadConst("CJK_FALLBACK") })(
+    loadConst("MONO_STACK_LATIN"),
+  ),
 };
 // _selectInitialTools is loaded in many isolated tests. Keep its resolved
 // intent-boundary helpers available in the shared harness rather than making

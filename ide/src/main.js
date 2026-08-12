@@ -2244,6 +2244,30 @@ const runBtn = $("runBtn");
 const toastEl = $("toast");
 
 // ---- editor state ----
+
+/*
+ * 中文兜底字体。
+ *
+ * Monaco 和 xterm 不读 CSS 变量，字体要在选项里逐个传进去 —— 于是这几处的字体栈是各写
+ * 各的，而且清一色以 `monospace` 收尾，没有一个字体含汉字。字体栈里没人认领汉字，浏览
+ * 器就走系统兜底，各平台的兜底都是衬线体：macOS 宋体（Songti SC），Windows 宋体
+ * （SimSun）。代码里的中文注释、终端里的中文输出，因此全是宋体。
+ *
+ * 位置在等宽字体**之后**、`monospace` **之前**：英文数字照旧走 SF Mono，汉字在轮到系统
+ * 兜底之前就已经被苹方/雅黑接住。三个平台各留一手，漏掉哪个那个平台就退回宋体。
+ */
+const CJK_FALLBACK = "PingFang SC, Microsoft YaHei UI, Microsoft YaHei, Noto Sans CJK SC, Source Han Sans SC";
+
+/** 拼一条带中文兜底的等宽栈。传入的是拉丁部分，不要带结尾的 `monospace`。 */
+function monoStack(latin) {
+  return `${latin}, ${CJK_FALLBACK}, monospace`;
+}
+
+/** 编辑器和终端的默认等宽栈。改这里等于同时改 Monaco、diff、终端。 */
+/** 拉丁部分单列一行，测试要拿它现算出同一条栈，不许在测试里另抄一份。 */
+const MONO_STACK_LATIN = "SF Mono, ui-monospace, SFMono-Regular, Menlo, JetBrains Mono, Consolas";
+const MONO_STACK = monoStack(MONO_STACK_LATIN);
+
 const monacoEditor = monaco.editor.create(editorEl, {
   // Start model-less: session restore immediately installs a real file model,
   // so creating and disposing a throwaway plaintext model only races Monaco's
@@ -2292,7 +2316,7 @@ const monacoEditor = monaco.editor.create(editorEl, {
   parameterHints: { enabled: true, cycle: true },
   inlineSuggest: { enabled: true, mode: "subwordSmart" },
   fontSize: 13,
-  fontFamily: "SF Mono, ui-monospace, Menlo, monospace",
+  fontFamily: MONO_STACK,
   minimap: { enabled: true, maxColumn: 80, renderCharacters: false, scale: 1 },
   scrollBeyondLastLine: false,
   renderWhitespace: "selection",
@@ -3477,7 +3501,7 @@ function openSplitEditor(filePath) {
     automaticLayout: true,
     fixedOverflowWidgets: true,
     fontSize: monacoEditor.getOptions().get(52),
-    fontFamily: "SF Mono, ui-monospace, Menlo, monospace",
+    fontFamily: MONO_STACK,
     minimap: { enabled: false },
     scrollBeyondLastLine: false,
     renderWhitespace: "selection",
@@ -3617,7 +3641,7 @@ const DEFAULT_EDITOR_SETTINGS = {
   country: "CN",
   theme: "light",
   fontSize: 13,
-  fontFamily: "SF Mono, ui-monospace, Menlo, monospace",
+  fontFamily: MONO_STACK,
   appIcon: "",
   lineHeight: 0,
   tabSize: 4,
@@ -3631,14 +3655,16 @@ const DEFAULT_EDITOR_SETTINGS = {
 };
 
 const FONT_FAMILY_OPTIONS = Object.freeze([
-  ["SF Mono, ui-monospace, Menlo, monospace", "SF Mono"],
-  ["JetBrains Mono, SF Mono, ui-monospace, Menlo, monospace", "JetBrains Mono"],
-  ["Cascadia Code, SF Mono, ui-monospace, Menlo, monospace", "Cascadia Code"],
-  ["Fira Code, SF Mono, ui-monospace, Menlo, monospace", "Fira Code"],
-  ["Menlo, SF Mono, ui-monospace, monospace", "Menlo"],
-  ["Monaco, SF Mono, ui-monospace, monospace", "Monaco"],
-  ["Consolas, SF Mono, ui-monospace, monospace", "Consolas"],
-  ["ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace", "System Monospace"],
+  // 每一项都过一遍 monoStack()，把中文兜底接在后面 —— 以前这八个选项全都以 `monospace`
+  // 收尾且不含汉字，所以无论用户选哪一个，代码里的中文都是宋体。
+  [monoStack("SF Mono, ui-monospace, Menlo"), "SF Mono"],
+  [monoStack("JetBrains Mono, SF Mono, ui-monospace, Menlo"), "JetBrains Mono"],
+  [monoStack("Cascadia Code, SF Mono, ui-monospace, Menlo"), "Cascadia Code"],
+  [monoStack("Fira Code, SF Mono, ui-monospace, Menlo"), "Fira Code"],
+  [monoStack("Menlo, SF Mono, ui-monospace"), "Menlo"],
+  [monoStack("Monaco, SF Mono, ui-monospace"), "Monaco"],
+  [monoStack("Consolas, SF Mono, ui-monospace"), "Consolas"],
+  [monoStack("ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas"), "System Monospace"],
 ]);
 
 const COUNTRY_OPTIONS = Object.freeze([
@@ -3774,8 +3800,27 @@ async function loadEditorPrefs() {
     localStorage.removeItem("michael-ide.autosave");
   }
   _editorPrefs.appIcon = normalizeAppIcon(_editorPrefs.appIcon || "");
+  _editorPrefs.fontFamily = withCjkFallback(_editorPrefs.fontFamily);
   localStorage.setItem("michael-ide-country", _editorPrefs.country);
   return _editorPrefs;
+}
+
+/**
+ * 给一条存下来的字体栈补上中文兜底。
+ *
+ * 光改默认值救不了已经选过字体的人：他们的偏好里存着旧的那一串，一个中文字体都没有，
+ * 于是编辑器里的中文照旧是宋体 —— 而且因为那串已经不在选项表里，设置面板还会把它显示
+ * 成"自定义"，看上去像是他自己挑的。这里在读取时就地补齐，不需要他重新选一次。
+ *
+ * 已经有中文字体的原样返回：用户真的手填了别的中文字体，不该被覆盖掉。
+ */
+function withCjkFallback(stack) {
+  const s = String(stack || "").trim();
+  if (!s) return "";
+  if (/PingFang|YaHei|Noto Sans CJK|Source Han|Hiragino|Songti|SimSun|微软雅黑|苹方/i.test(s)) return s;
+  // 去掉结尾的通用族再拼，免得出现 `…, monospace, PingFang SC, monospace` 这种
+  // 汉字永远轮不到中文字体的顺序。
+  return monoStack(s.replace(/,\s*(monospace|sans-serif|serif)\s*$/i, ""));
 }
 
 async function saveEditorPrefs() {
@@ -6137,7 +6182,7 @@ function _mpmEnsureSqlEditor() {
     minimap: { enabled: false },
     fontSize: 13,
     lineHeight: 21,
-    fontFamily: "ui-monospace, SFMono-Regular, Menlo, Consolas, monospace",
+    fontFamily: MONO_STACK,
     lineNumbers: "on",
     folding: true,
     wordWrap: "off",
@@ -11860,7 +11905,7 @@ function ensureDiffEditor(opts = {}) {
     renderSideBySide: true,
     enableSplitViewResizing: true,
     fontSize: 13,
-    fontFamily: "SF Mono, ui-monospace, Menlo, monospace",
+    fontFamily: MONO_STACK,
     minimap: { enabled: false },
     scrollBeyondLastLine: false,
     renderOverviewRuler: true,
@@ -13284,7 +13329,7 @@ async function showProfile() {
     st.textContent =
       "@keyframes pf-fade{from{opacity:0}to{opacity:1}}" +
       "@keyframes pf-pop{from{opacity:0;transform:translateY(16px) scale(.96)}to{opacity:1;transform:none}}" +
-      ".pf-ov{position:fixed;inset:0;background:rgba(32,33,36,.45);backdrop-filter:blur(2px);display:grid;place-items:center;z-index:99999;font-family:'Roboto',-apple-system,'PingFang SC',sans-serif;animation:pf-fade .18s ease both}" +
+      ".pf-ov{position:fixed;inset:0;background:rgba(32,33,36,.45);backdrop-filter:blur(2px);display:grid;place-items:center;z-index:99999;font-family:var(--font);animation:pf-fade .18s ease both}" +
       ".pf-card{background:#fff;color:#202124;border-radius:18px;width:440px;max-width:92vw;box-shadow:0 24px 70px rgba(60,64,67,.28),0 4px 12px rgba(60,64,67,.14);animation:pf-pop .32s cubic-bezier(.2,.75,.2,1) both;overflow:hidden}" +
       ".pf-head{display:flex;align-items:center;gap:14px;padding:26px 26px 20px}" +
       // Identical to the account console's Avatar: same source field, same fallback rule
@@ -13422,7 +13467,7 @@ async function showCustomModelsDialog() {
     st.textContent =
       "@keyframes cm-fade{from{opacity:0}to{opacity:1}}" +
       "@keyframes cm-pop{from{opacity:0;transform:translateY(16px) scale(.96)}to{opacity:1;transform:none}}" +
-      ".cm-ov{position:fixed;inset:0;background:rgba(32,33,36,.45);backdrop-filter:blur(2px);display:grid;place-items:center;z-index:99999;font-family:'Roboto',-apple-system,'PingFang SC',sans-serif;animation:cm-fade .18s ease both}" +
+      ".cm-ov{position:fixed;inset:0;background:rgba(32,33,36,.45);backdrop-filter:blur(2px);display:grid;place-items:center;z-index:99999;font-family:var(--font);animation:cm-fade .18s ease both}" +
       ".cm-card{background:#fff;color:#202124;border-radius:18px;width:480px;max-width:94vw;max-height:86vh;display:flex;flex-direction:column;box-shadow:0 24px 70px rgba(60,64,67,.28),0 4px 12px rgba(60,64,67,.14);animation:cm-pop .32s cubic-bezier(.2,.75,.2,1) both;overflow:hidden}" +
       ".cm-head{display:flex;align-items:center;gap:10px;padding:20px 24px 14px}" +
       ".cm-title{font-size:16px;font-weight:600;display:flex;align-items:center;gap:8px}" +
@@ -56402,7 +56447,7 @@ function _confirmDialog(title, body, confirmLabel, danger) {
   return new Promise((resolve) => {
     const esc = (s) => String(s == null ? "" : s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
     const ov = document.createElement("div");
-    ov.style.cssText = "position:fixed;inset:0;background:rgba(32,33,36,.45);backdrop-filter:blur(2px);display:grid;place-items:center;z-index:100000;font-family:'Roboto',-apple-system,'PingFang SC',sans-serif";
+    ov.style.cssText = "position:fixed;inset:0;background:rgba(32,33,36,.45);backdrop-filter:blur(2px);display:grid;place-items:center;z-index:100000;font-family:var(--font)";
     const card = document.createElement("div");
     card.style.cssText = "background:#fff;color:#202124;border-radius:16px;width:360px;max-width:90vw;box-shadow:0 24px 70px rgba(60,64,67,.28),0 4px 12px rgba(60,64,67,.14);overflow:hidden";
     card.innerHTML =
@@ -57946,7 +57991,7 @@ async function _openRemoteSshPanel(value, remoteRoot = "", password = "") {
   const stateEl = panelEl.querySelector("._sshState");
   const term = new Terminal({
     fontSize: 13,
-    fontFamily: "'SF Mono', Menlo, ui-monospace, 'JetBrains Mono', Consolas, monospace",
+    fontFamily: MONO_STACK,
     fontWeight: "normal",
     fontWeightBold: "bold",
     lineHeight: 1.42,
@@ -60333,7 +60378,7 @@ async function createTermTab(customLabel, cwdOverride = "") {
 
   const term = new Terminal({
     fontSize: 13,
-    fontFamily: "'SF Mono', Menlo, ui-monospace, 'JetBrains Mono', Consolas, monospace",
+    fontFamily: MONO_STACK,
     fontWeight: "normal",
     fontWeightBold: "bold",
     lineHeight: 1.4,

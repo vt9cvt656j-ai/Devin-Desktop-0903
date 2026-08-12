@@ -101,7 +101,12 @@ async function createTermTab() {
 
   const term = new Terminal({
     fontSize: 13,
-    fontFamily: "'SF Mono', Menlo, ui-monospace, 'JetBrains Mono', Consolas, monospace",
+    // 和 main.js 的 MONO_STACK 同一条栈。这里复制而不是 import：terminal.js 被
+    // main.js 引用，反向 import 会成环。中文黑体必须排在通用 monospace **之前**，
+    // 否则终端里的中文输出会掉到系统兜底 —— 也就是宋体。
+    fontFamily:
+      "'SF Mono', Menlo, ui-monospace, 'JetBrains Mono', Consolas, " +
+      "'PingFang SC', 'Microsoft YaHei UI', 'Microsoft YaHei', 'Noto Sans CJK SC', monospace",
     fontWeight: "normal",
     fontWeightBold: "bold",
     lineHeight: 1.4,
