@@ -90,7 +90,7 @@ fn response(
     mut limitations: Vec<String>,
 ) -> LiveDataResponse {
     limitations.push(
-        "retrieved_at is when Michael IDE completed this request, not the provider's model-validity, publication, observation, or event time."
+        "retrieved_at is when Mr. Day One completed this request, not the provider's model-validity, publication, observation, or event time."
             .into(),
     );
     limitations.push(

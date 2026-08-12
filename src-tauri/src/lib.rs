@@ -140,7 +140,9 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_process::init())
-        .plugin(tauri_plugin_store::Builder::new().build());
+        .plugin(tauri_plugin_store::Builder::new().build())
+        // mrday:// —— 网页登录页靠它唤起本 App 完成登录交接。
+        .plugin(tauri_plugin_deep_link::init());
 
     #[cfg(target_os = "macos")]
     {
@@ -168,7 +170,49 @@ pub fn run() {
 
             // Loopback listener the web sign-in page uses to adopt this app's session.
             // It starts signed-out; the frontend fills it in via handoff_set_session.
+            //
+            // 留着是因为它对**同机的非浏览器调用方**仍然有效（也仍然只认白名单来源）。
+            // 浏览器那条路已经不走它了：HTTPS 页面打明文 loopback 端口会被 Chrome 直接
+            // 拒绝，改走 mrday:// 深链 —— 见下面的 on_open_url。
             handoff::start();
+
+            /*
+             * 深链：mrday://signin?nonce=…
+             *
+             * 网页登录页打开它，操作系统把本 App 拉到前台（没运行会被一并启动），我们把
+             * nonce 转交给前端，由前端拿自己的登录令牌去网关认领 —— 认领成功网关就替这个
+             * 账号签一张网页会话，登录页那边轮询取走。
+             *
+             * 这里只做搬运：不解析令牌、不碰会话，身份完全由前端那张令牌决定。
+             */
+            {
+                use tauri::{Emitter, Manager};
+                use tauri_plugin_deep_link::DeepLinkExt;
+                let handle = app.handle().clone();
+                app.deep_link().on_open_url(move |event| {
+                    for url in event.urls() {
+                        if url.scheme() != "mrday" {
+                            continue;
+                        }
+                        let nonce = url
+                            .query_pairs()
+                            .find(|(k, _)| k == "nonce")
+                            .map(|(_, v)| v.to_string())
+                            .unwrap_or_default();
+                        // 只放行十六进制，长度也卡住：这串会被原样发回网关。
+                        let ok = !nonce.is_empty()
+                            && nonce.len() <= 64
+                            && nonce.chars().all(|c| c.is_ascii_hexdigit());
+                        if !ok {
+                            continue;
+                        }
+                        if let Some(w) = handle.get_webview_window("main") {
+                            let _ = w.set_focus();
+                            let _ = w.emit("michael://handoff-signin", nonce);
+                        }
+                    }
+                });
+            }
 
             // WebKit fetches do not share the Rust AI client's connection pool. Warm
             // that pool in the background so the first model turn does not pay a cold
@@ -405,7 +449,7 @@ pub fn run() {
             cleanup_stale,
         ])
         .build(tauri::generate_context!())
-        .expect("error while building Michael IDE")
+        .expect("error while building Mr. Day One")
         .run(|handle, event| {
             // On app exit, kill every child process (shells / LSP servers / debug
             // adapters) so nothing is left running after the window closes.

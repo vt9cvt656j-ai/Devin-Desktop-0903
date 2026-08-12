@@ -1844,7 +1844,7 @@ test("help menu opens a real About dialog with app version and owner info", () =
     "About should no longer be a transient toast");
   assert.match(I18N, /"menu\.about":\s*"关于"/,
     "Chinese Help menu should show short label 关于");
-  assert.doesNotMatch(I18N, /"menu\.about":\s*"关于 Michael IDE"/,
+  assert.doesNotMatch(I18N, /"menu\.about":\s*"关于 (?:Michael IDE|Mr\. Day One)"/,
     "Chinese Help menu should not keep the long product name in the menu item");
 
   assert.match(SRC, /import appPackage from "\.\.\/package\.json";/,
@@ -4407,7 +4407,7 @@ test("memory center uses Michael-owned labels and hides competitor implementatio
   assert.doesNotMatch(MEMORY_SRC, /Windsurf|Claude Code|Copilot|AGENTS\.md|CLAUDE\.md|\.cursorrules|copilot-instructions/i,
     "the island must not expose competitor names either");
   assert.doesNotMatch(panel, /Windsurf|Claude Code|Copilot|AGENTS\.md|CLAUDE\.md|\.cursorrules|copilot-instructions/i,
-    "the visible memory dialog markup should keep Michael IDE branding instead of showing implementation lineage");
+    "the visible memory dialog markup should keep Mr. Day One branding instead of showing implementation lineage");
   // Saving takes the island's current text rather than reading a textarea by class.
   assert.match(panel, /_saveKgText\(root, project\)/);
   assert.match(panel, /_saveKgText\("", global\)/);
@@ -6158,7 +6158,7 @@ test("agent retry toast is scoped and clears when real data resumes", () => {
   assert.doesNotMatch(SRC, /网络\/服务波动 \(\$\{_turnFails\}\/5\)|等待链路恢复后自动继续/);
 });
 
-test("Codex image skill tool naming maps to Michael IDE's real image tool", () => {
+test("Codex image skill tool naming maps to Mr. Day One's real image tool", () => {
   const canonical = load("_canonicalToolName", {
     _KNOWN_TOOLS: new Set(["generate_image"]),
     _TOOL_ALIASES: { image_gen: "generate_image" },
@@ -6444,9 +6444,9 @@ test("Plan Explorer Reviewer and Chat receive upgraded mode-specific operating r
     "non-Agent modes should get a runtime discipline block");
   assert.match(SRC, /const _contextPreamble = _dynPreamble \+ _atContext \+ _modeFrame \+ _decisionFrame/,
     "mode-specific guidance must be placed before the final user request");
-  assert.match(SRC, /plan: `你是 Michael IDE 的 Plan 模式：只读调查 \+ 输出可执行方案/);
-  assert.match(SRC, /explorer: `你是 Michael IDE 的 Explorer 模式：只读代码库侦察员/);
-  assert.match(SRC, /reviewer: `你是 Michael IDE 的 Reviewer 模式：只读代码审查员/);
+  assert.match(SRC, /plan: `你是 Mr\. Day One 的 Plan 模式：只读调查 \+ 输出可执行方案/);
+  assert.match(SRC, /explorer: `你是 Mr\. Day One 的 Explorer 模式：只读代码库侦察员/);
+  assert.match(SRC, /reviewer: `你是 Mr\. Day One 的 Reviewer 模式：只读代码审查员/);
 });
 
 test("semantic lightweight chat builds a genuinely small request body", () => {
@@ -20962,7 +20962,7 @@ test("an empty profile emits no design flag — the failure mode this guards", (
 test("_looksLikeUserQuestion: sign-offs and choice questions still pause the run", () => {
   const q = load("_looksLikeUserQuestion");
   // The exact reported closer.
-  assert.equal(q("你现在桌面上有 Mr.day One 官网这个项目，想继续完善它，还是想做点别的新东西？随时说 👋"), true);
+  assert.equal(q("你现在桌面上有 Mr. Day One 官网这个项目，想继续完善它，还是想做点别的新东西？随时说 👋"), true);
   assert.equal(q("需要我先跑一遍构建吗？随时说"), true, "a trailing sign-off must not disqualify");
   assert.equal(q("Which one do you want? let me know 😊"), true);
   assert.equal(q("用 Tailwind 还是原生 CSS？"), true, "A-or-B is a choice question by shape");

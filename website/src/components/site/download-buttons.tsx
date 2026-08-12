@@ -16,6 +16,16 @@ import { cn } from "@/lib/utils";
  * 运营在控制台发布 release 之后，这里下一次加载自动变成真实下载，站点不用再改。
  */
 const UPDATE_FEED = "https://code.mrday.one/api/ide/update";
+/**
+ * The installers that exist right now.
+ *
+ * The feed above only answers when a release carries `latest.json`, the signed manifest
+ * the auto-updater needs — and the published release predates that file, so it answers
+ * "no update" and this page concluded there was nothing to download at all. Installing and
+ * auto-updating are different questions: this endpoint reads the release's own assets, so
+ * the buttons offer what is actually published.
+ */
+const DOWNLOADS = "https://code.mrday.one/api/ide/downloads";
 const SIGN_UP = "https://code.mrday.one/gate";
 
 /** lucide has no Windows glyph; this is the four-pane mark. */
@@ -50,6 +60,29 @@ function useDetectedOS(): OS {
   return os;
 }
 
+/**
+ * The published installers, or `none` if there genuinely are not any.
+ *
+ * Kept separate from the manifest path above so the two reasons a download can be missing
+ * stay distinguishable: "no signed manifest" is common and recoverable, "no release at
+ * all" is the only one that should send someone to a sign-up link.
+ */
+async function installersOrNone(): Promise<Release> {
+  try {
+    const res = await fetch(DOWNLOADS, { cache: "no-store" });
+    if (!res.ok) return { state: "none" };
+    const body = (await res.json()) as { version?: string; mac?: string | null; windows?: string | null };
+    const urls: Partial<Record<OS, string>> = {};
+    if (body.mac) urls.mac = body.mac;
+    if (body.windows) urls.windows = body.windows;
+    return Object.keys(urls).length
+      ? { state: "ready", version: body.version ?? "", urls }
+      : { state: "none" };
+  } catch {
+    return { state: "none" };
+  }
+}
+
 function useRelease(): Release {
   const [release, setRelease] = useState<Release>({ state: "checking" });
   useEffect(() => {
@@ -69,13 +102,15 @@ function useRelease(): Release {
           if (url) urls[os] = url;
         }
         if (!alive) return;
-        setRelease(
-          Object.keys(urls).length
-            ? { state: "ready", version: manifest.version ?? "", urls }
-            : { state: "none" },
-        );
+        if (Object.keys(urls).length) {
+          setRelease({ state: "ready", version: manifest.version ?? "", urls });
+          return;
+        }
+        throw new Error("manifest carried no platforms");
       } catch {
-        if (alive) setRelease({ state: "none" });
+        // No manifest is not the same as nothing to install. Ask what is actually
+        // published before giving up and showing a sign-up link.
+        if (alive) setRelease(await installersOrNone());
       }
     })();
     return () => {
@@ -90,7 +125,9 @@ type IconType = React.ComponentType<{ className?: string }>;
 const PLATFORMS: Record<OS, { label: string; requirement: string; icon: IconType }> = {
   mac: {
     label: "Download for macOS",
-    requirement: "macOS 13+ · Apple Silicon · .dmg",
+    // The published disk image is universal, so it covers both architectures. Saying
+    // "Apple Silicon" here turned away Intel Mac owners the build actually supports.
+    requirement: "macOS 13+ · Intel & Apple Silicon · .dmg",
     icon: Apple,
   },
   windows: {

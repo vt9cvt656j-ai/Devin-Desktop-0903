@@ -23,14 +23,14 @@ export function IdeWindow({ className }: { className?: string }) {
         src={ideLight}
         width={1360}
         height={850}
-        alt="Mr.day One in light mode: the file explorer, a TypeScript file open in the Monaco editor, and the AI assistant panel"
+        alt="Mr. Day One in light mode: the file explorer, a TypeScript file open in the Monaco editor, and the AI assistant panel"
         className="block w-full dark:hidden"
       />
       <img
         src={ideDark}
         width={1360}
         height={850}
-        alt="Mr.day One in dark mode: the file explorer, a TypeScript file open in the Monaco editor, and the AI assistant panel"
+        alt="Mr. Day One in dark mode: the file explorer, a TypeScript file open in the Monaco editor, and the AI assistant panel"
         className="hidden w-full dark:block"
       />
     </div>

@@ -1020,7 +1020,7 @@ pub fn git_resolve_conflict(root: String, rel: String, resolution: String) -> Re
 #[tauri::command(async)]
 pub fn git_stash(root: String) -> Result<String, String> {
     require_git_root(&root, true)?;
-    let out = run_git(&root, &["stash", "push", "-m", "Michael IDE stash"])?;
+    let out = run_git(&root, &["stash", "push", "-m", "Mr. Day One stash"])?;
     let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
     if out.status.success() {
         Ok(if text.is_empty() {
@@ -1232,7 +1232,7 @@ mod tests {
     }
 
     fn configure_identity(root: &str) {
-        run_git_checked(root, &["config", "user.name", "Michael IDE Test"]).unwrap();
+        run_git_checked(root, &["config", "user.name", "Mr. Day One Test"]).unwrap();
         run_git_checked(root, &["config", "user.email", "ide-test@example.invalid"]).unwrap();
     }
 

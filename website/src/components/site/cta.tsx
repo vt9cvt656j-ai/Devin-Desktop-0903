@@ -11,7 +11,7 @@ export function Cta() {
             Stop reviewing suggestions. Start reviewing verified diffs.
           </h2>
           <p className="mx-auto mt-4 max-w-xl text-primary-foreground/70">
-            Mr.day One is free while in preview.
+            Mr. Day One is free while in preview.
           </p>
           <DownloadButtons variant="onDark" className="mt-8" />
         </SectionReveal>

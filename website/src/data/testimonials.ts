@@ -34,7 +34,7 @@ export type Testimonial = {
 export const testimonials: Testimonial[] = [
   {
     id: "one",
-    quote: "Paste a real post about Mr.day One here, word for word.",
+    quote: "Paste a real post about Mr. Day One here, word for word.",
     name: "Their name",
     handle: "theirhandle",
     platform: "x",

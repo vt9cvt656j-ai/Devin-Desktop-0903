@@ -4,7 +4,7 @@
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <meta name="robots" content="noindex, nofollow" />
-<title>Mr.day One · Sign in</title>
+<title>Mr. Day One · Sign in</title>
 <link rel="icon" type="image/png" href="/console/logo.png" />
 <style>
   :root {
@@ -60,6 +60,16 @@
   .link:hover { text-decoration: underline; }
   .back { margin-bottom: 12px; font-size: 13px; color: var(--muted); }
   .hint { font-size: 12.5px; color: var(--muted); margin: -6px 0 14px; }
+  /* 「(optional)」比标签本身轻一档：它说明的是「可以不填」，不该和字段名争注意力。 */
+  .opt { font-weight: 400; color: var(--muted); }
+  .ref-note {
+    display: flex; align-items: center; gap: 8px;
+    margin: 0 0 14px; padding: 10px 12px;
+    font-size: 13px; line-height: 1.5;
+    border: 1px solid var(--line); border-radius: 10px;
+    background: var(--soft); color: var(--fg);
+  }
+  .ref-note b { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; letter-spacing: .04em; }
   .or {
     display: flex; align-items: center; gap: 12px;
     margin: 20px 0 12px; font-size: 12px; color: var(--muted);
@@ -67,7 +77,11 @@
   .or::before, .or::after { content: ""; flex: 1; height: 1px; background: var(--line); }
   .providers { display: flex; flex-direction: column; gap: 10px; }
   .pv {
-    display: flex; align-items: center; gap: 10px; width: 100%;
+    /* 图标和文字作为一组居中。原来是「图标贴左 + 文字 flex:1 左对齐」，
+       三个按钮的文字起点被各自的图标宽度推着走，整排看上去是歪的。
+       徽章改成绝对定位钉在右边，这样它在不在都不会把中间那组推偏。 */
+    display: flex; align-items: center; justify-content: center; gap: 10px;
+    position: relative; width: 100%;
     padding: 12px 14px; font: inherit; font-size: 14.5px; font-weight: 550;
     border: 1px solid var(--line); border-radius: 10px;
     background: var(--card); color: inherit; cursor: pointer;
@@ -76,11 +90,12 @@
   .pv:hover:not(:disabled) { background: var(--soft); border-color: color-mix(in srgb, var(--ink) 22%, var(--line)); }
   .pv:disabled { cursor: not-allowed; opacity: .5; }
   .pv .mark { width: 18px; height: 18px; flex: none; }
-  .pv .txt { flex: 1; text-align: left; }
+  .pv .txt { flex: none; text-align: center; }
   /* "Soon" is the starting state, not the permanent one: the page asks the gateway which
      providers have credentials and takes the badge off those that do. A button that looks
      live but cannot sign anyone in is worse than an honest one. */
   .soon {
+    position: absolute; right: 14px;
     flex: none; font-size: 10px; font-weight: 600; letter-spacing: .04em;
     text-transform: uppercase; color: var(--muted);
     border: 1px solid var(--line); border-radius: 999px; padding: 2px 7px;
@@ -93,6 +108,7 @@
   }
   .pv.is-live:hover:not(:disabled) { background: color-mix(in srgb, var(--brand) 11%, var(--card)); }
   .tag {
+    position: absolute; right: 14px;
     flex: none; font-size: 10px; font-weight: 600; letter-spacing: .04em;
     text-transform: uppercase; color: var(--brand);
     border: 1px solid color-mix(in srgb, var(--brand) 40%, transparent);
@@ -104,7 +120,7 @@
 <body>
   <main class="wrap">
     <img class="logo" src="/console/logo.png" alt="" />
-    <h1 id="title">Welcome to Mr.day One</h1>
+    <h1 id="title">Welcome to Mr. Day One</h1>
     <p class="sub" id="subtitle">Create an account or sign in to continue</p>
 
     <!-- step 1: which email -->
@@ -130,8 +146,23 @@
       <p class="hint">We emailed you a code. It expires shortly.</p>
       <label for="newpw">Choose a password</label>
       <input id="newpw" type="password" required autocomplete="new-password" placeholder="At least 8 characters" minlength="8" />
+      <!--
+        邀请码。可选，而且是全站唯一能手动输入它的地方。
+        产品文案一直写着「或者填了你邀请码的人都算你的」，但在这之前根本没有可填的地方 ——
+        邀请码只能通过带 ?ref= 的链接生效，直接把码给朋友是无效的。
+        这里写进的是和链接完全同一个键（mide_ref），所以后面的绑定逻辑一行都不用改。
+      -->
+      <label for="refcode">Invite code <span class="opt">(optional)</span></label>
+      <input id="refcode" type="text" autocomplete="off" spellcheck="false" placeholder="e.g. 3Y37R9A5" maxlength="12" />
       <button class="primary" id="signupBtn" type="submit">Create account</button>
     </form>
+
+    <!--
+      邀请横幅。地址栏里的 ?ref= 会被 parkReferral 抹掉（避免刷新重复处理、避免这个码跟着
+      历史记录和 referer 到处跑），但抹掉之后页面和普通登录页一模一样 —— 用户看不出邀请
+      关系还在不在，只能以为链接失效了。所以把记住的码摆出来。
+    -->
+    <div class="ref-note" id="refNote" hidden></div>
 
     <div class="msg" id="msg"></div>
 
@@ -148,9 +179,9 @@
           <span class="txt">Continue with Google</span>
           <span class="soon" id="pvGoogleSoon">Soon</span>
         </button>
-        <button class="pv" type="button" id="pvMrday" aria-label="Continue with Mr.day One">
+        <button class="pv" type="button" id="pvMrday" aria-label="Continue with Mr. Day One">
           <img class="mark" id="pvLogo" alt="" />
-          <span class="txt">Continue with Mr.day One</span>
+          <span class="txt">Continue with Mr. Day One</span>
           <span class="tag" id="pvTag" hidden>Desktop</span>
         </button>
       </div>
@@ -189,7 +220,7 @@
     $("title").textContent =
       which === "signup" ? "Create your account"
       : which === "login" ? "Welcome back"
-      : "Welcome to Mr.day One";
+      : "Welcome to Mr. Day One";
     $("subtitle").textContent =
       which === "signup" ? "Confirm your email and pick a password"
       : which === "login" ? "Enter your password to continue"
@@ -284,7 +315,16 @@
     });
   })();
 
-  function finish(token) {
+  /*
+   * Write the cookie that actually decides whether the app shell is served.
+   *
+   * Split out of finish() because resume() needs it too, and the two getting out of step
+   * is not a cosmetic bug: nginx gates /dashboard on `$cookie_mide_token` alone, while
+   * this page decides "already signed in" from localStorage first. Redirecting on the
+   * strength of a token without also writing the cookie sends the person to a route that
+   * is guaranteed to bounce them straight back here.
+   */
+  function writeSessionCookie(token) {
     // The cookie nginx checks before serving the app shell. Real API calls still carry
     // the Bearer token and are authorized per request.
     // Lax, not Strict. Strict withholds the cookie on EVERY cross-site navigation —
@@ -295,9 +335,54 @@
     // Lax still withholds it from cross-site subresources and cross-site POSTs, which is
     // where CSRF lives. It only adds it back on top-level GET navigation — exactly the
     // return-from-checkout case, and nothing that can be triggered silently.
-    document.cookie = "mide_token=" + encodeURIComponent(token) + "; Path=/; Secure; SameSite=Lax; Max-Age=" + (7 * 24 * 3600);
+    // Domain=.mrday.one, not host-only.
+    //
+    // The marketing site is served from the apex and the gateway from code.mrday.one, so a
+    // host-only cookie is invisible to the site — someone with a live session was still
+    // being asked to log in there. Widening it to the registrable domain lets the site
+    // read the token and greet them by name.
+    //
+    // It stays SameSite=Lax: the site sends the token as an Authorization header, never as
+    // a cross-site cookie, so nothing here loosens the console's CSRF posture. What it does
+    // mean is that any *.mrday.one origin can read a session token — fine while those are
+    // the gateway and the site, and a reason not to host untrusted content on a subdomain.
+    document.cookie = "mide_token=" + encodeURIComponent(token) + "; Domain=.mrday.one; Path=/; Secure; SameSite=Lax; Max-Age=" + (7 * 24 * 3600);
     try { localStorage.setItem("michael_token", token); } catch (e) {}
+  }
+
+  /*
+   * Last-resort loop breaker.
+   *
+   * Everything above is meant to stop the gate and the guarded route from disagreeing —
+   * but if they ever do again, the failure mode is the worst one available: the page
+   * reloads forever and the person can neither get in nor sign in. A redirect that comes
+   * straight back within seconds is not a slow network, it is a loop; when that happens,
+   * drop the token this page was trusting and show the form instead.
+   *
+   * sessionStorage, so it is scoped to this tab and gone when the tab closes. Time-bounded
+   * rather than a plain flag: a real bounce returns in milliseconds, while coming back to
+   * the gate on purpose is minutes later, and a flag with no clock would refuse to resume
+   * a perfectly good session for the rest of the tab's life.
+   */
+  var BOUNCE_KEY = "mide_gate_redirect_at";
+  var BOUNCE_WINDOW_MS = 10000;
+  function cameStraightBack() {
+    try {
+      var at = parseInt(sessionStorage.getItem(BOUNCE_KEY) || "0", 10);
+      return at > 0 && Date.now() - at < BOUNCE_WINDOW_MS;
+    } catch (e) { return false; }
+  }
+  function leavingForApp() {
+    try { sessionStorage.setItem(BOUNCE_KEY, String(Date.now())); } catch (e) {}
+  }
+  function forgetBounce() {
+    try { sessionStorage.removeItem(BOUNCE_KEY); } catch (e) {}
+  }
+
+  function finish(token) {
+    writeSessionCookie(token);
     setMsg("Signed in — taking you through…", "ok");
+    leavingForApp();
     location.replace(nextTarget());
   }
 
@@ -357,6 +442,8 @@
     e.preventDefault();
     var btn = $("signupBtn");
     btn.disabled = true; setMsg("Creating your account…");
+    // 在建号之前就把手填的邀请码存好：注册成功会立刻跳走，之后再存就没机会了。
+    parkTypedReferral();
     try {
       var res = await post("/api/auth/register", {
         email: state.email,
@@ -364,6 +451,9 @@
         code: $("code").value.trim(),
         device: "web",
         device_id: deviceId(),
+        // 邀请码跟着注册一起提交 —— 绑推荐人最准确的时机就是建号这一刻。
+        // 存下来的那份仍然留着：这里绑不上（比如程序临时关闭），控制台加载时还会再试一次。
+        referral_code: storedReferral(),
       });
       if (!res.ok) { setMsg(res.data.error || "That code did not work. Check it and try again.", "err"); btn.disabled = false; return; }
       if (res.data.token) return finish(res.data.token);
@@ -381,86 +471,68 @@
     b.addEventListener("click", function () { show("email"); $("email").focus(); });
   });
 
-  // The Mr.day One provider is this page's own email flow, so reuse the header logo
+  // The Mr. Day One provider is this page's own email flow, so reuse the header logo
   // rather than shipping the data URI a second time.
   var headerLogo = document.querySelector("img.logo");
   if (headerLogo) $("pvLogo").src = headerLogo.src;
 
   // ---- Desktop handoff -----------------------------------------------------
-  // If the desktop app is running and signed in, it answers on one of these
-  // loopback ports and will hand this page its session. The custom header is what
-  // forces a CORS preflight, which is how the app gets to refuse other origins
-  // before they ever reach its handler.
-  var HANDOFF_PORTS = [47821, 47822, 47823];
-  var HANDOFF_HEADERS = { "X-MrDay-Handoff": "1" };
-  var desktop = null;
+  /*
+   * 桌面 App 已经登录了，这里就不该再让人输一遍密码。
+   *
+   * **不再走 loopback。** 以前是这个页面去打 http://127.0.0.1:47821 问 App。那条路做不成：
+   * App 在跑、在听、CORS 预检正确返回了 Access-Control-Allow-Private-Network、本地网络权限
+   * 也授予了，Chrome 依然以一句 TypeError: Failed to fetch 拒绝 —— HTTPS 页面访问明文
+   * loopback 端口正是浏览器这几年一直在关掉的形状。整套探测连同它在控制台留下的报错一起删了。
+   *
+   * 换成经由网关的三方交接：
+   *   1. 向网关要一个 nonce 和一个 secret；
+   *   2. 打开 mrday://signin?nonce=…，由操作系统唤起 App（App 没开会被一并拉起，这是深链
+   *      比 loopback 好的地方 —— 以前 App 没开就彻底没戏）；
+   *   3. App 拿自己的登录令牌去认领这个 nonce，网关替它签一张网页会话；
+   *   4. 这个页面拿 nonce + secret 去取。secret 从没进过链接，所以抢到深链的人取不走。
+   */
+  var HANDOFF_POLL_MS = 1000;
+  var HANDOFF_TRIES = 60;        // 约一分钟，够点开系统弹窗 + App 冷启动
 
-  function probePort(port) {
-    var ctl = new AbortController();
-    var timer = setTimeout(function () { ctl.abort(); }, 700);
-    return fetch("http://127.0.0.1:" + port + "/session", {
-      headers: HANDOFF_HEADERS, mode: "cors", cache: "no-store", signal: ctl.signal,
-    })
-      .then(function (r) { return r.ok ? r.json() : Promise.reject(new Error("status " + r.status)); })
-      .then(function (j) {
-        if (!j || j.app !== "mrday-one" || !j.signedIn) throw new Error("no session");
-        return { port: port, email: j.email || "" };
-      })
-      .finally(function () { clearTimeout(timer); });
-  }
-
-  // Sequential, not Promise.any: a refused connection is logged to the console by the
-  // network stack itself and cannot be caught away. Probing in order means the normal
-  // case — app listening on the first port — makes exactly one request and leaves a
-  // clean console, instead of one success plus a handful of visible failures.
-  function findDesktop(i) {
-    if (i >= HANDOFF_PORTS.length) return Promise.reject(new Error("no desktop app"));
-    return probePort(HANDOFF_PORTS[i]).catch(function () { return findDesktop(i + 1); });
-  }
-
-  findDesktop(0)
-    .then(function (found) {
-      desktop = found;
-      $("pvMrday").classList.add("is-live");
-      $("pvTag").hidden = false;
-      if (found.email) {
-        $("pvMrday").querySelector(".txt").textContent = "Continue as " + found.email;
-        $("pvMrday").setAttribute("aria-label", "Continue as " + found.email + ", already signed in on the desktop app");
-      }
-    })
-    .catch(function () { /* app not running, or signed out — the email flow stands */ });
+  function sleep(ms) { return new Promise(function (r) { setTimeout(r, ms); }); }
 
   async function useDesktopSession() {
-    setMsg("Signing you in from the desktop app…");
+    var btn = $("pvMrday");
+    var label = btn.querySelector(".txt");
+    var was = label.textContent;
+    btn.disabled = true;
+    label.textContent = "Opening the desktop app…";
+    setMsg("");
+
     try {
-      var r = await fetch("http://127.0.0.1:" + desktop.port + "/handoff", {
-        method: "POST", headers: HANDOFF_HEADERS, mode: "cors", cache: "no-store",
-      });
-      var j = await r.json().catch(function () { return {}; });
-      if (!r.ok || !j.token) {
-        // Most likely the app was signed out between the probe and the click.
-        setMsg(j.error === "no desktop session"
-          ? "The desktop app is signed out. Use your email instead."
-          : "The desktop app declined the handoff.", "err");
-        desktop = null;
-        $("pvMrday").classList.remove("is-live");
-        $("pvTag").hidden = true;
-        $("pvMrday").querySelector(".txt").textContent = "Continue with Mr.day One";
-        $("pvMrday").setAttribute("aria-label", "Continue with Mr.day One");
-        return;
+      var s = await post("/api/auth/handoff/start", {});
+      if (!s.ok || !s.data || !s.data.nonce) {
+        throw new Error((s.data && s.data.error) || "could not start");
       }
-      finish(j.token);
+      var nonce = s.data.nonce, secret = s.data.secret;
+
+      // 唤起 App。协议没注册时浏览器什么都不会发生 —— 下面的轮询会超时，
+      // 那句提示会告诉用户去更新 App。
+      try { location.href = "mrday://signin?nonce=" + encodeURIComponent(nonce); } catch (e) {}
+
+      setMsg("Waiting for the desktop app… approve the prompt if your browser asks.");
+      for (var i = 0; i < HANDOFF_TRIES; i++) {
+        await sleep(HANDOFF_POLL_MS);
+        var r = await post("/api/auth/handoff/poll", { nonce: nonce, secret: secret });
+        if (r.ok && r.data && r.data.ready && r.data.token) return finish(r.data.token);
+        // 交接过期或凭据不符 —— 再等下去也没有意义。
+        if (!r.ok) break;
+      }
+      setMsg("The desktop app did not respond. Make sure it is open and up to date, or sign in with your email.", "err");
     } catch (e) {
       setMsg("Could not reach the desktop app. Sign in with your email instead.", "err");
     }
+    btn.disabled = false;
+    label.textContent = was;
   }
 
-  $("pvMrday").addEventListener("click", function () {
-    if (desktop) return useDesktopSession();
-    var email = $("email");
-    if (email.value.trim()) forms.email.requestSubmit();
-    else { email.focus(); setMsg("Enter your email above to continue with Mr.day One."); }
-  });
+  $("pvMrday").addEventListener("click", function () { return useDesktopSession(); });
 
   function storedToken() {
     try {
@@ -477,21 +549,56 @@
    * against /api/me rather than trusted for merely existing, so an expired or revoked one
    * falls through to the form instead of bouncing the person into a console that would
    * immediately throw them back here.
+   *
+   * The redirect writes the cookie first. This page reads localStorage before the cookie,
+   * but nginx gates /dashboard on the cookie and nothing else — so resuming on a token
+   * whose cookie is gone used to send the person to a route that bounced them right back,
+   * forever. Signing out on the marketing site produced exactly that: mrday.one can delete
+   * the shared cookie but cannot reach code.mrday.one's localStorage, so this page kept
+   * finding a token, /api/me kept saying it was valid, and the login page reloaded on a
+   * loop. Sign-out now revokes the session server-side (POST /api/auth/logout) so the
+   * leftover copy is worthless; writing the cookie here closes the same gap for every
+   * other way the two can drift — a cookie that expired at 7 days while the token is good
+   * for 30, most obviously.
    */
   (async function resume() {
     show("email");
     var token = storedToken();
-    if (!token) { $("email").focus(); return; }
+    if (!token) { forgetBounce(); $("email").focus(); return; }
+
+    // We sent someone to the app a moment ago and here they are again. Whatever the app
+    // checks, it is not happy with this token — stop trying, or this repeats forever.
+    if (cameStraightBack()) {
+      forgetBounce();
+      try { localStorage.removeItem("michael_token"); } catch (e) {}
+      document.cookie = "mide_token=; Domain=.mrday.one; Path=/; Max-Age=0";
+      document.cookie = "mide_token=; Path=/; Max-Age=0";
+      setMsg("Your session has ended. Please sign in again.", "err");
+      $("email").focus();
+      return;
+    }
+
     // Hidden, not shown-then-replaced: a login form that flashes up and vanishes looks
     // like a glitch even when the redirect is instant.
     var wrap = document.querySelector("main.wrap");
     wrap.style.visibility = "hidden";
     try {
       var r = await fetch("/api/me", { headers: { Authorization: "Bearer " + token }, cache: "no-store" });
-      if (r.ok) { location.replace(nextTarget()); return; }
+      if (r.ok) {
+        // Restore the cookie before leaving: it is the only thing the guarded route reads.
+        writeSessionCookie(token);
+        leavingForApp();
+        location.replace(nextTarget());
+        return;
+      }
+      // Verified and rejected — revoked, expired, or the account is gone. Clear the copy
+      // that is lying to us, so the next load starts from a clean slate rather than
+      // repeating this request on every visit.
+      try { localStorage.removeItem("michael_token"); } catch (e) {}
     } catch (e) {
       /* offline, or the gateway is down — fall through and let them use the form */
     }
+    forgetBounce();
     wrap.style.visibility = "";
     $("email").focus();
   })();
@@ -516,6 +623,81 @@
     unknown: ["Unknown sign-in method.", "err"],
     error: ["Sign-in failed. Please try again.", "err"]
   };
+
+  /*
+   * A referral link is /gate?ref=CODE. Park the code and get it out of the address bar.
+   *
+   * Parked rather than sent, because there is nobody to attach it to yet — the account may
+   * not even exist. The console claims it after the session is live (see
+   * claimPendingReferral in account-ui), which is also the only place that works for
+   * GitHub and Google: those redirect from the provider straight to /dashboard and never
+   * come back through this page.
+   *
+   * localStorage survives that round trip because the provider returns to this same
+   * origin. The shape is checked here so nothing but a plausible code is ever stored, and
+   * the value is dropped from the URL so a reload or a shared screenshot does not carry
+   * somebody else's referral.
+   */
+  // 存下来的邀请码，localStorage 优先、cookie 兜底 —— 和控制台那边读的是同一套。
+  function storedReferral() {
+    var v = "";
+    try { v = localStorage.getItem("mide_ref") || ""; } catch (e) {}
+    if (!v) {
+      var m = document.cookie.match(/(?:^|;\s*)mide_ref=([^;]+)/);
+      v = m ? decodeURIComponent(m[1]) : "";
+    }
+    return v;
+  }
+
+  // 把记住的邀请码显示出来，并预填进注册表单。
+  function showReferral() {
+    var code = storedReferral();
+    var el = document.getElementById("refNote");
+    if (!el || !code) return;
+    el.innerHTML = "";
+    var span = document.createElement("span");
+    span.appendChild(document.createTextNode("You were invited \u2014 code "));
+    var b = document.createElement("b");
+    b.textContent = code;               // textContent：这个值来自 URL，绝不能当 HTML 插
+    span.appendChild(b);
+    span.appendChild(document.createTextNode(" will be applied when you create your account."));
+    el.appendChild(span);
+    el.hidden = false;
+    var input = document.getElementById("refcode");
+    if (input && !input.value) input.value = code;
+  }
+
+  // 手填的邀请码走和链接同一条路：同一个键、同一套校验。
+  function parkTypedReferral() {
+    var el = document.getElementById("refcode");
+    if (!el) return;
+    var code = (el.value || "").trim().toUpperCase();
+    if (!code) return;
+    if (!/^[2-9A-HJ-NP-Z]{6,12}$/.test(code)) return;
+    try { localStorage.setItem("mide_ref", code); } catch (e) {}
+    try { document.cookie = "mide_ref=" + code + "; Path=/; Max-Age=2592000; SameSite=Lax; Secure"; } catch (e) {}
+  }
+
+  (function parkReferral() {
+    var code;
+    try { code = new URLSearchParams(location.search).get("ref"); } catch (e) { return; }
+    if (!code) return;
+    code = code.trim().toUpperCase();
+    // Same alphabet the gateway mints from, minus the characters it refuses to use.
+    if (!/^[2-9A-HJ-NP-Z]{6,12}$/.test(code)) return;
+    try { localStorage.setItem("mide_ref", code); } catch (e) {}
+    // 再存一份 cookie：隐私模式或第三方存储被禁时 localStorage 会静默失败，
+    // 而这条路上每一个别的状态（令牌）都已经有 cookie 兜底，唯独邀请码没有。
+    try { document.cookie = "mide_ref=" + code + "; Path=/; Max-Age=2592000; SameSite=Lax; Secure"; } catch (e) {}
+    try {
+      var u = new URL(location.href);
+      u.searchParams.delete("ref");
+      history.replaceState({}, "", u.toString());
+    } catch (e) {}
+  })();
+
+  // 不只在带 ?ref= 时显示：上次存下的码这次打开照样有效，也该看得见。
+  try { showReferral(); } catch (e) {}
 
   (function reportOauth() {
     var said;

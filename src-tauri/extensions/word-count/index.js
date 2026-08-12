@@ -1,4 +1,4 @@
-// Word Count — a sample Michael IDE extension.
+// Word Count — a sample Mr. Day One extension.
 //
 // Demonstrates: registering a command, reading the active editor's text, and
 // contributing a status-bar item. Runs inside the sandboxed extension worker;

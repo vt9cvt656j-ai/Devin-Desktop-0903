@@ -22,7 +22,7 @@ export function Hero() {
 
         <SectionReveal delay={160}>
           <p className="type-measure mx-auto mt-6 text-pretty text-lg text-muted-foreground">
-            Mr.day One wires your repo, terminal, and diagnostics into one agent loop. The AI
+            Mr. Day One wires your repo, terminal, and diagnostics into one agent loop. The AI
             edits the code, runs the tests, reads the errors, and re-checks the result — instead
             of handing you a suggestion and walking away.
           </p>

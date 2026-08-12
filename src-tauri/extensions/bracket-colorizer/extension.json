@@ -3,7 +3,7 @@
   "name": "Bracket Colorizer",
   "version": "1.0.0",
   "description": "Colorize matching brackets and parentheses with different colors for each nesting level.",
-  "author": "Michael IDE",
+  "author": "Mr. Day One",
   "main": "index.js",
   "permissions": ["editor"],
   "contributes": {

@@ -1,4 +1,4 @@
-// Michael IDE — Debug Adapter Protocol client.
+// Mr. Day One — Debug Adapter Protocol client.
 //
 // The Rust backend (`debug.rs`) spawns the debug adapter and handles
 // Content-Length framing, forwarding each decoded DAP message to the frontend
@@ -287,7 +287,7 @@ export function createDapManager(options) {
     if (session !== target) return false;
     const initBody = await sendRequest("initialize", {
       clientID: "michael-ide",
-      clientName: "Michael IDE",
+      clientName: "Mr. Day One",
       adapterID: adapterId,
       locale: "en",
       linesStartAt1: true,

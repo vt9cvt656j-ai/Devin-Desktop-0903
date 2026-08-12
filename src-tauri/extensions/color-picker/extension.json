@@ -3,7 +3,7 @@
   "name": "Color Preview",
   "version": "1.0.0",
   "description": "Detects CSS color values (#hex, rgb, hsl) in your code and shows inline color swatches.",
-  "author": "Michael IDE",
+  "author": "Mr. Day One",
   "main": "index.js",
   "permissions": ["editor"],
   "contributes": {

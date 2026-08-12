@@ -25,7 +25,7 @@ export function Shell() {
             <img className="brandmark" src="/logo.png" alt="" aria-hidden="true" />
           </div>
           <nav className="titlebar__menu" id="menubar" aria-label="Main menu"></nav>
-          <div className="titlebar__title" id="windowTitle">Mr.day One</div>
+          <div className="titlebar__title" id="windowTitle">Mr. Day One</div>
           <div className="titlebar__actions">
             <button id="openFolderBtn" hidden></button>
             <button id="saveBtn" hidden></button>
@@ -260,7 +260,7 @@ export function Shell() {
               <div className="diff-view__body" id="diffBody"></div>
             </div>
             <div className="welcome" id="welcome">
-              <h1 data-i18n="welcome.title">Mr.day One</h1>
+              <h1 data-i18n="welcome.title">Mr. Day One</h1>
               <p data-i18n="welcome.desc">A macOS-style editor with a built-in AI assistant. Open a folder, pick a file, and ask the assistant on the right for help.</p>
               <div className="welcome__actions">
                 <Button size="lg" className="welcome__btn welcome__btn--primary" id="welcomeOpenBtn" type="button">
@@ -427,7 +427,7 @@ export function Shell() {
           <div className="sheet__body login-body">
             <button className="login-close" type="button" id="loginCloseBtn">✕</button>
             <div className="login-logo" id="loginLogo"></div>
-            <h2 className="login-title" data-i18n="login.title">欢迎使用 Mr.day One</h2>
+            <h2 className="login-title" data-i18n="login.title">欢迎使用 Mr. Day One</h2>
             {/* Step 1: email */}
             <div className="login-step" id="loginStep1">
               <p className="login-sub" data-i18n="login.subtitle">输入邮箱即可登录，新用户自动创建账号</p>

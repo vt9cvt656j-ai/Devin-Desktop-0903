@@ -1,4 +1,4 @@
-# Michael IDE — User Agreement
+# Mr. Day One — User Agreement
 
 **Draft for legal review. Not yet in force.**
 Version 0.1 · Last updated [DATE] · Effective [DATE]
@@ -12,14 +12,14 @@ Version 0.1 · Last updated [DATE] · Effective [DATE]
 
 ## 1. Who we are, and what this covers
 
-Michael IDE (also presented as "Mr.day One") is desktop software for writing and running code with
+Mr. Day One (formerly presented as "Michael IDE") is desktop software for writing and running code with
 the assistance of AI models. It is published by [LEGAL ENTITY NAME], of [REGISTERED ADDRESS]
 ("we", "us").
 
 This Agreement governs your use of:
 
-- the **Michael IDE desktop application**, on every platform we distribute it for;
-- the **Michael IDE service** — our hosted gateway at `api.michaelide.xyz` and `code.mrday.one`,
+- the **Mr. Day One desktop application**, on every platform we distribute it for;
+- the **Mr. Day One service** — our hosted gateway at `api.michaelide.xyz` and `code.mrday.one`,
   which routes your requests to AI model providers, meters usage, and holds your account;
 - the **website and account console**; and
 - any documentation, updates or support we provide for the above.
@@ -48,7 +48,7 @@ agreement.
 
 ## 4. What the Service is — and what it is not
 
-Michael IDE is a tool that **acts on your computer at your direction**. Depending on the permissions
+Mr. Day One is a tool that **acts on your computer at your direction**. Depending on the permissions
 you grant, it can read and write files, run terminal commands, install packages, drive a browser,
 query databases you have configured, capture network traffic, control desktop applications, and call
 external services and Model Context Protocol (MCP) servers you connect.
@@ -76,7 +76,7 @@ We do not warrant that the Service will produce correct, complete, secure, or no
 ## 5. Licence, and what you may not do with the software
 
 We grant you a personal, non-exclusive, non-transferable, revocable licence to install and use
-Michael IDE for as long as this Agreement is in force and your account is in good standing.
+Mr. Day One for as long as this Agreement is in force and your account is in good standing.
 
 You may not:
 

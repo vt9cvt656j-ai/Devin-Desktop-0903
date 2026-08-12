@@ -96,6 +96,34 @@ test("every profile write goes through the sticky merge", () => {
   }
 });
 
+test("a brand-new session waits, briefly and once, before sending an empty profile", () => {
+  // 画像是同步算出来的，而全新会话没有 _intentState 也没有缓存命中，本地证据函数又只返回
+  // URL 列表——所以第一轮的画像是空的：决定整个做法的那一轮拿不到 agent_engineering。
+  // 而且粘性画像让这件事在缓存上也要付账：第一轮空、第二轮有 flag，等于每个会话必然在第二轮
+  // 把整条对话的前缀作废一次——正是粘性本身要防的那个失败。
+  assert.match(SRC, /const _FIRST_TURN_INTENT_WAIT_MS = \d+;/,
+    "the first-turn wait must be one named bound, not a literal buried in the turn");
+  const bound = Number(/const _FIRST_TURN_INTENT_WAIT_MS = (\d+);/.exec(SRC)[1]);
+  assert.ok(bound > 0 && bound <= 2000,
+    `the wait is paid on a real turn — ${bound}ms is not a bounded cost`);
+
+  const guard = /if \(_turnIntentState && !\(sess\._semanticProfileFlags \|\| \[\]\)\.length\) \{/;
+  assert.match(SRC, guard,
+    "the wait must be gated on the session having no flags yet — otherwise every turn pays it");
+
+  // 等待必须发生在画像组装之前，否则等了也白等。
+  const waitAt = SRC.search(guard);
+  const assignAt = SRC.indexOf("config.ideSemanticProfile = _sessionStableSemanticProfile(sess,");
+  assert.ok(waitAt > 0 && assignAt > waitAt,
+    "the wait must precede the profile assignment it exists to inform");
+
+  // 超时也要照常发车：裁决迟到由循环边界的 _applyLateIntentIfLanded 兜底，不能把一轮卡死。
+  assert.match(SRC, /_waitTimer = setTimeout\(resolve, _FIRST_TURN_INTENT_WAIT_MS\)/,
+    "the race must have a timeout arm so a slow classifier cannot stall the turn");
+  assert.match(SRC, /_applyLateIntentIfLanded\(run, config, task, session, body, _live, messages\);/,
+    "the late-adopt path must remain as the fallback for a verdict that misses the window");
+});
+
 // ---------------------------------------------------------------------------
 // File tree — the explorer rows.
 // ---------------------------------------------------------------------------

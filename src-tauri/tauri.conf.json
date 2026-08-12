@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "Michael IDE",
-  "version": "0.3.88",
+  "productName": "Mr. Day One",
+  "version": "0.3.89",
   "identifier": "ai.devin.ide",
   "build": {
     "frontendDist": "../dist",
@@ -14,7 +14,7 @@
     "windows": [
       {
         "label": "main",
-        "title": "Michael IDE",
+        "title": "Mr. Day One",
         "width": 1180,
         "height": 760,
         "minWidth": 880,
@@ -56,7 +56,7 @@
     "category": "DeveloperTool",
     "copyright": "Copyright (c) 2026 weiligon",
     "shortDescription": "A macOS-style code editor with an AI assistant sidebar.",
-    "longDescription": "Michael IDE is a native-feeling code editor built on Tauri and Monaco, with a managed AI gateway and an autonomous coding assistant."
+    "longDescription": "Mr. Day One is a native-feeling code editor built on Tauri and Monaco, with a managed AI gateway and an autonomous coding assistant."
   },
   "plugins": {
     "macos-fps": {},

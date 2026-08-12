@@ -185,7 +185,7 @@ pub async fn read_screen(ocr: Option<bool>) -> Result<ReadScreenResponse, String
     }
     if elements.is_empty() {
         limitations.push(
-            "No elements were returned. The frontmost app may expose no accessibility tree, or Michael IDE may lack Accessibility/Screen Recording permission."
+            "No elements were returned. The frontmost app may expose no accessibility tree, or Mr. Day One may lack Accessibility/Screen Recording permission."
                 .into(),
         );
     }
