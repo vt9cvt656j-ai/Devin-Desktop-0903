@@ -9,7 +9,25 @@ use crate::error::{ApiResult, AppError};
 use crate::AppState;
 
 /// Membership tiers sold on the platform.
+/// 内置套餐名。**只作为默认值和测试基线**，不是校验用的白名单——真源是后台可编辑的
+/// `plan_quotas` 表（`settings::plans()`）。用它做校验会让两条发放路径给出相反结果：
+/// 运营在后台新建一个套餐，Stripe 付款能正常发放（走 `plan_spec` 查表就找得到），
+/// 后台手动发放却被判"套餐无效"。线上已经有一个这样的套餐（ceshi）。
 pub const PLANS: [&str; 5] = ["trial", "basic", "pro", "power", "ultra"];
+
+/// 这个套餐名现在真的可以发放吗——以后台配置为准。
+///
+/// 判据就是"它有没有额度规格"：能查到规格，Stripe 就能按它分配额度，后台自然也该能。
+pub(crate) fn plan_is_grantable(plan: &str) -> bool {
+    plan_spec(plan).is_some()
+}
+
+/// 拒绝时把后台**当前真实配置**的套餐列出来，而不是一句写死的 "trial / basic / pro …"。
+pub(crate) fn grantable_plans_hint() -> String {
+    let mut names: Vec<String> = crate::settings::plans().into_iter().map(|p| p.plan).collect();
+    names.sort();
+    names.join(" / ")
+}
 
 #[derive(Serialize, sqlx::FromRow)]
 pub struct Code {
@@ -70,8 +88,11 @@ pub async fn admin_generate(
     match req.kind.as_str() {
         "plan" => {
             let plan = req.plan.as_deref().unwrap_or("");
-            if !PLANS.contains(&plan) {
-                return Err(AppError::bad("套餐无效"));
+            if !plan_is_grantable(plan) {
+                return Err(AppError::bad(format!(
+                    "套餐无效（后台当前可用: {}）",
+                    grantable_plans_hint()
+                )));
             }
             if req.duration_days.unwrap_or(0) <= 0 {
                 return Err(AppError::bad("时长(天)需大于 0"));
@@ -364,8 +385,11 @@ pub async fn admin_grant(
     match req.kind.as_str() {
         "plan" => {
             let plan = req.plan.as_deref().unwrap_or("");
-            if !PLANS.contains(&plan) {
-                return Err(AppError::bad("套餐无效"));
+            if !plan_is_grantable(plan) {
+                return Err(AppError::bad(format!(
+                    "套餐无效（后台当前可用: {}）",
+                    grantable_plans_hint()
+                )));
             }
             if req.duration_days.unwrap_or(0) <= 0 {
                 return Err(AppError::bad("时长(天)需大于 0"));
@@ -444,10 +468,11 @@ pub async fn admin_set_plan(
 ) -> ApiResult<Json<serde_json::Value>> {
     admin_only(&claims)?;
     let plan = req.plan.trim();
-    if plan != "none" && !PLANS.contains(&plan) {
-        return Err(AppError::bad(
-            "套餐无效（合法值: trial / basic / pro / power / ultra / none）",
-        ));
+    if plan != "none" && !plan_is_grantable(plan) {
+        return Err(AppError::bad(format!(
+            "套餐无效（后台当前可用: {} / none）",
+            grantable_plans_hint()
+        )));
     }
     if plan == "none" {
         // Treat plan="none" as a cancel — clear membership.
@@ -561,6 +586,50 @@ mod plan_spec_tests {
     /// This landed once already, on all five plans at once, and would have taken down
     /// every paying account on deploy. The invariant is cheap to assert, so assert it.
     #[test]
+    /// 能不能发放，以**后台配置**为准，不是代码里写死的五元组。
+    ///
+    /// 两条发放路径必须给出同一个答案：Stripe 付款走 apply_plan → plan_spec 查表，查得到
+    /// 就照发；后台手动发放曾经查硬编码 PLANS，于是运营在后台新建的套餐（线上真有一个叫
+    /// ceshi 的）付款能发、手动发不了，同一份配置两种结果。
+    ///
+    /// 关键：必须先把配置换成一组**含内置列表之外套餐**的，否则默认配置下两种实现恰好
+    /// 等价，测试会两边都过、等于没守。
+    #[test]
+    fn grantable_follows_the_configured_plans_not_the_builtin_list() {
+        use crate::settings::PlanQuota;
+        let custom = PlanQuota {
+            plan: "yunying-xinzeng".to_string(),
+            total_cents: 12_345,
+            window_cents: 1_234,
+            weekly_cents: 0,
+            days: 30,
+            rank: 9,
+        };
+        let restore = crate::settings::replace_plans_for_test(vec![custom]);
+
+        // 后台新加的套餐：不在 PLANS 里，但必须可发放——Stripe 就是这么发的。
+        assert!(!PLANS.contains(&"yunying-xinzeng"));
+        assert!(
+            super::plan_is_grantable("yunying-xinzeng"),
+            "后台配了额度规格的套餐，手动发放也必须认"
+        );
+        // 反过来：内置名字被运营从后台删掉后，就不该再能发放。
+        assert!(
+            !super::plan_is_grantable("pro"),
+            "校验必须跟着配置走，不能回落到硬编码列表"
+        );
+        // 判据与 Stripe 那条完全同源。
+        for name in ["yunying-xinzeng", "pro", "nonexistent", ""] {
+            assert_eq!(super::plan_is_grantable(name), plan_spec(name).is_some());
+        }
+        // 拒绝文案要报后台当前的套餐。
+        let hint = super::grantable_plans_hint();
+        assert!(hint.contains("yunying-xinzeng"), "提示应报当前配置，实际: {hint}");
+        assert!(!hint.contains("pro"), "提示不该再报已经不存在的套餐");
+
+        crate::settings::replace_plans_for_test(restore);
+    }
+
     fn plan_spec_window_cap_is_never_zero() {
         for plan in PLANS {
             let (total, window_cap, _weekly, days) =

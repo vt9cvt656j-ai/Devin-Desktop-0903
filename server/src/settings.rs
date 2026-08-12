@@ -37,11 +37,17 @@ pub const MAX_FREE_POINTS_DAILY: i64 = 1_000_000;
 /// 不到时）读到的行为与改造前完全一致——这次改造本身不改变任何金额。
 pub const DEFAULT_RAW_CENTS_PER_CREDIT_USD: i64 = 663;
 pub const DEFAULT_FREE_POINTS_DAILY: i64 = 40;
+/// 7.10 CNY/USD。只用于把人民币销售折成美元记佣金，不参与任何展示。
+pub const DEFAULT_USD_PER_CNY_BPS: i64 = 1408;
+pub const MIN_USD_PER_CNY_BPS: i64 = 100;
+pub const MAX_USD_PER_CNY_BPS: i64 = 10_000;
 
 #[derive(Debug, Clone, Copy, Serialize)]
 pub struct Settings {
     pub raw_cents_per_credit_usd: i64,
     pub free_points_daily: i64,
+    /// 1 人民币分 折合多少美元分，万分比。佣金账本以美元计量，人民币销售在记账时折一次。
+    pub usd_per_cny_bps: i64,
 }
 
 impl Default for Settings {
@@ -49,6 +55,7 @@ impl Default for Settings {
         Self {
             raw_cents_per_credit_usd: DEFAULT_RAW_CENTS_PER_CREDIT_USD,
             free_points_daily: DEFAULT_FREE_POINTS_DAILY,
+            usd_per_cny_bps: DEFAULT_USD_PER_CNY_BPS,
         }
     }
 }
@@ -90,6 +97,17 @@ fn default_plans() -> Vec<PlanQuota> {
 static CACHE: LazyLock<RwLock<Settings>> = LazyLock::new(|| RwLock::new(Settings::default()));
 static PLANS: LazyLock<RwLock<Vec<PlanQuota>>> = LazyLock::new(|| RwLock::new(default_plans()));
 
+/// 测试专用：把套餐缓存换成给定的一组，返回原来的那组以便还原。
+///
+/// 存在的理由很具体：`plan_quotas` 是运营在后台加套餐的地方，而校验一度查的是代码里
+/// 写死的五元组。两者在**默认配置下恰好相等**，所以任何不改这份缓存的测试都无法区分
+/// 「按配置校验」和「按硬编码校验」——测试会两种实现都通过，等于没守。
+#[cfg(test)]
+pub fn replace_plans_for_test(plans: Vec<PlanQuota>) -> Vec<PlanQuota> {
+    let mut guard = PLANS.write().expect("plans lock");
+    std::mem::replace(&mut *guard, plans)
+}
+
 /// 读缓存。锁中毒时退回默认值而不是 panic——这些是展示与发放参数，让整个网关因为一把
 /// 读锁挂掉是更坏的结果。
 pub fn current() -> Settings {
@@ -101,6 +119,14 @@ pub fn raw_cents_per_credit_usd() -> i64 {
     current()
         .raw_cents_per_credit_usd
         .clamp(MIN_RAW_CENTS_PER_CREDIT_USD, MAX_RAW_CENTS_PER_CREDIT_USD)
+}
+
+/// 1 人民币分 折合多少美元分，万分比。夹在合理区间内：这个数是佣金的乘数，
+/// 一个离谱的值会静默地把每一笔中国销售的佣金放大或抹平。
+pub fn usd_per_cny_bps() -> i64 {
+    current()
+        .usd_per_cny_bps
+        .clamp(MIN_USD_PER_CNY_BPS, MAX_USD_PER_CNY_BPS)
 }
 
 /// 同一个数的浮点形式，供利润测算用（`models.rs` 原先的 6.63）。
@@ -147,18 +173,20 @@ pub fn plan_rank(plan: &str) -> i32 {
 /// 从数据库装载进缓存。启动时调用一次，每次写入后再调用一次。
 /// 读不到就保留当前缓存（首次即默认值），不让网关起不来。
 pub async fn load(db: &sqlx::PgPool) {
-    match sqlx::query_as::<_, (i32, i32)>(
-        "SELECT raw_cents_per_credit_usd, free_points_daily FROM app_settings WHERE id = 1",
+    match sqlx::query_as::<_, (i32, i32, i32)>(
+        "SELECT raw_cents_per_credit_usd, free_points_daily, usd_per_cny_bps \
+         FROM app_settings WHERE id = 1",
     )
     .fetch_optional(db)
     .await
     {
-        Ok(Some((raw, free))) => {
+        Ok(Some((raw, free, fx))) => {
             let next = Settings {
                 raw_cents_per_credit_usd: (raw as i64)
                     .clamp(MIN_RAW_CENTS_PER_CREDIT_USD, MAX_RAW_CENTS_PER_CREDIT_USD),
                 free_points_daily: (free as i64)
                     .clamp(MIN_FREE_POINTS_DAILY, MAX_FREE_POINTS_DAILY),
+                usd_per_cny_bps: (fx as i64).clamp(MIN_USD_PER_CNY_BPS, MAX_USD_PER_CNY_BPS),
             };
             if let Ok(mut g) = CACHE.write() {
                 *g = next;

@@ -49,7 +49,7 @@ fn validate_product(
     match kind {
         "plan" => {
             let p = plan.as_deref().unwrap_or("");
-            if !crate::codes::PLANS.contains(&p) {
+            if !crate::codes::plan_is_grantable(p) {
                 return Err(AppError::bad("套餐无效"));
             }
             if duration_days.unwrap_or(0) <= 0 {
@@ -152,6 +152,14 @@ pub struct Order {
     pub note: String,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub paid_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// What Stripe actually took, and in what currency. NULL on manual grants and on every
+    /// order placed before migration 20260827.
+    ///
+    /// `amount_cents` above is the catalogue's CNY shelf price in fen — 18800 for 「Power」 —
+    /// so rendering it as USD reported a $34.99 sale as $188.00. Anything showing money
+    /// should prefer this pair and fall back to `amount_cents` only when it is NULL.
+    pub charged_cents: Option<i64>,
+    pub charged_currency: Option<String>,
 }
 
 #[derive(Deserialize)]
