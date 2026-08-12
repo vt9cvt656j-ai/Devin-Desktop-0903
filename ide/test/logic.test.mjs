@@ -7277,7 +7277,9 @@ test("_disposeChatSession cancels streams and releases closed tab resources", ()
       setRemovalHandler(fn) { removalHandler = fn; },
     },
   };
+  let observerTornDown = false;
   const dispose = load("_disposeChatSession", {
+    _teardownChatGrowthObserver: (sess) => { observerTornDown = sess === session; },
     _setStreaming: (sess, on) => { stopped.push([sess, on]); sess.streaming = !!on; },
     _releaseMessagesAttachmentUrls: (messages, node, keep) => released.push({ messages, node, keep }),
     _releaseBlobMediaInNode: (node) => { blobReleased = node === container; },
@@ -7285,6 +7287,8 @@ test("_disposeChatSession cancels streams and releases closed tab resources", ()
 
   dispose(session);
   assert.deepEqual(stopped, [[session, false]], "closing a tab must cancel its active stream/request ids");
+  assert.equal(observerTornDown, true,
+    "an un-disconnected ResizeObserver outlives the page and pins the closed tab container in memory");
   assert.equal(released.length, 2, "memory and pending attachments are both released");
   assert.equal(blobReleased, true);
   assert.equal(paused, true);
@@ -10177,14 +10181,71 @@ test("long chat transcripts stay bounded while paging both directions", () => {
   // 验证存在 rAF 合帧机制
   assert.match(SRC, /_chatScrollRAF\s*=\s*requestAnimationFrame/,
     "scroll handler must use rAF coalescing to avoid forced synchronous reflow");
-  assert.match(SRC, /_userScrolledAway\s*=\s*false/,
-    "must track user scroll position to disable auto-follow when reading");
+  // 钉底只保留一个状态位。曾经是 _chatPinned + _userScrolledAway 两个各写各的：发消息
+  // 处只重置了前者，_chatFollow 的门却两个都要，于是跟随停掉之后连发新消息都救不回来。
+  assert.doesNotMatch(SRC, /_userScrolledAway\s*=/,
+    "the second pin flag is gone — one bit cannot desynchronize from itself");
+  assert.match(SRC, /function _repinChat\(\)\s*\{\s*_chatPinned = true; \}/,
+    "re-pinning must go through one named helper, not scattered assignments");
   assert.doesNotMatch(SRC, /while \(session\.container\.firstChild\)[\s\S]{0,180}_renderMsgRange\(session, 0, h\.length\)/,
     "opening earlier history must not synchronously rebuild the full transcript");
   assert.match(SRC, /const CHAT_LOCAL_RECENT_LIMIT = 96/,
     "the synchronous emergency mirror must remain bounded even when full context is huge");
   assert.match(SRC, /_chatFollowRAF = requestAnimationFrame\(/,
     "streaming updates should coalesce their layout-affecting scroll write via rAF");
+});
+
+test("content growing under a stationary scroll position cannot unpin the chat", () => {
+  // 这是用户报的两个症状的共同根因。某个增长点长高之后没人调 _chatFollow（终端输出展开、
+  // diff 视图打开、写入预览收尾都是），滚动监听器只看得到"距底 280px"，把它记成"用户滑走了"，
+  // 跟随就此停掉；而发消息处只重置了两个状态位里的一个，所以连发新消息都救不回来。
+  const decide = load("_chatPinAfterScroll", { _CHAT_BOTTOM_PX: 40, _CHAT_INTENT_WINDOW_MS: 700 });
+  const NO_INTENT = 60_000; // 最近一次人类输入是很久以前
+
+  // 终端输出一帧展开 280px：距底变成 280，但没有任何人类输入。必须还钉着。
+  assert.equal(decide(280, true, false, NO_INTENT), true,
+    "silent growth is not a user scrolling away — this is the freeze the user reported");
+  // 多文件写入：一张接一张卡片长出来，反复发生也不能把它拖坏。
+  let pinned = true;
+  for (const grew of [306, 612, 918, 1224]) pinned = decide(grew, pinned, false, NO_INTENT);
+  assert.equal(pinned, true, "four file cards in a row must not accumulate into an unpin");
+
+  // 真人滚轮往上翻：有意图作证，解除钉底。
+  assert.equal(decide(300, true, false, 50), false, "a real wheel gesture must unpin");
+  // 惯性余波（意图窗口外）不得把它抖回去，也不得自己恢复。
+  assert.equal(decide(300, false, false, 900), false, "unpinning is sticky across momentum events");
+  // 我们自己写的 scrollTop 弹回来的那次事件，即使恰好落在意图窗口内也不算意图。
+  assert.equal(decide(300, true, true, 50), true, "our own scroll write must never read as intent");
+  // 回到底部永远重新钉住——这是唯一的手动恢复途径，任何条件都不能挡它。
+  assert.equal(decide(0, false, false, NO_INTENT), true, "returning to the bottom always re-pins");
+  assert.equal(decide(39, false, false, 10), true, "re-pinning is not gated on intent or echo");
+  assert.equal(decide(40, false, false, NO_INTENT), false, "40px is outside the bottom zone");
+});
+
+test("only a human can unpin the chat, and landing at the bottom always re-pins", () => {
+  // 用户报的两个症状是同一条链：某个增长点（终端输出展开、diff 视图打开、写入预览收尾）
+  // 长高之后没人调 _chatFollow，滚动监听器把这段增长记成"用户滑走了"，跟随就此永久停掉——
+  // 连发新消息都救不回来，因为发送处只重置了两个状态位里的一个。
+  // 决策本身由上一条行为测试覆盖；这里只钉它够不到的接线事实。
+  const listener = SRC.slice(SRC.indexOf('chatEl.addEventListener("scroll"'));
+  const body = listener.slice(0, listener.indexOf("}, { passive: true });"));
+  assert.match(body, /_chatPinned = _chatPinAfterScroll\(/,
+    "the listener must route through the one named rule instead of re-implementing it inline");
+  assert.doesNotMatch(body, /requestAnimationFrame\([\s\S]*scrollHeight/,
+    "the pin measurement must stay synchronous — deferring it reads the geometry at maximum staleness");
+
+  // 意图信号必须真的绑上去，否则 sinceIntent 永远很大，等于永远解除不了钉底。
+  assert.match(SRC, /for \(const ev of \["wheel", "touchmove", "pointerdown", "keydown"\]\)/,
+    "without these listeners the intent window never opens and the chat can never be unpinned");
+
+  // 迟到的高度变化（CSS 动画驱动的 max-height 渐变）只有逐帧观察才跟得住，
+  // 手工在 t=0 补一次 _chatFollow 只会量到 0。
+  assert.match(extractFn("_installChatGrowthObserver"), /new ResizeObserver\(\(\) => \{ _chatFollow\(session\); \}\)/,
+    "late growth is corrected by observing the session container, not by hand-placed follow calls");
+  assert.match(extractFn("_teardownChatGrowthObserver"), /disconnect\(\)/,
+    "every observer needs its disconnect or it outlives the page and pins the container");
+  assert.match(extractFn("_installChatGrowthObserver"), /session\._growthRO/,
+    "the observer is per-session so a background tab's growth cannot scroll the visible one");
 });
 
 test("automatic verification converges instead of repeating per edit batch", () => {
@@ -15088,8 +15149,8 @@ test("streaming markdown appends into an open code fence instead of rebuilding i
   // The layout cost of the growing block is capped by the same window the agent-side
   // streaming card already uses.
   const CSS = readFileSync(join(HERE, "../src/styles/app.css"), "utf8");
-  assert.match(CSS, /\.md-stream-tail \.code-card__body \{\s*max-height: 300px; overflow-y: auto;\s*\}/,
-    "a streaming tail code block needs a viewport-sized window while it grows");
+  assert.match(CSS, /\.md-stream-tail \.code-card__body \{\s*max-height: 300px; overflow-y: auto; overscroll-behavior: contain;\s*\}/,
+    "a streaming tail code block needs a viewport-sized window while it grows, and must not chain its wheel into the chat");
 });
 
 test("流式Markdown增量渲染：settle 前缀不重建，divergence 只回滚受影响块", async () => {
