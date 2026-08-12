@@ -18399,6 +18399,36 @@ test("#53-2 并发预算共享：嵌套走同一个 _sess._subAgentsActive 上�
   assert.doesNotMatch(sub, /MAX_SUBAGENTS_PARALLEL \* /, "上限不得按层级乘倍放大");
 });
 
+test("并发槽位在每一条退出路径上都要还回去", () => {
+  // _sess._subAgentsActive++ 紧挨着等待门（两者必须相邻才有原子性），而归还它的 finally
+  // 属于两百多行之后才打开的 try。中间夹着两条没有任何保护的 return：只读模式挡 run_worker，
+  // 以及 [interrupted]。每走一次就永久烧掉一个槽，而计数器挂在**会话**上，跨轮累积。
+  //
+  // 用户看到的是：泄 1 次 → 最多 3 并发；泄 3 次 → 全部串行（"一个在动、其它干等"）；
+  // 泄满 4 次 → 子智能体彻底不跑，全挂在 15 秒一轮的等待里。全程零日志零卡片。
+  const sub = extractFn("_runSubAgent");
+
+  // 递增之后、保护 try 之前的每一条 return，都必须先归还槽位。
+  const incAt = sub.indexOf("_sess._subAgentsActive++");
+  assert.ok(incAt > 0);
+  const guardAt = sub.indexOf("_releaseSubAgentSlot();\n  }", incAt);
+  const between = sub.slice(incAt, sub.indexOf("finally {", incAt));
+  const returns = [...between.matchAll(/^\s*return\b/gm)];
+  assert.ok(returns.length >= 2, `自增与 finally 之间应有提前 return（找到 ${returns.length} 处）`);
+  for (const m of returns) {
+    const before = between.slice(Math.max(0, m.index - 260), m.index);
+    assert.match(before, /_releaseSubAgentSlot\(\)/,
+      `这条提前 return 之前没有归还槽位，会永久泄漏一格：${between.slice(m.index, m.index + 70).trim()}`);
+  }
+
+  // 释放必须幂等：提前 return 已经还过之后，finally 不能再还第二次（那会让计数器变负、
+  // 上限失效）。
+  assert.match(sub, /if \(_slotReleased\) return;\s*\n\s*_slotReleased = true;/,
+    "释放函数要自带幂等");
+  // 释放逻辑只能有一份，两份必然漂移。
+  assert.equal((sub.match(/_sess\._subAgentsActive--/g) || []).length, 1, "只允许一处递减");
+});
+
 test("#53-3 只读继承 + scope 收敛：嵌套强制只读，scope 必须是父 scope 子集，越界拒绝不泄漏", () => {
   const sub = extractFn("_runSubAgent");
   // 父已是子体（深度 ≥1）时：子集校验通过后仍强制只读——不继承 worker 写权限
