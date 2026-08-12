@@ -2073,21 +2073,30 @@ test("advanced tools panel exposes Settings Growth Adaptive and Shortcuts", () =
   assert.match(tabsBlock, /id:\s*"shortcuts"[\s\S]*titleKey:\s*"feature\.tab\.shortcuts"/);
   assert.match(tabsBlock, /id:\s*"growth"[\s\S]*id:\s*"adaptive"[\s\S]*id:\s*"shortcuts"/,
     "Adaptive should sit directly below Growth and above Shortcuts");
-  for (const removed of ["workspace", "tasks", "remote", "marketplace", "conflicts", "debugger", "lsp"]) {
-    assert.doesNotMatch(tabsBlock, new RegExp(`id:\\s*"${removed}"`),
-      `${removed} should not appear as an Advanced Tools tab`);
-  }
+  // 这里原本断言 workspace/tasks/remote/conflicts/debugger/lsp 都**不该**出现。那条断言是
+  // 首次导入时一起带进来的，仓库里没有任何一次提交解释过为什么——而它守住的状态是：六个写完的
+  // 面板没有登记，normalizeFeatureTab 把它们的 id 静默改写成 "settings"，于是命令面板里那六条
+  // 命令、以及状态栏那个写着「Click for logs」的语言服务器指示器，点下去全部打开「高级设置」。
+  // 结果是 700 行任务发现从没被执行过、三方合并冲突解决器从没被打开过。
+  //
+  // 现在它们被接回去了。marketplace 仍然排除——那份目录冒用真实第三方的身份（GitHub Copilot /
+  // Microsoft Docker 及其下载量），该删而不是该接。
+  assert.doesNotMatch(tabsBlock, /id:\s*"marketplace"/,
+    "扩展市场那份假目录不该被接回来");
   assert.match(SRC, /let activeFeatureTab = "settings";/,
     "Advanced Tools should open on Settings by default");
   assert.match(SRC, /function normalizeFeatureTab\(tab\) \{[\s\S]{0,120}FEATURE_TAB_IDS\.has\(tab\) \? tab : "settings"/,
     "stale callers for removed Advanced Tools tabs should fall back to Settings");
-  const renderersBlock = SRC.slice(SRC.indexOf("const renderers = {"), SRC.indexOf("};\n  renderers[activeFeatureTab]", SRC.indexOf("const renderers = {")));
+  const _rStart = SRC.indexOf("const renderers = {");
+  // 结束锚点用映射自己的收尾括号。以前钉的是紧随其后的那一行代码，那行一改，
+  // indexOf 返回 -1，slice(start, -1) 会一路切到文件末尾——断言从此形同虚设。
+  const renderersBlock = SRC.slice(_rStart, SRC.indexOf("\n  };", _rStart));
   assert.match(renderersBlock, /settings:\s*renderSettingsTool/);
   assert.match(renderersBlock, /growth:\s*renderGrowthTool/);
   assert.match(renderersBlock, /adaptive:\s*renderAdaptiveTool/);
   assert.match(renderersBlock, /shortcuts:\s*renderShortcutsTool/);
-  assert.doesNotMatch(renderersBlock, /workspace|tasks|remote|marketplace|conflicts|debugger|lsp/,
-    "removed Advanced Tools pages should not be reachable through the panel renderer");
+  assert.doesNotMatch(renderersBlock, /marketplace/,
+    "扩展市场不该有渲染器");
   assert.match(APP_CSS, /\.feature-panel\s*\{[\s\S]{0,260}--feature-backdrop:\s*rgba\(255,\s*255,\s*255,\s*0\.55\);[\s\S]{0,260}--feature-sheet:\s*#fff;[\s\S]{0,260}--feature-bg:\s*#fff;[\s\S]{0,260}--feature-rail:\s*#fff;[\s\S]{0,260}--feature-blue:\s*#1a73e8;/,
     "Advanced Tools light theme should use white Google-style backdrop, sheet, body, and rail surfaces with blue tokens only for accents");
   assert.match(APP_CSS, /:root\[data-theme="dark"\] \.feature-panel\s*\{[\s\S]{0,260}--feature-sheet:\s*#18181b;[\s\S]{0,260}--feature-header:\s*#18181b;[\s\S]{0,260}--feature-blue:\s*#8ab4f8;/,
@@ -15792,6 +15801,61 @@ test("closing a terminal before termOpen resolves reaps the late PTY without tou
   assert.equal(entry.backendId, null);
   assert.equal(entry.initTimer, 0);
   assert.deepEqual(entry.term.writes, []);
+});
+
+test("命令面板里的工具命令必须打开对应面板，而不是静默回落到设置", () => {
+  // 这是本次审计里最贵的一个 bug：FEATURE_TABS 只登记了 7 个 id，normalizeFeatureTab 把认不出的
+  // id 一律改写成 "settings"，于是命令面板里 6 条命令（任务运行器/调试器/合并冲突/语言服务/
+  // 工作区/远程）点下去全部打开「高级设置」。不报错、不打日志，就是开错面板——比缺功能更伤，
+  // 因为缺功能是"还没做"，点了开错东西是"这 IDE 是假的"。
+  //
+  // 压在这条回落分支下面的是已经写完、后端也齐备的能力：700 行的任务发现从没被执行过，
+  // 三方合并冲突解决器从没被打开过。
+  const TOOL_TABS = ["tasks", "debugger", "conflicts", "lsp", "workspace", "remote"];
+
+  const tabsSrc = /const FEATURE_TABS = \[([\s\S]*?)\];/.exec(SRC);
+  assert.ok(tabsSrc, "找不到 FEATURE_TABS");
+  const declared = [...tabsSrc[1].matchAll(/id: "([a-z]+)"/g)].map((m) => m[1]);
+  for (const id of TOOL_TABS) {
+    assert.ok(declared.includes(id), `FEATURE_TABS 缺 "${id}" —— 命令面板会把它改写成 settings`);
+  }
+
+  // 第二张表：每个登记的标签都必须有渲染器。两张表隔着 80 行，加了标签忘了渲染器的结果是
+  // 一块空白面板，比"开错面板"更难查。
+  const renderSrc = /const renderers = \{([\s\S]*?)\};/.exec(SRC);
+  assert.ok(renderSrc, "找不到 renderers 映射");
+  const mapped = [...renderSrc[1].matchAll(/^\s*([a-z]+): (render\w+),/gm)].map((m) => [m[1], m[2]]);
+  const mappedIds = mapped.map((m) => m[0]);
+  for (const id of declared) {
+    assert.ok(mappedIds.includes(id), `标签 "${id}" 没有渲染器 —— 会开出一块空白面板`);
+  }
+  // 反向也要成立：映射里不该有标签条上没有的 id（那样它永远到不了）。
+  for (const id of mappedIds) {
+    assert.ok(declared.includes(id), `渲染器 "${id}" 没有对应标签 —— 用户到不了`);
+  }
+  // 渲染函数必须真的存在于 main.js 里，不能只是个名字。
+  for (const [, fn] of mapped) {
+    assert.ok(new RegExp(`function ${fn}\\b`).test(SRC), `${fn} 在 main.js 里没有定义`);
+  }
+
+  // 标签文案不能缺 i18n 键，否则界面上会直接显示 "feature.tab.tasks" 这种原始键名。
+  const i18n = readFileSync(join(HERE, "../src/i18n.js"), "utf8");
+  for (const id of TOOL_TABS) {
+    assert.ok(i18n.includes(`"feature.tab.${id}"`), `i18n 缺 feature.tab.${id}，界面会显示原始键名`);
+  }
+
+  // 从源头堵住这类 bug：任何一处 openFeaturePanel("x")，x 都必须是登记过的标签。
+  // 这条断言要是当初就在，最初那个"6 条命令全开设置"根本活不到今天。
+  const targets = [...SRC.matchAll(/openFeaturePanel\("([a-z]+)"\)/g)].map((m) => m[1]);
+  assert.ok(targets.length >= 8, `openFeaturePanel 调用点只找到 ${targets.length} 个，正则可能失效了`);
+  for (const target of new Set(targets)) {
+    assert.ok(declared.includes(target),
+      `有代码调用 openFeaturePanel("${target}")，但 FEATURE_TABS 里没有这个 id —— 它会被静默改写成 settings`);
+  }
+
+  // 渲染异常不能让面板变成空白——那又是一次静默失败。
+  assert.match(SRC, /\} catch \(err\) \{[\s\S]{0,200}\[feature-panel\] render failed/,
+    "渲染器抛错要被兜住并显示出来");
 });
 
 test("the model is told which interpreter actually runs its commands", () => {
