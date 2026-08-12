@@ -16,6 +16,35 @@ export const es: Partial<Dict> = {
   navBilling: "Planes y facturación",
   navIntegrations: "Integraciones",
   navDevices: "Dispositivos",
+  navModels: "Rutas de modelos",
+  navReferral: "Referidos",
+  navChangelog: "Novedades",
+
+  navCommission: "Comisión",
+  navInvite: "Invitar",
+  navReferrals: "Mis referidos",
+  navSettlements: "Liquidaciones",
+  navWithdraw: "Retirar",
+
+  referral: "Referidos",
+  referralLede: "Invita a otras personas con tu código o enlace y gana por lo que gasten.",
+  referralFailed: "No se pudieron cargar tus datos de referidos.",
+  referralLockedTitle: "Los referidos no están activados para esta cuenta",
+  referralLockedBody:
+    "Un administrador activa los referidos cuenta por cuenta. Pídeselo y aquí aparecerán tu código y tu enlace.",
+  referralCode: "Tu código de invitación",
+  referralLink: "Tu enlace de invitación",
+  referralHow:
+    "Quien se registre con tu enlace o introduzca tu código queda asociado a ti: ganas el {rate}% de lo que pague durante los {days} días siguientes. Estas condiciones se aplican a quienes se unan a partir de ahora; quienes ya invitaste conservan las suyas.",
+  referralPaused:
+    "El programa de referidos está pausado, así que los nuevos registros no se asociarán a ti hasta que se reactive. A quienes ya invitaste no les afecta.",
+  referralInvited: "Personas invitadas",
+  referralPending: "Pendiente de liquidar",
+  referralSettled: "Liquidado",
+  referralCopy: "Copiar",
+  referralCopied: "Copiado",
+  referralPayout:
+    "Las comisiones se registran automáticamente cuando alguien a quien invitaste paga, y un administrador las liquida.",
   accountMenu: "Menú de la cuenta",
   getTheApp: "Obtener la app de escritorio",
 
@@ -129,7 +158,7 @@ export const es: Partial<Dict> = {
     "Este navegador inició sesión antes de que existiera el registro de dispositivos, por lo que no aparece abajo y no se puede cerrar por separado. Cierre sesión y vuelva a entrar para añadirlo.",
   integrations: "Integraciones",
   integrationsLede: "Cómo se conecta esta cuenta con la app de escritorio y con la API.",
-  desktopApp: "Mr.day One para escritorio",
+  desktopApp: "Mr. Day One para escritorio",
   connected: "Conectado",
   signedOut: "Sesión cerrada",
   notDetected: "No detectada",
@@ -165,7 +194,7 @@ export const es: Partial<Dict> = {
   disconnectedNote: "Desconectado. Para revocar también el acceso en el proveedor, visite",
   desktopNeedsPermission: "Necesita permiso",
   desktopPermissionAsk:
-    "Su navegador no tiene permiso para comunicarse con apps de este ordenador, así que esta página no puede saber si Mr.day One está en ejecución. Chrome solo lo pregunta cuando usted hace clic.",
+    "Su navegador no tiene permiso para comunicarse con apps de este ordenador, así que esta página no puede saber si Mr. Day One está en ejecución. Chrome solo lo pregunta cuando usted hace clic.",
   desktopConnectButton: "Buscar la app",
   desktopChecking: "Comprobando…",
   desktopPermissionBlocked: "Bloqueado por el navegador",

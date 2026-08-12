@@ -3,7 +3,7 @@
   "name": "Material Icons",
   "version": "1.0.0",
   "description": "Material-style file icons (theme contribution is limited in the sandbox).",
-  "author": "Michael IDE",
+  "author": "Mr. Day One",
   "main": "index.js",
   "permissions": [],
   "contributes": { "commands": [ { "id": "materialIcons.info", "title": "Material Icons: About" } ] }

@@ -9,6 +9,34 @@ export const ja: Partial<Dict> = {
   navBilling: "プランと請求",
   navIntegrations: "連携",
   navDevices: "デバイス",
+  navModels: "モデル経路",
+  navReferral: "紹介",
+  navChangelog: "更新履歴",
+
+  navCommission: "報酬",
+  navInvite: "招待",
+  navReferrals: "紹介した人",
+  navSettlements: "精算履歴",
+  navWithdraw: "出金",
+
+  referral: "紹介",
+  referralLede: "自分の招待コードやリンクで人を招き、その支払いから報酬を受け取れます。",
+  referralFailed: "紹介情報を読み込めませんでした。",
+  referralLockedTitle: "このアカウントでは紹介が有効になっていません",
+  referralLockedBody:
+    "紹介の利用は管理者がアカウントごとに有効にします。管理者に依頼すると、ここに招待コードとリンクが表示されます。",
+  referralCode: "招待コード",
+  referralLink: "招待リンク",
+  referralHow:
+    "あなたのリンクから登録した人、またはあなたのコードを入力した人があなたの紹介になります。その後 {days} 日間、その人の支払いの {rate}% を受け取れます。これはこれから参加する人に適用される条件で、すでに招待した人は参加時の条件のままです。",
+  referralPaused:
+    "紹介プログラムは現在停止中です。再開するまで新規登録は紐づきません。すでに招待した人には影響しません。",
+  referralInvited: "招待した人数",
+  referralPending: "精算待ち",
+  referralSettled: "精算済み",
+  referralCopy: "コピー",
+  referralCopied: "コピーしました",
+  referralPayout: "招待した人が支払うと報酬が自動で記録され、管理者が精算します。",
   accountMenu: "アカウントメニュー",
   getTheApp: "デスクトップ版を入手",
 
@@ -122,7 +150,7 @@ export const ja: Partial<Dict> = {
     "このブラウザはデバイス記録の導入前にサインインしたため、下の一覧には表示されず、個別に解除できません。一度サインアウトして再度サインインすると追加されます。",
   integrations: "連携",
   integrationsLede: "このアカウントとデスクトップ版・API との接続状況。",
-  desktopApp: "Mr.day One デスクトップ版",
+  desktopApp: "Mr. Day One デスクトップ版",
   connected: "接続済み",
   signedOut: "サインアウト中",
   notDetected: "検出されません",
@@ -156,7 +184,7 @@ export const ja: Partial<Dict> = {
   disconnectedNote: "解除しました。提供元側でもアクセスを取り消す場合はこちら：",
   desktopNeedsPermission: "許可が必要です",
   desktopPermissionAsk:
-    "このブラウザにはこのコンピュータ上のアプリへ接続する許可がないため、Mr.day One が実行中か判断できません。Chrome はクリックしたときにのみ確認します。",
+    "このブラウザにはこのコンピュータ上のアプリへ接続する許可がないため、Mr. Day One が実行中か判断できません。Chrome はクリックしたときにのみ確認します。",
   desktopConnectButton: "アプリを確認",
   desktopChecking: "確認中…",
   desktopPermissionBlocked: "ブラウザによりブロック",

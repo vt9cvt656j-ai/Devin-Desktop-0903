@@ -3,7 +3,7 @@
   "name": "Insert Date",
   "version": "0.1.0",
   "description": "Adds a command that inserts the current date and time at the cursor.",
-  "author": "Michael IDE",
+  "author": "Mr. Day One",
   "main": "index.js",
   "permissions": ["editor"],
   "contributes": {

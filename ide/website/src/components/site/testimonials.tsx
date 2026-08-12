@@ -121,7 +121,7 @@ function CollectingState() {
             We would rather show you real ones
           </h3>
           <p className="mt-3 text-pretty text-muted-foreground">
-            This is where quotes from people using Mr.day One will go — their words, linked to
+            This is where quotes from people using Mr. Day One will go — their words, linked to
             the post they came from. We are collecting them now rather than writing them
             ourselves. If it has changed how you work, we would like to hear it.
           </p>

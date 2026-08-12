@@ -3,7 +3,7 @@
   "name": "TODO Highlight",
   "version": "1.0.0",
   "description": "Highlights TODO, FIXME, HACK, BUG, and NOTE comments in your code with distinct colors.",
-  "author": "Michael IDE",
+  "author": "Mr. Day One",
   "main": "index.js",
   "permissions": ["editor"],
   "contributes": {

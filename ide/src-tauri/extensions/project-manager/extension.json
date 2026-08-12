@@ -3,7 +3,7 @@
   "name": "Project Manager",
   "version": "1.0.0",
   "description": "Shows the current project in the status bar.",
-  "author": "Michael IDE",
+  "author": "Mr. Day One",
   "main": "index.js",
   "permissions": ["editor"],
   "contributes": { "commands": [ { "id": "project.info", "title": "Project Manager: Show Current Project" } ] }

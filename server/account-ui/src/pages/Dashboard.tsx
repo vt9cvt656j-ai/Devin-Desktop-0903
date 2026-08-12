@@ -1,4 +1,9 @@
 import { useEffect, useRef, useState } from "react";
+import { ModelStatus } from "@/pages/ModelStatus";
+import { Invite } from "@/pages/Invite";
+import { Referrals } from "@/pages/Referrals";
+import { Settlements } from "@/pages/Settlements";
+import { Withdraw } from "@/pages/Withdraw";
 import { Camera, ChevronLeft, ChevronRight, Globe, Monitor, Smartphone } from "lucide-react";
 
 import { Avatar, AvatarFallback, AvatarImage } from "@/components/ui/avatar";
@@ -50,9 +55,19 @@ import { cn } from "@/lib/utils";
  * public update feed and shows either a real installer link or an honest "not published
  * yet" — either beats a 404.
  */
-const RELEASES = "https://www.michaelide.xyz/#download";
+const RELEASES = "https://mrday.one/#download";
 
-export type Tab = "overview" | "usage" | "settings" | "integrations" | "devices";
+export type Tab =
+  | "overview"
+  | "usage"
+  | "settings"
+  | "integrations"
+  | "devices"
+  | "models"
+  | "invite"
+  | "referrals"
+  | "settlements"
+  | "withdraw";
 
 /**
  * Centred, not left-aligned. These sit in a row of three: ragged left-aligned blocks of
@@ -886,8 +901,10 @@ function Devices({ lang }: { lang: Lang }) {
       await api.revokeSession(row.id);
       if (row.current) {
         // The token in this tab is dead from here on; anything else it tried would only
-        // bounce off the gate.
-        signOut();
+        // bounce off the gate. Awaited so the sign-out request goes before the redirect —
+        // it is a no-op here (the session was just revoked above) but the local clear at
+        // the end of it is what must not be skipped.
+        await signOut();
         return;
       }
       setNote({ text: t.deviceRevoked, ok: true });
@@ -1070,12 +1087,32 @@ export function Dashboard({
         <h2 className="mb-3 mt-8 text-sm font-semibold">{t.session}</h2>
         <Card className="bg-muted p-6">
           <p className="mb-4 text-[13.5px] leading-relaxed text-muted-foreground">{t.signOutNote}</p>
-          <Button variant="outline" onClick={signOut} className="w-fit">
+          <Button variant="outline" onClick={() => void signOut()} className="w-fit">
             {t.signOut}
           </Button>
         </Card>
       </div>
     );
+  }
+
+  if (tab === "models") {
+    return <ModelStatus lang={lang} />;
+  }
+
+  if (tab === "invite") {
+    return <Invite lang={lang} />;
+  }
+
+  if (tab === "referrals") {
+    return <Referrals lang={lang} />;
+  }
+
+  if (tab === "settlements") {
+    return <Settlements lang={lang} />;
+  }
+
+  if (tab === "withdraw") {
+    return <Withdraw lang={lang} />;
   }
 
   if (tab === "devices") {

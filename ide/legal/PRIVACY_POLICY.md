@@ -1,4 +1,4 @@
-# Michael IDE — Privacy Policy
+# Mr. Day One — Privacy Policy
 
 **Draft for legal review. Not yet in force.**
 Version 0.1 · Last updated [DATE] · Effective [DATE]
@@ -13,7 +13,7 @@ Version 0.1 · Last updated [DATE] · Effective [DATE]
 
 ## 1. Who this covers, and who is responsible
 
-This policy explains what Michael IDE (also presented as "Mr.day One") does with personal
+This policy explains what Mr. Day One (formerly presented as "Michael IDE") does with personal
 information. The controller is [LEGAL ENTITY NAME], [REGISTERED ADDRESS]. Contact us at
 [PRIVACY EMAIL].
 

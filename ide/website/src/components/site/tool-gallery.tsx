@@ -4,6 +4,7 @@ import { visualFor } from "@/components/site/tool-visuals";
 import { cn } from "@/lib/utils";
 import { SectionReveal } from "@/components/motion/section-reveal";
 import { seedIdePreferences } from "@/lib/seed-ide";
+import { useNearViewport } from "@/lib/use-near-viewport";
 
 /*
  * Tool coverflow：目录来自 public/tools.json —— scripts/extract-tools.mjs 从
@@ -14,6 +15,13 @@ import { seedIdePreferences } from "@/lib/seed-ide";
  */
 type Tool = { name: string; group: string; desktopOnly?: boolean };
 type Catalog = { count: number; groups: string[]; tools: Tool[] };
+
+/**
+ * Where the live catalogue is read from. The site is served from mrday.one and the
+ * gateway answers on code.mrday.one, so this is cross-origin by design — the gateway
+ * sends permissive CORS and the endpoint returns names only, nothing authenticated.
+ */
+const GATEWAY = "https://code.mrday.one";
 
 function ToolTile({ tool, focused }: { tool: Tool; focused: boolean }) {
   const v = visualFor(tool.name);
@@ -61,11 +69,74 @@ export function ToolGallery() {
     setSeeded(true);
   }, []);
 
+  /*
+   * The editor below does not boot until you are nearly at it.
+   *
+   * It used to mount with the page, and that is why the site opened part-way down: this
+   * iframe loads the whole IDE, something inside it takes focus as it starts, and a
+   * browser scrolls the *parent* document to bring a newly focused iframe into view. So
+   * every visit ended up parked on this section, with no hash in the address bar and
+   * nothing in the page's own scroll code to explain it. Three earlier attempts went
+   * looking in the wrong place because the URL looked innocent.
+   *
+   * Waiting for the section to approach fixes that outright — there is nothing to steal
+   * focus while you are at the top — and it stops a landing page from booting an entire
+   * editor for a section most readers never scroll to.
+   */
+  const embedBox = useRef<HTMLDivElement | null>(null);
+  const embedNear = useNearViewport(embedBox);
+
+  /*
+   * The bundled catalogue first, then the gateway's live one on top.
+   *
+   * tools.json is generated from the IDE registry at build time, which is accurate the
+   * day it is built and drifts the moment the catalogue changes without a site rebuild —
+   * exactly what happened: this page advertised 147 tools for a week after the product
+   * dropped to 130, including 17 the gateway could no longer inject. The build-time copy
+   * is kept because it carries the grouping and the desktop-only flags, and because a
+   * gateway that is unreachable should degrade to a slightly stale list rather than to an
+   * empty page. The live call decides only *membership* — which of those tools still
+   * exist — so the page can never again name something the product does not have.
+   */
   useEffect(() => {
-    fetch("/tools.json")
-      .then((r) => r.json())
-      .then((c: Catalog) => setCatalog(c))
-      .catch(() => setCatalog(null));
+    let cancelled = false;
+
+    (async () => {
+      let bundled: Catalog | null = null;
+      try {
+        bundled = (await (await fetch("/tools.json")).json()) as Catalog;
+      } catch {
+        // Not fatal on its own; the live list below can still carry the section.
+      }
+      if (cancelled) return;
+      if (bundled) setCatalog(bundled);
+
+      let live: string[] | null = null;
+      try {
+        const r = await fetch(`${GATEWAY}/api/tools/catalog`, { cache: "no-store" });
+        if (r.ok) live = ((await r.json()) as { tools: string[] }).tools ?? null;
+      } catch {
+        // Offline, or an older gateway without the endpoint. Keep the bundled list.
+      }
+      if (cancelled || !live || live.length === 0) return;
+
+      const known = new Map((bundled?.tools ?? []).map((t) => [t.name, t]));
+      // Declaration order is what puts the newest tools in the middle of the coverflow,
+      // and the gateway preserves it — so the live array's order is used as-is, with the
+      // bundled entry supplying group and flags where we have one.
+      const tools: Tool[] = live.map(
+        (name) => known.get(name) ?? { name, group: "Knowledge" },
+      );
+      setCatalog({
+        count: tools.length,
+        groups: [...new Set(tools.map((t) => t.group))].sort(),
+        tools,
+      });
+    })();
+
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
   // The embedded editor tells us when its bridge is listening.
@@ -185,14 +256,22 @@ export function ToolGallery() {
       </div>
 
       {/* the real editor, running whatever is selected */}
-      <div className="mt-6 overflow-hidden rounded-xl border border-border shadow-2xl">
-        {seeded && (
-        <iframe
-          ref={frame}
-          src="/app/index.html?demo=service&play=tools"
-          title="Mr.day One running the selected tool"
-          className="block h-[34rem] w-full border-0"
-        />
+      {/*
+        The fixed height is on the wrapper, not only on the iframe, so the space is
+        reserved before the editor mounts. Without it the page would grow by 34rem the
+        moment you scrolled near, shifting everything under it.
+      */}
+      <div
+        ref={embedBox}
+        className="mt-6 h-[34rem] overflow-hidden rounded-xl border border-border shadow-2xl"
+      >
+        {seeded && embedNear && (
+          <iframe
+            ref={frame}
+            src="/app/index.html?demo=service&play=tools"
+            title="Mr. Day One running the selected tool"
+            className="block h-full w-full border-0"
+          />
         )}
       </div>
       <p className="mt-3 text-center text-xs text-muted-foreground">

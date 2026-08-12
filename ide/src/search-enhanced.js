@@ -1,5 +1,5 @@
 /**
- * Enhanced Search System for Michael IDE
+ * Enhanced Search System for Mr. Day One
  * 
  * Features:
  * - Real-time incremental search with debounce

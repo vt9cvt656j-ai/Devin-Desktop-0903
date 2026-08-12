@@ -15,6 +15,36 @@ export const de: Partial<Dict> = {
   navBilling: "Tarife & Abrechnung",
   navIntegrations: "Integrationen",
   navDevices: "Geräte",
+  navModels: "Modellrouten",
+  navReferral: "Empfehlungen",
+  navChangelog: "Änderungsprotokoll",
+
+  navCommission: "Provision",
+  navInvite: "Einladen",
+  navReferrals: "Meine Empfehlungen",
+  navSettlements: "Abrechnungen",
+  navWithdraw: "Auszahlung",
+
+  referral: "Empfehlungen",
+  referralLede:
+    "Lade andere mit deinem eigenen Code oder Link ein und verdiene an dem, was sie ausgeben.",
+  referralFailed: "Deine Empfehlungsdaten konnten gerade nicht geladen werden.",
+  referralLockedTitle: "Empfehlungen sind für dieses Konto nicht freigeschaltet",
+  referralLockedBody:
+    "Empfehlungen werden von einem Administrator pro Konto freigeschaltet. Bitte ihn darum — danach erscheinen hier dein Code und dein Link.",
+  referralCode: "Dein Einladungscode",
+  referralLink: "Dein Einladungslink",
+  referralHow:
+    "Wer sich über deinen Link registriert oder deinen Code eingibt, wird dir zugeordnet — du erhältst {rate}% von allem, was diese Person in den nächsten {days} Tagen bezahlt. Diese Konditionen gelten für alle, die ab jetzt dazukommen; bereits eingeladene Personen behalten ihre ursprünglichen.",
+  referralPaused:
+    "Das Empfehlungsprogramm pausiert derzeit, neue Registrierungen werden dir bis auf Weiteres nicht zugeordnet. Bereits eingeladene Personen sind nicht betroffen.",
+  referralInvited: "Eingeladene Personen",
+  referralPending: "Offen",
+  referralSettled: "Abgerechnet",
+  referralCopy: "Kopieren",
+  referralCopied: "Kopiert",
+  referralPayout:
+    "Provisionen entstehen automatisch, sobald eine eingeladene Person bezahlt, und werden von einem Administrator abgerechnet.",
   accountMenu: "Kontomenü",
   getTheApp: "Desktop-App holen",
 
@@ -128,7 +158,7 @@ export const de: Partial<Dict> = {
     "Dieser Browser hat sich angemeldet, bevor es die Geräteliste gab. Er steht deshalb nicht unten und lässt sich nicht einzeln abmelden. Einmal ab- und wieder anmelden fügt ihn hinzu.",
   integrations: "Integrationen",
   integrationsLede: "Wie dieses Konto mit der Desktop-App und der API verbunden ist.",
-  desktopApp: "Mr.day One für Desktop",
+  desktopApp: "Mr. Day One für Desktop",
   connected: "Verbunden",
   signedOut: "Abgemeldet",
   notDetected: "Nicht gefunden",
@@ -164,7 +194,7 @@ export const de: Partial<Dict> = {
   disconnectedNote: "Getrennt. Um den Zugriff auch beim Anbieter zu widerrufen, besuchen Sie",
   desktopNeedsPermission: "Berechtigung nötig",
   desktopPermissionAsk:
-    "Ihr Browser hat keine Berechtigung, Apps auf diesem Computer zu erreichen. Diese Seite kann deshalb nicht feststellen, ob Mr.day One läuft. Chrome fragt erst, wenn Sie klicken.",
+    "Ihr Browser hat keine Berechtigung, Apps auf diesem Computer zu erreichen. Diese Seite kann deshalb nicht feststellen, ob Mr. Day One läuft. Chrome fragt erst, wenn Sie klicken.",
   desktopConnectButton: "Nach der App suchen",
   desktopChecking: "Wird geprüft…",
   desktopPermissionBlocked: "Vom Browser blockiert",

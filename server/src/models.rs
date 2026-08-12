@@ -908,12 +908,12 @@ fn i18n_pack_payload(
         "messages": [
             {
                 "role": "system",
-                "content": "You are a professional software UI localization engine. Return ONLY valid JSON. Translate UI strings accurately and naturally. Preserve placeholders like {name}, {count}, {path}, punctuation that belongs to variables, product names (Michael IDE, Git, MCP, Skills), code identifiers, file paths, shortcuts, and HTML/Markdown markers. Keep keys unchanged. Do not add explanations."
+                "content": "You are a professional software UI localization engine. Return ONLY valid JSON. Translate UI strings accurately and naturally. Preserve placeholders like {name}, {count}, {path}, punctuation that belongs to variables, product names (Mr. Day One, Git, MCP, Skills), code identifiers, file paths, shortcuts, and HTML/Markdown markers. Keep keys unchanged. Do not add explanations."
             },
             {
                 "role": "user",
                 "content": format!(
-                    "Translate this Michael IDE UI language pack from {} to locale {}. Return JSON exactly as {{\"translations\":{{\"key\":\"translated text\"}}}}. Entries JSON:\n{}",
+                    "Translate this Mr. Day One UI language pack from {} to locale {}. Return JSON exactly as {{\"translations\":{{\"key\":\"translated text\"}}}}. Entries JSON:\n{}",
                     source_locale,
                     locale,
                     serde_json::to_string(entries).unwrap_or_else(|_| "{}".into())

@@ -2,8 +2,8 @@
   "id": "michael.chinese-language-pack",
   "name": "Chinese Language Pack",
   "version": "1.0.0",
-  "description": "Chinese (Simplified) language pack for Michael IDE UI.",
-  "author": "Michael IDE",
+  "description": "Chinese (Simplified) language pack for Mr. Day One UI.",
+  "author": "Mr. Day One",
   "main": "index.js",
   "permissions": [],
   "contributes": {}

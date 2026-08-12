@@ -16,12 +16,22 @@ export function CodeReview() {
       <Card className="overflow-hidden">
         <CardContent className="p-8 lg:p-10">
           <div className="flex flex-wrap items-center gap-3">
-            <span
-              aria-hidden
-              className="flex size-11 items-center justify-center rounded-full bg-secondary font-display text-sm font-semibold"
-            >
-              C
-            </span>
+            {/*
+              Anthropic's own published mark, saved locally rather than redrawn or
+              hotlinked — a logo copied by eye is both wrong and unmistakably wrong.
+
+              It is here to attribute the review to the model that actually wrote it, and
+              a vendor mark on a product page does lean towards implying endorsement. That
+              is why the badge beside it and the footnote below stay exactly as they are:
+              "Code review · not a customer", and "an assessment of the code, not an
+              endorsement from a user". If the criticisms ever come off this card, the
+              logo has to come off with them — see the note in data/review.ts.
+            */}
+            <img
+              src="/anthropic-mark.png"
+              alt="Anthropic"
+              className="size-11 shrink-0 rounded-full object-cover"
+            />
             <div className="min-w-0 flex-1">
               <p className="font-semibold leading-tight">{review.author}</p>
               <p className="text-sm text-muted-foreground">{review.context}</p>

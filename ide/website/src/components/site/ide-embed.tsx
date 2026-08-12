@@ -11,6 +11,26 @@ import { seedIdePreferences } from "@/lib/seed-ide";
  * 同源，所以挂载前直接写 localStorage 把语言和主题交给它（IDE 在启动时读这两个键）。
  * 一次只允许一个实例存活：Monaco 很重，四个同时挂会拖垮页面。
  */
+/**
+ * Forget whichever project was open last.
+ *
+ * Each demo opens a different tree, and the IDE picks it up from localStorage when it
+ * starts — so without this, switching from one panel to the next boots the new editor on
+ * the previous one's state and it comes up empty. The theme is kept deliberately: that is
+ * the reader's choice, not the previous project's leftovers.
+ */
+function clearOpenProject() {
+  try {
+    for (const key of Object.keys(localStorage)) {
+      if (key.startsWith("michael-ide.") && key !== "michael-ide.theme") {
+        localStorage.removeItem(key);
+      }
+    }
+  } catch {
+    /* private mode — nothing was stored, so nothing needs clearing */
+  }
+}
+
 export function IdeEmbed({
   active,
   onActivate,
@@ -35,39 +55,91 @@ export function IdeEmbed({
   const [booted, setBooted] = useState(false);
   const frame = useRef<HTMLIFrameElement | null>(null);
 
-  useEffect(() => {
-    if (!active) setBooted(false);
-  }, [active]);
+  /*
+   * The editor must not mount until its slate has been wiped.
+   *
+   * Each demo opens a different project, and the IDE reads which one from localStorage at
+   * startup. `launch()` cleared the previous project's keys before setting `active`, so a
+   * click always produced a clean start. Auto-starting skipped that — the keys the last
+   * tab left behind were still there when the next one booted, and the panel came up
+   * empty. Clearing it from an effect would not help either: effects run after the iframe
+   * is in the DOM, by which point it has already read the stale values.
+   *
+   * So `prepared` is the gate. `active` says the reader should see the editor; `prepared`
+   * says the storage underneath it is ready. The iframe waits for both, which costs one
+   * extra render and removes the race entirely.
+   */
+  const [prepared, setPrepared] = useState(false);
 
-  // Sections that auto-activate never call launch(), so seed here too.
   useEffect(() => {
-    if (active) seedIdePreferences();
+    if (!active) {
+      setPrepared(false);
+      setBooted(false);
+      return;
+    }
+    clearOpenProject();
+    seedIdePreferences();
+    setPrepared(true);
+  }, [active, demo]);
+
+  /*
+   * Starting the editor must not move the reader.
+   *
+   * The iframe below runs the real IDE, and the editor takes focus as it starts. Focusing
+   * anything inside an iframe makes the browser scroll the *parent* document to reveal it
+   * — so a section that auto-activates while someone is still at the top drags them down
+   * to it. That is why the front page kept opening part-way down with a clean URL and
+   * nothing in the page's own scroll code to blame; three fixes went looking in the wrong
+   * place before the iframe turned out to be the one doing it.
+   *
+   * So for a few seconds after an embed starts, any scroll the reader did not ask for is
+   * undone. Their own wheel, key, touch or pointer input cancels the guard immediately,
+   * so this can never fight someone who is actually scrolling.
+   */
+  useEffect(() => {
+    if (!active) return;
+
+    const startedAt = window.scrollY;
+    let readerMoved = false;
+    const yield_ = () => {
+      readerMoved = true;
+    };
+    const events = ["wheel", "touchstart", "keydown", "pointerdown"] as const;
+    for (const name of events) window.addEventListener(name, yield_, { passive: true });
+
+    const guard = window.setInterval(() => {
+      if (readerMoved) return;
+      if (Math.abs(window.scrollY - startedAt) > 4) {
+        window.scrollTo({ top: startedAt, behavior: "instant" as ScrollBehavior });
+      }
+    }, 100);
+    // Long enough to cover the editor booting, short enough that it is gone well before
+    // anyone could be surprised by it.
+    const release = window.setTimeout(() => window.clearInterval(guard), 4000);
+
+    return () => {
+      window.clearInterval(guard);
+      window.clearTimeout(release);
+      for (const name of events) window.removeEventListener(name, yield_);
+    };
   }, [active]);
 
   function launch() {
-    try {
-      // Drop any project the previous section opened so each starts on its own.
-      for (const key of Object.keys(localStorage)) {
-        if (key.startsWith("michael-ide.") && key !== "michael-ide.theme") {
-          localStorage.removeItem(key);
-        }
-      }
-    } catch {
-      /* private mode */
-    }
-    seedIdePreferences();
+    // The preparation itself now happens in the effect above, which covers this path and
+    // the automatic one alike. This only asks to be shown.
     onActivate();
   }
 
   return (
     <div className="overflow-hidden rounded-xl border border-border bg-ide-bg shadow-2xl">
       <div className="relative aspect-[16/10] w-full">
-        {active ? (
+        {/* Both, not just `active` — see the note on `prepared`. */}
+        {active && prepared ? (
           <>
             <iframe
               ref={frame}
               src={`/app/index.html?demo=${demo}${play ? "&play=agent" : ""}`}
-              title={`Mr.day One — ${label}`}
+              title={`Mr. Day One — ${label}`}
               onLoad={() => setBooted(true)}
               className="absolute inset-0 size-full border-0"
             />
@@ -81,15 +153,30 @@ export function IdeEmbed({
           <>
             <img
               src={posterLight}
-              alt={`Mr.day One with the ${label} project open`}
+              alt={`Mr. Day One with the ${label} project open`}
               className="absolute inset-0 size-full object-cover object-top dark:hidden"
             />
             <img
               src={posterDark}
-              alt={`Mr.day One with the ${label} project open`}
+              alt={`Mr. Day One with the ${label} project open`}
               className="absolute inset-0 hidden size-full object-cover object-top dark:block"
             />
-            <div className="absolute inset-0 flex items-center justify-center bg-zinc-950/45 backdrop-blur-[2px]">
+            {/*
+              Revealed on hover, and no longer a wall.
+
+              The editor now starts by itself once the section is reached, so this is the
+              way back in after pressing reset — not the thing standing between the reader
+              and the panel. As a permanent dark scrim it obscured the very screenshot it
+              was advertising and implied a click was required. `focus-within` keeps it
+              reachable by keyboard, where there is no hover to depend on.
+            */}
+            <div
+              className={cn(
+                "absolute inset-0 flex items-center justify-center",
+                "bg-zinc-950/45 backdrop-blur-[2px]",
+                "opacity-0 transition-opacity duration-200 hover:opacity-100 focus-within:opacity-100",
+              )}
+            >
               <button
                 type="button"
                 onClick={launch}
@@ -105,7 +192,9 @@ export function IdeEmbed({
 
       <div className="flex items-center gap-2 border-t border-border bg-card px-3 py-2">
         <span className="font-mono text-[11px] text-muted-foreground">
-          {active ? "live — this is the application, not a video" : "click to launch"}
+          {/* It starts on its own now, so "click to launch" only described the old
+              behaviour. The inactive state is reached by pressing reset. */}
+          {active ? "live — this is the application, not a video" : "stopped — hover to run it again"}
         </span>
         {active && (
           <button

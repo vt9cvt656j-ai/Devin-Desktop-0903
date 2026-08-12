@@ -100,8 +100,253 @@ function token(): string {
   return m ? decodeURIComponent(m[1]) : "";
 }
 
+/**
+ * Re-issue this session's cookie on `.mrday.one`.
+ *
+ * Sessions created before the cookie was widened are host-only, so the marketing site
+ * cannot see them and keeps offering "Log in" to someone who is plainly signed in. Only
+ * the sign-in page writes the cookie, and a signed-in person has no reason to go back
+ * there — so without this the old sessions would stay invisible until they expired.
+ *
+ * Writing it here fixes them on the next visit to the console. Harmless when the cookie
+ * is already correct: same name, same value, same scope.
+ */
+export function ensureSharedSession(): void {
+  const t = token();
+  if (!t) return;
+  try {
+    document.cookie =
+      `mide_token=${encodeURIComponent(t)}; Domain=.mrday.one; Path=/; Secure; SameSite=Lax; Max-Age=${7 * 24 * 3600}`;
+  } catch {
+    /* nothing depends on this succeeding */
+  }
+}
+
 export function toGate(): void {
   location.replace(`/gate?next=${encodeURIComponent(location.pathname)}`);
+}
+
+export type Referral = {
+  granted: boolean;
+  /** true = commission lands as account credit; there is then nothing to withdraw. */
+  auto_settle: boolean;
+  /** true = 系统按冻结期和门槛自动打款，用户不需要（也不能）自己发起提现。 */
+  batch_enabled: boolean;
+  /** This account's outstanding requests. Keeps the screen reachable across a switch. */
+  pending_withdrawals: number;
+  rate_bps: number;
+  window_days: number;
+  /** The programme-wide switch. Off means nobody can bind new referrals right now. */
+  enabled: boolean;
+  code?: string;
+  link?: string;
+  invited?: number;
+  pending_cents?: number;
+  settled_cents?: number;
+};
+
+export type MyReferral = {
+  /** Masked by the gateway, e.g. `h***0@gmail.com`. */
+  who: string;
+  source: string;
+  rate_bps: number;
+  created_at: string;
+  expires_at: string;
+  active: boolean;
+  earned_cents: number;
+};
+
+export type MySettlement = {
+  id: string;
+  /** Masked by the gateway. */
+  customer_email: string;
+  amount_cents: number;
+  rate_bps: number;
+  commission_cents: number;
+  /** 'auto' = credited to your balance; 'manual' = an operator approved it. */
+  settled_by: "auto" | "manual";
+  settled_at: string | null;
+  created_at: string;
+  /** 'settled', or 'reversed' when the purchase behind it was refunded. */
+  status: string;
+  /** Set when that purchase was refunded or charged back. */
+  reversed_at: string | null;
+  reversal_reason: string;
+};
+
+export type SettlementList = {
+  rows: MySettlement[];
+  page: number;
+  pages: number;
+  total: number;
+  total_cents: number;
+  per_page: number;
+};
+
+export type Withdrawal = {
+  id: string;
+  amount_cents: number;
+  method: string;
+  account: string;
+  /** pending | paid | rejected | failed | returned */
+  status: string;
+  note: string;
+  created_at: string;
+  paid_at: string | null;
+  /** 'manual'(有人手动转的) | 'stripe_connect'(系统自动转的) */
+  provider?: string;
+  /** 自动打款失败或被冲回的原因，Stripe 的原话。 */
+  failure_reason?: string;
+};
+
+/** 一次支付的结果。见 stripe.rs session_result。 */
+export type PaymentResult = {
+  paid: boolean;
+  kind: string;
+  label: string | null;
+  plan: string | null;
+  duration_days: number | null;
+  /** 这一单买到的钱包额度（原始计费分），套餐单为 null。 */
+  credits_cents: number | null;
+  amount_cents: number;
+  /** Stripe 实收，以及币种。 */
+  charged_cents: number | null;
+  charged_currency: string | null;
+  raw_cents_per_credit_usd: number;
+  /** 发放之后账号的实际状态 —— 从账号读，不是复述订单。 */
+  account: {
+    plan: string;
+    plan_expires_at: string | null;
+    credits_cents: number;
+    quota_total_cents: number;
+  };
+};
+
+/** 自动打款的开通状态。见 connect.rs。 */
+export type ConnectState = {
+  /** 平台侧根本没配 Stripe 时为 false —— 这时不该显示开通按钮。 */
+  configured: boolean;
+  connected: boolean;
+  ready: boolean;
+  missing: string[];
+};
+
+export type WithdrawState = {
+  available_cents: number;
+  /** Earned but not yet approved, so not yet withdrawable. Shown so the gap is explained. */
+  pending_commission_cents: number;
+  min_cents: number;
+  methods: string[];
+  rows: Withdrawal[];
+};
+
+/** Where the gate parks a `?ref=` code until there is a session to attach it to. */
+export const REF_KEY = "mide_ref";
+
+/**
+ * Attach a pending referral, once, after signing in.
+ *
+ * Runs here rather than in the gate because the gate is not on every path in: signing in
+ * with GitHub or Google redirects from the provider straight to /dashboard with a cookie,
+ * never passing through the gate's own completion code. The console is the one place every
+ * route arrives at, so it is the only place this works for all of them.
+ *
+ * The key is cleared on success and on a refusal (already referred, own code, unknown
+ * code) — those are answers, and retrying them forever would be pointless. It is kept on a
+ * network error, which is not an answer and may work on the next load.
+ */
+export async function claimPendingReferral(): Promise<ReferralOutcome> {
+  // localStorage 优先，cookie 兜底：隐私模式下 gate 写 localStorage 会静默失败，
+  // 那时候唯一还留着邀请码的就是 cookie（gate 两条路都镜像了一份）。
+  let code = "";
+  try {
+    code = localStorage.getItem(REF_KEY) ?? "";
+  } catch {
+    /* 存储被禁，往下走 cookie */
+  }
+  if (!code) {
+    const hit = document.cookie.match(/(?:^|;\s*)mide_ref=([^;]+)/);
+    code = hit ? decodeURIComponent(hit[1]) : "";
+  }
+  if (!code) return { kind: "none" };
+
+  try {
+    await api.claimReferral(code);
+  } catch (e) {
+    /*
+     * 只有服务端**明确拒绝**这个码时才丢掉它。
+     *
+     * 以前这里只把断网（TypeError）当作可重试，于是任何 HTTP 错误都会走到下面的
+     * removeItem —— 一次 500（数据库抖一下）、一次 502（网关正在重启）、一次 401
+     * （令牌过期），都会把这个码唯一的副本永久删掉。码只在 gate 里写过一次，
+     * 没有第二份，删了就再也绑不上，而且没有任何人会收到提示。
+     *
+     * 400 才是「这个码不能用」：无效、已绑过、是自己的、账号已有付款记录。那些情况
+     * 留着也没意义。其余一律保留 —— 控制台每次挂载都会重跑这个函数，留着就等于自动重试。
+     */
+    const status = e instanceof ApiError ? e.status : 0;
+    const refused = status === 400;
+    // 没送到就留着下次再试；被明确拒绝才丢掉，并且把服务端的原话带出去 ——
+    // 用户点了一个邀请链接却什么都没发生，是这条链上最让人困惑的一步。
+    if (!refused) return { kind: "retry" };
+    clearRef();
+    return { kind: "refused", message: e instanceof Error ? e.message : "" };
+  }
+  clearRef();
+  return { kind: "bound" };
+}
+
+/** 本地两份邀请码一起清 —— 只清一份，下次挂载会拿另一份重试一个已经处理过的码。 */
+function clearRef() {
+  try {
+    localStorage.removeItem(REF_KEY);
+  } catch {
+    /* private mode — nothing to clear */
+  }
+  document.cookie = "mide_ref=; Path=/; Max-Age=0; SameSite=Lax; Secure";
+}
+
+/** 这次绑定的结果。`retry` 表示请求没送到，码还留着，下次挂载会自动再试。 */
+export type ReferralOutcome =
+  | { kind: "none" }
+  | { kind: "bound" }
+  | { kind: "retry" }
+  | { kind: "refused"; message: string };
+
+/**
+ * 系统语言、时区和 UTC 偏移。
+ *
+ * 服务端拿这三个加上 IP 判定是不是中国区（见 stripe.rs buyer_currency）。时区名和偏移
+ * 一起报，是为了让服务端能校验这两者自洽 —— 只报一个时区名的话，随手填一个就过了。
+ *
+ * 全部包在 try 里：老浏览器上 Intl 可能缺失，缺了就少报一个信号，不能让整个请求挂掉。
+ */
+function regionSignals(): Record<string, string> {
+  try {
+    return {
+      "x-ide-language": navigator.language || "",
+      "x-ide-timezone": Intl.DateTimeFormat().resolvedOptions().timeZone || "",
+      "x-ide-utc-offset-minutes": String(-new Date().getTimezoneOffset()),
+    };
+  } catch {
+    return {};
+  }
+}
+
+/**
+ * 带状态码的错误。
+ *
+ * 以前所有失败都抛同一个 `Error`，调用方只能靠字符串猜发生了什么 —— 而「服务器拒绝了」和
+ * 「请求根本没送到」在邀请码这条路上的后果完全相反：前者该丢掉码，后者必须留着重试。
+ */
+export class ApiError extends Error {
+  constructor(
+    message: string,
+    readonly status: number,
+  ) {
+    super(message);
+    this.name = "ApiError";
+  }
 }
 
 async function request<T>(path: string, init?: { method?: string; body?: unknown }): Promise<T> {
@@ -110,16 +355,24 @@ async function request<T>(path: string, init?: { method?: string; body?: unknown
     headers: {
       Authorization: `Bearer ${token()}`,
       ...(init?.body ? { "Content-Type": "application/json" } : {}),
+      // 中国区判定的三个信号。必须挂在**每一个**请求上：定价卡片和结账是两次独立的请求，
+      // 只给其中一个加，两边算出来的币种就可能不一致 —— 那是一笔拒付，不是显示问题。
+      //
+      // 偏移量的符号要翻过来：getTimezoneOffset() 对东八区返回 -480，而服务端比对的是
+      // 「UTC+480」这个方向。
+      ...regionSignals(),
     },
     body: init?.body ? JSON.stringify(init.body) : undefined,
     cache: "no-store",
   });
   if (res.status === 401 || res.status === 403) {
     toGate();
-    throw new Error("unauthorized");
+    throw new ApiError("unauthorized", res.status);
   }
   const data = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error((data as { error?: string }).error ?? `${path} → ${res.status}`);
+  if (!res.ok) {
+    throw new ApiError((data as { error?: string }).error ?? `${path} → ${res.status}`, res.status);
+  }
   return data as T;
 }
 
@@ -153,6 +406,38 @@ export const api = {
     request<{ ok: boolean; revoke_at_provider: string }>(`/api/integrations/${provider}`, {
       method: "DELETE",
     }),
+  /**
+   * This account's referral standing.
+   *
+   * `granted: false` is a normal answer, not an error — referring is a privilege an admin
+   * hands out, so most accounts get that and the page renders "ask an admin" rather than
+   * a failure.
+   */
+  referral: () => request<Referral>("/api/referral/me"),
+  /** The people this account brought in. Addresses are masked by the gateway. */
+  myReferrals: () => request<MyReferral[]>("/api/referral/referrals"),
+  mySettlements: (page: number) =>
+    request<SettlementList>(`/api/referral/settlements?page=${page}`),
+  /** Balance, limits and past requests. Nothing here moves money — see Withdraw.tsx. */
+  withdrawals: () => request<WithdrawState>("/api/referral/withdrawals"),
+  requestWithdrawal: (body: { amount_cents: number; method: string; account: string; qr?: string }) =>
+    request<{
+      id: string;
+      available_cents: number;
+      /** true = 已经直接打款到对方 Stripe 账户，没有人工环节。 */
+      auto_paid: boolean;
+      transfer_id: string | null;
+    }>("/api/referral/withdraw", { method: "POST", body }),
+  /** 这一笔支付买到了什么。订单没到账时后端会主动向 Stripe 核实并当场发放。 */
+  paymentResult: (sessionId: string) =>
+    request<PaymentResult>(`/api/billing/session/${encodeURIComponent(sessionId)}`),
+  /** 这个账号能不能自动收款，缺什么。 */
+  connect: () => request<ConnectState>("/api/referral/connect"),
+  /** 拿一条 Stripe 开户链接。链接是一次性的，每次点都重新要。 */
+  connectStart: () => request<{ url: string }>("/api/referral/connect/start", { method: "POST" }),
+  /** Bind whoever owns `code` as this account's referrer. See `claimPendingReferral`. */
+  claimReferral: (code: string) =>
+    request<{ ok: boolean }>("/api/referral/claim", { method: "POST", body: { code } }),
   redeem: (code: string) => request<unknown>("/api/redeem", { method: "POST", body: { code } }),
   models: () => request<unknown[]>("/api/models"),
   sessions: () => request<SessionList>("/api/sessions"),
@@ -160,12 +445,42 @@ export const api = {
     request<{ ok: boolean }>(`/api/sessions/${id}`, { method: "DELETE" }),
 };
 
-export function signOut(): void {
+/**
+ * 退出登录。先在服务端作废这一次登录，再清本地。
+ *
+ * 服务端那一步不是可有可无的。令牌的副本不止一处：这里的 localStorage、`.mrday.one` 那颗
+ * 共享 cookie、官网所在源的 localStorage —— 谁也删不掉别的源里的那份。只清本地，等于把
+ * 一张仍然有效的令牌留在别处；登录页读到它、问服务端、被告知有效，就会把人送回受门禁的
+ * 页面，而那里只认 cookie，于是又弹回登录页 —— 无限刷新。作废之后，残留副本在哪儿都换
+ * 不到东西。
+ *
+ * 只作废当前浏览器这一条，桌面端的登录不受影响 —— 界面上那句提示说的就是这个意思。
+ */
+export async function signOut(): Promise<void> {
+  const t = token();
+  if (t) {
+    try {
+      // 等它回来再跳转：请求还在飞的时候导航，浏览器可以直接把它丢掉，而丢掉的正好
+      // 就是让退出登录生效的那一步。keepalive 再兜一层。
+      await fetch("/api/auth/logout", {
+        method: "POST",
+        headers: { Authorization: `Bearer ${t}` },
+        keepalive: true,
+      });
+    } catch {
+      // 断网或网关挂了。照样退出：因为网络不通就拒绝让人退出登录，是错误的失败方式。
+    }
+  }
   try {
     localStorage.removeItem("michael_token");
   } catch {
     /* nothing to clear */
   }
+  // Cleared twice on purpose. The cookie is written with Domain=.mrday.one so the
+  // marketing site can see the session, and a delete only matches a cookie with the same
+  // domain — clearing the host-only form alone would leave the wider one alive, and
+  // signing out here would leave the site still greeting you by name.
+  document.cookie = "mide_token=; Domain=.mrday.one; Path=/; Max-Age=0";
   document.cookie = "mide_token=; Path=/; Max-Age=0";
   location.replace("/gate");
 }

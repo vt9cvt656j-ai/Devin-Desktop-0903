@@ -3,7 +3,7 @@
   "name": "Word Count",
   "version": "0.1.0",
   "description": "Shows word and character counts for the active editor in the status bar.",
-  "author": "Michael IDE",
+  "author": "Mr. Day One",
   "main": "index.js",
   "permissions": ["editor"],
   "contributes": {

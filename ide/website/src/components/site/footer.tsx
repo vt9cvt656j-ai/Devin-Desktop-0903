@@ -34,7 +34,7 @@ export function Footer() {
           <div className="max-w-xs">
             <p className="flex items-center gap-2.5 font-display text-lg font-semibold">
               <img src="/logo.png" alt="" className="size-8" />
-              Mr.day One
+              Mr. Day One
             </p>
             <p className="mt-3 text-sm text-muted-foreground">
               A native desktop code editor for macOS and Windows, with an agent that verifies its
@@ -66,7 +66,7 @@ export function Footer() {
         </div>
         <Separator className="my-10" />
         <p className="text-sm text-muted-foreground">
-          © {new Date().getFullYear()} Mr.day One. Companion to Devin Desktop.
+          © {new Date().getFullYear()} Mr. Day One. Companion to Devin Desktop.
         </p>
       </div>
     </footer>

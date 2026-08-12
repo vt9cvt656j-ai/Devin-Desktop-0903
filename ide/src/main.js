@@ -1,4 +1,4 @@
-// Michael IDE — editor + AI assistant orchestration.
+// Mr. Day One — editor + AI assistant orchestration.
 
 // Global error boundary: catch unhandled errors/rejections so the IDE never
 // silently dies. Shows a transient toast and logs to the console.
@@ -1314,7 +1314,7 @@ function mockBackend() {
       id: "michael.eslint",
       name: "ESLint",
       version: "4.2.1",
-      description: "Integrates ESLint into Mr.day One. Highlights problems in your code and offers quick-fix actions.",
+      description: "Integrates ESLint into Mr. Day One. Highlights problems in your code and offers quick-fix actions.",
       author: "Microsoft",
       download_url: "https://example.com/eslint.zip",
       tags: ["linter", "javascript", "typescript"],
@@ -1707,7 +1707,7 @@ function mockBackend() {
       return `${hash} ${msg}`;
     },
     gitPush: async (_root) => "Everything up-to-date (preview mock).",
-    gitClone: async () => { throw new Error("Git clone requires the native Mr.day One app."); },
+    gitClone: async () => { throw new Error("Git clone requires the native Mr. Day One app."); },
     gitBranches: async (_root) => ({ current: GIT_BRANCH, branches: [...GIT_BRANCHES] }),
     gitCheckout: async (_root, branch, create) => {
       const name = (branch || "").trim();
@@ -1740,7 +1740,7 @@ function mockBackend() {
     gitStash: async () => {
       if (!GIT_CHANGES.length && !GIT_STASHES.length) return "No local changes to stash.";
       const ts = new Date().toISOString().slice(0, 16).replace("T", " ");
-      GIT_STASHES.unshift(`stash@{0}: On main: Mr.day One stash (${ts})`);
+      GIT_STASHES.unshift(`stash@{0}: On main: Mr. Day One stash (${ts})`);
       return GIT_STASHES[0];
     },
     gitStashList: async () =>
@@ -1905,7 +1905,7 @@ function mockBackend() {
       mockTerms.set(id, { onEvent, line: "", cwd });
       const send = (s) => onEvent({ kind: "data", data: s });
       setTimeout(() => {
-        send("Mr.day One terminal \x1b[2m(preview mock)\x1b[0m\r\n");
+        send("Mr. Day One terminal \x1b[2m(preview mock)\x1b[0m\r\n");
         send("\x1b[2mSimulated shell — the native app runs your real shell via a PTY. Type 'help'.\x1b[0m\r\n\r\n");
         send(mockPrompt(cwd));
       }, 20);
@@ -4455,7 +4455,7 @@ function activate(path) {
   // The title bar sits between the traffic lights and the toolbar buttons; a full filename there
   // crowds both. CSS can ellipsize it, but only from the end, which drops the extension.
   $("windowTitle") && _setWindowTitle(
-    _ellipsizeMiddle(f.name) + (projectLabel ? " — " + _ellipsizeMiddle(projectLabel, 24) : "") + " — Mr.day One",
+    _ellipsizeMiddle(f.name) + (projectLabel ? " — " + _ellipsizeMiddle(projectLabel, 24) : "") + " — Mr. Day One",
   );
   if (!f.isImage && !f.isVideo && !f.isPdf && !f.isInspection) {
     // Cheap, in-memory decorations — render synchronously so they paint with the file.
@@ -7955,7 +7955,7 @@ async function closeFile(path, { force = false, discardBuffer = false } = {}) {
       hideMarkdownPreview();
       saveBtn.disabled = true;
       if (runBtn) runBtn.disabled = true;
-      const idleTitle = rootPath ? basename(rootPath) + " — Mr.day One" : "Mr.day One";
+      const idleTitle = rootPath ? basename(rootPath) + " — Mr. Day One" : "Mr. Day One";
       _setWindowTitle(idleTitle);
       refreshGutter();
     }
@@ -8989,8 +8989,8 @@ function setActiveWorkspaceRoot(path) {
   const titleFile = activePath ? openFiles.get(activePath)?.name : "";
   const project = path ? basename(path) : "";
   _setWindowTitle(project
-    ? (titleFile ? titleFile + " — " : "") + project + " — Mr.day One"
-    : "Mr.day One");
+    ? (titleFile ? titleFile + " — " : "") + project + " — Mr. Day One"
+    : "Mr. Day One");
 }
 
 async function renderWorkspaceRoots() {
@@ -15514,7 +15514,7 @@ async function _openNewWindow() {
     const label = "win-" + Date.now().toString(36);
     const w = new WebviewWindow(label, {
       url: "index.html?w=sub",
-      title: "Mr.day One",
+      title: "Mr. Day One",
       width: 1180, height: 760, minWidth: 880, minHeight: 560,
       resizable: true, titleBarStyle: "Overlay", hiddenTitle: true,
     });
@@ -16428,7 +16428,7 @@ let _ipcChannel = null;
 const _ipcPeers = new Map();
 
 // 统一设置窗口标题：同时更新自绘标题栏 DOM 和原生窗口标题。之前只改 DOM，
-// macOS 的 Dock/调度中心/窗口菜单里所有窗口都叫 "Michael IDE"，多窗口无法按项目区分。
+// macOS 的 Dock/调度中心/窗口菜单里所有窗口都叫 "Mr. Day One"，多窗口无法按项目区分。
 /**
  * Shorten from the middle, keeping both ends. For a filename the tail carries the extension and
  * usually the version or date — exactly what end-truncation throws away first. macOS shortens
@@ -18817,7 +18817,7 @@ const _TRUTHFULNESS_FALLBACK = `\n\nTruthfulness first: answer stable questions 
 // ordinary conversation slow or bureaucratic.
 const _HUMAN_EVIDENCE_FALLBACK = `\n\nTalk like someone solving the problem alongside them: lead with the conclusion or where things stand, then the grounds that matter; do not recite internal rules, a running log of tool calls, or a fixed template. Reason directly about stable facts; for anything that changes, that affects a decision, or that the user explicitly wants live, verify it against the real project, the terminal, the web, an official API or a reliable source. A tool being called is not the goal being met — for changes, runs, deployments and external operations, look at the actual result, exit code, response or interface state. When you have no evidence, say it is unknown; never invent a link, data, file contents, an API or a completion status. Never substitute a mock, demo data, a placeholder result or a "looks like it works" implementation for the real thing the user asked for. Whether the user is a beginner or an expert does not change the delivery standard — you are the one writing the code, so do not quietly cut it down to a minimum viable prototype or a stripped version because you think they are "a beginner starting from scratch"; build the complete, genuinely usable thing they actually asked for, and scale down only when they explicitly say they want a minimal version, a demo, or a placeholder.`;
 const _AI_MODE_PROMPTS = {
-  agent: `你是 Michael IDE 的协作式编码 AI，用**与用户相同的语言**自然直接地交流（用户用什么语言你就用什么语言，不要默认中文）。先理解人真正想要的结果：明确要求修改、实现、运行、提交或部署时，使用真实工具完成并验证；只是提问、讨论或让你评估时，只读调查和回答，不擅自制造副作用。已知目标直接读取，未知位置才定位；改已有文件前先读当前原文。改 package.json/锁文件/依赖版本前先用 package_search/官方 registry 核对 latest、版本历史、engines、peerDependencies，不能凭记忆猜版本。多文件、跨模块或外部操作可用 update_plan 给出完整而简洁的路线，状态只随真实证据推进。选择工具看任务语义、当前证据和工具结果，不依赖关键词或正则路由；需要当前资料时再联网，优先一手来源和真实响应。
+  agent: `你是 Mr. Day One 的协作式编码 AI，用**与用户相同的语言**自然直接地交流（用户用什么语言你就用什么语言，不要默认中文）。先理解人真正想要的结果：明确要求修改、实现、运行、提交或部署时，使用真实工具完成并验证；只是提问、讨论或让你评估时，只读调查和回答，不擅自制造副作用。已知目标直接读取，未知位置才定位；改已有文件前先读当前原文。改 package.json/锁文件/依赖版本前先用 package_search/官方 registry 核对 latest、版本历史、engines、peerDependencies，不能凭记忆猜版本。多文件、跨模块或外部操作可用 update_plan 给出完整而简洁的路线，状态只随真实证据推进。选择工具看任务语义、当前证据和工具结果，不依赖关键词或正则路由；需要当前资料时再联网，优先一手来源和真实响应。
 
 【开工前的工程思考】复杂任务动手前先在思考中完成四步（简单问答可跳过）：
 1. 现状盘点：现有代码/错误/约束的关键事实（不是复述任务）
@@ -18827,10 +18827,10 @@ const _AI_MODE_PROMPTS = {
 思考要有信息增量——每句话都应是读完材料后的新判断，禁止复述题面。收尾只说做成了什么、怎么验证、还剩什么限制，不要复读任务或催用户继续。
 
 【执行质量】每次工具调用都必须直接推进当前目标或验证已经完成的改动。先形成可证伪的工作假设，再选择取得该假设所需的最小证据；证据已经足够时立即决策，不要继续泛读。修 bug 时先定位触发路径和根因，再做最小一致改动，最后运行和改动直接相关的验证并依据真实输出迭代。不要为显得主动而重构无关代码、安装依赖、启动服务、浏览器巡检、生成文件或调用旁支工具；只有当前交付或验证确实需要时才做。工具失败时先根据错误和已有证据改变假设或路线，禁止原样重复调用。${_HUMAN_EVIDENCE_FALLBACK}`,
-  chat: `你是 Michael IDE 的 Chat 模式。像经验丰富的同事一样直接回答，不修改文件，也不假装运行过工具。问题涉及当前项目但没有要求动手时，说明需要真实取证的范围即可。区分事实、判断和未知，避免模板化措辞。**回复语言跟随用户**（用户用什么语言你就用什么语言，不要默认中文）。${_HUMAN_EVIDENCE_FALLBACK}`,
-  plan: `你是 Michael IDE 的 Plan 模式：只读调查 + 输出可执行方案。不修改文件或执行副作用命令。方案基于实际项目证据，说明目标、关键文件和契约、实现顺序、边界、验证与风险；计划应完整但每项简洁可核验。**回复语言跟随用户**（用户用什么语言你就用什么语言，不要默认中文）。${_HUMAN_EVIDENCE_FALLBACK}`,
-  explorer: `你是 Michael IDE 的 Explorer 模式：只读代码库侦察员。用最短证据路径说明代码在哪里、如何流动、影响哪些模块。目标已知直接读，未知才搜索；输出结论、关键路径、约定、风险和下一步，不修改文件或运行副作用命令。**回复语言跟随用户**（用户用什么语言你就用什么语言，不要默认中文）。${_HUMAN_EVIDENCE_FALLBACK}`,
-  reviewer: `你是 Michael IDE 的 Reviewer 模式：只读代码审查员。只报告能由真实代码、diff、诊断或调用方证实的问题。按严重程度给位置、触发条件、影响和最小修复建议；没证据就明确未确认。绝不修改文件或运行副作用命令。**回复语言跟随用户**（用户用什么语言你就用什么语言，不要默认中文）。${_HUMAN_EVIDENCE_FALLBACK}`,
+  chat: `你是 Mr. Day One 的 Chat 模式。像经验丰富的同事一样直接回答，不修改文件，也不假装运行过工具。问题涉及当前项目但没有要求动手时，说明需要真实取证的范围即可。区分事实、判断和未知，避免模板化措辞。**回复语言跟随用户**（用户用什么语言你就用什么语言，不要默认中文）。${_HUMAN_EVIDENCE_FALLBACK}`,
+  plan: `你是 Mr. Day One 的 Plan 模式：只读调查 + 输出可执行方案。不修改文件或执行副作用命令。方案基于实际项目证据，说明目标、关键文件和契约、实现顺序、边界、验证与风险；计划应完整但每项简洁可核验。**回复语言跟随用户**（用户用什么语言你就用什么语言，不要默认中文）。${_HUMAN_EVIDENCE_FALLBACK}`,
+  explorer: `你是 Mr. Day One 的 Explorer 模式：只读代码库侦察员。用最短证据路径说明代码在哪里、如何流动、影响哪些模块。目标已知直接读，未知才搜索；输出结论、关键路径、约定、风险和下一步，不修改文件或运行副作用命令。**回复语言跟随用户**（用户用什么语言你就用什么语言，不要默认中文）。${_HUMAN_EVIDENCE_FALLBACK}`,
+  reviewer: `你是 Mr. Day One 的 Reviewer 模式：只读代码审查员。只报告能由真实代码、diff、诊断或调用方证实的问题。按严重程度给位置、触发条件、影响和最小修复建议；没证据就明确未确认。绝不修改文件或运行副作用命令。**回复语言跟随用户**（用户用什么语言你就用什么语言，不要默认中文）。${_HUMAN_EVIDENCE_FALLBACK}`,
 };
 
 const _AI_MODES = [
@@ -19177,6 +19177,9 @@ const _AI_AGENT_ROLES = new Set([
 ]);
 const _aiIntentCache = new Map(); // 会话 + 上下文指纹 + 文本 -> { ts, intents }
 const _aiIntentInflight = new Map(); // key -> 物理请求 Promise；8s 前台窗口结束后仍保留到真实落定
+// 新会话第一轮愿意为意图裁决多等多久。整个会话只付一次：拿到 flag 之后画像就粘住了。
+// 上限刻意压得比 8s 前台窗口短得多——这一下是为了不让最关键的那轮裸奔，不是为了等到底。
+const _FIRST_TURN_INTENT_WAIT_MS = 1500;
 let _lastGoodAiConfig = null; // 上次真实发送用过的 config——运行中 steer 复用，绝不碰登录门
 function _aiIntentCacheKey(text, sessionId = "", contextFingerprint = "") {
   const normalized = String(text || "").trim().replace(/\s+/g, " ").toLowerCase().slice(0, 800);
@@ -19427,7 +19430,7 @@ async function _aiIntentProfile(text, config, session = null, context = null) {
   const inflight = _aiIntentInflight.get(key);
   if (inflight) return adoptWithinForegroundWindow(inflight);
   // 用户选什么模型就用什么模型判意图，不降级廉价模型。
-  const prompt = `你是 Michael IDE 的语义工程决策器。根据当前消息、同一会话状态和真实工作区证据，还原用户要交付的终态，并决定完成它所需的工程路径。严格输出一个 JSON 对象，除 JSON 外不要任何文字。禁止通过关键词表、正则或“提到某个词就开启某功能”的方式分类；必须从目标、业务行为、项目事实、风险和验收结果推理。
+  const prompt = `你是 Mr. Day One 的语义工程决策器。根据当前消息、同一会话状态和真实工作区证据，还原用户要交付的终态，并决定完成它所需的工程路径。严格输出一个 JSON 对象，除 JSON 外不要任何文字。禁止通过关键词表、正则或“提到某个词就开启某功能”的方式分类；必须从目标、业务行为、项目事实、风险和验收结果推理。
 语义字段：goal=用户最终要达到的结果；action=answer/inspect/modify/create/run/debug/review/plan/operate/cancel 之一；target=这次动作针对的对象；locationIntent=none/context_only/query/remember（请注意区分）：
 - 'context_only': 用户【只】提供了项目/文件位置，【无】查询或动作意图
   示例：'项目在 /path/to/repo' → 只记录位置，不查询、不分析、不执行
@@ -22319,7 +22322,7 @@ function _languagePreferenceBlock() {
 
 function _lightweightAgentSystemPrompt() {
   return [
-    "你是 Michael IDE 的轻量聊天助手。用用户的语言直接回答，短、准、真实。",
+    "你是 Mr. Day One 的轻量聊天助手。用用户的语言直接回答，短、准、真实。",
     "本轮没有接入项目文件、终端、浏览器或工具；不要声称已经读取、修改、运行或验证过任何东西。",
     "不要输出任务计划、待办卡片、工程动作或文件操作建议，除非用户明确提出要做项目任务。",
     "动态事实、价格、实时状态、附近地点、最新版本和新闻不能靠猜；没有真实来源时说明不确定或需要查询。",
@@ -23134,6 +23137,35 @@ async function sendPrompt(text, attachments = [], readyConfig = null) {
     const preparedWorkspace = await _workspacePreflightPromise;
     _turnRoot = preparedWorkspace.turnRoot || "";
     _curRoot = preparedWorkspace.currentRoot || String(_turnRoot || _knownWorkspaceRoots()[0] || "").replace(/\/+$/, "");
+  }
+  // 新会话的第一轮，短暂地等一下意图裁决。
+  //
+  // 画像是同步算的：_engineeringProfileWithAiIntent 读的是 session._intentState 和缓存，
+  // 而全新会话两者都是空的（本地证据函数 _semanticEngineeringEvidence 只返回 URL 列表，
+  // 一个维度都不给）。于是第一轮发出去的画像是空的，网关只挂 agent.base —— 决定整个做法
+  // 的那一轮，恰恰拿不到 agent_engineering 那套工程纪律，也拿不到设计/研究/缺陷分类块。
+  //
+  // 更实际的代价在缓存上：画像是会话粘性的（见 _sessionStableSemanticProfile），第一轮空、
+  // 第二轮有，意味着**每个会话在第二轮都必然把整条对话的前缀缓存作废一次**。粘性本来就是
+  // 为了让 byte 0 稳定而存在的，空的第一轮把它破了。等这一下，质量和缓存一起解决。
+  //
+  // 只在第一轮等，且有硬上限：会话一旦有了 flag，后面每一轮都直接命中，零等待。裁决没赶上
+  // 也照常发（_applyLateIntentIfLanded 会在循环边界补），不会把一轮卡死在这里。
+  if (_turnIntentState && !(sess._semanticProfileFlags || []).length) {
+    let _waitTimer = null;
+    try {
+      await Promise.race([
+        _turnIntentExactPromise,
+        new Promise((resolve) => { _waitTimer = setTimeout(resolve, _FIRST_TURN_INTENT_WAIT_MS); }),
+      ]);
+    } catch {}
+    if (_waitTimer) clearTimeout(_waitTimer);
+    if (_turnIntentState.settled && _turnIntentState.verdict) {
+      const _base = _semanticEngineeringEvidence(text);
+      _base._isAgentMode = effectiveMode === "agent";
+      const _resolved = _mergeAiIntentProfile(_base, _turnIntentState.verdict, text, null);
+      if (_resolved && _resolved.intentSource === "ai") _turnEngineeringResolved = _resolved;
+    }
   }
   config.ideSemanticProfile = _sessionStableSemanticProfile(sess, _semanticProfileHeaderFor(_turnEngineeringResolved, text));
 
@@ -25246,7 +25278,7 @@ async function _approveWorkspaceExecConfig(kind, path, text, details) {
   const decision = await _toolApprovalDialog({
     title: `这个仓库自带 ${kind} 配置，要运行它吗？`,
     detail: `${path}\n\n将要启动：\n${listed}${more}\n\n`
-      + `⚠️ 这些命令来自你打开的这个仓库，不是 Mr.day One 自带的。\n`
+      + `⚠️ 这些命令来自你打开的这个仓库，不是 Mr. Day One 自带的。\n`
       + `如果这个仓库不是你自己写的、或者你不认识上面的命令，请选择拒绝。\n`
       + `（配置内容一旦改变会重新询问）`,
   });
@@ -28750,7 +28782,7 @@ function _buildAgentToolSchemas(includeWrite, mcpTools = []) {
     { type: "function", function: { name: "await_subagent", description: "Wait for a background subagent job to finish and collect its result. Use it when you cannot continue without the sub-report; with no jobs running it returns a summary of the current job ledger. 【vs alternatives】To dispatch an investigation use run_subagent / spawn_multiple_agents.", parameters: { type: "object", properties: { job: { type: "string", description: "The job number (e.g. 3) or all, default all" } }, required: [] } } },
     { type: "function", function: { name: "spawn_multiple_agents", description: "**Dispatch several role-based subagents concurrently in one call** (asynchronous and in the background, while the main flow continues). Suited to a large task needing several perspectives at once: research-type roles (research/security/architect and so on) gather evidence independently and their results are delivered when ready, or you can join them with await_subagent. With shared_store collaboration enabled, each subagent's findings are broadcast to the others automatically, avoiding duplicated research. ⚠️ Do not use it for a single focused investigation — the main agent reading directly is faster; for parallel implementation that writes files use run_worker.", parameters: { type: "object", properties: { task: { type: "string", description: "The overall task description (shared background for every agent)" }, agents: { type: "array", minItems: 1, maxItems: 5, items: { type: "object", properties: { role: { type: "string", enum: ["architect", "product", "research", "frontend", "backend", "database", "security", "test", "devops", "design", "docs"], description: "A read-only specialist perspective" }, focus: { type: "string", description: "This agent's focused subtask (self-contained — it cannot see the conversation history)" } }, required: ["role", "focus"] }, description: "2-5 parallel subagent definitions" }, collaboration: { type: "string", enum: ["shared_store", "independent"], description: "Default shared_store = findings are broadcast between agents; independent = fully isolated" } }, required: ["task", "agents"] } } },
     { type: "function", function: { name: "research_project", description: "Dispatch a read-only subagent to map the stack, core responsibilities, data flow and change entry points — only when the user explicitly asks for a full codebase onboarding map, or the task genuinely spans several unknown modules and the existing project tree and symbol map cannot pin down the entry point. Do not call it when the target file or module is already clear — read_file the relevant source and its callers directly — and do not treat it as a fixed preamble to every task. Optionally use focus to concentrate on one area (such as the authentication flow, the data layer, or build and release).", parameters: { type: "object", properties: { focus: { type: "string", description: "Optional; the direction to dig into (e.g. \"the authentication flow\", \"the data layer\", \"build and deployment\"); omit = a whole-project overview" }, wait: { type: "boolean", description: "Optional, default false = a background job returning job#N immediately; true = wait synchronously for the result." } }, required: [] } } },
-    { type: "function", function: { name: "design_research", description: "Dispatch a read-only subagent to study comparable products and plan page structure, component tree, design tokens, responsiveness, state and motion — only when the user explicitly asks to redesign an interface, compare visual directions, or produce a full UI architecture blueprint. Do not call it to fix a functional bug in existing UI, a card's state, a render failure or a local interaction — read the relevant implementation and fix it — and do not treat it as a fixed preamble to every front-end task. Optionally use goal to state the design objective.", parameters: { type: "object", properties: { goal: { type: "string", description: "What site or interface is being built (e.g. \"the Michael IDE product site\", \"a SaaS admin dashboard\", \"an e-commerce home page\")" }, wait: { type: "boolean", description: "Optional, default false = a background job returning job#N immediately; true = wait synchronously for the result." } }, required: [] } } },
+    { type: "function", function: { name: "design_research", description: "Dispatch a read-only subagent to study comparable products and plan page structure, component tree, design tokens, responsiveness, state and motion — only when the user explicitly asks to redesign an interface, compare visual directions, or produce a full UI architecture blueprint. Do not call it to fix a functional bug in existing UI, a card's state, a render failure or a local interaction — read the relevant implementation and fix it — and do not treat it as a fixed preamble to every front-end task. Optionally use goal to state the design objective.", parameters: { type: "object", properties: { goal: { type: "string", description: "What site or interface is being built (e.g. \"the Mr. Day One product site\", \"a SaaS admin dashboard\", \"an e-commerce home page\")" }, wait: { type: "boolean", description: "Optional, default false = a background job returning job#N immediately; true = wait synchronously for the result." } }, required: [] } } },
     { type: "function", function: { name: "learn_design", description: "Genuinely learn a first-rate product's design system: scrape a styles.refero.design style page (or any web page), extract the complete embedded design-system data (palette hex values with each colour's real usage and frequency, type scale/fonts/letter spacing, dos and don'ts, component shapes), and write it to disk as a design-system document plus tokens.css under reference/, so you can work against it point by point while implementing. Before building a commercial-grade site, call this to learn a real benchmark — never invent a palette and layout from memory.", parameters: { type: "object", properties: { url: { type: "string", description: "URL of the page to learn from (preferably a styles.refero.design/style/… detail page; any product site also works)" }, name: { type: "string", description: "Optional; the system's name (used in the reference/ filename); omit to infer it from the page" } }, required: ["url"] } } },
     { type: "function", function: { name: "generate_wiki", description: "**Work the current codebase or product out into a structured \"product wiki\" automatically and save it** (DeepWiki style: overview / architecture / core features / data flow / selling points, distilling the real functionality from the source). Run it before building a marketing site so you have a real understanding of the product; it is reusable across sessions.", parameters: { type: "object", properties: { focus: { type: "string", description: "Optional; the direction to dig into (omit for a whole-product overview)" }, dest: { type: "string", description: "Optional; where to save the wiki, default PRODUCT_WIKI.md" } }, required: [] } } },
     { type: "function", function: { name: "run_worker", description: "Implement one writable specialist subtask within an already settled contract. Use it only when the interfaces, data and design boundaries are stable and the scope can be cleanly separated; adjacent worker calls under parallel_roles run concurrently and their scopes must not overlap. While architectural or product ambiguity remains, use read-only roles first.", parameters: { type: "object", properties: { description: { type: "string", description: "Short description of this subtask (3-6 words)" }, role: { type: "string", enum: ["frontend", "backend", "database", "security", "test", "devops", "design", "docs"], description: "The writing specialist role; architect/product/research may not be used as a writing worker." }, prompt: { type: "string", description: "The complete, self-contained implementation statement: the settled contract, the target files, what must not change, and a short verification command." }, scope: { type: "array", items: { type: "string" }, description: "The list of relative paths that may be modified; parallel workers' scopes must not overlap." } }, required: ["description", "prompt", "scope"] } } },
@@ -36416,7 +36448,7 @@ async function _agentModelTurn({ config, messages, toolSchemas, toolRegistry = n
       if (phase === "firstChunk" || phase === "streaming") _activeStreamDiag.lastBytesAt = Date.now();
       if (Number.isFinite(ev.bytes)) _activeStreamDiag.bytes = Math.max(_activeStreamDiag.bytes || 0, ev.bytes);
       if (_streamDebugOn && typeof console !== "undefined") {
-        console.info("[Michael IDE stream]", { phase, elapsedMs: ms, bytes: _activeStreamDiag.bytes || 0, repairAttempt });
+        console.info("[Mr. Day One stream]", { phase, elapsedMs: ms, bytes: _activeStreamDiag.bytes || 0, repairAttempt });
       }
     };
     try {
@@ -46972,7 +47004,7 @@ async function _executeToolStepInner(step, call, root, run) {
       }
 
     } else if (call.type === "readscreen") {
-      if (!inTauri) { res.className = "atc-result atc-result--err"; res.textContent = "桌面专用"; return { type: "readscreen", path: "", content: "[不可用] read_screen 需要 Michael IDE 桌面后端。" }; }
+      if (!inTauri) { res.className = "atc-result atc-result--err"; res.textContent = "桌面专用"; return { type: "readscreen", path: "", content: "[不可用] read_screen 需要 Mr. Day One 桌面后端。" }; }
       res.className = "atc-result"; res.innerHTML = `<span class="atc-spin"></span> 读取前台应用元素…`;
       try {
         const output = await backend.invoke("read_screen", { ocr: !!call.ocr });
@@ -46991,7 +47023,7 @@ async function _executeToolStepInner(step, call, root, run) {
       }
 
     } else if (call.type === "uiclick") {
-      if (!inTauri) { res.className = "atc-result atc-result--err"; res.textContent = "桌面专用"; return { type: "uiclick", path: "", content: "[不可用] ui_click 需要 Michael IDE 桌面后端。" }; }
+      if (!inTauri) { res.className = "atc-result atc-result--err"; res.textContent = "桌面专用"; return { type: "uiclick", path: "", content: "[不可用] ui_click 需要 Mr. Day One 桌面后端。" }; }
       if (!Number.isInteger(call.ref) || call.ref < 0) { res.className = "atc-result atc-result--err"; res.textContent = "缺 ref"; return { type: "uiclick", path: "", content: "[ERROR] ui_click 需要 read_screen 返回的非负整数 ref。" }; }
       if (!["press", "set_value", "focus", "increment", "decrement", "show_menu", "confirm", "cancel", "pick"].includes(call.action)) { res.className = "atc-result atc-result--err"; res.textContent = "action 无效"; return { type: "uiclick", path: "", content: "[ERROR] ui_click action 必须是 press、set_value、focus、increment、decrement、show_menu、confirm、cancel 或 pick。" }; }
       if (call.action === "set_value" && call.value == null) { res.className = "atc-result atc-result--err"; res.textContent = "缺 value"; return { type: "uiclick", path: "", content: "[ERROR] ui_click set_value 需要 value。" }; }
@@ -47010,7 +47042,7 @@ async function _executeToolStepInner(step, call, root, run) {
       }
 
     } else if (call.type === "localdiscovery") {
-      if (!inTauri) { res.className = "atc-result atc-result--err"; res.textContent = "桌面专用"; return { type: "localdiscovery", path: call.near || "", content: "[不可用] local_discovery 需要 Michael IDE 桌面后端。" }; }
+      if (!inTauri) { res.className = "atc-result atc-result--err"; res.textContent = "桌面专用"; return { type: "localdiscovery", path: call.near || "", content: "[不可用] local_discovery 需要 Mr. Day One 桌面后端。" }; }
       const query = String(call.query || "").trim();
       if (!query) { res.className = "atc-result atc-result--err"; res.textContent = "缺 query"; return { type: "localdiscovery", path: call.near || "", content: "[ERROR] local_discovery 需要 query。" }; }
       const normalizedLocation = _normalizeLocalDiscoveryLocation(call);
@@ -47079,7 +47111,7 @@ async function _executeToolStepInner(step, call, root, run) {
       }
 
     } else if (call.type === "liveenvironment") {
-      if (!inTauri) { res.className = "atc-result atc-result--err"; res.textContent = "桌面专用"; return { type: call.type, path: call.path || "", content: "[不可用] 环境数据查询需要 Michael IDE 桌面后端。" }; }
+      if (!inTauri) { res.className = "atc-result atc-result--err"; res.textContent = "桌面专用"; return { type: call.type, path: call.path || "", content: "[不可用] 环境数据查询需要 Mr. Day One 桌面后端。" }; }
       const kind = String(call.kind || "").trim();
       if (!["weather", "air_quality", "marine", "earthquakes", "natural_hazards"].includes(kind)) { res.className = "atc-result atc-result--err"; res.textContent = "kind 无效"; return { type: call.type, path: kind, content: "[ERROR] live_environment kind 无效。" }; }
       const invokeArgs = { kind, latitude: call.latitude, longitude: call.longitude, radiusKm: call.radiusKm, window: call.window || null, minimumMagnitude: call.minimumMagnitude, category: call.category || null, limit: call.limit };
@@ -47196,7 +47228,7 @@ async function _executeToolStepInner(step, call, root, run) {
       return { type: "websearch", path: call.path, content: text };
 
     } else if (call.type === "screenshot") {
-      if (!inTauri) { res.className = "atc-result atc-result--err"; res.textContent = "桌面专用"; return { type: "screenshot", path: "", content: "[不可用] screenshot 只能在 Michael IDE 桌面 App 里用（要驱动本机的无头 Chrome）。网页/预览版没有这个能力。" }; }
+      if (!inTauri) { res.className = "atc-result atc-result--err"; res.textContent = "桌面专用"; return { type: "screenshot", path: "", content: "[不可用] screenshot 只能在 Mr. Day One 桌面 App 里用（要驱动本机的无头 Chrome）。网页/预览版没有这个能力。" }; }
       const url = (call.url || call.path || "").trim();
       if (!url) { res.className = "atc-result atc-result--err"; res.textContent = "空 URL"; return { type: "screenshot", path: "", content: "[ERROR] 需要 url（要截图的网址，如 http://127.0.0.1:3000）。" }; }
       const _filmstrip = call.frames && call.frames >= 2;
@@ -47227,7 +47259,7 @@ async function _executeToolStepInner(step, call, root, run) {
         : { type: "screenshot", path: url, image: dataUrl, content: `已截取 ${url} 的渲染截图（图片已回传给你看）。请仔细看图，找出 UI 问题（布局/对齐/间距/配色/对比度/视觉层级/响应式）并改进。` };
 
     } else if (call.type === "vizcompare") {
-      if (!inTauri) { res.className = "atc-result atc-result--err"; res.textContent = "桌面专用"; return { type: "vizcompare", path: "", content: "[不可用] visual_compare 只能在 Michael IDE 桌面 App 里用（要驱动无头 Chrome 截图）。" }; }
+      if (!inTauri) { res.className = "atc-result atc-result--err"; res.textContent = "桌面专用"; return { type: "vizcompare", path: "", content: "[不可用] visual_compare 只能在 Mr. Day One 桌面 App 里用（要驱动无头 Chrome 截图）。" }; }
       const _vcUrl = (call.url || "").trim();
       const _vcDesignRel = (call.design || "").trim();
       if (!_vcUrl || !_vcDesignRel) { res.className = "atc-result atc-result--err"; res.textContent = "缺参数"; return { type: "vizcompare", path: "", content: "[ERROR] visual_compare 需要 design（设计图路径，如 assets/design/s1.png）和 url（dev server 网址）。" }; }
@@ -47266,7 +47298,7 @@ async function _executeToolStepInner(step, call, root, run) {
       return { type: "vizcompare", path: _vcUrl, image: _vcImg, content: `已并排对比【左=目标设计 DESIGN，右=你当前实现 LIVE】，图已回传给你看。**逐项比对、改代码到像素级吻合**：① 整体布局/分区结构；② 间距/留白/对齐；③ 配色 hex/渐变/背景；④ 字体族/字重/字号/行高；⑤ 圆角/阴影/边框；⑥ 组件细节(按钮/卡片/导航/图标)；⑦ 图片/插画位置与比例。把每处差异列出来 → 改 → 再 visual_compare，直到右边和左边几乎一模一样。**别停在"差不多"**。` };
 
     } else if (call.type === "worktree") {
-      if (!inTauri) { res.className = "atc-result atc-result--err"; res.textContent = "桌面专用"; return { type: "worktree", path: "", content: "[不可用] worktree 只能在 Michael IDE 桌面 App 里用。" }; }
+      if (!inTauri) { res.className = "atc-result atc-result--err"; res.textContent = "桌面专用"; return { type: "worktree", path: "", content: "[不可用] worktree 只能在 Mr. Day One 桌面 App 里用。" }; }
       const _wtRoot = root || rootPath || workspaceRoots[0] || "";
       if (!_wtRoot) { res.className = "atc-result atc-result--err"; res.textContent = "未打开工作区"; return { type: "worktree", path: "", content: "[失败] 没打开工作区，无法操作 worktree。" }; }
       try {
@@ -48331,7 +48363,7 @@ return { type: call.type, path: call.query || "", content: `[失败] ${call.type
       const _bmRetired = () => !_bmSess || (_bmSess._runGen || 0) !== _bmGen || !!_bmSess._disposed;
       const _bmNotify = (title) => {
         try {
-          if (typeof Notification !== "undefined" && Notification.permission === "granted") new Notification("Mr.day One", { body: title });
+          if (typeof Notification !== "undefined" && Notification.permission === "granted") new Notification("Mr. Day One", { body: title });
         } catch {}
       };
       const _bmFinish = (dotClass, statusText, followupText, suppressFollowup = false) => {
@@ -49055,7 +49087,7 @@ return { type: call.type, path: call.query || "", content: `[失败] ${call.type
     } else if (call.type === "browser") {
       const act = call.action || "screenshot";
       const _browserOwner = run?._reqId || "";
-      if (!inTauri) { res.className = "atc-result atc-result--err"; res.textContent = "桌面专用"; return { type: "browser", path: act, content: "[不可用] browser（有头/可见的自主浏览器自动化）只能在 Michael IDE 桌面 App 里用。网页/预览版没有这个能力；静态无头截图请用 screenshot。" }; }
+      if (!inTauri) { res.className = "atc-result atc-result--err"; res.textContent = "桌面专用"; return { type: "browser", path: act, content: "[不可用] browser（有头/可见的自主浏览器自动化）只能在 Mr. Day One 桌面 App 里用。网页/预览版没有这个能力；静态无头截图请用 screenshot。" }; }
       if (act === "close") {
         if (_browserOwner && _browserAgentOwner && _browserAgentOwner !== _browserOwner) {
           return { type: "browser", path: "close", content: "[BLOCKED] 浏览器已被另一个 Agent run 接管，当前 run 不能关闭它。" };
@@ -49381,7 +49413,7 @@ return { type: call.type, path: call.query || "", content: `[失败] ${call.type
       } catch {}
       return { type: "browser", path: act, image: state.screenshot, browserResult: state.result, browserUrl: state.url || "", runOwnedDevUrl, content };
     } else if (call.type === "system") {
-      if (!inTauri) { res.className = "atc-result atc-result--err"; res.textContent = "桌面专用"; return { type: "system", path: call.op, content: "[不可用] system（系统控制）只能在 Michael IDE 桌面 App 里用。" }; }
+      if (!inTauri) { res.className = "atc-result atc-result--err"; res.textContent = "桌面专用"; return { type: "system", path: call.op, content: "[不可用] system（系统控制）只能在 Mr. Day One 桌面 App 里用。" }; }
       const sop = call.op || "frontmost";
       try {
         let raw;
@@ -49403,7 +49435,7 @@ return { type: call.type, path: call.query || "", content: `[失败] ${call.type
       } catch (e) {
         const m = String(e?.message || e);
         res.className = "atc-result atc-result--err"; res.textContent = "失败";
-        return { type: "system", path: sop, content: `[系统控制失败] ${m}。${/仅支持/.test(m) ? "（仅该 Linux 平台暂不支持系统控制，改用 computer 坐标点）" : "若反复失败：macOS 去 系统设置→隐私与安全性→辅助功能 勾选 Michael IDE 后重启；Windows 确认目标软件暴露了 UI Automation（部分 Electron/自绘界面不暴露，改用 computer 节点）。"}` };
+        return { type: "system", path: sop, content: `[系统控制失败] ${m}。${/仅支持/.test(m) ? "（仅该 Linux 平台暂不支持系统控制，改用 computer 坐标点）" : "若反复失败：macOS 去 系统设置→隐私与安全性→辅助功能 勾选 Mr. Day One 后重启；Windows 确认目标软件暴露了 UI Automation（部分 Electron/自绘界面不暴露，改用 computer 节点）。"}` };
       }
 
     } else if (call.type === "cmd") {
@@ -53887,7 +53919,7 @@ async function _startDevServer(dir, port, fileName = "") {
     "s = socketserver.TCPServer(('', PORT), RH)",
     `FILE = '${fileName}'`,
     `path_suffix = '/' + FILE if FILE else ''`,
-    `print('\\n  \\033[1;32m✦ Mr.day One Dev Server\\033[0m\\n')`,
+    `print('\\n  \\033[1;32m✦ Mr. Day One Dev Server\\033[0m\\n')`,
     `print(f'  ➜  Local:   \\033[36mhttp://localhost:{PORT}{path_suffix}\\033[0m')`,
     `print(f'  ➜  Network: \\033[36mhttp://{ip}:{PORT}{path_suffix}\\033[0m')`,
     `print(f'\\n  Serving:  {os.getcwd()}')`,
@@ -55652,9 +55684,9 @@ function showAboutDialog() {
         <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M18 6L6 18M6 6l12 12"/></svg>
       </button>
       <div class="about-dialog__hero">
-        <img class="about-dialog__logo" src="${_escAttr(appIconSrc())}" alt="Mr.day One" />
+        <img class="about-dialog__logo" src="${_escAttr(appIconSrc())}" alt="Mr. Day One" />
         <div class="about-dialog__heading">
-          <h2 id="aboutDialogTitle">Mr.day One</h2>
+          <h2 id="aboutDialogTitle">Mr. Day One</h2>
           <p>${_escHtml(t("about.subtitle"))}</p>
         </div>
       </div>
@@ -56201,7 +56233,7 @@ _updateLoginUI();
 
 // login flow
 const loginLogoEl = $("loginLogo");
-if (loginLogoEl) loginLogoEl.innerHTML = `<img class="assistant-logo" data-app-icon="true" src="${appIconSrc()}" alt="Mr.day One" style="width:52px;height:52px;border-radius:13px" />`;
+if (loginLogoEl) loginLogoEl.innerHTML = `<img class="assistant-logo" data-app-icon="true" src="${appIconSrc()}" alt="Mr. Day One" style="width:52px;height:52px;border-radius:13px" />`;
 // Login / signup flow:
 //   step 1 — enter email → validate format → check DB for an existing account
 //   existing account → enter password → 登录                 (auth_login)
@@ -56749,7 +56781,7 @@ async function _voiceStart(btn) {
     // Permission denied / no system授权框 — point at System Settings (mic string needs a rebuild to prompt).
     _confirmDialog(
       "麦克风没授权",
-      "语音输入需要麦克风权限，但系统没弹出授权框。\n请在「系统设置 › 隐私与安全性 › 麦克风」里给 Mr.day One 打开开关。\n（首次系统授权框需要重新构建 App 后才会自动弹出。）",
+      "语音输入需要麦克风权限，但系统没弹出授权框。\n请在「系统设置 › 隐私与安全性 › 麦克风」里给 Mr. Day One 打开开关。\n（首次系统授权框需要重新构建 App 后才会自动弹出。）",
       "打开系统设置", false
     ).then((ok) => {
       if (!ok) return;
@@ -57931,7 +57963,7 @@ async function _openRemoteSshPanel(value, remoteRoot = "", password = "") {
   });
 
   try {
-    term.write(`\x1b[36mMr.day One SSH\x1b[0m 连接目标：${target}\r\n`);
+    term.write(`\x1b[36mMr. Day One SSH\x1b[0m 连接目标：${target}\r\n`);
     const pty = await backend.termOpen(
       { cwd: rootPath || undefined, cols: term.cols, rows: term.rows },
       (ev) => {
@@ -59321,7 +59353,7 @@ async function showNewProjectDialog() {
       </div>
       <div class="new-project-titleblock">
         <h2 id="newProjectTitle">新建项目</h2>
-        <p>选择一个真实模板，Mr.day One 会在终端里创建并安装依赖。</p>
+        <p>选择一个真实模板，Mr. Day One 会在终端里创建并安装依赖。</p>
       </div>
       <button class="new-project-close" type="button" aria-label="关闭">
         <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6 6 18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
@@ -62279,7 +62311,7 @@ async function checkWorkspaceTrust(path) {
   const decision = await _toolApprovalDialog({
     title: "信任这个文件夹的作者吗？",
     detail: `${path}\n\n`
-      + `信任后，Mr.day One 会使用这个仓库自带的开发工具（例如 node_modules 里的\n`
+      + `信任后，Mr. Day One 会使用这个仓库自带的开发工具（例如 node_modules 里的\n`
       + `语言服务器版本），并允许它的 .michael/hooks.json 运行。\n\n`
       + `不信任也能正常打开、阅读和编辑代码，你自己敲的命令照常执行——\n`
       + `只是不会去运行这个仓库提供的程序。\n\n`

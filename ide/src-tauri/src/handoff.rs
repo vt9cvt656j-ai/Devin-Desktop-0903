@@ -1,7 +1,7 @@
 //! Desktop → browser session handoff.
 //!
 //! When the web sign-in page loads, it asks the running desktop app whether anyone is
-//! signed in. If so, "Continue with Mr.day One" adopts that session instead of making
+//! signed in. If so, "Continue with Mr. Day One" adopts that session instead of making
 //! the user retype a password they already typed here.
 //!
 //! Everything below is shaped by one fact: ANY page the user visits can send requests

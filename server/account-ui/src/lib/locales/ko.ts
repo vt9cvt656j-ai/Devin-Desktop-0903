@@ -9,6 +9,34 @@ export const ko: Partial<Dict> = {
   navBilling: "요금제 및 결제",
   navIntegrations: "연동",
   navDevices: "기기",
+  navModels: "모델 경로",
+  navReferral: "추천",
+  navChangelog: "업데이트 기록",
+
+  navCommission: "수수료",
+  navInvite: "초대",
+  navReferrals: "내 추천",
+  navSettlements: "정산 내역",
+  navWithdraw: "출금",
+
+  referral: "추천",
+  referralLede: "내 초대 코드나 링크로 다른 사람을 초대하고, 그 사람의 결제에서 수익을 받으세요.",
+  referralFailed: "추천 정보를 불러오지 못했습니다.",
+  referralLockedTitle: "이 계정에는 추천 권한이 없습니다",
+  referralLockedBody:
+    "추천 권한은 관리자가 계정별로 부여합니다. 관리자에게 요청하면 여기에 초대 코드와 링크가 표시됩니다.",
+  referralCode: "내 초대 코드",
+  referralLink: "내 초대 링크",
+  referralHow:
+    "내 링크로 가입했거나 내 코드를 입력한 사람이 내 추천으로 기록됩니다. 이후 {days}일 동안 그 사람이 결제한 금액의 {rate}%를 받습니다. 이 조건은 앞으로 가입하는 사람에게 적용되며, 이미 초대한 사람은 가입 당시 조건을 그대로 유지합니다.",
+  referralPaused:
+    "추천 프로그램이 현재 중단되어 있어 새로 가입하는 사람은 연결되지 않습니다. 이미 초대한 사람은 영향을 받지 않습니다.",
+  referralInvited: "초대한 사람",
+  referralPending: "정산 대기",
+  referralSettled: "정산 완료",
+  referralCopy: "복사",
+  referralCopied: "복사됨",
+  referralPayout: "초대한 사람이 결제하면 수수료가 자동으로 기록되고, 관리자가 정산합니다.",
   accountMenu: "계정 메뉴",
   getTheApp: "데스크톱 앱 받기",
 
@@ -120,7 +148,7 @@ export const ko: Partial<Dict> = {
     "이 브라우저는 기기 기록 기능이 생기기 전에 로그인했기 때문에 아래 목록에 없으며 개별적으로 해제할 수 없습니다. 로그아웃 후 다시 로그인하면 추가됩니다.",
   integrations: "연동",
   integrationsLede: "이 계정이 데스크톱 앱 및 API와 연결된 상태입니다.",
-  desktopApp: "Mr.day One 데스크톱",
+  desktopApp: "Mr. Day One 데스크톱",
   connected: "연결됨",
   signedOut: "로그아웃 상태",
   notDetected: "감지되지 않음",
@@ -154,7 +182,7 @@ export const ko: Partial<Dict> = {
   disconnectedNote: "연결을 해제했습니다. 제공자 쪽에서도 권한을 취소하려면 다음으로 이동하세요:",
   desktopNeedsPermission: "권한 필요",
   desktopPermissionAsk:
-    "브라우저에 이 컴퓨터의 앱에 접근할 권한이 없어 Mr.day One이 실행 중인지 확인할 수 없습니다. Chrome은 클릭했을 때만 묻습니다.",
+    "브라우저에 이 컴퓨터의 앱에 접근할 권한이 없어 Mr. Day One이 실행 중인지 확인할 수 없습니다. Chrome은 클릭했을 때만 묻습니다.",
   desktopConnectButton: "앱 확인하기",
   desktopChecking: "확인 중…",
   desktopPermissionBlocked: "브라우저가 차단함",

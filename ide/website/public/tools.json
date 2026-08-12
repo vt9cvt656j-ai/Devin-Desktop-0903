@@ -1,7 +1,7 @@
 {
   "generatedFrom": "ide/src/main.js · _buildAgentToolSchemas",
   "generatedAt": null,
-  "count": 147,
+  "count": 130,
   "groups": [
     "Agents",
     "Code intelligence",
@@ -88,6 +88,11 @@
       "desktopOnly": false
     },
     {
+      "name": "think",
+      "group": "Knowledge",
+      "desktopOnly": false
+    },
+    {
       "name": "ask_user",
       "group": "Agents",
       "desktopOnly": false
@@ -104,11 +109,6 @@
     },
     {
       "name": "spawn_multiple_agents",
-      "group": "Agents",
-      "desktopOnly": false
-    },
-    {
-      "name": "debate",
       "group": "Agents",
       "desktopOnly": false
     },
@@ -270,6 +270,11 @@
     {
       "name": "visual_compare",
       "group": "Design & media",
+      "desktopOnly": false
+    },
+    {
+      "name": "debate",
+      "group": "Knowledge",
       "desktopOnly": false
     },
     {
@@ -443,11 +448,6 @@
       "desktopOnly": false
     },
     {
-      "name": "dockerhub_search",
-      "group": "Research",
-      "desktopOnly": false
-    },
-    {
       "name": "pubmed_search",
       "group": "Research",
       "desktopOnly": false
@@ -478,57 +478,12 @@
       "desktopOnly": false
     },
     {
-      "name": "gitlab_search",
-      "group": "Git & GitHub",
-      "desktopOnly": false
-    },
-    {
-      "name": "gitee_search",
-      "group": "Git & GitHub",
-      "desktopOnly": false
-    },
-    {
-      "name": "maven_search",
-      "group": "Research",
-      "desktopOnly": false
-    },
-    {
-      "name": "packagist_search",
-      "group": "Research",
-      "desktopOnly": false
-    },
-    {
-      "name": "rubygems_search",
-      "group": "Research",
-      "desktopOnly": false
-    },
-    {
-      "name": "nuget_search",
-      "group": "Research",
-      "desktopOnly": false
-    },
-    {
-      "name": "homebrew_search",
-      "group": "Research",
-      "desktopOnly": false
-    },
-    {
       "name": "mdn_search",
       "group": "Research",
       "desktopOnly": false
     },
     {
-      "name": "cdnjs_search",
-      "group": "Research",
-      "desktopOnly": false
-    },
-    {
       "name": "bundlephobia_search",
-      "group": "Research",
-      "desktopOnly": false
-    },
-    {
-      "name": "devto_search",
       "group": "Research",
       "desktopOnly": false
     },
@@ -540,11 +495,6 @@
     {
       "name": "iconify_search",
       "group": "Design & media",
-      "desktopOnly": false
-    },
-    {
-      "name": "juejin_search",
-      "group": "Research",
       "desktopOnly": false
     },
     {
@@ -560,41 +510,6 @@
     {
       "name": "awwwards_search",
       "group": "Research",
-      "desktopOnly": false
-    },
-    {
-      "name": "v2ex_search",
-      "group": "Research",
-      "desktopOnly": false
-    },
-    {
-      "name": "segmentfault_search",
-      "group": "Research",
-      "desktopOnly": false
-    },
-    {
-      "name": "github_discussions_search",
-      "group": "Research",
-      "desktopOnly": false
-    },
-    {
-      "name": "github_trending",
-      "group": "Research",
-      "desktopOnly": false
-    },
-    {
-      "name": "infoq_search",
-      "group": "Research",
-      "desktopOnly": false
-    },
-    {
-      "name": "codeberg_search",
-      "group": "Git & GitHub",
-      "desktopOnly": false
-    },
-    {
-      "name": "sourcegraph_search",
-      "group": "Code search",
       "desktopOnly": false
     },
     {

@@ -285,17 +285,17 @@ async fn send_email_code(to: &str, code: &str) -> Result<bool, String> {
 
     let msg = Message::builder()
         .from(
-            format!("Michael IDE <{user}>")
+            format!("Mr. Day One <{user}>")
                 .parse()
                 .map_err(|e| format!("bad sender address: {e}"))?,
         )
         .to(to
             .parse()
             .map_err(|e| format!("bad recipient address: {e}"))?)
-        .subject("Michael IDE 登录验证码")
+        .subject("Mr. Day One 登录验证码")
         .header(ContentType::TEXT_PLAIN)
         .body(format!(
-            "你的 Michael IDE 验证码是：{code}\n\n10 分钟内有效。如非本人操作，请忽略本邮件。"
+            "你的 Mr. Day One 验证码是：{code}\n\n10 分钟内有效。如非本人操作，请忽略本邮件。"
         ))
         .map_err(|e| format!("build email failed: {e}"))?;
 

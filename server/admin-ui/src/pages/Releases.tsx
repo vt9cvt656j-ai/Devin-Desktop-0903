@@ -31,7 +31,7 @@ import { num, when } from "@/lib/format";
 import { cn } from "@/lib/utils";
 
 /**
- * 版本发布 — the one screen where an operator ships a Michael IDE build: type an existing
+ * 版本发布 — the one screen where an operator ships a Mr. Day One build: type an existing
  * vX.Y.Z tag to start the signed GitHub Actions build, watch it land as a Draft, then publish
  * the Draft once it carries a usable updater payload.
  *
@@ -550,7 +550,7 @@ export function Releases() {
           <DialogHeader>
             <DialogTitle>发布 {confirming?.tag_name || ""}？</DialogTitle>
             <DialogDescription>
-              发布后这个版本立刻成为最新版，所有 Michael IDE
+              发布后这个版本立刻成为最新版，所有 Mr. Day One
               客户端下一次检查更新都会下载它。后台没有回退按钮。
             </DialogDescription>
           </DialogHeader>

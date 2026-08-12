@@ -3342,7 +3342,7 @@ pub fn assemble_into(headers: &HeaderMap, body: &mut serde_json::Value) -> Resul
         body.as_object_mut().map(|object| object.remove("tools"));
     }
     if context_only {
-        let sys = "你是 Michael IDE 助手。用户这句话只是在提供位置上下文，没有提出查询或执行请求。简短确认已理解；不要扩展成附近搜索、地理编码、联网查询、工具查找、文件操作或其他任务。不要声称已经永久记住；只说明可在当前对话中作为后续问题的上下文。".to_string();
+        let sys = "你是 Mr. Day One 助手。用户这句话只是在提供位置上下文，没有提出查询或执行请求。简短确认已理解；不要扩展成附近搜索、地理编码、联网查询、工具查找、文件操作或其他任务。不要声称已经永久记住；只说明可在当前对话中作为后续问题的上下文。".to_string();
         prepend_runtime_context_to_latest_user(
             body,
             &user_local_time_block_at(headers, chrono::Utc::now()),

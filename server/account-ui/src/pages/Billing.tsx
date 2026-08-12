@@ -8,7 +8,7 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { api, type Catalog, type CatalogItem, type Me } from "@/lib/api";
-import { creditsOf, currencySymbol, num, planIsActive, planLabel, price, usd, formatDate } from "@/lib/format";
+import { creditValueUsd, currencySymbol, planIsActive, planLabel, price, usd, formatDate } from "@/lib/format";
 import { DICTS, serverMessage, type Lang } from "@/lib/i18n";
 import { cn } from "@/lib/utils";
 
@@ -456,12 +456,15 @@ export function Billing({ catalog, me, lang, onRedeemed }: Props) {
           <SetLabel>{t.creditPacks}</SetLabel>
           <div className="flex flex-wrap items-stretch justify-center gap-4">
           {packs.map((p) => {
-            const credits = creditsOf(p.credits_cents);
+            // 面值就是美元，不再换算成"点"。
+            const credits = creditValueUsd(p.credits_cents);
             const width = CARD_WIDTH[columnsFor(packs.length)];
             // Rate against the price actually shown, in that price's own currency. It
             // used to divide by the stored yuan column, so a card read "$5.99" above
             // "3.33 per ¥1" — two different prices for one product.
             const major = (p.display_minor ?? 0) / 100;
+            // 「每 1 元/美元买到多少额度」。两边都是钱，所以这个倍数直接可读：
+            // 加油包 A 是 2.50，B 是 3.00，C 是 3.20。
             const rate = major > 0 ? (credits / major).toFixed(2) : null;
             return (
               <ProductCard
@@ -473,7 +476,10 @@ export function Billing({ catalog, me, lang, onRedeemed }: Props) {
                 priceMain={price(p)}
                 features={[
                   <Feature key="c">
-                    <strong className="font-semibold tabular-nums">{num(credits)}</strong>{" "}
+                    {/* 面值本身就是美元，直接印金额，不要再套一个"点"的单位。 */}
+                    <strong className="font-semibold tabular-nums">
+                      {usd(p.credits_cents)}
+                    </strong>{" "}
                     <span className="text-muted-foreground">{t.credits}</span>
                   </Feature>,
                   ...(rate
@@ -512,7 +518,7 @@ export function Billing({ catalog, me, lang, onRedeemed }: Props) {
                 detail={
                   <>
                     <strong className="font-semibold text-foreground tabular-nums">
-                      {num(creditsOf((custom.unit_credits_cents ?? 0) * quantity))}
+                      {usd((custom.unit_credits_cents ?? 0) * quantity)}
                     </strong>{" "}
                     {t.credits} · {t.neverExpires}
                   </>

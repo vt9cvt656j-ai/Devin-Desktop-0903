@@ -70,7 +70,7 @@
       <div class="done" id="done">
         <div class="check">✓</div>
         <h1>注册成功</h1>
-        <p class="sub" id="doneSub">你的 Michael 账号已创建，现在可以在 Michael IDE 登录使用。</p>
+        <p class="sub" id="doneSub">你的 Michael 账号已创建，现在可以在 Mr. Day One 登录使用。</p>
         <button class="primary" onclick="location.href='/'">前往后台</button>
       </div>
     </div>
@@ -116,7 +116,7 @@ async function register(){
     if(!r.ok) throw new Error(j.error||"注册失败");
     if(j.token){ try{ localStorage.setItem("michael_token", j.token); }catch{} }
     $("form").style.display="none"; $("done").style.display="block";
-    $("doneSub").textContent=`账号 ${email} 已创建，现在可以在 Michael IDE 登录使用。`;
+    $("doneSub").textContent=`账号 ${email} 已创建，现在可以在 Mr. Day One 登录使用。`;
   }catch(e){ setMsg(e.message||"注册失败"); b.disabled=false; b.textContent=orig; }
 }
 </script>

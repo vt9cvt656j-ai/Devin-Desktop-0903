@@ -1,4 +1,4 @@
-// Language catalogue for Michael IDE.
+// Language catalogue for Mr. Day One.
 //
 // Keep the product language surface intentionally small and fully supportable:
 // Chinese, English, Japanese, Korean, German, Spanish, Portuguese and Russian.

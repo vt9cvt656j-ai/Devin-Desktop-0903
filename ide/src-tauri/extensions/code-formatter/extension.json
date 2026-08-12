@@ -3,7 +3,7 @@
   "name": "Code Formatter",
   "version": "1.0.0",
   "description": "Auto-format code with consistent indentation, trailing whitespace cleanup, and line ending normalization.",
-  "author": "Michael IDE",
+  "author": "Mr. Day One",
   "main": "index.js",
   "permissions": ["editor"],
   "contributes": {

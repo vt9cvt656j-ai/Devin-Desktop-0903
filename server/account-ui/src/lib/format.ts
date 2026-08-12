@@ -61,9 +61,16 @@ export function num(value: number): string {
   return new Intl.NumberFormat(locale).format(value);
 }
 
-/** The operator prices credits at 22 per US dollar. */
-export function creditsOf(rawCents: number | null | undefined): number {
-  return Math.round(((Number(rawCents) || 0) / perUsd) * 22);
+/**
+ * 额度的面值，单位是美元。
+ *
+ * 以前这里再乘一个 22（「每美元 22 个点」），凭空造出了第三个单位：服务端只有原始计费分，
+ * 用户看到的余额是 `原始分 / 面值分母` 得到的美元（Dashboard 和 IDE 都按美元渲染），
+ * 中间这个 22 没有任何服务端依据。改价之后它会让加油包 A 印成「1100 点」，
+ * 而钱包里真正加进去的是 $50。
+ */
+export function creditValueUsd(rawCents: number | null | undefined): number {
+  return (Number(rawCents) || 0) / perUsd;
 }
 
 /**

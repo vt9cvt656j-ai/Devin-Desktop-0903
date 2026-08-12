@@ -1,4 +1,4 @@
-// Michael IDE — problem matchers.
+// Mr. Day One — problem matchers.
 //
 // Turns raw compiler/linter output captured from a task run into structured
 // diagnostics the editor can render in the Problems panel and as inline

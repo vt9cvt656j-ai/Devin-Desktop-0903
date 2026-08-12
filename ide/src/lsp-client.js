@@ -1,4 +1,4 @@
-// Michael IDE — real Language Server Protocol client.
+// Mr. Day One — real Language Server Protocol client.
 //
 // The Rust backend (`lsp.rs`) only handles process spawning and Content-Length
 // framing: it forwards each decoded LSP message to the frontend as a clean JSON
@@ -313,7 +313,7 @@ class LspClient {
     const primary = roots[0] || null;
     const params = {
       processId: null,
-      clientInfo: { name: "Michael IDE", version: "0.1.0" },
+      clientInfo: { name: "Mr. Day One", version: "0.1.0" },
       locale: "en",
       rootUri: primary ? pathToUri(primary) : null,
       rootPath: primary || null,

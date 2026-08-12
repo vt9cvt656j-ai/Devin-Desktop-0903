@@ -1,4 +1,4 @@
-// Insert Date — a sample Michael IDE extension.
+// Insert Date — a sample Mr. Day One extension.
 //
 // Demonstrates: registering a command and writing to the active editor through
 // the sandboxed `ide` API.

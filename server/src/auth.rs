@@ -466,12 +466,12 @@ fn code_email_html(code: &str) -> String {
 <body style="margin:0;padding:0;background:#f1f3f4;">
 <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#f1f3f4;padding:32px 12px;"><tr><td align="center">
 <table role="presentation" width="448" cellpadding="0" cellspacing="0" style="max-width:448px;width:100%;background:#ffffff;border-radius:16px;border:1px solid #e8eaed;font-family:'Segoe UI',Roboto,'Helvetica Neue',Arial,'PingFang SC','Microsoft YaHei',sans-serif;">
-<tr><td style="padding:40px 44px 6px;text-align:center;"><img src="https://code.mrday.one/api/logo.png" width="52" height="52" alt="Michael IDE" style="display:inline-block;width:52px;height:52px;border-radius:14px;" /></td></tr>
-<tr><td style="padding:16px 44px 0;text-align:center;"><div style="font-size:22px;font-weight:500;color:#202124;">验证您的邮箱</div><div style="font-size:14px;color:#5f6368;line-height:1.7;margin-top:10px;">您正在登录 / 注册 <b style="color:#202124;">Michael IDE</b>，请在登录页面输入下面的验证码：</div></td></tr>
+<tr><td style="padding:40px 44px 6px;text-align:center;"><img src="https://code.mrday.one/api/logo.png" width="52" height="52" alt="Mr. Day One" style="display:inline-block;width:52px;height:52px;border-radius:14px;" /></td></tr>
+<tr><td style="padding:16px 44px 0;text-align:center;"><div style="font-size:22px;font-weight:500;color:#202124;">验证您的邮箱</div><div style="font-size:14px;color:#5f6368;line-height:1.7;margin-top:10px;">您正在登录 / 注册 <b style="color:#202124;">Mr. Day One</b>，请在登录页面输入下面的验证码：</div></td></tr>
 <tr><td style="padding:26px 44px 6px;text-align:center;"><div style="display:inline-block;background:#f6f9fe;border:1px solid #d2e3fc;border-radius:12px;padding:16px 22px 16px 32px;font-size:34px;font-weight:700;letter-spacing:10px;color:#1a73e8;font-family:'SF Mono',Menlo,Consolas,monospace;">{code}</div></td></tr>
 <tr><td style="padding:18px 44px 0;text-align:center;"><div style="font-size:13px;color:#80868b;line-height:1.7;">验证码 <b>10 分钟</b>内有效，请勿泄露给他人。如果这不是您本人的操作，请忽略此邮件。</div></td></tr>
 <tr><td style="padding:28px 44px 0;"><div style="border-top:1px solid #e8eaed;font-size:0;line-height:0;">&nbsp;</div></td></tr>
-<tr><td style="padding:16px 44px 34px;text-align:center;"><div style="font-size:12px;color:#9aa0a6;line-height:1.6;">此邮件由 Michael IDE 自动发送，请勿直接回复。</div></td></tr>
+<tr><td style="padding:16px 44px 34px;text-align:center;"><div style="font-size:12px;color:#9aa0a6;line-height:1.6;">此邮件由 Mr. Day One 自动发送，请勿直接回复。</div></td></tr>
 </table></td></tr></table></body></html>"#,
         code = code
     )
@@ -483,7 +483,7 @@ async fn send_code_email(cfg: &Config, to: &str, code: &str) -> ApiResult<bool> 
         return Ok(false);
     }
     let html = code_email_html(code);
-    crate::email::send_mail(cfg, to, "Michael IDE 登录验证码", &html, true).await?;
+    crate::email::send_mail(cfg, to, "Mr. Day One 登录验证码", &html, true).await?;
     Ok(true)
 }
 
@@ -554,6 +554,13 @@ pub struct RegisterReq {
     /// See `LoginReq::device_id`.
     #[serde(default)]
     pub device_id: Option<String>,
+    /// 邀请码，可选。在建号的同一个请求里绑推荐人。
+    ///
+    /// 为什么在这里而不是只靠事后的 /api/referral/claim：产品规则是「只有新注册的账号能绑
+    /// 推荐人」，那么最准确的时机就是注册这一刻。而且桌面端 App 里注册的人根本走不到网页
+    /// 控制台那条事后绑定的路 —— 「点链接 → 下载 App → 在 App 里注册」整条推荐会丢掉。
+    #[serde(default)]
+    pub referral_code: Option<String>,
 }
 #[derive(Deserialize)]
 pub struct CodeReq {
@@ -697,14 +704,22 @@ pub async fn register(
     .await?
     .ok_or_else(|| AppError::bad("该邮箱已注册，请直接登录"))?;
     let token = start_session(&state, &user, &headers, req.device.as_deref(), req.device_id.as_deref()).await?;
+
+    // 带了邀请码就当场绑。失败不影响注册：账号已经建好了，一个绑不上的推荐关系不该让人
+    // 注册不成 —— 网页那条路稍后还会再试一次（同一个码、同一套规则）。
+    let referred_by = match req.referral_code.as_deref().map(str::trim).filter(|c| !c.is_empty()) {
+        Some(code) => crate::referral::bind_at_signup(&state, user.id, code).await,
+        None => None,
+    };
+
     crate::realtime::record_event(
         &state,
         Some(user.id),
         "register",
-        json!({ "email": user.email }),
+        json!({ "email": user.email, "referred_by": referred_by }),
     )
     .await;
-    Ok(Json(json!({ "token": token, "user": user })))
+    Ok(Json(json!({ "token": token, "user": user, "referred_by": referred_by })))
 }
 
 pub async fn login(
@@ -818,6 +833,61 @@ pub async fn verify_code(
 pub async fn authz(_claims: Claims) -> Response {
     // 能走到这里说明 Claims 提取器已经验过令牌、且用户还在库里（删号立刻失效）。
     StatusCode::NO_CONTENT.into_response()
+}
+
+/// `POST /api/auth/logout` — 结束调用方自己这一次登录。
+///
+/// **为什么必须有服务端这一步。** 以前「退出登录」只是各自清各自的本地存储 —— 令牌本身
+/// 还是好的。官网在 mrday.one，登录页和后台在 code.mrday.one，两个源的 localStorage
+/// 互相看不见：官网点退出，只能删掉共享的那颗 cookie，删不掉 code.mrday.one 里那份
+/// `michael_token` 副本。于是：
+///
+/// ```text
+///   /dashboard  ──(nginx 只认 cookie，没有)──▶  302 /gate?next=/dashboard
+///   /gate       ──(读到残留的 localStorage 令牌，/api/me 说它有效)──▶  跳回 /dashboard
+/// ```
+///
+/// 两边各自都「对」，合起来是一个永不停止的跳转循环 —— 用户看到的就是登录页一直刷新，
+/// 而且退不掉、也登不进。真正的修法不是拦跳转，是让退出登录真的把这次登录作废：令牌一失效，
+/// 残留副本在哪个源里都换不来任何东西。
+///
+/// 只作废 `sid` 指的这一条，所以桌面端不受影响 —— 这也正是界面上写的那句「登出只会清除
+/// 当前浏览器的登录」。
+///
+/// **重复调用会拿到 401，不是 200。** Claims 提取器在进入本函数之前就会拒掉已作废的令牌，
+/// 所以第二次点退出登录，请求在门口就被挡了。这是对的，不值得为它开一条"接受已作废令牌"
+/// 的路：客户端两边都把这个调用包在 try 里，无论成败都照常清本地、回登录页 —— 因为网络
+/// 不通或者"你已经退过了"就不让人退出，才是错误的失败方式。
+pub async fn logout(State(state): State<AppState>, claims: Claims) -> ApiResult<Json<serde_json::Value>> {
+    let uid = uuid::Uuid::parse_str(&claims.sub).map_err(|_| AppError::unauthorized("令牌损坏"))?;
+    let sid = claims.sid.as_deref().and_then(|s| uuid::Uuid::parse_str(s).ok());
+
+    // 限定 user_id：sid 来自调用方的令牌，但仍然只允许作废自己的行。
+    let revoked = match sid {
+        Some(sid) => {
+            sqlx::query(
+                "UPDATE sessions SET revoked_at = now() \
+                 WHERE id = $1 AND user_id = $2 AND revoked_at IS NULL",
+            )
+            .bind(sid)
+            .bind(uid)
+            .execute(&state.db)
+            .await?
+            .rows_affected()
+                > 0
+        }
+        // sessions 表出现之前签发的令牌不带 sid，没有对应的行可以作废。这种令牌只能等
+        // 30 天自然过期 —— 和它无法在设备列表里被单独登出是同一个既有限制。照实回报，
+        // 不要假装作废成功。
+        None => false,
+    };
+
+    if revoked {
+        tracing::info!(%uid, "session revoked by logout");
+    }
+    // revoked=false 有两种情况：本来就已作废，或者是那种老令牌。前端不据此改变行为
+    // （无论如何都要清本地并回登录页），但排查问题时这个字段能说明是哪一种。
+    Ok(Json(json!({ "ok": true, "revoked": revoked, "revocable": sid.is_some() })))
 }
 
 pub async fn me(State(state): State<AppState>, claims: Claims) -> ApiResult<Json<serde_json::Value>> {
@@ -935,7 +1005,7 @@ fn clean_name(raw: &str) -> Result<String, AppError> {
 /// Only these three encodings, and only as a self-contained `data:` URL. An `http(s)`
 /// URL would turn every profile render into a request to a third party chosen by the
 /// account holder — an SSRF-shaped hole on the server and a tracking pixel on the client.
-fn clean_avatar(raw: &str) -> Result<Option<String>, AppError> {
+pub(crate) fn clean_avatar(raw: &str) -> Result<Option<String>, AppError> {
     let value = raw.trim();
     if value.is_empty() {
         return Ok(None); // an explicit clear
@@ -1185,13 +1255,33 @@ mod authz_gate_tests {
     /// 远超 model_usage 的 78,086 行 —— 写入的主体不是计费，是这道门禁。
     ///
     /// 这条测试盯住两件事：`authz` 自己不能写，且 nginx 不能再指回 /api/me。
+    ///
+    /// 边界靠花括号配对，不靠"下一个函数是谁"。原来是从 `pub async fn authz(` 一路切到
+    /// `\npub async fn me(`，注释还写着"me 紧随其后"—— 直到 `logout` 插在这两者之间：
+    /// 切片里于是多出 logout 那条完全合法的 `UPDATE sessions SET revoked_at`，测试红了，
+    /// 而 authz 本身自始至终只有三行、零写入。守卫报了假警，被守的代码没有任何问题。
     #[test]
     fn authz_endpoint_performs_no_writes() {
         let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/auth.rs"))
             .expect("read auth.rs");
         let start = src.find("pub async fn authz(").expect("authz 必须存在");
-        let end = src[start..].find("\npub async fn me(").expect("me 紧随其后") + start;
-        let body = &src[start..end];
+        let open = start + src[start..].find('{').expect("authz 必须有函数体");
+        let mut depth = 0usize;
+        let mut end = None;
+        for (offset, ch) in src[open..].char_indices() {
+            match ch {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = Some(open + offset + 1);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let body = &src[start..end.expect("authz 的花括号必须配平")];
         for write in ["UPDATE ", "INSERT ", "DELETE ", "sqlx::query"] {
             assert!(
                 !body.contains(write),
