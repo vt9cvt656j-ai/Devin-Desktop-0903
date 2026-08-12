@@ -13538,6 +13538,16 @@ body.tree-selecting, body.tree-selecting * { user-select: none !important; -webk
   content: attr(data-placeholder);
   color: var(--text-dim); pointer-events: none; cursor: text;
 }
+/* 下一步预测：和占位符同一个位置、同一种灰，按 Tab 补全。
+   刻意用 data-suggest 而不是改写 data-placeholder——后者归 i18n 的标记扫描所有，
+   切换语言会把预测抹掉，而且异步语言包正好在"刚打开软件"那一刻落地，预测会莫名消失。
+   属性名也不在 i18n 的 attributeFilter 里，不会惊动它的 MutationObserver。 */
+#prompt.is-empty[data-suggest]::before {
+  content: attr(data-suggest);
+  color: var(--text-dim); pointer-events: none; cursor: text;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  display: block; max-width: 100%;
+}
 /* A dragged-in @-reference as a REAL inline card (Google-light pill: icon + name, atomic). */
 .composer-chip {
   display: inline-flex; align-items: center; gap: 4px;

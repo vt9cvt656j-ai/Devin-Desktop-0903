@@ -8590,7 +8590,7 @@ test("plan fold expands via delegated toggle and the expanded state survives re-
 });
 
 test("agent next-step chips use completed run memory and survive suggestion failures", () => {
-  const gen = load("_runStateNextActionSuggestions");
+  const gen = load("_runStateNextActionSuggestions", { _INCOMPLETE_LABELS: loadConst("_INCOMPLETE_LABELS") });
   const now = Date.now();
   // **新版最多 3 个精确预测**:基于 failureCategory/mutatedFileTypes/runtimeEffects 等证据
   // 场景 1:失败且有 failureCategory → 针对性修复建议
@@ -8603,7 +8603,32 @@ test("agent next-step chips use completed run memory and survive suggestion fail
       outcome: "partial", task: "修复工具参数不全", result: "", incompleteReason: "iteration_limit", 
       mutatedFileCount: 3, mutatedFileTypes: new Set(["src", "config"]), updatedAt: now 
     } 
+  }).some((c) => c.label === "接着上次的进度继续"));
+  // incompleteReason 是闭合枚举，标签要说清**哪里**没做完——泛泛的「继续完成剩余部分」
+  // 正是用户点名不要的废话。带 ":N" 后缀的取基名查表。
+  assert.ok(gen({
+    _lastRunState: { outcome: "partial", task: "x", result: "", incompleteReason: "build_failing",
+      mutatedFileCount: 1, mutatedFileTypes: new Set(["src"]), updatedAt: now }
+  }).some((c) => c.label === "修复构建失败"));
+  assert.ok(gen({
+    _lastRunState: { outcome: "partial", task: "x", result: "", incompleteReason: "plan_steps_pending:3",
+      mutatedFileCount: 1, mutatedFileTypes: new Set(["src"]), updatedAt: now }
+  }).some((c) => c.label === "继续没做完的步骤"));
+  // 枚举之外的原因仍然回落到通用文案，不会变成 undefined。
+  assert.ok(gen({
+    _lastRunState: { outcome: "partial", task: "x", result: "", incompleteReason: "something_new",
+      mutatedFileCount: 1, mutatedFileTypes: new Set(["src"]), updatedAt: now }
   }).some((c) => c.label === "继续完成剩余部分"));
+  // 智能体举着问题等人答时，没有"下一步"——不拦的话场景 4 会在没人回答的问题上面
+  // 喊「继续执行计划」（awaitingUserReply 和 plan_steps_pending 是同时打的标）。
+  assert.deepEqual(gen({
+    _lastRunState: { outcome: "awaiting_user", updatedAt: now,
+      planStepsStatus: { total: 3, completed: 1, pending: 2 } }
+  }), []);
+  // 时效窗口默认严格（旧会话不该指挥新对话），只有输入框那条路显式放宽。
+  const stale = { _lastRunState: { outcome: "failed", failureCategory: "network", updatedAt: now - 6 * 60_000 } };
+  assert.deepEqual(gen(stale), []);
+  assert.equal(gen(stale, { maxAgeMs: Infinity }).length, 1);
   // 场景 3:成功且有运行效果 → 提示验证
   assert.ok(gen({ 
     _lastRunState: { 
@@ -10193,6 +10218,105 @@ test("long chat transcripts stay bounded while paging both directions", () => {
     "the synchronous emergency mirror must remain bounded even when full context is huge");
   assert.match(SRC, /_chatFollowRAF = requestAnimationFrame\(/,
     "streaming updates should coalesce their layout-affecting scroll write via rAF");
+});
+
+test("the composer prediction is grounded in real run state, and costs nothing", () => {
+  const gen = load("_runStateNextActionSuggestions", { _INCOMPLETE_LABELS: loadConst("_INCOMPLETE_LABELS") });
+  const pred = load("_composerPrediction", {
+    _runStateNextActionSuggestions: gen,
+    _dynamicChatChips: () => [{ label: "上下文兜底", send: "ctx" }],
+  });
+  const now = Date.now();
+
+  // 举着问题等人答时不给预测：Tab 出一句"回答上面的问题"再发出去毫无意义。
+  assert.equal(pred({ id: "s", _lastRunState: { outcome: "awaiting_user", updatedAt: now },
+    _planSteps: [{ status: "pending", content: "补边界测试" }] }), null);
+
+  // 刚失败的这一轮，压过一切——包括还没做完的计划步骤。
+  const failed = pred({ id: "s", _planSteps: [{ status: "pending", content: "补边界测试" }],
+    _lastRunState: { outcome: "failed", failureCategory: "network", lastError: "ECONNREFUSED", updatedAt: now } });
+  assert.equal(failed.src, "run");
+  assert.match(failed.send, /ECONNREFUSED/);
+  assert.ok(!/补边界测试/.test(failed.text));
+
+  // 活着的计划步骤压过 _lastRunState 里的计划快照：快照是一轮结束那一刻的，
+  // 之后 _planSteps 还在变，用快照会说出已经做完的步骤。
+  const planned = pred({ id: "s",
+    _planSteps: [{ status: "cancelled", content: "删掉登录模块" }, { status: "pending", content: "补边界测试" }],
+    _lastRunState: { outcome: "partial", incompleteReason: "plan_steps_pending:2", updatedAt: now,
+      mutatedFileCount: 1, mutatedFileTypes: new Set(["src"]), result: "" } });
+  assert.equal(planned.src, "plan");
+  assert.match(planned.text, /补边界测试/);
+  // 用户明确取消掉的步骤，再提一次比不提更糟。
+  assert.ok(!/删掉登录模块/.test(planned.text + planned.send));
+  // in_progress 优先于 pending。
+  assert.match(pred({ id: "s", _planSteps: [
+    { status: "pending", content: "后面那步" }, { status: "in_progress", content: "正在做的那步" }] }).text,
+    /正在做的那步/);
+
+  // "打开软件"这一档：运行状态早过了 5 分钟的时效窗，仍然要能接上次继续，
+  // 否则用户点名的第一个触发时机永远是空的。
+  const resumed = pred({ id: "s", _lastRunState: { outcome: "partial", incompleteReason: "build_failing",
+    updatedAt: now - 3600_000, mutatedFileCount: 1, mutatedFileTypes: new Set(["src"]), result: "" } });
+  assert.equal(resumed.src, "resume");
+  assert.match(resumed.text, /^继续上次：/);
+
+  // 什么都没有时，回落到上下文预测器，而不是什么都不显示。
+  assert.equal(pred({ id: "s" }).src, "ctx");
+
+  // 钱：这条路在打开软件、切标签、切文件、每次 git 刷新时都会跑，绝不允许发付费调用。
+  for (const name of ["_composerPrediction", "_composerGhostEligible", "_composerGhostText",
+                      "_runStateNextActionSuggestions", "_renderComposerGhost"]) {
+    const body = stripJsComments(extractFn(name));
+    for (const banned of ["_billableAiComplete", "_callAI", "backend.ai", "fetch(", "await "]) {
+      assert.ok(!body.includes(banned), `${name} 必须保持纯本地——出现了 ${banned}`);
+    }
+  }
+});
+
+test("the composer ghost cannot render over content the user already has", () => {
+  const ok = load("_composerGhostEligible");
+  const base = { isEmpty: true, streaming: false, droppedRefs: false, pastedImages: false,
+    atMenuHidden: true, slashMenuHidden: true };
+  assert.equal(ok(base), true);
+  // 拖进来的 @文件引用渲染在**兄弟节点**里、不触发 input，所以输入框仍然"空"——
+  // 只看 .is-empty 会让预测飘在一排文件引用上面。粘贴的图片同理。
+  assert.equal(ok({ ...base, droppedRefs: true }), false);
+  assert.equal(ok({ ...base, pastedImages: true }), false);
+  assert.equal(ok({ ...base, isEmpty: false }), false);
+  assert.equal(ok({ ...base, streaming: true }), false);
+  assert.equal(ok({ ...base, atMenuHidden: false }), false);
+  assert.equal(ok({ ...base, slashMenuHidden: false }), false);
+
+  // 计划步骤的 content 是模型写的、没有长度上限，不截断会让输入框每次刷新都跳一下。
+  const cut = load("_composerGhostText", { _GHOST_MAX_CHARS: loadConst("_GHOST_MAX_CHARS") });
+  assert.ok(cut("修复".repeat(200)).length <= 42);
+  assert.equal(cut("  修复   构建  \n 失败 "), "修复 构建 失败");
+});
+
+test("the ghost is rendered from an attribute i18n does not own, and Tab is guarded", () => {
+  const APP_CSS = readFileSync(join(HERE, "../src/styles/app.css"), "utf8");
+  // 颜色和位置必须就是占位符那一套——用户指的就是这个灰。
+  assert.match(APP_CSS, /#prompt\.is-empty\[data-suggest\]::before\s*\{[^}]*content:\s*attr\(data-suggest\)/);
+  assert.match(APP_CSS, /#prompt\.is-empty\[data-suggest\]::before\s*\{[^}]*var\(--text-dim\)/);
+  // data-placeholder 归 i18n 的标记扫描所有：写进去会在切语言时、以及异步语言包落地时
+  // （正好是"刚打开软件"那一刻）被抹掉。
+  assert.ok(!/setAttribute\(\s*["']data-placeholder["']/.test(stripJsComments(SRC)),
+    "预测不能写进 data-placeholder——那个属性归 i18n 管");
+
+  // Tab 处理器必须注册在两个菜单之后，并且自己守住边界：stopPropagation 挡不住
+  // 同一个元素上的后续监听器，不守就会"既选中文件、又补全预测"。
+  const iSlash = SRC.indexOf("if (_slashMenu.hidden) return;");
+  const iGhost = SRC.indexOf("if (!_composerGhost) return;                       // 没预测就放行");
+  assert.ok(iSlash > 0 && iGhost > iSlash, "预测的 Tab 处理器必须注册在斜杠菜单之后");
+  const seg = stripJsComments(SRC.slice(iGhost - 1600, iGhost + 1200));
+  for (const guard of ["e.defaultPrevented", "_atMenu.hidden", "_slashMenu.hidden",
+                       "e.isComposing", "_ceSerialize(promptEl).trim()"]) {
+    assert.ok(seg.includes(guard), `Tab 处理器丢了 ${guard} 这道守卫`);
+  }
+  // 打字必须立刻作废预测，否则稍晚落地的预测会把已输入内容冲掉。
+  assert.match(SRC, /promptEl\.addEventListener\("input", \(\) => \{\s*\n[^}]*_clearComposerGhost\(\);/,
+    "input 监听器必须先清掉预测再更新占位状态");
 });
 
 test("the access gate counts free daily points as a payment source", () => {
