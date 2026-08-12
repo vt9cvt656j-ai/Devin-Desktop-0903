@@ -75,6 +75,9 @@ import { openMemoryCenterIsland } from "./ui/mount-memory-center.jsx";
 import { mountArchiveBrowser } from "./ui/mount-archive-browser.jsx";
 import { mountTableView } from "./ui/mount-table-view.jsx";
 import { getCollaborationEngine } from "./agent/collaboration-engine.js";
+import { escapeAttr as _escAttr, escapeHtml as _escHtml } from "./agent/escape.js";
+import { langBadge as _langBadge } from "./agent/language.js";
+import { buildDiffView as _buildDiffView, diffStat as _diffStat, highlightDiffView } from "./agent/diff-view.js";
 
 // Global shared state store for sub-agent collaboration
 const _globalSharedStore = getSharedStore();
@@ -25078,14 +25081,6 @@ function _splitAgentResponse(response) {
   return newSegs.length > 0 ? newSegs : segments;
 }
 
-const _ATC_LANG_MAP = { py: "py", python: "py", js: "js", javascript: "js", jsx: "js", ts: "ts", typescript: "ts", tsx: "ts", html: "html", htm: "html", css: "css", scss: "css", less: "css", rs: "rs", rust: "rs", go: "go", sh: "sh", bash: "sh", shell: "sh", zsh: "sh", json: "json", sql: "sql", md: "md", markdown: "md" };
-function _langBadge(pathOrLang) {
-  const s = String(pathOrLang == null ? "" : pathOrLang);
-  const ext = (s.split(".").pop() || "").toLowerCase();
-  const key = _ATC_LANG_MAP[ext] || _ATC_LANG_MAP[s] || "default";
-  const labels = { py: "PY", js: "JS", ts: "TS", html: "HTML", css: "CSS", rs: "RS", go: "GO", sh: "SH", json: "JSON", sql: "SQL", md: "MD", cmd: "CMD", default: "FILE" };
-  return `<span class="atc-lang-badge atc-lang-badge--${key}">${labels[key] || key.toUpperCase()}</span>`;
-}
 const _ATC_EXPAND_ICON = `<svg viewBox="0 0 12 12" width="12" height="12"><path d="M3 4.5l3 3 3-3" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></svg>`;
 
 // ============================================================================
@@ -50095,120 +50090,12 @@ async function _dbQueryWithRetry(driver, url, query, limit = null, maxRetries = 
   throw err;
 }
 
-// Real added/removed LINE counts (not "total new lines / total old lines").
-// Uses a line-multiset difference: a line that just moved counts as unchanged, a
-// modified line counts as one removed + one added — close to what a user expects
-// from a diff, and O(n). A brand-new file reports every line as added.
-function _diffStat(oldText, newText) {
-  const oldL = oldText ? oldText.split("\n") : [];
-  const newL = newText ? newText.split("\n") : [];
-  const counts = new Map();
-  for (const l of oldL) counts.set(l, (counts.get(l) || 0) + 1);
-  for (const l of newL) counts.set(l, (counts.get(l) || 0) - 1);
-  let added = 0, removed = 0;
-  for (const v of counts.values()) {
-    if (v < 0) added += -v;       // present more often in new → added
-    else if (v > 0) removed += v; // present more often in old → removed
-  }
-  return { added, removed };
-}
-
-function _buildDiffView(oldText, newText, filePath) {
-  oldText = oldText == null ? "" : String(oldText);
-  newText = newText == null ? "" : String(newText);
-  filePath = filePath == null ? "" : String(filePath);
-  const oldL = oldText ? oldText.split("\n") : [];
-  const newL = newText.split("\n");
-  const ext = filePath.split(".").pop().toLowerCase();
-  const monoLang = _ATC_LANG_MAP[ext] || ext;
-  const badge = _langBadge(filePath || ext || "file");
-  const isNew = !oldText;
-
-  let h = '';
-  h += `<div class="atc-diff" data-lang="${_escHtml(monoLang)}">`;
-
-  const cap = 60;
-  let rendered = 0;
-
-  if (isNew) {
-    for (let i = 0; i < newL.length && rendered < cap; i++, rendered++) {
-      h += `<div class="atc-diff-row atc-diff-row--add"><span class="atc-diff-ln">${i + 1}</span><span class="atc-diff-sign">+</span><span class="atc-diff-code" data-raw="${_escAttr(newL[i])}">${_escHtml(newL[i])}</span></div>`;
-    }
-  } else {
-    const maxLen = Math.max(oldL.length, newL.length);
-    let lastShown = -1;
-    for (let i = 0; i < maxLen && rendered < cap; i++) {
-      const oLine = i < oldL.length ? oldL[i] : undefined;
-      const nLine = i < newL.length ? newL[i] : undefined;
-
-      if (oLine !== undefined && nLine !== undefined && oLine === nLine) {
-        if (i - lastShown === 2) {
-          h += `<div class="atc-diff-row atc-diff-row--ctx"><span class="atc-diff-ln">${i + 1}</span><span class="atc-diff-sign"> </span><span class="atc-diff-code" data-raw="${_escAttr(nLine)}">${_escHtml(nLine)}</span></div>`;
-          rendered++;
-        }
-        continue;
-      }
-
-      if (i - lastShown > 2 && lastShown >= 0) {
-        const skipped = i - lastShown - 1;
-        if (skipped > 0) {
-          h += `<div class="atc-diff-more">@@ ${skipped} unchanged line${skipped > 1 ? 's' : ''} @@</div>`;
-        }
-      }
-
-      if (lastShown < 0 && i > 0) {
-        const ctxStart = Math.max(0, i - 2);
-        for (let c = ctxStart; c < i; c++) {
-          if (c < oldL.length) {
-            h += `<div class="atc-diff-row atc-diff-row--ctx"><span class="atc-diff-ln">${c + 1}</span><span class="atc-diff-sign"> </span><span class="atc-diff-code" data-raw="${_escAttr(oldL[c])}">${_escHtml(oldL[c])}</span></div>`;
-            rendered++;
-          }
-        }
-      }
-
-      if (oLine !== undefined && oLine !== nLine) {
-        h += `<div class="atc-diff-row atc-diff-row--del"><span class="atc-diff-ln">${i + 1}</span><span class="atc-diff-sign">-</span><span class="atc-diff-code" data-raw="${_escAttr(oLine)}">${_escHtml(oLine)}</span></div>`;
-        rendered++;
-      }
-      if (nLine !== undefined && oLine !== nLine) {
-        h += `<div class="atc-diff-row atc-diff-row--add"><span class="atc-diff-ln">${i + 1}</span><span class="atc-diff-sign">+</span><span class="atc-diff-code" data-raw="${_escAttr(nLine)}">${_escHtml(nLine)}</span></div>`;
-        rendered++;
-      }
-      lastShown = i;
-    }
-  }
-
-  if (rendered >= cap) {
-    const remaining = Math.max(oldL.length, newL.length) - cap;
-    if (remaining > 0) h += `<div class="atc-diff-more">… ${remaining} more lines not shown …</div>`;
-  }
-  h += "</div>";
-  return h;
-}
-
-function _escAttr(s) {
-  return String(s == null ? "" : s).replace(/&/g, "&amp;").replace(/"/g, "&quot;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
-}
-
+// diff 卡片的渲染搬到了 ./agent/diff-view.js。抽出来的版本把 Monaco 依赖改成注入式，
+// 这样测试能在没有 DOM 的 node 里跑；这里的 4 个调用点仍然只传一个参数。
+// 必须是提升的 function 声明，不能写成 const 箭头函数——现在的调用点在它上面，
+// const 会开一段 TDZ 窗口。async 保留，这样 querySelector 同步抛错时仍然是 rejected promise。
 async function _highlightDiffView(container) {
-  const diff = container.querySelector(".atc-diff");
-  if (!diff) return;
-  const lang = diff.dataset.lang;
-  if (!lang || lang === "default") return;
-
-  const monoId = monacoLang(lang);
-  if (monoId === "plaintext") return;
-
-  const codeEls = diff.querySelectorAll(".atc-diff-code[data-raw]");
-  for (const el of codeEls) {
-    const raw = el.dataset.raw;
-    if (!raw || !raw.trim()) continue;
-    try {
-      let html = await monaco.editor.colorize(raw, monoId, { tabSize: 2 });
-      html = html.replace(/<br\/?>\s*$/, "").replace(/^<div>/, "").replace(/<\/div>$/, "");
-      if (html) el.innerHTML = html;
-    } catch { /* keep plain text */ }
-  }
+  return highlightDiffView(container, { monaco, monacoLang });
 }
 
 async function _agentFollowUp(toolResults, container, session) {
@@ -62001,12 +61888,6 @@ function _symbolKindClass(kind) {
     13: "variable", 14: "constant", 15: "string", 16: "number", 17: "boolean", 18: "array",
     19: "object", 20: "key", 21: "null", 22: "enummember", 23: "struct", 24: "event", 25: "operator", 26: "typeparam" };
   return map[kind] || "variable";
-}
-
-function _escHtml(s) {
-  const d = document.createElement("div");
-  d.textContent = s;
-  return d.innerHTML;
 }
 
 $("outlineSortBtn")?.addEventListener("click", () => {

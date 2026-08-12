@@ -1,0 +1,95 @@
+import { test } from "node:test";
+import assert from "node:assert/strict";
+import {
+  buildDiffView,
+  diffStat,
+  escapeAttr,
+  escapeHtml,
+  highlightDiffView,
+} from "../src/agent/diff-view.js";
+
+test("diffStat counts true line additions and removals", () => {
+  assert.deepEqual(diffStat("a\nb\nc\nb", "b\na\nc\nd"), { added: 1, removed: 1 });
+  assert.deepEqual(diffStat("", "one\ntwo"), { added: 2, removed: 0 });
+  assert.deepEqual(diffStat("same\nsame", "same\nsame"), { added: 0, removed: 0 });
+});
+
+test("escape helpers are safe for text nodes and attributes", () => {
+  assert.equal(escapeHtml('<script a="b">&</script>'), '&lt;script a="b"&gt;&amp;&lt;/script&gt;');
+  assert.equal(escapeAttr('<script a="b">&</script>'), "&lt;script a=&quot;b&quot;&gt;&amp;&lt;/script&gt;");
+});
+
+// escapeHtml 原来是 DOM 实现（textContent → innerHTML），改成纯字符串版时有两条 HTML 片段
+// 序列化规则必须手工搬过来，否则 313 个调用点会静默改变输出。上面那条断言只用 ASCII，
+// 三次 replace 的朴素版本也能过——正是它守不住的地方。
+test("escapeHtml carries over the two DOM serialization rules", () => {
+  assert.equal(escapeHtml("a\u00a0b"), "a&nbsp;b");      // 不换行空格必须变实体
+  assert.equal(escapeHtml("a\u00a0&b"), "a&nbsp;&amp;b"); // 注入的 & 不能被二次转义
+  assert.equal(escapeHtml(null), "");                     // 不是字符串 "null"
+  assert.equal(escapeHtml(undefined), "");
+  assert.equal(escapeAttr(null), "");
+});
+
+test("buildDiffView renders new-file additions with escaped code and language", () => {
+  const html = buildDiffView("", '<script a="b">&</script>', "src/app.js");
+
+  assert.match(html, /<div class="atc-diff" data-lang="js">/);
+  assert.match(html, /atc-diff-row--add/);
+  assert.match(html, /data-raw="&lt;script a=&quot;b&quot;&gt;&amp;&lt;\/script&gt;"/);
+  assert.match(html, /&lt;script a="b"&gt;&amp;&lt;\/script&gt;/);
+});
+
+test("buildDiffView renders deletes, adds, context, and skipped-line markers", () => {
+  const oldText = ["same0", "same1", "old2", "same3", "same4", "same5", "same6", "old7"].join("\n");
+  const newText = ["same0", "same1", "new2", "same3", "same4", "same5", "same6", "new7"].join("\n");
+  const html = buildDiffView(oldText, newText, "src/app.ts");
+
+  assert.match(html, /data-lang="ts"/);
+  assert.match(html, /atc-diff-row--ctx/);
+  assert.match(html, /atc-diff-row--del/);
+  assert.match(html, /atc-diff-row--add/);
+  assert.match(html, /@@ 4 unchanged lines @@/);
+});
+
+test("buildDiffView caps large previews", () => {
+  const newText = Array.from({ length: 65 }, (_, index) => `line ${index + 1}`).join("\n");
+  const html = buildDiffView("", newText, "README.md");
+
+  assert.equal((html.match(/atc-diff-row--add/g) || []).length, 60);
+  // 省略号是 U+2026，不是三个 ASCII 点：产品里的截断标记跟 `@@ N unchanged lines @@`
+  // 是同一套排版，改成 ASCII 属于把界面改动混进重构里。
+  assert.match(html, /… 5 more lines not shown …/);
+});
+
+test("highlightDiffView colorizes through injected Monaco dependencies", async () => {
+  const codeEl = { dataset: { raw: "const x = 1;" }, innerHTML: "const x = 1;" };
+  const blankEl = { dataset: { raw: "   " }, innerHTML: "" };
+  const diff = {
+    dataset: { lang: "js" },
+    querySelectorAll(selector) {
+      assert.equal(selector, ".atc-diff-code[data-raw]");
+      return [codeEl, blankEl];
+    },
+  };
+  const container = {
+    querySelector(selector) {
+      assert.equal(selector, ".atc-diff");
+      return diff;
+    },
+  };
+  const calls = [];
+  const monaco = {
+    editor: {
+      async colorize(raw, lang, options) {
+        calls.push({ raw, lang, options });
+        return "<div><span>colored</span></div>";
+      },
+    },
+  };
+
+  await highlightDiffView(container, { monaco, monacoLang: (lang) => (lang === "js" ? "javascript" : lang) });
+
+  assert.deepEqual(calls, [{ raw: "const x = 1;", lang: "javascript", options: { tabSize: 2 } }]);
+  assert.equal(codeEl.innerHTML, "<span>colored</span>");
+  assert.equal(blankEl.innerHTML, "");
+});
