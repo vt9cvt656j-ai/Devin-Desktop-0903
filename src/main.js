@@ -38476,6 +38476,32 @@ async function _runSubAgent({ config, description, prompt, root, container, run,
   }
   _sess._subAgentsActive++;
 
+  /**
+   * 归还一个并发槽位。
+   *
+   * 自增在这里（紧挨着上面的等待，两者必须相邻才有原子性），而归还它的 `finally` 属于两百多行
+   * 之后才打开的那个 `try`。中间夹着两条**没有任何保护的 return**：只读模式挡 run_worker，
+   * 以及 `[interrupted]`（那行注释写着"finally frees the slot"——那个 finally 在它的位置还
+   * 不存在）。每走一次，一个槽位就永久烧掉，而计数器挂在**会话**上，跨轮累积、活到对话结束。
+   *
+   * 用户看到的：泄 1 次 → 最多 3 并发；泄 3 次 → 全部串行（"一个在动、其它干等"）；泄满 4 次 →
+   * 子智能体彻底不跑，全挂在 15 秒一轮的等待里，唯一出口是按停止。全程零日志零卡片，读起来
+   * 就像"今天它就是不想用子智能体"。
+   *
+   * 这里不把自增下移，因为那样会在等待和自增之间开一个窗口，并发数可能冲破上限。
+   */
+  let _slotReleased = false;
+  const _releaseSubAgentSlot = () => {
+    if (_slotReleased) return;
+    _slotReleased = true;
+    clearTimeout(timeoutId);
+    if (_sess && _sess._subAgentsActive) _sess._subAgentsActive--;
+    // 每次只放行一个：全量唤醒等于没有上限。变量名保持 _waiter —— 既有测试按这行的确切
+    // 写法守着"退出必须唤醒排队者，不唤醒就是死锁"，改名会让那条守卫失效。
+    const _waiter = _sess?._subAgentSlotWaiters?.shift?.();
+    if (typeof _waiter === "function") _waiter();
+  };
+
   // === run 字段安全初始化审计：子智能体路径补齐新机制字段的默认值 ===
   // Run 对象可能从主循环继承，但子智能体的独立执行环境需要这些字段的安全默认值
   if (run && !run._dupReadN) run._dupReadN = new Map();
@@ -38538,7 +38564,8 @@ async function _runSubAgent({ config, description, prompt, root, container, run,
     const _pmode = (run && run.mode) || "";
     if (_pmode === "explorer" || _pmode === "reviewer" || _pmode === "plan") {
       res.className = "atc-result atc-result--blocked"; res.textContent = "⛔ 只读模式"; card.classList.remove("is-open");
-      return "[BLOCKED] 当前是只读模式（Explorer / Plan / Reviewer），不能用 run_worker 改文件。需要改代码请切到 Agent 模式。";
+      _releaseSubAgentSlot();
+    return "[BLOCKED] 当前是只读模式（Explorer / Plan / Reviewer），不能用 run_worker 改文件。需要改代码请切到 Agent 模式。";
     }
     // Scope is a permission boundary, so it's enforced structurally — but an empty or
     // overlapping scope is a recoverable slip, not a dead end that burns a reseller round-trip.
@@ -38552,7 +38579,8 @@ async function _runSubAgent({ config, description, prompt, root, container, run,
     for (;;) {
       if (!_live()) {
         res.className = "atc-result atc-result--err"; res.textContent = "已中断"; card.classList.remove("is-open");
-        return "[interrupted]"; // finally frees the slot; scope not yet registered, nothing to unwind
+        _releaseSubAgentSlot(); // 这条路径上那个 finally 还没打开，必须自己还
+    return "[interrupted]"; // scope not yet registered, nothing to unwind
       }
       const conflict = run._activeWorkerScopes.find((s) => _scopesOverlap(s, scopeRel));
       if (!conflict) { run._activeWorkerScopes.push(scopeRel); break; }
@@ -38934,12 +38962,8 @@ async function _runSubAgent({ config, description, prompt, root, container, run,
       (run._workerScopeWaiters || []).splice(0).forEach((r) => { try { r(); } catch {} });
     }
     // === Cleanup: cancel timeout & decrement counter ===
-    clearTimeout(timeoutId);
-    if (_sess && _sess._subAgentsActive) _sess._subAgentsActive--;
-    // Release one queued sibling. Draining a single waiter per exit keeps the gate at
-    // exactly MAX; draining all of them would let the whole queue through at once.
-    const _waiter = _sess?._subAgentSlotWaiters?.shift?.();
-    if (typeof _waiter === "function") _waiter();
+    // 走同一个释放函数，两份释放逻辑不会漂移；它自带幂等，提前 return 已经还过就不会重复还。
+    _releaseSubAgentSlot();
   }
 
   // 0-step floor: keep the attempt visible and settled. Hiding the card made a
