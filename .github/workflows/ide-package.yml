@@ -1,4 +1,4 @@
-name: Package Michael IDE (macOS DMG + Windows EXE/MSI)
+name: Package Mr. Day One (macOS DMG + Windows EXE/MSI)
 
 on:
   workflow_dispatch:
@@ -138,7 +138,7 @@ jobs:
           projectPath: ide
           args: --target ${{ matrix.rust_target }} --config src-tauri/tauri.package.conf.json --ci
           tagName: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || '' }}
-          releaseName: Michael IDE ${{ github.ref_name }}
+          releaseName: Mr. Day One ${{ github.ref_name }}
           releaseDraft: true
           prerelease: false
 
