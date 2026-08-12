@@ -17,12 +17,12 @@ for (const [file, version] of versions) {
 }
 
 if (new Set(versions.values()).size !== 1) {
-  throw new Error(`Michael IDE versions do not match: ${[...versions].map(([file, version]) => `${file}=${version}`).join(", ")}`);
+  throw new Error(`Mr. Day One versions do not match: ${[...versions].map(([file, version]) => `${file}=${version}`).join(", ")}`);
 }
 
 const releaseTag = String(process.env.MICHAEL_RELEASE_TAG || "").trim();
 if (releaseTag && releaseTag !== `v${packageVersion}`) {
-  throw new Error(`release tag ${releaseTag} does not match Michael IDE v${packageVersion}`);
+  throw new Error(`release tag ${releaseTag} does not match Mr. Day One v${packageVersion}`);
 }
 
-console.log(`Michael IDE release version verified: v${packageVersion}`);
+console.log(`Mr. Day One release version verified: v${packageVersion}`);
