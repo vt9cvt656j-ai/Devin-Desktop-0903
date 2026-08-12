@@ -338,6 +338,16 @@ pub fn term_close(state: State<TerminalState>, id: u32) -> Result<(), String> {
 /// 正确识别，靠输出活跃度猜是猜不出来的。
 ///
 /// 一次返回全部，而不是一个终端一次调用：这是要按秒轮询的，N 次 IPC 没必要。
+/// Windows 上 ConPTY 没有前台进程组这个概念，portable-pty 也就不提供
+/// `process_group_leader`。这里返回空表，标签页退回到"出身"标记——比编不过强，
+/// 也比在 Windows 上乱猜一个假状态强。
+#[cfg(windows)]
+#[tauri::command(async)]
+pub fn term_running_ids(_state: State<TerminalState>) -> Vec<u32> {
+    Vec::new()
+}
+
+#[cfg(not(windows))]
 #[tauri::command(async)]
 pub fn term_running_ids(state: State<TerminalState>) -> Vec<u32> {
     let Ok(inner) = state.inner.lock() else {
