@@ -15576,6 +15576,10 @@ async function _switchChatSession(idx) {
     // 停在半截历史里的标签直接拽到底。
     _installChatGrowthObserver(session);
   }
+  // 输入框是所有标签共用的一个元素，切标签不会自动清。不刷新的话，A 标签算出来的
+  // 预测会挂在 B 标签上，Tab 一下就把不相干的指令灌进去了（接受路径里的 sid 校验
+  // 是第二道保险，这里是第一道）。
+  try { _renderComposerGhost(); } catch {}
   _ensureSessionHint(session); // empty tab → show the starter hint inside its container
   _renderQueueBar(session); // 切回标签时同步排队小卡片
   _drainFollowups(session); // returning to a tab whose run finished while away → send its queued follow-up
@@ -22437,10 +22441,29 @@ function _renderSuggestionChips(sess, items, label) {
 // 改了文件。旧版是对最近聊天文本的关键词正则桶——问候轮也会被历史里的“报错/验证/UI"
 // 字样命中，刷出一排不相干的按钮。纯问答/闲聊轮（没动文件、没计划、没失败）不出建议。
 // **改为最多 3 个精确预测**:基于 failureCategory/mutatedFileTypes/runtimeEffects 等证据
-function _runStateNextActionSuggestions(sess) {
+// incompleteReason 是个**闭合枚举**，由真实执行事实写入（build_failing = 模型自己声明的
+// 验证命令非零退出，new_diagnostics_unresolved = 诊断真的多出来了）。所以"哪里没做完"
+// 不需要让模型重读对话去猜——猜最好也只是复述，最坏是编一个不同的。这张表把枚举翻译成
+// 人话；泛泛的「继续完成剩余部分」正是用户点名不要的那种废话。
+const _INCOMPLETE_LABELS = {
+  build_failing: "修复构建失败",
+  code_delivered_unverified: "跑一遍验证刚才的改动",
+  new_diagnostics_unresolved: "清掉新增的报错",
+  plan_steps_pending: "继续没做完的步骤",
+  subagent_results_pending: "收拢子任务结果",
+  ui_verification_missing: "在界面上验一遍",
+  iteration_limit: "接着上次的进度继续",
+};
+
+function _runStateNextActionSuggestions(sess, { maxAgeMs = 5 * 60_000 } = {}) {
   const run = sess?._lastRunState;
   // 只信"刚结束的这一轮":恢复的旧会话里的陈旧状态不该冒出来指挥新对话。
-  if (!run || !run.updatedAt || Date.now() - run.updatedAt > 5 * 60_000) return [];
+  // 窗口可配是为了输入框的"打开软件时"那一档——只有它传 Infinity，卡片行仍然严格。
+  if (!run || !run.updatedAt || Date.now() - run.updatedAt > maxAgeMs) return [];
+  // 智能体正举着一个问题等人答时，没有"下一步"可言。awaitingUserReply 和
+  // plan_steps_pending 是同时打的标，所以不拦的话，场景 4 会在一个没人回答的问题上面
+  // 喊"继续执行计划"。
+  if (run.outcome === "awaiting_user") return [];
   const picks = [];
   const task = String(run.task || "").slice(0, 60);
 
@@ -22464,8 +22487,10 @@ function _runStateNextActionSuggestions(sess) {
   if (run.outcome === "partial") {
     const types = [...(run.mutatedFileTypes || [])].join("+");
     const incomplete = run.incompleteReason || "";
+    // 枚举带 ":N" 后缀（plan_steps_pending:3），取冒号前的基名查表。
+    const incompleteBase = incomplete.split(":")[0];
     picks.push({ 
-      label: `继续完成剩余部分`, 
+      label: _INCOMPLETE_LABELS[incompleteBase] || `继续完成剩余部分`, 
       send: `本轮已完成${types ? types + "文件" : "部分"}的修改 (${run.mutatedFileCount || 0}个)，但因${incomplete || "未知原因"}未完成。请继续：${String(run.result || "").slice(0, 200)}...` 
     });
   }
@@ -22499,6 +22524,104 @@ async function _maybeSuggestNext(sess, messages, config) {
     if (!sess || !inTauri) return;
     _renderSuggestionChips(sess, _runStateNextActionSuggestions(sess), t("chat.nextSteps"));
   } catch {}
+}
+
+// ---------------------------------------------------------------------------
+// 输入框里的下一步预测（灰字 + Tab 补全）
+//
+// 全部来自本地已有事实，一次模型调用都不发。理由不是省钱，是**更准**：
+// "哪里没做完"这件事运行时已经记录进 _lastRunState.incompleteReason 了（闭合枚举，
+// 由真实执行事实写入），让模型重读整段对话去推断，最好也只是复述，最坏是编一个不同的。
+// 而且用户点名的第一个触发时机是"打开软件"——那时候根本没有对话可读。
+// ---------------------------------------------------------------------------
+
+// 灰字最多多长。计划步骤的 content 是模型写的、没有上限，不截断会在
+// max-height:168px 的输入框里换行，让整个框每次刷新都跳一下。
+const _GHOST_MAX_CHARS = 42;
+function _composerGhostText(raw) {
+  const one = String(raw || "").replace(/\s+/g, " ").trim();
+  return one.length > _GHOST_MAX_CHARS ? one.slice(0, _GHOST_MAX_CHARS - 1) + "…" : one;
+}
+
+/// 现在该不该显示预测。纯函数，便于直接测。
+///
+/// 不能只看 .is-empty：拖进来的 @文件引用渲染在**兄弟节点** .ref-chips 里，
+/// 不触发 input 事件，所以输入框仍然是"空"的——那时候飘一行预测在一排文件引用上面
+/// 是错的。粘贴的图片同理。
+function _composerGhostEligible(st) {
+  if (!st || !st.isEmpty) return false;
+  if (st.streaming) return false;
+  if (st.droppedRefs || st.pastedImages) return false;
+  if (!st.atMenuHidden || !st.slashMenuHidden) return false;
+  return true;
+}
+
+/// 预测用户最想做的那一件事。第一个命中的档位胜出。
+///
+/// 排序理由：构建挂了压过下一个计划步骤；活着的 _planSteps 压过 _lastRunState 里的
+/// 计划快照（快照是一轮结束那一刻的，之后 _planSteps 还在变）；恢复的旧运行状态排在
+/// 最后但必须有，否则"打开软件"这一档永远是空的。
+function _composerPrediction(sess) {
+  if (!sess) return null;
+  const run = sess._lastRunState || null;
+  // 举着问题等人回答时不给预测：Tab 出一句"回答上面的问题"再发出去毫无意义，
+  // 空输入框配原本的占位符才是对的提示。
+  if (run && run.outcome === "awaiting_user") return null;
+
+  const fresh = _runStateNextActionSuggestions(sess);
+  const planShaped = String(run?.incompleteReason || "").startsWith("plan_steps_pending");
+  if (fresh.length && (run?.outcome === "failed" || !planShaped)) {
+    return { src: "run", text: fresh[0].label, send: fresh[0].send };
+  }
+
+  const steps = Array.isArray(sess._planSteps) ? sess._planSteps : [];
+  const step = steps.find((x) => x?.status === "in_progress") || steps.find((x) => x?.status === "pending");
+  if (step && step.content) {
+    // 只取 in_progress / pending：cancelled 是用户明确否掉的，再提一次比不提更糟。
+    return { src: "plan", text: "继续：" + step.content, send: "继续：" + step.content };
+  }
+
+  if (fresh.length) return { src: "run", text: fresh[0].label, send: fresh[0].send };
+
+  const old = _runStateNextActionSuggestions(sess, { maxAgeMs: Infinity });
+  if (old.length) {
+    return { src: "resume", text: "继续上次：" + old[0].label, send: old[0].send };
+  }
+
+  try {
+    const ctx = _dynamicChatChips();
+    if (ctx && ctx.length) return { src: "ctx", text: ctx[0].label, send: ctx[0].send };
+  } catch {}
+  return null;
+}
+
+// 当前显示中的预测。带 sid，防止 A 标签算出来的东西被 Tab 进 B 标签。
+let _composerGhost = null;
+function _clearComposerGhost() {
+  _composerGhost = null;
+  try { promptEl.removeAttribute("data-suggest"); } catch {}
+}
+function _renderComposerGhost() {
+  try {
+    const sess = _currentSession();
+    if (!sess) return _clearComposerGhost();
+    if (!_composerGhostEligible({
+      isEmpty: !_ceSerialize(promptEl).trim(),
+      streaming: !!sess.streaming,
+      droppedRefs: !!(typeof _droppedRefs !== "undefined" && _droppedRefs && _droppedRefs.length),
+      pastedImages: !!(typeof _pastedImages !== "undefined" && _pastedImages && _pastedImages.length),
+      atMenuHidden: !!_atMenu.hidden,
+      slashMenuHidden: !!_slashMenu.hidden,
+    })) return _clearComposerGhost();
+    // 每次重算，从不缓存：截断消息会把 _intentState 和 _lastRunState 一起清掉，
+    // _planSteps 在一轮结束后还继续变——快照会变成"陈旧且错误"，比陈旧更糟。
+    const p = _composerPrediction(sess);
+    if (!p || !p.text || !p.send) return _clearComposerGhost();
+    if (sess._ghostDismissKey === p.text) return _clearComposerGhost(); // 这条被 Esc 关过
+    const text = _composerGhostText(p.text);
+    _composerGhost = { sid: sess.id, text, send: p.send };
+    if (promptEl.getAttribute("data-suggest") !== text) promptEl.setAttribute("data-suggest", text);
+  } catch { _clearComposerGhost(); }
 }
 
 // The model often OFFERS the user a choice as plain text ("A. … B. … C. …" / "1. … 2. …")
@@ -24047,6 +24170,7 @@ async function sendPrompt(text, attachments = [], readyConfig = null) {
     });
     _chatFollow();
     _drainFollowups(sess); // a message sent while this reply streamed → process it now, as its own turn
+    try { _renderComposerGhost(); } catch {} // 一轮结束 → 刷新"接下来最想做什么"
   }
 }
 
@@ -56868,7 +56992,15 @@ function _makeComposerChip(rel, kind = "file", labelText = "") {
   chip.appendChild(nameEl);
   return chip;
 }
-promptEl.addEventListener("input", _cePlaceholder);
+promptEl.addEventListener("input", () => {
+  // 用户一开始打字，预测立刻作废——不能让一条稍晚落地的预测把已输入的内容冲掉。
+  // 先清再重算，两步都要：清是同步的，保证这一刻不可能 Tab 到一条陈旧预测；
+  // 重算是为了用户把输入框**清空之后**预测能回来（否则清一次就再也不出现了）。
+  // _renderComposerGhost 自己会判定资格，输入框非空时它只会再清一次，不会误显示。
+  _clearComposerGhost();
+  _cePlaceholder();
+  try { _renderComposerGhost(); } catch {}
+});
 _cePlaceholder();
 const _SEND_ICON = `<svg class="ic"><use href="#i-arrow-up" /></svg>`;
 const _STOP_ICON = `<svg class="ic" viewBox="0 0 16 16" fill="currentColor"><rect x="3.5" y="3.5" width="9" height="9" rx="1.5"/></svg>`;
@@ -58557,6 +58689,42 @@ promptEl.addEventListener("keydown", (e) => {
   else if (e.key === "Escape") { e.preventDefault(); _hideSlash(); }
 });
 promptEl.addEventListener("blur", () => setTimeout(_hideSlash, 150));
+
+// ---- 预测的接受（Tab）与关闭（Esc）。
+//
+// 必须注册在 @文件菜单（上面第二个 keydown）和斜杠菜单（第三个）**之后**：它们各自
+// 用 preventDefault + stopPropagation 抢 Tab，但 stopPropagation 只挡别的节点，**挡不住
+// 同一个元素上的后续监听器**。所以这里自己再守一遍 defaultPrevented 和两个菜单的可见性，
+// 否则在 @ 菜单里按 Tab 会既选中文件、又把预测灌进去。
+promptEl.addEventListener("keydown", (e) => {
+  if (e.key === "Escape") {
+    if (!_composerGhost) return; // 没有预测就别抢 Esc，上面还有停止/遮罩要用
+    const sess = _currentSession();
+    if (sess) sess._ghostDismissKey = _composerGhost.text; // 只静音这一条，换一条还会出
+    e.preventDefault();
+    _clearComposerGhost();
+    return;
+  }
+  if (e.key !== "Tab" || e.shiftKey || e.altKey || e.ctrlKey || e.metaKey) return;
+  if (e.defaultPrevented) return;                    // 菜单已经吃掉这次 Tab
+  if (!_atMenu.hidden || !_slashMenu.hidden) return; // 显式再挡一次，也是写给读代码的人看
+  if (e.isComposing || e.keyCode === 229) return;    // 输入法拼字中，Tab 可能是选候选词
+  if (!_composerGhost) return;                       // 没预测就放行，Tab 照常切焦点
+  const sess = _currentSession();
+  if (!sess || sess.id !== _composerGhost.sid) return _clearComposerGhost(); // 跨标签的陈旧预测
+  // 按下这一刻重新判空，不用渲染时的结论：预测可能是在用户开始打字之前那一瞬算出来的，
+  // 直接补全会把人家已经敲的字冲掉。
+  if (_ceSerialize(promptEl).trim()) return _clearComposerGhost();
+  const send = _composerGhost.send;
+  e.preventDefault();
+  _clearComposerGhost();
+  // 和起始卡片同一套填充动作，两条接受路径不会各走各的。input 事件是必须的：
+  // 它会重跑 _cePlaceholder 和两个菜单的更新。
+  promptEl.value = send;
+  promptEl.focus();
+  try { if (promptEl.setSelectionRange) promptEl.setSelectionRange(String(send).length); } catch {}
+  promptEl.dispatchEvent(new Event("input"));
+});
 
 let _pastedImages = [];
 
@@ -61004,7 +61172,9 @@ Promise.all([
 ]).catch(console.error);
 showChatHint();
 syncWelcome();
-restoreChatHistory().catch(console.warn);
+restoreChatHistory()
+  .then(() => { try { _renderComposerGhost(); } catch {} }) // 打开软件 → 接着上次继续
+  .catch(console.warn);
 startIdeUpdateChecks();
 
 // ---- recent projects ----
