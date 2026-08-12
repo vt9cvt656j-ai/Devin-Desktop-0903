@@ -269,6 +269,16 @@ const RUN_RECORD_KNOWN_SIGNATURE = load("_recordRunKnownSignature", {
   _runFileEvidenceAliases: EVIDENCE_ALIASES,
 });
 AUTO_LOAD_DEPS = {
+  // 程序化改完 model 之后通知语言服务器。它被 _setModelValueProgrammatically 和
+  // _appendModelTextProgrammatically 内部调用，所以任何抠出这两个函数的测试都需要它——
+  // 少了它是 ReferenceError，表现成"这个测试挂了"而不是"LSP 没收到通知"，很难查。
+  // 给真实实现而不是桩：断言"通知过谁"的测试才测得准。
+  _notifyLspProgrammaticChange: load("_notifyLspProgrammaticChange", {}),
+  // 销毁 model 前清标记。给真实实现配一个空的 monaco 存根：不关心标记的测试里它是个无操作，
+  // 关心的那个测试自己注入会记账的 monaco。少了它是 ReferenceError，表现成"这个测试挂了"。
+  _clearAllMarkersForModel: load("_clearAllMarkersForModel", {
+    monaco: { editor: { getModelMarkers: () => [], setModelMarkers: () => {} } },
+  }),
   _runFileEvidenceAliases: EVIDENCE_ALIASES,
   _normalizeFsPath: NORMALIZE_PATH,
   _pathIdentity: PATH_IDENTITY,
@@ -15870,6 +15880,93 @@ test("语言解析问 Monaco 自己的注册表，不再靠一张手抄的表", 
   assert.equal(extLang("go.mod"), "ini", "整名映射优先级最高");
   // Monaco 也不认的还是纯文本——这是诚实的结果，不该编一个语言出来。
   assert.equal(extLang("a.zzzz"), "plaintext");
+});
+
+test("关掉再打开文件，旧的报错不能再回来", () => {
+  // 用户报的「一直盯着旧版的报错不放」就是这条。
+  //
+  // Monaco 的 MarkerDecorationsService 在模型被移除时只清理 inMemory / internal / vscode
+  // 三种 scheme 的标记，file: 是**故意放过**的（那是给 VS Code 那种有工作区级诊断所有权的
+  // 编辑器准备的，我们没有那一层）。于是：报错 → 关标签页 → model 被销毁 → 标记按 file: URI
+  // 留在 MarkerService 里 → 服务器随后的「已无错误」空诊断因为没有 model 被丢掉 → 重新打开
+  // 时新 model 的 _onModelAdded 把旧标记原样重绘，还会被夹到新文件的行数范围内。
+  //
+  // 而且这条对每个 LSP 语言都必然发生：projectModels 只装 ts/tsx/js/jsx/mjs/cjs/json 七种
+  // 扩展名，和 23 种 MANAGED_LANGS 零交集，所以 Python/Rust/Go 文件关闭时一定走 dispose。
+  const cleared = [];
+  const clear = load("_clearAllMarkersForModel", {
+    monaco: {
+      editor: {
+        getModelMarkers: () => ([
+          { owner: "lsp:python", startLineNumber: 12 },
+          { owner: "lsp:python", startLineNumber: 40 },
+          { owner: "task", startLineNumber: 3 },
+          { owner: null, startLineNumber: 1 },
+        ]),
+        setModelMarkers: (_m, owner, markers) => cleared.push([owner, markers.length]),
+      },
+    },
+  });
+  clear({ uri: "file:///ws/app.py" });
+  // owner 从现有标记里反查，不写死列表：owner 有 typescript / javascript / json /
+  // lsp:<23 种语言> / 任务运行器，写死必然漏一个。
+  assert.deepEqual(cleared.sort(), [["lsp:python", 0], ["task", 0]],
+    "每个 owner 都要清空一次，重复的只清一次，空 owner 跳过");
+
+  // 三个销毁点都必须先清再销毁——漏一个就等于这条 bug 还在那条路径上活着。
+  assert.match(extractFn("closeFile"), /_clearAllMarkersForModel\(f\.model\); f\.model\.dispose\(\)/,
+    "关标签页是主路径");
+  assert.match(extractFn("_dropProjectModel"), /_clearAllMarkersForModel\(model\); model\.dispose\(\)/,
+    "切换/刷新项目时丢弃预加载模型也要清");
+  assert.match(SRC, /_clearAllMarkersForModel\(tab\.model\);\s*\n\s*tab\.model\.dispose\(\)/,
+    "分屏标签页同理");
+
+  // 它跑在关闭文件的热路径上，拿到已废弃的 model 不能抛。
+  assert.doesNotThrow(() => clear(null));
+});
+
+test("程序化改完文件必须告诉语言服务器，否则报错永远停在旧版", () => {
+  // attachModelListeners 的内容监听第一行就是 if (_programmaticModelUpdates.has(model)) return;
+  // ——它同时挡掉了 lspManager.didChange。抑制本身是对的（程序化更新不该被当成用户输入去触发
+  // 自动保存、脏标记、预览接管），但语言服务器不属于"用户输入"的范畴，它只需要知道文件现在是
+  // 什么内容。
+  //
+  // 漏掉的后果正是用户报的那条：智能体把文件重写了，编辑器显示新内容，语言服务器手里还是旧的，
+  // 于是继续对着早就不存在的代码报错，而且**不会自己纠正**——服务器只有收到 didChange 才重新
+  // 分析。改了、存了、重开都没用，因为重开又走一次程序化写入。
+  const told = [];
+  const load2 = (name) => load(name, {
+    _programmaticModelUpdates: new WeakSet(),
+    lspManager: { didChange: (p) => told.push(p) },
+    monaco: { Range: function () {} },
+    _notifyLspProgrammaticChange: undefined,
+  });
+  // 两个辅助函数都要覆盖：一个整体 setValue，一个流式追加。
+  const notify = load("_notifyLspProgrammaticChange", { lspManager: { didChange: (p) => told.push(p) } });
+  const setV = load("_setModelValueProgrammatically", {
+    _programmaticModelUpdates: new WeakSet(), _notifyLspProgrammaticChange: notify,
+  });
+  const model = (init) => {
+    let v = init;
+    return { uri: { fsPath: "/ws/a.ts" }, getValue: () => v, setValue: (x) => { v = x; } };
+  };
+
+  told.length = 0;
+  assert.equal(setV(model("旧"), "新"), true);
+  assert.deepEqual(told, ["/ws/a.ts"], "内容变了就要通知");
+
+  // 内容没变就提前返回，不该白发一次 didChange。
+  told.length = 0;
+  const same = model("同");
+  assert.equal(setV(same, "同"), false);
+  assert.equal(told.length, 0);
+
+  // 通知放在辅助函数内部，不是逐个调用点——调用点有七处，靠人记得补第八处靠不住。
+  assert.match(extractFn("_setModelValueProgrammatically"), /_notifyLspProgrammaticChange\(model\)/);
+  assert.match(extractFn("_appendModelTextProgrammatically"), /_notifyLspProgrammaticChange\(model\)/);
+  // 拿不到路径时要安全跳过，不能抛——它跑在编辑器写入的热路径上。
+  assert.doesNotThrow(() => notify({ uri: {} }));
+  assert.doesNotThrow(() => notify(null));
 });
 
 test("跨文件编辑必须落盘，而不是只改内存", async () => {

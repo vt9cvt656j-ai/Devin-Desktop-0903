@@ -4159,11 +4159,35 @@ const _programmaticModelUpdates = new WeakSet();
 // on the same preview transaction.
 const _liveEditorWritePreviews = new Map();
 
+/**
+ * 程序化改完 model 之后，**必须**把新内容告诉语言服务器。
+ *
+ * `attachModelListeners` 的内容监听第一行就是 `if (_programmaticModelUpdates.has(model)) return;`
+ * ——它同时挡掉了 `lspManager.didChange`。这个抑制本身是对的（程序化更新不该被当成用户输入去
+ * 触发自动保存、脏标记、预览接管），但语言服务器不在"用户输入"的范畴里：它只需要知道文件现在
+ * 是什么内容。
+ *
+ * 漏掉的后果正是"报错一直是旧版的、怎么改都不消失"：智能体把文件重写了、编辑器里显示的是新
+ * 内容，而语言服务器手里还是旧的，于是它继续对着早就不存在的代码报错，并且**不会自己纠正**
+ * ——服务器只有收到 didChange 才会重新分析。用户改了、存了、重开都没用，因为每次重开又会
+ * 走一次程序化写入。
+ *
+ * 通知放在这两个辅助函数内部，而不是逐个调用点上：调用点有七处，靠人记得补第八处是靠不住的。
+ * path 从 model 的 URI 反推，所以不需要调用方多传参数。
+ */
+function _notifyLspProgrammaticChange(model) {
+  try {
+    const path = model?.uri?.fsPath;
+    if (path) lspManager?.didChange(path, model);
+  } catch { /* 语言服务没起来就算了 */ }
+}
+
 function _setModelValueProgrammatically(model, content) {
   if (!model || model.getValue() === content) return false;
   _programmaticModelUpdates.add(model);
   try { model.setValue(content); }
   finally { _programmaticModelUpdates.delete(model); }
+  _notifyLspProgrammaticChange(model);
   return true;
 }
 
@@ -4181,6 +4205,7 @@ function _appendModelTextProgrammatically(model, text) {
       model.setValue(model.getValue() + text);
     }
   } finally { _programmaticModelUpdates.delete(model); }
+  _notifyLspProgrammaticChange(model);
   return true;
 }
 
@@ -6338,7 +6363,8 @@ function _mpmMountSqlEditor(tab, mountEl) {
 function _mpmDisposeQueryModel(tab) {
   if (tab?.model) {
     if (_mpmSqlEditor?.getModel() === tab.model) _mpmSqlEditor.setModel(null);
-    tab.model.dispose();
+    _clearAllMarkersForModel(tab.model);
+  tab.model.dispose();
     tab.model = null;
   }
 }
@@ -8023,7 +8049,8 @@ async function closeFile(path, { force = false, discardBuffer = false } = {}) {
     }
   }
   if (!f.isInspection) lspManager?.didClose(path);
-  if (!projectModels.has(path) && f.model) f.model.dispose();
+  // 销毁前先清标记——Monaco 不会替 file: 的 URI 清，标记会活过 dispose 并在重新打开时被重绘。
+  if (!projectModels.has(path) && f.model) { _clearAllMarkersForModel(f.model); f.model.dispose(); }
   openFiles.delete(path);
   if (activePath === path) {
     activePath = null;
@@ -8309,6 +8336,38 @@ async function _persistBackgroundModel(path, model) {
   }
 }
 
+/**
+ * 销毁一个 model 之前，把它身上所有 owner 的诊断标记清干净。
+ *
+ * **这是"报错一直是旧版的、怎么改都不消失"的根。** Monaco 的 MarkerDecorationsService 在
+ * 模型被移除时只清理 `inMemory` / `internal` / `vscode` 这三种 scheme 的标记
+ * （markerDecorationsService.js 的 `_onModelRemoved`），`file:` 是**故意放过**的——那是给
+ * 真编辑器准备的行为，因为 VS Code 那边有工作区级的诊断所有权。我们没有那一层。
+ *
+ * 于是这条链成立：文件报了错 → 关标签页 → model 被销毁（LSP 托管的 23 种语言必然走到这条
+ * 分支：projectModels 只装 ts/js/json 那七种扩展名，和 MANAGED_LANGS 零交集）→ 标记留在
+ * MarkerService 里，按 file: URI 存着 → 服务器随后发来的「已无错误」空诊断因为没有 model
+ * 被丢掉 → 用户重新打开这个文件 → 新 model 建好，MarkerDecorationsService 的 `_onModelAdded`
+ * 把**旧标记原样重绘**，还会被 validateRange 夹到新文件的行数范围内。
+ *
+ * 所以用户看到的是：改好了、存了盘、关掉重开，红波浪线还在，位置还错——因为那根本不是这次
+ * 分析出来的结果，是上一辈子的。
+ *
+ * owner 从现有标记里反查，不写死列表：owner 有 "typescript" / "javascript" / "json" /
+ * "lsp:<语言>"（23 种）/ 任务运行器那个，写死必然漏。
+ */
+function _clearAllMarkersForModel(model) {
+  if (!model) return;
+  try {
+    const owners = new Set(
+      monaco.editor.getModelMarkers({ resource: model.uri }).map((m) => m.owner).filter(Boolean),
+    );
+    for (const owner of owners) {
+      try { monaco.editor.setModelMarkers(model, owner, []); } catch {}
+    }
+  } catch { /* model 已经废了就算了 */ }
+}
+
 function _isMissingFileError(error) {
   return /No such file or directory|not found|does not exist|cannot find|ENOENT|os error 2|找不到(?:指定的)?文件|文件不存在/i.test(String(error?.message || error || ""));
 }
@@ -8319,7 +8378,7 @@ function _dropProjectModel(path) {
   if (openFiles.has(path)) return;
   try {
     const model = monaco.editor.getModel(monaco.Uri.file(path));
-    if (model) model.dispose();
+    if (model) { _clearAllMarkersForModel(model); model.dispose(); }
   } catch {}
 }
 
