@@ -58,11 +58,15 @@ impl Clone for NativeHandle {
                 // Windows COM 对象需要 AddRef
                 #[cfg(target_os = "windows")]
                 {
-                    use windows::Win32::System::Com::IUnknown;
+                    use windows::core::{IUnknown, Interface};
                     unsafe {
-                        let unknown = *handle as *mut IUnknown;
-                        if !unknown.is_null() {
-                            (*unknown).AddRef();
+                        let raw = *handle as *mut std::ffi::c_void;
+                        if !raw.is_null() {
+                            // windows 0.58 不再暴露 AddRef：借出指针后 clone 一次让计数 +1，
+                            // forget 掉借用的那一份，净效果与 AddRef 相同。
+                            let borrowed = IUnknown::from_raw(raw);
+                            std::mem::forget(borrowed.clone());
+                            std::mem::forget(borrowed);
                         }
                     }
                 }
