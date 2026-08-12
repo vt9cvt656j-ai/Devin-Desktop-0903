@@ -1,6 +1,7 @@
 //! Windows UI Automation 实现
 
 use crate::error::{Error, Result};
+use windows::core::Interface;
 use crate::platform::desktop_element::*;
 use windows::Win32::Foundation::*;
 use windows::Win32::System::Com::*;
@@ -16,6 +17,7 @@ impl WindowsUIAutomation {
         unsafe {
             // 初始化 COM
             CoInitializeEx(None, COINIT_MULTITHREADED)
+                .ok()
                 .map_err(|e| Error::System(format!("COM 初始化失败: {:?}", e)))?;
             
             // 创建 UI Automation 实例
@@ -95,15 +97,18 @@ impl DesktopElementControl for WindowsUIAutomation {
                     .unwrap_or_default();
                 
                 let is_enabled = elem.CurrentIsEnabled()
-                    .unwrap_or(false)
+                    .unwrap_or(windows::Win32::Foundation::FALSE)
                     .as_bool();
                 
                 let is_visible = !elem.CurrentIsOffscreen()
-                    .unwrap_or(true)
+                    .unwrap_or(windows::Win32::Foundation::TRUE)
                     .as_bool();
                 
                 let handle = elem.as_raw() as isize;
-                elem.AddRef(); // 句柄要存进 DesktopElement，elem 本体马上 drop（Release）；不补引用计数就是悬垂指针
+                // 句柄要存进 DesktopElement，elem 本体马上 drop（Release）；不补引用计数就是悬垂指针。
+                // windows 0.58 不再暴露 AddRef：clone 一次让计数 +1，再 forget 掉这份克隆，
+                // 净效果与 AddRef 相同（elem 自身 drop 时的 Release 由这次 +1 抵掉）。
+                std::mem::forget(elem.clone());
                 
                 Ok(Some(DesktopElement {
                     name,
@@ -169,15 +174,15 @@ impl DesktopElementControl for WindowsUIAutomation {
                         .unwrap_or_default();
                     
                     let is_enabled = elem.CurrentIsEnabled()
-                        .unwrap_or(false)
+                        .unwrap_or(windows::Win32::Foundation::FALSE)
                         .as_bool();
                     
                     let is_visible = !elem.CurrentIsOffscreen()
-                        .unwrap_or(true)
+                        .unwrap_or(windows::Win32::Foundation::TRUE)
                         .as_bool();
                     
                     let handle = elem.as_raw() as isize;
-                    elem.AddRef(); // 增加引用计数，防止提前释放
+                    std::mem::forget(elem.clone()); // 等价于 AddRef：防止提前释放
 
                     results.push(DesktopElement {
                         name,
@@ -201,11 +206,13 @@ impl DesktopElementControl for WindowsUIAutomation {
     fn click_element(&self, element: &DesktopElement) -> Result<()> {
         if let Some(NativeHandle::Windows(handle)) = element.native_handle {
             unsafe {
+                // 借来的裸指针：from_raw 会接管所有权，函数结束时 drop 会多 Release 一次。
+                // 先 clone 补回一次计数再 forget，保证借用期间不影响调用方持有的那一份。
                 let elem = IUIAutomationElement::from_raw(handle as *mut _);
-                elem.AddRef(); // 借用指针，增加引用计数
+                std::mem::forget(elem.clone());
                 
                 // 尝试调用 Invoke 模式（适用于按钮）
-                let invoke_pattern: Result<IUIAutomationInvokePattern, _> = elem.GetCurrentPatternAs(UIA_InvokePatternId);
+                let invoke_pattern = elem.GetCurrentPatternAs::<IUIAutomationInvokePattern>(UIA_InvokePatternId);
                 
                 if let Ok(pattern) = invoke_pattern {
                     pattern.Invoke()
@@ -224,8 +231,10 @@ impl DesktopElementControl for WindowsUIAutomation {
     fn type_into_element(&self, element: &DesktopElement, text: &str) -> Result<()> {
         if let Some(NativeHandle::Windows(handle)) = element.native_handle {
             unsafe {
+                // 借来的裸指针：from_raw 会接管所有权，函数结束时 drop 会多 Release 一次。
+                // 先 clone 补回一次计数再 forget，保证借用期间不影响调用方持有的那一份。
                 let elem = IUIAutomationElement::from_raw(handle as *mut _);
-                elem.AddRef(); // 借用指针，增加引用计数
+                std::mem::forget(elem.clone());
                 
                 // 使用 Value 模式设置文本
                 let value_pattern: IUIAutomationValuePattern = elem.GetCurrentPatternAs(UIA_ValuePatternId)
@@ -245,8 +254,10 @@ impl DesktopElementControl for WindowsUIAutomation {
     fn get_element_text(&self, element: &DesktopElement) -> Result<String> {
         if let Some(NativeHandle::Windows(handle)) = element.native_handle {
             unsafe {
+                // 借来的裸指针：from_raw 会接管所有权，函数结束时 drop 会多 Release 一次。
+                // 先 clone 补回一次计数再 forget，保证借用期间不影响调用方持有的那一份。
                 let elem = IUIAutomationElement::from_raw(handle as *mut _);
-                elem.AddRef(); // 借用指针，增加引用计数
+                std::mem::forget(elem.clone());
                 
                 let name = elem.CurrentName()
                     .unwrap_or_default()

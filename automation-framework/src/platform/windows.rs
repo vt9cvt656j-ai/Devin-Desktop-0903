@@ -6,6 +6,7 @@ use crate::types::{ScreenInfo, WindowInfo};
 use windows::Win32::Foundation::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::Win32::Graphics::Gdi::*;
+use windows::core::PCWSTR;
 use std::mem;
 
 pub struct WindowsControl;
@@ -50,6 +51,7 @@ impl WindowControl for WindowsControl {
             
             // 激活窗口
             SetForegroundWindow(hwnd)
+                .ok()
                 .map_err(|e| Error::System(format!("激活窗口失败: {:?}", e)))?;
         }
         
@@ -93,10 +95,10 @@ impl WindowControl for WindowsControl {
             let height = GetSystemMetrics(SM_CYSCREEN) as u32;
             
             // 获取 DPI 缩放
-            let hdc = GetDC(HWND(0));
+            let hdc = GetDC(HWND(std::ptr::null_mut()));
             let dpi_x = GetDeviceCaps(hdc, LOGPIXELSX);
             let scale_factor = dpi_x as f64 / 96.0;
-            ReleaseDC(HWND(0), hdc);
+            ReleaseDC(HWND(std::ptr::null_mut()), hdc);
             
             Ok(ScreenInfo {
                 width,
@@ -156,12 +158,7 @@ fn find_hwnd_by_title(title: &str) -> Result<HWND> {
     let title_wide: Vec<u16> = title.encode_utf16().chain(Some(0)).collect();
     
     unsafe {
-        let hwnd = FindWindowW(PCWSTR::null(), PCWSTR(title_wide.as_ptr()));
-        
-        if hwnd.0 == 0 {
-            return Err(Error::ElementNotFound(format!("未找到窗口: {}", title)));
-        }
-        
-        Ok(hwnd)
+        FindWindowW(PCWSTR::null(), PCWSTR(title_wide.as_ptr()))
+            .map_err(|_| Error::ElementNotFound(format!("未找到窗口: {}", title)))
     }
 }
