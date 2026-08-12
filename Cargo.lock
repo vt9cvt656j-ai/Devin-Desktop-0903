@@ -3264,7 +3264,7 @@ dependencies = [
 
 [[package]]
 name = "michael-ide"
-version = "0.3.90"
+version = "0.3.91"
 dependencies = [
  "bcrypt",
  "bzip2",
