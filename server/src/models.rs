@@ -2914,10 +2914,14 @@ fn compute_cost(
     // Price priority: admin's PER-MODEL override (model_in/out, set in the backend per enabled
     // model) wins; else the built-in official catalog; else the connection-level input/output
     // price. This lets each checked model be priced individually while keeping the catalog default.
-    let (off_in, off_out) = if model_in > 0.0 || model_out > 0.0 {
-        (model_in, model_out)
+    // 价格来自哪一层，决定了缓存价该跟谁：来自模型（每模型覆盖或官方目录）就按模型的输入价
+    // 推导；只有当输入价本身就是连接级兜底时，连接级的缓存价才是同一层配置、才该生效。
+    let (off_in, off_out, price_is_per_model) = if model_in > 0.0 || model_out > 0.0 {
+        (model_in, model_out, true)
+    } else if let Some((cat_in, cat_out)) = official_price(model_id) {
+        (cat_in, cat_out, true)
     } else {
-        official_price(model_id).unwrap_or((admin_in, admin_out))
+        (admin_in, admin_out, false)
     };
     if off_in <= 0.0 && off_out <= 0.0 {
         return 0; // no known price for this model → can't compute a real cost
@@ -2936,15 +2940,24 @@ fn compute_cost(
         .unwrap_or(0.0);
     // Per-token CACHE prices: admin's explicit price if set (>0), else the old factor off
     // input. cache READ is cheap, cache CREATE/write is a premium — billed separately now.
-    let read_price = if cache_read_price > 0.0 {
-        cache_read_price
-    } else {
+    // 缓存价必须跟着**这个模型**的输入价走，不能用一个连接级常数盖住所有模型。
+    //
+    // 上游的缓存价本来就是输入价的固定倍数（读 0.1×、写 1.25×，5 分钟 TTL）。连接级那两列
+    // 只能填一个数，而一条连接上同时跑 Opus($5)、Sonnet($5)、Fable($10)——线上就填着 3.75，
+    // 那是 Sonnet 的写入价（1.25×3），于是 Opus 的缓存写入按 3.75 计，正确值是 6.25；Fable
+    // 应当是 12.5。实测 30 天里仅这一项就少收约 $119，而缓存写入恰恰是单价最贵的一类 token。
+    //
+    // 所以：只要这个模型有自己的输入价（每模型覆盖或官方目录），就按倍数推导；连接级那两列
+    // 退回成"这个模型压根没有输入价"时的兜底。倍数不对的模型仍可在每模型价里单独校正。
+    let read_price = if price_is_per_model || cache_read_price <= 0.0 {
         off_in * CACHE_READ_FACTOR
-    };
-    let write_price = if cache_create_price > 0.0 {
-        cache_create_price
     } else {
+        cache_read_price
+    };
+    let write_price = if price_is_per_model || cache_create_price <= 0.0 {
         off_in * CACHE_WRITE_FACTOR
+    } else {
+        cache_create_price
     };
     // Split input into plain (full price) + cache-read + cache-create, bill each at its own
     // unit price; output at off_out. Then × 倍率. Anthropic reports input EXCLUDING cached;
@@ -7617,6 +7630,46 @@ mod billing_tests {
     // Claude Opus ($5/$25), 22k in + 2k out:
     //   (22000·5 + 2000·25)/1e6 = $0.16 = 16¢ real cost. × 倍率 3 → 48¢ billed.
     #[test]
+    /// 缓存价跟着模型走，不被连接级那一个数盖住。
+    ///
+    /// 线上 Claude 连接的 cache_create_price 填的是 3.75 —— 那是 Sonnet 的写入价（1.25×$3）。
+    /// 同一条连接上还跑着 Opus（$5，应为 6.25）和 Fable（$10，应为 12.5）。缓存写入是单价最贵
+    /// 的一类 token，30 天实测仅此一项少收约 $119。连接级两列只在这个模型压根没有输入价时兜底。
+    #[test]
+    fn cache_prices_follow_the_model_not_the_connection() {
+        // Anthropic 形状：出现 cache_read_input_tokens 才走 Anthropic 分支
+        // input_tokens 必须非零：compute_cost 在 prompt 和 completion 同时为 0 时提前返回 0，
+        // 所以"纯缓存写入"这一形状本身也是不计费的（另一个洞，不在这条测试的范围内）。
+        let usage = json!({
+            "input_tokens": 1, "output_tokens": 0,
+            "cache_read_input_tokens": 0, "cache_creation_input_tokens": 1_000_000,
+        });
+        let cents = |model: &str, conn_write: f64| {
+            compute_cost(Some(&usage), model, 1.0, 0.0, 0.0, 0.0, conn_write, 0.0, 0.0)
+        };
+        // 100 万缓存写入 token，倍率 1：应当 = 1.25 × 该模型输入价，单位美分。
+        assert_eq!(cents("claude-opus-4-8", 3.75), 625, "Opus 写入应为 1.25×$5=$6.25");
+        assert_eq!(cents("claude-sonnet-5", 3.75), 375, "Sonnet 写入应为 1.25×$3=$3.75");
+        assert_eq!(cents("claude-fable-5", 3.75), 1250, "Fable 写入应为 1.25×$10=$12.50");
+        // 连接级那个数不得再盖住任何有自己输入价的模型。
+        assert_eq!(
+            cents("claude-opus-4-8", 3.75),
+            cents("claude-opus-4-8", 999.0),
+            "连接级缓存价不能影响一个有自己输入价的模型"
+        );
+        // 但模型没有输入价时，它仍然是兜底（否则就成了白送）。
+        assert_eq!(
+            compute_cost(Some(&usage), "some-unlisted-model", 1.0, 0.0, 0.0, 0.0, 3.75, 0.0, 0.0),
+            0,
+            "没有输入价也没有连接价 → 0（这是另一个已知洞，此处只固定现状）"
+        );
+        assert_eq!(
+            compute_cost(Some(&usage), "some-unlisted-model", 1.0, 2.0, 8.0, 0.0, 3.75, 0.0, 0.0),
+            375,
+            "只有连接级输入价时，连接级缓存价仍然兜底"
+        );
+    }
+
     fn real_cost_times_rate() {
         let usage =
             json!({"prompt_tokens": 22000, "completion_tokens": 2000, "total_tokens": 24000});
