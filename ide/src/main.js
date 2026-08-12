@@ -4205,6 +4205,16 @@ function attachModelListeners(path, model) {
       if (_liveEditorWritePreviews.get(path) === preview) _liveEditorWritePreviews.delete(path);
     }
     markDirty(path, true);
+    // markDirty 对**没打开**的文件是空操作（它第一行就是 openFiles.get(path) 拿不到就 return），
+    // 而这里的 model 大多数正是没打开的：预加载的 60 个、LSP 为跨文件分析懒建的那些。
+    //
+    // 于是 F2 跨文件重命名会这样收场：当前文件改了、存了；另一个文件的 model 也改了，但没有
+    // openFiles 条目、没有 dirty 标记、自动保存的触发器（只挂在活动编辑器上）也够不着它。
+    // 磁盘上一个文件导入新名字、另一个文件导出旧名字——项目坏了，一句提示都没有。再打开那个
+    // 文件时它会从磁盘重读，改动直接蒸发。
+    //
+    // 这里补上：后台 model 的非程序化改动就是一次工作区编辑，必须落盘。
+    if (!openFiles.has(path)) _scheduleBackgroundPersist(path, model);
     if (_imeComposing) {
       if (!_imeFlushCallbacks.some(cb => cb._lspPath === path)) {
         const cb = () => lspManager?.didChange(path, model);
@@ -8215,6 +8225,60 @@ async function _writeOpenFileSnapshot(path, snapshot) {
     f.externalDeleted = false;
   } finally {
     if (f._savePromise === op) f._savePromise = null;
+    if (_pendingEditorWrites.get(path) === pending) _pendingEditorWrites.delete(path);
+  }
+}
+
+/**
+ * 把**没在编辑器里打开**的文件的改动落盘。
+ *
+ * 谁会改这种文件：F2 跨文件重命名、跨文件的快速修复（自动补 import、move to new file）、
+ * 语言服务器主动发来的 workspace/applyEdit。Monaco 的 standalone 批量编辑服务只做
+ * `model.pushEditOperations(...)`——纯内存，从不写盘，而 App 的自动保存只挂在活动编辑器的
+ * onDidChangeModelContent 上，够不着这些后台 model。
+ *
+ * 防抖是必须的：一次重命名会在同一个文件里推多条编辑，逐条写盘既慢又会互相 CAS 冲突。
+ */
+const _bgPersistTimers = new Map();
+const _BG_PERSIST_DELAY_MS = 700;
+function _scheduleBackgroundPersist(path, model) {
+  path = _coherentFilePath(path);
+  if (!path || !model) return;
+  clearTimeout(_bgPersistTimers.get(path));
+  _bgPersistTimers.set(path, setTimeout(() => {
+    _bgPersistTimers.delete(path);
+    _persistBackgroundModel(path, model).catch(() => {});
+  }, _BG_PERSIST_DELAY_MS));
+}
+
+async function _persistBackgroundModel(path, model) {
+  // 期间被打开了就交还给正常的自动保存——那条路有 dirty 标记和更完整的簿记。
+  if (openFiles.has(path)) return;
+  if (model.isDisposed?.()) return;
+  const snapshot = model.getValue();
+  let expected;
+  try {
+    expected = await backend.readTextFile(path);
+  } catch (e) {
+    // 文件没了（被删/被移走）。不要凭空把它写回来。
+    if (_isMissingFileError(e)) return;
+    throw e;
+  }
+  if (expected === snapshot) return; // 磁盘已经是这个内容
+  const op = backend.writeTextFileIfUnchanged(path, expected, snapshot);
+  const pending = { content: snapshot, op };
+  // 登记进来，watcher 才不会把我们自己的写当成外部改动去回读或报冲突。
+  _pendingEditorWrites.set(path, pending);
+  try {
+    await op;
+  } catch (e) {
+    // CAS 失败 = 从我们读到 expected 到写回之间，磁盘被别人改了。绝不覆盖，
+    // 而且必须说出来：这条路径上的失败以前是完全静默的。
+    try {
+      showToast(`⚠️ ${basename(path)} 的跨文件改动未能写入（磁盘已被其他程序修改）`, 6000);
+    } catch {}
+    throw e;
+  } finally {
     if (_pendingEditorWrites.get(path) === pending) _pendingEditorWrites.delete(path);
   }
 }
