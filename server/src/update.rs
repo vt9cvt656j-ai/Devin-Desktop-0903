@@ -257,6 +257,22 @@ fn github_request(state: &AppState, request: reqwest::RequestBuilder) -> reqwest
         .header("X-GitHub-Api-Version", "2022-11-28")
 }
 
+/// 取 Release 资产的**字节**，而不是它的元数据。
+///
+/// 必须和 `github_request` 分开：reqwest 的 `.header()` 是追加不是覆盖，所以
+/// `github_request(...).header("Accept", "application/octet-stream")` 发出去的是
+/// `Accept: application/vnd.github+json, application/octet-stream`，GitHub 认前者，
+/// 回的是资产的元数据 JSON。于是 latest.json 下载到的是一个没有 version 字段的对象，
+/// 校验报「manifest version must be semantic」，更新接口 502；安装包代理同理会把一段
+/// JSON 当成安装包发给客户端。这是自动更新一直不通的原因之一，而且它只在真的有一版
+/// 带 latest.json 的 Release 时才会暴露——在那之前这条路径从没被走到过。
+fn github_asset_request(state: &AppState, request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+    request
+        .bearer_auth(state.cfg.ide_release_github_token.trim())
+        .header("Accept", "application/octet-stream")
+        .header("X-GitHub-Api-Version", "2022-11-28")
+}
+
 fn github_transport_error(action: &str, error: reqwest::Error) -> AppError {
     AppError {
         status: StatusCode::BAD_GATEWAY,
@@ -523,13 +539,12 @@ async fn download_release_manifest(
         .get("id")
         .and_then(Value::as_u64)
         .ok_or_else(|| AppError::bad("latest.json asset id 无效"))?;
-    let response = github_request(
+    let response = github_asset_request(
         state,
         state
             .update_http
             .get(format!("{base}/releases/assets/{asset_id}")),
     )
-    .header("Accept", "application/octet-stream")
     .send()
     .await
     .map_err(|error| github_transport_error("读取 latest.json", error))?;
@@ -845,6 +860,233 @@ async fn latest_via_github_api(state: &AppState) -> Response {
     manifest_response(body, false)
 }
 
+/// `GET /api/ide/releases` — the published changelog.
+///
+/// Separate from `admin_release_status`, which exists to drive the build console and
+/// therefore includes drafts, run state and asset ids. This one is for people reading
+/// "what changed": published releases only, newest first, with their notes.
+///
+/// Notes are returned as raw text and rendered as text by the console — never as HTML.
+/// They are markdown written in GitHub's editor, and putting anyone's markdown through an
+/// HTML renderer on a page that carries a session is not worth the formatting.
+pub async fn releases(State(state): State<AppState>, _claims: Claims) -> Response {
+    if state.cfg.ide_release_github_token.trim().is_empty() {
+        return axum::Json(serde_json::json!({ "releases": [] })).into_response();
+    }
+    let Ok(base) = github_api_base(&state) else {
+        return axum::Json(serde_json::json!({ "releases": [] })).into_response();
+    };
+
+    let response = match github_request(
+        &state,
+        state.update_http.get(format!("{base}/releases?per_page=30")),
+    )
+    .send()
+    .await
+    {
+        Ok(r) if r.status().is_success() => r,
+        _ => return axum::Json(serde_json::json!({ "releases": [] })).into_response(),
+    };
+    let Ok(list) = response.json::<Value>().await else {
+        return axum::Json(serde_json::json!({ "releases": [] })).into_response();
+    };
+
+    let releases: Vec<Value> = list
+        .as_array()
+        .into_iter()
+        .flatten()
+        // Drafts are unpublished by definition — showing them would announce a version
+        // nobody can install, and drafts are exactly where unfinished notes live.
+        .filter(|r| !r.get("draft").and_then(Value::as_bool).unwrap_or(false))
+        .map(|r| {
+            let installers = r
+                .get("assets")
+                .and_then(Value::as_array)
+                .map(|assets| {
+                    assets
+                        .iter()
+                        .filter_map(|a| a.get("name").and_then(Value::as_str))
+                        .filter(|n| {
+                            let n = n.to_ascii_lowercase();
+                            n.ends_with(".dmg") || n.ends_with(".exe") || n.ends_with(".msi")
+                        })
+                        .count()
+                })
+                .unwrap_or(0);
+
+            serde_json::json!({
+                "tag": r.get("tag_name").and_then(Value::as_str).unwrap_or_default(),
+                "name": r.get("name").and_then(Value::as_str).unwrap_or_default(),
+                "published_at": r.get("published_at"),
+                "prerelease": r.get("prerelease").and_then(Value::as_bool).unwrap_or(false),
+                // Bounded: a release note is prose, and an unbounded field from an
+                // external service should not be relayed at whatever size it arrives.
+                "notes": r
+                    .get("body")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .chars()
+                    .take(20_000)
+                    .collect::<String>(),
+                "installers": installers,
+            })
+        })
+        .collect();
+
+    (
+        [(header::CACHE_CONTROL, "private, max-age=120")],
+        axum::Json(serde_json::json!({ "releases": releases })),
+    )
+        .into_response()
+}
+
+/// `GET /api/ide/downloads` — the installers a person can download right now.
+///
+/// Separate from `/api/ide/update`, and deliberately so. That endpoint answers "is there
+/// something newer than what you are running", which requires `latest.json` — the signed
+/// manifest the auto-updater needs. A release built before that file was generated has no
+/// manifest, so the update feed correctly answers "nothing", and the website concluded
+/// there was nothing to download and offered a sign-up link instead.
+///
+/// But the installers are right there in the release. Auto-updating and installing are
+/// different questions, and only the first one needs a manifest. This answers the second
+/// by reading the release's own asset list, so the download buttons work with whatever is
+/// actually published rather than waiting on a build pipeline.
+///
+/// Public: the URLs it returns are the proxy below, which is already public, and it
+/// reveals nothing beyond the filenames of a release meant to be installed.
+///
+/// **Which release counts.** This used to ask GitHub for `releases/latest`, which sounds
+/// like "the newest one" and is not: GitHub defines it as the newest release that is
+/// neither a draft **nor a prerelease**. On a 0.x product where prereleases are the normal
+/// way to ship, that means publishing a new build can leave both the download buttons and
+/// the version line on the site frozen at an old number — with nothing anywhere saying
+/// why. The site is not printing a hardcoded version; it prints this one, and this one had
+/// a way of quietly refusing to move.
+///
+/// So the newest **published** release wins, prerelease or not. Drafts stay excluded, and
+/// that is the deliberate signal for "not ready yet" — an unfinished build is a draft, not
+/// a published release nobody is meant to find.
+///
+/// A release with no installer in it is skipped rather than treated as the answer.
+/// Publishing a tag with the binaries still uploading used to take the downloads offline
+/// entirely; now the previous working release stays up until the new one has something to
+/// hand over.
+pub async fn downloads(State(state): State<AppState>) -> Response {
+    if state.cfg.ide_release_github_token.trim().is_empty() {
+        return no_downloads();
+    }
+    let Ok(base) = github_api_base(&state) else {
+        return no_downloads();
+    };
+
+    // 30 is far more than the number of releases anyone scrolls back through, and it is
+    // one request. GitHub returns them newest-first.
+    let response = match github_request(
+        &state,
+        state.update_http.get(format!("{base}/releases?per_page=30")),
+    )
+    .send()
+    .await
+    {
+        Ok(r) if r.status().is_success() => r,
+        _ => return no_downloads(),
+    };
+    let Ok(releases) = response.json::<Value>().await else {
+        return no_downloads();
+    };
+    let Some(releases) = releases.as_array() else {
+        return no_downloads();
+    };
+
+    let public = state.cfg.ide_update_public_base.trim_end_matches('/');
+
+    for release in releases {
+        // Drafts are invisible on purpose: they are the "still working on it" state, and a
+        // draft's assets are not reachable by the public proxy below either.
+        if release.get("draft").and_then(Value::as_bool).unwrap_or(false) {
+            continue;
+        }
+        let tag = release
+            .get("tag_name")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned();
+        if !safe_release_path_segment(&tag, 64) {
+            continue;
+        }
+
+        let names: Vec<&str> = release
+            .get("assets")
+            .and_then(Value::as_array)
+            .map(|assets| {
+                assets
+                    .iter()
+                    .filter_map(|a| a.get("name").and_then(Value::as_str))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        // A universal .dmg is preferred where one exists — it covers both Intel and Apple
+        // Silicon, which a per-architecture build does not. `.app.tar.gz` is the updater's
+        // payload, not something a person should be handed, so it is never offered here.
+        let pick = |wanted: &[&str]| -> Option<String> {
+            for suffix in wanted {
+                if let Some(name) = names
+                    .iter()
+                    .find(|n| n.to_ascii_lowercase().ends_with(suffix) && n.contains("universal"))
+                {
+                    return Some((*name).to_owned());
+                }
+                if let Some(name) = names.iter().find(|n| n.to_ascii_lowercase().ends_with(suffix))
+                {
+                    return Some((*name).to_owned());
+                }
+            }
+            None
+        };
+
+        let mac = pick(&[".dmg"]);
+        // .exe first: the NSIS installer is the one to hand a person, with the .msi kept as
+        // a fallback for machines where policy blocks it.
+        let windows = pick(&[".exe", ".msi"]);
+        if mac.is_none() && windows.is_none() {
+            // Nothing installable in this one — keep looking rather than reporting that
+            // the product has no downloads.
+            continue;
+        }
+
+        let url = |file: &str| format!("{public}/api/ide/update/download/{tag}/{file}");
+        let body = serde_json::json!({
+            "tag": tag,
+            "version": tag.trim_start_matches(|c: char| !c.is_ascii_digit()),
+            "prerelease": release.get("prerelease").and_then(Value::as_bool).unwrap_or(false),
+            "published_at": release.get("published_at"),
+            "mac": mac.as_deref().map(&url),
+            "windows": windows.as_deref().map(&url),
+        });
+
+        return (
+            // Five minutes. Long enough that this is not a GitHub API call per visitor,
+            // short enough that a release published now is on the site within one coffee.
+            [(header::CACHE_CONTROL, "public, max-age=300")],
+            axum::Json(body),
+        )
+            .into_response();
+    }
+
+    no_downloads()
+}
+
+/// Shape-compatible with a successful answer, so the caller has one thing to parse.
+fn no_downloads() -> Response {
+    (
+        [(header::CACHE_CONTROL, "public, max-age=60")],
+        axum::Json(serde_json::json!({ "mac": null, "windows": null })),
+    )
+        .into_response()
+}
+
 /// 公开的更新包代理：私有仓库的 Release 资产匿名拿不到，网关带 token 流式转发。
 /// 只暴露「已发布（非草稿）Release 的真实资产」，路径段严格白名单，token 绝不外泄
 ///（reqwest 跨域名重定向到 S3 时自动剥掉 Authorization）。
@@ -895,13 +1137,12 @@ pub async fn download_asset(
     let Some(asset_id) = asset_id else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    let response = match github_request(
+    let response = match github_asset_request(
         &state,
         state
             .update_http
             .get(format!("{base}/releases/assets/{asset_id}")),
     )
-    .header("Accept", "application/octet-stream")
     .send()
     .await
     {
@@ -935,8 +1176,8 @@ pub async fn download_asset(
 #[cfg(test)]
 mod tests {
     use super::{
-        valid_github_repo, valid_workflow_name, validate_manifest, validate_publish_manifest,
-        validate_release_tag,
+        safe_release_path_segment, valid_github_repo, valid_workflow_name, validate_manifest,
+        validate_publish_manifest, validate_release_tag,
     };
     use serde_json::json;
 
@@ -1012,5 +1253,68 @@ mod tests {
             }
         });
         assert!(validate_publish_manifest(&missing_windows, "v0.3.16").is_err());
+    }
+
+    /// 站点上那行版本号来自这里，所以"哪个 Release 算数"就是站点会显示哪个版本。
+    ///
+    /// 这一组断言盯的是选取规则本身：草稿排除、预发布**不**排除、没有安装包的那一版跳过。
+    /// 之前用的是 GitHub 的 `releases/latest` —— 名字像"最新一个"，实际含义是"最新的
+    /// 非草稿**且非预发布**"。0.x 阶段发预发布是常态，于是发了新版站点却纹丝不动，
+    /// 看起来就像版本号是写死的。
+    #[test]
+    fn the_release_picker_rules_are_the_ones_documented() {
+        let src = include_str!("update.rs");
+        let f = src
+            .split("pub async fn downloads(")
+            .nth(1)
+            .expect("downloads() 还在吗");
+        let body = &f[..f.find("\n/// Shape-compatible").unwrap_or(f.len())];
+
+        assert!(
+            body.contains("releases?per_page=30"),
+            "必须读整个列表；releases/latest 会把预发布一起漏掉",
+        );
+        assert!(
+            !body.contains("releases/latest"),
+            "回到 releases/latest 就等于把预发布重新拒之门外",
+        );
+        assert!(
+            body.contains(r#"release.get("draft")"#) && body.contains("continue"),
+            "草稿必须跳过：草稿是'还没做完'的信号，它的资产公开代理也拿不到",
+        );
+        assert!(
+            body.contains("mac.is_none() && windows.is_none()"),
+            "没有安装包的那一版要跳过，否则发一个还在传资产的 tag 就把下载整个打没了",
+        );
+        assert!(
+            body.contains("safe_release_path_segment(&tag, 64)"),
+            "tag 会拼进公开下载路径，必须先过白名单",
+        );
+    }
+
+    /// 资产名里的空格到不了这里——GitHub 上传时把它换成点。实测：
+    /// `Mr. Day One.app.tar.gz` 上传后叫 `Mr.Day.One.app.tar.gz`。
+    ///
+    /// 记下来是因为产品名带空格（Mr. Day One，旧名 Michael IDE 也带），很容易据此
+    /// 推断"白名单会把资产名拒掉、导致地址重写被跳过、更新静默失效"，然后去放宽这条
+    /// 校验。那是为一个不存在的问题削弱安全边界——这条测试就是拦这个的。
+    #[test]
+    fn release_asset_names_arrive_without_spaces_so_the_whitelist_stays_tight() {
+        // GitHub 规范化之后的真实形状
+        assert!(safe_release_path_segment("Mr.Day.One.app.tar.gz", 160));
+        assert!(safe_release_path_segment("Mr.Day.One_0.3.89_aarch64.dmg", 160));
+        assert!(safe_release_path_segment("v0.3.89", 64));
+
+        // 带空格的原始名不该被接受，也不需要被接受
+        assert!(!safe_release_path_segment("Mr. Day One.app.tar.gz", 160));
+
+        // 真正危险的形状
+        assert!(!safe_release_path_segment("../etc/passwd", 160));
+        assert!(!safe_release_path_segment("a/b.tar.gz", 160));
+        assert!(!safe_release_path_segment("a\\b.tar.gz", 160));
+        assert!(!safe_release_path_segment("..", 160));
+        assert!(!safe_release_path_segment(".hidden", 160));
+        assert!(!safe_release_path_segment("", 160));
+        assert!(!safe_release_path_segment(&"a".repeat(161), 160));
     }
 }
