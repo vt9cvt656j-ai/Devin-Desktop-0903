@@ -22873,3 +22873,30 @@ test("shadcn 对话框必须压过聊天输入框，否则面板会被输入框�
   assert.ok(hits.every((z) => z === 100000), `对话框该用本应用的模态层 100000，实际 ${hits}`);
   void zOf;
 });
+
+// 终端卡片：成 / 败不画左侧色条
+//
+// 用户原话：「终端卡片边上不需要有绿色和红色那种线条，这样看起来很丑」。他是对的——退出
+// 状态本来就写在卡片右上角的徽章里（✓ exit 0 / ✗ exit 1，自带图标和颜色），左边再来一条
+// 同色竖线是把同一件事说两遍；一屏堆上几张终端卡片，那几条竖线就只剩噪音。
+//
+// `--risk` 那条黄线是另一回事：它说的是"这条命令被判定为高风险"，不是退出码的重复，留着。
+test("终端卡片不再用左侧色条重复退出状态，但风险警示线留着", () => {
+  const rule = (selector) => {
+    const re = new RegExp(`(^|[},])\\s*[^{}]*\\.${selector}\\b[^{}]*\\{([^}]*)\\}`, "g");
+    return [...APP_CSS.matchAll(re)].map((m) => m[2]).join(";");
+  };
+  for (const cls of ["agent-term-card--ok", "agent-term-card--err"]) {
+    assert.doesNotMatch(rule(cls), /border-left/,
+      `.${cls} 又画上左侧色条了——退出状态徽章已经说过一遍`);
+  }
+  // 风险那条必须还在，否则"高风险命令"这个警示就没了视觉落点
+  assert.match(rule("agent-term-card--risk"), /border-left:\s*3px/);
+
+  // 类名本身要保留：JS 照常打上，折叠逻辑和别的测试按它选
+  assert.match(SRC, /agent-term-card--ok" : "agent-term-card--err/);
+  // 徽章仍然是状态的唯一出处——它要是也没了，成败就真的看不出来了
+  assert.match(SRC, /agent-term-status--err/);
+  assert.match(APP_CSS, /\.atc-term-exit--ok\s*\{/);
+  assert.match(APP_CSS, /\.atc-term-exit--err\s*\{/);
+});
