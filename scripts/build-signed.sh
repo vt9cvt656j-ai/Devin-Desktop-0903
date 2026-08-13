@@ -70,8 +70,10 @@ for f in src-tauri/gen/schemas/* src-tauri/binaries/* target/release/build/*/bui
 done
 echo "预清 provenance：$cleaned 个"
 
+# 只打 .app。DMG 那步会走 hdiutil internet-enable，在这台机器上稳定失败，而它跟
+# 签名身份、跟能不能跑毫无关系——让它把整条构建拖挂是纯粹的干扰。要 DMG 时单独加。
 npm run tauri build -- \
-  --bundles app,dmg \
+  --bundles "${MRDAYONE_BUNDLES:-app}" \
   --config "{\"bundle\":{\"macOS\":{\"signingIdentity\":\"$APPLE_SIGNING_IDENTITY\"}}}"
 
 APP="target/release/bundle/macos/Mr. Day One.app"
