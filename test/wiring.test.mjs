@@ -664,3 +664,33 @@ test("every semantic flag the client declares is one the gateway accepts and rou
       `"${flag}" is no longer inert — take it out of KNOWN_INERT instead of leaving the baseline stale`);
   }
 });
+
+test("思考深度必须真的到达模型：三条链路一条都不能断", () => {
+  const main = readFileSync(new URL("../src/main.js", import.meta.url), "utf8");
+  const ai = readFileSync(new URL("../src-tauri/src/ai.rs", import.meta.url), "utf8");
+
+  // 1) gpt-5.6 走的是 protocol="openai" 的透传线路，网关不改 reasoning_effort，
+  //    所以 xhigh 是真的能到模型的。默认停在 high 等于让不动转盘的人永远浅一档——
+  //    线上三天 44 次请求里 xhigh 零次，用户拿 opencode 跑同一个模型用的正是 xhigh。
+  const gpt56 = main.slice(main.indexOf("gpt[-_.]?5\\.6"), main.indexOf("gpt[-_.]?5\\.6") + 900);
+  assert.match(gpt56, /levels:\s*\[[^\]]*"xhigh"[^\]]*\]/, "gpt-5.6 的档位里必须有 xhigh");
+  assert.match(gpt56, /defaultLevel:\s*"xhigh"/, "gpt-5.6 的默认档位必须是 xhigh，不是 high");
+
+  // 2) 「推理 N tokens」是用户能拿到的唯一硬证据——没有它，档位拨了也看不出生效。
+  //    消费方一直都在（_recordUsage 读 reasoning_tokens），断的是两条传输层。
+  assert.match(main, /reasoning_tokens:\s*reasoning/, "网页传输层要把 reasoning_tokens 发上去");
+  assert.match(ai, /reasoning_tokens:\s*u32/, "AiEvent::Usage 要带 reasoning_tokens");
+  assert.match(ai, /completion_tokens_details"\]\["reasoning_tokens"/, "ai.rs 要解析 OpenAI 形状");
+  assert.match(ai, /output_tokens_details"\]\["reasoning_tokens"/, "ai.rs 要解析 Anthropic 形状");
+  assert.match(ai, /reasoning_tokens:\s*reasoning as u32/, "解析出来的值要真的发出去");
+
+  // 3) @model: 换族时先清后合。思考字段是按模型族成形的，Object.assign 不删多余键，
+  //    从 Claude 切到 GPT 会把 thinking:{type:"adaptive"} 一起带过去。
+  const routed = main.slice(main.indexOf("const routed = await _readyAiConfig"), main.indexOf("const routed = await _readyAiConfig") + 700);
+  assert.match(routed, /delete config\[k\]/, "@model: 切模型前要先清掉上一族的思考字段");
+  for (const k of ["reasoningEffort", "thinking", "thinkingConfig", "thinkingBudget"]) {
+    assert.ok(routed.includes(`"${k}"`), `清理列表里少了 ${k}`);
+  }
+  assert.ok(routed.indexOf("delete config[k]") < routed.indexOf("Object.assign(config, routed)"),
+    "必须先清再合，顺序反了等于没清");
+});

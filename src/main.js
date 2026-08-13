@@ -918,6 +918,14 @@ async function _realAiFetch(config, messages, tools, onEvent) {
               ? promptRaw + (cached || 0) + cacheWrite
               : promptRaw;
             const completion = Number(u.completion_tokens ?? u.output_tokens) || 0;
+            // 思考 token：_recordUsage 一直在读它（上下文环里的「思考 高 · 推理 1.2k」），
+            // 但两条传输层都没往上传，于是那半句永远不显示——用户拨了深度，拿不到任何回执。
+            // 各家字段名不同，全认一遍。
+            const reasoning = Number(
+              (u.completion_tokens_details && u.completion_tokens_details.reasoning_tokens)
+              ?? (u.output_tokens_details && u.output_tokens_details.reasoning_tokens)
+              ?? u.reasoning_tokens,
+            ) || 0;
             if (prompt > 0 || completion > 0) {
               onEvent({
                 kind: "usage",
@@ -925,6 +933,7 @@ async function _realAiFetch(config, messages, tools, onEvent) {
                 completion_tokens: completion,
                 cached_tokens: cached,
                 cache_creation_tokens: cacheWrite,
+                reasoning_tokens: reasoning,
               });
             }
           }
@@ -14120,7 +14129,16 @@ function _thinkingProfileFor(id) {
         kind: "reasoning_effort",
         configurable: true,
         levels: ["off", "low", "medium", "high", "xhigh", "max"],
-        defaultLevel: "high",
+        // 默认 xhigh，不是 high。
+        //
+        // 这一族在 GPT 线路上是 protocol="openai"，网关**原样透传** reasoning_effort
+        // （effort 天花板只存在于 Claude 那条 anthropic 桥里），所以 xhigh 是真的能到模型的。
+        // 但默认停在 high 意味着：不去手动拨那个转盘的人，永远比参照实现浅一档。
+        // 线上三天的遥测：gpt-5.6-sol 共 44 次请求，35 次 high、9 次没带档位，xhigh **零次**——
+        // 转盘上摆着这一档，实际没有一个人用到。用户拿 opencode 跑同一个模型、同一段提示词
+        // 时用的正是 xhigh，"感觉笨笨的"差的就是这一档。
+        // 编码/agent 任务本来就是 xhigh 的适用面，参照实现也把它当默认。
+        defaultLevel: "xhigh",
         effortMap: { off: "none", low: "low", medium: "medium", high: "high", xhigh: "xhigh", max: "max" },
         hint: t("model.thinking.reason.gpt56"),
       };
@@ -23464,6 +23482,13 @@ async function sendPrompt(text, attachments = [], readyConfig = null) {
     // a chip gets its baseUrl and apiKey too rather than only its name.
     const routed = await _readyAiConfig({ ...loadConfig(), model: _routedModel });
     if (!routed) return;
+    // 先清后合，不能直接打补丁：思考字段是**按模型族**成形的（Claude 发 thinking:{adaptive}、
+    // Gemini 发 thinkingConfig、OpenAI 发 reasoning_effort），而 _applyThinkingToConfig 只写
+    // 目标族用得上的那几个键。Object.assign 不删多余键，于是从 Claude 切到 GPT 时上一族的
+    // thinking:{type:"adaptive"} 会跟着一起发出去——对端要么忽略、要么直接 400。
+    for (const k of ["reasoningEffort", "thinkingBudget", "thinking", "thinkingConfig", "thinkingEffort", "customModelId"]) {
+      delete config[k];
+    }
     Object.assign(config, routed);
     text = _withoutModelToken(text);
     showToast(`本轮交给 ${_modelCatalogEntry(_routedModel)?.label || _routedModel}`);

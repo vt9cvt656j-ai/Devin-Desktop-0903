@@ -291,6 +291,14 @@ pub enum AiEvent {
         completion_tokens: u32,
         cached_tokens: u32,
         cache_creation_tokens: u32,
+        /// 这一轮模型**真的**花在思考上的 token 数。
+        ///
+        /// 前端一直有消费方（_recordUsage 读 completion_tokens_details.reasoning_tokens，
+        /// 上下文环里显示「思考 高 · 推理 1.2k」），但这个字段从来没被传上去过——于是
+        /// 那半句永远不显示，用户拨了深度也看不到任何回执，"思考深度都和假的一样"这句
+        /// 抱怨里有一半是这么来的：不是没生效，是没有任何东西证明它生效了。
+        /// 0 表示上游没报这个数（≠ 一定没思考）。
+        reasoning_tokens: u32,
     },
     Error {
         message: String,
@@ -2621,12 +2629,22 @@ async fn ai_chat_inner(
                 } else {
                     prompt_raw
                 };
+                // 思考 token 的字段名各家不一样，全都认一遍：
+                //   OpenAI / 兼容渠道 → completion_tokens_details.reasoning_tokens
+                //   Anthropic 原生    → output_tokens_details.reasoning_tokens
+                //   部分聚合渠道会平铺成顶层 reasoning_tokens
+                let reasoning = usage["completion_tokens_details"]["reasoning_tokens"]
+                    .as_u64()
+                    .or_else(|| usage["output_tokens_details"]["reasoning_tokens"].as_u64())
+                    .or_else(|| usage["reasoning_tokens"].as_u64())
+                    .unwrap_or(0);
                 if prompt > 0 || completion > 0 {
                     let _ = on_event.send(AiEvent::Usage {
                         prompt_tokens: prompt as u32,
                         completion_tokens: completion as u32,
                         cached_tokens: cached as u32,
                         cache_creation_tokens: cache_creation as u32,
+                        reasoning_tokens: reasoning as u32,
                     });
                 }
             }
