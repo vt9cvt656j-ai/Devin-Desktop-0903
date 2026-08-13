@@ -136,9 +136,16 @@ function openTag(s) {
   return `<span${attrs.length ? " " + attrs.join(" ") : ""}>`;
 }
 
-// CSI：ESC [ 参数 中间字符 最终字符。SGR 的最终字符是 `m`，其余（光标移动、清屏、
-// 私有模式 `?25l` 之类）解析出来直接丢。
+// CSI：ESC [ 参数 中间字符 最终字符。SGR（`m`）改样式，EL（`K`）擦行，CHA/CUF/CUB
+// （`G`/`C`/`D`）移动光标——这四类必须**执行**；其余（清屏、私有模式 `?25l` 之类）丢掉。
+//
+// 为什么 EL 不能丢：进度条的标准写法是「擦行 + 回车 + 写新的一帧」。只认 \r 不认 EL，
+// 等于把清空那一半吞了，于是新帧短于旧帧时旧帧的尾巴留在原地，拼出一个屏幕上从来没
+// 出现过的字符串——`  Compiling serde v1.0.200\x1b[2K\r    Finished` 会变成
+// `    Finishedserde v1.0.200`。这种伪造的 token 会一路进模型上下文，比不解析更糟。
 const CSI = /\x1b\[([0-9;:?]*)([ -\/]*)([@-~])/y;
+/** 一行最多这么宽。防 `ESC[100000C` 这类参数把行数组撑爆内存。 */
+const MAX_COL = 4096;
 // OSC：ESC ] … BEL 或 ESC \。设置窗口标题、iTerm 图片、超链接都走这里。
 const OSC = /\x1b\][\s\S]*?(?:\x07|\x1b\\)/y;
 
@@ -179,13 +186,38 @@ function parseAnsi(input, opts = {}) {
       CSI.lastIndex = i;
       const csi = CSI.exec(text);
       if (csi && csi.index === i) {
-        if (csi[3] === "m" && !csi[1].includes("?")) {
-          const params = csi[1]
-            .split(";")
-            .map((p) => (p === "" ? 0 : parseInt(p.split(":")[0], 10)))
-            .map((n) => (Number.isFinite(n) ? n : 0));
+        const isPrivate = csi[1].includes("?");
+        const params = isPrivate
+          ? []
+          : csi[1]
+              .split(";")
+              .map((p) => (p === "" ? 0 : parseInt(p.split(":")[0], 10)))
+              .map((n) => (Number.isFinite(n) ? n : 0));
+        const p0 = params.length ? params[0] : 0;
+        if (isPrivate) {
+          // 私有模式（显示/隐藏光标、开关备用屏）——没有可见效果，丢掉。
+        } else if (csi[3] === "m") {
           applySgr(state, params);
+        } else if (csi[3] === "K") {
+          // EL：0/缺省=擦到行尾，1=擦到行首，2=整行。光标位置不动。
+          if (p0 === 1) {
+            for (let k = 0; k <= col && k < line.length; k++) line[k] = { c: " ", s: { ...state } };
+          } else if (p0 === 2) {
+            line.length = 0;
+          } else {
+            if (line.length > col) line.length = col;
+          }
+        } else if (csi[3] === "G") {
+          // CHA：跳到第 n 列（1 起）。npm/yarn 的 spinner 用 `ESC[1G` 回行首，
+          // 丢掉它就等于光标永不归零，几百帧会堆成一行。
+          col = Math.min(MAX_COL, Math.max(0, (params.length ? p0 : 1) - 1));
+        } else if (csi[3] === "C") {
+          col = Math.min(MAX_COL, col + Math.max(1, p0));
+        } else if (csi[3] === "D") {
+          col = Math.max(0, col - Math.max(1, p0));
         }
+        // 其余（光标上下移、清屏、滚动区…）丢掉：捕获的是一段**流水**不是一块屏幕，
+        // 按屏幕语义去执行"上移一行再覆盖"只会把已经产出的证据抹掉。
         i = CSI.lastIndex;
         continue;
       }
@@ -199,14 +231,18 @@ function parseAnsi(input, opts = {}) {
       i += 1;
       continue;
     }
+    // 换行也算进 maxChars。否则一段几十万个 `\n` 的输出（日志刷屏、程序死循环打空行）
+    // 在 maxChars=5000 下照样整段进 innerHTML —— 那个上限就不是上限。
+    if (visible >= maxChars) { truncated = true; break; }
     if (ch === "\n") {
       flushLine();
+      visible += 1;
       i += 1;
       continue;
     }
     if (ch === "\r") {
       // 回到行首。`\r\n` 是普通换行，别把上一行清掉。
-      if (text[i + 1] === "\n") { flushLine(); i += 2; continue; }
+      if (text[i + 1] === "\n") { flushLine(); visible += 1; i += 2; continue; }
       col = 0;
       i += 1;
       continue;
@@ -216,8 +252,8 @@ function parseAnsi(input, opts = {}) {
       i += 1;
       continue;
     }
-    if (visible >= maxChars) { truncated = true; break; }
     // 覆盖写：col 落在已有内容上就替换，否则追加（中间空缺补空格）。
+    if (col >= MAX_COL) { i += 1; continue; }
     while (line.length < col) line.push({ c: " ", s: { ...state } });
     line[col] = { c: ch, s: { ...state } };
     col += 1;

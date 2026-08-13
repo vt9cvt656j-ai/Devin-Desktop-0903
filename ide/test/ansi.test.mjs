@@ -147,3 +147,68 @@ test("2MB 构建日志不会把界面卡住", () => {
   assert.equal(out.length, big.length);
   assert.ok(ms < 200, `纯文本 ${(big.length / 1e6).toFixed(1)}MB 花了 ${ms.toFixed(0)}ms`);
 });
+
+// ── 擦行 / 光标定位 ──────────────────────────────────────────────────
+// 进度条的标准写法是「擦行 + 回车 + 写新的一帧」。第一版只认 \r 不认 EL，把清空
+// 那一半吞了，于是新帧短于旧帧时旧帧的尾巴留在原地，拼出屏幕上从来没有过的字符串
+// ——而这些伪造的 token 会一路进模型上下文。
+
+test("ESC[K 擦到行尾——新帧比旧帧短时不会留下旧帧的尾巴", () => {
+  assert.equal(ansiToText(`Downloading 50%\r${E}[KDone`), "Done");
+  assert.equal(ansiToText(`abcdef\rXY${E}[0K`), "XY");
+});
+
+test("ESC[2K 擦整行——cargo 风格的重画不会拼出假版本号", () => {
+  assert.equal(
+    ansiToText(`  Compiling serde v1.0.200${E}[2K\r    Finished dev profile`),
+    "    Finished dev profile",
+  );
+  // 这条是回归的原样本：修之前得到的是 "    Finished dev profile00"
+  assert.ok(!ansiToText(`  Compiling serde v1.0.200${E}[2K\r    Finished`).includes("00"));
+});
+
+test("ESC[1K 擦到行首——光标不动，前面变成空白", () => {
+  assert.equal(ansiToText(`abcdef${E}[1K`), "      ");
+});
+
+test("ESC[1G 回到第一列——npm/yarn 的 spinner 不再堆成一行", () => {
+  const spinner = `⠋ Installing${E}[1G${E}[0K⠙ Installing${E}[1G${E}[0K✔ Installed`;
+  assert.equal(ansiToText(spinner), "✔ Installed");
+  assert.equal(
+    ansiToText(`sill resolveWithNewModule${E}[2K${E}[1Gadded 412 packages`),
+    "added 412 packages",
+  );
+});
+
+test("ESC[nC / ESC[nD 前后移动光标", () => {
+  assert.equal(ansiToText(`ab${E}[2Ccd`), "ab  cd");
+  assert.equal(ansiToText(`abcd${E}[2DXY`), "abXY");
+});
+
+test("裸 \\r 仍然只回列、不清行——没有 EL 就不该擅自清空", () => {
+  assert.equal(ansiToText("abcdef\rXY"), "XYcdef");
+});
+
+test("私有序列（ESC[?25l）不会被当成 EL/CHA 执行", () => {
+  assert.equal(ansiToText(`abc${E}[?2Kdef`), "abcdef");
+  assert.equal(ansiToText(`${E}[?25l隐藏光标${E}[?25h`), "隐藏光标");
+});
+
+test("清屏（ESC[2J）不擦掉已经产出的行——捕获的是流水不是屏幕", () => {
+  assert.equal(ansiToText(`第一行\n${E}[2J${E}[H第二行`), "第一行\n第二行");
+});
+
+test("maxChars 也约束换行——几十万个空行不能整段穿过去", () => {
+  const many = `${E}[0m` + "\n".repeat(200_000) + "x".repeat(50);
+  const out = ansiToText(many, { maxChars: 10 });
+  assert.ok(out.length < 40, `实际长度 ${out.length}`);
+  assert.match(out, /输出已截断/);
+  assert.ok(ansiToHtml(many, { maxChars: 10 }).length < 200, "HTML 侧同样要被约束住");
+});
+
+test("离谱的光标列数撑不爆行数组", () => {
+  const out = ansiToText(`a${E}[100000Cb`);
+  assert.ok(out.length <= 4100, `实际长度 ${out.length}`);
+  const back = ansiToText(`a${E}[999999Db`);
+  assert.equal(back, "b");
+});
