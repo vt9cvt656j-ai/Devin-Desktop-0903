@@ -6162,7 +6162,14 @@ test("AI provider config is forced through the Michael gateway with no user rout
   assert.match(extractFn("_aiConfigForRuntime"), /providerMode: AI_PROVIDER_GATEWAY/);
   assert.doesNotMatch(extractFn("_aiConfigForRuntime"), /customBaseUrl|customApiKey|customModel/);
   assert.match(SRC, /if \(!key && isGateway\)/, "the web request helper should fetch only the Michael gateway key");
-  assert.match(SRC, /if \(ideMode && _l0On\(_turnConfig\)\)/, "L0 must be decided from this turn's actual provider config");
+  // 判定必须来自**本轮真实的 provider config**（不是全局开关）。子智能体接进来之后条件
+  // 多了一个 `|| _isSub`，_l0On(_turnConfig) 这个核心判据没动。
+  assert.match(SRC, /const _wantsL0 = \(ideMode \|\| _isSub\) && _l0On\(_turnConfig\);/,
+    "L0 must be decided from this turn's actual provider config");
+  assert.match(SRC, /_turnConfig\.ideMode = _isSub \? "subagent" : ideMode;/,
+    "子智能体要用专属 mode，借 agent/explorer 会让网关 prepend 一份打架的系统提示词");
+  assert.match(SRC, /if \(!_isSub\) _l0Msgs = _l0MessagesWithSkills\(/,
+    "子智能体的消息不能被重写——它的系统提示词是本地的");
   assert.doesNotMatch(SRC, /const AI_PROVIDER_BYOK/);
   assert.doesNotMatch(INDEX_HTML, /aiProviderByok|settingsBaseUrl|settingsApiKey|settingsModel|本机直连|BYOK/);
   assert.match(INDEX_HTML, /模型请求固定走 Michael 网关/);
@@ -21290,7 +21297,10 @@ test("both L0 call sites preserve client-only context without duplicating gatewa
   const send = extractFn("sendPrompt");
   const sendL0 = send.slice(send.indexOf("if (_l0On(requestConfig))"), send.indexOf("const _mcTierPlain"));
   const agent = extractFn("_agentModelTurn");
-  const agentL0 = agent.slice(agent.indexOf("if (ideMode && _l0On(_turnConfig))"), agent.indexOf("delete _turnConfig.mcPrefix"));
+  // 锚点从 `if (ideMode && _l0On(...))` 改成 `if (_wantsL0)`：子智能体也要走这条路把工具
+  // 描述取回来（release 构建把描述全剥了），所以条件变成 (ideMode || _isSub) && _l0On(...)。
+  // 守的东西没变——下面几条断言仍然要求客户端专属上下文块一个不少。
+  const agentL0 = agent.slice(agent.indexOf("const _wantsL0 ="), agent.indexOf("delete _turnConfig.mcPrefix"));
 
   assert.match(sendL0, /const clientBlocks = languageBlock \+ adaptiveBlock/,
     "plain and lightweight L0 sends must preserve language and Adaptive preferences");
