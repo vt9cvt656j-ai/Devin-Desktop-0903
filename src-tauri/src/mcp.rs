@@ -1656,5 +1656,105 @@ mod tests {
 
         mcp_disconnect(session_name).await.unwrap();
     }
+
+    /// 对着一个**真的声明了 prompts** 的官方服务跑一遍取模板这条路。
+    ///
+    /// 加这条是因为斜杠菜单那个入口（`/服务:模板`）之前只在注入假数据的前端单测里验过。
+    /// 前端那半是纯逻辑，桩件跑得住；但"服务真的会回一段可用的提示词"这件事，只有对着
+    /// 真服务发一次 prompts/get 才算数。`server-everything` 是官方示例服务，tools /
+    /// resources / prompts 三类齐全，正好是这条路的对照物。
+    ///
+    /// 和上面那条一样 `#[ignore]`：它要联网下载包。跑法：
+    ///     cargo test --lib mcp::tests::live_official_everything -- --ignored --nocapture
+    #[tokio::test]
+    #[ignore = "downloads and calls the live official MCP everything server"]
+    async fn live_official_everything_server_returns_a_usable_prompt() {
+        let session_name = format!("official-everything-{}", std::process::id());
+        let discovery = mcp_connect_full(
+            session_name.clone(),
+            "npx".into(),
+            Some(vec![
+                "-y".into(),
+                "@modelcontextprotocol/server-everything".into(),
+            ]),
+            None,
+            Some(env!("CARGO_MANIFEST_DIR").into()),
+        )
+        .await
+        .expect("official everything MCP server should connect");
+
+        // 发现阶段：前端的斜杠菜单就是拿这份 prompts 列表生成 `服务:模板` 的。
+        assert!(
+            !discovery.prompts.is_empty(),
+            "everything 服务应当声明 prompts；拿不到的话斜杠菜单里什么都不会出现"
+        );
+
+        // **按形状挑，不按名字挑。** 第一版这里写死了 `simple_prompt` / `complex_prompt`，
+        // 是凭印象猜的——真实名字是 `simple-prompt` / `args-prompt`，于是测试红在一个
+        // 与被测行为无关的地方。上游改个名字就红的测试没有价值，前端也从不关心名字。
+        let no_args = discovery
+            .prompts
+            .iter()
+            .find(|p| {
+                p.arguments
+                    .as_array()
+                    .is_none_or(|a| a.iter().all(|x| x.get("required") != Some(&json!(true))))
+            })
+            .expect("至少要有一个不需要必填参数的模板");
+        assert!(
+            no_args.arguments.is_array(),
+            "arguments 必须是数组——前端拿它生成参数表单，不是数组会渲染成空表单"
+        );
+
+        // 取用阶段：这一步的返回值前端交给 _mcpResponseText 解包，再放进输入框。
+        let filled = mcp_get_prompt(session_name.clone(), no_args.name.clone(), None)
+            .await
+            .expect("prompts/get should succeed");
+        let messages = filled
+            .get("messages")
+            .and_then(Value::as_array)
+            .expect("prompts/get 必须回一个 messages 数组");
+        let text: String = messages
+            .iter()
+            .filter_map(|m| m.get("content")?.get("text")?.as_str())
+            .collect();
+        assert!(
+            !text.trim().is_empty(),
+            "模板展开后必须有正文，否则输入框里会是空的：{filled}"
+        );
+
+        // 带参数的那一个：前端会先弹表单收参数，再原样传过来。参数名同样从服务的声明里读，
+        // 不写死。
+        if let Some(with_args) = discovery
+            .prompts
+            .iter()
+            .find(|p| p.arguments.as_array().is_some_and(|a| !a.is_empty()))
+        {
+            let names: Vec<String> = with_args
+                .arguments
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|a| a.get("name")?.as_str().map(str::to_string))
+                .collect();
+            let args: serde_json::Map<String, Value> = names
+                .iter()
+                .map(|n| (n.clone(), Value::String("probe".into())))
+                .collect();
+            let out = mcp_get_prompt(
+                session_name.clone(),
+                with_args.name.clone(),
+                Some(Value::Object(args)),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("带参数的 prompts/get 失败（{}）：{e}", with_args.name));
+            assert!(
+                out.get("messages").and_then(Value::as_array).is_some_and(|m| !m.is_empty()),
+                "带参数的模板也必须回出正文：{out}"
+            );
+        }
+
+        mcp_disconnect(session_name).await.unwrap();
+    }
 }
 
