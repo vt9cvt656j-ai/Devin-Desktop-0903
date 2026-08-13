@@ -748,7 +748,10 @@ fn search_inner(
     //
     // 处理方式是"够用就不动"：只有当确实存在足够多的实心命中时，才把小节壳滤掉；
     // 否则宁可返回壳，也不返回空。
-    if design_mode {
+    // 只在**名额稀缺**的那条路上滤：工具路径只发 3 条，一条壳就是三分之一没了。
+    // 系统提示词的注入路径取 12 条、另有总量预算，滤掉小节只会让每条都换成大块，
+    // 白白把提示词顶大——那里一条壳的代价很小。
+    if design_mode && cap_override.is_none() {
         const MIN_USEFUL_BYTES: usize = 900;
         let solid = scored
             .iter()
