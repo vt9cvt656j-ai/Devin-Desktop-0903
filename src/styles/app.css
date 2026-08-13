@@ -6863,11 +6863,13 @@ button.agent-plan__fold--toggle:focus-visible { outline: 2px solid #1a73e8; outl
 .atc-confirm-btn--undo:hover {
   background: #f3f4f6; color: var(--atc-text);
 }
-.agent-tool-step--accepted { border-color: #1a7f3733; }
-.agent-tool-step--accepted .agent-tool-row::before {
-  content: ''; position: absolute; left: 0; top: 0; bottom: 0;
-  width: 3px; background: var(--atc-success); border-radius: 3px 0 0 3px;
-}
+/* 「已接受」**不做任何额外装饰**。
+   以前这里给卡片描一圈绿边、左侧再压一条 3px 的绿色竖条。问题是"改动已生效"是这类卡片的
+   常态——一屏十几张 Edited 卡就有十几圈绿边加十几条绿杠，成了背景噪音，还把整套卡片的
+   视觉语言（白底 + 极淡边 + 柔和阴影 + 左侧彩色图标 chip）冲掉了。
+   状态该由已有的元素表达：橙色铅笔 chip 说明这是编辑，右侧 `+5` 的 diffstat 说明改了多少，
+   都比一条纯装饰的竖线信息量大。所以这个修饰类现在只作为状态标记存在（JS 照常打，
+   .agent-tool-step--rejected 还要用它做对照），不带任何样式。 */
 .agent-tool-step--rejected { opacity: .55; }
 .agent-tool-step--rejected .agent-tool-row::before {
   content: ''; position: absolute; left: 0; top: 0; bottom: 0;
@@ -6994,7 +6996,6 @@ button.agent-plan__fold--toggle:focus-visible { outline: 2px solid #1a73e8; outl
 [data-theme="dark"] .atc-confirm, .dark .atc-confirm { background: #0d1117; }
 [data-theme="dark"] .atc-confirm-btn--accept, .dark .atc-confirm-btn--accept { background: #238636; border-color: #238636; }
 [data-theme="dark"] .atc-confirm-btn--reject:hover, .dark .atc-confirm-btn--reject:hover { background: #2c1014; }
-[data-theme="dark"] .agent-tool-step--accepted, .dark .agent-tool-step--accepted { border-color: #23863633; }
 
 /* ---- Agent segment-based inline rendering ---- */
 .agent-seg { animation: atcFadeIn .18s ease both; }
