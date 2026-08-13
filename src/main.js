@@ -14362,6 +14362,26 @@ function _applyThinkingToConfig(cfg, opts = {}) {
   // 默认；本条链路封顶在 high，所以 high 已经是这里能拿到的最深档。把 agent 轮压到 medium
   // 等于让它比参照实现浅两档，这正是「整体感觉好垃圾」的来源。
   // 保留的只有上限：max 在 agent 轮降到 high（省的是输出余量 64k→40k，不是思考深度）。
+  // 琐碎轮降到最浅档：一句"你好啊"不该花 24000 的思考预算。
+  //
+  // _shouldUseLightweightAgentTurn 判得很保守（action=answer、continuation=new、
+  // deliverySurface/changeScope/workspaceAction… 一律 none、无运行/外部义务、无任何
+  // 工程标记、没有待办计划步骤），这类轮次本来就已经在省系统提示词、跳过技能块和工作区
+  // 预热了——唯独思考预算照付。实测一句问候：总耗时 21s，模型 5.6s 就开始出字，
+  // 剩下十几秒全在"要不要问他修 bug / 要不要列菜单"上反复推演。
+  //
+  // 和下面那条一样，**显式选过档位的用户不受影响**。
+  if (opts.lightTurn && (profile.levels || []).length) {
+    let explicit = false;
+    try {
+      const saved = _loadThinkingPrefs()[preferenceId];
+      explicit = !!(saved && (profile.levels || []).includes(saved));
+    } catch {}
+    // 不降到 off：Fable/Mythos 没有 off（显式 disabled 是 400），而 adaptive 族
+    // 静默不发 thinking 反而会掉进"最贵的默认档"（见 _thinkingProfileFor 的说明）。
+    const shallowest = ["minimal", "low", "medium"].find((l) => (profile.levels || []).includes(l));
+    if (!explicit && shallowest && pref !== "off") pref = shallowest;
+  }
   if (opts.agentTurn && !opts.isComplexTask && pref === "max" && (profile.levels || []).includes("high")) {
     let explicit = false;
     try {
@@ -22991,9 +23011,20 @@ function _composerPrediction(sess) {
 
   if (fresh.length && !_predictionAlreadyUsed(sess, fresh[0].send)) return { src: "run", text: fresh[0].label, send: fresh[0].send };
 
-  const old = _runStateNextActionSuggestions(sess, { maxAgeMs: Infinity });
-  if (old.length) {
-    if (!_predictionAlreadyUsed(sess, old[0].send)) return { src: "resume", text: "继续上次：" + old[0].label, send: old[0].send };
+  // 「继续上次」这一档传的是 maxAgeMs: Infinity —— 它是给**打开软件那一刻**用的
+  // （上面 _runStateNextActionSuggestions 的注释写明了这一点）。但它永不过期，于是
+  // 只要这个会话跑过一次东西，5 分钟后前面几档静默之后，它就永远顶在最上面，把下面
+  // 那档「基于当前文件」的预测彻底压住：用户切文件、改选区、看着新代码，输入框里那句
+  // 灰字纹丝不动，而且推的还是一件早就做完的事——「预测不会实时变动 / 内容老是错的」
+  // 就是这么来的。
+  //
+  // 它只在**这个会话里用户还没发过话**时成立：那才是"接着上次继续"真正有意义的一刻。
+  // 一旦用户开口，当前正在看的东西就是比一个陈旧运行状态更新鲜的证据。
+  if (!(Array.isArray(sess._recentSent) ? sess._recentSent : []).length) {
+    const old = _runStateNextActionSuggestions(sess, { maxAgeMs: Infinity });
+    if (old.length && !_predictionAlreadyUsed(sess, old[0].send)) {
+      return { src: "resume", text: "继续上次：" + old[0].label, send: old[0].send };
+    }
   }
 
   try {
@@ -23607,6 +23638,16 @@ async function sendPrompt(text, attachments = [], readyConfig = null) {
       workspaceOpen: !!String(_earlyRoot || rootPath || (workspaceRoots && workspaceRoots[0]) || "").trim(),
     },
   );
+  // 思考档位要在**知道这轮是不是琐碎轮之后**再定一次。上面 _applyThinkingToConfig
+  // 跑在意图分类之前（那时还不知道这是问候还是施工），所以问候也照付默认档的思考预算。
+  if (_agentLightTurn) {
+    try {
+      // 用 config 而不是 _rawCfg：_applyThinkingToConfig 会先删掉全部思考字段再按模型重建，
+      // 是幂等的；而 _rawCfg 在这个位置不在作用域里。
+      Object.assign(config, _applyThinkingToConfig(config, { lightTurn: true }));
+      _activeThinkEffort = config.thinkingEffort || config.reasoningEffort || (config.thinkingBudget ? "high" : "off");
+    } catch {}
+  }
   _setSendBtnStop(true);
   // Mark this session streaming NOW — BEFORE any pre-processing await — so the
   // Stop button is live through the whole turn and a hang in compaction / context
