@@ -151,6 +151,10 @@ pub fn term_open(
     );
     // 以前这里无条件写死 en_US.UTF-8，把用户自己配的 zh_CN.UTF-8 / ja_JP.UTF-8 也一起
     // 顶掉了（排序、月份名、报错语言都会跟着变）。现在只在**一个 locale 都没有**时才补。
+    //
+    // 判定读的是本进程的环境，这是对的：CommandBuilder::new 的 envs 就是从
+    // std::env::vars_os() 拷过来的（portable-pty 的 get_base_env），父进程有什么子进程
+    // 就有什么——判定看到的和子进程实际拿到的是同一份。
     for (k, v) in crate::process_util::utf8_locale_env() {
         cmd.env(k, v);
     }

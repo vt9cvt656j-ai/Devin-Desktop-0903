@@ -613,6 +613,57 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
+    /// 接线守卫：捕获路径必须**真的**把 utf8_locale_env() 的结果塞给子进程。
+    ///
+    /// 这里刻意不去断言"子进程的 LANG 是 UTF-8"——那条断言在我这台机器上不删改动也
+    /// 照样绿（macOS 的 /etc/zprofile 里有 `if [ -z "$LANG" ]; then export
+    /// LANG=C.UTF-8`，登录 zsh 自己就把 LANG 补上了），是个假守卫。
+    /// 真正会断的接线只有一处：调用点被删掉。所以直接断言源码里有这个调用。
+    #[cfg(not(windows))]
+    #[test]
+    fn the_capture_path_injects_the_utf8_locale() {
+        // 只看测试模块**以前**的那部分源码。第一版直接搜整个文件，结果搜到的是这条断言
+        // 自己写的那个字符串字面量——把真正的调用点删掉它照样绿。
+        let src = include_str!("tasks.rs");
+        let production = &src[..src.find("mod tests").expect("tests module")];
+        assert!(
+            production.contains("process_util::utf8_locale_env()"),
+            "捕获路径不再注入 locale —— bash 登录 shell 下 `ls` 中文目录会打成 ????"
+        );
+    }
+
+    /// 端到端：中文文件名一路走下来必须完好。
+    ///
+    /// 覆盖两件事：子进程的输出字节被正确解码（decode_process_output），以及路径里的中文
+    /// 不会在 shell / 沙箱包装那一层被弄坏。
+    #[cfg(not(windows))]
+    #[test]
+    fn chinese_filenames_survive_the_whole_capture_path() {
+        let root = temp_root("capture-cjk");
+        let sub = root.join("中文目录");
+        std::fs::create_dir_all(&sub).expect("create dir");
+        std::fs::write(sub.join("你好世界.txt"), b"hi").expect("write file");
+        let result = task_run_capture_inner(
+            root.to_string_lossy().to_string(),
+            "ls 中文目录".into(),
+            None,
+            true,
+        )
+        .expect("task should run");
+        assert_eq!(result.code, 0, "stderr={}", result.stderr);
+        assert!(
+            result.stdout.contains("你好世界.txt"),
+            "中文文件名没能原样回来：{:?}",
+            result.stdout
+        );
+        assert!(
+            !result.combined.contains('\u{fffd}'),
+            "输出里出现了替换字符 U+FFFD——解码环节把中文弄坏了：{:?}",
+            result.combined
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     #[cfg(not(windows))]
     #[test]
     fn capture_reports_nonzero_exit() {

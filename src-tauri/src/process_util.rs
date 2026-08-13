@@ -357,13 +357,23 @@ pub fn decode_process_output(bytes: &[u8]) -> String {
 // ─────────────────────────── 子进程的 locale ───────────────────────────
 
 /// 从 Finder / Dock 启动的 macOS 应用**拿不到任何 locale 环境变量**——`LANG`、
-/// `LC_ALL`、`LC_CTYPE` 全是空的，子进程于是跑在 C locale 下。后果是实测过的：
-/// 终端里 `ls` 一个中文目录会打成 `????????????.txt`，`awk`/`wc -m`/`sort` 之类
-/// 按字符处理的工具也全部退化成按字节。
+/// `LC_ALL`、`LC_CTYPE` 全是空的（对着运行中的 app 进程 `ps eww` 查过）。
+///
+/// 这件事影响到谁，取决于登录 shell，实测结论是：
+///   - **zsh**（macOS 默认）：`/etc/zprofile` 里有 `if [ -z "$LANG" ]; then export
+///     LANG=C.UTF-8`，登录 shell 自己把这个洞补上了 —— 这条路径本来就没坏。
+///   - **bash**（换过登录 shell 的人）：`/etc/profile` 不设 locale，`bash -lc` 出来
+///     `LANG` 就是空的。实测在这种 shell 下 `ls` 一个中文目录打到终端是
+///     `????????????.txt`，`awk`/`wc -m`/`sort` 也全部退化成按字节。
+///   - Linux：发行版之间不一致，同样不能指望。
+///
+/// 所以这不是"macOS 全线坏了"，而是"不能指望登录 shell 替我们兜底"。在 shell 之前
+/// 补一个，三种情况就都是确定的。
 ///
 /// 规则：用户自己配过就不动（哪怕配的不是 UTF-8，那是他的选择）；一个都没有、或者
 /// 只是 `C`/`POSIX` 这种"等于没配"的值，才补一个 UTF-8 locale 进去。
-/// 补的是 `LANG` 而不是 `LC_ALL`，这样登录 shell 的 profile 还能再覆盖回去。
+/// 补的是 `LANG` 而不是 `LC_ALL`，这样登录 shell 的 profile 还能再覆盖回去
+/// （`/etc/zprofile` 那句 `if [ -z "$LANG" ]` 也就顺理成章地跳过，不会打架）。
 fn locale_is_configured(read: impl Fn(&str) -> Option<String>) -> bool {
     for key in ["LC_ALL", "LC_CTYPE", "LANG"] {
         if let Some(v) = read(key) {
@@ -388,12 +398,20 @@ fn default_utf8_locale() -> &'static str {
 }
 
 /// 要塞给子进程的 locale 环境变量；用户已经配好就返回空。
-#[cfg(not(windows))]
-pub fn utf8_locale_env() -> Vec<(&'static str, String)> {
-    if locale_is_configured(|k| std::env::var(k).ok()) {
+///
+/// 环境读取器是参数，这样这条判定能被确定性地测——直接读 `std::env` 的测试会跟着
+/// 跑测试那台机器的环境变量走，结果是"改动删掉也照样绿"的假守卫。
+#[allow(dead_code)]
+fn locale_env_from(read: impl Fn(&str) -> Option<String>) -> Vec<(&'static str, String)> {
+    if locale_is_configured(read) {
         return Vec::new();
     }
     vec![("LANG", default_utf8_locale().to_string())]
+}
+
+#[cfg(not(windows))]
+pub fn utf8_locale_env() -> Vec<(&'static str, String)> {
+    locale_env_from(|k| std::env::var(k).ok())
 }
 
 /// Windows 不走 POSIX locale，编码是靠代码页解决的（PTY 里 `chcp 65001`，
@@ -419,6 +437,20 @@ mod locale_tests {
     #[test]
     fn a_finder_launched_app_has_no_locale_and_gets_one() {
         assert!(!locale_is_configured(env_of(&[])));
+        // 这才是真守卫：断言**返回的东西**，而不是只断言判定函数。把 tasks.rs /
+        // terminal.rs 里的注入删掉这条不会红，但把这个函数改坏了一定会红。
+        let injected = locale_env_from(env_of(&[]));
+        assert_eq!(injected.len(), 1);
+        assert_eq!(injected[0].0, "LANG");
+        assert!(injected[0].1.to_lowercase().contains("utf-8"), "{injected:?}");
+    }
+
+    #[test]
+    fn a_configured_locale_means_we_inject_nothing() {
+        assert!(locale_env_from(env_of(&[("LANG", "zh_CN.UTF-8")])).is_empty());
+        assert!(locale_env_from(env_of(&[("LC_ALL", "ja_JP.eucJP")])).is_empty());
+        // C / POSIX 等于没配，要补。
+        assert!(!locale_env_from(env_of(&[("LANG", "C")])).is_empty());
     }
 
     #[test]
