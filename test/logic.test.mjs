@@ -6773,6 +6773,11 @@ test("MCP loads Claude Code-compatible project configs and merges their capabili
   const reads = [];
   const read = load("_readWorkspaceMcpDocument", {
     _workspaceAncestorRoots: ancestorRoots,
+    // 用户级（跨项目）那一层：见 test/mcp.test.mjs 的完整覆盖，这里只确认它接进来了、
+    // 并且不会把项目里的同名服务顶掉。
+    _readUserScopeMcpConfigs: async () => [
+      { path: "/home/me/.michael-ide/mcp.json", writable: true, servers: { global: { command: "node" }, local: { command: "全局的同名服务" } } },
+    ],
     backend: { readTextFile: async (path) => {
       reads.push(path);
       if (path === "/repo/.mcp.local.json") return JSON.stringify({ mcpServers: { local: { command: "node" } } });
@@ -6783,7 +6788,8 @@ test("MCP loads Claude Code-compatible project configs and merges their capabili
   });
   const result = await read("/repo");
   const merged = JSON.parse(result.text);
-  assert.deepEqual(Object.keys(merged.mcpServers).sort(), ["cursor", "local", "shared"]);
+  assert.deepEqual(Object.keys(merged.mcpServers).sort(), ["cursor", "global", "local", "shared"]);
+  assert.equal(merged.mcpServers.local.command, "node", "项目里的同名服务必须盖住全局那个");
   assert.match(result.path, /\.mcp\.local\.json/);
   assert.match(result.path, /\.mcp\.json/);
   assert.match(result.path, /\.cursor\/mcp\.json/);
@@ -6794,6 +6800,11 @@ test("MCP loads Claude Code-compatible project configs and merges their capabili
     local: "/repo/.mcp.local.json",
     shared: "/repo/.mcp.json",
     cursor: "/repo/.cursor/mcp.json",
+    global: "/home/me/.michael-ide/mcp.json",
+  });
+  // 判据从"来自哪个文件"升级成"哪种作用域"：权限门和面板都读这一张表。
+  assert.deepEqual(result.serverScopes, {
+    local: "local", shared: "repo", cursor: "repo", global: "user",
   });
 });
 
@@ -6826,12 +6837,16 @@ test("repo-provided MCP servers are gated; the user's own local config is not", 
   // The exact regression: a bare statement-level call whose result goes nowhere.
   assert.doesNotMatch(ensure, /\n\s*await checkWorkspaceTrust\(root\);\s*\n/,
     "the trust verdict must never be discarded again");
-  // Only repo-shipped files are gated.
+  // Only repo-shipped files are gated. 判据现在是**作用域**而不是路径后缀：用户级
+  // 配置（~/.michael-ide/mcp.json、以及从 Claude Code / Cursor 读来的那些）是绝对
+  // 路径，用"不是 .mcp.local.json 结尾就算仓库自带"会把它们全部误判成外部可执行内容。
   const isRepo = load("_mcpServerIsRepoProvided");
-  assert.equal(isRepo("/repo/.mcp.local.json"), false, "the IDE's own gitignored config is the user's own");
-  assert.equal(isRepo("/repo/.mcp.json"), true);
-  assert.equal(isRepo("/repo/.cursor/mcp.json"), true);
-  assert.equal(isRepo(""), false);
+  assert.equal(isRepo("repo"), true);
+  for (const scope of ["local", "user", "interop", "", undefined]) {
+    assert.equal(isRepo(scope), false, `${scope} 不该被当成仓库自带`);
+  }
+  assert.match(ensure, /_mcpServerIsRepoProvided\(cfgDoc\.serverScopes\?\.\[name\]\)/,
+    "门禁必须按作用域判定，别再按文件路径猜");
   // The dialog must show what will really run, with credentials masked.
   assert.match(ensure, /a === "--header"[\s\S]{0,140}": \*\*\*\*"/,
     "remote-server header credentials must be masked in the approval dialog");
@@ -14379,7 +14394,10 @@ test("MCP read-only annotations survive discovery and mapping", () => {
   assert.match(SRC, /mcp_status", \{ name \}.*catch \{ return false; \}/s);
   assert.match(SRC, /checkWorkspaceTrust\(root\)/);
   assert.match(SRC, /mcpRoot: m\?\.root \|\| ""/);
-  assert.match(SRC, /call\.mcpRoot !== root \|\| _mcpLoadedRoot !== root/);
+  // 归一化后比较：没打开文件夹时根目录是空串，旧写法里的 `!call.mcpRoot` 会把全局
+  // MCP 服务（恰恰是不属于任何项目的那些）整批拦掉。
+  assert.match(SRC, /String\(call\.mcpRoot \|\| ""\) !== String\(root \|\| ""\)/);
+  assert.doesNotMatch(SRC, /if \(!call\.mcpRoot \|\| call\.mcpRoot !== root/);
   assert.match(SRC, /function _buildAgentToolSchemas\(includeWrite, mcpTools = \[\]\)/);
   assert.match(SRC, /_selectInitialTools\(isAgent, run\._originalText, run\.mcpToolCache, run\.mode, null\)/);
   assert.doesNotMatch(SRC, /function _buildAgentToolSchemas\([^)]*\)[\s\S]*?if \(_mcpToolCache\.length\) tools\.push/);

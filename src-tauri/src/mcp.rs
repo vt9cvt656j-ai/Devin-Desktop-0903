@@ -1028,6 +1028,143 @@ pub async fn mcp_status(name: String) -> Result<bool, String> {
     .map_err(|e| e.to_string())?
 }
 
+// ── 用户级（跨项目）MCP 配置 ─────────────────────────────────────────────────
+//
+// 在这之前，MCP 配置**只**来自工作区里的 `.mcp.local.json` / `.mcp.json` /
+// `.cursor/mcp.json`。也就是说换一个项目，你配好的服务、连同填进去的 API Key 全都
+// 不在了，得从头再配一遍；没打开文件夹的时候更是一个 MCP 都用不了。那不叫"能用"。
+//
+// 用户级配置放在 `~/.michael-ide/mcp.json`，配一次到处都在。这里必须走**独立的
+// Tauri 命令**而不是复用 `write_text_file_if_unchanged`：那条路的
+// `require_inside_workspace(path, true)` 会明确拒绝"在 HOME 底下但不在已打开工作区
+// 里"的写入（正是它挡住了 ~/.ssh、~/.bashrc），不该为了这一个文件把那道墙挖开。
+// 这两个命令的作用域被钉死在这一个文件上，路径不接受调用方输入。
+//
+// 顺带把别的客户端的配置读进来（只读）：用户在 Claude Code / Cursor 里配好的服务
+// 直接就能用，不用再抄一遍。`~/.claude.json` 里除了 mcpServers 还有账号、项目历史
+// 等等，所以**在 Rust 侧就只摘 mcpServers 子树**交给前端，其余内容一个字节都不进
+// 渲染进程。这也顺便绕开了 read_text_file 的 5 MB 上限（那个文件会长得很大）。
+const USER_CONFIG_DIR: &str = ".michael-ide";
+const USER_CONFIG_FILE: &str = "mcp.json";
+/// 这几个文件都可能长期堆积（Claude Code 会把项目历史写进 ~/.claude.json）。
+const MAX_USER_CONFIG_BYTES: u64 = 32 * 1024 * 1024;
+
+fn home_dir() -> Result<std::path::PathBuf, String> {
+    std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .map(std::path::PathBuf::from)
+        .map_err(|_| "无法确定用户主目录（HOME / USERPROFILE 都没有设置）".to_string())
+}
+
+fn user_config_path() -> Result<std::path::PathBuf, String> {
+    Ok(home_dir()?.join(USER_CONFIG_DIR).join(USER_CONFIG_FILE))
+}
+
+/// 从一份配置文本里摘出服务表。兼容 `mcpServers`（Claude Code / Cursor / 本 IDE）
+/// 和 `servers`（VS Code）两种键名。
+fn servers_subtree(text: &str) -> Value {
+    let Ok(parsed) = serde_json::from_str::<Value>(text) else {
+        return json!({});
+    };
+    for key in ["mcpServers", "servers"] {
+        if let Some(map) = parsed.get(key) {
+            if map.is_object() {
+                return map.clone();
+            }
+        }
+    }
+    json!({})
+}
+
+fn read_capped(path: &std::path::Path) -> Option<String> {
+    let meta = std::fs::metadata(path).ok()?;
+    if !meta.is_file() || meta.len() > MAX_USER_CONFIG_BYTES {
+        return None;
+    }
+    std::fs::read_to_string(path).ok()
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct McpUserConfig {
+    path: String,
+    /// 本 IDE 自己的那份可以从面板里改；别的客户端的配置只读——那是它们的文件，
+    /// 面板不该替用户去动。
+    writable: bool,
+    servers: Value,
+}
+
+/// 用户级 MCP 配置：本 IDE 的 `~/.michael-ide/mcp.json`，加上 Claude Code / Cursor 的
+/// 全局配置（只读）。本 IDE 那份即使还不存在也会返回（servers 为空），面板要靠它
+/// 知道"保存会写到哪里"。
+#[tauri::command]
+pub fn mcp_user_configs() -> Result<Vec<McpUserConfig>, String> {
+    let home = home_dir()?;
+    let own = user_config_path()?;
+    let mut out = vec![McpUserConfig {
+        path: own.to_string_lossy().into_owned(),
+        writable: true,
+        servers: read_capped(&own)
+            .map(|text| servers_subtree(&text))
+            .unwrap_or_else(|| json!({})),
+    }];
+    for relative in [".claude.json", ".cursor/mcp.json", ".codex/mcp.json"] {
+        let path = home.join(relative);
+        let Some(text) = read_capped(&path) else {
+            continue;
+        };
+        let servers = servers_subtree(&text);
+        if servers.as_object().is_some_and(|map| !map.is_empty()) {
+            out.push(McpUserConfig {
+                path: path.to_string_lossy().into_owned(),
+                writable: false,
+                servers,
+            });
+        }
+    }
+    Ok(out)
+}
+
+/// 覆盖写 `~/.michael-ide/mcp.json`，返回它的绝对路径。
+///
+/// 权限收到 0600（目录 0700）：这个文件里会有 API Key。先写临时文件再 rename，
+/// 断电或者写到一半崩了不会留下半截 JSON 把所有 MCP 服务一起带走。
+#[tauri::command]
+pub fn mcp_save_user_config(text: String) -> Result<String, String> {
+    save_user_config_at(&user_config_path()?, &text)
+}
+
+/// 真正落盘的那一段。路径作参数是为了能在测试里用临时目录跑完整往返——命令本身
+/// 不接受调用方给路径（那会把 HOME 底下任意文件变成可写目标）。
+fn save_user_config_at(path: &std::path::Path, text: &str) -> Result<String, String> {
+    // 拒绝写坏文件：这一份被所有项目共用，写坏了是把全部 MCP 一起弄丢。
+    serde_json::from_str::<Value>(text).map_err(|e| format!("MCP 配置不是合法 JSON：{e}"))?;
+    let dir = path
+        .parent()
+        .ok_or_else(|| "无法确定配置目录".to_string())?
+        .to_path_buf();
+    std::fs::create_dir_all(&dir).map_err(|e| format!("无法创建 {}：{e}", dir.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+    }
+    let temp = dir.join(format!("{USER_CONFIG_FILE}.tmp"));
+    std::fs::write(&temp, text.as_bytes()).map_err(|e| format!("写入失败：{e}"))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        // rename 之前就设好权限，避免出现"已经在最终路径、权限还是 0644"的窗口。
+        std::fs::set_permissions(&temp, std::fs::Permissions::from_mode(0o600))
+            .map_err(|e| format!("无法收紧 {} 的权限：{e}", temp.display()))?;
+    }
+    std::fs::rename(&temp, path).map_err(|e| {
+        let _ = std::fs::remove_file(&temp);
+        format!("无法保存 {}：{e}", path.display())
+    })?;
+    Ok(path.to_string_lossy().into_owned())
+}
+
 /// Disconnect and kill an MCP server session.
 #[tauri::command]
 pub async fn mcp_disconnect(name: String) -> Result<(), String> {
@@ -1094,6 +1231,84 @@ mod tests {
             Some(env!("CARGO_MANIFEST_DIR").into()),
         )
         .await
+    }
+
+    #[test]
+    fn user_config_reader_takes_only_the_servers_subtree() {
+        // ~/.claude.json 里除了 mcpServers 还有 oauthAccount / userID / projects（整段
+        // 项目历史）。这个函数是那道闸：**只有** mcpServers 会离开 Rust 侧，其余内容
+        // 一个字节都不进渲染进程。
+        let claude = r#"{
+            "userID": "私密-不该外泄",
+            "oauthAccount": {"emailAddress": "a@b.c"},
+            "projects": {"/tmp/x": {"history": ["秘密"]}},
+            "mcpServers": {"memory": {"command": "npx", "args": ["-y", "server-memory"]}}
+        }"#;
+        let servers = servers_subtree(claude);
+        assert_eq!(servers["memory"]["command"], "npx");
+        let text = serde_json::to_string(&servers).unwrap();
+        for leaked in ["userID", "oauthAccount", "projects", "私密", "秘密", "a@b.c"] {
+            assert!(!text.contains(leaked), "{leaked} 泄漏进了返回值：{text}");
+        }
+    }
+
+    #[test]
+    fn user_config_reader_accepts_the_vs_code_key_and_survives_garbage() {
+        assert_eq!(
+            servers_subtree(r#"{"servers":{"x":{"command":"y"}}}"#)["x"]["command"],
+            "y"
+        );
+        // 手写坏了的配置不能把整套 MCP 带走，返回空表即可。
+        assert_eq!(servers_subtree("{ 这不是 json"), json!({}));
+        assert_eq!(servers_subtree(r#"{"mcpServers": 42}"#), json!({}));
+    }
+
+    #[test]
+    fn saving_the_user_config_rejects_invalid_json_before_touching_the_file() {
+        // 这一份被所有项目共用：写坏了是把全部 MCP 一起弄丢，所以先解析再落盘。
+        let dir = std::env::temp_dir().join("michael-mcp-usercfg-invalid");
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("mcp.json");
+        save_user_config_at(&path, r#"{"mcpServers":{"a":{"command":"x"}}}"#).unwrap();
+        let before = std::fs::read_to_string(&path).unwrap();
+
+        let error = save_user_config_at(&path, "{ 半截").unwrap_err();
+        assert!(error.contains("不是合法 JSON"), "{error}");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            before,
+            "参数非法时不该动到磁盘上的配置"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn user_config_round_trips_and_is_not_world_readable() {
+        // 这个文件里会有 API Key：目录 0700、文件 0600，而且 rename 之前就设好，
+        // 不留"已经在最终路径、权限还是 0644"的窗口。
+        let dir = std::env::temp_dir().join("michael-mcp-usercfg-roundtrip");
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("mcp.json");
+        let written = r#"{"mcpServers":{"tavily":{"command":"npx","env":{"TAVILY_API_KEY":"秘密"}}}}"#;
+        let saved = save_user_config_at(&path, written).unwrap();
+        assert_eq!(saved, path.to_string_lossy());
+
+        let servers = servers_subtree(&read_capped(&path).unwrap());
+        assert_eq!(servers["tavily"]["env"]["TAVILY_API_KEY"], "秘密");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "配置里有 API Key，不能是 {mode:o}");
+            let dir_mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+            assert_eq!(dir_mode, 0o700, "配置目录不能是 {dir_mode:o}");
+        }
+        // 覆盖写不留临时文件残骸。
+        assert!(!dir.join("mcp.json.tmp").exists());
+        save_user_config_at(&path, r#"{"mcpServers":{}}"#).unwrap();
+        assert_eq!(servers_subtree(&read_capped(&path).unwrap()), json!({}));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -1442,3 +1657,4 @@ mod tests {
         mcp_disconnect(session_name).await.unwrap();
     }
 }
+
