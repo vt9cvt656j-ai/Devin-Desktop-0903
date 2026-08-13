@@ -780,3 +780,28 @@ test("/sessions 必须能看到内存装不下的那部分历史会话", () => {
   assert.match(idx, /return \[\]/, "取不到索引要返回空数组而不是抛");
   assert.match(idx, /catch/, "索引查询要被 try/catch 包住");
 });
+
+test("「要方案」和「要施工」两条规则必须成对存在，只留一半就是这次的 bug", () => {
+  const main = readFileSync(new URL("../src/main.js", import.meta.url), "utf8");
+  const core = readFileSync(new URL("../../server/prompts/agent_core.txt", import.meta.url), "utf8");
+
+  // 起因：为了治「让他做 X 他却反问」，提示词被推向「直接开工」。但只写了
+  // 「不要把施工降级成方案」，没写反向那句，于是用户要方案时它给完方案顺手就开工了。
+  // 两条是对称的，任何一次只改一半都会把天平推到另一边。
+
+  // 施工方向（不能被这次修复削弱）
+  assert.match(main, /就是施工单，直接开工，不要降级成方案/);
+
+  // 方案方向（这次补的）
+  assert.match(main, /不要把方案自动升级成施工/, "判题那处要有反向规则");
+  assert.match(main, /\*\*用户要方案\*\*/, "协作边界要单独列出「要方案」这一类");
+  assert.match(main, /给完就停|停下来等他发话/, "要方案必须明确说「停」");
+
+  // 意图分类要把方案请求判成只读，否则计划门和评分都会按施工算
+  assert.match(main, /action=plan、workspaceAction=inspect/, "方案请求要分类成只读");
+
+  // 服务端那条也要在（客户端提示不一定每条路径都注入）
+  assert.match(core, /A plan request ends at the plan/, "服务端 agent_core 要有同一条规则");
+  assert.match(core, /never downgrade a build request into a plan|do\/fix\/change\/build\/run\/deploy must produce/,
+    "施工那半边不能被删掉");
+});
