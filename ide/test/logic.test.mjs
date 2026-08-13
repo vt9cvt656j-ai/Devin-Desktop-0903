@@ -18,6 +18,7 @@ import assert from "node:assert/strict";
 import * as acorn from "acorn";
 import exifr from "exifr";
 import { stripToolIp } from "../build/strip-tool-ip.mjs";
+import { ansiToText } from "../src/agent/ansi.js";
 import { ConversationMemory, extractExplicitCorrection, serializeMessagesForPersistence } from "../src/conversation-memory.js";
 import { GLOBAL_LANGUAGE_TAGS, buildLanguageOptions, coerceSupportedLocale, isSupportedLocale, localeLanguageCode, normalizeLocaleTag } from "../src/locales.js";
 import { compactToolExampleArgs, compactToolGuide, enrichedCatalogLine, TOOL_METADATA } from "../src/tool-guides.js";
@@ -16816,7 +16817,9 @@ test("验证命令先做存在性探测，缺失步骤被剔除而不是跑到 1
 });
 
 test("terminal evidence preserves structured status and the final log state within a bounded model payload", () => {
-  const stripAnsi = load("_stripAnsi");
+  // _stripAnsi 现在委托给 agent/ansi.js 的真解析器（旧正则漏掉 `\x1b[?25l` 这类私有
+  // 序列，也不处理 \r 进度条）。注入真模块，别在这里假一个。
+  const stripAnsi = load("_stripAnsi", { _ansiText: ansiToText });
   const bound = load("_headTailModelText");
   assert.equal(bound("must not leak when no budget remains", 0), "");
   const clip = load("_clipPreservingErrors", { _headTailModelText: bound, _hasErrorLine: load("_hasErrorLine") });

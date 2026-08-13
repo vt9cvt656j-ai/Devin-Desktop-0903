@@ -78,6 +78,7 @@ import { getCollaborationEngine } from "./agent/collaboration-engine.js";
 import { escapeAttr as _escAttr, escapeHtml as _escHtml } from "./agent/escape.js";
 import { langBadge as _langBadge } from "./agent/language.js";
 import { buildDiffView as _buildDiffView, diffStat as _diffStat, highlightDiffView } from "./agent/diff-view.js";
+import { ansiToHtml as _ansiHtml, ansiToText as _ansiText } from "./agent/ansi.js";
 
 // Global shared state store for sub-agent collaboration
 const _globalSharedStore = getSharedStore();
@@ -24859,7 +24860,8 @@ async function _agentRunInTerminal(root, command, stepEl) {
     if (outputEl) {
       const output = (result.stdout + (result.stderr ? "\n" + result.stderr : "")).trim();
       if (output && !output.startsWith("(")) {
-        outputEl.textContent = output.slice(0, 5000);
+        // 同上：ANSI 渲染成颜色而不是当文字显示；ansiToHtml 已做 HTML 转义。
+        outputEl.innerHTML = _ansiHtml(output, { maxChars: 5000 });
         outputEl.style.display = "block";
       }
     }
@@ -34524,7 +34526,23 @@ async function _compactHistoryIfHuge(config, session) {
 
 /** Serialize a tool's result into the `tool` message content the model reads next turn. */
 function _stripAnsi(s) {
-  return s.replace(/\x1b\[[0-9;]*[A-Za-z]|\x1b\].*?(?:\x07|\x1b\\)/g, "");
+  // 解析器的输入上限，首尾各留这么多字符。
+  const budget = 200_000;
+  // 走和终端卡片同一个解析器。旧的正则 `\x1b\[[0-9;]*[A-Za-z]` 匹配不到带 `?` 的私有
+  // 序列（`\x1b[?25l` 这种隐藏光标的），它们会原样进模型上下文；`\r` 也没处理，于是
+  // pip / npm 的进度条几十帧全都喂了进去，白烧 token 还盖住真正的结论。
+  //
+  // 逐字符解析比正则贵（实测 2MB 全彩日志 ~130ms）。下游本来就只取首尾几千字，
+  // 所以超大输入先按**首尾**各截一段再解析——两头都保住，成本封在 ~25ms。
+  const raw = String(s == null ? "" : s);
+  if (raw.length > budget * 2) {
+    return (
+      _ansiText(raw.slice(0, budget)) +
+      "\n…（中间省略）…\n" +
+      _ansiText(raw.slice(-budget))
+    );
+  }
+  return _ansiText(raw);
 }
 
 // A tool can emit megabytes of logs. Preserve the beginning for command context and
@@ -50165,7 +50183,10 @@ return { type: call.type, path: call.query || "", content: `[失败] ${call.type
       else _clearCmdFailure(run, call.command);
 
       if (output && outEl) {
-        outEl.textContent = output.slice(0, 5000);
+        // 命令输出里的 ANSI 转义序列要**渲染**成颜色，不能当文字显示（cargo/pytest/npm
+        // 的彩色输出以前在卡片里就是一屏 `[31m[1m`），带 \r 进度条的命令也不该把每一帧
+        // 都留下来。ansiToHtml 内部做了 HTML 转义——命令输出是不可信内容。
+        outEl.innerHTML = _ansiHtml(output, { maxChars: 5000 });
         footerEl.style.display = "";
 
         const toggleBtn = step.querySelector(".agent-term-toggle");
@@ -50179,7 +50200,8 @@ return { type: call.type, path: call.query || "", content: `[失败] ${call.type
         const copyBtn = step.querySelector(".agent-term-copy");
         copyBtn?.addEventListener("click", (e) => {
           e.stopPropagation();
-          navigator.clipboard?.writeText(output).then(() => {
+          // 复制的是看得见的那份：转义码去掉、\r 覆盖已经结算过，粘到别处才是干净的。
+          navigator.clipboard?.writeText(_ansiText(output)).then(() => {
             copyBtn.textContent = "Copied!";
             setTimeout(() => { copyBtn.textContent = "Copy"; }, 1500);
           });

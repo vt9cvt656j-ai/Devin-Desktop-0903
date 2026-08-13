@@ -6450,18 +6450,18 @@ button.agent-plan__fold--toggle:focus-visible { outline: 2px solid #1a73e8; outl
 }
 
 [data-theme="light"] .agent-cmd-chip,
-:not([data-theme]) .agent-cmd-chip {
+:root:not([data-theme]) .agent-cmd-chip {
   background: #fafbfc; border-color: #e5e7eb;
   box-shadow: 0 1px 3px rgba(0,0,0,.04), 0 1px 2px rgba(0,0,0,.06);
 }
 [data-theme="light"] .agent-cmd-chip__bar,
-:not([data-theme]) .agent-cmd-chip__bar { background: #f0f2f5; }
+:root:not([data-theme]) .agent-cmd-chip__bar { background: #f0f2f5; }
 [data-theme="light"] .agent-cmd-chip__prompt,
-:not([data-theme]) .agent-cmd-chip__prompt { color: #1a7f37; }
+:root:not([data-theme]) .agent-cmd-chip__prompt { color: #1a7f37; }
 [data-theme="light"] .agent-cmd-chip__code,
-:not([data-theme]) .agent-cmd-chip__code { color: #1f2328; }
+:root:not([data-theme]) .agent-cmd-chip__code { color: #1f2328; }
 [data-theme="light"] .agent-cmd-chip__title,
-:not([data-theme]) .agent-cmd-chip__title { color: #8b949e; }
+:root:not([data-theme]) .agent-cmd-chip__title { color: #8b949e; }
 
 /* ═══ Agent Terminal Card v2 — Cursor-level quality ═══ */
 .agent-term-card {
@@ -6615,7 +6615,8 @@ button.agent-plan__fold--toggle:focus-visible { outline: 2px solid #1a73e8; outl
 .agent-term-toggle:hover,
 .agent-term-copy:hover {
   color: var(--atc-text);
-  border-color: #d0d7de;
+  /* 别写死 #d0d7de——深色下没有对应的覆盖规则，一 hover 就冒出一圈浅灰边。 */
+  border-color: color-mix(in srgb, var(--atc-border) 60%, var(--atc-text));
   background: var(--hover);
 }
 .agent-term-card--running { border-color: rgba(9,105,218,.3); box-shadow: 0 0 0 1px rgba(9,105,218,.08); }
@@ -6623,61 +6624,144 @@ button.agent-plan__fold--toggle:focus-visible { outline: 2px solid #1a73e8; outl
 .agent-term-card--ok { border-left: 3px solid var(--atc-success); }
 .agent-term-card--err { border-left: 3px solid var(--atc-danger); }
 
-/* Light mode terminal card */
+/* Light mode terminal card.
+   注意这里必须写 `:root:not([data-theme])` 而不是裸的 `:not([data-theme])`：
+   后者是"任意一个没有 data-theme 属性的祖先"，<body> 永远满足，于是浅色规则
+   在深色模式下照样命中，而且 (0,2,0) 的权重压过基础规则里的 var(--atc-bg)
+   (0,1,0)——终端卡片就会在一片深色 UI 里刷成白的。主题只挂在 :root 上，
+   所以选择器也只能锚在 :root 上。 */
 [data-theme="light"] .agent-term-card,
-:not([data-theme]) .agent-term-card {
+:root:not([data-theme]) .agent-term-card {
+  /* 浅色下也把 --atc-* 补齐（深色在下面 [data-theme="dark"] 那段里给）。
+     基础规则全是 var(--atc-…) 驱动的，两套色板都定义好之后，卡片的配色就只由
+     这两个变量块决定，下面那些写死颜色的浅色规则只是维持现状的兜底。 */
+  --atc-bg: #fafbfc;
+  --atc-border: #e1e4e8;
+  --atc-head: #f6f8fa;
+  --atc-text: #1f2328;
+  --atc-dim: #8b949e;
+  --atc-accent: #0969da;
+  --atc-success: #1a7f37;
+  --atc-danger: #cf222e;
   background: #fafbfc;
   border-color: #e1e4e8;
   box-shadow: 0 1px 4px rgba(0,0,0,.06), 0 1px 2px rgba(0,0,0,.03);
 }
 [data-theme="light"] .agent-term-card:hover,
-:not([data-theme]) .agent-term-card:hover { border-color: #d0d7de; box-shadow: 0 2px 10px rgba(0,0,0,.08); transform: translateY(-1px); }
+:root:not([data-theme]) .agent-term-card:hover { border-color: #d0d7de; box-shadow: 0 2px 10px rgba(0,0,0,.08); transform: translateY(-1px); }
 [data-theme="light"] .agent-term-card__header,
-:not([data-theme]) .agent-term-card__header { background: linear-gradient(180deg, #f6f8fa, #f0f2f5); border-bottom-color: #e1e4e8; }
+:root:not([data-theme]) .agent-term-card__header { background: linear-gradient(180deg, #f6f8fa, #f0f2f5); border-bottom-color: #e1e4e8; }
 [data-theme="light"] .agent-term-card__prompt,
-:not([data-theme]) .agent-term-card__prompt { color: #1a7f37; }
+:root:not([data-theme]) .agent-term-card__prompt { color: #1a7f37; }
 [data-theme="light"] .agent-term-card__code,
-:not([data-theme]) .agent-term-card__code { color: #1f2328; }
+:root:not([data-theme]) .agent-term-card__code { color: #1f2328; }
 [data-theme="light"] .agent-term-card__cmd,
-:not([data-theme]) .agent-term-card__cmd { background: rgba(0,0,0,.01); }
+:root:not([data-theme]) .agent-term-card__cmd { background: rgba(0,0,0,.01); }
 [data-theme="light"] .agent-term-card__label,
-:not([data-theme]) .agent-term-card__label { color: #8b949e; }
+:root:not([data-theme]) .agent-term-card__label { color: #8b949e; }
 [data-theme="light"] .agent-term-timer,
-:not([data-theme]) .agent-term-timer { color: #8b949e; }
+:root:not([data-theme]) .agent-term-timer { color: #8b949e; }
 [data-theme="light"] .agent-term-output,
-:not([data-theme]) .agent-term-output { background: #f6f8fa; color: #1f2328; border-top-color: #e1e4e8; }
+:root:not([data-theme]) .agent-term-output { background: #f6f8fa; color: #1f2328; border-top-color: #e1e4e8; }
 [data-theme="light"] .agent-term-card__footer,
-:not([data-theme]) .agent-term-card__footer { background: #f6f8fa; border-top-color: #e1e4e8; }
+:root:not([data-theme]) .agent-term-card__footer { background: #f6f8fa; border-top-color: #e1e4e8; }
 [data-theme="light"] .agent-term-toggle,
-:not([data-theme]) .agent-term-toggle,
+:root:not([data-theme]) .agent-term-toggle,
 [data-theme="light"] .agent-term-copy,
-:not([data-theme]) .agent-term-copy { color: #656d76; border-color: #d8dee4; }
+:root:not([data-theme]) .agent-term-copy { color: #656d76; border-color: #d8dee4; }
 [data-theme="light"] .agent-term-toggle:hover,
-:not([data-theme]) .agent-term-toggle:hover,
+:root:not([data-theme]) .agent-term-toggle:hover,
 [data-theme="light"] .agent-term-copy:hover,
-:not([data-theme]) .agent-term-copy:hover { color: #1f2328; border-color: #afb8c1; background: rgba(0,0,0,.03); }
+:root:not([data-theme]) .agent-term-copy:hover { color: #1f2328; border-color: #afb8c1; background: rgba(0,0,0,.03); }
 [data-theme="light"] .agent-term-status--running,
-:not([data-theme]) .agent-term-status--running { color: #0969da; background: rgba(9,105,218,.07); }
+:root:not([data-theme]) .agent-term-status--running { color: #0969da; background: rgba(9,105,218,.07); }
 [data-theme="light"] .agent-term-status--ok,
-:not([data-theme]) .agent-term-status--ok { color: #1a7f37; background: rgba(26,127,55,.07); }
+:root:not([data-theme]) .agent-term-status--ok { color: #1a7f37; background: rgba(26,127,55,.07); }
 [data-theme="light"] .agent-term-status--err,
-:not([data-theme]) .agent-term-status--err { color: #cf222e; background: rgba(207,34,46,.07); }
+:root:not([data-theme]) .agent-term-status--err { color: #cf222e; background: rgba(207,34,46,.07); }
 [data-theme="light"] .agent-term-status--risk,
-:not([data-theme]) .agent-term-status--risk { color: #9a6700; background: rgba(251,188,4,.13); }
+:root:not([data-theme]) .agent-term-status--risk { color: #9a6700; background: rgba(251,188,4,.13); }
 [data-theme="light"] .agent-term-risk,
-:not([data-theme]) .agent-term-risk { color: #9a6700; background: rgba(251,188,4,.13); border-color: rgba(251,188,4,.28); }
+:root:not([data-theme]) .agent-term-risk { color: #9a6700; background: rgba(251,188,4,.13); border-color: rgba(251,188,4,.28); }
 [data-theme="light"] .agent-term-spinner,
-:not([data-theme]) .agent-term-spinner { border-color: rgba(9,105,218,.2); border-top-color: #0969da; }
+:root:not([data-theme]) .agent-term-spinner { border-color: rgba(9,105,218,.2); border-top-color: #0969da; }
 [data-theme="light"] .agent-term-card--ok,
-:not([data-theme]) .agent-term-card--ok { border-left-color: #1a7f37; }
+:root:not([data-theme]) .agent-term-card--ok { border-left-color: #1a7f37; }
 [data-theme="light"] .agent-term-card--err,
-:not([data-theme]) .agent-term-card--err { border-left-color: #cf222e; }
+:root:not([data-theme]) .agent-term-card--err { border-left-color: #cf222e; }
 [data-theme="light"] .agent-term-card--running,
-:not([data-theme]) .agent-term-card--running { border-color: rgba(9,105,218,.2); }
+:root:not([data-theme]) .agent-term-card--running { border-color: rgba(9,105,218,.2); }
 [data-theme="light"] .agent-term-card--risk,
-:not([data-theme]) .agent-term-card--risk { border-left-color: #d29922; box-shadow: 0 0 0 1px rgba(251,188,4,.10); }
+:root:not([data-theme]) .agent-term-card--risk { border-left-color: #d29922; box-shadow: 0 0 0 1px rgba(251,188,4,.10); }
 [data-theme="light"] .agent-term-output::-webkit-scrollbar-thumb,
-:not([data-theme]) .agent-term-output::-webkit-scrollbar-thumb { background: #d0d7de; }
+:root:not([data-theme]) .agent-term-output::-webkit-scrollbar-thumb { background: #d0d7de; }
+
+/* ═══ 命令输出里的 ANSI 配色 ═══
+   卡片输出以前是 textContent，cargo / pytest / npm 吐的 `ESC[31m` 只能当文字显示。
+   现在 agent/ansi.js 把 SGR 翻成下面这些 class，颜色在这里按主题给两套——
+   深色下用亮一档的色（GitHub Dark），浅色下用暗一档的（GitHub Light），
+   两边都能在各自的背景上读清楚。写死一套色板必然有一边糊掉。 */
+.agent-term-output {
+  --ansi-black: #484f58;   --ansi-bblack: #6e7681;
+  --ansi-red: #ff7b72;     --ansi-bred: #ffa198;
+  --ansi-green: #3fb950;   --ansi-bgreen: #56d364;
+  --ansi-yellow: #d29922;  --ansi-byellow: #e3b341;
+  --ansi-blue: #58a6ff;    --ansi-bblue: #79c0ff;
+  --ansi-magenta: #bc8cff; --ansi-bmagenta: #d2a8ff;
+  --ansi-cyan: #39c5cf;    --ansi-bcyan: #56d4dd;
+  --ansi-white: #b1bac4;   --ansi-bwhite: #f0f6fc;
+}
+[data-theme="light"] .agent-term-output,
+:root:not([data-theme]) .agent-term-output {
+  --ansi-black: #24292f;   --ansi-bblack: #57606a;
+  --ansi-red: #cf222e;     --ansi-bred: #a40e26;
+  --ansi-green: #116329;   --ansi-bgreen: #1a7f37;
+  --ansi-yellow: #4d2d00;  --ansi-byellow: #633c01;
+  --ansi-blue: #0969da;    --ansi-bblue: #218bff;
+  --ansi-magenta: #8250df; --ansi-bmagenta: #a475f9;
+  --ansi-cyan: #1b7c83;    --ansi-bcyan: #3192aa;
+  --ansi-white: #6e7781;   --ansi-bwhite: #8c959f;
+}
+.ansi-fg-black { color: var(--ansi-black); }
+.ansi-fg-red { color: var(--ansi-red); }
+.ansi-fg-green { color: var(--ansi-green); }
+.ansi-fg-yellow { color: var(--ansi-yellow); }
+.ansi-fg-blue { color: var(--ansi-blue); }
+.ansi-fg-magenta { color: var(--ansi-magenta); }
+.ansi-fg-cyan { color: var(--ansi-cyan); }
+.ansi-fg-white { color: var(--ansi-white); }
+.ansi-fg-bblack { color: var(--ansi-bblack); }
+.ansi-fg-bred { color: var(--ansi-bred); }
+.ansi-fg-bgreen { color: var(--ansi-bgreen); }
+.ansi-fg-byellow { color: var(--ansi-byellow); }
+.ansi-fg-bblue { color: var(--ansi-bblue); }
+.ansi-fg-bmagenta { color: var(--ansi-bmagenta); }
+.ansi-fg-bcyan { color: var(--ansi-bcyan); }
+.ansi-fg-bwhite { color: var(--ansi-bwhite); }
+.ansi-bg-black { background-color: var(--ansi-black); }
+.ansi-bg-red { background-color: var(--ansi-red); }
+.ansi-bg-green { background-color: var(--ansi-green); }
+.ansi-bg-yellow { background-color: var(--ansi-yellow); }
+.ansi-bg-blue { background-color: var(--ansi-blue); }
+.ansi-bg-magenta { background-color: var(--ansi-magenta); }
+.ansi-bg-cyan { background-color: var(--ansi-cyan); }
+.ansi-bg-white { background-color: var(--ansi-white); }
+.ansi-bg-bblack { background-color: var(--ansi-bblack); }
+.ansi-bg-bred { background-color: var(--ansi-bred); }
+.ansi-bg-bgreen { background-color: var(--ansi-bgreen); }
+.ansi-bg-byellow { background-color: var(--ansi-byellow); }
+.ansi-bg-bblue { background-color: var(--ansi-bblue); }
+.ansi-bg-bmagenta { background-color: var(--ansi-bmagenta); }
+.ansi-bg-bcyan { background-color: var(--ansi-bcyan); }
+.ansi-bg-bwhite { background-color: var(--ansi-bwhite); }
+/* 反显（ESC[7m）时只设了一侧颜色，另一侧用卡片自己的前景/背景顶上。 */
+.ansi-fg-default { color: var(--atc-bg); }
+.ansi-bg-default { background-color: var(--atc-text); }
+.ansi-bold { font-weight: 700; }
+.ansi-dim { opacity: .62; }
+.ansi-italic { font-style: italic; }
+.ansi-underline { text-decoration: underline; }
+.ansi-strike { text-decoration: line-through; }
 
 /* Diff rows — Cursor-style unified diff */
 .atc-diff {
