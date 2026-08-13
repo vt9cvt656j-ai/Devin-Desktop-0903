@@ -23912,6 +23912,33 @@ async function sendPrompt(text, attachments = [], readyConfig = null) {
   // (the visible bubble and stored history keep just the "@path" the user typed).
   let _atContext = "";
   const _mentioned = [...text.matchAll(/(?:^|\s)@([^\s]+)/g)].map((m) => m[1]);
+  /*
+   * `@mcp:服务/uri` → 发送前把资源内容读进这一轮上下文。
+   *
+   * 和 @文件 同一个道理：用户已经指着这份东西说"看这个"了，正确的工具调用数是 0。
+   * 让模型自己去调 `mcp__服务__read_resource` 意味着多一轮往返，而且它多半想不起来。
+   *
+   * 刻意**不**依赖 _contextRoot：MCP 资源不属于任何工作区，没打开文件夹时照样该能用。
+   * 权限门在这里不适用——这是用户自己从菜单里挑的，不是模型发起的调用。
+   */
+  const _mcpRefs = [...text.matchAll(/(?:^|\s)@mcp:([^\s@]+)/gi)]
+    .map((m) => m[1]).filter((v, i, a) => a.indexOf(v) === i).slice(0, 4);
+  if (!_agentLightTurn && _mcpRefs.length && inTauri) {
+    for (const ref of _mcpRefs) {
+      const slash = ref.indexOf("/");
+      const server = slash > 0 ? ref.slice(0, slash) : "";
+      const uri = slash > 0 ? ref.slice(slash + 1) : "";
+      if (!server || !uri) continue;
+      try {
+        const out = await _invokeCapped("mcp_read_resource", { name: server, uri }, 60_000, `MCP 资源 ${ref}`);
+        const body = _mcpResponseText(out);
+        _atContext += `\n\nMCP 资源 ${server} · ${uri}:\n\`\`\`\n${_contextSnippet(body, 6000, uri)}\n\`\`\``;
+      } catch (e) {
+        _atContext += `\n\n（MCP 资源 ${server} · ${uri} 读取失败：${String(e?.message || e).slice(0, 120)}）`;
+      }
+    }
+  }
+
   if (!_agentLightTurn && _mentioned.length && _contextRoot) {
     const _r = _contextRoot.replace(/\/$/, "");
     const _seen = new Set();
@@ -23928,6 +23955,10 @@ async function sendPrompt(text, attachments = [], readyConfig = null) {
     for (const rel of _mentioned.slice(0, 8)) {
       if (_seen.has(rel)) continue;
       _seen.add(rel);
+      // `@mcp:服务/uri` 不是本地路径。不摘出去的话下面会拿它去 readTextFile / readDir，
+      // 两次都抛、被 catch 静默吞掉——白占一个提及名额，一点上下文都没换来。
+      // 真正的读取在这个 if 块之后单独做（MCP 资源不需要 _contextRoot，没打开文件夹也能用）。
+      if (/^mcp:/i.test(rel)) continue;
       try {
         const fp = rel.startsWith("/") ? rel : _r + "/" + rel.replace(/^\.?\//, "");
         try {
@@ -57751,7 +57782,10 @@ function _makeComposerChip(rel, kind = "file", labelText = "") {
   } else {
     icon = kind === "model"
       ? iconSvg(brandOf(rel).sym, brandOf(rel).cls)
-      : iconSvg(`i-brand-${kind}`, "ic--doc");
+      // MCP 不是"品牌"，没有 i-brand-mcp 这个符号；拼出来的名字找不到会静默渲染成空白。
+      : kind === "mcp"
+        ? iconSvg("i-mcp", "ic--doc")
+        : iconSvg(`i-brand-${kind}`, "ic--doc");
   }
   const nameEl = document.createElement("span");
   nameEl.className = "composer-chip__name";
@@ -58195,6 +58229,9 @@ const _AT_CATEGORIES = [
   { id: "directory", label: "Directory", hint: "Pick a folder from this workspace", icon: "i-folder-open" },
   { id: "github", label: "GitHub", hint: "Work in a connected repository", icon: "i-brand-github" },
   { id: "gitlab", label: "GitLab", hint: "Work in a connected repository", icon: "i-brand-gitlab" },
+  // MCP 的第三类能力：resources。数据库 MCP 列表、Notion 列页面、文件系统列允许访问的目录。
+  // 和上面几类一样，选中之后内容作为这一轮的上下文进去，不是让模型自己去想起来调工具。
+  { id: "mcp", label: "MCP", hint: "Attach a resource from a connected MCP server", icon: "i-mcp" },
 ];
 
 /** null = the category list; otherwise the branch being browsed. */
@@ -58235,6 +58272,58 @@ function _atCategoryRows(query) {
       detail: c.hint,
       onPick: () => { _atMode = c.id; _renderAtMenu(); },
     }));
+}
+
+/**
+ * 已连接 MCP 服务提供的资源。
+ *
+ * 资源有两种：固定 uri 的（`postgres://…/users`）和模板（`file:///{path}`）。模板选中时
+ * 先问变量再拼——直接把 `{path}` 原样发过去，服务端只会回一个看不懂的错。
+ */
+function _atMcpRows(query) {
+  const q = String(query || "").toLowerCase();
+  const rows = [];
+  for (const item of Array.isArray(_mcpResourceCache) ? _mcpResourceCache : []) {
+    const server = String(item?.server || "");
+    const uri = String(item?.uri || item?.uriTemplate || "");
+    if (!server || !uri) continue;
+    const name = String(item?.name || uri);
+    const hay = `${server} ${name} ${uri}`.toLowerCase();
+    if (q && !hay.includes(q)) continue;
+    const detail = [server, String(item?.description || "").replace(/\s+/g, " ").trim() || uri]
+      .filter(Boolean).join(" · ");
+    rows.push({
+      kind: "mcp",
+      icon: "i-mcp",
+      iconClass: "ic--doc",
+      name: item?.template ? `${name}（模板）` : name,
+      detail: detail.slice(0, 120),
+      onPick: () => { void _pickMcpResource(server, item, name); },
+    });
+  }
+  if (!rows.length) {
+    rows.push({
+      kind: "hint",
+      icon: "i-mcp",
+      name: _mcpConnected.length ? "已连接的服务没有提供资源" : "还没连上 MCP 服务",
+      detail: _mcpConnected.length ? "resources 是可选能力，不是每个服务都有" : "在 高级设置 → MCP 里添加",
+      onPick: () => {},
+    });
+  }
+  return rows.slice(0, 30);
+}
+
+/// 模板要先把 `{var}` 填掉。填完插一个 chip，真正的读取留到发送时（见 sendPrompt 里的
+/// `@mcp:` 预取）——选中的那一刻就去读，用户改主意删掉 chip 的话那次读就白花了。
+async function _pickMcpResource(server, item, label) {
+  let uri = String(item?.uri || item?.uriTemplate || "");
+  const vars = [...uri.matchAll(/\{([^{}]+)\}/g)].map((m) => m[1]);
+  if (vars.length) {
+    const filled = await _askMcpPromptArgs(server, label, vars.map((v) => ({ name: v, required: true, description: `填 ${uri} 里的 ${v}` })));
+    if (filled === null) return;
+    for (const v of vars) uri = uri.replace(new RegExp(`\\{${v.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\}`, "g"), String(filled[v] ?? ""));
+  }
+  _insertAtChip({ kind: "mcp", value: `${server}/${uri}`, label });
 }
 
 function _atModelRows(query) {
@@ -58330,7 +58419,8 @@ async function _renderAtMenu() {
   const query = tok.query || "";
 
   let rows;
-  if (_atMode === "model") rows = _atModelRows(query);
+  if (_atMode === "mcp") rows = _atMcpRows(query);
+  else if (_atMode === "model") rows = _atModelRows(query);
   else if (_atMode === "directory") rows = await _atDirectoryRows(query);
   else if (_atMode === "github" || _atMode === "gitlab") {
     rows = _atRepoRows(_atMode, query);
@@ -59236,6 +59326,114 @@ const _SLASH = [
   { cmd: "remote", desc: "Connect to a remote machine", action: () => openRemoteDialog() },
 ];
 
+// ── MCP 服务声明的提示词模板 → 斜杠命令 ────────────────────────────────────
+//
+// MCP 有三类能力：tools、resources、prompts。前两类这个 IDE 一直在用，**prompts 一直
+// 只对模型可见**——包成一个 `mcp__服务__get_prompt` 工具丢给它，指望它自己想起来去调。
+// 实际上模型基本想不起来，于是服务作者精心写好的模板等于没有。
+//
+// 可这些模板恰恰是最该给人用的东西：写它们的人知道怎么用自己的工具最有效。所以把它们
+// 摆到用户敲 `/` 就能看见的地方，名字用 `服务:模板`，和 Claude Code 的 `/mcp__server__prompt`
+// 是同一个意思，只是短一些好打。
+//
+// 数据本来就在 `_mcpPromptCache` 里躺着（握手时 prompts/list 一并取回），这里只是把它
+// 变成斜杠菜单认得的形状。
+function _mcpSlashCommands() {
+  const rows = [];
+  for (const item of Array.isArray(_mcpPromptCache) ? _mcpPromptCache : []) {
+    const server = String(item?.server || "").trim();
+    const name = String(item?.name || "").trim();
+    if (!server || !name) continue;
+    const args = Array.isArray(item?.arguments) ? item.arguments : [];
+    const required = args.filter((a) => a && a.required).length;
+    rows.push({
+      cmd: `${server}:${name}`,
+      desc: String(item?.description || "").replace(/\s+/g, " ").trim()
+        || (args.length ? `${server} 的提示词模板（${args.length} 个参数${required ? `，${required} 个必填` : ""}）` : `${server} 的提示词模板`),
+      mcp: { server, prompt: name, args },
+    });
+  }
+  return rows.sort((a, b) => (a.cmd < b.cmd ? -1 : a.cmd > b.cmd ? 1 : 0)).slice(0, 40);
+}
+
+/// 模板要参数就先问一遍。必填项没填不让确认——空着提交多半换来一个服务端报错，
+/// 那时候用户已经不知道是哪一步错了。
+function _askMcpPromptArgs(server, prompt, args) {
+  const list = (Array.isArray(args) ? args : []).filter((a) => a && a.name);
+  if (!list.length) return Promise.resolve({});
+  return new Promise((resolve) => {
+    const m = _chatToolModal({ title: `${server} · ${prompt}`, icon: _ICON_MCP });
+    let settled = false;
+    const done = (value) => { if (settled) return; settled = true; m.close(); resolve(value); };
+    // 点右上角 ✕ 或按 Esc 走 _chatToolModal 自己的 close，这里补一个观察者把它翻译成"取消"。
+    const observer = new MutationObserver(() => { if (!document.body.contains(m.overlay)) { observer.disconnect(); done(null); } });
+    observer.observe(document.body, { childList: true });
+
+    const form = document.createElement("div");
+    form.className = "ctp-form";
+    const intro = document.createElement("div");
+    intro.className = "ctp-intro";
+    intro.textContent = "这个提示词模板需要几个参数，填完会展开成完整提示词放进输入框。";
+    form.appendChild(intro);
+    const inputs = [];
+    for (const arg of list) {
+      const label = document.createElement("label");
+      label.className = "ctp-lbl";
+      label.textContent = String(arg.name) + (arg.required ? " （必填）" : "（可选）");
+      const input = document.createElement("input");
+      input.className = "ctp-input";
+      input.placeholder = String(arg.description || "").replace(/\s+/g, " ").trim().slice(0, 90);
+      form.append(label, input);
+      inputs.push({ name: String(arg.name), required: !!arg.required, input });
+    }
+    const foot = document.createElement("div");
+    foot.className = "ctp-foot";
+    const cancel = document.createElement("button");
+    cancel.className = "ctp-btn"; cancel.type = "button"; cancel.textContent = "取消";
+    const ok = document.createElement("button");
+    ok.className = "ctp-btn ctp-btn--primary"; ok.type = "button"; ok.textContent = "生成提示词";
+    foot.append(cancel, ok);
+    form.appendChild(foot);
+    m.body.appendChild(form);
+
+    const submit = () => {
+      const out = {};
+      for (const f of inputs) {
+        const value = f.input.value.trim();
+        if (f.required && !value) { f.input.focus(); showToast(`「${f.name}」是必填参数`); return; }
+        if (value) out[f.name] = value;
+      }
+      observer.disconnect();
+      done(out);
+    };
+    ok.addEventListener("click", submit);
+    cancel.addEventListener("click", () => { observer.disconnect(); done(null); });
+    form.addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); submit(); } });
+    setTimeout(() => { try { inputs[0].input.focus(); } catch {} }, 0);
+  });
+}
+
+/// 取模板 → 展开 → 放进输入框。**不自动发送**：模板是起点不是终点，用户多半还要补一句。
+async function _runMcpSlashPrompt(entry) {
+  const { server, prompt, args } = entry.mcp;
+  if (!inTauri) { showToast("MCP 提示词模板只能在桌面 App 里用"); return; }
+  const filled = await _askMcpPromptArgs(server, prompt, args);
+  if (filled === null) return;   // 用户取消
+  promptEl.value = `正在取 ${server} 的提示词模板「${prompt}」…`;
+  try {
+    const out = await _invokeCapped("mcp_get_prompt", { name: server, prompt, args: filled }, 60_000, `MCP prompt ${server}/${prompt}`);
+    const text = _mcpResponseText(out);
+    if (!text || text === "(空结果)") { promptEl.value = ""; showToast(`${server} 没有返回这个模板的内容`); return; }
+    promptEl.value = text;
+    promptEl.dispatchEvent(new Event("input", { bubbles: true }));
+    promptEl.focus();
+    try { _ceSetCaret(promptEl.value.length); } catch {}
+  } catch (e) {
+    promptEl.value = "";
+    showToast(`取 ${server}/${prompt} 失败：${String(e?.message || e).slice(0, 120)}`);
+  }
+}
+
 function _sessionMemoryStats(session) {
   const memory = session?.memory;
   const transcript = Array.isArray(memory?.transcript) && memory.transcript.length
@@ -59515,10 +59713,18 @@ function _renderSlashActive() {
   });
 }
 function _updateSlashMenu() {
-  const m = /^\/(\w*)$/.exec(promptEl.value);
+  // `\w*` 认不出 MCP 那些命令：服务名里有 `-`（sequential-thinking），`服务:模板` 里还有 `:`。
+  const m = /^\/([\w:.\-]*)$/.exec(promptEl.value);
   if (!m) return _hideSlash();
   const q = m[1].toLowerCase();
-  _slashMatches = _SLASH.filter((s) => s.cmd.startsWith(q));
+  // 匹配 `服务:模板` 的整体，也匹配冒号后面的模板名——记得住模板叫什么、想不起来是哪个
+  // 服务提供的，是最常见的情形。
+  _slashMatches = [..._SLASH, ..._mcpSlashCommands()].filter((s) => {
+    const cmd = s.cmd.toLowerCase();
+    if (cmd.startsWith(q)) return true;
+    const colon = cmd.indexOf(":");
+    return colon > 0 && cmd.slice(colon + 1).startsWith(q);
+  });
   if (!_slashMatches.length) return _hideSlash();
   _slashActive = 0;
   const r = promptEl.getBoundingClientRect();
@@ -59536,6 +59742,8 @@ function _pickSlash(i) {
   _hideSlash();
   // Action commands (e.g. /sessions) run a UI action instead of filling a prompt.
   if (typeof s.action === "function") { promptEl.value = ""; promptEl.style.height = "auto"; try { s.action(); } catch (e) { console.warn("[slash]", e); } return; }
+  // MCP 模板要先取回来（可能还要先问参数），异步，所以清空输入框之后再走。
+  if (s.mcp) { promptEl.value = ""; void _runMcpSlashPrompt(s); return; }
   promptEl.value = s.prompt;
   promptEl.style.height = "auto";
   promptEl.style.height = Math.min(promptEl.scrollHeight, 160) + "px";

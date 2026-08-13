@@ -467,7 +467,11 @@ test("Directory is its own @ category, listing folders from the workspace", () =
   // Order matters: it sits below Files, which is where it was asked for.
   const cats = SRC.slice(SRC.indexOf("const _AT_CATEGORIES = ["), SRC.indexOf("];", SRC.indexOf("const _AT_CATEGORIES = [")));
   const order = [...cats.matchAll(/id: "(\w+)"/g)].map((m) => m[1]);
-  assert.deepEqual(order, ["model", "files", "directory", "github", "gitlab"]);
+  // MCP 排在最后：它是 2026-08-13 新加的一类（已连接 MCP 服务提供的 resources），
+  // 加在末尾就不会把上面几条的位置挪走——那几条的顺序是有人专门要求过的。
+  assert.deepEqual(order, ["model", "files", "directory", "github", "gitlab", "mcp"]);
+  assert.match(SRC, /if \(_atMode === "mcp"\) rows = _atMcpRows\(query\)/,
+    "MCP 这一类也要接进路由，不能只列在表里");
   assert.ok(INDEX.includes('id="i-folder-open"'), "its icon must be a real symbol");
   assert.match(SRC, /else if \(_atMode === "directory"\) rows = await _atDirectoryRows\(query\)/,
     "and it must be routed, not just listed");

@@ -41,6 +41,19 @@ function extractFn(name) {
   throw new Error(`unbalanced braces extracting ${name}`);
 }
 
+/**
+ * 剥掉注释再断言。
+ *
+ * 这个坑今天踩了两次：解释一处改动的注释里，几乎一定会原样引用它删掉或绕开的那段代码，
+ * 于是"这段代码不该出现"和"A 要排在 B 前面"这类断言全在跟自己的注释较劲。
+ * logic.test.mjs 顶部有同名工具，理由一模一样。
+ */
+function stripJsComments(source) {
+  return String(source)
+    .replace(/\/\*[\s\S]*?\*\//g, "")
+    .replace(/(^|[^:])\/\/[^\n]*/g, "$1");
+}
+
 function load(name, deps = {}) {
   const keys = Object.keys(deps);
   return new Function(...keys, `${extractFn(name)}\n;return ${name};`)(...keys.map((k) => deps[k]));
@@ -279,4 +292,185 @@ test("拒绝就是拒绝，不会被记成同意", async () => {
   });
   assert.equal(await approve("MCP", "/w/.mcp.json", "T", ["a"]), false);
   assert.equal(stored.size, 0, "拒绝不该写进已批准名单");
+});
+
+// ── MCP 的两个 UI 入口 ──────────────────────────────────────────────────────
+//
+// MCP 有三类能力：tools / resources / prompts。这个 IDE 一直只把第一类摆到了台面上，
+// 后两类虽然握手时就取回来了（_mcpResourceCache / _mcpPromptCache 里躺着），却只以
+// "再包一个工具丢给模型"的形式存在——指望模型自己想起来去调，而它基本想不起来。
+//
+// 入口一：敲 `/` 的菜单里直接列出各服务的提示词模板（`服务:模板`）。
+// 入口二：敲 `@` 的提及菜单里多一类 MCP 资源，选中后内容进这一轮上下文。
+
+const _mcpSlashCommands = (cache) => load("_mcpSlashCommands", { _mcpPromptCache: cache })();
+
+test("MCP 提示词模板变成 `服务:模板` 形式的斜杠命令", () => {
+  const rows = _mcpSlashCommands([
+    { server: "github", name: "review-pr", description: "审查一个 PR", arguments: [{ name: "pr", required: true }] },
+    { server: "ctx7", name: "docs", description: "", arguments: [] },
+  ]);
+  assert.deepEqual(rows.map((r) => r.cmd), ["ctx7:docs", "github:review-pr"], "要按名字排序");
+  assert.equal(rows[1].desc, "审查一个 PR");
+  assert.deepEqual(rows[1].mcp, { server: "github", prompt: "review-pr", args: [{ name: "pr", required: true }] });
+});
+
+test("模板没写说明时，退而告诉用户它要几个参数、几个必填", () => {
+  const [row] = _mcpSlashCommands([
+    { server: "db", name: "q", arguments: [{ name: "a", required: true }, { name: "b" }] },
+  ]);
+  assert.match(row.desc, /2 个参数/);
+  assert.match(row.desc, /1 个必填/);
+});
+
+test("缺服务名或模板名的条目直接丢掉，不能变成一条点不动的命令", () => {
+  assert.deepEqual(_mcpSlashCommands([
+    { server: "", name: "x" }, { server: "y", name: "" }, { name: "z" }, null,
+  ]), []);
+});
+
+test("没连 MCP 时不产生任何斜杠命令", () => {
+  assert.deepEqual(_mcpSlashCommands([]), []);
+  assert.deepEqual(_mcpSlashCommands(undefined), []);
+});
+
+// ── 斜杠菜单的匹配：跑真的 _updateSlashMenu ────────────────────────────────
+
+function makeSlashMatcher(mcpRows) {
+  const stub = {
+    _SLASH: [{ cmd: "sessions", desc: "" }, { cmd: "memory", desc: "" }],
+    _mcpSlashCommands: () => mcpRows,
+    promptEl: { value: "", getBoundingClientRect: () => ({ left: 0, top: 0, width: 400 }) },
+    _slashMenu: { style: {}, hidden: true },
+    window: { innerHeight: 800 },
+    _renderSlashActive: () => {},
+  };
+  const keys = Object.keys(stub);
+  return new Function(...keys, `
+    let _slashMatches = [], _slashActive = -1;
+    function _hideSlash() { _slashMatches = []; }
+    ${extractFn("_updateSlashMenu")}
+    return (typed) => { _slashMatches = []; promptEl.value = typed; _updateSlashMenu(); return _slashMatches.map((s) => s.cmd); };
+  `)(...keys.map((k) => stub[k]));
+}
+
+const MCP_ROWS = [
+  { cmd: "github:review-pr", desc: "", mcp: {} },
+  { cmd: "sequential-thinking:plan", desc: "", mcp: {} },
+];
+
+test("斜杠触发的正则放得下服务名里的连字符和 `服务:模板` 的冒号", () => {
+  const match = makeSlashMatcher(MCP_ROWS);
+  // 原来的 /^\/(\w*)$/ 到这两个都会直接不匹配 → 菜单根本不弹
+  assert.deepEqual(match("/sequential-thinking"), ["sequential-thinking:plan"]);
+  assert.deepEqual(match("/github:rev"), ["github:review-pr"]);
+});
+
+test("只记得模板名、想不起是哪个服务，也能搜到", () => {
+  const match = makeSlashMatcher(MCP_ROWS);
+  assert.deepEqual(match("/review"), ["github:review-pr"]);
+  assert.deepEqual(match("/plan"), ["sequential-thinking:plan"]);
+});
+
+test("原有的内置命令一条都没少", () => {
+  const match = makeSlashMatcher(MCP_ROWS);
+  assert.deepEqual(match("/"), ["sessions", "memory", "github:review-pr", "sequential-thinking:plan"]);
+  assert.deepEqual(match("/se"), ["sessions", "sequential-thinking:plan"]);
+});
+
+test("输入框里不止一个斜杠命令时不弹菜单（正则钉着整行）", () => {
+  const match = makeSlashMatcher(MCP_ROWS);
+  assert.deepEqual(match("帮我 /review 一下"), []);
+  assert.deepEqual(match("/review 这个 PR"), []);
+});
+
+// ── @ 菜单里的 MCP 资源 ────────────────────────────────────────────────────
+
+function makeAtMcpRows({ resources = [], connected = [] } = {}) {
+  return load("_atMcpRows", {
+    _mcpResourceCache: resources,
+    _mcpConnected: connected,
+    _pickMcpResource: () => {},
+  });
+}
+
+test("资源列出来带服务名和说明，模板另作标记", () => {
+  const rows = makeAtMcpRows({
+    connected: ["pg"],
+    resources: [
+      { server: "pg", uri: "postgres://db/users", name: "users", description: "用户表" },
+      { server: "fs", uriTemplate: "file:///{path}", name: "任意文件", template: true },
+    ],
+  })("");
+  assert.equal(rows[0].name, "users");
+  assert.match(rows[0].detail, /^pg · 用户表/);
+  assert.equal(rows[1].name, "任意文件（模板）", "模板要标出来——它选中后还要填变量");
+  assert.ok(rows.every((r) => r.kind === "mcp" && typeof r.onPick === "function"));
+});
+
+test("按服务名、资源名、uri 三样里的任意一样都能搜到", () => {
+  const rows = makeAtMcpRows({
+    connected: ["pg"],
+    resources: [
+      { server: "pg", uri: "postgres://db/users", name: "users" },
+      { server: "notion", uri: "notion://page/42", name: "路线图" },
+    ],
+  });
+  assert.deepEqual(rows("notion").map((r) => r.name), ["路线图"]);
+  assert.deepEqual(rows("users").map((r) => r.name), ["users"]);
+  assert.deepEqual(rows("db/us").map((r) => r.name), ["users"]);
+});
+
+test("空列表要说清是「没连服务」还是「连了但这些服务没有资源」——两句话不一样", () => {
+  const none = makeAtMcpRows({ connected: [], resources: [] })("");
+  assert.equal(none.length, 1);
+  assert.match(none[0].name, /还没连上/);
+  assert.match(none[0].detail, /高级设置/);
+
+  const connectedNoRes = makeAtMcpRows({ connected: ["memory"], resources: [] })("");
+  assert.match(connectedNoRes[0].name, /没有提供资源/);
+  assert.match(connectedNoRes[0].detail, /可选能力/);
+});
+
+test("缺 server 或 uri 的条目丢掉，不能插出一个读不了的 chip", () => {
+  const rows = makeAtMcpRows({ connected: ["x"], resources: [
+    { server: "x" }, { uri: "a://b" }, null, { server: "x", uri: "a://b", name: "好的" },
+  ] })("");
+  assert.deepEqual(rows.map((r) => r.name), ["好的"]);
+});
+
+// ── 发送时把 @mcp: 换成真内容 ──────────────────────────────────────────────
+
+test("@mcp: 的解析正则认得 服务/uri，并且去重、限量", () => {
+  const grab = (text) => [...text.matchAll(/(?:^|\s)@mcp:([^\s@]+)/gi)]
+    .map((m) => m[1]).filter((v, i, a) => a.indexOf(v) === i).slice(0, 4);
+  assert.deepEqual(grab("看看 @mcp:pg/postgres://db/users 这个表"), ["pg/postgres://db/users"]);
+  assert.deepEqual(grab("@mcp:a/x @mcp:a/x"), ["a/x"], "同一个资源只读一次");
+  assert.deepEqual(grab("@mcp:a/1 @mcp:a/2 @mcp:a/3 @mcp:a/4 @mcp:a/5").length, 4, "最多四个，别把上下文撑爆");
+  assert.deepEqual(grab("邮箱 a@mcp:b/c 不算"), [], "必须前面是行首或空白");
+});
+
+test("@文件 扫描要跳过 mcp: 前缀——否则拿它去读本地文件，白占一个提及名额", () => {
+  // 锚点钉在循环头上，不要用 "const _mentioned" —— 工作树里 `const _mentionedAll` 排在
+  // 它前面，indexOf 会先命中那一个，窗口就偏到别处去了。
+  const loopStart = SRC.indexOf("for (const rel of _mentioned.slice(0, 8))");
+  assert.ok(loopStart > 0, "找不到 @文件 的扫描循环");
+  const loop = stripJsComments(SRC.slice(loopStart, loopStart + 1200));
+  assert.match(loop, /if \(\/\^mcp:\/i\.test\(rel\)\) continue;/,
+    "文件扫描循环里必须把 mcp: 摘出去");
+  assert.ok(loop.indexOf("/^mcp:/i") < loop.indexOf("readTextFile"),
+    "跳过要发生在 readTextFile 之前，否则等于没跳");
+});
+
+test("MCP 资源的读取不依赖工作区根目录——没打开文件夹时它照样该能用", () => {
+  // 窗口切到自己这一段为止：后面紧跟着的就是 @文件 那个 if，它本来就该带 _contextRoot，
+  // 窗口开大一点这条断言就变成在骂邻居。
+  const blockStart = SRC.indexOf("const _mcpRefs");
+  assert.ok(blockStart > 0, "找不到 @mcp: 预取块");
+  const blockEnd = SRC.indexOf("if (!_agentLightTurn && _mentioned.length", blockStart);
+  assert.ok(blockEnd > blockStart, "找不到 @mcp: 预取块的结尾");
+  const block = SRC.slice(blockStart, blockEnd);
+  assert.match(block, /if \(!_agentLightTurn && _mcpRefs\.length && inTauri\)/);
+  assert.doesNotMatch(block, /_contextRoot/, "MCP 资源不属于任何工作区，不能被 _contextRoot 挡住");
+  assert.match(block, /catch[\s\S]{0,120}读取失败/, "读失败要在上下文里留一行，不能静默吞掉");
 });
