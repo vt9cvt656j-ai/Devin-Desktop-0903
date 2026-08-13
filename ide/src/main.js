@@ -15374,6 +15374,21 @@ const _ICON_RULES = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" 
   const _menu = document.getElementById("capabilitiesMenu");
   const _skillItem = document.getElementById("capabilitySkillsItem");
   const _rulesItem = document.getElementById("capabilityRulesItem");
+  const _items = () => [_skillItem, _rulesItem].filter(Boolean);
+  /*
+   * 状态直接画在行上，不加一行字。
+   *
+   * 副标题删掉之后（那两句本来就是错的：技能面板同时装项目技能，"所有项目通用"是假话），
+   * 菜单里就没有任何地方能看出"我到底开着几个技能""我写没写过规则"。用 .is-active 的家法
+   * 把状态变成颜色——`.menu__item.is-active` 全应用都是这么表达的，而且**不占宽度**。
+   * 写成文字要多占三十几像素，正好把刚收窄的宽度顶回去。
+   */
+  const _paintCapabilityState = () => {
+    try {
+      _skillItem?.classList.toggle("is-active", _activeSkillIds.size > 0);
+      _rulesItem?.classList.toggle("is-active", String(_userRulesText || "").trim().length > 0);
+    } catch {}
+  };
   /*
    * 菜单水平对齐到 ⋮ 按钮下方。
    *
@@ -15406,7 +15421,7 @@ const _ICON_RULES = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" 
     if (_capBtn) _capBtn.setAttribute("aria-expanded", "false");
   };
   const _openCapabilitiesMenu = () => {
-    if (_menu) { _menu.hidden = false; _alignCapabilitiesMenu(); }
+    if (_menu) { _paintCapabilityState(); _menu.hidden = false; _alignCapabilitiesMenu(); }
     if (_capBtn) _capBtn.setAttribute("aria-expanded", "true");
   };
   const _toggleCapabilitiesMenu = () => {
@@ -15433,6 +15448,27 @@ const _ICON_RULES = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" 
   }
   // 窗口大小一变，之前算好的 left 就不对了。菜单开着才重算，关着不做无用功。
   window.addEventListener("resize", () => { if (_menu && !_menu.hidden) _alignCapabilitiesMenu(); });
+  /*
+   * role="menu" 得配得上这个名字。
+   *
+   * 之前只处理 Escape：没有上下键、打开时不移焦点。屏幕阅读器会先播报"菜单"，然后发现它
+   * 不像菜单。这个应用里 @ 补全、斜杠命令、快速打开三处都实现了方向键，照同一套写。
+   */
+  const _moveCapabilityFocus = (delta) => {
+    const list = _items();
+    if (!list.length) return;
+    const at = list.indexOf(document.activeElement);
+    const next = at < 0 ? (delta > 0 ? 0 : list.length - 1) : (at + delta + list.length) % list.length;
+    try { list[next].focus(); } catch {}
+  };
+  if (_menu) {
+    _menu.addEventListener("keydown", (ev) => {
+      if (ev.key === "ArrowDown") { ev.preventDefault(); _moveCapabilityFocus(1); }
+      else if (ev.key === "ArrowUp") { ev.preventDefault(); _moveCapabilityFocus(-1); }
+      else if (ev.key === "Home") { ev.preventDefault(); try { _items()[0]?.focus(); } catch {} }
+      else if (ev.key === "End") { ev.preventDefault(); const l = _items(); try { l[l.length - 1]?.focus(); } catch {} }
+    });
+  }
   document.addEventListener("click", (ev) => {
     if (_menu?.hidden) return;
     if (_wrap && ev.target instanceof Node && _wrap.contains(ev.target)) return;
@@ -62581,6 +62617,13 @@ window.addEventListener(
 
 initLocale();
 applyPlatformShortcutLabels();
+// 用户规则必须在启动时读一次。
+//
+// 上一版漏了这一行，后果是**功能等于没做**：`_userRulesText` 初值是空串，唯一填它的地方
+// 是打开规则面板时那段内联读取。也就是说重启 App 之后，用户上周写的规则一轮都没进过提示词，
+// 直到他碰巧再打开一次那个面板——而且 `_userRulesBlock()` 只会安静地返回空串，不报错、
+// 没有任何迹象。菜单上"每轮都遵守"那句话在冷启动后是假的。
+void _refreshUserRules();
 Promise.all([
   loadConfigAsync().then(() => refreshModelBadge()),
   loadEditorPrefs().then(() => applyEditorPrefs()),
