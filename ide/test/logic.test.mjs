@@ -22900,3 +22900,36 @@ test("终端卡片不再用左侧色条重复退出状态，但风险警示线�
   assert.match(APP_CSS, /\.atc-term-exit--ok\s*\{/);
   assert.match(APP_CSS, /\.atc-term-exit--err\s*\{/);
 });
+
+// Write / Edit 卡片：不描绿边、不加绿色竖条
+//
+// 用户原话：「Write，Edit 这种卡片不要有绿色线条包围，然后左侧那个粗绿色线条也删除，太丑了，
+// 卡片谷歌风好好设计，可以看看其他的卡片」。
+//
+// 症结是"已接受"被当成了需要高亮的状态——可它是这类卡片的**常态**。一屏十几张 Edited 卡，
+// 就是十几圈绿边加十几条绿杠，成了背景噪音，还把整套卡片本来就有的视觉语言（白底 + 极淡边 +
+// 柔和阴影 + 左侧彩色图标 chip）冲掉了。状态本来就有更好的载体：橙色铅笔 chip 说明这是编辑，
+// 右侧 `+5` 说明改了多少。
+test("已接受的工具卡和普通卡片长得一样——不描绿边也不加绿色竖条", () => {
+  const ruleBodies = (selector) => {
+    const re = new RegExp(`(^|[},])\\s*[^{}]*\\.${selector}\\b[^{}]*\\{([^}]*)\\}`, "g");
+    return [...APP_CSS.matchAll(re)].map((m) => m[2]);
+  };
+  const accepted = ruleBodies("agent-tool-step--accepted").join(";");
+  assert.equal(accepted.trim(), "",
+    `.agent-tool-step--accepted 又有样式了：${accepted}`);
+  // 浅色删了深色留着的话，两套主题会长得不一样
+  assert.doesNotMatch(APP_CSS, /\.agent-tool-step--accepted\s*\{[^}]*border-color/);
+  // 那条 3px 竖条是靠 ::before 画的
+  assert.doesNotMatch(APP_CSS, /agent-tool-step--accepted[^{]*::before/);
+
+  // 卡片的身份改由已有元素承担：编辑类的图标 chip 是橙色，和读取(绿)/命令(蓝)区分开
+  assert.match(APP_CSS, /\.agent-tool-step--write \.atc-type-icon,[\s\S]{0,80}background:\s*#feefe3/);
+  assert.match(APP_CSS, /\.agent-tool-step--read \.atc-type-icon \{ background: #e6f4ea/);
+
+  // 类名要保留：JS 照常打，rejected 拿它做对照
+  assert.match(SRC, /agent-tool-step--accepted/);
+  // 被拒绝的卡片仍然要看得出来（那是异常态，值得标）
+  assert.match(APP_CSS, /\.agent-tool-step--rejected \{ opacity/);
+  assert.match(APP_CSS, /\.agent-tool-step--rejected \.atc-path \{ text-decoration: line-through/);
+});
