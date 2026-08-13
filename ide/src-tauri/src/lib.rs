@@ -260,6 +260,8 @@ pub fn run() {
             files::replace_in_project,
             conversation_store::conversation_snapshot_save,
             conversation_store::conversation_snapshot_load,
+            conversation_store::conversation_sessions_index,
+            conversation_store::conversation_session_load,
             conversation_store::conversation_transcript_append,
             conversation_store::conversation_transcript_load,
             conversation_store::conversation_transcript_window,

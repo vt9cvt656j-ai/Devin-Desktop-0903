@@ -404,6 +404,11 @@ async function tauriBackend() {
     readTextFile: (path) => core.invoke("read_text_file", { path }),
     conversationSnapshotSave: (snapshot) => core.invoke("conversation_snapshot_save", { snapshot }),
     conversationSnapshotLoad: () => core.invoke("conversation_snapshot_load"),
+    // 全部会话的轻量清单（只给 /sessions 列表用，不含 recent/transcript）。
+    // 快照里的 closedSessions 在 Rust 侧封顶 200、前端又 slice(0,80)，关掉的会话过一阵
+    // 就从清单里消失——而 conversation_sessions 表永不删除，这条路能看到全部。
+    conversationSessionsIndex: () => core.invoke("conversation_sessions_index"),
+    conversationSessionLoad: (sessionId) => core.invoke("conversation_session_load", { sessionId }),
     conversationTranscriptAppend: (session, message, sequence) => core.invoke("conversation_transcript_append", { session, message, sequence }),
     conversationTranscriptLoad: (sessionId) => core.invoke("conversation_transcript_load", { sessionId }),
     conversationTranscriptWindow: (sessionId, start, limit) => core.invoke("conversation_transcript_window", { sessionId, start, limit }),
@@ -58997,7 +59002,7 @@ if (typeof window !== "undefined") {
 }
 
 const _SLASH = [
-  { cmd: "sessions", desc: "Browse and switch conversations", action: () => _openSessionPicker() },
+  { cmd: "sessions", desc: "Browse and switch conversations", action: () => { void _openSessionPicker(); } },
   { cmd: "memory", desc: "Manage project memory", action: () => openMemoryPanel() },
   { cmd: "remote", desc: "Connect to a remote machine", action: () => openRemoteDialog() },
 ];
@@ -59137,6 +59142,47 @@ function _sessionPickerEntries() {
   return [...open, ...closed];
 }
 
+/// 内存里装不下的那部分历史会话。
+///
+/// `_closedChatSessions` 是**热副本**，被有意封在 80 条（每条都带着 recent/transcript，
+/// 常驻内存）。但 SQLite 的 `conversation_sessions` 表永不删除，用户开过的每个会话都在。
+/// 以前 /sessions 只读热副本，于是关掉的会话过一阵就"从历史里消失了"——数据一直在，
+/// 是清单没去看它。这里按 id 把已经在内存里的排掉，剩下的作为 archived 行补进清单。
+///
+/// 拿不到就返回空数组：清单退化回旧行为，绝不因为索引查询失败而让整个 /sessions 打不开。
+async function _archivedSessionRows() {
+  if (!inTauri || typeof backend?.conversationSessionsIndex !== "function") return [];
+  let rows = [];
+  try { rows = await backend.conversationSessionsIndex(); } catch (e) {
+    console.warn("[sessions] index load failed:", e);
+    return [];
+  }
+  if (!Array.isArray(rows)) return [];
+  const known = new Set([
+    ...(Array.isArray(_chatSessions) ? _chatSessions : []),
+    ...(Array.isArray(_closedChatSessions) ? _closedChatSessions : []),
+  ].map((s) => s?.id).filter(Boolean));
+  return rows
+    .filter((r) => r && r.sessionId && !known.has(r.sessionId))
+    // 一条内容都没有的空会话不值得占一行——和热副本那边的 _sessionHasRecoverableMemory 同义。
+    .filter((r) => (Number(r.totalTurns) || 0) > 0 || (r.preview || "").trim())
+    .map((r) => ({ row: r, state: "archived" }));
+}
+
+/// 从归档清单里点进一个会话：按 id 取回完整 JSON，塞进 _closedChatSessions，再走既有的恢复路径。
+async function _restoreArchivedSession(sessionId) {
+  if (!sessionId || typeof backend?.conversationSessionLoad !== "function") return null;
+  let data = null;
+  try { data = await backend.conversationSessionLoad(sessionId); } catch (e) {
+    console.warn("[sessions] archived load failed:", e);
+  }
+  if (!data) { showToast("这个会话的记录已经取不回来了"); return null; }
+  _closedChatSessions = (Array.isArray(_closedChatSessions) ? _closedChatSessions : [])
+    .filter((item) => item && item.id !== sessionId);
+  _closedChatSessions.unshift(data);
+  return _restoreClosedChatSession(0);
+}
+
 function _sessionLibraryTotals(entries) {
   const out = { totalTurns: 0, recentCount: 0, summaryCount: 0, fileEvidenceCount: 0, correctionCount: 0 };
   for (const { session } of entries || []) {
@@ -59152,12 +59198,15 @@ function _sessionLibraryTotals(entries) {
 
 // Session picker (/sessions): browse every conversation in this workspace — name,
 // project, mode, message count, last-message preview — and jump into one to continue.
-function _openSessionPicker() {
+async function _openSessionPicker() {
   // Data prep only — the panel is a React island (src/ui/session-picker.jsx). Everything the
   // island needs is flattened to plain values here so it stays presentational and main.js keeps
   // ownership of session state.
   const entries = _sessionPickerEntries();
-  const resumable = entries.filter((entry) => entry.state === "closed").length;
+  // 归档行是异步取的（一次 SQLite 查询）。**先把内存里的画出来再补**，不要让
+  // /sessions 卡在一次查询上——历史多的时候那会是几百毫秒的空白面板。
+  const archived = await _archivedSessionRows();
+  const resumable = entries.filter((entry) => entry.state === "closed").length + archived.length;
   const rows = entries.map(({ session: s, index: i, state }) => {
     const modeObj = _AI_MODES.find((m) => m.id === s.mode);
     const active = state === "open" && i === _activeChatIdx;
@@ -59183,11 +59232,31 @@ function _openSessionPicker() {
       search: _sessionSearchText(s),
     };
   });
+  // 归档行：只有清单信息，没有 session 对象，所以单独拼，不走上面那个 map。
+  const archivedRows = archived.map(({ row: r }, n) => ({
+    key: `archived:${r.sessionId}`,
+    index: n,
+    sessionId: r.sessionId,
+    state: "archived",
+    active: false,
+    name: (r.preview || "").trim().slice(0, 80) || r.name || "（未命名会话）",
+    project: r.project ? (r.project.split("/").filter(Boolean).pop() || "") : "",
+    dot: (_AI_MODES.find((m) => m.id === r.mode)?.color) || "#8a8a8d",
+    meta: [
+      Number(r.totalTurns) ? `${r.totalTurns} turn${r.totalTurns === 1 ? "" : "s"}` : "",
+      r.project ? (r.project.split("/").filter(Boolean).pop() || "") : "",
+    ].filter(Boolean).join(" · "),
+    tag: "resume",
+    preview: r.preview || "",
+    search: [r.name, r.project, r.preview].filter(Boolean).join(" ").toLowerCase(),
+  }));
+
   openSessionPickerIsland({
-    entries: rows,
+    entries: [...rows, ...archivedRows],
     resumableCount: resumable,
     onPick: (row) => {
-      if (row.state === "closed") _restoreClosedChatSession(row.index);
+      if (row.state === "archived") void _restoreArchivedSession(row.sessionId);
+      else if (row.state === "closed") _restoreClosedChatSession(row.index);
       else void _switchChatSession(row.index);
       promptEl.focus();
     },
