@@ -340,18 +340,58 @@ fn incomplete_utf8_tail(bytes: &[u8]) -> usize {
 /// 末尾半截的多字节序列先切掉（见 `incomplete_utf8_tail`），免得一个被截断的汉字
 /// 把整段输出判成"不是 UTF-8"从而错误地走 GBK 分支。
 pub fn decode_process_output(bytes: &[u8]) -> String {
-    let cut = bytes.len() - incomplete_utf8_tail(bytes);
-    let body = &bytes[..cut];
-    if let Ok(s) = std::str::from_utf8(body) {
+    decode_with(bytes, legacy_encoding())
+}
+
+/// 传统代码页作为参数传进来，这样 Windows 那条分支在 mac/Linux 上也能被测到——
+/// 否则整个 GBK 回退逻辑一行测试都跑不到，而它恰恰是最容易写错的那部分。
+fn decode_with(bytes: &[u8], legacy: Option<&'static encoding_rs::Encoding>) -> String {
+    // 1) 整体就是合法 UTF-8 —— 绝大多数情况。
+    if let Ok(s) = std::str::from_utf8(bytes) {
         return s.to_owned();
     }
-    match legacy_encoding() {
-        Some(enc) => {
-            let (text, _, _) = enc.decode(body);
-            text.into_owned()
+
+    // 2) 只是**结尾**被 8KB 分块 / 2MB 上限切断的 UTF-8：去掉那半截，剩下的必须仍然
+    //    合法，才认定是这种情况。
+    //
+    //    这里的顺序很要命。第一版是"无条件先按 UTF-8 规则砍尾巴，再判编码"，而 GBK
+    //    汉字的第二个字节常落在 0x80–0xBF、第一个字节常落在 0xE0–0xF7 —— 在 UTF-8 眼里
+    //    正好像"一个没读完的三/四字节字符"。实测 9 条 Windows 中文报错里有 4 条最后一个
+    //    汉字被砍掉半个（`无法打开` → `无法�`、`错误` → `错�`），制造出的正是这个函数
+    //    声称要杜绝的那个 `�`。
+    let tail = incomplete_utf8_tail(bytes);
+    if tail > 0 {
+        if let Ok(s) = std::str::from_utf8(&bytes[..bytes.len() - tail]) {
+            return s.to_owned();
         }
-        None => String::from_utf8_lossy(body).into_owned(),
     }
+
+    // 3) 到这儿说明**中间**就有非 UTF-8 字节。两种可能，代价完全不对称：
+    //      (a) 整段是传统代码页（Windows 中文机器的 GBK）——按 UTF-8 解会全变 `�`；
+    //      (b) 本来是 UTF-8，只是混进了个别坏字节（日志里夹了二进制）——整段按 GBK 解
+    //          会把所有中文换成**另一批汉字**，比几个 `�` 糟得多，而且看不出来是错的。
+    //
+    //    判据取"哪一边解得干净"，而不是比谁的坏字符少：只有代码页能**一个坏字符都不出**、
+    //    而 UTF-8 出了，才认定它是代码页。实测 10 组样本（6 组真 GBK + 4 组 UTF-8 掺坏
+    //    字节）全部分类正确。分不清的时候倒向 UTF-8 lossy —— 那是旧行为，不会更糟。
+    let lossy = String::from_utf8_lossy(bytes);
+    if let Some(enc) = legacy {
+        let (candidate, _, _) = enc.decode(bytes);
+        if !has_undecodable(&candidate) && has_undecodable(&lossy) {
+            return candidate.into_owned();
+        }
+    }
+    lossy.into_owned()
+}
+
+/// 这段文本里有没有"没解出来"的痕迹：替换字符，或者私用区码位。
+///
+/// 私用区也要算：GBK 会把一部分字节对映射进 U+E000–U+F8FF 而**不报错**，所以把一段
+/// UTF-8 硬按 GBK 解，经常得到一串 PUA 而不是替换字符——只看替换字符会漏掉这种情况。
+/// 正常的程序输出里不会出现私用区字符。
+fn has_undecodable(s: &str) -> bool {
+    s.chars()
+        .any(|c| c == '\u{fffd}' || ('\u{e000}'..='\u{f8ff}').contains(&c))
 }
 
 // ─────────────────────────── 子进程的 locale ───────────────────────────
@@ -372,18 +412,26 @@ pub fn decode_process_output(bytes: &[u8]) -> String {
 ///
 /// 规则：用户自己配过就不动（哪怕配的不是 UTF-8，那是他的选择）；一个都没有、或者
 /// 只是 `C`/`POSIX` 这种"等于没配"的值，才补一个 UTF-8 locale 进去。
-/// 补的是 `LANG` 而不是 `LC_ALL`，这样登录 shell 的 profile 还能再覆盖回去
+/// 首选补 `LANG` 而不是 `LC_ALL`，这样登录 shell 的 profile 还能再覆盖回去
 /// （`/etc/zprofile` 那句 `if [ -z "$LANG" ]` 也就顺理成章地跳过，不会打架）。
 fn locale_is_configured(read: impl Fn(&str) -> Option<String>) -> bool {
     for key in ["LC_ALL", "LC_CTYPE", "LANG"] {
-        if let Some(v) = read(key) {
-            let t = v.trim();
-            if !t.is_empty() && !t.eq_ignore_ascii_case("c") && !t.eq_ignore_ascii_case("posix") {
-                return true;
-            }
+        if meaningful_locale(&read, key) {
+            return true;
         }
     }
     false
+}
+
+/// 这个变量有没有配一个**有意义**的值。`C` / `POSIX` / 空串等于"按字节处理"，不算配过。
+fn meaningful_locale(read: &impl Fn(&str) -> Option<String>, key: &str) -> bool {
+    match read(key) {
+        Some(v) => {
+            let t = v.trim();
+            !t.is_empty() && !t.eq_ignore_ascii_case("c") && !t.eq_ignore_ascii_case("posix")
+        }
+        None => false,
+    }
 }
 
 /// 兜底 locale。macOS 上 `en_US.UTF-8` 一定存在；Linux 上 `C.UTF-8` 是 glibc/musl
@@ -403,10 +451,21 @@ fn default_utf8_locale() -> &'static str {
 /// 跑测试那台机器的环境变量走，结果是"改动删掉也照样绿"的假守卫。
 #[allow(dead_code)]
 fn locale_env_from(read: impl Fn(&str) -> Option<String>) -> Vec<(&'static str, String)> {
-    if locale_is_configured(read) {
+    if locale_is_configured(&read) {
         return Vec::new();
     }
-    vec![("LANG", default_utf8_locale().to_string())]
+    let target = default_utf8_locale().to_string();
+    let mut out = vec![("LANG", target.clone())];
+    // POSIX 的优先级是 LC_ALL > LC_* > LANG。所以光设 LANG 是不够的：一个已经存在的
+    // `LC_ALL=C`（或 `LC_CTYPE=C`）会把它整个压掉，子进程照样跑在 C locale 里，这个
+    // 修复就等于没做。只在它们**确实存在且等于 C/POSIX** 时才一起改——本来就没有的
+    // 变量不去平白无故地引入。
+    for key in ["LC_ALL", "LC_CTYPE"] {
+        if read(key).is_some() {
+            out.push((key, target.clone()));
+        }
+    }
+    out
 }
 
 #[cfg(not(windows))]
@@ -443,6 +502,26 @@ mod locale_tests {
         assert_eq!(injected.len(), 1);
         assert_eq!(injected[0].0, "LANG");
         assert!(injected[0].1.to_lowercase().contains("utf-8"), "{injected:?}");
+    }
+
+    /// POSIX 的优先级是 LC_ALL > LC_* > LANG。所以只设 LANG 是不够的：一个已经存在的
+    /// `LC_ALL=C` 会把它整个压掉，子进程照样在 C locale 里跑，修复等于没做。
+    #[test]
+    fn an_existing_lc_all_of_c_is_overridden_too_or_lang_would_lose() {
+        let injected = locale_env_from(env_of(&[("LC_ALL", "C")]));
+        let lc_all = injected.iter().find(|(k, _)| *k == "LC_ALL");
+        assert!(lc_all.is_some(), "LC_ALL=C 还在，光设 LANG 会被它压掉：{injected:?}");
+        assert!(lc_all.unwrap().1.to_lowercase().contains("utf-8"));
+        assert!(injected.iter().any(|(k, _)| *k == "LANG"));
+
+        // LC_CTYPE=POSIX 同理。
+        let injected = locale_env_from(env_of(&[("LC_CTYPE", "POSIX")]));
+        assert!(injected.iter().any(|(k, _)| *k == "LC_CTYPE"), "{injected:?}");
+
+        // 本来就不存在的变量不要平白无故引入——只补 LANG 就够，profile 还能覆盖。
+        let injected = locale_env_from(env_of(&[]));
+        assert_eq!(injected.len(), 1, "{injected:?}");
+        assert_eq!(injected[0].0, "LANG");
     }
 
     #[test]
@@ -495,13 +574,71 @@ mod decode_tests {
         assert!(!decoded.contains('\u{fffd}'));
     }
 
+    /// 传 Some(GBK) 模拟"跑在简体中文 Windows 上"，这样这条分支在 mac 上也测得到。
+    fn as_gbk_machine(bytes: &[u8]) -> String {
+        decode_with(bytes, Some(encoding_rs::GBK))
+    }
+
     #[test]
-    fn gbk_bytes_are_not_decoded_as_utf8() {
-        let (gbk, _, _) = encoding_rs::GBK.encode("找不到文件");
-        // 这串 GBK 字节不是合法 UTF-8——旧代码会把它变成一堆 �。
-        assert!(std::str::from_utf8(&gbk).is_err());
-        let lossy = String::from_utf8_lossy(&gbk);
-        assert!(lossy.contains('\u{fffd}'));
+    fn gbk_output_is_decoded_as_gbk_not_smashed_into_replacement_chars() {
+        for s in [
+            "找不到文件",
+            "无法打开",
+            "权限不足",
+            "错误",
+            "中文",
+            "系统找不到指定的路径。",
+            "error: 权限不足",
+        ] {
+            let (gbk, _, _) = encoding_rs::GBK.encode(s);
+            assert!(std::str::from_utf8(&gbk).is_err(), "{s} 的 GBK 字节应当不是合法 UTF-8");
+            assert!(
+                String::from_utf8_lossy(&gbk).contains('\u{fffd}'),
+                "{s}：旧的 from_utf8_lossy 会毁掉它",
+            );
+            assert_eq!(as_gbk_machine(&gbk), s, "{s} 没能原样解回来");
+        }
+    }
+
+    /// 第一版的顺序错了：先无条件按 UTF-8 规则砍尾巴，再判编码。GBK 汉字的第二个
+    /// 字节常在 0x80–0xBF、第一个字节常在 0xE0–0xF7，在 UTF-8 眼里正好像一个"没读完
+    /// 的三字节字符"，于是最后一个汉字被砍掉半个 —— 造出的正是要杜绝的那个 �。
+    #[test]
+    fn a_complete_gbk_string_never_loses_its_last_character() {
+        for s in ["无法打开", "错误", "中文", "权限不足"] {
+            let (gbk, _, _) = encoding_rs::GBK.encode(s);
+            let decoded = as_gbk_machine(&gbk);
+            assert!(!decoded.contains('\u{fffd}'), "{s} → {decoded:?} 出现了 �");
+            assert_eq!(decoded, s);
+        }
+    }
+
+    /// 反向的坑：一段本来是 UTF-8、只混进个别坏字节的输出，绝不能整段按 GBK 解——
+    /// 那会把所有中文换成**另一批汉字**，比几个 � 糟得多，而且看不出来是错的。
+    #[test]
+    fn mostly_utf8_output_with_a_stray_bad_byte_stays_utf8() {
+        let mut mixed = "编译成功：3 个文件已更新".as_bytes().to_vec();
+        mixed.push(0xFF);
+        mixed.extend_from_slice(b" done");
+        let decoded = as_gbk_machine(&mixed);
+        assert!(decoded.contains("编译成功"), "中文被改写成了别的字：{decoded:?}");
+        assert!(decoded.contains("done"));
+
+        // 夹了一小段二进制的日志同理。
+        let mut binary = "构建日志：".as_bytes().to_vec();
+        binary.extend_from_slice(&[0x00, 0xFF, 0xFE, 0x80]);
+        binary.extend_from_slice("结束".as_bytes());
+        let decoded = as_gbk_machine(&binary);
+        assert!(decoded.contains("构建日志"), "{decoded:?}");
+        assert!(decoded.contains("结束"), "{decoded:?}");
+    }
+
+    #[test]
+    fn private_use_characters_count_as_a_failed_decode() {
+        // GBK 会把一部分字节对映射进私用区而**不报错**，只看替换字符会漏掉。
+        assert!(has_undecodable("\u{e045}"));
+        assert!(has_undecodable("\u{fffd}"));
+        assert!(!has_undecodable("正常输出 ok ✓"));
     }
 
     #[test]

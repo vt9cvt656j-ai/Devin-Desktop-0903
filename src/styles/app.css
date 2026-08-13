@@ -6639,7 +6639,11 @@ button.agent-plan__fold--toggle:focus-visible { outline: 2px solid #1a73e8; outl
   --atc-border: #e1e4e8;
   --atc-head: #f6f8fa;
   --atc-text: #1f2328;
-  --atc-dim: #8b949e;
+  /* #8b949e 在 #fafbfc 上只有 2.8:1。图标 .agent-term-card__icon 用的就是这个变量，
+     补变量之前它没有值、继承的是卡片正文色（深色，看得清）——照抄 label 的灰会让图标
+     反而变淡。取 GitHub 的 muted #656d76（4.9:1）；label / timer 有各自的浅色规则，
+     显示不受影响。 */
+  --atc-dim: #656d76;
   --atc-accent: #0969da;
   --atc-success: #1a7f37;
   --atc-danger: #cf222e;
@@ -6762,6 +6766,9 @@ button.agent-plan__fold--toggle:focus-visible { outline: 2px solid #1a73e8; outl
 .ansi-italic { font-style: italic; }
 .ansi-underline { text-decoration: underline; }
 .ansi-strike { text-decoration: line-through; }
+/* 两个都写 text-decoration，同时出现时后一条整条盖掉前一条（下划线消失）。
+   `ESC[4m ESC[9m` 在 diff 工具里是会同时出现的，补一条合并规则。 */
+.ansi-underline.ansi-strike { text-decoration: underline line-through; }
 
 /* Diff rows — Cursor-style unified diff */
 .atc-diff {

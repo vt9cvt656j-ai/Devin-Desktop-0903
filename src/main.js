@@ -58427,7 +58427,11 @@ function _autoFillSshPasswordOnPrompt(entry, password) {
   let sent = false;
   const tick = () => {
     if (sent || !entry || entry.backendId == null) return;
-    const out = _stripAnsi(String(entry.recentOut || "")).slice(-1200);
+    // 先切后解析。_stripAnsi 现在是逐字符解析，比原来的正则贵得多，而这里是**每一个
+    // PTY data 事件**都会跑一次的热路径——对着整份 recentOut 解析完再取末尾 1200 字
+    // 是纯浪费。多留一点原始字节（切点可能落在转义序列中间，丢一个颜色无所谓，这里
+    // 只是拿正则找 password 提示）。
+    const out = _stripAnsi(String(entry.recentOut || "").slice(-4000)).slice(-1200);
     if (/(?:^|\n|\r)[^\n\r]{0,160}(?:password|密码)\s*:\s*$/i.test(out) || /(?:password|密码)\s*:\s*$/i.test(out)) {
       try {
         backend.termWrite(entry.backendId, secret + "\n");
@@ -58570,7 +58574,8 @@ async function _openRemoteSshPanel(value, remoteRoot = "", password = "") {
   };
   const inspectSshOutput = () => {
     if (entry.closed || entry.sshState === "error" || entry.sshState === "ready") return;
-    const plain = _stripAnsi(String(entry.recentOut || "")).slice(-2400);
+    // 同上：先切原始字节再解析，别在每个 data 事件上解析整份缓冲。
+    const plain = _stripAnsi(String(entry.recentOut || "").slice(-6000)).slice(-2400);
     if (/Permission denied|Host key verification failed|Could not resolve hostname|Connection refused|Connection timed out|No route to host|Operation timed out/i.test(plain)) {
       entry.sshState = "error";
       setState("error", "SSH 连接失败");
