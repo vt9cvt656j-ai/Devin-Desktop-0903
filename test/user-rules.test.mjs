@@ -68,12 +68,42 @@ test("轻量轮也带用户规则——闲聊轮才是最容易破规矩的地�
   assert.match(SRC, /: \(sysPrompt \+ _modelStyleTuning\(config\.model\) \+ userRulesBlock \+/);
 });
 
-test("保存后立刻生效，不用等重启", () => {
-  const panel = SRC.slice(SRC.indexOf("async function openUserRulesPanel"), SRC.indexOf("async function openMcpPanel"));
-  assert.match(panel, /_userRulesText = area\.value;/,
-    "保存成功要同步更新内存里那份，否则用户改完发现没变化，会以为没存上");
-  assert.match(panel, /user_rules_save/);
-  assert.match(panel, /留空 = 不启用/);
+test("点菜单是在编辑器里开标签页，不是弹一个 textarea", () => {
+  // 让人写 markdown 却塞进一个小框里——不给语法高亮、不给查找替换、不给撤销栈，
+  // 而这个应用本身就是个编辑器。
+  assert.match(SRC, /async function openUserDocTab\(kind = "rules"\)/);
+  assert.match(SRC, /await openFile\(path,/, "要真的开成编辑器标签页");
+  assert.ok(!SRC.includes("openUserRulesPanel"), "旧的弹窗实现要删干净");
+  assert.ok(!SRC.includes("_USER_DOC_META"), "弹窗的文案表也该跟着走");
+});
+
+test("这两份文档的保存要改道，否则沙箱会拒绝写入", () => {
+  // 编辑器保存走 write_text_file_if_unchanged，它的 require_inside_workspace(path, true)
+  // 明确拒绝"在 HOME 底下但不在工作区里"的写入——正是挡着 ~/.ssh 的那条。
+  assert.match(SRC, /function _userDocKindForPath\(path\)/);
+  // 两个写盘点都要改道：手动保存和后台持久化
+  const hooks = [...SRC.matchAll(/const _docKind = _userDocKindForPath\(path\);/g)];
+  assert.equal(hooks.length, 2, `编辑器有两处写盘，都要改道，实际改了 ${hooks.length} 处`);
+  // 光有判定不算数，得真的改道。只断言判定那行存在的话，把 `? _writeUserDoc(...)` 改回
+  // 普通写盘照样能过——变异验证时就是它先漏掉的。
+  const routed = [...SRC.matchAll(/\?\s*_writeUserDoc\(_docKind, snapshot\)/g)];
+  assert.equal(routed.length, 2, `两处写盘都要改道，实际 ${routed.length} 处`);
+  // 保存后要刷新内存那份，否则改完当轮还是旧内容
+  assert.match(SRC, /function _writeUserDoc\(kind, text\)[\s\S]{0,260}_userHabitsText = text; else _userRulesText = text;/);
+});
+
+test("路径判定要精确匹配，不能把工作区里同名的 rules.md 也劫持了", () => {
+  const fn = new Function("_userDocPaths",
+    `${extractFn("_userDocKindForPath")};return _userDocKindForPath;`)({
+      rules: "/home/me/.michael-ide/rules.md",
+      habits: "/home/me/.michael-ide/habits.md",
+    });
+  assert.equal(fn("/home/me/.michael-ide/rules.md"), "rules");
+  assert.equal(fn("/home/me/.michael-ide/habits.md"), "habits");
+  assert.equal(fn("/work/proj/rules.md"), "", "项目里自己的 rules.md 不该被劫持");
+  assert.equal(fn("/home/me/.michael-ide/rules.md.bak"), "");
+  assert.equal(fn(""), "");
+  assert.equal(fn(null), "");
 });
 
 // ── ⋮ 菜单 ────────────────────────────────────────────────────────────────
@@ -85,8 +115,8 @@ test("菜单两项都是「用户自己写、AI 要照做」的东西", () => {
   // 技能面板不属于这里——它列的是磁盘上发现的 SKILL.md，不是用户在这儿写的字。
   assert.ok(!shell.includes("capabilitySkillsItem"), "技能项已移走（高级设置 → Skills 仍可达）");
   assert.ok(!shell.includes("capabilityMcpItem"), "MCP 项已移走（高级设置 → MCP 仍可达）");
-  assert.match(SRC, /_habitsItem\.addEventListener\("click"[\s\S]{0,140}openUserRulesPanel\("habits"\)/);
-  assert.match(SRC, /_rulesItem\.addEventListener\("click"[\s\S]{0,140}openUserRulesPanel\("rules"\)/);
+  assert.match(SRC, /_habitsItem\.addEventListener\("click"[\s\S]{0,140}openUserDocTab\("habits"\)/);
+  assert.match(SRC, /_rulesItem\.addEventListener\("click"[\s\S]{0,140}openUserDocTab\("rules"\)/);
 });
 
 // ── 习惯 vs 规则：措辞必须分得开，否则就是同一个框写两遍 ──────────────────
@@ -124,7 +154,7 @@ test("只写了一个的时候，另一个一个字节都不占", () => {
 test("两份文档各自落盘，不会互相覆盖", () => {
   // 面板、读取、保存都带 kind；漏传的话两个框会写进同一个文件
   assert.match(SRC, /backend\.invoke\("user_rules_read", \{ kind \}\)/);
-  assert.match(SRC, /backend\.invoke\("user_rules_save", \{ text: area\.value, kind \}\)/);
+  assert.match(SRC, /backend\.invoke\("user_rules_save", \{ text, kind \}\)/);
   assert.match(SRC, /read\("rules"\), read\("habits"\)/, "启动时两份都要读");
 });
 

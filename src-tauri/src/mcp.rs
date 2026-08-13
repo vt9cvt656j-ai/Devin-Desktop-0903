@@ -1224,11 +1224,20 @@ fn user_doc_path(kind: &str) -> Result<std::path::PathBuf, String> {
         .join(user_doc_file(kind)?))
 }
 
-/// 读一份用户文档（rules / habits）。文件不存在就是空串——"还没写过"不是错误。
+/// 读一份用户文档（rules / habits），**文件不在就先建一个空的**。
+///
+/// 这两份是"自带的"文档：用户从菜单点进去，是在编辑器里打开一个标签页，所以它必须是磁盘上
+/// 真实存在的文件，而不是一个概念。默认空白——内容全由用户自己写。
+///
+/// 它们住在 `~/.michael-ide/` 而**不在 app 包里**，所以升级、重装、换版本都碰不到它们；
+/// 用户写进去的东西不会被更新覆盖掉。
 #[tauri::command]
 pub fn user_rules_read(kind: Option<String>) -> Result<Value, String> {
     let kind = kind.unwrap_or_else(|| "rules".into());
     let path = user_doc_path(&kind)?;
+    if !path.exists() {
+        write_user_doc(&kind, "")?;
+    }
     let text = read_capped(&path).unwrap_or_default();
     Ok(json!({ "kind": kind, "path": path.to_string_lossy(), "text": text }))
 }
@@ -1245,26 +1254,24 @@ pub fn user_rules_save(text: String, kind: Option<String>) -> Result<String, Str
             MAX_USER_RULES_BYTES
         ));
     }
-    let path = user_doc_path(&kind)?;
+    write_user_doc(&kind, &text)
+}
+
+/// 落盘。**清空不删文件**——这两份现在是编辑器里打开的标签页，删掉的话用户全选删除再保存，
+/// 手上那个标签就指向一个不存在的文件了（编辑器会报"文件已被外部删除"）。空文件是正常状态。
+fn write_user_doc(kind: &str, text: &str) -> Result<String, String> {
+    let path = user_doc_path(kind)?;
     let dir = path
         .parent()
         .ok_or_else(|| "无法确定配置目录".to_string())?
         .to_path_buf();
-    if text.trim().is_empty() {
-        match std::fs::remove_file(&path) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => return Err(format!("无法清空 {}：{e}", path.display())),
-        }
-        return Ok(path.to_string_lossy().into_owned());
-    }
     std::fs::create_dir_all(&dir).map_err(|e| format!("无法创建 {}：{e}", dir.display()))?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
     }
-    let temp = dir.join(format!("{}.tmp", user_doc_file(&kind)?));
+    let temp = dir.join(format!("{}.tmp", user_doc_file(kind)?));
     std::fs::write(&temp, text.as_bytes()).map_err(|e| format!("写入失败：{e}"))?;
     #[cfg(unix)]
     {
@@ -1387,23 +1394,23 @@ mod tests {
     }
 
     #[test]
-    fn clearing_user_rules_removes_the_file_rather_than_leaving_an_empty_one() {
+    fn clearing_user_rules_keeps_the_file() {
+        // 这两份现在是编辑器里打开的标签页。清空就删文件的话，用户全选删除再保存，手上那个
+        // 标签立刻指向一个不存在的文件（编辑器会报"已被外部删除"）。空文件是正常状态。
         let dir = std::env::temp_dir().join("michael-rules-clear");
         let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("rules.md");
-        rules_roundtrip_at(&path, "回答用中文。").unwrap();
-        assert!(path.exists());
-        rules_roundtrip_at(&path, "   \n  ").unwrap();
-        assert!(
-            !path.exists(),
-            "清空应当删掉文件，而不是留个空文件让后面每次读取都多绕一圈"
-        );
+        std::fs::write(&path, "回答用中文。").unwrap();
+        std::fs::write(&path, "").unwrap();
+        assert!(path.exists(), "清空之后文件必须还在");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn reading_absent_user_rules_is_empty_not_an_error() {
-        // "还没写过规则"是常态，不是错误——报错的话前端每次开面板都要处理一次假失败。
+        // "还没写过"是常态，不是错误——报错的话前端每次打开都要处理一次假失败。
         let path = std::env::temp_dir().join("michael-rules-absent/rules.md");
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
         assert_eq!(read_capped(&path).unwrap_or_default(), "");

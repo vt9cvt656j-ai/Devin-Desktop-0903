@@ -1728,10 +1728,10 @@ test("assistant header groups its capabilities behind one vertical capabilities 
     "capability button should toggle the menu");
   // 两项都是"用户自己写、AI 要照做"的东西；技能面板列的是磁盘上发现的 SKILL.md，
   // 不属于这里（高级设置 → Skills 仍可达）。
-  assert.match(SRC, /_habitsItem\.addEventListener\("click"[\s\S]{0,140}openUserRulesPanel\("habits"\)/,
+  assert.match(SRC, /_habitsItem\.addEventListener\("click"[\s\S]{0,140}openUserDocTab\("habits"\)/,
     "用户习惯那项要打开习惯编辑面板");
-  assert.match(SRC, /_rulesItem\.addEventListener\("click"[\s\S]{0,120}openUserRulesPanel/,
-    "用户规则那项要打开规则编辑面板");
+  assert.match(SRC, /_rulesItem\.addEventListener\("click"[\s\S]{0,140}openUserDocTab\("rules"\)/,
+    "用户规则那项要在编辑器里开标签页");
   assert.match(SRC, /document\.getElementById\("capabilitiesBtn"\); if \(!b\) return;/,
     "active skill count badge should move to the shared capability button");
   // 取整条规则体再判，不要数字符：原来那句用 [\s\S]{0,260} 卡窗口，往规则里加一行注释就红，
@@ -13938,6 +13938,9 @@ test("overlapping editor saves are serialized per path", async () => {
   const calls = [];
   const file = { model: {}, diskContent: disk, _savePromise: null };
   const save = load("_writeOpenFileSnapshot", {
+    // 这两份用户文档在沙箱外，写盘要改道（见 _userDocKindForPath）。这里的路径都不是它们，
+    // 所以判定恒为空串、走原来的普通写盘。
+    _userDocKindForPath: () => "",
     _coherentFilePath: COHERENT_PATH,
     openFiles: new Map([["/repo/a.js", file]]),
     _pendingEditorWrites: new Map(),
@@ -16042,6 +16045,8 @@ test("跨文件编辑必须落盘，而不是只改内存", async () => {
   const calls = [];
   const openFiles = new Map();
   const persist = load("_persistBackgroundModel", {
+    // 后台持久化也是编辑器的写盘点之一，同样要判定是不是那两份沙箱外的用户文档。
+    _userDocKindForPath: () => "",
     openFiles,
     _coherentFilePath: (x) => x,
     _isMissingFileError: () => false,
@@ -16080,6 +16085,8 @@ test("跨文件编辑写盘冲突时绝不覆盖，而且要说出来", async ()
   // 从读到 expected 到写回之间磁盘被别人改了。这条路径上的失败以前是完全静默的。
   const toasts = [];
   const persist = load("_persistBackgroundModel", {
+    // 后台持久化也是编辑器的写盘点之一，同样要判定是不是那两份沙箱外的用户文档。
+    _userDocKindForPath: () => "",
     openFiles: new Map(),
     _coherentFilePath: (x) => x,
     _isMissingFileError: () => false,
