@@ -19,11 +19,55 @@ pub struct BrowserAutomation {
     pub current_page: Option<Arc<Page>>,
 }
 
+/// 浏览器要用哪套身份。
+///
+/// 这是自动化里最容易出错的一个选择：抓公开页面、测自己的 dev server 该用干净实例；
+/// 而"去我的后台看一眼""把这条发出去"这类任务，用空白浏览器只会撞上登录墙——用户
+/// 已经在自己的浏览器里登录了一堆网站，再开一个全新的等于把那些登录态全扔了。
+///
+/// 注意**不能**直接用用户 Chrome 的 profile：Chrome 运行时会独占那个目录，而复制一份
+/// 4GB 的 profile 既慢又是隐私灾难。可行的是一个**专用的持久 profile**：用户在有头窗口
+/// 里登录一次，此后每次自动化都带着这些会话，并且和用户自己的 Chrome 井水不犯河水
+/// （实测两者可同时运行）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BrowserProfile {
+    /// 一次性目录，每次全新。默认，也是抓取/测试该用的。
+    Isolated,
+    /// 专用持久目录，保留登录态。需要用户身份的任务用这个。
+    Session,
+}
+
+fn profile_dir(profile: BrowserProfile) -> Result<std::path::PathBuf> {
+    let dir = match profile {
+        BrowserProfile::Isolated => std::env::temp_dir()
+            .join(format!("rust_automation_browser_{}", std::process::id())),
+        // 固定路径：跨进程、跨重启都是同一个，登录一次长期有效。
+        BrowserProfile::Session => {
+            let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+            std::path::PathBuf::from(home).join(".mrday-browser-session")
+        }
+    };
+    std::fs::create_dir_all(&dir)?;
+    Ok(dir)
+}
+
 impl BrowserAutomation {
     /// 创建新的浏览器实例（默认无头模式）
     pub async fn new() -> Result<Self> {
-        let temp_dir = std::env::temp_dir().join(format!("rust_automation_browser_{}", std::process::id()));
-        std::fs::create_dir_all(&temp_dir)?;
+        Self::new_with_profile(true, BrowserProfile::Isolated).await
+    }
+
+    /// 按「有头/无头 × 身份」创建实例。
+    pub async fn new_with_profile(headless: bool, profile: BrowserProfile) -> Result<Self> {
+        if headless {
+            Self::launch_headless(profile).await
+        } else {
+            Self::launch_headed(profile).await
+        }
+    }
+
+    async fn launch_headless(profile: BrowserProfile) -> Result<Self> {
+        let temp_dir = profile_dir(profile)?;
         
         let config = BrowserConfig::builder()
             .chrome_executable("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome")
@@ -34,22 +78,24 @@ impl BrowserAutomation {
             .arg("--disable-dev-shm-usage")
             .arg("--disable-software-rasterizer")
             .arg("--disable-background-networking")
-            .arg("--disable-sync")
             .arg("--metrics-recording-only")
             .arg("--disable-default-apps")
             .arg("--mute-audio")
             .arg("--no-first-run")
             .arg("--disable-gpu")
             .arg("--disable-features=site-per-process")
-            .arg(format!("--user-data-dir={}", temp_dir.display()))
+            .user_data_dir(&temp_dir)
             .build()?;
         Self::with_config(config).await
     }
 
     /// 创建有头（可见）浏览器实例
     pub async fn new_headed() -> Result<Self> {
-        let temp_dir = std::env::temp_dir().join(format!("rust_automation_browser_{}", std::process::id()));
-        std::fs::create_dir_all(&temp_dir)?;
+        Self::launch_headed(BrowserProfile::Isolated).await
+    }
+
+    async fn launch_headed(profile: BrowserProfile) -> Result<Self> {
+        let temp_dir = profile_dir(profile)?;
         
         let config = BrowserConfig::builder()
             .chrome_executable("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome")
@@ -60,12 +106,11 @@ impl BrowserAutomation {
             .arg("--disable-extensions")
             .arg("--disable-dev-shm-usage")
             .arg("--disable-background-networking")
-            .arg("--disable-sync")
             .arg("--metrics-recording-only")
             .arg("--disable-default-apps")
             .arg("--mute-audio")
             .arg("--disable-features=site-per-process")
-            .arg(format!("--user-data-dir={}", temp_dir.display()))
+            .user_data_dir(&temp_dir)
             .build()?;
         Self::with_config(config).await
     }
@@ -406,5 +451,50 @@ impl BrowserAutomation {
         info!("关闭浏览器");
         self.browser.close().await?;
         Ok(())
+    }
+
+    /// 优雅关闭（不消费 self）。
+    ///
+    /// 之前 browser_close 只是把 Arc drop 掉——chromiumoxide 的 Drop 会直接杀进程，
+    /// Chrome 来不及把 cookie 刷盘。隔离 profile 下无所谓（本来就要丢），持久 profile 下
+    /// 就是致命的：用户登录一次，关掉，登录态没了。所以必须发 CDP 的 Browser.close
+    /// 再等进程自己退出。
+    pub async fn close_gracefully(&mut self) -> Result<()> {
+        info!("优雅关闭浏览器（等待落盘）");
+        let _ = self.browser.close().await;
+        // 等它自己退出，给 cookie/localStorage 刷盘的时间；超时就算了，Drop 会兜底。
+        let _ = tokio::time::timeout(Duration::from_secs(8), self.browser.wait()).await;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod profile_tests {
+    use super::{profile_dir, BrowserProfile};
+
+    /// 两种身份必须落到不同目录，而且持久那个不能在临时目录里。
+    ///
+    /// 这条守的是「登录一次长期有效」。持久 profile 一旦被指到 /tmp 或带上进程号，
+    /// 用户登录完关掉就没了——而失败方式是安静的：下次照样能起浏览器，只是又变回未登录，
+    /// 模型会以为"这网站需要登录"，其实是身份被丢了。
+    #[test]
+    fn 两种身份落在不同目录且持久那个真的持久() {
+        let isolated = profile_dir(BrowserProfile::Isolated).expect("isolated");
+        let session = profile_dir(BrowserProfile::Session).expect("session");
+        assert_ne!(isolated, session, "两种身份不能共用目录");
+
+        let tmp = std::env::temp_dir();
+        assert!(isolated.starts_with(&tmp), "隔离身份就该在临时目录里：{isolated:?}");
+        assert!(
+            !session.starts_with(&tmp),
+            "持久身份不能放临时目录，否则登录态随时会被清掉：{session:?}"
+        );
+        let s = session.to_string_lossy();
+        assert!(
+            !s.contains(&std::process::id().to_string()),
+            "持久身份的路径里不能有进程号，否则每次启动都是新身份：{s}"
+        );
+        // 同一种身份重复取必须是同一个目录
+        assert_eq!(session, profile_dir(BrowserProfile::Session).expect("session again"));
     }
 }

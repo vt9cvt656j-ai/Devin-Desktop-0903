@@ -309,6 +309,20 @@ impl Agent {
 
     #[cfg(feature = "browser")]
     pub fn browser_start(&mut self, headless: bool) -> Result<()> {
+        self.browser_start_with_profile(headless, crate::browser::BrowserProfile::Isolated)
+    }
+
+    /// 起浏览器，并指定用哪套身份。
+    ///
+    /// Isolated：每次全新，抓公开页面/测自己的站点用。
+    /// Session：专用持久 profile，保留登录态——任务需要用户已登录的身份时用这个，
+    /// 否则一定撞登录墙。它和用户自己的 Chrome 互不干扰，可以同时开着。
+    #[cfg(feature = "browser")]
+    pub fn browser_start_with_profile(
+        &mut self,
+        headless: bool,
+        profile: crate::browser::BrowserProfile,
+    ) -> Result<()> {
         if self.browser.is_some() {
             return Ok(());
         }
@@ -317,10 +331,8 @@ impl Agent {
             .ok_or_else(|| Error::Other(anyhow::anyhow!("Runtime not initialized")))?;
         
         let browser = runtime.block_on(async {
-            if headless {
-                BrowserAutomation::new().await
-            } else {
-                BrowserAutomation::new_headed().await
+            {
+                BrowserAutomation::new_with_profile(headless, profile).await
             }
         })?;
         
@@ -374,9 +386,17 @@ impl Agent {
     
     #[cfg(feature = "browser")]
     pub fn browser_close(&mut self) -> Result<()> {
-        if let Some(browser_arc) = self.browser.take() {
-            drop(browser_arc);
+        let Some(browser_arc) = self.browser.take() else { return Ok(()) };
+        // 直接 drop 会杀掉 Chrome，cookie 来不及落盘——持久 profile 下等于登录白登。
+        // 先走 CDP 的优雅关闭再放手。
+        if let Some(runtime) = self.runtime.as_ref() {
+            runtime.block_on(async {
+                if let Ok(mut guard) = browser_arc.lock() {
+                    let _ = guard.close_gracefully().await;
+                }
+            });
         }
+        drop(browser_arc);
         Ok(())
     }
     

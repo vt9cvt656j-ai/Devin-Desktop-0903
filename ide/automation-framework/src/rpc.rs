@@ -135,8 +135,22 @@ impl RpcServer {
             #[cfg(feature = "browser")]
             "browser.start" => {
                 let headless = params.get("headless").and_then(|v| v.as_bool()).unwrap_or(false);
-                agent.browser_start(headless)?;
-                Ok(serde_json::json!({"status": "ok"}))
+                // profile 决定这次自动化用谁的身份。默认隔离（干净、安全）；
+                // 任务需要用户已登录的会话时传 session——否则必定撞登录墙。
+                let profile = match params.get("profile").and_then(|v| v.as_str()).unwrap_or("isolated") {
+                    "session" | "user" | "persistent" | "logged_in" => crate::browser::BrowserProfile::Session,
+                    _ => crate::browser::BrowserProfile::Isolated,
+                };
+                agent.browser_start_with_profile(headless, profile)?;
+                Ok(serde_json::json!({
+                    "status": "ok",
+                    "profile": if profile == crate::browser::BrowserProfile::Session { "session" } else { "isolated" },
+                    "note": if profile == crate::browser::BrowserProfile::Session {
+                        "Persistent profile: cookies and logins from earlier runs are available, and anything you sign into here stays signed in. If a site still shows a login wall, start again with headless=false so the user can sign in once."
+                    } else {
+                        "Clean isolated profile: no cookies, no logins. If the task needs the user's own account, restart with profile=session."
+                    }
+                }))
             }
             
             #[cfg(feature = "browser")]
