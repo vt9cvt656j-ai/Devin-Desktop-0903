@@ -53457,15 +53457,16 @@ function renderSkillsTool(body) {
 /**
  * 这个面板承载两类东西：偏好设置，和几个**开发工具**面板。
  *
- * 工具那一组（任务运行器、调试器、合并冲突、语言服务、工作区、远程）以前只写了渲染函数，
- * 却从没登记到这张表里。而 `normalizeFeatureTab` 对认不出的 id 一律回落成 "settings" ——
- * 于是命令面板里那 6 条命令、以及状态栏那个写着「Click for logs」的语言服务器指示器，
- * 点下去全部打开「设置」。不报错、不打日志，就是开错面板。
+ * 工具那一组以前只写了渲染函数，却从没登记到这张表里。而 `normalizeFeatureTab` 对认不出
+ * 的 id 一律回落成 "settings" —— 于是命令面板里那几条命令、以及状态栏那个写着
+ * 「Click for logs」的语言服务器指示器，点下去全部打开「设置」。不报错、不打日志，就是
+ * 开错面板。现在登记齐了，测试也从两个方向盯着这张表。
  *
- * 压在这条回落分支下面的是已经写完并且后端齐备的能力：700 行的任务发现（npm scripts /
- * Cargo / Makefile / .vscode/tasks.json，带沙箱和超时）一次都没被执行过；一个三方合并冲突
- * 解决器（基准/我方/对方 + 可编辑合并区）从来没被打开过；调试器面板里那个「自定义适配器
- * 命令」是 C/C++/Rust 用户唯一的调试入口。
+ * **2026-08-13 按所有者要求下掉了任务运行器 / 调试器 / 合并冲突三个页签**（"没啥用"）。
+ * 连带删掉的是命令面板里指向它们的三条命令 —— 留着比删掉更糟：它们会被
+ * `normalizeFeatureTab` 静默改写成 "settings"，点下去开错面板，正是上面这段说的那个 bug。
+ * 渲染函数（renderTasksTool / renderDebuggerTool / renderConflictsTool）和它们背后的能力
+ * 都还在，只是没有入口；要恢复只需把这三行和对应的 renderers 映射加回来。
  *
  * `group` 只影响标签条的分隔线，不影响可达性。
  */
@@ -53477,9 +53478,6 @@ const FEATURE_TABS = [
   { id: "shortcuts", titleKey: "feature.tab.shortcuts", icon: "i-command", group: "prefs" },
   { id: "mcp", titleKey: "feature.tab.mcp", icon: "i-mcp", group: "prefs" },
   { id: "skills", titleKey: "feature.tab.skills", icon: "i-skills", group: "prefs" },
-  { id: "tasks", titleKey: "feature.tab.tasks", icon: "i-play", group: "tools" },
-  { id: "debugger", titleKey: "feature.tab.debugger", icon: "i-bug", group: "tools" },
-  { id: "conflicts", titleKey: "feature.tab.conflicts", icon: "i-git", group: "tools" },
   { id: "lsp", titleKey: "feature.tab.lsp", icon: "i-braces", group: "tools" },
   { id: "workspace", titleKey: "feature.tab.workspace", icon: "i-folder-open", group: "tools" },
   { id: "remote", titleKey: "feature.tab.remote", icon: "i-remote", group: "tools" },
@@ -53567,10 +53565,7 @@ function renderFeaturePanel() {
     shortcuts: renderShortcutsTool,
     mcp: renderMcpTool,
     skills: renderSkillsTool,
-    // 这六个的渲染函数一直都在，只是从没被这张表引用过。
-    tasks: renderTasksTool,
-    debugger: renderDebuggerTool,
-    conflicts: renderConflictsTool,
+    // 这三个的渲染函数一直都在，只是从没被这张表引用过。
     lsp: renderLspTool,
     workspace: renderWorkspaceTool,
     remote: renderRemoteTool,
@@ -62018,15 +62013,12 @@ const palette = createCommandPalette({
     { id: "tools.michaelPremium", title: t("premiumDb.menu"), category: t("menu.tools"), run: () => openMichaelPremium() },
     { id: "file.autoSave", title: "切换自动保存", category: t("menu.file"), run: () => { toggleAutoSave(); buildMenubar(); } },
     { id: "code.runCurrentFile", title: "Run Current File", category: "Code", run: () => runCurrentFile() },
-    { id: "tasks.open", title: "Task Runner", category: "Tasks", run: () => openFeaturePanel("tasks") },
     { id: "view.extensions", title: t("ext.title"), category: t("menu.view"), run: () => extPanel.open() },
     { id: "view.terminal", title: panelToggleLabel("terminal"), category: t("menu.view"), run: () => toggleTerminal() },
     { id: "terminal.new", title: t("terminal.new"), category: t("terminal.title"), run: () => { openTerminal(); createTermTab(); } },
     { id: "view.splitEditor", title: "Toggle Split Editor", category: t("menu.view"), run: () => toggleSplitEditor() },
     { id: "remote.open", title: "Remote Development", category: "Tools", run: () => openFeaturePanel("remote") },
     { id: "marketplace.open", title: "扩展市场", category: "工具", run: () => openMarketplaceModal() },
-    { id: "git.conflicts", title: "Resolve Merge Conflicts", category: "Tools", run: () => openFeaturePanel("conflicts") },
-    { id: "debug.open", title: "Debugger", category: "Tools", run: () => openFeaturePanel("debugger") },
     { id: "lsp.open", title: "Language Servers", category: "Tools", run: () => openFeaturePanel("lsp") },
     { id: "view.zenMode", title: "Toggle Zen Mode", category: t("menu.view"), run: () => toggleZenMode() },
     { id: "tab.pin", title: "Pin/Unpin Tab", category: "Tabs", run: () => activePath && togglePinTab(activePath) },
