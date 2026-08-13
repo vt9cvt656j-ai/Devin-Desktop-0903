@@ -69,9 +69,43 @@ where
 /// Run a UI-automation script on the host: JXA via osascript on macOS, PowerShell on
 /// Windows. Each caller supplies BOTH; the platform picks one. (cfg confined here so the
 /// command bodies below stay platform-agnostic and compile-check on every OS.)
+/// JXA 会把权限拒绝伪装成业务错误。
+///
+/// System Events 被 TCC 拒绝时，脚本里的 catch 会把 `Error: … (-1743)` 塞进 JSON 的
+/// error 字段照常返回——上层看到的是一次"成功"调用，里面带着一句「该 App 没在运行」
+/// 或「菜单名要和界面完全一致」。于是用户被指去核对 App 名和菜单名，而真正的问题是
+/// 系统根本没放行。这里在唯一的出口处把它认出来，换成真话。
+#[cfg(target_os = "macos")]
+fn looks_like_apple_events_denial(text: &str) -> bool {
+    // -1743 = errAEEventNotPermitted，-25211 = 未获辅助功能授权。裸数字容易误伤
+    // （窗口标题里也可能出现），所以要求它和一次真实的错误同时出现。
+    let has_error_context = text.contains("Error") || text.contains("error");
+    (has_error_context && (text.contains("-1743") || text.contains("-25211")))
+        || text.contains("Not authorized to send Apple events")
+        || text.contains("not allowed assistive access")
+        || text.contains("is not allowed assistive access")
+}
+
+#[cfg(target_os = "macos")]
+fn apple_events_denied_message() -> String {
+    format!(
+        "[权限被拒] macOS 不允许 Mr. Day One 驱动其他应用（Apple Events 被系统拒绝）。         这和 App 名字、菜单项名字写得对不对无关，重试也不会好。{}",
+        crate::permissions::advice_text(
+            crate::permissions::accessibility_granted(),
+            true,
+            false,
+            crate::permissions::identity_pinned_to_build(),
+        )
+    )
+}
+
 #[cfg(target_os = "macos")]
 fn run_native(macos_jxa: &str, _windows_ps: &str, t: u64) -> Result<String, String> {
-    run_cmd_bounded("osascript", &["-l", "JavaScript", "-e", macos_jxa], t)
+    match run_cmd_bounded("osascript", &["-l", "JavaScript", "-e", macos_jxa], t) {
+        Ok(out) if looks_like_apple_events_denial(&out) => Err(apple_events_denied_message()),
+        Err(e) if looks_like_apple_events_denial(&e) => Err(apple_events_denied_message()),
+        other => other,
+    }
 }
 #[cfg(target_os = "windows")]
 fn run_native(_macos_jxa: &str, windows_ps: &str, t: u64) -> Result<String, String> {
@@ -125,6 +159,10 @@ fn do_open(name: &str, bg: bool) -> Result<String, String> {
             let script = format!("(function(){{try{{Application('System Events').applicationProcesses.byName({njs}).frontmost=true;return 'ok';}}catch(e){{return 'ERR';}}}})()");
             match run_cmd_bounded("osascript", &["-l", "JavaScript", "-e", &script], 3000) {
                 Ok(s) if s == "ok" => Ok(format!("✓ 已切换到「{name}」")),
+                // 这条回退不走 run_native，所以要自己认一次权限拒绝——否则一次 TCC 拒绝
+                // 会被原样说成「名字要和菜单栏显示的完全一致」，把排查带到拼写上去。
+                #[cfg(target_os = "macos")]
+                _ if !crate::permissions::apple_events_granted() => Err(apple_events_denied_message()),
                 _ => Err(format!("打不开/找不到 App「{name}」：{e}。名字要和「应用程序」或菜单栏显示的完全一致。")),
             }
         }

@@ -11,6 +11,8 @@
 	</dict>
 	<!-- Voice input: the composer's mic button records audio and transcribes it. macOS CRASHES the
 	     app if it accesses the mic / speech recognition without these usage strings present. -->
+	<key>NSAppleEventsUsageDescription</key>
+	<string>Mr. Day One 需要控制其他应用来替你完成桌面自动化任务（打开应用、切换窗口、点击菜单、读取界面）。</string>
 	<key>NSMicrophoneUsageDescription</key>
 	<string>Michael IDE 用麦克风做语音输入——把你说的话转成文字填进 AI 对话框。</string>
 	<key>NSSpeechRecognitionUsageDescription</key>
