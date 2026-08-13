@@ -18686,7 +18686,7 @@ function _approvalLabel(call) {
 // (dialog.showModal() throws if one is already open). Returns "once"|"always"|"deny".
 let _approveDlg = null;
 let _approveChain = Promise.resolve();
-function _toolApprovalDialog({ title, detail }) {
+function _toolApprovalDialog({ title, detail, onceLabel = "允许", alwaysLabel = "本会话总是允许" }) {
   const show = () => new Promise((resolve) => {
     if (!_approveDlg) {
       _approveDlg = document.createElement("dialog");
@@ -18697,6 +18697,12 @@ function _toolApprovalDialog({ title, detail }) {
     const dlg = _approveDlg;
     dlg.querySelector(".ta-title").textContent = title;
     dlg.querySelector(".ta-detail").textContent = detail || "";
+    // 对话框元素是复用的，标签和可见性每次都要重设回来，否则上一次的定制会漏给下一次。
+    const onceBtn = dlg.querySelector('[data-act="once"]');
+    const alwaysBtn = dlg.querySelector('[data-act="always"]');
+    onceBtn.textContent = onceLabel || "允许";
+    alwaysBtn.textContent = alwaysLabel || "本会话总是允许";
+    alwaysBtn.hidden = !alwaysLabel;
     const btns = [...dlg.querySelectorAll("button[data-act]")];
     let done = false;
     const finish = (val) => { if (done) return; done = true; dlg.removeEventListener("close", onClose); for (const b of btns) b.removeEventListener("click", onClick); resolve(val); };
@@ -18935,6 +18941,11 @@ async function _approveToolCall(call, run) {
 
   // ② 只读命令免打扰（规则显式 ask 时除外）。
   if (ruleVerdict !== "ask" && !dangerous && _callIsReadOnlyCommand(call)) return true;
+
+  // ②′ 用户自己配的 MCP 服务免打扰，理由和上面同一条：一道每次都要点的门，用户会
+  // 直接关掉整道门 —— 那才是真正的安全损失。判据见 `_mcpServerApprovalMode`：仓库
+  // 自带的 .mcp.json 不在此列，它照旧逐次问。
+  if (ruleVerdict !== "ask" && call.type === "mcp" && call.mcpAutoApprove) return true;
 
   const mode = (run && run.perm) || _currentAiPerm;
   const mustAsk = ruleVerdict === "ask" || dangerous || (mode === "approve" && _requiresApproval(call));
@@ -25895,16 +25906,41 @@ async function _approveWorkspaceExecConfig(kind, path, text, details) {
       + `⚠️ 这些命令来自你打开的这个仓库，不是 Mr. Day One 自带的。\n`
       + `如果这个仓库不是你自己写的、或者你不认识上面的命令，请选择拒绝。\n`
       + `（配置内容一旦改变会重新询问）`,
+    // 以前这里是三个按钮，而且只有点"本会话总是允许"才记账 —— 点"允许"的人下次开
+    // 软件会被一模一样的框再拦一次，永远拦下去。那个区分在这里本来就没有意义：
+    // key 里带着配置内容的指纹，配置一改自然会重新问，这才是真正起保护作用的东西。
+    // 所以收成两个按钮，答应了就记住。
+    onceLabel: "允许并记住",
+    alwaysLabel: "",
   });
   if (decision === "deny") return false;
-  if (decision === "always") {
-    approvals.add(key);
-    try {
-      const store = await getStore();
-      await store.set(_EXEC_CONFIG_APPROVALS_KEY, [...approvals]);
-    } catch { /* 存不下就下次再问一遍，不影响本次决定 */ }
-  }
+  approvals.add(key);
+  try {
+    const store = await getStore();
+    await store.set(_EXEC_CONFIG_APPROVALS_KEY, [...approvals]);
+  } catch { /* 存不下就下次再问一遍，不影响本次决定 */ }
   return true;
+}
+
+// 用户级（跨项目）MCP 配置：本 IDE 的 ~/.michael-ide/mcp.json，加上 Claude Code /
+// Cursor / Codex 的全局配置（只读接入）。见 src-tauri/src/mcp.rs 里为什么要走独立命令。
+//
+// 这一层是"MCP 能不能真的用起来"的关键：在它之前，配置**只**来自工作区里的文件，
+// 换个项目就得把服务和 API Key 从头再填一遍，没打开文件夹时干脆一个都用不了。
+async function _readUserScopeMcpConfigs() {
+  if (!inTauri) return [];
+  try {
+    const list = await backend.invoke("mcp_user_configs");
+    return Array.isArray(list) ? list : [];
+  } catch { return []; }
+}
+
+/// 用户级配置里可写的那一份的路径（面板保存的目标）。取不到就返回空串。
+async function _userScopeMcpConfigPath() {
+  for (const entry of await _readUserScopeMcpConfigs()) {
+    if (entry && entry.writable) return String(entry.path || "");
+  }
+  return "";
 }
 
 async function _readWorkspaceMcpDocument(root) {
@@ -25914,16 +25950,32 @@ async function _readWorkspaceMcpDocument(root) {
     // file wins when the same server name appears in more than one layer; parent roots are
     // still included so a monorepo-level service remains available to a nested package.
     for (const path of [base + "/.mcp.local.json", base + "/.mcp.json", base + "/.cursor/mcp.json"]) {
-      try { documents.push({ text: await backend.readTextFile(path), path, base }); } catch {}
+      const scope = path.endsWith("/.mcp.local.json") ? "local" : "repo";
+      try { documents.push({ text: await backend.readTextFile(path), path, base, scope }); } catch {}
     }
   }
-  if (!documents.length) return { text: "", path: "", base: "", serverBases: {}, serverSources: {} };
+  // 用户级配置排在工作区之后：同名时项目里的那个赢，项目可以覆写一个全局服务。
+  const workspaceCount = documents.length;
+  for (const entry of await _readUserScopeMcpConfigs()) {
+    const servers = entry && entry.servers && typeof entry.servers === "object" ? entry.servers : {};
+    if (!entry?.writable && !Object.keys(servers).length) continue;
+    documents.push({
+      text: JSON.stringify({ mcpServers: servers }),
+      path: String(entry.path || ""),
+      // 全局服务跟着**当前**工作区跑（相对 cwd 相对它解析）；没打开文件夹时就没有基准目录。
+      base: root || "",
+      scope: entry.writable ? "user" : "interop",
+    });
+  }
+  if (!documents.length) return { text: "", path: "", base: "", serverBases: {}, serverSources: {}, serverScopes: {} };
   const mergedServers = {};
   const serverBases = {};
   // 每个服务来自哪个文件。`.mcp.local.json` 是 IDE 自己的本地文件（_protectLocalMcpConfig
   // 会把它写进 .git/info/exclude，不进版本库）＝用户自己配的；`.mcp.json` / `.cursor/mcp.json`
   // 跟着仓库走 ＝ **外部可执行内容**，必须先过信任 + 逐条确认。调用方靠这张表区分两者。
   const serverSources = {};
+  // scope: local（项目本地，用户配的）/ repo（仓库自带）/ user（本 IDE 全局）/ interop（别的客户端的全局配置）
+  const serverScopes = {};
   const invalid = [];
   for (const document of documents) {
     let parsed;
@@ -25938,25 +25990,47 @@ async function _readWorkspaceMcpDocument(root) {
         mergedServers[name] = config;
         serverBases[name] = document.base;
         serverSources[name] = document.path;
+        serverScopes[name] = document.scope;
       }
     }
   }
-  if (!Object.keys(mergedServers).length && invalid.length) return { ...invalid[0], serverBases: {}, serverSources: {} };
+  if (!Object.keys(mergedServers).length && invalid.length) {
+    return { ...invalid[0], serverBases: {}, serverSources: {}, serverScopes: {} };
+  }
   return {
     text: JSON.stringify({ mcpServers: mergedServers }),
     path: documents.map((document) => document.path).join(","),
     base: documents[0].base,
+    workspaceDocuments: workspaceCount,
     serverBases,
     serverSources,
+    serverScopes,
   };
 }
 
-/// 这个服务是不是**仓库自带**的（而不是用户在 IDE 里自己配的本地服务）。
+/// 这个服务是不是**仓库自带**的（而不是用户自己配的——项目本地 / 全局 / 别的客户端）。
 /// 仓库自带的 MCP 配置本质上是一条任意命令行，和 hooks 一样属于外部可执行内容。
-function _mcpServerIsRepoProvided(sourcePath) {
-  const p = String(sourcePath || "").replace(/\\/g, "/");
-  if (!p) return false;
-  return !p.endsWith("/.mcp.local.json");
+function _mcpServerIsRepoProvided(scope) {
+  return String(scope || "") === "repo";
+}
+
+/// 这个服务的工具要不要逐次弹窗确认。
+///
+/// 用户抱怨的原话是"不需要始终允许那些按钮点击条件"。以前 MCP 是一刀切
+/// `needsApproval: true`：只要打开了「改动前审批」，**每一个** MCP 工具、**每一轮新
+/// 会话**都要重新点一次"本会话总是允许"（`_sessionApproved` 只活在内存里）。
+///
+/// 判据换成"这条命令行是谁写的"：
+///   * 用户自己配的（全局 / 项目本地 / 从 Claude Code·Cursor 读来的）→ 默认直接跑。
+///     他已经亲手把这个服务的启动命令写下来了，进程也早就起在他机器上——再逐个工具
+///     问一遍并不能多挡住什么，只会把人逼到去关掉整道审批门。
+///   * 仓库自带的 `.mcp.json` → 照旧问。那是 clone 下来的别人的代码，是这道门真正
+///     要防的东西，不动。
+/// 想恢复逐次确认的，在服务条目里写 `"__michael": { "approve": "ask" }`。
+function _mcpServerApprovalMode(scope, server) {
+  const explicit = String(server?.__michael?.approve || "").trim().toLowerCase();
+  if (explicit === "ask" || explicit === "auto") return explicit;
+  return _mcpServerIsRepoProvided(scope) ? "ask" : "auto";
 }
 
 async function _protectLocalMcpConfig(root) {
@@ -26196,12 +26270,8 @@ async function _ensureMcpTools(rootOverride = "") {
     _mcpServerMeta.clear();
     _mcpFailures.clear();
 
-    if (!root) {
-      _mcpConfigSig = "";
-      _mcpLoaded = true;
-      return _mcpSnapshot(root);
-    }
-
+    // 没打开文件夹时**不再**直接放弃：用户级配置是跨项目的，那时候它照样该起作用。
+    // （工作区那三个文件此时本来就读不到，_readWorkspaceMcpDocument 会自然只剩全局层。）
     const cfgDoc = await _readWorkspaceMcpDocument(root);
     const cfgText = cfgDoc.text;
     _mcpConfigSig = cfgDoc.path + "\n" + (cfgText || "");
@@ -26245,7 +26315,7 @@ async function _ensureMcpTools(rootOverride = "") {
     //   1. 工作区信任（用户可以整体拒绝这个仓库自带的可执行内容）
     //   2. _approveWorkspaceExecConfig 逐条列出**真正会执行的命令行**再确认一次
     // 用户自己在 MCP 面板里配的 .mcp.local.json 不进这道门（它不跟仓库走）。
-    const repoNames = names.filter((name) => _mcpServerIsRepoProvided(cfgDoc.serverSources?.[name]));
+    const repoNames = names.filter((name) => _mcpServerIsRepoProvided(cfgDoc.serverScopes?.[name]));
     if (repoNames.length) {
       const repoPaths = [...new Set(repoNames.map((name) => cfgDoc.serverSources?.[name] || "").filter(Boolean))];
       // 指纹只覆盖仓库自带的部分：改自己的本地配置不该让这个确认重新弹一次。
@@ -26281,6 +26351,10 @@ async function _ensureMcpTools(rootOverride = "") {
     const seenSourceTools = new Set();
     await Promise.all(names.map(async (serverName) => {
       const server = servers[serverName] || {};
+      const scope = cfgDoc.serverScopes?.[serverName] || "repo";
+      // 逐次审批与否是**服务**的属性，不是单个工具的。整套发现出来的东西（工具 /
+      // 资源 / prompt 适配器）都带上同一个结论，执行前的权限门直接读它。
+      const autoApprove = _mcpServerApprovalMode(scope, server) === "auto";
       const launch = _mcpServerLaunchConfig(server);
       if (launch.error) {
         _mcpFailures.set(serverName, launch.error);
@@ -26301,6 +26375,9 @@ async function _ensureMcpTools(rootOverride = "") {
           ? (discovery.resourceTemplates || discovery.resource_templates) : [];
         _mcpServerMeta.set(serverName, {
           root,
+          scope,
+          autoApprove,
+          source: cfgDoc.serverSources?.[serverName] || "",
           capabilities: discovery?.capabilities || {},
           serverInfo: discovery?.serverInfo || discovery?.server_info || {},
           resources,
@@ -26322,6 +26399,7 @@ async function _ensureMcpTools(rootOverride = "") {
             tool: tool.name,
             kind: "tool",
             readOnly: tool.annotations?.readOnlyHint === true,
+            autoApprove,
             root,
           });
           const inputSchema = tool.inputSchema || tool.input_schema;
@@ -26342,12 +26420,12 @@ async function _ensureMcpTools(rootOverride = "") {
         // through the same tool-call loop without pretending they are ordinary tools.
         const resourceAdapter = _mcpCapabilitySchema(serverName, "resource", [...resources, ...resourceTemplates], _mcpToolMap);
         if (resourceAdapter) {
-          _mcpToolMap.set(resourceAdapter.name, { ...resourceAdapter.route, root });
+          _mcpToolMap.set(resourceAdapter.name, { ...resourceAdapter.route, autoApprove, root });
           _mcpToolCache.push(resourceAdapter.schema);
         }
         const promptAdapter = _mcpCapabilitySchema(serverName, "prompt", prompts, _mcpToolMap);
         if (promptAdapter) {
-          _mcpToolMap.set(promptAdapter.name, { ...promptAdapter.route, root });
+          _mcpToolMap.set(promptAdapter.name, { ...promptAdapter.route, autoApprove, root });
           _mcpToolCache.push(promptAdapter.schema);
         }
         _mcpConnected.push(serverName);
@@ -27085,29 +27163,79 @@ function _openMcpUrl(url) {
 async function openMcpPanel(opts = null) {
   const m = _chatToolModal({ title: "MCP · 服务", icon: _ICON_MCP, wide: true });
   const root = (rootPath || workspaceRoots[0] || "").replace(/\/$/, "");
-  if (!root) { m.body.innerHTML = `<div class="ctp-empty">请先打开一个工作区文件夹。<br>MCP 配置保存在工作区根目录的 <code>.mcp.local.json</code>。</div>`; return; }
-  const mcpPath = root + "/.mcp.local.json";
-  const readCfg = async () => { try { const c = JSON.parse((await _readWorkspaceMcpDocument(root)).text || "{}"); return (c && typeof c === "object") ? c : { mcpServers: {} }; } catch { return { mcpServers: {} }; } };
-  const writeCfg = async (cfg) => {
+  // 没打开文件夹也照样能用：全局作用域的服务本来就不属于任何项目。
+  const mcpPath = root ? root + "/.mcp.local.json" : "";
+
+  // 读**单个作用域**的配置文件，而不是合并视图。以前这里读的是合并结果再整份写回
+  // .mcp.local.json —— 那会把仓库自带（以及现在的全局）服务连同别人的 API Key 一起
+  // 抄进项目文件里，加一个服务就顺手复制了一堆本来不该在那儿的东西。
+  const readScopeCfg = async (scope) => {
+    if (scope === "user") {
+      for (const entry of await _readUserScopeMcpConfigs()) {
+        if (entry?.writable) {
+          const servers = entry.servers && typeof entry.servers === "object" ? entry.servers : {};
+          return { mcpServers: { ...servers } };
+        }
+      }
+      return { mcpServers: {} };
+    }
+    try { const c = JSON.parse(await backend.readTextFile(mcpPath)); return (c && typeof c === "object") ? c : { mcpServers: {} }; }
+    catch { return { mcpServers: {} }; }
+  };
+  const writeScopeCfg = async (scope, cfg) => {
+    const text = JSON.stringify(cfg, null, 2);
+    if (scope === "user") { await backend.invoke("mcp_save_user_config", { text }); return; }
+    if (!mcpPath) throw new Error("没有打开工作区，无法保存到项目配置");
     if (!(await _protectLocalMcpConfig(root))) throw new Error("无法把 .mcp.local.json 加入 Git 本地排除，已取消保存以避免提交 MCP 环境变量");
     let expected = null;
     try { expected = await backend.readTextFile(mcpPath); } catch {}
-    await _commitDiskTextIfUnchanged(mcpPath, expected, JSON.stringify(cfg, null, 2));
+    await _commitDiskTextIfUnchanged(mcpPath, expected, text);
+  };
+  const removeFromScope = async (scope, name) => {
+    const cfg = await readScopeCfg(scope);
+    const servers = cfg.mcpServers || cfg.servers || {};
+    if (!Object.prototype.hasOwnProperty.call(servers, name)) return;
+    delete servers[name];
+    cfg.mcpServers = servers; delete cfg.servers;
+    await writeScopeCfg(scope, cfg);
+  };
+  const SCOPE_TAG = { user: "全局", local: "项目", repo: "仓库", interop: "其他客户端" };
+  let userPath = "";   // ~/.michael-ide/mcp.json，由后端给出；面板要显示"会存到哪里"
+  try { userPath = await _userScopeMcpConfigPath(); } catch {}
+  const _appOfSource = (source) => {
+    const p = String(source || "");
+    if (p.endsWith("/.claude.json")) return "Claude Code";
+    if (p.includes("/.cursor/")) return "Cursor";
+    if (p.includes("/.codex/")) return "Codex";
+    return "";
   };
   let editing = null;
   const renderList = async () => {
     m.body.innerHTML = `<div class="ctp-loading">加载中…</div>`;
-    const cfg = await readCfg();
+    const doc = await _readWorkspaceMcpDocument(root);
+    let cfg = {};
+    try { cfg = JSON.parse(doc.text || "{}") || {}; } catch { cfg = {}; }
     const servers = cfg.mcpServers || cfg.servers || {};
+    const scopes = doc.serverScopes || {};
+    const sources = doc.serverSources || {};
     const names = Object.keys(servers);
+    userPath = (await _userScopeMcpConfigPath()) || userPath;
     m.body.innerHTML = "";
     const intro = document.createElement("div"); intro.className = "ctp-intro";
-    intro.innerHTML = `接入本地 stdio MCP 服务，完成握手和工具发现后，其工具会以 <code>mcp__服务__工具</code> 提供给智能体。面板保存到已本地排除的 <code>.mcp.local.json</code>，也兼容共享 <code>.mcp.json</code> 与 <code>.cursor/mcp.json</code>；状态来自实际连接结果。`;
+    intro.innerHTML = `接入 MCP 服务，完成握手和工具发现后，其工具会以 <code>mcp__服务__工具</code> 提供给智能体。`
+      + `新服务默认存在<b>全局</b>配置 <code>${_escHtml(userPath || "~/.michael-ide/mcp.json")}</code>（权限 0600），<b>换项目照样在</b>；`
+      + `选「仅这个项目」则写进已本地排除的 <code>.mcp.local.json</code>。也会读取仓库里的 <code>.mcp.json</code> / <code>.cursor/mcp.json</code>，`
+      + `以及你在 Claude Code / Cursor / Codex 里配好的全局服务（只读）。`
+      + `<br>你自己配的服务<b>不会</b>逐次弹窗要授权；仓库自带的那些照旧需要确认。想让某个服务恢复逐次确认，给它加一行 <code>"__michael": { "approve": "ask" }</code>。`;
     m.body.appendChild(intro);
     const list = document.createElement("div"); list.className = "ctp-list";
     const currentRoot = _mcpLoaded && _mcpLoadedRoot === root;
     names.forEach((name) => {
       const s = servers[name] || {};
+      const scope = scopes[name] || "repo";
+      const source = sources[name] || "";
+      // 别的客户端的配置文件是它们的，面板只读不写——要改请回那边改。
+      const editable = scope === "user" || scope === "local";
       const connected = currentRoot && _mcpConnected.includes(name);
       const failure = currentRoot ? (_mcpFailures.get(name) || "") : "";
       const toolNames = currentRoot ? [..._mcpToolMap.values()].filter((v) => v.server === name && v.root === root).map((v) => v.tool) : [];
@@ -27118,20 +27246,30 @@ async function openMcpPanel(opts = null) {
       row.innerHTML =
         `<span class="mcp-row__dot ${connected ? "is-on" : (failure ? "is-error" : "")}"></span>` +
         `<div class="mcp-row__main"><div class="mcp-row__name"></div><div class="mcp-row__cmd"></div></div>` +
+        `<span class="mcp-row__scope">${_escHtml(_appOfSource(source) || SCOPE_TAG[scope] || scope)}</span>` +
         `<span class="mcp-row__tag${connected ? " is-on" : ""}${failure ? " is-error" : ""}${connected && toolCount ? " is-clickable" : ""}">${statusText}</span>` +
         `<div class="ctp-rowbtns"><button class="ctp-iconbtn _edit" type="button" title="编辑" aria-label="编辑">${_ICON_PENCIL}</button><button class="ctp-iconbtn ctp-iconbtn--danger _del" type="button" title="删除" aria-label="删除">${_ICON_TRASH}</button></div>`;
       row.querySelector(".mcp-row__name").textContent = name;
       row.querySelector(".mcp-row__cmd").textContent = [s.command, ...((s.args) || [])].join(" ");
+      row.querySelector(".mcp-row__scope").title = source || "";
       if (failure) row.querySelector(".mcp-row__tag").title = failure;
-      row.querySelector("._edit").addEventListener("click", () => { editing = { name, command: s.command || "", args: s.args || [], env: s.env || {}, cwd: s.cwd || "", meta: s.__michael || null, _orig: name }; renderForm(); });
-      row.querySelector("._del").addEventListener("click", async () => {
-        try {
-          const c = await readCfg(); const sv = c.mcpServers || c.servers || {}; delete sv[name]; c.mcpServers = sv; delete c.servers;
-          await writeCfg(c); await backend.invoke("mcp_disconnect", { name }).catch(() => {});
-          _forgetMcpServer(root, name);
-          _mcpLoaded = false; await _ensureMcpTools(root); renderList();
-        } catch (e) { showToast("删除 MCP 服务失败：" + String(e?.message || e).slice(0, 120)); }
-      });
+      const editBtn = row.querySelector("._edit"); const delBtn = row.querySelector("._del");
+      if (!editable) {
+        const why = scope === "repo"
+          ? "这个服务来自仓库里的配置文件，请直接编辑该文件"
+          : `这个服务来自 ${_appOfSource(source) || "其他客户端"} 的配置，请在那边管理`;
+        for (const b of [editBtn, delBtn]) { b.disabled = true; b.title = why; }
+      } else {
+        editBtn.addEventListener("click", () => { editing = { name, command: s.command || "", args: s.args || [], env: s.env || {}, cwd: s.cwd || "", meta: s.__michael || null, scope, _orig: name, _origScope: scope }; renderForm(); });
+        delBtn.addEventListener("click", async () => {
+          try {
+            await removeFromScope(scope, name);
+            await backend.invoke("mcp_disconnect", { name }).catch(() => {});
+            _forgetMcpServer(root, name);
+            _mcpLoaded = false; await _ensureMcpTools(root); renderList();
+          } catch (e) { showToast("删除 MCP 服务失败：" + String(e?.message || e).slice(0, 120)); }
+        });
+      }
       item.appendChild(row);
       // Click "N 个工具" to expand the exact tool names this server exposes (agent sees them as mcp__name__tool).
       if (connected && toolCount) {
@@ -27152,7 +27290,7 @@ async function openMcpPanel(opts = null) {
         `<button class="ctp-btn ctp-btn--sm _add" type="button">＋ 添加</button>`;
       row.querySelector(".mcp-row__name").textContent = p.name;
       row.querySelector(".mcp-row__cmd").textContent = p.desc;
-      row.querySelector("._add").addEventListener("click", () => { editing = { name: p.name, command: p.command, args: p.args || [], env: p.env || {}, cwd: p.cwd || "", meta: _mcpInstallMetaFromPreset(p), _orig: "" }; renderForm(); });
+      row.querySelector("._add").addEventListener("click", () => { editing = { name: p.name, command: p.command, args: p.args || [], env: p.env || {}, cwd: p.cwd || "", meta: _mcpInstallMetaFromPreset(p), scope: "user", _orig: "", _origScope: "" }; renderForm(); });
       list.appendChild(row);
     });
     if (!list.children.length) { const e = document.createElement("div"); e.className = "ctp-empty"; e.textContent = "还没有 MCP 服务，点下面「添加服务」自定义一个。"; list.appendChild(e); }
@@ -27161,7 +27299,7 @@ async function openMcpPanel(opts = null) {
     const reBtn = document.createElement("button"); reBtn.className = "ctp-btn"; reBtn.type = "button"; reBtn.textContent = "↻ 重新连接";
     reBtn.addEventListener("click", async () => { reBtn.disabled = true; reBtn.textContent = "连接中…"; _mcpLoaded = false; await _ensureMcpTools(root); renderList(); });
     const addBtn = document.createElement("button"); addBtn.className = "ctp-btn ctp-btn--primary"; addBtn.type = "button"; addBtn.textContent = "＋ 添加服务";
-    addBtn.addEventListener("click", () => { editing = { name: "", command: "", args: [], env: {}, cwd: "", _orig: "" }; renderForm(); });
+    addBtn.addEventListener("click", () => { editing = { name: "", command: "", args: [], env: {}, cwd: "", scope: "user", _orig: "", _origScope: "" }; renderForm(); });
     foot.append(reBtn, addBtn);
     m.body.appendChild(foot);
   };
@@ -27170,6 +27308,10 @@ async function openMcpPanel(opts = null) {
     m.body.innerHTML = "";
     const form = document.createElement("div"); form.className = "ctp-form";
     form.innerHTML =
+      `<label class="ctp-lbl">作用范围</label><select class="ctp-input _scope">` +
+        `<option value="user">所有项目（推荐）— 保存到 ${_escHtml(userPath || "~/.michael-ide/mcp.json")}</option>` +
+        `<option value="local"${root ? "" : " disabled"}>仅这个项目 — 保存到 ${_escHtml(root ? mcpPath : ".mcp.local.json（需要先打开文件夹）")}</option>` +
+      `</select>` +
       `<label class="ctp-lbl">服务名（英文/数字）</label><input class="ctp-input _name" placeholder="例如：filesystem" />` +
       `<label class="ctp-lbl">启动命令</label><input class="ctp-input _cmd" placeholder="例如：npx" />` +
       `<label class="ctp-lbl">参数（每行一个）</label><textarea class="ctp-textarea _args" rows="3" placeholder="-y&#10;@modelcontextprotocol/server-filesystem&#10;."></textarea>` +
@@ -27177,6 +27319,7 @@ async function openMcpPanel(opts = null) {
       `<label class="ctp-lbl">环境变量（KEY=VALUE，每行一个，可选）</label><textarea class="ctp-textarea _env" rows="2" placeholder="API_KEY=xxxx"></textarea>` +
       `<div class="ctp-foot"><button class="ctp-btn _cancel" type="button">取消</button><button class="ctp-btn ctp-btn--primary _save" type="button">保存并连接</button></div>`;
     m.body.appendChild(form);
+    form.querySelector("._scope").value = (e.scope === "local" && root) ? "local" : "user";
     form.querySelector("._name").value = e.name || "";
     form.querySelector("._cmd").value = e.command || "";
     form.querySelector("._args").value = (e.args || []).join("\n");
@@ -27206,12 +27349,16 @@ async function openMcpPanel(opts = null) {
       form.querySelector("._env").value.split("\n").map((x) => x.trim()).filter((l) => l.includes("=")).forEach((l) => {
         const k = l.slice(0, l.indexOf("=")).trim(); if (k) env[k] = l.slice(l.indexOf("=") + 1).trim();
       });
+      const scope = form.querySelector("._scope").value === "local" ? "local" : "user";
       try {
-        const c = await readCfg(); const sv = c.mcpServers || c.servers || {};
+        const c = await readScopeCfg(scope); const sv = c.mcpServers || c.servers || {};
         if (e._orig && e._orig !== name) delete sv[e._orig];
         sv[name] = { command, ...(args.length ? { args } : {}), ...(Object.keys(env).length ? { env } : {}), ...(cwd ? { cwd } : {}), ...(e.meta ? { __michael: e.meta } : {}) };
         c.mcpServers = sv; delete c.servers;
-        await writeCfg(c);
+        await writeScopeCfg(scope, c);
+        // 改了作用范围就得把旧位置那份删掉，否则两边各留一份，改了半天不生效的是
+        // 优先级更高的旧那份。
+        if (e._origScope && e._origScope !== scope) await removeFromScope(e._origScope, e._orig || name);
       } catch (err) { showToast("保存 MCP 配置失败：" + String(err?.message || err).slice(0, 120)); return; }
       editing = null;
       m.body.innerHTML = `<div class="ctp-loading">正在连接「${_escHtml(name)}」…</div>`;
@@ -27222,7 +27369,7 @@ async function openMcpPanel(opts = null) {
   // Auto-connect on open so the user sees LIVE status, not a stale 未加载. First run downloads the
   // package (npx/uvx) so it can take a while → show 连接中… and re-render with the real result.
   if (!_mcpLoaded || _mcpLoadedRoot !== root) _mcpConnecting = true;
-  if (opts && opts.add) { editing = { name: "", command: "", args: [], env: {}, cwd: "", _orig: "" }; renderForm(); }
+  if (opts && opts.add) { editing = { name: "", command: "", args: [], env: {}, cwd: "", scope: "user", _orig: "", _origScope: "" }; renderForm(); }
   else renderList();
   if (_mcpConnecting) _ensureMcpTools(root).catch(() => {}).finally(() => { _mcpConnecting = false; renderList(); });
 }
@@ -30572,7 +30719,7 @@ function _mapToolCall(name, args, mcpToolMap = _mcpToolMap) {
   // built in _ensureMcpTools so server/tool names with odd chars resolve exactly.
   if (typeof name === "string" && name.startsWith("mcp__")) {
     const m = mcpToolMap?.get(name);
-    return { type: "mcp", server: m ? m.server : "", tool: m ? m.tool : "", kind: m?.kind || "tool", mcpName: name, mcpReadOnly: !!m?.readOnly, mcpRoot: m?.root || "", args };
+    return { type: "mcp", server: m ? m.server : "", tool: m ? m.tool : "", kind: m?.kind || "tool", mcpName: name, mcpReadOnly: !!m?.readOnly, mcpAutoApprove: !!m?.autoApprove, mcpRoot: m?.root || "", args };
   }
   switch (name) {
     case "search_tools": return { type: "search_tools", query: args.query || args.q || args.description || "" };
@@ -49412,7 +49559,9 @@ return { type: call.type, path: call.query || "", content: `[失败] ${call.type
       const label = `${call.server || "?"}/${call.tool || call.mcpName || "?"}`;
       if (!inTauri) { res.className = "atc-result atc-result--err"; res.textContent = "桌面专用"; return { type: "mcp", path: label, content: "[不可用] MCP 外部工具只能在桌面 App 里用（要本地启动 MCP 服务进程）。" }; }
       if (_mcpRouteIssue(call)) { res.className = "atc-result atc-result--err"; res.textContent = "未知工具"; return { type: "mcp", path: call.mcpName || label, content: `[失败] 未知或未连接的 MCP 工具 ${call.mcpName || label}。确认 .mcp.json 里的服务已连上。` }; }
-      if (!call.mcpRoot || call.mcpRoot !== root || _mcpLoadedRoot !== root) {
+      // 归一化后比较，别再单独判 `!call.mcpRoot`：没打开文件夹时根目录本来就是空串，
+      // 那一条会把全局 MCP 服务全部拦掉——而它们恰恰是不属于任何项目的那些。
+      if (String(call.mcpRoot || "") !== String(root || "") || String(_mcpLoadedRoot || "") !== String(root || "")) {
         res.className = "atc-result atc-result--blocked"; res.textContent = "工作区 MCP 已切换";
         return { type: "mcp", path: label, content: `[BLOCKED] 这个 MCP 工具属于「${call.mcpRoot || "未知工作区"}」，当前运行根目录是「${root || "未知"}」，当前已连接 MCP 根目录是「${_mcpLoadedRoot || "无"}」。为避免并发项目串线，IDE 没有调用它；请在当前项目的新一轮 Agent 任务中重新连接。` };
       }
@@ -52399,7 +52548,7 @@ function renderMcpTool(body) {
       <div class="mcpfp-head">
         <div>
           <h3>MCP 服务器</h3>
-          <p class="mcpfp-sub">Model Context Protocol——给智能体接上外部工具（数据库、浏览器、API…）。安装后工具以 <code>mcp__服务__工具</code> 暴露给 AI 助手，配置保存在工作区 <code>.mcp.local.json</code>（已自动 Git 排除）。</p>
+          <p class="mcpfp-sub">Model Context Protocol——给智能体接上外部工具（数据库、浏览器、API…）。安装后工具以 <code>mcp__服务__工具</code> 暴露给 AI 助手；配置保存在全局 <code>~/.michael-ide/mcp.json</code>（权限 0600），<b>换项目照样在</b>。列表里也会显示项目自带和 Claude Code / Cursor 里配好的服务。</p>
         </div>
         <button type="button" class="ctp-btn ctp-btn--primary" data-mcpfp="add-service">＋ 添加服务</button>
       </div>
@@ -52430,15 +52579,28 @@ function renderMcpTool(body) {
   const marketEl = wrap.querySelector("[data-mcpfp-market]");
   const sourceEl = wrap.querySelector("[data-mcpfp-source]");
 
+  // 市场页装出来的服务落在**全局**配置里（~/.michael-ide/mcp.json）。以前写的是当前
+  // 工作区的 .mcp.local.json：在市场里装好、填完 API Key，换个项目全没了，得再装再填
+  // 一遍。装一次到处都在才是这个页面该有的语义。
+  //
+  // 而且 readCfg 以前读的是**合并视图**再整份写回项目文件——装一个服务会把仓库自带
+  // 的、别的项目的服务连同它们的 Key 一起抄进来。改成只读写全局那一份。
   const readCfg = async () => {
-    try { const c = JSON.parse((await _readWorkspaceMcpDocument(root)).text || "{}"); return (c && typeof c === "object") ? c : { mcpServers: {} }; } catch { return { mcpServers: {} }; }
+    for (const entry of await _readUserScopeMcpConfigs()) {
+      if (entry?.writable) {
+        const servers = entry.servers && typeof entry.servers === "object" ? entry.servers : {};
+        return { mcpServers: { ...servers } };
+      }
+    }
+    return { mcpServers: {} };
   };
   const writeCfg = async (cfg) => {
-    if (!(await _protectLocalMcpConfig(root))) throw new Error("无法把 .mcp.local.json 加入 Git 本地排除");
-    const mcpPath = root + "/.mcp.local.json";
-    let expected = null;
-    try { expected = await backend.readTextFile(mcpPath); } catch {}
-    await _commitDiskTextIfUnchanged(mcpPath, expected, JSON.stringify(cfg, null, 2));
+    await backend.invoke("mcp_save_user_config", { text: JSON.stringify(cfg, null, 2) });
+  };
+  /// 展示用的**合并**视图：全局 + 项目 + 仓库 + 其他客户端，和智能体实际拿到的一致。
+  const readMergedCfg = async () => {
+    try { const c = JSON.parse((await _readWorkspaceMcpDocument(root)).text || "{}"); return (c && typeof c === "object") ? c : {}; }
+    catch { return {}; }
   };
 
   let addServiceOpen = false;
@@ -52454,7 +52616,7 @@ function renderMcpTool(body) {
       <div class="mcpfp-inline-form__head">
         <div>
           <strong>添加自定义 MCP 服务</strong>
-          <p>保存后会写入当前工作区 <code>.mcp.local.json</code>，并立即尝试连接。</p>
+          <p>保存后会写入全局 <code>~/.michael-ide/mcp.json</code>（所有项目通用），并立即尝试连接。</p>
         </div>
       </div>
       <div class="mcpfp-form-grid">
@@ -52539,12 +52701,13 @@ function renderMcpTool(body) {
   let installedNames = [];
   const renderInstalled = async () => {
     installedEl.classList.add("mcpfp-installed--cards");
-    if (!root) { installedEl.innerHTML = `<div class="ctp-empty">先打开一个工作区文件夹，MCP 配置保存在工作区根目录。</div>`; return; }
-    const cfg = await readCfg();
+    // 不再要求先打开文件夹：全局服务不属于任何项目。
+    const cfg = await readMergedCfg();
     const servers = cfg.mcpServers || cfg.servers || {};
     installedNames = Object.keys(servers);
     if (!installedNames.length) { installedEl.innerHTML = `<div class="ctp-empty">还没配置 MCP 服务——从下面的热门清单一键安装，或点「＋ 添加服务」手动添加。</div>`; return; }
-    const live = _mcpLoaded && _mcpLoadedRoot === root;
+    const live = _mcpLoaded && _mcpLoadedRoot === (root || "");
+    const ownServers = (await readCfg()).mcpServers || {};
     installedEl.innerHTML = installedNames.map((name) => {
       const s = servers[name] || {};
       const meta = _mcpInstalledMeta(name, s);
@@ -52574,7 +52737,9 @@ function renderMcpTool(body) {
           </div>
           <div class="mcpfp-card__btns">
             ${sourceUrl ? `<button type="button" class="ctp-iconbtn" data-mcpfp-repo="${_escAttr(sourceUrl)}" title="查看来源">${_dbUiIconSvg("open")}</button>` : ""}
-            <button type="button" class="ctp-iconbtn ctp-iconbtn--danger" data-mcpfp-del="${_escAttr(name)}" title="删除 MCP 服务">${_ICON_TRASH}</button>
+            ${Object.prototype.hasOwnProperty.call(ownServers, name)
+              ? `<button type="button" class="ctp-iconbtn ctp-iconbtn--danger" data-mcpfp-del="${_escAttr(name)}" title="删除 MCP 服务">${_ICON_TRASH}</button>`
+              : `<button type="button" class="ctp-iconbtn ctp-iconbtn--danger" disabled title="这个服务来自项目或其他客户端的配置文件，请在那边删除">${_ICON_TRASH}</button>`}
           </div>
         </div>`;
     }).join("") + `
@@ -52718,7 +52883,7 @@ function renderMcpTool(body) {
         c.mcpServers = sv; delete c.servers;
         await writeCfg(c);
         const needKey = p.env && Object.values(p.env).some((v) => !v);
-        showToast(needKey ? `已安装「${p.name}」——需要在 .mcp.local.json 里补 API Key` : `已安装「${p.name}」，正在连接…`);
+        showToast(needKey ? `已安装「${p.name}」——需要在全局 MCP 配置里补 API Key` : `已安装「${p.name}」，正在连接…`);
         _mcpLoaded = false;
         _mcpConnecting = true;
         await renderInstalled();
