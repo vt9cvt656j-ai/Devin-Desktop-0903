@@ -742,6 +742,22 @@ fn search_inner(
     } else {
         top_k.clamp(1, 3)
     };
+    // BM25 的长度归一化会把「几乎没有正文的小节」推到前面：查 "hero section" 时返回的前三名
+    // 曾经是 373/262/305 字节的标题壳。放在别的域没什么，但 michael-design 只发 3 条，
+    // 一条空壳就是三分之一的名额没了——而模型拿不到可抄的蓝图，就只能凭印象编。
+    //
+    // 处理方式是"够用就不动"：只有当确实存在足够多的实心命中时，才把小节壳滤掉；
+    // 否则宁可返回壳，也不返回空。
+    if design_mode {
+        const MIN_USEFUL_BYTES: usize = 900;
+        let solid = scored
+            .iter()
+            .filter(|(i, _)| idx.chunks[*i].text.len() >= MIN_USEFUL_BYTES)
+            .count();
+        if solid >= take {
+            scored.retain(|(i, _)| idx.chunks[*i].text.len() >= MIN_USEFUL_BYTES);
+        }
+    }
     scored
         .into_iter()
         .take(take)
@@ -772,4 +788,41 @@ fn search_inner(
             }
         })
         .collect()
+}
+
+#[cfg(test)]
+mod knowledge_design_tests {
+    /// michael-design 只发 3 条，一条空壳就是三分之一的名额没了。
+    ///
+    /// BM25 的长度归一化天然偏袒短文档：查 "hero section" 时前三名曾经是 373/262/305 字节的
+    /// 标题壳——模型拿不到可抄的蓝图，只能凭印象编，页面就难看。这条钉住"有实心命中时
+    /// 不许让壳占位"。
+    #[test]
+    fn design_search_does_not_waste_its_three_slots_on_stubs() {
+        let hits = super::search("hero section", Some("michael-design"), 6);
+        assert!(!hits.is_empty(), "查不到任何东西，说明语料没加载");
+        for h in &hits {
+            assert!(
+                h.text.len() >= 900,
+                "空壳占了名额：{} ({} 字节)",
+                h.section,
+                h.text.len()
+            );
+        }
+    }
+
+    /// 具体做法层必须在语料里，且检索得到。
+    ///
+    /// 这批内容原本躺在 prompts/css_concrete_tokens.txt 里，既不在 PROMPT_NAMES 也不在
+    /// prompt_graph 里——写好了却从不注入，等于不存在。搬进语料后由 knowledge_search 承载：
+    /// 不占提示词预算，按需取。
+    #[test]
+    fn concrete_css_craft_is_in_the_corpus_and_retrievable() {
+        let hits = super::search("card surface craft inner highlight shadow", Some("michael-design"), 6);
+        assert!(
+            hits.iter().any(|h| h.topic == "concrete-css-craft"),
+            "做法层检索不到：{:?}",
+            hits.iter().map(|h| h.topic.as_str()).collect::<Vec<_>>()
+        );
+    }
 }

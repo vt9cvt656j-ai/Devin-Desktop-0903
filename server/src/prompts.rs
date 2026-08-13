@@ -3715,6 +3715,10 @@ const PROMPT_NAMES: &[&str] = &[
     "explorer",
     "reviewer",
     "design_core",
+    // 数值层。知识库给的是蓝本与配色，字体族/字号阶/4px 间距网格/圆角/阴影/动效时长这些
+    // 具体数字它没有——缺了这一层，模型只能凭印象编间距和阴影，页面就是"说不出哪里不对
+    // 但就是难看"。这份文件本来就写好了，只是从没被挂进任何 prompt 集合。
+    "design_tokens",
     "design_implementation",
     "design_components",
     "design_scaffold",
@@ -4047,6 +4051,124 @@ mod tests {
             );
             let text = read_prompt(name).unwrap_or_else(|err| panic!("{name}: {err}"));
             assert!(!text.trim().is_empty(), "graph module is empty: {name}");
+        }
+    }
+
+    /// 提示词里点名要求调用的工具，必须真的存在于 tools.json。
+    ///
+    /// 这条守卫是补上一个真实事故的：prompts/design_tokens.txt（当时叫 css_concrete_tokens.txt）
+    /// 让模型去调 `shadcn_reference` 和 `tailwind_palette` 取真实色值——两个工具**从来就不存在**。
+    /// 模型照做只会拿到「未知工具」，然后回退到凭记忆编色，页面就难看。这类错误不会报警、
+    /// 不会崩，只会安静地让产出变差，所以必须由测试盯着。
+    #[test]
+    fn prompts_never_name_a_tool_that_does_not_exist() {
+        let catalog = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("prompts/tools.json"),
+        )
+        .expect("tools.json");
+        let tools: serde_json::Value = serde_json::from_str(&catalog).expect("tools.json is valid JSON");
+        let known: std::collections::HashSet<String> = tools
+            .as_array()
+            .expect("tools.json is an array")
+            .iter()
+            .filter_map(|t| t.pointer("/function/name")?.as_str().map(str::to_string))
+            .collect();
+        assert!(known.len() > 100, "工具目录看起来没读对：只有 {} 个", known.len());
+
+        // 判据要窄。提示词里大量反引号包着的是枚举值（`staged_roles`）、字段名（`owner_id`）、
+        // CSS 变量，不是工具。只有两种情况算「点名要求调用工具」：写成调用形态 `name(`，
+        // 或者裸标识符出现在一段明确在讲调用工具的文字里（附近几行提到 调用/工具/call/tool）。
+        let mut missing: Vec<String> = Vec::new();
+        for name in PROMPT_NAMES {
+            let Ok(text) = read_prompt(name) else { continue };
+            for line in text.lines() {
+                // 「作为条目列出来」和「散文里顺带提到」是两回事。前者形如
+                //     - **`shadcn_reference`** → 官方 CSS 变量清单
+                // 后者形如
+                //     - Use time fields with their exact meaning: `created_date`, `updated_at` …
+                // 只有前者才是在告诉模型"有这么个工具可以调"。用反引号距行首的位置区分：
+                // 条目名总在开头，散文里的字段名在句中。
+                let head_slot = line.char_indices().take(12).any(|(_, c)| c == '`');
+                for (ident, call_form) in backticked_identifiers(line) {
+                    if !call_form && !head_slot {
+                        continue;
+                    }
+                    // 至少两段的 snake_case 才可能是工具名
+                    if !ident.contains('_') || known.contains(&ident) {
+                        continue;
+                    }
+                    // 确实不是工具的下划线标识符
+                    const NOT_TOOLS: &[&str] = &[
+                        "search_tools", "font_sans", "font_display", "font_mono", "data_url",
+                        "node_modules", "package_json", "staged_roles", "parallel_roles",
+                        "opening_hours", "is_admin", "owner_id", "user_id", "tenant_id",
+                    ];
+                    if NOT_TOOLS.contains(&ident.as_str()) {
+                        continue;
+                    }
+                    missing.push(format!("{name}.txt 让模型调用了不存在的工具 `{ident}`"));
+                }
+            }
+        }
+        missing.sort();
+        missing.dedup();
+        assert!(missing.is_empty(), "{}", missing.join("\n"));
+    }
+
+    /// 一行里反引号包起来的标识符，附带「是不是写成了调用形态 name(」。
+    /// 不引 regex 依赖，手写一个够用的扫描。
+    fn backticked_identifiers(text: &str) -> Vec<(String, bool)> {
+        let mut out = Vec::new();
+        let chars: Vec<char> = text.chars().collect();
+        let mut i = 0;
+        while i < chars.len() {
+            if chars[i] != '`' {
+                i += 1;
+                continue;
+            }
+            let start = i + 1;
+            let mut end = start;
+            while end < chars.len() && chars[end] != '`' {
+                end += 1;
+            }
+            if end >= chars.len() {
+                break;
+            }
+            let inner: String = chars[start..end].iter().collect();
+            let head: String = inner
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                .collect();
+            if !head.is_empty() {
+                let rest = &inner[head.len()..];
+                let call_form = rest.starts_with('(');
+                if call_form || rest.is_empty() {
+                    out.push((head, call_form));
+                }
+            }
+            i = end + 1;
+        }
+        out
+    }
+
+    /// 数值层必须真的挂在 design 上。
+    ///
+    /// 知识库给的是蓝本与配色，字体族/字号阶/间距网格/圆角/阴影/动效时长这些具体数字它没有。
+    /// 这份文件写好之后有很长时间既不在 PROMPT_NAMES 也不在 prompt_graph 里，等于不存在——
+    /// 模型只能凭印象编间距和阴影。
+    #[test]
+    fn design_tokens_is_actually_injected_for_ui_work() {
+        assert!(PROMPT_NAMES.contains(&"design_tokens"));
+        let graph = read_prompt_graph().expect("prompt graph");
+        assert!(
+            graph.design.base.iter().any(|m| m == "design_tokens"),
+            "design_tokens 必须挂在 design.base 上，否则只有特定子意图才拿得到：{:?}",
+            graph.design.base
+        );
+        let text = read_prompt("design_tokens").expect("design_tokens.txt");
+        // 钉的是"数值层确实在场"，不是具体某个数字——改版式不该让这条误红。
+        for marker in ["--sp-", "--text-", "--radius", "shadow"] {
+            assert!(text.contains(marker), "数值层缺了 {marker}");
         }
     }
 
@@ -5568,7 +5690,9 @@ mod tests {
     #[test]
     fn ui_contract_is_split_across_graph_routed_michael_design_modules() {
         let graph = read_prompt_graph().expect("prompt graph should load");
-        assert_eq!(graph.design.base, vec!["design_core"]);
+        // design_tokens 与 design_core 一起进 base：知识库给蓝本与配色，数值层（字号阶、
+        // 4px 间距网格、圆角、阴影、动效时长）只在这份文件里，两者缺一不可。
+        assert_eq!(graph.design.base, vec!["design_core", "design_tokens"]);
         assert_eq!(
             graph.design.implementation,
             vec![

@@ -1,28 +1,81 @@
 {
   "version": 2,
   "modes": {
-    "chat": ["chat", "truthfulness", "answer_quality"],
-    "plan": ["plan", "truthfulness", "answer_quality"],
-    "explorer": ["explorer", "truthfulness", "answer_quality"],
-    "reviewer": ["reviewer", "defect_hunting", "truthfulness", "answer_quality"]
+    "chat": [
+      "chat",
+      "truthfulness",
+      "answer_quality"
+    ],
+    "plan": [
+      "plan",
+      "truthfulness",
+      "answer_quality"
+    ],
+    "explorer": [
+      "explorer",
+      "truthfulness",
+      "answer_quality"
+    ],
+    "reviewer": [
+      "reviewer",
+      "defect_hunting",
+      "truthfulness",
+      "answer_quality"
+    ]
   },
   "agent": {
-    "base": ["agent_core", "reasoning", "truthfulness", "answer_quality"],
-    "engineering": ["agent_engineering"],
-    "defects": ["defect_hunting"],
-    "collaboration": ["agent_collaboration"],
-    "research": ["agent_research"],
-    "automation": ["agent_automation"],
-    "git": ["git_guide"]
+    "base": [
+      "agent_core",
+      "reasoning",
+      "truthfulness",
+      "answer_quality"
+    ],
+    "engineering": [
+      "agent_engineering"
+    ],
+    "defects": [
+      "defect_hunting"
+    ],
+    "collaboration": [
+      "agent_collaboration"
+    ],
+    "research": [
+      "agent_research"
+    ],
+    "automation": [
+      "agent_automation"
+    ],
+    "git": [
+      "git_guide"
+    ]
   },
   "design": {
-    "base": ["design_core"],
-    "implementation": ["design_implementation", "design_components", "design_engineering"],
-    "scaffold": ["design_scaffold"],
-    "content": ["design_content"],
-    "data": ["design_data"],
-    "review": ["design_verification"],
-    "verification": ["design_verification"],
-    "motion": ["design_motion"]
+    "base": [
+      "design_core",
+      "design_tokens"
+    ],
+    "implementation": [
+      "design_implementation",
+      "design_components",
+      "design_engineering"
+    ],
+    "scaffold": [
+      "design_scaffold"
+    ],
+    "content": [
+      "design_content"
+    ],
+    "data": [
+      "design_data"
+    ],
+    "review": [
+      "design_verification"
+    ],
+    "verification": [
+      "design_verification"
+    ],
+    "motion": [
+      "design_motion"
+    ]
   }
 }

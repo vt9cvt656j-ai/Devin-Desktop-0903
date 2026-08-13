@@ -1,0 +1,28 @@
+# michael-design 数值层（字号阶 / 间距网格 / 圆角 / 阴影 / 时长）
+
+这些是知识库里没有的具体数字，直接用。**颜色不在这里**——本轮配色来自
+`knowledge_search(domain="michael-design")` 命中的蓝图，决策链见 design core。
+项目已有 spacing / radius / shadow token 就沿用项目的，别另起一套。
+
+```css
+:root {
+  /* 字体：别默认 Inter（满屏 AI 味）。正文选中性现代体，标题选有性格的展示体，从 Google Fonts 真加载 */
+  --font-sans: 'Manrope', system-ui, -apple-system, sans-serif;   /* 可换 Plus Jakarta Sans / Geist / Instrument Sans */
+  --font-display: 'Space Grotesk', var(--font-sans);              /* 可换 Fraunces / Sora / Clash Display / Bricolage Grotesque */
+  --font-mono: 'JetBrains Mono', ui-monospace, monospace;
+  --text-xs: .75rem; --text-sm: .875rem; --text-base: 1rem;
+  --text-lg: 1.125rem; --text-xl: 1.25rem; --text-2xl: 1.5rem;
+  --leading-tight: 1.15; --leading-normal: 1.55;
+  /* 间距：4px 网格，只用这些值，禁止临时编 px */
+  --sp-1: 4px; --sp-2: 8px; --sp-3: 12px; --sp-4: 16px;
+  --sp-6: 24px; --sp-8: 32px; --sp-12: 48px; --sp-16: 64px;
+  --radius-sm: 4px; --radius-md: 8px; --radius-lg: 12px; --radius-full: 9999px;
+  --shadow-sm: 0 1px 2px rgb(0 0 0 / .05);
+  --shadow-md: 0 4px 6px -1px rgb(0 0 0 / .07), 0 2px 4px -2px rgb(0 0 0 / .05);
+  --duration: 150ms; --ease: cubic-bezier(.16, 1, .3, 1);
+}
+```
+
+更细的做法——卡片质感的 surface 阶梯与顶边内高光、用单一强调色的透明度档做层次、
+mockup 真实感、深度氛围、可直接抄的组件模板——在知识库里：
+`knowledge_search(domain="michael-design", query="concrete css craft")`。
