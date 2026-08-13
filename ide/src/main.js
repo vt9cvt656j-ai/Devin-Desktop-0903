@@ -8293,7 +8293,10 @@ async function _writeOpenFileSnapshot(path, snapshot) {
   const expected = typeof f.diskContent === "string"
     ? f.diskContent
     : await backend.readTextFile(path);
-  const op = backend.writeTextFileIfUnchanged(path, expected, snapshot);
+  const _docKind = _userDocKindForPath(path);
+  const op = _docKind
+    ? _writeUserDoc(_docKind, snapshot)      // 用户文档在沙箱外，走专用命令
+    : backend.writeTextFileIfUnchanged(path, expected, snapshot);
   const pending = { content: snapshot, op };
   _pendingEditorWrites.set(path, pending);
   f._savePromise = op;
@@ -8344,7 +8347,10 @@ async function _persistBackgroundModel(path, model) {
     throw e;
   }
   if (expected === snapshot) return; // 磁盘已经是这个内容
-  const op = backend.writeTextFileIfUnchanged(path, expected, snapshot);
+  const _docKind = _userDocKindForPath(path);
+  const op = _docKind
+    ? _writeUserDoc(_docKind, snapshot)      // 用户文档在沙箱外，走专用命令
+    : backend.writeTextFileIfUnchanged(path, expected, snapshot);
   const pending = { content: snapshot, op };
   // 登记进来，watcher 才不会把我们自己的写当成外部改动去回读或报冲突。
   _pendingEditorWrites.set(path, pending);
@@ -15442,12 +15448,12 @@ const _ICON_RULES = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" 
   if (_habitsItem) {
     const icon = _habitsItem.querySelector(".assistant-capability__item-icon");
     if (icon) icon.innerHTML = _ICON_HABITS;
-    _habitsItem.addEventListener("click", () => { _closeCapabilitiesMenu(); void openUserRulesPanel("habits"); });
+    _habitsItem.addEventListener("click", () => { _closeCapabilitiesMenu(); void openUserDocTab("habits"); });
   }
   if (_rulesItem) {
     const icon = _rulesItem.querySelector(".assistant-capability__item-icon");
     if (icon) icon.innerHTML = _ICON_RULES;
-    _rulesItem.addEventListener("click", () => { _closeCapabilitiesMenu(); void openUserRulesPanel("rules"); });
+    _rulesItem.addEventListener("click", () => { _closeCapabilitiesMenu(); void openUserDocTab("rules"); });
   }
   // 窗口大小一变，之前算好的 left 就不对了。菜单开着才重算，关着不做无用功。
   window.addEventListener("resize", () => { if (_menu && !_menu.hidden) _alignCapabilitiesMenu(); });
@@ -22838,18 +22844,45 @@ function _preferredLanguageCode() {
 // 立刻刷新——不然改完要等下次启动才生效，用户会以为没保存上。
 let _userRulesText = "";
 let _userHabitsText = "";
+/// 两份用户文档在磁盘上的真实路径（启动时从后端拿）。保存拦截和"点菜单开标签页"都要用。
+const _userDocPaths = { rules: "", habits: "" };
 let _userRulesLoaded = false;
 const _USER_RULES_MAX = 4_000;   // 软上限：这段每一轮都发，超了截断并在块里说明
 
 async function _refreshUserRules() {
   if (!inTauri) { _userRulesText = ""; _userHabitsText = ""; _userRulesLoaded = true; return _userRulesText; }
   const read = async (kind) => {
-    try { return String((await backend.invoke("user_rules_read", { kind }))?.text || ""); }
-    catch { return ""; }
+    try {
+      const out = await backend.invoke("user_rules_read", { kind });
+      if (out?.path) _userDocPaths[kind] = String(out.path);
+      return String(out?.text || "");
+    } catch { return ""; }
   };
   [_userRulesText, _userHabitsText] = await Promise.all([read("rules"), read("habits")]);
   _userRulesLoaded = true;
   return _userRulesText;
+}
+
+/// 这个路径是不是两份用户文档之一？是的话返回 "rules" / "habits"，否则空串。
+///
+/// 编辑器保存走 `write_text_file_if_unchanged`，而它的 `require_inside_workspace(path, true)`
+/// **明确拒绝**"在 HOME 底下但不在已打开工作区里"的写入——正是这条挡着 ~/.ssh、~/.bashrc。
+/// 所以这两份文档的保存在前端改道走专用命令，而不是去把那道墙挖开。
+function _userDocKindForPath(path) {
+  const value = String(path || "").replace(/\\/g, "/");
+  if (!value) return "";
+  for (const kind of ["rules", "habits"]) {
+    const known = String(_userDocPaths[kind] || "").replace(/\\/g, "/");
+    if (known && known === value) return kind;
+  }
+  return "";
+}
+
+/// 写这两份文档：走专用命令，并同步刷新内存里那份——保存完下一轮对话立刻生效。
+function _writeUserDoc(kind, text) {
+  return backend.invoke("user_rules_save", { text, kind }).then(() => {
+    if (kind === "habits") _userHabitsText = text; else _userRulesText = text;
+  });
 }
 
 /// 截断到本轮预算内，超了就说明白（而不是整段丢掉，也不是闷声截断）。
@@ -27440,84 +27473,32 @@ function _openMcpUrl(url) {
   try { if (backend.taskRunCapture) { backend.taskRunCapture("/", 'open "' + url + '"').catch(() => { try { openExternal(url); } catch {} }); return; } } catch {}
   try { openExternal(url); } catch {}
 }
-/// 用户习惯 / 用户规则的编辑器。一个纯文本框——这些就是给模型看的话，不该套一层表单。
-/// 两者只有文案和落盘文件不同，共用一个实现，免得改一处忘另一处。
-const _USER_DOC_META = {
-  rules: {
-    title: "用户规则",
-    intro: `你定下的<b>硬性要求</b>，<b>每一轮对话都会带上</b>，换项目也在。`
-      + `这些是约束不是建议——模型会当成必须遵守的条件，只有你在当轮明确说了相反的话才让路。`
-      + `<br>适合放"不许直接推 main""改完必须跑测试再说完成""不要自作主张加依赖"这类底线。`,
-    placeholder: "一行一条，写你的底线。例如：\n\n不要直接 push 到 main。\n改完代码必须先跑测试，测试没过不许说做完了。\n不要自作主张引入新依赖，先问我。",
-  },
-  habits: {
-    title: "用户习惯",
-    intro: `你平时<b>怎么干活</b>，<b>每一轮对话都会带上</b>，换项目也在。`
-      + `这些是默认做法——模型没有相反理由就照着来，确实需要偏离时会先跟你说一声。`
-      + `<br>适合放"我用 pnpm""回答用中文""先给方案再动手""变量名用下划线"这类偏好。`,
-    placeholder: "一行一条，用大白话写。例如：\n\n回答用中文。\n包管理器用 pnpm。\n先给我方案，我点头了再动手。",
-  },
-};
-
-async function openUserRulesPanel(kind = "rules") {
-  const meta = _USER_DOC_META[kind] || _USER_DOC_META.rules;
-  const m = _chatToolModal({ title: meta.title, icon: kind === "habits" ? _ICON_HABITS : _ICON_RULES });
-  if (!inTauri) { m.body.innerHTML = `<div class="ctp-empty">${_escHtml(meta.title)}只能在桌面 App 里编辑。</div>`; return; }
-  m.body.innerHTML = `<div class="ctp-loading">加载中…</div>`;
-  let path = "";
-  let current = "";
+/// 点菜单 → 在编辑器里打开那份 markdown。
+///
+/// 原来是弹窗里塞一个 textarea：让人写 markdown，却不给语法高亮、不给查找替换、不给撤销栈，
+/// 而这个应用本身就是个编辑器。现在直接开成标签页，用它自己的编辑器写。
+///
+/// 文件由后端保证存在（`user_rules_read` 不在就建一个空的）。它们住在 `~/.michael-ide/`
+/// 而**不在 app 包里**，所以升级、重装、换版本都碰不到——写进去的东西不会被更新覆盖。
+async function openUserDocTab(kind = "rules") {
+  const label = kind === "habits" ? "用户习惯" : "用户规则";
+  if (!inTauri) { showToast(`${label}只能在桌面 App 里编辑`); return; }
   try {
     const out = await backend.invoke("user_rules_read", { kind });
-    current = String(out?.text || "");
-    if (kind === "habits") _userHabitsText = current; else _userRulesText = current;
-    _userRulesLoaded = true;
-    path = String(out?.path || "");
-  } catch (e) {
-    m.body.innerHTML = `<div class="ctp-empty">读取失败：${_escHtml(String(e?.message || e).slice(0, 160))}</div>`;
-    return;
-  }
-  m.body.innerHTML = "";
-  const intro = document.createElement("div");
-  intro.className = "ctp-intro";
-  intro.innerHTML = meta.intro
-    + `<br>项目自己的约定继续写在仓库的 <code>AGENTS.md</code> / <code>CLAUDE.md</code> 里——那是团队的，这里是你自己的。`
-    + (path ? `<br>保存在 <code>${_escHtml(path)}</code>（权限 0600）。` : "");
-  const area = document.createElement("textarea");
-  area.className = "ctp-textarea";
-  area.rows = 14;
-  area.placeholder = meta.placeholder;
-  area.value = current;
-  const foot = document.createElement("div");
-  foot.className = "ctp-foot ctp-foot--between";
-  const hint = document.createElement("span");
-  hint.className = "ctp-hint";
-  const paint = () => {
-    const n = area.value.trim().length;
-    hint.textContent = n
-      ? `${n} 字符${n > _USER_RULES_MAX ? `（超过 ${_USER_RULES_MAX}，发送时会截断——建议精简）` : ""}`
-      : "留空 = 不启用";
-    hint.style.color = n > _USER_RULES_MAX ? "var(--atc-danger, #d93025)" : "";
-  };
-  area.addEventListener("input", paint);
-  paint();
-  const save = document.createElement("button");
-  save.className = "ctp-btn ctp-btn--primary"; save.type = "button"; save.textContent = "保存";
-  save.addEventListener("click", async () => {
-    save.disabled = true; save.textContent = "保存中…";
-    try {
-      await backend.invoke("user_rules_save", { text: area.value, kind });
-      // 立刻生效，不用等重启
-      if (kind === "habits") _userHabitsText = area.value; else _userRulesText = area.value;
-      showToast(area.value.trim() ? `${meta.title}已保存，下一轮对话就会带上` : `已清空${meta.title}`);
-      m.close();
-    } catch (e) {
-      save.disabled = false; save.textContent = "保存";
-      showToast("保存失败：" + String(e?.message || e).slice(0, 140));
+    const path = String(out?.path || "");
+    if (!path) throw new Error("拿不到文件路径");
+    _userDocPaths[kind] = path;
+    const text = String(out?.text || "");
+    if (kind === "habits") _userHabitsText = text; else _userRulesText = text;
+    await openFile(path, path.split("/").filter(Boolean).pop() || `${kind}.md`);
+    if (!text.trim()) {
+      showToast(kind === "habits"
+        ? "用户习惯：写你平时怎么干活（用 pnpm、回答用中文…），保存后每轮都带上"
+        : "用户规则：写你的底线（不许推 main、改完必须跑测试…），保存后每轮都带上");
     }
-  });
-  foot.append(hint, save);
-  m.body.append(intro, area, foot);
-  setTimeout(() => { try { area.focus(); } catch {} }, 0);
+  } catch (e) {
+    showToast(`打开${label}失败：${String(e?.message || e).slice(0, 140)}`);
+  }
 }
 
 async function openMcpPanel(opts = null) {
