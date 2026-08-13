@@ -805,3 +805,24 @@ test("「要方案」和「要施工」两条规则必须成对存在，只留�
   assert.match(core, /never downgrade a build request into a plan|do\/fix\/change\/build\/run\/deploy must produce/,
     "施工那半边不能被删掉");
 });
+
+test("打包进 app 的 automation sidecar 必须带鉴权，且这道闸在构建期", () => {
+  const build = readFileSync(new URL("../src-tauri/build.rs", import.meta.url), "utf8");
+
+  // 事故形状（2026-08-13 实测）：rpc.rs 的两道闸 08-02 就加上了，但 binaries/ 里放的是
+  // 手工构建、部分未跟踪的二进制。aarch64 是加固后编的（有鉴权），x86_64 和 universal
+  // 虽然文件日期更晚却是加固**之前**的产物——零鉴权。Tauri 按目标三元组挑文件，于是
+  // Apple Silicon 装到安全的那份、Intel Mac 和 Windows 装到零鉴权那份，全程无报错。
+  // 换掉二进制不够：手工产物迟早再次和源码脱节，所以闸必须在构建期。
+  assert.match(build, /fn assert_sidecar_is_authenticated/, "构建期要有 sidecar 鉴权闸");
+  assert.match(build, /assert_sidecar_is_authenticated\(\);\s*\n\s*tauri_build::build\(\)/,
+    "闸必须在 tauri_build::build() 之前跑");
+  assert.match(build, /MICHAEL_AUTOMATION_TOKEN/);
+  assert.match(build, /unauthorized/);
+  assert.match(build, /panic!/, "缺鉴权要让构建失败，不能只打个警告");
+
+  // 判据只能用会进 .rodata 的字符串。短比较字面量（strip_prefix("x-automation-token:")）
+  // 在 release 下被内联成立即数，从**已加固**的源码新编出来也搜不到——拿它当判据只会
+  // 得到假警报。今天在这上面栽过三次。
+  assert.doesNotMatch(build, /has\("x-automation-token/, "别用会被内联的短字面量当判据");
+});
