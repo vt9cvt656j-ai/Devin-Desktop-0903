@@ -1,6 +1,40 @@
 // 工具元数据映射表：为每个重要工具定义使用场景、触发条件和示例调用
 // 目的：让 AI 从"被动保守"转变为"主动发现和调用工具"
 const TOOL_METADATA = Object.freeze({
+  // 元能力：工程起步 / 推理 / 技能 / 决策
+  create_project: {
+    category: 'planning',
+    use_cases: ['用户要做一个东西但没打开任何工作区', '从零起一个项目'],
+    triggers: ['没有工作区却被要求写代码', '"帮我做一个…"'],
+    example_call: "create_project(name='telegram-bot')",
+    priority: 'high',
+    usage_note: '【何时用】用户让你造东西、而当前没有打开的工作区时，直接建，不要反问放哪。【vs 替代】已有工作区就用 create_dir/write_file。'
+  },
+  think: {
+    category: 'planning',
+    use_cases: ['动手前把目标、假设、下一步说清楚'],
+    triggers: ['信息够了但路径有分叉', '要先定性再动手'],
+    example_call: "think(thought='报错来自缓存而不是源码，先验证缓存')",
+    priority: 'medium',
+    usage_note: '【何时用】决策前记一条内部结论。【何时不用】不要拿它当回复用户的话。'
+  },
+  read_skill: {
+    category: 'planning',
+    use_cases: ['系统提示里列出的技能与当前任务对上了'],
+    triggers: ['技能目录里有名字贴合本任务的条目'],
+    example_call: "read_skill(name='pdf-processing')",
+    priority: 'high',
+    usage_note: '【何时用】技能目录里某条与任务吻合时读全文再照做。【何时不用】别把不相关的技能都读一遍，浪费上下文。'
+  },
+  debate: {
+    category: 'orchestration',
+    use_cases: ['A 方案还是 B 方案', '要不要重构', '架构方向之争'],
+    triggers: ['真的有争议且没有唯一答案的技术决策'],
+    example_call: "debate(topic='REST 还是 gRPC')",
+    priority: 'medium',
+    usage_note: '【何时用】重大且确有分歧的取舍，多方并行论证再由裁判合议。【何时不用】普通问题直接答，别开辩论。'
+  },
+
   // 调研类工具
   github_search: {
     category: 'research',
@@ -664,4 +698,64 @@ export function enrichedCatalogLine(entry) {
   return line;
 }
 
-export { TOOL_METADATA };
+// 分类展示名。索引的价值在于"按目标扫一眼就能定位"，光有名字不够。
+const CATEGORY_LABELS = Object.freeze({
+  planning: '规划与起步',
+  file_io: '文件读写',
+  code_editing: '代码编辑',
+  search: '符号与语义检索',
+  diagnostics: '诊断与性能',
+  execution: '命令与终端',
+  version_control: '版本控制与 PR',
+  research: '联网调研',
+  networking: '网络请求与抓包',
+  ui_automation: '浏览器自动化',
+  desktop_automation: '桌面自动化',
+  creative: '设计',
+  generation: '生成脚手架与图像',
+  game_asset_generation: '游戏素材生成',
+  data_layer: '数据库',
+  specification_parsing: '接口规范',
+  deployment: '部署',
+  orchestration: '多智能体编排',
+  interaction: '与用户交互与记忆',
+  location: '本地环境发现',
+  utility: '杂项',
+});
+
+let _capabilityIndexCache = "";
+
+/**
+ * 全量工具能力索引：按类别列出每一个已注册工具的名字。
+ *
+ * 为什么需要它：search_tools 是**精确名**查找，语义编排器又要等到第一次工具调用之后
+ * 才介入。于是开局窗口里没有的工具，模型既叫不出名字也搜不到——132 个工具里真正够得着
+ * 的只有开局那十来个。把名字全列出来，每一个就都变成可达的。
+ *
+ * 返回值是**字节稳定**的（只依赖冻结的 TOOL_METADATA，不含任务文本），可以安全地
+ * 待在 prompt cache 前缀里。
+ */
+export function toolCapabilityIndex() {
+  if (_capabilityIndexCache) return _capabilityIndexCache;
+  const byCategory = new Map();
+  for (const [name, meta] of Object.entries(TOOL_METADATA)) {
+    const cat = meta?.category || 'utility';
+    if (!byCategory.has(cat)) byCategory.set(cat, []);
+    byCategory.get(cat).push(name);
+  }
+  const lines = [];
+  for (const cat of Object.keys(CATEGORY_LABELS)) {
+    const names = byCategory.get(cat);
+    if (!names?.length) continue;
+    lines.push(`${CATEGORY_LABELS[cat]}: ${names.slice().sort().join(' ')}`);
+  }
+  // 兜底：新增了分类却忘了配展示名时，仍然把工具列出来，绝不让它从索引里消失
+  for (const [cat, names] of byCategory) {
+    if (CATEGORY_LABELS[cat] || !names.length) continue;
+    lines.push(`${cat}: ${names.slice().sort().join(' ')}`);
+  }
+  _capabilityIndexCache = lines.join('\n');
+  return _capabilityIndexCache;
+}
+
+export { TOOL_METADATA, CATEGORY_LABELS };

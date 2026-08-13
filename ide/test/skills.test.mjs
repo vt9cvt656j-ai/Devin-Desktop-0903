@@ -151,3 +151,18 @@ test("组合块 = 目录 + 已启用全文，两个注入点用的都是它", ()
   assert.match(SRC, /const skillsBlock = _agentLightTurn \? "" : _skillsSystemBlock\(\)/);
   assert.match(SRC, /run\?\.skillsBlock \?\? _skillsSystemBlock\(\)/);
 });
+
+test("冷启动首轮不会漏掉磁盘上的技能", () => {
+  // 文件技能靠 _idleRun 异步发现。开完工作区立刻提问时它还没跑完，技能目录里就只剩
+  // localStorage 那批——模型看不见的技能等于不存在，且没有任何报错。这条钉住首轮的等待。
+  const send = extractFn("sendPrompt");
+  const at = send.indexOf("const skillsBlock =");
+  assert.ok(at > 0, "找不到技能块的构建点");
+  const before = send.slice(0, at);
+  assert.match(before, /_fileSkillsCacheKey/,
+    "构建技能块之前必须判断磁盘技能是否已经发现过");
+  assert.match(before, /await Promise\.race\(\[\s*\n?\s*_refreshFileSkills\(/,
+    "首轮必须等一次目录扫描，且要带超时——不能无限期阻塞这一轮");
+  assert.match(before, /setTimeout\(resolve, \d+\)/,
+    "等待必须有上界");
+});
