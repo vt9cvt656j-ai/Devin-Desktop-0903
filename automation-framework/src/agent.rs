@@ -18,6 +18,44 @@ use crate::platform::windows_ui_automation::WindowsUIAutomation;
 #[cfg(all(feature = "system", target_os = "macos"))]
 use crate::platform::macos_accessibility::MacOSAccessibility;
 
+/// macOS 会静默丢弃未授权进程发出的合成事件：enigo 照样返回 Ok，于是每一次点击、
+/// 每一次按键都"成功"了，但屏幕上什么都没发生。这是最坏的一种失败——调用方据此
+/// 继续推进，越走越偏，还查不出原因。宁可在入口就报错，并且把补救路径写清楚。
+#[cfg(all(feature = "system", target_os = "macos"))]
+pub fn input_permission_granted() -> bool {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static GRANTED: AtomicBool = AtomicBool::new(false);
+    // 授权一旦拿到，本进程生命周期内不会再撤销，缓存住即可；反过来没拿到时必须
+    // 每次真查——用户可能刚在系统设置里勾上（虽然通常还需要重启应用才生效）。
+    if GRANTED.load(Ordering::Relaxed) {
+        return true;
+    }
+    let trusted = unsafe { accessibility_sys::AXIsProcessTrusted() };
+    if trusted {
+        GRANTED.store(true, Ordering::Relaxed);
+    }
+    trusted
+}
+
+#[cfg(all(feature = "system", not(target_os = "macos")))]
+pub fn input_permission_granted() -> bool {
+    true
+}
+
+#[cfg(feature = "system")]
+fn ensure_input_permission() -> Result<()> {
+    if input_permission_granted() {
+        return Ok(());
+    }
+    Err(Error::System(
+        "macOS 未授予辅助功能（Accessibility）权限，鼠标与键盘事件会被系统静默丢弃，\
+         看起来成功其实没有任何效果。请到 系统设置 → 隐私与安全性 → 辅助功能 勾选本应用，\
+         然后完全退出并重新打开它。在此之前请改用不需要该权限的手段：浏览器自动化、\
+         Shell 命令、或直接读写文件。"
+            .to_string(),
+    ))
+}
+
 pub struct Agent {
     #[cfg(feature = "browser")]
     browser: Option<Arc<Mutex<BrowserAutomation>>>,
@@ -60,6 +98,9 @@ impl Agent {
     
     #[cfg(feature = "system")]
     pub fn system_init(&mut self) -> Result<()> {
+        // 所有注入型操作（鼠标/键盘）都以这里为唯一入口；剪贴板走 arboard、
+        // screen.info 走 platform，都不经过这里，所以只在这里预检不会误伤只读能力。
+        ensure_input_permission()?;
         if self.system.is_none() {
             let sys = SystemAutomation::new()?;
             self.system = Some(Arc::new(Mutex::new(sys)));
@@ -67,6 +108,12 @@ impl Agent {
         Ok(())
     }
     
+    /// 移动指针，并且**等它真的到位**再返回。
+    ///
+    /// CGEvent 是异步投递的。enigo 的 button() 会先读当前指针位置、再把点击事件发到
+    /// 那个位置上——移动刚发出、指针还没落位时点击，事件就带着旧坐标发出去：不但点错
+    /// 地方，那条 mouse-down 还会把指针拽回旧位置。整条链路一路返回 ok，屏幕上什么
+    /// 都没发生。所以"移动"必须是同步语义，不能是"已发出移动请求"。
     #[cfg(feature = "system")]
     pub fn mouse_move(&mut self, x: i32, y: i32) -> Result<()> {
         self.system_init()?;
@@ -74,9 +121,30 @@ impl Agent {
             .ok_or_else(|| Error::System("系统自动化未初始化".to_string()))?
             .lock()
             .map_err(|e| Error::System(format!("Mutex 中毒: {}", e)))?;
-        sys.move_mouse(x, y)
+        sys.move_mouse(x, y)?;
+        // 轮询到位。上限 200ms：到不了就说明目标被系统夹住了（越界、被其他进程抢走），
+        // 与其假装成功，不如让调用方拿到真实落点自己判断。
+        for _ in 0..40 {
+            match sys.mouse_location() {
+                Ok((cx, cy)) if (cx - x).abs() <= 1 && (cy - y).abs() <= 1 => return Ok(()),
+                Ok(_) => {}
+                Err(_) => return Ok(()),
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        Ok(())
     }
     
+    #[cfg(feature = "system")]
+    pub fn mouse_location(&mut self) -> Result<(i32, i32)> {
+        self.system_init()?;
+        let sys = self.system.as_ref()
+            .ok_or_else(|| Error::System("系统自动化未初始化".to_string()))?
+            .lock()
+            .map_err(|e| Error::System(format!("Mutex 中毒: {}", e)))?;
+        sys.mouse_location()
+    }
+
     #[cfg(feature = "system")]
     pub fn mouse_click(&mut self, button: Option<&str>) -> Result<()> {
         self.system_init()?;

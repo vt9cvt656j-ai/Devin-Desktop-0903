@@ -92,6 +92,41 @@ impl RpcServer {
         }
     }
     
+    /// 带了 {x,y} 就先把指针移过去再点。
+    ///
+    /// 之所以做成"有就用、没有就保持原样"，是因为 mouse.click 的老语义是"在当前位置点"，
+    /// 有脚本依赖它；而两个工具 schema 又都对外声明可以带坐标。两边都认账。
+    #[cfg(feature = "system")]
+    fn click_at_if_given(
+        agent: &mut crate::agent::Agent,
+        params: &serde_json::Value,
+    ) -> Result<()> {
+        let x = Self::coord(params, "x");
+        let y = Self::coord(params, "y");
+        if let (Some(x), Some(y)) = (x, y) {
+            agent.mouse_move(x as i32, y as i32)?;
+        }
+        Ok(())
+    }
+
+    /// 坐标解析。工具 schema 里坐标是 number，模型给 100.0 或 "100" 都合法，
+    /// 而 as_i64() 对这两种都返回 None——于是坐标被当成"没传"，静默丢弃。
+    #[cfg(feature = "system")]
+    fn coord(params: &serde_json::Value, key: &str) -> Option<f64> {
+        let v = params.get(key)?;
+        v.as_f64().or_else(|| v.as_str().and_then(|s| s.trim().parse::<f64>().ok()))
+    }
+
+    /// 回执带上动作后的真实落点。只回 {"status":"ok"} 的话，"坐标被忽略"这类 bug
+    /// 在调用方眼里完全不可见——它正是这么潜伏下来的。
+    #[cfg(feature = "system")]
+    fn acted_at(agent: &mut crate::agent::Agent) -> serde_json::Value {
+        match agent.mouse_location() {
+            Ok((x, y)) => serde_json::json!({"status": "ok", "x": x, "y": y, "coordinate_space": "screen_points_top_left"}),
+            Err(_) => serde_json::json!({"status": "ok"}),
+        }
+    }
+
     fn execute_method(&self, method: &str, params: serde_json::Value) -> Result<serde_json::Value> {
         let mut agent = self.agent.lock().unwrap();
         
@@ -182,44 +217,49 @@ impl RpcServer {
             }
             
             #[cfg(feature = "system")]
+            "mouse.position" => {
+                let (x, y) = agent.mouse_location()?;
+                Ok(serde_json::json!({"x": x, "y": y, "coordinate_space": "screen_points_top_left"}))
+            }
+
+            #[cfg(feature = "system")]
             "mouse.move" => {
-                let x = params.get("x")
-                    .and_then(|v| v.as_i64())
+                let x = Self::coord(&params, "x")
                     .ok_or_else(|| Error::Other(anyhow::anyhow!("Missing 'x' parameter")))? as i32;
-                let y = params.get("y")
-                    .and_then(|v| v.as_i64())
+                let y = Self::coord(&params, "y")
                     .ok_or_else(|| Error::Other(anyhow::anyhow!("Missing 'y' parameter")))? as i32;
                 agent.mouse_move(x, y)?;
-                Ok(serde_json::json!({"status": "ok"}))
+                Ok(Self::acted_at(&mut agent))
             }
             
             #[cfg(feature = "system")]
             "mouse.click" => {
+                // 两个工具入口（automation / computer）都对外声明可以传 {x,y}，而这里以前只读
+                // button——多余的键被 serde 静默忽略，于是"带坐标的点击"实际点在光标上次停留的
+                // 位置上，还回一个 ok。不传坐标时保持原地点击的老行为。
+                Self::click_at_if_given(&mut agent, &params)?;
                 let button = params.get("button").and_then(|v| v.as_str());
                 agent.mouse_click(button)?;
-                Ok(serde_json::json!({"status": "ok"}))
+                Ok(Self::acted_at(&mut agent))
             }
             
             #[cfg(feature = "system")]
             "mouse.double_click" => {
+                Self::click_at_if_given(&mut agent, &params)?;
                 let button = params.get("button").and_then(|v| v.as_str());
                 agent.mouse_double_click(button)?;
-                Ok(serde_json::json!({"status": "ok"}))
+                Ok(Self::acted_at(&mut agent))
             }
             
             #[cfg(feature = "system")]
             "mouse.drag" => {
-                let from_x = params.get("from_x")
-                    .and_then(|v| v.as_i64())
+                let from_x = Self::coord(&params, "from_x")
                     .ok_or_else(|| Error::Other(anyhow::anyhow!("Missing 'from_x' parameter")))? as i32;
-                let from_y = params.get("from_y")
-                    .and_then(|v| v.as_i64())
+                let from_y = Self::coord(&params, "from_y")
                     .ok_or_else(|| Error::Other(anyhow::anyhow!("Missing 'from_y' parameter")))? as i32;
-                let to_x = params.get("to_x")
-                    .and_then(|v| v.as_i64())
+                let to_x = Self::coord(&params, "to_x")
                     .ok_or_else(|| Error::Other(anyhow::anyhow!("Missing 'to_x' parameter")))? as i32;
-                let to_y = params.get("to_y")
-                    .and_then(|v| v.as_i64())
+                let to_y = Self::coord(&params, "to_y")
                     .ok_or_else(|| Error::Other(anyhow::anyhow!("Missing 'to_y' parameter")))? as i32;
                 agent.mouse_drag(from_x, from_y, to_x, to_y)?;
                 Ok(serde_json::json!({"status": "ok"}))
@@ -230,8 +270,7 @@ impl RpcServer {
                 let delta_x = params.get("delta_x")
                     .and_then(|v| v.as_i64())
                     .unwrap_or(0) as i32;
-                let delta_y = params.get("delta_y")
-                    .and_then(|v| v.as_i64())
+                let delta_y = Self::coord(&params, "delta_y")
                     .ok_or_else(|| Error::Other(anyhow::anyhow!("Missing 'delta_y' parameter")))? as i32;
                 agent.mouse_scroll(delta_x, delta_y)?;
                 Ok(serde_json::json!({"status": "ok"}))
@@ -360,10 +399,30 @@ impl RpcServer {
                 Ok(serde_json::json!({ "status": "ok" }))
             }
             #[cfg(feature = "system")]
+            // screen.info 报的 width/height 来自 CGDisplay::pixels_wide()——名字叫 pixels，
+            // 返回的其实是**点**（本机实测 1728x1117，而物理像素是 3456x2234）。合成事件的
+            // enigo、read_screen 的 AX 树、window.list 用的也都是点。曾经的提示词教模型
+            // "坐标要乘 scale_factor"，于是每一次坐标点击都打在两倍的位置上。
+            // 让接口自己把坐标空间说清楚，比在提示词里反复叮嘱可靠。
             "screen.info" => {
                 drop(agent);
                 let info = crate::platform::get_window_controller().get_screen_info()?;
-                Ok(serde_json::json!({ "width": info.width, "height": info.height, "scale_factor": info.scale_factor }))
+                Ok(serde_json::json!({
+                    "width": info.width,
+                    "height": info.height,
+                    "scale_factor": info.scale_factor,
+                    // 自描述：别让调用方猜。width/height 和 mouse.move / read_screen /
+                    // window.list 是同一套坐标；scale_factor 只说明像素密度，不是换算系数。
+                    "coordinate_space": "screen_points_top_left",
+                    "note": "width/height are already in the units mouse.move accepts. Never multiply coordinates by scale_factor.",
+                    // 先告诉调用方能不能注入事件，省得它点了十次才发现系统压根没收到
+                    "input_permission": if crate::agent::input_permission_granted() { "granted" } else { "denied" },
+                    "input_permission_hint": if crate::agent::input_permission_granted() {
+                        ""
+                    } else {
+                        "Accessibility permission is missing: synthetic mouse/keyboard events are discarded by macOS. Use browser automation, shell, or file tools instead, and tell the user to grant it in System Settings > Privacy & Security > Accessibility, then fully restart the app."
+                    }
+                }))
             }
 
             // ── 剪贴板：agent.rs 早就实现（clipboard_get/set、quick_paste 粘贴长文本比逐键快百倍），补暴露。 ──
@@ -536,5 +595,31 @@ mod tests {
         let req: RpcRequest = serde_json::from_str(json).unwrap();
         assert_eq!(req.method, "browser.goto");
         assert_eq!(req.params["url"], "https://example.com");
+    }
+}
+
+#[cfg(all(test, feature = "system"))]
+mod coord_tests {
+    use super::RpcServer;
+
+    // 工具 schema 把坐标声明成 number，模型给 100.0 完全合法；而 as_i64() 对它返回 None，
+    // 于是坐标被当成"根本没传"——RPC 照样回 ok，点击落在光标上次停留的地方。
+    #[test]
+    fn 小数与字符串坐标不再被当成没传() {
+        let p = serde_json::json!({"x": 100.0, "y": 200.5, "sx": "512", "bad": "abc", "nil": null});
+        assert_eq!(RpcServer::coord(&p, "x"), Some(100.0));
+        assert_eq!(RpcServer::coord(&p, "y"), Some(200.5));
+        assert_eq!(RpcServer::coord(&p, "sx"), Some(512.0));
+        assert_eq!(RpcServer::coord(&p, "bad"), None, "非数字文本不能被当成坐标");
+        assert_eq!(RpcServer::coord(&p, "nil"), None);
+        assert_eq!(RpcServer::coord(&p, "missing"), None, "真的没传要如实报缺参");
+    }
+
+    #[test]
+    fn 整数坐标保持原样() {
+        let p = serde_json::json!({"x": 0, "y": -3, "big": 1728});
+        assert_eq!(RpcServer::coord(&p, "x"), Some(0.0));
+        assert_eq!(RpcServer::coord(&p, "y"), Some(-3.0), "负坐标是合法的多显示器坐标");
+        assert_eq!(RpcServer::coord(&p, "big"), Some(1728.0));
     }
 }

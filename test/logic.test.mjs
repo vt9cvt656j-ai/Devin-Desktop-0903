@@ -21,7 +21,7 @@ import { stripToolIp } from "../build/strip-tool-ip.mjs";
 import { ansiToText } from "../src/agent/ansi.js";
 import { ConversationMemory, extractExplicitCorrection, serializeMessagesForPersistence } from "../src/conversation-memory.js";
 import { GLOBAL_LANGUAGE_TAGS, buildLanguageOptions, coerceSupportedLocale, isSupportedLocale, localeLanguageCode, normalizeLocaleTag } from "../src/locales.js";
-import { compactToolExampleArgs, compactToolGuide, enrichedCatalogLine, TOOL_METADATA } from "../src/tool-guides.js";
+import { compactToolExampleArgs, compactToolGuide, enrichedCatalogLine, toolCapabilityIndex, TOOL_METADATA } from "../src/tool-guides.js";
 import * as toolPolicy from "../src/agent/tool-policy.js";
 
 // Every symbol main.js imports from the policy registry, injected into `load()` so extracted
@@ -270,6 +270,8 @@ const RUN_RECORD_KNOWN_SIGNATURE = load("_recordRunKnownSignature", {
   _runFileEvidenceAliases: EVIDENCE_ALIASES,
 });
 AUTO_LOAD_DEPS = {
+  // 完整能力名录（真的那份，不是桩）：_buildToolHint 把它拼进随 system 前缀发送的提示。
+  toolCapabilityIndex,
   // 重试间隔：真实值是 2000ms（源码里那条断言钉着），这里给 0 是为了不让每个抠出
   // _runModelRequestWithRetry 的测试都真等 2 秒 × 10 次。要验"确实等了"的那条测试
   // 自己传一个小的非零值。少了这个键是 ReferenceError，表现成"测试挂了"而不是
@@ -9711,8 +9713,14 @@ test("tool hints stay capability-neutral while the semantic orchestrator control
   const build = load("_buildToolHint");
   const hint = build("跑起来了但看不到哪里错", { applies: true, bug: true, backendApi: true });
   assert.match(hint, /动态工具编排/);
-  assert.doesNotMatch(hint, /get_diagnostics|http_request|capture_start/,
+  // 情境→工具的映射仍然禁止手写扩张（那会过拟合到昨天的工具集）。但从注册表生成的
+  // **完整名录**不是路由表：它没有情境映射，也不会过期——tool-reach.test.mjs 钉着
+  // 它与注册表逐一对齐。没有名录，133 个工具里模型只叫得出开局窗口里那 11 个。
+  const routingTable = hint.slice(0, hint.indexOf("完整能力名录"));
+  assert.ok(routingTable.length > 0, "完整能力名录必须在场");
+  assert.doesNotMatch(routingTable, /get_diagnostics|http_request|capture_start/,
     "prompt hint must not hard-code a second tool routing table");
+  assert.match(hint, /completeness placeholder|完整能力名录/);
   assert.doesNotMatch(extractFn("_buildToolHint"), /_profileToolPriorities|filter\(|\.bug/);
   const loop = extractFn("_runAgenticLoop");
   assert.match(loop, /const _startInitialToolRoutingAfterFirstTurn = \(\) => \{[\s\S]{0,600}_routeAgentTools\(\s*"initial"/,
@@ -17181,7 +17189,7 @@ test("Tool Search 只在命中时回传压缩调用指南，不把全量手册�
   assert.match(search, /工具已加载：\\n· \$\{compactToolGuide\(exact\.schema\)\}/,
     "已加载工具被再次查询时也要回传调用范式");
   assert.doesNotMatch(directory, /例:\s*\w+\(\{/, "稳定 search_tools 描述不能内嵌全量调用样例");
-  assert.match(SRC, /import \{ compactToolGuide, enrichedCatalogLine, autoEnrichToolMetadata, TOOL_METADATA \} from "\.\/tool-guides\.js"/,
+  assert.match(SRC, /import \{[^}]*\bcompactToolGuide\b[^}]*\bTOOL_METADATA\b[^}]*\} from "\.\/tool-guides\.js"/,
     "工具手册必须独立于庞大的主编排模块");
 });
 

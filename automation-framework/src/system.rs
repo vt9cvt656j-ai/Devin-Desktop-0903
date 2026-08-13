@@ -35,6 +35,13 @@ impl SystemAutomation {
     }
 
     /// 相对移动鼠标
+    /// 指针当前位置。此前整个框架只能"盲发"移动和点击，无从确认落点——
+    /// 出了偏差既查不出来，模型也没法自我纠正。
+    pub fn mouse_location(&self) -> Result<(i32, i32)> {
+        self.enigo.location()
+            .map_err(|e| Error::System(format!("读取指针位置失败: {}", e)))
+    }
+
     pub fn move_mouse_relative(&mut self, dx: i32, dy: i32) -> Result<()> {
         debug!("相对移动鼠标 ({}, {})", dx, dy);
         self.enigo
