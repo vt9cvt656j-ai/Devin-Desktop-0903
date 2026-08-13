@@ -344,21 +344,18 @@ export function Shell() {
               </span>
               <span className="assistant__actions">
                 <span className="assistant-capability" id="capabilitiesMenuWrap">
-                  <button className="assistant__action assistant__action--capabilities" id="capabilitiesBtn" type="button" data-i18n-title="assistant.capabilities" data-i18n-aria-label="assistant.capabilities.open" title="能力菜单" aria-label="打开 Skills 和 MCP 菜单" aria-haspopup="menu" aria-expanded="false"></button>
+                  <button className="assistant__action assistant__action--capabilities" id="capabilitiesBtn" type="button" data-i18n-title="assistant.capabilities" data-i18n-aria-label="assistant.capabilities.open" title="能力菜单" aria-label="打开技能和用户规则菜单" aria-haspopup="menu" aria-expanded="false"></button>
+                  {/* 每项只有一行：图标 + 一个词。副标题删掉了——那两句本来就是错的
+                      （技能面板同时装项目技能，"所有项目通用"是假话），而且这个应用里
+                      别的下拉全是单行，两行排版只有这一处，显得又高又空。 */}
                   <span className="assistant-capability__menu" id="capabilitiesMenu" role="menu" hidden>
                     <button className="assistant-capability__item" id="capabilitySkillsItem" type="button" role="menuitem">
                       <span className="assistant-capability__item-icon"></span>
-                      <span className="assistant-capability__item-main">
-                        <span className="assistant-capability__item-title">全局技能</span>
-                        <span className="assistant-capability__item-sub">所有项目通用</span>
-                      </span>
+                      <span data-i18n="assistant.capability.skills">技能</span>
                     </button>
                     <button className="assistant-capability__item" id="capabilityRulesItem" type="button" role="menuitem">
                       <span className="assistant-capability__item-icon"></span>
-                      <span className="assistant-capability__item-main">
-                        <span className="assistant-capability__item-title">用户规则</span>
-                        <span className="assistant-capability__item-sub">每轮都遵守</span>
-                      </span>
+                      <span data-i18n="assistant.capability.rules">用户规则</span>
                     </button>
                   </span>
                 </span>

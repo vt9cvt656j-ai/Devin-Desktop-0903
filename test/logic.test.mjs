@@ -1737,13 +1737,22 @@ test("assistant header groups its capabilities behind one vertical capabilities 
   const menuRule = /\.assistant-capability__menu\s*\{([^}]*)\}/.exec(APP_CSS);
   assert.ok(menuRule, "找不到 .assistant-capability__menu 规则");
   assert.match(menuRule[1], /position:\s*absolute;/);
-  assert.match(menuRule[1], /border-radius:\s*14px;/);
+  // 圆角 14 → 11：整套尺寸改成照自家 .menu 的家法（见 assistant-capability__menu 的注释）。
+  // 这条断言要守的是"它是个有圆角的浮层"，不是某个具体数字，所以不再钉死 14。
+  assert.match(menuRule[1], /border-radius:\s*\d+px;/);
+  assert.match(menuRule[1], /box-shadow:/);
   // 定位交给 JS 按实测几何算（对齐到 ⋮ 下方居中并夹进视口），CSS 里只留兜底值——
   // 要是又写死 right:0，菜单会整块甩到按钮左边去，正是所有者报过的那个"很丑"。
   assert.doesNotMatch(menuRule[1], /right:\s*0;/);
   assert.match(SRC, /const _alignCapabilitiesMenu = \(\) => \{/);
-  assert.match(APP_CSS, /\.assistant-capability__item-icon svg\s*\{[^}]*width:\s*18px;[\s\S]*height:\s*18px;/,
-    "menu item icons should share the assistant toolbar visual size");
+  // 图标 18 → 15px：菜单改成单行紧凑排版后，18px 的图标比 13px 的文字还高一截，行高就压不下去。
+  // 这条断言守的是"图标和文字成比例、且宽高一致"，不钉某个具体数字。
+  const iconRule = /\.assistant-capability__item-icon svg\s*\{([^}]*)\}/.exec(APP_CSS);
+  assert.ok(iconRule, "找不到菜单图标规则");
+  const w = /width:\s*(\d+)px/.exec(iconRule[1]);
+  const h = /height:\s*(\d+)px/.exec(iconRule[1]);
+  assert.ok(w && h && w[1] === h[1], `图标应为正方形：${iconRule[1].trim()}`);
+  assert.ok(Number(w[1]) <= 18, `单行菜单里 ${w[1]}px 的图标会把行高顶起来`);
 });
 
 test("selected model label is dynamic and not overwritten by i18n", () => {
