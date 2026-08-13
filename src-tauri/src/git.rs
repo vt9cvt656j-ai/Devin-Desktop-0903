@@ -933,7 +933,18 @@ pub struct ConflictFile {
 #[tauri::command(async)]
 pub fn git_conflicts(root: String) -> Result<Vec<ConflictFile>, String> {
     require_git_root(&root, false)?;
-    let out = run_git(&root, &["diff", "--name-only", "--diff-filter=U"])?;
+    // core.quotepath=false：否则中文文件名会被 git 转义成 `"\344\275\240\345\245\275.txt"`，
+    // 冲突列表里显示的就是这串八进制。git status 那边早就加了，这里漏了。
+    let out = run_git(
+        &root,
+        &[
+            "-c",
+            "core.quotepath=false",
+            "diff",
+            "--name-only",
+            "--diff-filter=U",
+        ],
+    )?;
     if !out.status.success() {
         return Ok(Vec::new());
     }
