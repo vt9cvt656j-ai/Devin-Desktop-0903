@@ -17,12 +17,25 @@ export const DialogTrigger = DialogPrimitive.Trigger;
 export const DialogPortal = DialogPrimitive.Portal;
 export const DialogClose = DialogPrimitive.Close;
 
+/*
+ * z-index 用本应用的模态层（100000），不是 Tailwind 默认的 z-50。
+ *
+ * 这个组件是照 shadcn 原样搬过来的，而 shadcn 的 z-50 是给一个"页面里最高只有几十层"的
+ * 站点设计的。这个 IDE 不是：`.composer`（聊天输入框那一片）就是 z-index 60，于是
+ * `/sessions` 的会话面板一打开，输入框、模型选择器、发送按钮全都压在面板上面——面板左下角
+ * 被盖住一块，看着像渲染坏了。app.css 里所有原生浮层（.ctp-overlay / .about-dialog-overlay /
+ * .remote-dialog-overlay …）用的都是 100000，这里跟上，整套 shadcn 对话框（会话选择器、
+ * 记忆中心、组件画廊）一次性对齐。
+ *
+ * 遮罩和内容同一层：Radix 把它们渲染成同一个 portal 里的兄弟节点，内容在后面，同 z-index
+ * 时自然压在遮罩之上——原来 z-50 时也是这么工作的。
+ */
 export function DialogOverlay({ className, ...props }) {
   return (
     <DialogPrimitive.Overlay
       data-slot="dialog-overlay"
       className={cn(
-        "fixed inset-0 z-50 bg-black/50",
+        "fixed inset-0 z-[100000] bg-black/50",
         "data-[state=open]:animate-in data-[state=closed]:animate-out",
         "data-[state=closed]:fade-out-0 data-[state=open]:fade-in-0",
         className,
@@ -39,7 +52,7 @@ export function DialogContent({ className, children, showCloseButton = true, ...
       <DialogPrimitive.Content
         data-slot="dialog-content"
         className={cn(
-          "fixed left-1/2 top-1/2 z-50 grid w-full max-w-[calc(100%-2rem)] -translate-x-1/2 -translate-y-1/2 gap-4 rounded-xl border border-border bg-popover p-6 text-popover-foreground shadow-lg sm:max-w-lg",
+          "fixed left-1/2 top-1/2 z-[100000] grid w-full max-w-[calc(100%-2rem)] -translate-x-1/2 -translate-y-1/2 gap-4 rounded-xl border border-border bg-popover p-6 text-popover-foreground shadow-lg sm:max-w-lg",
           "data-[state=open]:animate-in data-[state=closed]:animate-out",
           "data-[state=closed]:fade-out-0 data-[state=open]:fade-in-0",
           "data-[state=closed]:zoom-out-95 data-[state=open]:zoom-in-95",
