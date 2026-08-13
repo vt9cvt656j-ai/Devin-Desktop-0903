@@ -6661,7 +6661,11 @@ test("active Skills survive L0 prompt stripping and are inherited by child work"
   assert.match(messages[0].content, /Strict review/);
   assert.equal(messages[1].content, "review this");
   assert.ok(!messages.some((message) => message.content.includes("private bundled prompt")));
-  assert.match(SRC, /run\?\.skillsBlock \?\? _activeSkillsBlock\(\)/);
+  // 注入的是"目录 + 已启用全文"这个组合块。光有已启用那半，模型永远不知道还有别的技能
+  // 存在——那正是"装了技能却没用上"的成因。
+  assert.match(SRC, /run\?\.skillsBlock \?\? _skillsSystemBlock\(\)/);
+  assert.match(SRC, /const skillsBlock = _agentLightTurn \? "" : _skillsSystemBlock\(\)/);
+  assert.match(SRC, /function _skillsSystemBlock\(\) \{\s*return _skillCatalogBlock\(\) \+ _activeSkillsBlock\(\);/);
   assert.match(SRC, /skillsBlock: run\.skillsBlock/);
   assert.doesNotMatch(SRC, /_l0MessagesWithSkills\(messages, skillsBlock \|\|/);
 
@@ -6674,7 +6678,10 @@ test("active Skills survive L0 prompt stripping and are inherited by child work"
     ],
   })();
   assert.ok(bounded.length < 10_200, `skill block exceeded budget: ${bounded.length}`);
-  assert.match(bounded, /总预算/);
+  // 被截断时要告诉模型剩下的怎么拿。以前只说一句"已截断"，模型除了将就没有别的路；
+  // 现在有 read_skill 了，指一下比省这十几个字重要。
+  assert.match(bounded, /预算/);
+  assert.match(bounded, /read_skill/, "截断了就要指出完整内容怎么取");
 });
 
 test("dynamic time and bulky file context stay out of the cached system prefix", () => {

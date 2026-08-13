@@ -23879,7 +23879,7 @@ async function sendPrompt(text, attachments = [], readyConfig = null) {
   if (!_agentLightTurn) _scheduleWorkspaceAgentWarmup(_curRoot);
   // Append the model-family style corrective (GPT → strong anti-verbosity; weaker
   // models → terse). Static per model, so the prompt prefix still caches.
-  const skillsBlock = _agentLightTurn ? "" : _activeSkillsBlock();
+  const skillsBlock = _agentLightTurn ? "" : _skillsSystemBlock();
   const adaptiveBlock = _adaptivePromptBlock();
   const _adaptiveMemory = _adaptiveMemoryBlock(text);
   const languageBlock = _languagePreferenceBlock();
@@ -26618,8 +26618,75 @@ let _fileSkills = [];
 let _fileSkillsCacheKey = "";
 let _fileSkillsLoadedAt = 0;
 function _saveActiveSkills() { try { localStorage.setItem(_ACTIVE_SKILLS_KEY, JSON.stringify([..._activeSkillIds])); } catch {} }
-function _isSkillActive(id) { return !!id && _activeSkillIds.has(id); }
-function _toggleSkillActive(id) { if (!id) return; if (_activeSkillIds.has(id)) _activeSkillIds.delete(id); else _activeSkillIds.add(id); _saveActiveSkills(); _updateSkillBadge(); }
+/// 传技能对象或裸 id 都行——目录块拿到的是对象，面板拿到的有时是 id。
+function _isSkillActive(skill) {
+  const id = typeof skill === "string" ? skill : skill?.id;
+  return !!id && _activeSkillIds.has(id);
+}
+function _toggleSkillActive(skill) {
+  const id = typeof skill === "string" ? skill : skill?.id;
+  if (!id) return;
+  if (_activeSkillIds.has(id)) _activeSkillIds.delete(id); else _activeSkillIds.add(id);
+  _saveActiveSkills();
+  _updateSkillBadge();
+}
+/// 所有已发现技能的 name + description，始终在上下文里。
+///
+/// **这是"技能真正能用"缺的那一半。** 在此之前，技能只有"用户手动打开开关"这一条路进上下文，
+/// 模型从头到尾不知道有哪些技能存在——于是一个装了 11 个技能的人，问一句"帮我设计这个页面"，
+/// 模型照样自己瞎写，因为它不知道 ui-ux-pro-max 就在那儿。
+///
+/// Anthropic 的 Agent Skills 是渐进式披露：name + description 常驻（很便宜），模型据此判断
+/// 该用哪个，再去读那一个的完整正文。实测这台机器上 11 个技能的目录一共 3108 字符 ≈ 970
+/// token；而全部正文加起来 105k 字符 ≈ 33k token——差 34 倍，这就是为什么目录常驻、正文按需。
+///
+/// 正文由 `read_skill` 工具按需取（见 _buildAgentToolSchemas）。
+function _skillCatalogBlock() {
+  try {
+    const byId = new Map();
+    for (const skill of [..._loadSkillsLocal(), ..._fileSkills]) {
+      if (skill && skill.id && String(skill.prompt || "").trim()) byId.set(skill.id, skill);
+    }
+    const all = [...byId.values()];
+    if (!all.length) return "";
+    const MAX = 6_000;          // ~1900 token；比"把正文塞进去"便宜一个数量级
+    const PER_DESC = 400;       // 单条 description 的上限：有人写了 914 字符的
+    let out = "\n\n# 可用技能（用户装好的专项能力清单）\n"
+      + "需要哪个就用 `read_skill` 读它的完整内容再照做；不相关的不要读。标着「已启用」的"
+      + "已经在下面给出全文，不用再读。\n";
+    let listed = 0;
+    for (const s of all) {
+      const desc = String(s.desc || "").replace(/\s+/g, " ").trim().slice(0, PER_DESC);
+      const line = `- ${s.name}${_isSkillActive(s) ? "（已启用）" : ""}：${desc || "（没写说明）"}\n`;
+      if (out.length + line.length > MAX) {
+        out += `（另有 ${all.length - listed} 个技能未列出：清单已达上限）\n`;
+        break;
+      }
+      out += line;
+      listed++;
+    }
+    return out;
+  } catch { return ""; }
+}
+
+/// 进系统提示词的技能内容：目录（全部）＋ 已启用技能的全文。
+/// 按名字找技能。模型是照着目录里的名字写的，但大小写、空格、连字符经常对不上
+/// （`UI/UX Pro Max` vs `ui-ux-pro-max`），归一化之后再比；还找不到就退一步做包含匹配，
+/// 但要求查询至少 3 个字符，免得一个 "a" 命中一堆。
+function _findSkillByName(catalog, want) {
+  const list = Array.isArray(catalog) ? catalog : [];
+  const norm = (v) => String(v || "").toLowerCase().replace(/[\s_/-]+/g, "");
+  const q = norm(want);
+  if (!q) return null;
+  return list.find((s) => norm(s?.name) === q)
+    || (q.length >= 3 ? list.find((s) => norm(s?.name).includes(q)) : null)
+    || null;
+}
+
+function _skillsSystemBlock() {
+  return _skillCatalogBlock() + _activeSkillsBlock();
+}
+
 // System-prompt injection for all currently-active skills ("" when none). Appended to the system
 // message so the model treats these as standing instructions for the whole conversation.
 function _activeSkillsBlock() {
@@ -26639,14 +26706,17 @@ function _activeSkillsBlock() {
       const room = maxChars - out.length;
       if (room <= 256) break;
       if (entry.length > room) {
-        out += entry.slice(0, Math.max(0, room - 80)) + "\n…（技能内容达到本轮总预算，后文已截断）\n";
+        // 截断时明确告诉模型剩下的怎么拿——read_skill 一次能取到 24k，比这里的余量多。
+        out += entry.slice(0, Math.max(0, room - 110)) + `\n…（本轮预算已满，后文未展开。需要完整内容用 read_skill 读「${s.name || "这个技能"}」。）\n`;
         included++;
         break;
       }
       out += entry;
       included++;
     }
-    if (included < active.length) out += `\n（另有 ${active.length - included} 个已启用技能因总上下文预算未注入；请关闭无关技能后重试。）\n`;
+    if (included < active.length) {
+      out += `\n（另有 ${active.length - included} 个已启用技能未展开全文；它们仍在上面的技能清单里，需要时用 read_skill 按名字读。）\n`;
+    }
     return out;
   } catch { return ""; }
 }
@@ -29585,6 +29655,9 @@ function _buildAgentToolSchemas(includeWrite, mcpTools = []) {
     { type: "function", function: { name: "worktree", description: "**best-of-N isolation**: create/list/remove git worktrees so 2-3 candidate approaches can be implemented in parallel in their own worktrees without touching the main code (undo = delete the worktree). Use it on a hard or uncertain task where you want several candidates and then the best one — the literature shows this is the single most effective way to raise correctness.", parameters: { type: "object", properties: { action: { type: "string", enum: ["add", "list", "remove"], description: "add = create a new worktree (returns its absolute path) / list = list them / remove = delete one (i.e. discard that candidate)" }, name: { type: "string", description: "For add: the candidate's name (a short slug, e.g. cand-a)" }, path: { type: "string", description: "For remove: the absolute path of the worktree to delete" } }, required: ["action"] } } },
     { type: "function", function: { name: "recall_conversation", description: "Retrieve **the original text of earlier conversation that was compacted away in this session** (archived memory). When the context summary mentions an early decision, requirement or error without the detail, use this to find the actual words by keyword rather than guessing from the summary.", parameters: { type: "object", properties: { query: { type: "string", description: "Search keywords (a filename, a fragment of the original requirement, an error keyword)" }, max_results: { type: "integer", description: "Maximum entries to return, default 6" } }, required: ["query"] } } },
     { type: "function", function: { name: "remember", description: "Write one piece of knowledge worth **remembering across sessions** into the memory knowledge graph (auto-tagged, auto-linked to older notes, recalled by task relevance, and auto-pruned — record freely, the graph filters for you). **Pick one of two scopes:** (1) **project** (default) = relevant only to the current project (stack / architecture decisions / directory and naming conventions / build, test and run commands / traps hit in this project plus root cause and fix); (2) **global** = **user-level knowledge that spans every project** (who the user is, preferences and taste, rules they repeat, general ways of working, lessons that carry across projects) — global memories are **loaded automatically for every project, every time**. **Make it a habit: every time you learn a reusable, valuable insight — especially a \"root cause + fix\" after hitting a trap, an explicit user preference, or an approach that keeps working — record one.** Write each as an atomic fact (one concept, short, self-contained); do not record one-off details.", parameters: { type: "object", properties: { content: { type: "string", description: "The one atomic piece of knowledge to remember (one concept, short, self-contained)" }, scope: { type: "string", enum: ["project", "global"], description: "project = current project only (default); global = user-level knowledge across all projects (preferences/identity/general lessons)" } }, required: ["content"] } } },
+    // 渐进式披露的另一半：技能目录常驻上下文（_skillCatalogBlock），正文靠这个按需取。
+    // 全部正文一起塞是 33k token，目录只要 970——差 34 倍，所以正文必须按需。
+    { type: "function", function: { name: "read_skill", description: "Read the FULL text of one skill from the user's installed skill library. The system prompt lists every available skill as `name: description`; when one of them matches the task at hand, call this to get its complete instructions and then follow them. Read-only, needs no authorization. Read only the skill you actually need — reading irrelevant ones wastes the context window. If a skill is already marked 已启用 its full text is already in the system prompt; do not re-read it.", parameters: { type: "object", properties: { name: { type: "string", description: "The skill's name, exactly as listed in the available-skills catalogue" } }, required: ["name"] } } },
     { type: "function", function: { name: "get_diagnostics", description: "Read the editor/LSP live diagnostics for a file (errors and warnings), returning file:line:column, source/code, nearby code, likely cause and direction of the fix. It is a read-only evidence tool, not a command, and needs no extra authorization this round. When the user asks \"which files have bugs / why is this erroring / how do I fix this error\", reach for it first to read the errors that already exist; after changing code, use it as a quick self-check. Omit path to get diagnostics for every open file.", parameters: { type: "object", properties: { path: { type: "string", description: "Optional; the file path to check. Omit to check every open file" } } } } },
     { type: "function", function: { name: "read_logs", description: "Read the tail of the latest terminal output or of a log file. Use it to look straight at the cause when a backend/API/build fails; it is a read-only evidence tool, starts no new command, and needs no extra authorization this round. When the error output names an npm debug log or a .log/.out/.err path, pass that as path; with no path it aggregates the recent task terminals and the workspace's usual logs. 【vs alternatives】For the live state of a long-running task terminal use read_terminal; for live editor/LSP diagnostics use get_diagnostics.", parameters: { type: "object", properties: { path: { type: "string", description: "Optional; the log file whose tail to read" }, paths: { type: "array", description: "Optional; several log file paths", items: { type: "string" } }, name: { type: "string", description: "Optional; the task name given to run_in_terminal" }, lines: { type: "integer", description: "How many trailing lines to read, default 200" }, include_terminal: { type: "boolean", description: "Whether to include task terminal output as well, default true" } } } } },
     { type: "function", function: { name: "git_status", description: "Show the git repository status: current branch, and the staged / unstaged / untracked file lists. Use it to learn which files were touched, or before committing. 【vs alternatives】For the actual line-by-line difference use git_diff; for commit history use git_log.", parameters: { type: "object", properties: {} } } },
@@ -30057,6 +30130,7 @@ const _TOOL_ALIASES = {
   awaitsubagent: "await_subagent", wait_subagent: "await_subagent", waitsubagent: "await_subagent",
   runworker: "run_worker",
   updateplan: "update_plan", plan: "update_plan", todo: "update_plan", todowrite: "update_plan", todo_write: "update_plan", set_plan: "update_plan", write_todos: "update_plan",
+  readskill: "read_skill", skill: "read_skill", load_skill: "read_skill", use_skill: "read_skill", get_skill: "read_skill", open_skill: "read_skill",
   getdiagnostics: "get_diagnostics", diagnostics: "get_diagnostics", diag: "get_diagnostics", lint: "get_diagnostics", check_errors: "get_diagnostics", get_errors: "get_diagnostics", problems: "get_diagnostics",
   generateimage: "generate_image", genimage: "generate_image", gen_image: "generate_image", image_gen: "generate_image", create_image: "generate_image", make_image: "generate_image", draw_image: "generate_image", text_to_image: "generate_image",
   designboard: "design_board", design_grid: "design_board", show_designs: "design_board", show_design_board: "design_board", design_variants: "design_board", image_grid: "design_board",
@@ -30844,6 +30918,7 @@ function _mapToolCall(name, args, mcpToolMap = _mcpToolMap) {
     case "worktree": return { type: "worktree", action: String(args.action || "list"), name: String(args.name || ""), path: String(args.path || args.dest || "") };
     case "remember": return { type: "memory", path: (args.scope === "global" ? "全局记忆" : "项目记忆"), content: args.content || "", scope: args.scope === "global" ? "global" : "project" };
     case "recall_conversation": return { type: "recall", query: args.query || args.q || args.keyword || "", limit: Number.isFinite(+args.max_results) ? Math.max(1, Math.min(20, +args.max_results)) : 6 };
+    case "read_skill": return { type: "skill", name: String(args.name || args.skill || args.id || "") };
     case "get_diagnostics": return { type: "diag", path: args.path || "" };
     case "delete_path": { const _p = String(args.path || "").trim(); if (!_p) return { type: "delete", _error: "path 不能为空" }; return { type: "delete", path: _p }; }
     case "move_path": { const _f = String(args.from || "").trim(); const _t = String(args.to || "").trim(); if (!_f) return { type: "move", _error: "from 不能为空" }; if (!_t) return { type: "move", _error: "to 不能为空" }; return { type: "move", path: _f, to: _t }; }
@@ -36965,7 +37040,7 @@ function _tauriSearchInvokeArgs(call) {
 // db queries and terminal reads — so a turn that batches many such calls finishes in
 // one round-trip. Every workspace-writing tool, including asset generation, stays
 // strictly sequential even when two calls happen to name different destinations.
-const _READ_ONLY_TYPES = new Set(["read", "list", "search", "find", "web", "websearch", "lsp", "screenshot", "diag", "think", "recall", "termread", "termlist", "logs", "search_tools", "current_time", "localdiscovery", "liveenvironment", "github_repo", "gitlab_repo", "gitee_repo", "codeberg_repo"]);
+const _READ_ONLY_TYPES = new Set(["read", "list", "search", "find", "web", "websearch", "lsp", "screenshot", "diag", "think", "recall", "termread", "termlist", "logs", "search_tools", "skill", "current_time", "localdiscovery", "liveenvironment", "github_repo", "gitlab_repo", "gitee_repo", "codeberg_repo"]);
 const _MUTATING_FILE_TOOL_TYPES = fileEditTypes();
 function _isMergedToolItem(item) {
   return item?.merged != null;
@@ -38969,7 +39044,7 @@ async function _runSubAgent({ config, description, prompt, root, container, run,
     : `\n\n# 你的可改范围(scope)\n你**只能修改**下面这些路径内的文件（相对工作区根），其余文件只读：\n${scopeRel.map((s) => "- " + s).join("\n")}`;
   const sysPrompt = (write
     ? _WORKER_SYSTEM + _scopeGuidance
-    : _SUBAGENT_SYSTEM) + _agentRoleBlock(role) + (run?.skillsBlock ?? _activeSkillsBlock());
+    : _SUBAGENT_SYSTEM) + _agentRoleBlock(role) + (run?.skillsBlock ?? _skillsSystemBlock());
   // Retrieval is ranked by the CHILD'S OWN TASK, not an empty string. The empty query
   // silently disabled three paths at once: _buildRepoMap degraded to pure symbol-count
   // ranking (biggest files, almost never the worker's scope), _buildRetrievedCodeContext
@@ -39057,7 +39132,7 @@ async function _runSubAgent({ config, description, prompt, root, container, run,
   // P1.4(#51): 纳入 git 只读四件套（blame/log 是"查代码历史/为什么这样写"的核心证据工具）。
   // git 工具全部映射为单一 type "git"（op 区分读写），type 级门禁分不出 git_commit/git_push，
   // 所以 _READ_TYPES 放行 "git" 的同时必须用 _GIT_READ_OPS 做 op 级二次把关。
-  const _READ_TOOLS = ["read_file", "list_dir", "search", "find_files", "semantic_search", "find_symbol", "lsp_symbols", "lsp_definition", "lsp_references", "get_diagnostics", "read_logs", "knowledge_search", "web_fetch", "web_search", "screenshot", "git_status", "git_diff", "git_log", "git_blame"];
+  const _READ_TOOLS = ["read_file", "list_dir", "search", "find_files", "semantic_search", "find_symbol", "lsp_symbols", "lsp_definition", "lsp_references", "get_diagnostics", "read_logs", "knowledge_search", "read_skill", "web_fetch", "web_search", "screenshot", "git_status", "git_diff", "git_log", "git_blame"];
   const _READ_TYPES = ["read", "list", "search", "find", "semsearch", "findsymbol", "lsp", "diag", "knowledge", "web", "websearch", "screenshot", "liveenvironment", "git"];
   const _GIT_READ_OPS = ["status", "diff", "log", "blame"];
   // P0.2: 只读 subagent 额外授予 run_cmd 权限，但仅限纯探索类命令（ls/cat/grep 等）
@@ -45075,7 +45150,7 @@ function _createToolStep(call) {
   const step = document.createElement("div");
   step.className = `agent-tool-step agent-tool-step--${call.type}${_isKSearch ? " agent-tool-step--ksearch" : ""}${call.type === "current_time" ? " agent-tool-step--current_time" : ""}${call.type === "game_scaffold" ? " agent-tool-step--game_scaffold" : ""}${call.type === "generate_3d" || call.type === "generate_sound" || call.type === "generate_music" || call.type === "generate_voice" || call.type === "auto_rig" || call.type === "generate_motion" || call.type === "generate_texture" || call.type === "search_game_assets" || call.type === "download_asset" ? " agent-tool-step--game_asset" : ""}`;
 
-  const _nonClickable = call.type === "cmd" || call.type === "search" || call.type === "find" || call.type === "web" || call.type === "websearch" || call.type === "localdiscovery" || call.type === "liveenvironment" || call.type === "readscreen" || call.type === "uiclick" || call.type === "search_tools" || call.type === "unknown" || call.type === "vizcompare" || call.type === "memory" || call.type === "recall" || call.type === "think" || call.type === "delete" || call.type === "move" || call.type === "diag" || call.type === "git" || call.type === "gh" || call.type === "findsymbol" || call.type === "semsearch" || call.type === "knowledge" || call.type === "lsp" || call.type === "mkdir" || call.type === "copy" || call.type === "termtask" || call.type === "termread" || call.type === "termlist" || call.type === "termstop" || call.type === "http" || call.type === "download" || call.type === "genimage" || call.type === "mcp" || call.type === "demostart" || call.type === "demostop" || call.type === "screenshot" || call.type === "browser" || call.type === "db" || call.type === "qr" || call.type === "remote" || call.type === "system" || call.type === "automation" || call.type === "askuser" || call.type === "current_time" || _isAwaitSub || call.type === "game_scaffold" || call.type === "generate_3d" || call.type === "generate_sound" || call.type === "generate_music" || call.type === "generate_voice" || call.type === "auto_rig" || call.type === "generate_motion" || call.type === "generate_texture" || call.type === "search_game_assets" || call.type === "download_asset" || _isKSearch;
+  const _nonClickable = call.type === "cmd" || call.type === "search" || call.type === "find" || call.type === "web" || call.type === "websearch" || call.type === "localdiscovery" || call.type === "liveenvironment" || call.type === "readscreen" || call.type === "uiclick" || call.type === "search_tools" || call.type === "skill" || call.type === "unknown" || call.type === "vizcompare" || call.type === "memory" || call.type === "recall" || call.type === "think" || call.type === "delete" || call.type === "move" || call.type === "diag" || call.type === "git" || call.type === "gh" || call.type === "findsymbol" || call.type === "semsearch" || call.type === "knowledge" || call.type === "lsp" || call.type === "mkdir" || call.type === "copy" || call.type === "termtask" || call.type === "termread" || call.type === "termlist" || call.type === "termstop" || call.type === "http" || call.type === "download" || call.type === "genimage" || call.type === "mcp" || call.type === "demostart" || call.type === "demostop" || call.type === "screenshot" || call.type === "browser" || call.type === "db" || call.type === "qr" || call.type === "remote" || call.type === "system" || call.type === "automation" || call.type === "askuser" || call.type === "current_time" || _isAwaitSub || call.type === "game_scaffold" || call.type === "generate_3d" || call.type === "generate_sound" || call.type === "generate_music" || call.type === "generate_voice" || call.type === "auto_rig" || call.type === "generate_motion" || call.type === "generate_texture" || call.type === "search_game_assets" || call.type === "download_asset" || _isKSearch;
   let pathHtml = _nonClickable
     ? `<span class="atc-path atc-path--text">${_escHtml(pathDisplay)}</span>`
     : `<span class="atc-path atc-path--clickable" data-filepath="${_escAttr(pathDisplay)}">${dirPath ? '<span class="atc-dir">' + _escHtml(dirPath) + '/</span>' : ''}<span class="atc-file">${_escHtml(fileName)}</span></span>`;
@@ -47738,6 +47813,28 @@ async function _executeToolStepInner(step, call, root, run) {
         res.className = "atc-result atc-result--err"; res.textContent = "下载失败";
         return { type: "download_asset", path: "", content: `[失败] download_asset: ${String(e?.message || e).slice(0, 300)}` };
       }
+
+    } else if (call.type === "skill") {
+      // 按名字取技能全文。目录在系统提示词里（_skillCatalogBlock），这里是"再读一层"。
+      const want = String(call.name || "").trim();
+      const catalog = [..._loadSkillsLocal(), ..._fileSkills].filter((s) => s && String(s.prompt || "").trim());
+      const hit = _findSkillByName(catalog, want);
+      if (!hit) {
+        res.className = "atc-result atc-result--err"; res.textContent = "没有这个技能";
+        const names = catalog.map((s) => s.name).slice(0, 40).join("、");
+        return { type: "skill", path: want, ok: false, failure: { attempted: true, code: "skill_not_found" },
+          content: `[失败] 没有名为「${want}」的技能。${names ? `现有技能：${names}。请用清单里的准确名字。` : "当前没有安装任何技能。"}` };
+      }
+      // 正文按上限截断而不是拒绝：一个 44k 字符的技能，读到前 24k 也远比读不到有用。
+      const MAX = 24_000;
+      const body = String(hit.prompt).trim();
+      const text = body.length > MAX
+        ? body.slice(0, MAX) + `\n\n…（技能正文共 ${body.length} 字符，此处截断。完整文件：${hit.sourcePath || "本地技能"}，需要后半部分可用 read_file 读它。）`
+        : body;
+      res.className = "atc-result atc-result--ok"; res.textContent = hit.name;
+      if (typeof vp !== "undefined" && vp) vp.innerHTML = `<pre>${_escHtml(text.slice(0, 2000))}</pre>`;
+      return { type: "skill", path: hit.sourcePath || hit.name, ok: true,
+        content: `技能「${hit.name}」的完整内容如下，按它执行：\n\n${text}` };
 
     } else if (call.type === "think") {
       // The "think" tool: a no-op reasoning scratchpad. The thought lives in the
