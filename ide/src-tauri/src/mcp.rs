@@ -1062,6 +1062,23 @@ fn user_config_path() -> Result<std::path::PathBuf, String> {
 
 /// 从一份配置文本里摘出服务表。兼容 `mcpServers`（Claude Code / Cursor / 本 IDE）
 /// 和 `servers`（VS Code）两种键名。
+/// 摘出 `disabled` 数组（只保留非空字符串）。不存在或写错类型都回空数组。
+fn disabled_subtree(text: &str) -> Value {
+    let Ok(parsed) = serde_json::from_str::<Value>(text) else {
+        return json!([]);
+    };
+    match parsed.get("disabled").and_then(Value::as_array) {
+        Some(items) => Value::Array(
+            items
+                .iter()
+                .filter(|item| item.as_str().is_some_and(|value| !value.trim().is_empty()))
+                .cloned()
+                .collect(),
+        ),
+        None => json!([]),
+    }
+}
+
 fn servers_subtree(text: &str) -> Value {
     let Ok(parsed) = serde_json::from_str::<Value>(text) else {
         return json!({});
@@ -1092,6 +1109,9 @@ pub struct McpUserConfig {
     /// 面板不该替用户去动。
     writable: bool,
     servers: Value,
+    /// 用户在本 IDE 里停用的服务名。只有自己那份配置有这个字段——从 Cursor / Claude Code
+    /// 读来的服务住在它们的文件里，想少加载一个不该去改人家的配置，所以停用记在自己这儿。
+    disabled: Value,
 }
 
 /// 用户级 MCP 配置：本 IDE 的 `~/.michael-ide/mcp.json`，加上 Claude Code / Cursor 的
@@ -1101,12 +1121,18 @@ pub struct McpUserConfig {
 pub fn mcp_user_configs() -> Result<Vec<McpUserConfig>, String> {
     let home = home_dir()?;
     let own = user_config_path()?;
+    let own_text = read_capped(&own);
     let mut out = vec![McpUserConfig {
         path: own.to_string_lossy().into_owned(),
         writable: true,
-        servers: read_capped(&own)
-            .map(|text| servers_subtree(&text))
+        servers: own_text
+            .as_deref()
+            .map(servers_subtree)
             .unwrap_or_else(|| json!({})),
+        disabled: own_text
+            .as_deref()
+            .map(disabled_subtree)
+            .unwrap_or_else(|| json!([])),
     }];
     for relative in [".claude.json", ".cursor/mcp.json", ".codex/mcp.json"] {
         let path = home.join(relative);
@@ -1119,6 +1145,7 @@ pub fn mcp_user_configs() -> Result<Vec<McpUserConfig>, String> {
                 path: path.to_string_lossy().into_owned(),
                 writable: false,
                 servers,
+                disabled: json!([]),   // 别人的文件里没有这个概念
             });
         }
     }

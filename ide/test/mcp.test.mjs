@@ -79,10 +79,12 @@ function makeDoc({ files = {}, userConfigs = [] } = {}) {
     },
   };
   const _readUserScopeMcpConfigs = load("_readUserScopeMcpConfigs", { inTauri: true, backend });
+  const _disabledMcpServers = load("_disabledMcpServers", { _readUserScopeMcpConfigs });
   return load("_readWorkspaceMcpDocument", {
     backend,
     _workspaceAncestorRoots,
     _readUserScopeMcpConfigs,
+    _disabledMcpServers,
   });
 }
 
@@ -473,4 +475,114 @@ test("MCP 资源的读取不依赖工作区根目录——没打开文件夹时�
   assert.match(block, /if \(!_agentLightTurn && _mcpRefs\.length && inTauri\)/);
   assert.doesNotMatch(block, /_contextRoot/, "MCP 资源不属于任何工作区，不能被 _contextRoot 挡住");
   assert.match(block, /catch[\s\S]{0,120}读取失败/, "读失败要在上下文里留一行，不能静默吞掉");
+});
+
+// ── 「删除」在别人的配置上也要真的有用：停用清单 ────────────────────────────
+//
+// 用户报的是「mcp 这里内容没法真正删除」。查下来那个垃圾桶按钮对**不属于本 IDE 的**服务
+// （从 Cursor / Claude Code 读来的、仓库自带的）是 disabled 的——点下去毫无反应，只有悬停
+// 才看得到一句说明。等于一个坏掉的按钮。
+//
+// 但那些服务住在**别人的**配置文件里，Day One 只读不写：总不能因为用户想在这儿少加载一个
+// 服务，就跑去改 Cursor 的配置。所以「删除」的正确语义是**停用**——记进自己的
+// ~/.michael-ide/mcp.json 的 `disabled: []`，可恢复，一个字节都不碰对方的文件。
+
+const CURSOR_SVC = { path: CURSOR_FILE, writable: false, servers: { "Michael-Cursor": { command: "node" } } };
+
+test("停用之后那个服务不再进合并结果——也就不会连、不会出现在工具里", async () => {
+  const read = makeDoc({
+    userConfigs: [
+      { path: USER_FILE, writable: true, servers: {}, disabled: ["Michael-Cursor"] },
+      CURSOR_SVC,
+    ],
+  });
+  const doc = await read("/work/a");
+  assert.deepEqual(Object.keys(JSON.parse(doc.text).mcpServers), []);
+  assert.ok(doc.disabled.has("michael-cursor"), "停用清单要跟着返回，面板才能给出恢复入口");
+  assert.equal(doc.disabled.get("michael-cursor"), "Michael-Cursor",
+    "显示要保留用户写的大小写——面板上显示成 michael-cursor 会像是另一个服务");
+});
+
+test("没停用时照常在——别把功能反过来了", async () => {
+  const read = makeDoc({
+    userConfigs: [{ path: USER_FILE, writable: true, servers: {}, disabled: [] }, CURSOR_SVC],
+  });
+  assert.deepEqual(Object.keys(JSON.parse((await read("/work/a")).text).mcpServers), ["Michael-Cursor"]);
+});
+
+test("服务名大小写不一致也认得出来", async () => {
+  const read = makeDoc({
+    userConfigs: [
+      { path: USER_FILE, writable: true, servers: {}, disabled: ["  MICHAEL-cursor  "] },
+      CURSOR_SVC,
+    ],
+  });
+  assert.deepEqual(Object.keys(JSON.parse((await read("/work/a")).text).mcpServers), []);
+});
+
+test("仓库自带的服务同样可以停用（它也不是本 IDE 的文件）", async () => {
+  const read = makeDoc({
+    files: { "/work/a/.mcp.json": JSON.stringify({ mcpServers: { fromRepo: { command: "x" } } }) },
+    userConfigs: [{ path: USER_FILE, writable: true, servers: {}, disabled: ["fromRepo"] }],
+  });
+  assert.deepEqual(Object.keys(JSON.parse((await read("/work/a")).text).mcpServers), []);
+});
+
+test("只认自己那份配置里的 disabled——别的客户端的文件里没这个概念", async () => {
+  const read = makeDoc({
+    userConfigs: [
+      { path: USER_FILE, writable: true, servers: { mine: { command: "x" } }, disabled: [] },
+      // 假装 Cursor 的文件里也有个 disabled，不该被采纳
+      { path: CURSOR_FILE, writable: false, servers: {}, disabled: ["mine"] },
+    ],
+  });
+  assert.deepEqual(Object.keys(JSON.parse((await read("/work/a")).text).mcpServers), ["mine"]);
+});
+
+test("停用写回自己的全局配置，绝不碰别人的文件", async () => {
+  const saved = [];
+  const backend = {
+    invoke: async (cmd, args) => {
+      if (cmd === "mcp_user_configs") {
+        return [{ path: USER_FILE, writable: true, servers: { keepMe: { command: "x" } }, disabled: ["old"] },
+                { path: CURSOR_FILE, writable: false, servers: { "Michael-Cursor": { command: "node" } } }];
+      }
+      if (cmd === "mcp_save_user_config") { saved.push(JSON.parse(args.text)); return USER_FILE; }
+      throw new Error("unexpected " + cmd);
+    },
+  };
+  const _readUserScopeMcpConfigs = load("_readUserScopeMcpConfigs", { inTauri: true, backend });
+  const set = load("_setMcpServerDisabled", { inTauri: true, backend, _readUserScopeMcpConfigs });
+
+  await set("Michael-Cursor", true);
+  assert.deepEqual(saved.at(-1).disabled, ["old", "Michael-Cursor"]);
+  assert.deepEqual(Object.keys(saved.at(-1).mcpServers), ["keepMe"], "停用不该动到已配置的服务");
+  // 只写了自己那一份
+  assert.equal(saved.length, 1);
+
+  await set("old", false);
+  // 断言字段**不存在**，而不是 `?? []` —— 那样写的话"留了个空数组"也能蒙混过去，
+  // 等于这条断言什么都没管住（变异验证时就是它先漏掉的）。
+  assert.ok(!("disabled" in saved.at(-1)), `清空后不该留空数组字段：${JSON.stringify(saved.at(-1))}`);
+});
+
+test("重复停用同一个不会写出两条", async () => {
+  const saved = [];
+  const backend = {
+    invoke: async (cmd, args) => {
+      if (cmd === "mcp_user_configs") return [{ path: USER_FILE, writable: true, servers: {}, disabled: ["dup"] }];
+      if (cmd === "mcp_save_user_config") { saved.push(JSON.parse(args.text)); return USER_FILE; }
+      throw new Error("unexpected " + cmd);
+    },
+  };
+  const _readUserScopeMcpConfigs = load("_readUserScopeMcpConfigs", { inTauri: true, backend });
+  await load("_setMcpServerDisabled", { inTauri: true, backend, _readUserScopeMcpConfigs })("dup", true);
+  assert.deepEqual(saved.at(-1).disabled, ["dup"]);
+});
+
+test("面板要给出恢复入口，否则停用完就再也找不回来了", () => {
+  assert.match(SRC, /已停用 · 不会加载/);
+  assert.match(SRC, /_setMcpServerDisabled\(off, false\)/);
+  // 编辑仍然不给——那是别人的文件
+  assert.match(SRC, /editBtn\.disabled = true;/);
 });

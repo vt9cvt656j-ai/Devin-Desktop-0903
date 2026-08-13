@@ -25969,6 +25969,29 @@ async function _readUserScopeMcpConfigs() {
   } catch { return []; }
 }
 
+/// 被停用的服务名（大小写不敏感）。
+///
+/// 从 Cursor / Claude Code 读来的服务住在**它们的**配置文件里，本 IDE 只读不写——总不能
+/// 因为用户想在 Day One 里少加载一个服务，就跑去改 Cursor 的配置。所以停用记在自己的全局
+/// 配置里：`~/.michael-ide/mcp.json` 的 `disabled: []`。仓库自带的 .mcp.json 同理。
+///
+/// 这也是「删除」按钮之前形同虚设的原因：它对这两类服务是 disabled 的，点下去毫无反应，
+/// 只有悬停才看得到一句说明——等于一个坏掉的按钮。
+/// 返回 Map<小写名, 原样名>：匹配要不分大小写，显示要保留用户写的那个大小写。
+/// 用 Set 存小写的话，面板里那条"已停用"会显示成 michael-cursor，和他在 Cursor 里看到的
+/// Michael-Cursor 对不上，读起来像是另一个服务。
+async function _disabledMcpServers() {
+  const out = new Map();
+  for (const entry of await _readUserScopeMcpConfigs()) {
+    if (!entry?.writable) continue;   // 只认自己那份；别的客户端的文件里没有这个字段
+    for (const name of Array.isArray(entry.disabled) ? entry.disabled : []) {
+      const raw = String(name || "").trim();
+      if (raw) out.set(raw.toLowerCase(), raw);
+    }
+  }
+  return out;
+}
+
 /// 用户级配置里可写的那一份的路径（面板保存的目标）。取不到就返回空串。
 async function _userScopeMcpConfigPath() {
   for (const entry of await _readUserScopeMcpConfigs()) {
@@ -26001,7 +26024,8 @@ async function _readWorkspaceMcpDocument(root) {
       scope: entry.writable ? "user" : "interop",
     });
   }
-  if (!documents.length) return { text: "", path: "", base: "", serverBases: {}, serverSources: {}, serverScopes: {} };
+  const disabled = await _disabledMcpServers();
+  if (!documents.length) return { text: "", path: "", base: "", serverBases: {}, serverSources: {}, serverScopes: {}, disabled };
   const mergedServers = {};
   const serverBases = {};
   // 每个服务来自哪个文件。`.mcp.local.json` 是 IDE 自己的本地文件（_protectLocalMcpConfig
@@ -26020,6 +26044,7 @@ async function _readWorkspaceMcpDocument(root) {
     // Documents are visited nearest-first and local-first. Do not let a parent/shared
     // file silently replace an explicitly configured child server.
     for (const [name, config] of Object.entries(servers)) {
+      if (disabled.has(String(name).toLowerCase())) continue;   // 用户在本 IDE 里停用了它
       if (!Object.prototype.hasOwnProperty.call(mergedServers, name)) {
         mergedServers[name] = config;
         serverBases[name] = document.base;
@@ -26029,7 +26054,7 @@ async function _readWorkspaceMcpDocument(root) {
     }
   }
   if (!Object.keys(mergedServers).length && invalid.length) {
-    return { ...invalid[0], serverBases: {}, serverSources: {}, serverScopes: {} };
+    return { ...invalid[0], serverBases: {}, serverSources: {}, serverScopes: {}, disabled };
   }
   return {
     text: JSON.stringify({ mcpServers: mergedServers }),
@@ -26039,7 +26064,27 @@ async function _readWorkspaceMcpDocument(root) {
     serverBases,
     serverSources,
     serverScopes,
+    disabled,
   };
+}
+
+/// 把一个服务加进 / 移出停用清单（写自己的全局配置，绝不碰别的客户端的文件）。
+async function _setMcpServerDisabled(name, off) {
+  const value = String(name || "").trim();
+  if (!value || !inTauri) return false;
+  let cfg = { mcpServers: {} };
+  for (const entry of await _readUserScopeMcpConfigs()) {
+    if (!entry?.writable) continue;
+    const servers = entry.servers && typeof entry.servers === "object" ? entry.servers : {};
+    cfg = { mcpServers: { ...servers }, disabled: Array.isArray(entry.disabled) ? [...entry.disabled] : [] };
+    break;
+  }
+  const list = Array.isArray(cfg.disabled) ? cfg.disabled : [];
+  const kept = list.filter((item) => String(item || "").trim().toLowerCase() !== value.toLowerCase());
+  cfg.disabled = off ? [...kept, value] : kept;
+  if (!cfg.disabled.length) delete cfg.disabled;
+  await backend.invoke("mcp_save_user_config", { text: JSON.stringify(cfg, null, 2) });
+  return true;
 }
 
 /// 这个服务是不是**仓库自带**的（而不是用户自己配的——项目本地 / 全局 / 别的客户端）。
@@ -27359,10 +27404,25 @@ async function openMcpPanel(opts = null) {
       if (failure) row.querySelector(".mcp-row__tag").title = failure;
       const editBtn = row.querySelector("._edit"); const delBtn = row.querySelector("._del");
       if (!editable) {
-        const why = scope === "repo"
+        // 编辑仍然不给：那是别人的文件，改它是越界。
+        editBtn.disabled = true;
+        editBtn.title = scope === "repo"
           ? "这个服务来自仓库里的配置文件，请直接编辑该文件"
-          : `这个服务来自 ${_appOfSource(source) || "其他客户端"} 的配置，请在那边管理`;
-        for (const b of [editBtn, delBtn]) { b.disabled = true; b.title = why; }
+          : `这个服务来自 ${_appOfSource(source) || "其他客户端"} 的配置，请在那边编辑`;
+        // 但**停用要给**。以前这个按钮也是 disabled，点下去毫无反应，只有悬停才看得到一句
+        // 说明——用户看到的就是"删不掉"。想在本 IDE 里少加载一个服务是完全合理的诉求，
+        // 不该逼人跑去改 Cursor 的配置。所以这里改成"停用"：记进自己的全局配置，可恢复，
+        // 一个字节都不碰对方的文件。
+        delBtn.title = `在 Day One 里停用（不会改动 ${_appOfSource(source) || "原始"} 配置，可恢复）`;
+        delBtn.addEventListener("click", async () => {
+          try {
+            await _setMcpServerDisabled(name, true);
+            await backend.invoke("mcp_disconnect", { name }).catch(() => {});
+            _forgetMcpServer(root, name);
+            _mcpLoaded = false; await _ensureMcpTools(root); renderList();
+            showToast(`已在 Day One 里停用「${name}」（原配置未改动）`);
+          } catch (e) { showToast("停用失败：" + String(e?.message || e).slice(0, 120)); }
+        });
       } else {
         editBtn.addEventListener("click", () => { editing = { name, command: s.command || "", args: s.args || [], env: s.env || {}, cwd: s.cwd || "", meta: s.__michael || null, scope, _orig: name, _origScope: scope }; renderForm(); });
         delBtn.addEventListener("click", async () => {
@@ -27397,6 +27457,21 @@ async function openMcpPanel(opts = null) {
       row.querySelector("._add").addEventListener("click", () => { editing = { name: p.name, command: p.command, args: p.args || [], env: p.env || {}, cwd: p.cwd || "", meta: _mcpInstallMetaFromPreset(p), scope: "user", _orig: "", _origScope: "" }; renderForm(); });
       list.appendChild(row);
     });
+    // 被停用的单独列一段。不列出来就没有回头路——停用完就再也找不到它了。
+    for (const off of [...(doc.disabled?.values?.() || [])].sort()) {
+      const row = document.createElement("div"); row.className = "mcp-row mcp-row--avail";
+      row.innerHTML = `<div class="mcp-row__main"><div class="mcp-row__name"></div><div class="mcp-row__cmd">已停用 · 不会加载，也不会出现在智能体的工具里</div></div>` +
+        `<button class="ctp-btn ctp-btn--sm _restore" type="button">恢复</button>`;
+      row.querySelector(".mcp-row__name").textContent = off;
+      row.querySelector("._restore").addEventListener("click", async () => {
+        try {
+          await _setMcpServerDisabled(off, false);
+          _mcpLoaded = false; await _ensureMcpTools(root); renderList();
+          showToast(`已恢复「${off}」`);
+        } catch (e) { showToast("恢复失败：" + String(e?.message || e).slice(0, 120)); }
+      });
+      list.appendChild(row);
+    }
     if (!list.children.length) { const e = document.createElement("div"); e.className = "ctp-empty"; e.textContent = "还没有 MCP 服务，点下面「添加服务」自定义一个。"; list.appendChild(e); }
     m.body.appendChild(list);
     const foot = document.createElement("div"); foot.className = "ctp-foot ctp-foot--between";
@@ -52870,7 +52945,7 @@ function renderMcpTool(body) {
             ${sourceUrl ? `<button type="button" class="ctp-iconbtn" data-mcpfp-repo="${_escAttr(sourceUrl)}" title="查看来源">${_dbUiIconSvg("open")}</button>` : ""}
             ${Object.prototype.hasOwnProperty.call(ownServers, name)
               ? `<button type="button" class="ctp-iconbtn ctp-iconbtn--danger" data-mcpfp-del="${_escAttr(name)}" title="删除 MCP 服务">${_ICON_TRASH}</button>`
-              : `<button type="button" class="ctp-iconbtn ctp-iconbtn--danger" disabled title="这个服务来自项目或其他客户端的配置文件，请在那边删除">${_ICON_TRASH}</button>`}
+              : `<button type="button" class="ctp-iconbtn ctp-iconbtn--danger" data-mcpfp-off="${_escAttr(name)}" title="在 Day One 里停用（来自项目或其他客户端的配置，原文件不会被改动，可恢复）">${_ICON_TRASH}</button>`}
           </div>
         </div>`;
     }).join("") + `
@@ -52975,6 +53050,21 @@ function renderMcpTool(body) {
       await _ensureMcpTools(root);
       await renderInstalled();
       renderMarket();
+      return;
+    }
+    const off = e.target.closest("[data-mcpfp-off]")?.getAttribute("data-mcpfp-off");
+    if (off) {
+      const btn = e.target.closest("button");
+      try {
+        if (btn) { btn.disabled = true; btn.classList.add("is-loading"); }
+        await _setMcpServerDisabled(off, true);
+        await backend.invoke("mcp_disconnect", { name: off }).catch(() => {});
+        _forgetMcpServer(root, off);
+        _mcpLoaded = false; _mcpConnecting = true;
+        await renderInstalled(); renderMarket();
+        _ensureMcpTools(root).then(async () => { await renderInstalled(); renderMarket(); });
+        showToast(`已在 Day One 里停用「${off}」（原配置未改动，可在 MCP 面板恢复）`);
+      } catch (err) { showToast("停用失败：" + String(err?.message || err).slice(0, 120)); }
       return;
     }
     const del = e.target.closest("[data-mcpfp-del]")?.getAttribute("data-mcpfp-del");
