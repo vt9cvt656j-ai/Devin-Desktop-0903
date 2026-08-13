@@ -1429,14 +1429,20 @@ test("#54 timeout-wrapped dev server is stripped, recognized as a service, and s
   // 裸 npm run dev（无 timeout）不走新分支，交给既有长命令门
   assert.equal(timeoutWrappedService("npm run dev"), false, "裸命令不归新分支，由既有 isLongRunning 门拦");
 
-  // ---- 无回归：裸 npm run dev 仍被既有 _srvRe 长命令门拦住 ----
-  // 直接从 source 取出真实的 _srvRe 字面量（它是 run_cmd 分支内的局部 const，无法 load）
-  const srvReM = SRC.match(/const _srvRe = (\/.*?\/i);/);
-  assert.ok(srvReM, "main.js 中应保留 _srvRe 长命令判定正则");
-  const srvRe = eval(srvReM[1]);
+  // ---- 无回归：裸 npm run dev 仍被长命令门拦住 ----
+  // 判据已从"拿词表扫整条命令"换成"看每段的段首命令"——旧写法把 cat scripts/serve.md、
+  // git log --grep=serve 这类无辜命令一并拒了，又漏掉裸 vite 这种真服务。
+  // 详细的正反用例在 test/flexibility.test.mjs；这里只钉住本条不回归。
+  const srvAt = SRC.indexOf("function _commandStartsLongRunningServer(");
+  assert.ok(srvAt > 0, "长命令判定必须仍然存在");
+  const srvDecls = SRC.indexOf("const _LONG_RUNNING_HEADS");
+  const startsServer = new Function(
+    SRC.slice(srvDecls, srvAt) + SRC.slice(srvAt, SRC.indexOf("\n}\n", srvAt) + 2)
+      + "\n;return _commandStartsLongRunningServer;",
+  )();
   const isLongRunning = (cmd) => {
     const backgrounded = /\bnohup\b/i.test(cmd) || /\s&(\s|$)/.test(cmd) || (/\bstart\b/i.test(cmd) && /\s\/b\b/i.test(cmd));
-    return !backgrounded && srvRe.test(cmd);
+    return !backgrounded && startsServer(cmd);
   };
   assert.equal(isLongRunning("npm run dev"), true, "裸 npm run dev 仍被既有长命令门拦（无回归）");
   assert.equal(isLongRunning("timeout 30 npm test"), false, "timeout 包 test 不被长命令门误拦");
