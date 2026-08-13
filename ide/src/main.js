@@ -396,6 +396,7 @@ async function tauriBackend() {
   const opener = await import("@tauri-apps/plugin-opener");
   return {
     registerWorkspaceRoot: (path) => core.invoke("register_workspace_root", { path }),
+    createProjectDir: (name) => core.invoke("create_project_dir", { name }),
     // Local-file URL for the webview (image / pdf preview) via the asset protocol.
     assetUrl: (p) => { try { return core.convertFileSrc(p); } catch { return p; } },
     readDir: async (path) => { const es = await core.invoke("read_dir", { path }); return Array.isArray(es) ? es.map((e) => (e && typeof e.path === "string" ? { ...e, path: _toPosix(e.path) } : e)) : es; },
@@ -1925,6 +1926,7 @@ function mockBackend() {
     termHistory: async () => [],
     // 浏览器预览里没有真 shell；报 posix 是因为这个兜底只在开发机上跑。
     envRefresh: async () => ({ changed: false, path: "", shell: { kind: "posix", label: "sh", program: "/bin/sh" } }),
+    createProjectDir: async (name) => `/mock/MrDayOne/${String(name || "proj")}`,
     shellPlan: async () => ({ kind: "posix", label: "sh", program: "/bin/sh", oneshot: ["-lc"], interactive: ["-l"] }),
     authLoginOrRegister: async () => ({ success: true, message: "mock login" }),
     authLogin: async (email) => ({ success: true, message: "mock login", email, user_id: "mock", is_new_user: false }),
@@ -23705,7 +23707,12 @@ async function sendPrompt(text, attachments = [], readyConfig = null) {
       if (snapshot) contextBlock += "\n" + snapshot;
       if (staleEvidence) contextBlock += staleEvidence;
     } else {
-      contextBlock += "\n(未打开工作区文件夹)";
+      // 以前这里只说"没打开文件夹"，然后 24026 的预检把整轮掐掉，回一句「请先点左侧最近项目」。
+    // 那在智能体没有开项目能力时是对的——沙箱 fail-closed，硬跑只会换来一轮全是 [BLOCKED]。
+    // 现在它有 create_project 了（位置固定在 ~/MrDayOne/<name>，名字过白名单，仍走
+    // register_workspace_root 的全部守卫），所以告诉它自己开工，而不是让它去求用户。
+    // 用户说「写个 telegram 机器人」时应该看到机器人，而不是一句"请先点这里"。
+    contextBlock += "\n(未打开工作区文件夹。要创建/修改/运行项目文件时，先调 create_project 建一个目录（给个描述性名字，如 telegram-image-bot），它会立刻成为当前工作区；别停下来问用户，也别写相对路径——那会被沙箱拒绝。收尾时把返回的完整路径告诉用户。)";
     }
   }
   if (_activeForSession && !_agentLightTurn) {
@@ -23952,7 +23959,17 @@ async function sendPrompt(text, attachments = [], readyConfig = null) {
     _turnEngineering.explicitRuntimeAction ||
     (_turnEngineering.implementation && !_turnEngineering.explicitExternalAction && !_turnEngineering.explicitReadOnly)
   );
-  if (_needsRealWorkspace) {
+
+  // 智能体现在有 create_project 了：位置固定在 ~/MrDayOne/<name>，名字过白名单，仍走
+  // register_workspace_root 的全部守卫。所以 agent 模式下**不再整轮拦掉**——上面已经在
+  // contextBlock 里告诉它自己建目录，让它去做。用户说「写个 telegram 机器人」时应该看到
+  // 机器人，而不是一句「请先点这里」。
+  //
+  // 但这道门要留着：只读模式（Explorer / Plan / Reviewer）不该建目录，而没有工作区时硬跑
+  // 只会换来一轮全是 [BLOCKED] 的失败——一句可操作的提示比那个好得多。这不是策略限制，
+  // 是 Rust 沙箱 fail-closed 的友好前置。
+  const _canSelfServeWorkspace = effectiveMode === "agent";
+  if (_needsRealWorkspace && !_canSelfServeWorkspace) {
     _setStreaming(sess, false);
     if (sess === _currentSession()) _setSendBtnStop(false);
     const blockedBody = addMessage("assistant", "⚠️ 这次要改/创建/运行项目文件，但当前没有绑定到真实工作区文件夹。我没有继续瞎写相对路径，避免文件写到错误位置或一直失败。\n\n请先点击左侧「最近项目」里的项目，或点聊天标签上的文件夹图标设置工作目录；绑定后我会按真实路径继续写文件。", sess);
@@ -29269,6 +29286,7 @@ function _buildAgentToolSchemas(includeWrite, mcpTools = []) {
         },
       },
     },
+    { type: "function", function: { name: "create_project", description: "**Create a new project folder and start working in it.** Use this the moment the user asks you to build something (a bot, a script, a service, a site) and no workspace folder is open — do not ask them to open one first, and do not stop to ask where it should go. The folder is always created under the user\u0027s home in MrDayOne/<name>, becomes the active workspace immediately, and every file tool works inside it right after. Reusing an existing name is safe: it binds to that folder instead of overwriting it. Say the full path in your summary so the user knows where their project lives.", parameters: { type: "object", properties: { name: { type: "string", description: "Folder name: letters, digits, \u0027.\u0027, \u0027_\u0027, \u0027-\u0027 only, not starting with a dot. Pick something descriptive, e.g. telegram-image-bot." } }, required: ["name"] } } },
     { type: "function", function: { name: "current_time", description: "Get the current real date and time (year, month, day, weekday, hour, minute, second, timezone, Unix timestamp). Call it when you need to know today's date, the weekday, or the current time — do not guess from memory. The current time only tells you when this request was made; it does not prove that a web page, paper, price, version, market quote, or rule is current. A dynamic fact still requires reading the publication date, update time, version number, observation time, or quote time from the corresponding source.", parameters: { type: "object", properties: {} } } },
     { type: "function", function: { name: "think", description: "Record a short internal reasoning conclusion within this round, to clarify the goal, the assumptions and the next step before acting. Write only conclusions directly relevant to the current user request, and do not treat it as a reply addressed to the user.", parameters: { type: "object", properties: { thought: { type: "string", minLength: 1, description: "A short reasoning conclusion for the current decision" } }, required: ["thought"] } } },
     { type: "function", function: { name: "ask_user", description: "**When you genuinely cannot tell what the user wants, ask them with this — do not guess and barrel ahead.** It shows a card in the conversation: the few **predicted options (buttons)** you supply, plus a **free-text box** (the user types their own requirement) and \"let the AI decide\". The user clicks one, types their own, or hands it back to you; you continue once you have their answer.\n**Use it only when the intent is genuinely ambiguous and the different readings would produce very different things** — e.g. the user asks to migrate the database and both an in-place migration and a rebuild are defensible; the user has two accounts/environments and you cannot tell which to target; two instructions in the same message contradict each other. A build request whose stack is unspecified is NOT ambiguous: \"build me a Telegram bot\" / \"build a login page\" → pick the mainstream library and a sensible default, build it, and state the choices in your summary. This tool is for decisions you genuinely cannot make on the user's behalf, not for \"which framework\".\n**Never ask about anything you can reasonably infer, or about mere implementation detail (which variable name, which file) — just do it.** Users hate being stopped for nothing. This tool is for \"what should I build\", not \"may I continue\".\n**Ordering rule: when the ambiguity is about direction, ask_user always comes before update_plan** — settle the direction, then plan. The system will never block your ask_user for \"there is no plan yet\".", parameters: { type: "object", properties: { question: { type: "string", description: "The specific clarifying question to put to the user (one sentence)" }, options: { type: "array", description: "2-4 answers you predict (each a few words), rendered as buttons for the user to pick; they can also skip them and type their own", items: { type: "string" } }, recommended: { type: "integer", description: "Index of the recommended option (0-based); that option is highlighted as recommended" }, multi_select: { type: "boolean", description: "true = multi-select mode (checkboxes; the user can pick several options and submit them together)" }, confirm_text: { type: "string", description: "Confirmation for a dangerous operation: once set, the user must type this text exactly into the box to continue (e.g. DELETE)" } }, required: ["question"] } } },
@@ -30491,6 +30509,7 @@ function _mapToolCall(name, args, mcpToolMap = _mcpToolMap) {
       const _cmd = `set -e; echo '构建中…'; npm run build; d=''; for x in dist build out .output/public public; do [ -d "$x" ] && { d="$x"; break; }; done; [ -n "$d" ] || { echo '❌ 没找到构建产物目录(dist/build/out/.output/public)——先确保项目能 npm run build'; exit 1; }; echo "打包 $d/ …"; tar czf /tmp/mi-deploy.tar.gz -C "$d" .; echo "上传到网关（账号鉴权·隔离·限大小·安全解压）…"; curl -sS -X POST -H "Authorization: Bearer ${_tok}" --data-binary @/tmp/mi-deploy.tar.gz "${_gw}/api/deploy?name=${_dn}"; echo ""; rm -f /tmp/mi-deploy.tar.gz; echo '（返回的 url 就是自动分配好的 HTTPS 二级域名 名字.michaelide.xyz，可直接访问分享，不用再配任何 DNS；报 401=没登录、太大就精简后再传）'`;
       return { type: "cmd", command: _cmd };
     }
+    case "create_project": return { type: "createproject", path: String(args.name || ""), name: String(args.name || "") };
     case "update_plan": return { type: "plan", steps: _normPlanSteps(args.steps || args.plan || args.todos) };
     case "think": return { type: "think", content: args.thought || args.thoughts || "" };
     case "ask_user": return { type: "askuser", question: args.question || args.q || args.prompt || args.text || "", options: Array.isArray(args.options) ? args.options : (Array.isArray(args.choices) ? args.choices : (Array.isArray(args.buttons) ? args.buttons : [])), recommended: Number.isFinite(+args.recommended) ? +args.recommended : -1, multiSelect: !!args.multi_select, confirmText: String(args.confirm_text || "") };
@@ -47242,6 +47261,40 @@ async function _executeToolStepInner(step, call, root, run) {
         return { type: "diag", path: call.path, content: `该文件未被语言服务分析（读不到内容或路径不存在），**不能据此认为没有问题**。请确认路径，或改用 run_cmd 跑项目自带的类型检查/测试。` };
       }
       return { type: "diag", path: call.path, content: `无错误或警告${note}（注意：LSP 分析可能略有延迟，改完稍等再查更准）。` };
+
+    } else if (call.type === "createproject") {
+      // 智能体唯一真正缺的能力：没打开文件夹时它自己开不了工。
+      //
+      // 130 个工具里没有任何一个能新建或绑定工作区根，而 create_dir 走
+      // require_inside_workspace（必须先有工作区才能建目录）。于是用户说「帮我写个 telegram
+      // 机器人」而左边什么都没打开时，智能体只能把问题退回给用户——这就是"它不肯直接干活"
+      // 最字面的复现，而它其实不是不肯，是真的做不到。
+      //
+      // 位置不由模型决定：后端把目录固定建在 ~/MrDayOne/<name>，名字过白名单，并且仍然走
+      // register_workspace_root 的全部守卫。这里只负责把它绑成当前工作区并如实报出路径。
+      const _pname = String(call.name || "").trim();
+      if (!_pname) {
+        const msg = "[ERROR] create_project 需要一个 name（文件夹名）。";
+        _settleToolStep(step, { type: "createproject", path: "", content: msg }, "参数缺失");
+        return { type: "createproject", path: "", content: msg };
+      }
+      try {
+        const _abs = await backend.createProjectDir(_pname);
+        // 绑成当前工作区，后续所有文件工具立刻可用；沿用打开文件夹那条既有链路。
+        try { workspaceRoots = [...new Set([...(workspaceRoots || []), _abs])]; } catch {}
+        try { setActiveWorkspaceRoot(_abs); } catch {}
+        try { await renderWorkspaceRoots(); } catch {}
+        try { await reloadDir(_abs); } catch {}
+        try { preloadProjectModels(_abs); } catch {}
+        try { startFileWatcher(); } catch {}
+        try { _ipcBroadcast("workspace_changed", { roots: [...workspaceRoots], active: _abs }); } catch {}
+        const content = `已新建并切换到项目目录：${_abs}\n现在所有文件工具都在这个目录里工作，直接开始写代码。`
+          + `\n**在最终回复里把这个完整路径告诉用户**，否则他不知道东西建到哪了。`;
+        return { type: "createproject", path: _abs, content };
+      } catch (e) {
+        const msg = `[ERROR] 新建项目目录失败：${String(e?.message || e).slice(0, 300)}`;
+        return { type: "createproject", path: _pname, content: msg };
+      }
 
     } else if (call.type === "current_time") {
       const now = new Date();

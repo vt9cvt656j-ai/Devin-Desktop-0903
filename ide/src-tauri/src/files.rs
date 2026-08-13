@@ -264,6 +264,58 @@ pub fn bootstrap_home_root() {
     }
 }
 
+/// 新建一个项目目录并把它注册成工作区根。
+///
+/// # 为什么需要一个专用命令
+///
+/// `create_dir` 走 `require_inside_workspace`，也就是"必须先有工作区才能建目录"——而这里要解决的
+/// 恰恰是**一个工作区都还没有**的情况。用户说「帮我写个 telegram 机器人」而左边没打开任何文件夹时，
+/// 智能体以前只能把问题退回给用户：它自己开不了工。这是它唯一真正缺的能力，不是策略问题。
+///
+/// # 边界
+///
+/// 位置**不由调用方决定**。模型只能给一个名字，目录一律建在 `~/MrDayOne/<name>` 下：
+/// - 名字过一遍白名单（字母数字、`.`、`_`、`-`），任何分隔符和 `..` 直接拒——所以拼不出逃逸路径；
+/// - 建完仍然走 `register_workspace_root` 的全部守卫（规范化、深度 ≤2 拒绝、系统目录黑名单）；
+/// - 已存在同名目录时**不覆盖**，直接复用并注册——重复调用是幂等的，不会悄悄清空谁的代码。
+///
+/// 换句话说：它能创造的最坏结果，是在用户自己的主目录下多出一个空文件夹。
+#[tauri::command(async)]
+pub fn create_project_dir(name: String) -> Result<String, String> {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        return Err("project name is empty".into());
+    }
+    // 单段名字，白名单字符。`/`、`\`、`..` 一律不在表内，所以拼不出逃逸路径。
+    if !trimmed
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-')
+        || trimmed.starts_with('.')
+        || trimmed.contains("..")
+    {
+        return Err(format!(
+            "invalid project name '{trimmed}': use letters, digits, '.', '_' or '-' only, and not starting with '.'"
+        ));
+    }
+    if trimmed.len() > 64 {
+        return Err("project name is too long (max 64)".into());
+    }
+    let home = home_dir().ok_or_else(|| "cannot resolve home directory".to_string())?;
+    let base = PathBuf::from(home).join("MrDayOne");
+    std::fs::create_dir_all(&base).map_err(|e| friendly_write_error("创建目录", &base.to_string_lossy(), &e))?;
+    let target = base.join(trimmed);
+    if !target.exists() {
+        std::fs::create_dir_all(&target)
+            .map_err(|e| friendly_write_error("创建目录", &target.to_string_lossy(), &e))?;
+    } else if !target.is_dir() {
+        return Err(format!("{} already exists and is not a directory", target.display()));
+    }
+    // 复用同一套注册守卫——这里不另开一条路径。
+    let canonical = std::fs::canonicalize(&target).map_err(|e| e.to_string())?;
+    register_workspace_root(canonical.to_string_lossy().into_owned())?;
+    Ok(canonical.to_string_lossy().into_owned())
+}
+
 /// Register a workspace root that the user explicitly opened.
 /// Called from the frontend after a successful folder-open dialog.
 #[tauri::command(async)]
@@ -2193,6 +2245,47 @@ mod archive_summary_tests {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn creating_a_project_binds_it_as_a_workspace_root() {
+        // 真跑一次：建目录 → 注册成工作区根 → 目录里能写文件。
+        // 只断言"参数校验能拒"是不够的——这个工具存在的意义是让没有工作区的智能体开得了工。
+        let name = format!("mrday-test-{}", std::process::id());
+        let abs = create_project_dir(name.clone()).expect("应当建成");
+        let p = std::path::Path::new(&abs);
+        assert!(p.is_dir(), "目录要真的存在");
+        assert!(abs.contains("MrDayOne"), "位置固定在 ~/MrDayOne 下，不由调用方决定");
+        assert!(abs.ends_with(&name));
+        // 注册成功之后，工作区边界应当放行这个目录里的写入——这正是"开得了工"的定义。
+        let inside = p.join("bot.py").to_string_lossy().into_owned();
+        assert!(require_inside_workspace(&inside, true).is_ok(), "建完就该能在里面写文件");
+        // 重复调用是幂等的：复用同名目录，不覆盖。
+        std::fs::write(p.join("keep.txt"), b"user code").unwrap();
+        let again = create_project_dir(name).expect("重复调用应当复用");
+        assert_eq!(again, abs);
+        assert!(p.join("keep.txt").exists(), "绝不能清空已有目录");
+        std::fs::remove_dir_all(p).ok();
+    }
+
+    #[test]
+    fn project_name_cannot_escape_the_base_directory() {
+        // 位置不由调用方决定：模型只能给一个名字，目录固定建在 ~/MrDayOne/<name> 下。
+        // 名字过白名单是这条边界的**唯一**依赖，所以逃逸形状要逐个测到。
+        for bad in [
+            "../../etc",       // 相对路径上跳
+            "a/b",             // 正斜杠
+            "a\\b",            // 反斜杠
+            "..",              // 纯上跳
+            ".ssh",            // 隐藏目录（点开头一律拒）
+            "",                // 空
+            "   ",             // 全空白
+            "a..b",            // 内嵌 ..
+        ] {
+            assert!(create_project_dir(bad.to_string()).is_err(), "应当拒绝: {bad:?}");
+        }
+        // 长度上限也要守住，免得拼出病态路径。
+        assert!(create_project_dir("x".repeat(65)).is_err());
+    }
+
     use super::*;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Barrier};
