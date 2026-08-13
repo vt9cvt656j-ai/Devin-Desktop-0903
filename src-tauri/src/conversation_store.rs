@@ -1395,6 +1395,129 @@ pub async fn conversation_transcript_truncate(
     })
 }
 
+/// 会话清单里的一行。**故意只带列表要用的那点东西**，不带 recent/transcript。
+///
+/// 存在的理由：`conversation_sessions` 表永不删除，每个开过的会话都在里面；但快照里的
+/// `closedSessions` 数组在 Rust 侧封顶 200、到了前端又被 `.slice(0, 80)` 砍一刀，
+/// 于是「关掉的会话过一阵就从 /sessions 里消失了」——数据还在，只是清单看不见。
+///
+/// 把清单和负载分开：一行索引几十字节，全量返回也不贵；真要恢复某个会话时再按 id
+/// 去取它的完整 JSON（conversation_session_load）。
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConversationIndexRow {
+    pub session_id: String,
+    pub name: String,
+    pub project: String,
+    pub mode: String,
+    pub created: i64,
+    pub closed_at: i64,
+    pub updated_at: i64,
+    pub is_closed: bool,
+    pub total_turns: i64,
+    /// 最后一条消息的开头，够在列表里认出是哪段对话就行。
+    pub preview: String,
+}
+
+/// 从 session_json 里抠出清单需要的字段。抠不到就给空值——**绝不因为某一条解析不出来
+/// 就让整个清单少一行**，那正是现在这个 bug 的形状。
+fn index_row_from_json(session_id: String, raw: &str, is_closed: bool, updated_at: i64) -> ConversationIndexRow {
+    let v: Value = serde_json::from_str(raw).unwrap_or(Value::Null);
+    let get_str = |k: &str| v.get(k).and_then(|x| x.as_str()).unwrap_or("").to_string();
+    let get_i64 = |k: &str| v.get(k).and_then(|x| x.as_i64()).unwrap_or(0);
+    let memory = v.get("memory");
+    let total_turns = memory
+        .and_then(|m| m.get("totalTurns"))
+        .and_then(|x| x.as_i64())
+        .unwrap_or_else(|| {
+            memory
+                .and_then(|m| m.get("transcript"))
+                .and_then(|x| x.as_array())
+                .map(|a| a.len() as i64)
+                .unwrap_or(0)
+        });
+    // 预览取 recent 的最后一条；content 可能是字符串，也可能是分块数组。
+    let preview = memory
+        .and_then(|m| m.get("recent"))
+        .and_then(|x| x.as_array())
+        .and_then(|a| a.last())
+        .map(|msg| {
+            let c = msg.get("content");
+            let text = match c {
+                Some(Value::String(s)) => s.clone(),
+                Some(Value::Array(parts)) => parts
+                    .iter()
+                    .filter_map(|p| p.get("text").and_then(|t| t.as_str()))
+                    .collect::<Vec<_>>()
+                    .join(" "),
+                _ => String::new(),
+            };
+            text.chars().take(160).collect::<String>()
+        })
+        .unwrap_or_default();
+    ConversationIndexRow {
+        session_id,
+        name: get_str("name"),
+        project: get_str("project"),
+        mode: get_str("mode"),
+        created: get_i64("created"),
+        closed_at: get_i64("closedAt"),
+        updated_at,
+        is_closed,
+        total_turns,
+        preview,
+    }
+}
+
+/// 全部会话的轻量清单，最近更新的排前面。
+///
+/// 不设上限：一行只有几十到两百字节，一万条也就一两 MB，而且只在打开 /sessions 时取一次。
+/// 真正贵的是转录，那个留在 conversation_transcript_events 里按需取。
+#[tauri::command]
+pub async fn conversation_sessions_index(
+    app: AppHandle,
+) -> Result<Vec<ConversationIndexRow>, String> {
+    let pool = pool(&app).await?;
+    let rows = sqlx::query(
+        "SELECT session_id, session_json, is_closed, updated_at FROM conversation_sessions ORDER BY updated_at DESC",
+    )
+    .fetch_all(&pool)
+    .await
+    .map_err(|error| format!("conversation session index load failed: {error}"))?;
+    Ok(rows
+        .into_iter()
+        .map(|row| {
+            let id: String = row.get("session_id");
+            let raw: String = row.get("session_json");
+            let closed: i64 = row.get("is_closed");
+            let updated: i64 = row.get("updated_at");
+            index_row_from_json(id, &raw, closed != 0, updated)
+        })
+        .collect())
+}
+
+/// 按 id 取回一个会话的完整 JSON（清单里点进去要恢复时才调）。
+#[tauri::command]
+pub async fn conversation_session_load(
+    app: AppHandle,
+    session_id: String,
+) -> Result<Option<Value>, String> {
+    let pool = pool(&app).await?;
+    let row = sqlx::query("SELECT session_json FROM conversation_sessions WHERE session_id = ?")
+        .bind(&session_id)
+        .fetch_optional(&pool)
+        .await
+        .map_err(|error| format!("conversation session load failed: {error}"))?;
+    let Some(row) = row else { return Ok(None) };
+    let raw: String = row.get("session_json");
+    let mut value: Value = serde_json::from_str(&raw)
+        .map_err(|error| format!("conversation session decode failed: {error}"))?;
+    // 和快照回填走同一套：把转录长度信息补上，前端才知道要不要按需拉取。
+    let lengths = transcript_lengths(&pool).await?;
+    externalize_transcript_metadata(&mut value, &lengths)?;
+    Ok(Some(value))
+}
+
 #[tauri::command]
 pub async fn conversation_snapshot_save(
     app: AppHandle,
@@ -1518,6 +1641,84 @@ pub async fn conversation_snapshot_load(
         snapshot,
         recovered_from_backup,
     }))
+}
+
+#[cfg(test)]
+mod session_index_tests {
+    use super::*;
+
+    async fn pool_with(rows: &[(&str, i64, i64, &str)]) -> SqlitePool {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::query("CREATE TABLE conversation_sessions (session_id TEXT PRIMARY KEY, session_json TEXT NOT NULL, is_closed INTEGER NOT NULL DEFAULT 0, updated_at INTEGER NOT NULL)")
+            .execute(&pool).await.unwrap();
+        for (id, closed, updated, json) in rows {
+            sqlx::query("INSERT INTO conversation_sessions (session_id, session_json, is_closed, updated_at) VALUES (?, ?, ?, ?)")
+                .bind(id).bind(json).bind(closed).bind(updated)
+                .execute(&pool).await.unwrap();
+        }
+        pool
+    }
+
+    /// 清单不设上限——这正是 bug 的形状：快照封顶 200、前端再 slice(0,80)，
+    /// 于是超出的历史会话"消失"了，而表里一直都在。
+    #[tokio::test]
+    async fn the_index_returns_every_session_not_just_the_newest_eighty() {
+        let json: Vec<String> = (0..300)
+            .map(|i| format!(r#"{{"id":"s{i}","name":"会话{i}","project":"/w/p","mode":"agent","created":1,"memory":{{"totalTurns":{},"recent":[{{"role":"user","content":"第 {i} 段对话"}}]}}}}"#, i + 1))
+            .collect();
+        let rows: Vec<(&str, i64, i64, &str)> = (0..300)
+            .map(|i| (Box::leak(format!("s{i}").into_boxed_str()) as &str, 1i64, i as i64, json[i].as_str()))
+            .collect();
+        let pool = pool_with(&rows).await;
+
+        let fetched = sqlx::query(
+            "SELECT session_id, session_json, is_closed, updated_at FROM conversation_sessions ORDER BY updated_at DESC",
+        ).fetch_all(&pool).await.unwrap();
+        let out: Vec<ConversationIndexRow> = fetched
+            .into_iter()
+            .map(|row| {
+                let id: String = row.get("session_id");
+                let raw: String = row.get("session_json");
+                let closed: i64 = row.get("is_closed");
+                let updated: i64 = row.get("updated_at");
+                index_row_from_json(id, &raw, closed != 0, updated)
+            })
+            .collect();
+
+        assert_eq!(out.len(), 300, "300 个会话必须一个不少地出现在清单里");
+        assert_eq!(out[0].session_id, "s299", "最近更新的排最前");
+        assert_eq!(out[0].total_turns, 300);
+        assert!(out[0].preview.contains("第 299 段对话"));
+        assert!(out.iter().all(|r| r.is_closed));
+    }
+
+    /// 单条解析失败不能连累整张清单——那就是把这个 bug 换了个形状再犯一次。
+    #[tokio::test]
+    async fn a_row_that_cannot_be_parsed_still_takes_its_place_in_the_list() {
+        let bad = index_row_from_json("broken".into(), "{ this is not json", false, 7);
+        assert_eq!(bad.session_id, "broken");
+        assert_eq!(bad.total_turns, 0);
+        assert_eq!(bad.name, "");
+        assert_eq!(bad.updated_at, 7);
+    }
+
+    /// content 有两种形状（字符串 / 分块数组），预览两种都要认。
+    #[tokio::test]
+    async fn preview_reads_both_content_shapes_and_falls_back_to_transcript_length() {
+        let blocks = r#"{"name":"n","memory":{"recent":[{"role":"user","content":[{"type":"text","text":"分块内容"}]}],"transcript":[1,2,3,4]}}"#;
+        let r = index_row_from_json("a".into(), blocks, true, 1);
+        assert!(r.preview.contains("分块内容"), "{:?}", r.preview);
+        assert_eq!(r.total_turns, 4, "没有 totalTurns 时用 transcript 长度兜底");
+
+        let plain = r#"{"name":"n","memory":{"totalTurns":9,"recent":[{"role":"user","content":"纯字符串"}]}}"#;
+        let r2 = index_row_from_json("b".into(), plain, true, 1);
+        assert_eq!(r2.preview, "纯字符串");
+        assert_eq!(r2.total_turns, 9);
+    }
 }
 
 #[cfg(test)]

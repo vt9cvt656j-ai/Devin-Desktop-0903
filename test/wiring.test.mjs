@@ -739,3 +739,44 @@ test("思考量在两条线路上都有东西可显示", () => {
   assert.match(main, /_lastThinkChars \? ` · 思考 \$\{k\(_lastThinkChars\)\} 字`/,
     "没有 token 数时要退回字符数，不能只剩一个光秃秃的档位名");
 });
+
+test("/sessions 必须能看到内存装不下的那部分历史会话", () => {
+  const main = readFileSync(new URL("../src/main.js", import.meta.url), "utf8");
+  const rs = readFileSync(new URL("../src-tauri/src/conversation_store.rs", import.meta.url), "utf8");
+  const lib = readFileSync(new URL("../src-tauri/src/lib.rs", import.meta.url), "utf8");
+
+  // 起因：热副本 _closedChatSessions 被有意封在 80 条（每条常驻内存、带 recent/transcript），
+  // Rust 侧回填也封在 200。但 conversation_sessions 表**永不删除**——用户开过的每个会话都在。
+  // 以前 /sessions 只读热副本，于是关掉的会话过一阵就从历史里消失了。数据一直在，是清单没去看。
+
+  // 1) 后端要有「全量轻量清单」和「按 id 取一条」两个命令，且都注册了。
+  assert.match(rs, /pub async fn conversation_sessions_index/);
+  assert.match(rs, /pub async fn conversation_session_load/);
+  assert.match(rs, /SELECT session_id, session_json, is_closed, updated_at FROM conversation_sessions ORDER BY updated_at DESC/,
+    "清单要按最近更新排序取全表");
+  assert.doesNotMatch(
+    rs.slice(rs.indexOf("pub async fn conversation_sessions_index")).slice(0, 1200),
+    /LIMIT/,
+    "清单查询不能带 LIMIT —— 那就又把历史砍掉了",
+  );
+  for (const cmd of ["conversation_sessions_index", "conversation_session_load"]) {
+    assert.ok(lib.includes(`conversation_store::${cmd}`), `${cmd} 没在 lib.rs 注册`);
+  }
+
+  // 2) 前端要有绑定、要真的去查、点进去要能恢复。
+  assert.match(main, /conversationSessionsIndex: \(\) => core\.invoke\("conversation_sessions_index"\)/);
+  assert.match(main, /conversationSessionLoad: \(sessionId\) => core\.invoke\("conversation_session_load"/);
+  assert.match(main, /async function _archivedSessionRows\(\)/);
+  assert.match(main, /async function _restoreArchivedSession\(sessionId\)/);
+
+  // 3) picker 必须把归档行拼进清单，并且点击时走归档恢复路径。
+  const picker = main.slice(main.indexOf("async function _openSessionPicker"), main.indexOf("async function _openSessionPicker") + 3000);
+  assert.match(picker, /await _archivedSessionRows\(\)/, "picker 要去取归档清单");
+  assert.match(picker, /entries: \[\.\.\.rows, \.\.\.archivedRows\]/, "归档行要真的进 entries");
+  assert.match(picker, /row\.state === "archived"/, "点归档行要走归档恢复");
+
+  // 4) 索引查不到时必须退化成旧行为，不能让整个 /sessions 打不开。
+  const idx = main.slice(main.indexOf("async function _archivedSessionRows"), main.indexOf("async function _restoreArchivedSession"));
+  assert.match(idx, /return \[\]/, "取不到索引要返回空数组而不是抛");
+  assert.match(idx, /catch/, "索引查询要被 try/catch 包住");
+});
