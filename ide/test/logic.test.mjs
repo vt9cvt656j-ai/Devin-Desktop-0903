@@ -270,6 +270,11 @@ const RUN_RECORD_KNOWN_SIGNATURE = load("_recordRunKnownSignature", {
   _runFileEvidenceAliases: EVIDENCE_ALIASES,
 });
 AUTO_LOAD_DEPS = {
+  // 重试间隔：真实值是 2000ms（源码里那条断言钉着），这里给 0 是为了不让每个抠出
+  // _runModelRequestWithRetry 的测试都真等 2 秒 × 10 次。要验"确实等了"的那条测试
+  // 自己传一个小的非零值。少了这个键是 ReferenceError，表现成"测试挂了"而不是
+  // "没等"，很难查——和下面那条 LSP 通知同一个道理。
+  _AI_MODEL_RETRY_DELAY_MS: 0,
   // 程序化改完 model 之后通知语言服务器。它被 _setModelValueProgrammatically 和
   // _appendModelTextProgrammatically 内部调用，所以任何抠出这两个函数的测试都需要它——
   // 少了它是 ReferenceError，表现成"这个测试挂了"而不是"LSP 没收到通知"，很难查。
@@ -22739,4 +22744,51 @@ test("a model chip serialises with its prefix and a file chip does not", () => {
   assert.equal(chipText({ dataset: { rel: "src/main.js" } }), " @src/main.js ", "kind defaults to file");
   assert.equal(chipText({ dataset: { rel: "claude-opus-5", kind: "model" } }), " @model:claude-opus-5 ");
   assert.equal(chipText({ dataset: { rel: "owner/repo", kind: "github" } }), " @github:owner/repo ");
+});
+
+test("模型重试之间要等两秒，不能背靠背连打把上游打成 502", async () => {
+  // 以前这里是 `attemptIndex += 1; continue;` —— 中间一点间隔都没有，10 次背靠背立刻重发。
+  // 上游正忙不过来的时候，这等于对着一个已经在喘的服务连打十拳。网关日志里那种"同一个请求
+  // 每两秒重来一次、连打六小时"就是这么来的（那两秒还只是请求本身的往返，不是我们在等）。
+  const run = load("_runModelRequestWithRetry", {
+    _AI_MODEL_RESUME_LIMIT: 3,
+    _AI_MODEL_RETRY_LIMIT: 10,
+    _AI_MODEL_RETRY_DELAY_MS: 120,        // 测试里缩短，只验"确实等了"而不是等满两秒
+    _isRetryableAiError: () => true,
+    _modelEventHasProgress: () => false,
+  });
+
+  const stamps = [];
+  const r = await run({
+    invoke: async (cb) => { stamps.push(Date.now()); cb({ kind: "error", message: "upstream 502" }); },
+    retryLimit: 3,
+  });
+  assert.equal(stamps.length, 4, "1 次首发 + 3 次重试");
+  assert.equal(r.attempts, 4);
+  for (let i = 1; i < stamps.length; i++) {
+    assert.ok(stamps[i] - stamps[i - 1] >= 100,
+      `第 ${i} 次重试只隔了 ${stamps[i] - stamps[i - 1]}ms，应当等满间隔`);
+  }
+
+  // 间隔要能被「停止」打断：一次性 setTimeout 会让用户按下停止后还得干等，等完还再发一次。
+  let calls = 0, live = true;
+  setTimeout(() => { live = false; }, 40);
+  const stopped = await run({
+    invoke: async (cb) => { calls++; cb({ kind: "error", message: "upstream 502" }); },
+    isLive: () => live,
+    retryLimit: 5,
+  });
+  assert.equal(stopped.cancelled, true, "停止之后要报 cancelled");
+  assert.equal(calls, 1, "停止之后不能再发一次");
+});
+
+test("重试节奏的三个数字是有意选的，不是碰巧", () => {
+  // 10 次、每次 60 秒窗口、间隔 2 秒。
+  assert.match(SRC, /const _AI_MODEL_RETRY_LIMIT = 10;/);
+  assert.match(SRC, /const _AI_MODEL_RETRY_DELAY_MS = 2_000;/);
+  assert.match(SRC, /const _AI_MODEL_ATTEMPT_TIMEOUT_MS = 60_000;/);
+  // 桌面侧的每次尝试窗口也必须是 60 秒，两条传输层不能各说各话
+  const AI_RS = readFileSync(new URL("../src-tauri/src/ai.rs", import.meta.url), "utf8");
+  assert.match(AI_RS, /const RESPONSE_HEADERS_TIMEOUT_SECS: u64 = 60;/);
+  assert.match(AI_RS, /const STANDARD_FIRST_STREAM_PROGRESS_TIMEOUT_SECS: u64 = 60;/);
 });
