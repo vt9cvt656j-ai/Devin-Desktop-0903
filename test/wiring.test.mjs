@@ -510,6 +510,34 @@ test("no NEW unreachable module appears under src/", async () => {
   }
 });
 
+test("create_project 五个环节都接上了——少一环这个工具就是死的", () => {
+  // 这是智能体唯一真正缺的能力：130 个工具里没有一个能新建或绑定工作区根，而 create_dir 走
+  // require_inside_workspace（必须先有工作区才能建目录）。于是用户没打开文件夹时说「写个
+  // telegram 机器人」，智能体只能把问题退回给用户——它不是不肯干，是真的做不到。
+  //
+  // 这条链五个环节，断任何一环工具就是死的，而且死得很安静：模型照样能看到它、照样会调，
+  // 只是什么都不会发生。这个仓库已经有过太多这样的东西了。
+  assert.match(SRC, /createProjectDir: \(name\) => core\.invoke\("create_project_dir", \{ name \}\)/,
+    "① backend 包装");
+  assert.match(SRC, /createProjectDir: async \(name\)/, "② 浏览器兜底（开发预览里一调就抛）");
+  assert.match(SRC, /name: "create_project", description:/, "③ 工具定义，模型才看得见");
+  assert.match(SRC, /case "create_project": return \{ type: "createproject"/, "④ 参数映射");
+  assert.match(SRC, /call\.type === "createproject"/, "⑤ 执行分支");
+  // 建完必须绑成活动工作区，否则后面每个文件工具照样 [BLOCKED]。
+  assert.match(SRC, /setActiveWorkspaceRoot\(_abs\)/, "⑥ 绑定活动工作区");
+  // 路径必须报给用户，否则他不知道东西建到哪了。
+  assert.match(SRC, /在最终回复里把这个完整路径告诉用户/);
+
+  // 后端命令要真的注册进 Tauri，否则前端 invoke 直接抛。
+  const lib = readFileSync(join(HERE, "../src-tauri/src/lib.rs"), "utf8");
+  assert.match(lib, /files::create_project_dir/, "⑦ Tauri 命令注册");
+
+  // 网关那份目录才是运行时生效的（见 MEMORY：两套工具目录）。只改客户端等于部署后模型看不见。
+  const gw = JSON.parse(readFileSync(join(HERE, "../../server/prompts/tools.json"), "utf8"));
+  assert.ok(gw.some((t) => t.function.name === "create_project"),
+    "⑧ 网关目录镜像——少了它，部署之后模型根本看不到这个工具");
+});
+
 test("施工请求不许被降级成反问：六处判题链和授权底线都要保持现状", () => {
   const P = (n) => readFileSync(join(HERE, "../../server/prompts/" + n), "utf8");
 

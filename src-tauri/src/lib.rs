@@ -235,6 +235,7 @@ pub fn run() {
         .manage(watcher::WatcherState::default())
         .invoke_handler(tauri::generate_handler![
             files::register_workspace_root,
+            files::create_project_dir,
             files::read_dir,
             files::read_text_file,
             files::read_log_tail,
