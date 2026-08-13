@@ -16089,12 +16089,13 @@ test("命令面板里的工具命令必须打开对应面板，而不是静默�
   // 工作区/远程）点下去全部打开「高级设置」。不报错、不打日志，就是开错面板——比缺功能更伤，
   // 因为缺功能是"还没做"，点了开错东西是"这 IDE 是假的"。
   //
-  // 2026-08-13：所有者把任务运行器 / 调试器 / 合并冲突三个页签下掉了（"没啥用"）。这条测试
-  // 的价值一点没变——**下掉页签就必须同时下掉指向它的命令**，否则那条命令会退回到同一个
-  // 静默回落分支里去。所以这里只把它们移出"必须存在"的名单，下面那条"每个
-  // openFeaturePanel 的目标都必须是登记过的标签"的断言原样保留，它现在正好盯着这件事。
-  const TOOL_TABS = ["lsp", "workspace", "remote"];
-  const REMOVED_TABS = ["tasks", "debugger", "conflicts"];
+  // 2026-08-13：所有者把整个"工具"组六个页签都下掉了（"没啥用"）。这条测试的价值一点没变，
+  // 只是方向反过来了——**下掉页签就必须同时下掉指向它的入口**，否则那个入口会退回到同一个
+  // 静默回落分支里去，点一下开错面板。所以"必须存在"的名单空了，下面那条"每个
+  // openFeaturePanel 的目标都必须是登记过的标签"的断言原样保留，它现在正好盯着这件事，
+  // 外加一条反向断言：这六个 id 不该又偷偷回到标签条里。
+  const TOOL_TABS = [];
+  const REMOVED_TABS = ["tasks", "debugger", "conflicts", "lsp", "workspace", "remote"];
 
   const tabsSrc = /const FEATURE_TABS = \[([\s\S]*?)\];/.exec(SRC);
   assert.ok(tabsSrc, "找不到 FEATURE_TABS");
@@ -16133,7 +16134,7 @@ test("命令面板里的工具命令必须打开对应面板，而不是静默�
   // 从源头堵住这类 bug：任何一处 openFeaturePanel("x")，x 都必须是登记过的标签。
   // 这条断言要是当初就在，最初那个"6 条命令全开设置"根本活不到今天。
   const targets = [...SRC.matchAll(/openFeaturePanel\("([a-z]+)"\)/g)].map((m) => m[1]);
-  assert.ok(targets.length >= 8, `openFeaturePanel 调用点只找到 ${targets.length} 个，正则可能失效了`);
+  assert.ok(targets.length >= 4, `openFeaturePanel 调用点只找到 ${targets.length} 个，正则可能失效了`);
   // 下掉页签之后，指向它们的调用点必须一起消失——留一个就是一个"点了开错面板"。
   for (const id of REMOVED_TABS) {
     assert.ok(!targets.includes(id), `还有 openFeaturePanel("${id}")，但这个页签已经删了`);
@@ -16142,6 +16143,16 @@ test("命令面板里的工具命令必须打开对应面板，而不是静默�
     assert.ok(declared.includes(target),
       `有代码调用 openFeaturePanel("${target}")，但 FEATURE_TABS 里没有这个 id —— 它会被静默改写成 settings`);
   }
+
+  // 状态栏那个 LSP 指示器过去点一下直通语言服务面板。面板下掉之后，onClick 必须一起去掉，
+  // 否则它会被 normalizeFeatureTab 静默改写成 "settings"；tooltip 里的「Click for logs」
+  // 也不能留着——那是在承诺一个不存在的动作。
+  // 必须先剥注释：解释这次改动的注释里原样引用了「Click for logs」和 openFeaturePanel，
+  // 不剥的话这条断言是在跟自己的注释较劲——正是本文件顶部 stripJsComments 存在的理由。
+  const lspStart = SRC.indexOf("function updateLspStatusBar");
+  const lspStatus = stripJsComments(SRC.slice(lspStart, lspStart + 1400));
+  assert.doesNotMatch(lspStatus, /openFeaturePanel/, "状态栏 LSP 指示器还指着已删的面板");
+  assert.doesNotMatch(lspStatus, /Click for logs/, "tooltip 还在承诺一个点不动的动作");
 
   // 渲染异常不能让面板变成空白——那又是一次静默失败。
   assert.match(SRC, /\} catch \(err\) \{[\s\S]{0,200}\[feature-panel\] render failed/,

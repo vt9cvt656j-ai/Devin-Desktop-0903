@@ -8939,10 +8939,13 @@ function updateLspStatusBar() {
     const parts = [];
     if (ready.length) parts.push(ready.join(", "));
     if (starting.length) parts.push(`(${starting.join(",")} starting…)`);
+    // 不再可点：语言服务面板已按所有者要求下掉（2026-08-13）。留着 onClick 会被
+    // normalizeFeatureTab 静默改写成 "settings"，点一下开错面板；tooltip 里的
+    // 「Click for logs」也跟着删掉，否则是在承诺一个不存在的动作。
+    // 不传 onClick，setStatusBarItem 就渲染成 <span>，手型光标和点击一起没有。
     setStatusBarItem(
       "lsp",
-      { text: `LSP: ${parts.join(" ")}`, order: 10, tooltip: `Active: ${ready.join(", ") || "none"}\nStarting: ${starting.join(", ") || "none"}\nClick for logs` },
-      () => openFeaturePanel("lsp"),
+      { text: `LSP: ${parts.join(" ")}`, order: 10, tooltip: `Active: ${ready.join(", ") || "none"}\nStarting: ${starting.join(", ") || "none"}` },
     );
   } else {
     removeStatusBarItem("lsp");
@@ -53462,11 +53465,13 @@ function renderSkillsTool(body) {
  * 「Click for logs」的语言服务器指示器，点下去全部打开「设置」。不报错、不打日志，就是
  * 开错面板。现在登记齐了，测试也从两个方向盯着这张表。
  *
- * **2026-08-13 按所有者要求下掉了任务运行器 / 调试器 / 合并冲突三个页签**（"没啥用"）。
+ * **2026-08-13 按所有者要求下掉了整个"工具"组六个页签**：任务运行器 / 调试器 / 合并冲突，
+ * 以及语言服务 / 工作区 / 远程开发（"没啥用"）。现在这张表只剩 prefs 一组，标签条里那条
+ * 分组分隔线也随之自然消失（渲染循环只在 group 变化时才画线）。
  * 连带删掉的是命令面板里指向它们的三条命令 —— 留着比删掉更糟：它们会被
  * `normalizeFeatureTab` 静默改写成 "settings"，点下去开错面板，正是上面这段说的那个 bug。
- * 渲染函数（renderTasksTool / renderDebuggerTool / renderConflictsTool）和它们背后的能力
- * 都还在，只是没有入口；要恢复只需把这三行和对应的 renderers 映射加回来。
+ * 六个渲染函数和它们背后的能力都还在，只是没有入口；要恢复只需把对应的行和 renderers
+ * 映射加回来。状态栏那个 LSP 指示器也一并去掉了点击（见 updateLspStatusBar）。
  *
  * `group` 只影响标签条的分隔线，不影响可达性。
  */
@@ -53478,9 +53483,6 @@ const FEATURE_TABS = [
   { id: "shortcuts", titleKey: "feature.tab.shortcuts", icon: "i-command", group: "prefs" },
   { id: "mcp", titleKey: "feature.tab.mcp", icon: "i-mcp", group: "prefs" },
   { id: "skills", titleKey: "feature.tab.skills", icon: "i-skills", group: "prefs" },
-  { id: "lsp", titleKey: "feature.tab.lsp", icon: "i-braces", group: "tools" },
-  { id: "workspace", titleKey: "feature.tab.workspace", icon: "i-folder-open", group: "tools" },
-  { id: "remote", titleKey: "feature.tab.remote", icon: "i-remote", group: "tools" },
 ];
 const FEATURE_TAB_IDS = new Set(FEATURE_TABS.map((tab) => tab.id));
 function normalizeFeatureTab(tab) {
@@ -53565,10 +53567,6 @@ function renderFeaturePanel() {
     shortcuts: renderShortcutsTool,
     mcp: renderMcpTool,
     skills: renderSkillsTool,
-    // 这三个的渲染函数一直都在，只是从没被这张表引用过。
-    lsp: renderLspTool,
-    workspace: renderWorkspaceTool,
-    remote: renderRemoteTool,
   };
   const render = renderers[activeFeatureTab];
   if (!render) {
@@ -62008,7 +62006,6 @@ const palette = createCommandPalette({
     { id: "window.new", title: "新建窗口 New Window", category: t("menu.file"), run: () => _openNewWindow() },
     { id: "memory.manage", title: "管理项目记忆 Project Memory", category: "工具", run: () => openMemoryPanel() },
     { id: "workspace.addFolder", title: "添加文件夹到工作区", category: "工作区", run: () => addFolderToWorkspace() },
-    { id: "workspace.manager", title: "Workspace Manager", category: "Workspace", run: () => openFeaturePanel("workspace") },
     { id: "file.quickOpen", title: `快速打开 (${shortcutLabel("mod+p")})`, category: t("menu.file"), run: () => qoOpen() },
     { id: "tools.michaelPremium", title: t("premiumDb.menu"), category: t("menu.tools"), run: () => openMichaelPremium() },
     { id: "file.autoSave", title: "切换自动保存", category: t("menu.file"), run: () => { toggleAutoSave(); buildMenubar(); } },
@@ -62017,9 +62014,7 @@ const palette = createCommandPalette({
     { id: "view.terminal", title: panelToggleLabel("terminal"), category: t("menu.view"), run: () => toggleTerminal() },
     { id: "terminal.new", title: t("terminal.new"), category: t("terminal.title"), run: () => { openTerminal(); createTermTab(); } },
     { id: "view.splitEditor", title: "Toggle Split Editor", category: t("menu.view"), run: () => toggleSplitEditor() },
-    { id: "remote.open", title: "Remote Development", category: "Tools", run: () => openFeaturePanel("remote") },
     { id: "marketplace.open", title: "扩展市场", category: "工具", run: () => openMarketplaceModal() },
-    { id: "lsp.open", title: "Language Servers", category: "Tools", run: () => openFeaturePanel("lsp") },
     { id: "view.zenMode", title: "Toggle Zen Mode", category: t("menu.view"), run: () => toggleZenMode() },
     { id: "tab.pin", title: "Pin/Unpin Tab", category: "Tabs", run: () => activePath && togglePinTab(activePath) },
     { id: "git.stash", title: t("git.stash"), category: "Git", run: () => doStash() },
