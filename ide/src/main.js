@@ -37105,13 +37105,26 @@ async function _agentModelTurn({ config, messages, toolSchemas, toolRegistry = n
       _turnConfig.ideUtcOffsetMinutes = _turnTime.utcOffsetMinutes;
       _turnConfig.ideRegion = _ideRegionCode();
       delete _turnConfig.ideMode; delete _turnConfig.ideTools;
-      if (ideMode && _l0On(_turnConfig)) {
+      // 子智能体也要走网关回填工具描述，否则**装出来的包里**它拿到的是一堆空描述的工具。
+      //
+      // release 构建把 _buildAgentToolSchemas 里的 description 全部清空（strip-tool-ip，
+      // 实测 165 行 / 93,176 字符），主循环靠 ideMode 让网关按名把全文描述注回来；子智能体
+      // 这条路一直没传 ideMode，于是 28 个工具只剩名字和参数名。不崩不报错，退化是安静的：
+      // 参数语义靠猜、该并行的批量读退回一个一个读、同类检索工具靠名字瞎选。dev 构建不剥，
+      // 本地永远复现不出来——现象就是「主智能体挺好，一派活给子智能体就变笨」。
+      //
+      // 用专属的 "subagent" 模式而不是借 agent/explorer：网关对这个模式**只注入工具、
+      // 不注入任何系统提示词**，子智能体的人格仍然来自本地的 _SUBAGENT_SYSTEM，
+      // 消息也不会被 _l0MessagesWithSkills 重写（下面那段用 _isSub 跳过）。
+      const _isSub = stepKind === "subagent";
+      const _wantsL0 = (ideMode || _isSub) && _l0On(_turnConfig);
+      if (_wantsL0) {
         const _stat = _staticToolNames(), _names = [], _keep = [];
         for (const _t of toolSchemas) {
           const _n = _t && _t.function && _t.function.name;
           if (_n && _stat.has(_n)) _names.push(_n); else if (_t) _keep.push(_t);
         }
-        _turnConfig.ideMode = ideMode;
+        _turnConfig.ideMode = _isSub ? "subagent" : ideMode;
         _turnConfig.ideTools = _names.join(",");
         _l0Tools = _keep;
         // Model-family tuning, user language/adaptive preferences, and the authorization
@@ -37130,7 +37143,9 @@ async function _agentModelTurn({ config, messages, toolSchemas, toolRegistry = n
           + _authContextBlock()
           + _languagePreferenceBlock()
           + _adaptivePromptBlock();
-        _l0Msgs = _l0MessagesWithSkills(providerMessages, skillsBlock, clientBlocks);
+        // 子智能体不重写消息：它的系统提示词是本地的、已经对了，网关那边对 "subagent"
+        // 也不会 prepend 任何东西。只借这条路把工具描述取回来。
+        if (!_isSub) _l0Msgs = _l0MessagesWithSkills(providerMessages, skillsBlock, clientBlocks);
       }
       // `_turnConfig` survives the outer agent loop. Always clear the previous turn's handle
       // before rebuilding so a rejected compression prefix cannot leak into a later tool turn.

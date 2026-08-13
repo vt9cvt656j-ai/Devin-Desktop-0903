@@ -253,6 +253,41 @@ fn allowed_static_tool(mode: &str, name: &str) -> bool {
         ),
         // Agent mode can request mutating tools, but still goes through a server-side cap.
         "agent" | "ui" => true,
+        // 子智能体：只注入工具描述、**不注入任何系统提示词**（它的人格来自客户端本地的
+        // _SUBAGENT_SYSTEM / _WORKER_SYSTEM，服务端再 prepend 一份会打架）。
+        //
+        // 为什么要有这条：release 构建把 _buildAgentToolSchemas 里的 description 全部清空
+        // （strip-tool-ip，实测 165 行、93,176 字符），主循环靠 x-ide-mode 走网关按名回填，
+        // 而子智能体那条路从来没传过 mode —— 于是**装出来的包里**子智能体拿到的是 28 个
+        // 只有名字和参数名、没有任何说明的工具。不崩不报错，退化是安静的：参数语义靠猜、
+        // 该并行的批量读退回一个一个读、同类检索工具之间靠名字瞎选。dev 构建不剥，所以
+        // 本地永远复现不出来。
+        //
+        // 这里用**拒绝清单**而不是复刻客户端那份允许清单：子智能体的工具集是动态的
+        // （只读集 + 写集 + 角色能力 + 嵌套派发），在服务端抄一份必然漂移，那正是
+        // 「两份工具目录」那个老坑。客户端已经算好并通过 x-ide-tools 报上来，服务端只做兜底。
+        //
+        // 拒绝的这些对应客户端 _STRICT_MUTATING_TOOL_NAMES 里**子智能体本来就拿不到**的那部分：
+        // 对外发布、改远端仓库、动别人机器。子智能体确实会用到的写文件/改文件/run_cmd 不在此列。
+        "subagent" => !matches!(
+            name,
+            "deploy_site"
+                | "git_commit"
+                | "git_push"
+                | "git_branch"
+                | "git_clone"
+                | "git_pull"
+                | "git_stash"
+                | "git_stash_pop"
+                | "gh_pr_create"
+                | "gh_pr_reply"
+                | "remote"
+                | "automation"
+                | "ui_click"
+                | "worktree"
+                | "delete_path"
+                | "move_path"
+        ),
         other => {
             tracing::warn!(
                 mode = other,
@@ -3300,7 +3335,50 @@ fn ide_semantic_profile(headers: &HeaderMap) -> Option<HashSet<String>> {
 /// no `x-ide-mode` header is left UNCHANGED (existing behavior), so this can't affect any
 /// traffic that doesn't opt in.
 ///   x-ide-mode:  agent | chat | plan | explorer | reviewer  → prepend that mode's system prompt
-///   x-ide-ui:    (present) → also append the UI flow + guide
+///   x-ide-ui:    (present) → also append the UI flow + guide/// 按名字从 prompts/tools.json 注入静态工具 schema。
+///
+/// 抽成独立函数是为了让 `subagent` 那条「只要工具、不要提示词」的早退路径能复用同一段逻辑，
+/// 而不是复制一份出来慢慢漂移。
+fn inject_static_tools(mode: &str, names: &str, body: &mut serde_json::Value) {
+    let want = requested_static_tools(mode, names);
+    if want.is_empty() {
+        return;
+    }
+    let Ok(text) = read_tools_file() else { return };
+    match serde_json::from_str::<serde_json::Value>(&text) {
+        Ok(serde_json::Value::Array(all)) => {
+            let mut catalog: HashMap<String, serde_json::Value> = all
+                .into_iter()
+                .filter_map(|tool| {
+                    tool_function_name(&tool)
+                        .map(str::to_string)
+                        .map(|name| (name, tool))
+                })
+                .collect();
+            // Resolve from the ordered request, not registry order. This makes the
+            // behavior stable even if tools.json is reorganized later.
+            let picked: Vec<serde_json::Value> =
+                want.iter().filter_map(|name| catalog.remove(name)).collect();
+            if picked.is_empty() {
+                tracing::warn!(mode, requested = ?want, "no matching static tools found");
+                return;
+            }
+            // MERGE, don't overwrite: the client may ship MCP/runtime tools in body.tools
+            // that we have no schema for — keep those, append the static schemas we injected.
+            // The final L0 budget dedupes the complete list while preserving runtime priority.
+            let mut merged = match body.get_mut("tools").and_then(|t| t.as_array_mut()) {
+                Some(arr) => std::mem::take(arr),
+                None => Vec::new(),
+            };
+            merged.extend(picked);
+            body["tools"] = serde_json::Value::Array(merged);
+        }
+        Ok(_) => tracing::warn!("prompts/tools.json is not a JSON array"),
+        Err(err) => tracing::warn!(%err, "failed to parse prompts/tools.json"),
+    }
+}
+
+
 ///   x-ide-tools: comma-separated tool names → inject those tools' schemas from tools.json
 pub fn assemble_into(headers: &HeaderMap, body: &mut serde_json::Value) -> Result<(), String> {
     let hdr = |k: &str| headers.get(k).and_then(|v| v.to_str().ok());
@@ -3309,6 +3387,23 @@ pub fn assemble_into(headers: &HeaderMap, body: &mut serde_json::Value) -> Resul
         _ => return Ok(()), // not opted in → leave the request exactly as the client sent it
     };
     if !body.is_object() {
+        return Ok(());
+    }
+    // 子智能体：**只回填工具描述，一个字的系统提示词都不加**。
+    //
+    // 它的人格来自客户端本地的 _SUBAGENT_SYSTEM / _WORKER_SYSTEM，服务端再 prepend 一份
+    // mode 提示词会和它打架，还会走 _l0MessagesWithSkills 重写消息。所以给它一个专属 mode
+    // 在这里就地早退，而不是放宽上面那条「没有 x-ide-mode 就原样透传」的不变量——那条
+    // 不变量是给把网关当普通 OpenAI 端点用的第三方客户端的，不能动。
+    //
+    // 修的是什么：release 构建把工具描述全部剥掉（strip-tool-ip，实测 165 行 / 93,176 字符），
+    // 主循环靠 x-ide-mode 走网关按名回填，子智能体那条路从来没传过 → 装出来的包里子智能体
+    // 拿到 28 个空描述的工具。dev 不剥，本地永远复现不出来。
+    if mode == "subagent" {
+        if let Some(names) = hdr("x-ide-tools") {
+            inject_static_tools(mode, names, body);
+        }
+        enforce_final_tool_budget(body);
         return Ok(());
     }
     let semantic_profile = ide_semantic_profile(headers).unwrap_or_default();
@@ -3552,46 +3647,7 @@ pub fn assemble_into(headers: &HeaderMap, body: &mut serde_json::Value) -> Resul
     // 2) inject the requested tool schemas from tools.json (client sends only the NAMES it
     //    selected via its lightweight bundle/catalog logic — never the heavy schema text).
     if let Some(names) = hdr("x-ide-tools") {
-        let want = requested_static_tools(mode, names);
-        if !want.is_empty() {
-            if let Ok(text) = read_tools_file() {
-                match serde_json::from_str::<serde_json::Value>(&text) {
-                    Ok(serde_json::Value::Array(all)) => {
-                        let mut catalog: HashMap<String, serde_json::Value> = all
-                            .into_iter()
-                            .filter_map(|tool| {
-                                tool_function_name(&tool)
-                                    .map(str::to_string)
-                                    .map(|name| (name, tool))
-                            })
-                            .collect();
-                        // Resolve from the ordered request, not registry order. This makes the
-                        // behavior stable even if tools.json is reorganized later.
-                        let picked: Vec<serde_json::Value> = want
-                            .iter()
-                            .filter_map(|name| catalog.remove(name))
-                            .collect();
-                        if !picked.is_empty() {
-                            // MERGE, don't overwrite: the client may ship MCP/runtime tools
-                            // in body.tools that we have no schema for — keep those, append
-                            // the static schemas we injected. The final L0 budget below dedupes
-                            // the complete list while preserving runtime priority.
-                            let mut merged =
-                                match body.get_mut("tools").and_then(|t| t.as_array_mut()) {
-                                    Some(arr) => std::mem::take(arr),
-                                    None => Vec::new(),
-                                };
-                            merged.extend(picked);
-                            body["tools"] = serde_json::Value::Array(merged);
-                        } else {
-                            tracing::warn!(mode, requested = ?want, "no matching static tools found");
-                        }
-                    }
-                    Ok(_) => tracing::warn!("prompts/tools.json is not a JSON array"),
-                    Err(err) => tracing::warn!(%err, "failed to parse prompts/tools.json"),
-                }
-            }
-        }
+        inject_static_tools(mode, names, body);
     }
     // Always re-check opted-in requests, including those without x-ide-tools. The client can send
     // runtime/MCP schemas directly, and those need the same cross-service aggregate defense.
@@ -6499,6 +6555,51 @@ mod tests {
                 !system.contains("# 一、最高准则"),
                 "{model} unexpectedly received the legacy prompt"
             );
+        }
+    }
+
+    /// 子智能体那条路：**只回填工具描述，一个字的系统提示词都不加**。
+    ///
+    /// 起因：release 构建把工具描述全剥了（strip-tool-ip：165 行 / 93,176 字符），主循环
+    /// 靠 x-ide-mode 让网关按名注回来，子智能体那条路从来没传过 → 装出来的包里子智能体
+    /// 拿到 28 个空描述的工具，安静地变笨。dev 构建不剥，本地复现不出来。
+    #[test]
+    fn subagent_mode_injects_tool_schemas_without_prepending_any_prompt() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-ide-mode", "subagent".parse().unwrap());
+        headers.insert("x-ide-tools", "read_file,edit_file,run_cmd".parse().unwrap());
+        let mut body = serde_json::json!({
+            "model": "claude-opus-5",
+            "messages": [{"role": "system", "content": "本地子智能体人格"},
+                         {"role": "user", "content": "看一下 database.py"}]
+        });
+        assemble_into(&headers, &mut body);
+
+        // 消息一个字都不能被改：子智能体的人格是本地的
+        assert_eq!(body["messages"][0]["content"], "本地子智能体人格");
+        assert_eq!(body["messages"].as_array().unwrap().len(), 2);
+
+        // 工具必须带回真实描述
+        let tools = body["tools"].as_array().expect("tools injected");
+        assert!(!tools.is_empty(), "subagent 必须拿到工具 schema");
+        let read_file = tools
+            .iter()
+            .find(|t| t["function"]["name"] == "read_file")
+            .expect("read_file 应当被注入");
+        let desc = read_file["function"]["description"].as_str().unwrap_or("");
+        assert!(desc.len() > 40, "read_file 的描述不能是空的，实际 {desc:?}");
+    }
+
+    /// 兜底是**拒绝清单**，不是复刻客户端那份动态允许清单（那必然漂移）。
+    /// 拒的是子智能体本来就拿不到的那类：对外发布、改远端仓库、动别人机器。
+    #[test]
+    fn subagent_mode_still_refuses_the_tools_it_must_never_get() {
+        for name in ["deploy_site", "git_push", "git_commit", "remote", "automation", "ui_click", "delete_path"] {
+            assert!(!allowed_static_tool("subagent", name), "{name} 不该给子智能体");
+        }
+        // 它确实要用的写文件/改文件/跑命令不在拒绝之列
+        for name in ["read_file", "write_file", "edit_file", "multi_edit", "run_cmd", "search"] {
+            assert!(allowed_static_tool("subagent", name), "{name} 是子智能体要用的");
         }
     }
 
