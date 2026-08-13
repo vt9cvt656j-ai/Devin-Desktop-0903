@@ -449,14 +449,17 @@ enum DesignKnowledgeScope {
 impl DesignKnowledgeScope {
     fn max_hits(self) -> usize {
         match self {
-            Self::Focused => 2,
+            // 「把首页配色和卡片改好看点」这类请求走的正是 Focused 档——它恰恰是最需要
+            // 具体做法（卡片质感、构图、动效）的一轮，却只拿到两段抽象说教，改完还是难看，
+            // 用户再说一遍，循环。名额和字数都给够；Focused 的提示词总量仍远低于预算守卫。
+            Self::Focused => 4,
             Self::Full => DESIGN_KNOWLEDGE_MAX_HITS,
         }
     }
 
     fn total_chars(self) -> usize {
         match self {
-            Self::Focused => 2_800,
+            Self::Focused => 5_000,
             // 8 条/18K 是被验证过的完整注入口径（品类前3 + 骨干四件套 + 动效/媒体/
             // 布局/卡片保底）；曾被压缩特性顺手砍到 8K，骨干挤不进=设计输出全面退化。
             Self::Full => 18_000,
@@ -472,7 +475,12 @@ impl DesignKnowledgeScope {
 
     fn secondary_chars(self) -> usize {
         match self {
-            Self::Focused => 800,
+            Self::Focused => 1_100,
+            // 1800 会把蓝本切在半截 class 串上。往上提到 UI 提示词预算守卫允许的上限；
+            // 再高就会挤破 56KB，那条守卫比多几百字符更值得留着。
+            // 单条上限维持原值：UI 提示词的 56KB 守卫已经被数值层吃掉了富余，
+            // 而真正治「照抄半截 CSS」的是下面 bounded_chars 的截断标记与边界对齐，
+            // 不是多那两百字符。要再放宽得先给守卫腾地方。
             Self::Full => 1_800,
         }
     }
@@ -657,7 +665,27 @@ const DESIGN_COLOR_DIRECTIONS: &[DesignColorDirection] = &[
 
 fn design_color_direction(query: &str) -> DesignColorDirection {
     let text = query.to_lowercase();
-    let matches = |keywords: &[&str]| keywords.iter().any(|keyword| text.contains(keyword));
+    // 裸 contains 对短英文词是灾难：表里有 "ai"，于是 `a hair salon website` 和
+    // `a chair furniture shop` 都命中 SaaS，理发店和家具店被锁进 zinc+emerald 的
+    // SaaS 配色、主蓝本给成 Nexora Automation。用户看到的就是"每个网站都长一样"。
+    //
+    // 中文词没有这个问题（不会被更长的词包住），英文词则要求词边界：命中位置的前后
+    // 都不能是字母或数字。
+    let matches = |keywords: &[&str]| {
+        keywords.iter().any(|keyword| {
+            if !keyword.is_ascii() {
+                return text.contains(keyword);
+            }
+            let bytes = text.as_bytes();
+            let k = keyword.len();
+            text.match_indices(keyword).any(|(at, _)| {
+                let before_ok = at == 0 || !bytes[at - 1].is_ascii_alphanumeric();
+                let after = at + k;
+                let after_ok = after >= bytes.len() || !bytes[after].is_ascii_alphanumeric();
+                before_ok && after_ok
+            })
+        })
+    };
     let id = if matches(&[
         "餐厅",
         "饭店",
@@ -672,6 +700,20 @@ fn design_color_direction(query: &str) -> DesignColorDirection {
         "餐饮",
         "烘焙",
         "甜品",
+        // 这些此前一个都不命中，全掉进纯灰兜底，于是面包店和茶室长成同一张灰色电商落地页
+        "面包",
+        "面包店",
+        "糕点",
+        "蛋糕",
+        "茶室",
+        "茶馆",
+        "奶茶",
+        "酒吧",
+        "小吃",
+        "火锅",
+        "brunch",
+        "patisserie",
+        "teahouse",
     ]) {
         "cafe-hospitality"
     } else if matches(&[
@@ -734,6 +776,17 @@ fn design_color_direction(query: &str) -> DesignColorDirection {
         "fitness",
         "beauty",
         "supplement",
+        // 理发/美甲此前落进纯灰兜底（而且英文 hair 还会被 "ai" 误抓进 SaaS）
+        "理发",
+        "美发",
+        "美甲",
+        "沙龙",
+        "按摩",
+        "salon",
+        "barber",
+        "hair",
+        "nail",
+        "massage",
     ]) {
         "wellness-organic"
     } else if matches(&[
@@ -749,6 +802,22 @@ fn design_color_direction(query: &str) -> DesignColorDirection {
         "gallery",
         "creative studio",
         "photography",
+        // 这些生意有很强的版式气质，此前全掉进纯灰兜底、长成同一张电商落地页
+        "书店",
+        "图书",
+        "花店",
+        "鲜花",
+        "婚礼",
+        "婚庆",
+        "策划",
+        "手作",
+        "陶艺",
+        "bookstore",
+        "florist",
+        "flower shop",
+        "wedding",
+        "ceramics",
+        "atelier",
     ]) {
         "editorial-portfolio"
     } else if matches(&[
@@ -1820,8 +1889,38 @@ fn user_local_time_block_at(headers: &HeaderMap, now_utc: chrono::DateTime<chron
     )
 }
 
+/// 按字符截断，**并且在真的截断时说出来**。
+///
+/// 原本是裸的 `take(n)`：蓝本被切在 `bg-` 这种半截 class 串上，模型看不出这是被截断的，
+/// 于是把半截规格当成完整规格照抄——按钮没有背景色、卡片没有 hover、区块只有上半段。
+/// 切点也退到最近的换行/空格边界，别停在一个 CSS 声明中间。
 fn bounded_chars(text: &str, max_chars: usize) -> String {
-    text.chars().take(max_chars).collect()
+    let mut count = 0usize;
+    let mut cut = text.len();
+    for (idx, _) in text.char_indices() {
+        if count == max_chars {
+            cut = idx;
+            break;
+        }
+        count += 1;
+    }
+    if cut >= text.len() {
+        return text.to_string();
+    }
+    // 退到最近的行/词边界，最多回退 200 字节，免得为了对齐丢掉太多内容。
+    // floor 必须落在字符边界上——直接减 200 会切进汉字中间，slice 当场 panic。
+    let mut floor = cut.saturating_sub(200);
+    while floor > 0 && !text.is_char_boundary(floor) {
+        floor -= 1;
+    }
+    let boundary = text[floor..cut]
+        .rfind('\n')
+        .or_else(|| text[floor..cut].rfind(' '))
+        .map(|off| floor + off)
+        .unwrap_or(cut);
+    let mut out = text[..boundary].trim_end().to_string();
+    out.push_str("\n…（截断，完整内容用 knowledge_search 查本 section）");
+    out
 }
 
 /// Build one bounded, model-independent knowledge block for a concrete agent coding task.
@@ -6937,4 +7036,42 @@ mod tests {
         }
     }
 
+}
+
+
+#[cfg(test)]
+mod design_truncation_tests {
+    use super::bounded_chars;
+
+    /// 截断必须说出来，而且不能停在半截 class 串上。
+    ///
+    /// 原本是裸的 `chars().take(n)`：蓝本被切在 `bg-` 这种位置上，模型看不出是截断，
+    /// 会把半截规格当完整规格照抄——按钮没有背景色、卡片没有 hover、区块只有上半段。
+    /// 这类损坏完全无声，产出的页面"哪里都差一点"，而看不出原因。
+    #[test]
+    fn 截断会留下标记且退到词边界() {
+        let text = "class=\"rounded-2xl border border-zinc-200 bg-white shadow-sm hover:shadow-md\"";
+        let cut = bounded_chars(text, 30);
+        assert!(cut.contains("截断"), "必须留下截断标记：{cut}");
+        let body = cut.split('\n').next().unwrap();
+        assert!(!body.ends_with('-'), "不能停在半截 class 上：{body:?}");
+        assert!(body.len() <= text.len(), "不该比原文还长");
+    }
+
+    #[test]
+    fn 没超长时原样返回不加噪声() {
+        let text = "short enough";
+        assert_eq!(bounded_chars(text, 100), text);
+        assert_eq!(bounded_chars(text, text.chars().count()), text);
+    }
+
+    /// 中文内容不能把切点落进字符中间——那是直接 panic，不是降级。
+    #[test]
+    fn 中文内容截断不会切碎字符() {
+        let text = "把首页的卡片做出层次：surface 阶梯、顶边内高光、分层阴影，不要靠厚重的投影堆出来".repeat(4);
+        for n in [5usize, 17, 33, 64, 100] {
+            let out = bounded_chars(&text, n);
+            assert!(out.chars().count() > 0, "n={n} 时返回空");
+        }
+    }
 }
