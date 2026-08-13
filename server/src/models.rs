@@ -517,19 +517,66 @@ fn friendly_upstream_for_test(status: u16, raw: &str) -> String {
     upstream_friendly_message(status, &raw.to_lowercase())
 }
 
+/// 把上游报错整理成可以给用户看的一句话。
+///
+/// 三件事都要做，少一件就漏：
+///
+/// 1. **URL**。`reqwest` 的 `Display` 会在末尾追加 ` for url (https://上游主机/…)`，于是
+///    「路由不可用」这类 502 会把上游是谁一起告诉任何一个登录用户。health.rs 专门写了
+///    base_url 不该出现在登录用户能打开的页面，还配了断言测试 —— 而这条路把它绕过去了。
+/// 2. **密钥**。原来只剥三种 `sk-` 前缀，且**只替换第一处**：一句话里出现两个 key，第二个
+///    照样发出去；`AIza…`（Google）、`Bearer …`、以及各家的长十六进制 token 一概不管。
+/// 3. **循环到没有匹配**，不是替换一次就收工。
 fn safe_upstream_error_excerpt(low: &str) -> String {
     let mut text = low
         .replace(['\r', '\n', '\t'], " ")
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ");
-    for marker in ["sk-", "sk_live_", "sk-proj-"] {
-        if let Some(pos) = text.find(marker) {
-            let end = (pos + 48).min(text.len());
+
+    // URL 整段拿掉 —— 主机名本身就是要藏的东西，留下 scheme 之外的任何部分都没意义。
+    loop {
+        let Some(pos) = text.find("http://").or_else(|| text.find("https://")) else {
+            break;
+        };
+        // 到第一个空白或右括号为止：reqwest 的格式是 `for url (https://…/path)`。
+        let end = text[pos..]
+            .find(|c: char| c.is_whitespace() || c == ')')
+            .map(|off| pos + off)
+            .unwrap_or(text.len());
+        text.replace_range(pos..end, "[redacted-url]");
+    }
+
+    // 密钥形态。每一种都循环替换到没有匹配为止。
+    for marker in ["sk-proj-", "sk_live_", "sk-", "aiza", "bearer ", "api-key "] {
+        while let Some(pos) = text.find(marker) {
+            let end = text[pos..]
+                .char_indices()
+                .find(|(i, c)| *i > marker.len() && !(c.is_ascii_alphanumeric() || *c == '-' || *c == '_'))
+                .map(|(i, _)| pos + i)
+                .unwrap_or(text.len());
+            // 至少吃掉 marker 本身，否则找到的还是同一处，会死循环。
+            let end = end.max(pos + marker.len()).min(text.len());
             text.replace_range(pos..end, "[redacted-key]");
         }
     }
-    text.chars().take(220).collect()
+
+    // 兜底：剩下的长连续串（20 位以上的十六进制/base64 形态）当作凭据处理。上面几种前缀
+    // 覆盖不到没有前缀的 token，而那种恰恰最难事后发现。
+    let mut out = String::with_capacity(text.len());
+    for word in text.split(' ') {
+        let looks_like_secret = word.len() >= 20
+            && word
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
+            && word.chars().filter(|c| c.is_ascii_digit()).count() >= 4;
+        if !out.is_empty() {
+            out.push(' ');
+        }
+        out.push_str(if looks_like_secret { "[redacted]" } else { word });
+    }
+
+    out.chars().take(220).collect()
 }
 
 fn upstream_failure_status(status: u16, low: &str) -> StatusCode {
@@ -671,6 +718,12 @@ pub struct Model {
     /// Upstream wire protocol: "anthropic" (native /v1/messages) or "openai" (/chat/completions
     /// compat). When "anthropic", the gateway translates the OpenAI request/response ⇄ Anthropic.
     pub protocol: String,
+    /// 把客户端拨的思考档位**原样**发给上游（含 `xhigh` / `max`），还是封顶在 `high`。
+    ///
+    /// 默认 false = 保持旧行为。见 `anthropic_effort_word` 里那段说明：封顶的理由是一条
+    /// 从未被验证过的推断，所以做成每条线路可配，而不是继续写死在 match 里。
+    #[sqlx(default)]
+    pub effort_passthrough: bool,
 }
 
 /// Per-MODEL (input, output) USD/1M price override from a connection's model_prices map.
@@ -1338,6 +1391,7 @@ pub async fn admin_list(
                 "model_prices": m.model_prices,
                 "model_billing": m.model_billing,
                 "protocol": m.protocol,
+                "effort_passthrough": m.effort_passthrough,
                 // Display grouping only — see `group_into` on the struct.
                 "group_into": m.group_into,
             })
@@ -1830,6 +1884,9 @@ pub struct UpdateReq {
     pub model_billing: Option<serde_json::Value>,
     /// "anthropic" | "openai" — upstream wire protocol for this connection.
     pub protocol: Option<String>,
+    /// 思考档位直通：开启后 `xhigh` / `max` 原样发给上游，关闭时封顶在 `high`。
+    /// 见 `anthropic_effort_word`——封顶的理由从来没被真实探测验证过，所以做成开关。
+    pub effort_passthrough: Option<bool>,
 }
 
 /// POST /api/admin/models/:id — update a connection (incl. enabled model set). admin.
@@ -1946,7 +2003,9 @@ pub async fn admin_update(
         Some("anthropic") => "anthropic".to_string(),
         _ => m.protocol, // unspecified → keep existing
     };
-    sqlx::query("UPDATE models SET label=$1, provider=$2, base_url=$3, api_key=$4, rate=$5, active=$6, sort=$7, enabled_models=$8, input_price=$9, output_price=$10, description=$11, billing_mode=$12, per_call_cents=$13, model_names=$14, cache_read_price=$15, cache_create_price=$16, model_prices=$17, protocol=$18, model_billing=$20, per_call_micro_usd=$21 WHERE id=$19")
+    // 没传就保持原值——和上面 protocol 一样的语义，别让一次只改价格的保存把开关关掉。
+    let effort_passthrough = req.effort_passthrough.unwrap_or(m.effort_passthrough);
+    sqlx::query("UPDATE models SET label=$1, provider=$2, base_url=$3, api_key=$4, rate=$5, active=$6, sort=$7, enabled_models=$8, input_price=$9, output_price=$10, description=$11, billing_mode=$12, per_call_cents=$13, model_names=$14, cache_read_price=$15, cache_create_price=$16, model_prices=$17, protocol=$18, model_billing=$20, per_call_micro_usd=$21, effort_passthrough=$22 WHERE id=$19")
         .bind(&label)
         .bind(&provider)
         .bind(&base_url)
@@ -1968,6 +2027,7 @@ pub async fn admin_update(
         .bind(id)
         .bind(&model_billing)
         .bind(per_call_micro_usd)
+        .bind(effort_passthrough)
         .execute(&state.db)
         .await?;
     Ok(Json(json!({ "ok": true })))
@@ -3375,7 +3435,7 @@ pub(crate) async fn auth_any_user(
         .await?
     {
         Some(u) => Ok(u),
-        None => crate::auth::user_from_jwt(&state.cfg, &token)
+        None => crate::auth::user_from_jwt(&state.db, &state.cfg, &token).await
             .ok_or_else(|| AppError::unauthorized("登录已失效或密钥无效")),
     }
 }
@@ -4296,15 +4356,44 @@ fn anthropic_thinking(model: &str, effort: Option<&str>) -> Option<serde_json::V
     None
 }
 
+/// 客户端拨的档位 → 发给上游的 `output_config.effort`。
+///
+/// **封顶那条规则是一条从未被验证过的推断。** 原注释说「这是转卖渠道不是 Anthropic 直连，
+/// 它不认识的 effort 词会返回空 completion 而不是干净的 400」，于是把 high / xhigh / max
+/// 一律改写成 "high"。翻遍两个仓库（src/ docs/ scripts/ migrations/ prompts/ 和全部测试）
+/// 没有任何一次真实探测记录——客户端和网关各写了一条同样意思的注释、互相引用，谁也没
+/// 真打过那一枪。而 250 行之上的实测记录（上游 polly.modelbridge.cc 原样回传了 Anthropic
+/// 自己的 400 文案）恰恰说明这条线路会转发真实错误体，而不是吞掉未知字段。
+///
+/// 代价是实打实的：`high` 正是这一族的 API 默认值，等于 IDE 上最深的那一档发出去的东西
+/// 和什么都不发一模一样——深度旋钮在这条线路上是个摆设。而参照实现（opencode）跑的正是
+/// xhigh，Anthropic 自己也把 xhigh 列为编码/agentic 任务的推荐档、Claude Code 的默认档。
+///
+/// 所以不写死成"信"或"不信"：`passthrough=false`（默认）保持旧行为，一行流量都不变；
+/// 管理员对某条线路打开它，试一次就知道上游认不认，不认就关回去，不用改代码重新发版。
+fn anthropic_effort_word(requested: &str, passthrough: bool) -> &'static str {
+    match (requested, passthrough) {
+        ("low", _) => "low",
+        ("high", _) => "high",
+        // 只有这两个档位受封顶影响——它们是 `high` 之上的两级。
+        ("xhigh", true) => "xhigh",
+        ("max", true) => "max",
+        ("xhigh", false) | ("max", false) => "high",
+        _ => "medium",
+    }
+}
+
 /// OpenAI /chat/completions body → Anthropic /v1/messages body.
 #[cfg(test)]
+
 fn oai_to_anthropic(body: &serde_json::Value) -> Result<serde_json::Value, String> {
-    oai_to_anthropic_with_cache(body, true)
+    oai_to_anthropic_with_cache(body, true, false)
 }
 
 fn oai_to_anthropic_with_cache(
     body: &serde_json::Value,
     prompt_cache: bool,
+    effort_passthrough: bool,
 ) -> Result<serde_json::Value, String> {
     let mut system_parts: Vec<serde_json::Value> = Vec::new();
     let mut messages: Vec<serde_json::Value> = Vec::new();
@@ -4474,12 +4563,13 @@ fn oai_to_anthropic_with_cache(
         // "max" deeper than "high" is more max_tokens room for adaptive thinking to stretch.
         // Without this the top UI dial is a no-op. Gated by effort so low/medium stay lean;
         // weak/fast models never reach here (thinking is None for haiku/3.5/non-Claude).
-        // `xhigh` sits between high and max on Anthropic's ladder, and the effort mapping below
-        // collapses it to "high" for this route — so it has to land on high's headroom too.
-        // Falling through to the 32000 default made the second-deepest dial shallower than the
-        // one under it, which is the one thing a depth control must never do.
+        // `xhigh` sits between high and max on Anthropic's ladder. 封顶开着的时候它被折成
+        // "high"，就得拿 high 的余量（掉到 32000 会让第二深的档比它下面那档还浅——一个深度
+        // 控件最不能出的错）；封顶关掉、xhigh 真的发出去了，它就该拿到 high 和 max 之间的
+        // 余量，否则"更深的思考"配上"更小的写作空间"，深度会被输出上限反过来卡住。
         let floor = match effort {
             Some("max") => 64000,
+            Some("xhigh") if effort_passthrough => 52000,
             Some("high") | Some("xhigh") => 40000,
             _ => 32000,
         };
@@ -4507,18 +4597,10 @@ fn oai_to_anthropic_with_cache(
         // 是要了思考却没告诉它想多深。
         if t.get("type").and_then(|v| v.as_str()) == Some("adaptive") {
             if let Some(e) = effort.filter(|e| !e.is_empty() && *e != "off") {
-                // Cap at "high". The max_tokens floor above already documents the contract:
-                // both "high" and "max" send effort="high", and "max" is made deeper by MORE
-                // ROOM (64k vs 40k), not by a bigger effort word. Passing "xhigh"/"max" through
-                // literally is not safe here — this route is a reseller, not Anthropic direct,
-                // and an effort value it does not accept comes back as an empty completion
-                // rather than a clean 400.
-                let eff = match e {
-                    "low" => "low",
-                    "high" | "xhigh" | "max" => "high",
-                    _ => "medium",
-                };
-                out.insert("output_config".into(), json!({ "effort": eff }));
+                out.insert(
+                    "output_config".into(),
+                    json!({ "effort": anthropic_effort_word(e, effort_passthrough) }),
+                );
             }
         }
     }
@@ -5215,7 +5297,7 @@ pub async fn audio_transcriptions(
     .await?
     {
         Some(u) => u,
-        None => crate::auth::user_from_jwt(&state.cfg, &token)
+        None => crate::auth::user_from_jwt(&state.db, &state.cfg, &token).await
             .ok_or_else(|| AppError::unauthorized("登录已失效或密钥无效"))?,
     };
     // Transcription burns a paid third-party key. Identity alone is not enough —
@@ -5339,7 +5421,7 @@ pub async fn chat_completions(
             u
         }
         // Also accept the login JWT directly (the IDE authenticates with it).
-        None => crate::auth::user_from_jwt(&state.cfg, &token)
+        None => crate::auth::user_from_jwt(&state.db, &state.cfg, &token).await
             .ok_or_else(|| AppError::unauthorized("登录已失效或密钥无效"))?,
     };
 
@@ -5701,7 +5783,11 @@ pub async fn chat_completions(
                 format!("{}/chat/completions", api_base(&candidate.base_url))
             };
             let mut candidate_upstream_body = if candidate_anthropic {
-                match oai_to_anthropic_with_cache(&body, route_supports_prompt_cache(candidate)) {
+                match oai_to_anthropic_with_cache(
+                    &body,
+                    route_supports_prompt_cache(candidate),
+                    candidate.effort_passthrough,
+                ) {
                     Ok(v) => v,
                     Err(err) => {
                         err_status = 400;
@@ -6512,7 +6598,7 @@ pub async fn responses_proxy(
                 .await;
             u
         }
-        None => crate::auth::user_from_jwt(&state.cfg, &token)
+        None => crate::auth::user_from_jwt(&state.db, &state.cfg, &token).await
             .ok_or_else(|| AppError::unauthorized("登录已失效或密钥无效"))?,
     };
 
@@ -6683,9 +6769,11 @@ pub async fn responses_proxy(
             return Err(AppError {
                 status: StatusCode::BAD_GATEWAY,
                 msg: format!(
+                    // 过一遍脱敏：msg 来自 reqwest 的 Display，末尾会带 ` for url (上游主机…)`，
+                    // 而 502 不在 error.rs 的脱敏范围里，等于把上游是谁告诉每个登录用户。
                     "【{model_id}】responses 上游不可用 ({}): {}",
                     st,
-                    msg.chars().take(200).collect::<String>()
+                    safe_upstream_error_excerpt(&msg.to_lowercase())
                 ),
             });
         }
@@ -6794,7 +6882,7 @@ pub async fn image_generations(
                 .await;
             u
         }
-        None => crate::auth::user_from_jwt(&state.cfg, &token)
+        None => crate::auth::user_from_jwt(&state.db, &state.cfg, &token).await
             .ok_or_else(|| AppError::unauthorized("登录已失效或密钥无效"))?,
     };
 
@@ -6910,8 +6998,9 @@ pub async fn image_generations(
                 return Err(AppError {
                     status: StatusCode::BAD_GATEWAY,
                     msg: format!(
+                        // 同上：last_err 是 reqwest 报错原文，直接回给用户会带出上游主机。
                         "【{model_id}】生图上游不可用: {}",
-                        last_err.chars().take(200).collect::<String>()
+                        safe_upstream_error_excerpt(&last_err.to_lowercase())
                     ),
                 });
             }
@@ -7015,7 +7104,8 @@ pub async fn image_generations(
 #[cfg(test)]
 mod billing_tests {
     use super::{
-        anthropic_beta_header, anthropic_thinking, anthropic_to_oai, chat_upstream_attempt_suffix,
+        anthropic_beta_header, anthropic_effort_word, anthropic_thinking, anthropic_to_oai,
+        oai_to_anthropic_with_cache, chat_upstream_attempt_suffix,
         chat_upstream_retry_base_delay_ms, claude_generation, clip_thinking_budget, compute_cost,
         is_image_gen_model, official_max_output,
         mark_thinking_clip, model_price_override, oai_to_anthropic, official_price,
@@ -8292,21 +8382,84 @@ mod billing_tests {
         );
     }
 
+    /// 同一个请求体，只改 effort_passthrough 这一个开关。
+    fn dial(eff: &str, passthrough: bool) -> serde_json::Value {
+        oai_to_anthropic_with_cache(
+            &json!({"model": "claude-opus-5", "reasoning_effort": eff, "messages": []}),
+            true,
+            passthrough,
+        )
+        .unwrap()
+    }
+    fn headroom(eff: &str, passthrough: bool) -> i64 {
+        dial(eff, passthrough)["max_tokens"].as_i64().unwrap()
+    }
+    fn effort_word(eff: &str, passthrough: bool) -> String {
+        dial(eff, passthrough)["output_config"]["effort"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    }
+
     #[test]
     fn the_second_deepest_dial_is_not_shallower_than_the_one_below_it() {
-        // `xhigh` collapses to effort=high on this route, so it must land on high's max_tokens
-        // headroom too. It fell through to the 32000 default, making it shallower than `high`.
-        let headroom = |eff: &str| {
-            oai_to_anthropic(&json!({
-                "model": "claude-opus-5", "reasoning_effort": eff, "messages": []
-            }))
-            .unwrap()["max_tokens"]
-                .as_i64()
-                .unwrap()
-        };
-        assert!(headroom("low") <= headroom("high"));
-        assert_eq!(headroom("xhigh"), headroom("high"));
-        assert!(headroom("max") > headroom("high"));
+        // 封顶开着时 `xhigh` 被折成 effort=high，所以它必须落在 high 的 max_tokens 余量上。
+        // 掉回 32000 默认值会让第二深的档比它下面那档还浅。
+        assert!(headroom("low", false) <= headroom("high", false));
+        assert_eq!(headroom("xhigh", false), headroom("high", false));
+        assert!(headroom("max", false) > headroom("high", false));
+        // 直通打开之后梯子必须是**严格单调**的：深一档不能比浅一档写得少。
+        assert!(headroom("low", true) <= headroom("high", true));
+        assert!(headroom("xhigh", true) > headroom("high", true));
+        assert!(headroom("max", true) > headroom("xhigh", true));
+    }
+
+    /// 封顶默认必须保持旧行为——升级不改变任何现有流量。
+    #[test]
+    fn the_effort_ceiling_is_on_by_default_and_unchanged() {
+        for eff in ["high", "xhigh", "max"] {
+            assert_eq!(effort_word(eff, false), "high", "{eff} 在默认配置下应当被折成 high");
+        }
+        assert_eq!(effort_word("low", false), "low");
+        assert_eq!(effort_word("medium", false), "medium");
+        // 老的两参数便捷包装（测试用）默认也是封顶的。
+        assert_eq!(
+            oai_to_anthropic(&json!({"model":"claude-opus-5","reasoning_effort":"max","messages":[]}))
+                .unwrap()["output_config"]["effort"],
+            json!("high")
+        );
+    }
+
+    /// 线路上打开直通后，用户拨的档位才真的到达模型。
+    ///
+    /// 这一条才是「思考深度和假的一样」的正解：`high` 是这一族的 API 默认值，封顶开着的
+    /// 时候，IDE 上最深的那一档发出去的东西和什么都不发一模一样。
+    #[test]
+    fn passthrough_lets_the_deepest_dials_actually_reach_the_model() {
+        assert_eq!(effort_word("xhigh", true), "xhigh");
+        assert_eq!(effort_word("max", true), "max");
+        // 直通只影响 high 之上的两级，浅档一个字都不变。
+        for eff in ["low", "medium", "high"] {
+            assert_eq!(effort_word(eff, true), effort_word(eff, false), "{eff} 不该受直通影响");
+        }
+    }
+
+    #[test]
+    fn the_effort_word_mapping_is_total_and_never_invents_a_tier() {
+        // 认识的档位只有这几个；别的一律落到 medium，不能把未知的词原样发出去。
+        for (input, want_off, want_on) in [
+            ("low", "low", "low"),
+            ("medium", "medium", "medium"),
+            ("high", "high", "high"),
+            ("xhigh", "high", "xhigh"),
+            ("max", "high", "max"),
+            ("minimal", "medium", "medium"),
+            ("garbage", "medium", "medium"),
+            ("", "medium", "medium"),
+        ] {
+            assert_eq!(anthropic_effort_word(input, false), want_off, "封顶: {input}");
+            assert_eq!(anthropic_effort_word(input, true), want_on, "直通: {input}");
+        }
     }
 
     #[test]
@@ -11266,6 +11419,58 @@ mod route_disable_tests {
 mod upstream_message_tests {
     use super::*;
 
+    /// 上游报错回给用户之前，主机名和凭据都必须消失。
+    ///
+    /// 每一条都对应一个真实形状：reqwest 的 `Display` 会追加 ` for url (…)`；OpenAI 的
+    /// `sk-`、Google 的 `AIza`、以及没有任何前缀的长 token。health.rs 专门为「base_url 不该
+    ///出现在登录用户能看到的地方」配了断言，这里守的是同一条线在错误路径上不被绕过。
+    #[test]
+    fn upstream_errors_never_carry_the_host_or_a_key() {
+        let cases = [
+            "error sending request for url (https://api.upstream-vendor.com/v1/chat/completions)",
+            "connect error http://10.0.0.7:8080/v1/models",
+            "invalid api key sk-proj-AbCdEf0123456789AbCdEf0123456789",
+            "unauthorized: aizasyd-1234567890abcdefghijklmnop",
+            "bad token bearer eyjhbgciOiJIUzI1NiIsInR5cCI6IkpXVCJ9",
+            "denied 4f2a91c30000111122223333444455556666",
+        ];
+        for raw in cases {
+            let out = safe_upstream_error_excerpt(&raw.to_lowercase());
+            assert!(
+                !out.contains("http://") && !out.contains("https://"),
+                "URL 泄露了: {out}"
+            );
+            assert!(!out.contains("upstream-vendor"), "上游主机名泄露了: {out}");
+            assert!(!out.contains("10.0.0.7"), "上游地址泄露了: {out}");
+            assert!(!out.contains("sk-proj-a"), "密钥泄露了: {out}");
+            assert!(!out.contains("aizasyd-1"), "密钥泄露了: {out}");
+            assert!(
+                !out.contains("eyjhbgci") && !out.contains("4f2a91c30000"),
+                "长 token 泄露了: {out}"
+            );
+        }
+    }
+
+    /// 一句话里有两个密钥，两个都要处理 —— 原来只替换第一处。
+    #[test]
+    fn every_occurrence_is_redacted_not_just_the_first() {
+        let out = safe_upstream_error_excerpt(
+            "sk-aaaa1111bbbb2222cccc failed then sk-dddd3333eeee4444ffff also failed",
+        );
+        assert!(!out.contains("sk-aaaa1111"), "第一个没脱敏: {out}");
+        assert!(!out.contains("sk-dddd3333"), "第二个没脱敏: {out}");
+    }
+
+    /// 脱敏不能把话说没了 —— 用户还得知道大概是什么问题。
+    #[test]
+    fn the_human_readable_part_survives() {
+        let out = safe_upstream_error_excerpt(
+            "rate limit exceeded for url (https://api.vendor.com/v1/chat)",
+        );
+        assert!(out.contains("rate limit exceeded"), "有用的部分被删掉了: {out}");
+    }
+
+
     /// 上游用中文报余额不足时，必须被认出来 —— 而不是压成"上游暂时不可用"。
     ///
     /// 线上真实报文（2026-08-05，claude-sonnet-5 → changhuai.ai）：
@@ -11408,4 +11613,5 @@ mod model_group_tests {
             "分组改的是所有用户看到的模型列表，必须是管理员",
         );
     }
+
 }

@@ -797,12 +797,33 @@ test("every tier the model card offers is a tier the request can carry", () => {
   // 400. An off button would be a tier that cannot exist.
   assert.match(profile, /const _alwaysThinks = \/fable\|mythos\/\.test\(s\);/);
 
-  // `xhigh` is absent on purpose, and the reason is the route rather than the model. Whatever the
-  // reason, the gateway must not leave it shallower than the tier below it.
+  // `xhigh` 在 Claude 这一族的档位里仍然缺席，但**理由变了**，所以断言也得跟着变。
+  //
+  // 以前的理由是「这条路是转卖渠道，它不认识的 effort 词会返回空 completion」——那是一条
+  // 从未被真实探测验证过的推断，两个仓库各写了一条同样意思的注释、互相引用。
+  // 现在网关把封顶做成了每条线路可配的开关（models.rs 的 anthropic_effort_word +
+  // models 表的 effort_passthrough 列），默认关着 = 保持旧行为。
+  //
+  // 所以这里要钉的是：**开关默认关着的时候，前端不能摆一个到不了模型的按钮**。
+  // 等某条线路真的把直通打开、确认上游认这个词了，再把按钮和这条断言一起改。
   const RS = fs.readFileSync("../server/src/models.rs", "utf8");
+  assert.match(RS, /fn anthropic_effort_word\(requested: &str, passthrough: bool\)/,
+    "封顶必须是可配的函数，不能又写回硬编码 match");
+  assert.match(RS, /\("xhigh", false\) \| \("max", false\) => "high",/,
+    "默认（passthrough=false）必须仍然封顶在 high —— 升级不改变任何现有流量");
+  assert.match(RS, /\("xhigh", true\) => "xhigh",/, "直通打开时 xhigh 要真的发出去");
+  // 深度梯子在两种配置下都不能倒挂：更深的档不能拿到更小的输出余量。
+  assert.match(RS, /Some\("xhigh"\) if effort_passthrough => 52000,/);
   assert.match(RS, /Some\("high"\) \| Some\("xhigh"\) => 40000,/);
   const claudeLevels = profile.match(/levels: _alwaysThinks \? \[[^\]]*\] : \[[^\]]*\]/)[0];
-  assert.doesNotMatch(claudeLevels, /xhigh/, "no button for a level this route cannot carry");
+  assert.doesNotMatch(claudeLevels, /xhigh/, "直通默认关着，就不该摆一个到不了模型的按钮");
+
+  // 反过来：走 OpenAI 协议透传的那一族（gpt-5.6）网关一个字都不改，xhigh 是真的能到模型的，
+  // 所以那边不但要有按钮，默认就该是 xhigh —— 参照实现（opencode / Claude Code）也是这么设的。
+  const gpt56 = SRC.slice(SRC.indexOf('gpt[-_.]?5\\.6'), SRC.indexOf('gpt[-_.]?5\\.6') + 900);
+  assert.match(gpt56, /levels:\s*\[[^\]]*"xhigh"[^\]]*\]/);
+  assert.match(gpt56, /defaultLevel:\s*"xhigh"/,
+    "gpt-5.6 走透传线路，默认停在 high 等于让不动转盘的人永远浅一档");
 
   // The old hint said the dial only moved output headroom and timeouts. It sends effort.
   assert.doesNotMatch(profile, /档位只影响输出余量与超时分级/);
