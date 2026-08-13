@@ -672,7 +672,8 @@ test("思考深度必须真的到达模型：三条链路一条都不能断", ()
   // 1) gpt-5.6 走的是 protocol="openai" 的透传线路，网关不改 reasoning_effort，
   //    所以 xhigh 是真的能到模型的。默认停在 high 等于让不动转盘的人永远浅一档——
   //    线上三天 44 次请求里 xhigh 零次，用户拿 opencode 跑同一个模型用的正是 xhigh。
-  const gpt56 = main.slice(main.indexOf("gpt[-_.]?5\\.6"), main.indexOf("gpt[-_.]?5\\.6") + 900);
+  // 窗口要够宽：这一段的注释里记着实测数据，窄了会把 defaultLevel 切在外面。
+  const gpt56 = main.slice(main.indexOf("gpt[-_.]?5\\.6"), main.indexOf("gpt[-_.]?5\\.6") + 2000);
   assert.match(gpt56, /levels:\s*\[[^\]]*"xhigh"[^\]]*\]/, "gpt-5.6 的档位里必须有 xhigh");
   assert.match(gpt56, /defaultLevel:\s*"xhigh"/, "gpt-5.6 的默认档位必须是 xhigh，不是 high");
 
@@ -693,4 +694,48 @@ test("思考深度必须真的到达模型：三条链路一条都不能断", ()
   }
   assert.ok(routed.indexOf("delete config[k]") < routed.indexOf("Object.assign(config, routed)"),
     "必须先清再合，顺序反了等于没清");
+});
+
+test("两条线路的思考档位一真一假，代码里必须分开处理", () => {
+  const main = readFileSync(new URL("../src/main.js", import.meta.url), "utf8");
+  const rs = readFileSync(new URL("../../server/src/models.rs", import.meta.url), "utf8");
+
+  // 2026-08-13 对真实上游实测：
+  //   GPT 线路（protocol=openai，网关透传）—— 乱填的 effort 被拒
+  //     （level "zzzz" not supported），low/medium 的输出量只有 high 的一半：档位是真的。
+  //   Claude 线路（protocol=anthropic，网关翻译）—— banana / ULTRA / 12345 全部 200
+  //     正常返回，high 之上没有任何梯度：档位是假的。
+  // 同一个 "xhigh" 在两条线路上一真一假，所以只能分开处理——这条守卫钉的就是这个区分。
+
+  // GPT：既然是真档位，就要有按钮、而且默认就该是它。
+  const gpt56 = main.slice(main.indexOf("gpt[-_.]?5\\.6"), main.indexOf("gpt[-_.]?5\\.6") + 1600);
+  assert.match(gpt56, /levels:\s*\[[^\]]*"xhigh"[^\]]*\]/);
+  assert.match(gpt56, /defaultLevel:\s*"xhigh"/);
+
+  // Claude：既然是假档位，就不能摆按钮——摆了就是用户抱怨的那个"和假的一样"。
+  const claudeLevels = main.match(/levels: _alwaysThinks \? \[[^\]]*\] : \[[^\]]*\]/)[0];
+  assert.doesNotMatch(claudeLevels, /xhigh/, "Claude 线路上 xhigh 不是真档位，不该有按钮");
+  assert.match(rs, /\("xhigh", false\) \| \("max", false\) => "high",/, "网关默认仍要封顶");
+
+  // 实测结论必须留在代码里，否则下一个人会照着文档把按钮加回去——这正是上一轮
+  // 「转卖渠道会返回空 completion」那条没人验证过的推断留下的教训。
+  assert.match(rs, /banana/, "网关注释里要留着控制组的实测数据");
+  assert.match(gpt56, /valid levels/, "客户端注释里要留着上游报错的原文");
+});
+
+test("思考量在两条线路上都有东西可显示", () => {
+  const main = readFileSync(new URL("../src/main.js", import.meta.url), "utf8");
+  const ai = readFileSync(new URL("../src-tauri/src/ai.rs", import.meta.url), "utf8");
+  const rs = readFileSync(new URL("../../server/src/models.rs", import.meta.url), "utf8");
+
+  // Anthropic 不单独报思考 token（算进 output_tokens），GPT 那条上游实测也不报
+  // completion_tokens_details.reasoning_tokens。两条路都没数 → 那半句永远不显示。
+  // 网关本来就在逐帧数思考字符（原本只进遥测日志），把它一并报上来。
+  assert.match(rs, /"thinking_chars": self\.thinking_telemetry\.thinking_utf8_chars/,
+    "网关要把已经数出来的思考字符报给客户端");
+  assert.match(ai, /thinking_chars: u32/, "桌面传输层要带这个字段");
+  assert.match(ai, /usage\["thinking_chars"\]/, "桌面侧要解析它");
+  assert.match(main, /thinking_chars: Number\(u\.thinking_chars\)/, "网页传输层也要带");
+  assert.match(main, /_lastThinkChars \? ` · 思考 \$\{k\(_lastThinkChars\)\} 字`/,
+    "没有 token 数时要退回字符数，不能只剩一个光秃秃的档位名");
 });

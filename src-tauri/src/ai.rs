@@ -299,6 +299,10 @@ pub enum AiEvent {
         /// 抱怨里有一半是这么来的：不是没生效，是没有任何东西证明它生效了。
         /// 0 表示上游没报这个数（≠ 一定没思考）。
         reasoning_tokens: u32,
+        /// 网关在 Anthropic 线路上补的思考**字符**数。那条路的上游根本不报思考 token
+        /// （思考算进 output_tokens），所以 reasoning_tokens 恒为 0；字符数是那边唯一
+        /// 真实可核对的思考量。两个数各显示各的，前端不拿它冒充 token。
+        thinking_chars: u32,
     },
     Error {
         message: String,
@@ -2638,6 +2642,7 @@ async fn ai_chat_inner(
                     .or_else(|| usage["output_tokens_details"]["reasoning_tokens"].as_u64())
                     .or_else(|| usage["reasoning_tokens"].as_u64())
                     .unwrap_or(0);
+                let thinking_chars = usage["thinking_chars"].as_u64().unwrap_or(0);
                 if prompt > 0 || completion > 0 {
                     let _ = on_event.send(AiEvent::Usage {
                         prompt_tokens: prompt as u32,
@@ -2645,6 +2650,7 @@ async fn ai_chat_inner(
                         cached_tokens: cached as u32,
                         cache_creation_tokens: cache_creation as u32,
                         reasoning_tokens: reasoning as u32,
+                        thinking_chars: thinking_chars as u32,
                     });
                 }
             }
