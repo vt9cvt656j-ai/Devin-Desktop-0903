@@ -4358,19 +4358,38 @@ fn anthropic_thinking(model: &str, effort: Option<&str>) -> Option<serde_json::V
 
 /// 客户端拨的档位 → 发给上游的 `output_config.effort`。
 ///
-/// **封顶那条规则是一条从未被验证过的推断。** 原注释说「这是转卖渠道不是 Anthropic 直连，
-/// 它不认识的 effort 词会返回空 completion 而不是干净的 400」，于是把 high / xhigh / max
-/// 一律改写成 "high"。翻遍两个仓库（src/ docs/ scripts/ migrations/ prompts/ 和全部测试）
-/// 没有任何一次真实探测记录——客户端和网关各写了一条同样意思的注释、互相引用，谁也没
-/// 真打过那一枪。而 250 行之上的实测记录（上游 polly.modelbridge.cc 原样回传了 Anthropic
-/// 自己的 400 文案）恰恰说明这条线路会转发真实错误体，而不是吞掉未知字段。
+/// ## 封顶该不该在——2026-08-13 实测过了，结论是「该在，但原来的理由是错的」
 ///
-/// 代价是实打实的：`high` 正是这一族的 API 默认值，等于 IDE 上最深的那一档发出去的东西
-/// 和什么都不发一模一样——深度旋钮在这条线路上是个摆设。而参照实现（opencode）跑的正是
-/// xhigh，Anthropic 自己也把 xhigh 列为编码/agentic 任务的推荐档、Claude Code 的默认档。
+/// 原注释说「这是转卖渠道不是 Anthropic 直连，它不认识的 effort 词会返回**空 completion**
+/// 而不是干净的 400」。这条推断在两个仓库里各写了一份、互相引用，谁也没真打过那一枪。
+/// 现在打了：对 zyz 上游的 claude-opus-5 逐个发 `output_config.effort`，同一道题、
+/// 非流式、只看返回：
 ///
-/// 所以不写死成"信"或"不信"：`passthrough=false`（默认）保持旧行为，一行流量都不变；
-/// 管理员对某条线路打开它，试一次就知道上游认不认，不认就关回去，不用改代码重新发版。
+/// ```text
+///   effort=low     HTTP 200  思考 34 字符      ← 明显更浅
+///   effort=medium  HTTP 200  思考 114 字符
+///   effort=high    HTTP 200  思考 114 字符
+///   effort=xhigh   HTTP 200  思考 141 字符
+///   effort=max     HTTP 200  思考 142 字符
+///   effort=banana  HTTP 200  思考 114 字符     ← 控制组
+///   effort=ULTRA   HTTP 200  思考 161 字符     ← 控制组
+///   effort=12345   HTTP 200  思考 365 字符     ← 控制组，比 xhigh 还"深"
+/// ```
+///
+/// 没有一个返回空 completion，也没有一个返回 400 —— 原来的理由是错的。
+/// 但结论反过来更硬：**`banana` 和 `high` 一模一样，`12345` 比 `xhigh` 还"深"**。
+/// 这条上游对未知的 effort 值是「照收不误、一概不理」，把 low 之外的所有值都落到同一个
+/// 默认档上，档位之间那点差异是采样噪声。换一道难题复测同样如此（low 3585 字符，
+/// high 8858、xhigh 8303、max 4286——顺序都不单调）。
+///
+/// 也就是说：**在这条线路上 xhigh 不是一个真档位。** 把它透传过去不会更深，只会在转盘上
+/// 多摆一个不起作用的位置——那正是用户抱怨的「思考深度和假的一样」，不是它的解药。
+/// 所以封顶保留，而且现在是有实测支撑的保留。
+///
+/// 那为什么还留着开关：换一条**直连 Anthropic** 的线路（或上游哪天真的支持了），
+/// 这段代码就不该拦着。开关默认关，管理员换线路时打开、按上面那套控制组复测一遍
+/// （关键是 banana 那一组必须报错或明显不同，否则就是又一个假档位），再决定开不开。
+/// 前端的 xhigh 按钮也得等这个开关真的打开、且复测通过之后再加。
 fn anthropic_effort_word(requested: &str, passthrough: bool) -> &'static str {
     match (requested, passthrough) {
         ("low", _) => "low",
@@ -4382,6 +4401,7 @@ fn anthropic_effort_word(requested: &str, passthrough: bool) -> &'static str {
         _ => "medium",
     }
 }
+
 
 /// OpenAI /chat/completions body → Anthropic /v1/messages body.
 #[cfg(test)]
@@ -5244,6 +5264,14 @@ impl AnthSse {
             "cache_read_input_tokens": self.cache_read, "cache_creation_input_tokens": self.cache_create,
             "prompt_tokens": self.input_tokens, "completion_tokens": self.output_tokens,
             "total_tokens": self.input_tokens + self.output_tokens,
+            // Anthropic 不单独报思考 token —— 思考算在 output_tokens 里，没有
+            // completion_tokens_details 这一层。于是 IDE 那半句「思考 高 · 推理 N」在
+            // Claude 线路上永远没数可显示，用户拨了深度看不到任何回执（"和假的一样"）。
+            //
+            // 这里我们**本来就在逐帧数思考字符**（thinking_utf8_chars，原本只进遥测日志）。
+            // 把它一起报上去：字符不是 token，但它是这条线路上唯一真实、可核对的思考量，
+            // 比一个永远不出现的数字有用得多。字段名单独取，别冒充 reasoning_tokens。
+            "thinking_chars": self.thinking_telemetry.thinking_utf8_chars,
         })
     }
     fn usage_is_authoritative(&self) -> bool {

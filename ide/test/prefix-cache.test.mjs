@@ -820,7 +820,8 @@ test("every tier the model card offers is a tier the request can carry", () => {
 
   // 反过来：走 OpenAI 协议透传的那一族（gpt-5.6）网关一个字都不改，xhigh 是真的能到模型的，
   // 所以那边不但要有按钮，默认就该是 xhigh —— 参照实现（opencode / Claude Code）也是这么设的。
-  const gpt56 = SRC.slice(SRC.indexOf('gpt[-_.]?5\\.6'), SRC.indexOf('gpt[-_.]?5\\.6') + 900);
+  // 窗口要够宽：那一段注释里记着 2026-08-13 的实测数据，窄了会把 defaultLevel 切在外面。
+  const gpt56 = SRC.slice(SRC.indexOf('gpt[-_.]?5\\.6'), SRC.indexOf('gpt[-_.]?5\\.6') + 2000);
   assert.match(gpt56, /levels:\s*\[[^\]]*"xhigh"[^\]]*\]/);
   assert.match(gpt56, /defaultLevel:\s*"xhigh"/,
     "gpt-5.6 走透传线路，默认停在 high 等于让不动转盘的人永远浅一档");

@@ -934,6 +934,8 @@ async function _realAiFetch(config, messages, tools, onEvent) {
                 cached_tokens: cached,
                 cache_creation_tokens: cacheWrite,
                 reasoning_tokens: reasoning,
+                // 网关在 Anthropic 线路上补的字段：那条路没有 reasoning_tokens 可报。
+                thinking_chars: Number(u.thinking_chars) || 0,
               });
             }
           }
@@ -14129,15 +14131,24 @@ function _thinkingProfileFor(id) {
         kind: "reasoning_effort",
         configurable: true,
         levels: ["off", "low", "medium", "high", "xhigh", "max"],
-        // 默认 xhigh，不是 high。
+        // 默认 xhigh，不是 high。**2026-08-13 对真实上游实测过**，不是照着文档猜的。
         //
-        // 这一族在 GPT 线路上是 protocol="openai"，网关**原样透传** reasoning_effort
-        // （effort 天花板只存在于 Claude 那条 anthropic 桥里），所以 xhigh 是真的能到模型的。
-        // 但默认停在 high 意味着：不去手动拨那个转盘的人，永远比参照实现浅一档。
-        // 线上三天的遥测：gpt-5.6-sol 共 44 次请求，35 次 high、9 次没带档位，xhigh **零次**——
-        // 转盘上摆着这一档，实际没有一个人用到。用户拿 opencode 跑同一个模型、同一段提示词
-        // 时用的正是 xhigh，"感觉笨笨的"差的就是这一档。
-        // 编码/agent 任务本来就是 xhigh 的适用面，参照实现也把它当默认。
+        // 这一族在 GPT 线路上是 protocol="openai"，网关原样透传 reasoning_effort
+        // （effort 天花板只在 Claude 那条 anthropic 桥里）。直接打上游 zyz：
+        //
+        //   low   输出 929 tok / 22s      xhigh 输出 1695 tok / 40s
+        //   medium 输出 938 tok / 26s     max   输出 2123 tok / 49s
+        //   high  输出 1917 tok / 52s
+        //   zzzz / 12345 → 明确报错：level "zzzz" not supported, valid levels: low, …
+        //
+        // 两件事同时成立：档位是**被校验**的（乱填会被拒，所以 xhigh 确实在合法集里），
+        // 而且深浅**真的有梯度**（low/medium 只有 high 一档的一半输出量）。
+        // 对照之下 Claude 那条线路连 banana 都照收不误、也没有梯度——那边的 xhigh 是假档位，
+        // 所以那边不加按钮。同一个词在两条线路上一真一假，只能分开处理。
+        //
+        // 那为什么要动默认值：线上三天遥测里 gpt-5.6-sol 共 44 次请求，35 次 high、
+        // 9 次没带档位，xhigh **零次**——转盘上摆着这一档，实际没有一个人用到。
+        // 用户拿 opencode 跑同一个模型、同一段提示词时用的正是 xhigh。
         defaultLevel: "xhigh",
         effortMap: { off: "none", low: "low", medium: "medium", high: "high", xhigh: "xhigh", max: "max" },
         hint: t("model.thinking.reason.gpt56"),
@@ -16954,6 +16965,10 @@ const _CONTEXT_RING_DANGER_PCT = 85;
 let _ctxMeter = { prompt: 0, completion: 0, cached: 0, total: 0, pct: 0, limit: 128_000, model: "", estimated: true, source: "idle", anyReal: false };
 let _activeThinkEffort = ""; // this turn's reasoning depth (off/minimal/low/medium/high/xhigh/max) — shown in the meter so the thinking is VISIBLE
 let _lastReasoningTok = 0;   // reasoning tokens the model actually spent (proof it thought)
+// Anthropic 不单独报思考 token（思考算在 output_tokens 里），所以 Claude 线路上
+// _lastReasoningTok 永远是 0。网关改成把它逐帧数出来的思考**字符**一并上报，
+// 这是那条线路上唯一真实可核对的思考量。两个数各显示各的，不互相冒充。
+let _lastThinkChars = 0;
 // Rough token estimate (only used when the provider reports no usage). CJK chars
 // are ~1 token each; ASCII/code is ~4 chars/token — counting them separately is far
 // closer than a flat ratio for mixed Chinese + code. Handles a string or a full
@@ -17248,6 +17263,8 @@ function _recordUsage(ev, opts = {}) {
     const _rt = (ev.completion_tokens_details && ev.completion_tokens_details.reasoning_tokens)
       || ev.reasoning_tokens || ev.reasoningTokens || 0;
     if (_rt) _lastReasoningTok = _rt;
+    const _tc = Number(ev.thinking_chars ?? ev.thinkingChars) || 0;
+    if (_tc) _lastThinkChars = _tc;
     _tok.in += pin; _tok.out += out;
     if (hasCacheInfo) { _tok.cached += cached; _tok.inWithCacheInfo += pin; _tok.anyCacheInfo = true; }
     if (!est) _tok.anyReal = true;
@@ -17662,7 +17679,12 @@ function _renderTokenMeter() {
   // actually buying headroom beyond the window.
   if (tierLimit > state.limit) lines.push(`档位 可留存 ${k(tierLimit)}，压缩后送进 ${k(state.limit)} 窗口`);
   if (_activeThinkEffort && _activeThinkEffort !== "off") {
-    lines.push(`思考 ${_depthLabel[_activeThinkEffort] || _activeThinkEffort}${_lastReasoningTok ? ` · 推理 ${k(_lastReasoningTok)}` : ""}`);
+    // 有 token 数就报 token，没有就报字符数——两个都没有才只显示档位。
+    // 这一行是用户判断"档位到底有没有生效"的唯一依据，不能永远只有一个光秃秃的档位名。
+    const _proof = _lastReasoningTok
+      ? ` · 推理 ${k(_lastReasoningTok)}`
+      : (_lastThinkChars ? ` · 思考 ${k(_lastThinkChars)} 字` : "");
+    lines.push(`思考 ${_depthLabel[_activeThinkEffort] || _activeThinkEffort}${_proof}`);
   }
   if (pct >= 100) lines.push("窗口已满，下一轮会先压缩旧上下文");
   else if (pct >= _CONTEXT_RING_DANGER_PCT) lines.push("接近满载，建议压缩旧上下文");
@@ -23422,6 +23444,7 @@ async function _readyAiConfig(overrideConfig = null) {
   const config = _applyThinkingToConfig(_rawCfg);
   _activeThinkEffort = config.thinkingEffort || config.reasoningEffort || (config.thinkingBudget ? "high" : "off");
   _lastReasoningTok = 0; // reset; gets filled when the model reports reasoning tokens
+  _lastThinkChars = 0;
   if (!config.baseUrl || !config.apiKey) {
     showToast("请先登录账号");
     openLoginDialog();
