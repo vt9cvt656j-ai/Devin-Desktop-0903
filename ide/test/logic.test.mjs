@@ -16089,15 +16089,21 @@ test("命令面板里的工具命令必须打开对应面板，而不是静默�
   // 工作区/远程）点下去全部打开「高级设置」。不报错、不打日志，就是开错面板——比缺功能更伤，
   // 因为缺功能是"还没做"，点了开错东西是"这 IDE 是假的"。
   //
-  // 压在这条回落分支下面的是已经写完、后端也齐备的能力：700 行的任务发现从没被执行过，
-  // 三方合并冲突解决器从没被打开过。
-  const TOOL_TABS = ["tasks", "debugger", "conflicts", "lsp", "workspace", "remote"];
+  // 2026-08-13：所有者把任务运行器 / 调试器 / 合并冲突三个页签下掉了（"没啥用"）。这条测试
+  // 的价值一点没变——**下掉页签就必须同时下掉指向它的命令**，否则那条命令会退回到同一个
+  // 静默回落分支里去。所以这里只把它们移出"必须存在"的名单，下面那条"每个
+  // openFeaturePanel 的目标都必须是登记过的标签"的断言原样保留，它现在正好盯着这件事。
+  const TOOL_TABS = ["lsp", "workspace", "remote"];
+  const REMOVED_TABS = ["tasks", "debugger", "conflicts"];
 
   const tabsSrc = /const FEATURE_TABS = \[([\s\S]*?)\];/.exec(SRC);
   assert.ok(tabsSrc, "找不到 FEATURE_TABS");
   const declared = [...tabsSrc[1].matchAll(/id: "([a-z]+)"/g)].map((m) => m[1]);
   for (const id of TOOL_TABS) {
     assert.ok(declared.includes(id), `FEATURE_TABS 缺 "${id}" —— 命令面板会把它改写成 settings`);
+  }
+  for (const id of REMOVED_TABS) {
+    assert.ok(!declared.includes(id), `"${id}" 已按所有者要求下掉，不该又回到标签条里`);
   }
 
   // 第二张表：每个登记的标签都必须有渲染器。两张表隔着 80 行，加了标签忘了渲染器的结果是
@@ -16128,6 +16134,10 @@ test("命令面板里的工具命令必须打开对应面板，而不是静默�
   // 这条断言要是当初就在，最初那个"6 条命令全开设置"根本活不到今天。
   const targets = [...SRC.matchAll(/openFeaturePanel\("([a-z]+)"\)/g)].map((m) => m[1]);
   assert.ok(targets.length >= 8, `openFeaturePanel 调用点只找到 ${targets.length} 个，正则可能失效了`);
+  // 下掉页签之后，指向它们的调用点必须一起消失——留一个就是一个"点了开错面板"。
+  for (const id of REMOVED_TABS) {
+    assert.ok(!targets.includes(id), `还有 openFeaturePanel("${id}")，但这个页签已经删了`);
+  }
   for (const target of new Set(targets)) {
     assert.ok(declared.includes(target),
       `有代码调用 openFeaturePanel("${target}")，但 FEATURE_TABS 里没有这个 id —— 它会被静默改写成 settings`);
