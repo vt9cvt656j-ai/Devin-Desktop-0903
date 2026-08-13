@@ -15367,14 +15367,17 @@ const _ICON_CAPABILITIES = '<svg viewBox="0 0 24 24" fill="currentColor" aria-hi
 const _ICON_SKILLS = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M2 3h6a4 4 0 0 1 4 4v14a3 3 0 0 0-3-3H2z"/><path d="M22 3h-6a4 4 0 0 0-4 4v14a3 3 0 0 1 3-3h7z"/></svg>';
 const _ICON_MCP = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22v-5"/><path d="M9 8V2"/><path d="M15 8V2"/><path d="M18 8v3a6 6 0 0 1-12 0V8z"/></svg>';
 // 用户规则：一张写着条文的纸。刻意不用"齿轮"——齿轮在这个界面里已经是「设置」的意思了。
+// 用户习惯：一个人 + 一条轨迹。和"规则"那张纸区分开——两项都是用户写的文字，
+// 图标是唯一能一眼分出强弱的地方。
+const _ICON_HABITS = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="7" r="3.2"/><path d="M5.5 20.5a6.5 6.5 0 0 1 13 0"/></svg>';
 const _ICON_RULES = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6"/><path d="M8 13h8"/><path d="M8 17h5"/></svg>';
 {
   const _wrap = document.getElementById("capabilitiesMenuWrap");
   const _capBtn = document.getElementById("capabilitiesBtn");
   const _menu = document.getElementById("capabilitiesMenu");
-  const _skillItem = document.getElementById("capabilitySkillsItem");
+  const _habitsItem = document.getElementById("capabilityHabitsItem");
   const _rulesItem = document.getElementById("capabilityRulesItem");
-  const _items = () => [_skillItem, _rulesItem].filter(Boolean);
+  const _items = () => [_habitsItem, _rulesItem].filter(Boolean);
   /*
    * 状态直接画在行上，不加一行字。
    *
@@ -15385,7 +15388,7 @@ const _ICON_RULES = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" 
    */
   const _paintCapabilityState = () => {
     try {
-      _skillItem?.classList.toggle("is-active", _activeSkillIds.size > 0);
+      _habitsItem?.classList.toggle("is-active", String(_userHabitsText || "").trim().length > 0);
       _rulesItem?.classList.toggle("is-active", String(_userRulesText || "").trim().length > 0);
     } catch {}
   };
@@ -15436,15 +15439,15 @@ const _ICON_RULES = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" 
       _toggleCapabilitiesMenu();
     });
   }
-  if (_skillItem) {
-    const icon = _skillItem.querySelector(".assistant-capability__item-icon");
-    if (icon) icon.innerHTML = _ICON_SKILLS;
-    _skillItem.addEventListener("click", () => { _closeCapabilitiesMenu(); openSkillsPanel(); });
+  if (_habitsItem) {
+    const icon = _habitsItem.querySelector(".assistant-capability__item-icon");
+    if (icon) icon.innerHTML = _ICON_HABITS;
+    _habitsItem.addEventListener("click", () => { _closeCapabilitiesMenu(); void openUserRulesPanel("habits"); });
   }
   if (_rulesItem) {
     const icon = _rulesItem.querySelector(".assistant-capability__item-icon");
     if (icon) icon.innerHTML = _ICON_RULES;
-    _rulesItem.addEventListener("click", () => { _closeCapabilitiesMenu(); void openUserRulesPanel(); });
+    _rulesItem.addEventListener("click", () => { _closeCapabilitiesMenu(); void openUserRulesPanel("rules"); });
   }
   // 窗口大小一变，之前算好的 left 就不对了。菜单开着才重算，关着不做无用功。
   window.addEventListener("resize", () => { if (_menu && !_menu.hidden) _alignCapabilitiesMenu(); });
@@ -22834,31 +22837,53 @@ function _preferredLanguageCode() {
 // 存 `~/.michael-ide/rules.md`（和 mcp.json 同目录，0600）。内存里缓存一份，面板保存后
 // 立刻刷新——不然改完要等下次启动才生效，用户会以为没保存上。
 let _userRulesText = "";
+let _userHabitsText = "";
 let _userRulesLoaded = false;
 const _USER_RULES_MAX = 4_000;   // 软上限：这段每一轮都发，超了截断并在块里说明
 
 async function _refreshUserRules() {
-  if (!inTauri) { _userRulesText = ""; _userRulesLoaded = true; return _userRulesText; }
-  try {
-    const out = await backend.invoke("user_rules_read");
-    _userRulesText = String(out?.text || "");
-  } catch { _userRulesText = ""; }
+  if (!inTauri) { _userRulesText = ""; _userHabitsText = ""; _userRulesLoaded = true; return _userRulesText; }
+  const read = async (kind) => {
+    try { return String((await backend.invoke("user_rules_read", { kind }))?.text || ""); }
+    catch { return ""; }
+  };
+  [_userRulesText, _userHabitsText] = await Promise.all([read("rules"), read("habits")]);
   _userRulesLoaded = true;
   return _userRulesText;
 }
 
-/// 进系统提示词的那一段（没写规则就是空串，一个字节都不占）。
+/// 截断到本轮预算内，超了就说明白（而不是整段丢掉，也不是闷声截断）。
+function _clipUserDoc(text, label) {
+  const value = String(text || "").trim();
+  if (!value) return "";
+  return value.length > _USER_RULES_MAX
+    ? value.slice(0, _USER_RULES_MAX) + `\n…（${label}超出本轮预算，后文已截断——建议精简）`
+    : value;
+}
+
+/// 进系统提示词的那两段（两个都没写就是空串，一个字节都不占）。
+///
+/// **习惯和规则必须措辞不同，否则就是同一个框写两遍。**
+///   · 规则 = 硬约束。违反了就是做错了，没有"这次情况特殊"。
+///   · 习惯 = 他平时怎么干活。默认照做，但任务本身确实需要别的做法时可以让路，
+///     且**要说一声**——不声不响地偏离，用户看到的就是"它没听我的"。
+/// 两者都低于他在**本轮**里的明确指令：长期偏好不该锁死他临时改主意的能力。
 function _userRulesBlock() {
-  const text = String(_userRulesText || "").trim();
-  if (!text) return "";
-  const body = text.length > _USER_RULES_MAX
-    ? text.slice(0, _USER_RULES_MAX) + "\n…（用户规则超出本轮预算，后文已截断——建议精简）"
-    : text;
-  // 说清楚它的来源和权重：用户自己写的长期要求，优先级在项目约定之上（项目约定是团队的，
-  // 这条是他本人的），但仍然低于他在**这一轮**里的明确指令。
-  return "\n\n# 用户规则（这台机器的主人写的长期要求，每一轮都适用）\n"
-    + "优先级：高于项目约定；但如果他在本轮里说了相反的话，听本轮的。\n\n"
-    + body + "\n";
+  const rules = _clipUserDoc(_userRulesText, "用户规则");
+  const habits = _clipUserDoc(_userHabitsText, "用户习惯");
+  if (!rules && !habits) return "";
+  let out = "";
+  if (rules) {
+    out += "\n\n# 用户规则（这台机器的主人定下的硬性要求，每一轮都适用）\n"
+      + "这些是**约束**，不是建议：违反即为做错。优先级高于项目约定（那是团队的，这条是他本人的）；"
+      + "只有他在本轮里明确说了相反的话，才听本轮的。\n\n" + rules + "\n";
+  }
+  if (habits) {
+    out += "\n\n# 用户习惯（他平时的工作方式，每一轮都适用）\n"
+      + "这些是**默认做法**：没有相反理由就照着做。若任务确实需要偏离，可以偏离，"
+      + "但要在回复里说一句为什么——不声不响地偏离，他看到的就是「没听我的」。\n\n" + habits + "\n";
+  }
+  return out;
 }
 
 function _languagePreferenceBlock() {
@@ -27415,15 +27440,36 @@ function _openMcpUrl(url) {
   try { if (backend.taskRunCapture) { backend.taskRunCapture("/", 'open "' + url + '"').catch(() => { try { openExternal(url); } catch {} }); return; } } catch {}
   try { openExternal(url); } catch {}
 }
-/// 用户规则编辑器。一个纯文本框——规则就是给模型看的话，不该套一层表单。
-async function openUserRulesPanel() {
-  const m = _chatToolModal({ title: "用户规则", icon: _ICON_RULES });
-  if (!inTauri) { m.body.innerHTML = `<div class="ctp-empty">用户规则只能在桌面 App 里编辑。</div>`; return; }
+/// 用户习惯 / 用户规则的编辑器。一个纯文本框——这些就是给模型看的话，不该套一层表单。
+/// 两者只有文案和落盘文件不同，共用一个实现，免得改一处忘另一处。
+const _USER_DOC_META = {
+  rules: {
+    title: "用户规则",
+    intro: `你定下的<b>硬性要求</b>，<b>每一轮对话都会带上</b>，换项目也在。`
+      + `这些是约束不是建议——模型会当成必须遵守的条件，只有你在当轮明确说了相反的话才让路。`
+      + `<br>适合放"不许直接推 main""改完必须跑测试再说完成""不要自作主张加依赖"这类底线。`,
+    placeholder: "一行一条，写你的底线。例如：\n\n不要直接 push 到 main。\n改完代码必须先跑测试，测试没过不许说做完了。\n不要自作主张引入新依赖，先问我。",
+  },
+  habits: {
+    title: "用户习惯",
+    intro: `你平时<b>怎么干活</b>，<b>每一轮对话都会带上</b>，换项目也在。`
+      + `这些是默认做法——模型没有相反理由就照着来，确实需要偏离时会先跟你说一声。`
+      + `<br>适合放"我用 pnpm""回答用中文""先给方案再动手""变量名用下划线"这类偏好。`,
+    placeholder: "一行一条，用大白话写。例如：\n\n回答用中文。\n包管理器用 pnpm。\n先给我方案，我点头了再动手。",
+  },
+};
+
+async function openUserRulesPanel(kind = "rules") {
+  const meta = _USER_DOC_META[kind] || _USER_DOC_META.rules;
+  const m = _chatToolModal({ title: meta.title, icon: kind === "habits" ? _ICON_HABITS : _ICON_RULES });
+  if (!inTauri) { m.body.innerHTML = `<div class="ctp-empty">${_escHtml(meta.title)}只能在桌面 App 里编辑。</div>`; return; }
   m.body.innerHTML = `<div class="ctp-loading">加载中…</div>`;
   let path = "";
+  let current = "";
   try {
-    const out = await backend.invoke("user_rules_read");
-    _userRulesText = String(out?.text || "");
+    const out = await backend.invoke("user_rules_read", { kind });
+    current = String(out?.text || "");
+    if (kind === "habits") _userHabitsText = current; else _userRulesText = current;
     _userRulesLoaded = true;
     path = String(out?.path || "");
   } catch (e) {
@@ -27433,15 +27479,14 @@ async function openUserRulesPanel() {
   m.body.innerHTML = "";
   const intro = document.createElement("div");
   intro.className = "ctp-intro";
-  intro.innerHTML = `写给 AI 的长期要求，<b>每一轮对话都会带上</b>，换项目也在。`
-    + `适合放"我一律用 pnpm""回答用中文""改完先跑测试再说完成"这类跟着你走、不跟着项目走的事。`
+  intro.innerHTML = meta.intro
     + `<br>项目自己的约定继续写在仓库的 <code>AGENTS.md</code> / <code>CLAUDE.md</code> 里——那是团队的，这里是你自己的。`
     + (path ? `<br>保存在 <code>${_escHtml(path)}</code>（权限 0600）。` : "");
   const area = document.createElement("textarea");
   area.className = "ctp-textarea";
   area.rows = 14;
-  area.placeholder = "每行一条，直接用大白话写。例如：\n\n回答用中文。\n包管理器一律用 pnpm，不要用 npm。\n改完代码先跑测试，别直接说做完了。";
-  area.value = _userRulesText;
+  area.placeholder = meta.placeholder;
+  area.value = current;
   const foot = document.createElement("div");
   foot.className = "ctp-foot ctp-foot--between";
   const hint = document.createElement("span");
@@ -27460,9 +27505,10 @@ async function openUserRulesPanel() {
   save.addEventListener("click", async () => {
     save.disabled = true; save.textContent = "保存中…";
     try {
-      await backend.invoke("user_rules_save", { text: area.value });
-      _userRulesText = area.value;       // 立刻生效，不用等重启
-      showToast(area.value.trim() ? "用户规则已保存，下一轮对话就会带上" : "已清空用户规则");
+      await backend.invoke("user_rules_save", { text: area.value, kind });
+      // 立刻生效，不用等重启
+      if (kind === "habits") _userHabitsText = area.value; else _userRulesText = area.value;
+      showToast(area.value.trim() ? `${meta.title}已保存，下一轮对话就会带上` : `已清空${meta.title}`);
       m.close();
     } catch (e) {
       save.disabled = false; save.textContent = "保存";

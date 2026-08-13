@@ -1718,7 +1718,7 @@ test("account dropdown keeps logged-in text contained and puts logout at the bot
 test("assistant header groups its capabilities behind one vertical capabilities menu", () => {
   assert.match(INDEX_HTML, /id="capabilitiesBtn"[\s\S]{0,220}aria-haspopup="menu"[\s\S]{0,120}aria-expanded="false"/,
     "assistant header should expose one compact capability menu button");
-  assert.match(INDEX_HTML, /id="capabilitiesMenu"[\s\S]{0,900}id="capabilitySkillsItem"[\s\S]{0,900}id="capabilityRulesItem"/,
+  assert.match(INDEX_HTML, /id="capabilitiesMenu"[\s\S]{0,900}id="capabilityHabitsItem"[\s\S]{0,900}id="capabilityRulesItem"/,
     "两项都要在同一个菜单里选得到");
   assert.doesNotMatch(INDEX_HTML, /id="skillsBtn"|id="mcpBtn"/,
     "old separate Skills/MCP header buttons should not remain visible in markup");
@@ -1726,8 +1726,10 @@ test("assistant header groups its capabilities behind one vertical capabilities 
     "capability entry should use the redesigned vertical three-dot icon");
   assert.match(SRC, /_capBtn\.addEventListener\("click"[\s\S]{0,260}_toggleCapabilitiesMenu\(\)/,
     "capability button should toggle the menu");
-  assert.match(SRC, /_skillItem\.addEventListener\("click", \(\) => \{ _closeCapabilitiesMenu\(\); openSkillsPanel\(\); \}\)/,
-    "Skills menu item should open the existing Skills panel");
+  // 两项都是"用户自己写、AI 要照做"的东西；技能面板列的是磁盘上发现的 SKILL.md，
+  // 不属于这里（高级设置 → Skills 仍可达）。
+  assert.match(SRC, /_habitsItem\.addEventListener\("click"[\s\S]{0,140}openUserRulesPanel\("habits"\)/,
+    "用户习惯那项要打开习惯编辑面板");
   assert.match(SRC, /_rulesItem\.addEventListener\("click"[\s\S]{0,120}openUserRulesPanel/,
     "用户规则那项要打开规则编辑面板");
   assert.match(SRC, /document\.getElementById\("capabilitiesBtn"\); if \(!b\) return;/,

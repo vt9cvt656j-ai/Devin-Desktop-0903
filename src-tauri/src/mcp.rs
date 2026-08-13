@@ -1202,34 +1202,50 @@ fn save_user_config_at(path: &std::path::Path, text: &str) -> Result<String, Str
 // 放在 `~/.michael-ide/rules.md`，和 mcp.json 同一个目录。走独立命令而不是
 // write_text_file_if_unchanged 的理由和那边一样：那条路的 require_inside_workspace
 // 明确拒绝"在 HOME 底下但不在已打开工作区里"的写入，不该为一个文件把那道墙挖开。
-const USER_RULES_FILE: &str = "rules.md";
+/// 用户自己写、每轮都要发给模型的两份文档。
+///
+/// **白名单，不是路径参数。** 调用方只能传 "rules" / "habits" 这两个词，路径由这里拼；
+/// 让前端传路径等于把 HOME 底下任意文件变成可写目标，那正是 require_inside_workspace
+/// 拦着的事。
+fn user_doc_file(kind: &str) -> Result<&'static str, String> {
+    match kind {
+        "rules" => Ok("rules.md"),
+        "habits" => Ok("habits.md"),
+        other => Err(format!("未知的用户文档类型：{other}")),
+    }
+}
 /// 规则是给模型读的，进的是每轮的系统提示词。给个硬上限，避免有人贴进去一整本手册
 /// 之后每轮都在为它付钱——前端另有更小的软上限并会提示。
 const MAX_USER_RULES_BYTES: usize = 64 * 1024;
 
-fn user_rules_path() -> Result<std::path::PathBuf, String> {
-    Ok(home_dir()?.join(USER_CONFIG_DIR).join(USER_RULES_FILE))
+fn user_doc_path(kind: &str) -> Result<std::path::PathBuf, String> {
+    Ok(home_dir()?
+        .join(USER_CONFIG_DIR)
+        .join(user_doc_file(kind)?))
 }
 
-/// 读用户规则。文件不存在就是空串——"还没写过"不是错误。
+/// 读一份用户文档（rules / habits）。文件不存在就是空串——"还没写过"不是错误。
 #[tauri::command]
-pub fn user_rules_read() -> Result<Value, String> {
-    let path = user_rules_path()?;
+pub fn user_rules_read(kind: Option<String>) -> Result<Value, String> {
+    let kind = kind.unwrap_or_else(|| "rules".into());
+    let path = user_doc_path(&kind)?;
     let text = read_capped(&path).unwrap_or_default();
-    Ok(json!({ "path": path.to_string_lossy(), "text": text }))
+    Ok(json!({ "kind": kind, "path": path.to_string_lossy(), "text": text }))
 }
 
 /// 覆盖写用户规则；空内容等于删掉这个文件（而不是留一个空文件让后面的读取多绕一圈）。
 #[tauri::command]
-pub fn user_rules_save(text: String) -> Result<String, String> {
+pub fn user_rules_save(text: String, kind: Option<String>) -> Result<String, String> {
+    let kind = kind.unwrap_or_else(|| "rules".into());
+    let label = if kind == "habits" { "用户习惯" } else { "用户规则" };
     if text.len() > MAX_USER_RULES_BYTES {
         return Err(format!(
-            "用户规则太长（{} 字节，上限 {}）。这段内容每一轮对话都会发给模型。",
+            "{label}太长（{} 字节，上限 {}）。这段内容每一轮对话都会发给模型。",
             text.len(),
             MAX_USER_RULES_BYTES
         ));
     }
-    let path = user_rules_path()?;
+    let path = user_doc_path(&kind)?;
     let dir = path
         .parent()
         .ok_or_else(|| "无法确定配置目录".to_string())?
@@ -1248,7 +1264,7 @@ pub fn user_rules_save(text: String) -> Result<String, String> {
         use std::os::unix::fs::PermissionsExt;
         let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
     }
-    let temp = dir.join(format!("{USER_RULES_FILE}.tmp"));
+    let temp = dir.join(format!("{}.tmp", user_doc_file(&kind)?));
     std::fs::write(&temp, text.as_bytes()).map_err(|e| format!("写入失败：{e}"))?;
     #[cfg(unix)]
     {
@@ -1344,10 +1360,28 @@ mod tests {
     }
 
     #[test]
+    fn user_doc_kind_is_a_whitelist_not_a_path() {
+        // 让调用方传路径 = 把 HOME 底下任意文件变成可写目标。只认这两个词。
+        assert_eq!(user_doc_file("rules").unwrap(), "rules.md");
+        assert_eq!(user_doc_file("habits").unwrap(), "habits.md");
+        for bad in ["", "../../.ssh/id_rsa", "rules.md", "Rules", "habits/../x"] {
+            assert!(user_doc_file(bad).is_err(), "{bad} 不该被接受");
+        }
+    }
+
+    #[test]
+    fn habits_and_rules_are_separate_files() {
+        let a = user_doc_path("rules").unwrap();
+        let b = user_doc_path("habits").unwrap();
+        assert_ne!(a, b, "两份文档必须各自落盘，否则写一个会盖掉另一个");
+        assert!(a.ends_with("rules.md") && b.ends_with("habits.md"));
+    }
+
+    #[test]
     fn user_rules_are_bounded_so_one_paste_cannot_tax_every_turn() {
         // 这段每一轮都发给模型。贴进去一整本手册的话，成本是按轮计的。
         let huge = "x".repeat(MAX_USER_RULES_BYTES + 1);
-        let error = user_rules_save(huge).unwrap_err();
+        let error = user_rules_save(huge, None).unwrap_err();
         assert!(error.contains("太长"), "{error}");
         assert!(error.contains("每一轮"), "报错要说清为什么有上限：{error}");
     }

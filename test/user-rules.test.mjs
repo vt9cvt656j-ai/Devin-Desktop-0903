@@ -29,8 +29,10 @@ function extractFn(name) {
   }
   throw new Error(`unbalanced braces in ${name}`);
 }
+// 规则那一段的便捷桩（习惯留空）。_userRulesBlock 现在同时渲染两份文档，且用到 _clipUserDoc。
 const block = (text, max = 4000) =>
-  new Function("_userRulesText", "_USER_RULES_MAX", `${extractFn("_userRulesBlock")};return _userRulesBlock();`)(text, max);
+  new Function("_userRulesText", "_userHabitsText", "_USER_RULES_MAX",
+    `${extractFn("_clipUserDoc")};${extractFn("_userRulesBlock")};return _userRulesBlock();`)(text, "", max);
 
 test("写了规则就进提示词，原文一字不改", () => {
   const out = block("回答用中文。\n包管理器一律用 pnpm。");
@@ -48,6 +50,7 @@ test("块里要说清它是谁写的、和项目约定谁大", () => {
   const out = block("x");
   assert.match(out, /用户规则/);
   assert.match(out, /高于项目约定/, "不说清优先级，模型碰上冲突只能瞎猜");
+  assert.match(out, /约束/, "规则是硬约束，不是建议");
   assert.match(out, /本轮/, "本轮的明确指令必须能压过长期规则，否则用户改不动主意");
 });
 
@@ -75,12 +78,54 @@ test("保存后立刻生效，不用等重启", () => {
 
 // ── ⋮ 菜单 ────────────────────────────────────────────────────────────────
 
-test("菜单里是「技能」和「用户规则」，MCP 那项已移走", () => {
+test("菜单两项都是「用户自己写、AI 要照做」的东西", () => {
   const shell = fs.readFileSync("src/app/Shell.jsx", "utf8");
-  assert.match(shell, /capabilitySkillsItem/);
+  assert.match(shell, /capabilityHabitsItem/);
   assert.match(shell, /capabilityRulesItem/);
-  assert.ok(!shell.includes("capabilityMcpItem"), "MCP 项已删（高级设置 → MCP 仍可达）");
-  assert.match(SRC, /_rulesItem\.addEventListener\("click"[\s\S]{0,120}openUserRulesPanel/);
+  // 技能面板不属于这里——它列的是磁盘上发现的 SKILL.md，不是用户在这儿写的字。
+  assert.ok(!shell.includes("capabilitySkillsItem"), "技能项已移走（高级设置 → Skills 仍可达）");
+  assert.ok(!shell.includes("capabilityMcpItem"), "MCP 项已移走（高级设置 → MCP 仍可达）");
+  assert.match(SRC, /_habitsItem\.addEventListener\("click"[\s\S]{0,140}openUserRulesPanel\("habits"\)/);
+  assert.match(SRC, /_rulesItem\.addEventListener\("click"[\s\S]{0,140}openUserRulesPanel\("rules"\)/);
+});
+
+// ── 习惯 vs 规则：措辞必须分得开，否则就是同一个框写两遍 ──────────────────
+
+const twoBlocks = (rules, habits, max = 4000) =>
+  new Function("_userRulesText", "_userHabitsText", "_USER_RULES_MAX",
+    `${extractFn("_clipUserDoc")};${extractFn("_userRulesBlock")};return _userRulesBlock();`)(rules, habits, max);
+
+test("规则是硬约束、习惯是默认做法——两段措辞不能一样", () => {
+  const out = twoBlocks("不许推 main", "我用 pnpm");
+  assert.match(out, /不许推 main/);
+  assert.match(out, /我用 pnpm/);
+  // 规则：约束、违反即错
+  const rulesPart = out.slice(out.indexOf("用户规则"), out.indexOf("用户习惯"));
+  assert.match(rulesPart, /约束/);
+  assert.match(rulesPart, /违反/);
+  // 习惯：默认做法、可以偏离但要说
+  const habitsPart = out.slice(out.indexOf("用户习惯"));
+  assert.match(habitsPart, /默认/);
+  assert.match(habitsPart, /偏离/);
+  assert.match(habitsPart, /说一句|说明/, "不声不响地偏离，用户看到的就是「没听我的」");
+});
+
+test("只写了一个的时候，另一个一个字节都不占", () => {
+  const onlyRules = twoBlocks("A", "");
+  assert.match(onlyRules, /用户规则/);
+  assert.ok(!onlyRules.includes("用户习惯"), "没写习惯就不该出现习惯那一段");
+  const onlyHabits = twoBlocks("", "B");
+  assert.match(onlyHabits, /用户习惯/);
+  assert.ok(!onlyHabits.includes("用户规则"), "没写规则就不该出现规则那一段");
+  assert.equal(twoBlocks("", ""), "");
+  assert.equal(twoBlocks("  ", "\n\t "), "");
+});
+
+test("两份文档各自落盘，不会互相覆盖", () => {
+  // 面板、读取、保存都带 kind；漏传的话两个框会写进同一个文件
+  assert.match(SRC, /backend\.invoke\("user_rules_read", \{ kind \}\)/);
+  assert.match(SRC, /backend\.invoke\("user_rules_save", \{ text: area\.value, kind \}\)/);
+  assert.match(SRC, /read\("rules"\), read\("habits"\)/, "启动时两份都要读");
 });
 
 test("对齐算法：宽窗口正居中，贴边时夹进视口，绝不跑出屏幕", () => {
@@ -123,7 +168,7 @@ test("启动时必须读一次用户规则，否则重启后规则一轮都不�
 });
 
 test("菜单打开时把状态画到行上——删掉副标题后这是唯一能看出状态的地方", () => {
-  assert.match(SRC, /_skillItem\?\.classList\.toggle\("is-active", _activeSkillIds\.size > 0\)/);
+  assert.match(SRC, /_habitsItem\?\.classList\.toggle\("is-active", String\(_userHabitsText \|\| ""\)\.trim\(\)\.length > 0\)/);
   assert.match(SRC, /_rulesItem\?\.classList\.toggle\("is-active", String\(_userRulesText \|\| ""\)\.trim\(\)\.length > 0\)/);
   // 必须在菜单显示之前刷，否则第一次打开看到的是上一次的状态
   assert.match(SRC, /_paintCapabilityState\(\); _menu\.hidden = false;/);
@@ -162,26 +207,26 @@ test("菜单收窄变矮，且不再是全应用唯一的两行排版", () => {
 
 test("菜单文案走真正的 i18n 键，不靠启发式翻译；三份字典都齐", () => {
   const shell = fs.readFileSync("src/app/Shell.jsx", "utf8");
-  assert.match(shell, /data-i18n="assistant\.capability\.skills"/);
+  assert.match(shell, /data-i18n="assistant\.capability\.habits"/);
   assert.match(shell, /data-i18n="assistant\.capability\.rules"/);
   // 裸中文文本节点会走 localizeLooseTextNode 的启发式通道——那条路曾经被幻觉翻译污染过。
   const i18n = fs.readFileSync("src/i18n.js", "utf8");
-  for (const key of ["assistant.capability.skills", "assistant.capability.rules"]) {
+  for (const key of ["assistant.capability.habits", "assistant.capability.rules"]) {
     const n = [...i18n.matchAll(new RegExp(`"${key.replace(/\./g, "\\.")}"\\s*:`, "g"))].length;
     assert.equal(n, 3, `${key} 应在 EN/ZH/JA 三份字典里各一条，实际 ${n} 条`);
   }
   // 同名键重复会被后写的覆盖，等于改了个寂寞
   assert.ok(!i18n.includes("assistant.capability.skillsSub"), "副标题的键该随排版一起删掉");
+  assert.ok(!i18n.includes('"assistant.capability.skills"'), "技能项已移出这个菜单，它的键也该走");
   assert.ok(!i18n.includes("assistant.capability.mcpSub"), "MCP 项已移出菜单，它的键也该走");
   // 按钮说明词不能还写着 MCP
   assert.ok(!/capabilities\.open": "[^"]*MCP/.test(i18n), "按钮说明还写着 MCP，但菜单里早就没有了");
 });
 
-test("第一项叫「技能」而不是「全局技能」——那个「全局」是句错话", () => {
-  // 技能面板同时会扫项目目录（_skillDiscoveryBases 走工作区、父仓库、用户目录），
-  // 点进去第一眼就能看见项目技能，「所有项目通用」是假的。
+test("两项的名字是「用户习惯」和「用户规则」", () => {
   const i18n = fs.readFileSync("src/i18n.js", "utf8");
-  assert.match(i18n, /"assistant\.capability\.skills": "技能"/);
-  assert.ok(!i18n.includes("全局技能"), "「全局技能」名不副实");
-  assert.match(SRC, /_skillDiscoveryBases/, "技能发现确实覆盖项目级目录，所以名字不能带「全局」");
+  assert.match(i18n, /"assistant\.capability\.habits": "用户习惯"/);
+  assert.match(i18n, /"assistant\.capability\.rules": "用户规则"/);
+  assert.ok(!i18n.includes("全局技能"), "「全局技能」名不副实（技能发现也覆盖项目目录）");
+  assert.ok(!i18n.includes('"assistant.capability.skills"'), "技能项已移出这个菜单");
 });
