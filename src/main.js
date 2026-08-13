@@ -593,6 +593,13 @@ const _AI_MODEL_RETRY_LIMIT = 10;
 // 一轮里最多从断点续几次。给得少是故意的：连着断三次说明线路真的不通，
 // 这时候继续续传只是把同一个失败拖长，不如把话说清楚交还给用户。
 const _AI_MODEL_RESUME_LIMIT = 3;
+/// 两次重试之间的间隔。
+///
+/// 以前是 0 —— `attemptIndex += 1; continue;` 中间什么都不等，10 次背靠背立刻重发。
+/// 上游正忙不过来的时候，这等于对着一个已经在喘的服务连打十拳：网关日志里那种
+/// "同一个请求 id 每两秒重来一次、连打六小时"就是这么来的（那两秒还只是请求本身的往返，
+/// 不是我们在等）。间隔本身就是治疗——给上游喘一口的时间，比立刻重试更可能成功。
+const _AI_MODEL_RETRY_DELAY_MS = 2_000;
 const _AI_MODEL_ATTEMPT_TIMEOUT_MS = 60_000;
 const _AI_RESPONSE_HEADERS_DEADLINE_MS = _AI_MODEL_ATTEMPT_TIMEOUT_MS;
 const _AI_ERROR_BODY_DEADLINE_MS = 2_000;
@@ -35605,7 +35612,15 @@ async function _runModelRequestWithRetry({
       && _isRetryableAiError(attemptError);
     if (canRetry) {
       const retry = retriesUsed + 1;
-      try { onRetry({ retry, retryLimit: boundedRetryLimit, nextAttempt: attempt + 1, error: attemptError }); } catch {}
+      try { onRetry({ retry, retryLimit: boundedRetryLimit, nextAttempt: attempt + 1, error: attemptError, delayMs: _AI_MODEL_RETRY_DELAY_MS }); } catch {}
+      // 等一下再重发。分片等待是为了「停止」能立刻生效——一次 setTimeout(2000) 会让
+      // 用户按下停止之后还要干等两秒，而且等完还会再发一次。
+      const _until = Date.now() + _AI_MODEL_RETRY_DELAY_MS;
+      while (Date.now() < _until) {
+        if (!isLive()) return { attempts: attempt, cancelled: true, error: "", hadModelProgress, resumes: resumesUsed };
+        await new Promise((r) => setTimeout(r, Math.min(150, _until - Date.now())));
+      }
+      if (!isLive()) return { attempts: attempt, cancelled: true, error: "", hadModelProgress, resumes: resumesUsed };
       attemptIndex += 1;
       continue;
     }

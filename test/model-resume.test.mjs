@@ -32,10 +32,23 @@ const load = async () => {
       need.unshift(m[1]); continue;
     }
     try {
-      // 探针：走一遍"出过内容 → 断线 → 判定能否重试/续传"的完整分支
+      // 探针一：走"出过内容 → 断线 → 判定能否重试/续传"这条分支
       await fn({
         invoke: (cb) => { cb({ kind: "token", delta: "p" }); cb({ kind: "error", message: "connection reset" }); return Promise.resolve(); },
         onEvent: () => {}, buildResumeInvoke: async () => null,
+      });
+      // 探针二：走"还没出字就失败 → 进重试分支"。这条和上面那条**不是同一段代码**——
+      // 重试分支里有自己的依赖（比如两次重试之间的等待间隔），只探上面那条的话，
+      // 缺的依赖会等到真正的测试跑起来才炸成 ReferenceError，而不是在这里被补上。
+      // isLive 按**调用次数**放行，不能在 invoke 里直接置假：invoke 返回之后紧接着就有
+      // 一个 `if (!isLive()) return`，那时候置假就直接返回了，重试分支根本进不去，
+      // 探针等于白探。前三次放行（函数入口 / 循环顶 / invoke 之后），之后返回 false，
+      // 让等待循环立刻退出——分支进得去，又不用真的干等一个间隔。
+      let _probeCalls = 0;
+      await fn({
+        // 用和真实测试同一个错误文案：文案不可重试的话 canRetry 为假，分支同样不进。
+        invoke: (cb) => { cb({ kind: "error", message: "fetch failed" }); return Promise.resolve(); },
+        onEvent: () => {}, isLive: () => ++_probeCalls <= 3, retryLimit: 1,
       });
       return fn;
     } catch (e) {
