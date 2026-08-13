@@ -4976,6 +4976,24 @@ impl AnthSse {
         self.saw_thinking_block && !self.saw_answer_block && self.stop_reason == "stop"
     }
 
+    /// 反过来的那半边丢块：**要了思考，却一个思考字符都没回，正文倒是好好的**。
+    ///
+    /// 上游（zyz 聚合）对 Claude 5 一族这件事是不确定的：同一个请求体、同样
+    /// `thinking:{type:adaptive,display:summarized}`，几分钟内一次回 2000+ 字思考、
+    /// 一次回 0。2026-08-13 的生产遥测里 claude-opus-5 ×2 与 claude-sonnet-5 ×1 都是
+    /// thinking_utf8_chars=0，而同一时段 claude-opus-4-6 是 667；手工连打 6 次又全部
+    /// 正常（934~2608 字）。所以这不是我们发错了参数，是上游在抽签。
+    ///
+    /// 单独把它认出来，是因为**这种响应绝不能进缓存**：它一旦被缓存，接下来一小时里
+    /// 每一个相同请求都会重放这份没有思考的副本——"有时候不返回思考、然后一直不返回、
+    /// 过一阵又好了"里的"一阵"，就是那条 3600 秒的 TTL。
+    ///
+    /// 注意**不要**顺手给这条线路记思考钳位：钳位是把思考预算调低，对"根本没思考"
+    /// 只会更糟。这里只做两件事——不缓存、留一条可统计的日志。
+    fn thinking_requested_but_none_returned(&self) -> bool {
+        self.saw_answer_block && self.thinking_telemetry.thinking_utf8_chars == 0
+    }
+
     fn thinking_telemetry(&self) -> ThinkingStreamTelemetry {
         self.thinking_telemetry
     }
@@ -6362,6 +6380,20 @@ pub async fn chat_completions(
             let relay_dropped_blocks = complete
                 && thinking_clip_probe
                 && conv.as_ref().is_some_and(|c| c.thinking_only_end_turn());
+            // 见 thinking_requested_but_none_returned：要了思考却一个字都没回。
+            // 不记钳位（钳位只会更糟），但绝不让它进缓存。
+            let thinking_went_missing = complete
+                && thinking_clip_probe
+                && conv
+                    .as_ref()
+                    .is_some_and(|c| c.thinking_requested_but_none_returned());
+            if thinking_went_missing {
+                tracing::warn!(
+                    model = %req_model,
+                    route_id = %cid,
+                    "upstream returned no thinking despite an explicit thinking request; not caching this response"
+                );
+            }
             if relay_dropped_blocks {
                 mark_thinking_clip(cid);
                 tracing::warn!(
@@ -6448,7 +6480,7 @@ pub async fn chat_completions(
             // Cache the FULL (OpenAI-shape) stream for identical future requests (only when complete).
             // 中转丢块的坏流（只有思考）绝不缓存：客户端的快速重试请求体逐字节相同，
             // 命中缓存就会拿回同一份坏流，钳位后的重试永远打不到上游。
-            if complete && !relay_dropped_blocks && !acc.is_empty() && acc.len() < 1_000_000 && response_cache_safe(&acc) {
+            if complete && !relay_dropped_blocks && !thinking_went_missing && !acc.is_empty() && acc.len() < 1_000_000 && response_cache_safe(&acc) {
                 let mut rconn = st.redis.clone();
                 let _: Result<(), redis::RedisError> = redis::cmd("SET")
                     .arg(&ckey_task)
@@ -8570,6 +8602,41 @@ mod billing_tests {
         assert!(o["choices"][0]["message"]
             .get("reasoning_content")
             .is_none());
+    }
+
+    /// 反过来那半边：要了思考、正文好好的、思考一个字都没回。
+    ///
+    /// 这种响应绝不能进缓存——缓存 1 小时意味着接下来一小时每个相同请求都重放这份
+    /// 没有思考的副本，用户看到的就是"一直不返回思考，过一阵又好了"。
+    #[test]
+    fn a_stream_that_returns_no_thinking_at_all_is_recognised_and_kept_out_of_cache() {
+        let mut c = AnthSse::new("claude-opus-5");
+        // 正文正常，从头到尾没有 thinking 块 —— 实测上游会这样（同一请求体时好时坏）。
+        let _ = c.push(b"data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n").unwrap();
+        let _ = c.push(b"data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"The bug is reentrancy.\"}}\n\n").unwrap();
+        let _ = c.push(b"data: {\"type\":\"content_block_stop\",\"index\":0}\n\n").unwrap();
+        let _ = c.push(b"data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":42}}\n\n").unwrap();
+        let _ = c.push(b"data: {\"type\":\"message_stop\"}\n\n").unwrap();
+        assert!(c.thinking_requested_but_none_returned(), "有正文、零思考 —— 必须认出来");
+        assert!(!c.thinking_only_end_turn(), "这不是「只有思考」那一种，别和它混了");
+
+        // 对照：思考正常回来的流不能被误判，否则每一条健康响应都进不了缓存。
+        let mut ok = AnthSse::new("claude-opus-5");
+        let _ = ok.push(b"data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"\"}}\n\n").unwrap();
+        let _ = ok.push(b"data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"weighing the lock scope\"}}\n\n").unwrap();
+        let _ = ok.push(b"data: {\"type\":\"content_block_stop\",\"index\":0}\n\n").unwrap();
+        let _ = ok.push(b"data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n").unwrap();
+        let _ = ok.push(b"data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\"Release the lock first.\"}}\n\n").unwrap();
+        let _ = ok.push(b"data: {\"type\":\"content_block_stop\",\"index\":1}\n\n").unwrap();
+        let _ = ok.push(b"data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":42}}\n\n").unwrap();
+        let _ = ok.push(b"data: {\"type\":\"message_stop\"}\n\n").unwrap();
+        assert!(!ok.thinking_requested_but_none_returned(), "健康的流不能被拦在缓存外");
+
+        // 缓存判据里三个条件必须同时出现，少一个这条修复就是空的。
+        let src = include_str!("models.rs");
+        let production = &src[..src.find("mod billing_tests").expect("tests module")];
+        assert!(production.contains("&& !thinking_went_missing &&"), "缓存判据没接上");
+        assert!(production.contains("thinking_requested_but_none_returned()"), "探测没接上");
     }
 
     #[test]
