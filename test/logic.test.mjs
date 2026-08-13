@@ -22838,3 +22838,38 @@ test("重试节奏的三个数字是有意选的，不是碰巧", () => {
   assert.match(AI_RS, /const RESPONSE_HEADERS_TIMEOUT_SECS: u64 = 60;/);
   assert.match(AI_RS, /const STANDARD_FIRST_STREAM_PROGRESS_TIMEOUT_SECS: u64 = 60;/);
 });
+
+// 浮层的叠放次序：模态框必须压过输入框那一片
+//
+// 症状：`/sessions` 打开会话面板，左下角被聊天输入框（模型选择器、麦克风、发送键）盖掉一块，
+// 看着像渲染坏了。原因是 src/ui/components/dialog.jsx 是照 shadcn 原样搬进来的，用的是它默认的
+// `z-50`——那个数字是给"整页最高只有几十层"的站点定的。这个 IDE 不是：`.composer` 就是
+// z-index 60，比它高。app.css 里所有原生浮层用的都是 100000，这个 React 对话框漏在了体系外。
+//
+// 一条断言管住三个面板：会话选择器、记忆中心、组件画廊都建在这个 Dialog 上。
+test("shadcn 对话框必须压过聊天输入框，否则面板会被输入框盖住一角", () => {
+  // 先剥注释：解释这处改动的注释里原样引用了 `z-50`，不剥的话下面那条"不该再有 z-50"
+  // 的断言是在跟自己的注释较劲。这个坑今天已经踩到第三次了。
+  const dialog = stripJsComments(readFileSync(join(HERE, "../src/ui/components/dialog.jsx"), "utf8"));
+  const zOf = (source, label) => {
+    const m = /\bz-\[(\d+)\]/.exec(source) || /\bz-(\d+)\b/.exec(source);
+    assert.ok(m, `${label} 里找不到 z-index`);
+    return Number(m[1]);
+  };
+  // 遮罩和内容两处都要抬，只抬一处会让内容压在自己的遮罩下面
+  const hits = [...dialog.matchAll(/\bz-\[(\d+)\]/g)].map((m) => Number(m[1]));
+  assert.equal(hits.length, 2, `dialog.jsx 应有两处 z-index（遮罩 + 内容），实际 ${hits.length} 处`);
+  assert.ok(!/\bz-50\b/.test(dialog), "还留着 shadcn 默认的 z-50");
+
+  const composer = /\.composer\s*\{[^}]*z-index:\s*(\d+)/.exec(APP_CSS);
+  assert.ok(composer, "app.css 里找不到 .composer 的 z-index");
+  const composerZ = Number(composer[1]);
+  for (const z of hits) {
+    assert.ok(z > composerZ,
+      `对话框 z-index ${z} 没有高过输入框 ${composerZ} —— 面板会被输入框压住`);
+  }
+  // 和本应用其它浮层同一层，别再自成一套
+  assert.match(APP_CSS, /\.ctp-overlay\s*\{[^}]*z-index:\s*100000/);
+  assert.ok(hits.every((z) => z === 100000), `对话框该用本应用的模态层 100000，实际 ${hits}`);
+  void zOf;
+});
