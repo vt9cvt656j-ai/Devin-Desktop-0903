@@ -249,3 +249,250 @@ pub fn command(program: impl AsRef<std::ffi::OsStr>) -> std::process::Command {
     }
     c
 }
+
+// ─────────────────────────── 子进程输出的解码 ───────────────────────────
+
+/// Windows 的 ANSI 代码页（`GetACP()`）对应的 encoding_rs 编码。
+///
+/// 简体中文机器是 936（GBK），繁体 950（Big5），日文 932，韩文 949，西欧 1252。
+/// 拿不到或者不认识就返回 None，交给调用方走 lossy。
+#[cfg(windows)]
+fn legacy_encoding() -> Option<&'static encoding_rs::Encoding> {
+    #[link(name = "Kernel32")]
+    extern "system" {
+        fn GetACP() -> u32;
+    }
+    // Safe: GetACP 无参数、无副作用，返回一个进程级的代码页号。
+    let cp = unsafe { GetACP() };
+    encoding_for_codepage(cp)
+}
+
+/// macOS / Linux 上非 UTF-8 的子进程输出极少见（系统本身就是 UTF-8），真碰上了
+/// 用 chardetng 猜——和 tabular.rs 读 CSV 用的是同一套探测器。
+#[cfg(not(windows))]
+fn legacy_encoding() -> Option<&'static encoding_rs::Encoding> {
+    None
+}
+
+/// 代码页号 → 编码。抽出来单独测，不然 Windows 分支在 mac 上一行都跑不到。
+#[allow(dead_code)]
+fn encoding_for_codepage(cp: u32) -> Option<&'static encoding_rs::Encoding> {
+    Some(match cp {
+        65001 => return None, // 已经是 UTF-8，走不到回退分支
+        936 => encoding_rs::GBK,
+        950 => encoding_rs::BIG5,
+        932 => encoding_rs::SHIFT_JIS,
+        949 => encoding_rs::EUC_KR,
+        874 => encoding_rs::WINDOWS_874,
+        1250 => encoding_rs::WINDOWS_1250,
+        1251 => encoding_rs::WINDOWS_1251,
+        1252 => encoding_rs::WINDOWS_1252,
+        1253 => encoding_rs::WINDOWS_1253,
+        1254 => encoding_rs::WINDOWS_1254,
+        1255 => encoding_rs::WINDOWS_1255,
+        1256 => encoding_rs::WINDOWS_1256,
+        1257 => encoding_rs::WINDOWS_1257,
+        1258 => encoding_rs::WINDOWS_1258,
+        _ => return None,
+    })
+}
+
+/// 末尾那截**还没读完**的多字节序列有多长。
+///
+/// 输出是按 8KB 分块读的，2MB 的上限也可能正好切在一个汉字中间。直接解码会把这个
+/// 半截字符变成一个 `�`，而 `�` 是不可逆的——所以宁可把这几个字节丢掉/留到下次。
+/// 返回 0 表示结尾是完整的。
+fn incomplete_utf8_tail(bytes: &[u8]) -> usize {
+    // UTF-8 一个字符最长 4 字节，所以只需要回看 3 个字节找起始字节。
+    for back in 1..=3usize {
+        if back > bytes.len() {
+            break;
+        }
+        let b = bytes[bytes.len() - back];
+        if b & 0b1100_0000 == 0b1000_0000 {
+            continue; // 续接字节，继续往前找
+        }
+        let need = if b & 0b1000_0000 == 0 {
+            1
+        } else if b & 0b1110_0000 == 0b1100_0000 {
+            2
+        } else if b & 0b1111_0000 == 0b1110_0000 {
+            3
+        } else if b & 0b1111_1000 == 0b1111_0000 {
+            4
+        } else {
+            return 0; // 非法起始字节，不是"没读完"，交给解码器出 �
+        };
+        return if need > back { back } else { 0 };
+    }
+    0
+}
+
+/// 把子进程的 stdout/stderr 字节解成字符串。
+///
+/// 规则是确定的，不猜：
+///   1. 整体是合法 UTF-8 → 按 UTF-8 解。**绝不**先 lossy 再补救。
+///   2. 否则按平台的传统代码页解（Windows 上就是 `GetACP()`：中文机器 GBK）。
+///      Windows 的命令行工具往管道里写的是 ANSI 代码页字节，`chcp 65001` 只管
+///      控制台不管管道，之前一律 `from_utf8_lossy` 就是中文全变 `���` 的原因。
+///   3. 代码页也认不出来 → 最后才 lossy。
+///
+/// 末尾半截的多字节序列先切掉（见 `incomplete_utf8_tail`），免得一个被截断的汉字
+/// 把整段输出判成"不是 UTF-8"从而错误地走 GBK 分支。
+pub fn decode_process_output(bytes: &[u8]) -> String {
+    let cut = bytes.len() - incomplete_utf8_tail(bytes);
+    let body = &bytes[..cut];
+    if let Ok(s) = std::str::from_utf8(body) {
+        return s.to_owned();
+    }
+    match legacy_encoding() {
+        Some(enc) => {
+            let (text, _, _) = enc.decode(body);
+            text.into_owned()
+        }
+        None => String::from_utf8_lossy(body).into_owned(),
+    }
+}
+
+// ─────────────────────────── 子进程的 locale ───────────────────────────
+
+/// 从 Finder / Dock 启动的 macOS 应用**拿不到任何 locale 环境变量**——`LANG`、
+/// `LC_ALL`、`LC_CTYPE` 全是空的，子进程于是跑在 C locale 下。后果是实测过的：
+/// 终端里 `ls` 一个中文目录会打成 `????????????.txt`，`awk`/`wc -m`/`sort` 之类
+/// 按字符处理的工具也全部退化成按字节。
+///
+/// 规则：用户自己配过就不动（哪怕配的不是 UTF-8，那是他的选择）；一个都没有、或者
+/// 只是 `C`/`POSIX` 这种"等于没配"的值，才补一个 UTF-8 locale 进去。
+/// 补的是 `LANG` 而不是 `LC_ALL`，这样登录 shell 的 profile 还能再覆盖回去。
+fn locale_is_configured(read: impl Fn(&str) -> Option<String>) -> bool {
+    for key in ["LC_ALL", "LC_CTYPE", "LANG"] {
+        if let Some(v) = read(key) {
+            let t = v.trim();
+            if !t.is_empty() && !t.eq_ignore_ascii_case("c") && !t.eq_ignore_ascii_case("posix") {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// 兜底 locale。macOS 上 `en_US.UTF-8` 一定存在；Linux 上 `C.UTF-8` 是 glibc/musl
+/// 的通用名。装不上也只是退回今天的 C locale，不会更糟。
+#[allow(dead_code)]
+fn default_utf8_locale() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "en_US.UTF-8"
+    } else {
+        "C.UTF-8"
+    }
+}
+
+/// 要塞给子进程的 locale 环境变量；用户已经配好就返回空。
+#[cfg(not(windows))]
+pub fn utf8_locale_env() -> Vec<(&'static str, String)> {
+    if locale_is_configured(|k| std::env::var(k).ok()) {
+        return Vec::new();
+    }
+    vec![("LANG", default_utf8_locale().to_string())]
+}
+
+/// Windows 不走 POSIX locale，编码是靠代码页解决的（PTY 里 `chcp 65001`，
+/// 管道输出交给 `decode_process_output` 按 ANSI 代码页解）。
+#[cfg(windows)]
+pub fn utf8_locale_env() -> Vec<(&'static str, String)> {
+    Vec::new()
+}
+
+#[cfg(test)]
+mod locale_tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    fn env_of(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
+        let map: HashMap<String, String> = pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        move |k: &str| map.get(k).cloned()
+    }
+
+    #[test]
+    fn a_finder_launched_app_has_no_locale_and_gets_one() {
+        assert!(!locale_is_configured(env_of(&[])));
+    }
+
+    #[test]
+    fn an_existing_locale_is_left_alone() {
+        assert!(locale_is_configured(env_of(&[("LANG", "zh_CN.UTF-8")])));
+        assert!(locale_is_configured(env_of(&[("LC_CTYPE", "UTF-8")])));
+        assert!(locale_is_configured(env_of(&[("LC_ALL", "ja_JP.eucJP")])));
+    }
+
+    #[test]
+    fn c_and_posix_count_as_unset() {
+        // 这两个值等于"按字节处理"，正是要修掉的那个状态。
+        assert!(!locale_is_configured(env_of(&[("LANG", "C")])));
+        assert!(!locale_is_configured(env_of(&[("LANG", "POSIX")])));
+        assert!(!locale_is_configured(env_of(&[("LC_ALL", "c")])));
+        assert!(!locale_is_configured(env_of(&[("LANG", "   ")])));
+    }
+
+    #[test]
+    fn the_fallback_locale_is_utf8_on_every_platform() {
+        assert!(default_utf8_locale().to_lowercase().contains("utf-8"));
+    }
+}
+
+#[cfg(test)]
+mod decode_tests {
+    use super::*;
+
+    #[test]
+    fn utf8_output_survives_untouched() {
+        let bytes = "编译成功 ✓\n".as_bytes();
+        assert_eq!(decode_process_output(bytes), "编译成功 ✓\n");
+    }
+
+    #[test]
+    fn a_chinese_char_cut_in_half_is_dropped_not_turned_into_a_replacement() {
+        let full = "你好".as_bytes().to_vec();
+        // 砍掉最后一个字节：'好' 只剩前两字节。
+        let cut = &full[..full.len() - 1];
+        let decoded = decode_process_output(cut);
+        assert_eq!(decoded, "你", "半截字符要丢掉，不能留下 �");
+        assert!(!decoded.contains('\u{fffd}'));
+    }
+
+    #[test]
+    fn gbk_bytes_are_not_decoded_as_utf8() {
+        let (gbk, _, _) = encoding_rs::GBK.encode("找不到文件");
+        // 这串 GBK 字节不是合法 UTF-8——旧代码会把它变成一堆 �。
+        assert!(std::str::from_utf8(&gbk).is_err());
+        let lossy = String::from_utf8_lossy(&gbk);
+        assert!(lossy.contains('\u{fffd}'));
+    }
+
+    #[test]
+    fn windows_codepages_map_to_the_right_encoding() {
+        assert_eq!(encoding_for_codepage(936), Some(encoding_rs::GBK));
+        assert_eq!(encoding_for_codepage(950), Some(encoding_rs::BIG5));
+        assert_eq!(encoding_for_codepage(932), Some(encoding_rs::SHIFT_JIS));
+        assert_eq!(encoding_for_codepage(1252), Some(encoding_rs::WINDOWS_1252));
+        // 65001 已经是 UTF-8，不该被当成"传统代码页"再解一遍。
+        assert_eq!(encoding_for_codepage(65001), None);
+        assert_eq!(encoding_for_codepage(1), None);
+    }
+
+    #[test]
+    fn ascii_and_empty_are_stable() {
+        assert_eq!(decode_process_output(b""), "");
+        assert_eq!(decode_process_output(b"ok\n"), "ok\n");
+    }
+
+    #[test]
+    fn a_complete_tail_is_never_trimmed() {
+        assert_eq!(incomplete_utf8_tail("你好".as_bytes()), 0);
+        assert_eq!(incomplete_utf8_tail(b"abc"), 0);
+        assert_eq!(incomplete_utf8_tail(b""), 0);
+    }
+}

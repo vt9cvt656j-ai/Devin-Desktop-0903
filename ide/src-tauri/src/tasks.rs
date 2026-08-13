@@ -347,6 +347,12 @@ fn task_run_capture_inner(
             .env("PATH", crate::process_util::augmented_path(Some(&cwd)))
             .env("CI", "1")
             .env("TERM", "dumb");
+        // 从 Finder 启动的应用一个 locale 变量都没有，子进程于是跑在 C locale 下，
+        // 按字符处理的工具（awk / wc -m / sort / ls）全部退化成按字节 —— 中文就烂了。
+        // 用户自己配过就不动（见 utf8_locale_env）。
+        for (k, v) in crate::process_util::utf8_locale_env() {
+            c.env(k, v);
+        }
         // Auto-activate a project venv so bare `python`/`pip`/`pytest` resolve INTO it and an installed
         // environment PERSISTS across restarts (previously they hit the system interpreter).
         for name in [".venv", "venv"] {
@@ -435,8 +441,12 @@ fn task_run_capture_inner(
     if !timed_out {
         terminate_task_tree(&mut child);
     }
-    let mut stdout = String::from_utf8_lossy(&out_bytes).into_owned();
-    let mut stderr = String::from_utf8_lossy(&err_bytes).into_owned();
+    // 不能用 from_utf8_lossy：Windows 的命令行工具往**管道**里写的是 ANSI 代码页
+    // 字节（简体中文机器是 GBK），`chcp 65001` 只改控制台不改管道，于是每一个汉字
+    // 都被换成 `�` 直接送进模型上下文。decode_process_output 先按 UTF-8 严格解，
+    // 解不动才按系统代码页解，并且会把末尾被 8KB 分块/2MB 上限切断的半截字符去掉。
+    let mut stdout = crate::process_util::decode_process_output(&out_bytes);
+    let mut stderr = crate::process_util::decode_process_output(&err_bytes);
     let mut truncated = truncate_on_boundary(&mut stdout, MAX_TASK_OUTPUT)
         | truncate_on_boundary(&mut stderr, MAX_TASK_OUTPUT);
     if timed_out {
