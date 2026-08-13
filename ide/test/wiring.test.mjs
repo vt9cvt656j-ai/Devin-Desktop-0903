@@ -576,7 +576,10 @@ test("施工请求不许被降级成反问：六处判题链和授权底线都�
     assert.ok(truth.includes(line), `授权底线缺失：${line}`);
   }
   // 补上的是禁令的对面，不是替代它。
-  assert.match(truth, /is ordinary engineering\. Build it, no preamble/);
+  assert.match(truth, /owns or is\s+authorized to use is ordinary engineering — build it, no preamble/,
+    "授权范围内的自动化/集成/写 bot 是普通工程，直接做");
+  assert.match(truth, /about\s+unauthorized third parties, not third-party APIs/,
+    "必须点明下面那条禁令针对的是未授权第三方，不是第三方 API——否则模型会把接 API 也当成越线");
 });
 
 test("the request-boundary markers the client emits are exactly the ones the gateway parses", () => {
