@@ -22,15 +22,26 @@ if [[ -n "$SERVER_KEY" ]]; then
   SSH_ARGS+=(-i "$SERVER_KEY")
 fi
 
+# `status=$?` 放在 `if ssh …; then return 0; fi` 之后取到的是 **if 语句** 的退出码——
+# 条件失败且没有 else 分支时它是 0。于是三次全失败之后这个函数返回 0，deploy.sh 一路走完
+# 并打印 "deployment healthy"，实际什么都没部署。
+#
+# 这不是假想：2026-08-13 一次部署里远程构建因编译错误失败了三次，脚本照样报健康，
+# 线上还跑着几小时前的旧镜像。同一个 bug 在本文件下面的 rsync_run 里已经被修过一次
+# （注释就在那儿），ssh_run 这半边当时漏了。修法一样：用 `|| status=$?` 拿真实退出码，
+# 它在 set -e 下也是安全的。
 ssh_run() {
   local attempt status
   for attempt in 1 2 3; do
-    if ssh "${SSH_ARGS[@]}" "$REMOTE" "$@"; then
+    status=0
+    ssh "${SSH_ARGS[@]}" "$REMOTE" "$@" || status=$?
+    if [ "$status" -eq 0 ]; then
       return 0
     fi
-    status=$?
+    echo "  remote step failed (exit ${status}); retrying" >&2
     sleep $((attempt * 2))
   done
+  echo "remote step failed after 3 attempts (last exit ${status})" >&2
   return "$status"
 }
 
