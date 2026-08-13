@@ -6782,6 +6782,9 @@ test("MCP loads Claude Code-compatible project configs and merges their capabili
     _workspaceAncestorRoots: ancestorRoots,
     // 用户级（跨项目）那一层：见 test/mcp.test.mjs 的完整覆盖，这里只确认它接进来了、
     // 并且不会把项目里的同名服务顶掉。
+    // _readWorkspaceMcpDocument 现在还会问一次"哪些服务被用户停用了"（见 test/mcp.test.mjs
+    // 里那组停用测试）。这里没有停用的场景，给个空集合即可。
+    _disabledMcpServers: async () => new Set(),
     _readUserScopeMcpConfigs: async () => [
       { path: "/home/me/.michael-ide/mcp.json", writable: true, servers: { global: { command: "node" }, local: { command: "全局的同名服务" } } },
     ],
