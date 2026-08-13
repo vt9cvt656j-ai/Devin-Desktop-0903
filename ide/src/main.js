@@ -32061,6 +32061,88 @@ function _renderPlan(container, steps, existingEl, run) {
 const _agentReadCache = new Map(); // absolute path -> file text (populated on read; freshness handled by the content-signature dedup, not a stale fast-path)
 const _agentWebCache = new Map(); // url|query -> result text
 
+// 启动后检查一次桌面自动化的权限，缺了就给一个能点的入口。
+//
+// 为什么必须做成"点一下"而不是后台静默检查：日常用的 AXIsProcessTrusted() 是**不提示**
+// 的变体，它从不弹框，也从不把本 App 写进系统设置的列表。带 prompt 的那个变体会让
+// macOS 自己弹标准授权框并把 App 加进列表——对"授权因为重新构建而失效"这种情况尤其
+// 管用，用户不必手工移除再重加。但它会弹系统框，所以只能由用户的明确动作触发。
+const _PERM_NOTICE_KEY = "michael-ide.desktop-perm-notice.v1";
+async function _checkDesktopPermissionsOnStart() {
+  if (!inTauri) return;
+  let st;
+  try { st = await backend.invoke("permission_status"); } catch { return; }
+  const advice = String(st?.advice || "").trim();
+  if (!advice) { try { localStorage.removeItem(_PERM_NOTICE_KEY); } catch {} return; }
+  // 同一次构建只打扰一次。换了构建（cdhash 变了）就该再提醒一次——那正是权限失效的时候。
+  const stamp = `${st.accessibility}|${st.apple_events}|${st.screen_recording}|${advice.length}`;
+  try { if (localStorage.getItem(_PERM_NOTICE_KEY) === stamp) return; } catch {}
+  const ok = await _confirmDialog("桌面自动化还没权限", advice, "让系统弹授权框", false).catch(() => false);
+  try { localStorage.setItem(_PERM_NOTICE_KEY, stamp); } catch {}
+  if (!ok) return;
+  let after;
+  try { after = await backend.invoke("request_accessibility"); } catch { after = null; }
+  if (after && !String(after.advice || "").trim()) {
+    showToast("权限已就绪，桌面自动化可以用了");
+    try { localStorage.removeItem(_PERM_NOTICE_KEY); } catch {}
+    return;
+  }
+  // 系统框弹过还是没拿到——通常是需要重启 App 才生效，或者那条旧授权得手工移除。
+  // 这里直接把用户送到对应的设置面板，别让他自己去翻。
+  const url = String(st?.settings_url || "");
+  if (url) {
+    try {
+      if (backend.taskRunCapture) { backend.taskRunCapture("/", 'open "' + url + '"').catch(() => { try { openExternal(url); } catch {} }); }
+      else openExternal(url);
+    } catch {}
+  }
+  showToast("授权后请完全退出 Mr. Day One 再重新打开");
+}
+
+// 桌面控制失败时补一句真实的权限诊断。
+//
+// 没有它的话，一次 TCC 拒绝在用户眼里长成这样：「打不开/找不到 App，名字要和菜单栏
+// 显示的完全一致」——于是他去核对拼写，而真正的问题是系统根本没放行。更麻烦的是
+// 本地构建每次都换代码签名，授权会在系统设置的开关**仍然亮着**的情况下失效，
+// 不明说的话用户只会认为程序在撒谎。
+async function _desktopPermissionNote() {
+  if (!inTauri) return "";
+  try {
+    const st = await backend.invoke("permission_status");
+    const advice = String(st?.advice || "").trim();
+    if (!advice) return "";
+    return `\n\n⚠️ 系统权限诊断（请原样转述给用户，别改写成"请去打开开关"）：\n${advice}`;
+  } catch { return ""; }
+}
+
+// 这一步是不是真的在动**用户的**电脑？红光该不该亮，全看它。
+//
+// 三类要分清，混起来红光就要么该亮不亮、要么常亮成噪音：
+//   · 真驱动 —— 合成鼠标键盘、回放录制、搬窗口、改剪贴板、点菜单、AX 操作前台 App；
+//   · 只读   —— screen.info / mouse.position / window.list / clipboard.get / read_screen /
+//               recorder.save / recorder.list / system 的 apps|windows|menu_items|frontmost；
+//   · 不沾桌面 —— browser.*：跑在 automation-server 自己拉起的独立 Chrome 里，
+//               用户的鼠标键盘屏幕一概不碰。
+//
+// 现成的 _toolMayProduceExternalEffect 不能拿来复用：它把 screen.info、mouse.position
+// 判成有副作用，而它列的 system 只读 op 名（list/status）在执行器里根本不存在。
+const _DESKTOP_READONLY_AUTOMATION = new Set([
+  "screen.info", "mouse.position", "window.list", "clipboard.get",
+  "recorder.save", "recorder.list", "system.init",
+]);
+const _DESKTOP_DRIVING_SYSTEM_OPS = new Set(["open", "focus", "menu"]);
+function _callDrivesDesktop(call) {
+  if (!call) return false;
+  if (call.type === "uiclick") return true;             // AX 操作前台 App，无一例外
+  if (call.type === "system") return _DESKTOP_DRIVING_SYSTEM_OPS.has(String(call.op || "frontmost"));
+  if (call.type !== "automation") return false;
+  const method = String(call.method || "").trim().toLowerCase();
+  if (!method) return false;
+  if (method.startsWith("browser.")) return false;      // 独立 Chrome，不碰用户桌面
+  if (_DESKTOP_READONLY_AUTOMATION.has(method)) return false;
+  return /^(mouse|keyboard|window|clipboard|recorder)\./.test(method);
+}
+
 // ---- "正在控制电脑" 红光边框：全自动操控时屏幕四周亮录制红光，控制结束就灭 ----
 // A transparent, click-through, always-on-top fullscreen overlay window (overlay.html).
 // Shown when the agent first drives the computer; destroyed in the run's finally.
@@ -48389,6 +48471,7 @@ async function _executeToolStepInner(step, call, root, run) {
       if (!Number.isInteger(call.ref) || call.ref < 0) { res.className = "atc-result atc-result--err"; res.textContent = "缺 ref"; return { type: "uiclick", path: "", content: "[ERROR] ui_click 需要 read_screen 返回的非负整数 ref。" }; }
       if (!["press", "set_value", "focus", "increment", "decrement", "show_menu", "confirm", "cancel", "pick"].includes(call.action)) { res.className = "atc-result atc-result--err"; res.textContent = "action 无效"; return { type: "uiclick", path: "", content: "[ERROR] ui_click action 必须是 press、set_value、focus、increment、decrement、show_menu、confirm、cancel 或 pick。" }; }
       if (call.action === "set_value" && call.value == null) { res.className = "atc-result atc-result--err"; res.textContent = "缺 value"; return { type: "uiclick", path: "", content: "[ERROR] ui_click set_value 需要 value。" }; }
+      _showControlGlow();
       try {
         const output = await backend.invoke("ui_click", { reference: call.ref, action: call.action, value: call.value });
         const ok = output?.ok === true;
@@ -48396,11 +48479,12 @@ async function _executeToolStepInner(step, call, root, run) {
         res.className = "atc-result " + (ok ? "atc-result--ok" : "atc-result--err");
         res.textContent = ok ? `${call.action} 已执行` : "操作未执行";
         if (vp) vp.innerHTML = `<pre style="white-space:pre-wrap">${_escHtml(structured.slice(0, 4000))}</pre>`;
-        return { type: "uiclick", path: String(call.ref), materialEffect: ok, content: `${ok ? "ui_click 已执行" : "[失败] ui_click 未执行"}：\n${structured}` };
+        const _perm = ok ? "" : await _desktopPermissionNote();
+        return { type: "uiclick", path: String(call.ref), materialEffect: ok, content: `${ok ? "ui_click 已执行" : "[失败] ui_click 未执行"}：\n${structured}${_perm}` };
       } catch (error) {
         const message = String(error?.message || error).slice(0, 360);
         res.className = "atc-result atc-result--err"; res.textContent = "操作失败";
-        return { type: "uiclick", path: String(call.ref), content: `[失败] ui_click: ${message}` };
+        return { type: "uiclick", path: String(call.ref), content: `[失败] ui_click: ${message}${await _desktopPermissionNote()}` };
       }
 
     } else if (call.type === "localdiscovery") {
@@ -49447,7 +49531,7 @@ return { type: call.type, path: call.query || "", content: `[失败] ${call.type
 
     } else if (call.type === "automation") {
       if (!inTauri) { res.className = "atc-result atc-result--err"; res.textContent = "桌面专用"; return { type: "automation", path: "", content: "[不可用] 桌面自动化只能在桌面 App 里用。" }; }
-      if (/^(mouse|keyboard)\./i.test(call.method || "")) _showControlGlow();
+      if (_callDrivesDesktop(call)) _showControlGlow();
       const _m = String(call.method || "").trim();
       if (!_m) return { type: "automation", path: "", content: "[ERROR] automation 需要 method（如 browser.goto / mouse.click / recorder.replay）。" };
       try {
@@ -49459,7 +49543,8 @@ return { type: call.type, path: call.query || "", content: `[失败] ${call.type
         res.className = "atc-result atc-result--err"; res.textContent = "失败";
         const _msg = String(e?.message || e);
         const _hint = /找不到 automation-server|未就绪/.test(_msg) ? "\n（首次用需在 ~/Desktop/自动化工具框架 里 `cargo build --release --features 'system browser' --bin automation-server`；正常我会自动拉起它。）" : "";
-        return { type: "automation", path: _m, content: `[失败] ${_m}: ${_msg.slice(0, 300)}${_hint}` };
+        const _perm = _callDrivesDesktop(call) ? await _desktopPermissionNote() : "";
+        return { type: "automation", path: _m, content: `[失败] ${_m}: ${_msg.slice(0, 300)}${_hint}${_perm}` };
       }
     } else if (call.type === "capture_start") {
       if (!inTauri) { res.className = "atc-result atc-result--err"; res.textContent = "桌面专用"; return { type: "capture_start", path: "", content: "[不可用] 抓包只能在桌面 App 里用。" }; }
@@ -50779,6 +50864,7 @@ return { type: call.type, path: call.query || "", content: `[失败] ${call.type
     } else if (call.type === "system") {
       if (!inTauri) { res.className = "atc-result atc-result--err"; res.textContent = "桌面专用"; return { type: "system", path: call.op, content: "[不可用] system（系统控制）只能在 Mr. Day One 桌面 App 里用。" }; }
       const sop = call.op || "frontmost";
+      if (_callDrivesDesktop(call)) _showControlGlow();
       try {
         let raw;
         if (sop === "open") raw = await backend.invoke("system_open_app", { name: call.name, background: !!call.background });
@@ -50799,7 +50885,13 @@ return { type: call.type, path: call.query || "", content: `[失败] ${call.type
       } catch (e) {
         const m = String(e?.message || e);
         res.className = "atc-result atc-result--err"; res.textContent = "失败";
-        return { type: "system", path: sop, content: `[系统控制失败] ${m}。${/仅支持/.test(m) ? "（仅该 Linux 平台暂不支持系统控制，改用 computer 坐标点）" : "若反复失败：macOS 去 系统设置→隐私与安全性→辅助功能 勾选 Mr. Day One 后重启；Windows 确认目标软件暴露了 UI Automation（部分 Electron/自绘界面不暴露，改用 computer 节点）。"}` };
+        const _perm = await _desktopPermissionNote();
+        // 权限诊断在手时就别再说那句"去勾选 Mr. Day One 后重启"了——用户看到的就是它已经
+        // 勾着，那句话只会把他引向死路。诊断为空（权限齐全）时才谈目标软件的 UI 暴露问题。
+        const _tail = /仅支持/.test(m)
+          ? "（仅该 Linux 平台暂不支持系统控制，改用 computer 坐标点）"
+          : (_perm ? "" : "权限没问题，那多半是目标软件本身不暴露可操作节点（部分 Electron/自绘界面如此），改用 computer 坐标点。");
+        return { type: "system", path: sop, content: `[系统控制失败] ${m}。${_tail}${_perm}` };
       }
 
     } else if (call.type === "cmd") {
@@ -57678,16 +57770,36 @@ function _finishLogin(result) {
 }
 // Branded confirm modal (Google-light) → resolves true/false. Used for destructive actions like
 // logout so they're deliberate AND give visible feedback (the "退出登录没有提示" fix).
+// 对话框正文的排版。
+//
+// 之前是整段 esc() 之后直接塞进 div：换行被 HTML 折成空格、`**强调**` 原样吐出一堆星号，
+// 一段本来分了小节的说明糊成一坨、还带着 markdown 残渣。这里认三样东西就够了——
+// 段落（空行）、换行、以及 **强调**；先转义再做替换，注入面不变。
+function _dialogBodyHtml(body) {
+  const esc = (v) => String(v == null ? "" : v).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+  const inline = (line) => esc(line)
+    .replace(/\*\*([^*]+)\*\*/g, '<strong style="color:#202124;font-weight:600">$1</strong>')
+    .replace(/「([^」]+)」/g, '<strong style="color:#202124;font-weight:600">「$1」</strong>');
+  return String(body || "")
+    .split(/\n{2,}/)                                  // 空行分段
+    .map((para) => para.split("\n").map(inline).join("<br>"))
+    .filter((para) => para.trim())
+    .map((para) => `<p style="margin:0 0 10px">${para}</p>`)
+    .join("");
+}
+
 function _confirmDialog(title, body, confirmLabel, danger) {
   return new Promise((resolve) => {
     const esc = (s) => String(s == null ? "" : s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
     const ov = document.createElement("div");
     ov.style.cssText = "position:fixed;inset:0;background:rgba(32,33,36,.45);backdrop-filter:blur(2px);display:grid;place-items:center;z-index:100000;font-family:var(--font)";
     const card = document.createElement("div");
-    card.style.cssText = "background:#fff;color:#202124;border-radius:16px;width:360px;max-width:90vw;box-shadow:0 24px 70px rgba(60,64,67,.28),0 4px 12px rgba(60,64,67,.14);overflow:hidden";
+    // 短确认框保持 360；说明性长文案给到 460，否则每行只剩十几个字，读起来像一堵墙。
+    const _wide = String(body || "").length > 160;
+    card.style.cssText = `background:#fff;color:#202124;border-radius:16px;width:${_wide ? 460 : 360}px;max-width:90vw;box-shadow:0 24px 70px rgba(60,64,67,.28),0 4px 12px rgba(60,64,67,.14);overflow:hidden`;
     card.innerHTML =
       `<div style="padding:22px 24px 6px;font-size:17px;font-weight:600">${esc(title)}</div>` +
-      (body ? `<div style="padding:2px 24px 16px;font-size:13.5px;color:#5f6368;line-height:1.6">${esc(body)}</div>` : `<div style="height:12px"></div>`) +
+      (body ? `<div style="padding:2px 24px 16px;font-size:13.5px;color:#5f6368;line-height:1.65;max-height:52vh;overflow-y:auto">${_dialogBodyHtml(body)}</div>` : `<div style="height:12px"></div>`) +
       `<div style="display:flex;justify-content:flex-end;gap:10px;padding:8px 20px 18px">` +
         `<button class="_cd-cancel" style="padding:8px 18px;border-radius:8px;border:1px solid #dadce0;background:#fff;color:#3c4043;cursor:pointer;font-size:13.5px;font-weight:600">取消</button>` +
         `<button class="_cd-ok" style="padding:8px 18px;border-radius:8px;border:0;background:${danger ? "#d93025" : "#1a73e8"};color:#fff;cursor:pointer;font-size:13.5px;font-weight:600">${esc(confirmLabel || "确定")}</button>` +
@@ -62671,6 +62783,8 @@ applyPlatformShortcutLabels();
 // 直到他碰巧再打开一次那个面板——而且 `_userRulesBlock()` 只会安静地返回空串，不报错、
 // 没有任何迹象。菜单上"每轮都遵守"那句话在冷启动后是假的。
 void _refreshUserRules();
+// 放在启动流程里，晚一点执行：让窗口先画出来，别一开机就糊一个对话框上去。
+setTimeout(() => { void _checkDesktopPermissionsOnStart(); }, 2500);
 Promise.all([
   loadConfigAsync().then(() => refreshModelBadge()),
   loadEditorPrefs().then(() => applyEditorPrefs()),

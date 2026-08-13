@@ -2,6 +2,7 @@
 // automation bridge; not every target currently wires each helper into a command.
 #[allow(dead_code)]
 mod accessibility;
+mod permissions;
 mod archive;
 mod repos;
 mod tabular;
@@ -400,6 +401,8 @@ pub fn run() {
             auth::db_marketplace_upsert,
             accessibility::read_screen,
             accessibility::ui_click,
+            permissions::permission_status,
+            permissions::request_accessibility,
             automation::automation_call,
             knowledge::package_search,
             knowledge::github_search,

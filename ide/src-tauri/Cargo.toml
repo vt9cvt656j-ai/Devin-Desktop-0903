@@ -19,7 +19,7 @@ tauri-build = { version = "2", features = [] }
 # automatically, but RELEASE builds must not ship one (it exposed the app's code and
 # live network traffic to anyone). Re-enable for a one-off release diagnosis with
 # `cargo tauri build -- --features devtools`.
-tauri = { version = "2", features = ["protocol-asset"] }
+tauri = { version = "2", features = ["macos-private-api", "protocol-asset"] }
 tauri-plugin-dialog = "2"
 tauri-plugin-opener = "2"
 tauri-plugin-updater = "2"
@@ -82,7 +82,9 @@ objc2-foundation = { version = "0.3.2", default-features = false, features = ["N
 objc2-core-location = { version = "0.3.2", default-features = false, features = ["std", "CLError", "CLLocation", "CLLocationManager", "CLLocationManagerDelegate"] }
 
 [features]
-default = []
+# 覆盖层（“正在控制电脑”红光框）要透明窗口，而 tauri 的透明窗口在 macOS 上走私有 API。
+# 不显式开这个 feature 的话，transparent:true 会被静默忽略，覆盖层变成一块不透明的全屏白窗。
+default = ["macos-private-api"]
 macos-private-api = ["tauri/macos-private-api"]
 custom-protocol = ["tauri/custom-protocol"]
 devtools = ["tauri/devtools"]

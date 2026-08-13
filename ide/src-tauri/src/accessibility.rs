@@ -184,10 +184,25 @@ pub async fn read_screen(ocr: Option<bool>) -> Result<ReadScreenResponse, String
         );
     }
     if elements.is_empty() {
-        limitations.push(
-            "No elements were returned. The frontmost app may expose no accessibility tree, or Mr. Day One may lack Accessibility/Screen Recording permission."
-                .into(),
-        );
+        // 以前这里把「辅助功能」和「屏幕录制」并列念一遍就完事。两个问题：AX 树这条路
+        // 根本用不到屏幕录制，把它写进来会把用户引到错的那一页去查（实际发生过）；而且
+        // 权限到底缺不缺是可以问系统的，不该让用户去猜。现在先问 API 再说话。
+        let ax = crate::permissions::accessibility_granted();
+        let ae = crate::permissions::apple_events_granted();
+        if !ax || !ae {
+            limitations.push(format!(
+                "Blocked by a missing macOS permission — this is NOT about Screen Recording (reading the UI tree captures no pixels). Reading an app's UI tree needs Accessibility AND Automation (Apple Events → System Events). {}",
+                crate::permissions::advice_text(ax, true, ae, crate::permissions::identity_pinned_to_build())
+            ));
+        } else {
+            // 权限齐全时空结果通常另有原因，而且是很具体的一个：这里读的是**前台**应用，
+            // 而 agent 干活时前台往往就是 Mr. Day One 自己（WebView 内容对 AX 不可见）。
+            // 不写清楚，模型会把它当权限问题反复上报。
+            limitations.push(
+                "No elements were returned, and permissions ARE granted — so this is not a permission problem. Two ordinary causes: (1) read_screen reads the FRONTMOST app, which is often Mr. Day One itself — bring the target to the front first with system open / window.activate, then read again; (2) the app draws its own UI and exposes no accessibility tree (games, Electron canvases, remote desktops) — read it with ocr=true instead. Retrying the same call unchanged will not help."
+                    .into(),
+            );
+        }
     }
     Ok(ReadScreenResponse {
         source: if use_ocr {
