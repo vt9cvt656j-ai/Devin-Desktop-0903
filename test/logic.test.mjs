@@ -1712,11 +1712,14 @@ test("account dropdown keeps logged-in text contained and puts logout at the bot
     "logged-out menu should not leave empty divider lines");
 });
 
-test("assistant header groups Skills and MCP behind one vertical capabilities menu", () => {
+// 2026-08-13：菜单内容按所有者要求换成「全局技能」+「用户规则」，MCP 项移出（高级设置 →
+// MCP 仍然可达）。这条测试要守的东西一点没变：这些能力**收在一个 ⋮ 菜单里**，而不是在
+// 标题栏排一排按钮。
+test("assistant header groups its capabilities behind one vertical capabilities menu", () => {
   assert.match(INDEX_HTML, /id="capabilitiesBtn"[\s\S]{0,220}aria-haspopup="menu"[\s\S]{0,120}aria-expanded="false"/,
     "assistant header should expose one compact capability menu button");
-  assert.match(INDEX_HTML, /id="capabilitiesMenu"[\s\S]{0,900}id="capabilitySkillsItem"[\s\S]{0,900}id="capabilityMcpItem"/,
-    "Skills and MCP should be selectable from the shared capability menu");
+  assert.match(INDEX_HTML, /id="capabilitiesMenu"[\s\S]{0,900}id="capabilitySkillsItem"[\s\S]{0,900}id="capabilityRulesItem"/,
+    "两项都要在同一个菜单里选得到");
   assert.doesNotMatch(INDEX_HTML, /id="skillsBtn"|id="mcpBtn"/,
     "old separate Skills/MCP header buttons should not remain visible in markup");
   assert.match(SRC, /const _ICON_CAPABILITIES = '<svg[\s\S]{0,220}<circle cx="12" cy="5" r="1\.85"\/>[\s\S]{0,180}<circle cx="12" cy="19" r="1\.85"\/><\/svg>';/,
@@ -1725,12 +1728,20 @@ test("assistant header groups Skills and MCP behind one vertical capabilities me
     "capability button should toggle the menu");
   assert.match(SRC, /_skillItem\.addEventListener\("click", \(\) => \{ _closeCapabilitiesMenu\(\); openSkillsPanel\(\); \}\)/,
     "Skills menu item should open the existing Skills panel");
-  assert.match(SRC, /_mcpItem\.addEventListener\("click", \(\) => \{ _closeCapabilitiesMenu\(\); openMcpPanel\(\); \}\)/,
-    "MCP menu item should open the existing MCP panel");
+  assert.match(SRC, /_rulesItem\.addEventListener\("click"[\s\S]{0,120}openUserRulesPanel/,
+    "用户规则那项要打开规则编辑面板");
   assert.match(SRC, /document\.getElementById\("capabilitiesBtn"\); if \(!b\) return;/,
     "active skill count badge should move to the shared capability button");
-  assert.match(APP_CSS, /\.assistant-capability__menu\s*\{[\s\S]{0,260}position:\s*absolute;[\s\S]{0,260}border-radius:\s*14px;/,
-    "capability menu should render as a lightweight anchored popover");
+  // 取整条规则体再判，不要数字符：原来那句用 [\s\S]{0,260} 卡窗口，往规则里加一行注释就红，
+  // 而注释和"它是不是一个轻量浮层"毫无关系。
+  const menuRule = /\.assistant-capability__menu\s*\{([^}]*)\}/.exec(APP_CSS);
+  assert.ok(menuRule, "找不到 .assistant-capability__menu 规则");
+  assert.match(menuRule[1], /position:\s*absolute;/);
+  assert.match(menuRule[1], /border-radius:\s*14px;/);
+  // 定位交给 JS 按实测几何算（对齐到 ⋮ 下方居中并夹进视口），CSS 里只留兜底值——
+  // 要是又写死 right:0，菜单会整块甩到按钮左边去，正是所有者报过的那个"很丑"。
+  assert.doesNotMatch(menuRule[1], /right:\s*0;/);
+  assert.match(SRC, /const _alignCapabilitiesMenu = \(\) => \{/);
   assert.match(APP_CSS, /\.assistant-capability__item-icon svg\s*\{[^}]*width:\s*18px;[\s\S]*height:\s*18px;/,
     "menu item icons should share the assistant toolbar visual size");
 });
@@ -2881,7 +2892,7 @@ test("Advanced Tools settings exposes the supported IDE language preference", ()
   assert.match(LOCALES_SRC, /export const GLOBAL_LANGUAGE_TAGS = Object\.freeze/);
   assert.match(SRC, /function _languagePreferenceBlock\(\) \{[\s\S]{0,620}全局语言与区域偏好[\s\S]{0,360}最终回答都使用该语言/,
     "AI requests should receive the global language and country preference");
-  assert.match(SRC, /const languageBlock = _languagePreferenceBlock\(\);[\s\S]{0,220}sysPrompt \+ languageBlock \+ adaptiveBlock/,
+  assert.match(SRC, /const languageBlock = _languagePreferenceBlock\(\);[\s\S]{0,220}sysPrompt \+ userRulesBlock \+ languageBlock \+ adaptiveBlock/,
     "lightweight chat must also follow the language preference");
   assert.match(SRC, /language:\s*args\.language \? String\(args\.language\) : _preferredLanguageCode\(\)/,
     "local discovery defaults should follow the selected language");
@@ -3000,7 +3011,7 @@ test("adaptive profile is persisted and injected into model context", () => {
     "global memory should be injected independently from the Adaptive style switch");
   assert.doesNotMatch(extractFn("_memoryBlocks"), /_adaptiveEnabled/,
     "Adaptive only controls coaching behavior, not durable remembered user preferences");
-  assert.match(SRC, /const adaptiveBlock = _adaptivePromptBlock\(\);[\s\S]{0,200}const languageBlock = _languagePreferenceBlock\(\);[\s\S]{0,220}const fullPrompt = _agentLightTurn \? \(sysPrompt \+ languageBlock \+ adaptiveBlock\) : \(sysPrompt \+ _modelStyleTuning\(config\.model\) \+ skillsBlock \+ _authContextBlock\(\) \+ languageBlock \+ adaptiveBlock\)/,
+  assert.match(SRC, /const adaptiveBlock = _adaptivePromptBlock\(\);[\s\S]{0,200}const languageBlock = _languagePreferenceBlock\(\);[\s\S]{0,220}const fullPrompt = _agentLightTurn \? \(sysPrompt \+ userRulesBlock \+ languageBlock \+ adaptiveBlock\) : \(sysPrompt \+ _modelStyleTuning\(config\.model\) \+ userRulesBlock \+ skillsBlock \+ _authContextBlock\(\) \+ languageBlock \+ adaptiveBlock\)/,
     "Every model send path should receive the Adaptive profile block");
 });
 
@@ -6496,7 +6507,7 @@ test("semantic lightweight chat builds a genuinely small request body", () => {
     "non-light turns should schedule Skills, MCP, and context warming without awaiting it");
   assert.doesNotMatch(extractFn("sendPrompt"), /await\s+(?:Promise\.race\(\[)?_refreshFileSkills/,
     "the first-token path must not await Skills discovery");
-  assert.match(SRC, /const fullPrompt = _agentLightTurn \? \(sysPrompt \+ languageBlock \+ adaptiveBlock\) : \(sysPrompt \+ _modelStyleTuning\(config\.model\) \+ skillsBlock \+ _authContextBlock\(\) \+ languageBlock \+ adaptiveBlock\)/,
+  assert.match(SRC, /const fullPrompt = _agentLightTurn \? \(sysPrompt \+ userRulesBlock \+ languageBlock \+ adaptiveBlock\) : \(sysPrompt \+ _modelStyleTuning\(config\.model\) \+ userRulesBlock \+ skillsBlock \+ _authContextBlock\(\) \+ languageBlock \+ adaptiveBlock\)/,
     "lightweight turns must not carry the full agent tuning/auth prompt");
   assert.match(SRC, /for \(const m of _lightweightMemoryMessagesForModel\(sess\.memory\)\) messages\.push\(m\)/,
     "lightweight turns must use bounded short history");
@@ -6685,7 +6696,7 @@ test("active Skills survive L0 prompt stripping and are inherited by child work"
 });
 
 test("dynamic time and bulky file context stay out of the cached system prefix", () => {
-  assert.match(SRC, /const adaptiveBlock = _adaptivePromptBlock\(\);[\s\S]{0,200}const languageBlock = _languagePreferenceBlock\(\);[\s\S]{0,220}const fullPrompt = _agentLightTurn \? \(sysPrompt \+ languageBlock \+ adaptiveBlock\) : \(sysPrompt \+ _modelStyleTuning\(config\.model\) \+ skillsBlock \+ _authContextBlock\(\) \+ languageBlock \+ adaptiveBlock\);/);
+  assert.match(SRC, /const adaptiveBlock = _adaptivePromptBlock\(\);[\s\S]{0,200}const languageBlock = _languagePreferenceBlock\(\);[\s\S]{0,220}const fullPrompt = _agentLightTurn \? \(sysPrompt \+ userRulesBlock \+ languageBlock \+ adaptiveBlock\) : \(sysPrompt \+ _modelStyleTuning\(config\.model\) \+ userRulesBlock \+ skillsBlock \+ _authContextBlock\(\) \+ languageBlock \+ adaptiveBlock\);/);
   assert.doesNotMatch(SRC, /const fullPrompt = [^\n;]*_currentDateBlock\(\)/);
   assert.doesNotMatch(SRC, /const fullPrompt = [^\n;]*_adaptiveMemoryBlock/,
     "per-query adaptive preference memory must never enter the cached system prefix");

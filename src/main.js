@@ -15366,18 +15366,47 @@ function _renderChatTabs() {
 const _ICON_CAPABILITIES = '<svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><circle cx="12" cy="5" r="1.85"/><circle cx="12" cy="12" r="1.85"/><circle cx="12" cy="19" r="1.85"/></svg>';
 const _ICON_SKILLS = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M2 3h6a4 4 0 0 1 4 4v14a3 3 0 0 0-3-3H2z"/><path d="M22 3h-6a4 4 0 0 0-4 4v14a3 3 0 0 1 3-3h7z"/></svg>';
 const _ICON_MCP = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22v-5"/><path d="M9 8V2"/><path d="M15 8V2"/><path d="M18 8v3a6 6 0 0 1-12 0V8z"/></svg>';
+// 用户规则：一张写着条文的纸。刻意不用"齿轮"——齿轮在这个界面里已经是「设置」的意思了。
+const _ICON_RULES = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6"/><path d="M8 13h8"/><path d="M8 17h5"/></svg>';
 {
   const _wrap = document.getElementById("capabilitiesMenuWrap");
   const _capBtn = document.getElementById("capabilitiesBtn");
   const _menu = document.getElementById("capabilitiesMenu");
   const _skillItem = document.getElementById("capabilitySkillsItem");
-  const _mcpItem = document.getElementById("capabilityMcpItem");
+  const _rulesItem = document.getElementById("capabilityRulesItem");
+  /*
+   * 菜单水平对齐到 ⋮ 按钮下方。
+   *
+   * 原来是 `right: 0`——菜单右缘贴着按钮右缘，整块往左甩出去一大截，按钮孤零零挂在菜单
+   * 的右上角，看着就是歪的。
+   *
+   * 但**真正的居中在这里做不到**：实测按钮中心离窗口右缘只有 30px，而菜单再窄也有一百多
+   * 像素，居中会溢出窗口 50+ px。所以是"尽量居中 + 贴边夹紧"：先按居中算，再夹进视口内
+   * （留 8px 边距）。窗口宽的时候它就是正的居中；贴着右边时退化成靠右，但不会跑出屏幕。
+   *
+   * 用 JS 而不是纯 CSS，是因为这个夹紧要参照**视口**宽度，CSS 里拿不到相对定位父元素与
+   * 视口的关系。开菜单时算一次，成本可以忽略。
+   */
+  const _alignCapabilitiesMenu = () => {
+    if (!_menu || !_capBtn || !_wrap) return;
+    const btn = _capBtn.getBoundingClientRect();
+    const wrap = _wrap.getBoundingClientRect();
+    const width = _menu.offsetWidth || 0;
+    if (!width) return;
+    const margin = 8;
+    const centered = (btn.left + btn.right) / 2 - width / 2;
+    // 夹紧的顺序不能反：先压上界再抬下界。写成 min(max(margin, x), 上界) 的话，一旦视口比
+    // 菜单还窄（上界 < 下界，例如窗口被拖到极窄、或某些嵌入场景里 innerWidth 报 0），
+    // min 会选中那个比 margin 还小的上界，菜单直接被推到屏幕外。这样写最差也只是贴左边。
+    const clamped = Math.max(margin, Math.min(centered, window.innerWidth - width - margin));
+    _menu.style.left = `${Math.round(clamped - wrap.left)}px`;
+  };
   const _closeCapabilitiesMenu = () => {
     if (_menu) _menu.hidden = true;
     if (_capBtn) _capBtn.setAttribute("aria-expanded", "false");
   };
   const _openCapabilitiesMenu = () => {
-    if (_menu) _menu.hidden = false;
+    if (_menu) { _menu.hidden = false; _alignCapabilitiesMenu(); }
     if (_capBtn) _capBtn.setAttribute("aria-expanded", "true");
   };
   const _toggleCapabilitiesMenu = () => {
@@ -15397,11 +15426,13 @@ const _ICON_MCP = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" st
     if (icon) icon.innerHTML = _ICON_SKILLS;
     _skillItem.addEventListener("click", () => { _closeCapabilitiesMenu(); openSkillsPanel(); });
   }
-  if (_mcpItem) {
-    const icon = _mcpItem.querySelector(".assistant-capability__item-icon");
-    if (icon) icon.innerHTML = _ICON_MCP;
-    _mcpItem.addEventListener("click", () => { _closeCapabilitiesMenu(); openMcpPanel(); });
+  if (_rulesItem) {
+    const icon = _rulesItem.querySelector(".assistant-capability__item-icon");
+    if (icon) icon.innerHTML = _ICON_RULES;
+    _rulesItem.addEventListener("click", () => { _closeCapabilitiesMenu(); void openUserRulesPanel(); });
   }
+  // 窗口大小一变，之前算好的 left 就不对了。菜单开着才重算，关着不做无用功。
+  window.addEventListener("resize", () => { if (_menu && !_menu.hidden) _alignCapabilitiesMenu(); });
   document.addEventListener("click", (ev) => {
     if (_menu?.hidden) return;
     if (_wrap && ev.target instanceof Node && _wrap.contains(ev.target)) return;
@@ -22758,6 +22789,42 @@ function _preferredLanguageCode() {
   try { return localeLanguageCode(_preferredLocale(), "zh"); } catch { return "zh"; }
 }
 
+// ── 用户规则：跨项目的长期要求 ──────────────────────────────────────────────
+//
+// 项目级约定一直会读（AGENTS.md / CLAUDE.md / .cursorrules，见 _gatherAgentContext），
+// **用户级的一直没有**。「我一律用 pnpm」「回答用中文」「别写没要求的测试」这类要求跟着
+// 人走不跟着项目走，以前只能每个项目重抄一遍，或者每轮对话重复一次。
+//
+// 存 `~/.michael-ide/rules.md`（和 mcp.json 同目录，0600）。内存里缓存一份，面板保存后
+// 立刻刷新——不然改完要等下次启动才生效，用户会以为没保存上。
+let _userRulesText = "";
+let _userRulesLoaded = false;
+const _USER_RULES_MAX = 4_000;   // 软上限：这段每一轮都发，超了截断并在块里说明
+
+async function _refreshUserRules() {
+  if (!inTauri) { _userRulesText = ""; _userRulesLoaded = true; return _userRulesText; }
+  try {
+    const out = await backend.invoke("user_rules_read");
+    _userRulesText = String(out?.text || "");
+  } catch { _userRulesText = ""; }
+  _userRulesLoaded = true;
+  return _userRulesText;
+}
+
+/// 进系统提示词的那一段（没写规则就是空串，一个字节都不占）。
+function _userRulesBlock() {
+  const text = String(_userRulesText || "").trim();
+  if (!text) return "";
+  const body = text.length > _USER_RULES_MAX
+    ? text.slice(0, _USER_RULES_MAX) + "\n…（用户规则超出本轮预算，后文已截断——建议精简）"
+    : text;
+  // 说清楚它的来源和权重：用户自己写的长期要求，优先级在项目约定之上（项目约定是团队的，
+  // 这条是他本人的），但仍然低于他在**这一轮**里的明确指令。
+  return "\n\n# 用户规则（这台机器的主人写的长期要求，每一轮都适用）\n"
+    + "优先级：高于项目约定；但如果他在本轮里说了相反的话，听本轮的。\n\n"
+    + body + "\n";
+}
+
 function _languagePreferenceBlock() {
   const locale = _preferredLocale();
   const label = localeDisplayName(locale, "zh-CN");
@@ -23880,10 +23947,13 @@ async function sendPrompt(text, attachments = [], readyConfig = null) {
   // Append the model-family style corrective (GPT → strong anti-verbosity; weaker
   // models → terse). Static per model, so the prompt prefix still caches.
   const skillsBlock = _agentLightTurn ? "" : _skillsSystemBlock();
+  // 用户规则连轻量轮也带上：那些轮次省的是系统提示词和工作区预热，而"用中文回答"这种
+  // 要求恰恰在闲聊轮最该生效——省掉它等于每次寒暄都破一次规矩。
+  const userRulesBlock = _userRulesBlock();
   const adaptiveBlock = _adaptivePromptBlock();
   const _adaptiveMemory = _adaptiveMemoryBlock(text);
   const languageBlock = _languagePreferenceBlock();
-  const fullPrompt = _agentLightTurn ? (sysPrompt + languageBlock + adaptiveBlock) : (sysPrompt + _modelStyleTuning(config.model) + skillsBlock + _authContextBlock() + languageBlock + adaptiveBlock);
+  const fullPrompt = _agentLightTurn ? (sysPrompt + userRulesBlock + languageBlock + adaptiveBlock) : (sysPrompt + _modelStyleTuning(config.model) + userRulesBlock + skillsBlock + _authContextBlock() + languageBlock + adaptiveBlock);
 
   if (!_agentLightTurn) _compactHistoryIfNeeded(sess);
 
@@ -27309,6 +27379,65 @@ function _openMcpUrl(url) {
   try { if (backend.taskRunCapture) { backend.taskRunCapture("/", 'open "' + url + '"').catch(() => { try { openExternal(url); } catch {} }); return; } } catch {}
   try { openExternal(url); } catch {}
 }
+/// 用户规则编辑器。一个纯文本框——规则就是给模型看的话，不该套一层表单。
+async function openUserRulesPanel() {
+  const m = _chatToolModal({ title: "用户规则", icon: _ICON_RULES });
+  if (!inTauri) { m.body.innerHTML = `<div class="ctp-empty">用户规则只能在桌面 App 里编辑。</div>`; return; }
+  m.body.innerHTML = `<div class="ctp-loading">加载中…</div>`;
+  let path = "";
+  try {
+    const out = await backend.invoke("user_rules_read");
+    _userRulesText = String(out?.text || "");
+    _userRulesLoaded = true;
+    path = String(out?.path || "");
+  } catch (e) {
+    m.body.innerHTML = `<div class="ctp-empty">读取失败：${_escHtml(String(e?.message || e).slice(0, 160))}</div>`;
+    return;
+  }
+  m.body.innerHTML = "";
+  const intro = document.createElement("div");
+  intro.className = "ctp-intro";
+  intro.innerHTML = `写给 AI 的长期要求，<b>每一轮对话都会带上</b>，换项目也在。`
+    + `适合放"我一律用 pnpm""回答用中文""改完先跑测试再说完成"这类跟着你走、不跟着项目走的事。`
+    + `<br>项目自己的约定继续写在仓库的 <code>AGENTS.md</code> / <code>CLAUDE.md</code> 里——那是团队的，这里是你自己的。`
+    + (path ? `<br>保存在 <code>${_escHtml(path)}</code>（权限 0600）。` : "");
+  const area = document.createElement("textarea");
+  area.className = "ctp-textarea";
+  area.rows = 14;
+  area.placeholder = "每行一条，直接用大白话写。例如：\n\n回答用中文。\n包管理器一律用 pnpm，不要用 npm。\n改完代码先跑测试，别直接说做完了。";
+  area.value = _userRulesText;
+  const foot = document.createElement("div");
+  foot.className = "ctp-foot ctp-foot--between";
+  const hint = document.createElement("span");
+  hint.className = "ctp-hint";
+  const paint = () => {
+    const n = area.value.trim().length;
+    hint.textContent = n
+      ? `${n} 字符${n > _USER_RULES_MAX ? `（超过 ${_USER_RULES_MAX}，发送时会截断——建议精简）` : ""}`
+      : "留空 = 不启用";
+    hint.style.color = n > _USER_RULES_MAX ? "var(--atc-danger, #d93025)" : "";
+  };
+  area.addEventListener("input", paint);
+  paint();
+  const save = document.createElement("button");
+  save.className = "ctp-btn ctp-btn--primary"; save.type = "button"; save.textContent = "保存";
+  save.addEventListener("click", async () => {
+    save.disabled = true; save.textContent = "保存中…";
+    try {
+      await backend.invoke("user_rules_save", { text: area.value });
+      _userRulesText = area.value;       // 立刻生效，不用等重启
+      showToast(area.value.trim() ? "用户规则已保存，下一轮对话就会带上" : "已清空用户规则");
+      m.close();
+    } catch (e) {
+      save.disabled = false; save.textContent = "保存";
+      showToast("保存失败：" + String(e?.message || e).slice(0, 140));
+    }
+  });
+  foot.append(hint, save);
+  m.body.append(intro, area, foot);
+  setTimeout(() => { try { area.focus(); } catch {} }, 0);
+}
+
 async function openMcpPanel(opts = null) {
   const m = _chatToolModal({ title: "MCP · 服务", icon: _ICON_MCP, wide: true });
   const root = (rootPath || workspaceRoots[0] || "").replace(/\/$/, "");

@@ -634,9 +634,12 @@ body.is-tauri.is-mac.is-fullscreen .titlebar {
 .assistant-capability__menu {
   position: absolute;
   top: calc(100% + 8px);
-  right: 0;
+  /* left 由 JS 按实测几何算（见 _alignCapabilitiesMenu）：对齐到 ⋮ 按钮下方居中，
+     再夹进视口内。这里给个兜底值，JS 没跑起来时也不会贴到左边去。 */
+  left: 0;
   z-index: 70;
-  min-width: 176px;
+  /* 收窄：两行标题 + 副标题不需要 176px，宽出来的部分全是空白。 */
+  min-width: 148px;
   padding: 6px;
   background: var(--panel-solid, #fff);
   border: 1px solid var(--line);

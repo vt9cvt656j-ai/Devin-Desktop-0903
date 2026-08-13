@@ -349,15 +349,15 @@ export function Shell() {
                     <button className="assistant-capability__item" id="capabilitySkillsItem" type="button" role="menuitem">
                       <span className="assistant-capability__item-icon"></span>
                       <span className="assistant-capability__item-main">
-                        <span className="assistant-capability__item-title" data-i18n="assistant.capability.skills">Skills</span>
-                        <span className="assistant-capability__item-sub" data-i18n="assistant.capability.skillsSub">技能</span>
+                        <span className="assistant-capability__item-title">全局技能</span>
+                        <span className="assistant-capability__item-sub">所有项目通用</span>
                       </span>
                     </button>
-                    <button className="assistant-capability__item" id="capabilityMcpItem" type="button" role="menuitem">
+                    <button className="assistant-capability__item" id="capabilityRulesItem" type="button" role="menuitem">
                       <span className="assistant-capability__item-icon"></span>
                       <span className="assistant-capability__item-main">
-                        <span className="assistant-capability__item-title" data-i18n="assistant.capability.mcp">MCP</span>
-                        <span className="assistant-capability__item-sub" data-i18n="assistant.capability.mcpSub">服务</span>
+                        <span className="assistant-capability__item-title">用户规则</span>
+                        <span className="assistant-capability__item-sub">每轮都遵守</span>
                       </span>
                     </button>
                   </span>

@@ -1192,6 +1192,77 @@ fn save_user_config_at(path: &std::path::Path, text: &str) -> Result<String, Str
     Ok(path.to_string_lossy().into_owned())
 }
 
+// ── 用户规则：跨项目的长期要求 ────────────────────────────────────────────────
+//
+// 项目级的约定这个 IDE 一直会读（AGENTS.md / CLAUDE.md / .cursorrules /
+// .github/copilot-instructions.md，见 _gatherAgentContext），但**用户级的没有**——
+// 「我一律用 pnpm」「回答用中文」「别写没要求的测试」这类跟着人走、不跟着项目走的要求，
+// 以前只能每个项目重写一遍，或者每轮对话重复一次。
+//
+// 放在 `~/.michael-ide/rules.md`，和 mcp.json 同一个目录。走独立命令而不是
+// write_text_file_if_unchanged 的理由和那边一样：那条路的 require_inside_workspace
+// 明确拒绝"在 HOME 底下但不在已打开工作区里"的写入，不该为一个文件把那道墙挖开。
+const USER_RULES_FILE: &str = "rules.md";
+/// 规则是给模型读的，进的是每轮的系统提示词。给个硬上限，避免有人贴进去一整本手册
+/// 之后每轮都在为它付钱——前端另有更小的软上限并会提示。
+const MAX_USER_RULES_BYTES: usize = 64 * 1024;
+
+fn user_rules_path() -> Result<std::path::PathBuf, String> {
+    Ok(home_dir()?.join(USER_CONFIG_DIR).join(USER_RULES_FILE))
+}
+
+/// 读用户规则。文件不存在就是空串——"还没写过"不是错误。
+#[tauri::command]
+pub fn user_rules_read() -> Result<Value, String> {
+    let path = user_rules_path()?;
+    let text = read_capped(&path).unwrap_or_default();
+    Ok(json!({ "path": path.to_string_lossy(), "text": text }))
+}
+
+/// 覆盖写用户规则；空内容等于删掉这个文件（而不是留一个空文件让后面的读取多绕一圈）。
+#[tauri::command]
+pub fn user_rules_save(text: String) -> Result<String, String> {
+    if text.len() > MAX_USER_RULES_BYTES {
+        return Err(format!(
+            "用户规则太长（{} 字节，上限 {}）。这段内容每一轮对话都会发给模型。",
+            text.len(),
+            MAX_USER_RULES_BYTES
+        ));
+    }
+    let path = user_rules_path()?;
+    let dir = path
+        .parent()
+        .ok_or_else(|| "无法确定配置目录".to_string())?
+        .to_path_buf();
+    if text.trim().is_empty() {
+        match std::fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(format!("无法清空 {}：{e}", path.display())),
+        }
+        return Ok(path.to_string_lossy().into_owned());
+    }
+    std::fs::create_dir_all(&dir).map_err(|e| format!("无法创建 {}：{e}", dir.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+    }
+    let temp = dir.join(format!("{USER_RULES_FILE}.tmp"));
+    std::fs::write(&temp, text.as_bytes()).map_err(|e| format!("写入失败：{e}"))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&temp, std::fs::Permissions::from_mode(0o600))
+            .map_err(|e| format!("无法收紧 {} 的权限：{e}", temp.display()))?;
+    }
+    std::fs::rename(&temp, &path).map_err(|e| {
+        let _ = std::fs::remove_file(&temp);
+        format!("无法保存 {}：{e}", path.display())
+    })?;
+    Ok(path.to_string_lossy().into_owned())
+}
+
 /// Disconnect and kill an MCP server session.
 #[tauri::command]
 pub async fn mcp_disconnect(name: String) -> Result<(), String> {
@@ -1258,6 +1329,50 @@ mod tests {
             Some(env!("CARGO_MANIFEST_DIR").into()),
         )
         .await
+    }
+
+    /// 规则文件的读写往返。路径参数化，测试不碰真实的 ~/.michael-ide。
+    fn rules_roundtrip_at(path: &std::path::Path, text: &str) -> Result<String, String> {
+        let dir = path.parent().unwrap();
+        std::fs::create_dir_all(dir).unwrap();
+        if text.trim().is_empty() {
+            let _ = std::fs::remove_file(path);
+            return Ok(path.to_string_lossy().into_owned());
+        }
+        std::fs::write(path, text).map_err(|e| e.to_string())?;
+        Ok(path.to_string_lossy().into_owned())
+    }
+
+    #[test]
+    fn user_rules_are_bounded_so_one_paste_cannot_tax_every_turn() {
+        // 这段每一轮都发给模型。贴进去一整本手册的话，成本是按轮计的。
+        let huge = "x".repeat(MAX_USER_RULES_BYTES + 1);
+        let error = user_rules_save(huge).unwrap_err();
+        assert!(error.contains("太长"), "{error}");
+        assert!(error.contains("每一轮"), "报错要说清为什么有上限：{error}");
+    }
+
+    #[test]
+    fn clearing_user_rules_removes_the_file_rather_than_leaving_an_empty_one() {
+        let dir = std::env::temp_dir().join("michael-rules-clear");
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("rules.md");
+        rules_roundtrip_at(&path, "回答用中文。").unwrap();
+        assert!(path.exists());
+        rules_roundtrip_at(&path, "   \n  ").unwrap();
+        assert!(
+            !path.exists(),
+            "清空应当删掉文件，而不是留个空文件让后面每次读取都多绕一圈"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reading_absent_user_rules_is_empty_not_an_error() {
+        // "还没写过规则"是常态，不是错误——报错的话前端每次开面板都要处理一次假失败。
+        let path = std::env::temp_dir().join("michael-rules-absent/rules.md");
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+        assert_eq!(read_capped(&path).unwrap_or_default(), "");
     }
 
     #[test]
