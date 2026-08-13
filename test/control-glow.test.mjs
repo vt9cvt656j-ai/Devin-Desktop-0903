@@ -269,3 +269,32 @@ test("构建不会悄悄退回 ad-hoc 签名", () => {
   assert.match(conf, /"signingIdentity":\s*"[^"-][^"]*"/,
     "必须指定一个真实的签名身份");
 });
+
+// —— michael-design：设计证据要赶在第一个模型回合之前到场 ——
+
+test("设计证据在首个模型回合之前有界等待，不是发完就走", () => {
+  // 原来的写法是 _startMichaelDesignPreflight(...) 之后紧跟同步的 _consumeMichaelDesignPreflight()，
+  // 中间没有任何 await——检索请求不可能已经回来，brief 最早只能在第二个回合注入。而同一轮的
+  // UI 律已经在告诉模型「先用本轮已预取的三轨证据」。模型于是照着不存在的证据定配色和结构。
+  const code = stripJsComments(SRC);
+  const start = code.indexOf("_startMichaelDesignPreflight({ run, body, isLive: _live });");
+  assert.ok(start > 0, "找不到预检启动点");
+  const consume = code.indexOf("_consumeMichaelDesignPreflight();", start);
+  assert.ok(consume > start, "找不到消费点");
+  const between = code.slice(start, consume);
+  assert.match(between, /await Promise\.race\(/,
+    "启动与消费之间必须有一次有界等待，否则 brief 赶不上第一个回合");
+  assert.match(between, /_michaelDesignPreflightPromise/, "等的必须是预检那个 promise");
+  assert.match(between, /setTimeout\(resolve, _MICHAEL_DESIGN_PREFLIGHT_WAIT_MS\)/,
+    "等待必须有上界，不能无限期卡住首个 token");
+  assert.match(between, /designKnowledgeRequired/,
+    "只在真的需要设计知识时等，别拖慢所有任务");
+});
+
+test("界面活会自动去取设计蓝图，不用用户提醒", () => {
+  // 这条进的是随 system 前缀发送、字节稳定的场景直觉表——每一轮都在，
+  // 所以模型碰到界面活时的第一反应就是先取蓝图，而不是凭印象编色。
+  const hint = extractTopLevelFn("_buildToolHint");
+  assert.match(hint, /michael-design/, "场景直觉表必须把界面活指向 michael-design");
+  assert.match(hint, /界面|UI/, "要说清什么算界面活");
+});
