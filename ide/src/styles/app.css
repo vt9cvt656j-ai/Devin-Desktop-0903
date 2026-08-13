@@ -6623,8 +6623,10 @@ button.agent-plan__fold--toggle:focus-visible { outline: 2px solid #1a73e8; outl
 }
 .agent-term-card--running { border-color: rgba(9,105,218,.3); box-shadow: 0 0 0 1px rgba(9,105,218,.08); }
 .agent-term-card--risk { border-left: 3px solid #f2b600; box-shadow: 0 0 0 1px rgba(251,188,4,.09); }
-.agent-term-card--ok { border-left: 3px solid var(--atc-success); }
-.agent-term-card--err { border-left: 3px solid var(--atc-danger); }
+/* 成 / 败**不**画左侧色条：退出状态已经写在卡片右上角的徽章里（✓ exit 0 / ✗ exit 1，
+   自带图标和颜色），左边再来一条同色竖线是把同一件事说两遍——一屏堆上几张就只剩噪音。
+   类名保留：JS 照常打上，别处（折叠、测试）按它选。
+   `--risk` 那条黄线留着——它说的是"这条命令有风险"，是另一个信号，不是退出码的重复。 */
 
 /* Light mode terminal card.
    注意这里必须写 `:root:not([data-theme])` 而不是裸的 `:not([data-theme])`：
@@ -6691,10 +6693,6 @@ button.agent-plan__fold--toggle:focus-visible { outline: 2px solid #1a73e8; outl
 :root:not([data-theme]) .agent-term-risk { color: #9a6700; background: rgba(251,188,4,.13); border-color: rgba(251,188,4,.28); }
 [data-theme="light"] .agent-term-spinner,
 :root:not([data-theme]) .agent-term-spinner { border-color: rgba(9,105,218,.2); border-top-color: #0969da; }
-[data-theme="light"] .agent-term-card--ok,
-:root:not([data-theme]) .agent-term-card--ok { border-left-color: #1a7f37; }
-[data-theme="light"] .agent-term-card--err,
-:root:not([data-theme]) .agent-term-card--err { border-left-color: #cf222e; }
 [data-theme="light"] .agent-term-card--running,
 :root:not([data-theme]) .agent-term-card--running { border-color: rgba(9,105,218,.2); }
 [data-theme="light"] .agent-term-card--risk,
