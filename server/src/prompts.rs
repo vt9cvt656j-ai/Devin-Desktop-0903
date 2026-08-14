@@ -6838,8 +6838,14 @@ mod tests {
             let cjk = automation_system.chars().filter(|c| ('\u{4e00}'..='\u{9fff}').contains(c)).count();
             cjk + (automation_system.chars().count() - cjk) / 4
         };
+        // 5_900：这条守的是「自动化任务不该背 UI 税」，而同一个测试里那几条
+        // "不含 michael-design 各层" 的断言才是它真正的保证——它们仍然成立。
+        // 数字上浮是因为 agent_core（每轮都发的核心层，不是 UI 层）加了一条：
+        // 「没有现成工具不等于做不到，自己造出来用」。此前整个提示词体系里没有任何一条
+        // 这样的指令，模型碰到没内置支持的服务/格式就直说做不到——用户报的"很呆"就是它。
+        // 这条对自动化任务同样适用，不是 UI 专属，所以该由核心层承担。
         assert!(
-            automation_tokens < 5_600,
+            automation_tokens < 5_900,
             "automation prompt should not pay the UI tax: ~{automation_tokens} tokens ({} bytes)",
             automation_system.len()
         );
@@ -7264,6 +7270,39 @@ mod palette_single_source_tests {
         assert!(
             !block.contains("orange-950"),
             "orange-950 是抄漂了的旧值，真源里没有：{block}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod resourcefulness_tests {
+    use super::read_prompt;
+
+    /// 「没有现成工具 ≠ 做不到」必须在**每轮都发**的核心层里。
+    ///
+    /// 此前整个提示词体系里没有任何一条这样的指令：全部 30 个 prompt 文件里，最接近的
+    /// 一句讲的是"注册表里有、只是没装进开局窗口"，跟"没有就自己拼"是两回事。
+    /// 于是碰到没内置支持的服务、没人认的文件格式、想固化的工作流，模型就直说做不到——
+    /// 而它手上其实有 http_request、有 run_cmd、有写文件的能力。
+    #[test]
+    fn 核心层写明没有现成工具也要自己造() {
+        let core = read_prompt("agent_core").expect("agent_core.txt");
+        assert!(
+            core.contains("not a reason to say you cannot"),
+            "核心层必须直说「没有内置工具不等于做不到」"
+        );
+        // 三条具体出路，缺一条模型就少一种解法
+        for (needle, why) in [
+            ("http_request", "没有专用工具的服务要能自己按文档调"),
+            ("write the parser", "没人认的格式要能自己写解析"),
+            ("SKILL.md", "值得留下的能力要能存成技能"),
+        ] {
+            assert!(core.contains(needle), "缺少出路：{why}");
+        }
+        // 时机要说清，否则模型会以为写完技能这轮就能用
+        assert!(
+            core.contains("same-turn") || core.contains("next run"),
+            "必须说清哪条当轮生效、哪条下一轮才生效"
         );
     }
 }
