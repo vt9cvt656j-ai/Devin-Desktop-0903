@@ -1941,3 +1941,54 @@ mod tests {
     }
 }
 
+
+#[cfg(test)]
+mod live_user_config_tests {
+    /// 用 IDE 自己的客户端，按用户真实配置连一次、列一次工具。
+    ///
+    /// 「配置写进去了」和「IDE 真的能用它」是两回事：GUI 启动的 App 拿到的 PATH 很窄，
+    /// 裸 npx 常常 spawn 不起来；配置形状写错也只会在运行时静默变成"没有工具"。
+    /// 这条测试走的是 connect_full_blocking——和运行时同一条路。
+    ///
+    /// 标 ignore：它会真的拉起子进程、走网络装包，不适合进常规 CI。
+    /// 手动跑：cargo test --release live_user_config -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn 用户配置里的服务能真连上并列出工具() {
+        let configs = super::mcp_user_configs().expect("读用户 MCP 配置");
+        let mut checked = 0;
+        for cfg in &configs {
+            let Some(servers) = cfg.servers.as_object() else { continue };
+            for (name, spec) in servers {
+                let command = spec.get("command").and_then(|v| v.as_str()).unwrap_or("");
+                if command.is_empty() {
+                    continue;
+                }
+                let args: Vec<String> = spec
+                    .get("args")
+                    .and_then(|v| v.as_array())
+                    .map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect())
+                    .unwrap_or_default();
+                println!("  连接 {name}: {command} {}", args.join(" "));
+                let out = super::connect_full_blocking(
+                    name.clone(),
+                    command.to_string(),
+                    Some(args),
+                    None,
+                    None,
+                );
+                match out {
+                    Ok(d) => {
+                        println!("    ✅ 工具 {} 个: {}", d.tools.len(),
+                            d.tools.iter().map(|t| t.name.as_str())
+                                .collect::<Vec<_>>().join(", "));
+                        assert!(!d.tools.is_empty(), "{name} 连上了但一个工具都没有");
+                        checked += 1;
+                    }
+                    Err(e) => panic!("{name} 连接失败：{e}"),
+                }
+            }
+        }
+        assert!(checked > 0, "用户配置里一个可连的 MCP 服务都没有");
+    }
+}
