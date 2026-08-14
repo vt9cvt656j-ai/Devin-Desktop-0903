@@ -336,6 +336,12 @@ Object.assign(AUTO_LOAD_DEPS, {
   // Read from source rather than restated here, so a marker change in main.js cannot silently
   // diverge from what the budget tests exercise.
   _REQUEST_MARKERS: loadConst("_REQUEST_MARKERS"),
+  // _selectInitialTools 现在还要按「整服务放行」把小体量 MCP 服务放进开局窗口，
+  // 于是多了这三个依赖。同样从源码读，不在这里复述数字——上限调了而测试还按旧值
+  // 跑，等于守着一条早已不存在的边界。
+  _INITIAL_MCP_MAX_TOOLS: loadConst("_INITIAL_MCP_MAX_TOOLS"),
+  _INITIAL_MCP_MAX_BYTES: loadConst("_INITIAL_MCP_MAX_BYTES"),
+  _utf8ByteLength: load("_utf8ByteLength"),
 });
 const BASENAME = load("basename");
 const FILE_WATCHER_ROOT_PLAN = load("_fileWatcherRootPlan");

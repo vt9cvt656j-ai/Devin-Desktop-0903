@@ -25924,6 +25924,12 @@ const _MCP_TOOL_SEARCH_WAIT_MS = 8_000;
 // make the model choose among the entire product catalog.
 const _TOOL_PAYLOAD_MAX_TOOLS = 128;
 const _TOOL_PAYLOAD_MAX_SCHEMA_BYTES = 512 * 1024;
+// 允许进**开局**窗口的 MCP 用量（见 _selectInitialTools 里的整服务放行）。
+// 开局窗口本来是 10 个核心工具 + search_tools；这两个上限意味着最多变成 19 个，
+// 仍远低于 128 / 512 KiB 的总窗口。定得住的理由：用户自己配的一两个小服务该像内建
+// 工具一样零成本可选，而一个 35 个工具的服务不该有资格挤进开局。
+const _INITIAL_MCP_MAX_TOOLS = 8;
+const _INITIAL_MCP_MAX_BYTES = 12_000;
 
 function _utf8ByteLength(value) {
   let bytes = 0;
@@ -30358,6 +30364,48 @@ function _selectInitialTools(includeWrite, taskText, mcpTools = [], mode = inclu
     return !!n && !mcpNames.has(n) && coreNames.has(n);
   });
   
+  // ── 体量小的 MCP 服务直接进开局窗口 ────────────────────────────────────────
+  // 把 MCP 一律挡在窗口外，代价不是"晚一轮加载"，而是**结构性地永远不会被选中**：
+  // 内建的 web_fetch / http_request 就在窗口里，零成本可调；同样能办成的 MCP 工具却要
+  // 先花一轮 search_tools 取 schema。两条路结果差不多时，模型当然走便宜的那条。
+  // 实测就是这样：装好 context7、名录也报给它了，问「查 shadcn 最新官方文档」，它照旧
+  // 用 web_fetch 抓网页，context7 一次都没调。
+  //
+  // 但当初排除它们的理由也是真的：一个 35 个工具的服务会把开局窗口挤爆。
+  // 所以按**服务**整体放行，工具少的先进，进不下的整个服务留给 search_tools：
+  //   · 整服务放行 —— 只放进半个服务的工具清单，比不放更糟：模型会以为那就是全部；
+  //   · 双预算（条数 + 字节）—— MCP 的 JSON schema 可以很大，只数条数拦不住；
+  //   · 装不进的照样在上下文的 MCP 名录里（_mcpAvailabilitySystemContext），
+  //     带名字带说明，search_tools 一步就能取回，不是失联。
+  const mcpByServer = new Map();
+  for (const tool of (Array.isArray(mcpTools) ? mcpTools : [])) {
+    const name = String(tool?.function?.name || "");
+    if (!name.startsWith("mcp__")) continue;
+    const rest = name.slice("mcp__".length);
+    const cut = rest.indexOf("__");
+    if (cut <= 0) continue;
+    const service = rest.slice(0, cut);
+    if (!mcpByServer.has(service)) mcpByServer.set(service, []);
+    mcpByServer.get(service).push(tool);
+  }
+  let mcpBudgetTools = _INITIAL_MCP_MAX_TOOLS;
+  let mcpBudgetBytes = _INITIAL_MCP_MAX_BYTES;
+  const ranked = [...mcpByServer.entries()].sort((a, b) =>
+    a[1].length - b[1].length || (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0));
+  for (const [, tools] of ranked) {
+    let bytes = 0;
+    try { bytes = _utf8ByteLength(JSON.stringify(tools)); } catch { bytes = Infinity; }
+    if (tools.length > mcpBudgetTools || bytes > mcpBudgetBytes) continue;
+    mcpBudgetTools -= tools.length;
+    mcpBudgetBytes -= bytes;
+    // 服务内部按名字排序：不排的话首包顺序跟着发现顺序走，同一份配置两次启动可能
+    // 排出两种工具表，白白打穿提示词缓存前缀，也让"这轮到底发了什么"不可复现。
+    for (const tool of tools.slice().sort((x, y) => {
+      const a = String(x?.function?.name || ""), b = String(y?.function?.name || "");
+      return a < b ? -1 : a > b ? 1 : 0;
+    })) out.push(tool);
+  }
+
   // Every Agent turn has the registry discovery entry point, including conversational
   // turns whose profile happens to be answer-only. It is still bounded by the payload
   // window and does not expose the complete catalog in the prompt.
