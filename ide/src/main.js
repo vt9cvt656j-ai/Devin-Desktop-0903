@@ -32757,7 +32757,13 @@ const _DOC_EXT = /\.(pdf|docx|pptx|xlsx|odt)$/i;
 async function _readFileOrDoc(fp) {
   if (_DOC_EXT.test(fp) && !(typeof _remote !== "undefined" && _remote && _remote.active)) {
     try { const t = await backend.invoke("read_document", { path: fp }); return typeof t === "string" ? t : String(t || ""); }
-    catch (e) { return `[文档无法解析] ${String(e?.message || e)}`; }
+    catch (e) {
+      // 别把解析失败当成文件内容返回：那样 readFailed 是 false，这次读取被记成**成功**
+      // 并进了读缓存，模型于是拿着一句错误文案当文档正文往下推。抛出去，让失败就是失败，
+      // 并顺带说清真正的出路——这类格式基本都能用 run_cmd 跑个脚本读出来。
+      const _m = String(e?.message || e);
+      throw new Error(`${_m}。文档抽取只覆盖文本层；要按结构读（表格行列、数值、嵌入对象），用 run_cmd 跑 python（openpyxl / pandas / pdfplumber）或对应的命令行工具。`);
+    }
   }
   return await backend.readTextFile(fp);
 }
@@ -43144,12 +43150,14 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
           let content;
           if (lines.length) content = "已加载 " + lines.length + " 个工具，现在可直接调用：\n" + lines.join("\n") + (usedFuzzyFallback ? "\n（语义调度本次不可用，以上为多维度模糊匹配结果，按推荐场景自行判断适用性）" : thoughtNote) + rejectedNote;
           else if (exact?.schema && loaded.has(exact.name)) content = `工具已加载：\n· ${compactToolGuide(exact.schema)}`;
-          else if (exact && !exact.schema) content = `当前注册表没有名为 ${exact.name} 的工具。`;
+          // 「没有这个工具」是能力缺口，不是查询写错了。以前这句到此为止，模型就把它当
+          // 「IDE 不支持」回给用户——用户说的"很呆"正是这个。指路要跟着结论一起给。
+          else if (exact && !exact.schema) content = `当前注册表没有名为 ${exact.name} 的工具——注册表是起手包，不是能力边界。别再换词搜，直接按目标组合出来：外部服务/API → web_search+web_fetch 读官方文档再用 http_request 打通；本地格式或批处理 → write_file 写脚本 + run_cmd 跑；工作区里的 .db/.sqlite → db_query 传 driver=sqlite、url=sqlite:///绝对路径；值得复用的流程 → 写成 <工作区>/.claude/skills/<名字>/SKILL.md，下一轮就在你的技能清单里。`;
           else if (adds.length) content = `语义调度选出 ${adds.length} 个工具，但当前 128 tools / 512 KiB 窗口无法装入，未加载。请缩小当前阶段后重试。`;
           else if (semanticDecision?.instruction) content = `语义调度未要求增加新 schema；当前工具已足够。${thoughtNote}\n下一步：${semanticDecision.instruction}`;
           else if (fuzzyHits.length && fuzzyHits.every((h) => h.alreadyLoaded)) content = `相关工具均已加载，可直接调用：\n${fuzzyHits.slice(0, 8).map((h) => `· ${h.name}${_toolMetaGuideSuffix(h.name)}`).join("\n")}`;
           else if (mcpFailureNote) content = `没有找到匹配的新工具；部分 MCP 服务在后台发现时失败。\n\n${mcpFailureNote}`;
-          else content = "语义工具调度本次不可用，且模糊匹配无命中。可换更具体的能力描述（如「数据库查询」而不是「查数据」）或按已知注册名称重试。";
+          else content = "语义工具调度本次不可用，且模糊匹配无命中。这**不是检索失败，是这件事没有专用工具**——注册表是起手包，不是能力边界。别再换词空搜，按目标改走组合路径：外部服务或 API → web_search/web_fetch 读官方文档，再用 http_request 打通；本地格式或批处理 → write_file 写个脚本 + run_cmd 跑（这是正路，不算绕过专用工具）；工作区里的 .db/.sqlite 文件 → db_query 传 driver=sqlite、url=sqlite:///绝对路径（路径本身就是连接串，不用问用户要）；值得复用的流程 → 写成 <工作区>/.claude/skills/<名字>/SKILL.md 存下来，下一轮它就在你的技能清单里。";
           const r = { type: "search_tools", path: "", content };
           it.rawResult = r;
           _settleToolStep(step, r, lines.length ? `已加载 ${lines.length}` : "无新工具");

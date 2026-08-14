@@ -1526,7 +1526,22 @@ pub fn read_document(path: String) -> Result<String, String> {
         "pdf" => pdf_extract::extract_text(&path).map_err(|e| format!("PDF 解析失败: {e}"))?,
         "docx" | "odt" => extract_office(&path, |n| n == "word/document.xml" || n == "content.xml")?,
         "pptx" => extract_office(&path, |n| n.starts_with("ppt/slides/slide") && n.ends_with(".xml"))?,
-        "xlsx" => extract_office(&path, |n| n == "xl/sharedStrings.xml")?,
+        // 只抽 sharedStrings 是**去重后的字符串池**：没有行列、没有 sheet 名，而且数值单元格
+        // 根本不在这个文件里（数字存在 worksheet XML 的 <v> 里）。纯数字表抽出来是空的。
+        // 把 worksheet 一起抽出来，至少单元格引用和数值在场，模型能对上号；结构化读取仍然
+        // 要靠 run_cmd + python，下面的抬头会说明这一点。
+        "xlsx" => {
+            let text = extract_office(&path, |n| {
+                n == "xl/sharedStrings.xml"
+                    || (n.starts_with("xl/worksheets/sheet") && n.ends_with(".xml"))
+            })?;
+            format!(
+                "【注意：这是 Excel 的**文本层抽取**，不是结构化表格】共享字符串与单元格内容\
+                 被拼在一起，行列关系、sheet 名、公式与格式都不在其中，数值与文本的对应关系\
+                 需要自行对照单元格引用。要按行列读真实数据，用 run_cmd 跑 python\
+                 （openpyxl / pandas.read_excel），不要凭下面的文本推断表结构。\n\n{text}"
+            )
+        }
         other => {
             return Err(format!(
                 "read_document 不支持 .{other}（支持 pdf/docx/pptx/xlsx/odt）；普通文本文件用 read_file 即可"
