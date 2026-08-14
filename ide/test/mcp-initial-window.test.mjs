@@ -41,6 +41,7 @@ function selector() {
     "  [...CORE, 'web_fetch', 'http_request', 'browser'].map((n) => ({type:'function',function:{name:n}}))" +
     "    .concat(mcp || []);" +
     topLevelFn("_utf8ByteLength") +
+    topLevelFn("_mcpServersForInitialWindow") +
     topLevelFn("_selectInitialTools") +
     "\n;return _selectInitialTools;",
   )(CORE);
@@ -123,7 +124,7 @@ test("非 mcp__ 前缀的东西不会被这段逻辑误放进来", () => {
 test("上限是具名常量，不是散落的魔法数字", () => {
   assert.match(SRC, /const _INITIAL_MCP_MAX_TOOLS = \d+;/);
   assert.match(SRC, /const _INITIAL_MCP_MAX_BYTES = [\d_]+;/);
-  const body = topLevelFn("_selectInitialTools");
+  const body = topLevelFn("_mcpServersForInitialWindow");
   assert.match(body, /_INITIAL_MCP_MAX_TOOLS/);
   assert.match(body, /_INITIAL_MCP_MAX_BYTES/);
 });

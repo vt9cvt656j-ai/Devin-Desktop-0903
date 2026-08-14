@@ -342,6 +342,11 @@ Object.assign(AUTO_LOAD_DEPS, {
   _INITIAL_MCP_MAX_TOOLS: loadConst("_INITIAL_MCP_MAX_TOOLS"),
   _INITIAL_MCP_MAX_BYTES: loadConst("_INITIAL_MCP_MAX_BYTES"),
   _utf8ByteLength: load("_utf8ByteLength"),
+  _mcpServersForInitialWindow: load("_mcpServersForInitialWindow", {
+    _INITIAL_MCP_MAX_TOOLS: loadConst("_INITIAL_MCP_MAX_TOOLS"),
+    _INITIAL_MCP_MAX_BYTES: loadConst("_INITIAL_MCP_MAX_BYTES"),
+    _utf8ByteLength: load("_utf8ByteLength"),
+  }),
 });
 const BASENAME = load("basename");
 const FILE_WATCHER_ROOT_PLAN = load("_fileWatcherRootPlan");
