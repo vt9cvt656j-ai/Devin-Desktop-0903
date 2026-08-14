@@ -552,7 +552,9 @@ test("停用写回自己的全局配置，绝不碰别人的文件", async () =>
     },
   };
   const _readUserScopeMcpConfigs = load("_readUserScopeMcpConfigs", { inTauri: true, backend });
-  const set = load("_setMcpServerDisabled", { inTauri: true, backend, _readUserScopeMcpConfigs });
+  const _readOwnMcpConfig = load("_readOwnMcpConfig", { _readUserScopeMcpConfigs });
+  const _writeOwnMcpConfig = load("_writeOwnMcpConfig", { backend });
+  const set = load("_setMcpServerDisabled", { inTauri: true, _readOwnMcpConfig, _writeOwnMcpConfig });
 
   await set("Michael-Cursor", true);
   assert.deepEqual(saved.at(-1).disabled, ["old", "Michael-Cursor"]);
@@ -576,7 +578,9 @@ test("重复停用同一个不会写出两条", async () => {
     },
   };
   const _readUserScopeMcpConfigs = load("_readUserScopeMcpConfigs", { inTauri: true, backend });
-  await load("_setMcpServerDisabled", { inTauri: true, backend, _readUserScopeMcpConfigs })("dup", true);
+  const _readOwnMcpConfig = load("_readOwnMcpConfig", { _readUserScopeMcpConfigs });
+  const _writeOwnMcpConfig = load("_writeOwnMcpConfig", { backend });
+  await load("_setMcpServerDisabled", { inTauri: true, _readOwnMcpConfig, _writeOwnMcpConfig })("dup", true);
   assert.deepEqual(saved.at(-1).disabled, ["dup"]);
 });
 
@@ -585,4 +589,309 @@ test("面板要给出恢复入口，否则停用完就再也找不回来了", ()
   assert.match(SRC, /_setMcpServerDisabled\(off, false\)/);
   // 编辑仍然不给——那是别人的文件
   assert.match(SRC, /editBtn\.disabled = true;/);
+});
+
+// ── 全局配置的读写：不丢 disabled，不覆盖读不动的文件 ─────────────────────────
+//
+// 用户丢过一次数据：面板里显示「还没配置 MCP 服务」，点一下添加，几十个服务连同
+// 里面的 API Key 一起没了。原因是后端把「解析失败」和「文件不存在」都投影成
+// `servers: {}`，而前端三份读取器里有两份只取 mcpServers、写入又是整份覆盖。
+// 于是一个多打了逗号的 mcp.json 长得和全新安装一模一样，一写就清空。
+//
+// 同一个缺口的轻症版本：装个服务顺手把用户停用过的服务全恢复了——disabled 在
+// 读的时候就掉了，写回去自然没有。
+function ownCfgIO({ servers = {}, disabled = [], parseError = "", path = "/u/.michael-ide/mcp.json" } = {}) {
+  const saved = [];
+  const deps = {
+    _readUserScopeMcpConfigs: async () => [
+      { path: "/u/.claude.json", writable: false, servers: { readonlyOne: {} }, disabled: [] },
+      { path, writable: true, servers, disabled, parseError },
+    ],
+    backend: { invoke: async (cmd, args) => { saved.push({ cmd, args }); } },
+  };
+  return {
+    saved,
+    read: load("_readOwnMcpConfig", deps),
+    write: load("_writeOwnMcpConfig", deps),
+  };
+}
+
+test("读全局配置会把 disabled 一起带回来——掉在这一步，写回去就等于恢复了停用的服务", async () => {
+  const io = ownCfgIO({ servers: { a: { command: "x" } }, disabled: ["Michael-Cursor"] });
+  const cfg = await io.read();
+  assert.deepEqual(cfg.disabled, ["Michael-Cursor"], "disabled 在读取时就丢了");
+  assert.ok(cfg.mcpServers.a, "服务没读出来");
+});
+
+test("装一个新服务不会把停用清单抹掉", async () => {
+  const io = ownCfgIO({ servers: { a: {} }, disabled: ["old-one"] });
+  const cfg = await io.read();
+  cfg.mcpServers.b = { command: "new" };          // 面板装服务就是这么改的
+  await io.write(cfg);
+  const written = JSON.parse(io.saved.at(-1).args.text);
+  assert.deepEqual(written.disabled, ["old-one"], "写回时把 disabled 丢了，停用的服务会自己复活");
+  assert.ok(written.mcpServers.a && written.mcpServers.b, "服务没写全");
+});
+
+test("停用清单为空时不写这个字段——不给配置文件留一个空数组", async () => {
+  const io = ownCfgIO({ servers: { a: {} }, disabled: [] });
+  await io.write(await io.read());
+  const written = JSON.parse(io.saved.at(-1).args.text);
+  assert.ok(!("disabled" in written), "空的 disabled 不该落盘");
+});
+
+test("配置文件解析失败时**拒绝写入**——这是数据丢失的最后一道闸", async () => {
+  const io = ownCfgIO({ servers: {}, parseError: "trailing comma at line 12" });
+  const cfg = await io.read();
+  assert.equal(cfg.parseError, "trailing comma at line 12", "解析失败没有传到前端");
+  await assert.rejects(() => io.write(cfg), /解析失败/,
+    "读不动的文件被整份覆盖了——用户的服务和 API Key 就是这么没的");
+  assert.equal(io.saved.length, 0, "拒绝之后不该还发生一次写入");
+});
+
+test("文件不存在是首次运行，不是损坏——必须能写进第一个服务", async () => {
+  // 后端对「不存在」给的是空 servers + 空 parseError。这两种情况分不开的话，
+  // 要么新用户永远配不上服务，要么坏文件继续被覆盖。
+  const io = ownCfgIO({ servers: {}, parseError: "" });
+  const cfg = await io.read();
+  cfg.mcpServers.first = { command: "npx" };
+  await io.write(cfg);
+  assert.equal(JSON.parse(io.saved.at(-1).args.text).mcpServers.first.command, "npx");
+});
+
+// 这几条对**原文**匹配，不先剥注释：stripJsComments 的块注释规则会被文件里字符串
+// 内的 /* 带偏，把真代码一起吞掉（这一行就中过招）。而下面这些模式足够具体，
+// 解释性的注释里不会原样出现，所以对原文匹配反而更准。
+test("面板的三个读写口走的是同一对函数，不各写各的", () => {
+  assert.match(SRC, /const readCfg = _readOwnMcpConfig;/, "市场页还在自己读一遍");
+  assert.match(SRC, /const writeCfg = _writeOwnMcpConfig;/, "市场页还在自己写一遍");
+  assert.match(SRC, /if \(scope === "user"\) return _readOwnMcpConfig\(\);/, "作用域读取器没走统一口");
+  assert.match(SRC, /if \(scope === "user"\) \{ await _writeOwnMcpConfig\(cfg\); return; \}/, "作用域写入器没走统一口");
+  assert.match(extractFn("_setMcpServerDisabled"), /_readOwnMcpConfig\(\)[\s\S]*_writeOwnMcpConfig\(/,
+    "停用/恢复没走统一口");
+});
+
+test("文件读不动时面板要说出来，而且要排在「还没配置」之前", () => {
+  const at = SRC.indexOf("还没配置 MCP 服务——从下面的热门清单");
+  assert.ok(at > 0, "找不到空状态文案");
+  const before = SRC.slice(Math.max(0, at - 2000), at);
+  assert.match(before, /parseError/, "空状态之前没有检查解析失败——坏文件会被显示成「还没配置」");
+  assert.match(before, /data-mcpfp-openbroken/, "没给出打开那个文件的入口");
+});
+
+// ── ${VAR} 展开：从 Claude Code / Cursor 导入的服务能真的通过鉴权 ────────────────
+//
+// 那两家的文档都教人写 "env": {"GITHUB_PERSONAL_ACCESS_TOKEN": "${GITHUB_TOKEN}"}，
+// 导入过来的配置里到处都是。以前这里只做 String() 强转，服务真的收到了字面量
+// "${GITHUB_TOKEN}" 这 15 个字符，对面 401 —— 而用户只看到一句「连接失败」。
+const launchCfg = load("_mcpServerLaunchConfig", {
+  _expandMcpPlaceholders: load("_expandMcpPlaceholders"),
+});
+
+test("env 里的 ${VAR} 用真实值替换掉——不展开就是一路 401", () => {
+  const out = launchCfg({ command: "npx", env: { TOKEN: "${GITHUB_TOKEN}" } }, { GITHUB_TOKEN: "ghp_real" });
+  assert.equal(out.env.TOKEN, "ghp_real");
+});
+
+test("五个字段都展开：command / args / env / url / headers", () => {
+  const local = launchCfg(
+    { command: "${BIN}", args: ["--key", "${K}"], env: { E: "${K}" } },
+    { BIN: "/usr/bin/node", K: "secret" },
+  );
+  assert.equal(local.command, "/usr/bin/node");
+  assert.deepEqual(local.args, ["--key", "secret"]);
+  assert.equal(local.env.E, "secret");
+
+  const remote = launchCfg(
+    { url: "https://${HOST}/mcp", headers: { Authorization: "Bearer ${K}" } },
+    { HOST: "api.example.com", K: "secret" },
+  );
+  assert.ok(remote.args.includes("https://api.example.com/mcp"), "url 没展开");
+  assert.ok(remote.args.includes("Authorization: Bearer secret"), "header 没展开");
+});
+
+test("${VAR:-默认值} 和 ${env:VAR} 两种写法都认", () => {
+  const out = launchCfg(
+    { command: "x", env: { A: "${MISSING:-fallback}", B: "${env:REAL}" } },
+    { REAL: "v" },
+  );
+  assert.equal(out.env.A, "fallback");
+  assert.equal(out.env.B, "v");
+});
+
+test("取不到值又没默认值时报错，而不是拿空字符串去启动", () => {
+  // 留空只会把失败推到更远的地方，报出来的还是鉴权错误，用户根本查不到是没展开。
+  const out = launchCfg({ command: "x", env: { T: "${NOPE}" } }, {});
+  assert.match(out.error || "", /未定义的环境变量.*NOPE/);
+});
+
+test("${input:...} 明确说不支持——静默留空会让人以为配好了", () => {
+  const out = launchCfg({ command: "x", env: { T: "${input:token}" } }, {});
+  assert.match(out.error || "", /不支持/);
+});
+
+test("没传 envMap 时一律不展开——确认框走的就是这条，不能把 token 摊在屏幕上", () => {
+  const out = launchCfg({ command: "npx", args: ["--k", "${SECRET}"], env: { T: "${SECRET}" } });
+  assert.deepEqual(out.args, ["--k", "${SECRET}"], "确认框那条路把密钥展开了");
+  assert.equal(out.env.T, "${SECRET}");
+  assert.ok(!out.error, "不展开的那条路不该因为取不到值就报错");
+});
+
+test("仓库自带 MCP 的确认框用的是不展开的那一版", () => {
+  const at = SRC.indexOf("_approveWorkspaceExecConfig(\"MCP\"");
+  assert.ok(at > 0, "找不到仓库 MCP 的确认调用");
+  const before = SRC.slice(Math.max(0, at - 1400), at);
+  assert.match(before, /_mcpServerLaunchConfig\(servers\[name\] \|\| \{\}\)/,
+    "确认框调用了带 envMap 的版本——用户的 token 会被打印在确认框里");
+});
+
+test("真正启动那一步才展开，且带上登录 shell 的环境变量", () => {
+  const at = SRC.indexOf("mcp_connect_full");
+  assert.ok(at > 0);
+  const before = SRC.slice(Math.max(0, at - 1200), at);
+  assert.match(before, /_mcpServerLaunchConfig\(server, _launchEnv\)/, "启动路径没传 envMap，等于没展开");
+  assert.match(before, /await _mcpShellEnv\(\)/, "没去问登录 shell——GUI 启动的 App 拿不到用户的导出");
+});
+
+// ── 并排开两个项目：第二个不能把第一个打死 ────────────────────────────────────
+//
+// 用户的原话是「第二个项目标签页会把前一个的调用打成 BLOCKED」。两条独立的原因叠在一起：
+//   1. 加载新根时，断开的是 _mcpConnected——那是"最近一次加载的那个根"的清单，
+//      于是打开项目 B 会把项目 A 的服务进程全部 mcp_disconnect 掉；
+//   2. 派发前还要判 `_mcpLoadedRoot === root`，只要 B 加载过，A 里正在跑的 Agent
+//      每一次 MCP 调用都撞上这一条——哪怕它手里的工具表是自己那个根的、进程也还活着。
+// 两条都得拆，只拆一条的话，要么进程被杀、要么调用被拦。
+
+test("加载另一个根时，只断自己那个根的服务", () => {
+  const src = extractFn("_ensureMcpTools");
+  assert.match(src, /const _mine = _mcpStateFor\(root\)\.connected/,
+    "断开清单还是取的全局 _mcpConnected——那会杀掉另一个项目正在用的服务");
+  assert.match(src, /_mine\.map\(\(name\) => backend\.invoke\("mcp_disconnect", \{ name, root \}\)/,
+    "断开时没带 root，会连到别的项目那个同名服务上");
+});
+
+test("派发不再看「最近加载的是哪个根」，只看这个工具属不属于本次运行的根", () => {
+  const at = SRC.indexOf('res.textContent = "工具属于别的工作区"');
+  assert.ok(at > 0, "找不到 MCP 派发的根校验");
+  const region = SRC.slice(at - 600, at + 200);
+  assert.ok(!/_mcpLoadedRoot/.test(region),
+    "派发还在拿全局 _mcpLoadedRoot 拦——并排开两个项目就会满屏 BLOCKED");
+  assert.match(region, /String\(call\.mcpRoot \|\| ""\) !== String\(root \|\| ""\)/,
+    "跨项目串线的那道真校验不能一起删掉");
+});
+
+test("服务真断了要说「断了」，不是说「工作区被切换了」", () => {
+  // 说成切换，用户会去重开一轮 Agent，而问题其实是服务退出了——白忙一趟。
+  const at = SRC.indexOf('res.textContent = "服务已断开"');
+  assert.ok(at > 0, "没有针对「服务确实不在连接中」的分支");
+  const region = SRC.slice(at - 700, at + 400);
+  assert.match(region, /_mcpStates\.get\(String\(call\.mcpRoot \|\| ""\)\)/,
+    "判断服务在不在，要按它自己那个根查");
+  assert.match(region, /重新连接全部/, "要给出可操作的下一步");
+});
+
+test("每个根的连接状态各存一份，切回去能直接复用", () => {
+  assert.match(SRC, /const _mcpStates = new Map\(\)/, "没有按根存的状态表");
+  const adopt = extractFn("_adoptMcpViewFrom");
+  for (const field of ["_mcpToolMap", "_mcpToolCache", "_mcpConnected", "_mcpFailures"]) {
+    assert.ok(adopt.includes(field), `切回一个根时没有恢复 ${field}`);
+  }
+  assert.match(extractFn("_forgetMcpServer"), /_mcpStates\.get\(serverRoot\)/,
+    "删掉一个服务时没同步按根存的那份——切回去它会诈尸成「已连接」");
+});
+
+test("连接时把 root 交给后端——同名服务不能共用一个进程", () => {
+  const at = SRC.indexOf('backend.invoke("mcp_connect_full"');
+  assert.ok(at > 0);
+  const region = SRC.slice(at, at + 700);
+  assert.match(region, /\n\s+root,/,
+    "connect 没带 root：两个项目都配了 filesystem 时会共用一个进程，后连的顶掉先连的");
+});
+
+// ── 面板要能改、能恢复、没打开文件夹也能用 ────────────────────────────────────
+
+test("已配置的服务能编辑——只能加和删的面板，改个 API Key 都要去手改 JSON", () => {
+  assert.match(SRC, /data-mcpfp-edit="\$\{_escAttr\(name\)\}"/, "卡片上没有编辑入口");
+  assert.match(SRC, /const edit = e\.target\.closest\("\[data-mcpfp-edit\]"\)/, "编辑按钮没有接处理");
+  // 编辑和新增共用一个表单，靠 editingServer 区分——分两套表单只会各自长歪。
+  assert.match(SRC, /let editingServer = null;/);
+  assert.match(SRC, /editingServer = \{ name: edit, conf \};/);
+});
+
+test("编辑只对自己全局配置里的服务开放", () => {
+  // 项目 / 仓库 / 其他客户端的条目从这儿写，只会在全局配置里造一份影子副本，
+  // 而真正生效的仍是优先级更高的那份原件——用户会以为改了却不生效。
+  assert.match(SRC, /Object\.prototype\.hasOwnProperty\.call\(ownServers, name\)[\s\S]{0,200}data-mcpfp-edit/,
+    "编辑按钮没有按「是不是自己那份配置」来渲染");
+  assert.match(SRC, /不在全局配置里，改动请到它自己的文件里做/, "缺少越权编辑的兜底提示");
+});
+
+test("编辑时保留原有的 __michael 元信息，只覆盖简介", () => {
+  // 那块元信息驱动卡片的图标、徽章、星数和「查看来源」。原样盖成 custom，
+  // 等于一个从市场装来的服务改一次参数就降级成无名自定义项。
+  assert.match(SRC, /const prevMeta = \(wasEditing && wasEditing\.conf\.__michael\) \|\| null;/);
+  assert.match(SRC, /prevMeta\s*\?\s*\{ \.\.\.prevMeta, name, \.\.\.\(desc \? \{ desc \} : \{\}\) \}/);
+});
+
+test("改名要删掉旧键并断开旧会话，否则两份并存、改了不生效", () => {
+  assert.match(SRC, /if \(oldName && oldName !== name\) \{[\s\S]{0,300}delete sv\[oldName\]/);
+  assert.match(SRC, /_forgetMcpServer\(root, oldName\)/);
+});
+
+test("停用过的服务在面板里找得回来，而且排在「还没配置」之前", () => {
+  // 停用按钮的提示写着「可在 MCP 面板恢复」，而那个带恢复入口的面板早就没人调用了——
+  // 停用等于单向操作。最需要恢复入口的时刻，恰恰是把唯一一个服务停用之后。
+  assert.match(SRC, /data-mcpfp-restore="\$\{_escAttr\(name\)\}"/, "没有恢复按钮");
+  assert.match(SRC, /const restore = e\.target\.closest\("\[data-mcpfp-restore\]"\)/, "恢复按钮没接处理");
+  const at = SRC.indexOf("还没配置 MCP 服务——从下面的热门清单");
+  const before = SRC.slice(Math.max(0, at - 2600), at);
+  assert.match(before, /disabledRows/, "恢复入口排在了空状态之后，最需要它的时候看不到");
+});
+
+test("装服务和重连都不再要求先打开文件夹", () => {
+  // 写的是全局配置，本来就不属于任何项目；拦在这儿等于「想装 MCP 先随便开个项目」。
+  // saveCustomMcpService 是箭头函数常量，extractFn 只认 function 声明——按区间取。
+  const saveAt = SRC.indexOf("const saveCustomMcpService = async");
+  assert.ok(saveAt > 0, "找不到 saveCustomMcpService");
+  const save = SRC.slice(saveAt, saveAt + 900);
+  assert.ok(!/请先打开一个工作区文件夹/.test(save), "装服务还在要求先打开文件夹");
+  const at = SRC.indexOf('if (act === "reconnect")');
+  assert.ok(at > 0);
+  assert.ok(!/if \(!root\) return;/.test(SRC.slice(at, at + 260)),
+    "重连还在要求先打开文件夹——全局服务连失败了就没有重试入口了");
+});
+
+// ── 前端和 Rust 的调用契约：所有 mcp_* 都必须带 root ─────────────────────────
+//
+// 会话在 Rust 侧按 (窗口, 根, 服务名) 存。漏传 root 不是"可能问错人"这么轻——
+// 参数反序列化会直接失败，那条路整个不可用。这类漏网最容易出在**派发之外**的
+// 零散调用点（@mcp: 预取、提示词模板选择器），它们不走同一段代码。
+test("每一处 mcp_* 调用都带 root，一个都不能漏", () => {
+  const callSites = [...SRC.matchAll(/(?:_invokeCapped|backend\.invoke)\(\s*"(mcp_[a-z_]+)"\s*,\s*\{([^}]*)\}/g)];
+  assert.ok(callSites.length >= 8, `调用点太少，正则可能没匹配上：${callSites.length}`);
+  const missing = callSites
+    .filter(([, name]) => name !== "mcp_user_configs" && name !== "mcp_save_user_config")
+    .filter(([, , args]) => !/\broot\b/.test(args))
+    .map(([whole, name]) => `${name}: ${whole.slice(0, 90)}`);
+  assert.deepEqual(missing, [], "这些 mcp_* 调用没带 root，Rust 侧会直接反序列化失败");
+});
+
+test("工具调用的墙钟上限要给进度续期留出空间", () => {
+  // Rust 侧允许"只要还在报进度就接着等"（静默 60s / 总计 600s）。这边压回 60 秒的话，
+  // 一个每 20 秒报一次进度的长任务照样被掐掉，服务端那套续期就白做了。
+  const at = SRC.indexOf('_invokeCapped("mcp_call_full"');
+  assert.ok(at > 0);
+  const line = SRC.slice(at, at + 260);
+  const m = line.match(/\},\s*(\d[\d_]*)\s*,/);
+  assert.ok(m, "找不到超时参数");
+  assert.ok(Number(String(m[1]).replace(/_/g, "")) >= 600_000,
+    `工具调用上限只有 ${m[1]}，会把服务端的进度续期整个废掉`);
+});
+
+test("等待浏览器授权要单独显示，不能混成「已连接」", () => {
+  // 这种会话是有意保留的（kill 掉就把 mcp-remote 接 OAuth 回调的本地服务器一起杀了，
+  // 令牌永远存不下来），而 mcp_status 对它返回 true。只看 status 就会显示「已连接」，
+  // 用户点了工具却报错，完全看不出是在等他去浏览器点同意。
+  assert.match(SRC, /mcp_pending_auth/, "没有查询等待授权状态");
+  assert.match(SRC, /waitingAuth \? "等待浏览器授权"/, "等待授权没有单独的状态文案");
 });

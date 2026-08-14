@@ -126,7 +126,9 @@ function seed() {
   defineTool("termtask", EXEC);
 
   // ── other side-effecting tools ────────────────────────────────────────────
-  defineTool("mcp", { needsApproval: true, readOnlyModeBlocked: true });
+  // 只读模式里按**单次调用**判：服务自己声明了 readOnlyHint 的放行，没声明的照挡。
+  // 每一次调用仍然过 needsApproval 那道门，所以放行的也不是无人看管。
+  defineTool("mcp", { needsApproval: true, readOnlyModeBlocked: (call) => !call?.mcpReadOnly });
   defineTool("uiclick", { needsApproval: true, readOnlyModeBlocked: true });
   defineTool("automation", { needsApproval: true });
   defineTool("db", { needsApproval: true });
@@ -170,7 +172,22 @@ export const mutatesWorkspace = (type) => toolPolicy(type).mutatesWorkspace;
 export const isFileMutation = (type) => toolPolicy(type).fileMutation;
 export const isFileEdit = (type) => toolPolicy(type).fileEdit;
 export const needsApproval = (type) => toolPolicy(type).needsApproval;
-export const blockedInReadOnlyMode = (type) => toolPolicy(type).readOnlyModeBlocked;
+/*
+ * 只读模式（Plan / Explorer / Reviewer）里这个调用要不要挡。
+ *
+ * `call` 是可选的第二个参数，为的是让 MCP 能按**这一次调用**判断，而不是整个类型
+ * 一刀切。一刀切的代价是：用户装的 MCP 服务在只读模式里全都用不了——查文档、读数据库
+ * 结构这类纯读取的事，恰恰是 Plan 模式最需要的，而它们和"写文件"被归成了同一类。
+ *
+ * 判据用调用上带的 mcpReadOnly（来自服务自己声明的 readOnlyHint）。声明缺失时按
+ * **可能有副作用**处理——MCP 规范里这个提示是可选的，多数服务不写，宁可挡住也不能
+ * 在只读模式里替用户改了东西。
+ */
+export const blockedInReadOnlyMode = (type, call) => {
+  const blocked = toolPolicy(type).readOnlyModeBlocked;
+  if (typeof blocked === "function") return blocked(call);
+  return blocked;
+};
 
 /**
  * Which argument of `call` a worker sub-agent's scope is checked against, or "" when the tool

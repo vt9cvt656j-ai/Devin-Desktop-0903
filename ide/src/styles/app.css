@@ -4312,6 +4312,33 @@ body.zen-mode .editor {
 .mcpfp-row__status.is-off { color: var(--text-dim); background: color-mix(in srgb, var(--text-dim) 8%, transparent); }
 .mcpfp-installed--cards .mcpfp-actions { grid-column: 1 / -1; }
 .mcpfp-actions { display: flex; justify-content: flex-end; margin-top: 4px; }
+/* 技能面板里「用户 / 插件目录」那一段的分隔标题。同样要跨满整行，
+   否则它会被挤成半列，看起来像一张卡片的标题而不是一段的开头。 */
+.mcpfp-installed--cards .skfp-section { grid-column: 1 / -1; }
+.skfp-section {
+  margin: 10px 0 2px;
+  padding-top: 10px;
+  border-top: 1px solid var(--line);
+  font-size: 12px;
+  color: var(--text-dim);
+}
+/* 配置文件解析失败的横幅。跨满整行——它说明的是「下面这些卡片不完整」，
+   缩在一列里会被当成某一个服务的状态。 */
+.mcpfp-installed--cards .mcpfp-broken { grid-column: 1 / -1; }
+.mcpfp-broken {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  align-items: flex-start;
+  padding: 12px 14px;
+  margin-bottom: 4px;
+  border: 1px solid color-mix(in srgb, #ff3b30 34%, var(--line));
+  border-radius: 14px;
+  background: color-mix(in srgb, #ff3b30 8%, transparent);
+}
+.mcpfp-broken__title { font-weight: 600; color: #e0453a; }
+.mcpfp-broken__path { font-family: var(--mono, ui-monospace, monospace); font-size: 12px; color: var(--text-dim); word-break: break-all; }
+.mcpfp-broken__why { font-size: 12px; color: var(--text-dim); word-break: break-word; }
 .mcpfp-inline-form {
   margin-top: 10px;
   padding: 12px;

@@ -109,7 +109,9 @@ if (new Set(names).size !== names.length) {
 
 /** Group by what the tool actually touches. Order matters: first match wins. */
 const GROUPS = [
-  ["Files", /^(read_file|write_file|edit_file|multi_edit|list_dir|create_dir|copy_path|move_path|delete_path|format_file|read_logs|download_file)$/],
+  // create_project 建的是一整个项目目录，属于文件操作。不列进来会掉进末尾那个
+  // `?? "Knowledge"` 兜底桶——那个桶的语义是"没归到类的"，不是"知识类工具"。
+  ["Files", /^(read_file|write_file|edit_file|multi_edit|list_dir|create_dir|create_project|copy_path|move_path|delete_path|format_file|read_logs|download_file)$/],
   // Searching YOUR repository, kept apart from the research lookups below.
   ["Code search", /^(search|find_files|semantic_search|find_symbol|search_tools|deep_search|sourcegraph_search)$/],
   ["Code intelligence", /^(lsp_|get_diagnostics|visual_explain)/],

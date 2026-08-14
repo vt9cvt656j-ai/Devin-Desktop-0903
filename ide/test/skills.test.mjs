@@ -148,8 +148,23 @@ test("技能被截断时要指出完整内容怎么取，不能只说一句「�
 
 test("组合块 = 目录 + 已启用全文，两个注入点用的都是它", () => {
   assert.match(SRC, /function _skillsSystemBlock\(\) \{\s*return _skillCatalogBlock\(\) \+ _activeSkillsBlock\(\);/);
-  assert.match(SRC, /const skillsBlock = _agentLightTurn \? "" : _skillsSystemBlock\(\)/);
   assert.match(SRC, /run\?\.skillsBlock \?\? _skillsSystemBlock\(\)/);
+});
+
+test("聊天模式只给已启用技能的正文，不给指向 read_skill 的目录", () => {
+  // 聊天那条路径不执行工具：模型吐出来的调用会被当成 [TOOL:…] 文本渲染掉。
+  // 给它一份写着「需要哪个就用 read_skill 读」的目录，等于指着一条死路。
+  // 已启用技能的正文不需要任何工具，所以照给。
+  assert.match(SRC, /const skillsBlock = _agentLightTurn \? "" : \(effectiveMode === "chat" \? _activeSkillsBlock\(\) : _skillsSystemBlock\(\)\)/,
+    "聊天模式还在收整份技能目录");
+});
+
+test("聊天模式不发 MCP 名录——那段话会直接指使模型编造它做过的操作", () => {
+  const at = SRC.indexOf("_mcpAvailabilitySystemContext(_readyMcpSnapshot(_curRoot))");
+  assert.ok(at > 0, "找不到 MCP 名录的注入点");
+  const before = SRC.slice(Math.max(0, at - 400), at);
+  assert.match(before, /effectiveMode !== "chat"/,
+    "聊天模式仍在收 MCP 名录，而那段话写着「按名字直接调用」「别回复用户说做不到」");
 });
 
 test("冷启动首轮不会漏掉磁盘上的技能", () => {
@@ -165,4 +180,229 @@ test("冷启动首轮不会漏掉磁盘上的技能", () => {
     "首轮必须等一次目录扫描，且要带超时——不能无限期阻塞这一轮");
   assert.match(before, /setTimeout\(resolve, \d+\)/,
     "等待必须有上界");
+});
+
+// ── read_skill 必须真的在开局工具窗口里 ───────────────────────────────────────
+//
+// 上面那些测试保证了「模型看得见有哪些技能」。但看得见不等于读得到：技能清单里写着
+// 「需要哪个就用 `read_skill` 读它的完整内容再照做」，而 read_skill 不在任何一个
+// roleCoreMap 里、末尾也没人推它——那句话指向一个从没声明过的函数。工具调用是按声明
+// 列表出的，模型只能先花一轮 search_tools 把 schema 取回来（提示词里从没提过要这么做），
+// 或者干脆放弃、凭记忆自己写。清单列了 28 个技能却一个都读不到，就是这一环断的。
+function selectWith({ skills = [], mode = "agent", includeWrite = true } = {}) {
+  const READ_SKILL = { type: "function", function: { name: "read_skill", parameters: {} } };
+  const CORE = ["read_file", "list_dir", "search", "find_files", "update_plan", "ask_user",
+                "write_file", "edit_file", "multi_edit", "run_cmd", "get_diagnostics", "git_diff"]
+    .map((n) => ({ type: "function", function: { name: n, parameters: {} } }));
+  const fn = load("_selectInitialTools", {
+    _buildAgentToolSchemas: () => [...CORE, READ_SKILL],
+    _mcpServersForInitialWindow: () => new Map(),
+    _SEARCH_TOOLS_SCHEMA: { type: "function", function: { name: "search_tools", parameters: {} } },
+    _fileSkills: skills,
+    _loadSkillsLocal: () => [],
+  });
+  return fn(includeWrite, "", [], mode).map((t) => t.function.name);
+}
+
+const ONE_SKILL = [{ id: "file:/s/a/SKILL.md", name: "pdf", desc: "PDF 处理", prompt: "做 PDF" }];
+
+for (const mode of ["agent", "plan", "explorer", "reviewer"]) {
+  test(`装了技能，${mode} 模式的开局窗口里就有 read_skill——否则提示词在指一个没声明的函数`, () => {
+    const names = selectWith({ skills: ONE_SKILL, mode, includeWrite: mode === "agent" });
+    assert.ok(names.includes("read_skill"),
+      `${mode} 模式没把 read_skill 放进窗口，技能清单里那句「用 read_skill 读」就是空头支票`);
+  });
+}
+
+test("一个技能都没有时不放 read_skill——不给模型一个永远返回空的工具", () => {
+  const names = selectWith({ skills: [], mode: "agent" });
+  assert.ok(!names.includes("read_skill"), "没有技能却把 read_skill 塞进了窗口");
+});
+
+test("只有名字没有正文的技能不算数——它读回来也是空的", () => {
+  const names = selectWith({ skills: [{ id: "x", name: "空的", desc: "", prompt: "   " }] });
+  assert.ok(!names.includes("read_skill"), "空技能不该让 read_skill 进窗口");
+});
+
+test("判据必须便宜——不能在开局选工具时去拼整份技能目录", () => {
+  // _selectInitialTools 每次 _syncAgentToolWindowToProfile 都会重跑；_skillCatalogBlock()
+  // 会加载全部技能、去重、拼最多 6KB 字符串。在这里调它等于每轮多付一次全量扫描。
+  // 只看代码，不看注释——注释里提到这个名字是解释「为什么不用它」，不是调用。
+  const src = extractFn("_selectInitialTools")
+    .replace(/\/\*[\s\S]*?\*\//g, "").replace(/\/\/[^\n]*/g, "");
+  assert.ok(!/_skillCatalogBlock\s*\(/.test(src),
+    "开局选工具里不该调 _skillCatalogBlock——只该问「有没有技能」");
+});
+
+test("read_skill 的 schema 取自已构建的目录，不另写一份字面量", () => {
+  // 发布构建会剥掉描述、L0 网关会回填描述。自己拼一份就会和其余工具走两条路，
+  // 出现「别的工具没描述、就它有」这种不一致。
+  const src = extractFn("_selectInitialTools");
+  assert.match(src, /all\.find\(\(t\) => t\?\.function\?\.name === "read_skill"\)/,
+    "read_skill 的 schema 必须从 all 里取");
+});
+
+// ── SKILL.md 的 YAML 折叠标量 ────────────────────────────────────────────────
+//
+// Anthropic 官方那批技能大量这么写描述：
+//     description: >-
+//       Use this skill when the user wants to create, read or edit Word documents.
+// 逐行抠 `description:` 后面那截，抠到的是指示符本身 ">-"。它非空，于是被当成描述用了，
+// 连带「没写描述就退回一级标题」也永远不触发。模型看到的清单是 `- docx：>-`——
+// 它据此判断这个技能干什么用，什么也判断不出来。
+const parseSkill = load("_parseSkillDocument");
+
+test("description: >- 的正文在后面几行，要接着读完", () => {
+  const s = parseSkill(`---
+name: docx
+description: >-
+  Use this skill when the user wants to create,
+  read or edit Word documents.
+---
+正文`, "/s/docx/SKILL.md");
+  assert.equal(s.desc, "Use this skill when the user wants to create, read or edit Word documents.");
+});
+
+test("| 保留换行，> 折成空格——两种指示符行为不同", () => {
+  const folded = parseSkill(`---
+description: >
+  一行
+  两行
+---
+x`, "/s/a/SKILL.md");
+  assert.equal(folded.desc, "一行 两行");
+  const literal = parseSkill(`---
+description: |
+  一行
+  两行
+---
+x`, "/s/b/SKILL.md");
+  // 清单那边会把空白压平，所以这里断言两个词都在、且没粘成一个。
+  assert.match(literal.desc, /一行 两行/);
+});
+
+test("指示符可以带显式缩进位和行尾注释：|2 # 说明", () => {
+  const s = parseSkill(`---
+description: |2 # 这是注释
+  真正的描述
+---
+x`, "/s/c/SKILL.md");
+  assert.equal(s.desc, "真正的描述");
+  assert.ok(!s.desc.includes("#"), "把行尾注释当成描述了");
+});
+
+test("嵌在别的键下面的块标量不会把后面的内容一起吞掉", () => {
+  const s = parseSkill(`---
+name: real-name
+metadata:
+  description: >-
+    嵌套的说明
+---
+x`, "/s/d/SKILL.md");
+  assert.equal(s.name, "real-name", "嵌套块把后面的 name 吞了");
+});
+
+test("写坏的块标量退回一级标题，而不是把 >- 当描述", () => {
+  const s = parseSkill(`---
+description: >-
+---
+# 这个技能是干这个的`, "/s/e/SKILL.md");
+  assert.equal(s.desc, "这个技能是干这个的");
+});
+
+test("allowed-tools 两种写法都解析出来：行内和列表", () => {
+  const inline = parseSkill(`---
+allowed-tools: read_file, run_cmd
+---
+x`, "/s/f/SKILL.md");
+  assert.deepEqual(inline.tools, ["read_file", "run_cmd"]);
+  const listed = parseSkill(`---
+allowed-tools:
+  - read_file
+  - write_file
+---
+x`, "/s/g/SKILL.md");
+  assert.deepEqual(listed.tools, ["read_file", "write_file"]);
+});
+
+test("没写 allowed-tools 就不带这个字段——不是空数组", () => {
+  const s = parseSkill(`---
+name: x
+---
+y`, "/s/h/SKILL.md");
+  assert.ok(!("tools" in s), "没声明工具却带了 tools 字段");
+});
+
+// ── 登录不能吞掉离线攒的技能 ─────────────────────────────────────────────────
+//
+// 服务端对「这个账号从没同步过」和「这个账号把技能全删了」返回的是同一个 []。
+// 照单全收就等于：离线用了半年的自定义技能，登录那一刻全没，本地缓存也被写成空的。
+function skillsSync({ remote, local, syncedAccounts = [], account = "me@x.com" }) {
+  const store = new Map([
+    ["michael-ide.skills.v1", JSON.stringify(local)],
+    ["michael-ide.skills.synced.v1", JSON.stringify(syncedAccounts)],
+  ]);
+  const puts = [];
+  const deps = {
+    _skillsApi: async (method, body) => { if (method === "GET") return remote; puts.push(body); return true; },
+    _loadSkillsLocal: () => JSON.parse(store.get("michael-ide.skills.v1") || "[]"),
+    _saveSkillsLocal: (l) => store.set("michael-ide.skills.v1", JSON.stringify(l)),
+    _saveSkills: async (l) => { puts.push(l); store.set("michael-ide.skills.v1", JSON.stringify(l)); },
+    _loggedInEmail: account,
+    _SKILLS_SYNCED_KEY: "michael-ide.skills.synced.v1",
+    localStorage: { getItem: (k) => store.get(k) ?? null, setItem: (k, v) => store.set(k, v) },
+  };
+  deps._skillsSyncedAccounts = load("_skillsSyncedAccounts", deps);
+  deps._markSkillsSynced = load("_markSkillsSynced", deps);
+  return { run: load("_loadSkills", deps), puts, store };
+}
+
+test("首次登录时服务端的空清单不能抹掉本地技能——反而要把本地那份传上去", async () => {
+  const mine = [{ id: "a", name: "我的技能", prompt: "x" }];
+  const s = skillsSync({ remote: [], local: mine });
+  const got = await s.run();
+  assert.deepEqual(got, mine, "登录把离线攒的技能吞了");
+  assert.deepEqual(JSON.parse(s.store.get("michael-ide.skills.v1")), mine, "本地缓存也被写空了");
+  assert.deepEqual(s.puts.at(-1), mine, "没有把本地那份认领到账号上");
+});
+
+test("已经同步过的账号，服务端的空清单就是真的「我删光了」——这时它该赢", async () => {
+  // 不然在另一台设备上删技能永远同步不过来。
+  const s = skillsSync({ remote: [], local: [{ id: "a", name: "旧的", prompt: "x" }], syncedAccounts: ["me@x.com"] });
+  assert.deepEqual(await s.run(), []);
+  assert.deepEqual(JSON.parse(s.store.get("michael-ide.skills.v1")), []);
+});
+
+test("服务端有内容就整份替换，不按 id 合并", async () => {
+  // 合并的话，在另一台设备上删掉的那个会从本地缓存里复活。
+  const s = skillsSync({ remote: [{ id: "b", name: "服务端的", prompt: "y" }], local: [{ id: "a", name: "本地的", prompt: "x" }] });
+  assert.deepEqual((await s.run()).map((v) => v.id), ["b"]);
+});
+
+test("没登录 / 请求失败时用本地那份，不动缓存", async () => {
+  const mine = [{ id: "a", name: "我的", prompt: "x" }];
+  const s = skillsSync({ remote: null, local: mine });
+  assert.deepEqual(await s.run(), mine);
+  assert.equal(s.puts.length, 0, "失败路径不该发起写入");
+});
+
+// ── 同名技能的优先级必须确定 ─────────────────────────────────────────────────
+
+test("扫描按来源分桶收集，再按来源顺序拼接——不是共用一个数组抢先到先得", () => {
+  const src = extractFn("_refreshFileSkills");
+  assert.match(src, /const perBase = bases\.map\(\(\) => \[\]\)/,
+    "还在共用一个 found 数组：同名技能谁生效取决于哪次磁盘读先返回");
+  assert.match(src, /perBase\.flat\(\)/, "没有按来源顺序拼接");
+  const at = src.indexOf("perBase.flat()");
+  const after = src.slice(at);
+  assert.match(after, /\.sort\(/, "拼接之后要靠稳定排序保住来源优先级");
+});
+
+test("扫描预算用尽时丢掉的数量要记下来，并算进清单的「另有 N 个」", () => {
+  assert.match(extractFn("_refreshFileSkills"), /_fileSkillsDropped = dropped/,
+    "扫描丢了技能却没记账");
+  const cat = extractFn("_skillCatalogBlock");
+  assert.match(cat, /_fileSkillsDropped/, "清单没有把扫描丢掉的算进去");
+  assert.match(cat, /typeof _fileSkillsDropped === "number"/,
+    "要用 typeof 守卫，否则被单独 eval 时会抛 ReferenceError 并被吞成空清单");
 });
