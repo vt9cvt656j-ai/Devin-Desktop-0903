@@ -4,24 +4,12 @@
 - When the user specifies a stack, use it. An existing working site keeps its actual framework, language, build tool, styling approach, and component system (including server-rendered stacks such as Django/Flask/Jinja, Rails, and PHP) — do not rewrite it into React, mix in a second framework, or start a separate frontend.
 - Only when the workspace is empty, the project has no website, or the user explicitly asks for a rebuild and there is no reusable or declared stack, default to React + Tailwind CSS + shadcn/ui, using Vite + TypeScript when the default scaffold needs filling in. On that default branch, add only the shadcn/ui components the pages actually use, and wire them to the current stable Tailwind and the real build tool; do not apply this wiring to any other branch.
 
-## 默认分支的接线（下面每一步都实测跑通过，2026-08 的 CLI）
+## 默认分支的脚手架
 
 ```bash
 npm create vite@latest <name> -- --template react-ts && cd <name> && npm install
-npm install -D tailwindcss @tailwindcss/vite
-npx shadcn@latest init -b radix -p vega -y      # -b 和 -p 不能省
-npx shadcn@latest add button card input -y      # 只加这个页面真正用到的
 ```
 
-- **`-b` 和 `-p` 必须带。** 裸跑 `npx shadcn@latest init` 会弹交互菜单让你选组件库和预设，
-  非交互环境里要么挂住要么空退——看着"装过了"其实什么都没装，最后只能手写组件。
-  `-d/--defaults` 也别用：它等于 `--template=next`，会把 Vite 项目按 Next 处理。
-  预设名只有 nova / vega / maia / lyra / mira / luma / sera / rhea。
-- init **之前**先接好这三样，否则 `@/lib/utils` 解析不了、构建直接失败：
-  `vite.config.ts` 里 `plugins: [react(), tailwindcss()]` ＋
-  `resolve: { alias: { "@": path.resolve(__dirname, "./src") } }`；
-  `tsconfig.json` 与 `tsconfig.app.json` 里加 `"paths": { "@/*": ["./src/*"] }`，
-  **不要加 `baseUrl`**（当前 TypeScript 已废弃，加了报 TS5101 构建失败）；
-  `src/index.css` 第一行 `@import "tailwindcss";`。
-- 这两个 tsconfig 是 create-vite 生成的、**带注释**，当纯 JSON 解析会炸，用文本方式改。
-- 装完立刻 `npm run build` 验一次再往下写页面：上面每一个坑都是构建期才暴露的。
+随后按 design tokens 那一节的五步接 Tailwind + 路径别名 + shadcn（那五步是必需的，
+少任何一步 `shadcn init` 都会失败）。装完立刻 `npm run build` 验一次再往下写页面——
+那几个坑全部只在构建期暴露。

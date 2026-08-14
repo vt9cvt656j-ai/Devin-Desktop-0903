@@ -7148,7 +7148,11 @@ mod design_palette_and_shadcn_tests {
     ///   · 把带注释的 tsconfig 当纯 JSON 解析：直接炸。
     #[test]
     fn 从零起项目的接线配方不缺关键项() {
-        let text = read_prompt("design_scaffold").expect("design_scaffold.txt");
+        // 接线配方现在放在 design_tokens（UI 任务必注入）里，而不是只放 scaffold 层。
+        // 原因是实测出来的：scaffold 只在判定 greenfield 时加载，而在已有文件的目录里
+        // 起新站会被判成 existing——模型只拿到命令、拿不到前置条件，`shadcn init` 直接报
+        // `Could not find valid path aliases` 退出，然后它就回去手写组件了。
+        let text = read_prompt("design_tokens").expect("design_tokens.txt");
         for (needle, why) in [
             ("-b radix", "少了 -b，init 会弹交互菜单"),
             ("-p vega", "少了 -p，init 会停在预设选择"),
@@ -7303,6 +7307,57 @@ mod resourcefulness_tests {
         assert!(
             core.contains("same-turn") || core.contains("next run"),
             "必须说清哪条当轮生效、哪条下一轮才生效"
+        );
+    }
+}
+
+#[cfg(test)]
+mod shadcn_delivery_tests {
+    use super::assemble_into;
+
+    fn assembled(profile: &str, mode: &str, text: &str) -> String {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert("x-ide-mode", mode.parse().unwrap());
+        if !profile.is_empty() {
+            headers.insert("x-ide-semantic-profile", profile.parse().unwrap());
+        }
+        let mut body = serde_json::json!({
+            "model": "gpt-5.6-sol",
+            "messages": [{"role": "user", "content": text}]
+        });
+        assemble_into(&headers, &mut body);
+        body["messages"][0]["content"].as_str().unwrap_or("").to_string()
+    }
+
+    /// 安装命令必须真的到达模型——不只是"文件里写了"。
+    ///
+    /// 它现在放在两处：design_tokens（design.base，UI 任务必注入）与 design_scaffold
+    /// （只在判定 greenfield 时加载）。只靠 scaffold 那一份是不够的：在已有文件的目录里
+    /// 起新站会被判成 existing，那一层根本不加载，模型就又回去手写组件了。
+    #[test]
+    fn 安装命令在普通_ui_任务里就能拿到而不只在greenfield() {
+        // 只报 design（不报 design_scaffold）——这正是"在已有目录里做界面"的情形
+        let sys = assembled("2.5:design", "agent", "做一个面包店官网");
+        eprintln!("--- 组装出的 system 长度 {} ---", sys.len());
+        for marker in ["michael-design core", "design_tokens", "数值层", "shadcn", "近黑白", "scaffold layer"] {
+            eprintln!("  {:24} {}", marker, if sys.contains(marker) { "有" } else { "无" });
+        }
+        assert!(
+            sys.contains("shadcn@latest init -b radix -p vega -y"),
+            "普通 UI 任务就必须拿到带参数的安装命令，否则裸跑 init 会卡在交互菜单"
+        );
+        assert!(sys.contains("shadcn@latest add"), "add 命令也要在");
+        // 前置接线也必须在同一层：少了别名，init 会直接报 Could not find valid path aliases
+        for (needle, why) in [
+            ("@/*", "路径别名是 init 的硬前提"),
+            ("baseUrl", "要点明不能加 baseUrl，否则 TS5101 构建失败"),
+            ("@tailwindcss/vite", "Tailwind 要先装好"),
+        ] {
+            assert!(sys.contains(needle), "普通 UI 任务缺 `{needle}`：{why}");
+        }
+        assert!(
+            sys.contains("禁止") || sys.contains("不是照着样子写"),
+            "必须明确禁止手写 shadcn 风格组件"
         );
     }
 }
