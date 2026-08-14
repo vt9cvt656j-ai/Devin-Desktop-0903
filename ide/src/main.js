@@ -10505,6 +10505,10 @@ async function renderChildren(path, container) {
   if (_treeRoots().some((root) => _pathIdentity(root) === _pathIdentity(path))) {
     _workspaceRootEntryCounts.set(_treePath(path), entries.length);
     syncWelcome();
+    // 这个计数是预测的输入之一（空工作区该推"做点什么"而不是"读懂什么"），而它是**扫完
+    // 才有**的。不在这儿通知一声，预测就停在扫描之前算出的那一版：打开一个空文件夹，
+    // 灰字里仍然写着"深挖整个项目"，用户看到的就是"预测不会实时变"。
+    try { _refreshChatHintIfEmpty(); } catch {}
   }
   container.innerHTML = "";
   for (const entry of entries) {
@@ -18587,12 +18591,34 @@ function _dynamicChatChips() {
     if (!isDoc && !isTest) add(22, t("assistant.chip.errorHandling"), t("assistant.prompt.errorHandling", { path: target }));
     if (!isDoc) add(18, t("assistant.chip.callGraph"), t("assistant.prompt.callGraph", { path: target }));
   } else if (root || (workspaceRoots && workspaceRoots.length)) {
-    add(50, t("assistant.chip.projectResearch"), t("assistant.prompt.projectResearch"));
-    add(44, t("assistant.chip.whatIsProject"), t("assistant.prompt.whatIsProject"));
-    add(40, t("assistant.chip.howToRun"), t("assistant.prompt.howToRunProject"));
-    add(34, t("assistant.chip.addFeature"), t("assistant.prompt.addFeature"));
-    add(30, t("assistant.chip.findIssues"), t("assistant.prompt.findProjectIssues"));
-    add(26, t("assistant.chip.addTests"), t("assistant.prompt.addProjectTests"));
+    /*
+     * 打开了工作区，但里面**可能一个文件都没有**。
+     *
+     * 这一档以前只判"有没有根目录"，不看根目录里有没有东西，于是对着一个空文件夹照样
+     * 推「用 research_project 深挖整个项目，给我一份上手地图：技术栈、目录结构……」——
+     * 而助手上一条刚说完"当前目录完全为空"。预测和事实当场打架，这就是"预测老是不准"
+     * 最刺眼的一种。
+     *
+     * 空与非空要给完全不同的建议：空目录该问的是"做点什么"，不是"读懂什么"。
+     * 注意只认 `=== 0`：这个计数是异步扫出来的，还没扫到时是 undefined，
+     * 那时候不能当成空——否则刚打开一个大项目的头一秒会推一串"新建项目"。
+     */
+    const _entryCount = (() => {
+      try { return _workspaceRootEntryCounts.get(_treePath(root)); } catch { return undefined; }
+    })();
+    if (_entryCount === 0) {
+      add(50, t("assistant.chip.startProject"), t("assistant.prompt.startProject"));
+      add(44, t("assistant.chip.scaffoldHere"), t("assistant.prompt.scaffoldHere"));
+      add(38, t("assistant.chip.whatCanIdeDo"), t("assistant.prompt.whatCanIdeDo"));
+      add(30, t("assistant.chip.writeScript"), t("assistant.prompt.writeScript"));
+    } else {
+      add(50, t("assistant.chip.projectResearch"), t("assistant.prompt.projectResearch"));
+      add(44, t("assistant.chip.whatIsProject"), t("assistant.prompt.whatIsProject"));
+      add(40, t("assistant.chip.howToRun"), t("assistant.prompt.howToRunProject"));
+      add(34, t("assistant.chip.addFeature"), t("assistant.prompt.addFeature"));
+      add(30, t("assistant.chip.findIssues"), t("assistant.prompt.findProjectIssues"));
+      add(26, t("assistant.chip.addTests"), t("assistant.prompt.addProjectTests"));
+    }
   } else {
     add(30, t("assistant.chip.openFolder"), t("assistant.prompt.openFolder"));
     add(26, t("assistant.chip.whatCanIdeDo"), t("assistant.prompt.whatCanIdeDo"));
