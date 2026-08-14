@@ -6899,8 +6899,10 @@ mod tests {
             let cjk = focused_system.chars().filter(|c| ('\u{4e00}'..='\u{9fff}').contains(c)).count();
             cjk + (focused_system.chars().count() - cjk) / 4
         };
+        // 与下面 full 档同一批增补（配色菜单 + shadcn 真实安装命令）连带抬高。
+        // 小改动这一档同样需要配色依据：「把首页配色和卡片改好看点」走的正是这条路。
         assert!(
-            focused_tokens < 10_500,
+            focused_tokens < 11_200,
             "focused UI prompt should remain compact: ~{focused_tokens} tokens ({} bytes)",
             focused_system.len()
         );
@@ -6932,8 +6934,17 @@ mod tests {
             !build_system.contains("# Loaded per task: research, community, and current facts"),
             "a product category inside a UI build must not load the research module"
         );
+        // 上限从 56_000 提到 59_500。守卫的用途是拦住无人过问的膨胀，不是禁止有意的增补；
+        // 这次多出来的两千多字节全部有名有姓：
+        //   · design_tokens 里业主实测过的配色菜单（Mono Ink / Paper Warm / Google / Apple /
+        //     Ink & Signal 等）——自己编配色是页面显得像 AI 生成的头号原因，而配色决策发生在
+        //     检索之前，靠"需要时再查"来不及；
+        //   · shadcn/ui 的**真实安装命令**——此前提示词只说"按需添加 primitive"，从没给过命令，
+        //     模型就理解成"照着 shadcn 的样子手写一套"，产出的控件缺 focus-visible/disabled/
+        //     Radix 浮层行为，一眼就是手作的。
+        // 再往上加要先腾地方，别继续抬这个数。
         assert!(
-            build_system.len() < 56_000,
+            build_system.len() < 59_500,
             "full UI prompt should remain bounded: {} bytes",
             build_system.len()
         );
@@ -7072,6 +7083,51 @@ mod design_truncation_tests {
         for n in [5usize, 17, 33, 64, 100] {
             let out = bounded_chars(&text, n);
             assert!(out.chars().count() > 0, "n={n} 时返回空");
+        }
+    }
+}
+
+#[cfg(test)]
+mod design_palette_and_shadcn_tests {
+    use super::{read_prompt, PROMPT_NAMES};
+
+    /// 业主实测过的配色必须在**每轮都注入**的那一层，不能只躺在知识库里。
+    ///
+    /// 配色决策发生在检索之前——模型一旦自己编了一套色，后面查到什么都晚了。
+    /// 而"自己编配色"正是页面显得像 AI 生成的头号原因。
+    #[test]
+    fn 实测配色菜单随每次_ui_任务注入() {
+        assert!(PROMPT_NAMES.contains(&"design_tokens"));
+        let text = read_prompt("design_tokens").expect("design_tokens.txt");
+        for name in ["Mono Ink", "Paper Warm", "Google", "Apple", "Ink & Signal"] {
+            assert!(text.contains(name), "配色菜单缺了 {name}");
+        }
+        // 得给到可直接用的值，不能只有名字
+        for value in ["#FFFFFF", "#1A73E8", "#F5F5F7", "#0071E3", "#0A0A0A"] {
+            assert!(text.contains(value), "缺具体色值 {value}");
+        }
+        assert!(text.contains("自己编配色"), "要说清为什么不许自己编");
+    }
+
+    /// shadcn/ui 必须写成**真的安装**，而不是"照它的样子写"。
+    ///
+    /// 此前提示词只说「按需添加 primitive」，从没给过命令，模型就理解成手写一套
+    /// "shadcn 风格"的组件——缺 focus-visible、disabled、键盘可达性和 Radix 的浮层行为，
+    /// 看起来就是差一截。这正是用户说的「自己写的组件样式会很丑」。
+    #[test]
+    fn shadcn_是装出来的不是仿出来的() {
+        // 逐个文件断言，不是"任一个有就算数"——两处都写了命令，只查"有没有"的话
+        // 删掉其中一处测试照样绿，等于没守住。
+        for name in ["design_tokens", "design_components"] {
+            let text = read_prompt(name).unwrap_or_default();
+            assert!(
+                text.contains("shadcn@latest init") && text.contains("shadcn@latest add"),
+                "{name} 必须给出真实的安装命令，光说「按需添加」会被理解成手写一套"
+            );
+            assert!(
+                text.contains("shadcn-style") || text.contains("shadcn 风格"),
+                "{name} 必须明确禁止手写「shadcn 风格」的控件"
+            );
         }
     }
 }

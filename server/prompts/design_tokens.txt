@@ -23,6 +23,36 @@
 }
 ```
 
-更细的做法——卡片质感的 surface 阶梯与顶边内高光、用单一强调色的透明度档做层次、
-mockup 真实感、深度氛围、可直接抄的组件模板——在知识库里：
+## 配色：没有蓝本钉死时，从这几套里挑一套，别自己编
+
+业主实测过的几套。**自己编配色是页面像 AI 生成的头号原因**。按气质挑，不按喜好。
+
+- **Mono Ink（黑白）** `#FFFFFF` / ink `#111111` / 面 `#FAFAFA`。主色就是墨黑本身。
+  最稳、最难显廉价；用户没提偏好时的默认。作品集、机构、编辑、开发者工具、轻奢。
+- **Paper Warm（暖白纸）** `#FBFAF8` / ink `#1C1917` / 需要时点缀陶土 `#B45309`。
+  烘焙、咖啡、茶室、花店、婚礼、手作、书店——有食物或手感的都走这套。
+- **Google** `#FFFFFF` / ink `#202124` / 主色 `#1A73E8` / 面 `#F8F9FA`。大留白、强字阶、
+  颜色只当功能用。仪表盘、后台、SaaS、教育、政务。
+- **Apple** `#F5F5F7` / ink `#1D1D1F` / 主色 `#0071E3`。排版留白做事，颜色几乎不参与；
+  标题 48–80px、正文 17–21px、区块很高。产品发布、硬件、高端消费——**必须有真图真文案**。
+- **Ink & Signal（深色）** `#0A0A0A` / ink `#EDEDED` / 面 `#141414` / 单一强调色（indigo /
+  emerald / sky / violet 选一个）。开发者工具、基础设施、AI、数据产品。卡片必须比画布**更亮**。
+- 另有 **Nordic Calm**（医疗/金融/法务）、**Forest**（自然/公益）、**Midnight Gold**（金融/律所/奢侈）。
+
+完整值、暗色档、每套"什么会毁掉它"，以及卡片质感、单色相层次、mockup 真实感、
+深度氛围、可抄的组件模板，都在知识库：
+`knowledge_search(domain="michael-design", query="curated palettes")` /
 `knowledge_search(domain="michael-design", query="concrete css craft")`。
+
+## shadcn/ui 要**真的装**，不是"照着它的样子写"
+
+走默认分支（空工作区/没有可沿用的栈）时，组件库是装出来的，不是手写的：
+
+```bash
+npx shadcn@latest init          # 建立 components.json、CSS 变量、cn() 工具
+npx shadcn@latest add button card input dialog   # 只加页面真正用到的
+```
+
+**禁止**自己写"shadcn 风格的" Button/Card/Input——手写控件缺 focus-visible、disabled、
+键盘可达性和 Radix 浮层行为，一眼就差一截，这正是"自己写的组件很丑"的来源。
+已有项目组合它自己的 primitive，同样不另造平行控件。
