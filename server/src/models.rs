@@ -293,6 +293,10 @@ fn looks_like_relay_truncation(err: &str) -> bool {
     const SIGNATURES: &[&str] = &[
         "incomplete arguments JSON",
         "incomplete SSE frame",
+        // 线上实测最高频的那一种：中转丢块之后，tool_use 的 input 是残的，于是被
+        // 必填参数校验拦下——文案里没有任何"截断/incomplete"字样，纯靠这条认。
+        // 268 次请求里协议校验失败 4 次，其中 3 次是它，而钳位一次都没触发。
+        "is missing required arguments",
         "ended before protocol completion",
         "ended before message_stop",
         "ended before tool_use",
@@ -11760,6 +11764,8 @@ mod relay_truncation_tests {
             "OpenAI upstream stream ended without terminal data: [DONE]",
             "upstream stream stalled for 180 seconds",
             "OpenAI SSE tool call ended without function.name",
+            // 线上最高频的那一种（丢块后 tool_use 的 input 是残的）
+            "Anthropic tool call \"edit_file\" is missing required arguments: old_string, new_string",
         ] {
             assert!(
                 looks_like_relay_truncation(err),
@@ -11777,6 +11783,8 @@ mod relay_truncation_tests {
             "Anthropic tool_use \"x\" input must be a JSON object",
             "429 Too Many Requests",
             "upstream returned 500",
+            // 上游自己报错，不是丢块——钳位帮不上忙
+            "Anthropic streaming error: Upstream request failed",
         ] {
             assert!(
                 !looks_like_relay_truncation(err),
@@ -11798,10 +11806,13 @@ mod relay_truncation_tests {
             let rest = &line[start + 1..];
             let Some(end) = rest.find('"') else { continue };
             let text = &rest[..end];
+            // 也要扫"参数缺失"这一类：丢块的表现之一是 tool_use 的 input 残缺，
+            // 被必填参数校验拦下，而它的文案里一个"截断"字样都没有。上一版漏的就是它。
             let looks_like_truncation_message = text.contains("ended before")
                 || text.contains("ended without")
                 || text.contains("incomplete SSE frame")
-                || text.contains("incomplete arguments JSON");
+                || text.contains("incomplete arguments JSON")
+                || text.contains("is missing required arguments");
             // 只看校验器造出来的错误文案，跳过判据自己那张表和测试用例
             if !looks_like_truncation_message || text.len() < 15 {
                 continue;
