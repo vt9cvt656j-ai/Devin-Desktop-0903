@@ -496,11 +496,11 @@ struct DesignColorDirection {
     category: &'static str,
     source: &'static str,
     blueprint_query: &'static str,
-    background: &'static str,
-    foreground: &'static str,
-    primary: &'static str,
-    support: Option<&'static str>,
-    muted: &'static str,
+    // 这里**不再放色值**。曾经放过五个角色的 Tailwind 档，是从知识库手抄的，
+    // 抄漂了也没人发现（cafe 的 foreground 抄成 orange-950，真源是 espresso #3E2723；
+    // wellness 那一整条真源里根本没有），而输出还署名 "Evidence source: …Curated Palette Library"。
+    // 现在色值一律在 design_color_direction_block 里从 knowledge/michael-design 现取，
+    // 这张表只负责"把请求路由到哪一条"。
     typography: &'static str,
 }
 
@@ -510,11 +510,6 @@ const DESIGN_COLOR_DIRECTIONS: &[DesignColorDirection] = &[
         category: "cafe / coffee / bakery / restaurant",
         source: "enterprise-standard#Curated Palette Library — Cafe / coffee / bakery",
         blueprint_query: "cafe coffee bakery restaurant dining menu warm hospitality editorial food photography",
-        background: "orange-50",
-        foreground: "orange-950",
-        primary: "amber-800",
-        support: Some("orange-700"),
-        muted: "orange-100",
         typography: "Fraunces display + Inter body",
     },
     DesignColorDirection {
@@ -522,11 +517,6 @@ const DESIGN_COLOR_DIRECTIONS: &[DesignColorDirection] = &[
         category: "nature stay / travel / hotel / cabin",
         source: "enterprise-standard#Curated Palette Library — Nature lodge / travel stay",
         blueprint_query: "nature lodge cabin hotel resort travel booking stay warm forest editorial photography",
-        background: "stone-50",
-        foreground: "stone-800",
-        primary: "amber-700",
-        support: Some("green-800"),
-        muted: "stone-100",
         typography: "Fraunces display + Inter body",
     },
     DesignColorDirection {
@@ -534,11 +524,6 @@ const DESIGN_COLOR_DIRECTIONS: &[DesignColorDirection] = &[
         category: "finance / fintech / investment / banking",
         source: "enterprise-standard#Curated Palette Library — Finance / fintech",
         blueprint_query: "fintech finance investment wealth banking dashboard analytics payments trustworthy light",
-        background: "slate-50",
-        foreground: "slate-900",
-        primary: "blue-700",
-        support: Some("emerald-700"),
-        muted: "slate-100",
         typography: "Space Grotesk display + Inter body",
     },
     DesignColorDirection {
@@ -546,23 +531,15 @@ const DESIGN_COLOR_DIRECTIONS: &[DesignColorDirection] = &[
         category: "health / clinic / medical / healthcare",
         source: "enterprise-standard#Curated Palette Library — Health / clinic / wellness",
         blueprint_query: "healthcare medical clinic patient care health portal calm trustworthy light",
-        background: "emerald-50",
-        foreground: "teal-950",
-        primary: "teal-600",
-        support: Some("lime-600"),
-        muted: "emerald-100",
         typography: "Inria Serif display + Inter body",
     },
     DesignColorDirection {
         id: "wellness-organic",
         category: "wellness / spa / yoga / beauty / supplements",
-        source: "design-judgment#Category Palette Harmony — spa/wellness",
+        // 知识库把 wellness 并在 Health 那一行里，键要对得上，否则这一条永远走兜底、
+        // 拿不到成套配色（而它原先那组 emerald 值，真源里根本不存在）。
+        source: "enterprise-standard#Curated Palette Library — Health / clinic / wellness",
         blueprint_query: "wellness spa yoga beauty supplements botanical organic calm product photography",
-        background: "stone-50",
-        foreground: "emerald-950",
-        primary: "emerald-700",
-        support: Some("lime-600"),
-        muted: "stone-100",
         typography: "DM Sans display + Inter body",
     },
     DesignColorDirection {
@@ -570,11 +547,6 @@ const DESIGN_COLOR_DIRECTIONS: &[DesignColorDirection] = &[
         category: "AI / SaaS / chat / productivity / workflow",
         source: "enterprise-standard#Curated Palette Library — SaaS / tech / AI / chat",
         blueprint_query: "AI SaaS workflow automation chat productivity dashboard application light interface",
-        background: "zinc-50",
-        foreground: "zinc-950",
-        primary: "emerald-600",
-        support: Some("blue-600"),
-        muted: "zinc-100",
         typography: "Space Grotesk display + Inter body",
     },
     DesignColorDirection {
@@ -582,11 +554,6 @@ const DESIGN_COLOR_DIRECTIONS: &[DesignColorDirection] = &[
         category: "editorial / magazine / creative portfolio / studio",
         source: "design-judgment#Category Palette Harmony — Monochrome is a complete design",
         blueprint_query: "editorial magazine creative portfolio studio art gallery typography photography layout",
-        background: "zinc-50",
-        foreground: "zinc-950",
-        primary: "zinc-900",
-        support: None,
-        muted: "zinc-100",
         typography: "Playfair Display or Newsreader display + Source Serif 4 body",
     },
     DesignColorDirection {
@@ -594,11 +561,6 @@ const DESIGN_COLOR_DIRECTIONS: &[DesignColorDirection] = &[
         category: "luxury / jewelry / fashion / premium retail",
         source: "enterprise-standard#Curated Palette Library — Luxury / jewelry / fashion",
         blueprint_query: "luxury jewelry fashion premium retail editorial product photography dark refined",
-        background: "stone-950",
-        foreground: "stone-50",
-        primary: "yellow-600",
-        support: Some("stone-500"),
-        muted: "stone-900",
         typography: "Cormorant Garamond display + Jost body",
     },
     DesignColorDirection {
@@ -606,11 +568,6 @@ const DESIGN_COLOR_DIRECTIONS: &[DesignColorDirection] = &[
         category: "education / kids / course / learning community",
         source: "enterprise-standard#Curated Palette Library — Education / kids",
         blueprint_query: "education course learning school kids community playful clear dashboard",
-        background: "amber-50",
-        foreground: "slate-800",
-        primary: "orange-600",
-        support: Some("cyan-600"),
-        muted: "amber-100",
         typography: "Space Grotesk display + Inter body",
     },
     DesignColorDirection {
@@ -618,11 +575,6 @@ const DESIGN_COLOR_DIRECTIONS: &[DesignColorDirection] = &[
         category: "real estate / architecture / property",
         source: "enterprise-standard#Curated Palette Library — Real estate / architecture",
         blueprint_query: "real estate architecture property homes interior editorial listings premium neutral",
-        background: "stone-50",
-        foreground: "stone-900",
-        primary: "teal-700",
-        support: Some("yellow-700"),
-        muted: "stone-200",
         typography: "Marcellus display + Inter body",
     },
     DesignColorDirection {
@@ -630,11 +582,6 @@ const DESIGN_COLOR_DIRECTIONS: &[DesignColorDirection] = &[
         category: "nonprofit / charity / community impact",
         source: "enterprise-standard#Curated Palette Library — Nonprofit / charity / animal rescue",
         blueprint_query: "nonprofit charity community impact donation volunteer warm trustworthy photography",
-        background: "stone-50",
-        foreground: "stone-900",
-        primary: "teal-600",
-        support: Some("rose-500"),
-        muted: "stone-100",
         typography: "Fraunces display + Inter body",
     },
     DesignColorDirection {
@@ -642,11 +589,6 @@ const DESIGN_COLOR_DIRECTIONS: &[DesignColorDirection] = &[
         category: "pets / veterinary / animal care",
         source: "enterprise-standard#Curated Palette Library — Pets / vet",
         blueprint_query: "pets veterinary animal care clinic adoption service friendly photography",
-        background: "zinc-50",
-        foreground: "zinc-900",
-        primary: "sky-600",
-        support: Some("orange-400"),
-        muted: "zinc-100",
         typography: "Space Grotesk display + Inter body",
     },
     DesignColorDirection {
@@ -654,11 +596,6 @@ const DESIGN_COLOR_DIRECTIONS: &[DesignColorDirection] = &[
         category: "general product / service website",
         source: "design-judgment#Category Palette Harmony — Monochrome is a complete design",
         blueprint_query: "modern product service website light editorial responsive layout visual hierarchy",
-        background: "zinc-50",
-        foreground: "zinc-950",
-        primary: "zinc-900",
-        support: None,
-        muted: "zinc-100",
         typography: "Space Grotesk display + Inter body",
     },
 ];
@@ -889,31 +826,63 @@ fn design_color_direction(query: &str) -> DesignColorDirection {
         .expect("design color direction catalog must contain every routed id")
 }
 
+/// 从用户的知识库里现取这一品类的成套配色。
+///
+/// 之前那五个角色的值是**手抄进 Rust 常量**的，而输出文案还署名
+/// "Evidence source: enterprise-standard#Curated Palette Library"——把手抄值冒充成知识库真源。
+/// 抄的过程还漂了：cafe 的 foreground 抄成 orange-950（真源是 espresso `#3E2723`，该 snap 到
+/// stone-800），health 的 background 抄成 emerald-50（真源 slate-50），wellness 那一整条
+/// 在真源里根本不存在。用户的要求很明确：配色只能来自他的知识库。
+///
+/// 所以代码现在只做一件事——决定**读哪一行**；色值逐字来自 knowledge/michael-design。
+fn curated_palette_line(kb_key: &str) -> Option<String> {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("knowledge/michael-design/enterprise-standard.md");
+    let text = std::fs::read_to_string(path).ok()?;
+    let start = text.find("[sections/curated-palette-library]")?;
+    let section = &text[start..];
+    let end = section[1..].find("\n## ").map(|i| i + 1).unwrap_or(section.len());
+    let needle = kb_key.to_lowercase();
+    section[..end]
+        .lines()
+        .find(|line| line.trim_start().starts_with("- ") && line.to_lowercase().contains(&needle))
+        .map(|line| line.trim_start_matches("- ").trim().to_string())
+}
+
 fn design_color_direction_block(direction: DesignColorDirection) -> String {
-    let support = direction
-        .support
-        .map(|support| format!("accent / secondary highlight = {support}"))
-        .unwrap_or_else(|| {
-            "accent / secondary highlight = none (keep the page monochrome)".to_string()
-        });
+    // source 形如 "enterprise-standard#Curated Palette Library — Cafe / coffee / bakery"，
+    // 破折号后面那截就是知识库里那一行的抬头。
+    let kb_key = direction
+        .source
+        .rsplit('\u{2014}')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .split('/')
+        .next()
+        .unwrap_or("")
+        .trim();
+    if let Some(line) = curated_palette_line(kb_key) {
+        return format!(
+            "--- michael-design runtime-locked colour direction (mandatory, not a suggestion) ---\n\
+             Category: {} (route: {})\n\
+             Evidence source: {} — quoted verbatim below, this is the operator's own palette library:\n\
+             {}\n\
+             Preferred search term within this category: `{}`. Type character: {}.\n\
+             Snap any bare hex above to its nearest Tailwind family+step before use, then define semantic tokens (background/foreground/primary/accent/muted) from them; feature components consume only tokens. The root canvas, cards, CTAs, links, active, focus ring and icon tint all derive from these roles; no hue other than a genuine status colour may be introduced. Keep at least 90% of the page neutral — near-monochrome with one crisp CTA colour beats a colourful page every time. Do not switch to violet/indigo, neon-on-black or full-page gradients on your own because something should feel \"premium\"; a cross-category hit may lend layout and motion only, never its palette.",
+            direction.category, direction.id, direction.source, line,
+            direction.blueprint_query, direction.typography,
+        );
+    }
+    // 读不到就**不要编**：明说没有成套依据，让模型自己去知识库取，而不是端出一组来历不明的色值。
     format!(
-        "--- michael-design runtime-locked colour direction (mandatory, not a suggestion) ---\n\
-         Category: {} (route: {})\n\
-         Evidence source: {}. Preferred search term within this category: `{}`.\n\
-         When defining tokens use: background = {}; foreground = {}; primary = {}; {}; muted / card-alt = {}.\n\
-         Type character: {}. The root canvas, cards, CTAs, links, active, focus ring and icon tint must all derive from these 5 roles; no hue other than a genuine status colour may be introduced. Keep at least 90% of the page as neutral background/foreground/muted area. Do not switch to violet/indigo, neon-on-black or full-page gradients on your own because something should feel \"premium\" or \"high-tech\"; a cross-category hit may lend layout and motion only, and must not change this palette. Define the semantic tokens in source first, and have feature components consume only tokens.",
-        direction.category,
-        direction.id,
-        direction.source,
-        direction.blueprint_query,
-        direction.background,
-        direction.foreground,
-        direction.primary,
-        support,
-        direction.muted,
-        direction.typography,
+        "--- michael-design colour direction ---\n\
+         Category: {} (route: {}).\n\
+         No ready-made palette line was found for this category in the operator's library. Do NOT invent one. Default to near-monochrome (white/near-black, ≥90% neutral area, one crisp CTA colour), and if colour is genuinely needed run `knowledge_search(domain=\"michael-design\", query=\"{} palette\")` and adopt the closest set from enterprise-standard#Curated Palette Library, stating which line you took. Type character: {}.",
+        direction.category, direction.id, direction.blueprint_query, direction.typography,
     )
 }
+
 
 /// Flatten the textual content of one user message, including multimodal text parts.
 fn user_message_text(message: &serde_json::Value) -> Option<String> {
@@ -2084,6 +2053,12 @@ fn ensure_design_backbone_hits(
             "shadcn component coverage primitives Tailwind semantics cva",
             "shadcn-component-coverage",
         ),
+        // 骨干里原本有"字体该怎么配"的成套答案，偏偏没有"颜色该怎么配"的。
+        // 品类没命中站点蓝本时（律所、作品集实测如此），这是唯一一份成套配色真源。
+        (
+            "curated palette library enterprise token sets by category background foreground primary accent muted",
+            "curated-palette-library",
+        ),
         (
             "Typography Pairings display body combinations brand tone",
             "typography-pairings",
@@ -2540,6 +2515,10 @@ fn design_hit_key(hit: &crate::knowledge::SearchHit) -> String {
     format!("{}#{}", hit.topic, hit.section.to_lowercase())
 }
 
+/// 这一节曾经被无条件剔出注入块，理由是"别挤掉真实品类站点"。
+/// 但在没有同品类站点蓝本的品类上（律所、作品集实测都是），剔掉它等于把**唯一**一份
+/// 成套配色真源也拿走了，模型就只剩自己编色——用户看到的"配色丑"正是从这里来的。
+/// 现在只在本轮已经有同品类站点蓝本时才让位。
 fn design_hit_is_generic_palette_library(hit: &crate::knowledge::SearchHit) -> bool {
     hit.section
         .to_lowercase()
@@ -6623,13 +6602,25 @@ mod tests {
         for (request, expected_id, expected_background, expected_primary) in cases {
             let direction = design_color_direction(request);
             assert_eq!(direction.id, expected_id, "wrong route for: {request}");
-            assert_eq!(direction.background, expected_background);
-            assert_eq!(direction.primary, expected_primary);
+            // 色值不再由这张表提供——它现在只管路由，值逐字来自 knowledge/michael-design。
+            // 所以这里断言的是「引用到了知识库对应那一行」，而不是某个写死的档位。
             let packet = design_color_direction_block(direction);
-            assert!(packet.contains("runtime-locked colour direction"));
-            assert!(packet.contains(expected_background));
-            assert!(packet.contains(expected_primary));
-            assert!(packet.contains(direction.source));
+            let quoted = packet.contains("quoted verbatim");
+            assert!(
+                quoted || packet.contains("Do NOT invent"),
+                "要么逐字引用知识库那一行，要么明说没有、别编：{packet}"
+            );
+            // 只有真的引用到了才署名。兜底分支故意不写 "Evidence source"——
+            // 把来路不明的值挂上知识库的名号，正是这次要治的毛病。
+            if quoted {
+                assert!(packet.contains(direction.source), "引用了就要署明出处：{packet}");
+            } else {
+                assert!(
+                    !packet.contains("Evidence source"),
+                    "没引用到就不该署名知识库：{packet}"
+                );
+            }
+            let _ = (expected_background, expected_primary);
             ids.insert(direction.id);
         }
         assert_eq!(ids.len(), cases.len());
@@ -6649,12 +6640,13 @@ mod tests {
             "the fixed color direction must be read before generic blueprint evidence"
         );
         assert!(block.contains("route: fintech-investment"));
-        assert!(block.contains("background = slate-50"));
-        assert!(block.contains("primary = blue-700"));
+        // 色值来自知识库那一行的逐字引用，不再是代码里写死的 "background = slate-50"。
         assert!(
-            !block.contains("curated-palette-library"),
-            "the generic palette section must not crowd out category blueprints"
+            block.contains("quoted verbatim") && block.contains("Finance"),
+            "金融品类应当逐字引用知识库 Curated Palette Library 里的那一行"
         );
+        // 这一节不再被剔出注入：品类没命中站点蓝本时（律所、作品集实测如此），
+        // 它是**唯一**一份成套配色真源，剔掉就等于逼模型自己编色。
     }
 
     #[test]
@@ -7096,17 +7088,30 @@ mod design_palette_and_shadcn_tests {
     /// 配色决策发生在检索之前——模型一旦自己编了一套色，后面查到什么都晚了。
     /// 而"自己编配色"正是页面显得像 AI 生成的头号原因。
     #[test]
-    fn 实测配色菜单随每次_ui_任务注入() {
+    fn 配色纪律随每次_ui_任务注入且不自造色板() {
         assert!(PROMPT_NAMES.contains(&"design_tokens"));
         let text = read_prompt("design_tokens").expect("design_tokens.txt");
-        for name in ["Mono Ink", "Paper Warm", "Google", "Apple", "Ink & Signal"] {
-            assert!(text.contains(name), "配色菜单缺了 {name}");
+        // 近黑白是**默认**，不是"备选之一"。只查"近黑白"三个字太松——它在别处也出现，
+        // 把默认那句删掉测试照样绿。要钉的是"默认"这个断言本身。
+        assert!(
+            text.contains("默认就是近黑白"),
+            "必须明确写出近黑白是默认，而不是众多选择里的一个"
+        );
+        assert!(text.contains("90%"), "必须给出中性色占比这个可执行判据");
+        // 其余配色只能来自知识库
+        assert!(text.contains("michael-design"), "偏离近黑白时必须指向知识库检索");
+        assert!(
+            text.contains("Curated Palette Library"),
+            "要点名知识库里那套配色库，别让模型自己找"
+        );
+        assert!(text.contains("不是编色的许可"), "必须堵死「品类没列出所以我自己编」这条路");
+        // 提示词里不许出现我们自己编的成套色值——配色的唯一来源是知识库
+        for invented in ["Mono Ink", "Paper Warm", "Ink & Signal", "Nordic Calm", "Midnight Gold"] {
+            assert!(
+                !text.contains(invented),
+                "{invented} 是提示词自造的配色，配色只能来自用户的知识库"
+            );
         }
-        // 得给到可直接用的值，不能只有名字
-        for value in ["#FFFFFF", "#1A73E8", "#F5F5F7", "#0071E3", "#0A0A0A"] {
-            assert!(text.contains(value), "缺具体色值 {value}");
-        }
-        assert!(text.contains("自己编配色"), "要说清为什么不许自己编");
     }
 
     /// shadcn/ui 必须写成**真的安装**，而不是"照它的样子写"。
@@ -7129,5 +7134,94 @@ mod design_palette_and_shadcn_tests {
                 "{name} 必须明确禁止手写「shadcn 风格」的控件"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod palette_single_source_tests {
+    use super::{
+        curated_palette_line, design_color_direction, design_color_direction_block,
+        DESIGN_COLOR_DIRECTIONS,
+    };
+
+    fn kb_text() -> String {
+        std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("knowledge/michael-design/enterprise-standard.md"),
+        )
+        .expect("知识库读不到")
+    }
+
+    /// 注入给模型的每一个色值，都必须逐字出自用户的知识库。
+    ///
+    /// 这条守的是本次事故的根因：五个角色的值原本是**手抄**进 Rust 常量的，输出还署名
+    /// "Evidence source: enterprise-standard#Curated Palette Library"，把手抄值冒充成真源。
+    /// 抄漂了也没人知道——cafe 的 foreground 成了 orange-950（真源 espresso #3E2723 → stone-800），
+    /// health 的 background 成了 emerald-50（真源 slate-50），wellness 那一整条真源里没有。
+    /// Rust 常量和 knowledge/*.md 是两份独立真源，此前没有任何测试交叉校验。
+    #[test]
+    fn 注入的色值全部逐字来自知识库() {
+        let kb = kb_text().to_lowercase();
+        let mut offenders: Vec<String> = Vec::new();
+        for direction in DESIGN_COLOR_DIRECTIONS {
+            let block = design_color_direction_block(*direction).to_lowercase();
+            // 抽出块里出现的所有 Tailwind 族+档 与裸 hex
+            for token in block.split(|c: char| !(c.is_ascii_alphanumeric() || c == '-' || c == '#')) {
+                let looks_like_step = token.contains('-')
+                    && token.rsplit('-').next().map(|n| n.parse::<u32>().is_ok()).unwrap_or(false);
+                let looks_like_hex = token.starts_with('#') && token.len() == 7;
+                if !looks_like_step && !looks_like_hex {
+                    continue;
+                }
+                if !kb.contains(token) {
+                    offenders.push(format!("{}: `{token}` 不在知识库里", direction.id));
+                }
+            }
+        }
+        offenders.sort();
+        offenders.dedup();
+        assert!(
+            offenders.is_empty(),
+            "配色只能来自用户的知识库，这些是代码自己造的：\n{}",
+            offenders.join("\n")
+        );
+    }
+
+    /// 知识库里没有对应品类时，宁可说"没有"，也不能端出一组来历不明的色值。
+    #[test]
+    fn 品类缺席时不编色而是指回知识库() {
+        // 真源里确实没有 wellness 独立一行（它并在 health 里）
+        let block = design_color_direction_block(
+            *DESIGN_COLOR_DIRECTIONS
+                .iter()
+                .find(|d| d.id == "wellness-organic")
+                .expect("wellness-organic 路由应当存在"),
+        );
+        if !block.contains("quoted verbatim") {
+            assert!(block.contains("Do NOT invent"), "缺席时必须明确禁止编色：{block}");
+            assert!(block.contains("near-monochrome"), "缺席时的默认必须是近黑白：{block}");
+            assert!(block.contains("knowledge_search"), "要指回知识库：{block}");
+        }
+    }
+
+    /// 取到的行必须是真的那一行，不是随便一行。
+    #[test]
+    fn 按品类取到的是对应那一行() {
+        let line = curated_palette_line("Cafe").expect("cafe 那一行应当取得到");
+        assert!(line.to_lowercase().contains("cafe"), "取错行了：{line}");
+        assert!(line.contains('#'), "配色行应当带具体值：{line}");
+        assert!(curated_palette_line("这个品类不存在").is_none());
+    }
+
+    /// 咖啡店走的必须是知识库那一行，而不是旧的手抄值。
+    #[test]
+    fn 咖啡店拿到的是知识库真源不是手抄值() {
+        let block = design_color_direction_block(design_color_direction("做一个咖啡店官网"));
+        assert!(block.contains("quoted verbatim"), "应当逐字引用知识库：{block}");
+        assert!(block.contains("#FFFBF5"), "应当出现真源里的 cream 值：{block}");
+        assert!(
+            !block.contains("orange-950"),
+            "orange-950 是抄漂了的旧值，真源里没有：{block}"
+        );
     }
 }
