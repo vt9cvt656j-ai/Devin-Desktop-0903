@@ -926,7 +926,9 @@ test("卡片里的服务自述取的是消毒过那份，不是带免责前缀�
 test("卡片按根取快照，不读会被整个换掉的那两张全局表", () => {
   // 直接读模块级 _mcpToolCache / _mcpServerMeta 会串项目：切换工作区时它们被整份替换，
   // 于是 A 项目的卡片会显示 B 项目那个同名服务的说明和配置路径。
-  for (const fn of ["_mcpToolCardHtml", "_toolStepWhyLine"]) {
+  // 按根取快照的地方有三处：卡片正文、行里的头像、（原来还有说明行——那一行现在
+  // 改成显示"这次调用了什么"，不再读服务自述，所以不在此列）。
+  for (const fn of ["_mcpToolCardHtml", "_mcpServerIconHtml"]) {
     const at = SRC.indexOf(`function ${fn}`);
     assert.ok(at > 0, `找不到 ${fn}`);
     const src = SRC.slice(at, at + 2600);
@@ -966,4 +968,71 @@ test("审批框要说清这次要干嘛，而不是只给两个名字", () => {
   const seg = SRC.slice(at, at + 900);
   assert.match(seg, /descBody/, "审批框里没有能力说明");
   assert.match(seg, /服务自述（第三方文本）/, "没标明这段说明的作者是第三方");
+});
+
+// ── 行里要看得出「这次到底调了什么」，图标要是服务自己的头像 ──────────────────
+//
+// 用户的原话：「MCP 的头像用真实的，然后调用的时候卡片直接显示细节，比如具体调用了
+// MCP 的什么，这样才能看到实际的操作，不然都不知道在干嘛」。
+// 只写 服务名/工具名 等于没说——真正要看的是传了什么参数。
+
+test("行里第二行显示这次调用的参数，不是服务的自我介绍", () => {
+  const why = load("_toolStepWhyLine", { _mcpCallSummary: load("_mcpCallSummary") });
+  const line = why({ type: "mcp", server: "context7", tool: "get-library-docs",
+    args: { libraryID: "/vercel/next.js", topic: "app router caching" } });
+  assert.equal(line.k, "这次调用");
+  assert.match(line.text, /libraryID=\/vercel\/next\.js/);
+  assert.match(line.text, /topic=app router caching/);
+});
+
+test("参数逐个截断，长的那个不能把后面几个挤没", () => {
+  const sum = load("_mcpCallSummary");
+  const out = sum({ type: "mcp", args: { sql: "SELECT " + "x".repeat(400), table: "users" } });
+  assert.match(out, /table=users/, "第一个长参数把后面的挤掉了");
+  assert.ok(out.length < 200, "整体没截住：" + out.length);
+});
+
+test("资源和 prompt 适配器显示它们真正的入参", () => {
+  const sum = load("_mcpCallSummary");
+  assert.match(sum({ type: "mcp", kind: "resource", args: { uri: "file:///a/b.md" } }), /uri=file:\/\/\/a\/b\.md/);
+  assert.match(sum({ type: "mcp", kind: "prompt", args: { prompt: "review-pr" } }), /prompt=review-pr/);
+});
+
+test("没有参数时明说「无参数」，不是留空", () => {
+  assert.equal(load("_mcpCallSummary")({ type: "mcp", args: {} }), "无参数");
+});
+
+test("图标用服务真实头像：安装时存的 → GitHub owner → 首字母", () => {
+  const mk = (meta) => load("_mcpServerIconHtml", {
+    _mcpStates: new Map([["/w", { snapshot: { serverMeta: new Map([["s", meta]]) } }]]),
+    _mcpRegIconHtml: (o) => JSON.stringify(o),
+  })({ type: "mcp", server: "s", mcpRoot: "/w" });
+  assert.match(mk({ avatar: "https://x/a.png", displayName: "Context7" }), /"avatar":"https:\/\/x\/a\.png"/);
+  assert.match(mk({ owner: "upstash" }), /"owner":"upstash"/);
+  assert.match(mk({ displayName: "Context7" }), /"name":"Context7"/, "没头像时也要把展示名交给兜底逻辑");
+});
+
+test("头像信息存进 serverMeta，否则卡片渲染时根本拿不到", () => {
+  // 卡片渲染时拿不到 servers[name] 那份配置（avatar 在 __michael 里）。
+  const at = SRC.indexOf("_mcpServerMeta.set(serverName, {");
+  assert.ok(at > 0);
+  const seg = SRC.slice(at - 400, at + 500);
+  assert.match(seg, /const _im = _mcpInstalledMeta\(serverName, server\)/, "没从配置里取安装元信息");
+  assert.match(seg, /avatar: String\(_im\.avatar \|\| ""\)/);
+  assert.match(seg, /owner: String\(_im\.owner \|\| ""\)/);
+});
+
+test("头像是建好卡片之后再换的，不动那个被钉住的图标选择表达式", () => {
+  // 那个表达式保证「三机器人只走 _awaitAll 一条路」，包一层就会把这条保证弄坏。
+  const cardSrc = SRC.slice(SRC.indexOf("function _createToolStep(call)"), SRC.indexOf("function _settleToolStep"));
+  assert.ok(cardSrc.includes('${_awaitAll ? _SVG_TRIO_BOTS : (typeIcons[call.type] || (_isKSearch ? typeIcons._ksearch : typeIcons.read))}'),
+    "模板里那个表达式被改动了");
+  assert.match(cardSrc, /_ic\.classList\.add\("atc-type-icon--avatar"\); _ic\.innerHTML = _av;/,
+    "头像没有作为后置装饰换上去");
+});
+
+test("MCP 卡片默认展开——折叠起来就等于又藏回去了", () => {
+  const cardSrc = SRC.slice(SRC.indexOf("function _createToolStep(call)"), SRC.indexOf("function _settleToolStep"));
+  assert.match(cardSrc, /if \(call\.type === "mcp"\) step\.classList\.add\("is-open"\)/,
+    "MCP 卡不默认展开，用户要点开才知道发生了什么，那就还是不知道");
 });
