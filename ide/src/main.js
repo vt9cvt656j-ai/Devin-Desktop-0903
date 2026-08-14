@@ -27094,10 +27094,17 @@ async function _ensureMcpTools(rootOverride = "") {
         const prompts = Array.isArray(discovery?.prompts) ? discovery.prompts : [];
         const resourceTemplates = Array.isArray(discovery?.resourceTemplates || discovery?.resource_templates)
           ? (discovery.resourceTemplates || discovery.resource_templates) : [];
+        // 头像/展示名也存进来：工具卡要画**真实的服务图标**，而卡片渲染时拿不到
+        // servers[serverName] 这份配置（__michael 里才有 avatar/owner）。存原始字段而
+        // 不是拼好的 HTML——状态里塞标记串，改样式时会有一份改不到。
+        const _im = _mcpInstalledMeta(serverName, server);
         _mcpServerMeta.set(serverName, {
           root,
           scope,
           autoApprove,
+          avatar: String(_im.avatar || ""),
+          owner: String(_im.owner || ""),
+          displayName: String(_im.name || serverName),
           source: cfgDoc.serverSources?.[serverName] || "",
           capabilities: discovery?.capabilities || {},
           serverInfo: discovery?.serverInfo || discovery?.server_info || {},
@@ -46364,6 +46371,51 @@ function _toolStepActionLabel(call) {
  * 技能自述**不能**顶「为什么」的位置：那是两个作者写的两句话，一个说"这个技能是干嘛的"，
  * 一个说"这次为什么要它"。混成一句，用户就分不清哪句是模型的判断。所以自述另起一个眉标。
  */
+/*
+ * 这次 MCP 调用**到底做了什么** —— 直接摆在行里，不用展开。
+ *
+ * 只写服务名和工具名，用户看到的是「context7 调了 get-library-docs」，那和没说差不多：
+ * 真正要看的是传了什么。所以这里把参数压成一行 `键=值 · 键=值`。
+ * 值可能很长（整段 SQL、整个 URL、一大坨 JSON），逐个截断而不是整体截断，
+ * 否则第一个长参数会把后面几个全挤掉。
+ */
+function _mcpCallSummary(call) {
+  if (call?.kind === "resource") {
+    const uri = String(call?.args?.uri || "").trim();
+    return uri ? `uri=${uri.slice(0, 90)}` : "";
+  }
+  if (call?.kind === "prompt") {
+    const name = String(call?.args?.prompt || "").trim();
+    return name ? `prompt=${name.slice(0, 60)}` : "";
+  }
+  const args = call?.args && typeof call.args === "object" && !Array.isArray(call.args) ? call.args : {};
+  const keys = Object.keys(args);
+  if (!keys.length) return "无参数";
+  const parts = [];
+  for (const k of keys.slice(0, 4)) {
+    let v;
+    try { v = typeof args[k] === "string" ? args[k] : JSON.stringify(args[k]); } catch { v = String(args[k]); }
+    v = String(v ?? "").replace(/\s+/g, " ").trim();
+    parts.push(`${k}=${v.length > 48 ? v.slice(0, 48) + "…" : v}`);
+  }
+  if (keys.length > 4) parts.push(`…另有 ${keys.length - 4} 个参数`);
+  return parts.join(" · ");
+}
+
+/// MCP 服务的**真实头像**：安装时存下的 avatar → GitHub owner 头像 → 首字母兜底。
+/// 和市场卡片、技能卡片走的是同一个 _mcpRegIconHtml，所以三处长得一样。
+function _mcpServerIconHtml(call) {
+  try {
+    const snap = _mcpStates.get(String(call?.mcpRoot || "").replace(/\/+$/, ""))?.snapshot;
+    const meta = snap?.serverMeta?.get?.(call?.server) || {};
+    return _mcpRegIconHtml({
+      name: meta.displayName || call?.server || "?",
+      owner: meta.owner || "",
+      avatar: meta.avatar || "",
+    });
+  } catch { return ""; }
+}
+
 function _toolStepWhyLine(call) {
   const declared = call?.type === "skill" ? String(call.why || "").trim() : "";
   if (declared) return { k: "为什么", text: declared.slice(0, 200), self: false };
@@ -46374,18 +46426,11 @@ function _toolStepWhyLine(call) {
     return desc ? { k: "技能自述", text: desc.slice(0, 200), self: true } : null;
   }
   if (call?.type !== "mcp") return null;
-  // 资源 / prompt 适配器没有 descBody（它们不是普通工具），给一句我们自己写的说明，
-  // 而不是让这一行空着或者编一个服务名。
-  if (call.kind === "resource") return { k: "这个能力", text: "读取该服务发布的资源", self: false };
-  if (call.kind === "prompt") return { k: "这个能力", text: "取用该服务发布的 prompt", self: false };
-  // 按**根**取快照。直接读模块级 _mcpToolCache 会串项目：_adoptMcpViewFrom 在切换工作区时
-  // 会把它整份换掉，于是 A 项目的卡片会显示 B 项目那个同名服务的说明。
-  let desc = "";
-  try {
-    const snap = _mcpStates.get(String(call.mcpRoot || "").replace(/\/+$/, ""))?.snapshot;
-    desc = (snap?.toolCache || []).find((e) => e?.function?.name === call.mcpName)?.descBody || "";
-  } catch {}
-  return desc ? { k: "服务自述", text: String(desc).slice(0, 200), self: true } : null;
+  // MCP 这一行放的是**这次实际调用的参数**，不是服务的自我介绍。
+  // 服务自述是"这个工具一般是干嘛的"，用户在这一行真正想知道的是"它这次动了什么"——
+  // 自述已经在展开的卡片里有一整段，不必占用行里唯一这一行。
+  const summary = _mcpCallSummary(call);
+  return summary ? { k: "这次调用", text: summary.slice(0, 200), self: false } : null;
 }
 
 // #49 三机器人图标：专用于 await_subagent 等待全部子智能体（job=all/空）的卡片。
@@ -46512,6 +46557,7 @@ function _createToolStep(call) {
 
   const _whyLine = (call.type === "mcp" || call.type === "skill") ? _toolStepWhyLine(call) : null;
 
+
   step.innerHTML =
     `<div class="agent-tool-row">` +
     `<svg class="atc-chev" viewBox="0 0 12 12" width="12" height="12"><path d="M4 2.5l3.5 3.5-3.5 3.5" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>` +
@@ -46530,6 +46576,15 @@ function _createToolStep(call) {
       growth.signal("review-diff", { ctype: call.type });
     }
   });
+  // MCP 用**服务自己的头像**，不是那个通用插头图标——用户认的是"我装的那个 context7"。
+  // 建好之后再换，而不是写进上面那个模板：那个图标选择表达式被测试按字面钉住了
+  // （三机器人只走 _awaitAll 一条路），包一层就会把那条保证弄坏。
+  if (call.type === "mcp") {
+    const _av = _mcpServerIconHtml(call);
+    const _ic = _av && step.querySelector(".atc-type-icon");
+    if (_ic) { _ic.classList.add("atc-type-icon--avatar"); _ic.innerHTML = _av; }
+  }
+
   const clickablePath = step.querySelector(".atc-path--clickable");
   if (clickablePath) {
     clickablePath.addEventListener("click", (e) => {
@@ -46550,6 +46605,10 @@ function _createToolStep(call) {
         _vp0.innerHTML = call.type === "mcp"
           ? _mcpToolCardHtml(call, null)
           : _skillToolCardHtml(call, _findSkillByName([..._loadSkillsLocal(), ..._fileSkills], String(call.name || "")), null);
+        // MCP 默认**展开**：这张卡存在的理由就是"让人看见外部服务正在被调用、动了什么"。
+        // 折叠起来等于把它藏回原样——用户要点开才知道发生了什么，那就还是不知道。
+        // 结果段的原文块自己有高度上限并可滚动，展开不会把对话冲垮。
+        if (call.type === "mcp") step.classList.add("is-open");
       } catch { /* 身份画不出来不该让整张卡建不起来 */ }
     }
   }

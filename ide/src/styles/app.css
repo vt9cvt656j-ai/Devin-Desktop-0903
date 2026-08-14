@@ -5937,6 +5937,14 @@ img.settings-dropdown__avatar--filled { object-fit: cover; }
 .agent-tool-step--game_asset .atc-type-icon { background: #e3f2fd; color: #1565c0; } .atc-type-icon { background: #ede7f6; color: #4527a0; }
 /* 技能：紫色，和 read 的蓝、write 的绿都不撞——它以前就是回落成 read 那张纸的。 */
 .agent-tool-step--skill .atc-type-icon { background: #ede7f6; color: #5e35b1; }
+/* MCP 用服务自己的真实头像（复用市场卡那套 .mcpfp-icon）。图标位是 27px，而 .mcpfp-icon
+   本身按 38px 写的，这里缩到位并去掉底色——头像自己就是底色，再叠一层会出现一圈边。 */
+.agent-tool-step--mcp .atc-type-icon--avatar { background: none; padding: 0; }
+.agent-tool-step--mcp .atc-type-icon--avatar .mcpfp-icon {
+  width: 27px; height: 27px; border-radius: 8px;
+}
+/* 没有头像时回落成首字母，字号要跟着缩，否则 27px 里那个字会顶出来。 */
+.agent-tool-step--mcp .atc-type-icon--avatar .mcpfp-icon__letter { font-size: 12px; }
 .agent-tool-step--ksearch .atc-type-icon { background: #e0f2f1; color: #00897b; }
 .agent-tool-step--mcp .atc-type-icon { background: #fce4ec; color: #c62828; }
 .agent-tool-step--computer .atc-type-icon,
