@@ -43,15 +43,18 @@ enterprise-standard 的 **Curated Palette Library** 里最接近的一套，并�
 配色词汇表是「Tailwind 族+档」+「语义 token」两层：叙述与业务代码里禁止裸 hex，
 蓝本给的 hex 要先贴到最近的 Tailwind 族+档（如 #17130d → stone-950）再用。
 
-## shadcn/ui 要**真的装**，不是"照着它的样子写"
+## 默认栈：React + Tailwind + shadcn/ui + 知识库配色，四样合起来用
 
-走默认分支（空工作区/没有可沿用的栈）时，组件库是装出来的，不是手写的：
+空工作区/没有可沿用的栈时走默认分支。组件库是**装出来的，不是照着样子写的**：
+`npx shadcn@latest init -b radix -p vega -y`（`-b`/`-p` 不能省，裸跑会弹交互菜单、
+在非交互环境里等于什么都没装），再 `npx shadcn@latest add <本页真正用到的> -y`。
+完整接线步骤在 scaffold 层。
 
-```bash
-npx shadcn@latest init          # 建立 components.json、CSS 变量、cn() 工具
-npx shadcn@latest add button card input dialog   # 只加页面真正用到的
-```
+**配色在这里合流**：init 会在 `src/index.css` 的 `:root` 生成
+`--background / --foreground / --primary / --card / --muted / --border`。
+把本轮从知识库命中的那套配色填进这些变量，业务组件只消费 `bg-background` /
+`text-foreground` / `bg-primary` 这类语义类——不写裸 hex、不另造色板。
 
-**禁止**自己写"shadcn 风格的" Button/Card/Input——手写控件缺 focus-visible、disabled、
+**禁止**自己写"shadcn 风格的" Button/Card/Input：手写控件缺 focus-visible、disabled、
 键盘可达性和 Radix 浮层行为，一眼就差一截，这正是"自己写的组件很丑"的来源。
 已有项目组合它自己的 primitive，同样不另造平行控件。

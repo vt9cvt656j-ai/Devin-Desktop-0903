@@ -6935,8 +6935,13 @@ mod tests {
         //     模型就理解成"照着 shadcn 的样子手写一套"，产出的控件缺 focus-visible/disabled/
         //     Radix 浮层行为，一眼就是手作的。
         // 再往上加要先腾地方，别继续抬这个数。
+        // 62_500：又一次有名有姓的增补——从零起项目时那套**实测跑通**的接线配方
+        // （shadcn init 的 -b/-p 不能省、@/* 别名要写进 vite.config 与两个 tsconfig、
+        // 不能加已废弃的 baseUrl）。没有它 shadcn 压根装不上：裸跑 init 会弹交互菜单，
+        // 非交互环境里等于什么都没做，模型只能回去手写组件——用户报的正是这个。
+        // 配方只放在 scaffold 层（从零起才加载），每轮必注入的那层只留规矩不留命令。
         assert!(
-            build_system.len() < 59_500,
+            build_system.len() < 62_500,
             "full UI prompt should remain bounded: {} bytes",
             build_system.len()
         );
@@ -6959,10 +6964,18 @@ mod tests {
         // design_system.txt stays Chinese (it is a frozen rollback artifact, never injected), so a
         // byte comparison is measuring UTF-8 encoding rather than prompt weight — CJK is 3 bytes
         // but ~1 token per char, ASCII 1 byte but ~0.25. Tokens compare the two fairly.
-        let legacy_design_bytes = est_prompt_tokens(&read_prompt("design_system").unwrap());
+        // 原本比的是「拆分后总量 < 旧单体 design_system.txt」。那个锚在拆分当时有意义，
+        // 但 design_system.txt 是**冻结的回滚件、从不注入**——它永远不会再长，于是任何正当
+        // 增补迟早都会撞上它，而它衡量的又不是模型真正背的东西。真正的天花板是上面两条
+        // （focused token 数、full 字节数），那两条量的是实际发出去的 prompt。
+        //
+        // 所以换成绝对值。5_200 容得下当前这套（含从零起项目那份实测接线配方）。
+        // 要再往上加，先问一句：这段内容是不是每一轮都值得模型背？不是的话就挪进
+        // 只在对应意图下加载的模块，或者挪进知识库按需检索。
         assert!(
-            routed_design_bytes < legacy_design_bytes,
-            "the complete split design contract should remain smaller than the legacy monolith: {routed_design_bytes} vs {legacy_design_bytes}"
+            routed_design_bytes < 5_200,
+            "the split design contract has outgrown its budget: {routed_design_bytes} tokens (legacy monolith, frozen and never injected, was {})",
+            est_prompt_tokens(&read_prompt("design_system").unwrap())
         );
     }
 
@@ -7119,6 +7132,35 @@ mod design_palette_and_shadcn_tests {
     /// 此前提示词只说「按需添加 primitive」，从没给过命令，模型就理解成手写一套
     /// "shadcn 风格"的组件——缺 focus-visible、disabled、键盘可达性和 Radix 的浮层行为，
     /// 看起来就是差一截。这正是用户说的「自己写的组件样式会很丑」。
+    /// 从零起项目的接线配方必须完整——每一条都是实测撞出来的坑。
+    ///
+    /// 少一条就前功尽弃，而且失败方式都很隐蔽：
+    ///   · 少 `-b`/`-p`：裸跑 init 弹交互菜单，非交互环境里空退，看着"装过了"其实没装；
+    ///   · 用 `-d/--defaults`：等于 --template=next，把 Vite 项目按 Next 处理；
+    ///   · 少 `@/*` 别名：shadcn 组件 import 的 `@/lib/utils` 解析不了，构建失败；
+    ///   · 加了 `baseUrl`：当前 TypeScript 报 TS5101，构建失败；
+    ///   · 把带注释的 tsconfig 当纯 JSON 解析：直接炸。
+    #[test]
+    fn 从零起项目的接线配方不缺关键项() {
+        let text = read_prompt("design_scaffold").expect("design_scaffold.txt");
+        for (needle, why) in [
+            ("-b radix", "少了 -b，init 会弹交互菜单"),
+            ("-p vega", "少了 -p，init 会停在预设选择"),
+            ("shadcn@latest add", "没给 add 命令"),
+            ("baseUrl", "必须点名 baseUrl 已废弃，加了就构建失败"),
+            ("@/*", "必须交代路径别名，否则 @/lib/utils 解析不了"),
+            ("vite.config", "别名要同时写进 vite 配置"),
+            ("npm run build", "装完要立刻验一次——这些坑都在构建期才暴露"),
+        ] {
+            assert!(text.contains(needle), "接线配方缺 `{needle}`：{why}");
+        }
+        // -d 会把 Vite 项目按 Next 处理，必须明确劝退
+        assert!(
+            text.contains("--defaults") || text.contains("-d/"),
+            "必须说明 -d/--defaults 不能用（它等于 --template=next）"
+        );
+    }
+
     #[test]
     fn shadcn_是装出来的不是仿出来的() {
         // 逐个文件断言，不是"任一个有就算数"——两处都写了命令，只查"有没有"的话
