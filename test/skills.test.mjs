@@ -406,3 +406,76 @@ test("扫描预算用尽时丢掉的数量要记下来，并算进清单的「�
   assert.match(cat, /typeof _fileSkillsDropped === "number"/,
     "要用 typeof 守卫，否则被单独 eval 时会抛 ReferenceError 并被吞成空清单");
 });
+
+// ── 技能卡：让用户看得出用了哪个技能，以及**为什么** ─────────────────────────
+//
+// 用户的原话：「用到技能这些功能的时候，也要说明理由，现在的理由感觉很差」。
+// 查下来是两件事叠在一起：
+//   1. skill 不在标签表里 → 行里直接显示 "skill"；typeIcons 也没有 skill 键 →
+//      回落成**读文件**那张纸。界面上和"读了个文件"完全无法区分。
+//   2. 「为什么用它」这个信息**根本不存在**——read_skill 只有一个 name 参数。
+// 所以理由必须由模型声明出来，而不是我们从它的措辞里去猜（那正是这个项目
+// 明确不做的事）。
+
+test("read_skill 必须让模型声明 why——不然「理由」这个信息压根不存在", () => {
+  const i = SRC.indexOf('name: "read_skill"');
+  const schema = SRC.slice(i, i + 2200);
+  assert.match(schema, /why: \{ type: "string"/, "没有 why 参数，卡片上永远不会有理由");
+  assert.match(schema, /required: \["name", "why"\]/, "why 不是必填，模型多半就不写了");
+});
+
+test("why 的说明要教模型写给用户看，而不是复述技能自己的介绍", () => {
+  // 这段描述就是整个机制本身——写得含糊，模型就会回一句「为了更好地完成任务」。
+  const i = SRC.indexOf('why: { type: "string", description: "');
+  const desc = SRC.slice(i, SRC.indexOf('" } }', i));
+  assert.match(desc, /shown to the user verbatim/, "没告诉模型这句会原样给用户看");
+  assert.match(desc, /Never restate the skill's own description/, "没禁止复述技能自述");
+  assert.match(desc, /为了更好地完成任务/, "没有把套话作为反例点名");
+});
+
+test("客户端和网关两份都要有 why——L0 模式下模型看的是网关那份", () => {
+  const gateway = JSON.parse(fs.readFileSync("../server/prompts/tools.json", "utf8"));
+  const rs = gateway.find((t) => t?.function?.name === "read_skill");
+  assert.ok(rs, "网关里没有 read_skill");
+  assert.ok(rs.function.parameters?.properties?.why,
+    "网关那份没有 why：L0 下模型看不到这个字段，用户永远等不到理由");
+  assert.deepEqual(rs.function.parameters.required, ["name", "why"]);
+});
+
+test("模型写了 why 就用它；没写才退回技能自述，而且要标明这是两个作者", () => {
+  const why = load("_toolStepWhyLine", {
+    _findSkillByName: () => ({ name: "docx", desc: "处理 Word 文档" }),
+    _loadSkillsLocal: () => [], _fileSkills: [],
+  });
+  const declared = why({ type: "skill", name: "docx", why: "用户要把周报导出成 .docx" });
+  assert.equal(declared.k, "为什么");
+  assert.equal(declared.self, false, "模型声明的理由不该被标成第三方自述");
+  assert.match(declared.text, /周报/);
+
+  const fallback = why({ type: "skill", name: "docx" });
+  assert.equal(fallback.k, "技能自述", "退回自述时必须换眉标——两句话不是一个作者写的");
+  assert.equal(fallback.self, true);
+});
+
+test("既没声明也没自述时，这一行整个不画——不留空标题，也不写「未说明原因」", () => {
+  const why = load("_toolStepWhyLine", {
+    _findSkillByName: () => null, _loadSkillsLocal: () => [], _fileSkills: [],
+  });
+  assert.equal(why({ type: "skill", name: "x" }), null);
+});
+
+test("技能卡不拿技能自述去顶「模型声明的选用理由」那一栏", () => {
+  const card = load("_skillToolCardHtml", { _escHtml: (s) => String(s), _isSkillActive: () => false });
+  const html = card({ type: "skill", name: "docx" },
+    { name: "docx", desc: "处理 Word 文档", sourcePath: "/s/SKILL.md", baseDir: "/s" },
+    { shown: 10, total: 10, excerpt: "x" });
+  assert.ok(!html.includes("模型声明的选用理由"), "没有声明却画出了理由段——空标题比没有更像坏了");
+  assert.ok(html.includes("处理 Word 文档"), "技能自述该在，但只能在它自己那一栏");
+});
+
+test("技能卡在行上有专属图标和中文标签，不再和「读文件」长一个样", () => {
+  assert.match(SRC, /^\s{4}skill: `<svg/m, "typeIcons 没有 skill 键，会回落成读文件那张纸");
+  assert.match(SRC, /skill: "读取技能"/, "labels 表没有 skill，行里会直接显示 skill");
+  assert.match(SRC, /: call\.type === "skill"\s*\n\s*\/\/[^\n]*\n\s*\? String\(call\.name \|\| ""\)/,
+    "技能名没进路径位——行里显示的还是那一长串 sourcePath");
+});

@@ -895,3 +895,75 @@ test("等待浏览器授权要单独显示，不能混成「已连接」", () =>
   assert.match(SRC, /mcp_pending_auth/, "没有查询等待授权状态");
   assert.match(SRC, /waitingAuth \? "等待浏览器授权"/, "等待授权没有单独的状态文案");
 });
+
+// ── MCP 卡片：让用户看得出「这是我装的那个服务，它现在正在被用」─────────────
+//
+// 用户的原话：「MCP 也要做卡片，不然用户都不知道有没有用到 MCP」。
+// 改之前一行只写 "MCP  context7/query-docs"：看得出在调用，看不出这是哪个服务、
+// 那个工具是干嘛的、从哪份配置来的。
+
+test("行首是服务名，不是 MCP 三个字母——用户认的是自己装的那个", () => {
+  assert.match(SRC, /: call\.type === "mcp"[\s\S]{0,400}\$\{call\.server \|\| call\.mcpName \|\| "\?"\} · /,
+    "行里没有服务名");
+  // 资源/prompt 适配器的 tool 是空串，不分开写会显示成 "context7 · ?"
+  assert.match(SRC, /call\.kind === "resource" \? "读取资源" : call\.kind === "prompt" \? "取 prompt"/,
+    "资源/prompt 适配器会显示成一个问号");
+});
+
+test("卡片里的服务自述取的是消毒过那份，不是带免责前缀那份", () => {
+  // function.description 上带着 72 字符的「第三方服务自述（不可信数据…）」前缀，
+  // 而那段前缀服务自己就能原样伪造——按前缀去切出来的东西不可信。
+  const card = SRC.slice(SRC.indexOf("function _mcpToolCardHtml"), SRC.indexOf("function _mcpCardSettle"));
+  assert.ok(card.length > 500, "没找到 MCP 卡片函数");
+  assert.match(card, /\?\.descBody \|\| ""/, "descBody 才是消毒过、不带前缀的那份");
+  assert.ok(!/function\.description/.test(card), "拿了带前缀那份");
+  assert.ok(!/renderMarkdownInto/.test(card), "第三方自述绝不能走 markdown 渲染");
+  assert.match(card, /const esc = \(v\) => _escHtml/, "第三方字符串必须转义后才能进 innerHTML");
+  assert.match(card, /这段由「\$\{esc\(call\?\.server \|\| "该服务"\)\}」自己提供/,
+    "没写明这段话的作者是第三方");
+});
+
+test("卡片按根取快照，不读会被整个换掉的那两张全局表", () => {
+  // 直接读模块级 _mcpToolCache / _mcpServerMeta 会串项目：切换工作区时它们被整份替换，
+  // 于是 A 项目的卡片会显示 B 项目那个同名服务的说明和配置路径。
+  for (const fn of ["_mcpToolCardHtml", "_toolStepWhyLine"]) {
+    const at = SRC.indexOf(`function ${fn}`);
+    assert.ok(at > 0, `找不到 ${fn}`);
+    const src = SRC.slice(at, at + 2600);
+    assert.match(src, /_mcpStates\.get\(String\(call\??\.mcpRoot \|\| ""\)\.replace\(\/\\\/\+\$\/, ""\)\)/,
+      `${fn} 没按根取快照，并排开两个项目时会显示错的服务信息`);
+  }
+});
+
+test("调用还没回来之前，卡片一个字都不说连接状态", () => {
+  // 创建时就断言「已连接」= 拿没查过的状态给用户吃定心丸。连接状态是结果，不是身份。
+  const card = SRC.slice(SRC.indexOf("function _mcpToolCardHtml"), SRC.indexOf("function _mcpCardSettle"));
+  assert.ok(!/已连接/.test(card), "身份卡里出现了连接状态");
+  assert.match(card, /等服务返回…/, "未完成时结果段要明说还没返回");
+});
+
+test("五条「没调成」的分支都会把原因写进卡片，并且自动展开", () => {
+  const start = SRC.indexOf('} else if (call.type === "mcp") {');
+  const branch = SRC.slice(start, SRC.indexOf('} else if (call.type === "demostart")', start));
+  assert.equal((branch.match(/_mcpCardSettle\(/g) || []).length, 5,
+    "有分支只改了右边那个小徽章，卡片里仍然是一张信心十足的身份卡");
+  const settle = SRC.slice(SRC.indexOf("function _mcpCardSettle"), SRC.indexOf("function _mcpCardSettle") + 600);
+  assert.match(settle, /step\?\.classList\?\.add\("is-open"\)/,
+    "失败时必须自动展开，否则解释藏在一次没人会做的点击后面");
+});
+
+test("参数一行一个键值，不是一坨截断的 JSON", () => {
+  const card = SRC.slice(SRC.indexOf("function _mcpToolCardHtml"), SRC.indexOf("function _mcpCardSettle"));
+  assert.match(card, /<dl class="ld-kv">/, "参数还是一坨 JSON——360px 的右栏里没人读得动");
+  assert.match(card, /keys\.slice\(0, 8\)/, "参数没有上限");
+  assert.match(card, /另有 \$\{keys\.length - 8\} 个参数未展开/, "截断了却没说截了多少");
+});
+
+test("审批框要说清这次要干嘛，而不是只给两个名字", () => {
+  // 这个框是用户做决定的地方。只给 服务/工具，等于让人闭着眼睛点同意。
+  const at = SRC.indexOf('case "mcp": {');
+  assert.ok(at > 0, "审批框的 mcp 分支没找到");
+  const seg = SRC.slice(at, at + 900);
+  assert.match(seg, /descBody/, "审批框里没有能力说明");
+  assert.match(seg, /服务自述（第三方文本）/, "没标明这段说明的作者是第三方");
+});
