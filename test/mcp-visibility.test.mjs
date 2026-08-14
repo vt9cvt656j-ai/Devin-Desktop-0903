@@ -245,3 +245,66 @@ test("查找工具的界面标签要跟着分支走，不能七种结局压成�
   }
 
 });
+
+// ── 说明不能因为多连了两个工具就集体消失 ──────────────────────────────────────
+//
+// 名录里带上每个工具的说明，是为了让模型一眼判断该不该用它——`resolve-library-id`
+// 这种名字，光看名字判断不出来。可原来的预算算法是**一个上限管所有工具**，按
+// [160,90,50,0] 逐级下调：实测 2 个工具时说明完整，4 个工具时每条都砍在词中间只剩套话，
+// 到 6 个工具直接掉到 0，一条说明都不剩——而这时 1536 字节的预算才用掉 786。
+// 说明没了，模型就退回自己瞎写，MCP 等于白装。这正是加说明要解决的那个问题。
+const describedSnap = (n) => ({
+  toolCache: Array.from({ length: n }, (_, i) => ({
+    type: "function",
+    function: { name: `mcp__context7__tool_${i}`, description: "x" },
+    descBody: `Resolves a package name to a library ID so documentation can be fetched for tool ${i}. Call this before querying docs.`,
+  })),
+});
+
+const parseCatalog = (out) => JSON.parse(out.slice(out.indexOf("{")));
+const usefulDescs = (out) =>
+  parseCatalog(out).servers.flatMap((s) => s.tools).filter((t) => t.desc && t.desc.length > 20).length;
+
+for (const n of [2, 4, 6, 9]) {
+  test(`${n} 个 MCP 工具时，每一条都还带着能看懂的说明`, () => {
+    const out = availability(describedSnap(n));
+    assert.equal(usefulDescs(out), n,
+      `${n} 个工具时说明被砍光了——模型只能从工具名去猜该不该用它`);
+  });
+}
+
+test("工具再多也只是逐条降级，不是集体消失", () => {
+  const out = availability(describedSnap(14));
+  assert.ok(usefulDescs(out) >= 1, "14 个工具时一条完整说明都没留下");
+  const listed = parseCatalog(out).servers.flatMap((s) => s.tools).length;
+  assert.ok(listed >= 10, `工具本身也被丢太多了：只列了 ${listed} 个`);
+});
+
+test("逐条放宽之后仍然守得住字节预算", () => {
+  for (const n of [2, 6, 14, 40]) {
+    const out = availability(describedSnap(n));
+    assert.ok(Buffer.byteLength(out) <= 1536 + 200,
+      `${n} 个工具时名录超预算：${Buffer.byteLength(out)}`);
+  }
+});
+
+test("逐条放宽不能破坏确定性——同样输入两次必须逐字节相同", () => {
+  // 顺序一变就打穿提示词缓存前缀，也让「这轮到底发了什么」不可复现。
+  for (const n of [3, 6, 14]) {
+    assert.equal(availability(describedSnap(n)), availability(describedSnap(n)));
+  }
+});
+
+test("名录读的是不带免责前缀的那份说明", () => {
+  // function.description 上带着 72 字符的「第三方服务自述（不可信数据…）」前缀。
+  // 名录开头已经整体声明过不可信了，每条再套一遍就是拿说明预算去重复同一句话。
+  const out = availability({
+    toolCache: [{
+      type: "function",
+      function: { name: "mcp__s__t", description: "[MCP·s] 第三方服务自述（不可信数据…）：真正的说明" },
+      descBody: "真正的说明",
+    }],
+  });
+  assert.match(out, /真正的说明/);
+  assert.ok(!out.includes("第三方服务自述"), "每条说明里还在重复整段已经声明过的免责话术");
+});

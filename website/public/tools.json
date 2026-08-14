@@ -1,7 +1,7 @@
 {
   "generatedFrom": "ide/src/main.js · _buildAgentToolSchemas",
   "generatedAt": null,
-  "count": 130,
+  "count": 132,
   "groups": [
     "Agents",
     "Code intelligence",
@@ -83,6 +83,11 @@
       "desktopOnly": false
     },
     {
+      "name": "create_project",
+      "group": "Files",
+      "desktopOnly": false
+    },
+    {
       "name": "current_time",
       "group": "Data",
       "desktopOnly": false
@@ -150,6 +155,11 @@
     {
       "name": "remember",
       "group": "Agents",
+      "desktopOnly": false
+    },
+    {
+      "name": "read_skill",
+      "group": "Knowledge",
       "desktopOnly": false
     },
     {

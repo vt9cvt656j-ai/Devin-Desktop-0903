@@ -59,6 +59,104 @@ fn probe_login_shell_path(budget_ms: u64) -> Option<String> {
     parse_probe_output(&raw)
 }
 
+// ─────────────────── 登录 shell 的**整份**环境（不只是 PATH） ───────────────────
+//
+// 从 Claude Code / Cursor 导进来的 MCP 配置里，密钥基本都写成引用而不是明文：
+//     "env": {"GITHUB_PERSONAL_ACCESS_TOKEN": "${GITHUB_TOKEN}"}
+// 展开这些 `${VAR}` 不能拿本进程的环境去查：从 Finder / Dock 启动的 macOS 应用**一个 shell
+// 导出都继承不到**，`std::env::var("GITHUB_TOKEN")` 对着的正好是这批人——把导出写在
+// `.zshrc`/`.zprofile` 里、因此才需要这个功能的人——永远是空。展开成空串比展开失败更糟：
+// 服务照样起来，只是带着一个空 token，报出来的是「401」这种完全看不出原因的错。
+
+/// 从探测输出里抠出 `env -0` 的结果。
+///
+/// 两处细节都是被真实数据逼出来的：
+///   - **按 NUL 切，不按行切。** 环境变量的值里可以有换行（多行的 SSH key、粘进来的证书），
+///     按行切会把它们切成一堆不成对的碎片。NUL 是值里唯一不可能出现的字节。
+///   - **marker 包裹。** `-lic` 会 source 用户的 rc 文件，里面的 `echo` / MOTD / 版本管理器
+///     的提示会先打到同一个 stdout 上，不剥掉就会和第一条 `KEY=VALUE` 粘在一起。
+///
+/// 解析不出任何变量返回 `None`：真实环境一定有 PATH / HOME，一个都没有意味着这次探测没成功
+/// （`env -0` 不被支持、rc 文件把 stdout 吞了），而不是「用户的环境是空的」。
+#[cfg(not(windows))]
+fn parse_env0_output(raw: &[u8]) -> Option<std::collections::HashMap<String, String>> {
+    const MARKER: &[u8] = b"__WE__";
+    let start = raw.windows(MARKER.len()).position(|w| w == MARKER)?;
+    let end = raw.windows(MARKER.len()).rposition(|w| w == MARKER)?;
+    if end <= start {
+        return None;
+    }
+    let mut map = std::collections::HashMap::new();
+    for entry in raw[start + MARKER.len()..end].split(|byte| *byte == 0) {
+        let Ok(text) = std::str::from_utf8(entry) else {
+            continue;
+        };
+        let Some((key, value)) = text.split_once('=') else {
+            continue; // 没有 '=' 的不是环境变量（rc 文件漏出来的噪声）
+        };
+        if !key.is_empty() {
+            map.insert(key.to_string(), value.to_string());
+        }
+    }
+    if map.is_empty() {
+        None
+    } else {
+        Some(map)
+    }
+}
+
+/// 真跑一次 `$SHELL -lic 'env -0'` 把用户登录 shell 的整份环境问出来。
+///
+/// 纪律和上面那个 PATH 探测完全一致：跑在独立线程里并设预算（一个病态的 rc 文件永远卡不死
+/// app），**失败返回 `None`，绝不返回空表**——空表会被上层当成「用户就是没有这些变量」，
+/// 于是 `${GITHUB_TOKEN}` 被展开成空串写进配置，比直接失败难查得多。
+///
+/// 这里**不做缓存**，所以 PATH 那条「绝不缓存失败」的规矩在这儿是天然成立的。不缓存是故意的：
+/// 这张表装的是用户的真密钥，多留一份就多一份泄漏面，而它只在展开配置时才被调一次。
+#[cfg(not(windows))]
+fn probe_login_shell_env(budget_ms: u64) -> Option<std::collections::HashMap<String, String>> {
+    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".into());
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let out = std::process::Command::new(&shell)
+            // `command` 绕开被别名/函数改写过的 printf 和 env。
+            .args(["-lic", "command printf '__WE__'; command env -0; command printf '__WE__'"])
+            .output();
+        let _ = tx.send(out.map(|o| o.stdout).ok());
+    });
+    let raw = rx
+        .recv_timeout(std::time::Duration::from_millis(budget_ms))
+        .ok()
+        .flatten()?;
+    parse_env0_output(&raw)
+}
+
+/// 用户登录 shell 里的环境变量表。给前端展开 MCP 配置里的 `${VAR}` 用。
+///
+/// **这张表里装的是用户的真密钥**（GITHUB_TOKEN、各家 API Key）。所以：不打日志、不进任何
+/// 错误串——错误串会一路回到前端并可能落进对话记录里，那等于把密钥写进一个纯文本文件。
+/// 探测失败就退回本进程的环境：那是**今天**的行为，不会更糟，而且从终端启动 IDE 时它本来
+/// 就是对的；探测成功时用户 shell 里的那份是严格更全的。
+#[cfg(not(windows))]
+pub fn login_shell_env() -> std::collections::HashMap<String, String> {
+    // 预算给 4 秒：这条路不在关键路径上（用户点「连接」时才走一次），而 rc 文件里挂着
+    // nvm/conda 初始化的机器实测能跑到 1 秒以上，给短了会白白退回空环境。
+    probe_login_shell_env(4000).unwrap_or_else(|| std::env::vars().collect())
+}
+
+/// Windows 上 GUI 进程继承的就是用户注册表里那份环境，没有「只有登录 shell 才看得到」的
+/// 变量，直接给本进程的环境即可。
+#[cfg(windows)]
+pub fn login_shell_env() -> std::collections::HashMap<String, String> {
+    std::env::vars().collect()
+}
+
+/// 探一次登录 shell 的环境，交给前端去展开 MCP 配置里的 `${VAR}`。
+#[tauri::command(async)]
+pub fn shell_env_probe() -> std::collections::HashMap<String, String> {
+    login_shell_env()
+}
+
 /// 重新探测用户的登录 shell PATH。`force` 跳过间隔下限。
 ///
 /// 返回值表示"这次真的探测了"。探测失败时**保留上一次的好值**——宁可用旧的，也不要退回
@@ -551,6 +649,63 @@ mod locale_tests {
     #[test]
     fn the_fallback_locale_is_utf8_on_every_platform() {
         assert!(default_utf8_locale().to_lowercase().contains("utf-8"));
+    }
+}
+
+#[cfg(all(test, not(windows)))]
+mod shell_env_probe_tests {
+    use super::*;
+
+    fn probe_output(body: &[u8]) -> Vec<u8> {
+        let mut raw = b"nvm: v20.11.0\n__WE__".to_vec(); // rc 文件先打了一行字
+        raw.extend_from_slice(body);
+        raw.extend_from_slice(b"__WE__");
+        raw
+    }
+
+    #[test]
+    fn a_multiline_secret_survives_the_probe_intact() {
+        // 私钥、证书这种带换行的值是这个函数存在的理由：按行切会把它们切碎，
+        // 展开进 MCP 配置的就是半截 key，服务起来之后报的是「认证失败」。
+        let key = "-----BEGIN KEY-----\nline1\nline2\n-----END KEY-----";
+        let body = format!("PATH=/usr/bin\0SSH_KEY={key}\0GITHUB_TOKEN=ghp_x\0");
+        let map = parse_env0_output(&probe_output(body.as_bytes())).unwrap();
+        assert_eq!(map.get("SSH_KEY").map(String::as_str), Some(key));
+        assert_eq!(map.get("GITHUB_TOKEN").map(String::as_str), Some("ghp_x"));
+        assert_eq!(map.len(), 3);
+    }
+
+    #[test]
+    fn rc_file_chatter_outside_the_markers_is_not_mistaken_for_a_variable() {
+        // `-lic` 会 source 用户的 rc 文件，MOTD / 版本管理器的提示先落在同一个 stdout 上。
+        let map = parse_env0_output(&probe_output(b"HOME=/Users/x\0")).unwrap();
+        assert_eq!(map.len(), 1, "{map:?}");
+        assert_eq!(map.get("HOME").map(String::as_str), Some("/Users/x"));
+        // 值里带 '=' 的（连接串、base64）只在第一个 '=' 处切。
+        let map = parse_env0_output(&probe_output(b"DSN=postgres://a:b@h/db?x=1\0")).unwrap();
+        assert_eq!(map["DSN"], "postgres://a:b@h/db?x=1");
+    }
+
+    #[test]
+    fn a_failed_probe_is_none_not_an_empty_environment() {
+        // 空表会被上层当成「用户就是没有这些变量」，于是 ${GITHUB_TOKEN} 被展开成空串写进
+        // 配置——服务照样起来，只是带着一个空 token，报的是看不出原因的 401。
+        assert!(parse_env0_output(b"").is_none());
+        assert!(parse_env0_output(b"zsh: command not found: env\n").is_none());
+        assert!(parse_env0_output(&probe_output(b"")).is_none());
+        assert!(parse_env0_output(b"__WE__").is_none(), "只有一个 marker 不算一次完整输出");
+    }
+
+    /// 真跑一次登录 shell。会 spawn 子进程、source 用户的 rc 文件（秒级），所以默认不跑：
+    ///     cargo test --lib process_util -- --ignored --nocapture
+    #[test]
+    #[ignore = "spawns the user's real login shell"]
+    fn the_real_login_shell_yields_a_usable_environment() {
+        let map = probe_login_shell_env(8000).expect("登录 shell 应当能问出环境");
+        assert!(map.contains_key("PATH"), "拿不到 PATH 说明解析或 marker 出了问题");
+        assert!(map.contains_key("HOME"));
+        // 密钥不打印：这里只报数量。
+        println!("probed {} variables", map.len());
     }
 }
 

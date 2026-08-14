@@ -170,3 +170,33 @@ test("main.js no longer hand-maintains the tool family lists", () => {
   assert.match(MAIN, /import \{[^}]*\} from "\.\/agent\/tool-policy\.js"/,
     "main.js must consume the registry");
 });
+
+// ── 只读模式里的 MCP：按服务自己的声明逐次判，不整类一刀切 ────────────────────
+//
+// 以前 mcp 类型是 readOnlyModeBlocked: true，于是 Plan / Explorer / Reviewer 里
+// 用户装的 MCP 服务一个都用不了。可"查官方文档、读表结构、看 issue"恰恰是
+// 先调研再动手最需要的东西——调研这一半反而没工具。
+// 但也不能反过来全放：MCP 规范里 readOnlyHint 是**可选**的，多数服务不写；
+// 缺声明时必须按"可能有副作用"处理，否则只读模式会替用户改了东西。
+test("声明了只读的 MCP 工具，在只读模式里可以用", () => {
+  assert.equal(blockedInReadOnlyMode("mcp", { type: "mcp", mcpReadOnly: true }), false);
+});
+
+test("没声明只读的 MCP 工具照旧挡住——缺声明按有副作用处理", () => {
+  assert.equal(blockedInReadOnlyMode("mcp", { type: "mcp", mcpReadOnly: false }), true);
+  assert.equal(blockedInReadOnlyMode("mcp", { type: "mcp" }), true, "没有这个字段时必须挡");
+  assert.equal(blockedInReadOnlyMode("mcp", undefined), true, "连 call 都没有时必须挡");
+});
+
+test("其它类型不受影响：写文件和跑命令在只读模式里照旧禁止", () => {
+  for (const t of ["write", "edit", "multiedit", "cmd"]) {
+    assert.equal(blockedInReadOnlyMode(t), true, `${t} 不该在只读模式里放行`);
+  }
+  assert.equal(blockedInReadOnlyMode("read"), false);
+});
+
+test("MCP 在只读模式里放行，不等于不用审批", () => {
+  // 两道门是独立的：readOnlyModeBlocked 管"这个模式能不能做这件事"，
+  // needsApproval 管"要不要问用户"。放行第一道不该顺手关掉第二道。
+  assert.ok(needsApproval("mcp"), "mcp 不再需要审批了");
+});

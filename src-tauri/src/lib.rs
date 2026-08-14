@@ -229,6 +229,18 @@ pub fn run() {
 
             Ok(())
         })
+        // 窗口关掉 = 它拉起来的 MCP 服务该收了。
+        //
+        // 在这之前整个 App 一个窗口事件监听都没注册：关掉一个副窗口，它那些 MCP 子进程
+        // （node / uvx / mcp-remote）会一直活到退出 App，用户开开关关几次项目窗口，机器上就
+        // 堆着一串没人用的进程。`cleanup_stale` 补不了这个洞——它是按进程收尸的，多窗口时会
+        // 把别的窗口正在用的一起杀掉，所以那边多窗口直接跳过（见上面的说明）。MCP 会话现在
+        // 按 (窗口, 根目录, 服务名) 分区，只有这里能做到「只收这一个窗口的」。
+        .on_window_event(|window, event| {
+            if let tauri::WindowEvent::Destroyed = event {
+                mcp::stop_window(window.label());
+            }
+        })
         .manage(terminal::TerminalState::default())
         .manage(lsp::LspManager::default())
         .manage(debug::DebugManager::default())
@@ -324,6 +336,11 @@ pub fn run() {
             mcp::mcp_get_prompt,
             mcp::mcp_status,
             mcp::mcp_disconnect,
+            mcp::mcp_cancel,
+            mcp::mcp_take_changes,
+            mcp::mcp_rediscover,
+            mcp::mcp_server_log,
+            mcp::mcp_pending_auth,
             mcp::mcp_user_configs,
             mcp::mcp_save_user_config,
             mcp::user_rules_read,
@@ -369,6 +386,7 @@ pub fn run() {
             terminal::term_history,
             shell_env::env_refresh,
             shell_env::shell_plan,
+            process_util::shell_env_probe,
             lsp::lsp_start,
             lsp::lsp_send,
             lsp::lsp_stop,
