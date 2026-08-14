@@ -748,6 +748,27 @@ fn search_inner(
     //
     // 处理方式是"够用就不动"：只有当确实存在足够多的实心命中时，才把小节壳滤掉；
     // 否则宁可返回壳，也不返回空。
+    // 问配色时，配色库必须够得着。
+    //
+    // michael-design 只发 3 条，而提示词明确教模型去查 `<品类> palette`——实测
+    // `law firm palette` 里配色库排第 4、`律所 palette` 排第 7、`portfolio palette` 也进不去，
+    // 恰恰是最需要"取最接近的一套"的那些品类查不到。提示词许下的承诺检索兑现不了，
+    // 模型只能回去自己编色。所以问配色时把它提到第一位；不问配色时一切照旧。
+    if design_mode {
+        let q = query.to_lowercase();
+        let asks_palette = ["palette", "colour", "color", "配色", "色板", "颜色"]
+            .iter()
+            .any(|k| q.contains(k));
+        if asks_palette {
+            if let Some(at) = scored
+                .iter()
+                .position(|(i, _)| idx.chunks[*i].section.to_lowercase().contains("curated palette library"))
+            {
+                let hit = scored.remove(at);
+                scored.insert(0, hit);
+            }
+        }
+    }
     // 只在**名额稀缺**的那条路上滤：工具路径只发 3 条，一条壳就是三分之一没了。
     // 系统提示词的注入路径取 12 条、另有总量预算，滤掉小节只会让每条都换成大块，
     // 白白把提示词顶大——那里一条壳的代价很小。
@@ -819,6 +840,43 @@ mod knowledge_design_tests {
     /// 这批内容原本躺在 prompts/css_concrete_tokens.txt 里，既不在 PROMPT_NAMES 也不在
     /// prompt_graph 里——写好了却从不注入，等于不存在。搬进语料后由 knowledge_search 承载：
     /// 不占提示词预算，按需取。
+    /// 提示词教模型去查 `<品类> palette`，检索就必须兑现。
+    ///
+    /// michael-design 只发 3 条。实测过：`law firm palette` 里配色库排第 4、
+    /// `律所 palette` 排第 7、`portfolio palette` 也进不去——恰恰是知识库里没有同品类
+    /// 站点蓝本、最需要"取最接近的一套"的那些品类。提示词许诺了、检索给不出，
+    /// 模型就只能回去自己编色，而"自己编色"正是配色难看的根源。
+    #[test]
+    fn 问配色时配色库一定够得着() {
+        for q in [
+            "law firm palette",
+            "律所 palette",
+            "portfolio palette",
+            "cafe palette",
+            "咖啡店 配色",
+            "bookstore color palette",
+        ] {
+            let hits = super::search(q, Some("michael-design"), 6);
+            assert!(
+                hits.iter().any(|h| h.section.to_lowercase().contains("curated palette library")),
+                "「{q}」查不到配色库，只发 3 条时它被挤掉了：{:?}",
+                hits.iter().map(|h| h.section.as_str()).collect::<Vec<_>>()
+            );
+        }
+    }
+
+    /// 不问配色时不该占用那 3 个名额。
+    #[test]
+    fn 不问配色时配色库不占名额() {
+        for q in ["coffee shop hero section", "scroll animation motion"] {
+            let hits = super::search(q, Some("michael-design"), 6);
+            assert!(
+                !hits.iter().any(|h| h.section.to_lowercase().contains("curated palette library")),
+                "「{q}」没问配色，配色库不该占名额"
+            );
+        }
+    }
+
     #[test]
     fn concrete_css_craft_is_in_the_corpus_and_retrievable() {
         let hits = super::search("card surface craft inner highlight shadow", Some("michael-design"), 6);
