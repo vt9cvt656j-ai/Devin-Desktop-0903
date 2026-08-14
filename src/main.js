@@ -31705,8 +31705,8 @@ function _planStepActionKind(step) {
   const text = String(step?.content || step?.title || step?.description || step || "").toLowerCase();
   if (!text) return "";
   if (/(?:test|check|verify|validat|assert|build|compile|type.?check|lint|smoke|regression|screenshot|browser|viewport|health|exit\s*code|console|network|测试|检查|验证|校验|确认|复测|回归|构建|编译|截图|浏览器|视口|退出码|控制台|网络|验收)/i.test(text)) return "verify";
-  if (/(?:implement|edit|change|fix|add|create|refactor|write|update|integrat|migrat|wire|remove|replace|patch|scaffold|setup|install|初始化|搭建|脚手架|实现|修改|修复|新增|创建|生成|编辑|重构|编写|接入|迁移|改造|替换|删除|落地|补齐|安装|写入|更新)/i.test(text)) return "implement";
-  if (/(?:execute|run|start|serve|preview|launch|wait|monitor|terminal|watch|daemon|background|执行|运行|启动|预览|等待|监听|监控|终端|持续任务|后台|守护进程)/i.test(text)) return "execute";
+  if (/(?:implement|edit|change|fix|add|create|refactor|write|update|integrat|migrat|wire|remove|replace|patch|scaffold|setup|install|config|初始化|搭建|脚手架|实现|修改|修复|新增|创建|生成|编辑|重构|编写|接入|迁移|改造|替换|删除|落地|补齐|安装|写入|更新|配置|设置|定义|设计|完善|调整|优化|加上|做一个|做个)/i.test(text)) return "implement";
+  if (/(?:execute|run|start|serve|preview|launch|wait|monitor|terminal|watch|daemon|background|deploy|执行|运行|启动|跑起来|跑通|跑一下|预览|等待|监听|监控|终端|持续任务|后台|守护进程|部署|上线)/i.test(text)) return "execute";
   if (/(?:investigat|inspect|analy[sz]|reproduc|locat|trace|read|review|understand|diagnos|audit|map|inventory|log|error|stack|调用链|数据流|调查|检查|分析|复现|定位|追踪|读取|阅读|审查|梳理|摸清|确认|盘点|取证|诊断|日志|报错|根因)/i.test(text)) return "investigate";
   return "";
 }
@@ -31745,7 +31745,17 @@ function _planEvidenceKindsForTool(call, result) {
 
 function _planStepMatchesEvidence(step, evidenceKinds) {
   const kind = _planStepActionKind(step);
-  if (!kind) return !!(Array.isArray(evidenceKinds) && evidenceKinds.length);
+  // 分不出这一步要做什么，就**不要**自动打勾。
+  //
+  // 这里原本是「分不出类 → 任何证据都算完成」，方向正好反了：措辞没被上面那张动词表
+  // 认出来的步骤，会被紧接着的任意一次工具调用勾掉，一次 read_file 就够。实测用户
+  // 自己那份面包店计划，7 步里有 3 步分不出类（"配置 Tailwind…设计 tokens"、
+  // "面包店门店信息与地图"、"把首页跑起来给用户看"——"跑"不在动词表里），
+  // 于是模型只是读了个文件，这三步就显示成做完了。这就是"假完成"。
+  //
+  // 不认识就交回给模型自己的 update_plan：一个停在进行中的步骤只是看着慢，
+  // 一个假勾却会让用户以为事情已经做了。
+  if (!kind) return false;
   const kinds = new Set(evidenceKinds || []);
   if (kind === "investigate") return kinds.has("investigate");
   if (kind === "implement") return kinds.has("implement");
