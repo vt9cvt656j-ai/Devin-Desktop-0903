@@ -113,3 +113,63 @@ test("琐碎轮把思考降到最浅档，但显式选过档位的用户不受�
   assert.match(SRC, /if \(_agentLightTurn\) \{[\s\S]{0,400}lightTurn: true/,
     "_agentLightTurn 判定之后要重新套一次思考配置");
 });
+
+// ── 空工作区不能推「深挖整个项目」 ───────────────────────────────────────────
+//
+// 用户截图：工作区 小说 是个空文件夹，助手上一条刚说完「当前目录完全为空，没有任何
+// 文件」，而输入框的灰字还在推「用 research_project 深挖整个项目，给我一份上手地图：
+// 技术栈、目录结构、核心模块职责……」。预测和事实当场打架。
+//
+// 成因：那一档只判「有没有根目录」，从不看根目录里有没有东西。
+// 空目录该问的是"做点什么"，不是"读懂什么"——这是两种完全不同的建议。
+function chipsWith(entryCount) {
+  const zh = (() => {
+    const I = fs.readFileSync("src/i18n.js", "utf8");
+    const at = I.indexOf("const ZH_CN");
+    return Function("return {" + I.slice(I.indexOf("{", at) + 1, I.indexOf("\n};", at)) + "}")();
+  })();
+  const deps = {
+    activePath: "", _pathToRel: (x) => x, t: (k) => zh[k] ?? k,
+    monacoEditor: { getSelection: () => null, getModel: () => null },
+    monaco: { editor: { getModelMarkers: () => [] } },
+    openFiles: new Map(), _isGeneratedDependencyDiagnostic: () => false, _lastGitFiles: [],
+    rootPath: "/w", workspaceRoots: ["/w"],
+    _workspaceRootEntryCounts: new Map([["/w", entryCount]]), _treePath: (x) => x,
+  };
+  const keys = Object.keys(deps);
+  return new Function(...keys, grab("_dynamicChatChips") + "\n;return _dynamicChatChips;")(...keys.map((k) => deps[k]))();
+}
+
+test("空文件夹推的是「做点什么」，不是「深挖整个项目」", () => {
+  const labels = chipsWith(0).map((c) => c.label).join(" | ");
+  assert.ok(!/深挖/.test(labels), `空目录仍在推深挖：${labels}`);
+  assert.match(labels, /开始做点什么|项目骨架/, `空目录该给可动手的建议：${labels}`);
+});
+
+test("有文件的项目照旧推「深挖整个项目」——别把好用的那档改坏了", () => {
+  assert.match(chipsWith(37).map((c) => c.label).join(" | "), /深挖/);
+});
+
+test("还没扫完（undefined）不能当成空——刚打开大项目的头一秒不该推「新建」", () => {
+  // 这个计数是异步扫出来的。把 undefined 当成 0，用户打开一个几千文件的仓库，
+  // 第一眼看到的会是"这个文件夹是空的"。
+  assert.match(chipsWith(undefined).map((c) => c.label).join(" | "), /深挖/);
+});
+
+test("扫完目录要通知预测重算，否则灰字停在扫描前那一版", () => {
+  // 「预测不会实时变」的另一半：事实是异步到的，到了没人通知，预测就一直是旧的。
+  const at = SRC.indexOf("_workspaceRootEntryCounts.set(_treePath(path), entries.length)");
+  assert.ok(at > 0, "找不到计数写入点");
+  assert.match(SRC.slice(at, at + 700), /_refreshChatHintIfEmpty\(\)/,
+    "算出目录有多少东西之后没有触发预测重算");
+});
+
+test("四个新词条三本词典都要有，少一本那个语言就露出原始键名", () => {
+  const I = fs.readFileSync("src/i18n.js", "utf8");
+  for (const k of ["assistant.chip.startProject", "assistant.prompt.startProject",
+                   "assistant.chip.scaffoldHere", "assistant.prompt.scaffoldHere",
+                   "tool.action.skill"]) {
+    const n = I.split(`"${k}"`).length - 1;
+    assert.equal(n, 3, `${k} 只在 ${n} 本词典里`);
+  }
+});
