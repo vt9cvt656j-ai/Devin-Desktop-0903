@@ -24664,7 +24664,11 @@ async function sendPrompt(text, attachments = [], readyConfig = null) {
         requestConfig.ideUtcOffsetMinutes = turnTime.utcOffsetMinutes;
         requestConfig.ideRegion = _ideRegionCode();
         delete requestConfig.ideTools;
-        const clientBlocks = languageBlock + adaptiveBlock + (_agentLightTurn
+        // userRulesBlock 必须在这里出现。_l0MessagesWithSkills 会把原来那条 system 消息
+        // **整条丢掉**、只用 clientBlocks + skillsBlock 重建，所以任何没列进来的块，
+        // 在 L0（走网关，也就是默认线路）下就等于没发。用户规则/习惯此前正是漏在这里：
+        // 菜单上写着"每轮都遵守"，实际一个字都没到模型手上。
+        const clientBlocks = _userRulesBlock() + languageBlock + adaptiveBlock + (_agentLightTurn
           ? ""
           : (_modelFamilyTuning(config.model) + _authContextBlock()));
         providerMessages = _l0MessagesWithSkills(
@@ -37822,7 +37826,8 @@ async function _agentModelTurn({ config, messages, toolSchemas, toolRegistry = n
         // The genuine line it still carries: no attacking unauthorized third parties, no
         // mass credential theft. Unconditional here: _agentModelTurn is always a full agent
         // turn (sendPrompt owns the light-turn path and passes its own value).
-        const clientBlocks = _modelFamilyTuning(_turnConfig.model)
+        const clientBlocks = _userRulesBlock()          // 见 _l0MessagesWithSkills：没列进来 = L0 下没发
+          + _modelFamilyTuning(_turnConfig.model)
           + _authContextBlock()
           + _languagePreferenceBlock()
           + _adaptivePromptBlock();

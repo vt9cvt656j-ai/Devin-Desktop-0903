@@ -260,3 +260,19 @@ test("两项的名字是「用户习惯」和「用户规则」", () => {
   assert.ok(!i18n.includes("全局技能"), "「全局技能」名不副实（技能发现也覆盖项目目录）");
   assert.ok(!i18n.includes('"assistant.capability.skills"'), "技能项已移出这个菜单");
 });
+
+test("L0（走网关）线路下用户规则不会被丢掉", () => {
+  // _l0MessagesWithSkills 把原来那条 system 消息整条丢掉，只用 clientBlocks + skillsBlock
+  // 重建。任何没列进 clientBlocks 的块，在默认线路下就等于从没发过。
+  // 用户规则/习惯此前正是漏在这里：UI 上写着"每轮都遵守"，实际一个字都没到模型手上。
+  // 这类失效完全无声——功能看起来做完了，只是不起作用。
+  const rebuild = extractFn("_l0MessagesWithSkills");
+  assert.match(rebuild, /source\.slice\(1\)/, "确认它确实会丢掉原 system 消息");
+
+  const callSites = [...SRC.matchAll(/const clientBlocks = [\s\S]{0,400}?;/g)].map((m) => m[0]);
+  assert.ok(callSites.length >= 2, `找不到两个 clientBlocks 组装点，只找到 ${callSites.length}`);
+  for (const site of callSites) {
+    assert.match(site, /_userRulesBlock\(\)/,
+      `这个 clientBlocks 漏了用户规则，L0 下用户写的规则会被静默丢弃：\n${site}`);
+  }
+});
