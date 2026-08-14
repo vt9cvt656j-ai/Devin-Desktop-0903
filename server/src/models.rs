@@ -276,6 +276,33 @@ static CHAT_UPSTREAM_ROUTE_COOLDOWNS: LazyLock<Mutex<HashMap<uuid::Uuid, Instant
 // 块并谎报 end_turn（对照实验：budget 6000 → thinking+text+tool_use 正常；budget 24000
 // → 只回 thinking 就 end_turn；官方 API 绝不会思考完直接收尾）。检出签名后该线路记
 // 30 分钟"思考钳位"，期间 budget_tokens 压到实测安全值；健康线路不受影响，到期自动解除。
+/// 这次流是不是"中转把后半段掐了"。
+///
+/// 判据必须覆盖协议校验器**实际会吐出的每一种截断错误**。原本这里只认两个字符串，
+/// 而校验器一共会吐出七种：流在 message_stop 之前结束、tool_use 没收尾、SSE 帧不完整、
+/// 没有终止 [DONE]、流卡死、工具名缺失——这五种一个都不匹配。于是自愈在最高频的那几种
+/// 截断上根本不触发：线路不被钳位，客户端把同一个注定失败的请求原样重掷，最多 10 次。
+///
+/// 用户看到的就是：内容已经出来一半，然后长时间干等——因为每一次重试都会再被掐一次。
+///
+/// 下面的 `relay_truncation_signatures_stay_in_sync` 钉住它不再漂：它直接扫本文件里所有
+/// 截断类错误文案，少认一个就红。写这条守卫时它当场抓出我自己漏掉的一个，正是它的用处。
+fn looks_like_relay_truncation(err: &str) -> bool {
+    // 用尽量短、尽量不含可变措辞的片段：文案改写（"ended before protocol completion"
+    // → "ended before message_stop"）正是上一次让这套自愈静默失效的原因。
+    const SIGNATURES: &[&str] = &[
+        "incomplete arguments JSON",
+        "incomplete SSE frame",
+        "ended before protocol completion",
+        "ended before message_stop",
+        "ended before tool_use",
+        "ended without terminal data",
+        "stream stalled for",
+        "ended without function.name",
+    ];
+    SIGNATURES.iter().any(|sig| err.contains(sig))
+}
+
 const THINKING_CLIP_COOLDOWN: Duration = Duration::from_secs(30 * 60);
 const THINKING_CLIP_SAFE_BUDGET: i64 = 6000;
 static THINKING_CLIP_ROUTES: LazyLock<Mutex<HashMap<uuid::Uuid, Instant>>> =
@@ -6407,10 +6434,7 @@ pub async fn chat_completions(
                 // 第二个丢块签名：思考开启时上游把工具参数流掐断（incomplete arguments
                 // JSON / 流中断在 tool_use 中途）。同样按线路记思考钳位——IDE 的整轮
                 // 重试会立刻换成低思考预算的请求，而不是原样重掷再被掐一次。
-                if thinking_clip_probe
-                    && (err.contains("produced incomplete arguments JSON")
-                        || err.contains("ended before protocol completion"))
-                {
+                if thinking_clip_probe && looks_like_relay_truncation(&err) {
                     mark_thinking_clip(cid);
                     tracing::warn!(
                         model = %req_model,
@@ -11709,4 +11733,89 @@ mod model_group_tests {
         );
     }
 
+}
+
+#[cfg(test)]
+mod relay_truncation_tests {
+    use super::looks_like_relay_truncation;
+
+    /// 检测判据必须认得出协议校验器真实吐出的**每一种**截断错误。
+    ///
+    /// 这条守的是一次静默失效：原判据里写着 `"ended before protocol completion"`，
+    /// 而那句消息早已被改写成 `ended before message_stop` / `ended before tool_use … completed`。
+    /// 检测没跟着改，于是"中转丢块自愈"对最高频的几种截断一个都不触发——线路不被钳位，
+    /// 客户端把同一个注定失败的请求原样重掷最多 10 次。用户看到的是：内容已经出来一半，
+    /// 然后长时间干等，而每一次重试都会再被掐一次。
+    ///
+    /// 失效方式完全无声：没有报错、没有降级提示，只是自愈不再发生。
+    #[test]
+    fn 真实截断错误一个都不漏() {
+        // 逐条取自协议校验器里 Err(...) 的实际文案
+        for err in [
+            "anthropic tool call \"write_file\" produced incomplete arguments JSON: EOF",
+            "Anthropic stream ended before message_stop",
+            "Anthropic stream ended before tool_use \"edit_file\" completed",
+            "Anthropic stream ended with an incomplete SSE frame",
+            "OpenAI upstream stream ended with an incomplete SSE frame",
+            "OpenAI upstream stream ended without terminal data: [DONE]",
+            "upstream stream stalled for 180 seconds",
+            "OpenAI SSE tool call ended without function.name",
+        ] {
+            assert!(
+                looks_like_relay_truncation(err),
+                "这是中转把后半段掐了，必须触发线路钳位，否则会被原样重掷 10 次：{err}"
+            );
+        }
+    }
+
+    /// 不是截断的失败不能误判——钳位会压低思考预算，对健康线路是纯损失。
+    #[test]
+    fn 非截断失败不误触发钳位() {
+        for err in [
+            "upstream sent no response headers within 57s",
+            "Anthropic SSE contains invalid UTF-8: bad byte",
+            "Anthropic tool_use \"x\" input must be a JSON object",
+            "429 Too Many Requests",
+            "upstream returned 500",
+        ] {
+            assert!(
+                !looks_like_relay_truncation(err),
+                "这不是截断，钳位只会白白压低思考预算：{err}"
+            );
+        }
+    }
+
+    /// 判据与校验器的文案必须留在同一份源码里，改一边就该发现另一边。
+    ///
+    /// 这里直接扫 models.rs：凡是 Err 文案里带 "ended before" / "ended without" /
+    /// "incomplete SSE frame" / "incomplete arguments JSON" 的，都必须被判据认出来。
+    #[test]
+    fn relay_truncation_signatures_stay_in_sync() {
+        let src = include_str!("models.rs");
+        let mut missed = Vec::new();
+        for line in src.lines() {
+            let Some(start) = line.find('"') else { continue };
+            let rest = &line[start + 1..];
+            let Some(end) = rest.find('"') else { continue };
+            let text = &rest[..end];
+            let looks_like_truncation_message = text.contains("ended before")
+                || text.contains("ended without")
+                || text.contains("incomplete SSE frame")
+                || text.contains("incomplete arguments JSON");
+            // 只看校验器造出来的错误文案，跳过判据自己那张表和测试用例
+            if !looks_like_truncation_message || text.len() < 15 {
+                continue;
+            }
+            if !looks_like_relay_truncation(text) {
+                missed.push(text.to_string());
+            }
+        }
+        missed.sort();
+        missed.dedup();
+        assert!(
+            missed.is_empty(),
+            "这些截断错误不会触发中转丢块自愈，线路不会被钳位：\n{}",
+            missed.join("\n")
+        );
+    }
 }
