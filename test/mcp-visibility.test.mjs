@@ -34,15 +34,21 @@ const build = () => new Function(
   "\n;return _mcpAvailabilitySystemContext;",
 )();
 
-const availability = build();
+const catalog = build();
+const availability = catalog;
 
-const snap = (names) => ({ toolCache: names.map((n) => ({ function: { name: n } })) });
+const snap = (names) => ({
+  toolCache: names.map((n) =>
+    typeof n === "string"
+      ? { function: { name: n } }
+      : { function: { name: n[0], description: n[1] } }),
+});
 
 const REAL = snap([
-  "mcp__context7__resolve-library-id",
-  "mcp__context7__query-docs",
-  "mcp__Michael-Cursor__memory_write",
-  "mcp__Michael-Cursor__task_create",
+  ["mcp__context7__resolve-library-id", "Resolve a package name to a Context7 library ID"],
+  ["mcp__context7__query-docs", "Fetch up-to-date official documentation for a library"],
+  ["mcp__Michael-Cursor__memory_write", "写入团队共享记忆"],
+  ["mcp__Michael-Cursor__task_create", "创建一个任务并派发"],
 ]);
 
 test("连上的服务和工具名要真的出现在给模型的上下文里", () => {
@@ -55,6 +61,28 @@ test("连上的服务和工具名要真的出现在给模型的上下文里", ()
     "mcp__Michael-Cursor__task_create",
   ]) {
     assert.ok(out.includes(n), `名录里缺 ${n}：模型叫不出名字就没法 search_tools 取回来`);
+  }
+});
+
+test("每个工具要带一句说明——只给名字，模型判断不了该不该用它", () => {
+  // `query-docs`、`resolve-library-id` 这种名字看不出用途，模型得先花一轮 search_tools
+  // 取回 schema 才知道能干嘛。查个文档四次往返，它在"别磨蹭"的压力下多半就凭记忆答了。
+  const out = catalog(REAL);
+  assert.match(out, /up-to-date official documentation/i,
+    "工具说明没进去——模型只能靠名字猜用途");
+  assert.match(out, /写入团队共享记忆/, "中文说明同样要带上");
+});
+
+test("说明超长时先压说明，不是直接丢工具", () => {
+  const long = snap([
+    ["mcp__big__tool-a", "说".repeat(2000)],
+    ["mcp__big__tool-b", "明".repeat(2000)],
+    ["mcp__big__tool-c", "很".repeat(2000)],
+  ]);
+  const out = catalog(long, 12, 1536);
+  assert.ok(new TextEncoder().encode(out).length <= 1536, "超出字节上限");
+  for (const n of ["tool-a", "tool-b", "tool-c"]) {
+    assert.ok(out.includes(n), `${n} 被整条丢掉了——说明该先被压短`);
   }
 });
 
@@ -111,10 +139,10 @@ test("输出稳定：同一份快照两次调用逐字节相同", () => {
   // 这段进的是 user 消息尾部，但顺序抖动仍会在别处制造无谓的 diff 和不可复现的排查。
   assert.equal(availability(REAL), availability(REAL));
   const shuffled = snap([
-    "mcp__Michael-Cursor__task_create",
-    "mcp__context7__query-docs",
-    "mcp__Michael-Cursor__memory_write",
-    "mcp__context7__resolve-library-id",
+    ["mcp__Michael-Cursor__task_create", "创建一个任务并派发"],
+    ["mcp__context7__query-docs", "Fetch up-to-date official documentation for a library"],
+    ["mcp__Michael-Cursor__memory_write", "写入团队共享记忆"],
+    ["mcp__context7__resolve-library-id", "Resolve a package name to a Context7 library ID"],
   ]);
   assert.equal(availability(shuffled), availability(REAL), "输入顺序变化不该改变输出");
 });
