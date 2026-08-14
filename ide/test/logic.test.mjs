@@ -21399,8 +21399,15 @@ test("both L0 call sites preserve client-only context without duplicating gatewa
   // 守的东西没变——下面几条断言仍然要求客户端专属上下文块一个不少。
   const agentL0 = agent.slice(agent.indexOf("const _wantsL0 ="), agent.indexOf("delete _turnConfig.mcPrefix"));
 
-  assert.match(sendL0, /const clientBlocks = languageBlock \+ adaptiveBlock/,
-    "plain and lightweight L0 sends must preserve language and Adaptive preferences");
+  // 逐项断言，不钉拼接顺序：这一行会随新增的客户端块变化，钉顺序只会在每次正当新增时
+  // 误红。真正要守的是"一个都不能少"——_l0MessagesWithSkills 会把原 system 消息整条丢掉，
+  // 没列进 clientBlocks 的块在 L0 下等于从没发过。用户规则就是这么漏掉过一次的。
+  for (const block of ["languageBlock", "adaptiveBlock", "_userRulesBlock()"]) {
+    assert.ok(
+      sendL0.includes(`const clientBlocks =`) && sendL0.slice(sendL0.indexOf("const clientBlocks ="), sendL0.indexOf("const clientBlocks =") + 400).includes(block),
+      `plain and lightweight L0 sends must preserve ${block}`,
+    );
+  }
   assert.match(sendL0, /_modelFamilyTuning\(config\.model\) \+ _authContextBlock\(\)/,
     "non-light plain sends must preserve family tuning and auth framing");
   assert.match(agentL0, /_modelFamilyTuning\(_turnConfig\.model\)[\s\S]*_authContextBlock\(\)[\s\S]*_languagePreferenceBlock\(\)[\s\S]*_adaptivePromptBlock\(\)/,
