@@ -91,3 +91,19 @@ test("判据不再是扫整条命令字符串", () => {
   assert.doesNotMatch(body, /\(serve\|watch\|/,
     "不能再用词表扫整串——那既拦无辜命令又漏真服务");
 });
+
+// —— 等待期间必须说清在等什么 ——
+
+test("请求已发出但上游还没开口时，界面要说明在等首字节", () => {
+  // 「请求发出、还没收到第一个字节」和「正在接收内容」此前显示成一模一样的跑秒表。
+  // 用户于是以为首字节已经到了、界面卡着不画，实际是上游还没开口——有些中转不做流式
+  // 转发，要等整段生成完才发第一个字节，那段时间本来就没有任何内容可显示。
+  // 两种状态长得一样，就没法判断该等还是该重试。
+  const at = SRC.indexOf("function _turnStatsText(");
+  assert.ok(at > 0, "找不到 _turnStatsText");
+  const fn = SRC.slice(at, SRC.indexOf("\n}\n", at));
+  assert.match(fn, /live/, "实时统计要能区分 live 与收尾");
+  assert.match(fn, /等待上游首字节/, "没有任何进展时要说明在等首字节");
+  assert.match(fn, /接收中/, "已经开始收但还没画出来时要说明在接收");
+  assert.ok(SRC.indexOf("live: true,") > 0, "实时统计必须以 live 模式渲染");
+});

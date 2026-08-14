@@ -17568,7 +17568,7 @@ function _agentTimelineRelative(timeline, at) {
   return Number.isFinite(startedAt) && Number.isFinite(value) && value >= startedAt ? value - startedAt : null;
 }
 
-function _turnStatsText({ elapsedMs = 0, settlement = null, timeline = null } = {}) {
+function _turnStatsText({ elapsedMs = 0, settlement = null, timeline = null, live = false } = {}) {
   const _svg = (d) => `<svg class="turn-stats__icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${d}</svg>`;
   const _icClock = _svg('<circle cx="8" cy="8.5" r="5.5"/><path d="M8 5.8v2.9l2 1.2M6.5 1.5h3"/>');
   const _icTokens = _svg('<path d="M5 2.5 2.5 5.5h5L5 2.5zM5 2.5v8"/><path d="M11 13.5l2.5-3h-5l2.5 3zM11 13.5v-8"/>');
@@ -17583,6 +17583,14 @@ function _turnStatsText({ elapsedMs = 0, settlement = null, timeline = null } = 
   const bits = [`${_icClock}${_fmtElapsed(elapsedMs)}`];
   const firstProgressMs = _timelineElapsed(timeline, "firstModelProgressAt");
   const firstVisibleMs = _timelineElapsed(timeline, "firstVisibleAt");
+  // 等待期间必须说清在等什么。"请求已发出、还没收到第一个字节"和"正在接收内容"是完全
+  // 不同的两件事，而此前它们显示成一模一样的跑秒表——用户以为首字节到了、界面卡着不画，
+  // 实际是上游还没开口。（有些中转不做流式转发：要等整段生成完才发第一个字节，
+  // 那段时间本来就没有任何内容可显示。）
+  if (live) {
+    if (firstProgressMs == null) bits.push("等待上游首字节");
+    else if (firstVisibleMs == null) bits.push("接收中");
+  }
   if (firstProgressMs != null) bits.push(`模型 ${_fmtElapsed(firstProgressMs)}`);
   if (firstVisibleMs != null) bits.push(`首显 ${_fmtElapsed(firstVisibleMs)}`);
   if (settlement) {
@@ -17678,6 +17686,7 @@ function _liveTurnStats(body, { startedAt = Date.now(), getSettlement, getTimeli
         elapsedMs,
         settlement,
         timeline,
+        live: true,
       }).html;
       el.title = _turnStatsTitle({ elapsedMs, settlement, live: true, timeline });
       if (el !== body.lastElementChild) body.appendChild(el); // 新内容追加后保持在最底部
