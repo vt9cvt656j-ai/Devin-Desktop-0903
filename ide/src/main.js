@@ -54131,6 +54131,30 @@ function _mcpInstallMetaFromRegistry(s, source = "") {
   };
 }
 
+/*
+ * 没有 __michael 元信息时，把「归谁」推出来，好让它有个真实头像。
+ *
+ * 手动加的服务（或早于元信息机制装的）没有 owner/avatar，于是图标只能显示首字母——
+ * 一屏几个服务全是灰底大写字母，跟通用图标没区别。但线索其实就在配置里：
+ *   · scope 化的 npm 包 `@upstash/context7-mcp` → 组织就是 upstash
+ *   · 仓库地址 github.com/<owner>/<repo>      → owner
+ *   · 远程地址 mcp.notion.com                  → 主域名那一段
+ * 推不出来才回落到首字母。推错的代价很小：GitHub 头像取不到时 onerror 会把 img 摘掉，
+ * 底下的首字母照常露出来。
+ */
+function _mcpInferOwner(config = {}, pkg = null, remote = "") {
+  const id = String(pkg?.id || "");
+  if (pkg?.kind === "npm" && id.startsWith("@")) {
+    const scope = id.slice(1).split("/")[0].trim();
+    if (scope) return scope;
+  }
+  for (const raw of [config?.__michael?.repo, config?.__michael?.url, remote]) {
+    const m = /github\.com\/([^/\s#?]+)/i.exec(String(raw || ""));
+    if (m && m[1]) return m[1];
+  }
+  return "";
+}
+
 function _mcpInstalledMeta(name, config = {}) {
   const meta = (config && typeof config.__michael === "object" && !Array.isArray(config.__michael)) ? config.__michael : {};
   const preset = _MCP_PRESETS.find((p) => p.name === name);
@@ -54138,6 +54162,7 @@ function _mcpInstalledMeta(name, config = {}) {
   const remote = meta.remote || (Array.isArray(config.args) ? config.args.find((x) => /^https?:\/\//i.test(String(x || ""))) : "");
   return {
     ...meta,
+    owner: meta.owner || _mcpInferOwner(config, pkg, remote),
     name: meta.name || preset?.name || name,
     desc: meta.desc || preset?.desc || "",
     group: meta.group || preset?.group || "",

@@ -776,6 +776,13 @@ body.is-tauri.is-mac.is-fullscreen .titlebar {
 .ctp-iconbtn { display: inline-flex; align-items: center; justify-content: center; background: none; border: none; cursor: pointer; color: var(--text-dim); font-size: 13px; width: 32px; height: 32px; border-radius: 50%; padding: 0; transition: background .12s, color .12s; }
 .ctp-iconbtn:hover { background: var(--hover); color: var(--text); }
 .ctp-iconbtn svg { width: 16px; height: 16px; }
+/* _dbUiIconSvg 那批是线性图标，本身不带 fill/stroke，靠所在环境的 CSS 给。放进这个
+   按钮里就按默认的黑色实心填充画出来，成了一个黑方块。只补给自己没声明 stroke 的，
+   _ICON_TRASH 这类自带属性的不动。 */
+.ctp-iconbtn svg:not([stroke]) {
+  fill: none; stroke: currentColor; stroke-width: 1.7;
+  stroke-linecap: round; stroke-linejoin: round;
+}
 .ctp-iconbtn--danger:hover { background: color-mix(in srgb, #e5484d 14%, transparent); color: #e5484d; }
 .ctp-foot { display: flex; justify-content: flex-end; gap: 8px; margin-top: 16px; }
 .ctp-foot--between { justify-content: space-between; }
@@ -4430,7 +4437,10 @@ body.zen-mode .editor {
 .mcpfp-icon img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; z-index: 1; }
 .mcpfp-icon__letter { font: 700 15px var(--font); color: var(--accent); }
 .mcpfp-card__main { flex: 1; min-width: 0; }
-.mcpfp-card__name { display: flex; align-items: center; gap: 7px; min-width: 0; }
+/* 名字是这张卡最重要的东西，却是唯一可收缩的元素（徽章全是 flex:none），
+   于是窄一点就被截成「cont…」。让徽章换行、名字守住一个最小宽度。 */
+.mcpfp-card__name { display: flex; align-items: center; gap: 7px; min-width: 0; flex-wrap: wrap; row-gap: 4px; }
+.mcpfp-card__name strong { flex: 1 1 auto; min-width: 8em; }
 .mcpfp-card__name strong { font-size: 12.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .mcpfp-badge { flex: none; font-size: 9.5px; font-weight: 650; padding: 1px 6px; border-radius: 999px; color: var(--accent); background: color-mix(in srgb, var(--accent) 11%, transparent); text-transform: uppercase; }
 .mcpfp-badge--count { color: #188038; background: color-mix(in srgb, #34a853 12%, transparent); text-transform: none; }

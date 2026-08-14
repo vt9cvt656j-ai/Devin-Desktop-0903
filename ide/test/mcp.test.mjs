@@ -16,6 +16,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 
 const SRC = fs.readFileSync("src/main.js", "utf8");
+const APP_CSS = fs.readFileSync("src/styles/app.css", "utf8");
 
 /** 抠出一个函数体（和 logic.test.mjs 同一套做法的精简版：跳过注释/字符串/模板/正则）。 */
 function extractFn(name) {
@@ -1035,4 +1036,52 @@ test("MCP 卡片默认展开——折叠起来就等于又藏回去了", () => {
   const cardSrc = SRC.slice(SRC.indexOf("function _createToolStep(call)"), SRC.indexOf("function _settleToolStep"));
   assert.match(cardSrc, /if \(call\.type === "mcp"\) step\.classList\.add\("is-open"\)/,
     "MCP 卡不默认展开，用户要点开才知道发生了什么，那就还是不知道");
+});
+
+// ── 面板卡片的三处显示问题（用户截图里一眼可见）─────────────────────────────
+//
+// 1. 名字被截成「cont…」「ope…」：.mcpfp-card__name 里只有 <strong> 可收缩，
+//    几个徽章全是 flex:none，而「编辑」按钮又从主区抢走一截宽度。
+// 2. context7 只显示首字母：它是手加的，没有 __michael 元信息，于是没有 owner。
+//    可线索就在配置里——包名是 @upstash/context7-mcp，scope 就是 upstash。
+// 3. 「查看来源」渲染成一个黑方块：_dbUiIconSvg 那批是线性图标，自己不带
+//    fill/stroke，靠所在环境的 CSS 给；这个按钮里没给，就按默认黑色实心填充画。
+
+test("scope 化的 npm 包能推出组织名，手加的服务也有真实头像", () => {
+  const infer = load("_mcpInferOwner");
+  assert.equal(infer({}, { kind: "npm", id: "@upstash/context7-mcp" }, ""), "upstash");
+  assert.equal(infer({}, { kind: "npm", id: "@modelcontextprotocol/server-memory" }, ""), "modelcontextprotocol");
+});
+
+test("非 scope 包推不出来就老实返回空，回落首字母——不瞎猜一个 owner", () => {
+  const infer = load("_mcpInferOwner");
+  assert.equal(infer({}, { kind: "npm", id: "agentbase-mcp" }, ""), "");
+  assert.equal(infer({}, null, ""), "");
+});
+
+test("仓库地址和远程地址也能推出 owner", () => {
+  const infer = load("_mcpInferOwner");
+  assert.equal(infer({ __michael: { repo: "https://github.com/modelcontextprotocol/servers" } }, null, ""), "modelcontextprotocol");
+  assert.equal(infer({}, null, "https://github.com/upstash/context7"), "upstash");
+});
+
+test("显式写了 owner 就听它的，推断只在缺失时补位", () => {
+  const src = extractFn("_mcpInstalledMeta");
+  assert.match(src, /owner: meta\.owner \|\| _mcpInferOwner\(config, pkg, remote\)/,
+    "推断不能盖掉配置里写死的 owner");
+});
+
+test("卡片名字守得住最小宽度，徽章换行而不是把名字截成四个字", () => {
+  assert.match(APP_CSS, /\.mcpfp-card__name \{[^}]*flex-wrap: wrap/,
+    "徽章不换行，名字就是唯一被牺牲的那个");
+  assert.match(APP_CSS, /\.mcpfp-card__name strong \{[^}]*min-width: 8em/,
+    "名字没有最小宽度，窄一点就被截成「cont…」");
+});
+
+test("线性图标补上描边，不再渲染成黑方块", () => {
+  assert.match(APP_CSS, /\.ctp-iconbtn svg:not\(\[stroke\]\) \{[^}]*fill: none;[^}]*stroke: currentColor/s,
+    "_dbUiIconSvg 那批图标没有 fill/stroke，会按默认黑色实心填充画出来");
+  // 只补给自己没声明的那些：_ICON_TRASH 自带属性，不该被这条规则改宽改细。
+  assert.match(SRC, /_ICON_TRASH = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor"/,
+    "垃圾桶图标本来就自带描边，:not([stroke]) 才不会误伤它");
 });
