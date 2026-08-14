@@ -4315,6 +4315,68 @@ body.zen-mode .editor {
 /* 技能面板里「用户 / 插件目录」那一段的分隔标题。同样要跨满整行，
    否则它会被挤成半列，看起来像一张卡片的标题而不是一段的开头。 */
 .mcpfp-installed--cards .skfp-section { grid-column: 1 / -1; }
+
+/* ---- MCP / 技能：行里多出来的「为什么」一行 --------------------------------
+   改的是 .atc-info 的主轴方向，所以必须**严格**限定在这两个修饰符下：.atc-info
+   是所有工具卡共用的，放开就是每张卡的标题和结果一起换行。 */
+.agent-tool-step--mcp .atc-info,
+.agent-tool-step--skill .atc-info {
+  flex-direction: column; align-items: flex-start; gap: 2px;
+}
+.agent-tool-step--mcp .atc-action-row,
+.agent-tool-step--skill .atc-action-row { width: 100%; }
+/* 身份（服务·工具 / 技能名）只占一行，两行留给「为什么」；否则 360px 的右栏里
+   一张卡能长到四行。 */
+.agent-tool-step--mcp .atc-path--text,
+.agent-tool-step--skill .atc-path--text { -webkit-line-clamp: 1; }
+.atc-why {
+  width: 100%; min-width: 0;
+  font-size: 11.5px; line-height: 1.35;
+  color: var(--text-dim);
+  display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2;
+  overflow: hidden; white-space: normal; word-break: break-word;
+}
+.atc-why__k { margin-right: 5px; font-size: 10.5px; font-weight: 650; opacity: .72; }
+/* 服务/技能自述用斜体：这不是模型说的话，是第三方自己写的。眉标已经写明来源，
+   斜体只是让它在一屏卡片里一眼分得出来。 */
+.atc-why--self { font-style: italic; }
+
+/* ---- MCP / 技能卡正文（复用 ld-* 家族，不另起一套同义名） ------------------ */
+/* 参数值、配置路径、第三方自述里常有一长串不带空格的东西；不加这条右栏会被撑出
+   横向滚动条。 */
+.ld-meta, .ld-line, .ld-note, .ld-chip, .ld-empty { overflow-wrap: anywhere; }
+/* 模型自己声明的理由是这张卡的重点，给正文色而不是次要灰；三行封顶。 */
+.ld-line--why {
+  color: var(--text);
+  display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 3;
+  overflow: hidden; white-space: normal;
+}
+.ld-kv {
+  margin: 4px 0 0; display: grid;
+  grid-template-columns: minmax(0, auto) minmax(0, 1fr);
+  gap: 2px 10px; font-size: 12px;
+}
+.ld-kv dt { color: var(--text-dim); font-family: var(--mono, ui-monospace, monospace); font-size: 11.5px; }
+.ld-kv dd { margin: 0; overflow-wrap: anywhere; }
+/* 360px 的面板里两列各剩三个字——窄了就上下排。 */
+@media (max-width: 420px) {
+  .ld-kv { grid-template-columns: minmax(0, 1fr); gap: 0; }
+  .ld-kv dd { margin-bottom: 5px; }
+}
+/* 卡片里的原文块。裸 <pre> 会把整个右栏横向撑开。 */
+.tc-pre {
+  margin: 8px 0 0; padding: 8px 10px;
+  max-height: 260px; overflow: auto;
+  border-radius: 8px; background: rgba(128,128,128,.07);
+  font: 11.5px/1.5 var(--mono, ui-monospace, monospace);
+  color: var(--text-dim);
+  white-space: pre-wrap; word-break: break-word;
+}
+/* ld-status 的成功/失败色是写死的浅色十六进制，暗色下那块浅绿刺眼。MCP/技能卡把这
+   两个 chip 用得比原来频繁得多，补上暗色。 */
+[data-theme="dark"] .ld-status--success, .dark .ld-status--success { background: rgba(86,211,100,.16); color: #56d364; }
+[data-theme="dark"] .ld-status--failed,  .dark .ld-status--failed  { background: rgba(244,112,103,.16); color: #f47067; }
+
 .skfp-section {
   margin: 10px 0 2px;
   padding-top: 10px;
@@ -5873,6 +5935,8 @@ img.settings-dropdown__avatar--filled { object-fit: cover; }
 .agent-tool-step--current_time .atc-type-icon { background: #fff3e0; color: #e65100; }
 .agent-tool-step--game_scaffold .atc-type-icon { background: #e8f5e9; color: #2e7d32; }
 .agent-tool-step--game_asset .atc-type-icon { background: #e3f2fd; color: #1565c0; } .atc-type-icon { background: #ede7f6; color: #4527a0; }
+/* 技能：紫色，和 read 的蓝、write 的绿都不撞——它以前就是回落成 read 那张纸的。 */
+.agent-tool-step--skill .atc-type-icon { background: #ede7f6; color: #5e35b1; }
 .agent-tool-step--ksearch .atc-type-icon { background: #e0f2f1; color: #00897b; }
 .agent-tool-step--mcp .atc-type-icon { background: #fce4ec; color: #c62828; }
 .agent-tool-step--computer .atc-type-icon,
