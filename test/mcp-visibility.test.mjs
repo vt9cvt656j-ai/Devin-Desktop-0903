@@ -27,9 +27,18 @@ function topLevelFn(name) {
   return SRC.slice(at, end + 2);
 }
 
+function topLevelConst(name) {
+  const m = SRC.match(new RegExp(`^const ${name} = .*?;$`, "m"));
+  assert.ok(m, `找不到常量 ${name}`);
+  return m[0];
+}
+
 const build = () => new Function(
+  topLevelConst("_INITIAL_MCP_MAX_TOOLS") +
+  topLevelConst("_INITIAL_MCP_MAX_BYTES") +
   topLevelFn("_utf8ByteLength") +
   topLevelFn("_truncateUtf8") +
+  topLevelFn("_mcpServersForInitialWindow") +
   topLevelFn("_mcpAvailabilitySystemContext") +
   "\n;return _mcpAvailabilitySystemContext;",
 )();
@@ -86,11 +95,51 @@ test("说明超长时先压说明，不是直接丢工具", () => {
   }
 });
 
-test("要说清这些工具「不在开局窗口但可用」，并指明取回的办法", () => {
+test("要指明取回的办法，并点破「窗口里看不见 ≠ 不存在」", () => {
   const out = availability(REAL);
   assert.match(out, /search_tools/, "不给取回路径，模型知道有也调不动");
-  assert.match(out, /不在开局工具窗口里|随时可用/,
-    "不点破「窗口里看不见 ≠ 不存在」，模型会直接回复用户做不到");
+  assert.match(out, /别因为开局窗口里没看见就当它不存在/,
+    "不点破这句，模型会直接回复用户做不到");
+});
+
+test("必须分清「已在你手上」和「要去取」——不能一律说成不在窗口里", () => {
+  // 体量小的服务已经被整体放进开局工具窗口了。名录若还一律说「不在窗口里，先 search_tools」，
+  // 模型要么白跑一趟检索，要么信了那句话干脆不去调它——这是自己造的误导。
+  const big = [];
+  for (let i = 0; i < 35; i++) big.push([`mcp__Michael-Cursor__tool_${i}`, "多智能体协作"]);
+  const out = availability(snap([
+    ["mcp__context7__query-docs", "Fetches up-to-date documentation for a library"],
+    ["mcp__context7__resolve-library-id", "Resolves a package name to a library ID"],
+    ...big,
+  ]));
+  assert.match(out, /"service":"context7","ready":true/,
+    "context7 只有两个工具，已经在开局窗口里，必须标成 ready");
+  assert.match(out, /"service":"Michael-Cursor","ready":false/,
+    "35 个工具的服务进不了开局窗口，必须标成未就绪");
+  assert.match(out, /ready=true[\s\S]*直接调用/, "没说清 ready=true 该怎么用");
+  assert.match(out, /ready=false[\s\S]*search_tools/, "没说清 ready=false 该怎么取");
+});
+
+test("就绪的服务排在前面——模型先看到零成本可调的那些", () => {
+  const out = availability(snap([
+    ["mcp__aaa-big__t1", "x"], ["mcp__aaa-big__t2", "x"], ["mcp__aaa-big__t3", "x"],
+    ["mcp__aaa-big__t4", "x"], ["mcp__aaa-big__t5", "x"], ["mcp__aaa-big__t6", "x"],
+    ["mcp__aaa-big__t7", "x"], ["mcp__aaa-big__t8", "x"], ["mcp__aaa-big__t9", "x"],
+    ["mcp__zzz-small__only", "x"],
+  ]));
+  assert.ok(out.indexOf('"zzz-small"') < out.indexOf('"aaa-big"'),
+    "就绪的小服务应排在未就绪的大服务前面，哪怕名字排序在后");
+});
+
+test("开局窗口的判据只有一份——两处共用，不会漂", () => {
+  // 各写一份迟早对不上：一边把服务放进了首包，另一边还在说它不在窗口里。
+  const body = topLevelFn("_mcpAvailabilitySystemContext");
+  assert.match(body, /_mcpServersForInitialWindow\(/, "名录没有复用同一个判据");
+  const select = topLevelFn("_selectInitialTools");
+  assert.match(select, /_mcpServersForInitialWindow\(/, "开局工具表没有复用同一个判据");
+  // 判据里不该再出现第二份预算数字
+  assert.doesNotMatch(body, /_INITIAL_MCP_MAX_(TOOLS|BYTES)/, "名录里重复了预算判断");
+  assert.doesNotMatch(select, /_INITIAL_MCP_MAX_(TOOLS|BYTES)/, "开局工具表里重复了预算判断");
 });
 
 test("服务名工具名是外部配置内容，必须标成不可信数据", () => {
@@ -164,4 +213,35 @@ test("不为这个块引入新的等待", () => {
   const at = SRC.indexOf("const mcpBlock = _mcpAvailabilitySystemContext(");
   const line = SRC.slice(at, SRC.indexOf("\n", at));
   assert.doesNotMatch(line, /await/, "这里不该 await");
+});
+
+// —— 界面标签必须能分辨结局 ——
+
+test("查找工具的界面标签要跟着分支走，不能七种结局压成两句", () => {
+  // 排查时最要命的是「无新工具」把两种相反的情况画成同一个样子：
+  //   · 想要的工具**本来就在手上**（已在开局窗口里）—— 一切正常；
+  //   · 压根**没找到** —— 能力真的缺。
+  // 下一步动作完全相反，界面却分不出来，只能靠猜——这一轮排查就卡在这。
+  // 锚在 search_tools 自己那段上——同名调用在别的分支也有。
+  const anchor = SRC.indexOf("const rejectedNote = update.rejected.length");
+  assert.ok(anchor > 0, "找不到 search_tools 的结果组装段");
+  const at = SRC.indexOf("_settleToolStep(step, r, ", anchor);
+  assert.ok(at > anchor, "找不到 search_tools 的界面落地点");
+  const line = SRC.slice(at, SRC.indexOf("\n", at));
+  assert.doesNotMatch(line, /无新工具/,
+    "还是一刀切的「无新工具」——已在手上和没找到看起来一模一样");
+  assert.match(line, /label/, "标签要由分支决定");
+
+  const region = SRC.slice(anchor, at);
+  for (const [needle, why] of [
+    ["已在手上", "「工具早就在手上」这个结局没有专属标签"],
+    ["注册表里没有", "「注册表里真没有」这个结局没有专属标签"],
+    ["窗口装不下", "「找到了但窗口装不下」这个结局没有专属标签"],
+    ["无需新增", "「编排器判断当前工具够用」这个结局没有专属标签"],
+    ["MCP 连接失败", "「MCP 后台连接失败」这个结局没有专属标签"],
+    ["无匹配", "「真的没匹配」这个结局没有专属标签"],
+  ]) {
+    assert.ok(region.includes(needle), why);
+  }
+
 });
