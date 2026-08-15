@@ -2,6 +2,7 @@ import type React from "react";
 import { useEffect, useState } from "react";
 import { Apple } from "lucide-react";
 import { Button } from "@/components/ui/button";
+import { mseFetch } from "@/lib/mse";
 import { cn } from "@/lib/utils";
 
 /*
@@ -69,7 +70,7 @@ function useDetectedOS(): OS {
  */
 async function installersOrNone(): Promise<Release> {
   try {
-    const res = await fetch(DOWNLOADS, { cache: "no-store" });
+    const res = await mseFetch(DOWNLOADS, { cache: "no-store" });
     if (!res.ok) return { state: "none" };
     const body = (await res.json()) as { version?: string; mac?: string | null; windows?: string | null };
     const urls: Partial<Record<OS, string>> = {};
@@ -89,8 +90,10 @@ function useRelease(): Release {
     let alive = true;
     void (async () => {
       try {
-        const res = await fetch(UPDATE_FEED, { cache: "no-store" });
-        // 204 means the gateway is healthy and simply has no published release.
+        const res = await mseFetch(UPDATE_FEED, { cache: "no-store" });
+        // 204 means the gateway is healthy and simply has no published release. Sealed or
+        // not, this reads the handler's own status — a sealed 204 carries no body and is
+        // rebuilt as a bodyless 204, so the distinction below survives encryption.
         if (res.status !== 200) throw new Error(String(res.status));
         const manifest = (await res.json()) as {
           version?: string;
@@ -124,10 +127,10 @@ type IconType = React.ComponentType<{ className?: string }>;
 
 const PLATFORMS: Record<OS, { label: string; requirement: string; icon: IconType }> = {
   mac: {
-    label: "Download for macOS",
+    label: "Download for MacOS",
     // The published disk image is universal, so it covers both architectures. Saying
     // "Apple Silicon" here turned away Intel Mac owners the build actually supports.
-    requirement: "macOS 13+ · Intel & Apple Silicon · .dmg",
+    requirement: "MacOS 13+ · Intel & Apple Silicon · .dmg",
     icon: Apple,
   },
   windows: {
@@ -162,7 +165,7 @@ export function DownloadButtons({
           <a href={SIGN_UP}>Create an account</a>
         </Button>
         <p className={cn("max-w-md text-center text-xs leading-relaxed", muted)}>
-          The macOS and Windows builds are not published yet. Create an account now — the editor
+          The MacOS and Windows builds are not published yet. Create an account now — the editor
           runs in your browser, and the download appears here the moment it ships.
         </p>
       </div>

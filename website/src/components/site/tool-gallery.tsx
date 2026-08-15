@@ -3,6 +3,7 @@ import { ChevronLeft, ChevronRight } from "lucide-react";
 import { visualFor } from "@/components/site/tool-visuals";
 import { cn } from "@/lib/utils";
 import { SectionReveal } from "@/components/motion/section-reveal";
+import { mseFetch } from "@/lib/mse";
 import { seedIdePreferences } from "@/lib/seed-ide";
 import { useNearViewport } from "@/lib/use-near-viewport";
 
@@ -104,6 +105,8 @@ export function ToolGallery() {
     (async () => {
       let bundled: Catalog | null = null;
       try {
+        // 明文 fetch，不走 mseFetch：这是本站自己的静态文件，和网关没有关系，
+        // 加密它只会为了一个和 CDN 一起缓存的构建产物白跑一次密钥协商。
         bundled = (await (await fetch("/tools.json")).json()) as Catalog;
       } catch {
         // Not fatal on its own; the live list below can still carry the section.
@@ -113,7 +116,7 @@ export function ToolGallery() {
 
       let live: string[] | null = null;
       try {
-        const r = await fetch(`${GATEWAY}/api/tools/catalog`, { cache: "no-store" });
+        const r = await mseFetch(`${GATEWAY}/api/tools/catalog`, { cache: "no-store" });
         if (r.ok) live = ((await r.json()) as { tools: string[] }).tools ?? null;
       } catch {
         // Offline, or an older gateway without the endpoint. Keep the bundled list.

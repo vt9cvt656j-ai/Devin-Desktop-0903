@@ -5,7 +5,10 @@
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <meta name="robots" content="noindex, nofollow" />
 <title>Mr. Day One · Sign in</title>
-<link rel="icon" type="image/png" href="/console/logo.png" />
+<!-- /api/logo.png，不是 /console/ 下那份：整个 /console/* 对非管理员一律 404，
+     而这是一张公开登录页，图标不该跟着一起消失。这个地址本来就是公开的
+     （验证邮件里的图片也从这里取）。 -->
+<link rel="icon" type="image/png" href="/api/logo.png" />
 <style>
   :root {
     color-scheme: light dark;
@@ -119,7 +122,7 @@
 </head>
 <body>
   <main class="wrap">
-    <img class="logo" src="/console/logo.png" alt="" />
+    <img class="logo" src="/api/logo.png" alt="" />
     <h1 id="title">Welcome to Mr. Day One</h1>
     <p class="sub" id="subtitle">Create an account or sign in to continue</p>
 
@@ -191,6 +194,46 @@
   </main>
 
 <script>
+/* MSE-BUNDLE-BEGIN — 生成物，改 server/web-shared/mse.ts */
+// ⚠️ 生成物，不要手改。源：server/web-shared/mse.ts
+function a0b(a,b){a=a-0x1ae;const c=a0a();let d=c[a];if(a0b['xcBvsA']===undefined){var e=function(i){const j='abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789+/=';let l='',m='';for(let n=0x0,o,p,q=0x0;p=i['charAt'](q++);~p&&(o=n%0x4?o*0x40+p:p,n++%0x4)?l+=String['fromCharCode'](0xff&o>>(-0x2*n&0x6)):0x0){p=j['indexOf'](p);}for(let r=0x0,s=l['length'];r<s;r++){m+='%'+('00'+l['charCodeAt'](r)['toString'](0x10))['slice'](-0x2);}return decodeURIComponent(m);};a0b['wEdKTT']=e,a0b['fPmtSt']={},a0b['xcBvsA']=!![];}const f=c[0x0],g=a+f,h=a0b['fPmtSt'][g];return!h?(d=a0b['wEdKTT'](d),a0b['fPmtSt'][g]=d):d=h,d;}(function(a,b){const b1=a0b,c=a();while(!![]){try{const d=parseInt(b1(0x1c2))/0x1*(-parseInt(b1(0x2e2))/0x2)+parseInt(b1(0x2b3))/0x3+-parseInt(b1(0x25d))/0x4*(parseInt(b1(0x1c3))/0x5)+parseInt(b1(0x1cd))/0x6+-parseInt(b1(0x2d9))/0x7+parseInt(b1(0x225))/0x8+parseInt(b1(0x2ed))/0x9;if(d===b)break;else c['push'](c['shift']());}catch(e){c['push'](c['shift']());}}}(a0a,0xe8085));function a0a(){const bB=['Ec1PzguTDgLTzxPVBMu','sxLRu1O','t3LOBMW','uLjXuuW','zMv0y2HjBxbS','z2vUzxjHDgvlzxK','AMXbvxG','s0vMq1G','t3joDLe','r1nXzKi','vKLurv9nu0vFtu9erq','s0Dqy0S','sND3Bue','y2XVBMu','qNPXD2e','zxHWAxjLza','AeDlBLC','tvnfms9Yzxe','ANv2z3e','5Rwb5OMt5lIn5BYaicG','Ag9oqLK','yM9KEq','yMfZzq','uc0Zodq','zgvSzxrL','CgfYC2u','rM1hsMu','qvDMtfK','rurqDhK','C2vHBeHLywrLCNm','ugfPAgG','BxnLu3rHDhvZ','ywrK','CMvWBgf5','Eurqyxy','y2HHCKnVzgvbDa','BMrdDw8','Ec1TC2uTC3rYzwfT','DMfSDwu','Dgv4Dc9LDMvUDc1ZDhjLyw0','77Ym6l+z5lIQ5A6I5OI356UV5y+Q5lYAia','C3rYzwfT','ios4JEwCQowBUUwUMUwqJEwnLEMhJo+8JoAlKUE7NEI/NUAoPq','zMv0y2G','Dhf2yMe','CMvZ','Bw9Kzq','tNvjs1u','wMTOsKK','BMfTzwrdDxj2zq','txnLrxjYB3i','A2LK','twXIEhe','u0vntvO','Bvf2wuS','rKXxDgG','Dg9mB3DLCKnHC2u','rezoA2S','C2XPy2u','sgvjr2y','Chz0D2u','C3vIyxjYyxK','zM9YrwfJAa','v0n6u2m','sxbTBMq','BM93','A2v5CW','CMf3','ndq1otH0ueHovxq','zs5Szw4','Dw5ZDxbWB3j0zwq','zw5JB2rL','iowVUEs4Gos4QUwkOowVHUIVT+AXGUwBNUs6HUAyJUAwH++8Ia','DhLWzq','Ec1TC2uTA2LK','EuHHq2u','CMvKDwnL','vMXdywG','BxnLuMvHzhK','zK5YAKW','wMnKy2i','zgLNzxn0','qw5jDMu','q2Pwsuu','Dgv4Dc9WBgfPBJTJAgfYC2v0pvvurI04','q0vnwNK','CMvWzwf0','C2vHCMnO','thv5Exe','wuHis1u','A1LsEKq','BKfYD3G','ELrQvg0','y29Kzq','BKnSsMG','qxncyMK','C3bRAq','BwfW','x19LC01VzhvSzq','vKzsuMi','B2vjCfu','sevrrMC','EuXfDMK','AgvHzgvYCW','l2fWAs9JCNLWDg8V','B2zMC2v0','mtyWmZG5nLn5r3vtqG','DhjPBq','zgf0ytOG','y2fSBa','u2LZzw4','EeXYz2W','rvr1vMK','BKfuC3m','572r5ywZ55sO55Qe5PIVia','mJaWmJjxu05xrNa','ug5szxy','CLfhveq','C3vPDgu','uKrTuK4','CgLU','sgrbz2q','Ec1TC2uTC2vX','DezLtvi','tw1lALG','CMHswM4','mtaYmJa3nJbcs0ThD3K','CKDZufy','zw5JCNLWDa','qKrZAxO','Ec1PzguTDxrJlw9MzNnLDc1TAw51DgvZ','rLzmzNG','tvnfms9ZC2u','z2v0uMfUzg9TvMfSDwvZ','z2DMug8','vKLurv9nu0vFueLo','zs5Kzwm','u2DpA0G','EKvNrhC','Ce9pyMS','C0TnqM8','t1ntDwK','sufJA3u','C3rYAw5N','z2v0','D0vgEMy','y1niuMi','s2zXBeS','zgvJCNLWDa','zKvwA2y','y29UDgvUDc10ExbL','wejRqxu','C2vX','ywHkyKW','r0vu','Bwzorwe','zs5IB2r5','zs5MB3jT','otjIDvvvDKi','ndmWnZmWwe15AKHU','tfrXswm','yxnru0q','EMzltwC','BM8TC3rVCMu','tKnnu1e','tw5ewKi','zuX5rMG','uuvJwuC','CMvXDwLYzq','mJi5mtC4ngPnyKjjyG','ufn2Evi','CMvRzxK','zs50CNvUyW','vKLurv9nu0vFqKftrq','z2v0uMvHzgvY','sKjJDwO','Ec1TC2uTDhm','C3rHDhvZ','sunvvfq','77Yj77Ym5BEY5Ps+5BYd','C2v0','ufzguhq','qMzOz0i','werozNm','yZjZ','CMvXDwLYzwq','D2Lst1a','C3bSAxq','AgfZt3DUuhjVCgvYDhK','Dg9vChbLCKnHC2u','ENbUA1e','q0zbD3y','vMHrENK','Dw5HDMfPBgfIBgu','zxbR','zNjVBunOyxjdB2rL','z2v0t3DUuhjVCgvYDhLoyw1LCW','u2DzuK4','tM1su0K','AM5HCKe','z2v0t3DUuhjVCgvYDhLezxnJCMLWDg9Y','zMLSDgvY','r3rktwS','572r5ywZ5ywS6zkLia','tvnfms92mxW','BevAr0C','quvtluDdtq','CMvWBgfJzq','Dg9tDhjPBMC','Ec1PzguTBgfUz3vHz2u','zvrWy1O','ChjLDG','y29UzMLNDxjLtxnL','tNjAsgS','zw52','Bwv0Ag9K','BNzwshu','zujQrKq','Aw1WB3j0s2v5','B2zM','z0jbq0C','Evjrug8','Bvrzr24','rMX5y3i','svfwu2e','A29KqwO','yxbWBgLJyxrPB24VB2n0zxqTC3rYzwfT','C3LTyM9S','572r5ywZ6iEQ56EWia','svjXz0i','B1bZBLy','yxv0Ag9YAxPHDgLVBG','zMnMzgG','CgHuAu4','rNDHAhC','rgHmveO','zeT5rLC','C2TLDW','zNvUy3rPB24','t3Lwz1q','Ec1TC2uTDG','z1bSrLa','zgvJB2rL','yLzwBui','u3jHzxa','Ec1TC2uTC2LK','Aw5KzxHpzG','rvLQswK','B3jPz2LU','se9ot0O','BxjxCfi','y2fIA08','CK9Jv2S','C3rHCNrZv2L0Aa','qwjkqLO','uhPzz1m','ANnVBG','mtaWntC5ndrgtw9zvKi','BxnLrw52q29UzMLN','77Ym5l2g5ywS6zkL55Qe5OYh57Q55PIVia','DgHLBG','zxzvrgi','zw51BwvYywjSzq','Bvjgv0O','C2LK','yxjYyxLcDwzMzxi','BMfTzq','Ahr0Ca','BxnL','u09Yywi','CZjJ','C2vZC2LVBL90DgW','ChjVDg90ExbL','yxv0BW','rurlC0K','BuDXDMe','C3vIDgXL','B0TnsuW','AeHTzfq','vu5fwum','BwfSzM9YBwvK','rLjevwO','AxfzvM0','BgvUz3rO','AKPpsNa','zgvYAxzLqML0CW','EuzuuM4','C2TmDwm','CgvQuMe','B2jQzwn0','zs52zxi','y2X0t0e','CgXHAw4','Bwf4','yM9VDhn0CMfW','sejYyvC','Egriuw8','Aw5JBhvKzxm','whDuzeW','tvnfms9Yzxm','Eur5yNe','5y+w5ywS6zkL5AsX6lsLicG','EYjFx21Zzv9LB3mIoNrYDwv9','uwncueu','zhrZtei','BNvTyMvY','C3rYAw5NAwz5','suPIDu4','C2vYDMvYx3rPBwu','AvDUzLC','B2L5sxq','tgncuhO','tvnfms1qmZG0luHlreyTu0HbmZG0luffuZi1nKDdtq','mZj1yKDQvgi','EwjMy1O','EKrYsLy','yxbWBgLJyxrPB24VEc13D3CTzM9YBs11CMXLBMnVzgvKo2nOyxjZzxq9vvrgltG','EvjhwKC','sevbra','Ec1TC2uTCq','zwrUBwe','AuL3C0K','CfDbvw4','vvPRuvq','y2f0y2G','zg5Wy2S','rwrKtK4','Dhj1BMnHDgvK','ChvI','shLhuLq','zgvMAw5LuhjVCgvYDhK'];a0a=function(){return bB;};return a0a();}var MSE=((()=>{const b2=a0b,d={'SEMMZ':function(au,av){return au!==av;},'yLEvi':b2(0x1b9),'mvUwO':function(au,av,aw,ax){return au(av,aw,ax);},'wEFzf':function(au,av){return au!==av;},'pWAUn':b2(0x1af),'RjxyS':b2(0x257),'fcfdh':function(au,av){return au==av;},'QEcYG':b2(0x245),'DhLTJ':function(au,av){return au==av;},'CEMZy':b2(0x212),'dnpck':function(au,av){return au(av);},'BDsiz':function(au,av){return au!==av;},'Bzqwa':function(au,av,aw){return au(av,aw);},'IykSZ':b2(0x2d7),'VhQzy':function(au,av){return au===av;},'ednma':b2(0x1cc),'fNrjL':b2(0x235),'mQvYK':function(au,av){return au!==av;},'FVLfx':function(au,av){return au&&av;},'Flycr':b2(0x2e7),'nArwx':b2(0x24e),'yRQPo':function(au,av){return au<av;},'yFTRn':function(au,av){return au+av;},'OyVgT':function(au,av){return au%av;},'yHaCe':function(au,av){return au<av;},'PVFPt':function(au,av){return au>av;},'zDrJV':function(au,av){return au-av;},'dtsLB':function(au,av){return au===av;},'EDKsI':b2(0x1bb),'jlAUx':'SHA-384','EycrO':'/api/crypto/pubkey','AWfLY':b2(0x1c7),'UNEYC':b2(0x24a),'HdAgd':b2(0x2e5),'BfhgB':function(au,av){return au(av);},'DFNkk':'\u7F51\u5173\u4E0A\u4E00\u628A\u5BC6\u94A5\u7684\x20kid\x20\u548C\u516C\u94A5\u5BF9\u4E0D\u4E0A','kodAj':function(au,av){return au>av;},'yDPav':b2(0x2a3),'GtJMk':function(au){return au();},'xLrgl':'HKDF','oPsnV':b2(0x2b2),'skLuc':'ECDH','bpzQR':b2(0x286),'sKMBo':'deriveBits','PSvyR':b2(0x2cf),'IRqgB':function(au,av){return au(av);},'PnRev':function(au,av,aw){return au(av,aw);},'IAcku':'s2c','AbJBZ':function(au,av){return au+av;},'cSHRb':function(au,av){return au*av;},'bVVmB':function(au,av){return au-av;},'LcBPz':b2(0x2dd),'ggfPo':function(au,av){return au(av);},'phTiN':function(au,av){return au%av;},'ahJbL':function(au,av){return au!==av;},'CjBQO':b2(0x23a),'mfNEa':function(au){return au();},'Oyhnl':b2(0x1b7),'WCzSc':function(au,av){return au>av;},'MnDZB':b2(0x1f2),'zfKMg':function(au,av){return au+av;},'frTmZ':function(au,av){return au<av;},'lEZGG':b2(0x2b4),'NrZHk':b2(0x246),'rQGTD':b2(0x1b8),'eTpcZ':b2(0x1e3),'SgYRN':b2(0x1b3),'XFsvN':b2(0x224),'zEgDw':function(au,av){return au??av;},'tFeMR':b2(0x2c3),'XDNfs':function(au,av){return au instanceof av;},'JwwmA':function(au,av){return au(av);},'RDmRN':b2(0x206),'asQSD':b2(0x260),'oeIpU':function(au,av){return au<av;},'FLWth':b2(0x2b5),'hoNBY':b2(0x1c0),'NcRLK':'http://placeholder.invalid','Paihh':function(au,av,aw){return au(av,aw);},'Zcdcb':function(au,av){return au!==av;},'CjVIE':b2(0x1eb),'pejRa':b2(0x22f),'oIAWd':function(au,av){return au(av);},'HeIGf':function(au,av){return au(av);},'ZkhJI':function(au,av){return au(av);},'nATss':function(au,av){return au===av;},'kYRzD':function(au,av){return au===av;},'EddNN':function(au,av){return au!==av;},'cabkO':b2(0x2d4),'EDPty':function(au){return au();},'RRqQL':function(au,av){return au===av;},'Fwahw':b2(0x1ff),'ndCuo':function(au,av){return au(av);},'HyGRT':b2(0x27e),'SgOkH':function(au){return au();},'JBcuj':'GET','NuIKU':b2(0x1ba),'SOrab':function(au,av){return au===av;},'yRGZG':function(au,av){return au!==av;},'rhRZn':function(au,av,aw,ax){return au(av,aw,ax);},'AZKho':function(au,av,aw,ax,ay,az){return au(av,aw,ax,ay,az);},'mRFWJ':b2(0x214),'gPlFP':'x-mse-epk','rOcWk':b2(0x2e9),'rGsPV':b2(0x1d4),'iqYVm':function(au,av){return au(av);},'LvDxH':b2(0x262),'nClJh':b2(0x263),'cltOA':function(au,av,aw,ax,ay){return au(av,aw,ax,ay);},'QcBPE':b2(0x27a),'zTjTm':function(au,av){return au!==av;},'KEfCX':b2(0x239),'nvVHu':b2(0x290),'HBraW':function(au,av,aw,ax,ay){return au(av,aw,ax,ay);},'jJOJp':b2(0x255),'Luyyq':function(au,av){return au===av;},'juvgq':b2(0x1e5),'gBACG':b2(0x1dd),'aVVqS':b2(0x296),'zpnkQ':function(au,av){return au===av;},'hGKnW':function(au,av){return au>=av;},'ICUTT':function(au,av){return au>=av;},'xINlC':'downgrade','YHHKU':function(au,av,aw,ax){return au(av,aw,ax);},'mTYGn':function(au,av,aw,ax){return au(av,aw,ax);},'BOKEk':function(au,av){return au===av;},'xdHQo':function(au,av){return au===av;},'Sraep':function(au,av){return au in av;},'GfvNy':b2(0x25a),'EYjIi':b2(0x250),'VFRRb':function(au,av){return au||av;},'PzYgS':b2(0x294),'ybfcZ':function(au,av){return au<av;},'eLyFh':b2(0x2db),'ETuVi':function(au,av){return au===av;},'dKyFW':b2(0x1d0),'evUDb':b2(0x26b),'GSqfB':'application/mse-sealed','Ipmnd':b2(0x252),'VlCah':b2(0x20b),'mGqva':b2(0x1f5),'MmKjX':b2(0x26f),'UZkQT':b2(0x2f1)};var e=Object[b2(0x26e)],f=Object[b2(0x1ec)],g=Object[b2(0x1e8)],i=Object[b2(0x234)][b2(0x1e0)],k=(au,av,aw)=>av in au?e(au,av,{'enumerable':!0x0,'configurable':!0x0,'writable':!0x0,'value':aw}):au[av]=aw,l=(au,av)=>{const b3=b2,aw={};aw[b3(0x2ce)]=function(aA,aB){return aA!==aB;};const ax=aw;if(d[b3(0x2a4)](b3(0x1de),d[b3(0x2d5)])){for(var ay in av)d['mvUwO'](e,au,ay,{'get':av[ay],'enumerable':!0x0});}else return{'ready':ax[b3(0x2ce)](f,null),'suite':g,'kid':a8,'mode':i['mode'],'pinned':a9[b3(0x2e7)][b3(0x23f)]>0x0};},m=(au,av,aw,ax)=>{const b4=b2;if(d[b4(0x1b5)](d[b4(0x266)],d['RjxyS'])){if(av&&d[b4(0x20c)](typeof av,d[b4(0x1cb)])||d[b4(0x20f)](typeof av,d[b4(0x2c4)])){for(let az of d[b4(0x269)](g,av))!i[b4(0x2dc)](au,az)&&d[b4(0x2f0)](az,aw)&&d['mvUwO'](e,au,az,{'get':()=>av[az],'enumerable':!(ax=d[b4(0x27d)](f,av,az))||ax[b4(0x22a)]});}return au;}else{const aA={};return aA[b4(0x29c)]=s,aA[b4(0x22c)]='',aA['seq']=0x0,aA['s2c']=null,aA[b4(0x248)]=!0x0,aA;}};const n={};n[b2(0x295)]=!0x0;var o=au=>m(e({},b2(0x2d1),n),au),p=(au,av,aw)=>k(au,typeof av!=b2(0x207)?av+'':av,aw),r={};const s={};s['MSE_SUITE']=()=>v,s['MseError']=()=>X,s[b2(0x1f8)]=()=>Q,s[b2(0x226)]=()=>S,s['mseEventStream']=()=>at,s['mseFetch']=()=>ao,s[b2(0x2bd)]=()=>ah,s[b2(0x28e)]=()=>aj,d[b2(0x2e3)](l,r,s);var t={},v=b2(0x25c),w=d[b2(0x278)],A=d[b2(0x2af)];function B(au){const b5=b2;return au[b5(0x221)](d['IykSZ']);}var D=[d[b2(0x2bc)],d[b2(0x237)],d[b2(0x2eb)],d[b2(0x267)]],P={'base':'','pin':[],'mode':d[b2(0x2be)],'sealHeaders':D,'fetchImpl':(...au)=>globalThis[b2(0x29a)](...au)};function Q(au){const b6=b2;P={'base':au[b6(0x285)]??P[b6(0x285)],'pin':au[b6(0x2e7)]??P[b6(0x2e7)],'mode':au[b6(0x29d)]??P['mode'],'sealHeaders':(au[b6(0x28c)]??P[b6(0x28c)])[b6(0x2d0)](av=>av[b6(0x2a7)]()),'fetchImpl':au['fetchImpl']??P[b6(0x273)]},a7=null,a8=null;}function S(){const b7=b2;let au={};try{au=t[b7(0x1fa)]??{};}catch{}let av=(au[b7(0x2f6)]??'')[b7(0x1df)](',')[b7(0x2d0)](aw=>aw[b7(0x2da)]())[b7(0x1ed)](Boolean);return{'base':au['VITE_MSE_BASE']??'','pin':av,'mode':d[b7(0x1e4)](au[b7(0x279)],d['ednma'])?d[b7(0x264)]:d[b7(0x2be)]};}var X=class extends Error{constructor(au,av){const b8=b2;super(au),d['mvUwO'](p,this,b8(0x2cc),av),this[b8(0x22e)]=b8(0x2a1);}},Y=new TextEncoder(),a0=new TextDecoder();function a1(au){const b9=b2;if(b9(0x1b1)!==d[b9(0x2ca)]){let aw='';for(let ax=0x0;d[b9(0x201)](ax,au[b9(0x23f)]);ax+=0x8000)aw+=String[b9(0x1e7)](...au[b9(0x2ac)](ax,d[b9(0x242)](ax,0x8000)));return d[b9(0x269)](btoa,aw)[b9(0x1f3)](/\+/g,'-')[b9(0x1f3)](/\//g,'_')[b9(0x1f3)](/=+$/,'');}else{let ay=m[b9(0x2e7)][b9(0x24d)](n),az=d[b9(0x2a5)](o,null)&&p['pin'][b9(0x24d)](aq);if(d[b9(0x2f2)](!ay,!az))throw new r(b9(0x1ef)+s+b9(0x299),d[b9(0x203)]);!ay&&t[b9(0x1f7)]&&(X[b9(0x2a2)]=v['prev'][b9(0x2a2)],w[b9(0x26c)]=Y[b9(0x1f7)][b9(0x26c)]);}}function a2(au){const ba=b2;let av=au[ba(0x1f3)](/-/g,'+')[ba(0x1f3)](/_/g,'/'),aw=d[ba(0x269)](atob,av+'='[ba(0x2c5)](d[ba(0x213)](0x4-d[ba(0x213)](av['length'],0x4),0x4))),ax=new Uint8Array(aw[ba(0x23f)]);for(let ay=0x0;d[ba(0x2ba)](ay,aw[ba(0x23f)]);ay++)ax[ay]=aw[ba(0x292)](ay);return ax;}function a3(...au){const bb=b2,av={'nAGqS':function(aA,aB){return d['PVFPt'](aA,aB);}};let aw=au[bb(0x2d0)](aA=>Y[bb(0x2b6)](aA)),ax=d[bb(0x242)](aw[bb(0x2bb)]((aA,aB)=>aA+aB[bb(0x23f)],0x0),d[bb(0x25f)](aw['length'],0x1)),ay=new Uint8Array(ax),az=0x0;return aw[bb(0x2ad)]((aA,aB)=>{const bc=bb;av['nAGqS'](aB,0x0)&&(ay[az++]=0x0),ay['set'](aA,az),az+=aA[bc(0x23f)];}),ay;}var a4=(au,av,aw,ax,ay)=>a3(b2(0x280),au,String(av),String(aw),ax,ay),a5=(au,av,aw)=>a3(b2(0x24f),au,String(av),aw),a6=(au,av,aw)=>a3(b2(0x2f3),au,String(av),String(aw)),a7=null,a8=null;function a9(au){const bd=b2;if(d[bd(0x254)](d[bd(0x236)],'UThxW'))n={'base':o[bd(0x285)]??p[bd(0x285)],'pin':aq[bd(0x2e7)]??r[bd(0x2e7)],'mode':s['mode']??t[bd(0x29d)],'sealHeaders':(X['sealHeaders']??v[bd(0x28c)])[bd(0x2d0)](aw=>aw[bd(0x2a7)]()),'fetchImpl':w[bd(0x273)]??Y[bd(0x273)]},a1=null,al=null;else return P[bd(0x285)]?''+P[bd(0x285)]+au:au;}async function aa(au){const be=b2;let av=new Uint8Array(await crypto[be(0x238)][be(0x2c0)](d['jlAUx'],au));return a1(av)['slice'](0x0,0x18);}async function ab(){const bf=b2;let au=await P['fetchImpl'](a9(d['EycrO']),{'cache':d[bf(0x28a)]});if(!au['ok'])throw new X(bf(0x251)+au[bf(0x1d5)]+')',d[bf(0x23b)]);let av=await au[bf(0x224)]();if(d[bf(0x2a4)](av[bf(0x2e5)],v))throw new X(bf(0x2e1)+av[bf(0x2e5)]+bf(0x297)+v,d[bf(0x2e8)]);let aw=d[bf(0x269)](a2,av[bf(0x26c)]),ax=await d[bf(0x1da)](aa,aw);if(d[bf(0x2a5)](ax,av[bf(0x2a2)]))throw new X(bf(0x208)+av[bf(0x2a2)]+bf(0x227)+ax,d[bf(0x203)]);let ay=null;if(av[bf(0x1f7)]&&(ay=await d[bf(0x1da)](aa,d[bf(0x1da)](a2,av[bf(0x1f7)][bf(0x26c)])),ay!==av[bf(0x1f7)][bf(0x2a2)]))throw new X(d[bf(0x2a8)],d[bf(0x203)]);if(d[bf(0x205)](P[bf(0x2e7)][bf(0x23f)],0x0)){let az=P[bf(0x2e7)][bf(0x24d)](ax),aA=d[bf(0x2a4)](ay,null)&&P['pin']['includes'](ay);if(d['FVLfx'](!az,!aA))throw new X(bf(0x1ef)+ax+bf(0x299),d['Flycr']);!az&&av['prev']&&(av['kid']=av[bf(0x1f7)]['kid'],av[bf(0x26c)]=av['prev'][bf(0x26c)]);}return ai=av[bf(0x2a2)],{...av,'offset':av[bf(0x258)]-Date[bf(0x2b0)]()};}function ac(){const bh=b2,au={'tqvba':function(av){const bg=a0b;return d[bg(0x1ee)](av);}};return a7||(a7=ab()[bh(0x268)](av=>{const bi=bh;if(d['SEMMZ']('OuBQR',d[bi(0x291)]))throw a7=null,av;else return f||(g=au[bi(0x29b)](a8)[bi(0x268)](ax=>{throw k=null,ax;})),a9;})),a7;}async function ad(au){const bk=b2,av={'IQVSa':function(aG,aH,aI){const bj=a0b;return d[bj(0x27d)](aG,aH,aI);},'HONOJ':d[bk(0x2de)],'FRDUj':d[bk(0x275)],'pvtwe':d[bk(0x20a)],'AnIve':bk(0x1f2),'OrNvQ':bk(0x1b8)},aw={};aw[bk(0x22e)]=d[bk(0x243)],aw[bk(0x2a0)]=d['bpzQR'];let ax=await crypto[bk(0x238)][bk(0x274)](aw,!0x1,[d[bk(0x1b0)]]),ay=new Uint8Array(await crypto[bk(0x238)]['exportKey'](d[bk(0x1ce)],ax['publicKey'])),az=d['IRqgB'](a2,au[bk(0x26c)]),aA=await crypto[bk(0x238)][bk(0x1fe)](bk(0x2cf),az,{'name':'ECDH','namedCurve':d['bpzQR']},!0x1,[]),aB=new Uint8Array(await crypto[bk(0x238)][bk(0x241)]({'name':d[bk(0x243)],'public':aA},ax['privateKey'],0x180)),aC=new Uint8Array(await crypto[bk(0x238)][bk(0x2c0)](d[bk(0x275)],d[bk(0x2e3)](ag,ay,az))),aD=await crypto[bk(0x238)][bk(0x1fe)](d[bk(0x20a)],aB,d[bk(0x2de)],!0x1,[bk(0x241)]),aE=async aG=>{const bl=bk;let aH=av[bl(0x204)](ag,Y[bl(0x2b6)](bl(0x1f0)+aG+'|'+au[bl(0x2a2)]+'|'),aC),aI=await crypto[bl(0x238)][bl(0x241)]({'name':av[bl(0x21d)],'hash':av[bl(0x23d)],'salt':new Uint8Array(0x0),'info':aH},aD,0x100);return crypto[bl(0x238)][bl(0x1fe)](av[bl(0x2ab)],aI,av[bl(0x2c1)],!0x1,[bl(0x2ef),av[bl(0x277)]]);},aF=new Uint8Array(await crypto[bk(0x238)][bk(0x2c0)](d[bk(0x275)],ay));return{'kid':au[bk(0x2a2)],'sid':a1(aF['subarray'](0x0,0x12)),'epk':d[bk(0x1da)](a1,ay),'c2s':await d[bk(0x209)](aE,bk(0x1dc)),'s2c':await aE(d[bk(0x1b2)]),'seq':0x0,'expiresAt':d[bk(0x222)](Date['now'](),d[bk(0x1b6)](Math[bk(0x249)](0x1e,d[bk(0x217)](au[bk(0x233)],0x3c)),0x3e8))};}function ae(){const bm=b2;if(d[bm(0x1b5)](d[bm(0x25b)],bm(0x2dd)))d['PVFPt'](i,0x0)&&(a9[k++]=0x0),l[bm(0x1d8)](m,n),o+=p[bm(0x23f)];else return a8||(a8=ac()[bm(0x228)](ad)[bm(0x268)](av=>{throw a8=null,av;})),a8;}function af(){const bn=b2;if(d[bn(0x1bd)](d['CjBQO'],bn(0x1ea)))a7=null,a8=null;else{let av=d[bn(0x1f3)](/-/g,'+')[bn(0x1f3)](/_/g,'/'),aw=d[bn(0x2f5)](e,av+'='[bn(0x2c5)](d[bn(0x20d)](d['zDrJV'](0x4,d[bn(0x213)](av[bn(0x23f)],0x4)),0x4))),ax=new f(aw[bn(0x23f)]);for(let ay=0x0;d[bn(0x2ba)](ay,aw['length']);ay++)ax[ay]=aw[bn(0x292)](ay);return ax;}}function ag(...au){const bo=b2;let av=new Uint8Array(au[bo(0x2bb)]((ax,ay)=>ax+ay[bo(0x23f)],0x0)),aw=0x0;for(let ax of au)av[bo(0x1d8)](ax,aw),aw+=ax[bo(0x23f)];return av;}async function ah(){const bp=b2;await d[bp(0x1bf)](ae);}var ai=null;function aj(){const bq=b2;if(d[bq(0x1e4)](d[bq(0x271)],bq(0x1fd))){let av=g[bq(0x1b4)](a8);av!==null&&(i[a9]=av,k['delete'](l));}else return{'ready':a8!==null,'suite':v,'kid':ai,'mode':P['mode'],'pinned':d[bq(0x2ae)](P['pin'][bq(0x23f)],0x0)};}async function ak(au,av,aw){const br=b2;let ax=crypto[br(0x2f4)](new Uint8Array(0xc)),ay=new Uint8Array(await crypto['subtle'][br(0x2ef)]({'name':d[br(0x1c9)],'iv':ax,'additionalData':av,'tagLength':0x80},au,aw)),az=new Uint8Array(d[br(0x1c6)](0xd,ay[br(0x23f)]));return az[0x0]=0x1,az[br(0x1d8)](ax,0x1),az[br(0x1d8)](ay,0xd),az;}async function al(au,av,aw){const bs=b2;if(d['frTmZ'](aw[bs(0x23f)],0x1d))throw new X(d[bs(0x1f1)],bs(0x23c));if(aw[0x0]!==0x1)throw new X(d[bs(0x1f9)],bs(0x23c));try{return new Uint8Array(await crypto[bs(0x238)][bs(0x1b8)]({'name':d['MnDZB'],'iv':aw[bs(0x2ac)](0x1,0xd),'additionalData':av,'tagLength':0x80},au,aw[bs(0x2ac)](0xd)));}catch{throw new X(bs(0x2f7),d[bs(0x2e4)]);}}async function am(au,av){const bt=b2;if(bt(0x1c8)!==d[bt(0x1f6)]){if(au==null||d[bt(0x254)](au,''))return{};if(d[bt(0x20f)](typeof au,d[bt(0x1e9)])){if(!av||av[bt(0x24d)](d['XFsvN']))try{return bt(0x21e)===bt(0x21e)?{'b':JSON[bt(0x288)](au)}:e[bt(0x285)]?''+f['base']+g:a8;}catch{}return{'raw':a1(Y[bt(0x2b6)](au)),'ct':d[bt(0x1ae)](av,d[bt(0x2ea)])};}if(d[bt(0x1db)](au,Uint8Array))return{'raw':d[bt(0x27b)](a1,au),'ct':av??bt(0x206)};if(d[bt(0x1db)](au,ArrayBuffer))return{'raw':d[bt(0x2f5)](a1,new Uint8Array(au)),'ct':av??bt(0x206)};if(au instanceof Blob)return{'raw':a1(new Uint8Array(await au['arrayBuffer']())),'ct':av??au[bt(0x2b8)]??d[bt(0x2e6)]};if(d[bt(0x1db)](au,URLSearchParams))return{'raw':d[bt(0x269)](a1,Y[bt(0x2b6)](au[bt(0x1f4)]())),'ct':d[bt(0x1c5)]};throw d[bt(0x2d3)](typeof FormData,'u')&&au instanceof FormData?new X(bt(0x1c1),d[bt(0x2a6)]):new X(d[bt(0x283)],d[bt(0x2a6)]);}else throw P=null,d;}function an(au){const bu=b2;let av=/^https?:\/\//i['test'](au),aw=new URL(au,av?void 0x0:d['NcRLK']);return{'path':aw['pathname'],'query':aw[bu(0x2c6)][bu(0x1f3)](/^\?/,''),'origin':av?aw[bu(0x21c)]:''};}async function ao(au,av={}){const bv=b2;return(await d[bv(0x28d)](ap,au,av))[bv(0x29c)];}async function ap(au,av){const bw=b2;if(d[bw(0x2bf)](d[bw(0x2c2)],'RouHH')){let ax=au[bw(0x221)](d[bw(0x244)])?au:a9(au),{path:ay}=d['oIAWd'](an,ax);if(d[bw(0x2aa)](B,ay))return d[bw(0x29f)](aq,await P['fetchImpl'](ax,av));try{return await ar(ax,av,ay,new Set());}catch(az){if(d[bw(0x254)](P[bw(0x29d)],bw(0x1cc)))throw az;if(d[bw(0x1db)](az,X)&&(az[bw(0x2cc)]===bw(0x24a)||d[bw(0x2e0)](az['code'],d[bw(0x2e8)])))return d['JwwmA'](aq,await P[bw(0x273)](ax,av));throw az;}}else{for(var aA in e)d['mvUwO'](f,g,aA,{'get':a8[aA],'enumerable':!0x0});}}function aq(au){const bx=b2,av={};return av[bx(0x29c)]=au,av[bx(0x22c)]='',av[bx(0x1bc)]=0x0,av['s2c']=null,av[bx(0x248)]=!0x0,av;}async function ar(au,av,aw,ax){const by=b2,ay={};ay[by(0x259)]=d[by(0x270)];const az=ay;if(d[by(0x26a)](d[by(0x21f)],d[by(0x21f)])){let aB={};try{aB=e[by(0x1fa)]??{};}catch{}let aC=(aB[by(0x2f6)]??'')[by(0x1df)](',')[by(0x2d0)](aD=>aD['trim']())[by(0x1ed)](d);return{'base':aB[by(0x1d1)]??'','pin':aC,'mode':d[by(0x2c9)](aB[by(0x279)],d[by(0x264)])?d[by(0x264)]:by(0x235)};}else{let aB=await d[by(0x28b)](ac);if(d[by(0x272)](aB[by(0x29d)],d[by(0x20e)]))return d[by(0x293)](aq,await P[by(0x273)](au,av));let aC=await ae();if(d[by(0x1d9)](Date['now'](),aC['expiresAt'])&&!ax['has']('expired'))return ax[by(0x28f)](d[by(0x26d)]),d[by(0x2f8)](af),ar(au,av,aw,ax);let aD=(av[by(0x1fb)]??d[by(0x1d3)])[by(0x1e1)](),{query:aE}=an(au),aF=new Headers(av[by(0x2d6)]??{}),aG=aF[by(0x1b4)](d[by(0x29e)]),aH={};for(let aW of P[by(0x28c)]){if(d[by(0x231)](by(0x1c4),by(0x289))){let aX=new aJ(e['reduce']((aZ,b0)=>aZ+b0['length'],0x0)),aY=0x0;for(let aZ of aI)aX[by(0x1d8)](aZ,aY),aY+=aZ[by(0x23f)];return aX;}else{let aX=aF[by(0x1b4)](aW);d[by(0x261)](aX,null)&&(aH[aW]=aX,aF[by(0x287)](aW));}}let aI={'q':aE,...await am(av[by(0x284)],aG),...Object[by(0x2b1)](aH)[by(0x23f)]?{'h':aH}:{}},aJ=++aC['seq'],aK=d[by(0x1c6)](Date[by(0x2b0)](),aB[by(0x2d8)]),aL=await d[by(0x2ec)](ak,aC['c2s'],d['AZKho'](a4,aC[by(0x22c)],aJ,aK,aD,aw),Y[by(0x2b6)](JSON[by(0x256)](aI)));aF[by(0x1d8)](d[by(0x22b)],'1'),aF[by(0x1d8)](by(0x2b9),aC['kid']),aF[by(0x1d8)](d[by(0x215)],aC[by(0x1e6)]),aF[by(0x1d8)](by(0x219),aC['sid']),aF[by(0x1d8)](d[by(0x220)],d['ZkhJI'](String,aJ)),aF['set'](d[by(0x2ee)],d[by(0x23e)](String,aK));let aM=aD===by(0x1be)||d[by(0x272)](aD,d['LvDxH']),aN=null;aM?(aF[by(0x1d8)](d[by(0x2cd)],a1(aL)),aF[by(0x287)](d[by(0x29e)])):(aF[by(0x1d8)](d[by(0x29e)],w),aN=aL);const aO={...av};aO[by(0x1fb)]=aD,aO[by(0x2d6)]=aF,aO[by(0x284)]=aN;let aP=au[by(0x1df)]('?')[0x0],aQ=await P[by(0x273)](aP,aO),aR=aY=>({'res':aY,'sid':aC[by(0x22c)],'seq':aJ,'s2c':aC[by(0x232)],'plain':!0x1}),aS=aQ[by(0x2d6)][by(0x1b4)](by(0x1ba))??'';if(aS[by(0x24d)](w))return d['dnpck'](aR,await d[by(0x247)](as,aQ,aC,aJ,aw));let aT;if(aQ[by(0x1d5)]===0x199||d[by(0x231)](aQ[by(0x1d5)],0x190)||d[by(0x254)](aQ[by(0x1d5)],0x1f7)){if(d[by(0x2a5)](d[by(0x253)],d[by(0x253)]))P=null,aJ=null;else{let aY=await aQ[by(0x27c)]()['json']()[by(0x268)](()=>null),aZ=aY?.[by(0x230)];if(aT=aZ,aZ&&!ax['has'](aZ)&&d[by(0x2d3)](ax['size'],0x2)){if(d[by(0x2cb)](by(0x265),d[by(0x276)])){if(ax[by(0x28f)](aZ),d[by(0x2e0)](aZ,by(0x1cf))||d[by(0x2e0)](aZ,d[by(0x1fc)]))return d[by(0x1bf)](af),d[by(0x24b)](ar,au,av,aw,ax);if(aZ===by(0x211))return typeof aY?.['server_time']==d[by(0x240)]&&((await ac())[by(0x2d8)]=aY[by(0x258)]-Date['now']()),ar(au,av,aw,ax);if(d[by(0x2c7)](aZ,d[by(0x281)])||aZ===d[by(0x200)])return af(),ar(au,av,aw,ax);}else return aK[by(0x221)](WQerQO[by(0x259)]);}}}let aU=aS['includes'](d['aVVqS'])&&d[by(0x1e2)](aQ[by(0x2d6)][by(0x1b4)]('x-mse-stream'),'1'),aV=d[by(0x27f)](aQ[by(0x1d5)],0x1f4)||d[by(0x2c7)](aQ[by(0x1d5)],0x65)||d[by(0x1d6)](aQ[by(0x1d5)],0x12c)&&aQ[by(0x1d5)]<0x190;if(!aU&&!aV)throw aT?new X(aw+'：加密层反复拒绝（'+aT+by(0x1d7),aT):new X(aw+by(0x2b7)+aQ[by(0x1d5)]+'）——\x20不接受',d['xINlC']);return d['oIAWd'](aR,aQ);}}async function as(au,av,aw,ax){const bz=b2;let ay=new Uint8Array(await au[bz(0x22d)]()),az=await d[bz(0x2c8)](al,av[bz(0x232)],d[bz(0x202)](a5,av[bz(0x22c)],aw,ax),ay),aA=JSON['parse'](a0[bz(0x216)](az)),aB=new Headers(aA['h']??{});aB[bz(0x1d8)](d['NuIKU'],aA['ct']);let aC=d['RRqQL'](aA['s'],0xcc)||d['BOKEk'](aA['s'],0xcd)||d[bz(0x24c)](aA['s'],0x130),aD=null;return aC||(d[bz(0x218)]('b',aA)?aD=JSON[bz(0x256)](aA['b']):aA[bz(0x2b2)]&&(aD=a2(aA['raw']))),new Response(aD,{'status':aA['s'],'headers':aB});}async function*at(au,av={}){const bA=b2;if(d['GfvNy']!==d[bA(0x21b)]){let {res:ax,sid:ay,seq:az,s2c:aA,plain:aB}=await d[bA(0x2e3)](ap,au,av);if(!ax['ok']||!ax[bA(0x284)])throw new X(bA(0x282)+ax[bA(0x1d5)]+')',bA(0x298));let aC=ax[bA(0x284)][bA(0x1d2)]();if(d[bA(0x2d2)](aB,!aA)||!ax['headers'][bA(0x1b4)](d[bA(0x223)]))for(;;){let {done:aG,value:aH}=await aC['read']();if(aG)return;const aI={};aI[bA(0x298)]=!0x0,yield a0[bA(0x216)](aH,aI);}let aD='',aE=0x0,aF=!0x1;A:for(;;){let {done:aJ,value:aK}=await aC['read']();if(aJ)break;const aL={};aL[bA(0x298)]=!0x0;for(aD+=a0[bA(0x216)](aK,aL);;){let aM=aD[bA(0x21a)]('\x0a\x0a');if(d[bA(0x25e)](aM,0x0))break;let aN=aD[bA(0x2a9)](0x0,aM);if(aD=aD[bA(0x2a9)](aM+0x2),!aN[bA(0x221)](d[bA(0x1ca)]))continue;let aO=aN[bA(0x2a9)](0x6)[bA(0x2da)]();if(!aO)continue;let aP=a0['decode'](await al(aA,a6(ay,az,aE),d['ndCuo'](a2,aO)));if(aE+=0x1,d[bA(0x2df)](aP,A)){aF=!0x0;break A;}yield aP;}}if(!aF)throw new X(d[bA(0x210)],d[bA(0x229)]);}else return g||(a8=i()['then'](a9)[bA(0x268)](aQ=>{throw m=null,aQ;})),l;}return d['dnpck'](o,r);})());
+/* MSE-BUNDLE-END */
+</script>
+
+<script>
+/*
+ * 这一页的请求走加密。
+ *
+ * 它提交的是密码和邮箱验证码 —— 全站最该藏起来的两样东西，而在此之前它们以明文经过
+ * Cloudflare、nginx 和任何装了根证书的中间人。上面那段是从 server/web-shared/mse.ts
+ * 编出来的同一个客户端（不是手抄的第二份实现），由
+ * `node server/scripts/sync-mse-client.mjs` 注入。
+ *
+ * 失败一律回退到明文 fetch：登录页是进入系统的唯一入口，宁可这一次没加密，也不能
+ * 因为加密层出问题就让所有人进不来。要杜绝回退，把下面的 mode 改成 "require"
+ * —— 但那要等网关的 MSE_MODE 也到 required，见 server/docs/MSE.md §11。
+ */
+(function () {
+  if (!window.MSE) return;
+  try {
+    window.MSE.configureMse({
+      mode: "auto",
+      // 网关静态公钥的指纹。这一页提交密码，是最需要挡住主动中间人的地方 ——
+      // 不固定的话，任何持有受信 CA 的中间人都能塞自己的公钥进来，全程可读。
+      //
+      // 轮换密钥时**必须**同时更新这里（还有 console-login/login.js 里那一份，
+      // 以及三个前端的 VITE_MSE_PIN）。对不上不会静默降级，会当场报错 ——
+      // 见 post() 里对 e.code 的处理，这是故意的。
+      pin: ["yddBgF9eaS-gVWQtCJKoTwoM"],
+    });
+    window.MSE.mseReady().catch(function () {});
+  } catch (e) {
+    /* 老浏览器没有 WebCrypto。post() 里的 window.MSE 判断会自动走明文。 */
+  }
+})();
+</script>
+
+<script>
 (function () {
   var $ = function (id) { return document.getElementById(id); };
   var msg = $("msg");
@@ -200,7 +243,15 @@
   // Only same-origin app paths may be redirected to, so ?next= can never become an
   // open redirect.
   var HOME = "/dashboard";
-  var ALLOWED = ["/dashboard", "/billing", "/app"];
+  // `/console/` 也在里面 —— 这是管理员唯一的回家路。
+  //
+  // 管理台的门禁是 nginx 的 auth_request，它**只看得到 cookie**。而管理台登录一直是拿
+  // localStorage 里的令牌换会话的，于是「localStorage 有令牌、cookie 已过期」这个状态下
+  // （cookie 7 天，localStorage 不过期），管理员会被自己的门禁挡在 404 外面。
+  //
+  // 这一页正好是修复点：resume() 读到令牌、跟服务端核实、**把 cookie 补写回来**。所以
+  // /gate?next=/console/ 是那个状态的解法 —— 前提是这里允许跳过去。
+  var ALLOWED = ["/dashboard", "/billing", "/app", "/console/"];
   function nextTarget() {
     try {
       var n = new URLSearchParams(location.search).get("next") || HOME;
@@ -231,12 +282,47 @@
     if (pv) pv.hidden = which !== "email";
     setMsg("");
   }
+  /*
+   * 加密优先，出问题回退明文。
+   *
+   * mseFetch 返回的是一个正常的 Response，所以下面这两行和以前一模一样 —— 这也是
+   * 这套客户端刻意做成 fetch 替身的原因。
+   */
+  function send(path, init) {
+    if (window.MSE) {
+      try {
+        return window.MSE.mseFetch(path, init);
+      } catch (e) {
+        /* 同步抛出（配置不对之类）。落到明文。 */
+      }
+    }
+    return fetch(path, init);
+  }
+
   async function post(path, body) {
-    var r = await fetch(path, {
+    var init = {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
-    });
+    };
+    var r;
+    try {
+      r = await send(path, init);
+    } catch (e) {
+      /*
+       * 回退与否，要看失败**说明了什么**。
+       *
+       * `pin` = 对面的公钥不是我们认识的那一把。`downgrade` = 我们发的是密文，对面拿
+       * 明文回。这两种都是敌意信号，此刻退回明文等于把密码原样交给中间人 —— 而这一页
+       * 输入框里装的就是密码。宁可这一次登录失败。
+       *
+       * 其余（取不到公钥、网关根本没有加密层、老浏览器没有 WebCrypto）说明的是「加密
+       * 不可用」，不是「有人在中间」。登录是唯一的入口，那种情况下必须还能进得来。
+       */
+      if (e && (e.code === "pin" || e.code === "downgrade")) throw e;
+      if (!window.MSE) throw e;
+      r = await fetch(path, init);
+    }
     var j = await r.json().catch(function () { return {}; });
     return { ok: r.ok, data: j };
   }
@@ -297,7 +383,7 @@
   (async function offerProviders() {
     var live;
     try {
-      var r = await fetch("/api/auth/oauth/providers", { cache: "no-store" });
+      var r = await send("/api/auth/oauth/providers", { cache: "no-store" });
       if (!r.ok) return;
       live = await r.json();
     } catch (e) {
@@ -483,53 +569,50 @@
    * **不再走 loopback。** 以前是这个页面去打 http://127.0.0.1:47821 问 App。那条路做不成：
    * App 在跑、在听、CORS 预检正确返回了 Access-Control-Allow-Private-Network、本地网络权限
    * 也授予了，Chrome 依然以一句 TypeError: Failed to fetch 拒绝 —— HTTPS 页面访问明文
-   * loopback 端口正是浏览器这几年一直在关掉的形状。整套探测连同它在控制台留下的报错一起删了。
+   * loopback 端口正是浏览器这几年一直在关掉的形状。
    *
-   * 换成经由网关的三方交接：
-   *   1. 向网关要一个 nonce 和一个 secret；
-   *   2. 打开 mrday://signin?nonce=…，由操作系统唤起 App（App 没开会被一并拉起，这是深链
-   *      比 loopback 好的地方 —— 以前 App 没开就彻底没戏）；
-   *   3. App 拿自己的登录令牌去认领这个 nonce，网关替它签一张网页会话；
-   *   4. 这个页面拿 nonce + secret 去取。secret 从没进过链接，所以抢到深链的人取不走。
+   * **也不再由这个页面发起。** 上一版是这里向网关要一对 nonce+secret，再让 App 去认领。
+   * 那个 start 接口按设计是公开的（调用它的正是还没登录的人），于是任何一个网站都能自己要
+   * 一对、诱导受害者的 App 去认领，然后用自己手里的 secret 换走受害者的会话 —— 一个账号
+   * 接管漏洞。校验来源补不上：攻击者用 curl 就能完成，受害者的浏览器根本不参与那两步。
+   *
+   * 所以方向反过来了，现在这个按钮只做一件事：喊一声 `mrday://signin`，**不带任何凭据**。
+   * 之后由 App 用它自己的令牌去换会话，并亲自打开浏览器把一次性 code 送到这个页面
+   * （`/gate?handoff=…`）。密钥全程在 App 手里，结果送去哪也由 App 决定，发起方插不进来。
+   *
+   * 这个页面因此只剩两段代码：点按钮时唤起 App；带着 ?handoff= 回来时把它换成会话。
    */
-  var HANDOFF_POLL_MS = 1000;
-  var HANDOFF_TRIES = 60;        // 约一分钟，够点开系统弹窗 + App 冷启动
 
-  function sleep(ms) { return new Promise(function (r) { setTimeout(r, ms); }); }
+  /* 带着交接码回来了 —— 换成会话，然后进站。 */
+  async function redeemHandoff(code) {
+    var wrap = document.querySelector("main.wrap");
+    wrap.style.visibility = "hidden";
+    setMsg("");
+    try {
+      var r = await post("/api/auth/handoff/redeem", { code: code });
+      if (r.ok && r.data && r.data.token) return finish(r.data.token);
+      setMsg((r.data && r.data.error) || "This sign-in link has expired. Open the app and try again.", "err");
+    } catch (e) {
+      setMsg("Could not complete the hand-off. Sign in with your email instead.", "err");
+    }
+    wrap.style.visibility = "";
+    $("email").focus();
+  }
 
-  async function useDesktopSession() {
+  function useDesktopSession() {
     var btn = $("pvMrday");
     var label = btn.querySelector(".txt");
-    var was = label.textContent;
     btn.disabled = true;
     label.textContent = "Opening the desktop app…";
-    setMsg("");
-
-    try {
-      var s = await post("/api/auth/handoff/start", {});
-      if (!s.ok || !s.data || !s.data.nonce) {
-        throw new Error((s.data && s.data.error) || "could not start");
-      }
-      var nonce = s.data.nonce, secret = s.data.secret;
-
-      // 唤起 App。协议没注册时浏览器什么都不会发生 —— 下面的轮询会超时，
-      // 那句提示会告诉用户去更新 App。
-      try { location.href = "mrday://signin?nonce=" + encodeURIComponent(nonce); } catch (e) {}
-
-      setMsg("Waiting for the desktop app… approve the prompt if your browser asks.");
-      for (var i = 0; i < HANDOFF_TRIES; i++) {
-        await sleep(HANDOFF_POLL_MS);
-        var r = await post("/api/auth/handoff/poll", { nonce: nonce, secret: secret });
-        if (r.ok && r.data && r.data.ready && r.data.token) return finish(r.data.token);
-        // 交接过期或凭据不符 —— 再等下去也没有意义。
-        if (!r.ok) break;
-      }
-      setMsg("The desktop app did not respond. Make sure it is open and up to date, or sign in with your email.", "err");
-    } catch (e) {
-      setMsg("Could not reach the desktop app. Sign in with your email instead.", "err");
-    }
-    btn.disabled = false;
-    label.textContent = was;
+    // 协议没注册时浏览器什么都不会发生，所以给一个到点恢复的提示 —— 没有可轮询的东西了，
+    // 真正的完成信号是 App 另开一个标签页把我们带回 /gate?handoff=…
+    try { location.href = "mrday://signin"; } catch (e) {}
+    setMsg("Approve the prompt if your browser asks. The app will finish signing you in.");
+    setTimeout(function () {
+      btn.disabled = false;
+      label.textContent = "Continue with Mr. Day One";
+      setMsg("If nothing happened, make sure the desktop app is open and up to date, or sign in with your email.", "err");
+    }, 12000);
   }
 
   $("pvMrday").addEventListener("click", function () { return useDesktopSession(); });
@@ -583,7 +666,9 @@
     var wrap = document.querySelector("main.wrap");
     wrap.style.visibility = "hidden";
     try {
-      var r = await fetch("/api/me", { headers: { Authorization: "Bearer " + token }, cache: "no-store" });
+      // 令牌走 send()：mseFetch 会把 Authorization 从外层摘掉、封进密文，所以这一行
+      // 之后中间人再也看不到会话令牌本身。
+      var r = await send("/api/me", { headers: { Authorization: "Bearer " + token }, cache: "no-store" });
       if (r.ok) {
         // Restore the cookie before leaving: it is the only thing the guarded route reads.
         writeSessionCookie(token);

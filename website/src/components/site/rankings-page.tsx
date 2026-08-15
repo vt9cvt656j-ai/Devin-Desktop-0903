@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { ArrowLeft, ChevronLeft, ChevronRight, Lock } from "lucide-react";
 
 import { authToken, GATEWAY } from "@/lib/account";
+import { mseFetch } from "@/lib/mse";
 import { cn } from "@/lib/utils";
 
 /*
@@ -42,18 +43,45 @@ type Payload = {
   per_page: number;
   total_cents: number;
   total_points: number;
+  /**
+   * 一美元等于多少个原始计费分。运营可调，所以跟着数据下发，不写死在页面里。
+   * 见服务端 rankings.rs 的同名字段。
+   */
+  raw_cents_per_credit_usd: number;
 };
 
+/*
+ * 标签写的是实际算的那个窗口。
+ *
+ * 以前是 Today / This week / This month，听起来是自然日、自然周、自然月；服务端算的却是
+ * `now() - N 天`，一律是往前推的滚动窗口。两者差得可不小 —— 早上八点点开"Today"，
+ * 拿到的是昨天早八点到现在，一多半属于昨天。页面右上角本来就写着"in the last 24 hours"，
+ * 也就是同一屏上两种说法互相打架。
+ *
+ * 改标签而不是改查询：要算自然日就得知道看的人在哪个时区，而这个接口没有这个信息，
+ * 拿服务器时区当所有人的"今天"只是把不准换个地方藏起来。
+ */
 const WINDOWS = [
-  { key: "day", label: "Today" },
-  { key: "week", label: "This week" },
-  { key: "month", label: "This month" },
+  { key: "day", label: "Last 24 hours" },
+  { key: "week", label: "Last 7 days" },
+  { key: "month", label: "Last 30 days" },
 ] as const;
 
 const nf = new Intl.NumberFormat("en-US");
 
-const money = (cents: number) =>
-  (cents / 100).toLocaleString("en-US", { style: "currency", currency: "USD" });
+/*
+ * 原始计费分 → 美元。
+ *
+ * 除的是 `raw_cents_per_credit_usd`，不是 100。这个网关里所有 `*_cents` 都是原始计费分，
+ * 一美元 663 个（运营可调）—— 用户后台渲染同一张 model_usage 表用的就是 `raw / 663`。
+ * 这里此前按 100 除，于是整栏金额被放大了 6.63 倍：真实的 $7.54 印成了 $50.02，
+ * 顶部合计的 $221.78 实际是 $33.45。
+ *
+ * 分母来自接口。写死会重蹈 account-ui 的覆辙 —— 那边的 format.ts 留着一句
+ * 「永远不要写死这个分母：它是运营设置，曾经有三个地方各说各话」。
+ */
+const money = (rawCents: number, perUsd: number) =>
+  (rawCents / perUsd).toLocaleString("en-US", { style: "currency", currency: "USD" });
 
 /** Points are fractional by design — a $0.003 call costs 0.06 of one. */
 const points = (n: number) =>
@@ -272,6 +300,14 @@ export function RankingsPage() {
   const [moneyPage, setMoneyPage] = useState(1);
   const [pointsPage, setPointsPage] = useState(1);
 
+  /*
+   * 换算分母，来自接口。
+   *
+   * 兜底成 663 只是为了在字段缺失时不把金额算成 Infinity —— 真正的值永远以服务端为准。
+   * 小于 1 一律不采信：那不是"另一种设置"，是坏数据，除下去只会得到一个更离谱的金额。
+   */
+  const perUsd = data && data.raw_cents_per_credit_usd >= 1 ? data.raw_cents_per_credit_usd : 663;
+
   useEffect(() => {
     const t = authToken();
     if (!t) {
@@ -281,7 +317,11 @@ export function RankingsPage() {
     let alive = true;
     void (async () => {
       try {
-        const res = await fetch(
+        // The query string travels inside the envelope, not on the URL — which is what
+        // stops "who looked at which page of the leaderboard" from accumulating in an
+        // access log. `res` is still an ordinary Response, and the status below is the
+        // handler's own: it comes out of the sealed body, not off the outer reply.
+        const res = await mseFetch(
           `${FEED}?window=${window_}&money_page=${moneyPage}&points_page=${pointsPage}`,
           {
             headers: { Authorization: `Bearer ${t}` },
@@ -357,7 +397,7 @@ export function RankingsPage() {
             ))}
             {data && (
               <span className="ml-auto text-xs text-muted-foreground">
-                {money(data.total_cents)} and {points(data.total_points)} points{" "}
+                {money(data.total_cents, perUsd)} and {points(data.total_points)} points{" "}
                 {data.days === 1 ? "in the last 24 hours" : `in the last ${data.days} days`}
               </span>
             )}
@@ -375,7 +415,7 @@ export function RankingsPage() {
                 title="By money spent"
                 note="Drawn from a balance or a plan."
                 data={data.money}
-                amount={(r) => money(r.cents)}
+                amount={(r) => money(r.cents, perUsd)}
                 onPage={setMoneyPage}
               />
               <Column
