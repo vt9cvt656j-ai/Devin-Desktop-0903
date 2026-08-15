@@ -134,3 +134,19 @@ test("方案本身有问题时要在动手前说——最常见的谄媚不是�
   assert.ok(TRUTH.includes('not unrequested honesty'));
   assert.ok(TRUTH.includes("Say it once"), "没写「说一次」会退化成每轮一段风险清单");
 });
+
+test("部署失败不能报成功——这是唯一会跨出 IDE 变成对外承诺的假成功", () => {
+  // 原来是 `curl -sS`（没有 --fail），网关返回 401/413/500 一律退出 0，set -e 不触发，
+  // 紧跟着那句「可直接访问分享」是**无条件**打印的。模型读到它就告诉用户「部署好了，
+  // 链接给你」——而那是个 404，用户把它发给别人之后才发现。
+  const i = SRC.indexOf("mi-deploy.tar.gz");
+  assert.ok(i >= 0, "deploy_site 的命令不见了");
+  const cmd = SRC.slice(SRC.lastIndexOf("`", i - 200), SRC.indexOf("`;", i) + 1);
+  assert.match(cmd, /-w '%\{http_code\}'/, "没有取回 HTTP 状态码，就无从判断成没成");
+  assert.match(cmd, /if \[ "\$code" != "200" \]/, "没有按状态码判定成败");
+  assert.match(cmd, /exit 1/, "失败时必须非零退出，否则上游仍会当成功");
+  // 成功文案必须在判定之后，否则又回到无条件打印。
+  assert.ok(cmd.indexOf('if [ "$code" != "200" ]') < cmd.indexOf("可直接访问分享"),
+    "成功文案排在状态码判定之前——失败时照样会打印");
+  assert.match(cmd, /不要把链接给别人/, "失败时要明说没有可用地址，否则模型仍可能给出链接");
+});
