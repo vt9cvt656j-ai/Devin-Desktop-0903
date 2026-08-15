@@ -156,11 +156,52 @@ test("这段要真的进提示词，而且排在项目上下文之前", () => {
   assert.ok(seg.indexOf("_resumeBlock") < seg.indexOf("项目上下文"), "交接块排在了项目上下文后面");
 });
 
-test("新一轮要继承会话里那份没做完的计划", () => {
-  const at = SRC.indexOf("run._sessionGen = session._runGen || 0;");
-  assert.ok(at > 0);
-  const seg = SRC.slice(at, at + 1400);
-  assert.match(seg, /run\._planSteps = _prevPlan\.map/, "run 没继承会话计划，步骤推进会从零开始");
+test("计划继承：限 agent 模式、排在 planSteps 声明之后、并同步局部变量", () => {
+  const loop = extractFn("_runAgenticLoop");
+  const at = loop.indexOf("run._planSteps = _prevPlan.map");
+  assert.ok(at > 0, "找不到继承块");
+  const seg = loop.slice(Math.max(0, at - 700), at + 200);
+
   assert.match(seg, /_prevOutcome === "failed" \|\| _prevOutcome === "partial"/,
     "继承没有限定在「确实没跑完」，正常收尾后的新任务会被旧计划粘住");
+  // 只读模式继承来的实现步骤根本执行不了，却会触发无模式门的 planFinish：
+  // 最多 3 个多余回合去催一个只读模式"继续做下一步"，再给正常回答盖上未完成。
+  assert.match(seg, /isAgent &&/, "继承没有模式门");
+  // 只设 run._planSteps 的话循环局部的 planSteps 永远是 null：
+  // 「改到第 3 个文件就提醒先停一下整合」会在每次续跑误报，周期性 planRefresh 也不触发。
+  assert.match(seg, /planSteps = run\._planSteps;/, "没有同步循环局部的 planSteps");
+  // isAgent 在 planSteps 声明附近才出现，继承块必须排在它之后
+  assert.ok(loop.indexOf("let didMutate = false") < at, "继承块排在了 planSteps 声明之前");
+  assert.ok(loop.indexOf("const isAgent = run.mode ===") < at, "继承块排在 isAgent 声明之前，拿不到它");
+});
+
+test("user_stopped 要有对应人话，不能把内部枚举名甩给用户", () => {
+  const at = SRC.indexOf("const _INCOMPLETE_LABELS");
+  assert.ok(at > 0);
+  assert.match(SRC.slice(at, at + 600), /user_stopped: "/,
+    "新枚举值没有人话，建议行会退回泛泛的「继续完成剩余部分」，send 串还会写「因 user_stopped 未完成」");
+});
+
+test("用户按停必须产出可续跑的结局，否则整套交接是死的", () => {
+  // 按停时循环是**干净 break** 出来的：不抛异常（finalErr 空），也没走到那几个会设
+  // _incompleteReason 的收尾门。于是结局被判成 success——而交接块和计划继承都只在
+  // failed/partial 时成立，两个机制一个都不会触发。交接写得再好也喂不到。
+  const loop = extractFn("_runAgenticLoop");
+  assert.match(loop, /const _stoppedEarly = !_live\(\);/,
+    "没有捕捉「这一轮是被停掉的」这个事实");
+  assert.match(loop, /_stoppedEarly \|\| run\._incompleteReason \|\| hitCap/,
+    "结局判定没有把「被停掉」算进去，按停后仍会被判成 success");
+  assert.match(loop, /run\._incompleteReason = run\._incompleteReason \|\| "user_stopped"/,
+    "没有记下中断原因，交接块就说不出「中断在哪」");
+
+  // 取值时机：_setStreaming(session, false) 之后 _live() 对所有运行都为假，
+  // 正常收尾的会被误判成中断。
+  // 先剥注释：上面那段解释里原样引用了 _setStreaming(session, false)，
+  // 不剥的话这条顺序断言是在跟我自己的注释较劲（这个仓库踩过好几次）。
+  const code = loop.replace(/\/\*[\s\S]*?\*\//g, "").replace(/(^|[^:])\/\/[^\n]*/g, "$1");
+  const capture = code.indexOf("const _stoppedEarly = !_live();");
+  const teardown = code.indexOf("_setStreaming(session, false)");
+  assert.ok(capture > 0 && teardown > 0, "锚点缺失");
+  assert.ok(capture < teardown,
+    "在 _setStreaming(false) 之后才取值——那时每一次运行看起来都像被停了");
 });

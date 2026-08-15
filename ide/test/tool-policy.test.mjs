@@ -178,6 +178,17 @@ test("main.js no longer hand-maintains the tool family lists", () => {
 // 先调研再动手最需要的东西——调研这一半反而没工具。
 // 但也不能反过来全放：MCP 规范里 readOnlyHint 是**可选**的，多数服务不写；
 // 缺声明时必须按"可能有副作用"处理，否则只读模式会替用户改了东西。
+test("只读门必须收到整个 call——少传一个实参，MCP 又被一刀切挡回去而且全绿", () => {
+  // 这里破例用源码断言（本文件开头反对钉源码形状，但 anti-drift 小节是它自己写明的例外）：
+  // MCP 的只读判定是**逐次**的，policy 里是个 lambda。调用点写成 blockedInReadOnlyMode(call.type)
+  // 的话，lambda 收到 undefined → !undefined === true → 只读模式里所有 MCP 全被挡，
+  // 而下面那些直接调函数的行为测试照样通过。钉的是元数，不是变量名。
+  assert.doesNotMatch(MAIN, /blockedInReadOnlyMode\(\s*[A-Za-z_$][\w$]*\.type\s*\)/,
+    "只读门只收到了 type，MCP 的逐次判定退化成一刀切");
+  assert.match(MAIN, /blockedInReadOnlyMode\(\s*[A-Za-z_$][\w$]*\.type\s*,\s*[A-Za-z_$][\w$]*\s*\)/,
+    "main.js 必须把整个 call 交给只读门");
+});
+
 test("声明了只读的 MCP 工具，在只读模式里可以用", () => {
   assert.equal(blockedInReadOnlyMode("mcp", { type: "mcp", mcpReadOnly: true }), false);
 });

@@ -4366,12 +4366,18 @@ body.zen-mode .editor {
 .ld-kv dt { color: var(--text-dim); font-family: var(--mono, ui-monospace, monospace); font-size: 11.5px; }
 .ld-kv dd { margin: 0; overflow-wrap: anywhere; }
 /* 360px 的面板里两列各剩三个字——窄了就上下排。 */
-@media (max-width: 420px) {
+/* 容器查询，不是媒体查询：@media 量的是**窗口**，而助手面板只是窗口里的一列
+   （默认 440px），桌面上 max-width:420px 永远不成立——那条规则从来没生效过。 */
+@container (max-width: 420px) {
   .ld-kv { grid-template-columns: minmax(0, 1fr); gap: 0; }
   .ld-kv dd { margin-bottom: 5px; }
 }
+/* 宽面板下长键（context7CompatibleLibraryID 这种）照样霸占一整条轨道，容器查询够不着。 */
+.ld-kv dt { overflow-wrap: anywhere; }
 /* 卡片里的原文块。裸 <pre> 会把整个右栏横向撑开。 */
-.tc-pre {
+/* 必须带 .atc-viewport 前缀：裸 .tc-pre 是 (0,1,0)，打不过下面的 .atc-viewport pre
+   (0,1,1)，等宽字体、底纹、外边距、行高会被逐条盖掉——摘录读起来就像卡片自己的散文。 */
+.atc-viewport pre.tc-pre {
   margin: 8px 0 0; padding: 8px 10px;
   max-height: 260px; overflow: auto;
   border-radius: 8px; background: rgba(128,128,128,.07);
@@ -4440,7 +4446,9 @@ body.zen-mode .editor {
 /* 名字是这张卡最重要的东西，却是唯一可收缩的元素（徽章全是 flex:none），
    于是窄一点就被截成「cont…」。让徽章换行、名字守住一个最小宽度。 */
 .mcpfp-card__name { display: flex; align-items: center; gap: 7px; min-width: 0; flex-wrap: wrap; row-gap: 4px; }
-.mcpfp-card__name strong { flex: 1 1 auto; min-width: 8em; }
+/* 只要下限，不要 grow：同一行的徽章全是 flex:none，给 strong 加 grow 会让它吃掉整行
+   剩余空间，把徽章和状态全推到行尾，中间留一大片空白（七种卡片都受影响）。 */
+.mcpfp-card__name strong { min-width: 8em; }
 .mcpfp-card__name strong { font-size: 12.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .mcpfp-badge { flex: none; font-size: 9.5px; font-weight: 650; padding: 1px 6px; border-radius: 999px; color: var(--accent); background: color-mix(in srgb, var(--accent) 11%, transparent); text-transform: uppercase; }
 .mcpfp-badge--count { color: #188038; background: color-mix(in srgb, #34a853 12%, transparent); text-transform: none; }
@@ -5949,7 +5957,9 @@ img.settings-dropdown__avatar--filled { object-fit: cover; }
 .agent-tool-step--skill .atc-type-icon { background: #ede7f6; color: #5e35b1; }
 /* MCP 用服务自己的真实头像（复用市场卡那套 .mcpfp-icon）。图标位是 27px，而 .mcpfp-icon
    本身按 38px 写的，这里缩到位并去掉底色——头像自己就是底色，再叠一层会出现一圈边。 */
-.agent-tool-step--mcp .atc-type-icon--avatar { background: none; padding: 0; }
+/* 只留 padding：background 挪到文件末尾的 (0,3,0) 规则，否则同分时被七行之下的
+   .agent-tool-step--mcp .atc-type-icon 按源序盖回去，头像底下透出一圈底色。 */
+.agent-tool-step--mcp .atc-type-icon--avatar { padding: 0; }
 .agent-tool-step--mcp .atc-type-icon--avatar .mcpfp-icon {
   width: 27px; height: 27px; border-radius: 8px;
 }
@@ -6127,7 +6137,9 @@ img.settings-dropdown__avatar--filled { object-fit: cover; }
   animation: atcViewportOpen .2s ease both;
 }
 
-.ld-card {
+/* 容器查询的锚点。锚 .ld-card 而不是 .atc-viewport：后者带 display:none + 展开动画，
+   在那儿加 containment 会波及每一张工具卡的开合。 */
+.ld-card { container-type: inline-size;
   padding: 12px 14px;
   display: flex;
   flex-direction: column;
@@ -14464,3 +14476,8 @@ body.tree-selecting, body.tree-selecting * { user-select: none !important; -webk
    condition in the tooltip. Dimming instead of hiding — the user asked to see all tiers. */
 .model-info-card .mic-ctx-btn--locked { opacity: .42; cursor: not-allowed; }
 .model-info-card .mic-ctx-btn--locked:hover { transform: none; box-shadow: none; }
+
+/* MCP 头像：明暗两套底板都要让开。写成 (0,3,0) 且放在文件末尾，才能同时压过
+   浅色的 .agent-tool-step--mcp .atc-type-icon 和深色的 [data-theme="dark"] 版本
+   ——头像自己就是底色，底下再垫一层会从 .mcpfp-icon 的半透明边框里透出来。 */
+.agent-tool-step--mcp .atc-type-icon.atc-type-icon--avatar { background: none; }
