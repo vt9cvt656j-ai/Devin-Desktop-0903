@@ -252,3 +252,26 @@ test("预测不能卡住收尾——只后台跑，不 await", () => {
   assert.ok(!/await _predictNextAsk\(/.test(SRC),
     "await 了这次预测，模型慢一点整轮收尾就跟着卡");
 });
+
+test("没有预测时，要把「为什么没有」留下来——否则那句承诺是空的", () => {
+  // _askPredictReject 记着读对话那一档被拒的具体原因（too_long / assistant_voice /
+  // meta_text / already_sent …），但在接上读者之前**没有任何地方读它**：
+  // 代码里那句「为什么这儿没有预测要答得出来」是句空话。
+  const fn = grab("_renderComposerGhost");
+  assert.match(fn, /sess\._askPredictReject/, "拒绝原因仍然没有读者");
+  assert.match(fn, /本轮没有给出预测：/, "没有把原因呈现出来");
+  // 有预测时要把上一次的原因清掉，否则 tooltip 会一直挂着一条过期的解释。
+  assert.match(fn, /promptEl\.removeAttribute\("title"\)/, "有预测时没有清掉旧的解释");
+});
+
+test("默认底色是明写的，不是粘在别的规则行尾的碎片", () => {
+  // 49 个工具类型里有 24 个没有专属配色，一直靠这两行上色；它原来粘在
+  // --game_asset 那条规则的行尾，读起来像笔误，删掉那 24 个图标会变透明。
+  // 先剥 CSS 注释：解释这条改动的注释里原样引用了 `{ … }`，不剥的话
+  // 下面 [^}]* 会在注释里的那个花括号处断掉（这个仓库同一个坑踩过三次）。
+  const APP_CSS = fs.readFileSync("src/styles/app.css", "utf8").replace(/\/\*[\s\S]*?\*\//g, "");
+  assert.doesNotMatch(APP_CSS, /\.agent-tool-step--game_asset \.atc-type-icon \{[^}]*\}\s*\.atc-type-icon \{/,
+    "无作用域的默认底色还粘在 --game_asset 行尾");
+  assert.match(APP_CSS, /\.atc-type-icon \{[^}]*background: #ede7f6; color: #4527a0;[^}]*\}/s,
+    "默认底色丢了——没有专属配色的 24 个工具图标会变成透明方块");
+});
