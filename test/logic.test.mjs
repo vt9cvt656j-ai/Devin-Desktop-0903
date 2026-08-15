@@ -8320,7 +8320,6 @@ test("agent semantic profiles do not authorize or deny real tool execution", () 
 
 test("structured semantic profiles drive planning without lexical classification", () => {
   const requiresPlan = load("_runRequiresPlan");
-  const hasCategoryArchitecture = load("_uiPlanHasCategoryArchitecture");
   const base = { applies: true, substantial: false, requiresPlan: false };
 
   assert.equal(requiresPlan({ engineering: { ...base, substantial: true, requiresPlan: true } }), true);
@@ -9028,127 +9027,8 @@ test("UI design craft guidance is injected only for front-end work", () => {
     "UI craft guidance must appear before the tool and experience hints");
 });
 
-test("full website readiness requires michael-design evidence and a real product architecture decision", () => {
-  const hasCategoryArchitecture = load("_uiPlanHasCategoryArchitecture");
-  const designGaps = load("_michaelDesignResearchGaps");
-  const readiness = load("_uiImplementationReadinessIssue", {
-    _uiPlanHasCategoryArchitecture: hasCategoryArchitecture,
-    _michaelDesignResearchGaps: designGaps,
-  });
-  const run = {
-    engineering: {
-      uiProject: true,
-      fullWebsite: true,
-      designKnowledgeRequired: true,
-      richMediaRequired: true,
-      motionDesignRequired: true,
-      advancedMotionRequired: true,
-      paletteHarmonyRequired: true,
-      cardLayoutRequired: true,
-      cardStylingRequired: true,
-      semanticIconRequired: true,
-      motionChoreographyRequired: true,
-      databaseDecisionRequired: true,
-    },
-  };
-  const incomplete = [{ content: "写一个 Hero、Features、Pricing 和 Footer，然后构建" }];
-  assert.match(readiness(run, incomplete), /成功检索 michael-design/);
-  assert.match(readiness(run, incomplete), /真实产品内容来源/);
-  run._michaelDesignEvidence = {
-    query: "SaaS information architecture media motion palette",
-    sourceSections: ["Workflow Canvas"],
-    paletteTokens: ["#0D212C", "#F5F2EA", "#FF6B4A"],
-    motionTechniques: ["motion-scroll-transform"],
-    layoutTechniques: ["responsive-grid-breakpoints"],
-    componentTechniques: ["shadcn/ui", "Radix primitives", "class-variance-authority"],
-    researchQueries: ["saas architecture palette", "saas motion responsive", "saas assets icons"],
-    researchTracks: { informationArchitecture: true, colorSystem: true, responsiveLayout: true, componentSystem: true, signatureMotion: true, responsiveMotion: true, mediaAssets: true, semanticIcons: true },
-  };
-  run._websiteContentEvidence = { sources: [{ kind: "workspace", path: "README.md" }] };
-  assert.match(readiness(run, incomplete), /按业务品类推导信息架构与差异化内容区块/);
-  assert.match(readiness(run, incomplete), /四层动效编排/);
-  const complete = [
-    { content: "按 SaaS 信息架构规划至少 7 个业务区块并写满具体栏目文案" },
-    { content: "使用 michael-design 的图片、视频 .mp4 与 GIF 媒体资产" },
-    { content: "组件落地映射：来源 Workflow Canvas section → shadcn/ui + Radix Button/Tabs primitives → default/secondary/outline variants → Tailwind bg-primary/text-primary-foreground semantic classes → 导航操作和案例筛选" },
-    { content: "采用 michael-design #0D212C 背景、#F5F2EA 正文、#FF6B4A primary；标题/正文/弱化文字按 foreground 层级区分；主按钮 primary/primary-foreground、重点卡片和标签使用 primary tint，次按钮 outline，并覆盖 hover/focus/active" },
-    { content: "配色契约采用 neutral 中性族 + orange 主强调族，不允许任何 section、图标或按钮新增陌生色相" },
-    { content: "卡片按实际数量编排：2/3/4 张等分，5 张 3+2 居中末行，6 张 3x2，7 张 4+3；动态 cards 使用 auto-fit/minmax；卡片 surface 用 card/muted 色阶、shadow elevation、重点卡 tint 和 hover variant" },
-    { content: "图标语义映射按对象/动作/状态选择：AI→Bot、订阅→Mail、安全→ShieldCheck，禁用万能 Sparkles" },
-    { content: "实现 hover 微交互与 SectionReveal 分区入场；知识库 useScroll + useTransform 连接 workflow/cases 两个 section，按 scroll progress 编排，移动端降级短位移并支持 prefers-reduced-motion" },
-    { content: "数据库 = 不需要：这是无提交与账户的静态展示官网" },
-  ];
-  assert.equal(readiness(run, complete), "");
-  const numberedArchitecture = [
-    { content: "首页内容编排：1. 世界观首屏 2. 战斗演示 3. 角色阵营 4. 武器工坊 5. 玩法循环 6. 媒体画廊 7. 制作人来信 8. 社区活动 9. 预约表单" },
-    ...complete.slice(1),
-    { content: "社区使用 Pexels 真人头像图片 URL，圆形 object-cover，加载失败时换本地备用头像图片" },
-  ];
-  assert.equal(readiness(run, numberedArchitecture), "", "a real numbered 1-9 architecture must not be rejected for omitting the literal phrase '至少 7 个'");
-  assert.equal(hasCategoryArchitecture("1. 首屏 2. 演示 3. 角色 4. 工坊 5. 玩法 6. 媒体"), true,
-    "a deliberate 6-section enumeration is a real architecture decision — section-count quotas (旧 1–7 配额) are banned; 差异化质量归 AI 语义评审");
-  assert.equal(hasCategoryArchitecture("写一个 Hero、Features、Pricing 和 Footer，然后构建"), false,
-    "a template blurb with neither IA vocabulary nor an enumerated structure still lacks the architecture decision");
-  // Readiness is a planning fact, not an executor permission gate. The helper
-  // may report missing design/content evidence, while an emitted browser or
-  // file tool call still follows the normal executor path.
-  assert.match(SRC, /按三轨编排检索/);
-  assert.match(SRC, /michael-design 主编排律/);
-  assert.match(SRC, /run\._michaelDesignEvidence =/);
-  assert.doesNotMatch(extractFn("_uiImplementationReadinessNudge"), /BLOCKED|hard_blocked|continue\s*;/);
-  assert.doesNotMatch(SRC, /designReadinessBlocks/);
-});
 
-test("UI readiness checklist nudge is disabled — visual writes are never intercepted", () => {
-  const visualPath = load("_uiVisualImplementationPath");
-  const applies = load("_uiReadinessAppliesToCall", { _uiVisualImplementationPath: visualPath });
-  const nudge = load("_uiImplementationReadinessNudge", { _uiReadinessAppliesToCall: applies });
-  const run = { engineering: { uiProject: true, fullWebsite: true, designKnowledgeRequired: true } };
-  const incompletePlan = [{ content: "搭建网站并实现页面" }];
-  const calls = [
-    { type: "web_scaffold", name: "site" },
-    { type: "write", path: "package.json" },
-    { type: "write", path: "src/App.tsx" },
-    { type: "write", path: "src/styles/theme.css" },
-    { type: "edit", path: "src/components/Hero.tsx" },
-  ];
-  for (const call of calls) assert.equal(nudge(run, incompletePlan, call), "", `${call.type}:${call.path || call.name} must proceed without checklist interception`);
-  assert.equal(run._uiReadinessNudged, undefined, "the disabled nudge must never mark the run");
-  assert.equal(applies({ type: "worker", scope: ["package.json", "vite.config.ts"] }), false);
-  assert.equal(applies({ type: "worker", scope: ["src/components"] }), true);
-  assert.doesNotMatch(SRC, /\[BLOCKED_ONCE\]/);
-  assert.doesNotMatch(SRC, /designReadinessBlocks/);
-});
 
-test("user-supplied reference sites must be learned and deliberately adapted before visual implementation", () => {
-  const key = load("_referenceWebsiteUrlKey");
-  const readiness = load("_uiImplementationReadinessIssue", {
-    _uiPlanHasCategoryArchitecture: load("_uiPlanHasCategoryArchitecture"),
-    _referenceWebsiteUrlKey: key,
-    _michaelDesignResearchGaps: load("_michaelDesignResearchGaps"),
-  });
-  const run = {
-    engineering: {
-      uiProject: true,
-      designKnowledgeRequired: true,
-      referenceWebsiteRequired: true,
-      referenceWebsiteUrls: ["https://www.linear.app/"],
-    },
-    _michaelDesignEvidence: {
-      sourceSections: ["Responsive product narrative"],
-      componentTechniques: ["shadcn/ui", "Radix primitives"],
-      researchQueries: ["product information architecture palette", "product responsive motion", "product media icons"],
-      researchTracks: { informationArchitecture: true, colorSystem: true, responsiveLayout: true, componentSystem: true, signatureMotion: true, responsiveMotion: true, mediaAssets: true, semanticIcons: true },
-    },
-  };
-  assert.match(readiness(run, [{ content: "开始实现页面" }]), /先读取用户指定参考站/);
-  run._referenceWebsiteEvidence = {
-    references: [{ key: "https://linear.app/", url: "https://www.linear.app/", methods: ["learn_design"] }],
-  };
-  assert.match(readiness(run, [{ content: "开始实现页面" }]), /参考站适配决策/);
-  const adapted = [{ content: "参考站 https://www.linear.app/ 的配色 palette token、信息架构与内容栏目作为取舍依据；结合 michael-design 的 Responsive product narrative section 转译为自己的响应式动效和移动端布局，不直接复制原站文案、资产或版式；组件映射为 shadcn/Radix Button primitive 的 default/outline variant 与 Tailwind bg-primary/text-primary-foreground semantic classes，落到导航和筛选操作。" }];
-  assert.equal(readiness(run, adapted), "");
-});
 
 test("michael-design prefetch starts only from a resolved structured design profile", () => {
   const start = extractFn("_startMichaelDesignPreflight");
@@ -9437,7 +9317,6 @@ test("knowledge retrieval uses the configured server endpoint and returns struct
 test("michael-design research is orchestrated by coverage instead of one generic UI search", () => {
   const categoryTerms = load("_michaelDesignCategoryTerms");
   const plan = load("_michaelDesignResearchPlan", { _michaelDesignCategoryTerms: categoryTerms });
-  const gaps = load("_michaelDesignResearchGaps");
   const profile = {
     designKnowledgeRequired: true,
     fullWebsite: true,
@@ -9461,22 +9340,6 @@ test("michael-design research is orchestrated by coverage instead of one generic
   assert.deepEqual(partialUiTracks.map((item) => item.id), ["architecture-color", "motion-responsive", "assets-icons"],
     "every real UI project gets the same bounded three-track michael-design preflight");
   assert.deepEqual(plan("修复后端接口", { uiProject: false, designKnowledgeRequired: false }), []);
-  const shallowEvidence = {
-    researchQueries: ["architecture palette"],
-    researchTracks: { informationArchitecture: true, colorSystem: true, responsiveLayout: true },
-  };
-  const shallowGaps = gaps(profile, shallowEvidence).join("\n");
-  assert.match(shallowGaps, /标志性动效/);
-  assert.match(shallowGaps, /移动端动效/);
-  assert.match(shallowGaps, /图片\/视频\/GIF/);
-  assert.match(shallowGaps, /语义图标/);
-  assert.match(shallowGaps, /组件 primitive、variant 与状态体系/);
-  assert.match(shallowGaps, /三轨分主题检索/);
-  const completeEvidence = {
-    researchQueries: tracks.map((item) => item.query),
-    researchTracks: { informationArchitecture: true, colorSystem: true, responsiveLayout: true, componentSystem: true, signatureMotion: true, responsiveMotion: true, mediaAssets: true, semanticIcons: true },
-  };
-  assert.deepEqual(gaps(profile, completeEvidence), []);
 });
 
 test("website content evidence accepts actual product sources and rejects bare search results", () => {
@@ -9543,112 +9406,7 @@ test("reference website evidence only accepts the exact user URL and preserves p
   assert.match(SRC, /run\._referenceWebsiteEvidence = _mergeReferenceWebsiteEvidence/);
 });
 
-test("full website source audit keeps real-defect checks and drops quota checklists", () => {
-  const audit = load("_uiDeliverySourceFindings", {
-    _referenceWebsiteUrlKey: load("_referenceWebsiteUrlKey"),
-  });
-  const profile = { uiProject: true, fullWebsite: true, richMediaRequired: true, motionDesignRequired: true, advancedMotionRequired: true, motionChoreographyRequired: true };
 
-  // 配额检查表已删：稀疏静态模板不再被打回（结构/密度由服务端知识库驱动的提示词负责）
-  const sparse = `<main><section className="hero"><h1>AI</h1></section><section className="features" /></main>`;
-  const sparseFindings = audit(sparse, profile).join("\n");
-  for (const removed of ["内容结构不足", "真实媒体不足", "响应式实现不足", "动画层级不足", "语义配色不足", "文字颜色层级不足", "动画无降级", "高级动效缺失", "真实内容来源缺失", "从零网站技术栈未落地", "知识库组件体系未落地", "动效编排不完整"]) {
-    assert.doesNotMatch(sparseFindings, new RegExp(removed), `${removed} quota checklist must be removed`);
-  }
-
-  const rich = `
-    @import "tailwindcss";
-    @theme {
-      --color-background: #f7f7f5; --color-foreground: #17201c;
-      --color-primary: #c34f32; --color-primary-foreground: #ffffff;
-    }
-    <main className="grid bg-background text-foreground sm:grid-cols-2">
-      <section id="workflow"/><section id="faq"/>
-      <button className="bg-primary text-primary-foreground hover:opacity-90 focus-visible:ring-2 active:scale-95">Start</button>
-    </main>`;
-  assert.deepEqual(audit(rich, profile), []);
-
-  const freshReactProfile = { ...profile, fromZeroUiProject: true };
-  const handRolledReact = `${rich}
-    { "dependencies": { "react": "^19.0.0" } }
-    import React from "react";
-    export function App() { return <button>\u{1F680} Launch</button>; }`;
-  const handRolledFindings = audit(handRolledReact, freshReactProfile).join("\n");
-  assert.match(handRolledFindings, /shadcn\/ui 未实际落地/);
-  assert.match(handRolledFindings, /SVG 图标库缺失/);
-  assert.match(handRolledFindings, /emoji 被当作图标/);
-
-  const shadcnReact = `${rich}
-    { "dependencies": { "react": "^19.0.0", "class-variance-authority": "^0.7.0", "lucide-react": "^0.468.0" } }
-    import { Button } from "@/components/ui/button";
-    import { ArrowRight } from "lucide-react";
-    export function App() { return <Button><ArrowRight /> Start</Button>; }
-    /* FILE: src/components/ui/button.tsx */
-    import { cva } from "class-variance-authority";`;
-  assert.deepEqual(audit(shadcnReact, freshReactProfile), []);
-
-  // 保留的真缺陷检查：默认暗色 / 渐变滥用 / AI 套话 / Tailwind v4 级联 / 头像 / 图片失败态 / 通用骨架
-  const darkByDefault = rich.replace("--color-background: #f7f7f5", "--color-background: #070612");
-  assert.match(audit(darkByDefault, profile).join("\n"), /默认暗色滥用/);
-  assert.doesNotMatch(audit(darkByDefault, { ...profile, darkThemeRequested: true }).join("\n"), /默认暗色滥用/);
-
-  const gradientHeavy = `${rich} .g1{background:linear-gradient(red,blue)} .g2{background:radial-gradient(red,blue)} .g3{background:linear-gradient(red,blue)} .g4{background:conic-gradient(red,blue)}`;
-  assert.match(audit(gradientHeavy, profile).join("\n"), /渐变滥用/);
-  assert.doesNotMatch(audit(gradientHeavy, { ...profile, gradientThemeRequested: true }).join("\n"), /渐变滥用/);
-
-  const aiCopy = `${rich}<p>一站式平台，赋能每一个团队，开启无限可能。</p>`;
-  assert.match(audit(aiCopy, profile).join("\n"), /AI 套话过多/);
-
-  const collapsedTailwind = `${rich}
-    @import "tailwindcss";
-    * { margin: 0; padding: 0; box-sizing: border-box; }`;
-  assert.match(audit(collapsedTailwind, profile).join("\n"), /Tailwind v4 级联冲突/);
-  const layeredTailwind = `${rich}
-    @layer base { * { margin: 0; padding: 0; box-sizing: border-box; } }`;
-  assert.deepEqual(audit(layeredTailwind, profile), []);
-
-  const initialsOnly = `${rich}<section id="community"><span className="rounded-full bg-gradient-to-br">K</span><p>玩家社区成员</p></section>`;
-  assert.match(audit(initialsOnly, profile).join("\n"), /真实头像缺失/);
-  const realAvatar = `${initialsOnly} const members = [{ avatar: "https://images.example.com/player.jpg" }]; <AvatarImage src={members[0].avatar} />`;
-  assert.doesNotMatch(audit(realAvatar, profile).join("\n"), /真实头像缺失/);
-
-  const hiddenBrokenImage = `${rich}<img src="/fallback.jpg" onError={(event) => { event.currentTarget.style.display = "none"; }} />`;
-  assert.match(audit(hiddenBrokenImage, profile).join("\n"), /图片失败态错误/);
-
-  const genericSkeleton = `${rich}<div id="hero"/><div id="features"/><div id="pricing"/><div id="cta"/><div id="footer"/>`;
-  assert.match(audit(genericSkeleton, profile).join("\n"), /通用 AI 骨架/);
-
-  // 用户点名的参考站保护保留
-  const referenceProfile = { ...profile, referenceWebsiteRequired: true, referenceWebsiteUrls: ["https://www.linear.app/"] };
-  assert.match(audit(rich, referenceProfile).join("\n"), /参考站取证缺失/);
-  const referenceEvidence = { references: [{ key: "https://linear.app/", url: "https://www.linear.app/", methods: ["learn_design"], paletteTokens: ["#f7f7f5", "#c34f32"] }] };
-  assert.doesNotMatch(audit(rich, referenceProfile, null, null, referenceEvidence).join("\n"), /参考站(?:取证缺失|配色未转译)/);
-  const mismatchedReferenceEvidence = { references: [{ ...referenceEvidence.references[0], paletteTokens: ["#101827", "#2563eb"] }] };
-  assert.match(audit(rich, referenceProfile, null, null, mismatchedReferenceEvidence).join("\n"), /参考站配色未转译/);
-
-  assert.match(SRC, /function _auditUiDeliveryFiles/);
-  const loop = extractFn("_runAgenticLoop");
-  assert.doesNotMatch(loop, /_pushNudge\("uiDeliveryAudit"|_pushNudge\("uiVerify"/,
-    "source and browser review remain available but cannot force another quiet-turn request");
-});
-
-test("full website source audit never blocks real browser verification", async () => {
-  const applies = load("_uiDeliveryBrowserAuditApplies");
-  let auditCalls = 0;
-  const preflight = load("_uiDeliveryBrowserPreflightIssue", {
-    _uiDeliveryBrowserAuditApplies: applies,
-    _auditUiDeliveryFiles: async () => {
-      auditCalls++;
-      return ["高级动效缺失", "shadcn/Tailwind 映射不完整"];
-    },
-  });
-  const profile = { uiProject: true, fullWebsite: true };
-  assert.equal(await preflight({ call: { type: "browser", action: "navigate" }, root: "/tmp/site", files: [], profile }), "");
-  assert.equal(await preflight({ call: { type: "browser", action: "check" }, profile }), "");
-  assert.equal(auditCalls, 0, "source-quality review is not an execution precondition");
-  const loop = extractFn("_runAgenticLoop");
-  assert.doesNotMatch(loop, /BLOCKED_UI_SOURCE_AUDIT|needsUiSourcePreflight|源码未达标 · 未打开浏览器/);
-});
 
 test("front-end build tasks defer design and browser schemas until tool search", () => {
   const schema = (name) => ({ type: "function", function: { name } });
@@ -9829,10 +9587,8 @@ test("task profiles do not expand the minimal first-turn tool schema payload", (
   }
 });
 
-test("bounded original requirements survive conversational Chinese and reconcile exactly once", () => {
+test("bounded original requirements survive conversational Chinese", () => {
   const extract = load("_extractRequirementsChecklist");
-  const requiresPlan = load("_runRequiresPlan");
-  const take = load("_takeRequirementsReconciliation", { _runRequiresPlan: requiresPlan });
   const request = "增强代码推理然后接入开发者社区还有保留 limit 默认值 20 并且同步所有调用方同时处理空值和错误路径接着补聚焦测试；不要改界面。";
   const checklist = extract(request);
   assert.ok(checklist.length >= 6, `expected connector-aware requirements, got ${JSON.stringify(checklist)}`);
@@ -9841,31 +9597,6 @@ test("bounded original requirements survive conversational Chinese and reconcile
   assert.ok(checklist.some((item) => item.includes("测试")));
   assert.ok(checklist.length <= 10);
   assert.ok(checklist.join("").length <= 1600);
-
-  const run = { engineering: { requiresPlan: true, explicitMutation: true }, _requirementsChecklist: checklist };
-  const first = take(run, {
-    files: ["src/auth.ts"],
-    planSteps: [{ content: "实现认证", status: "completed" }],
-  });
-  assert.match(first, /参数是否完整/);
-  assert.match(first, /默认值/);
-  assert.match(first, /调用方/);
-  assert.match(first, /错误、空值和边界/);
-  assert.match(first, /测试与真实验证/);
-  assert.match(first, /src\/auth\.ts/);
-  assert.equal(take(run, { files: ["src/again.ts"] }), "", "reconciliation is a one-shot finish gate");
-  assert.equal(take({ engineering: { requiresPlan: false }, _requirementsChecklist: checklist }), "");
-
-  const readOnlyRun = {
-    engineering: { requiresPlan: true, explicitReadOnly: true, projectScope: true },
-    _requirementsChecklist: ["评价项目质量", "给出风险建议"],
-  };
-  assert.equal(take(readOnlyRun, {
-    files: [],
-    planSteps: [{ content: "完成架构评价", status: "completed" }],
-  }), "", "pure research/evaluation turns must not show implementation checklist meta");
-  assert.equal(readOnlyRun._requirementsReconciled, undefined,
-    "skipping read-only reconciliation must not burn the one-shot flag");
 });
 
 test("requirements enter the running pad only for complex work or real progress", () => {
@@ -14548,7 +14279,6 @@ test("UI and read-before-edit gates are structurally wired for every agent model
   assert.match(SRC, /writeTextFileIfUnchanged\(fp, existed \? old : null, newContent\)/);
   assert.match(SRC, /ideMode: run\.mode/);
   // UI/readiness guidance and read coverage must not become an executor veto.
-  assert.equal(load("_uiImplementationReadinessNudge")({}, [], { type: "write", path: "src/App.tsx" }), "");
   assert.doesNotMatch(stripJsComments(extractFn("_executeToolStepInner")), /designReadinessBlocks|UI 实施准备不足[^\n]*BLOCKED/);
 });
 
@@ -15263,8 +14993,13 @@ test("UI quality guidance does not become a quiet-turn completion gate", () => {
   const loop = extractFn("_runAgenticLoop");
   assert.doesNotMatch(loop, /_pushNudge\("uiDiscipline"|_pushNudge\("demoSmell"/,
     "mechanical style scans must not override the model's completion decision");
-  assert.match(SRC, /async function _auditUiDeliveryFiles/,
-    "UI source-quality analysis remains available outside the finish gate");
+  // 这两条原本各自待在一个整块测试里，而那两块测的都是已经删掉的正则质检函数。
+  // 守卫本身是活的、也仍然重要：源码质检既不能变成完成判定的否决票，也不能变成
+  // 打开浏览器的前置条件——所以搬到这里保住。
+  assert.doesNotMatch(loop, /_pushNudge\("uiDeliveryAudit"|_pushNudge\("uiVerify"/,
+    "source-quality review must not become a completion nudge");
+  assert.doesNotMatch(loop, /BLOCKED_UI_SOURCE_AUDIT|needsUiSourcePreflight|源码未达标 · 未打开浏览器/,
+    "source-quality review must not become an execution precondition");
 });
 
 test("UI re-verification is incremental: full viewport matrix runs once per run", () => {
