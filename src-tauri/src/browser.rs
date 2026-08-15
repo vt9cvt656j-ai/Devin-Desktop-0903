@@ -1602,6 +1602,43 @@ pub async fn browser_close() -> Result<(), String> {
 }
 
 /// Synchronous close — called from cleanup_stale on webview reload / app exit.
+/// 退出 App 时**同步**收掉浏览器。
+///
+/// `close_all` 把 drop 丢进后台线程，为的是不让 Chrome 的进程树拖住 Tauri 的事件线程——
+/// 那对 cleanup_stale（重载）是对的。退出时不行：进程马上就没了，那个后台线程根本来不及跑，
+/// Chrome 于是成了孤儿留在机器上。终端、LSP、调试适配器、代理、MCP、自动化服务在退出那条
+/// 分支里全都收了，唯独浏览器没有——而它是这堆里最重的一个。
+///
+/// 所以在当前线程上 drop，并给操作锁一个上限：一次卡住的 CDP 调用不该把「退出」变成
+/// 退不出去。等不到就照样 drop——留一个跑着的 Chrome，比让用户按了退出没反应要好。
+pub fn close_all_blocking(wait: std::time::Duration) {
+    let Some(session) = take_browser_session() else {
+        return;
+    };
+    let deadline = std::time::Instant::now() + wait;
+    loop {
+        match BROWSER_OPERATION.try_lock() {
+            // 拿到锁：在锁的保护下 drop，让在途的 CDP 调用先收尾。
+            Ok(_operation) => {
+                drop(session);
+                return;
+            }
+            // 锁中毒说明持有者 panic 过，等下去没有意义。
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                drop(session);
+                return;
+            }
+            Err(std::sync::TryLockError::WouldBlock) => {
+                if std::time::Instant::now() >= deadline {
+                    drop(session);
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        }
+    }
+}
+
 pub fn close_all() {
     let session = take_browser_session();
     if let Some(session) = session {

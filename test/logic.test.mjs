@@ -16481,10 +16481,19 @@ test("model-authored markup and third-party text stay untrusted", () => {
   // ③ capture_replay 的 url 是模型可控的：把 A 站抓到的请求"重放"到攻击者域名，就是
   //    一次完整的凭据外发，看起来还只是个正常调试动作。
   assert.match(SRC, /const _replayCreds = \["cookie", "authorization"/);
-  assert.match(SRC, /if \(srcHost && dstHost && dstHost !== srcHost\)/,
+  assert.match(SRC, /_crossOrigin = !!\(srcHost && dstHost && dstHost !== srcHost\);/,
     "只在跨域时剥离——同域重放正是这个工具的用途");
   assert.match(SRC, /!\(call\.headers && k in call\.headers\)/,
     "模型显式给出的头不剥，跨站调试仍然可用");
+  // ③′ 头剥干净了，**请求体一样是凭据**：登录 POST 里的用户名密码、OAuth 换 token 的
+  //    client_secret、JSON 里塞的 API key，全在 body 里。上一版只管了头。
+  assert.match(SRC, /if \(_crossOrigin && call\.body == null && body != null && String\(body\) !== ""\) \{/,
+    "跨域重放仍会把抓到的请求体原样送到别人的域名");
+  assert.match(SRC, /_droppedBody = true;/);
+  // 模型自己给的 body 照发——那是它明确的意图，不是从别处捡来的凭据。
+  assert.match(SRC, /call\.body != null \? String\(call\.body\)/);
+  // 剥了就得说，否则模型只会看到一个莫名其妙的 400 然后原地重试。
+  assert.match(SRC, /_droppedBody \? "抓到的请求体/);
 });
 
 test("michael-compression 的档位与前缀在客户端两端都真的接上了", () => {
@@ -22950,4 +22959,26 @@ test("最直接被攻击者控制的那几条通道都在标记名单里", () =>
   for (const t of ["write", "edit", "delete", "mkdir", "think", "plan", "memory"]) {
     assert.equal(isExternal(t), false, `${t} 不该带外部数据标记`);
   }
+});
+
+test("退出 App 时浏览器也要收——这张单子上原来只差它一个", () => {
+  const lib = readFileSync(new URL("../src-tauri/src/lib.rs", import.meta.url), "utf8");
+  const exitBranch = lib.slice(lib.indexOf("RunEvent::ExitRequested"));
+  const end = exitBranch.indexOf("\n            }");
+  const branch = exitBranch.slice(0, end);
+  // 终端 / LSP / 调试适配器 / 代理 / MCP / 自动化服务都在这条分支里收，唯独浏览器不在，
+  // 于是退出 App 之后无头 Chrome 的整棵进程树还活着——而它是这堆里最重的一个。
+  for (const call of ["reset_all()", "stop_all()", "proxy::stop_all", "automation::stop()"]) {
+    assert.ok(branch.includes(call), `退出分支少了 ${call}`);
+  }
+  assert.match(branch, /browser::close_all_blocking\(/, "退出时不收浏览器");
+  // 必须是 blocking 版：close_all 把 drop 丢进后台线程，而这时候进程马上就没了，
+  // 那个线程根本来不及跑，Chrome 照样成孤儿。
+  assert.doesNotMatch(branch, /browser::close_all\(\)/, "用了非阻塞版，等于没收");
+
+  const browser = readFileSync(new URL("../src-tauri/src/browser.rs", import.meta.url), "utf8");
+  assert.match(browser, /pub fn close_all_blocking\(wait: std::time::Duration\)/);
+  // 一次卡住的 CDP 调用不该把「退出」变成退不出去：锁要有上限，等不到也照样 drop。
+  assert.match(browser, /TryLockError::WouldBlock/);
+  assert.match(browser, /if std::time::Instant::now\(\) >= deadline/);
 });
