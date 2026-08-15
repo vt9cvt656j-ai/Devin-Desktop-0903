@@ -1796,7 +1796,19 @@ async fn pending_auth_at(key: SessionKey) -> Result<bool, String> {
         let Some(slot) = find_session_slot(&key)? else {
             return Ok(false);
         };
-        let active = slot.lock().map_err(|_| "MCP session state poisoned")?;
+        // try_lock，不是 lock。这把锁在握手（远端预算 180 秒）和工具调用（600 秒）全程
+        // 被握着，而前端渲染"已配置服务"列表之前会对每个服务 await 一次这个查询——
+        // 用阻塞锁的话，用户配好远程服务点了连接、再打开 MCP 面板想看看卡在哪，
+        // 列表最长 180 秒根本不渲染，正好卡在它要报告的那段时间里。
+        //
+        // 拿不到锁 = 有请求在飞，而 awaiting_auth 只在超时分支赋值、且要等 drop(active)
+        // 之后才对外可见；status_at / on_session 又都对这种会话短路。所以"长时间持锁"
+        // 与"awaiting_auth == true"不可能同时成立：拿不到锁就是 false。
+        let active = match slot.try_lock() {
+            Ok(guard) => guard,
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(false),
+            Err(std::sync::TryLockError::Poisoned(_)) => return Err("MCP session state poisoned".to_string()),
+        };
         Ok(active.as_ref().is_some_and(|session| session.awaiting_auth))
     })
     .await

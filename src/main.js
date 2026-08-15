@@ -9108,7 +9108,9 @@ const FOLDER_ICON = {
 
 /** Map a filename to a bundled Material file-icon URL. */
 function fileIconUrl(name) {
-  const lower = name.toLowerCase();
+  // String(name || "")：一次没传名字的 openFile 不该让 renderTabs 在剩下的
+  // 整个会话里全抛——标签栏是全局的，单点故障代价太大。
+  const lower = String(name || "").toLowerCase();
   if (lower in NAME_ICON) return iconUrl(NAME_ICON[lower]);
   if (lower.endsWith(".lock")) return iconUrl("lock");
   const ext = lower.includes(".") ? lower.split(".").pop() : "";
@@ -9118,7 +9120,7 @@ function fileIconUrl(name) {
 
 /** Map a folder name + open state to a bundled Material folder-icon URL. */
 function folderIconUrl(name, open) {
-  const base = FOLDER_ICON[name.toLowerCase()] || "folder";
+  const base = FOLDER_ICON[String(name || "").toLowerCase()] || "folder";
   return (
     iconUrl(open ? base + "-open" : base) ||
     iconUrl(open ? "folder-open" : "folder")
@@ -23096,6 +23098,9 @@ const _INCOMPLETE_LABELS = {
   subagent_results_pending: "收拢子任务结果",
   ui_verification_missing: "在界面上验一遍",
   iteration_limit: "接着上次的进度继续",
+  // 用户按停也是一种"没做完"。少了这一行，建议行会退回泛泛的「继续完成剩余部分」，
+  // send 串里还会写成「因 user_stopped 未完成」——把内部枚举名甩给用户看。
+  user_stopped: "接着上次的进度继续",
 };
 
 function _runStateNextActionSuggestions(sess, { maxAgeMs = 5 * 60_000 } = {}) {
@@ -23169,6 +23174,21 @@ async function _maybeSuggestNext(sess, messages, config) {
     // 而且它和下面的卡片行读的是同一份运行状态——两个界面永远不会各说各话。
     // 不受 inTauri 限制：网页版同样需要预测，卡片行才是桌面端专属。
     try { _renderComposerGhost(); } catch {}
+    /*
+     * 读对话的那一档：**智能体轮同样要算**。
+     *
+     * 它原来只挂在 sendPrompt 的纯聊天 finally 里，而带工具的那条路更早就 return 了——
+     * 默认模式恰好是 agent，于是这一档在最需要它的轮次里从来没跑过：跑完一轮真活儿，
+     * 输入框里还是旧的「环境暗示」档（报错数 / git 脏不脏 / 目录空不空），
+     * 正是它要取代的那些。
+     *
+     * 挂在这里：这是智能体轮跑完的必经之处，而且在 inTauri 早退之前——网页版同样要预测。
+     * 举着问题等人回答时不算：_composerPrediction 对 awaiting_user 直接返回 null，
+     * 算了也是白花钱。
+     */
+    if (sess?._lastRunState?.outcome !== "awaiting_user") {
+      try { void _predictNextAsk(sess); } catch {}
+    }
     if (!inTauri) return;
     _renderSuggestionChips(sess, _runStateNextActionSuggestions(sess), t("chat.nextSteps"));
   } catch {}
@@ -23288,8 +23308,22 @@ async function _predictNextAsk(sess) {
     const recent = (sess.memory && Array.isArray(sess.memory.recent)) ? sess.memory.recent : [];
     // 至少要有一来一回才谈得上"接下来问什么"。
     if (recent.filter((m) => m && m.role === "assistant").length < 1) return;
-    const cfg = await _readyAiConfig();
+    /*
+     * **绝不能走 _readyAiConfig()**。那不是一次静默的配置读取，是一整道带 UI 的鉴权门：
+     * 没登录会弹登录框、401 会把 michael_token 删掉、点数用完会弹一个原生 alert 付费墙，
+     * 顺带还把刚结束那一轮的推理计数清零（token 提示里的证据就没了）。
+     * 一个用户没点过任何东西的后台杂活，绝不该有这些副作用——本函数上面写着"失败/被拒都静默"。
+     *
+     * loadConfig() 恒定返回网关地址 + 网关 JWT，所以主机永远是对的；没 token 就直接不预测。
+     */
+    let _tok = "";
+    try { _tok = localStorage.getItem("michael_token") || ""; } catch {}
+    if (!_tok) return;
+    const cfg = loadConfig();
     if (!cfg || !cfg.baseUrl || !cfg.apiKey) return;
+    // 自定义模型用户跳过：cfg.model 是 "custom:<id>"，而 _pickCheapModel 只认网关目录里的
+    // 模型名——硬挑一个会拿着网关的名字去问用户自己的端点，静默 4xx，白花一次往返。
+    try { if (_customModelById && _customModelById(cfg.model)) return; } catch {}
 
     sess._askPredictInflight = true;
     const turnKey = recent.length;
@@ -23302,7 +23336,15 @@ async function _predictNextAsk(sess) {
     const to = ctrl ? setTimeout(() => ctrl.abort(), 12000) : null;
     const res = await fetch(_chatCompletionsUrl(cfg.baseUrl), {
       method: "POST",
-      headers: { "Content-Type": "application/json", Authorization: "Bearer " + (cfg.apiKey || "") },
+      headers: (() => {
+        const h = { "Content-Type": "application/json", Authorization: "Bearer " + (cfg.apiKey || "") };
+        // 不带 request_id 的话，网关插 model_usage 时它是 NULL，而结算接口按 request_id 查——
+        // 这笔钱扣了、进了用量页，却不进本轮的费用页脚。用户会看到额度掉得比页面上所有
+        // 费用行加起来还多。格式守卫是必须的：畸形值网关直接 400，会把预测整条打死。
+        const rid = String(sess._reqId || "");
+        if (/^[-_A-Za-z0-9]{8,128}$/.test(rid)) h["x-ide-request-id"] = rid;
+        return h;
+      })(),
       body: JSON.stringify({
         model: _pickCheapModel(cfg.model),
         messages: [{ role: "system", content: _ASK_PREDICT_SYSTEM }, { role: "user", content: convo }],
@@ -26880,7 +26922,10 @@ function _mcpCapabilitySchema(server, kind, metadata, usedNames) {
   return {
     name: publicName,
     schema,
-    route: { server, tool: "", kind, root: "", mcpName: publicName },
+    // resources/read 和 prompts/get 按 MCP 协议就是读取操作，不可能改动任何东西。
+    // 不标 readOnly 的话，只读模式那道按 mcpReadOnly 判定的门会把它们一律拦掉——
+    // 而"查文档、取模板"恰恰是 Plan/Explorer 最需要的两件事。
+    route: { server, tool: "", kind, root: "", mcpName: publicName, readOnly: true },
   };
 }
 
@@ -42899,24 +42944,6 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
   // Snapshot the session generation once. Interactive tools use this to retire
   // themselves when Stop or a replacement turn advances the session.
   run._sessionGen = session._runGen || 0;
-  /*
-   * 接着上次跑：把会话里那份没做完的计划装回这一轮。
-   *
-   * run._planSteps 原本只有模型调 update_plan 才会有值，于是中断后重开一轮它是空的——
-   * 界面上的计划条还画着旧计划，模型和执行侧手里却什么都没有，步骤推进、完成度判定
-   * 全部从零开始。这正是「任务计划被打乱、不遵守」的机制来源。
-   *
-   * 同样只在"确实没跑完"时继承（判据和 _resumeHandoffBlock 一致），否则一次正常收尾
-   * 之后开的新任务会被上一轮的旧计划粘住。模型想换计划照样可以调 update_plan 覆盖。
-   */
-  try {
-    const _prevPlan = Array.isArray(session._planSteps) ? session._planSteps : [];
-    const _prevOutcome = String(session._lastRunState?.outcome || "");
-    if (!run._planSteps && _prevPlan.some((x) => x?.status === "pending" || x?.status === "in_progress")
-        && (_prevOutcome === "failed" || _prevOutcome === "partial")) {
-      run._planSteps = _prevPlan.map((x) => ({ ...x }));
-    }
-  } catch {}
   run._intentState = intentState;
   run.timeline = timeline || _createAgentTimeline(_newIdeRunId(), run._recStart);
   run._runId = String(run.timeline.runId || _newIdeRunId());
@@ -43066,6 +43093,29 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
   // latest plan — so we can nudge the model to finish its plan and to verify its
   // changes before it stops. Bounded so it can never loop forever.
   let didMutate = false, didVerify = false, verificationPassed = false, planSteps = null;
+  /*
+   * 接着上次跑：把会话里那份没做完的计划装回这一轮。判据与 _resumeHandoffBlock 一致
+   *（有未完成步骤 && 上一轮是 failed/partial）。
+   *
+   * 三个约束缺一不可：
+   *   · **只在 agent 模式继承**。explorer/reviewer/plan 是只读模式，继承来的实现步骤它们
+   *     根本执行不了，却会触发那道无模式门的 planFinish——最多逼出 3 个多余回合去催一个
+   *     只读模式"继续做下一步"，最后还给一次正常回答盖上 plan_steps_pending。
+   *   · **必须排在 planSteps 声明之后**：isAgent 在上面才声明，写在前面拿不到。
+   *   · **同时写循环局部的 planSteps**。只设 run._planSteps 的话，局部变量永远是 null，
+   *     于是"改到第 3 个文件就提醒先停一下整合"会在每次续跑误报，周期性的 planRefresh
+   *     也永远不触发——而这一轮明明手里有计划。
+   */
+  try {
+    const _prevPlan = Array.isArray(session._planSteps) ? session._planSteps : [];
+    const _prevOutcome = String(session._lastRunState?.outcome || "");
+    if (isAgent && !run._planSteps
+        && _prevPlan.some((x) => x?.status === "pending" || x?.status === "in_progress")
+        && (_prevOutcome === "failed" || _prevOutcome === "partial")) {
+      run._planSteps = _prevPlan.map((x) => ({ ...x }));
+      planSteps = run._planSteps;
+    }
+  } catch {}
   // Runtime commands produce structured evidence. A script/application run is
   // not considered functionally verified until the model reviews that evidence
   // against the user's requested outcome.
@@ -45460,6 +45510,20 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
   } catch (e) { finalErr = String(e?.message || e); }
   finally {
     planSteps = _settleRunPlan(run);
+    /*
+     * 用户按停 / 这一轮被新一轮顶掉时，循环是**干净 break** 出来的：不抛异常，
+     * 所以 finalErr 是空的；也没有走到那几个会设 _incompleteReason 的收尾门。
+     * 于是结局被判成 success——而"接着上次继续"的交接（_resumeHandoffBlock）和计划继承
+     * 都只在 failed/partial 时才成立，两个机制就都不会触发。
+     *
+     * 这正是「中断之后说继续，它还是从头重来」剩下的那一半：交接块写好了，但按停这条
+     * 最常见的路径根本喂不到它。
+     *
+     * 必须赶在下面 _setStreaming(session, false) 之前取值：那之后 _live() 对每一次运行
+     * 都会变成假，正常收尾的也会被误判成中断。_settleRunPlan 不碰 streaming，放它后面安全。
+     */
+    const _stoppedEarly = !_live();
+    if (_stoppedEarly && !finalErr) run._incompleteReason = run._incompleteReason || "user_stopped";
     // === P2.1 取消传播：run 结束（Stop/换轮/异常/正常收尾）时，仍在跑的后台作业标 cancelled ===
     // 子智能体本体由 _subGenSnap 代际快照在下个检查点自行退出，Rust 侧请求由下方
     // _setStreaming(false) 遍历 session._cancelIds 取消；这里只做台账诚实记账，防幽灵作业。
@@ -45558,7 +45622,7 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
     try { _thinkLedgerPush(session, _extractThinkingConclusion(reasoningAll), session.memory?.totalTurns || 0); } catch { /* 沉淀失败不影响收尾 */ }
     _streamDraftClear(session); // 本次运行已持久化收尾，流式草稿不再需要（只清本会话的槽）
     const _runOutcome = awaitingUserReply ? "awaiting_user" : finalErr ? "failed"
-      : (run._incompleteReason || hitCap || (didMutate && (!verificationPassed || !uiVerificationPassed))) ? "partial" : "success";
+      : (_stoppedEarly || run._incompleteReason || hitCap || (didMutate && (!verificationPassed || !uiVerificationPassed))) ? "partial" : "success";
     session._lastRunState = {
       outcome: _runOutcome,
       task: String(task || "").replace(/\s+/g, " ").trim().slice(0, 700),
@@ -54774,7 +54838,11 @@ function renderMcpTool(body) {
     // 配置文件坏了的时候，唯一有用的动作是把那个文件打开让人看见哪儿写错了。
     const broken = e.target.closest("[data-mcpfp-openbroken]")?.getAttribute("data-mcpfp-openbroken");
     if (broken) {
-      try { await openFile(broken); closeFeaturePanel(); }
+      // 必须传文件名：openFile 的第二参是 name，缺了它 renderTabs 会在
+      // fileIconUrl(undefined) 上抛 TypeError——而抛之前 openFiles.set 已经执行，
+      // 那条坏记录会永久留在表里，此后每一次 renderTabs（开文件、切标签、关标签）
+      // 都抛在它上面，新文件再也进不了标签栏，直到重启。
+      try { await openFile(broken, broken.split(/[\\/]/).filter(Boolean).pop() || "mcp.json"); closeFeaturePanel(); }
       catch { showToast("打不开 " + broken + "——请在编辑器里手动打开修正"); }
       return;
     }
