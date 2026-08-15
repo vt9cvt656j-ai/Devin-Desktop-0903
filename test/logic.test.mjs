@@ -23556,3 +23556,65 @@ test("探测结果交给模型时要说清「这是事实不是推断」", () =>
   // 包管理器的判据要说清楚，否则模型不知道该多信它
   assert.match(branch, /按 lockfile 认定，是"实际用过"的证据/);
 });
+
+// ══ 失败之后必须有路可走 ═══════════════════════════════════════════════════
+
+test("git 失败时不再把 git 自己写好的下一步砍掉", () => {
+  const branch = SRC.slice(SRC.indexOf('} else if (call.type === "git") {'));
+  const seg = branch.slice(0, branch.indexOf('} else if (call.type === "gh")'));
+  // 200 字正好断在 push 被拒的第一行 hint 中间（实测全文 473 字符），
+  // "'git pull' before pushing again" 整句丢掉。而 _toolMsgForModel 给 git 的预算是 30000。
+  assert.match(seg, /String\(e\?\.message \|\| e\)\.slice\(0, 1200\)/, "还是 200，git 的 hint 段会被砍掉");
+  // 再补一条这个工具**自己就有**的下一步——外层通用恢复只会说"别重复同一个失败调用"
+  assert.match(seg, /const _gitNext = \{/);
+  assert.match(seg, /push: "[\s\S]{0,200}先 git_pull 合并/);
+  assert.match(seg, /\*\*不要 force\*\*/, "push 被拒时最危险的错误答案就是 force");
+  assert.match(seg, /pull: "[\s\S]{0,200}git_stash → git_pull → git_stash_pop/);
+  // 仓库根被自动重定位时那条上下文，失败路径原来也丢了
+  assert.match(seg, /\$\{_gitNext\}\$\{gitRerootNote\}/);
+});
+
+test("资产生成失败时指向同一套工具里现成的素材库", () => {
+  const i = SRC.indexOf("const _gaAlt =");
+  assert.ok(i > 0, "没有替代路");
+  const seg = SRC.slice(i, i + 1200);
+  assert.match(seg, /search_game_assets\(query, asset_type\)[\s\S]{0,120}download_asset/);
+  assert.match(seg, /不走生成计费链，不受这次失败影响/, "要说清为什么这条路还能走");
+  assert.match(seg, /用了素材而不是生成，在回复里说清楚/, "不能让它悄悄换成素材");
+  // 配音没有对等替代，就照实说，别编一条
+  assert.match(seg, /generate_voice[\s\S]{0,200}没有对等的免费替代/);
+  assert.match(seg, /别假装生成了/);
+  // auto_rig/generate_motion 缺 id 时上面已抛出自解释错误，不该重复一遍
+  assert.match(seg, /需要\.\{0,12\}task_id\/\.test/, "会和已有的自解释错误重复");
+});
+
+test("只读模式那句「只能用四个工具」是假的，已经换成真实清单", () => {
+  assert.doesNotMatch(SRC, /只能用 read_file\/list_dir\/search\/find_files。/, "这句话是假的");
+  const i = SRC.indexOf("只读模式下**读取与取证类工具全部可用**");
+  assert.ok(i > 0, "没给出真实可用清单");
+  const seg = SRC.slice(i, i + 500);
+  // 同一个文件自己就在打脸：Reviewer 开局窗口里就有 get_diagnostics 和 git_diff
+  for (const t of ["find_symbol", "lsp_definition", "get_diagnostics", "read_terminal", "read_logs"]) {
+    assert.ok(seg.includes(t), `真实可用的 ${t} 没列出来`);
+  }
+  assert.match(seg, /git 只有 commit·push·pull·stash·clone·新建分支被挡/);
+  assert.match(seg, /不要换 run_cmd 或别的工具去做同一件事/);
+});
+
+test("没打开工作区时给出可执行的下一步，而不是求用户去点菜单", () => {
+  // 工具描述和轮次开头的 contextBlock 都明写「别停下来问用户」，而这条刚发生的
+  // 工具结果原来和它们唱反调，叫模型去求用户打开文件夹——模型做不到的事。
+  const n = (SRC.match(/\*\*下一步直接调 create_project/g) || []).length;
+  assert.equal(n, 4, `四处无工作区拦截都要给出路，实际 ${n} 处`);
+  assert.doesNotMatch(SRC, /请先打开项目文件夹或给当前聊天标签设置工作目录/, "还在求用户");
+  // 不能建议"改用绝对路径"——无根时写操作 fail-closed，那是第二条死路
+  assert.match(SRC, /也不要改用绝对路径绕过去[\s\S]{0,60}那是第二条死路/);
+});
+
+test("命令不存在时指向 probe_env，不再推它一条条 run_cmd 试", () => {
+  // probe_env 存在的全部理由就是根除"一轮一条命令"，而这两句最强的指引原来在把它往反方向推
+  assert.match(SRC, /\*\*先调 probe_env\*\* —— 一次就能拿到这台机器上装了什么/);
+  assert.match(SRC, /\*\*直接调 probe_env\*\*——一次拿到本机全部工具链的有无与版本/);
+  // 提示词和工具结果必须同一口径，否则互相打架
+  assert.doesNotMatch(SRC, /先用最小探测确认（command -v、ls node_modules\/\.bin/, "提示词还在推旧路子");
+});

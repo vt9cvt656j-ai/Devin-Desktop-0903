@@ -22427,7 +22427,7 @@ const _AGENT_RECOVERY_TUNING = `
 - 后端/API/服务验证要分情况：纯脚本/CLI/单测/类型检查用 run_cmd；dev server、watch、守护进程用 run_in_terminal 启动后 read_logs/read_terminal 看真实启动日志和 URL，再用 http_request/browser 验关键路径。服务没跑起来先看日志根因，不要凭空假设成功。
 - 如果真实诊断/日志显示项目依赖未恢复（node_modules 缺失、Cannot find module、缺类型声明）且 package.json/lockfile 已声明依赖，直接用对应包管理器执行依赖恢复（npm ci/npm install/pnpm install/yarn install/bun install）；这是修复运行环境。用户要你实现某个功能时，该功能所需的新依赖属于实现本身，直接装、直接写进 package.json/requirements，不必再问；只有与当前目标无关的包才需要用户点名。
 - 改 package.json、锁文件、依赖版本或新增/替换库前，必须先查真实来源：package_search 精确包名拿 dist-tags.latest、最近版本、engines、peerDependencies/dependencies/deprecated；必要时再用 bundlephobia_search、GitHub release/issues 或官方文档核对兼容性。无法联网核实时保持现有 semver 范围或说明未验证，绝不凭记忆把版本升降级。
-- 命令也是事实，先证实再敲：不确定装没装的工具先用最小探测确认（command -v、ls node_modules/.bin、ls .venv/bin、--version）；优先项目内工具和项目声明过的脚本。命令不存在（127）是环境事实不是代码错误：装上、或换一定存在的等价途径（python3 -m …、node --check），不连猜拼法变体。
+- 命令也是事实，先证实再敲：不确定装没装的工具，**直接调 probe_env**——一次拿到本机全部工具链的有无与版本、以及这个项目按 lockfile 实际在用哪个包管理器；它比 command -v 一条条试便宜一个数量级。优先项目内工具和项目声明过的脚本。命令不存在（127）是环境事实不是代码错误：装上、或换一定存在的等价途径（python3 -m …、node --check），不连猜拼法变体。
 - 复杂或不熟的任务先在脑内过三问：①用户真正要的终态是什么；②当前证据缺哪一块会导致写错；③最小可验证下一步是什么。展示给用户的思考必须是“观察 → 判断 → 下一步”的实证链，别写空泛自言自语、别把计划当结果。
 - Bug 修复必须先建立因果链：复现/读取真实报错、日志、截图、失败命令或用户描述中的具体症状；沿入口、状态、数据契约、异步时序、边界值和调用方定位根因；说明为什么这个补丁能切断故障路径；改完重跑同一失败路径或最接近的聚焦回归。没有复现条件时也要列出可证伪假设和下一步证据，不准凭感觉乱改。
 - 写代码前先确认数据契约、调用方和失败/空值路径；涉及 UI 时先读真实内容源、素材、框架、组件库和 token/theme/style 入口，真实调用 michael-design 后把设计事实映射到当前项目机制；只有无网站且无可沿用/用户指定栈时才默认 React + Tailwind CSS + shadcn/ui，不能先凭模板瞎拼。
@@ -34166,7 +34166,7 @@ async function _commandFailureDiagnostics(command, output, root = "", extraPaths
   } else if (/command not found|not recognized as an internal or external command|could not determine executable|\bexecutable file not found\b/i.test(out)) {
     // 命令不存在是**环境事实**，不是代码错误，也不是"换个相似拼法再碰碰"的邀请。
     // 给出确定性取证链，杀掉"连猜命令变体"这个最常见的瞎猜循环。
-    lines.push("[失败判断] 命令/可执行文件不存在（环境问题，不是代码错误）。不要换相似拼法盲猜：① 先 `command -v <工具>` 或 `ls node_modules/.bin .venv/bin` 探清本机/项目内真正可用的工具；② 项目自带的优先用项目内路径（.venv/bin/…、npx --no-install …）；③ 确实要装就用对应包管理器装上再跑；④ 都不行就换一定存在的等价途径（python3 -m …、node --check 等）。");
+    lines.push("[失败判断] 命令/可执行文件不存在（环境问题，不是代码错误）。不要换相似拼法盲猜：① **先调 probe_env** —— 一次就能拿到这台机器上装了什么、版本多少、这个项目用哪个包管理器，不要再用 run_cmd 一条条试（那正是 probe_env 存在的原因）；② 项目自带的优先用项目内路径（.venv/bin/…、npx --no-install …）；③ 确实要装就用对应包管理器装上再跑；④ 都不行就换一定存在的等价途径（python3 -m …、node --check 等）。");
   } else if (_isTransientCommandFailure(out)) {
     lines.push("[失败判断] 这可能是临时网络/服务波动；确认命令没有外部写入副作用后，可以短重试 1-2 次，否则先读取日志定位。");
   } else if (out.trim()) {
@@ -48665,7 +48665,20 @@ async function _executeToolStepInner(step, call, root, run) {
       : call.type === "worktree" ? "建/删工作树" : "修改文件";
     res.className = "atc-result atc-result--blocked";
     res.textContent = `⛔ ${modeName} 模式下禁止${what}`;
-    return { type: call.type, path: call.path, content: `[BLOCKED] ${modeName} 是只读模式，不能${what}。只能用 read_file/list_dir/search/find_files。` };
+    // 原文是「只能用 read_file/list_dir/search/find_files」——**这句是假的**。
+    // 按 agent/tool-policy.js，只读模式无条件挡住的只有 11 个类型（写/改/删/移/建目录/
+    // 复制/格式化/命令/终端任务/点界面）外加三个逐次判定的（mcp/userhttp/worktree）；
+    // 其余每一个未登记的类型都走默认策略、照常可用。同一个文件自己就在打脸：Reviewer 的
+    // 开局窗口里就放着 get_diagnostics 和 git_diff，而这句话说它们不存在。
+    // 于是模型收着一堆能用的 schema，却被告知只有四个工具——直接放弃它本来做得到的取证。
+    //
+    // 这句名单**手写**而不是从 allPolicies() 反查：那个函数只暴露"非默认"的声明，
+    // 反查不出可用集合，用它反而会让这句话更不准。
+    const _roMode = _mode === "explorer" ? "explorer" : _mode === "plan" ? "plan" : "reviewer";
+    const _roExit = _roMode === "explorer"
+      ? "\n出路：Explorer 只调查不动手。把该改的地方写成带 path:line 的最小修复建议交回去，由用户切到 Agent 模式执行。"
+      : "";  // plan / reviewer 每轮都从 _modeRuntimeGuidanceBlock 收到同样口径的指引，不重复说
+    return { type: call.type, path: call.path, content: `[BLOCKED] ${modeName} 是只读模式，不能${what}。\n只读模式下**读取与取证类工具全部可用**：read_file / list_dir / search / find_files / find_symbol / lsp_definition / lsp_references / get_diagnostics / read_terminal / read_logs / git 的 status·diff·log·blame·show / 声明为只读的 MCP。git 只有 commit·push·pull·stash·clone·新建分支被挡。\n这是**模式限制不是能力缺失**——不要换 run_cmd 或别的工具去做同一件事。${_roExit}` };
   }
 
   // Worker scope guard: a parallel worker sub-agent may read anywhere and may run
@@ -49299,7 +49312,7 @@ async function _executeToolStepInner(step, call, root, run) {
       if (_relativeMutationWithoutRoot(call.path, root)) {
         res.className = "atc-result atc-result--blocked";
         res.textContent = "⛔ 未打开工作区";
-        return { type: call.type, path: call.path, content: `[BLOCKED] 当前没有真实工作区根目录，IDE 已阻止对相对路径「${call.path}」写入/编辑，避免写到错误位置。请先打开项目文件夹或给当前聊天标签设置工作目录。` };
+        return { type: call.type, path: call.path, content: `[BLOCKED] IDE 已阻止对相对路径「${call.path}」写入/编辑，避免写到错误位置。当前没有工作区根目录。**下一步直接调 create_project({name:"<描述性名字>"})** 建一个目录，它会立刻成为当前工作区，然后原样重试这一步。不要停下来让用户去打开文件夹。（也不要改用绝对路径绕过去：无工作区时写操作是 fail-closed 的，绝对路径同样会被拒，那是第二条死路。）` };
       }
       const boundPath = _boundRunFilePath(run, root, call.path);
       const fp = boundPath || (call.type === "edit"
@@ -50209,7 +50222,22 @@ async function _executeToolStepInner(step, call, root, run) {
         return { type: call.type, path: _gaPath, task_id: _returnedTaskId || undefined, content: `已生成${_gaLabels[call.type]}并保存到 ${_gaPath}（${_gaOut && _gaOut.bytes ? _gaOut.bytes : "?"}字节）。${_taskNote}` };
       } catch (e) {
         res.className = "atc-result atc-result--err"; res.textContent = `${_gaLabels[call.type]}生成失败`;
-        return { type: call.type, path: "", content: `[失败] ${call.type}: ${String(e?.message || e).slice(0, 400)}` };
+        // 外层只兜到一句通用的"先判断真实原因、别换旁门左道"。可额度不足 / 模型暂不可用
+        // 这类失败，模型**无因可修**——而那句"别换旁门左道"还会劝阻它去找替代路。
+        // 于是它把任务丢回给用户说"音效生成不了"，尽管同一批工具里 search_game_assets
+        // （免费素材库：Sketchfab / Freesound / Poly Haven）+ download_asset 恰好能完成
+        // 同一件事，而且 download_asset 不走计费链、不在这次失败的那条路上。
+        const _gaAlt = ["generate_sound", "generate_music", "generate_3d", "generate_texture"].includes(call.type)
+          ? `\n\n替代路（就在同一套工具里）：生成通道这次不可用，改走素材库——search_game_assets(query, asset_type) 找现成的，选中后 download_asset 落盘到工作区。它不走生成计费链，不受这次失败影响。用了素材而不是生成，在回复里说清楚。`
+          : call.type === "generate_voice"
+          ? `\n\n这一类没有对等的免费替代。照实告诉用户配音生成不可用，先用文本占位，或请他自己录一段。别假装生成了。`
+          // auto_rig / generate_motion 缺 task_id 时，上面（50209/50210）**已经**抛出了
+          // 自解释的错误并经这个 catch 原样送达。那种情况不要再补一句重复的话；
+          // 只有真的调了网关才失败时才提"id 可能过期"。
+          : (/需要.{0,12}task_id/.test(String(e?.message || e))
+            ? ""
+            : `\n\n这个工具依赖上游的 task_id。如果报的是 task 过期或找不到，重跑 generate_3d（auto_rig 则重跑到 auto_rig）拿一个**新的真实 id**，不要复用旧的。`);
+        return { type: call.type, path: "", content: `[失败] ${call.type}: ${String(e?.message || e).slice(0, 400)}${_gaAlt}` };
       }
 
     } else if (call.type === "search_game_assets") {
@@ -51014,7 +51042,7 @@ async function _executeToolStepInner(step, call, root, run) {
       if (!p) { res.className = "atc-result atc-result--err"; res.textContent = "空路径"; return { type: "mkdir", path: p, content: "[ERROR] 空路径。" }; }
       if (_relativeMutationWithoutRoot(p, root)) {
         res.className = "atc-result atc-result--blocked"; res.textContent = "⛔ 未打开工作区";
-        return { type: "mkdir", path: p, content: `[BLOCKED] 当前没有真实工作区根目录，IDE 已阻止创建相对目录「${p}」。请先打开项目文件夹或给当前聊天标签设置工作目录。` };
+        return { type: "mkdir", path: p, content: `[BLOCKED] IDE 已阻止创建相对目录「${p}」。当前没有工作区根目录。**下一步直接调 create_project({name:"<描述性名字>"})** 建一个目录，它会立刻成为当前工作区，然后原样重试这一步。不要停下来让用户去打开文件夹。（也不要改用绝对路径绕过去：无工作区时写操作是 fail-closed 的，绝对路径同样会被拒，那是第二条死路。）` };
       }
       const fp = _resolveRel(p, root);
       call._resolvedPath = fp;
@@ -51047,7 +51075,7 @@ async function _executeToolStepInner(step, call, root, run) {
       if (!from || !to) { res.className = "atc-result atc-result--err"; res.textContent = "缺少 from/to"; return { type: "copy", path: from, content: "[ERROR] 需要 from 和 to。" }; }
       if (_relativeMutationWithoutRoot(from, root) || _relativeMutationWithoutRoot(to, root)) {
         res.className = "atc-result atc-result--blocked"; res.textContent = "⛔ 未打开工作区";
-        return { type: "copy", path: from, content: `[BLOCKED] 当前没有真实工作区根目录，IDE 已阻止复制相对路径「${from} → ${to}」。请先打开项目文件夹或给当前聊天标签设置工作目录。` };
+        return { type: "copy", path: from, content: `[BLOCKED] IDE 已阻止复制相对路径「${from} → ${to}」。当前没有工作区根目录。**下一步直接调 create_project({name:"<描述性名字>"})** 建一个目录，它会立刻成为当前工作区，然后原样重试这一步。不要停下来让用户去打开文件夹。（也不要改用绝对路径绕过去：无工作区时写操作是 fail-closed 的，绝对路径同样会被拒，那是第二条死路。）` };
       }
       const fromFp = _boundRunFilePath(run, root, from) || await _resolveExisting(from, root);
       const toFp = _resolveRel(to, root);
@@ -51075,7 +51103,7 @@ async function _executeToolStepInner(step, call, root, run) {
       if (!rel) { res.className = "atc-result atc-result--err"; res.textContent = "空路径"; return { type: "format", path: rel, content: "[ERROR] 空路径。" }; }
       if (_relativeMutationWithoutRoot(rel, root)) {
         res.className = "atc-result atc-result--blocked"; res.textContent = "⛔ 未打开工作区";
-        return { type: "format", path: rel, content: `[BLOCKED] 当前没有真实工作区根目录，IDE 已阻止格式化相对路径「${rel}」。请先打开项目文件夹或给当前聊天标签设置工作目录。` };
+        return { type: "format", path: rel, content: `[BLOCKED] IDE 已阻止格式化相对路径「${rel}」。当前没有工作区根目录。**下一步直接调 create_project({name:"<描述性名字>"})** 建一个目录，它会立刻成为当前工作区，然后原样重试这一步。不要停下来让用户去打开文件夹。（也不要改用绝对路径绕过去：无工作区时写操作是 fail-closed 的，绝对路径同样会被拒，那是第二条死路。）` };
       }
       const fp = _boundRunFilePath(run, root, rel) || _resolveRel(rel, root);
       call._resolvedPath = fp;
@@ -51394,9 +51422,24 @@ async function _executeToolStepInner(step, call, root, run) {
         }
         return { type: "git", path: call.op, content: `未知 git 操作: ${call.op}` };
       } catch (e) {
-        const msg = String(e?.message || e).slice(0, 200);
+        // 200 字太紧了。git.rs 把 stdout+stderr **原样**合并回传，而 git 的错误输出本来就是
+        // 多行的：push 被拒的完整输出实测 473 字符，200 字正好断在第一行 hint 中间，
+        // "'git pull' before pushing again" 整句丢掉。pull 撞上未提交改动时更糟——可执行的
+        // 那句 "Please commit your changes or stash them before you merge." 排在文件列表之后，
+        // 改动文件一多就整句没了。
+        // 而 _toolMsgForModel 给 type==="git" 的预算是 30000：这个 200 是唯一约束点，紧了 150 倍。
+        const msg = String(e?.message || e).slice(0, 1200);
         res.className = "atc-result atc-result--err"; res.textContent = msg.slice(0, 80);
-        return { type: "git", path: call.op, content: `[ERROR] git ${call.op} 失败: ${msg}` };
+        // 再补一条**这个工具自己就有**的下一步。外层的通用恢复只会说"别重复同一个失败调用"，
+        // 而 git_pull / git_stash / git_stash_pop / git_status 就在同一个工具里，路在脚下。
+        const _gitNext = {
+          push: "\n\n下一步：被远端拒绝几乎总是因为远端有新提交。先 git_pull 合并（或 git_log 看分叉点）再 push。**不要 force**——那会覆盖别人的提交。",
+          pull: "\n\n下一步：若报本地改动会被覆盖，走 git_stash → git_pull → git_stash_pop 三步。若报冲突，用 git_conflicts 看是哪些文件。",
+          commit: "\n\n下一步：若报 nothing to commit，先 git_status 确认是不是已经提交过了，不要重复 commit。若报 pathspec，检查路径是否在这个仓库里。",
+          clone: "\n\n下一步：确认远端地址可达、有访问权限。私有仓库需要凭据，而这里刻意不做交互式认证（会挂死），所以认证失败要交回给用户。",
+          stash_pop: "\n\n下一步：pop 冲突时改动**还在 stash 里没丢**，用 git_stash_list 确认，解决冲突后再 pop。",
+        }[call.op] || "";
+        return { type: "git", path: call.op, content: `[ERROR] git ${call.op} 失败: ${msg}${_gitNext}${gitRerootNote}` };
       }
 
     } else if (call.type === "knowledge") {
