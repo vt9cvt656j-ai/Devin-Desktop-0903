@@ -5931,6 +5931,11 @@ img.settings-dropdown__avatar--filled { object-fit: cover; }
   width: 27px; height: 27px; flex-shrink: 0;
   display: flex; align-items: center; justify-content: center;
   border-radius: 8px;
+  /* 默认底色。原来这两行是粘在下面 --game_asset 那条规则**行尾**的一截无作用域碎片
+     （`… .atc-type-icon { … } .atc-type-icon { background: #ede7f6; … }`），读起来像笔误，
+     但真的在干活：49 个工具类型里有 24 个没有专属配色，全靠它上色。所以不是删掉，
+     是提上来写明白——外观一字不变，畸形消失。专属配色是 (0,2,0)，照常压过这里。 */
+  background: #ede7f6; color: #4527a0;
 }
 .agent-tool-step--write .atc-type-icon,
 .agent-tool-step--multiedit .atc-type-icon { background: #feefe3; color: #e8710a; }
@@ -5952,7 +5957,7 @@ img.settings-dropdown__avatar--filled { object-fit: cover; }
 .agent-tool-step--download .atc-type-icon { background: #e8f0fe; color: #1565c0; }
 .agent-tool-step--current_time .atc-type-icon { background: #fff3e0; color: #e65100; }
 .agent-tool-step--game_scaffold .atc-type-icon { background: #e8f5e9; color: #2e7d32; }
-.agent-tool-step--game_asset .atc-type-icon { background: #e3f2fd; color: #1565c0; } .atc-type-icon { background: #ede7f6; color: #4527a0; }
+.agent-tool-step--game_asset .atc-type-icon { background: #e3f2fd; color: #1565c0; }
 /* 技能：紫色，和 read 的蓝、write 的绿都不撞——它以前就是回落成 read 那张纸的。 */
 .agent-tool-step--skill .atc-type-icon { background: #ede7f6; color: #5e35b1; }
 /* MCP 用服务自己的真实头像（复用市场卡那套 .mcpfp-icon）。图标位是 27px，而 .mcpfp-icon

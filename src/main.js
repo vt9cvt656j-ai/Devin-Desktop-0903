@@ -23445,7 +23445,23 @@ function _renderComposerGhost() {
     // 每次重算，从不缓存：截断消息会把 _intentState 和 _lastRunState 一起清掉，
     // _planSteps 在一轮结束后还继续变——快照会变成"陈旧且错误"，比陈旧更糟。
     const p = _composerPrediction(sess);
-    if (!p || !p.text || !p.send) return _clearComposerGhost();
+    if (!p || !p.text || !p.send) {
+      /*
+       * 没有预测时，把「为什么没有」留在标题里。
+       *
+       * _askPredictReject 记着读对话那一档被拒的具体原因（太长、助手口吻、模型在叙述
+       * 自己沉默、刚发过同样的话……），但在此之前**没有任何读者**——那句"为什么这儿
+       * 没有预测要答得出来"是句空话。放进 title：不占版面，鼠标停一下就能看到，
+       * 而且用户报"预测不出来了"时，这一条比任何日志都直接。
+       */
+      const why = String(sess._askPredictReject || "");
+      try {
+        if (why) promptEl.setAttribute("title", `本轮没有给出预测：${why}`);
+        else promptEl.removeAttribute("title");
+      } catch {}
+      return _clearComposerGhost();
+    }
+    try { promptEl.removeAttribute("title"); } catch {}
     // 用 send 当键，不用 text：text 只是给卡片行用的短标签，各来源的 label 和 send 本来就不
     // 相等，拿它比对等于这条静音永远命中不了，Esc 关掉后下一次输入就又弹回来。
     if (sess._ghostDismissKey === p.send) return _clearComposerGhost(); // 这条被 Esc 关过
