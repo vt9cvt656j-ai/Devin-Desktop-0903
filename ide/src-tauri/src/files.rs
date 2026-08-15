@@ -25,6 +25,64 @@ const INSPECT_STRING_SCAN_BYTES: usize = 1024 * 1024;
 
 /// Directories that are never descended into during search (build output,
 /// vendored deps, VCS metadata). Dot-directories are skipped separately.
+/// 点号开头的目录里，真正只有噪声的那几个。
+///
+/// 这里原来根本没有名单：search / replace 两处都是 `if name.starts_with('.') { continue; }`
+/// ——一刀切跳过**所有**点号条目。于是 `.github/`、`.env`、`.eslintrc`、`.gitignore`、
+/// `.dockerignore` 全是盲区：模型搜 "workflow_dispatch" 得到 0 命中，而文件就在
+/// `.github/workflows/` 下面躺着；搜索面板同理。IGNORED_DIRS 上面那句注释写的是
+/// 「dot-dirs like .next/.gradle/.venv are already skipped separately」——意图只是跳掉这几个
+/// 生成物目录，实现却把所有点号条目一起跳了。
+///
+/// 更要命的是同一个模型用 find_files **能**找到 `.github/workflows/ci.yml`
+/// （src/main.js 的 _agentFindFiles 早就改成具名黑名单了），却 search 不到里面的内容——
+/// 两个工具对同一个仓库给出互相矛盾的答案，模型无从判断哪个是真的。
+/// 这份名单刻意和 _agentFindFiles 里那份对齐。
+const IGNORED_DOT_DIRS: &[&str] = &[
+    ".git",
+    ".next",
+    ".nuxt",
+    ".svelte-kit",
+    ".venv",
+    ".download-venv",
+    ".gradle",
+    ".idea",
+    ".vscode",
+    ".cache",
+    ".turbo",
+    ".vite",
+    ".parcel-cache",
+    ".pytest_cache",
+    ".mypy_cache",
+    ".ruff_cache",
+    ".tox",
+    ".terraform",
+    ".yarn",
+    ".pnpm-store",
+    ".angular",
+    ".dart_tool",
+    ".swiftpm",
+    ".bundle",
+    ".sass-cache",
+    ".nyc_output",
+    ".serverless",
+    ".vercel",
+    ".netlify",
+    ".DS_Store",
+];
+
+/// 遍历时要不要跳过这个条目。目录看名单，文件一律保留。
+///
+/// 文件不过滤是有意的：`.env`、`.eslintrc`、`.gitignore`、`.prettierrc` 恰恰是最常被搜的
+/// 那批配置。唯一的例外 `.DS_Store` 已经在上面的名单里（它既可能是目录名也可能是文件名，
+/// 统一挡掉）。
+fn skip_walk_entry(name: &str, is_dir: bool) -> bool {
+    if IGNORED_DOT_DIRS.contains(&name) {
+        return true;
+    }
+    is_dir && IGNORED_DIRS.contains(&name)
+}
+
 const IGNORED_DIRS: &[&str] = &[
     "node_modules",
     "target",
@@ -1064,6 +1122,23 @@ fn sqlite_value_to_json(row: &sqlx::sqlite::SqliteRow, index: usize) -> serde_js
 
 fn inspect_sqlite_tables(path: &Path) -> Vec<SqliteTablePreview> {
     let path = path.to_path_buf();
+    // 这里原来直接 `tauri::async_runtime::block_on(...)`。
+    //
+    // 调用它的 `inspect_file` 标着 `#[tauri::command(async)]`，而它本身是同步函数——
+    // Tauri 于是把整个命令 spawn 到 tokio 运行时上跑。在 tokio 的 worker 线程里再
+    // `block_on` 另一个 future，tokio 会直接 panic（"Cannot start a runtime from within
+    // a runtime"）。表现就是：双击一个 .db / .sqlite 文件，invoke 再也不返回，前端那句
+    // await 永远挂着，文件预览转圈转到天荒地老，而且没有任何错误弹出来。
+    //
+    // 换到一个**没有环境运行时**的独立线程上跑那个 future，然后同步等它。等待期间确实
+    // 占着一个 tokio worker，但 inspect_file 本来就是同步命令、读文件那部分也是这么占的；
+    // 这是把「必 panic」换成「和其它同步命令一样阻塞」，方向是对的。
+    std::thread::spawn(move || inspect_sqlite_tables_blocking(path))
+        .join()
+        .unwrap_or_default()
+}
+
+fn inspect_sqlite_tables_blocking(path: std::path::PathBuf) -> Vec<SqliteTablePreview> {
     tauri::async_runtime::block_on(async move {
         use sqlx::{Column, Connection, Row};
         let options = sqlx::sqlite::SqliteConnectOptions::new()
@@ -1938,7 +2013,7 @@ fn search_project_scope(
                 let Some(name) = child.file_name().map(|name| name.to_string_lossy()) else {
                     continue;
                 };
-                if name.starts_with('.') {
+                if skip_walk_entry(name.as_ref(), child.is_dir()) {
                     continue;
                 }
                 stack.push(child);
@@ -2185,13 +2260,12 @@ pub fn replace_in_project(
                 Some(n) => n.to_string_lossy().to_string(),
                 None => continue,
             };
-            if name.starts_with('.') {
+            let is_dir = path.is_dir();
+            if skip_walk_entry(&name, is_dir) {
                 continue;
             }
-            if path.is_dir() {
-                if !IGNORED_DIRS.contains(&name.as_str()) {
-                    stack.push(path);
-                }
+            if is_dir {
+                stack.push(path);
                 continue;
             }
             let meta = match std::fs::metadata(&path) {
@@ -2260,6 +2334,93 @@ mod archive_summary_tests {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn inspecting_a_sqlite_file_from_inside_the_async_runtime_returns_instead_of_blowing_up() {
+        // inspect_file 标着 #[tauri::command(async)] 而本身是同步函数，Tauri 会把它 spawn
+        // 到 tokio 运行时上跑。原来 inspect_sqlite_tables 在那儿直接 block_on 另一个 future
+        // —— 在运行时线程里再起一个运行时，tokio 直接炸。表现是：双击一个 .db 文件，
+        // invoke 再也不返回，前端那句 await 永远挂着，也没有任何错误弹出来。
+        //
+        // 这条测试就跑在 tokio 运行时里（#[tokio::test]），复现的正是那个上下文。
+        let dir = std::env::temp_dir().join(format!("mrday-sqlite-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("app.db");
+        // 一个合法的空 SQLite 文件：头 16 字节是魔数，其余按页补零。
+        let mut bytes = b"SQLite format 3\0".to_vec();
+        bytes.resize(4096, 0);
+        std::fs::write(&db, &bytes).unwrap();
+
+        // 只要求它**返回**。内容对不对不是这条测试的事——这里测的是"会不会挂死/炸掉"。
+        let tables = inspect_sqlite_tables(&db);
+        assert!(tables.is_empty() || !tables.is_empty(), "只要能走到这一行就说明没炸");
+
+        // 不存在的文件同样要老老实实返回空，而不是把命令拖死。
+        let missing = inspect_sqlite_tables(&dir.join("nope.db"));
+        assert!(missing.is_empty());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn search_can_see_dotfiles_like_github_workflows_but_still_skips_dot_noise() {
+        // 原来 search / replace 两处都是 `if name.starts_with('.') { continue; }`，
+        // 于是 .github/、.env、.eslintrc 全是盲区：模型搜 "workflow_dispatch" 得到 0 命中，
+        // 而文件就躺在 .github/workflows/ 里。同一个模型用 find_files **能**看见那个文件
+        // （前端那份早改成具名黑名单了）——两个工具对同一个仓库给出互相矛盾的答案。
+        let root = std::env::temp_dir().join(format!("mrday-dotsearch-{}", std::process::id()));
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::create_dir_all(root.join(".github/workflows")).unwrap();
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        std::fs::create_dir_all(root.join("node_modules")).unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join(".github/workflows/ci.yml"), "on: workflow_dispatch\n").unwrap();
+        std::fs::write(root.join(".env"), "API_BASE=needle_here\n").unwrap();
+        std::fs::write(root.join(".eslintrc"), "{ \"rules\": { \"needle_here\": 0 } }").unwrap();
+        std::fs::write(root.join("src/app.ts"), "// needle_here\n").unwrap();
+        // 这两个必须仍然被跳过，否则搜索会被生成物淹没
+        std::fs::write(root.join(".git/COMMIT_EDITMSG"), "needle_here\n").unwrap();
+        std::fs::write(root.join("node_modules/dep.js"), "needle_here\n").unwrap();
+
+        let rootstr = root.to_string_lossy().to_string();
+        register_workspace_root(rootstr.clone()).ok();
+        let found = search_project_scope(&rootstr, "needle_here", true, None).expect("搜索应当成功");
+        let hits: Vec<String> = found
+            .files
+            .iter()
+            .map(|f| f.path.replace('\\', "/"))
+            .collect();
+        let has = |frag: &str| hits.iter().any(|h| h.contains(frag));
+
+        assert!(has(".env"), "看不见 .env —— 点号开头的配置是最常被搜的那批。命中: {hits:?}");
+        assert!(has(".eslintrc"), "看不见 .eslintrc。命中: {hits:?}");
+        assert!(has("app.ts"), "连普通文件都没搜到，说明测试本身写坏了。命中: {hits:?}");
+        assert!(!has("/.git/"), ".git 里的东西不该进搜索结果。命中: {hits:?}");
+        assert!(!has("node_modules"), "node_modules 不该进搜索结果。命中: {hits:?}");
+
+        // 目录层：.github/ 必须能走进去
+        let wf = search_project_scope(&rootstr, "workflow_dispatch", true, None).expect("搜索应当成功");
+        assert!(
+            wf.files.iter().any(|f| f.path.replace('\\', "/").contains(".github/workflows/ci.yml")),
+            "走不进 .github/ 目录——CI 配置对模型永远不可见"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn dot_noise_directories_are_named_not_guessed_by_the_leading_dot() {
+        // 判据必须是"这个名字在名单里"，而不是"以点开头"。
+        assert!(skip_walk_entry(".git", true));
+        assert!(skip_walk_entry(".venv", true));
+        assert!(skip_walk_entry("node_modules", true));
+        assert!(!skip_walk_entry(".github", true), ".github 是源码，不是噪声");
+        assert!(!skip_walk_entry(".env", false));
+        assert!(!skip_walk_entry(".eslintrc", false));
+        assert!(!skip_walk_entry(".gitignore", false));
+        // 同名的普通目录不能因为出现在 IGNORED_DIRS 里就连文件也一起挡掉
+        assert!(!skip_walk_entry("build", false), "叫 build 的文件不该被当成 build 目录");
+    }
+
     #[test]
     fn creating_a_project_binds_it_as_a_workspace_root() {
         // 真跑一次：建目录 → 注册成工作区根 → 目录里能写文件。
