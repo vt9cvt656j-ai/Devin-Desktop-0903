@@ -51612,7 +51612,20 @@ return { type: call.type, path: call.query || "", content: `[失败] ${call.type
       if (!inTauri) { return { type: "capture_flows", path: "", content: "[不可用] 抓包只能在桌面 App 里用。" }; }
       const q = call.filter || "";
       const match = (f) => !q || (`${f.host||""} ${f.path||""} ${f.url||""} ${f.method||""} ${f.status||""} ${f.ctype||""}`).toLowerCase().includes(q);
-      const h2t = (h) => (h && typeof h === "object") ? Object.keys(h).map((k) => `${k}: ${h[k]}`).join("\n") : "";
+      // 凭据头只报"有"，不报值。
+      //
+      // 抓包结果是直接进模型上下文的（再经网关发给模型服务商），而 Cookie / Authorization
+      // 这些恰好躲开了 _redactSecrets——它认的是 `xxx_token=` 这类形状，`Cookie: sid=…`
+      // 和 `Authorization: Bearer …` 都不匹配。于是每调一次 capture_flows，整个会话的
+      // Cookie 就被原样送出去一次。
+      // 而模型**根本不需要这些值**：重放走 capture_replay(id)，凭据是在本地从抓包缓冲区
+      // 取的（跨域时还会被剥掉）。报出名字和长度足够它判断"这个请求带了鉴权"，值留在本机。
+      const _credHeaders = new Set(["cookie", "set-cookie", "authorization", "proxy-authorization", "x-api-key", "x-auth-token", "x-csrf-token", "x-xsrf-token"]);
+      const h2t = (h) => (h && typeof h === "object")
+        ? Object.keys(h).map((k) => _credHeaders.has(k.toLowerCase())
+            ? `${k}: [本机保留，${String(h[k] ?? "").length} 字符 —— 用 capture_replay(id) 重放会自动带上它]`
+            : `${k}: ${h[k]}`).join("\n")
+        : "";
       const n = Math.max(1, Math.min(200, call.limit || 30));
       const picked = _captureFlows.filter(match).slice(-n).reverse();
       res.className = "atc-result atc-result--ok"; res.textContent = `${picked.length}/${_captureFlows.length} 条`;
