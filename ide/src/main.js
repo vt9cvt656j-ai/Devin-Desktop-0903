@@ -25029,7 +25029,7 @@ function _localizationPlan(command, output, run) {
   return out.join("\n");
 }
 
-async function _agentRunInTerminal(root, command, stepEl) {
+async function _agentRunInTerminal(root, command, stepEl, explicitTimeoutSecs) {
   if (!command || !command.trim()) return { code: -1, stdout: "", stderr: "" };
   const cmd = command.trim();
   if (cmd === "cd" || cmd === "cd ~" || cmd === "cd /") return { code: 0, stdout: "", stderr: "" };
@@ -25043,7 +25043,20 @@ async function _agentRunInTerminal(root, command, stepEl) {
       status.innerHTML = `⚠ ${_escHtml(riskLabel)} · Running`;
     }
   }
-  const timeoutSecs = _agentCommandTimeoutSecs(cmd);
+  // 超时上限：模型显式给的优先，没给才按命令字面量推。
+  //
+  // 原来只有 `_agentCommandTimeoutSecs(cmd)` 这一条路——一张正则白名单，不在名单里的
+  // 一律 240 秒。`make -j8`、`docker build .`、`cmake --build build`、
+  // `./scripts/integration-test.sh` 一条都不命中，冷编一个 Tauri 工程 300 秒也打不住。
+  // 到点子进程被杀，模型收到 exit -1 加一句"长时间运行的命令请在终端里手动运行"——
+  // 而它**没有任何办法**说"再给我 600 秒"：schema 里根本没有这个参数。于是它要么反复
+  // 重跑反复被杀，要么听劝改用 run_in_terminal，而那条路长命令拿不到退出码，恰恰毁掉
+  // purpose:"verify" 承诺的"退出码就是结论"。
+  // 后端一直支持到 600 秒（tasks.rs 的 TASK_TIMEOUT_SECS），能力是现成的，只是没暴露。
+  const _explicit = Number(explicitTimeoutSecs);
+  const timeoutSecs = Number.isFinite(_explicit) && _explicit > 0
+    ? Math.min(600, Math.max(5, Math.floor(_explicit)))
+    : _agentCommandTimeoutSecs(cmd);
   // Remote dev: run the command ON the connected remote machine (no SSH). Safety
   // filters above still apply. Live streaming is skipped; the final result is shown.
   if (_remote.active) {
@@ -31067,7 +31080,7 @@ function _buildAgentToolSchemas(includeWrite, mcpTools = []) {
       { type: "function", function: { name: "edit_file", description: "Make an exact replacement in an existing file: replace old_string with new_string. Prefer this for modifying an existing file. old_string must locate uniquely in the file (include enough context), otherwise it errors.", parameters: { type: "object", properties: { path: { type: "string" }, old_string: { type: "string", description: "The original text to replace; must match the file character for character" }, new_string: { type: "string", description: "The replacement text" }, replace_all: { type: "boolean", description: "When true, replace every match; by default only the single unique occurrence" } }, required: ["path", "old_string", "new_string"] } } },
       { type: "function", function: { name: "multi_edit", description: "Make several exact replacements in the same file: edits is a list of {old_string, new_string, replace_all?} applied in order, atomically (if any one fails to locate, nothing is written and it errors). Use it for refactors or several changes in one file — faster and more reliable than firing multiple edit_file calls. Each old_string must still locate uniquely in the file as it stands at that point. 【vs alternatives】One change: edit_file. New file or full rewrite: write_file.", parameters: { type: "object", properties: { path: { type: "string" }, edits: { type: "array", description: "Ordered list of replacements", items: { type: "object", properties: { old_string: { type: "string" }, new_string: { type: "string" }, replace_all: { type: "boolean" } }, required: ["old_string", "new_string"] } } }, required: ["path", "edits"] } } },
       { type: "function", function: { name: "write_file", description: "Create a new file or rewrite one entirely. Use only for creation or a complete rewrite; for a local change use edit_file.", parameters: { type: "object", properties: { path: { type: "string", minLength: 1, description: "The exact file path confirmed this round; a relative path is always based on this task's workspace root" }, content: { type: "string", minLength: 1, description: "The complete, non-empty UTF-8 file content to write — never omitted and never placeholder content" } }, required: ["path", "content"], additionalProperties: false } } },
-      { type: "function", function: { name: "run_cmd", description: "Run a command in the workspace that terminates, and return its exit code and output (installing dependencies, running tests, building, git, etc.). Use the syntax for the current OS: Windows goes through cmd.exe (dir/type/findstr, cd /d, start \"\" /b, %TEMP%), mac/Linux through bash/zsh (ls/cat/grep, nohup …&, /tmp). **It is a pipe capture with no real terminal (TTY)**: full-screen and interactive programs — bubbletea/ncurses TUIs, vim/top, REPLs, or anything that reads /dev/tty, clears the screen, or waits for keystrokes — will fail here with errors like \"open /dev/tty\" or \"not a tty\". Those, like dev servers/watchers/listeners, go to run_in_terminal (the IDE's real PTY terminal) instead. Never start a service or watcher in the foreground here. 【vs alternatives】Dev servers, watchers, long-lived processes, and interactive/full-screen TUIs all use run_in_terminal — do not block on them with run_cmd.", parameters: { type: "object", properties: { command: { type: "string" }, purpose: { type: "string", enum: ["explore", "verify", "install", "mutate", "scaffold", "run"], description: "What this command is for: explore = read-only probing; verify = a one-shot check such as build/test/typecheck/lint (the exit code is the conclusion); install = installing dependencies; mutate = will modify workspace files; scaffold = generates a project skeleton; run = run the app/script to see its behaviour. Declare it honestly — verify + exit 0 is recorded as verification evidence, and mutate/scaffold re-arm the verification obligation." } }, required: ["command"] } } },
+      { type: "function", function: { name: "run_cmd", description: "Run a command in the workspace that terminates, and return its exit code and output (installing dependencies, running tests, building, git, etc.). Use the syntax for the current OS: Windows goes through cmd.exe (dir/type/findstr, cd /d, start \"\" /b, %TEMP%), mac/Linux through bash/zsh (ls/cat/grep, nohup …&, /tmp). **It is a pipe capture with no real terminal (TTY)**: full-screen and interactive programs — bubbletea/ncurses TUIs, vim/top, REPLs, or anything that reads /dev/tty, clears the screen, or waits for keystrokes — will fail here with errors like \"open /dev/tty\" or \"not a tty\". Those, like dev servers/watchers/listeners, go to run_in_terminal (the IDE's real PTY terminal) instead. Never start a service or watcher in the foreground here. 【vs alternatives】Dev servers, watchers, long-lived processes, and interactive/full-screen TUIs all use run_in_terminal — do not block on them with run_cmd.", parameters: { type: "object", properties: { command: { type: "string" }, purpose: { type: "string", enum: ["explore", "verify", "install", "mutate", "scaffold", "run"], description: "What this command is for: explore = read-only probing; verify = a one-shot check such as build/test/typecheck/lint (the exit code is the conclusion); install = installing dependencies; mutate = will modify workspace files; scaffold = generates a project skeleton; run = run the app/script to see its behaviour. Declare it honestly — verify + exit 0 is recorded as verification evidence, and mutate/scaffold re-arm the verification obligation." }, timeout_secs: { type: "integer", description: "Optional; how long to allow before the command and its children are killed. Default is inferred from the command (60-600s; a bare command gets 240s), hard maximum 600s. Raise it for one-shot commands that are simply slow — a cold `cargo build --release`, `docker build .`, `make -j8`, a full integration script. Being killed at the default is NOT a sign you should move to run_in_terminal: that is for servers and watchers, and it does not give you an exit code." } }, required: ["command"] } } },
       { type: "function", function: { name: "deploy_site", description: "**Put a finished site online in one command** — it runs npm run build, uploads to the server, and **allocates an HTTPS subdomain `name.michaelide.xyz` automatically** (wildcard DNS and a wildcard certificate are already configured, so the user need not touch DNS or add an A record in a registrar console), returning a URL they can open and share (of the form https://my-portfolio.michaelide.xyz/). **When the user says \"point a subdomain at it / a custom domain / put it online to share\", just use this tool — the subdomain is fully automatic, so do not ask them what the domain is or send them to a registrar to add records by hand.** Use it once a site is built and the user should genuinely be able to open and share it (the last step of the idea → design → build → launch loop).", parameters: { type: "object", properties: { name: { type: "string", description: "Site name (a short slug used as the URL path, e.g. mrday / my-portfolio)" } }, required: ["name"] } } },
       { type: "function", function: { name: "delete_path", description: "Delete a file or directory inside the workspace (recursively). For cleanup and refactoring. Delete only what genuinely should be deleted, and confirm the path exists first. 【When to use】When cleaning up abandoned files, or removing an old module during a refactor.", parameters: { type: "object", properties: { path: { type: "string", minLength: 1, description: "Path of the file or directory to delete" } }, required: ["path"] } } },
       { type: "function", function: { name: "move_path", description: "Move or rename a file or directory inside the workspace (from → to). For refactoring and renaming. 【When to use】When renaming during a refactor, or reorganizing the directory structure.", parameters: { type: "object", properties: { from: { type: "string", minLength: 1, description: "Source path" }, to: { type: "string", minLength: 1, description: "Target path" } }, required: ["from", "to"] } } },
@@ -32316,7 +32329,8 @@ function _mapToolCall(name, args, mcpToolMap = _mcpToolMap) {
     case "write_file": return { type: "write", path: args.path || "", content: args.content || "", contentProvided: Object.prototype.hasOwnProperty.call(args, "content") };
     case "run_cmd": {
       const _purpose = ["explore", "verify", "install", "mutate", "scaffold", "run"].includes(args.purpose) ? args.purpose : "";
-      return { type: "cmd", command: args.command || "", purpose: _purpose };
+      const _t = Number(args.timeout_secs);
+      return { type: "cmd", command: args.command || "", purpose: _purpose, timeoutSecs: Number.isFinite(_t) && _t > 0 ? Math.floor(_t) : 0 };
     }
     case "deploy_site": {
       // 安全部署：构建 → 打包 → 带用户 JWT POST 到网关 /api/deploy（账号绑定 + 白名单 + 限大小 +
@@ -36529,7 +36543,15 @@ function _headTailModelText(value, maxChars) {
   const limit = Math.max(0, Math.floor(Number(maxChars) || 0));
   if (!limit) return "";
   if (text.length <= limit) return text;
-  const marker = `\n…（中间 ${text.length} 字中的部分日志已省略；保留开头和最终状态）…\n`;
+  // 措辞很要紧：这句话是模型判断"我手上是不是全部"的唯一依据。
+  //
+  // 原文是「中间 N 字中的部分**日志**已省略；保留开头和最终状态」。两个毛病：
+  // (a) "日志"是个误导词——同一条路径上跑的还有网页正文、git diff、检索结果，
+  //     模型看到"日志"会以为省掉的是噪声，而对一份 API 文档来说省掉的正是参数表。
+  // (b) 它没说清这是**投递给模型时的二次省略**。工具自己可能已经截过一刀并附了说明
+  //     （web_fetch 会写"这里只给了前 24000 字符"），那句说明活在 tail 里，于是模型
+  //     同时收到"你有前 24000"和"中间省了"两句互相矛盾的话，无从知道到底缺了哪一段。
+  const marker = `\n…（⚠️ 这里被**再次**省略过：原始结果共 ${text.length} 字，投递给你时只保留了开头和结尾，中间约 ${text.length - limit} 字不在上下文里。如果上面还有工具自己写的截断说明，那是另一层截断——两层叠加，你手上的比任何一句说明讲的都少。需要完整内容就换更窄的查询重取。）…\n`;
   if (limit <= marker.length + 2) return text.slice(-limit);
   const remaining = limit - marker.length;
   const head = Math.ceil(remaining * 0.45);
@@ -36760,6 +36782,15 @@ function _toolMsgForModel(call, result) {
     // the tail (matches / symbols / diagnostics) so the model re-runs the query or edits on an
     // incomplete set — the same starvation trap as reads, on the highest-volume tools.
     : _rt === "search" || _rt === "find" || _rt === "lsp" || _rt === "semsearch" || _rt === "findsymbol" || _rt === "knowledge" || _rt === "localdiscovery" || _rt === "liveenvironment" || _rt === "diag" ? 30000
+    // web_fetch / git_diff 和 read_file 是同性质的：它们的**全部目的就是投递内容**。
+    // 落在下面 8000 那一档会被拦腰切开——而 web_fetch 的后端刚在末尾附了一句
+    // "这里只给了前 24000 字符"，那句话经此一刀就变成假的：模型手上只有约 8000 字，
+    // 却被明确告知拿到了 24000，于是它据此断言"文档里没提到 X"，而 X 就在被掐掉的中段。
+    // git_diff 更直接：Reviewer 模式把它列为主证据源，一个 500 行的 diff 会被切掉中间
+    // 几个改动文件，模型对着半份 diff 做评审。
+    // 两者都天然有界（web_fetch 后端硬顶 24000 字符，git diff 后端硬顶 200KB），
+    // 放进 30000 档不会失控。tor / openapi_parser / figma 没有核到后端上界，不跟着挪。
+    : _rt === "web" || _rt === "git" ? 30000
     : _rt && _rt.endsWith("_search") ? 20000
     // cmd/http/mcp output can be arbitrarily huge and noisy → keep the tight guard.
     : 8000;
@@ -53117,7 +53148,7 @@ return { type: call.type, path: call.query || "", content: `[失败] ${call.type
       // Baseline for the observed-mutation fact: anything the watcher reports after this
       // point and before the result is read is attributable to this command.
       call._fsWatchSnap = _fsWatchSnapshot();
-      const result = await _agentRunInTerminal(root, call.command, step);
+      const result = await _agentRunInTerminal(root, call.command, step, call.timeoutSecs);
       let commandDiagnostics = null;
 
       // The native watcher observes only the local machine. After a remote command,
