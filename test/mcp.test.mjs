@@ -1144,3 +1144,56 @@ test("用户停止不能报成「失败」——那是他自己要的结果", ()
   assert.match(seg, /已按你的要求停止/, "卡片没说清是被停的");
   assert.match(seg, /\[interrupted\]/, "回给模型的不是中断标记，它会当成工具坏了去重试");
 });
+
+// ── 服务在运行中改了工具清单，要能就地看到 ───────────────────────────────────
+//
+// 谁会这么干：github-mcp-server 的 toolset 动态启用、切了仓库之后重列、服务内部完成一次
+// 交互后解锁新工具。在此之前这些改动完全不可见——配置指纹没变、mcp_status 全 true，
+// 快路径每轮原样返回旧快照，非得用户去面板手动点「重新连接全部」不可。
+// 而 Session 那三个标志的注释还写着「由每轮 ping 排空」，是假的：status_at 不碰它们。
+test("每轮 status 全绿之后，要顺带把宣告过变化的服务重列一次", () => {
+  const fn = extractFn("_ensureMcpTools");
+  assert.match(fn, /_mcpSyncServerChanges\(name, root, sigDoc\)/, "快路径没有接上就地重列");
+  // 不能 await：这一步只是让清单更新得更早，让它挡住首字延迟就得不偿失。
+  assert.match(fn, /void _mcpSyncServerChanges\(/, "await 了重列，会把首字延迟拖长");
+});
+
+test("就地重列绝不走断开重连——那会把引发变化的状态一起杀掉", () => {
+  const fn = extractFn("_mcpSyncServerChanges");
+  assert.match(fn, /_mcpDropServerEntries\(root, serverName\)/, "没有先摘旧条目");
+  assert.match(fn, /_mcpIngestServer\(serverName, server, discovery/, "没有走统一的收编函数");
+  assert.ok(!/_forgetMcpServer|mcp_disconnect|mcp_connect_full/.test(fn),
+    "掉进了断开重连：清单会变往往正因为服务刚登录完，重连会把那个状态连同变化一起抹掉");
+});
+
+test("先取标志再重列，顺序反了就等于每轮无条件重列", () => {
+  const fn = extractFn("_mcpSyncServerChanges");
+  const take = fn.indexOf("mcp_take_changes");
+  const redo = fn.indexOf("mcp_rediscover");
+  assert.ok(take > 0 && redo > take, "mcp_rediscover 自己会清标志，先重列就永远看不出变没变");
+});
+
+test("冷却期内连标志都不取——取了不用就等于永久吞掉一次变更", () => {
+  // mcp_take_changes 走的是 mem::take，取完 Rust 侧再也没有那条信息。
+  const fn = extractFn("_mcpSyncServerChanges");
+  assert.match(fn, /if \(!slot\.pending && Date\.now\(\) - slot\.at < _MCP_REDISCOVER_FLOOR_MS\) return false;/,
+    "冷却判断放在取标志之后的话，那次变更会被吞掉");
+  assert.match(fn, /slot\.pending = true;/, "取到手没记账，重列失败这次变更就永久消失");
+  assert.match(fn, /slot\.busy = false;/, "没有并发保护，同一个服务会被并发重列");
+});
+
+test("跨项目串线保护：两次 await 之间视图可能已经换成别的项目了", () => {
+  const fn = extractFn("_mcpSyncServerChanges");
+  assert.match(fn, /if \(!\(_mcpLoaded && _mcpLoadedRoot === root\)\) return false;/,
+    "不检查的话，会把 A 项目的工具塞进 B 项目的实时视图");
+});
+
+test("重列失败不标红，也不能弹假消息", () => {
+  const fn = extractFn("_mcpSyncServerChanges");
+  assert.ok(!/_mcpFailures\.set/.test(fn),
+    "服务活着、旧清单还能用，标红只会让用户看到一个既看不懂也不用管的错");
+  assert.match(fn, /if \(_mcpToolCache\.length !== before\)/,
+    "有的服务对每条请求都回一发 list_changed，清单没变还弹「更新了工具清单」就是假话");
+  assert.match(fn, /_mcpToolCache\.sort\(/,
+    "就地重列只动一个服务，不补排序新工具会全堆在尾巴上——而名录和开局窗口都按序截断");
+});

@@ -6988,7 +6988,11 @@ test("MCP launch normalization connects Claude/Cursor remote configs without dro
   // 启动那一步必须**带上**环境变量：不传就等于不展开 ${VAR}，从 Claude Code /
   // Cursor 导入的服务会拿着字面量 "${GITHUB_TOKEN}" 去鉴权，一路 401。
   assert.match(ensureSource, /_mcpServerLaunchConfig\(server, _launchEnv\)/);
-  assert.match(ensureSource, /tool\.inputSchema \|\| tool\.input_schema/);
+  // 收编发现结果那一段抽成了 _mcpIngestServer（就地重列要走逐字一样的这段：公开名消毒、
+  // readOnlyHint、descBody、资源/prompt 适配器；复制一份两边迟早长歪）。保证没变，换了位置。
+  assert.match(extractFn("_mcpIngestServer"), /tool\.inputSchema \|\| tool\.input_schema/);
+  assert.match(ensureSource, /_mcpIngestServer\(serverName, server, discovery, \{/,
+    "连接成功后没有走统一的收编函数");
 });
 
 test("MCP full discovery is connected to the Agent registry and execution path", () => {

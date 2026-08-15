@@ -27160,6 +27160,196 @@ function _forgetMcpServer(root, name) {
   }
 }
 
+/*
+ * 把一次发现结果装进实时视图。
+ *
+ * 抽出来是因为「就地重列」（服务发了 notifications/tools/list_changed 之后走 mcp_rediscover）
+ * 要走的是**逐字一样**的这一段：公开名的消毒与去重、readOnlyHint、descBody、资源与
+ * prompt 适配器。复制一份的话两边迟早长歪，而长歪的那一半决定「模型看到的工具叫什么、
+ * 能不能在只读模式里用」——那是最不该有两份的东西。
+ *
+ * seenSourceTools 从原来那个整轮共用的集合改成每次调用一个：它的键本来就带服务名，
+ * 跨服务撞不上，语义一字未变。
+ *
+ * server 传的是**原始配置**而不是拆好的字段：头像、审批模式、scope 都是配置的属性
+ * （藏在 __michael 里），不是服务自述的。重列时必须拿同一份配置重新算，否则一次重列
+ * 就把从市场装来的服务降级成无名自定义项。
+ */
+function _mcpIngestServer(serverName, server, discovery, { root, scope, source }) {
+  // 逐次审批与否是**服务**的属性，不是单个工具的。整套发现出来的东西（工具 /
+  // 资源 / prompt 适配器）都带上同一个结论，执行前的权限门直接读它。
+  const autoApprove = _mcpServerApprovalMode(scope, server) === "auto";
+  const seenSourceTools = new Set();
+  const tools = Array.isArray(discovery?.tools) ? discovery.tools : [];
+  const resources = Array.isArray(discovery?.resources) ? discovery.resources : [];
+  const prompts = Array.isArray(discovery?.prompts) ? discovery.prompts : [];
+  const resourceTemplates = Array.isArray(discovery?.resourceTemplates || discovery?.resource_templates)
+    ? (discovery.resourceTemplates || discovery.resource_templates) : [];
+  // 头像/展示名也存进来：工具卡要画**真实的服务图标**，而卡片渲染时拿不到
+  // servers[serverName] 这份配置（__michael 里才有 avatar/owner）。存原始字段而
+  // 不是拼好的 HTML——状态里塞标记串，改样式时会有一份改不到。
+  const _im = _mcpInstalledMeta(serverName, server);
+  _mcpServerMeta.set(serverName, {
+    root,
+    scope,
+    autoApprove,
+    avatar: String(_im.avatar || ""),
+    owner: String(_im.owner || ""),
+    displayName: String(_im.name || serverName),
+    // 用传进来的 source，不是 cfgDoc：那是 _ensureMcpTools 的闭包变量，搬进这个函数之后
+    // 就够不着了，运行到这一行会抛 ReferenceError（仓库的未声明标识符守卫抓住了它）。
+    source: String(source || ""),
+    capabilities: discovery?.capabilities || {},
+    serverInfo: discovery?.serverInfo || discovery?.server_info || {},
+    resources,
+    resourceTemplates,
+    prompts,
+  });
+  for (const item of resources) _mcpResourceCache.push({ server: serverName, root, ...item });
+  for (const item of resourceTemplates) _mcpResourceCache.push({ server: serverName, root, ...item, template: true });
+  for (const item of prompts) _mcpPromptCache.push({ server: serverName, root, ...item });
+  for (const tool of tools || []) {
+    if (!tool || !tool.name) continue;
+    const sourceKey = `${serverName}\0${tool.name}`;
+    if (seenSourceTools.has(sourceKey)) continue;
+    seenSourceTools.add(sourceKey);
+
+    const publicName = _mcpPublicToolName(serverName, tool.name, _mcpToolMap);
+    _mcpToolMap.set(publicName, {
+      server: serverName,
+      tool: tool.name,
+      kind: "tool",
+      readOnly: tool.annotations?.readOnlyHint === true,
+      autoApprove,
+      root,
+    });
+    const inputSchema = tool.inputSchema || tool.input_schema;
+    const schema = (inputSchema && typeof inputSchema === "object" && inputSchema.type)
+      ? inputSchema
+      : { type: "object", properties: (inputSchema && inputSchema.properties) || {} };
+    _mcpToolCache.push({
+      type: "function",
+      function: {
+        name: publicName,
+        description: _mcpDescriptionAsData(serverName, tool.description || tool.name),
+        parameters: schema,
+      },
+      // 名录块用的是不带免责前缀的这份。不能让它去 function.description 上按前缀
+      // 文本切——那段文字是可以被服务自述里原样伪造的，切出来的东西不可信。
+      descBody: _mcpDescriptionBody(tool.description || tool.name),
+    });
+  }
+  // MCP resources and prompts are first-class capabilities, not just metadata.
+  // Expose one explicit adapter per connected server so the model can use them
+  // through the same tool-call loop without pretending they are ordinary tools.
+  const resourceAdapter = _mcpCapabilitySchema(serverName, "resource", [...resources, ...resourceTemplates], _mcpToolMap);
+  if (resourceAdapter) {
+    _mcpToolMap.set(resourceAdapter.name, { ...resourceAdapter.route, autoApprove, root });
+    _mcpToolCache.push(resourceAdapter.schema);
+  }
+  const promptAdapter = _mcpCapabilitySchema(serverName, "prompt", prompts, _mcpToolMap);
+  if (promptAdapter) {
+    _mcpToolMap.set(promptAdapter.name, { ...promptAdapter.route, autoApprove, root });
+    _mcpToolCache.push(promptAdapter.schema);
+  }
+}
+
+/*
+ * 就地重列的节流与重试状态，键是 `${根}\0${服务名}`。
+ *
+ *   at      上次开始重列的时刻。_ensureMcpTools 一秒内可能被叫好几次（每轮开头一次、
+ *           面板重绘一次、开文件夹预热一次），而 mcp_rediscover 自己发的那几条 list 请求
+ *           也可能被服务再回一条 list_changed——它清掉的标志会被自己的请求重新立起来。
+ *           没有这道地板，那类服务会让每一次 _ensureMcpTools 都多付一整轮 tools/list。
+ *   pending 标志已经从 Rust 那边取走、但还没成功重列。**这一位不能省**：mcp_take_changes
+ *           走的是 std::mem::take，取完 Rust 侧就再也没有那条信息了，重列失败就等于这次
+ *           变更永久消失。也不能指望「下一轮 status 返回 false 会整根重连」兜底——
+ *           status_at 现在是 try_lock，锁被握着时答的是 true。
+ *   busy    这条正在飞。两个 await 之间会放别人进来，没有它就会对同一个服务并发发起重列。
+ */
+const _MCP_REDISCOVER_FLOOR_MS = 10_000;
+const _mcpRediscover = new Map();
+function _mcpRediscoverSlot(key) {
+  let slot = _mcpRediscover.get(key);
+  if (!slot) { slot = { at: 0, pending: false, busy: false }; _mcpRediscover.set(key, slot); }
+  return slot;
+}
+
+/*
+ * 服务宣告过「我的清单变了」时，在**同一个会话**上把新清单换进来。
+ *
+ * 谁会这么干：运行中改工具集的服务——github-mcp-server 的 toolset 动态启用、切了仓库或
+ * workspace 之后重列、服务内部完成一次交互后解锁新工具。在此之前这些改动完全不可见：
+ * 配置指纹没变、mcp_status 全 true，快路径每轮原样返回旧快照，非得用户去面板手动点
+ * 「重新连接全部」不可。
+ *
+ * **绝不走断开重连**：重连会把导致清单变化的那个状态一起杀掉，用户看到的是「刷新了一下，
+ * 新工具反而没了」。mcp_rediscover 存在的全部理由就是这个。
+ *
+ * 两条命令的顺序不能反：mcp_rediscover 自己会把标志清掉，先重列再取标志就永远看不出到底
+ * 变没变，等于每轮无条件重列一遍。
+ */
+async function _mcpSyncServerChanges(serverName, root, cfgDoc) {
+  const key = `${root}\0${serverName}`;
+  const slot = _mcpRediscoverSlot(key);
+  if (slot.busy) return false;
+  // 冷却期内**连标志都不去取**。取了却因为冷却而不重列，那次变更就被吞掉了——标志在
+  // Rust 侧已经被 mem::take 清空，之后谁也不会再知道它变过。留着不取，冷却过去照样看得到。
+  if (!slot.pending && Date.now() - slot.at < _MCP_REDISCOVER_FLOOR_MS) return false;
+  slot.busy = true;
+  try {
+    if (!slot.pending) {
+      // 5 秒够了：take_changes_at 是 try_lock，锁被握着就当场回全 false，不会排队。
+      const changes = await _invokeCapped("mcp_take_changes", { name: serverName, root }, 5_000, `MCP 清单变更 ${serverName}`);
+      if (!changes || !(changes.tools || changes.resources || changes.prompts)) return false;
+      // 取到手就立刻记账。下面任何一步失败，这一位都要留着，让下一轮**跳过 take 直接重列**。
+      slot.pending = true;
+    }
+    slot.at = Date.now();
+    // 上限 180 秒：rediscover 走的是**阻塞**会话锁，最坏要等在飞的 tools/call 走完再轮到它。
+    // 刻意不去覆盖那 600 秒——真有调用在飞时重列一点都不急；超时了 pending 留着、busy 挡着
+    // 并发，下一轮再来。
+    const discovery = await _invokeCapped("mcp_rediscover", { name: serverName, root }, 180_000, `MCP 重新发现 ${serverName}`);
+    // 上面两次 await 之间，另一个项目标签页可能已经把实时视图整份换成它自己的了。
+    // 这时候再往里拼，就是把 A 项目的工具塞进 B 项目的视图。丢掉即可——pending 留着，
+    // 切回来那一轮会重来。
+    if (!(_mcpLoaded && _mcpLoadedRoot === root)) return false;
+    // 元信息（头像 / 审批模式 / scope）来自配置而不是服务自述，重列要用**同一份**配置。
+    // 走到这里的前提正是配置指纹没变，所以重新解析出来的一定还是当初装它的那一份。
+    let server = {};
+    try {
+      const parsed = JSON.parse(cfgDoc?.text || "{}");
+      server = ((parsed && (parsed.mcpServers || parsed.servers)) || {})[serverName] || {};
+    } catch {}
+    const before = _mcpToolCache.length;
+    _mcpDropServerEntries(root, serverName);
+    _mcpIngestServer(serverName, server, discovery, {
+      root,
+      scope: cfgDoc?.serverScopes?.[serverName] || "repo",
+      source: cfgDoc?.serverSources?.[serverName] || "",
+    });
+    slot.pending = false;
+    // 初次发现是所有服务装完之后统一排一次序；就地重列只动一个服务，得自己补这一下，
+    // 否则新工具全堆在数组尾巴上，而名录和开局工具窗口都是按序截断的。
+    _mcpToolCache.sort((a, b) => (
+      a.function.name < b.function.name ? -1 : a.function.name > b.function.name ? 1 : 0
+    ));
+    // 只在数量真的变了时才吭声：有的服务对每条请求都回一发 list_changed，重列出来的清单
+    // 和原来一模一样——那种情况弹一句「更新了工具清单」，说的是假话。
+    if (_mcpToolCache.length !== before) {
+      showToast(`MCP 服务 ${serverName} 更新了工具清单，现有 ${_mcpToolCache.length} 个工具`);
+    }
+    return true;
+  } catch (error) {
+    // 重列失败**不**记进 _mcpFailures：服务活着、旧清单还能用，把它标红只会让用户看到一个
+    // 既看不懂也不用管的错。变更本身没丢——pending 还立着，冷却一过下一轮直接重列。
+    console.warn("[mcp] 就地重新发现失败:", serverName, error);
+    return false;
+  } finally {
+    slot.busy = false;
+  }
+}
+
 async function _ensureMcpTools(rootOverride = "") {
   try { _perfPhase("_ensureMcpTools"); } catch {}
   if (!inTauri) return { connected: 0, tools: 0, failed: [] };
@@ -27187,12 +27377,27 @@ async function _ensureMcpTools(rootOverride = "") {
     // already-spawned servers (and their tools) loaded in every later conversation
     // until app restart ("我删除了 mcp 每次对话还能加载").
     let sigNow = "";
-    try { const doc = await _readWorkspaceMcpDocument(root); sigNow = doc.path + "\n" + (doc.text || ""); } catch {}
+    let sigDoc = null;
+    try { sigDoc = await _readWorkspaceMcpDocument(root); sigNow = sigDoc.path + "\n" + (sigDoc.text || ""); } catch {}
     if (sigNow === _mcpConfigSig) {
       const statuses = await Promise.all(_mcpConnected.map(async (name) => {
         try { return await backend.invoke("mcp_status", { name, root }); } catch { return false; }
       }));
       if (statuses.every(Boolean)) {
+        /*
+         * 服务活着、配置也没变——但它可能在运行中改了自己的工具清单（发过
+         * notifications/tools/list_changed）。这条快路径原本每轮原样返回旧快照，于是那些
+         * 新工具非得等用户去面板手动「重新连接全部」才看得见。
+         *
+         * 在同一个会话上就地重列，绝不断开重连：清单会变往往正是因为服务里刚发生了状态
+         * 变化（比如用户刚在浏览器里登录完），重连会把那个状态连同变化一起抹掉。
+         *
+         * 不 await：这一步只是让清单更新得更早一点，让它挡住首字延迟就得不偿失了。
+         * 重列成功会就地改实时视图，下一轮自然看得到。
+         */
+        for (const name of _mcpConnected) {
+          try { void _mcpSyncServerChanges(name, root, sigDoc); } catch {}
+        }
         return _mcpRememberState(root, _mcpSnapshot(root));
       }
     }
@@ -27300,16 +27505,12 @@ async function _ensureMcpTools(rootOverride = "") {
       }
     }
 
-    const seenSourceTools = new Set();
     // 真正拼启动参数这一步才展开 ${VAR}。上面那个确认框用的是**没展开**的版本，
     // 免得把 token 摊在屏幕上；探测登录 shell 只做一次，这里等它一下。
     const _launchEnv = await _mcpShellEnv();
     await Promise.all(names.map(async (serverName) => {
       const server = servers[serverName] || {};
       const scope = cfgDoc.serverScopes?.[serverName] || "repo";
-      // 逐次审批与否是**服务**的属性，不是单个工具的。整套发现出来的东西（工具 /
-      // 资源 / prompt 适配器）都带上同一个结论，执行前的权限门直接读它。
-      const autoApprove = _mcpServerApprovalMode(scope, server) === "auto";
       const launch = _mcpServerLaunchConfig(server, _launchEnv);
       if (launch.error) {
         _mcpFailures.set(serverName, launch.error);
@@ -27328,76 +27529,11 @@ async function _ensureMcpTools(rootOverride = "") {
           cwd: _mcpServerCwd(cfgDoc.serverBases?.[serverName] || cfgDoc.base || root, launch.cwd),
           remote: !!launch.remote,
         });
-        const tools = Array.isArray(discovery?.tools) ? discovery.tools : [];
-        const resources = Array.isArray(discovery?.resources) ? discovery.resources : [];
-        const prompts = Array.isArray(discovery?.prompts) ? discovery.prompts : [];
-        const resourceTemplates = Array.isArray(discovery?.resourceTemplates || discovery?.resource_templates)
-          ? (discovery.resourceTemplates || discovery.resource_templates) : [];
-        // 头像/展示名也存进来：工具卡要画**真实的服务图标**，而卡片渲染时拿不到
-        // servers[serverName] 这份配置（__michael 里才有 avatar/owner）。存原始字段而
-        // 不是拼好的 HTML——状态里塞标记串，改样式时会有一份改不到。
-        const _im = _mcpInstalledMeta(serverName, server);
-        _mcpServerMeta.set(serverName, {
+        _mcpIngestServer(serverName, server, discovery, {
           root,
           scope,
-          autoApprove,
-          avatar: String(_im.avatar || ""),
-          owner: String(_im.owner || ""),
-          displayName: String(_im.name || serverName),
           source: cfgDoc.serverSources?.[serverName] || "",
-          capabilities: discovery?.capabilities || {},
-          serverInfo: discovery?.serverInfo || discovery?.server_info || {},
-          resources,
-          resourceTemplates,
-          prompts,
         });
-        for (const item of resources) _mcpResourceCache.push({ server: serverName, root, ...item });
-        for (const item of resourceTemplates) _mcpResourceCache.push({ server: serverName, root, ...item, template: true });
-        for (const item of prompts) _mcpPromptCache.push({ server: serverName, root, ...item });
-        for (const tool of tools || []) {
-          if (!tool || !tool.name) continue;
-          const sourceKey = `${serverName}\0${tool.name}`;
-          if (seenSourceTools.has(sourceKey)) continue;
-          seenSourceTools.add(sourceKey);
-
-          const publicName = _mcpPublicToolName(serverName, tool.name, _mcpToolMap);
-          _mcpToolMap.set(publicName, {
-            server: serverName,
-            tool: tool.name,
-            kind: "tool",
-            readOnly: tool.annotations?.readOnlyHint === true,
-            autoApprove,
-            root,
-          });
-          const inputSchema = tool.inputSchema || tool.input_schema;
-          const schema = (inputSchema && typeof inputSchema === "object" && inputSchema.type)
-            ? inputSchema
-            : { type: "object", properties: (inputSchema && inputSchema.properties) || {} };
-          _mcpToolCache.push({
-            type: "function",
-            function: {
-              name: publicName,
-              description: _mcpDescriptionAsData(serverName, tool.description || tool.name),
-              parameters: schema,
-            },
-            // 名录块用的是不带免责前缀的这份。不能让它去 function.description 上按前缀
-            // 文本切——那段文字是可以被服务自述里原样伪造的，切出来的东西不可信。
-            descBody: _mcpDescriptionBody(tool.description || tool.name),
-          });
-        }
-        // MCP resources and prompts are first-class capabilities, not just metadata.
-        // Expose one explicit adapter per connected server so the model can use them
-        // through the same tool-call loop without pretending they are ordinary tools.
-        const resourceAdapter = _mcpCapabilitySchema(serverName, "resource", [...resources, ...resourceTemplates], _mcpToolMap);
-        if (resourceAdapter) {
-          _mcpToolMap.set(resourceAdapter.name, { ...resourceAdapter.route, autoApprove, root });
-          _mcpToolCache.push(resourceAdapter.schema);
-        }
-        const promptAdapter = _mcpCapabilitySchema(serverName, "prompt", prompts, _mcpToolMap);
-        if (promptAdapter) {
-          _mcpToolMap.set(promptAdapter.name, { ...promptAdapter.route, autoApprove, root });
-          _mcpToolCache.push(promptAdapter.schema);
-        }
         _mcpConnected.push(serverName);
       } catch (error) {
         _mcpFailures.set(serverName, String(error?.message || error).slice(0, 160));
