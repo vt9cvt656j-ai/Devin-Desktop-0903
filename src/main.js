@@ -49605,7 +49605,33 @@ async function _executeToolStepInner(step, call, root, run) {
       if (!_analyzed) {
         return { type: "diag", path: call.path, content: `该文件未被语言服务分析（读不到内容或路径不存在），**不能据此认为没有问题**。请确认路径，或改用 run_cmd 跑项目自带的类型检查/测试。` };
       }
-      return { type: "diag", path: call.path, content: `无错误或警告${note}（注意：LSP 分析可能略有延迟，改完稍等再查更准）。` };
+      // 这个语言到底有没有人在给它出诊断？
+      //
+      // markers 只可能来自 Monaco 内置的 worker（TS/JS/JSON/CSS/HTML）和已装扩展推进来的。
+      // 对一个 .py/.rs/.go/.rb 文件，上面那套「临时建 model 等 900ms」照样跑，markers 恒为空，
+      // _analyzed 仍是 true——于是走到这一句「无错误或警告」。而工具描述教模型「改完代码拿它
+      // 做快速自检」，模型改完 Python 调它、拿到全绿、然后向用户报告「已修复并验证通过」。
+      //
+      // 括号里那句「分析可能略有延迟」更糟：它暗示再等等就准了，而真相是这个语言根本没有
+      // 诊断提供方，等到天亮也是空的。同一段代码上方的注释早就把这类假阴性写清楚了，只是
+      // 只在「文件读不到」那条腿上防住了。
+      const _diagLang = (() => {
+        try {
+          const m = _tempModel || _modelForExactPath(monaco.editor.getModels(), diagnosticPath);
+          return String(m?.getLanguageId?.() || "");
+        } catch { return ""; }
+      })();
+      const _BUILTIN_DIAG_LANGS = new Set(["typescript", "javascript", "typescriptreact", "javascriptreact", "json", "jsonc", "css", "scss", "less", "html"]);
+      if (diagnosticPath && _diagLang && !_BUILTIN_DIAG_LANGS.has(_diagLang) && !probs.length) {
+        return {
+          type: "diag", path: call.path,
+          content: `该文件是 ${_diagLang} 语言，当前 IDE **没有语言服务在给它出诊断**`
+            + `（内置只覆盖 TS/JS/JSON/CSS/HTML，其它语言要装对应的 LSP 扩展）。`
+            + `所以这次**一条都没检查**，不能当成「没有问题」。`
+            + `要验证它，跑项目自带的类型检查 / 编译 / 测试命令（run_cmd 或 run_in_terminal），并看真实退出码。`,
+        };
+      }
+      return { type: "diag", path: call.path, content: `无错误或警告${note}（${_diagLang || "该"} 语言的语言服务已在分析；LSP 出结果略有延迟，改完稍等再查更准）。` };
 
     } else if (call.type === "createproject") {
       // 智能体唯一真正缺的能力：没打开文件夹时它自己开不了工。
@@ -52960,6 +52986,37 @@ return { type: call.type, path: call.query || "", content: `[失败] ${call.type
         return { type: "docker_compose_up", path: composePath, content: `[ERROR] Docker Compose 启动失败（exit ${result.code}）:\n${output}${failureHint}${containerInfo}` };
       }
       
+      // `docker compose up -d` 退出 0 只代表**容器被创建并启动过**——镜像里的进程起来就崩
+      // （配置写错、缺环境变量、连不上数据库、CMD 路径不对）时它照样返回 0，容器状态是
+      // Exited(1) 或 Restarting。而下面那句「✅ 启动成功」原本只看这个退出码，ps 的输出
+      // 取了却只当装饰贴在后面。于是模型据此告诉用户「服务已启动」，用户去访问是连接被拒。
+      //
+      // ps 的结果已经在手上了，把它变成判据而不是装饰。
+      const _badStates = [];
+      try {
+        for (const line of String(statusOutput || "").split("\n")) {
+          const t = line.trim();
+          if (!t) continue;
+          if (t.startsWith("{")) {
+            const o = JSON.parse(t);
+            const st = String(o.State || o.Status || "");
+            if (st && !/^running|^Up\b/i.test(st)) _badStates.push(`${o.Service || o.Name || "?"}: ${st}`);
+          } else if (/\b(Exit(ed)?|Restarting|Dead|Created)\b/i.test(t) && !/^NAME\b/i.test(t)) {
+            _badStates.push(t.slice(0, 120));
+          }
+        }
+      } catch {}
+      if (_badStates.length) {
+        step.classList.add("agent-term-step--rejected");
+        res.className = "atc-result atc-result--err";
+        return {
+          type: "docker_compose_up", path: composePath,
+          content: `[未真正跑起来] docker compose up 退出码是 0（容器已创建），但容器**没有处于 running 状态**：\n`
+            + _badStates.map((x) => "  · " + x).join("\n")
+            + `\n\n退出码 0 只说明容器被创建并启动过，不代表里面的进程还活着——常见原因是配置错误、缺环境变量、依赖服务没起来。`
+            + `\n先看日志定位（docker compose logs --tail=100 <服务名>），修掉再重来；**不要告诉用户服务已经可用**。\n\n${output}${containerInfo}${failureHint}`,
+        };
+      }
       step.classList.add("agent-term-step--accepted");
       res.className = "atc-result atc-result--ok";
       res.innerHTML = `<svg viewBox="0 0 14 14" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 7.5l2.8 2.8L11 4"/></svg> <span>Docker 服务已启动</span>`;
