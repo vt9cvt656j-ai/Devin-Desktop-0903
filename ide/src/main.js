@@ -51639,10 +51639,12 @@ return { type: call.type, path: call.query || "", content: `[失败] ${call.type
       // 可用（只是需要模型自己显式给出新凭据）。
       const _replayCreds = ["cookie", "authorization", "proxy-authorization", "x-api-key", "x-auth-token", "x-csrf-token", "x-xsrf-token"];
       let _strippedCreds = [];
+      let _crossOrigin = false;
       try {
         const dstHost = new URL(url).host;
         const srcHost = (f && f.host) || (f && f.url ? new URL(f.url).host : "");
-        if (srcHost && dstHost && dstHost !== srcHost) {
+        _crossOrigin = !!(srcHost && dstHost && dstHost !== srcHost);
+        if (_crossOrigin) {
           for (const k of Object.keys(headers)) {
             if (_replayCreds.includes(k.toLowerCase()) && !(call.headers && k in call.headers)) {
               delete headers[k];
@@ -51651,15 +51653,25 @@ return { type: call.type, path: call.query || "", content: `[失败] ${call.type
           }
         }
       } catch { /* URL 解析不了就按原样发，这里不是安全边界的唯一一层 */ }
-      const body = call.body != null ? String(call.body) : (f ? f.reqBody : undefined);
+      // 上面只管住了头，**请求体一样是凭据**：登录 POST 里的用户名密码、OAuth 换 token 的
+      // client_secret、JSON 里塞的 API key，全在 body 里。把 A 站抓到的登录请求原样"重放"
+      // 到攻击者的域名，头剥干净了，密码照样送出去——而且看起来只是个正常的调试动作。
+      // 处理方式和头一致：跨域时不带抓到的 body，并明说怎么显式给。模型自己给的 body 照发
+      // （那是它明确的意图，不是从别处捡来的凭据）。
+      let _droppedBody = false;
+      let body = call.body != null ? String(call.body) : (f ? f.reqBody : undefined);
+      if (_crossOrigin && call.body == null && body != null && String(body) !== "") {
+        body = undefined;
+        _droppedBody = true;
+      }
       try {
         const r = await backend.invoke("http_request", { method, url, headers, body: (body == null ? null : String(body)) });
         const hdrs = r && r.headers ? Object.entries(r.headers).slice(0, 20).map(([k, v]) => `${k}: ${v}`).join("\n") : "";
         res.className = (r && r.ok) ? "atc-result atc-result--ok" : "atc-result atc-result--err";
         res.textContent = r ? `${r.status} ${r.status_text || ""}`.trim() : "无响应";
         const redirectBlock = _httpRedirectBlock(method, url, r);
-        const _credNote = _strippedCreds.length
-          ? `\n（注：目标域与抓包来源域不同，已移除 ${_strippedCreds.join("/")} 等凭据头；确需带凭据请在 headers 参数里显式给出。）`
+        const _credNote = (_strippedCreds.length || _droppedBody)
+          ? `\n（注：目标域与抓包来源域不同，已移除${_strippedCreds.length ? ` ${_strippedCreds.join("/")} 等凭据头` : ""}${_strippedCreds.length && _droppedBody ? "，" : ""}${_droppedBody ? "抓到的请求体（里面可能有密码 / client_secret / API key）" : ""}；确需带上请在 headers / body 参数里显式给出。）`
           : "";
         return { type: "capture_replay", path: url, ok: !!(r && r.ok), status: Number(r?.status), redirectUrl: r?.redirect_url || "", ...(redirectBlock ? { failure: { code: "http_redirect" } } : {}), content: _clip(`${_credNote}重发 ${method} ${url}\n状态: ${r ? r.status : "?"} ${r ? (r.status_text || "") : ""}\nContent-Type: ${r ? (r.content_type || "") : ""}${r && r.body_encoding ? `\nBody-Encoding: ${r.body_encoding}` : ""}${redirectBlock ? `\n${redirectBlock}` : ""}\n响应头:\n${hdrs}\n\n响应体:\n${r ? (r.body || "(空)") : "(无响应)"}`, 8000, "重发的响应内容") };
       } catch (e) {

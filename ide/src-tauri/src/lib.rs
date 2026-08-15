@@ -494,6 +494,11 @@ pub fn run() {
                 proxy::stop_all(&handle.state::<proxy::ProxyState>()); // reap the mitmdump proxy
                 mcp::stop_all(); // reap MCP servers on quit (global map, not Tauri State)
                 automation::stop(); // reap the desktop-automation server
+                // 浏览器一直不在这张单子上：退出 App 之后无头 Chrome 的整棵进程树还活着，
+                // 而它是这堆子进程里最重的一个。cleanup_stale（重载那条路）早就收它了，
+                // 只有退出这条漏了。必须用 blocking 版：close_all 把 drop 丢进后台线程，
+                // 而这时候进程马上就没了，那个线程根本来不及跑。
+                browser::close_all_blocking(std::time::Duration::from_secs(3));
             }
         });
 }
