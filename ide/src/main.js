@@ -9678,7 +9678,10 @@ async function preloadProjectModels(root) {
   for (const p of projectModels) {
     if (openFiles.has(p)) continue;
     const m = monaco.editor.getModel(monaco.Uri.file(p));
-    if (m) m.dispose();
+    // 先清标记再 dispose。标记记在 monaco 的全局表上、按 resource URI 索引，不跟着 model
+    // 一起消失；下次打开同一个文件夹时 URI 一样，上一辈子的红线就原样贴回来了。
+    // 其余几个 dispose 点都先清了（见 _clearAllMarkersForModel 上面那段说明），只有这个漏了。
+    if (m) { _clearAllMarkersForModel(m); m.dispose(); }
   }
   projectModels.clear();
 
