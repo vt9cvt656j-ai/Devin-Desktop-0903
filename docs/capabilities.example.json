@@ -1,0 +1,76 @@
+{
+  "_说明": [
+    "把这份文件的内容合并进下面任一处，Mr. Day One 就会自动认到（10 秒内生效，不用重启）：",
+    "  ~/.michael/settings.json              —— 你个人的，所有项目都有",
+    "  <项目>/.michael/settings.json         —— 跟着仓库走，团队共享",
+    "  <项目>/.michael/settings.local.json   —— 只属于你，别提交",
+    "同名的以先读到的为准（个人 > 项目）；disabled 是并集——任何一层说「别用这个」都算数。",
+    "删掉某一段，那个能力就没了。不用改代码，不用重新发版。"
+  ],
+
+  "capabilities": {
+    "tools": [
+      {
+        "name": "acme_tickets",
+        "description": "查 ACME 内部工单系统。按关键词或工单号查，返回标题、状态、负责人。问到「我们的工单」「这个 bug 谁在跟」时用它。",
+        "parameters": {
+          "query": { "type": "string", "description": "关键词或工单号", "required": true }
+        },
+        "http": {
+          "url": "https://intra.acme.com/api/tickets?q={query}",
+          "headers": { "Authorization": "Bearer ${ACME_TOKEN}" }
+        }
+      },
+
+      {
+        "name": "team_wiki",
+        "description": "检索团队内网 wiki。查内部规范、部署流程、历史决策时用它。",
+        "parameters": {
+          "q": { "type": "string", "description": "要查什么", "required": true }
+        },
+        "http": { "url": "${WIKI_BASE}/search?q={q}" }
+      },
+
+      {
+        "name": "notify_oncall",
+        "description": "给值班群发一条消息。只在用户明确要求通知时使用。",
+        "parameters": {
+          "text": { "type": "string", "description": "消息正文", "required": true }
+        },
+        "http": {
+          "url": "https://intra.acme.com/api/notify",
+          "method": "POST",
+          "headers": { "Content-Type": "application/json", "Authorization": "Bearer ${ACME_TOKEN}" },
+          "body": "{\"channel\":\"oncall\",\"text\":\"{text}\"}"
+        }
+      }
+    ],
+
+    "commands": [
+      {
+        "cmd": "review",
+        "desc": "按团队清单做代码评审",
+        "prompt": "按 CONTRIBUTING.md 里的评审清单逐条检查当前改动，只报真正的问题，每条给出文件和行号。"
+      },
+      {
+        "cmd": "deploy-staging",
+        "desc": "部署到预发并回帖结果",
+        "prompt": "跑 scripts/deploy.sh staging，把完整输出贴回来；失败的话先定位原因再问我要不要重试。"
+      }
+    ],
+
+    "disabled": [
+      "generate_image",
+      "generate_music",
+      "tor_request"
+    ]
+  },
+
+  "_要点": [
+    "写的是**工具名**（generate_image），不是内部类型名。工具名就是模型看到的那个名字。",
+    "${ACME_TOKEN} 这种取自你的 shell 环境变量——密钥不用写进这个文件。",
+    "{query} 这种是模型填的参数，拼进 URL 时会自动做 URL 编码。",
+    "GET / HEAD 默认算只读，所以 Plan、Explorer 这些只读模式里也能用它查东西；POST 这类照旧挡住。",
+    "每次调用都会问你一次，审批框里会写明这条声明来自哪个文件——因为 clone 来的仓库也可能带一份。"
+  ]
+}
