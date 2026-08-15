@@ -322,6 +322,9 @@ AUTO_LOAD_DEPS = {
   buildHttpCall,
   _userCapabilities: () => ({ tools: [], commands: [], disabled: [], errors: [] }),
   _userSlashCommands: () => [],
+  // 用户自定义角色：默认空。角色的行为测试见 test/capabilities-roles.test.mjs。
+  _userRoleMap: () => new Map(),
+  _userRoleEnumSuffix: () => "",
   _withoutDisabledTools: (tools) => tools,
   // The retired single-site search tools resolve through this table inside _mapToolCall.
   // Injecting the REAL table (not a stub) is what makes "gitlab_search still maps" a genuine

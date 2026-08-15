@@ -52,6 +52,7 @@ const ALLOWED_PARAM_TYPES = new Set(["string", "number", "integer", "boolean"]);
 /** 允许一次声明多少条，纯粹是防止一个坏文件把整个工具窗口挤爆。 */
 export const MAX_TOOLS = 64;
 export const MAX_COMMANDS = 64;
+export const MAX_ROLES = 32;
 
 const str = (v) => (typeof v === "string" ? v.trim() : "");
 
@@ -65,7 +66,7 @@ const str = (v) => (typeof v === "string" ? v.trim() : "");
  * @param {string} source 这份声明来自哪个文件，用于报错和审批框
  */
 export function normalizeCapabilities(raw, source = "") {
-  const out = { tools: [], commands: [], disabled: [], errors: [] };
+  const out = { tools: [], commands: [], roles: [], disabled: [], errors: [] };
   const bag = raw && typeof raw === "object" && !Array.isArray(raw) ? raw : null;
   if (!bag) return out;
   // 顶层允许直接写，也允许包在 `capabilities` 下——两种写法用户都会自然写出来。
@@ -89,11 +90,42 @@ export function normalizeCapabilities(raw, source = "") {
     out.commands.push(command);
   }
 
+  const seenRole = new Set();
+  for (const item of Array.isArray(caps.roles) ? caps.roles.slice(0, MAX_ROLES) : []) {
+    const { role, error } = normalizeRole(item, source);
+    if (error) { out.errors.push(error); continue; }
+    if (seenRole.has(role.name)) { out.errors.push(`角色重复：${role.name}`); continue; }
+    seenRole.add(role.name);
+    out.roles.push(role);
+  }
+
   for (const name of Array.isArray(caps.disabled) ? caps.disabled : []) {
     const n = str(name);
     if (n) out.disabled.push(n);
   }
   return out;
+}
+
+/**
+ * 规整一条角色声明。
+ *
+ * 角色不只是一段提示词，它还带一份**工具矩阵**——一个 `design` 子智能体拿得到浏览器，
+ * 一个 `database` 子智能体拿得到数据库查询。以前这三样（合法名单、提示词、工具矩阵）
+ * 是三张写死的表，加一个角色要改三处代码。
+ *
+ * 这里只校验形状。「这个工具名真的存在吗」要在 main.js 里对着真实工具目录查——那份
+ * 目录不在这个纯模块的视野里，而放行一个不存在的工具名，代价是子智能体被派出去之后
+ * 才发现手里没有那件工具。
+ */
+function normalizeRole(item, source) {
+  if (!item || typeof item !== "object") return { error: "角色声明必须是对象" };
+  const name = str(item.name).toLowerCase();
+  if (!NAME_RE.test(name)) return { error: `角色名不合法：${item.name || "(空)"}` };
+  const prompt = str(item.prompt);
+  if (!prompt) return { error: `角色 ${name} 缺少 prompt —— 那正是这个角色和别的角色的区别所在` };
+  const tools = (Array.isArray(item.tools) ? item.tools : []).map(str).filter(Boolean);
+  const types = (Array.isArray(item.types) ? item.types : []).map(str).filter(Boolean);
+  return { role: { name, prompt, tools, types, source } };
 }
 
 /** 规整一条工具声明。返回 `{tool}` 或 `{error}`，两者必有其一。 */
@@ -234,8 +266,9 @@ export function userToolShortName(fullName) {
  * 「收紧永远赢」的方向一致：一个作用域说"别用这个"，另一个作用域不该把它打开。
  */
 export function mergeCapabilities(list) {
-  const out = { tools: [], commands: [], disabled: [], errors: [] };
+  const out = { tools: [], commands: [], roles: [], disabled: [], errors: [] };
   const seenTool = new Set();
+  const seenRole = new Set();
   const seenCmd = new Set();
   for (const one of list || []) {
     if (!one) continue;
@@ -248,6 +281,11 @@ export function mergeCapabilities(list) {
       if (seenCmd.has(c.cmd)) continue;
       seenCmd.add(c.cmd);
       out.commands.push(c);
+    }
+    for (const r of one.roles || []) {
+      if (seenRole.has(r.name)) continue;
+      seenRole.add(r.name);
+      out.roles.push(r);
     }
     for (const d of one.disabled || []) if (!out.disabled.includes(d)) out.disabled.push(d);
     for (const e of one.errors || []) out.errors.push(e);
