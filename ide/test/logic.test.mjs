@@ -6882,6 +6882,9 @@ test("MCP loads Claude Code-compatible project configs and merges their capabili
     // _readWorkspaceMcpDocument 现在还会问一次"哪些服务被用户停用了"（见 test/mcp.test.mjs
     // 里那组停用测试）。这里没有停用的场景，给个空集合即可。
     _disabledMcpServers: async () => new Set(),
+    // `.mcp.local.json` 算不算"用户自己配的"要问 git（被跟踪＝跟着 clone 来的，按仓库自带
+    // 处理）。完整覆盖在 test/mcp.test.mjs；这里的场景是用户自己那份，答"没跟踪"。
+    _mcpLocalFileIsTracked: async () => false,
     _readUserScopeMcpConfigs: async () => [
       { path: "/home/me/.michael-ide/mcp.json", writable: true, servers: { global: { command: "node" }, local: { command: "全局的同名服务" } } },
     ],

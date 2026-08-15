@@ -26370,6 +26370,33 @@ async function _userScopeMcpConfigPath() {
   return "";
 }
 
+// `.mcp.local.json` 是不是**跟着仓库来的**。
+//
+// 这个文件名本来的含义是"用户自己在 MCP 面板里配的、不进版本库"（保存时
+// `_protectLocalMcpConfig` 会把它写进 .git/info/exclude）。整条信任链都建立在这个含义上：
+// scope=local → `_mcpServerApprovalMode` 返回 "auto" → 工具调用零弹窗，而一条 MCP 配置
+// 就是一条任意命令行。
+//
+// 但作用域原来是**按文件名猜的**。攻击者把 `.mcp.local.json` 直接 commit 进仓库，clone
+// 下来就带着它——文件名照样是 .mcp.local.json，于是被判成"用户自己配的"，绕开工作区信任
+// 和逐条命令确认，打开文件夹即执行。.git/info/exclude 不随 clone 传播，帮不上忙。
+//
+// 判据换成 git 是否跟踪它：被跟踪 ＝ 来自仓库 ＝ 和 .mcp.json 同等对待。
+// 结果按 base 缓存——这个函数每轮对话都会被调（缓存有效性校验那条路），不能每次都开进程。
+const _mcpLocalTrackedCache = new Map();
+async function _mcpLocalFileIsTracked(base) {
+  if (_mcpLocalTrackedCache.has(base)) return _mcpLocalTrackedCache.get(base);
+  let tracked = false;
+  try {
+    // 故意不用 --error-unmatch：它对"没跟踪"和"根本不是 git 仓库"都返回非零，分不开。
+    // 这样写时 code===0 就代表 git 确实回答了，stdout 非空即被跟踪。
+    const r = await backend.taskRunCapture(base, "git ls-files -- .mcp.local.json");
+    tracked = r?.code === 0 && !!String(r.stdout || "").trim();
+  } catch { tracked = false; }
+  _mcpLocalTrackedCache.set(base, tracked);
+  return tracked;
+}
+
 async function _readWorkspaceMcpDocument(root) {
   const documents = [];
   for (const base of _workspaceAncestorRoots(root)) {
@@ -26377,8 +26404,12 @@ async function _readWorkspaceMcpDocument(root) {
     // file wins when the same server name appears in more than one layer; parent roots are
     // still included so a monorepo-level service remains available to a nested package.
     for (const path of [base + "/.mcp.local.json", base + "/.mcp.json", base + "/.cursor/mcp.json"]) {
-      const scope = path.endsWith("/.mcp.local.json") ? "local" : "repo";
-      try { documents.push({ text: await backend.readTextFile(path), path, base, scope }); } catch {}
+      const isLocalName = path.endsWith("/.mcp.local.json");
+      let text;
+      try { text = await backend.readTextFile(path); } catch { continue; }
+      // 只在文件真的存在时才问 git——不存在的文件不值得开一个进程。
+      const scope = isLocalName && !(await _mcpLocalFileIsTracked(base)) ? "local" : "repo";
+      documents.push({ text, path, base, scope });
     }
   }
   // 用户级配置排在工作区之后：同名时项目里的那个赢，项目可以覆写一个全局服务。
@@ -26398,9 +26429,10 @@ async function _readWorkspaceMcpDocument(root) {
   if (!documents.length) return { text: "", path: "", base: "", serverBases: {}, serverSources: {}, serverScopes: {}, disabled };
   const mergedServers = {};
   const serverBases = {};
-  // 每个服务来自哪个文件。`.mcp.local.json` 是 IDE 自己的本地文件（_protectLocalMcpConfig
-  // 会把它写进 .git/info/exclude，不进版本库）＝用户自己配的；`.mcp.json` / `.cursor/mcp.json`
-  // 跟着仓库走 ＝ **外部可执行内容**，必须先过信任 + 逐条确认。调用方靠这张表区分两者。
+  // 每个服务来自哪个文件。**未被 git 跟踪的** `.mcp.local.json` 是 IDE 自己的本地文件
+  // （_protectLocalMcpConfig 会把它写进 .git/info/exclude）＝用户自己配的；`.mcp.json` /
+  // `.cursor/mcp.json`、以及被提交进版本库的 `.mcp.local.json`，都跟着仓库走
+  // ＝ **外部可执行内容**，必须先过信任 + 逐条确认。调用方靠这张表区分两者。
   const serverSources = {};
   // scope: local（项目本地，用户配的）/ repo（仓库自带）/ user（本 IDE 全局）/ interop（别的客户端的全局配置）
   const serverScopes = {};
