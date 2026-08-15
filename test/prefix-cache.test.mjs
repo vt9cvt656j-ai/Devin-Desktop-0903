@@ -1173,8 +1173,17 @@ test("续传成功了要画得出来，正文不能在工具开始时被删掉",
   // 工具一开始就删正文：对 write/edit 还有卡片顶上，对 read/search/list/cmd 就是纯粹的字没了。
   assert.doesNotMatch(turn, /_suppressNarrativeForTools = true;[\s\S]{0,400}streamEl\.remove\(\); streamEl = null;/,
     "不能再一见工具名就把已经读到的正文删掉");
-  assert.match(turn, /streamEl\.classList\.remove\("agent-seg--stream"\); streamEl = null;/,
+  assert.match(turn, /streamEl\.classList\.remove\("agent-seg--stream"\); _degradedProseEl = streamEl; streamEl = null;/,
     "就地降级：留住节点，后续帧另开一段");
+  // 松手之后必须留个引用：断线续传要复位渲染时得能撤掉这个孤儿节点，
+  // 否则渲染器会把整个 acc 重画进新段落，同一段话出现两次。
+  assert.match(turn, /let _degradedProseEl = null;/);
+  // 两条续传分支都要复位并撤孤儿——rerequest 那条早就有复位，continue 那条一直没有：
+  // 于是"从断点继续"成功之后，模型的整段回答一个字都画不出来。
+  const contBranch = turn.slice(turn.indexOf('if (mode === "continue")'), turn.indexOf('mode === "rerequest"'));
+  assert.match(contBranch, /_suppressNarrativeForTools = false;/,
+    "continue 分支不复位，续传成功也画不出来");
+  assert.match(contBranch, /_degradedProseEl\.remove\(\)/, "continue 分支不撤孤儿会重复正文");
 });
 
 test("中断和停止都不能把已经写出来的内容丢掉", () => {

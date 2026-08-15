@@ -36309,6 +36309,19 @@ function _trimMessagesIfHuge(messages, run = null, root = "", contextLimitTok = 
     for (let k = 0; k < trimUpTo; k++) {
       const i = toolIdx[k];
       const c = messages[i].content ? String(messages[i].content) : "";
+      // 压过一次就定形，别再压第二次。
+      //
+      // Tier 1 有这条守卫（`c.startsWith("[已折叠较早的")` → continue，注释写着"折叠一次定形"），
+      // Tier 2 一直没有。而 _smartCompress 的产物长度是 max(budget*2, 800)，稳定大于这里的
+      // 门槛 cap + 80 = 480 —— 所以**每一个后续压缩轮都会把它再压一遍**：
+      //   · `（原 N 字，已抽取压缩）` 会一层层叠加，而那个 N 从第二轮起指的是**上一轮压缩后**
+      //     的长度，不是原始长度。模型被告知"原 830 字"，实际原文 5000 字，它据此判断
+      //     "这条结果本来就不长、没什么被省掉"——正好判反。
+      //   · _lexCompress 反复作用在自己的产物上，第一轮特意抽出来的关键/报错行要重新过一遍
+      //     head/tail/important 的筛子，位置一变就可能被挤出去。
+      // 用元数据标记而不是匹配文本前缀：Tier 2 的产物没有固定前缀（读文件那支给的是
+      // "[已折叠 …行原文…"，普通那支是压缩后的正文本身），靠文本认必漏。
+      if (messages[i]?._ideMeta?.compressed) continue;
       if (c.length > cap + 80) {
         // Source code folded through an error-log extractor loses exactly what an edit needs.
         // If this read stashed a skeleton, keep that instead: true line numbers turn the
@@ -36321,7 +36334,8 @@ function _trimMessagesIfHuge(messages, run = null, root = "", contextLimitTok = 
         const meta = messages[i]?._ideMeta;
         messages[i] = {
           ...messages[i],
-          ...(meta?.kind === "read" ? { _ideMeta: { ...meta, contextAvailable: false } } : {}),
+          // compressed 是这条消息"已定形"的唯一标记，上面那道守卫认它。
+          _ideMeta: { ...(meta || {}), compressed: true, ...(meta?.kind === "read" ? { contextAvailable: false } : {}) },
           content: comp.length < c.length ? comp + `\n（原 ${c.length} 字，已抽取压缩）` : comp,
         };
         if (meta?.kind === "read") { readContextChanged = true; if (meta.signature) _foldedSigs.add(meta.signature); }
@@ -38954,6 +38968,10 @@ async function _agentModelTurn({ config, messages, toolSchemas, toolRegistry = n
   // reasoning -> tool cards -> later final answer.  The final guard below also covers
   // text-shaped tool calls, which are only recognized after the stream closes.
   let _suppressNarrativeForTools = false;
+  // 模型一开始调工具，前面那段正文就"就地降级"：摘掉流式标记、松手（streamEl = null），
+  // 节点留在 body 里。松手之后**没有任何变量再持有它**——断线续传要复位渲染时就找不到它，
+  // 于是渲染器会把整个 acc 重画进一个新段落，同一段话出现两次。留个引用给续传用。
+  let _degradedProseEl = null;
   // Throttle streaming re-render to ~12fps. Re-parsing + rebuilding the whole
   // markdown DOM (and re-highlighting code) on every animation frame is O(n²)
   // over a long reply and freezes the UI. The final full render runs once when
@@ -39266,6 +39284,17 @@ async function _agentModelTurn({ config, messages, toolSchemas, toolRegistry = n
             // the prefill the model continues from.
             for (const [, e] of byIndex) { try { _removeWritePreview(e, "resume"); } catch {} }
             byIndex.clear();
+            // 这一位只被置真、从不复位，而隔壁 rerequest 分支复位了、这条没有。
+            //
+            // 走到这里的场景是：模型写了一段话 → 开始调工具（此刻置真、正文就地降级）
+            // → 连接在工具调用中途断了。半截的工具调用刚被 byIndex.clear() 丢掉，续传会重发，
+            // 所以在它重新报出工具名之前，模型吐的字都是该给用户看的正文。
+            // 不复位的话 doRender 在入口就 return——续传即使成功也一个字都画不出来。
+            //
+            // 光复位还不够：降级时那个节点已经松手，渲染器会把整个 acc（旧正文 + 续写）
+            // 重画进一个新段落，于是同一段话出现两次。把孤儿节点撤掉，让这一次重画成为唯一的一份。
+            _suppressNarrativeForTools = false;
+            if (_degradedProseEl) { try { _degradedProseEl.remove(); } catch {} _degradedProseEl = null; }
             const resumeMsgs = [..._l0Msgs, { role: "assistant", content: partial }];
             showAgentRetryToast(
               `连接中断，正在从断点继续（${resume}/${resumeLimit}）——已生成的内容会保留，不重跑本轮`,
@@ -39290,6 +39319,8 @@ async function _agentModelTurn({ config, messages, toolSchemas, toolRegistry = n
           // 空串。修了续传却不修这一行，等于上线一个看不见的修复。
           _suppressNarrativeForTools = false;
           if (streamEl) { streamEl.remove(); streamEl = null; }
+          // 这条路 acc 会被清空重来，降级留下的那个孤儿节点不撤就是纯残留正文。
+          if (_degradedProseEl) { try { _degradedProseEl.remove(); } catch {} _degradedProseEl = null; }
           for (const el of _turnThinkCards) { try { el.remove(); } catch {} }
           _turnThinkCards.length = 0;
           reasoningEl = null;
@@ -39372,7 +39403,7 @@ async function _agentModelTurn({ config, messages, toolSchemas, toolRegistry = n
               // 改成就地降级：不删节点，只摘掉流式标记并松手，后续帧会另开一段。已经写出来的
               // 前言留在原处（它也因此能进 _keepProse 和 turn.text，不再是只存在过一瞬间的
               // 东西），工具卡照常追加在它后面。
-              if (streamEl) { streamEl.classList.remove("agent-seg--stream"); streamEl = null; }
+              if (streamEl) { streamEl.classList.remove("agent-seg--stream"); _degradedProseEl = streamEl; streamEl = null; }
             }
           }
           if (ev.arguments) e.args += ev.arguments;
