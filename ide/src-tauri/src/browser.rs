@@ -355,7 +355,14 @@ fn launch() -> Result<Session, String> {
         "--disable-session-crashed-bubble".into(),
         "--hide-crash-restore-bubble".into(),
         "--disable-infobars".into(),
-        "--disable-features=Translate,InfobarScreenshot,MediaRouter,OptimizationHints".into(),
+        // 这一条要**同时**带上 headless_chrome 默认参数里那份的值（TranslateUI /
+        // BlinkGenPropertyTrees），并在下面把默认那条摘掉。
+        //
+        // 原来是两条 --disable-features 一起传，靠「Chromium 对重复开关只认最后一次」
+        // 让我们这条覆盖掉默认那条——也就是默认那份的值被静默丢掉了。之前没出问题只是
+        // 因为那两个值本来就不重要；但现在开始用 ignore_default_args 管理默认参数，
+        // 再留着这种靠拼接顺序生效的隐式行为，出问题时根本没法推理。
+        "--disable-features=Translate,TranslateUI,BlinkGenPropertyTrees,InfobarScreenshot,MediaRouter,OptimizationHints".into(),
         "--disable-backgrounding-occluded-windows".into(),
         proxy_bypass.into(),
     ];
@@ -507,11 +514,14 @@ fn launch() -> Result<Session, String> {
     // 摘掉它就是**隐藏自动化身份**，也就是反检测——这个产品不做，由测试钉住。
     let ext_os: Vec<std::ffi::OsString> = exts.iter().map(std::ffi::OsString::from).collect();
     let ext_ref: Vec<&std::ffi::OsStr> = ext_os.iter().map(|s| s.as_os_str()).collect();
-    let drop_defaults: Vec<&std::ffi::OsStr> = if ext_ref.is_empty() {
-        Vec::new()
-    } else {
-        vec![std::ffi::OsStr::new("--disable-extensions")]
-    };
+    let mut drop_defaults: Vec<&std::ffi::OsStr> = vec![
+        // 我们自己那条 --disable-features 已经把默认那条的值并进去了，摘掉默认的，
+        // 让命令行上只剩一条——不再依赖「重复开关取最后一次」这种隐式覆盖。
+        std::ffi::OsStr::new("--disable-features=TranslateUI,BlinkGenPropertyTrees"),
+    ];
+    if !ext_ref.is_empty() {
+        drop_defaults.push(std::ffi::OsStr::new("--disable-extensions"));
+    }
     let opts = LaunchOptionsBuilder::default()
         .path(Some(std::path::PathBuf::from(&path)))
         .headless(headless)
@@ -1725,7 +1735,7 @@ mod tests {
     }
 
     #[test]
-    fn 只摘掉禁用扩展那一个默认参数_绝不摘自动化标志() {
+    fn 摘默认参数只摘该摘的两个_绝不摘自动化标志() {
         // `--enable-automation` 和 `--disable-extensions` 同在这个库的默认参数里。
         // 摘掉前者就是隐藏自动化身份，也就是反检测——这个产品不做，这条钉死它。
         let src = include_str!("browser.rs");
@@ -1736,6 +1746,25 @@ mod tests {
         assert!(
             !src.contains("OsStr::new(\"--enable-automation\")"),
             "不许把 --enable-automation 摘掉：那是反检测"
+        );
+    }
+
+    #[test]
+    fn 命令行上只能有一条_disable_features() {
+        // 以前两条一起传，靠「Chromium 对重复开关只认最后一次」让我们这条覆盖默认那条，
+        // 于是默认那份的值被静默丢掉。现在默认那条被显式摘掉，我们这条必须把它的值
+        // 并进来——否则这个"合并"是假的，只是把丢弃换了个写法。
+        let src = include_str!("browser.rs");
+        let ours = src
+            .lines()
+            .find(|l| l.contains("\"--disable-features=Translate,"))
+            .expect("找不到我们那条 --disable-features");
+        for inherited in ["TranslateUI", "BlinkGenPropertyTrees"] {
+            assert!(ours.contains(inherited), "默认参数里的 {inherited} 没并进来");
+        }
+        assert!(
+            src.contains("OsStr::new(\"--disable-features=TranslateUI,BlinkGenPropertyTrees\")"),
+            "默认那条 --disable-features 必须被显式摘掉，不能靠拼接顺序覆盖"
         );
     }
 
