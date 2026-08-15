@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { ArrowLeft, Plus, RefreshCw, Wrench } from "lucide-react";
 
 import type { ChangeKind, ChangelogEntry } from "@/data/changelog";
+import { mseFetch } from "@/lib/mse";
 import { cn } from "@/lib/utils";
 
 /*
@@ -77,7 +78,7 @@ export function ChangelogPage() {
     let alive = true;
     void (async () => {
       try {
-        const res = await fetch(FEED, { cache: "no-store" });
+        const res = await mseFetch(FEED, { cache: "no-store" });
         if (!res.ok) throw new Error(String(res.status));
         const body = (await res.json()) as { entries: ChangelogEntry[] };
         if (alive) setEntries(body.entries ?? []);

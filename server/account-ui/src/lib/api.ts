@@ -6,6 +6,8 @@
  * it is not the access control.
  */
 
+import { mseFetch } from "@/lib/mse";
+
 export type Me = {
   id: string;
   email: string;
@@ -350,7 +352,10 @@ export class ApiError extends Error {
 }
 
 async function request<T>(path: string, init?: { method?: string; body?: unknown }): Promise<T> {
-  const res = await fetch(path, {
+  // mseFetch 而不是 fetch：整个后台的请求都从这里出去，换掉这一处，Bearer 令牌、请求体、
+  // 查询串和响应体就都不再以明文经过 Cloudflare、nginx 和它们的日志。返回的仍是普通的
+  // Response，所以下面的 401/403、res.ok、res.json() 全都照旧。
+  const res = await mseFetch(path, {
     method: init?.method ?? "GET",
     headers: {
       Authorization: `Bearer ${token()}`,
@@ -461,8 +466,12 @@ export async function signOut(): Promise<void> {
   if (t) {
     try {
       // 等它回来再跳转：请求还在飞的时候导航，浏览器可以直接把它丢掉，而丢掉的正好
-      // 就是让退出登录生效的那一步。keepalive 再兜一层。
-      await fetch("/api/auth/logout", {
+      // 就是让退出登录生效的那一步。keepalive 再兜一层（mseFetch 原样透传 init，
+      // 所以封装之后 keepalive 依然生效）。
+      //
+      // 这一条尤其值得封起来：它是唯一一个**目的就是**把令牌送出去的请求，明文发等于
+      // 在退出登录的同时把还没作废的令牌抄给沿途每一个中间人。
+      await mseFetch("/api/auth/logout", {
         method: "POST",
         headers: { Authorization: `Bearer ${t}` },
         keepalive: true,
@@ -643,7 +652,13 @@ export async function probeDesktop(): Promise<DesktopProbe> {
   };
 }
 
-/** Carries the last failure back up, so the card can show it instead of a guess. */
+/**
+ * Carries the last failure back up, so the card can show it instead of a guess.
+ *
+ * Plain `fetch` on purpose, and it must stay that way: 127.0.0.1 is the desktop app, not
+ * our gateway. It has no MSE key, so sealing this would send an envelope it cannot open
+ * and the probe would report "unreachable" for an app that is running fine.
+ */
 async function reachDesktop(
   index = 0,
   lastError = "no attempt made",

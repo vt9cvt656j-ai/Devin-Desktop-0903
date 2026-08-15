@@ -74,7 +74,7 @@ pub fn purchase_html(r: &Receipt) -> String {
     <!-- Most clients block remote images by default, so the wordmark below is real text.
          The logo is a bonus, never the only thing carrying the brand. -->
     <img src="{logo}" width="44" height="44" alt="" style="display:block;margin:0 auto 12px auto;border:0;border-radius:10px;">
-    <div style="font-size:15px;font-weight:600;color:{INK};letter-spacing:-0.01em;">Mr.day One</div>
+    <div style="font-size:15px;font-weight:600;color:{INK};letter-spacing:-0.01em;">Mr. Day One</div>
   </td></tr>
 
   <tr><td align="center" style="padding:28px 32px 0 32px;text-align:center;">
@@ -102,7 +102,7 @@ pub fn purchase_html(r: &Receipt) -> String {
   <tr><td align="center" style="padding:28px 32px 32px 32px;text-align:center;">
     <div style="border-top:1px solid {LINE};padding-top:20px;font-size:12px;line-height:1.8;color:{MUTED};">
       付款由 <strong style="color:{INK};font-weight:600;">Stripe</strong> 处理<br>
-      银行卡信息不会经过 Mr.day One 的服务器<br>
+      银行卡信息不会经过 Mr. Day One 的服务器<br>
       <span style="display:inline-block;margin-top:8px;">如需发票或有任何疑问，直接回复这封邮件即可</span>
     </div>
   </td></tr>

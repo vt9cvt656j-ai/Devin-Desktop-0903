@@ -28,6 +28,16 @@ impl AppError {
             msg: msg.into(),
         }
     }
+    /// 「没有这个东西」。
+    ///
+    /// 和 `forbidden` 的区别值得写下来：403 说的是「有，但你不能看」，404 说的是「没有」。
+    /// 对**未发布**的内容要用这一个 —— 403 等于承认草稿存在，那本身就是信息。
+    pub fn not_found(msg: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::NOT_FOUND,
+            msg: msg.into(),
+        }
+    }
     pub fn internal(msg: impl Into<String>) -> Self {
         Self {
             status: StatusCode::INTERNAL_SERVER_ERROR,

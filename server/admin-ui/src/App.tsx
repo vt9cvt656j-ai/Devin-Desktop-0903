@@ -1,13 +1,17 @@
 import { useEffect, useState } from "react";
 import { Login } from "@/components/Login";
-import { Shell, type NavKey } from "@/components/Shell";
+import { Shell, navFor, type NavKey } from "@/components/Shell";
 import { Overview } from "@/pages/Overview";
 import { Customers } from "@/pages/Customers";
 import { Billing } from "@/pages/Billing";
 import { Settings } from "@/pages/Settings";
-import { Routing } from "@/pages/Routing";
+import { Routing, type RoutingView } from "@/pages/Routing";
 import { Pricing } from "@/pages/Pricing";
 import { Releases } from "@/pages/Releases";
+import { Changelog, type ChangelogView } from "@/pages/Changelog";
+import { Docs } from "@/pages/Docs";
+import { Commission, type CommissionView } from "@/pages/Commission";
+import { Mail, type MailView } from "@/pages/Mail";
 import { api, auth, endConsoleSession } from "@/lib/api";
 import { loadSettings } from "@/lib/settings";
 
@@ -16,6 +20,11 @@ export default function App() {
   const [authed, setAuthed] = useState(false);
   const [email, setEmail] = useState("");
   const [page, setPage] = useState<NavKey>("overview");
+  /*
+   * 结算方式决定侧栏里有没有「提现申请」。在这里取一次，而不是让 Shell 自己去拉 ——
+   * 侧栏每一页都在，放在里面就是每次切页都请求一遍同一个设置。
+   */
+  const [payoutNav, setPayoutNav] = useState({ auto: false, pending: 0 });
 
   const check = async () => {
     // 没有本地令牌就直接回登录页 —— 不再退回内嵌的登录框。能加载到这段代码说明门禁
@@ -30,6 +39,13 @@ export default function App() {
         return;
       }
       setAuthed(true);
+      // 拿不到就按「显示」处理：少显示一个入口比多显示一个更难发现。
+      void api
+        .get<{ auto_settle: boolean; pending_withdrawals: number }>(
+          "/api/admin/referral/settings",
+        )
+        .then((r) => setPayoutNav({ auto: r.auto_settle, pending: r.pending_withdrawals }))
+        .catch(() => undefined);
       // 面值分母等运营参数一次性拉进内存，金额显示才不会停在兜底值上。
       loadSettings(true);
       setEmail(me?.email || "");
@@ -51,14 +67,24 @@ export default function App() {
   if (!authed) return <Login onDone={check} />;
 
   return (
-    <Shell active={page} onNavigate={setPage} email={email} onLogout={() => setAuthed(false)}>
+    <Shell
+      active={page}
+      onNavigate={setPage}
+      email={email}
+      onLogout={() => setAuthed(false)}
+      nav={navFor(payoutNav.auto, payoutNav.pending)}
+    >
       {page === "overview" && <Overview />}
       {page === "customers" && <Customers />}
       {page === "billing" && <Billing />}
       {page === "settings" && <Settings />}
-      {page === "routing" && <Routing />}
+      {page.startsWith("mail") && <Mail view={page as MailView} />}
+      {page.startsWith("routing") && <Routing view={page as RoutingView} />}
       {page === "pricing" && <Pricing />}
+      {page.startsWith("commission") && <Commission view={page as CommissionView} />}
       {page === "releases" && <Releases />}
+      {page === "docs" && <Docs />}
+      {page.startsWith("changelog") && <Changelog view={page as ChangelogView} />}
     </Shell>
   );
 }

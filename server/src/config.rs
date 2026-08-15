@@ -24,6 +24,10 @@ pub struct Config {
     pub brevo_api_key: String,
     pub mail_from: String,
     pub mail_from_name: String,
+    /// Where this service answers from the public internet. Used to build links that are
+    /// followed from outside it — an unsubscribe link in an email being the first — which
+    /// cannot be relative and cannot point at a container's own hostname.
+    pub public_base: String,
     // Speech-to-text (voice input) upstream — OpenAI-compatible /audio/transcriptions.
     // Defaults to Groq's free Whisper-large-v3. Key from GROQ_API_KEY (or TRANSCRIBE_API_KEY).
     pub transcribe_api_key: String,
@@ -60,6 +64,35 @@ pub struct Config {
     pub github_login_client_secret: String,
     pub google_client_id: String,
     pub google_client_secret: String,
+
+    /// MSE-1 应用层加密。协议见 docs/MSE.md，实现见 mse.rs。
+    ///
+    /// `mse_mode` 默认 `optional`（收密文也收明文），而且**必须**是这个默认值：
+    /// 已经装在用户机器上的桌面端没法自动更新，一上来就 `required` 等于把它们全部
+    /// 锁在外面。灰度顺序写在 docs/MSE.md §11。
+    pub mse_mode: String,
+    /// base64 的 P-384 PKCS#8 私钥。留空则每次启动现生成一把 —— 能跑，但密钥固定
+    /// 失效（那是挡住主动中间人的那一步），且重启就换。
+    pub mse_server_key: String,
+    /// 轮换宽限期里仍然接受的上一把密钥。
+    pub mse_server_key_prev: String,
+    pub mse_session_ttl_secs: u64,
+    pub mse_max_skew_ms: i64,
+    pub mse_max_sealed_bytes: usize,
+    /// Redis 答不上来时是否放行重放检查。默认否 —— 放行等于在 Redis 抖动的那几秒里
+    /// 给「兑换码」和「提现」开一个重放窗口。
+    pub mse_replay_fail_open: bool,
+    /// 把加密响应的外层状态码一律写成 200，真实状态码只留在密文里。默认关：开了之后
+    /// 按状态码统计错误率的监控会全瞎，这个取舍要由部署方自己做。
+    pub mse_mask_status: bool,
+}
+
+/// 显式写 1/true/yes/on 才算开。其余一律关（fail-closed）。
+fn flag(key: &str, default: &str) -> bool {
+    matches!(
+        opt(key, default).trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "on"
+    )
 }
 
 /// JWT 密钥是整套鉴权的根：拿到它就能签一张 `role: "admin"` 的令牌，而 Claims 提取器
@@ -115,6 +148,7 @@ impl Config {
             mail_from: std::env::var("MAIL_FROM")
                 .unwrap_or_else(|_| std::env::var("QQ_SMTP_USER").unwrap_or_default()),
             mail_from_name: opt("MAIL_FROM_NAME", "Michael"),
+            public_base: opt("PUBLIC_BASE", "https://code.mrday.one"),
             transcribe_api_key: std::env::var("GROQ_API_KEY")
                 .or_else(|_| std::env::var("TRANSCRIBE_API_KEY"))
                 .unwrap_or_default(),
@@ -150,6 +184,25 @@ impl Config {
                 .unwrap_or_default(),
             google_client_id: std::env::var("GOOGLE_CLIENT_ID").unwrap_or_default(),
             google_client_secret: std::env::var("GOOGLE_CLIENT_SECRET").unwrap_or_default(),
+
+            mse_mode: opt("MSE_MODE", "optional"),
+            mse_server_key: std::env::var("MSE_SERVER_KEY").unwrap_or_default(),
+            mse_server_key_prev: std::env::var("MSE_SERVER_KEY_PREV").unwrap_or_default(),
+            mse_session_ttl_secs: opt("MSE_SESSION_TTL_SECS", "1800").parse().unwrap_or(1800),
+            mse_max_skew_ms: opt("MSE_MAX_SKEW_MS", "120000").parse().unwrap_or(120_000),
+            // 64 MiB。这个数是从 /api/deploy 倒推的，不是随手取的整数：
+            //
+            // 非 JSON 的 body（deploy 传的是原始归档）在信封里要 base64，35 MiB 会涨到
+            // 约 46.7 MiB。上限设成 36 MiB 的话，超过 27 MiB 的部署包就会被加密层挡下来
+            // —— 而且报错出现在一个和「包太大」毫无关系的地方。64 MiB 留足余量，同时仍然
+            // 低于 nginx 的 client_max_body_size 55m（真正的外层闸门在那里）。
+            //
+            // JSON body 不受影响：它以对象形态放进信封的 `b` 字段，不过 base64。
+            mse_max_sealed_bytes: opt("MSE_MAX_SEALED_BYTES", "67108864")
+                .parse()
+                .unwrap_or(67_108_864),
+            mse_replay_fail_open: flag("MSE_REPLAY_FAIL_OPEN", "0"),
+            mse_mask_status: flag("MSE_MASK_STATUS", "0"),
         })
     }
 

@@ -935,6 +935,17 @@ fn ide_request_id(headers: &HeaderMap) -> ApiResult<Option<String>> {
     Ok(Some(value.to_string()))
 }
 
+/// 落库加密的 context（= 列身份，绑进 AAD）。见 field_crypto.rs。
+const MODEL_KEY_CTX: &str = "models.api_key";
+
+/// 取出一条线路的上游 api_key 明文。存的是密文（`fc1:...`）或遗留明文，这里统一解开。
+///
+/// 解不开（密钥没配却是密文、或密钥不对）返回空串：空 Bearer 会让上游干净地回 401，
+/// 好过把一段 `fc1:...` 当令牌发出去，也好过 panic 掉一条不相关的请求。
+fn model_key(stored: &str) -> String {
+    crate::field_crypto::decrypt(stored, MODEL_KEY_CTX).unwrap_or_default()
+}
+
 fn allowed_ids(m: &Model) -> Vec<String> {
     if !m.enabled_models.is_empty() {
         return m.enabled_models.clone();
@@ -1050,7 +1061,7 @@ async fn i18n_pack_from_model(
     let url = format!("{}/chat/completions", api_base(&m.base_url));
     let resp = GW_HTTP
         .post(url)
-        .header("Authorization", format!("Bearer {}", m.api_key))
+        .header("Authorization", format!("Bearer {}", model_key(&m.api_key)))
         .json(&payload)
         .timeout(Duration::from_secs(90))
         .send()
@@ -1247,6 +1258,14 @@ pub async fn i18n_pack(
     if entries.is_empty() {
         return Err(AppError::bad("entries 不能为空"));
     }
+    // 总字节封顶。逐项限制（700 × 900）合起来仍有约 630KB 会被原样送进上游 —— 每次
+    // 缓存未命中都是一次这么大的输入，而这条路不计费。UI 文案实际远小于此；超了就拒，
+    // 而不是照单发给上游。
+    const MAX_ENTRIES_BYTES: usize = 128 * 1024;
+    let total_bytes: usize = entries.iter().map(|(k, v)| k.len() + v.len()).sum();
+    if total_bytes > MAX_ENTRIES_BYTES {
+        return Err(AppError::bad("entries 总量过大"));
+    }
 
     let cache_key = i18n_pack_cache_key(&locale, &entries);
     if let Some(v) = i18n_pack_cache_get(&cache_key) {
@@ -1268,8 +1287,16 @@ pub async fn i18n_pack(
     .fetch_all(&state.db)
     .await?;
 
+    // 扇出封顶：最多试 2 条线路（按管理台的 sort 顺序，即运营方自己排在最前面的两条）。
+    //
+    // 失败时这里会遍历**每一条**线路 × 每一个 model_id，逐个打上游（用运营方的 key，
+    // 不计费）。而失败是可以稳定构造的 —— 700 项的翻译输出超过任何上游的输出上限，
+    // 回包必然截断、解析失败。于是「每小时 40 次 miss 配额」被放大成「40 × 线路数 ×
+    // 模型数」次真实上游调用。翻译是机械活，靠前的线路试不出来，再沿目录往下试只是
+    // 烧钱；试不出就直接落到 public_translate 兜底。
+    const MAX_ROUTES_TRIED: usize = 2;
     let mut failures: Vec<String> = Vec::new();
-    for m in &models {
+    for m in models.iter().take(MAX_ROUTES_TRIED) {
         let mut ids = allowed_ids(m);
         if ids.is_empty() {
             if let Some(id) = &m.model_id {
@@ -1810,7 +1837,7 @@ pub async fn admin_create(
     .bind(req.provider.unwrap_or_default())
     .bind(req.base_url.trim().trim_end_matches('/'))
     .bind(req.model_id.unwrap_or_default().trim())
-    .bind(req.api_key.trim())
+    .bind(crate::field_crypto::encrypt(req.api_key.trim(), MODEL_KEY_CTX))
     .bind(req.rate.unwrap_or(1.0).max(0.0))
     .bind(req.input_price.unwrap_or(0.0).max(0.0))
     .bind(req.output_price.unwrap_or(0.0).max(0.0))
@@ -1866,7 +1893,7 @@ pub async fn admin_available(
         .map_err(|e| AppError::internal(e.to_string()))?;
     let resp = client
         .get(&url)
-        .header("Authorization", format!("Bearer {}", m.api_key))
+        .header("Authorization", format!("Bearer {}", model_key(&m.api_key)))
         .send()
         .await
         .map_err(|e| AppError::internal(format!("拉取模型列表失败: {e}")))?;
@@ -1946,8 +1973,10 @@ pub async fn admin_update(
         .unwrap_or(m.base_url);
     let api_key = match req.api_key {
         Some(k) if !k.trim().is_empty() => k.trim().to_string(),
-        _ => m.api_key,
+        _ => m.api_key, // 没传就沿用原值（此时已是密文；encrypt 对已加密值幂等）
     };
+    // 新传的是明文 → 加密；沿用的旧值已是密文 → 原样透过。见 field_crypto::encrypt。
+    let api_key = crate::field_crypto::encrypt(&api_key, MODEL_KEY_CTX);
     let rate = req.rate.unwrap_or(m.rate).max(0.0);
     let input_price = req.input_price.unwrap_or(m.input_price).max(0.0);
     let output_price = req.output_price.unwrap_or(m.output_price).max(0.0);
@@ -2156,6 +2185,20 @@ pub async fn chat(
     Json(mut body): Json<serde_json::Value>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let uid = uuid::Uuid::parse_str(&claims.sub).map_err(|_| AppError::unauthorized("令牌损坏"))?;
+
+    /*
+     * 并发闸。这条路由此前是**唯一**没有的。
+     *
+     * `/v1/chat/completions`、`/v1/responses`、`/v1/images/generations` 三条都拿了
+     * InFlightGuard，只有这一条漏了 —— 而它恰恰是会替用户发起 gpt-5.5 视觉调用的那一条
+     * （见 vision_preprocess）。没有闸意味着一个账号可以同时挂起任意多个 90 秒的上游
+     * 请求：钱最终会扣，但扣之前运营方已经先垫付了全部并发量，而且 upstream 那边的
+     * 速率配额是共享的，一个人就能把所有人卡住。
+     *
+     * 加密对这件事一点用都没有 —— 自己写脚本的人本来就绕开了浏览器。能拦的只有这里。
+     */
+    let _inflight_guard = InFlightGuard::acquire(&state, uid).await?;
+
     let request_id = ide_request_id(&headers)?;
     let model = sqlx::query_as::<_, Model>("SELECT * FROM models WHERE id = $1 AND active = true")
         .bind(id)
@@ -2222,7 +2265,7 @@ pub async fn chat(
     // request has images and the chosen model isn't vision-native, let gpt-5.5
     // describe the images first, then hand the text to the chosen model.
     if needs_vision_help(&chosen) {
-        vision_preprocess(&state, &mut body).await;
+        vision_preprocess(&state, uid, &mut body).await;
     }
 
     let url = format!("{}/chat/completions", api_base(&model.base_url));
@@ -2232,7 +2275,7 @@ pub async fn chat(
         .map_err(|e| AppError::internal(e.to_string()))?;
     let resp = client
         .post(&url)
-        .header("Authorization", format!("Bearer {}", model.api_key))
+        .header("Authorization", format!("Bearer {}", model_key(&model.api_key)))
         .json(&body)
         .send()
         .await
@@ -2575,7 +2618,19 @@ fn needs_vision_help(model_id: &str) -> bool {
 /// If the request carries images, ask gpt-5.5 to describe them, then rewrite the
 /// messages to plain text (description injected) so a non-vision model can work
 /// from it. No-op if there are no images or no gpt-5.5 connection is configured.
-async fn vision_preprocess(state: &AppState, body: &mut serde_json::Value) {
+/// 一次代看图最多带几张。
+///
+/// 之前不限：请求体上限 12 MB，全部图片打包进**一次** gpt-5.5 调用，按 $5/M 输入计价。
+/// 也就是说单个请求就能构造出一次很贵的上游调用。截断而不是拒绝 —— 正常人不会一次发
+/// 八张以上，而超出的那部分对"让文本模型看懂这张图"这个目的也没有边际价值。
+const MAX_VISION_IMAGES: usize = 8;
+/// 每个账号每小时能触发多少次代看图。
+///
+/// 这是钱包之外的第二道闸。钱包只保证"最终会扣到他头上"，但运营方是**先垫付**的：
+/// 上游那边的速率配额是所有用户共享的，一个账号狂刷就能把别人卡住，而且退款是事后的事。
+const VISION_CALLS_PER_HOUR: i64 = 60;
+
+async fn vision_preprocess(state: &AppState, uid: uuid::Uuid, body: &mut serde_json::Value) {
     let mut images: Vec<serde_json::Value> = Vec::new();
     if let Some(msgs) = body.get("messages").and_then(|m| m.as_array()) {
         for m in msgs {
@@ -2591,6 +2646,12 @@ async fn vision_preprocess(state: &AppState, body: &mut serde_json::Value) {
     if images.is_empty() {
         return;
     }
+    let dropped = images.len().saturating_sub(MAX_VISION_IMAGES);
+    images.truncate(MAX_VISION_IMAGES);
+
+    // 每小时配额。超了就跳过识别、照常把图片剥成文本 —— 这条路径本来就是 best-effort，
+    // 让整个对话失败比少一段图片描述糟糕得多。理由会写进注入的文本里，用户看得到。
+    let over_budget = !vision_budget_ok(state, uid).await;
     // best-effort: have gpt-5.5 describe the images (may fail → we still strip them)
     let mut desc: Option<String> = None;
     let conns = sqlx::query_as::<_, Model>(
@@ -2599,11 +2660,16 @@ async fn vision_preprocess(state: &AppState, body: &mut serde_json::Value) {
     .fetch_all(&state.db)
     .await
     .unwrap_or_default();
-    if let Some(vconn) = conns.into_iter().find(|m| {
-        allowed_ids(m)
-            .iter()
-            .any(|id| id.eq_ignore_ascii_case("gpt-5.5"))
-    }) {
+    let vconn = if over_budget {
+        None
+    } else {
+        conns.into_iter().find(|m| {
+            allowed_ids(m)
+                .iter()
+                .any(|id| id.eq_ignore_ascii_case("gpt-5.5"))
+        })
+    };
+    if let Some(vconn) = vconn {
         let mut vcontent = vec![json!({
             "type": "text",
             "text": "请详细、客观地描述这些图片的全部内容（文字、数据、图表、代码、界面元素、布局、配色等），让一个无法读图的模型也能据此完成工作。只输出描述本身。"
@@ -2617,12 +2683,29 @@ async fn vision_preprocess(state: &AppState, body: &mut serde_json::Value) {
             let url = format!("{}/chat/completions", api_base(&vconn.base_url));
             if let Ok(r) = client
                 .post(&url)
-                .header("Authorization", format!("Bearer {}", vconn.api_key))
+                .header("Authorization", format!("Bearer {}", model_key(&vconn.api_key)))
                 .json(&payload)
                 .send()
                 .await
             {
                 if let Ok(d) = r.json::<serde_json::Value>().await {
+                    /*
+                     * 立刻结账，**在返回之前**。
+                     *
+                     * 这一次调用花的是运营方自己的 key，此前完全不计费：调用方只要
+                     * 挑一个非原生视觉的模型（deepseek-*、glm-*、grok-*、kimi、qwen
+                     * 都算，见 needs_vision_help），随请求塞满图片，服务端就替他打一
+                     * 次 gpt-5.5（$5/M 输入），而账单上什么都不会出现。
+                     *
+                     * 更糟的是顺序：这一步跑在下游请求**之前**，而下游一旦非 2xx，
+                     * 外面那个 handler 会直接 return Err —— 那是在 bill() 之前。
+                     * 于是「故意让下游报错」就成了一个稳定的白嫖姿势，而且这条路由
+                     * 上没有 InFlightGuard，可以无限并发。
+                     *
+                     * 所以在这里就把账结掉，不依赖调用方后面还会不会走到计费点。
+                     * 记账口径和 bill_compression_call 一致，单独打标便于对账。
+                     */
+                    bill_vision_call(state, uid, &vconn, d.get("usage")).await;
                     if let Some(s) = d["choices"][0]["message"]["content"].as_str() {
                         if !s.trim().is_empty() {
                             desc = Some(s.to_string());
@@ -2632,9 +2715,18 @@ async fn vision_preprocess(state: &AppState, body: &mut serde_json::Value) {
             }
         }
     }
-    let note = match desc {
-        Some(d) => format!("【图片内容（由 GPT-5.5 视觉识别）】：\n{}", d),
-        None => "【图片】（视觉识别暂不可用，无法读取图片内容）".to_string(),
+    // 说清楚为什么少了东西。静默降级会让人以为模型看不懂图，转头去反复重试 ——
+    // 那正好是配额已经吃紧时最不该发生的事。
+    let note = match (&desc, over_budget) {
+        (Some(d), _) if dropped > 0 => format!(
+            "【图片内容（由 GPT-5.5 视觉识别，仅前 {} 张）】：\n{}\n（另有 {} 张未识别）",
+            MAX_VISION_IMAGES, d, dropped
+        ),
+        (Some(d), _) => format!("【图片内容（由 GPT-5.5 视觉识别）】：\n{}", d),
+        (None, true) => {
+            "【图片】（本小时的图片识别次数已用完，未读取图片内容；稍后再试）".to_string()
+        }
+        (None, false) => "【图片】（视觉识别暂不可用，无法读取图片内容）".to_string(),
     };
     // ALWAYS strip images → plain text so a non-vision model never chokes on them.
     if let Some(msgs) = body.get_mut("messages").and_then(|m| m.as_array_mut()) {
@@ -11394,6 +11486,74 @@ fn compression_spawn_warm(state: &AppState, uid: uuid::Uuid, pending: Vec<(Strin
 /// 压缩调用花的是运营方的上游余额，如果不记账，`model_usage` 就对不上真实支出——
 /// 这正是审计在 `/api/i18n/pack` 上查到的问题（匿名、不计费、不可归因），不能在新特性
 /// 上重犯。用量拿不到时按 0 计，但**仍然写一行 model_usage**，保证调用可归因。
+/// 这个账号这一小时还能不能再触发一次代看图。
+///
+/// 按自然小时分桶（键里带小时数），所以不需要滑动窗口也不需要清理：桶自己会过期。
+/// Redis 答不上来时**放行** —— 这是一道花钱的闸，不是安全边界，为一次缓存抖动把所有
+/// 人的图片识别关掉是更糟的失败方式。真正保证钱不白花的是 bill_vision_call。
+async fn vision_budget_ok(state: &AppState, uid: uuid::Uuid) -> bool {
+    let hour = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() / 3600)
+        .unwrap_or(0);
+    let key = format!("vision:{uid}:{hour}");
+    let mut redis = state.redis.clone();
+    let n: i64 = match redis::cmd("INCR").arg(&key).query_async(&mut redis).await {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(error = %e, "视觉配额计数失败，放行");
+            return true;
+        }
+    };
+    if n == 1 {
+        let _: Result<(), redis::RedisError> = redis::cmd("EXPIRE")
+            .arg(&key)
+            .arg(3600)
+            .query_async(&mut redis)
+            .await;
+    }
+    if n > VISION_CALLS_PER_HOUR {
+        tracing::info!(%uid, count = n, "视觉识别已超过每小时配额，本次跳过");
+        return false;
+    }
+    true
+}
+
+/// 给「替非视觉模型看图」那一次 gpt-5.5 调用记账。
+///
+/// 和 `bill_compression_call` 是同一个套路，理由也一样：这是服务端**代用户发起**的
+/// 上游调用，花的是运营方的 key。不记账的话，它就是一条绕过计费的通道 —— 而且比
+/// 压缩那条更划算，因为视觉输入按 $5/M 计价，用户那边只按便宜模型的文本 token 付钱。
+///
+/// `use_quota=false`：和这条路由上的正餐调用（chat 结尾那次 `bill(..., false, ...)`）
+/// 保持一致，走钱包而不是套餐时段额度。看图是用户自己发起的额外动作，不是套餐内含。
+async fn bill_vision_call(
+    state: &AppState,
+    uid: uuid::Uuid,
+    vconn: &Model,
+    usage: Option<&serde_json::Value>,
+) {
+    let reported = usage_is_authoritative(usage);
+    let (model_in, model_out) = model_price_override(&vconn.model_prices, "gpt-5.5");
+    let cost = resolve_cost(
+        &vconn.billing_mode,
+        vconn.per_call_cents,
+        usage.filter(|_| reported),
+        "gpt-5.5",
+        vconn.rate,
+        vconn.input_price,
+        vconn.output_price,
+        vconn.cache_read_price,
+        vconn.cache_create_price,
+        model_in,
+        model_out,
+    );
+    // 单独打标，和聊天、压缩三者在用量表里分得开。
+    let mut tokens = extract_bill_tokens(usage.filter(|_| reported), "michael-vision/gpt-5.5", !reported);
+    tokens.request_id = None;
+    bill(state, uid, vconn.id, cost, false, &tokens, false, 0).await;
+}
+
 async fn bill_compression_call(
     state: &AppState,
     uid: uuid::Uuid,
@@ -11431,6 +11591,107 @@ async fn bill_compression_call(
     // token 远多于摘要本身的花费，走额度对用户是净赚；而"额度少了一截"这件事，
     // 正确的解法是在用量页面把压缩单独列出来，不是把账记到钱包上。
     bill(state, uid, conn.id, cost, true, &tokens, false, 0).await;
+}
+
+#[cfg(test)]
+mod vision_billing_tests {
+    /// 「替非视觉模型看图」那一次调用必须计费，而且必须在**返回之前**就结掉。
+    ///
+    /// 这条守的是一个真实存在过、且线上可利用的漏洞：`vision_preprocess` 拿运营方的
+    /// key 打一次 gpt-5.5（$5/M 输入）却一分不记。调用方只要挑一个非原生视觉的模型
+    /// （生产上 deepseek-v4-flash / glm-5.2 / grok-4.6 / kimi-k3 / qwen3.8-max /
+    /// deepseek-v4-pro 都算），随请求塞图片就能触发。
+    ///
+    /// 而且它跑在下游请求之前，下游一旦非 2xx，外层 handler 直接 return Err —— 那是
+    /// 在 bill() 之前。也就是说「故意让下游报错」= 稳定白嫖，这条路由还没有
+    /// InFlightGuard，可以无限并发。
+    ///
+    /// 用源码断言而不是跑一遍：这个函数要数据库和一个真上游才跑得起来，而要守住的
+    /// 性质（有没有记账、记在哪一步）在源码层面是确定的。同样的做法见 oauth.rs。
+    #[test]
+    fn the_vision_helper_call_is_billed_before_it_can_be_skipped() {
+        let src = include_str!("models.rs");
+        let body = src
+            .split("async fn vision_preprocess(")
+            .nth(1)
+            .expect("找不到 vision_preprocess");
+        let body = &body[..body.find("\nasync fn ").unwrap_or(body.len())];
+
+        assert!(
+            body.contains("bill_vision_call("),
+            "vision_preprocess 必须给它自己发起的上游调用记账，否则这是一条绕过计费的通道",
+        );
+
+        // 记账要发生在解析出描述文本**之前**：描述可能为空、可能解析失败，
+        // 但钱在收到响应的那一刻就已经花出去了。
+        let bill_at = body.find("bill_vision_call(").expect("bill");
+        let desc_at = body.find("desc = Some(").expect("desc");
+        assert!(
+            bill_at < desc_at,
+            "记账必须排在取描述之前 —— 上游已经收费了，拿没拿到可用文本不影响这一点",
+        );
+
+        // 记账要在函数内部完成，不能指望外层 handler 后面还会走到 bill()。
+        // 外层在下游非 2xx 时会直接 return Err，那一条路径根本到不了计费点。
+        assert!(
+            !body.contains("return;\n    }\n    // billed by caller"),
+            "不要把记账推给调用方 —— 下游失败时调用方会提前返回",
+        );
+    }
+
+    /// models::chat 必须和另外三条上游路由一样持并发闸 —— 它此前是唯一漏的，而且是
+    /// 会替用户发起 gpt-5.5 视觉调用的那一条。
+    #[test]
+    fn chat_route_acquires_the_inflight_guard() {
+        let src = include_str!("models.rs");
+        let body = src.split("pub async fn chat(").nth(1).expect("chat");
+        let body = &body[..body.find("\npub async fn ").unwrap_or(body.len())];
+        assert!(
+            body.contains("InFlightGuard::acquire(&state, uid).await?"),
+            "models::chat 必须取 InFlightGuard，否则一个账号能挂起任意多个上游请求",
+        );
+        // 必须在发起上游请求之前就拿到 —— 拿晚了等于没拿。chat 里第一次碰上游是
+        // vision_preprocess（它就会打 gpt-5.5），闸必须排在它前面。
+        let guard_at = body.find("InFlightGuard::acquire").expect("guard");
+        let first_upstream = body.find("vision_preprocess(").expect("vision_preprocess call");
+        assert!(guard_at < first_upstream, "并发闸必须早于任何上游调用");
+    }
+
+    /// 视觉代看图有每小时配额和张数上限，二者都不能被悄悄拿掉。
+    #[test]
+    fn vision_has_a_budget_and_an_image_cap() {
+        let src = include_str!("models.rs");
+        assert!(src.contains("const MAX_VISION_IMAGES"), "缺图片张数上限");
+        assert!(src.contains("const VISION_CALLS_PER_HOUR"), "缺每小时配额");
+        let body = src.split("async fn vision_preprocess(").nth(1).expect("vp");
+        let body = &body[..body.find("\nasync fn ").unwrap_or(body.len())];
+        assert!(body.contains("images.truncate(MAX_VISION_IMAGES)"), "没有真正截断图片数");
+        assert!(body.contains("vision_budget_ok("), "没有查每小时配额");
+        // 配额查询必须在选定 vconn（也就是决定要不要真打上游）之前。
+        assert!(
+            body.find("vision_budget_ok(").unwrap() < body.find("gpt-5.5").unwrap(),
+            "配额判定要早于决定发起上游调用",
+        );
+    }
+
+    /// 触发这条路径的判定不能悄悄变窄：漏掉一个模型 id 就等于给它开一个免费视觉通道。
+    #[test]
+    fn production_non_vision_models_still_trigger_the_helper() {
+        for id in [
+            "deepseek-v4-flash",
+            "deepseek-v4-pro",
+            "glm-5.2",
+            "grok-4.6",
+            "kimi-k3",
+            "qwen3.8-max",
+        ] {
+            assert!(super::needs_vision_help(id), "{id} 应当走视觉预处理");
+        }
+        // 原生支持视觉的不该多跑一次。
+        for id in ["gpt-5.5", "claude-opus-5", "gemini-3-pro", "qwen2-vl", "o3-mini"] {
+            assert!(!super::needs_vision_help(id), "{id} 自己能读图，不该再代看一次");
+        }
+    }
 }
 
 #[cfg(test)]

@@ -44,7 +44,16 @@ type User = {
 type Stats = { total_users?: number; today_users?: number; online?: number };
 
 /** pay.rs Order（只取这一屏用得上的字段）。email / amount_cents / status 在库里都是非空。 */
-type Order = { id: string; email?: string; amount_cents?: number; status?: string; created_at?: string };
+type Order = {
+  id: string;
+  email?: string;
+  /** 目录标价，人民币分。「Power」是 18800。 */
+  amount_cents?: number;
+  /** Stripe 实收金额。手工发放和 20260827 之前的订单为 null。 */
+  charged_cents?: number | null;
+  status?: string;
+  created_at?: string;
+};
 
 /** realtime.rs Event —— id 是 i64，data 是 serde_json::Value，没有 detail 这个字段。 */
 type Event = {
@@ -131,7 +140,17 @@ export function Overview() {
   // "not paid" counts every CANCELLED order as needing action. The tile then shows a backlog
   // that never clears and disagrees with Billing, which filters correctly.
   const pending = loadedOrders.filter((o) => o.status === "pending");
-  const revenue = paid.reduce((a, o) => a + (o.amount_cents || 0), 0);
+  /*
+   * 优先用 Stripe 实收的钱。
+   *
+   * amount_cents 是目录里的人民币标价（「Power」= 18800 分），这一栏却按美元渲染 ——
+   * 一笔实收 $34.99 的订单会显示成 $188.00，整体营收虚高五六倍。Billing.tsx 已经改过，
+   * 这里是同一个数的另一处显示。
+   */
+  const revenue = paid.reduce(
+    (a, o) => a + (typeof o.charged_cents === "number" ? o.charged_cents : o.amount_cents || 0),
+    0,
+  );
 
   const loadedUsers = users ?? [];
   const active = (u: User) =>

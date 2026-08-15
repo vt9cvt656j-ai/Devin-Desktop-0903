@@ -213,8 +213,10 @@ pub async fn admin_create_commission(
 
     let row = sqlx::query_as::<_, Commission>(
         "INSERT INTO commissions \
-         (referrer_user_id, referrer_email, customer_user_id, customer_email, order_id, source, amount_cents, rate_bps, commission_cents, note) \
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING *",
+         (referrer_user_id, referrer_email, customer_user_id, customer_email, order_id, source, amount_cents, rate_bps, commission_cents, note, mature_at) \
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10, \
+                 now() + make_interval(days => (SELECT referral_hold_days FROM app_settings WHERE id = 1))) \
+         RETURNING *",
     )
     .bind(referrer_user_id)
     .bind(&referrer_email)
@@ -267,20 +269,27 @@ pub async fn admin_update_commission_status(
     validate_status(req.status.as_str())?;
     let note = req.note.unwrap_or_default();
     let row = sqlx::query_as::<_, Commission>(
+        // `settled_by` names the operator, which is what makes a manual settlement
+        // distinguishable from an automatic one on the records screen — and answerable
+        // for later. Cleared when a row leaves the settled state.
         "UPDATE commissions \
          SET status = $2, \
              note = CASE WHEN $3::text = '' THEN note ELSE $3 END, \
              settled_at = CASE WHEN $2 = 'settled' THEN COALESCE(settled_at, now()) ELSE NULL END, \
+             settled_by = CASE WHEN $2 = 'settled' THEN $4 ELSE '' END, \
              updated_at = now() \
-         WHERE id = $1 \
+         WHERE id = $1 AND reversed_at IS NULL AND status <> 'reversed' \
          RETURNING *",
     )
     .bind(id)
     .bind(&req.status)
     .bind(note.trim())
+    .bind(&claims.email)
     .fetch_optional(&state.db)
     .await?
-    .ok_or_else(|| AppError::bad("佣金记录不存在"))?;
+    // 退款/拒付撤销过的佣金不能再被改回 settled —— 那等于把一笔已经退掉的订单重新变成
+    // 可提现的钱。这里没有 from-guard 的话，一次误点就能绕过整条退款追缴逻辑。
+    .ok_or_else(|| AppError::bad("佣金记录不存在，或已因退款撤销、不能再改状态"))?;
 
     crate::realtime::record_event(
         &state,

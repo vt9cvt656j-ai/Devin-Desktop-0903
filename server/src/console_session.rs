@@ -112,12 +112,68 @@ pub async fn is_admin_request(state: &AppState, headers: &HeaderMap) -> bool {
     role.as_deref() == Some("admin")
 }
 
-/// `GET /api/admin/authz` —— nginx `auth_request` 的目标。204 = 是管理员，403 = 不是。
+/// 这个浏览器的 Mr.day One 登录（`mide_token` cookie）是不是管理员。
+///
+/// 和上面那个的区别是**读哪张凭据**：上面读管理台自己的门禁 cookie，这里读普通登录会话。
+/// 用途只有一个 —— 区分「是管理员但还没换管理台会话」和「根本不是管理员」，好让前者看到
+/// 登录页、后者看到 404。role 同样每次回库现读。
+async fn ide_admin_cookie(state: &AppState, headers: &HeaderMap) -> bool {
+    let Some(tok) = cookie_value(headers, "mide_token") else {
+        return false;
+    };
+    let Ok(data) = jsonwebtoken::decode::<crate::auth::Claims>(
+        &tok,
+        &jsonwebtoken::DecodingKey::from_secret(state.cfg.jwt_secret.as_bytes()),
+        &jsonwebtoken::Validation::default(),
+    ) else {
+        return false;
+    };
+    let Ok(uid) = uuid::Uuid::parse_str(&data.claims.sub) else {
+        return false;
+    };
+    // 令牌里那份 role 不作数 —— 它是 30 天前签的。
+    let role: Option<String> = sqlx::query_scalar("SELECT role FROM users WHERE id = $1")
+        .bind(uid)
+        .fetch_optional(&state.db)
+        .await
+        .ok()
+        .flatten();
+    role.as_deref() == Some("admin")
+}
+
+/// `GET /api/admin/authz` —— nginx `auth_request` 的目标。**三态**，不是两态。
+///
+/// | 返回 | 含义 | nginx 的动作 |
+/// |---|---|---|
+/// | 204 | 管理台会话有效 | 放行 |
+/// | 401 | 没有管理台会话，但这个浏览器的 Mr.day One 账号**是管理员** | 给登录页 |
+/// | 403 | 其余一切 | **回 404**，和不存在的路径一模一样 |
+///
+/// 为什么要分 401 和 403：以前只有 403，nginx 一律跳登录页 —— 于是任何人访问 `/console/`
+/// 都会被告知"这里有个管理后台，去这儿登录"。探测者输个域名就能拿到这张地图。现在只有
+/// 已经证明自己是管理员的浏览器才看得到登录页，其他人连"这里有东西"都不知道。
+///
+/// 真正的门禁始终是 role 判定，这一层只决定**失败时对方看到什么**。所以它是障眼法之上的
+/// 一层，不是障眼法本身 —— 把 403 换成 404 不会让任何本来进不去的人进得去。
 ///
 /// 只读：一次 Redis GET + 一次带索引的 SELECT。它每个受控请求都会跑一次，所以绝不能
 /// 换成 `/api/me`（那个会跑两条 UPDATE，而且对任何登录用户都返回 200）。
 pub async fn authz(State(state): State<AppState>, headers: HeaderMap) -> Response {
     if is_admin_request(&state, &headers).await {
+        return StatusCode::NO_CONTENT.into_response();
+    }
+    if ide_admin_cookie(&state, &headers).await {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    StatusCode::FORBIDDEN.into_response()
+}
+
+/// `GET /api/admin/ide-authz` —— 只问一件事：这个浏览器的 Mr.day One 账号是不是管理员。
+///
+/// 给 `/console/login` 那几个静态资源用。登录页本身不该是公开的：它一旦返回 200，就等于
+/// 向任何人确认"这个域名下有管理后台"。204 = 是管理员，403 = 不是（nginx 会翻成 404）。
+pub async fn ide_authz(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if ide_admin_cookie(&state, &headers).await {
         StatusCode::NO_CONTENT.into_response()
     } else {
         StatusCode::FORBIDDEN.into_response()
@@ -223,5 +279,54 @@ mod tests {
         assert_eq!(a.len(), 64, "{a}");
         assert!(a.bytes().all(|c| c.is_ascii_hexdigit()), "{a}");
         assert_ne!(a, b);
+    }
+
+    /// 门禁必须是三态，不是两态。
+    ///
+    /// 只有 204/403 的话，nginx 分不出「是管理员但还没换管理台会话」和「根本不是管理员」，
+    /// 于是只能一律跳登录页 —— 那等于对任何访问 /console/ 的人宣告"这里有个管理后台"。
+    /// 401 那一档存在的唯一目的，就是让登录页只对已经证明身份的浏览器可见。
+    #[test]
+    fn the_gate_answers_three_ways_not_two() {
+        let src = include_str!("console_session.rs");
+        let body = &src[..src.find("\n#[cfg(test)]").unwrap_or(src.len())];
+        let f = body.split("pub async fn authz(").nth(1).expect("authz");
+        let f = &f[..f.find("\n/// `GET /api/admin/ide-authz`").unwrap_or(f.len())];
+        for want in ["StatusCode::NO_CONTENT", "StatusCode::UNAUTHORIZED", "StatusCode::FORBIDDEN"] {
+            assert!(f.contains(want), "authz 少了 {want} 这一档");
+        }
+        // 顺序也要对：先看管理台会话，再看 IDE 登录，最后才拒。
+        let ok = f.find("StatusCode::NO_CONTENT").unwrap();
+        let need_login = f.find("StatusCode::UNAUTHORIZED").unwrap();
+        let deny = f.find("StatusCode::FORBIDDEN").unwrap();
+        assert!(ok < need_login && need_login < deny, "三档顺序反了");
+    }
+
+    /// role 一律回数据库现读，两条路都不许信令牌里那份。
+    ///
+    /// 令牌是 30 天前签的；降权、删号必须立刻生效。
+    #[test]
+    fn role_is_always_read_from_the_row() {
+        let src = include_str!("console_session.rs");
+        let body = &src[..src.find("\n#[cfg(test)]").unwrap_or(src.len())];
+        for f in ["async fn is_admin_request(", "async fn ide_admin_cookie("] {
+            let seg = body.split(f).nth(1).expect(f);
+            let seg = &seg[..seg.find("\n}").unwrap_or(seg.len())];
+            assert!(
+                seg.contains("SELECT role FROM users WHERE id = $1"),
+                "{f} 必须回库读 role",
+            );
+            assert!(
+                seg.contains(r#"role.as_deref() == Some("admin")"#),
+                "{f} 必须比对 admin",
+            );
+        }
+        // 尤其不能拿 JWT 里的 role 当数
+        let seg = body.split("async fn ide_admin_cookie(").nth(1).unwrap();
+        let seg = &seg[..seg.find("\n}").unwrap_or(seg.len())];
+        assert!(
+            !seg.contains("claims.role"),
+            "令牌里那份 role 是 30 天前签的，不作数",
+        );
     }
 }

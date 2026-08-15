@@ -604,6 +604,23 @@ export function Billing({ catalog, me, lang, onRedeemed }: Props) {
                 {t.redeem}
               </Button>
             </div>
+            {/*
+              兑换的结果就贴在按钮下面，不跟着页面底部那个公共提示走。
+
+              公共提示在「当前账户状态」和两张说明卡之后，也就是这一屏之外。输一个无效
+              的码、点「立即兑换」，服务端明明回了「激活码无效」，而屏幕上什么都没有变 ——
+              看上去就是按钮坏了。错误必须出现在动作旁边。
+            */}
+            {message ? (
+              <p
+                className={cn(
+                  "mt-3 text-[13px]",
+                  message.kind === "ok" ? "text-success" : "text-destructive",
+                )}
+              >
+                {message.text}
+              </p>
+            ) : null}
             <p className="mt-4 text-[13px] leading-relaxed text-muted-foreground">{t.redeemNote}</p>
           </Card>
 
@@ -643,7 +660,8 @@ export function Billing({ catalog, me, lang, onRedeemed }: Props) {
         </div>
       ) : null}
 
-      {message ? (
+      {/* 兑换页有自己的提示位（就在按钮下面），这里只服务订阅和点数两个页签。 */}
+      {message && group !== "redeem" ? (
         <p
           className={cn(
             "mt-4 text-center text-[13px]",

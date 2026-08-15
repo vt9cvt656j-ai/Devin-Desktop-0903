@@ -1,8 +1,9 @@
-import { Fragment, useEffect, useState } from "react";
-import { ChevronDown, Plus, RefreshCw } from "lucide-react";
+import { Fragment, useCallback, useEffect, useState } from "react";
+import { ChevronDown, Layers, Plus, RefreshCw } from "lucide-react";
 import { EmptyState } from "@/components/EmptyState";
 import { ErrorState } from "@/components/ErrorState";
 import { PageHeader } from "@/components/PageHeader";
+import { Panel } from "@/components/Panel";
 import { Stat } from "@/components/Stat";
 import { TableSkeleton } from "@/components/TableSkeleton";
 import { SectionReveal } from "@/components/motion/section-reveal";
@@ -104,6 +105,8 @@ type Conn = {
   model_prices?: unknown;
   model_billing?: unknown;
   protocol?: string;
+  /** 显示分组：把这条线路的模型挂在另一条线路的名字下。只影响 IDE 选择器上的标题。 */
+  group_into?: string | null;
 };
 
 /** GET /api/admin/model-usage returns totals only (models.rs:1978-1991). */
@@ -205,7 +208,27 @@ function modelCost(c: Conn, id: string): string {
   return "内置官方价";
 }
 
-export function Routing() {
+/**
+ * 分组解析，一比一照抄 list_for_client（models.rs:1980-2003）。
+ *
+ * 只跳一层：A 分到 B、B 又分到 C，A 显示在 B 下面而不是 C 下面。指向自己、指向不存在的线路、
+ * 指向一条已停用因而根本不在 /api/models 里的线路 —— 三种情况都退回自己的名字，所以配错的分组
+ * 只会让分组不生效，不会让模型从选择器里消失。
+ */
+function headingOf(c: Conn, labelOf: Map<string, string>): string {
+  const own = c.label || "未命名";
+  if (!c.group_into || c.group_into === c.id) return own;
+  return labelOf.get(c.group_into) ?? own;
+}
+
+/** 只有在转的线路进得了 /api/models，所以只有它们参与分组解析（models.rs:1979）。 */
+function liveLabels(conns: Conn[]): Map<string, string> {
+  return new Map(conns.filter(isOn).map((c) => [c.id, c.label || "未命名"]));
+}
+
+export type RoutingView = "routing" | "routing-groups";
+
+export function Routing({ view }: { view: RoutingView }) {
   const [conns, setConns] = useState<Conn[]>([]);
   const [usage, setUsage] = useState<Usage>({});
   const [err, setErr] = useState("");
@@ -224,11 +247,14 @@ export function Routing() {
 
   // No polling here, unlike 总览: this screen is edited, and a 30s refresh would yank the table
   // out from under an open dialog. Every mutation reloads instead.
-  const load = async () => {
+  const load = useCallback(async () => {
     try {
       const [m, u] = await Promise.all([
         api.get<Conn[] | { items?: Conn[] }>("/api/admin/models"),
-        api.get<Usage>("/api/admin/model-usage").catch(() => ({}) as Usage),
+        // 分组那一屏不显示调用量，就别去要它。
+        view === "routing"
+          ? api.get<Usage>("/api/admin/model-usage").catch(() => ({}) as Usage)
+          : Promise.resolve({} as Usage),
       ]);
       setConns(Array.isArray(m) ? m : m?.items || []);
       setUsage(u || {});
@@ -238,11 +264,11 @@ export function Routing() {
     } finally {
       setLoading(false);
     }
-  };
+  }, [view]);
 
   useEffect(() => {
     load();
-  }, []);
+  }, [load]);
 
   async function setActive(c: Conn, active: boolean) {
     setBusyId(c.id);
@@ -284,6 +310,11 @@ export function Routing() {
 
   const live = conns.filter(isOn);
   const exposed = live.reduce((a, c) => a + allowedIds(c).length, 0);
+  const labelOf = liveLabels(conns);
+
+  if (view === "routing-groups") {
+    return <Groups conns={conns} loading={loading} err={err} onReload={load} />;
+  }
 
   return (
     <div className="space-y-6">
@@ -366,6 +397,14 @@ export function Routing() {
                         >
                           {c.provider || "other"} · {c.base_url || "—"}
                         </Truncate>
+                        {/* 被分到别的名字下时说一声。否则在 IDE 里找不到这条线路的标题，
+                            会以为它没生效 —— 而它其实在照常接单。 */}
+                        {headingOf(c, labelOf) !== (c.label || "未命名") && (
+                          <Truncate className="mt-0.5 text-xs text-muted-foreground">
+                            <Layers aria-hidden className="mr-1 inline size-3 align-[-1px]" />
+                            在 IDE 里显示为「{headingOf(c, labelOf)}」
+                          </Truncate>
+                        )}
                       </TableCell>
                       <TableCell>
                         {isOn(c) ? (
@@ -537,6 +576,256 @@ export function Routing() {
             </div>
           </DialogContent>
         </Dialog>
+      )}
+    </div>
+  );
+}
+
+/**
+ * 线路分组 —— 把几条线路的模型收进同一个标题下面。
+ *
+ * 这一屏只写 models.group_into 一列，而那一列只喂 /api/models 的 `group` 字段，也就是 IDE 模型
+ * 选择器里的分组标题（main.js:12422 拿它当桶名，14044 当标题渲染）。请求走哪条线路是按模型 id
+ * 现算的（models.rs:5230-5238：所有在转、且开放了这个 id 的线路，按 sort、created_at 排，第一条
+ * 接单），那段查询根本不看这一列。所以分组改的是标题，改不了计费、密钥、用量归属。
+ *
+ * 和「线路」那一屏分开，是因为这里每一个下拉框都是纯展示操作，而那边每一个按钮都能停掉线上流量。
+ * 放在一起，会让人以为改分组也有同样的分量。
+ */
+function Groups({
+  conns, loading, err, onReload,
+}: {
+  conns: Conn[];
+  loading: boolean;
+  err: string;
+  onReload: () => Promise<void>;
+}) {
+  const [busyId, setBusyId] = useState("");
+  const [note, setNote] = useState<{ text: string; ok: boolean } | null>(null);
+
+  const labelOf = liveLabels(conns);
+  const own = (c: Conn) => c.label || "未命名";
+
+  /** 自己已经分到别处的线路。 */
+  const grouped = new Set(conns.filter((c) => c.group_into).map((c) => c.id));
+  /** 名下已经挂着别的线路的。 */
+  const parents = new Set(conns.map((c) => c.group_into).filter(Boolean) as string[]);
+
+  /**
+   * 为什么这个目标选不了 —— 空字符串表示能选。
+   *
+   * 前三种服务端会直接 400（admin_group），在这里先灰掉，省得点完才知道不行。第四种服务端
+   * 允许：停用的线路能当目标，只是它不在 /api/models 里，分组解析会退回自己的名字 ——
+   * 等于白设一次，所以同样标出来。
+   */
+  function targetIssue(self: Conn, t: Conn): string {
+    if (t.id === self.id) return "自己";
+    if (grouped.has(t.id)) return "已分到别处";
+    if (parents.has(self.id)) return "本身是个组";
+    if (!isOn(t)) return "已停用";
+    return "";
+  }
+
+  async function setGroup(c: Conn, target: string) {
+    setBusyId(c.id);
+    setNote(null);
+    try {
+      await api.post(`/api/admin/models/${c.id}/group`, { group_into: target || null });
+      await onReload();
+      const to = conns.find((x) => x.id === target);
+      setNote({
+        ok: true,
+        text: to
+          ? `「${own(c)}」的模型现在显示在「${own(to)}」下面。计费和用量还记在「${own(c)}」上。`
+          : `「${own(c)}」恢复用自己的名字显示。`,
+      });
+    } catch (e) {
+      setNote({ ok: false, text: e instanceof Error ? e.message : "保存失败" });
+    } finally {
+      setBusyId("");
+    }
+  }
+
+  // IDE 里实际会看到的样子：只有在转的线路进得了 /api/models，标题相同的会并成一堆 ——
+  // 这正是分组的原理，两条线路重名本来就已经并在一起了。
+  const buckets = new Map<string, Conn[]>();
+  for (const c of conns.filter(isOn)) {
+    const head = headingOf(c, labelOf);
+    const bucket = buckets.get(head);
+    if (bucket) bucket.push(c);
+    else buckets.set(head, [c]);
+  }
+
+  return (
+    <div className="space-y-6">
+      <PageHeader
+        title="线路分组"
+        description="把一条线路的模型收到另一条线路的名字下面，IDE 的模型列表里就只剩一个标题。只改标题——密钥、计费方式、单模型定价和用量统计都还在原来那条线路上，随时能取消。"
+      />
+
+      <ErrorState message={err} />
+      {note && (
+        <p
+          role="status"
+          className={cn(
+            "rounded-lg border px-4 py-2.5 text-sm",
+            note.ok
+              ? "border-border bg-secondary/60 text-foreground"
+              : "border-destructive/40 bg-destructive/10 text-destructive",
+          )}
+        >
+          {note.text}
+        </p>
+      )}
+
+      {loading && <TableSkeleton rows={4} columns={["30%", "20%", "30%"]} label="线路读取中" />}
+
+      {!loading && !conns.length && (
+        <EmptyState title="还没有连接" hint="先去「线路」建一条，再回来决定它显示在哪个名字下。" />
+      )}
+
+      {!loading && conns.length > 0 && (
+        <>
+          <SectionReveal as="section" delay={70}>
+            <Panel
+              title="IDE 里会看到"
+              aside={
+                <span className="text-xs text-muted-foreground">
+                  {buckets.size} 个标题 · 只统计在转的线路
+                </span>
+              }
+              bodyClassName="p-5"
+            >
+              {buckets.size === 0 ? (
+                <p className="text-sm text-muted-foreground">
+                  没有在转的线路，模型列表现在是空的。
+                </p>
+              ) : (
+                <ul className="grid gap-3 sm:grid-cols-2">
+                  {[...buckets].map(([head, members]) => {
+                    const ids = members.flatMap(allowedIds);
+                    // 同一个 id 出现两次：选择器里只看得到一条，请求按 sort 落到排在前面
+                    // 那条线路。分组之前这个冲突也在，只是分开显示时还看得出来。
+                    const dupes = [...new Set(ids.filter((id, i) => ids.indexOf(id) !== i))];
+                    return (
+                      <li key={head} className="rounded-lg border border-border bg-background p-3">
+                        <div className="flex items-baseline justify-between gap-3">
+                          <Truncate className="font-medium">{head}</Truncate>
+                          <span className="shrink-0 text-xs tabular-nums text-muted-foreground">
+                            {ids.length} 个模型
+                          </span>
+                        </div>
+                        <div className="mt-1.5 flex flex-wrap gap-1.5">
+                          {members.map((m) => (
+                            <Badge key={m.id} variant="outline" className="font-normal">
+                              {own(m)}
+                              {allowedIds(m).length ? ` · ${allowedIds(m).length}` : " · 0"}
+                            </Badge>
+                          ))}
+                        </div>
+                        {dupes.length > 0 && (
+                          <p className="mt-2 text-xs text-destructive" title={dupes.join("、")}>
+                            {dupes.length} 个模型 id 在这个标题下重复，列表里只会出现一条，
+                            请求落到排序靠前的那条线路。
+                          </p>
+                        )}
+                      </li>
+                    );
+                  })}
+                </ul>
+              )}
+            </Panel>
+          </SectionReveal>
+
+          <SectionReveal as="section" delay={140}>
+            <Panel
+              title="归到哪个名字下"
+              aside={
+                <Button variant="ghost" size="sm" onClick={() => void onReload()}>
+                  <RefreshCw /> 刷新
+                </Button>
+              }
+            >
+              <Table className="min-w-[52rem]">
+                <TableHeader>
+                  <TableRow>
+                    <TableHead className="w-[22rem]">线路</TableHead>
+                    <TableHead className="w-28">状态</TableHead>
+                    <TableHead className="w-28">开放模型</TableHead>
+                    <TableHead className="w-[20rem]">显示在</TableHead>
+                  </TableRow>
+                </TableHeader>
+                <TableBody>
+                  {conns.map((c) => {
+                    // 分组解析出来的目标名。指向自己、指向已删除的、或指向一条停用因而不在
+                    // /api/models 里的线路 —— 三种都拿不到名字，分组等于没生效。
+                    const under =
+                      c.group_into && c.group_into !== c.id ? labelOf.get(c.group_into) : undefined;
+                    const dangling = !!c.group_into && !under;
+                    const isParent = parents.has(c.id);
+                    return (
+                      <TableRow key={c.id} className={cn(!isOn(c) && "opacity-60")}>
+                        <TableCell className="max-w-[22rem]">
+                          <Truncate className="font-medium">{own(c)}</Truncate>
+                          <Truncate className="text-xs text-muted-foreground">
+                            {c.provider || "other"}
+                          </Truncate>
+                        </TableCell>
+                        <TableCell>
+                          {isOn(c) ? (
+                            <Badge variant="success">在转</Badge>
+                          ) : (
+                            <Badge variant="outline">已停用</Badge>
+                          )}
+                        </TableCell>
+                        <TableCell className="text-sm tabular-nums text-muted-foreground">
+                          {allowedIds(c).length}
+                        </TableCell>
+                        <TableCell>
+                          <Select
+                            className="h-9 text-sm"
+                            value={c.group_into || ""}
+                            disabled={busyId === c.id}
+                            onChange={(e) => void setGroup(c, e.target.value)}
+                            aria-label={`${own(c)} 显示在哪个名字下`}
+                          >
+                            <option value="">自己的名字（{own(c)}）</option>
+                            {conns
+                              .filter((t) => t.id !== c.id)
+                              .map((t) => {
+                                const issue = targetIssue(c, t);
+                                return (
+                                  <option key={t.id} value={t.id} disabled={!!issue}>
+                                    {own(t)}
+                                    {issue && ` —— ${issue}`}
+                                  </option>
+                                );
+                              })}
+                          </Select>
+                          {isParent && (
+                            <p className="mt-1 text-xs text-muted-foreground">
+                              已经有线路分到这个名字下，先把它们放出来才能再往别处分。
+                            </p>
+                          )}
+                          {under && (
+                            <p className="mt-1 text-xs text-muted-foreground">
+                              计费和用量仍记在「{own(c)}」。
+                            </p>
+                          )}
+                          {dangling && (
+                            <p className="mt-1 text-xs text-destructive">
+                              目标线路不在转，分组没生效，现在还是按自己的名字显示。
+                            </p>
+                          )}
+                        </TableCell>
+                      </TableRow>
+                    );
+                  })}
+                </TableBody>
+              </Table>
+            </Panel>
+          </SectionReveal>
+        </>
       )}
     </div>
   );

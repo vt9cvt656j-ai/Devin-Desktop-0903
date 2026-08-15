@@ -1,7 +1,31 @@
 import { StrictMode } from "react";
 import { createRoot } from "react-dom/client";
 import App from "@/App";
+import { GATEWAY } from "@/lib/account";
+import { configureMse, mseEnvConfig, mseReady } from "@/lib/mse";
 import "@/index.css";
+
+/*
+ * Application-layer encryption, configured before anything is rendered — and so before any
+ * component effect can reach the gateway.
+ *
+ * `base` has to be spelled out rather than left at the default empty string. Every call
+ * this site makes is cross-origin: the pages are served from mrday.one and the API lives on
+ * code.mrday.one, which is why `lib/account.ts` prefixes each path with `GATEWAY`. The
+ * client's own bootstrap does not go through those call sites, so with the default base it
+ * would fetch `/api/crypto/pubkey` from the static host, get the SPA's index.html back, and
+ * fail to bootstrap — every request would then quietly go out in plaintext.
+ *
+ * Started, not awaited. The handshake is a round trip to another host and nothing on the
+ * first paint depends on it; blocking render on it would buy nothing and cost a visible
+ * delay. The catch is not indifference — a failed bootstrap is retried by the first sealed
+ * request that needs it, and swallowing it here only keeps an unhandled rejection out of
+ * the console.
+ */
+configureMse({ ...mseEnvConfig(), base: GATEWAY });
+void mseReady().catch(() => {
+  /* retried by the first sealed request */
+});
 
 /*
  * A visit to the bare address starts at the top of the page.

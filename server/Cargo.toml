@@ -33,6 +33,16 @@ anyhow = "1"
 sha2 = "0.10"   # per-user gateway cache key (DefaultHasher is not collision resistant)
 hmac = "0.12"   # Stripe webhook signature (HMAC-SHA256 over the raw request body)
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream", "multipart"] }
+base64 = "0.22"  # provider profile pictures, stored as data: URLs (see oauth.rs)
+
+# MSE-1 应用层加密（见 src/mse.rs 和 docs/MSE.md）。
+# 套件是 CNSA 1.0：ECDH P-384 + HKDF-SHA-384 + AES-256-GCM —— 选它不是因为更强，是
+# 因为 WebCrypto 原生就有这三样，前端因此不需要引入任何第三方密码学库。
+# 全部是 RustCrypto 的纯 Rust 实现，不引 OpenSSL。
+p384 = { version = "0.13", default-features = false, features = ["ecdh", "pkcs8", "std", "arithmetic"] }
+aes-gcm = "0.10"
+hkdf = "0.12"
+zeroize = "1"
 
 [profile.release]
 opt-level = 3

@@ -6,6 +6,8 @@
  * Query would be a real dependency for a console with one operator and no offline story; if
  * caching ever matters, it can be added later without touching call sites.
  */
+import { mseFetch } from "./mse";
+
 const TOKEN_KEY = "michael_admin_token";
 
 export const auth = {
@@ -21,7 +23,10 @@ export class ApiError extends Error {
 }
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
-  const res = await fetch(path, {
+  // 整个控制台的请求都从这一个函数出去，所以「后台不再有明文流量」就是这里的
+  // fetch → mseFetch 一个词。mseFetch 回的是普通 Response，下面的 401 / 204 /
+  // 错误分支一行都不用动 —— 这正是它做成 fetch 替身而不是新客户端的原因。
+  const res = await mseFetch(path, {
     ...init,
     headers: {
       "Content-Type": "application/json",
@@ -48,6 +53,8 @@ export const api = {
   get: <T,>(p: string) => request<T>(p),
   post: <T,>(p: string, body?: unknown) =>
     request<T>(p, { method: "POST", body: JSON.stringify(body ?? {}) }),
+  put: <T,>(p: string, body?: unknown) =>
+    request<T>(p, { method: "PUT", body: JSON.stringify(body ?? {}) }),
   del: <T,>(p: string) => request<T>(p, { method: "DELETE" }),
 };
 
@@ -58,7 +65,9 @@ export const api = {
  */
 export async function endConsoleSession() {
   try {
-    await fetch("/api/admin/session/logout", {
+    // credentials 不能少：服务端要靠浏览器自动带上的那张 mide_console cookie 才知道
+    // 该删 Redis 里的哪一条会话。mseFetch 把 init 原样透传，所以这一条照旧生效。
+    await mseFetch("/api/admin/session/logout", {
       method: "POST",
       credentials: "same-origin",
     });

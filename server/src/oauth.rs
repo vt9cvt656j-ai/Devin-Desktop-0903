@@ -222,6 +222,12 @@ pub async fn start(
     }
     let (client_id, _) = provider.credentials(&state);
 
+    // 这个 nonce 要同时出现在两个地方：签名的 state 里，和一颗只有发起方浏览器拿得到的
+    // cookie 里。callback 会比对两者 —— 这是唯一能证明「完成回调的浏览器就是发起的那个」
+    // 的东西。缺了它就是登录 CSRF：攻击者在自己浏览器里走完授权、扣下回调 URL、诱导受害者
+    // 打开，受害者的浏览器就拿到了**攻击者账号**的会话，之后他绑定的代码托管令牌会写进
+    // 攻击者的行。签名本身挡不住这个 —— 那个 state 确实是我们签的，只是不是给他签的。
+    let nonce = uuid::Uuid::new_v4().to_string();
     let state_token = match encode(
         &Header::default(),
         &StateClaims {
@@ -229,7 +235,7 @@ pub async fn start(
             provider: provider.key().to_owned(),
             next: safe_next(q.next.as_deref().unwrap_or(HOME)),
             device_id: crate::auth::clean_device_id(q.device_id.as_deref()),
-            nonce: uuid::Uuid::new_v4().to_string(),
+            nonce: nonce.clone(),
             exp: chrono::Utc::now().timestamp() + STATE_TTL_SECS,
         },
         &EncodingKey::from_secret(state.cfg.jwt_secret.as_bytes()),
@@ -256,9 +262,44 @@ pub async fn start(
     }
 
     match reqwest::Url::parse_with_params(provider.authorize_url(), &params) {
-        Ok(url) => Redirect::to(url.as_str()).into_response(),
+        // SameSite=Lax 而不是 Strict：回调是从 provider 过来的顶层 GET 导航，Strict 会把
+        // cookie 扣下不发，那样每一次正常登录都会失败。Lax 恰好只在这种导航上放行。
+        // HttpOnly：页面脚本永远不需要读它，读得到就等于多一条被 XSS 偷走的路。
+        // Path 收到 /api/auth/oauth：它只在回调那一个请求上有用。
+        Ok(url) => (
+            [(
+                header::SET_COOKIE,
+                format!(
+                    "{NONCE_COOKIE}={nonce}; Path=/api/auth/oauth; Max-Age={STATE_TTL_SECS}; \
+                     HttpOnly; Secure; SameSite=Lax"
+                ),
+            )],
+            Redirect::to(url.as_str()),
+        )
+            .into_response(),
         Err(_) => gate_error(&state, "error"),
     }
+}
+
+/// 发起方浏览器持有的那半。见 `start` 里的说明。
+const NONCE_COOKIE: &str = "mide_oauth_nonce";
+
+/// 从 Cookie 头里取出发起时下发的 nonce。
+fn nonce_cookie(headers: &HeaderMap) -> Option<String> {
+    let raw = headers.get(header::COOKIE)?.to_str().ok()?;
+    raw.split(';')
+        .filter_map(|kv| kv.split_once('='))
+        .find(|(k, _)| k.trim() == NONCE_COOKIE)
+        .map(|(_, v)| v.trim().to_owned())
+}
+
+/// 常量时间比较：不因为第一个不同的字节就提前返回。
+fn nonce_matches(a: &str, b: &str) -> bool {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    if a.len() != b.len() || a.is_empty() {
+        return false;
+    }
+    a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
 // ── GET /api/auth/oauth/:provider/callback ───────────────────────────────────────────
@@ -353,8 +394,11 @@ fn signed_in(state: &AppState, token: &str, next: &str) -> Response {
     {
         return gate_error(state, "error");
     }
+    // Domain=.mrday.one so the marketing site on the apex can see the session too — see
+    // the matching note in gate.html. Still SameSite=Lax: the site reads the value and
+    // sends it as an Authorization header rather than relying on a cross-site cookie.
     let cookie = format!(
-        "mide_token={token}; Path=/; Secure; SameSite=Lax; Max-Age={}",
+        "mide_token={token}; Domain=.mrday.one; Path=/; Secure; SameSite=Lax; Max-Age={}",
         7 * 24 * 3600
     );
     let target = format!("{}{}", public_base(state), safe_next(next));
@@ -376,6 +420,76 @@ struct Identity {
     email: String,
     email_verified: bool,
     name: String,
+    /// Where the provider hosts their picture. A URL, not the image — turned into a
+    /// `data:` URL by `fetch_picture` before it goes anywhere near the column.
+    picture: String,
+}
+
+/// Hosts a profile picture may be fetched from.
+///
+/// The URL arrives inside a provider's JSON, which makes it attacker-influenced input the
+/// moment a provider account is compromised or a response is tampered with. Fetching it
+/// unchecked would make this service issue arbitrary GETs from inside the network — the
+/// ordinary shape of an SSRF. Both providers serve avatars from a single dedicated host, so
+/// an allow-list costs nothing and closes it.
+const PICTURE_HOSTS: [&str; 2] = ["avatars.githubusercontent.com", "googleusercontent.com"];
+
+/// Bytes of image to accept. Comfortably above a 128px avatar and far below what would
+/// have to be re-encoded to fit `AVATAR_MAX_CHARS` once base64 inflates it by a third.
+const PICTURE_MAX_BYTES: usize = 180_000;
+
+/// A provider's picture, downloaded and turned into the only thing the column accepts.
+///
+/// Returns `None` for every failure — a missing picture is a letter on a circle, which is
+/// a perfectly good avatar. Nothing here is worth failing a sign-in over.
+async fn fetch_picture(state: &AppState, url: &str) -> Option<String> {
+    let url = url.trim();
+    if url.is_empty() {
+        return None;
+    }
+    let parsed = reqwest::Url::parse(url).ok()?;
+    if parsed.scheme() != "https" {
+        return None;
+    }
+    let host = parsed.host_str()?.to_ascii_lowercase();
+    if !PICTURE_HOSTS
+        .iter()
+        .any(|h| host == *h || host.ends_with(&format!(".{h}")))
+    {
+        return None;
+    }
+
+    let res = state.update_http.get(parsed).send().await.ok()?;
+    if !res.status().is_success() {
+        return None;
+    }
+    // The prefix is chosen from what the server says it sent, not from the file extension
+    // in the URL, and only the three types the column allows are accepted.
+    let mime = res
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    let kind = match mime.as_str() {
+        "image/png" => "png",
+        "image/jpeg" => "jpeg",
+        "image/webp" => "webp",
+        _ => return None,
+    };
+
+    let bytes = res.bytes().await.ok()?;
+    if bytes.is_empty() || bytes.len() > PICTURE_MAX_BYTES {
+        return None;
+    }
+
+    use base64::Engine as _;
+    let encoded = base64::engine::general_purpose::STANDARD.encode(&bytes);
+    Some(format!("data:image/{kind};base64,{encoded}"))
 }
 
 async fn finish(
@@ -399,6 +513,20 @@ async fn finish(
     }
     if data.claims.provider != provider.key() {
         return Err(Failure::Broken(anyhow::anyhow!("state provider mismatch")));
+    }
+    // 完成回调的必须是发起的那个浏览器。
+    //
+    // 上面两条检查的是「这个 state 是我们签的、给这个 provider 的」—— 都成立，攻击者手里
+    // 那个 state 也成立，因为那确实是我们给**他**签的。缺的是「给谁签的」。发起时下发的
+    // cookie 就是这一半：攻击者没法让受害者的浏览器带上他那颗 cookie。
+    //
+    // 拿不到 cookie 也一律拒。缺失和不匹配在这里是同一件事 —— 正常流程里它必然在（同域、
+    // SameSite=Lax、顶层导航），不在就说明这不是发起过的那个浏览器。
+    let held = nonce_cookie(headers).unwrap_or_default();
+    if !nonce_matches(&held, &data.claims.nonce) {
+        return Err(Failure::Broken(anyhow::anyhow!(
+            "state was not issued to this browser"
+        )));
     }
 
     let access = exchange_code(state, provider, code).await?;
@@ -537,6 +665,17 @@ async fn fetch_identity(
                     .or_else(|| profile.get("login").and_then(|v| v.as_str()))
                     .unwrap_or_default()
                     .to_owned(),
+                // `?s=` asks GitHub to resize server-side. Without it the original upload
+                // comes back — often several hundred KB, which the byte cap would reject,
+                // leaving someone with a letter when a picture was available.
+                picture: profile
+                    .get("avatar_url")
+                    .and_then(|v| v.as_str())
+                    .map(|u| {
+                        let sep = if u.contains('?') { '&' } else { '?' };
+                        format!("{u}{sep}s=160")
+                    })
+                    .unwrap_or_default(),
             })
         }
         Provider::Google => {
@@ -571,6 +710,17 @@ async fn fetch_identity(
                     .and_then(|v| v.as_str())
                     .unwrap_or_default()
                     .to_owned(),
+                // Google's picture URL carries its size in the path as `=s96-c`. Replacing
+                // that segment asks for a larger square; appending one when it is absent
+                // does the same for URLs that arrive without it.
+                picture: profile
+                    .get("picture")
+                    .and_then(|v| v.as_str())
+                    .map(|u| match u.rfind("=s") {
+                        Some(i) => format!("{}=s160-c", &u[..i]),
+                        None => format!("{u}=s160-c"),
+                    })
+                    .unwrap_or_default(),
             })
         }
     }
@@ -654,14 +804,44 @@ async fn resolve_account(
         .execute(&state.db)
         .await?;
     }
-    // The provider's profile picture is deliberately NOT taken.
+    // The provider's picture, downloaded here and stored as a `data:` URL.
     //
-    // It arrives as a URL on the provider's CDN, and the console is served under
-    // `img-src 'self' data:` — so that URL can never render, in any browser, no matter
-    // what. The column's own contract agrees: `clean_avatar` accepts only a base64 `data:`
-    // image. Storing a link that is guaranteed not to display would put a value in the
-    // row that looks like a picture and behaves like a broken one; the initials the
-    // console falls back to are a better answer, and Settings already takes an upload.
+    // The URL itself is still not stored, for the reason it never was: it points at the
+    // provider's CDN, the console is served under `img-src 'self' data:`, and
+    // `clean_avatar` accepts only a base64 `data:` image — so a link would be a value that
+    // looks like a picture and behaves like a broken one. Fetching it once at sign-in and
+    // keeping the bytes satisfies both constraints and gets people a real photograph
+    // instead of an initial, which is the whole point of having asked the provider.
+    //
+    // Same rule as the name: only into an empty field. Someone who uploaded a picture in
+    // Settings has said what they want their avatar to be, and signing in again must not
+    // quietly replace it. Failure is silent by design — `fetch_picture` returns None for
+    // anything unexpected and the account keeps its initial.
+    //
+    // Asked as its own scalar because `avatar` is deliberately not a field on `User` (that
+    // struct is also the admin list, and an inline image per row would make it megabytes).
+    // Checking first means a returning visitor who already has a picture does not re-fetch
+    // one on every sign-in only to have the UPDATE discard it.
+    let needs_picture: bool = sqlx::query_scalar(
+        "SELECT (avatar IS NULL OR avatar = '') FROM users WHERE id = $1",
+    )
+    .bind(user.id)
+    .fetch_optional(&state.db)
+    .await?
+    .unwrap_or(false);
+
+    if needs_picture {
+        if let Some(data_url) = fetch_picture(state, &who.picture).await {
+            sqlx::query(
+                "UPDATE users SET avatar = $2, updated_at = now() \
+                 WHERE id = $1 AND (avatar IS NULL OR avatar = '')",
+            )
+            .bind(user.id)
+            .bind(&data_url)
+            .execute(&state.db)
+            .await?;
+        }
+    }
 
     // Re-read so the caller sees the row as it now stands rather than as it was inserted.
     Ok(
@@ -690,6 +870,79 @@ fn split_name(full: &str) -> (String, String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The same host check `fetch_picture` runs, so the table below tests the rule rather
+    /// than a copy of it. Kept in sync by the source-scan test underneath.
+    fn host_allowed(url: &str) -> bool {
+        let Ok(parsed) = reqwest::Url::parse(url) else {
+            return false;
+        };
+        if parsed.scheme() != "https" {
+            return false;
+        }
+        let Some(host) = parsed.host_str().map(|h| h.to_ascii_lowercase()) else {
+            return false;
+        };
+        PICTURE_HOSTS
+            .iter()
+            .any(|h| host == *h || host.ends_with(&format!(".{h}")))
+    }
+
+    /// A picture URL comes out of a provider's JSON, so it is attacker-influenced the
+    /// moment a provider account is taken over. Fetching one is this service making an
+    /// outbound request on that input — the allow-list is what keeps it off the network
+    /// it is sitting inside.
+    #[test]
+    fn a_picture_is_only_fetched_from_the_providers_own_hosts() {
+        assert!(host_allowed("https://avatars.githubusercontent.com/u/1?s=160"));
+        assert!(host_allowed("https://lh3.googleusercontent.com/a/abc=s160-c"));
+
+        // The SSRF shapes: internal addresses, cloud metadata, and the loopback that a
+        // service reaching its own admin port would use.
+        assert!(!host_allowed("https://169.254.169.254/latest/meta-data/"));
+        assert!(!host_allowed("https://127.0.0.1:8080/api/admin/users"));
+        assert!(!host_allowed("https://10.0.0.5/"));
+        assert!(!host_allowed("http://avatars.githubusercontent.com/u/1"));
+        assert!(!host_allowed("file:///etc/passwd"));
+        // Lookalikes: a suffix match must be on a dot boundary, not on the string.
+        assert!(!host_allowed("https://evilgoogleusercontent.com/a"));
+        assert!(!host_allowed("https://avatars.githubusercontent.com.evil.test/a"));
+        // A host that merely mentions an allowed one in its path or credentials.
+        assert!(!host_allowed(
+            "https://evil.test/avatars.githubusercontent.com"
+        ));
+    }
+
+    /// Whatever is downloaded ends up in a column whose contract is a base64 `data:` image
+    /// of one of three types. If this loosened, `clean_avatar` would start rejecting rows
+    /// this code had already written.
+    #[test]
+    fn a_downloaded_picture_matches_what_the_column_accepts() {
+        let src = include_str!("oauth.rs");
+        let body = src.split("async fn fetch_picture").nth(1).expect("fn");
+        let body = &body[..body.find("\n#[cfg(test)]").unwrap_or(body.len())];
+        for kind in ["image/png", "image/jpeg", "image/webp"] {
+            assert!(body.contains(kind), "{kind} must round-trip to the column");
+        }
+        assert!(
+            body.contains("data:image/{kind};base64,"),
+            "the stored value must be a base64 data: URL, not a link to the CDN"
+        );
+        assert!(
+            body.contains("PICTURE_MAX_BYTES"),
+            "an unbounded download would let a provider decide this service's memory use"
+        );
+    }
+
+    /// Signing in again must not overwrite a picture the account holder chose.
+    #[test]
+    fn an_uploaded_picture_survives_the_next_sign_in() {
+        let src = include_str!("oauth.rs");
+        assert!(
+            src.contains("WHERE id = $1 AND (avatar IS NULL OR avatar = '')"),
+            "the write must be conditional in SQL, not only in the branch above it"
+        );
+    }
 
     #[test]
     fn only_our_own_app_paths_are_valid_landing_places() {
@@ -791,5 +1044,50 @@ mod tests {
             !integrations.contains("purpose"),
             "integrations state gained a purpose field — make sure it is not \"login\""
         );
+    }
+
+    /// 完成回调的必须是发起的那个浏览器。
+    ///
+    /// 少了这一半就是登录 CSRF：攻击者在自己浏览器里走完授权、扣下回调 URL、诱导受害者
+    /// 打开，受害者的浏览器就拿到了**攻击者账号**的会话。签名挡不住 —— 那个 state 确实是
+    /// 我们签的，只是不是给他签的。
+    #[test]
+    fn the_flow_is_bound_to_the_browser_that_started_it() {
+        let src = include_str!("oauth.rs");
+        let body = &src[..src.find("\n#[cfg(test)]").unwrap_or(src.len())];
+
+        let start = body.split("pub async fn start(").nth(1).expect("start");
+        let start = &start[..start.find("\nconst NONCE_COOKIE").unwrap_or(start.len())];
+        assert!(
+            start.contains("header::SET_COOKIE") && start.contains("HttpOnly"),
+            "start 必须把 nonce 下发成 HttpOnly cookie，否则没有任何东西能证明浏览器身份",
+        );
+        assert!(
+            start.contains("SameSite=Lax") && !start.contains("SameSite=Strict"),
+            "回调是从 provider 过来的顶层导航，Strict 会把 cookie 扣下，正常登录就永远失败",
+        );
+
+        let finish = body.split("async fn finish(").nth(1).expect("finish");
+        // 确切的守卫形状，不是"提到了这个函数"。`if false && !nonce_matches(…)` 能满足
+        // 后者，却把校验整个短路掉。
+        assert!(
+            finish.contains("let held = nonce_cookie(headers).unwrap_or_default();")
+                && finish.contains("if !nonce_matches(&held, &data.claims.nonce) {"),
+            "finish 必须无条件比对 cookie 与 state 里的 nonce；只发不校验等于没做",
+        );
+        // 拿不到 cookie 要当成不匹配，不能放行。
+        assert!(
+            finish.contains("unwrap_or_default()"),
+            "缺失的 cookie 必须落到比对里被拒，而不是被当作'没有要求'跳过",
+        );
+    }
+
+    #[test]
+    fn nonce_comparison_is_constant_time_and_rejects_empty() {
+        assert!(nonce_matches("abc", "abc"));
+        assert!(!nonce_matches("abc", "abd"));
+        assert!(!nonce_matches("abc", "abcd"));
+        // 空对空必须是 false —— 否则「双方都没有 cookie」会被当成匹配，正好放过攻击者。
+        assert!(!nonce_matches("", ""));
     }
 }

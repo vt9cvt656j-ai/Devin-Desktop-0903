@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { RefreshCw } from "lucide-react";
 
 import { Card, CardContent } from "@/components/ui/card";
+import { mseFetch } from "@/lib/mse";
 import { cn } from "@/lib/utils";
 import { formatDateTime } from "@/lib/format";
 import type { Lang } from "@/lib/i18n";
@@ -104,7 +105,10 @@ export function ModelStatus({ lang }: { lang: Lang }) {
 
   const load = useCallback(async (window: number) => {
     try {
-      const res = await fetch(`/api/models/status?days=${window}`, {
+      // This page bypasses lib/api's request(), so it needs its own mseFetch — left on
+      // plain fetch it would be the one screen still handing this account's Bearer token
+      // to every hop in the clear, once a minute, for as long as the tab is open.
+      const res = await mseFetch(`/api/models/status?days=${window}`, {
         headers: { Authorization: `Bearer ${token()}` },
         cache: "no-store",
       });

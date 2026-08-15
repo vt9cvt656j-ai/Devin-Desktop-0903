@@ -387,16 +387,24 @@ function CodeHosts({ lang }: { lang: Lang }) {
           const open = tokenFor === row.provider;
           return (
             <Card key={row.provider} className="items-center bg-muted p-6 text-center">
-              <div className="mb-2.5 flex items-center justify-center gap-2.5">
-                {Mark ? <Mark className="size-5" /> : null}
-                <span className="text-lg font-semibold">{row.label}</span>
+              <div className="mb-4 flex items-center justify-center gap-3">
+                {Mark ? <Mark className="size-7" /> : null}
+                {/* 卡片里就这一个标题，text-lg 压不住整张卡的留白。图标同步放大，
+                    不然文字变大之后它会显得像个补丁。 */}
+                <span className="text-2xl font-semibold">{row.label}</span>
                 {row.connected ? <Badge variant="success">{t.connected}</Badge> : null}
               </div>
-              <p className="mb-4 min-h-[2.5rem] text-[13.5px] leading-relaxed text-muted-foreground">
-                {row.connected
-                  ? `${t.connectedAs} ${row.account_login || row.account_name || "—"}`
-                  : `@${row.provider}:`}
-              </p>
+              {/*
+                这一段只在连上之后才存在。
+                以前它无条件占着 min-h-[2.5rem] 用来对齐两张卡，里面印的是 `@github:` ——
+                我把那行字删掉之后，留下的就是标题和按钮之间一块 40px 的空白。卡片本身在
+                grid 里已经等高，不需要靠一个空段落来撑。
+              */}
+              {row.connected ? (
+                <p className="mb-4 text-[13.5px] leading-relaxed text-muted-foreground">
+                  {`${t.connectedAs} ${row.account_login || row.account_name || "—"}`}
+                </p>
+              ) : null}
 
               {row.connected ? (
                 <Button
@@ -460,25 +468,35 @@ function CodeHosts({ lang }: { lang: Lang }) {
                         card — the token route below always works. */}
                     {row.oauth_configured ? (
                       <Button
+                        // min-w 而不是固定宽度：两张卡的主按钮文案长度不同（「连接」对
+                        // 「用令牌连接」），靠内容撑宽必然一长一短。给同一个下限就齐了，
+                        // 而文案将来变长时按钮还能自己长出去，不会被截断。
+                        className="min-w-[9.5rem]"
                         disabled={busy === row.provider}
                         onClick={() => void connect(row.provider)}
                       >
                         {busy === row.provider ? t.connecting : t.connect}
                       </Button>
                     ) : null}
-                    {/* Named for what it does. Labelled plain "Connect" it promised a
-                        jump to GitHub's sign-in page and instead opened a paste box,
-                        which reads as a broken button rather than a different route. */}
-                    <Button
-                      variant={row.oauth_configured ? "outline" : "default"}
-                      onClick={() => {
-                        setNote(null);
-                        setToken("");
-                        setTokenFor(row.provider);
-                      }}
-                    >
-                      {row.oauth_configured ? t.useToken : t.connectWithToken}
-                    </Button>
+                    {/*
+                      令牌入口只在没有一键授权时出现。
+                      两个都摆出来时，用户要先读懂「连接」和「使用令牌」的区别才能动手 ——
+                      而在能一键授权的情况下，粘贴令牌只是同一件事的更麻烦版本。
+                      不能无条件删掉它：GitLab 还没注册 OAuth 应用，那张卡上这是唯一的入口，
+                      删了就等于把那个 provider 变成不可用。
+                    */}
+                    {!row.oauth_configured ? (
+                      <Button
+                        className="min-w-[9.5rem]"
+                        onClick={() => {
+                          setNote(null);
+                          setToken("");
+                          setTokenFor(row.provider);
+                        }}
+                      >
+                        {t.connectWithToken}
+                      </Button>
+                    ) : null}
                   </div>
                   {!row.oauth_configured ? (
                     <p className="text-xs leading-relaxed text-muted-foreground">

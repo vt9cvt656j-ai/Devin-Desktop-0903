@@ -3,6 +3,7 @@ import { LayoutDashboard, LogIn, LogOut } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 import { DASHBOARD, GATEWAY, authToken, avatarLetter, displayName, useAccount } from "@/lib/account";
+import { mseFetch } from "@/lib/mse";
 
 /**
  * "Log in", or who you already are.
@@ -43,7 +44,7 @@ async function signOut() {
       // Awaited, so the session is revoked before the reload — a request still in flight
       // when the page navigates is a request the browser is free to drop, and dropping
       // this one is precisely the bug. keepalive covers the reload racing us anyway.
-      await fetch(`${GATEWAY}/api/auth/logout`, {
+      await mseFetch(`${GATEWAY}/api/auth/logout`, {
         method: "POST",
         headers: { Authorization: `Bearer ${token}` },
         keepalive: true,

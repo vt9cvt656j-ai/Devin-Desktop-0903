@@ -249,28 +249,83 @@ fn issue_token(cfg: &Config, user: &User, sid: uuid::Uuid) -> ApiResult<String> 
 
 /// Resolve a user id from a raw JWT (used by the model gateway so the IDE can
 /// authenticate with the login token, not just an API key). None if invalid.
-pub fn user_from_jwt(cfg: &Config, token: &str) -> Option<uuid::Uuid> {
+///
+/// **签名有效 ≠ 这次登录还在。** 这个函数以前只验签名和过期就放行，而它正是所有计费入口
+/// 的认证回落路径：`/v1/chat/completions`、responses、audio、images、knowledge。`Claims`
+/// 提取器一直在查 `sessions.revoked_at`，这里没查 —— 两条路对同一张令牌给出相反的答案。
+///
+/// 后果是用户在后台点「注销该设备」之后：`/api/me` 如实 401 了，可同一张令牌还能继续烧他
+/// 的额度，直到 30 天自然过期。设备列表在宣传一个不生效的开关，而真正花钱的那条路根本
+/// 没在听。所以这里必须做和提取器一模一样的检查。
+///
+/// 删号同理：用户行没了也要拒，否则注销的账号还能接着调用。
+pub async fn user_from_jwt(
+    db: &sqlx::PgPool,
+    cfg: &Config,
+    token: &str,
+) -> Option<uuid::Uuid> {
     let data = decode::<Claims>(
         token,
         &DecodingKey::from_secret(cfg.jwt_secret.as_bytes()),
         &Validation::default(),
     )
     .ok()?;
-    uuid::Uuid::parse_str(&data.claims.sub).ok()
+    let uid = uuid::Uuid::parse_str(&data.claims.sub).ok()?;
+    let sid = data.claims.sid.as_deref().and_then(|s| uuid::Uuid::parse_str(s).ok());
+
+    // 和 Claims 提取器同一条判定：`$2 IS NULL` 那一支放行 sessions 表出现之前签发的老令牌
+    // （它们没有 sid，没有对应的行可查），其余一律要求会话还活着。
+    let ok: Option<(bool,)> = sqlx::query_as(
+        "SELECT ($2::uuid IS NULL OR EXISTS ( \
+             SELECT 1 FROM sessions \
+             WHERE id = $2 AND user_id = $1 AND revoked_at IS NULL \
+         )) AS live \
+         FROM users WHERE id = $1",
+    )
+    .bind(uid)
+    .bind(sid)
+    .fetch_optional(db)
+    .await
+    .ok()?;
+
+    match ok {
+        Some((true,)) => Some(uid),
+        // 会话已注销，或者用户行已经不在了。
+        _ => None,
+    }
 }
 
 /// Decode and validate a login JWT into its claims. For contexts that cannot use
 /// the `Claims` extractor because there is no request to extract from — notably the
 /// WebSocket feed, where the browser cannot send an Authorization header and the
 /// token arrives in the first frame instead.
-pub fn claims_from_jwt(cfg: &Config, token: &str) -> Option<Claims> {
-    decode::<Claims>(
+/// 同样要查会话是否已注销 —— 理由见上面 `user_from_jwt`。这条路的调用方（管理后台的
+/// WebSocket）随后会用 `is_admin_now` 现查一次 role，所以降权是立刻生效的；但"这次登录
+/// 已被注销"以前没人查，被踢掉的管理员会话照样能连上实时推送。
+pub async fn claims_from_jwt(db: &sqlx::PgPool, cfg: &Config, token: &str) -> Option<Claims> {
+    let claims = decode::<Claims>(
         token,
         &DecodingKey::from_secret(cfg.jwt_secret.as_bytes()),
         &Validation::default(),
     )
     .ok()
-    .map(|data| data.claims)
+    .map(|data| data.claims)?;
+
+    let uid = uuid::Uuid::parse_str(&claims.sub).ok()?;
+    let sid = claims.sid.as_deref().and_then(|s| uuid::Uuid::parse_str(s).ok());
+    let live: Option<(bool,)> = sqlx::query_as(
+        "SELECT ($2::uuid IS NULL OR EXISTS ( \
+             SELECT 1 FROM sessions \
+             WHERE id = $2 AND user_id = $1 AND revoked_at IS NULL \
+         )) AS live \
+         FROM users WHERE id = $1",
+    )
+    .bind(uid)
+    .bind(sid)
+    .fetch_optional(db)
+    .await
+    .ok()?;
+    matches!(live, Some((true,))).then_some(claims)
 }
 
 // ---- password-login brute-force guard --------------------------------------
@@ -640,13 +695,15 @@ pub async fn send_code(
             return Err(AppError::bad("验证码发送过于频繁，请 30 秒后再试"));
         }
     }
-    // Daily ceiling per address — protects the victim's inbox.
-    let per_email =
-        bump_fixed_window(&mut conn, &format!("code_send_d:{email}"), 24 * 3600).await?;
-    if per_email > CODE_SENDS_PER_EMAIL_PER_DAY {
-        return Err(AppError::bad("该邮箱今日验证码发送次数已达上限，请明天再试"));
-    }
-    // Hourly ceiling per caller — protects the email quota and sender reputation.
+    // 调用方的每小时上限**先查**。
+    //
+    // 顺序在这里是安全属性，不是风格问题。原来是先给 `code_send_d:{email}` 加一，再查 IP
+    // 上限 —— 于是一个被 IP 限流挡掉、一封信都没发出去的请求，照样烧掉了受害者当天 12 次
+    // 配额里的一次。一个 IP 因此可以在不触发任何发信的情况下，把任意多个邮箱的验证码登录
+    // 路径挨个封死：每个地址打 12 下就够了，而它自己早就越过上限、什么都没寄出去。
+    //
+    // 先查 IP，越限的请求根本走不到那个计数器，攻击就没有了着力点。
+    //
     // nginx restores the real client IP (conf.d/cloudflare-realip.conf), so
     // X-Forwarded-For's last hop is meaningful here; absent it we fall back to a
     // shared bucket rather than skipping the check.
@@ -660,6 +717,12 @@ pub async fn send_code(
     let per_ip = bump_fixed_window(&mut conn, &format!("code_send_ip:{ip}"), 3600).await?;
     if per_ip > CODE_SENDS_PER_IP_PER_HOUR {
         return Err(AppError::bad("请求过于频繁，请稍后再试"));
+    }
+    // Daily ceiling per address — protects the victim's inbox.
+    let per_email =
+        bump_fixed_window(&mut conn, &format!("code_send_d:{email}"), 24 * 3600).await?;
+    if per_email > CODE_SENDS_PER_EMAIL_PER_DAY {
+        return Err(AppError::bad("该邮箱今日验证码发送次数已达上限，请明天再试"));
     }
     let code = gen_code();
     store_code(&state, &req.email, &code).await?;
@@ -719,7 +782,15 @@ pub async fn register(
         json!({ "email": user.email, "referred_by": referred_by }),
     )
     .await;
-    Ok(Json(json!({ "token": token, "user": user, "referred_by": referred_by })))
+    // 布尔，不是邮箱。
+    //
+    // `bind_at_signup` 返回的是**推荐人的真实邮箱**，上面那行 record_event 需要它（事件流
+    // 只有管理员看得到）。但它同时被原样放进了 HTTP 响应 —— 而邀请链接是公开发布的：
+    // 任何人拿一个公开的 `?ref=CODE` 注册一个自己的邮箱，响应体里就有推荐人的邮箱。
+    //
+    // 调用方（ide/src/main.js:386）只判断真假 —— 绑上了就把本地存的邀请码清掉，从不显示
+    // 这个值。所以换成布尔不影响任何人，而邮箱不再离开服务器。键名保持不变，老客户端照常工作。
+    Ok(Json(json!({ "token": token, "user": user, "referred_by": referred_by.is_some() })))
 }
 
 pub async fn login(
@@ -1310,5 +1381,31 @@ mod authz_gate_tests {
             !block.contains("proxy_pass http://127.0.0.1:8080/api/me"),
             "/_app_authz 不能再打 /api/me —— 那会让每个静态资源触发两条 UPDATE",
         );
+    }
+
+    /// 调用方的上限必须在受害者的配额之前检查。
+    ///
+    /// 顺序反了的后果不是「限流不准」，是一个可以拿来封别人账号的工具：被 IP 上限挡掉、
+    /// 一封信都没发的请求，照样会把目标邮箱当天的发送次数扣掉一次。一个 IP 每个地址打
+    /// 12 下，就能把任意多个人的验证码登录路径封死，而它自己什么都没寄出去。
+    #[test]
+    fn the_caller_ceiling_is_checked_before_the_victims_quota() {
+        let src = include_str!("auth.rs");
+        let body = &src[..src.find("\n#[cfg(test)]").unwrap_or(src.len())];
+        let f = body.split("pub async fn send_code(").nth(1).expect("send_code");
+        // 匹配真正的调用形式，不是裸键名 —— 上面那段注释里就提到了键名，只找名字会命中注释。
+        let ip_at = f
+            .find(r#"bump_fixed_window(&mut conn, &format!("code_send_ip:"#)
+            .expect("per-IP counter");
+        let email_at = f
+            .find(r#"bump_fixed_window(&mut conn, &format!("code_send_d:"#)
+            .expect("per-email counter");
+        assert!(
+            ip_at < email_at,
+            "per-IP 的计数与判定必须排在 per-email 之前，否则越限的请求仍在消耗受害者配额",
+        );
+        // 两个上限都要真的判，不能只计数不拦。
+        assert!(f.contains("per_ip > CODE_SENDS_PER_IP_PER_HOUR"));
+        assert!(f.contains("per_email > CODE_SENDS_PER_EMAIL_PER_DAY"));
     }
 }

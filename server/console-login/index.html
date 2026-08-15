@@ -169,6 +169,17 @@
         <button id="go" type="submit">登录</button>
       </div>
     </form>
+    <!--
+      MSE 客户端。必须排在 login.js 前面 —— login.js 在模块初始化时就会读 window.MSE。
+
+      这一页提交的是**管理员**密码，是整个系统里最值钱的一份凭据，在此之前它以明文
+      经过 Cloudflare 和 nginx。mse.js 是从 server/web-shared/mse.ts 编出来的生成物
+      （`node server/scripts/sync-mse-client.mjs`），不是手抄的第二份实现。
+
+      单独一个文件而不是内联：这一页的 CSP 是 script-src 'self'，内联脚本会被拦掉。
+      nginx 里有一条和 /console/login.js 完全对称的 location 放行它。
+    -->
+    <script src="/console/mse.js"></script>
     <script src="/console/login.js"></script>
   </body>
 </html>

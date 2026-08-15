@@ -73,9 +73,32 @@ type Price = Grant & {
 type Order = Grant & {
   id: string;
   email?: string;
+  /** 目录上的标价，人民币分。「Power」是 18800。 */
   amount_cents?: number;
+  /**
+   * Stripe 实际收到的钱和币种。手工发放的订单、以及 20260827 之前的订单都是 null。
+   *
+   * 显示金额必须优先用这个：amount_cents 是人民币标价，按美元渲染会把一笔 $34.99 的
+   * 交易显示成 $188.00，整体营收虚高五六倍。
+   */
+  charged_cents?: number | null;
+  charged_currency?: string | null;
   status?: string;
   created_at?: string;
+};
+
+/** 一笔订单真正收到的钱。拿不到就退回标价，并让调用方知道这是退回来的。 */
+const realAmount = (o: Order) =>
+  typeof o.charged_cents === "number" ? o.charged_cents : (o.amount_cents || 0);
+
+/** Stripe 的金额是所收币种的最小单位；标价那一路仍按老样子当分处理。 */
+const money = (o: Order) => {
+  if (typeof o.charged_cents !== "number") return cents(o.amount_cents);
+  const ccy = (o.charged_currency || "usd").toUpperCase();
+  return (o.charged_cents / 100).toLocaleString("en-US", {
+    style: "currency",
+    currency: ccy,
+  });
 };
 type Code = Grant & {
   id: string;
@@ -89,8 +112,21 @@ type Code = Grant & {
 };
 type Ask = { title: string; desc: string; label: string; danger?: boolean; act: () => Promise<void> };
 
-/** codes.rs PLANS — the server rejects anything else. */
-const PLANS = ["trial", "basic", "pro", "power", "ultra"] as const;
+/**
+ * codes.rs PLANS —— 服务端只认这几个，别的会被拒。
+ *
+ * 名字跟着 2026Q3 的价目走：等级 key 是不能改的（用户身上存的就是它），但下拉框里只写 key
+ * 的话，运营得自己记住 ultra 是「尊享」。`pro` 已经停售 —— 它没有对应商品，配额行留着只是
+ * 为了还挂在这一档的老用户能查到。默认值曾经就是它，点一下「生成」就会发出一批
+ * 没人买得到、名字也对不上的套餐码。
+ */
+const PLANS = [
+  { key: "trial", label: "日卡" },
+  { key: "basic", label: "入门" },
+  { key: "power", label: "主力" },
+  { key: "ultra", label: "尊享" },
+  { key: "pro", label: "pro（已停售，仅供老用户补发）" },
+] as const;
 
 /**
  * User-facing credit balances are denominated at N real billing cents = $1.00 of visible
@@ -174,14 +210,14 @@ export function Billing() {
   // 商品表单
   const [pLabel, setPLabel] = useState("");
   const [pKind, setPKind] = useState("plan");
-  const [pPlan, setPPlan] = useState("pro");
+  const [pPlan, setPPlan] = useState("basic");
   const [pDays, setPDays] = useState("30");
   const [pCredit, setPCredit] = useState("10");
   const [pAmount, setPAmount] = useState("9.90");
 
   // 兑换码表单
   const [gKind, setGKind] = useState("plan");
-  const [gPlan, setGPlan] = useState("pro");
+  const [gPlan, setGPlan] = useState("basic");
   const [gDays, setGDays] = useState("30");
   const [gCredit, setGCredit] = useState("10");
   const [gCount, setGCount] = useState("10");
@@ -270,7 +306,9 @@ export function Billing() {
 
   const paid = orders.filter((o) => o.status === "paid");
   const pending = orders.filter((o) => o.status === "pending");
-  const revenue = paid.reduce((a, o) => a + (o.amount_cents || 0), 0);
+  // 只累加真收到的钱。混币种相加本来就不对,但在把标价当营收之后,这已经是更接近真相的
+  // 版本;真要分币种统计,得先决定用哪天的汇率,那是另一件事。
+  const revenue = paid.reduce((a, o) => a + realAmount(o), 0);
   const unused = codes.filter((c) => c.status === "unused");
   // 在售 = 客户真能买到的，也就是买入路径要求的 active = true（pay.rs:171）。
   const onSale = prices.filter((p) => p.active !== false);
@@ -332,7 +370,7 @@ export function Billing() {
   const confirmOrder = (o: Order) =>
     setAsk({
       title: "确认收款",
-      desc: `确认已收到 ${o.email || o.id} 的 ${cents(o.amount_cents)}？确认后立即发放，且无法撤销。`,
+      desc: `确认已收到 ${o.email || o.id} 的 ${money(o)}？确认后立即发放，且无法撤销。`,
       label: "确认收款并发放",
       act: async () => {
         const done = await mutate("已确认收款并发放", () =>
@@ -345,7 +383,7 @@ export function Billing() {
   const cancelOrder = (o: Order) =>
     setAsk({
       title: "取消订单",
-      desc: `取消 ${o.email || o.id} 的这笔 ${cents(o.amount_cents)} 订单？不会发放任何权益。`,
+      desc: `取消 ${o.email || o.id} 的这笔 ${money(o)} 订单？不会发放任何权益。`,
       label: "取消订单",
       danger: true,
       act: async () => {
@@ -484,7 +522,7 @@ export function Billing() {
                         <Truncate className="font-medium">{o.email || o.id}</Truncate>
                       </TableCell>
                       <TableCell>{content(o)}</TableCell>
-                      <TableCell numeric>{cents(o.amount_cents)}</TableCell>
+                      <TableCell numeric>{money(o)}</TableCell>
                       <TableCell>{orderStatus(o.status)}</TableCell>
                       <TableCell className="whitespace-nowrap text-muted-foreground">
                         {when(o.created_at)}
@@ -546,8 +584,8 @@ export function Billing() {
                   <Field id="pr-plan" label="套餐">
                     <Select id="pr-plan" value={pPlan} onChange={(e) => setPPlan(e.target.value)}>
                       {PLANS.map((p) => (
-                        <option key={p} value={p}>
-                          {p}
+                        <option key={p.key} value={p.key}>
+                          {p.label}
                         </option>
                       ))}
                     </Select>
@@ -665,8 +703,8 @@ export function Billing() {
                     <Field id="gen-plan" label="套餐">
                       <Select id="gen-plan" value={gPlan} onChange={(e) => setGPlan(e.target.value)}>
                         {PLANS.map((p) => (
-                          <option key={p} value={p}>
-                            {p}
+                          <option key={p.key} value={p.key}>
+                            {p.label}
                           </option>
                         ))}
                       </Select>

@@ -14,6 +14,20 @@
 (function () {
   "use strict";
 
+  // 加密层预热。index.html 先加载了 mse.js，把客户端挂在 window.MSE 上。
+  // 不等它 —— 提前取公钥只是为了让第一次提交少一个往返，取不到就在 send() 里回退明文。
+  if (window.MSE) {
+    try {
+      window.MSE.configureMse({
+        mode: "auto",
+        // 网关静态公钥的指纹。这一页提交的是**管理员**密码，全站最值钱的一份凭据。
+        // 轮换密钥时必须同时更新这里、ide/gate/gate.html，以及三个前端的 VITE_MSE_PIN。
+        pin: ["yddBgF9eaS-gVWQtCJKoTwoM"],
+      });
+      window.MSE.mseReady().catch(function () {});
+    } catch (_) {}
+  }
+
   var TOKEN_KEY = "michael_admin_token";
   var f = document.getElementById("f");
   var go = document.getElementById("go");
@@ -61,7 +75,7 @@
     try {
       var ctl = typeof AbortController === "function" ? new AbortController() : null;
       var timer = setTimeout(function () { if (ctl) ctl.abort(); }, 3000);
-      await fetch("/api/admin/session/logout", {
+      await send("/api/admin/session/logout", {
         method: "POST",
         credentials: "same-origin",
         signal: ctl ? ctl.signal : undefined,
@@ -83,10 +97,36 @@
   passwordEl.addEventListener("input", syncEnabled);
   syncEnabled();
 
+  /*
+   * 加密优先，失败回退明文。
+   *
+   * mse.js（index.html 里先加载的那个）把 MSE 客户端挂成 window.MSE。mseFetch 返回的
+   * 是正常的 Response，所以下面读 res.ok / res.status / res.json() 的代码一行都不用改。
+   *
+   * 回退是必须的：这是管理员唯一的入口，加密层不通时宁可这一次走明文，也不能把人
+   * 锁在外面。/api/admin/session 下发的门禁 cookie 走的是**外层** Set-Cookie，
+   * 加密不会把它吃掉（见 server/src/mse.rs 的 forward_set_cookie）。
+   */
+  async function send(path, init) {
+    if (window.MSE) {
+      try {
+        return await window.MSE.mseFetch(path, init);
+      } catch (e) {
+        /*
+         * `pin`（对面公钥不认识）和 `downgrade`（我们发密文、对面回明文）是敌意信号，
+         * 不是「加密不可用」。这一页输入框里是管理员密码，这种时候退回明文等于直接
+         * 把它交出去 —— 宁可这次登录失败。其余情况（网关没有加密层、老浏览器）才回退。
+         */
+        if (e && (e.code === "pin" || e.code === "downgrade")) throw e;
+      }
+    }
+    return fetch(path, init);
+  }
+
   async function post(path, body, token) {
     var headers = { "Content-Type": "application/json" };
     if (token) headers.Authorization = "Bearer " + token;
-    var res = await fetch(path, {
+    var res = await send(path, {
       method: "POST",
       headers: headers,
       body: JSON.stringify(body || {}),

@@ -140,8 +140,29 @@ pub async fn list(State(state): State<AppState>, claims: Claims) -> ApiResult<Js
     let mut order: Vec<String> = Vec::new();
     let mut groups: std::collections::HashMap<String, (&Row, chrono::DateTime<chrono::Utc>, bool)> =
         std::collections::HashMap::new();
+    /*
+     * 指纹 → 设备组 的别名表，用来把「device_id 出现之前的老会话」并进同一台设备。
+     *
+     * 分组键有两套：有 device_id 的按 id 分，没有的按「类型+浏览器+平台+IP」这个指纹分。
+     * device_id 是后来才加的，所以同一个浏览器里，早期登录没有它、现在的登录有 —— 两把
+     * 钥匙落进两个组，设备列表上就出现两行一模一样的 Chrome·macOS、同一个 IP，其中一行
+     * 的「最近活跃」永远停在几天前。用户看到的就是这个。
+     *
+     * 行是按创建时间倒序来的，所以带 device_id 的那条（较新）先到，先登记自己的指纹；
+     * 后面指纹相同的老会话就并进它。不撤销任何会话 —— 那些 token 还是有效的，
+     * 这里改的只是「怎么把它们归成一台设备」。
+     */
+    let mut alias: std::collections::HashMap<String, String> = std::collections::HashMap::new();
     for row in &rows {
-        let key = device_group(&row.6, &row.1, &row.2, &row.3);
+        let fingerprint = device_group("", &row.1, &row.2, &row.3);
+        let key = if row.6.is_empty() {
+            // 老会话：能认领就认领，认不到就自成一组。
+            alias.get(&fingerprint).cloned().unwrap_or(fingerprint)
+        } else {
+            let k = device_group(&row.6, &row.1, &row.2, &row.3);
+            alias.entry(fingerprint).or_insert_with(|| k.clone());
+            k
+        };
         let is_current = Some(row.0) == current;
         match groups.get_mut(&key) {
             Some(entry) => {
@@ -395,5 +416,53 @@ mod tests {
         // An unrecognised hint must not be honoured as a kind of its own.
         assert_eq!(device_kind(Some("toaster"), CHROME_MAC), "web");
         assert_eq!(device_kind(None, ""), "web");
+    }
+}
+
+#[cfg(test)]
+mod grouping_tests {
+    use super::*;
+
+    /// device_id 出现之前的老会话，必须能并进同一台设备，而不是自成一行。
+    ///
+    /// 这是用户实际看到的样子：同一台 Mac 的 Chrome，同一个 IP，设备列表里出现两行，
+    /// 其中一行标着「当前设备」，另一行的「最近活跃」永远停在几天前 —— 因为两把分组键
+    /// 不一样（一个 id、一个指纹），而它们其实是同一个浏览器。
+    #[test]
+    fn a_legacy_session_folds_into_the_device_it_belongs_to() {
+        let ua = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 \
+                  (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36";
+        let with_id = device_group("f1b54f1f-cafe", "web", ua, "165.254.118.214");
+        let legacy = device_group("", "web", ua, "165.254.118.214");
+        assert_ne!(
+            with_id, legacy,
+            "两把键本来就不同，这正是重复行的来源；list() 靠别名表把它们并起来",
+        );
+        // 指纹这一半必须只由「类型+浏览器+平台+IP」决定，别名表才对得上。
+        assert_eq!(
+            legacy,
+            device_group("", "web", ua, "165.254.118.214"),
+            "同样的浏览器和 IP 必须算出同一个指纹",
+        );
+    }
+
+    /// 不同 IP 的老会话不能被并进来 —— 那是另一个地方登录的。
+    #[test]
+    fn a_different_ip_stays_its_own_device() {
+        let ua = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) Chrome/141.0.0.0";
+        assert_ne!(
+            device_group("", "web", ua, "165.254.118.214"),
+            device_group("", "web", ua, "8.8.8.8"),
+        );
+    }
+
+    /// 桌面端和浏览器即便同机同 IP，也必须分开：它们是两个可以各自撤销的登录。
+    #[test]
+    fn desktop_and_browser_are_never_merged() {
+        let ua = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) Chrome/141.0.0.0";
+        assert_ne!(
+            device_group("", "web", ua, "1.2.3.4"),
+            device_group("", "desktop", ua, "1.2.3.4"),
+        );
     }
 }

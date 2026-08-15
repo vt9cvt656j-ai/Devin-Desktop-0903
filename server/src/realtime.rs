@@ -149,7 +149,7 @@ async fn ws_authenticate(socket: &mut WebSocket, state: &AppState) -> Option<uui
         return None;
     }
     let token = frame.get("token").and_then(|v| v.as_str())?;
-    let claims = crate::auth::claims_from_jwt(&state.cfg, token)?;
+    let claims = crate::auth::claims_from_jwt(&state.db, &state.cfg, token).await?;
     let uid = uuid::Uuid::parse_str(&claims.sub).ok()?;
     is_admin_now(state, uid).await.then_some(uid)
 }

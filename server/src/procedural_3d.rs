@@ -355,7 +355,23 @@ fn get_f32(v: &serde_json::Value, key: &str, def: f32) -> f32 {
     v.get(key)
         .and_then(|x| x.as_f64())
         .map(|x| x as f32)
+        // NaN / inf 会原样流进顶点缓冲，再进 GLB。谁读这个模型谁崩。非有限值一律退默认。
+        .filter(|x| x.is_finite())
         .unwrap_or(def)
+}
+
+/// 单个基元的最大细分段数。
+///
+/// 这一条是入口处的硬闸，不是美学取舍。`segments` 之前从请求直接 `as u32`，只有下限、
+/// 没有上限：sphere 的顶点数是 (seg+1)·(2·seg+1)，seg=20000 就是约 8 亿个顶点，同步
+/// 分配、直接 OOM 掉整个网关进程 —— 聊天、计费、Stripe webhook 全部随之崩掉，而且一分钱
+/// 余额的账号就能发这个请求。64 段已经足够圆滑，再高肉眼也分不出。
+const MAX_SEGMENTS: u32 = 64;
+/// 一个场景最多几个节点。50MB 的请求体能塞进几百万个平凡节点，每个都要分配几何。
+const MAX_NODES: usize = 256;
+/// 读段数并夹紧。NaN/inf 已在 get_f32 里挡掉，这里再兜一次下限。
+fn seg_of(params: &serde_json::Value, floor: u32) -> u32 {
+    (get_f32(params, "segments", 16.0) as u32).clamp(floor, MAX_SEGMENTS)
 }
 
 fn get_arr3(v: &serde_json::Value, key: &str, def: [f32; 3]) -> [f32; 3] {
@@ -393,28 +409,29 @@ pub fn parse_scene(scene: &serde_json::Value) -> Vec<SceneNode> {
         .unwrap_or(&empty);
     nodes
         .iter()
+        // 节点数封顶。50MB 请求体能装几百万个平凡节点，每个都要建几何、进 GLB。
+        .take(MAX_NODES)
         .map(|n| {
             let shape = n.get("shape").and_then(|s| s.as_str()).unwrap_or("cube");
             let params = n.get("params").cloned().unwrap_or(json!({}));
-            let seg = get_f32(&params, "segments", 16.0) as u32;
             let mesh = match shape {
                 "cube" => cube(get_f32(&params, "size", 1.0)),
-                "sphere" => sphere(get_f32(&params, "radius", 0.5), seg),
+                "sphere" => sphere(get_f32(&params, "radius", 0.5), seg_of(&params, 4)),
                 "cylinder" => cylinder(
                     get_f32(&params, "radius", 0.5),
                     get_f32(&params, "height", 1.0),
-                    seg,
+                    seg_of(&params, 3),
                 ),
                 "cone" => cone(
                     get_f32(&params, "radius", 0.5),
                     get_f32(&params, "height", 1.0),
-                    seg,
+                    seg_of(&params, 3),
                 ),
                 "torus" => torus(
                     get_f32(&params, "major_radius", 0.5),
                     get_f32(&params, "minor_radius", 0.15),
-                    seg,
-                    seg,
+                    seg_of(&params, 3),
+                    seg_of(&params, 3),
                 ),
                 "plane" => plane(
                     get_f32(&params, "width", 1.0),
@@ -479,3 +496,47 @@ Rules:
 - Position objects so they compose naturally (e.g. legs under tabletop).
 - Output ONLY the JSON object {"nodes":[...]}, nothing else.
 - Be creative: use scale to reshape primitives (flat cube = board, tall thin cylinder = pole)."#;
+
+#[cfg(test)]
+mod dos_guard_tests {
+    use super::*;
+
+    /// 一个请求打崩整个网关的那条路：segments 从请求直接读、无上限、同步分配。
+    /// 这个测试守住入口处的三道闸：段数夹紧、节点封顶、NaN/inf 不入缓冲。
+    #[test]
+    fn a_hostile_scene_cannot_allocate_an_unbounded_mesh() {
+        // 段数被夹到 MAX_SEGMENTS，无论请求写多大。
+        let scene = json!({ "nodes": [
+            { "shape": "sphere", "params": { "segments": 20000, "radius": 0.5 } }
+        ]});
+        let nodes = parse_scene(&scene);
+        assert_eq!(nodes.len(), 1);
+        // sphere(seg) 的顶点数 = (seg+1)*(2*seg+1)。seg 被夹到 64，顶点数应在万级，
+        // 而不是 8 亿。用顶点数反推，别依赖内部字段名。
+        let verts = nodes[0].mesh.positions.len();
+        let cap = ((MAX_SEGMENTS + 1) * (2 * MAX_SEGMENTS + 1)) as usize;
+        assert!(verts <= cap, "顶点数 {verts} 超过 seg={MAX_SEGMENTS} 的上限 {cap}");
+
+        // 节点数被 MAX_NODES 截断。
+        let many: Vec<_> = (0..100_000)
+            .map(|_| json!({ "shape": "cube", "params": { "size": 1.0 } }))
+            .collect();
+        let big = json!({ "nodes": many });
+        assert_eq!(parse_scene(&big).len(), MAX_NODES);
+    }
+
+    #[test]
+    fn non_finite_numbers_never_reach_the_buffer() {
+        // NaN/inf 写进顶点缓冲会让任何读这个 GLB 的东西崩掉。get_f32 应退回默认值。
+        // 1e400 是编译期就溢出的字面量，编不过；用运行时溢出到 inf 的值。
+        let huge = 1e308_f64 * 10.0; // = inf
+        let scene = json!({ "nodes": [
+            { "shape": "sphere", "params": { "segments": 16, "radius": huge } }
+        ]});
+        let nodes = parse_scene(&scene);
+        assert!(
+            nodes[0].mesh.positions.iter().all(|v| v.iter().all(|x| x.is_finite())),
+            "顶点里出现了非有限值",
+        );
+    }
+}
