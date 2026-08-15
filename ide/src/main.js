@@ -24348,7 +24348,76 @@ async function sendPrompt(text, attachments = [], readyConfig = null) {
   // @file mentions → pull each pinned file's content into THIS turn's context
   // (the visible bubble and stored history keep just the "@path" the user typed).
   let _atContext = "";
-  const _mentioned = [...text.matchAll(/(?:^|\s)@([^\s]+)/g)].map((m) => m[1]);
+  /*
+   * `@github:owner/repo` 之前是一个死字符串。
+   *
+   * chip 只被序列化成字面文本，全项目没有任何消费者 —— 于是模型收到的只有一串
+   * "@github:fendoushaonian/WeChat_Chat"，仓库里是什么它一无所知，只能靠 github_repo 一层层
+   * 爬出来。用户看到的十几次「GitHub 仓库读取」就是这么来的。
+   *
+   * 更糟的是下面这个提及扫描会把 `github:owner/repo` 当成**本地路径**去 readTextFile /
+   * readDir，两次都抛、被 catch 静默吞掉 —— 白占一个提及名额，一点上下文都没换来。
+   *
+   * 所以：远程仓库前缀从本地扫描里摘出去，另走一条发送期预取。
+   */
+  const _REMOTE_AT = /^(github|gitlab|gitee|codeberg|model):/i;
+  const _mentionedAll = [...text.matchAll(/(?:^|\s)@([^\s]+)/g)].map((m) => m[1]);
+  const _mentioned = _mentionedAll.filter((v) => !_REMOTE_AT.test(v));
+
+  /*
+   * 发送期预取：@github:owner/repo → overview + readme 直接进上下文。
+   *
+   * 一次问「这个项目是干嘛的」，正确的工具调用数是 0 —— 答案在 README 里，发送前就该带上。
+   * 只取这两块：tree/file 留给模型在真的需要实现细节时自己去拿，预取整棵树既费额度又多半用不上。
+   * 三次网络请求并发，任何一块失败都不阻塞发送，只在上下文里留一行说明。
+   */
+  const _remoteRepos = [...text.matchAll(/(?:^|\s)@(github|gitlab):([\w.-]+\/[\w.-]+)/gi)]
+    .map((m) => ({ kind: m[1].toLowerCase(), full: m[2] }))
+    .slice(0, 2);
+  if (!_agentLightTurn && _remoteRepos.length) {
+    for (const { kind, full } of _remoteRepos) {
+      const [owner, repo] = full.split("/");
+      if (!owner || !repo) continue;
+      const tool = kind === "github" ? "github_repo" : "gitlab_repo";
+      /*
+       * 优先走网关代读。
+       *
+       * 桌面端的 github_repo 工具直连 GitHub，而它的鉴权只认进程环境变量 GITHUB_TOKEN
+       * （src-tauri/src/knowledge.rs 的 github_auth_header）—— 用户在后台用 OAuth 连的那份
+       * 令牌它根本不知道。于是每次读都是匿名请求，配额 60 次/小时，读几下就被限流。
+       *
+       * 网关那条用的是服务端保管的令牌（认证配额 5000/小时），而且令牌一步都不下发到客户端。
+       * 没登录 Mr.day One、或没连过代码托管时，回落到本地那条 —— 至少还能读公开仓库。
+       */
+      const grab = async (action) => {
+        const session = _michaelSessionToken();
+        if (session) {
+          try {
+            const r = await fetch(
+              `${_michaelBase()}/api/integrations/${kind}/read?owner=${encodeURIComponent(owner)}&repo=${encodeURIComponent(repo)}&action=${action}`,
+              { headers: { Authorization: "Bearer " + session }, cache: "no-store" },
+            );
+            if (r.ok) {
+              const j = await r.json().catch(() => null);
+              if (j && typeof j.content === "string" && j.content) return j.content;
+            }
+          } catch { /* 落到下面那条 */ }
+        }
+        try {
+          const out = await backend.invoke(tool, { owner, repo, action });
+          return typeof out === "string" ? out : JSON.stringify(out);
+        } catch { return ""; }
+      };
+      const [overview, readme] = await Promise.all([grab("overview"), grab("readme")]);
+      const label = kind === "github" ? "GitHub" : "GitLab";
+      if (overview) _atContext += `\n\n${label} 仓库 ${full}（概览）:\n\`\`\`\n${_contextSnippet(overview, 2000, full)}\n\`\`\``;
+      if (readme) _atContext += `\n\n${label} 仓库 ${full}（README）:\n\`\`\`\n${_contextSnippet(readme, 6000, full)}\n\`\`\``;
+      if (!overview && !readme) {
+        _atContext += `\n\n（${label} 仓库 ${full} 预取失败；需要时用 ${tool} 自行读取。）`;
+      }
+    }
+  }
+
   /*
    * `@mcp:服务/uri` → 发送前把资源内容读进这一轮上下文。
    *
@@ -52438,6 +52507,38 @@ return { type: call.type, path: call.query || "", content: `[失败] ${call.type
         : (act === "autofill" || act === "fill")
           ? `\n（表单类任务下一步先看 autofill 返回的 invalid/missing；缺字段就补字段后再 submit，不要只看截图猜。）`
           : `\n（截图里每个可点元素都标了**红色数字**；优先用 index=该数字 来 click / type，定位最准、不用猜选择器；连续多步请用 batch，不要每一步 screenshot。登录/注册/搜索表单优先用 autofill 一次填完并看 invalid/missing。）`;
+      // 这次拿到的是哪个浏览器（接管了已开着的 / 另起了一个 / 用了临时配置），后端只在
+      // 浏览器刚起来的那一次给，所以这里原样带上，不做去重也不做加工。
+      if (state.session_note) content += `\n\n[浏览器会话] ${state.session_note}`;
+      // 落在人机验证墙上：这一步没拿到目标页面，拿到的是一道验证。
+      //
+      // 这里唯一正确的动作是**停下来交给人**——窗口本来就是可见的，用户点一下就过了。
+      // 明确禁止模型自己去「想办法过」：换 UA、改 navigator.webdriver、反复重试、找镜像绕，
+      // 都是绕过机器人检测，这个产品不做。不写死这句话，模型会把验证页当正文继续解析，
+      // 或者原地重试到把工具调用次数耗光——那正是现在的表现。
+      if (state.blocked) {
+        content = `[需要你本人操作] 这一步没能拿到目标页面，落在了一道人机验证上：${state.blocked}\n`
+          + `当前地址：${state.url || "(未知)"}\n\n`
+          + `**不要尝试绕过它**——不要换 User-Agent、不要改 navigator.webdriver、不要反复重试同一个地址、不要找镜像站绕行。\n`
+          + `按这个顺序处理：\n`
+          + `1. 自动化浏览器窗口现在就开着，验证就显示在上面。直接告诉用户「这个页面要过一次人机验证，请在浏览器窗口里点一下，完成后我接着做」，然后停下等他。他点完之后你再重新导航同一个地址即可。\n`
+          + `2. 如果这件事不需要非得从这个网页拿，改用 web_search / 官方 API / 其它数据源完成，并说明你换了路径。\n`
+          + `3. 不要把下面这张截图和文本当成目标页面的内容来解析或引用。\n\n`
+          + content;
+        res.className = "atc-result atc-result--err";
+        res.textContent = "需人工验证";
+        if (step) step.classList.add("is-open");
+        // 也说给**人**听。只写进 content 的话，这句话要等模型下一轮才转述出来，
+        // 而这时候需要动手的恰恰是坐在屏幕前的人——浏览器窗口就在旁边开着。
+        if (vp) vp.insertAdjacentHTML("beforeend",
+          `<div class="browser-wall-note"><b>这一页要过人机验证（${_escHtml(state.blocked)}）</b>`
+          + `<span>自动化浏览器窗口现在就开着，验证就在上面——你点一下完成它，我接着往下做。</span></div>`);
+      }
+      // 「Dock 里为什么多出一个 Chrome」的答案，就贴在它出现的那一次上。
+      if (state.session_note && vp) {
+        vp.insertAdjacentHTML("beforeend",
+          `<div class="browser-session-note">${_escHtml(state.session_note)}</div>`);
+      }
       const runOwnedDevUrl = !!state._runOwnedDevUrl || _isRunOwnedDevUrl(run, state.url || "");
       // Log browser operation for dedup - **必须移到 return 前**，这是唯一 push 点
       try {
@@ -59328,32 +59429,47 @@ function _startDesktopHeartbeat() {
 }
 
 /**
- * 网页登录页通过 mrday://signin?nonce=… 唤起本 App，请求把这里的登录身份交接过去。
+ * 网页登录页通过 `mrday://signin` 唤起本 App，请求把这里的登录身份交接到浏览器。
  *
- * 这一步只做一件事：拿**本 App 自己的登录令牌**去网关认领那个 nonce。网关据此替这个账号
- * 签一张网页会话，登录页轮询取走。所以「谁被登录进网页」完全由这里登录的是谁决定 ——
- * 传过去的只有一个 nonce，它指定不了用户。
+ * **深链不携带任何凭据，这是有意的。** 上一版是网页先向网关要一对 nonce+secret，再让这里
+ * 拿着 nonce 去认领。那个 start 接口按设计公开（调用它的正是还没登录的人），于是任何一个
+ * 网站都能自己要一对、诱导受害者的 App 去认领，然后用自己手里的 secret 换走受害者完整的
+ * 会话 —— 一个不需要用户做任何事的账号接管。校验来源补不上：攻击者用 curl 就能完成那两步，
+ * 受害者的浏览器根本不参与。
+ *
+ * 所以现在由这边发起，密钥一步都不经过发起方：
+ *
+ *   1. 用**本 App 自己的登录令牌**向网关换一个一次性交接码（offer）；
+ *   2. **由本 App 亲自打开系统浏览器**到 `/gate?handoff=<code>`；
+ *   3. 那个页面把码换成会话（redeem），取走即焚。
+ *
+ * 攻击者能造成的唯一后果，是受害者自己的浏览器上真的登录了他自己的账号 —— 那正是他点那个
+ * 按钮想要的结果。因为码从网关直接经由本 App 进入用户自己的浏览器，第三方没有任何位置可以
+ * 插进来，也因此不需要弹确认框。
  *
  * 没登录就什么都不做：没有可交接的身份，静默比弹一个错更合适（用户是在浏览器那边点的，
  * 那边会自己超时并提示）。
  */
-async function _handleHandoffSignin(nonce) {
-  if (!/^[0-9a-f]{1,64}$/i.test(String(nonce || ""))) return;
+async function _handleHandoffSignin() {
   let token = "";
   try { token = localStorage.getItem("michael_token") || ""; } catch (_) {}
   if (!token || !_loggedInEmail) return;
   try {
-    const r = await fetch(_michaelBase() + "/api/auth/handoff/claim", {
+    const r = await fetch(_michaelBase() + "/api/auth/handoff/offer", {
       method: "POST",
       headers: { "Content-Type": "application/json", Authorization: "Bearer " + token },
-      body: JSON.stringify({ nonce: String(nonce) }),
+      body: JSON.stringify({}),
     });
-    if (!r.ok) {
-      const j = await r.json().catch(() => ({}));
-      console.warn("[handoff] claim rejected:", r.status, j.error || "");
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok || !j.url) {
+      console.warn("[handoff] offer rejected:", r.status, j.error || "");
+      return;
     }
+    // 必须由这里打开。整个设计的安全性就建立在「码只走网关 → 本 App → 用户自己的浏览器」
+    // 这条路径上；把 url 交给别人去开，就等于把上一版的漏洞原样搬回来。
+    await backend.openUrl(j.url);
   } catch (e) {
-    console.warn("[handoff] claim failed:", e && e.message);
+    console.warn("[handoff] offer failed:", e && e.message);
   }
 }
 
@@ -59363,7 +59479,7 @@ if (inTauri) {
   (async () => {
     try {
       const { listen } = await import("@tauri-apps/api/event");
-      await listen("michael://handoff-signin", (e) => { void _handleHandoffSignin(e.payload); });
+      await listen("michael://handoff-signin", () => { void _handleHandoffSignin(); });
     } catch (_) { /* 老版本后端没有这个事件，忽略 */ }
   })();
 }
@@ -60584,6 +60700,40 @@ function _atIntegrationToken(kind) {
   try { return (localStorage.getItem(`michael-ide.${kind}-token`) || "").trim(); } catch { return ""; }
 }
 
+/*
+ * 代码托管的连接状态有**两个**来源，这里以前只认其中一个。
+ *
+ * 一个是本地粘贴的 PAT（`michael-ide.<kind>-token`）；另一个是用户在网页后台点「连接」走
+ * OAuth 授权、令牌存在服务端的那种。后者才是现在推荐的路径，而这个菜单只查前者 —— 于是
+ * 后台明明显示「已连接 fendoushaonian」，IDE 里 @github 还在让人去粘贴令牌。
+ *
+ * 所以先问网关。它有现成的 `/api/integrations/<kind>/repos`，用的是服务端存的那份令牌，
+ * 本地什么都不用存。问不到（没登录 Mr.day One、或者没连过）才回落到本地 PAT。
+ */
+const _atRepoState = { github: "unknown", gitlab: "unknown" };
+
+function _michaelSessionToken() {
+  try { return (localStorage.getItem("michael_token") || "").trim(); } catch { return ""; }
+}
+
+/** 网关侧的仓库列表。null = 这条路走不通（未登录/未连接/出错），交给本地 PAT 兜底。 */
+async function _atGatewayRepos(kind) {
+  const session = _michaelSessionToken();
+  if (!session) return null;
+  try {
+    const r = await fetch(`${_michaelBase()}/api/integrations/${kind}/repos`, {
+      headers: { Authorization: "Bearer " + session },
+      cache: "no-store",
+    });
+    if (!r.ok) return null;
+    const j = await r.json().catch(() => null);
+    // 后端回的是数组；未连接时会是 4xx，上面已经挡掉。
+    return Array.isArray(j) ? j : Array.isArray(j?.repos) ? j.repos : null;
+  } catch {
+    return null;
+  }
+}
+
 /** Rows for the category list, filtered by whatever has been typed after the @. */
 function _atCategoryRows(query) {
   const q = String(query || "").toLowerCase();
@@ -60683,7 +60833,12 @@ function _atModelRows(query) {
  */
 function _atRepoRows(kind, query) {
   const token = _atIntegrationToken(kind);
-  if (!token) {
+  // 网关还没回话之前不要下结论：直接判「未连接」会让已经在后台连好的人先看到一次
+  // 「去连接」，然后才被替换掉 —— 那一闪读起来像是连接掉了。
+  if (_atRepoState[kind] === "unknown" && !token) {
+    return [{ kind: "hint", icon: `i-brand-${kind}`, name: "Loading repositories…", detail: "", onPick: () => {} }];
+  }
+  if (!token && _atRepoState[kind] !== "connected") {
     return [{
       kind: "connect",
       icon: `i-brand-${kind}`,
@@ -60705,10 +60860,17 @@ function _atRepoRows(kind, query) {
       onPick: () => _insertAtChip({ kind, value: r.full_name, label: r.full_name }),
     }));
   if (rows.length) return rows;
+  // 三种"没有行"要说三句不同的话。以前只分了两种：缓存空就一律说「Loading…」，于是一个
+  // 连上了但确实没有仓库的账号，会看到一个永远转不完的加载提示。
+  const empty = !cached.length;
   return [{
     kind: "hint",
     icon: `i-brand-${kind}`,
-    name: cached.length ? "No matching repository" : "Loading repositories…",
+    name: !empty
+      ? "No matching repository"
+      : _atRepoState[kind] === "connected"
+        ? "No repositories in this account"
+        : "Loading repositories…",
     detail: "",
     onPick: () => {},
   }];
@@ -60718,13 +60880,31 @@ const _atRepoCache = { github: [], gitlab: [] };
 
 /** Fetch the account's repositories once per menu opening. */
 async function _atLoadRepos(kind) {
+  if (_atRepoCache[kind].length) return;
+
+  // 先问网关 —— 用户在后台用 OAuth 连的就是这条，令牌在服务端，本地没有副本。
+  const viaGateway = await _atGatewayRepos(kind);
+  if (viaGateway) {
+    _atRepoCache[kind] = viaGateway;
+    _atRepoState[kind] = "connected";
+    if (_atMode === kind) _renderAtMenu();
+    return;
+  }
+
+  // 回落到本地粘贴的 PAT。桌面端才有这条（浏览器里 backend.listRepositories 会抛）。
   const token = _atIntegrationToken(kind);
-  if (!token || _atRepoCache[kind].length) return;
+  if (!token) {
+    _atRepoState[kind] = "disconnected";
+    if (_atMode === kind) _renderAtMenu();
+    return;
+  }
   try {
     const repos = await backend.listRepositories(kind, token);
     _atRepoCache[kind] = Array.isArray(repos) ? repos : [];
+    _atRepoState[kind] = "connected";
   } catch {
     _atRepoCache[kind] = [];
+    _atRepoState[kind] = "disconnected";
   }
   if (_atMode === kind) _renderAtMenu();
 }

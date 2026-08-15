@@ -53,6 +53,17 @@ static BROWSER: LazyLock<Mutex<BrowserStore>> =
 // this separate mutex lets close/reload take the browser state immediately.
 static BROWSER_OPERATION: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
+/// Pending "which browser did you get" note, produced when a session is established
+/// and consumed by the first `snapshot` after it. `Option` rather than a plain
+/// String so it is delivered exactly once instead of on every action.
+static SESSION_NOTE: LazyLock<Mutex<Option<String>>> = LazyLock::new(|| Mutex::new(None));
+
+fn set_session_note(note: String) {
+    if let Ok(mut slot) = SESSION_NOTE.lock() {
+        *slot = Some(note);
+    }
+}
+
 // Installed before any page script runs. The frontend's browser check reads these
 // two arrays, so recording at document creation time preserves boot-time failures
 // that would otherwise be gone by the time the agent asks for a health check.
@@ -213,6 +224,22 @@ pub struct BrowserState {
     /// Optional extra (e.g. a JS eval result).
     #[serde(skip_serializing_if = "Option::is_none")]
     result: Option<String>,
+    /// Set when the page we landed on is a human-verification / bot wall rather than
+    /// the content that was asked for (reCAPTCHA, Cloudflare challenge, "unusual
+    /// traffic"). Names which wall it is.
+    ///
+    /// This exists so the agent STOPS instead of scraping the challenge page and
+    /// retrying it forever. The window is visible by design: the human can clear the
+    /// check themselves and the run continues. Nothing here tries to defeat, evade or
+    /// solve the challenge — announcing the wall is the opposite of hiding from it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    blocked: Option<String>,
+    /// One-shot note about WHICH browser this session is (attached to an existing one
+    /// vs. freshly launched, and with which profile). Delivered on the first action
+    /// after the browser comes up, so "why is there a second Chrome icon" is answered
+    /// where it happens instead of being a mystery.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    session_note: Option<String>,
 }
 
 /// Check if Google Chrome is currently running (macOS).
@@ -279,7 +306,8 @@ fn launch() -> Result<Session, String> {
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false);
     // Chrome 在跑时它的 profile 是锁着的，共享不了——即使显式开了也只能退回独立 profile。
-    let profile_dir = if use_real_profile && !is_chrome_running() {
+    let chrome_running = is_chrome_running();
+    let real_profile = if use_real_profile && !chrome_running {
         #[cfg(target_os = "macos")]
         {
             std::env::var_os("HOME")
@@ -294,8 +322,9 @@ fn launch() -> Result<Session, String> {
         }
     } else {
         None
-    }
-    .or_else(|| {
+    };
+    let used_real_profile = real_profile.is_some();
+    let profile_dir = real_profile.or_else(|| {
         std::env::var_os("HOME")
             .or_else(|| std::env::var_os("USERPROFILE"))
             .map(|h| {
@@ -303,6 +332,28 @@ fn launch() -> Result<Session, String> {
                     .join(".michael-ide")
                     .join("browser-profile")
             })
+    });
+    // Say which browser this is and why, once, on the first action after it opens.
+    // The separate Dock icon is not a bug to be hidden — it is a real second Chrome,
+    // and the only honest thing to do is name the reason it had to be started.
+    set_session_note(if used_real_profile {
+        "已用你本人的 Chrome 配置启动自动化浏览器（登录态/cookie 都在），但它是一个独立进程，所以 Dock 里会多一个图标。".into()
+    } else {
+        // 这里只说**已经证实**的原因，不推荐没验证过的开关。
+        // 真实 profile 那条路（MICHAEL_BROWSER_USE_REAL_PROFILE）在 Chrome 运行时必定
+        // 失败（配置目录被 SingletonLock 锁着），所以它不是一条能推荐的路，别写成建议。
+        let why = if use_real_profile && chrome_running {
+            "你已开着 Chrome，它把配置目录锁住了，共享不了"
+        } else {
+            "接管别人的 Chrome 需要那个实例在启动时就开了调试端口，而端口是启动期参数，跑起来之后加不上"
+        };
+        format!(
+            "没能复用你正开着的 Chrome，已另起一个自动化浏览器（Dock 里那第二个图标就是它）。\
+原因：先扫了 9222-9229 调试端口没找到可接管的实例——{why}。\
+它用的是独立配置 ~/.michael-ide/browser-profile：全新、没登录过、没扩展，\
+所以像 Google 这类站点更容易弹人机验证。\
+**在这个窗口里登录一次会被记住**，下次直接就是登录态——这是让它少弹验证的正路。"
+        )
     });
     if let Some(ref p) = profile_dir {
         let _ = std::fs::create_dir_all(p);
@@ -388,6 +439,11 @@ fn launch() -> Result<Session, String> {
                 .args(extra_ref.clone())
                 .build()
                 .map_err(|e| e.to_string())?;
+            set_session_note(
+                "上一份浏览器配置用不了（损坏或被残留进程锁住），已改用一次性临时配置启动。\
+本次的登录态不会保留，但自动化不会因此中断。"
+                    .into(),
+            );
             Browser::new(opts2).map_err(|e| e.to_string())?
         }
     };
@@ -421,6 +477,9 @@ fn try_connect_existing() -> Option<Session> {
                     continue;
                 }
                 tracing::info!("[browser] attached to existing Chrome on port {port}");
+                set_session_note(format!(
+                    "已接管你已经开着的 Chrome（调试端口 {port}），没有另起浏览器——用的是你本人的登录态、cookie 和扩展。"
+                ));
                 return Some(Session {
                     _browser: browser,
                     tab,
@@ -555,6 +614,95 @@ fn enumerate_elements(tab: &Tab) -> Vec<BrowserElement> {
     }
 }
 
+/// Name the human-verification wall this page is, if it is one.
+///
+/// Detection only. There is deliberately no counterpart that solves, bypasses or
+/// hides from these checks — the agent's correct move on hitting one is to stop and
+/// hand the visible window back to the person driving it, which it cannot do while
+/// it thinks a challenge page is the article it asked for.
+///
+/// Both halves matter: the DOM probe catches the widget even when the challenge is
+/// embedded in an otherwise normal-looking page, and the URL/title check catches the
+/// walls that ship no widget at all (a bare 403, Google's `/sorry/` redirect).
+fn detect_wall(tab: &Tab, title: &str, url: &str, text: &str) -> Option<String> {
+    let probe = r#"(function(){try{
+  var hit=[];
+  var q=function(s){try{return !!document.querySelector(s)}catch(e){return false}};
+  if(q('iframe[src*="recaptcha/api2"],iframe[src*="recaptcha/enterprise"],.g-recaptcha,#recaptcha,#captcha-form')) hit.push('reCAPTCHA');
+  if(q('iframe[src*="hcaptcha.com"],.h-captcha')) hit.push('hCaptcha');
+  if(q('iframe[src*="challenges.cloudflare.com"],.cf-turnstile,#cf-challenge-running,#challenge-form,#challenge-stage')) hit.push('Cloudflare 验证');
+  if(q('#px-captcha,#px-captcha-wrapper')) hit.push('PerimeterX');
+  if(q('iframe[src*="arkoselabs"],iframe[src*="funcaptcha"]')) hit.push('Arkose/FunCaptcha');
+  return hit.join('、');
+}catch(e){return ''}})()"#;
+    let mut found = tab
+        .evaluate(probe, false)
+        .ok()
+        .and_then(|ro| ro.value)
+        .and_then(|v| v.as_str().map(|s| s.to_string()))
+        .unwrap_or_default();
+    if found.is_empty() {
+        found = detect_wall_static(title, url, text).unwrap_or_default();
+    }
+    if found.is_empty() {
+        None
+    } else {
+        Some(found)
+    }
+}
+
+/// The half of wall detection that needs no page access: walls that ship no widget
+/// at all (a bare 403, Google's `/sorry/` redirect, Cloudflare's interstitial).
+///
+/// Split out from `detect_wall` because it is pure and therefore testable, and
+/// because a false positive here is expensive in a specific way: it would tell the
+/// user to go clear a verification on a page that has none. So the signals are
+/// graded. Only endpoints that exist *solely* to serve a challenge count on their
+/// own; every keyword that could plausibly appear in ordinary content ("captcha",
+/// "access denied", "unusual traffic") additionally requires a nearly empty page —
+/// an interstitial has almost no text, an article about CAPTCHAs has plenty.
+fn detect_wall_static(title: &str, url: &str, text: &str) -> Option<String> {
+    let lower_url = url.to_ascii_lowercase();
+    let lower_title = title.to_ascii_lowercase();
+    let lower_text = text.to_ascii_lowercase();
+    // Paths that are challenge endpoints and nothing else.
+    let strong_url = ["/sorry/index", "/cdn-cgi/challenge-platform/", "/recaptcha/api2/"]
+        .iter()
+        .any(|needle| lower_url.contains(needle));
+    // Titles a real page does not carry.
+    let strong_title = ["just a moment", "attention required", "人机身份验证"]
+        .iter()
+        .any(|needle| lower_title.contains(needle));
+    if strong_url || strong_title {
+        return Some("人机验证 / 反爬拦截".to_string());
+    }
+    // An interstitial is a nearly empty page. Below this threshold the weaker
+    // keywords stop being ambiguous; above it, the page has real content and the
+    // same words are just words.
+    let thin = text.chars().count() < 400;
+    if !thin {
+        return None;
+    }
+    let weak = ["captcha", "验证码"]
+        .iter()
+        .any(|needle| lower_url.contains(needle) || lower_title.contains(needle))
+        || [
+            "unusual traffic",
+            "verify you are human",
+            "are you a robot",
+            "access denied",
+            "异常流量",
+            "检测到异常",
+        ]
+        .iter()
+        .any(|needle| lower_title.contains(needle) || lower_text.contains(needle));
+    if weak {
+        Some("人机验证 / 反爬拦截".to_string())
+    } else {
+        None
+    }
+}
+
 /// Capture the current page state (title / url / visible text / elements / shot).
 fn snapshot(tab: &Tab, result: Option<String>) -> Result<BrowserState, String> {
     let title = tab.get_title().unwrap_or_default();
@@ -579,6 +727,8 @@ fn snapshot(tab: &Tab, result: Option<String>) -> Result<BrowserState, String> {
         .map_err(|e| e.to_string())?;
     // Compact JPEG so the screenshot data URL doesn't blow the AI body limit (413).
     let screenshot = crate::capture::bytes_to_jpeg_data_url(&png, 1280, 68)?;
+    let blocked = detect_wall(tab, &title, &url, &text);
+    let session_note = SESSION_NOTE.lock().ok().and_then(|mut slot| slot.take());
     Ok(BrowserState {
         title,
         url,
@@ -586,6 +736,8 @@ fn snapshot(tab: &Tab, result: Option<String>) -> Result<BrowserState, String> {
         screenshot,
         elements,
         result,
+        blocked,
+        session_note,
     })
 }
 
@@ -1327,6 +1479,64 @@ pub fn kill_orphaned_browsers() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // 一篇长文，用来喂「正文足够长 → 弱信号不算数」那条规则。
+    const ARTICLE: &str = "x的正文很长，足够长到不像一张过渡页。这一段会被重复很多遍以越过阈值。";
+
+    fn long_body() -> String {
+        ARTICLE.repeat(40)
+    }
+
+    #[test]
+    fn 挡在验证墙上要认出来_不管它带不带控件() {
+        // 只用来提供挑战的端点：单凭 URL 就该判定，正文再长也一样。
+        assert!(detect_wall_static("Google", "https://www.google.com/sorry/index?continue=x", "").is_some());
+        assert!(detect_wall_static("", "https://例子.com/cdn-cgi/challenge-platform/h/b/x", "").is_some());
+        // 正常页面不会顶着这些标题。
+        assert!(detect_wall_static("Just a moment...", "https://例子.com/a", "").is_some());
+        assert!(detect_wall_static("Attention Required! | Cloudflare", "https://例子.com/a", "").is_some());
+    }
+
+    #[test]
+    fn 一篇讲验证码的文章不能被当成验证墙() {
+        // 这是这个函数最容易犯、代价也最高的错：误判会让用户跑去一个根本没有验证的页面
+        // 上「点一下」。所以凡是正常内容里也会出现的词，都必须再满足「页面几乎没正文」。
+        let body = long_body();
+        assert_eq!(detect_wall_static("reCAPTCHA 是怎么工作的", "https://blog.example.com/how-captcha-works", &body), None);
+        assert_eq!(detect_wall_static("如何应对 access denied 报错", "https://example.com/faq", &body), None);
+        assert_eq!(detect_wall_static("聊聊 unusual traffic 告警", "https://example.com/ops", &body), None);
+        // 普通页面完全不该触发。
+        assert_eq!(detect_wall_static("首页", "https://example.com/", &body), None);
+    }
+
+    #[test]
+    fn 弱信号加上几乎空白的正文_才算撞墙() {
+        // 过渡页的共同点是「没有内容」——弱信号只在这种页面上才不再有歧义。
+        assert!(detect_wall_static("", "https://example.com/captcha", "请完成验证").is_some());
+        assert!(detect_wall_static(
+            "",
+            "https://example.com/x",
+            "Our systems have detected unusual traffic from your computer network."
+        )
+        .is_some());
+        // 同样的词，配上真实正文，就只是词而已。
+        assert_eq!(
+            detect_wall_static("", "https://example.com/x", &format!("unusual traffic {}", long_body())),
+            None
+        );
+    }
+
+    #[test]
+    fn 会话说明只发一次_不是每个动作都重复() {
+        // 「为什么 Dock 里多了一个 Chrome」只需要在浏览器起来的那一次说清楚。
+        // 每个动作都带一遍的话，模型上下文会被同一段话反复占满。
+        *SESSION_NOTE.lock().unwrap() = None;
+        set_session_note("另起了一个自动化浏览器".into());
+        let first = SESSION_NOTE.lock().unwrap().take();
+        assert_eq!(first.as_deref(), Some("另起了一个自动化浏览器"));
+        let second = SESSION_NOTE.lock().unwrap().take();
+        assert_eq!(second, None, "同一条说明不该被重复投递");
+    }
 
     #[test]
     fn viewport_validation_applies_defaults_and_preserves_mobile() {
