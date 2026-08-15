@@ -423,8 +423,31 @@ fn route_cooldown_remaining(id: uuid::Uuid, now: Instant) -> Option<Duration> {
 }
 
 fn mark_route_cooldown(id: uuid::Uuid) {
+    // 只延长不缩短：否则一条正处于 5 分钟鉴权冷却里的坏线路，被一次瞬时故障
+    // 覆盖成 20 秒，又提前回到轮换里继续 401。
     if let Ok(mut guard) = CHAT_UPSTREAM_ROUTE_COOLDOWNS.lock() {
-        guard.insert(id, Instant::now() + CHAT_UPSTREAM_ROUTE_COOLDOWN);
+        let until = Instant::now() + CHAT_UPSTREAM_ROUTE_COOLDOWN;
+        let e = guard.entry(id).or_insert(until);
+        if until > *e {
+            *e = until;
+        }
+    }
+}
+
+/// 鉴权失败（401/403、invalid key）后的冷却，比瞬时故障长得多。
+///
+/// 坏 key 不会在几十秒里变好，所以 20 秒的瞬时冷却在这里没用——到期它又回轮换、又
+/// 401。5 分钟意味着：坏了之后基本不再被挑中（同模型的好线路接管），而运维在后台把
+/// key 修好后，最迟 5 分钟这条线路自动回归，不需要重启。用 max 避免把一条已经在更长
+/// 冷却里的线路缩短。
+const CHAT_UPSTREAM_AUTH_COOLDOWN: Duration = Duration::from_secs(5 * 60);
+fn mark_route_cooldown_auth(id: uuid::Uuid) {
+    if let Ok(mut guard) = CHAT_UPSTREAM_ROUTE_COOLDOWNS.lock() {
+        let until = Instant::now() + CHAT_UPSTREAM_AUTH_COOLDOWN;
+        let e = guard.entry(id).or_insert(until);
+        if until > *e {
+            *e = until;
+        }
     }
 }
 
@@ -6007,6 +6030,10 @@ pub async fn chat_completions(
             }
             let mut route_attempts = 0u32;
             let mut route_failed_transient = false;
+            // 持久性鉴权失败（401/403、invalid api key）。这类路由必须**更**该被冷却：
+            // key 是坏的，20 秒后它也不会自己好。不冷却的话它一直留在轮换里，下一个
+            // 请求可能又挑中它、又 401 —— 用户看到的就是「时好时坏」甚至一直报错。
+            let mut route_failed_persistent = false;
             // Never replay a chat prompt inside one user request. Even a transport error can
             // happen after the supplier accepted the body, so a fresh send is not reliably
             // idempotent and may duplicate both model work and billing.
@@ -6033,6 +6060,10 @@ pub async fn chat_completions(
                     build_chat_http_client(0)
                 };
                 let req0 = chat_client.post(&candidate_url);
+                // 上游 key 落库是密文（field_crypto，`fc1:...`）。必须先解密再发出去，
+                // 否则等于把一段密文当令牌发给上游 → 每条线路一律 401。遗留明文原样透传，
+                // 所以对加密/未加密两种行都正确。这一处漏解密，正是「所有模型都用不了」。
+                let candidate_key = model_key(&candidate.api_key);
                 let mut req = if candidate_anthropic {
                     // 1M context must be explicitly enabled upstream. Anthropic's own API ships
                     // 1M by default on Opus 4.6+/Sonnet 4.6+/Fable, but resellers front it behind
@@ -6042,14 +6073,14 @@ pub async fn chat_completions(
                     // 1M entry, send the flag. It is a no-op where 1M is already default, and it
                     // is the difference between working and a hard 400 where it is not.
                     let mut r = req0
-                        .header("x-api-key", &candidate.api_key)
+                        .header("x-api-key", &candidate_key)
                         .header("anthropic-version", "2023-06-01");
                     if let Some(beta) = candidate_anthropic_beta.as_deref() {
                         r = r.header("anthropic-beta", beta);
                     }
                     r.json(&candidate_upstream_body)
                 } else {
-                    req0.header("Authorization", format!("Bearer {}", candidate.api_key))
+                    req0.header("Authorization", format!("Bearer {}", candidate_key))
                         .json(&body)
                 };
                 if !streaming {
@@ -6174,6 +6205,11 @@ pub async fn chat_completions(
                             break 'routes;
                         }
                         if persistent || !transient {
+                            // 持久鉴权失败 → 冷却这条线路（见 route_failed_persistent），
+                            // 让接下来的请求绕开它、走还能用的同模型线路。
+                            if persistent {
+                                route_failed_persistent = true;
+                            }
                             break;
                         }
                         if attempt + 1 >= candidate_max_attempts {
@@ -6208,6 +6244,17 @@ pub async fn chat_completions(
                         }
                     }
                 }
+            }
+            if route_failed_persistent {
+                // 坏 key 不会在 20 秒内变好，冷却时间要长得多，避免它反复回到轮换里
+                // 又反复 401。到期后会被再探一次；一旦运维在后台把 key 修好，它自然回归。
+                mark_route_cooldown_auth(candidate.id);
+                tracing::warn!(
+                    model = %model_name,
+                    provider = %candidate.provider,
+                    route_id = %candidate.id,
+                    "上游鉴权失败（key 无效/未授权），已冷却这条线路，后续请求改走其它同模型线路"
+                );
             }
             if route_failed_transient {
                 mark_route_cooldown(candidate.id);
@@ -6878,6 +6925,8 @@ pub async fn responses_proxy(
     }
 
     let url = format!("{}/responses", api_base(&conn.base_url));
+    // 落库密文 → 解密再发（同 chat 主链路，漏了就是把 `fc1:...` 当令牌发出去）。
+    let conn_key = model_key(&conn.api_key);
 
     // Two-stage attempt for image models:
     //   stage 1: forward AS-IS — relay routes to real gpt-image-2 (full HD output).
@@ -6920,7 +6969,7 @@ pub async fn responses_proxy(
         Err((0, "exhausted".into()))
     }
 
-    let resp = match send_once(&url, &conn.api_key, &body).await {
+    let resp = match send_once(&url, &conn_key, &body).await {
         Ok(r) => r,
         Err((st, msg)) if is_image_model && msg.to_lowercase().contains("no active plus oauth") => {
             // HD pool empty → fall back to mainline-wrap (model=gpt-5.4) for low-res but functional output.
@@ -6930,7 +6979,7 @@ pub async fn responses_proxy(
             if let Some(obj) = body.as_object_mut() {
                 obj.insert("model".into(), serde_json::json!("gpt-5.4"));
             }
-            match send_once(&url, &conn.api_key, &body).await {
+            match send_once(&url, &conn_key, &body).await {
                 Ok(r) => r,
                 Err((st2, msg2)) => {
                     return Err(AppError {
@@ -7138,13 +7187,15 @@ pub async fn image_generations(
     // InFlightGuard exists to provide simply did not hold here.
     let _inflight_guard = InFlightGuard::acquire(&state, uid).await?;
     let url = format!("{}/images/generations", api_base(&conn.base_url));
+    // 落库密文 → 解密再发（生成 + 轮询两处都用它）。
+    let conn_key = model_key(&conn.api_key);
     let resp = {
         let mut success = None;
         let mut last_err = String::new();
         for attempt in 0u32..3 {
             match GW_HTTP
                 .post(&url)
-                .header("Authorization", format!("Bearer {}", conn.api_key))
+                .header("Authorization", format!("Bearer {}", conn_key))
                 .json(&body)
                 .timeout(std::time::Duration::from_secs(120))
                 .send()
@@ -7210,7 +7261,7 @@ pub async fn image_generations(
                 tokio::time::sleep(std::time::Duration::from_secs(3)).await;
                 if let Ok(pr) = GW_HTTP
                     .get(&poll_url)
-                    .header("Authorization", format!("Bearer {}", conn.api_key))
+                    .header("Authorization", format!("Bearer {}", conn_key))
                     .timeout(std::time::Duration::from_secs(15))
                     .send()
                     .await
@@ -7602,6 +7653,58 @@ mod billing_tests {
         assert!(
             src.contains("candidates.iter().any(|c| effective_billing(c, &model_id).2)"),
             "the main path must decide freeness across every candidate route",
+        );
+    }
+
+    /// 落库字段加密上线后，`models.api_key` 存的是密文（`fc1:...`）。凡是把它当外发凭据
+    /// 的地方都必须先 `model_key()` 解密——漏一处，那条链路就把密文当令牌发给上游，
+    /// 上游一律 401。这正是「加密上线后所有模型都用不了」的根因：主 chat 链路
+    /// （6072/6079）、图像 /responses、images/generations（含轮询）、会话压缩，全都漏了解密，
+    /// 而单模型 chat 端点没漏，所以只在网关主路径上暴雷。此测试扫描非测试源码，禁止
+    /// 任何把 `.api_key` 字段直接塞进 Authorization/x-api-key 头的写法。
+    #[test]
+    fn upstream_key_is_always_decrypted_before_send() {
+        // 扫【整份文件】，不在 `mod billing_tests` 处截断——本文件把测试模块夹在生产代码
+        // 中间，7336 行之后还有真生产代码（compression_summarize 等），截断会把它们漏掉。
+        // 为了不误伤本测试自身，所有要搜的 needle 都在运行时用 format! 拼出来，测试源码里
+        // 不出现它们的逐字形态，所以整份扫描不会扫到自己。
+        let full = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/models.rs"))
+            .expect("read models.rs");
+        let dot = |holder: &str| format!("{holder}.api_key");
+
+        // —— 反面：任何把【原始】.api_key 字段直接塞进 Authorization/x-api-key 头的写法都禁止。
+        // 覆盖 Model 结构在本文件里出现过的全部持有者名字。
+        // needle 全部运行时拼装；注释里【绝不写出】拼装后的逐字形态，否则整份扫描会扫到自己。
+        for holder in ["conn", "candidate", "model", "vconn", "m"] {
+            let bearer_raw = format!("Bearer {{}}\", {}", dot(holder)); // 组装出「Bearer 头直发原始字段」的形态
+            assert!(
+                !full.contains(&bearer_raw),
+                "发现未解密外发：Bearer 直接发了原始 {holder}.api_key（密文），必须先 model_key() 解密",
+            );
+            let xapi_raw = format!("x-api-key\", &{}", dot(holder)); // 组装出「x-api-key 头直发原始字段」的形态
+            assert!(
+                !full.contains(&xapi_raw),
+                "发现未解密外发：x-api-key 直接发了原始 {holder}.api_key（密文），必须先 model_key() 解密",
+            );
+        }
+        // send_once 以 Bearer 形参外发，其形参只能喂解密后的 conn_key；禁止把原始字段传进去。
+        let send_once_raw = format!("send_once(&url, &{}", dot("conn"));
+        assert!(
+            !full.contains(&send_once_raw),
+            "send_once 收到的必须是解密后的 conn_key，不能是原始 conn.api_key",
+        );
+
+        // —— 正面：曾漏解密的四条链路，其解密写法必须在位（防止有人整段删掉解密后再裸发，
+        // 那样上面的反面检查扫不到）。conn 三处（responses/images/compression）、candidate 一处（主 chat）。
+        let decrypt_conn = format!("model_key(&{})", dot("conn"));
+        assert!(
+            full.matches(&decrypt_conn).count() >= 3,
+            "conn.api_key 的解密点少于 3（responses/images/compression 各一），疑似有链路把解密删了",
+        );
+        let decrypt_candidate = format!("model_key(&{})", dot("candidate"));
+        assert!(
+            full.contains(&decrypt_candidate),
+            "主 chat 链路必须先解密 candidate.api_key",
         );
     }
 
@@ -10265,7 +10368,8 @@ async fn compression_summarize(
     });
     let resp = GW_HTTP
         .post(format!("{}/chat/completions", api_base(&conn.base_url)))
-        .header("Authorization", format!("Bearer {}", conn.api_key))
+        // 落库密文 → 解密再发。
+        .header("Authorization", format!("Bearer {}", model_key(&conn.api_key)))
         .json(&payload)
         .timeout(Duration::from_secs(120))
         .send()
@@ -11591,6 +11695,44 @@ async fn bill_compression_call(
     // token 远多于摘要本身的花费，走额度对用户是净赚；而"额度少了一截"这件事，
     // 正确的解法是在用量页面把压缩单独列出来，不是把账记到钱包上。
     bill(state, uid, conn.id, cost, true, &tokens, false, 0).await;
+}
+
+#[cfg(test)]
+mod route_cooldown_tests {
+    use super::*;
+
+    /// 鉴权失败（401 坏 key）后，这条线路必须被冷却，好让后续请求绕开它。
+    ///
+    /// 这是「claude-opus-4-7 时好时坏一直 401」的真因：之前只有**瞬时**故障（502/超时）
+    /// 才冷却，401 这类持久鉴权失败**不冷却**，于是坏 key 的线路一直留在轮换里被反复挑中。
+    #[test]
+    fn auth_failure_cools_the_route_so_next_request_avoids_it() {
+        let id = uuid::Uuid::new_v4();
+        let now = Instant::now();
+        // 冷却前：不在冷却中，会被正常挑选。
+        assert!(route_cooldown_remaining(id, now).is_none());
+        // 一次鉴权失败后：进入长冷却（远超瞬时的 20 秒）。
+        mark_route_cooldown_auth(id);
+        let remaining = route_cooldown_remaining(id, Instant::now())
+            .expect("鉴权失败后必须处于冷却中");
+        assert!(
+            remaining > CHAT_UPSTREAM_ROUTE_COOLDOWN,
+            "鉴权失败的冷却（{remaining:?}）必须比瞬时冷却（{CHAT_UPSTREAM_ROUTE_COOLDOWN:?}）长——坏 key 不会在 20 秒内变好",
+        );
+        assert!(remaining <= CHAT_UPSTREAM_AUTH_COOLDOWN);
+    }
+
+    /// 冷却只延长、不缩短：已经在更长冷却里的线路，不会被一次新的鉴权失败缩回去。
+    #[test]
+    fn auth_cooldown_only_extends() {
+        let id = uuid::Uuid::new_v4();
+        mark_route_cooldown_auth(id);
+        let first = route_cooldown_remaining(id, Instant::now()).unwrap();
+        // 再来一次（瞬时冷却更短）：不应把剩余时间缩短。
+        mark_route_cooldown(id);
+        let second = route_cooldown_remaining(id, Instant::now()).unwrap();
+        assert!(second + Duration::from_secs(2) >= first, "冷却被缩短了");
+    }
 }
 
 #[cfg(test)]
