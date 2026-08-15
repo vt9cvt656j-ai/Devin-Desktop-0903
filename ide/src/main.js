@@ -27116,13 +27116,20 @@ function _mcpSnapshot(root) {
   };
 }
 
-function _forgetMcpServer(root, name) {
-  const serverName = String(name || "");
-  const serverRoot = String(root || "").replace(/\/+$/, "");
-  if (!serverName) return;
+/*
+ * 把一个服务发现出来的东西从实时视图里摘干净——**只摘发现结果，不动「它连着」这件事**。
+ *
+ * 分出来是给「就地重列」用的：清单变了要先摘旧的再放新的。不能直接叫 _forgetMcpServer——
+ * 它还会把服务从 _mcpConnected 里剔除、把 _mcpConfigSig 清空、把按根存的快照置空，于是
+ * 下一次 _ensureMcpTools 判定缓存失效，走整套断开重连；而重连正是这条路要躲开的东西
+ * （清单会变，往往就是因为服务里刚发生了状态变化——比如用户刚在浏览器里登录完——
+ * 重连会把那个状态连同变化一起抹掉）。
+ *
+ * 先摘后放、而不是逐条 diff：公开名在正常情况下只由 (服务名, 工具名) 决定，所以摘掉重放
+ * 对留下来的工具算出的是同一个名字，正在跑的那一轮手里的快照不会因此失配。
+ */
+function _mcpDropServerEntries(serverRoot, serverName) {
   const removedToolNames = new Set();
-  _mcpConnected = (_mcpConnected || []).filter((item) => item !== serverName);
-  _mcpFailures.delete(serverName);
   for (const [toolName, meta] of [..._mcpToolMap.entries()]) {
     if (meta?.server !== serverName) continue;
     if (serverRoot && meta?.root && meta.root !== serverRoot) continue;
@@ -27133,6 +27140,15 @@ function _forgetMcpServer(root, name) {
   _mcpResourceCache = (_mcpResourceCache || []).filter((item) => item?.server !== serverName || (item?.root && item.root !== serverRoot));
   _mcpPromptCache = (_mcpPromptCache || []).filter((item) => item?.server !== serverName || (item?.root && item.root !== serverRoot));
   _mcpServerMeta.delete(serverName);
+}
+
+function _forgetMcpServer(root, name) {
+  const serverName = String(name || "");
+  const serverRoot = String(root || "").replace(/\/+$/, "");
+  if (!serverName) return;
+  _mcpConnected = (_mcpConnected || []).filter((item) => item !== serverName);
+  _mcpFailures.delete(serverName);
+  _mcpDropServerEntries(serverRoot, serverName);
   _mcpConfigSig = "";
   // 按根存的那份也要跟着删，否则下次切回这个根，恢复出来的视图里这个服务又活了，
   // 而它的进程早就没了——变成一个"看着已连接、一调就失败"的幽灵条目。

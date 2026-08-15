@@ -14370,8 +14370,16 @@ test("MCP and Skills settings cards expose live state and real deletion cleanup"
   assert.match(SRC, /function _forgetMcpServer\(root, name\)/);
   assert.match(extractFn("_forgetMcpServer"), /_mcpConnected = \(_mcpConnected \|\| \[\]\)\.filter/);
   assert.match(extractFn("_forgetMcpServer"), /_mcpFailures\.delete\(serverName\)/);
-  assert.match(extractFn("_forgetMcpServer"), /_mcpToolMap\.delete\(toolName\)/);
-  assert.match(extractFn("_forgetMcpServer"), /_mcpToolCache = \(_mcpToolCache \|\| \[\]\)\.filter/);
+  // 清理动作搬进了 _mcpDropServerEntries（就地重列要复用同一段：先摘旧的再放新的）。
+  // 保证没变——删服务仍然要把它的工具从实时视图里摘干净——只是换了个位置。
+  assert.match(extractFn("_forgetMcpServer"), /_mcpDropServerEntries\(serverRoot, serverName\)/);
+  assert.match(extractFn("_mcpDropServerEntries"), /_mcpToolMap\.delete\(toolName\)/);
+  // 反向约束：摘条目那段**不许**去动「它连着」和配置指纹，否则就地重列会退化成整根重连，
+  // 而重连会把「服务刚登录完」这类状态连同它宣告的清单变化一起抹掉。
+  const drop = extractFn("_mcpDropServerEntries");
+  assert.ok(!/_mcpConnected/.test(drop), "摘条目不该动连接清单");
+  assert.ok(!/_mcpConfigSig/.test(drop), "摘条目不该清配置指纹——那会触发整根重连");
+  assert.match(extractFn("_mcpDropServerEntries"), /_mcpToolCache = \(_mcpToolCache \|\| \[\]\)\.filter/);
   assert.match(SRC, /data-mcpfp-del/);
   assert.match(SRC, /_forgetMcpServer\(root, del\)/);
   assert.match(SRC, /mcpfp-badge--count/);

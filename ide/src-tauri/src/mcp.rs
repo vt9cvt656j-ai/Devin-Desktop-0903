@@ -162,10 +162,13 @@ struct Session {
     /// 只会一直等到它自己结束——等于什么都没取消。
     cancel: Arc<AtomicBool>,
     /// 服务自己宣告「我的清单变了」。没有独立的读线程能收这些通知（单个 `Receiver` 归
-    /// `Session` 独占，后台再起一个读线程会把在飞的响应偷走），所以它们只在某次请求
-    /// 顺路读到时被记下，由每轮的 `mcp_status` ping 排空——见 `mcp_take_changes`。
-    /// （只在会话闲着的时候；正忙时那次 ping 拿不到锁会直接答「在」，标志由在飞的
-    /// 那条请求顺路读到。）
+    /// `Session` 独占，后台再起一个读线程会把在飞的响应偷走），所以通知只能靠某条请求
+    /// 把它从管道里读进来——每轮的 `mcp_status` ping 就是那一下。
+    ///
+    /// **但 ping 只负责读进来，取走标志的是 `mcp_take_changes` 自己**：`status_at` 从头到尾
+    /// 不碰这三个字段。这句话以前写成「由 ping 排空」，是假的——而正因为没人排空，
+    /// 一个宣告过清单变化的服务（比如登录后才长出工具的远程服务）在整根重连之前，
+    /// 新工具永远不会出现。
     tools_changed: bool,
     resources_changed: bool,
     prompts_changed: bool,
@@ -1727,7 +1730,24 @@ async fn take_changes_at(key: SessionKey) -> Result<McpChanges, String> {
         let Some(slot) = find_session_slot(&key)? else {
             return Ok(none);
         };
-        let mut active = slot.lock().map_err(|_| "MCP session state poisoned")?;
+        /*
+         * try_lock，拿不到就当「没变化」——**这是无损的**，和 status_at 那次改动理由相同
+         * 但道理不同：那边拿不到锁必须答「在」（答错会触发整根重连），这边拿不到锁只是
+         * 晚一轮再取，std::mem::take 还没执行，标志原封不动躺在会话里。
+         *
+         * 不能用阻塞锁：前端每开一轮都会对每个已连服务问一次，而这把锁被一次 tools/call
+         * 握着最长 600 秒。阻塞的话这些查询全堆在在飞的调用后面——status_at 刚为此改成
+         * try_lock，这条路再用阻塞锁就是把同一个拥塞从另一扇门放回来。更糟的是前端那层
+         * _invokeCapped 只 reject 它自己的 promise，Rust 这边的 spawn_blocking 线程照样
+         * 停在锁上，每轮再来一次就多停一条。
+         */
+        let mut active = match slot.try_lock() {
+            Ok(guard) => guard,
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(none),
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                return Err("MCP session state poisoned".to_string())
+            }
+        };
         let Some(session) = active.as_mut() else {
             return Ok(none);
         };
