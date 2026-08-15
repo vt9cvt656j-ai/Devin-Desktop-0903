@@ -6,6 +6,7 @@ mod permissions;
 mod archive;
 mod repos;
 mod tabular;
+mod ui_clone;
 mod ai;
 mod auth;
 mod automation;
@@ -303,6 +304,7 @@ pub fn run() {
             git::git_file_log,
             git::git_file_at,
             git::git_show,
+            ui_clone::ui_diff,
             git::git_stash,
             git::git_stash_pop,
             git::git_stash_apply,
@@ -366,6 +368,7 @@ pub fn run() {
             browser::browser_cookies,
             browser::browser_storage,
             browser::browser_close,
+            browser::browser_extract_ui,
             sysctl::system_open_app,
             sysctl::system_list_apps,
             sysctl::system_app_windows,

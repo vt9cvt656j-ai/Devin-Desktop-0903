@@ -1263,6 +1263,150 @@ fn stringify_eval_result(value: Option<serde_json::Value>, description: Option<S
         .unwrap_or_default()
 }
 
+/// 页内 UI 规格提取器。
+///
+/// 不是"把 DOM 全吐出来"——那既超上限又没用。1:1 还原真正需要的是**这个页面实际用了
+/// 哪些设计决定**：真在用的配色（按覆盖面积排序，不是声明里出现过就算）、字体组合、
+/// 间距刻度、圆角、阴影，加上可见元素的盒模型骨架。
+///
+/// 这份东西是**读出来的事实**，不是看着截图猜的——所以"从网站还原"能做到接近 1:1，
+/// 而"只给一张图"不能。两者的差别就在这里。
+const UI_EXTRACT_JS: &str = r####"
+(() => {
+  const MAX_NODES = __MAX_NODES__;
+  const px = (v) => Math.round(parseFloat(v) || 0);
+  const seenColor = new Map();
+  const seenType = new Map();
+  const spacing = new Map();
+  const radii = new Map();
+  const shadows = new Map();
+  const nodes = [];
+  const assets = [];
+
+  const norm = (c) => {
+    if (!c) return "";
+    const m = String(c).match(/rgba?\(([^)]+)\)/);
+    if (!m) return String(c);
+    const p = m[1].split(",").map((x) => parseFloat(x));
+    if (p.length >= 4 && p[3] === 0) return "";
+    const h = (n) => Math.max(0, Math.min(255, Math.round(n))).toString(16).padStart(2, "0");
+    return "#" + h(p[0]) + h(p[1]) + h(p[2]);
+  };
+  const bump = (map, key, weight) => { if (key) map.set(key, (map.get(key) || 0) + weight); };
+
+  const vw = window.innerWidth, vh = window.innerHeight;
+  const all = document.body ? document.body.querySelectorAll("*") : [];
+  for (const el of all) {
+    let r;
+    try { r = el.getBoundingClientRect(); } catch (e) { continue; }
+    if (!r || r.width < 1 || r.height < 1) continue;
+    if (r.bottom < -50 || r.top > vh + 400) continue;
+    let cs;
+    try { cs = getComputedStyle(el); } catch (e) { continue; }
+    if (cs.display === "none" || cs.visibility === "hidden" || parseFloat(cs.opacity) === 0) continue;
+    const area = r.width * r.height;
+
+    bump(seenColor, norm(cs.backgroundColor), area);
+    const text = (el.childElementCount === 0 ? (el.textContent || "") : "").trim();
+    if (text) {
+      bump(seenColor, norm(cs.color), Math.max(area, 400));
+      const key = [cs.fontFamily, cs.fontSize, cs.fontWeight, cs.lineHeight, cs.letterSpacing, norm(cs.color)].join("|");
+      const prev = seenType.get(key);
+      if (prev) { prev.count += 1; }
+      else {
+        seenType.set(key, {
+          family: cs.fontFamily, size: cs.fontSize, weight: cs.fontWeight,
+          lineHeight: cs.lineHeight, letterSpacing: cs.letterSpacing,
+          color: norm(cs.color), count: 1, sample: text.slice(0, 40)
+        });
+      }
+    }
+    const spaceKeys = ["paddingTop", "paddingBottom", "paddingLeft", "paddingRight", "gap", "rowGap", "columnGap"];
+    for (const k of spaceKeys) {
+      const v = px(cs[k]);
+      if (v > 0 && v <= 200) bump(spacing, v, 1);
+    }
+    if (cs.borderRadius && cs.borderRadius !== "0px") bump(radii, cs.borderRadius, 1);
+    if (cs.boxShadow && cs.boxShadow !== "none") bump(shadows, cs.boxShadow, 1);
+
+    if (el.tagName === "IMG" && el.currentSrc) {
+      assets.push({ type: "img", src: String(el.currentSrc).slice(0, 300), alt: (el.alt || "").slice(0, 60),
+        x: px(r.left), y: px(r.top), w: px(r.width), h: px(r.height) });
+    }
+    const bg = cs.backgroundImage;
+    if (bg && bg !== "none" && bg.indexOf("url(") === 0) {
+      assets.push({ type: "bg", src: bg.slice(4, 200), x: px(r.left), y: px(r.top), w: px(r.width), h: px(r.height) });
+    } else if (bg && bg.indexOf("gradient") >= 0) {
+      assets.push({ type: "gradient", src: bg.slice(0, 200), x: px(r.left), y: px(r.top), w: px(r.width), h: px(r.height) });
+    }
+
+    nodes.push({
+      _area: area,
+      tag: el.tagName.toLowerCase(),
+      cls: (typeof el.className === "string" ? el.className : "").split(/\s+/).filter(Boolean).slice(0, 3).join(" "),
+      text: text.slice(0, 60),
+      x: px(r.left), y: px(r.top), w: px(r.width), h: px(r.height),
+      bg: norm(cs.backgroundColor),
+      color: text ? norm(cs.color) : "",
+      font: text ? (cs.fontSize + "/" + cs.fontWeight) : "",
+      display: cs.display,
+      dir: cs.display.indexOf("flex") >= 0 ? cs.flexDirection : (cs.display.indexOf("grid") >= 0 ? String(cs.gridTemplateColumns || "").slice(0, 60) : ""),
+      pad: [px(cs.paddingTop), px(cs.paddingRight), px(cs.paddingBottom), px(cs.paddingLeft)].join(" "),
+      radius: cs.borderRadius === "0px" ? "" : cs.borderRadius,
+      border: cs.borderTopWidth === "0px" ? "" : (cs.borderTopWidth + " " + cs.borderTopStyle + " " + norm(cs.borderTopColor)),
+      shadow: cs.boxShadow === "none" ? "" : String(cs.boxShadow).slice(0, 80)
+    });
+  }
+
+  nodes.sort((a, b) => b._area - a._area);
+  const top = nodes.slice(0, MAX_NODES).map((n) => { delete n._area; return n; });
+  const rank = (m, n) => Array.from(m.entries()).sort((a, b) => b[1] - a[1]).slice(0, n);
+
+  const fonts = [];
+  try { document.fonts.forEach((f) => { if (fonts.indexOf(f.family) < 0) fonts.push(f.family); }); } catch (e) {}
+
+  return JSON.stringify({
+    url: location.href,
+    title: document.title,
+    viewport: { w: vw, h: vh, dpr: window.devicePixelRatio || 1 },
+    pageHeight: Math.round(document.documentElement.scrollHeight),
+    palette: rank(seenColor, 14).map((e) => ({ hex: e[0], coverage: Math.round(e[1]) })),
+    typography: Array.from(seenType.values()).sort((a, b) => b.count - a.count).slice(0, 12),
+    spacingScale: rank(spacing, 10).map((e) => e[0]).sort((a, b) => a - b),
+    radii: rank(radii, 6).map((e) => e[0]),
+    shadows: rank(shadows, 5).map((e) => e[0]),
+    fonts: fonts.slice(0, 8),
+    assets: assets.slice(0, 30),
+    nodes: top,
+    nodeTotal: nodes.length
+  });
+})()
+"####;
+
+/// 提取当前页面的 UI 规格（配色 / 字体 / 间距 / 圆角 / 阴影 / 可见元素盒模型 / 资源）。
+///
+/// 和 `browser_eval` 的区别不只是脚本：那个函数把结果砍在 8000 字符，对整页规格远远不够，
+/// 而且砍完恰好是半截 JSON。这里给 60000，并且**超了如实说**——一份被截断的规格如果冒充
+/// 完整，模型会照着它还原，然后对着缺失的部分反复困惑。
+#[tauri::command]
+pub async fn browser_extract_ui(max_nodes: Option<u32>) -> Result<BrowserState, String> {
+    let n = max_nodes.unwrap_or(120).clamp(10, 400);
+    let script = UI_EXTRACT_JS.replace("__MAX_NODES__", &n.to_string());
+    with_tab(move |tab| {
+        let ro = tab.evaluate(&script, true).map_err(|e| e.to_string())?;
+        let val = stringify_eval_result(ro.value, ro.description);
+        let total = val.chars().count();
+        if total > 60000 {
+            let head: String = val.chars().take(60000).collect();
+            return Ok(Some(format!(
+                "{head}\n\n[已截断] UI 规格共 {total} 字符，只返回了前 60000——**上面的 JSON 是半截的**。把 max_nodes 调小（如 60）重取，或者先只还原首屏。"
+            )));
+        }
+        Ok(Some(val))
+    })
+    .await
+}
+
 /// Run JavaScript in the page and return its (stringified) result.
 #[tauri::command]
 pub async fn browser_eval(script: String) -> Result<BrowserState, String> {

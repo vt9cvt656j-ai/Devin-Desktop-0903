@@ -23374,3 +23374,69 @@ test("给 read 的元数据合并不能因为加了 compressed 就丢掉 context
   // read 那支原来单独写 { ...meta, contextAvailable: false }；合并进新对象时两者都得在
   assert.match(src, /compressed: true, \.\.\.\(meta\?\.kind === "read" \? \{ contextAvailable: false \} : \{\}\)/);
 });
+
+// ══ 1:1 UI 还原：先提取事实，再用实测差异收敛 ═══════════════════════════════
+//
+// 原来这条链路上**没有任何一个数字**：visual_compare 把目标图和实现截图并排拼给模型，
+// 提示词写着「改到像素级吻合」「别停在差不多」，但"够不够像"完全由模型主观判断——
+// 而模型判断自己的作品像不像，天然偏向"像"。那句话没有任何东西能兑现它。
+
+test("visual_compare 现在会量出相似度，而不是只拼一张并排图", () => {
+  const branch = SRC.slice(SRC.indexOf('} else if (call.type === "vizcompare") {'), SRC.indexOf('} else if (call.type === "worktree") {'));
+  assert.match(branch, /await backend\.uiDiff\(_vcDesign, _vcLive\)/, "没有真正测量");
+  assert.match(branch, /【实测差异】/);
+  // 定位要给坐标：只给一个总分，模型不知道该改哪儿
+  assert.match(branch, /坐标是目标图上的像素位置/);
+  assert.match(branch, /r\.kind === "missing"[\s\S]{0,200}r\.kind === "extra"[\s\S]{0,200}r\.kind === "color"/,
+    "四类差异要翻译成人话，不然 kind 字段对模型没用");
+  // 退出条件必须是数字，不是感觉
+  assert.match(branch, /判据是这个数字在涨/);
+  assert.match(branch, /连续两轮不涨/, "没给出「方向错了」的判据，模型会一直微调下去");
+  // 测量失败不能静默当成成功
+  assert.match(branch, /没能算出相似度[\s\S]{0,80}别声称"已经一致"/);
+});
+
+test("ui_extract 五处都接齐了", () => {
+  assert.match(SRC, /name: "ui_extract", description: "\*\*Read the REAL design decisions/);
+  assert.match(SRC, /case "ui_extract": return \{ type: "uiextract"/);
+  assert.match(SRC, /\} else if \(call\.type === "uiextract"\) \{/);
+  assert.match(SRC, /    ui_extract: \{\},/);
+  const guides = readFileSync(new URL("../src/tool-guides.js", import.meta.url), "utf8");
+  assert.match(guides, /ui_extract: \{ category: 'creative'/);
+  assert.match(guides, /ui_extract: \{ source: 'url' \}/);
+  const gw = JSON.parse(readFileSync(new URL("../../server/prompts/tools.json", import.meta.url), "utf8"));
+  const t = gw.find((x) => x?.function?.name === "ui_extract");
+  assert.ok(t, "网关目录里没有");
+  assert.deepEqual(t.function.parameters.required, ["source"]);
+});
+
+test("提取的是事实，且拿不到时如实说拿不到", () => {
+  const branch = SRC.slice(SRC.indexOf('} else if (call.type === "uiextract") {'), SRC.indexOf('} else if (call.type === "viewimage") {'));
+  // 原生应用：没权限 / 应用不暴露结构，都要说清楚，不能假装读到了
+  assert.match(branch, /系统设置 → 隐私与安全性 → 辅助功能/, "没告诉用户怎么开权限");
+  assert.match(branch, /别假装读到了结构/);
+  // 网页：iframe 跨域读不到是真实限制，要说
+  assert.match(branch, /iframe 的内部结构跨域时读不到/);
+  // 结果要教模型怎么读这份规格，否则 palette 的排序含义会被误解
+  assert.match(branch, /palette 按覆盖面积排序/);
+  assert.match(branch, /不要再从截图猜色值和字号/);
+  // 页面提取的内容是外部数据
+  const isExternal = EXTERNAL_DATA_PREDICATE();
+  assert.equal(isExternal("uiextract"), true);
+});
+
+test("提取器脚本本身必须是合法 JS —— 它在页内跑，语法错只会静默失败", () => {
+  const browser = readFileSync(new URL("../src-tauri/src/browser.rs", import.meta.url), "utf8");
+  const start = browser.indexOf('const UI_EXTRACT_JS: &str = r####"');
+  assert.ok(start > 0, "提取器不见了");
+  const body = browser.slice(start + 'const UI_EXTRACT_JS: &str = r####"'.length, browser.indexOf('"####;', start));
+  // 用 Function 构造一次：语法不合法会当场抛
+  assert.doesNotThrow(() => new Function(body.replace("__MAX_NODES__", "120")),
+    "页内提取器有语法错误");
+  // 占位符必须还在，否则 Rust 那边的 replace 会静默失效、MAX_NODES 变成未定义
+  assert.ok(body.includes("__MAX_NODES__"), "占位符没了，Rust 侧的 replace 会静默失效");
+  assert.match(browser, /UI_EXTRACT_JS\.replace\("__MAX_NODES__", &n\.to_string\(\)\)/);
+  // 上限要比 browser_eval 的 8000 大得多，且超了要说
+  assert.match(browser, /if total > 60000 \{/);
+  assert.match(browser, /上面的 JSON 是半截的/);
+});

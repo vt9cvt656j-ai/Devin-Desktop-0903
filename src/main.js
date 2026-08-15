@@ -455,6 +455,8 @@ async function tauriBackend() {
     gitLog: (root, count) => core.invoke("git_log", { root, count }),
     gitFileLog: (root, rel, count) => core.invoke("git_file_log", { root, rel, count }),
     gitFileAt: (root, rel, rev) => core.invoke("git_file_at", { root, rel, rev }),
+    uiDiff: (target, candidate) => core.invoke("ui_diff", { target, candidate }),
+    browserExtractUi: (maxNodes) => core.invoke("browser_extract_ui", { maxNodes }),
     gitConflicts: (root) => core.invoke("git_conflicts", { root }),
     gitMergeVersions: (root, rel) => core.invoke("git_merge_versions", { root, rel }),
     gitResolveConflict: (root, rel, resolution) =>
@@ -23437,6 +23439,7 @@ function _previewToolArgs(name, root) {
     knowledge_search: { query: "fastapi conventions" },
     get_diagnostics: {},
     view_image: {},
+    ui_extract: {},
     git_status: {},
     git_diff: {},
     git_show: {},
@@ -31074,7 +31077,8 @@ function _buildAgentToolSchemas(includeWrite, mcpTools = []) {
     { type: "function", function: { name: "knowledge_search", description: "**Query the platform's built-in professional knowledge base** — battle-tested best practices and common traps across specialist areas (front-end React/Next, back-end API design, database schema/indexing, application security, UI/UX design, DevOps deployment), distilled from senior experience. **When a domain task is unfamiliar or has to be right, look here first**: how to design a database schema, where a JWT should be stored, how to make UI look professional, how to use API status codes, how to prevent SQL injection or IDOR, how to write a Dockerfile, **which tool plus exact command to use to reverse-engineer or decompile a given format**, and so on. Follow the best practices you find rather than going from impressions. It returns the few most relevant passages. This is faster and more focused than a web search (it is already curated), and a second spent here before you start avoids many traps and noticeably raises the quality of the result.", parameters: { type: "object", properties: { query: { type: "string", description: "What you are doing / the best practice you want to confirm, e.g. \"how to build a database index\", \"jwt vs session\", \"how to unpack an NSIS installer\", \"pyinstaller decompile\", \"js deobfuscation\", \"radare2 disassembly\"" }, domain: { type: "string", description: "Optional; restrict to a domain. **michael-design** is the design blueprint corpus \u2014 441 production-grade, Tailwind-native page and section blueprints with real palettes, layout composition patterns, motion recipes and component coverage. Pass it for ANY visible UI work (website, web app, desktop GUI, dashboard, landing page, a single component) and build from what it returns instead of inventing colours and spacing from memory. Other domains: web-frontend / backend-api / database / security / ui-ux / devops / reverse-engineering / penetration-testing" }, top_k: { type: "integer", description: "How many passages to return (default 6, maximum 20)" } }, required: ["query"] } } },
     { type: "function", function: { name: "lsp_definition", description: "Jump to a symbol's definition. Give the file the symbol appears in, its line number and the symbol name, and it returns file:line for the definition. It resolves semantically, so it is more accurate than guessing with search. Requires a language service for that language. 【When to use】When reading code and you want to jump precisely into an implementation (you already know an occurrence at path:line); if you do not know where it is, use find_symbol first, and for usages use lsp_references. 【vs alternatives】For callers use lsp_references; when the location is unknown start with find_symbol.", parameters: { type: "object", properties: { path: { type: "string", description: "The file where the symbol appears" }, line: { type: "integer", description: "The line the symbol is on (1-based)" }, symbol: { type: "string", description: "The symbol name (used to locate the column on that line)" } }, required: ["path", "line"] } } },
     { type: "function", function: { name: "lsp_references", description: "Find every reference to / use of a symbol in the project. Give the file the symbol appears in, its line number and the symbol name, and it returns the reference list (file:line). It resolves semantically, so it is more accurate than a plain-text search (it distinguishes same-named but different things). Requires a language service for that language. 【When to use】To see who calls a function or variable and to gauge the blast radius of a change — more precise than a full-text grep, with semantic boundaries that do not report same-named false positives. 【vs alternatives】To jump to the definition use lsp_definition; to outline a whole file's symbols use lsp_symbols.", parameters: { type: "object", properties: { path: { type: "string", description: "The file where the symbol appears" }, line: { type: "integer", description: "The line the symbol is on (1-based)" }, symbol: { type: "string", description: "The symbol name (used to locate the column on that line)" } }, required: ["path", "line"] } } },
-          { type: "function", function: { name: "view_image", description: "**Actually look at an image file that is already in the workspace** — a design mockup, a screenshot of a failure the user dropped in, a photo attached to a bug report, a rendered chart, an exported asset. The image is returned to you visually, the same way a screenshot is. 【When to use】Any time the answer depends on what an image CONTAINS: matching an implementation to a mockup, reading an error message that only exists as a screenshot, checking an exported asset. Do not guess from the filename. 【vs alternatives】read_file only reads TEXT and will fail on a .png; screenshot renders a live URL, not a file on disk; visual_compare needs both a design file AND a running URL — use this when you only want to see the image itself. Formats: png / jpg / webp / gif / svg / bmp / avif, up to 25 MB.", parameters: { type: "object", properties: { path: { type: "string", description: "Path to the image, relative to the workspace root (or absolute inside it)" } }, required: ["path"] } } },
+          { type: "function", function: { name: "ui_extract", description: "**Read the REAL design decisions out of a live UI, instead of guessing them from a picture.** source='url' drives the headless browser to a page and extracts what it ACTUALLY uses: the colour palette ranked by how much screen area each colour covers, every font/size/weight/line-height/colour combination with a text sample, the spacing scale, corner radii, shadows, the box model of every visible element, and the image/gradient assets. source='app' reads the accessibility tree of the frontmost native application — real element roles, labels and on-screen rectangles. 【Why this matters】Rebuilding from a screenshot alone is guesswork: you cannot recover the exact font family, the pre-compression hex values, or hidden states. This tool returns FACTS, so a rebuild from a URL or a running app can be near-identical rather than approximate. Call it FIRST, before writing any code. 【The loop】ui_extract -> write the code -> visual_compare (which now returns a measured similarity score and the worst-matching regions) -> fix those regions -> repeat until the score stops rising.", parameters: { type: "object", properties: { source: { type: "string", enum: ["url", "app"], description: "url = a web page (navigate first with browser, or pass url here); app = the frontmost native application on this Mac" }, url: { type: "string", description: "For source=url; the page to extract. Omitted = whatever the browser is currently on." }, max_nodes: { type: "integer", description: "Optional; how many of the largest visible elements to include (default 120, max 400). Lower it if the result comes back truncated." } }, required: ["source"] } } },
+      { type: "function", function: { name: "view_image", description: "**Actually look at an image file that is already in the workspace** — a design mockup, a screenshot of a failure the user dropped in, a photo attached to a bug report, a rendered chart, an exported asset. The image is returned to you visually, the same way a screenshot is. 【When to use】Any time the answer depends on what an image CONTAINS: matching an implementation to a mockup, reading an error message that only exists as a screenshot, checking an exported asset. Do not guess from the filename. 【vs alternatives】read_file only reads TEXT and will fail on a .png; screenshot renders a live URL, not a file on disk; visual_compare needs both a design file AND a running URL — use this when you only want to see the image itself. Formats: png / jpg / webp / gif / svg / bmp / avif, up to 25 MB.", parameters: { type: "object", properties: { path: { type: "string", description: "Path to the image, relative to the workspace root (or absolute inside it)" } }, required: ["path"] } } },
       { type: "function", function: { name: "screenshot", description: "Render an http/https URL in a headless browser and capture it — **the screenshot is sent straight back to you**. These are your eyes. Typical use: start a dev server with run_in_terminal, then screenshot its address (e.g. http://127.0.0.1:3000), inspect layout, alignment, spacing, palette, contrast, hierarchy and responsiveness from the image and improve them, then capture again — a look → change loop. **When working on animation, transitions or effects, pass frames=4** (2-5): it captures successive frames over a span of time and stitches them into one filmstrip, so you can actually see the animation in motion (a single still shows you nothing about it) and judge whether it is smooth, whether the easing is right, and whether it jumps or stutters before changing it. Requires a Chromium-based browser installed locally — Chrome, Edge, Brave or Chromium (it tells you if none is found).", parameters: { type: "object", properties: { url: { type: "string", description: "The URL to capture, e.g. http://127.0.0.1:3000" }, width: { type: "integer", description: "Viewport width, default 1280" }, height: { type: "integer", description: "Viewport height, default 800" }, frames: { type: "integer", description: "Filmstrip mode: how many frames (2-5) to stitch into one image to see the animation play out. Pass around 4 for animation/transitions/effects; leave it out for static layout" }, duration_ms: { type: "integer", description: "Filmstrip mode: how long a span of the animation to cover (milliseconds, default 2400)" } }, required: ["url"] } } },
     { type: "function", function: { name: "visual_compare", description: "Show the current UI and the target design side by side, so differences in layout, spacing, colour and type are easy to check and iterate on. It provides a visual comparison; it does not guarantee automatic pixel-perfect agreement. 【vs alternatives】To look at the current result with no design to compare against use screenshot; for interaction use browser.", parameters: { type: "object", properties: { design: { type: "string", description: "Path to the target design (relative to the workspace root, e.g. assets/design/s1.png)" }, url: { type: "string", description: "The URL of your implementation on the dev server, e.g. http://127.0.0.1:3000" }, width: { type: "integer", description: "Screenshot viewport width, default 1440" }, height: { type: "integer", description: "Screenshot viewport height, default 900" } }, required: ["design", "url"] } } },
   ];
@@ -32321,6 +32325,7 @@ function _mapToolCall(name, args, mcpToolMap = _mcpToolMap) {
     case "list_dir": return { type: "list", path: args.path || "", depth: args.depth };
     case "search": return { type: "search", path: args.query || "", query: args.query || "", searchPath: args.path || "", mode: args.mode === "regex" ? "regex" : "literal", caseSensitive: !!args.case_sensitive };
     case "view_image": return { type: "viewimage", path: String(args.path || "").trim() };
+    case "ui_extract": return { type: "uiextract", source: String(args.source || "url").trim(), url: String(args.url || "").trim(), maxNodes: Number.isFinite(+args.max_nodes) ? +args.max_nodes : 0 };
     case "find_files": return { type: "find", path: args.pattern || "", pattern: args.pattern || "", limit: Number.isFinite(+args.limit) ? +args.limit : 0 };
     case "web_fetch": return { type: "web", path: args.url || "", url: args.url || "" };
     case "web_search": return { type: "websearch", path: String(args.query || ""), query: String(args.query || "") };
@@ -36774,7 +36779,7 @@ const _EXTERNAL_DATA_TYPES = new Set([
   //   openapi_parser / figma / liveenvironment —— 远端文档与实况环境
   //   skill                    —— 技能说明可能来自仓库里的技能目录
   // 少一条标记，模型就少一处依据去区分"给我读的材料"和"给我执行的指令"。
-  "browser", "preview", "capture_flows", "capture_replay", "viewimage",
+  "browser", "preview", "capture_flows", "capture_replay", "viewimage", "uiextract",
   "web", "websearch", "realtime_news_feed", "readscreen", "db", "gh", "git",
   "userhttp", "userfolder", "logs", "lsp", "diag",
   "openapi_parser", "figma", "liveenvironment", "skill",
@@ -50722,6 +50727,53 @@ async function _executeToolStepInner(step, call, root, run) {
       vp.innerHTML = `<pre>${_escHtml(text.slice(0, 4000))}</pre>`;
       return { type: "websearch", path: call.path, content: text };
 
+    } else if (call.type === "uiextract") {
+      // 「1:1 还原」的地基：把真实的设计决定**读出来**，而不是看着截图猜。
+      // 网页读 DOM 计算样式，原生应用读辅助功能树——两者都是事实。只有一张图的时候
+      // 这个工具帮不上忙，那种情况只能靠 visual_compare 的实测差异一轮轮收敛。
+      if (!inTauri) { res.className = "atc-result atc-result--err"; res.textContent = "桌面专用"; return { type: "uiextract", path: "", content: "[不可用] ui_extract 要驱动本机的浏览器/辅助功能，只能在桌面 App 里用。" }; }
+      const _uxSource = call.source === "app" ? "app" : "url";
+      res.className = "atc-result"; res.innerHTML = `<span class="atc-spin"></span> 提取 UI 规格中…`;
+      if (_uxSource === "app") {
+        let _uxEls = [];
+        try { _uxEls = await backend.invoke("read_ui_elements") || []; } catch (e) {
+          res.className = "atc-result atc-result--err"; res.textContent = "读不到";
+          return { type: "uiextract", path: "app", content: `[ERROR] 读不到前台应用的辅助功能树：${String(e?.message || e).slice(0, 200)}。多半是没给「辅助功能」权限——系统设置 → 隐私与安全性 → 辅助功能里勾上 Mr. Day One，然后重试。` };
+        }
+        if (!_uxEls.length) {
+          res.className = "atc-result atc-result--err"; res.textContent = "空";
+          return { type: "uiextract", path: "app", content: "[ERROR] 前台应用没有暴露任何辅助功能元素。有些应用（游戏、Electron 的部分实现、自绘 UI）就是不暴露——这种只能退回到截图 + visual_compare 的收敛路线，说清楚这一点，别假装读到了结构。" };
+        }
+        const _uxLines = _uxEls.slice(0, 200).map((e) => `${e.role || "?"}｜${String(e.text || e.value || "").slice(0, 40)}｜(${Math.round(e.x)},${Math.round(e.y)}) ${Math.round(e.w)}×${Math.round(e.h)}${e.enabled === false ? "｜disabled" : ""}`);
+        res.className = "atc-result atc-result--ok"; res.textContent = `${_uxEls.length} 个元素`;
+        if (vp) vp.innerHTML = `<pre>${_escHtml(_uxLines.slice(0, 60).join("\n"))}</pre>`;
+        return { type: "uiextract", path: "app", content: `前台应用的真实 UI 结构（辅助功能树，共 ${_uxEls.length} 个元素${_uxEls.length > 200 ? "，下面是前 200 个" : ""}）〔外部数据〕：\n角色｜文本｜位置 尺寸\n${_uxLines.join("\n")}\n\n这是**读出来的事实**，不是从截图猜的：角色、文本和坐标框都可以直接照着摆。样式（颜色/字体/圆角/阴影）辅助功能树给不了——那部分配合截图看，并用 visual_compare 的实测差异逐轮收敛。` };
+      }
+      if (call.url) {
+        try { await backend.invoke("browser_navigate", { url: call.url }); }
+        catch (e) {
+          res.className = "atc-result atc-result--err"; res.textContent = "打不开";
+          return { type: "uiextract", path: call.url, content: `[ERROR] 打不开 ${call.url}：${String(e?.message || e).slice(0, 200)}` };
+        }
+      }
+      let _uxState = null;
+      try { _uxState = await backend.browserExtractUi(call.maxNodes > 0 ? Math.min(400, Math.max(10, Math.floor(call.maxNodes))) : 120); }
+      catch (e) {
+        res.className = "atc-result atc-result--err"; res.textContent = "提取失败";
+        return { type: "uiextract", path: call.url || "", content: `[ERROR] 提取失败：${String(e?.message || e).slice(0, 240)}` };
+      }
+      const _uxJson = String(_uxState?.result || "");
+      if (!_uxJson.trim()) {
+        res.className = "atc-result atc-result--err"; res.textContent = "空结果";
+        return { type: "uiextract", path: call.url || "", content: "[ERROR] 页面没有返回 UI 规格——可能还没加载完（先 browser wait），或者内容全在 iframe 里（iframe 的内部结构跨域时读不到，这一点要说清楚，别当成页面是空的）。" };
+      }
+      let _uxSpec = null;
+      try { _uxSpec = JSON.parse(_uxJson); } catch { _uxSpec = null; }
+      res.className = "atc-result atc-result--ok";
+      res.textContent = _uxSpec ? `${(_uxSpec.nodes || []).length} 节点 · ${(_uxSpec.palette || []).length} 色` : "已提取";
+      if (vp) vp.innerHTML = `<pre>${_escHtml(_uxJson.slice(0, 4000))}</pre>`;
+      return { type: "uiextract", path: call.url || _uxSpec?.url || "", content: `这个页面**实际使用**的设计决定〔外部数据〕：\n${_uxJson}\n\n读法：palette 按覆盖面积排序（第一个通常就是页面底色，不是"出现过的颜色"）；typography 每条带 sample，能对上是哪段文字；nodes 按面积从大到小，先照着大的把结构和分区摆对。\n这些是**读出来的事实**，可以直接照抄成 CSS 变量，不要再从截图猜色值和字号。摆完用 visual_compare 量差距，按它给的区域坐标定向修。` };
+
     } else if (call.type === "viewimage") {
       // 工作区里已经躺着的一张图：设计稿、用户丢进来的失败截图、bug 报告里的照片、
       // 导出的素材。在这之前**一张都看不了**——read_file 只读文本层（对 png 直接抛错），
@@ -50823,10 +50875,34 @@ async function _executeToolStepInner(step, call, root, run) {
         return { type: "vizcompare", path: _vcDesignAbs, content: `[ERROR] visual_compare 未完成：目标设计图和实时截图已取得，但并排对比图生成失败（${_vcWhy}）。未把实时截图当作对比结果返回。` };
       }
       const _vcImg = _vcOut;
-      res.className = "atc-result atc-result--ok"; res.textContent = "已并排对比";
+      // 量出来，别只用眼睛看。
+      //
+      // 这个工具原来只做一件事：把目标图和实现截图并排拼成一张交给模型，提示词里写着
+      // 「改到像素级吻合」「别停在差不多」。但整条链路上**没有任何一个数字**——"够不够像"
+      // 完全由模型主观判断，而模型判断自己的作品像不像，天然偏向"像"。那句"别停在差不多"
+      // 没有任何东西能兑现它，循环也就没有退出条件。
+      //
+      // 现在把真实的相似度和**最差的那几块的坐标**一起给出去：修正因此是定向的，
+      // 而不是再整体猜一遍。失败不阻断——并排图仍然有价值，只是少了那个数。
+      let _vcMetric = null;
+      try { _vcMetric = await backend.uiDiff(_vcDesign, _vcLive); } catch (e) { _vcMetric = null; }
+      let _vcNumbers = "";
+      if (_vcMetric && Number.isFinite(_vcMetric.similarity)) {
+        const worst = (_vcMetric.worst_regions || []).slice(0, 8).map((r) =>
+          `  · (${r.x},${r.y}) ${r.w}×${r.h} 相似度 ${r.similarity.toFixed(0)}% — ${
+            r.kind === "missing" ? "这块目标里有内容，你没画出来"
+            : r.kind === "extra" ? "这块你多画了目标里没有的东西"
+            : r.kind === "color" ? `颜色不对：目标 ${r.target_color}，你的 ${r.candidate_color}`
+            : "位置/尺寸对不上"}`).join("\n");
+        _vcNumbers = `\n\n【实测差异】${_vcMetric.verdict}\n最需要改的区域（坐标是目标图上的像素位置，可以用 view_image 裁出来细看）：\n${worst}\n\n把这几块改完再 visual_compare 一次。**判据是这个数字在涨**，不是你觉得像了。连续两轮不涨就说明方向错了，回去看结构而不是继续微调。`;
+      } else {
+        _vcNumbers = `\n\n（这次没能算出相似度，只有并排图可看——结论要保守，别声称"已经一致"。）`;
+      }
+      res.className = "atc-result atc-result--ok";
+      res.textContent = _vcMetric ? `相似度 ${_vcMetric.similarity.toFixed(1)}%` : "已并排对比";
       if (vp) vp.innerHTML = `<img src="${_vcImg}" alt="compare" style="max-width:100%;border-radius:8px;display:block;border:1px solid rgba(128,128,128,.25)">`;
       step.classList.add("is-open"); _chatFollow(run && run.session);
-      return { type: "vizcompare", path: _vcUrl, image: _vcImg, content: `已并排对比【左=目标设计 DESIGN，右=你当前实现 LIVE】，图已回传给你看。**逐项比对、改代码到像素级吻合**：① 整体布局/分区结构；② 间距/留白/对齐；③ 配色 hex/渐变/背景；④ 字体族/字重/字号/行高；⑤ 圆角/阴影/边框；⑥ 组件细节(按钮/卡片/导航/图标)；⑦ 图片/插画位置与比例。把每处差异列出来 → 改 → 再 visual_compare，直到右边和左边几乎一模一样。**别停在"差不多"**。` };
+      return { type: "vizcompare", path: _vcUrl, image: _vcImg, content: `已并排对比【左=目标设计 DESIGN，右=你当前实现 LIVE】，图已回传给你看。**逐项比对、改代码到像素级吻合**：① 整体布局/分区结构；② 间距/留白/对齐；③ 配色 hex/渐变/背景；④ 字体族/字重/字号/行高；⑤ 圆角/阴影/边框；⑥ 组件细节(按钮/卡片/导航/图标)；⑦ 图片/插画位置与比例。把每处差异列出来 → 改 → 再 visual_compare，直到右边和左边几乎一模一样。**别停在"差不多"**。${_vcNumbers}` };
 
     } else if (call.type === "worktree") {
       if (!inTauri) { res.className = "atc-result atc-result--err"; res.textContent = "桌面专用"; return { type: "worktree", path: "", content: "[不可用] worktree 只能在 Mr. Day One 桌面 App 里用。" }; }
