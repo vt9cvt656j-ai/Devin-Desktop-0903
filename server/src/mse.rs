@@ -1180,11 +1180,16 @@ async fn seal_response(st: &AppState, ctx: Ctx, res: Response) -> Response {
         Err(e) => return e.into_response(),
     };
 
-    let outer = if m.mask_status {
-        StatusCode::OK
-    } else {
-        status
-    };
+    // 外层状态码。
+    //
+    // **无正文状态（204/205/304）必须改成 200**，否则就是个致命 bug：这些状态按 HTTP
+    // 规范不能带 body，而我们要把密文信封放进 body。浏览器（和 nginx/Cloudflare）会把
+    // 204 上的 body 直接剥掉，客户端于是拿到一个空信封、解密抛错。真实状态码已经在
+    // 密文内层的 `s` 字段里（客户端读它重建成 204），所以外层用 200 承载信封是安全的。
+    //
+    // 这正是管理台登录卡在「网络异常」的原因：/api/admin/session 成功时回 204，每一次
+    // 成功登录都会踩中；而用假令牌测时回的是 401（带 body），所以一直没暴露出来。
+    let outer = outer_status(status, m.mask_status);
 
     let mut res = Response::new(Body::from(envelope));
     *res.status_mut() = outer;
@@ -1194,6 +1199,26 @@ async fn seal_response(st: &AppState, ctx: Ctx, res: Response) -> Response {
     forward_set_cookie(&parts.headers, hm);
     stamp(hm, &ctx);
     res
+}
+
+/// 密文响应的外层状态码。
+///
+/// **无正文状态（204/205/304）必须回 200**：这些状态按 HTTP 规范不能带 body，而密文
+/// 信封就在 body 里。浏览器（和 nginx/Cloudflare）会把 204 上的 body 剥掉，客户端于是
+/// 拿到空信封、解密抛错——管理台登录卡「网络异常」正是这个（/api/admin/session 成功回
+/// 204）。真实状态码在密文内层的 `s` 里，客户端读它重建，所以外层用 200 承载信封是安全的。
+///
+/// `mask_status` 开启时一切都回 200（拿可观测性换流量特征，见 MSE_MASK_STATUS）。
+fn outer_status(status: StatusCode, mask_status: bool) -> StatusCode {
+    let bodyless = matches!(
+        status,
+        StatusCode::NO_CONTENT | StatusCode::RESET_CONTENT | StatusCode::NOT_MODIFIED
+    );
+    if mask_status || bodyless {
+        StatusCode::OK
+    } else {
+        status
+    }
 }
 
 fn stamp(hm: &mut HeaderMap, ctx: &Ctx) {
@@ -1497,6 +1522,21 @@ mod tests {
 
         // 垃圾输入仍然要报错，别把「什么都收」变成「什么都不检查」。
         assert!(StaticKey::from_der_b64(&B64.encode(b"not a key")).is_err());
+    }
+
+    #[test]
+    fn bodyless_statuses_seal_as_200_outer() {
+        // 204/205/304 不能带 body，但密文信封就在 body 里。外层必须回 200 承载信封，
+        // 否则浏览器剥掉 body、客户端解密空信封抛错 —— 管理台登录「网络异常」的真因。
+        assert_eq!(outer_status(StatusCode::NO_CONTENT, false), StatusCode::OK);
+        assert_eq!(outer_status(StatusCode::RESET_CONTENT, false), StatusCode::OK);
+        assert_eq!(outer_status(StatusCode::NOT_MODIFIED, false), StatusCode::OK);
+        // 有正文的状态原样保留（客户端只认内层 s，但外层如实反映便于观测）。
+        assert_eq!(outer_status(StatusCode::OK, false), StatusCode::OK);
+        assert_eq!(outer_status(StatusCode::UNAUTHORIZED, false), StatusCode::UNAUTHORIZED);
+        assert_eq!(outer_status(StatusCode::BAD_REQUEST, false), StatusCode::BAD_REQUEST);
+        // mask 档一切归 200。
+        assert_eq!(outer_status(StatusCode::UNAUTHORIZED, true), StatusCode::OK);
     }
 
     #[test]
