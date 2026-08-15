@@ -77,6 +77,10 @@ pub struct Config {
     /// 轮换宽限期里仍然接受的上一把密钥。
     pub mse_server_key_prev: String,
     pub mse_session_ttl_secs: u64,
+    /// 前向保密：服务器临时密钥的轮换周期（秒）。默认 600（10 分钟）。越短，一旦服务器
+    /// 内存被读，能倒推的历史流量窗口越小；但太短会让 pubkey 回源更频繁。静态密钥被偷
+    /// 不受影响——它只签名不做 ECDH。见 mse.rs 的 Ephemeral。
+    pub mse_ephemeral_ttl_secs: u64,
     pub mse_max_skew_ms: i64,
     pub mse_max_sealed_bytes: usize,
     /// Redis 答不上来时是否放行重放检查。默认否 —— 放行等于在 Redis 抖动的那几秒里
@@ -189,6 +193,7 @@ impl Config {
             mse_server_key: std::env::var("MSE_SERVER_KEY").unwrap_or_default(),
             mse_server_key_prev: std::env::var("MSE_SERVER_KEY_PREV").unwrap_or_default(),
             mse_session_ttl_secs: opt("MSE_SESSION_TTL_SECS", "1800").parse().unwrap_or(1800),
+            mse_ephemeral_ttl_secs: opt("MSE_EPHEMERAL_TTL_SECS", "600").parse().unwrap_or(600),
             mse_max_skew_ms: opt("MSE_MAX_SKEW_MS", "120000").parse().unwrap_or(120_000),
             // 64 MiB。这个数是从 /api/deploy 倒推的，不是随手取的整数：
             //

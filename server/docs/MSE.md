@@ -107,9 +107,58 @@ Separate keys per direction, so a response can never be replayed as a request. `
 both public keys into the derivation, so a swapped server key yields a different key
 rather than a working session.
 
-Because the server key is static, this gives forward secrecy against compromise of the
-*client's* ephemeral key, not against later compromise of the server key. Rotation
-(§3.1) is what bounds that window.
+### 3.3 Forward secrecy — the static key signs, it does not do ECDH
+
+The scheme above, on its own, has no forward secrecy against **server** key compromise: the
+client ephemeral public travels in the clear (`X-Mse-Epk`), so an attacker who records
+ciphertext and *later* steals the static private key recomputes `z = ECDH(static, client_eph)`
+and decrypts everything recorded. That is the classic static-DH weakness.
+
+The fix (TLS 1.3 / Signal shape): the static key stops doing ECDH and instead **signs** a
+rotating server **ephemeral** key. ECDH runs client-ephemeral × server-ephemeral. The static
+key is now only a *trust anchor* — it authenticates the ephemeral so an active MITM can't
+substitute one.
+
+- `/api/crypto/pubkey` carries an `eph` object: `{ id, pub, exp, sig }`, where `sig` is
+  `ECDSA-P384-SHA384(static_priv, "MSE-EPH-v1\0" || eph_spki || exp_ms_be)` in raw r‖s (96 B,
+  the form WebCrypto verifies). `id` is `kid_of(eph_spki)`.
+- The client pins the **static** kid (unchanged), verifies `sig` against it, checks `exp`, and
+  then does ECDH with the ephemeral. `X-Mse-Kid` now carries the **ephemeral** id.
+- The server rotates the ephemeral every `MSE_EPHEMERAL_TTL_SECS` (default 600 s) and keeps
+  each ephemeral private only until `created_at + ephemeral_ttl + session_ttl` — long enough
+  that a mid-session client can still re-derive, short enough that older privates are gone.
+  `exp` on the wire equals that retention deadline, so a client never uses an ephemeral whose
+  private the server has discarded.
+
+Result: stealing the static private key later decrypts **nothing** — it never held a DH secret.
+A live-RAM compromise still exposes only the traffic of ephemerals not yet discarded (bounded by
+`ephemeral_ttl + session_ttl`, ~40 min) — unavoidable, since a running server must hold current
+session keys. This is proven by `forward_secrecy_static_key_alone_cannot_derive_the_session` in
+`mse.rs`, and cross-language (Rust signs, WebCrypto verifies) end to end.
+
+**Backward compatibility.** Old clients (desktop builds that can't auto-update) seal to the
+**static** kid; the server still serves those via static ECDH — they work, without forward
+secrecy. New clients seal to the ephemeral id. The server tells them apart by `X-Mse-Kid`.
+
+**Downgrade floor — `requireFs`.** The `eph` object is an unauthenticated optional field, so an
+*active* MITM can **strip it with no key** and force a client onto the static path; that recorded
+session then becomes decryptable *if the static key is later stolen* — the very thing FS closes.
+A signature over the ephemeral key alone doesn't stop this (the attack deletes the offer, it
+doesn't forge one). So the client carries a `requireFs` policy (build flag `VITE_MSE_REQUIRE_FS=1`):
+when set, a missing or unverifiable `eph` is a **hard error** (`code: "fs"`), never a silent
+static fallback. This converts the downgrade from invisible to a visible connection failure — an
+active MITM can still deny service (they always could, by dropping packets) but can no longer
+downgrade-then-decrypt.
+
+The SPAs build with `requireFs` on. The two login pages deliberately leave it **off**: they are
+the only door in, a stripped `eph` there still keeps the password confidential *now* (it's sealed
+to the pinned static key, which the MITM cannot read), and availability outweighs the narrow
+"MITM now **and** static-key theft later" residual. `requireFs` needs a gateway that actually
+serves `eph` — ours always does, so deploy the server (which offers `eph`) before shipping
+`requireFs` frontends.
+
+The client's ephemeral key still gives forward secrecy against compromise of the *client*, and
+rotation (§3.1) still bounds the static key's exposure as an authenticator.
 
 ---
 

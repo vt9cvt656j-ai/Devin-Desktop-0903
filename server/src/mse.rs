@@ -161,7 +161,42 @@ impl StaticKey {
     fn pub_b64u(&self) -> String {
         B64U.encode(&self.spki)
     }
+
+    /// 用静态私钥做 ECDSA-P384-SHA384 签名，输出 96 字节的 r||s（固定长，非 DER）。
+    ///
+    /// 用 r||s 而不是 DER：浏览器 WebCrypto 的 ECDSA verify 只认这种定长编码。
+    /// `sign` 内部会先用 SHA-384 摘要 msg，客户端 verify 时也用 SHA-384，两边对齐。
+    fn sign(&self, msg: &[u8]) -> Vec<u8> {
+        use p384::ecdsa::signature::Signer;
+        use p384::ecdsa::{Signature, SigningKey};
+        let sk = SigningKey::from(&self.secret);
+        let sig: Signature = sk.sign(msg);
+        sig.to_bytes().to_vec()
+    }
 }
+
+/// 服务端的**临时**密钥：会轮换，私钥用完即弃。前向保密就靠它。
+///
+/// 现在静态密钥只做一件事——**签名**这把临时公钥，让客户端确认对面是真服务器（挡主动
+/// 中间人）。真正参与 ECDH 的是临时私钥。于是：偷到静态私钥也解不了任何流量（它从没
+/// 握过 DH 秘密），而临时私钥每 `ephemeral_ttl` 轮换、旧的丢弃——录下来的历史流量在
+/// 临时私钥被丢弃之后，连活着的服务器自己都再也解不开。
+///
+/// 老客户端（没法自动更新的桌面端）仍然封给静态密钥、走老的静态 ECDH 路径，没有前向
+/// 保密但继续可用。见 derive。
+struct Ephemeral {
+    secret: SecretKey,
+    spki: Vec<u8>,
+    id: String,
+    created_at: u64,
+    /// 静态密钥对 `EPH_SIG_CTX || spki || exp_ms(be)` 的签名。客户端拿固定的静态公钥
+    /// 验它，从而信任这把临时公钥。
+    sig: Vec<u8>,
+    exp_ms: i64,
+}
+
+/// 签名消息的域分隔前缀。绑死用途，别让这个签名在别处被重用。
+const EPH_SIG_CTX: &[u8] = b"MSE-EPH-v1\0";
 
 /// kid = base64url(SHA-384(SPKI))[..24]。24 个 base64 字符 = 144 bit，碰撞不是问题，
 /// 而且短到能原样写进构建参数里。
@@ -199,6 +234,9 @@ pub struct Mse {
     replay_fail_open: bool,
     mask_status: bool,
     cache: RwLock<HashMap<String, Cached>>,
+    /// 轮换的临时密钥环，最新的在末尾。前向保密的核心，见 Ephemeral。
+    ephemerals: RwLock<Vec<Ephemeral>>,
+    ephemeral_ttl: u64,
 }
 
 impl Mse {
@@ -257,6 +295,8 @@ impl Mse {
             replay_fail_open: cfg.mse_replay_fail_open,
             mask_status: cfg.mse_mask_status,
             cache: RwLock::new(HashMap::new()),
+            ephemerals: RwLock::new(Vec::new()),
+            ephemeral_ttl: cfg.mse_ephemeral_ttl_secs,
         })
     }
 
@@ -266,6 +306,75 @@ impl Mse {
 
     fn by_kid(&self, kid: &str) -> Option<&StaticKey> {
         self.keys.iter().find(|k| k.kid == kid)
+    }
+
+    /// 当前对外通告的临时密钥。过期就地轮换一把，顺手清掉太老的。
+    ///
+    /// 返回 `(id, pub_b64u, exp_ms, sig_b64u)`。签名由**当前静态密钥**背书，客户端拿固定
+    /// 的静态公钥验它——这就是信任链：钉住的静态密钥 → 签名 → 临时密钥 → ECDH。
+    ///
+    /// 保留策略：一把临时密钥在 `ephemeral_ttl` 内是「当前」（发给新会话），之后仍留在
+    /// 环里 `session_ttl` 那么久，好让**已经**用它建了会话、但派生缓存恰好被淘汰的客户端
+    /// 还能重新派生。再老就丢弃——丢弃临时私钥正是前向保密：那之前的流量，连活着的服务器
+    /// 自己都再也解不开。
+    fn current_ephemeral(&self) -> (String, String, i64, String) {
+        let now = unix_secs();
+
+        // 快路径：已有一把还在「当前」窗口内的，直接用。
+        if let Ok(ring) = self.ephemerals.read() {
+            if let Some(e) = ring.last() {
+                if now < e.created_at + self.ephemeral_ttl {
+                    return (e.id.clone(), B64U.encode(&e.spki), e.exp_ms, B64U.encode(&e.sig));
+                }
+            }
+        }
+
+        // 慢路径：造一把新的，由当前静态密钥签名。
+        let mut w = match self.ephemerals.write() {
+            Ok(w) => w,
+            // 锁中毒时退回静态密钥：pubkey 里不带 eph，客户端就走静态路径（无前向保密
+            // 但能用），好过整条 pubkey 挂掉。
+            Err(_) => return self.static_as_pseudo_eph(),
+        };
+        // 再查一次：可能刚才有别的线程已经轮换好了（double-checked）。
+        if let Some(e) = w.last() {
+            if now < e.created_at + self.ephemeral_ttl {
+                return (e.id.clone(), B64U.encode(&e.spki), e.exp_ms, B64U.encode(&e.sig));
+            }
+        }
+
+        let secret = SecretKey::random(&mut rand::rngs::OsRng);
+        let spki = secret
+            .public_key()
+            .to_public_key_der()
+            .expect("P-384 公钥一定能编成 SPKI")
+            .as_bytes()
+            .to_vec();
+        let id = kid_of(&spki);
+        // exp 覆盖「当前窗口 + 一条会话」的可用寿命：客户端在这段时间内都可以拿它建/续会话。
+        let exp_ms = unix_millis() + ((self.ephemeral_ttl + self.session_ttl) as i64) * 1000;
+
+        // 签名对象：域前缀 + 临时公钥 SPKI + 过期毫秒（大端）。客户端逐字节重建再验。
+        let mut msg = Vec::with_capacity(EPH_SIG_CTX.len() + spki.len() + 8);
+        msg.extend_from_slice(EPH_SIG_CTX);
+        msg.extend_from_slice(&spki);
+        msg.extend_from_slice(&exp_ms.to_be_bytes());
+        let sig = self.current().sign(&msg);
+
+        let out = (id.clone(), B64U.encode(&spki), exp_ms, B64U.encode(&sig));
+
+        // 清掉太老的：留 `ephemeral_ttl + session_ttl`，覆盖最长可能还在引用它的会话。
+        let keep_after = now.saturating_sub(self.ephemeral_ttl + self.session_ttl);
+        w.retain(|e| e.created_at >= keep_after);
+        w.push(Ephemeral { secret, spki, id, created_at: now, sig, exp_ms });
+        out
+    }
+
+    /// 锁中毒时的退路：把静态密钥当「伪临时」通告，签名为空。客户端验签会失败 → 回退
+    /// 到静态路径（封给静态 kid）。等于「本次没有前向保密」，但服务照常。
+    fn static_as_pseudo_eph(&self) -> (String, String, i64, String) {
+        let k = self.current();
+        (k.kid.clone(), k.pub_b64u(), 0, String::new())
     }
 
     /// ECDH + HKDF。命中缓存就不再做点乘。
@@ -289,26 +398,43 @@ impl Mse {
             }
         }
 
-        let key = self.by_kid(kid).ok_or_else(MseErr::rekey)?;
         let peer = PublicKey::from_public_key_der(epk_spki)
             .map_err(|_| MseErr::malformed("epk 不是合法的 P-384 SPKI 公钥"))?;
 
-        let shared = diffie_hellman(key.secret.to_nonzero_scalar(), peer.as_affine());
-        let mut z = shared.raw_secret_bytes().to_vec();
+        // 服务端这一侧的 ECDH 私钥：先看是不是静态密钥（老客户端封给它，无前向保密），
+        // 否则查临时密钥环（新客户端封给临时公钥，有前向保密）。都不匹配 → 让客户端
+        // 重新取公钥（可能是临时密钥已经轮换过去、或服务端重启了）。
+        let (mut z, server_spki) = if let Some(key) = self.by_kid(kid) {
+            let shared = diffie_hellman(key.secret.to_nonzero_scalar(), peer.as_affine());
+            (shared.raw_secret_bytes().to_vec(), key.spki.clone())
+        } else {
+            // ECDH 在读锁内做完，只把 z 和 spki 带出锁，绝不把临时私钥的引用泄到锁外。
+            self.ephemerals
+                .read()
+                .ok()
+                .and_then(|ring| {
+                    ring.iter().rev().find(|e| e.id == kid).map(|e| {
+                        let shared =
+                            diffie_hellman(e.secret.to_nonzero_scalar(), peer.as_affine());
+                        (shared.raw_secret_bytes().to_vec(), e.spki.clone())
+                    })
+                })
+                .ok_or_else(MseErr::rekey)?
+        };
 
-        // transcript 绑定：把双方公钥都揉进 info。换掉服务端公钥不会得到一条能用的
-        // 会话，只会得到一把不同的密钥 —— 失败在解密，而不是悄悄成功。
+        // transcript 绑定：server_spki 是**真正做了 ECDH 的那把**（静态或临时）。换掉它
+        // 不会得到一条能用的会话，只会得到一把不同的密钥 —— 失败在解密，而不是悄悄成功。
         let mut tx = Sha384::new();
         tx.update(epk_spki);
-        tx.update(&key.spki);
+        tx.update(&server_spki);
         let tx = tx.finalize();
 
         let hk = Hkdf::<Sha384>::new(None, &z);
         let mut k_c2s = [0u8; 32];
         let mut k_s2c = [0u8; 32];
-        hk.expand(&info_for("c2s", &key.kid, &tx), &mut k_c2s)
+        hk.expand(&info_for("c2s", kid, &tx), &mut k_c2s)
             .map_err(|_| MseErr::internal("HKDF c2s"))?;
-        hk.expand(&info_for("s2c", &key.kid, &tx), &mut k_s2c)
+        hk.expand(&info_for("s2c", kid, &tx), &mut k_s2c)
             .map_err(|_| MseErr::internal("HKDF s2c"))?;
         z.zeroize();
 
@@ -572,12 +698,25 @@ impl IntoResponse for MseErr {
 pub async fn pubkey(State(st): State<AppState>) -> Response {
     let m = &st.mse;
     let cur = m.current();
+    // 当前临时密钥：客户端拿它做 ECDH（前向保密），拿静态公钥验它的签名。
+    let (eph_id, eph_pub, eph_exp, eph_sig) = m.current_ephemeral();
     let body = json!({
         "v": 1,
         "suite": SUITE,
+        // 静态密钥：仍然是信任锚（客户端 pin 的就是它的 kid），但它现在**只签名不做
+        // ECDH**（老客户端除外）。见 mse.rs 的 Ephemeral。
         "kid": cur.kid,
         "pub": cur.pub_b64u(),
         "prev": m.keys.get(1).map(|k| json!({ "kid": k.kid, "pub": k.pub_b64u() })),
+        // 临时密钥：sig 是**静态密钥**对 (EPH_SIG_CTX || pub || exp_be) 的 ECDSA-P384
+        // 签名。客户端验签通过就用 pub 做 ECDH——偷到静态私钥也解不了流量，因为它从没
+        // 握过 DH 秘密。sig 为空表示服务端暂时给不出（锁中毒兜底），客户端回退静态路径。
+        "eph": (!eph_sig.is_empty()).then(|| json!({
+            "id": eph_id,
+            "pub": eph_pub,
+            "exp": eph_exp,
+            "sig": eph_sig,
+        })),
         "mode": m.mode.as_str(),
         "session_ttl": m.session_ttl,
         "max_skew_ms": m.max_skew_ms,
@@ -586,7 +725,9 @@ pub async fn pubkey(State(st): State<AppState>) -> Response {
         "server_time": unix_millis(),
     });
     (
-        [(header::CACHE_CONTROL, "public, max-age=300")],
+        // 缓存 60s（不是 300s）：临时密钥每 ephemeral_ttl 轮换，缓存太久会让客户端拿到
+        // 偏旧的一把。60s 远小于轮换周期，客户端总能较快跟上，而每源每分钟一次回源也不重。
+        [(header::CACHE_CONTROL, "public, max-age=60")],
         Json(body),
     )
         .into_response()
@@ -1373,6 +1514,104 @@ mod tests {
     }
 
     #[test]
+    fn ephemeral_signature_verifies_against_the_static_key() {
+        // 信任链的第一环：静态密钥签的临时密钥，必须能被静态**公钥**验过。
+        // 这正是客户端做的事（用 pin 锚定的静态公钥验 eph 签名）。
+        use p384::ecdsa::signature::Verifier;
+        use p384::ecdsa::{Signature, VerifyingKey};
+
+        let m = mse_with(test_key());
+        let (_id, pub_b64, exp, sig_b64) = m.current_ephemeral();
+        assert!(!sig_b64.is_empty(), "应当给出一把带签名的临时密钥");
+
+        let eph_spki = B64U.decode(&pub_b64).unwrap();
+        let sig_bytes = B64U.decode(&sig_b64).unwrap();
+        assert_eq!(sig_bytes.len(), 96, "P-384 的 r||s 应当是 96 字节（WebCrypto 认这个）");
+
+        // 重建被签的消息：EPH_SIG_CTX || eph_spki || exp_be
+        let mut msg = Vec::new();
+        msg.extend_from_slice(EPH_SIG_CTX);
+        msg.extend_from_slice(&eph_spki);
+        msg.extend_from_slice(&exp.to_be_bytes());
+
+        let vk = VerifyingKey::from_public_key_der(&m.current().spki).unwrap();
+        let sig = Signature::from_slice(&sig_bytes).unwrap();
+        assert!(vk.verify(&msg, &sig).is_ok(), "静态公钥必须能验过这把临时密钥的签名");
+
+        // 改一个字节就验不过（签名真的绑住了临时公钥）。
+        let mut bad = msg.clone();
+        bad[EPH_SIG_CTX.len()] ^= 1;
+        assert!(vk.verify(&bad, &sig).is_err(), "篡改临时公钥后签名必须失效");
+    }
+
+    #[test]
+    fn forward_secrecy_static_key_alone_cannot_derive_the_session() {
+        // 前向保密的核心断言：会话密钥来自 ECDH(client_eph, **server_eph**)，静态密钥
+        // 没参与。所以只握有静态私钥的攻击者算不出会话密钥 —— 这正是「将来偷到静态私钥
+        // 也解不了历史流量」的根据。
+        let m = mse_with(test_key());
+        let (eph_id, eph_pub_b64, _exp, _sig) = m.current_ephemeral();
+        let eph_spki = B64U.decode(&eph_pub_b64).unwrap();
+
+        // 模拟客户端：一把临时密钥。
+        let client = SecretKey::random(&mut rand::rngs::OsRng);
+        let client_spki = client
+            .public_key()
+            .to_public_key_der()
+            .unwrap()
+            .as_bytes()
+            .to_vec();
+        let sid = sid_of(&client_spki);
+
+        // 服务端按 eph_id 派生（走临时密钥环那条路）。
+        let (k_c2s, _k_s2c) = m.derive(&eph_id, &client_spki, &sid).unwrap();
+
+        // 客户端侧：z_eph = ECDH(client_priv, server_eph_pub)。
+        let server_eph_pub = PublicKey::from_public_key_der(&eph_spki).unwrap();
+        let z_eph = diffie_hellman(client.to_nonzero_scalar(), server_eph_pub.as_affine());
+
+        // 用 z_eph 复算 k_c2s，应当和服务端一致（证明这条会话确实建立在临时密钥上）。
+        let mut tx = Sha384::new();
+        tx.update(&client_spki);
+        tx.update(&eph_spki);
+        let tx = tx.finalize();
+        let hk = Hkdf::<Sha384>::new(None, z_eph.raw_secret_bytes());
+        let mut expect = [0u8; 32];
+        hk.expand(&info_for("c2s", &eph_id, &tx), &mut expect).unwrap();
+        assert_eq!(k_c2s, expect, "会话密钥必须来自临时密钥的 ECDH");
+
+        // 关键：拿**静态私钥**去 ECDH，得到的是完全不同的 z —— 攻击者据此算不出会话密钥。
+        let z_static = diffie_hellman(
+            m.current().secret.to_nonzero_scalar(),
+            PublicKey::from_public_key_der(&client_spki).unwrap().as_affine(),
+        );
+        assert_ne!(
+            z_eph.raw_secret_bytes(),
+            z_static.raw_secret_bytes(),
+            "静态密钥的 ECDH 结果若和临时密钥相同，前向保密就是假的",
+        );
+    }
+
+    #[test]
+    fn old_clients_sealing_to_the_static_kid_still_work() {
+        // 向后兼容：封给静态 kid 的老客户端仍然能派生（无前向保密，但不掉线）。
+        let m = mse_with(test_key());
+        let static_kid = m.current().kid.clone();
+        let client = SecretKey::random(&mut rand::rngs::OsRng);
+        let client_spki = client
+            .public_key()
+            .to_public_key_der()
+            .unwrap()
+            .as_bytes()
+            .to_vec();
+        let sid = sid_of(&client_spki);
+        assert!(
+            m.derive(&static_kid, &client_spki, &sid).is_ok(),
+            "封给静态 kid 的请求必须仍能派生，否则老桌面端全掉线",
+        );
+    }
+
+    #[test]
     fn mode_defaults_to_optional() {
         // 灰度期唯一安全的档位。拼错的值不能悄悄变成 required，那会锁死所有老客户端。
         assert_eq!(Mode::parse(""), Mode::Optional);
@@ -1439,6 +1678,8 @@ mod tests {
             replay_fail_open: false,
             mask_status: false,
             cache: RwLock::new(HashMap::new()),
+            ephemerals: RwLock::new(Vec::new()),
+            ephemeral_ttl: 600,
         }
     }
 

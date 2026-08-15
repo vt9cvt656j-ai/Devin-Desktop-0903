@@ -39,7 +39,9 @@ base64 = "0.22"  # provider profile pictures, stored as data: URLs (see oauth.rs
 # 套件是 CNSA 1.0：ECDH P-384 + HKDF-SHA-384 + AES-256-GCM —— 选它不是因为更强，是
 # 因为 WebCrypto 原生就有这三样，前端因此不需要引入任何第三方密码学库。
 # 全部是 RustCrypto 的纯 Rust 实现，不引 OpenSSL。
-p384 = { version = "0.13", default-features = false, features = ["ecdh", "pkcs8", "std", "arithmetic"] }
+# ecdsa：静态密钥用它**签名**轮换的临时密钥（前向保密，见 mse.rs 的 Ephemeral）。
+# 静态密钥不再参与 ECDH（老客户端除外），只签名——所以偷到它也解不了历史流量。
+p384 = { version = "0.13", default-features = false, features = ["ecdh", "ecdsa", "pkcs8", "std", "arithmetic"] }
 aes-gcm = "0.10"
 hkdf = "0.12"
 zeroize = "1"

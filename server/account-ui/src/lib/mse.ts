@@ -58,6 +58,17 @@ export type MseConfig = {
   pin?: string[];
   /** `require` = 永不明文回退；密码学不可用就抛错，而不是把明文发出去。 */
   mode?: MseMode;
+  /**
+   * `true` = **强制前向保密**：网关没给出可信的临时密钥（eph 被剥掉、或验签失败）就
+   * 直接报错，绝不回退到静态 ECDH。
+   *
+   * 为什么需要它：eph 是可选 JSON 字段，主动中间人**不需要任何密钥**就能把它从
+   * pubkey 响应里删掉，逼客户端走无前向保密的静态路径——之后一旦静态私钥泄露，录下来
+   * 的这段流量就能被解开，正好是前向保密要消灭的那件事。开了这一档，剥 eph 只会让连接
+   * **失败**（可见），而不是**静默降级**（不可见）。代价：网关必须确实在发 eph（我们
+   * 自己的网关一直在发），否则连不上。所以登录页刻意不开这一档（可用性优先），SPA 开。
+   */
+  requireFs?: boolean;
   /** 要封进密文的请求头（小写）。默认把 Bearer 令牌和地区信号封起来。 */
   sealHeaders?: string[];
   fetchImpl?: typeof fetch;
@@ -80,6 +91,7 @@ let cfg: Required<Omit<MseConfig, "fetchImpl">> & { fetchImpl: typeof fetch } = 
   base: "",
   pin: [],
   mode: "auto",
+  requireFs: false,
   sealHeaders: DEFAULT_SEAL_HEADERS,
   fetchImpl: (...a: Parameters<typeof fetch>) => globalThis.fetch(...a),
 };
@@ -89,6 +101,7 @@ export function configureMse(next: MseConfig): void {
     base: next.base ?? cfg.base,
     pin: next.pin ?? cfg.pin,
     mode: next.mode ?? cfg.mode,
+    requireFs: next.requireFs ?? cfg.requireFs,
     sealHeaders: (next.sealHeaders ?? cfg.sealHeaders).map((h) => h.toLowerCase()),
     fetchImpl: next.fetchImpl ?? cfg.fetchImpl,
   };
@@ -116,6 +129,8 @@ export function mseEnvConfig(): MseConfig {
     base: env.VITE_MSE_BASE ?? "",
     pin,
     mode: env.VITE_MSE_MODE === "require" ? "require" : "auto",
+    // VITE_MSE_REQUIRE_FS=1 的构建强制前向保密：剥掉 eph 只会连不上，不会静默降级。
+    requireFs: env.VITE_MSE_REQUIRE_FS === "1" || env.VITE_MSE_REQUIRE_FS === "true",
   };
 }
 
@@ -188,6 +203,11 @@ type Boot = {
   kid: string;
   pub: string;
   prev: { kid: string; pub: string } | null;
+  /**
+   * 服务端的轮换临时密钥（前向保密）。`sig` 是**静态密钥**对它的 ECDSA-P384 签名。
+   * 老服务端不带这个字段——那时回退到静态密钥做 ECDH（无前向保密但能用）。
+   */
+  eph?: { id: string; pub: string; exp: number; sig: string } | null;
   mode: "off" | "optional" | "required";
   session_ttl: number;
   max_skew_ms: number;
@@ -195,7 +215,60 @@ type Boot = {
   suite: string;
   /** server_time - Date.now()。本地时钟不准时，靠它把每个请求的时间戳纠回来。 */
   offset: number;
+  /**
+   * **实际用于 ECDH 的服务端密钥**：验签通过且没过期的临时公钥，否则回退到静态公钥。
+   * loadBoot 里算好，derive 直接用。activeKid 进 X-Mse-Kid 和 HKDF info。
+   */
+  activeKid: string;
+  activePub: string;
+  /** true = 用的是临时密钥（有前向保密）；false = 回退到了静态密钥。诊断用。 */
+  forwardSecret: boolean;
 };
+
+/** i64 大端 8 字节。和 Rust 的 `exp_ms.to_be_bytes()` 必须一致。 */
+function i64be(n: number): Uint8Array<ArrayBuffer> {
+  const b = new Uint8Array(8);
+  new DataView(b.buffer).setBigInt64(0, BigInt(Math.trunc(n)), false);
+  return b;
+}
+
+/** 签名的域前缀。和 Rust 的 `EPH_SIG_CTX` 逐字节一致（含结尾的 NUL）。 */
+const EPH_SIG_CTX: Uint8Array<ArrayBuffer> = new Uint8Array([...enc.encode("MSE-EPH-v1"), 0]);
+
+/**
+ * 验证临时密钥的签名，通过就返回它，否则返回 null（调用方回退静态密钥）。
+ *
+ * 信任链：钉住的静态密钥 → 用它验这个签名 → 签名背书了临时公钥 → 临时公钥做 ECDH。
+ * 于是偷到静态私钥也解不了流量（它只签过名），而临时私钥会轮换、用完即弃。
+ */
+async function verifyEph(
+  staticSpki: Uint8Array<ArrayBuffer>,
+  eph: { id: string; pub: string; exp: number; sig: string },
+  offset: number,
+): Promise<{ id: string; pub: string } | null> {
+  try {
+    // 过期的临时密钥不用（用服务端时间基准判，避免本地时钟偏差误杀/误放）。
+    if (eph.exp <= Date.now() + offset) return null;
+
+    const ephSpki = b64uDecode(eph.pub);
+    const sig = b64uDecode(eph.sig); // 96 字节 r||s
+    // id 必须是临时公钥的真实指纹，不采信服务端报的字符串（和静态 kid 同理）。
+    if ((await kidOf(ephSpki)) !== eph.id) return null;
+
+    const verifyKey = await crypto.subtle.importKey(
+      "spki",
+      staticSpki,
+      { name: "ECDSA", namedCurve: "P-384" },
+      false,
+      ["verify"],
+    );
+    const msg = concat(EPH_SIG_CTX, ephSpki, i64be(eph.exp));
+    const ok = await crypto.subtle.verify({ name: "ECDSA", hash: "SHA-384" }, verifyKey, sig, msg);
+    return ok ? { id: eph.id, pub: eph.pub } : null;
+  } catch {
+    return null;
+  }
+}
 
 type Session = {
   kid: string;
@@ -256,13 +329,21 @@ async function loadBoot(): Promise<Boot> {
     }
   }
 
+  // `spki` 是响应里**最初的当前静态公钥**（下面 pin 块可能把 j.pub 改成 prev，但这个
+  // 变量已经在那之前解好了）。eph 的签名永远由当前静态密钥出，所以验签必须用它。
+  const currentStaticSpki = spki;
+
   // 密钥固定。不在名单里就拒绝，**不回退明文** —— 回退等于把固定密钥变成装饰。
+  // currentTrusted：客户端是否信任「当前静态密钥」。没配 pin 就都信；配了 pin 只信
+  // 名单里的那把。这决定了敢不敢用当前静态密钥背书的 eph（见下）。
+  let currentTrusted = cfg.pin.length === 0;
   if (cfg.pin.length > 0) {
     const pinnedCurrent = cfg.pin.includes(realKid);
     const pinnedPrev = prevKid !== null && cfg.pin.includes(prevKid);
     if (!pinnedCurrent && !pinnedPrev) {
       throw new MseError(`网关公钥 ${realKid} 不在固定名单里，拒绝连接`, "pin");
     }
+    currentTrusted = pinnedCurrent;
     // 轮换期：名单里的那一把优先，即使服务端把它标成 prev。
     if (!pinnedCurrent && j.prev) {
       j.kid = j.prev.kid;
@@ -271,7 +352,41 @@ async function loadBoot(): Promise<Boot> {
   }
 
   lastKid = j.kid;
-  return { ...j, offset: j.server_time - Date.now() };
+  const offset = j.server_time - Date.now();
+
+  /*
+   * 前向保密：静态密钥（信任锚）只用来**验签**一把轮换的临时密钥；真正做 ECDH 的是那把
+   * 临时公钥。偷到静态私钥也解不了历史流量——它从没握过 DH。
+   *
+   * 只有在**信任当前静态密钥**时才用 eph：eph 由当前静态密钥签名，若客户端只 pin 了
+   * prev（当前那把不在名单里），就无从确认签名者可信 —— 这时回退到 prev 的静态 ECDH。
+   */
+  let activeKid = j.kid;
+  let activePub = j.pub;
+  let forwardSecret = false;
+  if (j.eph && currentTrusted) {
+    const verified = await verifyEph(currentStaticSpki, j.eph, offset);
+    if (verified) {
+      activeKid = verified.id;
+      activePub = verified.pub;
+      forwardSecret = true;
+    }
+    // 验不过就回退静态密钥：仍受 pin 保护、挡得住主动中间人，只是这一条会话没有前向
+    // 保密。不抛错——老服务端或部署间隙都可能暂时给不出合法 eph。
+  }
+
+  // 强制前向保密：拿不到可信的临时密钥就**报错**，不静默降级到静态 ECDH。这把
+  // 「主动中间人剥掉 eph → 悄悄降级 → 将来静态私钥泄露就能解密」变成一个可见的失败。
+  // 剥 eph 不需要密钥，所以没有这道闸，pin + require 都拦不住这次降级。
+  if (cfg.requireFs && !forwardSecret) {
+    throw new MseError(
+      "此构建要求前向保密，但网关没有提供可信的临时密钥（可能是 eph 被中间人剥掉）",
+      "fs",
+    );
+  }
+
+  lastForwardSecret = forwardSecret;
+  return { ...j, offset, activeKid, activePub, forwardSecret };
 }
 
 function bootstrap(): Promise<Boot> {
@@ -294,7 +409,9 @@ async function derive(b: Boot): Promise<Session> {
   )) as CryptoKeyPair;
 
   const epkSpki = new Uint8Array(await crypto.subtle.exportKey("spki", pair.publicKey));
-  const serverSpki = b64uDecode(b.pub);
+  // 用**活跃密钥**做 ECDH：验签通过就是临时公钥（前向保密），否则回退的静态公钥。
+  // 服务端那边靠 activeKid 走对应分支（临时密钥环 or 静态密钥）。
+  const serverSpki = b64uDecode(b.activePub);
   const serverPub = await crypto.subtle.importKey(
     "spki",
     serverSpki,
@@ -308,13 +425,13 @@ async function derive(b: Boot): Promise<Session> {
     await crypto.subtle.deriveBits({ name: "ECDH", public: serverPub }, pair.privateKey, 384),
   );
 
-  // transcript 绑定：双方公钥都揉进 info。对面换了公钥不会得到一条能用的会话，
-  // 只会得到一把不同的密钥 —— 失败在解密，而不是悄悄成功。
+  // transcript 绑定：双方公钥都揉进 info。server_spki 是**真正做了 ECDH 的那把**（活跃
+  // 密钥）。对面换了公钥不会得到一条能用的会话，只会得到一把不同的密钥。
   const tx = new Uint8Array(await crypto.subtle.digest("SHA-384", concat(epkSpki, serverSpki)));
 
   const prk = await crypto.subtle.importKey("raw", z, "HKDF", false, ["deriveBits"]);
   const expand = async (dir: "c2s" | "s2c") => {
-    const info = concat(enc.encode(`MSE1/v1|${dir}|${b.kid}|`), tx);
+    const info = concat(enc.encode(`MSE1/v1|${dir}|${b.activeKid}|`), tx);
     const bits = await crypto.subtle.deriveBits(
       { name: "HKDF", hash: "SHA-384", salt: new Uint8Array(0), info },
       prk,
@@ -325,7 +442,8 @@ async function derive(b: Boot): Promise<Session> {
 
   const epkHash = new Uint8Array(await crypto.subtle.digest("SHA-384", epkSpki));
   return {
-    kid: b.kid,
+    // 活跃密钥的 id 进 X-Mse-Kid —— 服务端据此选临时密钥环还是静态密钥来 ECDH。
+    kid: b.activeKid,
     sid: b64uEncode(epkHash.subarray(0, 18)),
     epk: b64uEncode(epkSpki),
     c2s: await expand("c2s"),
@@ -375,6 +493,8 @@ export async function mseReady(): Promise<void> {
 
 /** 当前用的是哪一把服务端密钥。诊断用 —— 「它到底加密了没有」要能一眼看出来。 */
 let lastKid: string | null = null;
+/** 上一次引导时，是否用上了临时密钥（前向保密生效）。诊断用。 */
+let lastForwardSecret = false;
 
 export function mseStatus(): {
   ready: boolean;
@@ -382,6 +502,7 @@ export function mseStatus(): {
   kid: string | null;
   mode: MseMode;
   pinned: boolean;
+  forwardSecret: boolean;
 } {
   return {
     ready: session !== null,
@@ -389,6 +510,7 @@ export function mseStatus(): {
     kid: lastKid,
     mode: cfg.mode,
     pinned: cfg.pin.length > 0,
+    forwardSecret: lastForwardSecret,
   };
 }
 
