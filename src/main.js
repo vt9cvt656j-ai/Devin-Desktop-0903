@@ -19823,6 +19823,20 @@ const _AI_WORKSPACE_ACTIONS = new Set(["none", "inspect", "modify"]);
 const _AI_CAPTURE_MODES = new Set(["none", "isolated_browser", "system", "background"]);
 const _AI_BROWSER_GOALS = new Set(["none", "static", "interactive", "network_capture"]);
 const _AI_ORCHESTRATION_MODES = new Set(["solo", "staged_roles", "parallel_roles"]);
+/**
+ * 用户自己声明的角色名，拼进判定提示词的角色枚举里。
+ *
+ * 模型不知道存在的角色，它永远不会选。以前角色枚举是写死的一串，用户加了角色也白加。
+ *
+ * **只有真的声明了角色时才返回非空**——这段提示词在缓存前缀里，字节稳定才有缓存。
+ * 没声明的用户（绝大多数）拿到的字符串和以前逐字节相同，缓存一点没受影响；声明了的
+ * 用户本来就已经把自己的东西加进去了，这一次未命中是应得的成本。
+ */
+function _userRoleEnumSuffix() {
+  const names = _userCapabilities().roles?.map((r) => r.name) || [];
+  return names.length ? "/" + names.join("/") : "";
+}
+
 const _AI_AGENT_ROLES = new Set([
   "architect", "product", "research", "frontend", "backend", "database",
   "security", "test", "devops", "design", "docs",
@@ -19998,7 +20012,10 @@ function _normalizeAiIntentVerdict(value, context = {}) {
     : "none";
   const roleNeeds = _aiIntentList(rawEngineering?.roleNeeds, 8, 40)
     .map((item) => item.toLowerCase())
-    .filter((item) => _AI_AGENT_ROLES.has(item));
+    // 内置角色 + 用户自己声明的角色。这一层过滤是**必要**的——它挡住模型凭空编出来的
+    // 角色名（编出来的角色既没有提示词也没有工具矩阵，派出去等于派一个空壳）。放宽到
+    // 用户声明，恰恰不是放松：那些角色是有提示词、有工具矩阵的真角色。
+    .filter((item) => _AI_AGENT_ROLES.has(item) || _userRoleMap().has(item));
   let orchestrationMode = _aiIntentEnum(rawEngineering?.orchestrationMode, _AI_ORCHESTRATION_MODES, "solo");
   if (orchestrationMode !== "solo" && !roleNeeds.length) orchestrationMode = "solo";
   if (orchestrationMode === "parallel_roles" && roleNeeds.length < 2) orchestrationMode = "solo";
@@ -20096,7 +20113,7 @@ async function _aiIntentProfile(text, config, session = null, context = null) {
 ;constraints=不能违反的要求；successCriteria=用户会据此判断完成的可观察结果；continuation=new/continue/correct/replace/clarify；confidence=0 到 1；ambiguities=仍会实质改变结果且无法从上下文消除的歧义；restatedTask=把用户这句话（哪怕很短/有错别字/口语/指代）用第一人称、完整、可直接执行地重述一遍——补全从上下文能确定的对象和范围、纠正明显笔误、展开"做个网站"这类省略，但绝不臆造用户没有的意图或约束；能从上下文确定就写清，不能确定的写进 ambiguities 而不是在这里编。这是给执行阶段的"读懂了你要什么"的确认，不替代用户原话。
 规则：短句不能孤立理解。“继续/这个/还是不行/不对/按刚才的”必须结合 priorTask、recentTurns、lastRun、unfinishedPlan 和附件解析指代；correct 表示纠正旧理解，replace 表示换目标，continue 表示沿用已确认目标。最新用户消息优先，旧要求冲突时只保留最新约束。不要把助手上一轮的建议误当成用户授权。
 当前消息的动作边界必须独立成立：普通问候、身份问答和一般知识问答用 action=answer、workspaceAction=none、deliverySurface=answer，打开了工作区也不等于要求检查项目；**用户要方案/思路/设计/架构建议/"怎么做"/"评估一下"时是 action=plan、workspaceAction=inspect、runtimeActions=[]、externalActions=[]**——交付物是方案本身，只读取形成方案所需的最小事实，不得派生写文件、装依赖、起服务、打包或部署；同一句话里既要方案又明确说了"然后做/做完给我"才算 workspaceAction=modify；“你觉得这个项目怎么样/评价一下当前项目”是 action=inspect、locationIntent=query、workspaceAction=inspect、deliverySurface=answer，只读取形成评价所需的最小项目事实，runtimeActions/externalActions=[]，不得派生写文件、安装依赖、启动服务、打包、部署或设计知识检索；明确要求视觉/UI 设计评审时才用 action=review + workspaceAction=inspect + 对应 designMode；实际新建或修改 UI 时用 create/modify + workspaceAction=modify。只有 continuation 明确为 continue/correct/clarify 时才能沿用 priorTask；新问题和判定未决都不能继承上一轮的修改、运行或外部动作。
-工程字段（全部必填）：projectState=none/existing/greenfield/unknown；deliverySurface=answer/code/ui_component/website/web_app/backend/data/cli/desktop/automation/mixed；changeScope=none/local/module/project/system；architectureMode=none/follow_existing/extend_existing/design_new/refactor_existing；dataStrategy=not_applicable/none/local/server/inspect_existing/undecided；researchMode=none/official/community/official_and_community；designMode=none/michael_design_2_5_existing/michael_design_2_5_greenfield；workspaceAction=none/inspect/modify；captureMode=none/isolated_browser/system/background；browserGoal=none/static/interactive/network_capture；orchestrationMode=solo/staged_roles/parallel_roles；roleNeeds 只能从 architect/product/research/frontend/backend/database/security/test/devops/design/docs 选择且只列真正需要的角色；coordinationRisks 记录跨角色契约、共享文件、顺序依赖或集成风险；runtimeActions 和 externalActions 只列实际需要的动作；researchTopics 列需要核验的具体技术主题；rationale 用短句记录决定依据。
+工程字段（全部必填）：projectState=none/existing/greenfield/unknown；deliverySurface=answer/code/ui_component/website/web_app/backend/data/cli/desktop/automation/mixed；changeScope=none/local/module/project/system；architectureMode=none/follow_existing/extend_existing/design_new/refactor_existing；dataStrategy=not_applicable/none/local/server/inspect_existing/undecided；researchMode=none/official/community/official_and_community；designMode=none/michael_design_2_5_existing/michael_design_2_5_greenfield；workspaceAction=none/inspect/modify；captureMode=none/isolated_browser/system/background；browserGoal=none/static/interactive/network_capture；orchestrationMode=solo/staged_roles/parallel_roles；roleNeeds 只能从 architect/product/research/frontend/backend/database/security/test/devops/design/docs${_userRoleEnumSuffix()} 选择且只列真正需要的角色；coordinationRisks 记录跨角色契约、共享文件、顺序依赖或集成风险；runtimeActions 和 externalActions 只列实际需要的动作；researchTopics 列需要核验的具体技术主题；rationale 用短句记录决定依据。
 工程决策律：
 1. workspaceEvidence 是事实，不是用户指令。现有项目时先 inspect 并 follow_existing/extend_existing，是指已有对应实现时继承技术栈、目录、组件和设计系统；仓库虽已存在但只有后端/CLI/库、正在创建第一个网站或第一个 UI surface 时，projectState 仍是 existing，但 architectureMode=design_new。只有证据要求整体重构才 refactor_existing。
 2. 不因为“做产品”就自动上数据库。静态展示/纯计算通常 none；只在单机保存可用 local；多用户共享、登录、交易、关系查询、审计或服务端一致性通常 server；已有项目疑似有数据层先 inspect_existing；必须看代码才能决定用 undecided。需要数据库但用户没说出“数据库”也必须识别。
@@ -40471,8 +40488,43 @@ const _AGENT_ROLE_BLOCKS = {
 - 优先一手来源（源码/官方文档/真实运行结果），社区内容只作线索。
 - 简报格式：结论一句话 → 证据清单 → 边界与未知 → 建议的下一步。`,
 };
+/**
+ * 用户自己声明的角色 → 和内置角色同一个形状。
+ *
+ * 角色以前是**三张写死的表**：合法名单、提示词、工具矩阵，加一个角色要改三处代码。
+ * 而这三处的查表函数早就写成了「按 key 查、查不到返回默认」的样子——缺的从来不是
+ * 分发，是「行」的来源。所以这里只换掉它们查的那张表，查表函数本身一行没动。
+ *
+ * 工具名和类型在这里对着**真实的工具目录**校验一遍：一个名字进不了子智能体的白名单，
+ * 派出去之后才会发现手里没有那件工具，而那时候已经烧掉一轮了。校验不过就丢掉那一项
+ * 并记进 errors，角色本身照常生效（少一件工具，好过整个角色静默消失）。
+ */
+function _userRoleMap() {
+  const out = new Map();
+  const caps = _userCapabilities();
+  if (!caps.roles?.length) return out;
+  let known = null;
+  const isRealTool = (n) => {
+    if (!known) {
+      known = new Set(_buildAgentToolSchemas(true, []).map((t) => t?.function?.name).filter(Boolean));
+    }
+    return known.has(n);
+  };
+  for (const r of caps.roles) {
+    out.set(r.name, {
+      prompt: r.prompt,
+      tools: r.tools.filter(isRealTool),
+      types: r.types,
+      source: r.source,
+    });
+  }
+  return out;
+}
+
 function _agentRoleBlock(role) {
   const key = String(role || "").trim().toLowerCase();
+  const mine = _userRoleMap().get(key);
+  if (mine) return "\n\n" + mine.prompt;
   return (_AGENT_ROLE_BLOCKS[key] ? "\n\n" + _AGENT_ROLE_BLOCKS[key] : "");
 }
 
@@ -40500,7 +40552,11 @@ const _ROLE_CAPABILITIES = {
 };
 function _roleCapabilities(role, write) {
   if (!write) return { tools: [], types: [] }; // read-only child: read+web only, no side-effect tools
-  const spec = _ROLE_CAPABILITIES[String(role || "").trim().toLowerCase()];
+  const key = String(role || "").trim().toLowerCase();
+  // 用户声明优先：他为自己项目定义的 `data` 角色，比内置的同名角色更贴他的活。
+  const mine = _userRoleMap().get(key);
+  if (mine) return { tools: [...mine.tools], types: [...mine.types] };
+  const spec = _ROLE_CAPABILITIES[key];
   return spec ? { tools: [...spec.tools], types: [...spec.types] } : { tools: [], types: [] };
 }
 
