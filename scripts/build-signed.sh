@@ -72,9 +72,42 @@ echo "预清 provenance：$cleaned 个"
 
 # 只打 .app。DMG 那步会走 hdiutil internet-enable，在这台机器上稳定失败，而它跟
 # 签名身份、跟能不能跑毫无关系——让它把整条构建拖挂是纯粹的干扰。要 DMG 时单独加。
+# 更新签名的私钥必须在这里注入。
+#
+# 这个脚本原来只管 Apple 代码签名，完全没有 TAURI_SIGNING_PRIVATE_KEY——而带密钥的是
+# package.json 里的 `build:signed`。于是走这个脚本构建时，Tauri 会打完包再抱怨
+# 「A public key has been found, but no private key」并以非零退出：**.app 其实已经
+# 造好了，失败的只是更新产物的签名**。这个失败模式很坏——退出码说失败、产物却在，
+# 一眼看去像构建挂了；而真正的后果是 .app.tar.gz 没有有效 .sig，发上去客户端会拒绝安装。
+UPDATER_KEY_FILE="${TAURI_SIGNING_KEY_FILE:-$HOME/.tauri/michael-ide.key}"
+if [ -f "$UPDATER_KEY_FILE" ]; then
+  export TAURI_SIGNING_PRIVATE_KEY="$(cat "$UPDATER_KEY_FILE")"
+  export TAURI_SIGNING_PRIVATE_KEY_PASSWORD="${TAURI_SIGNING_PRIVATE_KEY_PASSWORD:-}"
+  echo "更新签名私钥：已注入（$UPDATER_KEY_FILE）"
+else
+  echo "更新签名私钥：$UPDATER_KEY_FILE 不存在 —— 本次产物无法用于自动更新" >&2
+  echo "（本地自用可以忽略；要发版就必须有它，否则客户端会因签名验证失败拒绝安装）" >&2
+fi
+
 npm run tauri build -- \
   --bundles "${MRDAYONE_BUNDLES:-app}" \
   --config "{\"bundle\":{\"macOS\":{\"signingIdentity\":\"$APPLE_SIGNING_IDENTITY\"}}}"
+
+# 签名产物要跟这次的包对得上。.sig 比 .app.tar.gz 旧，说明这次没签成、留下的是上一次的，
+# 而那份签名配不上这次的内容——发出去客户端一律验签失败。宁可现在红，也别发出去才发现。
+if [ -n "${TAURI_SIGNING_PRIVATE_KEY:-}" ]; then
+  _bundle_dir="target/release/bundle/macos"
+  for _tar in "$_bundle_dir"/*.app.tar.gz; do
+    [ -f "$_tar" ] || continue
+    if [ ! -f "$_tar.sig" ]; then
+      echo "更新产物缺少签名：$_tar.sig 不存在" >&2; exit 1
+    fi
+    if [ "$_tar.sig" -ot "$_tar" ]; then
+      echo "更新产物的签名比包还旧：$_tar.sig —— 这是上一次的签名，配不上这次的内容" >&2; exit 1
+    fi
+    echo "更新产物签名：$(basename "$_tar").sig ✓"
+  done
+fi
 
 APP="target/release/bundle/macos/Mr. Day One.app"
 
