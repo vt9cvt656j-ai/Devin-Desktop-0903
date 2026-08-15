@@ -16,6 +16,7 @@ mod content_length_frame;
 mod conversation_store;
 mod db;
 mod debug;
+mod env_probe;
 mod extensions;
 mod files;
 mod game;
@@ -305,6 +306,7 @@ pub fn run() {
             git::git_file_at,
             git::git_show,
             ui_clone::ui_diff,
+            env_probe::probe_env,
             git::git_stash,
             git::git_stash_pop,
             git::git_stash_apply,

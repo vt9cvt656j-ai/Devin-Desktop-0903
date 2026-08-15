@@ -23507,3 +23507,52 @@ test("gh 的只读 op 放行了，但建 PR / 回复评论仍然拒绝", () => {
     "不可逆的对外动作绝不能进只读名单");
   assert.match(sub, /建 PR \/ 回复评论是不可逆的对外动作，交回主任务做/);
 });
+
+// ══ 卡住时能自己搞清楚状况 ═════════════════════════════════════════════════
+//
+// 在这之前 IDE 里**没有任何工具**能回答"这台机器上有什么"——live_environment 是查天气
+// 和地震的，名字像但不是一回事。于是模型撞上 command not found 只能用 run_cmd 一条条试，
+// 一轮试一个，每轮都是一次完整的模型往返。"卡住时先搞清楚状况"这个最基本的动作，
+// 成本高到它宁可去猜。
+
+test("probe_env 五处接齐，且子智能体也拿得到", () => {
+  assert.match(SRC, /name: "probe_env", description: "\*\*Ask the machine what it actually has/);
+  assert.match(SRC, /case "probe_env": return \{ type: "probeenv", path: "" \};/);
+  assert.match(SRC, /\} else if \(call\.type === "probeenv"\) \{/);
+  assert.match(SRC, /    probe_env: \{\},/);
+  const guides = readFileSync(new URL("../src/tool-guides.js", import.meta.url), "utf8");
+  assert.match(guides, /probe_env: \{ category: 'diagnostics'/);
+  const gw = JSON.parse(readFileSync(new URL("../../server/prompts/tools.json", import.meta.url), "utf8"));
+  assert.ok(gw.some((t) => t?.function?.name === "probe_env"), "网关目录里没有");
+  // "我的智能体都要能做"——子体也得有，而且名字和类型要成对
+  const sub = extractFn("_runSubAgent");
+  assert.ok(sub.match(/const _READ_TOOLS = \[([^\]]*)\]/s)[1].includes('"probe_env"'));
+  assert.ok(sub.match(/const _READ_TYPES = \[([^\]]*)\]/s)[1].includes('"probeenv"'),
+    "类型没跟上就是给了一把打不开门的钥匙");
+});
+
+test("环境探测报的是事实，且「文件在」不等于「装了」", () => {
+  const rs = readFileSync(new URL("../src-tauri/src/env_probe.rs", import.meta.url), "utf8");
+  // macOS 自带一个永远存在的 java 存根：spawn 成功、输出 "Unable to locate a Java Runtime"。
+  // 只看 spawn 成不成功会把它报成"装了 java"，模型据此去跑 Java 构建，撞一堵没预料到的墙。
+  assert.match(rs, /let looks_absent = !o\.status\.success\(\)/,
+    "判据必须是「非零 **且** 输出像没装」——只看退出码会误伤那些 --version 本来就返回非零的工具");
+  assert.match(rs, /low\.contains\("unable to locate"\)/);
+  assert.match(rs, /out\.note = first_line/, "存根要把系统原话交出去，模型才知道该让用户装什么");
+  // 超时 ≠ 不存在，这两者必须分开
+  assert.match(rs, /None => \{[\s\O\s\S]{0,300}out\.found = true;/,
+    "超时时命令是存在的，不能报成没装");
+  // lockfile 是"实际用过"的证据，不是声明
+  assert.match(rs, /\("pnpm-lock\.yaml", "pnpm"\)/);
+  // 没打开工作区要明说，别让模型从空结果里推断
+  assert.match(rs, /没有打开工作区——涉及项目的判断一律不成立/);
+});
+
+test("探测结果交给模型时要说清「这是事实不是推断」", () => {
+  const branch = SRC.slice(SRC.indexOf('} else if (call.type === "probeenv") {'), SRC.indexOf('} else if (call.type === "uiextract") {'));
+  assert.match(branch, /这些都是\*\*刚探测到的事实\*\*，不是推断/);
+  assert.match(branch, /"未安装"是真的不在（存根已经排除掉了）/);
+  assert.match(branch, /别再一条条 run_cmd 试/);
+  // 包管理器的判据要说清楚，否则模型不知道该多信它
+  assert.match(branch, /按 lockfile 认定，是"实际用过"的证据/);
+});
