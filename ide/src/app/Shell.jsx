@@ -357,6 +357,13 @@ export function Shell() {
                       <span className="assistant-capability__item-icon"></span>
                       <span data-i18n="assistant.capability.rules">用户规则</span>
                     </button>
+                    {/* 自动化用哪个浏览器。放这里而不是只留一个环境变量：装了 Chrome
+                        就只能用 Chrome 是以前的实际行为，而"把自己的 Chrome 留给自己、
+                        让自动化去用 Edge"恰恰能让两个一模一样的图标从根上消失。 */}
+                    <button className="assistant-capability__item" id="capabilityBrowserItem" type="button" role="menuitem">
+                      <span className="assistant-capability__item-icon"></span>
+                      <span data-i18n="assistant.capability.browser">浏览器</span>
+                    </button>
                   </span>
                 </span>
               </span>
