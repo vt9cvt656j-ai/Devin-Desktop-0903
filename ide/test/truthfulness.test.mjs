@@ -150,3 +150,62 @@ test("部署失败不能报成功——这是唯一会跨出 IDE 变成对外承
     "成功文案排在状态码判定之前——失败时照样会打印");
   assert.match(cmd, /不要把链接给别人/, "失败时要明说没有可用地址，否则模型仍可能给出链接");
 });
+
+test("红灯和绿灯必须用同一套判据，否则「不声明 + 跑个失败的测试」是最省事的过关路径", () => {
+  // 发绿灯的 _evidenceCertifies 只看执行期盖上的 verifierRecognized，不看 purpose；
+  // 而判红灯的 _freshBuildFailure 原来额外要求 purpose === "verify"。于是模型跑
+  // `npm test` 不声明 purpose：过了拿满学分，挂了被直接跳过、照常宣布完成。
+  const red = SRC.slice(SRC.indexOf("function _freshBuildFailure"), SRC.indexOf("function _freshBuildFailure") + 1800);
+  const green = SRC.slice(SRC.indexOf("function _evidenceCertifies"), SRC.indexOf("function _evidenceCertifies") + 1800);
+  assert.doesNotMatch(red, /e\.purpose !== "verify"/,
+    "判红灯又要求声明 purpose 了——绿灯不要求，这个不对称就是一条过关捷径");
+  for (const seg of [red, green]) {
+    assert.match(seg, /verifierRecognized !== true/, "两侧都必须只认执行期盖的 verifierRecognized");
+    assert.match(seg, /implementationVersion !== implOps/, "两侧都必须要求证据比最后一次改动新");
+  }
+});
+
+test("验证义务的扩展名表要覆盖这个 IDE 最常改的那几类", () => {
+  // 这张表是两道验证门唯一的入口。漏掉 html/css/json 等于：改一版 CSS 那一轮
+  // **整轮零验证义务**——而界面恰恰是这个 IDE 最常做的交付。
+  const m = SRC.match(/const _CODE_FILE_RE = \/([^/]+)\//);
+  assert.ok(m, "_CODE_FILE_RE 不见了——两道验证门会一起失去入口");
+  for (const ext of ["html", "css", "scss", "json", "yaml", "toml"]) {
+    assert.ok(m[1].includes(ext), `验证义务漏掉了 .${ext}`);
+  }
+});
+
+test("「改了代码没验证」只记账不补回合——这是刻意的，别再改回去", () => {
+  // 我一度把它改成推提醒并续跑，被两条测试拦下，而它们是对的：红构建是**观测到失败**，
+  // 是「已完成」为假的直接证据；「没验证」观测到的是**缺席**，缺席不等于工作是坏的。
+  // 拿缺席去覆盖模型的收尾判断，就是用 harness 的偏好压过它的判断。
+  const loop = SRC.slice(SRC.indexOf("function _runAgenticLoop"));
+  assert.match(loop, /run\._incompleteReason = "code_delivered_unverified"/,
+    "缺席必须记账，否则这一轮看起来就像验证过了");
+  assert.ok(!/_pushNudge\("codeVerify"/.test(loop),
+    "又把它改成强制补回合了——见 logic.test.mjs 里那两条守卫");
+  // 记了账就必须到得了用户：outcome 变 partial，然后作为一枚建议按钮出现。
+  assert.match(SRC, /code_delivered_unverified: "跑一遍验证刚才的改动"/,
+    "标签没有对应的人话，用户看到的会是「继续完成剩余部分」这种废话");
+});
+
+test("中文查询必须搜得到——原来整段汉字是一个 token，几乎必然落空", () => {
+  // 这个 IDE 的用户大多用中文提问。原来 `[一-鿿]+` 把「用户登录校验在哪」当成一个
+  // token，它和注释里的「登录校验」永远不相等，BM25 里 df===0 直接跳过——
+  // 也就是说「搜不到」和「不存在」在中文上长得完全一样，而这正是最容易骗到人的一种。
+  const i = SRC.indexOf("function _tokenize");
+  assert.ok(i >= 0);
+  const tokenize = new Function("_BM25_STOP",
+    `${SRC.slice(i, (() => { let d = 0, j = SRC.indexOf("{", SRC.indexOf(")", i)); for (; j < SRC.length; j++) { const c = SRC[j]; if (c === "{") d++; else if (c === "}") { d--; if (!d) break; } } return j + 1; })())}\nreturn _tokenize;`,
+  )(new Set());
+
+  const q = tokenize("用户登录校验在哪");
+  const doc = tokenize("这里做登录校验");
+  const shared = q.filter((t) => doc.includes(t));
+  assert.ok(shared.length >= 2, `中文查询和文档没有共同 token（${shared.join("/") || "空"}）——搜索对中文是瞎的`);
+  assert.ok(shared.includes("登录") && shared.includes("校验"), "二元切分没覆盖到实际词");
+  // 整段那个 token 要保留：完整短语命中时它仍然是一次强匹配。
+  assert.ok(q.includes("用户登录校验在哪"));
+  // ASCII 的行为一个字都不能变。
+  assert.deepEqual(tokenize("getUserPermission"), ["getuserpermission", "get", "user", "permission"]);
+});
