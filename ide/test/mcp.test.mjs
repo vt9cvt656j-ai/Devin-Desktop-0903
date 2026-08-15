@@ -948,7 +948,9 @@ test("调用还没回来之前，卡片一个字都不说连接状态", () => {
 test("五条「没调成」的分支都会把原因写进卡片，并且自动展开", () => {
   const start = SRC.indexOf('} else if (call.type === "mcp") {');
   const branch = SRC.slice(start, SRC.indexOf('} else if (call.type === "demostart")', start));
-  assert.equal((branch.match(/_mcpCardSettle\(/g) || []).length, 5,
+  // 6 = 原来的五条「没调成」+ 用户主动停止。停止不是失败，但同样要把原因写进卡片，
+  // 否则卡片停在"等服务返回…"，看起来像卡死了。
+  assert.equal((branch.match(/_mcpCardSettle\(/g) || []).length, 6,
     "有分支只改了右边那个小徽章，卡片里仍然是一张信心十足的身份卡");
   const settle = SRC.slice(SRC.indexOf("function _mcpCardSettle"), SRC.indexOf("function _mcpCardSettle") + 600);
   assert.match(settle, /step\?\.classList\?\.add\("is-open"\)/,
@@ -1084,4 +1086,61 @@ test("线性图标补上描边，不再渲染成黑方块", () => {
   // 只补给自己没声明的那些：_ICON_TRASH 自带属性，不该被这条规则改宽改细。
   assert.match(SRC, /_ICON_TRASH = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor"/,
     "垃圾桶图标本来就自带描边，:not([stroke]) 才不会误伤它");
+});
+
+// ── 服务自己说了什么，要能看到 ─────────────────────────────────────────────────
+//
+// 后端早就把 stderr 和 notifications/message 收在一条有界尾巴里（40 行 × 500 字），
+// 但前端一个调用者都没有。用户能看到的全部只有：连接超时/子进程退出这两种错误串在
+// 卡片 title 里剩下的 160 个字符。服务连上了、调用时回 JSON-RPC 错误、或者狂打警告的
+// 那种，一个字都看不到——而那恰恰是最需要看日志的时候。
+test("每张已装服务的卡片都有看日志的入口", () => {
+  assert.match(SRC, /data-mcpfp-log="\$\{_escAttr\(name\)\}"/, "卡片上没有日志入口");
+  assert.match(SRC, /const logName = e\.target\.closest\("\[data-mcpfp-log\]"\)/, "日志按钮没接处理");
+});
+
+test("日志只在点击时取一次，不轮询——它是排障用的，不是状态指示", () => {
+  const at = SRC.indexOf("const logName = e.target.closest");
+  const seg = SRC.slice(at, at + 1400);
+  assert.match(seg, /_invokeCapped\("mcp_server_log", \{ name: logName, root \}/,
+    "没带 root 会去问另一个项目那个同名服务；不用 _invokeCapped 则一个卡死的服务能把面板吊住");
+  assert.ok(!/setInterval|setTimeout\(\s*\(\)\s*=>[^)]*mcp_server_log/.test(seg), "不该轮询");
+});
+
+test("日志内容要转义，且空日志要说人话而不是留空白", () => {
+  const at = SRC.indexOf("const logName = e.target.closest");
+  const seg = SRC.slice(at, at + 1400);
+  assert.match(seg, /_escHtml\(text\)/, "服务写的字符串是第三方内容，必须转义");
+  assert.match(seg, /这个服务还没说过话/, "空日志留一片空白，用户会以为是功能坏了");
+});
+
+
+// ── 全局 Stop 要真的停掉 MCP ─────────────────────────────────────────────────
+//
+// 按停只取消了模型请求（cancelAi），MCP 那条完全没碰：界面不转了，而那个外部服务还在
+// 替一个没人要的请求干活——写文件、发请求、扣配额照常发生。下一条 MCP 调用走阻塞锁，
+// 还会排在这条没人要的旧调用后面，最长十分钟。
+test("按停要把在飞的 MCP 调用一起取消，而不只是取消模型请求", () => {
+  const fn = extractFn("_setStreaming");
+  assert.match(fn, /sess\._mcpInFlight instanceof Map/, "Stop 没有看在飞的 MCP 调用");
+  assert.match(fn, /backend\.invoke\("mcp_cancel", \{ name, root \}\)/, "没有真的发取消");
+  assert.match(fn, /_mcpInFlight\.clear\(\)/, "取消完没清表，下次按停会重复取消");
+});
+
+test("在飞的调用要登记也要注销——不注销就会误杀下一条无辜的调用", () => {
+  // Rust 侧的取消标志是留给"当前在飞"的那条的。对一条早就结束的调用发取消，
+  // 标志会被下一条调用捡走。
+  assert.match(SRC, /_mcpFlightSess\._mcpInFlight\.set\(_mcpFlightKey/, "没有登记");
+  assert.match(SRC, /_mcpFlightSess\?\._mcpInFlight\?\.delete\(_mcpFlightKey\)/, "没有注销");
+  const at = SRC.indexOf("_mcpInFlight?.delete(_mcpFlightKey)");
+  const before = SRC.slice(Math.max(0, at - 300), at);
+  assert.match(before, /\} finally \{/, "注销必须在 finally 里，否则出错那条永远留在表上");
+});
+
+test("用户停止不能报成「失败」——那是他自己要的结果", () => {
+  const at = SRC.indexOf("MCP 请求已取消");
+  assert.ok(at > 0, "没有识别取消态");
+  const seg = SRC.slice(at, at + 400);
+  assert.match(seg, /已按你的要求停止/, "卡片没说清是被停的");
+  assert.match(seg, /\[interrupted\]/, "回给模型的不是中断标记，它会当成工具坏了去重试");
 });
