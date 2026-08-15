@@ -412,6 +412,26 @@ pub async fn http_request(
     })
 }
 
+/// 下载不覆盖已有文件。
+///
+/// dest 到这一步为止完全是模型给的一个路径，而下载走的**不是**结构化写入那条路：没有
+/// "先读再写"的下限、没有 diff、没有 checkpoint 里的旧副本。于是
+/// `download_file(url, "src/main.js")` 就是把那个文件原地换掉——无声、撤不回来，返回的
+/// 还是"已下载 N 字节"。一个笔误的 dest，或者一段诱导模型的网页内容，就够了。
+///
+/// 目录不挡：`create_dir_all` 本来就允许已存在，这里只挡真正会被顶掉的文件。
+fn refuse_existing_download_target(target: &Path) -> Result<(), String> {
+    if target.is_file() {
+        return Err(format!(
+            "{} 已经存在，没有下载——下载会把它整个换掉，而这一步没有旧内容备份、撤不回来。\
+             要替换就先 delete_path 删掉它（那一步会留 checkpoint），或者换一个目标文件名。",
+            target.display()
+        ));
+    }
+    Ok(())
+}
+
+
 /// Download a file from a URL into the workspace. `dest` is resolved relative to
 /// `root` (or absolute) and MUST stay inside `root`. Bounded to 200 MB.
 #[tauri::command]
@@ -437,6 +457,8 @@ pub async fn download_file(root: String, url: String, dest: String) -> Result<St
     if !base.as_os_str().is_empty() && !target.starts_with(base) {
         return Err("只能下载到工作区目录内".into());
     }
+
+    refuse_existing_download_target(&target)?;
 
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(120))
@@ -1455,5 +1477,32 @@ mod img_tests {
         let (text, enc) = decode_body_text(body, "text/html");
         assert!(text.contains("中文"));
         assert!(enc.contains("GB"));
+    }
+}
+
+#[cfg(test)]
+mod download_overwrite_tests {
+    use super::*;
+
+    #[test]
+    fn download_refuses_to_replace_an_existing_file() {
+        let dir = std::env::temp_dir().join("mrday-dl-guard");
+        let _ = std::fs::create_dir_all(&dir);
+        let existing = dir.join("main.js");
+        std::fs::write(&existing, "// 用户的代码").unwrap();
+
+        let err = refuse_existing_download_target(&existing).unwrap_err();
+        assert!(err.contains("已经存在"), "{err}");
+        // 报错必须说清下一步怎么办，否则模型只会换个工具再试一次同一件事。
+        assert!(err.contains("delete_path"), "{err}");
+        // 文件必须原样还在。
+        assert_eq!(std::fs::read_to_string(&existing).unwrap(), "// 用户的代码");
+
+        // 不存在的路径照旧放行——这道闸只挡覆盖，不挡下载。
+        refuse_existing_download_target(&dir.join("new.bin")).unwrap();
+        // 目录不挡：create_dir_all 本来就允许它已存在。
+        refuse_existing_download_target(&dir).unwrap();
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
