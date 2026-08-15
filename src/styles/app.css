@@ -6113,6 +6113,34 @@ img.settings-dropdown__avatar--filled { object-fit: cover; }
 [data-theme="dark"] .browser-url-card, .dark .browser-url-card {
   background: rgba(255,255,255,.04); border-color: rgba(255,255,255,.1);
 }
+/* 撞上人机验证时贴在截图下面的那条：这是要**人**动手的一步，所以按警示色处理，
+   不跟随普通 URL 卡片的低对比度。文案本身就是操作指引，不折行截断。 */
+.browser-wall-note {
+  display: flex; flex-direction: column; gap: 3px;
+  padding: 9px 12px; margin-top: -1px;
+  font-size: 11.5px; line-height: 1.45;
+  background: rgba(217,48,37,.07);
+  border: 1px solid rgba(217,48,37,.28);
+  border-top: none; border-radius: 0 0 8px 8px;
+}
+.browser-wall-note b { font-size: 12px; font-weight: 650; }
+.browser-wall-note span { opacity: .8; }
+/* 「为什么 Dock 里多了一个 Chrome」——只在浏览器刚起来那一次出现，说明性质，
+   所以压到最低存在感，别和正文抢注意力。 */
+.browser-session-note {
+  padding: 7px 12px; margin-top: -1px;
+  font-size: 11px; line-height: 1.45; opacity: .55;
+  background: rgba(128,128,128,.04);
+  border: 1px solid rgba(128,128,128,.2);
+  border-top: none; border-radius: 0 0 8px 8px;
+}
+[data-theme="dark"] .browser-session-note, .dark .browser-session-note {
+  background: rgba(255,255,255,.04); border-color: rgba(255,255,255,.1);
+}
+/* 这三种条子会叠在同一张截图下面（URL 卡 → 验证提示 → 会话说明），
+   圆角只该长在最后一条上，否则中间会出现一道断开的弧。 */
+.browser-url-card:not(:last-child),
+.browser-wall-note:not(:last-child) { border-radius: 0; }
 /* "Undo" sits inside the result pill after a write/edit — render it as a subtle
    inline action (divider + link), not a raw OS button. */
 .atc-undo-btn {
