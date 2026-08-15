@@ -23042,3 +23042,90 @@ test("换文件夹时丢弃旧 model 要先清标记，否则下次打开同一�
   assert.match(seg, /_clearAllMarkersForModel\(m\); m\.dispose\(\);/,
     "先清标记再 dispose——顺序反了等于没清");
 });
+
+// ══ find_files 必须说清「你拿到的不是全部」════════════════════════════════
+//
+// 截断发生在 out.sort() **之前**：收满 MAX 就停止遍历，然后才排序。于是模型拿到的是
+// 「DFS 碰巧先撞上的 MAX 个」，排完序看起来却像完整结果的前 MAX 个字典序。找 *.ts 时
+// 可能整个 src/ 一条没给、全是 test/ 下面的。而原来只在**无匹配**时才提"扫描没走完"。
+
+test("find_files 截断时必须说明这不是字典序的前 N 个", () => {
+  const src = extractFn("_agentFindFiles");
+  // 截断确实发生在排序之前——这是问题的根，提示语都建立在它之上。
+  // 剥注释再比位置：我自己写的那段说明里就引用了 out.sort()，不剥的话断言比的是注释。
+  const code = src.split("\n").filter((l) => !/^\s*(\/\/|\*|\/\*)/.test(l)).join("\n");
+  assert.ok(code.indexOf("out.length < MAX") < code.indexOf("out.sort()"),
+    "如果哪天改成先排序再截断，下面这些提示语就都不对了");
+  assert.match(src, /const hitLimit = out\.length >= MAX;/);
+  assert.match(src, /const scanCapped = scanned >= MAX_SCAN;/);
+  // 两种截断都要说，不能只在无匹配时说
+  assert.match(src, /if \(hitLimit\) \{[\s\S]{0,400}这不是字典序的前/);
+  assert.match(src, /if \(scanCapped\) \{[\s\S]{0,400}剩下的目录一个都没看过/);
+  // 结构化字段必须交出去——调用方不该靠嗅文本判断截断
+  assert.match(src, /truncated: hitLimit, scanCapped/);
+});
+
+test("调用方用结构化字段判断截断，不再嗅提示文本", () => {
+  // 原来是 `if (/更多结果已截断/.test(result.text))`。提示语一改这里就静默失灵，
+  // 而失灵的方向是"看起来没截断"——正好是最坏的那个。
+  assert.match(SRC, /if \(result\?\.truncated\) findTruncated = true;/);
+  assert.match(SRC, /if \(result\?\.scanCapped\) findScanCapped = true;/);
+  assert.doesNotMatch(SRC, /\/更多结果已截断\/\.test/, "还在嗅文本");
+});
+
+test("find_files 的 limit 两份目录都有——只改客户端等于没改", () => {
+  assert.match(SRC, /case "find_files": return \{ type: "find"[^}]*limit: Number\.isFinite/);
+  assert.match(SRC, /const MAX = Math\.max\(1, Math\.min\(2000, Number\(limit\)/);
+  const gw = JSON.parse(readFileSync(new URL("../../server/prompts/tools.json", import.meta.url), "utf8"));
+  const find = gw.find((t) => t?.function?.name === "find_files");
+  assert.ok(find, "网关目录里没有 find_files");
+  assert.ok(find.function.parameters.properties.limit, "网关那份没有 limit —— L0 模式下运行时以它为准");
+});
+
+// ══ 切分支不许和读文件并发 ══════════════════════════════════════════════════
+
+test("git_branch 切到另一个分支不算只读——它会把整棵工作树换掉", () => {
+  const isRo = load("_isReadOnlyParallel", {
+    _READ_ONLY_TYPES: new Set(["read", "list", "search"]),
+    _dbCallMayMutate: () => true,
+  });
+  // 列分支：只读
+  assert.equal(isRo({ type: "git", op: "branch" }), true);
+  // 切分支：带名字、create 为假 —— 原来这里返回 true，于是它和同一轮的 read_file 并发跑，
+  // 那些读拿到的是**另一个分支**的文件内容，而且读成功了、没有任何报错。
+  assert.equal(isRo({ type: "git", op: "branch", branch: "feature/x" }), false,
+    "切分支被当成只读，并发的 read_file 会读到另一个分支的内容");
+  assert.equal(isRo({ type: "git", op: "branch", branch: "feature/x", create: true }), false);
+  // 判据要和 _toolMutatesWorkspace 对齐：branch 带名字＝动工作树
+  const mutates = load("_toolMutatesWorkspace", { _mcpMutationHint: () => false, mutatesWorkspace: () => false });
+  assert.equal(mutates({ type: "git", op: "branch", branch: "feature/x" }), true);
+  assert.equal(mutates({ type: "git", op: "branch" }), false);
+  // 其余只读 op 不受影响
+  for (const op of ["status", "diff", "log", "blame", "conflicts", "stash_list"]) {
+    assert.equal(isRo({ type: "git", op }), true, op);
+  }
+  for (const op of ["commit", "push", "pull", "clone", "stash"]) {
+    assert.equal(isRo({ type: "git", op }), false, op);
+  }
+});
+
+// ══ hook 收到的工具名必须是真名 ══════════════════════════════════════════════
+
+test("hook 事件里的工具名要和模型看到的一致，mkdir 的真名是 create_dir", () => {
+  const name = load("_hookToolName");
+  // 真名在工具清单里：31079 那条 schema 写的是 create_dir，从来没有叫 mkdir 的工具。
+  assert.match(SRC, /name: "create_dir"/);
+  assert.doesNotMatch(SRC, /function: \{ name: "mkdir"/, "工具清单里并没有叫 mkdir 的工具");
+  assert.equal(name({ type: "mkdir" }), "create_dir",
+    "hook 发出去的是个查无此名的工具名：写 create_dir 的 hook 永远不触发");
+  // 其余映射不许跟着漂
+  assert.equal(name({ type: "write" }), "write_file");
+  assert.equal(name({ type: "multiedit" }), "multi_edit");
+  assert.equal(name({ type: "termtask" }), "run_cmd");
+  assert.equal(name({ type: "copy" }), "copy_path");
+  // 每个映射目标都必须是工具清单里真实存在的名字
+  for (const t of ["write", "edit", "multiedit", "cmd", "termtask", "delete", "move", "mkdir", "copy"]) {
+    const n = name({ type: t });
+    assert.ok(new RegExp(`name: "${n}"`).test(SRC), `${t} → ${n}，但清单里没有这个工具`);
+  }
+});
