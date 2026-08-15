@@ -27831,7 +27831,11 @@ async function _openBrowserPanel() {
   }
   const rows = [{ id: "", label: "自动选", path: "装了哪个用哪个（当前：" + installed[0].label + "）" }]
     .concat(installed);
-  const current = installed.some((b) => b.id === pref.browser) ? pref.browser : "";
+  // 以后端**实际生效**的那个为准，而不是 localStorage 里存的。两者会不一致：
+  // 没设选择时后端还会回落到 MICHAEL_BROWSER 环境变量，这时面板若照着 localStorage
+  // 画「自动选」，显示的就是一件没在发生的事。
+  const effective = (state && typeof state.active === "string" && state.active) || pref.browser || "";
+  const current = installed.some((b) => b.id === effective) ? effective : "";
   m.body.innerHTML =
     `<div class="bp-hint">选中的浏览器会被用来跑自动化。<b>它和你自己开的那个是两个进程</b>，Dock 里会各有一个图标——选一个跟你日常用的不同的牌子，就一眼能分清哪个是机器人在开。</div>`
     + `<div class="bp-list">` + rows.map((b) => {
