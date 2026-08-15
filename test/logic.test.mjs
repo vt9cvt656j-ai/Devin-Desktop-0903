@@ -23030,3 +23030,15 @@ test("抓包结果不把 Cookie / Authorization 的值送进模型上下文", ()
   // 非凭据头照旧原样给——那正是这个工具的用途（看 content-type、看自定义签名字段名）。
   assert.match(seg, /: \$\{h\[k\]\}`\)\.join/, "普通头不该被一起打码");
 });
+
+test("换文件夹时丢弃旧 model 要先清标记，否则下次打开同一个文件夹红线原样贴回来", () => {
+  // 标记记在 monaco 的全局表上、按 resource URI 索引，不跟着 model 一起消失。
+  // projectModels 里的是**跨文件夹存活**的那批：换回同一个文件夹时 URI 完全相同，
+  // 上一辈子的诊断就直接显示出来了——而那时候没有任何语言服务器会来覆盖它们。
+  // （函数内临时 created 的 model 不在此列：真打开文件时 LSP 会按同一个 owner 覆盖。）
+  const i = SRC.indexOf("// Drop project models from a previously opened folder.");
+  assert.ok(i > 0, "换文件夹时丢弃旧 model 的那段不见了");
+  const seg = SRC.slice(i, i + 500);
+  assert.match(seg, /_clearAllMarkersForModel\(m\); m\.dispose\(\);/,
+    "先清标记再 dispose——顺序反了等于没清");
+});
