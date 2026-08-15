@@ -23208,3 +23208,64 @@ test("二次省略必须说清「你手上比任何一句说明讲的都少」",
   assert.match(out, /两层叠加/, "没提醒工具自己那句截断说明已经不准了");
   assert.match(out, /原始结果共 6020 字/, "要给出真实的原始长度");
 });
+
+// ══ diff 卡片的「还有 N 行没显示」不能少算或不显示 ═════════════════════════
+//
+// cap 数的是渲染出来的 DOM 行，而一处修改渲染两行（- 和 +）。原来 footer 用
+// `maxLen - cap` 算剩余，于是 50 行整体重写时 rendered 撞到 cap=60 其实只走到第 30 行，
+// 而 50 - 60 = -10 → 判定 remaining <= 0 → footer 干脆不显示，用户看到半个 diff 却
+// 以为那就是全部。
+
+test("整体重写一个文件时，diff 卡片会说清还有多少行没显示", async () => {
+  const { buildDiffView } = await import("../src/agent/diff-view.js");
+  // 50 行全部改掉：每行渲染 - 和 + 两行，rendered 在第 30 行左右就撞上 cap=60
+  const oldText = Array.from({ length: 50 }, (_, i) => `old line ${i}`).join("\n");
+  const newText = Array.from({ length: 50 }, (_, i) => `new line ${i}`).join("\n");
+  const html = buildDiffView(oldText, newText, "a.js");  // 签名是 (oldText, newText, filePath)
+  const m = html.match(/… (\d+) more lines not shown …/);
+  assert.ok(m, "被截断了却没有任何提示——用户看到半个 diff 还以为是全部");
+  const remaining = Number(m[1]);
+  assert.ok(remaining > 0 && remaining < 50, `剩余行数不合理：${remaining}`);
+  // 显示出来的源行数 + 剩余 应当等于总行数
+  const shown = 50 - remaining;
+  assert.ok(shown > 0 && shown < 50, `显示了 ${shown} 行，剩 ${remaining} 行`);
+});
+
+test("没超出上限时不该凭空冒出「还有 N 行」", async () => {
+  const { buildDiffView } = await import("../src/agent/diff-view.js");
+  const oldText = "a\nb\nc";
+  const newText = "a\nB\nc";
+  const html = buildDiffView(oldText, newText, "a.js");  // 签名是 (oldText, newText, filePath)
+  assert.doesNotMatch(html, /more lines not shown/);
+});
+
+// ══ 子智能体收件箱里不许出现 [object Object] ══════════════════════════════
+
+test("共享知识广播要给人看得懂的正文，不是丢个对象过去", () => {
+  const ce = readFileSync(new URL("../src/agent/collaboration-engine.js", import.meta.url), "utf8");
+  // 写入端补上 content
+  assert.match(ce, /content: `\$\{key\}：\$\{typeof value === 'string' \? value : JSON\.stringify\(value\)\}`/);
+  // 读取端兜底：任何情况下都不该吐出 [object Object]
+  const drain = load("_drainSubAgentCollaborationInbox");
+  const store = {
+    get: () => ({
+      findings: [
+        { source: "shared_knowledge", data: { key: "k", value: { a: 1 } }, isExternal: true },
+        { source: "同伴", content: "正常的一条", isExternal: true },
+      ],
+    }),
+  };
+  const out = drain(store, "1_1", 0);
+  assert.doesNotMatch(out.message, /\[object Object\]/, "读取端没兜住对象");
+  assert.match(out.message, /正常的一条/);
+  assert.match(out.message, /"key":"k"|"a":1/, "对象要序列化成看得懂的内容，不是丢掉");
+});
+
+test("新派的子智能体拿到的是同伴**最新**的发现，不是最旧的", () => {
+  const ce = readFileSync(new URL("../src/agent/collaboration-engine.js", import.meta.url), "utf8");
+  // collectRelatedFindings 末尾按 timestamp 降序排（新的在前）
+  assert.match(ce, /return allFindings\.sort\(\(a, b\) => \(b\.timestamp \|\| 0\) - \(a\.timestamp \|\| 0\)\);/);
+  // 对降序数组取 slice(-10) 拿到的是**最旧**的 10 条——注释还写着"最新 10 条"，正好相反
+  assert.match(ce, /enhanced\.relatedFindings = relatedFindings\.slice\(0, 10\);/);
+  assert.doesNotMatch(ce, /relatedFindings\.slice\(-10\)/, "又取回最旧的那批了");
+});

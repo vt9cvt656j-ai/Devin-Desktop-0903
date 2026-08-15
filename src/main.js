@@ -40583,7 +40583,13 @@ function _drainSubAgentCollaborationInbox(store, jobId, cursor = 0, maxItems = 6
   const lines = [];
   const candidates = findings.slice(start).filter((finding) => finding?.isExternal === true).slice(-Math.max(1, maxItems));
   for (const finding of candidates) {
-    const content = String(finding?.content ?? finding?.data ?? "").replace(/\s+/g, " ").trim();
+    // `String(对象)` 是字面的 "[object Object]" —— 写入端只要漏给 content（
+    // addSharedKnowledge 就漏过），模型上下文里就会多出一行毫无信息量的垃圾。
+    // 写入端已经补上了 content，但这里也得兜住：读取端不该有任何情况下能吐出那六个字。
+    const raw = finding?.content ?? finding?.data ?? "";
+    const content = (typeof raw === "string" ? raw : (() => {
+      try { return JSON.stringify(raw); } catch { return ""; }
+    })()).replace(/\s+/g, " ").trim();
     if (!content) continue;
     const source = String(finding?.source || "同伴").replace(/\s+/g, " ").trim().slice(0, 48) || "同伴";
     const key = `${source}\0${content}`;

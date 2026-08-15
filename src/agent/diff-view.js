@@ -55,15 +55,22 @@ export function buildDiffView(oldText, newText, filePath) {
 
   const cap = 60;
   let rendered = 0;
+  // 走到哪一**源行**为止。cap 数的是渲染出来的 DOM 行，而一处修改会渲染两行（- 和 +），
+  // 上下文行也各占一行——rendered 和源行号完全不是一回事。下面的 footer 必须用这个变量
+  // 算"还剩多少行没显示"：用 cap 算会少算一半，甚至算出负数导致 footer 干脆不显示
+  // （一个 50 行整体重写的文件，rendered 撞到 cap=60 时其实只走到第 30 行，
+  //  而 maxLen - cap = -10 → 用户看到半个 diff，下面什么提示都没有）。
+  // 声明在 if/else 之外：两个分支都要写它，footer 在两个分支之后读它。
+  let stoppedAt = 0;
 
   if (isNew) {
-    for (let i = 0; i < newL.length && rendered < cap; i++, rendered++) {
+    for (let i = 0; i < newL.length && rendered < cap; i++, rendered++, stoppedAt = i) {
       h += `<div class="atc-diff-row atc-diff-row--add"><span class="atc-diff-ln">${i + 1}</span><span class="atc-diff-sign">+</span><span class="atc-diff-code" data-raw="${escapeAttr(newL[i])}">${escapeHtml(newL[i])}</span></div>`;
     }
   } else {
     const maxLen = Math.max(oldL.length, newL.length);
     let lastShown = -1;
-    for (let i = 0; i < maxLen && rendered < cap; i++) {
+    for (let i = 0; i < maxLen && rendered < cap; i++, stoppedAt = i) {
       const oLine = i < oldL.length ? oldL[i] : undefined;
       const nLine = i < newL.length ? newL[i] : undefined;
 
@@ -105,7 +112,8 @@ export function buildDiffView(oldText, newText, filePath) {
   }
 
   if (rendered >= cap) {
-    const remaining = Math.max(oldL.length, newL.length) - cap;
+    // 用真正走到的源行数算，不用 cap（见上面 stoppedAt 那段说明）。
+    const remaining = Math.max(oldL.length, newL.length) - stoppedAt;
     if (remaining > 0) h += `<div class="atc-diff-more">… ${remaining} more lines not shown …</div>`;
   }
   h += "</div>";

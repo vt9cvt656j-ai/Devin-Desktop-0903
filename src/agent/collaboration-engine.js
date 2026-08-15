@@ -223,7 +223,11 @@ class CollaborationEngine {
     
     // 添加相关 findings (来自其他协作的 jobs)
     const relatedFindings = await this.collectRelatedFindings(jobId);
-    enhanced.relatedFindings = relatedFindings.slice(-10); // 最新 10 条
+    // collectRelatedFindings 返回的是**降序**（新的在前，见它末尾的 sort）。
+    // 这里原来写 `.slice(-10)` —— 对降序数组取末尾 10 条，拿到的正是**最旧**的 10 条；
+    // main.js 那边再 `.slice(0, 6)`，于是新派的子智能体永远看到同伴最早的几条发现，
+    // 刚查出来的结论一条都进不去。注释还写着"最新 10 条"，和代码正好相反。
+    enhanced.relatedFindings = relatedFindings.slice(0, 10); // 降序数组的前 10 条 = 最新 10 条
     
     // 添加共享知识
     const sharedKnowledge = {};
@@ -518,9 +522,14 @@ class CollaborationEngine {
     
     // 广播给所有相关 jobs
     session.jobIds.forEach(jobId => {
+      // 这里原来只给 `data: { key, value }`，没有 `content`。而收件箱那边读的是
+      // `String(finding.content ?? finding.data ?? "")` —— 对一个对象求 String 就是
+      // 字面的 "[object Object]"，于是子智能体的上下文里每次广播都多出一行
+      // `· shared_knowledge: [object Object]`。占着 token，还让模型以为自己漏看了什么。
       this.store.appendFinding(jobId, {
         source: 'shared_knowledge',
         channel: 'knowledge_update',
+        content: `${key}：${typeof value === 'string' ? value : JSON.stringify(value)}`,
         data: { key, value },
         isExternal: true
       });
