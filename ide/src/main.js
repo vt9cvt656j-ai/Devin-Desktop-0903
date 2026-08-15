@@ -13481,6 +13481,35 @@ function openLoginDialog() {
 }
 
 // Gate before any AI use: require login + (active membership OR remaining credits).
+/**
+ * 第一次真正用某个自定义端点发请求时，把**代价**一次性说清楚。
+ *
+ * 不说的话，这个开关就是个陷阱：请求确实发出去了、也确实用的是用户自己的 key，但
+ * 智能体是**明显变弱**的，而且从界面上完全看不出来——
+ *   - 工具描述：正式构建会把 132 个工具的描述整段清空（约 9 万字符），走网关时由服务端
+ *     按名回填。第三方端点没有这一步，模型收到的是一批**只有名字和参数名**的工具。
+ *   - 系统提示词：完整那份在服务端（十几万字节的 Prompt Graph），客户端只有一份两千
+ *     字左右的兜底。
+ *   - 另外，长上下文压缩和「下一句预测」在自定义端点上是关闭的（前者是网关侧协议，
+ *     后者会拿网关的模型名去问用户端点，必然失败）。
+ *
+ * 这些不是这里能补的——补齐意味着把提示词和工具描述发到客户端，那是产品侧的决定。
+ * 能做也应该做的，是让用户**知情地**选择，而不是在一个看起来正常的界面下悄悄变笨。
+ *
+ * 每个端点只提醒一次（按 id 记在 localStorage），不打扰。
+ */
+const _CUSTOM_WARNED_KEY = "michael-ide.custom-endpoint.warned.v1";
+function _warnCustomEndpointOnce(custom) {
+  try {
+    const id = String(custom?.id || "");
+    if (!id) return;
+    const seen = JSON.parse(localStorage.getItem(_CUSTOM_WARNED_KEY) || "[]");
+    if (Array.isArray(seen) && seen.includes(id)) return;
+    localStorage.setItem(_CUSTOM_WARNED_KEY, JSON.stringify([...(Array.isArray(seen) ? seen : []), id]));
+    showToast("已切到你自己的端点：工具描述和完整系统提示词由服务端下发，这条路上拿不到，智能体会比走网关时弱一些；长上下文压缩与下一句预测也会关闭。", 9000);
+  } catch {}
+}
+
 async function michaelAccessGate() {
   const token = localStorage.getItem("michael_token");
   if (!token) { showToast("请先登录账号"); openLoginDialog(); return false; }
@@ -13750,10 +13779,8 @@ async function showCustomModelsDialog() {
     u = await r.json();
   } catch (_) { showToast("无法连接服务器"); return; }
   _setMichaelUserProfile(u);
-  if (!_membershipActive(u)) {
-    alert("自定义模型是会员专属功能。\n请先开通会员（或续费）后再配置自定义模型。");
-    return;
-  }
+  // 配置自定义端点不再要求会员：用自己的 key 打自己的端点，钱是用户自己的。
+    
 
   if (!document.getElementById("cm-style")) {
     const st = document.createElement("style");
@@ -14739,7 +14766,7 @@ function buildModelMenu() {
         item.addEventListener("mouseenter", hideModelInfoCard);
         item.addEventListener("click", () => {
           // 选用即验会员（权威的到期复核在每次发送前的 _readyAiConfig 里再做一次）。
-          if (!_membershipActive()) { showToast("自定义模型为会员专属，请先开通会员"); refreshMichaelUser(true); return; }
+          // 选中自定义模型不再要求会员——同上，用的是用户自己的额度。
           selectModel(cm.id, cm.group);
           closeModelMenu();
         });
@@ -18816,6 +18843,14 @@ function _approvalLabel(call) {
     // 这个框是用户**做决定**的地方，也是目前唯一告诉他"这次要干嘛"的地方——
     // 只给 服务/工具 两个名字，等于让人闭着眼睛点同意。带上服务自己写的能力说明
     // （已过 _mcpDescriptionBody 消毒；它是第三方文本，所以明说来源）。
+    case "userfolder": {
+      const d = call.userDef;
+      return {
+        title: "检索你接入的知识库？",
+        detail: `${call.userName || "?"}（目录 ${d?.folder?.path || "?"}）`
+          + (d?.source ? `\n声明来自：${d.source}` : ""),
+      };
+    }
     case "userhttp": {
       // 审批框里必须说清楚**这条声明是哪来的**：它可能来自 clone 来的仓库里的配置文件，
       // 而它能往任意 http(s) 地址发请求。只写工具名，用户无从判断该不该点同意。
@@ -20559,131 +20594,6 @@ function _designLayoutTechniques(value) {
   ].filter(([, pattern]) => pattern.test(text)).map(([name]) => name);
 }
 
-function _uiPaletteHarmonyFindings(value, designEvidence = null) {
-  const text = String(value || "");
-  const findings = [];
-  const accentFamily = "red|orange|amber|yellow|lime|green|emerald|teal|cyan|sky|blue|indigo|violet|purple|fuchsia|pink|rose";
-  const sectionTags = text.match(/<section\b[^>]{0,1600}>/gi) || [];
-  const hardCodedSections = [];
-  for (const tag of sectionTags) {
-    const tailwind = tag.match(new RegExp(`\\bbg-(${accentFamily})-(?:50|100|200|300|400|500|600|700|800|900|950)\\b`, "i"))?.[0];
-    const inline = tag.match(/background(?:Color)?\s*:\s*["'`](#[0-9a-f]{3,8}\b|oklch\([^)]{3,120}\))/i)?.[1];
-    if (tailwind || inline) hardCodedSections.push(tailwind || inline);
-  }
-  const literalSectionCss = text.match(/(?:^|[},])\s*section(?:\[[^\]]+\]|[.#:\w-])*\s*\{[^}]{0,500}background(?:-color)?\s*:\s*(?:#[0-9a-f]{3,8}\b|oklch\([^)]{3,120}\))/gim) || [];
-  if (hardCodedSections.length || literalSectionCss.length) {
-    const samples = [...hardCodedSections, ...literalSectionCss.map((item) => item.match(/(?:#[0-9a-f]{3,8}\b|oklch\([^)]{3,120}\))/i)?.[0]).filter(Boolean)];
-    findings.push(`局部配色跳变：完整 section 使用了 ${[...new Set(samples)].slice(0, 4).join("/")} 这类硬编码色带；全页区块必须引用 bg-background/bg-muted/bg-secondary/bg-accent 或已声明的 section 语义 token，禁止某一段突然发明新色相`);
-  }
-
-  const directClasses = [...text.matchAll(new RegExp(`\\b(?:bg|text|border|fill|stroke|ring|from|via|to)-(${accentFamily})-(?:50|100|200|300|400|500|600|700|800|900|950)\\b`, "gi"))];
-  const sourceFamilies = new Set(directClasses.map((match) => match[1].toLowerCase()));
-  if (sourceFamilies.size > 2) {
-    findings.push(`强调色族失控：业务组件直接使用了 ${[...sourceFamilies].join("/")} ${sourceFamilies.size} 个 Tailwind 彩色色族；选定一个主强调族和至多一个有明确角色的辅助族，其余收回语义 token`);
-  }
-  const evidenceFamilies = new Set((Array.isArray(designEvidence?.tailwindPaletteTokens) ? designEvidence.tailwindPaletteTokens : [])
-    .map((token) => String(token).toLowerCase().match(new RegExp(`^(${accentFamily})-`))?.[1]).filter(Boolean));
-  if (evidenceFamilies.size && evidenceFamilies.size <= 2) {
-    const unexpected = [...sourceFamilies].filter((family) => !evidenceFamilies.has(family));
-    if (unexpected.length) findings.push(`知识库色板外出现陌生色族：${unexpected.join("/")} 不属于本轮 michael-design 选定的 ${[...evidenceFamilies].join("/")}；除真实 success/warning/destructive 状态外不得用于装饰、图标或整段背景`);
-  }
-  return findings;
-}
-
-function _cardGridLayoutFindings(value) {
-  const text = String(value || "");
-  const findings = [];
-  const collections = [];
-  const declaration = /\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*(?::[^=;\n]+)?=\s*\[/gi;
-  let match;
-  while ((match = declaration.exec(text))) {
-    if (!/(?:cards?|items?|features?|projects?|games?|products?|plans?|testimonials?|members?|entries?|stories?|services?)$/i.test(match[1])) continue;
-    let squareDepth = 1;
-    let braceDepth = 0;
-    let parenDepth = 0;
-    let count = 0;
-    let index = declaration.lastIndex;
-    for (; index < text.length && squareDepth > 0; index++) {
-      const char = text[index];
-      const next = text[index + 1];
-      if (char === "'" || char === '"' || char === "`") {
-        const quote = char;
-        for (index++; index < text.length; index++) {
-          if (text[index] === "\\") index++;
-          else if (text[index] === quote) break;
-        }
-        continue;
-      }
-      if (char === "/" && next === "/") {
-        index = text.indexOf("\n", index + 2);
-        if (index < 0) index = text.length;
-        continue;
-      }
-      if (char === "/" && next === "*") {
-        const end = text.indexOf("*/", index + 2);
-        index = end < 0 ? text.length : end + 1;
-        continue;
-      }
-      if (char === "[" ) squareDepth++;
-      else if (char === "]") squareDepth--;
-      else if (char === "(" ) parenDepth++;
-      else if (char === ")") parenDepth = Math.max(0, parenDepth - 1);
-      else if (char === "{") {
-        if (squareDepth === 1 && braceDepth === 0 && parenDepth === 0) count++;
-        braceDepth++;
-      } else if (char === "}") braceDepth = Math.max(0, braceDepth - 1);
-    }
-    declaration.lastIndex = Math.max(declaration.lastIndex, index);
-    if (count >= 2) collections.push({ name: match[1], count });
-  }
-
-  for (const collection of collections) {
-    const usage = new RegExp(`\\b${collection.name.replace(/[$]/g, "\\$")}\\s*\\.\\s*map\\s*\\(`, "g").exec(text);
-    if (!usage) continue;
-    const prefix = text.slice(Math.max(0, usage.index - 1800), usage.index);
-    const classValues = [...prefix.matchAll(/class(?:Name)?\s*=\s*(?:["']([^"']*)["']|\{`([^`]*)`\})/gi)]
-      .map((classMatch) => classMatch[1] || classMatch[2] || "").filter((classes) => /(?:^|\s)grid(?:\s|$)/.test(classes));
-    const classes = classValues.at(-1) || "";
-    const columns = [...classes.matchAll(/(?:(sm|md|lg|xl|2xl):)?grid-cols-(\d+)/g)]
-      .map((columnMatch) => ({ rank: ["", "sm", "md", "lg", "xl", "2xl"].indexOf(columnMatch[1] || ""), count: Number(columnMatch[2]) }))
-      .sort((a, b) => a.rank - b.rank).at(-1)?.count || 0;
-    if (columns < 2) continue;
-    const remainder = collection.count % columns;
-    const context = text.slice(Math.max(0, usage.index - 1200), Math.min(text.length, usage.index + 1800));
-    const balancesLastRow = /(?:last:(?:col-span|col-start|justify-self)|nth-last-child|\blength\s*-\s*1\b|\bindex\s*(?:===|==)\s*(?:\d+|[^?\n]+\.length\s*-\s*1)|(?:md|lg|xl):col-start-|grid-column\s*:|place-content-center)/i.test(context);
-    if ((collection.count < columns || remainder) && !balancesLastRow) {
-      const detail = collection.count < columns ? `${columns} 列只放 ${collection.count} 张` : `${collection.count} 张按 ${columns} 列会留下 ${remainder} 张孤立末行`;
-      findings.push(`卡片数量与网格不匹配：${collection.name} ${detail}；按实际数量改成等分网格、3+2/4+3 居中末行、主卡跨列或 auto-fit/minmax，不能让最后一张单独掉到左下角`);
-    }
-  }
-  return [...new Set(findings)];
-}
-
-function _semanticIconFindings(value) {
-  const text = String(value || "");
-  const genericUsage = /<\s*(Sparkles|WandSparkles|Wand2|Stars|BadgeSparkles)\b|\bicon\s*:\s*(Sparkles|WandSparkles|Wand2|Stars|BadgeSparkles)\b/gi;
-  const rules = [
-    { label: "AI/智能体", concept: /(?:\bAI\b|artificial\s+intelligence|copilot|assistant|agent|人工智能|智能体|机器人)/i, icon: /\b(?:Bot|Robot|Cpu|CircuitBoard|MessageSquareCode)\b/ },
-    { label: "邮件/订阅", concept: /(?:newsletter|subscribe|subscription|inbox|weekly\s+drop|dispatch|邮件|邮箱|订阅|周报)/i, icon: /\b(?:Mail|Inbox|Newspaper|Rss|Send|MailPlus)\b/ },
-    { label: "自动化/工作流", concept: /(?:automation|workflow|pipeline|自动化|工作流|流程)/i, icon: /\b(?:Workflow|GitBranch|Waypoints|ListChecks)\b/ },
-    { label: "安全/隐私", concept: /(?:security|secure|privacy|permission|安全|隐私|权限)/i, icon: /\b(?:Shield|ShieldCheck|Lock|KeyRound|Fingerprint)\b/ },
-    { label: "分析/数据", concept: /(?:analytics|insight|metric|report|分析|洞察|指标|报表)/i, icon: /\b(?:ChartNoAxesCombined|ChartColumn|ChartLine|Gauge|Activity)\b/ },
-    { label: "社区/成员", concept: /(?:community|member|team|people|社区|成员|团队|用户群)/i, icon: /\b(?:Users|MessagesSquare|UserRoundCheck)\b/ },
-    { label: "游戏/玩法", concept: /(?:game|gaming|player|quest|游戏|玩家|玩法)/i, icon: /\b(?:Gamepad2|Joystick|Trophy|Swords)\b/ },
-  ];
-  const findings = [];
-  let usage;
-  while ((usage = genericUsage.exec(text))) {
-    const iconName = usage[1] || usage[2];
-    const nearby = text.slice(Math.max(0, usage.index - 700), Math.min(text.length, usage.index + 700));
-    const rule = rules.find((candidate) => candidate.concept.test(nearby));
-    if (rule) {
-      findings.push(`图标语义不匹配：${rule.label} 内容使用了通用 ${iconName}；先理解对象/动作/状态，再选对应 Lucide/Iconify 图标（例如 AI→Bot/Robot，订阅→Mail/Inbox），不要用 Sparkles/Wand 作为万能 AI 图标`);
-    }
-  }
-  return [...new Set(findings)];
-}
-
 function _michaelDesignResearchTracks(query, content = "") {
   // Coverage is evidence about what the knowledge base returned, not what we
   // asked it to return. Including the query here made every carefully-worded
@@ -20815,74 +20725,6 @@ function _michaelDesignResearchGaps(profile, evidence = null) {
   const queryRounds = Array.isArray(evidence.researchQueries) ? evidence.researchQueries.length : 0;
   if (queryRounds < 3) gaps.push("三轨分主题检索（结构配色组件 + 动效响应式 + 媒体图标）");
   return [...new Set(gaps)];
-}
-
-function _uiVisualRichnessFindings(value, profile = null) {
-  profile = profile || {};
-  const text = String(value || "");
-  const findings = [];
-  const isChromaticColor = (value) => {
-    const raw = String(value || "").trim().toLowerCase();
-    const hex = raw.match(/#([0-9a-f]{3}|[0-9a-f]{6})\b/i)?.[1];
-    if (hex) {
-      const expanded = hex.length === 3 ? [...hex].map((char) => char + char).join("") : hex;
-      const channels = [0, 2, 4].map((index) => parseInt(expanded.slice(index, index + 2), 16));
-      return Math.max(...channels) - Math.min(...channels) >= 24;
-    }
-    const oklch = raw.match(/oklch\(\s*[\d.]+(?:%\s*)?\s+([\d.]+)/i);
-    if (oklch) return Number(oklch[1]) >= 0.035;
-    const rgb = raw.match(/rgba?\(\s*([\d.]+)[,\s]+([\d.]+)[,\s]+([\d.]+)/i);
-    if (rgb) {
-      const channels = rgb.slice(1, 4).map(Number);
-      return Math.max(...channels) - Math.min(...channels) >= 24;
-    }
-    const hsl = raw.match(/hsla?\([^,\s]+[,\s]+([\d.]+)%/i);
-    return !!hsl && Number(hsl[1]) >= 12;
-  };
-
-  const roleValues = [...text.matchAll(/--(?:color-)?(?:primary|secondary|accent|brand)(?:-\d+)?\s*:\s*([^;}\n]+)/gi)]
-    .map((match) => match[1]);
-  const directAccentFamilies = text.match(/\b(?:bg|text|border|ring|fill|stroke|from|via|to)-(?:red|orange|amber|yellow|lime|green|emerald|teal|cyan|sky|blue|indigo|violet|purple|fuchsia|pink|rose)-(?:50|100|200|300|400|500|600|700|800|900|950)\b/gi) || [];
-  const hasChromaticAccent = roleValues.some(isChromaticColor) || directAccentFamilies.length > 0;
-  if (!profile.monochromeThemeRequested && !hasChromaticAccent) {
-    findings.push("品牌色消失：页面只有中性黑白/灰阶，primary/secondary/accent 没有任何可识别色相；配色统一不等于单色线框，必须从 michael-design 命中配色保留一个真实品牌强调色并映射到项目现有主题机制");
-  }
-
-  const semanticAccentUses = [...text.matchAll(/\b(bg|text|border|ring|fill|stroke|from|via|to)-(primary|secondary|accent)(?!-foreground)(?:\/[\d.]+)?\b/gi)];
-  const cssAccentUses = [...text.matchAll(/\b(background(?:-color)?|color|border-color|box-shadow)\s*:\s*[^;}\n]{0,120}var\(--(?:color-)?(?:primary|secondary|accent)\)/gi)];
-  const accentKinds = new Set([
-    ...semanticAccentUses.map((match) => match[1].toLowerCase()),
-    ...cssAccentUses.map((match) => match[1].toLowerCase()),
-  ]);
-  if (!profile.monochromeThemeRequested && (semanticAccentUses.length + cssAccentUses.length < 3 || accentKinds.size < 2)) {
-    findings.push("主色利用不足：品牌色不能只定义在 token 里或只出现一次；至少让它承担两类以上真实角色，例如主 CTA、重点卡片/标签底色、选中态、链接/图标、边框或焦点环，并使用同色阶而不是新增色相");
-  }
-
-  const cardBlocks = [];
-  const classAttribute = /<([A-Za-z][\w.]*)\b[^>]{0,700}\bclass(?:Name)?\s*=\s*(?:"([^"]*)"|'([^']*)'|\{([^}]*)\})[^>]*>/gi;
-  let classMatch;
-  while ((classMatch = classAttribute.exec(text))) {
-    const tag = classMatch[1];
-    const classes = classMatch[2] || classMatch[3] || classMatch[4] || "";
-    const namedCard = /(?:Card|card|panel|tile|feature|step|item)/i.test(`${tag} ${classes}`);
-    const shapedCard = /(?:^|\s)rounded(?:-|\s)/i.test(classes)
-      && /(?:^|\s)(?:p[xytrbl]?-[\w[\]./-]+|border(?:-|\s)|bg-(?:card|muted|secondary|accent|primary))/i.test(classes);
-    if (namedCard || shapedCard || /(?:^|\.)article$/i.test(tag)) cardBlocks.push(classes);
-  }
-  const mappedCards = /\.map\s*\(\s*(?:\([^)]*\)|[\w$]+)\s*=>[\s\S]{0,900}<(?:Card|article|motion\.(?:div|article)|div)\b/i.test(text);
-  if (cardBlocks.length >= 3 || mappedCards) {
-    const cardClasses = cardBlocks.join(" ");
-    const treatmentLayers = [
-      /\bbg-(?:card|muted|secondary|accent|primary)(?:\/[\d.]+)?\b/i,
-      /\b(?:shadow-(?!none)|shadow-\[|backdrop-blur|backdrop-saturate|inset-shadow)\b/i,
-      /\b(?:bg-primary\/|bg-accent\/|bg-secondary\/|border-primary|ring-primary|text-primary|from-primary|to-primary)\b/i,
-      /(?:hover:[^\s"']*(?:shadow|translate|scale|border-primary)|whileHover|group-hover:)/i,
-    ].filter((pattern) => pattern.test(cardClasses)).length;
-    if (treatmentLayers < 2) {
-      findings.push("卡片视觉层级不足：重复卡片几乎只有透明/同色背景加细边框，已经退化成线框图；从知识库采用 surface 阶梯，并至少组合背景 tone、柔和 elevation/内高光、品牌色 tint/重点卡、媒体或克制 hover 中的两层，不能所有卡片同一种空框");
-    }
-  }
-  return findings;
 }
 
 function _michaelDesignEvidenceFromResult(call, result) {
@@ -23973,8 +23815,20 @@ async function _readyAiConfig(overrideConfig = null) {
       requestId: "",
     };
   }
-  // Require login + active membership or credits before any AI call.
-  if (!(await michaelAccessGate())) return null;
+  // 本轮到底走网关还是走用户自己的端点，**先判这一件事**——它决定后面每一道门该不该拦。
+  //
+  // 以前的顺序是：先过会员门 → 再校验网关 baseUrl/apiKey/model → 最后才把自定义端点
+  // 覆写进去。于是「用自己的 key 打自己的端点」也必须先登录本产品、账上还得有钱，而且
+  // 校验的是一组本轮根本不会用到的网关字段。顺序反了，门就拦错了对象。
+  const _preCfg = overrideConfig || loadConfig();
+  const _customPre = _customModelById(_preCfg?.model);
+  // 走自己的端点时不再要求会员/额度：钱是他自己的。仍然尽力刷一次账号信息（拿得到
+  // 更好，拿不到也不拦），因为界面别处要显示它。
+  if (!_customPre) {
+    if (!(await michaelAccessGate())) return null;
+  } else {
+    try { void refreshMichaelUser(false); } catch {}
+  }
   if (!MODEL_GROUPS.length) await loadBackendModels();
   await _ensureGatewayModelSelected();
   const _rawCfg = overrideConfig || loadConfig();
@@ -23984,28 +23838,27 @@ async function _readyAiConfig(overrideConfig = null) {
   _activeThinkEffort = config.thinkingEffort || config.reasoningEffort || (config.thinkingBudget ? "high" : "off");
   _lastReasoningTok = 0; // reset; gets filled when the model reports reasoning tokens
   _lastThinkChars = 0;
-  if (!config.baseUrl || !config.apiKey) {
-    showToast("请先登录账号");
-    openLoginDialog();
-    return null;
-  }
-  if (!config.model) {
-    showToast("网关模型列表暂不可用，请稍后再试");
-    return null;
-  }
-  // 自定义模型（会员专属）：只覆写**本轮**config 的接入点，存储配置仍指向网关。
-  // michaelAccessGate 刚用最新 /api/me 刷新过 _michaelUser，这里的到期判定是权威的：
-  // 会员过期立刻拦下，不让请求发向自定义端点。
+  // 自定义端点：只覆写**本轮** config 的接入点，存储配置仍指向网关。
+  // 覆写放在下面那两道校验**之前**——否则校验的是一组本轮根本不会用到的网关字段，
+  // 一个只用自己端点的用户会被「请先登录账号」拦住，而他压根不需要登录。
   const _custom = _customModelById(config.model);
   if (_custom) {
-    if (!_membershipActive()) {
-      alert("自定义模型是会员专属功能，你的会员已到期或未开通。\n续费后可继续使用，或切回网关模型。");
-      return null;
-    }
     config.baseUrl = _custom.baseUrl;
     config.apiKey = _custom.apiKey;
     config.model = _custom.name;
-    config.customModelId = _custom.id; // 关掉 L0 注入与压缩前缀（第三方端点不认识）
+    // 这个字段不能省：思考档位偏好按它绑回 `custom:` 选择器 id，删了每轮会读错档位。
+    // 它同时也是「不发网关注入头」的判据——第三方端点确实不该指望网关注入。
+    config.customModelId = _custom.id;
+    _warnCustomEndpointOnce(_custom);
+  }
+  if (!config.baseUrl || !config.apiKey) {
+    showToast(_custom ? "这个自定义模型缺少接入地址或 API key，请在模型设置里补全" : "请先登录账号");
+    if (!_custom) openLoginDialog();
+    return null;
+  }
+  if (!config.model) {
+    showToast(_custom ? "这个自定义模型没有填模型名" : "网关模型列表暂不可用，请稍后再试");
+    return null;
   }
   return config;
 }
@@ -31211,7 +31064,7 @@ function _buildAgentToolSchemas(includeWrite, mcpTools = []) {
     { type: "function", function: { name: "search", description: "Locate text inside a single file or directory when the position is unknown, returning matching lines with context. When the target file is known, read_file directly; after a hit, read the target source to confirm the full context — never edit from a fragment alone. Defaults to literal; use regex only when you genuinely need pattern matching.", parameters: { type: "object", properties: { query: { type: "string", description: "Text to search for (regex supported, e.g. \"function\\s+login\")" }, path: { type: "string", description: "Optional, restrict to a single file or subdirectory (e.g. \"src/auth.ts\" or \"src/\")" }, mode: { type: "string", enum: ["literal", "regex"], description: "Match mode, default literal" }, case_sensitive: { type: "boolean", description: "Whether to match case, default false" } }, required: ["query"] } } },
     { type: "function", function: { name: "find_files", description: "Find files by name or glob pattern — *.rs, main.js, src/**/*.ts — or just a substring of the filename. 【vs alternatives】Search by content with search; find a symbol's definition with find_symbol; when you know the exact path, read_file directly.", parameters: { type: "object", properties: { pattern: { type: "string", description: "Filename or glob pattern" } }, required: ["pattern"] } } },
     { type: "function", function: { name: "web_search", description: "General web-search fallback (the current desktop backend tries Google, Bing and DuckDuckGo in parallel and merges whatever actually comes back), returning a list of titles, URLs and snippets. Prefer tools closer to the question — the existing knowledge base, structured live sources, specialist databases, official documentation, package registries, GitHub and developer communities; use web_search only when no dedicated source applies or you need supplementary general-web evidence. Search snippets are only leads: read the original with web_fetch for any key conclusion and weigh it by source credibility — never treat a snippet, or this round's retrieved_at, as a current fact.", parameters: { type: "object", properties: { query: { type: "string", description: "Search keywords (English is often more precise)" } }, required: ["query"] } } },
-    { type: "function", function: { name: "web_fetch", description: "Fetch a public web page and return its body text — for reading pages found by web_search, online documentation, API references, error messages and so on. Only public http/https addresses are supported (local and intranet ones are rejected). 【vs alternatives】To find a page use web_search; to call an API, send headers, or POST, use http_request.", parameters: { type: "object", properties: { url: { type: "string", description: "The full http/https URL" } }, required: ["url"] } } },
+    { type: "function", function: { name: "web_fetch", description: "Fetch a public web page and return its body text — for reading pages found by web_search, online documentation, API references, error messages and so on. http/https only. Intranet and localhost addresses ARE reachable — an internal wiki, a private docs site or a dev server on this machine can all be fetched; only link-local / cloud-metadata addresses (169.254.x.x) are refused. 【vs alternatives】To find a page use web_search; to call an API, send headers, or POST, use http_request.", parameters: { type: "object", properties: { url: { type: "string", description: "The full http/https URL" } }, required: ["url"] } } },
     { type: "function", function: { name: "local_discovery", description: "Look up places to eat, sights, venues and similar information near a location: addresses are resolved with Nominatim first, falling back to ArcGIS World Geocoding only when that is not acceptable; POIs come from OpenStreetMap Overpass, weather from Open-Meteo, and Wikipedia GeoSearch supplies nearby background only. distance_m is the Haversine straight-line distance, not a route distance or travel time. source_statuses[].status=success only means that endpoint responded successfully this time and the result parsed; it does not prove the data is complete, correct, fresh or live. The top-level retrieved_at is when the IDE finished this request, not when the map, POI, address or encyclopedia data was updated; source_statuses[].data_as_of, when present, is only the dataset/snapshot time the provider exposes, not a per-venue verification time; weather.observed_at is the observation time the provider reports. OSM POIs and raw opening_hours are only what the data source recorded — they do not prove a venue still exists or is open now, and a missing rating, price or open_now must stay unknown. These public endpoints may rate-limit and carry no application SLA. near=current requires coordinates obtained with the user's permission — never infer the location from a timezone or IP address.", parameters: { type: "object", properties: { query: { type: "string", minLength: 1, description: "What you are looking for, e.g. local breakfast, Sichuan food, museum, family activity" }, near: { type: "string", minLength: 1, description: "A city, address or district; for the current location pass current (the IDE will try to request location permission once)" }, latitude: { type: "number", minimum: -90, maximum: 90, description: "Latitude obtained with the user's permission; pass together with longitude" }, longitude: { type: "number", minimum: -180, maximum: 180, description: "Longitude obtained with the user's permission; pass together with latitude" }, radius_m: { type: "integer", minimum: 100, maximum: 20000, description: "Search radius in metres, default 3000" }, limit: { type: "integer", minimum: 1, maximum: 30, description: "Maximum number of places to return, default 12" }, language: { type: "string", description: "Language for Wikipedia and geocoding, e.g. zh, en, ja" } }, required: ["query"], anyOf: [{ required: ["near"] }, { required: ["latitude", "longitude"] }] } } },
     { type: "function", function: { name: "live_environment", description: "Query structured public environment and hazard sources that need no API key: Open-Meteo weather / air quality / marine, USGS earthquakes, NASA EONET natural events. Each call returns records, per-source success/empty/failed, data_as_of, retrieved_at and the applicable limits. Open-Meteo is a time-stamped gridded model estimate and must not be described as an on-site sensor measurement; an empty result likewise does not mean there is no risk. weather/air_quality/marine require coordinates the user gave explicitly or authorized you to obtain — never infer a location from IP address or timezone.", parameters: { type: "object", properties: { kind: { type: "string", enum: ["weather", "air_quality", "marine", "earthquakes", "natural_hazards"] }, latitude: { type: "number", minimum: -90, maximum: 90 }, longitude: { type: "number", minimum: -180, maximum: 180 }, radius_km: { type: "integer", minimum: 1, maximum: 20000, description: "Optional radius for earthquakes" }, window: { type: "string", enum: ["hour", "day", "week", "month"], description: "Time window for earthquakes" }, minimum_magnitude: { type: "number", minimum: -1, maximum: 10 }, category: { type: "string", description: "NASA EONET category id, e.g. wildfires" }, limit: { type: "integer", minimum: 1, maximum: 50 } }, required: ["kind"], anyOf: [{ properties: { kind: { enum: ["weather", "air_quality", "marine"] } }, required: ["latitude", "longitude"] }, { properties: { kind: { enum: ["earthquakes", "natural_hazards"] } } }] } } },
     { type: "function", function: { name: "performance_profile", description: "Analyse a front-end page's performance metrics and produce a report. It drives the browser to inject the Performance API for timing data and pairs that with screenshots to confirm the page's state. Good for tracking down slow loads and render jank. 【When to use】When a page stutters or loads slowly, run this first to get real timing data and locate the bottleneck — do not read the code and guess \"it is probably rendering\".", parameters: { type: "object", properties: { url: { type: "string", description: "Target page URL (must start with http://localhost or http://127.0.0.1)" }, metrics: { type: "string", enum: ["cpu", "memory", "both"], description: "What to monitor: cpu = CPU usage, memory = memory usage, both = both", default: "both" }, timeoutSeconds: { type: "number", description: "Timeout in seconds, default 30", default: 30 } }, required: ["url"] } } },
@@ -32515,7 +32368,10 @@ function _mapToolCall(name, args, mcpToolMap = _mcpToolMap) {
   if (typeof name === "string" && name.startsWith(USER_TOOL_PREFIX)) {
     const short = userToolShortName(name);
     const def = _userCapabilities().tools.find((t) => t.name === short) || null;
-    return { type: "userhttp", userName: short, userDef: def, userReadOnly: !!def?.readOnly, args };
+    // kind 决定走哪条执行路：http 发请求，folder 在目录里检索。**只有这一处按 kind 分叉**，
+    // 加第三种 kind 也只加一个分支，不是一个能力一个 case。
+    const type = def?.kind === "folder" ? "userfolder" : "userhttp";
+    return { type, userName: short, userDef: def, userReadOnly: !!def?.readOnly, args };
   }
   if (typeof name === "string" && name.startsWith("mcp__")) {
     const m = mcpToolMap?.get(name);
@@ -51290,6 +51146,43 @@ async function _executeToolStepInner(step, call, root, run) {
       try { closeTermTab(idx); } catch (e) { res.className = "atc-result atc-result--err"; res.textContent = "停止失败"; return { type: "termstop", path: lbl, content: `[失败] 停止终端出错: ${e?.message || e}` }; }
       res.className = "atc-result atc-result--ok"; res.textContent = "已停止";
       return { type: "termstop", path: lbl, content: `已停止任务终端「${lbl}」（进程已结束）。` };
+
+    } else if (call.type === "userfolder") {
+      // 用户接进来的知识库：在他指定的目录里检索。复用后端已有的 search_in_project，
+      // 它本来就收任意 root——所以 Rust 一行都不用改。
+      if (!inTauri) { res.className = "atc-result atc-result--err"; res.textContent = "桌面专用"; return { type: "knowledge", path: call.userName || "", content: "[不可用] 本地知识库检索只能在桌面 App 里用。" }; }
+      const def = call.userDef;
+      if (!def) { res.className = "atc-result atc-result--err"; res.textContent = "声明已不在"; return { type: "knowledge", path: call.userName || "", content: `[失败] 找不到名为「${call.userName || "?"}」的知识库声明——多半是配置刚被改过或删掉了。` }; }
+      const q = String(call.args?.query || "").trim();
+      if (!q) { res.className = "atc-result atc-result--err"; res.textContent = "缺 query"; return { type: "knowledge", path: def.name, content: "[ERROR] 知识库检索需要 query。" }; }
+      // `~` 是用户会自然写下的写法，后端不认，在这里展开。
+      let dir = String(def.folder?.path || "");
+      if (dir.startsWith("~")) {
+        try { dir = String((await backend.homeDir?.()) || "").replace(/\/+$/, "") + dir.slice(1); } catch {}
+      }
+      try {
+        const hits = await backend.invoke("search_in_project", { root: dir, query: q, caseSensitive: false, mode: "text" });
+        const files = Array.isArray(hits) ? hits : [];
+        const total = files.reduce((n, f) => n + (f?.matches?.length || 0), 0);
+        res.className = total ? "atc-result atc-result--ok" : "atc-result atc-result--err";
+        res.textContent = total ? `${total} 处` : "没找到";
+        const lines = [];
+        for (const f of files.slice(0, 20)) {
+          for (const m of (f.matches || []).slice(0, 5)) {
+            lines.push(`${f.path}:${m.line ?? "?"}  ${String(m.text || "").trim().slice(0, 200)}`);
+          }
+        }
+        if (vp) vp.innerHTML = `<pre>${_escHtml(lines.slice(0, 40).join("\n") || "（没有命中）")}</pre>`;
+        return {
+          type: "knowledge", path: def.name, ok: total > 0,
+          content: total
+            ? `知识库「${def.name}」检索「${q}」，命中 ${total} 处（目录 ${dir}）：\n${lines.slice(0, 40).join("\n")}`
+            : `知识库「${def.name}」里没有找到「${q}」（目录 ${dir}）。换个说法再试一次，或者确认这份资料确实在这个库里。`,
+        };
+      } catch (e) {
+        res.className = "atc-result atc-result--err"; res.textContent = "检索失败";
+        return { type: "knowledge", path: def.name, content: `[失败] 知识库「${def.name}」检索出错：${String(e?.message || e).slice(0, 200)}（确认目录 ${dir} 存在且可读）` };
+      }
 
     } else if (call.type === "http" || call.type === "userhttp") {
       // 用户自己声明的能力：在这里把声明 + 模型给的参数合成一次真实请求，然后**原样走

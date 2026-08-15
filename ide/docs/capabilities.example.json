@@ -46,6 +46,23 @@
       }
     ],
 
+    "knowledge": [
+      {
+        "name": "team_docs",
+        "description": "团队文档库（本地目录，按内容检索）。查内部规范、部署流程、历史决策时用它。",
+        "path": "~/work/team-docs"
+      }
+    ],
+
+    "roles": [
+      {
+        "name": "data",
+        "prompt": "你是数据工程专家：动手之前先看清表结构、数据量级和上下游依赖；改动要能回滚。",
+        "tools": ["db_query", "http_request"],
+        "types": ["db", "http"]
+      }
+    ],
+
     "commands": [
       {
         "cmd": "review",
@@ -68,6 +85,8 @@
 
   "_要点": [
     "写的是**工具名**（generate_image），不是内部类型名。工具名就是模型看到的那个名字。",
+    "knowledge 里每一项会变成一个可检索的工具，模型据 description 决定该不该来这里查。",
+    "roles 里的角色带自己的提示词和工具矩阵；工具名写错的那一件会被挡掉，角色本身照常生效。",
     "${ACME_TOKEN} 这种取自你的 shell 环境变量——密钥不用写进这个文件。",
     "{query} 这种是模型填的参数，拼进 URL 时会自动做 URL 编码。",
     "GET / HEAD 默认算只读，所以 Plan、Explorer 这些只读模式里也能用它查东西；POST 这类照旧挡住。",

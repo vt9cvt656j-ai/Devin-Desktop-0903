@@ -65,6 +65,8 @@ test("approval set matches the pre-refactor literal exactly", () => {
     // 新增：用户自己声明接进来的 HTTP 能力。它能往任意 http(s) 地址发请求，而声明可能
     // 来自 clone 来的仓库，所以和 mcp 同级——一律要审批。
     "userhttp",
+    // 新增：用户接进来的本地知识库检索。读的是用户机器上的目录，所以要审批。
+    "userfolder",
   ])));
 });
 
