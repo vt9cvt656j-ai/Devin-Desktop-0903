@@ -27,33 +27,58 @@
 # 顺带公证（用户下载后不会被 Gatekeeper 拦），再多给三个：
 #   APPLE_ID / APPLE_PASSWORD（App 专用密码）/ APPLE_TEAM_ID
 #
-# 查本机有哪些可用身份：
-#   security find-identity -v -p codesigning
+# 查本机有哪些签名身份（**不要加 -v**，理由见下面 resolve 那段）：
+#   security find-identity -p codesigning
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
+# 身份从哪来：环境变量优先，其次读 tauri.conf.json 里已经配好的那个。
+#
+# 原来这里是「没设 APPLE_SIGNING_IDENTITY 就拒绝构建」，理由写着「直接跑 tauri build
+# 会用 ad-hoc 签名（配置里是 signingIdentity: "-"）」。**那个前提已经过时**——配置里
+# 现在写的是 "Mr Day One Local Signing"，普通构建早就是正经证书签名的了。于是这个脚本
+# 会对着一个配置齐全、能签、也一直在签的项目说「拒绝构建」。
+if [ -z "${APPLE_SIGNING_IDENTITY:-}" ]; then
+  APPLE_SIGNING_IDENTITY="$(python3 -c 'import json,sys
+try:
+    d=json.load(open("src-tauri/tauri.conf.json"))
+    v=d.get("bundle",{}).get("macOS",{}).get("signingIdentity") or ""
+except Exception:
+    v=""
+print("" if v.strip() in ("","-") else v)' 2>/dev/null || true)"
+  [ -n "$APPLE_SIGNING_IDENTITY" ] && echo "签名身份取自 tauri.conf.json：$APPLE_SIGNING_IDENTITY"
+fi
+
 if [ -z "${APPLE_SIGNING_IDENTITY:-}" ]; then
   cat >&2 <<'MSG'
-未设置 APPLE_SIGNING_IDENTITY，拒绝构建。
+没有可用的代码签名身份（环境变量没设，tauri.conf.json 里也是 ad-hoc "-"），拒绝构建。
 
-直接跑 `npm run tauri build` 会用 ad-hoc 签名，那样每发一版用户的隐私授权都会失效，
-而且系统设置里的开关还照样亮着——这正是要根治的问题，不应该被无声地绕过。
+ad-hoc 签名拿不出证书，系统只能用 cdhash 当指定要求——每发一版 cdhash 就变一次，
+用户之前授的隐私权限当场作废，而系统设置里的开关还照样亮着。这正是要根治的问题。
 
-本机可用的签名身份：
+本机现有的签名身份（**故意不加 -v**：项目用的是自签证书，它一定带
+CSSMERR_TP_NOT_TRUSTED 而被 -v 过滤掉——那个标记只说明「验证这张证书的链不受信任」，
+**不影响用它签名**，实测每次构建都签成功）：
 MSG
-  security find-identity -v -p codesigning >&2 || true
+  security find-identity -p codesigning >&2 || true
   cat >&2 <<'MSG'
 
-一个都没有的话，先跑一次：
+一个都没有的话，跑一次（它是幂等的，证书已存在会直接退出，不会造出第二张）：
 
     ./scripts/setup-signing-cert.sh
 
-它会造一张自签的代码签名证书。**对权限来说自签就够了**——签名要求嵌在二进制里，
-换台机器一样成立，所有用户都受益（实测：同一张证书签两个内容不同的二进制，指定
-要求逐字节相同）。它不解决的只有 Gatekeeper：别人下载后首次打开要右键「打开」。
-要连这个也免掉，才需要 Apple 开发者证书（$99/年）做公证，那时把
-APPLE_SIGNING_IDENTITY 换成 Developer ID 即可，本脚本不用改。
+自签对权限来说就够了——签名要求嵌在二进制里，换台机器一样成立。它不解决的只有
+Gatekeeper：别人下载后首次打开要右键「打开」。要连这个也免掉，才需要 Apple 开发者
+证书（$99/年）做公证，那时把 APPLE_SIGNING_IDENTITY 换成 Developer ID 即可。
 MSG
+  exit 1
+fi
+
+# 身份得真的能用来签，而不只是名字对得上。私钥不在（只导入了证书没导入私钥）时，
+# codesign 会在构建**最后一步**才失败——那时几分钟的编译已经白烧了。这里先花 0.1 秒问一句。
+if ! security find-identity -p codesigning 2>/dev/null | grep -qF "$APPLE_SIGNING_IDENTITY"; then
+  echo "钥匙串里找不到签名身份「$APPLE_SIGNING_IDENTITY」——先确认证书和私钥都在 login 钥匙串里。" >&2
+  security find-identity -p codesigning >&2 || true
   exit 1
 fi
 
@@ -97,15 +122,30 @@ npm run tauri build -- \
 # 而那份签名配不上这次的内容——发出去客户端一律验签失败。宁可现在红，也别发出去才发现。
 if [ -n "${TAURI_SIGNING_PRIVATE_KEY:-}" ]; then
   _bundle_dir="target/release/bundle/macos"
-  for _tar in "$_bundle_dir"/*.app.tar.gz; do
-    [ -f "$_tar" ] || continue
-    if [ ! -f "$_tar.sig" ]; then
-      echo "更新产物缺少签名：$_tar.sig 不存在" >&2; exit 1
-    fi
-    if [ "$_tar.sig" -ot "$_tar" ]; then
-      echo "更新产物的签名比包还旧：$_tar.sig —— 这是上一次的签名，配不上这次的内容" >&2; exit 1
-    fi
-    echo "更新产物签名：$(basename "$_tar").sig ✓"
+  # 只校验**这次**的产物。
+  #
+  # 原来是遍历 *.app.tar.gz —— 于是应用改过名之后，目录里遗留的旧名产物
+  # （Michael IDE.app.tar.gz，几个月前的）会让这道校验永远红：它的 .sig 当然比它自己
+  # 还旧，但那跟这次构建毫无关系。校验该只认当前 productName 那一个。
+  _product="$(python3 -c 'import json
+try: print(json.load(open("src-tauri/tauri.conf.json")).get("productName") or "")
+except Exception: print("")' 2>/dev/null || true)"
+  _tar="$_bundle_dir/$_product.app.tar.gz"
+  if [ -z "$_product" ] || [ ! -f "$_tar" ]; then
+    echo "没有找到本次的更新产物（$_tar）——无法确认签名状态" >&2; exit 1
+  fi
+  if [ ! -f "$_tar.sig" ]; then
+    echo "更新产物缺少签名：$_tar.sig 不存在" >&2; exit 1
+  fi
+  if [ "$_tar.sig" -ot "$_tar" ]; then
+    echo "更新产物的签名比包还旧：$_tar.sig —— 这是上一次的签名，配不上这次的内容" >&2; exit 1
+  fi
+  echo "更新产物签名：$(basename "$_tar").sig ✓"
+  # 旧名遗留物只提醒，不拦——它不影响这次发版，但留着会让人下次又困惑一遍。
+  for _old in "$_bundle_dir"/*.app.tar.gz; do
+    [ -f "$_old" ] || continue
+    [ "$_old" = "$_tar" ] && continue
+    echo "提示：目录里还有改名前的遗留产物 $(basename "$_old")（不影响本次，可以删）"
   done
 fi
 
