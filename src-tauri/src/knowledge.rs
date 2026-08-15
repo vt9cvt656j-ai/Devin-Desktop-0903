@@ -622,7 +622,12 @@ async fn search_npm(c: &Client, q: &str, limit: u32) -> Result<String, String> {
         Ok(resp) => resp,
         Err(e) => {
             if let Some(info) = exact {
-                return Ok(format!("npm packages:\n\n{info}"));
+                // 降级要说出来。registry 的搜索接口已经失败了，返回的只是按精确包名直查
+                // 到的那一条，而表头原来照样写「npm packages」——调用方以为这就是搜索
+                // 结果的全部，于是得出「npm 上相关的包只有这一个」。
+                return Ok(format!(
+                    "npm packages（**registry 搜索接口本次失败：{e}**，下面只有按精确包名直查到的一条，不是搜索结果，也没有和其它候选比较过）:\n\n{info}"
+                ));
             }
             return Err(format!("npm: {e}"));
         }
@@ -631,7 +636,12 @@ async fn search_npm(c: &Client, q: &str, limit: u32) -> Result<String, String> {
         Ok(json) => json,
         Err(e) => {
             if let Some(info) = exact {
-                return Ok(format!("npm packages:\n\n{info}"));
+                // 降级要说出来。registry 的搜索接口已经失败了，返回的只是按精确包名直查
+                // 到的那一条，而表头原来照样写「npm packages」——调用方以为这就是搜索
+                // 结果的全部，于是得出「npm 上相关的包只有这一个」。
+                return Ok(format!(
+                    "npm packages（**registry 搜索接口本次失败：{e}**，下面只有按精确包名直查到的一条，不是搜索结果，也没有和其它候选比较过）:\n\n{info}"
+                ));
             }
             return Err(format!("npm JSON: {e}"));
         }
@@ -2369,7 +2379,15 @@ pub async fn cve_search(query: String, max_results: Option<u32>) -> Result<Strin
         .json_capped()
         .await
         .map_err(|e| format!("NVD JSON: {e}"))?;
-    let total = json["totalResults"].as_u64().unwrap_or(0);
+    // 字段缺失不能当成「0 个漏洞」。NVD 换字段名、限流提示体、维护页 JSON 都会让
+    // as_u64() 返回 None，unwrap_or(0) 于是把「没查成」变成「这个组件没有已知 CVE」——
+    // 而调用方正拿它当安全结论。
+    let Some(total) = json["totalResults"].as_u64() else {
+        return Err(
+            "NVD 返回体里没有 totalResults 字段（接口变更或被限流），本次**未能完成漏洞查询**——不要据此认为没有漏洞"
+                .to_string(),
+        );
+    };
     let mut out = format!("NVD CVE: {total} results\n\n");
 
     if let Some(vulns) = json["vulnerabilities"].as_array() {

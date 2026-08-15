@@ -327,6 +327,12 @@ AUTO_LOAD_DEPS = {
   // 计划步骤的四种性质。模型现在可以在 update_plan 里逐步声明，动词表退化成兜底，
   // 于是判定函数多了这个依赖。声明那条路的测试在 test/plan-step-kind.test.mjs。
   _PLAN_STEP_KINDS: new Set(["investigate", "implement", "execute", "verify"]),
+  // 截断留痕的共用函数。裸 .slice 让「被截断」和「就这么多」同形，_clip 会把真实长度
+  // 写进文案。抠出来的函数只要碰过截断就需要它。
+  _clip: (t, cap, what = "内容") => {
+    const x = String(t ?? "");
+    return x.length <= cap ? x : x.slice(0, cap) + `\n\n[已截断] ${what}共 ${x.length} 字符，这里只给了前 ${cap} 字符——**后面还有，不要当成全部**。`;
+  },
   _userRoleEnumSuffix: () => "",
   _withoutDisabledTools: (tools) => tools,
   // The retired single-site search tools resolve through this table inside _mapToolCall.
@@ -18407,7 +18413,11 @@ test("子智能体的超时是真的会停，而且父侧读真值不掐表", ()
     "循环头要检查墙钟，否则陷在慢工具里的子体会一直烧到父轮结束");
 
   // 子体自报超时，沿用父侧已有的 [ERROR] 前缀约定。
-  assert.match(sub, /_subTimedOut \? `\[TIMEOUT\] \$\{_out\}` : _out/);
+  // 形状从三元换成三分支：轮次用尽也要有自己的前缀——子体最后一轮还在调工具就被截断时，
+  // report 里存的是中途叙述，原来被原样当成最终简报返回，父体据此以为调查做完了。
+  // 守的意图不变：真超时必须在简报前面挂 [TIMEOUT]。
+  assert.match(sub, /if \(_subTimedOut\) return `\[TIMEOUT\] \$\{_out\}`;/);
+  assert.match(sub, /\[轮次用尽·未完成\]/, "轮次用尽必须和自然收尾区分开");
 
   // 父侧不许再按经过时间猜：一个正常跑了 6 分钟、简报完整的子体被打成"超时(部分结果)"，
   // 主体会重派一遍同样的调研，再烧一份钱。
@@ -18491,7 +18501,9 @@ test("#53-5 结果链路：嵌套报告只进父子体消息流/简报，不直�
   const nestIdx = sub.indexOf('if (call.type === "subagent" || call.type === "worker") {');
   assert.ok(nestIdx > 0, "嵌套派发分支必须存在");
   const nestBranch = sub.slice(nestIdx, sub.indexOf("const step = _createToolStep(call);", nestIdx));
-  assert.match(nestBranch, /messages\.push\(\{ role: "tool", tool_call_id: tc\.id, content: String\(_nestReport \|\| ""\)\.slice\(0, 8000\) \}\)/,
+  // 形状从裸 .slice(0,8000) 换成了 _clip(...)：截断必须留痕，否则「被截断的简报」和
+  // 「简报就这么短」同形。守的意图没变——嵌套报告要回到父子体的消息流里。
+  assert.match(nestBranch, /messages\.push\(\{ role: "tool", tool_call_id: tc\.id, content: _clip\(String\(_nestReport \|\| ""\), 8000/,
     "嵌套报告回到父子体消息流");
   assert.doesNotMatch(nestBranch, /_subAgentJobs\.set/, "嵌套分支不建 job 台账——主 run 看不到孙子作业");
   // execRun 拿自己的空台账：嵌套 await_subagent 消化不了父级/主 run 的在途作业，层级隔离
@@ -19049,7 +19061,12 @@ test("find_files 重写: 无匹配时返回 (无匹配文件) 而非错误", asy
   });
   const r = await findFiles("/work", "*.xyz");
   assert.equal(r.count, 0);
-  assert.equal(r.text, "(\u65e0\u5339\u914d\u6587\u4ef6)");
+  // 文案从「(无匹配文件)」扩成了两种：完整遍历完确实没有 vs 扫到上限就停了。
+  // 后者以前和前者说同一句话——而它意味着还有目录压根没看过，调用方却会据此判定
+  // 「项目里没有这个文件」然后去新建一个。守的意图不变：无匹配是提示，不是错误。
+  assert.match(r.text, /^\(无匹配文件/);
+  assert.match(r.text, /已完整遍历，确实不存在/, "扫完了就要说扫完了");
+  assert.doesNotMatch(r.text, /\[ERROR\]|失败/);
 });
 
 test("find_files 执行入口跨独立工作区聚合，并用统一失败键", () => {

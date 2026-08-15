@@ -20,6 +20,13 @@ struct AccessibilityTarget {
 struct UiSnapshot {
     target: Option<AccessibilityTarget>,
     elements: Vec<UiElement>,
+    /// 这次**读取本身**为什么没完成（超时 / 起不来 / 输出不是合法 JSON）。
+    ///
+    /// 没有这个字段之前，三种失败都返回一个空快照，然后被下游断言成「权限没问题，
+    /// 这个 app 就是不暴露辅助功能树，重试没有意义」——而超时恰恰是复杂界面最常见的
+    /// 结果，重试或先把窗口切到前台往往就成了。模型被明确告知「重试没用」，于是转去
+    /// OCR 拿一堆不可操作的坐标，然后基于「这个界面没有可点的元素」做后续决定。
+    read_error: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -160,6 +167,7 @@ pub async fn read_screen(ocr: Option<bool>) -> Result<ReadScreenResponse, String
             UiSnapshot {
                 target: None,
                 elements: read_ocr_elements(),
+                read_error: None, // OCR 路径不经过 AX 读取，没有「读取没完成」这回事
             }
         } else {
             read_ui_snapshot()
@@ -193,6 +201,17 @@ pub async fn read_screen(ocr: Option<bool>) -> Result<ReadScreenResponse, String
             limitations.push(format!(
                 "Blocked by a missing macOS permission — this is NOT about Screen Recording (reading the UI tree captures no pixels). Reading an app's UI tree needs Accessibility AND Automation (Apple Events → System Events). {}",
                 crate::permissions::advice_text(ax, true, ae, crate::permissions::identity_pinned_to_build())
+            ));
+        } else if let Some(reason) = snapshot.read_error.as_deref() {
+            // 读取本身没完成 ≠ 这个 app 没有辅助功能树。
+            //
+            // 超时、osascript 起不来、输出不是合法 JSON——三种失败原来都返回空快照，然后
+            // 落到下面那段「权限没问题，就是不暴露 AX 树，重试没有意义」。而超时恰恰是复杂
+            // 界面最常见的结果，重试或先把目标窗口切到前台往往就成了。模型被明确告知
+            // 「重试没用」，于是转去 OCR 拿一堆不可操作的坐标，再基于「这个界面没有可点的
+            // 元素」做后续决定——整条链建立在一句假话上。
+            limitations.push(format!(
+                "The UI-tree read DID NOT COMPLETE ({reason}). This says NOTHING about whether the app exposes an accessibility tree, and it is NOT a permission problem. Bring the target window to the front (system open / window.activate) and call read_screen again — a retry often succeeds on complex UIs. Do NOT switch to ocr=true on this basis, and do not conclude the app has no clickable elements."
             ));
         } else {
             // 权限齐全时空结果通常另有原因，而且是很具体的一个：这里读的是**前台**应用，
@@ -370,7 +389,7 @@ fn read_ui_snapshot() -> UiSnapshot {
         .spawn()
     {
         Ok(c) => c,
-        Err(_) => return UiSnapshot::default(),
+        Err(_) => return UiSnapshot { read_error: Some("osascript 启动失败".into()), ..Default::default() },
     };
 
     // 6s for complex apps (all windows, all roles, more elements).
@@ -382,11 +401,11 @@ fn read_ui_snapshot() -> UiSnapshot {
                 if Instant::now() > deadline {
                     let _ = child.kill();
                     let _ = child.wait();
-                    return UiSnapshot::default();
+                    return UiSnapshot { read_error: Some("读取超时（6 秒）".into()), ..Default::default() };
                 }
                 std::thread::sleep(Duration::from_millis(40));
             }
-            Err(_) => return UiSnapshot::default(),
+            Err(_) => return UiSnapshot { read_error: Some("等待 osascript 时出错".into()), ..Default::default() },
         }
     }
 
@@ -394,7 +413,10 @@ fn read_ui_snapshot() -> UiSnapshot {
     if let Some(mut so) = child.stdout.take() {
         let _ = so.read_to_string(&mut s);
     }
-    serde_json::from_str::<UiSnapshot>(s.trim()).unwrap_or_default()
+    serde_json::from_str::<UiSnapshot>(s.trim()).unwrap_or(UiSnapshot {
+        read_error: Some("osascript 输出不是合法快照 JSON".into()),
+        ..Default::default()
+    })
 }
 
 #[cfg(target_os = "macos")]
@@ -999,6 +1021,7 @@ return JSON.stringify({operated:operated,changed:changed});
                 name: "First".to_string(),
             }),
             elements: vec![element(7)],
+            read_error: None,
         };
         install_ax_snapshot(&mut first).expect("first snapshot should install");
         let first_ref = first.elements[0].ref_;
@@ -1016,6 +1039,7 @@ return JSON.stringify({operated:operated,changed:changed});
                 name: "Second".to_string(),
             }),
             elements: vec![element(3)],
+            read_error: None,
         };
         install_ax_snapshot(&mut second).expect("second snapshot should install");
         assert_ne!(first_ref, second.elements[0].ref_);

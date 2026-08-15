@@ -274,3 +274,63 @@ test("get_diagnostics 对没有语言服务的语言不能报「无错误或警�
   // 原来那句免责说「分析可能略有延迟」，暗示再等等就准了——而真相是等到天亮也是空的。
   assert.match(SRC, /要验证它，跑项目自带的类型检查/, "没有给出真正能验证的替代路径");
 });
+
+// ── 全量工具面的「假成功」清扫（31 条 high）──────────────────────────
+//
+// 统一判据：没做成 / 只做了一部分 / 作用域比调用方以为的小，返回文案必须与「确认无事」
+// 在字面上不同。下面按类钉住，避免任何一条被悄悄改回去。
+
+test("裸 slice 一律换成留痕的截断", () => {
+  // 「被截断」和「就这么多」同形，是最容易让人停止追查的一种假话。而更阴的是：同一段
+  // 文案里已经有另一个截断标记（「响应体已截断到 5MB」），于是「没有标记」被读成「完整」。
+  assert.match(SRC, /function _clip\(text, cap, what/, "共用的截断函数不见了");
+  assert.match(SRC, /\[已截断\][\s\S]{0,80}不要当成全部/);
+  // 三条 HTTP 通道 + 子智能体简报 + 检索结果都要走它。
+  for (const site of ["响应内容", "重发的响应内容", "子智能体的简报", "检索结果"]) {
+    assert.ok(SRC.includes(`, 8000, "${site}")`), `这处还在裸 slice：${site}`);
+  }
+});
+
+test("gh / git：退出码就是结论，不能把原始输出原样丢回去", () => {
+  assert.match(SRC, /CI 全绿（gh pr checks 退出码 0/, "gh_pr_checks 仍然不看退出码");
+  assert.match(SRC, /没有任何检查.{0,30}不是「全绿」/, "「没有 CI」和「CI 通过」仍然同形");
+  assert.match(SRC, /这不等于没有评论.{0,10}是没查成/, "gh_pr_review_comments 仍然不看退出码");
+  assert.match(SRC, /最近 \$\{runs\.length\} 次 Actions run 里\*\*没有失败的\*\*/,
+    "挑不到失败的 run 时仍然会拿一次成功的顶上");
+  assert.match(SRC, /没有匹配到任何失败关键词/, "日志采样方式仍然不自报");
+  assert.match(SRC, /git add -A 失败[\s\S]{0,120}没有提交/, "git_commit 仍然吞掉暂存失败");
+  assert.match(SRC, /git diff 没有输出/, "git_diff 的空输出仍然说成「无改动」");
+});
+
+test("检索类：说清楚「没找到」还是「没去找」", () => {
+  assert.match(SRC, /扫描没走完/, "find_files 扫到上限仍然说「无匹配文件」");
+  assert.match(SRC, /符号索引只覆盖/, "find_symbol 不说索引作用域");
+  assert.match(SRC, /在\*\*已建索引的部分\*\*里/, "semantic_search 不说索引作用域");
+  assert.match(SRC, /扫描范围不含点开头的目录和文件/, "search 不说它从不扫点开头的路径");
+  assert.match(SRC, /这只是这一个域的结论/, "knowledge_search 不说它只查了一个域");
+  assert.match(SRC, /环形缓冲的当前长度，不是本次抓包的总量/, "capture_flows 拿缓冲长度冒充总量");
+});
+
+test("动作没发生就不许报成功", () => {
+  assert.match(SRC, /invalidMethod/, "computer 仍然把不认识的 method 静默降级");
+  assert.match(SRC, /这次什么都没做/, "降级仍然没有变成显式失败");
+  assert.match(SRC, /_batchDropped/, "browser batch 超限的步骤仍然被静默丢弃");
+  assert.match(SRC, /后面 \$\{call\._batchDropped\} 步一个都没跑/);
+  assert.match(SRC, /轮次用尽·未完成/, "子智能体轮次用尽仍然冒充最终简报");
+  assert.match(SRC, /running 只表示这个终端标签页还开着/, "run_in_terminal 仍拿 PTY 当命令");
+  assert.match(SRC, /这次没有查成.{0,10}不是「没有引用」/, "lsp_references 定位失败仍落到「未找到」");
+});
+
+test("Rust 侧：三处会被当成结论的空值", () => {
+  const AX = readFileSync(join(HERE, "..", "src-tauri", "src", "accessibility.rs"), "utf8");
+  const KN = readFileSync(join(HERE, "..", "src-tauri", "src", "knowledge.rs"), "utf8");
+  const AI = readFileSync(join(HERE, "..", "src-tauri", "src", "ai.rs"), "utf8");
+  const BR = readFileSync(join(HERE, "..", "src-tauri", "src", "browser.rs"), "utf8");
+  assert.match(AX, /read_error: Option<String>/, "读屏失败仍和「这个 app 没有 AX 树」同形");
+  assert.match(AX, /The UI-tree read DID NOT COMPLETE/);
+  assert.doesNotMatch(KN, /totalResults"\]\.as_u64\(\)\.unwrap_or\(0\)/, "CVE 查询失败仍被当成「没有漏洞」");
+  assert.match(KN, /registry 搜索接口本次失败/, "npm 降级到单点查询仍不说明");
+  assert.match(AI, /本页正文共 \{total\} 字符/, "web_fetch 24000 截断仍无标记");
+  assert.match(AI, /没有任何来源返回结果/, "web_search 表头仍写死三引擎合并");
+  assert.match(BR, /上面的 JSON 很可能是半截的/, "browser eval 8000 截断仍无标记");
+});
