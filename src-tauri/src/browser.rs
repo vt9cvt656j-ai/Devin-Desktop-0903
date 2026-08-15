@@ -242,24 +242,98 @@ pub struct BrowserState {
     session_note: Option<String>,
 }
 
-/// Check if Google Chrome is currently running (macOS).
+/// 用户此刻是不是正开着这个浏览器（macOS）。
+///
+/// 进程名由 `BrowserKind` 给，不再写死 "Google Chrome"：选了 Edge 却拿 Chrome 的
+/// 进程名去问，答案永远是错的，跟着错的是「真实 profile 能不能共享」这个判断。
 #[cfg(target_os = "macos")]
-fn is_chrome_running() -> bool {
+fn is_browser_running(process_name: &str) -> bool {
     std::process::Command::new("pgrep")
-        .args(["-x", "Google Chrome"])
+        .args(["-x", process_name])
         .output()
         .map(|o| o.status.success())
         .unwrap_or(false)
 }
 
 #[cfg(not(target_os = "macos"))]
-fn is_chrome_running() -> bool {
+fn is_browser_running(_process_name: &str) -> bool {
     false
 }
 
+/// 这个浏览器**用户本人**那份配置目录在哪（macOS）。只有显式开了共享才会走到这里。
+#[cfg(target_os = "macos")]
+fn real_profile_dir(kind_id: &str) -> Option<std::path::PathBuf> {
+    let rel = match kind_id {
+        "chrome" => "Library/Application Support/Google/Chrome",
+        "edge" => "Library/Application Support/Microsoft Edge",
+        "brave" => "Library/Application Support/BraveSoftware/Brave-Browser",
+        "chromium" => "Library/Application Support/Chromium",
+        _ => return None,
+    };
+    std::env::var_os("HOME")
+        .map(|h| std::path::PathBuf::from(h).join(rel))
+        .filter(|p| p.join("Default").exists())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn real_profile_dir(_kind_id: &str) -> Option<std::path::PathBuf> {
+    None
+}
+
+/// 每个浏览器自己的独立配置目录名（在 `~/.michael-ide/` 下）。
+///
+/// **不能共用一个目录**：Chrome 和 Edge 的 profile 格式并不互通，同一个目录轮流被两个
+/// 浏览器打开会把它写坏，代价是里面攒的全部登录态一起没。
+///
+/// chrome 保留原来那个不带后缀的名字——已经在自动化窗口里登录过的人不该因为这次改动
+/// 平白丢一次登录态。
+fn profile_dir_name(kind_id: &str) -> String {
+    if kind_id == "chrome" {
+        "browser-profile".to_string()
+    } else {
+        format!("browser-profile-{kind_id}")
+    }
+}
+
+/// 用户配置要加载的浏览器扩展目录（未打包的目录，不是 .crx）。
+static EXTENSION_DIRS: LazyLock<Mutex<Vec<String>>> = LazyLock::new(|| Mutex::new(Vec::new()));
+
+/// 设定要加载的扩展目录列表。只保留真实存在的目录——传进来一个不存在的路径，
+/// 浏览器要么整个启动失败、要么默默忽略，两种都比在这里先筛掉更难查。
+pub fn set_extension_dirs(dirs: Vec<String>) {
+    let kept: Vec<String> = dirs
+        .into_iter()
+        .map(|d| d.trim().to_string())
+        .filter(|d| !d.is_empty() && std::path::Path::new(d).is_dir())
+        .collect();
+    if let Ok(mut slot) = EXTENSION_DIRS.lock() {
+        *slot = kept;
+    }
+}
+
+fn extension_dirs() -> Vec<String> {
+    if let Ok(slot) = EXTENSION_DIRS.lock() {
+        if !slot.is_empty() {
+            return slot.clone();
+        }
+    }
+    std::env::var("MICHAEL_BROWSER_EXTENSIONS")
+        .ok()
+        .map(|v| {
+            v.split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty() && std::path::Path::new(s).is_dir())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 fn launch() -> Result<Session, String> {
-    let path = crate::capture::find_headless_browser()
-        .ok_or("未找到 Chrome / Chromium / Edge，无法启动浏览器自动化。请先安装其一。")?;
+    let (kind, path, missing_pref) = crate::capture::resolve_browser(
+        crate::capture::browser_pref().as_deref(),
+    )
+    .ok_or("未找到 Chrome / Edge / Brave / Chromium，无法启动浏览器自动化。请先安装其一。")?;
+    let exts = extension_dirs();
     // Make intranet/localhost dev servers reachable: ignore self-signed certs and
     // bypass any system/corporate proxy for private addresses (so "内网不能访问"
     // doesn't happen), while still letting public sites use the proxy.
@@ -305,56 +379,73 @@ fn launch() -> Result<Session, String> {
     let use_real_profile = std::env::var("MICHAEL_BROWSER_USE_REAL_PROFILE")
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false);
-    // Chrome 在跑时它的 profile 是锁着的，共享不了——即使显式开了也只能退回独立 profile。
-    let chrome_running = is_chrome_running();
-    let real_profile = if use_real_profile && !chrome_running {
-        #[cfg(target_os = "macos")]
-        {
-            std::env::var_os("HOME")
-                .map(|h| {
-                    std::path::PathBuf::from(h).join("Library/Application Support/Google/Chrome")
-                })
-                .filter(|p| p.join("Default").exists())
-        }
-        #[cfg(not(target_os = "macos"))]
-        {
-            None::<std::path::PathBuf>
-        }
+    // 浏览器在跑时它的 profile 是锁着的，共享不了——即使显式开了也只能退回独立 profile。
+    let browser_running = is_browser_running(kind.process_name);
+    let real_profile = if use_real_profile && !browser_running {
+        real_profile_dir(kind.id)
     } else {
         None
     };
     let used_real_profile = real_profile.is_some();
+    let profile_name = profile_dir_name(kind.id);
     let profile_dir = real_profile.or_else(|| {
         std::env::var_os("HOME")
             .or_else(|| std::env::var_os("USERPROFILE"))
             .map(|h| {
                 std::path::PathBuf::from(h)
                     .join(".michael-ide")
-                    .join("browser-profile")
+                    .join(&profile_name)
             })
     });
     // Say which browser this is and why, once, on the first action after it opens.
     // The separate Dock icon is not a bug to be hidden — it is a real second Chrome,
     // and the only honest thing to do is name the reason it had to be started.
-    set_session_note(if used_real_profile {
-        "已用你本人的 Chrome 配置启动自动化浏览器（登录态/cookie 都在），但它是一个独立进程，所以 Dock 里会多一个图标。".into()
+    let mut note = if used_real_profile {
+        format!(
+            "已用你本人的 {} 配置启动自动化浏览器（登录态/cookie 都在），但它是一个独立进程，所以 Dock 里会多一个图标。",
+            kind.label
+        )
     } else {
         // 这里只说**已经证实**的原因，不推荐没验证过的开关。
-        // 真实 profile 那条路（MICHAEL_BROWSER_USE_REAL_PROFILE）在 Chrome 运行时必定
+        // 真实 profile 那条路（MICHAEL_BROWSER_USE_REAL_PROFILE）在浏览器运行时必定
         // 失败（配置目录被 SingletonLock 锁着），所以它不是一条能推荐的路，别写成建议。
-        let why = if use_real_profile && chrome_running {
-            "你已开着 Chrome，它把配置目录锁住了，共享不了"
+        let why = if use_real_profile && browser_running {
+            format!("你已开着 {}，它把配置目录锁住了，共享不了", kind.label)
         } else {
-            "接管别人的 Chrome 需要那个实例在启动时就开了调试端口，而端口是启动期参数，跑起来之后加不上"
+            "接管一个已经开着的浏览器，需要那个实例在启动时就开了调试端口，而端口是启动期参数，跑起来之后加不上".to_string()
         };
         format!(
-            "没能复用你正开着的 Chrome，已另起一个自动化浏览器（Dock 里那第二个图标就是它）。\
+            "自动化用的是 **{}**，是新起的一个实例（Dock 里多出来的那个图标就是它）。\
 原因：先扫了 9222-9229 调试端口没找到可接管的实例——{why}。\
-它用的是独立配置 ~/.michael-ide/browser-profile：全新、没登录过、没扩展，\
+它用的是独立配置 ~/.michael-ide/{profile_name}：全新、没登录过，\
 所以像 Google 这类站点更容易弹人机验证。\
-**在这个窗口里登录一次会被记住**，下次直接就是登录态——这是让它少弹验证的正路。"
+**在这个窗口里登录一次会被记住**，下次直接就是登录态——这是让它少弹验证的正路。",
+            kind.label
         )
-    });
+    };
+    // 选了一个没装的浏览器，不能默默换一个了事——那是这套代码以前最让人困惑的地方。
+    if let Some(ref want) = missing_pref {
+        let have = crate::capture::installed_browsers()
+            .iter()
+            .map(|(k, _)| k.id)
+            .collect::<Vec<_>>()
+            .join(" / ");
+        note = format!(
+            "你指定的浏览器「{want}」没装，这次改用了 {}。本机装了：{}。\n{note}",
+            kind.label,
+            if have.is_empty() { "无".into() } else { have }
+        );
+    }
+    // 扩展：Chrome 137 起彻底不理 --load-extension（实测 151 连坏 manifest 都不报错，
+    // 加 --disable-features=DisableLoadExtensionCommandLineSwitch 也救不回来）。
+    // 配了却不生效必须当场说清楚，不然用户会以为是自己路径写错了。
+    if !exts.is_empty() && kind.id == "chrome" {
+        note = format!(
+            "{note}\n注意：配了 {} 个浏览器扩展，但 Chrome 从 137 起已经不再接受命令行加载扩展，这些扩展**不会生效**。要用扩展得把自动化浏览器换成 Edge / Brave / Chromium（本机没装的话要先装）。",
+            exts.len()
+        );
+    }
+    set_session_note(note);
     if let Some(ref p) = profile_dir {
         let _ = std::fs::create_dir_all(p);
         // Remove stale singleton locks left by a previous crash / navigation timeout —
@@ -409,6 +500,18 @@ fn launch() -> Result<Session, String> {
     // window opens and the agent drives it (fast, node-based). Set MICHAEL_BROWSER_HEADLESS=1
     // to force headless for pure background scraping where no window is wanted.
     let headless = std::env::var("MICHAEL_BROWSER_HEADLESS").ok().as_deref() == Some("1");
+    // 扩展要生效，两件事缺一不可：把扩展目录交给浏览器，**并且**把这个库默认加的
+    // `--disable-extensions` 摘掉——只做前一半的话浏览器照样一个扩展都不加载。
+    //
+    // 只摘 `--disable-extensions` 这一个。`--enable-automation` 同在那份默认参数里，
+    // 摘掉它就是**隐藏自动化身份**，也就是反检测——这个产品不做，由测试钉住。
+    let ext_os: Vec<std::ffi::OsString> = exts.iter().map(std::ffi::OsString::from).collect();
+    let ext_ref: Vec<&std::ffi::OsStr> = ext_os.iter().map(|s| s.as_os_str()).collect();
+    let drop_defaults: Vec<&std::ffi::OsStr> = if ext_ref.is_empty() {
+        Vec::new()
+    } else {
+        vec![std::ffi::OsStr::new("--disable-extensions")]
+    };
     let opts = LaunchOptionsBuilder::default()
         .path(Some(std::path::PathBuf::from(&path)))
         .headless(headless)
@@ -417,6 +520,8 @@ fn launch() -> Result<Session, String> {
         .user_data_dir(profile_dir.clone())
         .window_size(Some((1280, 900)))
         .args(extra_ref.clone())
+        .extensions(ext_ref.clone())
+        .ignore_default_args(drop_defaults.clone())
         .build()
         .map_err(|e| e.to_string())?;
     let browser = match Browser::new(opts) {
@@ -463,8 +568,8 @@ fn launch() -> Result<Session, String> {
 /// sessions, and extensions — instead of a separate automation instance.
 fn try_connect_existing() -> Option<Session> {
     for port in [9222u16, 9223, 9224, 9225, 9226, 9229] {
-        let ws_url = match get_cdp_ws_url(port) {
-            Some(url) => url,
+        let (ws_url, brand) = match get_cdp_ws_url(port) {
+            Some(pair) => pair,
             None => continue,
         };
         let browser = match Browser::connect_with_timeout(ws_url, Duration::from_secs(120)) {
@@ -476,9 +581,9 @@ fn try_connect_existing() -> Option<Session> {
                 if configure_new_tab(&tab).is_err() {
                     continue;
                 }
-                tracing::info!("[browser] attached to existing Chrome on port {port}");
+                tracing::info!("[browser] attached to existing {brand} on port {port}");
                 set_session_note(format!(
-                    "已接管你已经开着的 Chrome（调试端口 {port}），没有另起浏览器——用的是你本人的登录态、cookie 和扩展。"
+                    "已接管你已经开着的 {brand}（调试端口 {port}），没有另起浏览器——用的是你本人的登录态、cookie 和扩展。"
                 ));
                 return Some(Session {
                     _browser: browser,
@@ -492,7 +597,7 @@ fn try_connect_existing() -> Option<Session> {
 }
 
 /// Query Chrome's `/json/version` endpoint to get the DevTools WebSocket URL.
-fn get_cdp_ws_url(port: u16) -> Option<String> {
+fn get_cdp_ws_url(port: u16) -> Option<(String, String)> {
     use std::io::{Read, Write};
     let addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().ok()?;
     let mut stream =
@@ -524,7 +629,29 @@ fn get_cdp_ws_url(port: u16) -> Option<String> {
     if !path.starts_with("/devtools/") {
         return None;
     }
-    Some(format!("ws://127.0.0.1:{port}{path}"))
+    // 这个端口后面到底是谁。以前这个字段被丢掉了，于是接管了 Edge 也照样告诉用户
+    // 「已接管你的 Chrome」——而那正是用户唯一能拿来核对「接管的是不是我那个窗口」
+    //   的信息。认不出来就说「浏览器」，别默认叫 Chrome。
+    let brand = brand_from_version(json.get("Browser").and_then(|v| v.as_str()));
+    Some((format!("ws://127.0.0.1:{port}{path}"), brand))
+}
+
+/// `/json/version` 的 `Browser` 字段（形如 `Chrome/151.0` 或 `Edg/126.0`）→ 人话牌子名。
+///
+/// 认不出来就说「浏览器」，**不默认叫 Chrome**：这句话是用户唯一能拿来核对
+/// 「接管的到底是不是我那个窗口」的信息，说错了比不说更糟。
+fn brand_from_version(raw: Option<&str>) -> String {
+    let Some(raw) = raw else {
+        return "浏览器".to_string();
+    };
+    match raw.split('/').next().unwrap_or(raw).trim() {
+        "Edg" | "Edge" => "Microsoft Edge".to_string(),
+        "Chrome" | "HeadlessChrome" => "Google Chrome".to_string(),
+        "Brave" => "Brave".to_string(),
+        "Chromium" => "Chromium".to_string(),
+        other if !other.is_empty() => other.to_string(),
+        _ => "浏览器".to_string(),
+    }
 }
 
 /// Enumerate the visible, in-viewport interactive elements: tag each with a
@@ -1322,6 +1449,33 @@ pub async fn browser_wait(
     .await
 }
 
+/// 自动化用哪个浏览器 + 要加载哪些扩展。
+///
+/// 做成命令而不是只认环境变量：面向用户的能力要能在界面里选，改一个开关不该等于
+/// 改代码重新发版。`browser` 传 "" 表示自动选。返回本机实际装了哪些，界面据此列选项
+/// ——不然用户只能对着一个下拉框猜哪个真的能用。
+#[tauri::command]
+pub fn browser_set_preference(
+    browser: Option<String>,
+    extensions: Option<Vec<String>>,
+) -> Result<serde_json::Value, String> {
+    crate::capture::set_browser_pref(browser);
+    if let Some(dirs) = extensions {
+        set_extension_dirs(dirs);
+    }
+    let installed: Vec<serde_json::Value> = crate::capture::installed_browsers()
+        .iter()
+        .map(|(k, path)| {
+            serde_json::json!({ "id": k.id, "label": k.label, "path": path })
+        })
+        .collect();
+    Ok(serde_json::json!({
+        "installed": installed,
+        "active": crate::capture::browser_pref(),
+        "extensions": extension_dirs(),
+    }))
+}
+
 /// Toggle the visible Set-of-Mark number badges. The frontend turns them OFF
 /// while recording a user-facing demo (clean frames) and back ON after.
 #[tauri::command]
@@ -1463,15 +1617,20 @@ pub fn kill_orphaned_browsers() {
         }
         #[cfg(windows)]
         {
-            let _ = std::process::Command::new("taskkill")
-                .args([
-                    "/F",
-                    "/FI",
-                    "IMAGENAME eq chrome.exe",
-                    "/FI",
-                    "WINDOWTITLE eq rust-headless*",
-                ])
-                .output();
+            // 按镜像名清理，所以每个可能被选中的浏览器都要单独来一遍——以前只写了
+            // chrome.exe，于是自动化跑 Edge 或 Brave 时残留进程一个都清不掉，它们
+            // 继续占着 profile 目录，下一次启动就全线失败。
+            for image in ["chrome.exe", "msedge.exe", "brave.exe", "chromium.exe"] {
+                let _ = std::process::Command::new("taskkill")
+                    .args([
+                        "/F",
+                        "/FI",
+                        &format!("IMAGENAME eq {image}"),
+                        "/FI",
+                        "WINDOWTITLE eq rust-headless*",
+                    ])
+                    .output();
+            }
         }
     });
 }
@@ -1523,6 +1682,48 @@ mod tests {
         assert_eq!(
             detect_wall_static("", "https://example.com/x", &format!("unusual traffic {}", long_body())),
             None
+        );
+    }
+
+    #[test]
+    fn 每个浏览器一份独立配置_chrome_保留原路径() {
+        // 共用一个目录会把 profile 写坏（Chrome 和 Edge 的格式不互通），
+        // 而给 chrome 也加后缀则会让已经登录过的人平白丢一次登录态。
+        assert_eq!(profile_dir_name("chrome"), "browser-profile");
+        assert_eq!(profile_dir_name("edge"), "browser-profile-edge");
+        assert_eq!(profile_dir_name("brave"), "browser-profile-brave");
+        let all: Vec<String> = ["chrome", "edge", "brave", "chromium"]
+            .iter()
+            .map(|k| profile_dir_name(k))
+            .collect();
+        let uniq: std::collections::HashSet<_> = all.iter().collect();
+        assert_eq!(uniq.len(), all.len(), "两个浏览器指向了同一个配置目录");
+    }
+
+    #[test]
+    fn 接管到谁就说谁_认不出来也不许默认说成_chrome() {
+        assert_eq!(brand_from_version(Some("Edg/126.0.2592.87")), "Microsoft Edge");
+        assert_eq!(brand_from_version(Some("Chrome/151.0.7922.138")), "Google Chrome");
+        assert_eq!(brand_from_version(Some("HeadlessChrome/151.0")), "Google Chrome");
+        assert_eq!(brand_from_version(Some("Brave/1.68")), "Brave");
+        // 这条是重点：说错牌子比不说更糟——它是用户唯一能核对「接管的是不是我那个
+        // 窗口」的信息。
+        assert_eq!(brand_from_version(None), "浏览器");
+        assert_eq!(brand_from_version(Some("")), "浏览器");
+    }
+
+    #[test]
+    fn 只摘掉禁用扩展那一个默认参数_绝不摘自动化标志() {
+        // `--enable-automation` 和 `--disable-extensions` 同在这个库的默认参数里。
+        // 摘掉前者就是隐藏自动化身份，也就是反检测——这个产品不做，这条钉死它。
+        let src = include_str!("browser.rs");
+        assert!(
+            src.contains("OsStr::new(\"--disable-extensions\")"),
+            "扩展要生效必须摘掉 --disable-extensions"
+        );
+        assert!(
+            !src.contains("OsStr::new(\"--enable-automation\")"),
+            "不许把 --enable-automation 摘掉：那是反检测"
         );
     }
 

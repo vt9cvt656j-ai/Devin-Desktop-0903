@@ -358,6 +358,7 @@ pub fn run() {
             browser::browser_screenshot,
             browser::browser_set_viewport,
             browser::browser_set_marks,
+            browser::browser_set_preference,
             browser::browser_scroll,
             browser::browser_wait,
             browser::browser_cookies,

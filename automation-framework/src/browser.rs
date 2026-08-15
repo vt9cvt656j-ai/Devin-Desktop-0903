@@ -19,6 +19,82 @@ pub struct BrowserAutomation {
     pub current_page: Option<Arc<Page>>,
 }
 
+/// 找一个能用的 Chromium 内核浏览器。
+///
+/// 以前这里写死的是 `/Applications/Google Chrome.app/...` 这个绝对路径，于是：
+/// 没装 Chrome 的机器上（只有 Edge 或 Brave），`automation` 工具的整条 browser.*
+/// 链路直接起不来——而同一台机器上 IDE 自己的 browser 工具明明跑得好好的，因为那边
+/// 会探测。Linux / Windows 上这个路径更是永远不存在，等于整条链路不可用。
+///
+/// 顺序：`MICHAEL_BROWSER_PATH` 指定的可执行文件 → `MICHAEL_BROWSER` 指定的牌子 →
+/// 装了的第一个。这个 crate 独立于 src-tauri，所以目录表在这里单独维护。
+fn find_browser() -> Result<String> {
+    if let Ok(p) = std::env::var("MICHAEL_BROWSER_PATH") {
+        let p = p.trim().to_string();
+        if !p.is_empty() && std::path::Path::new(&p).exists() {
+            return Ok(p);
+        }
+    }
+    let want = std::env::var("MICHAEL_BROWSER")
+        .ok()
+        .map(|s| s.trim().to_ascii_lowercase())
+        .filter(|s| !s.is_empty());
+
+    #[cfg(target_os = "macos")]
+    let table: &[(&str, &[&str])] = &[
+        ("chrome", &["/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"]),
+        ("edge", &["/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge"]),
+        ("brave", &["/Applications/Brave Browser.app/Contents/MacOS/Brave Browser"]),
+        ("chromium", &["/Applications/Chromium.app/Contents/MacOS/Chromium"]),
+    ];
+    #[cfg(target_os = "windows")]
+    let table: &[(&str, &[&str])] = &[
+        ("chrome", &[
+            r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+            r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+        ]),
+        ("edge", &[
+            r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
+            r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
+        ]),
+        ("brave", &[r"C:\Program Files\BraveSoftware\Brave-Browser\Application\brave.exe"]),
+    ];
+    #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
+    let table: &[(&str, &[&str])] = &[
+        ("chrome", &["/usr/bin/google-chrome", "/usr/bin/google-chrome-stable"]),
+        ("edge", &["/usr/bin/microsoft-edge", "/usr/bin/microsoft-edge-stable"]),
+        ("brave", &["/usr/bin/brave-browser", "/usr/bin/brave"]),
+        ("chromium", &["/usr/bin/chromium", "/usr/bin/chromium-browser"]),
+    ];
+
+    let first_installed = |id: &str| -> Option<String> {
+        table
+            .iter()
+            .find(|(k, _)| *k == id)
+            .and_then(|(_, paths)| {
+                paths
+                    .iter()
+                    .find(|p| std::path::Path::new(p).exists())
+                    .map(|p| p.to_string())
+            })
+    };
+    if let Some(ref id) = want {
+        if let Some(p) = first_installed(id) {
+            return Ok(p);
+        }
+    }
+    for (id, _) in table {
+        if let Some(p) = first_installed(id) {
+            return Ok(p);
+        }
+    }
+    Err(Error::Browser(
+        "未找到可用的 Chromium 内核浏览器（Chrome / Edge / Brave / Chromium）。\
+装上其一，或用 MICHAEL_BROWSER_PATH 指定可执行文件路径。"
+            .into(),
+    ))
+}
+
 /// 浏览器要用哪套身份。
 ///
 /// 这是自动化里最容易出错的一个选择：抓公开页面、测自己的 dev server 该用干净实例；
@@ -35,6 +111,21 @@ pub enum BrowserProfile {
     Isolated,
     /// 专用持久目录，保留登录态。需要用户身份的任务用这个。
     Session,
+}
+
+/// 一次性实例关掉扩展（干净、可复现）；持久实例**不关**。
+///
+/// 以前两种都无条件加 `--disable-extensions`，于是「在有头窗口里登录一次、此后一直
+/// 带着这些会话」这条设计是残的：用户在那个持久窗口里装的密码管理器、拦截器，每次
+/// 自动化启动都被关掉，等于装了个寂寞。
+fn with_extension_policy(
+    b: chromiumoxide::browser::BrowserConfigBuilder,
+    profile: BrowserProfile,
+) -> chromiumoxide::browser::BrowserConfigBuilder {
+    match profile {
+        BrowserProfile::Isolated => b.arg("--disable-extensions"),
+        BrowserProfile::Session => b,
+    }
 }
 
 fn profile_dir(profile: BrowserProfile) -> Result<std::path::PathBuf> {
@@ -69,12 +160,10 @@ impl BrowserAutomation {
     async fn launch_headless(profile: BrowserProfile) -> Result<Self> {
         let temp_dir = profile_dir(profile)?;
         
-        let config = BrowserConfig::builder()
-            .chrome_executable("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome")
+        let config = with_extension_policy(BrowserConfig::builder().chrome_executable(find_browser()?), profile)
             .arg("--no-first-run")
             .arg("--no-default-browser-check")
             .arg("--disable-infobars")
-            .arg("--disable-extensions")
             .arg("--disable-dev-shm-usage")
             .arg("--disable-software-rasterizer")
             .arg("--disable-background-networking")
@@ -97,13 +186,13 @@ impl BrowserAutomation {
     async fn launch_headed(profile: BrowserProfile) -> Result<Self> {
         let temp_dir = profile_dir(profile)?;
         
-        let config = BrowserConfig::builder()
-            .chrome_executable("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome")
-            .with_head()
+        let config = with_extension_policy(
+            BrowserConfig::builder().chrome_executable(find_browser()?).with_head(),
+            profile,
+        )
             .arg("--no-first-run")
             .arg("--no-default-browser-check")
             .arg("--disable-infobars")
-            .arg("--disable-extensions")
             .arg("--disable-dev-shm-usage")
             .arg("--disable-background-networking")
             .arg("--metrics-recording-only")
