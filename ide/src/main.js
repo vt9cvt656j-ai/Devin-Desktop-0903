@@ -36687,6 +36687,22 @@ const _EXTERNAL_DATA_TYPES = new Set([
   "read", "list", "cmd", "termtask", "termread", "http", "tor", "mcp",
   "search", "semsearch", "find", "findsymbol", "knowledge", "localdiscovery",
   "github_repo", "gitlab_repo", "gitee_repo", "codeberg_repo",
+  // 下面这批原来一条都没在名单里，而其中好几条恰恰是**最直接由攻击者控制**的通道：
+  //   browser / preview        —— 任意网页的正文、eval 结果、控制台输出
+  //   capture_flows / _replay  —— 任意主机的 HTTP 请求体和响应体（比 http 还宽：它是整包）
+  //   web / websearch / realtime_news_feed —— 搜索结果摘要，投毒成本极低
+  //   readscreen               —— 屏幕上的任何东西（截图里的文字同样是别人写的）
+  //   db                       —— 数据库里的行，内容多半是用户之外的人写进去的
+  //   gh / git                 —— issue / PR 正文、提交信息、diff
+  //   userhttp / userfolder    —— 用户自己接进来的能力，声明本身可能来自 clone 来的仓库
+  //   logs / lsp / diag        —— 日志正文、语言服务器回显的仓库文本
+  //   openapi_parser / figma / liveenvironment —— 远端文档与实况环境
+  //   skill                    —— 技能说明可能来自仓库里的技能目录
+  // 少一条标记，模型就少一处依据去区分"给我读的材料"和"给我执行的指令"。
+  "browser", "preview", "capture_flows", "capture_replay",
+  "web", "websearch", "realtime_news_feed", "readscreen", "db", "gh", "git",
+  "userhttp", "userfolder", "logs", "lsp", "diag",
+  "openapi_parser", "figma", "liveenvironment", "skill",
 ]);
 function _isExternalDataToolResult(type) {
   const t = String(type || "");
@@ -36697,9 +36713,17 @@ function _toolResultToStringRaw(call, result) {
   const c = result.content != null ? String(result.content) : "";
   const executionEvidence = _executionToolResultForModel(call, result, c);
   if (executionEvidence) return executionEvidence;
-  if (c && /\[(ERROR|BLOCKED|DENIED|失败|不可用|error)\]/i.test(c)) return c;
   const kind = result.type || call.type;
   const tag = _isExternalDataToolResult(kind) ? _EXTERNAL_DATA_TAG : "";
+  // 错误结果原样交给模型（不套壳、不改写），但**标记不能跟着丢**。
+  //
+  // 这里原来是 `return c;` —— 于是只要正文里出现 `[error]`（这个正则不分大小写、也不锚定
+  // 行首），整条结果就绕过下面所有分支、连〔外部数据〕都不带地进了模型上下文。日志文件、
+  // 命令输出、README 里的代码块，随便哪个都带这四个字；攻击者要故意脱掉这层标记，只需要
+  // 在网页里写一句 `[error]`。标记本身正是为这种内容存在的，不该被这种内容关掉。
+  if (c && /\[(ERROR|BLOCKED|DENIED|失败|不可用|error)\]/i.test(c)) {
+    return tag ? `${tag}\n${c}` : c;
+  }
   switch (kind) {
     case "read": return `文件 ${result.path}${tag}:\n${c}`;
     case "list": return `目录 ${result.path}${tag}:\n${c}`;
