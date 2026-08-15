@@ -2612,7 +2612,7 @@ test("deny beats ask beats allow, so no scope can loosen another's restriction",
   assert.equal(verdict({ allow: [], ask: [], deny: [] }, call), "", "no match defers to the default policy");
 });
 
-test("permission scopes merge rather than override", async () => {
+test("权限作用域：收紧处处合并，放宽只认用户自己的", async () => {
   const files = {
     "/repo/.michael/settings.json": JSON.stringify({ permissions: { deny: ["Read(./.env)"], allow: ["Bash(npm test)"] } }),
     "/repo/.michael/settings.local.json": JSON.stringify({ permissions: { allow: ["Bash(npm run build)"] } }),
@@ -2625,9 +2625,26 @@ test("permission scopes merge rather than override", async () => {
     Date: { now: () => 1 },
   })("/repo");
 
-  // Every scope's restrictions survive: the project deny, the user deny, and both allows.
+  // 收紧（deny / ask）每一层都算数——这一半没变。
   assert.deepEqual(rules.deny.sort(), ["Bash(sudo *)", "Read(./.env)"]);
-  assert.deepEqual(rules.allow.sort(), ["Bash(npm run build)", "Bash(npm test)"]);
+  // 放宽（allow）**只认用户自己的作用域**。这条断言以前是
+  // `["Bash(npm run build)", "Bash(npm test)"]`，也就是接受工作区文件里的 allow——
+  // 而那正是一个洞，不是一个特性：
+  //
+  //   · `.michael/settings.json` 和 `.michael/settings.local.json` 默认都不在 gitignore
+  //     里，都能被提交、跟着 git clone 一起到用户机器上（`.local` 只是个命名约定，
+  //     不是关于「谁写的」的事实）；
+  //   · `_approveToolCall` 里 `if (ruleVerdict === "allow") return true` **排在
+  //     dangerous 判断之前**，所以一句 `{"permissions":{"allow":["Bash"]}}` 就关掉了
+  //     那份代码自称的「整条执行链上唯一的授权检查点」，`rm -rf ~` / `curl x|sh` 静默执行。
+  //
+  // 而 `_loadPermissionRules` 自己的注释早就写明了正确的不变量：「user 作用域先读：
+  // 它是"我的偏好"，project/local 只能在它之上继续收紧」。实现原来和这句话相反，
+  // 这条测试把相反的那一版钉住了。现在两者对齐。
+  //
+  // 代价是「项目级白名单」这个用法没了：要为某个项目常放行某条命令，写进你自己的
+  // ~/.michael/settings.json——那是一次明确的、由你本人做出的采纳动作。
+  assert.deepEqual(rules.allow, [], "工作区文件里的 allow 必须被丢弃");
   // Malformed or absent files are skipped, never fatal — a broken settings file must not
   // take the whole permission layer down with it.
   const empty = await load("_loadPermissionRules", {

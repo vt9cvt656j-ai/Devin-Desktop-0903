@@ -334,3 +334,45 @@ test("Rust 侧：三处会被当成结论的空值", () => {
   assert.match(AI, /没有任何来源返回结果/, "web_search 表头仍写死三引擎合并");
   assert.match(BR, /上面的 JSON 很可能是半截的/, "browser eval 8000 截断仍无标记");
 });
+
+// ── 安全边界：clone 一个仓库不该等于交出这台机器 ──────────────────────
+//
+// 这三条是同一个根因的三种形态：**信任是按文件名猜的，不是按来源定的**。
+// `.michael/settings.json`、`.michael/settings.local.json`、`.mcp.local.json` 默认都不在
+// gitignore 里，都能被提交、跟着 clone 到受害者机器上。
+
+test("仓库里的 permissions.allow 必须被丢弃——它会短路唯一那道高危弹窗", () => {
+  const i = SRC.indexOf("const merged = { allow: [], ask: [], deny: [] }");
+  assert.ok(i >= 0, "权限规则加载器不见了");
+  const seg = SRC.slice(i, i + 2200);
+  assert.match(seg, /bucket === "allow" && !trusted/, "allow 仍然接受工作区文件");
+  // 放行必须由用户本人给出；收紧任何来源都算数。
+  assert.match(SRC, /absorb\(localStorage\.getItem\("michael-ide\.permissions"\)[^)]*\{ trusted: true \}/);
+  // 工作区那几份文件必须以 trusted:false 读入。两处（权限规则、能力声明）都要。
+  assert.equal((SRC.match(/\{ trusted: false \}/g) || []).length, 2,
+    "工作区文件仍被当成可信来源（应有两处：权限规则 + 能力声明）");
+});
+
+test("仓库里的能力声明只能关能力，不能开能力", () => {
+  // 我上一版给 userhttp 设了 needsApproval: true 并写了「一律要审批」——**在默认模式下
+  // 那句话是错的**：mustAsk 只在 mode === "approve" 时才看 needsApproval，而默认是 auto。
+  // 于是 clone 一个仓库就等于给对方一个常驻出网通道。
+  assert.match(SRC, /if \(trusted\) \{ scopes\.push\(one\); return; \}/, "仓库声明仍被整份采纳");
+  assert.match(SRC, /跟着 git clone 下来的文件不能给自己加能力/, "没有把原因告诉用户");
+  // disabled 仍然任何来源都认——那是收紧。
+  assert.match(SRC, /disabled: one\.disabled/);
+});
+
+test("打开外部链接不许经过 shell", () => {
+  // 市场里的「查看仓库」按钮，URL 来自第三方注册表（PulseMCP 的 source_code_url）。
+  // 原来是 `taskRunCapture("/", 'open "' + url + '"')`——双引号 shell 串里 `"`、`$()`、
+  // 反引号全部有效，点一下按钮就是任意命令执行，而且 cwd 传 "/" 连沙箱都不设防。
+  // 剥注释再断言：这个文件和 main.js 里都有注释在**引用**那段旧代码来解释它为什么危险，
+  // 不剥的话断言会被解释文字喂到，而真代码删没删都测不出来。（这个坑这轮踩过三次。）
+  const codeOnly = SRC.split("\n").filter((l) => !/^\s*(\/\/|\*|\/\*)/.test(l)).join("\n");
+  assert.doesNotMatch(codeOnly, /taskRunCapture\("\/", *'open "' *\+/, "又把 URL 拼进 shell 了");
+  assert.match(SRC, /function _openExternalUrlSafe\(url\)/);
+  assert.match(SRC, /u\.protocol === "http:" \|\| u\.protocol === "https:"/, "没有校验协议");
+  // 仅剩的一处 shell open 是本地证书路径，必须走转义。
+  assert.match(SRC, /`open \$\{shellQuote\(p\)\}`/);
+});
