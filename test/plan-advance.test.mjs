@@ -103,3 +103,64 @@ test("兜底方向写进了注释，避免以后又被改回去", () => {
   assert.match(fn, /if \(!kind\) return false;/, "分不出类必须直接返回 false");
   assert.match(fn, /假完成|不要自动打勾/, "要写明为什么，否则很容易被当成过严又改回去");
 });
+
+// ── 中断之后说「继续」：不该从头重来 ─────────────────────────────────────────
+//
+// 用户报的：中断修复过程后让它继续，它会重新从头读取文件、任务计划被打乱不遵守、
+// 上下文丢失。查下来是三处断口叠在一起：
+//
+//   1. 计划从来没进过执行模型的提示词。unfinishedPlan 只喂给了**意图分类器**
+//      （旁路小模型，判定任务维度用），真正干活的模型从没见过这份计划。
+//   2. 新一轮的 run._planSteps 只有模型自己调 update_plan 才有值，中断重开时是空的——
+//      界面上计划条还画着，模型和执行侧手里却什么都没有。
+//   3. 历史是 text-only（工具调用和结果不入库，为了压缩和重放安全），所以"读过什么"
+//      只能靠证据账本转达；不明说，模型就会重读。
+function resumeBlock() {
+  const i = SRC.indexOf("function _resumeHandoffBlock");
+  const tail = '\n  } catch { return ""; }\n}';
+  const end = SRC.indexOf(tail, i);
+  assert.ok(i > 0 && end > i, "找不到 _resumeHandoffBlock");
+  return new Function(SRC.slice(i, end + tail.length) + "\nreturn _resumeHandoffBlock;")();
+}
+const PLAN = [
+  { content: "读取现有实现", status: "completed" },
+  { content: "补上隔离", status: "completed" },
+  { content: "给失败分支补卡片", status: "in_progress" },
+  { content: "跑完整测试", status: "pending" },
+];
+
+test("中断之后要把计划和进度交接给模型——不然它只能重新规划", () => {
+  const out = resumeBlock()({ _planSteps: PLAN, _lastRunState: { outcome: "partial", task: "把卡片做完", incompleteReason: "用户中断" } });
+  assert.match(out, /接着上次继续——不是新任务/);
+  assert.match(out, /已完成的步骤（别重做）：读取现有实现、补上隔离/);
+  assert.match(out, /还没做的步骤（照这份走，别重新规划）：给失败分支补卡片、跑完整测试/);
+  assert.match(out, /不要重新 search 定位、也不要整份重读/, "没有明说别重读，它就会重读");
+});
+
+test("正常收尾之后开的新任务，不能被上一轮的旧计划粘住", () => {
+  assert.equal(resumeBlock()({ _planSteps: PLAN, _lastRunState: { outcome: "success" } }), "");
+});
+
+test("计划全做完 / 压根没有计划时，不输出这段", () => {
+  const rb = resumeBlock();
+  assert.equal(rb({ _planSteps: PLAN.map((x) => ({ ...x, status: "completed" })), _lastRunState: { outcome: "partial" } }), "");
+  assert.equal(rb({ _lastRunState: { outcome: "failed" } }), "");
+});
+
+test("这段要真的进提示词，而且排在项目上下文之前", () => {
+  // 它讲的是"这一轮该怎么接"，比项目背景更该被先读到。
+  const at = SRC.indexOf("const _dynPreamble =");
+  assert.ok(at > 0);
+  const seg = SRC.slice(at, at + 500);
+  assert.match(seg, /_resumeBlock \? _resumeBlock \+ "\\n\\n" : ""/, "交接块没有拼进提示词");
+  assert.ok(seg.indexOf("_resumeBlock") < seg.indexOf("项目上下文"), "交接块排在了项目上下文后面");
+});
+
+test("新一轮要继承会话里那份没做完的计划", () => {
+  const at = SRC.indexOf("run._sessionGen = session._runGen || 0;");
+  assert.ok(at > 0);
+  const seg = SRC.slice(at, at + 1400);
+  assert.match(seg, /run\._planSteps = _prevPlan\.map/, "run 没继承会话计划，步骤推进会从零开始");
+  assert.match(seg, /_prevOutcome === "failed" \|\| _prevOutcome === "partial"/,
+    "继承没有限定在「确实没跑完」，正常收尾后的新任务会被旧计划粘住");
+});

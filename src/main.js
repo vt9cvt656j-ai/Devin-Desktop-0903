@@ -24365,8 +24365,10 @@ async function sendPrompt(text, attachments = [], readyConfig = null) {
     ? _thinkLedgerBlockText(sess._thinkLedger)
     : "";
   const _timeBlock = _currentDateBlock();
+  const _resumeBlock = (!_agentLightTurn && effectiveMode === "agent") ? _resumeHandoffBlock(sess) : "";
   const _dynPreamble =
     (_timeBlock ? _timeBlock + "\n\n" : "") +
+    (_resumeBlock ? _resumeBlock + "\n\n" : "") +
     _demandLedgerBlock +
     _thinkLedgerBlock +
     (_adaptiveMemory ? _adaptiveMemory + "\n\n" : "") +
@@ -32885,6 +32887,44 @@ function _syncPlanChip(run, steps) {
   if (panel && !panel.hasAttribute("hidden")) _renderPlanChipPanel(panel, run);
 }
 function _clearPlanChip() { try { document.getElementById("planChipWrap")?.remove(); } catch {} }
+/*
+ * 「上一轮没跑完，这是接着上次继续」——中断后必须交给模型的那份交接。
+ *
+ * 用户报的：中断之后说一句「继续」，它会从头重读文件、把任务计划打乱不照着走、上下文全丢。
+ * 查下来是三处断口，这段补的是最要命的一处：
+ *
+ *   · 计划从来没进过提示词。unfinishedPlan 只喂给了**意图分类器**（一个旁路小模型，
+ *     用来判定任务维度），真正执行的那个模型从头到尾没看过这份计划——它当然会重新规划。
+ *   · 新一轮的 run._planSteps 只有模型自己调 update_plan 才会有值，中断重开时是空的。
+ *   · 历史里只有助手写的散文，没有工具调用和结果（那是有意的，为了压缩和重放安全），
+ *     所以"我读过哪些文件"这件事只能靠证据账本转达。
+ *
+ * 只在**确实没跑完**时出现：有未完成步骤，且上一轮结局是 failed/partial。一次正常收尾
+ * 之后再开新任务，不该被上一轮的计划粘住。
+ */
+function _resumeHandoffBlock(session) {
+  try {
+    const last = session?._lastRunState;
+    const steps = Array.isArray(session?._planSteps) ? session._planSteps : [];
+    const open = steps.filter((x) => x?.status === "pending" || x?.status === "in_progress");
+    if (!open.length) return "";
+    const outcome = String(last?.outcome || "");
+    // 正常收尾过的不算"没跑完"——那时留着的待办属于下一次的新任务，不该被当成中断残留。
+    if (outcome !== "failed" && outcome !== "partial") return "";
+
+    const done = steps.filter((x) => x?.status === "completed").map((x) => String(x.content || "").slice(0, 90));
+    const todo = open.map((x) => String(x.content || "").slice(0, 90));
+    const lines = ["〔上一轮没有跑完，这一轮是接着上次继续——不是新任务〕"];
+    if (last?.task) lines.push(`上次在做：${String(last.task).slice(0, 200)}`);
+    if (last?.incompleteReason) lines.push(`中断在：${String(last.incompleteReason).slice(0, 160)}`);
+    if (done.length) lines.push(`已完成的步骤（别重做）：${done.slice(-8).join("、")}`);
+    lines.push(`还没做的步骤（照这份走，别重新规划）：${todo.slice(0, 8).join("、")}`);
+    lines.push("直接从第一个未完成的步骤接着做。已经读过的文件见下面的证据账本——"
+      + "文件没变就用已有结论，不要重新 search 定位、也不要整份重读；只有确实缺某段原文时才按范围精读。");
+    return lines.join("\n");
+  } catch { return ""; }
+}
+
 function _settleRunPlan(run) {
   if (!run || !Array.isArray(run._planSteps)) { _clearPlanChip(); return []; }
   _clearPlanReveal(run);
@@ -42859,6 +42899,24 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
   // Snapshot the session generation once. Interactive tools use this to retire
   // themselves when Stop or a replacement turn advances the session.
   run._sessionGen = session._runGen || 0;
+  /*
+   * 接着上次跑：把会话里那份没做完的计划装回这一轮。
+   *
+   * run._planSteps 原本只有模型调 update_plan 才会有值，于是中断后重开一轮它是空的——
+   * 界面上的计划条还画着旧计划，模型和执行侧手里却什么都没有，步骤推进、完成度判定
+   * 全部从零开始。这正是「任务计划被打乱、不遵守」的机制来源。
+   *
+   * 同样只在"确实没跑完"时继承（判据和 _resumeHandoffBlock 一致），否则一次正常收尾
+   * 之后开的新任务会被上一轮的旧计划粘住。模型想换计划照样可以调 update_plan 覆盖。
+   */
+  try {
+    const _prevPlan = Array.isArray(session._planSteps) ? session._planSteps : [];
+    const _prevOutcome = String(session._lastRunState?.outcome || "");
+    if (!run._planSteps && _prevPlan.some((x) => x?.status === "pending" || x?.status === "in_progress")
+        && (_prevOutcome === "failed" || _prevOutcome === "partial")) {
+      run._planSteps = _prevPlan.map((x) => ({ ...x }));
+    }
+  } catch {}
   run._intentState = intentState;
   run.timeline = timeline || _createAgentTimeline(_newIdeRunId(), run._recStart);
   run._runId = String(run.timeline.runId || _newIdeRunId());
