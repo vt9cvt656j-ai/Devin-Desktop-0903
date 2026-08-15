@@ -40487,6 +40487,24 @@ function _sessionFileEvidenceBlock(session, root, limit = 8) {
   return `〔本会话文件证据账本——复用已知路径与结论，不要重新 search 定位；逐字符修改所需原文若已离开当前上下文，只精读目标文件/范围〕\n${lines.join("\n")}`;
 }
 
+// 共享黑板里的作业键。
+//
+// jobId 来自 `run._subAgentJobSeq`，而那个计数器**每个 run 都从 0 重新数**——嵌套子体的
+// execRun 也一样。写进去的键却是 `sm_${jobId}`，落在**全局**的 _globalSharedStore 上。
+// 于是两个聊天标签页各自派并行子智能体，双方都产出 sm_1 / sm_2：A 的作业记录被 B 的
+// `set` 整个覆盖，A 的 updateJobStatus 改的是 B 的状态，而 appendFinding 会把 A 那边
+// 子体的调查结论追加进 B 的协同收件箱——B 的子体下一轮就把别的项目的内容当成"同事的发现"
+// 读进了上下文。既是串台，也是跨项目的内容泄漏。
+//
+// 给每个 run 发一个进程内唯一的前缀，jobId 本身保持不变（模型看到的 job#N、
+// await_subagent 的查找、run._subAgentJobs 这个 Map 都是 run 内语义，本来就是对的）。
+let _smRunTokenSeq = 0;
+function _smRunToken(run) {
+  if (!run) return "x";
+  if (!run._smRunToken) run._smRunToken = String(++_smRunTokenSeq);
+  return run._smRunToken;
+}
+
 function _drainSubAgentCollaborationInbox(store, jobId, cursor = 0, maxItems = 6, maxChars = 1600) {
   const next = { cursor: Math.max(0, Number(cursor) || 0), message: "" };
   if (!store || typeof store.get !== "function" || jobId == null || jobId === "") return next;
@@ -40534,10 +40552,13 @@ function _broadcastMainAgentFinding(run, text, store = _globalSharedStore) {
   const jobs = run._subAgentJobs;
   if (!(jobs instanceof Map) || jobs.size === 0) return 0;
   let sent = 0;
+  // 键要和派发时写进黑板的那个一致：run 前缀 + run 内的 jobId（见 _smRunToken）。
+  // Map 的键是 run 内的 jobId，直接拿它拼就会投进别的标签页那个同号作业的收件箱。
+  const _token = _smRunToken(run);
   for (const [jobId, job] of jobs) {
     if (job && job.status && job.status !== "running") continue;
     try {
-      store.appendFinding(`sm_${jobId}`, {
+      store.appendFinding(`sm_${_token}_${jobId}`, {
         source: "主智能体",
         channel: "collaboration",
         content: body.slice(0, 420),
@@ -44949,6 +44970,8 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
           for (const spec of specs) {
             run._subAgentJobSeq = (run._subAgentJobSeq || 0) + 1;
             const jobId = run._subAgentJobSeq;
+            // 共享黑板是全局的，jobId 是 run 内的——键必须带上 run 前缀，见 _smRunToken。
+            const storeId = `${_smRunToken(run)}_${jobId}`;
             const desc = `${spec.role}·${String(spec.focus).slice(0, 16)}`;
             // role 存进作业本身：会诊归总要按角色署名（"后端说 X、安全说 Y"），
             // 只有 desc 的话归总里全是任务描述，看不出这是谁的意见。
@@ -44960,7 +44983,7 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
             run._subAgentJobs.set(jobId, job);
             run._parallelDispatches = (run._parallelDispatches || 0) + 1;
             // 控制台可见性：同步登记到 SharedStore（面板/仪表盘读这里）
-            try { _globalSharedStore.set(`jobs.sm_${jobId}`, { tool: "run_subagent", role: spec.role, description: desc, status: "running", progress: 0, findings: [], createdAt: Date.now() }); } catch {}
+            try { _globalSharedStore.set(`jobs.sm_${storeId}`, { tool: "run_subagent", role: spec.role, description: desc, status: "running", progress: 0, findings: [], createdAt: Date.now() }); } catch {}
             job.promise = _runSubAgent({
               config,
               description: desc,
@@ -44969,7 +44992,7 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
               collaboration: _smShared ? {
                 shared: true,
                 store: _globalSharedStore,
-                jobId,
+                jobId: storeId,
                 peerJobIds: _smJobs,
               } : null,
             }).then((report) => {
@@ -44981,12 +45004,12 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
               else if (/^\[ERROR\]/.test(job.result)) job.status = "failed";
               else job.status = "done";
               try {
-                _globalSharedStore.updateJobStatus(`sm_${jobId}`, job.status === "done" ? "completed" : job.status, 100);
+                _globalSharedStore.updateJobStatus(`sm_${storeId}`, job.status === "done" ? "completed" : job.status, 100);
                 // shared_store 协同：把本作业的报告摘要广播给其他并行作业的记录（供面板与后续汇总）
                 if (_smShared) {
                   const digest = job.result.replace(/\s+/g, " ").slice(0, 400);
                   for (const other of _smJobs) {
-                    if (other !== jobId) _globalSharedStore.appendFinding(`sm_${other}`, { source: `sm_${jobId}`, channel: "collaboration", content: digest, isExternal: true });
+                    if (other !== storeId) _globalSharedStore.appendFinding(`sm_${other}`, { source: `sm_${storeId}`, channel: "collaboration", content: digest, isExternal: true });
                   }
                 }
                 // 这里原本调 collaborationEngine.trackTokenUsage：它把用量记进一个
@@ -45000,10 +45023,10 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
               job.result = `[ERROR] 子智能体作业异常：${String(error?.message || error).slice(0, 300)}`;
               if (!_smLive()) { job.status = "cancelled"; job.consumed = true; }
               else job.status = "failed";
-              try { _globalSharedStore.updateJobStatus(`sm_${jobId}`, "failed"); } catch {}
+              try { _globalSharedStore.updateJobStatus(`sm_${storeId}`, "failed"); } catch {}
               return job.result;
             });
-            _smJobs.push(jobId);
+            _smJobs.push(storeId);
           }
           if (_smShared && window.collaborationEngine) {
             const _collabId = `sm_${Date.now()}_${run._subAgentJobSeq || 0}`;
