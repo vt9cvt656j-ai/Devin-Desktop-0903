@@ -173,3 +173,82 @@ test("四个新词条三本词典都要有，少一本那个语言就露出原�
     assert.equal(n, 3, `${k} 只在 ${n} 本词典里`);
   }
 });
+
+// ── 预测的是「用户接下来会打什么」，不是「环境暗示该干什么」 ──────────────────
+//
+// 用户第二次纠正：「这里预测是预测用户接下来会问什么，具体要问的问题，而不是乱猜」。
+// 上一轮我修的是"空目录别推深挖项目"——那只是把一个错答案换成另一个来源相同的答案。
+// 真正的断层是：原有五档全部读**环境状态**（报错数、git 脏、开着哪个文件、目录空否），
+// 一档都没读对话。助手刚分析完三个项目怎么变现，输入框却在推「这个文件夹是空的」，
+// 两件事毫无关系——这就是"乱猜"。
+//
+// 所以加了一档真正读对话的，并且排在最前面。判据来自 Claude Code 那套：
+// 预测"他会打什么"而不是"接下来该做什么"，说不准就沉默。
+function rejectAsk() {
+  const i = SRC.indexOf("function _rejectPredictedAsk");
+  const tail = '\n  return "";\n}';
+  const end = SRC.indexOf(tail, i);
+  assert.ok(i > 0 && end > i, "找不到 _rejectPredictedAsk");
+  return new Function(SRC.slice(i, end + tail.length) + "\nreturn _rejectPredictedAsk;")();
+}
+
+test("用户真会打的那些话要放行", () => {
+  const rej = rejectAsk();
+  for (const v of ["那先做压缩包大侠的上架", "帮我把自动化框架发到 crates.io",
+                   "先补 README 的例子", "第 3 个，重点打中文市场", "这个能跑起来吗"]) {
+    assert.equal(rej(v), "", `误杀了一句用户真会打的话：${v}`);
+  }
+});
+
+test("助手口吻一律拦下——「我来帮你…」不是用户会打的字", () => {
+  const rej = rejectAsk();
+  assert.equal(rej("我来帮你发到 crates.io"), "assistant_voice");
+  assert.equal(rej("让我先看看这个文件"), "assistant_voice");
+});
+
+test("反问用户、客套、空泛的一律拦下", () => {
+  const rej = rejectAsk();
+  assert.equal(rej("你想先做哪一个？"), "question_to_user");
+  assert.equal(rej("不错"), "evaluative");
+  assert.equal(rej("继续"), "too_generic", "「继续」任何时候都成立，等于没预测");
+});
+
+test("模型叙述自己在沉默也要拦——提示词说了它照样会漏", () => {
+  // 软的那层（提示词里要求"不确定就输出空"）会漏，所以必须配一层硬的。
+  const rej = rejectAsk();
+  assert.equal(rej("（保持沉默）"), "meta_wrapped");
+  assert.equal(rej("无法预测用户意图"), "meta_text");
+});
+
+test("长度按中文卡 32 字，不是照搬英文那套 100 字符", () => {
+  const rej = rejectAsk();
+  assert.equal(rej("帮我把这个项目从头到尾重新梳理一遍，包括技术栈选型、目录结构、核心模块职责和数据流"), "too_long");
+  assert.equal(rej("先把自动化框架发到 crates.io。然后再补文档。"), "multiple_sentences",
+    "用户不会一次打两句");
+});
+
+test("读过对话的那一档排在所有环境档之前", () => {
+  const fn = grab("_composerPrediction");
+  const askAt = fn.indexOf("sess._askPredict");
+  const envAt = fn.indexOf("_runStateNextActionSuggestions(sess)");
+  assert.ok(askAt > 0, "没有读对话的那一档");
+  assert.ok(askAt < envAt, "对话档排在了环境档后面——环境档一命中就再也轮不到它");
+});
+
+test("对话往前走了，旧预测就作废", () => {
+  // 不作废的话，用户发完新消息还会看到针对上一轮的那句预测。
+  assert.match(grab("_composerPrediction"), /ask\.turnKey === \(\(sess\.memory && sess\.memory\.recent\) \|\| \[\]\)\.length/);
+});
+
+test("被拒的原因要记下来，「为什么这儿没有预测」得答得出来", () => {
+  assert.match(SRC, /sess\._askPredictReject = why/);
+  assert.match(SRC, /sess\._askPredictReject = "already_sent"/);
+});
+
+test("预测不能卡住收尾——只后台跑，不 await", () => {
+  // 注意别匹配到函数定义那一处——第一个 _predictNextAsk(sess) 是 `async function` 的签名。
+  assert.match(SRC, /void _predictNextAsk\(sess\)/,
+    "收尾处没有以后台方式触发预测");
+  assert.ok(!/await _predictNextAsk\(/.test(SRC),
+    "await 了这次预测，模型慢一点整轮收尾就跟着卡");
+});

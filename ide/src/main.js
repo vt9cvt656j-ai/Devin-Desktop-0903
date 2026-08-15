@@ -23220,12 +23220,126 @@ function _predictionAlreadyUsed(sess, send) {
   return (sess?._recentSent || []).some((prev) => norm(prev) === key);
 }
 
+/*
+ * 「用户接下来会打什么」——唯一一档真正读对话的预测。
+ *
+ * 下面那五档全部来自**环境状态**（有没有报错、git 脏不脏、开着哪个文件、目录空不空）。
+ * 环境能回答"这个工程眼下哪里不对劲"，回答不了"你看完刚才那段话会想问什么"。用户报的
+ * 「预测老是不准 / 在乱猜」就是这个断层：助手刚分析完三个项目怎么变现，输入框却在推
+ * 「这个文件夹是空的，先问我想做什么」——两件事毫无关系。
+ *
+ * 所以这一档把最近几轮对话交给模型，只问一件事：**他们下一句会打什么**。
+ * 判据不是"接下来该做什么"（那是助手的活），而是"他们会不会想'我正要打这个'"。
+ *
+ * 三条纪律，缺一条就会退化成套话：
+ *   · 说不准就输出空。宁可不显示，也不显示一句正确但没用的话。
+ *   · 禁止助手口吻。「我来帮你…」不是用户会打的字。
+ *   · 短。用户不会打一段。太长的一律丢掉，见 _rejectPredictedAsk。
+ */
+const _ASK_PREDICT_SYSTEM = [
+  "你在预测用户接下来会在输入框里打的**那一句话**。",
+  "先看用户最近说了什么、他最初想要什么，再看助手刚回了什么。",
+  "预测**他会打什么**，不是你觉得接下来该做什么——后者是助手的活，不是这里要的。",
+  "判据只有一条：他看到这句会不会想「我正要打这个」。",
+  "",
+  "不确定就输出空字符串。以下情况一律输出空：",
+  "· 助手刚报错或明显误解了他 —— 让他自己判断，别替他决定下一步",
+  "· 对话刚开始、看不出他要往哪走",
+  "· 你只能想出一句放之四海皆准的话（「继续」「帮我优化一下」）",
+  "",
+  "绝对不要输出：评价（「不错」「谢谢」）、反问用户的话、助手口吻（「我来…」「让我…」）、",
+  "他从没提过的新点子、超过一句话。",
+  "",
+  "格式：一句话，越短越好，用他自己的说话方式和语言。或者空。",
+].join("\n");
+
+/// 丢弃不像"用户会打的话"的预测。理由和 Claude Code 那套过滤器一样：
+/// 提示词里已经要求过的事，模型照样会漏，软的那层必须配一层硬的。
+/// 返回被拒的原因（便于排查"为什么没有预测"），通过返回 "" 表示可用。
+function _rejectPredictedAsk(text) {
+  const v = String(text || "").replace(/\s+/g, " ").trim();
+  if (!v) return "empty";
+  // 32 个字。Claude Code 那套卡 12 个词 / 100 字符，那是英文；中文单字的信息密度是
+  // 两三倍，照搬 100 会把「帮我把这个项目从头到尾重新梳理一遍，包括技术栈选型、目录
+  // 结构、核心模块职责和数据流」这种整段指令放进来——那正是用户嫌它"像乱猜"的东西。
+  if (v.length > 32) return "too_long";
+  // 多句话：用户不会一次打一段
+  if (/[。！？!?][^」』）)\]】]*[。！？!?]/.test(v)) return "multiple_sentences";
+  if (/```|\n/.test(v)) return "has_formatting";
+  // 助手口吻
+  if (/^(我来|让我|我将|我会|我先|接下来我|我可以帮)/.test(v)) return "assistant_voice";
+  // 反过来问用户
+  if (/^(你|您|要不要|需要我)/.test(v) && /[?？]$/.test(v)) return "question_to_user";
+  // 评价 / 客套
+  if (/^(不错|很好|挺好|可以|谢谢|多谢|辛苦|收到|明白|好的)[。！!~\s]*$/.test(v)) return "evaluative";
+  // 模型在叙述自己保持沉默
+  if (/^[（(\[【].*[）)\]】]$/.test(v)) return "meta_wrapped";
+  if (/(保持沉默|无法预测|不确定用户|没有建议|输出空)/.test(v)) return "meta_text";
+  // 太空泛：这些话任何时候都成立，等于没预测
+  if (/^(继续|接着做|往下|下一步|帮我优化一下|然后呢)[。！!~\s]*$/.test(v)) return "too_generic";
+  return "";
+}
+
+/// 后台算一次"他下一句会打什么"，算完刷新输入框。失败/被拒都静默——
+/// 这一档的正确失败方式是**什么都不显示**，交给下面的环境档。
+async function _predictNextAsk(sess) {
+  try {
+    if (!sess || sess._askPredictInflight) return;
+    const recent = (sess.memory && Array.isArray(sess.memory.recent)) ? sess.memory.recent : [];
+    // 至少要有一来一回才谈得上"接下来问什么"。
+    if (recent.filter((m) => m && m.role === "assistant").length < 1) return;
+    const cfg = await _readyAiConfig();
+    if (!cfg || !cfg.baseUrl || !cfg.apiKey) return;
+
+    sess._askPredictInflight = true;
+    const turnKey = recent.length;
+    const convo = recent.slice(-6).map((m) => {
+      const who = m.role === "assistant" ? "助手" : "用户";
+      return `${who}：${String(m.content || "").replace(/\s+/g, " ").slice(0, 700)}`;
+    }).join("\n");
+
+    const ctrl = typeof AbortController !== "undefined" ? new AbortController() : null;
+    const to = ctrl ? setTimeout(() => ctrl.abort(), 12000) : null;
+    const res = await fetch(_chatCompletionsUrl(cfg.baseUrl), {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: "Bearer " + (cfg.apiKey || "") },
+      body: JSON.stringify({
+        model: _pickCheapModel(cfg.model),
+        messages: [{ role: "system", content: _ASK_PREDICT_SYSTEM }, { role: "user", content: convo }],
+        max_tokens: 60, temperature: 0.3, stream: false,
+      }),
+      signal: ctrl ? ctrl.signal : undefined,
+    });
+    if (to) clearTimeout(to);
+    if (!res.ok) return;
+    const data = await res.json();
+    const raw = String(data?.choices?.[0]?.message?.content || "").trim().replace(/^["「『]|["」』]$/g, "");
+    const why = _rejectPredictedAsk(raw);
+    // 记下被拒的原因而不是一走了之：「为什么这儿没有预测」要答得出来。
+    sess._askPredictReject = why;
+    if (why) return;
+    if (_predictionAlreadyUsed(sess, raw)) { sess._askPredictReject = "already_sent"; return; }
+    sess._askPredict = { text: raw, turnKey };
+    try { _renderComposerGhost(); } catch {}
+  } catch { /* 预测失败就是没有预测 */ }
+  finally { try { sess._askPredictInflight = false; } catch {} }
+}
+
 function _composerPrediction(sess) {
   if (!sess) return null;
   const run = sess._lastRunState || null;
   // 举着问题等人回答时不给预测：Tab 出一句"回答上面的问题"再发出去毫无意义，
   // 空输入框配原本的占位符才是对的提示。
   if (run && run.outcome === "awaiting_user") return null;
+
+  // 读过对话的那一档排在最前面。它一旦有话说，就一定比下面任何一档"环境暗示"更贴近
+  // 用户此刻真正想打的字——后者根本没看过这段对话。
+  // turnKey 对不上说明对话又往前走了，那句预测已经过期，宁可不显示。
+  const ask = sess._askPredict;
+  if (ask && ask.text && ask.turnKey === ((sess.memory && sess.memory.recent) || []).length
+      && !_predictionAlreadyUsed(sess, ask.text)) {
+    return { src: "ask", text: ask.text, send: ask.text };
+  }
 
   const fresh = _runStateNextActionSuggestions(sess);
   const planShaped = String(run?.incompleteReason || "").startsWith("plan_steps_pending");
@@ -24958,6 +25072,9 @@ async function sendPrompt(text, attachments = [], readyConfig = null) {
     _chatFollow();
     _drainFollowups(sess); // a message sent while this reply streamed → process it now, as its own turn
     try { _renderComposerGhost(); } catch {} // 一轮结束 → 刷新"接下来最想做什么"
+    // 再后台算一次"他下一句会打什么"。这一档要读对话，所以只能在这里发起；
+    // 算完它自己会再刷一次输入框。不 await：预测迟到一秒没关系，卡住收尾不行。
+    try { void _predictNextAsk(sess); } catch {}
   }
 }
 
