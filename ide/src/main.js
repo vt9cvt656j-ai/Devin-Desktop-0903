@@ -23438,6 +23438,7 @@ function _previewToolArgs(name, root) {
     get_diagnostics: {},
     git_status: {},
     git_diff: {},
+    git_show: {},
     git_log: { limit: 5 },
     git_branch: {},
     git_stash_list: {},
@@ -31052,6 +31053,7 @@ function _buildAgentToolSchemas(includeWrite, mcpTools = []) {
     { type: "function", function: { name: "read_logs", description: "Read the tail of the latest terminal output or of a log file. Use it to look straight at the cause when a backend/API/build fails; it is a read-only evidence tool, starts no new command, and needs no extra authorization this round. When the error output names an npm debug log or a .log/.out/.err path, pass that as path; with no path it aggregates the recent task terminals and the workspace's usual logs. 【vs alternatives】For the live state of a long-running task terminal use read_terminal; for live editor/LSP diagnostics use get_diagnostics.", parameters: { type: "object", properties: { path: { type: "string", description: "Optional; the log file whose tail to read" }, paths: { type: "array", description: "Optional; several log file paths", items: { type: "string" } }, name: { type: "string", description: "Optional; the task name given to run_in_terminal" }, lines: { type: "integer", description: "How many trailing lines to read, default 200" }, include_terminal: { type: "boolean", description: "Whether to include task terminal output as well, default true" } } } } },
     { type: "function", function: { name: "git_status", description: "Show the git repository status: current branch, and the staged / unstaged / untracked file lists. Use it to learn which files were touched, or before committing. 【vs alternatives】For the actual line-by-line difference use git_diff; for commit history use git_log.", parameters: { type: "object", properties: {} } } },
     { type: "function", function: { name: "git_diff", description: "Show the git diff of the changes (unified diff text). By default it shows unstaged working-tree changes against HEAD; staged=true shows the staged (--cached) ones; path limits it to a single file. Note: it does not show untracked new files — use git_status for those.", parameters: { type: "object", properties: { path: { type: "string", description: "Optional; show the diff for this file only" }, staged: { type: "boolean", description: "true to see the staged changes" } } } } },
+      { type: "function", function: { name: "git_show", description: "Look at a PAST commit — either the commit itself (message, per-file stat and the full patch) or what one file looked like at that point. This is the step that turns `git_log` into an actual regression hunt: find the suspect commit with git_log, see what it changed with git_show, then read the file as it was before with git_show(rev, path). 【vs alternatives】git_diff only compares the working tree against HEAD and cannot see history; git_blame gives per-line attribution but not the surrounding change; git_log lists commits but not their contents.", parameters: { type: "object", properties: { rev: { type: "string", description: "The commit: a hash from git_log, or a branch/tag/relative ref — a1b2c3d, main~3, v1.2.0, HEAD^ all work" }, path: { type: "string", description: "Optional; path relative to the repository root. Given, returns that file's FULL contents as of that commit instead of the commit's patch. The path must be the one that existed in that commit — if the file was renamed later, check git_log first." } }, required: ["rev"] } } },
     { type: "function", function: { name: "git_log", description: "Show recent commit history (short hash, author, time, message, branch/tag). 【When to use】To find what changed recently in a module, locate where a regression was introduced, or get the background of a commit git_blame pointed at. 【vs alternatives】To see who changed a specific line and in which commit, use git_blame; for current uncommitted changes use git_status/git_diff.", parameters: { type: "object", properties: { count: { type: "integer", description: "How many entries to return, default 20" } } } } },
     { type: "function", function: { name: "git_blame", description: "Show, for each line of a file, which commit last changed it, by whom, and when (git blame). Very useful for \"why is this line like this / when was it introduced\". 【When to use】When you see odd-looking code, first find when and by whom the line was introduced, then read that commit's message with git_log — do not guess at the reason. 【vs alternatives】For overall history use git_log; for current changes use git_diff.", parameters: { type: "object", properties: { path: { type: "string", description: "File path (relative to the workspace root, or absolute)" } }, required: ["path"] } } },
     { type: "function", function: { name: "git_stash_list", description: "List the entries currently on the git stash stack. 【When to use】When you stashed changes before switching branches and now want them back, or want to see what is stashed.", parameters: { type: "object", properties: {} } } },
@@ -32407,6 +32409,7 @@ function _mapToolCall(name, args, mcpToolMap = _mcpToolMap) {
     case "move_path": { const _f = String(args.from || "").trim(); const _t = String(args.to || "").trim(); if (!_f) return { type: "move", _error: "from 不能为空" }; if (!_t) return { type: "move", _error: "to 不能为空" }; return { type: "move", path: _f, to: _t }; }
     case "git_status": return { type: "git", op: "status" };
     case "git_diff": return { type: "git", op: "diff", path: args.path || "", staged: !!args.staged };
+    case "git_show": return { type: "git", op: "show", rev: String(args.rev || args.commit || "").trim(), path: args.path || "" };
     case "git_log": { const _c = Number.isFinite(+args.count) ? Math.max(1, Math.min(100, +args.count)) : 20; return { type: "git", op: "log", count: _c }; }
     case "git_commit": return { type: "git", op: "commit", message: args.message || "", all: args.all !== false };
     case "git_branch": return { type: "git", op: "branch", branch: args.name || "", create: !!args.create };
@@ -40998,7 +41001,15 @@ async function _runSubAgent({ config, description, prompt, root, container, run,
   // git 工具全部映射为单一 type "git"（op 区分读写），type 级门禁分不出 git_commit/git_push，
   // 所以 _READ_TYPES 放行 "git" 的同时必须用 _GIT_READ_OPS 做 op 级二次把关。
   const _READ_TOOLS = ["read_file", "list_dir", "search", "find_files", "semantic_search", "find_symbol", "lsp_symbols", "lsp_definition", "lsp_references", "get_diagnostics", "read_logs", "knowledge_search", "read_skill", "web_fetch", "web_search", "screenshot", "git_status", "git_diff", "git_log", "git_blame"];
-  const _READ_TYPES = ["read", "list", "search", "find", "semsearch", "findsymbol", "lsp", "diag", "knowledge", "web", "websearch", "screenshot", "liveenvironment", "git"];
+  // 这张表必须和上面 _READ_TOOLS 里每个名字的**类型**一一对上。
+  //
+  // 名字进 _READ_TOOLS 决定"模型看得见"，类型进 _READ_TYPES 决定"派发时放不放行"——
+  // 两份手抄名单，漏一个就是给了它一把打不开门的钥匙（这句话本来就写在下面 MCP 那段
+  // 注释里，只是没人拿它检查这两张表）。read_logs（type=logs）和 read_skill（type=skill）
+  // 就这么漂了：子智能体的工具清单里明晃晃列着它们，一调就是 [BLOCKED]，
+  // 于是它要么反复重试，要么绕远路用 run_cmd 去 cat 日志。
+  // test/logic.test.mjs 里有一条测试拿 _mapToolCall 把两张表逐个对账，别再漂。
+  const _READ_TYPES = ["read", "list", "search", "find", "semsearch", "findsymbol", "lsp", "diag", "knowledge", "web", "websearch", "screenshot", "liveenvironment", "git", "logs", "skill"];
   const _GIT_READ_OPS = ["status", "diff", "log", "blame"];
   // P0.2: 只读 subagent 额外授予 run_cmd 权限，但仅限纯探索类命令（ls/cat/grep 等）
   const _allow = write
@@ -51015,6 +51026,25 @@ async function _executeToolStepInner(step, call, root, run) {
           return { type: "git", path: "diff", content: (text
           ? `git diff${call.staged ? " --cached" : ""}${diffRel ? " -- " + diffRel : ""}:\n${text}`
           : `（git diff 没有输出）\n注意它覆盖不到两种情况：**新建的未跟踪文件**（git diff 从不列 untracked，刚写出来的新文件在这里一定是空的——用 git_status 确认）、以及${diffRel ? `**路径 ${diffRel} 不在仓库里或拼错了**` : "**改动都已暂存**（加 staged:true 再看一次）"}。空输出不等于「没改过东西」。`) + gitRerootNote };
+        } else if (call.op === "show") {
+          // 看一个**历史提交**。整套 git 工具原来只能看"现在"：定位回归的标准路径是
+          // git_log 找到可疑提交 → 看那个提交改了什么 → 看改之前那个文件长什么样，
+          // 而这条路走到第二步就断头（git_diff 只比工作区，git_blame 只给行级归属）。
+          const showRel = call.path ? _gitPathForRepo(call.path, gitExecRoot, gitCtx?.requestedRoot || gitRoot) : "";
+          let showText = "";
+          try {
+            showText = String(await backend.invoke("git_show", { root: gitExecRoot, rev: call.rev || "", rel: showRel || null }) || "");
+          } catch (e) {
+            const msg = String(e?.message || e).slice(0, 400);
+            res.className = "atc-result atc-result--err"; res.textContent = "查不到";
+            return { type: "git", path: "show", content: `[ERROR] git show ${call.rev || "(空)"}${showRel ? ":" + showRel : ""} 失败：${msg}` + gitRerootNote };
+          }
+          const shown = showText.trim();
+          res.className = "atc-result atc-result--ok"; res.textContent = shown ? `${shown.split("\n").length} 行` : "空";
+          if (vp) vp.innerHTML = `<pre>${_escHtml(shown.slice(0, 4000) || "(空)")}</pre>`;
+          return { type: "git", path: "show", content: shown
+            ? `git show ${call.rev}${showRel ? ":" + showRel : " --stat --patch"}:\n${shown}`
+            : `（git show ${call.rev}${showRel ? ":" + showRel : ""} 没有输出）\n${showRel ? "那个提交里可能没有这个路径——文件后来改过名的话，用 git_log 看重命名历史。" : "这可能是个空提交。"}` };
         } else if (call.op === "log") {
           const n = (Number.isFinite(call.count) && call.count > 0) ? Math.floor(call.count) : 20;
           const entries = await backend.invoke("git_log", { root: gitExecRoot, count: n }) || [];
