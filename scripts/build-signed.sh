@@ -151,6 +151,31 @@ fi
 
 APP="target/release/bundle/macos/Mr. Day One.app"
 
+# 验收对象要按**这次真的产出了什么**来找，不能把路径钉死。
+#
+# 打 DMG 时 Tauri 会在装完盘之后把 macos/ 下的 .app 清掉（日志里那句 "Cleaning …"）。
+# 于是钉死路径的写法在 `MRDAYONE_BUNDLES=dmg` 这条路上，codesign 读到的永远是空，
+# 脚本 exit 1，而 DMG 好好地躺在 bundle/dmg/ 里——退出码说失败、产物却在。这正是这个
+# 脚本别处一直在骂的那种失败模式，只是发生在它自己身上。
+# 而且后果比"看着吓人"严重：**真正发给用户的那条路，签名稳定性校验从来没跑过**。
+#
+# .app 还在就验它；被清掉了就挂载 DMG 验里面那份——那才是用户实际拿到的东西。
+_mounted=""
+_unmount() { [ -n "$_mounted" ] && hdiutil detach "$_mounted" -quiet >/dev/null 2>&1; _mounted=""; }
+trap _unmount EXIT
+if [ ! -d "$APP" ]; then
+  _dmg="$(ls -t target/release/bundle/dmg/*.dmg 2>/dev/null | head -1)"
+  if [ -n "$_dmg" ]; then
+    _mounted="$(mktemp -d)"
+    if hdiutil attach "$_dmg" -nobrowse -readonly -mountpoint "$_mounted" -quiet; then
+      APP="$_mounted/$(basename "$APP")"
+      echo "（macos/ 下的 .app 已被 DMG 打包步骤清理，改为校验 $(basename "$_dmg") 里的那份）"
+    else
+      echo "挂载 $_dmg 失败，无法校验签名。" >&2; exit 1
+    fi
+  fi
+fi
+
 # 验收：签出来的东西必须真的不再钉在 cdhash 上，否则这次构建等于白签。
 echo
 echo "── 校验签名身份是否稳定 ──"

@@ -58,3 +58,31 @@ test("最终必须验证指定要求不再钉在 cdhash 上", () => {
   assert.match(SH, /cdhash\*\)/, "没有对 cdhash 结果报错");
   assert.match(SH, /身份跨构建稳定/);
 });
+
+// ── 打 DMG 时的验收对象 ──────────────────────────────────────────────────────
+//
+// Tauri 打完 DMG 会把 macos/ 下的 .app 清掉（日志里那句 "Cleaning …"）。脚本最后那道
+// 签名校验原来把路径钉死在那个 .app 上，于是 `MRDAYONE_BUNDLES=dmg` 这条路：codesign
+// 读到空 → exit 1，而 DMG 好好地躺在 bundle/dmg 里。退出码说失败、产物却在——这正是
+// 这个脚本别处一直在骂的失败模式，只是发生在它自己身上。
+// 后果比"看着吓人"严重：真正发给用户的那条路，签名稳定性校验从来没跑过。
+
+test("DMG 路径下改验 DMG 里那份 app，而不是对着被清掉的路径报失败", () => {
+  const tail = SH.slice(SH.indexOf('APP="target/release/bundle/macos'));
+  assert.match(tail, /if \[ ! -d "\$APP" \]; then/, "没有处理 .app 被清掉的情况");
+  assert.match(tail, /ls -t target\/release\/bundle\/dmg\/\*\.dmg/, "没去找刚打出来的 DMG");
+  assert.match(tail, /hdiutil attach "\$_dmg"[^\n]*-readonly/, "必须只读挂载，别改动产物");
+  assert.match(tail, /APP="\$_mounted\/\$\(basename "\$APP"\)"/, "验收对象没切到 DMG 里那份");
+  // 挂载失败要明着报错，不能默默拿着空 APP 往下走——那又变回"读不到就 exit 1"的老样子，
+  // 但这次原因完全不同，会把人引到错的方向。
+  assert.match(tail, /挂载 \$_dmg 失败/);
+});
+
+test("挂载点一定会被卸掉，包括校验失败提前退出的那两条路", () => {
+  const tail = SH.slice(SH.indexOf('APP="target/release/bundle/macos'));
+  assert.match(tail, /trap _unmount EXIT/, "得用 trap——下面那个 case 里有两个 exit 1，逐个补 detach 必漏");
+  assert.match(tail, /hdiutil detach "\$_mounted" -quiet/);
+  // trap 必须在第一次可能挂载之前就装好。
+  assert.ok(tail.indexOf("trap _unmount EXIT") < tail.indexOf("hdiutil attach"),
+    "trap 装晚了，挂载后到装 trap 之间失败就会留下残留挂载");
+});
