@@ -36867,6 +36867,23 @@ function _tokenize(text) {
     let tok = m[0].toLowerCase();
     if (tok.length < 2 || _BM25_STOP.has(tok)) continue;
     out.push(tok);
+    // 连续汉字再切二元组。
+    //
+    // 原来一整段连续汉字是**一个** token，于是查询「用户登录校验在哪」和注释里的
+    // 「登录校验」永远不相等，BM25 里 df === 0 直接跳过——中文查询几乎必然落空，而这个
+    // IDE 的用户大多用中文提问。中文没有空格，二元切分是最小可用的近似（"登录校验" →
+    // 登录/录校/校验），正确写法就在隔壁 src/conversation-memory.js 的 memSearchTokens。
+    //
+    // 整段那个 token 保留：完整短语命中时它仍然贡献一次强匹配，二元组只是补上局部命中。
+    if (/^[一-鿿]+$/.test(tok)) {
+      // 上限防止一段长中文注释把索引撑爆：N 个字产出 N-1 个二元组，长段落收益递减。
+      const _lim = Math.min(tok.length - 1, 40);
+      for (let i = 0; i < _lim; i++) {
+        const bg = tok.slice(i, i + 2);
+        if (!_BM25_STOP.has(bg)) out.push(bg);
+      }
+      continue; // 汉字段没有 camelCase 可拆
+    }
     // Also split camelCase: "getUserPermission" → ["getuserpermission","get","user","permission"]
     const parts = m[0].replace(/([A-Z])/g, " $1").replace(/[_\-]/g, " ").trim().split(/\s+/);
     if (parts.length > 1) for (const p of parts) { const t = p.toLowerCase(); if (t.length >= 2 && !_BM25_STOP.has(t)) out.push(t); }
@@ -38411,7 +38428,10 @@ function _runtimeEvidenceKinds(call, result) {
 // these carries an implicit "prove it at least parses/builds" obligation. Docs, config
 // and data files (md/json/yaml/txt/…) are intentionally excluded so trivial content
 // edits are never held hostage to a build.
-const _CODE_FILE_RE = /\.(?:js|jsx|ts|tsx|mjs|cjs|vue|svelte|astro|py|rs|go|java|kt|kts|c|h|cc|cpp|hpp|cs|rb|php|swift|m|mm|scala|sh|bash|zsh|sql|lua|dart|ex|exs|elm|clj|hs)$/i;
+// 加上 html/css/scss/less/json/yaml/toml：这张表是两道验证门唯一的入口，漏掉就等于
+// **整轮零验证义务**——而这个 IDE 最常做的交付恰恰是界面，改一版 CSS 和一份配置
+// 一个字的源码都不算「改了代码」，收尾门于是完全不看这一轮。
+const _CODE_FILE_RE = /\.(?:js|jsx|ts|tsx|mjs|cjs|vue|svelte|astro|py|rs|go|java|kt|kts|c|h|cc|cpp|hpp|cs|rb|php|swift|m|mm|scala|sh|bash|zsh|sql|lua|dart|ex|exs|elm|clj|hs|html|htm|css|scss|sass|less|json|jsonc|yaml|yml|toml)$/i;
 
 function _executionEvidenceFromTool(call, result, root) {
   if (!call || !result) return null;
@@ -38447,10 +38467,16 @@ function _freshBuildFailure(run, implOps) {
   const ev = run && Array.isArray(run._executionEvidence) ? run._executionEvidence : [];
   for (let i = ev.length - 1; i >= 0; i--) {
     const e = ev[i];
-    if (!e || e.purpose !== "verify") continue;
-    // Recognition is stamped at execution time. Re-classifying a legacy record here
-    // would let a command become a verifier after the fact (or after the project stack
-    // changed), which is not evidence about the current run.
+    if (!e) continue;
+    // 判据必须和 `_evidenceCertifies`（发绿灯那一侧）**完全一致**，否则就有一条最省事的
+    // 过关路径。原来这里额外要求 `e.purpose === "verify"`，而绿灯那侧只看
+    // `verifierRecognized`、不看 purpose。于是模型跑 `npm test` 不声明 purpose：
+    //   过了 → 拿满验证学分；挂了 → 这里直接 continue 跳过，照常宣布完成。
+    // 「不填 purpose + 跑一条失败的测试」因此成了全系统最省事的收尾方式。
+    //
+    // 现在两侧都只认执行期盖上的 `verifierRecognized`。放宽的风险是：模型为了别的目的
+    // 跑了一条被识别为验证器的命令（比如 `npm run build` 只为产出资源）而它失败了，
+    // 于是这里会拦。但一个失败的 build 本来就不该收尾——拦对了。
     if (e.verifierRecognized !== true) continue;
     if (e.implementationVersion !== implOps) continue; // only the current artifact may drive another fix pass
     if (e.timedOut === true) continue;
@@ -44133,6 +44159,18 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
           && !run._diagnosticBlock;
         // Browser operation dedup ledger: track recent actions to prevent repeated same operations
         if (!run._browserOpLog) run._browserOpLog = [];
+        // 这里**只记账，不补回合**——这是一条刻意的设计，不是遗漏（测试
+        // 「code delivery without build/test evidence is reported without forcing another turn」
+        // 和「a quiet turn is the model's completion decision except for real bounded work」
+        // 一起钉着它）。
+        //
+        // 我一度把它改成推一条提醒并续跑，被这两条测试拦下来了，而它们是对的：红构建是
+        // **观测到失败**，那是「已完成」为假的直接证据；而「没验证」观测到的是**缺席**，
+        // 缺席不等于工作是坏的——改动很小、项目根本没有构建系统、用户明说别跑，都是正当
+        // 理由。拿缺席去覆盖模型的收尾判断，就是用 harness 的偏好压过它的判断。
+        //
+        // 真话要求的不是「强迫它再跑一轮」，而是**这一轮的收尾绝不能看起来像验证过了**。
+        // 那件事由下面这个 incompleteReason 承担，它会进结果卡片。
         if (_codeDeliveredUnverified && !run._incompleteReason) {
           run._incompleteReason = "code_delivered_unverified";
         }
