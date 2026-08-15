@@ -128,6 +128,11 @@ function seed() {
   // 只读模式里按**单次调用**判：服务自己声明了 readOnlyHint 的放行，没声明的照挡。
   // 每一次调用仍然过 needsApproval 那道门，所以放行的也不是无人看管。
   defineTool("mcp", { needsApproval: true, readOnlyModeBlocked: (call) => !call?.mcpReadOnly });
+  // 用户自己声明接进来的 HTTP 能力。一律要审批，和 MCP 同级——声明可能来自 clone 来的
+  // 仓库，而它能往任意 http(s) 地址发请求。只读判定同样**逐次**看这一次调用：声明里写的
+  // 方法是 GET/HEAD 就当只读（那是用户自己写下的事实，不是我们猜的），于是 Plan /
+  // Explorer 这些只读模式里，「查一下我们内网的工单」这类事照样能做。
+  defineTool("userhttp", { needsApproval: true, readOnlyModeBlocked: (call) => !call?.userReadOnly });
   defineTool("uiclick", { needsApproval: true, readOnlyModeBlocked: true });
   defineTool("automation", { needsApproval: true });
   defineTool("db", { needsApproval: true });

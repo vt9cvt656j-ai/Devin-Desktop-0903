@@ -43,10 +43,16 @@ function extractFn(name) {
 }
 
 function registeredToolNames() {
+  // 用户声明给空：本文件测的是**内置**注册表的覆盖度，用户自己接进来的能力
+  // 有自己的测试（test/capabilities.test.mjs）。
   const build = new Function(
-    "inTauri", "_applyCloudToolDescs",
+    "inTauri", "_applyCloudToolDescs", "_userCapabilities", "compileToolSchema", "_withoutDisabledTools",
     `${extractFn("_buildAgentToolSchemas")}\n;return _buildAgentToolSchemas;`,
-  )(true, (tools) => tools);
+  )(
+    true, (tools) => tools,
+    () => ({ tools: [], commands: [], disabled: [], errors: [] }),
+    (t) => t, (tools) => tools,
+  );
   return build(true, []).map((t) => String(t?.function?.name || "")).filter(Boolean);
 }
 

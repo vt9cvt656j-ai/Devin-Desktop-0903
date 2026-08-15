@@ -343,6 +343,8 @@ function makeSlashMatcher(mcpRows) {
   const stub = {
     _SLASH: [{ cmd: "sessions", desc: "" }, { cmd: "memory", desc: "" }],
     _mcpSlashCommands: () => mcpRows,
+    // 用户自己声明的命令：本文件测的是 MCP 模板的匹配，这里给空。
+    _userSlashCommands: () => [],
     promptEl: { value: "", getBoundingClientRect: () => ({ left: 0, top: 0, width: 400 }) },
     _slashMenu: { style: {}, hidden: true },
     window: { innerHeight: 800 },

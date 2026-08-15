@@ -65,9 +65,13 @@ import { compactToolGuide, enrichedCatalogLine, autoEnrichToolMetadata, toolCapa
 import exifr from "exifr";
 import appPackage from "../package.json";
 import {
-  approvalTypes, blockedInReadOnlyMode, fileEditTypes, hookedTypes,
+  approvalTypes, blockedInReadOnlyMode, defineTool, fileEditTypes, hookedTypes,
   isFileMutation, fileMutationTypes, workerScopeField, workerScopeTarget, workspaceMutatingTypes,
 } from "./agent/tool-policy.js";
+import {
+  USER_TOOL_PREFIX, buildHttpCall, compileToolSchema, mergeCapabilities,
+  normalizeCapabilities, userToolShortName,
+} from "./agent/capabilities.js";
 import getSharedStore from "./agent/shared-store.js";
 import { renderSlashMenu, destroySlashMenu } from "./ui/mount-slash-menu.jsx";
 import { openSessionPickerIsland } from "./ui/mount-session-picker.jsx";
@@ -18812,6 +18816,17 @@ function _approvalLabel(call) {
     // 这个框是用户**做决定**的地方，也是目前唯一告诉他"这次要干嘛"的地方——
     // 只给 服务/工具 两个名字，等于让人闭着眼睛点同意。带上服务自己写的能力说明
     // （已过 _mcpDescriptionBody 消毒；它是第三方文本，所以明说来源）。
+    case "userhttp": {
+      // 审批框里必须说清楚**这条声明是哪来的**：它可能来自 clone 来的仓库里的配置文件，
+      // 而它能往任意 http(s) 地址发请求。只写工具名，用户无从判断该不该点同意。
+      const d = call.userDef;
+      return {
+        title: "调用你接入的能力？",
+        detail: `${call.userName || "?"}（${d?.http?.method || "GET"} ${d?.http?.url || "?"}）`
+          + (d?.source ? `\n声明来自：${d.source}` : "")
+          + (d?.description ? `\n用途：${String(d.description).slice(0, 160)}` : ""),
+      };
+    }
     case "mcp": {
       let d = "";
       try {
@@ -19009,6 +19024,47 @@ async function _loadPermissionRules(root) {
   _permRulesCache = { root: key, ts: now, rules: merged };
   return merged;
 }
+// ===== 用户声明的能力 =====
+//
+// 和权限规则同一批配置文件、同一套作用域顺序——用户只需要记住一个地方。加一段声明就
+// 多一个能力，删掉那段就没了；不改代码、不发版、不重启（10 秒缓存，改完下一轮生效）。
+//
+// `_userCaps` 是**同步可读**的快照，因为 `_buildAgentToolSchemas` 是同步的，而且在模块
+// 求值时就会被调用一次（`_KNOWN_TOOLS`）。那一次读到的是空快照，正好——`_KNOWN_TOOLS`
+// 要的就是静态全集，不该被用户的停用清单削掉。
+let _userCaps = { tools: [], commands: [], disabled: [], errors: [] };
+let _userCapsCache = { root: null, ts: 0 };
+
+/** 当前生效的用户声明（同步）。 */
+function _userCapabilities() { return _userCaps; }
+
+async function _refreshUserCapabilities(root) {
+  const key = String(root || "");
+  const now = Date.now();
+  if (_userCapsCache.root === key && now - _userCapsCache.ts < 10000) return _userCaps;
+  const scopes = [];
+  const absorb = (raw, source) => {
+    let parsed = null;
+    try { parsed = JSON.parse(raw || "{}"); } catch { return; }
+    scopes.push(normalizeCapabilities(parsed, source));
+  };
+  try { absorb(localStorage.getItem("michael-ide.capabilities") || "", "本机设置"); } catch {}
+  if (typeof backend !== "undefined" && backend?.readTextFile) {
+    try {
+      const home = String((await backend.homeDir?.()) || "").replace(/\/+$/, "");
+      if (home) absorb(await backend.readTextFile(`${home}/.michael/settings.json`), "~/.michael/settings.json");
+    } catch {}
+    if (key) {
+      for (const { rel } of _PERM_SCOPE_FILES) {
+        try { absorb(await backend.readTextFile(`${key.replace(/\/+$/, "")}/${rel}`), rel); } catch {}
+      }
+    }
+  }
+  _userCaps = mergeCapabilities(scopes);
+  _userCapsCache = { root: key, ts: now };
+  return _userCaps;
+}
+
 /// 规则判定：deny → ask → allow，第一个命中即为结论；都没命中返回 ""，交给默认策略。
 function _permissionRuleVerdict(rules, call) {
   if (!rules || !call) return "";
@@ -27741,6 +27797,9 @@ function _scheduleWorkspaceAgentWarmup(root) {
           // 后端的浏览器选择是进程内状态、不落盘，不回灌的话用户选了 Edge、重启一次
           // 又悄悄变回 Chrome——一个只在下次启动才出现的 bug。
           _restoreBrowserPref(),
+          // 用户声明的能力：和技能、MCP 同批预热，这样第一次对话就已经带着它们，
+          // 而不是等用户先问一句才发现工具不在。
+          _refreshUserCapabilities(normalized),
         ]);
       } finally {
         state.pending = false;
@@ -31303,6 +31362,11 @@ function _buildAgentToolSchemas(includeWrite, mcpTools = []) {
   // blockedInReadOnlyMode(call.type, call)：它按服务自己声明的 readOnlyHint 逐次判，
   // 没声明的照挡。挡在这里只会让模型连它们存在都不知道。
   if (mcpTools.length) tools.push(...mcpTools);
+  // 用户自己声明接进来的能力，走和 MCP 完全相同的那条轨：注册表(_buildToolRegistry)、
+  // 开局窗口(_selectInitialTools)、search_tools 全在这一处的下游，所以只需要在这里推进去。
+  // 名字带 `user__` 前缀，于是它天然落在 _staticToolNames() 之外，schema 会随请求体一起
+  // 发出，不依赖网关那份产品目录（那份用户改不了）。
+  for (const t of _userCapabilities().tools) tools.push(compileToolSchema(t));
   const browserSchema = tools.find((t) => t?.function?.name === "browser");
   const browserProps = browserSchema?.function?.parameters?.properties;
   if (browserProps) {
@@ -31354,9 +31418,26 @@ function _buildAgentToolSchemas(includeWrite, mcpTools = []) {
   try { _galleryMode = !inTauri && new URLSearchParams(location.search).get("play") === "tools"; } catch {}
   if (!inTauri && !_galleryMode) {
     const desktopOnly = new Set(["run_in_terminal", "read_terminal", "list_terminals", "stop_terminal", "browser", "screenshot", "http_request", "download_file", "decode_qr", "remote", "system", "capture_start", "capture_flows", "capture_stop", "capture_replay", "automation", "computer", "read_screen", "ui_click", "background_monitor", "local_discovery", "live_environment", "game_scaffold", "web_scaffold", "generate_3d", "generate_sound", "generate_music", "generate_voice", "auto_rig", "generate_motion", "generate_texture", "search_game_assets", "download_asset"]);
-    return _applyCloudToolDescs(tools.filter((t) => !desktopOnly.has(t.function.name)));
+    return _applyCloudToolDescs(_withoutDisabledTools(tools.filter((t) => !desktopOnly.has(t.function.name))));
   }
-  return _applyCloudToolDescs(tools);
+  return _applyCloudToolDescs(_withoutDisabledTools(tools));
+}
+
+/**
+ * 把用户关掉的工具从清单里摘掉——**从源头不发 schema**。
+ *
+ * 之前"禁用"只发生在执行前那道检查点：schema 照发给模型、模型照挑中它调一次、再拿回
+ * 一句「用户已拒绝」——白烧一轮，而且用户根本没得写（权限规则按内部类型名匹配，写
+ * `web_search` 不生效，得知道它内部叫 `websearch`）。不发出去，模型连试都不会试。
+ *
+ * 只摘工具，摘不掉下限：危险命令拦截、数据库破坏性判定那些不受这里影响，它们是下限
+ * 不是选项。
+ */
+function _withoutDisabledTools(tools) {
+  const off = _userCapabilities().disabled;
+  if (!off.length) return tools;
+  const drop = new Set(off);
+  return tools.filter((t) => !drop.has(t?.function?.name));
 }
 
 // ============================================================================
@@ -32412,6 +32493,13 @@ function _mapToolCall(name, args, mcpToolMap = _mcpToolMap) {
   }
   // External MCP tools are dynamic (mcp__<server>__<tool>) — route by the lookup
   // built in _ensureMcpTools so server/tool names with odd chars resolve exactly.
+  // 用户自己声明接进来的能力。**一个类型，不是一个工具一个 case** —— 之后用户加第 N
+  // 个接口，这里一行代码都不用改。
+  if (typeof name === "string" && name.startsWith(USER_TOOL_PREFIX)) {
+    const short = userToolShortName(name);
+    const def = _userCapabilities().tools.find((t) => t.name === short) || null;
+    return { type: "userhttp", userName: short, userDef: def, userReadOnly: !!def?.readOnly, args };
+  }
   if (typeof name === "string" && name.startsWith("mcp__")) {
     const m = mcpToolMap?.get(name);
     return { type: "mcp", server: m ? m.server : "", tool: m ? m.tool : "", kind: m?.kind || "tool", mcpName: name, mcpReadOnly: !!m?.readOnly, mcpAutoApprove: !!m?.autoApprove, mcpRoot: m?.root || "", args };
@@ -51147,7 +51235,25 @@ async function _executeToolStepInner(step, call, root, run) {
       res.className = "atc-result atc-result--ok"; res.textContent = "已停止";
       return { type: "termstop", path: lbl, content: `已停止任务终端「${lbl}」（进程已结束）。` };
 
-    } else if (call.type === "http") {
+    } else if (call.type === "http" || call.type === "userhttp") {
+      // 用户自己声明的能力：在这里把声明 + 模型给的参数合成一次真实请求，然后**原样走
+      // 下面那条内置的 http 执行路径**——幂等重试判定、重定向提示、错误文案全部白拿，
+      // 不另抄一份。之后用户加第 N 个接口，这里一行都不用改。
+      if (call.type === "userhttp") {
+        if (!call.userDef) {
+          res.className = "atc-result atc-result--err"; res.textContent = "声明已不在";
+          return { type: "http", path: call.userName || "", content: `[失败] 找不到名为「${call.userName || "?"}」的用户能力声明——多半是配置刚被改过或删掉了。` };
+        }
+        let built = null;
+        try {
+          built = buildHttpCall(call.userDef, call.args || {}, await _mcpShellEnv());
+        } catch (e) {
+          res.className = "atc-result atc-result--err"; res.textContent = "声明有问题";
+          return { type: "http", path: call.userName || "", content: `[失败] 用户能力「${call.userName}」合成请求失败：${String(e?.message || e).slice(0, 200)}` };
+        }
+        call.method = built.method; call.url = built.url;
+        call.headers = built.headers; call.body = built.body;
+      }
       if (!inTauri) { res.className = "atc-result atc-result--err"; res.textContent = "桌面专用"; return { type: "http", path: call.url || "", content: "[不可用] http_request 只能在桌面 App 里用（要发真实网络请求）。网页/预览版没有这个能力。" }; }
       if (!call.url) { res.className = "atc-result atc-result--err"; res.textContent = "缺 url"; return { type: "http", path: "", content: "[ERROR] http_request 需要 url。" }; }
       try {
@@ -61952,6 +62058,15 @@ const _SLASH = [
 //
 // 数据本来就在 `_mcpPromptCache` 里躺着（握手时 prompts/list 一并取回），这里只是把它
 // 变成斜杠菜单认得的形状。
+/** 用户声明的斜杠命令。团队的 /review、/deploy-staging 这类东西。 */
+function _userSlashCommands() {
+  return _userCapabilities().commands.map((c) => ({
+    cmd: c.cmd,
+    desc: c.desc,
+    prompt: c.prompt,
+  }));
+}
+
 function _mcpSlashCommands() {
   const rows = [];
   for (const item of Array.isArray(_mcpPromptCache) ? _mcpPromptCache : []) {
@@ -62334,7 +62449,10 @@ function _updateSlashMenu() {
   const q = m[1].toLowerCase();
   // 匹配 `服务:模板` 的整体，也匹配冒号后面的模板名——记得住模板叫什么、想不起来是哪个
   // 服务提供的，是最常见的情形。
-  _slashMatches = [..._SLASH, ..._mcpSlashCommands()].filter((s) => {
+  // 用户自己声明的命令排在 MCP 模板之前：那是他为自己团队写的东西，比第三方
+  // 服务提供的模板更该先看到。`_pickSlash` 不用改——它对 `{cmd, desc, prompt}`
+  // 这种普通条目本来就是「把 prompt 填进输入框」。
+  _slashMatches = [..._SLASH, ..._userSlashCommands(), ..._mcpSlashCommands()].filter((s) => {
     const cmd = s.cmd.toLowerCase();
     if (cmd.startsWith(q)) return true;
     const colon = cmd.indexOf(":");
