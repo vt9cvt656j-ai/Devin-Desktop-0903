@@ -62,6 +62,9 @@ test("approval set matches the pre-refactor literal exactly", () => {
   assert.deepEqual(sorted(approvalTypes()), sorted(new Set([
     "write", "edit", "multiedit", "delete", "move", "mkdir", "copy", "format",
     "cmd", "termtask", "automation", "uiclick", "download", "db", "mcp",
+    // 新增：用户自己声明接进来的 HTTP 能力。它能往任意 http(s) 地址发请求，而声明可能
+    // 来自 clone 来的仓库，所以和 mcp 同级——一律要审批。
+    "userhttp",
   ])));
 });
 
@@ -79,12 +82,26 @@ test("read-only-mode block matches the pre-refactor chain, plus the closed termt
   assert.deepEqual(sorted(readOnlyBlockedTypes()), sorted(new Set([
     "write", "edit", "multiedit", "cmd", "delete", "move", "mkdir", "copy", "format",
     "uiclick", "mcp", "termtask",
+    // 新增：用户 HTTP 能力。和 mcp 一样是**逐次**判定（下面那条测试钉住细则），
+    // 所以它出现在这个集合里只表示「默认挡住」，不表示一刀切。
+    "userhttp",
   ])));
   // 上一版这里断言的是 `false`，并写着「补掉的时候这一行要在同一个提交里翻成 true」——
   // 这就是那个提交。termtask 就是 run_in_terminal，命令串由模型给出、原样执行，和 cmd
   // 是同一类能力；cmd 在只读模式被挡而它不被挡，等于换个工具名就绕过去了。
   assert.equal(blockedInReadOnlyMode("termtask"), true,
     "run_in_terminal is arbitrary shell — a read-only mode must not be able to start one");
+});
+
+test("用户声明的 HTTP 能力：GET 类在只读模式可用，写类照旧挡住", () => {
+  // 判据来自用户自己写下的方法（GET/HEAD → 只读），不是我们去猜接口语义。
+  // 这样 Plan / Explorer 这些只读模式里，「查一下我们内网的工单」照样做得了，
+  // 而 POST 到内部系统仍然被挡在门外。
+  assert.equal(blockedInReadOnlyMode("userhttp", { type: "userhttp", userReadOnly: true }), false);
+  assert.equal(blockedInReadOnlyMode("userhttp", { type: "userhttp", userReadOnly: false }), true);
+  assert.equal(blockedInReadOnlyMode("userhttp", { type: "userhttp" }), true, "没声明时按有副作用处理");
+  // 放行只读，不等于不用审批——两道门是独立的。
+  assert.ok(needsApproval("userhttp"), "用户 HTTP 能力不再需要审批了");
 });
 
 test("file-mutation and file-edit families match their pre-refactor literals", () => {

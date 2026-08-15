@@ -370,8 +370,17 @@ test("a @model: chip actually routes the turn to that model", () => {
 
 test("an unlinked integration offers to connect rather than showing nothing", () => {
   // An empty list and "you have not connected this" look identical and mean opposite things.
-  assert.match(SRC, /if \(!token\) \{\s*return \[\{\s*kind: "connect"/,
-    "no token must produce a connect row");
+  //
+  // 「未连接」现在有两个来源都要排除掉才成立：本地粘贴的 PAT，以及用户在网页后台走 OAuth
+  // 连好的那种（令牌在服务端，本地没有副本）。这个菜单一度只查前者，于是后台显示「已连接」
+  // 的账号在 IDE 里仍被要求去粘贴令牌。
+  assert.match(SRC, /if \(!token && _atRepoState\[kind\] !== "connected"\) \{\s*return \[\{\s*kind: "connect"/,
+    "no token AND no gateway link must produce a connect row");
+  assert.match(SRC, /`\$\{_michaelBase\(\)\}\/api\/integrations\/\$\{kind\}\/repos`/,
+    "the gateway-side link must be consulted, not just localStorage");
+  // 网关还没回话时不能先说「未连接」—— 那一闪读起来像是连接掉了。
+  assert.match(SRC, /_atRepoState\[kind\] === "unknown" && !token/,
+    "an unresolved state must render as loading, not as disconnected");
   assert.match(SRC, /localStorage\.setItem\(`michael-ide\.\$\{kind\}-token`/,
     "the token is stored locally, like the Figma one");
   // The chip serialiser and the caret arithmetic must share one definition of a chip's text.

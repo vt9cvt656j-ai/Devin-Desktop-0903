@@ -18,6 +18,9 @@ import assert from "node:assert/strict";
 import * as acorn from "acorn";
 import exifr from "exifr";
 import { stripToolIp } from "../build/strip-tool-ip.mjs";
+import {
+  USER_TOOL_PREFIX, buildHttpCall, compileToolSchema, userToolShortName,
+} from "../src/agent/capabilities.js";
 import { ansiToText } from "../src/agent/ansi.js";
 import { ConversationMemory, extractExplicitCorrection, serializeMessagesForPersistence } from "../src/conversation-memory.js";
 import { GLOBAL_LANGUAGE_TAGS, buildLanguageOptions, coerceSupportedLocale, isSupportedLocale, localeLanguageCode, normalizeLocaleTag } from "../src/locales.js";
@@ -190,11 +193,22 @@ function load(name, deps = {}) {
 }
 
 function buildRegisteredToolSchemas() {
+  // 用户声明的能力也要注入：目录里现在多了「把用户声明推进来」和「把用户关掉的摘出去」
+  // 两步。这里给空声明——本函数的用途是拿到**内置**目录，用户声明有自己的测试。
   return new Function(
     "inTauri",
     "_applyCloudToolDescs",
+    "_userCapabilities",
+    "compileToolSchema",
+    "_withoutDisabledTools",
     `${extractFn("_buildAgentToolSchemas")}\n;return _buildAgentToolSchemas;`,
-  )(true, (tools) => tools)(true, []);
+  )(
+    true,
+    (tools) => tools,
+    () => ({ tools: [], commands: [], disabled: [], errors: [] }),
+    compileToolSchema,
+    (tools) => tools,
+  )(true, []);
 }
 function collectIdentifiers(source, name) {
   const ast = acorn.parse(source, { ecmaVersion: "latest", sourceType: "module" });
@@ -298,6 +312,17 @@ AUTO_LOAD_DEPS = {
   // tests used to hand-roll a fake mutation-family set, which could (and did) drift from the
   // literal main.js actually used. See test/tool-policy.test.mjs for the policy's own tests.
   ...TOOL_POLICY_DEPS,
+  // 用户声明的能力：纯函数给**真的**实现（和 tool-policy 同一个理由——桩会和真实现漂移），
+  // 只有「当前有哪些声明」给空快照。既有测试跑的都是「用户没声明任何东西」这条默认路径，
+  // 空快照正是它。要测有声明的行为，见 test/capabilities.test.mjs（那个模块是纯的，直接
+  // import 就能测，不用走这套抠源码的机制）。
+  USER_TOOL_PREFIX,
+  userToolShortName,
+  compileToolSchema,
+  buildHttpCall,
+  _userCapabilities: () => ({ tools: [], commands: [], disabled: [], errors: [] }),
+  _userSlashCommands: () => [],
+  _withoutDisabledTools: (tools) => tools,
   // The retired single-site search tools resolve through this table inside _mapToolCall.
   // Injecting the REAL table (not a stub) is what makes "gitlab_search still maps" a genuine
   // assertion about shipped behaviour.

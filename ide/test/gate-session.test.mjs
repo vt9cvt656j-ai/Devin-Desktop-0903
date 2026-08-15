@@ -143,9 +143,12 @@ test("sign-out revokes the session on the server before clearing anything local"
     body.indexOf("/api/auth/logout") < body.indexOf('localStorage.removeItem("michael_token")'),
     "the token has to still be readable when the revoke request is built",
   );
+  // `mseFetch` 也算：MSE-1 上线后这条请求走加密替身，但它仍然是一个返回 Response 的
+  // fetch，而这条断言守的是 **await**，不是函数名字。不加密的回退路径仍然是 fetch，
+  // 所以两个名字都认。
   assert.match(
     body,
-    /await fetch\(/,
+    /await (?:mse)?[fF]etch\(/,
     "not awaiting it lets the reload cancel the request — and that request is the fix",
   );
 });
