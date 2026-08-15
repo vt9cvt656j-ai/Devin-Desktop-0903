@@ -324,6 +324,9 @@ AUTO_LOAD_DEPS = {
   _userSlashCommands: () => [],
   // 用户自定义角色：默认空。角色的行为测试见 test/capabilities-roles.test.mjs。
   _userRoleMap: () => new Map(),
+  // 计划步骤的四种性质。模型现在可以在 update_plan 里逐步声明，动词表退化成兜底，
+  // 于是判定函数多了这个依赖。声明那条路的测试在 test/plan-step-kind.test.mjs。
+  _PLAN_STEP_KINDS: new Set(["investigate", "implement", "execute", "verify"]),
   _userRoleEnumSuffix: () => "",
   _withoutDisabledTools: (tools) => tools,
   // The retired single-site search tools resolve through this table inside _mapToolCall.
