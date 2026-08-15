@@ -30671,6 +30671,7 @@ function _buildAgentToolSchemas(includeWrite, mcpTools = []) {
                 properties: {
                   content: { type: "string", description: "What this step does — specific but short, understandable at a glance (naming the key technology/file)" },
                   status: { type: "string", enum: ["pending", "in_progress", "completed", "cancelled"], description: "Status: pending / in_progress / completed / cancelled (a step the user cancelled stays cancelled)" },
+                  kind: { type: "string", enum: ["investigate", "implement", "execute", "verify"], description: "What this step IS: investigate (read/search/analyse) / implement (write or change files) / execute (run, serve, deploy, watch) / verify (test, lint, build, browser-check). Declare it — the harness uses it to decide whether a tool result counts as finishing this step. Leave it out only if the step genuinely does not fit one of the four; an unlabelled step is never auto-completed, so it will just sit in progress until you mark it yourself." },
                 },
                 required: ["content", "status"],
               },
@@ -32423,6 +32424,9 @@ function _invalidToolRepairInstruction(attempts, recoveryCalls = [], registry = 
 }
 
 /** Normalize loosely-shaped plan steps from the model into {content, status}. */
+/** 计划步骤的四种性质。模型在 update_plan 里逐步声明，猜测只是老计划的兜底。 */
+const _PLAN_STEP_KINDS = new Set(["investigate", "implement", "execute", "verify"]);
+
 function _normPlanSteps(steps) {
   if (!Array.isArray(steps)) return [];
   const normStatus = (st) => {
@@ -32435,7 +32439,14 @@ function _normPlanSteps(steps) {
   return steps
     .map((s) => typeof s === "string"
       ? { content: s, status: "pending" }
-      : { content: s.content || s.step || s.text || s.title || "", status: normStatus(s.status) })
+      : {
+        content: s.content || s.step || s.text || s.title || "",
+        status: normStatus(s.status),
+        // 模型自己声明这一步是什么性质。以前只能靠动词表去猜措辞，而猜错是有代价的：
+        // 猜不出来就不打勾（对的），但猜错了类别就会被错误的证据勾掉。声明是模型
+        // 写计划时顺手就能给的事实，比我们回头猜准得多。
+        ...(_PLAN_STEP_KINDS.has(String(s.kind || "").toLowerCase()) ? { kind: String(s.kind).toLowerCase() } : {}),
+      })
     .filter((s) => s.content);
 }
 
@@ -32549,6 +32560,10 @@ document.addEventListener("click", (e) => {
 });
 
 function _planStepActionKind(step) {
+  // 声明优先。模型在 update_plan 里写下的 kind 是事实，下面那几张动词表是**猜**——
+  // 有声明就不该再猜，猜错的代价是一步被错误的证据勾掉（"假完成"）。
+  const declared = String(step?.kind || "").toLowerCase();
+  if (_PLAN_STEP_KINDS.has(declared)) return declared;
   const text = String(step?.content || step?.title || step?.description || step || "").toLowerCase();
   if (!text) return "";
   if (/(?:test|check|verify|validat|assert|build|compile|type.?check|lint|smoke|regression|screenshot|browser|viewport|health|exit\s*code|console|network|测试|检查|验证|校验|确认|复测|回归|构建|编译|截图|浏览器|视口|退出码|控制台|网络|验收)/i.test(text)) return "verify";
