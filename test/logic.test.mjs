@@ -23014,3 +23014,19 @@ test("派发、状态回写、同伴广播、主体广播——四处用的是�
   assert.doesNotMatch(SRC, /_globalSharedStore\.(?:set|updateJobStatus)\(`(?:jobs\.)?sm_\$\{jobId\}`/,
     "还有地方在用不带 run 前缀的裸键");
 });
+
+test("抓包结果不把 Cookie / Authorization 的值送进模型上下文", () => {
+  // 这两个头恰好躲开了 _redactSecrets（它认的是 `xxx_token=` 那类形状），于是每调一次
+  // capture_flows，整个会话的 Cookie 就原样发给模型服务商一次。而模型根本不需要这些值：
+  // 重放走 capture_replay(id)，凭据是在本地从抓包缓冲区取的。
+  const i = SRC.indexOf("const _credHeaders = new Set([");
+  assert.ok(i > 0, "抓包的头渲染里没有凭据名单");
+  const seg = SRC.slice(i, i + 900);
+  for (const h of ["cookie", "authorization", "x-api-key"]) {
+    assert.ok(seg.includes(`"${h}"`), `${h} 不在凭据名单里`);
+  }
+  assert.match(seg, /本机保留/, "凭据值必须被替换掉");
+  assert.match(seg, /capture_replay\(id\)/, "得告诉模型重放照样能用，否则它会想别的办法去拿值");
+  // 非凭据头照旧原样给——那正是这个工具的用途（看 content-type、看自定义签名字段名）。
+  assert.match(seg, /: \$\{h\[k\]\}`\)\.join/, "普通头不该被一起打码");
+});
