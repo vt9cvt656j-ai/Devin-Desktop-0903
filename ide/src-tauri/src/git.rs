@@ -1124,8 +1124,19 @@ pub fn git_stash_drop(root: String, index: usize) -> Result<String, String> {
 pub fn git_stash_list(root: String) -> Result<Vec<String>, String> {
     require_git_root(&root, false)?;
     let out = run_git(&root, &["stash", "list"])?;
+    // 命令失败绝不能吞成空列表。
+    //
+    // 原来这里 `return Ok(Vec::new())`，前端于是印「(stash 堆栈为空)」——而真实情况可能是
+    // 仓库损坏、index.lock 被占、权限不足。用户刚 stash 完切分支回来，看到「为空」会以为
+    // 改动丢了；更糟的是模型据此判定「没有需要恢复的东西」，跳过 stash_pop 直接在工作区上
+    // 继续写——改动还在 stash 里，但再没人去取。
     if !out.status.success() {
-        return Ok(Vec::new());
+        let err = String::from_utf8_lossy(&out.stderr);
+        return Err(format!(
+            "git stash list 失败（exit {}）：{}",
+            out.status.code().unwrap_or(-1),
+            err.trim()
+        ));
     }
     let text = String::from_utf8_lossy(&out.stdout);
     Ok(text

@@ -241,3 +241,36 @@ test("get_diagnostics 不带 path 时，「什么都没查」不能说成「没�
   assert.match(SRC, /这份快照只覆盖这 \$\{_openFiles\} 个文件，不是整个项目/,
     "有打开文件时也必须说清作用域，否则会被当成全项目结论");
 });
+
+test("git_stash_list 命令失败不能吞成「堆栈为空」——那会让人以为改动丢了", () => {
+  // 原来后端 `if !out.status.success() { return Ok(Vec::new()) }`，前端于是印
+  // 「(stash 堆栈为空)」。用户刚 stash 完切分支回来看到这句会以为改动没了；更糟的是
+  // 模型据此判定「没有需要恢复的东西」，跳过 stash_pop 直接在工作区上继续写。
+  const GIT = readFileSync(join(HERE, "..", "src-tauri", "src", "git.rs"), "utf8");
+  const i = GIT.indexOf("pub fn git_stash_list");
+  assert.ok(i >= 0);
+  const seg = GIT.slice(i, i + 900);
+  assert.doesNotMatch(seg, /return Ok\(Vec::new\(\)\);/, "命令失败仍然被吞成空列表");
+  assert.match(seg, /return Err\(format!\(/, "失败必须报错，让前端的 catch 接住");
+});
+
+test("docker_compose_up 的结论必须来自容器状态，不是 up -d 的退出码", () => {
+  // `up -d` 退出 0 只代表容器被创建并启动过——里面的进程起来就崩时它照样是 0。
+  // ps 的输出本来就已经取到了，原来只当装饰贴在成功文案后面。
+  const i = SRC.indexOf("Docker Compose 启动成功");
+  assert.ok(i >= 0);
+  const seg = SRC.slice(Math.max(0, i - 3000), i);
+  assert.match(seg, /_badStates/, "没有解析容器状态，结论仍然只看退出码");
+  assert.match(seg, /未真正跑起来/, "容器没 running 时仍然会报成功");
+  assert.match(seg, /不要告诉用户服务已经可用/, "没有明确阻止把「已启动」转述给用户");
+});
+
+test("get_diagnostics 对没有语言服务的语言不能报「无错误或警告」", () => {
+  // 内置 worker 只覆盖 TS/JS/JSON/CSS/HTML。改完 Python/Rust 调它拿到全绿，
+  // 然后向用户报告「已修复并验证通过」——而一条都没检查过。
+  assert.match(SRC, /_BUILTIN_DIAG_LANGS/, "没有区分「有没有诊断提供方」");
+  assert.match(SRC, /没有语言服务在给它出诊断/);
+  assert.match(SRC, /不能当成「没有问题」/);
+  // 原来那句免责说「分析可能略有延迟」，暗示再等等就准了——而真相是等到天亮也是空的。
+  assert.match(SRC, /要验证它，跑项目自带的类型检查/, "没有给出真正能验证的替代路径");
+});
