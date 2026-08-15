@@ -30982,7 +30982,7 @@ function _buildAgentToolSchemas(includeWrite, mcpTools = []) {
     { type: "function", function: { name: "read_file", description: "Read a file's contents. By default it reads the whole file from the start (up to 2000 lines) — **prefer omitting offset/limit and just reading the whole file**; use offset/limit only when the file is too large for one read (the result says it was truncated) to continue through the part you have not covered. You can issue several tool calls in parallel in one reply: **speculatively reading every possibly-useful file in one parallel batch is always better** than reading one at a time. When investigating, evaluating, or reviewing and you find further relevant files you have not read (modules the entry point imports, build scripts, config): **read them and then conclude — never stop to ask the user \"shall I keep reading?\". The unread list you just produced is your reading queue, not a question to hand back.** Do not re-read a whole file you already read and that has not changed; re-read a range only when you need character-exact text for an edit and the exact original has fallen out of context. Before modifying an existing file you must have its current real version. It can also read the text layer of .pdf/.docx/.pptx/.xlsx (image-only scans need OCR).", parameters: { type: "object", properties: { path: { type: "string", description: "Path relative to the workspace root, or an absolute path" }, offset: { type: "integer", description: "Starting line number (1-based). Provide only when the file is too large to read in one go" }, limit: { type: "integer", description: "How many lines to read. Provide only when the file is too large to read in one go; omit = read the whole file at once" } }, required: ["path"] } } },
     { type: "function", function: { name: "list_dir", description: "List the direct children of a directory on demand; use \".\" for the workspace root. When the IDE has already provided a project tree or symbol map, use that instead of re-scanning level by level; list a directory once only when the target location is unknown or the directory genuinely may have changed. Results include the resolved absolute path.", parameters: { type: "object", properties: { path: { type: "string", description: "Directory path (relative to the workspace root, or absolute)" }, depth: { type: "integer", description: "Recursion depth, default 1 (current level only); 0 = recurse all the way down" } }, required: ["path"] } } },
     { type: "function", function: { name: "search", description: "Locate text inside a single file or directory when the position is unknown, returning matching lines with context. When the target file is known, read_file directly; after a hit, read the target source to confirm the full context — never edit from a fragment alone. Defaults to literal; use regex only when you genuinely need pattern matching.", parameters: { type: "object", properties: { query: { type: "string", description: "Text to search for (regex supported, e.g. \"function\\s+login\")" }, path: { type: "string", description: "Optional, restrict to a single file or subdirectory (e.g. \"src/auth.ts\" or \"src/\")" }, mode: { type: "string", enum: ["literal", "regex"], description: "Match mode, default literal" }, case_sensitive: { type: "boolean", description: "Whether to match case, default false" } }, required: ["query"] } } },
-    { type: "function", function: { name: "find_files", description: "Find files by name or glob pattern — *.rs, main.js, src/**/*.ts — or just a substring of the filename. 【vs alternatives】Search by content with search; find a symbol's definition with find_symbol; when you know the exact path, read_file directly.", parameters: { type: "object", properties: { pattern: { type: "string", description: "Filename or glob pattern" } }, required: ["pattern"] } } },
+    { type: "function", function: { name: "find_files", description: "Find files by name or glob pattern — *.rs, main.js, src/**/*.ts — or just a substring of the filename. 【vs alternatives】Search by content with search; find a symbol's definition with find_symbol; when you know the exact path, read_file directly.", parameters: { type: "object", properties: { pattern: { type: "string", description: "Filename or glob pattern" }, limit: { type: "integer", description: "Optional; max results (default 200, max 2000). Results are capped DURING traversal and sorted afterwards, so a truncated result is an arbitrary subset in directory order — not the alphabetically first N. When the answer says it was truncated, narrow the pattern to a subdirectory rather than assuming you saw everything." } }, required: ["pattern"] } } },
     { type: "function", function: { name: "web_search", description: "General web-search fallback (the current desktop backend tries Google, Bing and DuckDuckGo in parallel and merges whatever actually comes back), returning a list of titles, URLs and snippets. Prefer tools closer to the question — the existing knowledge base, structured live sources, specialist databases, official documentation, package registries, GitHub and developer communities; use web_search only when no dedicated source applies or you need supplementary general-web evidence. Search snippets are only leads: read the original with web_fetch for any key conclusion and weigh it by source credibility — never treat a snippet, or this round's retrieved_at, as a current fact.", parameters: { type: "object", properties: { query: { type: "string", description: "Search keywords (English is often more precise)" } }, required: ["query"] } } },
     { type: "function", function: { name: "web_fetch", description: "Fetch a public web page and return its body text — for reading pages found by web_search, online documentation, API references, error messages and so on. http/https only. Intranet and localhost addresses ARE reachable — an internal wiki, a private docs site or a dev server on this machine can all be fetched; only link-local / cloud-metadata addresses (169.254.x.x) are refused. 【vs alternatives】To find a page use web_search; to call an API, send headers, or POST, use http_request.", parameters: { type: "object", properties: { url: { type: "string", description: "The full http/https URL" } }, required: ["url"] } } },
     { type: "function", function: { name: "local_discovery", description: "Look up places to eat, sights, venues and similar information near a location: addresses are resolved with Nominatim first, falling back to ArcGIS World Geocoding only when that is not acceptable; POIs come from OpenStreetMap Overpass, weather from Open-Meteo, and Wikipedia GeoSearch supplies nearby background only. distance_m is the Haversine straight-line distance, not a route distance or travel time. source_statuses[].status=success only means that endpoint responded successfully this time and the result parsed; it does not prove the data is complete, correct, fresh or live. The top-level retrieved_at is when the IDE finished this request, not when the map, POI, address or encyclopedia data was updated; source_statuses[].data_as_of, when present, is only the dataset/snapshot time the provider exposes, not a per-venue verification time; weather.observed_at is the observation time the provider reports. OSM POIs and raw opening_hours are only what the data source recorded — they do not prove a venue still exists or is open now, and a missing rating, price or open_now must stay unknown. These public endpoints may rate-limit and carry no application SLA. near=current requires coordinates obtained with the user's permission — never infer the location from a timezone or IP address.", parameters: { type: "object", properties: { query: { type: "string", minLength: 1, description: "What you are looking for, e.g. local breakfast, Sichuan food, museum, family activity" }, near: { type: "string", minLength: 1, description: "A city, address or district; for the current location pass current (the IDE will try to request location permission once)" }, latitude: { type: "number", minimum: -90, maximum: 90, description: "Latitude obtained with the user's permission; pass together with longitude" }, longitude: { type: "number", minimum: -180, maximum: 180, description: "Longitude obtained with the user's permission; pass together with latitude" }, radius_m: { type: "integer", minimum: 100, maximum: 20000, description: "Search radius in metres, default 3000" }, limit: { type: "integer", minimum: 1, maximum: 30, description: "Maximum number of places to return, default 12" }, language: { type: "string", description: "Language for Wikipedia and geocoding, e.g. zh, en, ja" } }, required: ["query"], anyOf: [{ required: ["near"] }, { required: ["latitude", "longitude"] }] } } },
@@ -32303,7 +32303,7 @@ function _mapToolCall(name, args, mcpToolMap = _mcpToolMap) {
     case "read_file": return { type: "read", path: args.path || "", offset: args.offset, limit: args.limit };
     case "list_dir": return { type: "list", path: args.path || "", depth: args.depth };
     case "search": return { type: "search", path: args.query || "", query: args.query || "", searchPath: args.path || "", mode: args.mode === "regex" ? "regex" : "literal", caseSensitive: !!args.case_sensitive };
-    case "find_files": return { type: "find", path: args.pattern || "", pattern: args.pattern || "" };
+    case "find_files": return { type: "find", path: args.pattern || "", pattern: args.pattern || "", limit: Number.isFinite(+args.limit) ? +args.limit : 0 };
     case "web_fetch": return { type: "web", path: args.url || "", url: args.url || "" };
     case "web_search": return { type: "websearch", path: String(args.query || ""), query: String(args.query || "") };
     case "read_screen": return { type: "readscreen", ocr: !!args.ocr };
@@ -37284,7 +37284,7 @@ async function _tsWorkerFormat(fp) {
   } finally { if (created) { try { model.dispose(); } catch {} } }
 }
 
-async function _agentFindFiles(root, pattern) {
+async function _agentFindFiles(root, pattern, limit) {
   root = String(root || "").replace(/\\/g, "/").replace(/\/+$/, "");
   if (!root) {
     const error = "[ERROR] 未打开工作区。";
@@ -37310,7 +37310,13 @@ async function _agentFindFiles(root, pattern) {
   ]);
   const out = [];
   const errors = [];
-  const MAX = 200, MAX_SCAN = 8000;
+  // MAX 原来是写死的 200，且**截断发生在 out.sort() 之前**——收满 200 就停止遍历，
+  // 然后再排序。于是模型拿到的是"遍历顺序（DFS，栈是 pop 的所以近似逆序）碰巧先撞上的
+  // 200 个"，排完序看起来却像是完整结果的前 200 个字典序。找 *.ts 时它可能整个 src/
+  // 一个没给、全是 test/ 下面的。
+  // 现在 limit 可由调用方给（上限 2000），并且下面会**如实说明**这是被截断的子集。
+  const MAX = Math.max(1, Math.min(2000, Number(limit) > 0 ? Math.floor(Number(limit)) : 200));
+  const MAX_SCAN = 8000;
   let scanned = 0;
   const stack = [{ dir: root, rel: "" }];
   while (stack.length && out.length < MAX && scanned < MAX_SCAN) {
@@ -37344,18 +37350,30 @@ async function _agentFindFiles(root, pattern) {
     }
   }
   out.sort();
+  // 遍历为什么停下来，必须让模型知道——它据此决定"这就是全部"还是"得换个找法"。
+  //
+  // 原来只在**无匹配**时才提"扫描没走完"。有匹配时，两种截断（收满 MAX、扫满 MAX_SCAN）
+  // 一个都不说清：前者只附一句"更多结果已截断"，后者干脆只字不提。模型于是把一个任意
+  // 子集当成完整答案，接着断言"项目里只有这 200 个 .ts"。
+  const hitLimit = out.length >= MAX;
+  const scanCapped = scanned >= MAX_SCAN;
+  const notes = [];
+  if (hitLimit) {
+    notes.push(`⚠️ 只给了 ${out.length} 条就停了（上限 ${MAX}）。**这不是字典序的前 ${MAX} 个**——遍历到 ${MAX} 条就停止了，再排的序，所以这是按目录遍历顺序碰巧先撞上的那批，整个子目录可能一个都没出现。要完整结果：把 pattern 缩到具体子目录（如 "src/**/*.ts"），或把 limit 调大（最大 2000）。`);
+  }
+  if (scanCapped) {
+    notes.push(`⚠️ 扫描到 ${MAX_SCAN} 个条目的上限就停了，剩下的目录一个都没看过。${out.length ? "上面这些是已看部分里的匹配，不是全部。" : "这不等于文件不存在。"}缩小到具体子目录再找一次，或改用 search。`);
+  }
   const body = out.length
     ? out.join("\n")
-    : (scanned >= MAX_SCAN
-      ? `(无匹配文件——但**扫描没走完**：到 ${MAX_SCAN} 个条目的上限就停了，剩下的目录一个都没看过。这不等于文件不存在，缩小到具体子目录再找一次，或改用 search。)`
-      : "(无匹配文件——已完整遍历，确实不存在)");
+    : (scanCapped ? "(已看过的部分里无匹配)" : "(无匹配文件——已完整遍历，确实不存在)");
   const text = body
-    + (out.length >= MAX ? "\n…(更多结果已截断)" : "")
+    + (notes.length ? `\n\n${notes.join("\n")}` : "")
     + (errors.length ? `\n\n${errors.join("\n")}` : "");
   // Traversal diagnostics are not files. Mixing them into `files` and `count`
   // made a failed scan look like successful matches and fed bogus `[ERROR]...`
   // pseudo-paths into read_file's fuzzy recovery.
-  return { count: out.length, text, files: out, errors };
+  return { count: out.length, text, files: out, errors, truncated: hitLimit, scanCapped };
 }
 
 /**
@@ -38771,7 +38789,19 @@ function _isReadOnlyParallel(call) {
   const t = call.type;
   if (_READ_ONLY_TYPES.has(t)) return true;
   if (t.endsWith("_search") || t === "knowledge") return true;
-  if (t === "git") return /^(status|diff|log|blame|conflicts|stash_list|branch)$/.test(call.op || "") && !call.create;
+  // git：只有**不动工作树**的那几个能并行。
+  //
+  // `branch` 原来只靠 `!call.create` 排除，于是「切到另一个分支」（有 branch 名、
+  // create 为假）被判成只读，和同一轮的 read_file 并发跑。切分支会把整棵工作树换掉，
+  // 那些并发的读拿到的是**另一个分支**的文件内容——而且读成功了、没有任何报错，模型
+  // 据此往下推理。这是最难查的一类：结果看起来完全正常，只是内容来自别的地方。
+  // 判据和 `_toolMutatesWorkspace` 对齐：branch 带名字＝切/建分支＝动工作树；
+  // 不带名字＝列分支＝只读。
+  if (t === "git") {
+    const op = call.op || "";
+    if (op === "branch") return !call.branch && !call.create;
+    return /^(status|diff|log|blame|conflicts|stash_list)$/.test(op);
+  }
   if (t === "http") return /^(get|head)$/i.test((call.method || "GET").trim());
   // WITH/PRAGMA/EXPLAIN are not provably read-only: writable CTEs, assignment
   // pragmas, and EXPLAIN ANALYZE can all execute mutations.
@@ -48275,7 +48305,11 @@ async function _fireHooks(root, event, payload) {
 }
 const _HOOKED_TOOL_TYPES = hookedTypes();
 function _hookToolName(call) {
-  return ({ write: "write_file", edit: "edit_file", multiedit: "multi_edit", cmd: "run_cmd", termtask: "run_cmd", delete: "delete_path", move: "move_path", mkdir: "mkdir", copy: "copy_path" })[call.type] || call.type;
+  // 这张表要给出**模型真正看到的工具名**——hook 脚本是照着工具名写匹配的。
+  // `mkdir` 曾经映射成 "mkdir"，而那个名字在工具清单里根本不存在（真名是 create_dir，
+  // 见 31079）。后果是双向的：照着文档写 create_dir 的 hook 永远不触发，而真触发时
+  // 脚本收到的 tool 是个查无此名的字符串，按名字分派的 hook 只能走进兜底分支。
+  return ({ write: "write_file", edit: "edit_file", multiedit: "multi_edit", cmd: "run_cmd", termtask: "run_cmd", delete: "delete_path", move: "move_path", mkdir: "create_dir", copy: "copy_path" })[call.type] || call.type;
 }
 
 async function _fetchWithTimeout(url, options = {}, timeoutMs = 9000) {
@@ -49691,13 +49725,14 @@ async function _executeToolStepInner(step, call, root, run) {
       let findFiles = [];
       const findErrors = [];
       let findTruncated = false;
+      let findScanCapped = false;
 
       if (!requests.length) {
         findErrors.push(`[ERROR] 绝对 pattern 不属于任何已打开的工作区: ${requestedPattern}`);
       } else {
         const scopedResults = await Promise.all(requests.map(async (request) => ({
           request,
-          result: await _agentFindFiles(request.root, request.pattern),
+          result: await _agentFindFiles(request.root, request.pattern, call.limit),
         })));
         const rootNameCounts = new Map();
         for (const { request } of scopedResults) {
@@ -49720,14 +49755,20 @@ async function _executeToolStepInner(step, call, root, run) {
           for (const error of Array.isArray(result?.errors) ? result.errors : []) {
             findErrors.push(requests.length > 1 && request.root ? `[${request.root}] ${error}` : error);
           }
-          if (/更多结果已截断/.test(String(result?.text || ""))) findTruncated = true;
+          // 用结构化字段，不要再嗅文本——提示语一改，这里就静默失灵了（而失灵的方向是
+          // "看起来没截断"，正好是最坏的那个方向）。
+          if (result?.truncated) findTruncated = true;
+          if (result?.scanCapped) findScanCapped = true;
         }
       }
 
       findFiles.sort((a, b) => String(a).localeCompare(String(b), "en"));
       if (findFiles.length > 2000) { findFiles = findFiles.slice(0, 2000); findTruncated = true; }
+      const findNotes = [];
+      if (findTruncated) findNotes.push(`⚠️ 结果被截断了。**这不是字典序的前 N 个**——遍历到上限就停了、之后才排的序，所以这是按目录遍历顺序碰巧先撞上的那批，整个子目录可能一条都没出现。别据此断言"项目里只有这些"。要完整结果：把 pattern 缩到具体子目录（如 "src/**/*.ts"），或把 limit 调大（最大 2000）。`);
+      if (findScanCapped) findNotes.push(`⚠️ 目录扫描到上限就停了，剩下的目录一个都没看过。${findFiles.length ? "上面这些是已看部分里的匹配，不是全部。" : ""}缩小到具体子目录再找一次，或改用 search。`);
       const findText = (findFiles.length ? findFiles.join("\n") : "(无匹配文件)")
-        + (findTruncated ? "\n…(更多结果已截断)" : "")
+        + (findNotes.length ? `\n\n${findNotes.join("\n")}` : "")
         + (findErrors.length ? `\n\n${findErrors.join("\n")}` : "");
       const findCount = findFiles.length;
       res.className = findCount && !findErrors.length ? "atc-result atc-result--ok" : "atc-result atc-result--err";
