@@ -986,7 +986,15 @@ test("an interrupted turn keeps what the model already wrote", () => {
   // 3. The run loop broke on the error BEFORE the line that accumulates the prose into the run
   //    summary — which is the only thing persisted to history. This is the one that made it
   //    survive a restart as well as a repaint.
-  assert.match(SRC, /if \(turn\.error\) \{[\s\S]{0,900}summaryText \+= \(summaryText \? "\\n\\n" : ""\) \+ turn\.text\.trim\(\);[\s\S]{0,200}finalErr = turn\.error; break;/);
+  assert.match(SRC, /if \(turn\.error\) \{[\s\S]{0,900}summaryText \+= \(summaryText \? "\\n\\n" : ""\) \+ turn\.text\.trim\(\);[\s\S]{0,700}finalErr = turn\.error; break;/);
+  // 正文之外，**已经落盘的文件**也要收账再走。流完即写是在流式阶段就真写磁盘的，
+  // 而这条 break 走在批处理之前：不收的话，落了盘的文件在消息历史、run 摘要、账本里
+  // 一个记录都没有——磁盘变了，所有记录都说没变。
+  // 注意锚点：`if (turn.error) {` 在子智能体循环里也有一处，而且排在前面。
+  // 用主循环那段独有的注释定位。
+  const errBranch = SRC.slice(SRC.indexOf("Bank whatever the dying turn managed to write"));
+  assert.match(errBranch.slice(0, 1400), /await _settleEagerWritesForBreak\(run\)/,
+    "出错那一轮不收流完即写的账");
 
   // And the notice now describes what actually happened to the interrupted call, instead of
   // implying every file change landed.
@@ -1188,8 +1196,20 @@ test("续传成功了要画得出来，正文不能在工具开始时被删掉",
 
 test("中断和停止都不能把已经写出来的内容丢掉", () => {
   // agent：用户点停止那一轮的正文，以前从入账那行上面 break 走了。
-  assert.match(SRC, /if \(!_live\(\)\) \{[\s\S]{0,700}summaryText \+= \(summaryText \? "\\n\\n" : ""\) \+ turn\.text\.trim\(\);[\s\S]{0,300}break;/,
+  assert.match(SRC, /if \(!_live\(\)\) \{[\s\S]{0,700}summaryText \+= \(summaryText \? "\\n\\n" : ""\) \+ turn\.text\.trim\(\);[\s\S]{0,700}break;/,
     "按停止的那一轮也要入账");
+  // 用户点停止时最需要知道的恰恰是"我按下去之前，它到底改了什么"。
+  const stopBranch = SRC.slice(SRC.indexOf("入账那一行在下面几十行之外，这条 break 从它上面走掉"));
+  assert.match(stopBranch.slice(0, 1200), /await _settleEagerWritesForBreak\(run\)/,
+    "按停止那一轮不收流完即写的账");
+  // 收账本身：要等在途写入落定（但有上限，不能让一个卡住的写入把 run 挂死），
+  // 并且如实报告哪些成功、哪些失败、哪些没落定。
+  const settle = SRC.slice(SRC.indexOf("async function _settleEagerWritesForBreak"));
+  assert.match(settle.slice(0, 1600), /Promise\.race\(\[/, "不等在途写入，run 结束了它还在飞");
+  assert.match(settle.slice(0, 1600), /setTimeout\(r, 8000\)/, "无上限地等会把 run 挂死");
+  assert.match(settle.slice(0, 1600), /已经真实写入磁盘/);
+  assert.match(settle.slice(0, 1600), /尝试写入但失败/);
+  assert.match(settle.slice(0, 1600), /状态未知/, "没落定的要如实说未知，不能算成功");
 
   // 普通聊天：两处 push 都挂着 !err —— 答案画在屏幕上却从不落库，下一次渲染就没了。
   assert.doesNotMatch(SRC, /if \(!err && historyContent\.trim\(\)\)/);

@@ -36161,6 +36161,36 @@ function _smartCompress(text, budget) {
   return out;
 }
 
+/// 出错 / 停止时把"流完即写"的账收干净。
+///
+/// 这两条 break 都走在批处理之前，而流完即写是在**流式阶段**就真落盘的。不收的话：
+/// 写入可能还在飞（run 都结束了它才落地），而且落了盘的文件在消息历史、run 摘要、
+/// 账本里一个记录都没有——磁盘变了，所有记录都说没变。
+///
+/// 返回一句给 run 摘要用的说明；没有任何即时写入时返回空串。
+async function _settleEagerWritesForBreak(run) {
+  if (!run) return "";
+  const pending = run._eagerPending;
+  if (pending && pending.size) {
+    // 等它们落定，但不能无限等：一个卡住的写入不该让整个 run 挂在这儿。
+    try {
+      await Promise.race([
+        Promise.allSettled([...pending]),
+        new Promise((r) => setTimeout(r, 8000)),
+      ]);
+    } catch {}
+  }
+  const landed = Array.isArray(run._eagerLanded) ? run._eagerLanded : [];
+  if (!landed.length) return "";
+  const ok = landed.filter((x) => x && x.ok).map((x) => x.path).filter(Boolean);
+  const bad = landed.filter((x) => x && !x.ok).map((x) => x.path).filter(Boolean);
+  const parts = [];
+  if (ok.length) parts.push(`这一轮已经真实写入磁盘：${[...new Set(ok)].join("、")}`);
+  if (bad.length) parts.push(`尝试写入但失败：${[...new Set(bad)].join("、")}`);
+  if (pending && pending.size) parts.push(`还有 ${pending.size} 个写入未在 8 秒内落定，状态未知`);
+  return parts.length ? `〔本轮中断前的写入结果〕${parts.join("；")}` : "";
+}
+
 function _trimMessagesIfHuge(messages, run = null, root = "", contextLimitTok = 0) {
   try { _perfPhase("trimMessages"); } catch {}
   // michael-compression 依赖逐字稳定的前缀。网关开启时，本地不再改写同一份 Agent
@@ -44350,7 +44380,18 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
           catch (err) { result = { type: "write", path: call.path, content: `[ERROR] ${err?.message || err}` }; }
           _settleCallLiveWritePreview(call, result);
           entry._eagerResult = { call, step, result };
+          // 记在 run 上，而不是只挂在 entry 上。
+          //
+          // 出错/停止那两条 break 走在批处理之前，`entry` 只活在 _agentModelTurn 内部的
+          // byIndex 里，外面够不着。于是一个**真的落了盘**的文件：不进消息历史（没有工具
+          // 结果消息）、不进 run 摘要（累加在 break 下面）、不进任何账本。下一轮模型完全
+          // 不知道自己写过它，撤销也不知道。磁盘变了而所有记录都说没变，这是最坏的一种不一致。
+          const _landedOk = !/^\[(?:ERROR|BLOCKED|DENIED)\]/.test(String(result?.content || ""));
+          (run._eagerLanded = run._eagerLanded || []).push({ path: call.path, ok: _landedOk });
         })();
+        // 在途集合：出错/停止时要等它们落定再收尾，否则 run 都结束了写入还在飞。
+        (run._eagerPending = run._eagerPending || new Set()).add(entry._eagerPromise);
+        entry._eagerPromise.finally(() => { try { run._eagerPending.delete(entry._eagerPromise); } catch {} });
       });
       // 让流式草稿携带本 run 已完成轮次的叙述（summaryText）：中途硬重启时能恢复整段 run、
       // 而不是只恢复当前这一轮（长 agent run 的先前几轮本来只在 run 结束才合并 push）。
@@ -44367,6 +44408,9 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
         // 路是同一个洞（那条今天早些时候已经补上），只是触发方式是用户自己点的停止。
         if (turn.text && turn.text.trim()) summaryText += (summaryText ? "\n\n" : "") + turn.text.trim();
         if (turn.reasoning && turn.reasoning.trim()) reasoningAll += (reasoningAll ? "\n" : "") + turn.reasoning.trim();
+        // 同上：按了停止，但这一轮流式阶段可能已经写了文件。用户最需要知道的恰恰是
+        // "我点停止之前，它到底改了什么"。
+        { const _eagerNote = await _settleEagerWritesForBreak(run); if (_eagerNote) summaryText += (summaryText ? "\n\n" : "") + _eagerNote; }
         break;
       }
       // The classifier ran in parallel with this visible model turn. Adopt it before any
@@ -44410,6 +44454,9 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
         // content had been preserved.
         if (turn.text && turn.text.trim()) summaryText += (summaryText ? "\n\n" : "") + turn.text.trim();
         if (turn.reasoning && turn.reasoning.trim()) reasoningAll += (reasoningAll ? "\n" : "") + turn.reasoning.trim();
+        // 流完即写是在流式阶段就真落盘的，而这条 break 走在批处理之前——不收账的话，
+        // 落了盘的文件在消息历史、run 摘要、账本里一个记录都没有。
+        { const _eagerNote = await _settleEagerWritesForBreak(run); if (_eagerNote) summaryText += (summaryText ? "\n\n" : "") + _eagerNote; }
         finalErr = turn.error; break;
       }
       clearAgentRetryToast();
