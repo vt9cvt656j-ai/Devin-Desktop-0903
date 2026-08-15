@@ -1275,7 +1275,8 @@ const UI_EXTRACT_JS: &str = r####"
 (() => {
   const MAX_NODES = __MAX_NODES__;
   const px = (v) => Math.round(parseFloat(v) || 0);
-  const seenColor = new Map();
+  const seenBg = new Map();
+  const seenText = new Map();
   const seenType = new Map();
   const spacing = new Map();
   const radii = new Map();
@@ -1295,7 +1296,13 @@ const UI_EXTRACT_JS: &str = r####"
   const bump = (map, key, weight) => { if (key) map.set(key, (map.get(key) || 0) + weight); };
 
   const vw = window.innerWidth, vh = window.innerHeight;
-  const all = document.body ? document.body.querySelectorAll("*") : [];
+  // 必须把 html 和 body 自己算进去。
+  //
+  // 原来只走 body.querySelectorAll("*")——那**不含 body 和 html 自身**，于是页面真正的
+  // 底色一次都没被采到。在 example.com 上实测：背景是白的，提取出来的主色却是文字的
+  // #000000。照这份规格还原会做出一个黑底页面，而且模型没有任何依据察觉不对。
+  const roots = [document.documentElement, document.body].filter(Boolean);
+  const all = document.body ? [...roots, ...document.body.querySelectorAll("*")] : roots;
   for (const el of all) {
     let r;
     try { r = el.getBoundingClientRect(); } catch (e) { continue; }
@@ -1306,10 +1313,12 @@ const UI_EXTRACT_JS: &str = r####"
     if (cs.display === "none" || cs.visibility === "hidden" || parseFloat(cs.opacity) === 0) continue;
     const area = r.width * r.height;
 
-    bump(seenColor, norm(cs.backgroundColor), area);
+    // 背景色和文字色分开统计。混在一张表里模型分不清"这是底色"还是"这是字色"——
+    // 而这两者在还原时是完全不同的用途，搞反了整页观感就反了。
+    bump(seenBg, norm(cs.backgroundColor), area);
     const text = (el.childElementCount === 0 ? (el.textContent || "") : "").trim();
     if (text) {
-      bump(seenColor, norm(cs.color), Math.max(area, 400));
+      bump(seenText, norm(cs.color), Math.max(area, 400));
       const key = [cs.fontFamily, cs.fontSize, cs.fontWeight, cs.lineHeight, cs.letterSpacing, norm(cs.color)].join("|");
       const prev = seenType.get(key);
       if (prev) { prev.count += 1; }
@@ -1370,7 +1379,15 @@ const UI_EXTRACT_JS: &str = r####"
     title: document.title,
     viewport: { w: vw, h: vh, dpr: window.devicePixelRatio || 1 },
     pageHeight: Math.round(document.documentElement.scrollHeight),
-    palette: rank(seenColor, 14).map((e) => ({ hex: e[0], coverage: Math.round(e[1]) })),
+    pageBackground: (() => {
+      // 页面底色：body → html 往上找第一个不透明的；都透明就是浏览器默认白。
+      for (const el of roots) {
+        try { const c = norm(getComputedStyle(el).backgroundColor); if (c) return c; } catch (e) {}
+      }
+      return "#ffffff";
+    })(),
+    palette: rank(seenBg, 10).map((e) => ({ hex: e[0], role: "background", coverage: Math.round(e[1]) }))
+      .concat(rank(seenText, 6).map((e) => ({ hex: e[0], role: "text", coverage: Math.round(e[1]) }))),
     typography: Array.from(seenType.values()).sort((a, b) => b.count - a.count).slice(0, 12),
     spacingScale: rank(spacing, 10).map((e) => e[0]).sort((a, b) => a - b),
     radii: rank(radii, 6).map((e) => e[0]),
