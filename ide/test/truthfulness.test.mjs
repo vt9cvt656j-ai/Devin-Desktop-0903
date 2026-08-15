@@ -82,3 +82,55 @@ test("代码里不许对模型输出做「加糖」后处理", () => {
     assert.doesNotMatch(SRC, re, `渲染层出现了对输出加糖的处理：${re}`);
   }
 });
+
+test("反谄媚纪律要发到 worker 和子智能体——它们才是真正交付的那一层", () => {
+  // 网关对 subagent 模式**只注入工具、不注入系统提示词**，所以主智能体那份 truthfulness
+  // 到不了这一层。而 worker 恰恰是改文件、跑验证、然后交简报的角色；它没有这条纪律，
+  // 简报天然偏向报喜，主智能体复核的又是跨模块契约而不是「有没有把失败埋在中间」。
+  // 表现就是：单干时诚实，一并行就出现「五件事报三件」。
+  assert.match(SRC, /const _SUBAGENT_TRUTH = `/, "子智能体的真话下限不见了");
+  const i = SRC.indexOf("const _SUBAGENT_TRUTH = `");
+  const seg = SRC.slice(i, SRC.indexOf("`;", i));
+  for (const clause of ["FIRST", "name those two", "could not verify"]) {
+    assert.ok(seg.includes(clause), `子智能体的下限里少了：${clause}`);
+  }
+  // 光有常量不算数，得真的拼进去。
+  assert.match(SRC, /\+ _SUBAGENT_TRUTH;/, "常量写了却没挂到 sysPrompt 上");
+});
+
+test("硬防线要拦提示词点名禁止的那几句恭维开场", () => {
+  // 提示词是软约束（模型可以不听），剥离器是硬约束。以前硬约束打的是「我明白了」
+  // 这类状态应答，而提示词点名的「好问题/你说得对/Great question」一句都不拦——
+  // 靶子对不上，等于两层都漏。
+  const i = SRC.indexOf("function _stripAckOpeners");
+  assert.ok(i >= 0);
+  const seg = SRC.slice(i, i + 4000);
+  for (const opener of ["好问题", "你说得", "Great (?:question|point)", "Good (?:catch|question|point)", "right", "Thanks for"]) {
+    assert.ok(seg.includes(opener), `剥离器不拦这句恭维：${opener}`);
+  }
+  // 剥到空就不剥：「你说得对。」独立成句时剥掉等于把整条回复吞掉。
+  assert.ok(seg.includes("if (!next.trim()) break;"), "缺少防空守卫，会把纯恭维的回复剥成空白");
+});
+
+test("「温和解释」这档不能把真话下限一起温和掉", () => {
+  // 用户在设置里点两下就能切到这一档。只注入「回答风格：温和解释。」四个字，
+  // 最容易被读成「坏消息要包一层」。
+  assert.match(SRC, /profile\.tone === "warm"/, "warm 档没有任何下限限定");
+  assert.match(SRC, /坏消息仍然先说/);
+});
+
+test("用户纠正你——口味照收，事实主张要先核对", () => {
+  // 自适应档案原来把所有纠正无条件当长期偏好，还会立刻覆盖持久记忆。
+  // 「不是这个，useEffect 的清理函数是同步执行的」长得就像一次纠正，但它是个错误的
+  // 事实主张；写进记忆之后会在此后每一轮被当成事实注入。
+  assert.match(SRC, /只对口味类纠正成立/);
+  assert.match(SRC, /不要把这条错误主张写进记忆/);
+});
+
+test("方案本身有问题时要在动手前说——最常见的谄媚不是假话，是沉默", () => {
+  assert.ok(TRUTH.includes("silently implementing a plan you believe is wrong"),
+    "缺少「方案有问题要先说」这条——而它正是最常见的那种谄媚");
+  // 必须写明它和「只做被要求的事」不冲突，否则两条规则会对撞，而让路的总是这条。
+  assert.ok(TRUTH.includes('not unrequested honesty'));
+  assert.ok(TRUTH.includes("Say it once"), "没写「说一次」会退化成每轮一段风险清单");
+});

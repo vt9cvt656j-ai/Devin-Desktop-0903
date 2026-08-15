@@ -25225,10 +25225,13 @@ function _stripAckOpeners(text) {
   text = text.replace(/^(?:[^\u000a]*(?:系统注入|编排提示|📌 ?标记|没有(?:看到|收到)新的(?:用户)?(?:请求|问题|消息))[^\u000a]*\u000a*)+/u, "").trimStart();
   for (let pass = 0; pass < 2; pass++) {
     const next = text.replace(
-      /^(?:(?:I (?:understand|see|acknowledge|got)\b[^\u000a.!?]{0,120}[.!?]\s*)|(?:I['’]m ready to (?:continue|proceed|help)\b[^\u000a.!?]{0,120}[.!?]\s*)|(?:(?:好的[，,]?|收到[，,]?|明白了?[，,]?)?我(?:明白|理解|了解|知道)(?:了|当前)[^\u000a。！？]{0,60}[。！？]\s*)|(?:(?:好的|收到|明白)[，,]?我(?:会|将)(?:优先|遵循|按照|使用)[^\u000a。！？]{0,80}[。！？]\s*)|(?:我注意到你?(?:给了我|提供了|发来了)[^\u000a。！？]{0,80}[。！？]?\s*)|(?:你?(?:给了我|发来了)(?:这些)?(?:运行状态|执行状态|状态信息|上下文)[^\u000a。！？]{0,60}[。！？]\s*))/u,
+      /^(?:(?:(?:好问题|问得好|说得对|你说得(?:很)?对|完全正确|Great (?:question|point)|Good (?:catch|question|point)|You(?:[’']?re| are) (?:absolutely |totally )?right|Thanks for (?:asking|the question))[！!。.，,—\-\s]*)|(?:I (?:understand|see|acknowledge|got)\b[^\u000a.!?]{0,120}[.!?]\s*)|(?:I['’]m ready to (?:continue|proceed|help)\b[^\u000a.!?]{0,120}[.!?]\s*)|(?:(?:好的[，,]?|收到[，,]?|明白了?[，,]?)?我(?:明白|理解|了解|知道)(?:了|当前)[^\u000a。！？]{0,60}[。！？]\s*)|(?:(?:好的|收到|明白)[，,]?我(?:会|将)(?:优先|遵循|按照|使用)[^\u000a。！？]{0,80}[。！？]\s*)|(?:我注意到你?(?:给了我|提供了|发来了)[^\u000a。！？]{0,80}[。！？]?\s*)|(?:你?(?:给了我|发来了)(?:这些)?(?:运行状态|执行状态|状态信息|上下文)[^\u000a。！？]{0,60}[。！？]\s*))/u,
       "",
     );
     if (next === text) break;
+    // 剥到空就不剥：「你说得对。」独立成句时，剥掉等于把整条回复吞掉。
+    // 恭维之所以要剥，是因为它挤在真内容前面；后面没有真内容时，它就是全部内容了。
+    if (!next.trim()) break;
     text = next.trimStart();
   }
   return text;
@@ -40366,6 +40369,21 @@ function _broadcastSubAgentCollaborationFinding(store, sourceJobId, peerJobIds, 
   return delivered;
 }
 
+/**
+ * 子智能体与 worker 的真话下限。
+ *
+ * 网关对 subagent 这个模式**只注入工具、不注入任何系统提示词**，所以主智能体那份
+ * truthfulness 模块（含反谄媚一节）到不了这一层。而 worker 恰恰是真正改文件、跑验证、
+ * 然后向主智能体交简报的角色——它没有这条纪律，交上来的简报天然偏向报喜，主智能体
+ * 复核的又是跨模块契约而不是「他有没有把失败埋在中间」。
+ *
+ * 结果就是：单干时诚实，一并行就开始出现「五件事报三件」。所以这里补一条压缩版，
+ * 只留最要命的三点——子智能体的提示词预算本来就被角色块和共享上下文占掉不少。
+ */
+const _SUBAGENT_TRUTH = `
+
+Reporting discipline (overrides tone and brevity): put what failed or was skipped FIRST, not after what worked. If you were asked for five things and two did not land, name those two — a report that mentions only the three implies the rest happened, and the agent reading you will act on that. Never describe something as done that you did not run and see succeed; "I could not verify that" is a complete line. No praise, no filler openers.`;
+
 async function _runSubAgent({ config, description, prompt, root, container, run, write = false, scope = [], role = "", depth = 1, onMutation = null, collaboration = null }) {
   const _sess = run && run.session;
   const _subGenSnap = _sess ? (_sess._runGen || 0) : 0; // 代际快照：父 run 被新回合取代后，子代理下个检查点确定性退出
@@ -40568,7 +40586,8 @@ async function _runSubAgent({ config, description, prompt, root, container, run,
     : `\n\n# 你的可改范围(scope)\n你**只能修改**下面这些路径内的文件（相对工作区根），其余文件只读：\n${scopeRel.map((s) => "- " + s).join("\n")}`;
   const sysPrompt = (write
     ? _WORKER_SYSTEM + _scopeGuidance
-    : _SUBAGENT_SYSTEM) + _agentRoleBlock(role) + (run?.skillsBlock ?? _skillsSystemBlock());
+    : _SUBAGENT_SYSTEM) + _agentRoleBlock(role) + (run?.skillsBlock ?? _skillsSystemBlock())
+    + _SUBAGENT_TRUTH;
   // Retrieval is ranked by the CHILD'S OWN TASK, not an empty string. The empty query
   // silently disabled three paths at once: _buildRepoMap degraded to pure symbol-count
   // ranking (biggest files, almost never the worker's scope), _buildRetrievedCodeContext
@@ -48834,9 +48853,33 @@ async function _executeToolStepInner(step, call, root, run) {
         return { type: call.type, path: fp, content: `[CONFLICT] ${fp} 在编辑器里有尚未保存的用户改动。IDE 已保留这些内容并阻止 Agent 覆盖；先保存或处理冲突后，再读取当前磁盘版本并重试。` };
       }
       const redactedRead = existed && _runReadWasRedacted(run, root, old, call.path, fp);
-      // The executor always reads the current disk text above and commits against that
-      // exact version below. Missing conversational read evidence is not a write veto;
-      // editor conflicts and writeTextFileIfUnchanged remain the objective guards.
+      // 缺少读取证据本身不否决写入——执行器每次都读当前磁盘内容并对着那一版提交，
+      // 编辑器冲突和 writeTextFileIfUnchanged 是客观防线。
+      //
+      // **但那两道防线防不住这一种**：模型对一个 3000 行的已有文件调 write_file，只重建了
+      // 它记得的 200 行。CAS 比对的 `old` 是执行器自己三行前刚读的磁盘内容，永远相等，
+      // 于是另外 2800 行被静默删除，而这次调用**报告成功**。这是这套系统能说出的最响的
+      // 一句假话：用户拿到一个「已完成」，代价是他的文件没了。
+      //
+      // 所以这里只加一道**下限**（不是判断，不去猜模型想干什么）：文件存在、这一轮没读过它、
+      // 而且新内容比原文少了一大半——三条同时成立才拦。合法的整文件重写不受影响（读过就放行），
+      // 有意的大幅删减也不受影响（读过就放行），小文件不受影响。拦下来的只有
+      // 「没看过就大幅覆盖」这一种，而它没有任何合法用途。
+      if (existed && call.type === "write" && !_runHasCurrentRead(run, root, old, call.path, fp)) {
+        const _oldLines = String(old || "").split("\n").length;
+        const _newLines = String(call.content ?? "").split("\n").length;
+        if (_oldLines >= 40 && _newLines < _oldLines * 0.5) {
+          res.className = "atc-result atc-result--blocked";
+          res.textContent = "⛔ 未读先覆盖";
+          return {
+            type: call.type, path: fp, recoverable: true,
+            content: `[BLOCKED] ${fp} 现有 ${_oldLines} 行，这次 write_file 只给了 ${_newLines} 行，`
+              + `而本轮没有完整读过这个文件——差额会被静默删掉，且无法从这次调用里看出来。\n`
+              + `先 read_file 读完整（或读到你要改的区间），确认剩下的内容确实该删；`
+              + `只想改其中一段的话用 edit / multi_edit，那样不会碰到没读过的部分。`,
+          };
+        }
+      }
       let _redactNote = "";
       let newContent = call.content;
       let _editNote = ""; // set when tolerant matching recovered a fuzzy old_string
@@ -56058,7 +56101,7 @@ function _adaptivePromptBlock() {
   if (profile.enabled === false) return "";
   const memory = "";
   return `\n\n【自适应用户档案】已开启。你要逐步贴近用户的真实工作方式，但这些只是偏好，不覆盖本轮明确指令；若本轮指令冲突，以用户本轮为准。
-回答风格：${_adaptiveOptionLabel("tone", profile.tone)}。
+回答风格：${_adaptiveOptionLabel("tone", profile.tone)}。${profile.tone === "warm" ? "（只影响措辞和解释密度，不影响结论：坏消息仍然先说、不稀释；用户说错了仍然当面说。）" : ""}
 细节密度：${_adaptiveOptionLabel("detail", profile.detail)}。
 执行节奏：${_adaptiveOptionLabel("autonomy", profile.autonomy)}。
 用户熟练度：${_adaptiveOptionLabel("skill", profile.skill)}。
@@ -56066,7 +56109,7 @@ function _adaptivePromptBlock() {
 自适应理解规则：
 - 用户表达很短、很乱、带情绪，或只说“啊 / ？？ / 继续 / 这个 / 不是这个 / 没懂 / 怎么回事”时，先结合最近对话、当前 UI/截图、刚完成或失败的动作、打开文件和任务状态推断他精确指的是什么；置信高就直接处理，并用一句话说明你依据哪条上下文判断。
 - 用户明显不懂技术或概念时，自动降到新手可理解的说法：先说结论和下一步，再补最少必要解释；不要甩术语、不要让用户自己翻文档。
-- 用户纠正你（例如“不是这个”“要中文”“不要改界面”“别打包”）时，把它当成强自适应信号；后续同类任务优先遵守。若是跨项目长期偏好，并且当前模式有 remember 工具，可记为 global 偏好。
+- 用户纠正你（例如“不是这个”“要中文”“不要改界面”“别打包”）时，把它当成强自适应信号；后续同类任务优先遵守。若是跨项目长期偏好，并且当前模式有 remember 工具，可记为 global 偏好。**但这一条只对口味类纠正成立**（语言、风格、范围、要不要做某一步）。如果这次纠正本身断言了一个技术事实（版本、API 行为、某段代码怎么执行），先按真实性纪律用证据核对：证据相反就在第一句说清并给出文件:行或真实输出，然后照他的决定做——但不要把这条错误主张写进记忆，否则它会在此后每一轮被当成事实注入。
 - 只有上下文仍不足以唯一判断时，才问；问题必须给 2-3 个具体候选，不要泛泛问“你想做什么”。${memory}`;
 }
 
