@@ -75,16 +75,16 @@ test("hooked set matches the pre-refactor literal exactly, including format's ab
   assert.equal(toolPolicy("format").hooked, false);
 });
 
-test("read-only-mode block matches the pre-refactor chain, gap included", () => {
+test("read-only-mode block matches the pre-refactor chain, plus the closed termtask gap", () => {
   assert.deepEqual(sorted(readOnlyBlockedTypes()), sorted(new Set([
     "write", "edit", "multiedit", "cmd", "delete", "move", "mkdir", "copy", "format",
-    "uiclick", "mcp",
+    "uiclick", "mcp", "termtask",
   ])));
-  // Documented gap, preserved deliberately: run_in_terminal is NOT blocked in the read-only
-  // modes, so Explorer/Plan/Reviewer can start a terminal task today. This assertion exists
-  // to make the gap loud — when it is closed, this line flips to `true` in the same commit.
-  assert.equal(blockedInReadOnlyMode("termtask"), false,
-    "known gap: closing it is a one-word policy change, and should be its own commit");
+  // 上一版这里断言的是 `false`，并写着「补掉的时候这一行要在同一个提交里翻成 true」——
+  // 这就是那个提交。termtask 就是 run_in_terminal，命令串由模型给出、原样执行，和 cmd
+  // 是同一类能力；cmd 在只读模式被挡而它不被挡，等于换个工具名就绕过去了。
+  assert.equal(blockedInReadOnlyMode("termtask"), true,
+    "run_in_terminal is arbitrary shell — a read-only mode must not be able to start one");
 });
 
 test("file-mutation and file-edit families match their pre-refactor literals", () => {

@@ -18477,6 +18477,23 @@ function _setStreaming(sess, on) {
       for (const cid of sess._cancelIds) { try { backend.cancelAi(cid); } catch {} }
     }
   }
+  /*
+   * Stop 也要停掉**在飞的 MCP 调用**。
+   *
+   * 上面那几行只取消模型请求（cancelAi），MCP 那条完全没碰过：用户按了停、界面也不转了，
+   * 而那个外部服务还在替一个没人要的请求干活——它的副作用照常发生（写文件、发请求、
+   * 扣配额）。而且下一条 MCP 调用走的是阻塞锁，会排在这条没人要的旧调用后面，
+   * 最长十分钟。
+   *
+   * 按 (服务, 根) 去重取消；Rust 侧的取消标志在会话锁之外，所以正握着锁的那条请求
+   * 也收得到。
+   */
+  if (!on && sess._mcpInFlight instanceof Map && sess._mcpInFlight.size) {
+    for (const { name, root } of sess._mcpInFlight.values()) {
+      try { backend.invoke("mcp_cancel", { name, root }); } catch {}
+    }
+    sess._mcpInFlight.clear();
+  }
   try {
     const c = sess.container;
     if (c && document.contains(c)) {
@@ -48056,7 +48073,8 @@ async function _executeToolStepInner(step, call, root, run) {
   // （查文档、读表结构）恰恰是 Plan 模式最需要的，不该和"写文件"一起被一刀切掉。
   if (readOnlyMode && blockedInReadOnlyMode(call.type, call)) {
     const modeName = _mode === "explorer" ? "Explorer" : _mode === "plan" ? "Plan" : "Reviewer";
-    const what = call.type === "cmd" ? "运行命令" : call.type === "mcp" ? "执行 MCP 工具" : "修改文件";
+    const what = call.type === "cmd" || call.type === "termtask" ? "运行命令"
+      : call.type === "mcp" ? "执行 MCP 工具" : "修改文件";
     res.className = "atc-result atc-result--blocked";
     res.textContent = `⛔ ${modeName} 模式下禁止${what}`;
     return { type: call.type, path: call.path, content: `[BLOCKED] ${modeName} 是只读模式，不能${what}。只能用 read_file/list_dir/search/find_files。` };
@@ -51460,6 +51478,16 @@ return { type: call.type, path: call.query || "", content: `[失败] ${call.type
         res.className = "atc-result atc-result--err"; res.textContent = "服务已断开";
         return { type: "mcp", path: label, content: `[失败] MCP 服务「${call.server}」在「${call.mcpRoot || "当前工作区"}」下已不在连接中。可能是它退出了或配置改过；在 MCP 面板点「重新连接全部」后重试。` };
       }
+      // 登记这条在飞的调用，好让全局 Stop 够得着它（见 _setStreaming 里那段）。
+      // 键带上工具名：同一个服务可能同时有资源读和工具调用在飞。
+      const _mcpFlightKey = `${call.server}\u0000${call.mcpRoot || ""}\u0000${call.tool || call.kind || ""}`;
+      const _mcpFlightSess = (run && run.session) || _currentSession();
+      try {
+        if (_mcpFlightSess) {
+          if (!(_mcpFlightSess._mcpInFlight instanceof Map)) _mcpFlightSess._mcpInFlight = new Map();
+          _mcpFlightSess._mcpInFlight.set(_mcpFlightKey, { name: call.server, root: call.mcpRoot || "" });
+        }
+      } catch {}
       try {
         const requestArgs = call.args && typeof call.args === "object" ? call.args : {};
         let out;
@@ -51517,9 +51545,19 @@ return { type: call.type, path: call.query || "", content: `[失败] ${call.type
         return { type: "mcp", path: label, content: mcpError ? `[MCP_ERROR] ${content}` : content, ...(feedbackImage ? { image: feedbackImage } : {}) };
       } catch (e) {
         const msg = String(e?.message || e).slice(0, 280);
+        // 被 Stop 取消的和真出错的，对用户是两件事：前者是他自己要的结果，不该报成失败。
+        if (/MCP 请求已取消/.test(msg)) {
+          _mcpCardSettle(vp, step, "已按你的要求停止");
+          res.className = "atc-result atc-result--blocked"; res.textContent = "已停止";
+          return { type: "mcp", path: label, content: `[interrupted] 你停止了这次 MCP 调用（${label}）。` };
+        }
         _mcpCardSettle(vp, step, "调用出错：" + msg);
         res.className = "atc-result atc-result--err"; res.textContent = "失败";
         return { type: "mcp", path: label, content: `[失败] MCP 工具 ${label} 出错: ${msg}` };
+      } finally {
+        // 注销。不删的话，一次成功调用之后再按停，会去取消一条早就结束的请求——
+        // Rust 那边会把标志留给**下一条**调用，等于误杀一次无辜的调用。
+        try { _mcpFlightSess?._mcpInFlight?.delete(_mcpFlightKey); } catch {}
       }
 
     } else if (call.type === "demostart") {
@@ -54761,6 +54799,7 @@ function renderMcpTool(body) {
             <p title="${_escAttr(desc)}">${_escHtml(desc)}</p>
           </div>
           <div class="mcpfp-card__btns">
+            <button type="button" class="ctp-iconbtn" data-mcpfp-log="${_escAttr(name)}" title="看这个服务自己说了什么（stderr 与它的日志通知）">${_dbUiIconSvg("list")}</button>
             ${sourceUrl ? `<button type="button" class="ctp-iconbtn" data-mcpfp-repo="${_escAttr(sourceUrl)}" title="查看来源">${_dbUiIconSvg("open")}</button>` : ""}
             ${Object.prototype.hasOwnProperty.call(ownServers, name)
               ? `<button type="button" class="ctp-iconbtn" data-mcpfp-edit="${_escAttr(name)}" title="编辑（命令、参数、环境变量）">${_dbUiIconSvg("edit") || "✎"}</button>`
@@ -54990,6 +55029,32 @@ function renderMcpTool(body) {
         renderMarket();
         _ensureMcpTools(root).then(async () => { await renderInstalled(); renderMarket(); });
       } catch (err) { showToast("安装失败：" + String(err?.message || err).slice(0, 120)); }
+      return;
+    }
+    /*
+     * 服务自己说了什么——目前**没有任何界面**能看到。
+     *
+     * 连接超时和子进程退出这两种错误会把 stderr 尾巴带进错误串（error_with_stderr），
+     * 但那条串在卡片上只剩 title 里 160 个字符；而服务连上了、调用时回 JSON-RPC 错误
+     * 或者狂打警告的那种，一个字都看不到。后端早就把 stderr 和 notifications/message
+     * 一起收在一条有界的尾巴里（40 行 × 500 字），只是从来没人取。
+     *
+     * 只在点击时取一次，不轮询：这是排障用的，不是状态指示。
+     */
+    const logName = e.target.closest("[data-mcpfp-log]")?.getAttribute("data-mcpfp-log");
+    if (logName) {
+      const btn = e.target.closest("button");
+      try {
+        if (btn) btn.disabled = true;
+        const lines = await _invokeCapped("mcp_server_log", { name: logName, root }, 8000, "MCP 服务日志");
+        const text = (Array.isArray(lines) ? lines : []).join("\n").trim();
+        const m = _chatToolModal({ title: `${logName} 的日志`, icon: _dbUiIconSvg("list"), wide: true });
+        m.body.innerHTML = text
+          ? `<pre class="tc-pre" style="max-height:60vh">${_escHtml(text)}</pre>`
+          : `<div class="ctp-empty">这个服务还没说过话——它既没往 stderr 写东西，也没发过日志通知。</div>`;
+      } catch (err) {
+        showToast("读不到日志：" + String(err?.message || err).slice(0, 120));
+      } finally { if (btn) btn.disabled = false; }
       return;
     }
     const repo = e.target.closest("[data-mcpfp-repo]")?.getAttribute("data-mcpfp-repo");

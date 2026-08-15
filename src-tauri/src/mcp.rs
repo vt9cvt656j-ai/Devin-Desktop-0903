@@ -164,6 +164,8 @@ struct Session {
     /// 服务自己宣告「我的清单变了」。没有独立的读线程能收这些通知（单个 `Receiver` 归
     /// `Session` 独占，后台再起一个读线程会把在飞的响应偷走），所以它们只在某次请求
     /// 顺路读到时被记下，由每轮的 `mcp_status` ping 排空——见 `mcp_take_changes`。
+    /// （只在会话闲着的时候；正忙时那次 ping 拿不到锁会直接答「在」，标志由在飞的
+    /// 那条请求顺路读到。）
     tools_changed: bool,
     resources_changed: bool,
     prompts_changed: bool,
@@ -1588,7 +1590,25 @@ async fn status_at(key: SessionKey) -> Result<bool, String> {
             return Ok(false);
         };
         let (running, retired) = {
-            let mut active = slot.lock().map_err(|_| "MCP session state poisoned")?;
+            /*
+             * try_lock，拿不到就答「在」。
+             *
+             * 这把锁被在飞的请求握着（工具调用最长 600 秒），而前端每一轮开工前都要对
+             * 每个已连接服务 await 一次 mcp_status，还是 Promise.all——用阻塞锁的话，
+             * 一个正在干活的服务会把**下一轮的工具准备**整个吊住，用户看到的是"发了一句
+             * 话，界面卡住不动"。
+             *
+             * 拿不到锁 = 有请求正在这个会话上跑 = 子进程活着并且在应答，这比下面那次 ping
+             * 是更强的存活证据，不是更弱。所以 WouldBlock 映射成 true 不是猜，是事实。
+             * （映射成 false 才是错的：那会把一个正忙的服务判成死的，接着被回收。）
+             *
+             * Poisoned 仍然照旧报错——那是真的坏了，和"忙"不是一回事。
+             */
+            let mut active = match slot.try_lock() {
+                Ok(guard) => guard,
+                Err(std::sync::TryLockError::WouldBlock) => return Ok(true),
+                Err(std::sync::TryLockError::Poisoned(_)) => return Err("MCP session state poisoned".to_string()),
+            };
             let Some(session) = active.as_mut() else {
                 return Ok(false);
             };
@@ -3351,6 +3371,52 @@ mod tests {
         let _ = stuck.await;
         mcp_disconnect(session_name).await.unwrap();
         let _ = std::fs::remove_file(&started_path);
+    }
+
+    /// 一个正在干活的服务，不该把下一轮的工具准备整个吊住。
+    ///
+    /// status_at 以前用阻塞锁，而这把锁被在飞的请求握着（工具调用最长 600 秒）；前端每轮
+    /// 开工前都要对每个已连接服务 await 一次 mcp_status，还是 Promise.all。于是用户发一句
+    /// 话，界面就停在"准备工具"那步不动——而服务其实好好的，只是忙。
+    #[tokio::test]
+    async fn status_answers_immediately_while_the_session_is_busy() {
+        let session_name = format!("fixture-status-while-busy-{}", std::process::id());
+        let session_key = key(&session_name);
+        let started_path = std::env::temp_dir().join(format!("mcp-busy-started-{session_name}"));
+        let _ = std::fs::remove_file(&started_path);
+        connect_fixture(&session_name, None).await.unwrap();
+
+        let stuck = {
+            let key = session_key.clone();
+            let started = started_path.to_string_lossy().into_owned();
+            tokio::task::spawn_blocking(move || {
+                call_on_session(
+                    &key,
+                    "delay_echo".into(),
+                    Some(json!({"text":"忙着","delay_ms":30_000,"started_path":started})),
+                )
+            })
+        };
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !started_path.is_file() {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("fixture 应当已经收到那条慢调用");
+
+        let alive = tokio::time::timeout(Duration::from_secs(2), status_at(session_key.clone()))
+            .await
+            .expect("忙碌会话把 mcp_status 吊住了——下一轮的工具准备会跟着一起卡")
+            .unwrap();
+        assert!(
+            alive,
+            "锁被在飞的请求握着，正说明它活着；这时候答「不在」会把一个正忙的服务当死的回收"
+        );
+
+        cancel_at(session_key.clone()).await.unwrap();
+        let _ = stuck.await;
+        mcp_disconnect(session_name).await.unwrap();
     }
 
     /// 服务回的 JSON-RPC 错误要把 `code` 和 `data` 一起带出来。

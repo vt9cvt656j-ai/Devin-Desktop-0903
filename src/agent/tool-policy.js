@@ -117,13 +117,12 @@ function seed() {
 
   // ── command execution ─────────────────────────────────────────────────────
   defineTool("cmd", { ...EXEC, readOnlyModeBlocked: true });
-  // KNOWN GAP, preserved on purpose. `termtask` (run_in_terminal) is absent from the
-  // read-only-mode block, so Explorer / Plan / Reviewer can currently start a terminal task
-  // even though those modes are meant to be read-only. It was invisible while the rule lived
-  // in an eleven-term `||` chain; here it is one field, and closing it is a one-word change
-  // (`readOnlyModeBlocked: true`). Left as-is so this refactor provably changes nothing —
-  // a behaviour fix belongs in its own commit, not smuggled into a "no-op" migration.
-  defineTool("termtask", EXEC);
+  // 缺口已补（原来这里留着一段注释说"故意先不改，behaviour fix 该单独一个提交"——
+  // 这就是那个提交）。`termtask` 就是 run_in_terminal：命令串由模型给出、原样执行，
+  // 和 `cmd` 是同一类能力，只是多了个长驻终端。它不在只读封禁名单里，意味着
+  // Explorer / Plan / Reviewer 这三个**声称只读**的模式可以起任意 shell——
+  // 而 `cmd` 在它们那儿是被挡住的。同一件事换个工具名就绕过去了，那道门等于虚设。
+  defineTool("termtask", { ...EXEC, readOnlyModeBlocked: true });
 
   // ── other side-effecting tools ────────────────────────────────────────────
   // 只读模式里按**单次调用**判：服务自己声明了 readOnlyHint 的放行，没声明的照挡。
