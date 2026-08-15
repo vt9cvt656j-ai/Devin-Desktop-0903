@@ -23452,6 +23452,21 @@ test("提取器脚本本身必须是合法 JS —— 它在页内跑，语法错
   // 上限要比 browser_eval 的 8000 大得多，且超了要说
   assert.match(browser, /if total > 60000 \{/);
   assert.match(browser, /上面的 JSON 是半截的/);
+
+  // 在 example.com 上实测抓出来的真 bug：只走 body.querySelectorAll("*") 不含 body 和
+  // html 自身，于是**页面真正的底色一次都没被采到**。那个页面底色是 #eeeeee，旧版提取
+  // 结果里这个色值完全不存在，主色被报成文字的 #000000——照它还原会做出个黑底页面，
+  // 而且模型没有任何依据发现不对。
+  assert.match(body, /const roots = \[document\.documentElement, document\.body\]\.filter\(Boolean\);/,
+    "遍历必须包含 html 和 body 自身，否则页面底色永远采不到");
+  assert.match(body, /\[\.\.\.roots, \.\.\.document\.body\.querySelectorAll\("\*"\)\]/);
+  assert.match(body, /pageBackground:/, "底色要显式给出，不能让模型从 palette 里猜");
+  // 背景色和文字色要分开：混在一张表里模型分不清哪个是底色，而这两者用途完全相反
+  assert.match(body, /const seenBg = new Map\(\);/);
+  assert.match(body, /const seenText = new Map\(\);/);
+  assert.match(body, /role: "background"/);
+  assert.match(body, /role: "text"/);
+  assert.doesNotMatch(body, /const seenColor = new Map\(\)/, "又混回一张表了");
 });
 
 // ══ 子智能体的自由度 ═══════════════════════════════════════════════════════
