@@ -364,6 +364,13 @@ export function Shell() {
                       <span className="assistant-capability__item-icon"></span>
                       <span data-i18n="assistant.capability.browser">浏览器</span>
                     </button>
+                    {/* 用户自己接进来的工具、知识库、角色、命令。带一个出错角标——声明写错
+                        时以前是彻底静默的，用户只能怀疑自己路径写错了。 */}
+                    <button className="assistant-capability__item" id="capabilityCapsItem" type="button" role="menuitem">
+                      <span className="assistant-capability__item-icon"></span>
+                      <span data-i18n="assistant.capability.caps">我的能力</span>
+                      <span className="assistant-capability__badge" id="capabilityCapsBadge" hidden></span>
+                    </button>
                   </span>
                 </span>
               </span>
