@@ -15416,7 +15416,8 @@ const _ICON_BROWSER = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor
   const _habitsItem = document.getElementById("capabilityHabitsItem");
   const _rulesItem = document.getElementById("capabilityRulesItem");
   const _browserItem = document.getElementById("capabilityBrowserItem");
-  const _items = () => [_habitsItem, _rulesItem, _browserItem].filter(Boolean);
+  const _capsItem = document.getElementById("capabilityCapsItem");
+  const _items = () => [_habitsItem, _rulesItem, _browserItem, _capsItem].filter(Boolean);
   /*
    * 状态直接画在行上，不加一行字。
    *
@@ -15429,6 +15430,16 @@ const _ICON_BROWSER = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor
     try {
       _habitsItem?.classList.toggle("is-active", String(_userHabitsText || "").trim().length > 0);
       _rulesItem?.classList.toggle("is-active", String(_userRulesText || "").trim().length > 0);
+      // 声明写错时必须在**没打开面板**的时候就看得见——否则用户根本不知道该来看。
+      const _caps = _userCapabilities();
+      const _capsCount = _caps.tools.length + _caps.roles.length + _caps.commands.length + _caps.disabled.length;
+      _capsItem?.classList.toggle("is-active", _capsCount > 0);
+      const _badge = document.getElementById("capabilityCapsBadge");
+      if (_badge) {
+        _badge.hidden = !_caps.errors.length;
+        _badge.textContent = _caps.errors.length ? String(_caps.errors.length) : "";
+        _badge.title = _caps.errors.length ? `${_caps.errors.length} 条能力声明没有生效` : "";
+      }
     } catch {}
   };
   /*
@@ -15492,6 +15503,11 @@ const _ICON_BROWSER = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor
     const icon = _browserItem.querySelector(".assistant-capability__item-icon");
     if (icon) icon.innerHTML = _ICON_BROWSER;
     _browserItem.addEventListener("click", () => { _closeCapabilitiesMenu(); void _openBrowserPanel(); });
+  }
+  if (_capsItem) {
+    const icon = _capsItem.querySelector(".assistant-capability__item-icon");
+    if (icon) icon.innerHTML = _ICON_CAPS;
+    _capsItem.addEventListener("click", () => { _closeCapabilitiesMenu(); void _openCapabilitiesPanel(); });
   }
   // 窗口大小一变，之前算好的 left 就不对了。菜单开着才重算，关着不做无用功。
   window.addEventListener("resize", () => { if (_menu && !_menu.hidden) _alignCapabilitiesMenu(); });
@@ -27384,6 +27400,142 @@ async function _openBrowserPanel() {
   m.body.querySelectorAll('input[name="bp-browser"]').forEach((r) => r.addEventListener("change", save));
   ext.addEventListener("change", save);
   paintWarn();
+}
+
+// ===== 「我接进来的能力」面板 =====
+//
+// 上一版把能力系统做完了，却漏掉了它的另一半：**用户看不见它**。
+//
+// 声明写错时 `normalizeCapabilities` 认真收集了 errors，然后这些 errors 没给任何人看——
+// 用户手写 JSON 一定会写错，而错了是彻底静默的：工具没出现、没有提示、他只能怀疑自己
+// 路径写错了，然后查一晚上。收集了不显示，比不收集更糟，因为它让人以为已经处理了。
+//
+// 而且整套能力唯一的发现途径是一份他不知道存在的文档文件。一个功能只有能被找到、能看出
+// 它此刻是什么状态、出错时能说清哪里错了，才算做完。
+const _ICON_CAPS = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2 4 6v6c0 5 3.4 8.9 8 10 4.6-1.1 8-5 8-10V6z"/><path d="m9 12 2 2 4-4"/></svg>';
+
+/** 声明文件的候选位置，按读取顺序。面板照这个顺序展示，用户才知道谁盖过谁。 */
+function _capabilityScopePaths(home, root) {
+  const out = [];
+  if (home) out.push({ label: "个人（所有项目通用）", path: `${home}/.michael/settings.json` });
+  if (root) {
+    out.push({ label: "项目（跟着仓库走，团队共享）", path: `${root.replace(/\/+$/, "")}/.michael/settings.json` });
+    out.push({ label: "项目 · 只属于你（别提交）", path: `${root.replace(/\/+$/, "")}/.michael/settings.local.json` });
+  }
+  return out;
+}
+
+/** 新建配置文件时写进去的起手式——不是空文件，是一份改改就能用的东西。 */
+const _CAPABILITY_STARTER = `{
+  "capabilities": {
+    "tools": [
+      {
+        "name": "my_api",
+        "description": "改成你自己的接口。这段描述就是模型判断「什么时候该用它」的依据，写具体些。",
+        "parameters": { "query": { "type": "string", "description": "要查什么", "required": true } },
+        "http": { "url": "https://example.internal/api?q={query}", "headers": { "Authorization": "Bearer \${MY_TOKEN}" } }
+      }
+    ],
+    "knowledge": [],
+    "roles": [],
+    "commands": [],
+    "disabled": []
+  }
+}
+`;
+
+async function _openCapabilitiesPanel() {
+  const m = _chatToolModal({ title: "能力 · 你自己接进来的", icon: _ICON_CAPS, wide: true });
+  if (!inTauri) { m.body.innerHTML = `<div class="bp-empty">能力声明只在桌面 App 里生效。</div>`; return; }
+  const root = String(_knownWorkspaceRoots()[0] || "").replace(/\/+$/, "");
+  // 打开面板时**重新读一次**：用户多半是刚改完文件过来看结果的，这时候给他 10 秒前的
+  // 缓存等于什么都没说。
+  _userCapsCache = { root: null, ts: 0 };
+  const caps = await _refreshUserCapabilities(root);
+  let home = "";
+  try { home = String((await backend.homeDir?.()) || "").replace(/\/+$/, ""); } catch {}
+
+  const esc = _escHtml;
+  const rows = (items, render) => items.map(render).join("");
+  const section = (title, count, inner) =>
+    `<div class="cap-sec"><div class="cap-sec__head">${esc(title)}<span class="cap-sec__n">${count}</span></div>${inner}</div>`;
+
+  let html = "";
+  // 错误排在最前面，红的。这是这个面板存在的首要理由。
+  if (caps.errors.length) {
+    html += `<div class="cap-err"><b>${caps.errors.length} 条声明没有生效</b>`
+      + `<ul>${caps.errors.map((e) => `<li>${esc(e)}</li>`).join("")}</ul>`
+      + `<span>其余声明照常生效。改完文件回到这里再看一次即可，不用重启。</span></div>`;
+  }
+  const httpTools = caps.tools.filter((t) => t.kind !== "folder");
+  const folders = caps.tools.filter((t) => t.kind === "folder");
+  html += section("工具", httpTools.length, httpTools.length
+    ? `<div class="cap-list">${rows(httpTools, (t) => `<div class="cap-row"><span class="cap-row__name">${esc(t.name)}</span>`
+      + `<span class="cap-row__src">${esc(t.source || "")}</span>`
+      + `<span class="cap-row__mid">${esc(t.http.method)} ${esc(t.http.url)}</span></div>`)}</div>`
+    : `<div class="cap-none">还没有。下面「新建示例」会给你一份改改就能用的。</div>`);
+  html += section("知识库", folders.length, folders.length
+    ? `<div class="cap-list">${rows(folders, (t) => `<div class="cap-row"><span class="cap-row__name">${esc(t.name)}</span>`
+      + `<span class="cap-row__src">${esc(t.source || "")}</span>`
+      + `<span class="cap-row__mid">${esc(t.folder.path)}</span></div>`)}</div>`
+    : `<div class="cap-none">还没有。指一个本地目录，模型就能在里面检索。</div>`);
+  html += section("角色", caps.roles.length, caps.roles.length
+    ? `<div class="cap-list">${rows(caps.roles, (r) => `<div class="cap-row"><span class="cap-row__name">${esc(r.name)}</span>`
+      + `<span class="cap-row__src">${esc(r.source || "")}</span>`
+      + `<span class="cap-row__mid">${esc((r.tools || []).join("、") || "只有提示词，没有额外工具")}</span></div>`)}</div>`
+    : `<div class="cap-none">还没有。角色可以带自己的提示词和工具矩阵。</div>`);
+  html += section("命令", caps.commands.length, caps.commands.length
+    ? `<div class="cap-list">${rows(caps.commands, (c) => `<div class="cap-row"><span class="cap-row__name">/${esc(c.cmd)}</span>`
+      + `<span class="cap-row__src">${esc(c.source || "")}</span>`
+      + `<span class="cap-row__mid">${esc(c.desc)}</span></div>`)}</div>`
+    : `<div class="cap-none">还没有。写一条就能在输入框里按 / 唤出来。</div>`);
+  html += section("已关闭的内置工具", caps.disabled.length, caps.disabled.length
+    ? `<div class="cap-off">${caps.disabled.map((d) => `<code>${esc(d)}</code>`).join("")}</div>`
+    : `<div class="cap-none">没有关掉任何内置工具。</div>`);
+
+  const scopes = _capabilityScopePaths(home, root);
+  html += `<div class="cap-sec"><div class="cap-sec__head">配置文件</div><div class="cap-files">`
+    + scopes.map((s, i) => `<div class="cap-file"><span class="cap-file__label">${esc(s.label)}</span>`
+      + `<code class="cap-file__path">${esc(s.path)}</code>`
+      + `<button class="cap-btn" data-open="${i}">打开</button>`
+      + `<button class="cap-btn cap-btn--ghost" data-new="${i}">新建示例</button></div>`).join("")
+    + `</div><div class="cap-hint">同名的以先读到的为准（个人 &gt; 项目）；「已关闭」取并集——任一层说别用就算数。改完 10 秒内自动生效。</div></div>`;
+  m.body.innerHTML = html;
+
+  m.body.querySelectorAll("[data-open]").forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      const s = scopes[Number(btn.dataset.open)];
+      if (!s) return;
+      try {
+        await openFile(s.path, s.path.split("/").pop());
+        m.close();
+      } catch { showToast("这个文件还不存在，点「新建示例」先建一份"); }
+    });
+  });
+  m.body.querySelectorAll("[data-new]").forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      const s = scopes[Number(btn.dataset.new)];
+      if (!s) return;
+      // 已经存在就绝不覆盖——用户的配置比一份示例值钱得多。
+      try {
+        const existing = await backend.readTextFile(s.path);
+        if (String(existing || "").trim()) {
+          showToast("这个文件已经有内容了，直接打开来改，不覆盖");
+          await openFile(s.path, s.path.split("/").pop());
+          m.close();
+          return;
+        }
+      } catch { /* 不存在，正常往下建 */ }
+      try {
+        await backend.invoke("write_text_file", { path: s.path, content: _CAPABILITY_STARTER });
+        await openFile(s.path, s.path.split("/").pop());
+        m.close();
+        showToast("已建好一份示例，改成你自己的接口即可");
+      } catch (e) {
+        showToast(`建不了：${String(e?.message || e).slice(0, 120)}`);
+      }
+    });
+  });
 }
 
 const _SKILLS_KEY = "michael-ide.skills.v1";
