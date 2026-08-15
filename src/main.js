@@ -15383,13 +15383,17 @@ const _ICON_MCP = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" st
 // 图标是唯一能一眼分出强弱的地方。
 const _ICON_HABITS = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="7" r="3.2"/><path d="M5.5 20.5a6.5 6.5 0 0 1 13 0"/></svg>';
 const _ICON_RULES = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6"/><path d="M8 13h8"/><path d="M8 17h5"/></svg>';
+// 浏览器：一个地球仪。下面那段块语句在模块求值时就跑，所以这个常量必须在它**之前**
+// 声明完——放到文件后面会是 TDZ 报错，而且是「应用一启动就白屏」那种，测试还照样全绿。
+const _ICON_BROWSER = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M3.5 9h17M3.5 15h17"/><ellipse cx="12" cy="12" rx="4" ry="9"/></svg>';
 {
   const _wrap = document.getElementById("capabilitiesMenuWrap");
   const _capBtn = document.getElementById("capabilitiesBtn");
   const _menu = document.getElementById("capabilitiesMenu");
   const _habitsItem = document.getElementById("capabilityHabitsItem");
   const _rulesItem = document.getElementById("capabilityRulesItem");
-  const _items = () => [_habitsItem, _rulesItem].filter(Boolean);
+  const _browserItem = document.getElementById("capabilityBrowserItem");
+  const _items = () => [_habitsItem, _rulesItem, _browserItem].filter(Boolean);
   /*
    * 状态直接画在行上，不加一行字。
    *
@@ -15460,6 +15464,11 @@ const _ICON_RULES = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" 
     const icon = _rulesItem.querySelector(".assistant-capability__item-icon");
     if (icon) icon.innerHTML = _ICON_RULES;
     _rulesItem.addEventListener("click", () => { _closeCapabilitiesMenu(); void openUserDocTab("rules"); });
+  }
+  if (_browserItem) {
+    const icon = _browserItem.querySelector(".assistant-capability__item-icon");
+    if (icon) icon.innerHTML = _ICON_BROWSER;
+    _browserItem.addEventListener("click", () => { _closeCapabilitiesMenu(); void _openBrowserPanel(); });
   }
   // 窗口大小一变，之前算好的 left 就不对了。菜单开着才重算，关着不做无用功。
   window.addEventListener("resize", () => { if (_menu && !_menu.hidden) _alignCapabilitiesMenu(); });
@@ -27729,6 +27738,9 @@ function _scheduleWorkspaceAgentWarmup(root) {
           _refreshFileSkills(normalized),
           _warmMcpTools(normalized),
           _gatherAgentContext("", normalized),
+          // 后端的浏览器选择是进程内状态、不落盘，不回灌的话用户选了 Edge、重启一次
+          // 又悄悄变回 Chrome——一个只在下次启动才出现的 bug。
+          _restoreBrowserPref(),
         ]);
       } finally {
         state.pending = false;
@@ -27761,6 +27773,100 @@ function _chatToolModal(opts) {
   overlay.addEventListener("mousedown", (e) => { if (e.target === overlay) close(); });
   card.querySelector(".ctp-close").addEventListener("click", close);
   return { overlay, card, body: card.querySelector(".ctp-body"), close };
+}
+
+// ===== 自动化用哪个浏览器 =====
+//
+// 以前这是写死的：候选表按固定优先级取第一个装了的，装了 Chrome 就只能用 Chrome。
+// 想把自己的 Chrome 留给自己、让自动化去用 Edge，做不到——而那恰恰能让「Dock 里两个
+// 一模一样的图标」从根上消失：一个是你的，一个明显是机器人的。
+//
+// 存 localStorage 并在启动时回灌给后端：后端那份是进程内状态，不落盘，重启就没了。
+const _BROWSER_PREF_KEY = "michael-ide.browser.pref.v1";
+
+function _loadBrowserPref() {
+  try {
+    const raw = JSON.parse(localStorage.getItem(_BROWSER_PREF_KEY) || "{}");
+    return {
+      browser: typeof raw.browser === "string" ? raw.browser : "",
+      extensions: Array.isArray(raw.extensions) ? raw.extensions.filter((s) => typeof s === "string") : [],
+    };
+  } catch { return { browser: "", extensions: [] }; }
+}
+
+async function _applyBrowserPref(pref) {
+  try { localStorage.setItem(_BROWSER_PREF_KEY, JSON.stringify(pref)); } catch {}
+  if (!inTauri) return null;
+  try {
+    return await backend.invoke("browser_set_preference", {
+      browser: pref.browser || "",
+      extensions: pref.extensions || [],
+    });
+  } catch { return null; }
+}
+
+/// 启动时把存下来的选择回灌给后端。不做的话，用户选了 Edge、重启一次又变回 Chrome。
+async function _restoreBrowserPref() {
+  const pref = _loadBrowserPref();
+  if (!pref.browser && !(pref.extensions || []).length) return;
+  await _applyBrowserPref(pref);
+}
+
+async function _openBrowserPanel() {
+  const m = _chatToolModal({ title: "浏览器 · 自动化用哪个", icon: _ICON_BROWSER });
+  const pref = _loadBrowserPref();
+  let state = null;
+  if (inTauri) {
+    try { state = await backend.invoke("browser_get_preference"); } catch {}
+  }
+  const installed = (state && Array.isArray(state.installed)) ? state.installed : [];
+  const extOk = new Set((state && state.extensionsWorkOn) || []);
+  if (!inTauri) {
+    m.body.innerHTML = `<div class="bp-empty">浏览器自动化只在桌面 App 里可用。</div>`;
+    return;
+  }
+  if (!installed.length) {
+    m.body.innerHTML = `<div class="bp-empty">本机没有找到 Chromium 内核的浏览器。<br>装上 Chrome、Edge、Brave 或 Chromium 任一款，自动化才能跑起来。</div>`;
+    return;
+  }
+  const rows = [{ id: "", label: "自动选", path: "装了哪个用哪个（当前：" + installed[0].label + "）" }]
+    .concat(installed);
+  const current = installed.some((b) => b.id === pref.browser) ? pref.browser : "";
+  m.body.innerHTML =
+    `<div class="bp-hint">选中的浏览器会被用来跑自动化。<b>它和你自己开的那个是两个进程</b>，Dock 里会各有一个图标——选一个跟你日常用的不同的牌子，就一眼能分清哪个是机器人在开。</div>`
+    + `<div class="bp-list">` + rows.map((b) => {
+      const on = b.id === current;
+      return `<label class="bp-row${on ? " is-on" : ""}"><input type="radio" name="bp-browser" value="${_escHtml(b.id)}"${on ? " checked" : ""}>`
+        + `<span class="bp-row__text"><span class="bp-row__name">${_escHtml(b.label)}</span>`
+        + `<span class="bp-row__path">${_escHtml(b.path)}</span></span></label>`;
+    }).join("") + `</div>`
+    + `<div class="bp-sec">浏览器扩展（每行一个**未打包**的扩展目录，留空就是不加载）</div>`
+    + `<textarea class="bp-ext" rows="3" placeholder="/Users/你/某个扩展目录">${_escHtml((pref.extensions || []).join("\n"))}</textarea>`
+    + `<div class="bp-warn" hidden></div>`;
+
+  const warn = m.body.querySelector(".bp-warn");
+  const ext = m.body.querySelector(".bp-ext");
+  const paintWarn = () => {
+    // 配了扩展却选着 Chrome，当场说清楚——实测 Chrome 151 完全不理 --load-extension，
+    // 不说的话用户会以为是自己路径写错了，然后查一晚上。
+    const picked = m.body.querySelector('input[name="bp-browser"]:checked')?.value || (installed[0] || {}).id || "";
+    const hasExt = ext.value.split("\n").some((s) => s.trim());
+    const bad = hasExt && !extOk.has(picked);
+    warn.hidden = !bad;
+    if (bad) warn.textContent = "Chrome 从 137 起已经不接受命令行加载扩展，这里填的扩展不会生效。要用扩展请改选 Edge / Brave / Chromium。";
+  };
+  const save = () => {
+    const picked = m.body.querySelector('input[name="bp-browser"]:checked')?.value ?? "";
+    const dirs = ext.value.split("\n").map((s) => s.trim()).filter(Boolean);
+    m.body.querySelectorAll(".bp-row").forEach((r) => {
+      r.classList.toggle("is-on", r.querySelector("input")?.checked === true);
+    });
+    paintWarn();
+    void _applyBrowserPref({ browser: picked, extensions: dirs });
+  };
+  m.body.querySelectorAll('input[name="bp-browser"]').forEach((r) => r.addEventListener("change", save));
+  ext.addEventListener("change", save);
+  paintWarn();
 }
 
 const _SKILLS_KEY = "michael-ide.skills.v1";

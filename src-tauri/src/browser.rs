@@ -1463,17 +1463,29 @@ pub fn browser_set_preference(
     if let Some(dirs) = extensions {
         set_extension_dirs(dirs);
     }
+    Ok(browser_state_json())
+}
+
+/// 只读当前状态。和 setter 分开，因为 setter 传空就是「自动选」——拿它来读会把用户
+/// 刚选的浏览器清掉，而这种 bug 只在「打开面板看一眼再关掉」时才出现，最难查。
+#[tauri::command]
+pub fn browser_get_preference() -> Result<serde_json::Value, String> {
+    Ok(browser_state_json())
+}
+
+fn browser_state_json() -> serde_json::Value {
     let installed: Vec<serde_json::Value> = crate::capture::installed_browsers()
         .iter()
-        .map(|(k, path)| {
-            serde_json::json!({ "id": k.id, "label": k.label, "path": path })
-        })
+        .map(|(k, path)| serde_json::json!({ "id": k.id, "label": k.label, "path": path }))
         .collect();
-    Ok(serde_json::json!({
+    serde_json::json!({
         "installed": installed,
         "active": crate::capture::browser_pref(),
         "extensions": extension_dirs(),
-    }))
+        // Chrome 从 137 起彻底不理 --load-extension（实测 151 连坏 manifest 都不报错）。
+        // 界面据此告诉用户「选了 Chrome 的话扩展这栏是白填的」，而不是让他自己撞。
+        "extensionsWorkOn": ["edge", "brave", "chromium"],
+    })
 }
 
 /// Toggle the visible Set-of-Mark number badges. The frontend turns them OFF
