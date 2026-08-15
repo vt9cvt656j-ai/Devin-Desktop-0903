@@ -84,10 +84,22 @@ fi
 
 echo "签名身份：$APPLE_SIGNING_IDENTITY"
 
+# 目标架构。留空＝本机（Apple Silicon 上就是 aarch64）。
+#
+#   MRDAYONE_TARGET=x86_64-apple-darwin     ← Intel Mac 专用包
+#   MRDAYONE_TARGET=universal-apple-darwin  ← 一个包通吃两种架构
+#
+# 指定 target 之后 cargo/Tauri 的产物会落到 target/<triple>/release/ 而不是 target/release/，
+# 所以下面每一处路径都得跟着走。原来是三处硬编码 target/release/…：不改的话指定架构构建会
+# 「成功但什么也找不到」——脚本对着本机架构的旧产物做校验，甚至给出通过的结论。
+TARGET="${MRDAYONE_TARGET:-}"
+TARGET_DIR="target${TARGET:+/$TARGET}/release"
+[ -n "$TARGET" ] && echo "目标架构：$TARGET（产物落在 $TARGET_DIR/bundle/）" || echo "目标架构：本机"
+
 # macOS 会给执行过的文件盖上 com.apple.provenance，它会让 cargo 的硬链接/克隆失败，
 # 而 xattr -d 删不掉——只能重写文件换个 inode。
 cleaned=0
-for f in src-tauri/gen/schemas/* src-tauri/binaries/* target/release/build/*/build_script_build-*; do
+for f in src-tauri/gen/schemas/* src-tauri/binaries/* "$TARGET_DIR"/build/*/build_script_build-*; do
   [ -f "$f" ] || continue
   if xattr -p com.apple.provenance "$f" >/dev/null 2>&1; then
     cp "$f" "$f.tmp" && mv -f "$f.tmp" "$f" && cleaned=$((cleaned + 1))
@@ -114,14 +126,28 @@ else
   echo "（本地自用可以忽略；要发版就必须有它，否则客户端会因签名验证失败拒绝安装）" >&2
 fi
 
+# 记下开工时间，下面用它判断更新产物是不是**这一轮**造的。
+#
+# 清理统一走一个函数：后面校验那段还要挂载 DMG，而 `trap ... EXIT` 是**覆盖**不是追加——
+# 各装各的必然只剩最后一个，前面那个临时文件就永远留在 /tmp 了。
+_started="$(mktemp)"
+_mounted=""
+_cleanup() {
+  rm -f "$_started" 2>/dev/null || true
+  [ -n "$_mounted" ] && hdiutil detach "$_mounted" -quiet >/dev/null 2>&1
+  _mounted=""
+}
+trap _cleanup EXIT
+
 npm run tauri build -- \
   --bundles "${MRDAYONE_BUNDLES:-app}" \
+  ${TARGET:+--target "$TARGET"} \
   --config "{\"bundle\":{\"macOS\":{\"signingIdentity\":\"$APPLE_SIGNING_IDENTITY\"}}}"
 
 # 签名产物要跟这次的包对得上。.sig 比 .app.tar.gz 旧，说明这次没签成、留下的是上一次的，
 # 而那份签名配不上这次的内容——发出去客户端一律验签失败。宁可现在红，也别发出去才发现。
 if [ -n "${TAURI_SIGNING_PRIVATE_KEY:-}" ]; then
-  _bundle_dir="target/release/bundle/macos"
+  _bundle_dir="$TARGET_DIR/bundle/macos"
   # 只校验**这次**的产物。
   #
   # 原来是遍历 *.app.tar.gz —— 于是应用改过名之后，目录里遗留的旧名产物
@@ -133,6 +159,17 @@ except Exception: print("")' 2>/dev/null || true)"
   _tar="$_bundle_dir/$_product.app.tar.gz"
   if [ -z "$_product" ] || [ ! -f "$_tar" ]; then
     echo "没有找到本次的更新产物（$_tar）——无法确认签名状态" >&2; exit 1
+  fi
+  # 它得是**这一轮**造出来的。
+  #
+  # 只打 dmg 时 Tauri 根本不产出 .app.tar.gz（它自己会警告 "no updater-enabled targets
+  # were built"），而上一轮 app 构建留下的那份还躺在原地——.sig 和 .tar.gz 时间戳都是上次的、
+  # 谁也不比谁旧，于是这道校验照样打勾说「更新产物签名 ✓」。人看到绿的就发出去了，实际发的
+  # 是上一次的更新包。对一个靠自动更新推测试版的项目，这是最贵的一种假绿。
+  if [ ! "$_tar" -nt "$_started" ]; then
+    echo "更新产物不是这一轮造的：$_tar 比本次构建还旧。" >&2
+    echo "（bundles=${MRDAYONE_BUNDLES:-app} 里没有 app 时不会产出 .app.tar.gz；要更新包就用 MRDAYONE_BUNDLES=app,dmg）" >&2
+    exit 1
   fi
   if [ ! -f "$_tar.sig" ]; then
     echo "更新产物缺少签名：$_tar.sig 不存在" >&2; exit 1
@@ -149,7 +186,7 @@ except Exception: print("")' 2>/dev/null || true)"
   done
 fi
 
-APP="target/release/bundle/macos/Mr. Day One.app"
+APP="$TARGET_DIR/bundle/macos/Mr. Day One.app"
 
 # 验收对象要按**这次真的产出了什么**来找，不能把路径钉死。
 #
@@ -160,11 +197,8 @@ APP="target/release/bundle/macos/Mr. Day One.app"
 # 而且后果比"看着吓人"严重：**真正发给用户的那条路，签名稳定性校验从来没跑过**。
 #
 # .app 还在就验它；被清掉了就挂载 DMG 验里面那份——那才是用户实际拿到的东西。
-_mounted=""
-_unmount() { [ -n "$_mounted" ] && hdiutil detach "$_mounted" -quiet >/dev/null 2>&1; _mounted=""; }
-trap _unmount EXIT
 if [ ! -d "$APP" ]; then
-  _dmg="$(ls -t target/release/bundle/dmg/*.dmg 2>/dev/null | head -1)"
+  _dmg="$(ls -t "$TARGET_DIR"/bundle/dmg/*.dmg 2>/dev/null | head -1)"
   if [ -n "$_dmg" ]; then
     _mounted="$(mktemp -d)"
     if hdiutil attach "$_dmg" -nobrowse -readonly -mountpoint "$_mounted" -quiet; then

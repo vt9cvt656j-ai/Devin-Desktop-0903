@@ -68,9 +68,9 @@ test("最终必须验证指定要求不再钉在 cdhash 上", () => {
 // 后果比"看着吓人"严重：真正发给用户的那条路，签名稳定性校验从来没跑过。
 
 test("DMG 路径下改验 DMG 里那份 app，而不是对着被清掉的路径报失败", () => {
-  const tail = SH.slice(SH.indexOf('APP="target/release/bundle/macos'));
+  const tail = SH.slice(SH.indexOf('APP="$TARGET_DIR/bundle/macos'));
   assert.match(tail, /if \[ ! -d "\$APP" \]; then/, "没有处理 .app 被清掉的情况");
-  assert.match(tail, /ls -t target\/release\/bundle\/dmg\/\*\.dmg/, "没去找刚打出来的 DMG");
+  assert.match(tail, /ls -t "\$TARGET_DIR"\/bundle\/dmg\/\*\.dmg/, "没去找刚打出来的 DMG");
   assert.match(tail, /hdiutil attach "\$_dmg"[^\n]*-readonly/, "必须只读挂载，别改动产物");
   assert.match(tail, /APP="\$_mounted\/\$\(basename "\$APP"\)"/, "验收对象没切到 DMG 里那份");
   // 挂载失败要明着报错，不能默默拿着空 APP 往下走——那又变回"读不到就 exit 1"的老样子，
@@ -79,10 +79,45 @@ test("DMG 路径下改验 DMG 里那份 app，而不是对着被清掉的路径�
 });
 
 test("挂载点一定会被卸掉，包括校验失败提前退出的那两条路", () => {
-  const tail = SH.slice(SH.indexOf('APP="target/release/bundle/macos'));
-  assert.match(tail, /trap _unmount EXIT/, "得用 trap——下面那个 case 里有两个 exit 1，逐个补 detach 必漏");
-  assert.match(tail, /hdiutil detach "\$_mounted" -quiet/);
+  const tail = SH.slice(SH.indexOf('APP="$TARGET_DIR/bundle/macos'));
+  assert.match(SH, /trap _cleanup EXIT/, "得用 trap——下面那个 case 里有两个 exit 1，逐个补 detach 必漏");
+  assert.match(SH, /hdiutil detach "\$_mounted" -quiet/);
+  // trap 是**覆盖**不是追加：临时文件和挂载点各装各的 trap，必然只剩最后一个。
+  assert.equal((SH.match(/^trap /gm) || []).length, 1, "装了不止一个 EXIT trap，前面的会被覆盖掉");
   // trap 必须在第一次可能挂载之前就装好。
-  assert.ok(tail.indexOf("trap _unmount EXIT") < tail.indexOf("hdiutil attach"),
+  assert.ok(SH.indexOf("trap _cleanup EXIT") < SH.indexOf("hdiutil attach"),
     "trap 装晚了，挂载后到装 trap 之间失败就会留下残留挂载");
+});
+
+// ── 指定架构构建 ────────────────────────────────────────────────────────────
+//
+// 指定 target 之后产物落在 target/<triple>/release/，而脚本原来有三处硬编码
+// target/release/…。不改的话「构建 Intel 版」会成功、然后脚本对着本机 arm64 的旧产物
+// 做校验并给出通过的结论——最坏的一种绿。
+
+test("MRDAYONE_TARGET 指定架构时，每一处产物路径都跟着走", () => {
+  assert.match(SH, /TARGET="\$\{MRDAYONE_TARGET:-\}"/);
+  assert.match(SH, /TARGET_DIR="target\$\{TARGET:\+\/\$TARGET\}\/release"/);
+  assert.match(SH, /\$\{TARGET:\+--target "\$TARGET"\}/, "构建命令没把 --target 传下去");
+  // 三处校验路径：更新产物、验收的 .app、兜底找的 .dmg
+  assert.match(SH, /_bundle_dir="\$TARGET_DIR\/bundle\/macos"/);
+  assert.match(SH, /APP="\$TARGET_DIR\/bundle\/macos\/Mr\. Day One\.app"/);
+  assert.match(SH, /ls -t "\$TARGET_DIR"\/bundle\/dmg\/\*\.dmg/);
+  // provenance 预清也要清对目录，否则 cargo 在新 target 目录里照样撞硬链接失败
+  assert.match(SH, /"\$TARGET_DIR"\/build\/\*\/build_script_build-\*/);
+  // 一处 target/release/ 硬编码都不该剩
+  assert.doesNotMatch(SH.split("\n").filter((l) => !/^\s*#/.test(l)).join("\n"),
+    /target\/release\//, "还有写死本机架构路径的地方");
+});
+
+test("只打 dmg 时不许拿上一轮的更新产物冒充这一轮", () => {
+  // Tauri 只打 dmg 时不产出 .app.tar.gz，而上一轮 app 构建留下的那份还在原地，
+  // .sig 和 .tar.gz 时间戳都是上次的、谁也不比谁旧 —— 原来的新鲜度校验照样打勾。
+  // 对一个靠自动更新推测试版的项目，这是最贵的一种假绿。
+  assert.match(SH, /_started="\$\(mktemp\)"/, "没有记录开工时间就没法判断产物是不是这一轮的");
+  assert.match(SH, /if \[ ! "\$_tar" -nt "\$_started" \]; then/);
+  assert.match(SH, /MRDAYONE_BUNDLES=app,dmg/, "报错要给出可执行的下一步");
+  // 时间戳必须在 tauri build **之前**取，否则永远判定为陈旧
+  assert.ok(SH.indexOf('_started="$(mktemp)"') < SH.indexOf("npm run tauri build"),
+    "开工时间戳取晚了，这道校验会永远红");
 });
