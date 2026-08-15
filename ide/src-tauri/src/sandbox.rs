@@ -95,9 +95,76 @@ fn home_dir() -> Option<PathBuf> {
         .filter(|p| !p.as_os_str().is_empty())
 }
 
+/// Paths that must stay read-only even though they sit INSIDE one of the writable roots above.
+///
+/// SBPL is last-match-wins and bubblewrap's later binds win, so these are emitted after the
+/// allow block and carve holes back out of it.
+///
+/// Why they are needed: the comment on `HOME_WRITABLE_RELATIVE` claims "none of them is a
+/// credential store or an autostart location". That was not true. `~/.cargo/bin`, `~/.bun/bin`,
+/// `~/.deno/bin`, `~/.yarn/bin`, `~/.dotnet/tools` and `~/.composer/vendor/bin` are on a
+/// developer's PATH — dropping a file there is the same persistence this module exists to block,
+/// just one directory over from `~/.local/bin`. `~/.cargo/config.toml` is worse than a PATH
+/// entry: `rustc-wrapper` / `[target.*.runner]` / `[alias]` in it are executed by the NEXT
+/// `cargo build`, no PATH lookup involved. `~/.gradle/init.d/*.gradle` is run by every gradle
+/// invocation. `~/.m2/settings.xml` redirects Maven to whatever repository it names.
+///
+/// None of these is written by the flows the writable list exists for: `npm install`,
+/// `cargo build`, `gradle build` and `mvn package` touch caches, not PATH directories or the
+/// config that drives them. Installing a global binary or rewriting your cargo config from
+/// inside a sandboxed agent command should not be silent — run it outside the sandbox.
+const HOME_DENY_RELATIVE: &[&str] = &[
+    ".cargo/bin",
+    ".cargo/config.toml",
+    ".cargo/config",
+    ".cargo/env",
+    ".bun/bin",
+    ".deno/bin",
+    ".yarn/bin",
+    ".dotnet/tools",
+    ".composer/vendor/bin",
+    ".gem/bin",
+    ".gradle/init.d",
+    ".gradle/init.gradle",
+    ".m2/settings.xml",
+];
+
+/// Whether a path is too broad to be handed to `(subpath …)` as a write root.
+///
+/// `/` is the one that actually happened: a caller passing `cwd = "/"` produced a profile whose
+/// first rule was `(allow file-write* (subpath "/"))` — everything writable, `~/.ssh` included —
+/// while the plan still reported `kind: "seatbelt"`. A sandbox that lies about confining is worse
+/// than no sandbox, because the label is what the rest of the app reasons about.
+///
+/// This file's own `credential_and_autostart_locations_are_never_writable` test already asserted
+/// `/` must never become a writable root; it just never passed `/` in as the workspace.
+fn too_broad_for_write_root(p: &Path) -> bool {
+    if p.parent().is_none() {
+        return true; // filesystem root
+    }
+    if let Some(home) = home_dir() {
+        if real(&home) == *p {
+            return true; // the home directory itself contains every path we protect
+        }
+    }
+    matches!(
+        p.to_string_lossy().as_ref(),
+        "/Users" | "/home" | "/private" | "/var" | "/opt" | "/usr" | "/etc" | "/Library"
+            | "/Applications" | "/System" | "/private/var"
+    )
+}
+
 /// Every directory a sandboxed command may write to.
 fn writable_roots(workspace: &Path, extra: &[PathBuf]) -> Vec<PathBuf> {
-    let mut roots: Vec<PathBuf> = vec![real(workspace)];
+    let mut roots: Vec<PathBuf> = Vec::new();
+    // A too-broad workspace is dropped rather than making the whole plan bail out: the command
+    // still runs confined (tmp + caches writable, credentials and autostart denied) and a write
+    // it genuinely needed fails visibly with EPERM. Bailing out would run it with no confinement
+    // at all, which is the strictly worse of the two.
+    let ws = real(workspace);
+    if !too_broad_for_write_root(&ws) {
+        roots.push(ws);
+    }
     roots.push(real(&std::env::temp_dir()));
     for fixed in ["/tmp", "/private/tmp", "/var/folders", "/private/var/folders"] {
         let p = PathBuf::from(fixed);
@@ -111,11 +178,22 @@ fn writable_roots(workspace: &Path, extra: &[PathBuf]) -> Vec<PathBuf> {
         }
     }
     for p in extra {
-        roots.push(real(p));
+        let p = real(p);
+        // `extra` comes from callers too (extra workspace roots), so it needs the same guard —
+        // otherwise the hole just moves one argument over.
+        if !too_broad_for_write_root(&p) {
+            roots.push(p);
+        }
     }
     roots.sort();
     roots.dedup();
     roots
+}
+
+/// Paths carved back out of the writable set (see `HOME_DENY_RELATIVE`).
+fn readonly_holes() -> Vec<PathBuf> {
+    let Some(home) = home_dir() else { return Vec::new() };
+    HOME_DENY_RELATIVE.iter().map(|rel| home.join(rel)).collect()
 }
 
 /// Escape a path for an SBPL string literal.
@@ -155,6 +233,22 @@ fn seatbelt_profile(writable: &[PathBuf]) -> String {
     profile.push_str(")\n");
     // ioctl/write on ttys and other char devices, without granting node creation under /dev.
     profile.push_str("(allow file-write-data (subpath \"/dev\"))\n");
+    // …then carve the PATH directories and auto-executed configs back out. Last match wins, so
+    // this must come after every allow above — including the `/dev` one, or a future writable
+    // root added below this line would silently re-open the hole.
+    let holes = readonly_holes();
+    if !holes.is_empty() {
+        profile.push_str("(deny file-write*\n");
+        for hole in &holes {
+            let p = escape_sbpl(hole);
+            // Both forms: `subpath` covers the directory entries (~/.cargo/bin/…), `literal`
+            // covers the single-file ones (~/.cargo/config.toml) and the creation of a
+            // directory entry at exactly that name. Emitting both means the list does not
+            // have to know which of the two each path is.
+            profile.push_str(&format!("  (subpath \"{p}\")\n  (literal \"{p}\")\n"));
+        }
+        profile.push_str(")\n");
+    }
     profile
 }
 
@@ -262,6 +356,17 @@ pub fn wrap(
                 args.push(p);
             }
         }
+        // Carve the PATH directories and auto-executed configs back out. Later binds win in
+        // bwrap, so this must come after every `--bind` above — same invariant as the SBPL
+        // deny block on macOS.
+        for hole in readonly_holes() {
+            if hole.exists() {
+                let p = hole.to_string_lossy().to_string();
+                args.push("--ro-bind".into());
+                args.push(p.clone());
+                args.push(p);
+            }
+        }
         args.push("--chdir".into());
         args.push(ws.to_string_lossy().to_string());
         args.push("--".into());
@@ -331,6 +436,51 @@ mod tests {
                 "{rel} must stay writable — npm/cargo fail outright without it"
             );
         }
+    }
+
+    #[test]
+    fn a_root_workspace_does_not_make_everything_writable() {
+        // 这是真发生过的那条：调用方传 cwd = "/"（市场里"查看仓库"那个按钮就是），
+        // profile 的第一条规则于是变成 (allow file-write* (subpath "/"))——全盘可写，
+        // ~/.ssh 在内——而 plan 仍然报 kind: "seatbelt"。会撒谎的沙箱比没有沙箱更糟，
+        // 因为应用其余部分是照着那个标签做判断的。
+        let roots = writable_roots(Path::new("/"), &[]);
+        assert!(!roots.iter().any(|r| r == Path::new("/")), "/ 成了可写根");
+        // 但沙箱本身不该塌掉：临时目录照旧可写，命令还能跑。
+        assert!(!roots.is_empty());
+        assert!(roots.iter().any(|r| r.starts_with("/private/tmp") || r.starts_with("/tmp")));
+    }
+
+    #[test]
+    fn a_home_workspace_does_not_make_everything_writable() {
+        let Some(home) = home_dir() else { return };
+        let roots = writable_roots(&home, &[]);
+        assert!(!roots.iter().any(|r| r == &real(&home)), "$HOME 整个成了可写根");
+        // extra 也走同一道闸——否则这个洞只是挪到另一个参数上。
+        let roots = writable_roots(&home.join("code/p"), &[PathBuf::from("/")]);
+        assert!(!roots.iter().any(|r| r == Path::new("/")), "extra 里的 / 溜进去了");
+    }
+
+    #[test]
+    fn path_directories_inside_the_writable_caches_are_carved_back_out() {
+        let Some(home) = home_dir() else { return };
+        let profile = seatbelt_profile(&writable_roots(&home.join("code/p"), &[]));
+        // ~/.cargo 整个可写，意味着 ~/.cargo/bin（在 PATH 上）和 ~/.cargo/config.toml
+        // （里面的 rustc-wrapper / [alias] 会被下一次 cargo build 执行）都可写——
+        // 这正是这个模块声称要挡的持久化。
+        let deny_at = profile.rfind("(deny file-write*\n").expect("没有 deny 收尾块");
+        let allow_at = profile.find("(allow file-write*").unwrap();
+        // 最后匹配者胜：deny 必须排在所有 allow 之后，否则等于没写。
+        assert!(deny_at > allow_at, "deny 块排在 allow 前面，SBPL 里等于无效");
+        assert!(deny_at > profile.find("(allow file-write-data").unwrap());
+        for rel in [".cargo/bin", ".cargo/config.toml", ".gradle/init.d", ".bun/bin", ".m2/settings.xml"] {
+            let p = home.join(rel);
+            let p = escape_sbpl(&p);
+            assert!(profile[deny_at..].contains(&format!("(subpath \"{p}\")")), "{rel} 没被挡");
+            assert!(profile[deny_at..].contains(&format!("(literal \"{p}\")")), "{rel} 缺 literal 形式");
+        }
+        // 缓存本身还得可写，否则 npm install / cargo build 直接跑不了。
+        assert!(profile[..deny_at].contains(&format!("(subpath \"{}\")", escape_sbpl(&home.join(".cargo")))));
     }
 
     #[test]
