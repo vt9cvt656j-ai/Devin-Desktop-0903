@@ -69,6 +69,20 @@ fn decode(bytes: &[u8]) -> (String, &'static str) {
     (text.into_owned(), encoding.name())
 }
 
+/// 把字节长度收敛到不超过 `max` 的**字符边界**。
+///
+/// `&s[..n]` 在 n 落到多字节字符中间时会 panic。knowledge.rs 里有同名同义的实现
+/// （那边是抓外部 HTML 时踩到的），这里不共用是因为两个模块之间没有依赖关系，
+/// 为一个八行函数建一个 util 模块不划算——但两处的语义必须保持一致。
+fn clamp_char_boundary(s: &str, max: usize) -> usize {
+    let mut n = max.min(s.len());
+    while n > 0 && !s.is_char_boundary(n) {
+        n -= 1;
+    }
+    n
+}
+
+
 /// Pick the delimiter by consistency, not by frequency: the right one appears the same number of
 /// times in every line. A comma that only shows up inside one quoted address would otherwise win
 /// on raw count alone.
@@ -186,7 +200,12 @@ pub fn read_table(path: &Path, max_rows: Option<usize>) -> Result<TablePreview, 
         buf
     };
     let (text, encoding) = decode(&bytes);
-    let delimiter = sniff_delimiter(&text[..text.len().min(64 * 1024)], path);
+    // `&text[..n]` 是按**字节**切 String：n 落在多字节字符中间就 panic。
+    // 一个 64KiB 边界正好压在某个汉字上的 CSV 就能让整个 Tauri 命令 panic —— 而这是
+    // 「双击打开一个 csv」这条最普通的路径，中文数据集撞上的概率接近 1/3（UTF-8 汉字
+    // 三字节，边界落在字符内部的概率就是 2/3 × 命中率）。本机全绿是因为测试数据全是
+    // ASCII，切在哪都是边界。
+    let delimiter = sniff_delimiter(&text[..clamp_char_boundary(&text, 64 * 1024)], path);
 
     let mut reader = csv::ReaderBuilder::new()
         .delimiter(delimiter)
@@ -292,6 +311,51 @@ pub fn read_table_file(path: String, max_rows: Option<usize>) -> Result<TablePre
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_chinese_csv_whose_64kib_boundary_lands_inside_a_character_does_not_panic() {
+        // 复现：CSV 正文里第 65536 个**字节**落在一个汉字中间。
+        // `&text[..64*1024]` 是按字节切 String，切在字符内部直接 panic ——
+        // 而这是「双击打开一个 csv」这条最普通的路径。本机测试全绿是因为原来的数据全是
+        // ASCII，切在哪都是边界。
+        let mut body = String::from("名称,数量\n");
+        // 每行 "中文中文中文,1\n" —— 全是三字节汉字，填到刚好跨过 64KiB
+        while body.len() < 64 * 1024 + 16 {
+            body.push_str("中文中文中文,1\n");
+        }
+        // 确认这个样本真的"切不得"：64KiB 处必须落在字符内部，否则这条测试测了个寂寞
+        assert!(
+            !body.is_char_boundary(64 * 1024),
+            "样本没能把 64KiB 边界压在汉字中间，测试无效"
+        );
+
+        let dir = std::env::temp_dir().join(format!("mrday-csv-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("中文数据.csv");
+        std::fs::write(&path, &body).unwrap();
+
+        // 修之前这一行 panic；修之后正常返回。
+        let table = read_table(&path, Some(10)).expect("中文 CSV 应当能读");
+        assert_eq!(table.columns.len(), 2, "列没解析出来");
+        assert!(table.has_header);
+        assert_eq!(table.columns[0].name, "名称");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn clamp_char_boundary_never_cuts_inside_a_character() {
+        let s = "a中b文c";
+        for n in 0..=s.len() + 4 {
+            let cut = clamp_char_boundary(s, n);
+            assert!(s.is_char_boundary(cut), "n={n} 切在了字符内部");
+            assert!(cut <= s.len());
+            // 且必须是"不超过 n 的最大边界"，不能保守到把内容全丢了
+            assert!(cut <= n.min(s.len()));
+        }
+        assert_eq!(clamp_char_boundary(s, 0), 0);
+        assert_eq!(clamp_char_boundary(s, 1000), s.len());
+    }
+
     use super::*;
 
     fn temp(name: &str, bytes: &[u8]) -> std::path::PathBuf {
