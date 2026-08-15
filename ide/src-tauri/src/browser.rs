@@ -1272,7 +1272,19 @@ pub async fn browser_eval(script: String) -> Result<BrowserState, String> {
         // 8000 chars (~2.7k tokens worst case) so structured tools — network 抓包,
         // inspect 视觉解析, design — can return their full JSON without truncating
         // mid-string (which would hand the model invalid JSON).
-        Ok(Some(val.chars().take(8000).collect()))
+        //
+        // 注释的意图是「8000 够用所以不会截断」，但代码里没有任何判断——超了就直接砍，
+        // 而且恰恰砍出注释自己担心的那种半截 JSON。调用方看到「整页节点清单」，相信
+        // nodes[] 是全集；中等复杂度的页面上 JSON 早就超过 8000，后半截连同结构一起没了，
+        // 而它无从察觉。截断本身可以接受，**不说**不行。
+        let total = val.chars().count();
+        if total > 8000 {
+            let head: String = val.chars().take(8000).collect();
+            return Ok(Some(format!(
+                "{head}\n\n[已截断] 本次页面求值结果共 {total} 字符，只返回了前 8000——**上面的 JSON 很可能是半截的，不要当成完整结构**。缩小选择器范围或分批取。"
+            )));
+        }
+        Ok(Some(val))
     })
     .await
 }

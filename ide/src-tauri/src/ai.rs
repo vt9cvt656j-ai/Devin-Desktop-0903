@@ -3006,7 +3006,19 @@ pub async fn web_fetch(url: String) -> Result<String, String> {
             if let Ok(Ok(Some(html))) = rendered {
                 let text = html_to_text(&html);
                 if text.len() > 100 {
-                    return Ok(text.chars().take(24_000).collect());
+                    return {
+        // 截断必须留痕。原来直接 take(24_000) 就返回，正文在半句话处结束、没有省略号、
+        // 没有字数——模型据此得出「这个页面没有提到 X」，而 X 就在第 24001 个字符之后。
+        let total = text.chars().count();
+        if total > 24_000 {
+            let head: String = text.chars().take(24_000).collect();
+            Ok(format!(
+                "{head}\n\n[已截断] 本页正文共 {total} 字符，这里只给了前 24000 字符——**后面还有内容，不要当成全文**。需要后文就带上更具体的锚点重新抓取。"
+            ))
+        } else {
+            Ok(text)
+        }
+    };
                 }
             }
         }
@@ -3047,7 +3059,19 @@ pub async fn web_fetch(url: String) -> Result<String, String> {
     } else {
         raw
     };
-    Ok(text.chars().take(24_000).collect())
+    {
+        // 截断必须留痕。原来直接 take(24_000) 就返回，正文在半句话处结束、没有省略号、
+        // 没有字数——模型据此得出「这个页面没有提到 X」，而 X 就在第 24001 个字符之后。
+        let total = text.chars().count();
+        if total > 24_000 {
+            let head: String = text.chars().take(24_000).collect();
+            Ok(format!(
+                "{head}\n\n[已截断] 本页正文共 {total} 字符，这里只给了前 24000 字符——**后面还有内容，不要当成全文**。需要后文就带上更具体的锚点重新抓取。"
+            ))
+        } else {
+            Ok(text)
+        }
+    }
 }
 
 fn percent_decode_str(s: &str) -> String {
@@ -3158,7 +3182,13 @@ pub async fn web_search(query: String) -> Result<String, String> {
             "「{q}」这次没搜到结果（搜索引擎可能限流、反爬，或当前关键词没有索引结果）。不要原样重发或只换近义词反复搜索：已有明确官方 URL 就直接 web_fetch；只有出现新的具体假设时才换一次真正不同的来源或检索方式。仍无新增证据就停止，并如实说明这次没有检索到可验证结果。"
         ));
     }
-    let mut out = format!("搜索「{q}」的结果（Google+Bing+DuckDuckGo 实际响应合并去重）：\n");
+    // 表头不能写死「三引擎合并」——每个抓取器失败都是 `Err(_) => Vec::new()`，
+    // 三个全挂也照样这么写，于是「三大引擎都没搜到」和「三个抓取器全被拦了」同形。
+    let mut out = if results.is_empty() {
+        format!("搜索「{q}」：**没有任何来源返回结果**——可能是三个抓取器都被拦截/限流了，而不是这个词没有结果。换个词再试，或改用 web_fetch 直接抓已知地址。\n")
+    } else {
+        format!("搜索「{q}」的结果（多来源合并去重；某个来源被拦截时结果会少于预期，本次合并后 {} 条）：\n", results.len())
+    };
     for (i, (title, url, snippet)) in results.iter().take(12).enumerate() {
         out.push_str(&format!(
             "\n{}. {}\n   {}\n   {}\n",

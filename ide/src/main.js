@@ -25217,6 +25217,28 @@ function _dedupeRunNarrative(text, seen) {
 // 是对内部消息的应答，不是给用户的内容；只清洗开头 1-2 句，实质内容保留。
 // 渲染层（新输出）和历史回放层（老会话已存的旧先例）共用——老会话里的旧行为样板
 // 在回放给模型之前被物理剥掉，模型不再有可模仿的坏先例。
+/**
+ * 截断必须留痕。
+ *
+ * 「被截断了」和「一共就这么多」是两件事，而裸 `.slice(0, N)` 让它们长得一模一样——
+ * 调用方读到的是一个看起来完整的答案，于是停止追查。这是最容易让人停下来的一种假话，
+ * 而且它在这份代码里出现过至少六次（网页正文、仓库文件、HTTP 响应体、批量步骤、
+ * 深读采样、页面求值结果）。
+ *
+ * 更阴的一种：同一段文案里已经有**另一个**截断标记（比如「响应体已截断到 5MB」），
+ * 于是「没有标记」被合理地读成「这次是完整的」——而真正生效的是后面那个裸 slice。
+ *
+ * @param {string} text 原文
+ * @param {number} cap 上限
+ * @param {string} what 被截断的是什么（进文案，让调用方知道该怎么补齐）
+ */
+function _clip(text, cap, what = "内容") {
+  const s = String(text ?? "");
+  if (s.length <= cap) return s;
+  return s.slice(0, cap)
+    + `\n\n[已截断] ${what}共 ${s.length} 字符，这里只给了前 ${cap} 字符——**后面还有，不要当成全部**。`;
+}
+
 function _stripAckOpeners(text) {
   text = String(text == null ? "" : text);
   // 编排协议叙述绝不讲给用户（确定性防线）：模型把内部提示识破后写出
@@ -32429,7 +32451,7 @@ function _mapToolCall(name, args, mcpToolMap = _mcpToolMap) {
         uploadPaths: Array.isArray(args.paths) ? args.paths : (args.path ? [args.path] : (args.file ? [args.file] : (args.files ? (Array.isArray(args.files) ? args.files : [args.files]) : []))),
       };
     }
-    case "computer": { const _m = String(args.method || args.action || "").trim(); if (!_m) return { type: "automation", method: "screen.info", params: {} }; const _validMethods = ["mouse.click","mouse.double_click","mouse.move","mouse.drag","mouse.scroll","keyboard.type","keyboard.press","keyboard.combo","keyboard.paste","screen.info","clipboard.get","clipboard.set","window.list","window.activate","window.minimize"]; const _method = _validMethods.includes(_m) ? _m : null; if (!_method) return { type: "automation", method: "screen.info", params: { _warning: "不支持的 method: " + _m + "，已降级为 screen.info" } }; const _p = (args.params && typeof args.params === "object" && !Array.isArray(args.params)) ? args.params : {}; return { type: "automation", method: _method, params: _p }; }
+    case "computer": { const _m = String(args.method || args.action || "").trim(); if (!_m) return { type: "automation", method: "screen.info", params: {} }; const _validMethods = ["mouse.click","mouse.double_click","mouse.move","mouse.drag","mouse.scroll","keyboard.type","keyboard.press","keyboard.combo","keyboard.paste","screen.info","clipboard.get","clipboard.set","window.list","window.activate","window.minimize"]; const _method = _validMethods.includes(_m) ? _m : null; if (!_method) return { type: "automation", method: "", invalidMethod: _m }; const _p = (args.params && typeof args.params === "object" && !Array.isArray(args.params)) ? args.params : {}; return { type: "automation", method: _method, params: _p }; }
     case "preview_choices": return { type: "preview", title: args.title || "选择方案", target: args.target || "", variants: Array.isArray(args.variants) ? args.variants : [] };
     case "visual_explain": return { type: "explain", title: args.title || "概念解释", prompt: args.prompt || "", summary: args.summary || "" };
     case "system": {
@@ -33363,7 +33385,7 @@ async function _autoDeepRead(text, maxPages = 3, perChars = 3200) {
   reads.forEach((r, i) => {
     if (r.status === "fulfilled" && r.value && String(r.value).length > 60 && !/^\[(ERROR|失败)/.test(String(r.value))) {
       successfulReads++;
-      extra += `\n\n──── 深读：${urls[i]} ────\n${String(r.value).slice(0, perChars)}\n`;
+      extra += `\n\n──── 深读：${urls[i]} ────\n${_clip(String(r.value), perChars, "这一页的正文")}\n`;
     }
   });
   return extra ? { text: "\n\n【自动跨域抽样深读了页面正文（不用重复 web_fetch，直接基于下面的实际内容回答）】" + extra, count: successfulReads } : _none;
@@ -37140,7 +37162,11 @@ async function _agentFindFiles(root, pattern) {
     }
   }
   out.sort();
-  const body = out.length ? out.join("\n") : "(无匹配文件)";
+  const body = out.length
+    ? out.join("\n")
+    : (scanned >= MAX_SCAN
+      ? `(无匹配文件——但**扫描没走完**：到 ${MAX_SCAN} 个条目的上限就停了，剩下的目录一个都没看过。这不等于文件不存在，缩小到具体子目录再找一次，或改用 search。)`
+      : "(无匹配文件——已完整遍历，确实不存在)");
   const text = body
     + (out.length >= MAX ? "\n…(更多结果已截断)" : "")
     + (errors.length ? `\n\n${errors.join("\n")}` : "");
@@ -40770,6 +40796,7 @@ async function _runSubAgent({ config, description, prompt, root, container, run,
   let _collaborationCursor = 0;
   let toolCount = 0;
   const SUB_MAX = write ? 18 : 12;
+  let _subFinished = false;
   try {
     for (let i = 0; i < SUB_MAX; i++) {
       if (!_live()) break;
@@ -40813,6 +40840,7 @@ async function _runSubAgent({ config, description, prompt, root, container, run,
             continue;
           }
         }
+        _subFinished = true; // 这一轮没调工具 = 子体自己写完结论了，这才是自然收尾
         break;
       }
       for (const tc of turn.toolCalls) {
@@ -40892,7 +40920,7 @@ async function _runSubAgent({ config, description, prompt, root, container, run,
         if (call.type === "subagent" || call.type === "worker") {
           toolCount++;
           const _nestReport = await _runSubAgent({ config, description: call.description || "嵌套子任务", prompt: call.prompt || "", root, container: vp, run: execRun, write: call.type === "worker", scope: call.scope || [], role: call.role || "" });
-          messages.push({ role: "tool", tool_call_id: tc.id, content: String(_nestReport || "").slice(0, 8000) });
+          messages.push({ role: "tool", tool_call_id: tc.id, content: _clip(String(_nestReport || ""), 8000, "子智能体的简报") });
           continue;
         }
         const step = _createToolStep(call);
@@ -41034,7 +41062,17 @@ async function _runSubAgent({ config, description, prompt, root, container, run,
   // 而子体的超时回调因为第一句抛异常从来没生效过——于是一个正常跑了 6 分钟、**简报完整**的
   // 调研子体会被打上"超时(部分结果)"，主智能体据此要么重派一遍同样的调研（再烧一份子体的
   // 钱），要么在最终答案里含糊其辞。报告没问题，只有标签是错的。
-  return _subTimedOut ? `[TIMEOUT] ${_out}` : _out;
+  // 三种出口，三种前缀。
+  //
+  // 循环还有第二种结束方式：**轮数用尽**——子体最后一轮还在调工具、还没写结论，循环就到
+  // 头了。此时 report 里存的是中途叙述（「接下来我去看 auth/session.js 确认这个假设」），
+  // 原来被原样当成最终简报返回，前面什么标记都没有，父体据此以为调查已经做完。
+  if (_subTimedOut) return `[TIMEOUT] ${_out}`;
+  if (!_subFinished) {
+    return `[轮次用尽·未完成] 这个子智能体把 ${SUB_MAX} 轮工具预算用满就被截断了，下面是它**截止当时的中间状态，不是结论**`
+      + `——需要的话把范围缩小再派一次，别把它当成做完了。\n\n${_out}`;
+  }
+  return _out;
 }
 
 function _verificationCommandsForStack(stack) {
@@ -44451,7 +44489,7 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
           else if (semanticDecision?.instruction) { content = `语义调度未要求增加新 schema；当前工具已足够。${thoughtNote}\n下一步：${semanticDecision.instruction}`; label = "无需新增"; }
           else if (fuzzyHits.length && fuzzyHits.every((h) => h.alreadyLoaded)) { content = `相关工具均已加载，可直接调用：\n${fuzzyHits.slice(0, 8).map((h) => `· ${h.name}${_toolMetaGuideSuffix(h.name)}`).join("\n")}`; label = "已在手上"; }
           else if (mcpFailureNote) { content = `没有找到匹配的新工具；部分 MCP 服务在后台发现时失败。\n\n${mcpFailureNote}`; label = "MCP 连接失败"; }
-          else { content = "语义工具调度本次不可用，且模糊匹配无命中。这**不是检索失败，是这件事没有专用工具**——注册表是起手包，不是能力边界。别再换词空搜，按目标改走组合路径：外部服务或 API → web_search/web_fetch 读官方文档，再用 http_request 打通；本地格式或批处理 → write_file 写个脚本 + run_cmd 跑（这是正路，不算绕过专用工具）；工作区里的 .db/.sqlite 文件 → db_query 传 driver=sqlite、url=sqlite:///绝对路径（路径本身就是连接串，不用问用户要）；值得复用的流程 → 写成 <工作区>/.claude/skills/<名字>/SKILL.md 存下来，下一轮它就在你的技能清单里。"; label = "无匹配"; }
+          else { content = "语义工具调度本次不可用，且模糊匹配无命中。这**不是检索失败，是内置工具里没有专用的**（⚠️ 如果本轮 MCP 服务发现还没完成，已连接服务提供的工具不在这次检索范围内——过几步再调一次 search_tools 确认）——注册表是起手包，不是能力边界。别再换词空搜，按目标改走组合路径：外部服务或 API → web_search/web_fetch 读官方文档，再用 http_request 打通；本地格式或批处理 → write_file 写个脚本 + run_cmd 跑（这是正路，不算绕过专用工具）；工作区里的 .db/.sqlite 文件 → db_query 传 driver=sqlite、url=sqlite:///绝对路径（路径本身就是连接串，不用问用户要）；值得复用的流程 → 写成 <工作区>/.claude/skills/<名字>/SKILL.md 存下来，下一轮它就在你的技能清单里。"; label = "无匹配"; }
           const r = { type: "search_tools", path: "", content };
           it.rawResult = r;
           _settleToolStep(step, r, label);
@@ -48079,7 +48117,7 @@ async function _searchKnowledgeBase(call) {
         type: "knowledge",
         path: call.query,
         knowledge: { hitCount: 0, domains: [] },
-        content: `知识库里没有「${call.query}」相关的内容。不要编造知识库结论；记录该主题不可用后，基于用户明确要求与项目证据继续。`,
+        content: `知识库${call.domain ? `的「${call.domain}」这一个域` : "（未指定域，已全库检索）"}里没有「${call.query}」相关的内容。${call.domain ? "**这只是这一个域的结论**——换个域、或不传 domain 再查一次，再下判断。" : ""}不要编造知识库结论；确认该主题确实不可用后，基于用户明确要求与项目证据继续。`,
       };
     }
     const body = hits.map((hit, index) => `【${index + 1}｜${hit.domain}/${hit.topic} · ${hit.section}】\n${hit.text}`).join("\n\n———\n\n");
@@ -49439,7 +49477,7 @@ async function _executeToolStepInner(step, call, root, run) {
       res.textContent = fileMatches.length ? `${hits} 处匹配${searchErrors.length ? " · 部分范围失败" : ""}` : (searchErrors.length ? "无匹配 · 部分范围失败" : "无匹配");
       const _body = blocks.join("\n\n");
       vp.innerHTML = `<pre>${_escHtml((_body || "(无匹配)") + partialNote)}</pre>`;
-      return { type: "search", path: call.path, content: (blocks.length ? `搜索 "${q}" — ${summary}:\n${_redactSecrets(_body)}` : `搜索 "${q}"：无匹配。换个关键词、或用 semantic_search 按语义找、或 find_files 按文件名找。`) + partialNote };
+      return { type: "search", path: call.path, content: (blocks.length ? `搜索 "${q}" — ${summary}:\n${_redactSecrets(_body)}` : `搜索 "${q}"：在已扫描的范围里无匹配。**扫描范围不含点开头的目录和文件**（.github/.vscode/.env 这些整个不扫），也不含被忽略的目录——所以这不等于「工作区里没有」。要找 CI 配置、编辑器配置这类点开头路径下的内容，直接 read_file 指名读；否则换关键词、或用 semantic_search 按语义找、find_files 按文件名找。`) + partialNote };
 
     } else if (call.type === "find") {
       const requestedPattern = call.pattern || call.path || "";
@@ -49764,7 +49802,7 @@ async function _executeToolStepInner(step, call, root, run) {
       try {
         const _saOut = await backend.invoke("search_game_assets", { baseUrl: _saCfg.baseUrl || MICHAEL_API, apiKey: _saCfg.apiKey || "", query: call.query || "", assetType: call.asset_type });
         res.className = "atc-result atc-result--ok"; res.textContent = "搜索完成";
-        return { type: "search_game_assets", path: "", content: JSON.stringify(_saOut).slice(0, 8000) };
+        return { type: "search_game_assets", path: "", content: _clip(JSON.stringify(_saOut), 8000, "检索结果") };
       } catch (e) {
         res.className = "atc-result atc-result--err"; res.textContent = "搜索失败";
         return { type: "search_game_assets", path: "", content: `[失败] search_game_assets: ${String(e?.message || e).slice(0, 300)}` };
@@ -50584,7 +50622,25 @@ async function _executeToolStepInner(step, call, root, run) {
           let character = 0;
           const sym = (call.symbol || "").trim();
           if (sym) {
-            try { const t = await backend.readTextFile(fp); const lt = (t.split("\n")[line - 1] || ""); const idx = lt.indexOf(sym); if (idx >= 0) character = idx + Math.floor(sym.length / 2); } catch {}
+            // 定位失败要**显式失败**，不能静默留 character=0。
+            //
+            // 原来：符号在第 line 行找不到（行号偏了、文件这轮被改过、大小写不符），或者
+            // 文件读不出来（被 catch {} 吞掉），character 就留在 0——于是发给语言服务的是
+            // 「第 line 行第 0 列那个词」的引用，返回「未找到引用」。调用方读到的是
+            // 「这个符号没人用」，然后放心地把它删了。
+            let _lt = null;
+            try { _lt = (String(await backend.readTextFile(fp)).split("\n")[line - 1] ?? null); } catch {}
+            if (_lt === null) {
+              res.className = "atc-result atc-result--err"; res.textContent = "读不到文件";
+              return { type: "lsp", path: rel, content: `[ERROR] 读不到 ${rel}，无法定位符号「${sym}」的列号——**没有查成**，不要当作「没有引用」。` };
+            }
+            const _idx = _lt.indexOf(sym);
+            if (_idx < 0) {
+              res.className = "atc-result atc-result--err"; res.textContent = "该行没有这个符号";
+              return { type: "lsp", path: rel, content:
+                `[ERROR] 第 ${line} 行里没有「${sym}」——行号可能不对，或这轮改动后行号已经变了。**这次没有查成**，不是「没有引用」。\n该行内容：${_lt.trim().slice(0, 160)}` };
+            }
+            character = _idx + Math.floor(sym.length / 2);
           }
           let locs = null;
           try { locs = await (lspManager && lspManager.agentLocate ? lspManager.agentLocate(fp, line, character, call.op) : null); } catch {}
@@ -50663,7 +50719,9 @@ async function _executeToolStepInner(step, call, root, run) {
           const text = (diff || "").trim();
           res.className = "atc-result atc-result--ok"; res.textContent = text ? `${text.split("\n").length} 行 diff` : "无改动";
           if (vp) vp.innerHTML = `<pre>${_escHtml((text || "(无改动)").slice(0, 4000))}</pre>`;
-          return { type: "git", path: "diff", content: (text ? `git diff${call.staged ? " --cached" : ""}${diffRel ? " -- " + diffRel : ""}:\n${text}` : "（无改动）") + gitRerootNote };
+          return { type: "git", path: "diff", content: (text
+          ? `git diff${call.staged ? " --cached" : ""}${diffRel ? " -- " + diffRel : ""}:\n${text}`
+          : `（git diff 没有输出）\n注意它覆盖不到两种情况：**新建的未跟踪文件**（git diff 从不列 untracked，刚写出来的新文件在这里一定是空的——用 git_status 确认）、以及${diffRel ? `**路径 ${diffRel} 不在仓库里或拼错了**` : "**改动都已暂存**（加 staged:true 再看一次）"}。空输出不等于「没改过东西」。`) + gitRerootNote };
         } else if (call.op === "log") {
           const n = (Number.isFinite(call.count) && call.count > 0) ? Math.floor(call.count) : 20;
           const entries = await backend.invoke("git_log", { root: gitExecRoot, count: n }) || [];
@@ -50674,7 +50732,18 @@ async function _executeToolStepInner(step, call, root, run) {
         } else if (call.op === "commit") {
           const msg = (call.message || "").trim();
           if (!msg) { res.className = "atc-result atc-result--err"; res.textContent = "缺提交信息"; return { type: "git", path: "commit", content: "[ERROR] git_commit 需要 message。" }; }
-          if (call.all) { try { await backend.invoke("git_stage_all", { root: gitExecRoot }); } catch {} }
+          if (call.all) {
+          // 不要吞。git add -A 失败（权限、.gitignore 冲突、磁盘满）被吞掉之后，只要之前
+          // 暂存过任何东西，commit 照样成功——于是返回「已提交」，而用户以为 all 的那些
+          // 改动进去了，实际没有。
+          try {
+            await backend.invoke("git_stage_all", { root: gitExecRoot });
+          } catch (e) {
+            return { type: "git", path: "commit", content:
+              `[ERROR] git add -A 失败：${String(e?.message || e).slice(0, 200)}——**没有提交**，`
+              + `因为这次要提交的改动没能全部暂存。先解决这个错误再重试。` };
+          }
+        }
           const out = await backend.invoke("git_commit", { root: gitExecRoot, message: msg });
           try { refreshGitStatus(); } catch {}
           res.className = "atc-result atc-result--ok"; res.textContent = "已提交";
@@ -50770,7 +50839,7 @@ async function _executeToolStepInner(step, call, root, run) {
         return { type: "semsearch", path: call.query, content: "[ERROR] 当前工作区的语义索引尚未就绪，请稍后重试；未使用其他项目的旧索引。" };
       }
       const hits = bm25Search(call.query, call.topK || 10);
-      if (!hits.length) { res.className = "atc-result"; res.textContent = "无结果"; return { type: "semsearch", path: call.query, content: `semantic_search「${call.query}」: 无结果（索引里 ${_bm25Index.chunks.length} 个 chunk）。换个说法 / 抓关键词重试，或用 search/find_symbol 精确找。` }; }
+      if (!hits.length) { res.className = "atc-result"; res.textContent = "无结果"; return { type: "semsearch", path: call.query, content: `semantic_search「${call.query}」: 在**已建索引的部分**里没有语义相近的内容（索引里 ${_bm25Index.chunks.length} 个 chunk）。索引只覆盖白名单扩展名、单文件不超过 512KB、最多前 6000 个源文件——没被索引到的代码和「不存在」在这里长得一样，不要据此下「项目里没有」的结论。换个说法重试，或用 search（逐字）/ find_symbol（按符号名）再确认一次。` }; }
       const body2 = hits.map((h, i) => `[${i + 1}] ${h.path}:${h.start}-${h.end} (score=${h.score.toFixed(2)})\n${h.snippet.slice(0, 360)}${h.snippet.length > 360 ? "…" : ""}`).join("\n---\n");
       res.className = "atc-result atc-result--ok"; res.textContent = `${hits.length} 处相关`;
       if (vp) vp.innerHTML = `<pre>${_escHtml(body2.slice(0, 4500))}</pre>`;
@@ -50794,7 +50863,7 @@ async function _executeToolStepInner(step, call, root, run) {
       hits = hits.slice(0, limit);
       const body2 = hits.length
         ? hits.map((h) => `[${h.kind || "?"}] ${h.path}:${h.line}    ${h.sig}`).join("\n")
-        : `(没找到符号「${call.name}」${call.kind ? "/" + call.kind : ""}。索引里 ${_symbolIndex.size} 个符号；试试 search 用正则、或确认大小写、或换个名。)`;
+        : `(没找到符号「${call.name}」${call.kind ? "/" + call.kind : ""}。**注意作用域**：符号索引只覆盖白名单内扩展名、单个不超过 512KB、且最多前 6000 个源文件的部分——没被索引到的文件和「符号不存在」在这里是同一个结果。索引里现有 ${_symbolIndex.size} 个符号。别据此判定「项目里没有这个实现」；用 search 按正则再找一次，或确认大小写/换个名。)`;
       res.className = "atc-result " + (hits.length ? "atc-result--ok" : "");
       res.textContent = hits.length ? `${total} 处` : "无结果";
       if (vp) vp.innerHTML = `<pre>${_escHtml(body2.slice(0, 4000))}</pre>`;
@@ -50868,7 +50937,17 @@ async function _executeToolStepInner(step, call, root, run) {
           res.className = "atc-result " + (failed ? "atc-result--err" : passed ? "atc-result--ok" : "");
           res.textContent = failed ? "有失败" : passed ? "全绿" : "状态";
           if (vp) vp.innerHTML = `<pre>${_escHtml(out.slice(0, 3000))}</pre>`;
-          return { type: "gh", path: "pr_checks", content: `gh pr checks ${sel}:\n${out.slice(0, 3000)}` };
+          // 退出码是唯一确定的结论来源（0=全过，1=有失败或**根本没有任何检查**，8=还在
+          // 进行中）。原来这三件事被同一个标题「gh pr checks N:」包住原样丢回去，于是
+          // 「没有配置任何 CI」和「CI 全绿」在模型眼里一模一样，它会据此说「CI 通过了」。
+          const _ck = r.code === 0
+            ? `✅ CI 全绿（gh pr checks 退出码 0，所有检查通过）`
+            : r.code === 8
+              ? `⏳ 检查仍在进行中，**尚未有结论**（退出码 8）——不要据此判断能不能合并`
+              : /no checks reported/i.test(out)
+                ? `⚠️ 这个 PR **没有任何检查**（退出码 ${r.code}）——不是「全绿」，是根本没有 CI 在跑`
+                : `❌ 有检查失败（退出码 ${r.code}）`;
+          return { type: "gh", path: "pr_checks", content: `${_ck}\n\ngh pr checks ${sel}:\n${out.slice(0, 3000)}` };
         }
         if (call.op === "actions_log") {
           let runId = String(call.runId || "").trim();
@@ -50876,7 +50955,16 @@ async function _executeToolStepInner(step, call, root, run) {
             // Pick the most recent FAILED run automatically.
             const _ls = await backend.taskRunCapture(ghRoot, `gh run list --limit 20 --json databaseId,name,conclusion,status,createdAt 2>&1`);
             let runs = []; try { runs = JSON.parse(_ls.stdout || "[]"); } catch {}
-            const failedRun = runs.find((r) => r.conclusion === "failure") || runs.find((r) => r.status === "completed") || runs[0];
+            // 挑不到 failure 时不要退而取一次**成功**的 run 然后照常说「最近一次失败的 run」。
+            // 工具描述承诺「省略 run_id 就取最近一次失败的 run」，兜底链却会拿成功的顶上，
+            // 于是模型对着一份全绿日志找失败原因，找不到就开始编。
+            const failedRun = runs.find((r) => r.conclusion === "failure");
+            if (!failedRun && runs.length) {
+              const _latest = runs[0];
+              return { type: "gh", path: "actions_log", content:
+                `最近 ${runs.length} 次 Actions run 里**没有失败的**（最近一次：${_latest.conclusion || _latest.status || "?"}）。`
+                + `没有可分析的失败日志——如果你在找某次具体失败，把 run_id 传进来。` };
+            }
             if (!failedRun) return { type: "gh", path: "actions_log", content: "[ERROR] 找不到任何 Actions run。" };
             runId = String(failedRun.databaseId || "");
           }
@@ -50885,19 +50973,32 @@ async function _executeToolStepInner(step, call, root, run) {
           let out = (r.stdout || r.stderr || "").trim();
           // Truncate to the FIRST failure block (model doesn't need the full 10MB log).
           const lines = out.split("\n");
+          // 采样方式必须自报。同一个标题「gh run view --log-failed:」后面原来可能跟着三种
+          // 完全不同的东西：命中失败关键词后截取的一段（后面第二、第三个失败 job 被丢掉）、
+          // 一行都没命中时的**日志开头 100 行**（很可能全是环境准备，一条错误都没有）、
+          // 或者命令本身失败时的错误输出。模型对着开头 100 行找不到失败原因，就会开始编。
+          const _total = lines.length;
           const failIdx = lines.findIndex((l) => /error|fail|✗|exception|panic/i.test(l));
-          if (failIdx > 0) out = lines.slice(Math.max(0, failIdx - 5), failIdx + 80).join("\n");
-          else out = lines.slice(0, 100).join("\n");
+          let _how = "";
+          if (failIdx > 0) {
+            out = lines.slice(Math.max(0, failIdx - 5), failIdx + 80).join("\n");
+            _how = `已定位到第 ${failIdx + 1} 行的第一处失败迹象，下面是它前 5 行到后 80 行（日志共 ${_total} 行，**其余部分包括可能存在的后续失败 job 都没有列出**）`;
+          } else {
+            out = lines.slice(0, 100).join("\n");
+            _how = `⚠️ 整份日志里**没有匹配到任何失败关键词**，下面是日志的**开头 100 行**（共 ${_total} 行）——这多半是环境准备阶段，不是失败原因所在。别在这段里找根因，换个 run_id 或直接看完整日志。`;
+          }
           res.className = "atc-result"; res.textContent = `run ${runId}`;
           if (vp) vp.innerHTML = `<pre>${_escHtml(out.slice(0, 3500))}</pre>`;
-          return { type: "gh", path: "actions_log", content: `gh run view ${runId} --log-failed:\n${out.slice(0, 3500)}` };
+          return { type: "gh", path: "actions_log", content: `gh run view ${runId} --log-failed（${_how}）:\n${out.slice(0, 3500)}` };
         }
         if (call.op === "pr_review_comments") {
           if (!Number.isFinite(call.number)) return { type: "gh", path: "pr_review_comments", content: "[ERROR] 需要 number（PR 编号）。" };
           const r = await backend.taskRunCapture(ghRoot, `gh api repos/{owner}/{repo}/pulls/${call.number}/comments --paginate 2>&1`);
           const raw = (r.stdout || "").trim();
           let arr = []; try { arr = JSON.parse(raw) || []; } catch {}
-          if (!Array.isArray(arr) || !arr.length) return { type: "gh", path: "pr_review_comments", content: `PR #${call.number} 没有 review 评论。` };
+          if (!Array.isArray(arr) || !arr.length) return { type: "gh", path: "pr_review_comments", content: r.code === 0
+              ? `PR #${call.number} 没有 review 评论（gh 命令成功执行，确实是空的）。`
+              : `[ERROR] 取 PR #${call.number} 的 review 评论失败（gh 退出码 ${r.code}）——**这不等于没有评论**，是没查成:\n${String(r.stdout || r.stderr || "").slice(0, 800)}` };
           const formatted = arr.slice(0, 30).map((c) => {
             const at = `${c.path || "?"}:${c.line || c.original_line || "?"}`;
             return `[${c.user?.login || "?"}] ${at}\n${(c.body || "").trim()}\n---`;
@@ -50995,7 +51096,7 @@ async function _executeToolStepInner(step, call, root, run) {
         stderr: "",
         content: (r.reused ? "（已复用现有终端 tab 原地重跑，未新开）\n" : "") + (exited
         ? `[ERROR] 命令在 IDE 终端「${label}」启动后很快退出，未形成持续运行任务。一次性命令应改用 run_cmd 取得真实退出码；持续服务请根据下面输出修复后重启：\n$ ${cmd}\n输出:\n${out || "(无)"}${_readyNote}`
-        : `已在 IDE 终端 tab「${label}」启动持续任务并保持运行：\n$ ${cmd}\n\n启动后输出（前几秒）:\n${out || "(暂无输出)"}\n\n该任务在 IDE 终端里持续运行、用户可见可手动停止。${devServerUrl ? `本 run 检测到的 dev server：${devServerUrl}` : "尚未从该终端识别出本地 URL；用 read_logs/read_terminal 读取后续日志。"}${_readyNote}`),
+        : `已在 IDE 终端 tab「${label}」启动持续任务并保持运行：\n$ ${cmd}\n\n启动后输出（前几秒）:\n${out || "(暂无输出)"}\n\n该任务在 IDE 终端里持续运行、用户可见可手动停止。**注意：running 只表示这个终端标签页还开着（PTY 存活），不等于你这条命令本身还在跑**——命令自己退出了（编译失败、端口被占、进程崩溃），shell 仍然活着，这里照样显示运行中。要确认它真的在服务，读一次 read_terminal 看输出，或直接访问它应该提供的地址。${devServerUrl ? `本 run 检测到的 dev server：${devServerUrl}` : "尚未从该终端识别出本地 URL；用 read_logs/read_terminal 读取后续日志。"}${_readyNote}`),
       };
 
     } else if (call.type === "termread") {
@@ -51134,7 +51235,7 @@ async function _executeToolStepInner(step, call, root, run) {
 ${r ? (r.content_type || "") : ""}${r && r.body_encoding ? "\nencoding: " + r.body_encoding : ""}${redirectBlock ? "\n\n" + redirectBlock : ""}
 
 ${bodyPreview}`)}</pre>`;
-        return { type: "http", path: call.url, ok, status: Number(r?.status), redirectUrl: r?.redirect_url || "", ...(redirectBlock ? { failure: { code: "http_redirect" } } : {}), content: `${call.method} ${call.url}\n状态: ${r ? r.status : "?"} ${r ? (r.status_text || "") : ""}${r && r.truncated ? "（响应体已截断到 5MB）" : ""}\nContent-Type: ${r ? (r.content_type || "") : ""}${r && r.body_encoding ? `\nBody-Encoding: ${r.body_encoding}` : ""}${redirectBlock ? `\n${redirectBlock}` : ""}\n响应头:\n${hdrs}\n\n响应体:\n${r ? (r.body || "(空)") : "(无响应)"}`.slice(0, 8000) };
+        return { type: "http", path: call.url, ok, status: Number(r?.status), redirectUrl: r?.redirect_url || "", ...(redirectBlock ? { failure: { code: "http_redirect" } } : {}), content: _clip(`${call.method} ${call.url}\n状态: ${r ? r.status : "?"} ${r ? (r.status_text || "") : ""}${r && r.truncated ? "（响应体已截断到 5MB）" : ""}\nContent-Type: ${r ? (r.content_type || "") : ""}${r && r.body_encoding ? `\nBody-Encoding: ${r.body_encoding}` : ""}${redirectBlock ? `\n${redirectBlock}` : ""}\n响应头:\n${hdrs}\n\n响应体:\n${r ? (r.body || "(空)") : "(无响应)"}`, 8000, "响应内容") };
       } catch (e) {
         const msg = String(e?.message || e).slice(0, 240);
         const retryNote = e?.retryInfo ? `（${e.retryInfo}）` : "";
@@ -51157,7 +51258,7 @@ ${bodyPreview}`)}</pre>`;
 ${r ? (r.content_type || "") : ""}${r && r.body_encoding ? "\nencoding: " + r.body_encoding : ""}
 
 ${bodyPreview}`)}</pre>`;
-        return { type: "tor", path: call.url, ok, status: Number(r?.status), content: `🧅 Tor ${call.method} ${call.url}\n状态: ${r ? r.status : "?"} ${r ? (r.status_text || "") : ""}${r && r.truncated ? "（响应体已截断到 5MB）" : ""}\nContent-Type: ${r ? (r.content_type || "") : ""}${r && r.body_encoding ? `\nBody-Encoding: ${r.body_encoding}` : ""}\n响应头:\n${hdrs}\n\n响应体:\n${r ? (r.body || "(空)") : "(无响应)"}`.slice(0, 8000) };
+        return { type: "tor", path: call.url, ok, status: Number(r?.status), content: _clip(`🧅 Tor ${call.method} ${call.url}\n状态: ${r ? r.status : "?"} ${r ? (r.status_text || "") : ""}${r && r.truncated ? "（响应体已截断到 5MB）" : ""}\nContent-Type: ${r ? (r.content_type || "") : ""}${r && r.body_encoding ? `\nBody-Encoding: ${r.body_encoding}` : ""}\n响应头:\n${hdrs}\n\n响应体:\n${r ? (r.body || "(空)") : "(无响应)"}`, 8000, "响应内容") };
       } catch (e) {
         const msg = String(e?.message || e).slice(0, 300);
         res.className = "atc-result atc-result--err"; res.textContent = "Tor 请求失败";
@@ -51187,7 +51288,7 @@ ${bodyPreview}`)}</pre>`;
         const _args = _tauriSearchInvokeArgs(call);
         const r = await backend.invoke(call.type, _args);
         const _resultCap = call.type === "developer_community_search" ? 30000 : 12000;
-        let _content = String(r).slice(0, _resultCap);
+        let _content = _clip(String(r), _resultCap, "这次请求的结果");
         // Force-read the top linked pages (README / forum thread / article) so the
         // model answers from real content, not just repo names + titles.
         let _deep = { text: "", count: 0 };
@@ -51223,6 +51324,20 @@ return { type: call.type, path: call.query || "", content: `[失败] ${call.type
       if (!inTauri) { res.className = "atc-result atc-result--err"; res.textContent = "桌面专用"; return { type: "automation", path: "", content: "[不可用] 桌面自动化只能在桌面 App 里用。" }; }
       if (_callDrivesDesktop(call)) _showControlGlow();
       const _m = String(call.method || "").trim();
+      // 不认识的 method 必须是**显式失败**，不能降级。
+      //
+      // 原来映射层碰到不认识的 method（keyboard.hotkey、mouse.right_click…）会静默改成
+      // screen.info，于是这次调用真正做的事是「截了张图」，却返回一条成功文案——点击、
+      // 按键根本没有发生，而模型据此继续往下走，后面每一步都建立在一个没发生的动作上。
+      if (call.invalidMethod) {
+        res.className = "atc-result atc-result--err"; res.textContent = "不支持的动作";
+        return { type: "automation", path: "", content:
+          `[ERROR] 不支持的 method「${String(call.invalidMethod).slice(0, 60)}」——**这次什么都没做**（以前会静默降级成截图并报成功）。`
+          + `\n可用的是：mouse.click / mouse.double_click / mouse.move / mouse.drag / mouse.scroll / `
+          + `keyboard.type / keyboard.press / keyboard.combo / keyboard.paste / screen.info / `
+          + `clipboard.get / clipboard.set / window.list / window.activate / window.minimize。`
+          + `\n组合键用 keyboard.combo，右键用 uiclick 或 browser 的 rightclick。` };
+      }
       if (!_m) return { type: "automation", path: "", content: "[ERROR] automation 需要 method（如 browser.goto / mouse.click / recorder.replay）。" };
       try {
         const r = await backend.automationCall(_m, call.params || {});
@@ -51301,7 +51416,7 @@ return { type: call.type, path: call.query || "", content: `[失败] ${call.type
           + (rsh ? `\n  响应头: ${rsh.replace(/\n/g, "\n  ")}` : "")
           + (f.respBody ? `\n  响应体: ${String(f.respBody).slice(0, 4000)}` : "");
       };
-      return { type: "capture_flows", path: q || "all", content: `共抓到 ${_captureFlows.length} 条，最新 ${picked.length} 条${q ? `（筛选「${q}」）` : ""}：\n\n${picked.map(fmt).join("\n\n")}`.slice(0, 12000) };
+      return { type: "capture_flows", path: q || "all", content: `缓冲区里现有 ${_captureFlows.length} 条（**这是环形缓冲的当前长度，不是本次抓包的总量**——超出上限后最早的流量会被丢弃，而登录握手、token 签发这些恰恰发生在最早），其中最新 ${picked.length} 条${q ? `（筛选「${q}」）` : ""}：\n\n${picked.map(fmt).join("\n\n")}`.slice(0, 12000) };
 
     } else if (call.type === "capture_stop") {
       if (!inTauri) { return { type: "capture_stop", path: "", content: "[不可用] 桌面专用。" }; }
@@ -51357,7 +51472,7 @@ return { type: call.type, path: call.query || "", content: `[失败] ${call.type
         const _credNote = _strippedCreds.length
           ? `\n（注：目标域与抓包来源域不同，已移除 ${_strippedCreds.join("/")} 等凭据头；确需带凭据请在 headers 参数里显式给出。）`
           : "";
-        return { type: "capture_replay", path: url, ok: !!(r && r.ok), status: Number(r?.status), redirectUrl: r?.redirect_url || "", ...(redirectBlock ? { failure: { code: "http_redirect" } } : {}), content: `${_credNote}重发 ${method} ${url}\n状态: ${r ? r.status : "?"} ${r ? (r.status_text || "") : ""}\nContent-Type: ${r ? (r.content_type || "") : ""}${r && r.body_encoding ? `\nBody-Encoding: ${r.body_encoding}` : ""}${redirectBlock ? `\n${redirectBlock}` : ""}\n响应头:\n${hdrs}\n\n响应体:\n${r ? (r.body || "(空)") : "(无响应)"}`.slice(0, 8000) };
+        return { type: "capture_replay", path: url, ok: !!(r && r.ok), status: Number(r?.status), redirectUrl: r?.redirect_url || "", ...(redirectBlock ? { failure: { code: "http_redirect" } } : {}), content: _clip(`${_credNote}重发 ${method} ${url}\n状态: ${r ? r.status : "?"} ${r ? (r.status_text || "") : ""}\nContent-Type: ${r ? (r.content_type || "") : ""}${r && r.body_encoding ? `\nBody-Encoding: ${r.body_encoding}` : ""}${redirectBlock ? `\n${redirectBlock}` : ""}\n响应头:\n${hdrs}\n\n响应体:\n${r ? (r.body || "(空)") : "(无响应)"}`, 8000, "重发的响应内容") };
       } catch (e) {
         res.className = "atc-result atc-result--err"; res.textContent = "重发失败";
         return { type: "capture_replay", path: url, content: `[失败] 重发出错: ${String(e?.message || e).slice(0, 200)}（内网地址允许，169.254.x.x 被禁）` };
@@ -52460,7 +52575,12 @@ return { type: call.type, path: call.query || "", content: `[失败] ${call.type
         else if (act === "batch") {
           // FAST automation: run a whole sequence of node ops in ONE call — no per-step
           // screenshot, no model round-trip between steps. Collapses N turns into 1.
-          const steps = Array.isArray(call.steps) ? call.steps.slice(0, 25) : [];
+          // 超出上限的步骤被丢弃这件事必须说出来。原来直接 slice 掉，而文案还写着
+          // 「一次跑完多步、不要再补 screenshot」——模型给了 32 步、第 26 步之后一个字都
+          // 没跑，却以为整个序列走完了，而提交按钮可能正好在第 28 步。
+          const _allSteps = Array.isArray(call.steps) ? call.steps : [];
+          const steps = _allSteps.slice(0, 25);
+          call._batchDropped = Math.max(0, _allSteps.length - steps.length);
           if (!steps.length) { res.className = "atc-result atc-result--err"; res.textContent = "缺 steps"; return { type: "browser", path: "batch", content: "[ERROR] batch 需要 steps 数组。例：browser(action:\"batch\", steps:[{op:\"type\",node:3,text:\"user\"},{op:\"type\",node:5,text:\"pass\"},{op:\"click\",node:8},{op:\"wait\",ms:600}])。op ∈ click/type/press/scroll/wait/navigate；目标用 node=节点号（先 nodes 拿）或 index=红数字 或 selector。" }; }
           const fastOps = new Set(["observe", "click", "tap", "dblclick", "doubleclick", "rightclick", "contextmenu", "longpress", "hold", "hover", "move", "drag", "slide", "swipe", "wheel", "toggle", "check", "uncheck", "select", "choose", "type", "fill", "input", "clear", "append", "focus", "blur", "press", "key", "scroll", "wait"]);
           const canFastBatch = steps.every((s) => fastOps.has(String(s?.op || s?.action || "").toLowerCase().trim()));
@@ -52548,6 +52668,10 @@ return { type: call.type, path: call.query || "", content: `[失败] ${call.type
         }
       }
       if (act === "batch") {
+        if (call._batchDropped > 0) {
+          content += `\n\n[未全部执行] 你给了 ${call._batchDropped + 25} 个步骤，单次上限是 25——**后面 ${call._batchDropped} 步一个都没跑**。`
+            + `剩下的步骤请再发一次 batch；不要以为整个序列已经走完。`;
+        }
         content += `\n**批量自动化结果**（${call._batchFast ? "fast batch：页面内一次执行多步，只截最终一次" : "兼容 batch：一次模型调用跑完多步"}，不要再为同一步骤补 screenshot）：\n${call._batchLog || "(无步骤)"}` + (state.result != null && state.result !== "" ? `\n\n**执行后的结构化状态**（已是最新状态；接着用 \`node=i\` 继续操作，或用 assert/check 验证。只有最终视觉排版验收才截图）：\n${state.result}` : "");
       } else if (act === "observe" && state.result != null && state.result !== "") {
         content += `\n**页面观察状态**（不是截图猜测，是结构化 DOM/可访问节点快照）。包含 ready、active、contexts(同源 iframe / shadow DOM 数量)、nodes、状态字段；复杂页面先看这里，再用 batch 连续执行，并用 expectText/expectSelector/expectUrl/expectValue 做动作后验收：\n${state.result}`;
