@@ -81,6 +81,14 @@ export function normalizeCapabilities(raw, source = "") {
     out.tools.push(tool);
   }
 
+  for (const item of Array.isArray(caps.knowledge) ? caps.knowledge.slice(0, MAX_TOOLS) : []) {
+    const { tool, error } = normalizeKnowledge(item, source);
+    if (error) { out.errors.push(error); continue; }
+    if (seen.has(tool.name)) { out.errors.push(`名字和已有工具重复：${tool.name}`); continue; }
+    seen.add(tool.name);
+    out.tools.push(tool);
+  }
+
   const seenCmd = new Set();
   for (const item of Array.isArray(caps.commands) ? caps.commands.slice(0, MAX_COMMANDS) : []) {
     const { command, error } = normalizeCommand(item, source);
@@ -128,6 +136,44 @@ function normalizeRole(item, source) {
   return { role: { name, prompt, tools, types, source } };
 }
 
+/**
+ * 规整一条知识库声明 → 一个可检索的工具。
+ *
+ * 「把我们团队的文档库接进来」这件事以前一条路都没有：knowledge_search 只会 POST 到
+ * 写死的网关端点，语义检索看不见工作区之外的文档，用户规则那两份文件各有字数上限。
+ *
+ * 这里不另造一套：一个知识源就是一个**工具**，走和 HTTP 能力完全相同的那条轨——同样的
+ * 名字前缀、同样的审批、同样的「删掉声明就没了」。区别只在 kind：执行时一个发 HTTP，
+ * 一个在目录里检索。
+ */
+function normalizeKnowledge(item, source) {
+  if (!item || typeof item !== "object") return { error: "知识库声明必须是对象" };
+  const name = str(item.name);
+  if (!NAME_RE.test(name)) return { error: `知识库名不合法：${item.name || "(空)"}` };
+  const description = str(item.description);
+  if (!description) return { error: `知识库 ${name} 缺少 description —— 模型是靠它决定该不该来这里查的` };
+  const path = str(item.path);
+  if (!path) return { error: `知识库 ${name} 缺少 path` };
+  return {
+    tool: {
+      name,
+      toolName: USER_TOOL_PREFIX + name,
+      kind: "folder",
+      description,
+      // 检索型工具的参数是固定的一个 query，不让用户自己写——写错了反而查不了。
+      parameters: {
+        type: "object",
+        properties: { query: { type: "string", description: "要查什么（关键词或短语）" } },
+        required: ["query"],
+      },
+      folder: { path },
+      // 检索永远是只读的，所以 Plan / Explorer 这些只读模式里查资料照样能用。
+      readOnly: true,
+      source,
+    },
+  };
+}
+
 /** 规整一条工具声明。返回 `{tool}` 或 `{error}`，两者必有其一。 */
 function normalizeTool(item, source) {
   if (!item || typeof item !== "object") return { error: "工具声明必须是对象" };
@@ -165,6 +211,7 @@ function normalizeTool(item, source) {
     tool: {
       name,
       toolName: USER_TOOL_PREFIX + name,
+      kind: "http",
       description,
       parameters,
       http: { url, method, headers, body: typeof http.body === "string" ? http.body : "" },
@@ -216,7 +263,7 @@ export function compileToolSchema(tool) {
       name: tool.toolName,
       // 明确告诉模型这是本机用户自己接进来的能力，不是产品内置的——它据此判断
       // 该不该优先用（用户特地接进来的东西，通常就是他想让你用的那个）。
-      description: `${tool.description}\n（用户自己接入的能力，来自 ${tool.source || "本机配置"}）`,
+      description: `${tool.description}\n（用户自己接入的${tool.kind === "folder" ? "知识库检索" : "能力"}，来自 ${tool.source || "本机配置"}）`,
       parameters: tool.parameters,
     },
   };

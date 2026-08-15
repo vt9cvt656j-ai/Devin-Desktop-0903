@@ -133,6 +133,9 @@ function seed() {
   // 方法是 GET/HEAD 就当只读（那是用户自己写下的事实，不是我们猜的），于是 Plan /
   // Explorer 这些只读模式里，「查一下我们内网的工单」这类事照样能做。
   defineTool("userhttp", { needsApproval: true, readOnlyModeBlocked: (call) => !call?.userReadOnly });
+  // 用户接进来的本地知识库。检索永远是只读的，所以只读模式一律放行——「先查资料再动手」
+  // 恰恰是 Plan / Explorer 最需要的事。仍然要审批：它读的是用户机器上的一个目录。
+  defineTool("userfolder", { needsApproval: true });
   defineTool("uiclick", { needsApproval: true, readOnlyModeBlocked: true });
   defineTool("automation", { needsApproval: true });
   defineTool("db", { needsApproval: true });
