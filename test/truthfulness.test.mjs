@@ -209,3 +209,35 @@ test("中文查询必须搜得到——原来整段汉字是一个 token，几�
   // ASCII 的行为一个字都不能变。
   assert.deepEqual(tokenize("getUserPermission"), ["getuserpermission", "get", "user", "permission"]);
 });
+
+test("检索截断必须说出来——「搜到上限」和「一共就这么多」不能同形", () => {
+  // 原来摘要写「${hits} 处匹配」，而 hits 被 HIT_CAP 封在 150：真有 500 处时它照样说
+  // 「150 处匹配」。调用方读到的是一个完整答案，于是停止追查——这是最容易让人停下来的
+  // 一种假话。
+  const i = SRC.indexOf("const HIT_CAP = 150");
+  assert.ok(i >= 0, "搜索的上限常量不见了");
+  const seg = SRC.slice(i, i + 4200);
+  assert.match(seg, /已截断/, "达到上限时没有任何提示");
+  assert.match(seg, /不要当成全部结果/, "没有明确告诉调用方还有没看到的");
+  assert.match(seg, /_totalHits/, "没有统计真实总数，就无从判断有没有被截断");
+});
+
+test("检索结果按命中数排序——字母序会把最相关的文件埋掉，而截断从末尾砍", () => {
+  // 后端刚按命中数排好（files.rs 里注释写明「以前是纯字母序，会把 30 处命中的文件埋在
+  // 一个偶然命中 1 处的文件下面」），前端原来一行 localeCompare 把那次修复整个撤销了。
+  const i = SRC.indexOf("const fileMatches = [...matchesByPath.values()]");
+  assert.ok(i >= 0);
+  const seg = SRC.slice(i, i + 400);
+  assert.match(seg, /_hitsOf\(b\) - _hitsOf\(a\)/, "又变回按路径字母序了");
+  assert.match(seg, /localeCompare/, "同分时仍需稳定次序，否则结果不可复现");
+});
+
+test("get_diagnostics 不带 path 时，「什么都没查」不能说成「没有问题」", () => {
+  // 带 path 那条腿半年前就修对了（读不到就明说未被分析），而不带 path 时
+  // getProblemMarkers() 只报**已打开**文件的标记——一个文件都没开时返回「无错误或警告」，
+  // 那句话的真实含义是「我一个文件都没看」。而不带 path 恰恰是推荐的整体自检用法。
+  assert.match(SRC, /当前没有任何文件处于语言服务分析中/, "「什么都没查」仍然和「没问题」同形");
+  assert.match(SRC, /这不等于「项目没有问题」/);
+  assert.match(SRC, /这份快照只覆盖这 \$\{_openFiles\} 个文件，不是整个项目/,
+    "有打开文件时也必须说清作用域，否则会被当成全项目结论");
+});

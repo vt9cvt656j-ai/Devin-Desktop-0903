@@ -49362,7 +49362,15 @@ async function _executeToolStepInner(step, call, root, run) {
         vp.innerHTML = `<pre>${_escHtml(detail)}</pre>`;
         return { type: "search", path: call.path, content: `[ERROR] 搜索范围不存在或无法读取。已尝试:\n${detail}` };
       }
-      const fileMatches = [...matchesByPath.values()].sort((a, b) => String(a.path).localeCompare(String(b.path), "en"));
+      // 按命中数降序，路径名只做稳定的同分次序。
+      //
+      // 原来这里是纯字母序——而后端（files.rs 的 search_project_scope）刚刚**按命中数排好**，
+      // 注释还专门写着「以前是纯字母序，会把 30 处命中的文件埋在一个偶然命中 1 处的文件
+      // 下面」。前端这一行把那次修复整个撤销了。跨多个搜索范围合并时次序确实要重建，
+      // 但重建成字母序就把「哪个文件最相关」这个信息扔了——而截断恰恰从末尾砍。
+      const _hitsOf = (f) => (Array.isArray(f?.matches) ? f.matches.length : 0);
+      const fileMatches = [...matchesByPath.values()].sort((a, b) =>
+        _hitsOf(b) - _hitsOf(a) || String(a.path).localeCompare(String(b.path), "en"));
       const rootNameCounts = new Map();
       for (const scope of searchScopes) rootNameCounts.set(basename(scope), (rootNameCounts.get(basename(scope)) || 0) + 1);
       // STRONGER retrieval: show each hit WITH ±2 lines of surrounding context (like
@@ -49410,7 +49418,22 @@ async function _executeToolStepInner(step, call, root, run) {
           blocks.push(lineNos.map((ln, i) => `${rel}:${ln}: ${(mlist[i]?.text || "").trim()}`).join("\n"));
         }
       }
-      const summary = `${hits} 处匹配 · ${fileMatches.length} 个文件${ctxFiles ? "（►=命中行，带上下文）" : ""}`;
+      // 截断必须说出来。
+      //
+      // 原来摘要写的是「${hits} 处匹配」，而 hits 被 HIT_CAP 封在 150 —— 真有 500 处时
+      // 它照样说「150 处匹配」，调用方读到的是一个完整答案。于是「搜到上限了」和
+      // 「一共就这么多」长得一模一样，而前者意味着**还有没看到的**，后者意味着到此为止。
+      // 这正是最容易让人停止追查的一种假话。
+      const _totalHits = fileMatches.reduce((n, f) => n + _hitsOf(f), 0);
+      const _shownFiles = blocks.length;
+      const _truncated = hits < _totalHits || _shownFiles < fileMatches.length;
+      const _truncNote = _truncated
+        ? `（**已截断**：命中 ${_totalHits} 处 / ${fileMatches.length} 个文件，这里只列出前 ${hits} 处 / ${_shownFiles} 个文件，按命中数排序。要看全需要缩小范围或换更精确的关键词——不要当成全部结果。）`
+        : "";
+      const _ctxNote = ctxFiles < _shownFiles
+        ? `（其中 ${_shownFiles - ctxFiles} 个文件只给了命中行、没带上下文：单轮读取文件数上限）`
+        : "";
+      const summary = `${hits} 处匹配 · ${fileMatches.length} 个文件${ctxFiles ? "（►=命中行，带上下文）" : ""}${_truncNote}${_ctxNote}`;
       const partialNote = searchErrors.length ? `\n\n[ERROR] 部分搜索范围未完成:\n${searchErrors.join("\n")}` : "";
       res.className = fileMatches.length && !searchErrors.length ? "atc-result atc-result--ok" : "atc-result atc-result--err";
       res.textContent = fileMatches.length ? `${hits} 处匹配${searchErrors.length ? " · 部分范围失败" : ""}` : (searchErrors.length ? "无匹配 · 部分范围失败" : "无匹配");
@@ -49549,6 +49572,36 @@ async function _executeToolStepInner(step, call, root, run) {
       }
       // 「没分析成」和「分析了没问题」是两件事，不能都说成"无错误"——前者说成后者就是在骗
       // 调用方，而调用方正拿它当"已验证"的依据。
+      // 不带 path 时的作用域：`getProblemMarkers()` 只报**已打开**文件的标记，而这条腿
+      // 完全没有上面那套「没开就临时建 model」的补救。于是编辑器里一个文件都没开时，
+      // 它返回「无错误或警告」——那句话的真实含义是「我一个文件都没看」。
+      //
+      // 而「不带 path」恰恰是工具描述里推荐的整体自检用法，调用方拿它当「全项目没问题」。
+      // 带 path 那条腿半年前已经按正确规则修过（见下面那段注释），这里补上同一条规则：
+      // 「没看成」「只看了一部分」都不能和「看过了没问题」说同一句话。
+      if (!diagnosticPath) {
+        let _openFiles = 0;
+        try {
+          _openFiles = monaco.editor.getModels().filter((m) => String(m?.uri?.scheme || "") === "file").length;
+        } catch {}
+        if (!_openFiles) {
+          return {
+            type: "diag", path: "",
+            content: "当前没有任何文件处于语言服务分析中（编辑器里没有打开的文件），"
+              + "所以这次**什么都没检查**——这不等于「项目没有问题」。"
+              + "要检查某个文件，给 get_diagnostics 传它的 path（会临时加载并分析）；"
+              + "要查整个项目，跑项目自己的构建或类型检查命令。",
+          };
+        }
+        if (!probs.length) {
+          return {
+            type: "diag", path: "",
+            content: `当前已打开的 ${_openFiles} 个文件里没有错误或警告${note}。`
+              + `**这份快照只覆盖这 ${_openFiles} 个文件，不是整个项目**——没打开的文件不在其中。`
+              + "（LSP 分析可能略有延迟，改完稍等再查更准。）",
+          };
+        }
+      }
       if (!_analyzed) {
         return { type: "diag", path: call.path, content: `该文件未被语言服务分析（读不到内容或路径不存在），**不能据此认为没有问题**。请确认路径，或改用 run_cmd 跑项目自带的类型检查/测试。` };
       }
