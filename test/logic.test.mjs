@@ -21071,7 +21071,9 @@ test("spawn_multiple_agents wires a real per-child collaboration inbox into the 
   const spawnAt = SRC.indexOf("if (it.tc.name === \"spawn_multiple_agents\")");
   const spawnBlock = SRC.slice(spawnAt, spawnAt + 6000);
   assert.match(spawnBlock, /collaboration:\s*_smShared\s*\?\s*\{/);
-  assert.match(spawnBlock, /jobId,\s*\n\s*peerJobIds:\s*_smJobs/,
+  // 传的是 storeId 而不是裸 jobId：黑板是全局的、jobId 是 run 内的编号，不带 run 前缀
+  // 两个标签页的 job#1 会写进同一条记录（见「两个 run 的同号作业不串台」那组测试）。
+  assert.match(spawnBlock, /jobId:\s*storeId,\s*\n\s*peerJobIds:\s*_smJobs/,
     "the spawn path must pass stable job identity and the live peer roster to each child");
   assert.match(spawnBlock, /collaborationEngine\.startSession\([^,]+,[\s\S]{0,200}mode:\s*"lead_follower"/,
     "spawn_multiple_agents must start a lead_follower collaboration session when shared mode is on");
@@ -22981,4 +22983,34 @@ test("退出 App 时浏览器也要收——这张单子上原来只差它一个
   // 一次卡住的 CDP 调用不该把「退出」变成退不出去：锁要有上限，等不到也照样 drop。
   assert.match(browser, /TryLockError::WouldBlock/);
   assert.match(browser, /if std::time::Instant::now\(\) >= deadline/);
+});
+
+// ══ 并行子智能体的黑板键必须按 run 隔离 ═════════════════════════════════════
+//
+// jobId 来自 run._subAgentJobSeq，那个计数器每个 run 都从 0 重新数（嵌套子体的 execRun
+// 也一样），而写进去的键 `sm_${jobId}` 落在全局的 _globalSharedStore 上。于是两个聊天
+// 标签页各自派并行子智能体，双方都产出 sm_1 / sm_2。
+
+test("两个 run 的同号作业不共用一个黑板键", () => {
+  const token = load("_smRunToken", { _smRunTokenSeq: 0 });
+  const a = {}, b = {};
+  assert.notEqual(token(a), token(b), "两个 run 拿到了同一个前缀");
+  assert.equal(token(a), token(a), "同一个 run 每次要拿到同一个前缀，否则前后写的键对不上");
+});
+
+test("派发、状态回写、同伴广播、主体广播——四处用的是同一个键", () => {
+  // 四处只要有一处漏了前缀，就是"写进去的和读出来的不是同一条记录"：
+  // 状态永远停在 running，或者别人的调查结论被当成同事的发现读进上下文。
+  assert.match(SRC, /const storeId = `\$\{_smRunToken\(run\)\}_\$\{jobId\}`;/);
+  assert.match(SRC, /_globalSharedStore\.set\(`jobs\.sm_\$\{storeId\}`/);
+  assert.match(SRC, /updateJobStatus\(`sm_\$\{storeId\}`, job\.status === "done"/);
+  assert.match(SRC, /updateJobStatus\(`sm_\$\{storeId\}`, "failed"\)/);
+  assert.match(SRC, /if \(other !== storeId\) _globalSharedStore\.appendFinding\(`sm_\$\{other\}`, \{ source: `sm_\$\{storeId\}`/);
+  assert.match(SRC, /jobId: storeId,/, "collaboration.jobId 就是黑板键，必须传带前缀的那个");
+  assert.match(SRC, /_smJobs\.push\(storeId\);/, "同伴名单里也得是带前缀的键");
+  // 主体→子体那条广播遍历的是 run 内的 Map，键得自己拼前缀。
+  assert.match(SRC, /store\.appendFinding\(`sm_\$\{_token\}_\$\{jobId\}`/);
+  // 裸键一个都不该再有。
+  assert.doesNotMatch(SRC, /_globalSharedStore\.(?:set|updateJobStatus)\(`(?:jobs\.)?sm_\$\{jobId\}`/,
+    "还有地方在用不带 run 前缀的裸键");
 });
