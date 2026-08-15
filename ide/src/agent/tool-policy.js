@@ -136,6 +136,19 @@ function seed() {
   // 用户接进来的本地知识库。检索永远是只读的，所以只读模式一律放行——「先查资料再动手」
   // 恰恰是 Plan / Explorer 最需要的事。仍然要审批：它读的是用户机器上的一个目录。
   defineTool("userfolder", { needsApproval: true });
+  // git worktree：add 在磁盘上建目录并新建分支，remove 连未提交的改动一起删。它一直
+  // **完全没登记**，于是拿的是默认值（不审批、只读模式不挡）——Plan / Explorer / Reviewer
+  // 这三个声称只读的模式里，模型可以建目录、删目录。这是漏登记，不是有意放行。
+  //
+  // 只读判定按**这一次调用**来：list 是纯读取，只读模式里该能用（"先看看有哪些候选"正是
+  // Plan 要做的事）；add / remove 动磁盘，挡住。
+  // 不设 needsApproval：它只在 <root>/.michael/worktrees/ 下面动，是 IDE 自己的目录，
+  // 每建一个候选都弹一次窗会把 best-of-N 这件事变得没法用。真正的数据风险（重名时
+  // --force 销毁上一个候选）已经在 git.rs 的 git_worktree_add 里从根上去掉了。
+  defineTool("worktree", {
+    mutatesWorkspace: true,
+    readOnlyModeBlocked: (call) => String(call?.action || "list") !== "list",
+  });
   defineTool("uiclick", { needsApproval: true, readOnlyModeBlocked: true });
   defineTool("automation", { needsApproval: true });
   defineTool("db", { needsApproval: true });

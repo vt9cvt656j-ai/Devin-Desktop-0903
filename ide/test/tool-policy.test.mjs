@@ -51,6 +51,9 @@ test("workspace-mutating set matches the pre-refactor literal exactly", () => {
     "game_scaffold", "web_scaffold", "download", "download_asset", "genimage", "generate_3d",
     "generate_sound", "generate_music", "generate_voice", "auto_rig", "generate_motion",
     "generate_texture",
+    // 新增：git worktree。它在 <root>/.michael/worktrees/ 下面建目录、建分支，remove
+    // 还会连未提交的改动一起删。原来完全没登记，拿的是默认策略。
+    "worktree",
   ])));
   // The subtle one: a shell command may change the workspace but never REPORTS it, so it is
   // not in this set. Adding it would make `mutated === false` look like proof of a no-op.
@@ -87,6 +90,9 @@ test("read-only-mode block matches the pre-refactor chain, plus the closed termt
     // 新增：用户 HTTP 能力。和 mcp 一样是**逐次**判定（下面那条测试钉住细则），
     // 所以它出现在这个集合里只表示「默认挡住」，不表示一刀切。
     "userhttp",
+    // 新增：worktree。同样是**逐次**判定——list 放行（只读模式最需要"先看看有哪些候选"），
+    // add / remove 挡住。出现在这个集合里只表示「至少有一种调用会被挡」。
+    "worktree",
   ])));
   // 上一版这里断言的是 `false`，并写着「补掉的时候这一行要在同一个提交里翻成 true」——
   // 这就是那个提交。termtask 就是 run_in_terminal，命令串由模型给出、原样执行，和 cmd
@@ -229,4 +235,28 @@ test("MCP 在只读模式里放行，不等于不用审批", () => {
   // 两道门是独立的：readOnlyModeBlocked 管"这个模式能不能做这件事"，
   // needsApproval 管"要不要问用户"。放行第一道不该顺手关掉第二道。
   assert.ok(needsApproval("mcp"), "mcp 不再需要审批了");
+});
+
+// ── worktree ────────────────────────────────────────────────────────────────
+// 这个工具一直**完全没登记**，拿的是默认策略（不审批、只读模式不挡）。它在磁盘上建目录、
+// 删目录（remove 连未提交的改动一起删），却能在 Plan / Explorer / Reviewer 这三个声称
+// 只读的模式里跑。和当初 termtask 是同一类漏登记。
+
+test("worktree list 在只读模式里能用——「先看看有哪些候选」正是 Plan 要做的事", () => {
+  assert.equal(blockedInReadOnlyMode("worktree", { type: "worktree", action: "list" }), false);
+});
+
+test("worktree add / remove 在只读模式里挡住——它们动磁盘", () => {
+  for (const action of ["add", "remove"]) {
+    assert.equal(blockedInReadOnlyMode("worktree", { type: "worktree", action }), true, action);
+  }
+});
+
+test("worktree 没带 action 时按 list 处理（工具定义里 list 就是默认动作）", () => {
+  assert.equal(blockedInReadOnlyMode("worktree", { type: "worktree" }), false);
+});
+
+test("worktree 算改动工作区——它在 <root>/.michael/worktrees 下面造东西", () => {
+  assert.equal(mutatesWorkspace("worktree"), true);
+  assert.ok(workspaceMutatingTypes().has("worktree"));
 });

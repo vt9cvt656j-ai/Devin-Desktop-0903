@@ -200,6 +200,7 @@ function makeGate({ asked = [] } = {}) {
     _requiresApproval: () => true,             // mcp 类型在策略表里就是 needsApproval
     _approvalKey: (call) => `mcp:${call.server}/${call.tool}`,
     _approvalLabel: () => ({ title: "执行 MCP 工具？", detail: "" }),
+    _approvalAlwaysLabel: load("_approvalAlwaysLabel"),
     _sessionApproved: new Set(),
     document: { body: {} },
     _toolApprovalDialog: async ({ title }) => { asked.push(title); return "once"; },
@@ -235,6 +236,7 @@ test("工作区权限规则写了 ask，就算是自己配的服务也得问—�
     _requiresApproval: () => true,
     _approvalKey: () => "k",
     _approvalLabel: () => ({ title: "执行 MCP 工具？", detail: "" }),
+    _approvalAlwaysLabel: load("_approvalAlwaysLabel"),
     _sessionApproved: new Set(),
     document: { body: {} },
     _toolApprovalDialog: async ({ title }) => { asked.push(title); return "once"; },
