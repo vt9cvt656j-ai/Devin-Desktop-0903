@@ -302,6 +302,7 @@ pub fn run() {
             git::git_log,
             git::git_file_log,
             git::git_file_at,
+            git::git_show,
             git::git_stash,
             git::git_stash_pop,
             git::git_stash_apply,

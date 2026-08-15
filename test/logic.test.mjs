@@ -23269,3 +23269,34 @@ test("新派的子智能体拿到的是同伴**最新**的发现，不是最旧�
   assert.match(ce, /enhanced\.relatedFindings = relatedFindings\.slice\(0, 10\);/);
   assert.doesNotMatch(ce, /relatedFindings\.slice\(-10\)/, "又取回最旧的那批了");
 });
+
+// ══ 子智能体：看得见的工具必须真的能调 ═════════════════════════════════════
+//
+// 名字进 _READ_TOOLS 决定"模型看得见"，类型进 _READ_TYPES 决定"派发时放不放行"。
+// 两份手抄名单，漏一个就是给了它一把打不开门的钥匙——read_logs / read_skill 就这么漂了：
+// 工具清单里明晃晃列着，一调就是 [BLOCKED]，子智能体要么反复重试，要么绕远路用
+// run_cmd 去 cat 日志。
+
+test("子智能体看得见的每个只读工具，类型都在可执行名单里", () => {
+  const readTools = SRC.match(/const _READ_TOOLS = \[([^\]]*)\]/s)[1]
+    .match(/"[a-z0-9_]+"/g).map((s) => s.slice(1, -1));
+  const readTypes = new Set(SRC.match(/const _READ_TYPES = \[([^\]]*)\]/s)[1]
+    .match(/"[a-z0-9_]+"/g).map((s) => s.slice(1, -1)));
+  assert.ok(readTools.length > 15, "名单抠错了");
+
+  // 名字 → 类型的权威来源是 _mapToolCall，不是再抄一份
+  const nameToType = new Map();
+  for (const m of SRC.matchAll(/case "([a-z0-9_]+)": return \{ type: "([a-z0-9_]+)"/g)) nameToType.set(m[1], m[2]);
+  for (const m of SRC.matchAll(/case "([a-z0-9_]+)": \{[\s\S]{0,400}?return \{ type: "([a-z0-9_]+)"/g)) {
+    if (!nameToType.has(m[1])) nameToType.set(m[1], m[2]);
+  }
+
+  const stranded = [];
+  for (const name of readTools) {
+    const type = nameToType.get(name);
+    if (!type) continue;              // 映射抠不到的不算数，宁可漏报也别误报
+    if (!readTypes.has(type)) stranded.push(`${name}(type=${type})`);
+  }
+  assert.deepEqual(stranded, [],
+    `这些工具子智能体看得见却调不动，每次调用都是 [BLOCKED]：${stranded.join("、")}`);
+});

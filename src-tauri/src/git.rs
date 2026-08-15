@@ -618,6 +618,69 @@ pub fn git_worktree_list(root: String) -> Result<String, String> {
     run_git_checked(&root, &["worktree", "list", "--porcelain"])
 }
 
+/// 看一个**历史提交**：提交本身，或者某个文件在那个提交时的样子。
+///
+/// 缺了这个，整套 git 工具只能看「现在」。定位一个回归的标准路径是
+/// git_log 找到可疑提交 → 看那个提交改了什么 → 看改之前那个文件长什么样，
+/// 而这条路走到第二步就断头了：git_diff 只比较工作区，git_blame 只给行级归属。
+/// 模型于是只能绕道 run_cmd 跑 `git show`——那条路要过审批、输出不受这里的截断保护，
+/// 而且它本来就该是个一等工具。
+///
+/// `rev` 允许分支名和 tag（不只是十六进制哈希）：定位回归时 `main~3`、`v1.2.0`
+/// 和 `HEAD^` 一样常用。但仍然逐字符白名单，杜绝把参数喂成 git 的选项或 shell 元字符。
+#[tauri::command(async)]
+pub fn git_show(root: String, rev: String, rel: Option<String>) -> Result<String, String> {
+    require_git_root(&root, false)?;
+    let rev = rev.trim().to_string();
+    if rev.is_empty() {
+        return Err("需要给出提交（哈希 / 分支名 / tag / HEAD~2 之类）".into());
+    }
+    // 白名单而不是黑名单：允许 [A-Za-z0-9_./-] 加 ^~@{}，其余一律拒。
+    // 特别要挡住开头的 '-'，否则 rev 会被 git 当成选项。
+    if rev.starts_with('-')
+        || !rev
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "_./-^~@{}".contains(c))
+    {
+        return Err(format!(
+            "非法的版本号「{rev}」。只允许字母数字和 _ . / - ^ ~ @ {{ }}（例：a1b2c3d、main~3、v1.2.0、HEAD^）"
+        ));
+    }
+
+    let rel = rel.unwrap_or_default().trim().to_string();
+    let out = if rel.is_empty() {
+        // 提交本身：元信息 + 每文件统计 + 完整 patch。
+        run_git(&root, &["show", "--stat", "--patch", "--no-color", &rev])?
+    } else {
+        if rel.contains("..") {
+            return Err("路径不能包含 ..".into());
+        }
+        run_git(&root, &["show", "--no-color", &format!("{rev}:{rel}")])?
+    };
+
+    if !out.status.success() {
+        let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        // git 的原话对模型比"失败了"有用得多，但要补上下一步。
+        return Err(if rel.is_empty() {
+            format!("{err}\n（先用 git_log 拿到真实的提交哈希；分支名和 tag 也行。）")
+        } else {
+            format!("{err}\n（路径要相对仓库根，且必须是那个提交里**当时**存在的路径——文件后来改过名的话，用 git_log 看重命名历史。）")
+        });
+    }
+
+    let mut text = String::from_utf8_lossy(&out.stdout).to_string();
+    const MAX: usize = 200_000;
+    if text.len() > MAX {
+        let mut end = MAX;
+        while end > 0 && !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        text.truncate(end);
+        text.push_str("\n…（内容过大已截断；想看单个文件就带上 rel 参数）");
+    }
+    Ok(text)
+}
+
 /// 移除一个 worktree（并尽力删掉它的临时分支）= 丢弃这个候选。
 #[tauri::command(async)]
 pub fn git_worktree_remove(root: String, path: String) -> Result<String, String> {
@@ -1506,5 +1569,65 @@ mod git_path_tests {
         assert_eq!(unquote_git_path("src/main.rs"), "src/main.rs");
         assert_eq!(unquote_git_path("my file.txt"), "my file.txt");
         assert_eq!(unquote_git_path(""), "");
+    }
+}
+
+#[cfg(test)]
+mod git_show_tests {
+    use super::*;
+
+    /// 在一个真造出来的仓库上跑，不是断言字符串。
+    fn tmp_repo(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("mrday-show-{}-{}", tag, std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        let git = crate::process_util::resolve_system_command("git");
+        let run = |args: &[&str]| {
+            crate::process_util::command(&git)
+                .arg("-C").arg(&dir).args(args)
+                .env("PATH", crate::process_util::augmented_path(None))
+                .env("GIT_AUTHOR_NAME", "t").env("GIT_AUTHOR_EMAIL", "t@t")
+                .env("GIT_COMMITTER_NAME", "t").env("GIT_COMMITTER_EMAIL", "t@t")
+                .output().unwrap()
+        };
+        run(&["init", "-q", "."]);
+        std::fs::write(dir.join("app.js"), "const VERSION = 1;\n").unwrap();
+        run(&["add", "."]);
+        run(&["commit", "-q", "-m", "第一版"]);
+        std::fs::write(dir.join("app.js"), "const VERSION = 2;\n").unwrap();
+        run(&["commit", "-q", "-am", "把版本号改成 2"]);
+        dir
+    }
+
+    #[test]
+    fn git_show_reaches_into_history_which_diff_and_blame_cannot() {
+        let dir = tmp_repo("hist");
+        let root = dir.to_string_lossy().to_string();
+        crate::files::register_workspace_root(root.clone()).ok();
+
+        // ① 看提交本身：要有提交信息、文件统计和 patch
+        let commit = git_show(root.clone(), "HEAD".into(), None).expect("看 HEAD 应当成功");
+        assert!(commit.contains("把版本号改成 2"), "没有提交信息：{commit}");
+        assert!(commit.contains("app.js"), "没有文件统计");
+        assert!(commit.contains("+const VERSION = 2;"), "没有 patch");
+
+        // ② 看**改之前**那个文件的全文——这正是 git_diff / git_blame 做不到的那一步
+        let before = git_show(root.clone(), "HEAD~1".into(), Some("app.js".into())).expect("看历史文件应当成功");
+        assert_eq!(before.trim(), "const VERSION = 1;", "拿到的不是那次提交时的内容");
+
+        // ③ 分支名 / 相对引用要能用，不是只认十六进制哈希
+        assert!(git_show(root.clone(), "HEAD^".into(), None).is_ok());
+
+        // ④ 非法 rev 必须拒，且不能被当成 git 的选项
+        for bad in ["--upload-pack=touch /tmp/pwned", "-x", "a;b", "a b", "$(id)"] {
+            let e = git_show(root.clone(), bad.into(), None).unwrap_err();
+            assert!(e.contains("非法的版本号"), "{bad} 没被拒：{e}");
+        }
+
+        // ⑤ 查不到的提交要给出可执行的下一步，不是干巴巴一句失败
+        let e = git_show(root.clone(), "deadbeef".into(), None).unwrap_err();
+        assert!(e.contains("git_log"), "错误信息没告诉模型下一步该干嘛：{e}");
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
