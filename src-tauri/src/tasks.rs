@@ -451,8 +451,35 @@ fn task_run_capture_inner(
         | truncate_on_boundary(&mut stderr, MAX_TASK_OUTPUT);
     if timed_out {
         truncated = true;
+        // 这句话原来只有一个版本：「长时间运行的命令（如启动服务器）请在终端里手动运行」。
+        //
+        // 但绝大多数超时不是"你启了个服务"，而是"这条一次性命令就是慢"——冷编一个
+        // Rust/Tauri 工程、docker build、make -j8、一整套集成测试。把它们诊断成"该去终端跑"
+        // 是把模型主动推向错的方向：run_in_terminal 对长命令返回的是 running:true /
+        // exitCode:null，而 purpose:"verify" 那条路要的正是退出码。于是模型照做，然后
+        // 永远拿不到它需要的结论。
+        //
+        // 现在按命令形态分两种说法，并且明确告诉它"可以把 timeout_secs 调大"——这个参数
+        // 后端一直支持（TASK_TIMEOUT_SECS 上限 600），只是以前没有暴露给模型。
+        let looks_like_service = {
+            let c = command.to_ascii_lowercase();
+            c.contains("dev")
+                || c.contains("serve")
+                || c.contains("watch")
+                || c.contains("start")
+                || c.contains("nodemon")
+                || c.contains("http-server")
+                || c.contains("tail -f")
+        };
+        let advice = if looks_like_service {
+            "这条命令看起来是长驻服务/监听（dev/serve/watch/start 之类）。run_cmd 只能跑会退出的命令；\
+             服务请改用 run_in_terminal 在真实终端里起，再用 read_terminal / background_monitor 看输出。"
+        } else {
+            "这看起来是一条会退出的命令，只是没跑完。**不要**因此改用 run_in_terminal——那是给服务用的，\
+             而且长命令拿不到退出码，你要的验证结论就没了。直接重跑并把 timeout_secs 调大（上限 600）。"
+        };
         stderr.push_str(&format!(
-            "\n[已超时 {timeout_secs}s，命令及其子进程已被终止。长时间运行的命令（如启动服务器）请在终端里手动运行。]"
+            "\n[已超时 {timeout_secs}s，命令及其子进程已被终止。{advice}]"
         ));
     }
     let combined = format!("{stdout}{stderr}");

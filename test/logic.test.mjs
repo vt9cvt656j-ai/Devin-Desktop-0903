@@ -11022,7 +11022,13 @@ test("tool success and verification command checks reject fake green command res
   assert.equal(timeoutSecs("npm run build"), 300);
   assert.equal(timeoutSecs("git status"), 120);
   const runTerminal = extractFn("_agentRunInTerminal");
-  assert.match(runTerminal, /const timeoutSecs = _agentCommandTimeoutSecs\(cmd\)/);
+  // 模型显式给的 timeout_secs 优先，没给才按命令字面量推。
+  // 原来这里钉的是「只能按字面量推」——那正是问题本身：make / docker build / cmake
+  // 一条正则都不命中，一律 240 秒被杀，而模型没有任何办法说"再给我 600 秒"。
+  assert.match(runTerminal, /const _explicit = Number\(explicitTimeoutSecs\);/);
+  assert.match(runTerminal, /\? Math\.min\(600, Math\.max\(5, Math\.floor\(_explicit\)\)\)/,
+    "显式超时必须夹在后端上限内，别让模型传个 99999 进来");
+  assert.match(runTerminal, /: _agentCommandTimeoutSecs\(cmd\);/, "没给时仍要回落到字面量推断");
   assert.match(runTerminal, /timeout:\s*timeoutSecs/);
   assert.match(runTerminal, /backend\.taskRunCapture\(captureRoot, cmd, \{ timeoutSecs \}\)/);
   assert.doesNotMatch(runTerminal, /120_000|超过 120s|timeout:\s*120/);
@@ -13349,8 +13355,8 @@ test("a destructive shell command with zero observed facts executes and reports 
     "the extra scope note is bounded and disappears after real orientation");
   assert.doesNotMatch(inner, /NOT_RUN·先确认作用域|return \{ type: "cmd"[^}]*先确认作用域/,
     "scope advice must never replace terminal execution with a fabricated result");
-  assert.match(inner, /const result = await _agentRunInTerminal\(root, call\.command, step\)/,
-    "the command always reaches the real terminal executor");
+  assert.match(inner, /const result = await _agentRunInTerminal\(root, call\.command, step, call\.timeoutSecs\)/,
+    "the command always reaches the real terminal executor, carrying the model's explicit timeout");
   assert.match(inner, /〔作用域提示·不拦截〕/,
     "the real command result carries a non-blocking scope warning");
   assert.match(inner, /if \(_scopeAdvice\) _content \+= _scopeAdvice;/,
@@ -17164,7 +17170,7 @@ test("失败命令历史保留证据但从不阻止重试，成功清账，FIFO 
 
 test("失败命令历史已接入 cmd 执行分支：记录上下文但仍进入终端", () => {
   // 执行前读取账本；没有 early return，因此本次重试仍抵达真实终端。
-  assert.match(SRC, /const _retryHistory = _previousFailedCmdRetryNote\(run, call\.command\);[\s\S]{0,6000}const result = await _agentRunInTerminal\(root, call\.command, step\);/,
+  assert.match(SRC, /const _retryHistory = _previousFailedCmdRetryNote\(run, call\.command\);[\s\S]{0,6000}const result = await _agentRunInTerminal\(root, call\.command, step, call\.timeoutSecs\);/,
     "cmd 重试必须在读取失败历史后继续进入 _agentRunInTerminal");
   assert.doesNotMatch(SRC, /_repeatedFailedCmdShortCircuit/);
   assert.match(SRC, /if \(_retryHistory\) _content = _retryHistory/,
@@ -23128,4 +23134,77 @@ test("hook 事件里的工具名要和模型看到的一致，mkdir 的真名是
     const n = name({ type: t });
     assert.ok(new RegExp(`name: "${n}"`).test(SRC), `${t} → ${n}，但清单里没有这个工具`);
   }
+});
+
+// ══ run_cmd 的超时能由模型自己定 ═══════════════════════════════════════════
+//
+// 原来上限只能靠命令字面量猜：一张正则白名单，不在名单里的一律 240 秒。
+// make -j8 / docker build . / cmake --build build / ./scripts/integration-test.sh
+// 一条都不命中，冷编一个 Tauri 工程 300 秒也打不住。到点被杀，而模型**没有任何办法**
+// 说"再给我 600 秒"——schema 里根本没有这个参数。后端一直支持到 600 秒，只是没暴露。
+
+test("模型给的 timeout_secs 优先于字面量推断，且夹在后端上限内", () => {
+  // _mapToolCall(name, args, mcpMap) —— harness 形状照抄 capabilities-wiring.test.mjs
+  const map = new Function(
+    "USER_TOOL_PREFIX", "userToolShortName", "_userCapabilities",
+    "_applyToolArgDefaults", "_normalizeArgKeys", "_STR_ARG_KEYS", "_KNOWN_TOOLS",
+    "_canonicalToolName", "_mcpToolMap", "_RETIRED_SEARCH_ALIASES",
+    `${extractFn("_mapToolCall")}\n;return _mapToolCall;`,
+  )(
+    "user__", () => "", () => ({ tools: [], roles: [], commands: [], disabled: new Set() }),
+    undefined, (a) => a, new Set(), new Set(), (n) => n, new Map(), new Map(),
+  );
+  const call = map("run_cmd", { command: "make -j8", timeout_secs: 600 }, new Map());
+  assert.equal(call.type, "cmd");
+  assert.equal(call.timeoutSecs, 600, "normalizer 没把 timeout_secs 透传出来");
+  assert.equal(map("run_cmd", { command: "ls" }, new Map()).timeoutSecs, 0,
+    "没给时要留空，好回落到字面量推断");
+  // 负数/垃圾值不能变成"永不超时"
+  assert.equal(map("run_cmd", { command: "ls", timeout_secs: -5 }, new Map()).timeoutSecs, 0);
+  assert.equal(map("run_cmd", { command: "ls", timeout_secs: "abc" }, new Map()).timeoutSecs, 0);
+});
+
+test("timeout_secs 两份目录都有——只改客户端等于没改", () => {
+  const gw = JSON.parse(readFileSync(new URL("../../server/prompts/tools.json", import.meta.url), "utf8"));
+  const rc = gw.find((t) => t?.function?.name === "run_cmd");
+  assert.ok(rc?.function?.parameters?.properties?.timeout_secs, "网关那份没有 timeout_secs");
+  // 描述里必须明说"被杀不代表该改用 run_in_terminal"——那条路拿不到退出码，
+  // 而 purpose:"verify" 要的正是退出码。
+  assert.match(rc.function.parameters.properties.timeout_secs.description, /run_in_terminal/);
+});
+
+test("超时文案按命令形态分两种，不再把「编译太慢」诊断成「你该去终端起服务」", () => {
+  const tasks = readFileSync(new URL("../src-tauri/src/tasks.rs", import.meta.url), "utf8");
+  assert.match(tasks, /let looks_like_service = \{/);
+  // 服务型：指向终端是对的
+  assert.match(tasks, /服务请改用 run_in_terminal/);
+  // 一次性命令：明确劝阻改用终端，并给出可执行的下一步
+  assert.match(tasks, /\*\*不要\*\*因此改用 run_in_terminal/);
+  assert.match(tasks, /把 timeout_secs 调大（上限 600）/);
+});
+
+// ══ 投递内容类工具不该被拦腰切开 ═══════════════════════════════════════════
+
+test("web_fetch / git_diff 不再落进 8000 那一档", () => {
+  const src = extractFn("_toolMsgForModel");
+  const code = src.split("\n").filter((l) => !/^\s*(\/\/|\*|\/\*)/.test(l)).join("\n");
+  assert.match(code, /_rt === "web" \|\| _rt === "git" \? 30000/);
+  // read/list 那两档不许被顺手改掉
+  assert.match(code, /_rt === "read" \|\| _rt === "list" \? 60000/);
+  // http 保持 8000 是对的：响应体上限 5MB，没有天然界
+  assert.doesNotMatch(code, /_rt === "http" \? 30000/);
+});
+
+test("二次省略必须说清「你手上比任何一句说明讲的都少」", () => {
+  const cut = load("_headTailModelText");
+  const long = "A".repeat(3000) + "MIDDLE_SHOULD_VANISH" + "B".repeat(3000);
+  const out = cut(long, 800);
+  assert.ok(out.length <= 900);
+  assert.ok(!out.includes("MIDDLE_SHOULD_VANISH"), "测试样本没被切中，这条测试无效");
+  // 旧措辞把省掉的东西叫"日志"——同一条路径上还有网页正文、git diff、检索结果，
+  // 模型看到"日志"会以为省掉的是噪声。
+  assert.doesNotMatch(out, /部分日志已省略/, "还在用「日志」这个误导词");
+  assert.match(out, /被\*\*再次\*\*省略过/, "没说清这是投递时的二次省略");
+  assert.match(out, /两层叠加/, "没提醒工具自己那句截断说明已经不准了");
+  assert.match(out, /原始结果共 6020 字/, "要给出真实的原始长度");
 });
