@@ -566,10 +566,48 @@ pub fn git_worktree_add(root: String, name: String) -> Result<String, String> {
     }
     let abs = format!("{}/.michael/worktrees/{}", root.trim_end_matches('/'), safe);
     let branch = format!("michael/bon-{safe}");
-    // 清掉同名残留（best-effort），避免 add 失败。
-    let _ = run_git(&root, &["worktree", "remove", "--force", &abs]);
-    let _ = run_git(&root, &["branch", "-D", &branch]);
-    run_git_checked(&root, &["worktree", "add", "-b", &branch, &abs, "HEAD"])?;
+
+    // 同名残留原来是这么"清掉"的：
+    //     let _ = run_git(&root, &["worktree", "remove", "--force", &abs]);
+    //     let _ = run_git(&root, &["branch", "-D", &branch]);
+    // 注释写的是「避免 add 失败」，实际做的是**无声销毁上一个同名候选**——`--force` 连
+    // 未提交的改动一起删，`-D` 连没合并的提交一起丢。而重名恰恰是最常发生的事：模型重试
+    // 一步、或者换个思路重来，都会拿同一个 slug（cand-a）再 add 一次，几十分钟的工作就
+    // 这么没了，还返回成功。best-of-N 的整个价值就是"候选留在那儿等你挑"，这段代码把它
+    // 反过来了。
+    //
+    // 现在：能复用就复用，不能复用就报错，一律不删任何文件。
+    // prune 只清理"登记还在、目录已经没了"的簿记，不碰磁盘上的东西，是安全的。
+    let _ = run_git(&root, &["worktree", "prune"]);
+
+    if std::path::Path::new(&abs).exists() {
+        let listed = run_git(&root, &["worktree", "list", "--porcelain"])
+            .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+            .unwrap_or_default();
+        let registered = listed
+            .lines()
+            .filter_map(|l| l.strip_prefix("worktree "))
+            .any(|p| p.trim() == abs);
+        if registered {
+            return Ok(abs); // 上次那个候选还在——交回去接着做，别推倒重来
+        }
+        return Err(format!(
+            "{abs} 已经存在，但它不是一个 git worktree。没有动它——里面可能有要留的东西。\
+             换一个候选名，或者自己确认过之后再删掉这个目录。"
+        ));
+    }
+
+    // 目录不在，但分支可能还在（上一个候选被 remove 掉了，分支删除是 best-effort）。
+    // 这时候用 `-b` 会因为分支已存在直接失败，用 `-B` 会把那个分支上已有的提交丢掉。
+    // 挂上已有分支：上次的提交还在，接着往下做。
+    let branch_exists = run_git(&root, &["rev-parse", "--verify", "--quiet", &format!("refs/heads/{branch}")])
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    if branch_exists {
+        run_git_checked(&root, &["worktree", "add", &abs, &branch])?;
+    } else {
+        run_git_checked(&root, &["worktree", "add", "-b", &branch, &abs, "HEAD"])?;
+    }
     Ok(abs)
 }
 

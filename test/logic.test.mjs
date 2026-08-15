@@ -291,6 +291,10 @@ AUTO_LOAD_DEPS = {
   // 自己传一个小的非零值。少了这个键是 ReferenceError，表现成"测试挂了"而不是
   // "没等"，很难查——和下面那条 LSP 通知同一个道理。
   _AI_MODEL_RETRY_DELAY_MS: 0,
+  // 「本会话总是允许」按钮上的文案（它要把这一下到底放行了多大一片写出来）。
+  // _approveToolCall 每次弹框都要用它，所以每个抠出那个门的测试都需要它——少了是
+  // ReferenceError，表现成"这个测试挂了"而不是"按钮文案不对"。给真实实现，不给桩。
+  _approvalAlwaysLabel: load("_approvalAlwaysLabel", {}),
   // 程序化改完 model 之后通知语言服务器。它被 _setModelValueProgrammatically 和
   // _appendModelTextProgrammatically 内部调用，所以任何抠出这两个函数的测试都需要它——
   // 少了它是 ReferenceError，表现成"这个测试挂了"而不是"LSP 没收到通知"，很难查。
@@ -22841,4 +22845,66 @@ test("已接受的工具卡和普通卡片长得一样——不描绿边也不�
   // 被拒绝的卡片仍然要看得出来（那是异常态，值得标）
   assert.match(APP_CSS, /\.agent-tool-step--rejected \{ opacity/);
   assert.match(APP_CSS, /\.agent-tool-step--rejected \.atc-path \{ text-decoration: line-through/);
+});
+
+// ══ 「本会话总是允许」授出去的必须就是框上写的那一片 ══════════════════════════
+//
+// 会话记忆的 key 原来对 cmd/git/mcp 之外的所有工具都落到 `type:<类型>`，于是那个按钮
+// 的真实含义是「本会话这一类全放行」。框上写「删除（不可恢复）？ build/a.o」，点完之后
+// `delete src/` 静默执行——用户看到的和授出去的不是一回事。
+
+test("批一次删除不等于批下所有删除——按父目录收", () => {
+  const key = load("_approvalKey");
+  const run = { root: "/repo", session: { id: "c1" } };
+  const inBuild = key({ type: "delete", path: "/repo/build/a.o" }, run);
+  const alsoBuild = key({ type: "delete", path: "/repo/build/b.o" }, run);
+  const inSrc = key({ type: "delete", path: "/repo/src/main.js" }, run);
+  assert.equal(inBuild, alsoBuild, "同一个目录里的第二个文件不该再问一遍");
+  assert.notEqual(inBuild, inSrc, "批了 build/ 的删除，src/ 里的删除照样静默执行");
+});
+
+test("移动看两头，下载看来源域名，用户能力按名字分", () => {
+  const key = load("_approvalKey");
+  const run = { root: "/repo", session: { id: "c1" } };
+  assert.notEqual(
+    key({ type: "move", path: "/repo/a/x", to: "/repo/b/x" }, run),
+    key({ type: "move", path: "/repo/a/x", to: "/repo/src/x" }, run),
+    "换了目的地就是另一回事——移动会覆盖目标");
+  assert.notEqual(
+    key({ type: "download", url: "https://good.test/f", dest: "/repo/d/f" }, run),
+    key({ type: "download", url: "https://evil.test/f", dest: "/repo/d/f" }, run),
+    "批了一个域名不等于批了任意域名往工作区落文件");
+  assert.notEqual(
+    key({ type: "userhttp", userName: "查工单" }, run),
+    key({ type: "userhttp", userName: "往外发" }, run),
+    "用户接了好几个能力，批一个不该连带批另一个");
+});
+
+test("write/edit 仍然按类型记——approve 模式的本意就是别一个文件一个框地问", () => {
+  const key = load("_approvalKey");
+  const run = { root: "/repo", session: { id: "c1" } };
+  assert.equal(
+    key({ type: "edit", path: "/repo/a.js" }, run),
+    key({ type: "edit", path: "/repo/b.js" }, run));
+});
+
+test("高危调用不吃会话记忆，也不给「总是允许」按钮", () => {
+  const src = extractFn("_approveToolCall");
+  assert.match(src, /if \(!dangerous && _sessionApproved\.has\(key\)\)/,
+    "高危调用仍会被一次无关的「总是允许」提前满足");
+  assert.match(src, /alwaysLabel: dangerous \? "" : _approvalAlwaysLabel\(call\)/,
+    "高危框上不该还摆着「本会话总是允许」");
+  // db 的会话 key 曾经只到类型：批一条 SELECT 之后 DROP TABLE 直接命中缓存，
+  // 「⚠️ 破坏性数据库操作」那个框再也不弹。
+  const keySrc = extractFn("_approvalKey");
+  assert.match(keySrc, /db:\$\{String\(call\.driver/, "db 该按驱动分，别一把批完");
+});
+
+test("按钮文案说出它放行的范围，不让用户猜", () => {
+  const label = load("_approvalAlwaysLabel");
+  assert.match(label({ type: "delete", path: "/repo/build/a.o" }), /\/repo\/build/);
+  assert.match(label({ type: "download", url: "https://cdn.test/x", dest: "/repo/d/x" }), /cdn\.test/);
+  assert.equal(label({ type: "edit", path: "/a" }), "本会话总是允许");
+  // 下载不知道来源域名时不给这个按钮——说不清范围就别给。
+  assert.equal(label({ type: "download", url: "", dest: "/repo/d/x" }), "");
 });

@@ -18832,7 +18832,62 @@ function _approvalKey(call, run = null) {
           : [];
     return `${scope}\0git:${call.op || "?"}:${JSON.stringify(args)}`;
   }
+  /*
+   * 剩下的原来一律落到 `type:<类型>` —— 「本会话总是允许」于是等于「本会话这一类全放行」。
+   * 对 write/edit/format/mkdir/copy 这是对的：approve 模式的本意就是「别再一个文件一个
+   * 框地问我」，而且它们都进 checkpoint、撤得回来。
+   *
+   * 对下面这几个就不对了，因为框里给用户看的和按钮实际授出去的不是一回事：
+   *   delete —— 框上写着「删除（不可恢复）？ build/a.o」，点完之后 `delete src/` 静默执行。
+   *   move   —— 同理，而且移动会覆盖目标。
+   *   download —— 批了一个域名的下载，等于批了任意域名往工作区落文件。
+   *   userhttp / userfolder —— 用户可能接了好几个能力，批「查内网工单」不该连带批
+   *                            另一个往外发请求的工具（声明还可能来自 clone 来的仓库）。
+   *
+   * 删除/移动按**父目录**收：既符合人的想法（「嗯，build/ 你随便清」），又挡住了越界到
+   * src/。按钮文案由 `_approvalAlwaysLabel` 把这个范围写出来，不靠用户猜。
+   */
+  const dir = (p) => {
+    const s = String(p || "").replace(/\\/g, "/").replace(/\/+$/, "");
+    const i = s.lastIndexOf("/");
+    return i > 0 ? s.slice(0, i) : (i === 0 ? "/" : "");
+  };
+  if (call.type === "delete") return `${scope}\0delete-in:${dir(call.path)}`;
+  if (call.type === "move") return `${scope}\0move:${dir(call.path)}\0${dir(call.to)}`;
+  if (call.type === "download") {
+    let origin = "";
+    try { origin = new URL(String(call.url || "")).origin; } catch { origin = String(call.url || ""); }
+    return `${scope}\0download:${origin}\0${dir(call.dest)}`;
+  }
+  if (call.type === "userhttp" || call.type === "userfolder") {
+    return `${scope}\0${call.type}:${String(call.userName || "?")}`;
+  }
+  // db 的破坏性语句永远走 `dangerous`，那条路已经不吃会话记忆了（见 _approveToolCall）。
+  // 这里再按驱动分一次：批了 postgres 不等于连 redis 一起批。
+  if (call.type === "db") return `${scope}\0db:${String(call.driver || "?")}`;
   return `${scope}\0type:${call.type}`;
+}
+/// 「本会话总是允许」这个按钮到底放行了多大一片 —— 写在按钮上，别让用户猜。
+/// 返回空串＝这一类不该给这个按钮。
+function _approvalAlwaysLabel(call) {
+  const dir = (p) => {
+    const s = String(p || "").replace(/\\/g, "/").replace(/\/+$/, "");
+    const i = s.lastIndexOf("/");
+    return i > 0 ? s.slice(0, i) : (i === 0 ? "/" : "");
+  };
+  const short = (p) => { const s = dir(p); return s ? (s.length > 44 ? "…" + s.slice(-43) : s) : "当前目录"; };
+  switch (call?.type) {
+    case "delete": return `总是允许删除 ${short(call.path)} 里的文件`;
+    case "move": return `总是允许在 ${short(call.path)} → ${short(call.to)} 之间移动`;
+    case "download": {
+      let host = "";
+      try { host = new URL(String(call.url || "")).host; } catch { host = ""; }
+      return host ? `总是允许从 ${host} 下载到 ${short(call.dest)}` : "";
+    }
+    case "userhttp": case "userfolder": return `本会话总是允许「${call.userName || "这个能力"}」`;
+    case "db": return `本会话总是允许 ${call.driver || "这个数据库"} 的非破坏性操作`;
+    default: return "本会话总是允许";
+  }
 }
 function _approvalLabel(call) {
   switch (call.type) {
@@ -19241,12 +19296,21 @@ async function _approveToolCall(call, run) {
   const mustAsk = ruleVerdict === "ask" || dangerous || (mode === "approve" && _requiresApproval(call));
   if (!mustAsk) return true;
   const key = _approvalKey(call, run);
-  if (_sessionApproved.has(key)) return true;
+  // 高危调用**不吃会话记忆**，也不给「本会话总是允许」。
+  //
+  // 这两条原来都没有，后果是那道红色警告框可以被一次无关的同意提前满足：`db` 的
+  // 会话 key 曾经只到类型（`type:db`），于是用户对一条 SELECT 点了「总是允许」，之后的
+  // `DROP TABLE` 直接命中缓存 return true —— 「⚠️ 破坏性数据库操作，确认执行？」那个框
+  // 从此再也不弹。这个框存在的全部意义就是每一次都得有人看着，缓存它等于删掉它。
+  if (!dangerous && _sessionApproved.has(key)) return true;
   // 没有 DOM 就没人可问（headless / 单测 / 无窗口环境）。此时高危命令按拒绝处理：
   // 无人确认时，安全的默认是不执行，而不是静默放行。
   if (typeof document === "undefined" || !document?.body) return !dangerous;
   const label = _approvalLabel(call);
   const decision = await _toolApprovalDialog({
+    // 「总是允许」这个按钮必须说清它到底放行了多大一片，否则用户看着一行
+    // 「删除（不可恢复）？ build/a.o」点下去，实际授权的是别的东西。空串＝不给这个按钮。
+    alwaysLabel: dangerous ? "" : _approvalAlwaysLabel(call),
     title: dangerous ? (_dbCallIsDestructive(call) ? "⚠️ 破坏性数据库操作，确认执行？" : "⚠️ 高风险命令，确认执行？") : label.title,
     detail: dangerous
       ? `${label.detail}\n\n${_dbCallIsDestructive(call)
@@ -48342,7 +48406,8 @@ async function _executeToolStepInner(step, call, root, run) {
   if (readOnlyMode && blockedInReadOnlyMode(call.type, call)) {
     const modeName = _mode === "explorer" ? "Explorer" : _mode === "plan" ? "Plan" : "Reviewer";
     const what = call.type === "cmd" || call.type === "termtask" ? "运行命令"
-      : call.type === "mcp" ? "执行 MCP 工具" : "修改文件";
+      : call.type === "mcp" ? "执行 MCP 工具"
+      : call.type === "worktree" ? "建/删工作树" : "修改文件";
     res.className = "atc-result atc-result--blocked";
     res.textContent = `⛔ ${modeName} 模式下禁止${what}`;
     return { type: call.type, path: call.path, content: `[BLOCKED] ${modeName} 是只读模式，不能${what}。只能用 read_file/list_dir/search/find_files。` };
@@ -50514,7 +50579,16 @@ async function _executeToolStepInner(step, call, root, run) {
       try {
         if (call.action === "add") {
           if (!call.name) { res.className = "atc-result atc-result--err"; res.textContent = "缺 name"; return { type: "worktree", path: "", content: "[ERROR] worktree add 需要 name（候选名 slug，如 cand-a）。" }; }
+          // 同名候选已经存在时后端会把它原样交回来（以前是 --force 删掉重建，几十分钟的
+          // 工作无声消失）。先记下有没有，好把话说准——"接着做"和"新建"是两回事，说错了
+          // 模型就会以为自己面对的是一张白纸，把上次做过的又做一遍。
+          const _wtBefore = await backend.gitWorktreeList(_wtRoot).catch(() => "");
           const _wtPath = await backend.gitWorktreeAdd(_wtRoot, call.name);
+          const _wtReused = String(_wtBefore || "").split(/\r?\n/).some((l) => l.trim() === `worktree ${_wtPath}`);
+          if (_wtReused) {
+            res.className = "atc-result atc-result--ok"; res.textContent = "沿用已有工作树";
+            return { type: "worktree", path: _wtPath, content: `候选「${call.name}」的工作树**已经存在**，原样交回给你：${_wtPath}\n里面是上一次在这个候选上做到的进度（分支 michael/bon-${call.name}），没有被清空。先看一眼再动手，已经做完的部分别重做。\n真要从头来过：先 worktree remove ${_wtPath} 丢弃它，再重新 add。` };
+          }
           res.className = "atc-result atc-result--ok"; res.textContent = "已建工作树";
           return { type: "worktree", path: _wtPath, content: `已建隔离工作树（候选「${call.name}」）：${_wtPath}\n在这个目录下实现这个候选（改它下面的文件、run_cmd 跑命令时先 cd 进去）。⚠️ JS 项目这个新工作树**没有 node_modules**——跑测试/起 dev server 前先软链复用主仓库依赖：run_cmd 执行「ln -s ${_wtRoot}/node_modules ${_wtPath}/node_modules」（或进去 npm i）。\n选定后：没选中的 worktree remove 删掉丢弃；选中的把改动合并回主分支（git -C ${_wtRoot} merge 它的分支）或拷改动文件回主工作区。` };
         } else if (call.action === "remove") {
