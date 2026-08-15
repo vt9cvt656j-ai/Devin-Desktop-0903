@@ -41069,7 +41069,20 @@ async function _runSubAgent({ config, description, prompt, root, container, run,
   // P1.4(#51): 纳入 git 只读四件套（blame/log 是"查代码历史/为什么这样写"的核心证据工具）。
   // git 工具全部映射为单一 type "git"（op 区分读写），type 级门禁分不出 git_commit/git_push，
   // 所以 _READ_TYPES 放行 "git" 的同时必须用 _GIT_READ_OPS 做 op 级二次把关。
-  const _READ_TOOLS = ["read_file", "list_dir", "search", "find_files", "semantic_search", "find_symbol", "lsp_symbols", "lsp_definition", "lsp_references", "get_diagnostics", "read_logs", "knowledge_search", "read_skill", "web_fetch", "web_search", "screenshot", "git_status", "git_diff", "git_log", "git_blame"];
+  // 子智能体看得见的只读工具。
+  //
+  // 这张表原来只有 20 个名字，而主智能体有 135 个。于是一个"调研"子体连
+  // stackoverflow_search、package_search、github_repo、read_terminal 都没有——它要查一个
+  // 依赖的版本、看一眼 CI 日志、读一份 PR 讨论，全都做不到，只能退回去让主体做，
+  // 或者绕道 run_cmd 硬啃。派子体的意义本来就是并行分担，工具比主体少一个数量级，
+  // 这件事就不成立。
+  //
+  // 新放的这批全是**纯读取**：各类检索、代码托管平台的只读接口、git/gh 的只读 op、
+  // 看图、读终端输出、读屏、think/recall。每个名字的**类型**必须同时进 _READ_TYPES，
+  // 否则就是"看得见打不开的钥匙"（read_logs / read_skill 已经这么漂过一次，
+  // test/logic.test.mjs 里那条对账测试就是为此加的）。
+  // git 和 gh 是单 type 多 op，类型放行之后另有 _GIT_READ_OPS / _GH_READ_OPS 二次把关。
+  const _READ_TOOLS = ["read_file", "list_dir", "search", "find_files", "semantic_search", "find_symbol", "lsp_symbols", "lsp_definition", "lsp_references", "get_diagnostics", "read_logs", "knowledge_search", "read_skill", "web_fetch", "web_search", "screenshot", "git_status", "git_diff", "git_log", "git_blame", "arxiv_search", "awwwards_search", "bundlephobia_search", "clinical_trials_search", "codrops_search", "crossref_search", "cve_search", "developer_community_search", "github_search", "hackernews_search", "iconify_search", "mdn_search", "openalex_search", "package_search", "pubchem_search", "pubmed_search", "smashingmag_search", "stackoverflow_search", "steam_search", "wiki_search", "search_game_assets", "github_repo", "gitlab_repo", "gitee_repo", "codeberg_repo", "git_show", "git_conflicts", "git_stash_list", "gh_pr_view", "gh_pr_review_comments", "gh_actions_log", "view_image", "ui_extract", "read_screen", "read_terminal", "list_terminals", "think", "recall_conversation", "current_time"];
   // 这张表必须和上面 _READ_TOOLS 里每个名字的**类型**一一对上。
   //
   // 名字进 _READ_TOOLS 决定"模型看得见"，类型进 _READ_TYPES 决定"派发时放不放行"——
@@ -41078,8 +41091,18 @@ async function _runSubAgent({ config, description, prompt, root, container, run,
   // 就这么漂了：子智能体的工具清单里明晃晃列着它们，一调就是 [BLOCKED]，
   // 于是它要么反复重试，要么绕远路用 run_cmd 去 cat 日志。
   // test/logic.test.mjs 里有一条测试拿 _mapToolCall 把两张表逐个对账，别再漂。
-  const _READ_TYPES = ["read", "list", "search", "find", "semsearch", "findsymbol", "lsp", "diag", "knowledge", "web", "websearch", "screenshot", "liveenvironment", "git", "logs", "skill"];
-  const _GIT_READ_OPS = ["status", "diff", "log", "blame"];
+  const _READ_TYPES = ["read", "list", "search", "find", "semsearch", "findsymbol", "lsp", "diag", "knowledge", "web", "websearch", "screenshot", "liveenvironment", "git", "logs", "skill", "arxiv_search", "awwwards_search", "bundlephobia_search", "clinical_trials_search", "codeberg_repo", "codrops_search", "crossref_search", "current_time", "cve_search", "developer_community_search", "gh", "gitee_repo", "github_repo", "github_search", "gitlab_repo", "hackernews_search", "iconify_search", "mdn_search", "openalex_search", "package_search", "pubchem_search", "pubmed_search", "readscreen", "recall", "search_game_assets", "smashingmag_search", "stackoverflow_search", "steam_search", "termlist", "termread", "think", "uiextract", "viewimage", "wiki_search"];
+  // 只读的 git op。type 级放行之后按 op 二次把关（见下面 _gitOpBlocked）。
+  // show/conflicts/stash_list 都只读：git show 看历史提交，conflicts 列冲突文件，
+  // stash_list 列储藏——三个都不动工作树，也不写远端。
+  const _GIT_READ_OPS = ["status", "diff", "log", "blame", "show", "conflicts", "stash_list"];
+  // gh 和 git 是同一个形状：单 type 多 op，其中 pr_create / pr_reply 会**不可逆地推到
+  // GitHub**。原来 gh 类型根本不在子体的可执行集合里，所以不需要 op 闸门；现在把
+  // gh_pr_view / gh_pr_review_comments / gh_actions_log 这三个只读的放给子体（读 PR 讨论
+  // 和 CI 日志是调研的常规动作），类型就必须放行，于是必须补上同样的把关。
+  // 只按名字挡不住：模型会调它没被展示过的工具（这个仓库还专门为此做了"工具不丢失"的
+  // 自愈加载），真正的边界只能在执行侧。
+  const _GH_READ_OPS = ["pr_view", "pr_review_comments", "pr_checks", "actions_log"];
   // P0.2: 只读 subagent 额外授予 run_cmd 权限，但仅限纯探索类命令（ls/cat/grep 等）
   const _allow = write
     ? [..._READ_TOOLS, "write_file", "edit_file", "multi_edit", "run_cmd", "format_file", "create_dir"]
@@ -41145,7 +41168,14 @@ async function _runSubAgent({ config, description, prompt, root, container, run,
   const narrativeSeen = new Set();
   let _collaborationCursor = 0;
   let toolCount = 0;
-  const SUB_MAX = write ? 18 : 12;
+  // 子体的轮数上限。
+  //
+  // 原来是 18 / 12。工具从 20 个涨到 59 个之后这个数就偏紧了：一个调研子体现在能查
+  // stackoverflow、看 CI 日志、读 PR 讨论、翻历史提交，12 轮里光"取材料"就用掉大半，
+  // 真正做分析和写简报的余量没了——表现是简报越来越像"我查了这些"而不是"结论是什么"。
+  // 放到 28 / 20。墙钟上限（_subDeadlineAt）没动，所以这不是把"跑更久"当成能力：
+  // 它只是让子体在同样的时间预算里不至于被轮数先卡住。
+  const SUB_MAX = write ? 28 : 20;
   let _subFinished = false;
   try {
     for (let i = 0; i < SUB_MAX; i++) {
@@ -41240,12 +41270,16 @@ async function _runSubAgent({ config, description, prompt, root, container, run,
         // MCP 和 git 一样是"单 type 多行为"：类型放行之后必须逐次把关。判据是服务自己
         // 声明的 readOnlyHint；没声明的按可能有副作用处理，退回父智能体去做。
         const _mcpWriteBlocked = !!call && call.type === "mcp" && !call.mcpReadOnly;
-        if (!call || !_execTypes.includes(call.type) || _gitOpBlocked || _mcpWriteBlocked) {
+        // gh 同理：pr_create / pr_reply 是不可逆的对外动作，子任务一律拒绝。
+        const _ghWriteBlocked = !!call && call.type === "gh" && !_GH_READ_OPS.includes(call.op);
+        if (!call || !_execTypes.includes(call.type) || _gitOpBlocked || _mcpWriteBlocked || _ghWriteBlocked) {
           const rejectedCall = call || { type: "unknown", path: "" };
           rejectedCall._toolName = rejectedCall._toolName || tc.name || "unknown";
           const rejectedContent = call
             ? (_gitOpBlocked
-              ? `[BLOCKED] 子任务只允许 git 只读操作（status/diff/log/blame），不能用 ${tc.name}。`
+              ? `[BLOCKED] 子任务只允许 git 只读操作（${_GIT_READ_OPS.join("/")}），不能用 ${tc.name}。`
+              : _ghWriteBlocked
+              ? `[BLOCKED] 子任务只能读 GitHub（${_GH_READ_OPS.join("/")}），不能用 ${tc.name} —— 建 PR / 回复评论是不可逆的对外动作，交回主任务做。`
               : _mcpWriteBlocked
               ? `[BLOCKED] 子任务只能用声明为只读的 MCP 工具，${tc.name} 没有这个声明。把这一步交回主任务处理。`
               : `[BLOCKED] ${write ? "worker 只能读 + 在 scope 内改文件" : "子智能体只读"}，不能用 ${tc.name}。`)

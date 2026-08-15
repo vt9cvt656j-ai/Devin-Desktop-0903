@@ -18292,18 +18292,31 @@ test("#51-4 子智能体白名单：web_search 在场 + git 只读四件套 + op
   assert.ok(typesM && typesM[1].includes('"websearch"') && typesM[1].includes('"git"'),
     "_READ_TYPES 必须含 websearch 与 git");
   // git 单 type 多 op：type 级放行必须配 op 级二次把关，否则 commit/push 会漏进只读子智能体
-  assert.match(sub, /const _GIT_READ_OPS = \["status", "diff", "log", "blame"\]/);
+  assert.match(sub, /const _GIT_READ_OPS = \["status", "diff", "log", "blame", "show", "conflicts", "stash_list"\]/,
+    "show/conflicts/stash_list 都只读——不动工作树也不写远端，该放给子体");
   assert.match(sub, /call\.type === "git" && !_GIT_READ_OPS\.includes\(call\.op\)/,
     "必须有 op 级把关表达式");
   // 不钉"它是条件里的最后一项"——MCP 现在也是单 type 多行为，同一个位置多了一道
   // 同样形状的把关。要守的是"op 把关确实接进了拒绝条件"，不是它排第几。
   assert.match(sub, /\|\| _gitOpBlocked\b/, "op 把关必须接进拒绝门禁条件");
-  assert.match(sub, /git 只读操作（status\/diff\/log\/blame）/, "拒绝文案必须说清允许的 op 范围");
+  assert.match(sub, /git 只读操作（\$\{_GIT_READ_OPS\.join\("\/"\)\}）/,
+    "拒绝文案要从名单生成，不要手抄——手抄的那份上一次就和名单脱节了");
+  // gh 和 git 同构：单 type 多 op，其中 pr_create / pr_reply 会**不可逆地推到 GitHub**。
+  // 把只读的三个放给子体、类型随之放行之后，必须补上同样的 op 闸门。
+  // 只按名字挡不住：模型会调它没被展示过的工具（这个仓库还专门为此做了自愈加载）。
+  assert.match(sub, /const _GH_READ_OPS = \["pr_view", "pr_review_comments", "pr_checks", "actions_log"\]/);
+  assert.match(sub, /call\.type === "gh" && !_GH_READ_OPS\.includes\(call\.op\)/);
+  assert.match(sub, /\|\| _ghWriteBlocked\b/, "gh 把关必须接进拒绝门禁条件");
+  assert.doesNotMatch(sub, /_GH_READ_OPS = \[[^\]]*"pr_create"/, "pr_create 绝不能进只读名单");
+  assert.doesNotMatch(sub, /_GH_READ_OPS = \[[^\]]*"pr_reply"/, "pr_reply 绝不能进只读名单");
 
   // MCP 与 git 同构：类型放行之后按服务自己声明的 readOnlyHint 逐次把关。
   // 少了这道，子智能体就能调用会改东西的 MCP 工具——那本该退回主任务。
   assert.match(sub, /call\.type === "mcp" && !call\.mcpReadOnly/, "MCP 缺少逐次只读把关");
-  assert.match(sub, /\|\| _mcpWriteBlocked\)/, "MCP 把关没接进拒绝条件");
+  // 不钉"它是条件里的最后一项"——这个位置每加一道同构的把关就会挪一次（gh 就是这么把它
+  // 挤走的）。要守的是"确实接进了拒绝条件"。上面几行的注释早就写明了这个原则，
+  // 只是这一条自己没照做。
+  assert.match(sub, /\|\| _mcpWriteBlocked\b/, "MCP 把关没接进拒绝条件");
   assert.match(sub, /_execTypes\.includes\("mcp"\)/, "mcp 没进可执行类型，放行 schema 也调不动");
 });
 
@@ -23439,4 +23452,43 @@ test("提取器脚本本身必须是合法 JS —— 它在页内跑，语法错
   // 上限要比 browser_eval 的 8000 大得多，且超了要说
   assert.match(browser, /if total > 60000 \{/);
   assert.match(browser, /上面的 JSON 是半截的/);
+});
+
+// ══ 子智能体的自由度 ═══════════════════════════════════════════════════════
+//
+// 主智能体 135 个工具，只读子体原来只看得见 20 个。一个"调研"子体连 stackoverflow_search、
+// package_search、github_repo、read_terminal 都没有——查依赖版本、看 CI 日志、读 PR 讨论
+// 全做不到，只能退回去让主体做，或者绕道 run_cmd 硬啃。派子体的意义本来就是并行分担，
+// 工具比主体少一个数量级，这件事就不成立。
+
+test("子智能体拿得到成套的只读调研工具，而不是二十来个", () => {
+  const sub = extractFn("_runSubAgent");
+  const names = sub.match(/const _READ_TOOLS = \[([^\]]*)\]/s)[1].match(/"[a-z0-9_]+"/g).map((x) => x.slice(1, -1));
+  assert.ok(names.length >= 55, `只读工具只有 ${names.length} 个，太少`);
+  for (const t of [
+    "stackoverflow_search", "package_search", "github_repo", "github_search",
+    "git_show", "gh_pr_view", "read_terminal", "view_image", "ui_extract",
+    "recall_conversation", "think",
+  ]) assert.ok(names.includes(t), `子体应当能用 ${t}`);
+  // 写操作一个都不许混进只读名单
+  for (const t of ["write_file", "delete_path", "run_in_terminal", "gh_pr_create", "git_push", "deploy_site"]) {
+    assert.ok(!names.includes(t), `${t} 不该出现在只读名单里`);
+  }
+});
+
+test("放权之后轮数上限跟着放开，但墙钟上限没动", () => {
+  const sub = extractFn("_runSubAgent");
+  assert.match(sub, /const SUB_MAX = write \? 28 : 20;/);
+  // 墙钟才是真正的成本闸门；放开轮数不等于让它跑更久。
+  assert.match(sub, /_subDeadlineAt/, "墙钟上限不能被顺手拿掉");
+  assert.match(sub, /Date\.now\(\) > _subDeadlineAt/, "墙钟判断必须还在循环里");
+});
+
+test("gh 的只读 op 放行了，但建 PR / 回复评论仍然拒绝", () => {
+  const sub = extractFn("_runSubAgent");
+  const ops = sub.match(/const _GH_READ_OPS = \[([^\]]*)\]/)[1];
+  assert.ok(ops.includes('"pr_view"') && ops.includes('"actions_log"'));
+  assert.ok(!ops.includes("pr_create") && !ops.includes("pr_reply"),
+    "不可逆的对外动作绝不能进只读名单");
+  assert.match(sub, /建 PR \/ 回复评论是不可逆的对外动作，交回主任务做/);
 });
