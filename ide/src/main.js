@@ -50257,7 +50257,23 @@ async function _executeToolStepInner(step, call, root, run) {
             + `要验证它，跑项目自带的类型检查 / 编译 / 测试命令（run_cmd 或 run_in_terminal），并看真实退出码。`,
         };
       }
-      return { type: "diag", path: call.path, content: `无错误或警告${note}（${_diagLang || "该"} 语言的语言服务已在分析；LSP 出结果略有延迟，改完稍等再查更准）。` };
+      // "没有诊断"有两种截然不同的原因，必须分开说：
+      //   ① 语言服务真的在跑、真的没查出问题 → 这是有效的绿灯
+      //   ② 语言服务**根本没起来**（没装 pyright / rust-analyzer，或启动失败）→ 一行都没查
+      // 原来两种情况回的是同一句话，还断言"语言服务已在分析"。模型改完 Python 拿到
+      // "无错误"，据此向用户报"已修复"，而真相是一行都没被检查过——这正是"写完说没问题、
+      // 拿去跑就报错"的直接来源。那句"稍等再查更准"更糟：它暗示再等等就准了。
+      const _diagReady = (() => {
+        try { return lspManager?.diagnosticsProviderReady?.(_diagLang) === true; } catch { return false; }
+      })();
+      if (_diagLang && !_BUILTIN_DIAG_LANGS.has(_diagLang) && !_diagReady) {
+        return { type: "diag", path: call.path, content:
+          `**这次一条都没检查。** ${_diagLang} 的语言服务当前没有运行——多半是没装对应的 LSP`
+          + `（Python 要 pyright-langserver，Rust 要 rust-analyzer，Go 要 gopls），或者启动失败了。\n`
+          + `不要把这个当成"没有问题"。要真验证它，跑项目自带的类型检查 / 编译 / 测试命令`
+          + `（run_cmd，看真实退出码）——那是这个语言现在唯一可信的检查方式。` };
+      }
+      return { type: "diag", path: call.path, content: `无错误或警告${note}（${_diagLang || "该"} 语言的语言服务正在运行且已分析过这个文件${_BUILTIN_DIAG_LANGS.has(_diagLang) ? "" : "；LSP 出结果略有延迟，刚改完可稍等再查一次"}）。` };
 
     } else if (call.type === "createproject") {
       // 智能体唯一真正缺的能力：没打开文件夹时它自己开不了工。

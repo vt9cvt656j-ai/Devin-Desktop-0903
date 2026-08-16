@@ -23868,3 +23868,43 @@ test("幂等空操作不算前项失败", () => {
   assert.match(batch, /item\.rawResult\.mutated !== false/);
   assert.match(batch, /磁盘已经是目标状态/);
 });
+
+// ══ 「没有诊断」不等于「没有问题」═══════════════════════════════════════════
+//
+// 用户反馈：写出来的代码很容易用不了、很容易报错。这是其中最直接的一条机器原因。
+//
+// get_diagnostics 原来在没查到问题时一律回「无错误或警告（语言服务已在分析；
+// LSP 出结果略有延迟，改完稍等再查更准）」。可 ensureServer 拿不到服务时返回 null
+// 且**静默**——没装 pyright / rust-analyzer、或启动超时，都走到同一句话。
+// 于是模型改完 Python 拿到"无错误 + 语言服务已在分析"，据此向用户报"已修复"，
+// 而真相是一行都没被检查过。
+
+test("语言服务没起来时，get_diagnostics 必须说「一条都没检查」而不是「无错误」", () => {
+  const i = SRC.indexOf("const _diagReady = (() => {");
+  assert.ok(i > 0, "没有就绪判断");
+  const seg = SRC.slice(i, i + 1400);
+  assert.match(seg, /lspManager\?\.diagnosticsProviderReady\?\.\(_diagLang\) === true/);
+  assert.match(seg, /\*\*这次一条都没检查。\*\*/);
+  // 要点名缺什么，否则用户不知道该装什么
+  assert.match(seg, /pyright-langserver[\s\S]{0,60}rust-analyzer[\s\S]{0,40}gopls/);
+  // 必须给出这个语言现在唯一可信的检查方式
+  assert.match(seg, /跑项目自带的类型检查 \/ 编译 \/ 测试命令/);
+  assert.match(seg, /看真实退出码/);
+  // 那句"稍等再查更准"在服务没起来时是谎话——它暗示再等等就准了
+  assert.doesNotMatch(seg, /稍等再查更准/);
+});
+
+test("语言服务真的在跑时，绿灯才是有效的绿灯", () => {
+  // 内置语言（Monaco 自带 worker）不需要 LSP 就绪；其余语言要
+  assert.match(SRC, /语言的语言服务正在运行且已分析过这个文件/);
+  assert.match(SRC, /_BUILTIN_DIAG_LANGS\.has\(_diagLang\) \? "" : "；LSP 出结果略有延迟/,
+    "延迟提示只对走 LSP 的语言有意义，内置 worker 是同步的");
+});
+
+test("lsp-client 暴露真实就绪状态，而不是让调用方假设", () => {
+  const lsp = readFileSync(new URL("../src/lsp-client.js", import.meta.url), "utf8");
+  assert.match(lsp, /diagnosticsProviderReady\(langId\) \{/);
+  // 判据必须是 initialized，不是"clients 里有这个 key"——
+  // 初始化超时的客户端会留在表里但 initialized 仍是 false（那段代码专门这么写的）
+  assert.match(lsp, /return !!\(client && client\.initialized === true\);/);
+});
