@@ -1041,29 +1041,43 @@ test("AI 助手开关：按钮、面板、分隔条、落盘、开机还原，�
     "收放面板后没触发重算，编辑器会停在旧宽度");
 });
 
-test("设置面板的下拉框必须是自绘的，且一列右端要对齐", () => {
-  // 原生 <select> 在 macOS 上右端是一个上下双箭头的系统步进器，和这套界面里其它
-  // 任何东西都不是一路货；而且原生控件宽度由最长选项撑开，「简体中文 (zh-CN)」很宽、
-  // 「关闭」很窄，一列扫下来右边缘参差不齐。两件事都不报错，只是看着廉价。
+test("设置面板的下拉必须是自绘组件：菜单在控件正下方、同宽，且点击不留焦点环", () => {
   const css = readFileSync(join(HERE, "../src/styles/app.css"), "utf8");
-  const at = css.indexOf("select.settings-input {");
-  assert.notEqual(at, -1, "下拉框的样式规则没了");
-  const block = css.slice(at, at + 900);
-  assert.match(block, /appearance:\s*none/,
-    "又用回原生下拉了，右端会冒出系统的上下双箭头");
-  assert.match(block, /background-image:\s*url\("data:image\/svg/,
-    "关掉原生外观却没自己画箭头，下拉框会变成一个没有任何提示的方框");
-  // 深色主题要单独给一版箭头：currentColor 在背景图里不生效，只写一套的话
-  // 深色下箭头会是深灰压深灰，几乎看不见。
-  assert.match(css, /:root\[data-theme="dark"\] select\.settings-input\s*\{[^}]*background-image:/,
-    "深色主题没有单独的箭头颜色，会糊在背景里");
-  // 对齐靠的是**固定宽度的控件轨道**，不是给每个控件设下限。
-  // 只设下限时右缘能齐、左缘仍随控件自身宽度浮动（实测跨度 150px）；固定轨道两端都齐。
+
+  // 1) 面板内不许再有原生 <select>。原生控件的弹出菜单是系统画的：盖在控件上、
+  //    宽度按最长选项算，位置和宽度 CSS 一行都管不着——"菜单在下方、同宽"这个要求
+  //    在原生控件上根本无法满足，打扮得再像也没用。
+  const selAt = SRC.indexOf('createElement("select")');
+  assert.equal(selAt, -1, "又建原生 select 了，它的弹出菜单没法按要求定位");
+
+  // 2) 两处入口都走同一个组件——否则同一个面板里两种下拉各弹各的。
+  assert.match(SRC, /function buildSelectControl\(/, "自绘下拉组件没了");
+  const bc = SRC.slice(SRC.indexOf("function buildSettingControl"));
+  assert.match(bc.slice(0, 700), /buildSelectControl\(/, "通用设置行没用自绘下拉");
+  const mk = SRC.slice(SRC.indexOf("const makeSelect = "));
+  assert.match(mk.slice(0, 400), /buildSelectControl\(/, "自适应页没用自绘下拉");
+
+  // 3) 菜单必须与控件同宽、贴在正下方。这三行是"对齐"这件事的全部实现。
+  const open = SRC.slice(SRC.indexOf("const r = btn.getBoundingClientRect();"));
+  assert.match(open.slice(0, 600), /menu\.style\.width = `\$\{r\.width\}px`/, "菜单没跟控件同宽");
+  assert.match(open.slice(0, 600), /menu\.style\.left = `\$\{r\.left\}px`/, "菜单左缘没和控件对齐");
+  assert.match(open.slice(0, 600), /r\.bottom \+ 4/, "菜单没贴在控件下方");
+
+  // 4) 键盘要能用。原生 select 白送的东西，自绘就得自己补——少一样键盘用户就用不了。
+  const kd = SRC.slice(SRC.indexOf('wrap.addEventListener("keydown"'));
+  for (const key of ["Escape", "ArrowDown", "ArrowUp"]) {
+    assert.match(kd.slice(0, 900), new RegExp(key), `键盘少了 ${key}`);
+  }
+
+  // 5) 鼠标点完不留灰描边：焦点环只给 :focus-visible。
+  assert.match(css, /\.settings-input:focus \{[^}]*box-shadow:\s*none/,
+    "鼠标点完还挂着一圈灰描边");
+  assert.match(css, /\.settings-input:focus-visible \{[^}]*box-shadow:\s*0 0 0 3px/,
+    "键盘焦点环没了，键盘用户看不出焦点在哪");
+
+  // 6) 控件轨道固定宽度——右缘齐靠统一宽度，左缘齐靠固定轨道。
   assert.match(css, /\.settings-row__control\s*\{[^}]*flex:\s*0 0 220px/,
     "控件列不是固定轨道，左缘会参差不齐");
-  assert.match(css, /\.settings-row__control > \.settings-input\s*\{[^}]*width:\s*100%/,
-    "控件没有铺满轨道，右缘又会随内容浮动");
-  // 开关是定宽的，跟着拉满只会让它飘在轨道中间。
   assert.match(css, /\.settings-row__control > \.settings-toggle\s*\{[^}]*flex:\s*0 0 42px/,
     "开关被拉宽了");
 });

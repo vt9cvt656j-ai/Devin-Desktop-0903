@@ -57743,22 +57743,13 @@ function renderAdaptiveTool(body) {
     row.append(meta, ctrl);
     return row;
   };
-  const makeSelect = (key) => {
-    const sel = document.createElement("select");
-    sel.className = "settings-input";
-    for (const [value, label] of ADAPTIVE_PROFILE_OPTIONS[key]) {
-      const opt = document.createElement("option");
-      opt.value = value;
-      opt.textContent = label;
-      if (profile[key] === value) opt.selected = true;
-      sel.appendChild(opt);
-    }
-    sel.addEventListener("change", () => {
-      profile[key] = sel.value;
-      persistProfile();
-    });
-    return sel;
-  };
+  // 走和其它页同一个自绘下拉。这页原来自己建原生 <select>，于是同一个面板里两种下拉
+  // 各弹各的——一种系统菜单盖在控件上，一种贴在控件下方。
+  const makeSelect = (key) => buildSelectControl(
+    ADAPTIVE_PROFILE_OPTIONS[key],
+    profile[key],
+    (val) => { profile[key] = String(val); persistProfile(); },
+  );
 
   const sec = document.createElement("div");
   sec.className = "settings-group";
@@ -57907,23 +57898,107 @@ async function updateEditorPreference(key, value, { rerender = false } = {}) {
   if (rerender) renderFeaturePanel();
 }
 
+/**
+ * 自绘下拉。
+ *
+ * 换掉原生 <select> 是被逼的：macOS 的原生弹出菜单是**盖在控件上**弹的（当前项对齐
+ * 到控件位置），宽度按最长选项算，位置和宽度都由系统决定，CSS 一行都管不着。要"菜单
+ * 在控件正下方、和控件同宽、左右对齐"，只能自己画。
+ *
+ * 菜单挂在 document.body 上按视口坐标定位，而不是塞进行内：设置行有 overflow 和层叠
+ * 上下文，塞在里面会被裁掉或压在别的行下面。
+ *
+ * 键盘照旧能用：↑/↓ 移动、Enter/Space 选中、Esc 关闭、Tab 移出即关。这些是原生 select
+ * 白送的，自绘就得自己补齐——少补一样，键盘用户就用不了这个设置项。
+ */
+function buildSelectControl(options, cur, onPick) {
+  const wrap = document.createElement("div");
+  wrap.className = "mselect";
+  const btn = document.createElement("button");
+  btn.type = "button";
+  btn.className = "settings-input mselect__btn";
+  btn.setAttribute("aria-haspopup", "listbox");
+  btn.setAttribute("aria-expanded", "false");
+  const label = document.createElement("span");
+  label.className = "mselect__label";
+  wrap.appendChild(btn);
+  btn.appendChild(label);
+
+  let value = String(cur);
+  const paint = () => {
+    const hit = options.find(([v]) => String(v) === value);
+    label.textContent = hit ? hit[1] : value;
+  };
+  paint();
+
+  let menu = null;
+  const close = () => {
+    if (!menu) return;
+    menu.remove();
+    menu = null;
+    btn.setAttribute("aria-expanded", "false");
+    document.removeEventListener("mousedown", onDocDown, true);
+    window.removeEventListener("resize", close, true);
+    window.removeEventListener("scroll", close, true);
+  };
+  const onDocDown = (ev) => { if (!menu?.contains(ev.target) && ev.target !== btn) close(); };
+
+  const open = () => {
+    if (menu) return close();
+    menu = document.createElement("div");
+    menu.className = "mselect__menu";
+    menu.setAttribute("role", "listbox");
+    for (const [val, text] of options) {
+      const it = document.createElement("button");
+      it.type = "button";
+      it.className = "mselect__opt" + (String(val) === value ? " is-on" : "");
+      it.setAttribute("role", "option");
+      it.setAttribute("aria-selected", String(String(val) === value));
+      it.textContent = text;
+      it.addEventListener("click", () => {
+        value = String(val);
+        paint();
+        close();
+        btn.focus();
+        onPick(val);
+      });
+      menu.appendChild(it);
+    }
+    document.body.appendChild(menu);
+    const r = btn.getBoundingClientRect();
+    // 同宽 + 左对齐 + 贴在控件正下方；下方装不下就翻到上方。
+    menu.style.width = `${r.width}px`;
+    menu.style.left = `${r.left}px`;
+    const h = menu.offsetHeight;
+    const below = window.innerHeight - r.bottom - 8;
+    menu.style.top = h <= below ? `${r.bottom + 4}px` : `${Math.max(8, r.top - h - 4)}px`;
+    btn.setAttribute("aria-expanded", "true");
+    menu.querySelector(".is-on")?.focus?.();
+    document.addEventListener("mousedown", onDocDown, true);
+    window.addEventListener("resize", close, true);
+    window.addEventListener("scroll", close, true);
+  };
+
+  btn.addEventListener("click", (ev) => { ev.stopPropagation(); open(); });
+  wrap.addEventListener("keydown", (ev) => {
+    const items = menu ? [...menu.querySelectorAll(".mselect__opt")] : [];
+    if (ev.key === "Escape" && menu) { ev.preventDefault(); close(); btn.focus(); return; }
+    if (!menu && (ev.key === "ArrowDown" || ev.key === "ArrowUp")) { ev.preventDefault(); open(); return; }
+    if (!menu || !items.length) return;
+    const at = items.indexOf(document.activeElement);
+    if (ev.key === "ArrowDown") { ev.preventDefault(); items[Math.min(items.length - 1, at + 1)]?.focus(); }
+    else if (ev.key === "ArrowUp") { ev.preventDefault(); items[Math.max(0, at - 1)]?.focus(); }
+  });
+  return wrap;
+}
+
 function buildSettingControl(item, cur, update) {
   const control = document.createElement("div");
   control.className = "settings-row__control";
 
   if (item.type === "select") {
-    const sel = document.createElement("select");
-    sel.className = "settings-input";
     const options = typeof item.options === "function" ? item.options(cur) : item.options;
-    for (const [val, text] of options) {
-      const opt = document.createElement("option");
-      opt.value = val;
-      opt.textContent = text;
-      if (String(val) === String(cur)) opt.selected = true;
-      sel.appendChild(opt);
-    }
-    sel.addEventListener("change", () => update(item.key, sel.value));
-    control.appendChild(sel);
+    control.appendChild(buildSelectControl(options, cur, (val) => update(item.key, String(val))));
   } else if (item.type === "number") {
     const inp = document.createElement("input");
     inp.type = "number";

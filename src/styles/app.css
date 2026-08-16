@@ -12015,7 +12015,13 @@ button.agent-plan__fold--toggle:focus-visible { outline: 2px solid #1a73e8; outl
   outline: none;
   transition: border-color 0.15s ease, box-shadow 0.15s ease;
 }
-.settings-input:focus { border-color: var(--feature-border-strong, var(--line-strong)); box-shadow: 0 0 0 3px var(--feature-ring, rgba(0,0,0,.13)); }
+/* 焦点环只给**键盘**。鼠标点完还挂着一圈灰描边是纯噪音——用户已经知道自己点了哪儿。
+   :focus-visible 由浏览器判定来源，键盘 Tab 进来照样有环，无障碍不受影响。 */
+.settings-input:focus { border-color: var(--feature-border-strong, var(--line-strong)); box-shadow: none; outline: none; }
+.settings-input:focus-visible {
+  border-color: var(--feature-border-strong, var(--line-strong));
+  box-shadow: 0 0 0 3px var(--feature-ring, rgba(0,0,0,.13));
+}
 .settings-input--num { width: 84px; }
 .settings-input--text { width: 260px; max-width: 40vw; }
 textarea.settings-input {
@@ -12026,33 +12032,9 @@ textarea.settings-input {
   line-height: 1.5;
   resize: vertical;
 }
-/*
- * 下拉框自绘。
- *
- * 原来是浏览器原生 <select>：右端那个上下双箭头是 macOS 的系统步进器，和这套界面
- * 里其它任何东西都不是一路货；而且原生控件的宽度由最长选项撑开，于是「简体中文
- * (zh-CN)」很宽、「关闭」很窄、「4」更窄，右边缘参差不齐，一列看下去像没对齐。
- *
- * appearance:none 之后箭头要自己画。这里用 data URI 而不是伪元素：<select> 的伪元素
- * 在各引擎里行为不一致，背景图是唯一稳的做法。currentColor 在背景图里不生效，所以
- * 深浅两套各写一次描边色。
- */
-select.settings-input {
-  cursor: pointer;
-  appearance: none;
-  -webkit-appearance: none;
-  padding-right: 26px;
-  background-image: url("data:image/svg+xml;charset=utf8,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 12 12' fill='none' stroke='%236b6b70' stroke-width='1.4' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M3 4.8 6 7.8l3-3'/%3E%3C/svg%3E");
-  background-repeat: no-repeat;
-  background-position: right 8px center;
-  background-size: 11px 11px;
-}
-:root[data-theme="dark"] select.settings-input {
-  background-image: url("data:image/svg+xml;charset=utf8,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 12 12' fill='none' stroke='%239a9aa0' stroke-width='1.4' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M3 4.8 6 7.8l3-3'/%3E%3C/svg%3E");
-}
-/* 右边缘对齐：所有控件给一个共同的下限宽度，一列扫下来右端是一条直线。
-   上限用 max-width 兜住，免得某个超长选项把整行撑开。 */
-/* 轨道已经定宽 220px，控件铺满它即可——不再需要各自的 min/max。 */
+/* 原来这里是一大段把原生 <select> 打扮成自绘样子的规则（appearance:none + 背景图箭头）。
+   打扮得再像，弹出菜单仍然是系统画的——盖在控件上、宽度按最长选项算。现在整个换成了
+   .mselect 自绘组件（见本文件末尾），面板内已经没有原生 select，这段随之删除。 */
 .settings-input:hover { border-color: var(--feature-border-strong, var(--line-strong)); }
 /* 数字框的原生上下箭头同样是系统件。藏掉之后 ↑/↓ 键照样能调，功能没丢。 */
 .settings-input--num::-webkit-outer-spin-button,
@@ -14824,3 +14806,56 @@ body.tree-selecting, body.tree-selecting * { user-select: none !important; -webk
 }
 .feature-panel__body .app-icon-preview img { width: 24px; height: 24px; border-radius: 5px; }
 .feature-panel__body .app-icon-control { gap: 10px; }
+
+/* ---- 自绘下拉 ----
+   原生 <select> 的弹出菜单是系统画的：盖在控件上、宽度按最长选项算，位置和宽度 CSS
+   一行都管不着。这里的菜单贴在控件正下方、与控件同宽同左缘。 */
+.mselect { position: relative; width: 100%; }
+.mselect__btn {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  text-align: left;
+  cursor: pointer;
+}
+.mselect__label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.mselect__btn::after {
+  content: "";
+  flex: none;
+  width: 11px;
+  height: 11px;
+  background: currentColor;
+  opacity: .5;
+  /* 用遮罩而不是背景图：这样箭头跟着 currentColor 走，深浅主题不用各写一版。 */
+  -webkit-mask: url("data:image/svg+xml;charset=utf8,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 12 12' fill='none' stroke='%23000' stroke-width='1.4' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M3 4.8 6 7.8l3-3'/%3E%3C/svg%3E") center / contain no-repeat;
+  mask: url("data:image/svg+xml;charset=utf8,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 12 12' fill='none' stroke='%23000' stroke-width='1.4' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M3 4.8 6 7.8l3-3'/%3E%3C/svg%3E") center / contain no-repeat;
+}
+/* 菜单挂在 body 上：设置行有 overflow 和层叠上下文，塞在行内会被裁掉。 */
+.mselect__menu {
+  position: fixed;
+  z-index: 120;
+  max-height: 300px;
+  overflow-y: auto;
+  padding: 4px;
+  background: var(--feature-card, #fff);
+  border: 1px solid var(--feature-border-strong, rgba(0, 0, 0, .14));
+  border-radius: var(--feature-radius-control, 8px);
+  box-shadow: 0 10px 28px rgba(0, 0, 0, .16), 0 2px 6px rgba(0, 0, 0, .06);
+}
+.mselect__opt {
+  width: 100%;
+  display: block;
+  padding: 6px 9px;
+  font-family: var(--font);
+  font-size: 13px;
+  text-align: left;
+  color: var(--feature-text, var(--text));
+  background: transparent;
+  border: 0;
+  border-radius: 6px;
+  cursor: pointer;
+}
+.mselect__opt:hover, .mselect__opt:focus-visible { background: var(--feature-hover); outline: none; }
+.mselect__opt.is-on { font-weight: 600; }
