@@ -1160,3 +1160,32 @@ test("面板里的按钮不能出现蓝字压蓝底，页尾动作要居中", ()
   assert.doesNotMatch(adaptive, /_saveKgText\(/, "保存按钮回来了，但它已经没有要保存的东西");
   assert.match(adaptive, /actions\.append\(reset, memory\)/, "页尾按钮不是预期的两颗");
 });
+
+test("快捷键显示必须分平台：Mac 用符号，Windows 用词并带加号", () => {
+  // ⇧ ⏎ ⌫ 这些字形在 Windows 上既不是系统习惯，很多字体里还缺字，会渲染成方框。
+  // 上一版只有 mod/ctrl/alt/meta 做了分支，shift/enter/backspace 无论什么平台都吐
+  // Mac 符号；shortcutLabel 又是无分隔连写的，Windows 上会出现 "CtrlShiftP"。
+  const cut = (n) => {
+    const i = SRC.indexOf("function " + n + "(");
+    assert.notEqual(i, -1, `${n} 没了`);
+    let d = 0;
+    for (let k = SRC.indexOf("{", i); k < SRC.length; k++) {
+      if (SRC[k] === "{") d++;
+      else if (SRC[k] === "}") { d--; if (!d) return SRC.slice(i, k + 1); }
+    }
+    return "";
+  };
+  const build = (platform) => new Function(
+    "navigator",
+    cut("isMacPlatform") + cut("formatCombo") + cut("shortcutLabel") + ";return shortcutLabel;",
+  )({ platform });
+
+  const mac = build("MacIntel");
+  const win = build("Win32");
+  assert.equal(mac("mod+shift+p"), "⌘⇧P", "Mac 上应该是符号连写");
+  assert.equal(win("mod+shift+p"), "Ctrl+Shift+P", "Windows 上应该是词 + 加号");
+  // 这三个是上一版漏掉分支的
+  assert.equal(win("alt+enter"), "Alt+Enter", "Windows 上 enter 还在吐 Mac 的 ↩");
+  assert.equal(win("mod+backspace"), "Ctrl+Backspace", "Windows 上 backspace 还在吐 ⌫");
+  assert.equal(mac("mod+backspace"), "⌘⌫", "Mac 上应保持符号");
+});

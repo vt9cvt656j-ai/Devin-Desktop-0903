@@ -58471,20 +58471,34 @@ function isMacPlatform(platform = navigator.platform) {
   return /Mac|iPhone|iPad|iPod/i.test(String(platform || ""));
 }
 
+/*
+ * 组合键的显示。
+ *
+ * Mac 用符号（⌘⇧⌥⌃⏎⌫），Windows/Linux 用词（Ctrl/Shift/Alt/Enter/Backspace）——
+ * 这不是风格偏好：⇧ ⏎ ⌫ 这些字形在 Windows 上既不是系统习惯，很多字体里还缺字，
+ * 会渲染成方框。上一版只有 mod/ctrl/alt/meta 做了分支，shift/enter/backspace 三个
+ * 无论什么平台都吐 Mac 符号。
+ */
 function formatCombo(combo) {
   const isMac = isMacPlatform();
   const map = {
     mod: isMac ? "\u2318" : "Ctrl",
     ctrl: isMac ? "\u2303" : "Ctrl",
-    shift: "\u21e7",
+    shift: isMac ? "\u21e7" : "Shift",
     alt: isMac ? "\u2325" : "Alt",
     meta: isMac ? "\u2318" : "Win",
-    enter: "\u21a9",
+    enter: isMac ? "\u21a9" : "Enter",
     escape: "Esc",
     esc: "Esc",
-    backspace: "\u232b",
-    delete: "Del",
+    backspace: isMac ? "\u232b" : "Backspace",
+    delete: isMac ? "\u2326" : "Delete",
+    tab: isMac ? "\u21e5" : "Tab",
+    up: isMac ? "\u2191" : "Up",
+    down: isMac ? "\u2193" : "Down",
+    left: isMac ? "\u2190" : "Left",
+    right: isMac ? "\u2192" : "Right",
     " ": "Space",
+    space: "Space",
   };
   return combo.split("+").map((part) => {
     if (map[part]) return map[part];
@@ -58492,8 +58506,14 @@ function formatCombo(combo) {
   });
 }
 
+/*
+ * 文本形式的组合键（菜单项右侧、提示语里用）。
+ *
+ * Mac 上符号连写就是系统习惯（⌘⇧P）；Windows 上词与词之间必须有加号，否则
+ * "CtrlShiftP" 根本读不断句。
+ */
 function shortcutLabel(combo) {
-  return formatCombo(combo).join("");
+  return formatCombo(combo).join(isMacPlatform() ? "" : "+");
 }
 
 function renderKbdCombo(container, combo) {
