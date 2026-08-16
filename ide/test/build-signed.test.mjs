@@ -6,6 +6,7 @@
 //
 // 它自己却一度是坏的，而且坏法很典型：**前提过时了，没人发现**。
 import { readFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import { test } from "node:test";
@@ -127,12 +128,31 @@ test("只打 dmg 时不许拿上一轮的更新产物冒充这一轮", () => {
     "开工时间戳取晚了，这道校验会永远红");
 });
 
+test("预清段必须真的能执行——语法检查过不代表跑得起来", () => {
+  // 第一版预清用了「awk + 命令替换 + heredoc」三层嵌套，`bash -n` 语法检查是过的，
+  // 真跑时却在 zsh 下 parse error，整个脚本在那一步就崩了：日志只到"目标架构"，
+  // npm run tauri build 根本没跑。语法检查证明不了这个。
+  const sh = readFileSync(join(HERE, "..", "scripts", "build-signed.sh"), "utf8");
+  const start = sh.indexOf("# 卸载：hdiutil detach");
+  assert.ok(start > 0, "预清段不见了");
+  const end = sh.indexOf("# macOS 会给执行过的文件盖上", start);
+  const segment = sh.slice(start, end);
+  // 在仓库根目录下真跑一遍这一段（它只 detach 本产品自己的映像、只删 rw.*.dmg，
+  // 在没有残留时是纯空操作）
+  const out = execFileSync("bash", ["-euo", "pipefail", "-c", `cd ${JSON.stringify(join(HERE, ".."))}\n${segment}\necho __PRECLEAN_OK__`], { encoding: "utf8" });
+  assert.match(out, /__PRECLEAN_OK__/, "预清段执行失败——语法过了但跑不起来");
+});
+
 test("构建前要扫掉上次没收干净的 DMG 中间产物", () => {
   // Tauri 的 bundle_dmg.sh 每次建一个 rw.<pid>.dmg 并挂载；任何一次中断都会让映像
   // 永远挂着。攒够十来个之后 hdiutil attach 失败，而 Tauri 只报一句
   // `failed to run bundle_dmg.sh`——不说是挂载失败，也不说为什么。实测就是这么挂的。
   assert.match(SH, /hdiutil detach "\$_dev" -force/);
-  assert.match(SH, /rm -f target\/release\/bundle\/macos\/rw\.\*\.dmg/);
+  // 不要再写「awk + 命令替换 + heredoc」那种三层嵌套：语法检查过，真跑会崩
+  assert.doesNotMatch(SH, /<<EOF\n\$\(hdiutil info/, "又写回嵌套 heredoc 了");
+  // 改用 find -delete：rm -f + glob 在没有匹配时会把 glob 原样传给 rm，
+  // 而 zsh 在 nomatch 下直接报错退出（第一版就栽在这类外壳差异上）。
+  assert.match(SH, /find target\/release\/bundle\/macos -maxdepth 1 -name 'rw\.\*\.dmg' -delete/);
   // 只能动本产品自己的临时映像，不许误伤用户挂着的别的磁盘映像
   assert.match(SH, /target\/release\/bundle\/macos\/rw/,
     "过滤条件必须限定到本产品的中间产物路径");
