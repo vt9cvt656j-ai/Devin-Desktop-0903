@@ -24454,7 +24454,7 @@ async function sendPrompt(text, attachments = [], readyConfig = null) {
   // Append the model-family style corrective (GPT → strong anti-verbosity; weaker
   // models → terse). Static per model, so the prompt prefix still caches.
   // 聊天模式只给**常驻技能的全文**，不给技能目录：目录的落点是「用 read_skill 读它」，
-  // 而聊天那条路径不执行工具，那句话在这儿是死路。已启用的正文不需要任何工具，照给。
+  // 而聊天那条路径不执行工具，那句话在这儿是死路。常驻技能的正文不需要任何工具，照给。
   const skillsBlock = _agentLightTurn ? "" : (effectiveMode === "chat" ? _activeSkillsBlock() : _skillsSystemBlock());
   // 用户规则连轻量轮也带上：那些轮次省的是系统提示词和工作区预热，而"用中文回答"这种
   // 要求恰恰在闲聊轮最该生效——省掉它等于每次寒暄都破一次规矩。
@@ -28283,11 +28283,11 @@ function _skillCatalogBlock() {
     const MAX = 6_000;          // ~1900 token；比"把正文塞进去"便宜一个数量级
     const head = "\n\n# 可用技能（用户装好的专项能力清单）\n"
       + "需要哪个就用 `read_skill` 读它的完整内容再照做，并在 why 里一句话说清**这次任务里的什么**"
-      + "让你要它（那句会原样显示给用户）；不相关的不要读。标着「已启用」的"
+      + "让你要它（那句会原样显示给用户）；不相关的不要读。标着「常驻」的"
       + "已经在下面给出全文，不用再读。\n";
     const lineFor = (s, perDesc) => {
       const desc = String(s.desc || "").replace(/\s+/g, " ").trim().slice(0, perDesc);
-      return `- ${s.name}${_isSkillActive(s) ? "（已启用）" : ""}：${desc || "（没写说明）"}\n`;
+      return `- ${s.name}${_isSkillActive(s) ? "（常驻）" : ""}：${desc || "（没写说明）"}\n`;
     };
     // 装不下时**先压说明、再丢技能**。原来是一条条按 400 字满额往里塞，塞爆就把剩下的
     // 整条丢掉——这台机器上 28 个技能有 2 个因此从没进过模型的上下文。可这两件事的代价
@@ -28363,7 +28363,7 @@ function _skillToolCardHtml(call, hit, facts) {
     + `<div class="ld-k">技能</div>`
     + `<div class="ld-title">${esc(hit?.name || call?.name || "未指名")}</div>`
     + (hit?.desc ? `<div class="ld-meta">${esc(hit.desc)}</div>` : "")
-    + `</div><span class="ld-pill">${active ? "已启用" : "按需读取"}</span></div>`;
+    + `</div><span class="ld-pill">${active ? "常驻" : "按需读取"}</span></div>`;
 
   if (why) {
     html += `<div class="ld-section"><div class="ld-k">模型声明的选用理由</div>`
@@ -28376,7 +28376,7 @@ function _skillToolCardHtml(call, hit, facts) {
       + (hit.baseDir ? `<div class="ld-meta">正文里的相对路径都相对 ${esc(hit.baseDir)}</div>` : "")
       + `<div class="ld-statuses">`
       +   (hit.repo ? `<span class="ld-chip">装自 ${esc(hit.repo)}</span>` : "")
-      +   (active ? `<span class="ld-status ld-status--success">已启用 · 全文本来就在系统提示词里</span>` : "")
+      +   (active ? `<span class="ld-status ld-status--success">常驻 · 全文本来就在系统提示词里</span>` : "")
       +   tools.map((n) => `<span class="ld-chip">正文要用 ${esc(n)}</span>`).join("")
       + `</div></div>`;
   }
@@ -29032,7 +29032,7 @@ async function openSkillsPanel() {
       `<label class="ctp-lbl">图标</label><div class="skill-iconpick"></div>` +
       `<label class="ctp-lbl">简介（可选）</label><input class="ctp-input _desc" placeholder="一句话说明这个技能" />` +
       `${e.sourcePath ? `<div class="ctp-intro">来源：<code>${_escHtml(e.sourcePath)}</code></div>` : ""}` +
-      `<label class="ctp-lbl">指令内容</label><textarea class="ctp-textarea _prompt" rows="8" placeholder="启用后注入模型的完整指令…"></textarea>` +
+      `<label class="ctp-lbl">指令内容</label><textarea class="ctp-textarea _prompt" rows="8" placeholder="技能的完整指令内容…"></textarea>` +
       `<div class="ctp-foot"><button class="ctp-btn _cancel" type="button">${readonly ? "返回" : "取消"}</button>${readonly ? "" : `<button class="ctp-btn ctp-btn--primary _save" type="button">保存</button>`}</div>`;
     m.body.appendChild(form);
     const pick = form.querySelector(".skill-iconpick");
@@ -31631,7 +31631,7 @@ function _buildAgentToolSchemas(includeWrite, mcpTools = []) {
     { type: "function", function: { name: "remember", description: "Write one piece of knowledge worth **remembering across sessions** into the memory knowledge graph (auto-tagged, auto-linked to older notes, recalled by task relevance, and auto-pruned — record freely, the graph filters for you). **Pick one of two scopes:** (1) **project** (default) = relevant only to the current project (stack / architecture decisions / directory and naming conventions / build, test and run commands / traps hit in this project plus root cause and fix); (2) **global** = **user-level knowledge that spans every project** (who the user is, preferences and taste, rules they repeat, general ways of working, lessons that carry across projects) — global memories are **loaded automatically for every project, every time**. **Make it a habit: every time you learn a reusable, valuable insight — especially a \"root cause + fix\" after hitting a trap, an explicit user preference, or an approach that keeps working — record one.** Write each as an atomic fact (one concept, short, self-contained); do not record one-off details.", parameters: { type: "object", properties: { content: { type: "string", description: "The one atomic piece of knowledge to remember (one concept, short, self-contained)" }, scope: { type: "string", enum: ["project", "global"], description: "project = current project only (default); global = user-level knowledge across all projects (preferences/identity/general lessons)" } }, required: ["content"] } } },
     // 渐进式披露的另一半：技能目录常驻上下文（_skillCatalogBlock），正文靠这个按需取。
     // 全部正文一起塞是 33k token，目录只要 970——差 34 倍，所以正文必须按需。
-    { type: "function", function: { name: "read_skill", description: "Read the FULL text of one skill from the user's installed skill library. The system prompt lists every available skill as `name: description`; when one of them matches the task at hand, call this to get its complete instructions and then follow them. Read-only, needs no authorization. Read only the skill you actually need — reading irrelevant ones wastes the context window. If a skill is already marked 已启用 its full text is already in the system prompt; do not re-read it.", parameters: { type: "object", properties: { name: { type: "string", description: "The skill's name, exactly as listed in the available-skills catalogue" }, why: { type: "string", description: "One short sentence, in the user's language, shown to the user verbatim on the tool card. Name the concrete thing in THIS request that made you reach for this skill — the file type, the format they asked for, the words they used. Write it for them, not for yourself: 「用户要把这份周报导出成 .docx，这个技能里带了模板和写入脚本」, not 「docx 技能用于处理 Word 文档」. Never restate the skill's own description, and never write filler like 「为了更好地完成任务」 — the user already knows you are trying to help; what they cannot see is what you noticed. If you cannot point at something in the request, do not read this skill." } }, required: ["name", "why"] } } },
+    { type: "function", function: { name: "read_skill", description: "Read the FULL text of one skill from the user's installed skill library. The system prompt lists every available skill as `name: description`; when one of them matches the task at hand, call this to get its complete instructions and then follow them. Read-only, needs no authorization. Read only the skill you actually need — reading irrelevant ones wastes the context window. If a skill is already marked 常驻 its full text is already in the system prompt; do not re-read it.", parameters: { type: "object", properties: { name: { type: "string", description: "The skill's name, exactly as listed in the available-skills catalogue" }, why: { type: "string", description: "One short sentence, in the user's language, shown to the user verbatim on the tool card. Name the concrete thing in THIS request that made you reach for this skill — the file type, the format they asked for, the words they used. Write it for them, not for yourself: 「用户要把这份周报导出成 .docx，这个技能里带了模板和写入脚本」, not 「docx 技能用于处理 Word 文档」. Never restate the skill's own description, and never write filler like 「为了更好地完成任务」 — the user already knows you are trying to help; what they cannot see is what you noticed. If you cannot point at something in the request, do not read this skill." } }, required: ["name", "why"] } } },
     { type: "function", function: { name: "get_diagnostics", description: "Read the editor/LSP live diagnostics for a file (errors and warnings), returning file:line:column, source/code, nearby code, likely cause and direction of the fix. It is a read-only evidence tool, not a command, and needs no extra authorization this round. When the user asks \"which files have bugs / why is this erroring / how do I fix this error\", reach for it first to read the errors that already exist; after changing code, use it as a quick self-check. Omit path to get diagnostics for every open file.", parameters: { type: "object", properties: { path: { type: "string", description: "Optional; the file path to check. Omit to check every open file" } } } } },
     { type: "function", function: { name: "read_logs", description: "Read the tail of the latest terminal output or of a log file. Use it to look straight at the cause when a backend/API/build fails; it is a read-only evidence tool, starts no new command, and needs no extra authorization this round. When the error output names an npm debug log or a .log/.out/.err path, pass that as path; with no path it aggregates the recent task terminals and the workspace's usual logs. 【vs alternatives】For the live state of a long-running task terminal use read_terminal; for live editor/LSP diagnostics use get_diagnostics.", parameters: { type: "object", properties: { path: { type: "string", description: "Optional; the log file whose tail to read" }, paths: { type: "array", description: "Optional; several log file paths", items: { type: "string" } }, name: { type: "string", description: "Optional; the task name given to run_in_terminal" }, lines: { type: "integer", description: "How many trailing lines to read, default 200" }, include_terminal: { type: "boolean", description: "Whether to include task terminal output as well, default true" } } } } },
     { type: "function", function: { name: "git_status", description: "Show the git repository status: current branch, and the staged / unstaged / untracked file lists. Use it to learn which files were touched, or before committing. 【vs alternatives】For the actual line-by-line difference use git_diff; for commit history use git_log.", parameters: { type: "object", properties: {} } } },
@@ -57282,7 +57282,7 @@ function renderSkillsTool(body) {
       <div class="mcpfp-head">
         <div>
           <h3>Skills 技能</h3>
-          <p class="mcpfp-sub">启用后的技能指令会进入每次模型请求（也传给 Agent 子任务）。技能可以是自定义提示词，也可以是含 <code>SKILL.md</code> 的目录——安装到工作区 <code>.claude/skills/</code> 后自动被发现。</p>
+          <p class="mcpfp-sub">技能始终对模型可见：清单里的名称和描述一直在上下文里，模型按需自己读取正文。「常驻」是把某个技能的全文钉进每次请求（也传给 Agent 子任务）。技能可以是自定义提示词，也可以是含 <code>SKILL.md</code> 的目录——安装到工作区 <code>.claude/skills/</code> 后自动被发现。</p>
         </div>
         <button type="button" class="ctp-btn ctp-btn--primary" data-skfp="add-skill">＋ 添加技能</button>
       </div>
@@ -57328,7 +57328,7 @@ function renderSkillsTool(body) {
       <div class="mcpfp-inline-form__head">
         <div>
           <strong>添加自定义 Skill</strong>
-          <p>保存后会立刻加入上方卡片，并默认启用到模型请求里。</p>
+          <p>保存后会立刻加入上方卡片，并默认设为常驻（全文进入每次请求）。</p>
         </div>
       </div>
       <div class="mcpfp-form-grid">
@@ -57342,12 +57342,12 @@ function renderSkillsTool(body) {
         </label>
         <label class="mcpfp-field mcpfp-field--wide">
           <span>指令内容</span>
-          <textarea class="ctp-textarea" data-skfp-new-prompt rows="7" placeholder="启用后注入模型的完整指令…"></textarea>
+          <textarea class="ctp-textarea" data-skfp-new-prompt rows="7" placeholder="技能的完整指令内容…"></textarea>
         </label>
       </div>
       <div class="mcpfp-inline-form__actions">
         <button type="button" class="ctp-btn" data-skfp="cancel-add-skill">取消</button>
-        <button type="button" class="ctp-btn ctp-btn--primary" data-skfp="save-skill">保存并启用</button>
+        <button type="button" class="ctp-btn ctp-btn--primary" data-skfp="save-skill">保存并常驻</button>
       </div>`;
     setTimeout(() => { try { addFormEl.querySelector("[data-skfp-new-name]")?.focus(); } catch {} }, 0);
   };
@@ -57367,10 +57367,10 @@ function renderSkillsTool(body) {
       addSkillOpen = false;
       renderAddSkillForm();
       await renderInstalled();
-      showToast(`已添加并启用技能：${name}`);
+      showToast(`已添加技能并设为常驻：${name}`);
     } catch (err) {
       showToast("添加失败：" + String(err?.message || err).slice(0, 140));
-      if (button) { button.disabled = false; button.textContent = "保存并启用"; }
+      if (button) { button.disabled = false; button.textContent = "保存并常驻"; }
     }
   };
   const renderInstalled = async () => {
@@ -57410,7 +57410,10 @@ function renderSkillsTool(body) {
       const repoUrl = _skillSourceUrl(s) || (officialLike && installedDir ? `https://github.com/anthropics/skills/tree/main/skills/${installedDir}` : "");
       const desc = String(meta.desc || (officialPath ? `Anthropic 官方技能 · ${officialPath}` : "") || s.desc || (isFile ? s.baseDir || "" : "自定义技能")).slice(0, 160);
       const sourceBadge = !isFile ? "自定义" : officialLike ? "官方" : meta.source === "github" ? "GitHub" : workspaceSkill ? "工作区" : "只读";
-      const status = on ? "已启用" : "未启用";
+      // 不写「未启用」：那是这一页最误导的一个字。它是常驻显示的**状态标签**，用户
+      // 读到的是"这个技能是关着的"——而技能从来没关过，模型随时能在清单里看见它、
+      // 用 read_skill 读它。这个开关管的只是"要不要把全文钉进每次请求"。
+      const status = on ? "常驻" : "按需";
       const iconOwner = officialLike ? "anthropics" : String(meta.owner || "");
       return `
         <div class="mcpfp-card mcpfp-card--installed${officialLike ? " mcpfp-card--featured" : ""}${on ? " is-on" : " is-off"}" data-skfp-id="${_escAttr(s.id)}">
@@ -57426,14 +57429,14 @@ function renderSkillsTool(body) {
           </div>
           <div class="mcpfp-card__btns">
             ${repoUrl ? `<button type="button" class="ctp-iconbtn" data-skfp-repo="${_escAttr(repoUrl)}" title="查看来源">${_dbUiIconSvg("open")}</button>` : ""}
-            <button type="button" class="ctp-btn ctp-btn--sm${on ? " ctp-btn--primary" : ""}" data-skfp-toggle="${_escAttr(s.id)}">${on ? "已启用" : "启用"}</button>
+            <button type="button" class="ctp-btn ctp-btn--sm${on ? " ctp-btn--primary" : ""}" data-skfp-toggle="${_escAttr(s.id)}">${on ? "已常驻" : "设为常驻"}</button>
             ${canDelete ? `<button type="button" class="ctp-iconbtn ctp-iconbtn--danger" data-skfp-del="${_escAttr(s.id)}" title="${workspaceSkill ? "删除工作区 Skills 目录" : "删除自定义技能"}">${_ICON_TRASH}</button>` : ""}
           </div>
         </div>`;
     };
     // 工作区那批照旧排在前面；家目录 / 插件目录那批单独一段，标题写清楚它们从哪来、
     // 为什么删不掉。分成两段而不是混在一起，是因为这两类的可操作性完全不同：
-    // 上面那批能删，下面那批只能开关。
+    // 上面那批能删，下面那批只能设常驻 / 取消常驻。
     installedEl.innerHTML =
       [...custom, ...visibleFileSkills].map(cardFor).join("")
       + (externalFileSkills.length

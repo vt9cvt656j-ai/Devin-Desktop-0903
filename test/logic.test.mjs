@@ -6836,10 +6836,10 @@ test("active Skills survive L0 prompt stripping and are inherited by child work"
   assert.match(messages[0].content, /Strict review/);
   assert.equal(messages[1].content, "review this");
   assert.ok(!messages.some((message) => message.content.includes("private bundled prompt")));
-  // 注入的是"目录 + 已启用全文"这个组合块。光有已启用那半，模型永远不知道还有别的技能
+  // 注入的是"目录 + 常驻全文"这个组合块。光有常驻那半，模型永远不知道还有别的技能
   // 存在——那正是"装了技能却没用上"的成因。
   assert.match(SRC, /run\?\.skillsBlock \?\? _skillsSystemBlock\(\)/);
-  // 会跑工具的模式拿整个组合块；聊天模式只拿已启用那半——它不执行工具，
+  // 会跑工具的模式拿整个组合块；聊天模式只拿常驻那半——它不执行工具，
   // 目录里那句「用 read_skill 读」在那儿是死路。
   assert.match(SRC, /const skillsBlock = _agentLightTurn \? "" : \(effectiveMode === "chat" \? _activeSkillsBlock\(\) : _skillsSystemBlock\(\)\)/);
   assert.match(SRC, /function _skillsSystemBlock\(\) \{\s*return _skillCatalogBlock\(\) \+ _activeSkillsBlock\(\);/);
