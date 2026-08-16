@@ -28701,9 +28701,21 @@ function _skillIsWorkspaceInstalled(skill, root) {
   const installRoot = _skillWorkspaceInstallRoot(root);
   return !!(baseDir && installRoot && baseDir !== installRoot && _pathIsAtOrUnder(baseDir, installRoot));
 }
+/*
+ * 哪些技能能删。
+ *
+ * 原来只有"自定义"和"装进本工作区"的能删；来自用户目录 / 插件目录的一律只能停用，
+ * 卡片上连删除按钮都不画——用户看到的是"这一堆技能没有删除功能"，而不是"它们不属于
+ * 这个工作区"。按所有者要求放开：只要它在磁盘上有一个实实在在的目录，就能删。
+ *
+ * 代价是这一下会删到工作区**外面**的文件，所以删之前必须把目录路径摆给用户看
+ * （见 _deleteSkillRecord 里的确认框）——放开权限可以，闷声删不行。
+ */
 function _skillCanDelete(skill, root) {
   if (!skill) return false;
-  return !skill._readonly || _skillIsWorkspaceInstalled(skill, root);
+  if (!skill._readonly) return true;
+  if (_skillIsWorkspaceInstalled(skill, root)) return true;
+  return !!String(skill.baseDir || "").trim();
 }
 function _skillInstalledDirName(skill) {
   return String(skill?.baseDir || "").replace(/\\/g, "/").replace(/\/+$/, "").split("/").pop() || "";
@@ -28745,8 +28757,19 @@ async function _deleteSkillRecord(skill, root, customList = null) {
   if (!skill?.id) throw new Error("技能记录无效");
   const skillRoot = String(root || rootPath || workspaceRoots[0] || "").replace(/\/+$/, "");
   if (skill._readonly) {
-    if (!_skillIsWorkspaceInstalled(skill, skillRoot)) throw new Error("这个技能来自系统/插件/用户目录，只能禁用，不能从当前工作区删除");
-    await backend.deletePath(skill.baseDir);
+    const dir = String(skill.baseDir || "").trim();
+    if (!dir) throw new Error("这个技能没有对应的磁盘目录，只能停用");
+    // 工作区外面的技能：删的是用户目录 / 插件目录里的真实文件夹。把完整路径摆出来再删
+    // ——它不在当前项目里，用户很可能以为只是从这个列表里移除。
+    if (!_skillIsWorkspaceInstalled(skill, skillRoot)) {
+      const ok = confirm(
+        `这个技能不在当前工作区，它的文件在：\n\n${dir}\n\n`
+        + "删除会把这个目录整个删掉，其它项目里也会跟着消失。\n"
+        + "如果只是不想让它生效，关掉开关就行。\n\n确定删除？",
+      );
+      if (!ok) return;
+    }
+    await backend.deletePath(dir);
     _fileSkillsCacheKey = "";
     await _refreshFileSkills(skillRoot);
   } else {
@@ -57259,7 +57282,7 @@ function renderSkillsTool(body) {
     installedEl.innerHTML =
       [...custom, ...visibleFileSkills].map(cardFor).join("")
       + (externalFileSkills.length
-        ? `<div class="skfp-section">用户 / 插件目录（只读，可开关但不能在这里删除）</div>`
+        ? `<div class="skfp-section">用户 / 插件目录（不属于当前项目，删除会连磁盘上的文件夹一起删）</div>`
           + externalFileSkills.map(cardFor).join("")
         : "");
     renderMarket();

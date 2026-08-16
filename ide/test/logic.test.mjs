@@ -14287,7 +14287,9 @@ test("MCP and Skills settings cards expose live state and real deletion cleanup"
   assert.match(SRC, /function _skillIsWorkspaceInstalled\(skill, root\)/);
   assert.match(SRC, /\.claude\/skills/);
   assert.match(SRC, /function _deleteSkillRecord\(skill, root, customList = null\)/);
-  assert.match(extractFn("_deleteSkillRecord"), /backend\.deletePath\(skill\.baseDir\)/);
+  // 删的仍然是这个技能自己的目录，只是先把路径读进局部变量再删（要在确认框里显示它）。
+  assert.match(extractFn("_deleteSkillRecord"), /const dir = String\(skill\.baseDir \|\| ""\)\.trim\(\);/);
+  assert.match(extractFn("_deleteSkillRecord"), /backend\.deletePath\(dir\)/);
   assert.match(extractFn("_deleteSkillRecord"), /await _saveSkills/);
   assert.match(extractFn("_deleteSkillRecord"), /_activeSkillIds\.delete\(skill\.id\)/);
   assert.match(SRC, /data-skfp-del/);
