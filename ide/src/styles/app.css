@@ -10996,6 +10996,9 @@ button.agent-plan__fold--toggle:focus-visible { outline: 2px solid #1a73e8; outl
   --feature-bg: #fff;
   /* 侧栏比卡片浅一档。原来两者同为 #fff，所以左边那条导航根本没有"栏"的存在感。 */
   --feature-rail: #f7f7f8;
+  /* 毛玻璃用的半透明底。透明度不能再低了——侧栏上是 13.5px 的正文，背后可能是任意
+     颜色的代码，太透会直接失去可读性。72% 是"看得出后面有东西"和"字还读得清"的交点。 */
+  --feature-glass: rgba(252, 252, 253, .72);
   --feature-card: #fff;
   --feature-control: #fff;
   --feature-border: #e0e0e5;
@@ -11031,7 +11034,9 @@ button.agent-plan__fold--toggle:focus-visible { outline: 2px solid #1a73e8; outl
   align-items: stretch;
   justify-content: stretch;
   padding: 0;
-  background: var(--feature-sheet);
+  /* 本体透明：毛玻璃要有东西可糊，背后得能看见工作区。内容区自己是实色的（见
+     .feature-panel__body 的 --feature-bg），所以只有顶栏和侧栏那两条会透。 */
+  background: transparent;
 }
 :root[data-theme="dark"] .feature-panel {
   --feature-backdrop: rgba(0, 0, 0, 0.40);
@@ -11050,6 +11055,7 @@ button.agent-plan__fold--toggle:focus-visible { outline: 2px solid #1a73e8; outl
   --feature-hover: rgba(255,255,255,.055);
   --feature-sel: rgba(255,255,255,.09);
   --feature-ring: rgba(255,255,255,.20);
+  --feature-glass: rgba(24, 24, 27, .72);
   --feature-ok: #3fb950;
   --feature-warn: #e0a000;
   --feature-err: #e5484d;
@@ -11062,7 +11068,7 @@ button.agent-plan__fold--toggle:focus-visible { outline: 2px solid #1a73e8; outl
   flex-direction: column;
   overflow: hidden;
   color: var(--feature-text);
-  background: var(--feature-sheet);
+  background: transparent;
   border: 0;
   border-radius: 0;
   box-shadow: none;
@@ -11078,7 +11084,9 @@ button.agent-plan__fold--toggle:focus-visible { outline: 2px solid #1a73e8; outl
   justify-content: space-between;
   padding: 0 16px 0 20px;
   border-bottom: 1px solid var(--feature-border);
-  background: var(--feature-header);
+  background: var(--feature-glass);
+  backdrop-filter: blur(22px) saturate(180%);
+  -webkit-backdrop-filter: blur(22px) saturate(180%);
 }
 .feature-panel__title {
   display: inline-flex;
@@ -11131,8 +11139,17 @@ button.agent-plan__fold--toggle:focus-visible { outline: 2px solid #1a73e8; outl
 .feature-panel__tabs {
   padding: 10px 10px 16px;
   border-right: 1px solid var(--feature-border);
-  background: var(--feature-rail);
+  /* 毛玻璃：半透明底 + 背景模糊，工作区在后面糊成一片色块。saturate 是关键——
+     只 blur 不提饱和度的话，背后的内容会褪成一片脏灰。 */
+  background: var(--feature-glass);
+  backdrop-filter: blur(22px) saturate(180%);
+  -webkit-backdrop-filter: blur(22px) saturate(180%);
   overflow-y: auto;
+}
+/* 不支持 backdrop-filter 时退回实色——半透明底叠在没被模糊的工作区上，
+   文字会直接压在代码上，那是不可读，不是"降级"。 */
+@supports not ((backdrop-filter: blur(1px)) or (-webkit-backdrop-filter: blur(1px))) {
+  .feature-panel__tabs, .feature-panel__head { background: var(--feature-rail); }
 }
 /* 侧栏分组小标题。原来这里是一条 .feature-tab__sep 分隔线，两个毛病：它取的
    var(--border) 在整个仓库里根本没定义（见本文件 5253 行那段注释），永远落到
