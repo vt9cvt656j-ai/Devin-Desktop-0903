@@ -993,3 +993,52 @@ test("档位滑块：拖动要真的落到档位上，且拖出卡片边界不�
   // 5) 买不到的档位要弹回并解释，不能静默钉住（那看起来就是滑块坏了）。
   assert.match(bind, /showToast\(/, "锁定档位没有任何提示，用户只会觉得滑块坏了");
 });
+
+test("AI 助手开关：按钮、面板、分隔条、落盘、开机还原，缺一环都不算能用", () => {
+  const shell = readFileSync(join(HERE, "../src/app/Shell.jsx"), "utf8");
+  // 1) 按钮在标题栏里，且在调试图标**左边**——用户指定的位置。
+  const btnAt = shell.indexOf('id="toggleAssistantBtn"');
+  const dbgAt = shell.indexOf('id="debugBtn"');
+  assert.notEqual(btnAt, -1, "标题栏里没有这个按钮");
+  assert.ok(btnAt < dbgAt, "按钮跑到调试图标右边去了");
+  assert.match(shell.slice(btnAt, btnAt + 300), /#i-panel-right-close/, "按钮没用那个面板图标");
+  const html = readFileSync(join(HERE, "../index.html"), "utf8");
+  for (const sym of ["i-panel-right-close", "i-panel-right-open"]) {
+    assert.match(html, new RegExp(`<symbol id="${sym}"`),
+      `${sym} 没定义——切到那个状态时按钮会变成一个空白方块`);
+  }
+  // 图标要和右边那几个一样大。尺寸规则是 `.titlebar__action-group .tbtn--icon .ic`
+  // （20px）；按钮放在 action-group 外面就只能拿到通用的 16px，肉眼一眼看得出小一圈。
+  const groupAt = shell.lastIndexOf("titlebar__action-group", btnAt);
+  assert.ok(groupAt !== -1 && shell.slice(groupAt, btnAt).split("</div>").length === 1,
+    "按钮不在 titlebar__action-group 里，图标会比旁边的小一圈（16px vs 20px）");
+
+  // 两个状态用的是**两个图标**，不是给同一个图标加样式——箭头指向要说明点下去会发生什么。
+  assert.match(SRC, /icon\.setAttribute\("href", hidden \? "#i-panel-right-open" : "#i-panel-right-close"\)/,
+    "切换时没换图标，箭头会一直指着同一个方向");
+
+  // 2) 点击接上了。只画按钮不绑事件 = 点了没反应，而且不报错。
+  assert.match(SRC, /\$\("toggleAssistantBtn"\)\?\.addEventListener\("click", toggleAssistantPanel\)/,
+    "按钮没绑点击，点了什么都不会发生");
+
+  // 3) 面板**和分隔条**都要收。只收面板会在编辑区右边留一条竖着的拖拽条，
+  //    还能被拖动——那条缝看起来就是个渲染 bug。
+  const apply = SRC.slice(SRC.indexOf("function _applyAssistantVisibility"));
+  const applyBody = apply.slice(0, apply.indexOf("\n}\n") + 3);
+  assert.match(applyBody, /\$\("assistant"\)/, "没收面板");
+  // 断言的是**真的把它藏了**，不是"源码里取过这个节点"——只留一行 const sash = $("sashRight")
+  // 也能让按名字找的断言通过，那就成了自己喂饱自己。
+  assert.match(applyBody, /sash\.hidden = hidden/,
+    "没收分隔条，编辑区右边会留一条悬空的、还能拖的竖条");
+
+  // 4) 状态落盘 + 开机还原。少了任何一半，用户收起来的面板在重启后又会弹回来。
+  const toggle = SRC.slice(SRC.indexOf("function toggleAssistantPanel"));
+  assert.match(toggle.slice(0, 400), /localStorage\.setItem\(_ASSISTANT_HIDDEN_KEY/,
+    "开关状态没存，重开 IDE 就丢");
+  assert.match(SRC, /_applyAssistantVisibility\(_assistantHidden\(\)\)/,
+    "启动时没把存下来的状态贴回去，存了也等于没存");
+
+  // 5) 布局变了要让编辑器重算宽度，否则代码区停在旧宽度上，右边空一大块。
+  assert.match(applyBody, /new Event\("resize"\)/,
+    "收放面板后没触发重算，编辑器会停在旧宽度");
+});

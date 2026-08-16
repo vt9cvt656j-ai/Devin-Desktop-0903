@@ -65972,6 +65972,43 @@ $("terminalClose")?.addEventListener("click", closeTerminal);
 $("termNewBtn")?.addEventListener("click", () => createTermTab());
 $("terminalBtn")?.addEventListener("click", toggleTerminal);
 
+// ---- AI 助手面板开关（标题栏，调试图标左边）----
+//
+// 收起的是**整块面板**，不是把宽度拖到 0：宽度归零后分隔条还在、还能被拖回来，
+// 而且面板里的编辑器/滚动容器仍在布局里参与计算。直接 hidden 掉面板和它的分隔条，
+// 编辑区自然铺满。
+//
+// 状态落盘：这是一个会改变整个窗口布局的开关，重开 IDE 还原成"上次那样"才对得上
+// 用户的预期——每次启动都把他收起来的面板弹回来，等于这个开关只在当前这一程有效。
+const _ASSISTANT_HIDDEN_KEY = "michael_assistant_hidden_v1";
+function _assistantHidden() {
+  try { return localStorage.getItem(_ASSISTANT_HIDDEN_KEY) === "1"; } catch { return false; }
+}
+function _applyAssistantVisibility(hidden) {
+  const panel = $("assistant");
+  const sash = $("sashRight");
+  if (panel) panel.hidden = hidden;
+  if (sash) sash.hidden = hidden;
+  const btn = $("toggleAssistantBtn");
+  if (btn) {
+    btn.setAttribute("aria-pressed", hidden ? "false" : "true");
+    btn.title = hidden ? "显示 AI 助手" : "隐藏 AI 助手";
+  }
+  // 换的是 Lucide 那两个图标本身，不是给一个图标加状态样式：箭头指向就是"点下去会
+  // 发生什么"，开着时朝右（推出去＝收起），收起时朝左（拉回来＝展开）。
+  const icon = $("toggleAssistantIcon");
+  if (icon) icon.setAttribute("href", hidden ? "#i-panel-right-open" : "#i-panel-right-close");
+  // 编辑器按容器宽度布局，容器一变必须重算，否则代码区会停在旧宽度上。
+  try { window.dispatchEvent(new Event("resize")); } catch {}
+}
+function toggleAssistantPanel() {
+  const next = !_assistantHidden();
+  try { localStorage.setItem(_ASSISTANT_HIDDEN_KEY, next ? "1" : "0"); } catch {}
+  _applyAssistantVisibility(next);
+}
+$("toggleAssistantBtn")?.addEventListener("click", toggleAssistantPanel);
+_applyAssistantVisibility(_assistantHidden());
+
 // terminal panel resize
 {
   const resizeHandle = $("terminalResize");
