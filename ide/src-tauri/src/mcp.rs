@@ -1059,6 +1059,22 @@ const REMOTE_HANDSHAKE_SECS: u64 = 180;
 ///
 /// 空的、非数字、0 都当没设：0 的字面意思是"立刻超时"，没人是这个意思，而认下来的话
 /// 每一次请求都会当场失败，比不认更难查。
+///
+/// # 生效范围：从终端启动才读得到
+///
+/// 读的是**本进程**的环境。macOS 上从 Dock / Finder 启动的 GUI 进程不继承登录 shell 的
+/// 环境，所以写在 `.zshrc` 里的这两个变量在打包版里是看不见的——`open -a` 或双击启动时
+/// 这个开关等于没有。从终端跑（`cargo tauri dev`、或者直接执行 .app 里的可执行文件）时
+/// 正常生效；想让 GUI 启动也认，得 `launchctl setenv MCP_TIMEOUT 300000` 再重登录。
+///
+/// 没走 `process_util::login_shell_env()` 是有意的：那个函数每次调用都要真起一个登录
+/// shell（预算 4 秒），而且**故意不缓存**——它返回的表里装着用户的真密钥，多留一份就多
+/// 一份泄漏面。为了两个整数让每个 GUI 用户在第一次连 MCP 时多等最多 4 秒，绝大多数人还
+/// 根本没设过这两个变量，这笔账不划算。
+///
+/// 也没有落到 `~/.michael-ide/mcp.json` 里：面板保存走的是"从投影重建整份文档"那条路
+/// （见 `save_user_config_at`），投影里没有的键会被静默删掉——用户在面板里改一次服务，
+/// 手写的超时就没了。真要做成配置项，得连读写投影一起改，不是加一个键的事。
 fn env_timeout_secs(name: &str) -> Option<u64> {
     let millis: u64 = std::env::var(name).ok()?.trim().parse().ok()?;
     (millis > 0).then(|| millis.div_ceil(1000).max(1))
