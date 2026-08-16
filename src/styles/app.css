@@ -10988,7 +10988,6 @@ button.agent-plan__fold--toggle:focus-visible { outline: 2px solid #1a73e8; outl
 
 /* ---- advanced feature panel ---- */
 .feature-panel {
-  --feature-backdrop: rgba(255, 255, 255, 0.55);
   --feature-sheet: #fff;
   --feature-header: #fff;
   /* 内容区用白。卡片和它同色，所以"卡"这件事完全靠描边立住——描边就必须比发丝线
@@ -11047,7 +11046,6 @@ button.agent-plan__fold--toggle:focus-visible { outline: 2px solid #1a73e8; outl
   background: transparent;
 }
 :root[data-theme="dark"] .feature-panel {
-  --feature-backdrop: rgba(0, 0, 0, 0.40);
   --feature-sheet: #18181b;
   --feature-header: #18181b;
   --feature-bg: #101011;
@@ -11081,9 +11079,24 @@ button.agent-plan__fold--toggle:focus-visible { outline: 2px solid #1a73e8; outl
   border: 0;
   border-radius: 0;
   box-shadow: none;
-  /* 全屏之后不再用弹卡片那个缩放动画（整屏缩放会晕），改成一层轻淡入。
-     千万别去改 @keyframes sheet-in —— 它同时被旧设置对话框和命令面板引用。 */
-  animation: feature-fade .14s ease both;
+  /*
+   * 淡入动画**不能挂在这一层**。
+   *
+   * @keyframes feature-fade 动的是 opacity，而 fill-mode: both 让这条 opacity 动画在播完
+   * 之后永久挂在元素上——浏览器据此把 sheet 当成 backdrop root，于是它后代的
+   * backdrop-filter 只能采样这个 root 内部；而这层里 .feature-panel / __sheet 都是
+   * transparent、__main 不画背景，采样到的是一片空白，blur 等于对空气做，屏幕上只剩
+   * 那层半透明白纱压在**没被模糊**的工作区上。
+   *
+   * 挪到下面三个实体层各自身上。元素自己的 opacity 动画不会切断它自己的 backdrop-filter，
+   * 观感上整屏仍然一起淡入。
+   *
+   * ⚠️ 这三层（.feature-panel / __sheet / __main）永远不许出现 opacity<1 / filter / mask /
+   *    clip-path / will-change / isolation / contain —— 任何一个都会当场把顶栏和侧栏的
+   *    毛玻璃变回一块白纱。test/wiring.test.mjs 有反向断言守着。
+   *
+   * 另：别去改 @keyframes sheet-in，它同时被旧设置对话框和命令面板引用。
+   */
 }
 @keyframes feature-fade { from { opacity: 0; } to { opacity: 1; } }
 .feature-panel__head {
@@ -11097,6 +11110,7 @@ button.agent-plan__fold--toggle:focus-visible { outline: 2px solid #1a73e8; outl
   backdrop-filter: blur(28px) saturate(190%);
   -webkit-backdrop-filter: blur(28px) saturate(190%);
   box-shadow: inset 0 1px 0 var(--feature-glass-edge);
+  animation: feature-fade .14s ease both;
 }
 .feature-panel__title {
   display: inline-flex;
@@ -11157,6 +11171,7 @@ button.agent-plan__fold--toggle:focus-visible { outline: 2px solid #1a73e8; outl
   /* 内侧一道亮边 + 一点点内阴影：玻璃是靠边缘的高光被认出来的。 */
   box-shadow: inset 1px 0 0 var(--feature-glass-edge), inset -12px 0 24px -18px rgba(0, 0, 0, .35);
   overflow-y: auto;
+  animation: feature-fade .14s ease both;
 }
 /* 不支持 backdrop-filter 时退回实色——半透明底叠在没被模糊的工作区上，
    文字会直接压在代码上，那是不可读，不是"降级"。 */
@@ -11235,6 +11250,7 @@ button.agent-plan__fold--toggle:focus-visible { outline: 2px solid #1a73e8; outl
   /* 内边距跟着窗口走：写死 40px 时，窗口一窄内容就贴边，⌘+ 放大后又显得局促。 */
   padding: clamp(20px, 2.6vh, 34px) clamp(16px, 3vw, 44px) 56px;
   background: var(--feature-bg);
+  animation: feature-fade .14s ease both;
 }
 /* 内容栏封顶。面板本身可以宽到 1080px，但一行设置横跨那么宽之后，左边的标题和右边的
    控件之间会拉开一大片空白，眼睛得来回扫。市场页（.mcpfp）是两列网格，故意不封。 */

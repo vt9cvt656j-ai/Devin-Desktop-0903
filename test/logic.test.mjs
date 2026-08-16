@@ -2210,7 +2210,9 @@ test("advanced tools panel exposes Settings Growth Adaptive and Shortcuts", () =
     "扩展市场不该有渲染器");
   // 面板必须自带一整套令牌（深浅各一份）。它在自己的子树里把全局令牌重映射了一遍，
   // 少一份就意味着某个主题下面板内所有内容都跟着外面的配色走，观感立刻散架。
-  assert.match(APP_CSS, /\.feature-panel\s*\{[\s\S]{0,400}--feature-backdrop:[\s\S]{0,400}--feature-rail:[\s\S]{0,400}--feature-sel:/,
+  // 锚点从 --feature-backdrop 换成 --feature-sheet：前者全仓一处引用都没有，是死令牌，
+  // 已随毛玻璃那轮一起删掉。
+  assert.match(APP_CSS, /\.feature-panel\s*\{[\s\S]{0,400}--feature-sheet:[\s\S]{0,500}--feature-rail:[\s\S]{0,500}--feature-sel:/,
     "浅色令牌不全——侧栏底色和选中色都得有自己的令牌");
   assert.match(APP_CSS, /:root\[data-theme="dark"\] \.feature-panel\s*\{[\s\S]{0,260}--feature-sheet:\s*#18181b;[\s\S]{0,700}--feature-sel:/,
     "深色令牌不全");
