@@ -44557,6 +44557,19 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
             + `\n这不是需要用户拍板的方向问题，直接继续做，别用「要不要我继续」停下来。`);
           continue;
         }
+        // 正文提问和 ask_user 卡片是同一件事的两种形态，额度要合起来算。
+        //
+        // 否则模型会在两条路之间来回横跳：卡片被拦下之后改用正文问，正文被拦下之后再调
+        // 一次卡片——用户看到的还是"一直在问"，只是形式变了。上面那条只管"计划还有剩步"
+        // 这一种情形，管不到没有计划的任务。
+        run._askUserCount = (run._askUserCount || 0) + 1;
+        if (run._askUserCount >= 3 && _live()) {
+          _pushNudge("askBudget", `这是本次任务第 ${run._askUserCount} 次向用户提问（卡片和正文提问合并计数）。`
+            + `\n别再问了：按最合理的方案直接做下去，把假设写进最终回答（"我按 X 处理了，因为 Y；要是你想要 Z，说一声我改"）。`
+            + `\n能自己查清的先查（read_file / search / probe_env 都在手边）。`
+            + `\n只有在"不做假设就没法继续、或者做错了整个成果作废"时才停——那种情况把卡在哪、需要什么写进最终回答，用一句话说清，而不是再问一次。`);
+          continue;
+        }
         // Genuinely waiting now — but if steps are still open, say so in the accounting rather
         // than letting "awaiting_user" read as a clean finish.
         if (_pendingPlan.length) run._incompleteReason = run._incompleteReason || `plan_steps_pending:${_pendingPlan.length}`;
@@ -48650,6 +48663,9 @@ async function _executeToolStepInner(step, call, root, run) {
   // Per-run context (so parallel tab runs don't cross state): the run's mode was
   // captured at start (a later tab/mode switch can't block this run), and its
   // private revert-checkpoint map keeps each run's "undo" independent.
+  // 连续提问的判据：两次 ask_user 之间有没有别的工具。这里在每个工具执行入口清标记，
+  // askuser 分支自己再置回 true——不清的话"连着问"就永远判不出来。
+  if (run && call && call.type !== "askuser") run._lastToolWasAsk = false;
   const _mode = (run && run.mode) || _currentAiMode;
   const _cp = (run && run.checkpoint) || _runCheckpoint;
   const readOnlyMode = _mode === "explorer" || _mode === "reviewer" || _mode === "plan";
@@ -50334,6 +50350,44 @@ async function _executeToolStepInner(step, call, root, run) {
 
     } else if (call.type === "askuser") {
       const q = String(call.question || "").trim() || "需要你确认一下方向";
+      // ── 反复提问的下限 ──────────────────────────────────────────────────
+      //
+      // 用户实测反馈：任务没做完的时候它「一直不停问问问问」。
+      //
+      // 根因是 ask_user 在这之前**完全没有次数限制**。它是个普通工具：弹卡片、阻塞最多
+      // 120 秒、把答案作为工具结果返回，然后这一轮继续——所以模型可以在一轮里无限次调它。
+      // 四次就是用户对着卡片干等八分钟，而任务一步没往前走。
+      //
+      // 提示词其实写得很好（工具描述明写"不要问任何你能合理推断的事，用户讨厌被无谓地
+      // 打断"，网关那几份也都设了高门槛），但**只有劝导没有下限**。这个仓库有个明显的
+      // 历史倾向：好几处硬拦截被改成了"只给建议不拦截"，注释里都说硬拦造成过更糟的问题。
+      // 对首次提问那是对的——空工作区里问清方向本来就是正确首步。但对**重复**提问，
+      // 只给建议等于没有底线：模型一不确定就问，没有任何东西阻止它再问一次。
+      //
+      // 所以这里给的是**分级**下限，不是禁令：
+      //   第 1 次 —— 原样放行，一个字都不加。
+      //   第 2 次 —— 照常问，但结果里明说"你已经问过一次了，剩下的分歧自己定"。
+      //   第 3 次起 —— **不再弹卡片**。这不是惩罚，是替用户挡住那 120 秒的干等：
+      //                告诉它按最合理的方案继续，并把假设写进回答。
+      //   连着问 —— 两次提问之间一个别的工具都没调，那不是在收集信息，是在原地停摆。
+      //                这种情况直接按第 3 级处理，不等它问满三次。
+      const _auN = (run._askUserCount = (run._askUserCount || 0) + 1);
+      const _auBackToBack = run._lastToolWasAsk === true;
+      run._lastToolWasAsk = true;
+      if (_auN >= 3 || (_auN >= 2 && _auBackToBack)) {
+        res.className = "atc-result atc-result--blocked";
+        res.textContent = _auBackToBack ? "连续提问已拦下" : `第 ${_auN} 次提问已拦下`;
+        return { type: "askuser", path: "", content:
+          `[BLOCKED] ${_auBackToBack ? "你连着两次提问，中间一个工具都没调——那不是在收集信息，是原地停摆。" : `这是本次任务第 ${_auN} 次提问。`}\n`
+          + `没有再弹卡片，因为每次提问都让用户对着界面干等最多两分钟，而任务一步没往前走。\n\n`
+          + `你要问的是：「${q.slice(0, 120)}」\n\n`
+          + `下一步：**按最合理的方案直接做下去**，把你的假设写进最终回答（"我按 X 处理了，因为 Y；如果你要的是 Z，告诉我我改"）。\n`
+          + `能自己查清的先查（read_file / search / probe_env / git_log 都在手边），别拿它当问题问。\n`
+          + `如果这件事真的**不做出假设就没法继续、或者做错了整个成果作废**，那就停下来把它写进最终回答里说清楚——用一句话说明卡在哪、需要什么，而不是再弹一张卡片。` };
+      }
+      const _auRepeatNote = _auN === 2
+        ? `\n\n〔这是本次任务第 2 次提问〕你已经问过一次并拿到了答案。剩下的分歧自己定，把假设写进回答；再问一次就不会弹卡片了。`
+        : "";
       const opts = (Array.isArray(call.options) ? call.options : []).map((o) => String(o || "").trim()).filter(Boolean).slice(0, 5);
       const _auTimeout = 120;
       const _auRecommended = call.recommended;
@@ -50342,7 +50396,7 @@ async function _executeToolStepInner(step, call, root, run) {
       res.className = "atc-result"; res.textContent = "等你选择…";
       step.classList.add("is-open");
       _chatFollow(run && run.session);
-      if (typeof vp === "undefined" || !vp) return { type: "askuser", path: "", content: "（无法渲染交互卡片，按你认为最合理的方案继续）" };
+      if (typeof vp === "undefined" || !vp) return { type: "askuser", path: "", content: "（无法渲染交互卡片，按你认为最合理的方案继续）" + _auRepeatNote };
       return await new Promise((resolve) => {
         let done = false;
         let _auTimer = null, _auCountdown = _auTimeout;
@@ -50355,7 +50409,7 @@ async function _executeToolStepInner(step, call, root, run) {
           _releaseInteraction();
           vp.innerHTML = `<div class="au-done">${_escHtml(label || answer)}</div>`;
           res.className = "atc-result atc-result--ok"; res.textContent = "已回复";
-          resolve({ type: "askuser", path: "", content: answer });
+          resolve({ type: "askuser", path: "", content: answer + _auRepeatNote });
         };
         _releaseInteraction = _registerRunInteraction(run, () => {
           finish("[已取消] 当前等待已因任务停止或被新的请求替换，不要继续此步骤。", "已取消");
