@@ -15015,12 +15015,14 @@ body.tree-selecting, body.tree-selecting * { user-select: none !important; -webk
   border-radius: var(--feature-radius-card, 12px);
   overflow: hidden;
 }
-/* 五列固定：名字 / 进度条 / 迁移徽标 / 百分比 / 加减。
-   原来右侧三件东西挤在一个 auto 列里，宽度随内容变——"可迁移 · 14" 比 "8 个项目" 宽，
-   于是每一行的百分比和 ± 都错开一点点，竖着看是锯齿。 */
+/* 三列：名字 / 进度条 / 右侧一组。
+   右侧那组**内部**再固定成 84 / 78 / auto 三格——徽标和百分比宽度随内容变的话
+   （"可迁移 · 14" 比 "8 个项目" 宽），每一行的 ± 都会错开一点点，竖着看是锯齿。
+   上一版是用 display:contents 把右侧四个元素摊进外层网格，但外层只有五列而元素有
+   六个（名字/条/徽标/百分比/减/加），第六个只能掉到下一行——± 因此断成了两行。 */
 .growth-skill {
   display: grid;
-  grid-template-columns: minmax(170px, 1fr) minmax(90px, 1.4fr) 84px 78px auto;
+  grid-template-columns: minmax(170px, 1fr) minmax(90px, 1.4fr) auto;
   gap: 12px;
   align-items: center;
   margin: 0;
@@ -15051,7 +15053,12 @@ body.tree-selecting, body.tree-selecting * { user-select: none !important; -webk
   border-radius: 3px;
   background: var(--feature-blue, var(--accent));
 }
-.growth-skill__right { display: contents; }
+.growth-skill__right {
+  display: grid;
+  grid-template-columns: 84px 78px auto auto;
+  gap: 8px;
+  align-items: center;
+}
 .growth-skill__pct {
   text-align: right;
   font-size: 12px;
@@ -15075,7 +15082,6 @@ body.tree-selecting, body.tree-selecting * { user-select: none !important; -webk
   font-weight: 600;
 }
 /* 纠正按钮：和数字步进器同一副长相。 */
-.growth-nudge { margin-left: 6px; }
 .growth-nudge {
   width: 26px;
   height: 26px;
@@ -15133,7 +15139,7 @@ body.tree-selecting, body.tree-selecting * { user-select: none !important; -webk
 .growth-stat span { font-size: 11.5px; color: var(--feature-dim, var(--text-dim)); }
 
 .growth-reset, .growth-project__btn {
-  margin-top: 14px;
+  margin-top: 12px;
   height: 28px;
   padding: 0 12px;
   font-size: 12px;
@@ -15143,6 +15149,7 @@ body.tree-selecting, body.tree-selecting * { user-select: none !important; -webk
   border-radius: var(--feature-radius-control, 8px);
   cursor: pointer;
 }
+.growth-reset { margin-top: 20px; }
 .growth-reset:hover { color: var(--feature-err, #c62828); border-color: var(--feature-err, #c62828); }
 .growth-project__btn:hover { background: var(--feature-hover); }
 
@@ -15166,7 +15173,7 @@ body.tree-selecting, body.tree-selecting * { user-select: none !important; -webk
   border-radius: var(--feature-radius-card, 12px);
   overflow: hidden;
 }
-.growth-card.growth-project { padding: 14px; }
+.growth-card.growth-project { padding: 14px 16px 16px; }
 .growth-row {
   display: flex;
   align-items: center;

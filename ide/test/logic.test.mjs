@@ -24425,6 +24425,11 @@ test("成长页下半部分和上半部分是同一套卡片语言", () => {
   assert.match(APP_CSS, /\.growth-profile__line\s*\{[^}]*text-align:\s*center/,
     "概览下面那句总结没有居中");
   // 能力档位的右侧几件东西各占固定列，否则每行的百分比和 ± 会错开一点点，竖着看是锯齿。
-  assert.match(APP_CSS, /\.growth-skill\s*\{[^}]*grid-template-columns:[^;]*84px 78px auto/,
+  // 右侧那一组内部要固定列宽，否则徽标和百分比宽度随内容变，每行的 ± 会错开。
+  assert.match(APP_CSS, /\.growth-skill__right\s*\{[^}]*grid-template-columns:\s*84px 78px auto auto/,
     "能力档位右侧没有固定列宽，各行会对不齐");
+  // 右侧这一组**不能**用 display:contents 摊进外层网格：外层三列而元素有四个，
+  // 多出来的那个会掉到下一行，± 就断成两行了。
+  assert.doesNotMatch(APP_CSS, /\.growth-skill__right\s*\{[^}]*display:\s*contents/,
+    "右侧组被摊进外层网格了，± 会换行");
 });
