@@ -23055,6 +23055,13 @@ test("两个 run 的同号作业不共用一个黑板键", () => {
   assert.equal(token(a), token(a), "同一个 run 每次要拿到同一个前缀，否则前后写的键对不上");
 });
 
+test("主作业键也要带 run 前缀——上一轮串台修复漏了这一半", () => {
+  // `main_${_smLedgerLen}` 用的是账本长度，两个标签页在相同步数时会撞出同一个键，
+  // 而 createJob 直接覆盖：A 的主作业记录被 B 顶掉，leadJobId 也指向别人的作业。
+  assert.match(SRC, /const _mainJobId = `main_\$\{_smRunToken\(run\)\}_\$\{_smLedgerLen\}`;/);
+  assert.doesNotMatch(SRC, /const _mainJobId = `main_\$\{_smLedgerLen\}`;/, "又漏掉前缀了");
+});
+
 test("派发、状态回写、同伴广播、主体广播——四处用的是同一个键", () => {
   // 四处只要有一处漏了前缀，就是"写进去的和读出来的不是同一条记录"：
   // 状态永远停在 running，或者别人的调查结论被当成同事的发现读进上下文。
