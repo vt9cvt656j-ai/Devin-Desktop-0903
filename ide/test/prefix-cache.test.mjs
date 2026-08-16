@@ -1014,7 +1014,7 @@ test("a run does not end while its own plan has open steps", () => {
   const quiet = loop.slice(loop.indexOf("if (!turn.toolCalls.length)"),
                            loop.indexOf("// Render every tool step up front"));
   assert.match(quiet, /run\._planSteps[\s\S]{0,300}status === "pending" \|\| step\?\.status === "in_progress"/);
-  assert.match(quiet, /\(run\._planFinishNudges \|\| 0\) < 3/, "bounded, so an unfinishable plan converges");
+  assert.match(quiet, /\(run\._planFinishNudges \|\| 0\) < 2/, "bounded, so an unfinishable plan converges");
   assert.match(quiet, /run\._incompleteReason = run\._incompleteReason \|\| `plan_steps_pending:/);
 
   // And the other exit: "第三步做完了，要不要我继续？" trips the wait-for-user boundary, which
