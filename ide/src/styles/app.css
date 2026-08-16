@@ -14619,3 +14619,22 @@ body.tree-selecting, body.tree-selecting * { user-select: none !important; -webk
    浅色的 .agent-tool-step--mcp .atc-type-icon 和深色的 [data-theme="dark"] 版本
    ——头像自己就是底色，底下再垫一层会从 .mcpfp-icon 的半透明边框里透出来。 */
 .agent-tool-step--mcp .atc-type-icon.atc-type-icon--avatar { background: none; }
+
+/* 模型卡片右上角的「强力版」开关（只有 Claude 一族会渲染出来）。
+   关闭时压成低对比的描边按钮，打开时点亮 —— 它切的是线路，属于会改变这一轮
+   请求去向的状态，得让人一眼看出现在是开是关。 */
+.model-info-card .mic-head { position: relative; }
+.mic-power {
+  position: absolute; top: -2px; right: 0;
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 24px; height: 24px; padding: 0;
+  border: 1px solid var(--border, #333); border-radius: 6px;
+  background: transparent; color: var(--muted-fg, #8a8a8a);
+  cursor: pointer; transition: color .12s, border-color .12s, background .12s;
+}
+.mic-power:hover { color: var(--fg, #e6e6e6); border-color: var(--fg-dim, #666); }
+.mic-power.is-on {
+  color: #f5a524; border-color: rgba(245, 165, 36, .55);
+  background: rgba(245, 165, 36, .12);
+}
+.mic-power.is-on svg { fill: currentColor; }

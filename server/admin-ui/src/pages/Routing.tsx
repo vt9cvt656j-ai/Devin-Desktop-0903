@@ -104,6 +104,7 @@ type Conn = {
   model_names?: unknown;
   model_prices?: unknown;
   model_caps?: unknown;
+  power_route?: boolean;
   model_billing?: unknown;
   protocol?: string;
   /** 显示分组：把这条线路的模型挂在另一条线路的名字下。只影响 IDE 选择器上的标题。 */
@@ -941,6 +942,8 @@ function ConnectionDialog({
   const [outPrice, setOutPrice] = useState(String(conn?.output_price ?? 0));
   const [cacheRead, setCacheRead] = useState(String(conn?.cache_read_price ?? 0));
   const [cacheCreate, setCacheCreate] = useState(String(conn?.cache_create_price ?? 0));
+  // 「Claude 强力版」：勾上之后，IDE 里打开强力版开关的那一轮请求只会落到这条线路上。
+  const [powerRoute, setPowerRoute] = useState(Boolean(conn?.power_route));
   const [perCall, setPerCall] = useState(String(conn ? channelFeeUsd(conn) : 0.2));
   const [rows, setRows] = useState<Row[]>(() => initialRows(conn));
   const [hint, setHint] = useState("");
@@ -1030,6 +1033,7 @@ function ConnectionDialog({
       description: description.trim(),
       billing_mode: mode,
       rate: rateVal,
+      power_route: powerRoute,
       input_price: nz(inPrice),
       output_price: nz(outPrice),
       cache_read_price: nz(cacheRead),
@@ -1165,6 +1169,22 @@ function ConnectionDialog({
             />
           </div>
         </div>
+
+        <label className="flex items-start gap-3 rounded-lg border border-border p-4">
+          <Checkbox
+            className="mt-1"
+            checked={powerRoute}
+            onChange={(e) => setPowerRoute(e.target.checked)}
+          />
+          <span className="text-sm">
+            <span className="font-medium">Claude 强力版线路</span>
+            <span className="mt-0.5 block text-muted-foreground">
+              勾上之后，IDE 里 Claude 模型卡片右上角的「强力版」开关打开时，那一轮请求只会落到
+              勾了这个标记的线路上。没有勾任何线路时，那个开关会明确报错而不是悄悄退回普通线路——
+              用户点了强力版就该走强力线路，退回去等于把他的选择改掉了。
+            </span>
+          </span>
+        </label>
 
         {editing && (
           <label className="flex items-start gap-3 rounded-lg border border-border p-4">

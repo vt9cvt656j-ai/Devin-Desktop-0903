@@ -781,6 +781,9 @@ pub struct Model {
     /// 从未被验证过的推断，所以做成每条线路可配，而不是继续写死在 match 里。
     #[sqlx(default)]
     pub effort_passthrough: bool,
+    /// 这条线路是不是「Claude 强力版」承载线路。IDE 打开强力版开关的那一轮，
+    /// 路由只在勾了这个标记的线路里挑。
+    pub power_route: bool,
 }
 
 /// 后台按模型手填的能力兜底（contexts 升序去重、最多 5 档；max_output）。
@@ -1503,6 +1506,7 @@ pub async fn admin_list(
                 "model_names": m.model_names,
                 "model_prices": m.model_prices,
                 "model_caps": m.model_caps,
+                "power_route": m.power_route,
                 "model_billing": m.model_billing,
                 "protocol": m.protocol,
                 "effort_passthrough": m.effort_passthrough,
@@ -2045,6 +2049,7 @@ pub struct UpdateReq {
     pub model_prices: Option<serde_json::Value>,
     /// { raw_model_id → {"contexts":[...],"max_output":n} }：目录没收录时的手填兜底。
     pub model_caps: Option<serde_json::Value>,
+    pub power_route: Option<bool>,
     pub model_billing: Option<serde_json::Value>,
     /// "anthropic" | "openai" — upstream wire protocol for this connection.
     pub protocol: Option<String>,
@@ -2171,7 +2176,7 @@ pub async fn admin_update(
     };
     // 没传就保持原值——和上面 protocol 一样的语义，别让一次只改价格的保存把开关关掉。
     let effort_passthrough = req.effort_passthrough.unwrap_or(m.effort_passthrough);
-    sqlx::query("UPDATE models SET label=$1, provider=$2, base_url=$3, api_key=$4, rate=$5, active=$6, sort=$7, enabled_models=$8, input_price=$9, output_price=$10, description=$11, billing_mode=$12, per_call_cents=$13, model_names=$14, cache_read_price=$15, cache_create_price=$16, model_prices=$17, protocol=$18, model_billing=$20, per_call_micro_usd=$21, effort_passthrough=$22, model_caps=$23 WHERE id=$19")
+    sqlx::query("UPDATE models SET label=$1, provider=$2, base_url=$3, api_key=$4, rate=$5, active=$6, sort=$7, enabled_models=$8, input_price=$9, output_price=$10, description=$11, billing_mode=$12, per_call_cents=$13, model_names=$14, cache_read_price=$15, cache_create_price=$16, model_prices=$17, protocol=$18, model_billing=$20, per_call_micro_usd=$21, effort_passthrough=$22, model_caps=$23, power_route=$24 WHERE id=$19")
         .bind(&label)
         .bind(&provider)
         .bind(&base_url)
@@ -2195,6 +2200,7 @@ pub async fn admin_update(
         .bind(per_call_micro_usd)
         .bind(effort_passthrough)
         .bind(req.model_caps.clone().unwrap_or_else(|| m.model_caps.clone()))
+        .bind(req.power_route.unwrap_or(m.power_route))
         .execute(&state.db)
         .await?;
     Ok(Json(json!({ "ok": true })))
@@ -5677,10 +5683,29 @@ pub async fn chat_completions(
     )
     .fetch_all(&state.db)
     .await?;
-    let candidates: Vec<Model> = conns
+    // 「Claude 强力版」：IDE 打开那个开关时带 x-ide-power-route，这一轮只在运维勾了
+    // power_route 的线路里挑。
+    //
+    // 是**筛选**不是排序：用户点了强力版就该走强力线路，退回普通线路等于把他的选择
+    // 悄悄改掉——这正是本轮刚从思考档位里拿掉的那种行为。没有可用的强力线路时宁可
+    // 明确报错，让人知道后台还没配。
+    let want_power = headers
+        .get("x-ide-power-route")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
+    let mut candidates: Vec<Model> = conns
         .into_iter()
         .filter(|m| allowed_ids(m).contains(&model_id))
         .collect();
+    if want_power {
+        let power: Vec<Model> = candidates.iter().filter(|m| m.power_route).cloned().collect();
+        if power.is_empty() {
+            return Err(AppError::bad(format!(
+                "{model_id} 没有可用的强力版线路——请在后台把某条线路勾上「Claude 强力版」"
+            )));
+        }
+        candidates = power;
+    }
     let route_count = candidates.len();
     let primary_conn = candidates
         .first()
@@ -12328,6 +12353,64 @@ mod relay_truncation_tests {
             missed.is_empty(),
             "这些截断错误不会触发中转丢块自愈，线路不会被钳位：\n{}",
             missed.join("\n")
+        );
+    }
+}
+
+#[cfg(test)]
+mod power_route_tests {
+    /// 只看派单函数那一段源码，别让本模块自己的字面量把断言喂饱。
+    fn dispatch_src() -> String {
+        let s = include_str!("models.rs");
+        s[..s.find("mod power_route_tests").unwrap_or(s.len())].to_string()
+    }
+
+    #[test]
+    fn 强力版是筛选而不是排序() {
+        // 用户点了强力版，就该走强力线路。没有可用的就明确报错，不能悄悄退回普通
+        // 线路——那等于把他的选择改掉。这一轮刚从思考档位里拿掉过同样的行为
+        //（max 被静默降成 high），不能在这儿又长回来。
+        let src = dispatch_src();
+        let at = src
+            .find("let want_power")
+            .expect("强力版筛选整段没了，后台那个开关就没人读了");
+        let block = &src[at..(at + 900).min(src.len())];
+        assert!(
+            block.contains("return Err("),
+            "没有强力线路时没报错——请求会静默落到普通线路上，用户看不出自己被降级了"
+        );
+        assert!(
+            block.contains("candidates = power"),
+            "筛出来的强力线路没被用上，筛选等于白做"
+        );
+        assert!(
+            !block.contains("sort_by") && !block.contains("unwrap_or(candidates)"),
+            "强力版被写成了排序/兜底，那是静默降级"
+        );
+    }
+
+    #[test]
+    fn 开关必须能从后台存进来也读得出去() {
+        // 断的是链路：后台勾选 → 落库 → 派单时读到。任何一环缺失，后台那个复选框
+        // 就是个装饰品。
+        let src = dispatch_src();
+        assert!(src.contains("pub power_route: bool"), "Model 上没有这个字段，派单读不到");
+        assert!(
+            src.contains("power_route: Option<bool>"),
+            "UpdateReq 上没有这个字段，后台勾了也存不进去"
+        );
+        // 要在**派单那一段**里读到，不是"整个文件里出现过这个名字"——后台的
+        // 增删改查里到处都是 power_route，照名字找会被它们喂饱。
+        let at = src.find("let want_power").expect("强力版筛选整段没了");
+        let block = &src[at..(at + 900).min(src.len())];
+        assert!(
+            block.contains("m.power_route"),
+            "派单时压根没读这个字段，后台勾选不影响任何行为"
+        );
+        let mig = include_str!("../migrations/20260841_power_route.sql");
+        assert!(
+            mig.contains("power_route"),
+            "迁移没建这一列，线上启动就会因为查不到列而炸"
         );
     }
 }

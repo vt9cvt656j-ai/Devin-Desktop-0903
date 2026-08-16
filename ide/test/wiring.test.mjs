@@ -859,3 +859,55 @@ test("官网的工具画廊必须还能从 main.js 里取出真目录", () => {
   assert.equal(after, before,
     "public/tools.json 和 main.js 的真目录不同步了——跑 website/ 的 `node scripts/extract-tools.mjs` 并提交结果");
 });
+
+test("强力版开关必须真的改变请求去向，而不只是一个会亮的图标", () => {
+  // 这个开关的全部意义是把这一轮派到后台勾了「Claude 强力版」的线路上。
+  // 只要下面任何一环断了，UI 照样亮、请求照走普通线路——正是这个文件专门盯的
+  // 那种"存在但没人够得着"的缺陷。
+  // 1) 按钮渲染进卡片头部（不是定义了一个没人调的函数）
+  // 断言的是**调用点在卡片模板里**，不是"源码里出现过这个名字"——函数定义本身
+  // 就含有这个名字，照着名字找等于自己喂饱自己。
+  const tpl = SRC.slice(SRC.indexOf("card.innerHTML ="));
+  assert.match(tpl.slice(0, 700), /_modelPowerToggleHtml\(/,
+    "卡片模板没调强力版按钮，那个函数成了死代码");
+
+  // 2) 点击真的落盘，而不是只切了个 class
+  const clickBlock = SRC.slice(SRC.indexOf('.closest?.(".mic-power")'));
+  assert.match(clickBlock.slice(0, 600), /_setPowerRoute\(/,
+    "点了按钮没写进持久化状态，刷新/重开卡片就丢");
+
+  // 3) 意图盖到了**所有**去后端的入口。轮次组装点有好几处，漏一处就会出现
+  //    "开关亮着但请求走普通线路"。
+  for (const cmd of ["ai_chat", "ai_chat_with_tools", "ai_complete"]) {
+    const at = SRC.indexOf(`core.invoke("${cmd}",`);
+    assert.notEqual(at, -1, `${cmd} 入口不见了`);
+    assert.match(SRC.slice(at, at + 200), /_stampPowerRoute\(config\)/,
+      `${cmd} 没盖强力版标记，从这个入口发的轮次会静默走普通线路`);
+  }
+
+  // 4) 盖上的标记最终变成请求头——网页端在 JS 里发，桌面端在 Rust 里发
+  assert.match(SRC, /x-ide-power-route/,
+    "网页端没把标记转成请求头，网关看不到");
+  const rust = readFileSync(join(HERE, "../src-tauri/src/ai.rs"), "utf8");
+  assert.match(rust, /ide_power_route/,
+    "AiConfig 没有这个字段，serde 会把 JS 传的值直接丢掉（michaelCompression 就这么丢过一次）");
+  assert.match(rust, /header\("x-ide-power-route"/,
+    "桌面端没发这个头，桌面版的开关等于没接");
+
+  // 5) 只有 Claude 一族有。用户明确要求过。
+  // 这里**跑**这个判定而不是读它的源码：上一版按 /claude/i 去匹配源文本，结果被
+  // 函数上面那段写着 Claude 的注释喂饱了——把限定改成 `return true` 都照样绿。
+  const gate = SRC.slice(SRC.indexOf("function _modelSupportsPowerRoute"));
+  const supports = new Function(`${gate.slice(0, gate.indexOf("\n}") + 2)}
+    return _modelSupportsPowerRoute;`)();
+  for (const yes of ["claude-opus-4-6", "claude-sonnet-4-5", "anthropic/claude-haiku-4-5"]) {
+    assert.equal(supports(yes), true, `${yes} 是 Claude，应该有强力版按钮`);
+  }
+  for (const no of ["gpt-5.2", "gemini-3-pro", "glm-5.3", "deepseek-v4", "kimi-k3", ""]) {
+    assert.equal(supports(no), false,
+      `${no} 不是 Claude，却冒出了强力版按钮——用户明确要求过只有 Claude 有`);
+  }
+  const render = SRC.slice(SRC.indexOf("function _modelPowerToggleHtml"));
+  assert.match(render.slice(0, 900), /if \(!_modelSupportsPowerRoute\(id\)\) return ""/,
+    "渲染时没挡住非 Claude 模型");
+});
