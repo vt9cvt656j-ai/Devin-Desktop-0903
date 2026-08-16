@@ -1301,3 +1301,39 @@ test("Skills：外部技能可删，但删之前必须把磁盘路径摆出来",
   assert.doesNotMatch(SRC, /只读，可开关但不能在这里删除/,
     "分区标题还写着不能删除，和实际行为对不上");
 });
+
+test("侧栏毛玻璃要真能透出后面，且不支持时必须退回实色", () => {
+  const css = readFileSync(join(HERE, "../src/styles/app.css"), "utf8");
+  // 玻璃要有效果，背后得有东西可糊。面板本体和 sheet 必须是透明的——它们只要有实色，
+  // 侧栏糊的就是自己那层白底，等于白做。
+  const panelAt = css.indexOf("\n.feature-panel {");
+  assert.match(css.slice(panelAt, css.indexOf("}", panelAt)), /background:\s*transparent/,
+    "面板本体不透明，侧栏的模糊糊的是它自己的底色，看不出任何效果");
+  const sheetAt = css.indexOf("\n.feature-panel__sheet {");
+  assert.match(css.slice(sheetAt, css.indexOf("}", sheetAt)), /background:\s*transparent/,
+    "sheet 不透明，同上");
+  // 内容区必须**仍然是实色**：正文压在模糊的代码上没法读。
+  const bodyAt = css.indexOf("\n.feature-panel__body {");
+  assert.match(css.slice(bodyAt, css.indexOf("}", bodyAt)), /background:\s*var\(--feature-bg\)/,
+    "内容区跟着透明了，正文会压在工作区上");
+
+  // 用行首锚定：@media (max-width:720px) 里也有一条同名规则（缩成图标栏那个），
+  // 它缩进两格，indexOf 会先撞上它。
+  const railAt = css.indexOf("\n.feature-panel__tabs {");
+  const rail = css.slice(railAt, css.indexOf("}", railAt));
+  assert.match(rail, /backdrop-filter:\s*blur/, "侧栏没有背景模糊");
+  assert.match(rail, /-webkit-backdrop-filter/, "缺 -webkit- 前缀，WKWebView 上不生效");
+  // 匹配**属性值本身**，不是"规则体里出现过 saturate 这个词"——解释它为什么重要的
+  // 注释里也写着这个词，按词去找会被自己的注释喂饱。
+  assert.match(rail, /backdrop-filter:\s*blur\([^)]*\)\s+saturate\(/,
+    "只 blur 不提饱和度，背后内容会褪成一片脏灰");
+  assert.match(rail, /background:\s*var\(--feature-glass\)/, "侧栏没有半透明底");
+  // 深浅两套各自的玻璃色。
+  for (const [sel, who] of [[".feature-panel {", "浅色"], [':root[data-theme="dark"] .feature-panel {', "深色"]]) {
+    const at = css.indexOf("\n" + sel);
+    assert.match(css.slice(at, css.indexOf("}", at)), /--feature-glass:/, `${who}主题没有玻璃色`);
+  }
+  // 不支持 backdrop-filter 时必须退回实色，否则文字直接压在没被模糊的代码上。
+  assert.match(css, /@supports not \(\(backdrop-filter[\s\S]{0,220}background:\s*var\(--feature-rail\)/,
+    "没有降级路径，不支持模糊的环境里侧栏文字会压在工作区上");
+});
