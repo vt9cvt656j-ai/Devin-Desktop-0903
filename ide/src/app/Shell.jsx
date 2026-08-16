@@ -29,6 +29,11 @@ export function Shell() {
           <div className="titlebar__actions">
             <button id="openFolderBtn" hidden></button>
             <button id="saveBtn" hidden></button>
+            <div className="titlebar__action-group titlebar__action-group--panel" aria-label="面板">
+              <button className="tbtn tbtn--icon" id="toggleAssistantBtn" type="button" title="隐藏 AI 助手" aria-pressed="true">
+                <svg className="ic"><use href="#i-panel-right-close" id="toggleAssistantIcon" /></svg>
+              </button>
+            </div>
             <div className="titlebar__action-group titlebar__action-group--run" data-i18n-aria-label="debug.runGroup" aria-label="运行与调试">
               <button className="tbtn tbtn--icon" id="debugBtn" data-i18n-title="debug.title" data-i18n-aria-label="debug.aria" title="调试 / Debugger (断点、单步、变量)" aria-label="调试">
                 <svg className="ic"><use href="#i-bug" /></svg>
