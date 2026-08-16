@@ -24406,3 +24406,25 @@ test("上游的 none 映射成本地的 off", () => {
   assert.equal(liveLevels()("glm-5"), null, "空档位要交还内置表");
   assert.equal(liveLevels()("私有命名-x"), null);
 });
+
+test("成长页下半部分和上半部分是同一套卡片语言", () => {
+  // 原来项目理解、教学偏好、行为信号三块是裸挂在底色上的控件和按钮——同一页里
+  // "有卡"和"没卡"两种形态混着出现，翻到下半页会觉得换了个软件。
+  for (const [needle, who] of [
+    ["box.className = \"growth-project growth-card\"", "项目理解"],
+    ["ctlCard.className = \"growth-card\"", "教学偏好"],
+    ["statCard.className = \"growth-card\"", "行为信号"],
+  ]) {
+    assert.ok(GROWTH_SRC.includes(needle), `${who}那一块没有装进卡里`);
+  }
+  // 这一页的下拉必须和其它页共用同一个自绘组件，而不是自己建原生 select。
+  // growth.js 直接 import main.js 会成环，所以构造函数是通过 ctx 递进来的。
+  assert.match(SRC, /buildSelect: buildSelectControl/, "宿主没把自绘下拉递给成长页");
+  assert.match(GROWTH_SRC, /ctx\.buildSelect\(EXPLAIN,/, "成长页没用递进来的自绘下拉");
+  // 概览下面那句总结要居中。
+  assert.match(APP_CSS, /\.growth-profile__line\s*\{[^}]*text-align:\s*center/,
+    "概览下面那句总结没有居中");
+  // 能力档位的右侧几件东西各占固定列，否则每行的百分比和 ± 会错开一点点，竖着看是锯齿。
+  assert.match(APP_CSS, /\.growth-skill\s*\{[^}]*grid-template-columns:[^;]*84px 78px auto/,
+    "能力档位右侧没有固定列宽，各行会对不齐");
+});

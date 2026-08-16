@@ -57605,6 +57605,9 @@ function renderGrowthTool(body) {
     // _loadMemory read a dead legacy key that was never written → always empty = "bug".)
     projectMemory: [..._kgLoad(_root), ..._kgLoad("")].map((n) => n.content).join("\n"),
     onOpenMemory: openMemoryPanel,
+    // 把自绘下拉传进去。growth.js 是独立模块，直接 import main.js 会成环；用 ctx 递
+    // 一个构造函数进去，这一页的下拉就和其它页是同一个组件，而不是各弹各的原生菜单。
+    buildSelect: buildSelectControl,
   });
 }
 
