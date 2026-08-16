@@ -270,7 +270,19 @@ fn task_run_capture_inner(
 ) -> Result<TaskRunResult, String> {
     let dir = PathBuf::from(&cwd);
     if !dir.is_dir() {
-        return Err("task working directory is not a directory".into());
+        // 带上路径和**身份**。原文是一句不带任何路径的 "task working directory is not a
+        // directory"，前端把它当普通 stderr 拼成 `[ERROR] run_cmd 退出 1`，而失败分型的
+        // 四条规则全部落空，只补一句通用的"按上面真实输出定位根因"，外层恢复又给出
+        // "判断是路径、参数、依赖、端口还是权限错误"——正好把模型引向**命令本身**。
+        // 于是它会改命令、换路径、反复重试，而真相是**整个工作区根目录没了**
+        // （被改名、移动，或所在卷已卸载），所有 run_cmd 和文件读写都会因此失败。
+        return Err(format!(
+            "[WORKSPACE_GONE] 工作目录不存在：{cwd}\n\
+             这是**当前工作区的根目录**，不是命令里写的路径——所以换命令、换路径都没用，\
+             这个会话里后续所有 run_cmd 和文件操作都会同样失败。\
+             多半是这个文件夹被改名、移动了，或所在的卷已卸载。\
+             停下来告诉用户重新打开这个文件夹（或说清它被移到哪了），不要继续重试。"
+        ));
     }
     if command.trim().is_empty() {
         return Err("empty task command".into());
