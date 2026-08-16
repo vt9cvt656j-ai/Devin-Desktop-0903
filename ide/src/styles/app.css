@@ -12242,61 +12242,82 @@ textarea.settings-input {
 }
 
 /* ---- Keyboard shortcuts panel ---- */
-.shortcuts-list { display: flex; flex-direction: column; gap: 9px; }
+/* 快捷键列表：整份拼成一张卡、行间发丝线，和设置页同一个形态。
+   原来每一条是一张独立的圆角描边卡、彼此隔 9px——十几条排下来是一堆平级的盒子。 */
+.shortcuts-list {
+  display: flex;
+  flex-direction: column;
+  background: var(--feature-card, var(--panel-2));
+  border: 1px solid var(--feature-border, var(--line));
+  border-radius: var(--feature-radius-card, 12px);
+  overflow: hidden;
+}
 .shortcut-row {
   display: flex;
   align-items: center;
   gap: 12px;
   min-height: 48px;
-  padding: 12px 14px;
-  border: 1px solid var(--feature-border, var(--line));
-  border-radius: 13px;
-  background: var(--feature-card, var(--panel-2));
+  padding: 10px 14px;
+  border: 0;
+  border-radius: 0;
+  background: none;
 }
+.shortcut-row + .shortcut-row { border-top: 1px solid var(--feature-border, var(--line)); }
 .shortcut-row__label {
   flex: 1;
   display: flex;
   align-items: center;
   gap: 8px;
-  font-size: 14px;
-  font-weight: 680;
+  font-size: 13.5px;
+  font-weight: 550;
   color: var(--feature-text, var(--text));
   min-width: 0;
 }
 .shortcut-row__badge {
+  padding: 1px 6px;
   font-size: 10px;
-  font-weight: 700;
-  letter-spacing: 0.03em;
-  text-transform: uppercase;
-  color: var(--feature-blue, var(--accent));
-  background: var(--feature-active, var(--sel));
-  padding: 2px 6px;
-  border-radius: 5px;
+  font-weight: 600;
+  letter-spacing: .02em;
+  text-transform: none;
+  color: var(--feature-dim, var(--text-dim));
+  background: var(--feature-hover);
+  border-radius: 999px;
 }
-.shortcut-row__keys { display: flex; align-items: center; gap: 4px; }
+/* 键帽固定占一条轨道，右端和「修改」按钮各自成列——否则组合键长短不一
+   （⌘O 两个键、⌘⇧E 三个键），每一行的按钮都会左右浮动。 */
+.shortcut-row__keys {
+  flex: 0 0 128px;
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 4px;
+}
 .shortcut-row__keys kbd {
   min-width: 22px;
-  height: 24px;
-  padding: 0 7px;
+  height: 22px;
+  padding: 0 6px;
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  font-family: var(--mono);
-  font-size: 12px;
-  font-weight: 600;
+  font-family: var(--font);
+  font-size: 11.5px;
+  font-weight: 500;
   color: var(--feature-text, var(--text));
-  background: var(--feature-control, var(--editor-bg, #fff));
-  border: 1px solid var(--feature-border-strong, var(--line-strong));
-  border-bottom-width: 2px;
-  border-radius: 6px;
+  background: var(--feature-hover);
+  /* 原来是 1px 边框 + 2px 底边的拟物键帽，是这个面板里唯一一处拟物元素。
+     改成纯色块，和徽标、步进器共用一套观感。 */
+  border: 0;
+  border-radius: 5px;
 }
-.shortcut-row__unbound { font-size: 12px; color: var(--feature-dim, var(--text-dim)); font-style: italic; }
+.shortcut-row__unbound { font-size: 12px; color: var(--feature-dim, var(--text-dim)); }
 .btn--sm { height: 26px; padding: 0 10px; font-size: 12px; }
+/* 录制中的按钮宽度写死，否则文案一变（"修改"→"按下组合键…"）会把左边的键帽整排推走。 */
+.shortcut-row__change { flex: 0 0 64px; justify-content: center; }
 .shortcut-row__change.is-recording {
   color: var(--feature-blue, var(--accent));
   border-color: var(--feature-blue, var(--accent));
-  background: var(--feature-active, var(--sel));
 }
+
 
 /* ---- Outline Panel ---- */
 .outline-bar {
