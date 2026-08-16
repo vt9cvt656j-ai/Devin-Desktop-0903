@@ -12826,9 +12826,24 @@ const _POWER_ROUTE_KEY = "michael_power_route_v1";
 function _loadPowerRoutes() {
   try { return JSON.parse(localStorage.getItem(_POWER_ROUTE_KEY) || "{}") || {}; } catch { return {}; }
 }
+/**
+ * 网关说这个模型有没有强力线路。三态：true/false/null（null = 不知道）。
+ *
+ * 单独拆出来是因为**发送侧和渲染侧必须用同一条闸**：只把按钮藏起来、请求头照发，
+ * 用户就会陷在一个每次都报错、又找不到地方关掉的状态里。
+ */
+function _powerRouteAvailable(id = "") {
+  const entry = _modelCatalogEntry(String(id || ""));
+  const v = entry?.powerRouteAvailable;
+  return typeof v === "boolean" ? v : null;
+}
+
 /** 这一轮该不该走强力版线路。只对 Claude 一族生效。 */
 function _powerRouteOn(id = "") {
   if (!_modelSupportsPowerRoute(id)) return false;
+  // 网关明确说没有强力线路时，连头都不发。留着发只会每一轮都撞同一句报错，
+  // 而按钮这时候是不显示的，用户根本没有关掉它的入口。
+  if (_powerRouteAvailable(id) === false) return false;
   return _loadPowerRoutes()[String(id)] === true;
 }
 function _setPowerRoute(id, on) {
@@ -12853,6 +12868,8 @@ function _setPowerRoute(id, on) {
 function _modelPowerToggleHtml(m) {
   const id = m?.id || "";
   if (!_modelSupportsPowerRoute(id)) return "";
+  // 网关明确说没有强力线路 → 不画这个按钮。null（不知道）仍然画，见 _powerRouteAvailable。
+  if (_powerRouteAvailable(id) === false) return "";
   const on = _powerRouteOn(id);
   const tip = on
     ? "强力版已开：这一轮只走后台勾了「Claude 强力版」的线路。再点关闭。"
@@ -12992,6 +13009,13 @@ async function loadBackendModels() {
         // 0 here carries that through — nothing downstream may substitute a number for it.
         maxOutput: Math.max(0, Math.round(Number(it.max_output_tokens ?? it.maxOutputTokens) || 0)),
         priceSource: it.price_source || it.priceSource || "",
+        // 这个模型有没有一条强力线路。三态，不能压成布尔：
+        //   true  → 显示右上角那个闪电按钮；
+        //   false → 网关明确说了没有，别把按钮画出来（点了只会撞报错）；
+        //   null  → 网关还没升级 / 目录没拉到 → 退回旧行为（按模型名判断）。
+        // 压成布尔的话，离线或网关旧版时按钮会集体消失，而那是"不知道"，不是"没有"。
+        powerRouteAvailable:
+          typeof it.power_route_available === "boolean" ? it.power_route_available : null,
         desc: it.description || "", group: label,
       });
     }
