@@ -72,13 +72,18 @@ const _workspaceAncestorRoots = load("_workspaceAncestorRoots");
 // noGit：这些 base 不是 git 仓库（git 命令非零退出）。
 function makeDoc({ files = {}, userConfigs = [], tracked = [], noGit = [] } = {}) {
   const gitCalls = [];
+  const invokeArgs = [];
   const backend = {
     readTextFile: async (path) => {
       if (!(path in files)) throw new Error("ENOENT " + path);
       return files[path];
     },
-    invoke: async (cmd) => {
-      if (cmd === "mcp_user_configs") return userConfigs;
+    invoke: async (cmd, args) => {
+      if (cmd === "mcp_user_configs") {
+        invokeArgs.push(args);
+        // userConfigs 传函数就是在演 Rust 侧那份「按当前项目筛过的」返回值。
+        return typeof userConfigs === "function" ? userConfigs(args?.project) : userConfigs;
+      }
       throw new Error("unexpected invoke " + cmd);
     },
     taskRunCapture: async (cwd, cmd) => {
@@ -101,11 +106,13 @@ function makeDoc({ files = {}, userConfigs = [], tracked = [], noGit = [] } = {}
     _mcpLocalFileIsTracked,
   });
   read.gitCalls = gitCalls;
+  read.invokeArgs = invokeArgs;
   return read;
 }
 
 const USER_FILE = "/home/me/.michael-ide/mcp.json";
 const CURSOR_FILE = "/home/me/.cursor/mcp.json";
+const CLAUDE_FILE = "/home/me/.claude.json";
 
 // ── ① 全局作用域：换项目还在，没打开文件夹也在 ──────────────────────────────
 
@@ -150,6 +157,31 @@ test("Claude Code / Cursor 里配好的服务直接就能用，不用再抄一�
   assert.equal(JSON.parse(doc.text).mcpServers["my-api"].command, "node");
   assert.equal(doc.serverScopes["my-api"], "interop");
   assert.equal(doc.serverSources["my-api"], CURSOR_FILE);
+});
+
+test("当前项目路径要传给 Rust 侧，否则 Claude Code 缺省作用域的服务一条都读不到", async () => {
+  // `claude mcp add` 不带 -s 时用的是 local 作用域，服务写在
+  // ~/.claude.json 的 projects["<当时的 cwd>"].mcpServers 底下。Rust 那边要靠这个路径
+  // 才认得出哪一条属于当前项目——不传的话它只能回全局那一层，于是用户在 Claude Code
+  // 里配的绝大多数服务在这边一个都不出现，面板却照样显示"已读取 Claude Code 配置"。
+  const read = makeDoc({
+    userConfigs: (project) => [{
+      path: CLAUDE_FILE,
+      writable: false,
+      servers: project === "/work/a" ? { "local-scoped": { command: "node" } } : {},
+    }],
+  });
+  const mine = await read("/work/a");
+  assert.equal(JSON.parse(mine.text).mcpServers["local-scoped"].command, "node");
+  // 不能取最后一次：_disabledMcpServers 之后还会再调一次，它只读自己那份可写配置，
+  // 不需要项目路径，传的就是空串。要问的是"有没有带着当前项目问过一次"。
+  assert.ok(
+    read.invokeArgs.some((args) => args?.project === "/work/a"),
+    `没带项目路径问过：${JSON.stringify(read.invokeArgs)}`,
+  );
+  // 换个项目就该没有它：local 作用域在 Claude Code 里本来就不跨项目。
+  const other = await read("/work/b");
+  assert.equal(JSON.parse(other.text || "{}").mcpServers?.["local-scoped"], undefined);
 });
 
 test("每个服务都带着它的来源作用域——权限门和面板都靠这个分辨谁写的", async () => {
