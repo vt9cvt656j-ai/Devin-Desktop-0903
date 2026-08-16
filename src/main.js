@@ -58039,6 +58039,56 @@ function buildSelectControl(options, cur, onPick) {
   return wrap;
 }
 
+/**
+ * 数字步进器。
+ *
+ * 原生 <input type="number"> 右端那个上下箭头是 macOS 的系统件，和这套界面不是一路货，
+ * 所以之前把它藏了——但那样连"这个值可以加减"的提示也一起没了，剩一个裸文本框。
+ * 这里把加减做成自绘的两颗按钮，和下拉框共用同一套边框、圆角、高度。
+ *
+ * 中间仍然是真的 <input type="number">：直接键入、↑/↓ 键、读屏器的数值语义都还在，
+ * 不是拿 div 假装的输入框。
+ */
+function buildNumberControl(cur, opts, onCommit) {
+  const min = opts?.min == null ? -Infinity : Number(opts.min);
+  const max = opts?.max == null ? Infinity : Number(opts.max);
+  const wrap = document.createElement("div");
+  wrap.className = "mnum";
+  const dec = document.createElement("button");
+  const inp = document.createElement("input");
+  const inc = document.createElement("button");
+  dec.type = inc.type = "button";
+  dec.className = "mnum__step";
+  inc.className = "mnum__step";
+  dec.textContent = "−";
+  inc.textContent = "+";
+  dec.setAttribute("aria-label", "减小");
+  inc.setAttribute("aria-label", "增大");
+  inp.type = "number";
+  inp.className = "mnum__input";
+  inp.value = cur;
+  if (opts?.min != null) inp.min = opts.min;
+  if (opts?.max != null) inp.max = opts.max;
+
+  const clamp = (n) => Math.min(max, Math.max(min, n));
+  const commit = (n) => {
+    const v = clamp(Number.isFinite(n) ? n : Number(cur) || 0);
+    inp.value = String(v);
+    // 到头的那颗按钮置灰，省得用户对着一个点了没反应的按钮反复点。
+    dec.disabled = v <= min;
+    inc.disabled = v >= max;
+    onCommit(v);
+  };
+  dec.addEventListener("click", () => commit(Number(inp.value) - 1));
+  inc.addEventListener("click", () => commit(Number(inp.value) + 1));
+  inp.addEventListener("change", () => commit(Number(inp.value)));
+  dec.disabled = Number(cur) <= min;
+  inc.disabled = Number(cur) >= max;
+
+  wrap.append(dec, inp, inc);
+  return wrap;
+}
+
 function buildSettingControl(item, cur, update) {
   const control = document.createElement("div");
   control.className = "settings-row__control";
@@ -58047,14 +58097,7 @@ function buildSettingControl(item, cur, update) {
     const options = typeof item.options === "function" ? item.options(cur) : item.options;
     control.appendChild(buildSelectControl(options, cur, (val) => update(item.key, String(val))));
   } else if (item.type === "number") {
-    const inp = document.createElement("input");
-    inp.type = "number";
-    inp.className = "settings-input settings-input--num";
-    inp.value = cur;
-    if (item.min != null) inp.min = item.min;
-    if (item.max != null) inp.max = item.max;
-    inp.addEventListener("change", () => update(item.key, Number(inp.value)));
-    control.appendChild(inp);
+    control.appendChild(buildNumberControl(cur, item, (v) => update(item.key, v)));
   } else if (item.type === "text") {
     const inp = document.createElement("input");
     inp.type = "text";
