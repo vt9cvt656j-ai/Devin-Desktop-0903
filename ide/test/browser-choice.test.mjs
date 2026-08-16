@@ -84,28 +84,44 @@ test("automation-framework 不再写死 Chrome 的绝对路径", () => {
   }
 });
 
-test("浏览器弹窗和设置面板同一套语言，且颜色不依赖面板令牌", () => {
+test("浏览器弹窗用托盘式选择列表，且颜色不依赖面板令牌", () => {
   const css = readFileSync(join(HERE, "../src/styles/app.css"), "utf8");
   const rule = (sel) => {
     const at = css.indexOf("\n" + sel + " {");
     assert.notEqual(at, -1, `${sel} 规则没了`);
     return css.slice(at, css.indexOf("\n}", at));
   };
-  // 一张卡 + 行间发丝线，不再是一列各自描边的小盒子。
-  assert.match(rule(".bp-list, .bp-card"), /border-radius:\s*12px/, "选项列表不是一张卡");
-  assert.match(rule(".bp-row + .bp-row"), /border-top/, "行间没有发丝线");
-  assert.match(rule(".bp-row"), /border:\s*0/, "每一行还各自描着边");
+
+  // 这里只有两三个选项，是一次**选择**，不是一屏几十项的设置表。M3 对这种场景给的是
+  // 托盘式列表：项与项之间用留白而不是分隔线，选中项整块铺一层淡色容器。
+  // 上一版照搬了设置页那套"一张卡 + 发丝线"，密排语汇用在三个选项上显得又挤又闷。
+  assert.doesNotMatch(css, /\.bp-row \+ \.bp-row\s*\{[^}]*border-top/,
+    "又给选项之间加分隔线了——三个选项的选择列表不该用密排表格的语汇");
+  assert.match(rule(".bp-list"), /gap:\s*\dpx/, "项与项之间没有留白");
+  assert.match(rule(".bp-row"), /border-radius:\s*14px/, "选项自己不是圆角容器，选中态铺不出来");
+  assert.match(css, /\.bp-row\.is-on\s*\{[^}]*background:\s*#e8f0fe/,
+    "选中态不是 tonal 容器");
+  // 左边的首字母图块：认牌子比读一行路径快得多。
+  assert.match(rule(".bp-mono"), /border-radius:/, "首字母图块没了");
+  assert.match(SRC, /<span class="bp-mono"/, "没渲染首字母图块");
 
   // 单选圈是自绘的：原生 radio 在这套界面里是唯一一处系统件。
   assert.match(css, /\.bp-row input\[type="radio"\]\s*\{[^}]*opacity:\s*0/, "原生 radio 没藏起来");
   assert.match(css, /\.bp-row\.is-on \.bp-radio::after/, "选中没有自绘的实心点");
 
+  // 深色必须单独覆盖：选中态和图块用的是写死的浅色，深色下不覆盖会白底黑字压深底。
+  // 带上花括号精确匹配：光按前缀找会被 `.is-on:hover`、`.is-on .bp-mono` 这些同前缀的
+  // 规则喂饱——把真正那条删掉也照样通过。
+  for (const need of [".bp-row.is-on", ".bp-mono", ".bp-warn"]) {
+    assert.ok(css.includes(`:root[data-theme="dark"] ${need} {`), `${need} 缺深色覆盖`);
+  }
+
   // 这个弹窗**不在** .feature-panel 里，取不到 --feature-* 令牌；用了又不写兜底的话，
   // 整条声明会作废（毛玻璃那次就是这么栽的）。
-  for (const sel of [".bp-lede", ".bp-sec", ".bp-list, .bp-card", ".bp-row", ".bp-ext"]) {
+  for (const sel of [".bp-lede", ".bp-sec", ".bp-list", ".bp-row", ".bp-ext"]) {
     assert.doesNotMatch(rule(sel), /var\(--feature-/,
       `${sel} 用了面板作用域的令牌，在这个弹窗里取不到`);
   }
-  // 全局令牌也要带字面兜底。
   assert.match(rule(".bp-ext"), /var\(--text,\s*#/, "颜色没写兜底值");
 });
+

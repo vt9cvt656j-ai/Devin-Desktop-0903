@@ -773,140 +773,142 @@ body.is-tauri.is-mac.is-fullscreen .titlebar {
 }
 
 /* 「自动化用哪个浏览器」面板。整块沿用 ctp- 卡片的排版，只补它自己的行样式。 */
-/* ---- 浏览器选择弹窗 ----
-   和设置面板同一套语言：小节标题 + 一张卡、卡内多行用发丝线分隔、行内左标题右控件。
-   **这个弹窗在面板外面**，所以颜色一律用全局令牌（:root 上定义的）并带字面兜底——
-   面板那套 --feature-* 在这儿取不到，取不到又没兜底的话整条声明会作废（毛玻璃那次
-   就是这么栽的）。 */
+/* ---- 浏览器选择弹窗（Material 3 语汇）----
+ *
+ * 和设置面板那套"发丝线分隔的密排列表"是**两种东西**：那是一屏几十项的设置表，靠密度
+ * 取胜；这里只有两三个选项，是一次**选择**。M3 对这种场景给的是托盘式列表——项与项之间
+ * 用留白而不是线，选中项整块铺一层淡色容器（tonal container），左边一个首字母图块帮人
+ * 认牌子，右边一个单选圈。
+ *
+ * 这个弹窗在 .feature-panel 外面，取不到 --feature-* 令牌；var() 取不到又没兜底会让整条
+ * 声明作废（毛玻璃那次就是这么栽的），所以颜色一律全局令牌 + 字面兜底，深色单独覆盖。
+ */
+.ctp-card--bp .ctp-body { padding-bottom: 4px; }
 .bp-lede {
-  margin: 0 0 18px;
-  font-size: 12.5px;
-  line-height: 1.6;
-  color: var(--text-dim, #6e6e73);
+  margin: -2px 0 22px;
+  font-size: 13px;
+  line-height: 1.65;
+  color: var(--text-dim, #5f6368);
 }
-.bp-lede b { font-weight: 600; color: var(--text, #1c1c1e); }
+.bp-lede b { font-weight: 600; color: var(--text, #202124); }
 .bp-empty {
   padding: 10px 0 4px;
-  font-size: 12.5px;
-  line-height: 1.6;
-  color: var(--text-dim, #6e6e73);
+  font-size: 13px;
+  line-height: 1.65;
+  color: var(--text-dim, #5f6368);
 }
+/* 小节标题用 M3 的 title-small：正文色、13.5px/600，而不是一行灰色小字——
+   这是一次选择，标题该有分量。 */
 .bp-sec {
-  margin: 0 0 8px 2px;
-  font-size: 12px;
+  margin: 0 0 10px 2px;
+  font-size: 13.5px;
   font-weight: 600;
-  letter-spacing: .01em;
-  color: var(--text-dim, #6e6e73);
+  color: var(--text, #202124);
 }
-.bp-list, .bp-card {
-  margin-bottom: 22px;
-  background: var(--panel-2, #fbfbfd);
-  border: 1px solid var(--line-strong, rgba(0, 0, 0, .14));
-  border-radius: 12px;
-  overflow: hidden;
-}
-.bp-card { padding: 12px 14px 10px; }
-/* 一行一个选项，行间发丝线；不再是一堆各自描边、彼此隔 6px 的小盒子。 */
+.bp-list { display: flex; flex-direction: column; gap: 4px; margin-bottom: 24px; }
+/* 托盘式列表项：项之间**没有分隔线**，靠 4px 留白；选中项自己是一块圆角容器。 */
 .bp-row {
   display: flex;
   align-items: center;
-  gap: 12px;
-  min-height: 54px;
-  padding: 11px 14px;
-  cursor: pointer;
+  gap: 14px;
+  min-height: 64px;
+  padding: 10px 14px;
   border: 0;
-  border-radius: 0;
-  background: none;
+  border-radius: 14px;
+  background: transparent;
+  cursor: pointer;
+  transition: background .12s ease;
 }
-.bp-row + .bp-row { border-top: 1px solid var(--line, rgba(0, 0, 0, .09)); }
-.bp-row:hover { background: var(--hover, rgba(0, 0, 0, .05)); }
-/* 原生 radio 藏掉，自己画一个——原生控件在这套界面里是唯一一处系统件。 */
+.bp-row:hover { background: rgba(0, 0, 0, .045); }
+.bp-row.is-on { background: #e8f0fe; }
+.bp-row.is-on:hover { background: #ddeafc; }
 .bp-row input[type="radio"] { position: absolute; opacity: 0; pointer-events: none; }
+/* 首字母图块：认牌子比读一行路径快得多。 */
+.bp-mono {
+  flex: none;
+  width: 38px;
+  height: 38px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--text-dim, #5f6368);
+  background: rgba(0, 0, 0, .055);
+  border-radius: 11px;
+}
+.bp-row.is-on .bp-mono { color: #1a73e8; background: rgba(26, 115, 232, .14); }
 .bp-row__text { flex: 1 1 auto; min-width: 0; display: flex; flex-direction: column; gap: 3px; }
-.bp-row__name { font-size: 13.5px; font-weight: 550; color: var(--text, #1c1c1e); }
+.bp-row__name { font-size: 14px; font-weight: 500; color: var(--text, #202124); }
+.bp-row.is-on .bp-row__name { color: #174ea6; }
 .bp-row__path {
-  font-size: 11.5px;
+  font-size: 12px;
   line-height: 1.45;
-  color: var(--text-dim, #6e6e73);
+  color: var(--text-dim, #5f6368);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+.bp-row.is-on .bp-row__path { color: #1a73e8; opacity: .85; }
 .bp-radio {
-  flex: none;
-  width: 17px;
-  height: 17px;
-  border: 1.5px solid var(--line-strong, rgba(0, 0, 0, .22));
-  border-radius: 50%;
   position: relative;
+  flex: none;
+  width: 20px;
+  height: 20px;
+  border: 2px solid var(--line-strong, #80868b);
+  border-radius: 50%;
 }
-.bp-row.is-on .bp-radio { border-color: var(--accent, #0a84ff); }
+.bp-row.is-on .bp-radio { border-color: #1a73e8; }
 .bp-row.is-on .bp-radio::after {
   content: "";
   position: absolute;
   inset: 3px;
   border-radius: 50%;
-  background: var(--accent, #0a84ff);
+  background: #1a73e8;
 }
-/* 选中不再给整行铺一层蓝底——那在一列选项里比选中标记本身还抢眼。 */
+/* M3 的 outlined text field：1px 描边，聚焦时描边加粗成主色，而不是外发光。 */
 .bp-ext {
   width: 100%;
-  min-height: 74px;
-  padding: 8px 10px;
+  box-sizing: border-box;
+  min-height: 84px;
+  padding: 12px 14px;
   font-family: var(--mono);
-  font-size: 12px;
-  line-height: 1.55;
-  color: var(--text, #1c1c1e);
-  background: var(--editor-bg, #fff);
-  border: 1px solid var(--line-strong, rgba(0, 0, 0, .14));
-  border-radius: 8px;
+  font-size: 12.5px;
+  line-height: 1.6;
+  color: var(--text, #202124);
+  background: transparent;
+  border: 1px solid var(--line-strong, #dadce0);
+  border-radius: 12px;
   outline: none;
   resize: vertical;
+  transition: border-color .12s ease, box-shadow .12s ease;
 }
-.bp-ext:focus-visible { box-shadow: 0 0 0 3px var(--sel, rgba(10, 132, 255, .14)); }
-.bp-note {
-  margin: 8px 0 0;
-  font-size: 11.5px;
-  line-height: 1.5;
-  color: var(--text-dim, #6e6e73);
-}
-.bp-note b { font-weight: 600; color: var(--text, #1c1c1e); }
+.bp-ext:hover { border-color: var(--text-dim, #5f6368); }
+.bp-ext:focus { border-color: #1a73e8; box-shadow: inset 0 0 0 1px #1a73e8; }
+.bp-note { margin: 8px 2px 0; font-size: 12px; line-height: 1.5; color: var(--text-dim, #5f6368); }
+.bp-note b { font-weight: 600; color: var(--text, #202124); }
+/* 警告用 tonal container：淡底深字、不描边——M3 里这类提示是"一块颜色"，不是"一个框"。 */
 .bp-warn {
-  padding: 10px 12px;
-  font-size: 12px;
-  line-height: 1.55;
-  color: #b26a00;
-  background: rgba(224, 160, 0, .10);
-  border: 1px solid rgba(224, 160, 0, .28);
-  border-radius: 10px;
+  margin-top: 18px;
+  padding: 12px 14px;
+  font-size: 12.5px;
+  line-height: 1.6;
+  color: #8a5300;
+  background: #fef7e0;
+  border: 0;
+  border-radius: 12px;
 }
-:root[data-theme="dark"] .bp-warn { color: #e0a000; background: rgba(224, 160, 0, .12); }
-
-/* 选中态用边框而不是填充：这一列里每行都有一个单选圆点，再加底色会有两个"选中"信号。 */
-.bp-row.is-on { border-color: #4a9eff; background: rgba(74,158,255,.07); }
-.bp-row input { margin: 0; flex-shrink: 0; }
-.bp-row__text { display: flex; flex-direction: column; min-width: 0; gap: 1px; }
-.bp-row__name { font-size: 12.5px; font-weight: 600; }
-/* 路径可能很长，截断而不是把卡片撑宽。 */
-.bp-row__path { font-size: 11px; opacity: .5; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.bp-sec { font-size: 11.5px; opacity: .6; margin: 16px 0 6px; }
-.bp-ext {
-  width: 100%; box-sizing: border-box; resize: vertical;
-  font: 11.5px ui-monospace, SFMono-Regular, Menlo, monospace; line-height: 1.5;
-  padding: 8px 10px; border-radius: 8px; color: inherit;
-  border: 1px solid rgba(128,128,128,.25); background: rgba(128,128,128,.04);
-}
-/* 配了扩展却选着 Chrome 时那条警示——Chrome 137 起彻底不理命令行加载扩展。 */
-.bp-warn {
-  margin-top: 8px; padding: 8px 10px; border-radius: 8px;
-  font-size: 11.5px; line-height: 1.5;
-  background: rgba(217,48,37,.07); border: 1px solid rgba(217,48,37,.28);
-}
-[data-theme="dark"] .bp-row, .dark .bp-row,
-[data-theme="dark"] .bp-ext, .dark .bp-ext {
-  background: rgba(255,255,255,.04); border-color: rgba(255,255,255,.12);
-}
-[data-theme="dark"] .bp-row.is-on, .dark .bp-row.is-on { border-color: #4a9eff; background: rgba(74,158,255,.12); }
+:root[data-theme="dark"] .bp-row:hover { background: rgba(255, 255, 255, .06); }
+:root[data-theme="dark"] .bp-row.is-on { background: rgba(138, 180, 248, .16); }
+:root[data-theme="dark"] .bp-row.is-on:hover { background: rgba(138, 180, 248, .22); }
+:root[data-theme="dark"] .bp-mono { background: rgba(255, 255, 255, .08); }
+:root[data-theme="dark"] .bp-row.is-on .bp-mono { color: #8ab4f8; background: rgba(138, 180, 248, .2); }
+:root[data-theme="dark"] .bp-row.is-on .bp-row__name { color: #d2e3fc; }
+:root[data-theme="dark"] .bp-row.is-on .bp-row__path { color: #8ab4f8; }
+:root[data-theme="dark"] .bp-row.is-on .bp-radio { border-color: #8ab4f8; }
+:root[data-theme="dark"] .bp-row.is-on .bp-radio::after { background: #8ab4f8; }
+:root[data-theme="dark"] .bp-ext:focus { border-color: #8ab4f8; box-shadow: inset 0 0 0 1px #8ab4f8; }
+:root[data-theme="dark"] .bp-warn { color: #fdd663; background: rgba(253, 214, 99, .12); }
 .ctp-intro { font-size: 13px; color: var(--text-dim); line-height: 1.65; margin: 0 0 14px; }
 .ctp-intro code, .ctp-empty code { background: var(--hover); padding: 1.5px 6px; border-radius: 5px; font-size: 12px; font-family: var(--mono); }
 .ctp-empty { font-size: 13px; color: var(--text-dim); text-align: center; padding: 30px 12px; line-height: 1.8; }

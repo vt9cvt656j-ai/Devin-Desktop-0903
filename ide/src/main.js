@@ -27969,23 +27969,25 @@ async function _openBrowserPanel() {
   // 画「自动选」，显示的就是一件没在发生的事。
   const effective = (state && typeof state.active === "string" && state.active) || pref.browser || "";
   const current = installed.some((b) => b.id === effective) ? effective : "";
+  m.card.classList.add("ctp-card--bp");
+  const mono = (label) => _escHtml(String(label || "?").replace(/^Google\s+/i, "").slice(0, 1).toUpperCase());
   m.body.innerHTML =
-    `<p class="bp-lede">选中的浏览器会被用来跑自动化。<b>它和你自己开的那个是两个进程</b>，`
-    + `Dock 里会各有一个图标——选一个跟你日常用的不同的牌子，就一眼能分清哪个是机器人在开。</p>`
+    // M3 的对话框结构：标题下面先给一句 supporting text，再进内容。
+    `<p class="bp-lede">选中的浏览器专门用来跑自动化，<b>和你自己开的那个是两个进程</b>。`
+    + `选一个跟你日常用的不同的牌子，Dock 里一眼就能分清哪个是机器人在开。</p>`
     + `<div class="bp-sec">自动化浏览器</div>`
     + `<div class="bp-list">` + rows.map((b) => {
       const on = b.id === current;
       return `<label class="bp-row${on ? " is-on" : ""}">`
         + `<input type="radio" name="bp-browser" value="${_escHtml(b.id)}"${on ? " checked" : ""}>`
+        + `<span class="bp-mono" aria-hidden="true">${mono(b.label)}</span>`
         + `<span class="bp-row__text"><span class="bp-row__name">${_escHtml(b.label)}</span>`
         + `<span class="bp-row__path">${_escHtml(b.path)}</span></span>`
         + `<span class="bp-radio" aria-hidden="true"></span></label>`;
     }).join("") + `</div>`
     + `<div class="bp-sec">浏览器扩展</div>`
-    + `<div class="bp-card">`
     + `<textarea class="bp-ext" rows="3" placeholder="/Users/你/某个扩展目录">${_escHtml((pref.extensions || []).join("\n"))}</textarea>`
     + `<p class="bp-note">每行一个<b>未打包</b>的扩展目录，留空就是不加载。</p>`
-    + `</div>`
     + `<div class="bp-warn" hidden></div>`;
 
   const warn = m.body.querySelector(".bp-warn");
