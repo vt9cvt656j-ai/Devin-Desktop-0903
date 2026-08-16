@@ -2927,7 +2927,7 @@ fn html_to_text(html: &str) -> String {
 }
 
 /// Fetch a public web page for the agent. Guards against SSRF (public IPs only,
-/// no redirects), bounds time/size, and returns readable text.
+/// redirects are followed but **re-validated on every hop**), bounds time/size, and returns readable text.
 #[tauri::command]
 pub async fn web_fetch(url: String) -> Result<String, String> {
     use std::net::ToSocketAddrs;
@@ -2967,8 +2967,46 @@ pub async fn web_fetch(url: String) -> Result<String, String> {
         }
     }
 
+    // 重定向必须**逐跳重新校验**，否则上面那圈 IP 检查等于没做。
+    //
+    // 原来是 `Policy::limited(5)`——只在**第一个** URL 上校验过 IP，之后 5 跳全部放行。
+    // 攻击者页面回一个 302 指向 169.254.169.254（云元数据端点），web_fetch 就直接跟过去，
+    // 整道检查形同虚设。这个文件上面的注释写的是「no redirects」，和代码已经对不上了；
+    // 而同类的 net.rs 用的是 `Policy::none()`，注释还专门写着「3xx 不能把我们弹到内网」。
+    //
+    // 但不能简单关掉：web_fetch 抓的是真实网页，短链和 http→https 跳转太常见，
+    // 一关就大面积失效。所以用自定义策略——每一跳都把目标主机解析一遍，
+    // 解析出来的任何一个地址不合格就当场掐断。
     let client = reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::limited(5))
+        .redirect(reqwest::redirect::Policy::custom(|attempt| {
+            if attempt.previous().len() >= 5 {
+                return attempt.error("too many redirects");
+            }
+            let Some(host) = attempt.url().host_str() else {
+                return attempt.stop();
+            };
+            // 重定向发生在 reqwest 的同步回调里，做不了异步 DNS；这里用阻塞解析。
+            // 代价是一次重定向多一次同步查询（本地缓存命中时几乎为零），
+            // 换来的是"每一跳都校验"——这个交换在安全上是必须的。
+            let port = attempt.url().port_or_known_default().unwrap_or(80);
+            match (host, port).to_socket_addrs() {
+                Ok(addrs) => {
+                    let mut any = false;
+                    for a in addrs {
+                        any = true;
+                        if !ip_fetch_allowed(a.ip()) {
+                            return attempt.error("redirect target is link-local / metadata / multicast");
+                        }
+                    }
+                    // 一个都解析不出来时不放行：宁可失败，也不跟一个没验过的地址。
+                    if !any {
+                        return attempt.error("redirect target did not resolve");
+                    }
+                    attempt.follow()
+                }
+                Err(_) => attempt.error("redirect target did not resolve"),
+            }
+        }))
         .connect_timeout(std::time::Duration::from_secs(6))
         .timeout(std::time::Duration::from_secs(15))
         .build()
@@ -3681,4 +3719,67 @@ fn parse_ddg_lite(html: &str) -> Vec<(String, String, String)> {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod web_fetch_redirect_tests {
+    use super::ip_fetch_allowed;
+
+    /// 云元数据端点（169.254.169.254）是 SSRF 的经典目标：AWS/GCP/Azure 上一个 GET
+    /// 就能拿到实例凭据。这条守的是判据本身。
+    #[test]
+    fn the_cloud_metadata_endpoint_is_refused() {
+        for bad in [
+            "169.254.169.254", // 云元数据
+            "169.254.1.1",     // link-local 其余部分
+            "0.0.0.0",         // Linux 上连它就是连本机
+            "255.255.255.255", // 广播
+            "224.0.0.1",       // 多播
+            "192.0.2.1",       // TEST-NET-1，文档保留段
+        ] {
+            let ip: std::net::IpAddr = bad.parse().unwrap();
+            assert!(!ip_fetch_allowed(ip), "{bad} 应当被拒绝");
+        }
+        for good in ["93.184.216.34", "1.1.1.1", "8.8.8.8"] {
+            let ip: std::net::IpAddr = good.parse().unwrap();
+            assert!(ip_fetch_allowed(ip), "{good} 是正常公网地址，不该被拒");
+        }
+        // IPv6 的 link-local 同样是元数据入口（fe80::/10）
+        let v6: std::net::IpAddr = "fe80::1".parse().unwrap();
+        assert!(!ip_fetch_allowed(v6));
+    }
+
+    /// 真正的洞不在判据，在**只校验第一跳**。
+    #[test]
+    fn redirects_are_revalidated_on_every_hop_not_just_the_first() {
+        let raw = include_str!("ai.rs");
+        // 剥注释再断言：修复的说明里原样引用了旧写法（Policy::limited），
+        // 不剥的话断言匹配的是注释而不是代码。这个坑本轮已经踩过五次。
+        let src: String = raw
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let src = src.as_str();
+        // 原来只在第一个 URL 校验过 IP，之后 5 跳全部放行。攻击者页面回一个 302
+        // 指向云元数据端点，整道检查就形同虚设。
+        // 拼出来找，不要写成字面量——include_str! 读的是**整个文件**（含本测试模块），
+        // 断言自己的字符串字面量会匹配它自己。剥注释救不了这一层，因为它是代码。
+        let banned = format!("redirect(reqwest::redirect::Policy::{}(5))", "limited");
+        assert!(!src.contains(&banned), "又变回只校验第一跳了");
+        assert!(src.contains("Policy::custom(|attempt|"), "重定向必须走自定义策略");
+        // 策略里必须真的调判据，而不是只数跳数
+        let policy_start = src.find("Policy::custom(|attempt|").unwrap();
+        let policy = &src[policy_start..policy_start + 1600];
+        assert!(policy.contains("ip_fetch_allowed(a.ip())"), "每一跳都要过 IP 判据");
+        assert!(policy.contains("attempt.previous().len() >= 5"), "跳数上限不能丢");
+        // 解析不出地址时**不能**放行——宁可失败也别跟一个没验过的地址
+        assert!(
+            policy.contains("redirect target did not resolve"),
+            "解析失败必须掐断，不能默认 follow"
+        );
+        // 注释和代码要对得上：原来写着 "no redirects" 而代码在跟 5 跳（这条对**原文**判断）
+        let stale_doc = format!("/// no {}), bounds time/size", "redirects");
+        assert!(!raw.contains(&stale_doc), "注释还在说不跟重定向");
+    }
 }

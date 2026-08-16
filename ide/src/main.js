@@ -45363,7 +45363,12 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
           }
           if (_smShared && window.collaborationEngine) {
             const _collabId = `sm_${Date.now()}_${run._subAgentJobSeq || 0}`;
-            const _mainJobId = `main_${_smLedgerLen}`;
+            // 主作业键也要带 run 前缀。上一轮给子作业修串台时漏了这一半：
+            // `main_${_smLedgerLen}` 用的是**账本长度**，两个标签页在相同步数时会撞出
+            // 同一个键——而 createJob 会直接覆盖，于是 A 的主作业记录被 B 顶掉，
+            // startSession 里 leadJobId 指向的也变成了别人的作业。
+            // 修串台修到一半，比不修更难查。
+            const _mainJobId = `main_${_smRunToken(run)}_${_smLedgerLen}`;
             try {
               _globalSharedStore.createJob({ tool: "main_agent", status: "running", findings: [] }, _mainJobId);
               window.collaborationEngine.startSession(_collabId,
