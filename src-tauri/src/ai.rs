@@ -194,6 +194,11 @@ pub struct AiConfig {
     /// region-appropriate package mirror guidance (e.g. npmmirror for mainland China).
     #[serde(default)]
     pub ide_region: Option<String>,
+    /// 用户在 Claude 模型卡片右上角打开了「强力版」。为 true 时网关只会把这一轮派到
+    /// 后台勾了「Claude 强力版」的线路上；一条都没勾时网关明确报错，而不是悄悄退回
+    /// 普通线路 —— 用户点了强力版还给他普通线路，等于把他的选择改掉了。
+    #[serde(default)]
+    pub ide_power_route: Option<bool>,
     /// michael-compression 的档位（"1m"/"2m"/"5m"），由 /api/me 下发、客户端原样回传。
     ///
     /// 这个字段此前**不存在**：JS 侧设了 `config.michaelCompression`，serde 默认忽略
@@ -571,6 +576,9 @@ fn with_ide_headers(rb: reqwest::RequestBuilder, config: &AiConfig) -> reqwest::
         )
     }) {
         rb = rb.header("x-ide-step-kind", step_kind);
+    }
+    if config.ide_power_route == Some(true) {
+        rb = rb.header("x-ide-power-route", "1");
     }
     if let Some(m) = config.ide_mode.as_deref().filter(|s| !s.is_empty()) {
         rb = rb.header("x-ide-mode", m);

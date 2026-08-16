@@ -522,7 +522,7 @@ async function tauriBackend() {
     aiChat: (config, messages, onEvent) => {
       const channel = new core.Channel();
       channel.onmessage = onEvent;
-      const p = core.invoke("ai_chat", { config, messages, onEvent: channel });
+      const p = core.invoke("ai_chat", { config: _stampPowerRoute(config), messages, onEvent: channel });
       // Tauri keeps Channel callbacks after invoke resolves. Replace this turn's
       // capture with a sink, rather than null, because a final event may be queued.
       const _free = () => _releaseTauriChannel(channel);
@@ -532,13 +532,13 @@ async function tauriBackend() {
     aiChatWithTools: (config, messages, tools, onEvent) => {
       const channel = new core.Channel();
       channel.onmessage = onEvent;
-      const p = core.invoke("ai_chat_with_tools", { config, messages, tools, onEvent: channel });
+      const p = core.invoke("ai_chat_with_tools", { config: _stampPowerRoute(config), messages, tools, onEvent: channel });
       const _free = () => _releaseTauriChannel(channel); // see aiChat
       p.then(_free, _free);
       return p;
     },
     aiComplete: (config, messages, maxTokens) =>
-      core.invoke("ai_complete", { config, messages, maxTokens }),
+      core.invoke("ai_complete", { config: _stampPowerRoute(config), messages, maxTokens }),
     cancelAi: (requestId) => { try { return core.invoke("cancel_ai", { requestId }); } catch { return Promise.resolve(); } },
     termOpen: async (opts, onEvent) => {
       const channel = new core.Channel();
@@ -724,6 +724,7 @@ async function _realAiFetch(config, messages, tools, onEvent) {
     // whenever L0 is on — without these headers nobody re-injects them on the web build,
     // leaving the agent prompt-less and tool-less.
     const _h = { "Content-Type": "application/json", Authorization: "Bearer " + (key || "") };
+    if (config.idePowerRoute === true) _h["x-ide-power-route"] = "1";
     if (config.ideMode) _h["x-ide-mode"] = String(config.ideMode);
     if (config.ideTools) _h["x-ide-tools"] = String(config.ideTools);
     if (config.ideSemanticProfile) _h["x-ide-semantic-profile"] = String(config.ideSemanticProfile).slice(0, 1024);
@@ -12816,6 +12817,53 @@ function _codeSkeleton(body, cap = 800, startLine = 1) {
   return out.join("\n").slice(0, cap);
 }
 
+/** 这个模型能不能用「强力版」——只有 Claude 一族有。 */
+function _modelSupportsPowerRoute(id = "") {
+  return /claude|opus|sonnet|haiku|fable|mythos/i.test(String(id || ""));
+}
+
+const _POWER_ROUTE_KEY = "michael_power_route_v1";
+function _loadPowerRoutes() {
+  try { return JSON.parse(localStorage.getItem(_POWER_ROUTE_KEY) || "{}") || {}; } catch { return {}; }
+}
+/** 这一轮该不该走强力版线路。只对 Claude 一族生效。 */
+function _powerRouteOn(id = "") {
+  if (!_modelSupportsPowerRoute(id)) return false;
+  return _loadPowerRoutes()[String(id)] === true;
+}
+function _setPowerRoute(id, on) {
+  try {
+    const map = _loadPowerRoutes();
+    if (on) map[String(id)] = true; else delete map[String(id)];
+    localStorage.setItem(_POWER_ROUTE_KEY, JSON.stringify(map));
+  } catch {}
+}
+
+/**
+ * 卡片右上角的「强力版」开关（只有 Claude 一族出现）。
+ *
+ * 它切的是**线路**，不是模型也不是档位：运维在后台把某条通道勾成「Claude 强力版」，
+ * 这个开关打开时那一轮请求就只落到那条线路上（网关按 x-ide-power-route 筛选）。
+ * 后台一条都没勾时网关会明确报错，而不是悄悄退回普通线路——用户点了强力版就该走
+ * 强力线路，退回去等于把他的选择改掉。
+ *
+ * 图标是内联 SVG（闪电）：这张卡片的其它图标走 <use href="#sym">，而这个符号不在
+ * 那张 sprite 里，内联省得为一个按钮再往 index.html 里加一个 symbol。
+ */
+function _modelPowerToggleHtml(m) {
+  const id = m?.id || "";
+  if (!_modelSupportsPowerRoute(id)) return "";
+  const on = _powerRouteOn(id);
+  const tip = on
+    ? "强力版已开：这一轮只走后台勾了「Claude 强力版」的线路。再点关闭。"
+    : "切到强力版线路（需要后台先把某条线路勾成「Claude 强力版」）";
+  return `<button type="button" class="mic-power${on ? " is-on" : ""}" data-power="${_escAttr(id)}"`
+    + ` title="${_escAttr(tip)}" aria-pressed="${on ? "true" : "false"}" aria-label="强力版">`
+    + `<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor"`
+    + ` stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">`
+    + `<path d="M13 2 4.5 13.5H11l-1 8.5 8.5-11.5H12z" /></svg></button>`;
+}
+
 function _modelContextRows(m) {
   const id = m?.id || "";
   const native = _modelContextLimit(id);
@@ -14016,6 +14064,20 @@ function syncAssistantBrand() {
 // none so it never steals hover from the menu.
 let _modelInfoCard = null;
 let _modelInfoCurrent = null;
+/**
+ * 把「强力版」意图盖到这一轮的 config 上。
+ *
+ * 盖在这三个入口而不是各个 turn 的组装处：轮次的组装点有好几处（主轮、轻轮、
+ * 子智能体、补全），漏掉任何一处就会出现"开关亮着但请求没走强力线路"。这里是
+ * 所有轮次去后端的唯一出口。
+ */
+function _stampPowerRoute(config) {
+  if (config && typeof config === "object" && _powerRouteOn(config.model)) {
+    config.idePowerRoute = true;
+  }
+  return config;
+}
+
 function _ensureModelInfoCard() {
   if (_modelInfoCard) return _modelInfoCard;
   const el = document.createElement("div");
@@ -14033,6 +14095,20 @@ function _ensureModelInfoCard() {
   // handler — that handler doesn't know the card is a sibling of the menu's
   // wrapper, and would close everything mid-click.
   el.addEventListener("click", (ev) => ev.stopPropagation());
+  // 右上角的「强力版」开关。用委托而不是每次渲染都绑一次：卡片的 innerHTML 每次
+  // 悬浮都整个重建，绑在按钮上的监听会跟着一起被丢掉。
+  el.addEventListener("click", (ev) => {
+    const btn = ev.target?.closest?.(".mic-power");
+    if (!btn) return;
+    const id = btn.getAttribute("data-power") || "";
+    const on = !_powerRouteOn(id);
+    _setPowerRoute(id, on);
+    btn.classList.toggle("is-on", on);
+    btn.setAttribute("aria-pressed", on ? "true" : "false");
+    btn.title = on
+      ? "强力版已开：这一轮只走后台勾了「Claude 强力版」的线路。再点关闭。"
+      : "切到强力版线路（需要后台先把某条线路勾成「Claude 强力版」）";
+  });
   return el;
 }
 
@@ -14686,7 +14762,8 @@ function showModelInfoCard(m, anchorEl) {
   const b = brandFor(m);
   card.innerHTML =
     `<div class="mic-head"><svg class="mic-ic ${b.cls}"><use href="#${b.sym}" /></svg>` +
-    `<div class="mic-htxt"><div class="mic-name"></div><div class="mic-group"></div></div></div>` +
+    `<div class="mic-htxt"><div class="mic-name"></div><div class="mic-group"></div></div>` +
+    _modelPowerToggleHtml(m) + `</div>` +
     `<div class="mic-id"></div>` +
     `<div class="mic-desc"></div>` +
     `<div class="mic-prices">${_modelPriceRows(m)}</div>` +
