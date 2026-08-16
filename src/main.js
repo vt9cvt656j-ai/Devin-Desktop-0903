@@ -58130,11 +58130,7 @@ function renderThemePreviewCard(theme, current, onSelect) {
       </div>
     </div>
     <div class="appearance-theme-card__meta">
-      <span>
-        <b>${t(isDark ? "feature.appearance.dark.title" : "feature.appearance.light.title")}</b>
-        <small>${t(isDark ? "feature.appearance.dark.desc" : "feature.appearance.light.desc")}</small>
-      </span>
-      <i class="appearance-theme-card__check">✓</i>
+      <b>${t(isDark ? "feature.appearance.dark.title" : "feature.appearance.light.title")}</b>
     </div>`;
   card.addEventListener("click", onSelect);
   return card;

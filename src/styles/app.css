@@ -12074,30 +12074,37 @@ textarea.settings-input {
   gap: 14px;
   margin: 0 0 30px;
 }
+/*
+ * 主题卡不再是"卡"：外面那圈描边+底色是多余的一层盒子——缩略图本身已经是一个有边界的
+ * 矩形，再套一个框就是框里画框。现在卡片本体透明，选中与否由**缩略图自己的边框**表达。
+ */
 .appearance-theme-card {
   position: relative;
   display: grid;
-  gap: 11px;
-  padding: 11px;
+  gap: 9px;
+  padding: 0;
   font-family: var(--font);
   color: var(--feature-text, var(--text));
-  background: var(--feature-card, var(--panel-2));
-  border: 1px solid var(--feature-border, var(--line));
-  border-radius: var(--feature-radius-card, 12px);
+  background: none;
+  border: 0;
   cursor: pointer;
   text-align: left;
-  transition: border-color .16s ease, box-shadow .16s ease;
-}
-.appearance-theme-card:hover { border-color: var(--feature-border-strong, var(--line-strong)); }
-.appearance-theme-card.is-active {
-  border-color: var(--feature-blue, var(--accent));
-  box-shadow: 0 0 0 2px color-mix(in srgb, var(--feature-blue, var(--accent)) 22%, transparent);
 }
 .appearance-theme-card__preview {
   height: 132px;
   overflow: hidden;
-  border-radius: 9px;
+  border-radius: 10px;
   border: 1px solid var(--feature-border, var(--line));
+  transition: border-color .14s ease, box-shadow .14s ease;
+}
+.appearance-theme-card:hover .appearance-theme-card__preview {
+  border-color: var(--feature-border-strong, var(--line-strong));
+}
+/* 选中：缩略图外围一圈主色环。用 box-shadow 而不是加粗 border——border 变粗会让缩略图
+   内容跟着位移 1px，两张卡并排时看得出来。 */
+.appearance-theme-card.is-active .appearance-theme-card__preview {
+  border-color: var(--feature-blue, var(--accent));
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--feature-blue, var(--accent)) 28%, transparent);
 }
 
 /*
@@ -12156,46 +12163,17 @@ textarea.settings-input {
 .appearance-theme-card--dark .thp__card s { background: rgba(255, 255, 255, .14); }
 .appearance-theme-card--dark .thp__card s.is-accent { background: #8ab4f8; }
 
-.appearance-theme-card__meta {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 10px;
-  padding: 0 3px 2px;
-}
+.appearance-theme-card__meta { padding: 0 2px; }
 .appearance-theme-card__meta b {
-  display: block;
-  font-size: 13.5px;
+  font-size: 13px;
   font-weight: 550;
-  color: var(--feature-text, var(--text));
-}
-.appearance-theme-card__meta small {
-  display: block;
-  margin-top: 2px;
-  font-size: 11.5px;
-  line-height: 1.45;
   color: var(--feature-dim, var(--text-dim));
 }
-/* 选中标记：一个描边小圆，选中时填成主色。原来是一个 28px 的实心蓝圆，在这么小的
-   卡片上比标题还抢眼。 */
-.appearance-theme-card__check {
-  flex: none;
-  width: 17px;
-  height: 17px;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  font-size: 10px;
-  font-style: normal;
-  color: transparent;
-  border: 1px solid var(--feature-border-strong, var(--line-strong));
-  border-radius: 50%;
+.appearance-theme-card.is-active .appearance-theme-card__meta b {
+  color: var(--feature-text, var(--text));
+  font-weight: 600;
 }
-.appearance-theme-card.is-active .appearance-theme-card__check {
-  color: #fff;
-  background: var(--feature-blue, var(--accent));
-  border-color: var(--feature-blue, var(--accent));
-}
+
 .app-icon-control {
   display: flex;
   align-items: center;
@@ -14842,15 +14820,30 @@ body.tree-selecting, body.tree-selecting * { user-select: none !important; -webk
  */
 .mselect__menu {
   position: fixed;
-  z-index: 120;
+  /* 高过 .feature-panel（90）。设置面板是全屏的，菜单必须盖在它上面。 */
+  z-index: 200;
   max-height: 300px;
   overflow-y: auto;
   padding: 4px;
-  color: var(--text, #1c1c1e);
-  background: var(--panel-2, #fbfbfd);
-  border: 1px solid var(--line-strong, rgba(0, 0, 0, .14));
+  color: #1c1c1e;
+  /*
+   * 表面色写**字面值**，不绕变量。
+   *
+   * 这个浮层挂在 document.body 上，不在面板的令牌作用域里；而 var() 的兜底只在变量
+   * **未定义**时生效，变量定义了却对当前属性无效时，整条声明会直接作废、回到初始值
+   * ——background 的初始值是 transparent，表现就是"菜单透明、底下内容透出来"。
+   * 一个悬浮菜单的底色没有任何跟随主题以外的可变性，写死最省事也最不会错。
+   */
+  background-color: #fbfbfd;
+  border: 1px solid rgba(0, 0, 0, .14);
   border-radius: 8px;
   box-shadow: 0 10px 28px rgba(0, 0, 0, .16), 0 2px 6px rgba(0, 0, 0, .06);
+}
+:root[data-theme="dark"] .mselect__menu {
+  color: #f2f2f4;
+  background-color: #1f1f23;
+  border-color: rgba(255, 255, 255, .14);
+  box-shadow: 0 10px 28px rgba(0, 0, 0, .5), 0 2px 6px rgba(0, 0, 0, .3);
 }
 .mselect__opt {
   width: 100%;
@@ -14859,7 +14852,7 @@ body.tree-selecting, body.tree-selecting * { user-select: none !important; -webk
   font-family: var(--font);
   font-size: 13px;
   text-align: left;
-  color: var(--text, #1c1c1e);
+  color: inherit;
   background: transparent;
   border: 0;
   border-radius: 6px;
@@ -14868,7 +14861,8 @@ body.tree-selecting, body.tree-selecting * { user-select: none !important; -webk
 }
 /* 高亮走 JS 挂的 .is-active（鼠标 mouseenter 和键盘上下键同一条路）。
    颜色用 --active 而不是 --hover：后者是 5% 的黑，压在近白的菜单上几乎看不出来。 */
-.mselect__opt.is-active { background: var(--active, rgba(0, 0, 0, .085)); }
+.mselect__opt.is-active { background: rgba(0, 0, 0, .075); }
+:root[data-theme="dark"] .mselect__opt.is-active { background: rgba(255, 255, 255, .10); }
 .mselect__opt.is-on { font-weight: 600; }
 /* 当前值再加一个勾，光靠字重在长列表里不够显眼。 */
 .mselect__opt.is-on::after { content: "✓"; float: right; opacity: .55; }
