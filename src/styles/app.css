@@ -10989,15 +10989,15 @@ button.agent-plan__fold--toggle:focus-visible { outline: 2px solid #1a73e8; outl
   --feature-backdrop: rgba(255, 255, 255, 0.55);
   --feature-sheet: #fff;
   --feature-header: #fff;
-  /* 内容区底色必须和卡片拉开。原来两者同为 #fff —— 卡片只剩一圈发丝线，
-     "一组设置合成一张卡"这件事在浅色下根本看不出来。 */
-  --feature-bg: #f7f7f8;
+  /* 内容区用白。卡片和它同色，所以"卡"这件事完全靠描边立住——描边就必须比发丝线
+     再实一点点，否则又回到"白压白、看不出边界"。侧栏仍然浅一档，左右两栏还有层次。 */
+  --feature-bg: #fff;
   /* 侧栏比卡片浅一档。原来两者同为 #fff，所以左边那条导航根本没有"栏"的存在感。 */
   --feature-rail: #f7f7f8;
   --feature-card: #fff;
   --feature-control: #fff;
-  --feature-border: #e6e6e9;
-  --feature-border-strong: #d8d8dc;
+  --feature-border: #e0e0e5;
+  --feature-border-strong: #d0d0d6;
   --feature-text: #1d1d1f;
   --feature-dim: #6b6b70;
   --feature-blue: #1a73e8;
@@ -11107,12 +11107,25 @@ button.agent-plan__fold--toggle:focus-visible { outline: 2px solid #1a73e8; outl
   flex: 1;
   min-height: 0;
   display: grid;
-  grid-template-columns: 236px minmax(0, 1fr);
+  /* 侧栏宽度跟着窗口走。写死 236px 时，窗口窄下来或 ⌘+ 放大之后，它会把内容挤成
+     一条细缝；clamp 让它在 172–236 之间收放，下限刚好放得下最长的那个页签名。 */
+  grid-template-columns: clamp(172px, 18vw, 236px) minmax(0, 1fr);
 }
-/* 全屏之后内容区可能有 2000px 宽。内容自己封顶并**居左**（不是居中）——居中会让侧栏
-   和内容之间裂开一条大缝，视线得先跨过空白才找到第一行。
+/* 很窄的窗口：侧栏收成一列图标，标签隐去。总比把内容挤没了强。 */
+@media (max-width: 720px) {
+  .feature-panel__main { grid-template-columns: 56px minmax(0, 1fr); }
+  .feature-panel__tabs { padding: 10px 6px; }
+  .feature-tab { justify-content: center; padding: 0; }
+  .feature-tab span { display: none; }
+  .feature-tab__group { display: none; }
+}
+/* 内容列封顶并**居中**。全屏之后内容区能有两千像素宽，左对齐时右边会空掉一大片。
    min(…,100%) 是为了窄窗口下不出横向滚动条。 */
-.feature-panel__body > * { max-width: min(820px, 100%); }
+.feature-panel__body > * {
+  max-width: min(820px, 100%);
+  margin-left: auto;
+  margin-right: auto;
+}
 .feature-panel__tabs {
   padding: 10px 10px 16px;
   border-right: 1px solid var(--feature-border);
@@ -11188,7 +11201,8 @@ button.agent-plan__fold--toggle:focus-visible { outline: 2px solid #1a73e8; outl
   --atc-border: var(--feature-border);
   min-width: 0;
   overflow: auto;
-  padding: 32px 40px 56px;
+  /* 内边距跟着窗口走：写死 40px 时，窗口一窄内容就贴边，⌘+ 放大后又显得局促。 */
+  padding: clamp(20px, 2.6vh, 34px) clamp(16px, 3vw, 44px) 56px;
   background: var(--feature-bg);
 }
 /* 内容栏封顶。面板本身可以宽到 1080px，但一行设置横跨那么宽之后，左边的标题和右边的

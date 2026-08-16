@@ -2201,8 +2201,14 @@ test("advanced tools panel exposes Settings Growth Adaptive and Shortcuts", () =
     "浅色令牌不全——侧栏底色和选中色都得有自己的令牌");
   assert.match(APP_CSS, /:root\[data-theme="dark"\] \.feature-panel\s*\{[\s\S]{0,260}--feature-sheet:\s*#18181b;[\s\S]{0,700}--feature-sel:/,
     "深色令牌不全");
-  assert.match(APP_CSS, /\.feature-panel__main\s*\{[^}]*grid-template-columns:\s*236px minmax\(0,\s*1fr\);/,
-    "Advanced Tools should use a JetBrains-style left navigation rail");
+  // 侧栏宽度从写死 236px 改成 clamp(172px, 18vw, 236px)：写死时窗口一窄、或者 ⌘+ 放大
+  // 之后，它会把右边内容挤成一条细缝。断言改成"有一条独立的左侧导航栏且宽度是收放的"，
+  // 而不是钉某个像素值——钉像素值正是上一版拦住这次改进的原因。
+  assert.match(APP_CSS, /\.feature-panel__main\s*\{[^}]*grid-template-columns:\s*clamp\([^)]*\) minmax\(0,\s*1fr\);/,
+    "左侧导航栏没了，或者宽度又被写死成一个像素值");
+  // 内容列必须居中：全屏之后内容区能有两千像素宽，左对齐会空掉右边一大片。
+  assert.match(APP_CSS, /\.feature-panel__body > \*\s*\{[^}]*margin-left:\s*auto;[\s\S]{0,60}margin-right:\s*auto;/,
+    "内容列没有水平居中");
   // 侧栏选中态是**柔和灰底**，不是蓝块。用户明确否掉过蓝色那版。
   // 断言背景走 --feature-sel 而不是 --feature-active：后者是焦点/选中语义色，
   // 输入框焦点环、快捷键徽标、主题卡都在吃它，拿它当侧栏底色会一次抹掉整套焦点语义。
