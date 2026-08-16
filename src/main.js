@@ -66271,6 +66271,11 @@ function _syncAssistantToggleBtn() {
   btn.classList.toggle("is-off", !open);
   btn.setAttribute("aria-pressed", open ? "true" : "false");
   btn.title = t(open ? "menu.closeAssistant" : "menu.openAssistant");
+  // 换的是**图标本身**，不是给同一个图标改个颜色：同一副几何、只差右段填不填
+  // （实心＝面板在，空框＝已收起）。只换颜色的话，光看图标判断不出当前是开是关，
+  // 得先记住"亮的是开还是关"——那不叫状态指示。
+  const icon = $("toggleAssistantIcon");
+  if (icon) icon.setAttribute("href", open ? "#i-sidebar-right-on" : "#i-sidebar-right");
 }
 _restorePaneState();
 _syncAssistantToggleBtn();

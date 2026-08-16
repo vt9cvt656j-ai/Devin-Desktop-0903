@@ -1007,9 +1007,16 @@ test("AI 助手开关：按钮、面板、分隔条、落盘、开机还原，�
   assert.ok(btnAt < dbgAt, "按钮跑到调试图标右边去了");
   // 用仓库里已有的 i-sidebar-right（就是标准的 panel-right 几何：外框 + 一条竖分隔），
   // 视图菜单里那条同功能的项用的也是它。另画一个新图标只会让同一个动作有两种长相。
-  assert.match(shell.slice(btnAt, btnAt + 300), /#i-sidebar-right/, "按钮没用面板图标");
-  assert.match(readFileSync(join(HERE, "../index.html"), "utf8"), /<symbol id="i-sidebar-right"/,
-    "图标 symbol 没定义，按钮会画成一个空白方块");
+  assert.match(shell.slice(btnAt, btnAt + 300), /#i-sidebar-right-on/, "按钮没用面板图标");
+  const html = readFileSync(join(HERE, "../index.html"), "utf8");
+  // 两个状态是**两个图标**，同一副几何、只差右段填不填（实心＝面板在，空框＝已收起）。
+  // 同一个图标只换颜色的话，光看图标判断不出当前是开是关——得先记住"亮的是开还是关"，
+  // 那就不叫状态指示了。
+  for (const sym of ["i-sidebar-right", "i-sidebar-right-on"]) {
+    assert.match(html, new RegExp(`<symbol id="${sym}"`), `${sym} 没定义，按钮会画成空白方块`);
+  }
+  assert.match(SRC, /icon\.setAttribute\("href", open \? "#i-sidebar-right-on" : "#i-sidebar-right"\)/,
+    "切换时没换图标，两个状态长得一模一样");
   // 图标要和右边那几个一样大。尺寸规则是 `.titlebar__action-group .tbtn--icon .ic`
   // （20px）；按钮放在 action-group 外面就只能拿到通用的 16px，肉眼一眼看得出小一圈。
   const groupAt = shell.lastIndexOf("titlebar__action-group", btnAt);
