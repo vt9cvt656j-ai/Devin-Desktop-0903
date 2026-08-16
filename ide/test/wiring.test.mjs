@@ -1114,3 +1114,26 @@ test("设置面板的下拉必须是自绘组件：菜单在控件正下方、�
   assert.match(css, /\.settings-row__control > \.settings-toggle\s*\{[^}]*flex:\s*0 0 42px/,
     "开关被拉宽了");
 });
+
+test("数字设置项要有自绘步进器，而不是一个裸文本框", () => {
+  // 之前为了去掉 macOS 那个系统步进器，把 <input type=number> 的原生箭头藏了——
+  // 连带把"这个值可以加减"的提示也一起拿掉了，剩一个看不出能干嘛的文本框。
+  const css = readFileSync(join(HERE, "../src/styles/app.css"), "utf8");
+  assert.match(SRC, /function buildNumberControl\(/, "步进器组件没了");
+  const bc = SRC.slice(SRC.indexOf("function buildSettingControl"));
+  assert.match(bc.slice(0, 900), /buildNumberControl\(/, "数字设置项没用步进器");
+
+  // 中间必须还是真的 number 输入框：键入、↑/↓、读屏器的数值语义都靠它。
+  const nc = SRC.slice(SRC.indexOf("function buildNumberControl"));
+  const body = nc.slice(0, nc.indexOf("\n}\n") + 3);
+  assert.match(body, /inp\.type = "number"/, "中间不是真的数字输入框，键盘和读屏器会失去数值语义");
+  // 到头置灰，否则用户会对着一个点了没反应的按钮反复点。
+  assert.match(body, /dec\.disabled = v <= min/, "减到下限没置灰");
+  assert.match(body, /inc\.disabled = v >= max/, "加到上限没置灰");
+  // 越界要钳住，不能靠 UI 拦——用户可以直接把数字键进去。
+  assert.match(body, /Math\.min\(max, Math\.max\(min,/, "直接键入的值没有钳位");
+
+  // 外观上和下拉框共用同一套边框/圆角/高度，否则同一行里两种控件长相不一。
+  assert.match(css, /\.mnum\s*\{[^}]*height:\s*32px/, "步进器高度和下拉框对不上");
+  assert.match(css, /\.mnum\s*\{[^}]*border-radius:\s*var\(--feature-radius-control/, "圆角和下拉框对不上");
+});

@@ -12040,7 +12040,7 @@ textarea.settings-input {
 .settings-input--num::-webkit-outer-spin-button,
 .settings-input--num::-webkit-inner-spin-button { -webkit-appearance: none; margin: 0; }
 .settings-input--num { -moz-appearance: textfield; appearance: textfield; text-align: right; }
-.settings-row__control > .settings-input--num { flex: 0 0 88px; width: 88px; }
+.settings-row__control > .mnum { flex: 0 0 116px; }
 .settings-toggle {
   position: relative;
   width: 42px;
@@ -14867,3 +14867,58 @@ body.tree-selecting, body.tree-selecting * { user-select: none !important; -webk
 .mselect__opt.is-on { font-weight: 600; }
 /* 当前值再加一个勾，光靠字重在长列表里不够显眼。 */
 .mselect__opt.is-on::after { content: "✓"; float: right; opacity: .55; }
+
+/* ---- 数字步进器 ----
+   和下拉框共用同一套边框/圆角/高度；加减是自绘按钮，不是 macOS 那个系统步进器。
+   中间是真的 <input type="number">，键入、↑/↓、读屏器的数值语义都还在。 */
+.mnum {
+  display: flex;
+  align-items: center;
+  height: 32px;
+  overflow: hidden;
+  background: var(--feature-control, var(--editor-bg, #fff));
+  border: 1px solid var(--feature-border-strong, var(--line-strong));
+  border-radius: var(--feature-radius-control, 8px);
+  transition: border-color .15s ease, box-shadow .15s ease;
+}
+.mnum:hover { border-color: var(--feature-border-strong, var(--line-strong)); }
+.mnum:focus-within {
+  box-shadow: 0 0 0 3px var(--feature-ring, rgba(0, 0, 0, .13));
+}
+.mnum__step {
+  flex: none;
+  width: 30px;
+  height: 100%;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-family: var(--font);
+  font-size: 15px;
+  line-height: 1;
+  color: var(--feature-dim, var(--text-dim));
+  background: transparent;
+  border: 0;
+  cursor: pointer;
+}
+.mnum__step:hover:not(:disabled) { background: var(--feature-hover); color: var(--feature-text, var(--text)); }
+/* 到头就置灰，省得对着一个点了没反应的按钮反复点。 */
+.mnum__step:disabled { opacity: .3; cursor: default; }
+.mnum__input {
+  flex: 1 1 auto;
+  width: 100%;
+  min-width: 0;
+  height: 100%;
+  padding: 0;
+  font-family: var(--font);
+  font-size: 13px;
+  font-variant-numeric: tabular-nums;
+  text-align: center;
+  color: var(--feature-text, var(--text));
+  background: transparent;
+  border: 0;
+  outline: none;
+  -moz-appearance: textfield;
+  appearance: textfield;
+}
+.mnum__input::-webkit-outer-spin-button,
+.mnum__input::-webkit-inner-spin-button { -webkit-appearance: none; margin: 0; }
