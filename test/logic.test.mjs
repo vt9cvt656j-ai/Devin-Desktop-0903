@@ -2242,8 +2242,21 @@ test("advanced tools panel exposes Settings Growth Adaptive and Shortcuts", () =
     "Settings rows should use the larger Google/JB card surface");
   assert.match(APP_CSS, /textarea\.settings-input\s*\{[^}]*min-height:\s*116px;[\s\S]*resize:\s*vertical;/,
     "Adaptive preference notes should use a proper multiline settings control");
-  assert.match(APP_CSS, /\.shortcut-row\s*\{[^}]*min-height:\s*48px;[\s\S]*background:\s*var\(--feature-card/,
-    "Shortcut rows should match the Advanced Tools card surface");
+  // 这条原来写的是 `min-height:48px [\s\S]* background: var(--feature-card`——中间那个
+  // 贪婪通配跨越整份 CSS，只要**文件里任何一处**后面有 --feature-card 就算通过，
+  // 等于没断言。改成钉真正的形态：整份列表拼成一张卡，行之间用发丝线。
+  assert.match(APP_CSS, /\.shortcuts-list\s*\{[^}]*background:\s*var\(--feature-card/,
+    "快捷键列表不是一张卡了");
+  assert.match(APP_CSS, /\.shortcut-row \+ \.shortcut-row\s*\{[^}]*border-top/,
+    "行之间没有发丝线，十几条会糊成一坨");
+  assert.match(APP_CSS, /\.shortcut-row\s*\{[^}]*min-height:\s*48px/,
+    "行高变了");
+  // 键帽和「修改」各占固定轨道：组合键长短不一（⌘O 两个键、⌘⇧E 三个键），
+  // 不定宽的话每一行的按钮都会左右浮动。
+  assert.match(APP_CSS, /\.shortcut-row__keys\s*\{[^}]*flex:\s*0 0 128px/,
+    "键帽列没定宽，各行的修改按钮会错开");
+  assert.match(APP_CSS, /\.shortcut-row__change\s*\{[^}]*flex:\s*0 0 64px/,
+    "修改按钮没定宽，录制时文案一变会把键帽整排推走");
   assert.match(INDEX_HTML, /<symbol id="i-adaptive"[\s\S]{0,520}stroke-width="1\.75"/,
     "Adaptive tab should have its own first-party SVG icon");
   assert.match(INDEX_HTML, /<symbol id="i-skills"[\s\S]{0,260}M12 6\.5C10\.5 5\.3 8\.6 5 6\.5 5H3v12\.5/,
