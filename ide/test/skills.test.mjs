@@ -61,10 +61,10 @@ test("目录只放 name + description，不放正文——正文贵 34 倍", () 
   assert.match(out, /UI\/UX design intelligence/);
 });
 
-test("已启用的技能在目录里标出来，免得模型再去读一遍它已经拿到的东西", () => {
+test("常驻技能在目录里标出来，免得模型再去读一遍它已经拿到的东西", () => {
   const out = catalog(["file:/s/b/SKILL.md"]);
-  assert.match(out, /systematic-debugging（已启用）/);
-  assert.ok(!/ui-ux-pro-max（已启用）/.test(out), "没启用的不该带这个标记");
+  assert.match(out, /systematic-debugging（常驻）/);
+  assert.ok(!/ui-ux-pro-max（常驻）/.test(out), "没常驻的不该带这个标记");
 });
 
 test("没写 description 的技能也列出来，不能因为缺字段就从清单里消失", () => {
@@ -146,15 +146,15 @@ test("技能被截断时要指出完整内容怎么取，不能只说一句「�
   assert.match(block, /ui-ux-pro-max/);
 });
 
-test("组合块 = 目录 + 已启用全文，两个注入点用的都是它", () => {
+test("组合块 = 目录 + 常驻全文，两个注入点用的都是它", () => {
   assert.match(SRC, /function _skillsSystemBlock\(\) \{\s*return _skillCatalogBlock\(\) \+ _activeSkillsBlock\(\);/);
   assert.match(SRC, /run\?\.skillsBlock \?\? _skillsSystemBlock\(\)/);
 });
 
-test("聊天模式只给已启用技能的正文，不给指向 read_skill 的目录", () => {
+test("聊天模式只给常驻技能的正文，不给指向 read_skill 的目录", () => {
   // 聊天那条路径不执行工具：模型吐出来的调用会被当成 [TOOL:…] 文本渲染掉。
   // 给它一份写着「需要哪个就用 read_skill 读」的目录，等于指着一条死路。
-  // 已启用技能的正文不需要任何工具，所以照给。
+  // 常驻技能的正文不需要任何工具，所以照给。
   assert.match(SRC, /const skillsBlock = _agentLightTurn \? "" : \(effectiveMode === "chat" \? _activeSkillsBlock\(\) : _skillsSystemBlock\(\)\)/,
     "聊天模式还在收整份技能目录");
 });

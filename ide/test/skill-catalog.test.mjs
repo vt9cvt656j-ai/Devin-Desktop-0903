@@ -73,7 +73,7 @@ test("列出来的每一个，都必须能被 read_skill 按名字取到", () =>
   ];
   const out = catalogWith(all);
   for (const line of out.split("\n").filter((l) => l.startsWith("- "))) {
-    const name = line.slice(2).split("：")[0].replace("（已启用）", "");
+    const name = line.slice(2).split("：")[0].replace("（常驻）", "");
     assert.ok(findByName(all, name), `清单里有「${name}」，read_skill 却找不到它`);
   }
 });
@@ -107,9 +107,9 @@ test("没有技能时返回空串，不占提示词", () => {
   assert.equal(catalogWith([]), "");
 });
 
-test("已启用的技能仍然带标记，且不重复给全文", () => {
+test("常驻技能仍然带标记，且不重复给全文", () => {
   const out = catalogWith([skill("a", "ui-ux-pro-max", "设计")], new Set(["ui-ux-pro-max"]));
-  assert.match(out, /ui-ux-pro-max（已启用）/);
+  assert.match(out, /ui-ux-pro-max（常驻）/);
 });
 
 test("输出稳定：同样的输入两次调用逐字节相同", () => {
@@ -212,4 +212,44 @@ test("技能正文进模型时剥掉 frontmatter，且开关的名字要说实�
   assert.match(row.slice(0, 700), /已常驻/, "气泡没说清它做了什么");
   assert.match(row.slice(0, 700), /模型仍可按需自行读取/,
     "取消常驻的气泡必须说清「它还在」，否则用户以为技能被关掉了");
+});
+
+test("「常驻」这个词在四个地方必须是同一个词——它们互相引用", () => {
+  /*
+   * 这不是文案洁癖，是一条真的交叉引用：
+   *
+   *   ① 技能清单给每个常驻技能打一个标记 `（常驻）`
+   *   ② read_skill 的工具描述里写着「标着 X 的正文已经在系统提示词里，别重读」
+   *   ③ 同一份描述在网关的 prompts/tools.json 里还有一份，而**运行时是网关那份说了算**
+   *   ④ 界面上给用户看的也是同一个词
+   *
+   * ① 和 ② 用词不一致，模型就对不上号：它照着描述去找「已启用」，清单里写的是
+   * 「常驻」，于是那条规则整条落空——每轮都把已经在上下文里的全文再 read_skill 读一遍。
+   * ② 和 ③ 不一致更隐蔽：改了源码、跑起来没变化，因为模型读的根本是另一份。
+   */
+  const catalogMark = /_isSkillActive\(s\) \? "（常驻）"/;
+  assert.match(SRC, catalogMark, "技能清单里的常驻标记被改了");
+  assert.match(SRC, /标着「常驻」的/, "清单抬头对这个标记的解释和标记本身对不上");
+
+  const readSkillDesc = SRC.slice(SRC.indexOf('name: "read_skill"'), SRC.indexOf('name: "read_skill"') + 1200);
+  assert.match(readSkillDesc, /already marked 常驻/,
+    "read_skill 的描述引用的标记和清单里打的不是同一个词——那条「别重读」的规则会整条落空");
+
+  const gateway = JSON.parse(readFileSync(join(HERE, "..", "..", "server", "prompts", "tools.json"), "utf8"));
+  const gwDesc = gateway.find((t) => t?.function?.name === "read_skill")?.function?.description || "";
+  assert.ok(gwDesc, "网关目录里没有 read_skill");
+  assert.match(gwDesc, /already marked 常驻/,
+    "网关那份还写着旧词——运行时用的是它，改源码等于没改");
+});
+
+test("界面上不再有任何「启用 / 未启用」的说法", () => {
+  // 技能从来没被"关"过：清单里的名称和描述始终在上下文里，模型随时能 read_skill 读它。
+  // 「未启用」尤其糟——它是常驻显示在卡片上的**状态标签**，用户读到的是"这个技能是
+  // 关着的"，于是他以为点一下就能停掉某个技能，实际什么都没停。
+  const skillsPage = SRC.slice(SRC.indexOf('<h3>Skills 技能</h3>'), SRC.indexOf('<h3>Skills 技能</h3>') + 40000);
+  for (const stale of ['"未启用"', '"已启用"', '保存并启用', '默认启用到模型请求里']) {
+    assert.ok(!skillsPage.includes(stale), `设置面板的 Skills 页还留着「${stale}」`);
+  }
+  assert.match(skillsPage, /on \? "常驻" : "按需"/, "状态标签没改成说实话的那个");
+  assert.match(skillsPage, /on \? "已常驻" : "设为常驻"/, "切换按钮还在说「启用」");
 });
