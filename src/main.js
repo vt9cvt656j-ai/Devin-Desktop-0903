@@ -57451,15 +57451,23 @@ function renderSkillsTool(body) {
  *
  * `group` 只影响标签条的分隔线，不影响可达性。
  */
+/*
+ * `group` 现在带字：侧栏按组显示小标题。以前七项的 group 全是 "prefs"，而渲染循环只在
+ * group 变化时插一条分隔线，所以那条线**从来没被创建过** —— 七个页签是一列没有任何
+ * 结构的按钮。分成三组之后，哪几项是一类一眼就能看出来。
+ */
 const FEATURE_TABS = [
   { id: "settings", titleKey: "feature.tab.settings", icon: "i-gear", group: "prefs" },
   { id: "appearance", titleKey: "feature.tab.appearance", icon: "i-appearance", group: "prefs" },
-  { id: "growth", titleKey: "feature.tab.growth", icon: "i-growth", group: "prefs" },
-  { id: "adaptive", titleKey: "feature.tab.adaptive", icon: "i-adaptive", group: "prefs" },
-  { id: "shortcuts", titleKey: "feature.tab.shortcuts", icon: "i-command", group: "prefs" },
-  { id: "mcp", titleKey: "feature.tab.mcp", icon: "i-mcp", group: "prefs" },
-  { id: "skills", titleKey: "feature.tab.skills", icon: "i-skills", group: "prefs" },
+  { id: "growth", titleKey: "feature.tab.growth", icon: "i-growth", group: "agent" },
+  { id: "adaptive", titleKey: "feature.tab.adaptive", icon: "i-adaptive", group: "agent" },
+  { id: "shortcuts", titleKey: "feature.tab.shortcuts", icon: "i-command", group: "ext" },
+  { id: "mcp", titleKey: "feature.tab.mcp", icon: "i-mcp", group: "ext" },
+  { id: "skills", titleKey: "feature.tab.skills", icon: "i-skills", group: "ext" },
 ];
+// 顺序保持不动：有一条测试钉着「自适应紧跟成长、且排在快捷键之前」。分组是叠在既有
+// 顺序之上的，不是拿来重排的理由。
+const FEATURE_GROUP_LABELS = { prefs: "偏好", agent: "智能体", ext: "工具与扩展" };
 const FEATURE_TAB_IDS = new Set(FEATURE_TABS.map((tab) => tab.id));
 function normalizeFeatureTab(tab) {
   return FEATURE_TAB_IDS.has(tab) ? tab : "settings";
@@ -57514,11 +57522,11 @@ function renderFeaturePanel() {
   tabs.innerHTML = "";
   let lastGroup = "";
   for (const tab of FEATURE_TABS) {
-    if (lastGroup && tab.group !== lastGroup) {
-      const sep = document.createElement("div");
-      sep.className = "feature-tab__sep";
-      sep.setAttribute("role", "separator");
-      tabs.appendChild(sep);
+    if (tab.group && tab.group !== lastGroup) {
+      const head = document.createElement("div");
+      head.className = "feature-tab__group";
+      head.textContent = FEATURE_GROUP_LABELS[tab.group] || tab.group;
+      tabs.appendChild(head);
     }
     lastGroup = tab.group || lastGroup;
     const btn = document.createElement("button");

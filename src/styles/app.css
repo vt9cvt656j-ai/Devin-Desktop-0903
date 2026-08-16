@@ -10990,16 +10990,23 @@ button.agent-plan__fold--toggle:focus-visible { outline: 2px solid #1a73e8; outl
   --feature-sheet: #fff;
   --feature-header: #fff;
   --feature-bg: #fff;
-  --feature-rail: #fff;
+  /* 侧栏比卡片浅一档。原来两者同为 #fff，所以左边那条导航根本没有"栏"的存在感。 */
+  --feature-rail: #f7f7f8;
   --feature-card: #fff;
   --feature-control: #fff;
-  --feature-border: #dadce0;
-  --feature-border-strong: #cfd4dc;
-  --feature-text: #202124;
-  --feature-dim: #5f6368;
+  --feature-border: #e6e6e9;
+  --feature-border-strong: #d8d8dc;
+  --feature-text: #1d1d1f;
+  --feature-dim: #6b6b70;
   --feature-blue: #1a73e8;
   --feature-active: #e8f0fe;
-  --feature-hover: #eef3fb;
+  --feature-hover: rgba(0, 0, 0, .045);
+  /* 侧栏选中态**单独一个令牌**，不复用 --feature-active。后者同时是输入框焦点环、
+     快捷键徽标、主题卡选中框的颜色，把它改成灰会一次把整个面板的"焦点"语义抹掉。 */
+  --feature-sel: rgba(0, 0, 0, .07);
+  --feature-ring: rgba(0, 0, 0, .13);
+  --feature-radius-card: 12px;
+  --feature-radius-control: 8px;
   position: fixed;
   inset: 0;
   z-index: 90;
@@ -11020,15 +11027,17 @@ button.agent-plan__fold--toggle:focus-visible { outline: 2px solid #1a73e8; outl
   --feature-header: #18181b;
   --feature-bg: #101011;
   --feature-rail: #141416;
-  --feature-card: #1f1f23;
+  --feature-card: #1c1c1f;
   --feature-control: #101011;
-  --feature-border: rgba(255,255,255,.09);
+  --feature-border: rgba(255,255,255,.085);
   --feature-border-strong: rgba(255,255,255,.14);
-  --feature-text: #e8eaed;
-  --feature-dim: #9aa0a6;
+  --feature-text: #f2f2f4;
+  --feature-dim: #9a9aa0;
   --feature-blue: #8ab4f8;
   --feature-active: rgba(138,180,248,.16);
-  --feature-hover: rgba(255,255,255,.06);
+  --feature-hover: rgba(255,255,255,.055);
+  --feature-sel: rgba(255,255,255,.09);
+  --feature-ring: rgba(255,255,255,.20);
 }
 .feature-panel[hidden] { display: none; }
 .feature-panel__sheet {
@@ -11039,13 +11048,13 @@ button.agent-plan__fold--toggle:focus-visible { outline: 2px solid #1a73e8; outl
   overflow: hidden;
   color: var(--feature-text);
   background: var(--feature-sheet);
-  border: 1px solid var(--feature-border-strong);
-  border-radius: 20px;
-  box-shadow: 0 18px 44px rgba(60, 64, 67, .24), 0 2px 8px rgba(60, 64, 67, .18);
+  border: 1px solid var(--feature-border);
+  border-radius: 14px;
+  box-shadow: 0 24px 60px rgba(0, 0, 0, .16), 0 2px 6px rgba(0, 0, 0, .06);
   animation: sheet-in 0.18s cubic-bezier(0.2, 0.9, 0.3, 1) both;
 }
 .feature-panel__head {
-  height: 52px;
+  height: 56px;
   display: flex;
   align-items: center;
   justify-content: space-between;
@@ -11057,11 +11066,11 @@ button.agent-plan__fold--toggle:focus-visible { outline: 2px solid #1a73e8; outl
   display: inline-flex;
   align-items: center;
   gap: 10px;
-  font-size: 15px;
-  font-weight: 760;
+  font-size: 14px;
+  font-weight: 600;
   color: var(--feature-text);
 }
-.feature-panel__title .ic { color: var(--feature-blue); }
+.feature-panel__title .ic { color: var(--feature-dim); }
 .feature-panel__close {
   width: 34px;
   height: 34px;
@@ -11085,34 +11094,40 @@ button.agent-plan__fold--toggle:focus-visible { outline: 2px solid #1a73e8; outl
   grid-template-columns: 236px minmax(0, 1fr);
 }
 .feature-panel__tabs {
-  padding: 18px 14px;
+  padding: 10px 10px 16px;
   border-right: 1px solid var(--feature-border);
   background: var(--feature-rail);
+  overflow-y: auto;
 }
-/* 偏好设置与开发工具之间的分隔。这两组东西性质不同：上面是设置，下面是任务运行器、
-   调试器、合并冲突这类工具面板。 */
-.feature-tab__sep {
-  height: 1px;
-  margin: 6px 10px;
-  background: var(--border, rgba(255, 255, 255, 0.08));
+/* 侧栏分组小标题。原来这里是一条 .feature-tab__sep 分隔线，两个毛病：它取的
+   var(--border) 在整个仓库里根本没定义（见本文件 5253 行那段注释），永远落到
+   rgba(255,255,255,.08) 的回退值上，白底看不见；而且七个页签的 group 全是 "prefs"，
+   插线的条件永不成立。改成有字的分组标题，一眼能看出哪几项是一类。 */
+.feature-tab__group {
+  margin: 14px 8px 4px;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: .04em;
+  color: var(--feature-dim);
 }
+.feature-tab__group:first-child { margin-top: 2px; }
 
 .feature-tab {
   position: relative;
   width: 100%;
-  height: 48px;
+  height: 34px;
   display: flex;
   align-items: center;
-  gap: 13px;
-  padding: 0 15px;
-  margin-bottom: 8px;
+  gap: 10px;
+  padding: 0 10px;
+  margin-bottom: 2px;
   font-family: var(--font);
-  font-size: 14.5px;
-  font-weight: 680;
-  color: var(--feature-dim);
+  font-size: 13.5px;
+  font-weight: 500;
+  color: var(--feature-text);
   background: transparent;
   border: 1px solid transparent;
-  border-radius: 14px;
+  border-radius: 8px;
   cursor: pointer;
   text-align: left;
 }
@@ -11120,16 +11135,23 @@ button.agent-plan__fold--toggle:focus-visible { outline: 2px solid #1a73e8; outl
   background: var(--feature-hover);
   color: var(--feature-text);
 }
+/* 选中态是**柔和的灰底**，不是蓝块。蓝色在这里没有信息量：整条侧栏只有一个选中项，
+   位置本身就说明了它被选中；用主题色去喊，只会把视线从右边的内容上拽走。
+   注意背景用的是 --feature-sel 而不是 --feature-active——后者是焦点/选中语义色，
+   输入框焦点环、快捷键徽标、主题卡都在吃它。 */
 .feature-tab.is-active {
-  color: var(--feature-blue);
-  background: var(--feature-active);
+  color: var(--feature-text);
+  background: var(--feature-sel);
   border-color: transparent;
-  box-shadow: 0 1px 2px rgba(60,64,67,.08);
+  box-shadow: none;
+  font-weight: 600;
 }
 .feature-tab .ic {
-  width: 21px;
-  height: 21px;
+  width: 17px;
+  height: 17px;
+  color: var(--feature-dim);
 }
+.feature-tab.is-active .ic { color: var(--feature-text); }
 .feature-panel__body {
   --panel: var(--feature-card);
   --panel-2: var(--feature-card);
@@ -11144,21 +11166,28 @@ button.agent-plan__fold--toggle:focus-visible { outline: 2px solid #1a73e8; outl
   --atc-border: var(--feature-border);
   min-width: 0;
   overflow: auto;
-  padding: 26px 30px;
+  padding: 32px 40px 56px;
   background: var(--feature-bg);
 }
-.tool-head { margin-bottom: 22px; }
+/* 内容栏封顶。面板本身可以宽到 1080px，但一行设置横跨那么宽之后，左边的标题和右边的
+   控件之间会拉开一大片空白，眼睛得来回扫。市场页（.mcpfp）是两列网格，故意不封。 */
+.feature-panel__body > .tool-head,
+.feature-panel__body > .settings-group,
+.feature-panel__body > .tool-actions,
+.feature-panel__body > .tool-list { max-width: 760px; }
+.tool-head { margin-bottom: 28px; }
 .tool-head h2 {
   margin: 0;
-  font-size: 22px;
+  font-size: 25px;
+  font-weight: 600;
   color: var(--feature-text);
-  letter-spacing: -0.01em;
+  letter-spacing: -0.015em;
 }
 .tool-head p,
 .tool-note {
-  margin: 7px 0 0;
+  margin: 8px 0 0;
   color: var(--feature-dim);
-  font-size: 13.5px;
+  font-size: 13px;
   line-height: 1.55;
 }
 .tool-actions {
@@ -11854,25 +11883,63 @@ button.agent-plan__fold--toggle:focus-visible { outline: 2px solid #1a73e8; outl
 }
 
 /* ---- Settings panel ---- */
-.settings-group { margin-bottom: 24px; }
+.settings-group { margin-bottom: 30px; }
+/* 小节标题在卡片**外面**，小号灰字。 */
 .settings-group__title {
-  margin: 0 0 10px;
-  font-size: 12.5px;
-  font-weight: 760;
+  margin: 0 0 8px 2px;
+  font-size: 12px;
+  font-weight: 600;
   letter-spacing: 0.01em;
   color: var(--feature-dim, var(--text-dim));
 }
+/*
+ * 一组设置 = 一张卡，组内每行用发丝线分隔。
+ *
+ * 原来是每个设置项各自一张描边圆角卡、彼此隔 10px —— 一屏排下来是七八个平级的盒子，
+ * 没有层次，也看不出哪几项是一类。改成整组拼成一张卡之后，"组"才真正成为一个视觉单位。
+ *
+ * 做法是让若干 .settings-row **自己拼**出这张卡（首行圆上两角、末行圆下两角、中间的
+ * 行去掉上下边框），而不是给 .settings-group 加边框——加在组上会把 h3 小节标题一起
+ * 圈进卡里，那不是要的形态。也**不要**用 overflow:hidden 去裁圆角：输入框聚焦时是
+ * 3px 外发光，贴边的那个会被切掉一条。
+ */
 .settings-row {
+  position: relative;
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 16px;
+  gap: 20px;
   min-height: 54px;
-  padding: 13px 16px;
+  padding: 12px 16px;
   border: 1px solid var(--feature-border, var(--line));
-  border-radius: 13px;
+  border-top-width: 0;
+  border-bottom-width: 0;
+  border-radius: 0;
   background: var(--feature-card, var(--panel-2));
-  margin-bottom: 10px;
+  margin-bottom: 0;
+}
+/* :first-of-type 选的是第一个 div 子元素 —— h3 是另一种 type，所以它精确命中第一行，
+   不需要为此改 DOM。 */
+.settings-group > .settings-row:first-of-type {
+  border-top-width: 1px;
+  border-radius: var(--feature-radius-card, 12px) var(--feature-radius-card, 12px) 0 0;
+}
+.settings-group > .settings-row:last-child {
+  border-bottom-width: 1px;
+  border-radius: 0 0 var(--feature-radius-card, 12px) var(--feature-radius-card, 12px);
+}
+.settings-group > .settings-row:first-of-type:last-child {
+  border-radius: var(--feature-radius-card, 12px);
+}
+/* 行间发丝线。左端从文字位置起（iOS 那种缩进写法），而不是整条通到底。 */
+.settings-group > .settings-row + .settings-row::before {
+  content: "";
+  position: absolute;
+  top: 0;
+  left: 16px;
+  right: 0;
+  height: 1px;
+  background: var(--feature-border, var(--line));
 }
 .settings-row__meta {
   display: flex;
@@ -11880,29 +11947,31 @@ button.agent-plan__fold--toggle:focus-visible { outline: 2px solid #1a73e8; outl
   gap: 2px;
   min-width: 0;
 }
-.settings-row__label { font-size: 14px; font-weight: 680; color: var(--feature-text, var(--text)); }
-.settings-row__hint { font-size: 12px; color: var(--feature-dim, var(--text-dim)); }
+.settings-row__label { font-size: 13.5px; font-weight: 550; color: var(--feature-text, var(--text)); }
+.settings-row__hint { font-size: 12px; line-height: 1.45; color: var(--feature-dim, var(--text-dim)); }
 .settings-row__control { flex-shrink: 0; }
 .settings-row--stack {
   align-items: stretch;
   flex-direction: column;
+  gap: 10px;
+  padding: 14px 16px 16px;
 }
 .settings-row--stack .settings-row__control {
   width: 100%;
 }
 .settings-input {
-  height: 34px;
-  padding: 0 12px;
+  height: 32px;
+  padding: 0 11px;
   font-family: var(--font);
-  font-size: 13.5px;
+  font-size: 13px;
   color: var(--feature-text, var(--text));
   background: var(--feature-control, var(--editor-bg, #fff));
   border: 1px solid var(--feature-border-strong, var(--line-strong));
-  border-radius: 10px;
+  border-radius: var(--feature-radius-control, 8px);
   outline: none;
   transition: border-color 0.15s ease, box-shadow 0.15s ease;
 }
-.settings-input:focus { border-color: var(--feature-blue, var(--accent)); box-shadow: 0 0 0 3px var(--feature-active, var(--sel)); }
+.settings-input:focus { border-color: var(--feature-border-strong, var(--line-strong)); box-shadow: 0 0 0 3px var(--feature-ring, rgba(0,0,0,.13)); }
 .settings-input--num { width: 84px; }
 .settings-input--text { width: 260px; max-width: 40vw; }
 textarea.settings-input {
@@ -11938,7 +12007,7 @@ select.settings-input { cursor: pointer; padding-right: 8px; }
   transition: transform 0.18s ease;
 }
 .settings-toggle.is-on .settings-toggle__knob { transform: translateX(18px); }
-.settings-actions { margin-top: 14px; }
+.settings-actions { margin-top: 18px; }
 
 /* ---- Appearance theme picker ---- */
 .appearance-theme-grid {
