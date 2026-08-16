@@ -1249,3 +1249,33 @@ test("快捷键表要覆盖真正生效的键，且每个动作都得有实现",
   assert.match(defBlock, /mac \? "mod\+\." : "mod\+shift\+v"/, "Markdown 预览没有分平台");
   assert.match(defBlock, /mac \? "mod\+backspace" : "delete"/, "删除键没有分平台");
 });
+
+test("MCP 页：已停用排在已装服务之后，卡片不靠整块染色表达状态", () => {
+  const css = readFileSync(join(HERE, "../src/styles/app.css"), "utf8");
+  // 一进 MCP 页第一眼该看到正在跑的服务。已停用是补救入口，不是主角。
+  const at = SRC.indexOf("installedEl.innerHTML = brokenBanner + installedNames.map");
+  assert.notEqual(at, -1, "已装服务列表的拼装变了");
+  const stmt = SRC.slice(at, at + 6000);
+  const joinAt = stmt.indexOf('}).join("")');
+  assert.notEqual(joinAt, -1, "已装列表的收尾没了");
+  assert.match(stmt.slice(joinAt, joinAt + 40), /\}\)\.join\(""\) \+ disabledRows/,
+    "已停用又跑到已装服务前面去了");
+
+  // 状态不靠整张卡染色。一屏七八张卡各有底色时页面像打翻调色盘，而且"绿底"和"选中"
+  // 在这个面板别处是两个意思。
+  const at2 = css.indexOf(".feature-panel__body .mcpfp-card--installed.is-on");
+  assert.notEqual(at2, -1, "卡片状态色的统一规则没了");
+  assert.match(css.slice(at2, at2 + 400), /background:\s*var\(--feature-card\)/,
+    "卡片又按状态染整块底色了");
+  // 状态徽标走语义令牌，深浅两套自动跟着变——原来是写死的 #34a853 / #d93025 那一套。
+  // 选择器是个分组（… .is-on, … .mcpfp-badge--count { ），不能假设 `{` 紧跟其后。
+  const okAt = css.indexOf(".feature-panel__body .mcpfp-row__status.is-on");
+  assert.notEqual(okAt, -1, "状态徽标的规则没了");
+  assert.match(css.slice(okAt, css.indexOf("}", okAt)), /var\(--feature-ok\)/,
+    "状态徽标没走语义令牌，深色下不会跟着变");
+  // 「安装」不再是整块实心主色。
+  const btnAt = css.indexOf(".feature-panel__body .ctp-btn--primary");
+  assert.notEqual(btnAt, -1, "市场里的主按钮没收进面板的按钮语言");
+  assert.match(css.slice(btnAt, css.indexOf("}", btnAt)), /background:\s*var\(--feature-control\)/,
+    "主按钮还是整块实心主色");
+});
