@@ -12881,43 +12881,128 @@ function _modelPowerToggleHtml(m) {
     + `<path d="M13 2 4.5 13.5H11l-1 8.5 8.5-11.5H12z" /></svg></button>`;
 }
 
+/**
+ * 卡片里的档位滑块。上下文和思考深度共用一个——两者都是**有序**的档位，
+ * 分段按钮把这层顺序丢掉了，滑块正好把它画出来。
+ *
+ * 用原生 <input type="range"> 而不是自己拿 div 拼一个：键盘（左右箭头/Home/End）、
+ * 触控板、读屏器全都是白送的，自己拼一律要重写一遍，而且多半重写不全。
+ * 轨道自己画（rail/lock/fill 三层绝对定位），因为 range 的原生轨道在
+ * 各引擎里能改的东西不一样，而这里要的是「已选段渐变 + 未解锁段另一种颜色」。
+ *
+ * `locked`：档位存在但当前会员档买不到。它照样占一个刻度（藏起来会让人以为没有
+ * 这个档），拖到那儿会弹回最高可选档并给一句提示。
+ */
+function _micSliderHtml(cfg) {
+  const opts = cfg.options || [];
+  if (!opts.length) return "";
+  const idx = Math.max(0, Math.min(opts.length - 1, Number(cfg.index) || 0));
+  const last = Math.max(1, opts.length - 1);
+  // 最后一个可选档的位置：它右边那段轨道画成"买不到"的颜色。
+  let lastOpen = -1;
+  opts.forEach((o, i) => { if (!o.locked) lastOpen = i; });
+  const pct = (i) => `${(i / last) * 100}%`;
+  const ticks = opts
+    .map((o, i) => `<i class="mic-sl__tick${o.locked ? " is-locked" : ""}${i <= idx ? " is-done" : ""}"`
+      + ` style="left:${pct(i)}"></i>`)
+    .join("");
+  const cur = opts[idx] || {};
+  return `<div class="mic-sl" data-sl="${_escAttr(cfg.kind || "")}">`
+    + `<div class="mic-sl__head"><span class="mic-sl__label">${_escHtml(cfg.title || "")}</span>`
+    + `<span class="mic-sl__val">${_escHtml(cur.valueLabel || cur.label || "")}</span></div>`
+    + `<div class="mic-sl__track">`
+    + `<i class="mic-sl__rail"></i>`
+    + (lastOpen >= 0 && lastOpen < last
+        ? `<i class="mic-sl__lock" style="left:${pct(lastOpen)}"></i>` : "")
+    + `<i class="mic-sl__fill" style="width:${pct(idx)}"></i>`
+    + ticks
+    + `<input type="range" class="mic-sl__input" min="0" max="${last}" step="1" value="${idx}"`
+    + ` aria-label="${_escAttr(cfg.title || "")}"`
+    + ` aria-valuetext="${_escAttr(cur.valueLabel || cur.label || "")}"`
+    + ` data-sl-max-open="${lastOpen}">`
+    + `</div>`
+    + `<div class="mic-sl__ends"><span>${_escHtml(opts[0].label || "")}</span>`
+    + `<span>${_escHtml(opts[opts.length - 1].label || "")}</span></div>`
+    + (cur.caption ? `<div class="mic-sl__cap">${_escHtml(cur.caption)}</div>` : "")
+    + `</div>`;
+}
+
+/**
+ * 滑块拖到哪一档就把哪一档写进去，并就地更新轨道和读数。
+ *
+ * **不重新渲染整张卡片**：分段按钮时代每点一次就 showModelInfoCard() 重画一遍，
+ * 那对滑块是致命的——重画会把正在被拖动的那个 input 换成新节点，指针立刻丢掉目标，
+ * 拖到一半就断。所以这里只改该动的那几个属性。
+ */
+function _bindMicSlider(root, onPick) {
+  const input = root.querySelector(".mic-sl__input");
+  if (!input) return;
+  const fill = root.querySelector(".mic-sl__fill");
+  const val = root.querySelector(".mic-sl__val");
+  const cap = root.querySelector(".mic-sl__cap");
+  const ticks = [...root.querySelectorAll(".mic-sl__tick")];
+  const last = Math.max(1, Number(input.max) || 1);
+  const apply = (i, res) => {
+    if (fill) fill.style.width = `${(i / last) * 100}%`;
+    ticks.forEach((t, n) => t.classList.toggle("is-done", n <= i));
+    if (val && res?.valueLabel) val.textContent = res.valueLabel;
+    if (res?.valueLabel) input.setAttribute("aria-valuetext", res.valueLabel);
+    if (cap) cap.textContent = res?.caption || "";
+  };
+  const onMove = (ev) => {
+    ev.stopPropagation();
+    const want = Number(input.value) || 0;
+    const res = onPick(want) || {};
+    // 买不到的档位：弹回最高可选档，并说清为什么。静默钉住会让人以为滑块坏了。
+    const at = Number.isInteger(res.index) ? res.index : want;
+    if (at !== want) input.value = String(at);
+    apply(at, res);
+  };
+  input.addEventListener("input", onMove);
+  input.addEventListener("change", onMove);
+  input.addEventListener("click", (ev) => ev.stopPropagation());
+}
+
+/**
+ * 上下文滑块的档位表。渲染和拖动处理**必须**读同一份，否则拖到第 n 格写进去的
+ * 会是另一张表的第 n 格 —— 这类错位不报错，只是默默存错档位。
+ */
+function _modelContextChoices(id) {
+  const native = _modelContextLimit(id);
+  if (!native) return [];
+  const out = _modelMaxOutput(id);
+  return _ctxChoiceOptions(id)
+    .slice()
+    .sort((a, b) => a.value - b.value || (a.kind === "native" ? -1 : 1))
+    .map((o) => ({
+      ...o,
+      label: _tokenShort(o.value),
+      valueLabel: _tokenShort(o.value),
+      caption: o.locked
+        ? o.lockHint
+        : (o.kind === "native"
+            ? `模型原生窗口${o.beta ? ` · 需上游 beta：${o.beta}` : ""}`
+            : `原生 ${_tokenShort(native)} + ${o.tier} 档`)
+          + (out > 0 ? ` · 单次输出上限 ${_tokenShort(out)}` : ""),
+    }));
+}
+
 function _modelContextRows(m) {
   const id = m?.id || "";
   const native = _modelContextLimit(id);
   if (!native) return "";
   const eff = _effectiveContextLimit(id);
-  const opts = _ctxChoiceOptions(id);
-  // The native button is active when the effective window equals native; otherwise the
-  // matching tier button is. Checked in order so native wins a value tie (native ≥ tier).
-  let activeMarked = false;
-  const btns = opts.map((o) => {
-    const active = !activeMarked && o.value === eff && !(o.locked);
-    if (active) activeMarked = true;
-    const cls = "mic-think-btn" + (active ? " is-active" : "")
-      + (o.locked ? " mic-ctx-btn--locked" : "");
-    const tip = o.locked ? o.lockHint
-      : (o.native
-          ? `${_tokenExact(o.value)} tokens（模型原生窗口）${o.beta ? `\n需上游 beta：${o.beta}（账号档位不够时上游会拒绝）` : ""}`
-          : `${o.lockHint} · ${_tokenExact(o.value)} tokens`);
-    return { kind: o.kind || (o.native ? "native" : "modified"),
-      html: `<button type="button" class="${cls}" data-ctx="${o.value}" data-ctx-kind="${o.kind || (o.native ? "native" : "modified")}"${o.locked ? ' data-locked="1"' : ""} title="${_escAttr(tip)}">${_escHtml(o.label)}</button>` };
-  });
-  // Two numbers, not one. The window is how much the model READS; the ceiling is how much it
-  // WRITES, and the catalogue carried only the first — which is how a blanket ceiling ended up
-  // being sent to every model regardless of what each one can actually produce. A route that does
-  // not report the ceiling says nothing rather than having one invented for it.
-  const out = _modelMaxOutput(id);
-  const hint = `当前生效：${_tokenShort(eff)}（${_tokenExact(eff)} tokens）`
-    + (out > 0 ? ` · 单次输出上限 ${_tokenShort(out)}` : "");
-  const nativeBtns = btns.filter((b) => b.kind === "native").map((b) => b.html).join("");
-  const modBtns = btns.filter((b) => b.kind !== "native").map((b) => b.html).join("");
-  return '<div class="mic-plabel">原生上下文</div>' +
-    `<div class="mic-think-row">${nativeBtns}</div>` +
-    (modBtns
-      ? '<div class="mic-plabel mic-plabel--sub">修改上下文</div>'
-        + `<div class="mic-think-row">${modBtns}</div>`
-      : "") +
-    `<div class="mic-think-hint">${_escHtml(hint)}</div>`;
+  // 原生窗口和加档合成**一条**滑块。以前是两行分段按钮，而"原生"那一行在绝大多数
+  // 模型上只有一个按钮——一个只有一种选择的选择器。它们本来就是同一个量（这一轮
+  // 总共能读多少），按数值排成一条连续的档位反而更好懂：加档那几档的读数直接写
+  // 合计（原生 1M + 1M 档 = 2.0M），不用再让人自己把两个数加起来。
+  const opts = _modelContextChoices(id);
+  if (!opts.length) return "";
+  // 生效值落在哪一档。原生优先——原生和某个加档数值撞上时算原生（原生 ≥ 加档）。
+  let idx = opts.findIndex((o) => o.value === eff && !o.locked && o.kind === "native");
+  if (idx < 0) idx = opts.findIndex((o) => o.value === eff && !o.locked);
+  if (idx < 0) idx = 0;
+  return _micSliderHtml({ kind: "ctx", title: "上下文", options: opts, index: idx });
 }
 
 function _modelCatalogEntry(id = "") {
@@ -14114,7 +14199,23 @@ function _ensureModelInfoCard() {
   // the thinking-effort buttons inside). Hover-leaves are debounced with a tiny
   // timer so quick mouse transits between menu rows don't flicker the card.
   el.addEventListener("mouseenter", () => { if (el._hideTimer) { clearTimeout(el._hideTimer); el._hideTimer = null; } });
-  el.addEventListener("mouseleave", () => hideModelInfoCard());
+  // 拖滑块时指针经常会滑出卡片边界（尤其是拖到最右端），这时候不能收卡片——
+  // 卡片一没，正在拖的那个 input 跟着从文档里消失，拖动就断在半路。
+  el.addEventListener("mouseleave", () => { if (el._sliderDrag) return; hideModelInfoCard(); });
+  el.addEventListener("pointerdown", (ev) => {
+    if (!ev.target?.closest?.(".mic-sl__input")) return;
+    el._sliderDrag = true;
+    const done = () => {
+      el._sliderDrag = false;
+      document.removeEventListener("pointerup", done);
+      document.removeEventListener("pointercancel", done);
+      // 松手时指针已经不在卡片上了就该收——那一下 mouseleave 被上面挡掉了，
+      // 不在这里补，卡片会一直赖着不走。
+      if (!el.matches(":hover")) hideModelInfoCard();
+    };
+    document.addEventListener("pointerup", done);
+    document.addEventListener("pointercancel", done);
+  });
   // ALL clicks inside the card must NOT bubble to the document close-on-outside
   // handler — that handler doesn't know the card is a sibling of the menu's
   // wrapper, and would close everything mid-click.
@@ -14826,33 +14927,58 @@ function showModelInfoCard(m, anchorEl) {
         : (profile.kind === "gemini_budget" ? "thinkingBudget"
           : (profile.kind === "kimi-toggle" ? "thinking.type" : "thinking budget")));
     const label = `<div class="mic-plabel">${_escHtml(t(_boolToggle ? "model.thinkingToggle" : "model.thinkingDepth"))}（${_escHtml(paramName)}）${statusTxt}</div>`;
-    const segs = levels.map((lvl) => {
-      // 布尔开关模型的非 off 档不给「深度推理」档位 tip（那是假话），改用能力说明
-      const tip = profile.levelTips?.[lvl]
+    const think = levels.map((lvl) => ({
+      lvl,
+      label: labels[lvl] || lvl,
+      valueLabel: labels[lvl] || lvl,
+      // 布尔开关模型的非 off 档不给「深度推理」话术——那是假话，它只有开和关。
+      caption: profile.levelTips?.[lvl]
         || (_boolToggle && lvl !== "off" ? (profile.hint || t("model.thinking.level.enabled")) : _thinkTip(lvl))
-        || profile.hint || "";
-      return `<button type="button" class="mic-think-btn${lvl === current ? " is-active" : ""}${lvl === "off" ? " mic-think-btn--off" : ""}" data-lvl="${_escAttr(lvl)}" title="${_escAttr(tip)}">${_escHtml(labels[lvl] || lvl)}</button>`;
-    }).join("");
+        || profile.hint || "",
+    }));
     const hint = profile.hint || t("model.thinking.defaultHint");
-    thinkEl.innerHTML = label + `<div class="mic-think-row">${segs}</div>` +
-      `<div class="mic-think-hint">${_escHtml(hint)}</div>`;
-    // Context-window selector: same segmented-button idiom as the thinking row below.
-    // Locked tiers (above membership) explain themselves via title instead of reacting.
-    for (const btn of card.querySelectorAll(".mic-ctx .mic-think-btn")) {
-      btn.addEventListener("click", (ev) => {
-        ev.stopPropagation();
-        if (btn.getAttribute("data-locked")) { showToast(btn.getAttribute("title") || "该档位需更高会员"); return; }
-        _setCtxChoice(m.id, Number(btn.getAttribute("data-ctx")) || 0, btn.getAttribute("data-ctx-kind") || "modified");
-        showModelInfoCard(m, anchorEl); // re-render: active button + 生效 hint update
+    thinkEl.innerHTML = label
+      + _micSliderHtml({
+          kind: "think",
+          title: "",
+          options: think,
+          index: Math.max(0, levels.indexOf(current)),
+        })
+      + `<div class="mic-think-hint">${_escHtml(hint)}</div>`;
+    // 上下文滑块。买不到的档位照样占一个刻度（藏起来会让人以为没这个档），
+    // 拖到那儿弹回最高可选档并说清为什么。
+    const ctxSl = card.querySelector('.mic-ctx .mic-sl[data-sl="ctx"]');
+    if (ctxSl) {
+      const ctxOpts = _modelContextChoices(m.id);
+      _bindMicSlider(ctxSl, (want) => {
+        let at = want;
+        if (ctxOpts[at]?.locked) {
+          let open = -1;
+          ctxOpts.forEach((o, i) => { if (!o.locked) open = i; });
+          at = Math.max(0, open);
+          showToast(ctxOpts[want]?.lockHint || "该档位需更高会员");
+        }
+        const o = ctxOpts[at];
+        if (o) _setCtxChoice(m.id, o.value, o.kind === "native" ? "native" : "modified");
+        return { index: at, valueLabel: o ? _tokenShort(o.value) : "", caption: o?.caption || "" };
       });
     }
-    for (const btn of thinkEl.querySelectorAll(".mic-think-btn")) {
-      btn.addEventListener("click", (ev) => {
-        ev.stopPropagation();
-        const lvl = btn.getAttribute("data-lvl");
-        _setThinkingPref(m.id, lvl);
-        // re-render this card so active state + status header update
-        showModelInfoCard(m, anchorEl);
+    // 思考深度滑块。
+    const thinkSl = thinkEl.querySelector('.mic-sl[data-sl="think"]');
+    if (thinkSl) {
+      _bindMicSlider(thinkSl, (want) => {
+        const o = think[Math.max(0, Math.min(think.length - 1, want))];
+        if (o) _setThinkingPref(m.id, o.lvl);
+        // 顶上那句「思考开启 · 高 / 已关闭」得跟着走，否则读数和状态会对不上。
+        const st = card.querySelector(".mic-think-status");
+        if (st && o) {
+          const off = o.lvl === "off";
+          st.className = `mic-think-status mic-think-status--${off ? "off" : "on"}`;
+          st.textContent = off
+            ? t("model.thinking.off")
+            : t("model.thinking.on", { level: o.label });
+        }
+        return { index: want, valueLabel: o?.valueLabel || "", caption: o?.caption || "" };
       });
     }
   } else {

@@ -13150,10 +13150,21 @@ test("上下文选择存的是意图而不是数字，原生窗口修正后不�
   assert.match(setter, /kind === "native"/, "必须能存下「跟随原生」这个意图");
   const getter = extractFn("_ctxChoiceFor");
   assert.match(getter, /rec\.kind === "native"/, "读取时原生要重新解析成当前真实值");
-  // 渲染分两组，且按钮要带上自己属于哪一组
+  // 「原生」和「加档」曾经是两行分段按钮、靠 data-ctx-kind 属性把意图带到点击处；
+  // 现在合成了一条滑块，意图改由档位表里的 kind 字段一路带到写入处。**不变量没变**：
+  // 存进去的必须是意图，不是一个数字。所以断言跟着挪到新位置，而不是跟着删掉。
+  const choices = extractFn("_modelContextChoices");
+  assert.match(choices, /kind === "native"/,
+    "档位表必须把原生档排在数值相同的加档前面，否则原生会被判成加档");
+  // 渲染和拖动处理必须读同一份档位表：读两份的话，拖到第 n 格写进去的会是另一张表
+  // 的第 n 格——不报错，只是默默存错档位。
   const rows = extractFn("_modelContextRows");
-  assert.match(rows, /原生上下文/); assert.match(rows, /修改上下文/);
-  assert.match(rows, /data-ctx-kind=/, "按钮必须标明所属分组，点击才能存对意图");
+  assert.match(rows, /_modelContextChoices\(/, "渲染没用共用档位表");
+  assert.match(SRC.slice(SRC.indexOf("const ctxSl =")), /_modelContextChoices\(m\.id\)/,
+    "拖动处理没用共用档位表，会和渲染错位");
+  assert.match(SRC.slice(SRC.indexOf("const ctxSl ="), SRC.indexOf("const ctxSl =") + 1400),
+    /_setCtxChoice\(m\.id, o\.value, o\.kind === "native" \? "native" : "modified"\)/,
+    "拖到某一档时没把「跟随原生」这个意图存下去，只存了数字——原生值一被修正就把用户钉死");
 });
 
 test("空闲期卡死：点文件不再拖着整段对话过 JSON，重复镜像不再重写", () => {
