@@ -83,3 +83,29 @@ test("automation-framework 不再写死 Chrome 的绝对路径", () => {
     assert.ok(AUTOMATION.includes(`target_os = "${os}"`), `${os} 没有候选表`);
   }
 });
+
+test("浏览器弹窗和设置面板同一套语言，且颜色不依赖面板令牌", () => {
+  const css = readFileSync(join(HERE, "../src/styles/app.css"), "utf8");
+  const rule = (sel) => {
+    const at = css.indexOf("\n" + sel + " {");
+    assert.notEqual(at, -1, `${sel} 规则没了`);
+    return css.slice(at, css.indexOf("\n}", at));
+  };
+  // 一张卡 + 行间发丝线，不再是一列各自描边的小盒子。
+  assert.match(rule(".bp-list, .bp-card"), /border-radius:\s*12px/, "选项列表不是一张卡");
+  assert.match(rule(".bp-row + .bp-row"), /border-top/, "行间没有发丝线");
+  assert.match(rule(".bp-row"), /border:\s*0/, "每一行还各自描着边");
+
+  // 单选圈是自绘的：原生 radio 在这套界面里是唯一一处系统件。
+  assert.match(css, /\.bp-row input\[type="radio"\]\s*\{[^}]*opacity:\s*0/, "原生 radio 没藏起来");
+  assert.match(css, /\.bp-row\.is-on \.bp-radio::after/, "选中没有自绘的实心点");
+
+  // 这个弹窗**不在** .feature-panel 里，取不到 --feature-* 令牌；用了又不写兜底的话，
+  // 整条声明会作废（毛玻璃那次就是这么栽的）。
+  for (const sel of [".bp-lede", ".bp-sec", ".bp-list, .bp-card", ".bp-row", ".bp-ext"]) {
+    assert.doesNotMatch(rule(sel), /var\(--feature-/,
+      `${sel} 用了面板作用域的令牌，在这个弹窗里取不到`);
+  }
+  // 全局令牌也要带字面兜底。
+  assert.match(rule(".bp-ext"), /var\(--text,\s*#/, "颜色没写兜底值");
+});
