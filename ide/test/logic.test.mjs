@@ -1705,7 +1705,12 @@ test("keyboard shortcuts use platform primary modifier instead of hardcoded mac 
   const macFormat = load("formatCombo", { isMacPlatform: () => true });
   const winFormat = load("formatCombo", { isMacPlatform: () => false });
   assert.deepEqual(macFormat("mod+enter"), ["⌘", "↩"]);
-  assert.deepEqual(winFormat("mod+enter"), ["Ctrl", "↩"]);
+  // 这一条原来写的是 ["Ctrl", "↩"] —— 它把"Windows 上显示 Mac 的回车符号"这个 bug
+  // 锁死了，而这条测试自己的名字就叫 "instead of hardcoded mac keys"。
+  // ↩ ⇧ ⌫ 在 Windows 上既不是系统习惯，很多字体里还缺字，会渲染成方框。
+  assert.deepEqual(winFormat("mod+enter"), ["Ctrl", "Enter"]);
+  assert.deepEqual(winFormat("mod+shift+backspace"), ["Ctrl", "Shift", "Backspace"]);
+  assert.deepEqual(macFormat("mod+shift+backspace"), ["⌘", "⇧", "⌫"]);
 
   assert.match(SRC, /if \(keyComboAliases\(e\)\.includes\("mod\+shift\+p"\)\)/,
     "command palette global shortcut should use platform aliases, not raw metaKey/ctrlKey");
