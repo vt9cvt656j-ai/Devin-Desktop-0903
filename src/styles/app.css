@@ -11008,18 +11008,21 @@ button.agent-plan__fold--toggle:focus-visible { outline: 2px solid #1a73e8; outl
   --feature-radius-card: 12px;
   --feature-radius-control: 8px;
   position: fixed;
-  inset: 0;
+  /* 顶到标题栏下面就行——红绿灯和窗口拖拽区还要能用。 */
+  inset: var(--titlebar-h, 44px) 0 0 0;
   z-index: 90;
   display: flex;
-  align-items: center;
-  justify-content: center;
-  padding: 28px;
-  background: var(--feature-backdrop);
-  /* The workspace behind the sheet should still read as the workspace. At 0.82 white over an
-     8px blur the editor was washed to a flat pane, which loses the sense of the panel sitting
-     on top of your project rather than replacing it. */
-  backdrop-filter: blur(4px);
-  -webkit-backdrop-filter: blur(4px);
+  /*
+   * 全屏接管，不再是"浮在工作区上的一张卡"。
+   *
+   * 设置不是一个顺手瞟一眼的浮层：进来之后要连着改好几项、翻好几页，模态卡片那点
+   * 宽高（1080×720）在 27 寸屏上只占中间一小块，两边全是虚化的工作区，读起来累。
+   * 铺满之后内容自己封顶 760px 居左，视线落点稳定。
+   */
+  align-items: stretch;
+  justify-content: stretch;
+  padding: 0;
+  background: var(--feature-sheet);
 }
 :root[data-theme="dark"] .feature-panel {
   --feature-backdrop: rgba(0, 0, 0, 0.40);
@@ -11041,20 +11044,23 @@ button.agent-plan__fold--toggle:focus-visible { outline: 2px solid #1a73e8; outl
 }
 .feature-panel[hidden] { display: none; }
 .feature-panel__sheet {
-  width: min(1080px, 94vw);
-  height: min(720px, 86vh);
+  width: 100%;
+  height: 100%;
   display: flex;
   flex-direction: column;
   overflow: hidden;
   color: var(--feature-text);
   background: var(--feature-sheet);
-  border: 1px solid var(--feature-border);
-  border-radius: 14px;
-  box-shadow: 0 24px 60px rgba(0, 0, 0, .16), 0 2px 6px rgba(0, 0, 0, .06);
-  animation: sheet-in 0.18s cubic-bezier(0.2, 0.9, 0.3, 1) both;
+  border: 0;
+  border-radius: 0;
+  box-shadow: none;
+  /* 全屏之后不再用弹卡片那个缩放动画（整屏缩放会晕），改成一层轻淡入。
+     千万别去改 @keyframes sheet-in —— 它同时被旧设置对话框和命令面板引用。 */
+  animation: feature-fade .14s ease both;
 }
+@keyframes feature-fade { from { opacity: 0; } to { opacity: 1; } }
 .feature-panel__head {
-  height: 56px;
+  height: 52px;
   display: flex;
   align-items: center;
   justify-content: space-between;
@@ -11093,6 +11099,9 @@ button.agent-plan__fold--toggle:focus-visible { outline: 2px solid #1a73e8; outl
   display: grid;
   grid-template-columns: 236px minmax(0, 1fr);
 }
+/* 全屏之后内容区可能有 2000px 宽。内容自己封顶 760px 并**居左**（不是居中）——
+   居中会让侧栏和内容之间裂开一条大缝，视线得先跨过空白才找到第一行。 */
+.feature-panel__body > * { max-width: 760px; }
 .feature-panel__tabs {
   padding: 10px 10px 16px;
   border-right: 1px solid var(--feature-border);
@@ -12012,221 +12021,131 @@ select.settings-input { cursor: pointer; padding-right: 8px; }
 /* ---- Appearance theme picker ---- */
 .appearance-theme-grid {
   display: grid;
-  grid-template-columns: repeat(2, minmax(240px, 1fr));
-  gap: 16px;
-  margin: 0 0 24px;
+  grid-template-columns: repeat(2, minmax(200px, 1fr));
+  gap: 14px;
+  margin: 0 0 30px;
 }
 .appearance-theme-card {
   position: relative;
   display: grid;
-  gap: 13px;
-  padding: 12px;
+  gap: 11px;
+  padding: 11px;
   font-family: var(--font);
   color: var(--feature-text, var(--text));
   background: var(--feature-card, var(--panel-2));
   border: 1px solid var(--feature-border, var(--line));
-  border-radius: 18px;
+  border-radius: var(--feature-radius-card, 12px);
   cursor: pointer;
   text-align: left;
-  box-shadow: 0 1px 2px rgba(60, 64, 67, .06);
-  transition: transform .16s ease, box-shadow .16s ease, border-color .16s ease, background .16s ease;
+  transition: border-color .16s ease, box-shadow .16s ease;
 }
-.appearance-theme-card:hover {
-  transform: translateY(-1px);
-  border-color: color-mix(in srgb, var(--feature-blue, var(--accent)) 42%, var(--feature-border, var(--line)));
-  box-shadow: 0 8px 22px rgba(60, 64, 67, .14);
-}
+.appearance-theme-card:hover { border-color: var(--feature-border-strong, var(--line-strong)); }
 .appearance-theme-card.is-active {
   border-color: var(--feature-blue, var(--accent));
-  box-shadow: 0 0 0 3px color-mix(in srgb, var(--feature-blue, var(--accent)) 18%, transparent), 0 10px 26px rgba(60, 64, 67, .14);
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--feature-blue, var(--accent)) 22%, transparent);
 }
 .appearance-theme-card__preview {
-  height: 176px;
+  height: 132px;
   overflow: hidden;
-  border-radius: 14px;
-  border: 1px solid rgba(60, 64, 67, .12);
+  border-radius: 9px;
+  border: 1px solid var(--feature-border, var(--line));
 }
-.appearance-theme-card--light .appearance-theme-card__preview {
-  color: #202124;
-  background: linear-gradient(135deg, #ffffff 0%, #f8fbff 52%, #edf4ff 100%);
-}
-.appearance-theme-card--dark .appearance-theme-card__preview {
-  color: #e8eaed;
-  background: linear-gradient(135deg, #0f0f10 0%, #151519 58%, #101827 100%);
-  border-color: rgba(255,255,255,.1);
-}
-.appearance-preview__bar {
-  height: 24px;
+
+/*
+ * 缩略图 = 这张设置页自己的缩影：左边一条侧栏，右边标题 + 一张分组卡片（卡内多行、
+ * 发丝线分隔）。用户此刻正看着这个界面，同构的图不用解读。
+ *
+ * 两张图的可分辨性靠的是**整套色板都换掉**，不只是外框：深色版的内层卡片也是深的。
+ * 参考图里深色版内层还是白卡，并排看只有外框深浅有别，一眼分不出来。
+ */
+.thp { display: grid; grid-template-columns: 26% 1fr; height: 100%; }
+.thp__rail { padding: 9px 6px; display: grid; align-content: start; gap: 5px; }
+.thp__rail i { height: 5px; border-radius: 3px; }
+.thp__rail i:nth-child(1) { width: 58%; }
+.thp__rail i:nth-child(2) { width: 76%; }
+.thp__rail i:nth-child(3) { width: 68%; }
+.thp__rail i:nth-child(4) { width: 82%; }
+.thp__rail i:nth-child(5) { width: 62%; }
+.thp__main { padding: 10px 10px 0 8px; display: grid; align-content: start; gap: 4px; }
+.thp__h { height: 7px; width: 34%; border-radius: 3px; }
+.thp__sub { height: 4px; width: 62%; border-radius: 2px; margin-bottom: 4px; }
+.thp__card { border-radius: 6px; overflow: hidden; }
+.thp__card p {
+  margin: 0;
+  height: 21px;
   display: flex;
   align-items: center;
-  gap: 5px;
-  padding: 0 10px;
-  border-bottom: 1px solid rgba(60, 64, 67, .1);
-  background: rgba(255,255,255,.62);
+  justify-content: space-between;
+  gap: 6px;
+  padding: 0 7px;
 }
-.appearance-theme-card--dark .appearance-preview__bar {
-  border-bottom-color: rgba(255,255,255,.08);
-  background: rgba(255,255,255,.035);
-}
-.appearance-preview__bar span {
-  width: 7px;
-  height: 7px;
-  border-radius: 50%;
-  background: #ea4335;
-}
-.appearance-preview__bar span:nth-child(2) { background: #fbbc04; }
-.appearance-preview__bar span:nth-child(3) { background: #34a853; }
-.appearance-preview__body {
-  height: calc(100% - 24px);
-  display: grid;
-  grid-template-columns: 54px minmax(0, 1fr) 86px;
-  gap: 10px;
-  padding: 10px;
-}
-.appearance-preview__rail,
-.appearance-preview__editor,
-.appearance-preview__assistant {
-  border-radius: 12px;
-  background: rgba(255,255,255,.76);
-  border: 1px solid rgba(60,64,67,.08);
-}
-.appearance-theme-card--dark .appearance-preview__rail,
-.appearance-theme-card--dark .appearance-preview__editor,
-.appearance-theme-card--dark .appearance-preview__assistant {
-  background: rgba(255,255,255,.045);
-  border-color: rgba(255,255,255,.075);
-}
-.appearance-preview__rail {
-  display: grid;
-  align-content: start;
-  gap: 8px;
-  padding: 10px;
-}
-.appearance-preview__rail i {
-  height: 9px;
-  border-radius: 999px;
-  background: #dfe8f9;
-}
-.appearance-preview__rail i:first-child { background: #1a73e8; }
-.appearance-theme-card--dark .appearance-preview__rail i { background: #2f3036; }
-.appearance-theme-card--dark .appearance-preview__rail i:first-child { background: #8ab4f8; }
-.appearance-preview__editor {
-  padding: 12px;
-}
-.appearance-preview__editor b,
-.appearance-preview__editor p,
-.appearance-preview__assistant strong,
-.appearance-preview__assistant span {
-  display: block;
-  border-radius: 999px;
-}
-.appearance-preview__editor b {
-  width: 52%;
-  height: 12px;
-  margin-bottom: 13px;
-  background: currentColor;
-  opacity: .76;
-}
-.appearance-preview__editor p {
-  height: 8px;
-  margin: 0 0 8px;
-  background: #d9e2f3;
-}
-.appearance-preview__editor p.short { width: 62%; }
-.appearance-theme-card--dark .appearance-preview__editor p { background: #343641; }
-.appearance-preview__chips {
-  display: flex;
-  gap: 7px;
-  margin-top: 16px;
-}
-.appearance-preview__chips em {
-  width: 42px;
-  height: 18px;
-  border-radius: 999px;
-  background: #e8f0fe;
-}
-.appearance-preview__chips em:nth-child(2) { background: #e6f4ea; }
-.appearance-theme-card--dark .appearance-preview__chips em { background: rgba(138,180,248,.18); }
-.appearance-theme-card--dark .appearance-preview__chips em:nth-child(2) { background: rgba(52,168,83,.2); }
-.appearance-preview__assistant {
-  padding: 10px;
-}
-.appearance-preview__assistant i {
-  display: block;
-  width: 24px;
-  height: 24px;
-  margin-bottom: 12px;
-  border-radius: 50%;
-  background: linear-gradient(135deg, #4285f4, #34a853);
-}
-.appearance-preview__assistant strong {
-  width: 64%;
-  height: 9px;
-  margin-bottom: 10px;
-  background: currentColor;
-  opacity: .68;
-}
-.appearance-preview__assistant span {
-  height: 7px;
-  margin-bottom: 7px;
-  background: #d9e2f3;
-}
-.appearance-preview__assistant span:last-child { width: 74%; }
-.appearance-theme-card--dark .appearance-preview__assistant span { background: #343641; }
+.thp__card p + p { border-top: 1px solid; }
+.thp__card em { height: 4px; width: 42%; border-radius: 2px; display: block; }
+.thp__card s { height: 8px; width: 22%; border-radius: 3px; display: block; }
+
+/* ---- 浅色一套 ---- */
+.appearance-theme-card--light .appearance-theme-card__preview { background: #f1f1f3; }
+.appearance-theme-card--light .thp__rail i { background: rgba(0, 0, 0, .13); }
+.appearance-theme-card--light .thp__rail i.is-on { background: rgba(0, 0, 0, .26); }
+.appearance-theme-card--light .thp__h { background: rgba(0, 0, 0, .55); }
+.appearance-theme-card--light .thp__sub { background: rgba(0, 0, 0, .18); }
+.appearance-theme-card--light .thp__card { background: #fff; border: 1px solid rgba(0, 0, 0, .08); }
+.appearance-theme-card--light .thp__card p + p { border-color: rgba(0, 0, 0, .07); }
+.appearance-theme-card--light .thp__card em { background: rgba(0, 0, 0, .30); }
+.appearance-theme-card--light .thp__card s { background: rgba(0, 0, 0, .10); }
+.appearance-theme-card--light .thp__card s.is-accent { background: #1a73e8; }
+
+/* ---- 深色一套：底、卡片、文字全换，不是只把外框调暗 ---- */
+.appearance-theme-card--dark .appearance-theme-card__preview { background: #0e0e10; }
+.appearance-theme-card--dark .thp__rail i { background: rgba(255, 255, 255, .14); }
+.appearance-theme-card--dark .thp__rail i.is-on { background: rgba(255, 255, 255, .34); }
+.appearance-theme-card--dark .thp__h { background: rgba(255, 255, 255, .72); }
+.appearance-theme-card--dark .thp__sub { background: rgba(255, 255, 255, .22); }
+.appearance-theme-card--dark .thp__card { background: #1c1c1f; border: 1px solid rgba(255, 255, 255, .10); }
+.appearance-theme-card--dark .thp__card p + p { border-color: rgba(255, 255, 255, .08); }
+.appearance-theme-card--dark .thp__card em { background: rgba(255, 255, 255, .42); }
+.appearance-theme-card--dark .thp__card s { background: rgba(255, 255, 255, .14); }
+.appearance-theme-card--dark .thp__card s.is-accent { background: #8ab4f8; }
+
 .appearance-theme-card__meta {
-  display: grid;
-  grid-template-columns: 36px minmax(0, 1fr) 26px;
+  display: flex;
   align-items: center;
+  justify-content: space-between;
   gap: 10px;
-}
-.appearance-theme-card__icon {
-  width: 36px;
-  height: 36px;
-  display: grid;
-  place-items: center;
-  border-radius: 13px;
-  color: var(--feature-blue, var(--accent));
-  background: var(--feature-active, var(--sel));
-}
-.appearance-theme-card__icon .ic {
-  width: 22px;
-  height: 22px;
+  padding: 0 3px 2px;
 }
 .appearance-theme-card__meta b {
   display: block;
-  font-size: 14px;
-  font-weight: 760;
+  font-size: 13.5px;
+  font-weight: 550;
   color: var(--feature-text, var(--text));
 }
 .appearance-theme-card__meta small {
   display: block;
   margin-top: 2px;
+  font-size: 11.5px;
+  line-height: 1.45;
   color: var(--feature-dim, var(--text-dim));
-  font-size: 12px;
-  line-height: 1.35;
 }
+/* 选中标记：一个描边小圆，选中时填成主色。原来是一个 28px 的实心蓝圆，在这么小的
+   卡片上比标题还抢眼。 */
 .appearance-theme-card__check {
-  width: 24px;
-  height: 24px;
-  display: grid;
-  place-items: center;
-  border-radius: 50%;
-  color: #fff;
-  background: var(--feature-blue, var(--accent));
+  flex: none;
+  width: 17px;
+  height: 17px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 10px;
   font-style: normal;
-  font-weight: 800;
-  opacity: 0;
-  transform: scale(.82);
-  transition: opacity .16s ease, transform .16s ease;
+  color: transparent;
+  border: 1px solid var(--feature-border-strong, var(--line-strong));
+  border-radius: 50%;
 }
 .appearance-theme-card.is-active .appearance-theme-card__check {
-  opacity: 1;
-  transform: scale(1);
-}
-.appearance-options { margin-top: 4px; }
-.appearance-app-icon-group { margin-bottom: 22px; }
-.settings-row--app-icon {
-  align-items: center;
+  color: #fff;
+  background: var(--feature-blue, var(--accent));
+  border-color: var(--feature-blue, var(--accent));
 }
 .app-icon-control {
   display: flex;

@@ -57985,24 +57985,29 @@ function renderThemePreviewCard(theme, current, onSelect) {
   card.type = "button";
   card.className = `appearance-theme-card appearance-theme-card--${theme}` + (current === theme ? " is-active" : "");
   card.setAttribute("aria-pressed", String(current === theme));
+  /*
+   * 缩略图画的就是**这张设置页自己**：侧栏 + 一张分组卡片。自我指涉是刻意的——
+   * 用户此刻正看着这个界面，缩略图和眼前的东西同构，不用解读就知道选下去会变成什么样。
+   *
+   * 关键在于深色那张要**真的是深的**：底、卡片、文字全部换成深色一套。参考图里深色版
+   * 的内层卡片仍然是白的，两张图并排看只有外框颜色不同，一眼分不出来。
+   */
   card.innerHTML = `
     <div class="appearance-theme-card__preview" aria-hidden="true">
-      <div class="appearance-preview__bar"><span></span><span></span><span></span></div>
-      <div class="appearance-preview__body">
-        <div class="appearance-preview__rail">
-          <i></i><i></i><i></i><i></i>
-        </div>
-        <div class="appearance-preview__editor">
-          <b></b><p></p><p class="short"></p><p></p>
-          <div class="appearance-preview__chips"><em></em><em></em></div>
-        </div>
-        <div class="appearance-preview__assistant">
-          <i></i><strong></strong><span></span><span></span>
+      <div class="thp">
+        <div class="thp__rail"><i></i><i></i><i class="is-on"></i><i></i><i></i></div>
+        <div class="thp__main">
+          <b class="thp__h"></b>
+          <span class="thp__sub"></span>
+          <div class="thp__card">
+            <p><em></em><s></s></p>
+            <p><em></em><s></s></p>
+            <p><em></em><s class="is-accent"></s></p>
+          </div>
         </div>
       </div>
     </div>
     <div class="appearance-theme-card__meta">
-      <span class="appearance-theme-card__icon"><svg class="ic"><use href="#${isDark ? "i-theme-dark" : "i-theme-light"}" /></svg></span>
       <span>
         <b>${t(isDark ? "feature.appearance.dark.title" : "feature.appearance.light.title")}</b>
         <small>${t(isDark ? "feature.appearance.dark.desc" : "feature.appearance.light.desc")}</small>

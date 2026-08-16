@@ -3205,8 +3205,10 @@ test("theme picker only exposes light and dark with Cursor-style dark tokens", (
   assert.doesNotMatch(menus, /Monokai|GitHub Light|Solarized Dark|Nord|theme\.system/,
     "help menu should not expose removed theme choices");
 
-  assert.match(INDEX_HTML, /<symbol id="i-theme-light"[\s\S]*<symbol id="i-theme-dark"/,
-    "light and dark theme SVG symbols should exist");
+  // i-theme-light / i-theme-dark 两个 symbol 已随主题缩略图改版一起删除（用户嫌那两个
+  // 小图标丑）。现在的缩略图是纯 CSS 画的这张设置页缩影，不依赖任何字形。
+  assert.doesNotMatch(INDEX_HTML, /<symbol id="i-theme-(light|dark)"/,
+    "那两个主题字形已经没人用了，别再留在 sprite 里");
   assert.doesNotMatch(INDEX_HTML, /i-theme-(monokai|github|solarized|nord|system)/,
     "removed theme SVG symbols should be deleted");
   assert.doesNotMatch(I18N, /theme\.system/,
@@ -22735,9 +22737,17 @@ test("every advanced-settings rail icon follows the tab's colour state", () => {
       `${id} hardcodes ${hardcoded.join(", ")} — it will ignore the tab's dim/hover/active colour`);
   }
 
-  // And the theme preview cards keep the coloured symbols, which is where colour is correct.
-  assert.match(SRC, /i-theme-dark" : "i-theme-light"/,
-    "the appearance page's theme cards should still use the coloured preview symbols");
+  // 主题缩略图不再用带色的 i-theme-light / i-theme-dark 字形（用户嫌那两个小图标丑，
+  // 已连同 index.html 里的 symbol 一起删掉）。现在画的是**这张设置页自己的缩影**，
+  // 全部由 CSS 上色。
+  assert.doesNotMatch(SRC, /i-theme-(light|dark)/,
+    "又把那两个已删除的主题字形用回来了，index.html 里已经没有对应 symbol");
+  assert.match(SRC, /class="thp__card"/, "缩略图没画那张分组卡，退回成一个空盒子了");
+  // 两张缩略图必须**整套色板都不同**，不能只有外框深浅有别——那样并排看一眼分不出来。
+  assert.match(APP_CSS, /\.appearance-theme-card--dark \.thp__card\s*\{[^}]*background:\s*#1c1c1f/,
+    "深色缩略图的内层卡片不是深的，和浅色版并排看区分不出来");
+  assert.match(APP_CSS, /\.appearance-theme-card--light \.thp__card\s*\{[^}]*background:\s*#fff/,
+    "浅色缩略图的内层卡片不是白的");
   assert.ok(!iconIds.includes("i-theme-light"),
     "the rail must not borrow the light-theme preview glyph as its Appearance icon");
 });
