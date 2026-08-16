@@ -60513,9 +60513,33 @@ function editorTrigger(cmd) {
   monacoEditor.focus();
   monacoEditor.trigger("menubar", cmd, null);
 }
+const _PANE_HIDDEN_KEY = "michael_panes_hidden_v1";
+/**
+ * 收起/展开侧栏或助手面板，并把状态记下来。
+ *
+ * 落盘这一步以前没有：这是一个改变整个窗口布局的开关，每次重开 IDE 都把用户收起来的
+ * 面板弹回来，等于它只在当前这一程有效。
+ */
 function togglePane(which) {
-  document.querySelector(".layout")?.classList.toggle("hide-" + which);
+  const layout = document.querySelector(".layout");
+  layout?.classList.toggle("hide-" + which);
+  _savePaneState();
   buildMenubar();
+}
+function _savePaneState() {
+  const layout = document.querySelector(".layout");
+  if (!layout) return;
+  const hidden = ["assistant", "explorer"].filter((p) => layout.classList.contains("hide-" + p));
+  try { localStorage.setItem(_PANE_HIDDEN_KEY, JSON.stringify(hidden)); } catch {}
+}
+function _restorePaneState() {
+  const layout = document.querySelector(".layout");
+  if (!layout) return;
+  let hidden = [];
+  try { hidden = JSON.parse(localStorage.getItem(_PANE_HIDDEN_KEY) || "[]") || []; } catch {}
+  for (const p of ["assistant", "explorer"]) {
+    layout.classList.toggle("hide-" + p, hidden.includes(p));
+  }
 }
 function paneIsOpen(which) {
   const layout = document.querySelector(".layout");
@@ -65972,42 +65996,27 @@ $("terminalClose")?.addEventListener("click", closeTerminal);
 $("termNewBtn")?.addEventListener("click", () => createTermTab());
 $("terminalBtn")?.addEventListener("click", toggleTerminal);
 
-// ---- AI 助手面板开关（标题栏，调试图标左边）----
+// ---- 助手面板开关（标题栏，调试图标左边）----
 //
-// 收起的是**整块面板**，不是把宽度拖到 0：宽度归零后分隔条还在、还能被拖回来，
-// 而且面板里的编辑器/滚动容器仍在布局里参与计算。直接 hidden 掉面板和它的分隔条，
-// 编辑区自然铺满。
-//
-// 状态落盘：这是一个会改变整个窗口布局的开关，重开 IDE 还原成"上次那样"才对得上
-// 用户的预期——每次启动都把他收起来的面板弹回来，等于这个开关只在当前这一程有效。
-const _ASSISTANT_HIDDEN_KEY = "michael_assistant_hidden_v1";
-function _assistantHidden() {
-  try { return localStorage.getItem(_ASSISTANT_HIDDEN_KEY) === "1"; } catch { return false; }
-}
-function _applyAssistantVisibility(hidden) {
-  const panel = $("assistant");
-  const sash = $("sashRight");
-  if (panel) panel.hidden = hidden;
-  if (sash) sash.hidden = hidden;
+// 走的是既有的 togglePane("assistant")，不是另起一套：视图菜单里本来就有这个开关，
+// CSS 的 .layout.hide-assistant 也早就同时收掉了面板和它右边的分隔条。各做一套的
+// 结果是两个入口互相不认账——从菜单关掉，标题栏按钮还亮着"已展开"。
+function _syncAssistantToggleBtn() {
   const btn = $("toggleAssistantBtn");
-  if (btn) {
-    btn.setAttribute("aria-pressed", hidden ? "false" : "true");
-    btn.title = hidden ? "显示 AI 助手" : "隐藏 AI 助手";
-  }
-  // 换的是 Lucide 那两个图标本身，不是给一个图标加状态样式：箭头指向就是"点下去会
-  // 发生什么"，开着时朝右（推出去＝收起），收起时朝左（拉回来＝展开）。
-  const icon = $("toggleAssistantIcon");
-  if (icon) icon.setAttribute("href", hidden ? "#i-panel-right-open" : "#i-panel-right-close");
+  if (!btn) return;
+  const open = paneIsOpen("assistant");
+  btn.classList.toggle("is-off", !open);
+  btn.setAttribute("aria-pressed", open ? "true" : "false");
+  btn.title = t(open ? "menu.closeAssistant" : "menu.openAssistant");
+}
+_restorePaneState();
+_syncAssistantToggleBtn();
+$("toggleAssistantBtn")?.addEventListener("click", () => {
+  togglePane("assistant");
+  _syncAssistantToggleBtn();
   // 编辑器按容器宽度布局，容器一变必须重算，否则代码区会停在旧宽度上。
   try { window.dispatchEvent(new Event("resize")); } catch {}
-}
-function toggleAssistantPanel() {
-  const next = !_assistantHidden();
-  try { localStorage.setItem(_ASSISTANT_HIDDEN_KEY, next ? "1" : "0"); } catch {}
-  _applyAssistantVisibility(next);
-}
-$("toggleAssistantBtn")?.addEventListener("click", toggleAssistantPanel);
-_applyAssistantVisibility(_assistantHidden());
+});
 
 // terminal panel resize
 {
