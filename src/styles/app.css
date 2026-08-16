@@ -10989,7 +10989,9 @@ button.agent-plan__fold--toggle:focus-visible { outline: 2px solid #1a73e8; outl
   --feature-backdrop: rgba(255, 255, 255, 0.55);
   --feature-sheet: #fff;
   --feature-header: #fff;
-  --feature-bg: #fff;
+  /* 内容区底色必须和卡片拉开。原来两者同为 #fff —— 卡片只剩一圈发丝线，
+     "一组设置合成一张卡"这件事在浅色下根本看不出来。 */
+  --feature-bg: #f7f7f8;
   /* 侧栏比卡片浅一档。原来两者同为 #fff，所以左边那条导航根本没有"栏"的存在感。 */
   --feature-rail: #f7f7f8;
   --feature-card: #fff;
@@ -11005,6 +11007,11 @@ button.agent-plan__fold--toggle:focus-visible { outline: 2px solid #1a73e8; outl
      快捷键徽标、主题卡选中框的颜色，把它改成灰会一次把整个面板的"焦点"语义抹掉。 */
   --feature-sel: rgba(0, 0, 0, .07);
   --feature-ring: rgba(0, 0, 0, .13);
+  /* 状态色。面板里原来散着九处写死的十六进制，深色下不跟着变，浅绿压淡绿底
+     对比度只有 2.4:1。 */
+  --feature-ok: #1a7f37;
+  --feature-warn: #b26a00;
+  --feature-err: #c62828;
   --feature-radius-card: 12px;
   --feature-radius-control: 8px;
   position: fixed;
@@ -11041,6 +11048,9 @@ button.agent-plan__fold--toggle:focus-visible { outline: 2px solid #1a73e8; outl
   --feature-hover: rgba(255,255,255,.055);
   --feature-sel: rgba(255,255,255,.09);
   --feature-ring: rgba(255,255,255,.20);
+  --feature-ok: #3fb950;
+  --feature-warn: #e0a000;
+  --feature-err: #e5484d;
 }
 .feature-panel[hidden] { display: none; }
 .feature-panel__sheet {
@@ -11099,9 +11109,10 @@ button.agent-plan__fold--toggle:focus-visible { outline: 2px solid #1a73e8; outl
   display: grid;
   grid-template-columns: 236px minmax(0, 1fr);
 }
-/* 全屏之后内容区可能有 2000px 宽。内容自己封顶 760px 并**居左**（不是居中）——
-   居中会让侧栏和内容之间裂开一条大缝，视线得先跨过空白才找到第一行。 */
-.feature-panel__body > * { max-width: 760px; }
+/* 全屏之后内容区可能有 2000px 宽。内容自己封顶并**居左**（不是居中）——居中会让侧栏
+   和内容之间裂开一条大缝，视线得先跨过空白才找到第一行。
+   min(…,100%) 是为了窄窗口下不出横向滚动条。 */
+.feature-panel__body > * { max-width: min(820px, 100%); }
 .feature-panel__tabs {
   padding: 10px 10px 16px;
   border-right: 1px solid var(--feature-border);
@@ -11170,6 +11181,8 @@ button.agent-plan__fold--toggle:focus-visible { outline: 2px solid #1a73e8; outl
   --text: var(--feature-text);
   --text-dim: var(--feature-dim);
   --accent: var(--feature-blue);
+  /* 没映射的话 --accent-2 会取到编辑器主题的紫，成为面板里唯一一抹紫色。 */
+  --accent-2: var(--feature-blue);
   --sel: var(--feature-active);
   --hover: var(--feature-hover);
   --atc-border: var(--feature-border);
@@ -11953,12 +11966,34 @@ button.agent-plan__fold--toggle:focus-visible { outline: 2px solid #1a73e8; outl
 .settings-row__meta {
   display: flex;
   flex-direction: column;
-  gap: 2px;
+  gap: 3px;
+  flex: 1 1 auto;
   min-width: 0;
+  padding-right: 8px;
 }
-.settings-row__label { font-size: 13.5px; font-weight: 550; color: var(--feature-text, var(--text)); }
+.settings-row__label { font-size: 13.5px; font-weight: 550; line-height: 1.35; color: var(--feature-text, var(--text)); }
 .settings-row__hint { font-size: 12px; line-height: 1.45; color: var(--feature-dim, var(--text-dim)); }
-.settings-row__control { flex-shrink: 0; }
+/*
+ * 控件列固定 220px。
+ *
+ * 原来只有 flex-shrink:0，宽度由控件自身撑开——于是「简体中文 (zh-CN)」那行的控件
+ * 从很左边就开始，「关闭」那行从很右边才开始，控件列的**左**缘参差不齐（实测跨度
+ * 150px）。右缘靠统一宽度已经齐了，左缘得靠固定轨道。
+ *
+ * 开关不跟着拉宽（它是定宽的 42px，拉宽只会让它飘在轨道中间）；图标行本身就宽于
+ * 220px，单独放行。
+ */
+.settings-row__control {
+  flex: 0 0 220px;
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+}
+.settings-row__control > .settings-input { width: 100%; }
+.settings-row__control > .settings-toggle { flex: 0 0 42px; }
+.settings-row__control.app-icon-control { flex: 0 0 auto; }
+.settings-row--stack .settings-row__control { flex: 1 1 auto; }
 .settings-row--stack {
   align-items: stretch;
   flex-direction: column;
@@ -12017,17 +12052,13 @@ select.settings-input {
 }
 /* 右边缘对齐：所有控件给一个共同的下限宽度，一列扫下来右端是一条直线。
    上限用 max-width 兜住，免得某个超长选项把整行撑开。 */
-.settings-row__control > .settings-input,
-.settings-row__control > select.settings-input {
-  min-width: 148px;
-  max-width: 280px;
-}
+/* 轨道已经定宽 220px，控件铺满它即可——不再需要各自的 min/max。 */
 .settings-input:hover { border-color: var(--feature-border-strong, var(--line-strong)); }
 /* 数字框的原生上下箭头同样是系统件。藏掉之后 ↑/↓ 键照样能调，功能没丢。 */
 .settings-input--num::-webkit-outer-spin-button,
 .settings-input--num::-webkit-inner-spin-button { -webkit-appearance: none; margin: 0; }
 .settings-input--num { -moz-appearance: textfield; appearance: textfield; text-align: right; }
-.settings-row__control > .settings-input--num { min-width: 88px; max-width: 88px; }
+.settings-row__control > .settings-input--num { flex: 0 0 88px; width: 88px; }
 .settings-toggle {
   position: relative;
   width: 42px;
@@ -14758,3 +14789,38 @@ body.tree-selecting, body.tree-selecting * { user-select: none !important; -webk
 
 /* 关掉时图标压成次要色，和 .layout.hide-assistant 的实际状态对齐。 */
 .tbtn.is-off .ic { color: var(--text-dim); opacity: .6; }
+
+/* ---- 面板内的按钮：走 feature 令牌，不吃全局那两套硬编码蓝 ----
+   全局 .btn 把主色写死成 #1a73e8、hover 底 #e8f0fe。面板在深色下的蓝是 #8ab4f8，
+   于是同一屏出现两种蓝，hover 还会闪一块浅蓝底。这里按面板作用域覆盖，不动全局。 */
+.feature-panel__body .btn {
+  color: var(--feature-blue);
+  border-radius: var(--feature-radius-control, 8px);
+}
+.feature-panel__body .btn:hover { background: var(--feature-hover); }
+/* 次级按钮：面板里不该出现整块实心主色。留一处描边就够，主色交给焦点和选中。 */
+.feature-panel__body .app-icon-actions .btn,
+.feature-panel__body .app-icon-actions .btn--primary {
+  height: 28px;
+  padding: 0 12px;
+  font-size: 12px;
+  color: var(--feature-text);
+  background: var(--feature-control);
+  border: 1px solid var(--feature-border-strong);
+  border-radius: var(--feature-radius-control, 8px);
+  box-shadow: none;
+}
+.feature-panel__body .app-icon-actions .btn:hover { background: var(--feature-hover); }
+/* 图标行右侧三件东西压到同一条 34px 基线上。原来是 62px 带投影的圆角方块 +
+   34px 实心蓝按钮 + 一个裸文字链接，除了水平中线没有任何共同基准。 */
+.feature-panel__body .app-icon-preview {
+  width: 34px;
+  height: 34px;
+  flex: 0 0 34px;
+  border-radius: var(--feature-radius-control, 8px);
+  background: var(--feature-control);
+  border: 1px solid var(--feature-border);
+  box-shadow: none;
+}
+.feature-panel__body .app-icon-preview img { width: 24px; height: 24px; border-radius: 5px; }
+.feature-panel__body .app-icon-control { gap: 10px; }
