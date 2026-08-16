@@ -16,7 +16,61 @@ use std::time::{Duration, Instant};
 use serde::Serialize;
 use serde_json::{json, Value};
 
+/// 改环境变量的用例和读它的用例必须排队：`std::env` 是**进程级**的，而 Rust 默认多线程
+/// 跑测试——一个用例把 MCP_TIMEOUT 设上，另一个正好在断言默认预算，就是一次偶发红，
+/// 而且每次红的不是同一条，最难查的那一类。
+#[cfg(test)]
+static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// 离开作用域就把这两个变量清掉——**包括断言失败 panic 出去的那条路**。少了它，
+/// 一条失败的用例会把脏环境留给后面所有用例，红的看起来像是别人。
+#[cfg(test)]
+struct ClearTimeoutEnv;
+#[cfg(test)]
+impl Drop for ClearTimeoutEnv {
+    fn drop(&mut self) {
+        unsafe {
+            std::env::remove_var("MCP_TIMEOUT");
+            std::env::remove_var("MCP_TOOL_TIMEOUT");
+        }
+    }
+}
+
 const PROTOCOL_VERSION: &str = "2025-06-18";
+/// 这个客户端认得的协议版本，新到旧。
+///
+/// `initialize` 是一次**协商**：客户端报自己想要的版本，服务回它实际会用的那个，两边不
+/// 一定相同。以前这个回值一个字都没看过——服务回什么都当没事发生，然后带着一套它根本
+/// 不认的请求形状往下走。故障因此全部推迟到后面某次 `tools/call`，报出来的是
+/// "Invalid params" 之类看不出所以然的话，而真正的原因（版本对不上）在握手那一刻就已经
+/// 明明白白写在回包里了。
+const SUPPORTED_PROTOCOL_VERSIONS: [&str; 3] = ["2025-06-18", "2025-03-26", "2024-11-05"];
+
+/// 服务在 `initialize` 里回的版本能不能用。
+///
+/// 不声明版本的照旧放行：规范要求回，但确实有服务不回，而这一条既没证据说它不兼容、
+/// 也不值得为此拒绝一次本来能用的连接。真正要拦的是**明确回了一个我们不认的版本**——
+/// 那是唯一一种"继续往下走一定会以别的方式失败"的情况，早报一步，报的还是真原因。
+///
+/// 这里不把版本存下来：目前没有任何一处按版本分叉行为，存了就是死字段。等到真有分叉
+/// 的那天再连着它的消费者一起加。
+fn check_protocol_version(initialized: &Value) -> Result<(), String> {
+    let Some(version) = initialized
+        .get("protocolVersion")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|version| !version.is_empty())
+    else {
+        return Ok(());
+    };
+    if SUPPORTED_PROTOCOL_VERSIONS.contains(&version) {
+        return Ok(());
+    }
+    Err(format!(
+        "MCP 协议版本对不上：服务要用 {version}，这个客户端支持 {}。请把该服务升级或降级到其中一个版本。",
+        SUPPORTED_PROTOCOL_VERSIONS.join(" / ")
+    ))
+}
 const MAX_TOOL_PAGES: usize = 100;
 const MAX_TOOLS_PER_SESSION: usize = 256;
 const MAX_TOOL_METADATA_BYTES: usize = 1024 * 1024;
@@ -998,12 +1052,24 @@ const LOCAL_HANDSHAKE_SECS: u64 = 45;
 /// `~/.mcp-auth`，下次连还是从头再来。所以远端要给足人操作的时间，超时了也不能杀。
 const REMOTE_HANDSHAKE_SECS: u64 = 180;
 
+/// 环境变量给的超时，换算成秒。
+///
+/// 单位跟着 Claude Code 走：`MCP_TIMEOUT` / `MCP_TOOL_TIMEOUT` 都是**毫秒**。同一个变量名
+/// 在两个工具里差 1000 倍的话，用户照着文档填的 30000 会变成八小时。
+///
+/// 空的、非数字、0 都当没设：0 的字面意思是"立刻超时"，没人是这个意思，而认下来的话
+/// 每一次请求都会当场失败，比不认更难查。
+fn env_timeout_secs(name: &str) -> Option<u64> {
+    let millis: u64 = std::env::var(name).ok()?.trim().parse().ok()?;
+    (millis > 0).then(|| millis.div_ceil(1000).max(1))
+}
+
 fn handshake_budget(remote: bool) -> u64 {
-    if remote {
+    env_timeout_secs("MCP_TIMEOUT").unwrap_or(if remote {
         REMOTE_HANDSHAKE_SECS
     } else {
         LOCAL_HANDSHAKE_SECS
-    }
+    })
 }
 
 fn connect_full_blocking(
@@ -1085,6 +1151,8 @@ fn connect_full_within(
             return Err(error);
         }
     };
+    // 版本对不上就在这里停：往下走一定会以别的方式失败，而那时候已经看不出真原因了。
+    check_protocol_version(&initialized)?;
     session.capabilities = initialized
         .get("capabilities")
         .cloned()
@@ -1421,13 +1489,24 @@ const TOOL_CALL_IDLE_SECS: u64 = 60;
 /// 等不到结果，也等不到报错。
 const TOOL_CALL_MAX_SECS: u64 = 600;
 
+/// 一次工具调用的（空闲, 硬顶）预算。`MCP_TOOL_TIMEOUT` 只给硬顶。
+fn tool_call_budget() -> (u64, u64) {
+    match env_timeout_secs("MCP_TOOL_TIMEOUT") {
+        // 空闲判定不能比硬顶还长：那样硬顶总是先到，"多久没动静就算它不干了"这条
+        // 一次都不会触发，用户把上限调小反而要等得更久。
+        Some(max) => (TOOL_CALL_IDLE_SECS.min(max), max),
+        None => (TOOL_CALL_IDLE_SECS, TOOL_CALL_MAX_SECS),
+    }
+}
+
 fn call_on_session(key: &SessionKey, tool: String, args: Option<Value>) -> Result<Value, String> {
+    let (idle_secs, max_secs) = tool_call_budget();
     on_session(key, |session| {
         session.request_with_progress(
             "tools/call",
             json!({ "name": tool, "arguments": args.unwrap_or(json!({})) }),
-            TOOL_CALL_IDLE_SECS,
-            TOOL_CALL_MAX_SECS,
+            idle_secs,
+            max_secs,
         )
     })
 }
@@ -2750,6 +2829,56 @@ mod tests {
         assert!(video.contains("[MCP_MEDIA video video/mp4]"));
     }
 
+    /// 握手是一次协商，服务回的版本不一定是我们报的那个。以前这个回值一个字都没看过，
+    /// 于是版本对不上时故障全推迟到后面某次 tools/call，报出来的话看不出真原因。
+    #[test]
+    fn an_unsupported_protocol_version_stops_the_handshake_with_the_real_reason() {
+        // 我们自己报的那个版本必须在支持表里，否则连"和自己握手"都过不了。
+        assert!(SUPPORTED_PROTOCOL_VERSIONS.contains(&PROTOCOL_VERSION));
+        for good in SUPPORTED_PROTOCOL_VERSIONS {
+            assert!(check_protocol_version(&json!({"protocolVersion": good})).is_ok(), "{good}");
+        }
+        let error = check_protocol_version(&json!({"protocolVersion": "1999-01-01"}))
+            .expect_err("不认的版本必须拦下来");
+        // 报错要同时说清两边各要什么——只说"版本不对"的话用户不知道该改哪个数字。
+        assert!(error.contains("1999-01-01"), "{error}");
+        assert!(error.contains(PROTOCOL_VERSION), "{error}");
+        // 不声明版本的照旧放行：确实有服务不回，这不构成拒绝一次能用的连接的理由。
+        assert!(check_protocol_version(&json!({})).is_ok());
+        assert!(check_protocol_version(&json!({"protocolVersion": "  "})).is_ok());
+    }
+
+    /// 慢服务以前没有任何退路：45 秒握不完手就是连不上，改不了。`MCP_TIMEOUT` /
+    /// `MCP_TOOL_TIMEOUT` 是 Claude Code 那两个变量，单位是**毫秒**——同名不同单位的话，
+    /// 用户照着文档填的 30000 在这边会变成八小时。
+    #[test]
+    fn timeout_env_vars_follow_claude_codes_names_and_milliseconds() {
+        let _serial = ENV_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _clean = ClearTimeoutEnv;   // 失败也要还原，见它的注释
+        assert_eq!(handshake_budget(true), REMOTE_HANDSHAKE_SECS);
+        assert_eq!(handshake_budget(false), LOCAL_HANDSHAKE_SECS);
+        assert_eq!(tool_call_budget(), (TOOL_CALL_IDLE_SECS, TOOL_CALL_MAX_SECS));
+
+        unsafe { std::env::set_var("MCP_TIMEOUT", "300000") };
+        assert_eq!(handshake_budget(false), 300, "30 万毫秒 = 300 秒，不是 30 万秒");
+        assert_eq!(handshake_budget(true), 300, "显式设过就该盖住远端那个默认值");
+
+        unsafe { std::env::set_var("MCP_TOOL_TIMEOUT", "30000") };
+        let (idle, max) = tool_call_budget();
+        assert_eq!(max, 30);
+        // 空闲判定不能比硬顶还长，否则硬顶先到、"没动静"这条一次都不触发。
+        assert!(idle <= max, "空闲 {idle}s 超过了硬顶 {max}s");
+
+        for junk in ["", "  ", "abc", "0", "-5", "12.5"] {
+            unsafe { std::env::set_var("MCP_TIMEOUT", junk) };
+            assert_eq!(
+                handshake_budget(false),
+                LOCAL_HANDSHAKE_SECS,
+                "{junk:?} 该当没设过；0 尤其不能认——那是「立刻超时」，每次请求当场失败",
+            );
+        }
+    }
+
     #[test]
     fn roots_list_exposes_the_real_workspace_uri() {
         let roots = workspace_roots(env!("CARGO_MANIFEST_DIR"));
@@ -3628,6 +3757,48 @@ mod tests {
         mcp_disconnect(session_name).await.unwrap();
     }
 
+    /// 版本对不上要在**握手那一刻**停下来，而不是揣着一个谈不拢的会话往下走。
+    ///
+    /// 单验 `check_protocol_version` 是不够的：把握手里那句改成 `let _ = ...`（＝根本不看
+    /// 它的结论），只验函数的那条守卫照样绿。这条走的是 connect_full_within——和运行时
+    /// 同一条路，钉的是"这个判断真的挂在链路上"。
+    #[tokio::test]
+    async fn the_handshake_actually_refuses_a_version_it_cannot_speak() {
+        let session_name = format!("fixture-badproto-{}", std::process::id());
+        let error = connect_full_within(
+            key(&session_name),
+            "node".into(),
+            Some(vec![fixture_path()]),
+            Some(HashMap::from([(
+                "MCP_FIXTURE_PROTOCOL_VERSION".to_string(),
+                "1999-01-01".to_string(),
+            )])),
+            Some(env!("CARGO_MANIFEST_DIR").into()),
+            false,
+            5,
+        )
+        .expect_err("服务回了一个客户端不认的协议版本，这次连接不该算成功");
+        assert!(error.contains("1999-01-01"), "报错里没说服务要哪个版本：{error}");
+        assert!(error.contains(PROTOCOL_VERSION), "报错里没说客户端支持哪些：{error}");
+
+        // 反过来：服务回一个我们支持的旧版本，连接照常成立——这道闸不能顺手把
+        // 还在 2024-11-05 上的服务全部拒掉。
+        let ok_name = format!("fixture-oldproto-{}", std::process::id());
+        connect_full_within(
+            key(&ok_name),
+            "node".into(),
+            Some(vec![fixture_path()]),
+            Some(HashMap::from([(
+                "MCP_FIXTURE_PROTOCOL_VERSION".to_string(),
+                "2024-11-05".to_string(),
+            )])),
+            Some(env!("CARGO_MANIFEST_DIR").into()),
+            false,
+            5,
+        )
+        .expect("2024-11-05 在支持表里，不该被拒");
+    }
+
     /// 远端服务在等浏览器授权时，会话必须**留着**。
     ///
     /// mcp-remote 第一次连接会开浏览器等用户点同意，这期间 initialize 没有回音。旧行为是超时
@@ -3639,6 +3810,8 @@ mod tests {
     /// 这条路的测试等于没有测试。
     #[tokio::test]
     async fn a_remote_server_waiting_for_browser_auth_is_parked_not_killed() {
+        // 这两条断言读的是进程级环境变量，和改它的那条用例要排队，见 ENV_LOCK。
+        let _serial = ENV_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         assert_eq!(handshake_budget(true), REMOTE_HANDSHAKE_SECS);
         assert_eq!(handshake_budget(false), LOCAL_HANDSHAKE_SECS);
 
