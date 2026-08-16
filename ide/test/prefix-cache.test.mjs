@@ -968,12 +968,13 @@ test("how much a model can WRITE is carried, not guessed", () => {
   assert.match(RS, /max_tokens\.clamp\(1, official_max_output\(model_str\)\.unwrap_or\(128000\)\)/);
   assert.doesNotMatch(RS, /max_tokens\.clamp\(1, 128000\)/, "no blanket ceiling for every model");
 
-  assert.match(SRC, /function _modelMaxOutput\(modelId = ""\) \{/);
-  assert.match(SRC, /maxOutput: Math\.max\(0, Math\.round\(Number\(it\.max_output_tokens \?\? it\.maxOutputTokens\) \|\| 0\)\),/);
-  // Unknown says nothing rather than having a number invented for it.
-  const helper = grab("_modelMaxOutput");
-  assert.match(helper, /if \(!entry\) return 0;/);
-  assert.match(SRC, /out > 0 \? ` · 单次输出上限 \$\{_tokenShort\(out\)\}` : ""/);
+  // 客户端这一侧的 _modelMaxOutput / maxOutput 已经删掉了：它唯一的用途是卡片上那行
+  // 「单次输出上限 128.0k」，用户要求去掉那行文字之后它就成了没人调的死代码，而这个
+  // 仓库里"存在但没人够得着"正是最要命的一类缺陷。真正防止截断的是**网关侧的钳位**
+  // （上面 RS 那三条），客户端从来没拿这个数做过任何预算，删掉不削弱任何保护。
+  assert.doesNotMatch(SRC, /function _modelMaxOutput\(/,
+    "又加回了一个没人调的客户端上限函数——要么接到真用途上，要么别留着");
+  assert.match(RS, /max_tokens\.clamp\(1, official_max_output\(model_str\)\.unwrap_or\(128000\)\)/);
 });
 
 test("the browser preview does not invent a window the model does not have", () => {

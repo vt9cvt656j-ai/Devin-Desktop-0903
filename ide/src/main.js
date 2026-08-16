@@ -12759,19 +12759,6 @@ function _parseTokenWindowValue(value) {
   return Math.max(0, Math.round(n * (unit === "m" ? 1_000_000 : unit === "k" ? 1_000 : 1)));
 }
 
-/** The most output tokens this model will write in one response — the second half of a model's
- *  shape, and the one the catalogue never carried. 0 means the route did not say, and callers
- *  must fall back rather than invent a number: a blanket ceiling is what sent 128,000 to a model
- *  that caps at 64,000, and an invented 8,192 to one that can write 128,000. */
-function _modelMaxOutput(modelId = "") {
-  const entry = _modelCatalogEntry(modelId);
-  if (!entry) return 0;
-  const direct = _firstFiniteNumber(entry, [
-    "maxOutput", "max_output_tokens", "maxOutputTokens", "output_token_limit",
-  ]);
-  return direct > 0 ? Math.round(direct) : 0;
-}
-
 function _catalogModelContextLimit(it) {
   it = it || {};
   const direct = _firstFiniteNumber(it, [
@@ -12923,7 +12910,6 @@ function _micSliderHtml(cfg) {
     + `</div>`
     + `<div class="mic-sl__ends"><span>${_escHtml(opts[0].label || "")}</span>`
     + `<span>${_escHtml(opts[opts.length - 1].label || "")}</span></div>`
-    + (cur.caption ? `<div class="mic-sl__cap">${_escHtml(cur.caption)}</div>` : "")
     + `</div>`;
 }
 
@@ -12939,7 +12925,6 @@ function _bindMicSlider(root, onPick) {
   if (!input) return;
   const fill = root.querySelector(".mic-sl__fill");
   const val = root.querySelector(".mic-sl__val");
-  const cap = root.querySelector(".mic-sl__cap");
   const ticks = [...root.querySelectorAll(".mic-sl__tick")];
   const last = Math.max(1, Number(input.max) || 1);
   const apply = (i, res) => {
@@ -12947,7 +12932,6 @@ function _bindMicSlider(root, onPick) {
     ticks.forEach((t, n) => t.classList.toggle("is-done", n <= i));
     if (val && res?.valueLabel) val.textContent = res.valueLabel;
     if (res?.valueLabel) input.setAttribute("aria-valuetext", res.valueLabel);
-    if (cap) cap.textContent = res?.caption || "";
   };
   const onMove = (ev) => {
     ev.stopPropagation();
@@ -12968,23 +12952,11 @@ function _bindMicSlider(root, onPick) {
  * 会是另一张表的第 n 格 —— 这类错位不报错，只是默默存错档位。
  */
 function _modelContextChoices(id) {
-  const native = _modelContextLimit(id);
-  if (!native) return [];
-  const out = _modelMaxOutput(id);
+  if (!_modelContextLimit(id)) return [];
   return _ctxChoiceOptions(id)
     .slice()
     .sort((a, b) => a.value - b.value || (a.kind === "native" ? -1 : 1))
-    .map((o) => ({
-      ...o,
-      label: _tokenShort(o.value),
-      valueLabel: _tokenShort(o.value),
-      caption: o.locked
-        ? o.lockHint
-        : (o.kind === "native"
-            ? `模型原生窗口${o.beta ? ` · 需上游 beta：${o.beta}` : ""}`
-            : `原生 ${_tokenShort(native)} + ${o.tier} 档`)
-          + (out > 0 ? ` · 单次输出上限 ${_tokenShort(out)}` : ""),
-    }));
+    .map((o) => ({ ...o, label: _tokenShort(o.value), valueLabel: _tokenShort(o.value) }));
 }
 
 function _modelContextRows(m) {
@@ -13092,7 +13064,6 @@ async function loadBackendModels() {
         defaultEffort: String(it.default_effort || ""),
         // How much the model will WRITE. Null from the gateway means unknown for this route, and
         // 0 here carries that through — nothing downstream may substitute a number for it.
-        maxOutput: Math.max(0, Math.round(Number(it.max_output_tokens ?? it.maxOutputTokens) || 0)),
         priceSource: it.price_source || it.priceSource || "",
         // 这个模型有没有一条强力线路。三态，不能压成布尔：
         //   true  → 显示右上角那个闪电按钮；
@@ -14919,32 +14890,18 @@ function showModelInfoCard(m, anchorEl) {
     const _boolToggle = !!profile.booleanToggle || profile.kind === "kimi-toggle";
     const labels = _thinkLabels(profile.labels || {});
     if (_boolToggle && !(profile.labels && profile.labels.high)) labels.high = t("model.thinking.level.enabled");
-    const statusTxt = current === "off"
-      ? `<span class="mic-think-status mic-think-status--off">${_escHtml(t("model.thinking.off"))}</span>`
-      : `<span class="mic-think-status mic-think-status--on">${_escHtml(t("model.thinking.on", { level: labels[current] || current }))}</span>`;
-    const paramName = profile.kind === "reasoning_effort" ? "reasoning_effort"
-      : (profile.kind === "thinking_level" ? "thinkingLevel"
-        : (profile.kind === "gemini_budget" ? "thinkingBudget"
-          : (profile.kind === "kimi-toggle" ? "thinking.type" : "thinking budget")));
-    const label = `<div class="mic-plabel">${_escHtml(t(_boolToggle ? "model.thinkingToggle" : "model.thinkingDepth"))}（${_escHtml(paramName)}）${statusTxt}</div>`;
-    const think = levels.map((lvl) => ({
-      lvl,
-      label: labels[lvl] || lvl,
-      valueLabel: labels[lvl] || lvl,
-      // 布尔开关模型的非 off 档不给「深度推理」话术——那是假话，它只有开和关。
-      caption: profile.levelTips?.[lvl]
-        || (_boolToggle && lvl !== "off" ? (profile.hint || t("model.thinking.level.enabled")) : _thinkTip(lvl))
-        || profile.hint || "",
-    }));
-    const hint = profile.hint || t("model.thinking.defaultHint");
+    // 标题只留「思考深度」。原来还挂着上游参数名（thinking budget / reasoning_effort）
+    // 和一句「思考开启 · 低」—— 参数名是实现细节，状态则和滑块右边那个读数说的是同
+    // 一件事，两处重复。
+    const label = `<div class="mic-plabel">${_escHtml(t(_boolToggle ? "model.thinkingToggle" : "model.thinkingDepth"))}</div>`;
+    const think = levels.map((lvl) => ({ lvl, label: labels[lvl] || lvl, valueLabel: labels[lvl] || lvl }));
     thinkEl.innerHTML = label
       + _micSliderHtml({
           kind: "think",
           title: "",
           options: think,
           index: Math.max(0, levels.indexOf(current)),
-        })
-      + `<div class="mic-think-hint">${_escHtml(hint)}</div>`;
+        });
     // 上下文滑块。买不到的档位照样占一个刻度（藏起来会让人以为没这个档），
     // 拖到那儿弹回最高可选档并说清为什么。
     const ctxSl = card.querySelector('.mic-ctx .mic-sl[data-sl="ctx"]');
@@ -14960,7 +14917,7 @@ function showModelInfoCard(m, anchorEl) {
         }
         const o = ctxOpts[at];
         if (o) _setCtxChoice(m.id, o.value, o.kind === "native" ? "native" : "modified");
-        return { index: at, valueLabel: o ? _tokenShort(o.value) : "", caption: o?.caption || "" };
+        return { index: at, valueLabel: o ? _tokenShort(o.value) : "" };
       });
     }
     // 思考深度滑块。
@@ -14969,16 +14926,7 @@ function showModelInfoCard(m, anchorEl) {
       _bindMicSlider(thinkSl, (want) => {
         const o = think[Math.max(0, Math.min(think.length - 1, want))];
         if (o) _setThinkingPref(m.id, o.lvl);
-        // 顶上那句「思考开启 · 高 / 已关闭」得跟着走，否则读数和状态会对不上。
-        const st = card.querySelector(".mic-think-status");
-        if (st && o) {
-          const off = o.lvl === "off";
-          st.className = `mic-think-status mic-think-status--${off ? "off" : "on"}`;
-          st.textContent = off
-            ? t("model.thinking.off")
-            : t("model.thinking.on", { level: o.label });
-        }
-        return { index: want, valueLabel: o?.valueLabel || "", caption: o?.caption || "" };
+        return { index: want, valueLabel: o?.valueLabel || "" };
       });
     }
   } else {

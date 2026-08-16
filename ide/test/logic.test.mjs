@@ -17629,8 +17629,14 @@ test("方案D：布尔思考开关模型诚实两态——能力表驱动，不�
   assert.match(SRC, /const _boolToggle = !!profile\.booleanToggle \|\| profile\.kind === "kimi-toggle";/);
   assert.match(SRC, /t\(_boolToggle \? "model\.thinkingToggle" : "model\.thinkingDepth"\)/,
     "布尔模型的选择器标题不得写「思考深度」");
-  assert.match(SRC, /_boolToggle && lvl !== "off" \? \(profile\.hint \|\| t\("model\.thinking\.level\.enabled"\)\) : _thinkTip\(lvl\)/,
-    "布尔模型不给「深度推理」档位话术 tip");
+  // 卡片现在一条**档位说明都不渲染**了（用户要求去掉那几段文字），所以"布尔模型别说
+  // 深度话术"这件事的守法也跟着变：不再是检查那句 tip 挑得对，而是检查卡片压根不生成
+  // 任何按档位的说明文字——那些话术的来源只有 _thinkTip / profile.levelTips 两个。
+  const thinkRender = SRC.slice(SRC.indexOf("const think = levels.map("));
+  const thinkBlock = thinkRender.slice(0, thinkRender.indexOf("thinkEl.innerHTML") + 400);
+  assert.doesNotMatch(thinkBlock, /_thinkTip\(|profile\.levelTips/,
+    "卡片又开始渲染按档位的说明文字了——布尔开关模型只有开和关，" +
+    "给它安上「低/中/高深度推理」的解释就是假话");
   // i18n 双语文案就位（en + zh）
   assert.equal((I18N.match(/"model\.thinking\.reason\.glmToggleHint"/g) || []).length, 2);
   assert.equal((I18N.match(/"model\.thinkingToggle"/g) || []).length, 2);
