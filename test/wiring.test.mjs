@@ -27,7 +27,8 @@
 //   3. Every check names the real defect it would have caught.
 import test from "node:test";
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import { readFileSync, writeFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 
@@ -825,4 +826,36 @@ test("打包进 app 的 automation sidecar 必须带鉴权，且这道闸在构�
   // 在 release 下被内联成立即数，从**已加固**的源码新编出来也搜不到——拿它当判据只会
   // 得到假警报。今天在这上面栽过三次。
   assert.doesNotMatch(build, /has\("x-automation-token/, "别用会被内联的短字面量当判据");
+});
+
+test("官网的工具画廊必须还能从 main.js 里取出真目录", () => {
+  // 事故形状（2026-08-16 实测）：`_buildAgentToolSchemas` 里先后多了 `_userCapabilities()`
+  // 和 `_withoutDisabledTools()` 两个调用（提交 46398dc），而 website/scripts/extract-tools.mjs
+  // 是把这个函数的**源文本**抠出来 `new Function` 求值的——注入的自由变量没跟着加。
+  //
+  // 后果不是"某个测试红了"。是 website/ 里的 `npm run build` 死在第一步 prebuild 上，
+  // 官网整个发不出去；而已经生成好的 public/tools.json 就停在旧的 132 个工具，画廊少列
+  // 四个真实存在的能力（git_show / probe_env / ui_extract / view_image）。两条链路都没有
+  // 任何东西会喊——本地测试全绿，服务器也全绿，只有真去构建官网的那一刻才炸。
+  //
+  // 这里跑**真脚本**而不是在测试里重写一份提取逻辑：重写的那份自己就会漂，正好抓不到
+  // 这一类缺陷。断言的是连接——"提取器仍然够得着 main.js 里的那个函数"。
+  const WEB = join(HERE, "../website");
+  const OUT = join(WEB, "public/tools.json");
+  const before = readFileSync(OUT, "utf8");
+  try {
+    execFileSync(process.execPath, ["scripts/extract-tools.mjs"], { cwd: WEB, stdio: "pipe" });
+  } catch (e) {
+    assert.fail(
+      "extract-tools.mjs 跑不起来了，官网 prebuild 会死在这里：\n" +
+        String(e.stderr || e.message).trim() +
+        "\n——_buildAgentToolSchemas 里多了一个提取器没注入的自由变量，去 extract-tools.mjs 的 new Function 参数里补上",
+    );
+  }
+  const after = readFileSync(OUT, "utf8");
+  // 生成是确定性的（generatedAt 刻意留空就是为了不churn），所以同步时这一步是空操作。
+  // 不同步就把文件还原，测试只报告、不改仓库。
+  if (after !== before) writeFileSync(OUT, before);
+  assert.equal(after, before,
+    "public/tools.json 和 main.js 的真目录不同步了——跑 website/ 的 `node scripts/extract-tools.mjs` 并提交结果");
 });
