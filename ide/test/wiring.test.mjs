@@ -1064,10 +1064,31 @@ test("设置面板的下拉必须是自绘组件：菜单在控件正下方、�
   assert.match(open.slice(0, 600), /r\.bottom \+ 4/, "菜单没贴在控件下方");
 
   // 4) 键盘要能用。原生 select 白送的东西，自绘就得自己补——少一样键盘用户就用不了。
-  const kd = SRC.slice(SRC.indexOf('wrap.addEventListener("keydown"'));
-  for (const key of ["Escape", "ArrowDown", "ArrowUp"]) {
-    assert.match(kd.slice(0, 900), new RegExp(key), `键盘少了 ${key}`);
+  const kd = SRC.slice(SRC.indexOf('btn.addEventListener("keydown"'));
+  for (const key of ["Escape", "ArrowDown", "ArrowUp", "Enter"]) {
+    assert.match(kd.slice(0, 1200), new RegExp(key), `键盘少了 ${key}`);
   }
+
+  // 4a) 高亮必须由 JS 自己挂类名，**不能**靠 :focus-visible。键盘移动时是程序化
+  //     focus，而 focus-visible 由浏览器按"这次焦点是不是键盘引起的"启发式判定，
+  //     程序化 focus 在 WKWebView 里经常不算——表现就是上下键走下去一路没有高亮。
+  assert.match(SRC, /el\.classList\.add\("is-active"\)/, "选项高亮没有由 JS 挂类名");
+  assert.doesNotMatch(css, /\.mselect__opt:focus-visible/,
+    "又把选项高亮压在 :focus-visible 上了，键盘走下去会没有高亮");
+  assert.match(css, /\.mselect__opt\.is-active\s*\{[^}]*background:/, "高亮没有可见的底色");
+  // 键盘走到视口外的项要带进来，否则高亮跑到看不见的地方。
+  // 只在 setActive 的函数体里找——main.js 别处也有 scrollIntoView，扫全文会被喂饱。
+  const sa = SRC.slice(SRC.indexOf("const setActive = (i) =>"));
+  assert.match(sa.slice(0, sa.indexOf("\n  };") + 5), /scrollIntoView/,
+    "键盘移动时没把当前项滚进视野，高亮会跑到看不见的地方");
+
+  // 4b) 只有菜单**外面**的滚动才关菜单。直接把 close 挂在 window 捕获阶段的话，
+  //     在菜单里滚滚轮同样会被捕获到，表现就是"菜单根本滚不动"。
+  const sc = SRC.slice(SRC.indexOf("const onScroll ="));
+  assert.match(sc.slice(0, 200), /menu\.contains\(ev\.target\)/,
+    "菜单内部的滚动也会关掉菜单——菜单会滚不动");
+  assert.doesNotMatch(SRC, /window\.addEventListener\("scroll", close/,
+    "又把 close 直接挂到 scroll 上了");
 
   // 5) 鼠标点完不留灰描边：焦点环只给 :focus-visible。
   assert.match(css, /\.settings-input:focus \{[^}]*box-shadow:\s*none/,

@@ -14857,5 +14857,9 @@ body.tree-selecting, body.tree-selecting * { user-select: none !important; -webk
   border-radius: 6px;
   cursor: pointer;
 }
-.mselect__opt:hover, .mselect__opt:focus-visible { background: var(--feature-hover); outline: none; }
+/* 高亮走 JS 挂的 .is-active（鼠标和键盘同一条路），颜色用 --feature-sel 而不是
+   --feature-hover：后者在浅色下是 4.5% 的黑，压在白色菜单上几乎看不见。 */
+.mselect__opt.is-active { background: var(--feature-sel); }
 .mselect__opt.is-on { font-weight: 600; }
+/* 当前值再加一个勾，光靠字重在长列表里不够显眼。 */
+.mselect__opt.is-on::after { content: "✓"; float: right; opacity: .55; }

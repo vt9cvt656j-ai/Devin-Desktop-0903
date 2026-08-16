@@ -57932,38 +57932,73 @@ function buildSelectControl(options, cur, onPick) {
   paint();
 
   let menu = null;
+  let items = [];
+  let active = -1;
+
+  /*
+   * 高亮由 JS 自己管，不靠 :hover / :focus-visible。
+   *
+   * 靠 focus-visible 的那一版是坏的：键盘移动时我们是**程序化** focus 的，而
+   * focus-visible 由浏览器按"这次焦点是不是键盘引起的"启发式判定，程序化 focus 在
+   * WKWebView 里经常不算——于是上下键走下去一路没有任何高亮。一个类名管住鼠标和
+   * 键盘两条路，行为一致，也不用猜浏览器的判定规则。
+   */
+  const setActive = (i) => {
+    if (!items.length) return;
+    items[active]?.classList.remove("is-active");
+    active = Math.max(0, Math.min(items.length - 1, i));
+    const el = items[active];
+    if (!el) return;
+    el.classList.add("is-active");
+    // 键盘走到视口外的那一项时要把它带进来，否则高亮跑到看不见的地方。
+    el.scrollIntoView({ block: "nearest" });
+  };
+
   const close = () => {
     if (!menu) return;
     menu.remove();
     menu = null;
+    items = [];
+    active = -1;
     btn.setAttribute("aria-expanded", "false");
     document.removeEventListener("mousedown", onDocDown, true);
     window.removeEventListener("resize", close, true);
-    window.removeEventListener("scroll", close, true);
+    window.removeEventListener("scroll", onScroll, true);
   };
   const onDocDown = (ev) => { if (!menu?.contains(ev.target) && ev.target !== btn) close(); };
+  /*
+   * 只有**菜单外面**的滚动才关菜单。
+   *
+   * 上一版直接把 close 挂在 window 的捕获阶段，于是在菜单里滚滚轮也会被捕获到 ——
+   * 刚一滚就关，表现就是"菜单根本滚不动"。菜单自己是可滚动容器，它的 scroll 事件
+   * 同样会走捕获路径经过 window。
+   */
+  const onScroll = (ev) => { if (menu && menu.contains(ev.target)) return; close(); };
+
+  const pick = (val) => {
+    value = String(val);
+    paint();
+    close();
+    btn.focus();
+    onPick(val);
+  };
 
   const open = () => {
     if (menu) return close();
     menu = document.createElement("div");
     menu.className = "mselect__menu";
     menu.setAttribute("role", "listbox");
-    for (const [val, text] of options) {
-      const it = document.createElement("button");
-      it.type = "button";
+    items = options.map(([val, text], i) => {
+      const it = document.createElement("div");
       it.className = "mselect__opt" + (String(val) === value ? " is-on" : "");
       it.setAttribute("role", "option");
       it.setAttribute("aria-selected", String(String(val) === value));
       it.textContent = text;
-      it.addEventListener("click", () => {
-        value = String(val);
-        paint();
-        close();
-        btn.focus();
-        onPick(val);
-      });
+      it.addEventListener("mouseenter", () => setActive(i));
+      it.addEventListener("click", () => pick(val));
       menu.appendChild(it);
-    }
+      return it;
+    });
     document.body.appendChild(menu);
     const r = btn.getBoundingClientRect();
     // 同宽 + 左对齐 + 贴在控件正下方；下方装不下就翻到上方。
@@ -57973,21 +58008,33 @@ function buildSelectControl(options, cur, onPick) {
     const below = window.innerHeight - r.bottom - 8;
     menu.style.top = h <= below ? `${r.bottom + 4}px` : `${Math.max(8, r.top - h - 4)}px`;
     btn.setAttribute("aria-expanded", "true");
-    menu.querySelector(".is-on")?.focus?.();
+    setActive(Math.max(0, options.findIndex(([v]) => String(v) === value)));
     document.addEventListener("mousedown", onDocDown, true);
     window.addEventListener("resize", close, true);
-    window.addEventListener("scroll", close, true);
+    window.addEventListener("scroll", onScroll, true);
   };
 
   btn.addEventListener("click", (ev) => { ev.stopPropagation(); open(); });
-  wrap.addEventListener("keydown", (ev) => {
-    const items = menu ? [...menu.querySelectorAll(".mselect__opt")] : [];
-    if (ev.key === "Escape" && menu) { ev.preventDefault(); close(); btn.focus(); return; }
-    if (!menu && (ev.key === "ArrowDown" || ev.key === "ArrowUp")) { ev.preventDefault(); open(); return; }
-    if (!menu || !items.length) return;
-    const at = items.indexOf(document.activeElement);
-    if (ev.key === "ArrowDown") { ev.preventDefault(); items[Math.min(items.length - 1, at + 1)]?.focus(); }
-    else if (ev.key === "ArrowUp") { ev.preventDefault(); items[Math.max(0, at - 1)]?.focus(); }
+  // 焦点始终留在按钮上，键盘事件都在这里处理——不用把焦点搬进菜单，
+  // 也就不用跟浏览器的 focus-visible 启发式打交道。
+  btn.addEventListener("keydown", (ev) => {
+    if (ev.key === "Escape" && menu) { ev.preventDefault(); close(); return; }
+    if (!menu) {
+      if (ev.key === "ArrowDown" || ev.key === "ArrowUp" || ev.key === "Enter" || ev.key === " ") {
+        ev.preventDefault();
+        open();
+      }
+      return;
+    }
+    if (ev.key === "ArrowDown") { ev.preventDefault(); setActive(active + 1); }
+    else if (ev.key === "ArrowUp") { ev.preventDefault(); setActive(active - 1); }
+    else if (ev.key === "Home") { ev.preventDefault(); setActive(0); }
+    else if (ev.key === "End") { ev.preventDefault(); setActive(items.length - 1); }
+    else if (ev.key === "Enter" || ev.key === " ") {
+      ev.preventDefault();
+      const hit = options[active];
+      if (hit) pick(hit[0]);
+    }
   });
   return wrap;
 }
