@@ -104,7 +104,12 @@ fn run_git(root: &str, args: &[&str]) -> Result<std::process::Output, String> {
         // instead. This keeps network commands like `git push` from hanging
         // indefinitely on an auth prompt when no credential helper is set.
         .env("GIT_TERMINAL_PROMPT", "0")
-        .env("GCM_INTERACTIVE", "Never");
+        .env("GCM_INTERACTIVE", "Never")
+        // 锁英文。git 会**本地化**它的 fatal 信息——中文环境下 `not a git repository`
+        // 印出来的是「不是 git 仓库」。任何拿英文子串去区分"不是仓库"和"git 跑不起来"的
+        // 判断，在中文机器上都会全线失配，把每个正常的非仓库目录报成"git 坏了"。
+        .env("LC_ALL", "C")
+        .env("LC_MESSAGES", "C");
     // SSH has its own prompts, independent of GIT_TERMINAL_PROMPT. Keep any
     // user-supplied identity/wrapper command, but append non-interactive options.
     // `accept-new` permits first contact while still rejecting changed host keys.
@@ -236,6 +241,28 @@ pub fn git_status(root: String) -> Result<GitStatus, String> {
     require_git_root(&root, false)?;
     let inside = run_git(&root, &["rev-parse", "--is-inside-work-tree"])?;
     if !inside.status.success() {
+        // 「git 说这里不是仓库」和「git 根本跑不起来」是两件完全不同的事，而这里原来
+        // 一律报成 is_repo:false。后果是：模型收到"这不是 Git 仓库"，于是它要么去
+        // git init 一个**已经存在**的仓库，要么在报告里写下"当前目录没有 Git 仓库"
+        // 这个**假结论**——而真相是这台机器上 git 没装、或者 xcode-select 没配好。
+        // 重试任何 git_* 工具都没有意义，而模型不知道这一点。
+        let stderr = String::from_utf8_lossy(&inside.stderr).to_lowercase();
+        let really_not_a_repo = stderr.contains("not a git repository")
+            || stderr.contains("not a git repo")
+            // 上面 run_git 锁了 LC_ALL=C，正常情况下拿到的一定是英文；这两条是给
+            // LC_ALL 被外部环境强行覆盖的极端情况留的兜底。
+            || stderr.contains("不是 git 仓库")
+            || stderr.contains("不是git仓库");
+        if !really_not_a_repo {
+            let detail = String::from_utf8_lossy(&inside.stderr).trim().to_string();
+            return Err(format!(
+                "[GIT_UNAVAILABLE] git 在这台机器上跑不起来（原文：{}）。\
+                 这**不是**仓库的问题——重试 git_* 工具没有意义。\
+                 先 run_cmd 跑 `git --version` 确认；macOS 上多半要 `xcode-select --install`。\
+                 装好之前用 read_file / search 做调查，收尾时明说 Git 相关的验证没做成。",
+                if detail.is_empty() { "无输出".into() } else { detail }
+            ));
+        }
         return Ok(GitStatus {
             is_repo: false,
             branch: String::new(),

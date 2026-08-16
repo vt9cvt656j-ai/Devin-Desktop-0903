@@ -21416,8 +21416,13 @@ async function _buildEngineeringReferenceContext(text, root, stack, profile = _e
   return _engineeringReferenceContextBlock(body, false, storedAt);
 }
 
-// gh CLI availability: probed once per run (cheap to re-check, expensive to spam).
-let _ghCheckedThisRun = false;
+// gh CLI 可用性。
+//
+// 原来是「一次运行只探一次」：探完永不复位。而这道检查失败时给的药方是「先在终端装 gh /
+// gh auth login，然后再让 agent 用 gh_pr_* 工具」——用户照做之后**这一整个会话里它都吃不
+// 进去**，因为标记还是 true，模型再调一次仍然拿到同一句"不可用"。它自己开的方子，自己不认。
+//
+// 改成：**只缓存成功**。gh --version + gh auth status 一共几十毫秒，不值得为它牺牲可恢复性。
 let _ghAvailable = false;
 let _ghErr = "";
 
@@ -41327,7 +41332,14 @@ async function _runSubAgent({ config, description, prompt, root, container, run,
           if (!write && call.type === "cmd") {
             const safeCmd = _subAgentCmdAllowed(call.command, root || "");
             if (!safeCmd) {
-              result = { type: "cmd", path: "", content: `[BLOCKED] 只读子智能体只能运行纯探索（ls/cat/grep/find 等）或只读验证类（node --check/tsc --noEmit/测试/lint）命令，禁止写盘/修改类命令。你的命令：${String(call.command).slice(0, 120)}\n[P0.2-SafeCmdFilter]` };
+              // 这个判定是**对整条命令原文扫词**的，所以 grep 的搜索词、find 的 -name 模式、
+              // 测试文件路径里只要出现 create/init/install/clone 就会被拒——而拒绝理由却说成
+              // 「禁止写盘/修改类命令」，模型完全看不出自己踩了哪个词，只能反复换写法重试。
+              const _blockedHit = (String(call.command).match(/\b(?:create|init|install|clone|write|delete|remove|move|copy|mkdir|touch|chmod|chown|rm|mv|cp)\b/i) || [])[0] || "";
+              result = { type: "cmd", path: "", content: `[BLOCKED] 只读子智能体只能运行纯探索（ls/cat/grep/find 等）或只读验证类（node --check/tsc --noEmit/测试/lint）命令。`
+                + (_blockedHit ? `\n触发点：命令里出现了「${_blockedHit}」。注意判定是对**整条命令原文**扫词的——如果它只是出现在你的搜索关键词、-name 模式或某个文件路径里，换个写法就能过。` : "")
+                + `\n更好的做法：命令行检索被拒时改用 search / find_files / find_symbol——这三个在子任务里**始终可用**，而且比 grep 管道更准。`
+                + `\n你的命令：${String(call.command).slice(0, 120)}\n[P0.2-SafeCmdFilter]` };
               _settleToolStep(step, result, "已拒绝");
               messages.push({ role: "tool", tool_call_id: tc.id, content: _toolMsgForModel(call, result) });
               continue;
@@ -46099,12 +46111,27 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
         // readable prefix + a hash of the FULL arg string so distinct calls stay distinct.
         const _tmsg = (toolMsgs[i] && toolMsgs[i].content) || "";
         const callSig = _stableToolCallSignature(c);
-        const sig = `${callSig}@${_resultFingerprint(_tmsg)}`;
-        const failed = !!_toolFailureMatch(_tmsg);
+        // 死循环判据拆成**两个**签名，不再把结果文本揉进同一个 key。
+        //
+        // 原来是 `callSig@resultFingerprint`：调用和结果拼在一起当唯一键。问题是 harness
+        // 自己会往结果里追加**易变的事实**——响应头里的日期、慢安装命令的 `(93s)` 耗时、
+        // 重试上下文的 [RETRY_CONTEXT] 前缀、[IDE刷新] 标记。同一个调用因此被拆成 N 个
+        // 互不相同的签名，重复计数永远凑不满。http_request 尤其明显：Rust 侧的响应头是
+        // HashMap，每次迭代顺序都可能不同，于是**即使打同一个静态接口**指纹也对不上。
+        //
+        // 拆开之后语义才对：
+        //   · callSig 相同 **且** resultSig 相同 → 真死循环（同样的调用拿到同样的结果）
+        //   · callSig 相同 **但** resultSig 变了 → 有进展（比如轮询构建日志），不算空转
+        // 不能只留 callSig：那样 `read_terminal` 这类正当轮询会被判成死循环。
+        const resultSig = _resultFingerprint(_tmsg);
+        const sig = callSig;
+        // http 的非 2xx 原来根本不算失败——`_toolFailureMatch` 扫的是文本，而 http 结果
+        // 是格式化好的响应体，500 也读不出"失败"两个字。用执行侧已经算好的结论。
+        const failed = !!_toolFailureMatch(_tmsg) || _toolExecutionSucceeded(items[i]?.call, items[i]?.rawResult) === false;
         // A deduped re-read ("别重读" / "死循环") = the model tried to re-read an unchanged file it
         // already has. Two of those = spinning, a stuck signal on par with repeated failures.
         const dupRead = /\[别重读\]|\[停止·你在死循环\]/.test(_tmsg) && !/命令失败后的当前磁盘版本复核|失败后的当前磁盘\/日志复核/.test(_tmsg);
-        _callLog.push({ sig, failed, dupRead });
+        _callLog.push({ sig, resultSig, failed, dupRead });
         // ── 步数效率（step efficiency）──────────────────────────────────────
         // `_callLog` 是给死循环检测用的 12 条滑动窗口，问不出"这个 run 整体绕了多少路"。
         // 这里另记一份**累计**账：总调用、失败、重复签名、重复读取。
@@ -46127,11 +46154,16 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
         const failCounts = {};
         let maxRepeat = 0, maxFailRepeat = 0, fails = 0, dupReads = 0;
         for (const e of win) {
-          counts[e.sig] = (counts[e.sig] || 0) + 1;
-          if (counts[e.sig] > maxRepeat) maxRepeat = counts[e.sig];
+          // 「调用相同 **且** 结果也相同」才算原地打转。只看调用会把正当轮询
+          // （比如构建跑着的时候反复 read_terminal）判成死循环；只看结果则什么都不是。
+          const spinKey = `${e.sig}@${e.resultSig}`;
+          counts[spinKey] = (counts[spinKey] || 0) + 1;
+          if (counts[spinKey] > maxRepeat) maxRepeat = counts[spinKey];
           if (e.dupRead) dupReads++;
           if (e.failed) {
             fails++;
+            // 失败计数只按**调用**归并：同一个调用连续失败，报错文案里带个时间戳或行号
+            // 差异不该让它逃过计数——这正是原来那套拼接签名最容易漏掉的情形。
             failCounts[e.sig] = (failCounts[e.sig] || 0) + 1;
             if (failCounts[e.sig] > maxFailRepeat) maxFailRepeat = failCounts[e.sig];
           }
@@ -51632,8 +51664,7 @@ async function _executeToolStepInner(step, call, root, run) {
         return { type: "gh", path: call.op, content: `[BLOCKED] ${modeName} 是只读模式，不能 ${call.op}。` };
       }
       // Quick preflight: gh available + authed? Cached for the session.
-      if (!_ghCheckedThisRun) {
-        _ghCheckedThisRun = true;
+      if (!_ghAvailable) {   // 只缓存成功：上次失败就重探一次，别让用户装完还得重启
         try {
           const _v = await backend.taskRunCapture(ghRoot, "gh --version 2>&1");
           if (_v.code !== 0) { _ghAvailable = false; _ghErr = (_v.stdout || _v.stderr || "").trim().slice(0, 240); }
@@ -51646,7 +51677,7 @@ async function _executeToolStepInner(step, call, root, run) {
       }
       if (!_ghAvailable) {
         res.className = "atc-result atc-result--err"; res.textContent = "gh 不可用";
-        return { type: "gh", path: call.op, content: `[ERROR] gh CLI 不可用：${_ghErr || "未安装或未登录"}。先在终端跑：① 装 GitHub CLI（macOS: brew install gh；其他平台见 https://cli.github.com）；② gh auth login 登录；然后再让 agent 用 gh_pr_* 工具。` };
+        return { type: "gh", path: call.op, content: `[ERROR] gh CLI 不可用：${_ghErr || "未安装或未登录"}。先在终端跑：① 装 GitHub CLI（macOS: brew install gh；其他平台见 https://cli.github.com）；② gh auth login 登录；然后**直接重试这个工具即可，不需要重启 IDE**——这次失败不会被缓存。` };
       }
       const _shq = (s) => "'" + String(s || "").replace(/'/g, "'\\''") + "'";
       try {

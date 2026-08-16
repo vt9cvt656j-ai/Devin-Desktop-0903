@@ -23744,3 +23744,59 @@ test("绿证据要能盖住更早的红，否则改好了还被要求再修一�
   assert.doesNotMatch(fn, /if \(typeof e\.exitCode === "number" && e\.exitCode !== 0\) return e;/,
     "又变回「遇绿不停」了");
 });
+
+// ══ 死路扫描剩余 6 条 ═══════════════════════════════════════════════════════
+
+test("git 跑不起来不能被当成「这不是 git 仓库」", () => {
+  const rs = readFileSync(new URL("../src-tauri/src/git.rs", import.meta.url), "utf8");
+  // 两件完全不同的事原来一律报成 is_repo:false —— 模型于是要么去 git init 一个已存在的
+  // 仓库，要么在报告里写下"当前目录没有 Git 仓库"这个假结论，而真相是 git 没装。
+  assert.match(rs, /\[GIT_UNAVAILABLE\]/);
+  assert.match(rs, /let really_not_a_repo = stderr\.contains\("not a git repository"\)/);
+  assert.match(rs, /重试 git_\* 工具没有意义/, "要说清重试无用，否则它会一直试");
+  assert.match(rs, /xcode-select --install/, "macOS 上最常见的原因要点名");
+  // i18n 陷阱：git 会本地化 fatal 信息，中文机器上英文匹配全线失配
+  assert.match(rs, /\.env\("LC_ALL", "C"\)/, "不锁语言的话，中文环境下每个非仓库目录都会被报成「git 坏了」");
+  assert.match(rs, /\.env\("LC_MESSAGES", "C"\)/);
+});
+
+test("工作区根目录没了要说清是「工作区没了」而不是命令写错了", () => {
+  const rs = readFileSync(new URL("../src-tauri/src/tasks.rs", import.meta.url), "utf8");
+  assert.match(rs, /\[WORKSPACE_GONE\] 工作目录不存在：\{cwd\}/, "报错必须带路径");
+  assert.match(rs, /这是\*\*当前工作区的根目录\*\*，不是命令里写的路径/,
+    "不说清身份，模型会去改命令、换路径，反复重试");
+  assert.match(rs, /换命令、换路径都没用/);
+  assert.match(rs, /不要继续重试/);
+});
+
+test("gh 不可用只缓存成功——用户装完不该还要重启", () => {
+  // 原来一次运行只探一次、永不复位。而失败文案让用户去装 gh / 登录，
+  // 照做之后这一整个会话它都吃不进去：它自己开的方子，自己不认。
+  assert.doesNotMatch(SRC, /_ghCheckedThisRun/, "还在按运行缓存，失败也会被记住");
+  assert.match(SRC, /if \(!_ghAvailable\) \{\s*\/\/ 只缓存成功/);
+  assert.match(SRC, /不需要重启 IDE\*\*——这次失败不会被缓存/);
+});
+
+test("子体命令被拒时要报出真正的触发词，并指向结构化检索", () => {
+  // 判定是对整条命令原文扫词的，所以 grep 的搜索词、find 的 -name 模式、测试文件路径
+  // 里出现 create/init/install/clone 都会被拒——而理由却说成"禁止写盘/修改类命令"。
+  assert.match(SRC, /const _blockedHit = \(String\(call\.command\)\.match\(/);
+  assert.match(SRC, /触发点：命令里出现了「\$\{_blockedHit\}」/);
+  assert.match(SRC, /判定是对\*\*整条命令原文\*\*扫词的/, "不说清这一点，模型看不出自己踩了哪个词");
+  assert.match(SRC, /改用 search \/ find_files \/ find_symbol——这三个在子任务里\*\*始终可用\*\*/);
+});
+
+test("死循环判据拆成两个签名：调用相同且结果相同才算原地打转", () => {
+  const loop = extractFn("_runAgenticLoop");
+  // 原来把结果文本揉进同一个 key，而 harness 自己会往结果里追加易变事实（响应头日期、
+  // 耗时、[RETRY_CONTEXT] 前缀），同一个调用被拆成 N 个签名，重复计数永远凑不满。
+  assert.match(loop, /const resultSig = _resultFingerprint\(_tmsg\);/);
+  assert.match(loop, /const sig = callSig;/);
+  assert.doesNotMatch(loop, /const sig = `\$\{callSig\}@\$\{_resultFingerprint/, "又拼回一个 key 了");
+  // 消费端：重复要看双签名，失败只按调用归并
+  assert.match(loop, /const spinKey = `\$\{e\.sig\}@\$\{e\.resultSig\}`;/);
+  assert.match(loop, /failCounts\[e\.sig\] = \(failCounts\[e\.sig\] \|\| 0\) \+ 1;/,
+    "失败计数按调用归并——报错里带时间戳不该让它逃过计数");
+  // http 的非 2xx 原来根本不算失败：_toolFailureMatch 扫的是文本，500 读不出"失败"
+  assert.match(loop, /_toolExecutionSucceeded\(items\[i\]\?\.call, items\[i\]\?\.rawResult\) === false/);
+});
