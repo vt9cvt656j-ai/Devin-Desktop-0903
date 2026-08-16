@@ -953,7 +953,7 @@ test("档位滑块：拖动要真的落到档位上，且拖出卡片边界不�
   // 1) 两个控件都换成了滑块（不再是分段按钮那一套）
   const ctxFn = SRC.slice(SRC.indexOf("function _modelContextRows"));
   assert.match(ctxFn.slice(0, 2000), /_micSliderHtml\(/, "上下文没渲染成滑块");
-  const thinkAt = SRC.indexOf("thinkEl.innerHTML = label");
+  const thinkAt = SRC.indexOf("thinkEl.innerHTML =");
   assert.notEqual(thinkAt, -1, "思考深度那段渲染没了");
   assert.match(SRC.slice(thinkAt, thinkAt + 600), /_micSliderHtml\(/, "思考深度没渲染成滑块");
 

@@ -12956,7 +12956,16 @@ function _modelContextChoices(id) {
   return _ctxChoiceOptions(id)
     .slice()
     .sort((a, b) => a.value - b.value || (a.kind === "native" ? -1 : 1))
-    .map((o) => ({ ...o, label: _tokenShort(o.value), valueLabel: _tokenShort(o.value) }));
+    // 标签说的是**运维在卖的那套档位名**，不是算出来的合计。
+    //
+    // 档位在网关侧是**叠加**的（compression.rs: capacity_for_native = native + tier），
+    // 所以 1M 原生配 2M 档，真实容量确实是 3M —— 数字没错。但后台卖的是「1M/2M/5M」，
+    // 卡片上冒出 3M / 6M 会让人以为自己买的档位对不上。写成 +1M / +2M / +5M：既是
+    // 后台那套名字，加号又说清了它是叠在原生之上的。
+    .map((o) => {
+      const label = o.kind === "native" ? _tokenShort(o.value) : `+${o.tier}`;
+      return { ...o, label, valueLabel: label };
+    });
 }
 
 function _modelContextRows(m) {
@@ -13065,6 +13074,10 @@ async function loadBackendModels() {
         // How much the model will WRITE. Null from the gateway means unknown for this route, and
         // 0 here carries that through — nothing downstream may substitute a number for it.
         priceSource: it.price_source || it.priceSource || "",
+        // 缓存读/写单价（每 100 万 token）。网关算好后下发，客户端不推算——推算过的
+        // 那版实测偏一半（deepseek 缓存读真实 0.0123、推算 0.0061）。
+        cacheReadPrice: Math.max(0, Number(it.cache_read_price) || 0),
+        cacheWritePrice: Math.max(0, Number(it.cache_write_price) || 0),
         // 这个模型有没有一条强力线路。三态，不能压成布尔：
         //   true  → 显示右上角那个闪电按钮；
         //   false → 网关明确说了没有，别把按钮画出来（点了只会撞报错）；
@@ -14814,42 +14827,38 @@ function officialPrice(id = "") {
 }
 function _modelPriceRows(m) {
   const p = officialPrice(m.id);
-  const hasBackend = (Number(m.inPrice) || 0) > 0 || (Number(m.outPrice) || 0) > 0;
-  const rows = [];
   const title = _escHtml(t("model.price.title"));
-  const input = _escHtml(t("model.price.input"));
-  const output = _escHtml(t("model.price.output"));
   const unit = _escHtml(t("model.price.perMillionTokens"));
-  // Price source ("后台单模型设置" etc.) and the billing rate multiplier are backend
-  // bookkeeping. Neither is something the user chose or can act on from this card, so
-  // neither earns a row here.
-  const sourceRow = () => "";
-  if (hasBackend) {
-    rows.push(
-      `<div class="mic-plabel">${title}</div>`,
-      `<div class="mic-row"><span class="mic-k">${input}</span><span class="mic-v">${_fmtTokPrice(m.inPrice)}</span><span class="mic-u">${unit}</span></div>`,
-      `<div class="mic-row"><span class="mic-k">${output}</span><span class="mic-v">${_fmtTokPrice(m.outPrice)}</span><span class="mic-u">${unit}</span></div>`
-    );
-
+  // 四格：输入 / 输出 / 缓存写 / 缓存读。缓存两项来自网关，走的是和报价接口同一条
+  // 三级规则（管理员手填 > 实时目录 > 按输入价推算），所以这里显示的价和账单上扣的
+  // 价不会分叉。网关没给就不画那一格——缓存价不该由客户端自己编一个出来。
+  const cell = (k, v) =>
+    `<div class="mic-price"><div class="mic-price__k">${_escHtml(k)}</div>`
+    + `<div class="mic-price__v">${_fmtTokPrice(v)}</div></div>`;
+  const inP = (Number(m.inPrice) || 0) > 0 ? Number(m.inPrice) : (p ? p.in : 0);
+  const outP = (Number(m.outPrice) || 0) > 0 ? Number(m.outPrice) : (p ? p.out : 0);
+  const cw = Number(m.cacheWritePrice) || 0;
+  const cr = Number(m.cacheReadPrice) || 0;
+  const cells = [];
+  if (inP > 0 || outP > 0) {
+    cells.push(cell(t("model.price.input"), inP), cell(t("model.price.output"), outP));
+    if (cw > 0) cells.push(cell("缓存输入", cw));
+    if (cr > 0) cells.push(cell("缓存读取", cr));
   } else if ((Number(m.flatPrice) || 0) > 0) {
-    rows.push(
-      `<div class="mic-plabel">${title}</div>`,
-      `<div class="mic-row"><span class="mic-k">${_escHtml(t("model.price.flat"))}</span><span class="mic-v">${_fmtTokPrice(m.flatPrice)}</span><span class="mic-u">${_escHtml(t("model.price.perCallUnsplit"))}</span></div>`
-    );
-  } else if (p) {
-    rows.push(
-      `<div class="mic-plabel">${title}</div>`,
-      `<div class="mic-row"><span class="mic-k">${input}</span><span class="mic-v">${_fmtTokPrice(p.in)}</span><span class="mic-u">${unit}</span></div>`,
-      `<div class="mic-row"><span class="mic-k">${output}</span><span class="mic-v">${_fmtTokPrice(p.out)}</span><span class="mic-u">${unit}</span></div>`,
-      sourceRow(t("model.price.source.catalog"))
-    );
+    cells.push(cell(t("model.price.flat"), Number(m.flatPrice)));
   }
-  if (rows.length) return rows.join("");
+  if (cells.length) {
+    return `<div class="mic-plabel mic-plabel--center">${title}</div>`
+      + `<div class="mic-prices__grid">${cells.join("")}</div>`
+      + `<div class="mic-price__unit">${unit}</div>`;
+  }
   if (/image|生图|图像/i.test(String(m.id))) {
     return `<div class="mic-row mic-row--hint"><span class="mic-u">${_escHtml(t("model.price.imageBilling"))}</span></div>`;
   }
-  return `<div class="mic-plabel">${title}</div><div class="mic-row mic-row--hint"><span class="mic-u">${_escHtml(t("model.price.missing"))}</span></div>`;
+  return `<div class="mic-plabel mic-plabel--center">${title}</div>`
+    + `<div class="mic-row mic-row--hint"><span class="mic-u">${_escHtml(t("model.price.unknown"))}</span></div>`;
 }
+
 function showModelInfoCard(m, anchorEl) {
   if (!m || !m.id) return hideModelInfoCard();
   _modelInfoCurrent = { m, anchorEl };
@@ -14862,9 +14871,11 @@ function showModelInfoCard(m, anchorEl) {
     _modelPowerToggleHtml(m) + `</div>` +
     `<div class="mic-id"></div>` +
     `<div class="mic-desc"></div>` +
-    `<div class="mic-prices">${_modelPriceRows(m)}</div>` +
     `<div class="mic-ctx">${_modelContextRows(m)}</div>` +
-    `<div class="mic-think"></div>`;
+    `<div class="mic-think"></div>` +
+    // 价格放最后：上下文和思考深度是**能动的**，价格是只读事实。可操作的控件排在
+    // 上面，一眼就能拖；只读信息垫底。
+    `<div class="mic-prices">${_modelPriceRows(m)}</div>`;
   // Fill text via textContent (admin-controlled strings → never inject markup).
   card.querySelector(".mic-name").textContent = m.name || m.id;
   const gEl = card.querySelector(".mic-group");
@@ -14893,15 +14904,16 @@ function showModelInfoCard(m, anchorEl) {
     // 标题只留「思考深度」。原来还挂着上游参数名（thinking budget / reasoning_effort）
     // 和一句「思考开启 · 低」—— 参数名是实现细节，状态则和滑块右边那个读数说的是同
     // 一件事，两处重复。
-    const label = `<div class="mic-plabel">${_escHtml(t(_boolToggle ? "model.thinkingToggle" : "model.thinkingDepth"))}</div>`;
+    // 标题交给滑块自己渲染，和右边的读数同一行——原来标题单独占一行、读数再占一行，
+    // 中间那截空白就是「思考深度」离滑块老远的原因。上下文那条本来就是一行的写法。
+    const thinkTitle = t(_boolToggle ? "model.thinkingToggle" : "model.thinkingDepth");
     const think = levels.map((lvl) => ({ lvl, label: labels[lvl] || lvl, valueLabel: labels[lvl] || lvl }));
-    thinkEl.innerHTML = label
-      + _micSliderHtml({
-          kind: "think",
-          title: "",
-          options: think,
-          index: Math.max(0, levels.indexOf(current)),
-        });
+    thinkEl.innerHTML = _micSliderHtml({
+      kind: "think",
+      title: thinkTitle,
+      options: think,
+      index: Math.max(0, levels.indexOf(current)),
+    });
     // 上下文滑块。买不到的档位照样占一个刻度（藏起来会让人以为没这个档），
     // 拖到那儿弹回最高可选档并说清为什么。
     const ctxSl = card.querySelector('.mic-ctx .mic-sl[data-sl="ctx"]');
@@ -14917,7 +14929,7 @@ function showModelInfoCard(m, anchorEl) {
         }
         const o = ctxOpts[at];
         if (o) _setCtxChoice(m.id, o.value, o.kind === "native" ? "native" : "modified");
-        return { index: at, valueLabel: o ? _tokenShort(o.value) : "" };
+        return { index: at, valueLabel: o?.valueLabel || "" };
       });
     }
     // 思考深度滑块。
