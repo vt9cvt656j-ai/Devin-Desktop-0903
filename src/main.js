@@ -19568,7 +19568,7 @@ function _callIsReadOnlyCommand(call) {
   try { return _looksLikeReadOnlyCommand(call.command); } catch { return false; }
 }
 /**
- * 已启用技能声明的 allowed-tools，是**真的约束**，不是卡片上一枚灰色小标签。
+ * 常驻技能声明的 allowed-tools，是**真的约束**，不是卡片上一枚灰色小标签。
  *
  * Claude Code 里 allowed-tools 的语义是"这个技能在场时只准用这几个工具"。这里原来只把
  * 它画在工具卡片上（"正文要用 X"），既不放行也不拦截——一个写着 `allowed-tools: Read, Grep`
@@ -19631,7 +19631,7 @@ async function _approveToolCall(call, run) {
   if (!call) return true;
   const dangerous = _callIsDestructive(call);
 
-  // ⓪ 已启用技能的 allowed-tools 先收窄。这一条排在权限规则**之前**：它不是"要不要问
+  // ⓪ 常驻技能的 allowed-tools 先收窄。这一条排在权限规则**之前**：它不是"要不要问
   // 用户"，而是"这个技能在场时这件事根本不在范围内"，和用户此刻愿不愿意批准无关。
   // typeof 守卫：这个闸会被测试单独抽出来跑（沙箱里只注入它显式声明的依赖），
   // 直接引用会 ReferenceError 把整道闸打挂。文件里其它可选依赖也是这个写法。
@@ -24453,7 +24453,7 @@ async function sendPrompt(text, attachments = [], readyConfig = null) {
   }
   // Append the model-family style corrective (GPT → strong anti-verbosity; weaker
   // models → terse). Static per model, so the prompt prefix still caches.
-  // 聊天模式只给**已启用技能的全文**，不给技能目录：目录的落点是「用 read_skill 读它」，
+  // 聊天模式只给**常驻技能的全文**，不给技能目录：目录的落点是「用 read_skill 读它」，
   // 而聊天那条路径不执行工具，那句话在这儿是死路。已启用的正文不需要任何工具，照给。
   const skillsBlock = _agentLightTurn ? "" : (effectiveMode === "chat" ? _activeSkillsBlock() : _skillsSystemBlock());
   // 用户规则连轻量轮也带上：那些轮次省的是系统提示词和工作区预热，而"用中文回答"这种
@@ -28327,7 +28327,7 @@ function _skillCatalogBlock() {
   } catch { return ""; }
 }
 
-/// 进系统提示词的技能内容：目录（全部）＋ 已启用技能的全文。
+/// 进系统提示词的技能内容：目录（全部）＋ 常驻技能的全文。
 /// 按名字找技能。模型是照着目录里的名字写的，但大小写、空格、连字符经常对不上
 /// （`UI/UX Pro Max` vs `ui-ux-pro-max`），归一化之后再比；还找不到就退一步做包含匹配，
 /// 但要求查询至少 3 个字符，免得一个 "a" 命中一堆。
@@ -28411,7 +28411,7 @@ function _activeSkillsBlock() {
     const active = [...byId.values()].filter((s) => _activeSkillIds.has(s.id) && String(s.prompt || "").trim());
     if (!active.length) return "";
     const maxChars = 10_000;
-    let out = "\n\n# 已启用的技能（用户手动开启，本次对话请始终遵循这些指令）\n";
+    let out = "\n\n# 常驻技能（用户把它钉住了，本次对话请始终遵循这些指令）\n";
     let included = 0;
     for (const s of active) {
       let entry = `\n## 技能 ${included + 1}：${s.name || "未命名"}\n`;
@@ -28429,7 +28429,7 @@ function _activeSkillsBlock() {
       included++;
     }
     if (included < active.length) {
-      out += `\n（另有 ${active.length - included} 个已启用技能未展开全文；它们仍在上面的技能清单里，需要时用 read_skill 按名字读。）\n`;
+      out += `\n（另有 ${active.length - included} 个常驻技能未展开全文；它们仍在上面的技能清单里，需要时用 read_skill 按名字读。）\n`;
     }
     return out;
   } catch { return ""; }
@@ -28673,7 +28673,20 @@ function _parseSkillDocument(text, sourcePath) {
      * 提前砍死，等于把那套动态预算的上限永久钉在 240。
      */
     desc: desc.replace(/\s+/g, " ").trim().slice(0, 1200),
-    prompt,
+    /*
+     * 正文剥掉 YAML frontmatter。
+     *
+     * 以前 prompt 存的是整份文件，于是 name / description / allowed-tools 会原样进模型：
+     * 常驻注入时进一次，read_skill 再读一次，而 description 早就在技能清单里了——同一段
+     * 元数据在上下文里出现三遍，占的还是最贵的那块预算（常驻 10k、read_skill 24k）。
+     * `allowed-tools: Read, Grep` 这行以纯文本混在指令里更别扭：它读起来像一句给模型的
+     * 命令，而真正的约束在 _skillAllowedTools 那道闸上，两边说法不一致时模型信哪个？
+     * Claude Code 给模型的就是剥掉 frontmatter 之后的正文。
+     *
+     * 剥完是空的（整份文件只有 frontmatter）就退回原文：那种技能本来也没有正文可给，
+     * 剥成空串只会让它从清单里凭空消失——那是比多几行元数据更糟的结果。
+     */
+    prompt: (frontmatter ? prompt.slice(frontmatter[0].length).trim() : prompt) || prompt,
     sourcePath: normalizedPath,
     baseDir: normalizedPath.slice(0, normalizedPath.lastIndexOf("/")) || ".",
     ...(tools.length ? { tools } : {}),
@@ -28879,14 +28892,17 @@ async function _deleteSkillRecord(skill, root, customList = null) {
   const skillRoot = String(root || rootPath || workspaceRoots[0] || "").replace(/\/+$/, "");
   if (skill._readonly) {
     const dir = String(skill.baseDir || "").trim();
-    if (!dir) throw new Error("这个技能没有对应的磁盘目录，只能停用");
+    if (!dir) throw new Error("这个技能没有对应的磁盘目录，删不掉（它不是从文件发现的）");
     // 工作区外面的技能：删的是用户目录 / 插件目录里的真实文件夹。把完整路径摆出来再删
     // ——它不在当前项目里，用户很可能以为只是从这个列表里移除。
     if (!_skillIsWorkspaceInstalled(skill, skillRoot)) {
       const ok = confirm(
         `这个技能不在当前工作区，它的文件在：\n\n${dir}\n\n`
         + "删除会把这个目录整个删掉，其它项目里也会跟着消失。\n"
-        + "如果只是不想让它生效，关掉开关就行。\n\n确定删除？",
+        // 这里原来劝用户"别删了，把开关关掉就不生效了"——那是假的。那个开关管的只是常驻
+        // 注入；关掉之后，模型照样在技能清单里看得见它、照样能 read_skill 读它、照样会用。
+        // 用户照着那句话点一下，以为技能被关了，实际什么都没变。
+        + "想让它彻底不出现，只能删；「取消常驻」只是不再把全文塞进每次请求。\n\n确定删除？",
       );
       if (!ok) return;
     }
@@ -28922,7 +28938,7 @@ async function openSkillsPanel() {
   const renderList = () => {
     m.body.innerHTML = "";
     const intro = document.createElement("p"); intro.className = "ctp-intro";
-    intro.textContent = "启用后的技能指令会进入每次模型请求，并传给 Agent 子任务。这里支持自定义技能，也会发现项目、父仓库、用户目录和 Codex 插件缓存中的 SKILL.md；文件型技能保持只读。登录后自定义技能会同步到账号。";
+    intro.textContent = "技能始终对模型可见：清单里的名称和描述一直在上下文里，模型按需自己读取正文。「常驻」是把某个技能的全文钉进每次请求，并传给 Agent 子任务。这里支持自定义技能，也会发现项目、父仓库、用户目录和 Codex 插件缓存中的 SKILL.md；文件型技能保持只读。登录后自定义技能会同步到账号。";
     m.body.appendChild(intro);
     const list = document.createElement("div"); list.className = "ctp-list";
     if (!skills.length) { const e = document.createElement("div"); e.className = "ctp-empty"; e.textContent = "还没有技能。点下面「新建技能」创建你自己的。"; list.appendChild(e); }
@@ -28935,13 +28951,27 @@ async function openSkillsPanel() {
       row.innerHTML =
         `<span class="skill-row__icon">${_skillIconMarkup(s.icon)}</span>` +
         `<div class="skill-row__main"><div class="skill-row__name"></div><div class="skill-row__desc"></div></div>` +
-        `<div class="ctp-rowbtns"><button class="ctp-btn ${on ? "ctp-btn--on" : "ctp-btn--primary"} _use" type="button">${on ? "取消使用" : "使用"}</button><button class="ctp-iconbtn _edit" type="button" title="查看" aria-label="查看">${_ICON_EYE}</button>${canDelete ? `<button class="ctp-iconbtn ctp-iconbtn--danger _del" type="button" title="${readonly ? "删除工作区技能目录" : "删除"}" aria-label="删除">${_ICON_TRASH}</button>` : ""}</div>`;
+        `<div class="ctp-rowbtns"><button class="ctp-btn ${on ? "ctp-btn--on" : "ctp-btn--primary"} _use" type="button">${on ? "取消常驻" : "常驻"}</button><button class="ctp-iconbtn _edit" type="button" title="查看" aria-label="查看">${_ICON_EYE}</button>${canDelete ? `<button class="ctp-iconbtn ctp-iconbtn--danger _del" type="button" title="${readonly ? "删除工作区技能目录" : "删除"}" aria-label="删除">${_ICON_TRASH}</button>` : ""}</div>`;
       row.querySelector(".skill-row__name").textContent = s.name || "(未命名)";
       row.querySelector(".skill-row__desc").textContent = s.desc || (s.prompt || "").slice(0, 64);
-      // 使用 = toggle this skill's injection into the prompt (Claude Code-style). Multiple can be active.
+      /*
+       * 这个开关叫「常驻」而不是「使用 / 停用」，因为它管的从来就不是"能不能用"。
+       *
+       * 技能**始终**对模型可见：所有已发现技能的 name + description 常驻在系统提示词的
+       * 技能清单里，模型自己判断该用哪个，再用 read_skill 读正文——这是 Anthropic Agent
+       * Skills 的渐进式披露，和 Claude Code 一致。这个开关只多做一件事：把选中技能的
+       * **全文**钉进每次请求，省掉模型自己去读那一步。
+       *
+       * 所以旧文案是错的。按钮写「取消使用」、气泡说「已取消」，读起来是"这个技能现在
+       * 不生效了"——而模型照样看得见它、照样能 read_skill 读它、照样会用。用户想关掉一个
+       * 技能时点了它、以为关掉了，实际什么都没关。文案换成常驻/取消常驻，说的才是它
+       * 真正做的那件事；真要让一个技能彻底不出现，得删掉它的文件（右边的删除按钮）。
+       */
       row.querySelector("._use").addEventListener("click", () => {
         _toggleSkillActive(s.id);
-        showToast(_isSkillActive(s.id) ? "已启用技能：" + (s.name || "技能") + "（会注入到对话）" : "已取消：" + (s.name || "技能"));
+        showToast(_isSkillActive(s.id)
+          ? `已常驻「${s.name || "技能"}」：全文进入每次请求`
+          : `已取消常驻「${s.name || "技能"}」：模型仍可按需自行读取它`);
         renderList();
       });
       row.querySelector("._edit").addEventListener("click", () => { editing = { ...s, _idx: i }; renderForm(); });
@@ -51067,8 +51097,8 @@ async function _executeToolStepInner(step, call, root, run) {
        * "run scripts/foo.py" 却不知道相对谁，只能拿工作区根去猜，猜错就是一次
        * "文件不存在"，然后它多半会自己重写一个脚本——技能里附带的那些资源白带了。
        *
-       * 放开头是因为 _toolMsgForModel 对 skill 类型有 8000 字符上限，且截断保留头部：
-       * 写在末尾的话，任何一个超过 8k 的技能都会把这段说明丢掉。
+       * 放开头是因为 _toolMsgForModel 对 skill 类型的预算是有限的（现在 30000，且截断
+       * 保留头部）：写在末尾的话，一个超预算的技能会把这段说明整段丢掉。
        */
       const home = hit.baseDir || (hit.sourcePath ? parentDir(hit.sourcePath) : "");
       const head = home
