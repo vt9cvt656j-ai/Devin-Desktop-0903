@@ -38795,7 +38795,14 @@ function _freshBuildFailure(run, implOps) {
     if (e.verifierRecognized !== true) continue;
     if (e.implementationVersion !== implOps) continue; // only the current artifact may drive another fix pass
     if (e.timedOut === true) continue;
-    if (typeof e.exitCode === "number" && e.exitCode !== 0) return e;
+    // 遇到**当前版本**的第一条有退出码的验证记录就地裁决（last-write-wins）。
+    //
+    // 原来这里只在 `exitCode !== 0` 时返回、绿的就继续往前找——于是
+    // 「跑一次红 → 改好 → 再跑同一条命令绿」之后，那条**更早的红**仍然会把这道门打开，
+    // 模型被要求再修一遍一个已经绿了的构建。倒序扫描的语义本来就是"最近一次说了算"，
+    // 绿的时候不停下来等于把这个语义丢了。
+    // 纯收紧：不放宽任何路径，只是让更晚的绿能盖住更早的红。
+    if (typeof e.exitCode === "number") return e.exitCode === 0 ? null : e;
   }
   return null;
 }
@@ -44581,6 +44588,56 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
       if (!turn.toolCalls.length) {
         quietTurns++;
         if (!_live()) break;
+        /*
+         * ── 静默轮：该收尾还是该续跑 ───────────────────────────────────────
+         *
+         * 模型这一轮没调工具，是它的**收尾决定**，默认成立。harness 只在「已观测到的
+         * 执行事实」与「已完成」**直接矛盾**时才推翻它——而且矛盾必须由机器产生：
+         * 命令的退出码、诊断相对基线的增量、用户输入队列里真实存在的消息、
+         * 模型自己调 update_plan 建立的计划状态。
+         *
+         * **模型正文里的任何措辞都不是事实。** 同一句中文（"我再跑一遍""下一步我会改 X"
+         * "- [ ] 迁移 Y""未实现"）既可能是欠账、也可能是完成态复述、也可能是用户明令
+         * 延后的事项、也可能交付物本身就是这段文字。表层措辞分不开这四者，而其中三者
+         * 不该续跑。（专门做过一轮设计：12 条基于正文的判据全部被反例打掉，最典型的是
+         * "最后我再跑一遍完整测试，断言仍然是绿的"——中文完成态复述的标准句式，
+         * 100% 命中"我要去做 X"的检测。详见提交信息。）
+         *
+         * 两类错误的代价不对称：**停早了**用户打一句"继续"，成本一轮；**停晚了**是烧钱
+         * 空转、把用户明说"别动"的文件改掉、把一次干净成功盖成 partial。所以分界线画在
+         * 保守一侧。
+         *
+         * 缺席不是失败。"没跑验证""没写测试"是观测到的**缺席**，只记账、永不补回合
+         * （test/logic.test.mjs 两条断言钉着，别动）。
+         */
+        // R0 全局关闸：这几种情形下任何门都不开。
+        // 不要用 run.engineering.explicitReadOnly —— 它是分类器画像推出来的，
+        // 纯问答（workspaceAction="none"）时它是 false，救不了任何一次问答。
+        const _gatesOff = run.mode !== "agent"
+          || run._userDenied === true
+          || run._readOnlyBlocked === true;
+        // R2 连续静默闸：推了提醒、模型却只把文字重写一遍 → 立刻停，别再开门。
+        // 正常的修复路径是"推提醒 → 模型调工具修 → 再静默"，中间那个工具轮会把
+        // quietTurns 归零，所以这条闸只拦真正的空转，不影响任何真实修复循环。
+        const _quietRepeat = quietTurns >= 2;
+        // 全局预算：三道门的子上限（诊断 2 / 构建 2 / 计划 2）之外再加一个总闸。
+        // 没有它，四道门各算各的，一次 run 最多能多转 9 轮。
+        if (run._quietResumePool == null) run._quietResumePool = 3;
+        const _canResume = !_gatesOff && !_quietRepeat && run._quietResumePool > 0 && _live();
+        // 上一轮门推的提醒必须清掉再进下一轮。不清的话那条 _ORCH_NOTE 会一直挂在消息
+        // 尾部，而模型又被禁止在回复里提及它——它唯一能做的合规动作就是把上一轮的答案
+        // 换个说法重写，于是产生第二个静默轮。这正是"再空转一轮"的机器成因。
+        if (quietTurns >= 2) _clearNudges();
+        // R1 用户插话优先：提到所有门之前。
+        // 原来这一句夹在构建门和计划门中间——只要上面任何一道门先 break，用户中途发的
+        // 那条消息就被永久搁死。用户重新定义了任务，之前的欠账账本一并作废。
+        if (Array.isArray(session._steerQueue) && session._steerQueue.length && _live()) {
+          run._diagnosticNudges = 0;
+          buildFixAttempts = 0;
+          run._planFinishNudges = 0;
+          run._quietResumePool = 3;
+          continue;
+        }
         // 模型自己派发的子智能体（run_subagent）：模型知道它们在跑，也有 await_subagent 可以
         // 显式汇合。它选择收尾就是它的判断——只如实记账那些还没读的结果，绝不制造回合去覆盖它。
         // （原来还有一条"IDE 自动派发的孩子给一次有界整合机会"的腿；auto-dispatch 删除后没有任何
@@ -44645,9 +44702,16 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
         // fresh-error count reaches zero, and the convergence counter above stops
         // populating it after two rounds without progress — so an unfixable diagnostic
         // converges to an honest incomplete instead of looping forever.
-        if (run._diagnosticBlock && _live()) {
+        if (run._diagnosticBlock && _canResume) {
           run._diagnosticNudges = (run._diagnosticNudges || 0) + 1;
           if (run._diagnosticNudges <= 2) {
+            run._quietResumePool--;
+            // 上一轮已经推过一次、而这一轮模型没有产生任何新的成功编辑 → 说明提醒没起作用，
+            // _diagnosticBlock 又只在有成功编辑时才重算，再推就是拿一个陈旧值反复烧钱。
+            if (run._diagnosticNudges >= 2 && !(Array.isArray(_successfulEdits) && _successfulEdits.length)) {
+              run._quietResumePool++;   // 没真的开火，把刚扣的还回去
+              run._incompleteReason = run._incompleteReason || "new_diagnostics_unresolved";
+            } else
             _pushNudge("diagFinish", "[BLOCKING_NEW_DIAGNOSTICS] 收尾前还有你这次改动引入的新增错误没清零。先定位并修掉，再确认它们消失；不要在这个状态下宣布完成：\n\n"
               + String(run._diagnosticBlock).slice(0, 2400));
             continue;
@@ -44660,9 +44724,10 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
         // which is the "开发服务器在跑但页面不可见 / 13 个 TS 错误" symptom. Bounded so an
         // unfixable build converges to an honest incomplete instead of thrashing forever.
         const _buildFail = _freshBuildFailure(run, _implOps);
-        if (_buildFail && _live()) {
+        if (_buildFail && _canResume) {
           if (buildFixAttempts < 2) {
             buildFixAttempts++;
+            run._quietResumePool--;
             const _tail = String(_buildFail.stderr || _buildFail.stdout || "").slice(-2400);
             _pushNudge("buildFix", `[BUILD_FAILED] 上次声明为验证的命令 \`${_buildFail.command}\` 退出码 ${_buildFail.exitCode}——构建/测试没过，代码现在跑不起来。这是交付前必须清零的硬事实（退出码即结论）。先读下面的真实错误、定位并修掉根因，再重新运行同一条验证命令确认退出 0；在拿到绿色之前不要收尾、不要转去做别的：\n\n${_tail}`);
             continue;
@@ -44675,7 +44740,7 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
         // queue but the loop was about to end and would never drain it. Loop once more so the
         // top-of-loop drain splices it in and the model actually acts on the new message,
         // instead of it being stranded until (maybe never) a future turn.
-        if (Array.isArray(session._steerQueue) && session._steerQueue.length && _live()) continue;
+        // （用户插话的抽干已提到本分支顶端 R1，见上面那段说明。）
         // 计划没做完就不算 truly done。这个退出点是「模型这一轮没调工具」——也正是它写完
         // 第 2 步、说两句话、然后停下来的那一轮。它上面所有强制续跑的条件（诊断、构建失败、
         // 用户插话）没有一条读计划，而唯二读计划的两个提醒都在「本轮有工具调用」的分支里，
@@ -44684,8 +44749,10 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
         // 有界（3 次）：计划确实做不下去时收敛成一次诚实的「未完成」，而不是无限循环。
         const _pendingPlan = (Array.isArray(run._planSteps) ? run._planSteps : [])
           .filter((step) => step?.status === "pending" || step?.status === "in_progress");
-        if (_pendingPlan.length && _live() && (run._planFinishNudges || 0) < 3) {
+        // 预算从 3 下调到 2，和另外两道门对齐——全局池只有 3，单门占 3 会把另外两道饿死。
+        if (_pendingPlan.length && _canResume && (run._planFinishNudges || 0) < 2) {
           run._planFinishNudges = (run._planFinishNudges || 0) + 1;
+          run._quietResumePool--;
           _pushNudge("planFinish", `[计划未完成] 还有 ${_pendingPlan.length} 步没做完：${_pendingPlan.slice(0, 8).map((step) => step.content).join("、")}。`
             + `\n继续做下一步。某一步确实不该做，就用 update_plan 标 cancelled 并写明原因——不要在还有未完成步骤时静默收尾，也不要反问「要不要我继续」。`);
           continue;

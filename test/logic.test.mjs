@@ -20728,7 +20728,9 @@ test("the diagnostic block and auto-verify convergence loop are actually wired",
 
   // The block must actually GATE the finish. A populated block that nothing reads is
   // exactly the regression this test exists to catch.
-  assert.match(loop, /if \(run\._diagnosticBlock && _live\(\)\)[\s\S]{0,600}?continue;/,
+  // _live() → _canResume：现在这道门还要过全局关闸（只读模式/用户拒绝过/撞过模式墙）
+  // 和全局预算池，不再只看"流还活着"。
+  assert.match(loop, /if \(run\._diagnosticBlock && _canResume\)[\s\S]{0,900}?continue;/,
     "a populated block must send the model back to fix, not just sit there");
   assert.match(loop, /run\._incompleteReason = run\._incompleteReason \|\| "new_diagnostics_unresolved"/,
     "once the bounded retries are spent the run must finish HONESTLY, not silently");
@@ -21604,9 +21606,19 @@ test("a quiet turn is the model's completion decision except for real bounded wo
   // quiet completion — bounded at three, then the run ends and records why. Before this, the exit
   // read nothing about the plan at all, so a model that wrote prose after step 2 of 7 simply
   // stopped: no error, no warning, and the user had to type "continue".
-  assert.match(quiet, /if \(Array\.isArray\(session\._steerQueue\)[\s\S]{0,140}continue;/,
+  // 抽干必须在**所有门之前**。原来它夹在构建门和计划门中间——只要上面任何一道门先
+  // break（而不是 continue），用户中途发的那条消息就被永久搁死。提到分支顶端之后，
+  // 这个顺序依赖永久消失。
+  assert.match(quiet, /if \(Array\.isArray\(session\._steerQueue\)[\s\S]{0,200}continue;/,
     "user steering is drained before the run ends");
-  assert.match(quiet, /\(run\._planFinishNudges \|\| 0\) < 3[\s\S]{0,600}continue;[\s\S]{0,400}break; \/\/ truly done/,
+  const _steerAt = quiet.indexOf("Array.isArray(session._steerQueue)");
+  for (const gate of ["_diagnosticNudges", "buildFixAttempts", "_planFinishNudges"]) {
+    assert.ok(_steerAt < quiet.indexOf(gate + " ="), `steer 抽干必须排在 ${gate} 那道门之前`);
+  }
+  // 用户重新定义了任务，之前的欠账账本作废——否则旧任务的提醒会继续推着模型跑。
+  assert.match(quiet, /run\._quietResumePool = 3;/, "插话后要把全局预算恢复");
+  // 预算 3 → 2：全局池只有 3，单门占 3 会把另外两道门饿死。
+  assert.match(quiet, /\(run\._planFinishNudges \|\| 0\) < 2[\s\S]{0,700}continue;[\s\S]{0,500}break; \/\/ truly done/,
     "an open plan re-enters, boundedly, and then the run ends honestly");
   assert.match(quiet, /run\._incompleteReason \|\| `plan_steps_pending:/,
     "a run that gives up on its plan must not be recorded as a clean finish");
@@ -23662,4 +23674,73 @@ test("正文提问和卡片提问合并计数，别让它在两条路之间横�
   assert.match(SRC, /run\._askUserCount = \(run\._askUserCount \|\| 0\) \+ 1;[\s\S]{0,200}if \(run\._askUserCount >= 3 && _live\(\)\)/);
   assert.match(SRC, /卡片和正文提问合并计数/);
   assert.match(SRC, /_pushNudge\("askBudget"/);
+});
+
+// ══ 静默轮续跑：全局关闸、总预算、死循环闸 ═══════════════════════════════════
+//
+// 用户实测反馈：「明明没完成任务、也不需要问用户的时候，它居然会停下」。
+// 专门设计过一轮：四路提方案 + 每条派一个 agent 专门构造误触发场景，
+// **12 条基于正文措辞的判据全部被打掉**。结论写进了分支顶部的注释，这里钉住它。
+
+test("续跑判据一律不看正文措辞——那 12 条被打掉的判据不许回来", () => {
+  const loop = extractFn("_runAgenticLoop");
+  const quiet = loop.slice(loop.indexOf("if (!turn.toolCalls.length)"));
+  const head = quiet.slice(0, 4000);
+  // 哲学必须写在代码里，否则下一个人会照着同样的直觉再加一遍
+  assert.match(head, /模型正文里的任何措辞都不是事实/);
+  assert.match(head, /最后我再跑一遍完整测试/, "要留下那个把整类判据打掉的反例");
+  // 不许出现任何从 turn.text 推断"还有活没干"的判据
+  const code = quiet.split("\n").filter((l) => !/^\s*(\/\/|\*|\/\*)/.test(l)).join("\n");
+  assert.doesNotMatch(code, /turn\.text[\s\S]{0,200}(?:我会|我将|接下来|I['’]ll|I will)/,
+    "又在拿正文措辞当续跑依据了——设计阶段这类判据 12 条全被反例打掉");
+  assert.doesNotMatch(code, /- \[ \]|未实现|not implemented/,
+    "复选框/占位标记这类判据同样被打掉：它们在审计报告里是结论本身");
+});
+
+test("全局关闸：只读模式、用户拒绝过、撞过模式墙 —— 一律不开门", () => {
+  const loop = extractFn("_runAgenticLoop");
+  const quiet = loop.slice(loop.indexOf("if (!turn.toolCalls.length)"));
+  assert.match(quiet, /const _gatesOff = run\.mode !== "agent"/);
+  assert.match(quiet, /run\._userDenied === true/, "用户拒绝过就别再自动续跑");
+  assert.match(quiet, /run\._readOnlyBlocked === true/, "撞过模式墙就别把它推回去再撞");
+  // 不许用画像字段当刹车：纯问答时 explicitReadOnly 是 false，救不了任何一次问答。
+  // 剥注释再断言——代码里那段说明本身就写着"不要用 explicitReadOnly"，不剥的话
+  // 断言匹配的是注释而不是代码。（这个坑本轮已经踩过四次。）
+  const _gateCode = quiet.slice(0, 4000).split("\n")
+    .filter((l) => !/^\s*(\/\/|\*|\/\*)/.test(l)).join("\n");
+  assert.doesNotMatch(_gateCode, /explicitReadOnly/,
+    "explicitReadOnly 是分类器画像推出来的，纯问答时为 false，不能当只读逃生口");
+});
+
+test("总预算封顶 3 轮，三道门先到先得", () => {
+  const loop = extractFn("_runAgenticLoop");
+  const quiet = loop.slice(loop.indexOf("if (!turn.toolCalls.length)"));
+  assert.match(quiet, /if \(run\._quietResumePool == null\) run\._quietResumePool = 3;/);
+  assert.match(quiet, /const _canResume = !_gatesOff && !_quietRepeat && run\._quietResumePool > 0 && _live\(\);/);
+  // 三道门都要扣池，否则总预算形同虚设
+  assert.equal((quiet.match(/run\._quietResumePool--;/g) || []).length, 3,
+    "三道门都要扣全局池");
+  // 没有它，四道门各算各的，一次 run 最多能多转 9 轮
+  assert.match(quiet, /没有它，四道门各算各的/);
+});
+
+test("连续静默立刻停 —— 这是唯一的死循环入口", () => {
+  const loop = extractFn("_runAgenticLoop");
+  const quiet = loop.slice(loop.indexOf("if (!turn.toolCalls.length)"));
+  assert.match(quiet, /const _quietRepeat = quietTurns >= 2;/);
+  // 推了提醒、模型只把文字重写一遍 → 停。正常修复路径中间夹着工具轮，会把计数归零，
+  // 所以这条闸不影响真实修复循环。
+  assert.match(quiet, /只拦真正的空转，不影响任何真实修复循环/);
+  // 上一轮的提醒必须清掉，否则它挂在消息尾部，而模型被禁止提及它——
+  // 唯一合规动作就是把答案换个说法重写，这就是"再空转一轮"的机器成因
+  assert.match(quiet, /if \(quietTurns >= 2\) _clearNudges\(\);/);
+});
+
+test("绿证据要能盖住更早的红，否则改好了还被要求再修一遍", () => {
+  const fn = extractFn("_freshBuildFailure");
+  // 原来只在 exitCode !== 0 时返回、绿的继续往前找 → 「跑红 → 改好 → 再跑绿」之后
+  // 那条更早的红仍然开门。倒序扫描的语义本来就是"最近一次说了算"。
+  assert.match(fn, /if \(typeof e\.exitCode === "number"\) return e\.exitCode === 0 \? null : e;/);
+  assert.doesNotMatch(fn, /if \(typeof e\.exitCode === "number" && e\.exitCode !== 0\) return e;/,
+    "又变回「遇绿不停」了");
 });
