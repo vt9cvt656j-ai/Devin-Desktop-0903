@@ -56560,7 +56560,11 @@ function renderMcpTool(body) {
         if (await backend.invoke("mcp_pending_auth", { name, root })) pendingAuth.add(name);
       } catch { /* 老后端没有这个命令，当作没有在等授权 */ }
     }));
-    installedEl.innerHTML = brokenBanner + disabledRows + installedNames.map((name) => {
+    /*
+ * 已停用的排在**已装服务后面**。原来拼在最前面，于是一进 MCP 页第一眼看到的是几个
+ * 灰掉的、不生效的服务，真正在跑的反而被挤到下面——它是补救入口，不是主角。
+ */
+    installedEl.innerHTML = brokenBanner + installedNames.map((name) => {
       const s = servers[name] || {};
       const meta = _mcpInstalledMeta(name, s);
       const connected = live && _mcpConnected.includes(name);
@@ -56597,7 +56601,7 @@ function renderMcpTool(body) {
               : `<button type="button" class="ctp-iconbtn ctp-iconbtn--danger" data-mcpfp-off="${_escAttr(name)}" title="在 Day One 里停用（来自项目或其他客户端的配置，原文件不会被改动，可恢复）">${_ICON_TRASH}</button>`}
           </div>
         </div>`;
-    }).join("") + `
+    }).join("") + disabledRows + `
       <div class="mcpfp-actions">
         <button type="button" class="ctp-btn" data-mcpfp="reconnect">↻ 重新连接全部</button>
       </div>`;

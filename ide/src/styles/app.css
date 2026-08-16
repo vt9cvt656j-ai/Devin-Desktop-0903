@@ -15245,3 +15245,102 @@ body.tree-selecting, body.tree-selecting * { user-select: none !important; -webk
 }
 .growth-stat b { display: block; font-size: 19px; font-weight: 600; font-variant-numeric: tabular-nums; }
 .growth-stat span { font-size: 11.5px; color: var(--feature-dim, var(--text-dim)); }
+
+/* ---- MCP / Skills 卡片并入面板的设计语言 ----
+   这两页的卡片是最早写的一套，带着自己的圆角、内边距，以及一堆写死的十六进制状态色
+   （#34a853 / #d93025 / #fbbc04 / #188038 / #d99a00 / #f5a623）——深色主题下它们不跟着
+   变，浅色下淡绿压淡绿底对比度只有 2.4:1。这里按面板作用域统一，不动这些类在面板外
+   的用法。 */
+.feature-panel__body .mcpfp-card,
+.feature-panel__body .mcpfp-row {
+  padding: 12px 14px;
+  border: 1px solid var(--feature-border);
+  border-radius: var(--feature-radius-card, 12px);
+  /* 状态**不靠整张卡染色**表达：一屏七八张卡各有底色时，页面看着像打翻了调色盘，
+     而且"绿底"和"选中"在别处是两个意思。状态交给右边那个徽标。 */
+  background: var(--feature-card);
+}
+.feature-panel__body .mcpfp-card:hover { border-color: var(--feature-border-strong); }
+.feature-panel__body .mcpfp-card--installed.is-on,
+.feature-panel__body .mcpfp-card--installed.is-error,
+.feature-panel__body .mcpfp-card--installed.is-connecting,
+.feature-panel__body .mcpfp-card--featured,
+.feature-panel__body .mcpfp-row.is-on,
+.feature-panel__body .mcpfp-row.is-error,
+.feature-panel__body .mcpfp-row.is-connecting {
+  background: var(--feature-card);
+  border-color: var(--feature-border);
+}
+.feature-panel__body .mcpfp-card--installed.is-off { opacity: .62; }
+
+/* 状态徽标走语义令牌，深浅两套自动跟着变。 */
+.feature-panel__body .mcpfp-row__status,
+.feature-panel__body .mcpfp-badge {
+  padding: 1px 7px;
+  font-size: 10.5px;
+  font-weight: 600;
+  border-radius: 999px;
+  color: var(--feature-dim);
+  background: var(--feature-hover);
+}
+.feature-panel__body .mcpfp-row__status.is-on,
+.feature-panel__body .mcpfp-badge--count {
+  color: var(--feature-ok);
+  background: color-mix(in srgb, var(--feature-ok) 12%, transparent);
+}
+.feature-panel__body .mcpfp-row__status.is-error {
+  color: var(--feature-err);
+  background: color-mix(in srgb, var(--feature-err) 12%, transparent);
+}
+.feature-panel__body .mcpfp-row__status.is-connecting,
+.feature-panel__body .mcpfp-badge--gold {
+  color: var(--feature-warn);
+  background: color-mix(in srgb, var(--feature-warn) 14%, transparent);
+}
+.feature-panel__body .mcpfp-stars { color: var(--feature-warn); }
+.feature-panel__body .mcpfp-icon__letter { color: var(--feature-dim); }
+
+/* 「安装」「添加服务」这些原来是整块实心蓝。一屏十几颗实心主色块，主色就不再有强调
+   作用了——面板里主色只留给焦点和选中。 */
+.feature-panel__body .ctp-btn,
+.feature-panel__body .ctp-btn--primary {
+  height: 28px;
+  padding: 0 12px;
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--feature-text);
+  background: var(--feature-control);
+  border: 1px solid var(--feature-border-strong);
+  border-radius: var(--feature-radius-control, 8px);
+  box-shadow: none;
+}
+.feature-panel__body .ctp-btn:hover,
+.feature-panel__body .ctp-btn--primary:hover { background: var(--feature-hover); }
+.feature-panel__body .ctp-btn:disabled { opacity: .45; cursor: default; }
+
+/* 小节标题和设置页同一档。 */
+.feature-panel__body .skfp-section,
+.feature-panel__body .mcpfp-head h3 {
+  margin: 0 0 8px;
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: .01em;
+  color: var(--feature-dim);
+  border: 0;
+  padding: 0;
+}
+.feature-panel__body .mcpfp-installed--cards .skfp-section { margin-top: 18px; }
+/* 搜索框和下拉、步进器共用一副长相。 */
+.feature-panel__body .mcpfp-searchbox {
+  height: 32px;
+  border: 1px solid var(--feature-border-strong);
+  border-radius: var(--feature-radius-control, 8px);
+  background: var(--feature-control);
+}
+.feature-panel__body .mcpfp-searchbox:hover { border-color: var(--feature-border-strong); }
+.feature-panel__body .mcpfp-searchbox:focus-within {
+  border-color: var(--feature-border-strong);
+  box-shadow: 0 0 0 3px var(--feature-ring);
+}
+/* 分页和动作条都靠右，原来一个居中一个靠右。 */
+.feature-panel__body .mcpfp-pager { justify-content: flex-end; }
