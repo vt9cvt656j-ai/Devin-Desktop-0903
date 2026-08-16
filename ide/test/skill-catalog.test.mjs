@@ -124,3 +124,49 @@ test("不再存在「按满额说明一条条塞、塞爆就 break」的老写�
   assert.match(body, /\[400, 240, 140, 90, 60\]/, "缺少「先压说明再丢技能」的逐级收窄");
   assert.match(body, /byName/, "还是按 id 去重，同名技能会重复占位");
 });
+
+test("技能：正文不被腰斩、描述不被提前砍死、allowed-tools 真的收窄", () => {
+  const SRC = readFileSync(join(HERE, "../src/main.js"), "utf8");
+
+  // ① 致命项：read_skill 的返回落在 8000 那一档时会被 _headTailModelText 从**中间**挖空，
+  //    而官方技能的 SKILL.md 普遍 10–20KB —— 模型拿到头尾、丢掉中段的分步说明，
+  //    同时工具卡片还显示「已全部读入」。两个互相矛盾的事实同时摆在用户和模型面前。
+  const cap = SRC.slice(SRC.indexOf("function _toolMsgForModel"), SRC.indexOf("const rawMessage"));
+  assert.match(cap, /_rt === "skill" \? 30000/,
+    "技能正文又落回 8000 档，会被从中间挖空");
+
+  // ② description 就是触发判据。官方技能的「什么时候该用我 / 什么时候别用我」写在
+  //    400–900 字符处，解析期砍到 240 等于把触发条件本身切掉。
+  const parse = SRC.slice(SRC.indexOf("id: `file:${normalizedPath}`"));
+  assert.match(parse.slice(0, 1400), /desc: desc\.replace\(\/\\s\+\/g, " "\)\.trim\(\)\.slice\(0, 1200\)/,
+    "描述又在解析期被砍短了——目录那边自有 6000 字预算和逐级压缩，这里不该提前钉死上限");
+
+  // ③ allowed-tools 必须是真约束。原来它唯一的消费点是工具卡片上一枚灰色标签：
+  //    一个写着 Read, Grep 的只读技能，启用后模型照样能 write_file、删文件。
+  assert.match(SRC, /function _skillAllowedTools\(\)/, "allowed-tools 的收窄逻辑没了");
+  const gate = SRC.slice(SRC.indexOf("async function _approveToolCall"));
+  // 钉住**白名单的来源**，不只是那行条件文本：把 skillGate 直接改成 null，条件那行还在，
+  // 只钉文本的话照样绿。
+  assert.match(gate.slice(0, 1400), /const skillGate = typeof _skillAllowedTools === "function" \? _skillAllowedTools\(\) : null;/,
+    "审批闸没接技能白名单，allowed-tools 又变回纯装饰");
+  assert.match(gate.slice(0, 1600), /!_skillToolAllowed\(skillGate\.allow,/, "闸没真的去查白名单");
+  // 取并集不取交集：启用两个技能时两边的工具都该可用，交集会让"启用越多能干越少"。
+  const allow = SRC.slice(SRC.indexOf("function _skillAllowedTools"));
+  assert.match(allow.slice(0, 900), /for \(const s of declaring\) for \(const t of s\.tools\)/,
+    "白名单不是并集");
+  assert.match(allow.slice(0, 900), /allow\.add\("read_skill"\)/,
+    "read_skill 没被永久放行——提示词要求模型用它读正文，挡掉等于技能自锁");
+  // 没声明 allowed-tools 的技能不表态，不该缩小任何范围。
+  assert.match(allow.slice(0, 900), /if \(!declaring\.length\) return null;/,
+    "没有声明的技能也参与收窄了");
+
+  // ④ Claude Code 插件市场的技能目录要扫到。
+  const bases = SRC.slice(SRC.indexOf("function _skillDiscoveryBases"));
+  assert.match(bases.slice(0, 900), /\.claude\/plugins/, "不扫 Claude Code 的插件技能目录");
+  assert.match(SRC, /\\.claude\\\/plugins\)\$\/\.test\(base\) \? 5 : 2/,
+    "插件目录层级更深，没给足扫描深度");
+
+  // ⑤ 往输入框填文本的那条路径是提示词模板语义，和 Agent Skills 是两回事，已删。
+  assert.doesNotMatch(SRC, /function _useSkill\(/,
+    "那条把技能正文填进输入框的死代码又回来了——它和技能是两种语义");
+});
