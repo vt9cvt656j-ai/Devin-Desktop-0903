@@ -945,3 +945,51 @@ test("强力版：网关说了没有强力线路，就不该把那个按钮画�
   assert.match(render.slice(0, 1200), /_powerRouteAvailable\(id\) === false/,
     "渲染侧没拦——按钮画在了没有强力线路的模型上，点了只会报错");
 });
+
+test("档位滑块：拖动要真的落到档位上，且拖出卡片边界不能把卡片收走", () => {
+  // 滑块换掉分段按钮之后，有三条连接一断就会变成"能拖、但什么都没发生"或者
+  // "拖到一半断掉"——三种都不报错，只是控件坏了。
+
+  // 1) 两个控件都换成了滑块（不再是分段按钮那一套）
+  const ctxFn = SRC.slice(SRC.indexOf("function _modelContextRows"));
+  assert.match(ctxFn.slice(0, 2000), /_micSliderHtml\(/, "上下文没渲染成滑块");
+  const thinkAt = SRC.indexOf("thinkEl.innerHTML = label");
+  assert.notEqual(thinkAt, -1, "思考深度那段渲染没了");
+  assert.match(SRC.slice(thinkAt, thinkAt + 600), /_micSliderHtml\(/, "思考深度没渲染成滑块");
+
+  // 2) 两个滑块都绑了处理器。只渲染不绑定 = 拖得动、但存不进去。
+  // 窗口必须**切在两个滑块之间**：从上下文那段一路读到思考深度那段的话，
+  // 上下文的绑定被剪掉了也照样能在隔壁读到 _bindMicSlider——自己喂饱自己。
+  const ctxAt = SRC.indexOf("const ctxSl =");
+  const thinkAt2 = SRC.indexOf("const thinkSl =");
+  assert.ok(ctxAt !== -1 && thinkAt2 > ctxAt, "两个滑块的绑定段没了或顺序变了");
+  const bind = SRC.slice(ctxAt, thinkAt2);
+  assert.match(bind, /_bindMicSlider\(/, "上下文滑块没绑处理器，拖了不存");
+  const tEnd = SRC.indexOf("// Position:", thinkAt2);
+  const tbind0 = SRC.slice(thinkAt2, tEnd > thinkAt2 ? tEnd : thinkAt2 + 1600);
+  assert.match(tbind0, /_bindMicSlider\(/, "思考深度滑块没绑处理器，拖了不存");
+  assert.match(bind, /_setCtxChoice\(/, "上下文滑块没写入选择");
+  assert.match(tbind0, /_setThinkingPref\(/, "思考深度滑块没写入选择");
+
+  // 3) 拖动中不得重画整张卡片。重画会把正在被拖的那个 input 换成新节点，
+  //    指针立刻丢掉目标，拖到一半就断——这正是分段按钮时代 showModelInfoCard() 的做法。
+  const binder = SRC.slice(SRC.indexOf("function _bindMicSlider"));
+  const binderBody = binder.slice(0, binder.indexOf("\n}\n") + 3);
+  assert.doesNotMatch(binderBody, /showModelInfoCard\(/,
+    "拖动处理里重画了整张卡片，拖动会断在半路");
+
+  // 4) 指针拖出卡片边界时不能收卡片，否则 input 随卡片一起消失。
+  const leaveAt = SRC.indexOf('el.addEventListener("mouseleave"');
+  assert.notEqual(leaveAt, -1, "卡片的 mouseleave 处理没了");
+  // 只看 mouseleave 那一条语句本身。往后多读几行就会读到 pointerdown 里的
+  // `el._sliderDrag = true`，那样这条断言就被隔壁喂饱了。
+  const leaveStmt = SRC.slice(leaveAt, SRC.indexOf("\n", leaveAt));
+  assert.match(leaveStmt, /_sliderDrag/,
+    "拖滑块时卡片仍会因为 mouseleave 被收走，拖到最右端必断");
+  // 但松手后必须能收，否则卡片赖着不走。
+  assert.match(SRC.slice(leaveAt, leaveAt + 1200), /pointerup/,
+    "没有在松手时补收卡片，卡片会一直挂在屏幕上");
+
+  // 5) 买不到的档位要弹回并解释，不能静默钉住（那看起来就是滑块坏了）。
+  assert.match(bind, /showToast\(/, "锁定档位没有任何提示，用户只会觉得滑块坏了");
+});

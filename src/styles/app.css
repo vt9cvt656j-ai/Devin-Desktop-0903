@@ -14638,3 +14638,79 @@ body.tree-selecting, body.tree-selecting * { user-select: none !important; -webk
   background: rgba(245, 165, 36, .12);
 }
 .mic-power.is-on svg { fill: currentColor; }
+
+/* 模型卡片里的档位滑块（上下文 / 思考深度）。
+   两者都是有序档位，分段按钮把顺序这层信息丢了；滑块把它画出来，顺便让
+   "原生窗口"那一行不再是一个只有一种选择的选择器。 */
+.model-info-card .mic-sl { margin: 2px 0 10px; }
+.model-info-card .mic-sl__head {
+  display: flex; align-items: baseline; justify-content: space-between;
+  gap: 8px; margin-bottom: 7px;
+}
+.model-info-card .mic-sl__label {
+  font-size: 11px; font-weight: 600; letter-spacing: .02em;
+  color: var(--muted-fg, #8a8a8a);
+}
+.model-info-card .mic-sl__val {
+  font-size: 15px; font-weight: 650; font-variant-numeric: tabular-nums;
+  color: var(--fg, #e6e6e6); margin-left: auto;
+}
+.model-info-card .mic-sl__track { position: relative; height: 20px; }
+.model-info-card .mic-sl__rail,
+.model-info-card .mic-sl__lock,
+.model-info-card .mic-sl__fill {
+  position: absolute; top: 50%; transform: translateY(-50%);
+  height: 6px; border-radius: 999px; pointer-events: none;
+}
+.model-info-card .mic-sl__rail { left: 0; right: 0; background: var(--mic-sl-rail, rgba(127,127,127,.22)); }
+/* 买不到的档位那一段。用斜纹而不是纯色：纯色只是"另一种颜色"，斜纹一眼就是"这块不可用"。 */
+.model-info-card .mic-sl__lock {
+  right: 0;
+  background: repeating-linear-gradient(115deg,
+    rgba(127,127,127,.30) 0 3px, rgba(127,127,127,.10) 3px 6px);
+}
+.model-info-card .mic-sl__fill {
+  left: 0; background: linear-gradient(90deg, #6d78ff, #a855f7);
+  box-shadow: 0 0 0 .5px rgba(109,120,255,.35);
+}
+.model-info-card .mic-sl__tick {
+  position: absolute; top: 50%; width: 3px; height: 3px; margin-left: -1.5px;
+  transform: translateY(-50%); border-radius: 50%;
+  background: var(--fg, #e6e6e6); opacity: .28; pointer-events: none;
+}
+.model-info-card .mic-sl__tick.is-done { opacity: 0; }
+.model-info-card .mic-sl__tick.is-locked { opacity: .5; }
+/* 原生轨道整个透明，可见部分是上面那三层；这里只留下拇指。 */
+.model-info-card .mic-sl__input {
+  position: absolute; inset: 0; width: 100%; height: 100%;
+  -webkit-appearance: none; appearance: none;
+  background: transparent; margin: 0; cursor: pointer;
+}
+.model-info-card .mic-sl__input:focus { outline: none; }
+.model-info-card .mic-sl__input::-webkit-slider-runnable-track { background: transparent; height: 100%; }
+.model-info-card .mic-sl__input::-moz-range-track { background: transparent; height: 100%; }
+.model-info-card .mic-sl__input::-webkit-slider-thumb {
+  -webkit-appearance: none; appearance: none;
+  width: 16px; height: 16px; border-radius: 50%;
+  background: #fff; border: 1px solid rgba(0,0,0,.16);
+  box-shadow: 0 1px 4px rgba(0,0,0,.30);
+  transition: transform .1s ease;
+}
+.model-info-card .mic-sl__input::-moz-range-thumb {
+  width: 16px; height: 16px; border-radius: 50%; border: 1px solid rgba(0,0,0,.16);
+  background: #fff; box-shadow: 0 1px 4px rgba(0,0,0,.30);
+}
+.model-info-card .mic-sl__input:hover::-webkit-slider-thumb { transform: scale(1.08); }
+.model-info-card .mic-sl__input:active::-webkit-slider-thumb { transform: scale(1.14); }
+.model-info-card .mic-sl__input:focus-visible::-webkit-slider-thumb {
+  box-shadow: 0 1px 4px rgba(0,0,0,.30), 0 0 0 3px rgba(109,120,255,.45);
+}
+.model-info-card .mic-sl__ends {
+  display: flex; justify-content: space-between; margin-top: 5px;
+  font-size: 10.5px; font-variant-numeric: tabular-nums;
+  color: var(--muted-fg, #8a8a8a); opacity: .8;
+}
+.model-info-card .mic-sl__cap {
+  margin-top: 6px; font-size: 11px; line-height: 1.5;
+  color: var(--muted-fg, #8a8a8a);
+}
