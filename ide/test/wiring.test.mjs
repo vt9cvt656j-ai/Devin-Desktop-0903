@@ -1189,3 +1189,63 @@ test("快捷键显示必须分平台：Mac 用符号，Windows 用词并带加�
   assert.equal(win("mod+backspace"), "Ctrl+Backspace", "Windows 上 backspace 还在吐 ⌫");
   assert.equal(mac("mod+backspace"), "⌘⌫", "Mac 上应保持符号");
 });
+
+test("快捷键表要覆盖真正生效的键，且每个动作都得有实现", () => {
+  // 之前设置页只登记了 15 条，而缩放、Markdown 预览、删除文件这些是各自挂 keydown 的
+  // ——在设置页里既查不到也改不了。现在它们都进了同一张表。
+  const labels = SRC.slice(SRC.indexOf("const ACTION_LABELS = {"));
+  const labelBlock = labels.slice(0, labels.indexOf("\n};") + 3);
+  const acts = SRC.slice(SRC.indexOf("const KB_ACTIONS = {"));
+  const actBlock = acts.slice(0, acts.indexOf("\n};") + 3);
+  const defs = SRC.slice(SRC.indexOf("function _defaultKeybindings()"));
+  const defBlock = defs.slice(0, defs.indexOf("\n}\n") + 3);
+
+  for (const id of ["view.markdownPreview", "view.zoomIn", "view.zoomOut", "view.zoomReset",
+                    "file.deleteSelected", "view.extensions", "view.bookmarks", "memory.manage"]) {
+    assert.ok(labelBlock.includes(`"${id}"`), `${id} 没有中文标签，设置页里不会出现`);
+    assert.ok(defBlock.includes(`"${id}"`), `${id} 没有默认键位，用户不改键就永远按不出来`);
+  }
+  // 每个有标签的动作都必须有实现——只有标签没实现的话，设置页列出来、按下去什么都不发生。
+  for (const m of labelBlock.matchAll(/"([\w.]+)":/g)) {
+    assert.ok(actBlock.includes(`"${m[1]}"`), `${m[1]} 只有标签没有实现`);
+  }
+
+  // 那些自己挂 keydown 的都要拆掉，否则同一个键会走两条路（其中一条还改不了）。
+  assert.doesNotMatch(SRC, /if \(\(e\.metaKey \|\| e\.ctrlKey\) && e\.key === "\."\)/,
+    "Markdown 预览又自己挂 keydown 了，设置页里改不了它");
+  assert.doesNotMatch(SRC, /k === "0"\) \{ e\.preventDefault\(\); _applyUiZoom\(1\)/,
+    "缩放又自己挂 keydown 了");
+
+  // 删除文件是分发器上唯一会破坏数据的动作：焦点在编辑器/终端/输入框里时必须让路，
+  // 否则在聊天框里按退格会删掉磁盘上的文件。守卫必须在动作函数**自己**身上。
+  // 这里**跑**这个函数，不是看它源码里有没有那几个字符串——把条件 `&& false` 掉，
+  // 按名字找的断言照样通过，而守卫已经形同虚设。
+  const del = SRC.slice(SRC.indexOf("function _deleteSelectedTreeItem"));
+  const delBody = del.slice(0, del.indexOf("\n}\n") + 3);
+  const runDelete = (activeElement) => {
+    let deleted = false;
+    new Function(
+      "_treeSel", "document", "_deleteSelectedTree",
+      delBody + ";return _deleteSelectedTreeItem;",
+    )(
+      new Set(["/x/a.txt"]),
+      { activeElement },
+      () => { deleted = true; },
+    )();
+    return deleted;
+  };
+  const el = (tag, closestHit = null) => ({
+    tagName: tag,
+    isContentEditable: false,
+    closest: (sel) => (sel === closestHit ? {} : null),
+  });
+  assert.equal(runDelete(el("DIV")), true, "焦点在普通元素上时应该真的删除");
+  assert.equal(runDelete(el("INPUT")), false, "焦点在输入框里还删文件——用户按的是退格删字");
+  assert.equal(runDelete(el("TEXTAREA")), false, "焦点在多行输入框里还删文件");
+  assert.equal(runDelete(el("DIV", ".monaco-editor")), false, "焦点在编辑器里还删文件");
+  assert.equal(runDelete(el("DIV", ".xterm")), false, "焦点在终端里还删文件");
+
+  // 平台分两套：Windows 的微软拼音会吃掉 Ctrl+.；Mac 惯例是 ⌘⌫ 而 Windows 是裸 Delete。
+  assert.match(defBlock, /mac \? "mod\+\." : "mod\+shift\+v"/, "Markdown 预览没有分平台");
+  assert.match(defBlock, /mac \? "mod\+backspace" : "delete"/, "删除键没有分平台");
+});
