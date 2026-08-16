@@ -1001,44 +1001,42 @@ test("AI 助手开关：按钮、面板、分隔条、落盘、开机还原，�
   const dbgAt = shell.indexOf('id="debugBtn"');
   assert.notEqual(btnAt, -1, "标题栏里没有这个按钮");
   assert.ok(btnAt < dbgAt, "按钮跑到调试图标右边去了");
-  assert.match(shell.slice(btnAt, btnAt + 300), /#i-panel-right-close/, "按钮没用那个面板图标");
-  const html = readFileSync(join(HERE, "../index.html"), "utf8");
-  for (const sym of ["i-panel-right-close", "i-panel-right-open"]) {
-    assert.match(html, new RegExp(`<symbol id="${sym}"`),
-      `${sym} 没定义——切到那个状态时按钮会变成一个空白方块`);
-  }
+  // 用仓库里已有的 i-sidebar-right（就是标准的 panel-right 几何：外框 + 一条竖分隔），
+  // 视图菜单里那条同功能的项用的也是它。另画一个新图标只会让同一个动作有两种长相。
+  assert.match(shell.slice(btnAt, btnAt + 300), /#i-sidebar-right/, "按钮没用面板图标");
+  assert.match(readFileSync(join(HERE, "../index.html"), "utf8"), /<symbol id="i-sidebar-right"/,
+    "图标 symbol 没定义，按钮会画成一个空白方块");
   // 图标要和右边那几个一样大。尺寸规则是 `.titlebar__action-group .tbtn--icon .ic`
   // （20px）；按钮放在 action-group 外面就只能拿到通用的 16px，肉眼一眼看得出小一圈。
   const groupAt = shell.lastIndexOf("titlebar__action-group", btnAt);
   assert.ok(groupAt !== -1 && shell.slice(groupAt, btnAt).split("</div>").length === 1,
     "按钮不在 titlebar__action-group 里，图标会比旁边的小一圈（16px vs 20px）");
 
-  // 两个状态用的是**两个图标**，不是给同一个图标加样式——箭头指向要说明点下去会发生什么。
-  assert.match(SRC, /icon\.setAttribute\("href", hidden \? "#i-panel-right-open" : "#i-panel-right-close"\)/,
-    "切换时没换图标，箭头会一直指着同一个方向");
+  // 2) 点击走的是**既有的** togglePane("assistant")，不是另起一套。视图菜单里本来就有
+  //    这个开关，CSS 的 .layout.hide-assistant 也早就同时收掉面板和分隔条；各做一套的
+  //    结果是两个入口互相不认账——从菜单关掉，标题栏按钮还亮着"已展开"。
+  const clickAt = SRC.indexOf('$("toggleAssistantBtn")?.addEventListener');
+  assert.notEqual(clickAt, -1, "按钮没绑点击，点了什么都不会发生");
+  const click = SRC.slice(clickAt, clickAt + 420);
+  assert.match(click, /togglePane\("assistant"\)/, "按钮没复用既有的面板开关");
+  assert.doesNotMatch(SRC, /function _applyAssistantVisibility/,
+    "又长出了第二套收放机制，会和视图菜单那条互相不认账");
 
-  // 2) 点击接上了。只画按钮不绑事件 = 点了没反应，而且不报错。
-  assert.match(SRC, /\$\("toggleAssistantBtn"\)\?\.addEventListener\("click", toggleAssistantPanel\)/,
-    "按钮没绑点击，点了什么都不会发生");
+  // 3) 按钮要跟着**实际状态**走，包括从视图菜单改的那次。
+  assert.match(click, /_syncAssistantToggleBtn\(\)/, "点完没同步按钮状态");
+  const sync = SRC.slice(SRC.indexOf("function _syncAssistantToggleBtn"));
+  assert.match(sync.slice(0, 500), /paneIsOpen\("assistant"\)/,
+    "按钮状态不是从布局真值读的，会和实际显示对不上");
 
-  // 3) 面板**和分隔条**都要收。只收面板会在编辑区右边留一条竖着的拖拽条，
-  //    还能被拖动——那条缝看起来就是个渲染 bug。
-  const apply = SRC.slice(SRC.indexOf("function _applyAssistantVisibility"));
-  const applyBody = apply.slice(0, apply.indexOf("\n}\n") + 3);
-  assert.match(applyBody, /\$\("assistant"\)/, "没收面板");
-  // 断言的是**真的把它藏了**，不是"源码里取过这个节点"——只留一行 const sash = $("sashRight")
-  // 也能让按名字找的断言通过，那就成了自己喂饱自己。
-  assert.match(applyBody, /sash\.hidden = hidden/,
-    "没收分隔条，编辑区右边会留一条悬空的、还能拖的竖条");
-
-  // 4) 状态落盘 + 开机还原。少了任何一半，用户收起来的面板在重启后又会弹回来。
-  const toggle = SRC.slice(SRC.indexOf("function toggleAssistantPanel"));
-  assert.match(toggle.slice(0, 400), /localStorage\.setItem\(_ASSISTANT_HIDDEN_KEY/,
-    "开关状态没存，重开 IDE 就丢");
-  assert.match(SRC, /_applyAssistantVisibility\(_assistantHidden\(\)\)/,
-    "启动时没把存下来的状态贴回去，存了也等于没存");
+  // 4) 状态落盘 + 开机还原。少了任何一半，用户收起来的面板重启后又弹回来。
+  // 只切 togglePane 的**函数体**。往后多读几行就会读到紧邻的 function _savePaneState()
+  // 定义，那样即便 togglePane 里根本没调它，按名字找的断言照样能通过。
+  const tpAll = SRC.slice(SRC.indexOf("function togglePane"));
+  const tp = tpAll.slice(0, tpAll.indexOf("\n}\n") + 3);
+  assert.match(tp, /_savePaneState\(\)/, "开关状态没存，重开 IDE 就丢");
+  assert.match(SRC, /_restorePaneState\(\);/, "启动时没还原，存了也等于没存");
 
   // 5) 布局变了要让编辑器重算宽度，否则代码区停在旧宽度上，右边空一大块。
-  assert.match(applyBody, /new Event\("resize"\)/,
+  assert.match(click, /new Event\("resize"\)/,
     "收放面板后没触发重算，编辑器会停在旧宽度");
 });

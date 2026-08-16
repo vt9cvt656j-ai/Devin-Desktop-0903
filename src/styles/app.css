@@ -14732,6 +14732,5 @@ body.tree-selecting, body.tree-selecting * { user-select: none !important; -webk
    原来那截空白就是这么来的。 */
 .model-info-card .mic-think { margin-top: 8px; }
 
-/* 面板和它的分隔条被 hidden 掉时必须真的退出布局。.layout .assistant 设了 flex:none
-   和固定宽度，光靠 [hidden] 的 display:none 会被更具体的选择器盖掉。 */
-.layout .assistant[hidden], .layout .panel-sash[hidden] { display: none; }
+/* 关掉时图标压成次要色，和 .layout.hide-assistant 的实际状态对齐。 */
+.tbtn.is-off .ic { color: var(--text-dim); opacity: .6; }

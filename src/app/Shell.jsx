@@ -31,7 +31,7 @@ export function Shell() {
             <button id="saveBtn" hidden></button>
             <div className="titlebar__action-group titlebar__action-group--panel" aria-label="面板">
               <button className="tbtn tbtn--icon" id="toggleAssistantBtn" type="button" title="隐藏 AI 助手" aria-pressed="true">
-                <svg className="ic"><use href="#i-panel-right-close" id="toggleAssistantIcon" /></svg>
+                <svg className="ic"><use href="#i-sidebar-right" /></svg>
               </button>
             </div>
             <div className="titlebar__action-group titlebar__action-group--run" data-i18n-aria-label="debug.runGroup" aria-label="运行与调试">
