@@ -2228,6 +2228,32 @@ pub async fn list_for_client(State(state): State<AppState>) -> ApiResult<Json<se
     let label_of: std::collections::HashMap<uuid::Uuid, &str> =
         rows.iter().map(|m| (m.id, m.label.as_str())).collect();
 
+    /*
+     * 「Claude 强力版」是**按钮**，不是分组。
+     *
+     * 运维把一条线路勾成强力版之后，它原本会照常在选择器里多出一个以自己 label 为标题
+     * 的分组，里面是一批和普通分组重名的模型 —— 用户看到的是"同一个模型出现两次"，
+     * 而强力版本来只该是悬浮卡片右上角那个开关。
+     *
+     * 所以强力线路提供的 model id，只要**任何一条普通线路也提供**，就不再往列表里推。
+     * 反过来，某个 id 只有强力线路提供时照常推 —— 上面那段注释说的"配错的分组绝不能让
+     * 模型从选择器里消失"，对这里同样成立。
+     *
+     * 刻意**不做**全局按 model_id 去重：同一个模型挂在两条普通线路下、以不同价格出售，
+     * 是运维在卖的东西（线上"特价开业福利"和"Claude"就是这么配的，sonnet 一个 10 一个 5）。
+     * 去重会把那份价格选择一起铲掉。
+     */
+    let power_ids: std::collections::HashSet<String> = rows
+        .iter()
+        .filter(|m| m.power_route)
+        .flat_map(|m| allowed_ids(m))
+        .collect();
+    let plain_ids: std::collections::HashSet<String> = rows
+        .iter()
+        .filter(|m| !m.power_route)
+        .flat_map(|m| allowed_ids(m))
+        .collect();
+
     let mut list = Vec::new();
     for m in &rows {
         let group = m
@@ -2237,6 +2263,11 @@ pub async fn list_for_client(State(state): State<AppState>) -> ApiResult<Json<se
             .unwrap_or(m.label.as_str());
 
         for mid in allowed_ids(m) {
+            // 强力线路的条目：普通线路也有这个 id 就不推（用按钮去它那儿），
+            // 只有它有才推（否则这个模型就再也选不到了）。
+            if m.power_route && plain_ids.contains(&mid) {
+                continue;
+            }
             let name = display_name_for(&m.model_names, &mid);
             let (model_in, model_out) = model_price_override(&m.model_prices, &mid);
             let (input_price, output_price, price_source) = if model_in > 0.0 || model_out > 0.0 {
@@ -2272,6 +2303,13 @@ pub async fn list_for_client(State(state): State<AppState>) -> ApiResult<Json<se
                 "conn_id": m.id,
                 // Only the heading in the picker. Grouping changes this and nothing else.
                 "group": group,
+                // 这个 model id 有没有一条勾了强力版的线路。客户端据此决定要不要显示那个
+                // 闪电按钮 —— 没有强力线路却把按钮画出来，用户点了只会撞上一句报错。
+                //
+                // 算的是**全局并集**，不是"当前这条线路是不是强力线路"：客户端拿到的是
+                // 按 model id 索引的目录，同一个 id 可能挂在好几条线路下，逐条判断会得出
+                // 一个取决于排序的随机答案。这个式子和派单那边的筛选条件必须是同一个。
+                "power_route_available": power_ids.contains(&mid),
                 "provider": m.provider,
                 "model_id": mid.clone(),
                 "name": name,
@@ -5705,6 +5743,20 @@ pub async fn chat_completions(
             )));
         }
         candidates = power;
+    } else {
+        // 没点强力版就别把人派到强力线路上。
+        //
+        // 这条线路从选择器里隐掉之后，它仍然留在普通请求的候选池里 —— 而挑主线路用的是
+        // `candidates.first()`，顺序由 `ORDER BY sort, created_at` 决定。也就是说运维哪天
+        // 把它的 sort 调前一格，所有普通 Claude 请求就会静默改走强力线路、按它计费，而
+        // 界面上没有任何地方看得出来。强力版是**用户点出来的**，不是排序碰出来的。
+        //
+        // 唯一的例外是这个模型只有强力线路提供 —— 那 candidates 会空，退回去总比让一个
+        // 选得到的模型发不出请求强。
+        let plain: Vec<Model> = candidates.iter().filter(|m| !m.power_route).cloned().collect();
+        if !plain.is_empty() {
+            candidates = plain;
+        }
     }
     let route_count = candidates.len();
     let primary_conn = candidates
@@ -12228,7 +12280,11 @@ mod model_group_tests {
         let i = src
             .find("let group = m")
             .expect("list_for_client 必须先算出显示标题再往下走");
-        let window = &src[i..i + 300];
+        // 按字符取窗口，不按字节。这一段前后都是中文注释，字节切片会在某个汉字中间
+        // 断开然后 panic —— 报出来的是 "not a char boundary"，和这条测试真正守的东西
+        // 毫无关系，会把人引到完全错误的方向去查。
+        let window: String = src[i..].chars().take(300).collect();
+        let window = window.as_str();
         assert!(
             window.contains(".filter(|target| *target != m.id)"),
             "指向自己要挡掉，否则 label_of 查到的就是它自己，白绕一圈",
@@ -12386,6 +12442,56 @@ mod power_route_tests {
         assert!(
             !block.contains("sort_by") && !block.contains("unwrap_or(candidates)"),
             "强力版被写成了排序/兜底，那是静默降级"
+        );
+    }
+
+    #[test]
+    fn 强力线路不自成一个分组也不吞掉模型() {
+        // 用户的原话：「我明明把强力版放入到按钮里面了，为什么还会出现在模型列表里面？」
+        // 强力版是悬浮卡片右上角那个开关，不该在选择器里另起一个标题、摆一批和普通分组
+        // 重名的模型。
+        let src = dispatch_src();
+        let at = src
+            .find("let power_ids")
+            .expect("list_for_client 里算强力 id 并集那段没了，按钮会退回到猜模型名");
+        let block = &src[at..(at + 2600).min(src.len())];
+        assert!(
+            block.contains("if m.power_route && plain_ids.contains(&mid)"),
+            "强力线路的条目又开始往列表里推了，那个重复分组会回来"
+        );
+        assert!(
+            block.contains("continue"),
+            "只算了并集没有跳过，等于没改"
+        );
+        // 反过来的那一半：只有强力线路提供的 id 必须照常列出，否则这个模型就再也选不到。
+        // 判据是 plain_ids（普通线路的并集），不是"这条线路是不是强力线路"。
+        assert!(
+            !block.contains("if m.power_route {\n                continue"),
+            "按整条线路无条件跳过了 —— 只挂在强力线路上的模型会从选择器里消失"
+        );
+        // 这一条在 json! 里，离 power_ids 有一大段中文注释的距离，所以扫整段派单源码
+        // 而不是窗口。dispatch_src 已经把本测试模块切掉了，不会自己喂饱自己。
+        assert!(
+            src.contains("\"power_route_available\": power_ids.contains(&mid)"),
+            "没下发这个模型有没有强力线路，客户端只能靠猜模型名，按钮会画在没有强力线路的模型上"
+        );
+    }
+
+    #[test]
+    fn 没点强力版就不该被派到强力线路上() {
+        // 强力线路从选择器里隐掉之后，它仍然留在普通请求的候选池里，而主线路取的是
+        // candidates.first()，顺序由 ORDER BY sort, created_at 决定 —— 运维调一格 sort，
+        // 所有普通请求就静默改走强力线路、按它计费，界面上看不出来。
+        let src = dispatch_src();
+        let at = src.find("let want_power").expect("派单那段没了");
+        let block = &src[at..(at + 2400).min(src.len())];
+        assert!(
+            block.contains("filter(|m| !m.power_route)"),
+            "普通请求没把强力线路排除掉，排序一变就会悄悄接普通流量"
+        );
+        assert!(
+            block.contains("if !plain.is_empty()"),
+            "无条件排除了强力线路 —— 只有强力线路提供的模型会变成发不出请求"
         );
     }
 

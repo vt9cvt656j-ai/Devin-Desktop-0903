@@ -650,8 +650,19 @@ function Groups({
 
   // IDE 里实际会看到的样子：只有在转的线路进得了 /api/models，标题相同的会并成一堆 ——
   // 这正是分组的原理，两条线路重名本来就已经并在一起了。
+  //
+  // 勾了「Claude 强力版」的线路不出现在这里：它的模型只要普通线路也有，就不会进 IDE 的
+  // 选择器（强力版是悬浮卡片右上角那个按钮，不是一个分组）。和 list_for_client 里那段
+  // `if m.power_route && plain_ids.contains(&mid)` 是同一条规则——这个预览自称一比一照抄
+  // 服务端，不跟着改就会在这儿显示一个 IDE 里根本看不到的分组。
+  const plainModels = new Set(
+    conns.filter((c) => isOn(c) && !c.power_route).flatMap(allowedIds),
+  );
+  const visible = conns
+    .filter(isOn)
+    .filter((c) => !c.power_route || !allowedIds(c).every((m) => plainModels.has(m)));
   const buckets = new Map<string, Conn[]>();
-  for (const c of conns.filter(isOn)) {
+  for (const c of visible) {
     const head = headingOf(c, labelOf);
     const bucket = buckets.get(head);
     if (bucket) bucket.push(c);

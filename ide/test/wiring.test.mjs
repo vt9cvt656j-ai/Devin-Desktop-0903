@@ -911,3 +911,37 @@ test("强力版开关必须真的改变请求去向，而不只是一个会亮�
   assert.match(render.slice(0, 900), /if \(!_modelSupportsPowerRoute\(id\)\) return ""/,
     "渲染时没挡住非 Claude 模型");
 });
+
+test("强力版：网关说了没有强力线路，就不该把那个按钮画出来", () => {
+  // 承接上一条。上一条钉的是"开关真的改变请求去向"，这一条钉的是"按钮只出现在它
+  // 真的有用的地方"——用户在后台没配强力线路时，画一个点了必然报错的按钮比不画更糟。
+  //
+  // 三态是关键：网关明确说 false 才藏；拿不到（离线、目录没拉到、网关旧版）是"不知道"，
+  // 这时候必须退回旧行为。压成布尔的话按钮会在离线时集体消失，而那不是"没有强力线路"。
+  const mapAt = SRC.indexOf("(byGroup[label] ||= []).push({");
+  assert.notEqual(mapAt, -1, "目录映射那个对象字面量没了");
+  assert.match(SRC.slice(mapAt, mapAt + 2600), /powerRouteAvailable:/,
+    "映射层没接这个字段——那个 push 是逐字段列举的白名单，不在里面就到不了按钮那儿");
+
+  // 字段名必须和网关下发的逐字一致，跨仓库对不上就是静默失效。
+  const rustList = readFileSync(join(HERE, "../../server/src/models.rs"), "utf8");
+  assert.match(rustList, /"power_route_available"/,
+    "网关没下发这个字段，客户端永远读到 undefined，等于这条闸不存在");
+  assert.match(SRC.slice(mapAt, mapAt + 2600), /it\.power_route_available/,
+    "客户端读的键名和网关下发的对不上");
+
+  // 三态判定：只认布尔，其它一律 null（不知道）。
+  const availSrc = SRC.slice(SRC.indexOf("function _powerRouteAvailable"));
+  const avail = availSrc.slice(0, availSrc.indexOf("\n}") + 2);
+  assert.match(avail, /typeof v === "boolean" \? v : null/,
+    "没做成三态——离线/网关旧版会被当成'没有强力线路'，按钮集体消失");
+
+  // 同一条闸必须同时管住**渲染**和**发送**。只藏按钮不拦请求头，用户会陷在一个
+  // 每轮都报错、又找不到地方关掉的状态里。
+  const send = SRC.slice(SRC.indexOf("function _powerRouteOn"));
+  assert.match(send.slice(0, 900), /_powerRouteAvailable\(id\) === false/,
+    "发送侧没拦——按钮藏了但请求头照发，用户没有关掉它的入口");
+  const render = SRC.slice(SRC.indexOf("function _modelPowerToggleHtml"));
+  assert.match(render.slice(0, 1200), /_powerRouteAvailable\(id\) === false/,
+    "渲染侧没拦——按钮画在了没有强力线路的模型上，点了只会报错");
+});
