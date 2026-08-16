@@ -4551,9 +4551,11 @@ body.zen-mode .editor {
 /* 名字是这张卡最重要的东西，却是唯一可收缩的元素（徽章全是 flex:none），
    于是窄一点就被截成「cont…」。让徽章换行、名字守住一个最小宽度。 */
 .mcpfp-card__name { display: flex; align-items: center; gap: 7px; min-width: 0; flex-wrap: wrap; row-gap: 4px; }
-/* 只要下限，不要 grow：同一行的徽章全是 flex:none，给 strong 加 grow 会让它吃掉整行
-   剩余空间，把徽章和状态全推到行尾，中间留一大片空白（七种卡片都受影响）。 */
-.mcpfp-card__name strong { min-width: 8em; }
+/* 名字后面的徽章要**紧挨着**名字。
+   原来给 strong 定了 8em 下限，本意是防止它被挤成 "cont…"；但短名字（context7）会被
+   撑到 8em 宽，徽章因此被推到老远，中间空一大块。真正防截断的是这一行的 flex-wrap：
+   挤不下时徽章整体换行，而不是把名字压扁。所以下限不需要，去掉。 */
+.mcpfp-card__name strong { flex: 0 1 auto; min-width: 0; }
 .mcpfp-card__name strong { font-size: 12.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .mcpfp-badge { flex: none; font-size: 9.5px; font-weight: 650; padding: 1px 6px; border-radius: 999px; color: var(--accent); background: color-mix(in srgb, var(--accent) 11%, transparent); text-transform: uppercase; }
 .mcpfp-badge--count { color: #188038; background: color-mix(in srgb, #34a853 12%, transparent); text-transform: none; }

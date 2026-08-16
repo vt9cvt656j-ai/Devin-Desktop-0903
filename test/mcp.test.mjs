@@ -1095,8 +1095,13 @@ test("显式写了 owner 就听它的，推断只在缺失时补位", () => {
 test("卡片名字守得住最小宽度，徽章换行而不是把名字截成四个字", () => {
   assert.match(APP_CSS, /\.mcpfp-card__name \{[^}]*flex-wrap: wrap/,
     "徽章不换行，名字就是唯一被牺牲的那个");
-  assert.match(APP_CSS, /\.mcpfp-card__name strong \{[^}]*min-width: 8em/,
-    "名字没有最小宽度，窄一点就被截成「cont…」");
+  // 8em 的下限去掉了：它确实防住了截断，但**短名字**（context7）会被撑到 8em 宽，
+  // 后面的徽章因此被推到老远，名字和徽章之间空一大块。真正防截断的是上面那条
+  // flex-wrap——挤不下时徽章整体换行，而不是把名字压扁。
+  assert.match(APP_CSS, /\.mcpfp-card__name strong \{[^}]*min-width: 0/,
+    "名字又被撑出一个下限宽度，徽章会被推离名字");
+  assert.doesNotMatch(APP_CSS, /\.mcpfp-card__name strong \{[^}]*min-width: 8em/,
+    "8em 下限回来了");
 });
 
 test("线性图标补上描边，不再渲染成黑方块", () => {

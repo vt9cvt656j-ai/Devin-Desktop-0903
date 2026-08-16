@@ -1279,3 +1279,25 @@ test("MCP 页：已停用排在已装服务之后，卡片不靠整块染色表�
   assert.match(css.slice(btnAt, css.indexOf("}", btnAt)), /background:\s*var\(--feature-control\)/,
     "主按钮还是整块实心主色");
 });
+
+test("Skills：外部技能可删，但删之前必须把磁盘路径摆出来", () => {
+  // 原来外部目录（用户 / 插件目录）的技能一律只能停用，卡片上连删除按钮都不画——
+  // 用户看到的是"这一堆技能没有删除功能"。按所有者要求放开了，但这一下会删到工作区
+  // **外面**的文件夹，所以必须先把完整路径摆给用户看。
+  const can = SRC.slice(SRC.indexOf("function _skillCanDelete"));
+  const canBody = can.slice(0, can.indexOf("\n}\n") + 3);
+  assert.match(canBody, /return !!String\(skill\.baseDir \|\| ""\)\.trim\(\)/,
+    "外部技能又不能删了");
+
+  const del = SRC.slice(SRC.indexOf("async function _deleteSkillRecord"));
+  const delBody = del.slice(0, del.indexOf("\n}\n") + 3);
+  assert.match(delBody, /confirm\(/, "删工作区外的目录居然不确认");
+  assert.match(delBody, /\$\{dir\}/, "确认框里没写清楚要删哪个目录");
+  assert.match(delBody, /if \(!ok\) return;/, "用户点了取消还照删");
+  // 确认只针对**工作区外**的；工作区里自己装的不必每次拦一道。
+  assert.match(delBody, /if \(!_skillIsWorkspaceInstalled\(skill, skillRoot\)\) \{/,
+    "把工作区内的删除也拦上了确认框，那是多余的摩擦");
+  // 分区标题不能再说"不能在这里删除"——现在能删了，留着就是假话。
+  assert.doesNotMatch(SRC, /只读，可开关但不能在这里删除/,
+    "分区标题还写着不能删除，和实际行为对不上");
+});
