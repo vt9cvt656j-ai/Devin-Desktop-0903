@@ -773,16 +773,115 @@ body.is-tauri.is-mac.is-fullscreen .titlebar {
 }
 
 /* 「自动化用哪个浏览器」面板。整块沿用 ctp- 卡片的排版，只补它自己的行样式。 */
-.bp-hint, .bp-empty { font-size: 12px; line-height: 1.55; opacity: .72; margin-bottom: 12px; }
-.bp-empty { opacity: .6; padding: 8px 0 4px; }
-.bp-list { display: flex; flex-direction: column; gap: 6px; }
-.bp-row {
-  display: flex; align-items: center; gap: 10px;
-  padding: 9px 11px; border-radius: 8px; cursor: pointer;
-  border: 1px solid rgba(128,128,128,.2);
-  background: rgba(128,128,128,.03);
+/* ---- 浏览器选择弹窗 ----
+   和设置面板同一套语言：小节标题 + 一张卡、卡内多行用发丝线分隔、行内左标题右控件。
+   **这个弹窗在面板外面**，所以颜色一律用全局令牌（:root 上定义的）并带字面兜底——
+   面板那套 --feature-* 在这儿取不到，取不到又没兜底的话整条声明会作废（毛玻璃那次
+   就是这么栽的）。 */
+.bp-lede {
+  margin: 0 0 18px;
+  font-size: 12.5px;
+  line-height: 1.6;
+  color: var(--text-dim, #6e6e73);
 }
-.bp-row:hover { background: rgba(128,128,128,.08); }
+.bp-lede b { font-weight: 600; color: var(--text, #1c1c1e); }
+.bp-empty {
+  padding: 10px 0 4px;
+  font-size: 12.5px;
+  line-height: 1.6;
+  color: var(--text-dim, #6e6e73);
+}
+.bp-sec {
+  margin: 0 0 8px 2px;
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: .01em;
+  color: var(--text-dim, #6e6e73);
+}
+.bp-list, .bp-card {
+  margin-bottom: 22px;
+  background: var(--panel-2, #fbfbfd);
+  border: 1px solid var(--line-strong, rgba(0, 0, 0, .14));
+  border-radius: 12px;
+  overflow: hidden;
+}
+.bp-card { padding: 12px 14px 10px; }
+/* 一行一个选项，行间发丝线；不再是一堆各自描边、彼此隔 6px 的小盒子。 */
+.bp-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-height: 54px;
+  padding: 11px 14px;
+  cursor: pointer;
+  border: 0;
+  border-radius: 0;
+  background: none;
+}
+.bp-row + .bp-row { border-top: 1px solid var(--line, rgba(0, 0, 0, .09)); }
+.bp-row:hover { background: var(--hover, rgba(0, 0, 0, .05)); }
+/* 原生 radio 藏掉，自己画一个——原生控件在这套界面里是唯一一处系统件。 */
+.bp-row input[type="radio"] { position: absolute; opacity: 0; pointer-events: none; }
+.bp-row__text { flex: 1 1 auto; min-width: 0; display: flex; flex-direction: column; gap: 3px; }
+.bp-row__name { font-size: 13.5px; font-weight: 550; color: var(--text, #1c1c1e); }
+.bp-row__path {
+  font-size: 11.5px;
+  line-height: 1.45;
+  color: var(--text-dim, #6e6e73);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.bp-radio {
+  flex: none;
+  width: 17px;
+  height: 17px;
+  border: 1.5px solid var(--line-strong, rgba(0, 0, 0, .22));
+  border-radius: 50%;
+  position: relative;
+}
+.bp-row.is-on .bp-radio { border-color: var(--accent, #0a84ff); }
+.bp-row.is-on .bp-radio::after {
+  content: "";
+  position: absolute;
+  inset: 3px;
+  border-radius: 50%;
+  background: var(--accent, #0a84ff);
+}
+/* 选中不再给整行铺一层蓝底——那在一列选项里比选中标记本身还抢眼。 */
+.bp-ext {
+  width: 100%;
+  min-height: 74px;
+  padding: 8px 10px;
+  font-family: var(--mono);
+  font-size: 12px;
+  line-height: 1.55;
+  color: var(--text, #1c1c1e);
+  background: var(--editor-bg, #fff);
+  border: 1px solid var(--line-strong, rgba(0, 0, 0, .14));
+  border-radius: 8px;
+  outline: none;
+  resize: vertical;
+}
+.bp-ext:focus-visible { box-shadow: 0 0 0 3px var(--sel, rgba(10, 132, 255, .14)); }
+.bp-note {
+  margin: 8px 0 0;
+  font-size: 11.5px;
+  line-height: 1.5;
+  color: var(--text-dim, #6e6e73);
+}
+.bp-note b { font-weight: 600; color: var(--text, #1c1c1e); }
+.bp-warn {
+  padding: 10px 12px;
+  font-size: 12px;
+  line-height: 1.55;
+  color: #b26a00;
+  background: rgba(224, 160, 0, .10);
+  border: 1px solid rgba(224, 160, 0, .28);
+  border-radius: 10px;
+}
+:root[data-theme="dark"] .bp-warn { color: #e0a000; background: rgba(224, 160, 0, .12); }
+
 /* 选中态用边框而不是填充：这一列里每行都有一个单选圆点，再加底色会有两个"选中"信号。 */
 .bp-row.is-on { border-color: #4a9eff; background: rgba(74,158,255,.07); }
 .bp-row input { margin: 0; flex-shrink: 0; }
