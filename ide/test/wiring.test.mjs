@@ -1328,6 +1328,15 @@ test("侧栏毛玻璃要真能透出后面，且不支持时必须退回实色",
   assert.match(rail, /backdrop-filter:\s*blur\([^)]*\)\s+saturate\(/,
     "只 blur 不提饱和度，背后内容会褪成一片脏灰");
   assert.match(rail, /background:\s*var\(--feature-glass\)/, "侧栏没有半透明底");
+  // 玻璃是靠**边缘的高光**被认出来的，只有模糊时更像"背景没渲染好"。
+  assert.match(rail, /box-shadow:\s*inset 1px 0 0 var\(--feature-glass-edge\)/,
+    "侧栏少了玻璃的亮边，看着只是一块半透明色块");
+  // 底色不能太实。72% 那一版看不出效果——侧栏背后正好是纯色的文件树面板，
+  // 模糊一块纯色出来还是那块纯色，得让背后的内容真的透上来一点。
+  const glassAt = css.indexOf("--feature-glass: rgba(252");
+  assert.notEqual(glassAt, -1, "浅色玻璃色没了");
+  const alpha = Number(/rgba\([^)]*,\s*\.(\d+)\)/.exec(css.slice(glassAt, glassAt + 60))?.[1] || "99");
+  assert.ok(alpha <= 60, `玻璃底太实（.${alpha}），背后的内容透不上来，看不出是玻璃`);
   // 深浅两套各自的玻璃色。
   for (const [sel, who] of [[".feature-panel {", "浅色"], [':root[data-theme="dark"] .feature-panel {', "深色"]]) {
     const at = css.indexOf("\n" + sel);
