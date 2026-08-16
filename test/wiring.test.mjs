@@ -1040,3 +1040,24 @@ test("AI 助手开关：按钮、面板、分隔条、落盘、开机还原，�
   assert.match(click, /new Event\("resize"\)/,
     "收放面板后没触发重算，编辑器会停在旧宽度");
 });
+
+test("设置面板的下拉框必须是自绘的，且一列右端要对齐", () => {
+  // 原生 <select> 在 macOS 上右端是一个上下双箭头的系统步进器，和这套界面里其它
+  // 任何东西都不是一路货；而且原生控件宽度由最长选项撑开，「简体中文 (zh-CN)」很宽、
+  // 「关闭」很窄，一列扫下来右边缘参差不齐。两件事都不报错，只是看着廉价。
+  const css = readFileSync(join(HERE, "../src/styles/app.css"), "utf8");
+  const at = css.indexOf("select.settings-input {");
+  assert.notEqual(at, -1, "下拉框的样式规则没了");
+  const block = css.slice(at, at + 900);
+  assert.match(block, /appearance:\s*none/,
+    "又用回原生下拉了，右端会冒出系统的上下双箭头");
+  assert.match(block, /background-image:\s*url\("data:image\/svg/,
+    "关掉原生外观却没自己画箭头，下拉框会变成一个没有任何提示的方框");
+  // 深色主题要单独给一版箭头：currentColor 在背景图里不生效，只写一套的话
+  // 深色下箭头会是深灰压深灰，几乎看不见。
+  assert.match(css, /:root\[data-theme="dark"\] select\.settings-input\s*\{[^}]*background-image:/,
+    "深色主题没有单独的箭头颜色，会糊在背景里");
+  // 右端对齐靠的是共同的下限宽度。
+  assert.match(css, /\.settings-row__control > select\.settings-input[\s\S]{0,120}min-width:/,
+    "控件没有统一的下限宽度，一列右边缘会参差不齐");
+});
