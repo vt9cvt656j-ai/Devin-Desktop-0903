@@ -1,1 +1,0 @@
-import{Mc as e,kc as t}from"./vendor-a8bn3H4I.js";e();export{t as WebviewWindow};

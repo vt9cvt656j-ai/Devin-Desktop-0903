@@ -20,27 +20,48 @@ const CONSOLE = "https://code.mrday.one";
  * uses for the providers it cannot offer.
  *
  * Model is an account page: a signed-out visitor following it lands on the sign-in page and
- * is returned afterwards, which is the gateway's normal behaviour. Update Log is public.
+ * is returned afterwards, which is the gateway's normal behaviour. Changelog is public.
  * Rankings is a page of this site but not a public one — it reports what accounts spent, so
  * it renders its own "sign in to see this" rather than redirecting; the nav should not
  * bounce someone off the site for clicking a tab.
+ *
+ * The labels are the vocabulary developer tools already share, because a nav is not the
+ * place to be original — someone scanning it should recognise each word without reading it.
+ *
+ *   "Home"       → "Product".   Every site has a home; the logo is already it. The word
+ *                               spends a nav slot saying nothing about what is being sold.
+ *   "Update Log" → "Changelog". The term Cursor, Linear and Raycast all use, and it is
+ *                               already the URL this points at (/changelog) — the nav was
+ *                               the only place calling it something else.
  */
 const links: { href?: string; label: string; soon?: boolean }[] = [
-  { href: "/", label: "Home" },
+  { href: "/", label: "Product" },
   { href: `${CONSOLE}/dashboard#models`, label: "Model" },
-  { href: "/changelog", label: "Update Log" },
+  { href: "/docs", label: "Docs" },
+  { href: "/changelog", label: "Changelog" },
   { href: "/rankings", label: "Rankings" },
 ];
 
 const linkClass =
   "rounded-lg px-3 py-2 text-sm font-medium text-muted-foreground transition-colors hover:bg-secondary hover:text-foreground";
 
-export function Navbar() {
+export function Navbar({ wide = false }: { wide?: boolean } = {}) {
   const [open, setOpen] = useState(false);
+
+  // 当前所在的那一项要高亮。绝对 URL（控制台）天然为 false —— 它不是本站的路径。
+  const here = (h?: string) =>
+    !!h && h.startsWith("/") && (h === "/" ? location.pathname === "/" : location.pathname.startsWith(h));
 
   return (
     <header className="sticky top-0 z-50 border-b border-border/60 bg-background/80 backdrop-blur-xl">
-      <nav className="mx-auto flex h-16 max-w-6xl items-center justify-between px-4 sm:px-6">
+      <nav
+        className={cn(
+          "mx-auto flex h-16 items-center justify-between px-4 sm:px-6",
+          // 文档是三栏、容器 84rem；导航不跟着加宽的话，logo 会比侧栏左边缘缩进近 100px，
+          // 两条对不齐的边比窄一点更难看。
+          wide ? "max-w-[84rem] lg:px-8" : "max-w-6xl",
+        )}
+      >
         {/* 标题栏式左组：窗口控制点 → 日/夜切换 → 品牌 */}
         <div className="flex items-center gap-3">
           <ThemeToggle />
@@ -64,7 +85,12 @@ export function Navbar() {
                 </span>
               </span>
             ) : (
-              <a key={link.label} href={link.href} className={linkClass}>
+              <a
+                key={link.label}
+                href={link.href}
+                aria-current={here(link.href) ? "page" : undefined}
+                className={cn(linkClass, here(link.href) && "bg-secondary text-foreground")}
+              >
                 {link.label}
               </a>
             ),

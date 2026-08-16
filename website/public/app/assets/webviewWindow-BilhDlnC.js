@@ -1,0 +1,1 @@
+import{fl as e,ll as t}from"./vendor-DXElHJaw.js";e();export{t as WebviewWindow};

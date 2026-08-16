@@ -37,7 +37,7 @@ export function Footer() {
               Mr. Day One
             </p>
             <p className="mt-3 text-sm text-muted-foreground">
-              A native desktop code editor for macOS and Windows, with an agent that verifies its
+              A native desktop code editor for MacOS and Windows, with an agent that verifies its
               own work.
             </p>
           </div>
@@ -65,8 +65,9 @@ export function Footer() {
           </div>
         </div>
         <Separator className="my-10" />
-        <p className="text-sm text-muted-foreground">
-          © {new Date().getFullYear()} Mr. Day One. Companion to Devin Desktop.
+        {/* text-center：这一行独占底部整行，左对齐会把它甩到最左边，和上面居中的版式对不齐。 */}
+        <p className="text-center text-sm text-muted-foreground">
+          © {new Date().getFullYear()} Mr. Day One.
         </p>
       </div>
     </footer>

@@ -1,0 +1,1 @@
+import{Tl as e,wl as t}from"./vendor-DXElHJaw.js";e();export{t as getCurrentWindow};

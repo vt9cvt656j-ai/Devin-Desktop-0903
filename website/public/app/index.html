@@ -4,551 +4,27 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Mr. Day One</title>
-    <script type="module" crossorigin src="/app/assets/main-B8ZfEzaG.js"></script>
+    <script type="module" crossorigin src="/app/assets/main-BHrUj6Mw.js"></script>
     <link rel="modulepreload" crossorigin href="/app/assets/rolldown-runtime-BVpWp9h4.js">
-    <link rel="modulepreload" crossorigin href="/app/assets/vendor-a8bn3H4I.js">
-    <link rel="modulepreload" crossorigin href="/app/assets/xterm-BynNY5yz.js">
-    <link rel="modulepreload" crossorigin href="/app/assets/editor.api2-DaaEyX5_.js">
-    <link rel="modulepreload" crossorigin href="/app/assets/workers-DERLcYzn.js">
-    <link rel="modulepreload" crossorigin href="/app/assets/monaco.contribution-hIiBNNTP.js">
-    <link rel="stylesheet" crossorigin href="/app/assets/xterm-B1njb2Cr.css">
-    <link rel="stylesheet" crossorigin href="/app/assets/editor-6dDxwTOO.css">
-    <link rel="stylesheet" crossorigin href="/app/assets/main-Cl5l9VtL.css">
+    <link rel="modulepreload" crossorigin href="/app/assets/vendor-DXElHJaw.js">
+    <link rel="modulepreload" crossorigin href="/app/assets/tailwind-iGaSgD7L.js">
+    <link rel="stylesheet" crossorigin href="/app/assets/tailwind-C7Vn9kUI.css">
+    <link rel="stylesheet" crossorigin href="/app/assets/main-B8L1ILca.css">
   </head>
   <body>
-    <div class="titlebar" data-tauri-drag-region>
-      <div class="titlebar__lead">
-        <img class="brandmark" src="/app/logo.png" alt="" aria-hidden="true" />
-      </div>
-      <nav class="titlebar__menu" id="menubar" aria-label="Main menu"></nav>
-      <div class="titlebar__title" id="windowTitle">Mr. Day One</div>
-      <div class="titlebar__actions">
-        <button id="openFolderBtn" hidden></button>
-        <button id="saveBtn" hidden></button>
-        <div class="titlebar__action-group titlebar__action-group--run" data-i18n-aria-label="debug.runGroup" aria-label="运行与调试">
-          <button class="tbtn tbtn--icon" id="debugBtn" data-i18n-title="debug.title" data-i18n-aria-label="debug.aria" title="调试 / Debugger (断点、单步、变量)" aria-label="调试">
-            <svg class="ic"><use href="#i-bug" /></svg>
-            <span data-i18n="debug.aria">Debug</span>
-          </button>
-          <button class="tbtn tbtn--icon" id="runBtn" data-i18n-title="menu.runCurrentFile" data-i18n-aria-label="menu.runCurrentFile" title="运行当前文件" aria-label="运行当前文件" disabled>
-            <svg class="ic"><use href="#i-play" /></svg>
-            <span data-i18n="menu.runCurrentFile">Run</span>
-          </button>
-        </div>
-        <div class="titlebar__action-group titlebar__action-group--tools" data-i18n-aria-label="menu.tools" aria-label="工具">
-          <button class="tbtn tbtn--icon tbtn--premium" id="michaelPremiumBtn" data-i18n-title="premiumDb.title" data-i18n-aria-label="premiumDb.title" title="Michael Premium — 数据库工具" aria-label="Michael Premium — 数据库工具">
-            <svg class="ic"><use href="#i-premiumdb" /></svg>
-          </button>
-          <button class="tbtn tbtn--icon" id="terminalBtn" data-i18n-title="terminal.toggle" title="Toggle terminal (⌃`)">
-            <svg class="ic"><use href="#i-terminal" /></svg>
-          </button>
-          <button class="tbtn tbtn--icon" id="extensionsBtn" data-i18n-title="ext.title" title="Extensions" hidden>
-            <svg class="ic"><use href="#i-ext" /></svg>
-          </button>
-          <button class="tbtn tbtn--icon notif-bell" id="notifBellBtn" data-i18n-title="notifications.title" title="Notifications">
-            <svg class="ic"><use href="#i-bell" /></svg>
-            <span class="notif-badge" id="notifBadge" hidden></span>
-          </button>
-          <button class="tbtn tbtn--icon ide-update-btn" id="ideUpdateBtn" type="button" hidden data-i18n-title="updates.check" title="Check for updates" aria-label="Check for updates">
-            <span class="ide-update-btn__brand" aria-hidden="true">
-              <img class="ide-update-btn__logo" src="/app/logo.png" alt="" />
-              <span class="ide-update-btn__new">NEW</span>
-            </span>
-          </button>
-          <div class="settings-wrap">
-            <button class="tbtn tbtn--icon" id="settingsBtn" data-i18n-title="feature.settings.title" title="设置">
-              <svg class="ic"><use href="#i-gear" /></svg>
-            </button>
-            <div class="settings-dropdown" id="settingsDropdown" hidden>
-              <button class="settings-dropdown__header" data-action="login">
-                <svg class="settings-dropdown__avatar" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
-                  <circle cx="12" cy="8" r="4" />
-                  <path d="M4 20c0-3.3 2.7-6 6-6h4c3.3 0 6 2.7 6 6" stroke-linecap="round" />
-                </svg>
-                <div class="settings-dropdown__account">
-                  <div class="settings-dropdown__name" data-i18n="account.notSignedIn">未登录</div>
-                  <div class="settings-dropdown__hint" data-i18n="account.signInHint">点击登录</div>
-                </div>
-              </button>
-              <div class="settings-dropdown__divider"></div>
-              <button class="settings-dropdown__item" data-action="profile" id="profileBtn" hidden>
-                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><circle cx="12" cy="8" r="3"/><path d="M6 18c0-2.5 2-5 6-5s6 2.5 6 5"/></svg>
-                <span data-i18n="account.profile">个人资料</span>
-              </button>
-              <button class="settings-dropdown__item" data-action="billing" id="billingBtn" hidden>
-                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
-                  <rect x="2" y="5" width="20" height="14" rx="2"/>
-                  <path d="M2 10h20"/>
-                  <path d="M6 15h4"/>
-                  <path d="M14 15h4"/>
-                </svg>
-                <span data-i18n="account.billing">账单</span>
-              </button>
-              <div class="settings-dropdown__divider" id="accountActionsDivider" hidden></div>
-              <button class="settings-dropdown__item" data-action="general-settings">
-                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
-                  <path d="M12.22 2h-.44a2 2 0 00-2 2v.18a2 2 0 01-1 1.73l-.43.25a2 2 0 01-2 0l-.15-.08a2 2 0 00-2.73.73l-.22.38a2 2 0 00.73 2.73l.15.1a2 2 0 011 1.72v.51a2 2 0 01-1 1.74l-.15.09a2 2 0 00-.73 2.73l.22.38a2 2 0 002.73.73l.15-.08a2 2 0 012 0l.43.25a2 2 0 011 1.73V20a2 2 0 002 2h.44a2 2 0 002-2v-.18a2 2 0 011-1.73l.43-.25a2 2 0 012 0l.15.08a2 2 0 002.73-.73l.22-.39a2 2 0 00-.73-2.73l-.15-.08a2 2 0 01-1-1.74v-.5a2 2 0 011-1.74l.15-.09a2 2 0 00.73-2.73l-.22-.38a2 2 0 00-2.73-.73l-.15.08a2 2 0 01-2 0l-.43-.25a2 2 0 01-1-1.73V4a2 2 0 00-2-2z"/>
-                  <circle cx="12" cy="12" r="3"/>
-                </svg>
-                <span data-i18n="account.generalSettings">通用设置</span>
-              </button>
-              <button class="settings-dropdown__item" data-action="shortcuts">
-                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
-                  <rect x="2" y="4" width="20" height="16" rx="3"/>
-                  <rect x="5" y="7" width="3" height="3" rx=".5" opacity=".6"/>
-                  <rect x="10" y="7" width="4" height="3" rx=".5" opacity=".6"/>
-                  <rect x="16" y="7" width="3" height="3" rx=".5" opacity=".6"/>
-                  <rect x="5" y="12" width="4" height="3" rx=".5" opacity=".6"/>
-                  <rect x="11" y="12" width="3" height="3" rx=".5" opacity=".6"/>
-                  <rect x="16" y="12" width="3" height="3" rx=".5" opacity=".6"/>
-                  <rect x="7" y="17" width="10" height="2.5" rx=".5" opacity=".4"/>
-                </svg>
-                <span data-i18n="account.shortcuts">快捷键</span>
-              </button>
-              <div class="settings-dropdown__divider" id="logoutDivider" hidden></div>
-              <button class="settings-dropdown__item settings-dropdown__item--danger" data-action="logout" id="logoutBtn" hidden>
-                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><path d="M9 21H5a2 2 0 01-2-2V5a2 2 0 012-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/></svg>
-                <span data-i18n="account.logout">退出登录</span>
-              </button>
-            </div>
-          </div>
-        </div>
-      </div>
-    </div>
+    <!--
+      UI markup 已经搬进 React（src/app/Shell.jsx），这里只留三样东西：
 
-    <main class="layout">
-      <!-- Left: file explorer + search -->
-      <aside class="panel explorer" id="explorer">
-        <header class="panel__head">
-          <div class="seg" id="sideTabs" role="tablist">
-            <button class="seg__btn is-active" id="tabExplorer" type="button" role="tab" data-i18n-title="sidebar.explorer" title="文件">
-              <svg class="ic"><use href="#i-files" /></svg><span data-i18n="sidebar.explorer">Explorer</span>
-            </button>
-            <button class="seg__btn" id="tabGit" type="button" role="tab" title="Git">
-              <svg class="ic"><use href="#i-git" /></svg><span data-i18n="sidebar.source">Source</span>
-            </button>
-            <button class="seg__btn" id="tabOutline" type="button" role="tab" data-i18n-title="sidebar.outline" title="大纲">
-              <svg class="ic"><use href="#i-outline" /></svg><span data-i18n="sidebar.outline">大纲</span>
-            </button>
-            <button class="seg__btn" id="tabTest" type="button" role="tab" data-i18n-title="sidebar.tests" title="测试">
-              <svg class="ic"><use href="#i-beaker" /></svg><span data-i18n="sidebar.tests">测试</span>
-            </button>
-          </div>
-        </header>
+        1. #root —— React 的挂载点。必须 height:100%：.layout 的
+           `height: calc(100% - var(--titlebar-h) - var(--statusbar-h))`
+           是按父元素算的，少了这一条整个三栏布局会塌成 0 高。
+        2. 图标 sprite —— 77 个 <symbol> 的静态 defs，被 <use href="#i-x"/> 引用。
+           搬进 React 只会让首屏多解析一遍，没有好处。
+        3. boot 入口 —— 它保证 React 先 commit、main.js 后加载，见 src/boot.jsx。
+    -->
+    <div id="root"></div>
 
-        <!-- Explorer view -->
-        <div class="side-view" id="viewExplorer">
-          <div class="explorer__bar">
-            <span class="explorer__root" id="rootName" title="" data-i18n="explorer.noFolder">No folder</span>
-            <span class="explorer__tools">
-              <button class="iconbtn" id="newFileBtn" type="button" data-i18n-title="explorer.newFile" title="New File" disabled><svg class="ic"><use href="#i-new-file" /></svg></button>
-              <button class="iconbtn" id="newFolderBtn" type="button" data-i18n-title="explorer.newFolder" title="New Folder" disabled><svg class="ic"><use href="#i-new-folder" /></svg></button>
-              <button class="iconbtn" id="refreshTreeBtn" type="button" data-i18n-title="explorer.refresh" title="Refresh" disabled><svg class="ic"><use href="#i-refresh" /></svg></button>
-            </span>
-          </div>
-          <div class="tree" id="tree">
-            <div class="empty">
-              <svg class="empty__art" viewBox="0 0 120 96"><use href="#art-folder" /></svg>
-              <p data-i18n="explorer.openHint">Open a folder to get started.</p>
-              <button class="btn btn--primary" id="emptyOpenBtn" data-i18n="explorer.openBtn">Open folder…</button>
-            </div>
-          </div>
-        </div>
-
-        <!-- Search view -->
-        <div class="side-view" id="viewSearch" hidden>
-          <div class="search-box">
-            <div class="search-input">
-              <svg class="ic"><use href="#i-search" /></svg>
-              <input id="searchInput" type="text" data-i18n-placeholder="search.placeholder" placeholder="Search in folder…" spellcheck="false" autocomplete="off" />
-              <button class="iconbtn search-case" id="searchCaseBtn" type="button" data-i18n-title="search.matchCase" title="Match Case" aria-pressed="false">Aa</button>
-            </div>
-            <div class="search-meta" id="searchMeta"></div>
-          </div>
-          <div class="search-results" id="searchResults"></div>
-        </div>
-
-        <!-- Source Control (Git) view -->
-        <div class="side-view" id="viewGit" hidden>
-          <div class="git-bar">
-            <button class="git-branch" id="gitBranchBtn" type="button" data-i18n-title="git.branchHint" title="Current branch — click to switch" aria-haspopup="true" aria-expanded="false">
-              <svg class="ic"><use href="#i-git" /></svg>
-              <span id="gitBranchName">—</span>
-              <svg class="ic git-branch__caret"><use href="#i-chevron" /></svg>
-            </button>
-            <button class="iconbtn" id="gitPullBtn" type="button" data-i18n-title="git.pull" title="Pull"><svg class="ic"><use href="#i-arrow-down" /></svg></button>
-            <button class="iconbtn" id="gitPushBtn" type="button" data-i18n-title="git.push" title="Push"><svg class="ic"><use href="#i-arrow-up" /></svg></button>
-            <button class="iconbtn" id="gitStashBtn" type="button" data-i18n-title="git.stash" title="Stash changes"><svg class="ic"><use href="#i-archive" /></svg></button>
-            <button class="iconbtn" id="gitRefreshBtn" type="button" data-i18n-title="explorer.refresh" title="Refresh"><svg class="ic"><use href="#i-refresh" /></svg></button>
-            <div class="git-branch-menu" id="gitBranchMenu" hidden></div>
-          </div>
-          <div class="git-commit">
-            <textarea id="gitCommitMsg" class="git-commit__msg" rows="1" data-i18n-placeholder="git.commitPlaceholder" placeholder="Message (commit staged changes)"></textarea>
-            <button class="git-commit__btn" id="gitCommitBtn" type="button" title="Commit staged changes">
-              <svg class="ic"><use href="#i-check" /></svg><span data-i18n="git.commit">Commit</span>
-            </button>
-          </div>
-          <div class="git-list" id="gitList"></div>
-          <div class="git-section-title git-stash-title" style="display:none" id="gitStashTitle">
-            <span data-i18n="git.stashes">Stashes</span>
-            <button class="git-section-act" id="gitStashToggle" type="button" data-i18n-title="git.toggleStashes" title="Toggle stashes">
-              <svg class="ic"><use href="#i-chevron" /></svg>
-            </button>
-          </div>
-          <div class="git-stash-list" id="gitStashList" hidden></div>
-          <div class="git-section-title git-log-title" style="display:none" id="gitLogTitle">
-            <span data-i18n="git.history">History</span>
-            <button class="git-section-act" id="gitLogToggle" type="button" data-i18n-title="git.toggleHistory" title="Toggle history">
-              <svg class="ic"><use href="#i-chevron" /></svg>
-            </button>
-          </div>
-          <div class="git-log" id="gitLog" hidden></div>
-        </div>
-
-        <!-- Outline view -->
-        <div class="side-view" id="viewOutline" hidden>
-          <div class="outline-bar">
-            <span class="outline-title" data-i18n="sidebar.outline">大纲</span>
-            <span class="outline-tools">
-              <button class="iconbtn" id="outlineSortBtn" type="button" title="Sort by position"><svg class="ic"><use href="#i-outline" /></svg></button>
-              <button class="iconbtn" id="outlineRefreshBtn" type="button" title="Refresh"><svg class="ic"><use href="#i-refresh" /></svg></button>
-            </span>
-          </div>
-          <div class="outline-filter">
-            <input id="outlineFilter" type="text" data-i18n-placeholder="outline.filter" placeholder="Filter symbols…" spellcheck="false" autocomplete="off" />
-          </div>
-          <div class="outline-tree" id="outlineTree">
-            <div class="empty"><p data-i18n="outline.empty">Open a file to see its outline.</p></div>
-          </div>
-          <div class="outline-timeline" id="outlineTimeline" hidden>
-            <div class="outline-section-title">
-              <svg class="ic"><use href="#i-history" /></svg>
-              <span data-i18n="outline.timeline">时间线</span>
-              <button class="iconbtn" id="timelineToggle" type="button" title="Toggle Timeline">
-                <svg class="ic"><use href="#i-chevron" /></svg>
-              </button>
-            </div>
-            <div class="timeline-list" id="timelineList"></div>
-          </div>
-        </div>
-
-        <!-- Test Explorer view -->
-        <div class="side-view" id="viewTest" hidden>
-          <div class="test-bar">
-            <span class="test-title" data-i18n="sidebar.tests">测试</span>
-            <span class="test-tools">
-              <button class="iconbtn" id="testRunAllBtn" type="button" data-i18n-title="test.runAll" title="Run All Tests"><svg class="ic"><use href="#i-play" /></svg></button>
-              <button class="iconbtn" id="testRefreshBtn" type="button" data-i18n-title="explorer.refresh" title="Refresh"><svg class="ic"><use href="#i-refresh" /></svg></button>
-            </span>
-          </div>
-          <div class="test-tree" id="testTree">
-            <div class="empty"><p data-i18n="test.empty">No tests detected. Open a project with test files.</p></div>
-          </div>
-          <div class="test-output" id="testOutput" hidden></div>
-        </div>
-
-        <!-- Debug view — the 测试 tab turns into this while a debug session is active -->
-        <div class="side-view dbg-side" id="viewDebug" hidden>
-          <div class="dbg-side__sec">
-            <div class="dbg-side__title" data-i18n="debug.variables">变量</div>
-            <div class="dbg-side__body" id="dbgSideVars"></div>
-          </div>
-          <div class="dbg-side__sec">
-            <div class="dbg-side__title" data-i18n="debug.callStack">调用栈</div>
-            <div class="dbg-side__body" id="dbgSideStack"></div>
-          </div>
-          <div class="dbg-side__sec">
-            <div class="dbg-side__title" data-i18n="debug.breakpoints">断点</div>
-            <div class="dbg-side__body" id="dbgSideBps"></div>
-          </div>
-        </div>
-      </aside>
-
-      <div class="panel-sash panel-sash--left" id="sashLeft"></div>
-
-      <!-- Center: tabs + editor -->
-      <section class="editorwrap">
-        <div class="tabs" id="tabs"></div>
-        <div class="editor-container" id="editorContainer">
-          <div class="editor" id="editor"></div>
-        </div>
-        <div class="diff-view" id="diffView" hidden>
-          <div class="diff-view__head">
-            <span class="diff-view__title">
-              <svg class="ic"><use href="#i-git" /></svg>
-              <span id="diffTitle" data-i18n="diff.title">Diff</span>
-              <span class="diff-view__sub" data-i18n="diff.sub">HEAD ↔ Working Tree</span>
-            </span>
-            <button class="diff-view__close" id="diffClose" type="button" data-i18n-title="diff.close" data-i18n-aria-label="diff.close" title="Close diff" aria-label="Close diff">
-              <svg class="ic"><use href="#i-close" /></svg>
-            </button>
-          </div>
-          <div class="diff-view__body" id="diffBody"></div>
-        </div>
-        <div class="welcome" id="welcome">
-          <h1 data-i18n="welcome.title">Mr. Day One</h1>
-          <p data-i18n="welcome.desc">A macOS-style editor with a built-in AI assistant. Open a folder, pick a file, and ask the assistant on the right for help.</p>
-          <div class="welcome__actions">
-            <button class="welcome__btn welcome__btn--primary" id="welcomeOpenBtn" type="button">
-              <svg class="ic"><use href="#i-folder" /></svg>
-              <span data-i18n="explorer.openBtn">打开文件夹</span>
-            </button>
-          </div>
-          <div class="welcome__recent" id="welcomeRecent" hidden>
-            <h3 data-i18n="welcome.recent">最近项目</h3>
-            <ul class="welcome__recent-list" id="recentList"></ul>
-          </div>
-          <div class="welcome__tips">
-            <span class="kbd-tip"><kbd>Ctrl</kbd><kbd>O</kbd> <span data-i18n="explorer.openBtn">打开文件夹</span></span>
-            <span class="kbd-tip"><kbd>Ctrl</kbd><kbd>⇧</kbd><kbd>P</kbd> <span data-i18n="menu.commandPalette">命令面板</span></span>
-            <span class="kbd-tip"><kbd>↩</kbd> <span data-i18n="welcome.tipAsk">询问助手</span></span>
-          </div>
-          <div class="welcome__copyright">© 2026 Digital Bang Intelligence LLC. All rights reserved.</div>
-        </div>
-        <div class="problems-panel" id="problemsPanel" hidden>
-          <div class="problems-panel__head">
-            <span class="problems-panel__title">
-              <svg class="ic" aria-hidden="true"><use href="#i-error" /></svg>
-              <span data-i18n="problems.title">Problems</span>
-              <span class="problems-panel__counts" id="problemsPanelCounts"></span>
-            </span>
-            <button class="problems-panel__close" id="problemsClose" type="button" data-i18n-title="problems.close" title="Close panel" aria-label="Close problems">
-              <svg class="ic"><use href="#i-close" /></svg>
-            </button>
-          </div>
-          <div class="problems-panel__body" id="problemsBody"></div>
-        </div>
-        <div class="terminal-panel" id="terminalPanel" hidden>
-          <div class="terminal-panel__resize" id="terminalResize"></div>
-          <div class="terminal-panel__head">
-            <div class="term-tabs" id="termTabBar"></div>
-            <div class="terminal-panel__actions">
-              <button class="terminal-panel__action" id="termSplitBtn" type="button" data-i18n-title="terminal.split" title="Split Terminal">
-                <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="2" width="12" height="12" rx="1.5"/><line x1="8" y1="2" x2="8" y2="14"/></svg>
-              </button>
-              <button class="terminal-panel__action" id="termNewBtn" type="button" data-i18n-title="terminal.new" title="新建终端">
-                <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"><path d="M8 3v10M3 8h10"/></svg>
-              </button>
-              <button class="terminal-panel__action" id="termMaxBtn" type="button" title="Maximize Panel">
-                <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="10" height="10" rx="1.5"/></svg>
-              </button>
-              <button class="terminal-panel__action" id="terminalClose" type="button" data-i18n-title="terminal.close" data-i18n-aria-label="terminal.close" title="Close Panel (⌃`)" aria-label="Close terminal">
-                <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"><path d="M4.5 4.5l7 7M11.5 4.5l-7 7"/></svg>
-              </button>
-            </div>
-          </div>
-          <div class="terminal-panel__body" id="terminalBody"></div>
-        </div>
-        <div class="output-panel" id="outputPanel" hidden>
-          <div class="output-panel__head">
-            <span class="output-panel__title" data-i18n="output.title">输出</span>
-            <select class="output-panel__channel" id="outputChannel">
-              <option value="lsp" data-i18n="output.channel.lsp">语言服务</option>
-              <option value="tasks" data-i18n="output.channel.tasks">任务</option>
-              <option value="extensions" data-i18n="output.channel.extensions">扩展</option>
-            </select>
-            <div class="output-panel__actions">
-              <button class="terminal-panel__action" id="outputClearBtn" type="button" title="Clear Output"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"><path d="M3 3l10 10M13 3l-10 10"/></svg></button>
-              <button class="terminal-panel__action" id="outputCloseBtn" type="button" data-i18n-title="terminal.closeTab" title="Close"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"><path d="M4.5 4.5l7 7M11.5 4.5l-7 7"/></svg></button>
-            </div>
-          </div>
-          <pre class="output-panel__body" id="outputBody"></pre>
-        </div>
-      </section>
-
-      <div class="panel-sash panel-sash--right" id="sashRight"></div>
-
-      <!-- Right: AI assistant -->
-      <aside class="panel assistant" id="assistant">
-        <header class="panel__head panel__head--assistant">
-          <span class="assistant__brand">
-            <span class="assistant__avatar assistant__avatar--logo">
-              <img class="assistant-logo" src="/app/logo.png" alt="" aria-hidden="true" />
-            </span>
-            <span class="assistant__name" data-i18n="assistant.name">Assistant</span>
-            <span id="ipcPeerCount"></span>
-          </span>
-          <span class="assistant__actions">
-            <span class="assistant-capability" id="capabilitiesMenuWrap">
-              <button class="assistant__action assistant__action--capabilities" id="capabilitiesBtn" type="button" data-i18n-title="assistant.capabilities" data-i18n-aria-label="assistant.capabilities.open" title="能力菜单" aria-label="打开 Skills 和 MCP 菜单" aria-haspopup="menu" aria-expanded="false"></button>
-              <span class="assistant-capability__menu" id="capabilitiesMenu" role="menu" hidden>
-                <button class="assistant-capability__item" id="capabilitySkillsItem" type="button" role="menuitem">
-                  <span class="assistant-capability__item-icon"></span>
-                  <span class="assistant-capability__item-main">
-                    <span class="assistant-capability__item-title" data-i18n="assistant.capability.skills">Skills</span>
-                    <span class="assistant-capability__item-sub" data-i18n="assistant.capability.skillsSub">技能</span>
-                  </span>
-                </button>
-                <button class="assistant-capability__item" id="capabilityMcpItem" type="button" role="menuitem">
-                  <span class="assistant-capability__item-icon"></span>
-                  <span class="assistant-capability__item-main">
-                    <span class="assistant-capability__item-title" data-i18n="assistant.capability.mcp">MCP</span>
-                    <span class="assistant-capability__item-sub" data-i18n="assistant.capability.mcpSub">服务</span>
-                  </span>
-                </button>
-              </span>
-            </span>
-          </span>
-        </header>
-        <div id="chatTabBar"></div>
-        <div class="chat" id="chat"></div>
-        <form class="composer" id="composer">
-          <div class="composer__box">
-            <div id="prompt" contenteditable="true" role="textbox" aria-multiline="true" data-i18n-placeholder="assistant.placeholder" data-placeholder="询问关于当前文件的问题…"></div>
-            <div class="composer__bar">
-              <div class="mode-picker" id="modePicker">
-                <button class="mode-picker__btn" id="modePickerBtn" type="button" data-i18n-title="assistant.mode.switch" title="切换 AI 模式">
-                  <svg class="ic mode-picker__icon" id="modeIcon" viewBox="0 0 16 16"><circle cx="8" cy="5" r="3" fill="none" stroke="currentColor" stroke-width="1.3"/><path d="M3 14c0-3 2-5 5-5s5 2 5 5" fill="none" stroke="currentColor" stroke-width="1.3"/><path d="M11 3l2-1m-2 1l2 1" stroke="currentColor" stroke-width="1" stroke-linecap="round"/></svg>
-                  <span id="modeLabel" data-i18n="assistant.mode.agent">Agent</span>
-                  <svg class="ic mode-picker__caret" viewBox="0 0 16 16"><path d="M4 6l4 4 4-4" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
-                </button>
-                <div class="mode-menu" id="modeMenu" hidden></div>
-              </div>
-              <div class="model-picker" id="modelPicker">
-                <button class="model-picker__btn" id="modelPickerBtn" type="button" data-i18n-title="assistant.switchModel" title="切换模型" aria-haspopup="listbox" aria-expanded="false">
-                  <svg class="ic"><use href="#i-cpu" /></svg>
-                  <span class="model-picker__label" id="modelPickerLabel" data-i18n="assistant.selectModel">选择模型</span>
-                  <svg class="ic model-picker__caret"><use href="#i-caret" /></svg>
-                </button>
-                <div class="menu" id="modelMenu" role="listbox" hidden></div>
-              </div>
-              <span class="cache-ring" id="tokenMeter" role="status" aria-label="上下文缓存 0%" data-tooltip="上下文缓存：0%">
-                <svg class="cache-ring__svg" viewBox="0 0 36 36" aria-hidden="true">
-                  <circle class="cache-ring__track" cx="18" cy="18" r="15.5"></circle>
-                  <circle class="cache-ring__progress" cx="18" cy="18" r="15.5" pathLength="100"></circle>
-                </svg>
-                <span class="cache-ring__label">0</span>
-              </span>
-              <button class="voice-btn" id="voiceBtn" type="button" data-i18n-title="voice.input" data-i18n-aria-label="voice.input" title="语音输入" aria-label="语音输入">
-                <svg class="voice-btn__mic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2a3 3 0 0 0-3 3v6a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3z"/><path d="M19 10v1a7 7 0 0 1-14 0v-1"/><path d="M12 19v3"/></svg>
-                <span class="voice-btn__wave" aria-hidden="true"><i></i><i></i><i></i><i></i><i></i></span>
-              </button>
-              <span class="composer__hint">Ctrl↩</span>
-              <button class="send" id="sendBtn" type="submit" data-i18n-title="assistant.send" title="发送">
-                <svg class="ic"><use href="#i-arrow-up" /></svg>
-              </button>
-            </div>
-          </div>
-        </form>
-      </aside>
-    </main>
-
-    <!-- Status bar -->
-    <footer class="statusbar" id="statusbar">
-      <div class="statusbar__left">
-        <button class="statusbar__item statusbar__item--btn" id="paletteBtn" data-i18n-title="menu.commandPalette" title="命令面板">
-          <svg class="ic"><use href="#i-command" /></svg>
-          <span data-i18n="statusbar.commands">Commands</span>
-        </button>
-        <button class="statusbar__item statusbar__item--btn" id="problemsBtn" title="Problems" aria-label="Problems">
-          <span class="statusbar__diag"><svg class="ic"><use href="#i-error" /></svg><span id="problemsErrCount">0</span></span>
-          <span class="statusbar__diag"><svg class="ic"><use href="#i-warn" /></svg><span id="problemsWarnCount">0</span></span>
-        </button>
-      </div>
-      <div class="statusbar__right" id="statusbarRight"></div>
-    </footer>
-
-    <!-- Login dialog -->
-    <dialog class="sheet login-sheet" id="loginDialog">
-      <div class="sheet__body login-body">
-        <button class="login-close" type="button" id="loginCloseBtn">✕</button>
-        <div class="login-logo" id="loginLogo"></div>
-        <h2 class="login-title" data-i18n="login.title">欢迎使用 Mr. Day One</h2>
-        <!-- Step 1: email -->
-        <div class="login-step" id="loginStep1">
-          <p class="login-sub" data-i18n="login.subtitle">输入邮箱即可登录，新用户自动创建账号</p>
-          <div class="login-field">
-            <input id="loginEmail" type="email" placeholder="your@email.com" class="login-input" />
-          </div>
-          <button class="login-btn" type="button" id="loginNextBtn" data-i18n="login.next">继续</button>
-          <p class="login-agree"><input type="checkbox" checked /><span data-i18n="login.agreePrefix">我已阅读并同意</span><a href="#" data-i18n="login.terms">服务条款</a><span data-i18n="login.and">和</span><a href="#" data-i18n="login.privacy">隐私政策</a></p>
-        </div>
-        <!-- Step 2: password or code -->
-        <div class="login-step" id="loginStep2" hidden>
-          <p class="login-sub" id="loginStep2Hint"></p>
-          <div class="login-field">
-            <input id="loginPassword" type="password" data-i18n-placeholder="login.passwordPlaceholder" placeholder="输入密码" class="login-input" />
-          </div>
-          <div class="login-field login-otp-field" id="loginCodeField" hidden>
-            <p class="login-otp-hint" data-i18n="login.codeHint">输入发送到邮箱的 6 位验证码</p>
-            <div class="login-otp" id="loginOtp" role="group" aria-label="6 位验证码">
-              <input class="login-otp__box" inputmode="numeric" maxlength="1" autocomplete="one-time-code" aria-label="第 1 位" />
-              <input class="login-otp__box" inputmode="numeric" maxlength="1" aria-label="第 2 位" />
-              <input class="login-otp__box" inputmode="numeric" maxlength="1" aria-label="第 3 位" />
-              <input class="login-otp__box" inputmode="numeric" maxlength="1" aria-label="第 4 位" />
-              <input class="login-otp__box" inputmode="numeric" maxlength="1" aria-label="第 5 位" />
-              <input class="login-otp__box" inputmode="numeric" maxlength="1" aria-label="第 6 位" />
-            </div>
-            <input id="loginCode" type="hidden" />
-            <button class="login-link login-resend" type="button" id="loginResendBtn" data-i18n="login.resend">重新发送验证码</button>
-          </div>
-          <button class="login-btn" type="button" id="loginSubmitBtn" data-i18n="login.submit">登录</button>
-          <div class="login-alt">
-            <button class="login-link" type="button" id="loginUseCodeBtn" data-i18n="login.useCode">使用验证码登录</button>
-            <button class="login-link" type="button" id="loginBackBtn" data-i18n="login.back">返回</button>
-          </div>
-        </div>
-      </div>
-    </dialog>
-
-    <!-- Settings dialog -->
-    <dialog class="sheet" id="settings">
-      <form method="dialog" class="sheet__body" id="settingsForm">
-        <div class="sheet__icon"><svg viewBox="0 0 24 24"><use href="#i-sparkle" /></svg></div>
-        <h2 data-i18n="settings.title">AI 模型</h2>
-        <p class="sheet__sub" data-i18n="settings.sub">模型请求固定走 Michael 网关，统一账号额度、计费、模型目录和线路容灾；用户无需配置任何第三方供应商。</p>
-        <div class="ai-provider-form ai-provider-form--locked">
-          <div class="ai-provider-option ai-provider-option--locked">
-            <span><strong data-i18n="settings.gatewayTitle">Michael 网关</strong><small data-i18n="settings.gatewayEnabled">已启用：所有 AI 模型请求都会通过你的网关转发。</small></span>
-          </div>
-        </div>
-        <div class="settings-figma">
-          <label class="settings-figma__label" for="figmaTokenInput">Figma 访问令牌 <small>（可选，用于把 Figma 设计转成代码/配色）</small></label>
-          <div class="settings-figma__row">
-            <input id="figmaTokenInput" class="settings-figma__input" type="password" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="figd_…" />
-            <button type="button" id="figmaTokenTest" class="btn settings-figma__test">测试</button>
-          </div>
-          <div class="settings-figma__hint" id="figmaTokenHint">figma.com → Settings → Security → Personal access tokens（勾 File content 读权限）。只存在本机，供 <code>figma</code> 工具读取你的设计文件。</div>
-        </div>
-        <div class="sheet__actions">
-          <button class="btn" value="cancel" formnovalidate data-i18n="dialog.cancel">取消</button>
-          <button class="btn btn--primary" id="settingsSaveBtn" value="default" data-i18n="settings.gotIt">知道了</button>
-        </div>
-      </form>
-    </dialog>
-
-    <!-- Devin API key dialog -->
-    <dialog class="sheet" id="devinKeyDialog">
-      <form method="dialog" class="sheet__body" id="devinKeyForm">
-        <div class="sheet__icon"><svg viewBox="0 0 24 24"><use href="#i-sparkle" /></svg></div>
-        <h2 data-i18n="devin.title">连接 Devin</h2>
-        <p class="sheet__sub"><span data-i18n="devin.subPrefix">输入你的 Devin API Key（以</span> <code>apk_</code> <span data-i18n="devin.subSuffix">开头），助手将直接对接真实的 Devin 会话。密钥只保存在本地。</span></p>
-        <input id="devinKeyInput" type="password" class="login-input" placeholder="apk_..." autocomplete="off" spellcheck="false" />
-        <div class="sheet__actions">
-          <button class="btn" value="cancel" formnovalidate data-i18n="dialog.cancel">取消</button>
-          <button class="btn btn--primary" value="save" data-i18n="settings.save">保存</button>
-        </div>
-      </form>
-    </dialog>
-
-    <!-- File-operation dialog (prompt / confirm) -->
-    <dialog class="sheet sheet--io" id="ioDialog">
-      <form method="dialog" class="sheet__body" id="ioForm">
-        <h2 id="ioTitle">Rename</h2>
-        <p class="sheet__sub" id="ioMessage" hidden></p>
-        <label id="ioInputWrap">
-          <input id="ioInput" type="text" spellcheck="false" autocomplete="off" />
-        </label>
-        <div class="sheet__actions">
-          <button class="btn" type="button" id="ioCancel" data-i18n="dialog.cancel">Cancel</button>
-          <button class="btn btn--primary" id="ioOk" value="ok" data-i18n="dialog.ok">OK</button>
-        </div>
-      </form>
-    </dialog>
-
-    <div class="toast" id="toast"></div>
-
-    <svg width="0" height="0" style="position:absolute" aria-hidden="true">
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
       <defs>
         <linearGradient id="g-logo" x1="0" y1="0" x2="1" y2="1">
           <stop offset="0" stop-color="#0a84ff" />
@@ -602,6 +78,14 @@
       <symbol id="i-brand-openai" viewBox="0 0 24 24">
         <path fill="currentColor" d="M22.2819 9.8211a5.9847 5.9847 0 0 0-.5157-4.9108 6.0462 6.0462 0 0 0-6.5098-2.9A6.0651 6.0651 0 0 0 4.9807 4.1818a5.9847 5.9847 0 0 0-3.9977 2.9 6.0462 6.0462 0 0 0 .7427 7.0966 5.98 5.98 0 0 0 .511 4.9107 6.051 6.051 0 0 0 6.5146 2.9001A5.9847 5.9847 0 0 0 13.2599 24a6.0557 6.0557 0 0 0 5.7718-4.2058 5.9894 5.9894 0 0 0 3.9977-2.9001 6.0557 6.0557 0 0 0-.7715-7.0729zm-9.022 12.6081a4.4755 4.4755 0 0 1-2.8764-1.0408l.1419-.0804 4.7783-2.7582a.7948.7948 0 0 0 .3927-.6813v-6.7369l2.02 1.1686a.071.071 0 0 1 .038.052v5.5826a4.504 4.504 0 0 1-4.4945 4.4944zm-9.6607-4.1254a4.4708 4.4708 0 0 1-.5346-3.0137l.142.0852 4.783 2.7582a.7712.7712 0 0 0 .7806 0l5.8428-3.3685v2.3324a.0804.0804 0 0 1-.0332.0615L9.74 19.9502a4.4992 4.4992 0 0 1-6.1408-1.6464zM2.3408 7.8956a4.485 4.485 0 0 1 2.3655-1.9728V11.6a.7664.7664 0 0 0 .3879.6765l5.8144 3.3543-2.0201 1.1685a.0757.0757 0 0 1-.071 0l-4.8303-2.7865A4.504 4.504 0 0 1 2.3408 7.872zm16.5963 3.8558L13.1038 8.364 15.1192 7.2a.0757.0757 0 0 1 .071 0l4.8303 2.7913a4.4944 4.4944 0 0 1-.6765 8.1042v-5.6772a.79.79 0 0 0-.407-.667zm2.0107-3.0231l-.142-.0852-4.7735-2.7818a.7759.7759 0 0 0-.7854 0L9.409 9.2297V6.8974a.0662.0662 0 0 1 .0284-.0615l4.8303-2.7866a4.4992 4.4992 0 0 1 6.6802 4.66zm-12.6438 4.135l-2.02-1.1638a.0804.0804 0 0 1-.038-.0567V6.0742a4.4992 4.4992 0 0 1 7.3757-3.4537l-.142.0805L8.704 5.459a.7948.7948 0 0 0-.3927.6813zm1.0976-2.3654l2.602-1.4998 2.6069 1.4998v2.9994l-2.5974 1.4997-2.6067-1.4997Z" />
       </symbol>
+      <!-- Real marks, not a generic branch glyph: a user scanning the @ menu recognises the
+           Octocat and the fox long before they read the label beside it. -->
+      <symbol id="i-brand-github" viewBox="0 0 24 24">
+        <path fill="currentColor" d="M12 .5C5.73.5.5 5.73.5 12c0 5.08 3.29 9.39 7.86 10.91.58.11.79-.25.79-.56 0-.28-.01-1.02-.02-2-3.2.7-3.88-1.54-3.88-1.54-.52-1.33-1.28-1.69-1.28-1.69-1.05-.71.08-.7.08-.7 1.16.08 1.77 1.19 1.77 1.19 1.03 1.76 2.7 1.25 3.36.96.1-.75.4-1.25.73-1.54-2.55-.29-5.24-1.28-5.24-5.69 0-1.26.45-2.29 1.19-3.09-.12-.29-.52-1.46.11-3.05 0 0 .97-.31 3.18 1.18a11.1 11.1 0 0 1 5.79 0c2.2-1.49 3.17-1.18 3.17-1.18.63 1.59.23 2.76.12 3.05.74.8 1.18 1.83 1.18 3.09 0 4.42-2.69 5.39-5.25 5.68.41.36.78 1.07.78 2.15 0 1.55-.01 2.8-.01 3.18 0 .31.21.68.8.56A11.51 11.51 0 0 0 23.5 12C23.5 5.73 18.27.5 12 .5Z"/>
+      </symbol>
+      <symbol id="i-brand-gitlab" viewBox="0 0 24 24">
+        <path fill="currentColor" d="m23.55 9.8-.03-.08-3.26-8.51a.85.85 0 0 0-.34-.4.87.87 0 0 0-1 .05.87.87 0 0 0-.29.44l-2.2 6.73H7.58l-2.2-6.73a.86.86 0 0 0-.29-.44.87.87 0 0 0-1-.06.86.86 0 0 0-.34.4L.48 9.71l-.03.09a6.06 6.06 0 0 0 2.01 7l.01.01.03.02 4.97 3.72 2.46 1.86 1.5 1.13a1.01 1.01 0 0 0 1.22 0l1.5-1.13 2.46-1.86 5-3.74.02-.02a6.06 6.06 0 0 0 2-6.99Z"/>
+      </symbol>
       <symbol id="i-brand-anthropic" viewBox="0 0 24 24">
         <path fill="currentColor" d="M17.3041 3.541h-3.6718l6.696 16.918H24Zm-10.6082 0L0 20.459h3.7442l1.3693-3.5527h7.0052l1.3693 3.5528h3.7442L10.5363 3.541Zm-.3712 10.2426 2.2914-5.9456 2.2914 5.9456Z" />
       </symbol>
@@ -637,9 +121,29 @@
       <symbol id="i-check" viewBox="0 0 24 24">
         <path fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" d="m5 12.5 4.5 4.5L19 7" />
       </symbol>
+      <!-- The model mark.
+           A sparkle was the wrong idea, not the wrong size: it means "AI magic" and says nothing
+           about a model. Redrawing it bigger twice was fixing the wrong axis.
+
+           What a model IS, drawn: inputs converging through a core to an output — a network with
+           a centre of mass. That is why the hub is r2.9 while the peripheral nodes are r1.9; the
+           weight sits where the computation does, and at 16px the eye reads that hierarchy before
+           it resolves any individual node. Edges are 1.5 stroke with round caps so they stay
+           visible when the glyph is scaled down and antialiased.
+
+           The spark at the top right is the one borrowed idea, and it earns its place: a bare
+           graph reads as "network" or "share". The spark is what makes it generative. It sits off
+           the axis of symmetry so it reads as an accent rather than a fifth node.
+
+           Three nodes, not five: at menu size every extra circle is mud. -->
       <symbol id="i-sparkle" viewBox="0 0 24 24">
-        <path fill="currentColor" d="M12 2.2c.34 2.86 1.94 4.46 4.8 4.8-2.86.34-4.46 1.94-4.8 4.8-.34-2.86-1.94-4.46-4.8-4.8 2.86-.34 4.46-1.94 4.8-4.8" />
-        <path fill="currentColor" d="M18.5 13c.2 1.66 1.14 2.6 2.8 2.8-1.66.2-2.6 1.14-2.8 2.8-.2-1.66-1.14-2.6-2.8-2.8 1.66-.2 2.6-1.14 2.8-2.8" opacity=".7" />
+        <path fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"
+              d="M6.4 7.6 11 11.4M6.4 16.4 11 12.6M13.4 12h4"/>
+        <circle cx="4.6" cy="6.6" r="1.9" fill="currentColor"/>
+        <circle cx="4.6" cy="17.4" r="1.9" fill="currentColor"/>
+        <circle cx="19.4" cy="12" r="1.9" fill="currentColor"/>
+        <circle cx="12" cy="12" r="2.9" fill="currentColor"/>
+        <path fill="currentColor" d="M17.9 3.1c.28 1.46.86 2.04 2.32 2.32-1.46.28-2.04.86-2.32 2.32-.28-1.46-.86-2.04-2.32-2.32 1.46-.28 2.04-.86 2.32-2.32Z"/>
       </symbol>
       <symbol id="i-close" viewBox="0 0 24 24">
         <path fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" d="M6 6l12 12M18 6 6 18" />
@@ -834,6 +338,16 @@
         <rect x="3" y="3" width="18" height="18" rx="2" fill="none" stroke="currentColor" stroke-width="1.7"/>
         <line x1="12" y1="3" x2="12" y2="21" stroke="currentColor" stroke-width="1.7"/>
       </symbol>
+      <!-- Appearance (advanced-settings rail). Its own symbol rather than borrowing
+           i-theme-light: that one is the light-THEME preview card, and its hardcoded
+           #f2c94c/#ffd166 fills made this the only rail icon that ignored the tab's
+           dim → text → blue colour states. Pure currentColor, 1.7 stroke to match the
+           rest of the family. The filled semicircle sits 1.15 inside the ring so the
+           mass and the stroke stay legibly separate at the 21px it actually renders at. -->
+      <symbol id="i-appearance" viewBox="0 0 24 24">
+        <circle cx="12" cy="12" r="8.6" fill="none" stroke="currentColor" stroke-width="1.7"/>
+        <path d="M12 5.4a6.6 6.6 0 0 1 0 13.2z" fill="currentColor"/>
+      </symbol>
       <symbol id="i-theme-light" viewBox="0 0 24 24">
         <rect x="3" y="4" width="18" height="16" rx="4" fill="#fffaf0" stroke="#f2c94c" stroke-width="1.2"/>
         <path d="M6.8 8.2h5.8M6.8 11.6h9.8M6.8 15h6.4" stroke="#8a6d1d" stroke-width="1.35" stroke-linecap="round"/>
@@ -860,5 +374,6 @@
         </g>
       </symbol>
     </svg>
+
   </body>
 </html>

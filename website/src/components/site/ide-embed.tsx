@@ -124,6 +124,70 @@ export function IdeEmbed({
     };
   }, [active]);
 
+  /*
+   * 遮罩什么时候撤掉。
+   *
+   * 以前只挂 `onLoad`，两个问题：
+   *
+   * 1. `load` 要等 iframe 里**所有**子资源下载完。里面是完整的 IDE —— Monaco、xterm、
+   *    几十个分块、好几兆。编辑器早就能敲了，`load` 还没来；而只要其中任何一个分块慢
+   *    或者卡住，遮罩就永远停在"starting the editor…"，看上去就是加载不出来。
+   * 2. React 在 commit 阶段才把 `onLoad` 挂上去。走缓存时 `load` 可能在那之前就已经
+   *    触发过一次 —— 事件错过了就不会再来，遮罩同样永远不消失。
+   *
+   * 所以改成盯真正要等的那件事：编辑器有没有出现。同源，读得到 iframe 的 document，
+   * `.monaco-editor` 一出现就撤遮罩 —— 这比 `load` 早得多，也正是遮罩那句话的字面意思。
+   * 同时补挂一次 load 监听并立刻查一遍 readyState，把上面第 2 条的竞态补掉。
+   *
+   * 最后还有一条兜底：到点无论如何都撤。宁可让人看见一个半成品编辑器，也不要一块永远
+   * 转不完的灰底 —— 前者还能往下读，后者只会让人以为网站坏了。
+   */
+  useEffect(() => {
+    if (!active || !prepared) return;
+    const el = frame.current;
+    if (!el) return;
+
+    let done = false;
+    const lift = () => {
+      if (done) return;
+      done = true;
+      setBooted(true);
+    };
+
+    const editorIsUp = () => {
+      try {
+        return !!el.contentDocument?.querySelector(".monaco-editor");
+      } catch {
+        // 跨源就读不到（现在不会，但别让它抛出来把轮询打断）。
+        return false;
+      }
+    };
+
+    const poll = window.setInterval(() => {
+      if (editorIsUp()) {
+        window.clearInterval(poll);
+        lift();
+      }
+    }, 120);
+
+    // 事件可能已经错过了，所以监听之外还要立刻自查一次。
+    el.addEventListener("load", lift);
+    try {
+      if (el.contentDocument?.readyState === "complete") lift();
+    } catch {
+      /* 读不到就等事件 */
+    }
+
+    // 兜底。给得比正常启动宽裕得多，只在真的出问题时才会用上。
+    const giveUp = window.setTimeout(lift, 8000);
+
+    return () => {
+      window.clearInterval(poll);
+      window.clearTimeout(giveUp);
+      el.removeEventListener("load", lift);
+    };
+  }, [active, prepared, demo]);
+
   function launch() {
     // The preparation itself now happens in the effect above, which covers this path and
     // the automatic one alike. This only asks to be shown.
