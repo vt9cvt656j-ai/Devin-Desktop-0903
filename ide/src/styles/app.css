@@ -14728,9 +14728,6 @@ body.tree-selecting, body.tree-selecting * { user-select: none !important; -webk
 .model-info-card .mic-price__v {
   font-size: 13px; font-weight: 640; color: var(--text); font-variant-numeric: tabular-nums;
 }
-.model-info-card .mic-price__unit {
-  margin-top: 5px; text-align: center; font-size: 10px; color: var(--text-dim); opacity: .85;
-}
 /* 思考深度整块往上收。标题现在和读数同一行（由滑块自己渲染），不再单独占一行，
    原来那截空白就是这么来的。 */
 .model-info-card .mic-think { margin-top: 8px; }
