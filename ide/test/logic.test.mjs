@@ -3127,15 +3127,30 @@ test("adaptive profile is persisted and injected into model context", () => {
     "Every model send path should receive the Adaptive profile block");
 });
 
-test("growth profile summary uses a left center right three-column layout", () => {
-  assert.match(GROWTH_SRC, /\.growth-profile__cells\{display:grid;grid-template-columns:repeat\(3,minmax\(0,1fr\)\);/,
-    "growth summary metrics should be split into three equal columns instead of bunching on the left");
-  assert.match(GROWTH_SRC, /\.growth-profile__c\{[^}]*display:flex;[\s\S]*flex-direction:column;[\s\S]*align-items:center;[\s\S]*justify-content:center;[\s\S]*text-align:center/,
-    "each growth metric card should center its number and label inside the box");
-  assert.doesNotMatch(GROWTH_SRC, /\.growth-profile__c:nth-child\(3\)\{text-align:right\}/,
-    "the right metric card should not right-align its internal content");
+test("growth profile summary uses a three-column layout", () => {
+  // 这一页的样式原来是 growth.js 运行时注入到 <head> 的一段 <style>——活在 app.css
+  // 之外，改设计语言时没人会想到还有这么一份，它因此一直保留着自己的圆角、开关尺寸
+  // 和状态色。现在整段搬进了 app.css，所以断言也跟到那边。
+  assert.match(GROWTH_SRC, /function injectStyles\(\) \{\}/,
+    "又往 <head> 注入样式了——那份 CSS 会再次游离在设计语言之外");
+  assert.match(APP_CSS, /\.growth-profile__cells\s*\{[^}]*grid-template-columns:\s*repeat\(3,\s*minmax\(0,\s*1fr\)\)/,
+    "概览三格没有平分三列");
+  assert.match(APP_CSS, /\.growth-profile__c\s*\{[^}]*text-align:\s*center/,
+    "每一格的数字和标签没有居中");
+  // 能力档位那些行必须真的装进卡里——CSS 写了 .growth-skills-card 而 DOM 里没有这个
+  // 容器的话，"一组拼成一张卡"就是一段谁也管不着的空规则。
+  assert.match(GROWTH_SRC, /skillsCard\.appendChild\(row\)/,
+    "能力档位的行没有挂进卡片容器，那段 CSS 管不到任何元素");
+  assert.match(APP_CSS, /\.growth-skill \+ \.growth-skill\s*\{[^}]*border-top/,
+    "行间没有发丝线，多行会糊成一坨");
+  // 三个指标本身必须还在。
   assert.match(GROWTH_SRC, /<div class="growth-profile__cells">[\s\S]{0,220}实战项目[\s\S]{0,220}可迁移能力[\s\S]{0,220}累计轮次/,
     "growth profile should still render the three expected summary metrics");
+  // 那条指责用户"把思考外包给 AI"的警告已按所有者要求删除。
+  // 断言的是**那个分支**，不是那几个字——解释为什么删掉的注释里也会写到它们，
+  // 按字面去找会被自己的注释喂饱（这个仓库已经翻过好几次这个车）。
+  assert.doesNotMatch(GROWTH_SRC, /warn:\s*true/,
+    "那条指责用户偷懒的警告分支不该回来");
 });
 
 test("shortcut reset clears persisted overrides and gives visible feedback", () => {

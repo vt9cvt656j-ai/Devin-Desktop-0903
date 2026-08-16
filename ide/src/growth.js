@@ -352,69 +352,14 @@ function levelLabel(p) { return p >= 0.7 ? "熟练" : p >= 0.4 ? "进阶" : "新
 
 // --- public: the Open Learner Model panel -------------------------------------
 
-function injectStyles() {
-  if (document.getElementById("growth-styles")) return;
-  const css = `
-  .growth-wrap{padding:4px 2px 24px}
-  .growth-banner{display:flex;gap:10px;align-items:flex-start;margin:6px 0 18px;padding:12px 14px;border-radius:10px;
-    background:color-mix(in srgb, var(--accent,#3b82f6) 12%, transparent);border:1px solid color-mix(in srgb,var(--accent,#3b82f6) 30%,transparent);font-size:12.5px;line-height:1.5}
-  .growth-banner.warn{background:color-mix(in srgb,#e0a000 14%,transparent);border-color:color-mix(in srgb,#e0a000 38%,transparent)}
-  .growth-banner svg{flex:0 0 auto;margin-top:1px;opacity:.85}
-  .growth-section-t{font-size:11px;text-transform:uppercase;letter-spacing:.06em;color:var(--text-dim,#888);margin:20px 2px 10px}
-  .growth-skill{display:grid;grid-template-columns:130px 1fr auto;gap:12px;align-items:center;margin:10px 2px}
-  .growth-skill__name{font-size:13px;font-weight:600}
-  .growth-skill__name small{display:block;font-weight:400;font-size:11px;color:var(--text-dim,#888);margin-top:1px}
-  .growth-bar{position:relative;height:8px;border-radius:5px;background:var(--hover,rgba(128,128,128,.18));overflow:hidden}
-  .growth-bar__fill{position:absolute;inset:0 auto 0 0;border-radius:5px;background:linear-gradient(90deg,var(--accent,#3b82f6),color-mix(in srgb,var(--accent,#3b82f6) 60%,#22c55e));transition:width .5s cubic-bezier(.2,.7,.3,1)}
-  .growth-skill__right{display:flex;align-items:center;gap:6px}
-  .growth-skill__pct{font-variant-numeric:tabular-nums;font-size:12px;color:var(--text-dim,#888);min-width:62px;text-align:right}
-  .growth-xfer{font-size:10.5px;padding:2px 7px;border-radius:10px;background:var(--hover,rgba(128,128,128,.16));color:var(--text-dim,#999);white-space:nowrap}
-  .growth-xfer.is-xfer{background:color-mix(in srgb,#22c55e 22%,transparent);color:#3fb950;font-weight:600}
-  .growth-profile{margin:6px 2px 4px;padding:14px;border-radius:14px;background:var(--panel-2,var(--hover,rgba(128,128,128,.1)));border:1px solid var(--atc-border,rgba(128,128,128,.2))}
-  .growth-profile__cells{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px;align-items:stretch}
-  .growth-profile__c{min-width:0;min-height:58px;padding:10px 12px;border-radius:12px;background:color-mix(in srgb,var(--hover,rgba(128,128,128,.1)) 62%,transparent);display:flex;flex-direction:column;align-items:center;justify-content:center;text-align:center}
-  .growth-profile__c b{font-size:22px;font-variant-numeric:tabular-nums;display:block;line-height:1.08}
-  .growth-profile__c span{font-size:11px;color:var(--text-dim,#888)}
-  .growth-profile__line{margin:11px 0 0;font-size:12.5px;color:var(--text-dim,#999);line-height:1.5}
-  .growth-nudge{width:22px;height:22px;border-radius:6px;border:1px solid var(--atc-border,rgba(128,128,128,.25));background:transparent;color:var(--text,#ddd);cursor:pointer;font-size:13px;line-height:1;display:grid;place-items:center}
-  .growth-nudge:hover{background:var(--hover,rgba(128,128,128,.15))}
-  .growth-ctl{display:flex;flex-wrap:wrap;gap:10px;align-items:center;margin:8px 2px}
-  .growth-ctl label{font-size:12.5px;color:var(--text,#ddd)}
-  .growth-ctl select{background:var(--panel-2,var(--panel,#222));color:var(--text,#ddd);border:1px solid var(--atc-border,rgba(128,128,128,.25));border-radius:7px;padding:4px 8px;font-size:12.5px}
-  .growth-switch{display:inline-flex;align-items:center;gap:8px;cursor:pointer;user-select:none}
-  .growth-switch input{appearance:none;width:34px;height:20px;border-radius:11px;background:var(--hover,rgba(128,128,128,.3));position:relative;cursor:pointer;transition:background .2s}
-  .growth-switch input:checked{background:var(--accent,#3b82f6)}
-  .growth-switch input::after{content:"";position:absolute;top:2px;left:2px;width:16px;height:16px;border-radius:50%;background:#fff;transition:transform .2s}
-  .growth-switch input:checked::after{transform:translateX(14px)}
-  .growth-stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(96px,1fr));gap:8px;margin:10px 2px}
-  .growth-stat{background:var(--hover,rgba(128,128,128,.1));border-radius:9px;padding:9px 11px}
-  .growth-stat b{display:block;font-size:18px;font-variant-numeric:tabular-nums}
-  .growth-stat span{font-size:11px;color:var(--text-dim,#888)}
-  .growth-reset{margin-top:14px;background:transparent;border:1px solid var(--atc-border,rgba(128,128,128,.25));color:var(--text-dim,#999);border-radius:7px;padding:6px 12px;font-size:12px;cursor:pointer}
-  .growth-reset:hover{color:#e5484d;border-color:#e5484d}
-  .growth-project{margin:6px 2px}
-  .growth-project__intro{font-size:12.5px;color:var(--text-dim,#999);line-height:1.55;margin:0 0 8px}
-  .growth-project__list{margin:0;padding-left:18px;display:flex;flex-direction:column;gap:5px}
-  .growth-project__list li{font-size:12.5px;line-height:1.45}
-  .growth-project__more{font-size:11.5px;color:var(--text-dim,#888);margin-top:6px}
-  .growth-project__btn{margin-top:10px;background:transparent;border:1px solid var(--atc-border,rgba(128,128,128,.25));color:var(--text,#ddd);border-radius:7px;padding:5px 11px;font-size:12px;cursor:pointer}
-  .growth-project__btn:hover{background:var(--hover,rgba(128,128,128,.15))}
-  .growth-gate{position:absolute;inset:0;display:grid;place-items:center;padding:14px;border-radius:8px;background:color-mix(in srgb,var(--panel,#1c1c1c) 72%,transparent);backdrop-filter:blur(7px);-webkit-backdrop-filter:blur(7px);z-index:3;text-align:center}
-  .growth-gate__inner{max-width:340px}
-  .growth-gate__t{font-size:15px;font-weight:700;margin-bottom:4px}
-  .growth-gate__s{font-size:12px;color:var(--text-dim,#999);line-height:1.5;margin-bottom:12px}
-  .growth-gate__reveal{background:var(--accent,#3b82f6);color:#fff;border:0;border-radius:8px;padding:7px 18px;font-size:13px;font-weight:600;cursor:pointer}
-  .growth-gate__reveal:hover{filter:brightness(1.08)}
-  .growth-gate__check{display:flex;gap:8px;align-items:center;flex-wrap:wrap;padding:8px 10px;font-size:12.5px;border-top:1px dashed var(--atc-border,rgba(128,128,128,.25))}
-  .growth-gate__check button{background:var(--hover,rgba(128,128,128,.15));border:1px solid var(--atc-border,rgba(128,128,128,.25));border-radius:7px;padding:4px 10px;cursor:pointer;color:var(--text,#ddd);font-size:12.5px}
-  .growth-gate__check button:hover{background:var(--accent,#3b82f6);color:#fff}
-  .growth-gate__done{color:var(--text-dim,#999)}
-  `;
-  const el = document.createElement("style");
-  el.id = "growth-styles";
-  el.textContent = css;
-  document.head.appendChild(el);
-}
+/*
+ * 样式已经搬进 src/styles/app.css（搜 "growth panel"）。
+ *
+ * 原来是运行时往 <head> 注入一段 <style>，那是这一页所有排版偏差的同一个根因：它活在
+ * app.css 之外，改设计语言时没人会想到还有这么一份；而且它写死了自己的一套圆角、开关
+ * 尺寸、状态色，和面板里其它页各说各话。
+ */
+function injectStyles() {}
 
 function trendVerdict() {
   const t = state.trend;
@@ -424,8 +369,9 @@ function trendVerdict() {
   const dMsgs = cur.msgs - prev.msgs;
   const dAvg = cur.avg - prev.avg;
   if (dMsgs < 6) return null;
-  if (dAvg <= 0.005 && state.stats.aiEdits >= 4)
-    return { warn: true, text: "你用得越来越多，但能力掌握度没怎么涨——当心把思考外包给 AI（“元认知惰性”）。试试多展开 diff 看看、或打开下面的「挑战模式」让自己先上手。" };
+  // 「元认知惰性」那条警告已按所有者要求删除：它是在用户没做错任何事的时候跳出来
+  // 指责他偷懒，而判据只是"用得多但分数没涨"——一个人用得多完全可能是因为项目变难了。
+  // 剩下的只有正向那一条。
   if (dAvg >= 0.02)
     return { warn: false, text: `保持住——最近你的整体掌握度在上升（+${Math.round(dAvg * 100)} 点）。越勇越厉害。` };
   return null;
@@ -484,6 +430,12 @@ export function renderPanel(body, ctx = {}) {
     st.textContent = "能力档位（点 ± 可纠正我的判断；标签 = 跨项目迁移度）";
     wrap.appendChild(st);
 
+    // 一组能力档位拼成一张卡（行间发丝线），和设置页"一组一张卡"是同一个形态。
+    // 原来这些行是直接裸挂在 wrap 上的，各自带 margin，看着是一堆浮在底色上的条。
+    const skillsCard = document.createElement("div");
+    skillsCard.className = "growth-skills-card";
+    wrap.appendChild(skillsCard);
+
     for (const sk of SKILLS) {
       const m = state.skills[sk.id];
       const pct = Math.round(m.p * 100);
@@ -510,7 +462,7 @@ export function renderPanel(body, ctx = {}) {
           rerender();
         });
       });
-      wrap.appendChild(row);
+      skillsCard.appendChild(row);
     }
 
     // project understanding — the "越来越懂你的项目" half of the model. Reuses the
