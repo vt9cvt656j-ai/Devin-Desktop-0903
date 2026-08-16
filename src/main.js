@@ -12930,17 +12930,27 @@ function _bindMicSlider(root, onPick) {
     if (val && res?.valueLabel) val.textContent = res.valueLabel;
     if (res?.valueLabel) input.setAttribute("aria-valuetext", res.valueLabel);
   };
-  const onMove = (ev) => {
-    ev.stopPropagation();
+  /*
+   * 拖动过程中**只更新画面，不落盘**。
+   *
+   * 之前 input 和 change 绑的是同一个处理器，而 input 在拖动时每移动一点就触发一次——
+   * 一次拖动几十上百次，每次都往 localStorage 写一遍。这个仓库的性能记录里，
+   * localStorage.setItem 正是最常见的多秒卡顿源（见 logic.test.mjs 那条「空闲期卡死」，
+   * 实测 120 次 2–60s 的卡顿里它出现得最多）。表现就是松手之后整个界面顿住好几秒。
+   *
+   * 现在 input 只走视觉（改宽度、改读数、必要时把滑块弹回可选档），change 才写。
+   * change 在松手/键盘改完时各触发一次，一次拖动只落一次盘。
+   */
+  const resolve = (commit) => {
     const want = Number(input.value) || 0;
-    const res = onPick(want) || {};
+    const res = onPick(want, commit) || {};
     // 买不到的档位：弹回最高可选档，并说清为什么。静默钉住会让人以为滑块坏了。
     const at = Number.isInteger(res.index) ? res.index : want;
     if (at !== want) input.value = String(at);
     apply(at, res);
   };
-  input.addEventListener("input", onMove);
-  input.addEventListener("change", onMove);
+  input.addEventListener("input", (ev) => { ev.stopPropagation(); resolve(false); });
+  input.addEventListener("change", (ev) => { ev.stopPropagation(); resolve(true); });
   input.addEventListener("click", (ev) => ev.stopPropagation());
 }
 
@@ -14917,7 +14927,7 @@ function showModelInfoCard(m, anchorEl) {
     const ctxSl = card.querySelector('.mic-ctx .mic-sl[data-sl="ctx"]');
     if (ctxSl) {
       const ctxOpts = _modelContextChoices(m.id);
-      _bindMicSlider(ctxSl, (want) => {
+      _bindMicSlider(ctxSl, (want, commit) => {
         let at = want;
         if (ctxOpts[at]?.locked) {
           let open = -1;
@@ -14926,16 +14936,18 @@ function showModelInfoCard(m, anchorEl) {
           showToast(ctxOpts[want]?.lockHint || "该档位需更高会员");
         }
         const o = ctxOpts[at];
-        if (o) _setCtxChoice(m.id, o.value, o.kind === "native" ? "native" : "modified");
+        // commit=false 是拖动途中，只回读数不落盘——每像素写一次 localStorage 会把
+        // 界面顿住好几秒。
+        if (o && commit) _setCtxChoice(m.id, o.value, o.kind === "native" ? "native" : "modified");
         return { index: at, valueLabel: o?.valueLabel || "" };
       });
     }
     // 思考深度滑块。
     const thinkSl = thinkEl.querySelector('.mic-sl[data-sl="think"]');
     if (thinkSl) {
-      _bindMicSlider(thinkSl, (want) => {
+      _bindMicSlider(thinkSl, (want, commit) => {
         const o = think[Math.max(0, Math.min(think.length - 1, want))];
-        if (o) _setThinkingPref(m.id, o.lvl);
+        if (o && commit) _setThinkingPref(m.id, o.lvl);
         return { index: want, valueLabel: o?.valueLabel || "" };
       });
     }

@@ -1391,3 +1391,27 @@ test("毛玻璃的祖先链不许出现切断 backdrop 的属性", () => {
     assert.match(ruleBody(sel), /animation:\s*feature-fade/, `${sel} 少了淡入，整屏淡入会缺一块`);
   }
 });
+
+test("拖滑块时不许每一帧都落盘", () => {
+  // 这个仓库的性能记录里，localStorage.setItem 是最常见的多秒卡顿源（见 logic.test.mjs
+  // 那条「空闲期卡死」：实测 120 次 2–60s 的卡顿里它出现得最多）。而 input 事件在拖动时
+  // 每移动一点就触发一次，一次拖动几十上百次——每次都写一遍盘，松手后界面顿好几秒。
+  const bind = SRC.slice(SRC.indexOf("function _bindMicSlider"));
+  const body = bind.slice(0, bind.indexOf("\n}\n") + 3);
+  assert.match(body, /addEventListener\("input",[\s\S]{0,80}resolve\(false\)/,
+    "input 还在提交——拖动时每一帧都会落盘");
+  assert.match(body, /addEventListener\("change",[\s\S]{0,80}resolve\(true\)/,
+    "change 不提交的话，拖完根本存不下来");
+
+  // 两个调用方都必须认这个 commit 参数：只要有一个不认，那一条滑块照旧每帧写盘。
+  // 窗口必须**切在两条滑块之间**：从上下文那段一路读到思考深度那段的话，上下文的
+  // `&& commit` 被删掉了也照样能在隔壁读到——自己喂饱自己。
+  const ctxAt = SRC.indexOf("const ctxSl =");
+  const thinkAt = SRC.indexOf("const thinkSl =");
+  const endAt = SRC.indexOf("// Position:", thinkAt);
+  assert.ok(ctxAt !== -1 && thinkAt > ctxAt && endAt > thinkAt, "两条滑块的绑定段没了或顺序变了");
+  for (const [seg, who] of [[SRC.slice(ctxAt, thinkAt), "上下文"], [SRC.slice(thinkAt, endAt), "思考深度"]]) {
+    assert.match(seg, /\(want, commit\) =>/, `${who}滑块没接 commit 参数`);
+    assert.match(seg, /&& commit\)/, `${who}滑块拖动途中仍在落盘`);
+  }
+});
