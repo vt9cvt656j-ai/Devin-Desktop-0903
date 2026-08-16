@@ -22433,6 +22433,27 @@ test("Rust tauri::command 全部在 lib.rs invoke_handler 注册", () => {
   assert.deepEqual(missing, [], `Tauri command 未注册:\n${missing.join("\n")}`);
 });
 
+test("sync-tools-json --check 对着**真的** main.js 能跑通，而且是同步的", () => {
+  // 下面那条用例喂的是合成的 fixture main.js（一行、一个工具），所以它验的是比对逻辑，
+  // 不是"这个脚本还能不能用"。真实那条路一次都没有人走过——于是它坏了很久没人知道：
+  // _buildAgentToolSchemas 后来开始调 _userCapabilities / _withoutDisabledTools，而脚本
+  // 里那份手工维护的依赖注入清单没跟上，真跑起来是 ReferenceError 当场崩。
+  //
+  // 后果不是"少同步一个工具"，是**目录再也同步不了**：新加的工具进不了网关那份
+  // tools.json，而 --check 自己也崩，于是连"不同步"这件事都报不出来。
+  //
+  // 这条用例不传 MICHAEL_IDE_* 覆盖，打的就是仓库里那两个真文件。
+  const result = spawnSync(process.execPath, [join(HERE, "../build/sync-tools-json.mjs"), "--check"], {
+    encoding: "utf8",
+  });
+  assert.equal(
+    result.status,
+    0,
+    `sync-tools-json --check 没跑通（同步脚本本身坏了，或者两份目录真的漂了）：\n${result.stdout}\n${result.stderr}`,
+  );
+  assert.match(result.stdout, /in sync/);
+});
+
 test("sync-tools-json --check 会拒绝目录独有工具", () => {
   const fixtureDir = mkdtempSync(join(tmpdir(), "michael-tools-sync-"));
   try {
