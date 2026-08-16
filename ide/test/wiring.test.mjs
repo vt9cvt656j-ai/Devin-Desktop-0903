@@ -1346,3 +1346,39 @@ test("侧栏毛玻璃要真能透出后面，且不支持时必须退回实色",
   assert.match(css, /@supports not \(\(backdrop-filter[\s\S]{0,220}background:\s*var\(--feature-rail\)/,
     "没有降级路径，不支持模糊的环境里侧栏文字会压在工作区上");
 });
+
+test("毛玻璃的祖先链不许出现切断 backdrop 的属性", () => {
+  // 这条是补给上一条的**反向**断言，也是这次真正漏掉的那道缝。
+  //
+  // 上一条只检查侧栏自己写没写 backdrop-filter —— 它一直是绿的，而效果一直是坏的：
+  // .feature-panel__sheet 上挂着 `animation: feature-fade … both`，而那个 keyframes 动的
+  // 是 opacity。fill-mode:both 让这条 opacity 动画播完之后永久生效，浏览器据此把 sheet
+  // 当成 backdrop root，后代的 backdrop-filter 只能采样这个 root 内部——而那里面三层
+  // 全是透明的，等于对空气做模糊。
+  const css = readFileSync(join(HERE, "../src/styles/app.css"), "utf8");
+  const ruleBody = (sel) => {
+    const at = css.indexOf("\n" + sel + " {");
+    assert.notEqual(at, -1, `${sel} 规则没了`);
+    return css.slice(at, css.indexOf("\n}", at));
+  };
+  // 注释里会提到这些词（正是解释它们为什么危险的那段），所以先把注释剥掉再断言。
+  const strip = (t) => t.replace(/\/\*[\s\S]*?\*\//g, "");
+  for (const sel of [".feature-panel", ".feature-panel__sheet", ".feature-panel__main"]) {
+    const body = strip(ruleBody(sel));
+    for (const bad of ["opacity:", "filter:", "mask:", "clip-path:", "will-change:", "isolation:", "contain:"]) {
+      assert.ok(!body.includes(bad),
+        `${sel} 上出现了 ${bad} —— 它会成为 backdrop root，侧栏和顶栏的毛玻璃会当场变成一层白纱`);
+    }
+    // animation 同样危险：只要它引用的 keyframes 动了 opacity，效果和直接写 opacity 一样。
+    const anim = /animation:\s*([\w-]+)/.exec(body);
+    if (anim) {
+      const kf = new RegExp(`@keyframes ${anim[1]}\\s*\\{[^}]*\\}[^}]*\\}`).exec(css)?.[0] || "";
+      assert.ok(!/opacity/.test(kf),
+        `${sel} 上的 animation ${anim[1]} 动了 opacity —— 和直接写 opacity 一个后果`);
+    }
+  }
+  // 动画得挂在实体层自己身上：元素自己的 opacity 动画不会切断它自己的 backdrop-filter。
+  for (const sel of [".feature-panel__head", ".feature-panel__tabs", ".feature-panel__body"]) {
+    assert.match(ruleBody(sel), /animation:\s*feature-fade/, `${sel} 少了淡入，整屏淡入会缺一块`);
+  }
+});
