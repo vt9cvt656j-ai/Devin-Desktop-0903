@@ -19567,9 +19567,82 @@ function _callIsReadOnlyCommand(call) {
   if (_callIsDangerousCommand(call)) return false;
   try { return _looksLikeReadOnlyCommand(call.command); } catch { return false; }
 }
+/**
+ * 已启用技能声明的 allowed-tools，是**真的约束**，不是卡片上一枚灰色小标签。
+ *
+ * Claude Code 里 allowed-tools 的语义是"这个技能在场时只准用这几个工具"。这里原来只把
+ * 它画在工具卡片上（"正文要用 X"），既不放行也不拦截——一个写着 `allowed-tools: Read, Grep`
+ * 的只读技能，启用后模型照样能调 write_file、删文件。用户从那枚标签会以为有约束，
+ * 实际一道都没有；这比没有这个字段更糟。
+ *
+ * 判据取**并集**而不是交集：同时启用两个技能时，两边声明的工具都该可用——交集会让
+ * 「启用得越多能干的越少」，那不是任何人的预期。
+ * 只有声明了 allowed-tools 的技能参与收窄；没声明的技能不表态，也就不缩小任何范围。
+ */
+function _skillAllowedTools() {
+  try {
+    if (!_activeSkillIds.size) return null;
+    const byId = new Map();
+    for (const skill of [..._loadSkillsLocal(), ..._fileSkills]) if (skill && skill.id) byId.set(skill.id, skill);
+    const declaring = [...byId.values()].filter((s) => _activeSkillIds.has(s.id) && Array.isArray(s.tools) && s.tools.length);
+    if (!declaring.length) return null;
+    const allow = new Set();
+    for (const s of declaring) for (const t of s.tools) {
+      const n = String(t || "").trim().toLowerCase();
+      if (n) allow.add(n);
+    }
+    // read_skill 永远放行：提示词里明确要求模型用它去读正文，把它挡掉等于让技能自锁。
+    allow.add("read_skill");
+    return allow.size ? { allow, names: declaring.map((s) => s.name || "技能") } : null;
+  } catch { return null; }
+}
+
+/** 工具调用落到 allowed-tools 白名单里的哪个名字上。技能里写的是 Claude Code 那套
+ *  名字（Read / Grep / Bash…），这里的工具名是 read_file / grep / run_cmd，做一次映射。 */
+const _SKILL_TOOL_ALIASES = {
+  read: ["read_file", "read_skill", "list_dir"],
+  write: ["write_file", "apply_patch", "edit_file"],
+  edit: ["apply_patch", "edit_file", "write_file"],
+  bash: ["run_cmd", "run_command", "terminal"],
+  grep: ["search", "grep", "search_in_project"],
+  glob: ["find", "find_files", "list_dir"],
+  webfetch: ["web_fetch"],
+  websearch: ["web_search"],
+  task: ["agent", "subagent"],
+};
+function _skillToolAllowed(allow, toolName) {
+  const n = String(toolName || "").trim().toLowerCase();
+  if (!n) return true;
+  if (allow.has(n)) return true;
+  for (const decl of allow) {
+    const mapped = _SKILL_TOOL_ALIASES[decl.replace(/[^a-z]/g, "")];
+    if (mapped && mapped.includes(n)) return true;
+  }
+  // MCP 工具：技能写 mcp__foo__bar 精确匹配，写 mcp 或 mcp__foo 视为整服务放行。
+  if (n.startsWith("mcp__")) {
+    for (const decl of allow) {
+      if (decl === "mcp" || n === decl || n.startsWith(decl + "__")) return true;
+    }
+  }
+  return false;
+}
+
 async function _approveToolCall(call, run) {
   if (!call) return true;
   const dangerous = _callIsDestructive(call);
+
+  // ⓪ 已启用技能的 allowed-tools 先收窄。这一条排在权限规则**之前**：它不是"要不要问
+  // 用户"，而是"这个技能在场时这件事根本不在范围内"，和用户此刻愿不愿意批准无关。
+  // typeof 守卫：这个闸会被测试单独抽出来跑（沙箱里只注入它显式声明的依赖），
+  // 直接引用会 ReferenceError 把整道闸打挂。文件里其它可选依赖也是这个写法。
+  const skillGate = typeof _skillAllowedTools === "function" ? _skillAllowedTools() : null;
+  if (skillGate && typeof _skillToolAllowed === "function"
+      && !_skillToolAllowed(skillGate.allow, call.name || call.tool || call.type)) {
+    try {
+      showToast(`「${skillGate.names[0]}」声明了 allowed-tools，${call.name || "这个工具"} 不在其中`);
+    } catch {}
+    return false;
+  }
 
   // ① 事先写下的规则最优先。deny 是全系统唯一的静默否决 —— 用户已经表过态，不该再问一遍。
   let ruleVerdict = "";
@@ -28370,6 +28443,13 @@ function _skillDiscoveryBases(projectRoot, home) {
   // ~/.codex/skills. Discover them too; they remain opt-in and retain baseDir so
   // relative scripts/assets referenced by the skill can be read and executed.
   if (home) bases.push(`${String(home).replace(/\/+$/, "")}/.codex/plugins/cache`);
+  /*
+   * Claude Code 插件市场装的技能落在 ~/.claude/plugins/<市场>/<插件>/skills/<名字>/SKILL.md。
+   * 不扫这一层的话，用户在 Claude Code 里装了一批插件技能、切到这个 IDE 就凭空少一半，
+   * 而界面上没有任何地方说明"这类没扫"——表现是"装了跟没装一样"。
+   * 目录层级比 .claude/skills 深两级，靠扫描函数自己的深度预算兜住（插件缓存那一档是 5 层）。
+   */
+  if (home) bases.push(`${String(home).replace(/\/+$/, "")}/.claude/plugins`);
   return [...new Set(bases)];
 }
 
@@ -28576,9 +28656,20 @@ function _parseSkillDocument(text, sourcePath) {
   return {
     id: `file:${normalizedPath}`,
     name: name.slice(0, 80),
-    // 折叠标量拼出来的描述里还留着原文的换行/连续空格，清单那边是按字符数掐的，
-    // 先压平再截断，才不会把预算浪费在空白上。
-    desc: desc.replace(/\s+/g, " ").trim().slice(0, 240),
+    /*
+     * 折叠标量拼出来的描述里还留着原文的换行/连续空格，清单那边是按字符数掐的，
+     * 先压平再截断，才不会把预算浪费在空白上。
+     *
+     * 上限从 240 提到 1200：**description 就是触发判据**。Anthropic 官方那批技能
+     * （pptx / xlsx / dataviz）的描述普遍 400–900 字符，而「什么时候该用我 / 什么时候
+     * 不要用我」恰恰写在后半截——240 一刀切下去，切掉的正是触发条件本身，模型于是
+     * 该用的时候不用、不该用的时候乱用。
+     *
+     * 这里不再承担"省预算"的职责：目录（_skillCatalogBlock）自己有 6000 字符总预算和
+     * 400→240→140→90→60 的逐级压缩，装不下时它会按当前技能数量决定压到哪一档。解析期
+     * 提前砍死，等于把那套动态预算的上限永久钉在 240。
+     */
+    desc: desc.replace(/\s+/g, " ").trim().slice(0, 1200),
     prompt,
     sourcePath: normalizedPath,
     baseDir: normalizedPath.slice(0, normalizedPath.lastIndexOf("/")) || ".",
@@ -28644,7 +28735,9 @@ async function _refreshFileSkills(root) {
     }
   };
   await Promise.all(bases.map((base, i) =>
-    visit(perBase[i], base, base.endsWith("/.codex/plugins/cache") ? 5 : 2)));
+    // 插件目录层级更深：Claude Code 是 ~/.claude/plugins/<市场>/<插件>/skills/<名字>/SKILL.md
+    // （比 .claude/skills/<名字>/ 深三级），Codex 的版本化缓存也一样。给它们 5 层。
+    visit(perBase[i], base, /\/(?:\.codex\/plugins\/cache|\.claude\/plugins)$/.test(base) ? 5 : 2)));
   // 先按来源顺序拼接，再按名字稳定排序——同名时留下的是优先级更高的那个来源。
   const found = perBase.flat();
   _fileSkillsDropped = dropped;
@@ -28807,17 +28900,14 @@ async function _deleteSkillRecord(skill, root, customList = null) {
 }
 // Fill a skill's instruction into the composer. APPENDS (blank line between) so several skills stack —
 // click 使用 on each. Validates empty prompts and toasts, so it's always clear something happened.
-function _useSkill(skill) {
-  const text = String((skill && skill.prompt) || "").trim();
-  if (!text) { showToast("这个技能没有指令内容"); return; }
-  try {
-    const cur = String(promptEl.value || "").replace(/\s+$/, "");
-    promptEl.value = cur ? cur + "\n\n" + text : text;
-    promptEl.dispatchEvent(new Event("input", { bubbles: true }));
-    try { promptEl.focus(); const n = String(promptEl.value || "").length; if (promptEl.setSelectionRange) promptEl.setSelectionRange(n); } catch {}
-    showToast("已填入：" + (skill.name || "技能"));
-  } catch { showToast("填入失败，请重试"); }
-}
+/*
+ * 这里原来有个 _useSkill(skill)：把技能正文当普通文本追加进输入框。
+ *
+ * 它是**死代码**——定义了但全仓零调用点（面板上的「使用」按钮实际调的是
+ * _toggleSkillActive）。删掉不是为了省几行，是因为它的语义和 Agent Skills 相反：
+ * 往输入框填文本那是**提示词模板**，是给用户填的；技能是给**模型**的能力，由模型
+ * 自己判断何时用 read_skill 去读。留着它，下一个改这块的人会以为技能有两套语义并存。
+ */
 async function openSkillsPanel() {
   const m = _chatToolModal({ title: "Skills · 技能", icon: _ICON_SKILLS });
   let editing = null, skills = [];
@@ -37340,6 +37430,13 @@ function _toolMsgForModel(call, result) {
     // 几个改动文件，模型对着半份 diff 做评审。
     // 两者都天然有界（web_fetch 后端硬顶 24000 字符，git diff 后端硬顶 200KB），
     // 放进 30000 档不会失控。tor / openapi_parser / figma 没有核到后端上界，不跟着挪。
+    // read_skill 和 read_file 是同一性质：它的**全部目的就是投递技能正文**。
+    // 落进 8000 那一档会被 _headTailModelText 从中间挖空——而 Anthropic 官方那批技能的
+    // SKILL.md 普遍 10–20KB，被挖掉的正好是中段的分步操作说明。更糟的是工具卡片这时
+    // 显示的是「共 16000 字符，已全部读入」（工具侧上限 24000），用户和模型收到的是
+    // 两个互相矛盾的事实：模型手上缺了一半，却被告知全在。
+    // 工具侧硬顶 24000，放进 30000 档不会失控。
+    : _rt === "skill" ? 30000
     : _rt === "web" || _rt === "git" ? 30000
     : _rt && _rt.endsWith("_search") ? 20000
     // cmd/http/mcp output can be arbitrarily huge and noisy → keep the tight guard.
