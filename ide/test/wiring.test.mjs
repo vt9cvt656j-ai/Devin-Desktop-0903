@@ -1057,7 +1057,13 @@ test("设置面板的下拉框必须是自绘的，且一列右端要对齐", ()
   // 深色下箭头会是深灰压深灰，几乎看不见。
   assert.match(css, /:root\[data-theme="dark"\] select\.settings-input\s*\{[^}]*background-image:/,
     "深色主题没有单独的箭头颜色，会糊在背景里");
-  // 右端对齐靠的是共同的下限宽度。
-  assert.match(css, /\.settings-row__control > select\.settings-input[\s\S]{0,120}min-width:/,
-    "控件没有统一的下限宽度，一列右边缘会参差不齐");
+  // 对齐靠的是**固定宽度的控件轨道**，不是给每个控件设下限。
+  // 只设下限时右缘能齐、左缘仍随控件自身宽度浮动（实测跨度 150px）；固定轨道两端都齐。
+  assert.match(css, /\.settings-row__control\s*\{[^}]*flex:\s*0 0 220px/,
+    "控件列不是固定轨道，左缘会参差不齐");
+  assert.match(css, /\.settings-row__control > \.settings-input\s*\{[^}]*width:\s*100%/,
+    "控件没有铺满轨道，右缘又会随内容浮动");
+  // 开关是定宽的，跟着拉满只会让它飘在轨道中间。
+  assert.match(css, /\.settings-row__control > \.settings-toggle\s*\{[^}]*flex:\s*0 0 42px/,
+    "开关被拉宽了");
 });
