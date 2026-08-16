@@ -21533,8 +21533,21 @@ function _formatStackHint(s) {
   // 猜测命令要如实标注——模型自己跑到 127 时才知道该换命令而不是当成代码错误。
   const _guessed = new Set(s.guessedCmds || []);
   const _unverified = (cmd) => _guessed.has(cmd) ? "（猜测默认、未验证已安装；退出 127 就换 venv 内工具或 python -m compileall，别当代码错误）" : "";
-  if (s.checkCmd) lines.push(`✅ 快速校验: \`${s.checkCmd}\`（编译/类型检查，改完先跑这条确认能编过；agent 会每改几个文件自动跑，编译错会立刻让你修）${_unverified(s.checkCmd)}`);
-  if (s.testCmd) lines.push(`🧪 测试: \`${s.testCmd}\`（改完跑这条验证；如果失败 agent 会自动注入失败报告让你修）${_unverified(s.testCmd)}`);
+  // 这两行原来向模型断言：「agent 会每改几个文件自动跑」「失败 agent 会自动注入失败报告」。
+  // **那套机器根本不存在**——`_runApprovedVerification` 只有定义零调用点，它包着的
+  // `_interleavedTest`（唯一会真去 taskRunCapture 跑命令的那个）因此也只在死代码里可达；
+  // `run._checkPendingPaths` / `_testPendingPaths` 这两个"待校验文件"账本只写不读，
+  // 全文件没有任何消费点，而那段注释还写着"推迟到收尾门"——收尾门里也没有。
+  //
+  // 后果不是"少了个功能"，是**机器主动给了模型一个错误的世界模型**：它每轮都在上下文
+  // 顶部读到这句断言，于是理性地把跑构建/测试外包给 IDE，改完就收尾。什么都没跑。
+  // 收尾时 `_hasVerifyEvidence` 为假，只记一行 `code_delivered_unverified`（那条路刻意
+  // 只记账不补回合），用户拿到的是一份没编译过的代码加一行小字。
+  // 这正是"写出来的代码很容易用不了"最直接的一条机器原因。
+  //
+  // 改成祈使句：验证是**模型自己的活**，而且说清"没人替你跑"。
+  if (s.checkCmd) lines.push(`✅ 快速校验: \`${s.checkCmd}\`（编译/类型检查）——**改完必须你自己跑这条**，没有任何东西会替你自动跑。退出码就是结论。${_unverified(s.checkCmd)}`);
+  if (s.testCmd) lines.push(`🧪 测试: \`${s.testCmd}\`——**改完必须你自己跑**，同样没人会替你跑，也不会有失败报告自动送到你面前。${_unverified(s.testCmd)}`);
   if (s.devCmd) lines.push(`🚀 启动 dev: \`${s.devCmd}\``);
   if (s.buildCmd) lines.push(`🔨 构建: \`${s.buildCmd}\``);
   if (s.lintCmd) lines.push(`🔧 lint: \`${s.lintCmd}\``);
@@ -44733,6 +44746,19 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
         // 真话要求的不是「强迫它再跑一轮」，而是**这一轮的收尾绝不能看起来像验证过了**。
         // 那件事由下面这个 incompleteReason 承担，它会进结果卡片。
         if (_codeDeliveredUnverified && !run._incompleteReason) {
+          // 改了代码、整轮零验证证据。这里**只记账，不代跑**——这是刻意的。
+          //
+          // 我一度在这里接上 `_runApprovedVerification` 让 IDE 自己跑一次 checkCmd，
+          // 被测试「验证事实由真实命令/诊断提供，不由 IDE 收尾门强行代跑」拦下了，
+          // 而它是对的：关键词是 **secretly**。偷偷跑一个模型不知道的命令，会让"已完成"
+          // 变得不可预测（模型没请求过它、也没机会解释它的结果），和整套"不拿 harness 的
+          // 偏好覆盖模型判断"的哲学冲突。
+          //
+          // 真正的病不在这里，在别处：栈提示每轮都在向模型断言「agent 会每改几个文件
+          // 自动跑」「失败会自动注入报告」，而那套机器是死的（`_runApprovedVerification`
+          // 零调用点、`_checkPendingPaths`/`_testPendingPaths` 只写不读）。模型据此把
+          // 验证外包给了一个不存在的东西。谎话已经在 `_formatStackHint` 里去掉，
+          // 改成祈使句"改完必须你自己跑，没有任何东西会替你跑"。
           run._incompleteReason = "code_delivered_unverified";
         }
         // ── 「读完就停」曾经在这里由 harness 画像门强制补一回合——已移除 ──

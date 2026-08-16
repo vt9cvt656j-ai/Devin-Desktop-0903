@@ -23908,3 +23908,58 @@ test("lsp-client 暴露真实就绪状态，而不是让调用方假设", () => 
   // 初始化超时的客户端会留在表里但 initialized 仍是 false（那段代码专门这么写的）
   assert.match(lsp, /return !!\(client && client\.initialized === true\);/);
 });
+
+// ══ 不许向模型承诺一套不存在的机器 ═════════════════════════════════════════
+//
+// 用户反馈：智能体写出来的代码很容易用不了。这是最直接的一条机器原因，而且方向出人意料
+// ——不是模型偷懒，是**机器主动给了它一个错误的世界模型**。
+//
+// 栈提示每轮都在上下文顶部断言：「agent 会每改几个文件自动跑」「失败 agent 会自动注入
+// 失败报告让你修」。而那套机器是**死的**：_runApprovedVerification 只有定义零调用点，
+// 它包着的 _interleavedTest（唯一真会 taskRunCapture 跑命令的那个）因此也只在死代码里
+// 可达；run._checkPendingPaths / _testPendingPaths 两个账本只写不读。
+// 模型于是理性地把跑构建/测试外包给 IDE，改完就收尾。什么都没跑。用户拿到没编译过的代码。
+
+test("栈提示不得承诺自动验证——那套机器是死的", () => {
+  const fn = extractFn("_formatStackHint");
+  const code = fn.split("\n").filter((l) => !/^\s*(\/\/|\*|\/\*)/.test(l)).join("\n");
+  // 断言语气的承诺必须消失
+  assert.doesNotMatch(code, /agent 会每改几个文件自动跑/, "又在承诺一套不存在的自动验证了");
+  assert.doesNotMatch(code, /agent 会自动注入失败报告/);
+  // 换成祈使句，并且明说没人替它跑
+  assert.match(code, /\*\*改完必须你自己跑这条\*\*，没有任何东西会替你自动跑/);
+  assert.match(code, /退出码就是结论/);
+  assert.match(code, /同样没人会替你跑/);
+});
+
+test("那套自动验证机器要么接上、要么别承诺——现在是「别承诺」", () => {
+  // 三个函数 + 两个账本目前全是死代码。这条测试不要求把它们删掉（将来可能接上），
+  // 但要求：只要它们还是死的，提示词里就不能有任何东西暗示它们活着。
+  const calls = (SRC.match(/_runApprovedVerification\(/g) || []).length;
+  if (calls <= 1) {
+    // 只有定义、没有调用 → 提示词里不许出现"自动跑/自动注入"这类承诺
+    const hint = extractFn("_formatStackHint");
+    // 剥注释：这个函数的说明里原样引用了那句被删掉的谎话（本轮第六次踩这个坑）。
+    // 用和上一条测试同一个过滤器，别再手写一个漏掉缩进的版本。
+    const hintCode = hint.split("\n").filter((l) => !/^\s*(\/\/|\*|\/\*)/.test(l)).join("\n");
+    // 找的是**承诺**，不是这几个字本身——新写的否定句「没有任何东西会替你自动跑」
+    // 里也含"自动跑"。判据必须是"agent/IDE 会替你做"这个语义。
+    assert.doesNotMatch(hintCode, /(?:agent|IDE)\s*会[^。\n]{0,12}(?:自动|替你)/,
+      "机器是死的，提示词却在说它活着");
+  }
+  // 原来这里还数了 _checkPendingPaths/_testPendingPaths 在代码里的出现次数，想借此
+  // 判断"账本有没有被消费"。删掉了：这条断言从设计上就会**自指**——它自己的说明文字
+  // 和引用也会被计入（实测 main.js 里只有 2 处，加上测试文件里的引用就变成 4 处）。
+  // 想守"死账本"这件事，得比对**写入点和读取点**，而不是数字符串出现次数。
+});
+
+test("收尾门只记账、不偷偷代跑——这条是刻意的", () => {
+  // 我一度在这里接上 _runApprovedVerification 让 IDE 自己跑一次 checkCmd，被
+  // 「验证事实由真实命令/诊断提供，不由 IDE 收尾门强行代跑」拦下了，而它是对的：
+  // 关键词是 secretly——偷偷跑一个模型不知道的命令，会让"已完成"变得不可预测。
+  const loop = stripJsComments(extractFn("_runAgenticLoop"));
+  assert.doesNotMatch(loop, /_runApprovedVerification\(/, "收尾门又在偷偷代跑了");
+  assert.match(SRC, /run\._incompleteReason = "code_delivered_unverified";/);
+  // 理由要写在代码里，否则下一个人（比如我）会再接一次
+  assert.match(SRC, /关键词是 \*\*secretly\*\*/);
+});
