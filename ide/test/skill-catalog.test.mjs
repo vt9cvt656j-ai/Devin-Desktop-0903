@@ -170,3 +170,46 @@ test("技能：正文不被腰斩、描述不被提前砍死、allowed-tools 真
   assert.doesNotMatch(SRC, /function _useSkill\(/,
     "那条把技能正文填进输入框的死代码又回来了——它和技能是两种语义");
 });
+
+const parseSkill = new Function(
+  "parentDir",
+  topLevelFn("_parseSkillDocument") + "\n;return _parseSkillDocument;",
+)((path) => String(path).slice(0, String(path).lastIndexOf("/")));
+
+test("技能正文进模型时剥掉 frontmatter，且开关的名字要说实话", () => {
+  // ① frontmatter 不该进模型。name / description / allowed-tools 这三样解析期已经取走，
+  //    description 更是早就在技能清单里；把它们原样留在正文里，等于同一段元数据在上下文
+  //    出现三遍，占的还是最贵的那块预算（常驻 10k、read_skill 24k）。
+  const doc = parseSkill(
+    ["---", "name: docx", "description: 处理 Word 文档", "allowed-tools: Read, Grep", "---", "", "# 正文", "第一步：先读模板。"].join("\n"),
+    "/w/.claude/skills/docx/SKILL.md",
+  );
+  assert.equal(doc.name, "docx");
+  assert.equal(doc.desc, "处理 Word 文档");
+  assert.deepEqual(doc.tools, ["Read", "Grep"]);
+  assert.ok(doc.prompt.startsWith("# 正文"), `正文没剥干净：${JSON.stringify(doc.prompt.slice(0, 60))}`);
+  for (const leaked of ["allowed-tools", "description:", "---"]) {
+    assert.ok(!doc.prompt.includes(leaked), `${leaked} 还留在给模型的正文里：${doc.prompt}`);
+  }
+  // 但整份文件只有 frontmatter 时不能剥成空串——那会让这个技能从清单里凭空消失，
+  // 比多几行元数据糟得多。
+  const bare = parseSkill(["---", "name: 空的", "description: 没有正文", "---"].join("\n"), "/w/.claude/skills/bare/SKILL.md");
+  assert.ok(bare.prompt.trim().length > 0, "剥成空串了，这个技能会从清单里消失");
+
+  // ② 开关文案必须说实话。它管的是"要不要把全文钉进每次请求"，不是"这个技能能不能用"
+  //    ——技能清单始终在上下文里，模型随时能 read_skill 读它。旧文案「取消使用 / 已取消」
+  //    读起来是"关掉了"，用户点完以为关了，实际什么都没关。
+  assert.doesNotMatch(SRC, /已启用技能：/, "旧文案还在：那句话说的不是这个开关做的事");
+  assert.doesNotMatch(SRC, /会注入到对话/, "旧文案还在");
+  assert.doesNotMatch(SRC, /如果只是不想让它生效，关掉开关就行/,
+    "删除确认里那句话是假的：取消常驻之后模型照样看得见、照样能读");
+  // 按钮上那两个字是用户唯一看得见的说明，必须单独钉住——只钉气泡的话，把标签改回
+  // 「使用 / 取消使用」照样绿。
+  const markup = SRC.slice(SRC.indexOf('row.className = "skill-row" + (on ? " is-active" : "")'));
+  assert.match(markup.slice(0, 900), /\$\{on \? "取消常驻" : "常驻"\}<\/button>/,
+    "按钮还写着「使用 / 取消使用」——它管的不是能不能用，是要不要把全文钉进每次请求");
+  const row = SRC.slice(SRC.indexOf('row.querySelector("._use")'));
+  assert.match(row.slice(0, 700), /已常驻/, "气泡没说清它做了什么");
+  assert.match(row.slice(0, 700), /模型仍可按需自行读取/,
+    "取消常驻的气泡必须说清「它还在」，否则用户以为技能被关掉了");
+});
