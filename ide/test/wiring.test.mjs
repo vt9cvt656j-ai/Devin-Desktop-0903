@@ -981,14 +981,18 @@ test("档位滑块：拖动要真的落到档位上，且拖出卡片边界不�
   // 4) 指针拖出卡片边界时不能收卡片，否则 input 随卡片一起消失。
   const leaveAt = SRC.indexOf('el.addEventListener("mouseleave"');
   assert.notEqual(leaveAt, -1, "卡片的 mouseleave 处理没了");
-  // 只看 mouseleave 那一条语句本身。往后多读几行就会读到 pointerdown 里的
-  // `el._sliderDrag = true`，那样这条断言就被隔壁喂饱了。
-  const leaveStmt = SRC.slice(leaveAt, SRC.indexOf("\n", leaveAt));
-  assert.match(leaveStmt, /_sliderDrag/,
+  // 抑制必须是**无状态**的：读事件自带的 buttons，而不是一个要靠 pointerup 清掉的标志位。
+  // 标志位那一版只要 pointerup 没送达（拖动中窗口失焦、指针捕获被中断、拖到屏幕外松手），
+  // 就永远挂着，卡片从此再也不会自动收起——表现就是"调完滑块后卡片赖着好几秒"。
+  const leaveBody = SRC.slice(leaveAt, SRC.indexOf("});", leaveAt));
+  assert.match(leaveBody, /if \(ev\.buttons\) return;/,
     "拖滑块时卡片仍会因为 mouseleave 被收走，拖到最右端必断");
-  // 但松手后必须能收，否则卡片赖着不走。
-  assert.match(SRC.slice(leaveAt, leaveAt + 1200), /pointerup/,
-    "没有在松手时补收卡片，卡片会一直挂在屏幕上");
+  assert.doesNotMatch(SRC, /_sliderDrag/,
+    "又用回那个要靠 pointerup 清掉的标志位了——它一旦漏清，卡片就再也收不起来");
+  // 松手时若指针已不在卡片上要补收一次；但这条即使没跑到，也只是少收一次，
+  // 不会把后续所有收起一起堵死。
+  assert.match(SRC.slice(leaveAt, leaveAt + 900), /window\.addEventListener\("pointerup"/,
+    "没有在松手时补收卡片");
 
   // 5) 买不到的档位要弹回并解释，不能静默钉住（那看起来就是滑块坏了）。
   assert.match(bind, /showToast\(/, "锁定档位没有任何提示，用户只会觉得滑块坏了");
