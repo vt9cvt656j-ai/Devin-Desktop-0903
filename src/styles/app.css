@@ -12091,7 +12091,7 @@ textarea.settings-input {
   text-align: left;
 }
 .appearance-theme-card__preview {
-  height: 132px;
+  height: 186px;
   overflow: hidden;
   border-radius: 10px;
   border: 1px solid var(--feature-border, var(--line));
@@ -12115,20 +12115,20 @@ textarea.settings-input {
  * 参考图里深色版内层还是白卡，并排看只有外框深浅有别，一眼分不出来。
  */
 .thp { display: grid; grid-template-columns: 26% 1fr; height: 100%; }
-.thp__rail { padding: 9px 6px; display: grid; align-content: start; gap: 5px; }
+.thp__rail { padding: 12px 8px; display: grid; align-content: start; gap: 7px; }
 .thp__rail i { height: 5px; border-radius: 3px; }
 .thp__rail i:nth-child(1) { width: 58%; }
 .thp__rail i:nth-child(2) { width: 76%; }
 .thp__rail i:nth-child(3) { width: 68%; }
 .thp__rail i:nth-child(4) { width: 82%; }
 .thp__rail i:nth-child(5) { width: 62%; }
-.thp__main { padding: 10px 10px 0 8px; display: grid; align-content: start; gap: 4px; }
+.thp__main { padding: 13px 13px 0 10px; display: grid; align-content: start; gap: 5px; }
 .thp__h { height: 7px; width: 34%; border-radius: 3px; }
 .thp__sub { height: 4px; width: 62%; border-radius: 2px; margin-bottom: 4px; }
 .thp__card { border-radius: 6px; overflow: hidden; }
 .thp__card p {
   margin: 0;
-  height: 21px;
+  height: 28px;
   display: flex;
   align-items: center;
   justify-content: space-between;
@@ -12163,16 +12163,17 @@ textarea.settings-input {
 .appearance-theme-card--dark .thp__card s { background: rgba(255, 255, 255, .14); }
 .appearance-theme-card--dark .thp__card s.is-accent { background: #8ab4f8; }
 
-.appearance-theme-card__meta { padding: 0 2px; }
+/* 名字居中落在自己那张缩略图下面。左对齐时两个标签贴在各自卡片的左边缘，看起来像
+   是从卡片上掉下来的两块碎片，而不是这张图的说明。 */
+.appearance-theme-card__meta { padding: 0; text-align: center; }
 .appearance-theme-card__meta b {
   font-size: 13px;
   font-weight: 550;
-  color: var(--feature-dim, var(--text-dim));
-}
-.appearance-theme-card.is-active .appearance-theme-card__meta b {
+  /* 两个名字用同一个字色。把未选中的压成灰会让"深色"这个词本身看着像被禁用了，
+     而它只是没被选中——选中与否由缩略图那圈主色环表达，足够了。 */
   color: var(--feature-text, var(--text));
-  font-weight: 600;
 }
+.appearance-theme-card.is-active .appearance-theme-card__meta b { font-weight: 600; }
 
 .app-icon-control {
   display: flex;
