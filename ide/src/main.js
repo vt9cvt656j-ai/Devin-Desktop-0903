@@ -29252,6 +29252,9 @@ async function openMcpPanel(opts = null) {
   const _appOfSource = (source) => {
     const p = String(source || "");
     if (p.endsWith("/.claude.json")) return "Claude Code";
+    // Claude Desktop 的配置不在 HOME 底下（macOS 在 Library/Application Support，
+    // Windows 在 APPDATA，Linux 在 .config），所以按文件名认，不按目录。
+    if (p.endsWith("/claude_desktop_config.json")) return "Claude Desktop";
     if (p.includes("/.cursor/")) return "Cursor";
     if (p.includes("/.codex/")) return "Codex";
     return "";

@@ -159,6 +159,24 @@ test("Claude Code / Cursor 里配好的服务直接就能用，不用再抄一�
   assert.equal(doc.serverSources["my-api"], CURSOR_FILE);
 });
 
+test("每份外部配置都认得出是哪个客户端写的——包括 Claude Desktop", () => {
+  // 面板上那一格显示的是"这个服务是谁配的"。认不出来就退回泛泛的「其他客户端」，
+  // 用户看到一个自己不记得配过的服务，第一件事是想知道它从哪来的。
+  const appOf = new Function(
+    "return " + SRC.slice(SRC.indexOf("const _appOfSource = (source) =>") + "const _appOfSource = ".length)
+      .slice(0, SRC.slice(SRC.indexOf("const _appOfSource = (source) =>")).indexOf("};") + 1),
+  )();
+  assert.equal(appOf("/home/me/.claude.json"), "Claude Code");
+  assert.equal(
+    appOf("/home/me/Library/Application Support/Claude/claude_desktop_config.json"),
+    "Claude Desktop",
+    "Claude Desktop 的配置刚接进来，这里没跟上就只会显示「其他客户端」",
+  );
+  assert.equal(appOf("/home/me/.cursor/mcp.json"), "Cursor");
+  assert.equal(appOf("/home/me/.codex/mcp.json"), "Codex");
+  assert.equal(appOf("/work/a/.mcp.json"), "", "项目自带的配置不属于任何外部客户端");
+});
+
 test("当前项目路径要传给 Rust 侧，否则 Claude Code 缺省作用域的服务一条都读不到", async () => {
   // `claude mcp add` 不带 -s 时用的是 local 作用域，服务写在
   // ~/.claude.json 的 projects["<当时的 cwd>"].mcpServers 底下。Rust 那边要靠这个路径
