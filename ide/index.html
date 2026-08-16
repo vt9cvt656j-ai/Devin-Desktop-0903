@@ -222,9 +222,17 @@
         <rect x="3.5" y="5" width="17" height="14" rx="2.5" fill="none" stroke="currentColor" stroke-width="1.7" />
         <path fill="none" stroke="currentColor" stroke-width="1.7" d="M9 5v14" />
       </symbol>
+      <!-- 右侧面板开关的两个状态，同一副几何、只差右段填不填 —— VS Code 那套惯例：
+           实心 = 面板在，空框 = 面板收起。两个状态用同一个图标只换颜色的话，光看图标
+           根本判断不出当前是开是关。 -->
       <symbol id="i-sidebar-right" viewBox="0 0 24 24">
         <rect x="3.5" y="5" width="17" height="14" rx="2.5" fill="none" stroke="currentColor" stroke-width="1.7" />
         <path fill="none" stroke="currentColor" stroke-width="1.7" d="M15 5v14" />
+      </symbol>
+      <symbol id="i-sidebar-right-on" viewBox="0 0 24 24">
+        <rect x="3.5" y="5" width="17" height="14" rx="2.5" fill="none" stroke="currentColor" stroke-width="1.7" />
+        <path fill="none" stroke="currentColor" stroke-width="1.7" d="M15 5v14" />
+        <path fill="currentColor" stroke="none" d="M15.9 5.9h2.7a1.9 1.9 0 0 1 1.9 1.9v8.4a1.9 1.9 0 0 1-1.9 1.9h-2.7z" />
       </symbol>
       <symbol id="i-book" viewBox="0 0 24 24">
         <path fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" d="M12 6.5C10.5 5.3 8.6 5 6.5 5H3v12.5h4c1.9 0 3.6.4 5 1.5 1.4-1.1 3.1-1.5 5-1.5h4V5h-3.5c-2.1 0-4 .3-5.5 1.5zM12 6.5V19" />
