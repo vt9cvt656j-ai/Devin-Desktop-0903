@@ -7969,15 +7969,13 @@ function hideMarkdownPreview() {
   if (_mdPreviewDisposable) { _mdPreviewDisposable.dispose(); _mdPreviewDisposable = null; }
 }
 
-// ⌘. to toggle markdown preview
-document.addEventListener("keydown", (e) => {
-  if ((e.metaKey || e.ctrlKey) && e.key === ".") {
-    e.preventDefault();
-    if (!_mdActiveModel) return;
-    _toggleMdPreview(!_mdPreviewOpen);
-    if (!_mdPreviewOpen) _renderMdThumb();
-  }
-});
+// Markdown 预览开关。键位登记在 DEFAULT_KEYBINDINGS 里（view.markdownPreview），
+// 这里只留动作本身——原来是自己挂 keydown，于是这个键在设置页里既看不到也改不了。
+function _toggleMarkdownPreviewAction() {
+  if (!_mdActiveModel) return;
+  _toggleMdPreview(!_mdPreviewOpen);
+  if (!_mdPreviewOpen) _renderMdThumb();
+}
 
 // ---- 整体界面缩放（Cmd/Ctrl + = / - / 0）：代码编辑器和所有 UI 一起缩放 ----
 const _UI_ZOOM_KEY = "michael-ide.ui-zoom";
@@ -8011,13 +8009,8 @@ async function _applyUiZoom(factor, { toast = true } = {}) {
   if (toast) showToast(`界面缩放 ${Math.round(_uiZoom * 100)}%`);
 }
 if (_uiZoom !== 1) _applyUiZoom(_uiZoom, { toast: false });
-document.addEventListener("keydown", (e) => {
-  if (!(e.metaKey || e.ctrlKey) || e.altKey || e.shiftKey && !["+", "="].includes(e.key)) return;
-  const k = e.key;
-  if (k === "=" || k === "+") { e.preventDefault(); _applyUiZoom(_uiZoom + 0.1); }
-  else if (k === "-") { e.preventDefault(); _applyUiZoom(_uiZoom - 0.1); }
-  else if (k === "0") { e.preventDefault(); _applyUiZoom(1); }
-}, true);
+// 缩放的键位同样登记在 DEFAULT_KEYBINDINGS 里（view.zoomIn/zoomOut/zoomReset），
+// 这里不再自己挂 keydown —— 自己挂的键在设置页里查不到也改不了。
 
 // 面包屑路径条已整体移除（只显示文件名没信息量还占一行，用户反馈无用）。
 
@@ -10487,17 +10480,21 @@ async function _deleteSelectedTree() {
     _treeDeleteBusy = false;
   }
 }
-// Cmd/Ctrl+Backspace (or Delete) removes the tree selection — guarded so it never
-// fires while editing in the editor / terminal / any input.
-window.addEventListener("keydown", (e) => {
-  if (!(e.metaKey || e.ctrlKey) || (e.key !== "Backspace" && e.key !== "Delete")) return;
+/**
+ * 删除文件树里选中的项。键位登记在 DEFAULT_KEYBINDINGS（file.deleteSelected）。
+ *
+ * **守卫必须留在这个函数里**，不能只靠外面的键位表。这是全局分发器上唯一一个会
+ * 破坏数据的动作：焦点在编辑器 / 终端 / 任何输入框里时按下删除键，用户想删的是
+ * 光标前的字，不是磁盘上的文件。原来这层守卫写在它自己的 keydown 里，动作搬进
+ * 分发器之后如果只搬动作、不搬守卫，就会变成"在聊天框里按退格删掉一个文件"。
+ */
+function _deleteSelectedTreeItem() {
   if (_treeSel.size === 0) return;
   const ae = document.activeElement;
   if (ae && (ae.tagName === "INPUT" || ae.tagName === "TEXTAREA" || ae.isContentEditable ||
       (ae.closest && (ae.closest(".monaco-editor") || ae.closest(".xterm"))))) return;
-  e.preventDefault();
   _deleteSelectedTree();
-});
+}
 
 // Absolute workspace path → path relative to its workspace root (for @-mention references).
 function _pathToRel(abs) {
@@ -58463,6 +58460,13 @@ const ACTION_LABELS = {
   "commandPalette": "命令面板",
   "view.splitEditor": "切换分屏编辑",
   "code.runCurrentFile": "运行当前文件",
+  "view.markdownPreview": "切换 Markdown 预览",
+  "view.zoomIn": "界面放大",
+  "view.zoomOut": "界面缩小",
+  "view.zoomReset": "缩放复位 100%",
+  "file.deleteSelected": "删除选中的文件",
+  "view.extensions": "打开扩展市场",
+  "view.bookmarks": "书签面板",
 };
 
 const DISABLED_BINDING = "__none__";
@@ -65216,22 +65220,43 @@ async function replaceInFiles(replaceAll) {
 replaceSingleBtn.addEventListener("click", () => replaceInFiles(false));
 replaceAllBtn.addEventListener("click", () => replaceInFiles(true));
 
-const DEFAULT_KEYBINDINGS = {
-  "ctrl+`": "terminal.toggle",
-  "mod+o": "file.openFolder",
-  "mod+p": "file.quickOpen",
-  "mod+s": "file.save",
-  "mod+w": "file.close",
-  "mod+shift+n": "window.new",
-  "mod+shift+e": "view.explorer",
-  "mod+shift+f": "view.search",
-  "ctrl+shift+g": "view.git",
-  "ctrl+shift+u": "view.output",
-  "mod+shift+m": "view.problems",
-  "mod+shift+p": "commandPalette",
-  "mod+\\": "view.splitEditor",
-  "mod+r": "code.runCurrentFile",
-};
+/*
+ * 默认键位。**按平台分两套**——几处不是审美问题，是会被系统/输入法吃掉：
+ *   · Markdown 预览：Windows 微软拼音里 Ctrl+. 是中英文标点切换，按下去进不来，
+ *     所以非 Mac 走 VS Code 同款的 mod+shift+v。
+ *   · 删除文件：Mac 惯例是 ⌘⌫；Windows 惯例是裸 Delete，而 Ctrl+Backspace 在系统里
+ *     是"删除前一个词"。
+ *   · view.git / view.output 保持 ctrl+ 开头：Mac 上 keyCombo 把 ⌘ 记成 mod、⌃ 记成
+ *     ctrl，所以这两条在 Mac 上要按 Control——和 VS Code Mac 版一致，是肌肉记忆。
+ */
+function _defaultKeybindings() {
+  const mac = isMacPlatform();
+  return {
+    "ctrl+`": "terminal.toggle",
+    "mod+o": "file.openFolder",
+    "mod+p": "file.quickOpen",
+    "mod+s": "file.save",
+    "mod+w": "file.close",
+    "mod+shift+n": "window.new",
+    "mod+shift+e": "view.explorer",
+    "mod+shift+f": "view.search",
+    "ctrl+shift+g": "view.git",
+    "ctrl+shift+u": "view.output",
+    "mod+shift+m": "view.problems",
+    "mod+shift+p": "commandPalette",
+    "mod+\\": "view.splitEditor",
+    "mod+r": "code.runCurrentFile",
+    "mod+shift+i": "memory.manage",
+    "mod+shift+b": "view.bookmarks",
+    "mod+shift+x": "view.extensions",
+    [mac ? "mod+." : "mod+shift+v"]: "view.markdownPreview",
+    "mod+=": "view.zoomIn",
+    "mod+-": "view.zoomOut",
+    "mod+0": "view.zoomReset",
+    [mac ? "mod+backspace" : "delete"]: "file.deleteSelected",
+  };
+}
+const DEFAULT_KEYBINDINGS = _defaultKeybindings();
 
 let userKeybindings = {};
 
@@ -65272,6 +65297,12 @@ const KB_ACTIONS = {
   "commandPalette": () => palette.open(),
   "view.splitEditor": () => toggleSplitEditor(),
   "code.runCurrentFile": () => runCurrentFile(),
+  "view.markdownPreview": () => _toggleMarkdownPreviewAction(),
+  "view.zoomIn": () => _applyUiZoom(_uiZoom + 0.1),
+  "view.zoomOut": () => _applyUiZoom(_uiZoom - 0.1),
+  "view.zoomReset": () => _applyUiZoom(1),
+  "file.deleteSelected": () => _deleteSelectedTreeItem(),
+  "view.extensions": () => openMarketplaceModal(),
 };
 
 function keyCombo(e) {
@@ -66533,17 +66564,12 @@ const palette = createCommandPalette({
 
 $("extensionsBtn").addEventListener("click", () => openMarketplaceModal());
 $("paletteBtn").addEventListener("click", () => palette.open());
-window.addEventListener(
-  "keydown",
-  (e) => {
-    if (keyComboAliases(e).includes("mod+shift+p")) {
-      e.preventDefault();
-      e.stopPropagation();
-      palette.open();
-    }
-  },
-  true,
-);
+/*
+ * 这里原来还有一条硬编码的 mod+shift+p 监听（capture + stopPropagation），和
+ * DEFAULT_KEYBINDINGS 里的 commandPalette 重复。后果不是"绑了两次"这么无害：它抢在
+ * capture 阶段并 stopPropagation，可改键那条永远跑不到——用户在设置页把命令面板改成
+ * 别的键，改了个寂寞，⌘⇧P 照旧打开。删掉，只留可改键的那一条。
+ */
 
 (async () => {
   try {

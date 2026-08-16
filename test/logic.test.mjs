@@ -1712,8 +1712,16 @@ test("keyboard shortcuts use platform primary modifier instead of hardcoded mac 
   assert.deepEqual(winFormat("mod+shift+backspace"), ["Ctrl", "Shift", "Backspace"]);
   assert.deepEqual(macFormat("mod+shift+backspace"), ["⌘", "⇧", "⌫"]);
 
-  assert.match(SRC, /if \(keyComboAliases\(e\)\.includes\("mod\+shift\+p"\)\)/,
-    "command palette global shortcut should use platform aliases, not raw metaKey/ctrlKey");
+  // 命令面板原来有**两条**监听：可改键的那条在 DEFAULT_KEYBINDINGS 里，另一条硬编码在
+  // capture 阶段并 stopPropagation。后果不是"绑了两次"这么无害——硬编码那条抢在前面，
+  // 可改键的永远跑不到，用户在设置页把命令面板改成别的键，⌘⇧P 照旧打开。
+  // 现在只留分发器这一条（它本身就走 keyComboAliases，平台别名照旧生效）。
+  assert.match(SRC, /"commandPalette":\s*\(\) => palette\.open\(\)/,
+    "命令面板没接进可改键的动作表");
+  assert.doesNotMatch(SRC, /includes\("mod\+shift\+p"\)/,
+    "又出现了第二条硬编码的命令面板监听，它会让改键失效");
+  assert.match(SRC, /const action = keyComboAliases\(e\)\.map\(\(combo\) => bindings\[combo\]\)/,
+    "全局分发器没用平台别名");
   assert.match(SRC, /"mod\+o": "file\.openFolder"/);
   assert.match(SRC, /"mod\+w": "file\.close"/);
   assert.match(SRC, /hint: shortcutLabel\("mod\+s"\)/,
