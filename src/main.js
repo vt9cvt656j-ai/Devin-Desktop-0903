@@ -12956,14 +12956,13 @@ function _modelContextChoices(id) {
   return _ctxChoiceOptions(id)
     .slice()
     .sort((a, b) => a.value - b.value || (a.kind === "native" ? -1 : 1))
-    // 标签说的是**运维在卖的那套档位名**，不是算出来的合计。
+    // 标签就是**运维在卖的那套档位名**，不是算出来的合计。
     //
-    // 档位在网关侧是**叠加**的（compression.rs: capacity_for_native = native + tier），
-    // 所以 1M 原生配 2M 档，真实容量确实是 3M —— 数字没错。但后台卖的是「1M/2M/5M」，
-    // 卡片上冒出 3M / 6M 会让人以为自己买的档位对不上。写成 +1M / +2M / +5M：既是
-    // 后台那套名字，加号又说清了它是叠在原生之上的。
+    // 档位在网关侧是叠加的（compression.rs: capacity_for_native = native + tier），
+    // 所以 1M 原生配 2M 档真实容量是 3M —— 数字没错，但那不是后台卖的名字，卡片上冒出
+    // 3M / 6M 会让人以为自己买的档位对不上。原生显示它真实的数字，加档原样用档位名。
     .map((o) => {
-      const label = o.kind === "native" ? _tokenShort(o.value) : `+${o.tier}`;
+      const label = o.kind === "native" ? _tokenShort(o.value) : String(o.tier || "");
       return { ...o, label, valueLabel: label };
     });
 }
@@ -14828,7 +14827,6 @@ function officialPrice(id = "") {
 function _modelPriceRows(m) {
   const p = officialPrice(m.id);
   const title = _escHtml(t("model.price.title"));
-  const unit = _escHtml(t("model.price.perMillionTokens"));
   // 四格：输入 / 输出 / 缓存写 / 缓存读。缓存两项来自网关，走的是和报价接口同一条
   // 三级规则（管理员手填 > 实时目录 > 按输入价推算），所以这里显示的价和账单上扣的
   // 价不会分叉。网关没给就不画那一格——缓存价不该由客户端自己编一个出来。
@@ -14849,8 +14847,7 @@ function _modelPriceRows(m) {
   }
   if (cells.length) {
     return `<div class="mic-plabel mic-plabel--center">${title}</div>`
-      + `<div class="mic-prices__grid">${cells.join("")}</div>`
-      + `<div class="mic-price__unit">${unit}</div>`;
+      + `<div class="mic-prices__grid">${cells.join("")}</div>`;
   }
   if (/image|生图|图像/i.test(String(m.id))) {
     return `<div class="mic-row mic-row--hint"><span class="mic-u">${_escHtml(t("model.price.imageBilling"))}</span></div>`;
