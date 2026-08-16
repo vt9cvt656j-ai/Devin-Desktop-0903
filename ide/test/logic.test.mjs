@@ -14140,13 +14140,18 @@ test("plain-text assistant questions wait without an automatic follow-up turn", 
   const loop = extractFn("_runAgenticLoop");
   const boundary = loop.indexOf("if (_agentTurnMustWaitForUser(turn))");
   assert.ok(boundary >= 0, "visible questions must have an explicit turn boundary");
-  const boundaryBlock = loop.slice(boundary, boundary + 1600);
+  const boundaryBlock = loop.slice(boundary, boundary + 3000);
   // A rhetorical "shall I continue?" with plan steps still open is not a direction question the
   // user has to answer — it is the model stopping short of its own list. Intercepted once, then
   // it is genuinely waiting.
   assert.match(boundaryBlock, /run\._planQuestionIntercepted[\s\S]{0,400}_pushNudge\("planFinish"[\s\S]{0,300}continue;/,
     "an unfinished plan must push the question back once before the run waits");
   assert.match(boundaryBlock, /awaitingUserReply = true/);
+  // 正文提问和 ask_user 卡片是同一件事的两种形态，额度合起来算——否则模型会在两条路
+  // 之间横跳：卡片被拦就改用正文问，正文被拦再调一次卡片，用户看到的还是"一直在问"。
+  assert.match(boundaryBlock, /run\._askUserCount = \(run\._askUserCount \|\| 0\) \+ 1;/,
+    "正文提问不计入提问额度，卡片那边的下限就形同虚设");
+  assert.match(boundaryBlock, /_pushNudge\("askBudget"/);
   assert.match(boundaryBlock, /_clearNudges\(\)/);
   assert.match(boundaryBlock, /break;/);
   assert.doesNotMatch(boundaryBlock, /_agentQuestionNeedsWorkspaceEvidence|_pushNudge\("toolFirst"|codeVerifyNudges/,
@@ -23617,4 +23622,44 @@ test("命令不存在时指向 probe_env，不再推它一条条 run_cmd 试", (
   assert.match(SRC, /\*\*直接调 probe_env\*\*——一次拿到本机全部工具链的有无与版本/);
   // 提示词和工具结果必须同一口径，否则互相打架
   assert.doesNotMatch(SRC, /先用最小探测确认（command -v、ls node_modules\/\.bin/, "提示词还在推旧路子");
+});
+
+// ══ 反复提问要有下限 ═══════════════════════════════════════════════════════
+//
+// 用户实测反馈：任务没做完的时候它「一直不停问问问问」。
+// 根因是 ask_user 在这之前**完全没有次数限制**——它是个普通工具：弹卡片、阻塞最多 120 秒、
+// 返回答案、这一轮继续，所以可以在一轮里无限次调。四次就是用户对着卡片干等八分钟，
+// 而任务一步没往前走。提示词其实写得很好（"不要问任何你能合理推断的事"），
+// 但只有劝导没有下限。
+
+test("ask_user 有分级下限：第一次原样放行，第三次不再弹卡片", () => {
+  const branch = SRC.slice(SRC.indexOf('} else if (call.type === "askuser") {'));
+  const seg = branch.slice(0, 3000);
+  assert.match(seg, /const _auN = \(run\._askUserCount = \(run\._askUserCount \|\| 0\) \+ 1\);/);
+  // 第 3 次起不弹卡片——这不是惩罚，是替用户挡住那 120 秒干等
+  assert.match(seg, /if \(_auN >= 3 \|\| \(_auN >= 2 && _auBackToBack\)\)/);
+  assert.match(seg, /没有再弹卡片，因为每次提问都让用户对着界面干等最多两分钟/);
+  // 被拦下时必须给出真正可执行的下一步，而不是单纯拒绝
+  assert.match(seg, /把你的假设写进最终回答/);
+  assert.match(seg, /read_file \/ search \/ probe_env \/ git_log 都在手边/);
+  // 真的必须问的情况要留出口——写进最终回答，而不是再弹一张卡
+  assert.match(seg, /不做出假设就没法继续、或者做错了整个成果作废/);
+  // 第 2 次照常问，但要提醒
+  assert.match(seg, /这是本次任务第 2 次提问〕你已经问过一次并拿到了答案/);
+});
+
+test("连着问两次（中间没调别的工具）直接按上限处理", () => {
+  // 两次提问之间一个工具都没调，那不是在收集信息，是原地停摆
+  const branch = SRC.slice(SRC.indexOf('} else if (call.type === "askuser") {'), SRC.indexOf('} else if (call.type === "askuser") {') + 3000);
+  assert.match(branch, /const _auBackToBack = run\._lastToolWasAsk === true;/);
+  assert.match(branch, /你连着两次提问，中间一个工具都没调——那不是在收集信息，是原地停摆/);
+  // 标记要在每个非 askuser 工具入口清掉，否则永远判不出"连着"
+  assert.match(SRC, /if \(run && call && call\.type !== "askuser"\) run\._lastToolWasAsk = false;/);
+});
+
+test("正文提问和卡片提问合并计数，别让它在两条路之间横跳", () => {
+  // 否则卡片被拦就改用正文问、正文被拦再调卡片，用户看到的还是"一直在问"
+  assert.match(SRC, /run\._askUserCount = \(run\._askUserCount \|\| 0\) \+ 1;[\s\S]{0,200}if \(run\._askUserCount >= 3 && _live\(\)\)/);
+  assert.match(SRC, /卡片和正文提问合并计数/);
+  assert.match(SRC, /_pushNudge\("askBudget"/);
 });
