@@ -105,17 +105,20 @@ TARGET_DIR="target${TARGET:+/$TARGET}/release"
 # 8 个昨天留下的 rw 映像一直挂着，今天的构建直接打不出 DMG，而脚本还退出 0。
 #
 # 这一步只动 target/ 下**本产品自己**的临时读写映像，不碰任何别的磁盘映像。
+# 卸载：hdiutil detach 直接吃设备节点。用 grep -F 按**文件路径**筛，不要写嵌套的
+# awk + 命令替换 + heredoc——那套转义层数太多，第一版就是在这儿把整个脚本崩掉的
+# （日志只到"目标架构"就没了，而脚本照样 exit 0，构建根本没跑）。
 _stale_mounts=0
-while read -r _dev; do
+_rw_prefix="$PWD/target/release/bundle/macos/rw."
+while IFS= read -r _dev; do
   [ -n "$_dev" ] || continue
-  hdiutil detach "$_dev" -force >/dev/null 2>&1 && _stale_mounts=$((_stale_mounts + 1))
-done <<EOF
-$(hdiutil info 2>/dev/null | awk -v pat="target/release/bundle/macos/rw\\." '
-    $0 ~ /image-path/ && $0 ~ pat { p = 1 }
-    p && /^\/dev\/disk[0-9]+\t/ { print $1; p = 0 }')
-EOF
-_stale_files=$(ls target/release/bundle/macos/rw.*.dmg 2>/dev/null | wc -l | tr -d " ")
-rm -f target/release/bundle/macos/rw.*.dmg 2>/dev/null || true
+  if hdiutil detach "$_dev" -force >/dev/null 2>&1; then
+    _stale_mounts=$((_stale_mounts + 1))
+  fi
+done < <(hdiutil info 2>/dev/null | grep -F -A2 "$_rw_prefix" | grep -oE '^/dev/disk[0-9]+' || true)
+
+_stale_files=$(find target/release/bundle/macos -maxdepth 1 -name 'rw.*.dmg' 2>/dev/null | wc -l | tr -d ' ')
+find target/release/bundle/macos -maxdepth 1 -name 'rw.*.dmg' -delete 2>/dev/null || true
 if [ "$_stale_mounts" -gt 0 ] || [ "${_stale_files:-0}" -gt 0 ]; then
   echo "预清 DMG 残留：卸载 $_stale_mounts 个挂载、删除 ${_stale_files:-0} 个临时映像"
 fi
