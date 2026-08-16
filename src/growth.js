@@ -476,7 +476,7 @@ export function renderPanel(body, ctx = {}) {
       wrap.appendChild(pt);
 
       const box = document.createElement("div");
-      box.className = "growth-project";
+      box.className = "growth-project growth-card";
       const intro = document.createElement("p");
       intro.className = "growth-project__intro";
       if (facts.length) {
@@ -518,31 +518,54 @@ export function renderPanel(body, ctx = {}) {
     ct.textContent = "教学偏好";
     wrap.appendChild(ct);
 
-    const ctl1 = document.createElement("div");
-    ctl1.className = "growth-ctl";
-    ctl1.innerHTML = `<label for="growth-explain">AI 讲解密度</label>`;
-    const sel = document.createElement("select");
-    sel.id = "growth-explain";
-    for (const [val, lbl] of [["auto", "自动（随能力渐隐）"], ["rich", "总是详尽"], ["min", "总是极简"]]) {
-      const o = document.createElement("option");
-      o.value = val; o.textContent = lbl;
-      if (state.prefs.explain === val) o.selected = true;
-      sel.appendChild(o);
-    }
-    sel.addEventListener("change", () => { state.prefs.explain = sel.value; save(); });
-    ctl1.appendChild(sel);
-    wrap.appendChild(ctl1);
+    // 两行装进一张卡，用和设置页一样的"左标题右控件"结构——原来是两行裸挂在底色上的
+    // 控件，同一页里"有卡"和"没卡"两种形态混着出现。
+    const ctlCard = document.createElement("div");
+    ctlCard.className = "growth-card";
 
+    const row1 = document.createElement("div");
+    row1.className = "growth-row";
+    row1.innerHTML = `<div class="growth-row__meta"><span class="growth-row__label">AI 讲解密度</span>`
+      + `<span class="growth-row__hint">能力涨上去之后，讲解会自动收敛</span></div>`;
+    const ctl1 = document.createElement("div");
+    ctl1.className = "growth-row__control";
+    const EXPLAIN = [["auto", "自动（随能力渐隐）"], ["rich", "总是详尽"], ["min", "总是极简"]];
+    if (typeof ctx.buildSelect === "function") {
+      ctl1.appendChild(ctx.buildSelect(EXPLAIN, state.prefs.explain, (v) => {
+        state.prefs.explain = String(v);
+        save();
+      }));
+    } else {
+      // 宿主没把构造函数递进来时的退路。正常路径不会走到这里。
+      const sel = document.createElement("select");
+      for (const [val, lbl] of EXPLAIN) {
+        const o = document.createElement("option");
+        o.value = val; o.textContent = lbl;
+        if (state.prefs.explain === val) o.selected = true;
+        sel.appendChild(o);
+      }
+      sel.addEventListener("change", () => { state.prefs.explain = sel.value; save(); });
+      ctl1.appendChild(sel);
+    }
+    row1.appendChild(ctl1);
+    ctlCard.appendChild(row1);
+
+    const row2 = document.createElement("div");
+    row2.className = "growth-row";
+    row2.innerHTML = `<div class="growth-row__meta"><span class="growth-row__label">挑战模式</span>`
+      + `<span class="growth-row__hint">难的地方让我先自己想，AI 再揭晓（练得更扎实）</span></div>`;
     const ctl2 = document.createElement("div");
-    ctl2.className = "growth-ctl";
+    ctl2.className = "growth-row__control";
     const sw = document.createElement("label");
     sw.className = "growth-switch";
-    sw.innerHTML = `<input type="checkbox"><span>挑战模式 — 难的地方让我先自己想，AI 再揭晓（练得更扎实）</span>`;
+    sw.innerHTML = `<input type="checkbox">`;
     const cb = sw.querySelector("input");
     cb.checked = !!state.prefs.challenge;
     cb.addEventListener("change", () => { state.prefs.challenge = cb.checked; save(); });
     ctl2.appendChild(sw);
-    wrap.appendChild(ctl2);
+    row2.appendChild(ctl2);
+    ctlCard.appendChild(row2);
+    wrap.appendChild(ctlCard);
 
     // stats
     const stt = document.createElement("div");
@@ -552,6 +575,8 @@ export function renderPanel(body, ctx = {}) {
 
     const s = state.stats;
     const blindRate = s.aiEdits ? Math.round((s.blind / s.aiEdits) * 100) : 0;
+    const statCard = document.createElement("div");
+    statCard.className = "growth-card";
     const grid = document.createElement("div");
     grid.className = "growth-stats";
     const cells = [
@@ -570,7 +595,8 @@ export function renderPanel(body, ctx = {}) {
       cell.querySelector("span").textContent = lbl;
       grid.appendChild(cell);
     }
-    wrap.appendChild(grid);
+    statCard.appendChild(grid);
+    wrap.appendChild(statCard);
 
     const reset = document.createElement("button");
     reset.className = "growth-reset";

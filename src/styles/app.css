@@ -14999,7 +14999,8 @@ body.tree-selecting, body.tree-selecting * { user-select: none !important; -webk
 .growth-profile__c span { font-size: 11.5px; color: var(--feature-dim, var(--text-dim)); }
 .growth-profile__line {
   margin: 0;
-  padding: 11px 14px;
+  padding: 12px 14px;
+  text-align: center;
   font-size: 12px;
   line-height: 1.5;
   color: var(--feature-dim, var(--text-dim));
@@ -15014,13 +15015,16 @@ body.tree-selecting, body.tree-selecting * { user-select: none !important; -webk
   border-radius: var(--feature-radius-card, 12px);
   overflow: hidden;
 }
+/* 五列固定：名字 / 进度条 / 迁移徽标 / 百分比 / 加减。
+   原来右侧三件东西挤在一个 auto 列里，宽度随内容变——"可迁移 · 14" 比 "8 个项目" 宽，
+   于是每一行的百分比和 ± 都错开一点点，竖着看是锯齿。 */
 .growth-skill {
   display: grid;
-  grid-template-columns: minmax(190px, 1.1fr) minmax(120px, 1.6fr) auto;
-  gap: 14px;
+  grid-template-columns: minmax(170px, 1fr) minmax(90px, 1.4fr) 84px 78px auto;
+  gap: 12px;
   align-items: center;
   margin: 0;
-  padding: 12px 14px;
+  padding: 13px 14px;
 }
 .growth-skill + .growth-skill { border-top: 1px solid var(--feature-border, var(--line)); }
 .growth-skill__name { font-size: 13.5px; font-weight: 550; color: var(--feature-text, var(--text)); }
@@ -15047,9 +15051,8 @@ body.tree-selecting, body.tree-selecting * { user-select: none !important; -webk
   border-radius: 3px;
   background: var(--feature-blue, var(--accent));
 }
-.growth-skill__right { display: flex; align-items: center; gap: 8px; }
+.growth-skill__right { display: contents; }
 .growth-skill__pct {
-  min-width: 74px;
   text-align: right;
   font-size: 12px;
   font-variant-numeric: tabular-nums;
@@ -15058,7 +15061,9 @@ body.tree-selecting, body.tree-selecting * { user-select: none !important; -webk
 /* 「可迁移」徽标：走语义令牌，不再写死 #22c55e / #3fb950——那两个色在浅色底上
    对比度只有 2.4:1，而且深色主题下不跟着变。 */
 .growth-xfer {
+  justify-self: start;
   padding: 2px 7px;
+  white-space: nowrap;
   font-size: 10.5px;
   border-radius: 999px;
   color: var(--feature-dim, var(--text-dim));
@@ -15070,6 +15075,7 @@ body.tree-selecting, body.tree-selecting * { user-select: none !important; -webk
   font-weight: 600;
 }
 /* 纠正按钮：和数字步进器同一副长相。 */
+.growth-nudge { margin-left: 6px; }
 .growth-nudge {
   width: 26px;
   height: 26px;
@@ -15151,3 +15157,44 @@ body.tree-selecting, body.tree-selecting * { user-select: none !important; -webk
 }
 .growth-project__list li + li { border-top: 1px solid var(--feature-border, var(--line)); }
 .growth-project__more { margin-top: 8px; font-size: 11.5px; color: var(--feature-dim, var(--text-dim)); }
+
+/* 成长页下半部分：项目理解 / 教学偏好 / 行为信号，统一成和上面一样的卡。
+   原来这三块是裸挂在底色上的控件和按钮，同一页里"有卡"和"没卡"两种形态混着出现。 */
+.growth-card {
+  background: var(--feature-card, var(--panel-2));
+  border: 1px solid var(--feature-border, var(--line));
+  border-radius: var(--feature-radius-card, 12px);
+  overflow: hidden;
+}
+.growth-card.growth-project { padding: 14px; }
+.growth-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 20px;
+  min-height: 54px;
+  padding: 12px 14px;
+}
+.growth-row + .growth-row { border-top: 1px solid var(--feature-border, var(--line)); }
+.growth-row__meta { display: flex; flex-direction: column; gap: 3px; flex: 1 1 auto; min-width: 0; }
+.growth-row__label { font-size: 13.5px; font-weight: 550; color: var(--feature-text, var(--text)); }
+.growth-row__hint { font-size: 12px; line-height: 1.45; color: var(--feature-dim, var(--text-dim)); }
+.growth-row__control { flex: 0 0 220px; display: flex; align-items: center; justify-content: flex-end; }
+.growth-row__control .growth-switch { flex: 0 0 42px; }
+/* 行为信号：六格并进一张卡，用网格线分隔，而不是六个各自描边的小盒子。 */
+.growth-stats {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+  gap: 1px;
+  margin: 0;
+  background: var(--feature-border, var(--line));
+}
+.growth-stat {
+  padding: 14px 12px;
+  text-align: center;
+  background: var(--feature-card, var(--panel-2));
+  border: 0;
+  border-radius: 0;
+}
+.growth-stat b { display: block; font-size: 19px; font-weight: 600; font-variant-numeric: tabular-nums; }
+.growth-stat span { font-size: 11.5px; color: var(--feature-dim, var(--text-dim)); }
