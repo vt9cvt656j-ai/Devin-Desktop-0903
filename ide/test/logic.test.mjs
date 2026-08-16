@@ -2195,20 +2195,38 @@ test("advanced tools panel exposes Settings Growth Adaptive and Shortcuts", () =
   assert.match(renderersBlock, /shortcuts:\s*renderShortcutsTool/);
   assert.doesNotMatch(renderersBlock, /marketplace/,
     "扩展市场不该有渲染器");
-  assert.match(APP_CSS, /\.feature-panel\s*\{[\s\S]{0,260}--feature-backdrop:\s*rgba\(255,\s*255,\s*255,\s*0\.55\);[\s\S]{0,260}--feature-sheet:\s*#fff;[\s\S]{0,260}--feature-bg:\s*#fff;[\s\S]{0,260}--feature-rail:\s*#fff;[\s\S]{0,260}--feature-blue:\s*#1a73e8;/,
-    "Advanced Tools light theme should use white Google-style backdrop, sheet, body, and rail surfaces with blue tokens only for accents");
-  assert.match(APP_CSS, /:root\[data-theme="dark"\] \.feature-panel\s*\{[\s\S]{0,260}--feature-sheet:\s*#18181b;[\s\S]{0,260}--feature-header:\s*#18181b;[\s\S]{0,260}--feature-blue:\s*#8ab4f8;/,
-    "Advanced Tools needs explicit dark-mode tokens");
+  // 面板必须自带一整套令牌（深浅各一份）。它在自己的子树里把全局令牌重映射了一遍，
+  // 少一份就意味着某个主题下面板内所有内容都跟着外面的配色走，观感立刻散架。
+  assert.match(APP_CSS, /\.feature-panel\s*\{[\s\S]{0,400}--feature-backdrop:[\s\S]{0,400}--feature-rail:[\s\S]{0,400}--feature-sel:/,
+    "浅色令牌不全——侧栏底色和选中色都得有自己的令牌");
+  assert.match(APP_CSS, /:root\[data-theme="dark"\] \.feature-panel\s*\{[\s\S]{0,260}--feature-sheet:\s*#18181b;[\s\S]{0,700}--feature-sel:/,
+    "深色令牌不全");
   assert.match(APP_CSS, /\.feature-panel__main\s*\{[^}]*grid-template-columns:\s*236px minmax\(0,\s*1fr\);/,
     "Advanced Tools should use a JetBrains-style left navigation rail");
-  assert.match(APP_CSS, /\.feature-tab\s*\{[^}]*height:\s*48px;[\s\S]*font-size:\s*14\.5px;[\s\S]*font-weight:\s*680;/,
-    "Advanced Tools sidebar buttons should be large enough to feel intentional");
-  assert.match(APP_CSS, /\.feature-tab\.is-active\s*\{[^}]*background:\s*var\(--feature-active\);[\s\S]*border-color:\s*transparent;[\s\S]*box-shadow:\s*0 1px 2px/,
-    "active Advanced Tools tab should use a Google-style filled pill without a left blue stripe");
+  // 侧栏选中态是**柔和灰底**，不是蓝块。用户明确否掉过蓝色那版。
+  // 断言背景走 --feature-sel 而不是 --feature-active：后者是焦点/选中语义色，
+  // 输入框焦点环、快捷键徽标、主题卡都在吃它，拿它当侧栏底色会一次抹掉整套焦点语义。
+  assert.match(APP_CSS, /\.feature-tab\.is-active\s*\{[^}]*background:\s*var\(--feature-sel\)/,
+    "侧栏选中态又变回蓝块了");
+  assert.doesNotMatch(APP_CSS, /\.feature-tab\.is-active\s*\{[^}]*color:\s*var\(--feature-blue\)/,
+    "选中项的文字不该是蓝的——整条侧栏只有一个选中项，位置本身就说明了它被选中");
   assert.doesNotMatch(APP_CSS, /\.feature-tab\.is-active\s*\{[^}]*inset 3px 0 0 var\(--feature-blue\)/,
     "active Advanced Tools tab must not render the ugly left blue edge");
-  assert.match(APP_CSS, /\.feature-tab \.ic\s*\{[^}]*width:\s*21px;[\s\S]*height:\s*21px;/,
-    "Advanced Tools sidebar icons should not be tiny");
+  // 侧栏分组小标题：这是"七个平级按钮"变成"三组"的那一步。
+  assert.match(APP_CSS, /\.feature-tab__group\s*\{/, "侧栏分组标题的样式没了");
+  assert.match(SRC, /head\.className = "feature-tab__group"/, "渲染时没画分组标题");
+  assert.doesNotMatch(APP_CSS, /\.feature-tab__sep\s*\{/,
+    "那条分隔线该删干净——它取的 var(--border) 全仓库没定义，而且插入条件永不成立");
+  // 一组设置拼成一张卡：默认行不带圆角、上下无边框，首末行各圆两角，行间用发丝线。
+  // 少任何一条都会退回"一堆独立小卡"那个形态。
+  assert.match(APP_CSS, /\.settings-row\s*\{[^}]*border-radius:\s*0;/,
+    "设置行又变回各自独立的圆角卡了");
+  assert.match(APP_CSS, /\.settings-group > \.settings-row:first-of-type\s*\{[^}]*border-radius:/,
+    "首行没圆上两角，卡片顶部是方的");
+  assert.match(APP_CSS, /\.settings-group > \.settings-row:last-child\s*\{[^}]*border-radius:/,
+    "末行没圆下两角");
+  assert.match(APP_CSS, /\.settings-group > \.settings-row \+ \.settings-row::before\s*\{/,
+    "行间没有发丝线，多行会糊成一坨");
   assert.match(APP_CSS, /\.settings-row\s*\{[^}]*min-height:\s*54px;[\s\S]*background:\s*var\(--feature-card/,
     "Settings rows should use the larger Google/JB card surface");
   assert.match(APP_CSS, /textarea\.settings-input\s*\{[^}]*min-height:\s*116px;[\s\S]*resize:\s*vertical;/,
