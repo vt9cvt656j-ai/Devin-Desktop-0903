@@ -103,6 +103,7 @@ type Conn = {
   per_call_micro_usd?: number;
   model_names?: unknown;
   model_prices?: unknown;
+  model_caps?: unknown;
   model_billing?: unknown;
   protocol?: string;
   /** 显示分组：把这条线路的模型挂在另一条线路的名字下。只影响 IDE 选择器上的标题。 */
@@ -832,13 +833,67 @@ function Groups({
 }
 
 /** One editable line of the enabled-model list. Four parallel maps flattened into one row. */
-type Row = { id: string; on: boolean; name: string; pin: string; pout: string; mode: string; fee: string };
+/** 网关实时抓到的模型能力（GET /api/admin/models/:id/available 的 capabilities）。 */
+type Caps = {
+  source: "live" | "static";
+  contexts?: number[];
+  max_output?: number | null;
+  efforts?: string[];
+  default_effort?: string | null;
+  input_price?: number | null;
+  output_price?: number | null;
+  cache_read_price?: number | null;
+  cache_write_price?: number | null;
+  accepts_image?: boolean | null;
+  generates_image?: boolean | null;
+};
+type Row = { id: string; on: boolean; name: string; pin: string; pout: string; mode: string; fee: string; ctx: string; caps?: Caps };
+
+/** 把一列上下文档位写成人看的样子：1000000 → 1M，204800 → 200K。 */
+function fmtCtx(n: number): string {
+  if (n >= 1_000_000) return `${Math.round((n / 1_000_000) * 10) / 10}M`;
+  if (n >= 1000) return `${Math.round(n / 1000)}K`;
+  return String(n);
+}
+
+/**
+ * 一行实时能力摘要，跟在模型 id 下面。
+ *
+ * 这些以前全靠管理员自己查文档手填，填错没人知道、填漏就掉到"连接兜底价"。实测硬编码
+ * 那张表 13 款里错了 6 款（deepseek-v4-flash 128K vs 真实 1.05M），所以让它直接可见
+ * 比让人去核对靠谱。留空价格框即用这里显示的实时价。
+ */
+function CapsLine({ caps }: { caps?: Caps }) {
+  if (!caps) return null;
+  if (caps.source !== "live") {
+    return (
+      <span className="text-[10px] text-muted-foreground">
+        实时目录未收录 · 价格与上下文需手填
+      </span>
+    );
+  }
+  const bits: string[] = [];
+  if (caps.contexts?.length) {
+    bits.push(`上下文 ${caps.contexts.map(fmtCtx).join(" / ")}`);
+  }
+  if (caps.max_output) bits.push(`出 ${fmtCtx(caps.max_output)}`);
+  if (caps.input_price != null && caps.output_price != null) {
+    bits.push(`$${caps.input_price}/$${caps.output_price}`);
+  }
+  if (caps.cache_read_price != null) bits.push(`缓存读 $${caps.cache_read_price}`);
+  // 空数组是有意义的答案：这个模型不吃思考档位（实测 glm-5 就是），不是"没查到"。
+  bits.push(caps.efforts?.length ? `思考 ${caps.efforts.join("/")}` : "无思考档位");
+  if (caps.accepts_image) bits.push("可看图");
+  if (caps.generates_image) bits.push("出图");
+  return <span className="text-[10px] text-muted-foreground">{bits.join(" · ")}</span>;
+}
 
 function initialRows(c: Conn | null): Row[] {
   if (!c) return [];
   const names = asMap<string>(c.model_names);
   const prices = asMap<PriceOverride>(c.model_prices);
   const billing = asMap<BillingOverride>(c.model_billing);
+  const caps = asMap<{ contexts?: number[] }>(c.model_caps);
   return allowedIds(c).map((id) => {
     const p = prices[id] || {};
     const b = billing[id] || {};
@@ -853,6 +908,7 @@ function initialRows(c: Conn | null): Row[] {
       pout: p.out ? String(p.out) : "",
       mode: ovMode(b),
       fee: micro > 0 ? String(micro / 1_000_000) : "",
+      ctx: (caps[id]?.contexts || []).join(","),
     };
   });
 }
@@ -901,10 +957,14 @@ function ConnectionDialog({
     setFetching(true);
     setFormErr("");
     try {
-      const r = await api.get<{ models?: string[]; enabled?: string[] }>(
-        `/api/admin/models/${conn.id}/available`,
-      );
+      const r = await api.get<{
+        models?: string[];
+        enabled?: string[];
+        capabilities?: Record<string, Caps>;
+        catalog_size?: number;
+      }>(`/api/admin/models/${conn.id}/available`);
       const stored = new Set(r.enabled || []);
+      const caps = r.capabilities || {};
       setRows((prev) => {
         const seen = new Set(prev.map((x) => x.id));
         const added = (r.models || [])
@@ -917,10 +977,19 @@ function ConnectionDialog({
             pout: "",
             mode: "",
             fee: "",
+            ctx: "",
+            caps: caps[id],
           }));
-        return [...prev, ...added];
+        // 能力要贴到**已存在**的行上，不只新增的：常见操作是重复点"拉取"来刷新能力，
+        // 只给新增行赋值的话，已经开着的模型永远看不到实时数据。
+        return [...prev.map((x) => (caps[x.id] ? { ...x, caps: caps[x.id] } : x)), ...added];
       });
-      setHint(`供应商返回 ${(r.models || []).length} 个模型`);
+      const liveCount = Object.values(caps).filter((c) => c?.source === "live").length;
+      setHint(
+        (r.catalog_size ?? 0) > 0
+          ? `供应商返回 ${(r.models || []).length} 个模型，其中 ${liveCount} 个有实时能力数据（上下文/思考档位/价格自动带入，留空即用实时值）`
+          : `供应商返回 ${(r.models || []).length} 个模型。能力目录暂不可用（网关刚启动或目录源不可达），价格请手填`,
+      );
     } catch (e) {
       setFormErr(e instanceof Error ? e.message : "拉取失败");
     } finally {
@@ -979,6 +1048,18 @@ function ConnectionDialog({
           active,
           protocol,
           enabled_models: on.map((r) => r.id),
+          // 手填的上下文兜底。只对实时目录没收录的模型有意义——目录有的时候网关不看这里。
+          model_caps: Object.fromEntries(
+            on
+              .map((r) => {
+                const list = r.ctx
+                  .split(/[,，\s]+/)
+                  .map((x) => Math.round(Number(x)))
+                  .filter((n) => Number.isFinite(n) && n > 0);
+                return list.length ? [r.id, { contexts: list }] : null;
+              })
+              .filter(Boolean) as [string, { contexts: number[] }][],
+          ),
           // These three replace the whole stored map, so only keep entries for models that are
           // still exposed — config for a model you unchecked is dead weight.
           model_names: Object.fromEntries(on.filter((r) => r.name.trim()).map((r) => [r.id, r.name.trim()])),
@@ -1175,8 +1256,11 @@ function ConnectionDialog({
                       aria-label={`开放 ${r.id}`}
                       onChange={(e) => patch(r.id, { on: e.target.checked })}
                     />
-                    <span className="min-w-0 flex-1 truncate font-mono text-xs" title={r.id}>
-                      {r.id}
+                    <span className="flex min-w-0 flex-1 flex-col leading-tight">
+                      <span className="truncate font-mono text-xs" title={r.id}>
+                        {r.id}
+                      </span>
+                      <CapsLine caps={r.caps} />
                     </span>
                     <Input
                       className="h-9 w-28 shrink-0 px-2.5 text-sm"
@@ -1191,7 +1275,8 @@ function ConnectionDialog({
                       min="0"
                       step="0.01"
                       value={r.pin}
-                      placeholder="入价"
+                      placeholder={r.caps?.input_price != null ? String(r.caps.input_price) : "入价"}
+                      title={r.caps?.input_price != null ? `留空即用实时价 $${r.caps.input_price}/1M` : undefined}
                       aria-label={`${r.id} 输入价`}
                       onChange={(e) => patch(r.id, { pin: e.target.value })}
                     />
@@ -1201,10 +1286,21 @@ function ConnectionDialog({
                       min="0"
                       step="0.01"
                       value={r.pout}
-                      placeholder="出价"
+                      placeholder={r.caps?.output_price != null ? String(r.caps.output_price) : "出价"}
+                      title={r.caps?.output_price != null ? `留空即用实时价 $${r.caps.output_price}/1M` : undefined}
                       aria-label={`${r.id} 输出价`}
                       onChange={(e) => patch(r.id, { pout: e.target.value })}
                     />
+                    {r.caps?.source !== "live" && (
+                      <Input
+                        className="h-9 w-36 shrink-0 px-2.5 text-sm"
+                        value={r.ctx}
+                        placeholder="上下文兜底"
+                        aria-label={`${r.id} 上下文兜底`}
+                        title={"实时目录里没有这一款，可在这里手填上下文档位（逗号分隔，如 128000,204800）。\n目录收录之后会自动改用目录的值，这里填的就不再生效。"}
+                        onChange={(e) => patch(r.id, { ctx: e.target.value })}
+                      />
+                    )}
                     <div className="w-28 shrink-0">
                       <Select
                         className="h-9 pl-2.5 pr-8 text-sm"

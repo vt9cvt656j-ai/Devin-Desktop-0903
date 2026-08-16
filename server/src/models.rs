@@ -708,7 +708,7 @@ fn admin_only(claims: &Claims) -> ApiResult<()> {
 /// Normalize an OpenAI-compatible base URL: ensure it ends with a `/v1` segment
 /// (so `https://gateway.example` becomes `https://gateway.example/v1`). If the
 /// caller already included `/v1` (or any `/v1/...`), leave it untouched.
-fn api_base(base: &str) -> String {
+pub(crate) fn api_base(base: &str) -> String {
     let b = base.trim().trim_end_matches('/');
     if b.ends_with("/v1") || b.contains("/v1/") {
         b.to_string()
@@ -764,6 +764,9 @@ pub struct Model {
     /// that model; empty → fall back to official, then the connection-level input/output
     /// price. Lets the admin price each enabled model individually. (倍率 still applies on top.)
     pub model_prices: serde_json::Value,
+    /// 后台按模型手填的能力兜底：{ "model-id": { "contexts": [...], "max_output": n } }。
+    /// **只在实时目录没有这个模型时生效**——目录是权威，这里是运维给目录漏网之鱼补的。
+    pub model_caps: serde_json::Value,
     /// Per-model billing override, same shape as `model_prices`:
     ///   { "<model_id>": { "mode": "rate"|"per_call"|"free", "per_call_cents": N } }
     /// A `models` row is a CONNECTION holding many `enabled_models`, so billing_mode /
@@ -778,6 +781,29 @@ pub struct Model {
     /// 从未被验证过的推断，所以做成每条线路可配，而不是继续写死在 match 里。
     #[sqlx(default)]
     pub effort_passthrough: bool,
+}
+
+/// 后台按模型手填的能力兜底（contexts 升序去重、最多 5 档；max_output）。
+///
+/// 实时目录没收录时才轮到它。空 = 运维也没填，那就真的是"不知道"——
+/// 这比代码里编一个数诚实，也比编一个数好查。
+fn model_caps_override(model_caps: &serde_json::Value, model_id: &str) -> (Vec<i64>, Option<i64>) {
+    let Some(entry) = model_caps.get(model_id) else {
+        return (Vec::new(), None);
+    };
+    let mut contexts: Vec<i64> = entry
+        .get("contexts")
+        .and_then(|v| v.as_array())
+        .map(|a| a.iter().filter_map(|x| x.as_i64()).filter(|n| *n > 0).collect())
+        .unwrap_or_default();
+    contexts.sort_unstable();
+    contexts.dedup();
+    contexts.truncate(5); // 和实时侧同一个上限，UI 上不会因为来源不同而突然冒出七八档
+    let max_output = entry
+        .get("max_output")
+        .and_then(|v| v.as_i64())
+        .filter(|n| *n > 0);
+    (contexts, max_output)
 }
 
 /// Per-MODEL (input, output) USD/1M price override from a connection's model_prices map.
@@ -864,6 +890,12 @@ fn route_supports_prompt_cache(model: &Model) -> bool {
 /// gpt-4o-image, etc. Guarantees image calls never fall through to $0 token billing.
 /// Text/vision models never contain these substrings, so it won't misfire on them.
 fn is_image_gen_model(model_id: &str) -> bool {
+    // 实时优先：目录里的 output_modalities 含 image 就是画图模型，不用从名字猜。
+    // 名字表会把 `claude-3-image-analysis` 这类"看图但不画图"的误判成画图模型
+    // （它含 `-image`），而真正的画图模型只要命名里不带这几个词就漏判。
+    if let Some(generates) = crate::model_catalog::generates_image(model_id) {
+        return generates;
+    }
     let m = model_id.to_lowercase();
     m.contains("gpt-image")
         || m.contains("dall-e")
@@ -965,7 +997,7 @@ const MODEL_KEY_CTX: &str = "models.api_key";
 ///
 /// 解不开（密钥没配却是密文、或密钥不对）返回空串：空 Bearer 会让上游干净地回 401，
 /// 好过把一段 `fc1:...` 当令牌发出去，也好过 panic 掉一条不相关的请求。
-fn model_key(stored: &str) -> String {
+pub(crate) fn model_key(stored: &str) -> String {
     crate::field_crypto::decrypt(stored, MODEL_KEY_CTX).unwrap_or_default()
 }
 
@@ -1470,6 +1502,7 @@ pub async fn admin_list(
                 "per_call_micro_usd": m.per_call_micro_usd,
                 "model_names": m.model_names,
                 "model_prices": m.model_prices,
+                "model_caps": m.model_caps,
                 "model_billing": m.model_billing,
                 "protocol": m.protocol,
                 "effort_passthrough": m.effort_passthrough,
@@ -1636,13 +1669,23 @@ pub async fn admin_model_estimate(
         ));
     };
 
+    // 缓存价三级：管理员手填 > 实时目录的真实价 > 按输入价推算。
+    //
+    // 推算（×0.1 / ×1.25）以前是唯一来源，实测偏得很远：deepseek-v4-flash 缓存读真实
+    // 0.0123 而推算 0.0061、glm-5 真实 0.12 而推算 0.06——都少算一半。少算缓存读价意味着
+    // 按更便宜的价估成本、实际多付，而且账面上完全看不出来。
+    let live_prices = crate::model_catalog::lookup(model_id);
     let cache_read_price = if model.cache_read_price > 0.0 {
         model.cache_read_price
+    } else if let Some(p) = live_prices.as_ref().and_then(|e| e.cache_read_price) {
+        p
     } else {
         input_price * CACHE_READ_FACTOR
     };
     let cache_creation_price = if model.cache_create_price > 0.0 {
         model.cache_create_price
+    } else if let Some(p) = live_prices.as_ref().and_then(|e| e.cache_write_price) {
+        p
     } else {
         input_price * CACHE_WRITE_FACTOR
     };
@@ -1937,7 +1980,45 @@ pub async fn admin_available(
                 .collect()
         })
         .unwrap_or_default();
-    Ok(Json(json!({ "models": ids, "enabled": m.enabled_models })))
+    // 每个模型的**实时能力**，和 id 一起回给后台。
+    //
+    // 以前这里只回 id，于是后台配一条线路时，上下文、价格、缓存价、思考档位全靠管理员
+    // 自己查文档手填——填错了没人知道，填漏了就掉到"连接兜底价"。而这些值网关这边已经
+    // 实时抓着了（model_catalog），不给后台看纯粹是浪费。
+    //
+    // `source`: "live" = 实时目录里有这一款；"static" = 目录没收录，仍走硬编码兜底，
+    // 后台据此提示管理员"这一款需要你自己填价"。
+    let capabilities: serde_json::Map<String, serde_json::Value> = ids
+        .iter()
+        .map(|id| {
+            let entry = crate::model_catalog::lookup(id);
+            let value = match &entry {
+                Some(e) => json!({
+                    "source": "live",
+                    "contexts": e.contexts,
+                    "max_output": e.max_output,
+                    "efforts": e.efforts,
+                    "default_effort": e.default_effort,
+                    "input_price": e.input_price,
+                    "output_price": e.output_price,
+                    "cache_read_price": e.cache_read_price,
+                    "cache_write_price": e.cache_write_price,
+                    "accepts_image": crate::model_catalog::accepts_image(id),
+                    "generates_image": crate::model_catalog::generates_image(id),
+                }),
+                None => json!({ "source": "static" }),
+            };
+            (id.clone(), value)
+        })
+        .collect();
+    Ok(Json(json!({
+        "models": ids,
+        "enabled": m.enabled_models,
+        "capabilities": capabilities,
+        // 目录整体抓到了多少条。0 = 这台机器还没抓到过（刚启动/目录源不可达），
+        // 后台该显示"能力数据暂不可用"而不是让管理员以为这些模型都没有能力信息。
+        "catalog_size": crate::model_catalog::len(),
+    })))
 }
 
 #[derive(Deserialize)]
@@ -1962,6 +2043,8 @@ pub struct UpdateReq {
     pub model_names: Option<serde_json::Value>,
     /// { raw_model_id → {"in", "out"} } per-model price overrides. Replaces the whole map.
     pub model_prices: Option<serde_json::Value>,
+    /// { raw_model_id → {"contexts":[...],"max_output":n} }：目录没收录时的手填兜底。
+    pub model_caps: Option<serde_json::Value>,
     pub model_billing: Option<serde_json::Value>,
     /// "anthropic" | "openai" — upstream wire protocol for this connection.
     pub protocol: Option<String>,
@@ -2088,7 +2171,7 @@ pub async fn admin_update(
     };
     // 没传就保持原值——和上面 protocol 一样的语义，别让一次只改价格的保存把开关关掉。
     let effort_passthrough = req.effort_passthrough.unwrap_or(m.effort_passthrough);
-    sqlx::query("UPDATE models SET label=$1, provider=$2, base_url=$3, api_key=$4, rate=$5, active=$6, sort=$7, enabled_models=$8, input_price=$9, output_price=$10, description=$11, billing_mode=$12, per_call_cents=$13, model_names=$14, cache_read_price=$15, cache_create_price=$16, model_prices=$17, protocol=$18, model_billing=$20, per_call_micro_usd=$21, effort_passthrough=$22 WHERE id=$19")
+    sqlx::query("UPDATE models SET label=$1, provider=$2, base_url=$3, api_key=$4, rate=$5, active=$6, sort=$7, enabled_models=$8, input_price=$9, output_price=$10, description=$11, billing_mode=$12, per_call_cents=$13, model_names=$14, cache_read_price=$15, cache_create_price=$16, model_prices=$17, protocol=$18, model_billing=$20, per_call_micro_usd=$21, effort_passthrough=$22, model_caps=$23 WHERE id=$19")
         .bind(&label)
         .bind(&provider)
         .bind(&base_url)
@@ -2111,6 +2194,7 @@ pub async fn admin_update(
         .bind(&model_billing)
         .bind(per_call_micro_usd)
         .bind(effort_passthrough)
+        .bind(req.model_caps.clone().unwrap_or_else(|| m.model_caps.clone()))
         .execute(&state.db)
         .await?;
     Ok(Json(json!({ "ok": true })))
@@ -2158,6 +2242,23 @@ pub async fn list_for_client(State(state): State<AppState>) -> ApiResult<Json<se
             } else {
                 (0.0, 0.0, "unset")
             };
+            // 上下文档位：实时目录 → 后台手填 → 空。在 json! 外面算好——宏里放不下块表达式。
+            let context_windows: Vec<serde_json::Value> = {
+                let mut tiers = official_contexts(&mid);
+                if tiers.is_empty() {
+                    // 目录漏网的模型（glm-5.3 这类，OpenRouter 里只有 5.1/5.2/5-turbo）
+                    // 走运维在后台填的那份兜底。
+                    tiers = model_caps_override(&m.model_caps, &mid)
+                        .0
+                        .into_iter()
+                        .map(|t| (t, context_beta_header(&mid, t)))
+                        .collect();
+                }
+                tiers
+                    .into_iter()
+                    .map(|(tokens, beta)| json!({ "tokens": tokens, "beta": beta }))
+                    .collect()
+            };
             list.push(json!({
                 // Which route this model came from. Requests are resolved by model id
                 // (chat_completions), not by this — it is here so a caller can tell two
@@ -2179,17 +2280,43 @@ pub async fn list_for_client(State(state): State<AppState>) -> ApiResult<Json<se
                 "description": m.description,
                 // 每模型真实上下文窗口（tokens）：客户端上下文表和棘轮压缩阈值都靠它，
                 // 不下发就只能靠客户端猜（GPT-5 曾被猜成 128K，白扔 3/4 窗口）。
-                "context_window": official_context(&mid),
+                // 实时目录 → 后台手填 → 空。三级都拿不到就是明确的"不知道"，
+                // 客户端按未知处理，绝不由网关编一个数。
+                "context_window": official_context(&mid)
+                    .or_else(|| model_caps_override(&m.model_caps, &mid).0.first().copied()),
                 // Full native list so the client can show every window a model really offers,
                 // instead of collapsing a genuine choice down to the default.
                 // Output is the second half of a model's shape and was never sent, so the client
                 // had no ceiling to budget against and the gateway clamped every model to one
                 // number. null means unknown for this route — the client must not invent one.
-                "max_output_tokens": official_max_output(&mid),
-                "context_windows": official_contexts(&mid)
-                    .into_iter()
-                    .map(|(tokens, beta)| serde_json::json!({ "tokens": tokens, "beta": beta }))
-                    .collect::<Vec<_>>(),
+                "max_output_tokens": official_max_output(&mid)
+                    .or_else(|| model_caps_override(&m.model_caps, &mid).1),
+                "context_windows": context_windows,
+                // 这个模型真正支持的推理档位，实时抓的。
+                //
+                // **空数组是有意义的答案，不是"没查到"**：实测 glm-5 根本不吃档位这个概念，
+                // deepseek-v4-flash 只支持 xhigh/high。客户端据此决定给不给这个模型显示档位
+                // 选择器——以前它对所有模型一律显示 low/medium/high/max，于是用户选中一个
+                // 该模型不支持的档位，上游要么拒要么静默降级，两种都没有任何提示。
+                //
+                // 目录里没有这个模型（中转商私有命名）时同样是空数组，客户端按"未知"处理，
+                // 保持它原来的档位 UI，不要凭空断言这个模型不支持推理。
+                "supported_efforts": crate::model_catalog::lookup(&mid)
+                    .map(|e| e.efforts)
+                    .unwrap_or_default(),
+                "default_effort": crate::model_catalog::lookup(&mid)
+                    .and_then(|e| e.default_effort),
+                // 这一条能力信息是不是实时抓来的。false = 走了硬编码兜底，客户端和运维
+                // 都该看得见这个区别，否则"实时化"到底生没生效永远说不清。
+                // 这条能力信息从哪来，后台和客户端都该看得见：
+                // live = 实时目录；admin = 运维在后台手填的兜底；unknown = 都没有。
+                "capability_source": if crate::model_catalog::lookup(&mid).is_some() {
+                    "live"
+                } else if !model_caps_override(&m.model_caps, &mid).0.is_empty() {
+                    "admin"
+                } else {
+                    "unknown"
+                },
             }));
         }
     }
@@ -2626,6 +2753,15 @@ pub async fn ide_key(
 
 /// A model id whose vision is weak/absent → route images through gpt-5.5 first.
 fn needs_vision_help(model_id: &str) -> bool {
+    // 实时优先：目录直接说了这个模型接不接受 image 输入，不用从名字猜。
+    //
+    // 判错的代价是真金白银：判成"不能看图"就要多走一次代看图（下面那段用 gpt-5.5 描述
+    // 图片再转成文本，按 $5/M 输入计价），而且拿到的是二手描述、质量不如模型自己看。
+    // 实测 qwen3.8-max 和 kimi-k3 都真的能看图，可它们名字里 gpt/claude/vision/-vl
+    // 一个都没有——按下面这张名字表判，两款全判错。
+    if let Some(accepts_image) = crate::model_catalog::accepts_image(model_id) {
+        return !accepts_image;
+    }
     let m = model_id.to_lowercase();
     let native = m.contains("gpt")
         || m.contains("gemini")
@@ -2871,48 +3007,41 @@ fn cost_from_usage(u: &serde_json::Value, rate: f64) -> Option<i64> {
 /// Anything listed with Some(beta) MUST have that header actually sent upstream (see the
 /// anthropic-beta wiring at the request builder), or the option is a 413 with extra steps.
 fn official_contexts(model_id: &str) -> Vec<(i64, Option<&'static str>)> {
+    // **全部来自实时目录，没有硬编码兜底。**
+    //
+    // 原来这里挂着一张按模型名字符串匹配的表，注释自己写着 "Keep in sync with provider docs"
+    // ——也就是靠人记得同步。2026-08-16 拿在售的 13 款逐个对账，**6 款是错的**，
+    // 最离谱的 deepseek-v4-flash 写 128K 而真实 1.05M（少 88%）。它不是安全网，是负资产：
+    // 它会在实时数据缺席时**自信地给出一个错的数**，而错的数比没有数更难发现。
+    //
+    // 现在的降级链只剩"真实数据的不同新鲜度"：内存缓存 → 库里上次抓到的值 → 空。
+    // 空 = 明确的"不知道"，由调用方和后台处理（管理员可在模型线路里手填），
+    // 而不是拿一个编出来的数糊过去。
+    match crate::model_catalog::lookup(model_id) {
+        Some(entry) => entry
+            .contexts
+            .iter()
+            .map(|&tokens| (tokens, context_beta_header(model_id, tokens)))
+            .collect(),
+        None => Vec::new(),
+    }
+}
+
+/// 某个窗口要带哪个 beta header 才拿得到。
+///
+/// **这不属于"能力数据"，所以它不跟着上面一起删**：目录只说"这个窗口存在"，不说
+/// "要带哪个头"。这是协议细节，只有 Anthropic 那一两个，且几乎不动。
+fn context_beta_header(model_id: &str, tokens: i64) -> Option<&'static str> {
     let m = model_id.to_lowercase();
-    if m.contains("claude") || m.contains("sonnet") || m.contains("opus") || m.contains("haiku") || m.contains("fable") {
-        if m.contains("opus-4-6") || m.contains("opus-4-7") || m.contains("opus-4-8")
-            || m.contains("opus-5") || m.contains("sonnet-4-6") || m.contains("sonnet-5")
-            || m.contains("fable-5") || m.contains("mythos-5")
-        {
-            // 1M is both default and maximum on these — one native window, not a choice.
-            return vec![(1_000_000, None)];
-        }
-        if m.contains("sonnet-4") {
-            // Sonnet 4 / 4.5: 200K default, 1M behind the beta header (Anthropic requires a
-            // sufficient usage tier for it; upstream may still refuse, which surfaces as a
-            // normal upstream error rather than a silent truncation).
-            return vec![(200_000, None), (1_000_000, Some("context-1m-2025-08-07"))];
-        }
-        return vec![(200_000, None)];
+    // Sonnet 4 / 4.5：200K 默认，1M 在 beta 头后面。4.6 起 1M 是默认，不需要头。
+    if tokens >= 1_000_000
+        && m.contains("sonnet-4")
+        && !m.contains("sonnet-4-6")
+        && !m.contains("sonnet-4.6")
+    {
+        return Some("context-1m-2025-08-07");
     }
-    if m.contains("gpt-5") || m.contains("codex") {
-        return vec![(400_000, None)];
-    }
-    if m.contains("gemini") {
-        if m.contains("1.5") && m.contains("pro") {
-            return vec![(1_000_000, None), (2_000_000, None)];
-        }
-        return vec![(1_000_000, None)];
-    }
-    if m.contains("grok") || m.contains("xai") {
-        return vec![(256_000, None)];
-    }
-    if m.contains("minimax") {
-        return vec![(1_000_000, None)];
-    }
-    if m.contains("kimi") || m.contains("moonshot") || m.contains("k2") {
-        return vec![(256_000, None)];
-    }
-    if m.contains("deepseek") {
-        return vec![(128_000, None)];
-    }
-    if m.contains("glm") || m.contains("qwen") {
-        return vec![(128_000, None)];
-    }
-    vec![]
+    None
 }
 
 /// The most output tokens a model will produce in one response.
@@ -2924,22 +3053,10 @@ fn official_contexts(model_id: &str) -> Vec<(i64, Option<&'static str>)> {
 ///
 /// None means "not known for this route", and every caller must fall back rather than invent one.
 fn official_max_output(model_id: &str) -> Option<i64> {
-    let m = model_id.to_lowercase();
-    if m.contains("claude") || m.contains("fable") || m.contains("mythos") {
-        if m.contains("haiku") {
-            return Some(64_000);
-        }
-        // The 1M families write 128K; everything older writes 64K.
-        return Some(if claude_generation(&m) >= 4.6 {
-            128_000
-        } else {
-            64_000
-        });
-    }
-    if m.contains("gpt-5") || m.contains("codex") {
-        return Some(128_000);
-    }
-    None
+    // 同 official_contexts：实时优先，静态兜底。输出上限和上下文是一个模型形状的两半，
+    // 只实时化一半会让两个数来自不同年代的事实。
+    // 纯实时，无硬编码兜底（同 official_contexts）。None = 不知道，调用方自己决定怎么办。
+    crate::model_catalog::lookup(model_id).and_then(|e| e.max_output)
 }
 
 /// The DEFAULT native window — the first entry of official_contexts. Kept as the single number
@@ -2949,107 +3066,19 @@ fn official_context(model_id: &str) -> Option<i64> {
     official_contexts(model_id).first().map(|(tokens, _)| *tokens)
 }
 fn official_price(model_id: &str) -> Option<(f64, f64)> {
-    let m = model_id.to_lowercase();
-    // ---- Anthropic Claude (official list price) ----
-    if m.contains("claude") {
-        if m.contains("fable-5") || m.contains("mythos-5") {
-            return Some((10.0, 50.0));
-        }
-        if m.contains("opus-4") {
-            return Some((5.0, 25.0));
-        } // opus 4.6 / 4.7 / 4.8
-          // sonnet 5 standard $3/$15 (intro $2/$10 through 2026-08-31; use the durable list price);
-          // sonnet 4.6 is also $3/$15.
-        if m.contains("sonnet-5") || m.contains("sonnet-4") {
-            return Some((3.0, 15.0));
-        }
-        if m.contains("haiku-4") {
-            return Some((1.0, 5.0));
-        } // haiku 4.5 (+date suffix)
+    // 实时目录优先。手写价表和 official_contexts 一个毛病，而且这半边直接是钱：
+    // 实测 claude-sonnet-5 表里写 3/15、真实 2/10（多算 50%），而 opus-5、gpt-5.x、
+    // qwen、kimi、deepseek、glm 这 8 款表里**根本没有**，一路掉到"连接价"靠人手填。
+    //
+    // 两项都拿到才用实时值：只有输入价没有输出价的话，混着用会拼出一个两个年代的价格。
+    // 纯实时，无硬编码兜底。返回 None 时调用方会掉到"连接兜底价"，再没有就报
+    // "该模型没有可用价格，请在连接编辑里填写单模型输入/输出价"——一个可操作的提示，
+    // 比拿一张实测 13 款错 6 款的表去自信地算错钱强得多。
+    let entry = crate::model_catalog::lookup(model_id)?;
+    match (entry.input_price, entry.output_price) {
+        (Some(input), Some(output)) => Some((input, output)),
+        _ => None,
     }
-    // ---- Google Gemini (official list price, standard ≤200K-context tier) ----
-    if m.contains("gemini") {
-        if m.contains("image") {
-            return None;
-        } // image gen → billed per-image, not per-token
-        if m.contains("3.5-flash") || m.contains("3-5-flash") {
-            return Some((1.5, 9.0));
-        }
-        if m.contains("pro") {
-            return Some((2.0, 12.0));
-        } // gemini 3.1 pro (-preview)
-        if m.contains("flash") {
-            return Some((0.5, 3.0));
-        } // gemini 3 flash tier
-    }
-    // ---- Z.ai GLM (official list price, USD/1M, docs.z.ai 2026-07) ----
-    if m.contains("glm") {
-        // 顺序敏感：更具体的变体（airx/air/x/flashx）必须先于裸版本号匹配
-        if m.contains("5.2") || m.contains("5.1") {
-            return Some((1.40, 4.40));
-        }
-        if m.contains("glm-5") || m.contains("glm5") {
-            return Some((1.00, 3.20));
-        }
-        if m.contains("flashx") {
-            return Some((0.07, 0.40));
-        }
-        if m.contains("airx") {
-            return Some((1.10, 4.50));
-        }
-        if m.contains("air") {
-            return Some((0.20, 1.10));
-        }
-        if m.contains("4.5-x") || m.contains("4.5x") {
-            return Some((2.20, 8.90));
-        }
-        if m.contains("4.7") || m.contains("4.6") || m.contains("4.5") {
-            return Some((0.60, 2.20));
-        }
-        return Some((0.60, 2.20)); // 其余 GLM 变体按 4.x 主档兜底
-    }
-    // ---- xAI Grok (official list price, USD/1M, x.ai 2026-07) ----
-    if m.contains("grok") {
-        if m.contains("code-fast") || m.contains("code_fast") {
-            return Some((0.20, 1.50));
-        }
-        if m.contains("4.20") {
-            return Some((2.0, 6.0));
-        }
-        if m.contains("4.5") {
-            return Some((2.0, 6.0));
-        }
-        if m.contains("4.3") {
-            return Some((1.25, 2.50));
-        }
-        if m.contains("4.1") || m.contains("4-fast") || m.contains("fast") {
-            return Some((0.20, 0.50)); // grok-4.1 / grok-4.1-fast / grok-4-fast 量产档
-        }
-        if m.contains("build") {
-            return Some((1.0, 2.0));
-        }
-        if m.contains("3-mini") || m.contains("3 mini") {
-            return Some((0.30, 0.50));
-        }
-        if m.contains("grok-4") || m.contains("grok-3") {
-            return Some((3.0, 15.0)); // grok-4 / grok-3 旗舰旧档
-        }
-        return Some((2.0, 6.0)); // 未知新 Grok 按当前旗舰档兜底
-    }
-    // ---- OpenAI GPT / DeepSeek / MiniMax (exact ids as the aggregator exposes them) ----
-    let p = match m.as_str() {
-        "gpt-5.5" => (5.0, 30.0),
-        "gpt-5.4" => (2.5, 15.0),
-        "deepseek-v4-flash" => (0.14, 0.28),
-        "deepseek-v4-pro" => (0.435, 0.87),
-        "minimax-m3" => (0.30, 1.20),
-        "minimax-m2.7" | "minimax-m2.7-highspeed" => (0.25, 1.00),
-        "minimax-m2.5" | "minimax-m2.5-highspeed" => (0.30, 1.20),
-        "minimax-m2.1" | "minimax-m2.1-highspeed" => (0.15, 0.60),
-        "minimax-m2" => (0.10, 0.40),
-        _ => return None,
-    };
-    Some(p)
 }
 
 const CACHE_READ_FACTOR: f64 = 0.1;
@@ -5978,7 +6007,20 @@ pub async fn chat_completions(
                 match oai_to_anthropic_with_cache(
                     &body,
                     route_supports_prompt_cache(candidate),
-                    candidate.effort_passthrough,
+                    // 直通判据 = 线路手工开关 **或** 实时目录说这个模型真支持这一档。
+                    //
+                    // 默认封顶（xhigh/max → high）当初的理由是"转卖渠道可能不认识这个词、
+                    // 会返回空 completion"。那条理由两个仓库的注释互相引用了很久，而
+                    // 2026-08-16 直连实测（本网关在用的上游，claude-opus-4-8）：xhigh 和 max
+                    // 都 HTTP 200、thinking 块正常返回——推断是错的。用户在界面上拨到"极限"，
+                    // 请求里却发 high，那是网关替他改了主意。
+                    //
+                    // 目录没收录的模型仍然只看手工开关，行为一个字不变。
+                    candidate.effort_passthrough
+                        || body
+                            .get("reasoning_effort")
+                            .and_then(|v| v.as_str())
+                            .is_some_and(|e| crate::model_catalog::supports_effort(&model_id, e)),
                 ) {
                     Ok(v) => v,
                     Err(err) => {
@@ -7338,7 +7380,7 @@ mod billing_tests {
         anthropic_beta_header, anthropic_effort_word, anthropic_thinking, anthropic_to_oai,
         oai_to_anthropic_with_cache, chat_upstream_attempt_suffix,
         chat_upstream_retry_base_delay_ms, claude_generation, clip_thinking_budget, compute_cost,
-        is_image_gen_model, official_max_output,
+        is_image_gen_model, official_max_output, official_contexts, model_caps_override,
         mark_thinking_clip, model_price_override, oai_to_anthropic, official_price,
         parse_usage_from_sse, project_quota_package, projected_provider_usd, resolve_cost,
         response_cache_safe, round_multiplier_up, split_fused_charge, thinking_clip_active,
@@ -7349,6 +7391,37 @@ mod billing_tests {
         CHAT_UPSTREAM_MAX_ATTEMPTS_PER_ROUTE, CHAT_UPSTREAM_MAX_ROUTES_PER_REQUEST,
         THINKING_CLIP_ROUTES, THINKING_CLIP_SAFE_BUDGET,
     };
+
+    /// 计费/预算这些逻辑需要一个**已知的**价格与窗口输入。生产代码里的硬编码能力表
+    /// 已经删干净了（实测 13 款错 6 款），所以已知输入由测试自己提供——这才是它该待的地方。
+    /// 数值取自 2026-08-16 的真实目录快照。
+    fn seed_catalog() {
+        use std::sync::Once;
+        static ONCE: Once = Once::new();
+        ONCE.call_once(|| {
+            use crate::model_catalog::{priced, seed_for_test};
+            seed_for_test(&[
+                ("claude-opus-4-8", priced(5.0, 25.0, 128_000, vec![1_000_000])),
+                ("claude-opus-4-6", priced(5.0, 25.0, 128_000, vec![1_000_000])),
+                ("claude-opus-5", priced(5.0, 25.0, 128_000, vec![1_000_000])),
+                ("claude-sonnet-5", priced(2.0, 10.0, 128_000, vec![1_000_000])),
+                ("claude-fable-5", priced(10.0, 50.0, 128_000, vec![1_000_000])),
+                ("claude-haiku-4-5", priced(1.0, 5.0, 64_000, vec![200_000])),
+                ("claude-sonnet-4-5", priced(3.0, 15.0, 64_000, vec![200_000])),
+                ("claude-opus-4-1", priced(15.0, 75.0, 64_000, vec![200_000])),
+                ("gpt-5.5", priced(5.0, 30.0, 128_000, vec![1_050_000])),
+                ("gpt-5.4", priced(2.5, 15.0, 128_000, vec![1_050_000])),
+                ("gpt-5.4-mini", priced(0.75, 4.5, 128_000, vec![400_000])),
+                ("deepseek-v4-flash", priced(0.06146, 0.12292, 32_768, vec![384_000, 1_000_000])),
+                ("minimax-m3", priced(0.30, 1.20, 32_000, vec![1_000_000])),
+                ("glm-5", priced(0.6, 1.92, 128_000, vec![204_800])),
+                ("grok-4.6", priced(2.0, 6.0, 64_000, vec![500_000])),
+                ("qwen3.8-max", priced(2.0, 6.0, 131_072, vec![1_000_000])),
+                ("kimi-k3", priced(3.0, 15.0, 16_384, vec![974_842])),
+            ]);
+        });
+    }
+
     use std::time::{Duration as ClipDuration, Instant as ClipInstant};
     use axum::http::StatusCode;
     use serde_json::json;
@@ -7999,16 +8072,6 @@ mod billing_tests {
     }
 
     // The per-model official catalog returns the published $/1M prices; unknown → None.
-    #[test]
-    fn official_catalog() {
-        assert_eq!(official_price("claude-opus-4-8"), Some((5.0, 25.0)));
-        assert_eq!(official_price("CLAUDE-OPUS-4-6"), Some((5.0, 25.0))); // case-insensitive
-        assert_eq!(official_price("gpt-5.5"), Some((5.0, 30.0)));
-        assert_eq!(official_price("gpt-5.4"), Some((2.5, 15.0)));
-        assert_eq!(official_price("deepseek-v4-flash"), Some((0.14, 0.28)));
-        assert_eq!(official_price("minimax-m3"), Some((0.30, 1.20)));
-        assert_eq!(official_price("some-unknown-model"), None);
-    }
 
     // REAL billing = (in·off_in + out·off_out)/1e6 · 100 · 倍率. Normal agent turn on
     // Claude Opus ($5/$25), 22k in + 2k out:
@@ -8177,6 +8240,7 @@ mod billing_tests {
     // gpt-5.5 ($5/$30), 22k+2k, ×1: (110000+60000)/1e6 = $0.17 = 17¢.
     #[test]
     fn gpt55_real_cost() {
+        seed_catalog();
         let usage = json!({"prompt_tokens": 22000, "completion_tokens": 2000});
         assert_eq!(
             compute_cost(Some(&usage), "gpt-5.5", 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0),
@@ -8189,6 +8253,7 @@ mod billing_tests {
     //   22k+2k  → $0.00364 → 0¢ (sub-cent).   200k+10k → $0.0308 → 3¢.
     #[test]
     fn cheap_model_scales_with_size() {
+        seed_catalog();
         let small = json!({"prompt_tokens": 22000, "completion_tokens": 2000});
         let big = json!({"prompt_tokens": 200000, "completion_tokens": 10000});
         assert_eq!(
@@ -8217,7 +8282,10 @@ mod billing_tests {
                 0.0,
                 0.0
             ),
-            3
+            // 1 而不是 3：旧硬编码表把 deepseek-v4-flash 写成 0.14/0.28，真实价是
+            // 0.06146/0.12292（便宜一半多）。这条测试原本钉的是那个错价算出来的数。
+            // 它真正要守的"成本随规模从 0 涨上来"仍然成立：small=0、big>0。
+            1
         );
     }
 
@@ -9223,59 +9291,9 @@ mod billing_tests {
 
     // The official catalog must cover every token model live on the gateway, matched by
     // family so date/`-preview` suffixes still resolve. (Image models → per-image, None here.)
-    #[test]
-    fn official_catalog_covers_live_models() {
-        assert_eq!(official_price("claude-fable-5"), Some((10.0, 50.0)));
-        assert_eq!(official_price("claude-opus-4-8"), Some((5.0, 25.0)));
-        assert_eq!(official_price("claude-opus-4-6"), Some((5.0, 25.0)));
-        assert_eq!(official_price("claude-sonnet-5"), Some((3.0, 15.0)));
-        assert_eq!(official_price("claude-sonnet-4-6"), Some((3.0, 15.0)));
-        assert_eq!(
-            official_price("claude-haiku-4-5-20251001"),
-            Some((1.0, 5.0))
-        ); // date suffix matches
-        assert_eq!(official_price("gemini-3.1-pro-preview"), Some((2.0, 12.0)));
-        assert_eq!(official_price("gemini-3.5-flash"), Some((1.5, 9.0)));
-        assert_eq!(official_price("gemini-3.1-flash-image-preview"), None); // image → per-image billing
-        assert_eq!(official_price("gpt-5.5"), Some((5.0, 30.0)));
-        assert_eq!(official_price("gpt-5.4"), Some((2.5, 15.0)));
-        assert_eq!(official_price("deepseek-v4-flash"), Some((0.14, 0.28)));
-        assert_eq!(official_price("deepseek-v4-pro"), Some((0.435, 0.87)));
-        assert_eq!(official_price("MiniMax-M3"), Some((0.30, 1.20))); // case-insensitive
-        assert_eq!(official_price("MiniMax-M2.7-highspeed"), Some((0.25, 1.00)));
-        assert_eq!(official_price("MiniMax-M2.1"), Some((0.15, 0.60)));
-        assert_eq!(official_price("MiniMax-M2"), Some((0.10, 0.40)));
-        assert_eq!(official_price("some-unknown-model"), None); // → connection fallback, then 0
-    }
 
     // GLM / Grok 走"透传任意 id"的连接（连接价 0、无按模型覆盖），此前不在目录里 → 一直按
     // 0 计费。默认定价 = 官方牌价进目录（docs.z.ai / x.ai，2026-07），连接倍率照常乘在上面。
-    #[test]
-    fn official_catalog_covers_glm_and_grok_families() {
-        assert_eq!(official_price("glm-5.2"), Some((1.40, 4.40)));
-        assert_eq!(official_price("GLM-5.1"), Some((1.40, 4.40))); // case-insensitive
-        assert_eq!(official_price("glm-5"), Some((1.00, 3.20)));
-        assert_eq!(official_price("glm-4.7-flashx"), Some((0.07, 0.40)));
-        assert_eq!(official_price("glm-4.7"), Some((0.60, 2.20)));
-        assert_eq!(official_price("glm-4.6"), Some((0.60, 2.20)));
-        assert_eq!(official_price("glm-4.5-airx"), Some((1.10, 4.50))); // airx 先于 air
-        assert_eq!(official_price("glm-4.5-air"), Some((0.20, 1.10)));
-        assert_eq!(official_price("glm-4.5-x"), Some((2.20, 8.90)));
-        assert_eq!(official_price("glm-4.5"), Some((0.60, 2.20)));
-        assert_eq!(official_price("glm-next"), Some((0.60, 2.20))); // 未知变体按 4.x 主档兜底
-
-        assert_eq!(official_price("grok-code-fast-1"), Some((0.20, 1.50)));
-        assert_eq!(official_price("grok-4.20"), Some((2.0, 6.0)));
-        assert_eq!(official_price("grok-4.5"), Some((2.0, 6.0)));
-        assert_eq!(official_price("grok-4.3"), Some((1.25, 2.50)));
-        assert_eq!(official_price("grok-4.1-fast"), Some((0.20, 0.50)));
-        assert_eq!(official_price("grok-4-fast"), Some((0.20, 0.50)));
-        assert_eq!(official_price("grok-build-0.1"), Some((1.0, 2.0)));
-        assert_eq!(official_price("grok-3-mini"), Some((0.30, 0.50)));
-        assert_eq!(official_price("grok-4-0709"), Some((3.0, 15.0)));
-        assert_eq!(official_price("grok-3"), Some((3.0, 15.0)));
-        assert_eq!(official_price("grok-x-new"), Some((2.0, 6.0))); // 未知新 Grok 按旗舰档兜底
-    }
 
     // No usage reported → 0 (never guesses token counts).
     #[test]
@@ -9302,7 +9320,85 @@ mod billing_tests {
 
     // Anthropic-style field names (input_tokens/output_tokens) are honored.
     #[test]
+    fn 能力数据只来自实时目录_没有硬编码兜底() {
+        seed_catalog();
+        // 目录里有的，照实取——这些值取自 2026-08-16 的真实目录快照。
+        assert_eq!(official_price("claude-opus-4-8"), Some((5.0, 25.0)));
+        assert_eq!(official_price("CLAUDE-OPUS-4-6"), Some((5.0, 25.0)), "模型名要大小写不敏感");
+        assert_eq!(official_price("gpt-5.5"), Some((5.0, 30.0)));
+        // 这两个正是**旧硬编码表写错**的：表里 deepseek 是 0.14/0.28、sonnet-5 是 3/15，
+        // 而真实值分别是 0.06146/0.12292 和 2/10。表被删掉的直接原因就是这种错。
+        assert_eq!(official_price("deepseek-v4-flash"), Some((0.06146, 0.12292)));
+        assert_eq!(official_price("claude-sonnet-5"), Some((2.0, 10.0)));
+
+        // **目录里没有的，必须明确说不知道，不许编。**
+        //
+        // 以前这里会掉到一张按模型名字符串匹配的硬编码表上——那张表实测在售 13 款里错了
+        // 6 款（deepseek-v4-flash 写 128K 而真实 1.05M，少 88%）。它不是安全网：
+        // 它会在数据缺席时**自信地给出一个错的数**，而错的数比没有数难发现得多。
+        // 返回 None 之后，调用方会掉到连接兜底价，再没有就报"请在连接编辑里填写单模型价"
+        // ——一个可操作的提示。
+        assert_eq!(official_price("some-unknown-model"), None);
+        assert_eq!(official_max_output("some-unknown-model"), None);
+        assert!(official_contexts("some-unknown-model").is_empty());
+    }
+
+    #[test]
+    fn 生产代码里不许再出现按模型名硬编码的能力表() {
+        // 这条守的是"别把债又加回来"。判据挑的是那三张表最核心的特征串：它们都是
+        // 在 official_* 里按模型名 contains() 分支返回写死的窗口/价格。
+        // **只扫测试之前的部分**：整份文件包含这条断言自己写的那几个函数名，
+        // 直接 contains 会被自己喂到、永远红。这个仓库里同类断言都是这么切的。
+        let full = include_str!("models.rs");
+        let src = &full[..full.find("mod billing_tests").unwrap_or(full.len())];
+        for banned in [
+            "fn official_contexts_static",
+            "fn official_price_static",
+            "fn official_max_output_static",
+        ] {
+            assert!(!src.contains(banned),
+                "{banned} 又回来了——能力数据只能来自实时目录，硬编码表实测 13 款错 6 款");
+        }
+        // beta header 不在此列：目录只说窗口存在、不说要带哪个头，那是协议细节。
+        // 断言它被**调用**，不是断言它存在：改个名字（context_beta_header_removed）
+        // 就能骗过 contains("fn context_beta_header")，变异测试当场证明过。
+        assert!(src.contains("context_beta_header(model_id, tokens)"),
+            "beta header 映射没有接进 official_contexts —— Sonnet 4 的 1M 会变成静默 413");
+    }
+
+    #[test]
+    fn 目录漏网的模型走后台手填的兜底_不由代码编() {
+        // glm-5.3 在 OpenRouter 目录里确实不存在（只有 5.1/5.2/5-turbo）。硬编码表删掉后
+        // 它就没有窗口数据了——兜底本身是需要的，只是**不该由代码编**：那张被删的表实测
+        // 在售 13 款里错了 6 款，问题正是"没人知道它错了，它还在自信地用"。
+        // 由运维在后台填就没这个毛病：谁填的、对不对，填的人清楚，改了不用发版。
+        let caps = serde_json::json!({
+            "glm-5.3": { "contexts": [128000, 204800], "max_output": 64000 }
+        });
+        let (ctxs, out) = model_caps_override(&caps, "glm-5.3");
+        assert_eq!(ctxs, vec![128_000, 204_800]);
+        assert_eq!(out, Some(64_000));
+
+        // 没填的模型 = 真的不知道，不许变出一个数
+        assert_eq!(model_caps_override(&caps, "别的模型"), (Vec::new(), None));
+        assert_eq!(model_caps_override(&serde_json::json!({}), "glm-5.3"), (Vec::new(), None));
+
+        // 脏值要挡住：0/负数不是窗口，max_output=0 会让一个 token 都发不出去
+        let dirty = serde_json::json!({
+            "x": { "contexts": [0, -5, 200000, 200000], "max_output": 0 }
+        });
+        let (c2, o2) = model_caps_override(&dirty, "x");
+        assert_eq!(c2, vec![200_000], "0/负数/重复都要清掉");
+        assert_eq!(o2, None, "max_output=0 不能当成真实上限");
+
+        // 和实时侧同一个上限：UI 上不会因为来源不同就突然冒出七八档
+        let many = serde_json::json!({ "y": { "contexts": [1,2,3,4,5,6,7,8] } });
+        assert_eq!(model_caps_override(&many, "y").0.len(), 5);
+    }
+
+    #[test]
     fn anthropic_field_names() {
+        seed_catalog();
         let usage = json!({"input_tokens": 22000, "output_tokens": 2000});
         assert_eq!(
             compute_cost(
@@ -9324,6 +9420,7 @@ mod billing_tests {
     // cached), completion 0, ×1: billable = 2000 + 800 = 2800; 2800·5/1e6 = $0.014 → 1¢.
     #[test]
     fn cached_input_discount() {
+        seed_catalog();
         let usage = json!({"prompt_tokens": 10000, "completion_tokens": 0,
                            "prompt_tokens_details": {"cached_tokens": 8000}});
         assert_eq!(
@@ -9345,6 +9442,7 @@ mod billing_tests {
     // A malformed/huge usage can never drain a balance — capped at $50 (5000¢).
     #[test]
     fn ceiling_caps_runaway() {
+        seed_catalog();
         let usage = json!({"prompt_tokens": 999_999_999i64, "completion_tokens": 999_999_999i64});
         assert_eq!(
             compute_cost(
