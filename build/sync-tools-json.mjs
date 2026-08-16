@@ -57,6 +57,13 @@ function isRegexPos(s, i) {
   if ("=([,{;:!&|?+-*%<>~^".includes(s[j])) return true;
   return /(?:^|[^\w$])(return|typeof|case|in|of|do|else|void|delete|instanceof|yield|await)$/.test(s.slice(Math.max(0, j - 12), j + 1));
 }
+// 源码里没有这个函数就不注入。测试用的合成 fixture main.js 只有一个注册表函数，
+// 它的注册表也确实不会去调这个辅助函数——"没有就不注入"比塞一个 identity 桩好：桩会在
+// 真文件里这个过滤器被改坏时替它兜底，把问题藏起来。
+function extractIfPresent(name) {
+  return new RegExp(`(?:async\\s+)?function\\s+${name}\\s*\\(`).test(SRC) ? extractFn(name) : "";
+}
+
 function extractFn(name) {
   const m = new RegExp(`(?:async\\s+)?function\\s+${name}\\s*\\(`).exec(SRC);
   if (!m) throw new Error(`function ${name} not found in main.js`);
@@ -74,12 +81,27 @@ function extractFn(name) {
   throw new Error(`unbalanced braces extracting ${name}`);
 }
 
-// Evaluate the real registry with its two module-level deps injected.
+// Evaluate the real registry with its module-level deps injected.
+//
+// `_userCapabilities` returns the tools THIS user declared in their own settings
+// (~/.michael/settings.json). They are per-user runtime data and must never be baked
+// into the shipped gateway catalog — one person's private HTTP tool would otherwise be
+// advertised to everyone. An empty list is the correct answer here, not a stub.
+//
+// 这份注入清单和 _buildAgentToolSchemas 的依赖是**手工对齐**的，漏一个的后果不是少一个
+// 工具，是整个脚本 ReferenceError 当场崩掉——于是目录再也同步不了，而两边就这么静静地
+// 越漂越远。这正是它上次坏掉时发生的事：_userCapabilities 是后来加的，这里没跟上，
+// 而唯一那条测试跑的是合成的 fixture main.js，真实那条路一次都没走过。
+// 下面那条 --check 用例现在打的就是真文件。
 const buildFn = new Function(
   "inTauri",
   "_applyCloudToolDescs",
-  `${extractFn("_buildAgentToolSchemas")}\n;return _buildAgentToolSchemas;`,
-)(true, (tools) => tools);
+  "_userCapabilities",
+  // `_withoutDisabledTools` 抽真源码进来，不塞桩：它自己只依赖 _userCapabilities，
+  // 而塞一个 identity 桩的话，将来这个过滤器改了逻辑这边不会跟着变，会静静地生成
+  // 一份和运行时不一样的目录——那正是这个脚本存在的意义的反面。
+  `${extractIfPresent("_withoutDisabledTools")}\n${extractFn("_buildAgentToolSchemas")}\n;return _buildAgentToolSchemas;`,
+)(true, (tools) => tools, () => ({ tools: [], disabled: [] }));
 
 const registry = buildFn(true, []);
 const registryByName = new Map();
