@@ -12079,7 +12079,8 @@ textarea.settings-input {
   transition: transform 0.18s ease;
 }
 .settings-toggle.is-on .settings-toggle__knob { transform: translateX(18px); }
-.settings-actions { margin-top: 18px; }
+/* 页尾的动作按钮居中。原来靠左，和上面居中的内容列对不上，看着像掉出来的。 */
+.settings-actions { margin-top: 20px; justify-content: center; }
 
 /* ---- Appearance theme picker ---- */
 .appearance-theme-grid {
@@ -14768,11 +14769,29 @@ body.tree-selecting, body.tree-selecting * { user-select: none !important; -webk
 /* ---- 面板内的按钮：走 feature 令牌，不吃全局那两套硬编码蓝 ----
    全局 .btn 把主色写死成 #1a73e8、hover 底 #e8f0fe。面板在深色下的蓝是 #8ab4f8，
    于是同一屏出现两种蓝，hover 还会闪一块浅蓝底。这里按面板作用域覆盖，不动全局。 */
-.feature-panel__body .btn {
-  color: var(--feature-blue);
+/*
+ * 面板内的按钮统一成一档次级按钮：描边 + 常规字色。
+ *
+ * 上一版只改了 color，没管 .btn--primary 那个实心蓝底——于是蓝字压在蓝底上，
+ * 「保存自适应档案」整颗按钮看起来是空白的。这里把两者一起收进同一副长相，
+ * 面板里不再有实心主色块（主色留给焦点和选中）。
+ */
+.feature-panel__body .btn,
+.feature-panel__body .btn--primary {
+  height: 30px;
+  padding: 0 14px;
+  font-size: 12.5px;
+  color: var(--feature-text);
+  background: var(--feature-control);
+  border: 1px solid var(--feature-border-strong);
   border-radius: var(--feature-radius-control, 8px);
+  box-shadow: none;
 }
-.feature-panel__body .btn:hover { background: var(--feature-hover); }
+.feature-panel__body .btn:hover,
+.feature-panel__body .btn--primary:hover {
+  background: var(--feature-hover);
+  border-color: var(--feature-text-dim, var(--feature-dim));
+}
 /* 次级按钮：面板里不该出现整块实心主色。留一处描边就够，主色交给焦点和选中。 */
 .feature-panel__body .app-icon-actions .btn,
 .feature-panel__body .app-icon-actions .btn--primary {

@@ -57781,27 +57781,19 @@ function renderAdaptiveTool(body) {
   sec.appendChild(makeRow("用户熟练度", "用户不懂时自动讲人话；用户像老手时少废话。", makeSelect("skill")));
   sec.appendChild(makeRow("意图识别", "短句、截图指代、情绪反馈优先结合上下文推断。", makeSelect("intentMode")));
 
-  const notes = document.createElement("textarea");
-  notes.className = "settings-input adaptive-notes";
-  notes.spellcheck = false;
-  notes.placeholder = "一行一条，例如：\n已有前端沿用原栈；无网站且未指定栈时用 React + Tailwind CSS + shadcn/ui。\n修 bug 必须先找根因再改。\n如果我只说“啊/？？/不是这个”，先结合上下文判断我卡在哪里。\n回答不要空话，要讲真实依据。";
-  notes.value = _kgText("");
-  const noteRow = makeRow("长期偏好记忆", "保存到全局用户偏好，所有项目都会按任务相关性召回。", notes);
-  noteRow.classList.add("settings-row--stack");
-  sec.appendChild(noteRow);
+  // 「长期偏好记忆」那块已按所有者要求删除：记忆中心是同一份数据的正主，设置页再放一个
+  // 编辑框等于同一份内容有两个入口，改哪个、以哪个为准都要靠猜。
   body.appendChild(sec);
 
+  /*
+   * 这里原来有第三颗「保存自适应档案」的实心蓝按钮，一并删掉了。
+   *
+   * 上面每一项都是 onchange 就落盘的（makeSelect / 开关里都直接调 persistProfile），
+   * 那颗按钮唯一真正在保存的东西是刚被删掉的那个偏好编辑框。留着它就成了一颗按下去
+   * 什么都不会改变、却让人以为"不按就没生效"的按钮——比没有更糟。
+   */
   const actions = document.createElement("div");
   actions.className = "tool-actions settings-actions";
-  const save = document.createElement("button");
-  save.className = "btn btn--primary";
-  save.type = "button";
-  save.textContent = "保存自适应档案";
-  save.addEventListener("click", () => {
-    persistProfile();
-    const count = _saveKgText("", notes.value);
-    showToast(`自适应档案已保存：全局偏好 ${count} 条`);
-  });
   const reset = document.createElement("button");
   reset.className = "btn";
   reset.type = "button";
@@ -57816,7 +57808,7 @@ function renderAdaptiveTool(body) {
   memory.type = "button";
   memory.textContent = "打开记忆中心";
   memory.addEventListener("click", openMemoryPanel);
-  actions.append(save, reset, memory);
+  actions.append(reset, memory);
   body.appendChild(actions);
 }
 
