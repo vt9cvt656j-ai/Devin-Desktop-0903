@@ -1751,6 +1751,18 @@ export function createLspManager(options) {
     didClose,
     refreshWorkspace,
     ensureServer,
+    /// 这个语言的语言服务**当前真的起来了吗**。
+    ///
+    /// get_diagnostics 原来在"没有诊断"时一律回一句「语言服务已在分析；LSP 出结果略有
+    /// 延迟，改完稍等再查更准」。可 ensureServer 拿不到服务时返回 null 且**静默**——
+    /// 没装 pyright / rust-analyzer、或者启动超时，都会走到同一句话。
+    /// 于是模型改完 Python 调 get_diagnostics，拿到"无错误 + 语言服务已在分析"，
+    /// 据此向用户报告"已修复"，而真相是**一行都没被检查过**。
+    /// 那句"稍等再查更准"更糟：它暗示再等等就准了，而实际上等到天亮也是空的。
+    diagnosticsProviderReady(langId) {
+      const client = clients.get(String(langId || ""));
+      return !!(client && client.initialized === true);
+    },
     async startManual(langId, custom) {
       return ensureServer(langId, custom);
     },
