@@ -993,6 +993,35 @@ test("tool messages append recovery guidance and agent loop nudges after blocked
   assert.match(SRC, /recoveryNudges < 4/);
 });
 
+test("MCP 的资源 / prompt 按文档给预算，工具结果照旧按噪音输出给", () => {
+  /*
+   * 三者的 result.type 都是 "mcp"，但性质不是一回事：
+   *   - 工具结果    → 输出可以任意大且很吵（一条 npm install 的日志） → 8000，该掐
+   *   - 资源 / prompt → 调用它的**全部目的就是取回那份文档** → 和 read_file 同性质
+   *
+   * 混在一档里的后果比读文件更糟：read_file 还能用 offset/limit 把剩下的取回来，
+   * MCP 资源没有第二次机会——一份 40KB 的 schema 被从中间挖空之后，模型永远只见得到
+   * 那两截，而且它并不知道自己缺了什么。
+   */
+  const toModel = load("_toolMsgForModel", {
+    _toolResultToString: (_call, result) => result.content,
+    _blockedToolRecoveryInstruction: () => null,
+  });
+  const body = "x".repeat(29_000);
+  for (const kind of ["resource", "prompt"]) {
+    const out = toModel({ type: "mcp", kind }, { type: "mcp", content: body });
+    assert.equal(out.length, body.length, `${kind} 被当成噪音输出掐掉了：只剩 ${out.length} 字`);
+  }
+  const tool = toModel({ type: "mcp", kind: "tool" }, { type: "mcp", content: body });
+  assert.ok(tool.length < 9000, `MCP 工具结果不该跟着放宽：${tool.length} 字`);
+
+  // 执行器里那道硬顶要同步分档，否则上面这一档调多大都没用——内容在进 _toolMsgForModel
+  // 之前就已经被切到 8000 了。
+  assert.match(SRC, /const _mcpCap = \(call\.kind === "resource" \|\| call\.kind === "prompt"\) \? 30000 : 8000;/,
+    "执行器仍然对所有 MCP 结果一刀切 8000");
+  assert.match(SRC, /readable\.length > _mcpCap/, "硬顶没用上分档后的预算");
+});
+
 test("AI permission startup preserves existing choices and never migrates by overwriting", () => {
   const loadPerm = load("_loadAiPerm");
   let writes = 0;

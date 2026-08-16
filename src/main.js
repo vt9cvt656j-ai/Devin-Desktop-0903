@@ -37473,6 +37473,13 @@ function _toolMsgForModel(call, result) {
     // 两个互相矛盾的事实：模型手上缺了一半，却被告知全在。
     // 工具侧硬顶 24000，放进 30000 档不会失控。
     : _rt === "skill" ? 30000
+    // MCP 的**资源**和 **prompt** 不是"命令输出"，和 read_file / web_fetch 是同一性质：
+    // 调用它的全部目的就是把那份文档取回来。混在下面 8000 那一档里，一份 40KB 的
+    // 数据库 schema 或 API 说明会被 _headTailModelText 从中间挖空——而且比读文件更糟：
+    // read_file 还有 offset/limit 能把剩下的取回来，MCP 资源没有第二次机会，模型永远
+    // 只见得到那两截。放进 30000 档，和 web_fetch / git_diff / read_skill 同一个理由。
+    // MCP **工具**照旧留在 8000：那才是"输出可以任意大且很吵"的那一类。
+    : _rt === "mcp" && (call?.kind === "resource" || call?.kind === "prompt") ? 30000
     : _rt === "web" || _rt === "git" ? 30000
     : _rt && _rt.endsWith("_search") ? 20000
     // cmd/http/mcp output can be arbitrarily huge and noisy → keep the tight guard.
@@ -53407,7 +53414,13 @@ return { type: call.type, path: call.query || "", content: `[失败] ${call.type
         let match;
         while ((match = mediaPattern.exec(raw))) media.push({ kind: match[1], mime: match[2], dataUrl: match[3] });
         const readable = raw.replace(mediaPattern, (_all, kind, mime) => `[MCP ${kind} media rendered: ${mime}]`);
-        const content = readable.length > 8000 ? readable.slice(0, 8000) + `\n[结果已截断：原始文本 ${readable.length} 字符]` : readable;
+        // 资源 / prompt 是文档投递，工具结果才是"可能任意大且很吵"的输出——两者不该
+        // 共用一个硬顶。这里不放宽的话，上面 _toolMsgForModel 那一档调多大都没用：
+        // 内容在进它之前就已经被切到 8000 了。
+        const _mcpCap = (call.kind === "resource" || call.kind === "prompt") ? 30000 : 8000;
+        const content = readable.length > _mcpCap
+          ? readable.slice(0, _mcpCap) + `\n[结果已截断：原始文本 ${readable.length} 字符]`
+          : readable;
         res.className = mcpError ? "atc-result atc-result--err" : "atc-result atc-result--ok";
         res.textContent = mcpError ? "服务返回错误" : `完成 · ${readable.length} 字${media.length ? ` · 附件 ${media.length}` : ""}`;
         if (vp) {
