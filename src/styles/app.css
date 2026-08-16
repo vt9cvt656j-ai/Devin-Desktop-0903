@@ -14936,3 +14936,218 @@ body.tree-selecting, body.tree-selecting * { user-select: none !important; -webk
 }
 .mnum__input::-webkit-outer-spin-button,
 .mnum__input::-webkit-inner-spin-button { -webkit-appearance: none; margin: 0; }
+
+/* ---- growth panel（成长页）----
+   原来这一整段是 growth.js 运行时注入到 <head> 的，活在 app.css 之外——改设计语言时
+   没人会想到还有这么一份，于是它一直保留着自己的圆角、开关尺寸和状态色。搬进来之后
+   全部改走面板令牌，和其它页共用同一套语言。 */
+.growth-wrap { padding: 0 0 8px; }
+
+/* 正向提示条。警告那一档已按所有者要求删掉，剩下的只有"保持住"这一条，所以不再需要
+   两套配色。 */
+.growth-banner {
+  display: flex;
+  gap: 10px;
+  align-items: flex-start;
+  margin: 4px 0 20px;
+  padding: 11px 13px;
+  font-size: 12.5px;
+  line-height: 1.55;
+  color: var(--feature-text, var(--text));
+  background: var(--feature-card, var(--panel-2));
+  border: 1px solid var(--feature-border, var(--line));
+  border-radius: var(--feature-radius-card, 12px);
+}
+.growth-banner svg { flex: 0 0 auto; margin-top: 2px; opacity: .55; }
+
+/* 小节标题：和 .settings-group__title 同一档，不再是 11px 全大写加宽字距。 */
+.growth-section-t {
+  margin: 26px 2px 8px;
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: .01em;
+  text-transform: none;
+  color: var(--feature-dim, var(--text-dim));
+}
+
+/* 概览三格：外面一张卡，里面三格用发丝线分隔——和设置页"一组一张卡"是同一个形态。 */
+.growth-profile {
+  margin: 0 0 4px;
+  padding: 0;
+  background: var(--feature-card, var(--panel-2));
+  border: 1px solid var(--feature-border, var(--line));
+  border-radius: var(--feature-radius-card, 12px);
+  overflow: hidden;
+}
+.growth-profile__cells { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); }
+.growth-profile__c {
+  min-width: 0;
+  padding: 16px 14px;
+  text-align: center;
+  background: none;
+  border: 0;
+}
+.growth-profile__c + .growth-profile__c { border-left: 1px solid var(--feature-border, var(--line)); }
+.growth-profile__c b {
+  display: block;
+  font-size: 24px;
+  font-weight: 600;
+  line-height: 1.1;
+  font-variant-numeric: tabular-nums;
+  color: var(--feature-text, var(--text));
+}
+.growth-profile__c span { font-size: 11.5px; color: var(--feature-dim, var(--text-dim)); }
+.growth-profile__line {
+  margin: 0;
+  padding: 11px 14px;
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--feature-dim, var(--text-dim));
+  border-top: 1px solid var(--feature-border, var(--line));
+}
+
+/* 能力档位：整组拼成一张卡，行间发丝线。名字列给足宽度——原来 130px，
+   "看懂并判断 AI 改了什么、对不对" 这种说明会被挤成三行。 */
+.growth-skills-card {
+  background: var(--feature-card, var(--panel-2));
+  border: 1px solid var(--feature-border, var(--line));
+  border-radius: var(--feature-radius-card, 12px);
+  overflow: hidden;
+}
+.growth-skill {
+  display: grid;
+  grid-template-columns: minmax(190px, 1.1fr) minmax(120px, 1.6fr) auto;
+  gap: 14px;
+  align-items: center;
+  margin: 0;
+  padding: 12px 14px;
+}
+.growth-skill + .growth-skill { border-top: 1px solid var(--feature-border, var(--line)); }
+.growth-skill__name { font-size: 13.5px; font-weight: 550; color: var(--feature-text, var(--text)); }
+.growth-skill__name small {
+  display: block;
+  margin-top: 2px;
+  font-size: 11.5px;
+  font-weight: 400;
+  line-height: 1.45;
+  color: var(--feature-dim, var(--text-dim));
+}
+/* 进度条：单色，不再是蓝绿渐变。渐变在这里没有信息量——它不表示两个端点的含义，
+   只是装饰，而这个面板里别处一处渐变都没有。 */
+.growth-bar {
+  position: relative;
+  height: 6px;
+  border-radius: 3px;
+  background: var(--feature-hover, rgba(128, 128, 128, .18));
+  overflow: hidden;
+}
+.growth-bar__fill {
+  position: absolute;
+  inset: 0 auto 0 0;
+  border-radius: 3px;
+  background: var(--feature-blue, var(--accent));
+}
+.growth-skill__right { display: flex; align-items: center; gap: 8px; }
+.growth-skill__pct {
+  min-width: 74px;
+  text-align: right;
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  color: var(--feature-dim, var(--text-dim));
+}
+/* 「可迁移」徽标：走语义令牌，不再写死 #22c55e / #3fb950——那两个色在浅色底上
+   对比度只有 2.4:1，而且深色主题下不跟着变。 */
+.growth-xfer {
+  padding: 2px 7px;
+  font-size: 10.5px;
+  border-radius: 999px;
+  color: var(--feature-dim, var(--text-dim));
+  background: var(--feature-hover, rgba(128, 128, 128, .16));
+}
+.growth-xfer.is-xfer {
+  color: var(--feature-ok, #1a7f37);
+  background: color-mix(in srgb, var(--feature-ok, #1a7f37) 12%, transparent);
+  font-weight: 600;
+}
+/* 纠正按钮：和数字步进器同一副长相。 */
+.growth-nudge {
+  width: 26px;
+  height: 26px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 14px;
+  line-height: 1;
+  color: var(--feature-dim, var(--text-dim));
+  background: var(--feature-control, transparent);
+  border: 1px solid var(--feature-border-strong, var(--line-strong));
+  border-radius: var(--feature-radius-control, 8px);
+  cursor: pointer;
+}
+.growth-nudge:hover { background: var(--feature-hover); color: var(--feature-text, var(--text)); }
+
+.growth-ctl { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; margin: 12px 2px; }
+.growth-ctl label { font-size: 12.5px; color: var(--feature-text, var(--text)); }
+/* 开关和设置页那个共用尺寸。原来这里是 34×20 的第二套，同一个面板里两种开关。 */
+.growth-switch { display: inline-flex; align-items: center; gap: 9px; cursor: pointer; user-select: none; }
+.growth-switch input {
+  appearance: none;
+  position: relative;
+  width: 42px;
+  height: 24px;
+  flex: none;
+  border-radius: 999px;
+  background: var(--feature-border-strong, var(--line-strong));
+  cursor: pointer;
+  transition: background .18s ease;
+}
+.growth-switch input:checked { background: var(--feature-blue, var(--accent)); }
+.growth-switch input::after {
+  content: "";
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  background: #fff;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, .25);
+  transition: transform .18s ease;
+}
+.growth-switch input:checked::after { transform: translateX(18px); }
+
+.growth-stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(110px, 1fr)); gap: 10px; margin: 12px 0; }
+.growth-stat {
+  padding: 10px 12px;
+  background: var(--feature-card, var(--panel-2));
+  border: 1px solid var(--feature-border, var(--line));
+  border-radius: var(--feature-radius-control, 8px);
+}
+.growth-stat b { display: block; font-size: 17px; font-weight: 600; font-variant-numeric: tabular-nums; }
+.growth-stat span { font-size: 11.5px; color: var(--feature-dim, var(--text-dim)); }
+
+.growth-reset, .growth-project__btn {
+  margin-top: 14px;
+  height: 28px;
+  padding: 0 12px;
+  font-size: 12px;
+  color: var(--feature-text, var(--text));
+  background: var(--feature-control, transparent);
+  border: 1px solid var(--feature-border-strong, var(--line-strong));
+  border-radius: var(--feature-radius-control, 8px);
+  cursor: pointer;
+}
+.growth-reset:hover { color: var(--feature-err, #c62828); border-color: var(--feature-err, #c62828); }
+.growth-project__btn:hover { background: var(--feature-hover); }
+
+.growth-project { margin: 0; }
+.growth-project__intro { margin: 0 0 10px; font-size: 12.5px; line-height: 1.55; color: var(--feature-dim, var(--text-dim)); }
+/* 圆点列表是全页唯一一处 ul 项目符号，和面板里其它列表都不是一路。改成发丝线分隔的行。 */
+.growth-project__list { margin: 0; padding: 0; list-style: none; display: flex; flex-direction: column; }
+.growth-project__list li {
+  padding: 9px 0;
+  font-size: 12.5px;
+  line-height: 1.5;
+}
+.growth-project__list li + li { border-top: 1px solid var(--feature-border, var(--line)); }
+.growth-project__more { margin-top: 8px; font-size: 11.5px; color: var(--feature-dim, var(--text-dim)); }
