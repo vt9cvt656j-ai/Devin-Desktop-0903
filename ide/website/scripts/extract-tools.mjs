@@ -92,11 +92,30 @@ function extractFunction(name) {
   throw new Error(`extract-tools: unbalanced braces in ${name}.`);
 }
 
+// `_userCapabilities` returns the user's own declared tools/commands, read from their
+// config files at runtime. The gallery documents the *product* catalog, so the right
+// snapshot here is the empty one — and that is not an approximation: main.js itself
+// evaluates `_buildAgentToolSchemas` once at module-evaluation time to build
+// `_KNOWN_TOOLS`, and reads exactly this empty snapshot then, precisely because the
+// static full set must not be widened or trimmed by whoever happens to be running the
+// app. Returning it keeps the `user__`-prefixed entries and the per-user disabled list
+// out of public/tools.json by construction rather than by filtering after the fact.
+// `_withoutDisabledTools` is pulled in as its real source rather than stubbed: it reads
+// the same snapshot, so an empty `disabled` list makes it a no-op on its own. Extracting
+// it means a future change to how disabling works cannot silently diverge here.
 const buildCatalog = new Function(
   "inTauri",
   "_applyCloudToolDescs",
-  `${extractFunction("_buildAgentToolSchemas")}\n;return _buildAgentToolSchemas;`,
-)(true, (tools) => tools);
+  "_userCapabilities",
+  `${extractFunction("_withoutDisabledTools")}
+   ${extractFunction("_buildAgentToolSchemas")}
+   ;return _buildAgentToolSchemas;`,
+)(true, (tools) => tools, () => ({
+  tools: [],
+  commands: [],
+  disabled: [],
+  errors: [],
+}));
 const names = buildCatalog(true, [])
   .map((tool) => tool?.function?.name)
   .filter(Boolean);

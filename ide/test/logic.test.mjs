@@ -6336,7 +6336,9 @@ test("Kimi and Grok models use dedicated brand icons", () => {
 });
 
 test("thinking depth is based on real per-model capabilities instead of fixed fake tiers", () => {
-  const profile = load("_thinkingProfileFor", {
+  // 直接加载**内置表**：实时收窄是外面那层包装器 _thinkingProfileFor 的事，
+  // 由"实时档位只做收窄"那一组测试覆盖。这里测的是内置判断本身。
+  const profile = load("_builtinThinkingProfileFor", {
     _isImageModel: (id) => /image|图像/i.test(String(id || "")),
     _customModelById: (id) => ["custom:claude", "custom:claude-off"].includes(id)
       ? { id, name: "claude-sonnet-5" }
@@ -13113,13 +13115,14 @@ test("前缀续传的校验必须认得网关真正签发的 token", () => {
   assert.doesNotMatch(gate, /\/\^\[a-f0-9\]\+\$\/i\.test\(trimmedPrefix\)/, "旧的纯 hex 正则必须消失");
 });
 
-test("上下文窗口：真实值来自网关，两张兜底表不得各说各话", () => {
-  // 真实来源是网关 /api/models 的 context_window（server/src/models.rs official_context），
-  // 客户端 _catalogModelContextLimit 优先读它。客户端那张正则表只服务第三方直连，
-  // 但它必须和服务端逐值一致——服务端的数用来规划 michael-compression，客户端的用来做
-  // 请求预算，分歧就是静默 413 或白扔窗口。历史上真的分歧过（gemini-1.5-pro 2M vs 1M）。
-  const RS = readFileSync(join(HERE, "../../server/src/models.rs"), "utf8");
-  const table = RS.slice(RS.indexOf("fn official_context"), RS.indexOf("fn official_context") + 3200);
+test("第三方直连的兜底窗口表本身要准——它是那条链路唯一的数据源", () => {
+  // 走网关时真实值来自 /api/models 的 context_window，而网关那边**已经没有硬编码表了**
+  // ——全部来自实时目录（2026-08-16 删除，那张表实测在售 13 款里错了 6 款）。所以这条
+  // 测试不再和服务端逐值对账：对账对象没了。
+  //
+  // 但客户端这张表仍然要准，因为它服务的是**另一条链路**：用户配自己的 API key 直连
+  // 第三方时不经过网关，也就拿不到实时目录，这张表是那里唯一的数据源。数错了就是
+  // 静默 413（估大了）或白扔窗口（估小了）。
   const client = load("_fallbackModelContextLimit");
   const pairs = [
     // Anthropic Models API (max_input_tokens) is the authority. Opus 4.6/4.7/4.8/5,
@@ -13132,22 +13135,8 @@ test("上下文窗口：真实值来自网关，两张兜底表不得各说各�
     ["deepseek-v3", 128_000], ["glm-4", 128_000], ["minimax-m2", 1_000_000],
   ];
   for (const [id, expect] of pairs) {
-    assert.equal(client(id), expect, `客户端兜底表 ${id} 应为 ${expect}`);
+    assert.equal(client(id), expect, `第三方直连兜底表 ${id} 应为 ${expect}`);
   }
-  // 服务端表必须覆盖同样这些族（有价就必须有窗口）
-  for (const fam of ["claude", "gpt-5", "gemini", "grok", "kimi", "deepseek", "glm", "minimax", "xai"]) {
-    assert.ok(table.includes(`"${fam}"`), `服务端 official_context 必须覆盖 ${fam}`);
-  }
-  assert.match(table, /1\.5.*pro[\s\S]{0,120}2_000_000/, "gemini-1.5-pro 服务端必须是 2M，与客户端一致");
-  // 服务端也必须逐型号，不能再一刀切 200K —— 那会把 Opus/Sonnet 新家族 4/5 的窗口白扔
-  assert.match(table, /opus-4-6[\s\S]{0,400}1_000_000/,
-    "服务端必须给 Opus 4.6/4.7/4.8/5、Sonnet 4.6/5、Fable 5 记 1M，不能一刀切 200K");
-  assert.doesNotMatch(table, /contains\("claude"\) \{\s*\n\s*\/\/[^\n]*\n\s*return Some\(200_000\)/,
-    "不得恢复成 claude 一律 200K");
-  // 标量必须从列表推导。两者一旦各写各的，就会重演「卡片显示一个数、记账用另一个数」
-  // 那次分歧——那正是这轮修的东西。
-  assert.match(RS, /fn official_context\(model_id: &str\) -> Option<i64> \{\s*\n\s*official_contexts\(model_id\)\.first\(\)/,
-    "official_context 必须取 official_contexts 的第一项，不能自己再写一份");
 });
 
 test("上下文选择存的是意图而不是数字，原生窗口修正后不会把用户钉死", () => {
@@ -17594,7 +17583,9 @@ test("方案C：验收契约块——格式、500 字硬上限、空清单不注
 });
 
 test("方案D：布尔思考开关模型诚实两态——能力表驱动，不渲染 low/medium/high 假档位", () => {
-  const profileFor = load("_thinkingProfileFor", {
+  // 直接加载内置表（glm-5 在真实目录里 efforts 是空数组，本就交还内置表——
+  // "没有深度档位"不等于"不能开思考"，这条测的正是后者）。
+  const profileFor = load("_builtinThinkingProfileFor", {
     _isImageModel: () => false,
     t: (key) => key,
   });
@@ -20001,17 +19992,71 @@ test("#92: list_dir depth>1 递归遍历实现", () => {
     "递归遍历必须跳过忽略目录");
 });
 
-test("#92: _workspaceTreeSnapshot 深度自适应（移除硬上限 5）", () => {
+test("#92: _workspaceTreeSnapshot 深度自适应（移除硬上限 5）", async () => {
   // 旧代码: Math.max(1, Math.min(5, ...))
   // 新代码: Math.max(1, ...) 不再有 Math.min(5, ...)
   const snapshotMatch = SRC.match(/_workspaceTreeSnapshot[\s\S]*?const maxDepth\s*=\s*([^;]+);/);
   assert.ok(snapshotMatch, "必须找到 _workspaceTreeSnapshot 的 maxDepth 定义");
   assert.ok(!snapshotMatch[1].includes("Math.min(5"),
     "maxDepth 不能再有 Math.min(5, ...) 硬上限");
-  // visited 计数器 + maxLines 预算仍然存在作为安全网
-  assert.match(SRC, /visited\s*>=\s*maxLines/,
-    "visited 计数器 + maxLines 预算兜底必须保留");
+  // 深度不再有硬上限，所以**预算兜底**是唯一挡住"深目录把快照撑爆"的东西。
+  //
+  // 这里断言的是那个不变量本身，不是它当时的实现。原断言钉的是 `visited >= maxLines`
+  // ——一个共享计数器。预算后来改成按层公平分配（见下一条测试：共享计数器会让靠后的
+  // 顶层目录整个消失），于是原断言被一次**正确**的重构搞红了。这正是本仓库反复吃过的亏：
+  // 钉实现的断言会在正确改动上报警，然后被删掉，之后它什么都不保护。
+  const deep = {};
+  let dir = "/r";
+  for (let i = 0; i < 40; i++) {
+    const child = `${dir}/d${i}`;
+    deep[dir] = [
+      { name: `d${i}`, path: child, is_dir: true },
+      ...Array.from({ length: 30 }, (_, j) => ({ name: `f${j}.js`, path: `${dir}/f${j}.js`, is_dir: false })),
+    ];
+    dir = child;
+  }
+  const text = await treeSnapshot(deep)("/r", { maxLines: 120, maxDepth: 40 });
+  const lines = text.split("\n").filter((l) => /📁|\.js/.test(l));
+  assert.ok(lines.length <= 120, `深目录把快照撑到 ${lines.length} 行，预算兜底没拦住`);
 });
+
+test("靠后的顶层目录不能被前面的吃光预算——大项目里那等于半个仓库消失", async () => {
+  // 缺陷形状（2026-08-16 实测）：预算原来是一个共享计数器，并行遍历后按顺序组装、再
+  // `.slice(0, maxLines)` 砍掉尾部。于是按字母序靠后的顶层目录**整个不出现**。
+  // 在这个仓库的默认档（180 项）下 `server/src/` 一行都没有——模型不知道后端源码在哪，
+  // 而它只看到结尾一句"只展示前 180 项"，连自己漏了半个项目都不知道。
+  //
+  // 用 aaa/ 塞满预算再看 zzz/ 还在不在，是那次事故的最小复现。
+  const tree = {
+    "/r": [
+      { name: "aaa", path: "/r/aaa", is_dir: true },
+      { name: "zzz", path: "/r/zzz", is_dir: true },
+    ],
+    // aaa 一个目录就足以吃光整份预算
+    "/r/aaa": Array.from({ length: 400 }, (_, i) => ({ name: `f${i}.js`, path: `/r/aaa/f${i}.js`, is_dir: false })),
+    "/r/zzz": [{ name: "src", path: "/r/zzz/src", is_dir: true }],
+    "/r/zzz/src": [{ name: "main.rs", path: "/r/zzz/src/main.rs", is_dir: false }],
+  };
+  const out = await treeSnapshot(tree)("/r", { maxLines: 120, maxDepth: 3 });
+  assert.ok(out.includes("zzz/"), "靠后的顶层目录被前面的吃光了预算，整个从快照里消失");
+  assert.ok(out.includes("zzz/src/"),
+    "靠后的顶层目录只剩一个名字、没能展开——模型仍然不知道它的源码目录在哪");
+});
+
+/** 用假 backend 跑真的 `_workspaceTreeSnapshot`。 */
+function treeSnapshot(tree) {
+  // `_remote` 未启用 = 本地工作区，正是这些断言要覆盖的场景。路径归一化那一族都读它。
+  const _remote = { active: false, url: "", token: "", root: "", host: "", platform: "" };
+  const _normalizeFsPath = load("_normalizeFsPath", { _toPosix: load("_toPosix"), _remote });
+  return load("_workspaceTreeSnapshot", {
+    backend: { readDir: async (p) => tree[p] || [] },
+    _normalizeFsPath,
+    _agentDirEntryName: load("_agentDirEntryName", { basename }),
+    _agentDirEntryIsDir: load("_agentDirEntryIsDir"),
+    _normRel: load("_normRel", { _normalizeFsPath, _pathIdentity: load("_pathIdentity", { _normalizeFsPath, _remote }) }),
+    _AGENT_CONTEXT_SKIP_DIRS: loadConst("_AGENT_CONTEXT_SKIP_DIRS"),
+  });
+}
 
 test("#92: 缓存指纹增强——包含一级子目录文件数", () => {
   // 指纹构建遍历一级子目录
@@ -23962,4 +24007,336 @@ test("收尾门只记账、不偷偷代跑——这条是刻意的", () => {
   assert.match(SRC, /run\._incompleteReason = "code_delivered_unverified";/);
   // 理由要写在代码里，否则下一个人（比如我）会再接一次
   assert.match(SRC, /关键词是 \*\*secretly\*\*/);
+});
+
+// ===========================================================================
+//  项目约定的注入：agent 写代码前到底看没看见这个项目的规矩
+// ===========================================================================
+//
+// 这一组守的是"AI 写出来的代码不像这个项目"的根因。约定文件和上下文里别的东西不是
+// 一个性质：树快照、关键文件是**素材**，模型可以选择性地看；约定是**硬指令**，漏一条
+// 就等于没有。而这条链路上三种丢失全都不报错——测试全绿、构建全绿，只有生成的代码
+// 在悄悄跑偏。
+
+test("子包自己的约定必须读得到——monorepo 里那份才是最具体的规矩", async () => {
+  // 缺陷形状：旧版只读 `root + "/" + guide` 这四个固定路径，packages/api/AGENTS.md 这类
+  // 子包约定一份都进不了上下文。模型于是拿着仓库总纲去写子包的代码。
+  const tree = {
+    "/repo": [
+      { name: "packages", path: "/repo/packages", is_dir: true },
+      { name: "node_modules", path: "/repo/node_modules", is_dir: true },
+      { name: ".git", path: "/repo/.git", is_dir: true },
+      { name: "README.md", path: "/repo/README.md", is_dir: false },
+    ],
+    "/repo/packages": [
+      { name: "api", path: "/repo/packages/api", is_dir: true },
+      { name: "web", path: "/repo/packages/web", is_dir: true },
+    ],
+    "/repo/node_modules": [{ name: "left-pad", path: "/repo/node_modules/left-pad", is_dir: true }],
+  };
+  const files = {
+    "/repo/packages/api/AGENTS.md": "API 包：handler 一律返回 Result，不许抛异常",
+    "/repo/packages/web/CLAUDE.md": "Web 包：只写 function 组件",
+    // 这份在被跳过的目录里，出现即说明 SKIP_DIRS 没生效
+    "/repo/node_modules/left-pad/AGENTS.md": "绝不该被读到",
+  };
+  const hits = await nestedGuides(tree, files)("/repo");
+  const got = hits.map(([dir, name]) => `${dir}/${name}`).sort();
+  assert.deepEqual(got, [
+    "/repo/packages/api/AGENTS.md",
+    "/repo/packages/web/CLAUDE.md",
+  ], "子包约定没被读全，或者读进了不该读的目录");
+});
+
+test("扫子包约定不能走进 node_modules 那种目录", async () => {
+  // 无脑递归会把 node_modules 整棵树扫一遍：每次重建上下文多花几百毫秒，还可能把
+  // 某个依赖自带的 AGENTS.md 当成本项目的规矩注进去——比读不到更糟。
+  const tree = {
+    "/repo": [
+      { name: "node_modules", path: "/repo/node_modules", is_dir: true },
+      { name: "target", path: "/repo/target", is_dir: true },
+      { name: ".venv", path: "/repo/.venv", is_dir: true },
+      { name: "src", path: "/repo/src", is_dir: true },
+    ],
+  };
+  const files = {
+    "/repo/node_modules/AGENTS.md": "依赖的规矩，不是本项目的",
+    "/repo/target/AGENTS.md": "构建产物里的",
+    "/repo/.venv/AGENTS.md": "虚拟环境里的",
+    "/repo/src/AGENTS.md": "这份才是真的",
+  };
+  const hits = await nestedGuides(tree, files)("/repo");
+  assert.deepEqual(hits.map(([d]) => d), ["/repo/src"], "跳过目录的名单没生效");
+});
+
+test("子包约定有数量上限——monorepo 顶层可能几十个包", async () => {
+  const subs = Array.from({ length: 30 }, (_, i) => ({
+    name: `p${i}`, path: `/repo/p${i}`, is_dir: true,
+  }));
+  const files = Object.fromEntries(subs.map((s) => [`${s.path}/AGENTS.md`, `包 ${s.name} 的规矩`]));
+  const hits = await nestedGuides({ "/repo": subs }, files)("/repo");
+  const cap = loadConst("_GUIDE_NESTED_MAX_FILES");
+  assert.equal(hits.length, cap, `注入了 ${hits.length} 份子包约定，上限应当是 ${cap}`);
+});
+
+test("根目录写了两份约定就要注入两份，不能只认第一份", () => {
+  // 缺陷形状：旧版命中第一个文件就 `break`。项目同时写了 AGENTS.md 和 CLAUDE.md 时
+  // ——两个 agent 生态各写一份非常常见——第二份整个消失，而用户以为两份都在生效。
+  const region = guideInjectionRegion();
+  assert.match(region, /for \(const hit of await _guidePromise\)/,
+    "根约定的注入循环不见了或改了名");
+  // 旧写法在命中后立刻 break。断言的是"循环体里不再有裸 break"，不是措辞。
+  assert.doesNotMatch(region, /parts\.push\([^\n]*项目约定[^\n]*\);\s*break;/,
+    "又变回了命中第一份就 break——第二份约定会被整份丢掉");
+});
+
+test("约定文件不能再被砍成 2000 字符、还挖掉中间那段", () => {
+  // 缺陷形状：旧版 `_contextSnippet(hit[1], 2000, ...)`。而 _contextSnippet 超限时留头
+  // 65% 尾 35%、中间换成一句"已截断"。一份认真写的约定文件里具体条款几乎总在中间，
+  // 于是模型拿到的是开头的背景和结尾的收尾，真正要遵守的部分正好被挖掉。
+  const region = guideInjectionRegion();
+  assert.doesNotMatch(region, /_contextSnippet\(hit\[1\],\s*2000/,
+    "又把项目约定砍回 2000 字符了");
+  assert.match(region, /_GUIDE_PER_FILE_CAP/, "单份预算不再走常量，说明预算逻辑被改回硬编码");
+  assert.ok(loadConst("_GUIDE_PER_FILE_CAP") >= 4000,
+    "单份约定的预算低到装不下一份正常的 AGENTS.md，截断会重新开始吃掉条款");
+  assert.match(region, /子目录约定/, "子包约定没有被注入进上下文");
+});
+
+/** 用假 backend 跑真的 `_nestedProjectGuides`。 */
+function nestedGuides(tree, files) {
+  return load("_nestedProjectGuides", {
+    backend: {
+      readDir: async (p) => tree[p] || [],
+      readTextFile: async (p) => {
+        if (Object.prototype.hasOwnProperty.call(files, p)) return files[p];
+        throw new Error(`ENOENT ${p}`);
+      },
+    },
+    _agentDirEntryIsDir: load("_agentDirEntryIsDir"),
+    _agentDirEntryName: load("_agentDirEntryName", { basename }),
+    _AGENT_CONTEXT_SKIP_DIRS: loadConst("_AGENT_CONTEXT_SKIP_DIRS"),
+    _NESTED_GUIDE_FILES: loadConst("_NESTED_GUIDE_FILES"),
+    _GUIDE_NESTED_MAX_DIRS: loadConst("_GUIDE_NESTED_MAX_DIRS"),
+    _GUIDE_NESTED_MAX_FILES: loadConst("_GUIDE_NESTED_MAX_FILES"),
+    _GUIDE_NESTED_DEPTH: loadConst("_GUIDE_NESTED_DEPTH"),
+  });
+}
+
+/**
+ * 约定注入那一段的源文本，**剥掉注释**。
+ *
+ * 不剥的话这几条断言会被我自己写在上面的注释喂到——那些注释里逐字引用了被修掉的旧代码
+ * （`_contextSnippet(hit[1], 2000` 和那个 break），于是"旧写法不该出现"的断言永远是绿的，
+ * 而真代码改回去了也照样绿。这个坑这个仓库踩过不止一次。
+ */
+function guideInjectionRegion() {
+  const at = SRC.indexOf("--- 项目约定 (");
+  assert.ok(at > 0, "项目约定的注入点找不到了");
+  return stripJsComments(SRC.slice(at - 1600, at + 1400));
+}
+
+// ===========================================================================
+//  符号索引：大项目里最重要的文件不能被整个挡在索引外
+// ===========================================================================
+
+test("大的正常源码必须能进索引——旧的 512KB 上限把本仓库的核心文件整个挡在外面", () => {
+  // 缺陷形状（2026-08-16 实测）：判据是文件大小，上限 512KB。而这个仓库自己的
+  // src/main.js 有 4MB——上限的 8 倍——于是它里面 11571 个符号一个都没进索引。
+  // find_symbol 找不到、符号地图里没有、BM25 全文检索也没有（三处共用这道判据）。
+  // 模型在承载了九成逻辑的那个文件上是瞎的，而且没有任何地方会提示它。
+  //
+  // 实测抽完这 4MB 只要 13ms（BM25 分词 24ms），所以旧限制省下的是几十毫秒，
+  // 付出的是整个项目的核心。项目越大，被挡在外面的越是关键文件。
+  const indexable = load("_indexableSource", {
+    _SYMBOL_INDEX_MAX_BYTES: loadConst("_SYMBOL_INDEX_MAX_BYTES"),
+    _SYMBOL_INDEX_MAX_LINE_AVG: loadConst("_SYMBOL_INDEX_MAX_LINE_AVG"),
+  });
+  // 拿真的 main.js 来测：它就是那个被挡掉的文件。
+  assert.ok(SRC.length > 1024 * 1024, "main.js 应当仍是一个百万字符级的大文件");
+  assert.ok(indexable(SRC),
+    `main.js（${SRC.length} 字符）又被挡在符号索引外了——它是本项目九成逻辑所在`);
+});
+
+test("压缩/生成的单行大文件仍然要挡住——放宽上限不能把噪音放进来", () => {
+  // 放宽大小上限的代价必须由一个**更准**的判据接住，否则等于把 .min.js 放进索引：
+  // 逐行 regex 在压缩文件上又慢又只抽得出噪音。判据是平均行长，不是大小——
+  // 大小挡不住 200KB 的 .min.js，却会误伤 4MB 的正常源码，这正是上一条测试的缺陷。
+  const indexable = load("_indexableSource", {
+    _SYMBOL_INDEX_MAX_BYTES: loadConst("_SYMBOL_INDEX_MAX_BYTES"),
+    _SYMBOL_INDEX_MAX_LINE_AVG: loadConst("_SYMBOL_INDEX_MAX_LINE_AVG"),
+  });
+  const minified = "var a=1;".repeat(30000); // 24 万字符、一行
+  assert.ok(!indexable(minified), "压缩过的单行文件混进索引了");
+  // 正常源码：同样的体量，但有正常的换行
+  const normal = "function f() { return 1; }\n".repeat(9000);
+  assert.ok(indexable(normal), "正常的大源文件被当成压缩文件挡掉了");
+  assert.ok(!indexable(""), "空内容不该进索引");
+  assert.ok(!indexable("x".repeat(loadConst("_SYMBOL_INDEX_MAX_BYTES") + 1)),
+    "超过硬上限的文件仍然要挡住");
+});
+
+test("icon_constants_precede_their_use: 模块顶层不能读到还没初始化的 const", () => {
+  // 事故形状（2026-08-16 实测，跑起来才发现）：`_ICON_CAPS` 被放在文件 27000 行外——
+  // 挨着它自己的功能代码——而用到它的那段块语句在 15514 行，**模块求值时就跑**。
+  // 于是 JS 抛 ReferenceError: Cannot access '_ICON_CAPS' before initialization，
+  // 模块顶层从那里整个中断：应用能起窗口、Rust 侧一切正常，但后面所有初始化一行都没跑。
+  //
+  // 为什么非要测试不可：15414 行**早就写着**这条警告（"放到文件后面会是 TDZ 报错，而且是
+  // 应用一启动就白屏那种，测试还照样绿"）。写警告的人踩过一次，加能力面板的人没看见，
+  // 又踩了一次。注释挡不住第二回，所以改由这条钉着。
+  //
+  // 查的是整类问题而不是那几个图标：任何在模块顶层被提前读到的 const/let/class 都算。
+  // 函数体内的引用不算——那是延迟执行的，等真正调用时早就初始化好了。
+  const ast = acorn.parse(SRC, { ecmaVersion: "latest", sourceType: "module" });
+  const declaredAt = new Map();   // 名字 → 顶层 TDZ 声明的位置
+  for (const node of ast.body) {
+    if (node.type === "VariableDeclaration" && node.kind !== "var") {
+      for (const d of node.declarations) {
+        if (d.id?.type === "Identifier") declaredAt.set(d.id.name, node.start);
+      }
+    } else if (node.type === "ClassDeclaration" && node.id) {
+      declaredAt.set(node.id.name, node.start);
+    }
+  }
+  const violations = [];
+  // 只走模块顶层**会立即执行**的语句，遇到任何函数体就停——那里面的引用是延迟的。
+  const scan = (node, stmtStart) => {
+    if (!node || typeof node.type !== "string") return;
+    if (node.type === "FunctionDeclaration" || node.type === "FunctionExpression"
+        || node.type === "ArrowFunctionExpression" || node.type === "ClassBody") return;
+    if (node.type === "Identifier") {
+      const at = declaredAt.get(node.name);
+      if (at !== undefined && node.start < at) {
+        violations.push({ name: node.name, usedAt: node.start, declaredAt: at });
+      }
+      return;
+    }
+    // 属性名（obj.foo 的 foo）不是变量引用
+    if (node.type === "MemberExpression" && !node.computed) { scan(node.object, stmtStart); return; }
+    if (node.type === "Property" && !node.computed) { scan(node.value, stmtStart); return; }
+    for (const [k, v] of Object.entries(node)) {
+      if (k === "start" || k === "end" || k === "loc") continue;
+      if (Array.isArray(v)) for (const c of v) scan(c, stmtStart);
+      else if (v && typeof v.type === "string") scan(v, stmtStart);
+    }
+  };
+  for (const node of ast.body) {
+    if (node.type === "FunctionDeclaration" || node.type === "ClassDeclaration") continue;
+    if (node.type === "ImportDeclaration" || node.type === "ExportNamedDeclaration") continue;
+    scan(node, node.start);
+  }
+  const line = (off) => SRC.slice(0, off).split("\n").length;
+  assert.deepEqual(violations.map((v) => `${v.name}（第 ${line(v.usedAt)} 行读，第 ${line(v.declaredAt)} 行才声明）`), [],
+    "模块顶层提前读到了还没初始化的绑定——应用一启动就会在这里中断，而所有测试仍然是绿的");
+});
+
+// ===========================================================================
+//  推理档位：用网关实时抓到的，而不是客户端那张手写表
+// ===========================================================================
+
+const liveLevels = () => load("_liveThinkingLevels", {
+  _modelCatalogEntry: (id) => ({
+    "claude-opus-4-8": { supportedEfforts: ["max", "xhigh", "high", "medium", "low"] },
+    "deepseek-v4-flash": { supportedEfforts: ["xhigh", "high"] },
+    "glm-5": { supportedEfforts: [] },
+    "gpt-5.4": { supportedEfforts: ["xhigh", "high", "medium", "low", "none"] },
+    "私有命名-x": { supportedEfforts: null },
+  }[id] || null),
+});
+
+/** 内置表 + 实时收窄的最终 profile。内置 profile 由调用方给，模拟不同 kind。 */
+const narrowed = (base, id) => load("_thinkingProfileFor", {
+  _builtinThinkingProfileFor: () => base,
+  _liveThinkingLevels: liveLevels(),
+  _effortIsSendable: load("_effortIsSendable"),
+  _THINK_LEVELS: loadConst("_THINK_LEVELS"),
+  _isImageModel: () => false,
+})(id);
+
+test("档位名单以实时目录为准，但绝不替换内置 profile 的 kind 和映射", () => {
+  // 事故形状（2026-08-16，用户报"开了思考却是不思考的效果"）：第一版让实时 profile
+  // 直接顶替整个内置 profile，还自造了一个 kind:"live"。而下游是**按 kind 分派**去构造
+  // 请求参数的（reasoning_effort / thinking_budget / thinking_level…），"live" 一个分支
+  // 都不匹配，于是一个思考参数都不发——线上日志是 reasoning_effort="absent"，
+  // 用户界面上明明选了"极限"。目录里有档位的 28 个模型全中招。
+  //
+  // 目录只知道"有哪些档位"，**不知道档位怎么变成参数**。所以只许收窄，kind 必须原样。
+  const base = {
+    kind: "reasoning_effort",
+    configurable: true,
+    levels: ["off", "low", "medium", "high", "xhigh", "max"],
+    defaultLevel: "high",
+    effortMap: { off: "none", low: "low", medium: "medium", high: "high", xhigh: "xhigh", max: "max" },
+  };
+  const p = narrowed(base, "deepseek-v4-flash");
+  assert.equal(p.kind, "reasoning_effort", "kind 被替换了，下游就构造不出参数");
+  assert.deepEqual(p.effortMap, base.effortMap, "参数映射必须原样保留");
+  // deepseek 实测只支持 xhigh/high —— 名单以目录为准，内置多出来的 low/medium 不再摆出来
+  assert.deepEqual(p.levels, ["off", "high", "xhigh"], "没按实时目录出名单");
+});
+
+test("发不出去的档位不许摆出来——budget 类 kind 缺映射就构造不出参数", () => {
+  // 名单虽以目录为准，但每一档都要先过 _effortIsSendable：thinking_budget 这类 kind
+  // 必须在 budgets 里查到数字，查不到就发不出去，摆出来只是让用户选一个静默失效的按钮。
+  const base = {
+    kind: "thinking_budget",
+    configurable: true,
+    levels: ["off", "low", "high"],
+    defaultLevel: "high",
+    budgets: { low: 4000, high: 24000 },
+  };
+  const p = narrowed(base, "claude-opus-4-8"); // 目录给 max/xhigh/medium，但 budgets 里只有 low/high
+  assert.deepEqual(p.levels, ["off", "low", "high"], "把构造不出参数的档位摆出来了");
+  assert.deepEqual(p.budgets, base.budgets);
+});
+
+test("目录没这一款、或它不吃档位时，内置表原样生效", () => {
+  const base = { kind: "reasoning_effort", configurable: true, levels: ["off", "low", "high"], defaultLevel: "high" };
+  // 目录里没有 → 原样
+  assert.deepEqual(narrowed(base, "私有命名-x").levels, base.levels);
+  assert.deepEqual(narrowed(base, "完全没见过").levels, base.levels);
+  // glm-5 有这一款但 efforts 为空 = 有开关没档位，同样交还内置表
+  assert.deepEqual(narrowed(base, "glm-5").levels, base.levels);
+});
+
+test("内置表猜错「不支持档位」时，实时目录要能推翻它", () => {
+  // 实测缺陷：deepseek-v4-flash 的目录里明确写着支持 xhigh/high，而内置表按模型名把它
+  // 归进了"原生推理、没有公开旋钮"那一类。于是界面上只剩一个"关闭"——这个模型的深度
+  // 用户根本调不了。内置表是猜的，目录是厂商声明的，冲突时信后者。
+  const none = { kind: "none", configurable: false, levels: ["off"], defaultLevel: "off" };
+  const p = narrowed(none, "deepseek-v4-flash");
+  assert.equal(p.configurable, true, "内置表的猜测把目录声明的档位挡住了");
+  assert.deepEqual(p.levels, ["off", "high", "xhigh"]);
+  assert.equal(p.kind, "reasoning_effort", "要用下游认得的 kind，否则参数发不出去");
+
+  // 但目录里没有这一款时，内置表的判断照旧生效
+  assert.deepEqual(narrowed(none, "完全没见过"), none);
+});
+
+test("图像模型是本地事实，目录推翻不了", () => {
+  // 画图模型没有推理档位这回事。这一条不是"猜"，所以不接受目录覆盖。
+  const none = { kind: "none", configurable: false, levels: ["off"], defaultLevel: "off" };
+  const withImage = (base, id) => load("_thinkingProfileFor", {
+    _builtinThinkingProfileFor: () => base,
+    _liveThinkingLevels: liveLevels(),
+    _effortIsSendable: load("_effortIsSendable"),
+    _THINK_LEVELS: loadConst("_THINK_LEVELS"),
+    _isImageModel: () => true,
+  })(id);
+  assert.deepEqual(withImage(none, "deepseek-v4-flash"), none, "图像模型被目录覆盖了");
+});
+
+test("一档都发不出去时交还内置表，不能让用户没档位可选", () => {
+  // budget 类 kind + 目录给的档位全都不在 budgets 里 → 一档都构造不出参数，
+  // 这时宁可原样用内置表，也不要渲染一个只有"关闭"的选择器。
+  const base = { kind: "gemini_budget", configurable: true, levels: ["off", "minimal"], defaultLevel: "minimal", budgets: { minimal: 1024 } };
+  const p = narrowed(base, "deepseek-v4-flash"); // 目录给 xhigh/high，budgets 里都没有
+  assert.deepEqual(p.levels, base.levels, "把档位清空了，用户没有档位可选");
+});
+
+test("上游的 none 映射成本地的 off", () => {
+  assert.deepEqual(liveLevels()("gpt-5.4"), ["xhigh", "high", "medium", "low", "off"]);
+  assert.equal(liveLevels()("glm-5"), null, "空档位要交还内置表");
+  assert.equal(liveLevels()("私有命名-x"), null);
 });

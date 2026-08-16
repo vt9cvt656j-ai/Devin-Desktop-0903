@@ -94,24 +94,22 @@ test("源码里那道闸真的在——去掉它这组测试就没意义了", ()
 // "要不要问他修 bug / 要不要列菜单"的反复推演上。这类轮次代码里本来就已经在省
 // 系统提示词、跳过技能块和工作区预热了（_shouldUseLightweightAgentTurn），
 // 唯独思考预算照付默认档（Claude 4.6 的 high = 24000 budget_tokens）。
-test("琐碎轮把思考降到最浅档，但显式选过档位的用户不受影响", () => {
-  // 不用 grab：这个函数的注释里有 {"type":"enabled","budget_tokens":N} 这种花括号，
-  // 会把朴素的括号计数带偏、body 被截断。直接按位置切一段足够长的源码。
+test("琐碎轮不再偷偷把思考降档——用户选什么就发什么", () => {
+  // 这一档降级删掉了。它写在"客户端还发不出 effort"的年代：当时 Claude 走
+  // budget_tokens=24000，一句"你好啊"确实会烧掉整份预算。现在是 adaptive + effort，
+  // 深浅由模型每轮自己定，前提没了，留下的只有"用户选的和实际发的不一致"。
+  //
+  // 轻量轮本身**保留**：它仍然省系统提示词、跳过技能块和工作区预热——那些是真的省，
+  // 而且不改变用户的任何选择。只有"改写思考档位"这一条被摘掉了。
   const _start = SRC.indexOf("function _applyThinkingToConfig(");
   assert.ok(_start > 0, "_applyThinkingToConfig 没找到");
   const fn = SRC.slice(_start, _start + 6000);
-  assert.match(fn, /opts\.lightTurn/, "要有 lightTurn 这一档降级");
-  assert.match(fn, /\["minimal", "low", "medium"\]\.find/, "降到该模型有的最浅档");
-  // 显式选择优先：和它下面那条 max→high 的钳位用同一套判据
-  const light = fn.slice(fn.indexOf("opts.lightTurn"), fn.indexOf("opts.agentTurn"));
-  assert.match(light, /_loadThinkingPrefs\(\)\[preferenceId\]/, "要读用户显式选过的档位");
-  assert.match(light, /if \(!explicit/, "显式选过就不降");
-  // 不能降到 off：Fable/Mythos 没有 off（显式 disabled 是 400）
-  assert.match(light, /pref !== "off"/, "已经关掉思考的不要再动");
+  assert.doesNotMatch(fn, /opts\.lightTurn/, "轻量轮又在改写档位了");
+  assert.doesNotMatch(fn, /\["minimal", "low", "medium"\]\.find/, "又在往最浅档压");
 
-  // 接线：判定出琐碎轮之后必须真的重设一次，否则这一档等于没写
-  assert.match(SRC, /if \(_agentLightTurn\) \{[\s\S]{0,400}lightTurn: true/,
-    "_agentLightTurn 判定之后要重新套一次思考配置");
+  // 轻量轮本身还在（省的是提示词，不是思考深度）
+  assert.match(SRC, /_agentLightTurn = _shouldUseLightweightAgentTurn\(/,
+    "轻量轮判定不该被一起删掉——它省的提示词是真省");
 });
 
 // ── 空工作区不能推「深挖整个项目」 ───────────────────────────────────────────

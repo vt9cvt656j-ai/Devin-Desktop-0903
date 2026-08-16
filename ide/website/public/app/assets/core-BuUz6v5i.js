@@ -1,0 +1,1 @@
+import{Bl as e,Gl as t,Hl as n,Jl as r,Kl as i,Ll as a,Rl as o,Ul as s,Vl as c,Wl as l,ql as u,zl as d}from"./vendor-DXElHJaw.js";l();export{a as Channel,o as PluginListener,d as Resource,e as SERIALIZE_TO_IPC_FN,c as addPluginListener,n as checkPermissions,s as convertFileSrc,t as invoke,i as isTauri,u as requestPermissions,r as transformCallback};

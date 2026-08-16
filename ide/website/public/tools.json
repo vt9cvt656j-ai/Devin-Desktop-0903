@@ -1,7 +1,7 @@
 {
   "generatedFrom": "ide/src/main.js · _buildAgentToolSchemas",
   "generatedAt": null,
-  "count": 132,
+  "count": 136,
   "groups": [
     "Agents",
     "Code intelligence",
@@ -183,6 +183,11 @@
       "desktopOnly": false
     },
     {
+      "name": "git_show",
+      "group": "Git & GitHub",
+      "desktopOnly": false
+    },
+    {
       "name": "git_log",
       "group": "Git & GitHub",
       "desktopOnly": false
@@ -270,6 +275,21 @@
     {
       "name": "lsp_references",
       "group": "Code intelligence",
+      "desktopOnly": false
+    },
+    {
+      "name": "probe_env",
+      "group": "Knowledge",
+      "desktopOnly": false
+    },
+    {
+      "name": "ui_extract",
+      "group": "Knowledge",
+      "desktopOnly": false
+    },
+    {
+      "name": "view_image",
+      "group": "Knowledge",
       "desktopOnly": false
     },
     {

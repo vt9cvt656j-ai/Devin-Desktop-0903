@@ -12931,6 +12931,15 @@ async function loadBackendModels() {
         // pricing + blurb for the hover info card (input/output = USD per 1M tokens)
         inPrice: pricing.inPrice, outPrice: pricing.outPrice, flatPrice: pricing.flatPrice, rate: pricing.rate,
         contextLimit, contextWindows,
+        // 网关实时抓到的推理档位。两种"空"必须分开，否则会把两件相反的事混成一件：
+        //   null = 目录里没有这一款（中转商私有命名）→ 客户端保持自己的内置判断；
+        //   []   = 目录里**有**，但它确实不吃档位（实测 glm-5 就是）→ 不该显示档位选择。
+        // capability_source 是网关告诉我们这条能力信息是实时的还是走了硬编码兜底，
+        // 只有 "live" 时那个空数组才是一个真正的答案。
+        supportedEfforts: it.capability_source === "live" && Array.isArray(it.supported_efforts)
+          ? it.supported_efforts.map((x) => String(x))
+          : null,
+        defaultEffort: String(it.default_effort || ""),
         // How much the model will WRITE. Null from the gateway means unknown for this route, and
         // 0 here carries that through — nothing downstream may substitute a number for it.
         maxOutput: Math.max(0, Math.round(Number(it.max_output_tokens ?? it.maxOutputTokens) || 0)),
@@ -14093,7 +14102,98 @@ function _claudeGeneration(id = "") {
   return (Number(m[1]) || 0) + minor / 10;
 }
 
+/**
+ * 这个模型实时目录里给出的思考档位。`null` = 目录没有它/没给档位 → 用内置表原样。
+ *
+ * 只返回**档位名单**，不返回 profile：档位怎么变成请求参数由内置表的 kind 决定，
+ * 这里越权替换掉整个 profile 正是"开了思考却不思考"那次事故的原因。
+ */
+function _liveThinkingLevels(modelId) {
+  let entry = null;
+  try { entry = _modelCatalogEntry(modelId); } catch { return null; }
+  const efforts = entry?.supportedEfforts;
+  // null = 目录里没这一款；空数组 = 有这一款但它不吃档位，两种都交还内置表
+  // （"没有深度档位"不等于"不能开思考"，GLM 就是有开关没档位）。
+  if (!Array.isArray(efforts) || !efforts.length) return null;
+  // 上游的 `none`（不推理）对应本地的 `off`，本地档位表里没有 `none` 这个名字。
+  return efforts.map((e) => (e === "none" ? "off" : String(e)));
+}
+
+/**
+ * 一个档位能不能被这个 profile 的 kind 构造成请求参数。
+ *
+ * 这是实时档位和内置表之间唯一的接缝：目录知道"这个模型有哪些档位"，**不知道档位怎么
+ * 变成请求字段**——那是 kind 管的。按 kind 分类：
+ *   · reasoning_effort / adaptive_thinking / thinking_level：映射表缺项时直接发档位名，
+ *     所以目录给什么都发得出去；
+ *   · thinking_budget / gemini_budget：必须在 budgets 里查到数字，查不到就发不出去，
+ *     摆出来只会让用户选一个静默失效的按钮；
+ *   · kimi-toggle / kimi-forced / none：本地事实（只有开关、或强制开），目录不该改它。
+ */
+function _effortIsSendable(base, level) {
+  if (level === "off") return true;
+  switch (base?.kind) {
+    case "reasoning_effort":
+    case "adaptive_thinking":
+    case "thinking_level":
+      return true;
+    case "thinking_budget":
+    case "gemini_budget":
+      return !!(base.budgets && Number(base.budgets[level]) > 0);
+    default:
+      return false;
+  }
+}
+
+/**
+ * 最终档位 = **实时目录的名单** + 内置表的 kind 与参数映射。
+ *
+ * 这个分工是踩出来的。第一版让实时 profile 整个顶替内置 profile、还自造了 `kind:"live"`，
+ * 而请求参数是**按 kind 分派**构造的，"live" 一个分支都不匹配 → 整轮一个思考参数都不发：
+ * 用户界面上拨到"极限"，线上日志却是 reasoning_effort="absent"，表现就是"开了思考却没思考"。
+ *
+ * 现在名单以目录为准（代码里不再写死哪几档），但每一档都要先过 `_effortIsSendable`——
+ * 摆出来的按钮必须真的能变成请求字段，否则就是换一种方式骗用户。
+ */
 function _thinkingProfileFor(id) {
+  const base = _builtinThinkingProfileFor(id);
+  const live = _liveThinkingLevels(id);
+  // 内置表说"这个模型没有可调档位"，但实时目录**明确列出了档位** → 以目录为准。
+  //
+  // 实测 deepseek-v4-flash 就是这样：目录说它支持 xhigh/high，而内置表把它归进了
+  // "原生推理、没有公开旋钮"那一类，于是界面上只剩一个"关闭"——用户根本调不了深度。
+  // 内置表是按模型名猜的，目录是厂商声明的，冲突时该信后者。
+  //
+  // 但**图像模型除外**：那是本地事实（画图模型没有推理档位这回事），不该被目录覆盖。
+  if (base && base.configurable !== true && live && live.length && base.kind !== "kimi-forced" && !_isImageModel(String(id || "").toLowerCase())) {
+    const allowed = new Set(live);
+    const levels = _THINK_LEVELS.filter((l) => allowed.has(l));
+    if (levels.length) {
+      if (!levels.includes("off")) levels.unshift("off");
+      return {
+        kind: "reasoning_effort",
+        configurable: true,
+        levels,
+        defaultLevel: levels.includes("high") ? "high" : levels[levels.length - 1],
+      };
+    }
+  }
+  if (!base || base.configurable !== true) return base; // 图像模型/强制开：本地事实优先
+  if (!live || !live.length) return base;
+  const usable = live.filter((l) => _effortIsSendable(base, l));
+  if (!usable.length) return base;
+  const allowed = new Set(usable);
+  // 按本地既有顺序排，UI 的档位次序不因目录返回顺序而抖动；off 永远保留，
+  // 用户任何时候都要能把思考关掉。
+  const levels = _THINK_LEVELS.filter((l) => allowed.has(l) || (l === "off" && (base.levels || []).includes("off")));
+  if (!levels.filter((l) => l !== "off").length) return base;
+  const defaultLevel = levels.includes(base.defaultLevel)
+    ? base.defaultLevel
+    : levels[levels.length - 1];
+  return { ...base, levels, defaultLevel };
+}
+
+function _builtinThinkingProfileFor(id) {
   // Custom entries use an internal selector id, but thinking capability belongs
   // to the real upstream model name. Preferences remain keyed by the selector id.
   let capabilityId = String(id || "");
@@ -14271,6 +14371,17 @@ function _thinkingProfileFor(id) {
       // this route is a reseller, and an effort word it does not accept returns an EMPTY
       // completion rather than a clean error. Adding the button means first probing the live
       // route with effort=xhigh and confirming real content comes back.
+      // xhigh 在这一族**仍然不摆按钮**，而且理由现在是实测的而不是推断的。
+      //
+      // 2026-08-16 我一度把它加了回来，依据是"上游不报错"：直连本网关在用的转卖上游发
+      // xhigh/max，都 HTTP 200、thinking 块正常返回。但"不报错"不等于"生效"——同一次
+      // 实测取三轮中位数：high 942 字符、xhigh 447、max 683，**没有梯度**。这正好印证了
+      // 这一族原本就记着的那条结论：这条线路连 banana 这种胡编的 effort 词都照收不误。
+      // 上游收下了、然后忽略它。
+      //
+      // 摆一个照收不误却没有实际效果的按钮，不是"把参数发出去"，是换一种方式骗用户。
+      // 网关那边的直通已经改成看实时目录（models.rs 的 supports_effort），等哪天换了真正
+      // 认这个词的线路，按钮和这条注释一起改。
       levels: _alwaysThinks ? ["low", "medium", "high", "max"] : ["off", "low", "medium", "high", "max"],
       defaultLevel: "high",
       levelTips: {
@@ -14399,47 +14510,23 @@ function _applyThinkingToConfig(cfg, opts = {}) {
   const preferenceId = cfg.customModelId || model;
   const profile = _thinkingProfileFor(model);
   let pref = _thinkingPrefFor(preferenceId);
-  // Agent 工具循环的自适应钳位：默认 high（如 Claude 24K 预算）会让 opus 把整个项目
-  // 在思考里闷头写完（4 分钟 + 不动手，实测）——工具型任务的推理本该外化到工具
-  // 循环逐轮展开，单轮思考 medium 足够且总智力不降（多轮叠加）。
-  // 但复杂任务（工业级大项目等）要保持深度；钳位逻辑分两层：
-  // 1) 显式选择永远优先：用户选过的档位从不改
-  // 2) 复杂度感知：复杂任务跳过默认降档
-  // 这条降档写在客户端还没真正发送 effort 的年代：当时 Claude 走的是 budget_tokens=24000，
-  // 一轮闷头想四分钟不动手是真的（实测）。现在这一族是 adaptive + output_config.effort，
-  // 想多深由模型每轮自己定、并且和工具调用交错展开——原来的前提没有了,留下的只有降档。
-  // Anthropic 自己的迁移指南把 xhigh 列为编码与 agentic 任务的推荐档、也是 Claude Code 的
-  // 默认；本条链路封顶在 high，所以 high 已经是这里能拿到的最深档。把 agent 轮压到 medium
-  // 等于让它比参照实现浅两档，这正是「整体感觉好垃圾」的来源。
-  // 保留的只有上限：max 在 agent 轮降到 high（省的是输出余量 64k→40k，不是思考深度）。
-  // 琐碎轮降到最浅档：一句"你好啊"不该花 24000 的思考预算。
+  // **不再按轮次类型改写用户选的档位。** 这里原来有两道自动降档，现在都去掉了：
   //
-  // _shouldUseLightweightAgentTurn 判得很保守（action=answer、continuation=new、
-  // deliverySurface/changeScope/workspaceAction… 一律 none、无运行/外部义务、无任何
-  // 工程标记、没有待办计划步骤），这类轮次本来就已经在省系统提示词、跳过技能块和工作区
-  // 预热了——唯独思考预算照付。实测一句问候：总耗时 21s，模型 5.6s 就开始出字，
-  // 剩下十几秒全在"要不要问他修 bug / 要不要列菜单"上反复推演。
+  //   1. 轻量轮（判定为"纯问答、不动工作区"）把档位压到最浅的一档；
+  //   2. agent 轮在非复杂任务时把 `max` 压成 `high`。
   //
-  // 和下面那条一样，**显式选过档位的用户不受影响**。
-  if (opts.lightTurn && (profile.levels || []).length) {
-    let explicit = false;
-    try {
-      const saved = _loadThinkingPrefs()[preferenceId];
-      explicit = !!(saved && (profile.levels || []).includes(saved));
-    } catch {}
-    // 不降到 off：Fable/Mythos 没有 off（显式 disabled 是 400），而 adaptive 族
-    // 静默不发 thinking 反而会掉进"最贵的默认档"（见 _thinkingProfileFor 的说明）。
-    const shallowest = ["minimal", "low", "medium"].find((l) => (profile.levels || []).includes(l));
-    if (!explicit && shallowest && pref !== "off") pref = shallowest;
-  }
-  if (opts.agentTurn && !opts.isComplexTask && pref === "max" && (profile.levels || []).includes("high")) {
-    let explicit = false;
-    try {
-      const saved = _loadThinkingPrefs()[preferenceId];
-      explicit = !!(saved && (profile.levels || []).includes(saved));
-    } catch {}
-    if (!explicit) pref = "high";
-  }
+  // 去掉的理由，那段代码自己的注释里就写着：**它的前提已经不存在了**。那两条是在
+  // "客户端还发不出 effort"的年代写的——当时 Claude 走 budget_tokens=24000，一轮闷头
+  // 想四分钟不动手是真的（实测）。现在这一族是 adaptive + output_config.effort，想多深
+  // 由模型每轮自己定、并且和工具调用交错展开。前提没了，留下的只有副作用：
+  // 用户在转盘上选了一个档位，实际发出去的却是另一个，而界面上不会有任何提示。
+  //
+  // 省下来的那点钱也不值：闲聊轮本来就已经在省系统提示词、跳过技能块和工作区预热了，
+  // 而"这题简不简单"是模型自己该判断的事——adaptive 的全部意义就在于此。harness 替它
+  // 提前拍板，正是这个代码库反复要避免的"拿预测去代替事实"。
+  //
+  // 现在的规则只有一条：**用户选什么就发什么**。opts 里的 lightTurn / agentTurn /
+  // isComplexTask 不再参与档位决策（调用方仍然传，其它用途不受影响）。
   out.thinkingEffort = pref || "off";
   if (!profile.configurable || !pref) return out;
 
@@ -15414,6 +15501,11 @@ const _ICON_RULES = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" 
 // 浏览器：一个地球仪。下面那段块语句在模块求值时就跑，所以这个常量必须在它**之前**
 // 声明完——放到文件后面会是 TDZ 报错，而且是「应用一启动就白屏」那种，测试还照样全绿。
 const _ICON_BROWSER = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M3.5 9h17M3.5 15h17"/><ellipse cx="12" cy="12" rx="4" ry="9"/></svg>';
+// 能力：一枚盾 + 一个勾。**必须和上面几个待在一起**——它 2026-08-16 曾被放到文件
+// 27000 行外（挨着它的功能代码），于是下面那段块语句在模块求值时读到未初始化的它，
+// 整个模块顶层从这里中断：应用能起窗口，但后面所有初始化一行都没跑。上面那条注释
+// 早就写过这个坑，注释没挡住第二次，所以现在由 icon_constants_precede_their_use 钉着。
+const _ICON_CAPS = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2 4 6v6c0 5 3.4 8.9 8 10 4.6-1.1 8-5 8-10V6z"/><path d="m9 12 2 2 4-4"/></svg>';
 {
   const _wrap = document.getElementById("capabilitiesMenuWrap");
   const _capBtn = document.getElementById("capabilitiesBtn");
@@ -21672,14 +21764,24 @@ async function _workspaceTreeSnapshot(root, options = {}) {
   // visited 计数器 + maxLines 预算兜底，不会因深度大而爆
   const maxDepth = Math.max(1, Number(options.maxDepth) || 3);
   // 并行 DFS：旧版逐目录串行 await readDir，几百个目录 = 几百次串行 IPC 往返，
-  // 每轮发送前的真实卡点。子目录并发遍历，共享计数器超预算短路，输出顺序不变。
-  let visited = 0;
+  // 每轮发送前的真实卡点。子目录并发遍历，输出顺序不变。
+  //
+  // 预算是**按层公平分**的，不是一个共享计数器。
+  //
+  // 旧版用一个全局 `visited` 计数 + 末尾 `.slice(0, maxLines)`：谁先遍历完谁吃掉预算，
+  // 组装后直接砍掉尾部。于是按字母序靠后的顶层目录会**整个从快照里消失**。实测这个仓库
+  // 在默认档（180 项）下 `server/src/` 一行都不出现——模型不知道后端源码在哪，而它只看到
+  // 结尾一句"只展示前 180 项"，连自己漏了半个项目都不知道，于是把整个后端当成不存在。
+  // 项目越大这个洞越大，正是"大项目做不动"的其中一处硬原因。
+  //
+  // 现在每个目录拿到自己的 `budget`，先保住本层条目（那是这一层的骨架），剩下的在可展开的
+  // 子目录之间**均分**。广度优先于深度是刻意的：模型知道 `server/src/` 存在就能自己
+  // `list_dir` 进去，而它压根不知道的目录，再详细的深层内容也补不回来。
   let truncated = false;
-  const walk = async (dir, depth, prefix = "") => {
-    if (visited >= maxLines) { truncated = true; return []; }
+  const listing = async (dir) => {
     let entries = [];
     try { entries = await backend.readDir(dir); } catch { return []; }
-    entries = (Array.isArray(entries) ? entries : [])
+    return (Array.isArray(entries) ? entries : [])
       .filter((entry) => {
         const name = _agentDirEntryName(entry);
         if (!name || name === "." || name === "..") return false;
@@ -21693,20 +21795,28 @@ async function _workspaceTreeSnapshot(root, options = {}) {
         if (ad !== bd) return ad - bd;
         return _agentDirEntryName(a).localeCompare(_agentDirEntryName(b), "en");
       });
-    visited += entries.length;
-    if (visited >= maxLines) truncated = true;
-    // 先并发启动全部子目录遍历（计数器超预算后子调用自行短路），再按原顺序组装；
+  };
+  const walk = async (dir, depth, prefix, budget) => {
+    if (budget <= 0) { truncated = true; return []; }
+    const entries = await listing(dir);
+    if (!entries.length) return [];
+    const shown = entries.slice(0, budget);
+    if (shown.length < entries.length) truncated = true;
+    const expandable = shown.filter((entry) => _agentDirEntryIsDir(entry) && depth < maxDepth);
+    const share = expandable.length ? Math.floor((budget - shown.length) / expandable.length) : 0;
+    if (expandable.length && share <= 0) truncated = true;
+    // 先并发启动全部子目录遍历（预算耗尽的子调用自行短路），再按原顺序组装；
     // 行格式与旧版逐字一致（📁 + 相对路径，Agent 直接按这些路径读写）。
-    const childJobs = entries.map((entry) => {
-      if (!_agentDirEntryIsDir(entry) || depth >= maxDepth) return null;
+    const childJobs = shown.map((entry) => {
+      if (!_agentDirEntryIsDir(entry) || depth >= maxDepth || share <= 0) return null;
       const name = _agentDirEntryName(entry);
       const abs = _normalizeFsPath(String(entry?.path || `${dir}/${name}`)).replace(/\/+$/, "");
-      return walk(abs, depth + 1, prefix + "  ");
+      return walk(abs, depth + 1, prefix + "  ", share);
     });
     const childLines = await Promise.all(childJobs.map((j) => j || Promise.resolve([])));
     const out = [];
-    for (let i = 0; i < entries.length; i++) {
-      const entry = entries[i];
+    for (let i = 0; i < shown.length; i++) {
+      const entry = shown[i];
       const name = _agentDirEntryName(entry);
       const isDir = _agentDirEntryIsDir(entry);
       const abs = _normalizeFsPath(String(entry?.path || `${dir}/${name}`)).replace(/\/+$/, "");
@@ -21716,7 +21826,7 @@ async function _workspaceTreeSnapshot(root, options = {}) {
     }
     return out;
   };
-  const lines = (await walk(root, 0, "")).slice(0, maxLines);
+  const lines = (await walk(root, 0, "", maxLines)).slice(0, maxLines);
   // 空工作区必须明说，不能缘默：返回空串会让“项目结构”段整体消失，模型两眼一抹黑，
   // 只能盲探 package.json/vite.config 撞 cannot stat（实测：明知可告知却没告知，
   // 模型的“错误推理”其实是信息缺失）。
@@ -21952,6 +22062,75 @@ async function _agentRootFingerprint(ents) {
   return parts.join("|");
 }
 
+// ===== 项目约定的注入预算 =====
+//
+// 约定文件和上下文里别的东西不是一个性质：树快照、关键文件那些是**素材**，模型可以
+// 选择性地看；约定是**硬指令**，漏掉一条就等于没有。所以这里的预算比素材类宽，但只在
+// 项目真写了约定时才花——没写就是 0 字节，不会让空约定每轮白付钱。
+const _GUIDE_ROOT_TOTAL = 12000;      // 根目录约定总预算（字符），随上下文档位放大
+const _GUIDE_PER_FILE_CAP = 8000;     // 单份上限：足够装下绝大多数完整的约定文件而不截断
+const _GUIDE_MIN_PER_FILE = 800;      // 低于这个就不注入了——半句规则比没有更危险
+const _GUIDE_NESTED_TOTAL = 4000;     // 嵌套（子包）约定总预算
+const _GUIDE_NESTED_PER_FILE = 1500;
+const _GUIDE_NESTED_MAX_DIRS = 40;    // 最多扫这么多目录，monorepo 顶层可能几十个包
+const _GUIDE_NESTED_MAX_FILES = 6;
+const _GUIDE_NESTED_DEPTH = 2;        // packages/web/AGENTS.md 在第二层，所以要 2 不是 1
+/** 嵌套只找这两种。.cursorrules / copilot-instructions 是编辑器级配置，按子包分本就没有语义。 */
+const _NESTED_GUIDE_FILES = ["AGENTS.md", "CLAUDE.md"];
+
+/**
+ * 逐层往下找子包自己的约定文件。
+ *
+ * monorepo 里「这个包该怎么写」最具体的那份说明就住在子包目录里（packages/api/AGENTS.md），
+ * 而旧版只看工作区根目录，这些**一份都读不到**。模型于是拿着仓库总纲去写子包的代码。
+ *
+ * 三个刻意的选择，和 `_agentRootFingerprint` 同一套理由：
+ * · **逐层并行**：串行 await N 个目录会把延迟叠成 N 倍，这段每次重建上下文都要跑。
+ * · **排序后再取**：`readDir` 不保证顺序稳定。不排序的话同一个仓库两次扫出不同的子包
+ *   集合，注入内容就会无缘无故地变。
+ * · **双上限**：扫描目录数和注入文件数分开限，前者管住 IO，后者管住 token。
+ */
+async function _nestedProjectGuides(root, options = {}) {
+  const maxDirs = options.maxDirs ?? _GUIDE_NESTED_MAX_DIRS;
+  const maxFiles = options.maxFiles ?? _GUIDE_NESTED_MAX_FILES;
+  const maxDepth = options.depth ?? _GUIDE_NESTED_DEPTH;
+  const out = [];
+  let frontier = [root];
+  let scanned = 0;
+  for (let level = 0; level < maxDepth; level++) {
+    if (!frontier.length || out.length >= maxFiles || scanned >= maxDirs) break;
+    const listings = await Promise.all(frontier.map((dir) =>
+      backend.readDir(dir).then((e) => (Array.isArray(e) ? e : [])).catch(() => [])));
+    const subdirs = [];
+    for (const entries of listings) {
+      for (const entry of entries) {
+        if (!_agentDirEntryIsDir(entry)) continue;
+        const name = _agentDirEntryName(entry);
+        // 隐藏目录整类跳过：.git/.venv 这些没有子包约定，扫它们只是浪费 IO 配额。
+        if (!name || name.startsWith(".") || _AGENT_CONTEXT_SKIP_DIRS.has(name)) continue;
+        const path = entry?.path || (root + "/" + name);
+        if (path) subdirs.push(String(path));
+      }
+    }
+    subdirs.sort();
+    frontier = subdirs.slice(0, Math.max(0, maxDirs - scanned));
+    scanned += frontier.length;
+    const hits = await Promise.all(frontier.map(async (dir) => {
+      for (const name of _NESTED_GUIDE_FILES) {
+        try {
+          const txt = await backend.readTextFile(dir + "/" + name);
+          if (txt && txt.trim()) return [dir, name, txt];
+        } catch {}
+      }
+      return null;
+    }));
+    for (const hit of hits) {
+      if (hit && out.length < maxFiles) out.push(hit);
+    }
+  }
+  return out;
+}
+
 async function _gatherAgentContext(query, sessionRoot) {
   try { _perfPhase("gatherAgentContext"); } catch {}
   const root = (sessionRoot || rootPath || workspaceRoots[0] || "").replace(/\/+$/, "");
@@ -22019,11 +22198,41 @@ async function _gatherAgentContext(query, sessionRoot) {
   const lockFiles = ["pnpm-lock.yaml", "yarn.lock", "bun.lock", "bun.lockb", "package-lock.json"];
   const _lockReadsPromise = Promise.all(lockFiles.map((name) =>
     backend.readTextFile(root + "/" + name).then(() => name).catch(() => null)));
+  // 和上面五段一起起跑：子包约定要多走一两层目录，串在后面会把这段的延迟直接加到每次
+  // 重建上下文上。（重建本身是 change-driven 缓存的，不是每轮都跑。）
+  const _nestedGuidesPromise = _nestedProjectGuides(root).catch(() => []);
   
-  // Pick up project-specific agent instructions the way Claude Code reads
-  // CLAUDE.md and Codex reads AGENTS.md — first match wins.
+  // Pick up project-specific agent instructions the way Claude Code reads CLAUDE.md and
+  // Codex reads AGENTS.md.
+  //
+  // 三处和旧版不同，每一处都是实测出来的丢失，而且丢的都不报错：
+  //
+  // (1) 旧版命中第一份就 `break`。项目同时写了 AGENTS.md 和 CLAUDE.md 时——两个 agent
+  //     生态各写一份是很常见的——第二份整个消失，而用户以为两份都在生效。
+  // (2) 旧版只看工作区根目录。monorepo 里 packages/*/AGENTS.md 这类子包约定一份都读不到，
+  //     模型于是拿着仓库总纲去写子包的代码。
+  // (3) 旧版把每份砍到 2000 字符，且截断策略是留头尾、挖中间。一份认真写的约定文件里，
+  //     具体的编码条款几乎总在中间那段，于是模型拿到的是开头的背景和结尾的收尾，
+  //     真正要遵守的部分正好被挖掉——"照着项目风格写"从此变成了猜。
+  //
+  // 预算按优先级顺序发：排在前面的文件先拿满。顺序本身就是重要性，不必再排一次。
+  let _guideRoom = Math.round(_GUIDE_ROOT_TOTAL * _treeScale);
   for (const hit of await _guidePromise) {
-    if (hit) { parts.push(`\n--- 项目约定 (${hit[0]}，请遵守) ---\n${_contextSnippet(hit[1], 2000, hit[0])}`); break; }
+    if (!hit) continue;
+    if (_guideRoom < _GUIDE_MIN_PER_FILE) break;
+    const share = Math.min(_guideRoom, _GUIDE_PER_FILE_CAP);
+    const body = _contextSnippet(hit[1], share, hit[0]);
+    _guideRoom -= body.length;
+    parts.push(`\n--- 项目约定 (${hit[0]}，请遵守) ---\n${body}`);
+  }
+  let _nestedRoom = _GUIDE_NESTED_TOTAL;
+  for (const [dir, name, text] of await _nestedGuidesPromise) {
+    if (_nestedRoom < _GUIDE_MIN_PER_FILE) break;
+    // 路径写成相对工作区根的形式，模型才能把这份约定对上是哪个子包的。
+    const rel = String(dir).startsWith(root + "/") ? String(dir).slice(root.length + 1) : dir;
+    const body = _contextSnippet(text, Math.min(_nestedRoom, _GUIDE_NESTED_PER_FILE), name);
+    _nestedRoom -= body.length;
+    parts.push(`\n--- 子目录约定 (${rel}/${name}，改动 ${rel}/ 下的文件时按这份来；与根约定冲突时以这份为准) ---\n${body}`);
   }
   
   // (Project memory is injected separately, per-query, via the knowledge graph —
@@ -27610,7 +27819,6 @@ async function _openBrowserPanel() {
 //
 // 而且整套能力唯一的发现途径是一份他不知道存在的文档文件。一个功能只有能被找到、能看出
 // 它此刻是什么状态、出错时能说清哪里错了，才算做完。
-const _ICON_CAPS = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2 4 6v6c0 5 3.4 8.9 8 10 4.6-1.1 8-5 8-10V6z"/><path d="m9 12 2 2 4-4"/></svg>';
 
 /** 声明文件的候选位置，按读取顺序。面板照这个顺序展示，用户才知道谁盖过谁。 */
 function _capabilityScopePaths(home, root) {
@@ -37020,7 +37228,26 @@ let _symbolIndexBuilt = false;
 let _symbolIndexBuilding = false;
 let _symbolIndexTimer = null;
 const _SYMBOL_INDEX_MAX_FILES = 6000;
-const _SYMBOL_INDEX_MAX_BYTES = 512 * 1024; // skip files > 500KB
+// 上限从 512KB 提到 8MB。旧值把**大项目里最重要的文件**整个挡在索引外：这个仓库自己的
+// src/main.js 是 4MB（上限的 8 倍），于是它里面 11571 个符号一个都不在索引里——find_symbol
+// 找不到，符号地图里也没有，模型在承载了九成逻辑的那个文件上是瞎的。实测抽完这 4MB 只要
+// 13ms，所以旧限制省下的是 13 毫秒，付出的是整个项目的核心。
+const _SYMBOL_INDEX_MAX_BYTES = 8 * 1024 * 1024;
+// 真正该挡的是**压缩/生成的单行文件**：逐行 regex 在那上面又慢又只抽得出噪音。
+// 文件大小做不了这个判据——它挡不住 200KB 的 .min.js，却误伤 4MB 的正常源码。
+// 平均行长可以：正常源码几十字符（本仓库 main.js 是 54），压缩后动辄上千。
+const _SYMBOL_INDEX_MAX_LINE_AVG = 400;
+
+/** 这份源码值不值得进符号索引。 */
+function _indexableSource(text) {
+  if (!text) return false;
+  if (text.length > _SYMBOL_INDEX_MAX_BYTES) return false;
+  // 只采前 64KB：压缩文件在开头就能看出来，整文件数换行对 4MB 是白花的开销。
+  const sample = text.length > 65536 ? text.slice(0, 65536) : text;
+  let newlines = 0;
+  for (let i = 0; i < sample.length; i++) if (sample.charCodeAt(i) === 10) newlines++;
+  return sample.length / Math.max(1, newlines + 1) <= _SYMBOL_INDEX_MAX_LINE_AVG;
+}
 const _SYMBOL_EXTS = new Set(["ts","tsx","js","jsx","mjs","cjs","py","rs","go","java","kt","swift","c","cc","cpp","cxx","h","hpp","cs","rb","php","ex","exs","scala","sh","lua","sol","vue","svelte","astro"]);
 const _SYMBOL_SKIP_DIRS = /\/(node_modules|\.git|dist|build|out|target|\.venv|venv|__pycache__|\.next|\.cache|coverage|vendor|bower_components|\.pnpm-store|\.turbo|\.gradle|Pods|DerivedData|\.idea|\.vscode|public\/build)\//;
 
@@ -37122,7 +37349,7 @@ async function buildSymbolIndex(root) {
     const visited = await _walkSourceFiles(root, async (path, ext) => {
       const patterns = _symbolPatternsFor(ext); if (!patterns) return;
       let text; try { text = await backend.readTextFile(path); } catch { return; }
-      if (!text || text.length > _SYMBOL_INDEX_MAX_BYTES) return;
+      if (!_indexableSource(text)) return;
       const lines = text.split("\n");
       for (let i = 0; i < lines.length; i++) {
         const ln = lines[i];
@@ -37164,7 +37391,7 @@ async function refreshSymbolIndexFor(path) {
   const ext = (path.split(".").pop() || "").toLowerCase();
   const patterns = _symbolPatternsFor(ext); if (!patterns) return;
   let text; try { text = await backend.readTextFile(path); } catch { return; }
-  if (!text || text.length > _SYMBOL_INDEX_MAX_BYTES) return;
+  if (!_indexableSource(text)) return;
   const lines = text.split("\n");
   for (let i = 0; i < lines.length; i++) {
     const ln = lines[i];
@@ -37273,7 +37500,7 @@ async function buildBM25Index(root) {
     await _walkSourceFiles(root, async (path, ext) => {
       if (abandoned) return;
       let text; try { text = await backend.readTextFile(path); } catch { return; }
-      if (!text || text.length > _SYMBOL_INDEX_MAX_BYTES) return;
+      if (!_indexableSource(text)) return;
       const rel = path.startsWith(root) ? path.slice(root.length + 1) : path;
       const lines = text.split("\n");
       for (let i = 0; i < lines.length; i += _BM25_CHUNK_LINES) {

@@ -800,7 +800,31 @@ test("the thinking switch splits by generation, not by named version", () => {
 });
 
 test("every tier the model card offers is a tier the request can carry", () => {
-  const profile = grab("_thinkingProfileFor");
+  // 内置能力表。实时目录只在外层做收窄，见下面那条对包装器的断言。
+  const profile = grab("_builtinThinkingProfileFor");
+
+  // 2026-08-16 实测事故：外层包装器一度直接顶替整个内置 profile，还自造了 `kind: "live"`。
+  // 而请求参数是**按 kind 分派**构造的（reasoning_effort / thinking_budget / thinking_level…），
+  // 一个下游不认识的 kind 会让整轮**一个思考参数都不发**——用户在界面上选了"极限"，
+  // 线上日志却是 reasoning_effort="absent"，表现就是"开了思考却没思考"。
+  // 这条测试的名字说的正是这件事：卡片摆出来的每一档，请求都得真的带得动。
+  const wrapper = grab("_thinkingProfileFor");
+  // 包装器**可以**指定 kind，但只能是下游那个分派器认得的几个之一。
+  // 当初的事故是自造了一个 `"live"`：下游按 kind 分派，认不出来就整轮一个思考参数都不发。
+  // 用 reasoning_effort 就没这个问题——它是分派器的第一个分支。
+  const KNOWN_KINDS = ["reasoning_effort", "adaptive_thinking", "thinking_budget",
+                       "gemini_budget", "thinking_level", "kimi-toggle", "kimi-forced", "none"];
+  for (const m of wrapper.matchAll(/kind:\s*["'`]([a-z_-]+)["'`]/g)) {
+    assert.ok(KNOWN_KINDS.includes(m[1]),
+      `包装器用了下游不认识的 kind "${m[1]}" —— 分派器认不出来就一个思考参数都不发`);
+  }
+  // 分派器里必须真的有这个分支，否则上面那份名单就是空口说白话
+  assert.match(SRC, /if \(profile\.kind === "reasoning_effort"/,
+    "reasoning_effort 分支不在了，包装器用它就发不出参数");
+  assert.match(wrapper, /\.\.\.base/,
+    "包装器必须原样继承内置 profile（kind 和它的参数映射），只许改档位名单");
+  assert.match(wrapper, /filter\(/,
+    "实时数据只许做交集收窄；放宽会摆出内置映射构造不出参数的档位");
 
   // `low` reaches the model as effort=low and always did once the client started sending effort;
   // it was dropped back when every level below `high` collapsed to the same request.
@@ -810,26 +834,30 @@ test("every tier the model card offers is a tier the request can carry", () => {
   // 400. An off button would be a tier that cannot exist.
   assert.match(profile, /const _alwaysThinks = \/fable\|mythos\/\.test\(s\);/);
 
-  // `xhigh` 在 Claude 这一族的档位里仍然缺席，但**理由变了**，所以断言也得跟着变。
+  // `xhigh` 在 Claude 这一族里仍然缺席，理由现在是**实测**的，不再是推断。
   //
-  // 以前的理由是「这条路是转卖渠道，它不认识的 effort 词会返回空 completion」——那是一条
-  // 从未被真实探测验证过的推断，两个仓库各写了一条同样意思的注释、互相引用。
-  // 现在网关把封顶做成了每条线路可配的开关（models.rs 的 anthropic_effort_word +
-  // models 表的 effort_passthrough 列），默认关着 = 保持旧行为。
+  // 旧注释里的理由（"转卖渠道不认识这个词、会返回空 completion"）确实是一条没人验证过的
+  // 推断。2026-08-16 直连实测推翻了它的表述：xhigh 和 max 都 HTTP 200、thinking 块正常返回。
+  // 但同一次实测也证明了**结论仍然成立，只是机制不同**——三轮取中位数：
+  // high 942 字符、xhigh 447、max 683，没有梯度。这条线路连 banana 这种胡编的 effort
+  // 都照收不误：它收下、然后忽略。
   //
-  // 所以这里要钉的是：**开关默认关着的时候，前端不能摆一个到不了模型的按钮**。
-  // 等某条线路真的把直通打开、确认上游认这个词了，再把按钮和这条断言一起改。
+  // 所以钉的是：**上游只是"收下"而不是"照做"的档位，不许摆成按钮**。
+  // 网关侧的直通已经改成看实时目录，等哪天换了真认这个词的线路，按钮和这条断言一起改。
   const RS = fs.readFileSync("../server/src/models.rs", "utf8");
   assert.match(RS, /fn anthropic_effort_word\(requested: &str, passthrough: bool\)/,
     "封顶必须是可配的函数，不能又写回硬编码 match");
   assert.match(RS, /\("xhigh", false\) \| \("max", false\) => "high",/,
-    "默认（passthrough=false）必须仍然封顶在 high —— 升级不改变任何现有流量");
+    "默认仍然封顶在 high");
   assert.match(RS, /\("xhigh", true\) => "xhigh",/, "直通打开时 xhigh 要真的发出去");
+  assert.match(RS, /model_catalog::supports_effort\(&model_id, e\)/,
+    "直通判据要接实时目录，换了真认这个词的线路时能自动生效");
   // 深度梯子在两种配置下都不能倒挂：更深的档不能拿到更小的输出余量。
   assert.match(RS, /Some\("xhigh"\) if effort_passthrough => 52000,/);
   assert.match(RS, /Some\("high"\) \| Some\("xhigh"\) => 40000,/);
   const claudeLevels = profile.match(/levels: _alwaysThinks \? \[[^\]]*\] : \[[^\]]*\]/)[0];
-  assert.doesNotMatch(claudeLevels, /xhigh/, "直通默认关着，就不该摆一个到不了模型的按钮");
+  assert.doesNotMatch(claudeLevels, /xhigh/,
+    "上游只收下不照做的档位不该摆成按钮——实测无梯度，banana 都照收");
 
   // 反过来：走 OpenAI 协议透传的那一族（gpt-5.6）网关一个字都不改，xhigh 是真的能到模型的，
   // 所以那边不但要有按钮，默认就该是 xhigh —— 参照实现（opencode / Claude Code）也是这么设的。
@@ -845,10 +873,12 @@ test("every tier the model card offers is a tier the request can carry", () => {
 });
 
 test("the native context window agrees end to end", () => {
-  // 1M on the 4.6-and-later families, 200K before them — the client budgets requests against
-  // this number and the gateway plans compression against its own copy, so a disagreement is a
-  // silent 413 or a discarded three quarters of the window.
-  const RS = fs.readFileSync("../server/src/models.rs", "utf8");
+  // 客户端拿这个数做请求预算。走网关时真实值由 /api/models 下发，而网关那边**已经没有
+  // 硬编码表了**——全部来自实时目录（2026-08-16 删除，实测在售 13 款里错了 6 款）。
+  // 所以这里不再和服务端的表逐族对账：对账对象没了。
+  //
+  // 留下的这一半仍然必须准：它服务的是用户配自己 key 直连第三方的链路，那条路不经过
+  // 网关、拿不到实时目录，这张表是唯一的数据源。估大了静默 413，估小了白扔窗口。
   const nativeLimit = load("_fallbackModelContextLimit", ["_fallbackModelContextLimit"]);
   for (const id of ["claude-opus-5", "claude-opus-4-8", "claude-opus-4-7", "claude-opus-4-6",
                     "claude-sonnet-5", "claude-sonnet-4-6", "claude-fable-5", "claude-mythos-5"]) {
@@ -857,11 +887,15 @@ test("the native context window agrees end to end", () => {
   for (const id of ["claude-opus-4-5", "claude-opus-4-1", "claude-haiku-4-5", "claude-sonnet-4-5"]) {
     assert.equal(nativeLimit(id), 200_000, id);
   }
-  const table = RS.slice(RS.indexOf("fn official_contexts"), RS.indexOf("fn official_context("));
-  for (const fam of ["opus-4-6", "opus-4-7", "opus-4-8", "opus-5", "sonnet-4-6", "sonnet-5", "fable-5", "mythos-5"]) {
-    assert.ok(table.includes(`"${fam}"`), `the gateway's table must name ${fam} too`);
-  }
-  assert.match(table, /return vec!\[\(1_000_000, None\)\];/);
+  // 网关侧现在只需保证一件事：能力入口不再有硬编码表，全部走目录。
+  // **只扫测试之前的部分**：models.rs 的测试里有一条同样意图的守卫，它的 banned 名单
+  // 里逐字写着这几个函数名，整份扫会被自己喂到、永远红。今天在这上面栽过三次。
+  const RS = fs.readFileSync("../server/src/models.rs", "utf8");
+  const prod = RS.slice(0, RS.indexOf("mod billing_tests"));
+  assert.doesNotMatch(prod, /fn official_contexts_static/,
+    "硬编码上下文表又回来了——它实测 13 款错 6 款，是负资产不是安全网");
+  assert.match(prod, /crate::model_catalog::lookup\(model_id\)/,
+    "official_contexts 必须从实时目录取");
 });
 
 test("the paid tier stacks on the model's own window, in the client as in the gateway", () => {
@@ -928,7 +962,9 @@ test("how much a model can WRITE is carried, not guessed", () => {
   // invented 8,192 default that truncated long answers on thinking-off turns.
   const RS = fs.readFileSync("../server/src/models.rs", "utf8");
   assert.match(RS, /fn official_max_output\(model_id: &str\) -> Option<i64> \{/);
-  assert.match(RS, /"max_output_tokens": official_max_output\(&mid\),/, "and it must reach the client");
+  // 尾部不再钉逗号：这一行后面接了一级兜底（.or_else(model_caps_override)），
+  // 给的是目录和探测都拿不到时运维手填的值。守的仍然是"这个数必须送到客户端"。
+  assert.match(RS, /"max_output_tokens": official_max_output\(&mid\)/, "and it must reach the client");
   assert.match(RS, /max_tokens\.clamp\(1, official_max_output\(model_str\)\.unwrap_or\(128000\)\)/);
   assert.doesNotMatch(RS, /max_tokens\.clamp\(1, 128000\)/, "no blanket ceiling for every model");
 
@@ -1025,21 +1061,28 @@ test("a run does not end while its own plan has open steps", () => {
     "the interception has to come before the run decides it is waiting");
 });
 
-test("agent turns are not demoted below the depth this route can deliver", () => {
-  // The clamp was written when Claude ran on budget_tokens=24000 and would think for four
-  // minutes without touching a tool — that was measured and the clamp was right. This family is
-  // adaptive now: depth is chosen per turn by the model and interleaved with tool calls, so the
-  // premise is gone and only the demotion was left. Anthropic's migration guide names xhigh as
-  // the setting for coding and agentic work and the default in Claude Code; this route caps at
-  // high, so high is already the deepest thing available here. Sending medium put the agent two
-  // notches under the reference implementation.
+test("用户选的思考档位不因轮次类型被改写", () => {
+  // 这里原来有两道自动降档：轻量轮压到最浅档、agent 轮把 max 压成 high。
+  //
+  // 删掉它们的理由，旧注释自己就写着："The clamp was written when Claude ran on
+  // budget_tokens=24000 and would think for four minutes without touching a tool — that was
+  // measured and the clamp was right. This family is adaptive now ... **so the premise is gone
+  // and only the demotion was left.**"
+  //
+  // 前提确实没了：现在这一族是 adaptive + output_config.effort，想多深由模型每轮自己定、
+  // 并且和工具调用交错展开。留着降档只剩一个后果——用户在转盘上选了一个档位，实际发出去
+  // 的是另一个，界面上没有任何提示。"这题简不简单"本来就是模型该判断的事，adaptive 的
+  // 全部意义就在于此；harness 替它提前拍板，正是这个仓库反复要避免的"拿预测代替事实"。
   const apply = grab("_applyThinkingToConfig");
-  assert.doesNotMatch(apply, /pref === "high"[\s\S]{0,400}pref = "medium"/,
-    "an agent turn must not be demoted out of high");
-  assert.match(apply, /opts\.agentTurn && !opts\.isComplexTask && pref === "max"[\s\S]{0,400}pref = "high"/,
-    "only the max→high ceiling remains, and that trades output headroom, not depth");
-  // An explicit choice still wins, which was the one part of the clamp that was never in doubt.
-  assert.match(apply, /const saved = _loadThinkingPrefs\(\)\[preferenceId\];[\s\S]{0,200}if \(!explicit\)/);
+  assert.doesNotMatch(apply, /opts\.lightTurn/,
+    "轻量轮又在改写用户选的档位了");
+  assert.doesNotMatch(apply, /pref = "high"/,
+    "又把 max 压成 high 了 —— 用户选极限就该发极限");
+  assert.doesNotMatch(apply, /pref = shallowest/,
+    "又按轮次类型把档位压到最浅了");
+  // 正面：用户选的那个值必须原样落到出参上
+  assert.match(apply, /out\.thinkingEffort = pref \|\| "off";/,
+    "用户选的档位没有原样发出去");
 });
 
 test("the loop stops advertising continuation machinery it does not have", () => {

@@ -1,1 +1,0 @@
-import{Sc as e,bc as t,xc as n,yc as r}from"./vendor-a8bn3H4I.js";r();export{t as openPath,n as openUrl,e as revealItemInDir};
