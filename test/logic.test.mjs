@@ -12326,8 +12326,21 @@ test("existing-file edits execute against current disk while exact anchors and C
 });
 
 test("implementation grounding is advisory and only a real prior failure stops a patch", () => {
+  // 两个谓词现在是**分开**的，因为两道门要的集合本来就不同：
+  //   · 批次拦截门（真拦截）用宽集合——delete/move/mkdir/copy 这些最不可逆的必须在内
+  //   · grounding 门（纯提示）用窄集合——落素材的生成器不该被要求先读代码
+  // 原来这里只 load 一个 candidate 然后到处注入，两者分家到什么程度这条测试都是绿的。
+  const RISK = (command) => command === "rewrite" ? "workspace-write" : "";
   const candidate = load("_implementationMutationCandidate", {
-    _commandRiskKind: (command) => command === "rewrite" ? "workspace-write" : "",
+    _commandRiskKind: RISK,
+    _toolMutatesWorkspace: load("_toolMutatesWorkspace", {
+      _mcpMutationHint: () => false,
+      mutatesWorkspace: (t) => ["write", "edit", "multiedit", "format", "mkdir", "copy", "delete", "move"].includes(t),
+    }),
+  });
+  const groundingCandidate = load("_implementationGroundingCandidate", {
+    _commandRiskKind: RISK,
+    fileEditTypes: () => new Set(["write", "edit", "multiedit", "format"]),
   });
   const groundingPath = load("_implementationGroundingFilePath");
   const mergeRanges = load("_mergeReadRanges");
@@ -12343,7 +12356,7 @@ test("implementation grounding is advisory and only a real prior failure stops a
     _pathIdentity: PATH_IDENTITY,
   });
   const issue = load("_implementationMutationGroundingIssue", {
-    _implementationMutationCandidate: candidate,
+    _implementationGroundingCandidate: groundingCandidate,
     _runRootConfirmedEmptyForImplementation: rootIsEmpty,
     _runHasImplementationGrounding: hasGrounding,
   });
@@ -12356,7 +12369,15 @@ test("implementation grounding is advisory and only a real prior failure stops a
     _toolExecutionSucceeded: succeeds,
   });
   const mutationAdvice = load("_debugMutationBlockResult", {
-    _debugMutationCandidate: candidate,
+    // 用真正的 _debugMutationCandidate，不再拿实现侧那份冒充——
+    // 冒充的话这条测试永远证明不了任何事（扫描点名的就是这一行）。
+    _debugMutationCandidate: load("_debugMutationCandidate", {
+      _toolMutatesWorkspace: load("_toolMutatesWorkspace", {
+        _mcpMutationHint: () => false,
+        mutatesWorkspace: (t) => ["write", "edit", "multiedit", "format", "mkdir", "copy", "delete", "move"].includes(t),
+      }),
+      _commandRiskKind: RISK,
+    }),
     _debugMutationGateIssue: () => "",
     _implementationMutationGroundingIssue: issue,
   });
@@ -23799,4 +23820,44 @@ test("死循环判据拆成两个签名：调用相同且结果相同才算原�
     "失败计数按调用归并——报错里带时间戳不该让它逃过计数");
   // http 的非 2xx 原来根本不算失败：_toolFailureMatch 扫的是文本，500 读不出"失败"
   assert.match(loop, /_toolExecutionSucceeded\(items\[i\]\?\.call, items\[i\]\?\.rawResult\) === false/);
+});
+
+// ══ 会改工作区的类型：派生，不手抄 ═════════════════════════════════════════
+//
+// 手抄的那份只认 6 个类型，而权威集合有 20 个——漏的正是最不可逆的
+// delete / move / mkdir / copy / download / worktree。而它守着的是一道**真拦截**：
+// 同一批里前项失败时停掉后续写入。于是 [edit A 失败, delete B, move C] 里
+// 两个不可逆操作照常打在没改成的工作区上。
+
+test("批次拦截门用派生集合，不再手抄类型名单", () => {
+  const src = extractFn("_implementationMutationCandidate");
+  assert.match(src, /_toolMutatesWorkspace\(call, null\) \|\| call\.type === "worker"/);
+  // 手抄名单必须消失
+  assert.doesNotMatch(src, /\["write", "edit", "multiedit", "format", "worker"/,
+    "又抄回一份白名单了——白名单的失效是静默的：新工具默认不在名单里＝闸门对它不存在");
+  // install 不能混进来：装依赖失败之后紧接着改 package.json 修复它恰恰是对的
+  assert.match(src, /\*\*不含 purpose === "install"\*\*/);
+});
+
+test("grounding 门和拦截门是两个集合，故意不同，不许合并", () => {
+  const g = extractFn("_implementationGroundingCandidate");
+  // 取证门要的是"改代码前先看清项目"——落素材的生成器、不写内容的 mkdir/copy 都不该被要求
+  assert.match(g, /fileEditTypes\(\)\.has\(type\)/);
+  // 注释在函数外面，extractFn 取不到，对全文断言
+  assert.match(SRC, /和上面\*\*故意不同\*\*，不要合并/,
+    "必须写清为什么不合并，否则下一个人会看到两个相似谓词就去合并");
+  // 两道门必须各调各的谓词
+  const issue = extractFn("_implementationMutationGroundingIssue");
+  assert.match(issue, /_implementationGroundingCandidate\(call\)/);
+  const batch = extractFn("_implementationMutationBatchBlockResult");
+  assert.match(batch, /_implementationMutationCandidate\(current\.call\)/);
+});
+
+test("幂等空操作不算前项失败", () => {
+  // _toolExecutionSucceeded 把 mutated===false 的写类工具一律判失败，而"目录已存在"
+  // "内容和目标一致"这些**磁盘已经是目标状态**的情形，UI 当面显示的就是成功。
+  // 放宽候选集合之后，[create_dir 已存在, write_file] 会被这道门硬拦。
+  const batch = extractFn("_implementationMutationBatchBlockResult");
+  assert.match(batch, /item\.rawResult\.mutated !== false/);
+  assert.match(batch, /磁盘已经是目标状态/);
 });

@@ -85,7 +85,9 @@ test("挂载点一定会被卸掉，包括校验失败提前退出的那两条�
   // trap 是**覆盖**不是追加：临时文件和挂载点各装各的 trap，必然只剩最后一个。
   assert.equal((SH.match(/^trap /gm) || []).length, 1, "装了不止一个 EXIT trap，前面的会被覆盖掉");
   // trap 必须在第一次可能挂载之前就装好。
-  assert.ok(SH.indexOf("trap _cleanup EXIT") < SH.indexOf("hdiutil attach"),
+  // 只看**校验阶段**那次 attach：构建前的残留预清也用 hdiutil，但它只 detach、不 attach，
+  // 而且发生在任何挂载点产生之前，没有需要 trap 守护的东西。
+  assert.ok(SH.indexOf("trap _cleanup EXIT") < SH.indexOf('hdiutil attach "$_dmg"'),
     "trap 装晚了，挂载后到装 trap 之间失败就会留下残留挂载");
 });
 
@@ -106,8 +108,11 @@ test("MRDAYONE_TARGET 指定架构时，每一处产物路径都跟着走", () =
   // provenance 预清也要清对目录，否则 cargo 在新 target 目录里照样撞硬链接失败
   assert.match(SH, /"\$TARGET_DIR"\/build\/\*\/build_script_build-\*/);
   // 一处 target/release/ 硬编码都不该剩
-  assert.doesNotMatch(SH.split("\n").filter((l) => !/^\s*#/.test(l)).join("\n"),
-    /target\/release\//, "还有写死本机架构路径的地方");
+  // 预清那段是唯一允许写死 target/release/ 的地方：DMG 的临时读写映像只会落在本机
+  // 架构的 bundle/macos 下，交叉编译产物不经过那条路径。
+  const _noPreclean = SH.split("\n").filter((l) => !/^\s*#/.test(l))
+    .filter((l) => !/\brw\b/.test(l)).join("\n");
+  assert.doesNotMatch(_noPreclean, /target\/release\//, "还有写死本机架构路径的地方");
 });
 
 test("只打 dmg 时不许拿上一轮的更新产物冒充这一轮", () => {
@@ -120,4 +125,18 @@ test("只打 dmg 时不许拿上一轮的更新产物冒充这一轮", () => {
   // 时间戳必须在 tauri build **之前**取，否则永远判定为陈旧
   assert.ok(SH.indexOf('_started="$(mktemp)"') < SH.indexOf("npm run tauri build"),
     "开工时间戳取晚了，这道校验会永远红");
+});
+
+test("构建前要扫掉上次没收干净的 DMG 中间产物", () => {
+  // Tauri 的 bundle_dmg.sh 每次建一个 rw.<pid>.dmg 并挂载；任何一次中断都会让映像
+  // 永远挂着。攒够十来个之后 hdiutil attach 失败，而 Tauri 只报一句
+  // `failed to run bundle_dmg.sh`——不说是挂载失败，也不说为什么。实测就是这么挂的。
+  assert.match(SH, /hdiutil detach "\$_dev" -force/);
+  assert.match(SH, /rm -f target\/release\/bundle\/macos\/rw\.\*\.dmg/);
+  // 只能动本产品自己的临时映像，不许误伤用户挂着的别的磁盘映像
+  assert.match(SH, /target\/release\/bundle\/macos\/rw/,
+    "过滤条件必须限定到本产品的中间产物路径");
+  assert.match(SH, /只动 target\/ 下\*\*本产品自己\*\*的临时读写映像，不碰任何别的磁盘映像/);
+  // 清了要说，否则下次有人排查"为什么我的映像被卸载了"会一头雾水
+  assert.match(SH, /预清 DMG 残留：卸载 \$_stale_mounts 个挂载/);
 });
