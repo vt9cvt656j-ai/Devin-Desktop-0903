@@ -1920,6 +1920,101 @@ fn servers_subtree(text: &str) -> Value {
     json!({})
 }
 
+/// 两个路径是不是指同一个目录。
+///
+/// 不能只比字符串：macOS 上 `/tmp/x` 和 `/private/tmp/x` 是同一个目录，IDE 打开的根路径
+/// 和 Claude Code 记下的 cwd 很容易一个走符号链接、一个不走。`canonicalize` 解得开就比
+/// 解开的结果，解不开（目录已经删了、或者权限不够）就退回去掉尾部斜杠的字面比较。
+fn same_dir(a: &str, b: &str) -> bool {
+    let trim = |s: &str| s.trim_end_matches(['/', '\\']).to_string();
+    let (a_trim, b_trim) = (trim(a), trim(b));
+    if a_trim.is_empty() || b_trim.is_empty() {
+        return false;
+    }
+    if a_trim == b_trim {
+        return true;
+    }
+    matches!(
+        (std::fs::canonicalize(a), std::fs::canonicalize(b)),
+        (Ok(x), Ok(y)) if x == y
+    )
+}
+
+/// `~/.claude.json` 里属于**当前项目**的服务表。
+///
+/// `claude mcp add` 不带 `-s` 时用的是 **local 作用域**，也就是默认的那一个，而它写的
+/// 位置不是顶层 `mcpServers`，是 `projects["<当时的 cwd>"].mcpServers`。只读顶层的话，
+/// 用户在 Claude Code 里配的绝大多数服务在这边一个都不出现——偏偏面板还会显示"已读取
+/// Claude Code 配置"，看起来像读到了、实际是空的。
+///
+/// 只摘出命中项目的 `mcpServers` 那一层：`projects` 里同一个条目下还有 `history` 等等
+/// 整段对话记录，和顶层那道闸一样，这些一个字节都不该离开 Rust 侧。
+fn claude_local_scope_servers(text: &str, project: &str) -> Value {
+    if project.trim().is_empty() {
+        return json!({});
+    }
+    let Ok(parsed) = serde_json::from_str::<Value>(text) else {
+        return json!({});
+    };
+    let Some(projects) = parsed.get("projects").and_then(Value::as_object) else {
+        return json!({});
+    };
+    for (key, entry) in projects {
+        if same_dir(key, project) {
+            if let Some(map) = entry.get("mcpServers").filter(|value| value.is_object()) {
+                return map.clone();
+            }
+        }
+    }
+    json!({})
+}
+
+/// 一份别的客户端的配置里能用的全部服务：全局那一层，叠上当前项目的 local 作用域。
+///
+/// 抽成函数不是为了复用（只有一个调用点），是为了**能对着它验**：合并的优先级写在
+/// `mcp_user_configs` 里的话，测试只能照抄一遍循环再断言自己那份抄写，实现改错了照样绿。
+fn interop_servers(
+    text: &str,
+    project: &str,
+    has_local_scope: bool,
+) -> serde_json::Map<String, Value> {
+    let mut servers = servers_subtree(text).as_object().cloned().unwrap_or_default();
+    if has_local_scope {
+        // 同名时项目里那份赢——那正是 Claude Code 自己的优先级（local 高于 user）。
+        if let Some(local) = claude_local_scope_servers(text, project).as_object() {
+            for (name, spec) in local {
+                servers.insert(name.clone(), spec.clone());
+            }
+        }
+    }
+    servers
+}
+
+/// 别的客户端的全局 MCP 配置（只读接入）。第二个字段是"这份要不要再看 local 作用域"，
+/// 只有 Claude Code 那份有 `projects` 这一层。
+fn interop_config_paths(home: &std::path::Path) -> Vec<(std::path::PathBuf, bool)> {
+    vec![
+        (home.join(".claude.json"), true),
+        (home.join(".cursor").join("mcp.json"), false),
+        (home.join(".codex").join("mcp.json"), false),
+        // Claude Desktop 的配置不在 HOME 底下，按平台各走各的。装了桌面版的用户往往
+        // 只在那儿配过服务，读不到就是"我明明配了却没有"。
+        (claude_desktop_config_path(home), false),
+    ]
+}
+
+fn claude_desktop_config_path(home: &std::path::Path) -> std::path::PathBuf {
+    if cfg!(target_os = "macos") {
+        home.join("Library/Application Support/Claude/claude_desktop_config.json")
+    } else if cfg!(target_os = "windows") {
+        std::env::var("APPDATA")
+            .map(|dir| std::path::PathBuf::from(dir).join("Claude/claude_desktop_config.json"))
+            .unwrap_or_else(|_| home.join("AppData/Roaming/Claude/claude_desktop_config.json"))
+    } else {
+        home.join(".config/Claude/claude_desktop_config.json")
+    }
+}
+
 /// 这份文本**解析不了**时的报错原文（解析得了就是 `None`）。
 ///
 /// `servers_subtree` / `disabled_subtree` 都把解析失败吞成空表，这对「读」是对的（一份手写坏
@@ -1982,20 +2077,20 @@ fn own_user_config(path: &std::path::Path) -> McpUserConfig {
 /// 全局配置（只读）。本 IDE 那份即使还不存在也会返回（servers 为空），面板要靠它
 /// 知道"保存会写到哪里"。
 #[tauri::command]
-pub fn mcp_user_configs() -> Result<Vec<McpUserConfig>, String> {
+pub fn mcp_user_configs(project: Option<String>) -> Result<Vec<McpUserConfig>, String> {
     let home = home_dir()?;
+    let project = project.unwrap_or_default();
     let mut out = vec![own_user_config(&user_config_path()?)];
-    for relative in [".claude.json", ".cursor/mcp.json", ".codex/mcp.json"] {
-        let path = home.join(relative);
+    for (path, has_local_scope) in interop_config_paths(&home) {
         let Some(text) = read_capped(&path) else {
             continue;
         };
-        let servers = servers_subtree(&text);
-        if servers.as_object().is_some_and(|map| !map.is_empty()) {
+        let servers = interop_servers(&text, &project, has_local_scope);
+        if !servers.is_empty() {
             out.push(McpUserConfig {
                 path: path.to_string_lossy().into_owned(),
                 writable: false,
-                servers,
+                servers: Value::Object(servers),
                 disabled: json!([]),   // 别人的文件里没有这个概念
                 // 这几份是**只读**的：本 IDE 一个字节都不会往里写，所以它们解析失败不存在
                 // 「被空投影覆盖」的风险，照旧静默跳过即可（上面 servers 为空就不会入列）。
@@ -2439,6 +2534,78 @@ mod tests {
         for leaked in ["userID", "oauthAccount", "projects", "私密", "秘密", "a@b.c"] {
             assert!(!text.contains(leaked), "{leaked} 泄漏进了返回值：{text}");
         }
+    }
+
+    /// `claude mcp add` 缺省用的是 local 作用域，写在 projects["<cwd>"].mcpServers 底下，
+    /// 不是顶层。只读顶层的话，用户在 Claude Code 里配的绝大多数服务在这边一个都不出现。
+    #[test]
+    fn claude_code_local_scope_servers_are_read_for_the_open_project() {
+        let text = r#"{
+            "mcpServers": {"global-one": {"command": "g"}},
+            "projects": {
+                "/w/mine":  {"history": ["秘密"], "mcpServers": {"local-one": {"command": "l"}}},
+                "/w/other": {"mcpServers": {"someone-elses": {"command": "x"}}}
+            }
+        }"#;
+        let mine = claude_local_scope_servers(text, "/w/mine");
+        assert_eq!(mine["local-one"]["command"], "l", "本项目的 local 作用域服务没读到");
+        // 另一个项目的服务不该跟着过来：Claude Code 里 local 作用域就是不跨项目的。
+        assert!(mine.get("someone-elses").is_none());
+        // projects 那一层里挨着服务表的就是整段对话历史，一个字节都不该出 Rust 侧。
+        let dumped = serde_json::to_string(&mine).unwrap();
+        assert!(!dumped.contains("秘密") && !dumped.contains("history"), "{dumped}");
+        // 没打开文件夹时没有基准项目，此时只该有全局那一层。
+        assert_eq!(claude_local_scope_servers(text, ""), json!({}));
+    }
+
+    /// 同名时项目里那份赢——Claude Code 自己的优先级就是 local 高于 user。
+    #[test]
+    fn local_scope_overrides_the_global_entry_with_the_same_name() {
+        let text = r#"{
+            "mcpServers": {"db": {"command": "生产库"}},
+            "projects": {"/w/mine": {"mcpServers": {"db": {"command": "本项目的库"}}}}
+        }"#;
+        // 打的是运行时那条路本身（interop_servers），不是在测试里照抄一遍合并循环——
+        // 抄一遍的话，实现里的优先级写反了这条照样绿。
+        let merged = interop_servers(text, "/w/mine", true);
+        assert_eq!(merged["db"]["command"], "本项目的库");
+        // 没有 local 作用域这一层的文件（Cursor / Codex / Claude Desktop）不该去猜 projects。
+        assert_eq!(interop_servers(text, "/w/mine", false)["db"]["command"], "生产库");
+    }
+
+    /// macOS 上 IDE 打开的根路径和 Claude Code 记下的 cwd 常常一个走符号链接一个不走
+    /// （/tmp ↔ /private/tmp 就是），字面比较会判成"不是同一个项目"，服务照样读不到。
+    #[test]
+    fn project_paths_match_across_symlinks_and_trailing_slashes() {
+        let dir = std::env::temp_dir().join("michael-mcp-samedir");
+        std::fs::create_dir_all(&dir).unwrap();
+        let literal = dir.to_string_lossy().into_owned();
+        let resolved = std::fs::canonicalize(&dir).unwrap().to_string_lossy().into_owned();
+        assert!(same_dir(&literal, &format!("{literal}/")), "尾部斜杠不该算成两个目录");
+        assert!(same_dir(&literal, &resolved), "{literal} 和 {resolved} 是同一个目录");
+        assert!(!same_dir(&literal, &format!("{literal}-别的")));
+        // 空路径谁都不匹配，否则"没打开文件夹"会命中 projects 里的第一条。
+        assert!(!same_dir("", "") && !same_dir(&literal, ""));
+    }
+
+    /// 装了 Claude Desktop 的用户往往只在它那儿配过服务；那份配置不在 HOME 底下。
+    #[test]
+    fn claude_desktop_config_is_among_the_files_read() {
+        let home = std::path::Path::new("/w/home");
+        let paths = interop_config_paths(home);
+        assert!(
+            paths.iter().any(|(path, _)| path
+                .to_string_lossy()
+                .ends_with("claude_desktop_config.json")),
+            "没读 Claude Desktop 的配置：{paths:?}"
+        );
+        // local 作用域这一层只有 Claude Code 那份有，别的文件不该去猜 projects。
+        let with_scope: Vec<_> = paths
+            .iter()
+            .filter(|(_, local)| *local)
+            .map(|(path, _)| path.clone())
+            .collect();
+        assert_eq!(with_scope, vec![home.join(".claude.json")]);
     }
 
     #[test]
@@ -3713,7 +3880,7 @@ mod live_user_config_tests {
     #[test]
     #[ignore]
     fn 用户配置里的服务能真连上并列出工具() {
-        let configs = super::mcp_user_configs().expect("读用户 MCP 配置");
+        let configs = super::mcp_user_configs(None).expect("读用户 MCP 配置");
         let mut checked = 0;
         for cfg in &configs {
             let Some(servers) = cfg.servers.as_object() else { continue };

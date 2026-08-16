@@ -26914,10 +26914,13 @@ async function _approveWorkspaceExecConfig(kind, path, text, details) {
 //
 // 这一层是"MCP 能不能真的用起来"的关键：在它之前，配置**只**来自工作区里的文件，
 // 换个项目就得把服务和 API Key 从头再填一遍，没打开文件夹时干脆一个都用不了。
-async function _readUserScopeMcpConfigs() {
+// root 要传：Claude Code 的 `claude mcp add` 缺省写的是 **local 作用域**，落在
+// ~/.claude.json 的 projects["<当时的 cwd>"].mcpServers 底下，只有把当前工作区路径交过去
+// 才认得出哪一条属于这个项目。不传（比如只是想拿可写配置的路径）就只读到全局那一层。
+async function _readUserScopeMcpConfigs(root) {
   if (!inTauri) return [];
   try {
-    const list = await backend.invoke("mcp_user_configs");
+    const list = await backend.invoke("mcp_user_configs", { project: String(root || "") });
     return Array.isArray(list) ? list : [];
   } catch { return []; }
 }
@@ -26997,7 +27000,7 @@ async function _readWorkspaceMcpDocument(root) {
   }
   // 用户级配置排在工作区之后：同名时项目里的那个赢，项目可以覆写一个全局服务。
   const workspaceCount = documents.length;
-  for (const entry of await _readUserScopeMcpConfigs()) {
+  for (const entry of await _readUserScopeMcpConfigs(root)) {
     const servers = entry && entry.servers && typeof entry.servers === "object" ? entry.servers : {};
     if (!entry?.writable && !Object.keys(servers).length) continue;
     documents.push({
