@@ -14179,22 +14179,26 @@ function _ensureModelInfoCard() {
   // the thinking-effort buttons inside). Hover-leaves are debounced with a tiny
   // timer so quick mouse transits between menu rows don't flicker the card.
   el.addEventListener("mouseenter", () => { if (el._hideTimer) { clearTimeout(el._hideTimer); el._hideTimer = null; } });
-  // 拖滑块时指针经常会滑出卡片边界（尤其是拖到最右端），这时候不能收卡片——
-  // 卡片一没，正在拖的那个 input 跟着从文档里消失，拖动就断在半路。
-  el.addEventListener("mouseleave", () => { if (el._sliderDrag) return; hideModelInfoCard(); });
-  el.addEventListener("pointerdown", (ev) => {
-    if (!ev.target?.closest?.(".mic-sl__input")) return;
-    el._sliderDrag = true;
-    const done = () => {
-      el._sliderDrag = false;
-      document.removeEventListener("pointerup", done);
-      document.removeEventListener("pointercancel", done);
-      // 松手时指针已经不在卡片上了就该收——那一下 mouseleave 被上面挡掉了，
-      // 不在这里补，卡片会一直赖着不走。
-      if (!el.matches(":hover")) hideModelInfoCard();
-    };
-    document.addEventListener("pointerup", done);
-    document.addEventListener("pointercancel", done);
+  /*
+   * 拖滑块时指针经常会滑出卡片边界（尤其是拖到最右端），这时候不能收卡片——卡片一没，
+   * 正在拖的那个 input 跟着从文档里消失，拖动就断在半路。
+   *
+   * 判据用事件自带的 `buttons`（当前按住了哪些键），**不再用一个需要靠 pointerup 清掉的
+   * 标志位**。上一版就是那么写的，而只要那次 pointerup 没送达——窗口在拖动中途失焦、
+   * 指针捕获被系统中断、拖到屏幕外松手——标志就永远挂着，卡片从此再也不会自动收起，
+   * 表现就是"调完滑块后卡片赖在那儿好久"。状态化的抑制一定要有兜底，而这里根本不需要
+   * 状态：按键有没有按下，事件里现成就带着。
+   */
+  el.addEventListener("mouseleave", (ev) => {
+    if (ev.buttons) return;
+    hideModelInfoCard();
+  });
+  // 拖动结束时如果指针已经不在卡片上，补一次收起——那一下的 mouseleave 被上面挡掉了。
+  // 这条即使没跑到也只是少收一次，不会像旧写法那样把后续所有收起一起堵死。
+  window.addEventListener("pointerup", () => {
+    if (!_modelInfoCard || _modelInfoCard.hidden) return;
+    if (_modelInfoCard.matches(":hover")) return;
+    hideModelInfoCard();
   });
   // ALL clicks inside the card must NOT bubble to the document close-on-outside
   // handler — that handler doesn't know the card is a sibling of the menu's
