@@ -3100,10 +3100,15 @@ test("adaptive profile is persisted and injected into model context", () => {
     "Adaptive UI should let the user choose how novice/expert-aware the AI should be");
   assert.match(SRC, /makeRow\("意图识别"[\s\S]{0,160}makeSelect\("intentMode"\)\)/,
     "Adaptive UI should expose vague-message intent inference");
-  assert.match(SRC, /notes\.value = _kgText\(""\);/,
-    "Adaptive notes should reuse the global user preference memory store");
-  assert.match(SRC, /const count = _saveKgText\("", notes\.value\);/,
-    "Saving Adaptive should write back to the global preference knowledge graph");
+  // 「长期偏好记忆」那个编辑框已按所有者要求从设置页删除：记忆中心是这份数据的正主，
+  // 设置页再放一个编辑框等于同一份内容有两个入口，改哪个、以哪个为准都要靠猜。
+  // 原来这里两条断言守的是"两处共用同一份存储"——编辑框没了之后，这件事由结构本身保证，
+  // 断言改成守住"设置页不许再长出第二个编辑入口"。
+  const _adaptive = SRC.slice(SRC.indexOf("function renderAdaptiveTool"), SRC.indexOf("const SETTINGS_SCHEMA"));
+  assert.doesNotMatch(_adaptive, /_saveKgText\(|_kgText\(/,
+    "自适应页又直接读写全局偏好存储了——那份数据的正主是记忆中心");
+  assert.match(_adaptive, /memory\.addEventListener\("click", openMemoryPanel\)/,
+    "去记忆中心的入口没了，那份数据就没有可达的编辑入口了");
   assert.match(SRC, /function _adaptivePromptBlock\(\) \{[\s\S]{0,1200}【自适应用户档案】已开启/,
     "Adaptive profile should produce a byte-stable (cache-safe) instruction block");
   assert.match(SRC, /function _adaptiveMemoryBlock\(query = ""\) \{[\s\S]{0,600}_kgRetrieve\("", query/,

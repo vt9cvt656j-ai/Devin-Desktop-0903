@@ -1137,3 +1137,26 @@ test("数字设置项要有自绘步进器，而不是一个裸文本框", () =>
   assert.match(css, /\.mnum\s*\{[^}]*height:\s*32px/, "步进器高度和下拉框对不上");
   assert.match(css, /\.mnum\s*\{[^}]*border-radius:\s*var\(--feature-radius-control/, "圆角和下拉框对不上");
 });
+
+test("面板里的按钮不能出现蓝字压蓝底，页尾动作要居中", () => {
+  const css = readFileSync(join(HERE, "../src/styles/app.css"), "utf8");
+  // 上一版给面板内的 .btn 统一改了字色，却没管 .btn--primary 那个实心蓝底——
+  // 蓝字压蓝底，整颗按钮看起来是**空白**的。两者必须一起收进同一副长相。
+  const at = css.indexOf(".feature-panel__body .btn,");
+  assert.notEqual(at, -1, "面板内的按钮样式没了");
+  const block = css.slice(at, at + 500);
+  assert.match(block, /\.feature-panel__body \.btn--primary/,
+    "只改了 .btn 没管 .btn--primary——它的实心蓝底还在，字会看不见");
+  assert.match(block, /background:\s*var\(--feature-control\)/, "按钮底色没跟着改");
+  // 页尾动作居中，和上面居中的内容列对齐。
+  assert.match(css, /\.settings-actions\s*\{[^}]*justify-content:\s*center/,
+    "页尾按钮没居中，会和居中的内容列对不上");
+
+  // 自适应页那颗「保存」按钮已删：上面每一项都是 onchange 就落盘的，它唯一真正保存的
+  // 是同时被删掉的那个偏好编辑框。留着就是一颗按下去什么都不改变、却让人以为"不按就
+  // 没生效"的按钮。
+  const adaptive = SRC.slice(SRC.indexOf("function renderAdaptiveTool"), SRC.indexOf("const SETTINGS_SCHEMA"));
+  assert.doesNotMatch(adaptive, /adaptive-notes/, "那个偏好编辑框不该回来——记忆中心才是这份数据的正主");
+  assert.doesNotMatch(adaptive, /_saveKgText\(/, "保存按钮回来了，但它已经没有要保存的东西");
+  assert.match(adaptive, /actions\.append\(reset, memory\)/, "页尾按钮不是预期的两颗");
+});
