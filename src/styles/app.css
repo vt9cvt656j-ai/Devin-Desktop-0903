@@ -11168,8 +11168,10 @@ button.agent-plan__fold--toggle:focus-visible { outline: 2px solid #1a73e8; outl
   background: var(--feature-glass);
   backdrop-filter: blur(28px) saturate(190%);
   -webkit-backdrop-filter: blur(28px) saturate(190%);
-  /* 内侧一道亮边 + 一点点内阴影：玻璃是靠边缘的高光被认出来的。 */
-  box-shadow: inset 1px 0 0 var(--feature-glass-edge), inset -12px 0 24px -18px rgba(0, 0, 0, .35);
+  /* 只留内侧一道亮边。原来右缘还压了一层内阴影（inset -12px 0 24px -18px），那道渐暗
+     让交界处看着像右边的内容盖在侧栏上面——分栏靠的是那条 1px 发丝线就够了，
+     再加阴影就成了"谁压着谁"的层次暗示，而这两栏本来是平级的。 */
+  box-shadow: inset 1px 0 0 var(--feature-glass-edge);
   overflow-y: auto;
   animation: feature-fade .14s ease both;
 }

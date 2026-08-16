@@ -1329,8 +1329,13 @@ test("侧栏毛玻璃要真能透出后面，且不支持时必须退回实色",
     "只 blur 不提饱和度，背后内容会褪成一片脏灰");
   assert.match(rail, /background:\s*var\(--feature-glass\)/, "侧栏没有半透明底");
   // 玻璃是靠**边缘的高光**被认出来的，只有模糊时更像"背景没渲染好"。
-  assert.match(rail, /box-shadow:\s*inset 1px 0 0 var\(--feature-glass-edge\)/,
+  assert.match(rail, /box-shadow:\s*inset 1px 0 0 var\(--feature-glass-edge\);/,
     "侧栏少了玻璃的亮边，看着只是一块半透明色块");
+  // 右缘不许再压内阴影：那道渐暗会让交界处看着像右边的内容盖在侧栏上面，
+  // 而这两栏是平级的，分栏靠那条 1px 发丝线就够了。
+  // 先剥注释：解释"原来那道内阴影长什么样"的注释里就写着它的值，不剥就会被自己喂饱。
+  assert.doesNotMatch(rail.replace(/\/\*[\s\S]*?\*\//g, ""), /inset -\d+px 0 \d+px/,
+    "交界处又加了内阴影，看着像右边内容压在侧栏上");
   // 底色不能太实。72% 那一版看不出效果——侧栏背后正好是纯色的文件树面板，
   // 模糊一块纯色出来还是那块纯色，得让背后的内容真的透上来一点。
   const glassAt = css.indexOf("--feature-glass: rgba(252");
