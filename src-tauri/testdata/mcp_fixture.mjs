@@ -95,7 +95,9 @@ input.on("line", (line) => {
     const capabilities = { tools: {}, resources: {}, prompts: {} };
     if (process.env.MCP_FIXTURE_LOGGING === "1") capabilities.logging = {};
     reply(message.id, {
-      protocolVersion: "2025-06-18",
+      // 握手是一次**协商**：服务回的版本不一定是客户端报的那个。让它可控，才验得了
+      // 客户端拿到一个不认的版本时是当场停下来说清楚，还是揣着往下走。
+      protocolVersion: process.env.MCP_FIXTURE_PROTOCOL_VERSION || "2025-06-18",
       capabilities,
       serverInfo: { name: "michael-ide-test-fixture", version: "1.0.0" },
     });
