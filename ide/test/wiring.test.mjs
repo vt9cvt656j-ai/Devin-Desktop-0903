@@ -1079,8 +1079,15 @@ test("设置面板的下拉必须是自绘组件：菜单在控件正下方、�
   // 菜单挂在 document.body 上，**不是** .feature-panel 的后代，所以取不到 --feature-*。
   // 用了又不写兜底的话，整条声明直接作废——类名挂上了、颜色是空的，表现就是"悬停毫无反应"。
   const menuCss = css.slice(css.indexOf(".mselect__menu {"), css.indexOf(".mselect__opt.is-on::after"));
-  assert.doesNotMatch(menuCss, /var\(--feature-[\w-]+\)/,
-    "菜单在面板外面却用了没有兜底的 --feature-* 令牌，那些颜色会全部失效");
+  // 这个浮层挂在 document.body 上，不在任何面板的令牌作用域里。var() 的兜底只在变量
+  // **未定义**时生效——定义了却对该属性无效时，整条声明作废、回到初始值（background
+  // 的初始值是 transparent），表现就是"菜单透明、底下内容透出来"。表面色一律写字面值。
+  // 只管**颜色**：--font 是 :root 上的字体栈，取不到也只是回退字体，不会让整块变透明。
+  assert.doesNotMatch(menuCss, /(?:background|background-color|color|border|box-shadow)[^;]*var\(--(?!font)/,
+    "浮层的颜色又绕回 CSS 变量了——它不在面板作用域里，取不到就整条作废、回到透明");
+  assert.match(menuCss, /background-color:\s*#/, "菜单没有实色底，会透出底下的内容");
+  assert.match(css, /:root\[data-theme="dark"\] \.mselect__menu\s*\{[^}]*background-color:/,
+    "深色主题下菜单没有自己的底色");
   // 键盘走到视口外的项要带进来，否则高亮跑到看不见的地方。
   // 只在 setActive 的函数体里找——main.js 别处也有 scrollIntoView，扫全文会被喂饱。
   const sa = SRC.slice(SRC.indexOf("const setActive = (i) =>"));
