@@ -96,6 +96,30 @@ TARGET="${MRDAYONE_TARGET:-}"
 TARGET_DIR="target${TARGET:+/$TARGET}/release"
 [ -n "$TARGET" ] && echo "目标架构：$TARGET（产物落在 $TARGET_DIR/bundle/）" || echo "目标架构：本机"
 
+# 先扫掉上一次没收干净的 DMG 中间产物。
+#
+# Tauri 的 bundle_dmg.sh 每次都建一个 `rw.<pid>.<产品名>.dmg`、挂载、填充、卸载、转换。
+# 任何一次中断（构建被杀、卸载失败、机器睡了）都会让那个映像**永远挂着**，文件也留在
+# target/ 下。攒够十来个之后 hdiutil attach 就会失败，而 Tauri 报出来的只有一句
+# `failed to run bundle_dmg.sh`——既不说是挂载失败，也不说为什么。实测就是这么挂的：
+# 8 个昨天留下的 rw 映像一直挂着，今天的构建直接打不出 DMG，而脚本还退出 0。
+#
+# 这一步只动 target/ 下**本产品自己**的临时读写映像，不碰任何别的磁盘映像。
+_stale_mounts=0
+while read -r _dev; do
+  [ -n "$_dev" ] || continue
+  hdiutil detach "$_dev" -force >/dev/null 2>&1 && _stale_mounts=$((_stale_mounts + 1))
+done <<EOF
+$(hdiutil info 2>/dev/null | awk -v pat="target/release/bundle/macos/rw\\." '
+    $0 ~ /image-path/ && $0 ~ pat { p = 1 }
+    p && /^\/dev\/disk[0-9]+\t/ { print $1; p = 0 }')
+EOF
+_stale_files=$(ls target/release/bundle/macos/rw.*.dmg 2>/dev/null | wc -l | tr -d " ")
+rm -f target/release/bundle/macos/rw.*.dmg 2>/dev/null || true
+if [ "$_stale_mounts" -gt 0 ] || [ "${_stale_files:-0}" -gt 0 ]; then
+  echo "预清 DMG 残留：卸载 $_stale_mounts 个挂载、删除 ${_stale_files:-0} 个临时映像"
+fi
+
 # macOS 会给执行过的文件盖上 com.apple.provenance，它会让 cargo 的硬链接/克隆失败，
 # 而 xattr -d 删不掉——只能重写文件换个 inode。
 cleaned=0

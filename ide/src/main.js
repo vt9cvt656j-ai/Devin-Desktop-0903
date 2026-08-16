@@ -34665,10 +34665,42 @@ function _debugMutationCandidate(call) {
 // grounding observation before the first implementation mutation. Empty
 // workspaces remain deliberately fast: their empty-root fact is already a
 // complete answer to the orientation question.
+// 「这次调用会不会改工作区」——批次拦截门用的宽集合。
+//
+// 原来这里手抄了 6 个类型（write/edit/multiedit/format + worker + 两个 scaffold），
+// 而权威集合 workspaceMutatingTypes() 有 20 个。漏掉的正是**最不可逆**的那几个：
+// delete / move / mkdir / copy / download / worktree，外加 11 个生成器。
+// 后果是真的：模型一批发出 [edit A, delete B, move C]，edit A 失败了，而 delete/move
+// 不在这份漏抄的名单里 → 拦截逻辑直接放行 → 两个不可逆操作照常打在没改成的工作区上。
+// 这正是这道闸存在的意义，而删和移比写更难还原。
+//
+// tool-policy.js 的模块头写得很清楚：能力声明一次，所有名单都是它的派生查询，
+// 「so the sets can never disagree with each other again」——这一份就是漏网的手抄。
+// 白名单的失效是**静默**的（新工具默认不在名单里＝闸门对它不存在），
+// 黑名单的失效是**响**的（新工具默认被覆盖，最多多一次提示）。所以用派生。
 function _implementationMutationCandidate(call) {
   if (!call) return false;
+  // worker 不是工具类型而是派发，tool-policy 里没有它，显式补上。
+  if (_toolMutatesWorkspace(call, null) || call.type === "worker") return true;
   const type = String(call.type || "");
-  if (["write", "edit", "multiedit", "format", "worker", "web_scaffold", "game_scaffold"].includes(type)) return true;
+  // cmd/termtask 不在 tool-policy 的 mutating 集合里（shell 改没改工作区它自己不报），
+  // 这一支保留显式判断。**不含 purpose === "install"**：装依赖失败之后，紧接着去改
+  // package.json 修复它恰恰是对的，不该被拦。
+  return (type === "cmd" || type === "termtask")
+    && (call.purpose === "mutate" || call.purpose === "scaffold"
+      || (typeof _commandRiskKind === "function" && _commandRiskKind(call.command) === "workspace-write"));
+}
+
+// 「这次调用要不要先有取证」——grounding 门用的窄集合。
+//
+// 和上面**故意不同**，不要合并：取证门要的是"改代码之前先看清项目"，
+// 而 genimage / generate_sound 这类落素材的、以及 mkdir/copy 这类不写内容的，
+// 都不该被要求先读代码。fileEditTypes() 正好就是写内容的那四个。
+function _implementationGroundingCandidate(call) {
+  if (!call) return false;
+  const type = String(call.type || "");
+  if (fileEditTypes().has(type)) return true;
+  if (type === "worker" || type === "web_scaffold" || type === "game_scaffold") return true;
   return (type === "cmd" || type === "termtask")
     && (call.purpose === "mutate" || call.purpose === "scaffold"
       || (typeof _commandRiskKind === "function" && _commandRiskKind(call.command) === "workspace-write"));
@@ -34748,7 +34780,7 @@ function _runRootConfirmedEmptyForImplementation(run, root = "") {
 }
 
 function _implementationMutationGroundingIssue(run, call, root = "") {
-  if (!run || run.mode !== "agent" || !_implementationMutationCandidate(call)) return "";
+  if (!run || run.mode !== "agent" || !_implementationGroundingCandidate(call)) return "";
   const profile = run.engineering || {};
   if (!(profile.implementation || profile.explicitWorkspaceMutation || profile.projectEngineering
       || profile.uiProject || profile.bug || profile.debugProject)) return "";
@@ -34768,7 +34800,12 @@ function _implementationMutationBatchBlockResult(run, items, index) {
   if (!_implementationMutationCandidate(current.call)) return null;
   const previous = items.slice(0, index).filter((item) => item?.call
     && !item._unknown && item.merged == null && _implementationMutationCandidate(item.call));
+  // 幂等空操作不算失败。`_toolExecutionSucceeded` 把 `mutated === false` 的写类工具
+  // 一律判失败，而"目录已存在""内容和目标一致，无改动"这些**磁盘已经是目标状态**的情形
+  // UI 当面给用户显示的就是成功。放宽候选集合之后，`[create_dir 已存在, write_file]`
+  // 会被这道门硬拦——把一次正常的批次判成"前项失败"。
   const priorFailed = previous.some((item) => item.rawResult != null
+    && item.rawResult.mutated !== false
     && !_toolExecutionSucceeded(item.call, item.rawResult));
   // A pending predecessor or an action with an unknown write scope is not a failure.
   // Preserve model order and let it execute; only a real settled failure stops later
