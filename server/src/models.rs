@@ -1678,21 +1678,8 @@ pub async fn admin_model_estimate(
     // 推算（×0.1 / ×1.25）以前是唯一来源，实测偏得很远：deepseek-v4-flash 缓存读真实
     // 0.0123 而推算 0.0061、glm-5 真实 0.12 而推算 0.06——都少算一半。少算缓存读价意味着
     // 按更便宜的价估成本、实际多付，而且账面上完全看不出来。
-    let live_prices = crate::model_catalog::lookup(model_id);
-    let cache_read_price = if model.cache_read_price > 0.0 {
-        model.cache_read_price
-    } else if let Some(p) = live_prices.as_ref().and_then(|e| e.cache_read_price) {
-        p
-    } else {
-        input_price * CACHE_READ_FACTOR
-    };
-    let cache_creation_price = if model.cache_create_price > 0.0 {
-        model.cache_create_price
-    } else if let Some(p) = live_prices.as_ref().and_then(|e| e.cache_write_price) {
-        p
-    } else {
-        input_price * CACHE_WRITE_FACTOR
-    };
+    let (cache_read_price, cache_creation_price) =
+        cache_prices_for(&model, model_id, input_price);
     let route_rate = model.rate.max(0.0);
     let provider_usd_per_call = projected_provider_usd(
         req.input_tokens,
@@ -2208,6 +2195,30 @@ pub async fn admin_update(
 
 // ---------- IDE-facing: list active models (safe fields, no secrets) ----------
 /// GET /api/models — active models for the IDE (no api_key / base_url leaked).
+/// 缓存读 / 缓存写的单价，三级：管理员手填 > 实时目录的真实价 > 按输入价推算。
+///
+/// 抽成函数是因为**估价和展示必须读同一条规则**。这条规则本来只长在报价接口里，
+/// 卡片要显示缓存价时若各写一遍，两处迟早会分叉——而分叉的表现是卡片上写一个价、
+/// 账单上按另一个价扣，用户对不上账还查不出原因。
+fn cache_prices_for(model: &Model, model_id: &str, input_price: f64) -> (f64, f64) {
+    let live = crate::model_catalog::lookup(model_id);
+    let read = if model.cache_read_price > 0.0 {
+        model.cache_read_price
+    } else if let Some(p) = live.as_ref().and_then(|e| e.cache_read_price) {
+        p
+    } else {
+        input_price * CACHE_READ_FACTOR
+    };
+    let write = if model.cache_create_price > 0.0 {
+        model.cache_create_price
+    } else if let Some(p) = live.as_ref().and_then(|e| e.cache_write_price) {
+        p
+    } else {
+        input_price * CACHE_WRITE_FACTOR
+    };
+    (read, write)
+}
+
 pub async fn list_for_client(State(state): State<AppState>) -> ApiResult<Json<serde_json::Value>> {
     let rows = sqlx::query_as::<_, Model>(
         "SELECT * FROM models WHERE active = true ORDER BY sort, created_at",
@@ -2279,6 +2290,7 @@ pub async fn list_for_client(State(state): State<AppState>) -> ApiResult<Json<se
             } else {
                 (0.0, 0.0, "unset")
             };
+            let (cache_read, cache_write) = cache_prices_for(m, &mid, input_price);
             // 上下文档位：实时目录 → 后台手填 → 空。在 json! 外面算好——宏里放不下块表达式。
             let context_windows: Vec<serde_json::Value> = {
                 let mut tiers = official_contexts(&mid);
@@ -2319,6 +2331,10 @@ pub async fn list_for_client(State(state): State<AppState>) -> ApiResult<Json<se
                 // price so the client can show exactly what the backend is using.
                 "input_price": input_price,
                 "output_price": output_price,
+                // 缓存读 / 缓存写的单价。走的是 cache_prices_for —— 和报价接口**同一条**
+                // 规则，卡片上写的价和账单上扣的价因此不可能分叉。
+                "cache_read_price": cache_read,
+                "cache_write_price": cache_write,
                 "price_source": price_source,
                 "rate": m.rate,
                 "description": m.description,
@@ -12493,6 +12509,35 @@ mod power_route_tests {
             block.contains("if !plain.is_empty()"),
             "无条件排除了强力线路 —— 只有强力线路提供的模型会变成发不出请求"
         );
+    }
+
+    #[test]
+    fn 卡片上的缓存价必须和账单读同一条规则() {
+        // 缓存价有三级：管理员手填 > 实时目录的真实价 > 按输入价推算。这条规则本来只
+        // 长在报价接口里；卡片要显示缓存价，若各写一遍，两处迟早分叉——而分叉的表现是
+        // 卡片写一个价、账单按另一个价扣，用户对不上账还查不出原因。
+        let src = dispatch_src();
+        assert!(
+            src.contains("fn cache_prices_for("),
+            "缓存价的三级规则没抽成函数，展示和计费又会各写一份"
+        );
+        // 两边都得**调**它，而不是各自照抄一遍。
+        let n = src.matches("cache_prices_for(").count();
+        assert!(n >= 3, "cache_prices_for 只出现 {n} 次——有一侧没在调它");
+        assert!(
+            src.contains("\"cache_read_price\": cache_read"),
+            "缓存读价没下发，卡片上那一格永远是空的"
+        );
+        assert!(
+            src.contains("\"cache_write_price\": cache_write"),
+            "缓存写价没下发"
+        );
+        // 三级里的每一级都得在那个函数里，少一级就意味着某种配置下卡片会显示 0。
+        let at = src.find("fn cache_prices_for(").unwrap();
+        let body = &src[at..(at + 1400).min(src.len())];
+        for level in ["model.cache_read_price", "e.cache_read_price", "CACHE_READ_FACTOR"] {
+            assert!(body.contains(level), "缓存价少了 {level} 这一级");
+        }
     }
 
     #[test]
