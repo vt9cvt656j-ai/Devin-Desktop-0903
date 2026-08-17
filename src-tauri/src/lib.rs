@@ -355,6 +355,8 @@ pub fn run() {
             mcp::mcp_rediscover,
             mcp::mcp_server_log,
             mcp::mcp_pending_auth,
+            mcp::mcp_pending_elicitation,
+            mcp::mcp_elicit_respond,
             mcp::mcp_user_config,
             mcp::mcp_save_user_config,
             mcp::user_rules_read,

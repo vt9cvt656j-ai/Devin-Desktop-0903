@@ -2020,6 +2020,11 @@ try {
   }
 } catch {}
 
+// MCP elicitation 轮询：服务反过来要用户填东西时，后端把请求挂起等前端来取。
+// 1.2 秒一次——服务那边正卡着等回答，太慢会让人以为工具卡死了；而这一下只是一次
+// IPC，没有挂起请求时后端直接返回 None。
+setInterval(() => { void _mcpPollElicitation(); }, 1200);
+
 // 内存压力自动减负：监测 WebView DOM 膨胀（历史卡死根因是 1.3GB），超过阈值时主动
 // 释放不可见的 heavy 资源（已完成工具卡的大 viewport、后台终端 canvas），
 // 避免系统 MemoryPressure 把整个 UI 冻住。每 30s 一次，轻量。
@@ -19488,6 +19493,113 @@ function _approvalLabel(call) {
   }
 }
 // Three-way approval prompt (允许 / 本会话总是允许 / 拒绝). Self-contained dialog so
+// ── MCP elicitation：服务反过来要用户填东西 ──────────────────────────────────
+//
+// 规范里 requestedSchema 被限制成"扁平对象 + 基本类型"，正是为了让客户端能安全地
+// 自动生成表单——所以这里照着渲染就行，不需要通用 JSON Schema 引擎。
+//
+// 三件事必须写在框上：**是哪个服务在问**（一个来路不明的表单要用户填东西，不写来源
+// 就是在教他闭着眼睛填）、它想要什么、以及"不填"是个正当选择。
+let _elicitBusy = false;
+function _mcpElicitFieldRow(key, spec, required) {
+  const type = String(spec?.type || "string");
+  const label = _escHtml(String(spec?.title || key));
+  const desc = spec?.description ? `<div class="mcpel-desc">${_escHtml(String(spec.description))}</div>` : "";
+  const req = required ? ` <span class="mcpel-req">*</span>` : "";
+  let control;
+  if (Array.isArray(spec?.enum) && spec.enum.length) {
+    const names = Array.isArray(spec.enumNames) ? spec.enumNames : null;
+    control = `<select data-k="${_escAttr(key)}" data-t="string">`
+      + spec.enum.map((v, i) => `<option value="${_escAttr(String(v))}">${_escHtml(String(names?.[i] ?? v))}</option>`).join("")
+      + `</select>`;
+  } else if (type === "boolean") {
+    control = `<input type="checkbox" data-k="${_escAttr(key)}" data-t="boolean"${spec?.default ? " checked" : ""}>`;
+  } else if (type === "number" || type === "integer") {
+    control = `<input type="number" data-k="${_escAttr(key)}" data-t="${type}"${spec?.default != null ? ` value="${_escAttr(String(spec.default))}"` : ""}>`;
+  } else {
+    const fmt = String(spec?.format || "");
+    const it = fmt === "email" ? "email" : fmt === "uri" ? "url" : "text";
+    control = `<input type="${it}" data-k="${_escAttr(key)}" data-t="string"${spec?.default != null ? ` value="${_escAttr(String(spec.default))}"` : ""}>`;
+  }
+  return `<label class="mcpel-row"><span class="mcpel-label">${label}${req}</span>${control}${desc}</label>`;
+}
+let _elicitDlg = null;
+function _mcpElicitationDialog({ server, message, schema }) {
+  return new Promise((resolve) => {
+    if (!_elicitDlg) {
+      _elicitDlg = document.createElement("dialog");
+      _elicitDlg.className = "sheet sheet--io";
+      _elicitDlg.innerHTML = `<form method="dialog" class="sheet__body">
+        <h2 class="ta-title"></h2>
+        <div class="sheet__sub el-from"></div>
+        <pre class="sheet__sub el-msg" style="white-space:pre-wrap"></pre>
+        <div class="el-fields"></div>
+        <div class="sheet__actions">
+          <button type="button" data-act="decline">拒绝</button>
+          <button type="button" data-act="cancel">取消</button>
+          <button type="button" data-act="accept" class="btn-primary">提交</button>
+        </div>
+      </form>`;
+      document.body.appendChild(_elicitDlg);
+    }
+    const dlg = _elicitDlg;
+    dlg.querySelector(".ta-title").textContent = "MCP 服务请求你补充信息";
+    // 来源写死在框上，不可省略。
+    dlg.querySelector(".el-from").textContent = `来自服务「${server || "未知"}」——以下文字由该服务提供，不是 IDE 的提示。`;
+    dlg.querySelector(".el-msg").textContent = String(message || "");
+    const props = (schema && typeof schema === "object" && schema.properties && typeof schema.properties === "object")
+      ? schema.properties : {};
+    const required = new Set(Array.isArray(schema?.required) ? schema.required.map(String) : []);
+    const keys = Object.keys(props).slice(0, 24); // 有界：别让一个坏服务铺满整屏
+    dlg.querySelector(".el-fields").innerHTML = keys
+      .map((k) => _mcpElicitFieldRow(k, props[k], required.has(k))).join("");
+    const btns = [...dlg.querySelectorAll("button[data-act]")];
+    let done = false;
+    const finish = (action) => {
+      if (done) return;
+      done = true;
+      dlg.removeEventListener("close", onClose);
+      for (const b of btns) b.removeEventListener("click", onClick);
+      if (action !== "accept") { resolve({ action }); return; }
+      const content = {};
+      for (const el of dlg.querySelectorAll("[data-k]")) {
+        const k = el.getAttribute("data-k");
+        const t = el.getAttribute("data-t");
+        if (t === "boolean") content[k] = !!el.checked;
+        else if (t === "number" || t === "integer") {
+          const n = Number(el.value);
+          if (el.value !== "" && Number.isFinite(n)) content[k] = t === "integer" ? Math.round(n) : n;
+        } else if (el.value !== "") content[k] = String(el.value);
+      }
+      resolve({ action: "accept", content });
+    };
+    // 关掉窗口 = 取消，不是拒绝：这两者服务端的处理往往不同。
+    const onClose = () => finish("cancel");
+    const onClick = (e) => { dlg.close(); finish(e.currentTarget.getAttribute("data-act")); };
+    for (const b of btns) b.addEventListener("click", onClick);
+    dlg.addEventListener("close", onClose);
+    dlg.showModal();
+  });
+}
+async function _mcpPollElicitation() {
+  if (!inTauri || _elicitBusy) return;
+  let pending = null;
+  try { pending = await backend.invoke("mcp_pending_elicitation"); }
+  catch { return; } // 老后端没有这个命令
+  if (!pending || !pending.token) return;
+  _elicitBusy = true;
+  try {
+    const answer = await _mcpElicitationDialog(pending);
+    await backend.invoke("mcp_elicit_respond", {
+      token: pending.token, action: answer.action, content: answer.content ?? null,
+    });
+  } catch (e) {
+    console.warn("[mcp] elicitation failed:", e);
+  } finally {
+    _elicitBusy = false;
+  }
+}
+
 // it never collides with the shared #ioDialog the agent may drive elsewhere.
 // Serialized via a promise chain so parallel mutations can't open two at once
 // (dialog.showModal() throws if one is already open). Returns "once"|"always"|"deny".
@@ -20621,9 +20733,20 @@ const _AI_AGENT_ROLES = new Set([
 ]);
 const _aiIntentCache = new Map(); // 会话 + 上下文指纹 + 文本 -> { ts, intents }
 const _aiIntentInflight = new Map(); // key -> 物理请求 Promise；8s 前台窗口结束后仍保留到真实落定
-// 新会话第一轮愿意为意图裁决多等多久。整个会话只付一次：拿到 flag 之后画像就粘住了。
-// 上限刻意压得比 8s 前台窗口短得多——这一下是为了不让最关键的那轮裸奔，不是为了等到底。
-const _FIRST_TURN_INTENT_WAIT_MS = 1500;
+// 意图裁决的前台等待窗口。物理请求的寿命比它长（迟到的裁决仍落 cache），这里只决定
+// 「当前这一轮愿意等多久」。
+const _INTENT_FOREGROUND_WAIT_MS = 8000;
+// 新会话第一轮愿意为意图裁决多等多久。整个会话只付一次：拿到裁决之后画像就粘住了。
+//
+// 这个值必须 >= 前台窗口，否则这道等待是**恒定失败**的：裁决用的是用户选的那个模型
+// （刻意不降级），实测生产网关 claude-opus-5 出这份 JSON 的响应头延迟是 6931ms 和
+// 7607ms（completion≈520 token）。旧值 1500 比它短 5 倍，于是 race 每次都由 timer 赢，
+// 主回合总是带着空画像发出去——网关只挂 agent.base 四块，agent_engineering / git_guide /
+// agent_research / agent_collaboration / agent_automation / defect_hunting 和整套
+// michael-design 设计层**一块都不挂**。这正是「突然变弱智、工具也不用了」的物理成因：
+// 决定整个做法的那一轮，手里既没有工程纪律也没有设计纪律。
+// 两个值绑在一起，就不会再各自漂移出这种「永远赢不了的 race」。
+const _FIRST_TURN_INTENT_WAIT_MS = _INTENT_FOREGROUND_WAIT_MS;
 let _lastGoodAiConfig = null; // 上次真实发送用过的 config——运行中 steer 复用，绝不碰登录门
 function _aiIntentCacheKey(text, sessionId = "", contextFingerprint = "") {
   const normalized = String(text || "").trim().replace(/\s+/g, " ").toLowerCase().slice(0, 800);
@@ -20867,7 +20990,7 @@ async function _aiIntentProfile(text, config, session = null, context = null) {
     let timer = 0;
     return Promise.race([
       adopted,
-      new Promise((resolve) => { timer = setTimeout(() => resolve(null), 8000); }),
+      new Promise((resolve) => { timer = setTimeout(() => resolve(null), _INTENT_FOREGROUND_WAIT_MS); }),
     ]).finally(() => { if (timer) clearTimeout(timer); });
   };
   const hit = _aiIntentCache.get(key);
@@ -21132,6 +21255,22 @@ function _ideSemanticProfile(profile) {
 function _semanticProfileHeaderFor(resolved, text) {
   void text;
   return _ideSemanticProfile(resolved || {});
+}
+
+// 「服务端这轮真的挂上了 michael-design 设计层吗」——_uiDesignCraftBlock 靠这个答案决定要不
+// 要把本地那份完整设计纪律（约 4K token）换成一句指向系统提示词的锚点。
+//
+// 此前的判据是 `!!config.ideSemanticProfile`，而画像为空时这个字符串是 `"2.5:"`——**truthy**。
+// 于是分类器迟到/失败的那些轮：客户端认定「服务端会给」，把自己的设计纪律全撤了；服务端那边
+// 因为一个 design flag 都没有，ui_intent 为假，design.base 及其下所有层一块都没挂。
+// 结果是设计纪律**两边都没发**，模型只能凭印象糊 UI。
+//
+// 判据必须是「画像里真的带着 design 旗标」。这里刻意用 includes 子串匹配，跟服务端
+// `semantic("design")` 的语义逐字对齐（design_review / design_motion 等都含 "design"），
+// 两边判同一件事就不会再分叉。
+function _serverDesignLayersRouted(config) {
+  if (!_l0On(config)) return false;
+  return String(config?.ideSemanticProfile || "").includes("design");
 }
 
 // The profile is what the gateway assembles its cacheable system prefix from, so it belongs to
@@ -24564,7 +24703,11 @@ async function sendPrompt(text, attachments = [], readyConfig = null) {
   //
   // 只在第一轮等，且有硬上限：会话一旦有了 flag，后面每一轮都直接命中，零等待。裁决没赶上
   // 也照常发（_applyLateIntentIfLanded 会在循环边界补），不会把一轮卡死在这里。
-  if (_turnIntentState && !(sess._semanticProfileFlags || []).length) {
+  // 「只在第一轮等」的判据不能只看 flag 是否为空：普通问答的裁决**合法地**返回零 flag
+  // （action=answer、workspaceAction=none，一个维度都不为 true），于是 flag 永远是空的，
+  // 这道等待就变成了每一轮都付一次完整窗口——纯聊天的会话会被这个数字拖成逐轮卡顿。
+  // 真正的判据是「这个会话已经拿到过一次裁决了」，跟裁决点亮了几个 flag 无关。
+  if (_turnIntentState && !(sess._semanticProfileFlags || []).length && !sess._intentWaitPaid) {
     let _waitTimer = null;
     try {
       await Promise.race([
@@ -24573,6 +24716,8 @@ async function sendPrompt(text, attachments = [], readyConfig = null) {
       ]);
     } catch {}
     if (_waitTimer) clearTimeout(_waitTimer);
+    // 裁决落定即记账：零 flag 也算付过了。超时没落定的不记，下一轮还值得再等一次。
+    if (_turnIntentState.settled) sess._intentWaitPaid = true;
     if (_turnIntentState.settled && _turnIntentState.verdict) {
       const _base = _semanticEngineeringEvidence(text);
       _base._isAgentMode = effectiveMode === "agent";
@@ -24937,7 +25082,7 @@ async function sendPrompt(text, attachments = [], readyConfig = null) {
   const _uiTurnEngineering = _turnEngineeringResolved;
   const _decisionFrame = (effectiveMode === "agent") ? _agentDecisionFrameBlock(text, _uiTurnEngineering) : "";
   const _uiDesignCraft = (effectiveMode === "agent")
-    ? _uiDesignCraftBlock(text, _uiTurnEngineering, { serverDesignLayersActive: _l0On(config) && !!config.ideSemanticProfile })
+    ? _uiDesignCraftBlock(text, _uiTurnEngineering, { serverDesignLayersActive: _serverDesignLayersRouted(config) })
     : "";
   const _toolHint = (effectiveMode === "agent") ? _buildToolHint(text, _uiTurnEngineering) : "";
   // Experiential memory: a matching reusable WORKFLOW (AWM procedural memory, if this
@@ -26724,7 +26869,13 @@ const _MCP_TOOL_SEARCH_WAIT_MS = 8_000;
 // This is an attention budget, not only a transport limit. The complete registry stays
 // available through search_tools/direct-name healing, so ordinary turns should never
 // make the model choose among the entire product catalog.
-const _TOOL_PAYLOAD_MAX_TOOLS = 128;
+//
+// 但它同时是 _agentModelTurn 那道**防御性收敛**的上限（那次调用不传 requestedSchemas，
+// 等于纯粹按上限裁剪当前窗口）。静态目录已经 138 个，128 意味着一旦窗口被编排器撑满，
+// 尾部工具会被静默切掉、且没有任何日志——「某个工具明明装载了却调不到」就是这么来的。
+// 上限必须留在目录规模之上：注意力预算由开局窗口（十个核心工具）和编排器的准入负责，
+// 这一层只做兜底，别在这里替它们做减法。
+const _TOOL_PAYLOAD_MAX_TOOLS = 256;
 const _TOOL_PAYLOAD_MAX_SCHEMA_BYTES = 512 * 1024;
 // 允许进**开局**窗口的 MCP 用量（见 _selectInitialTools 里的整服务放行）。
 // 开局窗口本来是 10 个核心工具 + search_tools；这两个上限意味着最多变成 19 个，
