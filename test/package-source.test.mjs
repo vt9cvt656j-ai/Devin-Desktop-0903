@@ -152,7 +152,10 @@ test("工具接进了注册表、意图映射和取证闸", () => {
     ["网关", join(ROOT, "..", "server", "prompts", "tools.json")],
     ["官网", join(ROOT, "website", "public", "tools.json")],
   ]) {
-    const list = JSON.parse(readFileSync(rel, "utf8"));
+    // 两份目录的形状不一样：网关那份是裸数组，官网那份是 { tools: [...] } 带元信息。
+    const doc = JSON.parse(readFileSync(rel, "utf8"));
+    const list = Array.isArray(doc) ? doc : (doc.tools || []);
+    assert.ok(list.length > 100, `${label}那份目录读出来是空的`);
     assert.ok(
       list.some((t) => (t?.function?.name || t?.name) === "package_source"),
       `${label}那份工具目录里没有 package_source`,
