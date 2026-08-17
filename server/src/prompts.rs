@@ -3759,6 +3759,29 @@ pub fn assemble_into(headers: &HeaderMap, body: &mut serde_json::Value) -> Resul
             || tool_schema_bytes == budgeted_tool_schema_bytes
     );
     let request_json_bytes = serde_json::to_vec(body).map_or(0, |request| request.len());
+    // 「用户这一轮的话到底有没有到模型手里」此前无从判断，只能从模型的反应反推——而反推
+    // 两次都推错了方向（先说消息丢了，后说没丢）。这两个字段是**纯结构**：抽取到的请求有
+    // 多少字节、最后一条 user 消息有多少字节。不记录任何内容，正文一个字都不进日志。
+    //
+    // 判读方式：marked_request_bytes=0 且 last_user_bytes 很大 = 前言到了、用户的话没到
+    // （或者标记不匹配）；两个都大 = 话到了，问题在模型这一侧或提示词。
+    let marked_request_bytes = anchor_request.as_deref().map_or(0, str::len);
+    let last_user_bytes = body
+        .get("messages")
+        .and_then(|messages| messages.as_array())
+        .and_then(|messages| {
+            messages
+                .iter()
+                .rev()
+                .find(|message| message.get("role").and_then(|r| r.as_str()) == Some("user"))
+        })
+        .and_then(|message| message.get("content"))
+        .map_or(0, |content| {
+            content
+                .as_str()
+                .map(str::len)
+                .unwrap_or_else(|| serde_json::to_vec(content).map_or(0, |bytes| bytes.len()))
+        });
     tracing::info!(
         mode,
         prompt_blocks = ?prompt_blocks,
@@ -3769,6 +3792,8 @@ pub fn assemble_into(headers: &HeaderMap, body: &mut serde_json::Value) -> Resul
         prompt_bytes,
         tool_schema_bytes,
         request_json_bytes,
+        marked_request_bytes,
+        last_user_bytes,
         "assembled IDE prompt request"
     );
     record_agent_trace(AgentTraceInput {
