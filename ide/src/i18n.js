@@ -323,6 +323,7 @@ const EN = {
   "assistant.mode.chat": "Chat",
   "assistant.mode.auto": "Auto",
   "assistant.mode.switch": "Switch AI mode",
+  "assistant.jumpToLatest": "Jump to latest",
   "assistant.tokenMeter": "Context cache: {percent}%",
 
   "model.desc.opus": "Anthropic Claude Opus — flagship-grade model for complex reasoning, coding, and long tasks.",
@@ -994,6 +995,7 @@ const ZH_CN = {
   "assistant.mode.chat": "Chat",
   "assistant.mode.auto": "Auto",
   "assistant.mode.switch": "切换 AI 模式",
+  "assistant.jumpToLatest": "回到最新",
   "assistant.tokenMeter": "上下文缓存：{percent}%",
   "model.desc.opus": "Anthropic Claude Opus —— 旗舰级，适合复杂推理、编程与长任务。",
   "model.desc.sonnet": "Anthropic Claude Sonnet —— 能力与速度均衡的主力款，适合日常编码。",

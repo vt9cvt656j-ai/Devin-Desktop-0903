@@ -2204,7 +2204,7 @@ let _programScrollTop = -1;
 // 这是唯一能把"人往上翻"和"下面又长出来一段"区分开的信号。
 let _lastUserIntentAt = 0;
 function _markProgramScroll() { if (chatEl) _programScrollTop = chatEl.scrollTop; }
-function _repinChat() { _chatPinned = true; }
+function _repinChat() { _chatPinned = true; try { _syncChatJump(); } catch {} }
 // 滚轮往上翻是意图最明确的一种，直接当场解除钉底，不经过下面那个时间窗口——窗口要靠
 // wheel 和随后的 scroll 事件挨得足够近才成立，那是个不必要的时序依赖。其余输入方式
 // （触摸、键盘、拖滚动条）没有可靠的方向信息，仍然走窗口。
@@ -2250,6 +2250,7 @@ if (chatEl) {
       Math.abs(top - _programScrollTop) <= 2,
       performance.now() - _lastUserIntentAt,
     );
+    _syncChatJump();
     if (_chatScrollRAF) return;
     _chatScrollRAF = requestAnimationFrame(() => {
       _chatScrollRAF = null;
@@ -17349,6 +17350,16 @@ function saveChatHistory(options) {
 // Jump the chat to the newest message. Retries across several frames because restored history renders
 // asynchronously (markdown, code cards, images), each of which grows scrollHeight after the first
 // paint — a single scrollTop assignment would land short and leave the user mid-history.
+// 「回到最新」的可见性。跟随一旦被解除就是**粘性**的（既不自己恢复也不来回抖），
+// 而在这之前界面上没有任何东西告诉用户这件事，也没有回程入口——长任务里往上翻一眼
+// diff 是最常见的动作，翻完人就被留在半空，下面还在不断长出新卡片。
+// 钉底状态还是按标签持久化的（切走再切回来也救不回来），所以逃生口比看起来还少。
+function _syncChatJump() {
+  const btn = typeof document !== "undefined" ? document.getElementById("chatJump") : null;
+  if (!btn) return;
+  btn.hidden = _chatPinned || !chatEl;
+}
+
 function _scrollChatBottom() {
   if (!chatEl) return;
   // 盲跳到底和"没钉住"是互相矛盾的两个状态，一起改掉，免得跳完第一帧就被判成用户滑走了。
@@ -20523,7 +20534,9 @@ function _fillModeMenu(menu) {
       _closeModeMenu();
       const session = _currentSession();
       if (session) { session.mode = mode.id; _renderChatTabs(); saveChatHistory(); }
-      showToast(`已切换到 ${mode.label} 模式`);
+      showToast(_isStreaming()
+        ? `已切换到 ${mode.label} 模式 · 当前这一轮仍按原模式跑完，从你下一条消息起生效`
+        : `已切换到 ${mode.label} 模式`);
     });
     menu.appendChild(item);
   }
@@ -20580,6 +20593,13 @@ function openModeMenuFor(pickerEl) {
   setTimeout(() => document.addEventListener("click", dismiss), 50);
 }
 
+$("chatJump")?.addEventListener("click", () => {
+  // 用 _scrollChatBottom 而不是 _repinChat()+_chatFollow()：恢复出来的历史里
+  // markdown / 代码卡 / 图片会在首帧之后继续长高，单次赋值会落在半空——而这颗按钮
+  // 最需要准的就是这一次。它内部已经是"重钉 + 跨帧重试"。
+  _scrollChatBottom();
+  _syncChatJump();
+});
 $("modePickerBtn")?.addEventListener("click", _toggleModeMenu);
 _updateModeUI();
 

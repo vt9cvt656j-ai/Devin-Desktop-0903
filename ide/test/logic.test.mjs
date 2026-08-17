@@ -10565,7 +10565,7 @@ test("long chat transcripts stay bounded while paging both directions", () => {
   // 处只重置了前者，_chatFollow 的门却两个都要，于是跟随停掉之后连发新消息都救不回来。
   assert.doesNotMatch(SRC, /_userScrolledAway\s*=/,
     "the second pin flag is gone — one bit cannot desynchronize from itself");
-  assert.match(SRC, /function _repinChat\(\)\s*\{\s*_chatPinned = true; \}/,
+  assert.match(SRC, /function _repinChat\(\)\s*\{\s*_chatPinned = true;/,
     "re-pinning must go through one named helper, not scattered assignments");
   assert.doesNotMatch(SRC, /while \(session\.container\.firstChild\)[\s\S]{0,180}_renderMsgRange\(session, 0, h\.length\)/,
     "opening earlier history must not synchronously rebuild the full transcript");
@@ -25773,4 +25773,43 @@ test("规则拦下的不能写成「用户已拒绝」——用户根本没点�
   assert.match(gate, /_noteRefusal\("user", ""\)/);
   assert.match(gate, /_noteRefusal\("skill", skillGate\.names\[0\]/,
     "技能范围外不置位的话，会落到默认的「用户拒绝」分支——而用户没点过");
+});
+
+test("往上翻之后要有回程入口——跟随是粘性解除的", () => {
+  // 按钮必须挂在 composer 里，不能放 #chat 里：切标签时 chatEl 的子节点会被整个清空
+  // （removeChild 循环），放进去第一次切标签就没了。
+  const shell = readFileSync(join(HERE, "../src/app/Shell.jsx"), "utf8");
+  const at = shell.indexOf('id="chatJump"');
+  assert.ok(at > 0, "「回到最新」按钮不见了");
+  const before = shell.slice(0, at);
+  assert.ok(
+    before.lastIndexOf('id="composer"') > before.lastIndexOf('id="chat"'),
+    "按钮放进了 #chat，切标签时会被 removeChild 循环清掉",
+  );
+  // 滚动监听器里同步可见性，且只切属性不造 DOM（这个监听器每次滚动都跑）
+  const _lisAt = SRC.indexOf('chatEl.addEventListener("scroll"');
+  const listener = SRC.slice(_lisAt, SRC.indexOf("{ passive: true });", _lisAt));
+  assert.match(listener, /_syncChatJump\(\)/, "滚动时不同步，按钮永远不会出现");
+  assert.doesNotMatch(listener, /createElement|innerHTML/, "滚动路径上不许造 DOM");
+  // 点击走 _scrollChatBottom：恢复的历史里 markdown/代码卡/图片首帧之后还会长高，
+  // 单次赋值会落在半空——而这颗按钮最需要准的就是这一次。
+  const _clkAt = SRC.indexOf('$("chatJump")?.addEventListener');
+  const click = SRC.slice(_clkAt, SRC.indexOf('$("modePickerBtn")', _clkAt));
+  assert.match(click, /_scrollChatBottom\(\)/);
+  assert.doesNotMatch(click, /scrollTop\s*=/, "自己赋 scrollTop 会落在半空");
+  // 每一处重新钉底都要收起它
+  assert.match(SRC, /function _repinChat\(\)\s*\{\s*_chatPinned = true;[\s\S]{0,60}_syncChatJump/);
+  // 两种语言都要有文案，否则界面上显示的是 key
+  const i18n = readFileSync(join(HERE, "../src/i18n.js"), "utf8");
+  assert.equal((i18n.match(/"assistant\.jumpToLatest"/g) || []).length, 2, "少了中文或英文词条");
+});
+
+test("跑到一半切模式，要说清从哪一刻起生效", () => {
+  const at = SRC.indexOf("已切换到 ${mode.label} 模式");
+  assert.ok(at > 0);
+  const block = stripJsComments(SRC.slice(at - 300, at + 200));
+  // run 在创建时就把 mode 定死了（mode: mode || _currentAiMode），跑到一半切对这一轮
+  // 完全没有影响。只说"已切换"，用户会盯着屏幕等它按新模式干活，然后怀疑软件坏了。
+  assert.match(block, /_isStreaming\(\)/, "没有区分「正在跑」和「空闲」两种情况");
+  assert.match(block, /当前这一轮仍按原模式跑完/);
 });
