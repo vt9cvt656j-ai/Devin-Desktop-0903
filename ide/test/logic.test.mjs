@@ -16084,8 +16084,11 @@ test("gateway compression makes the local LLM compaction stand down", () => {
   // Additive, matching the gateway's capacity_for_native (server/src/compression.rs): the tier is
   // granted ON TOP of the model's own window. Taking the larger of the two contradicted the
   // buttons, which have always been priced additively.
-  assert.match(SRC, /function _effectiveContextLimit\(modelId\)[\s\S]{0,900}_gatewayHandlesCompression\(\) && tierMax \? native \+ tierMax : native/,
+  assert.match(SRC, /function _effectiveContextLimit\(modelId\)[\s\S]{0,1400}return _ctxNativeDefault\(modelId\) \+ tier;/,
     "网关接管时本地按 原生+档位 裁剪，与 capacity_for_native 一致");
+  // 加法一旦退回成 max，两个数在 1M 原生模型上重合，整排档位按钮又变成空操作。
+  assert.doesNotMatch(SRC, /function _effectiveContextLimit\(modelId\)[\s\S]{0,1400}Math\.max\(\s*native,\s*tierMax/,
+    "档位又变成取较大值了，付费档位在 1M 原生模型上会整排失效");
   const callSites = SRC.match(/_trimMessagesIfHuge\(messages, \w+, root, _effectiveContextLimit\(config\?\.model\)\)/g) || [];
   assert.equal(callSites.length, 2,
     `两个调用点都要用有效窗口（找到 ${callSites.length} 个）`);
@@ -21062,9 +21065,11 @@ test("Tier-2 fold invalidates duplicate-read stubs for the same file", () => {
 // choice may NARROW the window (a cost dial) but must never budget past what native-or-
 // membership actually delivers — a fictional window dies upstream as context-length 400s.
 test("context-window choice clamps to what is actually deliverable", () => {
+  const win = { _modelContextLimit: () => 200_000, _nativeWindowsFor: () => [200_000] };
   const mkEff = (store, user, compress) => load("_effectiveContextLimit", {
-    _modelContextLimit: () => 200_000,
-    _nativeWindowsFor: () => [200_000],
+    ...win,
+    _ctxNativeCeiling: load("_ctxNativeCeiling", win),
+    _ctxNativeDefault: load("_ctxNativeDefault", win),
     _michaelUser: user,
     _gatewayHandlesCompression: () => compress,
     _ctxChoiceFor: () => store,
@@ -24858,6 +24863,129 @@ test("上游的 none 映射成本地的 off", () => {
   assert.deepEqual(liveLevels()("gpt-5.4"), ["xhigh", "high", "medium", "low", "off"]);
   assert.equal(liveLevels()("glm-5"), null, "空档位要交还内置表");
   assert.equal(liveLevels()("私有命名-x"), null);
+});
+
+// ── 同一份目录声明必须给出同一套档位 ──────────────────────────────────────
+//
+// 用户报的形状：glm-5.2 的卡片上只有"开/关"，而 deepseek-v4-pro 有三档——可这两款在
+// 网关目录里的声明**逐字相同**（都是 ["xhigh","high"]）。差别全出在客户端：GLM 命中内置表
+// 的布尔开关分支（kind=kimi-toggle），而 _effortIsSendable 对 kimi-toggle 一律返回 false，
+// 目录给的档位被整个过滤掉，xhigh 永远选不到。
+const gradedLive = () => load("_liveThinkingLevels", {
+  _modelCatalogEntry: (id) => ({
+    "glm-5.2": { supportedEfforts: ["xhigh", "high"] },
+    "kimi-k2.6": { supportedEfforts: [] }, // 目录确认它只有开关，没有深度档
+  }[id] || null),
+});
+const gradedProfile = (base, id) => load("_thinkingProfileFor", {
+  _builtinThinkingProfileFor: () => base,
+  _liveThinkingLevels: gradedLive(),
+  _effortIsSendable: load("_effortIsSendable"),
+  _THINK_LEVELS: loadConst("_THINK_LEVELS"),
+  _isImageModel: () => false,
+})(id);
+const boolToggleBase = () => ({
+  kind: "kimi-toggle",
+  configurable: true,
+  booleanToggle: true,
+  levels: ["off", "high"],
+  defaultLevel: "high",
+});
+
+test("目录给出多档时，布尔开关族要展开成真档位而不是停在开/关", () => {
+  const p = gradedProfile(boolToggleBase(), "glm-5.2");
+  assert.deepEqual(p.levels, ["off", "high", "xhigh"], "目录声明的 xhigh 被过滤掉了，用户选不到");
+  assert.equal(p.kind, "kimi-toggle", "kind 不能改——请求参数是按它分派构造的");
+  assert.equal(p.booleanToggle, false, "booleanToggle 没撤销，UI 会把多出来的档位吞回成两态开关");
+});
+
+test("目录没给档位的布尔开关模型，行为一个字不变", () => {
+  // 这条是上一条的回归保险：放开 kimi-toggle 不能顺手把只有开关的 Kimi 也改了。
+  const p = gradedProfile(boolToggleBase(), "kimi-k2.6");
+  assert.deepEqual(p.levels, ["off", "high"]);
+  assert.equal(p.booleanToggle, true, "只有开关的模型仍要渲染成两态");
+});
+
+test("布尔开关族的档位真的发得出去——开关照旧，档位额外带一份", () => {
+  // 摆出来的按钮必须变成请求字段，否则只是换一种方式骗用户。thinking 开关不能动：
+  // 今天 GLM 能思考靠的就是它；档位以 reasoning_effort 额外带，上游不认就当没有。
+  const apply = (id, level, base) => load("_applyThinkingToConfig", {
+    _thinkingProfileFor: () => gradedProfile(base, id),
+    _thinkingPrefFor: () => level,
+    _customModelById: () => null,
+  })({ model: id });
+
+  const high = apply("glm-5.2", "high", boolToggleBase());
+  const xhigh = apply("glm-5.2", "xhigh", boolToggleBase());
+  assert.deepEqual(high.thinking, { type: "enabled" }, "思考开关不能丢");
+  assert.deepEqual(xhigh.thinking, { type: "enabled" });
+  assert.equal(high.reasoningEffort, "high");
+  assert.equal(xhigh.reasoningEffort, "xhigh");
+  assert.notEqual(
+    JSON.stringify(high),
+    JSON.stringify(xhigh),
+    "两个档位发出去的请求逐字节相同 —— 那档位就是个装饰",
+  );
+
+  // 只有开关的模型不许平白多一个字段。
+  const kimi = apply("kimi-k2.6", "high", boolToggleBase());
+  assert.deepEqual(kimi.thinking, { type: "enabled" });
+  assert.equal(kimi.reasoningEffort, undefined, "目录没给档位，不该编一个发出去");
+});
+
+// ── 上下文：卡片、仪表、裁剪预算读同一个数 ────────────────────────────────
+//
+// 用户报的形状："和我选择的上下文这里不一样，使用的也不一样吧"。根因是 _contextMeterLimit
+// 和 _effectiveContextLimit 都写 max(默认窗口, 最宽窗口)——把"没选时用哪个"和"选了之后夹到
+// 哪"两个角色塞进一个变量。glm-5.2 默认 96,890 而目录列了 1.0M，于是没选也按 1.0M 记账：
+// 卡片高亮一个没人选过的 1.0M，仪表指针贴着 0，_trimMessagesIfHuge 按 1.0M 留历史。
+const ctxEnv = (choice) => ({
+  _modelCatalogEntry: () => ({
+    contextLimit: 96_890,
+    contextWindows: [96_890, 202_752, 262_144, 512_000, 1_000_000].map((tokens) => ({ tokens })),
+  }),
+  _customModelById: () => null,
+  loadConfig: () => ({}),
+  _ctxChoiceFor: () => choice,
+  _michaelUser: null,
+  _gatewayHandlesCompression: () => false,
+  _fallbackModelContextLimit: load("_fallbackModelContextLimit"),
+  _modelContextLimit: load("_modelContextLimit", {
+    _customModelById: () => null,
+    loadConfig: () => ({}),
+    _fallbackModelContextLimit: load("_fallbackModelContextLimit"),
+    _modelCatalogEntry: () => ({ contextLimit: 96_890 }),
+  }),
+  _nativeWindowsFor: () => [1_000_000, 512_000, 262_144, 202_752, 96_890],
+});
+const ctxFn = (name, choice) => load(name, {
+  ...ctxEnv(choice),
+  _ctxNativeCeiling: load("_ctxNativeCeiling", ctxEnv(choice)),
+  _ctxNativeDefault: load("_ctxNativeDefault", ctxEnv(choice)),
+});
+
+test("没选过窗口时，按连接真正给的默认窗口记账，不是目录里最宽的那个", () => {
+  assert.equal(ctxFn("_contextMeterLimit", 0)("glm-5.2"), 96_890, "仪表按最宽窗口算，指针永远抬不起来");
+  assert.equal(ctxFn("_effectiveContextLimit", 0)("glm-5.2"), 96_890, "裁剪预算按一个拿不到的窗口留历史");
+});
+
+test("用户显式选过的窗口原样生效，仍按最宽窗口夹住", () => {
+  assert.equal(ctxFn("_contextMeterLimit", 262_144)("glm-5.2"), 262_144, "用户点的档位没生效");
+  assert.equal(ctxFn("_effectiveContextLimit", 262_144)("glm-5.2"), 262_144);
+  // 夹取上限仍是最宽的原生窗口——收窄是成本旋钮，放宽不能超过模型给得出的。
+  assert.equal(ctxFn("_contextMeterLimit", 9_000_000)("glm-5.2"), 1_000_000, "夹取上限丢了");
+});
+
+test("卡片高亮的那一档和仪表用的窗口是同一个数", () => {
+  // 卡片用 _effectiveContextLimit 去 opts 里找高亮位（_modelContextRows），仪表用
+  // _contextMeterLimit。会员档位不介入时两者必须逐值相等，否则"显示的"和"用的"就是两个数。
+  for (const choice of [0, 262_144, 1_000_000]) {
+    assert.equal(
+      ctxFn("_contextMeterLimit", choice)("glm-5.2"),
+      ctxFn("_effectiveContextLimit", choice)("glm-5.2"),
+      `choice=${choice} 时卡片和仪表读出两个不同的窗口`,
+    );
+  }
 });
 
 test("成长页下半部分和上半部分是同一套卡片语言", () => {

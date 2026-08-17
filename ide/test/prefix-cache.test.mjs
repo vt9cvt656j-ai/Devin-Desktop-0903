@@ -607,7 +607,7 @@ const readingForStorage = load("_ctxReadingForStorage", ["_ctxReadingForStorage"
 const readingFromStorage = load("_ctxReadingFromStorage", ["_ctxReadingFromStorage"]);
 const meterLimit = (native, choice) => new Function(
   "_modelContextLimit", "_ctxChoiceFor", "_nativeWindowsFor",
-  `${grab("_contextMeterLimit")}\nreturn _contextMeterLimit("m");`,
+  `${grab("_ctxNativeCeiling")}\n${grab("_ctxNativeDefault")}\n${grab("_contextMeterLimit")}\nreturn _contextMeterLimit("m");`,
 )(() => native, () => choice, () => [native]);
 
 test("context counts the cached prompt, which is where the whole conversation lives", () => {
@@ -913,7 +913,7 @@ test("the paid tier stacks on the model's own window, in the client as in the ga
   // top tier a subscriber pays for could never light up. The two lines disagreed by construction.
   const eff = (native, tierMax, choice) => new Function(
     "_modelContextLimit", "_nativeWindowsFor", "_michaelUser", "_gatewayHandlesCompression", "_ctxChoiceFor",
-    `${grab("_effectiveContextLimit")}\nreturn _effectiveContextLimit("m");`,
+    `${grab("_ctxNativeCeiling")}\n${grab("_ctxNativeDefault")}\n${grab("_effectiveContextLimit")}\nreturn _effectiveContextLimit("m");`,
   )(() => native, () => [native], { michael_compression: { max_input_tokens: tierMax } }, () => tierMax > 0, () => choice);
 
   assert.equal(eff(1_000_000, 5_000_000, 0), 6_000_000, "1M native + a 5M tier is 6M, not 5M");
