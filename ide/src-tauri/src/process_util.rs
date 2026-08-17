@@ -229,7 +229,10 @@ pub fn augmented_path(workspace: Option<&str>) -> String {
     parts.push(format!("{home}/.bun/bin"));
     parts.push(format!("{home}/.deno/bin"));
     parts.push(format!("{home}/.volta/bin"));
-    parts.push(format!("{home}/.michael-ide/npm-global/bin")); // IDE-managed npm tools
+    // IDE 自己管的那份 npm 全局目录。目录名必须问同一个入口要——写死一份的后果是：
+    // 应用目录改名之后，npm 照旧往新目录装，而 PATH 里加的是老目录（那个目录在搬迁时
+    // 已经不存在了），于是 IDE 装过的命令行工具**一个都找不到**，且没有任何报错。
+    parts.push(format!("{home}/{}/npm-global/bin", crate::mcp::app_dir_name()));
     parts.push(format!("{home}/.npm-global/bin")); // common custom `npm config set prefix`
     parts.push("/usr/bin".into());
     parts.push("/bin".into());
@@ -294,7 +297,9 @@ pub fn augmented_path(workspace: Option<&str>) -> String {
     let home = std::env::var("USERPROFILE").unwrap_or_default();
     let mut base = Vec::new();
     if !home.is_empty() {
-        base.push(format!("{home}\\.michael-ide\\npm-global"));
+        // 目录名跟着应用走，不在这里写死：写死过一次，应用目录改名之后前后端就指着两个
+        // 不同的地方——npm 装出来的东西落在谁也不去看的目录里。
+        base.push(format!("{home}\\{}\\npm-global", crate::mcp::app_dir_name()));
     }
     match workspace.filter(|w| !w.is_empty()) {
         Some(ws) => {
