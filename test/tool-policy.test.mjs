@@ -51,6 +51,8 @@ test("workspace-mutating set matches the pre-refactor literal exactly", () => {
     "game_scaffold", "web_scaffold", "download", "download_asset", "genimage", "generate_3d",
     "generate_sound", "generate_music", "generate_voice", "auto_rig", "generate_motion",
     "generate_texture",
+    // 新增：真的会在磁盘上建目录（~/MrDayOne/<name>）并切换工作区。
+    "createproject",
     // 新增：git worktree。它在 <root>/.michael/worktrees/ 下面建目录、建分支，remove
     // 还会连未提交的改动一起删。原来完全没登记，拿的是默认策略。
     "worktree",
@@ -70,6 +72,12 @@ test("approval set matches the pre-refactor literal exactly", () => {
     "userhttp",
     // 新增：用户接进来的本地知识库检索。读的是用户机器上的目录，所以要审批。
     "userfolder",
+    // 新增：会在用户主目录下真的建出 ~/MrDayOne/<name>，并把左侧文件树整个切过去——
+    // 用户原来打开的项目就这么被顶掉。此前一条声明都没有。
+    "createproject",
+    // 新增：mode='system' / system_proxy=true 会改掉**操作系统级**代理，整台机器的
+    // 流量都走本地 mitmproxy，接着还要用户 sudo 装根证书。
+    "capture_start",
   ])));
 });
 
@@ -87,6 +95,8 @@ test("read-only-mode block matches the pre-refactor chain, plus the closed termt
   assert.deepEqual(sorted(readOnlyBlockedTypes()), sorted(new Set([
     "write", "edit", "multiedit", "cmd", "delete", "move", "mkdir", "copy", "format",
     "uiclick", "mcp", "termtask",
+    // 新增：只读模式里也能建目录并把用户当前工作区顶掉——模式标签写着「只读」。
+    "createproject",
     // 新增：用户 HTTP 能力。和 mcp 一样是**逐次**判定（下面那条测试钉住细则），
     // 所以它出现在这个集合里只表示「默认挡住」，不表示一刀切。
     "userhttp",

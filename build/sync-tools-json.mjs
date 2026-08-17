@@ -275,6 +275,23 @@ for (const [name, regTool] of registryByName) {
   if (diffs.length) drifted.push({ name, diffs });
 }
 
+// 描述漂移单独统计、只报不改。
+//
+// 这个脚本刻意不重写目录里的描述文字（网关那份可能是有意改过的），但"不重写"一路
+// 滑成了"不比对"：main.js 的描述改完、测试全绿、提交发版，模型看到的还是旧文字。
+// run_subagent 的并发上限就这样错了至少两个提交周期——注册表写着"4 个并发"，网关
+// 那份仍写着"最多 2 个并发、其余排队"，等于一直在劝模型少扇出一半。
+// 运行时以网关那份为准（release 构建还会把客户端描述整个剥掉），所以这条差异不是
+// 文案问题，是**模型实际读到的指令**和源码不一致。
+const describedDrift = [];
+for (const [name, regTool] of registryByName) {
+  const cur = currentByName.get(name);
+  if (!cur) continue;
+  const a = String(regTool.function?.description || "");
+  const b = String(cur.function?.description || "");
+  if (a !== b) describedDrift.push({ name, registryLen: a.length, catalogLen: b.length });
+}
+
 const merged = current
   .filter((tool) => registryByName.has(tool?.function?.name))
   .concat(missing.map((name) => registryByName.get(name)));
@@ -293,8 +310,22 @@ console.log(
   }`,
 );
 
+console.log(
+  `description drift:     ${describedDrift.length}${
+    describedDrift.length
+      ? "\n  - " + describedDrift
+        .map(({ name, registryLen, catalogLen }) => `${name} (main.js ${registryLen} 字 / 目录 ${catalogLen} 字)`)
+        .join("\n  - ")
+      : ""
+  }`,
+);
+
 if (check) {
   let bad = false;
+  if (describedDrift.length) {
+    console.error("tools.json 的工具描述和 main.js 注册表不一致——运行时以目录那份为准，请手工对齐后提交。");
+    bad = true;
+  }
   if (missing.length) {
     console.error("tools.json is missing client-registry tools; run without --check to sync.");
     bad = true;

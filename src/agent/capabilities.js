@@ -283,7 +283,12 @@ export function buildHttpCall(tool, args = {}, env = {}) {
     const v = args?.[k];
     return v === undefined || v === null ? "" : String(v);
   };
-  const expandEnv = (s) => String(s).replace(PLACEHOLDER_RE, (_m, k) => (env?.[k] ?? ""));
+  const missingEnv = new Set();
+  const expandEnv = (s) => String(s).replace(PLACEHOLDER_RE, (_m, k) => {
+    if (env && Object.prototype.hasOwnProperty.call(env, k) && env[k] != null && env[k] !== "") return String(env[k]);
+    missingEnv.add(k);
+    return "";
+  });
   const url = expandEnv(tool.http.url).replace(PARAM_RE, (_m, k) => encodeURIComponent(val(k)));
   const headers = {};
   for (const [k, v] of Object.entries(tool.http.headers || {})) {
@@ -295,6 +300,11 @@ export function buildHttpCall(tool, args = {}, env = {}) {
   if (tool.http.body) {
     body = expandEnv(tool.http.body).replace(PARAM_RE, (_m, k) =>
       val(k).replace(/\\/g, "\\\\").replace(/"/g, '\\"').replace(/\n/g, "\\n"));
+  }
+  if (missingEnv.size) {
+    throw new Error(`未定义的环境变量 ${[...missingEnv].map((k) => "${" + k + "}").join("、")}`
+      + "（写在这个能力声明的 url/headers/body 里）。从 Finder/Dock 启动时读不到登录 shell 的变量，"
+      + "把它写进 IDE 设置里的环境变量，或从终端启动 IDE。");
   }
   if (!/^https?:\/\//i.test(url)) throw new Error("插值之后 URL 不再是 http/https，已拒绝");
   return { method: tool.http.method, url, headers, body: body || null };

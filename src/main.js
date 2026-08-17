@@ -19313,9 +19313,26 @@ function _setAiPerm(p) { _currentAiPerm = (p === "approve" ? "approve" : "auto")
 // status/diff/log, lsp, think, screenshot, web search never ask.
 const _APPROVE_TYPES = approvalTypes(); // 见 agent/tool-policy.js —— 单一声明处，不再逐点重抄
 const _GIT_MUTATING_OPS = new Set(["clone", "commit", "push", "pull", "stash", "stash_pop"]);
+// computer 工具的合法动作。**唯一一份**：schema 的 enum、映射层的白名单、以及报错时
+// 那句「可用的是：…」以前是三处手抄，漏了 mouse.position——模型照 schema 调，撞一句
+// 「不支持的动作」，还附一份同样漏掉它的清单，于是认定读不到指针位置。
+const _COMPUTER_METHODS = [
+  "mouse.click", "mouse.double_click", "mouse.move", "mouse.position", "mouse.drag", "mouse.scroll",
+  "keyboard.type", "keyboard.press", "keyboard.combo", "keyboard.paste",
+  "screen.info", "clipboard.get", "clipboard.set",
+  "window.list", "window.activate", "window.minimize",
+];
 function _requiresApproval(call) {
   if (!call) return false;
   if (call.type === "git") return _GIT_MUTATING_OPS.has(call.op) || (call.op === "branch" && !!call.branch);
+  // gh / http 也是"往外面发东西"，而判据 _toolMayProduceExternalEffect 早就写对了
+  // （gh 认 pr_create/pr_reply，http 认非 GET/HEAD/OPTIONS）——只是审批门从来没问过它。
+  // 于是用户打开「改动前审批」之后：git_commit 会弹框，而 gh_pr_create 直接在他的仓库
+  // 上开了 PR、gh_pr_reply 用他的账号在别人 PR 下发了评论、http_request 拿同一个 URL
+  // 发 DELETE 也直接就发了。更别扭的是他自己接进来的 userhttp 反倒每次都问。
+  if (call.type === "gh" || call.type === "http") return _toolMayProduceExternalEffect(call);
+  // tor 无条件问：它整条链路绕开用户平时的网络出口。
+  if (call.type === "tor") return true;
   return _APPROVE_TYPES.has(call.type);
 }
 // Session allowlist: scope every decision to the exact chat + workspace. Commands
@@ -19411,6 +19428,21 @@ function _approvalLabel(call) {
     case "uiclick": return { title: "操作前台应用？", detail: `${call.action || "press"} ref=${Number.isInteger(call.ref) ? call.ref : "?"}` };
     case "download": return { title: "下载文件到工作区？", detail: (call.url || "") + "  →  " + (call.dest || "") };
     case "db": return { title: `执行数据库操作（${call.driver || "db"}）？`, detail: (call.query || "").slice(0, 300) };
+    case "gh": return {
+      title: call.op === "pr_create" ? "在 GitHub 上创建 Pull Request？" : "用你的账号在 GitHub 上发表评论？",
+      detail: `${call.owner || ""}/${call.repo || ""}${call.number ? ` #${call.number}` : ""}\n${String(call.title || call.body || "").slice(0, 240)}`,
+    };
+    case "http": return { title: `发送 ${String(call.method || "GET").toUpperCase()} 请求？`, detail: String(call.url || "").slice(0, 300) };
+    case "tor": return { title: "经 Tor 网络发送请求？", detail: String(call.url || "").slice(0, 300) };
+    // 关键信息是「改不改系统代理」，不是工具名：改了的话整台机器的流量都会走本地
+    // mitmproxy，接着还要用户 sudo 装一张根证书。这必须写进 detail。
+    case "capture_start": return {
+      title: call.systemProxy ? "修改系统代理并开始抓包？" : "开始抓包？",
+      detail: call.systemProxy
+        ? "整台机器的网络流量（浏览器 / 邮件 / 其他 App）都会经过本地代理，且需要安装根证书。"
+        : `端口 ${call.port || "?"}`,
+    };
+    case "createproject": return { title: "新建项目目录并切换工作区？", detail: `~/MrDayOne/${call.name || call.path || ""}` };
     // 这个框是用户**做决定**的地方，也是目前唯一告诉他"这次要干嘛"的地方——
     // 只给 服务/工具 两个名字，等于让人闭着眼睛点同意。带上服务自己写的能力说明
     // （已过 _mcpDescriptionBody 消毒；它是第三方文本，所以明说来源）。
@@ -31665,7 +31697,52 @@ function _buildAgentToolSchemas(includeWrite, mcpTools = []) {
   let _galleryMode = false;
   try { _galleryMode = !inTauri && new URLSearchParams(location.search).get("play") === "tools"; } catch {}
   if (!inTauri && !_galleryMode) {
-    const desktopOnly = new Set(["run_in_terminal", "read_terminal", "list_terminals", "stop_terminal", "browser", "screenshot", "http_request", "download_file", "decode_qr", "remote", "system", "capture_start", "capture_flows", "capture_stop", "capture_replay", "automation", "computer", "read_screen", "ui_click", "background_monitor", "local_discovery", "live_environment", "game_scaffold", "web_scaffold", "generate_3d", "generate_sound", "generate_music", "generate_voice", "auto_rig", "generate_motion", "generate_texture", "search_game_assets", "download_asset"]);
+    const desktopOnly = new Set(["run_in_terminal", "read_terminal", "list_terminals", "stop_terminal", "browser", "screenshot", "http_request", "download_file", "decode_qr", "remote", "system", "capture_start", "capture_flows", "capture_stop", "capture_replay", "automation", "computer", "read_screen", "ui_click", "background_monitor", "local_discovery", "live_environment", "game_scaffold", "web_scaffold", "generate_3d", "generate_sound", "generate_music", "generate_voice", "auto_rig", "generate_motion", "generate_texture", "search_game_assets", "download_asset",
+  // 这 40 个的执行器里都以 `if (!inTauri) return "[不可用] 只能在桌面 App 里用"` 开头，
+  // 却一直照样把 schema 发给模型：网页版里模型手上摆着 arxiv_search、db_query、
+  // gh_pr_view，选中一个就是一轮白烧，search_tools 也照样能把它们装进工具窗口、
+  // 占掉配额。和上面那段注释写下的意图正好相反——"don't even offer them there"。
+  // 这份名单和执行器的 !inTauri 分支是两处手抄，下面那条测试逐个对账，防止再漏。,
+  "gh_pr_create",
+  "gh_pr_view",
+  "gh_pr_checks",
+  "gh_actions_log",
+  "gh_pr_review_comments",
+  "gh_pr_reply",
+  "db_query",
+  "ui_extract",
+  "view_image",
+  "visual_compare",
+  "probe_env",
+  "worktree",
+  "tor_request",
+  "generate_image",
+  "visual_explain",
+  "performance_profile",
+  "package_search",
+  "github_search",
+  "github_repo",
+  "gitlab_repo",
+  "gitee_repo",
+  "codeberg_repo",
+  "cve_search",
+  "wiki_search",
+  "stackoverflow_search",
+  "hackernews_search",
+  "developer_community_search",
+  "pubmed_search",
+  "arxiv_search",
+  "crossref_search",
+  "openalex_search",
+  "pubchem_search",
+  "clinical_trials_search",
+  "mdn_search",
+  "bundlephobia_search",
+  "steam_search",
+  "iconify_search",
+  "codrops_search",
+  "smashingmag_search",
+  "awwwards_search"]);
     return _applyCloudToolDescs(_withoutDisabledTools(tools.filter((t) => !desktopOnly.has(t.function.name))));
   }
   return _applyCloudToolDescs(_withoutDisabledTools(tools));
@@ -31815,7 +31892,8 @@ function _selectInitialTools(includeWrite, taskText, mcpTools = [], mode = inclu
   //   · 双预算（条数 + 字节）—— MCP 的 JSON schema 可以很大，只数条数拦不住；
   //   · 装不进的照样在上下文的 MCP 名录里（_mcpAvailabilitySystemContext），
   //     带名字带说明，search_tools 一步就能取回，不是失联。
-  for (const tools of _mcpServersForInitialWindow(mcpTools).values()) {
+  const allowedMcp = all.filter((t) => mcpNames.has(String(t?.function?.name || "")));
+  for (const tools of _mcpServersForInitialWindow(allowedMcp).values()) {
     for (const tool of tools) out.push(tool);
   }
 
@@ -33136,7 +33214,7 @@ function _mapToolCall(name, args, mcpToolMap = _mcpToolMap) {
         uploadPaths: Array.isArray(args.paths) ? args.paths : (args.path ? [args.path] : (args.file ? [args.file] : (args.files ? (Array.isArray(args.files) ? args.files : [args.files]) : []))),
       };
     }
-    case "computer": { const _m = String(args.method || args.action || "").trim(); if (!_m) return { type: "automation", method: "screen.info", params: {} }; const _validMethods = ["mouse.click","mouse.double_click","mouse.move","mouse.drag","mouse.scroll","keyboard.type","keyboard.press","keyboard.combo","keyboard.paste","screen.info","clipboard.get","clipboard.set","window.list","window.activate","window.minimize"]; const _method = _validMethods.includes(_m) ? _m : null; if (!_method) return { type: "automation", method: "", invalidMethod: _m }; const _p = (args.params && typeof args.params === "object" && !Array.isArray(args.params)) ? args.params : {}; return { type: "automation", method: _method, params: _p }; }
+    case "computer": { const _m = String(args.method || args.action || "").trim(); if (!_m) return { type: "automation", method: "screen.info", params: {} }; const _validMethods = _COMPUTER_METHODS; const _method = _validMethods.includes(_m) ? _m : null; if (!_method) return { type: "automation", method: "", invalidMethod: _m }; const _p = (args.params && typeof args.params === "object" && !Array.isArray(args.params)) ? args.params : {}; return { type: "automation", method: _method, params: _p }; }
     case "preview_choices": return { type: "preview", title: args.title || "选择方案", target: args.target || "", variants: Array.isArray(args.variants) ? args.variants : [] };
     case "visual_explain": return { type: "explain", title: args.title || "概念解释", prompt: args.prompt || "", summary: args.summary || "" };
     case "system": {
@@ -37458,10 +37536,10 @@ function _isExternalDataToolResult(type) {
 function _toolResultToStringRaw(call, result) {
   if (!result) return call.type === "write" || call.type === "edit" ? `（${call.path}：未应用）` : "(无结果)";
   const c = result.content != null ? String(result.content) : "";
-  const executionEvidence = _executionToolResultForModel(call, result, c);
-  if (executionEvidence) return executionEvidence;
   const kind = result.type || call.type;
   const tag = _isExternalDataToolResult(kind) ? _EXTERNAL_DATA_TAG : "";
+  const executionEvidence = _executionToolResultForModel(call, result, c);
+  if (executionEvidence) return tag ? `${tag}\n${executionEvidence}` : executionEvidence;
   // 错误结果原样交给模型（不套壳、不改写），但**标记不能跟着丢**。
   //
   // 这里原来是 `return c;` —— 于是只要正文里出现 `[error]`（这个正则不分大小写、也不锚定
@@ -37503,7 +37581,7 @@ function _toolMsgForModel(call, result) {
     // Retrieval tools size their own output to what the model asked for; chopping to 8K silently drops
     // the tail (matches / symbols / diagnostics) so the model re-runs the query or edits on an
     // incomplete set — the same starvation trap as reads, on the highest-volume tools.
-    : _rt === "search" || _rt === "find" || _rt === "lsp" || _rt === "semsearch" || _rt === "findsymbol" || _rt === "knowledge" || _rt === "localdiscovery" || _rt === "liveenvironment" || _rt === "diag" ? 30000
+    : _rt === "search" || _rt === "find" || _rt === "lsp" || _rt === "semsearch" || _rt === "findsymbol" || _rt === "knowledge" || _rt === "localdiscovery" || _rt === "liveenvironment" || _rt === "diag" || _rt === "logs" ? 30000
     // web_fetch / git_diff 和 read_file 是同性质的：它们的**全部目的就是投递内容**。
     // 落在下面 8000 那一档会被拦腰切开——而 web_fetch 的后端刚在末尾附了一句
     // "这里只给了前 24000 字符"，那句话经此一刀就变成假的：模型手上只有约 8000 字，
@@ -42069,6 +42147,7 @@ async function _runSubAgent({ config, description, prompt, root, container, run,
   // 派发照样一句 [BLOCKED]，等于给了它一把打不开门的钥匙。真正的边界是下面那道
   // _mcpWriteBlocked：只有服务自己声明了只读的工具才放行。
   if (!_execTypes.includes("mcp")) _execTypes.push("mcp");
+  for (const t of ["userfolder", "userhttp"]) if (!_execTypes.includes(t)) _execTypes.push(t);
   // #53：与 _allow 同步——深度 <2 放行派发三类型；深度 ≥2 不进列表，执行层门禁二次兜底
   if (_canNest) for (const t of ["subagent", "worker", "awaitsubagent"]) if (!_execTypes.includes(t)) _execTypes.push(t);
   // Worker run context: inherit session + checkpoint (so edits are in the parent's
@@ -42194,9 +42273,10 @@ async function _runSubAgent({ config, description, prompt, root, container, run,
         // MCP 和 git 一样是"单 type 多行为"：类型放行之后必须逐次把关。判据是服务自己
         // 声明的 readOnlyHint；没声明的按可能有副作用处理，退回父智能体去做。
         const _mcpWriteBlocked = !!call && call.type === "mcp" && !call.mcpReadOnly;
+        const _userWriteBlocked = !!call && call.type === "userhttp" && !call.userReadOnly;
         // gh 同理：pr_create / pr_reply 是不可逆的对外动作，子任务一律拒绝。
         const _ghWriteBlocked = !!call && call.type === "gh" && !_GH_READ_OPS.includes(call.op);
-        if (!call || !_execTypes.includes(call.type) || _gitOpBlocked || _mcpWriteBlocked || _ghWriteBlocked) {
+        if (!call || !_execTypes.includes(call.type) || _gitOpBlocked || _mcpWriteBlocked || _userWriteBlocked || _ghWriteBlocked) {
           const rejectedCall = call || { type: "unknown", path: "" };
           rejectedCall._toolName = rejectedCall._toolName || tc.name || "unknown";
           const rejectedContent = call
@@ -49506,13 +49586,13 @@ function _dbResultToText(o) {
     const sep = cols.map(() => "---").join(" | ");
     const shown = rows.slice(0, 100);
     const body = shown.map((r) => (r || []).map((c) => (c === null || c === undefined) ? "NULL" : String(c)).join(" | ")).join("\n");
-    let s = o.truncated
-      ? `${o.driver} 查询已显示前 ${rows.length} 行，后面还有更多，耗时 ${o.elapsed_ms}ms：\n\n${head}\n${sep}\n${body}`
-      : `${o.driver} 查询返回 ${rows.length} 行，耗时 ${o.elapsed_ms}ms：\n\n${head}\n${sep}\n${body}`;
-    if (shown.length < rows.length) s += `\n…（本卡片还有 ${rows.length - shown.length} 行未在文本里列出）`;
-    return s.slice(0, 6000);
+    const more = shown.length < rows.length ? `（本卡片另有 ${rows.length - shown.length} 行未在文本里列出）` : "";
+    const s = o.truncated
+      ? `${o.driver} 查询已显示前 ${rows.length} 行，后面还有更多${more}，耗时 ${o.elapsed_ms}ms：\n\n${head}\n${sep}\n${body}`
+      : `${o.driver} 查询返回 ${rows.length} 行${more}，耗时 ${o.elapsed_ms}ms：\n\n${head}\n${sep}\n${body}`;
+    return _clip(s, 6000, "查询结果");
   }
-  if (o.result !== undefined) return `${o.driver || "数据库"} 结果：\n${JSON.stringify(o.result, null, 2)}`.slice(0, 6000);
+  if (o.result !== undefined) return _clip(`${o.driver || "数据库"} 结果：\n${JSON.stringify(o.result, null, 2)}`, 6000, "查询结果");
   return `${o.driver} 执行成功：${o.rows_affected ?? 0} 行受影响（${o.elapsed_ms ?? "?"}ms）。`;
 }
 
@@ -49782,6 +49862,8 @@ async function _executeToolStepInner(step, call, root, run) {
     const modeName = _mode === "explorer" ? "Explorer" : _mode === "plan" ? "Plan" : "Reviewer";
     const what = call.type === "cmd" || call.type === "termtask" ? "运行命令"
       : call.type === "mcp" ? "执行 MCP 工具"
+      : call.type === "userhttp" || call.type === "userfolder" ? "调用你接入的能力"
+      : call.type === "createproject" ? "新建项目目录"
       : call.type === "worktree" ? "建/删工作树" : "修改文件";
     res.className = "atc-result atc-result--blocked";
     res.textContent = `⛔ ${modeName} 模式下禁止${what}`;
@@ -49798,7 +49880,7 @@ async function _executeToolStepInner(step, call, root, run) {
     const _roExit = _roMode === "explorer"
       ? "\n出路：Explorer 只调查不动手。把该改的地方写成带 path:line 的最小修复建议交回去，由用户切到 Agent 模式执行。"
       : "";  // plan / reviewer 每轮都从 _modeRuntimeGuidanceBlock 收到同样口径的指引，不重复说
-    return { type: call.type, path: call.path, content: `[BLOCKED] ${modeName} 是只读模式，不能${what}。\n只读模式下**读取与取证类工具全部可用**：read_file / list_dir / search / find_files / find_symbol / lsp_definition / lsp_references / get_diagnostics / read_terminal / read_logs / git 的 status·diff·log·blame·show / 声明为只读的 MCP。git 只有 commit·push·pull·stash·clone·新建分支被挡。\n这是**模式限制不是能力缺失**——不要换 run_cmd 或别的工具去做同一件事。${_roExit}` };
+    return { type: call.type, path: call.path, content: `[BLOCKED] ${modeName} 是只读模式，不能${what}。\n只读模式下**读取与取证类工具全部可用**：read_file / list_dir / search / find_files / find_symbol / lsp_definition / lsp_references / get_diagnostics / read_terminal / read_logs / git 的 status·diff·log·blame·show / 声明为只读的 MCP / 声明为只读（GET·HEAD 或 readOnly）的用户能力与知识库检索。git 只有 commit·push·pull·stash·clone·新建分支被挡。\n这是**模式限制不是能力缺失**——不要换 run_cmd 或别的工具去做同一件事。${_roExit}` };
   }
 
   // Worker scope guard: a parallel worker sub-agent may read anywhere and may run
@@ -52013,7 +52095,7 @@ async function _executeToolStepInner(step, call, root, run) {
       res.className = "atc-result"; res.innerHTML = `<span class="atc-spin"></span> 提取 UI 规格中…`;
       if (_uxSource === "app") {
         let _uxEls = [];
-        try { _uxEls = await backend.invoke("read_ui_elements") || []; } catch (e) {
+        try { _uxEls = (await backend.invoke("read_screen", { ocr: false }))?.elements || []; } catch (e) {
           res.className = "atc-result atc-result--err"; res.textContent = "读不到";
           return { type: "uiextract", path: "app", content: `[ERROR] 读不到前台应用的辅助功能树：${String(e?.message || e).slice(0, 200)}。多半是没给「辅助功能」权限——系统设置 → 隐私与安全性 → 辅助功能里勾上 Mr. Day One，然后重试。` };
         }
@@ -53275,9 +53357,7 @@ return { type: call.type, path: call.query || "", content: `[失败] ${call.type
         res.className = "atc-result atc-result--err"; res.textContent = "不支持的动作";
         return { type: "automation", path: "", content:
           `[ERROR] 不支持的 method「${String(call.invalidMethod).slice(0, 60)}」——**这次什么都没做**（以前会静默降级成截图并报成功）。`
-          + `\n可用的是：mouse.click / mouse.double_click / mouse.move / mouse.drag / mouse.scroll / `
-          + `keyboard.type / keyboard.press / keyboard.combo / keyboard.paste / screen.info / `
-          + `clipboard.get / clipboard.set / window.list / window.activate / window.minimize。`
+          + `\n可用的是：${_COMPUTER_METHODS.join(" / ")}。`
           + `\n组合键用 keyboard.combo，右键用 uiclick 或 browser 的 rightclick。` };
       }
       if (!_m) return { type: "automation", path: "", content: "[ERROR] automation 需要 method（如 browser.goto / mouse.click / recorder.replay）。" };
@@ -54593,7 +54673,7 @@ return { type: call.type, path: call.query || "", content: `[失败] ${call.type
                   else if (op === "scroll") { state = await backend.invoke("browser_scroll", { amount: Number.isFinite(+s.amount) ? Math.round(+s.amount) : 600 }); blog.push(`${i + 1}. scroll ✓`); }
                   else if (op === "wait") { let ws = sel || null; if (ws && /:(?:has-text|text|contains)\(|text\s*=/i.test(ws)) ws = await _resolveBrowserSelector(ws); state = await backend.invoke("browser_wait", { selector: ws, ms: Number.isFinite(+s.ms) ? Math.round(+s.ms) : (ws ? null : 300) }); blog.push(`${i + 1}. wait ${ws ? "元素" : (s.ms || 300) + "ms"} ✓`); }
                   else if (op === "navigate" || op === "goto" || op === "open") { state = await backend.invoke("browser_navigate", { url: s.url || s.text || "" }); blog.push(`${i + 1}. navigate ${s.url || s.text || ""} ✓`); }
-                  else { blog.push(`${i + 1}. 跳过未知 op「${op}」`); }
+                  else { blog.push(`${i + 1}. ✗ 本路径不支持 op「${op}」（后续步骤已停）——把整批改成不含 navigate 的步骤走 fast batch，或把 navigate 单独发一次`); _batchBroken = true; break; }
                   break; // success — no retry needed
                 } catch (e) {
                   if (_retry === 0) { await new Promise(r => setTimeout(r, 400)); continue; }
@@ -54648,6 +54728,9 @@ return { type: call.type, path: call.query || "", content: `[失败] ${call.type
         }
       }
       if (act === "batch") {
+        if (call._batchBroken) {
+          content = `[失败] 批量自动化中断，后续步骤未执行。\n` + content;
+        }
         if (call._batchDropped > 0) {
           content += `\n\n[未全部执行] 你给了 ${call._batchDropped + 25} 个步骤，单次上限是 25——**后面 ${call._batchDropped} 步一个都没跑**。`
             + `剩下的步骤请再发一次 batch；不要以为整个序列已经走完。`;
@@ -54733,7 +54816,7 @@ return { type: call.type, path: call.query || "", content: `[失败] ${call.type
           });
         }
       } catch {}
-      return { type: "browser", path: act, image: state.screenshot, browserResult: state.result, browserUrl: state.url || "", runOwnedDevUrl, content };
+      return { type: "browser", path: act, image: state.screenshot, browserResult: state.result, browserUrl: state.url || "", runOwnedDevUrl, content, ok: !call._batchBroken };
     } else if (call.type === "system") {
       if (!inTauri) { res.className = "atc-result atc-result--err"; res.textContent = "桌面专用"; return { type: "system", path: call.op, content: "[不可用] system（系统控制）只能在 Mr. Day One 桌面 App 里用。" }; }
       const sop = call.op || "frontmost";

@@ -122,6 +122,6 @@ test("执行侧确实复用了内置的 http 通道，没有另抄一份", () =>
   const src = extractFn("_executeToolStepInner");
   assert.match(src, /call\.type === "http" \|\| call\.type === "userhttp"/,
     "用户能力没有并进内置 http 分支");
-  const seg = src.slice(src.indexOf('call.type === "userhttp"'));
+  const seg = src.slice(src.indexOf('call.type === "http" || call.type === "userhttp"'));
   assert.match(seg.slice(0, 1500), /buildHttpCall/, "没有用声明去合成请求");
 });
