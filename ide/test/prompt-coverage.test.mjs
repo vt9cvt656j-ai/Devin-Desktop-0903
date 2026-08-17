@@ -1,0 +1,119 @@
+// 「写了但运行时到不了模型」的两类死重量，各配一道守卫。
+//
+// 这个仓库自己的测试注释里已经写下过判据（server/src/prompts.rs，design_tokens 那条）：
+//     「这份文件写好之后有很长时间既不在 PROMPT_NAMES 也不在 prompt_graph 里，等于不存在
+//      ——模型只能凭印象编间距和阴影。」
+// PROMPT_NAMES 只喂一个管理员诊断接口和测试，它**不注入任何东西**；真正决定一个提示词模块
+// 能不能到模型手里的，只有 prompt_graph 或代码里显式的 read_prompt。
+//
+// 2026-08-17 全量对账的结果：37 个提示词文件里有 10 个运行时到不了模型，22 个语义旗标里有
+// 7 个服务端没有任何消费者。两类都不会让任何测试变红，也不会有任何日志——改了不生效，而且
+// 看起来跟生效一模一样。这个文件把它们变成**显式清单**：想让一个文件/旗标躺着不用，就得在
+// 下面写下理由；新加的没接上，当场红。
+import { readFileSync, readdirSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+import { dirname, join } from "node:path";
+import { test } from "node:test";
+import assert from "node:assert/strict";
+
+const HERE = dirname(fileURLToPath(import.meta.url));
+const CLIENT = readFileSync(join(HERE, "..", "src", "main.js"), "utf8");
+const RUST = readFileSync(join(HERE, "..", "..", "server", "src", "prompts.rs"), "utf8");
+const GRAPH = JSON.parse(readFileSync(join(HERE, "..", "..", "server", "prompts", "prompt_graph.json"), "utf8"));
+const PROMPT_DIR = join(HERE, "..", "..", "server", "prompts");
+
+// 图里被引用的模块名（modes / agent / design 各层都算）。
+function graphModules(node, out = new Set()) {
+  if (Array.isArray(node)) {
+    for (const item of node) (typeof item === "string" ? out.add(item) : graphModules(item, out));
+  } else if (node && typeof node === "object") {
+    for (const value of Object.values(node)) graphModules(value, out);
+  }
+  return out;
+}
+
+// 提示词文件：躺着不用的，必须在这里写下理由。
+//
+// 判据不是「有没有价值」，是「运行时有没有路径到模型」。这几个的活版本都在客户端 main.js 里
+// ——服务端这份是死副本，改了不生效。这是「两份目录」那个老坑的提示词版：真正的风险不是内容
+// 不好，是有人改了服务端那份，以为上线了。
+const RETIRED = {
+  agent: "legacy 整份 agent 提示词，已拆成 agent_core + reasoning + 各条件模块；prompts.rs 有 legacy 断言钉着不注入",
+  agent_lite: "legacy 精简版，同上，已被 agent_core 取代",
+  design_system: "冻结的回滚样本，prompts.rs 明确断言它永不注入（保留作语义真源）",
+  ui_design_flow: "michael-design 2.5 那次接通留下的中文稿，已被 design_core / design_tokens / design_components 等英文模块取代；塞回去会和新模块打架",
+  ui_design_guide: "同 ui_design_flow，2.5 时期的中文稿，已被拆分后的 design_* 模块覆盖",
+  next_action: "输入框「回复建议」的提示词，活版本是客户端的 _ASK_PREDICT_SYSTEM",
+  compact: "对话压缩的提示词，活版本在客户端的压缩路径里",
+  research_prompt: "research_project 子智能体的任务模板（带 {{FOCUS_EMPH}} 占位），活版本由客户端组装",
+  design_research_prompt: "design_research 子智能体的任务模板（带 {{GOAL}} 占位），活版本由客户端组装",
+  edit_rewrite: "编辑改写提示词，与客户端内联版本逐字重复",
+  edit_transform: "编辑转换提示词，与客户端内联版本逐字重复",
+  subagent_system: "子智能体人格，活版本是客户端的 _SUBAGENT_SYSTEM；网关对 subagent 模式刻意不注入任何系统提示词",
+  worker_system: "worker 人格，活版本是客户端的 _WORKER_SYSTEM，同上",
+};
+
+// 语义旗标：客户端算了、也发进请求头了，但服务端没有任何消费者。
+//
+// 这几个不是「忘了接」，是**还没有内容可挂**：agent_research 由 research 一个旗标就开了，
+// 官方/社区之分、staged/parallel 之分、brownfield 之分都还没有各自的模块。要让它们真的起作用
+// 得先写出对应的提示词内容——那是产品内容决策，不该由一道断言替人拍板。
+// 写在这里的意义是：它们的存在是**已知且有意的**，不是无人察觉的死重量。
+const RESERVED_FLAGS = {
+  official: "researchMode=official 的细分，agent_research 目前不按官方/社区分层",
+  community: "researchMode=community 的细分，同上",
+  network_capture: "抓包意图，captureMode 已在工具层生效，但没有对应的提示词模块",
+  collaboration_staged: "staged_roles 的细分，agent_collaboration 目前不区分编排形状",
+  collaboration_parallel: "parallel_roles 的细分，同上",
+  existing_project: "brownfield 信号，架构纪律目前写在 agent_engineering 里，没有单独模块",
+  existing_website: "已有网站信号，同上；design 各层由 designMode 区分而不是这个旗标",
+};
+
+test("每个提示词文件都必须运行时到得了模型，否则要写明为什么躺着", () => {
+  const files = readdirSync(PROMPT_DIR).filter((f) => f.endsWith(".txt")).map((f) => f.slice(0, -4));
+  assert.ok(files.length > 20, `只扫到 ${files.length} 个提示词文件——路径或后缀变了，这条断言等于没跑`);
+
+  const routed = graphModules(GRAPH);
+  const codeRead = new Set([...RUST.matchAll(/read_prompt\(\s*"([a-z0-9_]+)"/g)].map((m) => m[1]));
+
+  const orphans = files.filter((f) => !routed.has(f) && !codeRead.has(f) && !(f in RETIRED));
+  assert.deepEqual(orphans, [],
+    `这些提示词文件运行时到不了模型（既不在 prompt_graph、也没有 read_prompt），而且没写明理由：`
+    + `${orphans.join(", ")}。要么挂进图里，要么在 RETIRED 里写下为什么。`
+    + `注意 PROMPT_NAMES 不算——它只喂诊断接口，不注入任何东西。`);
+
+  // 反向：RETIRED 里的条目必须真的还在、且真的没被路由。删了文件却留着条目会让清单变成谎言；
+  // 后来把它接进图里却忘了删条目，会让下一个人以为它仍然是死的。
+  for (const [name, why] of Object.entries(RETIRED)) {
+    assert.ok(files.includes(name), `RETIRED 里的 ${name} 已经没有对应文件了，删掉这条`);
+    assert.ok(why && why.length >= 10, `RETIRED.${name} 得写清理由`);
+    assert.ok(!routed.has(name),
+      `${name} 已经挂进 prompt_graph 了，但仍留在 RETIRED 里——清单和现实对不上`);
+  }
+});
+
+test("客户端算出来的每个语义旗标，服务端都得有消费者，否则要写明是预留", () => {
+  const fn = /function _ideSemanticProfile\(profile\)\s*\{([\s\S]*?)\n\}/.exec(CLIENT);
+  assert.ok(fn, "找不到 _ideSemanticProfile——旗标清单的来源变了");
+  const flags = [...fn[1].matchAll(/add\("([a-z0-9_]+)"/g)].map((m) => m[1]);
+  assert.ok(flags.length > 15, `只解析出 ${flags.length} 个旗标——正则失效了`);
+
+  const consumed = new Set([...RUST.matchAll(/semantic\("([a-z0-9_]+)"\)/g)].map((m) => m[1]));
+  const graphKeys = new Set([
+    ...Object.keys(GRAPH.agent || {}),
+    ...Object.keys(GRAPH.design || {}),
+  ]);
+
+  const dead = flags.filter((f) => !consumed.has(f) && !graphKeys.has(f) && !(f in RESERVED_FLAGS));
+  assert.deepEqual(dead, [],
+    `这些旗标客户端每轮都在算、也发进了请求头，但服务端一个消费者都没有：${dead.join(", ")}。`
+    + `要么在 prompts.rs 里消费它，要么在 RESERVED_FLAGS 里写明是预留——`
+    + `旗标进请求头就会参与网关的缓存前缀，白算的旗标是要付钱的。`);
+
+  for (const [flag, why] of Object.entries(RESERVED_FLAGS)) {
+    assert.ok(flags.includes(flag), `RESERVED_FLAGS 里的 ${flag} 客户端已经不算了，删掉这条`);
+    assert.ok(why && why.length >= 10, `RESERVED_FLAGS.${flag} 得写清为什么预留`);
+    assert.ok(!consumed.has(flag),
+      `${flag} 服务端已经在消费了，但仍留在 RESERVED_FLAGS 里——清单和现实对不上`);
+  }
+});
