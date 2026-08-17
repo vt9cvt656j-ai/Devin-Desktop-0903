@@ -1083,15 +1083,6 @@ body.is-win .tbtn { font-weight: var(--wt-medium); }
   letter-spacing: .03em;
   opacity: .7;
 }
-.chat-tab__model {
-  font-size: 9px;
-  color: var(--text-dim);
-  opacity: .6;
-  max-width: 80px;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-
 /* Constrain to the panel width: without min-width:0 a flex item keeps its content's
    min-content width and overflows .chat (whose overflow-x:hidden then CLIPS the right
    side — the "看不到右边" bug). width:100%+min-width:0 forces it to the panel width so

@@ -15766,12 +15766,14 @@ function _renderChatTabs() {
     // Always render the folder chip (clickable) so every tab can set / switch its OWN
     // working directory — each tab's agent runs in its folder (see _runAgenticLoop root).
     const projTag = `<span class="chat-tab__project" title="点此设置该标签页的工作目录"><svg viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M1.75 2.75a.75.75 0 00-.75.75v9a.75.75 0 00.75.75h12.5a.75.75 0 00.75-.75v-7a.75.75 0 00-.75-.75H7.7L6.35 3.02a.75.75 0 00-.53-.27H1.75z"/></svg><span class="chat-tab__projname"></span></span>`;
-    const modelTag = s.model ? `<span class="chat-tab__model">${modelLabel(s.model)}</span>` : "";
+    // 模型名不进标签页：它是全局设置，每个标签页都一样，挤在标题里只是把真正要看的
+    // 会话名和工作目录往外顶。想知道用的是哪个模型，底部选择器上一直写着。
     const modeTag = s.mode && s.mode !== "agent" ? `<span class="chat-tab__mode" style="color:${modeColor}">${modeObj?.label || s.mode}</span>` : "";
-    tab.innerHTML = `<span class="chat-tab__dot" style="background:${modeColor}"></span><span class="chat-tab__label"></span>${projTag}${modeTag}${modelTag}<span class="chat-tab__x" aria-label="关闭" title="关闭">&times;</span>`;
+    tab.innerHTML = `<span class="chat-tab__dot" style="background:${modeColor}"></span><span class="chat-tab__label"></span>${projTag}${modeTag}<span class="chat-tab__x" aria-label="关闭" title="关闭">&times;</span>`;
     tab.querySelector(".chat-tab__label").textContent = s.name;
     tab.querySelector(".chat-tab__projname").textContent = projName || "选目录";
-    tab.title = (s.project ? `📁 ${s.project}\n` : "未设目录（点文件夹图标选）\n") + s.name;
+    tab.title = (s.project ? `📁 ${s.project}\n` : "未设目录（点文件夹图标选）\n") + s.name
+      + (s.model ? `\n模型：${modelLabel(s.model)}` : "");
     tab.addEventListener("click", (e) => {
       if (e.target.closest(".chat-tab__x")) {
         e.preventDefault();
@@ -20093,17 +20095,34 @@ function _modeRuntimeGuidanceBlock(mode, text, profile = _engineeringProfileWith
   return "";
 }
 
+// 这个标签在 HTML 里写死了 data-i18n="assistant.mode.agent"——一个**固定**的 key，
+// 而它显示的是**当前选中的模式**。全局 locale 观察者每做一次整页重刷（启动时语言包
+// 落地、切语言、或一帧内变更子树超过 32 个——流式输出很容易到），就按那个 key 把它
+// 改回「Agent」，而 session.mode 还是 plan/chat。用户看到的就是"切了模式没效果"。
+// 旁边的模型选择器 14220 早就踩过同一个坑并把 data-i18n 摘了，模式这边没跟上。
+// 这里不是一摘了事：五个模式里 agent/chat/plan 有各自的 key，用当前模式的 key 才能
+// 既跟着语言走、又不被改错；explorer/reviewer 没有 key，摘掉属性直接写字面量。
+function _modeLabelI18nKey(id) {
+  const key = `assistant.mode.${id}`;
+  return t(key) === key ? "" : key; // t() 找不到时原样返回 key
+}
+function _paintModeLabel(el, mode) {
+  if (!el) return;
+  const key = _modeLabelI18nKey(mode.id);
+  if (key) el.setAttribute("data-i18n", key); else el.removeAttribute("data-i18n");
+  el.textContent = key ? t(key) : mode.label;
+}
 function _updateModeUI() {
   _currentAiMode = _normalizeAiMode(_currentAiMode);
   const mode = _AI_MODES.find(m => m.id === _currentAiMode) || _AI_MODES[0];
-  $("modeLabel").textContent = mode.label;
+  _paintModeLabel($("modeLabel"), mode);
   $("modeIcon").innerHTML = mode.icon;
   // 镜像到消息编辑条的克隆 mode-picker（id 已剥离，按 class 找）：切模式后
   // 编辑条里的 Agent 标签/图标也立刻跟着刷新，与底部选择框保持一致。
+  // 克隆体照抄了 data-i18n 属性（cloneNode 只剥 id），所以它也得走同一条路。
   try {
     document.querySelectorAll(".msg__edit-bar .mode-picker").forEach((p) => {
-      const lab = p.querySelector(".mode-picker__btn span");
-      if (lab) lab.textContent = mode.label;
+      _paintModeLabel(p.querySelector(".mode-picker__btn span"), mode);
       const ic = p.querySelector(".mode-picker__icon");
       if (ic) ic.innerHTML = mode.icon;
     });
@@ -20130,6 +20149,10 @@ function _closeModeMenu() {
   }
 }
 function _fillModeMenu(menu) {
+  // 松散翻译器会按"页面上已有的相同文案"去改这里的名字：Explorer 撞上左侧文件面板的
+  // 「文件」，Reviewer 撞上「审阅者」——菜单里于是出现两个和模式本身无关的词，而
+  // _AI_MODES 里的名字和说明都是手写文案，不该被回译。整块跳过自动翻译。
+  menu.setAttribute("data-i18n-skip", "");
   menu.innerHTML = "";
   for (const mode of _AI_MODES) {
     const item = document.createElement("button");
