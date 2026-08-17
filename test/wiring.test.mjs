@@ -1422,3 +1422,31 @@ test("拖滑块时不许每一帧都落盘", () => {
     assert.match(seg, /&& commit\)/, `${who}滑块拖动途中仍在落盘`);
   }
 });
+
+test("前端调的每个后端命令，Rust 侧都注册了", () => {
+  // wiring.test 上面那几条守的是 schema → _mapToolCall → 处理器这条链。它管不到最后一跳：
+  // 处理器里 `invoke("some_command")` 的那个命令名，Rust 的 generate_handler! 里到底有没有。
+  // 少一个的表现是**只在运行时报错**——某个工具一调就失败，而全套测试照样全绿。
+  //
+  // 剥掉超长字符串字面量再扫：项目脚手架模板里带着示例 Rust + React 代码，里面有
+  // `invoke("write_note")` 这种示例调用，它不是真调用（`write_note` 确实不该注册）。
+  // 按"超长字面量"剥而不是写死排除名单，将来新增的模板也自动排除。
+  const stripReal = (s) => s
+    .replace(/'(?:[^'\\\n]|\\.){300,}'/g, "''")
+    .replace(/"(?:[^"\\\n]|\\.){300,}"/g, '""');
+  const invoked = [...new Set(
+    [...stripReal(SRC).matchAll(/invoke\(\s*["']([a-z0-9_]+)["']/g)].map((m) => m[1]),
+  )];
+  assert.ok(invoked.length > 150, `只扫出 ${invoked.length} 个 invoke——正则失效了，这条断言等于没跑`);
+
+  const LIB = readFileSync(join(HERE, "..", "src-tauri", "src", "lib.rs"), "utf8");
+  const handler = /generate_handler!\s*\[([\s\S]*?)\]/.exec(LIB);
+  assert.ok(handler, "找不到 generate_handler!——它被改名或挪走了，这条断言失去落点");
+  const registered = new Set(
+    [...handler[1].matchAll(/(?:[a-z0-9_]+::)*([a-z0-9_]+)/g)].map((m) => m[1]),
+  );
+
+  const missing = invoked.filter((c) => !registered.has(c));
+  assert.deepEqual(missing, [],
+    `前端会调、但 Rust 没注册的命令（调到就报错，且只有运行时才看得出来）：${missing.join(", ")}`);
+});
