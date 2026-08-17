@@ -78,7 +78,16 @@ test("approval set matches the pre-refactor literal exactly", () => {
     // 新增：mode='system' / system_proxy=true 会改掉**操作系统级**代理，整台机器的
     // 流量都走本地 mitmproxy，接着还要用户 sudo 装根证书。
     "capture_start",
+    // 新增：这一族全都真的往工作区写文件（web_scaffold / game_scaffold 更是直接铺
+    // 一整棵项目树），此前一个都不问——等于「改动前审批」这个开关对十种写盘方式
+    // 整体失效，而用户看不出来。
+    "genimage", "generate_3d", "generate_sound", "generate_music", "generate_voice",
+    "generate_motion", "generate_texture", "auto_rig",
+    "game_scaffold", "web_scaffold", "download_asset",
   ])));
+  // worktree 是**有意**不问的：它只在 <root>/.michael/worktrees/ 下动，是 IDE 自己的
+  // 目录，best-of-N 每建一个候选弹一次窗就没法用了。这条豁免要留着，也要看得见。
+  assert.equal(approvalTypes().has("worktree"), false, "worktree 的豁免是有意的，见 tool-policy 里的说明");
 });
 
 test("hooked set matches the pre-refactor literal exactly, including format's absence", () => {
@@ -269,4 +278,16 @@ test("worktree 没带 action 时按 list 处理（工具定义里 list 就是默
 test("worktree 算改动工作区——它在 <root>/.michael/worktrees 下面造东西", () => {
   assert.equal(mutatesWorkspace("worktree"), true);
   assert.ok(workspaceMutatingTypes().has("worktree"));
+});
+
+test("会改工作区的工具，开了审批就必须问——豁免只能是有名有姓的那一个", () => {
+  // 这条比上面那张字面量清单更耐用：新加一个写盘工具时，清单可以忘了改，这条不会。
+  // 它抓到过一整族——出图/出模型/出音/出声/建脚手架/下载素材十个工具都写工作区，
+  // 却一个都不问，等于「改动前审批」这个开关对十种写盘方式整体失效，而用户看不出来。
+  const ask = approvalTypes();
+  const gaps = [...workspaceMutatingTypes()].filter((t) => !ask.has(t)).sort();
+  assert.deepEqual(gaps, ["worktree"],
+    "这些工具会往工作区写东西，但开了「改动前审批」也不问：" + gaps.join(", ")
+    + "\n（worktree 是唯一有意的豁免：只动 IDE 自己的 .michael/worktrees/，"
+    + "best-of-N 每建一个候选弹一次窗就没法用了。）");
 });
