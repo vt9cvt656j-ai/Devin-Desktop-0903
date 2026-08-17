@@ -147,6 +147,13 @@ const _isSecondaryWindow = typeof location !== "undefined" && /[?&]w=sub\b/.test
 if (inTauri) document.body.classList.add("is-tauri");
 if (/Mac/i.test(navigator.platform || navigator.userAgent)) {
   document.body.classList.add("is-mac");
+} else if (/Win/i.test(navigator.platform || navigator.userAgent)) {
+  // 以前只有 is-mac，没有 is-win——于是没有任何钩子能给 Windows 单独调样式。
+  // 两处必须靠它：① 自绘的窗口按钮只在 Windows 显示（那边关掉了原生标题栏）；
+  // ② -webkit-font-smoothing 在 Windows 的 Blink 里是**空操作**（Chromium 只在 macOS
+  //    实现它），而这套界面的字重字号是照着 mac 削细之后的观感调的，同一份样式到
+  //    Windows 上整体偏粗偏糊——只有拿到这个钩子才补得回来。
+  document.body.classList.add("is-win");
 }
 // `content-visibility: auto` is what keeps a long conversation from getting heavy — it skips
 // layout and paint for everything off-screen. It is also, in WebKit, what leaves BLANK REGIONS
@@ -3700,15 +3707,23 @@ const DEFAULT_EDITOR_SETTINGS = {
   autoSave: true,
 };
 
+/*
+ * 每一项都过一遍 monoStack()，把中文兜底接在后面 —— 以前这八个选项全都以 `monospace`
+ * 收尾且不含汉字，所以无论用户选哪一个，代码里的中文都是宋体。
+ *
+ * 每条栈里**必须留一个本平台一定存在的等宽字体**，而且要排在中文兜底前面。原因是 CSS
+ * 的字体回退是**逐字符**的：SF Mono / Menlo / Monaco / Fira Code / JetBrains Mono 在
+ * Windows 上一个都不存在，拉丁字符往下找就撞到 `Microsoft YaHei UI`——雅黑有完整的拉丁
+ * 字形，而且是**比例宽度**。于是代码不对齐、缩进参考线错位、终端画的框线全散。
+ * 加一个 Consolas（Windows 一定有）挡在中文之前就够了；macOS 上它不存在，不影响。
+ */
 const FONT_FAMILY_OPTIONS = Object.freeze([
-  // 每一项都过一遍 monoStack()，把中文兜底接在后面 —— 以前这八个选项全都以 `monospace`
-  // 收尾且不含汉字，所以无论用户选哪一个，代码里的中文都是宋体。
-  [monoStack("SF Mono, ui-monospace, Menlo"), "SF Mono"],
-  [monoStack("JetBrains Mono, SF Mono, ui-monospace, Menlo"), "JetBrains Mono"],
-  [monoStack("Cascadia Code, SF Mono, ui-monospace, Menlo"), "Cascadia Code"],
-  [monoStack("Fira Code, SF Mono, ui-monospace, Menlo"), "Fira Code"],
-  [monoStack("Menlo, SF Mono, ui-monospace"), "Menlo"],
-  [monoStack("Monaco, SF Mono, ui-monospace"), "Monaco"],
+  [monoStack("SF Mono, ui-monospace, Menlo, Consolas"), "SF Mono"],
+  [monoStack("JetBrains Mono, SF Mono, ui-monospace, Menlo, Consolas"), "JetBrains Mono"],
+  [monoStack("Cascadia Code, Cascadia Mono, SF Mono, ui-monospace, Menlo, Consolas"), "Cascadia Code"],
+  [monoStack("Fira Code, SF Mono, ui-monospace, Menlo, Consolas"), "Fira Code"],
+  [monoStack("Menlo, SF Mono, ui-monospace, Consolas"), "Menlo"],
+  [monoStack("Monaco, SF Mono, ui-monospace, Consolas"), "Monaco"],
   [monoStack("Consolas, SF Mono, ui-monospace"), "Consolas"],
   [monoStack("ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas"), "System Monospace"],
 ]);
@@ -67237,6 +67252,29 @@ document.addEventListener("visibilitychange", () => {
 if (inTauri) {
   import("@tauri-apps/api/window").then(({ getCurrentWindow }) => {
     const currentWindow = getCurrentWindow();
+    /*
+     * Windows 上关掉了原生标题栏（否则它会压在应用自己那条上面，两条叠着），所以最小化 /
+     * 最大化 / 关闭这三个键得自己接。macOS 上这三个按钮不显示（CSS 按 body.is-win 控制），
+     * 红绿灯照旧由系统画。
+     *
+     * 关闭走 `currentWindow.close()` 而不是 destroy()：close 会触发下面那个
+     * onCloseRequested，未保存的会话、草稿、文件缓冲才有机会落盘。直接 destroy 等于
+     * 点一下叉就丢数据。
+     */
+    const bindWinCtl = (id, run) => {
+      const el = document.getElementById(id);
+      if (el) el.addEventListener("click", () => { void run(); });
+    };
+    bindWinCtl("winMinimize", () => currentWindow.minimize());
+    bindWinCtl("winMaximize", () => currentWindow.toggleMaximize());
+    bindWinCtl("winClose", () => currentWindow.close());
+    // 最大化状态要反映到图标上，否则用户分不清当前是不是最大化。
+    const syncMaxState = async () => {
+      try { document.body.classList.toggle("is-maximized", await currentWindow.isMaximized()); } catch {}
+    };
+    void syncMaxState();
+    try { void currentWindow.onResized(() => { void syncMaxState(); }); } catch {}
+
     currentWindow.onCloseRequested(async (event) => {
       event.preventDefault();
       const _exitDraft = _streamDraftFlushSync();

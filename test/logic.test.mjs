@@ -6655,6 +6655,59 @@ test("装完没装完问后端，不在前端拼一句只有 macOS 认的 shell"
     "通知适配器没把 langId 收进来");
 });
 
+test("Windows 上不再是两条标题栏叠着，而且自己画了窗口按钮", () => {
+  /*
+   * titleBarStyle / hiddenTitle 是 Tauri 的 **macOS 专属**键，Windows 上被整个编译掉。
+   * decorations 又没写（默认 true），于是 Windows 上是一条完整的原生标题栏压在应用自己
+   * 那条 44px 的上面：两条叠着约 76px，同一个标题显示两遍，而且原生那条按**操作系统**
+   * 主题上色——系统深色 + 应用浅色 = 一条纯黑的条焊在纯白界面上。
+   * 这是「Windows 界面很丑」最直接的结构性原因。
+   */
+  const winConf = JSON.parse(readFileSync(join(HERE, "..", "src-tauri", "tauri.windows.conf.json"), "utf8"));
+  assert.equal(winConf.app.windows[0].decorations, false,
+    "Windows 上没关掉原生标题栏——它会和应用自己那条叠在一起");
+
+  // 关了就必须自己画三个键，否则窗口没法最小化/关闭。
+  const shell = readFileSync(join(HERE, "..", "src", "app", "Shell.jsx"), "utf8");
+  for (const id of ["winMinimize", "winMaximize", "winClose"]) {
+    assert.ok(shell.includes(`id="${id}"`), `缺少窗口按钮 ${id}`);
+  }
+  assert.match(SRC, /bindWinCtl\("winMinimize", \(\) => currentWindow\.minimize\(\)\)/, "最小化没接");
+  assert.match(SRC, /bindWinCtl\("winMaximize", \(\) => currentWindow\.toggleMaximize\(\)\)/, "最大化没接");
+  // 关闭要走 close 而不是 destroy：close 才会触发 onCloseRequested，未保存的会话/草稿
+  // 才有机会落盘。直接 destroy 等于点一下叉就丢数据。
+  assert.match(SRC, /bindWinCtl\("winClose", \(\) => currentWindow\.close\(\)\)/,
+    "关闭键直接 destroy 会丢未保存的数据");
+
+  // 这三个键只在 Windows 显示，macOS 的红绿灯由系统画。
+  const css = readFileSync(join(HERE, "..", "src", "styles", "app.css"), "utf8");
+  assert.match(css, /\.titlebar__winctl \{[^}]*display: none/, "窗口按钮默认就该是隐藏的");
+  assert.match(css, /body\.is-win \.titlebar__winctl \{ display: flex; \}/, "没有按平台显示");
+  assert.match(SRC, /document\.body\.classList\.add\("is-win"\)/,
+    "没有 is-win 这个钩子，Windows 就没法单独调任何样式");
+});
+
+test("每个等宽字体选项在 Windows 上都还是等宽的", () => {
+  /*
+   * CSS 的字体回退是**逐字符**的。SF Mono / Menlo / Monaco / Fira Code / JetBrains Mono
+   * 在 Windows 上一个都不存在，拉丁字符往下找就撞到中文兜底里的 Microsoft YaHei UI——
+   * 雅黑有完整的拉丁字形，而且是**比例宽度**。于是选中这几项之后代码不对齐、缩进参考线
+   * 错位、终端画的框线全散。每条栈里必须留一个本平台一定有的等宽字体挡在中文之前。
+   */
+  const at = SRC.indexOf("const FONT_FAMILY_OPTIONS = Object.freeze([");
+  const block = SRC.slice(at, SRC.indexOf("]);", at));
+  assert.ok(block.length > 200, "找不到字体选项表");
+  const opts = [...block.matchAll(/monoStack\("([^"]+)"\), "([^"]+)"/g)];
+  assert.ok(opts.length >= 8, `选项数不对：${opts.length}`);
+  for (const [, latin, label] of opts) {
+    const fonts = latin.split(",").map((f) => f.trim());
+    assert.ok(
+      fonts.some((f) => ["Consolas", "ui-monospace", "Cascadia Mono"].includes(f)),
+      `「${label}」在 Windows 上会掉到比例宽度的中文字体：${latin}`,
+    );
+  }
+});
+
 test("界面上的快捷键按平台显示：Windows 用词、Ctrl 在最前，且没有 mac 字形", () => {
   const mk = (isMac) => new Function(
     "isMacPlatform",

@@ -122,7 +122,25 @@ export function Shell() {
                 </div>
               </div>
             </div>
-          </div>
+                      {/*
+              Windows 的窗口按钮。Windows 版关掉了原生标题栏（tauri.windows.conf.json 的
+              decorations:false）——不关的话原生那条会压在这条 44px 的标题栏上面，两条叠着、
+              同一个标题显示两遍，那是「Windows 上界面很丑」最直接的原因。关了就得自己画这
+              三个键，否则窗口没法最小化/关闭。
+              只在 Windows 上显示（body.is-win 控制），macOS 的红绿灯照旧由系统画。
+            */}
+            <div className="titlebar__winctl" aria-label="窗口控制">
+              <button className="winctl" id="winMinimize" type="button" title="最小化" aria-label="最小化">
+                <svg viewBox="0 0 12 12" aria-hidden="true"><rect x="2" y="5.5" width="8" height="1" /></svg>
+              </button>
+              <button className="winctl" id="winMaximize" type="button" title="最大化" aria-label="最大化">
+                <svg viewBox="0 0 12 12" aria-hidden="true"><rect x="2.5" y="2.5" width="7" height="7" fill="none" strokeWidth="1" stroke="currentColor" /></svg>
+              </button>
+              <button className="winctl winctl--close" id="winClose" type="button" title="关闭" aria-label="关闭">
+                <svg viewBox="0 0 12 12" aria-hidden="true"><path d="M3 3l6 6M9 3l-6 6" strokeWidth="1.2" stroke="currentColor" fill="none" /></svg>
+              </button>
+            </div>
+</div>
         </div>
 
         <main className="layout">
