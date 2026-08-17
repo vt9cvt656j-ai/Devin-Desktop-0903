@@ -5510,7 +5510,7 @@ function _mpQueryViewHtml(info, state, path) {
           ${_MPM_DRIVER_IDS.map((d) => `<option value="${d}"${driver === d ? " selected" : ""}>${_MPM_DRIVER_NAMES[d]}</option>`).join("")}
         </select>
         <input data-db-url value="${_escAttr(url)}" placeholder="数据库连接串，例如 sqlite:///path/to.db 或 mysql://user:pass@host:3306/db" aria-label="数据库连接串" spellcheck="false" />
-        <button type="button" class="mp-run" data-mp-action="run-query" title="运行 SQL（⌘↵）">${_dbUiIconSvg("run")}<span>运行</span></button>
+        <button type="button" class="mp-run" data-mp-action="run-query" title="运行 SQL（${shortcutLabel("mod+enter")}）">${_dbUiIconSvg("run")}<span>运行</span></button>
       </div>
       <textarea class="mp-query__editor" data-db-query spellcheck="false" aria-label="SQL 命令" placeholder="输入 SQL：SELECT / INSERT / UPDATE / DELETE / PRAGMA …">${_escHtml(queryText)}</textarea>
       <div class="mp-query__result" data-db-result aria-live="polite">
@@ -7593,10 +7593,10 @@ function _mpmConsoleHtml(tab) {
           ${_MPM_DRIVER_IDS.map((d) => `<option value="${d}"${tab.driver === d ? " selected" : ""}>${_MPM_DRIVER_NAMES[d]}</option>`).join("")}
         </select>
         <input data-mpm-url value="${_escAttr(tab.url)}" placeholder="本地 SQLite 填文件路径；远程 mysql://user:pass@host:3306/db" spellcheck="false" aria-label="连接串" />
-        <button type="button" class="mp-run" data-mpm-run title="运行（⌘↵）">${_dbUiIconSvg("run")}<span>运行</span></button>
+        <button type="button" class="mp-run" data-mpm-run title="运行（${shortcutLabel("mod+enter")}）">${_dbUiIconSvg("run")}<span>运行</span></button>
       </div>
       <div class="mpm-sqlhost" data-mpm-sql-mount></div>
-      <div class="mp-query__result" data-mpm-result>${tab.resultHtml || `<div class="mp-empty">⌘↵ 运行；结果直接显示在这里。</div>`}</div>
+      <div class="mp-query__result" data-mpm-result>${tab.resultHtml || `<div class="mp-empty">${shortcutLabel("mod+enter")} 运行；结果直接显示在这里。</div>`}</div>
     </div>`;
 }
 
@@ -18346,7 +18346,7 @@ function _beginEditResend(wrap, forSession) {
   _wireInlineEditMenuTrigger(editModelBtn, () => openModelMenuFor(editModelPicker));
   const sendBtn = bar.querySelector(".send") || document.createElement("button");
   sendBtn.type = "button";
-  sendBtn.title = "重新发送 (⌘↩)";
+  sendBtn.title = `重新发送 (${shortcutLabel("mod+enter")})`;
   if (!sendBtn.parentElement) bar.append(sendBtn);
   // 复用底部 composer 的盒子样式（同一个 class）：与底部输入框完全一致的白底圆角卡片
   const box = document.createElement("div");
@@ -58180,7 +58180,7 @@ async function renderAppearanceTool(body) {
     {
       key: "uiZoom",
       label: "界面缩放",
-      hint: "整体放大/缩小代码和所有界面内容，也可用 ⌘+ / ⌘- / ⌘0 调节",
+      hint: `整体放大/缩小代码和所有界面内容，也可用 ${shortcutLabel("mod+=")} / ${shortcutLabel("mod+-")} / ${shortcutLabel("mod+0")} 调节`,
       type: "select",
       options: () => [["0.5", "50%"], ["0.6", "60%"], ["0.7", "70%"], ["0.8", "80%"], ["0.9", "90%"], ["1", "100%"], ["1.1", "110%"], ["1.2", "120%"], ["1.3", "130%"], ["1.5", "150%"], ["1.75", "175%"], ["2", "200%"]],
     },
@@ -58352,10 +58352,23 @@ function formatCombo(combo) {
     " ": "Space",
     space: "Space",
   };
-  return combo.split("+").map((part) => {
+  /*
+   * 修饰键的**顺序**也是平台习惯的一部分。
+   *
+   * 绑定表里写的是 "shift+mod+e"（Mac 顺序：⇧⌘E）。照着原样渲染，Windows 用户看到的是
+   * "Shift+Ctrl+E"——而 Windows 的写法一律是 Ctrl 在最前：Ctrl+Shift+E。顺序反了不影响
+   * 按键生效，但用户照着念、照着找、跟别的软件对不上，读起来就是"这软件不是给我做的"。
+   */
+  const WIN_MODIFIER_ORDER = ["Ctrl", "Win", "Alt", "Shift"];
+  const rendered = combo.split("+").map((part) => {
     if (map[part]) return map[part];
     return part.length === 1 ? part.toUpperCase() : part.charAt(0).toUpperCase() + part.slice(1);
   });
+  if (isMac) return rendered;
+  const mods = rendered.filter((k) => WIN_MODIFIER_ORDER.includes(k));
+  const rest = rendered.filter((k) => !WIN_MODIFIER_ORDER.includes(k));
+  mods.sort((a, b) => WIN_MODIFIER_ORDER.indexOf(a) - WIN_MODIFIER_ORDER.indexOf(b));
+  return [...mods, ...rest];
 }
 
 /*
@@ -58383,18 +58396,43 @@ function renderKbdCombo(container, combo) {
   }
 }
 
-function setShortcutTitle(id, label, combo) {
+/*
+ * 给一个按钮写「名字 (组合键)」的 title。
+ *
+ * `labelKey` 传的是 i18n 的 key，不是写死的中文——这两个按钮的 `data-i18n-title` 标记已经
+ * 摘掉了（那个标记会让 i18n 的属性观察器在下一帧把 title 改回词条原文，组合键当场丢失），
+ * 所以本地化得在这里自己做。摘标记 + 在这儿取词条 = 只有一个写者，不会来回打架。
+ */
+function setShortcutTitle(id, labelKey, combo, fallback) {
   const el = $(id);
-  if (el) el.title = `${label} (${shortcutLabel(combo)})`;
+  if (!el) return;
+  let label = fallback || labelKey;
+  try { const v = t(labelKey); if (v && v !== labelKey) label = v; } catch {}
+  el.title = `${label} (${shortcutLabel(combo)})`;
+  if (el.hasAttribute("aria-label")) el.setAttribute("aria-label", el.title);
 }
 
+/*
+ * 界面上所有快捷键的显示，唯一的出处。
+ *
+ * 规矩：**任何地方都不许把组合键写进静态文案或 i18n 词条**。写进去就有两个后果——
+ * 一是 ⌘⌥⌃⇧↩⌫ 这些字形在 Windows 的 Segoe UI 里缺字，会掉到回落字体变成异体字符
+ * （读屏还会念出来）；二是它和这里互相打架：i18n 的属性观察器盯着 title，会把这里刚
+ * 写好的「切换终端 (Ctrl+`)」换回词条里那份带 ⌃ 的。所以词条只给名字，组合键在这儿拼。
+ *
+ * 语言切换之后要重跑一次（见 onLocaleChange 那处）——否则新语言的词条一铺上去，
+ * 这里的平台化结果就没了。
+ */
 function applyPlatformShortcutLabels() {
-  setShortcutTitle("runBtn", "运行当前文件", "mod+r");
-  setShortcutTitle("tabExplorer", "文件", "shift+mod+e");
-  setShortcutTitle("tabGit", "Git", "ctrl+shift+g");
-  setShortcutTitle("paletteBtn", "命令面板", "shift+mod+p");
-  setShortcutTitle("termNewBtn", "新建终端", "ctrl+shift+`");
-  setShortcutTitle("terminalClose", "关闭终端", "ctrl+`");
+  setShortcutTitle("runBtn", "toolbar.run", "mod+r", "运行当前文件");
+  setShortcutTitle("tabExplorer", "explorer.title", "shift+mod+e", "文件");
+  setShortcutTitle("tabGit", "git.title", "ctrl+shift+g", "Git");
+  setShortcutTitle("paletteBtn", "menu.commandPalette", "shift+mod+p", "命令面板");
+  setShortcutTitle("termNewBtn", "terminal.new", "ctrl+shift+`", "新建终端");
+  setShortcutTitle("terminalClose", "terminal.close", "ctrl+`", "关闭面板");
+  // 标题栏那个终端开关以前从没被平台化过：它的 title 只有 Shell.jsx 的静态串和 i18n 词条
+  // 两个来源，两份都写死 ⌃`。
+  setShortcutTitle("terminalBtn", "terminal.toggle", "ctrl+`", "切换终端");
 
   const composerHint = document.querySelector(".composer__hint");
   if (composerHint) composerHint.textContent = shortcutLabel("mod+enter");
@@ -58404,6 +58442,11 @@ function applyPlatformShortcutLabels() {
   const tips = document.querySelectorAll("#welcome .kbd-tip");
   renderKbdCombo(tips[0], "mod+o");
   renderKbdCombo(tips[1], "shift+mod+p");
+  // 第三条以前是写死的 <kbd>↩</kbd>，没人管它。
+  for (const tip of tips) {
+    const combo = tip?.getAttribute?.("data-kbd-combo");
+    if (combo) renderKbdCombo(tip, combo);
+  }
 }
 
 async function rebindAction(action, newCombo) {
@@ -60127,10 +60170,10 @@ function ensureDebugToolbar() {
     btn("pause", "", "暂停", _DBG_ICONS.pause) +
     btn("stepOver", "", "单步跳过 (F10)", _DBG_ICONS.stepOver) +
     btn("stepIn", "", "单步进入 (F11)", _DBG_ICONS.stepIn) +
-    btn("stepOut", "", "单步跳出 (⇧F11)", _DBG_ICONS.stepOut) +
+    btn("stepOut", "", `单步跳出 (${shortcutLabel("shift+f11")})`, _DBG_ICONS.stepOut) +
     `<span class="dbg-float__sep"></span>` +
     btn("restart", "", "重启", _DBG_ICONS.restart) +
-    btn("stop", "dbg-float__btn--stop", "停止 (⇧F5)", _DBG_ICONS.stop);
+    btn("stop", "dbg-float__btn--stop", `停止 (${shortcutLabel("shift+f5")})`, _DBG_ICONS.stop);
   _dbgFloat.addEventListener("click", (e) => {
     const act = e.target.closest("[data-act]")?.dataset.act; if (!act) return;
     ({ continue: () => dapManager.cont(), pause: () => dapManager.pause(), stepOver: () => dapManager.next(),
@@ -60683,7 +60726,7 @@ function getMenus() {
         { label: t("menu.redo"), icon: "i-redo", hint: shortcutLabel("shift+mod+z"), action: () => editorTrigger("redo") },
         { sep: true },
         { label: t("menu.find"), icon: "i-search", hint: shortcutLabel("mod+f"), action: () => editorAction("actions.find") },
-        { label: t("menu.replace"), icon: "i-replace", hint: shortcutLabel("alt+mod+f"), action: () => editorAction("editor.action.startFindReplaceAction") },
+        { label: t("menu.replace"), icon: "i-replace", hint: shortcutLabel(isMacPlatform() ? "alt+mod+f" : "mod+h"), action: () => editorAction("editor.action.startFindReplaceAction") },
       ],
     },
     {
@@ -61890,7 +61933,7 @@ function _setSendBtnStop(isStop) {
   } else {
     _sendBtnEl.innerHTML = _SEND_ICON;
     _sendBtnEl.classList.remove("is-stop");
-    _sendBtnEl.title = "发送 (↩ ；Shift+↩ 换行)";
+    _sendBtnEl.title = `发送 (${shortcutLabel("enter")} ；${shortcutLabel("shift+enter")} 换行)`;
     _sendBtnEl.type = "submit";
   }
 }
@@ -65219,14 +65262,40 @@ function keyComboAliases(e) {
 
 loadKeybindings().catch(console.error);
 
+/*
+ * 焦点在能打字的地方吗？（输入框 / 文本域 / contenteditable / 编辑器 / 终端）
+ *
+ * **不带修饰键的绑定必须先问这一句。** Windows 上删除文件的默认键位是裸 `delete`
+ * （macOS 是 mod+backspace，天然不冲突），而下面那个派发器以前是无条件先
+ * `preventDefault()` 再执行动作。于是在编辑器里、在聊天输入框里、在终端里按 Delete：
+ * 默认行为被吃掉（字符删不掉），删文件那个动作又被它自己内部的焦点守卫挡住——
+ * 净效果是 **Delete 键在整个应用里失效**。
+ *
+ * 守卫放在派发器这一层而不是各个动作里：它是一条通则——没有修饰键的键位在打字的时候
+ * 本来就该让给输入。以后再加裸键绑定，不必每个都记得自己写一遍。
+ */
+function _focusIsTextEntry() {
+  const ae = document.activeElement;
+  if (!ae) return false;
+  if (ae.tagName === "INPUT" || ae.tagName === "TEXTAREA" || ae.isContentEditable) return true;
+  return !!(ae.closest && (ae.closest(".monaco-editor") || ae.closest(".xterm")));
+}
+
 window.addEventListener("keydown", (e) => {
+  // 输入法正在组字时不抢键。Windows 上中文输入是常态（微软拼音），组字过程中浏览器会发
+  // 一串 keydown（isComposing / keyCode 229），这时候把键抢走就是把用户正在拼的字打断。
+  // 本仓库别处的输入处理已经这么判了（编辑器和输入框那两处），全局派发器漏了。
+  if (e.isComposing || e.keyCode === 229) return;
   const bindings = getKeybindings();
-  const action = keyComboAliases(e).map((combo) => bindings[combo]).find(Boolean);
-  if (action && KB_ACTIONS[action]) {
-    e.preventDefault();
-    e.stopPropagation();
-    KB_ACTIONS[action]();
-  }
+  const combos = keyComboAliases(e);
+  const action = combos.map((combo) => bindings[combo]).find(Boolean);
+  if (!action || !KB_ACTIONS[action]) return;
+  // 裸键（不含 mod/ctrl/alt/shift）在打字时让路：不拦默认行为，也不触发动作。
+  const bare = !e.metaKey && !e.ctrlKey && !e.altKey;
+  if (bare && _focusIsTextEntry()) return;
+  e.preventDefault();
+  e.stopPropagation();
+  KB_ACTIONS[action]();
 });
 
 // ---- integrated terminal (multi-tab) ----
