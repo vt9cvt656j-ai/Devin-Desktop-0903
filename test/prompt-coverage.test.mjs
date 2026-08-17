@@ -117,3 +117,39 @@ test("客户端算出来的每个语义旗标，服务端都得有消费者，�
       `${flag} 服务端已经在消费了，但仍留在 RESERVED_FLAGS 里——清单和现实对不上`);
   }
 });
+
+test("回答质量模块要管「怎么说话」，不只管「说什么」", () => {
+  // 用户："讲话也和人一样，而不是人机发言。"
+  // 补之前 answer_quality.txt 只有 13 行，全是内容质量（先给结论、要证据、别假装完成），
+  // **关于语气一个字都没有**。唯一沾边的是客户端那条禁令（不许寒暄/不许列功能菜单），
+  // 是个否定规则，没有正面标准——于是"像人"这件事没有任何地方负责。
+  const text = readFileSync(join(PROMPT_DIR, "answer_quality.txt"), "utf8");
+
+  assert.match(text, /How to sound like a person, not a chatbot/,
+    "语气规范不见了——没有它，回答就退回模板腔");
+
+  // 具体的反模式必须点名。写"要自然一点"是没法执行的，模型只会继续套模板。
+  for (const [pattern, why] of [
+    [/Open by restating the request/, "复述用户的问题当开场"],
+    [/As an AI/, "「作为AI」这类套话"],
+    [/Anything else you'd like me to do/, "机械追问「还需要我做什么」"],
+    [/reads as translated English/, "中文翻译腔"],
+    [/Summarise what you just said/, "总结自己刚说过的话"],
+  ]) {
+    assert.match(text, pattern, `反模式少了「${why}」——不点名的话模型不知道自己在犯`);
+  }
+  // 正面标准也要有：只列禁令会让回答变得干瘪。
+  assert.match(text, /the way a colleague at the next desk would/,
+    "缺了正面标准——只有禁令，回答会从模板腔变成干瘪");
+  assert.match(text, /Lead with bad news when there is bad news/,
+    "坏消息先说，这是「像人」里最难也最要紧的一条");
+  assert.match(text, /Name things concretely/, "要求具体名词，否则会退回「相关内容」这种泛指");
+
+  // 它必须真的每轮都送到：answer_quality 挂在所有模式的 base 上。
+  assert.ok(GRAPH.agent.base.includes("answer_quality"),
+    "answer_quality 不在 agent.base 上，语气规范就不是每轮都送");
+  for (const mode of ["chat", "plan", "explorer", "reviewer"]) {
+    assert.ok((GRAPH.modes[mode] || []).includes("answer_quality"),
+      `${mode} 模式没挂 answer_quality——那个模式说话会退回模板腔`);
+  }
+});
