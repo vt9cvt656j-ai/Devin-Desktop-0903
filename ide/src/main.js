@@ -19624,6 +19624,15 @@ function _approvalLabel(call) {
         : `端口 ${call.port || "?"}`,
     };
     case "createproject": return { title: "新建项目目录并切换工作区？", detail: `~/MrDayOne/${call.name || call.path || ""}` };
+    case "genimage": return { title: "生成图片并写入工作区？", detail: `${call.prompt || ""}\n→ ${call.name || call.path || "(自动命名)"}` };
+    case "generate_3d": case "generate_texture": case "generate_motion": case "auto_rig":
+      return { title: "生成素材并写入工作区？", detail: `${call.type} · ${(call.prompt || call.name || "").slice(0, 200)}` };
+    case "generate_sound": case "generate_music": case "generate_voice":
+      return { title: "生成音频并写入工作区？", detail: `${call.type} · ${(call.prompt || call.text || "").slice(0, 200)}` };
+    case "download_asset": return { title: "下载素材到工作区？", detail: `${call.url || ""}\n→ ${call.name || ""}` };
+    case "game_scaffold": case "web_scaffold":
+      // 这两个是直接铺一整棵项目树，最该说清会往哪儿写多少东西。
+      return { title: "生成整套项目脚手架？", detail: `${call.type === "game_scaffold" ? "游戏" : "网站"} · ${call.engine || call.framework || ""} · ${call.name || ""}\n会在工作区里创建一整套目录和文件。` };
     // 这个框是用户**做决定**的地方，也是目前唯一告诉他"这次要干嘛"的地方——
     // 只给 服务/工具 两个名字，等于让人闭着眼睛点同意。带上服务自己写的能力说明
     // （已过 _mcpDescriptionBody 消毒；它是第三方文本，所以明说来源）。
@@ -43812,6 +43821,14 @@ function _agentDecisionFrameBlock(text, profile = _engineeringProfileWithAiInten
   const intentContract = typeof _agentIntentExecutionBlock === "function" ? _agentIntentExecutionBlock(p) : "";
   if (intentContract) lines.splice(1, 0, intentContract);
   if (p.projectEngineering || p.engineeringGrade || p.allProjectsEngineering || p.projectScope || p.architecture) {
+    // 交付规格律——补的是一条**整个项目里从来没有过**的规则（全仓搜 MVP/最小可用/糊弄，
+    // 服务端提示词和客户端都是零命中）。用户的原话：「动不动就把别人代码写烂」「随便写 MVP
+    // 结构糊弄用户」。没有这条，模型缩水到能跑就交，而且缩水本身不会被说出来——用户是在
+    // 用的时候才发现少了一半。
+    //
+    // 关键在**降级必须是用户的选择，不是模型的**：真觉得该做小，就用 ask_user 把两条路
+    // （完整实现 / MVP）摆出来让用户点，而不是自己替他决定完再说"先做了个简版"。
+    lines.push("交付规格律：默认按**完整可用**交付，不是能跑就行的演示版。禁止未经用户同意就缩水：不留 TODO/占位实现/假数据/写死分支充数，不省错误处理、边界情况、加载与空状态，不把多处调用改成只改一处。确实认为该缩小范围时——比如工期、依赖缺失、需求本身过大——用 ask_user 把「完整实现」和「先做最小可用版」两条路和各自代价摆出来让用户选，用户选了 MVP 才做 MVP；绝不自己决定完再补一句「先做了个简版」。已有代码同理：沿用现存的分层、命名、错误处理和测试方式，不因为自己顺手就把别人的写法改烂或绕开。")
     lines.push("项目工程律：所有项目任务默认工程级，不管大小都走最短可靠证据链。小改动=真实文件/诊断 → 最小改动 → 真实验证；项目级改动先建立项目地图（package/workspace、入口、脚本、服务、配置、CI、数据库、部署线索）、模块边界和现有约定，再动代码。");
     lines.push("变更半径律：动手前识别调用方、API/数据契约、状态/缓存/权限/跨服务影响；不全仓盲改，不一次性重写无关模块；按薄切片交付，每个切片都有可验证结果。验证矩阵按影响选择 unit/typecheck/lint/build/integration/e2e/contract/migration/smoke，命令输出和 exit code 才算证据。");
     lines.push("可维护升级律：任何项目默认要好维护、好升级：清晰目录/模块边界、配置/env 集中、类型/schema/接口明确、组件/服务可复用、扩展点可替换、测试与 README/用法说明齐全；禁止把业务规则、颜色、端口、密钥、路径和魔法值散落硬编码。");

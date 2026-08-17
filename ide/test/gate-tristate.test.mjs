@@ -133,3 +133,26 @@ test("提醒按重要性淘汰，不是按先来后到", () => {
   const msgs2 = [reg2.get("steer"), reg2.get("researchFirst")];
   assert.deepEqual(evict(reg2, msgs2, "diag", rank), ["steer"], "用户实时插话被挤掉了");
 });
+
+test("默认按完整可用交付，缩水必须是用户通过 ask_user 选的", () => {
+  // 用户的原话：「随便写 MVP 结构糊弄用户」「动不动就把别人代码写烂」。
+  // 补这条之前，全仓搜 MVP / 最小可用 / 糊弄，服务端提示词和客户端**零命中**——也就是说
+  // 从来没有任何一条规则要求它别缩水。没有规则，模型缩到能跑就交，而且缩水本身不会被说出来，
+  // 用户是在用的时候才发现少了一半。
+  const frame = SRC.slice(SRC.indexOf("function _agentDecisionFrameBlock"));
+  const laws = frame.slice(0, 6000);
+
+  assert.match(laws, /交付规格律：默认按\*\*完整可用\*\*交付/,
+    "交付规格律不见了——没有它，模型默认就是能跑就交");
+  // 降级的决定权必须在用户手里，而且必须走 ask_user 这条真实通道，不是嘴上说说。
+  assert.match(laws, /用 ask_user 把「完整实现」和「先做最小可用版」两条路/,
+    "缩水必须通过 ask_user 让用户在两条路里选");
+  assert.match(laws, /用户选了 MVP 才做 MVP/, "没有这句，模型会自己决定完再补一句「先做了个简版」");
+  // 具体禁止项要写死，否则"完整"是个可以被任意解释的词。
+  for (const banned of ["TODO", "占位实现", "假数据"]) {
+    assert.ok(laws.includes(banned), `禁止项少了「${banned}」——"完整"没有具体所指就会被解释掉`);
+  }
+  // 「把别人代码写烂」那半边。
+  assert.match(laws, /沿用现存的分层、命名、错误处理和测试方式/,
+    "缺了「沿用现有约定」——用户抱怨的另一半正是既有代码被改烂");
+});
