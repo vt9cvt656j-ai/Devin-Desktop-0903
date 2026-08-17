@@ -23891,6 +23891,8 @@ async function _predictNextAsk(sess) {
 
     const ctrl = typeof AbortController !== "undefined" ? new AbortController() : null;
     const to = ctrl ? setTimeout(() => ctrl.abort(), 12000) : null;
+    // 挑一次、记一次：跳过刚刚连续失败过的那条，别每轮都往同一个死上游上撞。
+    const predictModel = _pickCheapModel(cfg.model, _cheapModelSkipSet());
     const res = await fetch(_chatCompletionsUrl(cfg.baseUrl), {
       method: "POST",
       headers: (() => {
@@ -23903,13 +23905,14 @@ async function _predictNextAsk(sess) {
         return h;
       })(),
       body: JSON.stringify({
-        model: _pickCheapModel(cfg.model),
+        model: predictModel,
         messages: [{ role: "system", content: _ASK_PREDICT_SYSTEM }, { role: "user", content: convo }],
         max_tokens: 60, temperature: 0.3, stream: false,
       }),
       signal: ctrl ? ctrl.signal : undefined,
     });
     if (to) clearTimeout(to);
+    _noteCheapModelOutcome(predictModel, res.ok);
     if (!res.ok) return;
     const data = await res.json();
     const raw = String(data?.choices?.[0]?.message?.content || "").trim().replace(/^["「『]|["」』]$/g, "");
@@ -43317,7 +43320,14 @@ function _mcpResponseText(value) {
 // Deliberately always returns a usable model. Whether a chore runs at all is decided
 // by that chore's own value (see the call sites) and must never depend on pricing —
 // tying the two together made the feature set silently vary with the model list.
-function _pickCheapModel(currentId = "") {
+// 目录里最便宜那条线路要是**永久**坏掉，这个函数会一直忠实地把它挑出来，而调用方只有
+// 一句 `if (!res.ok) return;`——功能被静默锁死，还每轮白烧一次上游请求。线上实测：
+// gpt-5.4-mini 24 小时内 6 次调用 6 次 502（那条 GPT 线路只有一条上游，网关已把它熔断），
+// 于是输入框的回复建议从此永远不出现，也没有任何地方说得出为什么。
+//
+// 排除名单由调用方维护并传进来——本函数仍然「总能给出一个可用模型」，只是先跳过刚刚
+// 连续失败过的。全被排除时退回不过滤的最便宜那个：宁可再试一次，也不要把功能判死。
+function _pickCheapModel(currentId = "", exclude = null) {
   const cur = String(currentId || "").trim();
   const price = (m) => (Number(m?.inPrice) || 0) + (Number(m?.outPrice) || 0);
   // Name-based nudge for the small tiers, mirroring _pickVisionModel: some catalog
@@ -43329,8 +43339,28 @@ function _pickCheapModel(currentId = "") {
     .flatMap((g) => g.models || [])
     .filter((m) => m?.id && !_isImageModel(m.id));
   if (!candidates.length) return cur;
-  const cheapest = candidates.slice().sort((a, b) => score(a) - score(b))[0];
+  const skip = exclude && typeof exclude.has === "function" ? exclude : null;
+  const usable = skip ? candidates.filter((m) => !skip.has(String(m.id))) : candidates;
+  // 全被排除也要给出一个：这个函数只决定「用哪个」，永远不决定「要不要做」。
+  const pool = usable.length ? usable : candidates;
+  const cheapest = pool.slice().sort((a, b) => score(a) - score(b))[0];
   return cheapest?.id || cur;
+}
+
+// 连续失败过的廉价模型。只给后台杂活用，且刻意是「连续」而不是「累计」：一次 502 可能
+// 只是上游抖了一下，成功一次就清零；连着 2 次才跳过它去试次便宜的那个。
+const _cheapModelStrikes = new Map();
+const _CHEAP_MODEL_STRIKE_OUT = 2;
+function _cheapModelSkipSet() {
+  const out = new Set();
+  for (const [id, n] of _cheapModelStrikes) if (n >= _CHEAP_MODEL_STRIKE_OUT) out.add(id);
+  return out;
+}
+function _noteCheapModelOutcome(modelId, ok) {
+  const id = String(modelId || "");
+  if (!id) return;
+  if (ok) _cheapModelStrikes.delete(id);
+  else _cheapModelStrikes.set(id, (_cheapModelStrikes.get(id) || 0) + 1);
 }
 // (A) The task-start payload is selected by _semanticToolOrchestrator from the complete
 // registry. This prompt stays capability-neutral instead of becoming a second static router.

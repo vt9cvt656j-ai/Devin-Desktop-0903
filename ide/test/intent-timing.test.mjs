@@ -200,3 +200,53 @@ test("两侧的工具数量上限都必须容得下静态目录的真实规模",
     + "前者抬上限并把这里的实测值写进注释，后者去收那个描述——别默认抬数字。",
   );
 });
+
+test("最便宜那条线路永久坏掉时，后台杂活要换一条，而不是每轮往死上游上撞", () => {
+  // 线上实测：gpt-5.4-mini 24 小时内 6 次调用 6 次 502（承载它的 GPT 线路只有一条上游，
+  // 网关已把它熔断）。而挑选函数会一直忠实地挑中它，调用方只有一句 `if (!res.ok) return;`
+  // ——输入框的回复建议从此永远不出现，没有任何地方说得出为什么，每轮还白烧一次上游请求。
+  const fn = extractSimpleFn("_pickCheapModel");
+  const GROUPS = [{ models: [
+    { id: "dead-mini", inPrice: 0.1, outPrice: 0.2 },
+    { id: "cheap-flash", inPrice: 0.3, outPrice: 0.5 },
+    { id: "flagship", inPrice: 15, outPrice: 60 },
+  ] }];
+  const pick = new Function("MODEL_GROUPS", "_isImageModel", `${fn}; return _pickCheapModel;`)(
+    GROUPS, () => false,
+  );
+
+  assert.equal(pick("flagship"), "dead-mini", "没有排除名单时仍然挑最便宜的");
+  assert.equal(pick("flagship", new Set(["dead-mini"])), "cheap-flash",
+    "排除了坏的那条，就该退到次便宜的，而不是继续挑它");
+
+  // 这个函数只决定「用哪个」，永远不决定「要不要做」——全被排除也必须给出一个可用模型，
+  // 否则功能会随目录状态时有时无（既有测试也钉着这条：不许 return null）。
+  const all = new Set(["dead-mini", "cheap-flash", "flagship"]);
+  assert.equal(pick("flagship", all), "dead-mini", "全被排除时退回不过滤的最便宜那个，宁可再试一次");
+  assert.equal(pick("flagship", null), "dead-mini");
+  assert.equal(pick("flagship", "不是集合"), "dead-mini", "参数形状不对时按没有排除名单处理，不要抛");
+
+  // 记账必须是「连续」而不是「累计」：一次 502 可能只是抖了一下，成功一次就清零。
+  const strikes = new Function(
+    [
+      /const _cheapModelStrikes = new Map\(\);/.exec(SRC)[0],
+      /const _CHEAP_MODEL_STRIKE_OUT = \d+;/.exec(SRC)[0],
+      extractSimpleFn("_cheapModelSkipSet"),
+      extractSimpleFn("_noteCheapModelOutcome"),
+      "return { skip: _cheapModelSkipSet, note: _noteCheapModelOutcome, out: _CHEAP_MODEL_STRIKE_OUT };",
+    ].join("\n"),
+  )();
+  assert.ok(strikes.out >= 2, "一次失败就永久跳过，等于把上游的一次抖动当成判决");
+  strikes.note("m", false);
+  assert.equal(strikes.skip().has("m"), false, "第一次失败还不该跳过");
+  strikes.note("m", false);
+  assert.equal(strikes.skip().has("m"), true, "连续失败到阈值就该跳过");
+  strikes.note("m", true);
+  assert.equal(strikes.skip().has("m"), false, "成功一次必须清零，否则线路修好了功能也回不来");
+
+  // 调用方真的把这两半接上了：挑选时传排除名单，拿到响应后记账。
+  assert.match(SRC, /_pickCheapModel\(cfg\.model, _cheapModelSkipSet\(\)\)/,
+    "预测请求没有把排除名单传给挑选函数");
+  assert.match(SRC, /_noteCheapModelOutcome\(predictModel, res\.ok\);\s*\n\s*if \(!res\.ok\) return;/,
+    "记账必须在那句静默 return 之前，否则失败永远不会被记下来");
+});
