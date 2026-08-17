@@ -283,13 +283,46 @@ for (const [name, regTool] of registryByName) {
 // 那份仍写着"最多 2 个并发、其余排队"，等于一直在劝模型少扇出一半。
 // 运行时以网关那份为准（release 构建还会把客户端描述整个剥掉），所以这条差异不是
 // 文案问题，是**模型实际读到的指令**和源码不一致。
+// 按 JSON 路径收集一份工具里所有的 description/title。
+//
+// 只比顶层是不够的——run_subagent 那句错了两个提交周期的并发说明就在
+// `parameters.properties.tasks.description` 里，顶层一个字都没变。嵌套的说明恰恰是
+// 最容易漂的：改行为的人改的是那一层，而同步脚本连看都不看。
+function annotationMap(node, path = "", out = new Map()) {
+  if (Array.isArray(node)) {
+    node.forEach((item, index) => annotationMap(item, `${path}[${index}]`, out));
+    return out;
+  }
+  if (!isObject(node)) return out;
+  for (const key of SCHEMA_ANNOTATIONS) {
+    if (typeof node[key] === "string") out.set(`${path}.${key}`, node[key]);
+  }
+  for (const [key, value] of Object.entries(node)) {
+    if (SCHEMA_ANNOTATIONS.has(key)) continue;
+    annotationMap(value, `${path}.${key}`, out);
+  }
+  return out;
+}
+
 const describedDrift = [];
 for (const [name, regTool] of registryByName) {
   const cur = currentByName.get(name);
   if (!cur) continue;
-  const a = String(regTool.function?.description || "");
-  const b = String(cur.function?.description || "");
-  if (a !== b) describedDrift.push({ name, registryLen: a.length, catalogLen: b.length });
+  const a = annotationMap(regTool.function || {});
+  const b = annotationMap(cur.function || {});
+  const paths = new Set([...a.keys(), ...b.keys()]);
+  const conflicts = [];
+  const onlyOneSide = [];
+  for (const path of [...paths].sort()) {
+    const left = a.get(path);
+    const right = b.get(path);
+    if (left === right) continue;
+    if (left != null && right != null) conflicts.push(path);
+    else onlyOneSide.push(`${path}${left == null ? "（只有目录有）" : "（只有 main.js 有）"}`);
+  }
+  if (conflicts.length || onlyOneSide.length) {
+    describedDrift.push({ name, conflicts, onlyOneSide });
+  }
 }
 
 const merged = current
@@ -314,7 +347,9 @@ console.log(
   `description drift:     ${describedDrift.length}${
     describedDrift.length
       ? "\n  - " + describedDrift
-        .map(({ name, registryLen, catalogLen }) => `${name} (main.js ${registryLen} 字 / 目录 ${catalogLen} 字)`)
+        .map(({ name, conflicts, onlyOneSide }) => `${name}`
+          + (conflicts.length ? ` 冲突: ${conflicts.slice(0, 3).join(", ")}${conflicts.length > 3 ? " …" : ""}` : "")
+          + (onlyOneSide.length ? ` 缺失: ${onlyOneSide.slice(0, 3).join(", ")}${onlyOneSide.length > 3 ? " …" : ""}` : ""))
         .join("\n  - ")
       : ""
   }`,
@@ -322,8 +357,15 @@ console.log(
 
 if (check) {
   let bad = false;
-  if (describedDrift.length) {
-    console.error("tools.json 的工具描述和 main.js 注册表不一致——运行时以目录那份为准，请手工对齐后提交。");
+  // 只有**冲突**才算失败。两边都写了却写的不一样，说明模型读到的和源码说的不是一回事
+  // （run_subagent 的并发文案就是这么错了两个提交周期）。而"一边有一边没有"是遗漏——
+  // 按 main.js 对齐会把只存在于目录里的指引删掉，那比不同步更糟，所以只报不拦。
+  const conflicting = describedDrift.filter((d) => d.conflicts.length);
+  if (conflicting.length) {
+    console.error(
+      "tools.json 和 main.js 的工具描述互相矛盾——运行时以目录那份为准，"
+      + `请逐个确认哪边是对的再手工对齐：${conflicting.map((d) => d.name).join(", ")}`,
+    );
     bad = true;
   }
   if (missing.length) {
