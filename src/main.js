@@ -23873,14 +23873,29 @@ async function _predictNextAsk(sess) {
      *
      * loadConfig() 恒定返回网关地址 + 网关 JWT，所以主机永远是对的；没 token 就直接不预测。
      */
-    let _tok = "";
-    try { _tok = localStorage.getItem("michael_token") || ""; } catch {}
-    if (!_tok) return;
     const cfg = loadConfig();
-    if (!cfg || !cfg.baseUrl || !cfg.apiKey) return;
-    // 自定义模型用户跳过：cfg.model 是 "custom:<id>"，而 _pickCheapModel 只认网关目录里的
-    // 模型名——硬挑一个会拿着网关的名字去问用户自己的端点，静默 4xx，白花一次往返。
-    try { if (_customModelById && _customModelById(cfg.model)) return; } catch {}
+    if (!cfg) return;
+    // 建议用**用户当前选的那个模型**，不降级到目录里最便宜的那个。
+    //
+    // 降级版此前的失败方式很难看：挑中的永远是目录里最便宜那条线路，它一旦长期坏掉
+    // （实测 gpt-5.4-mini 24 小时 6 次调用 6 次 502），建议就永久不出现、界面上没有任何
+    // 解释、每轮还白烧一次上游请求。更根本的是它答得也不像：预测"用户下一句会打什么"
+    // 要贴着这一轮的语气和上下文，换一个小模型来猜，猜出来的往往不是这个人会说的话。
+    //
+    // 自定义端点也照这个规矩走——用户选了自己的模型，建议就该出自那个模型。三个字段的
+    // 覆写与主发送路径同款（见 _custom 那段）；同时**不要求** michael_token：只用自己
+    // 端点的用户压根不需要登录，此前那道 token 闸把他们的建议整个挡掉了。
+    let _predictCfg = { baseUrl: cfg.baseUrl, apiKey: cfg.apiKey, model: cfg.model, viaGateway: true };
+    try {
+      const _cm = _customModelById && _customModelById(cfg.model);
+      if (_cm) _predictCfg = { baseUrl: _cm.baseUrl, apiKey: _cm.apiKey, model: _cm.name, viaGateway: false };
+    } catch {}
+    if (_predictCfg.viaGateway) {
+      let _tok = "";
+      try { _tok = localStorage.getItem("michael_token") || ""; } catch {}
+      if (!_tok) return;
+    }
+    if (!_predictCfg.baseUrl || !_predictCfg.apiKey || !_predictCfg.model) return;
 
     sess._askPredictInflight = true;
     const turnKey = recent.length;
@@ -23891,28 +23906,26 @@ async function _predictNextAsk(sess) {
 
     const ctrl = typeof AbortController !== "undefined" ? new AbortController() : null;
     const to = ctrl ? setTimeout(() => ctrl.abort(), 12000) : null;
-    // 挑一次、记一次：跳过刚刚连续失败过的那条，别每轮都往同一个死上游上撞。
-    const predictModel = _pickCheapModel(cfg.model, _cheapModelSkipSet());
-    const res = await fetch(_chatCompletionsUrl(cfg.baseUrl), {
+    const res = await fetch(_chatCompletionsUrl(_predictCfg.baseUrl), {
       method: "POST",
       headers: (() => {
-        const h = { "Content-Type": "application/json", Authorization: "Bearer " + (cfg.apiKey || "") };
+        const h = { "Content-Type": "application/json", Authorization: "Bearer " + (_predictCfg.apiKey || "") };
         // 不带 request_id 的话，网关插 model_usage 时它是 NULL，而结算接口按 request_id 查——
         // 这笔钱扣了、进了用量页，却不进本轮的费用页脚。用户会看到额度掉得比页面上所有
         // 费用行加起来还多。格式守卫是必须的：畸形值网关直接 400，会把预测整条打死。
+        // 只对网关发：这是我们自己的计费关联头，第三方端点既不认它，也没道理收到它。
         const rid = String(sess._reqId || "");
-        if (/^[-_A-Za-z0-9]{8,128}$/.test(rid)) h["x-ide-request-id"] = rid;
+        if (_predictCfg.viaGateway && /^[-_A-Za-z0-9]{8,128}$/.test(rid)) h["x-ide-request-id"] = rid;
         return h;
       })(),
       body: JSON.stringify({
-        model: predictModel,
+        model: _predictCfg.model,
         messages: [{ role: "system", content: _ASK_PREDICT_SYSTEM }, { role: "user", content: convo }],
         max_tokens: 60, temperature: 0.3, stream: false,
       }),
       signal: ctrl ? ctrl.signal : undefined,
     });
     if (to) clearTimeout(to);
-    _noteCheapModelOutcome(predictModel, res.ok);
     if (!res.ok) return;
     const data = await res.json();
     const raw = String(data?.choices?.[0]?.message?.content || "").trim().replace(/^["「『]|["」』]$/g, "");
@@ -43320,48 +43333,6 @@ function _mcpResponseText(value) {
 // Deliberately always returns a usable model. Whether a chore runs at all is decided
 // by that chore's own value (see the call sites) and must never depend on pricing —
 // tying the two together made the feature set silently vary with the model list.
-// 目录里最便宜那条线路要是**永久**坏掉，这个函数会一直忠实地把它挑出来，而调用方只有
-// 一句 `if (!res.ok) return;`——功能被静默锁死，还每轮白烧一次上游请求。线上实测：
-// gpt-5.4-mini 24 小时内 6 次调用 6 次 502（那条 GPT 线路只有一条上游，网关已把它熔断），
-// 于是输入框的回复建议从此永远不出现，也没有任何地方说得出为什么。
-//
-// 排除名单由调用方维护并传进来——本函数仍然「总能给出一个可用模型」，只是先跳过刚刚
-// 连续失败过的。全被排除时退回不过滤的最便宜那个：宁可再试一次，也不要把功能判死。
-function _pickCheapModel(currentId = "", exclude = null) {
-  const cur = String(currentId || "").trim();
-  const price = (m) => (Number(m?.inPrice) || 0) + (Number(m?.outPrice) || 0);
-  // Name-based nudge for the small tiers, mirroring _pickVisionModel: some catalog
-  // rows legitimately carry no price, and a "mini/flash/haiku" row is still the right
-  // pick over an unpriced flagship.
-  const tierBonus = (m) => (/mini|flash|haiku|nano|lite|air|small|turbo|8b|4b/i.test(String(m?.id || "")) ? -1000 : 0);
-  const score = (m) => price(m) + tierBonus(m);
-  const candidates = (MODEL_GROUPS || [])
-    .flatMap((g) => g.models || [])
-    .filter((m) => m?.id && !_isImageModel(m.id));
-  if (!candidates.length) return cur;
-  const skip = exclude && typeof exclude.has === "function" ? exclude : null;
-  const usable = skip ? candidates.filter((m) => !skip.has(String(m.id))) : candidates;
-  // 全被排除也要给出一个：这个函数只决定「用哪个」，永远不决定「要不要做」。
-  const pool = usable.length ? usable : candidates;
-  const cheapest = pool.slice().sort((a, b) => score(a) - score(b))[0];
-  return cheapest?.id || cur;
-}
-
-// 连续失败过的廉价模型。只给后台杂活用，且刻意是「连续」而不是「累计」：一次 502 可能
-// 只是上游抖了一下，成功一次就清零；连着 2 次才跳过它去试次便宜的那个。
-const _cheapModelStrikes = new Map();
-const _CHEAP_MODEL_STRIKE_OUT = 2;
-function _cheapModelSkipSet() {
-  const out = new Set();
-  for (const [id, n] of _cheapModelStrikes) if (n >= _CHEAP_MODEL_STRIKE_OUT) out.add(id);
-  return out;
-}
-function _noteCheapModelOutcome(modelId, ok) {
-  const id = String(modelId || "");
-  if (!id) return;
-  if (ok) _cheapModelStrikes.delete(id);
-  else _cheapModelStrikes.set(id, (_cheapModelStrikes.get(id) || 0) + 1);
-}
 // (A) The task-start payload is selected by _semanticToolOrchestrator from the complete
 // registry. This prompt stays capability-neutral instead of becoming a second static router.
 // 工具规划 Few-Shot 已禁用：移除强制思考引导语，避免简单任务也产生冗余编排步骤
@@ -44525,9 +44496,10 @@ async function _semanticToolOrchestrator({ config, task, profile, phase, progres
   const prevExpBlock = crossSessionExp ? `\n过往同类场景经验（基于同一任务签名）:\n${crossSessionExp}` : "";
   
   const user = `用户原始任务：${String(task || '').slice(0, 2600)}\n\n结构化工程画像：${currentProfileStr}\n\n当前编排阶段：${String(phase || 'next')}\n\n已加载工具：${currentToolsStr}\n\n运行进度：${String(progress || '（暂无）').slice(-7000)}\n\n工具使用账本（结构化摘要）：${toolHistory.length ? summarizeToolHistory(toolHistory, 8) : '（暂无）'}\n\n最近真实工具结果：${String(evidence || '（暂无）').slice(-7000)}${expBlock}${prevExpBlock}`;
-  // 工具编排是认知腿，不是后台杂活：它决定下一阶段装入哪些能力。曾用 _pickCheapModel
-  // 降级到全目录最便宜的 nano/8b，用户主对话用旗舰、编排大脑却是弱智——选错/选不出
-  // 工具直接表现为"不会用 100 多个工具"。与意图判定同源的约定：认知腿跟随用户选择的模型。
+  // 工具编排是认知腿，不是后台杂活：它决定下一阶段装入哪些能力。早期版本会降级到全目录
+  // 最便宜的 nano/8b，用户主对话用旗舰、编排大脑却是弱智——选错/选不出工具直接表现为
+  // "不会用 100 多个工具"。全项目现在只有一条约定：**任何面向模型的判断都跟随用户选择的
+  // 模型**，意图判定、工具编排、输入框的回复建议一律如此，廉价降级那条路已经整个删掉。
   const plannerModel = config.model;
   try {
     const ctrl = typeof AbortController !== "undefined" ? new AbortController() : null;

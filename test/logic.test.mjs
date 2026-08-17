@@ -11127,7 +11127,6 @@ test("natural-language capability queries are routed by the semantic tool orches
   const route = load("_semanticToolOrchestrator", {
     _criticToolCatalog: catalog,
     _criticRequestedToolSchemas: requested,
-    _pickCheapModel: (id) => `cheap:${id}`,
     _chatCompletionsUrl: () => "https://gateway.example/v1/chat/completions",
     _safeJsonLoose: JSON.parse,
     enrichedCatalogLine,
@@ -15612,19 +15611,13 @@ test("background LLM chores are bounded to at most one call per run", () => {
   assert.match(recordBody, /memoryTexts\.some\(\(value\) => _worthDistilling\(value\)\)/,
     "the shared run-end reflection should emit memory only for durable signals");
 
-  // 4. Whether a chore runs must never depend on model pricing — that made the feature
-  //    set vary silently with the catalog. _pickCheapModel always returns something
-  //    usable and is only about WHICH model, never WHETHER.
-  const pickCheapBody = SRC.slice(SRC.indexOf("function _pickCheapModel"));
-  const pickCheapFn = pickCheapBody.slice(0, pickCheapBody.indexOf("\n}\n") + 2);
-  assert.doesNotMatch(pickCheapFn, /return null/,
-    "_pickCheapModel must always yield a usable model; skipping is the caller's decision");
-  assert.match(pickCheapFn, /MODEL_GROUPS/,
-    "_pickCheapModel should choose from the curated catalog");
-  assert.match(pickCheapFn, /inPrice[\s\S]{0,80}outPrice/,
-    "_pickCheapModel should rank by the catalog's input+output price");
-  assert.doesNotMatch(SRC, /function _pickCheapModel\(currentId = ""\) \{\s*return currentId \|\| "";\s*\}/,
-    "_pickCheapModel must not regress to a pass-through stub");
+  // 4. Whether a chore runs must never depend on model pricing — that made the feature set
+  //    vary silently with the catalog. The cheap-model downgrade is now gone entirely: every
+  //    model-facing judgement (intent, tool orchestration, composer suggestion) runs on the
+  //    model the USER selected. Guarded in test/intent-timing.test.mjs; asserted here too so
+  //    the picker cannot creep back in as a "background chores are cheap" optimisation.
+  assert.doesNotMatch(SRC, /function _pickCheapModel/,
+    "the cheap-model downgrade came back; model-facing work follows the user's selected model");
 });
 
 test("memory correction is immediate, append-only, and outside foreground generation", () => {
@@ -17320,7 +17313,6 @@ test("语义收尾评审工具仍可独立使用，但 quiet turn 不会被评�
     _executionEvidenceReviewBlock: () => "run_cmd: exitCode=0; stdout=the remote request did not produce the requested artifact",
     _criticToolCatalog: catalog,
     _criticRequestedToolSchemas: requested,
-    _pickCheapModel: (id) => `cheap:${id}`,
     _chatCompletionsUrl: () => "https://gateway.example/v1/chat/completions",
     _safeJsonLoose: JSON.parse,
     enrichedCatalogLine,
