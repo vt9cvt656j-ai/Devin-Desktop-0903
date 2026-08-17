@@ -3765,6 +3765,14 @@ pub fn assemble_into(headers: &HeaderMap, body: &mut serde_json::Value) -> Resul
     //
     // 判读方式：marked_request_bytes=0 且 last_user_bytes 很大 = 前言到了、用户的话没到
     // （或者标记不匹配）；两个都大 = 话到了，问题在模型这一侧或提示词。
+    // 客户端到底报上来了哪些语义旗标。这串是**旗标名**（engineering / research / design…），
+    // 不含任何用户正文——但它是"提示词模块为什么没挂上"唯一的直接判据：
+    //   空（只有 "2.5:"）→ 客户端没算出旗标，问题在客户端；
+    //   有旗标但 prompt_blocks 只有 base → 服务端没路由，问题在这里。
+    // 没有它就只能从 prompt_blocks 反推，而反推分不清这两种。
+    // 复用函数开头那份（同一次解析），排序后再记，避免 HashSet 的随机顺序让日志难比对。
+    let mut semantic_profile_seen: Vec<&str> = semantic_profile.iter().map(String::as_str).collect();
+    semantic_profile_seen.sort_unstable();
     let marked_request_bytes = anchor_request.as_deref().map_or(0, str::len);
     let last_user_bytes = body
         .get("messages")
@@ -3794,6 +3802,7 @@ pub fn assemble_into(headers: &HeaderMap, body: &mut serde_json::Value) -> Resul
         request_json_bytes,
         marked_request_bytes,
         last_user_bytes,
+        semantic_profile_seen = ?semantic_profile_seen,
         "assembled IDE prompt request"
     );
     record_agent_trace(AgentTraceInput {
