@@ -25869,3 +25869,26 @@ test("一键全撤：不许覆盖你事后自己改过的文件", async () => {
   // 恢复出来的那份没有监听器、也没有 checkpoint，不能跨重启假装还能点
   assert.match(SRC, /\.run-revert-btn, \.agent-files-bar/, "快照清理里去掉了它，恢复后会留一个死按钮");
 });
+
+test("每个会弹审批框的工具都得有自己的文案，不能只给一句「执行该操作？」", async () => {
+  const { approvalTypes } = await import("../src/agent/tool-policy.js");
+  const label = load("_approvalLabel", { _escHtml: String, _dbCallIsDestructive: () => false });
+  const generic = label({ type: "__不存在的类型__" }).title;
+  const bland = [];
+  for (const t of [...approvalTypes()].sort()) {
+    const r = label({
+      type: t, path: "src/a.js", command: "npm run x", url: "https://x/a", name: "n",
+      prompt: "p", op: "pr_create", method: "POST", driver: "postgres", query: "select 1",
+      action: "press", ref: 1, dest: "d", to: "t", branch: "b", engine: "godot", text: "t",
+    });
+    if (!r || !r.title || r.title === generic) bland.push(t);
+  }
+  // 一个没有信息的框，只会让人闭着眼睛点同意——那时候这道门就只剩摩擦、不剩保护。
+  assert.deepEqual(bland, [], "这些工具会弹框，但框上只有一句没信息的默认文案：" + bland.join(", "));
+  // 铺一整棵项目树的那两个，必须在框里说清会往工作区写东西——它是这批里代价最大的一个。
+  for (const t of ["game_scaffold", "web_scaffold"]) {
+    const r = label({ type: t, name: "x", engine: "godot", framework: "react" });
+    assert.ok(String(r.detail || "").includes("工作区"),
+      `${t} 的确认框没说清会往哪儿写——它会创建一整套目录和文件`);
+  }
+});

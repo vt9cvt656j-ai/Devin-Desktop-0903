@@ -78,7 +78,7 @@ const FILE_OP = {
 /** the four that write content (and therefore reach diagnostics + diff review). */
 const FILE_CONTENT_OP = { ...FILE_OP, fileEdit: true, scopeField: "path" };
 /** a generator that lands assets in the workspace: mutating, but not a file operation. */
-const GENERATOR = { mutatesWorkspace: true };
+const GENERATOR = { mutatesWorkspace: true, needsApproval: true };
 /** an execution tool: side effects the harness cannot verify, but no `mutated` report. */
 const EXEC = { needsApproval: true, hooked: true };
 
