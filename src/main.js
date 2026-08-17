@@ -24369,8 +24369,21 @@ async function sendPrompt(text, attachments = [], readyConfig = null) {
   // 开局窗口里没看见就当它不存在，也别回复用户说做不到」。在一个不能执行工具的模式里
   // 说这些，等于直接指使模型去编造它做过的操作。
   if (effectiveMode !== "chat") {
-    const mcpBlock = _mcpAvailabilitySystemContext(_readyMcpSnapshot(_curRoot));
+    const mcpSnapshot = _readyMcpSnapshot(_curRoot);
+    const mcpBlock = _mcpAvailabilitySystemContext(mcpSnapshot);
     if (mcpBlock) contextBlock += `\n\n${mcpBlock}`;
+    /*
+     * 连不上的服务也要说。
+     *
+     * 以前这份诊断只在一个地方用得上：模型主动调了 search_tools、而且前面六个分支
+     * 全不命中时。普通一轮里，一个连接失败的服务对模型就是**不存在**——用户在面板上
+     * 看到红标和 toast，模型什么都不知道，只会回一句"我做不到"，说不出为什么。
+     *
+     * 更糟的是全军覆没那种：一个服务都没连上时上面那个名录返回空串，于是整轮对话里
+     * 关于 MCP 的信息量是零。用户明明配好了，问它却说没有这个能力。
+     */
+    const mcpFailures = _mcpFailureSystemContext(mcpSnapshot?.failed);
+    if (mcpFailures) contextBlock += `\n\n${mcpFailures}`;
   }
 
   // ── 提示词缓存: system = 纯静态前缀(跨轮复用), 动态内容下沉到 user 消息末尾 ──
@@ -24387,7 +24400,10 @@ async function sendPrompt(text, attachments = [], readyConfig = null) {
   if (inTauri && !_fileSkillsCacheKey) {
     try {
       await Promise.race([
-        _refreshFileSkills(_curRoot || ""),
+        // MCP 和技能一起等这一下。名录（_mcpAvailabilitySystemContext）是在这之后、
+        // run 开始**之前**算的：预热没落地它就是空串，于是首轮模型连"有哪些服务"都
+        // 不知道。等不到也不阻塞——1.5 秒上限，后台那次照常写回缓存，下一轮就齐了。
+        Promise.allSettled([_refreshFileSkills(_curRoot || ""), _warmMcpTools(_curRoot || "")]),
         new Promise((resolve) => setTimeout(resolve, 1500)),
       ]);
     } catch {}
@@ -27781,8 +27797,12 @@ async function _ensureMcpTools(rootOverride = "") {
 // should never be blocked by a separate trust prompt.
 async function _warmMcpTools(root) {
   try {
+    // 空根照样预热：用户级（scope="user"）的服务不属于任何项目，"没打开文件夹"和
+    // "该不该连它们"毫无关系。这里以前有个 `!root` 的早退，于是不开文件夹时**永远
+    // 不预热**——第一轮对话既没有工具 schema，也没有那份"有哪些服务"的名录，模型连
+    // 它们存在都不知道（而它不会去搜一件自己不知道存在的东西）。第二轮才正常。
     root = _toPosix(String(root || "")).replace(/\/+$/, "");
-    if (!inTauri || !root) return;
+    if (!inTauri) return;
     await _ensureMcpTools(root);
   } catch { /* warm-up is best-effort; the run path loads on demand anyway */ }
 }
@@ -27852,9 +27872,16 @@ async function _waitForRunMcpDiscovery(run) {
 }
 
 const _workspaceAgentWarmups = new Map();
+/*
+ * 空根（没打开文件夹）照样要跑：这一批里有两件事和项目无关——全局 MCP 服务、家目录
+ * 那份技能库。以前这里一个 `!normalized` 把整批挡掉，结果"启动 IDE、不开文件夹、直接
+ * 提问"这条最常见的路径上，MCP 从来没被预热过。
+ *
+ * 真正跟项目走的只有工作区上下文（_gatherAgentContext），空根时跳过它即可。
+ */
 function _scheduleWorkspaceAgentWarmup(root) {
   const normalized = String(root || "").replace(/\/+$/, "");
-  if (!inTauri || !normalized) return null;
+  if (!inTauri) return null;
   const existing = _workspaceAgentWarmups.get(normalized);
   if (existing && (existing.pending || Date.now() - existing.finishedAt < 5000)) return existing.promise;
   const state = { pending: true, finishedAt: 0, promise: null };
@@ -27864,7 +27891,8 @@ function _scheduleWorkspaceAgentWarmup(root) {
         await Promise.allSettled([
           _refreshFileSkills(normalized),
           _warmMcpTools(normalized),
-          _gatherAgentContext("", normalized),
+          // 只有这一件真的跟项目走；没打开文件夹时它没有对象可扫。
+          ...(normalized ? [_gatherAgentContext("", normalized)] : []),
           // 后端的浏览器选择是进程内状态、不落盘，不回灌的话用户选了 Edge、重启一次
           // 又悄悄变回 Chrome——一个只在下次启动才出现的 bug。
           _restoreBrowserPref(),
