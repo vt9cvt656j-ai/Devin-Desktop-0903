@@ -138,6 +138,26 @@ test("工具接进了注册表、意图映射和取证闸", () => {
     "还在把陌生库引向 semantic_search——那个工具的索引跳过 node_modules，必然空手而归");
   assert.match(SRC, /"package_search", "package_source", "github_repo"/,
     "没进官方证据表，取证 gate 不会装载它");
+
+  /*
+   * 加一个工具要同步的地方不止注册表——这五处漏一个，工具就等于半死不活：
+   * 少 TOOL_METADATA → 进不了能力名录，模型根本叫不出它的名字；
+   * 少网关那份 → 正式构建走网关时描述漂移；
+   * 少官网那份 → 工具画廊和真目录对不上。
+   * 这一条把它们一次钉齐（本次就是被这几条守卫逐个抓出来的）。
+   */
+  const guides = readFileSync(join(ROOT, "src", "tool-guides.js"), "utf8");
+  assert.match(guides, /package_source: \{ category: 'research'/, "缺 TOOL_METADATA");
+  for (const [label, rel] of [
+    ["网关", join(ROOT, "..", "server", "prompts", "tools.json")],
+    ["官网", join(ROOT, "website", "public", "tools.json")],
+  ]) {
+    const list = JSON.parse(readFileSync(rel, "utf8"));
+    assert.ok(
+      list.some((t) => (t?.function?.name || t?.name) === "package_source"),
+      `${label}那份工具目录里没有 package_source`,
+    );
+  }
 });
 
 test("read_file 读不到 node_modules 时不再塞假事实", () => {

@@ -18677,7 +18677,7 @@ test("#51-1a performance_profile 只返回所请求的真实指标", () => {
 test("#51-2 _buildToolHint 决策地图：静态字节稳定 + 八项场景映射齐全", () => {
   const hint = extractFn("_buildToolHint");
   assert.match(hint, /场景→工具直觉/);
-  for (const pair of ["查符号定义→find_symbol", "查谁调用→lsp_references", "陌生库初探→semantic_search", "git_blame\\/git_log", "db_query 直连", "developer_community_search", "页面卡顿→performance_profile", "已知工具名未装载→search_tools"]) {
+  for (const pair of ["查符号定义→find_symbol", "查谁调用→lsp_references", "第三方库的真实签名→package_source", "git_blame\\/git_log", "db_query 直连", "developer_community_search", "页面卡顿→performance_profile", "已知工具名未装载→search_tools"]) {
     assert.match(hint, new RegExp(pair), `决策地图必须含映射：${pair}`);
   }
   // 缓存纪律：return 的文本必须是纯字面量拼接，零模板插值——任何动态内容都会击穿 prompt cache

@@ -82,6 +82,12 @@ test("两份工具目录都要有 kind，否则正式构建走网关时等于没
   // 字段根本不存在，模型永远不会填。
   assert.match(SRC, /kind: \{ type: "string", enum: \["investigate", "implement", "execute", "verify"\]/,
     "本地目录里 update_plan 没有 kind");
-  assert.ok(GATEWAY.includes('"kind": {"type": "string", "enum": ["investigate", "implement", "execute", "verify"]'),
-    "网关目录里 update_plan 没有 kind —— 正式构建下这个声明通道是死的");
+  // 钉**结构**不钉文本：同步脚本会重排 JSON 的空格，按字面量比对会假红一次
+  // （这条就这么红过），而真正要保证的是"这个字段带着正确的枚举值在网关那份里"。
+  const gatewayKind = JSON.parse(GATEWAY)
+    .find((t) => t?.function?.name === "update_plan")
+    ?.function?.parameters?.properties?.steps?.items?.properties?.kind;
+  assert.ok(gatewayKind, "网关目录里 update_plan 没有 kind —— 正式构建下这个声明通道是死的");
+  assert.deepEqual(gatewayKind.enum, ["investigate", "implement", "execute", "verify"],
+    "网关那份的 kind 枚举和本地对不上");
 });
