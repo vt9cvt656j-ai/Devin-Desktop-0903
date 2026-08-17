@@ -9423,8 +9423,14 @@ test("Agent decision frame gives task-specific old-hand operating rules", () => 
 
   const small = frame("把按钮文案改一下", { applies: true });
   assert.match(small, /小任务律/);
-  assert.match(SRC, /const _decisionFrame = \(effectiveMode === "agent"\) \? _agentDecisionFrameBlock\(text, _uiTurnEngineering\) : ""/,
+  // 第三个参数是完整裁决缺席时的**临时角色契约**（快通道给的）。加它的理由：完整裁决实测
+  // 19.8 秒，第一轮通常没有——而"该派哪些角色"恰恰是第一轮就要决定的事，等到第二轮，活已经
+  // 按 solo 干起来了。边界是死的：信息可以走快通道，闸门仍然只认完整裁决，所以
+  // _fastRouteProfile 只进这个参数，不写 _uiTurnEngineering。
+  assert.match(SRC, /const _decisionFrame = \(effectiveMode === "agent"\)\s*\n?\s*\? _agentDecisionFrameBlock\(text, _uiTurnEngineering, _fastRouteProfile\)/,
     "Agent send path must add the decision frame to the per-turn preamble");
+  assert.doesNotMatch(SRC, /_uiTurnEngineering = _fastRouteProfile|run\.engineering = _fastRouteProfile/,
+    "快通道的判断不许写进驱动闸门的那份画像——它只负责给模型指路");
   assert.match(SRC, /_dynPreamble \+ _atContext \+ _modeFrame \+ _decisionFrame \+ _uiDesignCraft \+ _toolHint \+ _expHint/,
     "decision frame must sit before tool and experience hints in recency context");
   assert.match(SRC, /每次工具前先在内部过三问/);
