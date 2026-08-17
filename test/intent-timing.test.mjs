@@ -20,6 +20,7 @@
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
+import { spawnSync } from "node:child_process";
 import { test } from "node:test";
 import assert from "node:assert/strict";
 
@@ -157,6 +158,20 @@ test("两侧的工具数量上限都必须容得下静态目录的真实规模",
   const catalogCount = CATALOG.length;
   assert.ok(catalogCount > 0, "tools.json 是空的");
 
+  // 先确认这个数字**就是模型真正拿到的那份**。
+  //
+  // 网关目录和 main.js 的注册表是两套东西，运行时以网关那份为准（release 构建还会把
+  // 客户端描述整个剥掉）。只改一边是常态——就在今天，run_subagent 的并发文案在网关那份
+  // 里错了至少两个提交周期，而所有测试全绿。那种状态下这条断言量的是一个和模型无关的
+  // 数字：上限看着够，实际发出去的目录是另一副样子。
+  const sync = spawnSync(process.execPath, [join(HERE, "..", "build", "sync-tools-json.mjs"), "--check"], {
+    encoding: "utf8",
+  });
+  assert.equal(
+    sync.status, 0,
+    `两份工具目录不同步，下面的数量断言量的就不是模型真正收到的那份：\n${sync.stdout}\n${sync.stderr}`,
+  );
+
   const clientMax = numericConst(CODE, "_TOOL_PAYLOAD_MAX_TOOLS");
   assert.ok(
     clientMax >= catalogCount,
@@ -180,6 +195,8 @@ test("两侧的工具数量上限都必须容得下静态目录的真实规模",
   assert.ok(
     byteMax >= catalogBytes,
     `字节上限 ${byteMax} 收不住完整目录 ${catalogBytes}——数量上限放开之后，被静默丢工具的`
-    + "路径会从「数量」换到「字节」，症状一模一样",
+    + "路径会从「数量」换到「字节」，症状一模一样。\n"
+    + "撞上这条时先问一句：是目录真的该这么大，还是某个工具的描述在膨胀？"
+    + "前者抬上限并把这里的实测值写进注释，后者去收那个描述——别默认抬数字。",
   );
 });
