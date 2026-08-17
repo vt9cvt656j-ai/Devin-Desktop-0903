@@ -160,11 +160,16 @@ test("聊天模式只给常驻技能的正文，不给指向 read_skill 的目�
 });
 
 test("聊天模式不发 MCP 名录——那段话会直接指使模型编造它做过的操作", () => {
-  const at = SRC.indexOf("_mcpAvailabilitySystemContext(_readyMcpSnapshot(_curRoot))");
+  const at = SRC.indexOf("const mcpBlock = _mcpAvailabilitySystemContext(mcpSnapshot)");
   assert.ok(at > 0, "找不到 MCP 名录的注入点");
   const before = SRC.slice(Math.max(0, at - 400), at);
   assert.match(before, /effectiveMode !== "chat"/,
     "聊天模式仍在收 MCP 名录，而那段话写着「按名字直接调用」「别回复用户说做不到」");
+  // 失败诊断和名录在同一个 chat 闸门后面：聊天模式不执行工具，说"某个服务连不上"
+  // 对它没有任何可操作性，只是白占上下文。
+  const block = SRC.slice(at, at + 1400);
+  assert.match(block, /_mcpFailureSystemContext\(mcpSnapshot\?\.failed\)/,
+    "连不上的服务没告诉模型——它只会回一句「我做不到」，说不出为什么");
 });
 
 test("冷启动首轮不会漏掉磁盘上的技能", () => {
@@ -176,8 +181,12 @@ test("冷启动首轮不会漏掉磁盘上的技能", () => {
   const before = send.slice(0, at);
   assert.match(before, /_fileSkillsCacheKey/,
     "构建技能块之前必须判断磁盘技能是否已经发现过");
-  assert.match(before, /await Promise\.race\(\[\s*\n?\s*_refreshFileSkills\(/,
+  assert.match(before, /await Promise\.race\(\[[\s\S]{0,400}_refreshFileSkills\(/,
     "首轮必须等一次目录扫描，且要带超时——不能无限期阻塞这一轮");
+  // MCP 预热和技能扫描共用这一次等待：名录（_mcpAvailabilitySystemContext）是在这之后、
+  // run 开始之前算的，预热没落地它就是空串——首轮模型连"有哪些服务"都不知道。
+  assert.match(before, /await Promise\.race\(\[[\s\S]{0,400}_warmMcpTools\(/,
+    "首轮没等 MCP 预热，冷启动第一轮的服务名录会是空的");
   assert.match(before, /setTimeout\(resolve, \d+\)/,
     "等待必须有上界");
 });

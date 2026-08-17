@@ -307,3 +307,23 @@ test("名录读的是不带免责前缀的那份说明", () => {
   assert.match(out, /真正的说明/);
   assert.ok(!out.includes("第三方服务自述"), "每条说明里还在重复整段已经声明过的免责话术");
 });
+
+test("没打开文件夹也要预热——全局服务不属于任何项目", () => {
+  /*
+   * 这两处以前各有一个 `!root` 早退，于是"启动 IDE、不开文件夹、直接提问"这条最常见的
+   * 路径上，MCP **从来没被预热过**。第一轮既没有工具 schema，也没有那份「有哪些服务」的
+   * 名录——而模型不会去搜一件自己不知道存在的东西。第二轮才正常。
+   */
+  const warm = SRC.slice(SRC.indexOf("async function _warmMcpTools("), SRC.indexOf("async function _warmMcpTools(") + 900);
+  assert.doesNotMatch(warm, /if \(!inTauri \|\| !root\) return;/,
+    "空根又被早退挡掉了——不开文件夹就永远不预热 MCP");
+  assert.match(warm, /if \(!inTauri\) return;/, "预热的守卫应当只看在不在桌面端");
+
+  const sched = SRC.slice(SRC.indexOf("function _scheduleWorkspaceAgentWarmup("), SRC.indexOf("function _scheduleWorkspaceAgentWarmup(") + 1200);
+  assert.doesNotMatch(sched, /if \(!inTauri \|\| !normalized\) return null;/,
+    "整批预热又被空根挡掉了");
+  // 真正跟项目走的只有工作区上下文，空根时跳过它就够了。
+  assert.match(sched, /normalized \? \[_gatherAgentContext\("", normalized\)\] : \[\]/,
+    "空根时应当只跳过工作区上下文，而不是整批不跑");
+});
+
