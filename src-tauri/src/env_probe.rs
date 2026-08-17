@@ -79,8 +79,17 @@ const PROBES: &[(&str, &str)] = &[
     ("yarn", "--version"),
     ("bun", "--version"),
     ("deno", "--version"),
+    // Windows 上 python.org 的安装包只产出 python.exe / pip.exe —— 没有 python3、没有
+    // pip3（同名的 python3.exe 是微软商店的「应用执行别名」，跑它会弹商店而不是解释器）。
+    // 按 python3 去探，结论就是"这台机器没装 Python"，而模型被明确要求优先信这份探测。
+    #[cfg(not(windows))]
     ("python3", "--version"),
+    #[cfg(not(windows))]
     ("pip3", "--version"),
+    #[cfg(windows)]
+    ("python", "--version"),
+    #[cfg(windows)]
+    ("pip", "--version"),
     ("uv", "--version"),
     ("cargo", "--version"),
     ("rustc", "--version"),
@@ -343,8 +352,10 @@ pub fn probe_env(root: Option<String>) -> Result<EnvProbe, String> {
     }
 
     let workspace = workspace_facts(&root, &mut notes);
-    let path_entries = std::env::var("PATH")
-        .map(|p| p.split(':').filter(|s| !s.is_empty()).count())
+    // 分隔符按平台来：Windows 是 ';'。按 ':' 切 "C:\\Windows;C:\\Program Files" 会把盘符
+    // 也切开，数出来的条目数是错的——而这个数字是模型判断"这台机器环境正不正常"的依据之一。
+    let path_entries = std::env::var_os("PATH")
+        .map(|p| std::env::split_paths(&p).filter(|d| !d.as_os_str().is_empty()).count())
         .unwrap_or(0);
 
     Ok(EnvProbe {

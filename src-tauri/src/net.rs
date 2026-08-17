@@ -496,7 +496,9 @@ pub async fn ensure_tor() -> Result<(), String> {
     if tor_port_up().await {
         return Ok(());
     }
-    // Find the tor binary — Finder's minimal PATH omits Homebrew, so probe known locations.
+    // 找 tor。Finder 启动的应用 PATH 很窄（缺 Homebrew），所以先探几个已知位置，
+    // 再走统一的命令解析——那条路两个平台都对（Windows 上会按 PATHEXT 找 tor.exe），
+    // 而这里以前是按 ':' 切 PATH，Windows 的分隔符是 ';'，切出来第一段是 "C"。
     let bin = [
         "/opt/homebrew/bin/tor",
         "/usr/local/bin/tor",
@@ -506,14 +508,18 @@ pub async fn ensure_tor() -> Result<(), String> {
     .find(|p| std::path::Path::new(p).exists())
     .map(|s| s.to_string())
     .or_else(|| {
-        crate::process_util::augmented_path(None)
-            .split(':')
-            .map(|d| format!("{d}/tor"))
-            .find(|c| std::path::Path::new(c).exists())
+        let resolved = crate::process_util::resolve_command("tor", None);
+        (resolved != "tor").then_some(resolved)
     });
     let bin = match bin {
         Some(b) => b,
-        None => return Err("Tor 未安装——深网/.onion 访问需要它。装一下：brew install tor（装完自动就能用，会自愈启动）".into()),
+        None => {
+            return Err(if cfg!(windows) {
+                "Tor 未安装——深网/.onion 访问需要它。装一下：winget install -e --id TorProject.TorBrowser（或把 tor.exe 放进 PATH）".into()
+            } else {
+                "Tor 未安装——深网/.onion 访问需要它。装一下：brew install tor（装完自动就能用，会自愈启动）".to_string()
+            });
+        }
     };
     // Launch detached; tor keeps running in the background after we drop the handle.
     std::process::Command::new(&bin)

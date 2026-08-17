@@ -144,7 +144,19 @@ fn encode_lsp_message(content: &str) -> String {
     format!("Content-Length: {}\r\n\r\n{}", content.len(), content)
 }
 
-/// Strip a `file://` prefix from a root URI and URL-decode to get a real path.
+/// 把 `file://` 根 URI 还原成真实路径。
+///
+/// Windows 上这里以前是**每一个语言服务器都起不来**的原因，而且和"装没装"毫无关系：
+/// 前端给的是 monaco 的 `monaco.Uri.file(root).toString()`，形如
+/// `file:///c%3A/Users/me/proj`。
+/// 剥掉 `file://`、百分号解码之后得到 `/c:/Users/me/proj` —— **多一个前导斜杠**，不是合法
+/// 的 Windows 路径。它随后被交给 `current_dir()`，spawn 当场失败。于是：只要打开了工作区
+/// 文件夹，补全、跳转定义、悬停、诊断全部消失；反而"不打开文件夹、单独开一个文件"时是好的
+/// ——因为那条路不设 current_dir。
+///
+/// 修法是按 URI 规范来：`file:///C:/x` 里第三个斜杠是**路径的起始分隔符**，对 Windows 这种
+/// 带盘符的路径要去掉它。顺带把正斜杠换成反斜杠（Windows API 两种都收，但拼进错误信息和
+/// 日志时反斜杠才是用户认得的样子）。
 fn workspace_dir_from_uri(uri: &str) -> Option<String> {
     let trimmed = uri.strip_prefix("file://").unwrap_or(uri);
     if trimmed.is_empty() {
@@ -152,10 +164,26 @@ fn workspace_dir_from_uri(uri: &str) -> Option<String> {
     }
     let decoded = percent_decode(trimmed);
     if decoded.is_empty() {
-        None
-    } else {
-        Some(decoded)
+        return None;
     }
+    Some(normalize_uri_path(&decoded))
+}
+
+/// `/C:/x` → `C:\x`（Windows）；其余平台原样返回。
+///
+/// 判据是"斜杠后面跟着 <单字母><冒号>"，不是"当前编译目标是 Windows"——一台 mac 上如果
+/// 真收到这种 URI，那也是一个 Windows 路径，按 Windows 还原才对。这样这段逻辑在 mac 上
+/// 也能测，不必靠交叉编译。
+fn normalize_uri_path(path: &str) -> String {
+    let bytes = path.as_bytes();
+    let drive_letter_at_start = bytes.len() >= 3
+        && bytes[0] == b'/'
+        && bytes[1].is_ascii_alphabetic()
+        && bytes[2] == b':';
+    if !drive_letter_at_start {
+        return path.to_string();
+    }
+    path[1..].replace('/', "\\")
 }
 
 fn percent_decode(input: &str) -> String {
@@ -265,17 +293,20 @@ pub fn lsp_start(
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    // PATH 两个平台都要设。这里以前整段关在 cfg(not(windows)) 里，理由大概是"Windows 会
+    // 自己按 PATH 找"——可子进程继承的是**这个进程**的 PATH，而 GUI 启动的应用拿到的那份
+    // 很窄：nvm / volta / 用户级 npm 前缀全不在里面。于是语言服务器就算被拉起来了，它自己
+    // 再去找 node 也找不到，表现同样是"装了却没有补全"。
+    //
+    // 未信任的工作区不把它的目录放进 PATH：否则语言服务器再去 PATH 里找工具时会命中仓库
+    // 自带的版本——那是 clone 下来的别人的可执行文件。
     if let Some(ref ws_dir) = ws {
         builder.current_dir(ws_dir);
-        #[cfg(not(windows))]
-        // 子进程 PATH 同理：未信任时不放工作区目录进去，否则语言服务器自己再去 PATH
-        // 里找工具时又会命中仓库提供的版本。
         builder.env(
             "PATH",
             process_util::augmented_path(config.trust_workspace_binaries.then_some(ws_dir)),
         );
     } else {
-        #[cfg(not(windows))]
         builder.env("PATH", process_util::augmented_path(None));
     }
     tracing::info!(
@@ -420,20 +451,48 @@ pub struct PythonEnvInfo {
 /// even though the venv had X.
 fn pick_python(workspace: Option<&str>) -> String {
     if let Some(ws) = workspace.filter(|w| !w.is_empty()) {
-        for rel in [
-            ".venv/bin/python3",
-            ".venv/bin/python",
-            "venv/bin/python3",
-            "venv/bin/python",
-        ] {
+        // venv 的布局两个平台不一样：POSIX 是 <venv>/bin/python，Windows 是
+        // <venv>\Scripts\python.exe。这里以前只列了 POSIX 那四条，于是 Windows 上
+        // **一条都命中不了**，pyright 拿不到 venv 解释器——项目里 pip 装过的每一个包，
+        // import 那一行全是红波浪线，而 IDE 一句错都不报。
+        for rel in VENV_PYTHON_RELATIVE_PATHS {
             let p = format!("{ws}/{rel}");
             if std::path::Path::new(&p).exists() {
                 return p;
             }
         }
     }
-    process_util::resolve_command("python3", workspace)
+    // 兜底也不能写死 python3：Windows 上 python.org 的安装包只产出 python.exe，
+    // 而同名的 python3.exe 是微软商店的「应用执行别名」——跑它会弹出商店页面。
+    for name in DEFAULT_PYTHON_NAMES {
+        let resolved = process_util::resolve_command(name, workspace);
+        if resolved != *name {
+            return resolved;
+        }
+    }
+    process_util::resolve_command(DEFAULT_PYTHON_NAMES[0], workspace)
 }
+
+/// venv 里解释器的相对位置，按平台。
+#[cfg(windows)]
+const VENV_PYTHON_RELATIVE_PATHS: &[&str] = &[
+    ".venv/Scripts/python.exe",
+    "venv/Scripts/python.exe",
+];
+#[cfg(not(windows))]
+const VENV_PYTHON_RELATIVE_PATHS: &[&str] = &[
+    ".venv/bin/python3",
+    ".venv/bin/python",
+    "venv/bin/python3",
+    "venv/bin/python",
+];
+
+/// 没有 venv 时按什么名字找解释器。Windows 上 `python3` 通常不存在（存在的那个多半是
+/// 微软商店的别名），所以 `python` 排在前面。
+#[cfg(windows)]
+const DEFAULT_PYTHON_NAMES: &[&str] = &["python", "py"];
+#[cfg(not(windows))]
+const DEFAULT_PYTHON_NAMES: &[&str] = &["python3", "python"];
 
 #[tauri::command(async)]
 pub fn lsp_detect_python(workspace: Option<String>) -> Result<PythonEnvInfo, String> {
@@ -495,7 +554,8 @@ fn py_cache() -> &'static Mutex<Option<PythonModuleCache>> {
 }
 
 fn run_python_script(script: &str, extra_args: &[&str]) -> Option<String> {
-    let python = process_util::resolve_command("python3", None);
+    // 走和 pick_python 同一套按平台的名字，别在这里再写死一个 python3。
+    let python = pick_python(None);
     let aug_path = process_util::augmented_path(None);
     let mut cmd = crate::process_util::command(&python);
     cmd.args(["-c", script])
@@ -1029,3 +1089,49 @@ pub fn lsp_list(state: State<LspManager>) -> Result<Vec<LspInfo>, String> {
     }
     Ok(out)
 }
+#[cfg(test)]
+mod windows_path_tests {
+    use super::*;
+
+    /// Windows 上「打开文件夹之后每个语言服务器都起不来」的根因。
+    ///
+    /// 前端给的是 monaco 的 `Uri.file(root).toString()`：`file:///c%3A/Users/me/proj`。
+    /// 剥前缀 + 解码之后是 `/c:/Users/me/proj`——多一个前导斜杠，不是合法 Windows 路径，
+    /// 交给 current_dir() 当场失败。反而"不开文件夹、单开一个文件"是好的，因为那条路
+    /// 不设 current_dir——这也是为什么这个 bug 看起来像"时好时坏"。
+    #[test]
+    fn a_windows_file_uri_becomes_a_real_path() {
+        assert_eq!(
+            workspace_dir_from_uri("file:///c%3A/Users/me/proj").unwrap(),
+            "c:\\Users\\me\\proj",
+        );
+        assert_eq!(
+            workspace_dir_from_uri("file:///D%3A/work/%E9%A1%B9%E7%9B%AE").unwrap(),
+            "D:\\work\\项目",
+            "中文目录名解码之后也要按 Windows 还原",
+        );
+        // POSIX 路径一个字都不能动。
+        assert_eq!(
+            workspace_dir_from_uri("file:///Users/me/proj").unwrap(),
+            "/Users/me/proj",
+        );
+        assert_eq!(
+            workspace_dir_from_uri("file:///home/me/%E9%A1%B9%E7%9B%AE").unwrap(),
+            "/home/me/项目",
+        );
+        assert_eq!(workspace_dir_from_uri("file://"), None);
+    }
+
+    /// 判据是"斜杠后面跟着 <单字母><冒号>"，不是编译目标——所以这段在 mac 上也测得了，
+    /// 不必靠交叉编译（本仓库的交叉编译卡在 C 依赖上）。
+    #[test]
+    fn only_a_drive_letter_triggers_the_windows_rewrite() {
+        assert_eq!(normalize_uri_path("/c:/x"), "c:\\x");
+        assert_eq!(normalize_uri_path("/Z:/a/b"), "Z:\\a\\b");
+        // 这些都不是盘符，原样留着。
+        for keep in ["/usr/local/bin", "/ab:/x", "/1:/x", "/", "relative/path"] {
+            assert_eq!(normalize_uri_path(keep), keep, "{keep} 被误改了");
+        }
+    }
+}
+
