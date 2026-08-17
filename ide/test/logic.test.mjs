@@ -284,6 +284,14 @@ const RUN_RECORD_KNOWN_SIGNATURE = load("_recordRunKnownSignature", {
   _runFileEvidenceAliases: EVIDENCE_ALIASES,
 });
 AUTO_LOAD_DEPS = {
+  // 打包/构建正则：_isRecognizedVerifierCommand 和 _runtimeCommandKinds 共用同一份。
+  // 少了它是 ReferenceError，表现成"这个测试挂了"而不是"命令没认出来"。
+  // 命令归一化的第一步。_looksLikeVerificationCommand 和 _normalizedVerifierCommand
+  // 都调它，抠出任何一个的测试都需要——少了是 ReferenceError，表现成"这个测试挂了"
+  // 而不是"命令没认出来"。给真实现，不给桩。
+  _stripHarmlessRedirects: load("_stripHarmlessRedirects", {}),
+  _TAURI_BUILD_RE: new Function(`${/const _TAURI_BUILD_RE = [^\n]+/.exec(SRC)[0]}\n;return _TAURI_BUILD_RE;`)(),
+  _PACKAGE_CMD_RE: new Function(`${/const _PACKAGE_CMD_RE = [^\n]+/.exec(SRC)[0]}\n;return _PACKAGE_CMD_RE;`)(),
   // 完整能力名录（真的那份，不是桩）：_buildToolHint 把它拼进随 system 前缀发送的提示。
   toolCapabilityIndex,
   // 重试间隔：真实值是 2000ms（源码里那条断言钉着），这里给 0 是为了不让每个抠出
@@ -17133,8 +17141,14 @@ test("验证器不可用（退出 127）不能被当成验证失败", () => {
   // 收尾又弹验证器红卡"就是这个漏洞造成的。
   assert.match(SRC, /const _docOnlyMutation = \/\\\.\(md\|markdown\|rst\|adoc\)\$\/i\.test\(mutationPath\)/,
     "必须识别纯文档改动");
-  assert.match(SRC, /if \(!_docOnlyMutation\) \{[\s\S]{0,220}?_implOps\+\+;/,
-    "只有非文档改动才重新武装收尾门禁（_implOps 记账）；强制 verificationPassed=false 已随验证门拆除");
+  // 自增点已经移到工具 settle 那一刻（记账循环在**执行之后**才跑，戳出来的版本号
+  // 永远比同批里的验证命令晚一拍，红构建门因此看不见同批的失败）。文档豁免照旧。
+  assert.match(SRC, /const _docOnly = \/\\\.\(md\|markdown\|rst\|adoc\)\$\/i\.test\(_mutPath\)/,
+    "settle 侧也要认纯文档改动");
+  assert.match(SRC, /if \(!_docOnly\) \{[\s\S]{0,120}?_implOps\+\+;/,
+    "只有非文档改动才重新武装收尾门禁（_implOps 记账）");
+  assert.match(SRC, /if \(!_docOnlyMutation && !it\._implCounted\) \{/,
+    "记账循环不能再自增一次，否则同一次改动被算两遍");
 });
 
 test("验证命令先做存在性探测，缺失步骤被剔除而不是跑到 127", async () => {
@@ -21109,8 +21123,10 @@ test("verification credit expires when files change under it", () => {
     "only evidence stamped for the exact current edit version may certify");
 
   // both mutation handlers expire it, matching their sibling resets
-  assert.equal((loop.match(/_verifiedAtImplOps = -1;/g) || []).length, 2,
-    "both the file-mutation and worker-mutation handlers must expire verification credit");
+  // 三处：settle 时的文件改动、记账循环里的文件改动（旧数据/未在 settle 记账的路径）、
+  // 以及 worker 改动。少一处都会让过期的验证学分活下来。
+  assert.equal((loop.match(/_verifiedAtImplOps = -1;/g) || []).length, 3,
+    "settle、记账循环、worker 三个改动出口都必须让验证学分过期");
   assert.ok((loop.match(/verificationPassed = false;/g) || []).length >= 2,
     "…and clear the boolean alongside it");
 
@@ -22040,14 +22056,20 @@ test("the agent loop keeps fixing a red build, bounded, then finishes honestly",
   const loop = extractFn("_runAgenticLoop");
   // The build-failure signal drives a nudge + continue (keep fixing), like _diagnosticBlock.
   assert.match(loop, /const _buildFail = _freshBuildFailure\(run, _implOps\);/);
-  assert.match(loop, /if \(buildFixAttempts < 2\) \{[\s\S]{0,400}_pushNudge\("buildFix"[\s\S]{0,400}continue;/,
+  assert.match(loop, /if \(buildFixAttempts < 2\) \{[\s\S]{0,900}_pushNudge\("buildFix"[\s\S]{0,400}continue;/,
     "a fresh red build must feed stderr back and continue, not finish");
   // Bounded: past the budget it records an honest incomplete instead of thrashing.
   assert.match(loop, /run\._incompleteReason = "build_failing"/,
     "an unfixable build must converge to an honest incomplete");
-  // The nudge carries the real exit code and stderr — facts, not a keyword guess.
+  // The nudge carries the real exit code and BOTH streams — facts, not a keyword guess.
   assert.match(loop, /退出码 \$\{_buildFail\.exitCode\}/);
-  assert.match(loop, /_buildFail\.stderr \|\| _buildFail\.stdout/);
+  // 短路 || 是错的：pytest / vitest / go test / cargo test / node --test 都把
+  // "哪条挂了、期望什么、实际什么" 写 stdout，stderr 里往往只有一条弃用警告——
+  // stderr 有一个字节就把 stdout 整段丢掉，模型收到的"真实报错"于是是句无关的警告。
+  assert.doesNotMatch(loop, /_buildFail\.stderr \|\| _buildFail\.stdout/,
+    "又退回二选一了");
+  assert.match(loop, /String\(_buildFail\.stdout \|\| ""\)[\s\S]{0,160}String\(_buildFail\.stderr \|\| ""\)/,
+    "两路都要喂给模型");
 });
 
 // ---------------------------------------------------------------------------
@@ -25264,4 +25286,125 @@ test("插话丢掉过时工具批次前，先把已经落盘的写入收账", ()
   assert.match(block, /_settleEagerWritesForBreak\(run\)/,
     "流完即写在流式阶段就真落盘了，直接 continue 等于磁盘变了而账本里一个字没有");
   assert.match(block, /_mutatedFiles\.add/, "改动文件数也要补上，否则收尾会说「我没有改动文件」");
+});
+
+// ── 智能体质量：忘事 / 不会测 / 虚报完成 / 跑得慢 ────────────────────────────
+test("折叠自己早先的回复要保留结尾——结论写在那儿，而且没有工具能取回", () => {
+  const fold = load("_foldAssistantText", {});
+  const body = "开场白。".repeat(300) + "因此决定采用方案 B，理由是它不需要改数据库。";
+  const out = fold(body, 400);
+  assert.ok(out.length <= 400);
+  assert.ok(out.includes("因此决定采用方案 B"), "结论被盲切前缀砍掉了——它会把定过的方案重新推导一遍");
+  assert.ok(out.startsWith("开场白"), "开头也要留一点，否则模型认不出这是哪一段");
+  assert.doesNotMatch(out, /重取|重新调用/, "assistant 正文没有任何工具能取回，别叫它去重取");
+  assert.equal(fold("短的", 400), "短的", "预算内原样返回");
+
+  // Tier 3 必须走这个出口，且产物要短于它自己的触发线（600）否则会反复折叠
+  const at = SRC.indexOf('m.role === "assistant" && !m.tool_calls');
+  assert.ok(at > 0);
+  const block = stripJsComments(SRC.slice(at, at + 900));
+  assert.match(block, /_foldAssistantText\(String\(m\.content\), 400\)/, "又退回盲切前缀了");
+  assert.ok(fold("字".repeat(5000), 400).length < 600, "产物必须短于触发线，否则下一轮再折一次");
+});
+
+test("草稿纸按预算收发现，且折叠发生的那一轮必须补一张", () => {
+  const at = SRC.indexOf("if (_pad.findings.length) {");
+  assert.ok(at > 0, "找不到关键发现的渲染处");
+  const block = stripJsComments(SRC.slice(at, at + 700));
+  assert.doesNotMatch(block, /findings\.slice\(-5\)/, "又退回固定 5 条了");
+  assert.match(block, /8000/, "预算不能收得比旧写法最坏情况（5×1200=6000）还紧，那是倒退");
+  assert.match(block, /因篇幅未列出/, "丢掉的条数要说出来，静默截断读起来像「就这么多」");
+
+  // 折叠信号必须真的被读——它写完之后一直没有读者
+  assert.match(SRC, /\|\| run\._compactedThisTurn\) \{/,
+    "折叠可以在第 3 轮发生而草稿纸要等到第 6 轮，中间几轮是「已折叠、没草稿纸」");
+  assert.ok(SRC.indexOf("run._compactedThisTurn = doCompact") > 0, "信号本身还得写");
+});
+
+test("红测试要把 stdout 和 stderr 都喂回去，失败明细不能被对折掉", () => {
+  // 测试失败的主标记必须算错误行，否则长输出对折时明细正好落在省略区间里
+  const hasErr = load("_hasErrorLine", {});
+  for (const line of [
+    "FAIL src/foo.test.ts", "--- FAIL: TestParse", "not ok 1 - parses input",
+    "✕ renders the header", "E   assert 1 == 2", "Expected: 3", "Received: 4",
+    "AssertionError [ERR_ASSERTION]",
+  ]) {
+    assert.ok(hasErr(line), `测试失败标记没被认成错误行：${line}`);
+  }
+  assert.ok(!hasErr("Successfully compiled 12 files"), "普通成功行不该被当成错误");
+
+  // 对折时这些行要被豁免捞回
+  const clip = load("_clipPreservingErrors", {
+    _hasErrorLine: hasErr,
+    _headTailModelText: load("_headTailModelText", {}),
+  });
+  const noisy = ["ok 1 - a", "ok 2 - b"].concat(Array.from({ length: 400 }, (_, i) => `ok ${i + 3} - noise ${i}`));
+  noisy.splice(200, 0, "not ok 201 - the one that broke", "  Expected: 3", "  Received: 4");
+  const out = clip(noisy.join("\n"), 1200);
+  assert.ok(out.includes("not ok 201 - the one that broke"), "挂掉的那条被对折掉了，模型只能凭猜去改");
+});
+
+test("Maven / Gradle / .NET 这些项目也要认得出怎么跑测试", () => {
+  const extract = load("_extractStackHints", {});
+  const maven = extract({ "pom.xml": "<project><artifactId>x</artifactId></project>" });
+  assert.equal(maven.lang, "Java");
+  assert.equal(maven.testCmd, "mvn -q test");
+  const gradle = extract({ "build.gradle.kts": "plugins { kotlin(\"jvm\") }" });
+  assert.equal(gradle.testCmd, "./gradlew test");
+  assert.equal(gradle.lang, "Kotlin");
+  // 这些命令验证器白名单本来就认得——能认，以前却从来发现不了
+  const recognized = load("_isRecognizedVerifierCommand", {
+    _normalizedVerifierCommand: load("_normalizedVerifierCommand", {}),
+    _looksLikeVerificationCommand: load("_looksLikeVerificationCommand", {}),
+    _verificationCommandsForStack: () => [],
+  });
+  assert.ok(recognized("mvn -q test"));
+  assert.ok(recognized("./gradlew test"));
+  const keyAt = SRC.indexOf("const keyFiles = [");
+  assert.ok(keyAt > 0);
+  const keyLine = SRC.slice(keyAt, SRC.indexOf("];", keyAt));
+  assert.match(keyLine, /"pom\.xml"/, "关键文件清单里还是没有这些构建描述文件");
+  assert.match(keyLine, /"build\.gradle\.kts"/);
+});
+
+test("打包命令也算验证——打包失败必须被红构建门看见", () => {
+  const recognized = load("_isRecognizedVerifierCommand", {
+    _normalizedVerifierCommand: load("_normalizedVerifierCommand", {}),
+    _looksLikeVerificationCommand: load("_looksLikeVerificationCommand", {}),
+    _verificationCommandsForStack: () => [],
+  });
+  for (const cmd of [
+    "npm run tauri build", "cargo tauri build", "npm run package", "electron-builder",
+    "pyinstaller main.py", "mvn package", "dotnet publish", "docker build .",
+  ]) {
+    assert.ok(recognized(cmd), `打包命令没被当成验证：${cmd}——它失败了红构建门就看不见`);
+  }
+  // 两张表必须共用同一份正则，不能各写各的
+  assert.match(SRC, /const _TAURI_BUILD_RE = /);
+  assert.match(SRC, /const _PACKAGE_CMD_RE = /);
+  assert.match(SRC, /const tauriBuildCommand = _TAURI_BUILD_RE\.test\(segment\)/,
+    "_runtimeCommandKinds 又自己抄了一份");
+});
+
+test("实现版本在工具落定那一刻盖章，不能等到执行之后", () => {
+  const settleAt = SRC.indexOf("run._fsMutTick = (run._fsMutTick || 0) + 1;");
+  const stampAt = SRC.indexOf("implementationVersion: _implOps");
+  assert.ok(settleAt > 0 && stampAt > settleAt, "找不到 settle 段");
+  const between = stripJsComments(SRC.slice(settleAt, stampAt));
+  assert.match(between, /_implOps\+\+;/,
+    "自增还在执行之后的记账循环里：同一批「先改文件再跑验证」戳出来的版本号永远差一拍，"
+    + "红构建门因此看不见同批那条失败的验证命令");
+  assert.match(between, /it\._implCounted = true/, "得给记账循环留个标记，否则同一次改动算两遍");
+});
+
+test("每轮重扫整个项目要按工作区变更缓存，别每步都愣一下", () => {
+  const at = SRC.indexOf("const _fsTickNow = run._fsMutTick || 0;");
+  assert.ok(at > 0, "运行状态块没有加缓存");
+  const block = stripJsComments(SRC.slice(at - 200, at + 400));
+  assert.match(block, /run\._rtStateTick !== _fsTickNow/, "缓存键必须是工作区变更 tick");
+  assert.doesNotMatch(
+    stripJsComments(SRC.slice(at, at + 600)).replace(/if \(run\._rtStateTick[\s\S]*?\n      \}/, ""),
+    /await _promiseOrFallbackWithin\(_agentRuntimeStateBlock/,
+    "缓存外面还留着一次无条件调用",
+  );
 });
