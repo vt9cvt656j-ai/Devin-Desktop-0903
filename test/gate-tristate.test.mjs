@@ -91,3 +91,45 @@ test("工具编排的闸门必须区分「裁决未到」和「裁决说不适�
   assert.doesNotMatch(gate, /\|\|\s*!run\.engineering\?\.applies\s*\|\|/,
     "旧的无条件否决又长回来了");
 });
+
+// ── 提醒的淘汰顺序 ───────────────────────────────────────────────────────
+//
+// 同轮最多挂 2 条提醒（这个上限本身是对的：并排挂五条，模型会逐条表态，输出又长又自我横跳）。
+// 但淘汰原来是"清最旧的那条"——而最旧和最不重要没有关系。一条 [BUILD_FAILED]、一条
+// "你改了从没读过的文件"、一条子智能体带回来的 3200 字结果，都可能被一条"建议先调研"挤掉。
+// 挤掉的是**事实**，留下的是建议：事实丢了模型就按错误图景继续干活，建议丢了只少一句提点。
+test("提醒按重要性淘汰，不是按先来后到", () => {
+  const factsSrc = /const _NUDGE_FACTS = new Set\(\[[\s\S]*?\]\);/.exec(SRC);
+  const rankSrc = /const _nudgeRank = \(cat\) => [^;]+;/.exec(SRC);
+  assert.ok(factsSrc && rankSrc, "分级表或 _nudgeRank 被改名/挪走了——淘汰会退回按先来后到");
+  const rank = new Function(`${factsSrc[0]}\n${rankSrc[0]}\nreturn _nudgeRank;`)();
+
+  assert.equal(rank("steer"), 0, "用户实时插话必须永远最高优先级");
+  for (const fact of ["buildFix", "diag", "blindEdit", "subagentResult", "toolRepair", "recovery"]) {
+    assert.equal(rank(fact), 1, `${fact} 是事实类，丢了模型会按错误图景干活`);
+  }
+  for (const advice of ["researchFirst", "planNudge", "midSummary", "stuck", "askBudget"]) {
+    assert.equal(rank(advice), 2, `${advice} 是建议类，可以被事实挤掉`);
+  }
+  assert.equal(rank("someBrandNewNudge"), 2,
+    "没登记的新提醒必须默认按建议类——要保命就得显式登记，不能靠默认捡到便宜");
+
+  // 拿**源码里真实的那段淘汰循环**跑，不照抄一份：照抄的话我改了源码它照样绿。
+  const loopSrc = /while \(_nudgeReg\.size >= 2\) \{[\s\S]*?\n    \}/.exec(SRC);
+  assert.ok(loopSrc, "淘汰循环的形状变了，这条断言失去落点");
+  assert.match(loopSrc[0], /_nudgeRank\(key\) > _nudgeRank\(worst\)/,
+    "淘汰没有按 _nudgeRank 挑——又回到了按先来后到");
+
+  const evict = new Function("_nudgeReg", "messages", "cat", "_nudgeRank", `${loopSrc[0]}\nreturn [..._nudgeReg.keys()];`);
+  // 先进来一条事实、再一条建议，然后第三条要挤掉一个：该走的是建议，不是先来的那条事实。
+  const reg = new Map([["buildFix", { c: "fact" }], ["researchFirst", { c: "advice" }]]);
+  const msgs = [reg.get("buildFix"), reg.get("researchFirst")];
+  const left = evict(reg, msgs, "diag", rank);
+  assert.deepEqual(left, ["buildFix"], "被挤掉的应当是建议类，事实类要留下");
+  assert.equal(msgs.length, 1, "被淘汰的那条也要从消息列表里摘掉，不能只从注册表删");
+
+  // steer 永远不被挤。
+  const reg2 = new Map([["steer", { c: "steer" }], ["researchFirst", { c: "advice" }]]);
+  const msgs2 = [reg2.get("steer"), reg2.get("researchFirst")];
+  assert.deepEqual(evict(reg2, msgs2, "diag", rank), ["steer"], "用户实时插话被挤掉了");
+});
