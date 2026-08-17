@@ -60,7 +60,7 @@
     {
       "name": "performance_profile",
       "group": "Data",
-      "desktopOnly": false
+      "desktopOnly": true
     },
     {
       "name": "openapi_parser",
@@ -145,7 +145,7 @@
     {
       "name": "worktree",
       "group": "Terminal & system",
-      "desktopOnly": false
+      "desktopOnly": true
     },
     {
       "name": "recall_conversation",
@@ -210,32 +210,32 @@
     {
       "name": "gh_pr_create",
       "group": "Git & GitHub",
-      "desktopOnly": false
+      "desktopOnly": true
     },
     {
       "name": "gh_pr_view",
       "group": "Git & GitHub",
-      "desktopOnly": false
+      "desktopOnly": true
     },
     {
       "name": "gh_pr_checks",
       "group": "Git & GitHub",
-      "desktopOnly": false
+      "desktopOnly": true
     },
     {
       "name": "gh_actions_log",
       "group": "Git & GitHub",
-      "desktopOnly": false
+      "desktopOnly": true
     },
     {
       "name": "gh_pr_review_comments",
       "group": "Git & GitHub",
-      "desktopOnly": false
+      "desktopOnly": true
     },
     {
       "name": "gh_pr_reply",
       "group": "Git & GitHub",
-      "desktopOnly": false
+      "desktopOnly": true
     },
     {
       "name": "read_terminal",
@@ -285,17 +285,17 @@
     {
       "name": "probe_env",
       "group": "Knowledge",
-      "desktopOnly": false
+      "desktopOnly": true
     },
     {
       "name": "ui_extract",
       "group": "Knowledge",
-      "desktopOnly": false
+      "desktopOnly": true
     },
     {
       "name": "view_image",
       "group": "Knowledge",
-      "desktopOnly": false
+      "desktopOnly": true
     },
     {
       "name": "screenshot",
@@ -305,7 +305,7 @@
     {
       "name": "visual_compare",
       "group": "Design & media",
-      "desktopOnly": false
+      "desktopOnly": true
     },
     {
       "name": "debate",
@@ -425,12 +425,12 @@
     {
       "name": "tor_request",
       "group": "Web & browser",
-      "desktopOnly": false
+      "desktopOnly": true
     },
     {
       "name": "package_search",
       "group": "Research",
-      "desktopOnly": false
+      "desktopOnly": true
     },
     {
       "name": "package_source",
@@ -440,117 +440,117 @@
     {
       "name": "github_search",
       "group": "Research",
-      "desktopOnly": false
+      "desktopOnly": true
     },
     {
       "name": "github_repo",
       "group": "Research",
-      "desktopOnly": false
+      "desktopOnly": true
     },
     {
       "name": "gitlab_repo",
       "group": "Git & GitHub",
-      "desktopOnly": false
+      "desktopOnly": true
     },
     {
       "name": "gitee_repo",
       "group": "Git & GitHub",
-      "desktopOnly": false
+      "desktopOnly": true
     },
     {
       "name": "codeberg_repo",
       "group": "Git & GitHub",
-      "desktopOnly": false
+      "desktopOnly": true
     },
     {
       "name": "cve_search",
       "group": "Research",
-      "desktopOnly": false
+      "desktopOnly": true
     },
     {
       "name": "wiki_search",
       "group": "Research",
-      "desktopOnly": false
+      "desktopOnly": true
     },
     {
       "name": "stackoverflow_search",
       "group": "Research",
-      "desktopOnly": false
+      "desktopOnly": true
     },
     {
       "name": "hackernews_search",
       "group": "Research",
-      "desktopOnly": false
+      "desktopOnly": true
     },
     {
       "name": "developer_community_search",
       "group": "Research",
-      "desktopOnly": false
+      "desktopOnly": true
     },
     {
       "name": "pubmed_search",
       "group": "Research",
-      "desktopOnly": false
+      "desktopOnly": true
     },
     {
       "name": "arxiv_search",
       "group": "Research",
-      "desktopOnly": false
+      "desktopOnly": true
     },
     {
       "name": "crossref_search",
       "group": "Research",
-      "desktopOnly": false
+      "desktopOnly": true
     },
     {
       "name": "openalex_search",
       "group": "Research",
-      "desktopOnly": false
+      "desktopOnly": true
     },
     {
       "name": "pubchem_search",
       "group": "Research",
-      "desktopOnly": false
+      "desktopOnly": true
     },
     {
       "name": "clinical_trials_search",
       "group": "Research",
-      "desktopOnly": false
+      "desktopOnly": true
     },
     {
       "name": "mdn_search",
       "group": "Research",
-      "desktopOnly": false
+      "desktopOnly": true
     },
     {
       "name": "bundlephobia_search",
       "group": "Research",
-      "desktopOnly": false
+      "desktopOnly": true
     },
     {
       "name": "steam_search",
       "group": "Research",
-      "desktopOnly": false
+      "desktopOnly": true
     },
     {
       "name": "iconify_search",
       "group": "Design & media",
-      "desktopOnly": false
+      "desktopOnly": true
     },
     {
       "name": "codrops_search",
       "group": "Research",
-      "desktopOnly": false
+      "desktopOnly": true
     },
     {
       "name": "smashingmag_search",
       "group": "Research",
-      "desktopOnly": false
+      "desktopOnly": true
     },
     {
       "name": "awwwards_search",
       "group": "Research",
-      "desktopOnly": false
+      "desktopOnly": true
     },
     {
       "name": "download_file",
@@ -605,7 +605,7 @@
     {
       "name": "generate_image",
       "group": "Design & media",
-      "desktopOnly": false
+      "desktopOnly": true
     },
     {
       "name": "game_scaffold",
@@ -675,7 +675,7 @@
     {
       "name": "db_query",
       "group": "Data",
-      "desktopOnly": false
+      "desktopOnly": true
     },
     {
       "name": "figma",
@@ -705,7 +705,7 @@
     {
       "name": "visual_explain",
       "group": "Code intelligence",
-      "desktopOnly": false
+      "desktopOnly": true
     }
   ]
 }

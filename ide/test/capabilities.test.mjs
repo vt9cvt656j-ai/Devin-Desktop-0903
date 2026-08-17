@@ -98,10 +98,11 @@ test("放 token 的 ${VAR} 取自环境变量，且不做 URL 编码", () => {
   }).tools;
   const call = buildHttpCall(t, {}, { TOKEN: "abc/def+ghi=" });
   assert.equal(call.headers.Authorization, "Bearer abc/def+ghi=", "密钥被编码就用不了了");
-  // 环境里没有这个变量时给空串，而不是把 `${TOKEN}` 原样发出去——那会把密钥占位符
-  // 当成真密钥发给对端。
-  const missing = buildHttpCall(t, {}, {});
-  assert.equal(missing.headers.Authorization, "Bearer ");
+  // 取不到这个变量时**不发请求**，而不是替换成空串照发。也绝不能把 `${TOKEN}` 原样
+  // 发出去（那等于把占位符当密钥交给对端）。
+  assert.throws(() => buildHttpCall(t, {}, {}), /未定义的环境变量/);
+  assert.throws(() => buildHttpCall(t, {}, { TOKEN: "" }), /未定义的环境变量/,
+    "空字符串和没设一样，都不该被当成真密钥发出去");
 });
 
 test("body 里的参数按 JSON 转义，不能把 JSON 撑破", () => {
@@ -124,7 +125,8 @@ test("插值之后如果 URL 不再是 http/https，拒绝发出去", () => {
   }).tools;
   assert.ok(t, "url 以 ${VAR} 开头是合法写法，不该在声明期就被拒");
   assert.throws(() => buildHttpCall(t, {}, { BASE: "file:///etc" }), /不再是 http/);
-  assert.throws(() => buildHttpCall(t, {}, {}), /不再是 http/);
+  // BASE 没设时先撞未定义变量那道门——同样是拒发，只是把原因说得更准。
+  assert.throws(() => buildHttpCall(t, {}, {}), /未定义的环境变量/);
 });
 
 test("斜杠命令：/ 可写可不写，缺 prompt 的被拒", () => {

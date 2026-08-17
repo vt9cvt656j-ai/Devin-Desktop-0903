@@ -290,6 +290,9 @@ AUTO_LOAD_DEPS = {
   // 都调它，抠出任何一个的测试都需要——少了是 ReferenceError，表现成"这个测试挂了"
   // 而不是"命令没认出来"。给真实现，不给桩。
   _stripHarmlessRedirects: load("_stripHarmlessRedirects", {}),
+  // computer 的合法动作表：schema enum、映射白名单、报错文案三处以前各抄一份，
+  // 漏了 mouse.position。现在是同一份常量，抠映射层的测试要跟着注进来。
+  _COMPUTER_METHODS: new Function(`${/const _COMPUTER_METHODS = \[[\s\S]*?\];/.exec(SRC)[0]}\n;return _COMPUTER_METHODS;`)(),
   // 容器自愈：_coerceSchemaTypes 现在会调它（headers 被塞成 JSON 字符串 / 键值对数组
   // 这类包装错误，以前一律拒绝执行）。抠 _coerceSchemaTypes 的测试不止一处，少了它是
   // ReferenceError，表现成"这个测试挂了"而不是"参数没被扶正"。
@@ -25461,4 +25464,112 @@ test("工具参数：包装错了的容器要静默扶正，别拿它去折磨�
   assert.match(bad.issue, /必须是对象/, "有一项对不上就该整体放弃，不能悄悄把它丢掉");
   const notJson = fixed({ url: "http://x", headers: "Accept: application/json" });
   assert.match(notJson.issue, /必须是对象/, "不是 JSON 的字符串也被当成对象了");
+});
+
+// ── 工具链路接通：越权 / 跑不了 / 结果失真 ───────────────────────────────────
+test("对外发东西的工具也要走审批，不能只有 git 会问", async () => {
+  const { approvalTypes } = await import("../src/agent/tool-policy.js");
+  const req = load("_requiresApproval", {
+    _GIT_MUTATING_OPS: new Set(["clone", "commit", "push", "pull", "stash", "stash_pop"]),
+    _APPROVE_TYPES: approvalTypes(),
+    _toolMayProduceExternalEffect: load("_toolMayProduceExternalEffect", {
+      _mcpMutationHint: () => false, _sqlMayMutate: () => false,
+      _dbCallMayMutate: () => false, _commandProducesExternalEffect: () => false,
+    }),
+  });
+  // 在别人仓库上开 PR / 用你的账号发评论 —— 以前一次都不问
+  assert.equal(req({ type: "gh", op: "pr_create" }), true);
+  assert.equal(req({ type: "gh", op: "pr_reply" }), true);
+  assert.equal(req({ type: "gh", op: "pr_view" }), false, "只读的 gh 不该打扰用户");
+  // 同一个 URL，内建 http 发 DELETE 直接就发，而用户自己接的 userhttp 每次都问
+  assert.equal(req({ type: "http", method: "DELETE", url: "https://x/1" }), true);
+  assert.equal(req({ type: "http", method: "GET", url: "https://x/1" }), false);
+  assert.equal(req({ type: "tor", url: "http://x.onion" }), true, "Tor 绕开常规网络出口，无条件问");
+  // 建目录 + 顶掉当前工作区、改系统代理，两条以前都没有声明
+  assert.equal(req({ type: "createproject", name: "x" }), true);
+  assert.equal(req({ type: "capture_start", systemProxy: true }), true);
+});
+
+test("只读模式里也不许建目录顶掉用户的工作区", async () => {
+  const { blockedInReadOnlyMode } = await import("../src/agent/tool-policy.js");
+  assert.equal(blockedInReadOnlyMode("createproject", { type: "createproject" }), true,
+    "Plan/Explorer/Reviewer 标着「只读」，却能在磁盘上建目录并把文件树整个切过去");
+  // 拦截文案不能再把它说成「修改文件」
+  const at = SRC.indexOf('const what = call.type === "cmd" || call.type === "termtask" ? "运行命令"');
+  const block = SRC.slice(at, at + 500);
+  assert.match(block, /createproject.*新建项目目录/s);
+  assert.match(block, /userhttp.*调用你接入的能力/s, "用户接的 HTTP 接口被说成「修改文件」");
+});
+
+test("computer 的合法动作只有一份，schema / 映射 / 报错文案不再各抄一遍", () => {
+  const methods = new Function(`${/const _COMPUTER_METHODS = \[[\s\S]*?\];/.exec(SRC)[0]}\n;return _COMPUTER_METHODS;`)();
+  assert.ok(methods.includes("mouse.position"), "schema enum 里有、白名单里没有——模型照 schema 调就撞「不支持的动作」");
+  // schema 的 enum 必须和它逐字一致
+  const at = SRC.indexOf('name: "computer"');
+  const seg = SRC.slice(at, at + 1600);
+  const enumNames = [...seg.matchAll(/"([a-z]+\.[a-z_]+)"/g)].map((m) => m[1]);
+  assert.deepEqual(enumNames, methods, "schema enum 和白名单又分叉了");
+  // 报错文案要拼这份常量，不许再手抄
+  assert.match(SRC, /可用的是：\$\{_COMPUTER_METHODS\.join\(" \/ "\)\}/);
+});
+
+test("网页版不提供跑不了的工具", () => {
+  const at = SRC.indexOf("const desktopOnly = new Set([");
+  const block = SRC.slice(at, SRC.indexOf("])", at));
+  // 执行器里以 !inTauri 开头硬返回「[不可用]」的那些类型，对应的工具名都得在名单里
+  for (const name of ["arxiv_search", "db_query", "gh_pr_view", "worktree", "tor_request",
+                      "ui_extract", "package_search", "visual_compare", "probe_env"]) {
+    assert.ok(block.includes(`"${name}"`), `${name} 在网页版里必然报「只能在桌面 App 里用」，却照样把 schema 发给模型`);
+  }
+});
+
+test("命令输出也要带〔外部数据〕标记——它是最容易被投毒的一条", () => {
+  const src = stripJsComments(extractFn("_toolResultToStringRaw"));
+  const tagAt = src.indexOf("const tag = ");
+  const evidenceAt = src.indexOf("_executionToolResultForModel");
+  assert.ok(tagAt > 0 && evidenceAt > tagAt,
+    "早退发生在算 tag 之前，而 cmd/termtask/termread 正是外部数据名单的头三项");
+  assert.match(src, /return tag \? `\$\{tag\}\\n\$\{executionEvidence\}` : executionEvidence/,
+    "标记必须拼在**开头**：裁剪剪的是尾部");
+});
+
+test("db_query 截断要留记号，read_logs 别被腰斩", () => {
+  const src = stripJsComments(extractFn("_dbResultToText"));
+  assert.doesNotMatch(src, /\.slice\(0, 6000\)/, "又变回裸 slice 了——模型会把半份结果当成全部");
+  assert.match(src, /_clip\(s, 6000, "查询结果"\)/);
+  assert.ok(src.indexOf("另有") < src.indexOf("${body}"),
+    "「还有 N 行未列出」挂在末尾就是被砍掉的第一样东西，要挪到抬头");
+  // read_logs 的后端硬顶 30000，模型这边不能只按 8000 收
+  assert.match(SRC, /_rt === "diag" \|\| _rt === "logs" \? 30000/);
+});
+
+test("批量浏览器操作中断了就要报失败", () => {
+  const at = SRC.indexOf('if (act === "batch") {\n        if (call._batchBroken)');
+  assert.ok(at > 0, "找不到 batch 结果拼装处");
+  const block = SRC.slice(at, at + 700);
+  assert.match(block, /call\._batchBroken/, "第 2 步点空、后面全没跑，模型却收到一条看起来正常的结果");
+  assert.match(block, /\[失败\] 批量自动化中断/);
+  assert.match(SRC, /content, ok: !call\._batchBroken \}/, "ok:false 比文案匹配硬");
+  // 不认识的 op 不能只记一句「跳过」就继续
+  const loopAt = SRC.indexOf("本路径不支持 op");
+  assert.ok(loopAt > 0, "check/select 这些合法 op 被静默跳过，工具还报成功");
+  assert.match(SRC.slice(loopAt, loopAt + 260), /_batchBroken = true; break; \}/,
+    "置位之后必须跳出重试循环，否则这一步还会被重试一遍再往下走");
+  assert.doesNotMatch(SRC, /blog\.push\(`\$\{i \+ 1\}\. 跳过未知 op/, "又变回静默跳过了");
+});
+
+test("子智能体能用你接进来的只读能力，就像它能用只读 MCP 一样", () => {
+  const src = stripJsComments(SRC);
+  assert.match(src, /for \(const t of \["userfolder", "userhttp"\]\) if \(!_execTypes\.includes\(t\)\) _execTypes\.push\(t\)/,
+    "类型不在表里，派发照样 [BLOCKED]——等于给了一把打不开门的钥匙");
+  assert.match(src, /const _userWriteBlocked = !!call && call\.type === "userhttp" && !call\.userReadOnly/,
+    "放行之后必须逐次把关，判据用声明里的 readOnly，与 MCP 的 readOnlyHint 同源");
+  assert.match(src, /_mcpWriteBlocked \|\| _userWriteBlocked/, "门禁没把它算进去");
+});
+
+test("关掉的 MCP 工具不该还在开局窗口里", () => {
+  const src = stripJsComments(extractFn("_selectInitialTools"));
+  assert.match(src, /const allowedMcp = all\.filter/,
+    "补录拿的是原始 mcpTools，绕过了 disabled 过滤——内置工具关了是真关，MCP 关了还在");
+  assert.doesNotMatch(src, /_mcpServersForInitialWindow\(mcpTools\)/);
 });

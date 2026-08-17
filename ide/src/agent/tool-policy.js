@@ -153,6 +153,14 @@ function seed() {
   defineTool("automation", { needsApproval: true });
   defineTool("db", { needsApproval: true });
   defineTool("download", { mutatesWorkspace: true, needsApproval: true });
+  // create_project 一直没有声明：它会在用户主目录下真的建出 ~/MrDayOne/<name>，
+  // 并把左侧文件树整个切到那个新目录——只读模式里也能干，"改动前审批"也不弹。
+  // 用户原来打开的项目就这么被顶掉，而模式标签一直写着「只读」。
+  defineTool("createproject", { mutatesWorkspace: true, needsApproval: true, readOnlyModeBlocked: true });
+  // capture_start：mode='system' / system_proxy=true 会改掉**操作系统级**代理设置，
+  // 整台机器的流量（浏览器、邮件、其他 App）一起被切到本地 mitmproxy 上，接着还要
+  // 用户 sudo 装一张根证书。这不该是一句「我顺手开了抓包」就发生的事。
+  defineTool("capture_start", { needsApproval: true });
 
   // ── generators that land assets in the workspace ──────────────────────────
   for (const t of [
