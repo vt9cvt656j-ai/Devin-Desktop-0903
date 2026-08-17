@@ -9179,7 +9179,20 @@ const _profiledRoots = new Set();
 async function _seedProjectProfile(root) {
   if (!root || !inTauri || _profiledRoots.has(root)) return;
   _profiledRoots.add(root);
-  try { if (_kgLoad(root).some((n) => /^项目环境:|^项目档案:/.test(n.content || ""))) return; } catch {}
+  // 旧写法是"存在即返回"，于是首次打开时抓到的那份依赖清单永不更新：venv 删了、
+  // 包换了，它还在每轮说"这些包已装好，别重复安装"。改成 7 天过期，并且重播前先把
+  // 旧笔记删掉——不删的话 _kgInsert 的近似去重会把新笔记直接吞掉，等于没刷新。
+  const _SEED_TTL = 7 * 86400000;
+  try {
+    const notes = _kgLoad(root);
+    const stale = notes.filter((n) => /^项目环境:|^项目档案:/.test(n.content || ""));
+    if (stale.some((n) => Date.now() - (n.created || 0) < _SEED_TTL)) return;
+    if (stale.length) {
+      const ids = new Set(stale.map((n) => n.id));
+      _kgSave(root, notes.filter((n) => !ids.has(n.id)));
+      _kgCacheDrop(root);
+    }
+  } catch {}
   const add = (c) => { try { if (c) _kgAddNote(root, c); } catch {} };
   const read = (rel) => backend.readTextFile(`${root}/${rel}`).catch(() => null);
   try {
@@ -9193,7 +9206,9 @@ async function _seedProjectProfile(root) {
         const r = await backend.taskRunCapture(root, `"${root}/${v}/bin/python" -m pip list --format=freeze 2>/dev/null | cut -d= -f1 | grep -viE '^(pip|setuptools|wheel)$' | head -25 | paste -sd, -`);
         if (r && r.code === 0) pkgs = String(r.stdout || "").trim();
       } catch {}
-      add(`项目环境: Python venv 在 ${v}/${ver ? `（Python ${ver}）` : ""}${pkgs ? `；已装依赖: ${pkgs}` : ""}。调试/运行/装包都用这个 venv，上面这些包已装好，别重复安装。`);
+      // 写成带日期的观测值而不是祈使句："别重复安装"是命令，模型会照办到清单过期
+      // 之后；"某天抓到的、可能已变动"才是这条笔记真正的认识论地位。
+      add(`项目环境: Python venv 在 ${v}/${ver ? `（Python ${ver}）` : ""}${pkgs ? `；${new Date().toISOString().slice(0, 10)} 抓到的已装依赖（可能不全或已变动，装包前用 pip show 核实）: ${pkgs}` : ""}。调试/运行/装包用这个 venv。`);
       break;
     }
     // --- Stack / entry ---
@@ -24683,9 +24698,13 @@ async function sendPrompt(text, attachments = [], readyConfig = null) {
     : (effectiveMode === "agent" ? `\n🎨 generate_image 暂不可用（未配生图模型），需要配图时用 picsum.photos 等占位服务。` : "");
   // 会话需求账本块：历次真实要求整本怼在眼前（≤40 条、每条 ≤240 字）。只进当轮
   // 动态前导（历史存 lean text），不会打碎历史前缀缓存。
+  // 两处都在治同一个病：这本账本原来自称"全部仍然有效"，于是已经做完的、已经被
+  // 推翻的、以及只是提问或抱怨的历史消息，每一轮都作为待办重新压给模型。
+  // slice(0, -1) 也是错的——push 在 24767，比这里晚，账本里本来就不含当轮消息，
+  // 砍掉的是上一轮，也就是用户刚做出的那次纠正。
   const _demandLedgerBlock = (effectiveMode === "agent"
-    && Array.isArray(sess._demandLedger) && sess._demandLedger.length > 1)
-    ? `--- 本会话需求账本（用户历次真实要求；除非被后来的要求明确撤销/覆盖，全部仍然有效——别失忆）---\n${sess._demandLedger.slice(0, -1).map((d, i) => `${i + 1}. ${d}`).join("\n")}\n（最新一条要求在下方 📌 处；旧要求与最新冲突时以最新为准。）\n\n`
+    && Array.isArray(sess._demandLedger) && sess._demandLedger.length)
+    ? `--- 本会话历次用户消息（按时间先后，仅供回忆上下文，不是待办清单）---\n${sess._demandLedger.map((d, i) => `${i + 1}. ${d}`).join("\n")}\n（本轮真正要做的事只看下方 📌。上表里：越靠后的越新，后条对同一件事的说法直接作废前条；已完成、已撤销、以及只是提问或抱怨的，都不要再执行。）\n\n`
     : "";
   // 方案A：上轮思考结论块——只注结论摘要（总量 ≤400 字，最新一条永远在场），治"每轮
   // 从零重想"。只进当轮动态前导，不碰历史前缀缓存。
@@ -35312,14 +35331,21 @@ function _autoMemoryCapture(root, text) {
     const t = String(text || "").trim().replace(/\s+/g, " ");
     if (t.length < 6 || t.length > 300) return;
     if (/[?？]\s*$/.test(t)) return;
-    const globalSignal = /(?:以后|永远|每次|一律|所有项目|任何项目|从今往后|从现在开始|全部都|都要|都给我|记住|别再|不要再|不许再|下次)/.test(t);
+    // 「下次」不在这张表里：中文里它绝大多数是"这件事推迟"（"这个问题下次再看"），
+    // 不是"从此每次"。它却是唯一能把一句推迟语送进全局库的词——一旦进去，换到任何
+    // 别的项目、任何一轮都会带上，模型于是在不相干的仓库里主动提起它。
+    const globalSignal = /(?:以后|永远|每次|一律|所有项目|任何项目|从今往后|从现在开始|全部都|都要|都给我|记住|别再|不要再|不许再)/.test(t);
     const prefSignal = /(?:别用|不要用|不许|禁止|禁用|必须|要用|改用|统一|优先用|默认用|喜欢|讨厌|反感|风格|规范|习惯|标准是|一律)/.test(t);
     if (!globalSignal && !prefSignal) return;
     // 一次性任务指令（"帮我修/写/跑…"）没有全局词就不算持久偏好
     if (!globalSignal && /^(?:帮我|请你?|去|把|将|先)?(?:修|写|做|跑|运行|编译|打包|部署|看看|读|查|测试|启动)/.test(t)) return;
     const store = globalSignal ? "" : (root || "");
     const notes = _kgLoad(store);
-    const note = _kgInsert(notes, (globalSignal ? "[用户长期偏好] " : "[项目要求] ") + t);
+    // 不加 [项目要求]/[用户长期偏好] 前缀：项目还是全局已经由存储 key 和注入时的
+    // 表头表达了。前缀本身有三个害处——它让 _kgClassify 把普通句子误判成 preference
+    // 从而白拿常驻名额；它给每条笔记塞进 项目/目要/要求 三个共享 tag，于是所有条目
+    // 互相连边、召回一条就拖出一串；渲染出来还和模型自己归纳的条目长得一模一样。
+    const note = _kgInsert(notes, t);
     if (note) { _kgPrune(notes); _kgSave(store, notes); }
   } catch { /* memory capture must never break a send */ }
 }
@@ -35348,23 +35374,37 @@ function _memoryReflectionContext(root, text) {
   } catch { return "(无)"; }
 }
 
+// 模型在 run 收尾时归纳出来的记忆，和用户亲口说的，在注入时长得一模一样——用户
+// 会看到智能体三周后在一个不相干的项目里说"按你一贯的深色扁平风格"，而他从没说过
+// 这句话。更糟的是模型能拿 action:"correct" 把用户真说过的话标成"已作废"，而纠错
+// 账本优先级压过普通记忆，用户重申都推不翻。所以归纳出来的条目盖一个来源戳，
+// 并且只允许它改写同样是归纳来的条目。
+const _KG_INFERRED = "[据本轮归纳]";
 function _applyMemoryReflectionOutput(root, sourceText, items, conversationMemory = null) {
   const accepted = [];
   for (const item of Array.isArray(items) ? items.slice(0, 6) : []) {
     const action = item?.action === "correct" ? "correct" : item?.action === "add" ? "add" : "";
     const content = String(item?.content || "").trim().replace(/\s+/g, " ").slice(0, 120);
     if (!action || content.length < 5) continue;
+    const addInferred = (scopeRoot) => _kgAddNote(scopeRoot, `${_KG_INFERRED} ` + content);
     if (action === "add") {
       const isGlobal = item.scope === "global" || !root;
-      if (_kgAddNote(isGlobal ? "" : root, (isGlobal ? "[用户长期偏好] " : "[项目要求] ") + content)) {
-        accepted.push({ action, content });
-      }
+      if (addInferred(isGlobal ? "" : root)) accepted.push({ action, content });
       continue;
     }
     const match = /^([pg]):(.+)$/.exec(String(item?.old_id || "").trim());
     if (!match) continue;
     const memoryRoot = match[1] === "g" ? "" : (root || "");
     const old = _kgLoad(memoryRoot).find((note) => note.id === match[2]);
+    // 只有归纳来的条目能被归纳改写；而且得真在说同一件事——schema 里只有 correct
+    // 一种形状，模型想记一件新事时会随手抓一条无关旧笔记来顶（用户见过"包管理器
+    // 规则被圆角按钮取代"）。两道门都不过就降级成新增一条，让时间序去仲裁。
+    const oldTags = new Set(_kgTokens(old?.content || ""));
+    const overlap = _kgTokens(content).reduce((n, tok) => n + (oldTags.has(tok) ? 1 : 0), 0);
+    if (!old || !String(old.content || "").includes(_KG_INFERRED) || overlap < 2) {
+      if (addInferred(memoryRoot)) accepted.push({ action: "add", content });
+      continue;
+    }
     const correction = _kgSupersede(memoryRoot, match[2], content, sourceText);
     if (!correction) continue;
     accepted.push({ action, content });
@@ -35517,13 +35557,29 @@ function _kgSupersededIds(root) {
   return new Set(_kgCorrectionLoad(root).map((item) => String(item?.incorrectId || "")).filter(Boolean));
 }
 
-function _kgActiveCorrections(root, limit = 8) {
+function _kgActiveCorrections(root, limit = 8, query = "") {
   const corrections = _kgCorrectionLoad(root);
   const superseded = new Set(corrections.map((item) => String(item?.incorrectId || "")).filter(Boolean));
-  return corrections
+  const active = corrections
     .filter((item) => item?.id && item.corrected && (!item.correctedId || !superseded.has(String(item.correctedId))))
+    .sort((a, b) => Number(b.created || 0) - Number(a.created || 0));
+  const k = Math.max(1, Math.min(20, Number(limit) || 8));
+  // 账本原来完全不看当前问题，纯按时间全量塞。用户问包管理器的事，上下文顶部却挂着
+  // 一条讲按钮圆角的「已作废/当前有效」——它以"优先于普通记忆"的口吻在场，模型就会
+  // 去迁就它。按本轮问题过滤，最新 2 条无条件保底（刚纠正完不能被话题切换挤掉）。
+  if (!String(query || "").trim()) return active.slice(0, k);
+  const q = new Set(_kgTokens(query));
+  if (!q.size) return active.slice(0, k);
+  const pool = new Map();
+  for (const item of active.slice(0, 2)) pool.set(item.id, item);
+  for (const item of active) {
+    if (pool.size >= k) break;
+    const hay = new Set(_kgTokens(`${item.incorrect || ""} ${item.corrected || ""}`));
+    if ([...q].some((tok) => hay.has(tok))) pool.set(item.id, item);
+  }
+  return [...pool.values()]
     .sort((a, b) => Number(b.created || 0) - Number(a.created || 0))
-    .slice(0, Math.max(1, Math.min(20, Number(limit) || 8)));
+    .slice(0, k);
 }
 
 function _kgRecordCorrection(root, input = {}) {
@@ -35586,9 +35642,10 @@ function _kgSupersede(root, incorrectId, corrected, source = "") {
     const notes = _kgLoad(root);
     const old = notes.find((item) => item.id === String(incorrectId));
     if (!old) return null;
-    const prefix = /^\[(?:用户长期偏好|项目要求)\]/.exec(String(old.content || ""))?.[0]
-      || (root ? "[项目要求]" : "[用户长期偏好]");
-    const replacementContent = `${prefix} ${String(corrected || "").trim()}`;
+    // 沿用旧条自己的方括号前缀，没有就不加。写死那两个词会让"据本轮归纳"的来源戳
+    // 在被改写时丢掉——改一次，模型编的条目就洗成了和用户原话同形。
+    const prefix = /^\[[^\]\n]{1,16}\]/.exec(String(old.content || ""))?.[0] || "";
+    const replacementContent = `${prefix}${prefix ? " " : ""}${String(corrected || "").trim()}`;
     let replacement = _kgAddNoteRecord(root, replacementContent);
     if (replacement?.id === old.id) replacement = _kgAddNoteRecord(root, replacementContent, true);
     if (!replacement) return null;
@@ -35606,6 +35663,10 @@ function _kgSupersede(root, incorrectId, corrected, source = "") {
 function _applyExplicitMemoryCorrection(root, text) {
   const parsed = extractExplicitCorrection(text);
   if (!parsed?.explicitReplacement || parsed.incorrect.length < 2 || parsed.corrected.length < 2) return null;
+  // 覆盖持久记忆不该比新建持久记忆更宽松。"这个图标不是蓝色，是绿色"说的是当下这
+  // 一处，不是项目规矩——它由会话级纠错账本处理，随会话结束而消失。没有长期信号词
+  // 就返回 null，调用方会自然回落到 _autoMemoryCapture（那边同样过不了这道门）。
+  if (!/(?:以后|永远|每次|一律|所有项目|任何项目|从今往后|从现在开始|都要|记住|别再|不要再|不许再|统一|默认|规范|标准|风格)/.test(String(text || ""))) return null;
   const wanted = new Set(_kgTokens(parsed.incorrect));
   const candidates = [];
   for (const memoryRoot of [...new Set([root || "", ""])]) {
@@ -35727,12 +35788,21 @@ function _kgRetrieve(root, query, K = 6, MAX = 13) {
   const scored = notes.map((n) => [(n.tags || []).reduce((a, t) => a + (q.has(t) ? 1 : 0), 0), n]);
   scored.sort((a, b) => b[0] - a[0] || b[1].created - a[1].created);
   const picked = new Map();
+  // 真按相关性命中的那批。渲染侧要把它和下面几种"无条件塞进来的"分开标注——
+  // 混在一个标题下面写着"按本次任务相关性"，模型就会把一条毫不相干的旧笔记
+  // 当成本轮线索去顺，用户看到的就是它突然提起一件早就不说了的事。
+  const relIds = new Set();
   for (const [s, n] of scored) {
     if (s <= 0 || picked.size >= K) break;
     picked.set(n.id, n);
+    relIds.add(n.id);
   }
-  for (const n of [...notes].sort((a, b) => b.created - a.created).slice(0, 3)) {
-    if (picked.size < K + 3) picked.set(n.id, n);
+  // 最近 3 条只在相关性一条都没命中时兜底（注释里写的本来就是这个用途）。
+  // 命中了还塞，等于每轮把最近聊过的闲话顶到最高注意力位置。
+  if (!picked.size) {
+    for (const n of [...notes].sort((a, b) => b.created - a.created).slice(0, 3)) {
+      if (picked.size < K + 3) picked.set(n.id, n);
+    }
   }
   // 偏好/规矩/坑 无条件保底：这三类是"每次干活都必须遵守"的长期约束——
   // "别用黄色"和"做个电影网站"的 query 毫无词面交集，按相关性检索永远捞不中，
@@ -35757,21 +35827,52 @@ function _kgRetrieve(root, query, K = 6, MAX = 13) {
     localStorage.setItem(_kgKey(root), JSON.stringify(allNotes));
     _kgCacheStore(root, allNotes); // uses 写回后同步缓存，否则热点路径每次都缓存失效
   } catch {}
-  return [...picked.values()];
+  // 数组属性，不进 JSON.stringify(allNotes) 的持久化，只给渲染侧分组用。
+  const out = [...picked.values()];
+  out.relevantIds = relIds;
+  return out;
 }
 function _kgRetrieveBlock(root, query, isGlobal) {
   let notes;
   try { notes = _kgRetrieve(root, query); } catch { return ""; }
-  const corrections = _kgActiveCorrections(root, 6);
+  const corrections = _kgActiveCorrections(root, 6, query);
   if ((!notes || !notes.length) && !corrections.length) return "";
-  const lines = notes.map((n) => `- [${n.type}] ${n.content}`);
+  // n.type 是正则首次命中猜出来的（"临时改用 debug 排查"因为含 bug 被判 pitfall），
+  // 猜错的代价只在进模型上下文时才存在——修剪权重和保底名额里猜错无害，所以只把
+  // 标签从渲染里摘掉。内容里模型/用户自己写的前缀是有出处的，原样保留。
+  const rel = [];
+  const carried = [];
+  const byNew = (a, b) => Number(b.created || 0) - Number(a.created || 0);
+  for (const n of [...notes].sort(byNew)) {
+    (notes.relevantIds?.has(n.id) ? rel : carried).push(`- ${n.content}`);
+  }
   const head = isGlobal
     ? `\n--- 全局记忆（跨所有项目·用户级：身份/偏好/通用经验，每个项目每次都自动带上）---\n`
-    : `\n--- 项目记忆（知识图谱·按本次任务相关性 + 关联召回；你之前用 remember 记的，跨会话保留，开工前先看）---\n`;
+    : `\n--- 项目记忆（你之前用 remember 记的，跨会话保留）---\n`;
+  // 去重形同虚设，同一件事常有三四条措辞不同的副本并存。按时间倒序 + 一句仲裁规则，
+  // 副本仍在但不再能靠数量压倒最新那条。
+  const order = `（按记录时间从新到旧；同一件事有多条措辞不同的记录时以最上面那条为准，下面的是旧版本。）\n`;
+  const carriedBlock = carried.length
+    ? `\n[常驻长期约束·非本轮检索结果，可能与本轮完全无关]\n只有确实适用于本轮任务时才遵守；不适用就直接忽略，不要为此扩大本轮改动，也不要在回答里复述。\n${carried.join("\n")}\n`
+    : "";
   const correctionBlock = corrections.length
     ? `\n[纠错账本·优先于普通记忆]\n${corrections.map((item) => `- 已作废「${item.incorrect}」；当前有效「${item.corrected}」`).join("\n")}\n`
     : "";
-  return head + correctionBlock + lines.join("\n").slice(0, 4000);
+  return head + order + correctionBlock + _kgClampLines(rel) + carriedBlock;
+}
+// 旧写法是 lines.join("\n").slice(0, 4000)：从中间把一条事实切成半句，且不留任何
+// 记号——模型读到的是一句残缺的断言，而不是"这里被截断了"。改成整行丢弃并说明。
+function _kgClampLines(lines, budget = 4000) {
+  const kept = [];
+  let used = 0;
+  let dropped = 0;
+  for (const line of lines) {
+    if (used + line.length + 1 > budget) { dropped++; continue; }
+    kept.push(line);
+    used += line.length + 1;
+  }
+  if (dropped) kept.push(`（另有 ${dropped} 条较旧记忆因篇幅未列出）`);
+  return kept.join("\n");
 }
 // Project memory (current root) + global memory (cross-project, _global store) — both
 // injected every run so the agent always carries the user-level knowledge too.
@@ -35806,6 +35907,12 @@ function _saveKgText(root, text) {
   const notes = [];
   for (const line of lines) _kgInsert(notes, line);
   _kgSave(root, notes);
+  // 面板保存＝整库重建，note id 全部重生成，账本里的 incorrectId/correctedId 已经
+  // 全部悬空。不清的话，用户在面板里手工删掉的那条会继续以「已作废X；当前有效Y」
+  // 的形式每轮注入——他以为改干净了，其实只清掉了一半。
+  // 用 _kgCorrectionSave(root, []) 而不是直接删 localStorage：它会同时把空数组写进
+  // 文件镜像，否则下次打开工作区 _kgSyncFromStore 又把旧账本合并回来。
+  _kgCorrectionSave(root, []);
   try { localStorage.removeItem(_memoryKey(root)); } catch {}
   _agentContextCache = { root: null, ts: 0, data: "" };
   return notes.length;
@@ -36953,21 +37060,32 @@ function _extractThinkingConclusion(reasoning, maxChars = 400) {
   const cap = Math.max(80, Math.floor(Number(maxChars) || 400));
   const paras = text.split(/\u000a\s*\u000a/).map((p) => p.replace(/\s+/g, " ").trim()).filter((p) => p.length >= 8);
   if (!paras.length) return text.replace(/\s+/g, " ").slice(-cap);
-  const decisionRe = /决定|选择|因此|所以|方案|根因|结论|应该|需要|最终|therefore|decided|conclusion|root cause/i;
+  // 「应该」「需要」是推理中段的情态词，不是结论词——"应该先 read_file 看一下"是待办，
+  // 不是已定结论，而这本账本下一轮是以"勿重新推导已定结论"注入的。
+  const decisionRe = /决定|选择|因此|所以|方案|根因|结论|最终|therefore|decided|conclusion|root cause/i;
+  // 猜想词黑名单：模型说"可能配置在 config.json 里"，账本抄成一句光秃秃的断言，
+  // 下一轮它就"如前所述，配置在 config.json"——那个文件它从没读过，且纠正无效，
+  // 因为账本还在，重启也还在。带这些词的句子一律不入账。
+  const hedgeRe = /可能|也许|大概|似乎|好像|不确定|待确认|尚未|还没|未验证|没验证|猜测|怀疑|试试|看看|下一步|maybe|perhaps|might|probably|not sure|unverified|guess|assume|[?？]/i;
   const picked = [];
   let total = 0;
   // 从最后一段往前捞决策性语句——收尾处的结论价值最高；最多回看 6 段
   outer: for (let i = paras.length - 1; i >= Math.max(0, paras.length - 6); i--) {
     const sentences = paras[i].split(/(?<=[。；;！!？?])\s*/).map((s) => s.trim()).filter((s) => s.length >= 8);
     for (let j = sentences.length - 1; j >= 0; j--) {
-      if (!decisionRe.test(sentences[j]) || picked.includes(sentences[j])) continue;
+      if (!decisionRe.test(sentences[j]) || hedgeRe.test(sentences[j]) || picked.includes(sentences[j])) continue;
       picked.unshift(sentences[j]);
       total += sentences[j].length;
       if (total >= cap) break outer;
     }
   }
-  const summary = picked.length ? picked.join(" ") : paras[paras.length - 1];
-  return summary.slice(0, cap);
+  // 兜底取末段时同样过猜想词。一段"下一步打算去确认 X"被当成已定结论注入，正是
+  // 模型下一轮拿没验证过的前提往下走的来源。宁可这一轮什么都不记。
+  if (!picked.length) {
+    const tail = paras[paras.length - 1];
+    return hedgeRe.test(tail) ? "" : tail.slice(0, cap);
+  }
+  return picked.join(" ").slice(0, cap);
 }
 
 // 思考结论入账：FIFO ≤6 条、每条 ≤400 字，挂 session 跨 run 存活（同 _demandLedger 通道）。
@@ -43165,9 +43283,12 @@ function _projectJournalBlock(root) {
     const lines = eps.slice(-6).map((e) => {
       const tag = e.outcome === "failed" ? "✗" : e.outcome === "partial" ? "△" : "✓";
       const files = (e.files || []).slice(0, 3).join(", ");
-      return `- ${String(e.ts || "").slice(0, 10)} ${tag} ${String(e.task || "").slice(0, 60)}${files ? `（改了 ${files}）` : ""}`;
+      // ✓ 只表示这一轮正常收尾了，不表示东西做出来了。纯聊天/纯调研的轮次也记 ✓，
+      // 括号缺席全靠模型去猜——明写"未改动文件"，"登录页并没有被写出来"就成了
+      // 上下文里的显式事实，而不是一个需要推断的空白。
+      return `- ${String(e.ts || "").slice(0, 10)} ${tag} ${String(e.task || "").slice(0, 60)}${files ? `（改了 ${files}）` : "（未改动文件）"}`;
     });
-    return "\n--- 项目日志（本项目最近干过的活，新会话接着这个状态干）---\n" + lines.join("\n");
+    return "\n--- 项目日志（本项目最近干过的活，以工作区文件实况为准）---\n" + lines.join("\n");
   } catch { return ""; }
 }
 // (Store+reflect) at run end: persist the episode (Storage) and distill a reusable
@@ -43223,7 +43344,12 @@ async function _recordEpisode(run, task, root, outcome, config, session = null) 
     ]);
     const parsed = _safeJsonLoose(out) || {};
     // Tolerate a model that answers with the bare sentence instead of JSON.
-    const insight = String(parsed.insight || (typeof out === "string" && !/^[\s[{]/.test(out) ? out : ""))
+    // 「不以 [ { 开头」几乎不设防：中转商内联的 <think> 独白、整段拒答、被 token 上限
+    // 截断的半句，全都通过，然后作为「本项目经验」注入——用户看到的是它开始复述一段
+    // 没头没尾的自言自语。所以要求它真像一句经验：单行、无标签、长度像一句话。
+    const bare = String(typeof out === "string" ? out : "").replace(/<think(?:ing)?>[\s\S]*$/i, "").trim();
+    const looksLikeSentence = bare && bare.length <= 160 && !/[<\n]/.test(bare) && !/^[\s[{]/.test(bare);
+    const insight = String(parsed.insight || (looksLikeSentence ? bare : ""))
       .trim().replace(/^["「『]+|["」』]+$/g, "").slice(0, 160);
     if (insight) { const cur = _epLoad(root); const i = cur.findIndex((x) => x.id === ep.id); if (i >= 0) { cur[i].insight = insight; _epSave(root, cur); } }
     if (reviewMemory) _applyMemoryReflectionOutput(root, memorySource, parsed.memory, session?.memory);
@@ -43274,7 +43400,9 @@ function _retrieveWorkflow(task, root) {
 function _workflowHintBlock(task, root) {
   const w = _retrieveWorkflow(task, root);
   if (!w || !Array.isArray(w.steps) || !w.steps.length) return "";
-  return "\n\n💡 **本项目里这类任务的成熟做法（工作流「" + (w.name || "") + "」，已复用 " + (w.uses || 1) + " 次，按需调整、别生搬）**：\n"
+  // 不再声称"已复用 N 次"：这个 N 是归纳时的历史相似任务数，不是它被用过几次，
+  // 却给一份模型自己编的流程加上了权威口吻。说清出处和未验证状态。
+  return "\n\n💡 **这类任务的一份归纳做法（工作流「" + (w.name || "") + "」，由过往同类成功自动总结、未经验证，与当前任务不符就直接忽略）**：\n"
     + w.steps.map((s, i) => `${i + 1}. ${s}`).join("\n");
 }
 // AWM induction, split into the two halves that don't need a model of their own:
