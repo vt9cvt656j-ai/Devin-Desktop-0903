@@ -8869,14 +8869,14 @@ lspManager = createLspManager({
   getWorkspaceRoots: () => (workspaceRoots.length ? workspaceRoots : rootPath ? [rootPath] : []),
   isWorkspaceTrusted: () => isWorkspaceTrusted(),
   showToast: (msg) => showToast(msg),
-  showNotification: ({ title, message, actionLabel, duration, installCmd }) => {
+  showNotification: ({ title, message, actionLabel, duration, installCmd, langId }) => {
     const toolName = (title || "").replace(/^缺少\s*/, "").replace(/\s*语言服务器$/, "") || "LSP";
     showNotification({
       title, message, actionLabel, duration,
       action: installCmd ? async () => {
         await openTerminal();
         writeToActiveTerminal(installCmd + "\n");
-        _showInstallProgress(installCmd, toolName);
+        _showInstallProgress(installCmd, toolName, langId);
       } : undefined,
     });
   },
@@ -55357,7 +55357,11 @@ function _retryLspForOpenFiles() {
     }
   } catch {}
 }
-function _showInstallProgress(cmd, name) {
+/*
+ * langId 要传：装完了没，问的是后端那个跨平台探测（lsp_check_available，Windows 上按
+ * .exe/.cmd/.bat 扫 PATH），而不是在前端拼一句 shell 去找二进制。
+ */
+function _showInstallProgress(cmd, name, langId = "") {
   const card = document.createElement("div");
   card.className = "notif-card";
   card.innerHTML = `
@@ -55375,13 +55379,6 @@ function _showInstallProgress(cmd, name) {
     bar.style.width = width + "%";
   }, 300);
 
-  // The binary name is NOT the last word of the command: e.g.
-  // "go install golang.org/x/tools/gopls@latest" installs `gopls`. Strip any
-  // @version and take the final path segment.
-  const lastArg = (cmd.trim().split(/\s+/).pop() || "");
-  const bin = lastArg.split("@")[0].split("/").pop() || lastArg;
-  const cwd = rootPath || workspaceRoots[0] || "/tmp";
-
   let checkDone, giveUp, settled = false;
   const finish = (ok, title, msg) => {
     if (settled) return;
@@ -55394,16 +55391,23 @@ function _showInstallProgress(cmd, name) {
     setTimeout(() => { card.classList.remove("notif-card--visible"); setTimeout(() => card.remove(), 300); }, ok ? 4000 : 9000);
   };
 
+  /*
+   * 「装好了没」问后端，不在这里拼 shell。
+   *
+   * 这里原来跑的是一句 POSIX shell：先查命令是否在 PATH 上，再退回去挨个 ls 几个
+   * 约定俗成的安装目录（用户家目录下的 go/pip/cargo 那三个，加上 Homebrew 的两个前缀）。
+   * 那几样东西 Windows 一个都不认，整句永远返回空——于是**即使 pip 真的装成功了**，
+   * 这张卡片也会一直转到 90 秒，然后告诉用户「安装超时」。用户看到的就是"装语言服务器
+   * 根本用不了"。
+   *
+   * lsp_check_available 是同一件事的跨平台实现（Windows 分支按 .exe/.cmd/.bat 扫
+   * augmented PATH），而且它查的是**这个语言真正要启动的那个二进制**，比从命令行尾巴
+   * 猜出来的名字准——`go install golang.org/x/tools/gopls@latest` 装的是 gopls，
+   * `winget install -e --id LLVM.LLVM` 装的是 clangd，都猜不出来。
+   */
   checkDone = setInterval(async () => {
     try {
-      // Check PATH *and* the usual install dirs — go installs to ~/go/bin,
-      // pip --user to ~/.local/bin, cargo to ~/.cargo/bin — which aren't always
-      // on the shell PATH that term_list_commands sees.
-      const r = await backend.taskRunCapture(
-        cwd,
-        `command -v ${bin} 2>/dev/null || ls "$HOME/go/bin/${bin}" "$HOME/.local/bin/${bin}" "$HOME/.cargo/bin/${bin}" /opt/homebrew/bin/${bin} /usr/local/bin/${bin} 2>/dev/null | head -1`
-      );
-      if (r && String(r.stdout || "").trim()) {
+      if (langId && await backend.lspCheckAvailable(langId)) {
         finish(true, `${name} 安装完成`, "补全 / 跳转已就绪，无需重开文件");
         _retryLspForOpenFiles(); // start the just-installed server + wire completion right away
       }

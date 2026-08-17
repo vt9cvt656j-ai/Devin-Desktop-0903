@@ -6613,6 +6613,31 @@ test("工作区工具的判据来自语义裁决，不是用户话里的关键�
   assert.match(SRC, /const hasToolAccess = isAgent \|\| isExplorer \|\| isReviewer \|\| isPlan/);
 });
 
+test("装完没装完问后端，不在前端拼一句只有 macOS 认的 shell", () => {
+  /*
+   * 这是「安装语言服务器根本用不了」里最要命的一条：进度卡片原来跑
+   * `command -v X 2>/dev/null || ls "$HOME/go/bin/X" … /opt/homebrew/bin/X`
+   * 判断装好了没——`command -v`、`$HOME`、`ls`、`/opt/homebrew` 全是 POSIX/macOS 专用。
+   * Windows 上它永远返回空，于是**即使 pip 真的装成功了**，卡片也会转满 90 秒，然后
+   * 告诉用户「安装超时」。
+   *
+   * lsp_check_available 是同一件事的跨平台实现（Windows 分支按 .exe/.cmd/.bat 扫
+   * augmented PATH），而且它查的是这个语言真正要启动的那个二进制——比从命令行尾巴猜
+   * 出来的名字准：`go install golang.org/x/tools/gopls@latest` 装的是 gopls，
+   * `winget install -e --id LLVM.LLVM` 装的是 clangd，都猜不出来。
+   */
+  const fn = extractFn("_showInstallProgress");
+  assert.match(fn, /await backend\.lspCheckAvailable\(langId\)/, "没走跨平台探测");
+  assert.doesNotMatch(fn, /command -v|\$HOME|opt\/homebrew/,
+    "又在前端拼 POSIX shell 判断装好了没——Windows 上它永远返回空");
+  assert.doesNotMatch(fn, /taskRunCapture/, "这一步不该再开子进程跑命令");
+  assert.match(fn, /function _showInstallProgress\(cmd, name, langId = ""\)/, "langId 没接进来");
+  // 调用点要真的把 langId 传下去，否则上面全是空转。
+  assert.match(SRC, /_showInstallProgress\(installCmd, toolName, langId\)/, "调用点没传 langId");
+  assert.match(SRC, /showNotification: \(\{ title, message, actionLabel, duration, installCmd, langId \}\)/,
+    "通知适配器没把 langId 收进来");
+});
+
 test("任务完成的提醒走系统通知，不在应用内弹卡片挡输入框", () => {
   /*
    * 那张应用内卡片有两个毛病：它盖在输入框上（你正要接着打字，它挡在那儿），而且只在
