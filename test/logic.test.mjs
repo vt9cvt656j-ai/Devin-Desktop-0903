@@ -284,6 +284,10 @@ const RUN_RECORD_KNOWN_SIGNATURE = load("_recordRunKnownSignature", {
   _runFileEvidenceAliases: EVIDENCE_ALIASES,
 });
 AUTO_LOAD_DEPS = {
+  // 意图裁决的前台等待窗口。_aiIntentProfile 里那道 Promise.race 用它当超时，发送路径
+  // 的第一轮等待也从它推导——两个值同源，才不会漂回「等待 < 窗口」那个恒定失败的组合。
+  // 从源码里取真值而不是抄一份常数：抄的那份改不动源码也不会红。
+  _INTENT_FOREGROUND_WAIT_MS: Number(/const _INTENT_FOREGROUND_WAIT_MS = (\d+);/.exec(SRC)[1]),
   // 打包/构建正则：_isRecognizedVerifierCommand 和 _runtimeCommandKinds 共用同一份。
   // 少了它是 ReferenceError，表现成"这个测试挂了"而不是"命令没认出来"。
   // 命令归一化的第一步。_looksLikeVerificationCommand 和 _normalizedVerifierCommand
@@ -7910,8 +7914,10 @@ test("AI intent judgment is session-aware, semantic, and never falls back to key
   assert.doesNotMatch(aiIntentSrc, /for \(let attempt = 0; attempt < 3/,
     "底层网关已有有界重试，意图判定不能再叠一层重试风暴");
   assert.match(aiIntentSrc, /Promise\.race/, "判定调用必须有超时上限");
-  assert.match(aiIntentSrc, /timer = setTimeout\(\(\) => resolve\(null\), 8000\)/,
-    "8s 只限制前台采用窗口，绝不阻断发送");
+  // 窗口必须是那个具名常量，不是裸字面量：发送路径的第一轮等待从同一个常量推导，
+  // 各写一个数就是上一次留下 1500 的方式——等待短于窗口，race 从此恒定由 timer 赢。
+  assert.match(aiIntentSrc, /timer = setTimeout\(\(\) => resolve\(null\), _INTENT_FOREGROUND_WAIT_MS\)/,
+    "前台采用窗口只限制采用、绝不阻断发送，且必须与第一轮等待同源");
   assert.doesNotMatch(aiIntentSrc, /backend\.cancelAi|acceptResult\s*=\s*false/,
     "前台超时不能取消或废弃仍在运行的物理判定");
   assert.match(aiIntentSrc, /_safeJsonLoose/);
@@ -8116,8 +8122,11 @@ test("设计工艺块 token 瘦身：服务端设计层在场时只留锚点，�
   assert.match(lean, /【设计执行】/);
   assert.match(lean, /指定参考站优先/, "客户端独有细则（参考站）瘦身模式也要保留");
   assert.doesNotMatch(lean, /先数卡片再定网格/, "重叠内容不再本地重复");
-  assert.match(SRC, /serverDesignLayersActive: _l0On\(config\) && !!config\.ideSemanticProfile/,
-    "瘦身条件必须是 L0 开启且旗标头已送达");
+  // 瘦身条件不能是「画像字符串非空」：分类器迟到时画像是 "2.5:"，非空但零旗标，
+  // 服务端 ui_intent 为假、设计层一块没挂——客户端却据此把本地全量撤了，两边都没发。
+  // 判据必须是「画像里真的带着 design 旗标」，见 _serverDesignLayersRouted。
+  assert.match(SRC, /serverDesignLayersActive: _serverDesignLayersRouted\(config\)/,
+    "瘦身条件必须落在「服务端这轮真的挂了设计层」上，不是「画像字符串是 truthy」");
 });
 
 test("nothing tells the agent to expand a plan it already wrote", () => {
@@ -9447,7 +9456,7 @@ test("UI design craft guidance is injected only for front-end work", () => {
   assert.match(greenfield, /无栈网站默认实现/);
   assert.match(greenfield, /Button\/Dialog\/Tabs/);
   assert.match(greenfield, /Tailwind 采用 v4 时使用 CSS-first 配置/);
-  assert.match(SRC, /const _uiDesignCraft = \(effectiveMode === "agent"\)\s*\? _uiDesignCraftBlock\(text, _uiTurnEngineering, \{ serverDesignLayersActive: _l0On\(config\) && !!config\.ideSemanticProfile \}\)/,
+  assert.match(SRC, /const _uiDesignCraft = \(effectiveMode === "agent"\)\s*\? _uiDesignCraftBlock\(text, _uiTurnEngineering, \{ serverDesignLayersActive: _serverDesignLayersRouted\(config\) \}\)/,
     "Agent send path must add the UI craft block to front-end turns");
   assert.match(SRC, /_dynPreamble \+ _atContext \+ _modeFrame \+ _decisionFrame \+ _uiDesignCraft \+ _toolHint \+ _expHint/,
     "UI craft guidance must appear before the tool and experience hints");

@@ -20734,7 +20734,7 @@ const _AI_AGENT_ROLES = new Set([
 const _aiIntentCache = new Map(); // 会话 + 上下文指纹 + 文本 -> { ts, intents }
 const _aiIntentInflight = new Map(); // key -> 物理请求 Promise；8s 前台窗口结束后仍保留到真实落定
 // 意图裁决的前台等待窗口。物理请求的寿命比它长（迟到的裁决仍落 cache），这里只决定
-// 「当前这一轮愿意等多久」。
+// "当前这一轮愿意等多久"。
 const _INTENT_FOREGROUND_WAIT_MS = 8000;
 // 新会话第一轮愿意为意图裁决多等多久。整个会话只付一次：拿到裁决之后画像就粘住了。
 //
@@ -20743,9 +20743,9 @@ const _INTENT_FOREGROUND_WAIT_MS = 8000;
 // 7607ms（completion≈520 token）。旧值 1500 比它短 5 倍，于是 race 每次都由 timer 赢，
 // 主回合总是带着空画像发出去——网关只挂 agent.base 四块，agent_engineering / git_guide /
 // agent_research / agent_collaboration / agent_automation / defect_hunting 和整套
-// michael-design 设计层**一块都不挂**。这正是「突然变弱智、工具也不用了」的物理成因：
+// michael-design 设计层**一块都不挂**。这正是"突然变弱智、工具也不用了"的物理成因：
 // 决定整个做法的那一轮，手里既没有工程纪律也没有设计纪律。
-// 两个值绑在一起，就不会再各自漂移出这种「永远赢不了的 race」。
+// 两个值绑在一起，就不会再各自漂移出这种"永远赢不了的 race"。
 const _FIRST_TURN_INTENT_WAIT_MS = _INTENT_FOREGROUND_WAIT_MS;
 let _lastGoodAiConfig = null; // 上次真实发送用过的 config——运行中 steer 复用，绝不碰登录门
 function _aiIntentCacheKey(text, sessionId = "", contextFingerprint = "") {
@@ -21257,15 +21257,15 @@ function _semanticProfileHeaderFor(resolved, text) {
   return _ideSemanticProfile(resolved || {});
 }
 
-// 「服务端这轮真的挂上了 michael-design 设计层吗」——_uiDesignCraftBlock 靠这个答案决定要不
-// 要把本地那份完整设计纪律（约 4K token）换成一句指向系统提示词的锚点。
+// "服务端这轮真的挂上了 michael-design 设计层吗"——_uiDesignCraftBlock 靠这个答案决定要不要
+// 把本地那份完整设计纪律（约 4K token）换成一句指向系统提示词的锚点。
 //
 // 此前的判据是 `!!config.ideSemanticProfile`，而画像为空时这个字符串是 `"2.5:"`——**truthy**。
-// 于是分类器迟到/失败的那些轮：客户端认定「服务端会给」，把自己的设计纪律全撤了；服务端那边
-// 因为一个 design flag 都没有，ui_intent 为假，design.base 及其下所有层一块都没挂。
+// 于是分类器迟到/失败的那些轮：客户端认定"服务端会给"，把自己的设计纪律全撤了；服务端那边
+// 因为一个 design flag 都没有，`ui_intent` 为假，design.base 及其下所有层一块都没挂。
 // 结果是设计纪律**两边都没发**，模型只能凭印象糊 UI。
 //
-// 判据必须是「画像里真的带着 design 旗标」。这里刻意用 includes 子串匹配，跟服务端
+// 判据必须是"画像里真的带着 design 旗标"。这里刻意用 includes 子串匹配，跟服务端
 // `semantic("design")` 的语义逐字对齐（design_review / design_motion 等都含 "design"），
 // 两边判同一件事就不会再分叉。
 function _serverDesignLayersRouted(config) {
@@ -24703,10 +24703,10 @@ async function sendPrompt(text, attachments = [], readyConfig = null) {
   //
   // 只在第一轮等，且有硬上限：会话一旦有了 flag，后面每一轮都直接命中，零等待。裁决没赶上
   // 也照常发（_applyLateIntentIfLanded 会在循环边界补），不会把一轮卡死在这里。
-  // 「只在第一轮等」的判据不能只看 flag 是否为空：普通问答的裁决**合法地**返回零 flag
+  // "只在第一轮等"的判据不能只看 flag 是否为空：普通问答的裁决**合法地**返回零 flag
   // （action=answer、workspaceAction=none，一个维度都不为 true），于是 flag 永远是空的，
   // 这道等待就变成了每一轮都付一次完整窗口——纯聊天的会话会被这个数字拖成逐轮卡顿。
-  // 真正的判据是「这个会话已经拿到过一次裁决了」，跟裁决点亮了几个 flag 无关。
+  // 真正的判据是"这个会话已经拿到过一次裁决了"，跟裁决点亮了几个 flag 无关。
   if (_turnIntentState && !(sess._semanticProfileFlags || []).length && !sess._intentWaitPaid) {
     let _waitTimer = null;
     try {
@@ -26872,7 +26872,7 @@ const _MCP_TOOL_SEARCH_WAIT_MS = 8_000;
 //
 // 但它同时是 _agentModelTurn 那道**防御性收敛**的上限（那次调用不传 requestedSchemas，
 // 等于纯粹按上限裁剪当前窗口）。静态目录已经 138 个，128 意味着一旦窗口被编排器撑满，
-// 尾部工具会被静默切掉、且没有任何日志——「某个工具明明装载了却调不到」就是这么来的。
+// 尾部工具会被静默切掉、且没有任何日志——"某个工具明明装载了却调不到"就是这么来的。
 // 上限必须留在目录规模之上：注意力预算由开局窗口（十个核心工具）和编排器的准入负责，
 // 这一层只做兜底，别在这里替它们做减法。
 const _TOOL_PAYLOAD_MAX_TOOLS = 256;

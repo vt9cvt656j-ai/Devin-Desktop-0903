@@ -101,15 +101,23 @@ test("a brand-new session waits, briefly and once, before sending an empty profi
   // URL 列表——所以第一轮的画像是空的：决定整个做法的那一轮拿不到 agent_engineering。
   // 而且粘性画像让这件事在缓存上也要付账：第一轮空、第二轮有 flag，等于每个会话必然在第二轮
   // 把整条对话的前缀作废一次——正是粘性本身要防的那个失败。
-  assert.match(SRC, /const _FIRST_TURN_INTENT_WAIT_MS = \d+;/,
-    "the first-turn wait must be one named bound, not a literal buried in the turn");
-  const bound = Number(/const _FIRST_TURN_INTENT_WAIT_MS = (\d+);/.exec(SRC)[1]);
-  assert.ok(bound > 0 && bound <= 2000,
-    `the wait is paid on a real turn — ${bound}ms is not a bounded cost`);
+  // 这条断言原来写的是 `bound <= 2000`，把 1500 当成了「有界成本」的正解。生产网关实测
+  // 打脸：裁决用的是用户选的模型（刻意不降级），claude-opus-5 出这份 JSON 的响应头延迟是
+  // 6931ms / 7607ms。1500 的上限意味着这场 race **每次都由 timer 赢**——等待存在、全绿、
+  // 无日志，而主回合照旧带着空画像出门。所以正确的不变量不是「够短」，是「够得上裁决」：
+  // 必须 >= 前台窗口，且两个值同源，否则又会漂回那个恒定失败的组合。
+  assert.match(SRC, /const _FIRST_TURN_INTENT_WAIT_MS = _INTENT_FOREGROUND_WAIT_MS;/,
+    "the first-turn wait must be derived from the foreground window, not an independent literal"
+    + " — two separate numbers is how it drifted into a race the timer always wins");
+  const windowMs = Number(/const _INTENT_FOREGROUND_WAIT_MS = (\d+);/.exec(SRC)[1]);
+  assert.ok(windowMs >= 8000,
+    `the classifier measured 6931ms/7607ms upstream — a ${windowMs}ms window never catches it`);
 
-  const guard = /if \(_turnIntentState && !\(sess\._semanticProfileFlags \|\| \[\]\)\.length\) \{/;
+  const guard = /if \(_turnIntentState && !\(sess\._semanticProfileFlags \|\| \[\]\)\.length && !sess\._intentWaitPaid\) \{/;
   assert.match(SRC, guard,
-    "the wait must be gated on the session having no flags yet — otherwise every turn pays it");
+    "the wait must be gated on the session having no flags yet AND not having paid already —"
+    + " a plain-Q&A verdict legitimately returns zero flags, so the flags test alone makes every"
+    + " turn in a chat session pay the full window again");
 
   // 等待必须发生在画像组装之前，否则等了也白等。
   const waitAt = SRC.search(guard);
