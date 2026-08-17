@@ -25708,3 +25708,32 @@ test("撞限流不再直接判死：等一会儿自动重来，但预算极小�
   assert.equal(seen.length, 1, "应当正好通知一次「正在等待重试」");
   assert.equal(seen[0].rateLimited, true, "限流的重试通知要能和普通重试区分，否则界面没法说清在等什么");
 });
+
+test("chat 模式中断也能从断点继续，不是让用户把整条消息重发一遍", () => {
+  // 用户："有时候会中断也要会重试。"
+  // agent 模式早就有断点续传（buildResumeInvoke + _streamResumeMode），chat 模式**一直没接**：
+  // 连接在出字过程中断掉就直接报错收场。同一个能力两条路一有一无，没有理由。
+  const send = extractFn("sendPrompt");
+  const at = send.indexOf("invoke: (cb) => chatFn(cb)");
+  assert.ok(at > 0, "找不到 chat 模式那次 _runModelRequestWithRetry 调用");
+  const call = send.slice(at, at + 3000);
+
+  assert.match(call, /buildResumeInvoke: async \(\{ resume, resumeLimit \}\) => \{/,
+    "chat 模式没接断点续传——中断就报错收场，用户只能整条重发");
+  // prefill：把已出的正文作为最后一条 assistant 消息，模型接着写而不是重新开始。
+  assert.match(call, /\[\.\.\.requestMessages, \{ role: "assistant", content: partial \}\]/,
+    "续传必须以已生成的正文作 prefill——否则就是重放，会把已经出过的字再写一遍");
+  assert.match(call, /String\(acc \|\| ""\)\.replace\(\/\\s\+\$\/, ""\)/,
+    "prefill 结尾不能留空白，上游会直接 400");
+  assert.match(call, /if \(!partial\) return null;/,
+    "一个字都没出过时不该走续传——那是普通重试的场景");
+  // 保守边界：带工具时"参数能解析"不等于"参数完整"，那种判断留给 agent 路径验证过的那套。
+  assert.match(call, /if \(useTools\) return null;/,
+    "带工具的流不能用这条简化续传：半截工具参数续下去比整轮重来更危险");
+  // 每条流式路径都要在调用点过预算——prefill 会让请求变长，可能正好顶过上限。
+  assert.match(call, /backend\.aiChat\(requestConfig, _enforceModelRequestBudget\(resumeMsgs\), cb\)/,
+    "续传的请求没过预算");
+  // 限流的等待要和普通重试在界面上分得开，否则用户不知道在等什么。
+  assert.match(call, /rateLimited\s*\n?\s*\?\s*`线路被限流/,
+    "限流的提示要和普通重试区分");
+});

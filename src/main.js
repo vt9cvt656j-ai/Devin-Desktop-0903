@@ -25766,9 +25766,38 @@ async function sendPrompt(text, attachments = [], readyConfig = null) {
           _plainStreamDiag.firstRenderMs = null;
           _plainStreamDiag.bytes = 0;
         },
-        onRetry: ({ retry, retryLimit }) => {
+        onRetry: ({ retry, retryLimit, rateLimited }) => {
           _agentTimelineRecordMetric(_turnTimeline, _plainTimelineTurn, "modelRetry", 0, Date.now(), { attempt: retry });
-          showAgentRetryToast(`模型线路出现问题，当前将重试第 ${retry}/${retryLimit} 次`, true);
+          showAgentRetryToast(rateLimited
+            ? `线路被限流，等一会儿自动重试（${retry}/${retryLimit}）——不用手动重发`
+            : `模型线路出现问题，当前将重试第 ${retry}/${retryLimit} 次`, true);
+        },
+        /**
+         * chat 模式此前**没有**接断点续传：连接在出字过程中断掉就直接报错收场，用户只能把
+         * 整条消息重发一遍——而 agent 模式早就有这套机制。同一个能力两条路一有一无，没有理由，
+         * 用户的原话是"有时候会中断也要会重试"。
+         *
+         * chat 没有工具往返，所以这里比 agent 那条简单得多：把已经写出来的正文作为最后一条
+         * assistant 消息附上去，模型从它的末尾接着写（prefill），提示本身没变、走缓存，
+         * 续一次远比整轮重跑便宜，也不会重复已经出过的字。
+         *
+         * 仍然保守：只在**纯对话**且**真的出过字**时才续。带工具时"参数能被 JSON.parse"
+         * 不等于"参数完整"——它可能只是完整参数的一个合法前缀，拿半截参数去续比重来危险，
+         * 那种判断留给 agent 路径里已经验证过的那套（见 _streamResumeMode）。
+         */
+        buildResumeInvoke: async ({ resume, resumeLimit }) => {
+          if (useTools) return null;
+          // prefill 结尾不许有空白，否则上游直接 400。
+          const partial = String(acc || "").replace(/\s+$/, "");
+          if (!partial) return null;   // 一个字都没出过 → 那是普通重试的场景，不是续传
+          const resumeMsgs = [...requestMessages, { role: "assistant", content: partial }];
+          showAgentRetryToast(
+            `连接中断，正在从断点继续（${resume}/${resumeLimit}）——已生成的内容会保留，不重发整条消息`,
+            true,
+          );
+          // 预算写在调用点上：prefill 是**加长**对话，可能正好把这一轮顶过字节上限，那就换成
+          // 一个 400 而不是续上。有断言钉着"每条流式路径都在调用点过预算"，位置不能挪。
+          return (cb) => backend.aiChat(requestConfig, _enforceModelRequestBudget(resumeMsgs), cb);
         },
         onEvent: (ev) => {
       // User hit Stop → drop every further event so output halts AT ONCE (mirrors the agent
