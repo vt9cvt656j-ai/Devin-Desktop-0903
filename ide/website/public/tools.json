@@ -1,7 +1,7 @@
 {
   "generatedFrom": "ide/src/main.js · _buildAgentToolSchemas",
   "generatedAt": null,
-  "count": 136,
+  "count": 137,
   "groups": [
     "Agents",
     "Code intelligence",
@@ -425,6 +425,11 @@
     {
       "name": "package_search",
       "group": "Research",
+      "desktopOnly": false
+    },
+    {
+      "name": "package_source",
+      "group": "Knowledge",
       "desktopOnly": false
     },
     {
