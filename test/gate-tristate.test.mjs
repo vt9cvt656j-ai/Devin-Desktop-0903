@@ -174,3 +174,41 @@ test("默认完整交付、先读懂再动手、每一步先想", () => {
   // 已有代码的写法要沿用——用户抱怨的另一半。
   assert.match(laws, /沿用现存的分层、命名、错误处理和测试方式/, "缺了「沿用现有约定」");
 });
+
+// ── 项目本地记忆落到文件 ───────────────────────────────────────────────────
+//
+// 用户："能创建 Mr. Day One 项目本地记忆……可以实时扶正项目内容、锁定项目目标不偏航、
+// 也能把遇到的错误放进去保持自己不会再犯。"
+//
+// 补之前：记忆只活在 localStorage（key = michael-ide.kg:<root>）——**不在项目里**。用户看不见、
+// 改不动、换台机器就没了、清一次应用数据就丢，而里面存的恰恰是最不该丢的那些东西。
+test("项目记忆要落到项目里的文件，而不是只活在浏览器存储里", () => {
+  assert.match(SRC, /const _PROJECT_MEMORY_REL = "\.michael\/memory\.md";/,
+    "项目记忆没有对应的文件——清一次应用数据就全丢了");
+
+  // 分节沿用已有的 _kgClassify，不新造一套分类：两套分类必然漂。
+  const sections = /const _PM_SECTIONS = \[([\s\S]*?)\];/.exec(SRC);
+  assert.ok(sections, "分节表不见了");
+  for (const must of ["锁定，防偏航", "实时扶正", "不再犯"]) {
+    assert.ok(sections[1].includes(must), `分节少了「${must}」——那是用户点名要的三件事之一`);
+  }
+  assert.match(sections[1], /"pitfall"/, "「踩过的坑」要接到 _kgClassify 已有的 pitfall 分类上");
+
+  // 渲染：只写活的笔记，被作废的不能再出现在文件里（否则手改文件的人会照着过期结论走）。
+  const md = /function _projectMemoryMarkdown\(root\)[\s\S]*?\n\}/.exec(SRC);
+  assert.ok(md, "渲染函数不见了");
+  assert.match(md[0], /superseded\.has\(note\.id\)/, "被纠错作废的笔记不该写进文件");
+
+  // 写入：记完就落盘，但不 await——落盘失败不该让「已记住」变成失败。
+  assert.match(SRC, /if \(ok && !isGlobal\) void _mirrorProjectMemoryFile\(root\);/,
+    "项目记忆写入后没有落盘");
+
+  // 读回：只在本地存储确实为空时导入，否则一份旧文件会把刚记的东西抹掉。
+  const imp = /async function _importProjectMemoryFile\(root\)[\s\S]*?\n\}/.exec(SRC);
+  assert.ok(imp, "读回函数不见了");
+  assert.match(imp[0], /if \(_kgLoad\(root\)\.length\) return 0;/,
+    "必须只在本地记忆为空时导入——否则旧文件会静默回退掉新记的内容，那是最难查的一类问题");
+  assert.match(imp[0], /if \(!line\.startsWith\("- "\)\) continue;/,
+    "只认列表项：标题和注释不是记忆");
+  assert.match(SRC, /void _importProjectMemoryFile\(path\);/, "打开项目时没有读回");
+});

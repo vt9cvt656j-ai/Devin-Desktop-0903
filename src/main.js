@@ -9434,6 +9434,9 @@ async function openFolder(path, owner = null) {
   try { await backend.registerWorkspaceRoot(path); }
   catch (e) { if (inTauri) showToast(`⚠️ 打开「${basename(path)}」时注册失败：${String(e?.message || e).slice(0, 80)}。该目录下读写可能被拒绝。`); }
   _ipcBroadcast("workspace_changed", { roots: [path], active: path });
+  // 项目记忆读回：本地存储为空时（换机器、清了应用数据、重装）从 .michael/memory.md 恢复。
+  // 不 await——它只影响后续轮次的记忆检索，不该让"打开文件夹"多等一次磁盘往返。
+  void _importProjectMemoryFile(path);
   await renderWorkspaceRoots();
   preloadProjectModels(path);
   scheduleProjectCacheRefresh(path, "项目已打开");
@@ -36684,6 +36687,73 @@ function _kgPrune(notes) {
   for (let i = notes.length - 1; i >= 0; i--) if (!keep.has(notes[i].id)) notes.splice(i, 1);
   for (const n of notes) if (n.links) n.links = n.links.filter((id) => keep.has(id));
 }
+// ── 项目本地记忆文件 ──────────────────────────────────────────────────────────
+//
+// 记忆此前只活在 localStorage（key = michael-ide.kg:<root>）。也就是说它**不在项目里**：
+// 用户看不见、改不动、换台机器就没了、清一次应用数据就丢——而里面存的恰恰是"这个项目要做成
+// 什么""这个坑已经踩过"这类最不该丢的东西。用户的话：能实时扶正项目内容、锁定项目目标不偏航、
+// 把遇到的错误放进去不再犯。
+//
+// 所以镜像一份到 <root>/.michael/memory.md：
+//   · 写入时同步落盘 —— 文件是人可读、可手改的真相；
+//   · 打开项目时若 localStorage 为空则从文件读回 —— 换机器、清数据、重装都还在；
+//   · 检索/排序/纠错账本/篇幅裁剪那一整套逻辑**一行不动**，文件只当持久层。
+// 分节沿用已有的 _kgClassify，不新造一套分类——两套分类必然漂。
+const _PROJECT_MEMORY_REL = ".michael/memory.md";
+const _PM_SECTIONS = [
+  { title: "项目目标与约定（锁定，防偏航）", types: ["convention", "preference"] },
+  { title: "项目事实（实时扶正）", types: ["fact", "architecture", "command"] },
+  { title: "踩过的坑（不再犯）", types: ["pitfall"] },
+];
+function _projectMemoryPath(root) {
+  const base = String(root || "").replace(/\/+$/, "");
+  return base ? `${base}/${_PROJECT_MEMORY_REL}` : "";
+}
+function _projectMemoryMarkdown(root) {
+  const notes = _kgLoad(root);
+  if (!notes.length) return "";
+  const superseded = _kgSupersededIds(root);
+  const live = notes.filter((note) => note && !superseded.has(note.id));
+  if (!live.length) return "";
+  const lines = [
+    "# Mr. Day One 项目记忆",
+    "",
+    "<!-- 由 remember 工具维护。你可以直接编辑这个文件：本地记忆为空时（换机器/清数据/重装）会从这里读回。 -->",
+  ];
+  for (const section of _PM_SECTIONS) {
+    const picked = live
+      .filter((note) => section.types.includes(note.type || "fact"))
+      .sort((a, b) => Number(b.created || 0) - Number(a.created || 0));
+    if (!picked.length) continue;
+    lines.push("", `## ${section.title}`, "");
+    for (const note of picked) lines.push(`- ${note.content}`);
+  }
+  return `${lines.join("\n")}\n`;
+}
+async function _mirrorProjectMemoryFile(root) {
+  const path = _projectMemoryPath(root);
+  if (!path || !inTauri) return false;
+  const markdown = _projectMemoryMarkdown(root);
+  if (!markdown) return false;
+  try { await backend.writeTextFile(path, markdown); return true; } catch { return false; }
+}
+async function _importProjectMemoryFile(root) {
+  // 只在本地存储**确实为空**时导入。文件是备份，不是每次启动都要覆盖内存的权威源——
+  // 否则用户刚记下的东西会被一份旧文件抹掉，而"记忆被悄悄回退"是最难查的一类问题。
+  if (!inTauri || !root) return 0;
+  try { if (_kgLoad(root).length) return 0; } catch { return 0; }
+  let text = "";
+  try { text = String((await backend.readTextFile(_projectMemoryPath(root))) || ""); } catch { return 0; }
+  if (!text.trim()) return 0;
+  let imported = 0;
+  for (const raw of text.split("\n")) {
+    const line = raw.trim();
+    if (!line.startsWith("- ")) continue;   // 只认列表项：标题和注释不是记忆
+    if (_kgAddNote(root, line.slice(2))) imported += 1;
+  }
+  return imported;
+}
+
 function _kgAddNote(root, content) {
   return !!_kgAddNoteRecord(root, content);
 }
@@ -52446,6 +52516,9 @@ async function _executeToolStepInner(step, call, root, run) {
       // "global" → the cross-project _global store (root ""), else the current project.
       const isGlobal = call.scope === "global";
       const ok = _kgAddNote(isGlobal ? "" : root, call.content);
+      // 项目记忆同步落盘到 .michael/memory.md：不落盘的记忆等于只存在这台机器的浏览器里。
+      // 不 await——落盘失败不该让"已记住"变成失败，文件只是持久层，内存那份已经生效了。
+      if (ok && !isGlobal) void _mirrorProjectMemoryFile(root);
       res.className = ok ? "atc-result atc-result--ok" : "atc-result atc-result--err";
       res.textContent = ok ? (isGlobal ? "已记住·全局" : "已记住") : "内容太短";
       if (typeof vp !== "undefined" && vp) vp.innerHTML = `<pre>${_escHtml((call.content || "").slice(0, 500))}</pre>`;
