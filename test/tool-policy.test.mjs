@@ -84,6 +84,13 @@ test("approval set matches the pre-refactor literal exactly", () => {
     "genimage", "generate_3d", "generate_sound", "generate_music", "generate_voice",
     "generate_motion", "generate_texture", "auto_rig",
     "game_scaffold", "web_scaffold", "download_asset",
+    // 新增（2026-08-17 审计）：这四个有真实外部副作用，却从来没登记进 REGISTRY——
+    // 没登记 = 策略全取默认值 = needsApproval 恒 false，「改动前审批」开着也一次框都不弹。
+    // browser 能跑任意 JS、读会话 cookie / localStorage、上传**本机绝对路径**的文件、
+    // 替用户填表并按下提交；docker_compose_up 直接 `docker compose up -d` 起一整套容器；
+    // capture_replay 能指定任意 method/url/body 直发，是 http 那道门的完整旁路；
+    // system 能开 App、切前台窗口、触发任意 App 的菜单项。
+    "browser", "docker_compose_up", "capture_replay", "system",
   ])));
   // worktree 是**有意**不问的：它只在 <root>/.michael/worktrees/ 下动，是 IDE 自己的
   // 目录，best-of-N 每建一个候选弹一次窗就没法用了。这条豁免要留着，也要看得见。
@@ -93,6 +100,9 @@ test("approval set matches the pre-refactor literal exactly", () => {
 test("hooked set matches the pre-refactor literal exactly, including format's absence", () => {
   assert.deepEqual(sorted(hookedTypes()), sorted(new Set([
     "write", "edit", "multiedit", "cmd", "termtask", "delete", "move", "mkdir", "copy",
+    // docker_compose_up 借用 EXEC（needsApproval + hooked）：它和 cmd 一样是把一串命令
+    // 交给 shell，钩子该看得到它。另三个不是 shell 执行，不进这个集合。
+    "docker_compose_up",
   ])));
   // `format` writes content but is intentionally NOT hooked. It is the single element that
   // makes this set differ from the file-mutation family, and it was easy to lose.
@@ -112,6 +122,10 @@ test("read-only-mode block matches the pre-refactor chain, plus the closed termt
     // 新增：worktree。同样是**逐次**判定——list 放行（只读模式最需要"先看看有哪些候选"），
     // add / remove 挡住。出现在这个集合里只表示「至少有一种调用会被挡」。
     "worktree",
+    // 新增（2026-08-17 审计）：browser 是**逐次**判定——看页面（navigate/screenshot/read）
+    // 是观察，只读模式该放行；动会话、传文件、执行 JS、按提交才是副作用。另三个一刀切挡住：
+    // 起容器、发任意 HTTP、开 App 切窗口，没有一种能叫"只读"。
+    "browser", "docker_compose_up", "capture_replay", "system",
   ])));
   // 上一版这里断言的是 `false`，并写着「补掉的时候这一行要在同一个提交里翻成 true」——
   // 这就是那个提交。termtask 就是 run_in_terminal，命令串由模型给出、原样执行，和 cmd
@@ -278,6 +292,79 @@ test("worktree 没带 action 时按 list 处理（工具定义里 list 就是默
 test("worktree 算改动工作区——它在 <root>/.michael/worktrees 下面造东西", () => {
   assert.equal(mutatesWorkspace("worktree"), true);
   assert.ok(workspaceMutatingTypes().has("worktree"));
+});
+
+// 上面那条守卫有个它自己看不见的盲区：`workspaceMutatingTypes()` 只枚举**已经登记进
+// REGISTRY 的**类型。一个工具压根没 defineTool 过，它的策略就全取默认值（needsApproval
+// 是 false），既不在 approvalTypes 里也不在 workspaceMutatingTypes 里 —— 两个集合相减
+// 恒等于空，守卫永远绿。2026-08-17 的审计就是这么挖出 browser / docker_compose_up /
+// capture_replay / system 四个的：全都有真实外部副作用（任意 JS、读会话 cookie、上传本机
+// 绝对路径文件、起容器、发任意 HTTP、开 App 切窗口），"改动前审批"开着也一次框都不弹，
+// 而同类的 uiclick / automation 早就登记了。漏登记不报错，是这个盲区唯一的症状。
+//
+// 所以这条守卫换个方向：从 **_mapToolCall 真正会产出的 call.type** 出发反过来查。
+// 每一种都必须被归类——要么进 REGISTRY（有策略），要么写进下面这张"确认无需审批"的
+// 明单。新加一个工具时两边都不写，这条就红。
+//
+// 明单是**棘轮，不是体检报告**：这 81 个是审计当天的既有状态，逐个复核过的只有上面
+// 点名的那四个。里面仍有值得单独判的（gh / http / tor 由 _requiresApproval 特判，
+// memory 会写盘，preview / demostart 会起服务，subagent / spawnmulti 会派出子智能体）。
+// 它们留在这里只表示"今天不问"，不表示"已确认不该问"。
+const NO_APPROVAL_TODAY = new Set([
+  "arxiv_search", "askuser", "awaitsubagent", "awwwards_search", "background_monitor",
+  "bundlephobia_search", "capture_flows", "capture_stop", "clinical_trials_search",
+  "codeberg_repo", "codrops_search", "crossref_search", "current_time", "cve_search", "debate",
+  "demostart", "demostop", "designboard", "developer_community_search", "diag", "explain",
+  "figma", "find", "findsymbol", "gh", "git", "gitee_repo", "github_repo", "github_search",
+  "gitlab_repo", "hackernews_search", "http", "iconify_search", "knowledge", "learndesign",
+  "list", "liveenvironment", "localdiscovery", "logs", "lsp", "mdn_search", "memory",
+  "openalex_search", "openapi_parser", "package_search", "package_source",
+  "performance_profile", "plan", "preview", "probeenv", "pubchem_search", "pubmed_search",
+  "qr", "read", "readscreen", "realtime_news_feed", "recall", "remote", "screenshot", "search",
+  "search_game_assets", "search_tools", "semsearch", "skill", "smashingmag_search",
+  "spawnmulti", "stackoverflow_search", "steam_search", "subagent", "termlist", "termread",
+  "termstop", "think", "tor", "uiextract", "viewimage", "vizcompare", "web", "websearch",
+  "wiki_search", "worker",
+]);
+
+/** _mapToolCall 会产出的全部 call.type。剥注释再取，免得被注释里引用的旧类型名喂到。 */
+function mappedCallTypes() {
+  const at = MAIN.indexOf("function _mapToolCall(");
+  assert.ok(at > 0, "_mapToolCall 改名了，这条守卫要跟着改");
+  let depth = 0, end = MAIN.length;
+  for (let i = MAIN.indexOf("{", MAIN.indexOf(")", at)); i < MAIN.length; i++) {
+    if (MAIN[i] === "{") depth++;
+    else if (MAIN[i] === "}" && --depth === 0) { end = i + 1; break; }
+  }
+  const body = MAIN.slice(at, end).replace(/\/\/[^\n]*/g, "").replace(/\/\*[\s\S]*?\*\//g, "");
+  return [...new Set([...body.matchAll(/\btype:\s*"([a-z0-9_]+)"/g)].map((m) => m[1]))].sort();
+}
+
+test("每一种工具调用类型都必须被归类——没登记也算漏，不是默认放行", () => {
+  const types = mappedCallTypes();
+  assert.ok(types.length > 100, `只解析出 ${types.length} 种类型，取法多半坏了`);
+  const classified = (t) => {
+    const p = toolPolicy(t);
+    return p.needsApproval || p.mutatesWorkspace || p.readOnlyModeBlocked || NO_APPROVAL_TODAY.has(t);
+  };
+  const orphans = types.filter((t) => !classified(t)).sort();
+  assert.deepEqual(orphans, [],
+    "这些工具类型既没登记策略、也没写进「确认无需审批」的明单，于是默认无声放行：\n  "
+    + orphans.join(", ")
+    + "\n把它 defineTool 进 tool-policy.js，或者写进 NO_APPROVAL_TODAY 并说明为什么不用问。");
+});
+
+test("四个有外部副作用的工具已经在审批门内——它们曾经整整一轮都在门外", () => {
+  for (const t of ["browser", "docker_compose_up", "capture_replay", "system"]) {
+    assert.equal(needsApproval(t), true, `${t} 又掉出审批门了`);
+  }
+  // browser 的只读模式判据按 action 分：看页面是观察，动会话/文件/执行/提交是副作用。
+  for (const action of ["eval", "cookies", "storage", "upload", "autofill", "click", "type"]) {
+    assert.equal(blockedInReadOnlyMode("browser", { type: "browser", action }), true, action);
+  }
+  for (const action of ["navigate", "screenshot", "read", "text", "back", "forward", "close"]) {
+    assert.equal(blockedInReadOnlyMode("browser", { type: "browser", action }), false, action);
+  }
 });
 
 test("会改工作区的工具，开了审批就必须问——豁免只能是有名有姓的那一个", () => {

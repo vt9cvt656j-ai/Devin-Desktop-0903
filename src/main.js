@@ -15145,7 +15145,12 @@ function showModelInfoCard(m, anchorEl) {
     // 方案D：布尔思考开关模型（GLM-5.x/Kimi K2.5/K2.6 等 kimi-toggle 族）诚实渲染——
     // 只有「开/关」两态，标题、按钮文案、tip 都不得出现低/中/高深度话术。由模型能力表
     // （profile.booleanToggle/kind）驱动，渲染层不散落硬编码模型名。
-    const _boolToggle = !!profile.booleanToggle || profile.kind === "kimi-toggle";
+    // kind 不能再参与这个判断。kimi-toggle 是**发送形状**（发 thinking 布尔开关），不是
+    // **档位数量**——目录给出多档时同一个 kind 也会有三档可选，而 `|| kind === "kimi-toggle"`
+    // 让 _thinkingProfileFor 撤销 booleanToggle 的那一步整个失效：GLM-5.2 明明拿到了
+    // off/high/xhigh 三档，标题仍写"仅开/关"、high 仍被改写成"开启"，滑块渲染成
+    // 关闭|开启|超高——比不修还费解。只认这一个旗标，它由能力表和目录合并后统一给出。
+    const _boolToggle = !!profile.booleanToggle;
     const labels = _thinkLabels(profile.labels || {});
     if (_boolToggle && !(profile.labels && profile.labels.high)) labels.high = t("model.thinking.level.enabled");
     // 标题只留「思考深度」。原来还挂着上游参数名（thinking budget / reasoning_effort）
@@ -19659,6 +19664,38 @@ function _approvalLabel(call) {
       detail: `${call.owner || ""}/${call.repo || ""}${call.number ? ` #${call.number}` : ""}\n${String(call.title || call.body || "").slice(0, 240)}`,
     };
     case "http": return { title: `发送 ${String(call.method || "GET").toUpperCase()} 请求？`, detail: String(call.url || "").slice(0, 300) };
+    // 下面四个 2026-08-17 才进审批门。框上必须说清**这一次**要干什么：browser 的
+    // "点一下链接"和"把 ~/.ssh/id_rsa 传上去"是同一个工具的两个 action，只写"浏览器操作？"
+    // 等于让用户闭着眼睛点同意。
+    case "browser": {
+      const act = String(call.action || "");
+      const what = {
+        eval: "在页面里执行任意 JavaScript？",
+        cookies: "读取该站点的全部 Cookie（含登录态）？",
+        storage: "读取该站点的 localStorage？",
+        upload: "把本机文件上传到该网页？",
+        autofill: "替你填写表单并提交？",
+        click: "在页面上点击？",
+        type: "在页面里输入文字？",
+        navigate: "打开网址？",
+      }[act] || `浏览器操作（${act || "?"}）？`;
+      const extra = act === "upload"
+        ? (Array.isArray(call.paths) ? call.paths : [call.path]).filter(Boolean).join("\n")
+        : String(call.script || call.text || call.selector || "").slice(0, 240);
+      return { title: what, detail: [String(call.url || ""), extra].filter(Boolean).join("\n").slice(0, 400) };
+    }
+    case "docker_compose_up": return {
+      title: "启动一整套容器（后台常驻）？",
+      detail: `${call.path || "docker-compose.yml"}${Array.isArray(call.services) && call.services.length ? "\n服务：" + call.services.join(", ") : ""}`,
+    };
+    case "capture_replay": return {
+      title: `重放请求：${String(call.method || "GET").toUpperCase()}？`,
+      detail: String(call.url || "").slice(0, 300),
+    };
+    case "system": return {
+      title: "操作系统 / 其它应用？",
+      detail: `${call.action || call.op || "?"} ${String(call.app || call.target || call.item || "")}`.trim().slice(0, 300),
+    };
     case "tor": return { title: "经 Tor 网络发送请求？", detail: String(call.url || "").slice(0, 300) };
     // 关键信息是「改不改系统代理」，不是工具名：改了的话整台机器的流量都会走本地
     // mitmproxy，接着还要用户 sudo 装一张根证书。这必须写进 detail。
