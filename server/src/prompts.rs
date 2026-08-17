@@ -28,9 +28,19 @@ use std::path::PathBuf;
 const MAX_STATIC_TOOLS_PER_REQUEST: usize = 220;
 // L0 defense: the desktop can aggregate tools from several runtime/MCP services before this
 // request reaches the server. Bound the final array after every merge so one noisy service cannot
-// create an unbounded upstream payload. This limit is the complete compact JSON array, including
-// brackets and commas, measured as serialized UTF-8 bytes.
-const MAX_FINAL_TOOLS_PER_REQUEST: usize = 64;
+// create an unbounded upstream payload.
+//
+// The byte cap below is what actually bounds the payload (that trailing sentence about "serialized
+// UTF-8 bytes" always described IT, not the count). The count cap is only a sanity rail, and at 64
+// it silently contradicted MAX_STATIC_TOOLS_PER_REQUEST right above it: the client is explicitly
+// allowed to send "its complete static selection" (138 tools today), and enforce_final_tool_budget
+// keeps candidates in input order with runtime/MCP tools FIRST — so the tools dropped were the
+// core static ones (create_project, browser, http_request, db_query, the michael-design tools …),
+// evicted by whichever MCP service happened to be connected, with no warning on either side.
+// Keep the rail above the catalog plus MCP headroom and let the byte cap do the bounding.
+const MAX_FINAL_TOOLS_PER_REQUEST: usize = 220;
+// The complete compact JSON array, including brackets and commas, measured as serialized UTF-8
+// bytes. The bundled 138-tool catalog serializes to ~147 KiB, so this still binds.
 const MAX_FINAL_TOOL_SCHEMA_BYTES: usize = 256 * 1024;
 
 #[derive(Clone, Debug, Deserialize)]
