@@ -2003,6 +2003,57 @@ const APP_DIR_NAME: &str = ".mrdayone";
 
 /// 给别的模块用：它们要在同一个应用目录下开自己的子目录（OCR 辅助程序、浏览器 profile），
 /// 但不该各自硬编码名字——上一次改名就是这么漏的。
+/// 把只含用户自己该看的文件收紧到"仅当前用户"。
+///
+/// Unix 上是 chmod 0600 / 0700。Windows 上此前**什么都没做**：那三个
+/// `#[cfg(unix)]` 块整段跳过，于是存着 API Key 的 mcp.json 按目录继承的 ACL 落盘，
+/// 同机器上的其他账户照样读得到，而界面上、日志里没有任何异样——一道看起来存在、
+/// 实际空转的闸门比没有更糟。
+///
+/// Windows 侧走 icacls：`/inheritance:r` 先断掉继承来的 ACE，再只授当前用户完全控制。
+/// 不引新依赖（用 windows-acl 要拉一大串 crate），这也是微软自己文档里的做法。
+/// 失败要报出来而不是吞掉——静默失败正是这条的老毛病。
+pub fn restrict_to_current_user(path: &std::path::Path, dir: bool) -> Result<(), String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = if dir { 0o700 } else { 0o600 };
+        return std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
+            .map_err(|e| format!("无法收紧 {} 的权限：{e}", path.display()));
+    }
+    #[cfg(windows)]
+    {
+        let _ = dir;
+        let who = std::env::var("USERNAME").unwrap_or_default();
+        if who.trim().is_empty() {
+            return Err("无法确定当前用户名，未能收紧配置文件权限".into());
+        }
+        let out = crate::process_util::resolve_command("icacls")
+            .map(std::process::Command::new)
+            .unwrap_or_else(|| std::process::Command::new("icacls"))
+            .arg(path)
+            .arg("/inheritance:r")
+            .arg("/grant:r")
+            .arg(format!("{who}:(F)"))
+            .output()
+            .map_err(|e| format!("无法收紧 {} 的权限（icacls 未能运行）：{e}", path.display()))?;
+        if !out.status.success() {
+            return Err(format!(
+                "无法收紧 {} 的权限：icacls 退出码 {:?}，{}",
+                path.display(),
+                out.status.code(),
+                String::from_utf8_lossy(&out.stderr).trim()
+            ));
+        }
+        return Ok(());
+    }
+    #[allow(unreachable_code)]
+    {
+        let _ = (path, dir);
+        Ok(())
+    }
+}
+
 pub fn app_dir_name() -> &'static str {
     app_dir()
         .ok()
@@ -2161,13 +2212,8 @@ fn save_user_config_at(path: &std::path::Path, text: &str, force: bool) -> Resul
                 let backup = std::path::PathBuf::from(backup);
                 std::fs::write(&backup, existing.as_bytes())
                     .map_err(|e| format!("无法备份 {}：{e}", path.display()))?;
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt;
-                    // 备份里同样有 API Key，权限跟正本一致。
-                    let _ =
-                        std::fs::set_permissions(&backup, std::fs::Permissions::from_mode(0o600));
-                }
+                // 备份里同样有 API Key，权限跟正本一致。Windows 上以前整段跳过。
+                let _ = restrict_to_current_user(&backup, false);
                 return Err(format!(
                     "{} 现在不是合法 JSON（{reason}），已备份到 {}。\
                      直接保存会用面板里这份把它整个替换掉，里面的服务和 API Key 会一起丢失，\
@@ -2183,20 +2229,12 @@ fn save_user_config_at(path: &std::path::Path, text: &str, force: bool) -> Resul
         .ok_or_else(|| "无法确定配置目录".to_string())?
         .to_path_buf();
     std::fs::create_dir_all(&dir).map_err(|e| format!("无法创建 {}：{e}", dir.display()))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
-    }
+    let _ = restrict_to_current_user(&dir, true);
     let temp = dir.join(format!("{USER_CONFIG_FILE}.tmp"));
     std::fs::write(&temp, text.as_bytes()).map_err(|e| format!("写入失败：{e}"))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        // rename 之前就设好权限，避免出现"已经在最终路径、权限还是 0644"的窗口。
-        std::fs::set_permissions(&temp, std::fs::Permissions::from_mode(0o600))
-            .map_err(|e| format!("无法收紧 {} 的权限：{e}", temp.display()))?;
-    }
+    // rename 之前就设好权限，避免出现"已经在最终路径、权限还是宽的"的窗口。
+    // 失败直接返回错误：这份文件里有 API Key，收不紧就不该写下去。
+    restrict_to_current_user(&temp, false)?;
     std::fs::rename(&temp, path).map_err(|e| {
         let _ = std::fs::remove_file(&temp);
         format!("无法保存 {}：{e}", path.display())

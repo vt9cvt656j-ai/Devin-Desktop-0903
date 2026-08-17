@@ -454,13 +454,47 @@ const BLOCKED_ROOT_PREFIXES: &[&str] = &[
 /// Temp directories are carved back out: on macOS `std::env::temp_dir()` lives under
 /// `/var/folders`, and on Linux under `/tmp` — both inside blocked trees, and both
 /// legitimate scratch space that `SAFE_PREFIXES` already grants.
+/// Windows 前缀比对的纯字符串逻辑。**不带 cfg**，所以 macOS 上也编译、也被测试覆盖。
+///
+/// 这一步不是可选的。`std::fs::canonicalize` 在 Windows 上返回 verbatim 形式
+/// （`\\?\C:\Windows\System32`），而 `Path::starts_with` 是按**组件**比的：verbatim 路径的
+/// 首组件是 `Prefix::VerbatimDisk('C')`，和字面量 `C:\Windows` 里的 `Prefix::Disk('C')`
+/// 不相等 —— 于是整张系统目录黑名单一条都匹配不上，`C:\Windows` 能被登记成工作区根，
+/// 而这道闸门在界面上、日志里都不会有任何异样。加上 Windows 路径不区分大小写，
+/// `c:\windows` 同样要能命中。
+fn windows_prefix_match_form(raw: &str) -> String {
+    let stripped = raw
+        .strip_prefix(r"\\?\UNC\")
+        .map(|rest| format!(r"\\{rest}"))
+        .or_else(|| raw.strip_prefix(r"\\?\").map(str::to_string))
+        .unwrap_or_else(|| raw.to_string());
+    stripped.replace('/', "\\").to_lowercase()
+}
+
+/// 仍然按组件边界判，别让 `C:\Windowsfoo` 命中 `C:\Windows`。
+fn windows_starts_with_prefix(raw: &str, prefix: &str) -> bool {
+    let p = windows_prefix_match_form(raw);
+    let want = windows_prefix_match_form(prefix);
+    p == want || p.strip_prefix(&want).is_some_and(|rest| rest.starts_with('\\'))
+}
+
+#[cfg(windows)]
+fn starts_with_prefix(path: &Path, prefix: &str) -> bool {
+    windows_starts_with_prefix(&path.to_string_lossy(), prefix)
+}
+
+#[cfg(not(windows))]
+fn starts_with_prefix(path: &Path, prefix: &str) -> bool {
+    path.starts_with(Path::new(prefix))
+}
+
 fn blocked_root_prefix(path: &Path) -> Option<&'static str> {
     if has_safe_prefix(path) {
         return None;
     }
     BLOCKED_ROOT_PREFIXES
         .iter()
-        .find(|prefix| path.starts_with(Path::new(prefix)))
+        .find(|prefix| starts_with_prefix(path, prefix))
         .copied()
 }
 
@@ -475,7 +509,7 @@ const SAFE_PREFIXES: &[&str] = &[
 fn has_safe_prefix(path: &Path) -> bool {
     SAFE_PREFIXES
         .iter()
-        .any(|prefix| path.starts_with(Path::new(prefix)))
+        .any(|prefix| starts_with_prefix(path, prefix))
 }
 
 fn is_within_allowed_root(path: &Path, roots: &[PathBuf]) -> bool {
@@ -2617,6 +2651,60 @@ mod tests {
         // scratch space and are carved back out.
         assert!(blocked_root_prefix(Path::new("/tmp/scratch")).is_none());
         assert!(blocked_root_prefix(Path::new("/private/var/folders/ab/session")).is_none());
+    }
+
+    /// 两个匹配点必须走 `starts_with_prefix`，不能直接 `Path::starts_with`。
+    ///
+    /// 上面那条测试在 macOS 上验的是纯字符串逻辑；而"这段逻辑到底有没有被用上"
+    /// 在 macOS 上验不了——非 Windows 分支本来就是 `Path::starts_with`，改回去也一样绿。
+    /// 所以这里钉源码：谁把调用改回裸的 `path.starts_with`，Windows 上就又空转了。
+    #[test]
+    fn blocklist_routes_through_the_windows_aware_matcher() {
+        let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/files.rs"))
+            .expect("read files.rs");
+        let cut = src.find("mod tests").unwrap_or(src.len());
+        let code = &src[..cut];
+        let blocked = code
+            .find("fn blocked_root_prefix(")
+            .expect("blocked_root_prefix 必须存在");
+        let blocked_body = &code[blocked..blocked + 400];
+        assert!(
+            blocked_body.contains("starts_with_prefix(path, prefix)"),
+            "系统目录黑名单没走 Windows 感知的匹配器，Windows 上会整张空转"
+        );
+        let safe = code.find("fn has_safe_prefix(").expect("has_safe_prefix 必须存在");
+        assert!(
+            code[safe..safe + 300].contains("starts_with_prefix(path, prefix)"),
+            "临时目录豁免同样要按同一条规则匹配"
+        );
+    }
+
+    /// Windows 的系统目录黑名单此前**整张都是空转的**。
+    ///
+    /// `std::fs::canonicalize` 在 Windows 上返回 verbatim 形式（`\\?\C:\Windows`），
+    /// 而 `Path::starts_with` 按组件比：verbatim 的首组件是 `Prefix::VerbatimDisk`，和字面量
+    /// 里的 `Prefix::Disk` 不相等 —— 一条都匹配不上，`C:\Windows` 能被登记成工作区根，
+    /// 界面上和日志里都没有任何异样。这段逻辑只在 Windows 生效但**不带 cfg**，
+    /// 所以 macOS 上照样编译、照样跑得到。
+    #[test]
+    fn windows_prefix_match_handles_verbatim_and_case() {
+        // verbatim 前缀要被剥掉
+        assert!(windows_starts_with_prefix(r"\\?\C:\Windows\System32", r"C:\Windows"));
+        assert!(windows_starts_with_prefix(r"\\?\C:\Program Files\x", r"C:\Program Files"));
+        // 大小写不敏感
+        assert!(windows_starts_with_prefix(r"c:\windows\system32", r"C:\Windows"));
+        assert!(windows_starts_with_prefix(r"C:/Windows/System32", r"C:\Windows"));
+        // 根目录本身也算命中
+        assert!(windows_starts_with_prefix(r"C:\Windows", r"C:\Windows"));
+        // 但必须卡在组件边界上：C:\Windowsfoo 不是 C:\Windows 底下的东西
+        assert!(!windows_starts_with_prefix(r"C:\Windowsfoo\x", r"C:\Windows"));
+        assert!(!windows_starts_with_prefix(r"D:\Windows\x", r"C:\Windows"));
+        assert!(!windows_starts_with_prefix(r"C:\Users\m\proj", r"C:\Windows"));
+        // UNC 的 verbatim 形式还原成 \\server\share
+        assert_eq!(
+            windows_prefix_match_form(r"\\?\UNC\server\share\p"),
+            r"\\server\share\p"
+        );
     }
 
     #[cfg(unix)]

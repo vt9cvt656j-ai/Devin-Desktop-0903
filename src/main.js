@@ -14639,7 +14639,7 @@ function _builtinThinkingProfileFor(id) {
   // a hard 400 ("use thinking.type.adaptive"), while 3.7/4.6 still require the explicit
   // budget. One hardcoded budget table for every Claude was both dishonest UI and a broken
   // wire shape on aggregator (OpenAI-protocol) routes that forward the body verbatim.
-  if (/claude/.test(s)) {
+  if (/claude|opus|sonnet|haiku|fable|mythos/.test(s)) {
     if (/haiku/.test(s)) return none(t("model.thinking.reason.claudeHaiku"));
     if (/3[-_.]?5(?!\d)/.test(s)) return none("Claude 3.5 系列无扩展思考能力。");
     if (/3[-_.]?7(?!\d)/.test(s)) {
