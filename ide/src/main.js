@@ -16799,6 +16799,9 @@ function _scrubResidue(root) {
     // .run-revert-btn = 已移除的「撤销本轮全部改动」按钮；.agent-files-bar/.agent-files-list =
     // 已移除的「N Files」汇总条：旧会话快照里已经序列化了它们，
     // 恢复后是没有监听器的死 UI，这里一并清掉（保存+恢复两路都走）。
+    // .run-revert-btn 现在是**活的**（轮末的「本轮改了 N 个文件 · 全部撤销」），
+    // 但恢复出来的那份没有监听器、快照里也没有 run.checkpoint——按钮点了什么都不会
+    // 发生。所以仍然在保存/恢复时清掉：它是本轮的东西，不该跨重启假装还能用。
     root.querySelectorAll(".md-caret, .md-stream-tail, .next-steps, .run-revert-btn, .agent-files-bar, .agent-files-list").forEach((e) => e.remove());
     root.querySelectorAll(".agent-seg p, .msg__body > p").forEach((p) => {
       if (/^[.\s…。·]+$/.test(p.textContent || "")) p.remove();
@@ -18353,6 +18356,97 @@ function _liveTurnStats(body, { startedAt = Date.now(), getSettlement, getTimeli
     },
   };
 }
+// 本轮改动汇总 + 一键全撤。
+//
+// `run.checkpoint` 从第一次写入起就在存每个文件的原文（`_checkpointRecord`），
+// 而且每次写完还记一份"智能体最后写进去的内容"（`_checkpointMarkCurrent`）——
+// 两个字段**都没有任何消费点**，快照白攒了一路。用户想撤一轮改动，只能去聊天记录里
+// 翻十几张已经自动折叠的卡片逐个点。
+//
+// 这个按钮以前存在过又被删掉了（`_scrubResidue` 还在扫它的尸体 `.run-revert-btn`），
+// 历史是压缩导入的，查不到当初为什么删。所以这次按"最坏情况"重做：
+//   · 写回是**破坏性**的，必须先确认，且把要动的文件逐个列出来；
+//   · **事后被用户自己改过的文件一律不碰**——判据就是那个一直没人用的 `current`：
+//     磁盘上的内容和"智能体最后写的"不一致，说明这之后有人动过，撤回去就是毁掉他的
+//     编辑。这类文件在确认框里单独列出并跳过。
+function _runRevertPlan(cp) {
+  const entries = [];
+  for (const [path, snap] of cp || []) {
+    if (!snap) continue;
+    entries.push({ path, existed: !!snap.existed, content: snap.content || "", current: snap.current });
+  }
+  return entries;
+}
+
+async function _revertRunChanges(cp) {
+  const plan = _runRevertPlan(cp);
+  if (!plan.length) return { reverted: 0, skipped: [] };
+  const revert = [];
+  const skipped = [];
+  for (const item of plan) {
+    // current 为 undefined 表示这条没记到"最后写入的内容"（旧数据/删除类操作），
+    // 那就不做事后编辑检测——宁可少撤一个，也不要基于猜测去覆盖。
+    if (typeof item.current === "string") {
+      let onDisk = null;
+      try { onDisk = await backend.readTextFile(item.path); } catch { onDisk = null; }
+      if (onDisk !== null && onDisk !== item.current) { skipped.push(item.path); continue; }
+    }
+    revert.push(item);
+  }
+  if (!revert.length) return { reverted: 0, skipped };
+  let done = 0;
+  for (const item of revert) {
+    try {
+      if (item.existed) await backend.writeTextFile(item.path, item.content);
+      else await backend.deletePath(item.path);
+      done++;
+    } catch (error) {
+      console.warn("[revert] failed:", item.path, error);
+    }
+  }
+  return { reverted: done, skipped };
+}
+
+/// 轮末在 footer 旁边挂一条「改了 N 个文件 · 全部撤销」。
+function _appendRunRevertBar(body, run) {
+  try {
+    const cp = run?.checkpoint;
+    if (!body || !cp || !cp.size) return;
+    const bar = document.createElement("div");
+    bar.className = "run-revert-btn";
+    const n = cp.size;
+    const label = document.createElement("span");
+    label.textContent = `本轮改了 ${n} 个文件`;
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.textContent = "全部撤销";
+    btn.addEventListener("click", async () => {
+      if (btn.disabled) return;
+      const plan = _runRevertPlan(cp);
+      const list = plan.slice(0, 12).map((p) => `${p.existed ? "改" : "新建"} ${p.path}`).join("\n");
+      const ok = await _toolApprovalDialog({
+        title: `撤销本轮对 ${n} 个文件的改动？`,
+        detail: `${list}${plan.length > 12 ? `\n…另有 ${plan.length - 12} 个` : ""}`
+          + "\n\n新建的文件会被删除，改过的写回本轮开始前的内容。"
+          + "\n这之后你自己动过的文件会跳过，不会覆盖你的编辑。",
+        onceLabel: "撤销",
+        alwaysLabel: "",
+      });
+      if (ok !== "once") return;
+      btn.disabled = true;
+      btn.textContent = "撤销中…";
+      const { reverted, skipped } = await _revertRunChanges(cp);
+      btn.textContent = "已撤销";
+      label.textContent = skipped.length
+        ? `已撤销 ${reverted} 个 · 跳过 ${skipped.length} 个（你之后改过）`
+        : `已撤销 ${reverted} 个文件`;
+      try { showToast(skipped.length ? `撤销 ${reverted} 个；跳过 ${skipped.length} 个你之后改过的` : `已撤销 ${reverted} 个文件`); } catch {}
+    });
+    bar.append(label, btn);
+    body.appendChild(bar);
+  } catch { /* 汇总条不该影响回复本身 */ }
+}
+
 function _appendTurnStatsFooter(body, { elapsedMs = 0, settlement = null, timeline = null } = {}) {
   try {
     if (!body) return;
@@ -40730,9 +40824,13 @@ async function _agentModelTurn({ config, messages, toolSchemas, toolRegistry = n
           _activeStreamDiag.retryCount = 0;
           delete _activeStreamDiag.lastBytesAt;
         },
-        onRetry: ({ retry, retryLimit }) => {
+        onRetry: ({ retry, retryLimit, rateLimited }) => {
           _agentTimelineRecordMetric(timeline, _timelineTurn, "modelRetry", 0, Date.now(), { attempt: retry });
-          showAgentRetryToast(`模型线路出现问题，当前将重试第 ${retry}/${retryLimit} 次`, true);
+          const _msg = rateLimited
+            ? `线路被限流，等一会儿自动重试（${retry}/${retryLimit}）——不用手动重发`
+            : `模型线路出现问题，正在重试（${retry}/${retryLimit}）`;
+          _recoveryLine(body, _msg);
+          showAgentRetryToast(_msg, true);
         },
         /**
          * 连接在出字过程中断掉 → 带着"已经写出来的部分"接着写，而不是报错收场。
@@ -40774,6 +40872,7 @@ async function _agentModelTurn({ config, messages, toolSchemas, toolRegistry = n
             _suppressNarrativeForTools = false;
             if (_degradedProseEl) { try { _degradedProseEl.remove(); } catch {} _degradedProseEl = null; }
             const resumeMsgs = [..._l0Msgs, { role: "assistant", content: partial }];
+            _recoveryLine(body, `连接中断，正在从断点继续（${resume}/${resumeLimit}）——已生成的内容会保留`);
             showAgentRetryToast(
               `连接中断，正在从断点继续（${resume}/${resumeLimit}）——已生成的内容会保留，不重跑本轮`,
               true,
@@ -40903,6 +41002,19 @@ async function _agentModelTurn({ config, messages, toolSchemas, toolRegistry = n
         }
         return accepted;
         },
+      }).then((_recovered) => {
+        // 只有真的抖过才留痕：没抖过一个字都不该出现，否则这行本身变成噪音。
+        const _tries = Math.max(0, (Number(_recovered?.attempts) || 1) - 1);
+        const _resumed = Math.max(0, Number(_recovered?.resumes) || 0);
+        if (!_recovered?.error && (_tries || _resumed)) {
+          const _how = _resumed ? `从断点续传 ${_resumed} 次` : `重试 ${_tries} 次`;
+          _recoveryLine(body, `线路中途出过问题，已自动恢复（${_how}）`, true);
+          clearAgentRetryToast();
+        } else if (!_tries && !_resumed) {
+          // 一次就成的话，把可能残留的上一轮状态行撤掉。
+          try { body?.querySelector?.(".agent-recovery")?.remove(); } catch {}
+        }
+        return _recovered;
       });
     } catch (e) { turnErr = String(e?.message || e); }
     // 流结束：把最后一个（以及所有参数完整的）工具预览也定格，并同样通知外层。
@@ -47997,6 +48109,7 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
         settlement: _finalRunSettlement(_ru),
         timeline: run.timeline,
       });
+      _appendRunRevertBar(body, run);
     } catch {}
     finally {
       _liveStats.stop();
@@ -56482,6 +56595,27 @@ function clearToast(kind = "") {
   toastEl.classList.remove("is-visible");
   toastEl.textContent = "";
   return true;
+}
+// 恢复过程要**留痕**，不要飘走。
+//
+// 重试／断点续传／限流等待原来只走全局提示条：它盖在内容上、几秒后消失。于是事后用户完全
+// 不知道刚才线路抖过——而"它自己爬起来了"恰恰是最该被看见的一件事，那正是"像活的"和"很脆"
+// 的分界线。改成在这一轮的回答区里挂一行安静的状态：原地更新，结束后收敛成一句过去时留在
+// 原处，用户回头翻得到。
+//
+// role="status" 而不是 alert：读屏器要读得到，但不抢焦点、不打断正在进行的朗读。
+function _recoveryLine(body, text, settled = false) {
+  if (!body || typeof body.querySelector !== "function") return null;
+  let el = body.querySelector(".agent-recovery");
+  if (!el) {
+    el = document.createElement("div");
+    el.className = "agent-recovery";
+    el.setAttribute("role", "status");
+    body.appendChild(el);
+  }
+  el.classList.toggle("agent-recovery--settled", !!settled);
+  el.textContent = text;
+  return el;
 }
 function showAgentRetryToast(msg, persistent = false) {
   return showToast(msg, { kind: _AGENT_RETRY_TOAST_KIND, duration: persistent ? 0 : 3000 });

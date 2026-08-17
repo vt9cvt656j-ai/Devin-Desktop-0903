@@ -7809,6 +7809,32 @@ button.agent-plan__fold--toggle:focus-visible { outline: 2px solid #1a73e8; outl
 /* ---- composer (Cursor/Devin-style input card) ---- */
 /* 「回到最新」：往上翻之后跟随是**粘性**解除的，界面上原本没有任何回程入口。
    贴在输入框上沿，不占聊天区的布局。 */
+/* 轮末「本轮改了 N 个文件 · 全部撤销」。 */
+.run-revert-btn {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-top: 8px;
+  padding: 7px 10px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel);
+  color: var(--text-dim);
+  font-size: 12px;
+}
+.run-revert-btn button {
+  margin-left: auto;
+  padding: 3px 10px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text);
+  font-size: 12px;
+  cursor: pointer;
+}
+.run-revert-btn button:hover:not(:disabled) { background: var(--hover); }
+.run-revert-btn button:disabled { opacity: .55; cursor: default; }
+
 .chat-jump {
   position: absolute;
   top: -40px;
@@ -15573,3 +15599,37 @@ body.tree-selecting, body.tree-selecting * { user-select: none !important; -webk
 }
 /* 分页和动作条都靠右，原来一个居中一个靠右。 */
 .feature-panel__body .mcpfp-pager { justify-content: flex-end; }
+
+/* 恢复留痕：线路抖了/被限流/断点续传时，在这一轮回答区里挂一行安静的状态。
+   原来只有全局提示条——它盖在内容上、几秒后消失，事后用户完全不知道刚才发生过什么。
+   而"它自己爬起来了"恰恰是最该被看见的一件事。所以这行原地更新，结束后收敛成一句过去时
+   留在原处，用户回头翻得到。 */
+.agent-recovery {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 8px 0 2px;
+  padding: 6px 10px;
+  border-left: 2px solid var(--text-dim);
+  color: var(--text-dim);
+  font-size: 12.5px;
+  line-height: 1.5;
+  opacity: .92;
+}
+/* 进行中：左侧那道竖线缓缓呼吸，表示"还在动"，但不闪、不跳、不抢注意力。 */
+.agent-recovery::before {
+  content: "";
+  width: 5px; height: 5px; border-radius: 50%;
+  background: currentColor; flex: 0 0 auto;
+  animation: agent-recovery-pulse 1.8s ease-in-out infinite;
+}
+/* 已恢复：脉冲停掉，整行再压低一档——它已经是历史记录，不是当前状态。 */
+.agent-recovery--settled { opacity: .68; }
+.agent-recovery--settled::before { animation: none; opacity: .55; }
+@keyframes agent-recovery-pulse {
+  0%, 100% { opacity: .35; }
+  50%      { opacity: 1; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .agent-recovery::before { animation: none; }
+}

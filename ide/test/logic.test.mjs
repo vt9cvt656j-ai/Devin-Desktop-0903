@@ -6105,8 +6105,12 @@ test("agent transport retries stay inside the pre-progress request wrapper while
     "a transport error after partial tool deltas remains terminal");
   assert.match(turn, /_runModelRequestWithRetry\(\{/,
     "Agent turns must use the shared bounded model retry wrapper");
-  assert.match(turn, /onRetry:[\s\S]{0,300}模型线路出现问题，当前将重试第/,
+  // 文案换过一次（加了限流分支和行内留痕），钉的仍是同一条性质：**必须报出这是第几次重试**，
+  // 否则用户只看到"出问题了"，不知道它在自己往前走还是卡死了。
+  assert.match(turn, /onRetry:[\s\S]{0,400}正在重试（\$\{retry\}\/\$\{retryLimit\}）/,
     "a confirmed pre-progress route failure must advertise the retry index");
+  assert.match(turn, /onRetry:[\s\S]{0,400}线路被限流，等一会儿自动重试/,
+    "限流的等待要和普通重试分开说——用户得知道要不要自己动手");
   assert.doesNotMatch(SRC, /function _isTransientTurnErr|_waitForAiRecovery\(|_turnFails < 5/,
     "the outer Agent loop must not multiply the request retry policy");
   assert.doesNotMatch(SRC, /上一轮模型调用因网络波动[\s\S]{0,120}自动重试/);
@@ -6453,8 +6457,14 @@ test("agent retry toast is scoped and clears when real data resumes", () => {
     "a settled model turn must not leave a stale retry toast visible");
   assert.match(SRC, /showAgentRetryToast\("正在补齐工具参数后继续…"\)/,
     "tool-schema repair keeps the same scoped toast without making it persistent");
-  assert.match(SRC, /showAgentRetryToast\(`模型线路出现问题，当前将重试第 \$\{retry\}\/\$\{retryLimit\} 次`, true\)/,
+  assert.match(SRC, /_recoveryLine\(body, _msg\);\s*\n\s*showAgentRetryToast\(_msg, true\)/,
     "model-route retry status stays visible until real model output resumes");
+  // 提示条会飘走，行内那行不会：事后用户翻得到"线路抖过、它自己爬起来了"。
+  // 这是"像活的"和"很脆"的分界线，不是装饰。
+  assert.match(SRC, /_recoveryLine\(body, `线路中途出过问题，已自动恢复（\$\{_how\}）`, true\)/,
+    "恢复完要在原处留一句过去时，而不是让提示条飘走、什么痕迹都不留");
+  assert.match(SRC, /if \(!_recovered\?\.error && \(_tries \|\| _resumed\)\)/,
+    "没抖过就一个字都不该留——那行本身会变成噪音");
   assert.doesNotMatch(SRC, /网络\/服务波动 \(\$\{_turnFails\}\/5\)|等待链路恢复后自动继续/);
 });
 
