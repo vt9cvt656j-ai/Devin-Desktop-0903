@@ -33683,8 +33683,14 @@ function _mapToolCall(name, args, mcpToolMap = _mcpToolMap) {
       const _src = String(args.source || args.url || args.repo || args.repository || args.remote || "").trim();
       const _explicit = String(args.target || args.path || args.dest || args.destination
         || args.dir || args.directory || args.to || "").trim();
-      const _inferred = (_src.replace(/\.git$/i, "").replace(/[\/]+$/, "").split("/").pop() || "").trim();
-      return { type: "git", op: "clone", source: _src, target: _explicit || _inferred };
+      // 粘网页链接是常态：.../owner/repo/tree/main、/blob/main/src/app.ts 这种地址 git 根本
+      // clone 不动，而且照最后一段推目录名会推出 "main"。把 /tree、/blob 之后的部分截回
+      // owner/repo。只在**截完还剩下 owner/repo 两段**时才截——真有仓库就叫 tree
+      // （github.com/foo/tree），那种不能被截没了。
+      const _webUrl = /^(https?:\/\/[^\/]+\/[^\/]+\/[^\/]+)\/(?:tree|blob|commit|commits|releases|tags|pull|issues|wiki)(?:\/|$)/i.exec(_src);
+      const _clean = _webUrl ? _webUrl[1] : _src;
+      const _inferred = (_clean.replace(/\.git$/i, "").replace(/[\/]+$/, "").split("/").pop() || "").trim();
+      return { type: "git", op: "clone", source: _clean, target: _explicit || _inferred };
     }
     case "git_pull": return { type: "git", op: "pull" };
     case "git_blame": return { type: "git", op: "blame", path: args.path || "" };

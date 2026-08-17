@@ -850,7 +850,9 @@ test("Git clone is wired through L0 tools and mutating Git approvals are exact",
   assert.notEqual(first, second);
   assert.match(first, /git:clone/);
   assert.match(SRC, /gitClone: \(source, target\) => core\.invoke\("git_clone"/);
-  assert.match(SRC, /case "git_clone": \{[\s\S]{0,900}op: "clone"/);
+  // 上限放宽到 1800：这个分支的注释还会长（它要解释键名别名、目录推断、以及粘网页
+  // 链接时怎么截回 owner/repo）。守的是「这个分支产出 op: clone」，不是注释有多长。
+  assert.match(SRC, /case "git_clone": \{[\s\S]{0,1800}op: "clone"/);
   assert.match(SRC, /await backend\.gitClone\(source, target\)/);
 });
 
