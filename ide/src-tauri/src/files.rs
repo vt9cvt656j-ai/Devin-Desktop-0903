@@ -1760,17 +1760,45 @@ pub fn delete_text_file_if_unchanged(path: String, expected_content: String) -> 
     std::fs::remove_file(resolved).map_err(|e| e.to_string())
 }
 
-/// Write a file to /tmp for internal tools (no workspace restriction).
+/// 往系统临时目录写一个文件（内部工具用，不受工作区限制）。
+///
+/// 这里以前写死 `/tmp`。Windows 上那个路径会被解析成**当前盘根目录下的 `\tmp`**，默认
+/// 根本不存在，于是 `fs::write` 直接失败——依赖它的功能（HTML/CSS 实时预览的临时
+/// dev server 脚本等）在 Windows 上一律起不来。`std::env::temp_dir()` 两个平台都对。
 #[tauri::command(async)]
 pub fn write_tmp_file(name: String, content: String) -> Result<String, String> {
-    // Only ever write a bare filename under /tmp — strip any directory components
-    // so a name like "../etc/x" can't escape the temp dir.
+    // 只取文件名，去掉任何目录成分——`../etc/x` 这种逃不出临时目录。
     let safe = Path::new(&name)
         .file_name()
         .ok_or("invalid temp file name")?;
-    let path = std::path::Path::new("/tmp").join(safe);
+    let dir = std::env::temp_dir();
+    // 临时目录理论上一定在，但 Windows 上 TEMP 指向一个已被删掉的目录并不罕见。
+    let _ = std::fs::create_dir_all(&dir);
+    let path = dir.join(safe);
     std::fs::write(&path, &content).map_err(|e| e.to_string())?;
     Ok(path.to_string_lossy().to_string())
+}
+
+#[cfg(test)]
+mod tmp_file_tests {
+    /// `/tmp` 在 Windows 上被解析成**当前盘根目录下的 `\tmp`**，默认根本不存在，
+    /// 于是写入直接失败——依赖它的功能（HTML/CSS 实时预览的临时脚本等）一律起不来。
+    #[test]
+    fn a_temp_file_lands_in_the_systems_temp_dir_not_a_hardcoded_slash_tmp() {
+        let name = format!("michael-tmp-probe-{}.txt", std::process::id());
+        let written = super::write_tmp_file(name.clone(), "x".into()).expect("写临时文件");
+        let path = std::path::Path::new(&written);
+        assert!(path.is_file(), "没写出来：{written}");
+        assert!(
+            path.starts_with(std::env::temp_dir()),
+            "临时文件没落在系统临时目录里：{written}",
+        );
+        // 目录成分要被剥掉，`../` 逃不出去。
+        let escaped = super::write_tmp_file("../escaped.txt".into(), "x".into()).expect("写");
+        assert!(std::path::Path::new(&escaped).starts_with(std::env::temp_dir()), "{escaped}");
+        let _ = std::fs::remove_file(&written);
+        let _ = std::fs::remove_file(&escaped);
+    }
 }
 
 /// The current user's home directory, used as the default tree root.

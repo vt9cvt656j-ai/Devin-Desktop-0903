@@ -15,12 +15,24 @@ pub struct AuthResult {
     pub is_new_user: bool,
 }
 
+/// 本地账号库所在的目录。
+///
+/// Windows 上**没有 HOME，只有 USERPROFILE**。这里以前只读 HOME，读不到就退到 "."——
+/// 也就是把 SQLite 库建在**安装目录**下（Program Files 之类，通常不可写）。结果是
+/// 账号库初始化失败，登录整条路在 Windows 上不可用。全项目别处都写了这个兜底，
+/// 独独漏了这一处，所以单独抽出来并钉一条守卫。
+fn auth_db_dir() -> String {
+    let home = std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .unwrap_or_else(|_| ".".to_string());
+    format!("{home}/.michael_ide")
+}
+
 pub async fn init_db() -> Result<(), String> {
     // Default to an on-disk SQLite file under ~/.michael_ide (created if needed);
     // `mode=rwc` lets SQLite create the database file itself.
     let url = std::env::var("DATABASE_URL").unwrap_or_else(|_| {
-        let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-        let dir = format!("{home}/.michael_ide");
+        let dir = auth_db_dir();
         let _ = std::fs::create_dir_all(&dir);
         format!("sqlite://{dir}/auth.db?mode=rwc")
     });
@@ -478,5 +490,47 @@ pub async fn auth_verify_code(email: String, code: String) -> Result<AuthResult,
             message: "该邮箱尚未注册，请先设置密码注册".into(),
             is_new_user: true,
         }),
+    }
+}
+
+#[cfg(test)]
+mod auth_dir_tests {
+    /// HOME 和 USERPROFILE 都是进程级的，改它们的用例必须排队。
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    struct Restore(Vec<(&'static str, Option<String>)>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            for (key, old) in self.0.drain(..) {
+                unsafe {
+                    match old {
+                        Some(v) => std::env::set_var(key, v),
+                        None => std::env::remove_var(key),
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn windows_has_no_home_so_userprofile_must_be_honoured() {
+        let _serial = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _restore = Restore(vec![
+            ("HOME", std::env::var("HOME").ok()),
+            ("USERPROFILE", std::env::var("USERPROFILE").ok()),
+        ]);
+        unsafe {
+            std::env::remove_var("HOME");
+            std::env::set_var("USERPROFILE", "C:\\Users\\me");
+        }
+        assert_eq!(super::auth_db_dir(), "C:\\Users\\me/.michael_ide");
+        assert!(
+            !super::auth_db_dir().starts_with('.'),
+            "退到 \".\" 会把账号库建在安装目录里（Program Files 通常不可写），登录整条路会废掉",
+        );
+
+        // HOME 在的时候仍然优先用它——别把 macOS/Linux 的行为改掉。
+        unsafe { std::env::set_var("HOME", "/Users/me") };
+        assert_eq!(super::auth_db_dir(), "/Users/me/.michael_ide");
     }
 }

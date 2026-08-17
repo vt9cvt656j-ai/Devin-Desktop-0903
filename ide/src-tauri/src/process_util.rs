@@ -325,11 +325,75 @@ pub fn augmented_path(workspace: Option<&str>) -> String {
     }
 }
 
-/// Windows: let the OS resolve the command via PATH + PATHEXT (.exe/.cmd/.bat),
-/// so just hand the name back unchanged.
+/// Windows 上把命令名解析成一个**完整路径**。
+///
+/// 这里原来直接把名字原样交回去，注释写的理由是"让操作系统按 PATH + PATHEXT 去找"。
+/// **那个前提是错的**：Rust 的 `std::process::Command` 在 Windows 上走 `CreateProcessW`，
+/// 而它只会给无扩展名的名字补 `.exe`，**不查 PATHEXT**。npm 装出来的东西恰恰全是 `.cmd`
+/// （`npx.cmd`、`typescript-language-server.cmd`、`js-debug-adapter-stdio.cmd`），于是：
+///
+///   · 所有 npm 系语言服务器起不动（TS/JS、bash、yaml、dockerfile、vue…）
+///   · 几乎所有 MCP 服务连不上——内置市场那一排都是 `npx -y @modelcontextprotocol/...`，
+///     远程 MCP 依赖的 `mcp-remote` 桥也是
+///   · F5 一键调试起不来（Node 适配器同样是 .cmd）
+///
+/// 而且是**静默**的：`lsp_check_available` 那条路专门查了 .cmd/.bat，所以界面显示"已安装、
+/// 无需提示"，真正启动的这条路却找不到——用户看到的是"装好了但没反应"。
+///
+/// 另一半原因是 PATH 本身：`CreateProcessW` 用的是**进程**的 PATH，而 GUI 启动的应用拿到
+/// 的那份很窄，nvm/volta/用户级 npm 前缀都不在里面。所以这里查的是 `augmented_path`，
+/// 和 `lsp_check_available` 用的是同一份。
 #[cfg(windows)]
-pub fn resolve_command(cmd: &str, _workspace: Option<&str>) -> String {
+pub fn resolve_command(cmd: &str, workspace: Option<&str>) -> String {
+    if windows_command_is_explicit(cmd) {
+        return cmd.to_string();
+    }
+    let pathext = std::env::var("PATHEXT").unwrap_or_default();
+    let candidates = windows_command_candidates(cmd, &pathext);
+    for dir in augmented_path(workspace).split(';').filter(|d| !d.is_empty()) {
+        for name in &candidates {
+            let full = format!("{dir}\\{name}");
+            if std::path::Path::new(&full).is_file() {
+                return full;
+            }
+        }
+    }
+    // 找不到就退回原名：交给系统再试一次，报错也更像用户预期的那句"不是内部或外部命令"。
     cmd.to_string()
+}
+
+/// 调用方已经给了明确的东西（带路径、或带扩展名），别去改它。
+///
+/// **不带 cfg 是有意的**：这样它在 macOS 上也编译、也能测。Windows 那边的机器我没有，
+/// 交叉编译又卡在 C 依赖上——把纯逻辑留在两个平台都编译的地方，是这种情况下唯一能自证
+/// "至少语法和类型是对的"的办法。判据本身也和当前编译目标无关：一个带盘符或反斜杠的
+/// 字符串，在哪台机器上看都是"调用方已经指名道姓了"。
+fn windows_command_is_explicit(cmd: &str) -> bool {
+    cmd.contains('\\') || cmd.contains('/') || std::path::Path::new(cmd).extension().is_some()
+}
+
+/// `npx` + PATHEXT → `["npx", "npx.COM", "npx.EXE", "npx.BAT", "npx.CMD", …]`。
+///
+/// 裸名字排第一：PATH 上偶尔真的躺着一个无扩展名的可执行文件。PATHEXT 是用户可改的，
+/// 空的时候给一份和 Windows 默认一致的兜底。
+fn windows_command_candidates(cmd: &str, pathext: &str) -> Vec<String> {
+    let parse = |raw: &str| -> Vec<String> {
+        raw.split(';')
+            .map(str::trim)
+            .filter(|e| !e.is_empty())
+            .map(|e| e.to_string())
+            .collect()
+    };
+    // 兜底的判据是**解析出来的扩展名为空**，不是原始字符串为空：`";;"` 这种
+    // trim 之后非空、切出来却一个扩展名都没有，按前者判会让候选只剩裸名字——
+    // 而裸名字恰恰是 npm 系工具唯一找不到的那个形态。
+    let mut exts = parse(pathext);
+    if exts.is_empty() {
+        exts = parse(".COM;.EXE;.BAT;.CMD");
+    }
+    std::iter::once(cmd.to_string())
+        .chain(exts.into_iter().map(|e| format!("{cmd}{e}")))
+        .collect()
 }
 
 /// Maximum number of concurrent LSP or DAP processes allowed.
@@ -823,5 +887,59 @@ mod decode_tests {
         assert_eq!(incomplete_utf8_tail("你好".as_bytes()), 0);
         assert_eq!(incomplete_utf8_tail(b"abc"), 0);
         assert_eq!(incomplete_utf8_tail(b""), 0);
+    }
+}
+
+#[cfg(test)]
+mod windows_resolution_tests {
+    use super::*;
+
+    /// Windows 上「命令找不到」曾经同时打掉四个功能：npm 系语言服务器、几乎所有 MCP 服务
+    /// （内置目录清一色 `npx`）、Node 一键调试、抓包。根因是一句错的注释——`resolve_command`
+    /// 原样返回名字，理由写的是"让操作系统按 PATH + PATHEXT 解析"。**Rust 的 Command 在
+    /// Windows 上只补 `.exe`，从不读 PATHEXT。**
+    ///
+    /// 我没有 Windows 机器，交叉编译又卡在 C 依赖上，所以把纯逻辑抽了出来在这儿测——
+    /// 至少保证候选名的生成是对的，且这段代码在两个平台都真的编译过。
+    #[test]
+    fn npm_installed_tools_get_their_cmd_extension() {
+        let got = windows_command_candidates("npx", ".COM;.EXE;.BAT;.CMD");
+        assert_eq!(got, vec!["npx", "npx.COM", "npx.EXE", "npx.BAT", "npx.CMD"]);
+        // 裸名字必须排第一：PATH 上偶尔真的躺着无扩展名的可执行文件。
+        assert_eq!(got[0], "npx");
+        // 这三个是真实会被找的：npm/gem 装出来的就是它们。
+        for want in ["npx.CMD", "npx.BAT"] {
+            assert!(got.iter().any(|c| c == want), "少了 {want}：{got:?}");
+        }
+    }
+
+    #[test]
+    fn an_empty_or_odd_pathext_still_finds_cmd_and_bat() {
+        // PATHEXT 是用户可改的，清空它不该让 npm 系工具全体消失。
+        for weird in ["", "   ", ";;"] {
+            let got = windows_command_candidates("npx", weird);
+            assert!(got.iter().any(|c| c == "npx.CMD"), "{weird:?} → {got:?}");
+            assert!(got.iter().any(|c| c == "npx.EXE"), "{weird:?} → {got:?}");
+        }
+        // 分号周围的空格要吃掉，否则拼出来的是 "npx .CMD"。
+        assert!(windows_command_candidates("npx", " .EXE ; .CMD ")
+            .iter()
+            .any(|c| c == "npx.CMD"));
+    }
+
+    #[test]
+    fn an_explicit_path_or_extension_is_left_alone() {
+        // 调用方已经指名道姓的，不许改——改了会把用户显式选的解释器换掉。
+        for explicit in [
+            "C:\\Python311\\python.exe",
+            "..\\node_modules\\.bin\\tsserver.cmd",
+            "/usr/local/bin/node",
+            "python.exe",
+        ] {
+            assert!(windows_command_is_explicit(explicit), "{explicit}");
+        }
+        for bare in ["npx", "node", "python", "rust-analyzer"] {
+            assert!(!windows_command_is_explicit(bare), "{bare} 应当去 PATH 里找");
+        }
     }
 }
