@@ -48,7 +48,7 @@ export function Shell() {
               <button className="tbtn tbtn--icon tbtn--premium" id="michaelPremiumBtn" data-i18n-title="premiumDb.title" data-i18n-aria-label="premiumDb.title" title="Michael Premium — 数据库工具" aria-label="Michael Premium — 数据库工具">
                 <svg className="ic"><use href="#i-premiumdb" /></svg>
               </button>
-              <button className="tbtn tbtn--icon" id="terminalBtn" data-i18n-title="terminal.toggle" title="Toggle terminal (⌃`)">
+              <button className="tbtn tbtn--icon" id="terminalBtn" title="Toggle terminal">
                 <svg className="ic"><use href="#i-terminal" /></svg>
               </button>
               <button className="tbtn tbtn--icon" id="extensionsBtn" data-i18n-title="ext.title" title="Extensions" hidden>
@@ -279,8 +279,8 @@ export function Shell() {
               </div>
               <div className="welcome__tips">
                 <span className="kbd-tip"><kbd>Ctrl</kbd><kbd>O</kbd> <span data-i18n="explorer.openBtn">打开文件夹</span></span>
-                <span className="kbd-tip"><kbd>Ctrl</kbd><kbd>⇧</kbd><kbd>P</kbd> <span data-i18n="menu.commandPalette">命令面板</span></span>
-                <span className="kbd-tip"><kbd>↩</kbd> <span data-i18n="welcome.tipAsk">询问助手</span></span>
+                <span className="kbd-tip"><kbd>Ctrl</kbd><kbd>Shift</kbd><kbd>P</kbd> <span data-i18n="menu.commandPalette">命令面板</span></span>
+                <span className="kbd-tip" data-kbd-combo="enter"><span data-i18n="welcome.tipAsk">询问助手</span></span>
               </div>
               <div className="welcome__copyright">© 2026 Digital Bang Intelligence LLC. All rights reserved.</div>
             </div>
@@ -311,7 +311,7 @@ export function Shell() {
                   <button className="terminal-panel__action" id="termMaxBtn" type="button" title="Maximize Panel">
                     <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round" strokeLinejoin="round"><rect x="3" y="3" width="10" height="10" rx="1.5" /></svg>
                   </button>
-                  <button className="terminal-panel__action" id="terminalClose" type="button" data-i18n-title="terminal.close" data-i18n-aria-label="terminal.close" title="Close Panel (⌃`)" aria-label="Close terminal">
+                  <button className="terminal-panel__action" id="terminalClose" type="button" title="Close panel" aria-label="Close panel">
                     <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round"><path d="M4.5 4.5l7 7M11.5 4.5l-7 7" /></svg>
                   </button>
                 </div>
@@ -413,7 +413,7 @@ export function Shell() {
                     <svg className="voice-btn__mic" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"><path d="M12 2a3 3 0 0 0-3 3v6a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3z" /><path d="M19 10v1a7 7 0 0 1-14 0v-1" /><path d="M12 19v3" /></svg>
                     <span className="voice-btn__wave" aria-hidden="true"><i></i><i></i><i></i><i></i><i></i></span>
                   </button>
-                  <span className="composer__hint">Ctrl↩</span>
+                  <span className="composer__hint"></span>
                   <button className="send" id="sendBtn" type="submit" data-i18n-title="assistant.send" title="发送">
                     <svg className="ic"><use href="#i-arrow-up" /></svg>
                   </button>

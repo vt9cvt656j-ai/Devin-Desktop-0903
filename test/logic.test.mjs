@@ -1749,8 +1749,25 @@ test("keyboard shortcuts use platform primary modifier instead of hardcoded mac 
     "命令面板没接进可改键的动作表");
   assert.doesNotMatch(SRC, /includes\("mod\+shift\+p"\)/,
     "又出现了第二条硬编码的命令面板监听，它会让改键失效");
-  assert.match(SRC, /const action = keyComboAliases\(e\)\.map\(\(combo\) => bindings\[combo\]\)/,
+  assert.match(SRC, /const combos = keyComboAliases\(e\);[\s\S]{0,120}combos\.map\(\(combo\) => bindings\[combo\]\)/,
     "全局分发器没用平台别名");
+  /*
+   * 分发器还必须让两种键：
+   *  · 输入法组字时（Windows 上中文输入是常态）——抢走就是把用户正在拼的字打断；
+   *  · 打字时的**裸键**——Windows 上删除文件的默认键位是裸 Delete，而分发器以前无条件先
+   *    preventDefault 再执行动作，于是在编辑器/输入框/终端里按 Delete：字符删不掉，
+   *    删文件又被动作内部的守卫挡住，净效果是 Delete 键在整个应用里失效。
+   */
+  // 锚点要用派发器独有的那一句：文件里还有别的 keydown 监听（功能面板的 Esc），
+  // 按 `window.addEventListener("keydown"` 去找会命中更早的那一个。
+  const dispatcherAt = SRC.indexOf("const combos = keyComboAliases(e);");
+  assert.ok(dispatcherAt > 0, "找不到全局键位派发器");
+  const dispatcher = SRC.slice(Math.max(0, dispatcherAt - 700), dispatcherAt + 600);
+  assert.match(dispatcher, /if \(e\.isComposing \|\| e\.keyCode === 229\) return;/,
+    "分发器没让输入法——Windows 上打中文会被打断");
+  assert.match(dispatcher, /if \(bare && _focusIsTextEntry\(\)\) return;/,
+    "裸键在打字时没让路——Windows 上 Delete 键会被整个吃掉");
+  assert.match(SRC, /\[mac \? "mod\+backspace" : "delete"\]/, "删除文件的默认键位应当按平台分");
   assert.match(SRC, /"mod\+o": "file\.openFolder"/);
   assert.match(SRC, /"mod\+w": "file\.close"/);
   assert.match(SRC, /hint: shortcutLabel\("mod\+s"\)/,
@@ -6636,6 +6653,51 @@ test("装完没装完问后端，不在前端拼一句只有 macOS 认的 shell"
   assert.match(SRC, /_showInstallProgress\(installCmd, toolName, langId\)/, "调用点没传 langId");
   assert.match(SRC, /showNotification: \(\{ title, message, actionLabel, duration, installCmd, langId \}\)/,
     "通知适配器没把 langId 收进来");
+});
+
+test("界面上的快捷键按平台显示：Windows 用词、Ctrl 在最前，且没有 mac 字形", () => {
+  const mk = (isMac) => new Function(
+    "isMacPlatform",
+    extractFn("formatCombo") + extractFn("shortcutLabel") + ";return shortcutLabel;",
+  )(() => isMac);
+  const win = mk(false), mac = mk(true);
+
+  // 修饰键顺序也是平台习惯的一部分。绑定表写的是 mac 顺序（shift+mod+e ＝ ⇧⌘E），
+  // 照原样渲染 Windows 用户看到的是 "Shift+Ctrl+E"——而 Windows 一律 Ctrl 在最前。
+  assert.equal(win("shift+mod+e"), "Ctrl+Shift+E");
+  assert.equal(win("shift+mod+p"), "Ctrl+Shift+P");
+  assert.equal(win("mod+enter"), "Ctrl+Enter");
+  // mac 那套一个字都不能变。
+  assert.equal(mac("shift+mod+e"), "⇧⌘E");
+  assert.equal(mac("mod+enter"), "⌘↩");
+  // Windows 上不许出现 mac 字形——Segoe UI 里没有这些码位，会掉到回落字体变异体字符，
+  // 读屏还会把它念出来。
+  for (const combo of ["mod+r", "shift+mod+p", "mod+enter", "mod+backspace", "shift+f11"]) {
+    assert.doesNotMatch(win(combo), /[⌘⌥⌃⇧↩⌫⌦⇥]/, `${combo} 在 Windows 上渲染出了 mac 字形`);
+  }
+});
+
+test("快捷键文案只有一个写者——i18n 词条里不带组合键", () => {
+  /*
+   * 以前是两个写者互相打架：applyPlatformShortcutLabels 把 title 写成
+   * 「切换终端 (Ctrl+`)」，i18n 的属性观察器（它的 attributeFilter 里有 title）在下一帧
+   * 按 data-i18n-title 把它改回词条原文——而那几条词条硬编码着 `(⌃`)`。
+   * 净效果：Windows 上终端按钮永远显示 mac 的 ⌃，而运行/文件/命令面板那几个
+   * 因为词条里根本没有组合键，**快捷键提示整个消失**（两个平台都受影响）。
+   */
+  const i18n = readFileSync(join(HERE, "..", "src", "i18n.js"), "utf8");
+  assert.doesNotMatch(i18n, /[⌘⌥⌃⇧↩⌫]/, "i18n 词条里还有 mac 字形——它会覆盖平台化的结果");
+  const shell = readFileSync(join(HERE, "..", "src", "app", "Shell.jsx"), "utf8");
+  assert.doesNotMatch(shell, /[⌘⌥⌃⇧↩⌫]/, "静态 JSX 里还有写死的 mac 字形");
+  // 那两个按钮的 data-i18n-title 必须摘掉，否则观察器还是会把组合键抹掉。
+  assert.doesNotMatch(shell, /id="terminalBtn"[^>]*data-i18n-title/, "terminalBtn 的标记没摘");
+  assert.doesNotMatch(shell, /id="terminalClose"[^>]*data-i18n-title/, "terminalClose 的标记没摘");
+  // 摘了标记就得在这边取本地化名字，否则语言一切换按钮就永远是中文。
+  assert.match(extractFn("setShortcutTitle"), /t\(labelKey\)/, "标题没走 i18n 取名字");
+  assert.match(SRC, /setShortcutTitle\("terminalBtn", "terminal\.toggle"/, "标题栏终端按钮没被平台化");
+  // 语言切换后要重跑，否则新词条铺上去平台化结果就没了。
+  const onLocale = SRC.slice(SRC.indexOf("onLocaleChange(() => {"));
+  assert.match(onLocale.slice(0, 900), /applyPlatformShortcutLabels\(\);/, "切换语言后没重跑平台化");
 });
 
 test("项目模板不再用 shell 写种子文件，命令按平台展开", () => {
