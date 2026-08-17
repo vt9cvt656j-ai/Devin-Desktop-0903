@@ -9434,7 +9434,7 @@ async function openFolder(path, owner = null) {
   try { await backend.registerWorkspaceRoot(path); }
   catch (e) { if (inTauri) showToast(`⚠️ 打开「${basename(path)}」时注册失败：${String(e?.message || e).slice(0, 80)}。该目录下读写可能被拒绝。`); }
   _ipcBroadcast("workspace_changed", { roots: [path], active: path });
-  // 项目记忆读回：本地存储为空时（换机器、清了应用数据、重装）从 .michael/memory.md 恢复。
+  // 项目记忆读回：本地存储为空时（换机器、清了应用数据、重装）从 .mrdayone/memory.md 恢复。
   // 不 await——它只影响后续轮次的记忆检索，不该让"打开文件夹"多等一次磁盘往返。
   void _importProjectMemoryFile(path);
   await renderWorkspaceRoots();
@@ -36694,12 +36694,13 @@ function _kgPrune(notes) {
 // 什么""这个坑已经踩过"这类最不该丢的东西。用户的话：能实时扶正项目内容、锁定项目目标不偏航、
 // 把遇到的错误放进去不再犯。
 //
-// 所以镜像一份到 <root>/.michael/memory.md：
+// 所以镜像一份到 <root>/.mrdayone/memory.md（目录按产品名，对应 Claude Code 的 .claude/；
+// IDE 其它状态还在历史名 .michael/ 下，那是另一次迁移的事）：
 //   · 写入时同步落盘 —— 文件是人可读、可手改的真相；
 //   · 打开项目时若 localStorage 为空则从文件读回 —— 换机器、清数据、重装都还在；
 //   · 检索/排序/纠错账本/篇幅裁剪那一整套逻辑**一行不动**，文件只当持久层。
 // 分节沿用已有的 _kgClassify，不新造一套分类——两套分类必然漂。
-const _PROJECT_MEMORY_REL = ".michael/memory.md";
+const _PROJECT_MEMORY_REL = ".mrdayone/memory.md";
 const _PM_SECTIONS = [
   { title: "项目目标与约定（锁定，防偏航）", types: ["convention", "preference"] },
   { title: "项目事实（实时扶正）", types: ["fact", "architecture", "command"] },
@@ -44002,8 +44003,8 @@ function _agentDecisionFrameBlock(text, profile = _engineeringProfileWithAiInten
     //     blindEdit 提醒已经是事实类（改了从没读过的文件会被点名）。
     //   ③「每一步先想」——每写一个文件之前想清楚要达成什么、影响谁、怎么验证。
     lines.push("交付规格律：默认按**完整可用**交付，不降级、不做演示版。禁止留 TODO/占位实现/假数据/写死分支充数，不省错误处理、边界情况、加载与空状态，不把多处调用改成只改一处。需求过大就拆成**有序的完整切片**逐个交付，每片都真能用——不是砍功能凑一个能跑的壳。ask_user 只在你真的读不懂用户要什么时才用（两种读法会导向完全不同的东西），不要拿它去问「要不要先做个简版」。已有代码沿用现存的分层、命名、错误处理和测试方式，不因为自己顺手就把别人的写法改烂或绕开。");
-    lines.push("先读懂再动手律：改代码或加功能之前，先把这块真正读懂——依赖与版本、入口与启动方式、模块边界与调用方、现有约定，以及这个 bug 的**真实成因**（不是症状）。要改的文件必须先 read_file 读过，不靠记忆和猜测下手；读不到证据就先取证，别先写。");
-    lines.push("逐步思考律：每写一个文件、每走一步之前，先想清楚这一步要达成什么、会影响谁、怎么验证；写完立刻用真实结果（诊断/命令退出码/真实输出）验证再走下一步。一口气连写多个文件不验证，是本项目里出 bug 最多的方式。");
+    lines.push("先读懂再动手律：改代码或加功能之前，先把这块真正读懂——依赖与版本、入口与启动方式、模块边界与调用方、现有约定，以及这个 bug 的**真实成因**（不是症状）。要改的文件必须先 read_file 读过，不靠记忆和猜测下手；读不到证据就先取证，别先写。读懂之后**反推一遍**：用户没说但这件事显然需要的、这次改动会牵连到的地方、以及读代码时顺手发现的其它真实缺陷——属于本次目标的直接做掉，超出范围的在收尾时一句话点出来，别装作没看见。改动落盘之后，先前读到的内容就过期了：要再用就重新读，不拿旧快照当现状，也不沿用已经被替换掉的老文件。");
+    lines.push("逐步思考律：每写一个文件、每走一步之前，先想清楚这一步要达成什么、会影响谁、怎么验证；写完立刻用真实结果（诊断/命令退出码/真实输出）验证再走下一步。一口气连写多个文件不验证，是本项目里出 bug 最多的方式。光看代码不算验证——现成的测试就跑现成的，没有就**自己写一个测试文件或临时脚本**去真跑一遍（覆盖正常路径和你刚碰过的边界），拿退出码和输出当证据。临时脚本用完删掉，真正有价值的测试留在项目里并说明放在哪。");
     lines.push("项目工程律：所有项目任务默认工程级，不管大小都走最短可靠证据链。小改动=真实文件/诊断 → 最小改动 → 真实验证；项目级改动先建立项目地图（package/workspace、入口、脚本、服务、配置、CI、数据库、部署线索）、模块边界和现有约定，再动代码。");
     lines.push("变更半径律：动手前识别调用方、API/数据契约、状态/缓存/权限/跨服务影响；不全仓盲改，不一次性重写无关模块；按薄切片交付，每个切片都有可验证结果。验证矩阵按影响选择 unit/typecheck/lint/build/integration/e2e/contract/migration/smoke，命令输出和 exit code 才算证据。");
     lines.push("可维护升级律：任何项目默认要好维护、好升级：清晰目录/模块边界、配置/env 集中、类型/schema/接口明确、组件/服务可复用、扩展点可替换、测试与 README/用法说明齐全；禁止把业务规则、颜色、端口、密钥、路径和魔法值散落硬编码。");
@@ -52516,7 +52517,7 @@ async function _executeToolStepInner(step, call, root, run) {
       // "global" → the cross-project _global store (root ""), else the current project.
       const isGlobal = call.scope === "global";
       const ok = _kgAddNote(isGlobal ? "" : root, call.content);
-      // 项目记忆同步落盘到 .michael/memory.md：不落盘的记忆等于只存在这台机器的浏览器里。
+      // 项目记忆同步落盘到 .mrdayone/memory.md：不落盘的记忆等于只存在这台机器的浏览器里。
       // 不 await——落盘失败不该让"已记住"变成失败，文件只是持久层，内存那份已经生效了。
       if (ok && !isGlobal) void _mirrorProjectMemoryFile(root);
       res.className = ok ? "atc-result atc-result--ok" : "atc-result atc-result--err";
