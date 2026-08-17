@@ -7807,7 +7807,31 @@ button.agent-plan__fold--toggle:focus-visible { outline: 2px solid #1a73e8; outl
 }
 
 /* ---- composer (Cursor/Devin-style input card) ---- */
+/* 「回到最新」：往上翻之后跟随是**粘性**解除的，界面上原本没有任何回程入口。
+   贴在输入框上沿，不占聊天区的布局。 */
+.chat-jump {
+  position: absolute;
+  top: -40px;
+  right: 16px;
+  z-index: 5;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 5px 11px 5px 9px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: var(--panel-solid);
+  color: var(--text);
+  font-size: 12px;
+  box-shadow: 0 4px 14px rgba(0, 0, 0, .14);
+  cursor: pointer;
+}
+.chat-jump:hover { background: var(--hover); }
+.chat-jump[hidden] { display: none; }
+.chat-jump .ic { width: 13px; height: 13px; }
+
 .composer {
+  position: relative;
   padding: 12px;
   border-top: 1px solid var(--line);
   background: var(--panel-solid);

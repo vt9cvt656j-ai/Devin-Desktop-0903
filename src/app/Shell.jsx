@@ -401,6 +401,15 @@ export function Shell() {
             <div id="chatTabBar"></div>
             <div className="chat" id="chat"></div>
             <form className="composer" id="composer">
+              {/* 「回到最新」。放在 composer 里而不是 #chat 里：切标签时 chatEl 的子节点
+                  会被整个清空（main.js 的 removeChild 循环），放进去第一次切标签就没了。 */}
+              <button type="button" id="chatJump" className="chat-jump" hidden
+                data-i18n-title="assistant.jumpToLatest" title="回到最新">
+                <svg className="ic" viewBox="0 0 16 16" aria-hidden="true">
+                  <path d="M8 3v9m0 0l-4-4m4 4l4-4" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" />
+                </svg>
+                <span data-i18n="assistant.jumpToLatest">回到最新</span>
+              </button>
               <div className="composer__box">
                 <div id="prompt" contentEditable="true" role="textbox" aria-multiline="true" data-i18n-placeholder="assistant.placeholder" data-placeholder="询问关于当前文件的问题…"></div>
                 <div className="composer__bar">
