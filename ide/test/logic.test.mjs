@@ -850,7 +850,7 @@ test("Git clone is wired through L0 tools and mutating Git approvals are exact",
   assert.notEqual(first, second);
   assert.match(first, /git:clone/);
   assert.match(SRC, /gitClone: \(source, target\) => core\.invoke\("git_clone"/);
-  assert.match(SRC, /case "git_clone": return \{ type: "git", op: "clone"/);
+  assert.match(SRC, /case "git_clone": \{[\s\S]{0,900}op: "clone"/);
   assert.match(SRC, /await backend\.gitClone\(source, target\)/);
 });
 
@@ -24034,7 +24034,10 @@ test("ui_extract 五处都接齐了", () => {
   const gw = JSON.parse(readFileSync(new URL("../../server/prompts/tools.json", import.meta.url), "utf8"));
   const t = gw.find((x) => x?.function?.name === "ui_extract");
   assert.ok(t, "网关目录里没有");
-  assert.deepEqual(t.function.parameters.required, ["source"]);
+  // source 从必填改成可选：实现本来就兜底成 "url"（tool-guides 的示例参数也是 {source:"url"}），
+  // 而 schema 拦着 → 模型不填就整轮失败。schema 比实现更严是一整类 bug，用户实拍过 git_clone
+  // 那次：「把这个仓库拉下来」被 required:["source","target"] 挡死。
+  assert.deepEqual(t.function.parameters.required, []);
 });
 
 test("提取的是事实，且拿不到时如实说拿不到", () => {
