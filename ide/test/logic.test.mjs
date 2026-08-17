@@ -310,6 +310,11 @@ AUTO_LOAD_DEPS = {
   // 都调它，抠出任何一个的测试都需要——少了是 ReferenceError，表现成"这个测试挂了"
   // 而不是"命令没认出来"。给真实现，不给桩。
   _stripHarmlessRedirects: load("_stripHarmlessRedirects", {}),
+  // 「这次是谁拒的」走的旁路。那道授权门的返回值仍然是布尔（改成对象的话
+  // `{ok:false}` 是真值，门会当场变成一律放行），理由由这两个函数带出来。
+  // 抽那道门的测试不止一处，少了它是 ReferenceError。
+  _noteRefusal: () => {},
+  _permRuleSource: () => "",
   // computer 的合法动作表：schema enum、映射白名单、报错文案三处以前各抄一份，
   // 漏了 mouse.position。现在是同一份常量，抠映射层的测试要跟着注进来。
   _COMPUTER_METHODS: new Function(`${/const _COMPUTER_METHODS = \[[\s\S]*?\];/.exec(SRC)[0]}\n;return _COMPUTER_METHODS;`)(),
@@ -2388,7 +2393,7 @@ test("the approval gate is real, reachable, and exposed in settings", () => {
   assert.equal(gateRefs, 2,
     `_approveToolCall 应该恰好有 1 处定义 + 1 处调用（找到 ${gateRefs} 处引用）`);
   const wrapper = extractFn("_executeToolStep");
-  assert.match(wrapper, /if \(!\(await _approveToolCall\(call, run\)\)\)[\s\S]{0,400}return denied;/,
+  assert.match(wrapper, /if \(!\(await _approveToolCall\(call, run\)\)\)[\s\S]{0,900}return denied;/,
     "the single checkpoint lives at the top of _executeToolStep");
   // The gate must run BEFORE the failure-memory bookkeeping, or a user declining a risky
   // command would burn strikes toward the 3-failure lockout for that tool.
@@ -25736,4 +25741,36 @@ test("chat 模式中断也能从断点继续，不是让用户把整条消息重
   // 限流的等待要和普通重试在界面上分得开，否则用户不知道在等什么。
   assert.match(call, /rateLimited\s*\n?\s*\?\s*`线路被限流/,
     "限流的提示要和普通重试区分");
+});
+
+test("规则拦下的不能写成「用户已拒绝」——用户根本没点过", async () => {
+  const denied = load("_userDeniedToolResult", {});
+  // 规则拦：要说清是规则、并指出哪份文件；给模型的建议也不同（别绕，去让用户改规则）
+  const byRule = denied({ type: "cmd", command: "npm test" }, { by: "rule", detail: ".michael/settings.json" });
+  assert.equal(byRule.blockedBy, "rule");
+  assert.equal(byRule.userDenied, false, "标成用户拒绝会让失败记忆把仓库规则记成用户的决定");
+  assert.match(byRule.content, /权限规则/);
+  assert.match(byRule.content, /\.michael\/settings\.json/, "不说在哪，用户还得自己翻三个作用域");
+  assert.doesNotMatch(byRule.content, /用户拒绝了这次调用/);
+  // 技能范围外：既不是用户不同意，也不是规则
+  const bySkill = denied({ type: "web" }, { by: "skill", detail: "docx" });
+  assert.equal(bySkill.blockedBy, "skill");
+  assert.match(bySkill.content, /allowed-tools/);
+  // 用户真的点了拒绝：原样保留旧文案和旧信号
+  const byUser = denied({ type: "write", path: "a.js" }, { by: "user", detail: "" });
+  assert.equal(byUser.userDenied, true);
+  assert.equal(byUser.failure.code, "user_denied");
+  assert.match(byUser.content, /用户拒绝了这次调用/);
+  // 没带裁决时按用户拒绝处理——旧调用点的行为不变
+  assert.equal(denied({ type: "write" }).userDenied, true);
+
+  // 那道门的返回值必须保持布尔：改成返回对象的话 `{ok:false}` 是真值，
+  // 全链路的 `if (!(await ...))` 会当场变成一律放行。
+  const gate = stripJsComments(extractFn("_approveToolCall"));
+  assert.doesNotMatch(gate, /return \{[^}]*ok:\s*false/, "授权门开始返回对象了——这会把门变成一律放行");
+  assert.match(gate, /_noteRefusal\("rule", _permRuleSource\(call\)\)/,
+    "只说被规则拦了、不说在哪，用户还是得自己翻三个作用域");
+  assert.match(gate, /_noteRefusal\("user", ""\)/);
+  assert.match(gate, /_noteRefusal\("skill", skillGate\.names\[0\]/,
+    "技能范围外不置位的话，会落到默认的「用户拒绝」分支——而用户没点过");
 });

@@ -19828,7 +19828,10 @@ async function _loadPermissionRules(root) {
   //
   // 而那道弹窗是这份代码自己称为「整条执行链上唯一的授权检查点」的东西。放宽必须由用户
   // 本人给出，仓库只能收紧。
-  const absorb = (raw, { trusted }) => {
+  // 每条规则记一下出处：拦下的时候要能告诉用户"这是哪份文件写的"。
+  // 只说"被规则拦了"而不说在哪，用户还是得自己翻三个作用域去找。
+  const origin = new Map();
+  const absorb = (raw, { trusted, from = "" }) => {
     let parsed = null;
     try { parsed = JSON.parse(raw || "{}"); } catch { return; }
     const perms = parsed && typeof parsed === "object" ? parsed.permissions : null;
@@ -19836,26 +19839,29 @@ async function _loadPermissionRules(root) {
     for (const bucket of ["allow", "ask", "deny"]) {
       if (bucket === "allow" && !trusted) continue; // 仓库里的 allow 一律丢弃
       for (const r of Array.isArray(perms[bucket]) ? perms[bucket] : []) {
-        if (typeof r === "string" && r.trim()) merged[bucket].push(r.trim());
+        if (typeof r === "string" && r.trim()) {
+          merged[bucket].push(r.trim());
+          if (from && !origin.has(r.trim())) origin.set(r.trim(), from);
+        }
       }
     }
   };
   // user 作用域先读：它是"我的偏好"，project/local 只能在它之上继续收紧。
-  try { absorb(localStorage.getItem("michael-ide.permissions") || "", { trusted: true }); } catch {}
+  try { absorb(localStorage.getItem("michael-ide.permissions") || "", { trusted: true, from: "设置 · 权限" }); } catch {}
   if (typeof backend !== "undefined" && backend?.readTextFile) {
     // ~/.michael/settings.json —— 跨项目的个人规则，可以直接用编辑器改，不必依赖 UI。
     try {
       const home = String((await backend.homeDir?.()) || "").replace(/\/+$/, "");
-      if (home) absorb(await backend.readTextFile(`${home}/.michael/settings.json`), { trusted: true });
+      if (home) absorb(await backend.readTextFile(`${home}/.michael/settings.json`), { trusted: true, from: "~/.michael/settings.json" });
     } catch {}
     if (key) {
       for (const { rel } of _PERM_SCOPE_FILES) {
         // 工作区里的这几份跟着仓库走：只收紧，不放宽。
-        try { absorb(await backend.readTextFile(`${key.replace(/\/+$/, "")}/${rel}`), { trusted: false }); } catch {}
+        try { absorb(await backend.readTextFile(`${key.replace(/\/+$/, "")}/${rel}`), { trusted: false, from: rel }); } catch {}
       }
     }
   }
-  _permRulesCache = { root: key, ts: now, rules: merged };
+  _permRulesCache = { root: key, ts: now, rules: merged, origin };
   return merged;
 }
 // ===== 用户声明的能力 =====
@@ -19924,6 +19930,19 @@ async function _refreshUserCapabilities(root) {
 }
 
 /// 规则判定：deny → ask → allow，第一个命中即为结论；都没命中返回 ""，交给默认策略。
+/// 这条调用是被哪份文件里的规则挡住的。拿不准就返回空串——宁可少说一句，
+/// 也不要指错文件，让用户去改一个不相干的地方。
+function _permRuleSource(call) {
+  try {
+    const rules = _permRulesCache?.rules;
+    if (!rules || !call) return "";
+    for (const rule of rules.deny || []) {
+      if (_permRuleMatches(rule, call)) return _permRulesCache?.origin?.get?.(rule) || "";
+    }
+  } catch {}
+  return "";
+}
+
 function _permissionRuleVerdict(rules, call) {
   if (!rules || !call) return "";
   for (const bucket of ["deny", "ask", "allow"]) {
@@ -20056,6 +20075,15 @@ function _skillToolAllowed(allow, toolName) {
   return false;
 }
 
+// 「这次是谁拒的」走旁路，不进 `_approveToolCall` 的返回值。
+//
+// 返回值必须**保持布尔**：调用形状是 `if (!(await 那道门(...)))`，
+// 改成返回对象的话 `{ ok: false }` 是**真值**，那道门会当场变成"一律放行"。
+// 这是整条执行链上唯一的授权检查点，不值得为一句文案去动它的契约。
+let _lastRefusal = null;
+function _noteRefusal(by, detail) { _lastRefusal = { by, detail: String(detail || "") }; }
+function _takeRefusal() { const r = _lastRefusal; _lastRefusal = null; return r; }
+
 async function _approveToolCall(call, run) {
   if (!call) return true;
   const dangerous = _callIsDestructive(call);
@@ -20070,6 +20098,7 @@ async function _approveToolCall(call, run) {
     try {
       showToast(`「${skillGate.names[0]}」声明了 allowed-tools，${call.name || "这个工具"} 不在其中`);
     } catch {}
+    _noteRefusal("skill", skillGate.names[0] || "");
     return false;
   }
 
@@ -20077,7 +20106,7 @@ async function _approveToolCall(call, run) {
   let ruleVerdict = "";
   try { ruleVerdict = _permissionRuleVerdict(await _loadPermissionRules(run?.root || ""), call); }
   catch { ruleVerdict = ""; }
-  if (ruleVerdict === "deny") return false;
+  if (ruleVerdict === "deny") { _noteRefusal("rule", _permRuleSource(call)); return false; }
   if (ruleVerdict === "allow") return true;
 
   // ② 只读命令免打扰（规则显式 ask 时除外）。
@@ -20118,7 +20147,7 @@ async function _approveToolCall(call, run) {
         ? `${label.detail}\n\n（工作区权限规则要求这一步必须由你确认。）`
         : label.detail,
   });
-  if (decision === "deny") return false;
+  if (decision === "deny") { _noteRefusal("user", ""); return false; }
   if (decision === "always") _sessionApproved.add(key);
   return true;
 }
@@ -20126,16 +20155,28 @@ async function _approveToolCall(call, run) {
 // "这次根本没执行"信号：它让 `_toolExecutionSucceeded` 判否、让
 // `_blockedToolRecoveryInstruction` 不去生成"换条路绕过去"的恢复建议（那正是被拒
 // 之后最不该做的事），也让失败记忆不把用户的决定记成工具坏了。
-function _userDeniedToolResult(call) {
+function _userDeniedToolResult(call, verdict = null) {
+  const by = verdict && typeof verdict === "object" ? verdict.by : "user";
+  const where = verdict && typeof verdict === "object" ? String(verdict.detail || "") : "";
+  const content = by === "rule"
+    ? `[BLOCKED] 这次调用被**权限规则**挡下了${where ? `（${where}）` : ""}——不是用户刚刚拒绝的。`
+      + "别重试，也别换个工具做同一件事：规则是按工具类型匹配的，绕不过去。"
+      + "如果这一步确实必要，停下来告诉用户是哪条规则挡的、要放开需要改哪个文件。"
+    : by === "skill"
+      ? `[BLOCKED] 当前技能${where ? `「${where}」` : ""}声明的 allowed-tools 不包含这个工具。`
+        + "这不是「用户不同意」，是这件事不在该技能的范围内——换该技能允许的工具，或者说明需要退出技能范围。"
+      : "[BLOCKED] 用户拒绝了这次调用。不要重试同一个调用，也不要换一种工具做同一件事"
+        + "（例如改用 run_cmd 去完成刚被拒的写入）。改用别的方案推进；如果这一步确实必要，"
+        + "停下来向用户说明原因并请他确认。";
   return {
     type: call?.type || "tool",
     path: call?.path || call?.dest || call?.to || "",
-    content: "[BLOCKED] 用户拒绝了这次调用。不要重试同一个调用，也不要换一种工具做同一件事"
-      + "（例如改用 run_cmd 去完成刚被拒的写入）。改用别的方案推进；如果这一步确实必要，"
-      + "停下来向用户说明原因并请他确认。",
-    userDenied: true,
+    content,
+    userDenied: by === "user",
+    blockedBy: by,
+    blockedFrom: where,
     ok: false,
-    failure: { attempted: false, code: "user_denied" },
+    failure: { attempted: false, code: by === "user" ? "user_denied" : `${by}_denied` },
   };
 }
 
@@ -55718,10 +55759,19 @@ async function _executeToolStep(step, call, root, run) {
   // 不是这次调用失败了，不能计入 3 次硬封锁，否则用户拒一次高危命令会连带把
   // 同一个工具锁死。
   if (!(await _approveToolCall(call, run))) {
-    const denied = _userDeniedToolResult(call);
+    const denied = _userDeniedToolResult(call, _takeRefusal());
     try {
       const res = step?.querySelector?.(".atc-result");
-      if (res) { res.className = "atc-result atc-result--blocked"; res.textContent = "⛔ 用户已拒绝"; }
+      if (res) {
+        res.className = "atc-result atc-result--blocked";
+        // 卡片上必须写清是谁拒的。以前一律写「用户已拒绝」，而规则拒绝时用户根本
+        // 没点过任何东西——他会以为是自己或软件的问题，然后去找一个不存在的开关。
+        res.textContent = denied.blockedBy === "rule"
+          ? `⛔ 权限规则拦截${denied.blockedFrom ? `（${denied.blockedFrom}）` : ""}`
+          : denied.blockedBy === "skill"
+            ? "⛔ 不在当前技能的 allowed-tools 内"
+            : "⛔ 用户已拒绝";
+      }
     } catch {}
     return denied;
   }

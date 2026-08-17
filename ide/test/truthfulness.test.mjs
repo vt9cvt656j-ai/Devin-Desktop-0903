@@ -347,9 +347,9 @@ test("仓库里的 permissions.allow 必须被丢弃——它会短路唯一那�
   const seg = SRC.slice(i, i + 2200);
   assert.match(seg, /bucket === "allow" && !trusted/, "allow 仍然接受工作区文件");
   // 放行必须由用户本人给出；收紧任何来源都算数。
-  assert.match(SRC, /absorb\(localStorage\.getItem\("michael-ide\.permissions"\)[^)]*\{ trusted: true \}/);
+  assert.match(SRC, /absorb\(localStorage\.getItem\("michael-ide\.permissions"\)[^)]*trusted: true/);
   // 工作区那几份文件必须以 trusted:false 读入。两处（权限规则、能力声明）都要。
-  assert.equal((SRC.match(/\{ trusted: false \}/g) || []).length, 2,
+  assert.equal((SRC.match(/trusted: false/g) || []).length, 2,
     "工作区文件仍被当成可信来源（应有两处：权限规则 + 能力声明）");
 });
 
