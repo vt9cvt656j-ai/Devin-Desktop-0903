@@ -13697,20 +13697,36 @@ function _ctxChoiceOptions(modelId) {
   return opts;
 }
 
+/**
+ * 这条连接**不问就给**的窗口，和**问了最多能给到**的窗口——两个数，不是一个。
+ *
+ * 目录里 `context_window` 是默认窗口，`context_windows[]` 是这个模型在各家端点上出现过的
+ * 全部窗口。以前两处预算都写 `max(默认, 最宽)`，等于默认按最宽算：glm-5.2 默认 96,890，
+ * 却一律按 1.0M 记账——差 10 倍。表现是卡片上高亮着一个用户从没选过的 1.0M，仪表按 1.0M
+ * 算占用（永远贴着 0），`_trimMessagesIfHuge` 也按 1.0M 留历史，最后在上游炸成
+ * context-length 400。
+ *
+ * 分开之后：没选过 = 默认窗口（真实生效的那个）；选过 = 用户点的那个，仍按最宽夹住。
+ */
+function _ctxNativeCeiling(modelId) {
+  return Math.max(_modelContextLimit(modelId), _nativeWindowsFor(modelId)[0] || 0);
+}
+function _ctxNativeDefault(modelId) {
+  return Math.max(1, Math.round(Number(_modelContextLimit(modelId)) || 0));
+}
 function _effectiveContextLimit(modelId) {
   // The ceiling the gateway actually enforces is `capacity_for_native` — native PLUS the tier,
   // not the larger of the two (server/src/compression.rs). Taking the max here contradicted the
   // buttons, which have always been priced additively: on any 1M-native model every tier resolved
   // back to 1M, so the whole row was a no-op and the tier the user pays for could never light up.
-  const native = Math.max(_modelContextLimit(modelId), _nativeWindowsFor(modelId)[0] || 0);
   const tierMax = Number(_michaelUser?.michael_compression?.max_input_tokens) || 0;
-  const avail = _gatewayHandlesCompression() && tierMax ? native + tierMax : native;
+  const tier = _gatewayHandlesCompression() && tierMax ? tierMax : 0;
   const choice = _ctxChoiceFor(modelId);
   // The choice may narrow the window below entitlement (a cost dial) but never widen it past
   // what native-or-membership actually delivers — budgeting against a fictional window is how
   // requests die upstream as context-length 400s.
-  if (choice > 0) return Math.max(1, Math.min(choice, avail));
-  return avail;
+  if (choice > 0) return Math.max(1, Math.min(choice, _ctxNativeCeiling(modelId) + tier));
+  return _ctxNativeDefault(modelId) + tier;
 }
 
 // 上下文注入预算随档位适度伸缩，封顶 2 倍。档位（1M/2M/5M）的真正价值是**历史容量**：
@@ -14535,6 +14551,13 @@ function _effortIsSendable(base, level) {
     case "thinking_budget":
     case "gemini_budget":
       return !!(base.budgets && Number(base.budgets[level]) > 0);
+    case "kimi-toggle":
+      // 布尔开关族现在**开关和档位一起发**（见 _thinkingRequestParams 的 kimi-toggle 分支），
+      // 所以目录声明的档位是真发得出去的，不再是"摆出来骗人的按钮"。
+      // 这一条以前落在 default 返回 false：glm-5.2 和 deepseek-v4-pro 在目录里的声明一模一样
+      // （都是 xhigh/high），前者被这里过滤成只剩开/关，后者拿到三档——同一份声明两种结果，
+      // 而且 GLM 的 xhigh 永远选不到。
+      return true;
     default:
       return false;
   }
@@ -14585,7 +14608,10 @@ function _thinkingProfileFor(id) {
   const defaultLevel = levels.includes(base.defaultLevel)
     ? base.defaultLevel
     : levels[levels.length - 1];
-  return { ...base, levels, defaultLevel };
+  // booleanToggle 是"这个模型只有开/关"的断言，UI 据此渲染成两态开关（方案D）。目录一旦
+  // 给出不止一档，这个断言就不再成立——留着它，多出来的档位会被开关吞掉，用户还是只看到开/关。
+  const graded = levels.filter((l) => l !== "off").length;
+  return { ...base, levels, defaultLevel, booleanToggle: !!base.booleanToggle && graded <= 1 };
 }
 
 function _builtinThinkingProfileFor(id) {
@@ -14987,6 +15013,12 @@ function _applyThinkingToConfig(cfg, opts = {}) {
 
   if (profile.kind === "kimi-toggle") {
     out.thinking = { type: "enabled" };
+    // 双保险，和 thinking_budget / thinking_level 两支同理：布尔开关只说"想"，不说"想多深"。
+    // 目录明确给出档位的模型（实测 glm-5.2 声明 xhigh/high）如果只发这个开关，用户拨到
+    // "超高"和拨到"高"发出去的请求逐字节相同——档位是个装饰。开关照旧发（今天能思考靠的
+    // 就是它，不能动），档位额外带一份：上游不认就当没有，认了用户才第一次调得动深度。
+    // 只在目录真给了多档时才带，免得给只有开关的模型（Kimi K2.5/K2.6）平白多一个字段。
+    if ((profile.levels || []).filter((l) => l !== "off").length > 1) out.reasoningEffort = pref;
   }
   return out;
 }
@@ -17785,10 +17817,13 @@ function _tokenExact(n) {
  * choice is a real narrowing and still counts, but it cannot exceed what the model can read.
  */
 function _contextMeterLimit(modelId) {
-  // The widest window the model offers, so that picking Sonnet 4.5's 1M actually moves the gauge.
-  const native = Math.max(1, Number(_modelContextLimit(modelId)) || 0, _nativeWindowsFor(modelId)[0] || 0);
+  // 没选过就用**默认窗口**，不是最宽的那个（见 _ctxNativeDefault 上方那段）。用最宽的
+  // 当分母，仪表在 glm-5.2 这类模型上按 1.0M 记一个 96,890 的窗口，指针永远抬不起来。
+  // 用户点过某一档时仍按最宽夹住——那是他自己要的，卡片和仪表读的是同一个数。
   const choice = _ctxChoiceFor(modelId);
-  return choice > 0 ? Math.max(1, Math.min(choice, native)) : native;
+  return choice > 0
+    ? Math.max(1, Math.min(choice, _ctxNativeCeiling(modelId)))
+    : _ctxNativeDefault(modelId);
 }
 function _contextMeterSnapshot(input = {}) {
   const cfg = (() => { try { return loadConfig(); } catch { return {}; } })();
