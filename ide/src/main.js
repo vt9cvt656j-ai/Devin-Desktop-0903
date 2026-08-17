@@ -45318,8 +45318,20 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
   let _firstModelTurnCompleted = false;
   let _initialToolRoutingStarted = false;
   const _startInitialToolRoutingAfterFirstTurn = () => {
+    // `!run.engineering?.applies` 曾把「画像还没到」和「画像说了不适用」当成同一件事，而这两者
+    // 的代价完全不对称：
+    //   · 误判成"不适用" → 这一整轮工具窗口冻在开局那十个核心工具。没有 web_search、
+    //     knowledge_search、git、db_query、browser、package_search……用户的体感就是
+    //     "我让它干什么它都不知道，特别蠢"——它不是变笨，是手里真的什么都没有。
+    //   · 误判成"适用" → 多一次编排调用。
+    // 而完整裁决实测 19.8 秒（生产网关 upstream_header_ms=19836），第一个模型回合结束时它
+    // 经常还没落定。也就是说"还没到"是**常态**，不是边缘情况。
+    // 所以：有裁决就听裁决，没裁决时绝不当成不适用。_agentAnswerOnlyInspection 自身已经要求
+    // intentSource==="ai"，对空画像本来就是空操作，这里只需要把 applies 这一项也对齐。
+    const _verdictLanded = run.engineering?.intentSource === "ai";
     if (_initialToolRoutingStarted || !_firstModelTurnCompleted || !isAgent || !_live()
-        || !run.engineering?.applies || _agentAnswerOnlyInspection(run.engineering)) return;
+        || (_verdictLanded && !run.engineering.applies)
+        || _agentAnswerOnlyInspection(run.engineering)) return;
     _initialToolRoutingStarted = true;
     void _routeAgentTools(
       "initial",

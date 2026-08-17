@@ -9984,8 +9984,14 @@ test("tool hints stay capability-neutral while the semantic orchestrator control
   assert.match(hint, /completeness placeholder|完整能力名录/);
   assert.doesNotMatch(extractFn("_buildToolHint"), /_profileToolPriorities|filter\(|\.bug/);
   const loop = extractFn("_runAgenticLoop");
-  assert.match(loop, /const _startInitialToolRoutingAfterFirstTurn = \(\) => \{[\s\S]{0,600}_routeAgentTools\(\s*"initial"/,
+  // 窗口放宽到 2000：这道闸上面挂着一段长注释，写的是"画像还没到"和"画像说了不适用"为什么
+  // 不能当成同一件事（误判成不适用的代价是整轮工具窗口冻在开局十个工具）。断言要钉的是
+  // "初始路由在这个一次性函数里"，不是"函数体有多短"。
+  assert.match(loop, /const _startInitialToolRoutingAfterFirstTurn = \(\) => \{[\s\S]{0,2000}_routeAgentTools\(\s*"initial"/,
     "the initial semantic route is a one-shot background task");
+  // 「裁决还没到」不许再被当成「不适用」——这是"我让它干什么它都不知道"的直接成因。
+  assert.match(loop, /const _verdictLanded = run\.engineering\?\.intentSource === "ai";[\s\S]{0,400}\(_verdictLanded && !run\.engineering\.applies\)/,
+    "工具编排的闸门必须区分「裁决未到」和「裁决说不适用」——完整裁决实测 19.8 秒，未到是常态");
   const firstTurnAt = loop.indexOf("let turn = await _agentModelTurn");
   const turnDoneAt = loop.indexOf("_firstModelTurnCompleted = true;", firstTurnAt);
   const initialRouteCallAt = loop.indexOf("_startInitialToolRoutingAfterFirstTurn();", turnDoneAt);
