@@ -2430,11 +2430,28 @@ pub async fn chat(
         .unwrap_or_else(|| model.model_id.clone().unwrap_or_default());
     let (_pre_mode, _pre_percall, pre_free) = effective_billing(&model, &_pre_mid);
     if pre_free {
+        // 免费池空了不再直接拒绝：改用会员额度/钱包继续。这道门要和另外两个准入口
+        // 同一条规则，否则又会出现"同一个免费模型，从这个接口能用、从那个接口说没额度"。
         if free_points_balance(&state, uid).await <= 0 {
-            return Err(AppError {
-                status: axum::http::StatusCode::PAYMENT_REQUIRED,
-                msg: "今日免费额度已用完，明天 0 点重置（或改用付费模型）".into(),
-            });
+            let (plan, plan_exp, q_total, q_window, q_weekly_cap, q_week_used, credits): (
+                String, Option<chrono::DateTime<chrono::Utc>>, i64, i64, i64, i64, i64,
+            ) = sqlx::query_as(
+                "SELECT plan, plan_expires_at, quota_total_cents, quota_window_cents, \
+                        quota_weekly_cap_cents, quota_week_used_cents, credits_cents \
+                 FROM users WHERE id = $1",
+            )
+            .bind(uid)
+            .fetch_one(&state.db)
+            .await?;
+            let plan_active = plan != "none" && plan_exp.is_none_or(|e| e > chrono::Utc::now());
+            let quota_ok = plan_active
+                && q_total > 0
+                && q_window > 0
+                && (q_weekly_cap == 0 || q_week_used < q_weekly_cap);
+            admit_billing(
+                free_fallback_to_paid(), true, false, quota_ok, credits,
+                plan_active, q_total, q_window, q_weekly_cap, q_week_used,
+            )?;
         }
     } else {
         let not_free = model.rate > 0.0
@@ -4226,6 +4243,112 @@ async fn spend_free_points(state: &AppState, uid: uuid::Uuid, micro_usd: i64) ->
     }
 }
 
+/// 免费额度用完之后，是否允许改用付费余额/会员额度继续跑免费模型。
+///
+/// 默认开。关掉它就回到"免费池空了直接 402"的老行为。用环境变量而不是 app_settings：
+/// 这是运营侧的止血开关，不该需要一次迁移才关得掉；网关跑在 systemd/docker 下，
+/// 与 MICHAEL_COMPRESSION_ENABLED 是同一套读法。
+pub fn free_fallback_to_paid() -> bool {
+    std::env::var("MICHAEL_FREE_FALLBACK_PAID").ok().as_deref() != Some("0")
+}
+
+/// 全额扣或一点不扣，原子的。返回真正扣掉的毫点（0 = 池子不够，一点没动）。
+///
+/// 为什么不做部分覆盖：一次调用被劈成"池子出一半、钱包出一半"之后，用量历史里那条
+/// 记录就没法诚实地说清是谁付的钱，退款和对账都会跟着含糊。要么池子全出，要么走付费
+/// 路径全出。
+///
+/// `FOR UPDATE` + 同一条语句里顺带补发当日额度：读和写之间不能有第二个请求插进来把
+/// 余额吃掉——`spend_free_points` 的注释里记着这个教训。
+async fn try_spend_free_points(state: &AppState, uid: uuid::Uuid, points: i64) -> i64 {
+    if points <= 0 {
+        return 0;
+    }
+    let row: Result<Option<(i64,)>, _> = sqlx::query_as(
+        "WITH cur AS ( \
+             SELECT id, \
+                    CASE WHEN free_points_date IS DISTINCT FROM CURRENT_DATE \
+                         THEN $3 ELSE free_points END AS avail \
+             FROM users WHERE id = $1 FOR UPDATE \
+         ) \
+         UPDATE users u \
+            SET free_points = CASE WHEN cur.avail >= $2 THEN cur.avail - $2 ELSE cur.avail END, \
+                free_points_date = CURRENT_DATE \
+           FROM cur \
+          WHERE u.id = cur.id \
+         RETURNING (CASE WHEN cur.avail >= $2 THEN $2 ELSE 0 END)::bigint",
+    )
+    .bind(uid)
+    .bind(points)
+    .bind(free_milli_points_daily())
+    .fetch_optional(&state.db)
+    .await;
+    match row.ok().flatten() {
+        Some((spent,)) => spent.max(0),
+        None => 0,
+    }
+}
+
+/// 一次调用要从免费池扣多少毫点。地板是 1：`free + 不配费用` 若扣 0，这个模型就不是
+/// 免费而是**无限**——每日额度永远不动，也就永远没有"用完"这回事。
+pub fn free_points_needed(micro_usd: i64) -> i64 {
+    milli_points_for_micro_usd(micro_usd).max(1)
+}
+
+/// 三个准入口（chat / chat_completions / responses）共用的判定。
+///
+/// 分开写过一次，代价是同一个免费模型从 IDE 能用、从走 /v1/responses 的客户端被判成
+/// "请先开通会员或充值额度"——同一份后台配置两个接口两种结果。这次连"免费池空了之后
+/// 怎么办"也一起收拢，免得又漂开。
+///
+/// 返回 Err 就是拒绝；Ok(true) 表示这次由免费池付，Ok(false) 表示走付费路径。
+pub fn admit_billing(
+    fallback_enabled: bool,
+    free_here: bool,
+    free_pool_has_room: bool,
+    quota_ok: bool,
+    credits: i64,
+    plan_active: bool,
+    q_total: i64,
+    q_window: i64,
+    q_weekly_cap: i64,
+    q_week_used: i64,
+) -> Result<bool, AppError> {
+    if free_here && free_pool_has_room {
+        return Ok(true);
+    }
+    let paid_ok = quota_ok || credits > 0;
+    if paid_ok && (!free_here || fallback_enabled) {
+        // 免费池空了就改用会员额度/钱包继续跑。这正是用户要的："免费积分用光了，
+        // 也可以消耗付费余额和订阅额度"。
+        return Ok(false);
+    }
+    if free_here && !fallback_enabled {
+        return Err(AppError {
+            status: StatusCode::PAYMENT_REQUIRED,
+            msg: "今日免费额度已用完，明天 0 点重置（或改用付费模型）".into(),
+        });
+    }
+    let tail = if plan_active && q_total <= 0 {
+        "总额度已用完"
+    } else if plan_active && q_window <= 0 {
+        "本时段额度已用完，请等待刷新（每 5.5 小时）"
+    } else if plan_active && q_weekly_cap > 0 && q_week_used >= q_weekly_cap {
+        "本周额度已用完"
+    } else {
+        "请先开通会员或充值额度"
+    };
+    let msg = if free_here {
+        format!("今日免费额度已用完，付费余额和会员额度也不可用（{tail}）。明天 0 点重置免费额度。")
+    } else {
+        tail.to_string()
+    };
+    Err(AppError {
+        status: StatusCode::PAYMENT_REQUIRED,
+        msg,
+    })
+}
+
 async fn bill(
     state: &AppState,
     uid: uuid::Uuid,
@@ -4258,26 +4381,31 @@ async fn bill(
         } else {
             requested_cost.max(0) * MICRO_USD_PER_CENT
         };
-        // FLOOR: a 免费 model must always consume something, even when no fee is configured.
-        // Without this, "free + no fee" spent 0 点 — so the model was not merely free, it was
-        // UNCAPPED: the daily allowance never moved and there was nothing to run out of,
-        // which defeats the entire pool. One milli-点 (0.001 点) is negligible to a real user
-        // and still guarantees the cap eventually binds.
-        let points = spend_free_points(state, uid, micro).await.max(1);
-        // Deduct the floor when the fee itself produced nothing.
-        if micro <= 0 {
-            let _ = sqlx::query(
-                "UPDATE users SET free_points = GREATEST(0, free_points - 1) WHERE id = $1",
-            )
-            .bind(uid)
-            .execute(&state.db)
-            .await;
+        // FLOOR (free_points_needed 里的 .max(1))：a 免费 model must always consume something,
+        // even when no fee is configured. Without this, "free + no fee" spent 0 点 — so the
+        // model was not merely free, it was UNCAPPED: the daily allowance never moved and
+        // there was nothing to run out of, which defeats the entire pool.
+        //
+        // 全额扣或一点不扣：池子盖得住就由池子付；盖不住就**一点都不扣**，整笔落到下面的
+        // 付费路径。此前这里无论如何都要扣（LEAST 到 0 为止）然后直接 return，于是免费额度
+        // 见底那一刻起，免费模型既扣不到钱也不再拒绝——用量记着 0 点，钱包和会员额度一分
+        // 不动。现在它会真的改用付费余额/会员额度继续，与准入门那条规则对上。
+        let want = free_points_needed(micro);
+        let spent = try_spend_free_points(state, uid, want).await;
+        if spent > 0 {
+            // cost_cents stays the REAL provider cost (so operator-side reporting is honest);
+            // free_points_spent carries what the user actually paid, in 点.
+            record_usage_row(state, uid, conn_id, requested_cost, spent, tokens).await;
+            let _ = tx.rollback().await;
+            return;
         }
-        // cost_cents stays the REAL provider cost (so operator-side reporting is honest);
-        // free_points_spent carries what the user actually paid, in 点.
-        record_usage_row(state, uid, conn_id, requested_cost, points, tokens).await;
-        let _ = tx.rollback().await;
-        return;
+        if !free_fallback_to_paid() {
+            // 开关关掉时保持老行为：池子空了也只走池子，扣不到就记 0。
+            record_usage_row(state, uid, conn_id, requested_cost, 0, tokens).await;
+            let _ = tx.rollback().await;
+            return;
+        }
+        // 落下去，按普通付费调用结算（quota → 钱包）。
     }
     let charge = if requested_cost == 0 {
         FusedCharge::default()
@@ -5814,27 +5942,11 @@ pub async fn chat_completions(
     // connection; if ANY route that could serve this request bills from the pool, the pool is
     // what must have room.
     let free_here = candidates.iter().any(|c| effective_billing(c, &model_id).2);
-    if free_here && free_points_balance(&state, uid).await <= 0 {
-        return Err(AppError {
-            status: StatusCode::PAYMENT_REQUIRED,
-            msg: "今日免费额度已用完，明天 0 点重置（或改用付费模型）".into(),
-        });
-    }
-    if !free_here && !quota_ok && credits <= 0 {
-        let msg = if plan_active && q_total <= 0 {
-            "总额度已用完"
-        } else if plan_active && q_window <= 0 {
-            "本时段额度已用完，请等待刷新（每 5.5 小时）"
-        } else if plan_active && q_weekly_cap > 0 && q_week_used >= q_weekly_cap {
-            "本周额度已用完"
-        } else {
-            "请先开通会员或充值额度"
-        };
-        return Err(AppError {
-            status: StatusCode::PAYMENT_REQUIRED,
-            msg: msg.into(),
-        });
-    }
+    let free_pool_has_room = free_here && free_points_balance(&state, uid).await > 0;
+    admit_billing(
+        free_fallback_to_paid(), free_here, free_pool_has_room, quota_ok, credits,
+        plan_active, q_total, q_window, q_weekly_cap, q_week_used,
+    )?;
 
     // The gate above only proves the balance is positive, not that it covers this
     // call, and settlement happens after the upstream responds. Serially that lets a
@@ -7019,18 +7131,11 @@ pub async fn responses_proxy(
     // 能用，从任何走 /v1/responses 的客户端就被判成"请先开通会员或充值额度"。同一份后台配置，
     // 两个接口两种结果。
     let free_here = effective_billing(&conn, &model_id).2;
-    if free_here && free_points_balance(&state, uid).await <= 0 {
-        return Err(AppError {
-            status: StatusCode::PAYMENT_REQUIRED,
-            msg: "今日免费额度已用完，明天 0 点重置（或改用付费模型）".into(),
-        });
-    }
-    if !free_here && !quota_ok && credits <= 0 {
-        return Err(AppError {
-            status: StatusCode::PAYMENT_REQUIRED,
-            msg: "请先开通会员或充值额度".into(),
-        });
-    }
+    let free_pool_has_room = free_here && free_points_balance(&state, uid).await > 0;
+    admit_billing(
+        free_fallback_to_paid(), free_here, free_pool_has_room, quota_ok, credits,
+        plan_active, q_total, q_window, q_weekly_cap, q_week_used,
+    )?;
 
     // Same per-user concurrency ceiling chat_completions uses. Without it these two
     // billed paths had no cap at all, so the bounded-overdraft guarantee that
@@ -7928,15 +8033,91 @@ mod billing_tests {
     }
 
     #[test]
+    /// 免费额度用完之后，免费模型改用付费余额/会员额度继续跑。
+    ///
+    /// 之前是硬 402：免费池见底那一刻，免费模型既扣不到钱也不再让用，而用户的钱包和
+    /// 会员额度明明还有。开关关掉时回到老行为。
+    #[test]
+    fn free_pool_exhaustion_falls_back_to_paid_balances() {
+        // 池子还有 → 由池子付
+        let ok = |r: Result<bool, super::AppError>| match r {
+            Ok(v) => v,
+            Err(e) => panic!("不该被拒绝：{}", e.msg),
+        };
+        let err_msg = |r: Result<bool, super::AppError>| match r {
+            Ok(v) => panic!("不该放行（by_pool={v}）"),
+            Err(e) => (e.status, e.msg),
+        };
+        assert!(ok(super::admit_billing(true, true, true, false, 0, true, 100, 100, 0, 0)));
+        // 池子空了 + 钱包有余额 → 放行，走付费
+        assert!(
+            !ok(super::admit_billing(true, true, false, false, 500, false, 0, 0, 0, 0)),
+            "免费额度用完后，有余额就该继续能用，且必须走付费路径",
+        );
+        // 池子空了 + 只有会员额度 → 同样放行
+        assert!(
+            !ok(super::admit_billing(true, true, false, true, 0, true, 100, 100, 0, 0)),
+            "免费额度用完后，有订阅额度就该继续能用",
+        );
+        // 池子空了 + 两边都没有 → 拒绝，且话要说全（两件事都没了）
+        let (status, msg) = err_msg(super::admit_billing(true, true, false, false, 0, false, 0, 0, 0, 0));
+        assert_eq!(status, StatusCode::PAYMENT_REQUIRED);
+        assert!(msg.contains("免费额度已用完"), "实际：{msg}");
+        assert!(
+            msg.contains("付费余额") && msg.contains("会员额度"),
+            "只说免费额度用完，用户会以为充值也没用。实际：{msg}",
+        );
+        // 开关关掉 → 回到老行为：免费池空了就拒绝，哪怕钱包有钱
+        let (_, off) = err_msg(super::admit_billing(false, true, false, false, 500, false, 0, 0, 0, 0));
+        assert!(off.contains("明天 0 点重置"), "实际：{off}");
+        // 「两边都没了」那句里也有"明天 0 点重置"，光判这四个字会被它喂饱。开关关掉时
+        // 用户钱包里明明还有钱，措辞里就不该出现"付费余额也不可用"。
+        assert!(!off.contains("付费余额"), "开关关掉时不该走到「两边都没了」那句：{off}");
+        // 非免费模型的措辞不受影响
+        let (_, paid) = err_msg(super::admit_billing(true, false, false, false, 0, true, 0, 100, 0, 0));
+        assert_eq!(paid, "总额度已用完");
+        assert!(super::admit_billing(true, false, false, false, 1, false, 0, 0, 0, 0).is_ok());
+    }
+
+    /// 免费池按「全额扣或一点不扣」结算：剩 2 点时来一次 50 点的调用，不能把 2 点扣光
+    /// 还记 0 —— 那正是"扣不到钱也不拒绝"的旧行为。地板仍然是 1 毫点。
+    #[test]
+    fn free_points_needed_keeps_the_floor() {
+        assert_eq!(super::free_points_needed(0), 1, "免费且不配费用也必须消耗一点，否则就是无限");
+        assert_eq!(super::free_points_needed(1), 1);
+        assert!(super::free_points_needed(55_000) > 1, "真有费用就按真实金额算");
+    }
+
+    #[test]
     fn zero_fee_cannot_silently_mean_unlimited() {
         let full = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/models.rs"))
             .expect("read models.rs");
         let src = &full[..full.find("mod billing_tests").unwrap_or(full.len())];
 
-        // runtime floor on the free path
+        // runtime floor on the free path（地板搬进 free_points_needed 了）
         assert!(
-            src.contains("spend_free_points(state, uid, micro).await.max(1)"),
+            src.contains("milli_points_for_micro_usd(micro_usd).max(1)"),
             "a free-flagged call must always consume at least one milli-点",
+        );
+        assert!(
+            src.contains("let want = free_points_needed(micro);")
+                && src.contains("let spent = try_spend_free_points(state, uid, want).await;"),
+            "免费池必须走「全额扣或一点不扣」，部分覆盖会让用量记录说不清是谁付的钱",
+        );
+        // 池子盖不住时必须**落下去**按付费结算，而不是照旧早退。写成 `if true` 之类
+        // 无条件早退，免费额度见底那一刻起就既扣不到钱也不再拒绝——钱包和会员额度一分不动。
+        assert!(
+            src.contains("if spent > 0 {"),
+            "免费池的早退必须以「真的扣到了」为条件；无条件早退＝免费额度见底那一刻起，\
+             免费模型既扣不到钱也不再拒绝，钱包和会员额度一分不动",
+        );
+        assert!(
+            src.contains("if !free_fallback_to_paid() {"),
+            "开关关掉时才保持老行为，默认要落到付费路径",
+        );
+        assert!(
+            src.contains("// 落下去，按普通付费调用结算"),
+            "免费分支末尾必须贯穿到下面的付费结算，不能再有第三个 return",
         );
         // Save-time refusal for per-call with no fee — but resolved PER MODEL, not on the
         // connection field alone. A zero connection fee is legitimate when every model
@@ -8190,16 +8371,23 @@ mod billing_tests {
             // 按字符边界截断：源码里有中文，直接切字节会落在多字节字符中间而 panic。
             let body: String = src[start..].chars().take(14_000).collect();
             let body = body.as_str();
-            let gate = body
-                .find("if !free_here && !quota_ok && credits <= 0")
-                .unwrap_or_else(|| panic!("{entry} 的付费门没有豁免免费模型"));
+            // 三个准入口现在共用 admit_billing：分开写过一次，代价是同一个免费模型从
+            // IDE 能用、从 /v1/responses 被判成"请先开通会员或充值额度"。
             let pool = body
-                .find("free_here && free_points_balance")
+                .find("let free_pool_has_room = free_here && free_points_balance")
                 .unwrap_or_else(|| panic!("{entry} 没有检查每日点数池"));
+            let gate = body
+                .find("admit_billing(")
+                .unwrap_or_else(|| panic!("{entry} 没有走统一的准入判定"));
             assert!(pool < gate, "{entry}：点数池检查必须在付费门之前");
+            assert!(
+                !body[..gate].contains("今日免费额度已用完"),
+                "{entry}：免费池空了不该就地 402，要落到 admit_billing 去看付费余额/会员额度",
+            );
         }
     }
 
+    #[test]
     fn cache_prices_follow_the_model_not_the_connection() {
         // Anthropic 形状：出现 cache_read_input_tokens 才走 Anthropic 分支
         // input_tokens 必须非零：compute_cost 在 prompt 和 completion 同时为 0 时提前返回 0，
@@ -8213,7 +8401,7 @@ mod billing_tests {
         };
         // 100 万缓存写入 token，倍率 1：应当 = 1.25 × 该模型输入价，单位美分。
         assert_eq!(cents("claude-opus-4-8", 3.75), 625, "Opus 写入应为 1.25×$5=$6.25");
-        assert_eq!(cents("claude-sonnet-5", 3.75), 375, "Sonnet 写入应为 1.25×$3=$3.75");
+        assert_eq!(cents("claude-sonnet-5", 3.75), 250, "Sonnet 真实输入价 $2，写入应为 1.25×$2=$2.50");
         assert_eq!(cents("claude-fable-5", 3.75), 1250, "Fable 写入应为 1.25×$10=$12.50");
         // 连接级那个数不得再盖住任何有自己输入价的模型。
         assert_eq!(
@@ -8234,6 +8422,7 @@ mod billing_tests {
         );
     }
 
+    #[test]
     fn real_cost_times_rate() {
         let usage =
             json!({"prompt_tokens": 22000, "completion_tokens": 2000, "total_tokens": 24000});
