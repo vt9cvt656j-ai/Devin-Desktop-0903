@@ -6604,6 +6604,9 @@ test("Agent lightweight routing consumes the semantic verdict instead of user-me
   assert.match(sendSource, /let _agentLightTurn = false;/);
   assert.match(sendSource, /_shouldUseLightweightAgentTurn\([\s\S]{0,220}hasAttachments: attachments\.length > 0/);
   const shouldLight = load("_shouldUseLightweightAgentTurn");
+  // 这一组验的是**语义判据**（分类器怎么说），所以固定成"没配过能力"，把能力那道闸
+  // 排除在外——它自己有独立的用例（见「light turn stays available…」那条）。
+  const NO_CAPS = { hasCapabilities: false };
   const pureAnswer = {
     intentSource: "ai",
     intentSemantic: { action: "answer", continuation: "new" },
@@ -6611,10 +6614,10 @@ test("Agent lightweight routing consumes the semantic verdict instead of user-me
     dataStrategy: "not_applicable", researchMode: "none", designMode: "none", workspaceAction: "none",
     captureMode: "none", browserGoal: "none", orchestrationMode: "solo", runtimeObligations: [], externalObligations: [],
   };
-  assert.equal(shouldLight("agent", pureAnswer, {}), true, "a classifier-confirmed, answer-only turn may use the small transport path");
-  assert.equal(shouldLight("agent", pureAnswer, { streaming: true }), true,
+  assert.equal(shouldLight("agent", pureAnswer, {}, NO_CAPS), true, "a classifier-confirmed, answer-only turn may use the small transport path");
+  assert.equal(shouldLight("agent", pureAnswer, { streaming: true }, NO_CAPS), true,
     "sendPrompt marks the current turn streaming before routing; that marker must not kill the light path");
-  assert.equal(shouldLight("agent", pureAnswer, { streaming: true, _runIsLoop: true }), false,
+  assert.equal(shouldLight("agent", pureAnswer, { streaming: true, _runIsLoop: true }, NO_CAPS), false,
     "a real active Agent loop must still stay on the full path");
   assert.equal(shouldLight("agent", { ...pureAnswer, intentSemantic: { action: "answer", continuation: "continue" } }, {}), false,
     "project continuations must stay on the full Agent path");
@@ -6624,7 +6627,7 @@ test("Agent lightweight routing consumes the semantic verdict instead of user-me
     "runtime obligations must never be downgraded");
   assert.equal(shouldLight("agent", { ...pureAnswer, intentSource: "none" }, {}), false,
     "a missing semantic classifier must fail open to the full Agent path");
-  assert.equal(shouldLight("agent", pureAnswer, { _planSteps: [{ status: "in_progress" }] }), false,
+  assert.equal(shouldLight("agent", pureAnswer, { _planSteps: [{ status: "in_progress" }] }, NO_CAPS), false,
     "an unfinished engineering plan keeps follow-up answers on the full Agent path");
   assert.doesNotMatch(SRC, /function _looksQuickAsk\(/);
   assert.doesNotMatch(SRC, /function _looksLightweightAgentChat\(/);
@@ -22005,6 +22008,51 @@ test("_looksLikeUserQuestion: statements and rhetoric still do NOT pause the run
 // workspace is open. Project inspection is an explicit semantic action and must
 // instead enter the full bounded-read agent loop.
 // ---------------------------------------------------------------------------
+test("能力探测读的是配置，不是内存里已加载的状态", async () => {
+  /*
+   * 冷启动时 MCP 还没连、技能还没扫，内存里当然是空的。按内存判会得出"没配过能力"，
+   * 于是走轻量轮；而轻量轮**不进 agentic loop**，也就不会去加载它们——下一轮内存还是空的。
+   * 那是一个自己锁死自己的循环：用户配了服务却永远用不上，而且毫无征兆。
+   */
+  const probe = load("_hasConfiguredCapabilities", {
+    _readWorkspaceMcpDocument: async () => ({ text: JSON.stringify({ mcpServers: { context7: { command: "npx" } } }) }),
+    _fileSkills: [],                      // 内存里一个技能都没有
+    _loadSkillsLocal: () => [],
+    _capabilityProbe: { at: 0, root: null, value: null },
+  });
+  assert.equal(await probe("/repo"), true, "配置里有服务，却因为内存是空的判成「没配过」");
+
+  const none = load("_hasConfiguredCapabilities", {
+    _readWorkspaceMcpDocument: async () => ({ text: "{}" }),
+    _fileSkills: [],
+    _loadSkillsLocal: () => [],
+    _capabilityProbe: { at: 0, root: null, value: null },
+  });
+  assert.equal(await none("/repo"), false, "什么都没配也说有，轻量轮就永远不会触发了");
+
+  // 读不出来按"有"处理：宁可多给一次工具，也不要因为一次读取失败把模型的手绑起来。
+  const broken = load("_hasConfiguredCapabilities", {
+    _readWorkspaceMcpDocument: async () => { throw new Error("读不了"); },
+    _fileSkills: [],
+    _loadSkillsLocal: () => [],
+    _capabilityProbe: { at: 0, root: null, value: null },
+  });
+  assert.equal(await broken("/repo"), true, "探测失败时应当保守地当作「有能力」");
+
+  // 只有技能、没有 MCP 也算配过。
+  const skillsOnly = load("_hasConfiguredCapabilities", {
+    _readWorkspaceMcpDocument: async () => ({ text: "{}" }),
+    _fileSkills: [{ id: "file:/w/.claude/skills/x/SKILL.md", name: "x" }],
+    _loadSkillsLocal: () => [],
+    _capabilityProbe: { at: 0, root: null, value: null },
+  });
+  assert.equal(await skillsOnly("/repo"), true, "装了技能也该走完整轮——轻量轮不注入技能清单");
+
+  // 判定要真的接到发送那条路上，否则上面全是空转。
+  assert.match(SRC, /hasCapabilities: await _hasConfiguredCapabilities\(/,
+    "发送路径没把能力探测传给轻量轮判定");
+});
+
 test("light turn stays available for a genuine answer with a workspace open", () => {
   const light = load("_shouldUseLightweightAgentTurn", { _knownWorkspaceRoots: () => [] });
   // A profile the classifier would pass as a context-free answer turn.
@@ -22017,11 +22065,26 @@ test("light turn stays available for a genuine answer with a workspace open", ()
     browserGoal: "none", orchestrationMode: "solo",
     runtimeObligations: [], externalObligations: [],
   };
+  // 没配过能力（全新安装）才允许走快路——那时候本来也没有东西可丢。
+  const bare = { hasCapabilities: false };
   // No workspace open → the fast path is still allowed (its whole reason to exist).
-  assert.equal(light("agent", answerProfile, {}, { workspaceOpen: false }), true);
+  assert.equal(light("agent", answerProfile, {}, { ...bare, workspaceOpen: false }), true);
   // An open folder alone is background state, not an instruction to inspect it.
-  assert.equal(light("agent", answerProfile, {}, { workspaceOpen: true }), true);
-  assert.equal(light("agent", { ...answerProfile, projectState: "none" }, {}, { workspaceOpen: true }), true);
+  assert.equal(light("agent", answerProfile, {}, { ...bare, workspaceOpen: true }), true);
+  assert.equal(light("agent", { ...answerProfile, projectState: "none" }, {}, { ...bare, workspaceOpen: true }), true);
+
+  /*
+   * 配过能力就不走快路。
+   *
+   * 快路那一轮 hasToolAccess === false：工具数组是空的，技能清单也不注入。用户接了
+   * context7 之后问一句「useOptimistic 怎么用」，判成"纯回答"就等于——模型手上一个工具
+   * 都没有、也不知道 context7 存在，只能凭记忆答，而且没有第二次机会。
+   */
+  assert.equal(light("agent", answerProfile, {}, { hasCapabilities: true }), false,
+    "配了 MCP / 技能还走轻量轮 = 这一轮工具全没了，模型还不知道它们存在");
+  // 算不出来（读配置失败）按"有"处理：宁可多给一次工具，也不要把模型的手绑起来。
+  assert.equal(light("agent", answerProfile, {}, { workspaceOpen: true }), false,
+    "能力探测失败时应当保守地走完整轮");
   // A project assessment has workspaceAction=inspect and is therefore never a
   // light turn; it must obtain actual repository evidence.
   assert.equal(light("agent", { ...answerProfile, workspaceAction: "inspect" }, {}, { workspaceOpen: true }), false);

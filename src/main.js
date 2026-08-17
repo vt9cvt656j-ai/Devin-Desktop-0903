@@ -24199,6 +24199,7 @@ async function sendPrompt(text, attachments = [], readyConfig = null) {
     {
       hasAttachments: attachments.length > 0,
       workspaceOpen: !!String(_earlyRoot || rootPath || (workspaceRoots && workspaceRoots[0]) || "").trim(),
+      hasCapabilities: await _hasConfiguredCapabilities(_earlyRoot || _curRoot || ""),
     },
   );
   // 思考档位要在**知道这轮是不是琐碎轮之后**再定一次。上面 _applyThinkingToConfig
@@ -26358,8 +26359,53 @@ function _agentToolNameAllowedByProfile(name, profile) {
 // The light path is a transport optimization for a narrowly-defined conversational
 // answer, never an Agent downgrade. Its inputs are the model's structured decision
 // and live session state; it intentionally does not inspect the user's wording.
+/*
+ * 这台机器上到底配没配过能力（MCP 服务 / 技能）。
+ *
+ * 读的是**配置**而不是内存里已加载的状态：冷启动时 MCP 还没连、技能还没扫，内存里当然是
+ * 空的——按内存判会得出"没配过"，于是走轻量轮；而轻量轮又不会去加载它们，下一轮内存还是
+ * 空的。那是一个自己锁死自己的循环：配了服务却永远用不上，且毫无征兆。
+ *
+ * 结果缓存几秒：同一轮里会被问一次，用户连点几句时不必反复读盘；配置真变了（面板里加了
+ * 服务、装了技能）也最多晚几秒生效。
+ */
+let _capabilityProbe = { at: 0, root: null, value: null };
+async function _hasConfiguredCapabilities(root) {
+  const key = String(root || "");
+  const now = Date.now();
+  if (_capabilityProbe.root === key && now - _capabilityProbe.at < 5000 && _capabilityProbe.value !== null) {
+    return _capabilityProbe.value;
+  }
+  let value = true;   // 读不出来就当有——见 _shouldUseLightweightAgentTurn 的注释
+  try {
+    const doc = await _readWorkspaceMcpDocument(key);
+    const servers = Object.keys(JSON.parse(doc.text || "{}").mcpServers || {}).length;
+    const skills = (Array.isArray(_fileSkills) ? _fileSkills.length : 0)
+      + (typeof _loadSkillsLocal === "function" ? (_loadSkillsLocal() || []).length : 0);
+    value = servers > 0 || skills > 0;
+  } catch {}
+  _capabilityProbe = { at: now, root: key, value };
+  return value;
+}
+
+/*
+ * 轻量轮省的是提示词，不该省掉**能力**。
+ *
+ * 走这条路的一轮是 `hasToolAccess === false`：不进 agentic loop，工具数组是空的，技能
+ * 清单也不注入。对"你好""你是谁"那种轮次这没问题。可一旦用户接了 MCP 服务、装了技能，
+ * 同一条路就变成了"我替模型决定它这次不需要工具"——判错了没有第二次机会：模型手上一个
+ * 工具都没有，也**不知道**那些能力存在，只能凭记忆答，而用户看到的是"我明明连了 context7，
+ * 它却在瞎编 API"。
+ *
+ * Claude Code 没有这种东西：工具永远在请求里，用不用是模型自己的判断。所以这里的规矩是
+ * ——**只要配过能力，就不替它做这个决定**。没配过的（全新安装）照旧走轻量轮，那时候本来
+ * 也没有东西可丢。
+ */
 function _shouldUseLightweightAgentTurn(mode, profile, session = null, options = {}) {
   if (mode !== "agent" || !profile || profile.intentSource !== "ai") return false;
+  // 算不出来时按"有"处理（options.hasCapabilities !== false）：宁可多给一次工具，
+  // 也不要因为一次读取失败就把模型的手绑起来。
+  if (options.hasCapabilities !== false) return false;
   // sendPrompt marks the new turn streaming before this check so Stop works during
   // preprocessing. An older active loop is already handled at the send entry point;
   // only _runIsLoop means this session is genuinely in the full Agent loop here.
