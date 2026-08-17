@@ -1450,3 +1450,28 @@ test("前端调的每个后端命令，Rust 侧都注册了", () => {
   assert.deepEqual(missing, [],
     `前端会调、但 Rust 没注册的命令（调到就报错，且只有运行时才看得出来）：${missing.join(", ")}`);
 });
+
+test("harness 的编排信封两侧必须是同一个字面量，否则「谁在说话」就量不出来", () => {
+  // 和 📌 边界同一类：两个文件、两种语言约定同一个字符串，漂了没有任何东西会报错——
+  // 网关只是从此统计到 0 条编排消息，看起来跟"这一轮 harness 很安静"一模一样。
+  //
+  // 为什么要量：2026-08-17 实测，用户的一句话 83 字节，组装后发出去 21,643 字节（1:260），
+  // 而运行中还能继续插话的提醒有 25 类。每一段单看都有道理，合起来就把人挤出去了，
+  // 却没有任何一处代码为"人的话占多少比重"负责。
+  const client = /const _ORCH_NOTE = "([^"]+)"/.exec(SRC);
+  assert.ok(client, "_ORCH_NOTE 在 main.js 里改名或挪走了——网关那侧的统计会静默归零");
+
+  const rust = readFileSync(join(HERE, "../../server/src/prompts.rs"), "utf8");
+  const marker = /const ORCH_NOTE_MARKER: &str = "([^"]+)";/.exec(rust);
+  assert.ok(marker, "ORCH_NOTE_MARKER 在 prompts.rs 里改名或挪走了");
+
+  assert.ok(client[1].startsWith(marker[1]),
+    `网关认的前缀不是客户端信封的开头，统计会恒为 0：\n  客户端 ${client[1].slice(0, 24)}…\n  网关   ${marker[1]}`);
+  assert.ok(marker[1].length >= 6, "前缀太短，会误伤正常正文里碰巧出现的字");
+
+  // 统计必须真的记进那条装配日志，否则量了也看不到。
+  assert.match(rust, /orch_msg_count,\s*\n\s*orch_bytes,/,
+    "harness 话语量没有进 assembled IDE prompt request 那条日志——量了看不到等于没量");
+  // 只统计结构，不记内容。
+  assert.doesNotMatch(rust, /orch_(bytes|msg_count)\s*=\s*%/, "这两个字段只能记数字，不能记正文");
+});
