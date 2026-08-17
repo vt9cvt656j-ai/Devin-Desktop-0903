@@ -65,12 +65,13 @@ const _mcpServerApprovalMode = load("_mcpServerApprovalMode", { _mcpServerIsRepo
 const _workspaceAncestorRoots = load("_workspaceAncestorRoots");
 
 /**
- * 造一个假 backend：磁盘上的文件用 files 映射，用户级配置用 userConfigs 数组
- * （对应 Rust 侧 mcp_user_configs 的返回形状）。
+ * 造一个假 backend：磁盘上的文件用 files 映射，自有的用户级配置用 ownConfig
+ * （对应 Rust 侧 mcp_user_config 的返回形状——**只有一份**，就是
+ * ~/.michael-ide/mcp.json）。别的客户端的配置这一层已经不存在了。
  */
 // tracked：git 会跟踪 `<base>/.mcp.local.json` 的那些 base（＝这份文件跟着仓库来的）。
 // noGit：这些 base 不是 git 仓库（git 命令非零退出）。
-function makeDoc({ files = {}, userConfigs = [], tracked = [], noGit = [] } = {}) {
+function makeDoc({ files = {}, ownConfig = null, tracked = [], noGit = [] } = {}) {
   const gitCalls = [];
   const invokeArgs = [];
   const backend = {
@@ -79,10 +80,9 @@ function makeDoc({ files = {}, userConfigs = [], tracked = [], noGit = [] } = {}
       return files[path];
     },
     invoke: async (cmd, args) => {
-      if (cmd === "mcp_user_configs") {
+      if (cmd === "mcp_user_config") {
         invokeArgs.push(args);
-        // userConfigs 传函数就是在演 Rust 侧那份「按当前项目筛过的」返回值。
-        return typeof userConfigs === "function" ? userConfigs(args?.project) : userConfigs;
+        return ownConfig;
       }
       throw new Error("unexpected invoke " + cmd);
     },
@@ -92,8 +92,8 @@ function makeDoc({ files = {}, userConfigs = [], tracked = [], noGit = [] } = {}
       return { code: 0, stdout: tracked.includes(cwd) ? ".mcp.local.json\n" : "" };
     },
   };
-  const _readUserScopeMcpConfigs = load("_readUserScopeMcpConfigs", { inTauri: true, backend });
-  const _disabledMcpServers = load("_disabledMcpServers", { _readUserScopeMcpConfigs });
+  const _readOwnMcpUserConfig = load("_readOwnMcpUserConfig", { inTauri: true, backend });
+  const _disabledMcpServers = load("_disabledMcpServers", { _readOwnMcpUserConfig });
   const _mcpLocalFileIsTracked = load("_mcpLocalFileIsTracked", {
     backend,
     _mcpLocalTrackedCache: new Map(),   // 每个用例一份，别互相染
@@ -101,7 +101,7 @@ function makeDoc({ files = {}, userConfigs = [], tracked = [], noGit = [] } = {}
   const read = load("_readWorkspaceMcpDocument", {
     backend,
     _workspaceAncestorRoots,
-    _readUserScopeMcpConfigs,
+    _readOwnMcpUserConfig,
     _disabledMcpServers,
     _mcpLocalFileIsTracked,
   });
@@ -118,7 +118,7 @@ const CLAUDE_FILE = "/home/me/.claude.json";
 
 test("全局配置里的服务在任意项目里都能拿到——这就是「真实可以用」的那一半", async () => {
   const read = makeDoc({
-    userConfigs: [{ path: USER_FILE, writable: true, servers: { memory: { command: "npx", args: ["-y", "server-memory"] } } }],
+    ownConfig: { path: USER_FILE, servers: { memory: { command: "npx", args: ["-y", "server-memory"] } } },
   });
   for (const root of ["/work/alpha", "/work/beta"]) {
     const doc = await read(root);
@@ -130,7 +130,7 @@ test("全局配置里的服务在任意项目里都能拿到——这就是「�
 
 test("一个文件夹都没打开时，全局服务照样在（以前这里直接 early-return 成空）", async () => {
   const read = makeDoc({
-    userConfigs: [{ path: USER_FILE, writable: true, servers: { memory: { command: "npx" } } }],
+    ownConfig: { path: USER_FILE, servers: { memory: { command: "npx" } } },
   });
   const doc = await read("");
   assert.deepEqual(Object.keys(JSON.parse(doc.text).mcpServers), ["memory"]);
@@ -139,67 +139,41 @@ test("一个文件夹都没打开时，全局服务照样在（以前这里直�
 test("项目里的同名服务盖住全局的那个，而不是反过来", async () => {
   const read = makeDoc({
     files: { "/work/a/.mcp.local.json": JSON.stringify({ mcpServers: { db: { command: "项目版" } } }) },
-    userConfigs: [{ path: USER_FILE, writable: true, servers: { db: { command: "全局版" } } }],
+    ownConfig: { path: USER_FILE, servers: { db: { command: "全局版" } } },
   });
   const doc = await read("/work/a");
   assert.equal(JSON.parse(doc.text).mcpServers.db.command, "项目版");
   assert.equal(doc.serverScopes.db, "local");
 });
 
-test("Claude Code / Cursor 里配好的服务直接就能用，不用再抄一遍", async () => {
+test("工作区里 Cursor 的配置不再读——那是别的工具的目录", async () => {
+  // 这条以前是反的：`<工作区>/.cursor/mcp.json` 和 .mcp.json 并列被读进来，Cursor 里
+  // 配的服务在这个 IDE 里直接生效。按用户要求去掉了。
   const read = makeDoc({
-    userConfigs: [
-      { path: USER_FILE, writable: true, servers: {} },
-      { path: CURSOR_FILE, writable: false, servers: { "my-api": { command: "node", args: ["s.js"] } } },
-    ],
+    files: {
+      "/work/a/.cursor/mcp.json": JSON.stringify({ mcpServers: { "cursor-的": { command: "node" } } }),
+      "/work/a/.mcp.json": JSON.stringify({ mcpServers: { "项目自带的": { command: "node" } } }),
+    },
+    ownConfig: { path: USER_FILE, servers: {} },
   });
   const doc = await read("/work/a");
-  assert.equal(JSON.parse(doc.text).mcpServers["my-api"].command, "node");
-  assert.equal(doc.serverScopes["my-api"], "interop");
-  assert.equal(doc.serverSources["my-api"], CURSOR_FILE);
+  const names = Object.keys(JSON.parse(doc.text || "{}").mcpServers || {});
+  assert.deepEqual(names, ["项目自带的"], `Cursor 的配置又被读进来了：${names}`);
 });
 
-test("每份外部配置都认得出是哪个客户端写的——包括 Claude Desktop", () => {
-  // 面板上那一格显示的是"这个服务是谁配的"。认不出来就退回泛泛的「其他客户端」，
-  // 用户看到一个自己不记得配过的服务，第一件事是想知道它从哪来的。
-  const appOf = new Function(
-    "return " + SRC.slice(SRC.indexOf("const _appOfSource = (source) =>") + "const _appOfSource = ".length)
-      .slice(0, SRC.slice(SRC.indexOf("const _appOfSource = (source) =>")).indexOf("};") + 1),
-  )();
-  assert.equal(appOf("/home/me/.claude.json"), "Claude Code");
-  assert.equal(
-    appOf("/home/me/Library/Application Support/Claude/claude_desktop_config.json"),
-    "Claude Desktop",
-    "Claude Desktop 的配置刚接进来，这里没跟上就只会显示「其他客户端」",
-  );
-  assert.equal(appOf("/home/me/.cursor/mcp.json"), "Cursor");
-  assert.equal(appOf("/home/me/.codex/mcp.json"), "Codex");
-  assert.equal(appOf("/work/a/.mcp.json"), "", "项目自带的配置不属于任何外部客户端");
-});
-
-test("当前项目路径要传给 Rust 侧，否则 Claude Code 缺省作用域的服务一条都读不到", async () => {
-  // `claude mcp add` 不带 -s 时用的是 local 作用域，服务写在
-  // ~/.claude.json 的 projects["<当时的 cwd>"].mcpServers 底下。Rust 那边要靠这个路径
-  // 才认得出哪一条属于当前项目——不传的话它只能回全局那一层，于是用户在 Claude Code
-  // 里配的绝大多数服务在这边一个都不出现，面板却照样显示"已读取 Claude Code 配置"。
-  const read = makeDoc({
-    userConfigs: (project) => [{
-      path: CLAUDE_FILE,
-      writable: false,
-      servers: project === "/work/a" ? { "local-scoped": { command: "node" } } : {},
-    }],
-  });
-  const mine = await read("/work/a");
-  assert.equal(JSON.parse(mine.text).mcpServers["local-scoped"].command, "node");
-  // 不能取最后一次：_disabledMcpServers 之后还会再调一次，它只读自己那份可写配置，
-  // 不需要项目路径，传的就是空串。要问的是"有没有带着当前项目问过一次"。
+test("读用户级配置不再需要项目路径——那是为筛别人的 local 作用域才有的参数", async () => {
+  // 以前要把当前工作区路径传给 Rust，才认得出 ~/.claude.json 的 projects["<cwd>"] 里
+  // 哪一条属于这个项目。现在只读自有那一份，和打开的是哪个项目无关。
+  const read = makeDoc({ ownConfig: { path: USER_FILE, servers: { mine: { command: "x" } } } });
+  for (const root of ["/work/a", "/work/b", ""]) {
+    const doc = await read(root);
+    assert.deepEqual(Object.keys(JSON.parse(doc.text).mcpServers), ["mine"], `${root} 下读不到自有服务`);
+  }
+  assert.ok(read.invokeArgs.length > 0, "根本没问过后端");
   assert.ok(
-    read.invokeArgs.some((args) => args?.project === "/work/a"),
-    `没带项目路径问过：${JSON.stringify(read.invokeArgs)}`,
+    read.invokeArgs.every((args) => args === undefined),
+    `还在给 mcp_user_config 传参数：${JSON.stringify(read.invokeArgs)}`,
   );
-  // 换个项目就该没有它：local 作用域在 Claude Code 里本来就不跨项目。
-  const other = await read("/work/b");
-  assert.equal(JSON.parse(other.text || "{}").mcpServers?.["local-scoped"], undefined);
 });
 
 test("每个服务都带着它的来源作用域——权限门和面板都靠这个分辨谁写的", async () => {
@@ -208,10 +182,11 @@ test("每个服务都带着它的来源作用域——权限门和面板都靠�
       "/work/a/.mcp.local.json": JSON.stringify({ mcpServers: { mine: { command: "x" } } }),
       "/work/a/.mcp.json": JSON.stringify({ mcpServers: { fromRepo: { command: "x" } } }),
     },
-    userConfigs: [{ path: USER_FILE, writable: true, servers: { global: { command: "x" } } }],
+    ownConfig: { path: USER_FILE, servers: { global: { command: "x" } } },
   });
   const doc = await read("/work/a");
   assert.deepEqual(doc.serverScopes, { mine: "local", fromRepo: "repo", global: "user" });
+  assert.ok(!Object.values(doc.serverScopes).includes("interop"), "interop 这个作用域已经不存在了");
 });
 
 // ── ② 权限门：谁写的命令行，谁决定要不要逐次问 ──────────────────────────────
@@ -220,7 +195,6 @@ test("仓库自带的 MCP 照旧逐次确认；用户自己配的直接跑", () 
   assert.equal(_mcpServerApprovalMode("repo", {}), "ask");
   assert.equal(_mcpServerApprovalMode("user", {}), "auto");
   assert.equal(_mcpServerApprovalMode("local", {}), "auto");
-  assert.equal(_mcpServerApprovalMode("interop", {}), "auto");
 });
 
 test("服务条目里显式写了 approve 就听它的，两个方向都要生效", () => {
@@ -557,14 +531,13 @@ test("MCP 资源的读取不依赖工作区根目录——没打开文件夹时�
 // 服务，就跑去改 Cursor 的配置。所以「删除」的正确语义是**停用**——记进自己的
 // ~/.michael-ide/mcp.json 的 `disabled: []`，可恢复，一个字节都不碰对方的文件。
 
-const CURSOR_SVC = { path: CURSOR_FILE, writable: false, servers: { "Michael-Cursor": { command: "node" } } };
-
 test("停用之后那个服务不再进合并结果——也就不会连、不会出现在工具里", async () => {
   const read = makeDoc({
-    userConfigs: [
-      { path: USER_FILE, writable: true, servers: {}, disabled: ["Michael-Cursor"] },
-      CURSOR_SVC,
-    ],
+    ownConfig: {
+      path: USER_FILE,
+      servers: { "Michael-Cursor": { command: "node" } },
+      disabled: ["Michael-Cursor"],
+    },
   });
   const doc = await read("/work/a");
   assert.deepEqual(Object.keys(JSON.parse(doc.text).mcpServers), []);
@@ -575,17 +548,18 @@ test("停用之后那个服务不再进合并结果——也就不会连、不�
 
 test("没停用时照常在——别把功能反过来了", async () => {
   const read = makeDoc({
-    userConfigs: [{ path: USER_FILE, writable: true, servers: {}, disabled: [] }, CURSOR_SVC],
+    ownConfig: { path: USER_FILE, servers: { "Michael-Cursor": { command: "node" } }, disabled: [] },
   });
   assert.deepEqual(Object.keys(JSON.parse((await read("/work/a")).text).mcpServers), ["Michael-Cursor"]);
 });
 
 test("服务名大小写不一致也认得出来", async () => {
   const read = makeDoc({
-    userConfigs: [
-      { path: USER_FILE, writable: true, servers: {}, disabled: ["  MICHAEL-cursor  "] },
-      CURSOR_SVC,
-    ],
+    ownConfig: {
+      path: USER_FILE,
+      servers: { "Michael-Cursor": { command: "node" } },
+      disabled: ["  MICHAEL-cursor  "],
+    },
   });
   assert.deepEqual(Object.keys(JSON.parse((await read("/work/a")).text).mcpServers), []);
 });
@@ -593,36 +567,24 @@ test("服务名大小写不一致也认得出来", async () => {
 test("仓库自带的服务同样可以停用（它也不是本 IDE 的文件）", async () => {
   const read = makeDoc({
     files: { "/work/a/.mcp.json": JSON.stringify({ mcpServers: { fromRepo: { command: "x" } } }) },
-    userConfigs: [{ path: USER_FILE, writable: true, servers: {}, disabled: ["fromRepo"] }],
+    ownConfig: { path: USER_FILE, servers: {}, disabled: ["fromRepo"] },
   });
   assert.deepEqual(Object.keys(JSON.parse((await read("/work/a")).text).mcpServers), []);
-});
-
-test("只认自己那份配置里的 disabled——别的客户端的文件里没这个概念", async () => {
-  const read = makeDoc({
-    userConfigs: [
-      { path: USER_FILE, writable: true, servers: { mine: { command: "x" } }, disabled: [] },
-      // 假装 Cursor 的文件里也有个 disabled，不该被采纳
-      { path: CURSOR_FILE, writable: false, servers: {}, disabled: ["mine"] },
-    ],
-  });
-  assert.deepEqual(Object.keys(JSON.parse((await read("/work/a")).text).mcpServers), ["mine"]);
 });
 
 test("停用写回自己的全局配置，绝不碰别人的文件", async () => {
   const saved = [];
   const backend = {
     invoke: async (cmd, args) => {
-      if (cmd === "mcp_user_configs") {
-        return [{ path: USER_FILE, writable: true, servers: { keepMe: { command: "x" } }, disabled: ["old"] },
-                { path: CURSOR_FILE, writable: false, servers: { "Michael-Cursor": { command: "node" } } }];
+      if (cmd === "mcp_user_config") {
+        return { path: USER_FILE, servers: { keepMe: { command: "x" } }, disabled: ["old"] };
       }
       if (cmd === "mcp_save_user_config") { saved.push(JSON.parse(args.text)); return USER_FILE; }
       throw new Error("unexpected " + cmd);
     },
   };
-  const _readUserScopeMcpConfigs = load("_readUserScopeMcpConfigs", { inTauri: true, backend });
-  const _readOwnMcpConfig = load("_readOwnMcpConfig", { _readUserScopeMcpConfigs });
+  const _readOwnMcpUserConfig = load("_readOwnMcpUserConfig", { inTauri: true, backend });
+  const _readOwnMcpConfig = load("_readOwnMcpConfig", { _readOwnMcpUserConfig });
   const _writeOwnMcpConfig = load("_writeOwnMcpConfig", { backend });
   const set = load("_setMcpServerDisabled", { inTauri: true, _readOwnMcpConfig, _writeOwnMcpConfig });
 
@@ -642,13 +604,13 @@ test("重复停用同一个不会写出两条", async () => {
   const saved = [];
   const backend = {
     invoke: async (cmd, args) => {
-      if (cmd === "mcp_user_configs") return [{ path: USER_FILE, writable: true, servers: {}, disabled: ["dup"] }];
+      if (cmd === "mcp_user_config") return { path: USER_FILE, servers: {}, disabled: ["dup"] };
       if (cmd === "mcp_save_user_config") { saved.push(JSON.parse(args.text)); return USER_FILE; }
       throw new Error("unexpected " + cmd);
     },
   };
-  const _readUserScopeMcpConfigs = load("_readUserScopeMcpConfigs", { inTauri: true, backend });
-  const _readOwnMcpConfig = load("_readOwnMcpConfig", { _readUserScopeMcpConfigs });
+  const _readOwnMcpUserConfig = load("_readOwnMcpUserConfig", { inTauri: true, backend });
+  const _readOwnMcpConfig = load("_readOwnMcpConfig", { _readOwnMcpUserConfig });
   const _writeOwnMcpConfig = load("_writeOwnMcpConfig", { backend });
   await load("_setMcpServerDisabled", { inTauri: true, _readOwnMcpConfig, _writeOwnMcpConfig })("dup", true);
   assert.deepEqual(saved.at(-1).disabled, ["dup"]);
@@ -657,7 +619,7 @@ test("重复停用同一个不会写出两条", async () => {
 test("面板要给出恢复入口，否则停用完就再也找不回来了", () => {
   assert.match(SRC, /已停用 · 不会加载/);
   assert.match(SRC, /_setMcpServerDisabled\(off, false\)/);
-  // 编辑仍然不给——那是别人的文件
+  // 编辑仍然不给——走到那里的只剩仓库自带的 .mcp.json，那是版本库里的文件
   assert.match(SRC, /editBtn\.disabled = true;/);
 });
 
@@ -673,10 +635,7 @@ test("面板要给出恢复入口，否则停用完就再也找不回来了", ()
 function ownCfgIO({ servers = {}, disabled = [], parseError = "", path = "/u/.michael-ide/mcp.json" } = {}) {
   const saved = [];
   const deps = {
-    _readUserScopeMcpConfigs: async () => [
-      { path: "/u/.claude.json", writable: false, servers: { readonlyOne: {} }, disabled: [] },
-      { path, writable: true, servers, disabled, parseError },
-    ],
+    _readOwnMcpUserConfig: async () => ({ path, servers, disabled, parseError }),
     backend: { invoke: async (cmd, args) => { saved.push({ cmd, args }); } },
   };
   return {
@@ -940,7 +899,7 @@ test("每一处 mcp_* 调用都带 root，一个都不能漏", () => {
   const callSites = [...SRC.matchAll(/(?:_invokeCapped|backend\.invoke)\(\s*"(mcp_[a-z_]+)"\s*,\s*\{([^}]*)\}/g)];
   assert.ok(callSites.length >= 8, `调用点太少，正则可能没匹配上：${callSites.length}`);
   const missing = callSites
-    .filter(([, name]) => name !== "mcp_user_configs" && name !== "mcp_save_user_config")
+    .filter(([, name]) => name !== "mcp_user_config" && name !== "mcp_save_user_config")
     .filter(([, , args]) => !/\broot\b/.test(args))
     .map(([whole, name]) => `${name}: ${whole.slice(0, 90)}`);
   assert.deepEqual(missing, [], "这些 mcp_* 调用没带 root，Rust 侧会直接反序列化失败");

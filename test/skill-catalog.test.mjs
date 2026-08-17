@@ -160,11 +160,14 @@ test("技能：正文不被腰斩、描述不被提前砍死、allowed-tools 真
   assert.match(allow.slice(0, 900), /if \(!declaring\.length\) return null;/,
     "没有声明的技能也参与收窄了");
 
-  // ④ Claude Code 插件市场的技能目录要扫到。
-  const bases = SRC.slice(SRC.indexOf("function _skillDiscoveryBases"));
-  assert.match(bases.slice(0, 900), /\.claude\/plugins/, "不扫 Claude Code 的插件技能目录");
-  assert.match(SRC, /\\.claude\\\/plugins\)\$\/\.test\(base\) \? 5 : 2/,
-    "插件目录层级更深，没给足扫描深度");
+  // ④ 只扫自有目录。这一条以前是反的（断言"要扫到 Claude Code 的插件市场"）——
+  //    按用户要求，别的工具的目录一个都不扫了。
+  const bases = SRC.slice(SRC.indexOf("function _skillDiscoveryBases"), SRC.indexOf("function _skillDiscoveryBases") + 700);
+  assert.match(bases, /\$\{root\}\/\.claude\/skills/, "工作区的 .claude/skills 是安装落点，必须扫");
+  assert.match(bases, /\/\.michael-ide\/skills/, "家目录那份自有技能库没扫");
+  for (const foreign of ["plugins", ".cursor", ".codex", ".agents"]) {
+    assert.ok(!bases.includes(foreign), `还在扫别的工具的目录：${foreign}`);
+  }
 
   // ⑤ 往输入框填文本的那条路径是提示词模板语义，和 Agent Skills 是两回事，已删。
   assert.doesNotMatch(SRC, /function _useSkill\(/,
