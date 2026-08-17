@@ -24438,9 +24438,9 @@ async function sendPrompt(text, attachments = [], readyConfig = null) {
   // 时它还没跑完，技能目录里就只剩 localStorage 那批——模型看不见的技能等于不存在，
   // 而且不会有任何报错。首轮值得等这一次目录扫描：只扫几个目录，只在从没扫过时等，
   // 超时也不阻塞（后台那次照常写回缓存，下一轮就齐了）。
-  // 没打开文件夹也要扫：技能大多装在家目录（~/.claude/skills、~/.codex/plugins/cache），
-  // 跟有没有打开项目无关。这里以前带着 `_curRoot &&`，于是"启动 IDE、不开文件夹、
-  // 直接提问"这条最常见的路径上，磁盘技能一个都不会被发现——用户装了一堆，模型全不知道。
+  // 没打开文件夹也要扫：家目录那份技能库（~/.michael-ide/skills）跟有没有打开项目无关。
+  // 这里以前带着 `_curRoot &&`，于是"启动 IDE、不开文件夹、直接提问"这条最常见的路径上，
+  // 磁盘技能一个都不会被发现——用户装了一堆，模型全不知道。
   // 自限：扫完 _fileSkillsCacheKey 变成 "\0<home>"（非空），所以每次启动最多等这一回；
   // 之后真打开了文件夹，cacheKey 不同会自动重扫。
   if (!_agentLightTurn && inTauri && !_fileSkillsCacheKey) {
@@ -26909,51 +26909,47 @@ async function _approveWorkspaceExecConfig(kind, path, text, details) {
   return true;
 }
 
-// 用户级（跨项目）MCP 配置：本 IDE 的 ~/.michael-ide/mcp.json，加上 Claude Code /
-// Cursor / Codex 的全局配置（只读接入）。见 src-tauri/src/mcp.rs 里为什么要走独立命令。
+// 用户级（跨项目）MCP 配置：本 IDE 自己的 ~/.michael-ide/mcp.json，**只有这一份**。
+// 见 src-tauri/src/mcp.rs 里为什么要走独立命令。
 //
 // 这一层是"MCP 能不能真的用起来"的关键：在它之前，配置**只**来自工作区里的文件，
 // 换个项目就得把服务和 API Key 从头再填一遍，没打开文件夹时干脆一个都用不了。
-// root 要传：Claude Code 的 `claude mcp add` 缺省写的是 **local 作用域**，落在
-// ~/.claude.json 的 projects["<当时的 cwd>"].mcpServers 底下，只有把当前工作区路径交过去
-// 才认得出哪一条属于这个项目。不传（比如只是想拿可写配置的路径）就只读到全局那一层。
-async function _readUserScopeMcpConfigs(root) {
-  if (!inTauri) return [];
+//
+// 这里曾经还会把 Claude Code / Cursor / Codex / Claude Desktop 的全局配置一并读进来。
+// 按用户要求去掉了：别的客户端的配置文件不是他的目录，不该在这个 IDE 里生效。想用那边
+// 配过的服务，在 MCP 面板里加一遍就是——那一次是明确的采纳，而不是默默继承。
+async function _readOwnMcpUserConfig() {
+  if (!inTauri) return null;
   try {
-    const list = await backend.invoke("mcp_user_configs", { project: String(root || "") });
-    return Array.isArray(list) ? list : [];
-  } catch { return []; }
+    const config = await backend.invoke("mcp_user_config");
+    return config && typeof config === "object" ? config : null;
+  } catch { return null; }
 }
 
 /// 被停用的服务名（大小写不敏感）。
 ///
-/// 从 Cursor / Claude Code 读来的服务住在**它们的**配置文件里，本 IDE 只读不写——总不能
-/// 因为用户想在 Day One 里少加载一个服务，就跑去改 Cursor 的配置。所以停用记在自己的全局
-/// 配置里：`~/.michael-ide/mcp.json` 的 `disabled: []`。仓库自带的 .mcp.json 同理。
+/// 仓库自带的 `.mcp.json` 跟着 git clone 来，本 IDE 不去改它——想在这里少加载它带来的
+/// 一个服务，不该逼人去动版本库里的文件。所以停用记在自己的全局配置里：
+/// `~/.michael-ide/mcp.json` 的 `disabled: []`。
 ///
-/// 这也是「删除」按钮之前形同虚设的原因：它对这两类服务是 disabled 的，点下去毫无反应，
+/// 这也是「删除」按钮之前形同虚设的原因：它对这类服务是 disabled 的，点下去毫无反应，
 /// 只有悬停才看得到一句说明——等于一个坏掉的按钮。
 /// 返回 Map<小写名, 原样名>：匹配要不分大小写，显示要保留用户写的那个大小写。
-/// 用 Set 存小写的话，面板里那条"已停用"会显示成 michael-cursor，和他在 Cursor 里看到的
-/// Michael-Cursor 对不上，读起来像是另一个服务。
+/// 用 Set 存小写的话，面板里那条"已停用"会显示成 my-server，和他在配置里写的
+/// My-Server 对不上，读起来像是另一个服务。
 async function _disabledMcpServers() {
   const out = new Map();
-  for (const entry of await _readUserScopeMcpConfigs()) {
-    if (!entry?.writable) continue;   // 只认自己那份；别的客户端的文件里没有这个字段
-    for (const name of Array.isArray(entry.disabled) ? entry.disabled : []) {
-      const raw = String(name || "").trim();
-      if (raw) out.set(raw.toLowerCase(), raw);
-    }
+  const own = await _readOwnMcpUserConfig();
+  for (const name of Array.isArray(own?.disabled) ? own.disabled : []) {
+    const raw = String(name || "").trim();
+    if (raw) out.set(raw.toLowerCase(), raw);
   }
   return out;
 }
 
-/// 用户级配置里可写的那一份的路径（面板保存的目标）。取不到就返回空串。
+/// 自有全局配置的路径（面板保存的目标）。取不到就返回空串。
 async function _userScopeMcpConfigPath() {
-  for (const entry of await _readUserScopeMcpConfigs()) {
-    if (entry && entry.writable) return String(entry.path || "");
-  }
-  return "";
+  return String((await _readOwnMcpUserConfig())?.path || "");
 }
 
 // `.mcp.local.json` 是不是**跟着仓库来的**。
@@ -26986,10 +26982,11 @@ async function _mcpLocalFileIsTracked(base) {
 async function _readWorkspaceMcpDocument(root) {
   const documents = [];
   for (const base of _workspaceAncestorRoots(root)) {
-    // Claude Code and other MCP clients use the shared project files below. The IDE-local
-    // file wins when the same server name appears in more than one layer; parent roots are
-    // still included so a monorepo-level service remains available to a nested package.
-    for (const path of [base + "/.mcp.local.json", base + "/.mcp.json", base + "/.cursor/mcp.json"]) {
+    // 只读这两个：`.mcp.local.json` 是用户自己在这个项目里配的，`.mcp.json` 是 MCP 的
+    // 项目标准文件（跟着仓库走，所以要过信任门）。`.cursor/mcp.json` 曾经也在这里读，
+    // 按用户要求去掉了——那是 Cursor 的目录。
+    // 同名时 IDE-local 那份赢；父目录也一并看，好让 monorepo 顶层配的服务对子包仍然可用。
+    for (const path of [base + "/.mcp.local.json", base + "/.mcp.json"]) {
       const isLocalName = path.endsWith("/.mcp.local.json");
       let text;
       try { text = await backend.readTextFile(path); } catch { continue; }
@@ -27000,15 +26997,15 @@ async function _readWorkspaceMcpDocument(root) {
   }
   // 用户级配置排在工作区之后：同名时项目里的那个赢，项目可以覆写一个全局服务。
   const workspaceCount = documents.length;
-  for (const entry of await _readUserScopeMcpConfigs(root)) {
-    const servers = entry && entry.servers && typeof entry.servers === "object" ? entry.servers : {};
-    if (!entry?.writable && !Object.keys(servers).length) continue;
+  const own = await _readOwnMcpUserConfig();
+  if (own) {
+    const servers = own.servers && typeof own.servers === "object" ? own.servers : {};
     documents.push({
       text: JSON.stringify({ mcpServers: servers }),
-      path: String(entry.path || ""),
+      path: String(own.path || ""),
       // 全局服务跟着**当前**工作区跑（相对 cwd 相对它解析）；没打开文件夹时就没有基准目录。
       base: root || "",
-      scope: entry.writable ? "user" : "interop",
+      scope: "user",
     });
   }
   const disabled = await _disabledMcpServers();
@@ -27020,7 +27017,7 @@ async function _readWorkspaceMcpDocument(root) {
   // `.cursor/mcp.json`、以及被提交进版本库的 `.mcp.local.json`，都跟着仓库走
   // ＝ **外部可执行内容**，必须先过信任 + 逐条确认。调用方靠这张表区分两者。
   const serverSources = {};
-  // scope: local（项目本地，用户配的）/ repo（仓库自带）/ user（本 IDE 全局）/ interop（别的客户端的全局配置）
+  // scope: local（项目本地，用户配的）/ repo（仓库自带）/ user（本 IDE 全局配置）
   const serverScopes = {};
   const invalid = [];
   for (const document of documents) {
@@ -27070,8 +27067,8 @@ async function _readWorkspaceMcpDocument(root) {
  * 所以：读要带回 disabled 和 parseError，写要在 parseError 时**拒绝**。
  */
 async function _readOwnMcpConfig() {
-  for (const entry of await _readUserScopeMcpConfigs()) {
-    if (!entry?.writable) continue;
+  const entry = await _readOwnMcpUserConfig();
+  if (entry) {
     const servers = entry.servers && typeof entry.servers === "object" ? entry.servers : {};
     const disabled = Array.isArray(entry.disabled) ? [...entry.disabled] : [];
     return {
@@ -28435,24 +28432,21 @@ function _activeSkillsBlock() {
   } catch { return ""; }
 }
 
+/*
+ * 技能只从**这个 IDE 自己的目录**发现，两处：
+ *
+ *   <工作区及其父目录>/.claude/skills/<名字>/SKILL.md   ← 技能市场的安装落点（见
+ *                                                        destBase，「安装」按钮就写这里）
+ *   ~/.michael-ide/skills/<名字>/SKILL.md               ← 自己的家目录技能库，和
+ *                                                        ~/.michael-ide/mcp.json 同一个命名空间
+ *
+ * 这里曾经还会扫 .cursor/skills、.codex/skills、.agents/skills、~/.codex/plugins/cache、
+ * ~/.claude/plugins。按用户要求全部去掉了：那些是别的工具的目录，不该在这个 IDE 里生效。
+ * 想用那边的某个技能，把它复制到上面两个位置之一——那一次是明确的采纳，而不是默默继承。
+ */
 function _skillDiscoveryBases(projectRoot, home) {
-  const roots = _workspaceAncestorRoots(projectRoot);
-  if (home) roots.push(String(home).replace(/\/+$/, ""));
-  const bases = [];
-  for (const root of roots) {
-    for (const owner of [".agents", ".codex", ".claude", ".cursor"]) bases.push(`${root}/${owner}/skills`);
-  }
-  // Codex plugins keep their SKILL.md files under a versioned cache rather than
-  // ~/.codex/skills. Discover them too; they remain opt-in and retain baseDir so
-  // relative scripts/assets referenced by the skill can be read and executed.
-  if (home) bases.push(`${String(home).replace(/\/+$/, "")}/.codex/plugins/cache`);
-  /*
-   * Claude Code 插件市场装的技能落在 ~/.claude/plugins/<市场>/<插件>/skills/<名字>/SKILL.md。
-   * 不扫这一层的话，用户在 Claude Code 里装了一批插件技能、切到这个 IDE 就凭空少一半，
-   * 而界面上没有任何地方说明"这类没扫"——表现是"装了跟没装一样"。
-   * 目录层级比 .claude/skills 深两级，靠扫描函数自己的深度预算兜住（插件缓存那一档是 5 层）。
-   */
-  if (home) bases.push(`${String(home).replace(/\/+$/, "")}/.claude/plugins`);
+  const bases = _workspaceAncestorRoots(projectRoot).map((root) => `${root}/.claude/skills`);
+  if (home) bases.push(`${String(home).replace(/\/+$/, "")}/.michael-ide/skills`);
   return [...new Set(bases)];
 }
 
@@ -28750,10 +28744,9 @@ async function _refreshFileSkills(root) {
       }
     }
   };
-  await Promise.all(bases.map((base, i) =>
-    // 插件目录层级更深：Claude Code 是 ~/.claude/plugins/<市场>/<插件>/skills/<名字>/SKILL.md
-    // （比 .claude/skills/<名字>/ 深三级），Codex 的版本化缓存也一样。给它们 5 层。
-    visit(perBase[i], base, /\/(?:\.codex\/plugins\/cache|\.claude\/plugins)$/.test(base) ? 5 : 2)));
+  // 两个自有目录的形状是一样的：<base>/<名字>/SKILL.md，2 层够。以前这里有个 5 层的
+  // 分档，是给插件市场那种 <市场>/<插件>/skills/<名字>/ 的深目录用的——不扫了，一并去掉。
+  await Promise.all(bases.map((base, i) => visit(perBase[i], base, 2)));
   // 先按来源顺序拼接，再按名字稳定排序——同名时留下的是优先级更高的那个来源。
   const found = perBase.flat();
   _fileSkillsDropped = dropped;
@@ -28938,7 +28931,7 @@ async function openSkillsPanel() {
   const renderList = () => {
     m.body.innerHTML = "";
     const intro = document.createElement("p"); intro.className = "ctp-intro";
-    intro.textContent = "技能始终对模型可见：清单里的名称和描述一直在上下文里，模型按需自己读取正文。「常驻」是把某个技能的全文钉进每次请求，并传给 Agent 子任务。这里支持自定义技能，也会发现项目、父仓库、用户目录和 Codex 插件缓存中的 SKILL.md；文件型技能保持只读。登录后自定义技能会同步到账号。";
+    intro.textContent = "技能始终对模型可见：清单里的名称和描述一直在上下文里，模型按需自己读取正文。「常驻」是把某个技能的全文钉进每次请求，并传给 Agent 子任务。这里支持自定义技能；文件型技能只从两个自有位置发现——工作区（含上级仓库）的 .claude/skills/ 和家目录的 ~/.michael-ide/skills/；正文在文件里改，面板上只能常驻或删除。登录后自定义技能会同步到账号。";
     m.body.appendChild(intro);
     const list = document.createElement("div"); list.className = "ctp-list";
     if (!skills.length) { const e = document.createElement("div"); e.className = "ctp-empty"; e.textContent = "还没有技能。点下面「新建技能」创建你自己的。"; list.appendChild(e); }
@@ -29246,19 +29239,9 @@ async function openMcpPanel(opts = null) {
     cfg.mcpServers = servers; delete cfg.servers;
     await writeScopeCfg(scope, cfg);
   };
-  const SCOPE_TAG = { user: "全局", local: "项目", repo: "仓库", interop: "其他客户端" };
+  const SCOPE_TAG = { user: "全局", local: "项目", repo: "仓库" };
   let userPath = "";   // ~/.michael-ide/mcp.json，由后端给出；面板要显示"会存到哪里"
   try { userPath = await _userScopeMcpConfigPath(); } catch {}
-  const _appOfSource = (source) => {
-    const p = String(source || "");
-    if (p.endsWith("/.claude.json")) return "Claude Code";
-    // Claude Desktop 的配置不在 HOME 底下（macOS 在 Library/Application Support，
-    // Windows 在 APPDATA，Linux 在 .config），所以按文件名认，不按目录。
-    if (p.endsWith("/claude_desktop_config.json")) return "Claude Desktop";
-    if (p.includes("/.cursor/")) return "Cursor";
-    if (p.includes("/.codex/")) return "Codex";
-    return "";
-  };
   let editing = null;
   const renderList = async () => {
     m.body.innerHTML = `<div class="ctp-loading">加载中…</div>`;
@@ -29274,8 +29257,8 @@ async function openMcpPanel(opts = null) {
     const intro = document.createElement("div"); intro.className = "ctp-intro";
     intro.innerHTML = `接入 MCP 服务，完成握手和工具发现后，其工具会以 <code>mcp__服务__工具</code> 提供给智能体。`
       + `新服务默认存在<b>全局</b>配置 <code>${_escHtml(userPath || "~/.michael-ide/mcp.json")}</code>（权限 0600），<b>换项目照样在</b>；`
-      + `选「仅这个项目」则写进已本地排除的 <code>.mcp.local.json</code>。也会读取仓库里的 <code>.mcp.json</code> / <code>.cursor/mcp.json</code>，`
-      + `以及你在 Claude Code / Cursor / Codex 里配好的全局服务（只读）。`
+      + `选「仅这个项目」则写进已本地排除的 <code>.mcp.local.json</code>。仓库自带的 <code>.mcp.json</code> 也会读（只读）。`
+      + `<b>不会</b>读取 Claude Code / Cursor / Codex / Claude Desktop 的配置——那些是别的工具的目录，想用那边的服务在这里加一遍即可。`
       + `<br>你自己配的服务<b>不会</b>逐次弹窗要授权；仓库自带的那些照旧需要确认。想让某个服务恢复逐次确认，给它加一行 <code>"__michael": { "approve": "ask" }</code>。`;
     m.body.appendChild(intro);
     const list = document.createElement("div"); list.className = "ctp-list";
@@ -29296,7 +29279,7 @@ async function openMcpPanel(opts = null) {
       row.innerHTML =
         `<span class="mcp-row__dot ${connected ? "is-on" : (failure ? "is-error" : "")}"></span>` +
         `<div class="mcp-row__main"><div class="mcp-row__name"></div><div class="mcp-row__cmd"></div></div>` +
-        `<span class="mcp-row__scope">${_escHtml(_appOfSource(source) || SCOPE_TAG[scope] || scope)}</span>` +
+        `<span class="mcp-row__scope">${_escHtml(SCOPE_TAG[scope] || scope)}</span>` +
         `<span class="mcp-row__tag${connected ? " is-on" : ""}${failure ? " is-error" : ""}${connected && toolCount ? " is-clickable" : ""}">${statusText}</span>` +
         `<div class="ctp-rowbtns"><button class="ctp-iconbtn _edit" type="button" title="编辑" aria-label="编辑">${_ICON_PENCIL}</button><button class="ctp-iconbtn ctp-iconbtn--danger _del" type="button" title="删除" aria-label="删除">${_ICON_TRASH}</button></div>`;
       row.querySelector(".mcp-row__name").textContent = name;
@@ -29305,23 +29288,22 @@ async function openMcpPanel(opts = null) {
       if (failure) row.querySelector(".mcp-row__tag").title = failure;
       const editBtn = row.querySelector("._edit"); const delBtn = row.querySelector("._del");
       if (!editable) {
-        // 编辑仍然不给：那是别人的文件，改它是越界。
+        // 走到这里只有一种情况：仓库自带的 .mcp.json。编辑不给——那是版本库里的文件，
+        // 从面板里改它会和 git 打架。
         editBtn.disabled = true;
-        editBtn.title = scope === "repo"
-          ? "这个服务来自仓库里的配置文件，请直接编辑该文件"
-          : `这个服务来自 ${_appOfSource(source) || "其他客户端"} 的配置，请在那边编辑`;
+        editBtn.title = "这个服务来自仓库里的配置文件，请直接编辑该文件";
         // 但**停用要给**。以前这个按钮也是 disabled，点下去毫无反应，只有悬停才看得到一句
-        // 说明——用户看到的就是"删不掉"。想在本 IDE 里少加载一个服务是完全合理的诉求，
-        // 不该逼人跑去改 Cursor 的配置。所以这里改成"停用"：记进自己的全局配置，可恢复，
-        // 一个字节都不碰对方的文件。
-        delBtn.title = `在 Day One 里停用（不会改动 ${_appOfSource(source) || "原始"} 配置，可恢复）`;
+        // 说明——用户看到的就是"删不掉"。想在本 IDE 里少加载一个仓库带来的服务是完全合理
+        // 的诉求，不该逼人去动版本库里的文件。所以这里是"停用"：记进自己的全局配置，
+        // 可恢复，一个字节都不碰仓库里那份。
+        delBtn.title = "在 Day One 里停用（不会改动仓库里的配置，可恢复）";
         delBtn.addEventListener("click", async () => {
           try {
             await _setMcpServerDisabled(name, true);
             await backend.invoke("mcp_disconnect", { name, root }).catch(() => {});
             _forgetMcpServer(root, name);
             _mcpLoaded = false; await _ensureMcpTools(root); renderList();
-            showToast(`已在 Day One 里停用「${name}」（原配置未改动）`);
+            showToast(`已在 Day One 里停用「${name}」（仓库里的配置未改动）`);
           } catch (e) { showToast("停用失败：" + String(e?.message || e).slice(0, 120)); }
         });
       } else {
@@ -42707,7 +42689,7 @@ function _mcpToolCardHtml(call, result) {
   try { snap = _mcpStates.get(String(call?.mcpRoot || "").replace(/\/+$/, ""))?.snapshot || null; } catch {}
   const meta = snap?.serverMeta?.get?.(call?.server) || null;
   const desc = (snap?.toolCache || []).find((e) => e?.function?.name === call?.mcpName)?.descBody || "";
-  const scope = { local: "项目本地配置", repo: "仓库自带配置", user: "本机全局配置", interop: "其他客户端的配置" }[String(meta?.scope || "")] || "配置来源未知";
+  const scope = { local: "项目本地配置", repo: "仓库自带配置", user: "本机全局配置" }[String(meta?.scope || "")] || "配置来源未知";
   const kind = call?.kind === "resource" ? "读取资源" : call?.kind === "prompt" ? "取 prompt" : `调用工具 ${call?.tool || "?"}`;
   const info = meta?.serverInfo || {};
   const args = call?.args && typeof call.args === "object" && !Array.isArray(call.args) ? call.args : {};
@@ -57298,7 +57280,7 @@ function renderSkillsTool(body) {
       <div class="mcpfp-head">
         <div>
           <h3>Skills 技能</h3>
-          <p class="mcpfp-sub">技能始终对模型可见：清单里的名称和描述一直在上下文里，模型按需自己读取正文。「常驻」是把某个技能的全文钉进每次请求（也传给 Agent 子任务）。技能可以是自定义提示词，也可以是含 <code>SKILL.md</code> 的目录——安装到工作区 <code>.claude/skills/</code> 后自动被发现。</p>
+          <p class="mcpfp-sub">技能始终对模型可见：清单里的名称和描述一直在上下文里，模型按需自己读取正文。「常驻」是把某个技能的全文钉进每次请求（也传给 Agent 子任务）。技能可以是自定义提示词，也可以是含 <code>SKILL.md</code> 的目录。只发现两个自有位置：工作区（含上级仓库）的 <code>.claude/skills/</code>（下面「安装」按钮的落点）和家目录的 <code>~/.michael-ide/skills/</code>。</p>
         </div>
         <button type="button" class="ctp-btn ctp-btn--primary" data-skfp="add-skill">＋ 添加技能</button>
       </div>
@@ -57395,7 +57377,7 @@ function renderSkillsTool(body) {
      * 面板要显示**模型手上的全部技能**，而不只是装进当前工作区的那些。
      *
      * 这里以前只留 _skillIsWorkspaceInstalled 的那批。可技能目录（_skillCatalogBlock）
-     * 读的是 _fileSkills 全量——家目录 ~/.claude/skills、上级仓库、Codex 插件缓存都算。
+     * 读的是 _fileSkills 全量——家目录 ~/.michael-ide/skills 和上级仓库的都算。
      * 于是一个把技能装在家目录的人，模型明明按那些技能在干活，面板却写着「还没有技能」；
      * 想关掉其中某一个，界面上根本找不到它。面板和模型看到的必须是同一份。
      *
@@ -57425,7 +57407,9 @@ function renderSkillsTool(body) {
       const officialPath = officialCatalogHit ? `skills/${installedDir}` : "";
       const repoUrl = _skillSourceUrl(s) || (officialLike && installedDir ? `https://github.com/anthropics/skills/tree/main/skills/${installedDir}` : "");
       const desc = String(meta.desc || (officialPath ? `Anthropic 官方技能 · ${officialPath}` : "") || s.desc || (isFile ? s.baseDir || "" : "自定义技能")).slice(0, 160);
-      const sourceBadge = !isFile ? "自定义" : officialLike ? "官方" : meta.source === "github" ? "GitHub" : workspaceSkill ? "工作区" : "只读";
+      // 最后那档以前写「只读」，是假的：_skillCanDelete 对文件技能一律放行，卡片上删除键
+      // 就在那儿。真正的区别是它不装在本工作区——删它会波及其它项目。
+      const sourceBadge = !isFile ? "自定义" : officialLike ? "官方" : meta.source === "github" ? "GitHub" : workspaceSkill ? "工作区" : "家目录";
       // 不写「未启用」：那是这一页最误导的一个字。它是常驻显示的**状态标签**，用户
       // 读到的是"这个技能是关着的"——而技能从来没关过，模型随时能在清单里看见它、
       // 用 read_skill 读它。这个开关管的只是"要不要把全文钉进每次请求"。
@@ -57456,7 +57440,7 @@ function renderSkillsTool(body) {
     installedEl.innerHTML =
       [...custom, ...visibleFileSkills].map(cardFor).join("")
       + (externalFileSkills.length
-        ? `<div class="skfp-section">用户 / 插件目录（不属于当前项目，删除会连磁盘上的文件夹一起删）</div>`
+        ? `<div class="skfp-section">家目录 / 上级仓库（不属于当前项目，删除会连磁盘上的文件夹一起删，其它项目里也会跟着消失）</div>`
           + externalFileSkills.map(cardFor).join("")
         : "");
     renderMarket();

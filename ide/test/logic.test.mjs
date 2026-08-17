@@ -6937,7 +6937,10 @@ test("standard SKILL.md frontmatter is parsed with a stable source identity", ()
   assert.equal(skill.baseDir, "/repo/.agents/skills/release");
   assert.equal(skill._readonly, true);
   assert.match(skill.prompt, /Run the full test suite/);
-  assert.match(SRC, /\["\.agents", "\.codex", "\.claude", "\.cursor"\]/);
+  // 技能只从自有位置发现：工作区（含上级仓库）的 .claude/skills 和家目录的
+  // ~/.michael-ide/skills。.cursor / .codex / .agents 以及两个插件市场缓存都不再扫。
+  assert.match(SRC, /\$\{root\}\/\.claude\/skills/);
+  assert.match(SRC, /\/\.michael-ide\/skills/);
 });
 
 test("workspace SKILL.md discovery reads a real skill directory", async () => {
@@ -6945,11 +6948,11 @@ test("workspace SKILL.md discovery reads a real skill directory", async () => {
   const backend = {
     homeDir: async () => "/home/tester",
     readTextFile: async (path) => {
-      if (path === "/repo/.agents/skills/release/SKILL.md") return "---\nname: Release\ndescription: Verify releases\n---\nRun tests.";
+      if (path === "/repo/.claude/skills/release/SKILL.md") return "---\nname: Release\ndescription: Verify releases\n---\nRun tests.";
       throw new Error("missing");
     },
     readDir: async (path) => {
-      if (path === "/repo/.agents/skills") return [{ name: "release", path: "/repo/.agents/skills/release", is_dir: true }];
+      if (path === "/repo/.claude/skills") return [{ name: "release", path: "/repo/.claude/skills/release", is_dir: true }];
       return [];
     },
   };
@@ -6968,20 +6971,26 @@ test("workspace SKILL.md discovery reads a real skill directory", async () => {
   const found = await refresh("/repo");
   assert.equal(found.length, 1);
   assert.equal(found[0].name, "Release");
-  assert.equal(found[0].sourcePath, "/repo/.agents/skills/release/SKILL.md");
+  assert.equal(found[0].sourcePath, "/repo/.claude/skills/release/SKILL.md");
 });
 
-test("skill discovery includes parent repositories and user-owned directories", () => {
+test("技能只从自有目录发现：上级仓库算，别的工具的目录一个都不算", () => {
   const ancestorRoots = load("_workspaceAncestorRoots");
   const bases = load("_skillDiscoveryBases", { _workspaceAncestorRoots: ancestorRoots })("/repo/apps/ide", "/home/tester");
-  assert.ok(bases.includes("/repo/apps/ide/.agents/skills"));
-  assert.ok(bases.includes("/repo/apps/.cursor/skills"));
-  assert.ok(bases.includes("/repo/.agents/skills"));
-  assert.ok(bases.includes("/home/tester/.codex/skills"));
-  assert.ok(bases.includes("/home/tester/.codex/plugins/cache"));
+  // 工作区自己和上级仓库的 .claude/skills —— 那是技能市场「安装」按钮的落点。
+  assert.ok(bases.includes("/repo/apps/ide/.claude/skills"), bases.join(" "));
+  assert.ok(bases.includes("/repo/.claude/skills"), "上级仓库的也要算，monorepo 里技能常放顶层");
+  // 家目录那份技能库，和 ~/.michael-ide/mcp.json 同一个命名空间。
+  assert.ok(bases.includes("/home/tester/.michael-ide/skills"), bases.join(" "));
+  // 别的工具的目录一个都不扫——用户明确要求只加载自己的。
+  for (const foreign of [".cursor", ".codex", ".agents", "plugins"]) {
+    assert.ok(!bases.some((b) => b.includes(foreign)), `还在扫 ${foreign}：${bases.join(" ")}`);
+  }
+  // 家目录不该再冒出一个 .claude/skills（那是 Claude Code 的共享库，不是这个 IDE 的）。
+  assert.ok(!bases.includes("/home/tester/.claude/skills"), bases.join(" "));
 });
 
-test("MCP loads Claude Code-compatible project configs and merges their capabilities", async () => {
+test("项目配置只读 .mcp.local.json 和 .mcp.json，合并后各自带着来源", async () => {
   const ancestorRoots = load("_workspaceAncestorRoots");
   const reads = [];
   const read = load("_readWorkspaceMcpDocument", {
@@ -6994,9 +7003,11 @@ test("MCP loads Claude Code-compatible project configs and merges their capabili
     // `.mcp.local.json` 算不算"用户自己配的"要问 git（被跟踪＝跟着 clone 来的，按仓库自带
     // 处理）。完整覆盖在 test/mcp.test.mjs；这里的场景是用户自己那份，答"没跟踪"。
     _mcpLocalFileIsTracked: async () => false,
-    _readUserScopeMcpConfigs: async () => [
-      { path: "/home/me/.michael-ide/mcp.json", writable: true, servers: { global: { command: "node" }, local: { command: "全局的同名服务" } } },
-    ],
+    _readOwnMcpUserConfig: async () => ({
+      path: "/home/me/.michael-ide/mcp.json",
+      servers: { global: { command: "node" }, local: { command: "全局的同名服务" } },
+      disabled: [],
+    }),
     backend: { readTextFile: async (path) => {
       reads.push(path);
       if (path === "/repo/.mcp.local.json") return JSON.stringify({ mcpServers: { local: { command: "node" } } });
@@ -7007,24 +7018,23 @@ test("MCP loads Claude Code-compatible project configs and merges their capabili
   });
   const result = await read("/repo");
   const merged = JSON.parse(result.text);
-  assert.deepEqual(Object.keys(merged.mcpServers).sort(), ["cursor", "global", "local", "shared"]);
+  assert.deepEqual(Object.keys(merged.mcpServers).sort(), ["global", "local", "shared"]);
   assert.equal(merged.mcpServers.local.command, "node", "项目里的同名服务必须盖住全局那个");
   assert.match(result.path, /\.mcp\.local\.json/);
   assert.match(result.path, /\.mcp\.json/);
-  assert.match(result.path, /\.cursor\/mcp\.json/);
-  assert.ok(reads.length >= 3, "应检查三种 Claude Code/Michael 配置文件");
+  // Cursor 的项目配置不再读。文件就摆在那儿（上面的 readTextFile 会返回内容），
+  // 所以这条红了就是"又接回来了"，而不是"文件恰好不存在"。
+  assert.ok(!reads.includes("/repo/.cursor/mcp.json"), `又去读 Cursor 的配置了：${reads.join(" ")}`);
+  assert.ok(!result.path.includes(".cursor"), result.path);
   // Which file a server came from decides whether it needs an approval gate, so the
   // merge must not lose that provenance.
   assert.deepEqual(result.serverSources, {
     local: "/repo/.mcp.local.json",
     shared: "/repo/.mcp.json",
-    cursor: "/repo/.cursor/mcp.json",
     global: "/home/me/.michael-ide/mcp.json",
   });
   // 判据从"来自哪个文件"升级成"哪种作用域"：权限门和面板都读这一张表。
-  assert.deepEqual(result.serverScopes, {
-    local: "local", shared: "repo", cursor: "repo", global: "user",
-  });
+  assert.deepEqual(result.serverScopes, { local: "local", shared: "repo", global: "user" });
 });
 
 // This test previously locked in the vulnerability: it asserted `_ensureMcpTools` must NOT
