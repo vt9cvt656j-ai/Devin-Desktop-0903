@@ -776,7 +776,22 @@ export function createLspManager(options) {
         c: "winget install -e --id LLVM.LLVM",
         cpp: "winget install -e --id LLVM.LLVM",
         "objective-c": "winget install -e --id LLVM.LLVM",
+        // 这两个的 winget 包 ID 是核实过的，而且装出来的可执行文件名正好是上面
+        // SERVERS 表里要启动的那个（lua-language-server / terraform-ls）——包对不上
+        // 二进制名的一律不加：装完照样报"缺少"，比不给命令更糟。
+        lua: "winget install -e --id LuaLS.lua-language-server",
+        hcl: "winget install -e --id Hashicorp.TerraformLanguageServer",
       };
+      // 仍然没有 Windows 一键安装的：java(jdtls) / csharp(omnisharp) / kotlin /
+      // elixir / clojure / scala。原因各不相同，但都不是"懒得加"：
+      //   · jdtls / kotlin / elixir  —— 只有 GitHub release 压缩包，装完还要自己配 PATH；
+      //   · clojure-lsp             —— 要先 `scoop bucket add` 再装，两步且依赖 scoop；
+      //   · scala(metals)           —— 要先装 coursier 再 `cs install metals`，同样两步；
+      //   · csharp                  —— NuGet 上的 csharp-ls 装得上，但 IDE 启动的是
+      //                                `omnisharp -lsp`，二进制名和参数都对不上，
+      //                                给了它等于让用户装一个用不上的东西。
+      // 这几个宁可不给命令：给一条注定失败的，用户点一下、看它报错、再等 90 秒
+      // 进度条转完告诉他"安装超时"。
       const installHints = isWindows()
         ? { ...CROSS, ...WIN_ONLY }
         : { ...CROSS, ...MAC_ONLY };
