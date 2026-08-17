@@ -237,3 +237,82 @@ test("已有的公共代码搜索要说清它是干什么的", () => {
   const hintLine = SRC.slice(SRC.lastIndexOf("\n", hintAt) + 1, SRC.indexOf("\n", hintAt));
   assert.doesNotMatch(hintLine, /sources=\["/, "又在双引号字符串里用了双引号");
 });
+
+// ── TS 的类型兜底：垫片不能盖住真类型 ────────────────────────────────────────
+//
+// 这条防线是唯一**检出**而非降低概率的机制：参数写错、方法不存在，tsc 当场红。
+// 而它以前是断的——垫片无条件把每个用到的名字声明成 any，ambient module declaration
+// 又会盖过 node_modules 的正常解析，于是第三方符号的实际类型永远是 any，诊断必然绿。
+
+test("垫片只补真类型没覆盖到的名字", () => {
+  const makeShim = new Function(extractShim() + ";return _makeInstalledPackageShim;")();
+  const named = new Set(["defineConfig", "createServer"]);
+
+  // 真类型什么都没读到 → 行为和从前一样（宁可多一个 any，也不要假红）。
+  const full = makeShim("vite", { named, hasDefault: false }, null);
+  assert.match(full, /export const defineConfig: any;/);
+  assert.match(full, /export const createServer: any;/);
+
+  // 真类型覆盖了一个 → 只补另一个。补了被覆盖的那个就会把真类型盖掉。
+  const partial = makeShim("vite", { named, hasDefault: false }, new Set(["defineConfig"]));
+  assert.doesNotMatch(partial, /defineConfig/, "把真类型已有的名字也垫了，等于盖掉它");
+  assert.match(partial, /export const createServer: any;/);
+
+  // 注入点传进来的是 _extractExportNames 的返回值——数组，不是 Set。写死 instanceof
+  // 判断会让它默默退化成空集，过滤一个名字都不生效，而全 Set 的用例照样绿。
+  assert.doesNotMatch(
+    makeShim("vite", { named, hasDefault: false }, ["defineConfig"]),
+    /defineConfig/,
+    "数组形式的已知导出没被认出来，过滤等于没做",
+  );
+
+  // 全覆盖 → 返回空串，调用方据此整份跳过（加了照样遮蔽真解析）。
+  assert.equal(makeShim("vite", { named, hasDefault: false }, new Set(["defineConfig", "createServer"])), "");
+  // 默认导出同理。
+  assert.equal(makeShim("x", { named: new Set(), hasDefault: true }, new Set(["default"])), "");
+  assert.match(makeShim("x", { named: new Set(), hasDefault: true }, new Set()), /export default _default;/);
+
+  function extractShim() {
+    const at = SRC.indexOf("function _makeInstalledPackageShim(");
+    return SRC.slice(at, SRC.indexOf("\n}\n", at) + 2);
+  }
+});
+
+test("注入点：全覆盖时不加那份 ambient 声明", () => {
+  const at = SRC.indexOf("const shim = _makeInstalledPackageShim(specifier, details");
+  assert.ok(at > 0, "找不到垫片注入处");
+  const block = SRC.slice(at, at + 500);
+  assert.match(block, /realType\?\.exports \|\| null/, "没有把真类型的导出集传进去");
+  assert.match(block, /if \(shim\) \{/, "空串时仍然会 addExtraLib——那还是会遮蔽真解析");
+});
+
+test("类型入口要跟随 re-export，否则导出集永远是空的", async () => {
+  // 现代库的入口几乎全是再导出，入口文件里一个具体符号都没有。不跟的话
+  // knownExports 恒空，上面那条"只补没覆盖的"就等于没做。
+  const files = {
+    "/p/node_modules/vite/package.json": JSON.stringify({ types: "./dist/index.d.ts" }),
+    "/p/node_modules/vite/dist/index.d.ts":
+      'export * from "./config";\nexport { createServer } from "./server";\n',
+    "/p/node_modules/vite/dist/config.d.ts": "export declare function defineConfig(c: unknown): unknown;\n",
+    "/p/node_modules/vite/dist/server.d.ts": "export declare function createServer(): unknown;\n",
+  };
+  const backend = { readTextFile: async (p) => { if (!(p in files)) throw new Error("ENOENT"); return files[p]; } };
+  // TS_TYPE_REEXPORT_MAX_FILES 也得注进来：漏了它函数会抛 ReferenceError，而
+  // _readPackageTypeEntry 的外层 try/catch 会把它吞成"没读到类型入口"——症状和真失败
+  // 一模一样，最容易查错方向。
+  const api = new Function("backend", "TS_PACKAGE_TYPE_MAX_BYTES", "TS_TYPE_REEXPORT_MAX_FILES",
+    fnSrc("_typeEntryCandidatesFromPackageJson") + fnSrc("_followTypeReexports")
+    + fnSrc("_readPackageTypeEntry") + fnSrc("_extractExportNames")
+    + ";return _readPackageTypeEntry;")(backend, 256 * 1024, 8);
+
+  const entry = await api("/p", "vite");
+  assert.ok(entry, "没读到类型入口");
+  assert.ok(entry.exports.includes("defineConfig"), `export * 没跟上：${entry.exports}`);
+  assert.ok(entry.exports.includes("createServer"), `具名再导出没跟上：${entry.exports}`);
+
+  function fnSrc(name) {
+    const at = SRC.indexOf(`function ${name}(`);
+    const start = SRC.lastIndexOf("async ", at) === at - 6 ? at - 6 : at;
+    return SRC.slice(start, SRC.indexOf("\n}\n", at) + 2);
+  }
+});

@@ -9833,6 +9833,21 @@ function _typeEntryCandidatesFromPackageJson(pkgJson) {
   return [...new Set(out.map((p) => p.replace(/\\/g, "/")).filter((p) => p && !p.startsWith("../") && !p.includes("/../")))];
 }
 
+/*
+ * 读一个包的类型入口。**跟随 re-export**，最多再跟 8 个兄弟文件。
+ *
+ * 只读入口那一个 `.d.ts` 是不够的：现代库的入口几乎全是再导出——
+ *     export * from "./types";
+ *     export { defineConfig } from "./config";
+ * 入口文件里一个具体符号都没有。于是"这个包导出了什么"永远是空的，下面那个垫片就只能
+ * 无条件把每个符号都声明成 `any`，TS 的类型检查对第三方 API 彻底失效（诊断必然是绿的，
+ * 参数写错、方法不存在都查不出来）。
+ *
+ * 有界：8 个文件、总字节仍受 TS_PACKAGE_TYPE_MAX_BYTES 管。跟不动就跟不动——
+ * 拿到多少算多少，剩下的交给垫片补，不会比以前更差。
+ */
+const TS_TYPE_REEXPORT_MAX_FILES = 8;
+
 async function _readPackageTypeEntry(root, pkgName) {
   const pkgRoot = `${root.replace(/\/+$/, "")}/node_modules/${pkgName}`;
   let pkgJson = {};
@@ -9841,20 +9856,72 @@ async function _readPackageTypeEntry(root, pkgName) {
     try {
       const path = `${pkgRoot}/${rel}`;
       const content = await backend.readTextFile(path);
-      if (content && content.length <= TS_PACKAGE_TYPE_MAX_BYTES) return { path, content };
+      if (!content || content.length > TS_PACKAGE_TYPE_MAX_BYTES) continue;
+      const followed = await _followTypeReexports(path, content);
+      return { path, content, exports: _extractExportNames(followed) };
     } catch {}
   }
   return null;
 }
 
-function _makeInstalledPackageShim(specifier, details) {
-  const names = [...(details?.named || [])].filter((name) => /^[A-Za-z_$][\w$]*$/.test(name));
+/** 入口 + 它再导出的兄弟文件，拼成一段用来**抽导出名**的文本（不进 TS 服务，只做判断）。 */
+async function _followTypeReexports(entryPath, entryContent) {
+  const dir = entryPath.slice(0, entryPath.lastIndexOf("/"));
+  const seen = new Set([entryPath]);
+  let combined = entryContent;
+  const rels = new Set();
+  for (const re of [
+    /export\s+\*\s+from\s+["']([^"']+)["']/g,
+    /export\s*\{[^}]*\}\s*from\s+["']([^"']+)["']/g,
+    /\/\/\/\s*<reference\s+path=["']([^"']+)["']/g,
+  ]) {
+    let m;
+    while ((m = re.exec(entryContent))) rels.add(m[1]);
+  }
+  for (const rel of [...rels].slice(0, TS_TYPE_REEXPORT_MAX_FILES)) {
+    if (!rel.startsWith(".")) continue;                 // 只跟相对路径，不追别的包
+    const base = `${dir}/${rel}`.replace(/\/\.\//g, "/");
+    for (const cand of [base, `${base}.d.ts`, `${base}/index.d.ts`]) {
+      if (seen.has(cand)) continue;
+      seen.add(cand);
+      try {
+        const text = await backend.readTextFile(cand);
+        if (text && combined.length + text.length <= TS_PACKAGE_TYPE_MAX_BYTES) {
+          combined += "\n" + text;
+          break;
+        }
+      } catch {}
+    }
+  }
+  return combined;
+}
+
+/*
+ * 给一个包补一份 ambient 声明，把 import 里用到、但真类型没覆盖到的名字声明成 any。
+ *
+ * `knownExports` 是关键：以前这个垫片是**无条件全量**的，而 ambient module declaration
+ * 会盖过 node_modules 的正常解析——于是就算真类型读到了，第三方符号的实际类型仍然是
+ * `any`，参数写错、方法不存在，`get_diagnostics` 一律绿灯。TS 那条"能把幻觉当场打回"
+ * 的防线整个是断的。
+ *
+ * 现在只补真类型**确实没有**的那些名字。失败方向也选对了：`knownExports` 拿不到（没读到
+ * 类型、或者 re-export 跟不动）时它是空集，行为退回从前——宁可多一个 any，也不要凭一份
+ * 不完整的解析报「模块里没有这个导出」的假红。
+ */
+function _makeInstalledPackageShim(specifier, details, knownExports = null) {
+  const known = knownExports instanceof Set ? knownExports : new Set(knownExports || []);
+  const names = [...(details?.named || [])]
+    .filter((name) => /^[A-Za-z_$][\w$]*$/.test(name))
+    .filter((name) => !known.has(name));
   const lines = [`declare module ${JSON.stringify(specifier)} {`];
   for (const name of names) lines.push(`  export const ${name}: any;`);
-  if (details?.hasDefault || !names.length) {
+  const needDefault = details?.hasDefault && !known.has("default");
+  if (needDefault) {
     lines.push("  const _default: any;");
     lines.push("  export default _default;");
   }
+  // 具名和默认都不用补 = 真类型全覆盖了，返回空串让调用方整份跳过。
+  if (names.length === 0 && !needDefault) return "";
   lines.push("}");
   return lines.join("\n");
 }
@@ -10068,9 +10135,13 @@ async function refreshProjectCaches(root = rootPath, reason = "项目刷新") {
         }
       }
       const shimPath = `${targetRoot}/node_modules/.michael-ide-types/${specifier.replace(/[^\w.-]+/g, "__")}.d.ts`;
-      const shim = _makeInstalledPackageShim(specifier, details);
-      for (const d of [monaco.languages.typescript.typescriptDefaults, monaco.languages.typescript.javascriptDefaults]) {
-        disposers.push(d.addExtraLib(shim, monaco.Uri.file(shimPath).toString()));
+      // 真类型覆盖到的名字不再垫——垫了就会盖住它，类型检查对这个包彻底失效。
+      const shim = _makeInstalledPackageShim(specifier, details, realType?.exports || null);
+      // 一个名字都不用补时就别加这份 ambient 声明：加了照样会遮蔽真解析。
+      if (shim) {
+        for (const d of [monaco.languages.typescript.typescriptDefaults, monaco.languages.typescript.javascriptDefaults]) {
+          disposers.push(d.addExtraLib(shim, monaco.Uri.file(shimPath).toString()));
+        }
       }
       _tsPackageTypeDisposers.set(`${targetRoot}:${specifier}`, disposers);
       loaded++;
