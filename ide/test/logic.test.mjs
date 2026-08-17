@@ -8087,10 +8087,23 @@ test("classifier outages remain uncertain and never invoke a lexical intent fall
   assert.doesNotMatch(SRC, /function _localSemanticFallbackProfile\(/);
   assert.doesNotMatch(SRC, /function _engineeringTaskProfile\(/);
   assert.match(SRC, /classifier is[\s\S]{0,100}unavailable[\s\S]{0,140}empty profile/i);
-  // The turn's profile still comes from the classifier and nothing else — but it is merged into
-  // the session's flags before it goes out, so a turn the classifier reads more narrowly cannot
-  // rewrite the gateway's cached prefix mid-session.
-  assert.match(SRC, /config\.ideSemanticProfile = _sessionStableSemanticProfile\(sess, _semanticProfileHeaderFor\(_turnEngineeringResolved, text\)\);/);
+  // The turn's profile still comes from a MODEL judgement and nothing else — but it is merged into
+  // the session's flags before it goes out, so a turn read more narrowly cannot rewrite the
+  // gateway's cached prefix mid-session.
+  //
+  // 路由的来源可以是两条腿之一：完整裁决（在场时永远优先，它同时驱动行为闸门），或只回旗标的
+  // 快通道（_fastRoutingFlags，输出卡 200 token）。加这条腿的理由是完整裁决实测 19.8 秒——
+  // 只有它一条腿时，这道等待就是「干等二十几秒」和「这一轮一个模块都没有」的二选一。
+  // 两条腿都是**模型判断**，所以"绝不退回词表猜测"这条原则没有松动。
+  assert.match(SRC, /config\.ideSemanticProfile = _sessionStableSemanticProfile\(sess, _semanticProfileHeaderFor\(_routeSource, text\)\);/);
+  assert.match(SRC, /const _routeSource = _turnEngineeringResolved\?\.intentSource === "ai"\s*\?\s*_turnEngineeringResolved\s*:\s*\(_fastRouteProfile \|\| _turnEngineeringResolved\)/,
+    "完整裁决在场时必须优先用它——快通道是精简判断，不能盖掉全量结果");
+  // 快通道只喂请求头。run.engineering 还管着计划门槛/写入义务/角色编排，拿精简判断驱动它们
+  // 会把影响面放得太大；行为仍然只认完整裁决。
+  assert.doesNotMatch(SRC, /_turnEngineeringResolved = _fastRoute/,
+    "快通道的结果不许写进 _turnEngineeringResolved");
+  assert.doesNotMatch(SRC, /run\.engineering = _fastRoute/,
+    "快通道的结果不许写进 run.engineering");
 });
 
 test("planning gates consume structured semantic fields and do not infer intent after a classifier outage", () => {

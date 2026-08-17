@@ -269,3 +269,37 @@ test("一轮都没跑的时候，不许在最高注意力位摆一条「接着�
   assert.match(block, /本次运行还没有任何动作/,
     "facts-only 那支的标题仍在自称「执行状态」，模型会当成有进度可续");
 });
+
+test("完整裁决要 19.8 秒，路由必须有第二条腿——而且那条腿只喂请求头", () => {
+  // 生产网关实测（2026-08-17）：
+  //   17:37:51 分类器发出 → 17:38:06 主回合发出（等待 15s 超时）→ 17:38:10 分类器才回
+  //   upstream_header_ms=19836
+  // 只有完整裁决这一条腿时，这道等待就是二选一：干等二十几秒，或者这一轮工程/调研/设计/
+  // Git/协作/自动化/缺陷八个模块一个都不挂。两个都不能接受，所以拆快通道。
+  assert.match(CODE, /async function _fastRoutingFlags\(/,
+    "路由快通道没了——那这道等待又回到了「干等」和「没有模块」的二选一");
+
+  const fn = CODE.slice(CODE.indexOf("async function _fastRoutingFlags("), CODE.indexOf("async function _fastRoutingFlags(") + 3200);
+
+  // 快的全部原因就是输出短。max_tokens 一放开，它就跟完整裁决一样慢，这条腿白加。
+  assert.match(fn, /_billableAiComplete\(cfg, \[\{ role: "user", content: prompt \}\], 200\)/,
+    "快通道的 max_tokens 被放开了——输出一长它就不快了，加这条腿的意义就没了");
+
+  // 仍然用用户选的模型（全项目唯一约定），且不继承深度思考预算。
+  assert.doesNotMatch(fn, /_pickCheapModel|gpt-|claude-3|mini/,
+    "快通道不许换模型：面向模型的判断一律跟随用户选择的模型");
+  assert.match(fn, /for \(const key of \["reasoningEffort", "thinkingBudget", "thinking", "thinkingConfig", "thinkingEffort"\]\) delete cfg\[key\]/,
+    "快通道必须剥掉深度思考预算，否则它会和完整裁决一样慢");
+
+  // 宁缺毋滥：判不准就省略，靠单调并集让完整裁决补齐。
+  assert.match(fn, /raw\[k\] === true/,
+    "只接受显式为 true 的旗标——把缺省当真会让整轮带上不相干的纪律");
+  assert.match(fn, /return meaningful \? profile : null/,
+    "一个旗标都没点亮时要返回 null，别把空画像当成「判过了」");
+
+  // 两条腿必须真的并行 race，否则快通道等于没接。
+  const wait = waitBlock();
+  assert.match(wait, /_fastRoutingFlags\(text, config, sess/, "快通道没有在等待块里启动");
+  assert.match(wait, /Promise\.race\(\[\s*_turnIntentExactPromise,\s*_fastRoute,/,
+    "两条腿必须在同一个 race 里——串行等待就没有意义了");
+});
