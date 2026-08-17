@@ -860,6 +860,43 @@ fn workspace_roots(root: &str) -> Vec<Value> {
     vec![json!({"uri": uri.as_str(), "name": name})]
 }
 
+/// SSE 帧解析：把一段 `text/event-stream` 正文切成一条条 JSON-RPC 消息。
+///
+/// **不带 cfg、不碰网络**，纯字符串进出——传输层最容易写错的就是这一段（多行 data、
+/// 注释行、CRLF、事件之间的空行），而它恰恰是唯一能脱离网络测的部分。
+///
+/// 规范：以空行分事件；`data:` 可以出现多次，按换行拼接；`:` 开头是注释要丢掉；
+/// 冒号后的一个空格属于分隔符，不属于数据。
+pub fn parse_sse_frames(chunk: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut data = String::new();
+    for raw in chunk.split('\n') {
+        let line = raw.strip_suffix('\r').unwrap_or(raw);
+        if line.is_empty() {
+            if !data.is_empty() {
+                out.push(std::mem::take(&mut data));
+            }
+            continue;
+        }
+        if line.starts_with(':') {
+            // 冗余但照规范留着：下面那道 `data:` 前缀判定已经挡掉注释行了。
+            // 删掉它行为不变——所以别给这一行单独写测试，那种测试永远不会红。
+            continue;
+        }
+        let Some(rest) = line.strip_prefix("data:") else {
+            continue; // event: / id: / retry: 这些字段这里用不上
+        };
+        if !data.is_empty() {
+            data.push('\n');
+        }
+        data.push_str(rest.strip_prefix(' ').unwrap_or(rest));
+    }
+    if !data.is_empty() {
+        out.push(data);
+    }
+    out
+}
+
 fn spawn_session(
     command: &str,
     args: &[String],
@@ -4345,5 +4382,38 @@ mod elicitation_tests {
     fn answering_a_finished_request_is_an_error() {
         let err = mcp_elicit_respond("t-gone".into(), "accept".into(), None).unwrap_err();
         assert!(err.contains("已经结束"), "实际：{err}");
+    }
+}
+
+#[cfg(test)]
+mod sse_tests {
+    use super::parse_sse_frames;
+
+    /// 传输层最容易写错的就是分帧。这几条全是真实服务会发的形状。
+    #[test]
+    fn frames_split_on_blank_lines_and_join_multiline_data() {
+        // 常规：一条事件一条 JSON
+        assert_eq!(
+            parse_sse_frames("data: {\"id\":1}\n\ndata: {\"id\":2}\n\n"),
+            vec!["{\"id\":1}", "{\"id\":2}"]
+        );
+        // 多行 data 按换行拼接（大 payload 被服务切成多行时就是这样）
+        assert_eq!(
+            parse_sse_frames("data: {\"a\":\ndata: 1}\n\n"),
+            vec!["{\"a\":\n1}"]
+        );
+        // 注释/心跳丢掉——不丢的话会被当成一条坏 JSON 帧
+        assert_eq!(parse_sse_frames(": ping\n\ndata: {}\n\n"), vec!["{}"]);
+        // event:/id: 这些字段不参与
+        assert_eq!(parse_sse_frames("event: message\nid: 7\ndata: {}\n\n"), vec!["{}"]);
+        // CRLF 也要认（HTTP 里很常见）
+        assert_eq!(parse_sse_frames("data: {}\r\n\r\n"), vec!["{}"]);
+        // 冒号后只吃掉一个空格，第二个空格属于数据
+        assert_eq!(parse_sse_frames("data:  x\n\n"), vec![" x"]);
+        // 结尾没有空行时，最后一条也要交出来（流被切断在事件边界上）
+        assert_eq!(parse_sse_frames("data: {\"last\":true}"), vec!["{\"last\":true}"]);
+        // 空输入不产生空帧
+        assert!(parse_sse_frames("").is_empty());
+        assert!(parse_sse_frames("\n\n\n").is_empty());
     }
 }
