@@ -198,12 +198,11 @@ test("输出稳定：同一份快照两次调用逐字节相同", () => {
 
 // —— 光有函数不算数：必须真的被接进那一轮的上下文 ——
 
-test("这个块真的被拼进 contextBlock，而且只在非轻量轮", () => {
+test("这个块真的被拼进 contextBlock", () => {
   const at = SRC.indexOf("const mcpBlock = _mcpAvailabilitySystemContext(");
   assert.ok(at > 0, "函数定义了却没人调用——那等于没写");
   const around = SRC.slice(Math.max(0, at - 400), at + 300);
   assert.match(around, /contextBlock \+=/, "结果没有并进 contextBlock");
-  assert.match(around, /!_agentLightTurn/, "轻量轮（纯寒暄）不该为此付出上下文");
   assert.match(around, /_readyMcpSnapshot\(/, "要读已经预热好的快照，不能在这里现连");
 });
 

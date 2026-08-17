@@ -53,6 +53,11 @@ import { createExtensionsPanel } from "./ext/panel.js";
 import { t, initLocale, onLocaleChange, registerLocale, setLocale, applyToDOM, getLocale } from "./i18n.js";
 import { buildLanguageOptions, coerceSupportedLocale, localeDisplayName, localeLanguageCode } from "./locales.js";
 import { load as loadStore } from "@tauri-apps/plugin-store";
+import {
+  isPermissionGranted as _notifyPermitted,
+  requestPermission as _notifyRequestPermission,
+  sendNotification as _notifySystem,
+} from "@tauri-apps/plugin-notification";
 import { listen } from "@tauri-apps/api/event";
 import { join } from "@tauri-apps/api/path";
 import { registerSnippetProviders, setCustomSnippets } from "./snippets.js";
@@ -23122,44 +23127,6 @@ function _languagePreferenceBlock() {
   return `\n\n【全局语言与区域偏好】用户在高级设置 > 设置里选择的软件语言是：${label}（${locale}）；国家/地区是：${country.flag} ${country.name}（${country.code}）。除非用户本轮明确要求换语言，所有解释、计划、错误说明、工具摘要、最终回答都使用该语言；涉及价格、时间、地点、法律、商店、旅行、餐饮、支付、单位、区域数据和本地化建议时，优先按该国家/地区理解；代码、命令、API 名称、文件路径和原文引用保持原样。`;
 }
 
-function _lightweightAgentSystemPrompt() {
-  return [
-    "你是 Mr. Day One 的轻量聊天助手。用用户的语言直接回答，短、准、真实。",
-    "本轮没有接入项目文件、终端、浏览器或工具；不要声称已经读取、修改、运行或验证过任何东西。",
-    "不要输出任务计划、待办卡片、工程动作或文件操作建议，除非用户明确提出要做项目任务。",
-    "动态事实、价格、实时状态、附近地点、最新版本和新闻不能靠猜；没有真实来源时说明不确定或需要查询。",
-    _RESPONSE_ORDER_TUNING.trim(),
-  ].join("\n");
-}
-
-function _lightweightMemoryMessagesForModel(memory, maxMessages = 4, maxTotalChars = 1800) {
-  const assembled = memory?.assemble?.() || [];
-  const correction = assembled.find((msg) => msg?.role === "system"
-    && typeof msg.content === "string" && msg.content.startsWith("[纠错记忆·最高优先级]"));
-  const picked = [];
-  let used = correction ? Math.min(correction.content.length, maxTotalChars) : 0;
-  const recentLimit = Math.max(0, maxMessages - (correction ? 1 : 0));
-  for (let i = assembled.length - 1; i >= 0 && picked.length < recentLimit; i--) {
-    const msg = assembled[i];
-    if (!msg || (msg.role !== "user" && msg.role !== "assistant")) continue;
-    if (Array.isArray(msg.attachments) && msg.attachments.length) continue;
-    let content = typeof msg.content === "string" ? msg.content : "";
-    if (!content.trim()) continue;
-    if (/\[TOOL:|工具结果|agent-tool|```/.test(content) && content.length > 600) continue;
-    content = content
-      .replace(/```[\s\S]*?```/g, "[代码块已省略]")
-      .replace(/\[TOOL:[^\]]+\][^\n]*/g, "")
-      .replace(/\s+/g, " ")
-      .trim();
-    if (!content) continue;
-    if (content.length > 520) content = content.slice(0, 520) + "…";
-    if (used + content.length > maxTotalChars) break;
-    used += content.length;
-    picked.push({ role: msg.role, content });
-  }
-  const recent = picked.reverse();
-  return correction ? [{ role: "system", content: correction.content.slice(0, 1200) }, ...recent] : recent;
-}
 // Authorization / working-context framing. The model sometimes over-refuses legitimate dev work
 // (逆向/抓包/爬虫/安全测试) by pattern-matching the words, even though this is a developer IDE where
 // the user operates on their OWN machine/accounts/authorized systems. This states the true context so
@@ -24153,7 +24120,6 @@ async function sendPrompt(text, attachments = [], readyConfig = null) {
   // Agent routing is finalized from the semantic decision below. Starting on the full path is the
   // safe fail-open behavior: an unavailable classifier must not demote a real project request into
   // keyword-selected lightweight chat.
-  let _agentLightTurn = false;
   const _turnIntentContext = _aiIntentContextForTurn(sess, text, {
     root: _earlyRoot,
     activePath: _earlyActiveForSession,
@@ -24191,26 +24157,6 @@ async function sendPrompt(text, attachments = [], readyConfig = null) {
     _turnBillingTasks.push(_turnIntentExactPromise);
     _turnEngineeringResolved = _engineeringProfileWithAiIntent(text, sess, _turnIntentContext);
     _turnEngineeringResolved._isAgentMode = effectiveMode === "agent";
-  }
-  _agentLightTurn = _shouldUseLightweightAgentTurn(
-    effectiveMode,
-    _turnEngineeringResolved,
-    sess,
-    {
-      hasAttachments: attachments.length > 0,
-      workspaceOpen: !!String(_earlyRoot || rootPath || (workspaceRoots && workspaceRoots[0]) || "").trim(),
-      hasCapabilities: await _hasConfiguredCapabilities(_earlyRoot || _curRoot || ""),
-    },
-  );
-  // 思考档位要在**知道这轮是不是琐碎轮之后**再定一次。上面 _applyThinkingToConfig
-  // 跑在意图分类之前（那时还不知道这是问候还是施工），所以问候也照付默认档的思考预算。
-  if (_agentLightTurn) {
-    try {
-      // 用 config 而不是 _rawCfg：_applyThinkingToConfig 会先删掉全部思考字段再按模型重建，
-      // 是幂等的；而 _rawCfg 在这个位置不在作用域里。
-      Object.assign(config, _applyThinkingToConfig(config, { lightTurn: true }));
-      _activeThinkEffort = config.thinkingEffort || config.reasoningEffort || (config.thinkingBudget ? "high" : "off");
-    } catch {}
   }
   _setSendBtnStop(true);
   // Mark this session streaming NOW — BEFORE any pre-processing await — so the
@@ -24295,11 +24241,9 @@ async function sendPrompt(text, attachments = [], readyConfig = null) {
 
   let _turnRoot = "";
   let _curRoot = _earlyRoot;
-  if (!_agentLightTurn) {
-    const preparedWorkspace = await _workspacePreflightPromise;
-    _turnRoot = preparedWorkspace.turnRoot || "";
-    _curRoot = preparedWorkspace.currentRoot || String(_turnRoot || _knownWorkspaceRoots()[0] || "").replace(/\/+$/, "");
-  }
+  const preparedWorkspace = await _workspacePreflightPromise;
+  _turnRoot = preparedWorkspace.turnRoot || "";
+  _curRoot = preparedWorkspace.currentRoot || String(_turnRoot || _knownWorkspaceRoots()[0] || "").replace(/\/+$/, "");
   // 新会话的第一轮，短暂地等一下意图裁决。
   //
   // 画像是同步算的：_engineeringProfileWithAiIntent 读的是 session._intentState 和缓存，
@@ -24339,9 +24283,7 @@ async function sendPrompt(text, attachments = [], readyConfig = null) {
     return;
   }
 
-  const sysPrompt = _agentLightTurn
-    ? _lightweightAgentSystemPrompt()
-    : _P(effectiveMode, _AI_MODE_PROMPTS[effectiveMode] || _AI_MODE_PROMPTS.agent);
+  const sysPrompt = _P(effectiveMode, _AI_MODE_PROMPTS[effectiveMode] || _AI_MODE_PROMPTS.agent);
 
   const _contextRoot = _curRoot;
   // Explicit user corrections become authoritative before historical messages
@@ -24352,7 +24294,7 @@ async function sendPrompt(text, attachments = [], readyConfig = null) {
 
   let contextBlock = "";
   const _pendingContextEvidence = [];
-  if ((effectiveMode === "agent" || effectiveMode === "explorer" || effectiveMode === "reviewer" || effectiveMode === "plan") && !_agentLightTurn) {
+  if ((effectiveMode === "agent" || effectiveMode === "explorer" || effectiveMode === "reviewer" || effectiveMode === "plan")) {
     const osDetail = await _osDetailPromise;
     contextBlock = _platformContextLine(osDetail);
     if (_curRoot) {
@@ -24374,7 +24316,7 @@ async function sendPrompt(text, attachments = [], readyConfig = null) {
     contextBlock += "\n(未打开工作区文件夹。要创建/修改/运行项目文件时，先调 create_project 建一个目录（给个描述性名字，如 telegram-image-bot），它会立刻成为当前工作区；别停下来问用户，也别写相对路径——那会被沙箱拒绝。收尾时把返回的完整路径告诉用户。)";
     }
   }
-  if (_activeForSession && !_agentLightTurn) {
+  if (_activeForSession) {
     const f = openFiles.get(_activeForSession);
     if (f?.model) {
       const sel = monacoEditor.getModel() === f.model ? monacoEditor.getSelection() : null;
@@ -24413,10 +24355,8 @@ async function sendPrompt(text, attachments = [], readyConfig = null) {
       if (selected) contextBlock += `\n\n选中的代码:\n\`\`\`\n${_contextSnippet(selected, 3000, "选中的代码")}\n\`\`\``;
     }
   }
-  if (!_agentLightTurn) {
-    const diagBlock = agentDiagnosticsBlock(_contextRoot, _activeForSession);
-    if (diagBlock) contextBlock += `\n\n${diagBlock}`;
-  }
+  const diagBlock = agentDiagnosticsBlock(_contextRoot, _activeForSession);
+  if (diagBlock) contextBlock += `\n\n${diagBlock}`;
 
   // 已连上的 MCP 服务必须报给模型。它们的工具被 _selectInitialTools 挡在开局窗口外，
   // 名字又不在静态的 toolCapabilityIndex() 里——不在这儿说一句，模型就完全不知道
@@ -24428,13 +24368,13 @@ async function sendPrompt(text, attachments = [], readyConfig = null) {
   // 而这段名录的原话是「ready=true 的已经在你的工具列表里，按名字直接调用」「别因为
   // 开局窗口里没看见就当它不存在，也别回复用户说做不到」。在一个不能执行工具的模式里
   // 说这些，等于直接指使模型去编造它做过的操作。
-  if (!_agentLightTurn && effectiveMode !== "chat") {
+  if (effectiveMode !== "chat") {
     const mcpBlock = _mcpAvailabilitySystemContext(_readyMcpSnapshot(_curRoot));
     if (mcpBlock) contextBlock += `\n\n${mcpBlock}`;
   }
 
   // ── 提示词缓存: system = 纯静态前缀(跨轮复用), 动态内容下沉到 user 消息末尾 ──
-  if (!_agentLightTurn) _scheduleWorkspaceAgentWarmup(_curRoot);
+  _scheduleWorkspaceAgentWarmup(_curRoot);
   // 磁盘上的技能是异步发现的（_warmupWorkspaceAgent 里的 _idleRun）。冷启动后立刻提问
   // 时它还没跑完，技能目录里就只剩 localStorage 那批——模型看不见的技能等于不存在，
   // 而且不会有任何报错。首轮值得等这一次目录扫描：只扫几个目录，只在从没扫过时等，
@@ -24444,7 +24384,7 @@ async function sendPrompt(text, attachments = [], readyConfig = null) {
   // 磁盘技能一个都不会被发现——用户装了一堆，模型全不知道。
   // 自限：扫完 _fileSkillsCacheKey 变成 "\0<home>"（非空），所以每次启动最多等这一回；
   // 之后真打开了文件夹，cacheKey 不同会自动重扫。
-  if (!_agentLightTurn && inTauri && !_fileSkillsCacheKey) {
+  if (inTauri && !_fileSkillsCacheKey) {
     try {
       await Promise.race([
         _refreshFileSkills(_curRoot || ""),
@@ -24456,30 +24396,26 @@ async function sendPrompt(text, attachments = [], readyConfig = null) {
   // models → terse). Static per model, so the prompt prefix still caches.
   // 聊天模式只给**常驻技能的全文**，不给技能目录：目录的落点是「用 read_skill 读它」，
   // 而聊天那条路径不执行工具，那句话在这儿是死路。常驻技能的正文不需要任何工具，照给。
-  const skillsBlock = _agentLightTurn ? "" : (effectiveMode === "chat" ? _activeSkillsBlock() : _skillsSystemBlock());
+  const skillsBlock = effectiveMode === "chat" ? _activeSkillsBlock() : _skillsSystemBlock();
   // 用户规则连轻量轮也带上：那些轮次省的是系统提示词和工作区预热，而"用中文回答"这种
   // 要求恰恰在闲聊轮最该生效——省掉它等于每次寒暄都破一次规矩。
   const userRulesBlock = _userRulesBlock();
   const adaptiveBlock = _adaptivePromptBlock();
   const _adaptiveMemory = _adaptiveMemoryBlock(text);
   const languageBlock = _languagePreferenceBlock();
-  const fullPrompt = _agentLightTurn ? (sysPrompt + userRulesBlock + languageBlock + adaptiveBlock) : (sysPrompt + _modelStyleTuning(config.model) + userRulesBlock + skillsBlock + _authContextBlock() + languageBlock + adaptiveBlock);
+  const fullPrompt = sysPrompt + _modelStyleTuning(config.model) + userRulesBlock + skillsBlock + _authContextBlock() + languageBlock + adaptiveBlock;
 
-  if (!_agentLightTurn) _compactHistoryIfNeeded(sess);
+  _compactHistoryIfNeeded(sess);
 
   const messages = [{ role: "system", content: fullPrompt }];
   // Read THIS turn's session history explicitly (not the active-tab proxy) — the
   // user may have switched tabs during the awaits above.
-  if (_agentLightTurn) {
-    for (const m of _lightweightMemoryMessagesForModel(sess.memory)) messages.push(m);
-  } else {
-    for (const m of await _memoryMessagesForModel(sess.memory, config, text, attachments.length > 0)) messages.push(m);
-  }
+  for (const m of await _memoryMessagesForModel(sess.memory, config, text, attachments.length > 0)) messages.push(m);
   // Workspace-switch re-anchor: if the user opened a DIFFERENT folder mid-conversation, the history
   // above is full of the OLD project's paths/files — the model keeps working on the old dir unless
   // told. Drop a loud, RECENT notice (right before the new request) so it re-anchors on the current
   // root and forgets the stale paths. First send just records the root (no notice, no false alarm).
-  if (!_agentLightTurn) {
+  {
     if (sess._anchorRoot && _contextRoot && sess._anchorRoot !== _contextRoot && sess.memory.recent.length) {
       messages.push({ role: "user", content: `⚠️【工作区已切换 — 最高优先级】当前项目根目录已从「${sess._anchorRoot}」换成「${_contextRoot}」。从这条之后：① 所有相对路径一律基于「${_contextRoot}」；② **彻底忘掉上面对话里旧目录「${sess._anchorRoot}」的目录结构、文件路径、代码内容**，那些已作废；③ 需要任何文件先在**新目录**里 list_dir / read_file 重新确认真实路径，**绝不要再去读写旧目录下的文件**。先按新目录重新摸清，再动手。` });
     }
@@ -24517,7 +24453,7 @@ async function sendPrompt(text, attachments = [], readyConfig = null) {
   const _remoteRepos = [...text.matchAll(/(?:^|\s)@(github|gitlab):([\w.-]+\/[\w.-]+)/gi)]
     .map((m) => ({ kind: m[1].toLowerCase(), full: m[2] }))
     .slice(0, 2);
-  if (!_agentLightTurn && _remoteRepos.length) {
+  if (_remoteRepos.length) {
     for (const { kind, full } of _remoteRepos) {
       const [owner, repo] = full.split("/");
       if (!owner || !repo) continue;
@@ -24572,7 +24508,7 @@ async function sendPrompt(text, attachments = [], readyConfig = null) {
    */
   const _mcpRefs = [...text.matchAll(/(?:^|\s)@mcp:([^\s@]+)/gi)]
     .map((m) => m[1]).filter((v, i, a) => a.indexOf(v) === i).slice(0, 4);
-  if (!_agentLightTurn && _mcpRefs.length && inTauri) {
+  if (_mcpRefs.length && inTauri) {
     for (const ref of _mcpRefs) {
       const slash = ref.indexOf("/");
       const server = slash > 0 ? ref.slice(0, slash) : "";
@@ -24590,7 +24526,7 @@ async function sendPrompt(text, attachments = [], readyConfig = null) {
     }
   }
 
-  if (!_agentLightTurn && _mentioned.length && _contextRoot) {
+  if (_mentioned.length && _contextRoot) {
     const _r = _contextRoot.replace(/\/$/, "");
     const _seen = new Set();
     const _AT_TOTAL = 12_000;
@@ -24636,23 +24572,23 @@ async function sendPrompt(text, attachments = [], readyConfig = null) {
   // system prompt — so it never invalidates the cached static prefix above. Only
   // the lean `text` is stored in history, so this big preamble is sent once (this
   // turn) and doesn't bloat every future request.
-  const _imgModelAvail = (effectiveMode === "agent" && !_agentLightTurn) ? String(_autoImageModel() || "").trim() : "";
+  const _imgModelAvail = (effectiveMode === "agent") ? String(_autoImageModel() || "").trim() : "";
   const _imgHint = _imgModelAvail
     ? `\n🎨 **生图能力已就绪**：后台有 \`${_imgModelAvail}\` 模型，调 generate_image 即可生成图片。`
-    : (effectiveMode === "agent" && !_agentLightTurn ? `\n🎨 generate_image 暂不可用（未配生图模型），需要配图时用 picsum.photos 等占位服务。` : "");
+    : (effectiveMode === "agent" ? `\n🎨 generate_image 暂不可用（未配生图模型），需要配图时用 picsum.photos 等占位服务。` : "");
   // 会话需求账本块：历次真实要求整本怼在眼前（≤40 条、每条 ≤240 字）。只进当轮
   // 动态前导（历史存 lean text），不会打碎历史前缀缓存。
-  const _demandLedgerBlock = (effectiveMode === "agent" && !_agentLightTurn
+  const _demandLedgerBlock = (effectiveMode === "agent"
     && Array.isArray(sess._demandLedger) && sess._demandLedger.length > 1)
     ? `--- 本会话需求账本（用户历次真实要求；除非被后来的要求明确撤销/覆盖，全部仍然有效——别失忆）---\n${sess._demandLedger.slice(0, -1).map((d, i) => `${i + 1}. ${d}`).join("\n")}\n（最新一条要求在下方 📌 处；旧要求与最新冲突时以最新为准。）\n\n`
     : "";
   // 方案A：上轮思考结论块——只注结论摘要（总量 ≤400 字，最新一条永远在场），治"每轮
-  // 从零重想"；纯闲聊轮（_agentLightTurn）不注入。只进当轮动态前导，不碰历史前缀缓存。
-  const _thinkLedgerBlock = (effectiveMode === "agent" && !_agentLightTurn)
+  // 从零重想"。只进当轮动态前导，不碰历史前缀缓存。
+  const _thinkLedgerBlock = (effectiveMode === "agent")
     ? _thinkLedgerBlockText(sess._thinkLedger)
     : "";
   const _timeBlock = _currentDateBlock();
-  const _resumeBlock = (!_agentLightTurn && effectiveMode === "agent") ? _resumeHandoffBlock(sess) : "";
+  const _resumeBlock = (effectiveMode === "agent") ? _resumeHandoffBlock(sess) : "";
   const _dynPreamble =
     (_timeBlock ? _timeBlock + "\n\n" : "") +
     (_resumeBlock ? _resumeBlock + "\n\n" : "") +
@@ -24665,17 +24601,17 @@ async function sendPrompt(text, attachments = [], readyConfig = null) {
   // message (high-attention recency) so weak models actually reach for the right one.
   // Semantic rerank (cheap model, intent-aware, covers MCP tools) when it adds value.
   const _uiTurnEngineering = _turnEngineeringResolved;
-  const _decisionFrame = (effectiveMode === "agent" && !_agentLightTurn) ? _agentDecisionFrameBlock(text, _uiTurnEngineering) : "";
-  const _uiDesignCraft = (effectiveMode === "agent" && !_agentLightTurn)
+  const _decisionFrame = (effectiveMode === "agent") ? _agentDecisionFrameBlock(text, _uiTurnEngineering) : "";
+  const _uiDesignCraft = (effectiveMode === "agent")
     ? _uiDesignCraftBlock(text, _uiTurnEngineering, { serverDesignLayersActive: _l0On(config) && !!config.ideSemanticProfile })
     : "";
-  const _toolHint = (effectiveMode === "agent" && !_agentLightTurn) ? _buildToolHint(text, _uiTurnEngineering) : "";
+  const _toolHint = (effectiveMode === "agent") ? _buildToolHint(text, _uiTurnEngineering) : "";
   // Experiential memory: a matching reusable WORKFLOW (AWM procedural memory, if this
   // task type recurred) + the most similar past episodes' insights (ExpeL) — both at
   // the recency slot so the agent reuses proven recipes for this project.
   const _expRoot = _contextRoot;
-  const _expHint = (effectiveMode === "agent" && !_agentLightTurn) ? (_workflowHintBlock(text, _expRoot) + _episodeHintBlock(text, _expRoot)) : "";
-  const _modeFrame = (!_agentLightTurn && effectiveMode !== "agent") ? _modeRuntimeGuidanceBlock(effectiveMode, text, _uiTurnEngineering) : "";
+  const _expHint = (effectiveMode === "agent") ? (_workflowHintBlock(text, _expRoot) + _episodeHintBlock(text, _expRoot)) : "";
+  const _modeFrame = (effectiveMode !== "agent") ? _modeRuntimeGuidanceBlock(effectiveMode, text, _uiTurnEngineering) : "";
   // Put the user's ACTUAL request LAST, clearly delimited — recency = the model's
   // highest-attention slot. Burying the question in the MIDDLE of a big preamble
   // (project context + the up-to-12KB current-file dump + guides) was a top cause of
@@ -24691,9 +24627,7 @@ async function sendPrompt(text, attachments = [], readyConfig = null) {
   // The request frame is structural separation only (context above, request below); it injects no
   // scripted wording, keyword judgement or lecturing — keyword-driven conversation shaping was
   // explicitly rejected, and understanding and responding are left to the model itself.
-  const _requestFrame = _agentLightTurn
-    ? "\n\n━━━━━━━━━━━━━━━━━━━━━━━━\n📌 **用户这次是轻量对话/闲聊**：直接回答，不要声称已经读取项目、文件或运行工具；除非用户明确要求项目/文件/报错/运行/修改，否则不要主动进入工程任务。\n\n"
-    : "\n\n━━━━━━━━━━━━━━━━━━━━━━━━\n📌 **This turn's user request**: \n\n";
+  const _requestFrame = "\n\n━━━━━━━━━━━━━━━━━━━━━━━━\n📌 **This turn's user request**: \n\n";
   const _userText = _contextPreamble
     + _requestFrame
     + text
@@ -24744,7 +24678,7 @@ async function sendPrompt(text, attachments = [], readyConfig = null) {
   // Plan joins the read-only tool modes so the architect can actually investigate
   // the codebase (read / search / find / web) before proposing a design — it gets
   // _buildAgentToolSchemas(false), i.e. no write/edit/run_cmd.
-  const hasToolAccess = (isAgent && !_agentLightTurn) || isExplorer || isReviewer || isPlan;
+  const hasToolAccess = isAgent || isExplorer || isReviewer || isPlan;
 
   // If the user hit Stop during the (bounded) pre-processing above, abort cleanly.
   if (!_turnLive()) {
@@ -24807,7 +24741,7 @@ async function sendPrompt(text, attachments = [], readyConfig = null) {
         timeline: _turnTimeline,
       });
       // 异步 agent：任务在后台跑完时，若 app 没聚焦 / 用户已切到别的会话 → 弹通知 + 闪标题来叫你。
-      try { if (!document.hasFocus() || (typeof _currentSession === "function" && _currentSession() !== sess)) _notifyTaskDone(sess, text, true); } catch (_e) {}
+      try { if (!document.hasFocus() || (typeof _currentSession === "function" && _currentSession() !== sess)) void _notifyTaskDone(sess, text, true).catch(() => {}); } catch (_e) {}
       const postRunMessages = Array.isArray(sess.memory) && sess.memory.length ? sess.memory : messages;
       _maybeRenderChoices(sess, postRunMessages); // if the answer offered A/B/C… options → clickable chips
       _maybeSuggestNext(sess, postRunMessages, config); // Codex-style: offer 2-4 clickable next steps from the completed run
@@ -25133,7 +25067,7 @@ async function sendPrompt(text, attachments = [], readyConfig = null) {
       let providerTools = useTools ? _toolSchemas : [];
       if (_l0On(requestConfig)) {
         const turnTime = _currentTimeContext();
-        requestConfig.ideMode = _agentLightTurn ? "chat" : effectiveMode;
+        requestConfig.ideMode = effectiveMode;
         requestConfig.ideTimezone = turnTime.timeZone;
         requestConfig.ideUtcOffsetMinutes = turnTime.utcOffsetMinutes;
         requestConfig.ideRegion = _ideRegionCode();
@@ -25142,12 +25076,11 @@ async function sendPrompt(text, attachments = [], readyConfig = null) {
         // **整条丢掉**、只用 clientBlocks + skillsBlock 重建，所以任何没列进来的块，
         // 在 L0（走网关，也就是默认线路）下就等于没发。用户规则/习惯此前正是漏在这里：
         // 菜单上写着"每轮都遵守"，实际一个字都没到模型手上。
-        const clientBlocks = _userRulesBlock() + languageBlock + adaptiveBlock + (_agentLightTurn
-          ? ""
-          : (_modelFamilyTuning(config.model) + _authContextBlock()));
+        const clientBlocks = _userRulesBlock() + languageBlock + adaptiveBlock
+          + _modelFamilyTuning(config.model) + _authContextBlock();
         providerMessages = _l0MessagesWithSkills(
           providerMessages,
-          _agentLightTurn ? "" : skillsBlock,
+          skillsBlock,
           clientBlocks,
         );
       }
@@ -26360,80 +26293,18 @@ function _agentToolNameAllowedByProfile(name, profile) {
 // answer, never an Agent downgrade. Its inputs are the model's structured decision
 // and live session state; it intentionally does not inspect the user's wording.
 /*
- * 这台机器上到底配没配过能力（MCP 服务 / 技能）。
+ * 这里原来有一整套「轻量轮」：按意图分类器的判定，把一句
+ * 被认为是"纯回答"的话降级成不带工具的一轮——不进 agentic loop、工具数组为空、技能清单
+ * 也不注入，连系统提示词和记忆都换成精简版。
  *
- * 读的是**配置**而不是内存里已加载的状态：冷启动时 MCP 还没连、技能还没扫，内存里当然是
- * 空的——按内存判会得出"没配过"，于是走轻量轮；而轻量轮又不会去加载它们，下一轮内存还是
- * 空的。那是一个自己锁死自己的循环：配了服务却永远用不上，且毫无征兆。
+ * 整套删掉。它省下的那点提示词，代价是**判错时模型手上什么都没有**，而且不知道自己缺了
+ * 什么：接了 MCP 却在瞎编 API、装了技能却从来不用，用户看到的只是"它今天有点笨"，而没有
+ * 任何地方会说"这一轮我没给它工具"。Claude Code 那些主流实现都没有这一层——工具永远在
+ * 请求里，用不用是模型自己的判断。
  *
- * 结果缓存几秒：同一轮里会被问一次，用户连点几句时不必反复读盘；配置真变了（面板里加了
- * 服务、装了技能）也最多晚几秒生效。
+ * 连带删掉的还有它专用的精简系统提示词、精简历史组装，以及上一版为了给它打补丁而加的
+ * 「配过能力就不降级」那道闸——补丁的前提没了。
  */
-let _capabilityProbe = { at: 0, root: null, value: null };
-async function _hasConfiguredCapabilities(root) {
-  const key = String(root || "");
-  const now = Date.now();
-  if (_capabilityProbe.root === key && now - _capabilityProbe.at < 5000 && _capabilityProbe.value !== null) {
-    return _capabilityProbe.value;
-  }
-  let value = true;   // 读不出来就当有——见 _shouldUseLightweightAgentTurn 的注释
-  try {
-    const doc = await _readWorkspaceMcpDocument(key);
-    const servers = Object.keys(JSON.parse(doc.text || "{}").mcpServers || {}).length;
-    const skills = (Array.isArray(_fileSkills) ? _fileSkills.length : 0)
-      + (typeof _loadSkillsLocal === "function" ? (_loadSkillsLocal() || []).length : 0);
-    value = servers > 0 || skills > 0;
-  } catch {}
-  _capabilityProbe = { at: now, root: key, value };
-  return value;
-}
-
-/*
- * 轻量轮省的是提示词，不该省掉**能力**。
- *
- * 走这条路的一轮是 `hasToolAccess === false`：不进 agentic loop，工具数组是空的，技能
- * 清单也不注入。对"你好""你是谁"那种轮次这没问题。可一旦用户接了 MCP 服务、装了技能，
- * 同一条路就变成了"我替模型决定它这次不需要工具"——判错了没有第二次机会：模型手上一个
- * 工具都没有，也**不知道**那些能力存在，只能凭记忆答，而用户看到的是"我明明连了 context7，
- * 它却在瞎编 API"。
- *
- * Claude Code 没有这种东西：工具永远在请求里，用不用是模型自己的判断。所以这里的规矩是
- * ——**只要配过能力，就不替它做这个决定**。没配过的（全新安装）照旧走轻量轮，那时候本来
- * 也没有东西可丢。
- */
-function _shouldUseLightweightAgentTurn(mode, profile, session = null, options = {}) {
-  if (mode !== "agent" || !profile || profile.intentSource !== "ai") return false;
-  // 算不出来时按"有"处理（options.hasCapabilities !== false）：宁可多给一次工具，
-  // 也不要因为一次读取失败就把模型的手绑起来。
-  if (options.hasCapabilities !== false) return false;
-  // sendPrompt marks the new turn streaming before this check so Stop works during
-  // preprocessing. An older active loop is already handled at the send entry point;
-  // only _runIsLoop means this session is genuinely in the full Agent loop here.
-  if (options.hasAttachments === true || session?._runIsLoop) return false;
-  // An open folder is background state, not a request to inspect it. Project questions are
-  // represented by workspaceAction=inspect; a greeting/identity/general answer remains light.
-  void options.workspaceOpen;
-  const semanticDecision = profile.intentSemantic;
-  if (!semanticDecision || semanticDecision.action !== "answer" || semanticDecision.continuation !== "new") return false;
-  if (profile.deliverySurface !== "answer"
-      || profile.changeScope !== "none"
-      || profile.architectureMode !== "none"
-      || profile.dataStrategy !== "not_applicable"
-      || profile.researchMode !== "none"
-      || profile.designMode !== "none"
-      || profile.workspaceAction !== "none"
-      || profile.captureMode !== "none"
-      || profile.browserGoal !== "none"
-      || profile.orchestrationMode !== "solo") return false;
-  if ((profile.runtimeObligations || []).length || (profile.externalObligations || []).length) return false;
-  if ([
-    "applies", "projectEngineering", "implementation", "explicitWorkspaceMutation",
-    "explicitRuntimeAction", "explicitExternalAction", "bug", "debugProject", "database",
-    "git", "ui", "uiProject", "needsReferences", "capture", "browserAutomation",
-  ].some((key) => profile[key] === true)) return false;
-  return !Array.isArray(session?._planSteps)
-    || !session._planSteps.some((step) => step?.status === "pending" || step?.status === "in_progress");
-}
 
 // Whether a location is only conversational context is a semantic decision from the
 // intent model, never a local address/keyword matcher. This keeps the agent from
@@ -55429,17 +55300,36 @@ function _flashTitle(prefix) {
     document.addEventListener("visibilitychange", onVis);
   } catch (_e) {}
 }
-function _notifyTaskDone(sess, taskText, ok) {
+/*
+ * 任务跑完的提醒走**系统通知**（macOS 右上角通知中心 / Windows 右下角操作中心），
+ * 不再在应用内弹卡片。
+ *
+ * 应用内那张卡片有两个毛病：一是它盖在输入框上——你正要接着打字，它挡在那儿；二是
+ * 它只在 IDE 前台可见，而这个提醒的全部意义恰恰是「你去干别的了，活干完了叫你一声」。
+ * 系统通知两头都对：不挡输入，切到别的 App 甚至锁屏也叫得到。
+ *
+ * 走 Tauri 的通知插件而不是 webview 的 `Notification`：WKWebView 里那个 API 时有时无，
+ * 权限状态也不可靠，实测经常是"既不报错也不弹"。插件走的是系统原生通道。
+ *
+ * 应用内卡片只留一条退路：在浏览器里跑（没有 Tauri）时用它，否则连个提示都没有。
+ */
+async function _notifyTaskDone(sess, taskText, ok) {
   const t = String(taskText || "任务").replace(/\s+/g, " ").trim();
   const short = t.slice(0, 44) + (t.length > 44 ? "…" : "");
   const title = ok === false ? "⚠️ 任务结束（有问题）" : "✅ 任务完成";
-  // 先试系统通知（webview 支持就弹 OS 横幅，连 IDE 最小化/切到别的 App 都能叫你）；不支持自然退回下面的应用内卡片。
-  try {
-    if (typeof Notification !== "undefined") {
-      if (Notification.permission === "granted") { try { new Notification(title, { body: short }); } catch (_e) {} }
-      else if (Notification.permission === "default") { Notification.requestPermission().catch(() => {}); }
-    }
-  } catch (_e) {}
+  _flashTitle(ok === false ? "⚠️ 任务结束" : "✅ 任务完成");
+
+  if (inTauri) {
+    try {
+      // 权限没给过就问一次。用户拒绝了就安静收手——不要退回那张挡输入框的卡片，
+      // 那等于"你说了不要，我换个地方还要"。窗口标题闪烁（上面那行）已经够提示了。
+      let granted = await _notifyPermitted();
+      if (!granted) granted = (await _notifyRequestPermission()) === "granted";
+      if (granted) { await _notifySystem({ title, body: short }); }
+      return;
+    } catch (_e) { /* 插件不可用（老版本、权限被系统策略挡住）才落到下面 */ }
+  }
+
   let action = null;
   try {
     // 「查看」按钮：切到那个任务的会话（能定位到 index 就切）。
@@ -55452,14 +55342,8 @@ function _notifyTaskDone(sess, taskText, ok) {
     }
   } catch (_e) {}
   try {
-    showNotification({
-      title: ok === false ? "⚠️ 任务结束（有问题）" : "✅ 任务完成",
-      message: short,
-      action, actionLabel: "查看",
-      duration: 14000,
-    });
+    showNotification({ title, message: short, action, actionLabel: "查看", duration: 14000 });
   } catch (_e) {}
-  _flashTitle(ok === false ? "⚠️ 任务结束" : "✅ 任务完成");
 }
 
 // After a language server finishes installing, re-open the currently-open files with the LSP so the

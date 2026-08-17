@@ -99,17 +99,18 @@ test("琐碎轮不再偷偷把思考降档——用户选什么就发什么", ()
   // budget_tokens=24000，一句"你好啊"确实会烧掉整份预算。现在是 adaptive + effort，
   // 深浅由模型每轮自己定，前提没了，留下的只有"用户选的和实际发的不一致"。
   //
-  // 轻量轮本身**保留**：它仍然省系统提示词、跳过技能块和工作区预热——那些是真的省，
-  // 而且不改变用户的任何选择。只有"改写思考档位"这一条被摘掉了。
+  // 后来轻量轮**整套删掉了**（见 sendPrompt 里那段说明）：它省下的提示词，代价是判错时
+  // 模型手上一个工具都没有、还不知道自己缺了什么。这条用例现在只管一件事——
+  // 思考档位不许被任何东西偷偷改写。
   const _start = SRC.indexOf("function _applyThinkingToConfig(");
   assert.ok(_start > 0, "_applyThinkingToConfig 没找到");
   const fn = SRC.slice(_start, _start + 6000);
   assert.doesNotMatch(fn, /opts\.lightTurn/, "轻量轮又在改写档位了");
   assert.doesNotMatch(fn, /\["minimal", "low", "medium"\]\.find/, "又在往最浅档压");
 
-  // 轻量轮本身还在（省的是提示词，不是思考深度）
-  assert.match(SRC, /_agentLightTurn = _shouldUseLightweightAgentTurn\(/,
-    "轻量轮判定不该被一起删掉——它省的提示词是真省");
+  // 轻量轮已删干净：留一个字都可能让下一个人以为还能靠它省点什么。
+  assert.doesNotMatch(SRC, /_agentLightTurn|_shouldUseLightweightAgentTurn/,
+    "轻量轮又回来了——它会在判错时把工具和技能一起拿走");
 });
 
 // ── 空工作区不能推「深挖整个项目」 ───────────────────────────────────────────

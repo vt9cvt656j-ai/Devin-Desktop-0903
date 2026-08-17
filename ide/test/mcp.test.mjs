@@ -513,10 +513,10 @@ test("MCP 资源的读取不依赖工作区根目录——没打开文件夹时�
   // 窗口开大一点这条断言就变成在骂邻居。
   const blockStart = SRC.indexOf("const _mcpRefs");
   assert.ok(blockStart > 0, "找不到 @mcp: 预取块");
-  const blockEnd = SRC.indexOf("if (!_agentLightTurn && _mentioned.length", blockStart);
+  const blockEnd = SRC.indexOf("if (_mentioned.length", blockStart);
   assert.ok(blockEnd > blockStart, "找不到 @mcp: 预取块的结尾");
   const block = SRC.slice(blockStart, blockEnd);
-  assert.match(block, /if \(!_agentLightTurn && _mcpRefs\.length && inTauri\)/);
+  assert.match(block, /if \(_mcpRefs\.length && inTauri\)/);
   assert.doesNotMatch(block, /_contextRoot/, "MCP 资源不属于任何工作区，不能被 _contextRoot 挡住");
   assert.match(block, /catch[\s\S]{0,120}读取失败/, "读失败要在上下文里留一行，不能静默吞掉");
 });

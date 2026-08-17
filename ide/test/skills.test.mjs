@@ -155,7 +155,7 @@ test("聊天模式只给常驻技能的正文，不给指向 read_skill 的目�
   // 聊天那条路径不执行工具：模型吐出来的调用会被当成 [TOOL:…] 文本渲染掉。
   // 给它一份写着「需要哪个就用 read_skill 读」的目录，等于指着一条死路。
   // 常驻技能的正文不需要任何工具，所以照给。
-  assert.match(SRC, /const skillsBlock = _agentLightTurn \? "" : \(effectiveMode === "chat" \? _activeSkillsBlock\(\) : _skillsSystemBlock\(\)\)/,
+  assert.match(SRC, /const skillsBlock = effectiveMode === "chat" \? _activeSkillsBlock\(\) : _skillsSystemBlock\(\)/,
     "聊天模式还在收整份技能目录");
 });
 
