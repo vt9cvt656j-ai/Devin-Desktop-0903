@@ -373,6 +373,15 @@ test("打开外部链接不许经过 shell", () => {
   assert.doesNotMatch(codeOnly, /taskRunCapture\("\/", *'open "' *\+/, "又把 URL 拼进 shell 了");
   assert.match(SRC, /function _openExternalUrlSafe\(url\)/);
   assert.match(SRC, /u\.protocol === "http:" \|\| u\.protocol === "https:"/, "没有校验协议");
-  // 仅剩的一处 shell open 是本地证书路径，必须走转义。
-  assert.match(SRC, /`open \$\{shellQuote\(p\)\}`/);
+  // 仅剩的一处走 shell 打开的是本地证书路径，三个平台三条命令，但**都必须转义**。
+  // 窗口要卡在这条语句本身，不能按字节数开——多开一点就会溢进下面那条通知文案，
+  // 那里合法地用着 `${p}`，断言会被它喂到。（窗口越界这坑这轮也踩过。）
+  const openStart = SRC.indexOf("const openCmd = _isWin");
+  const openBlock = SRC.slice(openStart, SRC.indexOf("taskRunCapture(", openStart));
+  assert.ok(openBlock.length > 50, "找不到打开证书那段");
+  assert.match(openBlock, /shellQuote\(p\)/, "证书路径没转义就拼进了 shell");
+  assert.match(openBlock, /cmd \/c start ""/, "Windows 上没有 open，要走 start");
+  assert.match(openBlock, /xdg-open/, "Linux 上要走 xdg-open");
+  // 路径来自我们自己的后端，但转义这件事不能因为"这次可控"就省掉——那是给后人留先例。
+  assert.doesNotMatch(openBlock, /\$\{p\}/, "又把裸路径插进 shell 串了");
 });

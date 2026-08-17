@@ -6638,6 +6638,51 @@ test("装完没装完问后端，不在前端拼一句只有 macOS 认的 shell"
     "通知适配器没把 langId 收进来");
 });
 
+test("项目模板不再用 shell 写种子文件，命令按平台展开", () => {
+  /*
+   * 种子文件以前是 `echo '多行\n内容' > file` 写出来的。两个平台都靠不住：cmd 不把单引号
+   * 当引号、也不认 `\n` 转义，写出来是一坨带引号的垃圾**而退出码是 0**——用户只看到
+   * "项目已创建"，打开一看内容全乱；就算在 macOS 上，那也依赖 sh 内建 echo 恰好解释 `\n`。
+   */
+  const at = SRC.indexOf("const PROJECT_TEMPLATES = [");
+  const templates = SRC.slice(at, SRC.indexOf("\n];", at));
+  assert.ok(templates.length > 1000, "找不到模板表");
+  for (const posix of ["python3 ", "source .venv", "echo '"]) {
+    assert.ok(!templates.includes(posix), `模板命令里还有 POSIX 写法：${posix}`);
+  }
+  assert.match(templates, /\{\{PY\}\}/, "Python 模板没走平台占位符");
+  assert.match(templates, /\{\{ACTIVATE\}\}/, "venv 激活没走平台占位符");
+  assert.match(templates, /files: \[\{ path: "app\.py"/, "Flask 的种子文件没交给后端写");
+
+  // 占位符要真的被展开，而且展开成两套。断言得卡在**展开那一处**——
+  // `_isWin ? "python" : "python3"` 这段文本在别处（收尾验证的兜底命令）也有，
+  // 拿整份 SRC 去 match 会被那一处喂到，这里改坏了照样绿。
+  const expandStart = SRC.indexOf("const cmd = tmpl.cmd");
+  const expand = SRC.slice(expandStart, SRC.indexOf("shellQuote(name));", expandStart));
+  assert.ok(expand.length > 80, "找不到模板命令的展开处");
+  assert.match(expand, /_isWin \? "python" : "python3"/, "PY 占位符没按平台展开");
+  assert.match(SRC, /_isWin \? "\.venv\\\\Scripts\\\\activate" : "source \.venv\/bin\/activate"/,
+    "ACTIVATE 占位符没按平台展开");
+  // 种子文件要真的被写出来，否则模板建完是空壳。
+  assert.match(SRC, /for \(const seed of Array\.isArray\(tmpl\.files\) \? tmpl\.files : \[\]\)/,
+    "没有写种子文件那一步");
+  assert.match(SRC, /rel\.includes\("\.\."\)/, "种子文件路径没防目录穿越");
+});
+
+test("抓包与证书信任在 Windows 上给的是 Windows 的命令", () => {
+  // 这几段里有两处会**直接进模型上下文**，模型会照着它指挥用户去终端跑。给错了就是
+  // 指挥 Windows 用户去跑一条不存在的命令、去打开一个不存在的「钥匙串访问」。
+  assert.match(SRC, /function _captureInstallCmd\(\)/, "装 mitmproxy 的命令没有按平台分");
+  const install = extractFn("_captureInstallCmd");
+  assert.match(install, /winget install -e --id mitmproxy\.mitmproxy/, "Windows 上没给可用的装法");
+  assert.match(install, /brew install mitmproxy/, "macOS 那条不该丢");
+  assert.doesNotMatch(SRC, /点“安装”会在终端运行 brew install mitmproxy/,
+    "面板文案还写死 brew");
+  assert.match(SRC, /certutil -addstore -f Root/, "Windows 上信任 CA 用的是证书存储，不是钥匙串");
+  assert.match(SRC, /_isWin\s*\n?\s*\? `\\n抓 HTTPS 需信任 CA 证书[\s\S]{0,80}certutil/,
+    "给模型的那段说明没有按平台分");
+});
+
 test("只读命令的判定认得 cmd 的语法——否则 Windows 上连看目录都过不了", () => {
   /*
    * 两处 POSIX 假设，合起来让 Windows 上的智能体寸步难行：
@@ -16924,8 +16969,11 @@ test("验证器不可用（退出 127）不能被当成验证失败", () => {
   // 源头：不能只因为存在 requirements.txt 就断定 ruff/pytest 可用。
   assert.doesNotMatch(SRC, /return "ruff check \. && pytest"/,
     "不得无条件返回未经存在性检查的 ruff/pytest");
-  assert.match(SRC, /python3 -m compileall -q \./,
-    "两者都没有时要退回一定存在的语法编译检查，而不是给一条跑不了的命令");
+  // 兜底那条按平台给解释器：Windows 上 python3 不是命令（python.org 的包只产出
+  // python.exe，同名的 python3.exe 是微软商店的应用执行别名，跑它会弹商店）——
+  // 而这条恰恰是"收尾必跑"的验证命令，给错了等于每次收尾都失败一次。
+  assert.match(SRC, /\$\{_isWin \? "python" : "python3"\} -m compileall -q \./,
+    "两者都没有时要退回一定存在的语法编译检查，而且要按平台给对解释器");
   assert.match(SRC, /\.venv\/bin/, "优先用项目自带的虚拟环境");
 
   // 栈提示里"猜"的 Python 默认命令不得绕过存在性探测直接进验证管线——
