@@ -6638,6 +6638,28 @@ test("装完没装完问后端，不在前端拼一句只有 macOS 认的 shell"
     "通知适配器没把 langId 收进来");
 });
 
+test("应用目录名只有一个真相——前后端、两个平台都指同一个", () => {
+  /*
+   * 改名（~/.michael-ide → ~/.mrdayone）时漏了三处，其中两处是"装到 A、找的时候查 B"
+   * 这种最难查的：npm 全局前缀在前端和 Rust 的 Windows 分支里各写死了一份旧名字，
+   * 于是 npm 把包装进一个谁也不去看的目录，而 PATH 里加的是另一个。
+   */
+  assert.doesNotMatch(SRC, /\.michael-ide[\\/](npm-global|crash\.log|mcp\.json|skills)/,
+    "前端还有地方指着旧的应用目录");
+  assert.match(SRC, /_michaelNpmPrefix = _isWin \? "%USERPROFILE%\\\\\.mrdayone\\\\npm-global" : "\$HOME\/\.mrdayone\/npm-global"/,
+    "npm 全局前缀没跟上改名");
+
+  const proc = readFileSync(join(HERE, "..", "src-tauri", "src", "process_util.rs"), "utf8");
+  assert.doesNotMatch(proc, /\.michael-ide/, "Rust 的 Windows PATH 分支还写着旧目录名");
+  assert.match(proc, /crate::mcp::app_dir_name\(\)/,
+    "Windows 分支应当问同一个入口要目录名，而不是再写死一份");
+
+  // 唯一允许留旧名字的地方：搬迁用的那个常量。
+  const mcp = readFileSync(join(HERE, "..", "src-tauri", "src", "mcp.rs"), "utf8");
+  assert.match(mcp, /const LEGACY_APP_DIR_NAME: &str = "\.michael-ide";/,
+    "搬迁要认得老目录，这个常量不能删——删了老用户的东西就真的丢了");
+});
+
 test("任务完成的提醒走系统通知，不在应用内弹卡片挡输入框", () => {
   /*
    * 那张应用内卡片有两个毛病：它盖在输入框上（你正要接着打字，它挡在那儿），而且只在
@@ -14083,7 +14105,9 @@ test("debug adapters install real commands and failed launches tear down the ses
     "Node debug must launch the stdio wrapper used by the Tauri DAP backend");
   assert.doesNotMatch(SRC, /npm i -g js-debug-adapter/);
   assert.match(TAURI_DEBUG, /\("node",\s*"js-debug-adapter-stdio"/);
-  assert.match(PROCESS_UTIL, /\.michael-ide\/npm-global\/bin/);
+  // 目录名不再写死（应用目录改过一次名，写死的那份当场变成「装到 A、查 B」）——
+  // 钉的是"PATH 里确实加了 IDE 自己那份 npm 全局目录"，名字问同一个入口要。
+  assert.match(PROCESS_UTIL, /\{home\}\/\{\}\/npm-global\/bin", crate::mcp::app_dir_name\(\)/);
   assert.match(DAP_CLIENT, /if \(initBody === null\)[\s\S]*await endSession\("initialize failed", target\)[\s\S]*return false;/);
   assert.match(DAP_CLIENT, /if \(ok === null\)[\s\S]*await endSession\(`\$\{request\} failed`, target\)[\s\S]*return false;/);
 });

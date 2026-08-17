@@ -58544,7 +58544,8 @@ function shellQuote(value) {
 }
 const _isWin = typeof navigator !== "undefined" && navigator.platform && navigator.platform.startsWith("Win");
 const _clearCmd = _isWin ? "cls" : "clear";
-const _michaelNpmPrefix = _isWin ? "%USERPROFILE%\\.michael-ide\\npm-global" : "$HOME/.michael-ide/npm-global";
+// 和后端 augmented_path 里那份必须是同一个目录，否则 npm 装到 A、找的时候查 B。
+const _michaelNpmPrefix = _isWin ? "%USERPROFILE%\\.mrdayone\\npm-global" : "$HOME/.mrdayone/npm-global";
 const _nodeDebugAdapterBin = "js-debug-adapter-stdio";
 
 function dirname(path) {
@@ -65606,7 +65607,7 @@ async function createTermTab(customLabel, cwdOverride = "") {
       if (buffered) e.term.write("\r\n\x1b[2m--- shell 启动期输出 ---\x1b[0m\r\n" + buffered);
       e.term.write("\r\n\x1b[31m" + (e.startError || "终端启动失败") + "\x1b[0m\r\n");
       e.term.write("\x1b[2m终端没能起来。上面这段就是原因，请截图或复制发回。\x1b[0m\r\n");
-      e.term.write("\x1b[2m（Windows 若有崩溃日志，在 %USERPROFILE%\\.michael-ide\\crash.log）\x1b[0m\r\n");
+      e.term.write("\x1b[2m（Windows 若有崩溃日志，在 %USERPROFILE%\\.mrdayone\\crash.log）\x1b[0m\r\n");
     } catch { /* xterm 已经被销毁就算了 */ }
   };
   const entry = { term, fit, container, label, cwd, backendId: null, opening: false, closed: false, startError: "", inputLine: "", ghost: "", suggestion: "", webgl: webglAddon, createdAt: now, lastActivityAt: now, lastCommand: "", initTimer: 0 };
