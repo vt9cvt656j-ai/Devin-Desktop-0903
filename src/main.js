@@ -621,6 +621,17 @@ const _AI_MODEL_RESUME_LIMIT = 3;
 /// "同一个请求 id 每两秒重来一次、连打六小时"就是这么来的（那两秒还只是请求本身的往返，
 /// 不是我们在等）。间隔本身就是治疗——给上游喘一口的时间，比立刻重试更可能成功。
 const _AI_MODEL_RETRY_DELAY_MS = 2_000;
+/// 撞限流时"等一会儿再来"的次数与起步退避。
+///
+/// 限流**不能**并进普通重试集合——见 _isRateLimitedAiError 上面那段：它每发一次都带完整
+/// 上下文，既加深限流又实打实烧配额，历史上出过 25 秒 18 发的请求风暴。那条保护不动。
+///
+/// 但"直接判死"也不对：用户看到红字之后会自己发「继续」，那其实就是一次重试——只是来得
+/// 更快（没有任何退避）、更贵（整轮从头再来）。所以给限流一条**独立的、预算极小、退避很长**
+/// 的路：2 次，15 秒起步、逐次加倍，最长 60 秒。物理上造不出风暴，而绝大多数限流在这个
+/// 时间尺度上已经放开了。
+const _AI_MODEL_RATE_LIMIT_WAITS = 2;
+const _AI_MODEL_RATE_LIMIT_DELAY_MS = 15_000;
 const _AI_MODEL_ATTEMPT_TIMEOUT_MS = 60_000;
 const _AI_RESPONSE_HEADERS_DEADLINE_MS = _AI_MODEL_ATTEMPT_TIMEOUT_MS;
 const _AI_ERROR_BODY_DEADLINE_MS = 2_000;
@@ -38864,6 +38875,7 @@ async function _runModelRequestWithRetry({
   let attemptsRun = 0;
   let currentInvoke = invoke;
   let resumesUsed = 0;
+  let rateLimitWaitsUsed = 0;
 
   // 续传不消耗重试配额：重试是"这次请求没能开始"，续传是"请求好好地开始了、中途断了"，
   // 两者的预算不该互相挤占。用 while + 手动推进，才能让续传原地重开一次尝试。
@@ -38929,6 +38941,31 @@ async function _runModelRequestWithRetry({
       }
       if (!isLive()) return { attempts: attempt, cancelled: true, error: "", hadModelProgress, resumes: resumesUsed };
       attemptIndex += 1;
+      continue;
+    }
+
+    // 撞限流：等一会儿再来，用独立预算，不碰普通重试的配额，也不推进 attemptIndex。
+    // 只在**还没产出任何内容**时才等——已经出了内容就该走下面的续传，重发会重复正文和计费。
+    const canWaitOutRateLimit = !attemptProgress
+      && !hadModelProgress
+      && rateLimitWaitsUsed < _AI_MODEL_RATE_LIMIT_WAITS
+      && _isRateLimitedAiError(attemptError);
+    if (canWaitOutRateLimit) {
+      rateLimitWaitsUsed += 1;
+      const _waitMs = Math.min(60_000, _AI_MODEL_RATE_LIMIT_DELAY_MS * rateLimitWaitsUsed);
+      try {
+        onRetry({
+          retry: rateLimitWaitsUsed, retryLimit: _AI_MODEL_RATE_LIMIT_WAITS,
+          nextAttempt: attempt + 1, error: attemptError, delayMs: _waitMs, rateLimited: true,
+        });
+      } catch {}
+      // 和普通重试同样分片等待：用户按停止要立刻生效，不能让他干等一分钟还白发一次。
+      const _until = Date.now() + _waitMs;
+      while (Date.now() < _until) {
+        if (!isLive()) return { attempts: attempt, cancelled: true, error: "", hadModelProgress, resumes: resumesUsed };
+        await new Promise((r) => setTimeout(r, Math.min(250, _until - Date.now())));
+      }
+      if (!isLive()) return { attempts: attempt, cancelled: true, error: "", hadModelProgress, resumes: resumesUsed };
       continue;
     }
 
