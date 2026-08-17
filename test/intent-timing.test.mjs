@@ -300,3 +300,29 @@ test("完整裁决要 19.8 秒，路由必须有第二条腿——而且那条�
   assert.match(wait, /Promise\.race\(\[\s*_turnIntentExactPromise,\s*_fastRoute,/,
     "两条腿必须在同一个 race 里——串行等待就没有意义了");
 });
+
+test("角色计划第一轮就要到，但只当指路用——闸门仍然只认完整裁决", () => {
+  // 完整裁决实测 19.8 秒，第一轮通常没有。而"该派哪些角色"恰恰是第一轮就要决定的事：
+  // 等到第二轮，活已经按 solo 干起来了，多角色那条路等于没通。
+  //
+  // 边界是死的：给模型的**信息**可以走快通道，harness 自己的**闸门**（计划门槛、写入义务、
+  // 角色派发准入）仍然只认完整裁决。精简判断可以指路，不该管闸门。
+  const fn = CODE.slice(CODE.indexOf("async function _fastRoutingFlags("),
+                        CODE.indexOf("async function _fastRoutingFlags(") + 4200);
+  assert.match(fn, /orchestrationMode 不是 solo 时，再给 roleNeeds/,
+    "快通道没问角色——第一轮就不知道该派谁");
+  assert.match(fn, /\.filter\(\(role\) => _AI_AGENT_ROLES\.has\(role\)\)/,
+    "角色名必须逐个对着目录校验：弱模型会编出目录里没有的角色");
+  assert.match(fn, /profile\.orchestrationMode !== "solo" && Array\.isArray\(raw\.roleNeeds\)/,
+    "solo 时不该带角色清单");
+  assert.match(fn, /\[\.\.\.new Set\(roles\)\]\.slice\(0, 5\)/, "角色要去重并封顶，别让它列一长串");
+
+  // 临时契约必须**自报是临时的**：否则模型会把初判当最终结论，完整裁决到了也不改。
+  const frame = CODE.slice(CODE.indexOf("function _agentDecisionFrameBlock"));
+  const body = frame.slice(0, 3000);
+  assert.match(body, /〔协作初判·完整意图裁决还在路上，这是快速判断〕/,
+    "临时契约没有自报身份——模型会把它当成最终结论");
+  assert.match(body, /完整裁决落定后会自动补全或纠正/, "要说清它会被修正，否则模型不敢改口");
+  assert.match(body, /else if \(provisional && provisional\.orchestrationMode && provisional\.orchestrationMode !== "solo"\)/,
+    "临时契约必须只在完整契约缺席、且真的要多角色时才出现——否则纯属噪音");
+});
