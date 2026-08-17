@@ -6623,7 +6623,7 @@ test("工作区工具的判据来自语义裁决，不是用户话里的关键�
   assert.doesNotMatch(SRC, /function _looksLightweightAgentChat\(/);
   assert.doesNotMatch(SRC, /_shouldUseLightweightAgentTurn|_agentLightTurn/,
     "轻量轮又回来了——它会在判错时把工具和技能一起拿走，而模型不知道自己缺了什么");
-  assert.match(SRC, /\) \{[\s\S]{0,600}_agentContextSnapshotForTurn\(text, _curRoot, _turnEngineeringResolved, \{ coldWaitMs: 1200 \}\)/);
+  assert.match(SRC, /\) \{[\s\S]{0,600}_agentContextSnapshotForTurn\(text, _curRoot, _turnEngineeringResolved, \{ coldWaitMs: 1200, memoryRoot: _identityRoot \}\)/);
   assert.doesNotMatch(extractFn("sendPrompt"), /await\s+(?:Promise\.race\(\[)?_gatherAgentContext/,
     "the first-token path must not await a cold workspace scan");
   assert.match(SRC, /if \(_activeForSession\)/);
@@ -8036,7 +8036,7 @@ test("AI intent judgment is session-aware, semantic, and never falls back to key
   assert.match(extractFn("_runAgenticLoop"), /const _engineeringProfile = engineering \|\| _engineeringProfileWithAiIntent\(task, session\);[\s\S]*?run\.engineering = _engineeringProfile;/,
     "Agent 循环必须优先复用同一份画像，分类器超时时不能二次计算丢掉 Agent fail-open 状态");
   assert.match(SRC, /const profile = profileOverride \|\| _engineeringProfileWithAiIntent\(query\);/);
-  assert.match(SRC, /_agentContextSnapshotForTurn\(text, _curRoot, _turnEngineeringResolved, \{ coldWaitMs: 1200 \}\)/,
+  assert.match(SRC, /_agentContextSnapshotForTurn\(text, _curRoot, _turnEngineeringResolved, \{ coldWaitMs: 1200, memoryRoot: _identityRoot \}\)/,
     "首轮项目上下文必须消费本轮已解析语义画像，不能重新做无会话判定");
   assert.match(SRC, /const _steerVerdict = await _steerIntentTask;[\s\S]*_mergeAiIntentProfile\([\s\S]*_semanticEngineeringEvidence/,
     "实时引导必须等语义决策生效后再选择下一轮架构/工具路径");
@@ -11773,7 +11773,7 @@ test("send preflight starts independent work without waiting for semantic routin
     "the exact key, context, promise and result state must travel into the agent run");
   assert.doesNotMatch(send, /await\s+_compactHistoryIfHuge\(/,
     "LLM history compaction must never add its old 20-second serial delay to first output");
-  assert.match(send, /_agentContextSnapshotForTurn\(text, _curRoot, _turnEngineeringResolved, \{ coldWaitMs: 1200 \}\)/,
+  assert.match(send, /_agentContextSnapshotForTurn\(text, _curRoot, _turnEngineeringResolved, \{ coldWaitMs: 1200, memoryRoot: _identityRoot \}\)/,
     "a cold workspace gets only a short foreground digest window while warm-up continues");
   assert.match(send, /const \[snapshot, staleEvidence\] = await Promise\.all\(\[/,
     "workspace snapshot and stale-evidence checks should settle together");
@@ -17678,11 +17678,12 @@ test("草稿保存不得在节流之上展平累计正文（长内容卡死/崩�
   const KEY = "k";
   const m = new Map();
   const ls = { getItem: (k) => (m.has(k) ? m.get(k) : null), setItem: (k, v) => m.set(k, String(v)), removeItem: (k) => m.delete(k) };
-  const save = load("_streamDraftSave", { _isSecondaryWindow: false, _STREAM_DRAFT_KEY: KEY, localStorage: ls, inTauri: false });
+  const save = load("_streamDraftSave", { _isSecondaryWindow: false, _STREAM_DRAFT_KEY: KEY, localStorage: ls, inTauri: false, _streamDraftMapRead: load("_streamDraftMapRead", { _STREAM_DRAFT_KEY: KEY, localStorage: ls, _streamDraftMapFrom: load("_streamDraftMapFrom", {}) }), _streamDraftMapWrite: load("_streamDraftMapWrite", { _STREAM_DRAFT_KEY: KEY, localStorage: ls }), _streamDraftMapFrom: load("_streamDraftMapFrom", {}), });
   save({ id: "s" }, "   \n  ", "");
   assert.equal(ls.getItem(KEY), null, "纯空白内容不得落盘（行为必须与修复前一致）");
   save({ id: "s2" }, "真实内容", "");
-  assert.equal(JSON.parse(ls.getItem(KEY)).text, "真实内容", "真实内容照常落盘");
+  // 存储形状现在是 { [sessionId]: draft }——单槽会让两个标签页互相覆盖。
+  assert.equal(JSON.parse(ls.getItem(KEY)).s2.text, "真实内容", "真实内容照常落盘");
 });
 
 test("旧工具卡就地折叠，不再被搬进 Activity 抽屉", () => {
@@ -17729,22 +17730,39 @@ test("流式回复退出落盘：节流尾部常驻内存，退出 flush 同步�
   const KEY = "michael-stream-draft-v1";
   const mkLS = () => { const m = new Map(); return { getItem: (k) => (m.has(k) ? m.get(k) : null), setItem: (k, v) => m.set(k, String(v)), removeItem: (k) => m.delete(k) }; };
   const ls = mkLS();
-  const draftSave = load("_streamDraftSave", { _isSecondaryWindow: false, _STREAM_DRAFT_KEY: KEY, localStorage: ls, inTauri: false });
+  const draftSave = load("_streamDraftSave", { _isSecondaryWindow: false, _STREAM_DRAFT_KEY: KEY, localStorage: ls, inTauri: false, _streamDraftMapRead: load("_streamDraftMapRead", { _STREAM_DRAFT_KEY: KEY, localStorage: ls, _streamDraftMapFrom: load("_streamDraftMapFrom", {}) }), _streamDraftMapWrite: load("_streamDraftMapWrite", { _STREAM_DRAFT_KEY: KEY, localStorage: ls }), _streamDraftMapFrom: load("_streamDraftMapFrom", {}), });
   const sess = { id: "s1", streaming: true };
   draftSave(sess, "第一段", "思考1");
   draftSave(sess, "第一段+节流窗口内的后续内容", "思考2");
   // 平时节奏不变：2s 节流内第二次不落 localStorage，但最新全量内容必须留在内存 stash
-  assert.equal(JSON.parse(ls.getItem(KEY)).text, "第一段", "节流窗口内不重复写 localStorage（性能优化不推翻）");
+  assert.equal(JSON.parse(ls.getItem(KEY)).s1.text, "第一段", "节流窗口内不重复写 localStorage（性能优化不推翻）");
   assert.equal(sess._streamDraftLatest.text, "第一段+节流窗口内的后续内容", "节流丢掉的尾部必须常驻内存，供退出 flush 补写");
 
   // 退出/隐藏同步 flush：绕过节流，把内存里的最新全量草稿同步写进 localStorage
-  const flushSync = load("_streamDraftFlushSync", { _isSecondaryWindow: false, _STREAM_DRAFT_KEY: KEY, localStorage: ls, _chatSessions: [sess] });
+  const flushSync = load("_streamDraftFlushSync", { _isSecondaryWindow: false, _STREAM_DRAFT_KEY: KEY, localStorage: ls, _chatSessions: [sess], _streamDraftMapRead: load("_streamDraftMapRead", { _STREAM_DRAFT_KEY: KEY, localStorage: ls, _streamDraftMapFrom: load("_streamDraftMapFrom", {}) }), _streamDraftMapWrite: load("_streamDraftMapWrite", { _STREAM_DRAFT_KEY: KEY, localStorage: ls }), _streamDraftMapFrom: load("_streamDraftMapFrom", {}), });
   const flushed = flushSync();
   assert.equal(flushed.text, "第一段+节流窗口内的后续内容");
-  assert.equal(JSON.parse(ls.getItem(KEY)).text, "第一段+节流窗口内的后续内容", "退出 flush 必须落盘当前完整累计内容，不是增量");
+  {
+    // 两个标签页同时在流式时，退出兜底必须把**每一个**都写下来。旧写法 find 出第一个
+    // 就返回，另一个标签整轮输出（可能是几十分钟的 agent 运行）连保险都没有。
+    const lsMulti = mkLS();
+    const a = { id: "a", streaming: true, _streamDraftLatest: { text: "A 的在途回复", reasoning: "" } };
+    const b = { id: "b", streaming: true, _streamDraftLatest: { text: "B 的在途回复", reasoning: "" } };
+    const flushMulti = load("_streamDraftFlushSync", {
+      _isSecondaryWindow: false, _STREAM_DRAFT_KEY: KEY, localStorage: lsMulti, _chatSessions: [a, b],
+      _streamDraftMapRead: load("_streamDraftMapRead", { _STREAM_DRAFT_KEY: KEY, localStorage: lsMulti,
+        _streamDraftMapFrom: load("_streamDraftMapFrom", {}) }),
+      _streamDraftMapWrite: load("_streamDraftMapWrite", { _STREAM_DRAFT_KEY: KEY, localStorage: lsMulti }),
+      _streamDraftMapFrom: load("_streamDraftMapFrom", {}),
+    });
+    flushMulti();
+    const saved = JSON.parse(lsMulti.getItem(KEY) || "{}");
+    assert.deepEqual(Object.keys(saved).sort(), ["a", "b"], "并发流式时只兜底了第一个会话");
+  }
+  assert.equal(JSON.parse(ls.getItem(KEY)).s1.text, "第一段+节流窗口内的后续内容", "退出 flush 必须落盘当前完整累计内容，不是增量");
 
   // 回合正常收尾（clear 清 stash）后，退出 flush 不再把已落账内容复活成假草稿
-  const draftClear = load("_streamDraftClear", { _isSecondaryWindow: false, _STREAM_DRAFT_KEY: KEY, localStorage: ls, inTauri: false, loadStore: undefined });
+  const draftClear = load("_streamDraftClear", { _isSecondaryWindow: false, _STREAM_DRAFT_KEY: KEY, localStorage: ls, inTauri: false, loadStore: undefined, _streamDraftMapRead: load("_streamDraftMapRead", { _STREAM_DRAFT_KEY: KEY, localStorage: ls, _streamDraftMapFrom: load("_streamDraftMapFrom", {}) }), _streamDraftMapWrite: load("_streamDraftMapWrite", { _STREAM_DRAFT_KEY: KEY, localStorage: ls }), _streamDraftMapFrom: load("_streamDraftMapFrom", {}), });
   draftClear(sess);
   assert.equal(sess._streamDraftLatest, null, "收尾必须清掉内存 stash");
   assert.equal(ls.getItem(KEY), null);
@@ -17790,8 +17808,11 @@ test("流式草稿恢复：双通道取较新者，两侧都消费后清槽", as
   const ls = mkLS();
   ls.setItem(KEY, JSON.stringify({ sessionId: "s1", text: "早期的一小截", updatedAt: now - 60_000 }));
   const { store, m, calls } = mkStore({ [KEY]: { sessionId: "s1", text: "接近完整的全量内容", updatedAt: now - 1000 } });
-  const take = load("_streamDraftTake", { _STREAM_DRAFT_KEY: KEY, localStorage: ls, inTauri: true, loadStore: async () => store });
-  const picked = await take();
+  const take = load("_streamDraftTake", { _STREAM_DRAFT_KEY: KEY, localStorage: ls, inTauri: true, loadStore: async () => store,
+    _streamDraftMapRead: load("_streamDraftMapRead", { _STREAM_DRAFT_KEY: KEY, localStorage: ls, _streamDraftMapFrom: load("_streamDraftMapFrom", {}) }), _streamDraftMapFrom: load("_streamDraftMapFrom", {}),  });
+  // 返回的是数组：多标签页并发时每个会话各有一份在途草稿，只挑一份等于丢掉另一个
+  // 标签整轮输出。旧的单份存储形状仍然读得进来（这里两侧都是旧形状）。
+  const picked = (await take())[0];
   assert.equal(picked.text, "接近完整的全量内容", "必须优先恢复较新的磁盘镜像");
   assert.equal(ls.getItem(KEY), null, "localStorage 槽消费后清除");
   assert.equal(m.has(KEY), false, "磁盘镜像消费后清除，不能下次重启再复活");
@@ -17801,11 +17822,25 @@ test("流式草稿恢复：双通道取较新者，两侧都消费后清槽", as
   const ls2 = mkLS();
   ls2.setItem(KEY, JSON.stringify({ sessionId: "s1", text: "退出前同步 flush 的完整内容", updatedAt: now - 500 }));
   const second = mkStore({ [KEY]: { sessionId: "s1", text: "旧的磁盘镜像", updatedAt: now - 30_000 } });
-  const take2 = load("_streamDraftTake", { _STREAM_DRAFT_KEY: KEY, localStorage: ls2, inTauri: true, loadStore: async () => second.store });
-  assert.equal((await take2()).text, "退出前同步 flush 的完整内容");
+  const take2 = load("_streamDraftTake", { _STREAM_DRAFT_KEY: KEY, localStorage: ls2, inTauri: true, loadStore: async () => second.store,
+    _streamDraftMapRead: load("_streamDraftMapRead", { _STREAM_DRAFT_KEY: KEY, localStorage: ls2, _streamDraftMapFrom: load("_streamDraftMapFrom", {}) }), _streamDraftMapFrom: load("_streamDraftMapFrom", {}),  });
+  assert.equal((await take2())[0].text, "退出前同步 flush 的完整内容");
+
+  // 两个标签页同时被打断：两份都要回来，不能只补第一个。
+  const ls3 = mkLS();
+  ls3.setItem(KEY, JSON.stringify({
+    a: { sessionId: "a", text: "A 标签的在途回复", updatedAt: now - 800 },
+    b: { sessionId: "b", text: "B 标签的在途回复", updatedAt: now - 900 },
+  }));
+  const third = mkStore({});
+  const take3 = load("_streamDraftTake", { _STREAM_DRAFT_KEY: KEY, localStorage: ls3, inTauri: true, loadStore: async () => third.store,
+    _streamDraftMapRead: load("_streamDraftMapRead", { _STREAM_DRAFT_KEY: KEY, localStorage: ls3, _streamDraftMapFrom: load("_streamDraftMapFrom", {}) }), _streamDraftMapFrom: load("_streamDraftMapFrom", {}),  });
+  const both = await take3();
+  assert.deepEqual(both.map((d) => d.sessionId).sort(), ["a", "b"], "并发流式时另一个标签的整轮输出被丢掉了");
 
   // 恢复渲染完整性：草稿全文进 memory（push 不截断），并强制从持久历史重建可见窗口
-  assert.ok(SRC.includes("const _draft = await _streamDraftTake()"), "恢复路径必须 await 双通道草稿");
+  assert.ok(SRC.includes("for (const _draft of await _streamDraftTake())"),
+    "恢复路径必须遍历所有会话的草稿，只取一份会丢掉并发标签页的整轮输出");
   assert.ok(SRC.includes("此回复在生成途中因软件重启被打断，以下为已生成的部分）\\n\\n${_draft.text}") || /以下为已生成的部分）[\s\S]{0,40}_draft\.text/.test(SRC),
     "中断恢复必须把草稿全文（_draft.text 不截断）补进历史");
 });
@@ -25100,4 +25135,133 @@ test("聊天标签页不再显示模型名", () => {
   assert.doesNotMatch(block, /chat-tab__model/, "模型名又回到标签页上了");
   assert.match(block, /模型：\$\{modelLabel\(s\.model\)\}/, "移走可以，但别把这条信息弄丢——放进悬停提示");
   assert.doesNotMatch(APP_CSS, /\.chat-tab__model\s*\{/, "样式规则成了死代码");
+});
+
+// ── 上下文"有时候会抽"：间歇性丢上下文/串会话 ─────────────────────────────────
+test("journal 跑在 checkpoint 前面时，要把那截真正补回模型上下文", () => {
+  const mem = new ConversationMemory();
+  mem.push({ role: "user", content: "第一轮" });
+  mem.push({ role: "assistant", content: "第一轮回答" });
+  mem.summaries.push({ text: "早期摘要", range: "turns 1–2" });
+  // 模拟：checkpoint 停在 2 条，journal 已经有 4 条（跑任务期间保存被降级成 lightweight）
+  const journal = [
+    { role: "user", content: "第一轮" },
+    { role: "assistant", content: "第一轮回答" },
+    { role: "user", content: "崩溃前那一问" },
+    { role: "assistant", content: "崩溃前那一答" },
+  ];
+  const added = mem.adoptJournalTail(journal, 4);
+  assert.equal(added, 2, "只补 checkpoint 没见过的那截，不重复已有的");
+  assert.equal(mem.totalTurns, 4);
+  const text = JSON.stringify(mem.recent);
+  assert.ok(text.includes("崩溃前那一问") && text.includes("崩溃前那一答"),
+    "界面能显示、模型看不到——这正是「消息一条不少但它像没看过」");
+  assert.equal(mem.summaries.length, 1, "摘要是 checkpoint 真带着的状态，补 tail 不该把它抹掉");
+  // 幂等：再调一次不该重复灌
+  assert.equal(mem.adoptJournalTail(journal, 4), 0);
+
+  const src = stripJsComments(extractFn("_ensureSessionTranscript"));
+  assert.match(src, /adoptJournalTail/, "恢复时只对齐计数、不补内容，等于让模型停在旧 checkpoint");
+});
+
+test("落盘文本预算按会话分配，且用尽时也不得写成空串", () => {
+  const budget = { remaining: 10, perValue: 1000 };
+  const long = "甲".repeat(500);
+  serializeMessagesForPersistence([{ role: "user", content: long }], undefined, { textBudget: budget });
+  const drained = { remaining: 0, perValue: 1000 };
+  const out = serializeMessagesForPersistence([{ role: "user", content: long }], undefined, { textBudget: drained });
+  const body = String(out[0]?.content || "");
+  assert.notEqual(body, "", "预算耗尽就把正文写成空串——恢复后模型读到的是一条空消息");
+  assert.ok(body.includes("甲"), "至少要留一截真实内容");
+
+  // 检查点：每个会话一份预算 + 活动标签优先，别让排在前面的长会话吃干净
+  const src = stripJsComments(SRC.slice(
+    SRC.indexOf("const checkpointMediaBudget"),
+    SRC.indexOf("const closedList = closedSnapshot"),
+  ));
+  assert.match(src, /perSessionText/, "还是所有标签页共用一份预算");
+  assert.match(src, /a === activeIdxSnapshot/, "没有让活动标签先落盘");
+  // 光有排序数组没用，得真的按它遍历——照数组下标跑一遍，活动标签优先就白算了。
+  assert.match(src, /for \(const index of order\)/, "算了排序却没按它落盘");
+});
+
+test("reasoning 不跟正文抢落盘预算——它根本到不了模型", () => {
+  const budget = { remaining: 100_000, perValue: 48_000 };
+  const out = serializeMessagesForPersistence(
+    [{ role: "assistant", content: "正文", reasoning: "思".repeat(50_000) }],
+    undefined, { textBudget: budget },
+  );
+  assert.ok(String(out[0]?.reasoning || "").length <= 4000, "reasoning 该按固定上限截断");
+  assert.ok(budget.remaining > 90_000, `reasoning 又在吃共享预算：只剩 ${budget.remaining}`);
+  const memSrc = stripJsComments(readFileSync(join(HERE, "../src/conversation-memory.js"), "utf8"));
+  assert.doesNotMatch(memSrc, /message\.reasoning = serializeTextWithBudget/, "reasoning 又回到共享预算里了");
+});
+
+test("已经跑过 SQLite 的会话，重开时长度不许凭空膨胀", () => {
+  // transcript 空 + 有 offset = 转录在 SQLite 里；此时拿 archive+recent 合成 transcript
+  // 会把长度撑大，下一条消息的序号直接跳过一大段，在 journal 里凿出永久空洞。
+  const mem = ConversationMemory.fromJSON({
+    totalTurns: 100,
+    transcriptOffset: 100,
+    transcript: [],
+    recent: Array.from({ length: 20 }, (_, i) => ({ role: "user", content: `r${i}` })),
+    archive: Array.from({ length: 30 }, (_, i) => ({ turn: i, role: "assistant", text: `a${i}` })),
+  });
+  assert.equal(mem.transcript.length, 0, "又拿 archive+recent 合成了一份假 transcript");
+  assert.equal(mem.transcriptLength(), 100, `长度被撑到了 ${mem.transcriptLength()}`);
+
+  // 真·老数据（offset 为 0）仍然照旧恢复，别把兼容路径一起堵死
+  const legacy = ConversationMemory.fromJSON({
+    totalTurns: 3, transcriptOffset: 0, transcript: [],
+    recent: [{ role: "user", content: "x" }],
+    archive: [{ turn: 0, role: "assistant", text: "y" }],
+  });
+  assert.equal(legacy.transcript.length, 2, "老 session.json 的兼容恢复被堵死了");
+
+  // 关闭的标签页要带着 checkpoint 存档，否则重开时正好落进上面那个坑
+  assert.match(stripJsComments(extractFn("_archiveChatSession")), /externalizeTranscript: true/,
+    "关闭标签页时不写 transcriptCheckpoint，重开就会撞上长度膨胀");
+});
+
+test("目录/前缀/草稿的归属跟着请求走，不跟着此刻谁在前台", () => {
+  // openFolder：异步落地时前台可能已经换人，写死 _currentSession() 会把新目录
+  // 记到无辜标签头上，那个标签下一轮就会吃到「彻底忘掉旧目录」。
+  const open = stripJsComments(extractFn("openFolder"));
+  assert.match(open, /async function openFolder\(path, owner/, "openFolder 没有显式归属参数");
+  assert.match(open, /owner \|\| _currentSession\(\)/);
+  assert.match(stripJsComments(extractFn("_ensureSessionWorkspaceRoot")), /openFolder\(root, session\)/,
+    "调用方没把归属传下去");
+
+  // 压缩前缀：子智能体跑的是父会话的消息，不能拿它去覆盖主对话的前缀
+  const key = stripJsComments(extractFn("_mcPrefixKey"));
+  assert.match(key, /_mcPrefixKey\(session = null\)/);
+  assert.match(key, /session \|\| \(typeof _currentSession/);
+  assert.match(SRC, /_mcTier && !_isSub\) _l0Msgs = _applyCompressionPrefix\(_l0Msgs, _turnConfig, session\)/,
+    "子智能体还在动主对话的压缩前缀");
+
+  // 身份根：不能跟着编辑器里打开的文件漂
+  assert.match(SRC, /const _identityRoot = String\(_turnRoot \|\| _curRoot/,
+    "身份根和路径解析根还是同一个");
+  assert.match(SRC, /sess\._anchorRoot !== _identityRoot/, "「工作区已切换」还在按打开的文件误触发");
+  assert.match(SRC, /memoryRoot: _identityRoot/, "项目记忆还在跟着打开的文件换 key");
+});
+
+test("切标签页的每个 await 之后都要重新校验活动标签", () => {
+  const src = stripJsComments(extractFn("_switchChatSession"));
+  const guard = /if \(idx !== _activeChatIdx \|\| session !== _chatSessions\[idx\]\) return;/g;
+  assert.equal((src.match(guard) || []).length, 2,
+    "只有一道守卫：渲染让出主线程期间用户再点一下，就会把别的标签的容器挂进聊天区");
+  const renderAt = src.indexOf("await _renderSessionHistory");
+  const showAt = src.indexOf("session.container.hidden = false");
+  const between = src.slice(renderAt, showAt);
+  assert.match(between, guard, "第二道守卫必须夹在渲染和挂载之间");
+});
+
+test("插话丢掉过时工具批次前，先把已经落盘的写入收账", () => {
+  const at = SRC.indexOf("session._steerQueue.length && _live()) {");
+  assert.ok(at > 0, "找不到插话丢弃点");
+  const block = stripJsComments(SRC.slice(at, at + 900));
+  assert.match(block, /_settleEagerWritesForBreak\(run\)/,
+    "流完即写在流式阶段就真落盘了，直接 continue 等于磁盘变了而账本里一个字没有");
+  assert.match(block, /_mutatedFiles\.add/, "改动文件数也要补上，否则收尾会说「我没有改动文件」");
 });

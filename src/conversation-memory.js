@@ -178,6 +178,10 @@ function serializeAttachment(attachment, budget) {
 }
 
 const LOCAL_TEXT_TRUNCATION_MARKER = '\n...[local recovery mirror truncated; full history remains on disk]...\n';
+/// Bytes of a message kept even when the shared budget is completely spent.
+const TEXT_BUDGET_FLOOR = 400;
+/// Reasoning is display-only on restore; it gets a flat cap instead of budget bidding.
+const REASONING_PERSIST_MAX = 4000;
 
 function serializeTextWithBudget(value, textBudget) {
   if (typeof value !== 'string' || !textBudget || typeof textBudget !== 'object') return value;
@@ -188,7 +192,18 @@ function serializeTextWithBudget(value, textBudget) {
     textBudget.remaining -= value.length;
     return value;
   }
-  if (keep <= 0) return '';
+  // Never return '' — an empty string is indistinguishable from "the user sent nothing",
+  // and it goes straight back into the model's context on restore. A shared budget can be
+  // exhausted by earlier sessions, so this floor is what stops later tabs from being
+  // restored as a column of blank messages while their bubbles still render from the
+  // journal. Overrunning `remaining` here is deliberate: a marked stub costs a few hundred
+  // bytes and keeps the turn legible.
+  if (keep <= 0) {
+    const tail = value.slice(-TEXT_BUDGET_FLOOR);
+    const result = value.length > TEXT_BUDGET_FLOOR ? LOCAL_TEXT_TRUNCATION_MARKER + tail : tail;
+    textBudget.remaining = 0;
+    return result;
+  }
   let result;
   if (keep <= LOCAL_TEXT_TRUNCATION_MARKER.length + 32) {
     result = value.slice(-keep);
@@ -220,7 +235,11 @@ function serializeMessageText(message, textBudget) {
     message.content = content;
   }
   if (typeof message.reasoning === 'string') {
-    message.reasoning = serializeTextWithBudget(message.reasoning, textBudget);
+    // Reasoning is stripped before the request goes out (_sanitizeProviderMessages), so it
+    // never reaches the model — it only repaints the thinking card after a restart. Letting
+    // it bid for the shared budget against real message text is why a session with deep
+    // thinking enabled loses its context sooner than an identical one without it.
+    message.reasoning = message.reasoning.slice(0, REASONING_PERSIST_MAX);
   }
   if (Array.isArray(message.tool_calls)) {
     const calls = new Array(message.tool_calls.length);
@@ -406,6 +425,32 @@ export class ConversationMemory {
     if (!this.transcript.length) this.transcriptOffset = total;
     this.totalTurns = Math.max(total, this.transcriptOffset + this.transcript.length);
     return this.totalTurns;
+  }
+
+  // The journal can legitimately run ahead of the checkpoint: while any tab is streaming,
+  // `saveChatHistory` downgrades to lightweight and writes no checkpoint at all, yet every
+  // appended message still reaches SQLite. After a crash the bubbles all render (they come
+  // from the journal) while the model's context stops at the older checkpoint — the user
+  // asks "继续刚才那个" and it has never heard of it.
+  //
+  // Unlike `replacePromptTail` this is additive: summaries, archive and file evidence are
+  // real state the checkpoint did carry, and dropping them would trade one kind of amnesia
+  // for another. Only the tail that the checkpoint never saw is grafted on.
+  adoptJournalTail(messages, totalTurns = this.totalTurns) {
+    const tail = Array.isArray(messages) ? messages.filter(Boolean) : [];
+    if (!tail.length) return 0;
+    // Identity is by position in the durable journal, so overlap is resolved by count, not
+    // by comparing content — two identical "继续" turns must not collapse into one.
+    const known = Math.max(0, Math.trunc(Number(this.totalTurns) || 0));
+    const target = Math.max(known, Math.trunc(Number(totalTurns) || 0));
+    const missing = Math.min(tail.length, target - known);
+    if (missing <= 0) return 0;
+    const added = tail.slice(tail.length - missing);
+    this.recent = [...this.recent, ...added].slice(-RECENT_WINDOW);
+    this._recentChars = this.recent.reduce((total, message) => total + ConversationMemory._messageChars(message), 0);
+    this.totalTurns = target;
+    if (!this.transcript.length) this.transcriptOffset = target;
+    return added.length;
   }
 
   // Used after a historical edit. These messages are deliberately not inserted
@@ -907,7 +952,15 @@ export class ConversationMemory {
       // Older session.json files only had compacted recent/archive memories.
       // Recover the best available display history once, then all future saves
       // persist the canonical transcript without another lossy conversion.
-      if (!mem.transcript.length && checkpoint === null) {
+      // `transcriptOffset === 0` is what makes this branch safe: a genuinely legacy blob
+      // starts at sequence 0, so synthesizing a transcript from archive+recent lands on the
+      // sequences those messages already have. A session that HAS run against SQLite carries
+      // a large offset, and synthesizing there inflates transcriptLength() by
+      // archive+recent — the next append then jumps that far ahead and punches a permanent
+      // gap in the journal, after which the backend refuses the window and the tab is dead.
+      // (Reachable because _archiveChatSession serializes a closed tab without
+      // externalizeTranscript, so the checkpoint field is absent while the offset is not.)
+      if (!mem.transcript.length && checkpoint === null && mem.transcriptOffset === 0) {
         const legacyArchive = mem.archive.map((entry) => ({
           role: entry.role,
           content: entry.text,
