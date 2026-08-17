@@ -316,6 +316,44 @@ struct PendingElicitation {
     answer: Option<Value>,
 }
 
+/// 等一条挂起的询问被答复。返回要回给服务的 result。
+///
+/// 抽成自由函数是为了能测：Session 要一个真的子进程才构造得出来，而这段时序逻辑
+/// （答复 / 取消 / 超时三条出口）正是这条特性里唯一值得测的部分。
+fn wait_for_elicitation(
+    token: &str,
+    cancel: &Arc<AtomicBool>,
+    budget: Duration,
+) -> Value {
+    let deadline = Instant::now() + budget;
+    let mut answer = None;
+    while Instant::now() < deadline {
+        if cancel.load(Ordering::SeqCst) {
+            break;
+        }
+        if let Ok(mut list) = ELICITATIONS.lock() {
+            match list.iter_mut().find(|p| p.token == token) {
+                Some(slot) => {
+                    if let Some(value) = slot.answer.take() {
+                        answer = Some(value);
+                    }
+                }
+                // 被别处清掉了（会话断开等）——别再等了。
+                None => break,
+            }
+        }
+        if answer.is_some() {
+            break;
+        }
+        std::thread::sleep(CANCEL_POLL);
+    }
+    if let Ok(mut list) = ELICITATIONS.lock() {
+        list.retain(|p| p.token != token);
+    }
+    // 三条出口都落到这里：没答上来一律 cancel，不是 decline。
+    answer.unwrap_or_else(|| json!({"action":"cancel"}))
+}
+
 static ELICITATIONS: LazyLock<Mutex<Vec<PendingElicitation>>> =
     LazyLock::new(|| Mutex::new(Vec::new()));
 
@@ -530,30 +568,7 @@ impl Session {
         } else {
             return json!({"action":"cancel"});
         }
-        let deadline = Instant::now() + ELICITATION_WAIT;
-        let mut answer = None;
-        while Instant::now() < deadline {
-            if self.cancel.load(Ordering::SeqCst) {
-                break;
-            }
-            if let Ok(mut list) = ELICITATIONS.lock() {
-                if let Some(slot) = list.iter_mut().find(|p| p.token == token) {
-                    if let Some(value) = slot.answer.take() {
-                        answer = Some(value);
-                    }
-                } else {
-                    break; // 被别处清掉了（会话断开等）
-                }
-            }
-            if answer.is_some() {
-                break;
-            }
-            std::thread::sleep(CANCEL_POLL);
-        }
-        if let Ok(mut list) = ELICITATIONS.lock() {
-            list.retain(|p| p.token != token);
-        }
-        answer.unwrap_or_else(|| json!({"action":"cancel"}))
+        wait_for_elicitation(&token, &self.cancel, ELICITATION_WAIT)
     }
 
     fn respond_to_server_request(&mut self, request: &Value) {
@@ -4238,5 +4253,97 @@ mod live_user_config_tests {
             }
         }
         assert!(checked > 0, "用户配置里一个可连的 MCP 服务都没有");
+    }
+}
+
+#[cfg(test)]
+mod elicitation_tests {
+    use super::*;
+
+    fn register(token: &str) {
+        ELICITATIONS.lock().unwrap().push(PendingElicitation {
+            token: token.to_string(),
+            server: "svc".into(),
+            root: "/repo".into(),
+            message: "需要一个 API Key".into(),
+            schema: json!({"type":"object","properties":{"key":{"type":"string"}}}),
+            answer: None,
+        });
+    }
+
+    /// 用户答了 → 原样回给服务，并且这条从挂起表里消失。
+    #[test]
+    fn an_answer_is_delivered_and_the_slot_is_freed() {
+        let token = "t-accept";
+        register(token);
+        let handle = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            mcp_elicit_respond(token.into(), "accept".into(), Some(json!({"key": "abc"})))
+        });
+        let out = wait_for_elicitation(token, &Arc::new(AtomicBool::new(false)), Duration::from_secs(5));
+        handle.join().unwrap().unwrap();
+        assert_eq!(out["action"], "accept");
+        assert_eq!(out["content"]["key"], "abc");
+        assert!(
+            !ELICITATIONS.lock().unwrap().iter().any(|p| p.token == token),
+            "答完必须把槽位释放，否则一个坏服务能把表撑满（上限 8 条）"
+        );
+    }
+
+    /// 没人在电脑前 → 到点回 **cancel**，不是 decline。
+    ///
+    /// 这两者服务端处理往往不同：decline 是"用户看过并拒绝"，服务据此走"那就别做了"；
+    /// 超时只说明没人应答。混为一谈会让服务把一次无人值守当成用户的明确表态。
+    #[test]
+    fn nobody_home_times_out_as_cancel_not_decline() {
+        let token = "t-timeout";
+        register(token);
+        let out = wait_for_elicitation(token, &Arc::new(AtomicBool::new(false)), Duration::from_millis(120));
+        assert_eq!(out["action"], "cancel");
+        assert!(out.get("content").is_none(), "超时不该带内容回去");
+        assert!(!ELICITATIONS.lock().unwrap().iter().any(|p| p.token == token));
+    }
+
+    /// 用户点了停止 → 立刻回 cancel，别让服务以为还有人在等。
+    #[test]
+    fn stop_button_releases_the_wait_immediately() {
+        let token = "t-cancel";
+        register(token);
+        let flag = Arc::new(AtomicBool::new(true));
+        let started = Instant::now();
+        let out = wait_for_elicitation(token, &flag, Duration::from_secs(30));
+        assert_eq!(out["action"], "cancel");
+        assert!(started.elapsed() < Duration::from_secs(2), "点了停止还在傻等");
+    }
+
+    /// decline / cancel 不把用户填了一半的东西带出去。
+    #[test]
+    fn declining_never_leaks_a_half_filled_form() {
+        let token = "t-decline";
+        register(token);
+        mcp_elicit_respond(token.into(), "decline".into(), Some(json!({"key": "半个密钥"}))).unwrap();
+        let out = wait_for_elicitation(token, &Arc::new(AtomicBool::new(false)), Duration::from_secs(5));
+        assert_eq!(out["action"], "decline");
+        assert!(
+            out.get("content").is_none(),
+            "用户明确不给，却还是把他填的内容送出去了"
+        );
+    }
+
+    /// 前端传来不认识的 action 一律当 cancel——传错字符串不该被服务解读成"用户同意了"。
+    #[test]
+    fn an_unknown_action_is_never_read_as_consent() {
+        let token = "t-bogus";
+        register(token);
+        mcp_elicit_respond(token.into(), "yes-please".into(), Some(json!({"key": "x"}))).unwrap();
+        let out = wait_for_elicitation(token, &Arc::new(AtomicBool::new(false)), Duration::from_secs(5));
+        assert_eq!(out["action"], "cancel");
+    }
+
+    /// 已经结束的 token 再答一次要报错，而不是静静地写进一个不存在的槽位。
+    #[test]
+    fn answering_a_finished_request_is_an_error() {
+        let err = mcp_elicit_respond("t-gone".into(), "accept".into(), None).unwrap_err();
+        assert!(err.contains("已经结束"), "实际：{err}");
     }
 }
