@@ -6638,6 +6638,57 @@ test("装完没装完问后端，不在前端拼一句只有 macOS 认的 shell"
     "通知适配器没把 langId 收进来");
 });
 
+test("只读命令的判定认得 cmd 的语法——否则 Windows 上连看目录都过不了", () => {
+  /*
+   * 两处 POSIX 假设，合起来让 Windows 上的智能体寸步难行：
+   *
+   *   1. 单个 `&` 被一票否决——在 POSIX 里它是"扔后台跑"，可在 cmd 里它是**命令分隔符**
+   *      （等价于 POSIX 的 `;`），而 Windows 的交互终端就是 cmd。
+   *   2. 白名单里全是 POSIX 名字，没有 dir / where / findstr / more。
+   *
+   * 后果：只读子智能体的探索命令被 [BLOCKED]、纯读命令每条都弹确认框、连看一眼目录都
+   * 过不了计划门。
+   */
+  const build = (isWin) => new Function(
+    "_isWin", "_looksLikeVerificationCommand",
+    extractFn("_looksLikeReadOnlyCommand") + ";return _looksLikeReadOnlyCommand;",
+  )(isWin, () => false);
+
+  const win = build(true);
+  for (const readOnly of ["dir", "cd D:\\proj & dir", "where node", "findstr TODO src\\a.js", "type package.json"]) {
+    assert.equal(win(readOnly), true, `Windows 上这条是只读的：${readOnly}`);
+  }
+  // 分隔符切开之后每一段都要各自过闸——有一段是写操作就整条不算只读。
+  assert.equal(win("dir & del /q x.txt"), false, "`&` 后面跟了删除，不该判成只读");
+
+  const posix = build(false);
+  // POSIX 上 `&` 仍然是后台执行，维持原来的否决。
+  assert.equal(posix("ls & rm -rf /"), false);
+  assert.equal(posix("ls -la"), true, "别把原来的行为改坏了");
+  assert.equal(posix("cd /x && ls"), true);
+
+  // 沙箱里没有模块级的 _isWin，裸引用会抛 ReferenceError。
+  assert.match(extractFn("_looksLikeReadOnlyCommand"), /typeof _isWin !== "undefined" && _isWin/,
+    "平台判断要带 typeof 兜底，否则这个函数在测试沙箱里直接抛");
+});
+
+test("「这台机器有没有这个命令」问后端，不拼 command -v", () => {
+  // cmd 没有 `command` 这个内建，返回 9009 —— 于是 Windows 上答案永远是"没装"：
+  // 新建项目的 24 个模板一个都创建不出来，还附一句「安装 Node.js：brew install node」。
+  assert.doesNotMatch(SRC, /`command -v \$\{tool\}`/, "又在拼 command -v 探工具链");
+  assert.match(SRC, /await backend\.whichCommand\(tool, parentDirPath\)/, "预检没走跨平台的解析");
+  assert.match(SRC, /whichCommand: \(name, workspace\) => core\.invoke\("which_command"/,
+    "前端没接 which_command");
+  const proc = readFileSync(join(HERE, "..", "src-tauri", "src", "process_util.rs"), "utf8");
+  assert.match(proc, /pub fn which_command\(name: String, workspace: Option<String>\) -> String/,
+    "后端没有这个命令");
+  assert.match(
+    readFileSync(join(HERE, "..", "src-tauri", "src", "lib.rs"), "utf8"),
+    /process_util::which_command/,
+    "命令没在 invoke_handler 里注册——前端调用会直接失败",
+  );
+});
+
 test("应用目录名只有一个真相——前后端、两个平台都指同一个", () => {
   /*
    * 改名（~/.michael-ide → ~/.mrdayone）时漏了三处，其中两处是"装到 A、找的时候查 B"
