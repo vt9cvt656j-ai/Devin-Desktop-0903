@@ -644,6 +644,8 @@ mod plan_spec_tests {
     /// 等价，测试会两边都过、等于没守。
     #[test]
     fn grantable_follows_the_configured_plans_not_the_builtin_list() {
+        // 这条会把进程级 PLANS 换掉，必须和读 PLANS 的那几条串行。
+        let _g = crate::settings::plans_test_guard();
         use crate::settings::PlanQuota;
         let custom = PlanQuota {
             plan: "yunying-xinzeng".to_string(),
@@ -742,6 +744,7 @@ mod plan_spec_tests {
     /// typo — LEAST() would silently clamp it and the advertised figure would be fiction.
     #[test]
     fn plan_spec_window_cap_never_exceeds_total() {
+        let _g = crate::settings::plans_test_guard();
         for plan in PLANS {
             let (total, window_cap, _weekly, _days) = plan_spec(plan).unwrap();
             assert!(
@@ -754,6 +757,7 @@ mod plan_spec_tests {
     /// Grants must never silently downgrade: rank and price must move together.
     #[test]
     fn plan_spec_totals_increase_with_rank() {
+        let _g = crate::settings::plans_test_guard();
         let mut prev = 0i64;
         for plan in PLANS {
             let (total, ..) = plan_spec(plan).unwrap();

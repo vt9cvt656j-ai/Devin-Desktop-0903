@@ -102,6 +102,20 @@ static PLANS: LazyLock<RwLock<Vec<PlanQuota>>> = LazyLock::new(|| RwLock::new(de
 /// 存在的理由很具体：`plan_quotas` 是运营在后台加套餐的地方，而校验一度查的是代码里
 /// 写死的五元组。两者在**默认配置下恰好相等**，所以任何不改这份缓存的测试都无法区分
 /// 「按配置校验」和「按硬编码校验」——测试会两种实现都通过，等于没守。
+/// 换过 PLANS 的测试和读 PLANS 的测试必须串行。
+///
+/// PLANS 是**进程级**缓存，而 cargo 默认并行跑测试：一个测试把它换成一组只含
+/// "yunying-xinzeng" 的假配置期间，另外几个正在读真配置的测试就会 unwrap 到 None。
+/// 症状是这几条时红时绿、每次红的还不一定是同一条——最难查的那种。
+/// 中毒了也照用（`into_inner`）：一次 panic 不该让后面每条都变成"锁中毒"。
+#[cfg(test)]
+pub static PLANS_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(test)]
+pub fn plans_test_guard() -> std::sync::MutexGuard<'static, ()> {
+    PLANS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 #[cfg(test)]
 pub fn replace_plans_for_test(plans: Vec<PlanQuota>) -> Vec<PlanQuota> {
     let mut guard = PLANS.write().expect("plans lock");
@@ -494,6 +508,7 @@ mod tests {
     /// 未知套餐既没有额度也没有等级，和改造前一致。
     #[test]
     fn unknown_plan_has_no_spec_and_rank_zero() {
+        let _g = super::plans_test_guard();
         assert!(plan_spec("no-such-plan").is_none());
         assert_eq!(plan_rank("no-such-plan"), 0);
         assert_eq!(plan_rank("basic"), 2);
