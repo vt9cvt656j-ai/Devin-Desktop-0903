@@ -31270,6 +31270,12 @@ function _buildAgentToolSchemas(includeWrite, mcpTools = []) {
       { type: "function", function: { name: "http_request", description: "Call any HTTP API — the key capability for using online tools and services. method = GET/POST/PUT/PATCH/DELETE/HEAD, with optional headers and body; returns the status code, response headers and response body (text, up to 5MB). Typical uses: (1) test the local service you just started (http://127.0.0.1:<port>/api — send a request and see the real response); (2) call a public API (GitHub, weather, exchange rates, maps, any REST service); (3) fire a webhook. ⚠️ localhost and the LAN are allowed (so you can test your own service), but link-local and cloud metadata addresses (169.254.x.x) are blocked; only http/https are supported. 【vs alternatives】To read a web page's text use web_fetch (simpler); to find a page use web_search.", parameters: { type: "object", properties: { method: { type: "string", description: "HTTP method, e.g. GET, POST, PUT, DELETE" }, url: { type: "string", description: "A full http/https URL, which may be http://127.0.0.1:<port>/path" }, headers: { type: "object", description: "Optional; request header key/value pairs, e.g. {\"Authorization\":\"Bearer xxx\",\"Content-Type\":\"application/json\"}", additionalProperties: { type: "string" } }, body: { type: "string", description: "Optional; the request body (for POST/PUT etc.; to send JSON, pass a JSON string)" }, timeout_secs: { type: "integer", description: "Optional; timeout in seconds, default 30, maximum 120" } }, required: ["url"] } } },
       { type: "function", function: { name: "tor_request", description: "**Send an HTTP request through the Tor network — reach deep-web / dark-web .onion sites** (and optionally reach ordinary URLs anonymously). Use it to read .onion links, reach censored or hidden resources, and fetch anonymously. **Tor starts automatically** (it is brought up if not running; the first cold start takes about 10-30s, and only a machine with tor not installed at all needs brew install tor). This is how deep-web content gets read.", parameters: { type: "object", properties: { method: { type: "string", description: "HTTP method, e.g. GET, POST; omit for GET" }, url: { type: "string", description: "The full URL; .onion addresses (e.g. http://xxx.onion/path) and ordinary http/https are both supported" }, headers: { type: "object", description: "Optional; request header key/value pairs", additionalProperties: { type: "string" } }, body: { type: "string", description: "Optional; the request body" }, timeout_secs: { type: "integer", description: "Optional; timeout in seconds, default 60 (Tor is slow), maximum 300" } }, required: ["url"] } } },
       { type: "function", function: { name: "package_search", description: "**Search for a package or library and check version compatibility** — package information from npm, crates.io, PyPI, HuggingFace, pub.dev (Flutter), Conda, CocoaPods (iOS) and Hex (Elixir). For npm, passing an exact package name also returns registry metadata: dist-tags.latest, recent versions, engines, peerDependencies, dependencies and deprecated. Before editing package.json, choosing a version, or resolving a peer-dependency conflict, you must check here — do not guess a version from memory.", parameters: { type: "object", properties: { query: { type: "string", description: "Package name or search term; for npm version and compatibility checks pass the exact package name, e.g. 'axios' / '@vitejs/plugin-react' / 'tsx'" }, ecosystem: { type: "string", enum: ["npm", "pypi", "crates", "huggingface", "dart", "conda", "cocoapods", "hex", "maven", "nuget", "packagist", "rubygems", "homebrew", "dockerhub", "cdnjs"], description: "Ecosystem: npm (default) / pypi / crates / huggingface / dart / conda / cocoapods / hex. pypi supports exact package names only" }, max_results: { type: "integer", description: "How many to return, default 8" } }, required: ["query"] } } },
+      /*
+       * 和上面那个 package_search 是**两件事**，description 里也写清楚了：
+       * 那个查"有没有、什么版本、废弃没"，这个查"我这台机器上装的这份长什么样"。
+       * 装好的那份比任何全球索引都准——读的就是 lock 文件锁死的那一版。
+       */
+      { type: "function", function: { name: "package_source", description: "**Read the REAL API of a dependency as installed on this machine** — resolves the package inside the project's node_modules / site-packages and returns its installed version plus actual source. Two modes: without `symbol` you get `name@installedVersion`, the real on-disk path and the list of exported names; with `symbol` you get the definition body (signature + surrounding doc comment). 【When to use】BEFORE writing any call into a third-party library whose exact API you are not certain about — a signature you remember may belong to a different major version than the one installed here. This is the only tool that reads the version this project actually locked. 【How it differs】`package_search` answers \"does it exist / what versions / deprecated?\" from the registry and returns NO signatures. context7 (if connected) answers \"how do the official docs describe it?\". This one answers \"what is actually on disk\". Typical order: package_search → package_source → context7. 【Note】Ordinary search / find_files / semantic_search deliberately skip node_modules, so they can never answer this — use this tool instead of trying to grep dependencies.", parameters: { type: "object", properties: { package: { type: "string", description: "Package name as imported, e.g. 'zod' / '@tanstack/react-query' / 'pydantic'" }, symbol: { type: "string", description: "Optional. Exported function / class / type to look up; omit for an overview of what the package exports" }, root: { type: "string", description: "Optional workspace root when several are open" } }, required: ["package"] } } },
       { type: "function", function: { name: "github_search", description: "Search repositories, code or issues through the GitHub API, returning the metadata and links from this API response. updated_at is not proof of a recent commit, a release, or continued maintenance; a repository's quality and compatibility still need its source, releases and issues read, and verification in the current project.", parameters: { type: "object", properties: { query: { type: "string", description: "Search terms; GitHub search syntax is supported" }, search_type: { type: "string", description: "Search type, default repositories" }, max_results: { type: "integer", description: "How many to return, default 10, maximum 30" } }, required: ["query"] } } },
       { type: "function", function: { name: "github_repo", description: "Read a given GitHub repository's real contents. ONE call = ONE action. \u3010Order\u3011Start with `overview` (description / language / stars / default_branch). For \"what is this project / what is it for\", `overview` plus at most one `readme` call is the whole answer \u2014 stop there and answer; do not enumerate directories to answer a purpose question. Only reach for `tree`/`file` when the README is missing or the question is about implementation or a specific behaviour, and name the files you intend to read before reading them. \u3010tree lists ONE directory level\u3011`tree` calls GitHub /contents: subdirectories come back as bare names with no children, so drilling folder-by-folder costs one HTTP round trip per folder. \u3010Budget\u3011These requests are rate-limited; a repository is not a filesystem you can crawl for free.", parameters: { type: "object", properties: { owner: { type: "string", description: "Repository owner/org, e.g. vercel" }, repo: { type: "string", description: "Repository name, e.g. next.js" }, action: { type: "string", enum: ["overview", "readme", "tree", "file", "releases", "issues", "pulls"], description: "What to read, default overview" }, path: { type: "string", description: "For tree/file: a path inside the repository, e.g. packages/next/src/server" }, branch: { type: "string", description: "Optional branch/tag/SHA; omit for the default branch" }, max_results: { type: "integer", description: "How many tree/releases/issues/pulls entries to return, default 20, maximum 100" } }, required: ["owner", "repo"] } } },
       { type: "function", function: { name: "gitlab_repo", description: "Read a given GitLab.com repository's real contents directly: overview/readme/tree/file/releases/issues/pulls (pulls maps to GitLab merge requests). Public repositories are supported; setting GITLAB_TOKEN or GITLAB_PERSONAL_ACCESS_TOKEN raises the rate limit and allows authorized repositories to be read.", parameters: { type: "object", properties: { owner: { type: "string", description: "Repository namespace/group, subgroups allowed, e.g. gitlab-org or group/subgroup" }, repo: { type: "string", description: "Repository name, e.g. gitlab" }, action: { type: "string", enum: ["overview", "readme", "tree", "file", "releases", "issues", "pulls"], description: "What to read, default overview; pulls = merge requests" }, path: { type: "string", description: "For tree/file: a path inside the repository, e.g. app/models" }, branch: { type: "string", description: "Optional branch/tag/SHA; omit for the default branch" }, max_results: { type: "integer", description: "How many tree/releases/issues/pulls entries to return, default 20, maximum 100" } }, required: ["owner", "repo"] } } },
@@ -32644,6 +32650,7 @@ function _mapToolCall(name, args, mcpToolMap = _mcpToolMap) {
     // 18 个曾经独立的检索工具已折进上面两个聚合工具（见 _RETIRED_SEARCH_ALIASES）。它们不再
     // 出现在模型看到的目录里，但**旧调用仍然照常执行**：一次会话中途换目录时，历史里已经出现
     // 过的调用名不能突然变成"未知工具"。
+    case "package_source": return { type: "package_source", path: String(args.package || ""), package: String(args.package || ""), symbol: String(args.symbol || ""), root: String(args.root || "") };
     case "package_search": return { type: "package_search", query: String(args.query || ""), ecosystem: String(args.ecosystem || "npm"), max_results: Number.isFinite(+args.max_results) ? +args.max_results : undefined };
     case "github_search": return { type: "github_search", query: String(args.query || ""), search_type: String(args.search_type || "repositories"), max_results: Number.isFinite(+args.max_results) ? +args.max_results : undefined };
     case "github_repo": return { type: "github_repo", owner: String(args.owner || ""), repo: String(args.repo || ""), action: args.action ? String(args.action) : undefined, path: args.path ? String(args.path) : undefined, branch: args.branch ? String(args.branch) : undefined, max_results: Number.isFinite(+args.max_results) ? +args.max_results : undefined };
@@ -33177,7 +33184,9 @@ function _advancePlanFromTool(run, call, result) {
 }
 
 const _OFFICIAL_RESEARCH_EVIDENCE_TOOLS = new Set([
-  "package_search", "github_repo", "gitlab_repo", "gitee_repo", "codeberg_repo",
+  // package_source 算官方证据里**最硬**的一种：它读的是本机装好的那一份源码，
+  // 版本天然正确——比任何文档都不容易过时。
+  "package_search", "package_source", "github_repo", "gitlab_repo", "gitee_repo", "codeberg_repo",
   "mdn_search", ]);
 const _COMMUNITY_RESEARCH_EVIDENCE_TOOLS = new Set([
   "developer_community_search", "stackoverflow_search", "hackernews_search", ]);
@@ -37600,6 +37609,198 @@ async function _tsWorkerFormat(fp) {
       return tmp.getValue();
     } catch { return null; } finally { tmp.dispose(); }
   } finally { if (created) { try { model.dispose(); } catch {} } }
+}
+
+/*
+ * ── package_source：读磁盘上**装好的那一份**依赖，拿真实签名 ──────────────────
+ *
+ * 这治的是最难发现的一类幻觉：版本号是对的（package_search 查过了），写法是旧版的。
+ * 模型按训练记忆写 `useQuery(key, fn, opts)`（v4），而项目里装的是 v5
+ * （`useQuery({ queryKey, queryFn })`）——五道防线全部放行，运行时才炸。
+ *
+ * 为什么必须新写一条读取路径，而不是复用现成的检索：
+ *   · semantic_search / find_symbol 的索引硬跳过 node_modules
+ *   · find_files 的忽略表第一项就是 node_modules
+ *   · search 带上路径看着能进包目录，可忽略表里还有 `dist`——而绝大多数包的 .d.ts
+ *     恰好在 dist/ 里。只有把路径精确到 `node_modules/zod/dist` 才通，模型猜不到。
+ * 所以这里直接用 readDir / readTextFile 自己走，一层过滤都不加。
+ *
+ * 和另外两件的分工（description 里也写了，模型才分得清）：
+ *   package_search → 有没有这个包、最新什么版本、废弃没有   （注册表元数据，零签名）
+ *   context7       → 官方怎么讲这个 API、迁移指南           （叙述性文档）
+ *   package_source → **我这台机器上装的这份**长什么样        （磁盘事实，版本天然正确）
+ */
+const _PKG_SRC_MAX_FILES = 40;        // 一个包里最多翻这么多文件
+const _PKG_SRC_MAX_BYTES = 220_000;   // 单文件超过就跳过（压缩产物动辄几 MB）
+/*
+ * 类型声明文件单独给一档。`.d.ts` / `.pyi` 天生就大——monaco-editor 的
+ * editor.api.d.ts 是 269KB，正好卡在上面那个门槛外面，于是查 IRange 一无所获。
+ * 而它们恰恰是**最该读**的那一类：整个包的对外形状都在里面，而且回给模型的只有
+ * 命中处 ±20 行，读进来多大和上下文开销无关。
+ */
+const _PKG_SRC_MAX_TYPE_BYTES = 4_000_000;
+const _pkgSrcMaxBytes = (path) => (/\.(d\.ts|pyi)$/i.test(String(path)) ? _PKG_SRC_MAX_TYPE_BYTES : _PKG_SRC_MAX_BYTES);
+const _PKG_SRC_CONTEXT_LINES = 20;    // 命中处上下各带这么多行
+
+/*
+ * 去掉版本后缀，留下能拼进路径的裸包名。
+ *
+ * scoped 包必须单独处理：`@tauri-apps/api` 里的 `@` 是**作用域前缀**，不是版本分隔符。
+ * 一条 `^@?([^@]*)@.*$` 想同时管两种，实际把它削成了 `@`——于是所有 @scope/xxx 包一律
+ * 报"未安装"，而那恰恰是前端项目里最常见的一半依赖。
+ */
+function _packageBareName(pkg) {
+  const raw = String(pkg || "").trim();
+  if (raw.startsWith("@")) {
+    const slash = raw.indexOf("/");
+    if (slash < 0) return raw;                       // 只给了作用域，原样返回
+    const scope = raw.slice(0, slash);
+    const rest = raw.slice(slash + 1).split("@")[0]; // 斜杠之后的 @ 才是版本
+    return `${scope}/${rest}`;
+  }
+  return raw.split("@")[0] || raw;
+}
+
+/** 包在磁盘上的候选目录，按生态。返回的是**待验证**的路径，不保证存在。 */
+function _packageSourceCandidates(root, pkg) {
+  const base = String(root || "").replace(/\/+$/, "");
+  const name = _packageBareName(pkg);
+  const out = [];
+  if (base) {
+    out.push({ eco: "npm", dir: `${base}/node_modules/${name}` });
+    // pnpm 把实体装在 .pnpm 里，node_modules/<name> 只是符号链接；链接读不到时退到实体目录。
+    out.push({ eco: "npm(pnpm)", dir: `${base}/node_modules/.pnpm`, pnpm: name });
+    for (const venv of [".venv", "venv"]) {
+      // Windows 是 Lib\site-packages，POSIX 是 lib/pythonX.Y/site-packages。
+      out.push({ eco: "python", dir: `${base}/${venv}/Lib/site-packages/${name}` });
+      out.push({ eco: "python", dir: `${base}/${venv}/lib`, pyLib: name });
+    }
+  }
+  return out;
+}
+
+/** 读一个目录，读不到就当空——调用方靠"空"来判断这个候选不存在。 */
+async function _pkgReadDir(dir) {
+  try {
+    const entries = await backend.readDir(dir);
+    return Array.isArray(entries) ? entries : [];
+  } catch { return []; }
+}
+
+/** 从 package.json / METADATA 里取已安装版本。取不到返回空串——**不要**编一个。 */
+async function _packageInstalledVersion(dir, eco) {
+  try {
+    if (eco.startsWith("npm")) {
+      const raw = await backend.readTextFile(`${dir}/package.json`);
+      return String(JSON.parse(raw)?.version || "");
+    }
+  } catch {}
+  return "";
+}
+
+/** 定位一个包在磁盘上的真实目录。找不到返回 null。 */
+async function _resolvePackageDir(root, pkg) {
+  for (const cand of _packageSourceCandidates(root, pkg)) {
+    if (cand.pnpm) {
+      // .pnpm 下是 `<name>@<ver>/node_modules/<name>` 这种形状，名字里的 / 被换成 +。
+      const flat = cand.pnpm.replace(/\//g, "+");
+      for (const entry of await _pkgReadDir(cand.dir)) {
+        const n = entry?.name || "";
+        if (!n.startsWith(flat + "@")) continue;
+        const real = `${cand.dir}/${n}/node_modules/${cand.pnpm}`;
+        if ((await _pkgReadDir(real)).length) return { dir: real, eco: cand.eco };
+      }
+      continue;
+    }
+    if (cand.pyLib) {
+      // lib/python3.12/site-packages/<name>
+      for (const entry of await _pkgReadDir(cand.dir)) {
+        if (!entry?.is_dir && !entry?.isDirectory) continue;
+        const real = `${cand.dir}/${entry.name}/site-packages/${cand.pyLib}`;
+        if ((await _pkgReadDir(real)).length) return { dir: real, eco: cand.eco };
+      }
+      continue;
+    }
+    if ((await _pkgReadDir(cand.dir)).length) return { dir: cand.dir, eco: cand.eco };
+  }
+  return null;
+}
+
+/**
+ * 递归收集包里值得看的源文件（类型声明优先，其次源码）。
+ *
+ * package.json 的 `types` / `typings` 排在最前面：它就是这个包官方指定的"我长什么样"。
+ * 少了这一步，monaco-editor 这种大包会在遍历到任何 .d.ts 之前就撞上文件数上限——
+ * 实测拿回来的第一个文件是 `dev/vs/_commonjsHelpers-98qg88fe.js`，对判断 API 毫无用处。
+ */
+async function _collectPackageFiles(dir, depth = 3) {
+  const DECLARATION = /\.(d\.ts|pyi)$/i;
+  const SOURCE = /\.(ts|tsx|mjs|cjs|js|py|rs|go)$/i;
+  /*
+   * **两遍走**：第一遍只收声明文件，第二遍才用剩下的名额收普通源码。
+   *
+   * 一遍走会被目录顺序坑死：monaco-editor 的遍历先撞上 `dev/vs/` 底下几百个打包产物，
+   * 40 个名额全被吃光，而真正该看的 `esm/vs/editor/editor.api.d.ts` 一个都没进来——
+   * 实测查 IRange 一无所获。声明文件是"这个包对外长什么样"的权威描述，必须优先，
+   * 而不是收完再排序（排序救不了没被收进来的文件）。
+   */
+  const collect = async (match, budget) => {
+    const out = [];
+    const walk = async (cur, left) => {
+      if (left < 0 || out.length >= budget) return;
+      for (const entry of await _pkgReadDir(cur)) {
+        if (out.length >= budget) return;
+        const name = entry?.name || "";
+        if (!name || name.startsWith(".")) continue;
+        const full = `${cur}/${name}`;
+        if (entry.is_dir || entry.isDirectory) {
+          // 这里**不过滤 dist/build**——那正是 .d.ts 待的地方，也正是现成检索够不着的原因。
+          if (name === "node_modules" || name === "__pycache__") continue;
+          await walk(full, left - 1);
+        } else if (match.test(name)) {
+          out.push(full);
+        }
+      }
+    };
+    await walk(dir, depth);
+    return out;
+  };
+  // 官方声明的类型入口插在最前面，且不占遍历预算。
+  const entries = [];
+  try {
+    const meta = JSON.parse(await backend.readTextFile(`${dir}/package.json`));
+    for (const key of ["types", "typings"]) {
+      const rel = String(meta?.[key] || "").replace(/^\.\//, "");
+      if (rel) entries.push(`${dir}/${rel}`);
+    }
+  } catch {}
+  const decls = await collect(DECLARATION, _PKG_SRC_MAX_FILES);
+  const rest = decls.length >= _PKG_SRC_MAX_FILES
+    ? []
+    : await collect(SOURCE, _PKG_SRC_MAX_FILES - decls.length);
+  return [...new Set([...entries, ...decls, ...rest])];
+}
+
+/** 从一份源码里抽导出名。刻意用宽松正则——它只是给模型一张"有哪些东西"的清单。 */
+function _extractExportNames(text) {
+  const names = new Set();
+  const src = String(text || "");
+  for (const re of [
+    /export\s+(?:declare\s+)?(?:async\s+)?(?:function|const|let|var|class|interface|type|enum)\s+([A-Za-z_$][\w$]*)/g,
+    /export\s*\{([^}]*)\}/g,
+    /^\s*(?:async\s+)?def\s+([A-Za-z_][\w]*)/gm,
+    /^\s*class\s+([A-Za-z_][\w]*)/gm,
+    /pub\s+(?:fn|struct|enum|trait|type)\s+([A-Za-z_][\w]*)/g,
+  ]) {
+    let m;
+    while ((m = re.exec(src))) {
+      for (const piece of String(m[1] || "").split(",")) {
+        const n = piece.trim().split(/\s+as\s+/).pop().trim();
+        if (/^[A-Za-z_$][\w$]*$/.test(n)) names.add(n);
+      }
+    }
+  }
+  return [...names];
 }
 
 async function _agentFindFiles(root, pattern, limit) {
@@ -42442,7 +42643,7 @@ function _buildToolHint(text, profile = _engineeringProfileWithAiIntent(text)) {
   // P0.2(#51): 场景→工具静态决策地图。必须保持**字节稳定**（纯字面量、零动态插值）——
   // 该文本随 system 前缀进 prompt cache，任何动态内容都会击穿缓存。精炼映射，不是禁令。
   return "\n\n🔧 **动态工具编排**：所有已注册工具都能由语义编排器随用户目标、新证据和当前阶段装入。别因为开局窗口里不显示某个工具就假设它不可用；根据真实结果继续执行，已知精确工具名时也可用 search_tools 请求装入（支持自然语言能力描述的模糊搜索，如「数据库查询」）。" +
-    "\n\n🗺️ **场景→工具直觉**：做/改任何看得见的界面（网站、Web 应用、桌面 GUI、控制面板、单个组件）→ 先 knowledge_search(domain 传 michael-design) 取本品类蓝图，照命中的配色与构图做，别凭印象编色和间距；查符号定义→find_symbol；查谁调用→lsp_references；陌生库初探→semantic_search；代码历史/为什么这样写→git_blame/git_log；数据库结构→db_query 直连；技术选型/踩坑→developer_community_search；页面卡顿→performance_profile；已知工具名未装载→search_tools。用对专用工具比 read/grep 蛮力快数倍。" +
+    "\n\n🗺️ **场景→工具直觉**：做/改任何看得见的界面（网站、Web 应用、桌面 GUI、控制面板、单个组件）→ 先 knowledge_search(domain 传 michael-design) 取本品类蓝图，照命中的配色与构图做，别凭印象编色和间距；查符号定义→find_symbol；查谁调用→lsp_references；第三方库的真实签名→package_source（读本项目实际装的那个版本；search/find_files/semantic_search 都跳过 node_modules，查不到）；库的版本/废弃→package_search；代码历史/为什么这样写→git_blame/git_log；数据库结构→db_query 直连；技术选型/踩坑→developer_community_search；页面卡顿→performance_profile；已知工具名未装载→search_tools。用对专用工具比 read/grep 蛮力快数倍。" +
     // 全量名录。没有它，开局窗口外的工具模型既叫不出名字、search_tools 又是精确名查找，
     // 于是够得着的只有开局那十来个。字节稳定，可以待在 cache 前缀里。
     "\n\n📚 **完整能力名录（全部可用，按名字直接调用即可自动装载；不在开局窗口里不代表不能用）**\n" +
@@ -49317,7 +49518,12 @@ async function _executeToolStepInner(step, call, root, run) {
                   const _found = [];
                   for (const r of _allRoots()) { try { (await _agentFindFiles(r, _base)).files?.forEach((f) => _found.push(r + "/" + f)); } catch {} }
                   if (_found.length) helpHint = `\nnode_modules 内路径经常变（版本号/目录结构不同）。找到同名文件的真实路径：\n${_found.slice(0, 8).join("\n")}\n——用上面的完整路径重读。`;
-                  else helpHint = `\nnode_modules 内找不到 ${_base}。可能还没装依赖（先跑 npm/pnpm install）或包名不对。`;
+                  // 这句以前是「可能还没装依赖（先跑 npm/pnpm install）」——而它**必然**
+                  // 出现：上面那个查找函数的忽略表第一项就是 node_modules，所以永远返回空。
+                  // 依赖装得好好的，却在最容易幻觉的那一秒往模型嘴里塞了个假事实。
+                  else helpHint = `\n（按文件名没搜到——搜索层刻意跳过 node_modules，所以这不代表没装。）`
+                    + `\n要看某个依赖的真实 API，用 package_source(package="包名")：它直接读本机装的那一份，`
+                    + `\n带版本号和真实路径；要确认包本身存不存在用 package_search。`;
                 }
               } catch {}
             } else {
@@ -52339,6 +52545,99 @@ ${bodyPreview}`)}</pre>`;
         res.className = "atc-result atc-result--err"; res.textContent = "Figma 失败";
         return { type: "figma", path: call.url || "", content: `[FIGMA] 处理出错：${msg}` };
       }
+
+    } else if (call.type === "package_source") {
+      /*
+       * 全程用 readDir / readTextFile 自己走，不碰任何带忽略表的检索——那些表里
+       * 除了 node_modules 还有 dist，而绝大多数包的 .d.ts 恰好在 dist/ 底下。
+       */
+      const pkg = String(call.package || call.path || "").trim();
+      if (!pkg) {
+        res.className = "atc-result atc-result--err"; res.textContent = "缺包名";
+        return { type: "package_source", path: "", ok: false, content: "[失败] package_source 需要 package 参数（包名）。" };
+      }
+      const wantSymbol = String(call.symbol || "").trim();
+      const roots = call.root ? [String(call.root)] : _allRoots();
+      let hit = null;
+      for (const r of roots) {
+        hit = await _resolvePackageDir(r, pkg);
+        if (hit) break;
+      }
+      if (!hit) {
+        res.className = "atc-result atc-result--err"; res.textContent = "未安装";
+        // 说"没装"，不说"可能没装"——这里是确定的：所有候选目录都翻过了。
+        return { type: "package_source", path: pkg, ok: false,
+          content: `[未安装] 这些工作区里都找不到「${pkg}」的实体目录（node_modules / site-packages 都翻过了）。`
+            + `\n它可能确实没装（先装依赖），也可能包名和 import 名不一致。`
+            + `\n要确认这个包存不存在、最新什么版本，用 package_search；那是注册表元数据，和本机装没装无关。` };
+      }
+      const version = await _packageInstalledVersion(hit.dir, hit.eco);
+      const files = await _collectPackageFiles(hit.dir);
+      const head = `包「${pkg}」${version ? `@${version}` : "（版本号未取到）"}　来源：${hit.eco}\n真实路径：${hit.dir}\n`;
+
+      if (!wantSymbol) {
+        // 概览：导出名清单 + 类型入口。目的是让模型知道"有哪些东西"，再决定看哪个。
+        const names = new Set();
+        let scanned = 0;
+        for (const f of files.slice(0, 12)) {
+          try {
+            const text = await backend.readTextFile(f);
+            if (text.length > _pkgSrcMaxBytes(f)) continue;
+            scanned++;
+            for (const n of _extractExportNames(text)) names.add(n);
+          } catch {}
+        }
+        const list = [...names].sort().slice(0, 200);
+        res.className = "atc-result atc-result--ok"; res.textContent = `${list.length} 个导出`;
+        return { type: "package_source", path: pkg, ok: true, content: head
+          + `\n扫了 ${scanned} 个源文件（共发现 ${files.length} 个）。导出名（${list.length}）：\n`
+          + (list.length ? list.join("、") : "（没抽到导出名——这个包可能是纯运行时产物，用 symbol 参数直接查你要的名字更靠谱）")
+          + `\n\n要看某个导出的真实签名，带上 symbol 再调一次。` };
+      }
+
+      // 符号模式：找定义所在行，连上下文一起回——只给坐标的话模型多半不会再读一次。
+      const hits = [];
+      /*
+       * 判据是"名字前面有声明关键字"，而不是"名字出现过"——后者会命中一堆注释和调用点。
+       *
+       * `declare` 必须单列一支：`.d.ts` 里最常见的写法是
+       *     declare function invoke<T>(cmd: string, ...): Promise<T>;
+       *     export { invoke };
+       * 也就是**声明和导出分开写**。只认 `export function` 的话，@tauri-apps/api 这种
+       * 桶文件包一个符号都查不到（实测就是这么漏的）。
+       */
+      const esc = wantSymbol.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      const DECL = "(?:function|const|let|var|class|interface|type|enum)";
+      const defRe = new RegExp(
+        "(?:"
+        + `export\\s+(?:declare\\s+)?(?:async\\s+)?${DECL}\\s+`   // export function X / export const X
+        + `|declare\\s+(?:async\\s+)?${DECL}\\s+`                   // declare function X（随后 export { X }）
+        + `|^\\s*(?:async\\s+)?${DECL}\\s+`                         // 顶层 function X / class X
+        + "|(?:async\\s+)?def\\s+"                                  // Python
+        + "|pub\\s+(?:fn|struct|enum|trait|type)\\s+"                // Rust
+        + ")" + esc + "\\b",
+        "m",
+      );
+      for (const f of files) {
+        if (hits.length >= 3) break;
+        let text;
+        try { text = await backend.readTextFile(f); } catch { continue; }
+        if (!text || text.length > _pkgSrcMaxBytes(f)) continue;
+        const lines = text.split(/\r?\n/);
+        for (let n = 0; n < lines.length && hits.length < 3; n++) {
+          if (!defRe.test(lines[n])) continue;
+          const from = Math.max(0, n - 3);
+          const to = Math.min(lines.length, n + _PKG_SRC_CONTEXT_LINES);
+          hits.push(`--- ${f}:${n + 1} ---\n${lines.slice(from, to).join("\n")}`);
+        }
+      }
+      res.className = hits.length ? "atc-result atc-result--ok" : "atc-result atc-result--err";
+      res.textContent = hits.length ? `${hits.length} 处定义` : "没找到该导出";
+      return { type: "package_source", path: `${pkg}#${wantSymbol}`, ok: hits.length > 0, content: head
+        + (hits.length
+          ? `\n「${wantSymbol}」的定义（这一份就是本项目实际装的版本，以它为准）：\n\n${hits.join("\n\n")}`
+          : `\n在这个包里没找到导出「${wantSymbol}」。不带 symbol 再调一次可以看到它到底导出了哪些名字——`
+            + `记忆里的名字属于别的大版本，是最常见的原因。`) };
 
     } else if (call.type === "package_search" || call.type === "github_search" || call.type === "github_repo" || call.type === "gitlab_repo" || call.type === "gitee_repo" || call.type === "codeberg_repo" || call.type === "cve_search" || call.type === "wiki_search" || call.type === "stackoverflow_search" || call.type === "hackernews_search" || call.type === "developer_community_search" || call.type === "pubmed_search" || call.type === "arxiv_search" || call.type === "crossref_search" || call.type === "openalex_search" || call.type === "pubchem_search" || call.type === "clinical_trials_search" || call.type === "mdn_search" || call.type === "bundlephobia_search" || call.type === "steam_search" || call.type === "iconify_search" || call.type === "codrops_search" || call.type === "smashingmag_search" || call.type === "awwwards_search") {
       if (!inTauri) { res.className = "atc-result atc-result--err"; res.textContent = "桌面专用"; return { type: call.type, path: "", content: "[不可用] 知识库搜索只能在桌面 App 里用。" }; }
