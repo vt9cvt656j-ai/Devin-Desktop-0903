@@ -45667,11 +45667,23 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
       //
       // 事实本身是有价值的（省掉一轮瞎探），有害的是那层「已经在干活了，接着干」的框架。
       // 所以按有没有真实动作分两种说法，facts-only 那支绝不声称有未完成的动作。
+      // 一轮动作都没有时**整块不发**。
+      //
+      // 上一版只改了措辞（把标题从「执行状态」改成「项目环境事实」、把「接着完成尚未完成的
+      // 动作」换成「用户这一轮的请求就在上面的对话里」），位置照旧留在消息序列**最后一条**。
+      // 结果更糟：模型照着那句去"上面"翻找，然后在自己的思考里写下——
+      //     「我看到的只是系统注入的环境信息，没有看到用户的实际请求」
+      //     「最后有环境信息注入」「而最后的系统注入说『用户这一轮的请求就在上面的对话里』」
+      // 网关侧的字节数对得上：marked_request_bytes=83（你的问题在），last_user_bytes=2335
+      // （最后一条是这块环境事实）。也就是说问题确实发出去了，但被这 2.3KB 压在了后面。
+      //
+      // 而这个产品自己的注释早就写下了相反的原则（见发送路径 _requestFrame 那段）：
+      //     Put the user's ACTUAL request LAST — recency = the model's highest-attention slot
+      // 环境事实是锦上添花（省一轮瞎探），用户的问题在最后一位是刚需。真有活干到一半时这块
+      // 才有意义——那时它描述的是**已经发生的事**，不会和用户的话争最后一位。
       const _hasRunActivity = !!(_mutatedFiles.size || _readFiles.size || _evidenceBlock || _latestDiagBlock);
-      if (_hasRunActivity || _runtimeStateBlock) {
-        const _parts = [_ORCH_NOTE + (_hasRunActivity
-          ? "〔执行状态·不要从头重查〕"
-          : "〔项目环境事实·本次运行还没有任何动作，下面只是给你选工具用的静态事实，不代表有活干到一半〕")];
+      if (_hasRunActivity) {
+        const _parts = [_ORCH_NOTE + "〔执行状态·不要从头重查〕"];
         if (_mutatedFiles.size) {
           // 长任务写几十个文件后这行会无界膨胀，挤占尾部最高注意力位：只报最近 20 个，
           // 其余给计数——“别重建旧文件”的约束靠近期清单就够，全量清单磁盘上随时可查。
@@ -45683,12 +45695,7 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
         if (_runtimeStateBlock) _parts.push(_runtimeStateBlock);
         if (_evidenceBlock) _parts.push(_evidenceBlock);
         if (_latestDiagBlock) _parts.push(_latestDiagBlock);
-        _parts.push("目标文件/终端/API/DB线索已经知道时直接用对应工具读取，不要再用 search/find/cd/ls 绕一圈；只有位置未知时才搜索一次定位。若实时诊断、终端、日志、HTTP 或数据库返回 error，先解释根因并修掉再收尾；不要带着红线/红日志声称完成。"
-          + (_hasRunActivity
-            ? "接着完成尚未完成的动作。"
-            // 没有任何动作时绝不能说「接着完成」——那是在凭空断言有活干到一半，
-            // 而这条又坐在最高注意力位，模型会照着它去摸项目，把用户真正问的那句盖掉。
-            : "用户这一轮的请求就在上面的对话里，照它做；上面这些只是环境事实，本身不构成任务，也不要因为它们去主动摸项目。"));
+        _parts.push("目标文件/终端/API/DB线索已经知道时直接用对应工具读取，不要再用 search/find/cd/ls 绕一圈；只有位置未知时才搜索一次定位。若实时诊断、终端、日志、HTTP 或数据库返回 error，先解释根因并修掉再收尾；不要带着红线/红日志声称完成。接着完成尚未完成的动作。");
         _selfMemMsg = { role: "user", content: _parts.join("\n") };
         messages.push(_selfMemMsg);
       }
