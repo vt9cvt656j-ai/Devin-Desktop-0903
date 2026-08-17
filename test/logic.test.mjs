@@ -290,6 +290,12 @@ AUTO_LOAD_DEPS = {
   // 都调它，抠出任何一个的测试都需要——少了是 ReferenceError，表现成"这个测试挂了"
   // 而不是"命令没认出来"。给真实现，不给桩。
   _stripHarmlessRedirects: load("_stripHarmlessRedirects", {}),
+  // 容器自愈：_coerceSchemaTypes 现在会调它（headers 被塞成 JSON 字符串 / 键值对数组
+  // 这类包装错误，以前一律拒绝执行）。抠 _coerceSchemaTypes 的测试不止一处，少了它是
+  // ReferenceError，表现成"这个测试挂了"而不是"参数没被扶正"。
+  _coerceContainerBySchema: load("_coerceContainerBySchema", {
+    _safeJsonLoose: load("_safeJsonLoose", {}),
+  }),
   _TAURI_BUILD_RE: new Function(`${/const _TAURI_BUILD_RE = [^\n]+/.exec(SRC)[0]}\n;return _TAURI_BUILD_RE;`)(),
   _PACKAGE_CMD_RE: new Function(`${/const _PACKAGE_CMD_RE = [^\n]+/.exec(SRC)[0]}\n;return _PACKAGE_CMD_RE;`)(),
   // 完整能力名录（真的那份，不是桩）：_buildToolHint 把它拼进随 system 前缀发送的提示。
@@ -25407,4 +25413,52 @@ test("每轮重扫整个项目要按工作区变更缓存，别每步都愣一�
     /await _promiseOrFallbackWithin\(_agentRuntimeStateBlock/,
     "缓存外面还留着一次无条件调用",
   );
+});
+
+test("工具参数：包装错了的容器要静默扶正，别拿它去折磨模型", () => {
+  const loose = load("_safeJsonLoose", {});
+  const deps = {
+    _coerceScalarBySchema: load("_coerceScalarBySchema", {}),
+    _coerceContainerBySchema: load("_coerceContainerBySchema", { _safeJsonLoose: loose }),
+  };
+  const coerce = load("_coerceSchemaTypes", deps);
+  deps._coerceSchemaTypes = coerce;
+  const coerceSelf = load("_coerceSchemaTypes", deps);
+  const validate = load("_schemaValueIssue", {});
+  // http_request 的真实形状：headers 是自由键值表，值必须是字符串。
+  const params = {
+    type: "object",
+    properties: {
+      method: { type: "string" },
+      url: { type: "string" },
+      headers: { type: "object", additionalProperties: { type: "string" } },
+      timeout_secs: { type: "integer" },
+    },
+    required: ["url"],
+  };
+  const fixed = (args) => { coerceSelf(args, params); return { issue: validate(args, params), args }; };
+  void coerce;
+
+  // 用户实测撞到的那条：headers 被塞成 JSON 字符串 → 以前 [tool-args-invalid]，重试三次作废
+  const a = fixed({ url: "http://x", headers: '{"Accept":"application/json"}' });
+  assert.equal(a.issue, "", `JSON 字符串形式的 headers 还在被拒：${a.issue}`);
+  assert.deepEqual(a.args.headers, { Accept: "application/json" });
+
+  // 键值对数组 / 二元组数组
+  assert.equal(fixed({ url: "http://x", headers: [{ name: "Accept", value: "json" }] }).issue, "");
+  assert.equal(fixed({ url: "http://x", headers: [["Accept", "json"]] }).issue, "");
+
+  // additionalProperties 下的值此前完全没被走到：只认 schema.properties
+  const d = fixed({ url: "http://x", headers: { "X-Count": 5 } });
+  assert.equal(d.issue, "", `自由键值表里的数字还在被拒：${d.issue}`);
+  assert.equal(d.args.headers["X-Count"], "5", "值该被转成字符串");
+
+  // 标量自愈不能被这次改动弄丢
+  assert.equal(fixed({ url: "http://x", timeout_secs: "30" }).issue, "");
+
+  // 只做无歧义的转换：形状对不上就原样退回去报错，不许瞎猜
+  const bad = fixed({ url: "http://x", headers: [{ name: "Accept", value: "json" }, { foo: 1 }] });
+  assert.match(bad.issue, /必须是对象/, "有一项对不上就该整体放弃，不能悄悄把它丢掉");
+  const notJson = fixed({ url: "http://x", headers: "Accept: application/json" });
+  assert.match(notJson.issue, /必须是对象/, "不是 JSON 的字符串也被当成对象了");
 });

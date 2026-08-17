@@ -32413,14 +32413,58 @@ function _coerceScalarBySchema(v, schema) {
   if (t === "string" && typeof v === "number" && Number.isFinite(v)) return String(v);
   return undefined;
 }
+// 结构自愈：把"显然是同一个东西、只是包装错了"的容器转正。
+//
+// 标量自愈已经在治 "1280"→1280 这类小错，但模型更常犯的是**容器**层面的：
+//   headers: "{\"Accept\":\"x\"}"            —— 整个对象被塞成 JSON 字符串
+//   headers: [{name:"Accept",value:"x"}]     —— 写成键值对数组
+//   headers: [["Accept","x"]]                —— 写成二元组数组
+//   headers: {"X-Count": 5}                  —— 值该是字符串却给了数字
+// 这些以前一律 [tool-args-invalid]，重试三次还不中就整轮作废、未写盘——用户看到的是
+// 「AI 连参数都补不齐」。它们全都能无歧义地还原成正确形状，那就别拿它去折磨模型。
+// 只做无歧义的转换：一个 JSON 字符串解析出来不是期望的类型，就原样退回去让校验报错。
+function _coerceContainerBySchema(v, schema) {
+  const t = schema && schema.type;
+  if (t === "object") {
+    if (typeof v === "string" && v.trim().startsWith("{")) {
+      const parsed = _safeJsonLoose(v);
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) return parsed;
+      return undefined;
+    }
+    if (Array.isArray(v)) {
+      const out = {};
+      for (const item of v) {
+        if (Array.isArray(item) && item.length === 2 && typeof item[0] === "string") {
+          out[item[0]] = item[1];
+          continue;
+        }
+        if (item && typeof item === "object" && !Array.isArray(item)) {
+          const k = item.name ?? item.key ?? item.field;
+          const val = item.value ?? item.val ?? item.content;
+          if (typeof k === "string" && k && val !== undefined) { out[k] = val; continue; }
+        }
+        return undefined; // 有一项对不上就整体不猜
+      }
+      return Object.keys(out).length ? out : undefined;
+    }
+    return undefined;
+  }
+  if (t === "array" && typeof v === "string" && v.trim().startsWith("[")) {
+    const parsed = _safeJsonLoose(v);
+    return Array.isArray(parsed) ? parsed : undefined;
+  }
+  return undefined;
+}
 function _coerceSchemaTypes(value, schema) {
   if (!value || !schema || typeof value !== "object") return value;
   if (Array.isArray(value)) {
     if (schema.items) {
       for (let i = 0; i < value.length; i++) {
         const fixed = _coerceScalarBySchema(value[i], schema.items);
-        if (fixed !== undefined) value[i] = fixed;
-        else _coerceSchemaTypes(value[i], schema.items);
+        if (fixed !== undefined) { value[i] = fixed; continue; }
+        const shaped = _coerceContainerBySchema(value[i], schema.items);
+        if (shaped !== undefined) { value[i] = shaped; _coerceSchemaTypes(value[i], schema.items); continue; }
+        _coerceSchemaTypes(value[i], schema.items);
       }
     }
     return value;
@@ -32428,8 +32472,26 @@ function _coerceSchemaTypes(value, schema) {
   for (const [key, child] of Object.entries(schema.properties || {})) {
     if (!Object.prototype.hasOwnProperty.call(value, key) || value[key] == null || !child) continue;
     const fixed = _coerceScalarBySchema(value[key], child);
-    if (fixed !== undefined) value[key] = fixed;
-    else if (typeof value[key] === "object") _coerceSchemaTypes(value[key], child);
+    if (fixed !== undefined) { value[key] = fixed; continue; }
+    // 容器先扶正，再递归进去修里面的标量：headers 从 JSON 字符串还原成对象之后，
+    // 里面那个写成数字的值还得靠 additionalProperties 那一段转成字符串。
+    const shaped = _coerceContainerBySchema(value[key], child);
+    if (shaped !== undefined) value[key] = shaped;
+    if (typeof value[key] === "object") _coerceSchemaTypes(value[key], child);
+  }
+  // additionalProperties（headers 这种自由键值表）此前完全没被走到：上面的循环只认
+  // schema.properties，于是 {"X-Count": 5} 里的数字永远没人转成字符串。
+  const extra = schema.additionalProperties;
+  if (extra && typeof extra === "object") {
+    const declared = new Set(Object.keys(schema.properties || {}));
+    for (const key of Object.keys(value)) {
+      if (declared.has(key) || value[key] == null) continue;
+      const fixed = _coerceScalarBySchema(value[key], extra);
+      if (fixed !== undefined) { value[key] = fixed; continue; }
+      const shaped = _coerceContainerBySchema(value[key], extra);
+      if (shaped !== undefined) value[key] = shaped;
+      if (typeof value[key] === "object") _coerceSchemaTypes(value[key], extra);
+    }
   }
   return value;
 }
