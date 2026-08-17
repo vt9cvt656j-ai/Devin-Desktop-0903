@@ -41826,7 +41826,10 @@ async function _detectVerifyCmdRaw(root, stack = null) {
         return `${py} -m compileall -q .`;
       }
     }
-    return "python3 -m compileall -q .";
+    // Windows 上 python3 不是命令（python.org 的包只产出 python.exe；同名的 python3.exe
+    // 是微软商店的应用执行别名，跑它会弹商店）。这条是"收尾必跑"的验证命令，给错了等于
+    // 每次收尾都失败一次。
+    return `${_isWin ? "python" : "python3"} -m compileall -q .`;
   }
   return null;
 }
@@ -52398,7 +52401,8 @@ return { type: call.type, path: call.query || "", content: `[失败] ${call.type
         const st = await backend.proxyStatus();
         if (!st.mitmdump) {
           res.className = "atc-result atc-result--err"; res.textContent = "需装 mitmproxy";
-          return { type: "capture_start", path: "", content: "[需先安装抓包引擎 mitmproxy] 请让用户在终端执行：\n  brew install mitmproxy   （或 pipx install mitmproxy / pip install --user mitmproxy）\n装好后再调用 capture_start。" };
+          // 这句话会被模型原样转述给用户。Windows 上没有 brew，转述过去就是一条跑不了的命令。
+          return { type: "capture_start", path: "", content: `[需先安装抓包引擎 mitmproxy] 请让用户在终端执行：\n  ${_captureInstallCmd()}\n装好后再调用 capture_start。` };
         }
         const port = call.port > 0 ? call.port : 8080;
         const captureMode = _resolveCaptureStartMode(call, run);
@@ -52419,7 +52423,7 @@ return { type: call.type, path: call.query || "", content: `[失败] ${call.type
         }
         let sys = "";
         if (call.systemProxy) {
-          try { await backend.proxySetSystemProxy(true, port); _captureSystemProxyEnabled = true; sys = `\n已自动把 macOS 系统代理指向 127.0.0.1:${port}（capture_stop 会自动关闭）。`; }
+          try { await backend.proxySetSystemProxy(true, port); _captureSystemProxyEnabled = true; sys = `\n已自动把系统代理指向 127.0.0.1:${port}（capture_stop 会自动关闭）。`; }
           catch (e) { sys = `\n（自动设系统代理失败：${String(e?.message || e).slice(0,120)}；让用户手动把系统/浏览器代理设为 127.0.0.1:${port}）`; }
         } else if (captureMode.mode === "isolated_browser") {
           sys = `\n模式：无痕/隔离浏览器抓包——未修改系统代理；接下来 browser navigate(fresh:true) 会自动走 127.0.0.1:${port}。`;
@@ -52427,9 +52431,15 @@ return { type: call.type, path: call.query || "", content: `[失败] ${call.type
           sys = `\n模式：后台抓包——未修改系统代理；目标程序需手动设置代理，或用 background_monitor(check_type:"capture") 等待匹配流量。`;
         }
         const ca = await backend.proxyCaPath().catch(() => null);
+        // 这段是**直接进模型上下文**的：写错了模型就照着它指挥用户去跑一条不存在的命令、
+        // 去打开一个不存在的「钥匙串访问」。两个平台是两套完全不同的东西。
         const caLine = ca
-          ? `\n抓 HTTPS 需信任 CA 证书（一次即可）——让用户执行：\n  sudo security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain "${ca}"`
-          : `\n首次启动会在 ~/.mitmproxy/ 生成 CA 证书；抓 HTTPS 前需让用户信任它（钥匙串设“始终信任”，或用 sudo security add-trusted-cert）。`;
+          ? (_isWin
+            ? `\n抓 HTTPS 需信任 CA 证书（一次即可）——让用户在管理员终端执行：\n  certutil -addstore -f Root "${ca}"`
+            : `\n抓 HTTPS 需信任 CA 证书（一次即可）——让用户执行：\n  sudo security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain "${ca}"`)
+          : (_isWin
+            ? `\n首次启动会在 %USERPROFILE%\\.mitmproxy\\ 生成 CA 证书；抓 HTTPS 前需让用户把它装进「受信任的根证书颁发机构」（certutil -addstore -f Root <证书路径>）。`
+            : `\n首次启动会在 ~/.mitmproxy/ 生成 CA 证书；抓 HTTPS 前需让用户信任它（钥匙串设“始终信任”，或用 sudo security add-trusted-cert）。`);
         res.className = "atc-result atc-result--ok"; res.textContent = `${captureMode.label} :${port}`;
         return { type: "capture_start", path: String(port), captureMode: captureMode.mode, content: `✅ ${captureMode.label}已启动，代理 127.0.0.1:${port}。${sys}${caLine}\n\n下一步：${captureMode.next}\n产生流量后调用 capture_flows 读真实请求。` };
       } catch (e) {
@@ -55574,12 +55584,12 @@ async function _stopCaptureRuntime(run = null) {
 function _captureOfferInstall() {
   showNotification({
     title: "未安装 mitmproxy（抓包引擎）",
-    message: "抓包基于 mitmproxy。点“安装”会在终端运行 brew install mitmproxy（或 pipx / pip 兜底），装好后再点“启动抓包”。",
+    message: `抓包基于 mitmproxy。点“安装”会在终端运行 ${_captureInstallCmd()}，装好后再点“启动抓包”。`,
     actionLabel: "安装",
     duration: 20000,
     action: async () => {
       await openTerminal();
-      writeToActiveTerminal("brew install mitmproxy 2>/dev/null || pipx install mitmproxy 2>/dev/null || pip install --user mitmproxy\n");
+      writeToActiveTerminal(_captureInstallCmd() + "\n");
     },
   });
 }
@@ -55601,22 +55611,45 @@ async function _captureStop() {
   if (!featureOverlay.hidden && activeFeatureTab === "capture") renderFeaturePanel();
 }
 
+/*
+ * 装 mitmproxy 的命令，按平台。
+ *
+ * 原来只有一条 macOS 的：`brew install mitmproxy 2>/dev/null || pipx … || pip …`。Windows 上
+ * 两处都不成立——brew 不存在，而 `2>/dev/null` 在 cmd 里不是"丢弃错误输出"，是往 `.\dev\null`
+ * 这个不存在的目录写文件。这条命令既会打进终端，也会被模型原样转述给用户。
+ */
+function _captureInstallCmd() {
+  if (_isWin) return "winget install -e --id mitmproxy.mitmproxy";
+  return "brew install mitmproxy 2>/dev/null || pipx install mitmproxy 2>/dev/null || pip install --user mitmproxy";
+}
+
 async function _captureTrustCert() {
   try {
     const p = await backend.proxyCaPath();
     if (!p) { showToast("CA 证书还没生成——先启动一次抓包，mitmproxy 会创建 ~/.mitmproxy/ 证书"); return; }
-    // Open the cert so the user can add + trust it in 钥匙串访问 (double-click → 始终信任).
-    // 路径来自我们自己的 Rust（proxyCaPath），不是外部可控——但仍然用单引号转义走，
-    // 别在代码里留下「拼 shell 是可以的」这个先例。同理不再把 cwd 传成 "/"。
-    try { await backend.taskRunCapture(_knownWorkspaceRoots()[0] || ".", `open ${shellQuote(p)}`); } catch {}
+    // 用系统默认程序打开证书。命令按平台分：macOS 是 open，Windows 是 start（cmd 内建，
+    // 所以要 `cmd /c start ""`），Linux 是 xdg-open。以前只写了 open——Windows 上这条命令
+    // 不存在，失败又被 catch 吞掉，于是通知照样弹「已打开证书」，而用户什么也没看到。
+    // 路径来自我们自己的 Rust（proxyCaPath），不是外部可控——但仍然转义走，别在代码里
+    // 留下「拼 shell 是可以的」这个先例。
+    const openCmd = _isWin
+      ? `cmd /c start "" ${shellQuote(p)}`
+      : `${navigator.platform && navigator.platform.startsWith("Mac") ? "open" : "xdg-open"} ${shellQuote(p)}`;
+    try { await backend.taskRunCapture(_knownWorkspaceRoots()[0] || ".", openCmd); } catch {}
     showNotification({
       title: "信任抓包 CA 证书",
-      message: `已打开证书 ${p}。在“钥匙串访问”里把它加到“系统”钥匙串并设为“始终信任”，HTTPS 才能解密。点“自动信任”可尝试直接安装（需要输入密码）。`,
+      message: _isWin
+        ? `已打开证书 ${p}。在向导里选「本地计算机」→「受信任的根证书颁发机构」，装完 HTTPS 才能解密。点「自动信任」可用命令直接装（会弹管理员确认）。`
+        : `已打开证书 ${p}。在“钥匙串访问”里把它加到“系统”钥匙串并设为“始终信任”，HTTPS 才能解密。点“自动信任”可尝试直接安装（需要输入密码）。`,
       actionLabel: "自动信任",
       duration: 30000,
       action: async () => {
         await openTerminal();
-        writeToActiveTerminal(`sudo security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain "${p}"\n`);
+        // 两个平台是两套完全不同的东西：macOS 是钥匙串 + security 命令，Windows 是证书
+        // 存储 + certutil。以前只发 macOS 那条，Windows 上第一句 `sudo` 就不认识。
+        writeToActiveTerminal(_isWin
+          ? `certutil -addstore -f Root ${shellQuote(p)}\n`
+          : `sudo security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain "${p}"\n`);
       },
     });
   } catch (e) { showToast("获取证书失败：" + (e?.message || e)); }
@@ -58605,6 +58638,9 @@ function runCommandForFile(path) {
       return `${_isWin ? "py -3" : "python3"} ${q}`;
     case "sh":
     case "bash":
+      // Windows 上没有 bash，除非装了 Git for Windows。装了的话它在 PATH 上，这条照样成立；
+      // 没装就让 shell 自己报"不是内部或外部命令"——那句话用户看得懂，比我们瞎猜一个
+      // 解释器（比如硬塞 PowerShell 去跑 .sh）强。
       return `bash ${q}`;
     case "zsh":
       return `zsh ${q}`;
@@ -64596,15 +64632,27 @@ function _scheduleTermRefresh() {
 }
 
 // ---- new project templates ----
+/*
+ * 模板里那些"种子文件"以前是拿 `echo '多行\n内容' > file` 在 shell 里写出来的。两个平台
+ * 都靠不住：cmd 不把单引号当引号、也不认 `\n` 转义，写出来的是一坨带引号的垃圾**而退出码
+ * 是 0**（用户只看到项目建好了，打开一看内容全乱）；就算在 macOS 上，那也依赖 sh 内建
+ * echo 恰好解释 `\n`，换个 shell 就不成立。
+ *
+ * 现在 shell 只跑非它不可的部分（脚手架、装依赖），种子文件交给后端按路径写——两个平台
+ * 同一条路，也不用再跟引号转义搏斗。
+ *
+ * 命令里的 {{PY}} / {{ACTIVATE}} 按平台展开：Windows 上 python.org 的包只产出 python.exe
+ * （python3 是微软商店的别名），venv 的激活脚本也在 Scripts\ 而不是 bin/。
+ */
 const PROJECT_TEMPLATES = [
   { name: "React (Vite)", desc: "现代前端 SPA，适合快速做管理台、官网和工具页", tag: "Frontend", cmd: "npm create vite@latest {{name}} -- --template react && cd {{name}} && npm install", icon: "react" },
   { name: "React + TypeScript", desc: "类型安全的 React 项目，适合中大型前端工程", tag: "TypeScript", cmd: "npm create vite@latest {{name}} -- --template react-ts && cd {{name}} && npm install", icon: "react-ts" },
   { name: "Vue 3 (Vite)", desc: "轻量易维护，适合后台、组件化页面和渐进式应用", tag: "Frontend", cmd: "npm create vite@latest {{name}} -- --template vue && cd {{name}} && npm install", icon: "vue" },
   { name: "Svelte (Vite)", desc: "编译型前端框架，运行时代码少，交互体验轻快", tag: "Frontend", cmd: "npm create vite@latest {{name}} -- --template svelte && cd {{name}} && npm install", icon: "svelte" },
   { name: "Next.js", desc: "React 全栈框架，适合 SSR、SEO、官网和 SaaS 应用", tag: "Full-stack", cmd: "npx create-next-app@latest {{name}} --use-npm", icon: "next" },
-  { name: "Flask (Python)", desc: "Python 轻量 Web 服务，适合 API 原型和小型后端", tag: "Backend", cmd: "mkdir {{name}} && cd {{name}} && python3 -m venv .venv && source .venv/bin/activate && pip install flask && echo 'from flask import Flask\\napp = Flask(__name__)\\n\\n@app.route(\"/\")\\ndef index():\\n    return \"Hello World\"\\n\\nif __name__ == \"__main__\":\\n    app.run(debug=True)' > app.py", icon: "flask" },
-  { name: "FastAPI (Python)", desc: "高性能 Python API，适合数据接口和 AI 服务后端", tag: "API", cmd: "mkdir {{name}} && cd {{name}} && python3 -m venv .venv && source .venv/bin/activate && pip install fastapi uvicorn && echo 'from fastapi import FastAPI\\napp = FastAPI()\\n\\n@app.get(\"/\")\\ndef root():\\n    return {\"message\": \"Hello World\"}' > main.py", icon: "fastapi" },
-  { name: "Express (Node.js)", desc: "Node.js 经典后端框架，适合 REST API 和轻量服务", tag: "Backend", cmd: "mkdir {{name}} && cd {{name}} && npm init -y && npm install express && echo 'const express = require(\"express\");\\nconst app = express();\\napp.get(\"/\", (req, res) => res.json({ message: \"Hello World\" }));\\napp.listen(3000, () => console.log(\"Server on http://localhost:3000\"));' > index.js", icon: "express" },
+  { name: "Flask (Python)", desc: "Python 轻量 Web 服务，适合 API 原型和小型后端", tag: "Backend", cmd: "mkdir {{name}} && cd {{name}} && {{PY}} -m venv .venv && {{ACTIVATE}} && pip install flask", files: [{ path: "app.py", content: "from flask import Flask\napp = Flask(__name__)\n\n@app.route(\"/\")\ndef index():\n    return \"Hello World\"\n\nif __name__ == \"__main__\":\n    app.run(debug=True)\n" }], icon: "flask" },
+  { name: "FastAPI (Python)", desc: "高性能 Python API，适合数据接口和 AI 服务后端", tag: "API", cmd: "mkdir {{name}} && cd {{name}} && {{PY}} -m venv .venv && {{ACTIVATE}} && pip install fastapi uvicorn", files: [{ path: "main.py", content: "from fastapi import FastAPI\napp = FastAPI()\n\n@app.get(\"/\")\ndef root():\n    return {\"message\": \"Hello World\"}\n" }], icon: "fastapi" },
+  { name: "Express (Node.js)", desc: "Node.js 经典后端框架，适合 REST API 和轻量服务", tag: "Backend", cmd: "mkdir {{name}} && cd {{name}} && npm init -y && npm install express", files: [{ path: "index.js", content: "const express = require(\"express\");\nconst app = express();\napp.get(\"/\", (req, res) => res.json({ message: \"Hello World\" }));\napp.listen(3000, () => console.log(\"Server on http://localhost:3000\"));\n" }], icon: "express" },
   { name: "Tauri (Rust + React)", desc: "Rust + Web 的桌面应用方案，体积小、性能好", tag: "Desktop", cmd: "npm create tauri-app@latest {{name}} -- --template react --manager npm --yes", icon: "tauri" },
   { name: "Vue 3 + TypeScript", desc: "类型安全的 Vue 工程，适合中大型后台和组件库", tag: "TypeScript", cmd: "npm create vite@latest {{name}} -- --template vue-ts && cd {{name}} && npm install", icon: "vue" },
   { name: "Nuxt 3", desc: "Vue 全栈框架，SSR/SEO/服务端接口一体化", tag: "Full-stack", cmd: "npx nuxi@latest init {{name}} --packageManager npm --gitInit false --template v4", icon: "nuxt" },
@@ -64612,15 +64660,15 @@ const PROJECT_TEMPLATES = [
   { name: "Angular", desc: "企业级前端框架，全家桶齐全，适合大型团队工程", tag: "Frontend", cmd: "npx -y @angular/cli@latest new {{name}} --defaults --skip-git", icon: "angular" },
   { name: "Solid (Vite)", desc: "细粒度响应式框架，性能接近原生，API 类 React", tag: "Frontend", cmd: "npm create vite@latest {{name}} -- --template solid-ts && cd {{name}} && npm install", icon: "solid" },
   { name: "NestJS (Node.js)", desc: "工程化 Node 后端框架，依赖注入/模块化，适合中大型服务", tag: "Backend", cmd: "npx -y @nestjs/cli@latest new {{name}} --package-manager npm --skip-git", icon: "nest" },
-  { name: "Django (Python)", desc: "全功能 Python Web 框架，自带 ORM/后台，适合完整站点", tag: "Backend", cmd: "mkdir {{name}} && cd {{name}} && python3 -m venv .venv && source .venv/bin/activate && pip install django && django-admin startproject config .", icon: "django" },
-  { name: "Go (net/http)", desc: "Go 标准库 Web 服务，单二进制部署，适合高并发后端", tag: "Backend", cmd: "mkdir {{name}} && cd {{name}} && go mod init {{name}} && echo 'package main\\n\\nimport (\\n\\t\"fmt\"\\n\\t\"net/http\"\\n)\\n\\nfunc main() {\\n\\thttp.HandleFunc(\"/\", func(w http.ResponseWriter, r *http.Request) {\\n\\t\\tfmt.Fprintln(w, \"Hello World\")\\n\\t})\\n\\tfmt.Println(\"Server on http://localhost:8080\")\\n\\thttp.ListenAndServe(\":8080\", nil)\\n}' > main.go", icon: "go" },
+  { name: "Django (Python)", desc: "全功能 Python Web 框架，自带 ORM/后台，适合完整站点", tag: "Backend", cmd: "mkdir {{name}} && cd {{name}} && {{PY}} -m venv .venv && {{ACTIVATE}} && pip install django && django-admin startproject config .", icon: "django" },
+  { name: "Go (net/http)", desc: "Go 标准库 Web 服务，单二进制部署，适合高并发后端", tag: "Backend", cmd: "mkdir {{name}} && cd {{name}} && go mod init {{name}}", files: [{ path: "main.go", content: "package main\n\nimport (\n\t\"fmt\"\n\t\"net/http\"\n)\n\nfunc main() {\n\thttp.HandleFunc(\"/\", func(w http.ResponseWriter, r *http.Request) {\n\t\tfmt.Fprintln(w, \"Hello World\")\n\t})\n\tfmt.Println(\"Server on http://localhost:8080\")\n\thttp.ListenAndServe(\":8080\", nil)\n}\n" }], icon: "go" },
   { name: "Rust (Cargo)", desc: "Cargo 二进制项目，CLI、服务、系统工具通用起点", tag: "Backend", cmd: "cargo new {{name}}", icon: "rust" },
   { name: "Spring Boot (Java)", desc: "Java 企业级后端，自 start.spring.io 拉取官方骨架", tag: "Backend", cmd: "mkdir {{name}} && cd {{name}} && curl -fsSL 'https://start.spring.io/starter.tgz?type=maven-project&language=java&dependencies=web&name={{name}}&artifactId={{name}}' | tar -xz", icon: "spring" },
   { name: "Electron", desc: "Web 技术写跨平台桌面应用，生态成熟插件多", tag: "Desktop", cmd: "npx -y create-electron-app@latest {{name}}", icon: "electron" },
   { name: "Expo (React Native)", desc: "React 写 iOS/Android 原生应用，真机预览方便", tag: "Mobile", cmd: "npx -y create-expo-app@latest {{name}}", icon: "react" },
   { name: "Flutter", desc: "Dart 跨平台应用，一套代码 iOS/Android/桌面（需已装 Flutter SDK）", tag: "Mobile", cmd: "flutter create {{name}}", icon: "flutter" },
-  { name: "Node.js + TypeScript", desc: "TS 服务/工具库通用骨架，tsx 直接跑，零配置上手", tag: "TypeScript", cmd: "mkdir {{name}} && cd {{name}} && npm init -y && npm install -D typescript tsx @types/node && npx tsc --init --target es2022 --module nodenext && mkdir src && echo 'console.log(\"Hello World\");' > src/index.ts", icon: "express" },
-  { name: "Vanilla HTML/CSS/JS", desc: "无框架静态页面，适合练习、落地页和简单小工具", tag: "Web", cmd: "mkdir {{name}} && cd {{name}} && echo '<!DOCTYPE html>\\n<html lang=\"en\">\\n<head>\\n<meta charset=\"UTF-8\">\\n<meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\">\\n<title>{{name}}</title>\\n<link rel=\"stylesheet\" href=\"style.css\">\\n</head>\\n<body>\\n<h1>Hello World</h1>\\n<script src=\"main.js\"></script>\\n</body>\\n</html>' > index.html && echo 'body { font-family: system-ui; max-width: 800px; margin: 0 auto; padding: 20px; }' > style.css && echo 'console.log(\"Hello World\");' > main.js", icon: "vanilla" },
+  { name: "Node.js + TypeScript", desc: "TS 服务/工具库通用骨架，tsx 直接跑，零配置上手", tag: "TypeScript", cmd: "mkdir {{name}} && cd {{name}} && npm init -y && npm install -D typescript tsx @types/node && npx tsc --init --target es2022 --module nodenext", files: [{ path: "src/index.ts", content: "console.log(\"Hello World\");\n" }], icon: "express" },
+  { name: "Vanilla HTML/CSS/JS", desc: "无框架静态页面，适合练习、落地页和简单小工具", tag: "Web", cmd: "mkdir {{name}} && cd {{name}}", files: [{ path: "index.html", content: "<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n<meta charset=\"UTF-8\">\n<meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\">\n<title>{{name}}</title>\n<link rel=\"stylesheet\" href=\"style.css\">\n</head>\n<body>\n<h1>Hello World</h1>\n<script src=\"main.js\"></script>\n</body>\n</html>\n" }, { path: "style.css", content: "body { font-family: system-ui; max-width: 800px; margin: 0 auto; padding: 20px; }\n" }, { path: "main.js", content: "console.log(\"Hello World\");\n" }], icon: "vanilla" },
 ];
 
 function projectTemplateIcon(kind) {
@@ -64821,7 +64869,13 @@ async function showNewProjectDialog() {
       await _waitTermReady(3000);
       await new Promise((r) => setTimeout(r, 1800));
     }
-    const cmd = tmpl.cmd.replace(/\{\{name\}\}/g, shellQuote(name));
+    // {{PY}} / {{ACTIVATE}} 按平台展开。Windows 上 python.org 的安装包只产出 python.exe
+    // （同名的 python3.exe 是微软商店的应用执行别名，跑它会弹商店），venv 的激活脚本也在
+    // Scripts\ 底下而不是 bin/；`source` 更不是 cmd 的命令。
+    const cmd = tmpl.cmd
+      .replace(/\{\{PY\}\}/g, _isWin ? "python" : "python3")
+      .replace(/\{\{ACTIVATE\}\}/g, _isWin ? ".venv\\Scripts\\activate" : "source .venv/bin/activate")
+      .replace(/\{\{name\}\}/g, shellQuote(name));
     writeToActiveTerminal(`\n${_clearCmd}\ncd ${shellQuote(parentDirPath)} && ${cmd}\n`);
     showToast(`正在创建 ${tmpl.name} 项目：${projectPath}`);
     // 轮询项目目录出现（脚手架一建目录就打开，不等依赖装完），最多等 5 分钟。
@@ -64830,6 +64884,19 @@ async function showNewProjectDialog() {
       if (Date.now() - t0 > 5 * 60 * 1000) return;
       try {
         if (await _pathExistsAsDir(projectPath)) {
+          // 种子文件在这儿写，不在 shell 里 echo：目录一出现就写，两个平台同一条路，
+          // 也不用跟引号转义和 `\n` 要不要被解释这种事搏斗。写失败不阻断——项目本身已经
+          // 建好了，缺一个示例文件比"卡在这里不打开项目"好。
+          for (const seed of Array.isArray(tmpl.files) ? tmpl.files : []) {
+            try {
+              const rel = String(seed.path || "").replace(/\\/g, "/");
+              if (!rel || rel.includes("..")) continue;
+              const full = `${projectPath}/${rel}`;
+              const dir = full.slice(0, full.lastIndexOf("/"));
+              if (dir && dir !== projectPath) { try { await backend.createDir(dir); } catch {} }
+              await backend.writeTextFile(full, String(seed.content || "").replace(/\{\{name\}\}/g, name));
+            } catch {}
+          }
           // 无论当前是否开着项目，创建完一律直接打开新项目（用户预期：新建完就进去干活，
           // 旧版"已开项目时只弹提示"导致第二次新建不跳转）。依赖安装继续在终端跑。
           await openFolder(projectPath);
