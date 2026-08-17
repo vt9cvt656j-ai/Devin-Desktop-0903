@@ -251,6 +251,9 @@ test("仓库自带的 MCP 工具照旧要问——这道门不能顺手拆掉", 
 test("工作区权限规则写了 ask，就算是自己配的服务也得问——事先写下的策略优先", async () => {
   const asked = [];
   const approve = load("_approveToolCall", {
+    // 「是谁拒的」走旁路（那道门的返回值必须保持布尔）。测试里不关心理由，给个空实现。
+    _noteRefusal: () => {},
+    _permRuleSource: () => "",
     _permissionRuleVerdict: () => "ask",
     _loadPermissionRules: async () => ({}),
     _callIsDestructive: () => false,
@@ -271,6 +274,9 @@ test("工作区权限规则写了 ask，就算是自己配的服务也得问—�
 
 test("规则写了 deny 就直接否决，自动放行不能把它顶掉", async () => {
   const approve = load("_approveToolCall", {
+    // 「是谁拒的」走旁路（那道门的返回值必须保持布尔）。测试里不关心理由，给个空实现。
+    _noteRefusal: () => {},
+    _permRuleSource: () => "",
     _permissionRuleVerdict: () => "deny",
     _loadPermissionRules: async () => ({}),
     _callIsDestructive: () => false,
