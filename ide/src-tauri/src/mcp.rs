@@ -204,6 +204,9 @@ struct Session {
     stderr_log: Arc<Mutex<VecDeque<String>>>,
     next_id: u64,
     workspace_root: String,
+    /// 服务名。弹给用户的输入框上必须写清"是谁在问"——
+    /// 一个来路不明的表单要用户填东西，不写来源就是在教他闭着眼睛填。
+    server_name: String,
     capabilities: Value,
     server_info: Value,
     /// 连着几次请求超时没等到回应。**任何**一次回应都清零，包括服务回的 JSON-RPC 错误——
@@ -294,6 +297,31 @@ struct SideChannel {
     cancel: Arc<AtomicBool>,
     log: Arc<Mutex<VecDeque<String>>>,
 }
+
+/// 服务反过来要用户输入（MCP elicitation）时挂在这里，等前端来取、来答。
+///
+/// 为什么是「挂起 + 轮询」而不是推事件：这一层拿不到 AppHandle，而同一个文件里
+/// 「等用户在浏览器里完成 OAuth」早就是这么做的（`mcp_pending_auth`），沿用同一套
+/// 机制比新引一条推送通道可靠。
+///
+/// 为什么就地阻塞是对的：服务在等我们回答之前不会继续，而我们正卡在等它的工具结果。
+/// 但必须给出口——超时、用户拒绝、用户点取消，三条都得有。
+struct PendingElicitation {
+    token: String,
+    server: String,
+    root: String,
+    message: String,
+    schema: Value,
+    /// 用户答完由 `mcp_elicit_respond` 填。None = 还在等。
+    answer: Option<Value>,
+}
+
+static ELICITATIONS: LazyLock<Mutex<Vec<PendingElicitation>>> =
+    LazyLock::new(|| Mutex::new(Vec::new()));
+
+/// 等用户回答的上限。到点按规范回 `cancel`（不是 `decline`——那是"用户明确拒绝"，
+/// 而没人在电脑前和明确拒绝是两回事，服务对这两者的处理往往不同）。
+const ELICITATION_WAIT: Duration = Duration::from_secs(180);
 
 static SIDE_CHANNELS: LazyLock<Mutex<HashMap<SessionKey, SideChannel>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
@@ -467,6 +495,67 @@ impl Session {
         }
     }
 
+    /// 把服务要的输入交给用户，等他填。
+    ///
+    /// 就地阻塞是对的语义（服务在等我们，我们在等它的工具结果），但三条出口缺一不可：
+    ///   · 用户答了 → 原样回 accept/decline/cancel；
+    ///   · 用户点了「停止」→ 回 cancel，别让服务以为还有人在；
+    ///   · 没人在电脑前 → 到点回 **cancel** 而不是 decline。decline 是"用户看过并拒绝"，
+    ///     服务据此往往会走"那就别做了"的分支；超时只说明没人应答，两者不该混。
+    fn await_elicitation(&mut self, params: &Value) -> Value {
+        let token = format!("el{}{}", std::process::id(), self.next_id);
+        self.next_id += 1;
+        let message = params
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let schema = params
+            .get("requestedSchema")
+            .cloned()
+            .unwrap_or_else(|| json!({"type":"object","properties":{}}));
+        if let Ok(mut list) = ELICITATIONS.lock() {
+            // 有界：一个坏掉的服务不该把这张表撑爆。
+            if list.len() >= 8 {
+                return json!({"action":"cancel"});
+            }
+            list.push(PendingElicitation {
+                token: token.clone(),
+                server: self.server_name.clone(),
+                root: self.workspace_root.clone(),
+                message,
+                schema,
+                answer: None,
+            });
+        } else {
+            return json!({"action":"cancel"});
+        }
+        let deadline = Instant::now() + ELICITATION_WAIT;
+        let mut answer = None;
+        while Instant::now() < deadline {
+            if self.cancel.load(Ordering::SeqCst) {
+                break;
+            }
+            if let Ok(mut list) = ELICITATIONS.lock() {
+                if let Some(slot) = list.iter_mut().find(|p| p.token == token) {
+                    if let Some(value) = slot.answer.take() {
+                        answer = Some(value);
+                    }
+                } else {
+                    break; // 被别处清掉了（会话断开等）
+                }
+            }
+            if answer.is_some() {
+                break;
+            }
+            std::thread::sleep(CANCEL_POLL);
+        }
+        if let Ok(mut list) = ELICITATIONS.lock() {
+            list.retain(|p| p.token != token);
+        }
+        answer.unwrap_or_else(|| json!({"action":"cancel"}))
+    }
+
     fn respond_to_server_request(&mut self, request: &Value) {
         let Some(id) = request.get("id").cloned() else {
             return;
@@ -479,6 +568,10 @@ impl Session {
                 "id":id,
                 "result":{"roots": workspace_roots(&self.workspace_root)}
             }),
+            "elicitation/create" => {
+                let params = request.get("params").cloned().unwrap_or_else(|| json!({}));
+                json!({"jsonrpc":"2.0","id":id,"result": self.await_elicitation(&params)})
+            }
             _ => json!({
                 "jsonrpc":"2.0",
                 "id":id,
@@ -838,6 +931,7 @@ fn spawn_session(
         stderr_log,
         next_id: 1,
         workspace_root: cwd.to_string(),
+        server_name: String::new(),
         capabilities: json!({}),
         server_info: json!({}),
         consecutive_timeouts: 0,
@@ -1129,6 +1223,7 @@ fn connect_full_within(
     }
     let mut session = spawn_session(&command, &args, &env, &cwd, Arc::clone(&side.log))?;
     session.cancel = Arc::clone(&side.cancel);
+    session.server_name = key.name.clone();
     // 发现阶段的总截止时间要盖得住握手：远端握手本身就能占掉三分钟。
     let connect_deadline =
         Instant::now() + Duration::from_secs(handshake_secs.saturating_add(60));
@@ -1139,7 +1234,10 @@ fn connect_full_within(
         json!({
             "protocolVersion": PROTOCOL_VERSION,
             "capabilities": {
-                "roots": {"listChanged": false}
+                "roots": {"listChanged": false},
+                // 声明了就必须真能应答：不声明时按规范回 -32601 是合规的，
+                // 而声明了却总是拒绝，会让服务走一条注定失败的分支——比不声明更糟。
+                "elicitation": {}
             },
             "clientInfo": { "name": "Michael-IDE", "version": "1.0" }
         }),
@@ -1917,6 +2015,45 @@ async fn server_log_at(key: SessionKey) -> Result<Vec<String>, String> {
 ///
 /// 面板靠它把两种「在」分开：一种是连上了能用，一种是进程活着但握手还没做完（见
 /// `REMOTE_HANDSHAKE_SECS`）。没有它的话，用户只会看到一个既不报错也不能用的服务。
+/// 面板轮询：现在有没有服务在等用户填东西。
+///
+/// 和 `mcp_pending_auth` 同一套路子——这一层拿不到 AppHandle，推不了事件。
+#[tauri::command]
+pub fn mcp_pending_elicitation() -> Option<Value> {
+    let list = ELICITATIONS.lock().ok()?;
+    let p = list.iter().find(|p| p.answer.is_none())?;
+    Some(json!({
+        "token": p.token,
+        "server": p.server,
+        "root": p.root,
+        "message": p.message,
+        "schema": p.schema,
+    }))
+}
+
+/// 用户答完了。`action` 只认规范里那三个值，别的一律当 cancel——
+/// 前端传错字符串不该被服务解读成"用户同意了"。
+#[tauri::command]
+pub fn mcp_elicit_respond(token: String, action: String, content: Option<Value>) -> Result<(), String> {
+    let action = match action.as_str() {
+        "accept" => "accept",
+        "decline" => "decline",
+        _ => "cancel",
+    };
+    let mut list = ELICITATIONS.lock().map_err(|_| "MCP state poisoned")?;
+    let Some(slot) = list.iter_mut().find(|p| p.token == token) else {
+        return Err("这条询问已经结束了（超时或服务已断开）".into());
+    };
+    // 只有 accept 才带内容回去：decline/cancel 带上用户填了一半的东西，
+    // 等于把他明确不想给的信息还是给出去了。
+    slot.answer = Some(if action == "accept" {
+        json!({"action": "accept", "content": content.unwrap_or_else(|| json!({}))})
+    } else {
+        json!({"action": action})
+    });
+    Ok(())
+}
+
 #[tauri::command]
 pub async fn mcp_pending_auth(
     window: tauri::WebviewWindow,

@@ -914,7 +914,11 @@ test("每一处 mcp_* 调用都带 root，一个都不能漏", () => {
   const callSites = [...SRC.matchAll(/(?:_invokeCapped|backend\.invoke)\(\s*"(mcp_[a-z_]+)"\s*,\s*\{([^}]*)\}/g)];
   assert.ok(callSites.length >= 8, `调用点太少，正则可能没匹配上：${callSites.length}`);
   const missing = callSites
-    .filter(([, name]) => name !== "mcp_user_config" && name !== "mcp_save_user_config")
+    .filter(([, name]) => !["mcp_user_config", "mcp_save_user_config",
+      // 按 token 寻址：token 是挂起项的全局唯一 id，不经过 (窗口,根,服务名) 那张表，
+      // 所以 root 不参与寻址。给它加一个用不上的参数反而会误导下一个人。
+      "mcp_elicit_respond",
+    ].includes(name))
     .filter(([, , args]) => !/\broot\b/.test(args))
     .map(([whole, name]) => `${name}: ${whole.slice(0, 90)}`);
   assert.deepEqual(missing, [], "这些 mcp_* 调用没带 root，Rust 侧会直接反序列化失败");
