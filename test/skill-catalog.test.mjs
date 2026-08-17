@@ -164,7 +164,7 @@ test("技能：正文不被腰斩、描述不被提前砍死、allowed-tools 真
   //    按用户要求，别的工具的目录一个都不扫了。
   const bases = SRC.slice(SRC.indexOf("function _skillDiscoveryBases"), SRC.indexOf("function _skillDiscoveryBases") + 700);
   assert.match(bases, /\$\{root\}\/\.claude\/skills/, "工作区的 .claude/skills 是安装落点，必须扫");
-  assert.match(bases, /\/\.michael-ide\/skills/, "家目录那份自有技能库没扫");
+  assert.match(bases, /\/\.mrdayone\/skills/, "家目录那份自有技能库没扫");
   for (const foreign of ["plugins", ".cursor", ".codex", ".agents"]) {
     assert.ok(!bases.includes(foreign), `还在扫别的工具的目录：${foreign}`);
   }
@@ -199,22 +199,15 @@ test("技能正文进模型时剥掉 frontmatter，且开关的名字要说实�
   const bare = parseSkill(["---", "name: 空的", "description: 没有正文", "---"].join("\n"), "/w/.claude/skills/bare/SKILL.md");
   assert.ok(bare.prompt.trim().length > 0, "剥成空串了，这个技能会从清单里消失");
 
-  // ② 开关文案必须说实话。它管的是"要不要把全文钉进每次请求"，不是"这个技能能不能用"
-  //    ——技能清单始终在上下文里，模型随时能 read_skill 读它。旧文案「取消使用 / 已取消」
-  //    读起来是"关掉了"，用户点完以为关了，实际什么都没关。
+  // ② 开关文案必须说实话。这几条打的是设置面板那一页（renderSkillsTool）——
+  //    上面那个弹窗面板（openSkillsPanel）全仓零调用点，已经删掉了；在它身上改文案
+  //    改了两次都没生效，因为用户根本点不到它。
   assert.doesNotMatch(SRC, /已启用技能：/, "旧文案还在：那句话说的不是这个开关做的事");
   assert.doesNotMatch(SRC, /会注入到对话/, "旧文案还在");
   assert.doesNotMatch(SRC, /如果只是不想让它生效，关掉开关就行/,
     "删除确认里那句话是假的：取消常驻之后模型照样看得见、照样能读");
-  // 按钮上那两个字是用户唯一看得见的说明，必须单独钉住——只钉气泡的话，把标签改回
-  // 「使用 / 取消使用」照样绿。
-  const markup = SRC.slice(SRC.indexOf('row.className = "skill-row" + (on ? " is-active" : "")'));
-  assert.match(markup.slice(0, 900), /\$\{on \? "取消常驻" : "常驻"\}<\/button>/,
-    "按钮还写着「使用 / 取消使用」——它管的不是能不能用，是要不要把全文钉进每次请求");
-  const row = SRC.slice(SRC.indexOf('row.querySelector("._use")'));
-  assert.match(row.slice(0, 700), /已常驻/, "气泡没说清它做了什么");
-  assert.match(row.slice(0, 700), /模型仍可按需自行读取/,
-    "取消常驻的气泡必须说清「它还在」，否则用户以为技能被关掉了");
+  assert.doesNotMatch(SRC, /async function openSkillsPanel/,
+    "那个零调用点的重复面板又回来了——它是「改完了却没生效」的来源");
 });
 
 test("「常驻」这个词在四个地方必须是同一个词——它们互相引用", () => {

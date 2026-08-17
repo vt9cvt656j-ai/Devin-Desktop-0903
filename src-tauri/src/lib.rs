@@ -84,14 +84,22 @@ fn tracing_ignore_multiwindow() {
 
 /// Entry point shared by the binary and (potentially) mobile targets.
 /// Crash reporting: append every Rust panic (message + location + backtrace + timestamp)
-/// to `~/.michael-ide/crash.log`, so a crash on a user's machine leaves a trace we can ask
+/// to `~/.mrdayone/crash.log`, so a crash on a user's machine leaves a trace we can ask
 /// them for — instead of the window just vanishing with nothing to go on. Chains the
 /// previous hook so normal panic printing still happens.
 fn install_panic_logger() {
     let prev = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         if let Ok(home) = std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")) {
-            let dir = std::path::PathBuf::from(home).join(".michael-ide");
+            // 和 mcp.rs::app_dir 一致：新目录优先，只有它不存在而老目录在时才退回老的。
+            // 这里**不做搬迁**——panic hook 跑在最早期，此刻做文件系统改动风险太高；
+            // 搬迁交给 app_dir 那一次，这里只负责把日志写到正确的那一个。
+            let base = std::path::PathBuf::from(home);
+            let dir = if base.join(".mrdayone").is_dir() || !base.join(".michael-ide").is_dir() {
+                base.join(".mrdayone")
+            } else {
+                base.join(".michael-ide")
+            };
             let _ = std::fs::create_dir_all(&dir);
             let ts = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)

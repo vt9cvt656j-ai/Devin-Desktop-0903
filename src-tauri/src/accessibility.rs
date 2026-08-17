@@ -827,13 +827,13 @@ const OCR_HELPER_LEGACY_ABS: &[&str] = &[
     "/tmp/michael_ide_vision_ocr_v1.swift",
 ];
 
-/// OCR 辅助程序的私有目录：`$HOME/.michael-ide/bin`，权限 0700。
+/// OCR 辅助程序的私有目录：`$HOME/.mrdayone/bin`，权限 0700。
 #[cfg(target_os = "macos")]
 fn ocr_helper_dir() -> Option<std::path::PathBuf> {
     use std::os::unix::fs::PermissionsExt;
     let home = std::env::var("HOME").ok()?;
     let dir = std::path::PathBuf::from(home)
-        .join(".michael-ide")
+        .join(crate::mcp::app_dir_name())
         .join("bin");
     std::fs::create_dir_all(&dir).ok()?;
     // 只有自己能进：即使别人猜到路径也放不进文件。
