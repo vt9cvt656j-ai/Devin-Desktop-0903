@@ -235,41 +235,38 @@ test("面向模型的判断一律跟随用户选的模型——廉价降级这�
     "x-ide-request-id 必须只对网关发");
 });
 
-test("一轮都没跑的时候，不许在最高注意力位摆一条「接着完成尚未完成的动作」", () => {
-  // 线上实拍：用户问「deepseek 最近有什么进展，和 Claude Code / Codex 比」——一个纯外部
-  // 知识问题。模型的思考逐条复述了 express + better-sqlite3、data.db、node src/server.js，
-  // 然后得出「用户没有提出具体问题，只是打开了这个项目」，转头 list_dir + 读源码。
+test("一轮都没跑的时候，那块执行状态整块都不许发", () => {
+  // 两轮实拍才定的案。
   //
-  // 用户的话确实发出去了（网关计费 prompt=2 / cache_create=4735，那 4735 就是真实内容）。
-  // 盖住它的是 harness 每轮追加在**消息尾部**的那条合成消息：署名「执行状态·不要从头重查」、
-  // 末尾「接着完成尚未完成的动作」。它的触发条件里有 _runtimeStateBlock，而依赖/启动脚本/
-  // 数据库文件对任何真实项目都非空 —— 于是它每轮必发，包括一轮都还没跑的第一轮。
+  // 第一轮：这块署名〔执行状态·不要从头重查〕、末尾〔接着完成尚未完成的动作〕，一轮没跑也发。
+  //   → 模型复述里面的 express/better-sqlite3/data.db，得出「用户没有提出具体问题」，去 list_dir。
+  // 第二轮（只改措辞、位置照旧留在最后一条）：
+  //   → 模型思考原文：「我看到的只是系统注入的环境信息，没有看到用户的实际请求」
+  //                  「最后有环境信息注入」「而最后的系统注入说『用户这一轮的请求就在上面的对话里』」
+  //   → 网关字节数：marked_request_bytes=83（问题在），last_user_bytes=2335（最后一条是这块）。
+  //
+  // 结论：问题不在措辞，在**位置**。这个产品自己的注释写着 Put the user's ACTUAL request LAST
+  // ——recency 是最高注意力位。所以一轮没跑时整块不发：环境事实是锦上添花，用户的问题在最后
+  // 一位是刚需。真有活干到一半时它才有意义，那时它描述的是已经发生的事，不跟用户的话争位置。
   const i = CODE.indexOf("_hasRunActivity");
-  assert.ok(i > 0,
-    "执行状态块又变回「有没有活动」和「项目长什么样」共用一个条件了 —— 那会让它第一轮就发");
+  assert.ok(i > 0, "执行状态块的活动判据不见了");
   const block = CODE.slice(Math.max(0, i - 200), i + 2600);
 
-  // 触发条件必须把「真实动作」和「静态环境事实」分开算。
   assert.match(
     block,
-    /const _hasRunActivity = !!\(_mutatedFiles\.size \|\| _readFiles\.size \|\| _evidenceBlock \|\| _latestDiagBlock\)/,
-    "「本次运行做过事」的判据里不能含 _runtimeStateBlock：它是静态事实，第一轮就非空",
+    /const _hasRunActivity = !!\(_mutatedFiles\.size \|\| _readFiles\.size \|\| _evidenceBlock \|\| _latestDiagBlock\);\s*\n\s*if \(_hasRunActivity\) \{/,
+    "整块必须只在**真有动作**时才发。曾经的写法是 `if (_hasRunActivity || _runtimeStateBlock)`——"
+    + "而运行时状态对任何真实项目都非空，等于每轮必发，把用户的问题从最后一位挤走",
   );
 
-  // 「接着完成尚未完成的动作」只能出现在真的有动作的那一支。
-  const tailIdx = block.indexOf("接着完成尚未完成的动作");
-  assert.ok(tailIdx > 0, "找不到那句收尾指令，锚点已失效");
-  const guard = block.slice(Math.max(0, tailIdx - 220), tailIdx);
-  assert.match(guard, /_hasRunActivity/,
-    "「接着完成尚未完成的动作」没有被 _hasRunActivity 守住 —— 一轮没跑就凭空断言有活干到一半");
+  // 那段"请求在上面的对话里"是上一版的补救，位置没动所以补救失败，且它本身把模型送去翻找。
+  assert.doesNotMatch(block, /用户这一轮的请求就在上面的对话里/,
+    "这句是上一版只改措辞不改位置的产物，模型照着它去翻找然后报告找不到——整块不发之后它就不该存在");
 
-  // 没动作那一支必须反过来把注意力推回用户的话上。
-  assert.match(block, /用户这一轮的请求就在上面的对话里/,
-    "facts-only 那支要明确把模型指回用户真正说的话，否则它照着环境事实去摸项目");
-  assert.match(block, /本次运行还没有任何动作/,
-    "facts-only 那支的标题仍在自称「执行状态」，模型会当成有进度可续");
+  // 有动作那一支保持原样：那时它描述的是已经发生的事实。
+  assert.match(block, /接着完成尚未完成的动作/, "有动作时仍要催它接着做完");
+  assert.match(block, /〔执行状态·不要从头重查〕/);
 });
-
 test("完整裁决要 19.8 秒，路由必须有第二条腿——而且那条腿只喂请求头", () => {
   // 生产网关实测（2026-08-17）：
   //   17:37:51 分类器发出 → 17:38:06 主回合发出（等待 15s 超时）→ 17:38:10 分类器才回
