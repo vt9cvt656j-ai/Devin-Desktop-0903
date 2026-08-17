@@ -1072,7 +1072,7 @@ const REMOTE_HANDSHAKE_SECS: u64 = 180;
 /// 一份泄漏面。为了两个整数让每个 GUI 用户在第一次连 MCP 时多等最多 4 秒，绝大多数人还
 /// 根本没设过这两个变量，这笔账不划算。
 ///
-/// 也没有落到 `~/.michael-ide/mcp.json` 里：面板保存走的是"从投影重建整份文档"那条路
+/// 也没有落到 `~/.mrdayone/mcp.json` 里：面板保存走的是"从投影重建整份文档"那条路
 /// （见 `save_user_config_at`），投影里没有的键会被静默删掉——用户在面板里改一次服务，
 /// 手写的超时就没了。真要做成配置项，得连读写投影一起改，不是加一个键的事。
 fn env_timeout_secs(name: &str) -> Option<u64> {
@@ -1956,7 +1956,7 @@ async fn pending_auth_at(key: SessionKey) -> Result<bool, String> {
 // `.cursor/mcp.json`。也就是说换一个项目，你配好的服务、连同填进去的 API Key 全都
 // 不在了，得从头再配一遍；没打开文件夹的时候更是一个 MCP 都用不了。那不叫"能用"。
 //
-// 用户级配置放在 `~/.michael-ide/mcp.json`，配一次到处都在。这里必须走**独立的
+// 用户级配置放在 `~/.mrdayone/mcp.json`，配一次到处都在。这里必须走**独立的
 // Tauri 命令**而不是复用 `write_text_file_if_unchanged`：那条路的
 // `require_inside_workspace(path, true)` 会明确拒绝"在 HOME 底下但不在已打开工作区
 // 里"的写入（正是它挡住了 ~/.ssh、~/.bashrc），不该为了这一个文件把那道墙挖开。
@@ -1966,7 +1966,50 @@ async fn pending_auth_at(key: SessionKey) -> Result<bool, String> {
 // 直接就能用，不用再抄一遍。`~/.claude.json` 里除了 mcpServers 还有账号、项目历史
 // 等等，所以**在 Rust 侧就只摘 mcpServers 子树**交给前端，其余内容一个字节都不进
 // 渲染进程。这也顺便绕开了 read_text_file 的 5 MB 上限（那个文件会长得很大）。
-const USER_CONFIG_DIR: &str = ".michael-ide";
+/// 应用自己的家目录：`~/.mrdayone`。
+///
+/// 以前叫 `.michael-ide`。改名带**一次性搬迁**：这个目录里不只有 mcp.json，还有浏览器
+/// 的独立 profile（里面是登录态）、OCR 辅助程序、崩溃日志、用户规则和习惯。直接改常量
+/// 会让这些东西一夜之间"消失"——用户看到的是浏览器要重新登录、规则清空、配好的 MCP 服务
+/// 不见了，而磁盘上其实都还在，只是没人再去那儿找。
+///
+/// 搬迁用 `rename`：同一个家目录下是原子的，不会出现搬到一半两边各有一半的状态。搬不动
+/// （权限、跨卷、或者新目录已经存在）就继续用老目录——**绝不两边都写**，那才是真的丢数据。
+///
+/// 故意**不缓存**。缓存只省得下两次 `is_dir()`（搬迁完成后新目录就在，第一次判断即返回），
+/// 却会把第一次看到的 HOME 钉死在进程里——测试改了 HOME 之后拿到的还是旧答案，于是
+/// "只读自己那份配置"那条守卫会因为读错目录而假红。省两次 stat 不值这个代价。
+fn app_dir() -> Result<std::path::PathBuf, String> {
+    Ok(migrate_app_dir(&home_dir()?))
+}
+
+/// 决定用哪个目录，顺便把老目录搬过来。抽成函数是为了**能对着它验**——`app_dir` 带
+/// `OnceLock`，一个进程只算一次，测试没法在它身上试第二种情形。
+fn migrate_app_dir(home: &std::path::Path) -> std::path::PathBuf {
+    let current = home.join(APP_DIR_NAME);
+    if current.is_dir() {
+        return current;
+    }
+    let legacy = home.join(LEGACY_APP_DIR_NAME);
+    if legacy.is_dir() {
+        // 同一个家目录下 rename 是原子的：不会出现搬到一半、两边各有一半的状态。
+        // 搬不动（权限、跨卷）就继续用老的——绝不两边都写，那才是真的丢数据。
+        return if std::fs::rename(&legacy, &current).is_ok() { current } else { legacy };
+    }
+    current
+}
+
+const APP_DIR_NAME: &str = ".mrdayone";
+
+/// 给别的模块用：它们要在同一个应用目录下开自己的子目录（OCR 辅助程序、浏览器 profile），
+/// 但不该各自硬编码名字——上一次改名就是这么漏的。
+pub fn app_dir_name() -> &'static str {
+    app_dir()
+        .ok()
+        .and_then(|dir| dir.file_name().and_then(|n| n.to_str()).map(|n| if n == APP_DIR_NAME { APP_DIR_NAME } else { LEGACY_APP_DIR_NAME }))
+        .unwrap_or(APP_DIR_NAME)
+}
+const LEGACY_APP_DIR_NAME: &str = ".michael-ide";
 const USER_CONFIG_FILE: &str = "mcp.json";
 /// 这几个文件都可能长期堆积（Claude Code 会把项目历史写进 ~/.claude.json）。
 const MAX_USER_CONFIG_BYTES: u64 = 32 * 1024 * 1024;
@@ -1979,7 +2022,7 @@ fn home_dir() -> Result<std::path::PathBuf, String> {
 }
 
 fn user_config_path() -> Result<std::path::PathBuf, String> {
-    Ok(home_dir()?.join(USER_CONFIG_DIR).join(USER_CONFIG_FILE))
+    Ok(app_dir()?.join(USER_CONFIG_FILE))
 }
 
 /// 从自有配置文本里摘出服务表。`mcpServers` 是面板写的那个键；`servers` 一并认，
@@ -2069,7 +2112,7 @@ fn own_user_config(path: &std::path::Path) -> McpUserConfig {
     }
 }
 
-/// 用户级 MCP 配置：本 IDE 自己的 `~/.michael-ide/mcp.json`，**只有这一份**。
+/// 用户级 MCP 配置：本 IDE 自己的 `~/.mrdayone/mcp.json`，**只有这一份**。
 ///
 /// 这里曾经还会去读 Claude Code / Cursor / Codex / Claude Desktop 的全局配置，把它们的
 /// 服务一并合进来。按用户要求去掉了：别的客户端的配置文件不是他的目录，不该在这个 IDE
@@ -2081,7 +2124,7 @@ pub fn mcp_user_config() -> Result<McpUserConfig, String> {
     Ok(own_user_config(&user_config_path()?))
 }
 
-/// 覆盖写 `~/.michael-ide/mcp.json`，返回它的绝对路径。
+/// 覆盖写 `~/.mrdayone/mcp.json`，返回它的绝对路径。
 ///
 /// 权限收到 0600（目录 0700）：这个文件里会有 API Key。先写临时文件再 rename，
 /// 断电或者写到一半崩了不会留下半截 JSON 把所有 MCP 服务一起带走。
@@ -2168,7 +2211,7 @@ fn save_user_config_at(path: &std::path::Path, text: &str, force: bool) -> Resul
 // 「我一律用 pnpm」「回答用中文」「别写没要求的测试」这类跟着人走、不跟着项目走的要求，
 // 以前只能每个项目重写一遍，或者每轮对话重复一次。
 //
-// 放在 `~/.michael-ide/rules.md`，和 mcp.json 同一个目录。走独立命令而不是
+// 放在 `~/.mrdayone/rules.md`，和 mcp.json 同一个目录。走独立命令而不是
 // write_text_file_if_unchanged 的理由和那边一样：那条路的 require_inside_workspace
 // 明确拒绝"在 HOME 底下但不在已打开工作区里"的写入，不该为一个文件把那道墙挖开。
 /// 用户自己写、每轮都要发给模型的两份文档。
@@ -2188,9 +2231,7 @@ fn user_doc_file(kind: &str) -> Result<&'static str, String> {
 const MAX_USER_RULES_BYTES: usize = 64 * 1024;
 
 fn user_doc_path(kind: &str) -> Result<std::path::PathBuf, String> {
-    Ok(home_dir()?
-        .join(USER_CONFIG_DIR)
-        .join(user_doc_file(kind)?))
+    Ok(app_dir()?.join(user_doc_file(kind)?))
 }
 
 /// 读一份用户文档（rules / habits），**文件不在就先建一个空的**。
@@ -2198,7 +2239,7 @@ fn user_doc_path(kind: &str) -> Result<std::path::PathBuf, String> {
 /// 这两份是"自带的"文档：用户从菜单点进去，是在编辑器里打开一个标签页，所以它必须是磁盘上
 /// 真实存在的文件，而不是一个概念。默认空白——内容全由用户自己写。
 ///
-/// 它们住在 `~/.michael-ide/` 而**不在 app 包里**，所以升级、重装、换版本都碰不到它们；
+/// 它们住在 `~/.mrdayone/` 而**不在 app 包里**，所以升级、重装、换版本都碰不到它们；
 /// 用户写进去的东西不会被更新覆盖掉。
 #[tauri::command]
 pub fn user_rules_read(kind: Option<String>) -> Result<Value, String> {
@@ -2514,6 +2555,50 @@ mod tests {
         for leaked in ["userID", "oauthAccount", "projects", "私密", "秘密", "a@b.c"] {
             assert!(!text.contains(leaked), "{leaked} 泄漏进了返回值：{text}");
         }
+    }
+
+    /// 改名要带搬迁，否则用户的东西会"消失"。
+    ///
+    /// `~/.michael-ide` 里不只有 mcp.json：还有浏览器的独立 profile（登录态就在里面）、
+    /// OCR 辅助程序、崩溃日志、规则和习惯。只改常量不搬迁的话，这些东西一夜之间全没了
+    /// ——磁盘上其实还在，只是没人再去那儿找，而用户看到的是"浏览器要重新登录、规则被
+    /// 清空、配好的 MCP 服务不见了"。
+    #[test]
+    fn renaming_the_app_directory_carries_everything_over() {
+        let _serial = ENV_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let home = std::env::temp_dir().join(format!("michael-appdir-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        let legacy = home.join(LEGACY_APP_DIR_NAME);
+        std::fs::create_dir_all(legacy.join("browser-profile")).unwrap();
+        std::fs::write(legacy.join("mcp.json"), r#"{"mcpServers":{"我的":{"command":"x"}}}"#).unwrap();
+        std::fs::write(legacy.join("browser-profile").join("Cookies"), "登录态").unwrap();
+        std::fs::write(legacy.join("rules.md"), "我的规则").unwrap();
+
+        // app_dir 带 OnceLock，一个进程只算一次——所以这里直接验搬迁那段逻辑本身，
+        // 用同一份实现（migrate_app_dir），而不是照抄一遍到测试里。
+        let moved = migrate_app_dir(&home);
+        assert_eq!(moved, home.join(APP_DIR_NAME), "没搬到新目录");
+        assert!(!legacy.exists(), "老目录还在，会变成两份各写各的");
+        assert_eq!(std::fs::read_to_string(moved.join("mcp.json")).unwrap(),
+                   r#"{"mcpServers":{"我的":{"command":"x"}}}"#);
+        assert_eq!(std::fs::read_to_string(moved.join("browser-profile").join("Cookies")).unwrap(),
+                   "登录态", "浏览器 profile 没跟过来 = 用户要重新登录一遍");
+        assert_eq!(std::fs::read_to_string(moved.join("rules.md")).unwrap(), "我的规则");
+
+        // 新目录已经在了就不动老的——两边都写才是真的丢数据。
+        std::fs::create_dir_all(&legacy).unwrap();
+        std::fs::write(legacy.join("mcp.json"), "老的").unwrap();
+        assert_eq!(migrate_app_dir(&home), home.join(APP_DIR_NAME));
+        assert!(legacy.exists(), "新目录已存在时不该再去动老目录");
+        assert_eq!(std::fs::read_to_string(moved.join("mcp.json")).unwrap(),
+                   r#"{"mcpServers":{"我的":{"command":"x"}}}"#, "新目录被老的盖掉了");
+
+        // 全新用户：两个都没有，直接用新名字。
+        let fresh = std::env::temp_dir().join(format!("michael-appdir-fresh-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&fresh);
+        assert_eq!(migrate_app_dir(&fresh), fresh.join(APP_DIR_NAME));
+        let _ = std::fs::remove_dir_all(&home);
+        let _ = std::fs::remove_dir_all(&fresh);
     }
 
     /// 用户级配置**只有自己那一份**。

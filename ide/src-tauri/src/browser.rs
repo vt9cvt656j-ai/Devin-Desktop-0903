@@ -280,7 +280,7 @@ fn real_profile_dir(_kind_id: &str) -> Option<std::path::PathBuf> {
     None
 }
 
-/// 每个浏览器自己的独立配置目录名（在 `~/.michael-ide/` 下）。
+/// 每个浏览器自己的独立配置目录名（在 `~/.mrdayone/` 下）。
 ///
 /// **不能共用一个目录**：Chrome 和 Edge 的 profile 格式并不互通，同一个目录轮流被两个
 /// 浏览器打开会把它写坏，代价是里面攒的全部登录态一起没。
@@ -382,7 +382,7 @@ fn launch() -> Result<Session, String> {
     // 而恶意网页只要能让自动化访问它，就能顺着这份登录态操作你已登录的任何站点。
     //
     // 现在改成显式开关 `MICHAEL_BROWSER_USE_REAL_PROFILE=1`。能力完整保留，只是要你自己
-    // 点头；不设时一律用 ~/.michael-ide/browser-profile 这份独立 profile。
+    // 点头；不设时一律用 ~/.mrdayone/browser-profile 这份独立 profile。
     let use_real_profile = std::env::var("MICHAEL_BROWSER_USE_REAL_PROFILE")
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false);
@@ -400,7 +400,7 @@ fn launch() -> Result<Session, String> {
             .or_else(|| std::env::var_os("USERPROFILE"))
             .map(|h| {
                 std::path::PathBuf::from(h)
-                    .join(".michael-ide")
+                    .join(crate::mcp::app_dir_name())
                     .join(&profile_name)
             })
     });
@@ -424,7 +424,7 @@ fn launch() -> Result<Session, String> {
         format!(
             "自动化用的是 **{}**，是新起的一个实例（Dock 里多出来的那个图标就是它）。\
 原因：先扫了 9222-9229 调试端口没找到可接管的实例——{why}。\
-它用的是独立配置 ~/.michael-ide/{profile_name}：全新、没登录过，\
+它用的是独立配置 ~/.mrdayone/{profile_name}：全新、没登录过，\
 所以像 Google 这类站点更容易弹人机验证。\
 **在这个窗口里登录一次会被记住**，下次直接就是登录态——这是让它少弹验证的正路。",
             kind.label

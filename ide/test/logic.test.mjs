@@ -6940,7 +6940,7 @@ test("standard SKILL.md frontmatter is parsed with a stable source identity", ()
   // 技能只从自有位置发现：工作区（含上级仓库）的 .claude/skills 和家目录的
   // ~/.michael-ide/skills。.cursor / .codex / .agents 以及两个插件市场缓存都不再扫。
   assert.match(SRC, /\$\{root\}\/\.claude\/skills/);
-  assert.match(SRC, /\/\.michael-ide\/skills/);
+  assert.match(SRC, /\/\.mrdayone\/skills/);
 });
 
 test("workspace SKILL.md discovery reads a real skill directory", async () => {
@@ -6981,7 +6981,7 @@ test("技能只从自有目录发现：上级仓库算，别的工具的目录�
   assert.ok(bases.includes("/repo/apps/ide/.claude/skills"), bases.join(" "));
   assert.ok(bases.includes("/repo/.claude/skills"), "上级仓库的也要算，monorepo 里技能常放顶层");
   // 家目录那份技能库，和 ~/.michael-ide/mcp.json 同一个命名空间。
-  assert.ok(bases.includes("/home/tester/.michael-ide/skills"), bases.join(" "));
+  assert.ok(bases.includes("/home/tester/.mrdayone/skills"), bases.join(" "));
   // 别的工具的目录一个都不扫——用户明确要求只加载自己的。
   for (const foreign of [".cursor", ".codex", ".agents", "plugins"]) {
     assert.ok(!bases.some((b) => b.includes(foreign)), `还在扫 ${foreign}：${bases.join(" ")}`);

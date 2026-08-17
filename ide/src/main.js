@@ -23036,7 +23036,7 @@ function _preferredLanguageCode() {
 // **用户级的一直没有**。「我一律用 pnpm」「回答用中文」「别写没要求的测试」这类要求跟着
 // 人走不跟着项目走，以前只能每个项目重抄一遍，或者每轮对话重复一次。
 //
-// 存 `~/.michael-ide/rules.md`（和 mcp.json 同目录，0600）。内存里缓存一份，面板保存后
+// 存 `~/.mrdayone/rules.md`（和 mcp.json 同目录，0600）。内存里缓存一份，面板保存后
 // 立刻刷新——不然改完要等下次启动才生效，用户会以为没保存上。
 let _userRulesText = "";
 let _userHabitsText = "";
@@ -24438,7 +24438,7 @@ async function sendPrompt(text, attachments = [], readyConfig = null) {
   // 时它还没跑完，技能目录里就只剩 localStorage 那批——模型看不见的技能等于不存在，
   // 而且不会有任何报错。首轮值得等这一次目录扫描：只扫几个目录，只在从没扫过时等，
   // 超时也不阻塞（后台那次照常写回缓存，下一轮就齐了）。
-  // 没打开文件夹也要扫：家目录那份技能库（~/.michael-ide/skills）跟有没有打开项目无关。
+  // 没打开文件夹也要扫：家目录那份技能库（~/.mrdayone/skills）跟有没有打开项目无关。
   // 这里以前带着 `_curRoot &&`，于是"启动 IDE、不开文件夹、直接提问"这条最常见的路径上，
   // 磁盘技能一个都不会被发现——用户装了一堆，模型全不知道。
   // 自限：扫完 _fileSkillsCacheKey 变成 "\0<home>"（非空），所以每次启动最多等这一回；
@@ -26909,7 +26909,7 @@ async function _approveWorkspaceExecConfig(kind, path, text, details) {
   return true;
 }
 
-// 用户级（跨项目）MCP 配置：本 IDE 自己的 ~/.michael-ide/mcp.json，**只有这一份**。
+// 用户级（跨项目）MCP 配置：本 IDE 自己的 ~/.mrdayone/mcp.json，**只有这一份**。
 // 见 src-tauri/src/mcp.rs 里为什么要走独立命令。
 //
 // 这一层是"MCP 能不能真的用起来"的关键：在它之前，配置**只**来自工作区里的文件，
@@ -26930,7 +26930,7 @@ async function _readOwnMcpUserConfig() {
 ///
 /// 仓库自带的 `.mcp.json` 跟着 git clone 来，本 IDE 不去改它——想在这里少加载它带来的
 /// 一个服务，不该逼人去动版本库里的文件。所以停用记在自己的全局配置里：
-/// `~/.michael-ide/mcp.json` 的 `disabled: []`。
+/// `~/.mrdayone/mcp.json` 的 `disabled: []`。
 ///
 /// 这也是「删除」按钮之前形同虚设的原因：它对这类服务是 disabled 的，点下去毫无反应，
 /// 只有悬停才看得到一句说明——等于一个坏掉的按钮。
@@ -27009,7 +27009,7 @@ async function _readWorkspaceMcpDocument(root) {
     });
   }
   const disabled = await _disabledMcpServers();
-  if (!documents.length) return { text: "", path: "", base: "", serverBases: {}, serverSources: {}, serverScopes: {}, disabled };
+  if (!documents.length) return { text: "", path: "", base: "", serverBases: {}, serverSources: {}, serverScopes: {}, knownNames: new Set(), disabled };
   const mergedServers = {};
   const serverBases = {};
   // 每个服务来自哪个文件。**未被 git 跟踪的** `.mcp.local.json` 是 IDE 自己的本地文件
@@ -27019,6 +27019,8 @@ async function _readWorkspaceMcpDocument(root) {
   const serverSources = {};
   // scope: local（项目本地，用户配的）/ repo（仓库自带）/ user（本 IDE 全局配置）
   const serverScopes = {};
+  // 所有来源里出现过的服务名（停用过滤**之前**）。
+  const knownNames = new Set();
   const invalid = [];
   for (const document of documents) {
     let parsed;
@@ -27029,6 +27031,10 @@ async function _readWorkspaceMcpDocument(root) {
     // Documents are visited nearest-first and local-first. Do not let a parent/shared
     // file silently replace an explicitly configured child server.
     for (const [name, config] of Object.entries(servers)) {
+      // 先记名字、再过停用：面板要靠这张表分辨「停用了但源还在」和「源已经没了」。
+      // 少了它，一条源被删掉的停用记录会永远挂在「已停用」那一段，「恢复」点了什么也不
+      // 会发生——按钮在，作用没有。
+      knownNames.add(name);
       if (disabled.has(String(name).toLowerCase())) continue;   // 用户在本 IDE 里停用了它
       if (!Object.prototype.hasOwnProperty.call(mergedServers, name)) {
         mergedServers[name] = config;
@@ -27039,7 +27045,7 @@ async function _readWorkspaceMcpDocument(root) {
     }
   }
   if (!Object.keys(mergedServers).length && invalid.length) {
-    return { ...invalid[0], serverBases: {}, serverSources: {}, serverScopes: {}, disabled };
+    return { ...invalid[0], serverBases: {}, serverSources: {}, serverScopes: {}, disabled, knownNames };
   }
   return {
     text: JSON.stringify({ mcpServers: mergedServers }),
@@ -27050,11 +27056,12 @@ async function _readWorkspaceMcpDocument(root) {
     serverSources,
     serverScopes,
     disabled,
+    knownNames,
   };
 }
 
 /*
- * 全局配置（~/.michael-ide/mcp.json）的**唯一**读写口。
+ * 全局配置（~/.mrdayone/mcp.json）的**唯一**读写口。
  *
  * 这里原来有三份各写各的读取器，其中两份只取 `mcpServers`，把 `disabled` 丢在地上；
  * 而写入是整份 JSON.stringify 覆盖。于是在面板里装一个服务、或者点一下「重连」，
@@ -28437,8 +28444,8 @@ function _activeSkillsBlock() {
  *
  *   <工作区及其父目录>/.claude/skills/<名字>/SKILL.md   ← 技能市场的安装落点（见
  *                                                        destBase，「安装」按钮就写这里）
- *   ~/.michael-ide/skills/<名字>/SKILL.md               ← 自己的家目录技能库，和
- *                                                        ~/.michael-ide/mcp.json 同一个命名空间
+ *   ~/.mrdayone/skills/<名字>/SKILL.md               ← 自己的家目录技能库，和
+ *                                                        ~/.mrdayone/mcp.json 同一个命名空间
  *
  * 这里曾经还会扫 .cursor/skills、.codex/skills、.agents/skills、~/.codex/plugins/cache、
  * ~/.claude/plugins。按用户要求全部去掉了：那些是别的工具的目录，不该在这个 IDE 里生效。
@@ -28446,7 +28453,7 @@ function _activeSkillsBlock() {
  */
 function _skillDiscoveryBases(projectRoot, home) {
   const bases = _workspaceAncestorRoots(projectRoot).map((root) => `${root}/.claude/skills`);
-  if (home) bases.push(`${String(home).replace(/\/+$/, "")}/.michael-ide/skills`);
+  if (home) bases.push(`${String(home).replace(/\/+$/, "")}/.mrdayone/skills`);
   return [...new Set(bases)];
 }
 
@@ -28760,6 +28767,16 @@ async function _refreshFileSkills(root) {
   return _fileSkills;
 }
 // Sync skills to the account server when logged in; localStorage stays the offline cache / fallback.
+/*
+ * 这里原来有 openSkillsPanel / openMcpPanel 两个弹窗面板，共 382 行，**全仓零调用点**。
+ *
+ * 它们是设置面板里那两页（renderSkillsTool / renderMcpTool）的前身，功能重叠但各写各的
+ * 文案。删掉不是为了省行数——是因为它们今天已经骗了我两次：改技能开关的说法、改 MCP
+ * 的来源说明，两次都改在这份看不见的副本上，跑起来毫无变化，得把应用真的打开点进设置
+ * 才发现改错了地方。一份不可达的重复 UI 就是这么把"改完了"变成"没改"的。
+ *
+ * 真正在用的是 renderSkillsTool / renderMcpTool（高级设置 → Skills / MCP）。
+ */
 async function _skillsApi(method, body) {
   let token = ""; try { token = localStorage.getItem("michael_token") || ""; } catch {}
   if (!token) return null;
@@ -28920,160 +28937,6 @@ async function _deleteSkillRecord(skill, root, customList = null) {
  * 往输入框填文本那是**提示词模板**，是给用户填的；技能是给**模型**的能力，由模型
  * 自己判断何时用 read_skill 去读。留着它，下一个改这块的人会以为技能有两套语义并存。
  */
-async function openSkillsPanel() {
-  const m = _chatToolModal({ title: "Skills · 技能", icon: _ICON_SKILLS });
-  let editing = null, skills = [];
-  const persist = () => { _saveSkills(skills.filter((skill) => !skill._readonly)); }; // file skills stay read-only
-  m.body.innerHTML = `<div class="ctp-loading">加载中…</div>`;
-  const customSkills = await _loadSkills();
-  await _refreshFileSkills(rootPath || workspaceRoots[0] || "");
-  skills = [..._fileSkills, ...customSkills];
-  const renderList = () => {
-    m.body.innerHTML = "";
-    const intro = document.createElement("p"); intro.className = "ctp-intro";
-    intro.textContent = "技能始终对模型可见：清单里的名称和描述一直在上下文里，模型按需自己读取正文。「常驻」是把某个技能的全文钉进每次请求，并传给 Agent 子任务。这里支持自定义技能；文件型技能只从两个自有位置发现——工作区（含上级仓库）的 .claude/skills/ 和家目录的 ~/.michael-ide/skills/；正文在文件里改，面板上只能常驻或删除。登录后自定义技能会同步到账号。";
-    m.body.appendChild(intro);
-    const list = document.createElement("div"); list.className = "ctp-list";
-    if (!skills.length) { const e = document.createElement("div"); e.className = "ctp-empty"; e.textContent = "还没有技能。点下面「新建技能」创建你自己的。"; list.appendChild(e); }
-    skills.forEach((s, i) => {
-      const on = _isSkillActive(s.id);
-      const readonly = !!s._readonly;
-      const skillRoot = rootPath || workspaceRoots[0] || "";
-      const canDelete = _skillCanDelete(s, skillRoot);
-      const row = document.createElement("div"); row.className = "skill-row" + (on ? " is-active" : "");
-      row.innerHTML =
-        `<span class="skill-row__icon">${_skillIconMarkup(s.icon)}</span>` +
-        `<div class="skill-row__main"><div class="skill-row__name"></div><div class="skill-row__desc"></div></div>` +
-        `<div class="ctp-rowbtns"><button class="ctp-btn ${on ? "ctp-btn--on" : "ctp-btn--primary"} _use" type="button">${on ? "取消常驻" : "常驻"}</button><button class="ctp-iconbtn _edit" type="button" title="查看" aria-label="查看">${_ICON_EYE}</button>${canDelete ? `<button class="ctp-iconbtn ctp-iconbtn--danger _del" type="button" title="${readonly ? "删除工作区技能目录" : "删除"}" aria-label="删除">${_ICON_TRASH}</button>` : ""}</div>`;
-      row.querySelector(".skill-row__name").textContent = s.name || "(未命名)";
-      row.querySelector(".skill-row__desc").textContent = s.desc || (s.prompt || "").slice(0, 64);
-      /*
-       * 这个开关叫「常驻」而不是「使用 / 停用」，因为它管的从来就不是"能不能用"。
-       *
-       * 技能**始终**对模型可见：所有已发现技能的 name + description 常驻在系统提示词的
-       * 技能清单里，模型自己判断该用哪个，再用 read_skill 读正文——这是 Anthropic Agent
-       * Skills 的渐进式披露，和 Claude Code 一致。这个开关只多做一件事：把选中技能的
-       * **全文**钉进每次请求，省掉模型自己去读那一步。
-       *
-       * 所以旧文案是错的。按钮写「取消使用」、气泡说「已取消」，读起来是"这个技能现在
-       * 不生效了"——而模型照样看得见它、照样能 read_skill 读它、照样会用。用户想关掉一个
-       * 技能时点了它、以为关掉了，实际什么都没关。文案换成常驻/取消常驻，说的才是它
-       * 真正做的那件事；真要让一个技能彻底不出现，得删掉它的文件（右边的删除按钮）。
-       */
-      row.querySelector("._use").addEventListener("click", () => {
-        _toggleSkillActive(s.id);
-        showToast(_isSkillActive(s.id)
-          ? `已常驻「${s.name || "技能"}」：全文进入每次请求`
-          : `已取消常驻「${s.name || "技能"}」：模型仍可按需自行读取它`);
-        renderList();
-      });
-      row.querySelector("._edit").addEventListener("click", () => { editing = { ...s, _idx: i }; renderForm(); });
-      row.querySelector("._del")?.addEventListener("click", async (ev) => {
-        const btn = ev.currentTarget;
-        try {
-          btn.disabled = true;
-          await _deleteSkillRecord(s, skillRoot, skills.filter((skill) => !skill._readonly));
-          await _refreshFileSkills(skillRoot);
-          skills = [..._fileSkills, ...await _loadSkills()];
-          showToast(`已删除技能：${s.name || "技能"}`);
-          renderList();
-        } catch (err) {
-          btn.disabled = false;
-          showToast("删除技能失败：" + String(err?.message || err).slice(0, 120));
-        }
-      });
-      list.appendChild(row);
-    });
-    m.body.appendChild(list);
-    const foot = document.createElement("div"); foot.className = "ctp-foot";
-    // Import a document (.md / .txt) as a skill — reads the file, opens the form pre-filled for review.
-    const impFile = document.createElement("input");
-    impFile.type = "file"; impFile.accept = ".md,.markdown,.mdx,.txt,.text,text/plain,text/markdown"; impFile.style.display = "none";
-    impFile.addEventListener("change", async () => {
-      const f = impFile.files && impFile.files[0]; impFile.value = "";
-      if (!f) return;
-      try {
-        const body = String((await f.text()) || "").trim();
-        if (!body) { showToast("这个文档是空的"); return; }
-        const base = String(f.name || "技能").replace(/\.[^.]+$/, "").trim();
-        const h = body.match(/^\s*#\s+(.+?)\s*$/m);           // markdown "# Title" → skill name, else filename
-        editing = { name: String(h ? h[1] : base).slice(0, 60), icon: "", desc: "", prompt: body, _idx: -1 };
-        renderForm();
-      } catch { showToast("读取文档失败"); }
-    });
-    const impBtn = document.createElement("button"); impBtn.className = "ctp-btn"; impBtn.type = "button";
-    impBtn.style.cssText = "display:inline-flex;align-items:center;gap:6px;";
-    impBtn.innerHTML = _ICON_IMPORT + "<span>导入文档</span>";
-    impBtn.title = "从 .md / .txt 文档导入一个技能";
-    impBtn.addEventListener("click", () => impFile.click());
-    const addBtn = document.createElement("button"); addBtn.className = "ctp-btn ctp-btn--primary"; addBtn.type = "button"; addBtn.textContent = "＋ 新建技能";
-    addBtn.addEventListener("click", () => { editing = { name: "", icon: "", desc: "", prompt: "", _idx: -1 }; renderForm(); });
-    foot.appendChild(impFile); foot.appendChild(impBtn); foot.appendChild(addBtn);
-    m.body.appendChild(foot);
-  };
-  const renderForm = () => {
-    const e = editing;
-    const readonly = !!e._readonly;
-    const isImg = typeof e.icon === "string" && e.icon.slice(0, 5) === "data:";
-    let curIcon = isImg ? "sparkles" : (e.icon || "sparkles");
-    let curImg = isImg ? e.icon : "";   // user-uploaded image (data URL) or ""
-    let usingImg = isImg;               // is the uploaded image the chosen icon?
-    m.body.innerHTML = "";
-    const form = document.createElement("div"); form.className = "ctp-form";
-    form.innerHTML =
-      `<label class="ctp-lbl">名称</label><input class="ctp-input _name" placeholder="例如：代码审查" />` +
-      `<label class="ctp-lbl">图标</label><div class="skill-iconpick"></div>` +
-      `<label class="ctp-lbl">简介（可选）</label><input class="ctp-input _desc" placeholder="一句话说明这个技能" />` +
-      `${e.sourcePath ? `<div class="ctp-intro">来源：<code>${_escHtml(e.sourcePath)}</code></div>` : ""}` +
-      `<label class="ctp-lbl">指令内容</label><textarea class="ctp-textarea _prompt" rows="8" placeholder="技能的完整指令内容…"></textarea>` +
-      `<div class="ctp-foot"><button class="ctp-btn _cancel" type="button">${readonly ? "返回" : "取消"}</button>${readonly ? "" : `<button class="ctp-btn ctp-btn--primary _save" type="button">保存</button>`}</div>`;
-    m.body.appendChild(form);
-    const pick = form.querySelector(".skill-iconpick");
-    const fileInput = document.createElement("input");
-    fileInput.type = "file"; fileInput.accept = "image/*"; fileInput.style.display = "none";
-    form.appendChild(fileInput);
-    const rebuildPick = () => {
-      pick.innerHTML = "";
-      if (curImg) {                     // preview of the user's uploaded image
-        const prev = document.createElement("div");
-        prev.className = "skill-upload__preview";
-        prev.innerHTML = '<img class="skill-tile skill-tile--img" src="' + _escAttr(curImg) + '" alt="" draggable="false" />';
-        pick.appendChild(prev);
-      }
-      const up = document.createElement("button");
-      up.type = "button"; up.className = "skill-upload"; up.title = "上传图片作为技能图标";
-      up.innerHTML =
-        '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M12 5v10"/><path d="m8 9 4-4 4 4"/><path d="M4 15v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2"/></svg>' +
-        "<span>" + (curImg ? "换一张图片" : "上传图片") + "</span>";
-      up.addEventListener("click", () => fileInput.click());
-      pick.appendChild(up);
-    };
-    fileInput.addEventListener("change", async () => {
-      const f = fileInput.files && fileInput.files[0];
-      fileInput.value = "";
-      if (!f) return;
-      try { curImg = await _skillImgFromFile(f); usingImg = true; rebuildPick(); }
-      catch (err) { showToast(err && err.message ? err.message : "图片处理失败"); }
-    });
-    rebuildPick();
-    form.querySelector("._name").value = e.name || "";
-    form.querySelector("._desc").value = e.desc || "";
-    form.querySelector("._prompt").value = e.prompt || "";
-    if (readonly) form.querySelectorAll("input,textarea,button.skill-upload").forEach((element) => { element.disabled = true; });
-    form.querySelector("._cancel").addEventListener("click", () => { editing = null; renderList(); });
-    form.querySelector("._save")?.addEventListener("click", () => {
-      const name = form.querySelector("._name").value.trim();
-      const prompt = form.querySelector("._prompt").value.trim();
-      if (!name || !prompt) { showToast("请填写名称和指令内容"); return; }
-      const skill = { id: e.id || ("s" + Date.now().toString(36)), name, icon: (usingImg && curImg) ? curImg : curIcon, desc: form.querySelector("._desc").value.trim(), prompt };
-      if (e._idx >= 0) skills[e._idx] = skill; else skills.push(skill);
-      persist(); editing = null; renderList();
-    });
-    setTimeout(() => { try { form.querySelector("._name").focus(); } catch {} }, 0);
-  };
-  renderList();
-}
-
 // Common stdio MCP presets for one-click add (the user reviews args/token before saving).
 // External package names and authentication requirements can change; the live connection status
 // is the source of truth. npx = Node, uvx = Python (needs `uv`).
@@ -29183,7 +29046,7 @@ function _openMcpUrl(url) {
 /// 原来是弹窗里塞一个 textarea：让人写 markdown，却不给语法高亮、不给查找替换、不给撤销栈，
 /// 而这个应用本身就是个编辑器。现在直接开成标签页，用它自己的编辑器写。
 ///
-/// 文件由后端保证存在（`user_rules_read` 不在就建一个空的）。它们住在 `~/.michael-ide/`
+/// 文件由后端保证存在（`user_rules_read` 不在就建一个空的）。它们住在 `~/.mrdayone/`
 /// 而**不在 app 包里**，所以升级、重装、换版本都碰不到——写进去的东西不会被更新覆盖。
 async function openUserDocTab(kind = "rules") {
   const label = kind === "habits" ? "用户习惯" : "用户规则";
@@ -29204,236 +29067,6 @@ async function openUserDocTab(kind = "rules") {
   } catch (e) {
     showToast(`打开${label}失败：${String(e?.message || e).slice(0, 140)}`);
   }
-}
-
-async function openMcpPanel(opts = null) {
-  const m = _chatToolModal({ title: "MCP · 服务", icon: _ICON_MCP, wide: true });
-  const root = (rootPath || workspaceRoots[0] || "").replace(/\/$/, "");
-  // 没打开文件夹也照样能用：全局作用域的服务本来就不属于任何项目。
-  const mcpPath = root ? root + "/.mcp.local.json" : "";
-
-  // 读**单个作用域**的配置文件，而不是合并视图。以前这里读的是合并结果再整份写回
-  // .mcp.local.json —— 那会把仓库自带（以及现在的全局）服务连同别人的 API Key 一起
-  // 抄进项目文件里，加一个服务就顺手复制了一堆本来不该在那儿的东西。
-  const readScopeCfg = async (scope) => {
-    // 全局那份走统一读写口：它会把 disabled 一起带回来，并在文件解析失败时带上
-    // parseError，让下面的写入拒绝覆盖。自己就地读一次就会重新引入丢 disabled 的老毛病。
-    if (scope === "user") return _readOwnMcpConfig();
-    try { const c = JSON.parse(await backend.readTextFile(mcpPath)); return (c && typeof c === "object") ? c : { mcpServers: {} }; }
-    catch { return { mcpServers: {} }; }
-  };
-  const writeScopeCfg = async (scope, cfg) => {
-    if (scope === "user") { await _writeOwnMcpConfig(cfg); return; }
-    const text = JSON.stringify(cfg, null, 2);
-    if (!mcpPath) throw new Error("没有打开工作区，无法保存到项目配置");
-    if (!(await _protectLocalMcpConfig(root))) throw new Error("无法把 .mcp.local.json 加入 Git 本地排除，已取消保存以避免提交 MCP 环境变量");
-    let expected = null;
-    try { expected = await backend.readTextFile(mcpPath); } catch {}
-    await _commitDiskTextIfUnchanged(mcpPath, expected, text);
-  };
-  const removeFromScope = async (scope, name) => {
-    const cfg = await readScopeCfg(scope);
-    const servers = cfg.mcpServers || cfg.servers || {};
-    if (!Object.prototype.hasOwnProperty.call(servers, name)) return;
-    delete servers[name];
-    cfg.mcpServers = servers; delete cfg.servers;
-    await writeScopeCfg(scope, cfg);
-  };
-  const SCOPE_TAG = { user: "全局", local: "项目", repo: "仓库" };
-  let userPath = "";   // ~/.michael-ide/mcp.json，由后端给出；面板要显示"会存到哪里"
-  try { userPath = await _userScopeMcpConfigPath(); } catch {}
-  let editing = null;
-  const renderList = async () => {
-    m.body.innerHTML = `<div class="ctp-loading">加载中…</div>`;
-    const doc = await _readWorkspaceMcpDocument(root);
-    let cfg = {};
-    try { cfg = JSON.parse(doc.text || "{}") || {}; } catch { cfg = {}; }
-    const servers = cfg.mcpServers || cfg.servers || {};
-    const scopes = doc.serverScopes || {};
-    const sources = doc.serverSources || {};
-    const names = Object.keys(servers);
-    userPath = (await _userScopeMcpConfigPath()) || userPath;
-    m.body.innerHTML = "";
-    const intro = document.createElement("div"); intro.className = "ctp-intro";
-    intro.innerHTML = `接入 MCP 服务，完成握手和工具发现后，其工具会以 <code>mcp__服务__工具</code> 提供给智能体。`
-      + `新服务默认存在<b>全局</b>配置 <code>${_escHtml(userPath || "~/.michael-ide/mcp.json")}</code>（权限 0600），<b>换项目照样在</b>；`
-      + `选「仅这个项目」则写进已本地排除的 <code>.mcp.local.json</code>。仓库自带的 <code>.mcp.json</code> 也会读（只读）。`
-      + `<b>不会</b>读取 Claude Code / Cursor / Codex / Claude Desktop 的配置——那些是别的工具的目录，想用那边的服务在这里加一遍即可。`
-      + `<br>你自己配的服务<b>不会</b>逐次弹窗要授权；仓库自带的那些照旧需要确认。想让某个服务恢复逐次确认，给它加一行 <code>"__michael": { "approve": "ask" }</code>。`;
-    m.body.appendChild(intro);
-    const list = document.createElement("div"); list.className = "ctp-list";
-    const currentRoot = _mcpLoaded && _mcpLoadedRoot === root;
-    names.forEach((name) => {
-      const s = servers[name] || {};
-      const scope = scopes[name] || "repo";
-      const source = sources[name] || "";
-      // 别的客户端的配置文件是它们的，面板只读不写——要改请回那边改。
-      const editable = scope === "user" || scope === "local";
-      const connected = currentRoot && _mcpConnected.includes(name);
-      const failure = currentRoot ? (_mcpFailures.get(name) || "") : "";
-      const toolNames = currentRoot ? [..._mcpToolMap.values()].filter((v) => v.server === name && v.root === root).map((v) => v.tool) : [];
-      const toolCount = toolNames.length;
-      const statusText = connected ? toolCount + " 个工具 ▾" : (_mcpConnecting ? "连接中…" : (failure ? "连接失败" : (currentRoot ? "未连接" : "未加载")));
-      const item = document.createElement("div"); item.className = "mcp-item";
-      const row = document.createElement("div"); row.className = "mcp-row";
-      row.innerHTML =
-        `<span class="mcp-row__dot ${connected ? "is-on" : (failure ? "is-error" : "")}"></span>` +
-        `<div class="mcp-row__main"><div class="mcp-row__name"></div><div class="mcp-row__cmd"></div></div>` +
-        `<span class="mcp-row__scope">${_escHtml(SCOPE_TAG[scope] || scope)}</span>` +
-        `<span class="mcp-row__tag${connected ? " is-on" : ""}${failure ? " is-error" : ""}${connected && toolCount ? " is-clickable" : ""}">${statusText}</span>` +
-        `<div class="ctp-rowbtns"><button class="ctp-iconbtn _edit" type="button" title="编辑" aria-label="编辑">${_ICON_PENCIL}</button><button class="ctp-iconbtn ctp-iconbtn--danger _del" type="button" title="删除" aria-label="删除">${_ICON_TRASH}</button></div>`;
-      row.querySelector(".mcp-row__name").textContent = name;
-      row.querySelector(".mcp-row__cmd").textContent = [s.command, ...((s.args) || [])].join(" ");
-      row.querySelector(".mcp-row__scope").title = source || "";
-      if (failure) row.querySelector(".mcp-row__tag").title = failure;
-      const editBtn = row.querySelector("._edit"); const delBtn = row.querySelector("._del");
-      if (!editable) {
-        // 走到这里只有一种情况：仓库自带的 .mcp.json。编辑不给——那是版本库里的文件，
-        // 从面板里改它会和 git 打架。
-        editBtn.disabled = true;
-        editBtn.title = "这个服务来自仓库里的配置文件，请直接编辑该文件";
-        // 但**停用要给**。以前这个按钮也是 disabled，点下去毫无反应，只有悬停才看得到一句
-        // 说明——用户看到的就是"删不掉"。想在本 IDE 里少加载一个仓库带来的服务是完全合理
-        // 的诉求，不该逼人去动版本库里的文件。所以这里是"停用"：记进自己的全局配置，
-        // 可恢复，一个字节都不碰仓库里那份。
-        delBtn.title = "在 Day One 里停用（不会改动仓库里的配置，可恢复）";
-        delBtn.addEventListener("click", async () => {
-          try {
-            await _setMcpServerDisabled(name, true);
-            await backend.invoke("mcp_disconnect", { name, root }).catch(() => {});
-            _forgetMcpServer(root, name);
-            _mcpLoaded = false; await _ensureMcpTools(root); renderList();
-            showToast(`已在 Day One 里停用「${name}」（仓库里的配置未改动）`);
-          } catch (e) { showToast("停用失败：" + String(e?.message || e).slice(0, 120)); }
-        });
-      } else {
-        editBtn.addEventListener("click", () => { editing = { name, command: s.command || "", args: s.args || [], env: s.env || {}, cwd: s.cwd || "", meta: s.__michael || null, scope, _orig: name, _origScope: scope }; renderForm(); });
-        delBtn.addEventListener("click", async () => {
-          try {
-            await removeFromScope(scope, name);
-            await backend.invoke("mcp_disconnect", { name, root }).catch(() => {});
-            _forgetMcpServer(root, name);
-            _mcpLoaded = false; await _ensureMcpTools(root); renderList();
-          } catch (e) { showToast("删除 MCP 服务失败：" + String(e?.message || e).slice(0, 120)); }
-        });
-      }
-      item.appendChild(row);
-      // Click "N 个工具" to expand the exact tool names this server exposes (agent sees them as mcp__name__tool).
-      if (connected && toolCount) {
-        const det = document.createElement("div"); det.className = "mcp-tools"; det.hidden = true;
-        toolNames.forEach((t) => { const chip = document.createElement("span"); chip.className = "mcp-tool"; chip.textContent = t; det.appendChild(chip); });
-        item.appendChild(det);
-        const tag = row.querySelector(".mcp-row__tag");
-        tag.addEventListener("click", () => { det.hidden = !det.hidden; tag.textContent = toolCount + " 个工具 " + (det.hidden ? "▾" : "▴"); });
-      }
-      list.appendChild(item);
-    });
-    // Available common servers (not yet configured) — one FULL-WIDTH ROW each, like Claude Code's MCP list.
-    const presets = _MCP_PRESETS.filter((p) => !names.includes(p.name));
-    presets.forEach((p) => {
-      const row = document.createElement("div"); row.className = "mcp-row mcp-row--avail";
-      row.innerHTML =
-        `<div class="mcp-row__main"><div class="mcp-row__name"></div><div class="mcp-row__cmd"></div></div>` +
-        `<button class="ctp-btn ctp-btn--sm _add" type="button">＋ 添加</button>`;
-      row.querySelector(".mcp-row__name").textContent = p.name;
-      row.querySelector(".mcp-row__cmd").textContent = p.desc;
-      row.querySelector("._add").addEventListener("click", () => { editing = { name: p.name, command: p.command, args: p.args || [], env: p.env || {}, cwd: p.cwd || "", meta: _mcpInstallMetaFromPreset(p), scope: "user", _orig: "", _origScope: "" }; renderForm(); });
-      list.appendChild(row);
-    });
-    // 被停用的单独列一段。不列出来就没有回头路——停用完就再也找不到它了。
-    for (const off of [...(doc.disabled?.values?.() || [])].sort()) {
-      const row = document.createElement("div"); row.className = "mcp-row mcp-row--avail";
-      row.innerHTML = `<div class="mcp-row__main"><div class="mcp-row__name"></div><div class="mcp-row__cmd">已停用 · 不会加载，也不会出现在智能体的工具里</div></div>` +
-        `<button class="ctp-btn ctp-btn--sm _restore" type="button">恢复</button>`;
-      row.querySelector(".mcp-row__name").textContent = off;
-      row.querySelector("._restore").addEventListener("click", async () => {
-        try {
-          await _setMcpServerDisabled(off, false);
-          _mcpLoaded = false; await _ensureMcpTools(root); renderList();
-          showToast(`已恢复「${off}」`);
-        } catch (e) { showToast("恢复失败：" + String(e?.message || e).slice(0, 120)); }
-      });
-      list.appendChild(row);
-    }
-    if (!list.children.length) { const e = document.createElement("div"); e.className = "ctp-empty"; e.textContent = "还没有 MCP 服务，点下面「添加服务」自定义一个。"; list.appendChild(e); }
-    m.body.appendChild(list);
-    const foot = document.createElement("div"); foot.className = "ctp-foot ctp-foot--between";
-    const reBtn = document.createElement("button"); reBtn.className = "ctp-btn"; reBtn.type = "button"; reBtn.textContent = "↻ 重新连接";
-    reBtn.addEventListener("click", async () => { reBtn.disabled = true; reBtn.textContent = "连接中…"; _mcpLoaded = false; await _ensureMcpTools(root); renderList(); });
-    const addBtn = document.createElement("button"); addBtn.className = "ctp-btn ctp-btn--primary"; addBtn.type = "button"; addBtn.textContent = "＋ 添加服务";
-    addBtn.addEventListener("click", () => { editing = { name: "", command: "", args: [], env: {}, cwd: "", scope: "user", _orig: "", _origScope: "" }; renderForm(); });
-    foot.append(reBtn, addBtn);
-    m.body.appendChild(foot);
-  };
-  const renderForm = () => {
-    const e = editing;
-    m.body.innerHTML = "";
-    const form = document.createElement("div"); form.className = "ctp-form";
-    form.innerHTML =
-      `<label class="ctp-lbl">作用范围</label><select class="ctp-input _scope">` +
-        `<option value="user">所有项目（推荐）— 保存到 ${_escHtml(userPath || "~/.michael-ide/mcp.json")}</option>` +
-        `<option value="local"${root ? "" : " disabled"}>仅这个项目 — 保存到 ${_escHtml(root ? mcpPath : ".mcp.local.json（需要先打开文件夹）")}</option>` +
-      `</select>` +
-      `<label class="ctp-lbl">服务名（英文/数字）</label><input class="ctp-input _name" placeholder="例如：filesystem" />` +
-      `<label class="ctp-lbl">启动命令</label><input class="ctp-input _cmd" placeholder="例如：npx" />` +
-      `<label class="ctp-lbl">参数（每行一个）</label><textarea class="ctp-textarea _args" rows="3" placeholder="-y&#10;@modelcontextprotocol/server-filesystem&#10;."></textarea>` +
-      `<label class="ctp-lbl">工作目录（可选，相对工作区或绝对路径）</label><input class="ctp-input _cwd" placeholder="例如：packages/api" />` +
-      `<label class="ctp-lbl">环境变量（KEY=VALUE，每行一个，可选）</label><textarea class="ctp-textarea _env" rows="2" placeholder="API_KEY=xxxx"></textarea>` +
-      `<div class="ctp-foot"><button class="ctp-btn _cancel" type="button">取消</button><button class="ctp-btn ctp-btn--primary _save" type="button">保存并连接</button></div>`;
-    m.body.appendChild(form);
-    form.querySelector("._scope").value = (e.scope === "local" && root) ? "local" : "user";
-    form.querySelector("._name").value = e.name || "";
-    form.querySelector("._cmd").value = e.command || "";
-    form.querySelector("._args").value = (e.args || []).join("\n");
-    form.querySelector("._cwd").value = e.cwd || "";
-    form.querySelector("._env").value = Object.entries(e.env || {}).map(([k, v]) => `${k}=${v}`).join("\n");
-    // Show WHERE to get the key/token for env vars we know about (clickable → opens in the browser).
-    const _keyLinks = Object.keys(e.env || {}).filter((k) => _MCP_KEY_URLS[k]);
-    if (_keyLinks.length) {
-      const hint = document.createElement("div"); hint.className = "mcp-keyhint";
-      _keyLinks.forEach((k) => {
-        const a = document.createElement("a"); a.href = "#"; a.className = "mcp-keyhint__link";
-        a.textContent = "🔑 去申请 " + k + " →";
-        a.addEventListener("click", (ev) => { ev.preventDefault(); _openMcpUrl(_MCP_KEY_URLS[k]); });
-        hint.appendChild(a);
-      });
-      const envEl = form.querySelector("._env");
-      if (envEl && envEl.parentNode) envEl.parentNode.insertBefore(hint, envEl.nextSibling);
-    }
-    form.querySelector("._cancel").addEventListener("click", () => { editing = null; renderList(); });
-    form.querySelector("._save").addEventListener("click", async () => {
-      const name = form.querySelector("._name").value.trim().replace(/\s+/g, "-");
-      const command = form.querySelector("._cmd").value.trim();
-      if (!name || !command) { showToast("请填写服务名和启动命令"); return; }
-      const args = form.querySelector("._args").value.split("\n").map((x) => x.trim()).filter(Boolean);
-      const cwd = form.querySelector("._cwd").value.trim();
-      const env = {};
-      form.querySelector("._env").value.split("\n").map((x) => x.trim()).filter((l) => l.includes("=")).forEach((l) => {
-        const k = l.slice(0, l.indexOf("=")).trim(); if (k) env[k] = l.slice(l.indexOf("=") + 1).trim();
-      });
-      const scope = form.querySelector("._scope").value === "local" ? "local" : "user";
-      try {
-        const c = await readScopeCfg(scope); const sv = c.mcpServers || c.servers || {};
-        if (e._orig && e._orig !== name) delete sv[e._orig];
-        sv[name] = { command, ...(args.length ? { args } : {}), ...(Object.keys(env).length ? { env } : {}), ...(cwd ? { cwd } : {}), ...(e.meta ? { __michael: e.meta } : {}) };
-        c.mcpServers = sv; delete c.servers;
-        await writeScopeCfg(scope, c);
-        // 改了作用范围就得把旧位置那份删掉，否则两边各留一份，改了半天不生效的是
-        // 优先级更高的旧那份。
-        if (e._origScope && e._origScope !== scope) await removeFromScope(e._origScope, e._orig || name);
-      } catch (err) { showToast("保存 MCP 配置失败：" + String(err?.message || err).slice(0, 120)); return; }
-      editing = null;
-      m.body.innerHTML = `<div class="ctp-loading">正在连接「${_escHtml(name)}」…</div>`;
-      _mcpLoaded = false; await _ensureMcpTools(root); renderList();
-    });
-    setTimeout(() => { try { form.querySelector("._name").focus(); } catch {} }, 0);
-  };
-  // Auto-connect on open so the user sees LIVE status, not a stale 未加载. First run downloads the
-  // package (npx/uvx) so it can take a while → show 连接中… and re-render with the real result.
-  if (!_mcpLoaded || _mcpLoadedRoot !== root) _mcpConnecting = true;
-  if (opts && opts.add) { editing = { name: "", command: "", args: [], env: {}, cwd: "", scope: "user", _orig: "", _origScope: "" }; renderForm(); }
-  else renderList();
-  if (_mcpConnecting) _ensureMcpTools(root).catch(() => {}).finally(() => { _mcpConnecting = false; renderList(); });
 }
 
 // --- Demo recorder: capture the REAL feature in action as a step-by-step
@@ -56489,7 +56122,7 @@ function renderMcpTool(body) {
       <div class="mcpfp-head">
         <div>
           <h3>MCP 服务器</h3>
-          <p class="mcpfp-sub">Model Context Protocol——给智能体接上外部工具（数据库、浏览器、API…）。安装后工具以 <code>mcp__服务__工具</code> 暴露给 AI 助手；配置保存在全局 <code>~/.michael-ide/mcp.json</code>（权限 0600），<b>换项目照样在</b>。列表里也会显示项目自带和 Claude Code / Cursor 里配好的服务。</p>
+          <p class="mcpfp-sub">给智能体接上外部工具（数据库、浏览器、API…）。装好的服务存在 <code>~/.mrdayone/mcp.json</code>，换项目照样在；项目自带的 <code>.mcp.json</code> 也会列出来。</p>
         </div>
         <button type="button" class="ctp-btn ctp-btn--primary" data-mcpfp="add-service">＋ 添加服务</button>
       </div>
@@ -56520,7 +56153,7 @@ function renderMcpTool(body) {
   const marketEl = wrap.querySelector("[data-mcpfp-market]");
   const sourceEl = wrap.querySelector("[data-mcpfp-source]");
 
-  // 市场页装出来的服务落在**全局**配置里（~/.michael-ide/mcp.json）。以前写的是当前
+  // 市场页装出来的服务落在**全局**配置里（~/.mrdayone/mcp.json）。以前写的是当前
   // 工作区的 .mcp.local.json：在市场里装好、填完 API Key，换个项目全没了，得再装再填
   // 一遍。装一次到处都在才是这个页面该有的语义。
   //
@@ -56534,8 +56167,14 @@ function renderMcpTool(body) {
   const writeCfg = _writeOwnMcpConfig;
   /// 展示用的**合并**视图：全局 + 项目 + 仓库 + 其他客户端，和智能体实际拿到的一致。
   const readMergedCfg = async () => {
-    try { const c = JSON.parse((await _readWorkspaceMcpDocument(root)).text || "{}"); return (c && typeof c === "object") ? c : {}; }
-    catch { return {}; }
+    try {
+      const doc = await _readWorkspaceMcpDocument(root);
+      const parsed = JSON.parse(doc.text || "{}");
+      // knownNames 要带出来：它记的是"所有来源里出现过的名字"（停用过滤之前），
+      // 「已停用」那一段靠它分辨「停用了但源还在」和「源已经没了」。只解析 text 的话
+      // 它会掉在这儿，于是每一条停用都被判成孤儿。
+      return { ...(parsed && typeof parsed === "object" ? parsed : {}), knownNames: doc.knownNames || new Set() };
+    } catch { return { knownNames: new Set() }; }
   };
 
   let addServiceOpen = false;
@@ -56555,7 +56194,7 @@ function renderMcpTool(body) {
       <div class="mcpfp-inline-form__head">
         <div>
           <strong>${_ed ? `编辑「${_escHtml(_ed.name)}」` : "添加自定义 MCP 服务"}</strong>
-          <p>保存后会写入全局 <code>~/.michael-ide/mcp.json</code>（所有项目通用），并立即尝试连接。</p>
+          <p>保存后写入 <code>~/.mrdayone/mcp.json</code>，所有项目通用，并立即尝试连接。</p>
         </div>
       </div>
       <div class="mcpfp-form-grid">
@@ -56592,7 +56231,7 @@ function renderMcpTool(body) {
   };
 
   const saveCustomMcpService = async (button = null) => {
-    // 不再要求先打开文件夹：这里写的是**全局**配置（~/.michael-ide/mcp.json），
+    // 不再要求先打开文件夹：这里写的是**全局**配置（~/.mrdayone/mcp.json），
     // 装一次到处都在，本来就不属于任何项目。以前拦在这儿，等于"想装 MCP 先随便开个项目"。
     const name = String(addFormEl?.querySelector("[data-mcpfp-new-name]")?.value || "").trim().replace(/\s+/g, "-");
     const command = String(addFormEl?.querySelector("[data-mcpfp-new-command]")?.value || "").trim();
@@ -56690,7 +56329,7 @@ function renderMcpTool(body) {
      *
      * 停用按钮的提示写着「可在 MCP 面板恢复」，而那个带恢复入口的面板（openMcpPanel）
      * 早就没有任何地方调用了——也就是说，停用是**单向**的：点完之后这个服务从界面上
-     * 彻底消失，只能去手改 ~/.michael-ide/mcp.json 的 disabled 数组。
+     * 彻底消失，只能去手改 ~/.mrdayone/mcp.json 的 disabled 数组。
      *
      * 而且这一段必须排在下面「还没配置」那个提前返回**之前**：把自己唯一一个服务停用了，
      * 恰好就会走到那个分支——最需要恢复入口的时刻，反而什么都看不到。
@@ -56698,21 +56337,30 @@ function renderMcpTool(body) {
     let disabledRows = "";
     try {
       const disabledMap = await _disabledMcpServers();
-      // 值是原始大小写（键才是小写），显示要用值，否则 Michael-Cursor 会显示成 michael-cursor。
+      // 值是原始大小写（键才是小写），显示要用值，否则 My-Server 会显示成 my-server。
       const names = [...(disabledMap?.values?.() || [])].map((v) => String(v || "")).filter(Boolean).sort();
+      // 停用记录是按名字存的，而配置来源会变（比如那份配置文件被删了、或者不再读它）。
+      // 名字在任何来源里都找不到时，这条记录就是个孤儿：「恢复」点下去什么也不会发生——
+      // 没有服务可恢复。那种情况要说实话，按钮也该是「清除」而不是「恢复」。
+      const known = new Set([...(cfg.knownNames || [])].map((v) => String(v).toLowerCase()));
       if (names.length) {
         disabledRows = `<div class="skfp-section">已停用（不会加载，也不会出现在智能体的工具里）</div>`
-          + names.map((name) => `
+          + names.map((name) => {
+            const orphan = !known.has(name.toLowerCase());
+            return `
             <div class="mcpfp-card mcpfp-card--installed is-off">
               <div class="mcpfp-card__main">
                 <div class="mcpfp-card__name"><strong>${_escHtml(name)}</strong>
-                  <span class="mcpfp-badge">已停用</span></div>
-                <p>停用记在本机的全局配置里，原始文件没有被改动。</p>
+                  <span class="mcpfp-badge">${orphan ? "来源已移除" : "已停用"}</span></div>
+                <p>${orphan
+                  ? "这条停用记录还在，但已经找不到对应的服务了（那份配置不再被读取）。清除它即可。"
+                  : "停用记在本机的全局配置里，原始文件没有被改动。"}</p>
               </div>
               <div class="mcpfp-card__btns">
-                <button type="button" class="ctp-btn ctp-btn--sm" data-mcpfp-restore="${_escAttr(name)}">恢复</button>
+                <button type="button" class="ctp-btn ctp-btn--sm" data-mcpfp-restore="${_escAttr(name)}">${orphan ? "清除" : "恢复"}</button>
               </div>
-            </div>`).join("");
+            </div>`;
+          }).join("");
       }
     } catch {}
 
@@ -57280,7 +56928,7 @@ function renderSkillsTool(body) {
       <div class="mcpfp-head">
         <div>
           <h3>Skills 技能</h3>
-          <p class="mcpfp-sub">技能始终对模型可见：清单里的名称和描述一直在上下文里，模型按需自己读取正文。「常驻」是把某个技能的全文钉进每次请求（也传给 Agent 子任务）。技能可以是自定义提示词，也可以是含 <code>SKILL.md</code> 的目录。只发现两个自有位置：工作区（含上级仓库）的 <code>.claude/skills/</code>（下面「安装」按钮的落点）和家目录的 <code>~/.michael-ide/skills/</code>。</p>
+          <p class="mcpfp-sub">技能一直对模型可见，它按需自己读正文；「常驻」是把全文钉进每次请求。装在工作区 <code>.claude/skills/</code> 或 <code>~/.mrdayone/skills/</code>。</p>
         </div>
         <button type="button" class="ctp-btn ctp-btn--primary" data-skfp="add-skill">＋ 添加技能</button>
       </div>
@@ -57377,7 +57025,7 @@ function renderSkillsTool(body) {
      * 面板要显示**模型手上的全部技能**，而不只是装进当前工作区的那些。
      *
      * 这里以前只留 _skillIsWorkspaceInstalled 的那批。可技能目录（_skillCatalogBlock）
-     * 读的是 _fileSkills 全量——家目录 ~/.michael-ide/skills 和上级仓库的都算。
+     * 读的是 _fileSkills 全量——家目录 ~/.mrdayone/skills 和上级仓库的都算。
      * 于是一个把技能装在家目录的人，模型明明按那些技能在干活，面板却写着「还没有技能」；
      * 想关掉其中某一个，界面上根本找不到它。面板和模型看到的必须是同一份。
      *

@@ -617,10 +617,23 @@ test("重复停用同一个不会写出两条", async () => {
 });
 
 test("面板要给出恢复入口，否则停用完就再也找不回来了", () => {
-  assert.match(SRC, /已停用 · 不会加载/);
-  assert.match(SRC, /_setMcpServerDisabled\(off, false\)/);
-  // 编辑仍然不给——走到那里的只剩仓库自带的 .mcp.json，那是版本库里的文件
-  assert.match(SRC, /editBtn\.disabled = true;/);
+  // 打的是设置面板那一页（renderMcpTool）。以前这条钉的是 openMcpPanel 里的字符串，
+  // 而那个面板全仓零调用点——测试绿着，用户点不到。
+  assert.match(SRC, /已停用（不会加载，也不会出现在智能体的工具里）/);
+  assert.match(SRC, /data-mcpfp-restore=/, "没有恢复按钮");
+  assert.match(SRC, /_setMcpServerDisabled\(restore, false\)/, "恢复按钮没接上写回");
+});
+
+test("停用记录的来源没了就说实话，别给一个点了不动的「恢复」", () => {
+  // 停用是按**名字**记的，而来源会变（配置文件被删、或者不再读那份配置）。名字在任何
+  // 来源里都找不到时，这条记录就是孤儿：「恢复」点下去什么也不会发生，因为没有服务可恢复。
+  const block = SRC.slice(SRC.indexOf("let disabledRows"), SRC.indexOf("let disabledRows") + 2200);
+  assert.match(block, /const orphan = !known\.has\(name\.toLowerCase\(\)\)/, "没分辨孤儿记录");
+  assert.match(block, /orphan \? "来源已移除" : "已停用"/, "孤儿记录还显示成普通的「已停用」");
+  assert.match(block, /orphan \? "清除" : "恢复"/, "按钮还写着「恢复」，可它恢复不了任何东西");
+  // knownNames 必须真的从合并结果里带出来，否则 known 恒空、每条停用都被判成孤儿。
+  assert.match(SRC, /knownNames: doc\.knownNames \|\| new Set\(\)/, "面板没把 knownNames 带出来");
+  assert.match(SRC, /knownNames\.add\(name\);/, "合并时没有记下「来源里出现过的名字」");
 });
 
 // ── 全局配置的读写：不丢 disabled，不覆盖读不动的文件 ─────────────────────────
@@ -691,21 +704,23 @@ test("文件不存在是首次运行，不是损坏——必须能写进第一�
 // 这几条对**原文**匹配，不先剥注释：stripJsComments 的块注释规则会被文件里字符串
 // 内的 /* 带偏，把真代码一起吞掉（这一行就中过招）。而下面这些模式足够具体，
 // 解释性的注释里不会原样出现，所以对原文匹配反而更准。
-test("面板的三个读写口走的是同一对函数，不各写各的", () => {
+test("面板的读写口走的是同一对函数，不各写各的", () => {
   assert.match(SRC, /const readCfg = _readOwnMcpConfig;/, "市场页还在自己读一遍");
   assert.match(SRC, /const writeCfg = _writeOwnMcpConfig;/, "市场页还在自己写一遍");
-  assert.match(SRC, /if \(scope === "user"\) return _readOwnMcpConfig\(\);/, "作用域读取器没走统一口");
-  assert.match(SRC, /if \(scope === "user"\) \{ await _writeOwnMcpConfig\(cfg\); return; \}/, "作用域写入器没走统一口");
   assert.match(extractFn("_setMcpServerDisabled"), /_readOwnMcpConfig\(\)[\s\S]*_writeOwnMcpConfig\(/,
     "停用/恢复没走统一口");
 });
 
 test("文件读不动时面板要说出来，而且要排在「还没配置」之前", () => {
+  // 钉的是**拼接顺序**，不是"这两段代码挨得近"。以前这条量的是 2000 字节的窗口，
+  // 中间插一段新逻辑就会假红——而它要保证的性质其实很简单：坏文件横幅排在空状态前面。
   const at = SRC.indexOf("还没配置 MCP 服务——从下面的热门清单");
   assert.ok(at > 0, "找不到空状态文案");
-  const before = SRC.slice(Math.max(0, at - 2000), at);
-  assert.match(before, /parseError/, "空状态之前没有检查解析失败——坏文件会被显示成「还没配置」");
-  assert.match(before, /data-mcpfp-openbroken/, "没给出打开那个文件的入口");
+  const assembly = SRC.slice(SRC.lastIndexOf("installedEl.innerHTML", at), at);
+  assert.match(assembly, /^installedEl\.innerHTML = brokenBanner/,
+    "空状态那条 innerHTML 没有先拼坏文件横幅——一个多打逗号的配置会被显示成「还没配置」");
+  assert.match(SRC, /data-mcpfp-openbroken/, "没给出打开那个文件的入口");
+  assert.match(SRC.slice(0, at), /brokenBanner = String\(brokenCfg\.parseError/, "横幅不是由解析失败驱动的");
 });
 
 // ── ${VAR} 展开：从 Claude Code / Cursor 导入的服务能真的通过鉴权 ────────────────
