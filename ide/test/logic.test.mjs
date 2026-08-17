@@ -18133,8 +18133,12 @@ test("方案D：布尔思考开关模型诚实两态——能力表驱动，不�
   assert.ok(!gpt.booleanToggle && gpt.levels.includes("medium"));
   const gemini = profileFor("gemini-3-pro");
   assert.ok(!gemini.booleanToggle && gemini.levels.includes("medium"));
-  // 渲染层由能力位驱动（不散落模型名）：标题换「思考（仅开/关）」，非 off 档 tip 用能力说明
-  assert.match(SRC, /const _boolToggle = !!profile\.booleanToggle \|\| profile\.kind === "kimi-toggle";/);
+  // 渲染层由能力位驱动（不散落模型名）：标题换「思考（仅开/关）」，非 off 档 tip 用能力说明。
+  // 判据只剩 booleanToggle 一个——原来那句还带 `|| profile.kind === "kimi-toggle"`，
+  // 而 kind 是**发送形状**不是**档位数量**：目录给出多档时同一个 kind 也会有三档可选，
+  // kind 那半边会把 _thinkingProfileFor 撤销 booleanToggle 的动作整个吃掉，
+  // 于是 GLM-5.2 拿到三档却仍按"仅开/关"渲染，滑块写成 关闭|开启|超高。
+  assert.match(SRC, /const _boolToggle = !!profile\.booleanToggle;/);
   assert.match(SRC, /t\(_boolToggle \? "model\.thinkingToggle" : "model\.thinkingDepth"\)/,
     "布尔模型的选择器标题不得写「思考深度」");
   // 卡片现在一条**档位说明都不渲染**了（用户要求去掉那几段文字），所以"布尔模型别说
@@ -24900,6 +24904,20 @@ test("目录给出多档时，布尔开关族要展开成真档位而不是停�
   assert.deepEqual(p.levels, ["off", "high", "xhigh"], "目录声明的 xhigh 被过滤掉了，用户选不到");
   assert.equal(p.kind, "kimi-toggle", "kind 不能改——请求参数是按它分派构造的");
   assert.equal(p.booleanToggle, false, "booleanToggle 没撤销，UI 会把多出来的档位吞回成两态开关");
+});
+
+test("卡片的两态渲染只认 booleanToggle 这一个旗标，不许再看 kind", () => {
+  // 上一版把 booleanToggle 置 false 之后**什么都没发生**：渲染层写的是
+  // `!!profile.booleanToggle || profile.kind === "kimi-toggle"`，kind 那半边把撤销整个吃掉。
+  // 结果 GLM-5.2 确实拿到了三档，标题却仍写"仅开/关"、high 仍被改写成"开启"，
+  // 滑块渲染成 关闭|开启|超高——比不修还费解，而当时的三条守卫全都只断言 profile 对象，
+  // 一条都测不到这里。kind 是**发送形状**，不是**档位数量**，它不该参与这个判断。
+  const at = SRC.indexOf("const _boolToggle =");
+  assert.ok(at > 0, "_boolToggle 改名了，这条守卫要跟着改");
+  const line = SRC.slice(at, SRC.indexOf("\n", at));
+  assert.doesNotMatch(line, /kind/,
+    "两态渲染又开始看 kind 了，_thinkingProfileFor 撤销 booleanToggle 那一步会再次变成死代码：" + line.trim());
+  assert.match(line, /profile\.booleanToggle/);
 });
 
 test("目录没给档位的布尔开关模型，行为一个字不变", () => {

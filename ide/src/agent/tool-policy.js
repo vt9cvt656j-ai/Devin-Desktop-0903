@@ -162,6 +162,34 @@ function seed() {
   // 用户 sudo 装一张根证书。这不该是一句「我顺手开了抓包」就发生的事。
   defineTool("capture_start", { needsApproval: true });
 
+  // ── 有真实外部副作用、却一直没登记的四个 ──────────────────────────────────
+  //
+  // 这四个是审计（2026-08-17）挖出来的：它们和上面 uiclick / automation 是同一类东西
+  // （越过工作区去动真实世界），但从来没进过这张表。没进表 = needsApproval 取默认值
+  // false = 「改动前审批」开着也一次框都不弹，只读模式也不拦。而防漂移守卫只看得见
+  // **已登记且 mutatesWorkspace** 的类型，对完全没登记的工具恒绿——所以漏了很久没人发现。
+  //
+  // browser：跑在一个常驻登录态的自动化 profile 上。action:"eval" 是任意 JS，
+  //   "cookies"/"storage" 直接读走会话，"upload" 收的是**本机绝对路径**（模型可以填
+  //   ~/.ssh/id_rsa），"autofill"+提交能替用户按下不可撤销的按钮。同一时刻写一个文件
+  //   要弹框，这些不弹——这不是权衡，是漏登记。只读模式下同样要拦：读 cookie 不是"只读"。
+  defineTool("browser", {
+    needsApproval: true,
+    // 纯导航/截图/读页面是观察，不该在只读模式里被一刀切；动到会话、文件、执行和提交的
+    // 那几个 action 才是副作用。审批门则一律要过——观察别人的登录态浏览器也该让人知情。
+    readOnlyModeBlocked: (call) => !["navigate", "screenshot", "read", "text", "back", "forward", "close"]
+      .includes(String(call?.action || "")),
+  });
+  // docker_compose_up：直接起一整套容器（`docker compose up -d`），占端口、挂卷、
+  //   长期后台运行，停不停得掉不归本轮管。这是执行，不是读。
+  defineTool("docker_compose_up", { ...EXEC, readOnlyModeBlocked: true });
+  // capture_replay：可以指定任意 method / url / body 直接发出去，而且**不要求真有一条
+  //   抓包记录**——等于绕开 http_request 那道审批门的一条完整旁路。同门同待遇。
+  defineTool("capture_replay", { needsApproval: true, readOnlyModeBlocked: true });
+  // system：开 App、切前台窗口、触发任意 App 的菜单项。main.js 另一处早已把它判成
+  //   「有外部副作用」，只有这张表不知道。
+  defineTool("system", { needsApproval: true, readOnlyModeBlocked: true });
+
   // ── generators that land assets in the workspace ──────────────────────────
   for (const t of [
     "game_scaffold", "web_scaffold", "download_asset", "genimage", "generate_3d",
