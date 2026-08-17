@@ -573,6 +573,14 @@ function _lspMarkPrompted(langId) {
   } catch {}
 }
 
+/// 当前是不是 Windows。安装命令、以及"装好了没"的探测方式都得按这个分。
+function isWindows() {
+  try {
+    const nav = typeof navigator !== "undefined" ? navigator : null;
+    return /Win/i.test(nav?.userAgentData?.platform || nav?.platform || nav?.userAgent || "");
+  } catch { return false; }
+}
+
 export function createLspManager(options) {
   const {
     backend,
@@ -717,32 +725,61 @@ export function createLspManager(options) {
       const msg = String(e && e.message ? e.message : e);
       const alreadyRunning = /already running/i.test(msg);
       if (alreadyRunning) { onLog?.(`[lsp] ${langId}: ${msg}`); return null; }
-      const installHints = {
-        // venv-safe: inside an active project venv, `--user` is rejected, so fall back to a plain
-        // (venv) install → pyright-langserver lands in `.venv/bin` (persists with the project). No
-        // venv → `--user` puts it in `~/.local/bin` (on our augmented PATH). Either way it's found.
-        python: "pip install --user pyright 2>/dev/null || pip install pyright",
+      /*
+       * 安装命令按平台分。以前整张表是照 macOS 写的，Windows 上是三重失败：
+       *
+       *   1. 22 个语言里 11 个写的是 `brew install` —— Windows 上根本没有 brew，
+       *      终端里蹦出一句「'brew' 不是内部或外部命令」。
+       *   2. Pyright 那条的 `2>/dev/null` 在 cmd 里不是"丢弃错误输出"，是往
+       *      `.\dev\null` 这个不存在的目录里写文件，于是重定向本身就失败。
+       *   3. 命令是打进**交互终端**执行的，而 Windows 上那个终端是 cmd / PowerShell
+       *      （terminal.rs 读 COMSPEC），不是 Git Bash——POSIX 写法一句都不成立。
+       *
+       * 所以：能跨平台的（pip / npm / go / gem / rustup / dotnet）两边共用一条；只在
+       * 某个平台有包的，另一个平台**宁可不给命令**也不给一条注定失败的——给了就是让用户
+       * 点一下、看它报错、再等 90 秒进度条转完告诉他"安装超时"。没有命令时通知里不带
+       * 「安装」按钮，改成告诉他去哪儿装。
+       */
+      const CROSS = {
+        // pip 装的 pyright 自带 node 运行时。不再用 `--user … || …` 那套：`--user` 在
+        // 激活的 venv 里会被 pip 拒绝，原来的写法靠 POSIX 重定向吞掉报错再退回普通装，
+        // 换个 shell 就不成立。直接普通装——有 venv 就落进 venv，没有就落进用户目录，
+        // 两种情况 augmented PATH 都找得到。
+        python: "pip install pyright",
         rust: "rustup component add rust-analyzer",
         go: "go install golang.org/x/tools/gopls@latest",
+        ruby: "gem install solargraph",
+        php: "npm i -g intelephense",
+        shell: "npm i -g bash-language-server",
+        yaml: "npm i -g yaml-language-server",
+        graphql: "npm i -g graphql-language-service-cli",
+        dockerfile: "npm i -g dockerfile-language-server-nodejs",
+        vue: "npm i -g @vue/language-server",
+      };
+      const MAC_ONLY = {
         c: "brew install llvm",
         cpp: "brew install llvm",
         "objective-c": "brew install llvm",
         java: "brew install jdtls",
-        ruby: "gem install solargraph",
-        php: "npm i -g intelephense",
         lua: "brew install lua-language-server",
-        shell: "npm i -g bash-language-server",
-        yaml: "npm i -g yaml-language-server",
         csharp: "brew install omnisharp",
         kotlin: "brew install kotlin-language-server",
         elixir: "brew install elixir-ls",
         clojure: "brew install clojure-lsp",
         scala: "brew install coursier && cs install metals",
         hcl: "brew install hashicorp/tap/terraform-ls",
-        graphql: "npm i -g graphql-language-service-cli",
-        dockerfile: "npm i -g dockerfile-language-server-nodejs",
-        vue: "npm i -g @vue/language-server",
       };
+      // Windows 上只写有把握的：winget 里确实有 LLVM 这个包（clangd 在里面）。
+      // 其余几个在 Windows 上只有 GitHub release 或多步安装，与其给一条会失败的命令，
+      // 不如不给。
+      const WIN_ONLY = {
+        c: "winget install -e --id LLVM.LLVM",
+        cpp: "winget install -e --id LLVM.LLVM",
+        "objective-c": "winget install -e --id LLVM.LLVM",
+      };
+      const installHints = isWindows()
+        ? { ...CROSS, ...WIN_ONLY }
+        : { ...CROSS, ...MAC_ONLY };
       const names = {
         python: "Pyright", rust: "rust-analyzer", go: "gopls", c: "clangd", cpp: "clangd",
         "objective-c": "clangd", java: "jdtls", ruby: "Solargraph", php: "Intelephense",
@@ -754,14 +791,19 @@ export function createLspManager(options) {
       const hint = installHints[langId];
       let toolExists = false;
       try { toolExists = await backend.lspCheckAvailable(langId); } catch { /* ignore */ }
-      if (!toolExists && hint && showNotification && !_lspAlreadyPrompted(langId)) {
+      if (!toolExists && showNotification && !_lspAlreadyPrompted(langId) && names[langId]) {
         _lspMarkPrompted(langId); // show at most ONCE ever — never nag again on later file-opens
         showNotification({
           title: `缺少 ${names[langId] || langId} 语言服务器`,
-          message: `装了能获得智能补全 / 跳转定义（不装也能正常写代码、运行程序，不影响用）`,
-          actionLabel: "安装",
+          message: hint
+            ? `装了能获得智能补全 / 跳转定义（不装也能正常写代码、运行程序，不影响用）`
+            : `这个平台上它没有一键安装的包，需要手动装 ${names[langId] || langId}（不装也能正常写代码、运行程序）`,
+          actionLabel: hint ? "安装" : undefined,
           duration: 20000,
           installCmd: hint,
+          // 装完之后靠它判断成没成——后端那个探测是跨平台的（Windows 上会扫
+          // .exe/.cmd/.bat），比在前端拼一句 POSIX 命令可靠得多。
+          langId,
         });
       } else if (toolExists) {
         showToast(`${names[langId] || langId} 启动失败: ${msg}`);
