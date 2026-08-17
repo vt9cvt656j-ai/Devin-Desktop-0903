@@ -395,6 +395,16 @@ fn enforce_final_tool_budget(body: &mut serde_json::Value) -> (usize, usize) {
 }
 
 const USER_REQUEST_MARKER: &str = "📌 **This turn's user request**: ";
+/// harness 往上下文里注入的每一段编排提示都以这个信封开头（客户端的 _ORCH_NOTE）。
+///
+/// 记它是为了回答一个此前完全不可观测的问题：**这一轮到底是谁在说话**。2026-08-17 实测，
+/// 用户的一句话 83 字节，组装后发出去 21,643 字节——比例 1:260，而运行中还能继续插话的
+/// 提醒有 25 类。每一段单看都有道理，合起来就把人挤出去了，却没有任何一处代码为「人的话
+/// 占多少比重」负责。先量出来，才谈得上裁剪。
+///
+/// 只取前缀：信封正文会随文案调整，前缀是稳定的那一截。跨仓一致性由 ide 侧的
+/// wiring.test.mjs 钉着——两个文件两种语言约定同一个字面量，漂了就是静默失效。
+const ORCH_NOTE_MARKER: &str = "〔系统编排提示";
 const USER_STEERING_MARKER: &str = "[MICHAEL_USER_STEERING]";
 const USER_REQUEST_BOUNDARY_PREFIX: &str =
     "━━━━━━━━━━━━━━━━━━━━━━━━\n📌 **This turn's user request**: ";
@@ -3773,6 +3783,17 @@ pub fn assemble_into(headers: &HeaderMap, body: &mut serde_json::Value) -> Resul
     // 复用函数开头那份（同一次解析），排序后再记，避免 HashSet 的随机顺序让日志难比对。
     let mut semantic_profile_seen: Vec<&str> = semantic_profile.iter().map(String::as_str).collect();
     semantic_profile_seen.sort_unstable();
+    // 这一轮 harness 自己说了多少：带编排信封的消息条数与字节数。正文一个字都不进日志。
+    let (orch_msg_count, orch_bytes) = body
+        .get("messages")
+        .and_then(|messages| messages.as_array())
+        .map_or((0usize, 0usize), |messages| {
+            messages
+                .iter()
+                .filter_map(|message| message.get("content").and_then(|c| c.as_str()))
+                .filter(|text| text.contains(ORCH_NOTE_MARKER))
+                .fold((0usize, 0usize), |(n, bytes), text| (n + 1, bytes + text.len()))
+        });
     let marked_request_bytes = anchor_request.as_deref().map_or(0, str::len);
     let last_user_bytes = body
         .get("messages")
@@ -3803,6 +3824,8 @@ pub fn assemble_into(headers: &HeaderMap, body: &mut serde_json::Value) -> Resul
         marked_request_bytes,
         last_user_bytes,
         semantic_profile_seen = ?semantic_profile_seen,
+        orch_msg_count,
+        orch_bytes,
         "assembled IDE prompt request"
     );
     record_agent_trace(AgentTraceInput {
