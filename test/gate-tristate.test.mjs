@@ -257,7 +257,10 @@ test("schema 不许比实现更严——模型不填就整轮失败", () => {
 
   // git_clone：target 改成可选，并且实现要能从仓库地址推出落地目录名。
   assert.deepEqual(req("git_clone"), ["source"], "git_clone 的 target 又变成必填了");
-  assert.match(SRC, /const _inferred = \(_src\.replace\(\/\\\.git\$\/i, ""\)/,
+  // 不钉源变量名：推断的输入现在是**清洗过**的地址（粘网页链接时先截回 owner/repo），
+  // 名字还会再变。守的是「有这一步、且会剥掉 .git」。行为断言在
+  // test/tool-contract-sweep.test.mjs 里，那边是真把参数喂进归一化去比结果。
+  assert.match(SRC, /const _inferred = \([\w$]+\.replace\(\/\\\.git\$\/i, ""\)/,
     "缺了「从仓库地址推目录名」——只放宽 schema 而不给默认值，落地目录会是空字符串");
 
   // 其余几处：实现有真实默认值的字段不该拦在 schema 上。

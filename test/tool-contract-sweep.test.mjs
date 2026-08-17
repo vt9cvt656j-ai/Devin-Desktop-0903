@@ -173,6 +173,44 @@ test("必填参数不会在归一化里被静默丢掉", () => {
     "必填参数在归一化后消失了——工具会拿着空参数去跑，错误信息还会指向别处");
 });
 
+test("git_clone 认得模型真会发的各种参数形状", () => {
+  // 被实拍到的那个 bug 就在这里：模型填了仓库地址，归一化认不出键名/形状，
+  // 拿着空 source 去执行。schema 层的断言（required 是不是 ["source"]）看不出这个，
+  // 只有真把参数喂进去才看得出来。
+  const catalog = buildCatalog();
+  const map = buildMapToolCall(catalog);
+  const clone = (args) => map("git_clone", args, new Map());
+  const REPO = "https://github.com/vercel/next.js.git";
+
+  // 键名怎么叫都得认：模型不会永远写 source。
+  for (const key of ["source", "url", "repo", "repository", "remote"]) {
+    const call = clone({ [key]: REPO });
+    assert.equal(call.source, REPO, `${key} 这个键名没被认出来`);
+    assert.equal(call.target, "next.js", "落地目录没从仓库名推出来");
+  }
+  // 落地目录同样有一堆叫法，给了就必须尊重，不能被推断覆盖。
+  for (const key of ["target", "dest", "destination", "dir", "directory", "to"]) {
+    assert.equal(clone({ url: REPO, [key]: "myapp" }).target, "myapp", `${key} 指定的目录被忽略了`);
+  }
+  assert.equal(clone({ repository: "git@github.com:vercel/next.js.git" }).target, "next.js",
+    "SSH 形式的地址推不出目录名");
+
+  // 粘网页链接：git clone 不动这种地址，而且照最后一段推会推出 "main"。
+  assert.deepEqual(
+    (({ source, target }) => ({ source, target }))(clone({ url: "https://github.com/foo/bar/tree/main" })),
+    { source: "https://github.com/foo/bar", target: "bar" },
+  );
+  assert.deepEqual(
+    (({ source, target }) => ({ source, target }))(clone({ url: "https://github.com/foo/bar/blob/main/src/app.ts" })),
+    { source: "https://github.com/foo/bar", target: "bar" },
+  );
+  // 但真有仓库就叫 tree —— 那种不能被截掉。
+  assert.deepEqual(
+    (({ source, target }) => ({ source, target }))(clone({ url: "https://github.com/foo/tree" })),
+    { source: "https://github.com/foo/tree", target: "tree" },
+  );
+});
+
 test("网关那份工具目录和客户端目录不漂移", () => {
   // 走网关的用户（绝大多数）看到的 schema 来自 server/prompts/tools.json，执行却在客户端。
   // 名字或参数漂了，就会出现"模型被告知能填某个参数、客户端根本没声明"这种沉默失效。
