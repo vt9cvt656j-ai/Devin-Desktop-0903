@@ -20732,10 +20732,19 @@ const _AI_AGENT_ROLES = new Set([
   "security", "test", "devops", "design", "docs",
 ]);
 const _aiIntentCache = new Map(); // 会话 + 上下文指纹 + 文本 -> { ts, intents }
-const _aiIntentInflight = new Map(); // key -> 物理请求 Promise；8s 前台窗口结束后仍保留到真实落定
+const _aiIntentInflight = new Map(); // key -> 物理请求 Promise；前台窗口结束后仍保留到真实落定
 // 意图裁决的前台等待窗口。物理请求的寿命比它长（迟到的裁决仍落 cache），这里只决定
 // "当前这一轮愿意等多久"。
-const _INTENT_FOREGROUND_WAIT_MS = 8000;
+// 8000 曾经是这个值，理由是「覆盖实测的 6931ms / 7599ms」——余量只有几百毫秒，于是它变成
+// 一场五五开的赌博：赶上了这一轮就有 engineering / research / design 各层（实测提示词
+// 26951 字节），赶不上就只剩 agent.base 四块（18885 字节），模型手里没有工程和调研纪律，
+// 于是把「deepseek 最近有什么进展」这种外部知识问题回成一句「准备就绪，有什么需要我做的」。
+// 线上两种字节数交替出现，就是这个赌博的两面。
+//
+// 抬高这个数**没有代价**，这一点是关键：它是 Promise.race 的超时臂，裁决一落定就立刻放行。
+// 所以 8000 → 15000 只在「裁决慢到 8 秒以上」（也就是现在本来就失败）的那些轮次多等，
+// 快的轮次一毫秒都不多花。上限存在的意义只剩一个：上游卡死时别把一轮无限期挂住。
+const _INTENT_FOREGROUND_WAIT_MS = 15000;
 // 新会话第一轮愿意为意图裁决多等多久。整个会话只付一次：拿到裁决之后画像就粘住了。
 //
 // 这个值必须 >= 前台窗口，否则这道等待是**恒定失败**的：裁决用的是用户选的那个模型
