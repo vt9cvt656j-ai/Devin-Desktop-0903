@@ -22119,6 +22119,39 @@ function _extractStackHints(fileMap) {
   if (fileMap["Makefile"] && !out.testCmd) {
     if (/^test:/m.test(fileMap["Makefile"])) out.testCmd = "make test";
   }
+  if (fileMap["pom.xml"]) {
+    out.lang = out.lang ? out.lang + " + Java" : "Java";
+    out.pkgMgr = out.pkgMgr || "Maven";
+    out.testCmd = out.testCmd || "mvn -q test";
+    out.checkCmd = out.checkCmd || "mvn -q compile";
+    out.buildCmd = out.buildCmd || "mvn -q package";
+  }
+  const _gradle = fileMap["build.gradle"] || fileMap["build.gradle.kts"];
+  if (_gradle) {
+    out.lang = out.lang ? out.lang + " + JVM" : (/kotlin/i.test(_gradle) ? "Kotlin" : "Java");
+    out.pkgMgr = out.pkgMgr || "Gradle";
+    out.testCmd = out.testCmd || "./gradlew test";
+    out.checkCmd = out.checkCmd || "./gradlew build";
+    out.buildCmd = out.buildCmd || "./gradlew build";
+  }
+  if (fileMap["composer.json"]) {
+    out.lang = out.lang ? out.lang + " + PHP" : "PHP";
+    out.pkgMgr = out.pkgMgr || "Composer";
+    try {
+      const scripts = JSON.parse(fileMap["composer.json"])?.scripts || {};
+      if (scripts.test) out.testCmd = out.testCmd || "composer test";
+    } catch {}
+  }
+  if (fileMap["Gemfile"]) {
+    out.lang = out.lang ? out.lang + " + Ruby" : "Ruby";
+    out.pkgMgr = out.pkgMgr || "Bundler";
+    if (!out.testCmd) {
+      // 没读到 Rakefile/spec 目录就只是常规猜测——如实标注，模型跑到 127 时才知道
+      // 该换命令而不是当成代码错误。
+      out.testCmd = /rspec/i.test(fileMap["Gemfile"]) ? "bundle exec rspec" : "bundle exec rake test";
+      (out.guessedCmds = out.guessedCmds || []).push(out.testCmd);
+    }
+  }
   return out;
 }
 
@@ -22699,7 +22732,12 @@ async function _gatherAgentContext(query, sessionRoot) {
   const _others = _allRoots().filter((r) => r !== _activeNorm);
   const _otherTreesPromise = Promise.all(_others.slice(0, 4)
     .map((r) => _workspaceTreeSnapshot(r, { maxLines: 40, maxDepth: 2 }).then((tree) => [r, tree]).catch(() => [r, ""])));
-  const keyFiles = ["package.json", "README.md", "Cargo.toml", "pyproject.toml", "go.mod", "Makefile", "requirements.txt"];
+  // 漏掉一类构建描述文件，代价不是"少认一个栈"，是整块栈提示**一个字都不出**：
+  // lang 为空 → _formatStackHint 直接返回 ""，模型连一行「怎么跑测试」都收不到，
+  // 只能靠猜或者干脆一条验证命令都不跑就交付。讽刺的是验证器白名单本来就认得
+  // mvn/gradle/dotnet 这些命令——能认，但从来发现不了。
+  const keyFiles = ["package.json", "README.md", "Cargo.toml", "pyproject.toml", "go.mod", "Makefile", "requirements.txt",
+    "pom.xml", "build.gradle", "build.gradle.kts", "composer.json", "Gemfile"];
   const _keyReadsPromise = Promise.all(keyFiles.map(name =>
     backend.readTextFile(root + "/" + name).catch(() => null).then(c => c?.trim() ? [name, c] : null)
   ));
@@ -36965,7 +37003,12 @@ function _trimMessagesIfHuge(messages, run = null, root = "", contextLimitTok = 
     for (let i = 1; i < lastKeep; i++) {
       const m = messages[i];
       if (m.role === "assistant" && !m.tool_calls && m.content && String(m.content).length > 600) {
-        messages[i] = { ...m, content: String(m.content).slice(0, 400) + "\n…（较早回复已折叠）" };
+        // 盲切前缀是最坏的切法：结论写在末尾。`!m.tool_calls` 这个条件恰好把打击面
+        // 对准了**纯推理轮**——「我分析下来根因是 X，因此决定用方案 B」这种只说话不
+        // 动手的回合，被砍掉的正是那句决定。而且 assistant 正文是全场唯一没有任何
+        // 工具能重新取回的内容（工具结果折叠时至少还留着"重新调用 X 取回"的退路）。
+        // 症状：长任务过半之后它把早就定下的方案重新推导一遍，还常推出不一样的结论。
+        messages[i] = { ...m, content: _foldAssistantText(String(m.content), 400) };
       }
     }
   }
@@ -37142,11 +37185,34 @@ function _headTailModelText(value, maxChars) {
   return text.slice(0, head) + marker + text.slice(-tail);
 }
 
+// 折叠**自己**早先的回复：保留头尾，因为结论在末尾。
+//
+// 不复用 _headTailModelText：那句 marker 的收尾是"需要完整内容就换更窄的查询重取"，
+// 那是写给工具结果的。贴到 assistant 自己的旧回复上等于叫模型去重取一段根本没有任何
+// 工具能取回的文本——正好和这里要治的毛病相冲。
+function _foldAssistantText(text, budget) {
+  const raw = String(text ?? "");
+  const limit = Math.max(0, Math.floor(Number(budget) || 0));
+  if (!limit || raw.length <= limit) return raw;
+  const marker = "\n…（你这段早先的回复太长，只保留了开头和结尾；中间已永久省略，无法取回。"
+    + "下面的结尾部分是当时的结论，以它为准，不要重新推导。）\n";
+  if (limit <= marker.length + 2) return raw.slice(-limit);
+  const remaining = limit - marker.length;
+  const head = Math.ceil(remaining * 0.35); // 结论比开场白值钱，尾部多给一点
+  const tail = Math.max(1, remaining - head);
+  return raw.slice(0, head) + marker + raw.slice(-tail);
+}
+
 // ── 方案B/E 统一裁剪出口 ──────────────────────────────────────────────────────
 // 错误关键行判定：编译/运行报错、系统 errno、异常栈帧。仅作"裁剪时豁免保留"的
 // 尺寸控制辅助，不做语义分类（语义判断仍归模型）。
+// 测试失败的主标记也算错误行。原表只有 `failed`，只能命中汇总行（"3 failed"）——
+// 而汇总行只说挂了几条，不说哪条、为什么。真正要救的是 jest/vitest 的 `FAIL x.test.ts`
+// 和 `✕`、go 的 `--- FAIL: TestX`、TAP/node --test 的 `not ok 1 -`、pytest 的 `E assert`，
+// 以及 Expected/Received 这对明细。它们全落在被对折掉的中段里，模型于是凭猜去改。
 function _hasErrorLine(text) {
-  return /error|E\d{3}|ENOENT|EACCES|panic|exception|fatal|failed|Traceback|\bat\s+.+:\d+/i.test(String(text || ""));
+  return /error|E\d{3}|ENOENT|EACCES|panic|exception|fatal|fail(ed)?\b|--- FAIL|not ok \d|[✕✗×]|AssertionError|assert\b|Expected:|Received:|Traceback|\bat\s+.+:\d+/i
+    .test(String(text || ""));
 }
 
 // 在预算内裁剪长文本，但被裁掉中段里的错误关键行（含前后各 1 行上下文）以豁免块
@@ -38817,6 +38883,12 @@ function _toolExecutionSucceeded(call, result) {
 function _toolExecutionAttempted(result) {
   return result?.failure?.attempted !== false;
 }
+// 打包/构建命令：这两条正则原来只活在 _runtimeCommandKinds 里，验证器白名单一条都不认。
+// 后果是"打包失败的红命令被红构建门直接跳过"——用户说「打个包」，签名步骤退出 1，
+// 模型接着回一句「已成功打包」。放宽方向是安全的：发绿灯那侧 _evidenceCertifies 仍然
+// 要求 exitCode===0 且实现版本对得上，所以这一改只会让**失败的**打包被拦住。
+const _TAURI_BUILD_RE = /^(?:(?:npm|pnpm|yarn|bun)(?:\s+run)?\s+tauri\s+build\b|(?:npm|pnpm|yarn|bun)\s+exec\s+tauri\s+build\b|(?:npx|bunx)\s+tauri\s+build\b|cargo\s+tauri\s+build\b|tauri\s+build\b)/i;
+const _PACKAGE_CMD_RE = /^(?:(?:npm|pnpm|yarn|bun)(?:\s+run)?\s+(?:package|pack|dist|bundle|make)\b|electron-builder\b|(?:electron-forge|npx\s+electron-forge)\s+make\b|pyinstaller\b|cargo\s+bundle\b|dotnet\s+publish\b|mvn\s+package\b|(?:gradle\w*|\.\/gradlew)\s+assemble\b|xcodebuild\b[^\n]*\barchive\b|docker\s+build\b)/i;
 function _looksLikeVerificationCommand(command) {
   // Redirects are presentation, not semantics. `2>&1` is the most common way to capture
   // build output — the agent emits it by default — and rejecting the whole command on a
@@ -38842,7 +38914,7 @@ function _looksLikeVerificationCommand(command) {
     new RegExp(String.raw`^node\s+--check\b${safeArgs}$`, "i"),
     new RegExp(String.raw`^node\s+--test\b${safeArgs}$`, "i"),
     new RegExp(String.raw`^python\d*\s+-m\s+(?:compileall|py_compile)\b${safeArgs}$`, "i"),
-    new RegExp(String.raw`^(?:mvn|gradle\w*|\./gradlew)\s+(?:test|check|build)\b${safeArgs}$`, "i"),
+    new RegExp(String.raw`^(?:mvn|gradle\w*|\./gradlew)(?:\s+-{1,2}[\w.-]+)*\s+(?:test|check|build|verify)\b${safeArgs}$`, "i"),
     new RegExp(String.raw`^dotnet\s+(?:test|build)\b${safeArgs}$`, "i"),
     // The runners real projects actually invoke, directly or via npx/dlx. Without these,
     // `npx vite build` — the canonical Vite verification — matched nothing at all.
@@ -38884,6 +38956,8 @@ function _isRecognizedVerifierCommand(command, stack = null) {
   const normalized = _normalizedVerifierCommand(command);
   if (!normalized) return false;
   if (_looksLikeVerificationCommand(normalized)) return true;
+  // 打包也是验证：它跑失败了就该被红构建门看见。
+  if (_PACKAGE_CMD_RE.test(normalized) || _TAURI_BUILD_RE.test(normalized)) return true;
   const declared = _verificationCommandsForStack(stack)
     .map(_normalizedVerifierCommand)
     .filter(Boolean);
@@ -39495,8 +39569,8 @@ function _runtimeCommandKinds(command, persistent = false) {
   for (let segment of segments) {
     segment = segment.replace(/^(?:env\s+)?(?:[A-Za-z_][A-Za-z0-9_]*=(?:"[^"]*"|'[^']*'|[^\s]+)\s+)+/, "").trim();
     if (/(?:^|\s)(?:-h|--help|-V|--version)(?:\s|$)/.test(segment)) continue;
-    const tauriBuildCommand = /^(?:(?:npm|pnpm|yarn|bun)(?:\s+run)?\s+tauri\s+build\b|(?:npm|pnpm|yarn|bun)\s+exec\s+tauri\s+build\b|(?:npx|bunx)\s+tauri\s+build\b|cargo\s+tauri\s+build\b|tauri\s+build\b)/i.test(segment);
-    const packageCommand = /^(?:(?:npm|pnpm|yarn|bun)(?:\s+run)?\s+(?:package|pack|dist|bundle|make)\b|electron-builder\b|(?:electron-forge|npx\s+electron-forge)\s+make\b|pyinstaller\b|cargo\s+bundle\b|dotnet\s+publish\b|mvn\s+package\b|(?:gradle\w*|\.\/gradlew)\s+assemble\b|xcodebuild\b[^\n]*\barchive\b|docker\s+build\b)/i.test(segment);
+    const tauriBuildCommand = _TAURI_BUILD_RE.test(segment);
+    const packageCommand = _PACKAGE_CMD_RE.test(segment);
     if (packageCommand || (tauriBuildCommand && !/(?:^|\s)--no-bundle(?:\s|$)/i.test(segment))) kinds.add("package");
     if (tauriBuildCommand) kinds.add("build");
     if (/^(?:(?:npm|pnpm|yarn|bun)(?:\s+run)?\s+(?:build|compile|typecheck|type-check|check)\b|cargo\s+(?:build|check)\b|swift\s+build\b|rustc\b|go\s+build\b|(?:npx\s+)?tsc\b|dotnet\s+build\b|mvn\s+compile\b|(?:gradle\w*|(?:\.\\|\.\/)?gradlew(?:\.bat)?)\s+(?:build|compile\w*)\b|make(?:\s|$)|cmake\s+--build\b|xcodebuild\b|docker\s+build\b)/i.test(segment)) kinds.add("build");
@@ -44947,7 +45021,24 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
     if (_pad.filesRead.size) parts.push(`已读文件: ${[..._pad.filesRead].slice(-16).join("、")}（未变化时直接复用，不要重新搜索定位）`);
     if (_pad.modified.size) parts.push(`已改文件: ${[..._pad.modified].map(([f, d]) => `${f}(${d})`).join(", ")}`);
     if (_pad.errors.length) parts.push(`⚠ 当前未解决的错误: ${_pad.errors.slice(-3).join("; ")}`);
-    if (_pad.findings.length) parts.push(`关键发现: ${_pad.findings.slice(-5).join("; ")}`);
+    // 账本存 60 条，这里只发最后 5 条——而写进这个数组的还有子智能体简报（一轮并行
+    // 扇出就能塞 4~8 条）、上次崩溃留下的检查点提示。5 条一满，前半程的调研结论就
+    // 静默消失了；而这块草稿纸是历史被折叠之后**唯一**还记得那些结论的地方。
+    // 改成按字符预算从尾部往前收：条目短就多带几条，条目长也不会撑爆。预算取
+    // 8000 而不是更小——旧写法最坏能发 5×1200=6000 字，收得比它紧就是倒退。
+    if (_pad.findings.length) {
+      const picked = [];
+      let used = 0;
+      for (let i = _pad.findings.length - 1; i >= 0; i--) {
+        const one = String(_pad.findings[i] || "");
+        if (used + one.length > 8000 && picked.length) break;
+        picked.unshift(one);
+        used += one.length + 2;
+      }
+      const dropped = _pad.findings.length - picked.length;
+      parts.push(`关键发现: ${picked.join("; ")}`
+        + (dropped ? `（另有 ${dropped} 条更早的发现因篇幅未列出）` : ""));
+    }
     const executionBlock = _executionEvidenceReviewBlock(run._executionEvidence);
     if (executionBlock) parts.push(executionBlock);
     return parts.join("\n");
@@ -45156,7 +45247,17 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
       const _evidenceBlock = _sessionFileEvidenceBlock(session, root);
       const _activeDiagPath = activePath && (!root || _pathIsAtOrUnder(activePath, root)) ? activePath : "";
       const _latestDiagBlock = agentDiagnosticsBlock(root, _activeDiagPath);
-      const _runtimeStateBlock = await _promiseOrFallbackWithin(_agentRuntimeStateBlock(root), 1600, "");
+      // 这一块每轮都在重扫整个项目：两次读文件、8 个 marker 逐个探存在、13 个路径各探
+      // 目录+文件、再加一趟 depth-3 全树 walk 找 .sqlite——本仓库实测约 116 次串行 IPC，
+      // 最坏 1.6 秒被超时兜底整轮吃掉。10 轮的任务白多 16 秒，改一个字符串这种只需要
+      // 两三轮的活也照付。用户感觉是"它每做一步都要愣一下"。
+      // 这些事实只在**工作区真的变了**之后才会不同，run._fsMutTick 已经在维护这个信号。
+      const _fsTickNow = run._fsMutTick || 0;
+      if (run._rtStateTick !== _fsTickNow) {
+        run._rtState = await _promiseOrFallbackWithin(_agentRuntimeStateBlock(root), 1600, "");
+        run._rtStateTick = _fsTickNow;
+      }
+      const _runtimeStateBlock = run._rtState || "";
       if (_mutatedFiles.size || _readFiles.size || _evidenceBlock || _latestDiagBlock || _runtimeStateBlock) {
         const _parts = [_ORCH_NOTE + "〔执行状态·不要从头重查〕"];
         if (_mutatedFiles.size) {
@@ -45551,7 +45652,14 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
           if (buildFixAttempts < 2) {
             buildFixAttempts++;
             run._quietResumePool--;
-            const _tail = String(_buildFail.stderr || _buildFail.stdout || "").slice(-2400);
+            // 两路都要给，不能二选一。pytest / vitest / go test / cargo test /
+            // node --test 都把「哪条挂了、期望什么、实际什么」写 stdout，stderr 里
+            // 往往只有一条弃用警告——短路 || 让 stderr 有一个字节就把 stdout 整段丢掉，
+            // 于是模型收到的"真实报错"是句无关的警告，两次修复机会全部空烧。
+            const _tail = [
+              String(_buildFail.stdout || "").slice(-1600),
+              String(_buildFail.stderr || "").slice(-1600),
+            ].filter((part) => part.trim()).join("\n--- stderr ---\n");
             _pushNudge("buildFix", `[BUILD_FAILED] 上次声明为验证的命令 \`${_buildFail.command}\` 退出码 ${_buildFail.exitCode}——构建/测试没过，代码现在跑不起来。这是交付前必须清零的硬事实（退出码即结论）。先读下面的真实错误、定位并修掉根因，再重新运行同一条验证命令确认退出 0；在拿到绿色之前不要收尾、不要转去做别的：\n\n${_tail}`);
             continue;
           }
@@ -45945,6 +46053,22 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
         // "先改 package.json 再重跑 npm install"能立即放行。
         if (run && _toolMutatesWorkspace(call, result) && _toolExecutionSucceeded(call, result)) {
           run._fsMutTick = (run._fsMutTick || 0) + 1;
+          // 实现版本也得在这里推进，不能留到执行**之后**的记账循环。
+          // 证据记录在下面几行就盖章 implementationVersion；一个「edit_file + npm test」
+          // 的批次里，cmd 戳的是自增前的 N，而记账循环跑完变成 N+1——于是
+          // ① 红构建门 (_freshBuildFailure) 因为版本对不上直接跳过那条失败的验证命令，
+          //    模型下一轮收尾说"改好了，构建通过"；
+          // ② 构建真过了的时候，收尾门同样对不上号，照样记 code_delivered_unverified。
+          // 两个方向都错，而错的恰好是工程上唯一正确的顺序（先改再验）。
+          const _mutPath = it._wikiPath || call._resolvedPath || call.path || call.dest || call.to || "";
+          const _docOnly = /\.(md|markdown|rst|adoc)$/i.test(_mutPath)
+            || /(^|\/)(license|notice|changelog|authors|contributing|code_of_conduct)(\.[a-z]+)?$/i.test(_mutPath);
+          if (!_docOnly) {
+            _implOps++;
+            _verifiedAtImplOps = -1;
+            verificationPassed = false;
+            it._implCounted = true; // 记账循环别再自增一次
+          }
         }
         const executionEvidence = _executionEvidenceFromTool(call, result, root);
         if (run && executionEvidence) {
@@ -46571,7 +46695,10 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
       // summary at the context tail so the model retains what it did/found even
       // when older tool results have been folded away. Only from iter 6+ (early
       // iterations have full context). This is the key defense against "context rot".
-      if (iter >= 6 && (iter % 3 === 0 || iter >= 20)) {
+      // 折叠发生的那一轮必须补一张草稿纸，不管 iter 是几：折叠可以在第 3 轮就开始，
+      // 而这里第一次注入要等到第 6 轮——中间几轮是「历史已经被折叠、草稿纸还没出生」。
+      // 36827 那个写完就没人读的 _compactedThisTurn 正是为此存在。
+      if ((iter >= 6 && (iter % 3 === 0 || iter >= 20)) || run._compactedThisTurn) {
         for (let i = messages.length - 1; i >= 0; i--) {
           if (messages[i].role === "user" && typeof messages[i].content === "string" && messages[i].content.startsWith("[运行进度草稿纸")) { messages.splice(i, 1); break; }
         }
@@ -46639,8 +46766,8 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
           // 文件**不算**文档，照常重验。
           const _docOnlyMutation = /\.(md|markdown|rst|adoc)$/i.test(mutationPath)
             || /(^|\/)(license|notice|changelog|authors|contributing|code_of_conduct)(\.[a-z]+)?$/i.test(mutationPath);
-          if (!_docOnlyMutation) {
-                        _implOps++;
+          if (!_docOnlyMutation && !it._implCounted) {
+            _implOps++;
             // Verification credit expires with the artifact it certified — the same rule
             // already applied to _uiVerifiedAtImplOps below. Leaving it sticky was the outlier.
             // `didVerify` is deliberately NOT cleared: it means "a check was attempted this run",
