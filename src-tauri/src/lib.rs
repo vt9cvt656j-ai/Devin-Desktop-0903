@@ -404,6 +404,7 @@ pub fn run() {
             shell_env::env_refresh,
             shell_env::shell_plan,
             process_util::shell_env_probe,
+            process_util::which_command,
             lsp::lsp_start,
             lsp::lsp_send,
             lsp::lsp_stop,

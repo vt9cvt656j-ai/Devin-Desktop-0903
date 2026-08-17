@@ -396,6 +396,28 @@ fn windows_command_candidates(cmd: &str, pathext: &str) -> Vec<String> {
         .collect()
 }
 
+/// 这个命令在这台机器上找得到吗？找得到就返回它的完整路径，找不到返回空串。
+///
+/// 前端以前是拼一句 `command -v <名字>` 交给 shell 去问。那在 Windows 上不成立——cmd 没有
+/// `command` 这个内建，返回 9009，于是"这台机器有没有 npm"的答案永远是"没有"：新建项目的
+/// 24 个模板一个都创建不出来，还附一句「安装 Node.js：brew install node」。
+///
+/// 走这条路则两个平台同一套判据：按 PATH + PATHEXT 找（Windows 上认得 .cmd/.bat），
+/// 而且查的是 augmented PATH——GUI 启动的应用自己那份 PATH 很窄，nvm/volta 都不在里面。
+#[tauri::command(async)]
+pub fn which_command(name: String, workspace: Option<String>) -> String {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    let resolved = resolve_command(trimmed, workspace.as_deref().filter(|w| !w.is_empty()));
+    // 解析不到时 resolve_command 会把原名还回来；那不是"找到了"。
+    if resolved == trimmed && !std::path::Path::new(trimmed).is_file() {
+        return String::new();
+    }
+    resolved
+}
+
 /// Maximum number of concurrent LSP or DAP processes allowed.
 pub const MAX_CHILD_PROCESSES: usize = 16;
 
@@ -893,6 +915,22 @@ mod decode_tests {
 #[cfg(test)]
 mod windows_resolution_tests {
     use super::*;
+
+    /// 「找不到」必须回空串。`resolve_command` 解析不到时会把原名还回来——把那个原名
+    /// 当成"找到了"的话，新建项目的工具链预检永远说"装了"，然后在终端里当场炸给用户看。
+    #[test]
+    fn a_missing_command_reports_empty_not_its_own_name() {
+        let missing = which_command("肯定没有这个命令-zzz".into(), None);
+        assert_eq!(missing, "", "找不到却回了 {missing:?}");
+        assert_eq!(which_command("   ".into(), None), "", "空名字不该算找到");
+
+        // 真实存在的东西要能找到，且回的是完整路径而不是原名。
+        let real = if cfg!(windows) { "cmd" } else { "sh" };
+        let found = which_command(real.into(), None);
+        assert!(!found.is_empty(), "{real} 应当找得到");
+        assert_ne!(found, real, "回的应当是完整路径：{found}");
+        assert!(std::path::Path::new(&found).is_file(), "{found} 不是个文件");
+    }
 
     /// Windows 上「命令找不到」曾经同时打掉四个功能：npm 系语言服务器、几乎所有 MCP 服务
     /// （内置目录清一色 `npx`）、Node 一键调试、抓包。根因是一句错的注释——`resolve_command`

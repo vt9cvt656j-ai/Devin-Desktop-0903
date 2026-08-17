@@ -475,6 +475,9 @@ async function tauriBackend() {
     lspSend: (lang, message) => core.invoke("lsp_send", { lang, message }),
     lspStop: (lang) => core.invoke("lsp_stop", { lang }),
     lspCheckAvailable: (lang) => core.invoke("lsp_check_available", { lang }),
+    // 「这台机器上有没有这个命令」——两个平台同一套判据。前端不要再拼 `command -v`：
+    // cmd 没有那个内建，返回 9009，于是 Windows 上答案永远是没有。
+    whichCommand: (name, workspace) => core.invoke("which_command", { name, workspace: workspace || null }),
     writeTmpFile: (name, content) => core.invoke("write_tmp_file", { name, content }),
     lspDetectPython: (workspace) => core.invoke("lsp_detect_python", { workspace: workspace || null }),
     lspPythonEnvSymbols: (modules) => core.invoke("lsp_python_env_symbols", { modules }),
@@ -38395,7 +38398,24 @@ function _looksLikeReadOnlyCommand(command) {
   };
   const raw = String(command || "").trim();
   if (!raw || /[\r\n;<>`]|\$\(/.test(raw)) return false;
-  if (/(^|[^&])&([^&]|$)/.test(raw)) return false;
+  /*
+   * 单个 `&` 在 POSIX 里是"扔后台跑"，确实不该当成只读。可在 cmd 里它是**命令分隔符**
+   * （等价于 POSIX 的 `;`），而 Windows 上的交互终端就是 cmd。一票否决的后果是：
+   * `cd D:\proj & dir` 这种最普通的看目录命令被判成"非只读"——只读子智能体的探索命令
+   * 被 [BLOCKED]、纯读命令每条都弹确认框、连看一眼目录都过不了计划门。
+   *
+   * 按平台分：Windows 上把 `&` 当分隔符切开，每一段各自判；其余平台维持原样否决。
+   */
+  // typeof 兜底：这个函数会被单独装进测试沙箱跑，沙箱里没有模块级的 _isWin，
+  // 裸引用会直接抛 ReferenceError（本仓库别处也是这个写法）。
+  if (typeof _isWin !== "undefined" && _isWin) {
+    const ampSegments = raw.split(/\s*&\s*/).map((seg) => seg.trim()).filter(Boolean);
+    if (ampSegments.length > 1) {
+      return ampSegments.every((seg) => _looksLikeReadOnlyCommand(seg));
+    }
+  } else if (/(^|[^&])&([^&]|$)/.test(raw)) {
+    return false;
+  }
   const orTrue = raw.match(/^(.*?)\s*\|\|\s*(?:true|:)\s*$/i);
   if (orTrue) return _looksLikeReadOnlyCommand(orTrue[1]);
   if (raw.includes("|")) {
@@ -38404,7 +38424,7 @@ function _looksLikeReadOnlyCommand(command) {
       && _looksLikeReadOnlyCommand(parts[0])
       && parts.slice(1).every(pipeSegmentOk);
   }
-  const segmentOk = (segment) => /^(?:cd\s+(?:"[^"]+"|'[^']+'|\S+)|test\s+-[defrs]\s+\S+|\[\s+-[defrs]\s+\S+\s+\]|echo\b|pwd|ls|find|rg|grep|cat|head|tail|wc|du|df|tree|file|stat|which|type|whereis|lsof|ps|uname|sw_vers|date|whoami|env|printenv|jq\b|sed\s+-n\b|git\s+(?:status|diff|log|show|blame|branch|remote|stash\s+list|rev-parse|describe|config\s+--get)\b|(?:node|npm|pnpm|yarn|bun|python\d*|cargo|rustc|go|java|mvn|gradle\w*|dotnet)\s+(?:--version|-V|version)\b|(?:npm|pnpm|yarn|bun)\s+(?:list|ls|why|outdated)\b)(?:\s+[^;&|<>`]*)?$/i.test(segment);
+  const segmentOk = (segment) => /^(?:cd\s+(?:"[^"]+"|'[^']+'|\S+)|test\s+-[defrs]\s+\S+|\[\s+-[defrs]\s+\S+\s+\]|echo\b|pwd|ls|find|rg|grep|cat|head|tail|wc|du|df|tree|file|stat|which|type|whereis|lsof|ps|uname|sw_vers|date|whoami|env|printenv|jq\b|dir|where|findstr|more|ver|systeminfo|tasklist|set|chdir|attrib|sed\s+-n\b|git\s+(?:status|diff|log|show|blame|branch|remote|stash\s+list|rev-parse|describe|config\s+--get)\b|(?:node|npm|pnpm|yarn|bun|python\d*|cargo|rustc|go|java|mvn|gradle\w*|dotnet)\s+(?:--version|-V|version)\b|(?:npm|pnpm|yarn|bun)\s+(?:list|ls|why|outdated)\b)(?:\s+[^;&|<>`]*)?$/i.test(segment);
   const segments = raw.split(/\s*&&\s*/).map((segment) => segment.trim()).filter(Boolean);
   return segments.length > 0 && segments.every(segmentOk);
 }
@@ -64781,8 +64801,12 @@ async function showNewProjectDialog() {
     if (inTauri && backend.taskRunCapture) {
       for (const tool of _needTools) {
         try {
-          const r = await backend.taskRunCapture(parentDirPath, `command -v ${tool}`, { timeoutSecs: 10 });
-          if (!r || r.code !== 0) {
+          // 问后端要，别拼 `command -v`：cmd 没有那个内建，返回 9009，于是 Windows 上
+          // 这里的答案永远是"没装"——24 个模板一个都创建不出来，还附一句 brew install。
+          const found = backend.whichCommand
+            ? await backend.whichCommand(tool, parentDirPath)
+            : "skip";
+          if (!found) {
             showToast(`⚠️ 未检测到 ${tool} 命令，无法创建 ${tmpl.name} 项目。${_toolHints[tool] || "请先安装对应工具链"}`, { duration: 8000 });
             _resetCreateBtn();
             return;
