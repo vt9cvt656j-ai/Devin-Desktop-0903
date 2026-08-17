@@ -31236,6 +31236,7 @@ function _buildAgentToolSchemas(includeWrite, mcpTools = []) {
     { type: "function", function: { name: "semantic_search", description: "**Find code by meaning** — not exact grep matching, but \"find the code that does this\" from a sentence of natural language. 【When to use】First choice when first exploring an unfamiliar codebase, or when you can describe the behaviour but cannot name a keyword — far faster than reading and grepping your way through guesses. 【vs alternatives】When you know the exact symbol name use find_symbol; when you know a keyword or string use search; to find files by name use find_files.", parameters: { type: "object", properties: { query: { type: "string", description: "A natural-language description of the code you want (the more specific the better)" }, top_k: { type: "integer", description: "How many of the most relevant code blocks to return (default 10, maximum 30)" } }, required: ["query"] } } },
     { type: "function", function: { name: "knowledge_search", description: "**Query the platform's built-in professional knowledge base** — battle-tested best practices and common traps across specialist areas (front-end React/Next, back-end API design, database schema/indexing, application security, UI/UX design, DevOps deployment), distilled from senior experience. **When a domain task is unfamiliar or has to be right, look here first**: how to design a database schema, where a JWT should be stored, how to make UI look professional, how to use API status codes, how to prevent SQL injection or IDOR, how to write a Dockerfile, **which tool plus exact command to use to reverse-engineer or decompile a given format**, and so on. Follow the best practices you find rather than going from impressions. It returns the few most relevant passages. This is faster and more focused than a web search (it is already curated), and a second spent here before you start avoids many traps and noticeably raises the quality of the result.", parameters: { type: "object", properties: { query: { type: "string", description: "What you are doing / the best practice you want to confirm, e.g. \"how to build a database index\", \"jwt vs session\", \"how to unpack an NSIS installer\", \"pyinstaller decompile\", \"js deobfuscation\", \"radare2 disassembly\"" }, domain: { type: "string", description: "Optional; restrict to a domain. **michael-design** is the design blueprint corpus \u2014 441 production-grade, Tailwind-native page and section blueprints with real palettes, layout composition patterns, motion recipes and component coverage. Pass it for ANY visible UI work (website, web app, desktop GUI, dashboard, landing page, a single component) and build from what it returns instead of inventing colours and spacing from memory. Other domains: web-frontend / backend-api / database / security / ui-ux / devops / reverse-engineering / penetration-testing" }, top_k: { type: "integer", description: "How many passages to return (default 6, maximum 20)" } }, required: ["query"] } } },
     { type: "function", function: { name: "lsp_definition", description: "Jump to a symbol's definition. Give the file the symbol appears in, its line number and the symbol name, and it returns file:line for the definition. It resolves semantically, so it is more accurate than guessing with search. Requires a language service for that language. 【When to use】When reading code and you want to jump precisely into an implementation (you already know an occurrence at path:line); if you do not know where it is, use find_symbol first, and for usages use lsp_references. 【vs alternatives】For callers use lsp_references; when the location is unknown start with find_symbol.", parameters: { type: "object", properties: { path: { type: "string", description: "The file where the symbol appears" }, line: { type: "integer", description: "The line the symbol is on (1-based)" }, symbol: { type: "string", description: "The symbol name (used to locate the column on that line)" } }, required: ["path", "line"] } } },
+      { type: "function", function: { name: "lsp_hover", description: "**Ask the language server what a symbol's type/signature actually is**, at a given position — the same information the editor shows on hover: resolved signature plus doc comment, for the version actually installed here. 【When to use】When you are about to call something and are not sure of its exact signature, and you already have an occurrence at path:line (yours or existing code). This is the cheapest possible signature check — one round trip, no file reading. 【Limits】Needs a running language server for that language; if it returns nothing, fall back to package_source (for third-party APIs) or read the definition. Does NOT work for a symbol you have not written down anywhere yet — use find_symbol or package_source for that.", parameters: { type: "object", properties: { path: { type: "string", description: "File containing the occurrence" }, line: { type: "integer", description: "1-based line number of the occurrence" }, symbol: { type: "string", description: "The symbol name on that line (used to find the exact column)" } }, required: ["path", "line", "symbol"] } } },
     { type: "function", function: { name: "lsp_references", description: "Find every reference to / use of a symbol in the project. Give the file the symbol appears in, its line number and the symbol name, and it returns the reference list (file:line). It resolves semantically, so it is more accurate than a plain-text search (it distinguishes same-named but different things). Requires a language service for that language. 【When to use】To see who calls a function or variable and to gauge the blast radius of a change — more precise than a full-text grep, with semantic boundaries that do not report same-named false positives. 【vs alternatives】To jump to the definition use lsp_definition; to outline a whole file's symbols use lsp_symbols.", parameters: { type: "object", properties: { path: { type: "string", description: "The file where the symbol appears" }, line: { type: "integer", description: "The line the symbol is on (1-based)" }, symbol: { type: "string", description: "The symbol name (used to locate the column on that line)" } }, required: ["path", "line"] } } },
           { type: "function", function: { name: "probe_env", description: "**Ask the machine what it actually has, in one call.** Returns: OS/arch/shell, whether each of ~27 common toolchains is installed and at what version (node/npm/pnpm/yarn/bun/deno, python/pip/uv, cargo/rustc, go, java, docker, make/cmake/gcc, swift, ruby, php, psql, sqlite3, gh, rg, jq, ffmpeg), and the workspace's real state: is it a git repo, which branch, how many uncommitted files, which package managers the lockfiles prove are in use, which manifests exist, how many top-level entries. Takes well under a second. 【When to use】The moment reality surprises you: `command not found`, a build that fails for no visible reason, a project whose toolchain you are guessing at, or ANY point where you catch yourself about to probe the environment with run_cmd one command at a time. One call here replaces four or five round trips. Also call it before you tell the user 'X is not installed' — say it because you checked, not because a command failed. 【What it does NOT do】It reports facts, never advice. `found:false` with a `note` means the binary exists but is a stub (macOS ships a java shim that is always present and never works) — that is 'not installed', and the note is the system's own wording, useful for telling the user what to install.", parameters: { type: "object", properties: {} } } },
       { type: "function", function: { name: "ui_extract", description: "**Read the REAL design decisions out of a live UI, instead of guessing them from a picture.** source='url' drives the headless browser to a page and extracts what it ACTUALLY uses: the colour palette ranked by how much screen area each colour covers, every font/size/weight/line-height/colour combination with a text sample, the spacing scale, corner radii, shadows, the box model of every visible element, and the image/gradient assets. source='app' reads the accessibility tree of the frontmost native application — real element roles, labels and on-screen rectangles. 【Why this matters】Rebuilding from a screenshot alone is guesswork: you cannot recover the exact font family, the pre-compression hex values, or hidden states. This tool returns FACTS, so a rebuild from a URL or a running app can be near-identical rather than approximate. Call it FIRST, before writing any code. 【The loop】ui_extract -> write the code -> visual_compare (which now returns a measured similarity score and the worst-matching regions) -> fix those regions -> repeat until the score stops rising.", parameters: { type: "object", properties: { source: { type: "string", enum: ["url", "app"], description: "url = a web page (navigate first with browser, or pass url here); app = the frontmost native application on this Mac" }, url: { type: "string", description: "For source=url; the page to extract. Omitted = whatever the browser is currently on." }, max_nodes: { type: "integer", description: "Optional; how many of the largest visible elements to include (default 120, max 400). Lower it if the result comes back truncated." } }, required: ["source"] } } },
@@ -32731,6 +32732,7 @@ function _mapToolCall(name, args, mcpToolMap = _mcpToolMap) {
     case "visual_compare": return { type: "vizcompare", design: args.design || args.design_path || args.target || args.image || "", url: args.url || "", width: args.width, height: args.height };
     case "lsp_symbols": { const _p = String(args.path || "").trim(); if (!_p) return { type: "lsp", op: "symbols", _error: "path 不能为空" }; return { type: "lsp", op: "symbols", path: _p }; }
     case "lsp_definition": return { type: "lsp", op: "definition", path: args.path || "", line: args.line, symbol: args.symbol || "" };
+    case "lsp_hover": return { type: "lsp", op: "hover", path: args.path || "", line: args.line, symbol: args.symbol || "" };
     case "lsp_references": return { type: "lsp", op: "references", path: args.path || "", line: args.line, symbol: args.symbol || "" };
     case "create_dir": { const _p = String(args.path || "").trim(); if (!_p) return { type: "mkdir", _error: "path 不能为空" }; return { type: "mkdir", path: _p }; }
     case "copy_path": { const _f = String(args.from || "").trim(); const _t = String(args.to || "").trim(); if (!_f) return { type: "copy", _error: "from 不能为空" }; if (!_t) return { type: "copy", _error: "to 不能为空" }; return { type: "copy", path: _f, to: _t }; }
@@ -41539,7 +41541,7 @@ async function _runSubAgent({ config, description, prompt, root, container, run,
   // 否则就是"看得见打不开的钥匙"（read_logs / read_skill 已经这么漂过一次，
   // test/logic.test.mjs 里那条对账测试就是为此加的）。
   // git 和 gh 是单 type 多 op，类型放行之后另有 _GIT_READ_OPS / _GH_READ_OPS 二次把关。
-  const _READ_TOOLS = ["read_file", "list_dir", "search", "find_files", "semantic_search", "find_symbol", "lsp_symbols", "lsp_definition", "lsp_references", "get_diagnostics", "read_logs", "knowledge_search", "read_skill", "web_fetch", "web_search", "screenshot", "git_status", "git_diff", "git_log", "git_blame", "arxiv_search", "awwwards_search", "bundlephobia_search", "clinical_trials_search", "codrops_search", "crossref_search", "cve_search", "developer_community_search", "github_search", "hackernews_search", "iconify_search", "mdn_search", "openalex_search", "package_search", "pubchem_search", "pubmed_search", "smashingmag_search", "stackoverflow_search", "steam_search", "wiki_search", "search_game_assets", "github_repo", "gitlab_repo", "gitee_repo", "codeberg_repo", "git_show", "git_conflicts", "git_stash_list", "gh_pr_view", "gh_pr_review_comments", "gh_actions_log", "view_image", "ui_extract", "read_screen", "read_terminal", "list_terminals", "think", "recall_conversation", "current_time", "probe_env"];
+  const _READ_TOOLS = ["read_file", "list_dir", "search", "find_files", "semantic_search", "find_symbol", "lsp_symbols", "lsp_hover", "lsp_definition", "lsp_references", "get_diagnostics", "read_logs", "knowledge_search", "read_skill", "web_fetch", "web_search", "screenshot", "git_status", "git_diff", "git_log", "git_blame", "arxiv_search", "awwwards_search", "bundlephobia_search", "clinical_trials_search", "codrops_search", "crossref_search", "cve_search", "developer_community_search", "github_search", "hackernews_search", "iconify_search", "mdn_search", "openalex_search", "package_search", "pubchem_search", "pubmed_search", "smashingmag_search", "stackoverflow_search", "steam_search", "wiki_search", "search_game_assets", "github_repo", "gitlab_repo", "gitee_repo", "codeberg_repo", "git_show", "git_conflicts", "git_stash_list", "gh_pr_view", "gh_pr_review_comments", "gh_actions_log", "view_image", "ui_extract", "read_screen", "read_terminal", "list_terminals", "think", "recall_conversation", "current_time", "probe_env"];
   // 这张表必须和上面 _READ_TOOLS 里每个名字的**类型**一一对上。
   //
   // 名字进 _READ_TOOLS 决定"模型看得见"，类型进 _READ_TYPES 决定"派发时放不放行"——
@@ -51874,6 +51876,22 @@ async function _executeToolStepInner(step, call, root, run) {
             }
             character = _idx + Math.floor(sym.length / 2);
           }
+          if (call.op === "hover") {
+            // 悬停：一次往返拿到"这个符号在当前装的版本下到底是什么类型"。
+            let hover = null;
+            try { hover = await (lspManager && lspManager.agentHover ? lspManager.agentHover(fp, line, character) : null); } catch {}
+            if (!hover) {
+              res.className = "atc-result atc-result--err"; res.textContent = "无悬停信息";
+              return { type: "lsp", path: rel, content:
+                `[无结果] ${rel}:${line} 的「${sym}」拿不到悬停信息——这个语言可能没有可用的语言服务，`
+                + `或者该符号此刻无法解析。**这不代表这个符号不存在**。`
+                + `\n第三方库的签名改用 package_source(package="包名", symbol="${sym}")；项目内的用 lsp_definition。` };
+            }
+            res.className = "atc-result atc-result--ok"; res.textContent = "已解析";
+            if (vp) vp.innerHTML = `<pre>${_escHtml(String(hover).slice(0, 4000))}</pre>`;
+            return { type: "lsp", path: rel, content:
+              `「${sym}」在 ${rel}:${line} 处的类型（来自语言服务，即本项目当前实际解析到的那一份）：\n${String(hover).slice(0, 4000)}` };
+          }
           let locs = null;
           try { locs = await (lspManager && lspManager.agentLocate ? lspManager.agentLocate(fp, line, character, call.op) : null); } catch {}
           if (!locs) { try { locs = await _tsWorkerLocate(fp, line, character, call.op); } catch {} }
@@ -51885,9 +51903,35 @@ async function _executeToolStepInner(step, call, root, run) {
           const seen = new Set(); const uniq = [];
           for (const l of locs) { const k = (l.path || "") + ":" + (l.line || ""); if (!seen.has(k)) { seen.add(k); uniq.push(l); } }
           const rels = uniq.map(l => `${_relTo(l.path || "", lroot)}${l.line ? ":" + l.line : ""}`);
+          /*
+           * 「定义」要连正文一起回，不能只给坐标。
+           *
+           * 只回 `path:line` 的话，模型拿到一个坐标还得再花一次 read_file 才知道那儿写了
+           * 什么——而在"别磨蹭"的压力下它多半不再读，直接按记忆往下写。跳转的全部意义
+           * 就是拿到真实签名，省掉那一步等于这个工具白做。
+           *
+           * 只对**定义**这么做，不对引用：引用动辄几十处，每处贴 20 行会把上下文冲垮，
+           * 而引用要回答的是"谁在用"，坐标本身就够了。
+           */
+          let bodies = "";
+          if (call.op !== "references") {
+            const parts = [];
+            for (const l of uniq.slice(0, 2)) {
+              const at = Number(l.line) || 0;
+              if (!l.path || at <= 0) continue;
+              try {
+                const text = await backend.readTextFile(l.path);
+                const lines = String(text).split(/\r?\n/);
+                const from = Math.max(0, at - 3);
+                const to = Math.min(lines.length, at + 17);
+                parts.push(`--- ${_relTo(l.path, lroot)}:${at} ---\n${lines.slice(from, to).join("\n")}`);
+              } catch { /* 读不到就退回只给坐标——比整条失败强 */ }
+            }
+            if (parts.length) bodies = `\n\n${parts.join("\n\n")}`;
+          }
           res.className = uniq.length ? "atc-result atc-result--ok" : "atc-result atc-result--err"; res.textContent = uniq.length ? `${uniq.length} 处${label}` : `无${label}`;
           if (vp) vp.innerHTML = `<pre>${_escHtml(rels.join("\n") || "(无结果)")}</pre>`;
-          return { type: "lsp", path: rel, content: uniq.length ? `${sym || rel}（${rel}:${line}）的${label}（${uniq.length}）:\n${rels.join("\n")}` : `未找到${label}（可能索引未就绪，可稍后重试或改用 search）。` };
+          return { type: "lsp", path: rel, content: uniq.length ? `${sym || rel}（${rel}:${line}）的${label}（${uniq.length}）:\n${rels.join("\n")}${bodies}` : `未找到${label}（可能索引未就绪，可稍后重试或改用 search）。` };
         }
       } catch (e) {
         const msg = String(e?.message || e).slice(0, 200);

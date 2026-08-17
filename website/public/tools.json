@@ -1,7 +1,7 @@
 {
   "generatedFrom": "ide/src/main.js · _buildAgentToolSchemas",
   "generatedAt": null,
-  "count": 137,
+  "count": 138,
   "groups": [
     "Agents",
     "Code intelligence",
@@ -269,6 +269,11 @@
     },
     {
       "name": "lsp_definition",
+      "group": "Code intelligence",
+      "desktopOnly": false
+    },
+    {
+      "name": "lsp_hover",
       "group": "Code intelligence",
       "desktopOnly": false
     },

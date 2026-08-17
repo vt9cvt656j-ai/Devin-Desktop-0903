@@ -172,3 +172,45 @@ test("read_file 读不到 node_modules 时不再塞假事实", () => {
   assert.match(SRC, /搜索层刻意跳过 node_modules，所以这不代表没装/, "没说清为什么搜不到");
   assert.match(SRC, /package_source\(package="包名"\)/, "没指向真正能查的那个工具");
 });
+
+// ── lsp_hover / lsp_definition 回正文 ────────────────────────────────────────
+//
+// 跳转的全部意义就是拿到真实签名。只回 `path:line` 的话，模型还得再花一次 read_file
+// 才知道那儿写了什么——而在"别磨蹭"的压力下它多半不再读，直接按记忆往下写。
+
+test("lsp_definition 连正文一起回，引用则不带", () => {
+  const at = SRC.indexOf("const rels = uniq.map(");
+  assert.ok(at > 0, "找不到定义结果的拼装处");
+  const block = SRC.slice(at, at + 1600);
+  assert.match(block, /if \(call\.op !== "references"\)/,
+    "没有把引用排除在外——引用动辄几十处，每处贴 20 行会把上下文冲垮");
+  assert.match(block, /await backend\.readTextFile\(l\.path\)/, "没有真的去读正文");
+  assert.match(block, /uniq\.slice\(0, 2\)/, "没有限制条数");
+  assert.match(SRC, /\$\{rels\.join\("\\n"\)\}\$\{bodies\}/, "正文没有拼进返回值");
+});
+
+test("lsp_hover 从语言服务一直接到工具表", () => {
+  const client = readFileSync(join(ROOT, "src", "lsp-client.js"), "utf8");
+  // hover 在编辑器侧早就跑着，智能体侧一直没有入口——最省 token 的签名真相源反而没开。
+  assert.match(client, /async agentHover\(path, line, character\) \{/, "管理器上没有 agentHover");
+  assert.match(client, /ctx\.client\.supports\("hover"\)/, "没检查语言服务支持不支持");
+  // hover 的返回可能是字符串 / MarkedString / MarkupContent，三种都要认，否则大半语言拿到空。
+  assert.match(client, /if \(Array\.isArray\(node\)\)/, "没处理数组形态的 hover 内容");
+  assert.match(client, /typeof node\.value === "string"/, "没处理 MarkupContent 形态");
+
+  assert.match(SRC, /name: "lsp_hover"/, "工具没注册");
+  assert.match(SRC, /case "lsp_hover": return \{ type: "lsp", op: "hover"/, "意图没映射");
+  assert.match(SRC, /if \(call\.op === "hover"\) \{/, "执行分支没接");
+  assert.match(SRC, /lspManager\.agentHover \? lspManager\.agentHover\(fp, line, character\)/, "没调到管理器");
+  // 拿不到时必须说清"这不代表符号不存在"，并指向真正能查的那条路——
+  // 否则模型会把"没有悬停信息"理解成"没有这个符号"，然后开始编。
+  assert.match(SRC, /\*\*这不代表这个符号不存在\*\*/, "空结果的措辞会误导模型");
+  assert.match(SRC, /package_source\(package="包名", symbol=/, "空结果没指向 package_source");
+  // 只读工具，子智能体也该能用。
+  assert.match(SRC, /"lsp_symbols", "lsp_hover", "lsp_definition"/, "子智能体的只读工具表里没有它");
+  // 五个接线点里最容易漏的两个。
+  const guides = readFileSync(join(ROOT, "src", "tool-guides.js"), "utf8");
+  assert.match(guides, /lsp_hover: \{ category: 'search'/, "缺 TOOL_METADATA（或分类不在展示名表里）");
+  const gateway = JSON.parse(readFileSync(join(ROOT, "..", "server", "prompts", "tools.json"), "utf8"));
+  assert.ok(gateway.some((t) => t?.function?.name === "lsp_hover"), "网关目录里没有 lsp_hover");
+});

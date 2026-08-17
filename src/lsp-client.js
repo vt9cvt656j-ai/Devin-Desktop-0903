@@ -1912,6 +1912,37 @@ export function createLspManager(options) {
       return locs;
     },
 
+    /*
+     * 悬停信息（签名 + 文档）—— 智能体侧一直没有这个入口。
+     *
+     * 编辑器早就在用它（textDocument/hover 那条路），而它恰恰是**最省 token 的签名真相
+     * 源**：问一次就拿到那个符号在**当前安装版本**下的真实类型，不用读文档、不用猜。
+     * 以前只暴露了 symbols / locate / format，写代码最需要的这一件反而没开。
+     *
+     * 返回纯文本（LSP 的 hover 可能是字符串、MarkedString 或 MarkupContent，三种都要认），
+     * 拿不到就返回 null——调用方据此退回别的路子，而不是把"没有"说成"没有这个符号"。
+     */
+    async agentHover(path, line, character) {
+      const ctx = await _agentEnsureDoc(path);
+      if (!ctx) return null;
+      if (!ctx.client.supports("hover")) return null;
+      const position = { line: Math.max(0, (line | 0) - 1), character: Math.max(0, character | 0) };
+      let result;
+      try { result = await ctx.client.request("textDocument/hover", { textDocument: { uri: ctx.uri }, position }); }
+      catch { return null; }
+      const contents = result?.contents;
+      if (!contents) return null;
+      const flatten = (node) => {
+        if (!node) return "";
+        if (typeof node === "string") return node;
+        if (Array.isArray(node)) return node.map(flatten).filter(Boolean).join("\n\n");
+        if (typeof node.value === "string") return node.value;
+        return "";
+      };
+      const text = flatten(contents).trim();
+      return text || null;
+    },
+
     // Whole-document formatting. Returns the formatted text (applied to a
     // throwaway model so the editor's live model is never mutated), the original
     // text when the server reports no edits, or null when no managed formatter
