@@ -214,3 +214,26 @@ test("lsp_hover 从语言服务一直接到工具表", () => {
   const gateway = JSON.parse(readFileSync(join(ROOT, "..", "server", "prompts", "tools.json"), "utf8"));
   assert.ok(gateway.some((t) => t?.function?.name === "lsp_hover"), "网关目录里没有 lsp_hover");
 });
+
+test("已有的公共代码搜索要说清它是干什么的", () => {
+  /*
+   * `sourcegraph` 一直躺在 developer_community_search 的 sources 枚举里，后端打的就是
+   * 公共代码搜索——但描述里一个字都没说它是干什么的，整个工具被描述成"查踩坑/技术选型/
+   * 社区讨论"。于是这个能力等于不存在。
+   *
+   * 它治的是 package_source 治不了的那一层：**签名对了，但用法不对**——参数顺序、
+   * 必需的初始化步骤、真实的调用惯例。文档常常不写，一千个仓库的实际用法里全都有。
+   */
+  const at = SRC.indexOf('name: "developer_community_search"');
+  assert.ok(at > 0, "找不到这个工具");
+  const block = SRC.slice(at, at + 5000);
+  assert.match(block, /`sourcegraph` is public CODE search across many repositories/,
+    "描述里没说清 sourcegraph 是代码搜索");
+  assert.match(SRC, /签名对了但不确定怎么用→developer_community_search/,
+    "工具直觉里没有引导到它");
+  // 这句活在一条**双引号**字符串里，内部再出现裸的 " 会把它提前截断（踩过一次，
+  // 整个 main.js 语法都断了）。
+  const hintAt = SRC.indexOf("签名对了但不确定怎么用");
+  const hintLine = SRC.slice(SRC.lastIndexOf("\n", hintAt) + 1, SRC.indexOf("\n", hintAt));
+  assert.doesNotMatch(hintLine, /sources=\["/, "又在双引号字符串里用了双引号");
+});
