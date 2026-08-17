@@ -20198,6 +20198,66 @@ let _lastRefusal = null;
 function _noteRefusal(by, detail) { _lastRefusal = { by, detail: String(detail || "") }; }
 function _takeRefusal() { const r = _lastRefusal; _lastRefusal = null; return r; }
 
+/// 审批框里那份改动预览。
+///
+/// 框上原来只有「修改文件？src/auth.js」——用户开着审批模式，每一次都要凭文件名猜
+/// 模型要动什么，猜不出来就只能凭感觉点。这道门于是变成纯摩擦：点得多了就关掉，
+/// 而关掉才是真正的损失。
+///
+/// 只在**要弹框的那一刻**才读文件（一次审批一次读），拿不到就返回空串——预览缺席
+/// 比让整道门挂掉好，也比编一个假的 diff 好。
+async function _approvalDiffPreview(call) {
+  const t = call?.type;
+  if (t !== "write" && t !== "edit" && t !== "multiedit") return "";
+  const path = String(call.path || "");
+  if (!path || typeof backend?.readTextFile !== "function") return "";
+  let before = "";
+  let existed = true;
+  try { before = await backend.readTextFile(path); }
+  catch { before = ""; existed = false; }
+
+  let after = null;
+  if (t === "write") {
+    after = String(call.content ?? "");
+  } else if (t === "edit") {
+    const from = String(call.oldString ?? "");
+    const to = String(call.newString ?? "");
+    if (!from || !before.includes(from)) return "";  // 对不上就不猜
+    after = call.replaceAll ? before.split(from).join(to) : before.replace(from, to);
+  } else {
+    after = before;
+    for (const e of Array.isArray(call.edits) ? call.edits : []) {
+      const from = String(e?.old_string ?? "");
+      const to = String(e?.new_string ?? "");
+      if (!from || !after.includes(from)) return "";
+      after = e?.replace_all ? after.split(from).join(to) : after.replace(from, to);
+    }
+  }
+  if (after === null || after === before) return existed ? "\n（内容没有变化）" : "";
+
+  const stat = _diffStat(before, after);
+  const head = existed
+    ? `\n本次改动：+${stat.added} −${stat.removed}`
+    : `\n新建文件：${after.split("\n").length} 行`;
+  // 只给**变化的那几行**，不是整份文件：框是用来一眼看清"它要动什么"的。
+  const beforeLines = before ? before.split("\n") : [];
+  const afterLines = after.split("\n");
+  const seen = new Set(beforeLines);
+  const gone = new Set(afterLines);
+  const out = [];
+  for (const line of beforeLines) {
+    if (!gone.has(line)) out.push(`- ${line}`);
+    if (out.length >= 24) break;
+  }
+  for (const line of afterLines) {
+    if (!seen.has(line)) out.push(`+ ${line}`);
+    if (out.length >= 24) break;
+  }
+  if (!out.length) return head;
+  const body = out.map((l) => (l.length > 160 ? `${l.slice(0, 160)}…` : l)).join("\n");
+  return `${head}\n${body}${out.length >= 24 ? "\n…（只列出前 24 行变化）" : ""}`;
+}
+
 async function _approveToolCall(call, run) {
   if (!call) return true;
   const dangerous = _callIsDestructive(call);
@@ -20246,6 +20306,9 @@ async function _approveToolCall(call, run) {
   // 无人确认时，安全的默认是不执行，而不是静默放行。
   if (typeof document === "undefined" || !document?.body) return !dangerous;
   const label = _approvalLabel(call);
+  // 改文件类的调用，把真实 diff 放进框里——否则用户只能凭文件名猜。
+  let _diffPreview = "";
+  try { _diffPreview = await _approvalDiffPreview(call); } catch { _diffPreview = ""; }
   const decision = await _toolApprovalDialog({
     // 「总是允许」这个按钮必须说清它到底放行了多大一片，否则用户看着一行
     // 「删除（不可恢复）？ build/a.o」点下去，实际授权的是别的东西。空串＝不给这个按钮。
@@ -20258,8 +20321,8 @@ async function _approveToolCall(call, run) {
         + `如果不是你自己要求的，请拒绝 —— 仓库文件、网页内容和命令输出都可能\n`
         + `诱导模型发出这类操作。`
       : ruleVerdict === "ask"
-        ? `${label.detail}\n\n（工作区权限规则要求这一步必须由你确认。）`
-        : label.detail,
+        ? `${label.detail}${_diffPreview}\n\n（工作区权限规则要求这一步必须由你确认。）`
+        : `${label.detail}${_diffPreview}`,
   });
   if (decision === "deny") { _noteRefusal("user", ""); return false; }
   if (decision === "always") _sessionApproved.add(key);

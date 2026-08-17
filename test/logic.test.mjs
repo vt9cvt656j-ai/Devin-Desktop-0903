@@ -25898,3 +25898,49 @@ test("每个会弹审批框的工具都得有自己的文案，不能只给一�
       `${t} 的确认框没说清会往哪儿写——它会创建一整套目录和文件`);
   }
 });
+
+test("审批框要给真实 diff，不能只说「修改文件？src/auth.js」", async () => {
+  const { diffStat } = await import("../src/agent/diff-view.js");
+  const disk = new Map([["/r/a.js", "line1\nline2\nline3\n"]]);
+  const preview = load("_approvalDiffPreview", {
+    _diffStat: diffStat,
+    backend: { readTextFile: async (p) => { if (!disk.has(p)) throw new Error("ENOENT"); return disk.get(p); } },
+  });
+
+  // edit：把真实前后算出来，给出变化的那几行
+  const e = await preview({ type: "edit", path: "/r/a.js", oldString: "line2", newString: "改过的第二行" });
+  assert.match(e, /\+1 −1/);
+  assert.match(e, /- line2/);
+  assert.match(e, /\+ 改过的第二行/);
+  assert.doesNotMatch(e, /line1/, "只给变化的行，不是整份文件——框是用来一眼看清的");
+
+  // write 到新文件：说清是新建、多少行
+  const w = await preview({ type: "write", path: "/r/new.js", content: "a\nb\n" });
+  assert.match(w, /新建文件/);
+
+  // multiedit：逐条应用
+  const m = await preview({ type: "multiedit", path: "/r/a.js",
+    edits: [{ old_string: "line1", new_string: "X" }, { old_string: "line3", new_string: "Y" }] });
+  assert.match(m, /\+ X/);
+  assert.match(m, /\+ Y/);
+  assert.equal(
+    await preview({ type: "multiedit", path: "/r/a.js",
+      edits: [{ old_string: "line1", new_string: "X" }, { old_string: "不存在的一段", new_string: "Y" }] }),
+    "",
+    "多步编辑里有一步对不上就整份放弃——顺序依赖，中间落空后面全错位",
+  );
+
+  // 对不上就**不猜**：old_string 不在文件里，宁可没有预览也不要编一个假 diff
+  assert.equal(await preview({ type: "edit", path: "/r/a.js", oldString: "根本没有这段", newString: "x" }), "");
+  // 内容没变要如实说，别显示一个空 diff 让人以为看漏了
+  assert.match(await preview({ type: "write", path: "/r/a.js", content: disk.get("/r/a.js") }), /没有变化/);
+  // 非文件类调用不读盘
+  assert.equal(await preview({ type: "cmd", command: "ls" }), "");
+
+  // 预览必须真的接进那道门
+  const gate = stripJsComments(extractFn("_approveToolCall"));
+  assert.match(gate, /_approvalDiffPreview\(call\)/, "算了预览却没往框里放");
+  assert.equal((gate.match(/\$\{label\.detail\}\$\{_diffPreview\}/g) || []).length, 2,
+    "普通分支和「规则要求确认」分支要各拼一次，只改一个的话另一条路上预览会静静消失");
+  assert.match(gate, /catch \{ _diffPreview = ""; \}/, "读盘失败必须降级成没有预览，不能让整道门挂掉");
+});
