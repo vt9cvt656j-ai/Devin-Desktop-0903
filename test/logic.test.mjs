@@ -6655,6 +6655,31 @@ test("装完没装完问后端，不在前端拼一句只有 macOS 认的 shell"
     "通知适配器没把 langId 收进来");
 });
 
+test("tauri 配置里不许塞伪注释——它是严格校验的，构建会直接失败", () => {
+  /*
+   * JSON 没有注释，所以很容易想到写一个 "comment:xxx" 键把理由记在旁边。**不行**：
+   * Tauri 的 config 是 serde deny_unknown_fields，构建脚本当场报
+   * `unknown field 'comment:titlebar'` 然后整个 cargo build 失败。我就这么干过一次，
+   * 而且因为 JS 测试不编译 Rust，一路绿着提交了出去。
+   *
+   * 说明写在代码注释和这条用例里，配置文件只放真键。
+   */
+  for (const name of ["tauri.conf.json", "tauri.windows.conf.json"]) {
+    const conf = JSON.parse(readFileSync(join(HERE, "..", "src-tauri", name), "utf8"));
+    const walk = (node, path) => {
+      if (!node || typeof node !== "object") return;
+      for (const key of Object.keys(node)) {
+        assert.ok(
+          key === "$schema" || !/^(comment|_)|:/.test(key),
+          `${name} 里有伪注释键 ${path}${key} —— Tauri 会拒绝未知字段，构建直接失败`,
+        );
+        walk(node[key], `${path}${key}.`);
+      }
+    };
+    walk(conf, "");
+  }
+});
+
 test("Windows 上不再是两条标题栏叠着，而且自己画了窗口按钮", () => {
   /*
    * titleBarStyle / hiddenTitle 是 Tauri 的 **macOS 专属**键，Windows 上被整个编译掉。

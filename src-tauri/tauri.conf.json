@@ -20,7 +20,6 @@
         "minWidth": 880,
         "minHeight": 560,
         "resizable": true,
-        "comment:titlebar": "titleBarStyle / hiddenTitle 是 Tauri 的 **macOS 专属**键，Windows 上被整个编译掉。所以 Windows 那边靠 tauri.windows.conf.json 里的 decorations:false 去掉原生标题栏，窗口按钮由应用自己画（见 Shell.jsx 的 .titlebar__winctl）——否则原生标题栏会压在应用那条 44px 的标题栏上面，两条叠着、同一个标题显示两遍，那是 Windows 上「界面很丑」最直接的原因。",
         "titleBarStyle": "Overlay",
         "hiddenTitle": true
       }
