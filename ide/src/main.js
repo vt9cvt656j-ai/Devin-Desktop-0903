@@ -9334,7 +9334,13 @@ async function renderWorkspaceRoots() {
   syncWelcome();
 }
 
-async function openFolder(path) {
+// owner: 发起这次打开的会话。两个调用点都是异步且不锁定活动标签——切标签时
+// fire-and-forget 跑 _ensureSessionWorkspaceRoot，发送预检也跑它（外面那层 8s
+// Promise.race 只是不等，并不取消），所以落地那一刻前台可能已经换人了。写死
+// _currentSession() 就会把新目录记到无辜的那个标签头上：它的目录小标签悄悄变成
+// 别人的，下一轮还会吃到「工作区已切换，彻底忘掉上面对话里的目录/路径/代码」，
+// 模型当场否定自己前面读过的所有文件；项目记忆按 root 做 key，之前记的也全检索不到。
+async function openFolder(path, owner = null) {
   path = _toPosix(path);
   if (!(await _closeOpenFilesOutsideRoot(path))) return;
   _workspaceRootEntryCounts.clear();
@@ -9343,7 +9349,7 @@ async function openFolder(path) {
   // Opening a different project should immediately retag the active chat tab AND keep the
   // session's own root in sync (it was only updating .project, so session.workspaceRoots could
   // drift stale and later re-override the global root on restore).
-  const _sess = _currentSession();
+  const _sess = owner || _currentSession();
   if (_sess) {
     _sess.workspaceRoots = [path];
     if (_sess.project !== path) { _sess.project = path; _renderChatTabs(); saveChatHistory(); }
@@ -13399,23 +13405,28 @@ function _mcMessageFingerprint(message) {
   return (hash >>> 0).toString(36);
 }
 
-function _mcPrefixKey() {
-  // 按当前会话隔离：不同对话的前缀绝不能互相串用（网关侧还会校验 uid 和覆盖长度，
+function _mcPrefixKey(session = null) {
+  // 按会话隔离：不同对话的前缀绝不能互相串用（网关侧还会校验 uid 和覆盖长度，
   // 但客户端就不该把它发错地方）。
+  //
+  // 归属必须显式传进来，不能取 _currentSession()："这一轮属于谁"和"此刻谁在前台"
+  // 是两回事——子智能体跑的是父会话的消息、后台标签页也在跑自己的轮次，而用户随时
+  // 在切标签。取错了就是拿 A 的历史去存/删 B 的前缀：下一轮 B 只能整份重传，
+  // _enforceModelRequestBudget 于是把旧消息统一对折，再长直接抛 MODEL_REQUEST_TOO_LARGE。
   try {
-    const sess = typeof _currentSession === "function" ? _currentSession() : null;
+    const sess = session || (typeof _currentSession === "function" ? _currentSession() : null);
     return String(sess?.id || sess?.sessionId || "default");
   } catch {
     return "default";
   }
 }
 
-function _mcPrefixGet() {
-  return _mcPrefixBySession.get(_mcPrefixKey()) || null;
+function _mcPrefixGet(session = null) {
+  return _mcPrefixBySession.get(_mcPrefixKey(session)) || null;
 }
 
-function _mcPrefixSet(token, covered, sourceMessages) {
-  const key = _mcPrefixKey();
+function _mcPrefixSet(token, covered, sourceMessages, session = null) {
+  const key = _mcPrefixKey(session);
   const t = String(token || "").trim();
   const c = Number(covered) || 0;
   const messages = Array.isArray(sourceMessages) ? sourceMessages : [];
@@ -13447,8 +13458,8 @@ function _mcPrefixSet(token, covered, sourceMessages) {
 /// 返回实际要发的消息数组。任何一项不成立就原样返回、不带令牌 —— 服务端那道"客户端
 /// 没省略就忽略前缀"的防线只挡得住少裁，**挡不住多裁**（多裁等于静默丢历史），所以
 /// 这里的前置条件必须严格。
-function _applyCompressionPrefix(messages, turnConfig) {
-  const rec = _mcPrefixGet();
+function _applyCompressionPrefix(messages, turnConfig, session = null) {
+  const rec = _mcPrefixGet(session);
   if (!rec || !Array.isArray(messages)) return messages;
   // 开头连续的 system 是网关钉住不压的那一段，必须原样保留。
   let pinned = 0;
@@ -13461,7 +13472,7 @@ function _applyCompressionPrefix(messages, turnConfig) {
     && _mcMessageFingerprint(messages[pinned]) === rec.firstSig
     && _mcMessageFingerprint(messages[need - 1]) === rec.boundarySig;
   if (!sameHistory) {
-    _mcPrefixInvalidate();
+    _mcPrefixInvalidate(session);
     return messages;
   }
   turnConfig.mcPrefix = rec.token;
@@ -13471,8 +13482,8 @@ function _applyCompressionPrefix(messages, turnConfig) {
 
 /// 历史被本地改写过（压缩/裁剪/删除消息）之后必须作废：前缀记录的是"前 N 条已被
 /// 摘要覆盖"，历史一变这个 N 就对不上，继续发会让模型收到错位的上下文。
-function _mcPrefixInvalidate() {
-  _mcPrefixBySession.delete(_mcPrefixKey());
+function _mcPrefixInvalidate(session = null) {
+  _mcPrefixBySession.delete(_mcPrefixKey(session));
   _mcPrefixPersist();
 }
 
@@ -15453,7 +15464,8 @@ async function _ensureSessionWorkspaceRoot(session, options = {}) {
     try { _renderChatTabs(); saveChatHistory(); } catch {}
   }
   if (options.open && root !== rootPath && typeof openFolder === "function") {
-    try { await openFolder(root); } catch {}
+    // 归属跟着请求走，不跟着"此刻谁在前台"走。
+    try { await openFolder(root, session); } catch {}
   }
   return root;
 }
@@ -15551,6 +15563,33 @@ async function _flushTranscriptJournal() {
 // 回合正常收尾即清除；启动恢复时若发现残留草稿，查重后补成一条带标注的
 // assistant 消息落账——最坏只丢最后 ~2 秒的输出。
 const _STREAM_DRAFT_KEY = "michael-stream-draft-v1";
+// 单槽改成"按会话分槽"：旧写法是一个 key 存一份草稿，后写覆盖先写，退出兜底还只
+// find 出**第一个**仍在流式的会话。两个标签页同时跑时，崩溃/强退/热重载之后一个
+// 标签的回复被完整补回来并标注「因软件重启被打断」，另一个整轮输出（可能是几十分钟
+// 的 agent 叙述）凭空消失，只剩用户那条提问孤零零挂着。
+// 存储形状是 { [sessionId]: draft }；读取时兼容旧的单份 {sessionId,text,...}。
+function _streamDraftMapFrom(value) {
+  try {
+    const raw = typeof value === "string" ? JSON.parse(value) : value;
+    if (!raw || typeof raw !== "object") return {};
+    if (typeof raw.sessionId === "string") return { [raw.sessionId]: raw }; // 旧单槽
+    const out = {};
+    for (const [id, draft] of Object.entries(raw)) {
+      if (id && draft && typeof draft === "object") out[id] = draft;
+    }
+    return out;
+  } catch { return {}; }
+}
+function _streamDraftMapRead() {
+  try { return _streamDraftMapFrom(localStorage.getItem(_STREAM_DRAFT_KEY)); } catch { return {}; }
+}
+function _streamDraftMapWrite(map) {
+  try {
+    const ids = Object.keys(map || {});
+    if (!ids.length) localStorage.removeItem(_STREAM_DRAFT_KEY);
+    else localStorage.setItem(_STREAM_DRAFT_KEY, JSON.stringify(map));
+  } catch { /* 配额满等场景只是少个保险，不影响正常链路 */ }
+}
 function _streamDraftSave(session, text, reasoning) {
   // NOTE the ordering here — it is the whole point. `text` is the rope built by `acc += delta`,
   // so `.trim()` cannot run on it lazily: it forces a full String::Flatten, an O(n) memcpy of
@@ -15579,8 +15618,9 @@ function _streamDraftSave(session, text, reasoning) {
     reasoning: String(reasoning || "").slice(0, 20_000),
     updatedAt: now,
   };
-  try { localStorage.setItem(_STREAM_DRAFT_KEY, JSON.stringify(draft)); }
-  catch { /* 配额满等场景只是少个保险，不影响正常链路 */ }
+  const _map = _streamDraftMapRead();
+  _map[session.id] = draft;
+  _streamDraftMapWrite(_map);
   // 运行中周期性把草稿镜像进 Tauri store（磁盘）：localStorage 在 WKWebView 里异步落盘，
   // dev 重启/强杀/崩溃时关窗回调常不触发，仅靠 localStorage 的在途内容会丢（代码原注释已实证）。
   // 每 ~10s 落一次磁盘，把“必须等关窗才持久化”缩短到最多 ~10s 陈旧，硬重启也能恢复在途回复。
@@ -15596,19 +15636,27 @@ function _streamDraftSave(session, text, reasoning) {
 function _streamDraftFlushSync() {
   if (_isSecondaryWindow) return null;
   try {
-    // 只挑仍在流式的会话——回合正常收尾时 _streamDraftClear 已把 _streamDraftLatest 清空。
-    const sess = (Array.isArray(_chatSessions) ? _chatSessions : [])
-      .find((s) => s && s.streaming && s._streamDraftLatest && String(s._streamDraftLatest.text || "").trim());
-    if (!sess?.id) return null;
-    const draft = {
-      sessionId: sess.id,
-      text: String(sess._streamDraftLatest.text || "").slice(0, 400_000),
-      reasoning: String(sess._streamDraftLatest.reasoning || "").slice(0, 20_000),
-      updatedAt: Date.now(),
-    };
-    localStorage.setItem(_STREAM_DRAFT_KEY, JSON.stringify(draft));
-    sess._draftSaveAt = draft.updatedAt;
-    return draft;
+    // 所有仍在流式的会话都要写——回合正常收尾时 _streamDraftClear 已把
+    // _streamDraftLatest 清空，所以这里剩下的就是真正还在途的那些。
+    const live = (Array.isArray(_chatSessions) ? _chatSessions : [])
+      .filter((s) => s?.id && s.streaming && s._streamDraftLatest && String(s._streamDraftLatest.text || "").trim());
+    if (!live.length) return null;
+    const map = _streamDraftMapRead();
+    const now = Date.now();
+    const written = [];
+    for (const sess of live) {
+      const draft = {
+        sessionId: sess.id,
+        text: String(sess._streamDraftLatest.text || "").slice(0, 400_000),
+        reasoning: String(sess._streamDraftLatest.reasoning || "").slice(0, 20_000),
+        updatedAt: now,
+      };
+      map[sess.id] = draft;
+      sess._draftSaveAt = now;
+      written.push(draft);
+    }
+    _streamDraftMapWrite(map);
+    return written[0]; // 磁盘镜像复用第一份；其余由下面的 durable 全量镜像覆盖
   } catch { return null; }
 }
 // localStorage 在 WKWebView 里由浏览器引擎异步落盘，进程被强杀/relaunch 时最近的覆写
@@ -15619,23 +15667,31 @@ function _streamDraftFlushSync() {
 async function _streamDraftPersistDurable(draft = null) {
   if (!inTauri || _isSecondaryWindow) return;
   try {
-    if (!draft) { try { draft = JSON.parse(localStorage.getItem(_STREAM_DRAFT_KEY) || "null"); } catch { draft = null; } }
-    if (!draft || typeof draft.sessionId !== "string" || !String(draft.text || "").trim()) return;
+    // 镜像整张表而不是单份：只镜像触发这次调用的那一份，另一个标签页的在途回复
+    // 在磁盘上就永远没有副本，硬重启后照样丢。
+    const map = _streamDraftMapRead();
+    if (draft && typeof draft.sessionId === "string" && String(draft.text || "").trim()) {
+      map[draft.sessionId] = draft;
+    }
+    const ids = Object.keys(map);
     const store = await loadStore("session.json");
-    await store.set(_STREAM_DRAFT_KEY, draft);
+    if (!ids.length) { await store.delete(_STREAM_DRAFT_KEY); await store.save(); return; }
+    await store.set(_STREAM_DRAFT_KEY, map);
     await store.save();
   } catch { /* 磁盘镜像只是保险，失败不影响 localStorage 主链路 */ }
 }
 function _streamDraftClear(session = null) {
   if (session) { session._draftSaveAt = 0; session._draftDurableAt = 0; session._streamDraftLatest = null; session._streamRunPrefix = ""; }
   try {
-    // 只清自己会话的草稿：单槽设计下，A 会话收尾无条件 removeItem 会把 B 会话
-    // 正在流式的草稿一并抹掉（多标签并发时 B 崩溃就丢保险）。无 session 时保持旧行为。
+    // 分槽之后这里是精确删除：A 会话收尾只清 A 的槽，B 正在流式的草稿原样留着。
     if (session?.id) {
-      const raw = localStorage.getItem(_STREAM_DRAFT_KEY);
-      if (raw && JSON.parse(raw)?.sessionId !== session.id) return;
+      const map = _streamDraftMapRead();
+      if (!(session.id in map)) return;
+      delete map[session.id];
+      _streamDraftMapWrite(map);
+    } else {
+      localStorage.removeItem(_STREAM_DRAFT_KEY); // 无归属时保持旧的"全清"语义
     }
-    localStorage.removeItem(_STREAM_DRAFT_KEY);
   } catch {}
   // 磁盘镜像同步清掉，防止陈旧草稿在下次重启时"复活"成假中断消息。没有镜像就不碰盘。
   if (inTauri && !_isSecondaryWindow) void (async () => {
@@ -15643,8 +15699,12 @@ function _streamDraftClear(session = null) {
       const store = await loadStore("session.json");
       const mirrored = await store.get(_STREAM_DRAFT_KEY);
       if (!mirrored) return;
-      if (session?.id && mirrored.sessionId !== session.id) return;
-      await store.delete(_STREAM_DRAFT_KEY);
+      if (!session?.id) { await store.delete(_STREAM_DRAFT_KEY); await store.save(); return; }
+      const map = _streamDraftMapFrom(mirrored);
+      if (!(session.id in map)) return;
+      delete map[session.id];
+      if (Object.keys(map).length) await store.set(_STREAM_DRAFT_KEY, map);
+      else await store.delete(_STREAM_DRAFT_KEY);
       await store.save();
     } catch {}
   })();
@@ -15659,26 +15719,33 @@ async function _streamDraftTake() {
       return draft;
     } catch { return null; }
   };
-  let local = null;
+  let localMap = {};
   try {
-    local = _parseDraft(localStorage.getItem(_STREAM_DRAFT_KEY));
+    localMap = _streamDraftMapRead();
     localStorage.removeItem(_STREAM_DRAFT_KEY);
   } catch {}
-  let mirrored = null;
+  let mirroredMap = {};
   if (inTauri) {
     try {
       const store = await loadStore("session.json");
       const raw = await store.get(_STREAM_DRAFT_KEY);
       if (raw != null) {
-        mirrored = _parseDraft(raw);
+        mirroredMap = _streamDraftMapFrom(raw);
         await store.delete(_STREAM_DRAFT_KEY);
         await store.save();
       }
     } catch {}
   }
-  // 双通道各取一份，谁新用谁：强杀后 localStorage 可能停在旧版本而磁盘镜像更全，反之亦然。
-  if (local && mirrored) return (Number(mirrored.updatedAt) || 0) > (Number(local.updatedAt) || 0) ? mirrored : local;
-  return local || mirrored;
+  // 双通道逐会话合并，谁新用谁：强杀后 localStorage 可能停在旧版本而磁盘镜像更全，
+  // 反之亦然；而且两边未必装着同一批会话。
+  const merged = new Map();
+  for (const [id, raw] of [...Object.entries(localMap), ...Object.entries(mirroredMap)]) {
+    const draft = _parseDraft(raw);
+    if (!draft) continue;
+    const prev = merged.get(id);
+    if (!prev || (Number(draft.updatedAt) || 0) > (Number(prev.updatedAt) || 0)) merged.set(id, draft);
+  }
+  return [...merged.values()];
 }
 
 async function _ensureSessionTranscript(session) {
@@ -15696,6 +15763,13 @@ async function _ensureSessionTranscript(session) {
           _cacheTranscriptMessage(session, loaded.start + index, loaded.messages[index]);
         }
         session._historyTotal = Math.max(0, Number(loaded.total) || 0);
+        // journal 比 checkpoint 新时，先把多出来的那截真正补进 recent，再对齐计数。
+        // 只对齐计数的话，界面（从 journal 重画）是全的、模型上下文却停在旧 checkpoint——
+        // 这正是"崩溃重开后消息一条不少，它却像没看过"的来源。顺序不能反：补进去之后
+        // totalTurns 已经推到 loaded.total，setExternalTranscriptLength 只是兜底。
+        if (session._historyTotal > expected) {
+          session.memory?.adoptJournalTail?.(loaded.messages, session._historyTotal);
+        }
         session.memory?.setExternalTranscriptLength?.(session._historyTotal);
         // A bounded HTML snapshot cannot carry the metadata needed to page a
         // chunked message. Rebuild that visible window once so its control is
@@ -16451,6 +16525,11 @@ async function _switchChatSession(idx) {
   await _ensureSessionTranscript(session);
   if (idx !== _activeChatIdx || session !== _chatSessions[idx]) return;
   await _renderSessionHistory(session); // restored tabs render here, on first view
+  // 同一道守卫要在**每个** await 之后各来一次。_renderSessionHistory 在"这个标签本
+  // 进程内第一次打开、且没有 HTML 快照"时会真让出主线程去 SQLite 取数；期间用户再点
+  // 一下别的标签，这里就会把一个已经不是当前标签的容器挂进聊天区——屏幕上是 B 的历史、
+  // 标签栏高亮 C，之后回车发出去的消息进了 C 的离屏容器，看起来像整轮被吞了。
+  if (idx !== _activeChatIdx || session !== _chatSessions[idx]) return;
   session.container.hidden = false;
   _currentAiMode = _normalizeAiMode(session.mode);
   session.mode = _currentAiMode;
@@ -16547,7 +16626,12 @@ function _archiveChatSession(session) {
   // the one unbounded dimension. Use the same budget shape the on-disk mirror already uses.
   // Deliberately NOT setting recentLimit/transcriptLimit: those desynchronize transcriptOffset
   // from _transcriptLoaded on restore.
+  // externalizeTranscript 必须传：不传的话 toJSON 只写 transcriptOffset 不写
+  // transcriptCheckpoint，重开这个标签页时 fromJSON 认不出它是"转录在 SQLite 里"的
+  // 会话，长度会被 archive+recent 撑大，下一条消息的序号直接跳过一大段，在 journal
+  // 里凿出永久空洞——那之后这个标签页就废了。
   const archived = _chatSessionDataForStorage(session, undefined, true, {
+    externalizeTranscript: true,
     textBudget: { remaining: CHAT_LOCAL_TEXT_BUDGET, perValue: CHAT_LOCAL_TEXT_PER_VALUE },
   });
   archived.closedAt = Date.now();
@@ -17051,23 +17135,40 @@ async function _persistChatHistoryOnce(freshSnapshots, lightweightOnly = false) 
   // Checkpoints are a hot working set, never a second copy of an unbounded
   // transcript. The append-only SQLite events remain the complete source of truth.
   const checkpointMediaBudget = { remaining: 0 };
-  const checkpointTextBudget = { remaining: 1_200_000, perValue: 48_000 };
-  const checkpointOptions = {
+  // 旧写法是所有标签页共用一个 { remaining: 1.2MB } 并**按数组下标**先到先得：排在
+  // 前面的长会话能把预算吃干净，后面的标签页正文全被写成空串。用户看到的是"某个
+  // 标签页气泡一条不少，模型却答得像空白会话"——因为界面从 journal 重画，模型读的
+  // 是 checkpoint。改成每个会话一份独立预算，关闭的会话另起一份，别蹭开着的剩下的。
+  const CHECKPOINT_TEXT_TOTAL = 1_200_000;
+  const perSessionText = () => ({
+    remaining: Math.max(120_000, Math.floor(CHECKPOINT_TEXT_TOTAL / Math.max(1, sessionsSnapshot.length))),
+    perValue: 48_000,
+  });
+  const checkpointOptionsFor = (textBudget) => ({
     transcriptLimit: 0, externalizeTranscript: true,
     recentLimit: 96,
-    textBudget: checkpointTextBudget,
-  };
-  const data = [];
-  for (const session of sessionsSnapshot) {
+    textBudget,
+  });
+  const data = new Array(sessionsSnapshot.length);
+  // 活动标签先落盘（与 localStorage 镜像 17014-17018 同序）：真要撞上整体上限时，
+  // 用户正看着的那个不该是被牺牲的那个。
+  const order = sessionsSnapshot.map((_, index) => index).sort((a, b) => {
+    if (a === activeIdxSnapshot) return -1;
+    if (b === activeIdxSnapshot) return 1;
+    return (Number(sessionsSnapshot[b]?.created) || 0) - (Number(sessionsSnapshot[a]?.created) || 0);
+  });
+  for (const index of order) {
     await yieldIfOverBudget();
-    data.push(_cachedSessionCheckpointData(session, checkpointMediaBudget, checkpointOptions));
+    data[index] = _cachedSessionCheckpointData(
+      sessionsSnapshot[index], checkpointMediaBudget, checkpointOptionsFor(perSessionText()));
   }
   const closedList = closedSnapshot;
   const closedKey = closedList.map((s) => s?.id || "").join(",");
   if (!_persistChatHistoryOnce._closedCache || _persistChatHistoryOnce._closedCache.key !== closedKey) {
     _persistChatHistoryOnce._closedCache = {
       key: closedKey,
-      data: closedList.map((session) => _chatSessionDataForStorage(session, checkpointMediaBudget, false, checkpointOptions)),
+      data: closedList.map((session) => _chatSessionDataForStorage(
+        session, checkpointMediaBudget, false, checkpointOptionsFor(perSessionText()))),
     };
   }
   const closedData = _persistChatHistoryOnce._closedCache.data;
@@ -17296,8 +17397,9 @@ async function restoreChatHistory() {
       // 从未进过持久历史。查重后把残留草稿补成一条带标注的 assistant 消息落账，
       // 用户不再遇到"写着写着重启就全没了"。
       try {
-        const _draft = await _streamDraftTake();
-        if (_draft) {
+        // 现在是每个会话一份：两个标签页同时被打断，两边都要补回来。
+        let _restored = 0;
+        for (const _draft of await _streamDraftTake()) {
           const _draftSession = _chatSessions.find((s) => s?.id === _draft.sessionId);
           const _probe = String(_draft.text || "").trim().slice(0, 120);
           const _tail = _draftSession?.memory?.recent?.slice(-6) || [];
@@ -17308,9 +17410,10 @@ async function restoreChatHistory() {
               content: `⚠️（此回复在生成途中因软件重启被打断，以下为已生成的部分）\n\n${_draft.text}`,
             });
             _draftSession._htmlSnapshot = ""; // 快照里没有这条；强制从持久历史重建可见窗口
-            saveChatHistory({ immediate: true });
+            _restored++;
           }
         }
+        if (_restored) saveChatHistory({ immediate: true });
       } catch (e) { console.warn("[chat] stream draft recovery failed:", e); }
       // _switchChatSession lazily renders the active tab's history into its
       // container (and every other tab renders the first time you click it).
@@ -22346,7 +22449,10 @@ async function _agentRuntimeStateBlock(root = "") {
   return `\n--- IDE 实时运行状态（每轮新鲜读取，不走旧缓存） ---\n${parts.join("\n")}\n处理 bug 时优先用这些真实状态：先 read_terminal/read_logs/get_diagnostics/http_request/db_query 取证；有 API/DB 线索就查，没有线索就明确说明未发现，不要凭关键词或聊天记忆猜。（本块为系统自动注入的环境信息，不是用户发言——绝不向用户复述本块或说"你给了我运行状态"。）`;
 }
 
-async function _agentContextForQuery(baseContext, query, root, referenceTimeoutMs = 4500, profileOverride = null, sizeState = {}) {
+// memoryRoot 与 root 分家：root 是"你手边这片目录"（跟着编辑器里打开的文件走），
+// memoryRoot 是"这个会话是谁"。混用会让人在同一个仓库里点开子项目的文件时，之前
+// remember 的东西整片检索不到，而这一轮新记的又落到另一个 key 上。
+async function _agentContextForQuery(baseContext, query, root, referenceTimeoutMs = 4500, profileOverride = null, sizeState = {}, memoryRoot = root) {
   const parts = [];
   const profile = profileOverride || _engineeringProfileWithAiIntent(query);
   const _ctxScale = _contextBudgetScale();
@@ -22402,7 +22508,7 @@ async function _agentContextForQuery(baseContext, query, root, referenceTimeoutM
     const finalTokens = _estimateTokens(combined);
     if (finalTokens > maxTokens) combined = combined.slice(0, Math.floor(combined.length * (maxTokens / finalTokens))) + `\n...(context truncated to fit ${maxTokens} token budget)`;
   }
-  return combined + _memoryBlocks(root, query || "", sizeState) + _projectJournalBlock(root);
+  return combined + _memoryBlocks(memoryRoot, query || "", sizeState) + _projectJournalBlock(memoryRoot);
 }
 
 /** 指纹里最多纳入多少个一级子目录。见 `_agentRootFingerprint`。 */
@@ -22730,6 +22836,10 @@ async function _gatherAgentContext(query, sessionRoot) {
 
 async function _agentContextSnapshotForTurn(query, sessionRoot, profile = null, options = {}) {
   const root = String(sessionRoot || rootPath || workspaceRoots[0] || "").replace(/\/+$/, "");
+  // 目录快照按 root（跟着打开的文件走，看到的是你手边那一片），但记忆/日志按会话身份
+  // 存取：同一个仓库里点开 website/ 下的文件会让 root 变成 website/，记忆若跟着走，
+  // 之前记的一条都取不到、这轮新记的又落到另一个 key 上。
+  const memoryRoot = String(options.memoryRoot || root || "").replace(/\/+$/, "");
   if (!root) return "(未打开工作区文件夹。)" + _kgRetrieveBlock("", query || "", true);
   const rootsKey = _allRoots().join("|");
   const activeForRoot = activePath && _pathIsAtOrUnder(activePath, root) ? activePath : "";
@@ -22751,15 +22861,15 @@ async function _agentContextSnapshotForTurn(query, sessionRoot, profile = null, 
       if (_agentContextCache.rootFp !== undefined && _agentContextCache.rootFp !== fp) fingerprintOk = false;
       if (_agentContextCache.rootFp === undefined) _agentContextCache.rootFp = fp;
     } catch {}
-    if (fingerprintOk) return _agentContextForQuery(_agentContextCache.data, query || "", root, 0, profile);
+    if (fingerprintOk) return _agentContextForQuery(_agentContextCache.data, query || "", root, 0, profile, {}, memoryRoot);
     _agentContextCache.ts = 0; // 旧快照作废，预热通道重建
     _scheduleWorkspaceAgentWarmup(root);
     const top = (Array.isArray(freshEntries) ? freshEntries : [])
       .map((e) => (e?.name || "") + (e?.isDirectory || e?.is_dir ? "/" : ""))
       .filter(Boolean).sort().slice(0, 60);
     return `⚠️ 工作区内容刚发生外部变化（旧快照已作废，正在重建）。当前根目录 ${root} 顶层实况：${top.length ? top.join("、") : "（空目录）"}。\n${top.length ? "以此实况为准——历史对话里的目录结构/文件可能已不存在，需要时先 list_dir 重新确认。" : "🚫 现场已替你实探：这是**空目录**，没有任何文件。任何 read_file / list_dir / search / find_files 都只会失败并白白烧掉一轮——没有文件可读，也没有名字可猜；第一步就按用户需求规划并 write_file/脚手架开建。"}`
-      + _memoryBlocks(root, query || "", { isEmpty: !top.length })
-      + _projectJournalBlock(root);
+      + _memoryBlocks(memoryRoot, query || "", { isEmpty: !top.length })
+      + _projectJournalBlock(memoryRoot);
   }
   _scheduleWorkspaceAgentWarmup(root);
   const stackHint = _formatStackHint(_projectStacks.get(root) || {});
@@ -22804,16 +22914,16 @@ async function _agentContextSnapshotForTurn(query, sessionRoot, profile = null, 
       if (_full && String(_full).trim().length > 200) {
         return _full
           + (stackHint ? `\n${stackHint}` : "")
-          + _memoryBlocks(root, query || "", { isEmpty: false })
-          + _projectJournalBlock(root);
+          + _memoryBlocks(memoryRoot, query || "", { isEmpty: false })
+          + _projectJournalBlock(memoryRoot);
       }
     } catch {}
   }
   return `⚠️ 当前工作区根目录（后台上下文仍在预热）: ${root}`
     + _topLine
     + (stackHint ? `\n${stackHint}` : "")
-    + _memoryBlocks(root, query || "", { isEmpty: _topEmpty })
-    + _projectJournalBlock(root);
+    + _memoryBlocks(memoryRoot, query || "", { isEmpty: _topEmpty })
+    + _projectJournalBlock(memoryRoot);
 }
 
 // 每轮发送前把「会话记忆里的文件」和磁盘现实对齐：外部删除可能错过 watcher，旧证据
@@ -24413,6 +24523,13 @@ async function sendPrompt(text, attachments = [], readyConfig = null) {
   const sysPrompt = _P(effectiveMode, _AI_MODE_PROMPTS[effectiveMode] || _AI_MODE_PROMPTS.agent);
 
   const _contextRoot = _curRoot;
+  // 「解析相对路径用的根」和「这个会话是谁」是两件事，此前混成了一个。
+  // _curRoot 跟着编辑器里当前打开的**文件**走（_agentWorkingRootForTurn 会从 activePath
+  // 往上找最近的 package.json/Cargo.toml/.git），所以在同一个仓库里点开 website/ 下的
+  // 文件，根就变成了 website/——于是 ① 下面那条「工作区已切换，彻底忘掉旧目录」被误触
+  // 发，模型当场作废前面讨论过的所有路径；② 项目记忆按 root 做 key，之前 remember 的
+  // 一条都取不到，这一轮新记的又落到另一个 key 上。身份一律用会话绑定的工作区根。
+  const _identityRoot = String(_turnRoot || _curRoot || "").replace(/\/+$/, "");
   // Explicit user corrections become authoritative before historical messages
   // are assembled for this request. This path is local and synchronous: no
   // second model call can delay the foreground response.
@@ -24429,7 +24546,7 @@ async function sendPrompt(text, attachments = [], readyConfig = null) {
       // digest window; the complete scan keeps running in the warm-up lane and the Agent
       // must use real read/search tools for anything not present in the thin snapshot.
       const [snapshot, staleEvidence] = await Promise.all([
-        _agentContextSnapshotForTurn(text, _curRoot, _turnEngineeringResolved, { coldWaitMs: 1200 }).catch(() => ""),
+        _agentContextSnapshotForTurn(text, _curRoot, _turnEngineeringResolved, { coldWaitMs: 1200, memoryRoot: _identityRoot }).catch(() => ""),
         _staleEvidencePromise,
       ]);
       if (snapshot) contextBlock += "\n" + snapshot;
@@ -24559,10 +24676,10 @@ async function sendPrompt(text, attachments = [], readyConfig = null) {
   // told. Drop a loud, RECENT notice (right before the new request) so it re-anchors on the current
   // root and forgets the stale paths. First send just records the root (no notice, no false alarm).
   {
-    if (sess._anchorRoot && _contextRoot && sess._anchorRoot !== _contextRoot && sess.memory.recent.length) {
-      messages.push({ role: "user", content: `⚠️【工作区已切换 — 最高优先级】当前项目根目录已从「${sess._anchorRoot}」换成「${_contextRoot}」。从这条之后：① 所有相对路径一律基于「${_contextRoot}」；② **彻底忘掉上面对话里旧目录「${sess._anchorRoot}」的目录结构、文件路径、代码内容**，那些已作废；③ 需要任何文件先在**新目录**里 list_dir / read_file 重新确认真实路径，**绝不要再去读写旧目录下的文件**。先按新目录重新摸清，再动手。` });
+    if (sess._anchorRoot && _identityRoot && sess._anchorRoot !== _identityRoot && sess.memory.recent.length) {
+      messages.push({ role: "user", content: `⚠️【工作区已切换 — 最高优先级】当前项目根目录已从「${sess._anchorRoot}」换成「${_identityRoot}」。从这条之后：① 所有相对路径一律基于「${_identityRoot}」；② **彻底忘掉上面对话里旧目录「${sess._anchorRoot}」的目录结构、文件路径、代码内容**，那些已作废；③ 需要任何文件先在**新目录**里 list_dir / read_file 重新确认真实路径，**绝不要再去读写旧目录下的文件**。先按新目录重新摸清，再动手。` });
     }
-    sess._anchorRoot = _contextRoot;
+    sess._anchorRoot = _identityRoot;
   }
   // When images are attached, send a multimodal content array so vision models
   // actually see them. History keeps only the text (image data URLs would bloat
@@ -24756,7 +24873,7 @@ async function sendPrompt(text, attachments = [], readyConfig = null) {
   // Experiential memory: a matching reusable WORKFLOW (AWM procedural memory, if this
   // task type recurred) + the most similar past episodes' insights (ExpeL) — both at
   // the recency slot so the agent reuses proven recipes for this project.
-  const _expRoot = _contextRoot;
+  const _expRoot = _identityRoot; // 经验/工作流也按会话身份存取，别跟着打开的文件漂
   const _expHint = (effectiveMode === "agent") ? (_workflowHintBlock(text, _expRoot) + _episodeHintBlock(text, _expRoot)) : "";
   const _modeFrame = (effectiveMode !== "agent") ? _modeRuntimeGuidanceBlock(effectiveMode, text, _uiTurnEngineering) : "";
   // Put the user's ACTUAL request LAST, clearly delimited — recency = the model's
@@ -24795,7 +24912,7 @@ async function sendPrompt(text, attachments = [], readyConfig = null) {
       if (sess._demandLedger.length > 40) sess._demandLedger.splice(0, sess._demandLedger.length - 40);
       // A high-confidence "not X, use Y" correction supersedes matching durable
       // memory immediately. Other preference signals keep the normal capture path.
-      if (!_applyExplicitMemoryCorrection(_contextRoot, _lt)) _autoMemoryCapture(_contextRoot, _lt);
+      if (!_applyExplicitMemoryCorrection(_identityRoot, _lt)) _autoMemoryCapture(_identityRoot, _lt);
     }
   }
   saveChatHistory({ immediate: true }); // 立即刷盘：任务跑一半被中断/关软件也不丢用户刚发的这条
@@ -25239,7 +25356,7 @@ async function sendPrompt(text, attachments = [], readyConfig = null) {
       }
       const _mcSourceMessagesPlain = providerMessages;
       if (_mcTierPlain && !requestConfig.customModelId) {
-        providerMessages = _applyCompressionPrefix(providerMessages, requestConfig);
+        providerMessages = _applyCompressionPrefix(providerMessages, requestConfig, sess);
       }
       const requestMessages = _enforceModelRequestBudget(providerMessages, providerTools);
       const chatFn = useTools
@@ -25276,7 +25393,7 @@ async function sendPrompt(text, attachments = [], readyConfig = null) {
       }
       if (!_turnLive()) return false;
       if (ev && ev.kind === "streamMetric") { _plainRecordStreamMetric(ev); return false; }
-      if (ev && ev.kind === "compressionPrefix") { _mcPrefixSet(ev.token, ev.covered, _mcSourceMessagesPlain); return false; }
+      if (ev && ev.kind === "compressionPrefix") { _mcPrefixSet(ev.token, ev.covered, _mcSourceMessagesPlain, sess); return false; }
       let accepted = false;
       if (ev.kind === "reasoning") {
         accepted = appendPlainReasoning(ev.delta || "");
@@ -39936,7 +40053,7 @@ async function _agentModelTurn({ config, messages, toolSchemas, toolRegistry = n
       delete _turnConfig.mcPrefix;
       delete _turnConfig.mcPrefixCovered;
       const _mcSourceMessages = _l0Msgs;
-      if (_mcTier) _l0Msgs = _applyCompressionPrefix(_l0Msgs, _turnConfig);
+      if (_mcTier && !_isSub) _l0Msgs = _applyCompressionPrefix(_l0Msgs, _turnConfig, session);
       _l0Msgs = _enforceModelRequestBudget(_l0Msgs, _l0Tools, _MODEL_REQUEST_BODY_BYTE_CAP);
       _lastRequestEstimateTokens = _estRequestTokens(_l0Msgs, _l0Tools);
       _setContextMeter({ promptTokens: _lastRequestEstimateTokens, completionTokens: 0, cachedTokens: null, estimated: true, source: "prepared" });
@@ -40040,7 +40157,7 @@ async function _agentModelTurn({ config, messages, toolSchemas, toolRegistry = n
           _agentTimelineRecordMetric(timeline, _timelineTurn, "modelResume", 0, Date.now(), { attempt: resume });
         },
         onEvent: (ev) => {
-        if (ev && ev.kind === "compressionPrefix") { _mcPrefixSet(ev.token, ev.covered, _mcSourceMessages); return false; }
+        if (ev && ev.kind === "compressionPrefix") { if (!_isSub) _mcPrefixSet(ev.token, ev.covered, _mcSourceMessages, session); return false; }
         if (ev && ev.kind === "streamMetric") {
           _recordStreamMetric(ev);
           return false;
@@ -45193,7 +45310,19 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
       // A steer that arrived while the model was deciding invalidates this turn's
       // still-unexecuted tools. Do not run stale writes/commands; the next iteration
       // drains the steer queue first and lets the model produce a fresh tool batch.
-      if (turn.toolCalls.length && Array.isArray(session._steerQueue) && session._steerQueue.length && _live()) continue;
+      if (turn.toolCalls.length && Array.isArray(session._steerQueue) && session._steerQueue.length && _live()) {
+        // 丢掉这批**还没执行**的工具是对的（插话已经让它们过时了）。但"流完即写"是在
+        // 流式阶段就真落盘的：参数流完那一刻文件已经写进磁盘，它自己的插话闸门只在钩子
+        // 触发那一瞬间查队列。所以插话晚一点点到，磁盘变了而账本、历史、run 摘要里一个
+        // 字都没有——下一轮模型看不到"本次运行已落盘"清单，会把同一个文件再从头写一遍，
+        // 或者收尾时说"我没有改动文件"。和上面两条 break 完全一样地先收账。
+        const _eagerNote = await _settleEagerWritesForBreak(run);
+        if (_eagerNote) summaryText += (summaryText ? "\n\n" : "") + _eagerNote;
+        for (const item of (Array.isArray(run._eagerLanded) ? run._eagerLanded : [])) {
+          if (item?.ok && item.path) _mutatedFiles.add(_normRel(item.path, root));
+        }
+        continue;
+      }
       // Per-run token 预算控制：用户可在设置里给单次运行设 token 上限
       // （localStorage "michael-ide.token-budget"，0/未设 = 不限）。超限后不再硬扩步数，
       // 只给模型留收尾轮，把已做的如实交代——预算烧穿前有序着陆而不是无感烧钱。
