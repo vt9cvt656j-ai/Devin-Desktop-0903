@@ -284,6 +284,18 @@ const RUN_RECORD_KNOWN_SIGNATURE = load("_recordRunKnownSignature", {
   _runFileEvidenceAliases: EVIDENCE_ALIASES,
 });
 AUTO_LOAD_DEPS = {
+  // 限流等待用的独立预算：_runModelRequestWithRetry 现在会读它们。少了是 ReferenceError，
+  // 表现成"这个测试挂了"而不是"退避没生效"。从源码取真值，抄一份会漂。
+  _AI_MODEL_RATE_LIMIT_WAITS: Number(/const _AI_MODEL_RATE_LIMIT_WAITS = (\d+);/.exec(SRC)[1]),
+  _AI_MODEL_RATE_LIMIT_DELAY_MS: Number(/const _AI_MODEL_RATE_LIMIT_DELAY_MS = ([\d_]+);/.exec(SRC)[1].replace(/_/g, "")),
+  _isRateLimitedAiError: load("_isRateLimitedAiError", { _stripAiRetryPrefix: load("_stripAiRetryPrefix", {}) }),
+  _AI_MODEL_RESUME_LIMIT: Number(/const _AI_MODEL_RESUME_LIMIT = ([\d_]+);/.exec(SRC)[1].replace(/_/g, "")),
+  _AI_MODEL_RETRY_LIMIT: Number(/const _AI_MODEL_RETRY_LIMIT = ([\d_]+);/.exec(SRC)[1].replace(/_/g, "")),
+  _AI_MODEL_RETRY_DELAY_MS: Number(/const _AI_MODEL_RETRY_DELAY_MS = ([\d_]+);/.exec(SRC)[1].replace(/_/g, "")),
+  _isRetryableAiError: load("_isRetryableAiError", {
+    _isRateLimitedAiError: load("_isRateLimitedAiError", { _stripAiRetryPrefix: load("_stripAiRetryPrefix", {}) }),
+    _isProviderGatewayStatusError: load("_isProviderGatewayStatusError", { _stripAiRetryPrefix: load("_stripAiRetryPrefix", {}) }),
+  }),
   // 出站消息的代理对修复：_sanitizeProviderMessages 现在会调它们（被截断的 emoji 会让
   // Rust 的 serde_json 直接拒收整个请求）。少了就是 ReferenceError，表现成"这个测试挂了"。
   _stripLoneSurrogates: load("_stripLoneSurrogates", {}),
@@ -25650,4 +25662,49 @@ test("被截断的 emoji 不许把整轮请求打死在后端", () => {
     if (nativeIs) String.prototype.isWellFormed = nativeIs;
     if (nativeTo) String.prototype.toWellFormed = nativeTo;
   }
+});
+
+test("撞限流不再直接判死：等一会儿自动重来，但预算极小、退避很长", async () => {
+  // 用户的话：「502 和 40 几时候记得要重试，不然用户需要一直发继续」。
+  //
+  // 限流此前是**刻意**排除在重试之外的，理由写在 _isRateLimitedAiError 上面：它每发一次都带
+  // 完整上下文，既加深限流又实打实烧配额，历史上出过 25 秒 18 发的请求风暴。那条保护不能撤。
+  //
+  // 但"直接判死"同样不对：用户看到红字会自己发「继续」——那就是一次重试，只是来得更快
+  // （零退避）、更贵（整轮从头再来）。所以给限流一条独立的路：次数极小、退避很长。
+  const waits = Number(/const _AI_MODEL_RATE_LIMIT_WAITS = (\d+);/.exec(SRC)[1]);
+  const delay = Number(/const _AI_MODEL_RATE_LIMIT_DELAY_MS = ([\d_]+);/.exec(SRC)[1].replace(/_/g, ""));
+  assert.ok(waits >= 1 && waits <= 3, `限流等待次数 ${waits} 超出"极小"的范围——这条路的全部安全性就在于它小`);
+  assert.ok(delay >= 10_000, `限流退避 ${delay}ms 太短——太快回去只会加深限流，那正是当年请求风暴的成因`);
+
+  // 普通重试的判据里必须**仍然**把限流排除，否则它会同时吃两份预算，风暴就回来了。
+  const retryable = load("_isRetryableAiError", {
+    _isRateLimitedAiError: load("_isRateLimitedAiError", { _stripAiRetryPrefix: load("_stripAiRetryPrefix", {}) }),
+    _isProviderGatewayStatusError: load("_isProviderGatewayStatusError", { _stripAiRetryPrefix: load("_stripAiRetryPrefix", {}) }),
+  });
+  assert.equal(retryable("ai request failed (429 too many requests)"), false,
+    "限流被并回普通重试集合了——它会同时消耗两份预算，25 秒 18 发的风暴就是这么来的");
+  assert.equal(retryable("ai request failed (502 bad gateway)"), true, "502 仍然要走普通重试");
+
+  // 行为验证：第一次限流 → 等待 → 自动重来 → 第二次成功，全程不需要用户发「继续」。
+  // 退避按依赖注入压到 10ms：这里验的是"会不会自动重来"这个**行为**，真实退避时长由上面
+  // 那两条常量断言守着。不压的话这一条测试会真等 15 秒，把整个套件从 5 秒拖到 20 秒。
+  const runWithRetry = load("_runModelRequestWithRetry", { _AI_MODEL_RATE_LIMIT_DELAY_MS: 10 });
+  let attempts = 0;
+  const seen = [];
+  const result = await runWithRetry({
+    invoke: async (cb) => {
+      attempts += 1;
+      if (attempts === 1) throw new Error("ai request failed (429 too many requests)");
+      cb({ kind: "text", text: "ok" });
+    },
+    // 显式 true = 这个事件算真实产出（契约见 _runModelRequestWithRetry 里 accepted 那段）。
+    // 不给的话"没报错也没产出"会被判成失败，测的就不是限流那条路了。
+    onEvent: () => true,
+    onRetry: (info) => seen.push(info),
+  });
+  assert.equal(attempts, 2, "限流之后没有自动重来——用户又得手动发「继续」");
+  assert.equal(result.error, "", "自动重来成功之后不该还报错");
+  assert.equal(seen.length, 1, "应当正好通知一次「正在等待重试」");
+  assert.equal(seen[0].rateLimited, true, "限流的重试通知要能和普通重试区分，否则界面没法说清在等什么");
 });
