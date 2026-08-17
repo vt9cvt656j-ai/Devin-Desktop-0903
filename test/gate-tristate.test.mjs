@@ -226,3 +226,52 @@ test("项目记忆要落到项目里的文件，而不是只活在浏览器存�
     "只认列表项：标题和注释不是记忆");
   assert.match(SRC, /void _importProjectMemoryFile\(path\);/, "打开项目时没有读回");
 });
+
+test("harness 注入的消息都要戴信封，否则会被当成用户说的话", () => {
+  // 用户实拍：让它 clone 一个仓库 → git_clone 因缺必填字段失败 → 修复指令被当成**裸的**
+  // role:"user" 消息追加在最后 → 模型在思考里写下「只有系统提示和错误通知，没有用户的实际
+  // 请求」，开始怀疑自己是不是不该 clone。网关字节数对得上：请求正文=113（用户的话在），
+  // 末条用户=1469 且 orch_msg_count=0（最后那条既不是用户的话、也没戴信封）。
+  //
+  // 信封是模块级常量：修复指令在 _agentModelTurn 里注入，拿不到 _runAgenticLoop 的局部变量
+  // ——这就是它一直裸着的原因。戴上之后网关的 orch_bytes 统计也能覆盖到它。
+  assert.match(SRC, /^const _ORCH_NOTE = "〔系统编排提示/m,
+    "_ORCH_NOTE 必须是模块级常量，否则跨函数注入的消息戴不上信封");
+  assert.doesNotMatch(SRC, /^  const _ORCH_NOTE = /m,
+    "又变回局部常量了——那么 _agentModelTurn 里的注入会重新裸奔");
+
+  assert.match(SRC, /_argRepairMsg = \{ role: "user", content: `\$\{_ORCH_NOTE\}\[工具参数校验失败\]/,
+    "工具参数修复指令没戴信封——它会被模型当成用户发言，并把用户真正的请求顶走");
+});
+
+test("schema 不许比实现更严——模型不填就整轮失败", () => {
+  // 用户："估计许多工具有这种 bug 问题。" 对了：机械扫描发现 9 处 schema 标必填、而实现里
+  // 本来就有**有意义的默认值**。git_clone 是被实拍到的那个——required:["source","target"]，
+  // 而「把这个仓库拉下来」本不该逼模型编一个落地目录。
+  const catalog = JSON.parse(readFileSync(join(HERE, "..", "..", "server", "prompts", "tools.json"), "utf8"));
+  const req = (name) => {
+    const tool = catalog.find((t) => t?.function?.name === name);
+    assert.ok(tool, `目录里没有 ${name}`);
+    return (tool.function.parameters || {}).required || [];
+  };
+
+  // git_clone：target 改成可选，并且实现要能从仓库地址推出落地目录名。
+  assert.deepEqual(req("git_clone"), ["source"], "git_clone 的 target 又变成必填了");
+  assert.match(SRC, /const _inferred = \(_src\.replace\(\/\\\.git\$\/i, ""\)/,
+    "缺了「从仓库地址推目录名」——只放宽 schema 而不给默认值，落地目录会是空字符串");
+
+  // 其余几处：实现有真实默认值的字段不该拦在 schema 上。
+  for (const [name, field] of [
+    ["browser", "action"], ["ui_extract", "source"], ["worktree", "action"],
+    ["ui_click", "action"], ["visual_explain", "title"], ["background_monitor", "message"],
+    ["run_worker", "description"],
+  ]) {
+    assert.ok(!req(name).includes(field),
+      `${name}.${field} 仍是必填，而实现里有默认值——模型不填就白费一整轮`);
+  }
+
+  // 反过来：description 是 run_subagent 的**任务本身**，不是标签。默认值是占位符，
+  // 不填就派出一个不知道要干什么的子智能体——这里保持严格是对的，别被上面那条扫描带走。
+  assert.ok(req("run_subagent").includes("description"),
+    "run_subagent 的 description 是任务本身，必须保持必填");
+});
