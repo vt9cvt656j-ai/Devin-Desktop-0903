@@ -222,6 +222,70 @@ body.is-tauri.is-mac .titlebar {
 body.is-tauri.is-mac.is-fullscreen .titlebar {
   padding-left: 24px;
 }
+
+/* ── Windows：自绘窗口按钮 ──────────────────────────────────────────────────
+ *
+ * Windows 版关掉了原生标题栏（tauri.windows.conf.json 的 decorations:false）。不关的话
+ * 原生那条会压在这条 44px 的标题栏上面：两条标题栏叠着约 76px，同一个标题显示两遍，
+ * 而且原生栏按**操作系统**主题上色——系统深色 + 应用浅色 = 一条纯黑的条焊在纯白界面上。
+ * 那是「Windows 上界面很丑」最直接的结构性原因。
+ *
+ * 关掉之后这三个键必须自己画，否则窗口没法最小化/关闭。尺寸照 Windows 的习惯来：
+ * 46×32，比 mac 的红绿灯大一圈，因为它们是方形命中区而不是圆点。
+ */
+.titlebar__winctl {
+  display: none;
+  align-items: stretch;
+  align-self: stretch;
+  /* 顶到最右，且吃掉 .titlebar 的右内边距——Windows 的窗口按钮是贴边的 */
+  margin-right: -12px;
+  margin-left: 4px;
+}
+body.is-win .titlebar__winctl { display: flex; }
+.winctl {
+  width: 46px;
+  border: 0;
+  background: transparent;
+  color: var(--text-dim);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: default;
+  transition: background 120ms ease, color 120ms ease;
+}
+.winctl svg { width: 12px; height: 12px; fill: currentColor; }
+.winctl:hover { background: color-mix(in srgb, var(--text) 10%, transparent); color: var(--text); }
+.winctl:active { background: color-mix(in srgb, var(--text) 16%, transparent); }
+/* 关闭键 hover 变红是 Windows 的通用约定，用户靠它区分"这个点下去会关掉" */
+.winctl--close:hover { background: #c42b1c; color: #fff; }
+.winctl--close:active { background: #b0271a; color: #fff; }
+/* 最大化之后换成"还原"的双框图标 */
+body.is-maximized #winMaximize svg rect { transform: translate(1px, -1px) scale(0.82); }
+
+/* ── Windows：字重补偿 ──────────────────────────────────────────────────────
+ *
+ * `-webkit-font-smoothing: antialiased` 在 Windows 的 Blink 里是**空操作**——Chromium 只在
+ * macOS 实现它。mac 靠它把字重削细，Windows 走 DirectWrite 的次像素渲染，同一个字号字重
+ * 明显更粗更糊。而这套界面的字重（大量 500/600）和小字号是照着 mac 削细后的观感调的。
+ *
+ * 所以在 Windows 上把半粗那一档降一级：600→550、500→450。数值上只差半档，观感上正好
+ * 抵掉 DirectWrite 多出来的那点墨。不动 700 以上（标题本来就该重），也不动字号——
+ * 改字号会连带把布局挤变形。
+ */
+body.is-win {
+  --wt-strong: 550;
+  --wt-medium: 450;
+}
+body.is-win .titlebar__title,
+body.is-win .tab,
+body.is-win .feature-tab,
+body.is-win .settings-row__label,
+body.is-win .mcpfp-card__name strong,
+body.is-win .skill-row__name { font-weight: var(--wt-strong); }
+body.is-win .titlebar__menu,
+body.is-win .statusbar,
+body.is-win .ctp-btn,
+body.is-win .tbtn { font-weight: var(--wt-medium); }
 .titlebar__lead {
   display: inline-flex;
   align-items: center;
