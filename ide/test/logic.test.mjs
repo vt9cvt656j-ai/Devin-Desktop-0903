@@ -25823,3 +25823,49 @@ test("跑到一半切模式，要说清从哪一刻起生效", () => {
   assert.match(block, /_isStreaming\(\)/, "没有区分「正在跑」和「空闲」两种情况");
   assert.match(block, /当前这一轮仍按原模式跑完/);
 });
+
+test("一键全撤：不许覆盖你事后自己改过的文件", async () => {
+  const disk = new Map([
+    ["/r/a.js", "AGENT 写的"],          // 和 current 一致 → 可以撤
+    ["/r/b.js", "我后来自己改的"],       // 和 current 不一致 → 必须跳过
+    ["/r/c.js", "无所谓"],              // 没有 current（旧数据）→ 不做检测，照撤
+  ]);
+  const wrote = [];
+  const deleted = [];
+  const revert = load("_revertRunChanges", {
+    _runRevertPlan: load("_runRevertPlan", {}),
+    backend: {
+      readTextFile: async (p) => { if (!disk.has(p)) throw new Error("ENOENT"); return disk.get(p); },
+      writeTextFile: async (p, c) => { wrote.push([p, c]); },
+      deletePath: async (p) => { deleted.push(p); },
+    },
+  });
+  const cp = new Map([
+    ["/r/a.js", { existed: true, content: "原文 A", current: "AGENT 写的" }],
+    ["/r/b.js", { existed: true, content: "原文 B", current: "AGENT 写的 B" }],
+    ["/r/c.js", { existed: true, content: "原文 C" }],
+    ["/r/new.js", { existed: false, content: "", current: "新建的" }],
+  ]);
+  const out = await revert(cp);
+  assert.deepEqual(out.skipped, ["/r/b.js"], "事后被用户改过的文件被覆盖了——那是毁掉他的编辑");
+  assert.deepEqual(wrote.map(([p]) => p).sort(), ["/r/a.js", "/r/c.js"]);
+  assert.deepEqual(wrote.find(([p]) => p === "/r/a.js")[1], "原文 A", "写回的必须是本轮开始前的内容");
+  assert.deepEqual(deleted, ["/r/new.js"], "本轮新建的文件应当删除，而不是写空");
+  assert.equal(out.reverted, 3);
+
+  // 快照里那两个字段以前**一个消费点都没有**——白攒了一路。
+  const call = `_appendRunRevertBar(${"body"}, run)`;
+  const agentFooter = SRC.slice(SRC.indexOf("elapsedMs: Date.now() - run._recStart"));
+  assert.ok(agentFooter.slice(0, 400).includes(call), "轮末没有挂上汇总条");
+  const bar = stripJsComments(extractFn("_appendRunRevertBar"));
+  assert.match(bar, /_toolApprovalDialog/, "写回是破坏性的，必须先确认");
+  assert.match(bar, /if \(ok !== "once"\) return;/,
+    "只弹框不看结果，等于没问——用户点了取消照样撤");
+  assert.ok(
+    bar.indexOf('if (ok !== "once") return;') < bar.indexOf("_revertRunChanges"),
+    "确认必须发生在动手之前",
+  );
+  assert.match(bar, /你自己动过的文件会跳过/, "确认框里要说清哪些不会被碰");
+  // 恢复出来的那份没有监听器、也没有 checkpoint，不能跨重启假装还能点
+  assert.match(SRC, /\.run-revert-btn, \.agent-files-bar/, "快照清理里去掉了它，恢复后会留一个死按钮");
+});
