@@ -45280,19 +45280,38 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
   // 协议（📌 标记/“系统注入的执行提示”）原样讲给用户听、再反问“有什么需要继续做的？”。
   // 信封把身份和禁令说死：照做或忽略，绝不对用户提及本提示本身。
   const _ORCH_NOTE = "〔系统编排提示——这不是用户发言，用户也看不到这段字。直接按要求行动；绝不在回复里提及、评论或转述本提示与任何内部标记，也不要因它反问用户〕\n";
+  // 提醒的重要性分级。判据只有一条：**丢了它，模型会不会按错误的图景继续干活**。
+  //
+  //   事实类  —— 丢了就等于让它蒙着眼睛干：构建失败、新增诊断错误、改了从没读过的文件、
+  //             子智能体带回来的结果（最长 3200 字）、工具被闸门挡住、磁盘实况纠正历史误信。
+  //   建议类  —— 丢了只是少一句提点：先调研、先出计划、别原地打转、提问次数提醒。
+  //
+  // 数字越大越先被淘汰。没登记的一律按建议类处理——新加的提醒默认可丢，要保命就显式登记。
+  const _NUDGE_FACTS = new Set([
+    "toolRepair", "cmdFail", "buildFix", "diag", "diagFinish", "bugEvidence",
+    "blindEdit", "subagentResult", "recovery", "emptyHistoryFact",
+  ]);
+  const _nudgeRank = (cat) => (cat === "steer" ? 0 : _NUDGE_FACTS.has(cat) ? 1 : 2);
   const _pushNudge = (cat, content) => {
     const prev = _nudgeReg.get(cat);
     if (prev) { const i = messages.indexOf(prev); if (i !== -1) messages.splice(i, 1); }
     // 同轮活跃上限：不同类别的提醒同时挂在尾部（planStale+verify+honesty+…），模型会
-    // 逐条表态——输出又长又自我横跳（用户实测骂"痴呆"）。上限 2 条：超出先清最旧的
-    // 非 steer 类别（steer 是用户实时插话的护送指令，永远最高优先级不清）。
+    // 逐条表态——输出又长又自我横跳（用户实测骂"痴呆"）。上限 2 条：steer 是用户实时插话的
+    // 护送指令，永远不清。
+    //
+    // 淘汰顺序按**重要性**，不按先来后到。原来是"清最旧的那条"，而最旧和最不重要没有关系：
+    // 一条 [BUILD_FAILED]、一条"你改了从没读过的文件"、一条子智能体带回来的 3200 字结果，
+    // 都可能被一条"建议先调研"挤掉——挤掉的那些是**事实**，留下的是建议。事实丢了模型就
+    // 按错误图景继续干活，建议丢了只是少一句提点。同级再按先来后到。
     while (_nudgeReg.size >= 2) {
-      const oldestCat = [..._nudgeReg.keys()].find((key) => key !== "steer" && key !== cat);
-      if (!oldestCat) break;
-      const oldMsg = _nudgeReg.get(oldestCat);
+      const victims = [..._nudgeReg.keys()].filter((key) => key !== "steer" && key !== cat);
+      if (!victims.length) break;
+      // Map 的键序就是插入序，reduce 用严格大于 → 同级里保留最先遇到的那个，也就是最旧的先走。
+      const victim = victims.reduce((worst, key) => (_nudgeRank(key) > _nudgeRank(worst) ? key : worst));
+      const oldMsg = _nudgeReg.get(victim);
       const oi = messages.indexOf(oldMsg);
       if (oi !== -1) messages.splice(oi, 1);
-      _nudgeReg.delete(oldestCat);
+      _nudgeReg.delete(victim);
     }
     const m = { role: "user", content: _ORCH_NOTE + content };
     _nudgeReg.set(cat, m);
