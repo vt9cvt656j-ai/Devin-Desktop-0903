@@ -1,0 +1,151 @@
+// package_source：读磁盘上装好的那份依赖，拿真实签名。
+//
+// 它治的是最难被发现的一类幻觉——**版本号是对的，写法是旧版的**：
+// package_search 查过了说装的是 5.x，模型仍按训练记忆写 4.x 的调用形状，
+// 而现有的检索层一个都拦不住，因为它们全都够不着 node_modules。
+//
+// 这个文件里的用例**跑在这个仓库自己的 node_modules 上**，不用夹具：真实的包布局
+// （scoped、桶文件、几百个打包产物、269KB 的类型声明）才是会把实现坑掉的东西，
+// 手写的夹具全都碰不到。
+import test from "node:test";
+import assert from "node:assert/strict";
+import { readFileSync, readdirSync, statSync, existsSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+import { dirname, join } from "node:path";
+
+const HERE = dirname(fileURLToPath(import.meta.url));
+const ROOT = join(HERE, "..");
+const SRC = readFileSync(join(ROOT, "src", "main.js"), "utf8");
+
+function topLevelFn(name) {
+  const at = SRC.indexOf(`function ${name}(`);
+  assert.ok(at > 0, `找不到 ${name}`);
+  const start = SRC.lastIndexOf("async ", at) === at - 6 ? at - 6 : at;
+  const end = SRC.indexOf("\n}\n", at);
+  assert.ok(end > at, `${name} 没有行首收尾大括号`);
+  return SRC.slice(start, end + 2);
+}
+const constLine = (name) => {
+  const i = SRC.indexOf(`const ${name} =`);
+  assert.ok(i > 0, `找不到常量 ${name}`);
+  return SRC.slice(i, SRC.indexOf("\n", i) + 1);
+};
+
+// 真实文件系统当后端——被测的就是"能不能在真实包布局里找到东西"。
+const backend = {
+  readDir: async (p) => readdirSync(p).map((name) => ({
+    name, path: `${p}/${name}`, is_dir: statSync(`${p}/${name}`).isDirectory(),
+  })),
+  readTextFile: async (p) => readFileSync(p, "utf8"),
+};
+const api = new Function("backend",
+  constLine("_PKG_SRC_MAX_FILES") + constLine("_PKG_SRC_MAX_BYTES")
+  + constLine("_PKG_SRC_MAX_TYPE_BYTES") + constLine("_pkgSrcMaxBytes")
+  + topLevelFn("_packageBareName") + topLevelFn("_packageSourceCandidates")
+  + topLevelFn("_pkgReadDir") + topLevelFn("_packageInstalledVersion")
+  + topLevelFn("_resolvePackageDir") + topLevelFn("_collectPackageFiles")
+  + topLevelFn("_extractExportNames")
+  + ";return { _packageBareName, _resolvePackageDir, _packageInstalledVersion,"
+  + " _collectPackageFiles, _extractExportNames, _pkgSrcMaxBytes };")(backend);
+
+const hasDeps = existsSync(join(ROOT, "node_modules", "exifr"));
+
+test("包名里的 @ ：作用域前缀 vs 版本分隔符", () => {
+  // 一条正则想同时管两种，实际把 `@tauri-apps/api` 削成了 `@`——于是所有 @scope/xxx
+  // 一律报"未安装"，而那正是前端项目里最常见的一半依赖。
+  assert.equal(api._packageBareName("@tauri-apps/api"), "@tauri-apps/api");
+  assert.equal(api._packageBareName("@scope/x@1.2.3"), "@scope/x");
+  assert.equal(api._packageBareName("zod@3.22"), "zod");
+  assert.equal(api._packageBareName("exifr"), "exifr");
+});
+
+test("类型声明文件单独一档字节上限", () => {
+  // monaco 的 editor.api.d.ts 是 269KB，卡在普通上限外面，于是查 IRange 一无所获。
+  // 声明文件恰恰是最该读的那类，而回给模型的只有命中处 ±20 行，读多大都不占上下文。
+  assert.ok(api._pkgSrcMaxBytes("a/b/editor.api.d.ts") > 1_000_000);
+  assert.ok(api._pkgSrcMaxBytes("a/b/types.pyi") > 1_000_000);
+  assert.equal(api._pkgSrcMaxBytes("a/b/bundle.js"), 220_000);
+});
+
+test("在真实的 node_modules 里解析包、拿到已安装版本", { skip: !hasDeps && "没装依赖" }, async () => {
+  for (const pkg of ["exifr", "@tauri-apps/api", "monaco-editor"]) {
+    const hit = await api._resolvePackageDir(ROOT, pkg);
+    assert.ok(hit, `${pkg} 没解析到——scoped 包和普通包都必须能找到`);
+    const version = await api._packageInstalledVersion(hit.dir, hit.eco);
+    assert.match(version, /^\d+\.\d+/, `${pkg} 没拿到已安装版本：${version}`);
+  }
+  // 不存在的包要明确说没有，不能瞎猜一个目录。
+  assert.equal(await api._resolvePackageDir(ROOT, "肯定没有这个包-zzz"), null);
+});
+
+test("声明文件优先入列——否则大包的打包产物会把名额吃光", { skip: !hasDeps && "没装依赖" }, async () => {
+  /*
+   * monaco-editor 的遍历会先撞上 `dev/vs/` 底下几百个打包产物。一遍走 + 收完再排序
+   * 救不了——排序只能排已经收进来的，而真正该看的 editor.api.d.ts 那时压根没进来。
+   */
+  const hit = await api._resolvePackageDir(ROOT, "monaco-editor");
+  const files = await api._collectPackageFiles(hit.dir);
+  assert.ok(files.some((f) => f.endsWith("editor.api.d.ts")),
+    `monaco 的类型声明没被收进来：${files.slice(0, 5).join(" ")}`);
+  assert.match(files[0], /\.d\.ts$/, `第一个文件该是类型声明，实际是 ${files[0]}`);
+  // 而且必须正好是 package.json 里**官方声明的那个入口**——包里 .d.ts 往往有几十个，
+  // "随便哪个 .d.ts 排第一"和"官方说的入口排第一"是两回事：入口描述的才是对外形状。
+  const declared = JSON.parse(readFileSync(join(hit.dir, "package.json"), "utf8"));
+  const entry = String(declared.types || declared.typings || "").replace(/^\.\//, "");
+  assert.ok(entry, "monaco 的 package.json 该有 types 字段（用例前提变了就改这里）");
+  assert.equal(files[0], `${hit.dir}/${entry}`,
+    `官方类型入口没排在最前：期望 ${entry}，实际 ${files[0]}`);
+});
+
+test("符号模式在三种真实写法上都拿得到定义", { skip: !hasDeps && "没装依赖" }, async () => {
+  // 三种写法各代表一类真实包：
+  //   export function   —— exifr（直接导出）
+  //   declare function  —— @tauri-apps/api（声明和导出分开写，.d.ts 里最常见）
+  //   裸 interface      —— monaco（命名空间里的类型）
+  const i = SRC.indexOf("const esc = wantSymbol.replace");
+  assert.ok(i > 0, "找不到符号匹配那段");
+  const buildRe = new Function("wantSymbol", SRC.slice(i, SRC.indexOf("\n      );", i) + 9) + ";return defRe;");
+
+  const find = async (pkg, symbol) => {
+    const hit = await api._resolvePackageDir(ROOT, pkg);
+    const files = await api._collectPackageFiles(hit.dir);
+    const re = buildRe(symbol);
+    for (const f of files) {
+      let text;
+      try { text = readFileSync(f, "utf8"); } catch { continue; }
+      if (!text || text.length > api._pkgSrcMaxBytes(f)) continue;
+      const line = text.split(/\r?\n/).find((l) => re.test(l));
+      if (line) return line.trim();
+    }
+    return null;
+  };
+
+  assert.match(await find("exifr", "parse") || "", /export function parse\(/);
+  assert.match(await find("@tauri-apps/api", "invoke") || "", /declare function invoke</);
+  assert.match(await find("monaco-editor", "IRange") || "", /interface IRange/);
+  // 不存在的导出必须回空，不能拿个相似的糊弄过去。
+  assert.equal(await find("exifr", "肯定没有这个导出Zzz"), null);
+});
+
+test("工具接进了注册表、意图映射和取证闸", () => {
+  assert.match(SRC, /name: "package_source"/, "工具没注册");
+  assert.match(SRC, /case "package_source": return \{ type: "package_source"/, "意图没映射");
+  assert.match(SRC, /\} else if \(call\.type === "package_source"\)/, "没有执行分支");
+  // 光有工具没用——仓库里已经吃过一次亏：context7 装好了、名录也报了，模型照旧不调。
+  // 所以"什么时候用它"必须同时写在三处。
+  assert.match(SRC, /第三方库的真实签名→package_source/, "工具直觉里没引导到它");
+  assert.doesNotMatch(SRC, /陌生库初探→semantic_search/,
+    "还在把陌生库引向 semantic_search——那个工具的索引跳过 node_modules，必然空手而归");
+  assert.match(SRC, /"package_search", "package_source", "github_repo"/,
+    "没进官方证据表，取证 gate 不会装载它");
+});
+
+test("read_file 读不到 node_modules 时不再塞假事实", () => {
+  // 那句"可能还没装依赖（先跑 npm install）"是**必然**出现的：它依赖的查找函数
+  // 忽略表第一项就是 node_modules，永远返回空。依赖装得好好的，却在最容易幻觉的
+  // 那一秒告诉模型"没装"。
+  assert.doesNotMatch(SRC, /node_modules 内找不到 \$\{_base\}。可能还没装依赖/,
+    "那句假事实又回来了");
+  assert.match(SRC, /搜索层刻意跳过 node_modules，所以这不代表没装/, "没说清为什么搜不到");
+  assert.match(SRC, /package_source\(package="包名"\)/, "没指向真正能查的那个工具");
+});
