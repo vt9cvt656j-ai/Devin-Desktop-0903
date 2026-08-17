@@ -25051,3 +25051,53 @@ test("记忆卫生·纠错前缀按本轮问题挑，且最新两条保底", () 
   assert.match(text, /是建议不是禁令/);
   assert.doesNotMatch(text, /读取 src\/main\.js/);
 });
+
+// ── 模式标签不能被 i18n 重刷改回 Agent ──────────────────────────────────────
+test("模式标签跟当前模式走，整页重刷改不动它", () => {
+  const painted = [];
+  const el = {
+    attrs: { "data-i18n": "assistant.mode.agent" },
+    textContent: "Agent",
+    setAttribute(k, v) { this.attrs[k] = v; },
+    removeAttribute(k) { delete this.attrs[k]; },
+  };
+  const paint = load("_paintModeLabel", {
+    _modeLabelI18nKey: load("_modeLabelI18nKey", { t: (k) => ({
+      "assistant.mode.agent": "Agent",
+      "assistant.mode.chat": "Chat",
+      "assistant.mode.plan": "Plan",
+    })[k] ?? k }),
+    t: (k) => ({ "assistant.mode.plan": "Plan" })[k] ?? k,
+  });
+
+  // 有 key 的模式：属性要换成**这个模式**的 key。仍写死 agent 的 key，就等于
+  // 授权全局 locale 观察者把用户选的 Plan 改回 Agent。
+  paint(el, { id: "plan", label: "Plan" });
+  assert.equal(el.attrs["data-i18n"], "assistant.mode.plan");
+  assert.equal(el.textContent, "Plan");
+
+  // 没 key 的模式：属性必须摘掉，否则重刷会按残留的 key 把它写成别的模式名。
+  const el2 = { attrs: { "data-i18n": "assistant.mode.agent" }, textContent: "Agent",
+    setAttribute(k, v) { this.attrs[k] = v; }, removeAttribute(k) { delete this.attrs[k]; } };
+  paint(el2, { id: "explorer", label: "Explorer" });
+  assert.equal(el2.attrs["data-i18n"], undefined, "没有对应 key 时还留着旧 key");
+  assert.equal(el2.textContent, "Explorer");
+  void painted;
+});
+
+test("模式菜单跳过自动翻译，Explorer 不该变成「文件」", () => {
+  const src = stripJsComments(extractFn("_fillModeMenu"));
+  assert.match(src, /setAttribute\("data-i18n-skip"/,
+    "松散翻译器会按页面上已有的同款文案回译模式名，Explorer 撞上左侧「文件」面板");
+  assert.ok(src.indexOf("data-i18n-skip") < src.indexOf('innerHTML = ""'),
+    "得在填内容前就打上标记");
+});
+
+test("聊天标签页不再显示模型名", () => {
+  const at = SRC.indexOf('tab.innerHTML = `<span class="chat-tab__dot"');
+  assert.ok(at > 0, "找不到标签页渲染处");
+  const block = stripJsComments(SRC.slice(at - 600, at + 900));
+  assert.doesNotMatch(block, /chat-tab__model/, "模型名又回到标签页上了");
+  assert.match(block, /模型：\$\{modelLabel\(s\.model\)\}/, "移走可以，但别把这条信息弄丢——放进悬停提示");
+  assert.doesNotMatch(APP_CSS, /\.chat-tab__model\s*\{/, "样式规则成了死代码");
+});
