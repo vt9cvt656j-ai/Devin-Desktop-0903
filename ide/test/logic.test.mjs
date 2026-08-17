@@ -284,6 +284,10 @@ const RUN_RECORD_KNOWN_SIGNATURE = load("_recordRunKnownSignature", {
   _runFileEvidenceAliases: EVIDENCE_ALIASES,
 });
 AUTO_LOAD_DEPS = {
+  // 出站消息的代理对修复：_sanitizeProviderMessages 现在会调它们（被截断的 emoji 会让
+  // Rust 的 serde_json 直接拒收整个请求）。少了就是 ReferenceError，表现成"这个测试挂了"。
+  _stripLoneSurrogates: load("_stripLoneSurrogates", {}),
+  _wellFormedContent: load("_wellFormedContent", { _stripLoneSurrogates: load("_stripLoneSurrogates", {}) }),
   // 意图裁决的前台等待窗口。_aiIntentProfile 里那道 Promise.race 用它当超时，发送路径
   // 的第一轮等待也从它推导——两个值同源，才不会漂回「等待 < 窗口」那个恒定失败的组合。
   // 从源码里取真值而不是抄一份常数：抄的那份改不动源码也不会红。
@@ -25592,4 +25596,58 @@ test("关掉的 MCP 工具不该还在开局窗口里", () => {
   assert.match(src, /const allowedMcp = all\.filter/,
     "补录拿的是原始 mcpTools，绕过了 disabled 过滤——内置工具关了是真关，MCP 关了还在");
   assert.doesNotMatch(src, /_mcpServersForInitialWindow\(mcpTools\)/);
+});
+
+test("被截断的 emoji 不许把整轮请求打死在后端", () => {
+  // 用户实拍的红字：`lone leading surrogate in hex escape at line 1 column 47665`。
+  // 这句是 Rust serde_json 说的——JS 字符串容得下半个 UTF-16 代理对，JSON.stringify 也照样
+  // 输出 \ud83d，但后端拒收，整轮当场失败。来源是截断：代码里到处 .slice() 工具结果和历史，
+  // 一刀切在 emoji 中间就留下孤立代理。列号 47665 说明是社区搜索/网页抓取那种大结果。
+  const strip = load("_stripLoneSurrogates", {});
+  const sanitize = load("_sanitizeProviderMessages", {
+    _withoutLegacyReasoningSummary: load("_withoutLegacyReasoningSummary"),
+  });
+
+  assert.equal(strip("ok\ud83dtail"), "ok�tail", "孤立的高位代理要被替掉");
+  assert.equal(strip("a\udc00b"), "a�b", "孤立的低位代理同样要被替掉");
+  assert.equal(strip("ok😀tail"), "ok😀tail", "完整的代理对必须原样保留——修复不能吃掉正常 emoji");
+  assert.equal(strip("普通中文 abc"), "普通中文 abc");
+  assert.equal(strip(42), 42, "非字符串原样返回");
+
+  // 三种形状都要覆盖：纯文本 content、多模态分片、以及工具调用的 arguments（JSON 字符串）。
+  const out = sanitize([
+    { role: "user", content: "问题\ud83d" },
+    { role: "user", content: [{ type: "text", text: "分片\ud83d" }, { type: "image_url", image_url: { url: "x" } }] },
+    { role: "assistant", content: "", tool_calls: [{ id: "c1", function: { name: "f", arguments: '{"q":"参数\ud83d"}' } }] },
+  ]);
+  assert.doesNotMatch(out[0].content, /[\uD800-\uDFFF]/, "字符串 content 仍带孤立代理");
+  assert.doesNotMatch(out[1].content[0].text, /[\uD800-\uDFFF]/, "多模态分片仍带孤立代理");
+  assert.doesNotMatch(out[2].tool_calls[0].function.arguments, /[\uD800-\uDFFF]/,
+    "工具调用的 arguments 仍带孤立代理——它同样会被后端解析");
+  assert.equal(out[1].content[1].image_url.url, "x", "非文本分片不能被动到");
+
+  // 收口必须在这里，而不是散在几十个 slice 点上：漏一个就复发。
+  assert.match(extractFn("_sanitizeProviderMessages"), /_wellFormedContent\(providerMessage\.content\)/,
+    "出站消息的 content 没有过代理对修复");
+
+  // 手工兜底分支必须单独测：Node 和新版 WebView 都有原生 isWellFormed/toWellFormed，走原生
+  // 就永远碰不到那段循环——它是给老 WKWebView 准备的，不测等于没写。变异验证时发现它是盲区，
+  // 所以把原生方法临时摘掉，逼代码走兜底。
+  const nativeIs = String.prototype.isWellFormed;
+  const nativeTo = String.prototype.toWellFormed;
+  try {
+    delete String.prototype.isWellFormed;
+    delete String.prototype.toWellFormed;
+    const fallback = load("_stripLoneSurrogates", {});
+    assert.equal(typeof "".isWellFormed, "undefined", "原生方法没摘干净，下面测的还是原生路径");
+    assert.equal(fallback("ok\ud83dtail"), "ok\uFFFDtail", "兜底：孤立高位");
+    assert.equal(fallback("a\udc00b"), "a\uFFFDb", "兜底：孤立低位");
+    assert.equal(fallback("ok😀tail"), "ok😀tail", "兜底：完整代理对必须原样保留");
+    assert.equal(fallback("😀😀"), "😀😀", "兜底：连续的完整代理对");
+    assert.equal(fallback("\ud83d\ud83d"), "\uFFFD\uFFFD", "兜底：两个连着的孤立高位");
+    assert.equal(fallback("纯文本"), "纯文本");
+  } finally {
+    if (nativeIs) String.prototype.isWellFormed = nativeIs;
+    if (nativeTo) String.prototype.toWellFormed = nativeTo;
+  }
 });
