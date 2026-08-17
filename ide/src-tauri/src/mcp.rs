@@ -197,9 +197,70 @@ enum Absorbed {
     Passthrough,
 }
 
+/// 会话的传输通道。
+///
+/// 加这一层不是为了"支持更多协议"，是为了让 Session 上面那一整套来之不易的行为
+/// （超时预算、取消、通知吸收、连续超时驱逐）在两种传输下**一字不改**地复用。
+/// 所以两个分支对外只暴露三件事：写一行、还活着吗、关掉。
+enum Wire {
+    /// 子进程 + stdio。远端服务经 `npx mcp-remote` 桥接时也走这条。
+    Stdio { child: Child, stdin: ChildStdin },
+    /// 直连 HTTP（Streamable HTTP）。省掉 npx 冷启动和 Node 依赖。
+    Http(HttpWire),
+}
+
+/// 直连 HTTP 的写端。真正干活的是一个后台线程：它把每条出站消息 POST 出去，
+/// 再把回来的（JSON 或 SSE）帧塞进和 stdio 同一个 `Sender<String>`——正因为出口
+/// 一样，上层的请求循环完全不需要知道自己接的是哪种传输。
+struct HttpWire {
+    out: std::sync::mpsc::Sender<String>,
+    /// 后台线程还在不在。取代 stdio 那边的 `child.try_wait()`。
+    alive: Arc<AtomicBool>,
+}
+
+impl Wire {
+    fn send_line(&mut self, line: &str) -> std::io::Result<()> {
+        match self {
+            Wire::Stdio { stdin, .. } => {
+                stdin.write_all(line.as_bytes())?;
+                stdin.write_all(b"\n")?;
+                stdin.flush()
+            }
+            Wire::Http(http) => http.out.send(line.to_string()).map_err(|_| {
+                std::io::Error::new(std::io::ErrorKind::BrokenPipe, "HTTP 传输线程已退出")
+            }),
+        }
+    }
+
+    /// 「通道还在吗」。stdio 问子进程，HTTP 问后台线程。
+    fn is_alive(&mut self) -> bool {
+        match self {
+            Wire::Stdio { child, .. } => matches!(child.try_wait(), Ok(None)),
+            Wire::Http(http) => http.alive.load(Ordering::SeqCst),
+        }
+    }
+
+    fn pid(&self) -> Option<u32> {
+        match self {
+            Wire::Stdio { child, .. } => Some(child.id()),
+            Wire::Http(_) => None, // 没有进程可指——面板据此显示"直连"
+        }
+    }
+
+    fn shutdown(&mut self) {
+        match self {
+            Wire::Stdio { child, .. } => {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+            // 置死标志 + 丢掉发送端，后台线程下一次 recv 就退出。
+            Wire::Http(http) => http.alive.store(false, Ordering::SeqCst),
+        }
+    }
+}
+
 struct Session {
-    child: Child,
-    stdin: ChildStdin,
+    wire: Wire,
     rx: Receiver<String>,
     stderr_log: Arc<Mutex<VecDeque<String>>>,
     next_id: u64,
@@ -240,8 +301,7 @@ impl Drop for Session {
     // stop_all), so a wedged or forgotten MCP server never orphans its process + reader thread.
     // Killing the child closes its stdout → the reader thread's `lines()` returns None → it exits.
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        self.wire.shutdown();
     }
 }
 
@@ -594,9 +654,7 @@ impl Session {
             }),
         };
         if let Ok(line) = serde_json::to_string(&response) {
-            let _ = self.stdin.write_all(line.as_bytes());
-            let _ = self.stdin.write_all(b"\n");
-            let _ = self.stdin.flush();
+            let _ = self.wire.send_line(&line);
         }
     }
 
@@ -737,10 +795,8 @@ impl Session {
 
         let msg = json!({"jsonrpc":"2.0","id":id,"method":method,"params":params});
         let line = serde_json::to_string(&msg).map_err(|e| e.to_string())?;
-        self.stdin
-            .write_all(line.as_bytes())
-            .and_then(|_| self.stdin.write_all(b"\n"))
-            .and_then(|_| self.stdin.flush())
+        self.wire
+            .send_line(&line)
             .map_err(|e| format!("写入 MCP 服务失败: {e}"))?;
 
         let mut deadline = Instant::now() + Duration::from_secs(idle_secs);
@@ -810,9 +866,7 @@ impl Session {
     fn notify(&mut self, method: &str, params: Value) {
         let msg = json!({"jsonrpc":"2.0","method":method,"params":params});
         if let Ok(line) = serde_json::to_string(&msg) {
-            let _ = self.stdin.write_all(line.as_bytes());
-            let _ = self.stdin.write_all(b"\n");
-            let _ = self.stdin.flush();
+            let _ = self.wire.send_line(&line);
         }
     }
 }
@@ -897,6 +951,164 @@ pub fn parse_sse_frames(chunk: &str) -> Vec<String> {
     out
 }
 
+/// 直连 HTTP（Streamable HTTP）起一个会话。
+///
+/// 和 `spawn_session` 对称：都交出一个 `Session`，上层的请求循环一个字都不用改。
+/// 区别只在通道——这里没有子进程，出站是 POST，入站是响应体（JSON 或 SSE）。
+///
+/// **只做 Streamable HTTP，不做 2024-11-05 那套 HTTP+SSE**（先 GET 拿 endpoint 事件
+/// 再往那个地址 POST）。后者仍然交给 `mcp-remote` 桥接——两条路并存，认不出来就回落，
+/// 比在这里猜协议版本安全。
+/// 直连 HTTP 的开关。**默认关**。
+///
+/// 远端 MCP 现在靠 `npx mcp-remote` 桥接，那条路是通的（连 OAuth 都在跑）。直连的价值
+/// 是省掉 npx 冷启动和 Node 依赖，不是修什么坏掉的东西——所以它得自己挣来默认开启，
+/// 而不是替掉一条正在工作的路。
+fn native_http_enabled() -> bool {
+    std::env::var("MICHAEL_MCP_NATIVE_HTTP").ok().as_deref() == Some("1")
+}
+
+/// 从 `npx -y -- mcp-remote <url> [--header "K: V"]…` 里还原出直连所需的地址和请求头。
+///
+/// 前端把远端服务统一编译成了这个启动形式（`_mcpServerLaunchConfig`），所以这里做
+/// 逆向识别，好处是**前端和配置格式一个字都不用改**：认得出来就直连，认不出来就照旧
+/// 起子进程。纯字符串进出，不碰网络，测得到。
+fn native_http_target(command: &str, args: &[String]) -> Option<(String, HashMap<String, String>)> {
+    let launcher = std::path::Path::new(command)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or(command);
+    if !matches!(launcher, "npx" | "bunx" | "pnpm" | "yarn" | "npm" | "bun") {
+        return None;
+    }
+    let at = args.iter().position(|a| a == "mcp-remote")?;
+    let url = args.get(at + 1)?.trim().to_string();
+    if !url.starts_with("http://") && !url.starts_with("https://") {
+        return None;
+    }
+    let mut headers = HashMap::new();
+    let mut i = at + 2;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--header" => {
+                // mcp-remote 的写法是一个整串 `Name: value`。
+                let raw = args.get(i + 1)?;
+                let (name, value) = raw.split_once(':')?;
+                if name.trim().is_empty() {
+                    return None;
+                }
+                headers.insert(name.trim().to_string(), value.trim().to_string());
+                i += 2;
+            }
+            // 认不出来的开关一律放弃直连：宁可回落到 mcp-remote，也不要静静忽略一个
+            // 会改变行为的参数（--transport / --allow-http / --static-oauth… 都在此列）。
+            _ => return None,
+        }
+    }
+    Some((url, headers))
+}
+
+fn spawn_http_session(
+    url: &str,
+    headers: &HashMap<String, String>,
+    cwd: &str,
+    stderr_log: Arc<Mutex<VecDeque<String>>>,
+) -> Result<Session, String> {
+    let (tx, rx) = std::sync::mpsc::channel::<String>(); // 入站帧：和 stdio 同一个出口
+    let (out_tx, out_rx) = std::sync::mpsc::channel::<String>(); // 出站行
+    let alive = Arc::new(AtomicBool::new(true));
+
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(300))
+        .build()
+        .map_err(|e| format!("无法创建 HTTP 客户端：{e}"))?;
+
+    let endpoint = url.to_string();
+    let hdrs = headers.clone();
+    let alive_thread = Arc::clone(&alive);
+    let log = Arc::clone(&stderr_log);
+    std::thread::spawn(move || {
+        // 服务在 initialize 响应头里给的会话 id，之后每条请求都要带回去。
+        let mut session_id: Option<String> = None;
+        while let Ok(line) = out_rx.recv() {
+            if !alive_thread.load(Ordering::SeqCst) {
+                break;
+            }
+            let mut req = client
+                .post(&endpoint)
+                .header("content-type", "application/json")
+                // 两种都收：服务可以用单条 JSON 回，也可以开一条 SSE 流回。
+                .header("accept", "application/json, text/event-stream");
+            for (k, v) in &hdrs {
+                req = req.header(k.as_str(), v.as_str());
+            }
+            if let Some(id) = &session_id {
+                req = req.header("mcp-session-id", id.as_str());
+            }
+            let response = match req.body(line).send() {
+                Ok(r) => r,
+                Err(error) => {
+                    let _ = tx.send(format!(
+                        "{MCP_FRAME_ERROR_PREFIX}HTTP 传输失败：{error}"
+                    ));
+                    break;
+                }
+            };
+            if let Some(id) = response
+                .headers()
+                .get("mcp-session-id")
+                .and_then(|v| v.to_str().ok())
+            {
+                session_id = Some(id.to_string());
+            }
+            let status = response.status();
+            let is_sse = response
+                .headers()
+                .get(reqwest::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok())
+                .is_some_and(|v| v.contains("text/event-stream"));
+            let body = response.text().unwrap_or_default();
+            if !status.is_success() {
+                // 4xx/5xx 的正文往往就是服务给的解释（鉴权、协议版本），别丢。
+                push_server_log(&log, format!("HTTP {status}: {}", body.chars().take(400).collect::<String>()));
+                let _ = tx.send(format!(
+                    "{MCP_FRAME_ERROR_PREFIX}HTTP {status}（服务拒绝了这次请求）"
+                ));
+                break;
+            }
+            // 202 Accepted 是通知的正常回应：没有正文，也不该产生帧。
+            if body.trim().is_empty() {
+                continue;
+            }
+            let frames = if is_sse { parse_sse_frames(&body) } else { vec![body] };
+            for frame in frames {
+                if tx.send(frame).is_err() {
+                    alive_thread.store(false, Ordering::SeqCst);
+                    return;
+                }
+            }
+        }
+        alive_thread.store(false, Ordering::SeqCst);
+    });
+
+    Ok(Session {
+        wire: Wire::Http(HttpWire { out: out_tx, alive }),
+        rx,
+        stderr_log,
+        next_id: 1,
+        workspace_root: cwd.to_string(),
+        server_name: String::new(),
+        capabilities: json!({}),
+        server_info: json!({}),
+        consecutive_timeouts: 0,
+        cancel: Arc::new(AtomicBool::new(false)),
+        tools_changed: false,
+        resources_changed: false,
+        prompts_changed: false,
+        awaiting_auth: false,
+    })
+}
+
 fn spawn_session(
     command: &str,
     args: &[String],
@@ -977,8 +1189,7 @@ fn spawn_session(
     });
 
     Ok(Session {
-        child,
-        stdin,
+        wire: Wire::Stdio { child, stdin },
         rx,
         stderr_log,
         next_id: 1,
@@ -1273,7 +1484,16 @@ fn connect_full_within(
     if let Ok(mut log) = side.log.lock() {
         log.clear();
     }
-    let mut session = spawn_session(&command, &args, &env, &cwd, Arc::clone(&side.log))?;
+    // 直连优先（仅在显式开启且认得出启动参数时）；认不出来或没开就照旧起子进程。
+    let native = if remote && native_http_enabled() {
+        native_http_target(&command, &args)
+    } else {
+        None
+    };
+    let mut session = match &native {
+        Some((url, headers)) => spawn_http_session(url, headers, &cwd, Arc::clone(&side.log))?,
+        None => spawn_session(&command, &args, &env, &cwd, Arc::clone(&side.log))?,
+    };
     session.cancel = Arc::clone(&side.cancel);
     session.server_name = key.name.clone();
     // 发现阶段的总截止时间要盖得住握手：远端握手本身就能占掉三分钟。
@@ -1303,7 +1523,7 @@ fn connect_full_within(
             // 里的令牌，那一次握手会很快过去。
             if remote
                 && error.starts_with("MCP 请求超时")
-                && matches!(session.child.try_wait(), Ok(None))
+                && session.wire.is_alive()
             {
                 session.awaiting_auth = true;
                 let old = active.replace(session);
@@ -1711,7 +1931,7 @@ fn on_session<T>(
             ));
         }
         let response = run(session);
-        let dead_process = response.is_err() && matches!(session.child.try_wait(), Ok(Some(_)));
+        let dead_process = response.is_err() && !session.wire.is_alive();
         let unhealthy = response
             .as_ref()
             .err()
@@ -1865,13 +2085,9 @@ async fn status_at(key: SessionKey) -> Result<bool, String> {
             // 杀了，用户点完浏览器回来发现要重头再来。面板另有 mcp_pending_auth 区分这两种
             // 「在」。
             if session.awaiting_auth {
-                return Ok(matches!(session.child.try_wait(), Ok(None)));
+                return Ok(session.wire.is_alive());
             }
-            let dead = session
-                .child
-                .try_wait()
-                .map(|status| status.is_some())
-                .map_err(|e| format!("无法检查 MCP 服务状态: {e}"))?;
+            let dead = !session.wire.is_alive();
             if dead {
                 (false, active.take())
             } else {
@@ -1886,7 +2102,7 @@ async fn status_at(key: SessionKey) -> Result<bool, String> {
                     .is_some_and(|error| transport_session_error(error));
                 // 上面那次 try_wait 发生在请求**之前**：子进程完全可能在这几秒里退出，
                 // 只查一次会把一个已经死掉的服务报成健康的，UI 就一直亮着绿灯。
-                let dead_now = matches!(session.child.try_wait(), Ok(Some(_)));
+                let dead_now = !session.wire.is_alive();
                 // 活着但连着这么多次不回话，和死了对用户是一回事（见 MAX_CONSECUTIVE_TIMEOUTS）。
                 let wedged = session.consecutive_timeouts >= MAX_CONSECUTIVE_TIMEOUTS;
                 if unhealthy || dead_now || wedged {
@@ -2612,7 +2828,7 @@ mod tests {
     fn slot_child_pid(key: &SessionKey) -> Option<u32> {
         let slot = find_session_slot(key).unwrap()?;
         let guard = slot.lock().unwrap();
-        guard.as_ref().map(|session| session.child.id())
+        guard.as_ref().and_then(|session| session.wire.pid())
     }
 
     /// 下一条请求会用到的 JSON-RPC id。
@@ -4415,5 +4631,106 @@ mod sse_tests {
         // 空输入不产生空帧
         assert!(parse_sse_frames("").is_empty());
         assert!(parse_sse_frames("\n\n\n").is_empty());
+    }
+}
+
+#[cfg(test)]
+mod native_http_tests {
+    use super::native_http_target;
+    use std::collections::HashMap;
+
+    fn a(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// 前端把远端服务统一编译成 `npx -y -- mcp-remote <url> [--header …]`。
+    /// 认得出来就能直连，省掉 npx 冷启动和 Node 依赖。
+    #[test]
+    fn the_bridge_launch_form_is_recognised() {
+        let (url, headers) =
+            native_http_target("npx", &a(&["-y", "--", "mcp-remote", "https://x.dev/mcp"])).unwrap();
+        assert_eq!(url, "https://x.dev/mcp");
+        assert!(headers.is_empty());
+
+        let (_, headers) = native_http_target(
+            "npx",
+            &a(&["-y", "--", "mcp-remote", "https://x.dev/mcp",
+                 "--header", "Authorization: Bearer abc",
+                 "--header", "X-Tenant: acme"]),
+        )
+        .unwrap();
+        let want: HashMap<_, _> = [
+            ("Authorization".to_string(), "Bearer abc".to_string()),
+            ("X-Tenant".to_string(), "acme".to_string()),
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(headers, want);
+
+        // 绝对路径的启动器也要认（GUI 启动时 npx 被解析成全路径）。
+        assert!(native_http_target("/opt/homebrew/bin/npx", &a(&["-y", "--", "mcp-remote", "https://x/mcp"])).is_some());
+    }
+
+    /// 认不出来的一律回落到子进程——**宁可慢，不可静静忽略一个会改变行为的参数**。
+    #[test]
+    fn anything_unfamiliar_falls_back_to_the_subprocess() {
+        // 本地服务，不是桥接
+        assert!(native_http_target("node", &a(&["server.js"])).is_none());
+        // 参数里带 mcp-remote、但启动器不是包管理器——这才试得出白名单。
+        // 用 "node server.js" 试不出来：它参数里本来就没有 mcp-remote，删掉白名单结果一样。
+        assert!(
+            native_http_target("python", &a(&["-m", "mcp-remote", "https://x/mcp"])).is_none(),
+            "自己实现的转发器被当成 npx 起的 mcp-remote 桥接了"
+        );
+        assert!(native_http_target("/usr/local/bin/my-proxy", &a(&["mcp-remote", "https://x/mcp"])).is_none());
+        // 没有 mcp-remote 这一段
+        assert!(native_http_target("npx", &a(&["-y", "--", "some-other-cli", "https://x/mcp"])).is_none());
+        // 地址不是 http(s)
+        assert!(native_http_target("npx", &a(&["-y", "--", "mcp-remote", "ws://x/mcp"])).is_none());
+        // 认不出的开关：--transport 会改变协议，--allow-http 会放宽安全前提，
+        // 静静忽略它们等于用一套和用户配置不同的语义去连。
+        assert!(native_http_target(
+            "npx",
+            &a(&["-y", "--", "mcp-remote", "https://x/mcp", "--transport", "sse-only"]),
+        )
+        .is_none());
+        assert!(native_http_target(
+            "npx",
+            &a(&["-y", "--", "mcp-remote", "https://x/mcp", "--allow-http"]),
+        )
+        .is_none());
+        // --header 少了值
+        assert!(native_http_target("npx", &a(&["-y", "--", "mcp-remote", "https://x/mcp", "--header"])).is_none());
+        // header 里没有冒号
+        assert!(native_http_target(
+            "npx",
+            &a(&["-y", "--", "mcp-remote", "https://x/mcp", "--header", "NoColonHere"]),
+        )
+        .is_none());
+    }
+
+    /// 开关默认关：直连是优化，不该替掉一条正在工作的路。
+    #[test]
+    fn native_transport_is_off_unless_asked_for() {
+        let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/mcp.rs"))
+            .expect("read mcp.rs");
+        let at = src.find("fn native_http_enabled()").expect("开关必须存在");
+        let body = &src[at..at + 200];
+        assert!(
+            body.contains(r#"== Some("1")"#),
+            "默认必须是关：写成 != Some(\"0\") 就变成默认开了"
+        );
+        // 连接路径上那道门同样要钉住：只有**远端**且**开关打开**才走直连。
+        // 少任何一个条件，本地 stdio 服务或没开开关的用户都会被切到一条没验证过的路上。
+        let gate = format!("let native = if remote && {}() {{", "native_http_enabled");
+        assert!(
+            src.contains(&gate),
+            "直连的判据被放宽了——本地服务或未开启的用户会被切到直连路径",
+        );
+        let fallback = format!("None => {}(&command, &args, &env, &cwd,", "spawn_session");
+        assert!(
+            src.contains(&fallback),
+            "认不出来必须回落到子进程，而不是报错或空转",
+        );
     }
 }
