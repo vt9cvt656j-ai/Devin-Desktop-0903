@@ -62,12 +62,11 @@ test("超长会截断并说明，而不是整段丢掉", () => {
   assert.match(out, /精简/, "要告诉用户怎么办，不能只说被截了");
 });
 
-test("轻量轮也带用户规则——闲聊轮才是最容易破规矩的地方", () => {
-  // 轻量轮省的是系统提示词和工作区预热；「回答用中文」这种要求恰恰在寒暄时最该生效。
-  assert.match(SRC, /const fullPrompt = _agentLightTurn \? \(sysPrompt \+ userRulesBlock \+/);
-  assert.match(SRC, /: \(sysPrompt \+ _modelStyleTuning\(config\.model\) \+ userRulesBlock \+/);
+test("每一轮都带用户规则——不再有绕过它的精简路径", () => {
+  // 以前有条「轻量轮」会换一份精简系统提示词，用户规则得在那条路上单独再拼一次。
+  // 那条路删了，现在只有一份 fullPrompt，规矩对每一轮都生效。
+  assert.match(SRC, /const fullPrompt = sysPrompt \+ _modelStyleTuning\(config\.model\) \+ userRulesBlock \+/);
 });
-
 test("点菜单是在编辑器里开标签页，不是弹一个 textarea", () => {
   // 让人写 markdown 却塞进一个小框里——不给语法高亮、不给查找替换、不给撤销栈，
   // 而这个应用本身就是个编辑器。

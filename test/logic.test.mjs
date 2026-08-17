@@ -3061,8 +3061,8 @@ test("Advanced Tools settings exposes the supported IDE language preference", ()
   assert.match(LOCALES_SRC, /export const GLOBAL_LANGUAGE_TAGS = Object\.freeze/);
   assert.match(SRC, /function _languagePreferenceBlock\(\) \{[\s\S]{0,620}全局语言与区域偏好[\s\S]{0,360}最终回答都使用该语言/,
     "AI requests should receive the global language and country preference");
-  assert.match(SRC, /const languageBlock = _languagePreferenceBlock\(\);[\s\S]{0,220}sysPrompt \+ userRulesBlock \+ languageBlock \+ adaptiveBlock/,
-    "lightweight chat must also follow the language preference");
+  assert.match(SRC, /const languageBlock = _languagePreferenceBlock\(\);[\s\S]{0,320}const fullPrompt = sysPrompt \+[^\n;]*languageBlock/,
+    "每一轮都要遵守语言偏好——不再有绕过它的精简路径");
   assert.match(SRC, /language:\s*args\.language \? String\(args\.language\) : _preferredLanguageCode\(\)/,
     "local discovery defaults should follow the selected language");
 });
@@ -3185,7 +3185,7 @@ test("adaptive profile is persisted and injected into model context", () => {
     "global memory should be injected independently from the Adaptive style switch");
   assert.doesNotMatch(extractFn("_memoryBlocks"), /_adaptiveEnabled/,
     "Adaptive only controls coaching behavior, not durable remembered user preferences");
-  assert.match(SRC, /const adaptiveBlock = _adaptivePromptBlock\(\);[\s\S]{0,200}const languageBlock = _languagePreferenceBlock\(\);[\s\S]{0,220}const fullPrompt = _agentLightTurn \? \(sysPrompt \+ userRulesBlock \+ languageBlock \+ adaptiveBlock\) : \(sysPrompt \+ _modelStyleTuning\(config\.model\) \+ userRulesBlock \+ skillsBlock \+ _authContextBlock\(\) \+ languageBlock \+ adaptiveBlock\)/,
+  assert.match(SRC, /const adaptiveBlock = _adaptivePromptBlock\(\);[\s\S]{0,320}const fullPrompt = sysPrompt \+ _modelStyleTuning\(config\.model\) \+ userRulesBlock \+ skillsBlock \+ _authContextBlock\(\) \+ languageBlock \+ adaptiveBlock;/,
     "Every model send path should receive the Adaptive profile block");
 });
 
@@ -6594,50 +6594,54 @@ test("the per-turn 🧠 thinking return-status chip is fully removed (user: don'
   assert.doesNotMatch(SRC, /已收到上游推理正文/);
 });
 
-test("Agent lightweight routing consumes the semantic verdict instead of user-message keywords", () => {
+test("工作区工具的判据来自语义裁决，不是用户话里的关键词", () => {
   const mustUseWorkspace = load("_agentMustUseWorkspaceTools");
   assert.equal(mustUseWorkspace({ workspaceAction: "none" }, "/repo", "/repo/src/main.js"), false);
   assert.equal(mustUseWorkspace({ workspaceAction: "inspect" }, "/repo", ""), true);
   assert.equal(mustUseWorkspace({ workspaceAction: "modify" }, "/repo", ""), true);
 
-  const sendSource = extractFn("sendPrompt");
-  assert.match(sendSource, /let _agentLightTurn = false;/);
-  assert.match(sendSource, /_shouldUseLightweightAgentTurn\([\s\S]{0,220}hasAttachments: attachments\.length > 0/);
-  const shouldLight = load("_shouldUseLightweightAgentTurn");
-  // 这一组验的是**语义判据**（分类器怎么说），所以固定成"没配过能力"，把能力那道闸
-  // 排除在外——它自己有独立的用例（见「light turn stays available…」那条）。
-  const NO_CAPS = { hasCapabilities: false };
-  const pureAnswer = {
-    intentSource: "ai",
-    intentSemantic: { action: "answer", continuation: "new" },
-    projectState: "none", deliverySurface: "answer", changeScope: "none", architectureMode: "none",
-    dataStrategy: "not_applicable", researchMode: "none", designMode: "none", workspaceAction: "none",
-    captureMode: "none", browserGoal: "none", orchestrationMode: "solo", runtimeObligations: [], externalObligations: [],
-  };
-  assert.equal(shouldLight("agent", pureAnswer, {}, NO_CAPS), true, "a classifier-confirmed, answer-only turn may use the small transport path");
-  assert.equal(shouldLight("agent", pureAnswer, { streaming: true }, NO_CAPS), true,
-    "sendPrompt marks the current turn streaming before routing; that marker must not kill the light path");
-  assert.equal(shouldLight("agent", pureAnswer, { streaming: true, _runIsLoop: true }, NO_CAPS), false,
-    "a real active Agent loop must still stay on the full path");
-  assert.equal(shouldLight("agent", { ...pureAnswer, intentSemantic: { action: "answer", continuation: "continue" } }, {}), false,
-    "project continuations must stay on the full Agent path");
-  assert.equal(shouldLight("agent", { ...pureAnswer, projectState: "existing", workspaceAction: "inspect" }, {}), false,
-    "current-project questions must keep project context and tools");
-  assert.equal(shouldLight("agent", { ...pureAnswer, runtimeObligations: ["run"] }, {}), false,
-    "runtime obligations must never be downgraded");
-  assert.equal(shouldLight("agent", { ...pureAnswer, intentSource: "none" }, {}), false,
-    "a missing semantic classifier must fail open to the full Agent path");
-  assert.equal(shouldLight("agent", pureAnswer, { _planSteps: [{ status: "in_progress" }] }, NO_CAPS), false,
-    "an unfinished engineering plan keeps follow-up answers on the full Agent path");
+  // 这里原来还验着一整套「轻量轮」判定（_shouldUseLightweightAgentTurn）。那条路删了：
+  // 它省的提示词，代价是判错时模型手上一个工具都没有、还不知道自己缺了什么。
   assert.doesNotMatch(SRC, /function _looksQuickAsk\(/);
   assert.doesNotMatch(SRC, /function _looksLightweightAgentChat\(/);
-  assert.doesNotMatch(extractFn("_shouldUseLightweightAgentTurn"), /session\?\.streaming/,
-    "the current turn's Stop-button streaming marker is not an active-loop signal");
-  assert.match(SRC, /&& !_agentLightTurn\) \{[\s\S]{0,600}_agentContextSnapshotForTurn\(text, _curRoot, _turnEngineeringResolved, \{ coldWaitMs: 1200 \}\)/);
-  assert.doesNotMatch(sendSource, /await\s+(?:Promise\.race\(\[)?_gatherAgentContext/,
+  assert.doesNotMatch(SRC, /_shouldUseLightweightAgentTurn|_agentLightTurn/,
+    "轻量轮又回来了——它会在判错时把工具和技能一起拿走，而模型不知道自己缺了什么");
+  assert.match(SRC, /\) \{[\s\S]{0,600}_agentContextSnapshotForTurn\(text, _curRoot, _turnEngineeringResolved, \{ coldWaitMs: 1200 \}\)/);
+  assert.doesNotMatch(extractFn("sendPrompt"), /await\s+(?:Promise\.race\(\[)?_gatherAgentContext/,
     "the first-token path must not await a cold workspace scan");
-  assert.match(SRC, /if \(_activeForSession && !_agentLightTurn\)/);
-  assert.match(SRC, /const hasToolAccess = \(isAgent && !_agentLightTurn\) \|\| isExplorer \|\| isReviewer \|\| isPlan/);
+  assert.match(SRC, /if \(_activeForSession\)/);
+  assert.match(SRC, /const hasToolAccess = isAgent \|\| isExplorer \|\| isReviewer \|\| isPlan/);
+});
+
+test("任务完成的提醒走系统通知，不在应用内弹卡片挡输入框", () => {
+  /*
+   * 那张应用内卡片有两个毛病：它盖在输入框上（你正要接着打字，它挡在那儿），而且只在
+   * IDE 前台可见——可这个提醒的全部意义恰恰是「你去干别的了，活干完了叫你一声」。
+   *
+   * 走 Tauri 插件而不是 webview 的 Notification：WKWebView 里那个 API 时有时无，权限
+   * 状态也不可靠，实测经常"既不报错也不弹"。
+   */
+  const fn = extractFn("_notifyTaskDone");
+  assert.match(fn, /await _notifySystem\(\{ title, body: short \}\)/, "没走系统通知");
+  assert.match(fn, /if \(inTauri\)/, "桌面端应当优先走系统通知");
+  assert.match(fn, /return;/, "系统通知发出去之后还接着弹应用内卡片 = 两份提醒");
+  assert.match(SRC, /from "@tauri-apps\/plugin-notification"/, "没接 Tauri 通知插件");
+  assert.doesNotMatch(fn, /new Notification\(/,
+    "又用回 webview 的 Notification 了——它在 WKWebView 里时有时无");
+  // 权限被拒绝时安静收手：不要退回那张挡输入框的卡片，那等于"你说了不要，我换个地方还要"。
+  const gate = fn.slice(fn.indexOf("if (inTauri)"), fn.indexOf("let action"));
+  assert.match(gate, /if \(granted\)/, "没判权限就发");
+  // 插件要在 Rust 侧注册、并且在 capabilities 里放行，少一样运行时就是静默失败。
+  assert.match(
+    readFileSync(join(HERE, "..", "src-tauri", "src", "lib.rs"), "utf8"),
+    /tauri_plugin_notification::init\(\)/,
+    "插件没在 Rust 侧注册",
+  );
+  assert.match(
+    readFileSync(join(HERE, "..", "src-tauri", "capabilities", "default.json"), "utf8"),
+    /"notification:default"/,
+    "capabilities 里没放行，前端调用会被权限层拒掉",
+  );
 });
 
 test("pre-processing Stop discards the unconsumed assistant shell", () => {
@@ -6686,42 +6690,13 @@ test("Plan Explorer Reviewer and Chat receive upgraded mode-specific operating r
   assert.match(block("explorer", "梳理项目", {}), /Explorer 模式纪律[\s\S]*find_symbol\/lsp_definition\/lsp_references/);
   assert.match(block("reviewer", "审查代码", {}), /Reviewer 模式纪律[\s\S]*P0\/P1\/P2/);
 
-  assert.match(SRC, /const _modeFrame = \(!_agentLightTurn && effectiveMode !== "agent"\) \? _modeRuntimeGuidanceBlock\(effectiveMode, text, _uiTurnEngineering\) : ""/,
+  assert.match(SRC, /const _modeFrame = \(effectiveMode !== "agent"\) \? _modeRuntimeGuidanceBlock\(effectiveMode, text, _uiTurnEngineering\) : ""/,
     "non-Agent modes should get a runtime discipline block");
   assert.match(SRC, /const _contextPreamble = _dynPreamble \+ _atContext \+ _modeFrame \+ _decisionFrame/,
     "mode-specific guidance must be placed before the final user request");
   assert.match(SRC, /plan: `你是 Mr\. Day One 的 Plan 模式：只读调查 \+ 输出可执行方案/);
   assert.match(SRC, /explorer: `你是 Mr\. Day One 的 Explorer 模式：只读代码库侦察员/);
   assert.match(SRC, /reviewer: `你是 Mr\. Day One 的 Reviewer 模式：只读代码审查员/);
-});
-
-test("semantic lightweight chat builds a genuinely small request body", () => {
-  const sendSource = extractFn("sendPrompt");
-  assert.match(sendSource, /const _needsWorkspacePreflight = effectiveMode !== "chat";/,
-    "plain Chat must skip workspace, OS, stale-evidence, and history-compaction preflight");
-  assert.match(SRC, /if \(!_agentLightTurn\) _scheduleWorkspaceAgentWarmup\(_curRoot\)/,
-    "non-light turns should schedule Skills, MCP, and context warming without awaiting it");
-  assert.doesNotMatch(extractFn("sendPrompt"), /await\s+(?:Promise\.race\(\[)?_refreshFileSkills/,
-    "the first-token path must not await Skills discovery");
-  assert.match(SRC, /const fullPrompt = _agentLightTurn \? \(sysPrompt \+ userRulesBlock \+ languageBlock \+ adaptiveBlock\) : \(sysPrompt \+ _modelStyleTuning\(config\.model\) \+ userRulesBlock \+ skillsBlock \+ _authContextBlock\(\) \+ languageBlock \+ adaptiveBlock\)/,
-    "lightweight turns must not carry the full agent tuning/auth prompt");
-  assert.match(SRC, /for \(const m of _lightweightMemoryMessagesForModel\(sess\.memory\)\) messages\.push\(m\)/,
-    "lightweight turns must use bounded short history");
-
-  const trimHistory = load("_lightweightMemoryMessagesForModel");
-  const out = trimHistory({
-    assemble: () => [
-      { role: "system", content: "milestone summary should not be forwarded" },
-      { role: "user", content: "你好" },
-      { role: "assistant", content: "你好，我在。" },
-      { role: "assistant", content: "```js\n" + "x".repeat(2000) + "\n```\n[TOOL:read_file] src/main.js" },
-      { role: "user", content: "a".repeat(900) },
-      { role: "assistant", content: "短回答" },
-    ],
-  }, 4, 1400);
-  assert.deepEqual(out.map((m) => m.role), ["user", "assistant", "user", "assistant"]);
-  assert.ok(out.every((m) => m.content.length <= 521), "each lightweight history item is capped");
-  assert.ok(!out.some((m) => /```|\[TOOL:/.test(m.content)), "tool/code-heavy history is stripped");
 });
 
 test("location context is governed by the semantic verdict instead of address keywords", () => {
@@ -6873,7 +6848,7 @@ test("active Skills survive L0 prompt stripping and are inherited by child work"
   assert.match(SRC, /run\?\.skillsBlock \?\? _skillsSystemBlock\(\)/);
   // 会跑工具的模式拿整个组合块；聊天模式只拿常驻那半——它不执行工具，
   // 目录里那句「用 read_skill 读」在那儿是死路。
-  assert.match(SRC, /const skillsBlock = _agentLightTurn \? "" : \(effectiveMode === "chat" \? _activeSkillsBlock\(\) : _skillsSystemBlock\(\)\)/);
+  assert.match(SRC, /const skillsBlock = effectiveMode === "chat" \? _activeSkillsBlock\(\) : _skillsSystemBlock\(\)/);
   assert.match(SRC, /function _skillsSystemBlock\(\) \{\s*return _skillCatalogBlock\(\) \+ _activeSkillsBlock\(\);/);
   assert.match(SRC, /skillsBlock: run\.skillsBlock/);
   assert.doesNotMatch(SRC, /_l0MessagesWithSkills\(messages, skillsBlock \|\|/);
@@ -6894,7 +6869,7 @@ test("active Skills survive L0 prompt stripping and are inherited by child work"
 });
 
 test("dynamic time and bulky file context stay out of the cached system prefix", () => {
-  assert.match(SRC, /const adaptiveBlock = _adaptivePromptBlock\(\);[\s\S]{0,200}const languageBlock = _languagePreferenceBlock\(\);[\s\S]{0,220}const fullPrompt = _agentLightTurn \? \(sysPrompt \+ userRulesBlock \+ languageBlock \+ adaptiveBlock\) : \(sysPrompt \+ _modelStyleTuning\(config\.model\) \+ userRulesBlock \+ skillsBlock \+ _authContextBlock\(\) \+ languageBlock \+ adaptiveBlock\);/);
+  assert.match(SRC, /const adaptiveBlock = _adaptivePromptBlock\(\);[\s\S]{0,320}const fullPrompt = sysPrompt \+ _modelStyleTuning\(config\.model\) \+ userRulesBlock \+ skillsBlock \+ _authContextBlock\(\) \+ languageBlock \+ adaptiveBlock;/);
   assert.doesNotMatch(SRC, /const fullPrompt = [^\n;]*_currentDateBlock\(\)/);
   assert.doesNotMatch(SRC, /const fullPrompt = [^\n;]*_adaptiveMemoryBlock/,
     "per-query adaptive preference memory must never enter the cached system prefix");
@@ -9095,7 +9070,7 @@ test("Agent decision frame gives task-specific old-hand operating rules", () => 
 
   const small = frame("把按钮文案改一下", { applies: true });
   assert.match(small, /小任务律/);
-  assert.match(SRC, /const _decisionFrame = \(effectiveMode === "agent" && !_agentLightTurn\) \? _agentDecisionFrameBlock\(text, _uiTurnEngineering\) : ""/,
+  assert.match(SRC, /const _decisionFrame = \(effectiveMode === "agent"\) \? _agentDecisionFrameBlock\(text, _uiTurnEngineering\) : ""/,
     "Agent send path must add the decision frame to the per-turn preamble");
   assert.match(SRC, /_dynPreamble \+ _atContext \+ _modeFrame \+ _decisionFrame \+ _uiDesignCraft \+ _toolHint \+ _expHint/,
     "decision frame must sit before tool and experience hints in recency context");
@@ -9172,7 +9147,7 @@ test("UI design craft guidance is injected only for front-end work", () => {
   assert.match(greenfield, /无栈网站默认实现/);
   assert.match(greenfield, /Button\/Dialog\/Tabs/);
   assert.match(greenfield, /Tailwind 采用 v4 时使用 CSS-first 配置/);
-  assert.match(SRC, /const _uiDesignCraft = \(effectiveMode === "agent" && !_agentLightTurn\)\s*\? _uiDesignCraftBlock\(text, _uiTurnEngineering, \{ serverDesignLayersActive: _l0On\(config\) && !!config\.ideSemanticProfile \}\)/,
+  assert.match(SRC, /const _uiDesignCraft = \(effectiveMode === "agent"\)\s*\? _uiDesignCraftBlock\(text, _uiTurnEngineering, \{ serverDesignLayersActive: _l0On\(config\) && !!config\.ideSemanticProfile \}\)/,
     "Agent send path must add the UI craft block to front-end turns");
   assert.match(SRC, /_dynPreamble \+ _atContext \+ _modeFrame \+ _decisionFrame \+ _uiDesignCraft \+ _toolHint \+ _expHint/,
     "UI craft guidance must appear before the tool and experience hints");
@@ -22007,106 +21982,6 @@ test("_looksLikeUserQuestion: statements and rhetoric still do NOT pause the run
 // A light turn remains valid for a genuine conversational answer even when a
 // workspace is open. Project inspection is an explicit semantic action and must
 // instead enter the full bounded-read agent loop.
-// ---------------------------------------------------------------------------
-test("能力探测读的是配置，不是内存里已加载的状态", async () => {
-  /*
-   * 冷启动时 MCP 还没连、技能还没扫，内存里当然是空的。按内存判会得出"没配过能力"，
-   * 于是走轻量轮；而轻量轮**不进 agentic loop**，也就不会去加载它们——下一轮内存还是空的。
-   * 那是一个自己锁死自己的循环：用户配了服务却永远用不上，而且毫无征兆。
-   */
-  const probe = load("_hasConfiguredCapabilities", {
-    _readWorkspaceMcpDocument: async () => ({ text: JSON.stringify({ mcpServers: { context7: { command: "npx" } } }) }),
-    _fileSkills: [],                      // 内存里一个技能都没有
-    _loadSkillsLocal: () => [],
-    _capabilityProbe: { at: 0, root: null, value: null },
-  });
-  assert.equal(await probe("/repo"), true, "配置里有服务，却因为内存是空的判成「没配过」");
-
-  const none = load("_hasConfiguredCapabilities", {
-    _readWorkspaceMcpDocument: async () => ({ text: "{}" }),
-    _fileSkills: [],
-    _loadSkillsLocal: () => [],
-    _capabilityProbe: { at: 0, root: null, value: null },
-  });
-  assert.equal(await none("/repo"), false, "什么都没配也说有，轻量轮就永远不会触发了");
-
-  // 读不出来按"有"处理：宁可多给一次工具，也不要因为一次读取失败把模型的手绑起来。
-  const broken = load("_hasConfiguredCapabilities", {
-    _readWorkspaceMcpDocument: async () => { throw new Error("读不了"); },
-    _fileSkills: [],
-    _loadSkillsLocal: () => [],
-    _capabilityProbe: { at: 0, root: null, value: null },
-  });
-  assert.equal(await broken("/repo"), true, "探测失败时应当保守地当作「有能力」");
-
-  // 只有技能、没有 MCP 也算配过。
-  const skillsOnly = load("_hasConfiguredCapabilities", {
-    _readWorkspaceMcpDocument: async () => ({ text: "{}" }),
-    _fileSkills: [{ id: "file:/w/.claude/skills/x/SKILL.md", name: "x" }],
-    _loadSkillsLocal: () => [],
-    _capabilityProbe: { at: 0, root: null, value: null },
-  });
-  assert.equal(await skillsOnly("/repo"), true, "装了技能也该走完整轮——轻量轮不注入技能清单");
-
-  // 判定要真的接到发送那条路上，否则上面全是空转。
-  assert.match(SRC, /hasCapabilities: await _hasConfiguredCapabilities\(/,
-    "发送路径没把能力探测传给轻量轮判定");
-});
-
-test("light turn stays available for a genuine answer with a workspace open", () => {
-  const light = load("_shouldUseLightweightAgentTurn", { _knownWorkspaceRoots: () => [] });
-  // A profile the classifier would pass as a context-free answer turn.
-  const answerProfile = {
-    intentSource: "ai",
-    intentSemantic: { action: "answer", continuation: "new" },
-    projectState: "none", deliverySurface: "answer", changeScope: "none",
-    architectureMode: "none", dataStrategy: "not_applicable", researchMode: "none",
-    designMode: "none", workspaceAction: "none", captureMode: "none",
-    browserGoal: "none", orchestrationMode: "solo",
-    runtimeObligations: [], externalObligations: [],
-  };
-  // 没配过能力（全新安装）才允许走快路——那时候本来也没有东西可丢。
-  const bare = { hasCapabilities: false };
-  // No workspace open → the fast path is still allowed (its whole reason to exist).
-  assert.equal(light("agent", answerProfile, {}, { ...bare, workspaceOpen: false }), true);
-  // An open folder alone is background state, not an instruction to inspect it.
-  assert.equal(light("agent", answerProfile, {}, { ...bare, workspaceOpen: true }), true);
-  assert.equal(light("agent", { ...answerProfile, projectState: "none" }, {}, { ...bare, workspaceOpen: true }), true);
-
-  /*
-   * 配过能力就不走快路。
-   *
-   * 快路那一轮 hasToolAccess === false：工具数组是空的，技能清单也不注入。用户接了
-   * context7 之后问一句「useOptimistic 怎么用」，判成"纯回答"就等于——模型手上一个工具
-   * 都没有、也不知道 context7 存在，只能凭记忆答，而且没有第二次机会。
-   */
-  assert.equal(light("agent", answerProfile, {}, { hasCapabilities: true }), false,
-    "配了 MCP / 技能还走轻量轮 = 这一轮工具全没了，模型还不知道它们存在");
-  // 算不出来（读配置失败）按"有"处理：宁可多给一次工具，也不要把模型的手绑起来。
-  assert.equal(light("agent", answerProfile, {}, { workspaceOpen: true }), false,
-    "能力探测失败时应当保守地走完整轮");
-  // A project assessment has workspaceAction=inspect and is therefore never a
-  // light turn; it must obtain actual repository evidence.
-  assert.equal(light("agent", { ...answerProfile, workspaceAction: "inspect" }, {}, { workspaceOpen: true }), false);
-});
-
-test("the light-turn gate treats workspace state as context rather than an implicit task", () => {
-  const source = extractFn("_shouldUseLightweightAgentTurn");
-  assert.match(source, /void options\.workspaceOpen;/,
-    "a folder being open must not by itself force unrelated engineering activity");
-  assert.match(source, /profile\.workspaceAction !== "none"/,
-    "only an explicit inspect/modify decision may leave the lightweight path");
-});
-
-// ---------------------------------------------------------------------------
-// The first question after opening a project must get the project, not one file.
-//
-// Reported: "我项目是干嘛用的？" answered "基于已读取的 Cargo.toml" — it described the
-// whole project from the one open manifest, never opening README/src. Cause: on a cold
-// cache, _agentContextSnapshotForTurn returned only a "预热中" line + the top-level file
-// list. The README, tree and key files were all still "warming up", so the model received
-// nothing but the incidentally-open file. It now builds the real digest (bounded) before
-// falling back to the thin snapshot.
 // ---------------------------------------------------------------------------
 test("cold context snapshot builds the real digest before the warming-up fallback", () => {
   const fn = extractFn("_agentContextSnapshotForTurn");

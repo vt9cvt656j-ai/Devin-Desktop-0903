@@ -25,6 +25,7 @@ tauri-plugin-opener = "2"
 tauri-plugin-updater = "2"
 tauri-plugin-process = "2"
 tauri-plugin-store = "2"
+tauri-plugin-notification = "2"
 # 深链：网页登录页用 mrday:// 唤起本 App 完成登录交接（见 lib.rs / handoff.rs）。
 tauri-plugin-deep-link = "2"
 serde = { version = "1", features = ["derive"] }

@@ -153,6 +153,7 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_store::Builder::new().build())
+        .plugin(tauri_plugin_notification::init())
         // mrday:// —— 网页登录页靠它唤起本 App 完成登录交接。
         .plugin(tauri_plugin_deep_link::init());
 
