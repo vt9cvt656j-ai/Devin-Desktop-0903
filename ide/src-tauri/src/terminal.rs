@@ -377,14 +377,34 @@ pub fn term_running_ids(state: State<TerminalState>) -> Vec<u32> {
         .collect()
 }
 
+/// 去掉 Windows 可执行扩展名之后的裸名（非 Windows 上恒为空）。
+///
+/// **不带 cfg**，两个平台都编译、都测得到：这段逻辑只在 Windows 上生效，而 Windows
+/// 上跑不了这套测试——上一次同类改动就是因为整段被 cfg 挡住而没人验证过。
+fn strip_windows_exec_ext(name: &str) -> Vec<String> {
+    if !cfg!(windows) {
+        return Vec::new();
+    }
+    windows_bare_names(name)
+}
+
+/// 纯逻辑：`npm.cmd` → `npm`。只认可执行扩展名，`README.md` 这种不动。
+fn windows_bare_names(name: &str) -> Vec<String> {
+    const EXEC_EXTS: &[&str] = &["exe", "cmd", "bat", "com", "ps1"];
+    let Some((stem, ext)) = name.rsplit_once('.') else {
+        return Vec::new();
+    };
+    if stem.is_empty() || !EXEC_EXTS.iter().any(|e| ext.eq_ignore_ascii_case(e)) {
+        return Vec::new();
+    }
+    vec![stem.to_string()]
+}
+
 #[tauri::command(async)]
 pub fn term_list_commands() -> Vec<String> {
     use std::collections::BTreeSet;
     let mut set: BTreeSet<String> = BTreeSet::new();
-    #[cfg(not(windows))]
     let path_str = crate::process_util::augmented_path(None);
-    #[cfg(windows)]
-    let path_str = std::env::var("PATH").unwrap_or_default();
     let sep = if cfg!(windows) { ';' } else { ':' };
     for dir_str in path_str.split(sep) {
         let dir = std::path::PathBuf::from(dir_str);
@@ -410,6 +430,9 @@ pub fn term_list_commands() -> Vec<String> {
                             continue;
                         }
                     }
+                }
+                for stripped in strip_windows_exec_ext(&name) {
+                    set.insert(stripped);
                 }
                 set.insert(name);
             }
@@ -478,4 +501,21 @@ pub fn term_history() -> Vec<String> {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod windows_command_tests {
+    /// Windows 上目录项带扩展名，而所有调用方查的都是裸名：`checkToolForLanguage`
+    /// 用 `cmds.includes("rust-analyzer")` 判断装没装，于是不管装没装都弹
+    /// 「缺少 X 语言服务器」；终端补全同理，敲 `np` 补不出 npm。
+    /// 这段只在 Windows 生效但**不带 cfg**，所以 macOS 上照样测得到。
+    #[test]
+    fn windows_exec_names_also_appear_bare() {
+        assert_eq!(super::windows_bare_names("rust-analyzer.exe"), vec!["rust-analyzer"]);
+        assert_eq!(super::windows_bare_names("pyright-langserver.cmd"), vec!["pyright-langserver"]);
+        assert_eq!(super::windows_bare_names("NPM.CMD"), vec!["NPM"]);
+        // 非可执行扩展名不动，免得把 README.md 也塞成一条"命令"
+        assert!(super::windows_bare_names("README.md").is_empty());
+        assert!(super::windows_bare_names("gopls").is_empty());
+    }
 }
