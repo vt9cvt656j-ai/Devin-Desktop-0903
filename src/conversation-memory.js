@@ -523,8 +523,13 @@ export class ConversationMemory {
       previousTurn = Math.max(1, this.totalTurns - (this.recent.length - 1 - index));
       break;
     }
-    let incorrect = parsed.incorrect;
-    if (!incorrect && previousAssistant) incorrect = cleanCorrectionText(previousAssistant, 420);
+    // A bare "不对 / 错了 / 我的意思是" means the user is redirecting, not that the whole
+    // previous reply is void. Letting previousAssistant stand in registered its first 420
+    // chars as a superseded fact, then re-injected that at top priority every turn — the
+    // model would start avoiding the very files and steps it had just done correctly.
+    // The clarification itself is still an ordinary user message in `recent`, so nothing
+    // is lost. This restores the intent already documented at the top of this file.
+    const incorrect = parsed.incorrect;
     if (!incorrect) return null;
     return this.recordCorrection({
       kind: 'user',
@@ -634,11 +639,25 @@ export class ConversationMemory {
 
   prefixMessages() {
     const result = [];
-    const corrections = this._activeCorrections('', CORRECTION_PREFIX_MAX);
+    // Was `_activeCorrections('', MAX)` — an empty query means "no filter", so this block
+    // was a newest-first dump of every correction regardless of what the user just asked.
+    // Score against the latest user message instead, with the newest 2 always carried so a
+    // fresh correction can never be filtered out by a topic change.
+    const q = [...this.recent].reverse()
+      .find((m) => m?.role === 'user' && typeof m.content === 'string')?.content || '';
+    const pool = new Map();
+    for (const item of this._activeCorrections('', 2)) pool.set(item.id, item);
+    for (const item of (q ? this._activeCorrections(q, CORRECTION_PREFIX_MAX) : [])) pool.set(item.id, item);
+    const corrections = [...pool.values()]
+      .sort((a, b) => b.createdAt - a.createdAt)
+      .slice(0, CORRECTION_PREFIX_MAX);
     if (corrections.length > 0) {
+      // A reflection's `incorrect` is just this run's tool trace, not a forbidden action.
+      // Rendering it under "避免重复" told the model to stop reading the files it must read.
+      // The lesson (`corrected`) is the half that carries value.
       const text = corrections.map((item) => item.kind === 'reflection'
-        ? `- 避免重复：${item.incorrect}\n  后续做法：${item.corrected}`
-        : `- 已作废：${item.incorrect}${item.aliases?.length ? `（此前相关旧说法：${item.aliases.join('、')}）` : ''}\n  当前有效：${item.corrected}`).join('\n');
+        ? `- 经验教训（上一次没跑完的运行留下的，是建议不是禁令）：${item.corrected}`
+        : `- 已作废：${String(item.incorrect).slice(0, 120)}${item.aliases?.length ? `（此前相关旧说法：${item.aliases.join('、')}）` : ''}\n  当前有效：${String(item.corrected).slice(0, 200)}`).join('\n');
       result.push({
         role: 'system',
         content: `[纠错记忆·最高优先级]\n以下是对早期内容的追加纠正。原始历史仅供审计，不得继续把“已作废”内容当成事实或要求；若多条纠正冲突，以列表中更靠前的最新条目为准。\n${text}`,

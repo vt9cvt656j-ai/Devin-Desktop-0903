@@ -17889,8 +17889,17 @@ test("方案A：思考结论提取规则——取收尾决策句、兜底末段�
   assert.ok(!conclusion.includes("先看看项目结构"), "探索噪声不进摘要");
   assert.ok(conclusion.length <= 400, "提取上限 400 字（token 经济）");
   // 无决策词 → 兜底取末段
-  const plain = "前面在梳理代码结构，看了很多文件。".repeat(4) + "\n\n" + "末段描述了当前的实现状态与下一步计划。";
+  const plain = "前面在梳理代码结构，看了很多文件。".repeat(4) + "\n\n" + "末段描述了当前的实现状态与已落地的改动。";
   assert.ok(extract(plain).includes("末段描述了当前的实现状态"), "无决策词时兜底取末段");
+  // 但猜想不是结论。这本账本下一轮是以"勿重新推导已定结论"注入的，一句没验证的
+  // 假设被抄进去，模型就会拿它当既成前提往下走，且用户纠正无效（账本还在，重启也在）。
+  assert.equal(
+    extract("前面在梳理代码结构，看了很多文件。".repeat(4) + "\n\n" + "可能配置是在 config.json 里，应该先读一下确认。"),
+    "",
+    "带猜想词的末段不该被记成已定结论",
+  );
+  const hedged = "先看了几个文件。".repeat(10) + "\n\n" + "所以可能需要先确认配置在不在 config.json 里。";
+  assert.equal(extract(hedged), "", "含决策词但同时含猜想词的句子也不入账");
   // 超长决策段落也被封顶到 400
   const huge = "因此决定采用分层缓存方案处理这个问题。".repeat(60);
   assert.ok(extract(huge).length <= 400);
@@ -24753,4 +24762,292 @@ test("成长页下半部分和上半部分是同一套卡片语言", () => {
   // 多出来的那个会掉到下一行，± 就断成两行了。
   assert.doesNotMatch(APP_CSS, /\.growth-skill__right\s*\{[^}]*display:\s*contents/,
     "右侧组被摊进外层网格了，± 会换行");
+});
+
+// ── 记忆卫生：治"记忆杂乱→智能体胡言乱语" ────────────────────────────────────
+// 这几个函数是模块级互相引用的，沙箱里得把真实现一层层喂进去——喂桩的话测的就不是
+// 真的那套判据了。_KG_STOP 少了会是 ReferenceError，而 _autoMemoryCapture 外面包着
+// catch，表现成"这条没记住"而不是"依赖漏了"，最难查。
+const KG_STOP = new Function(`${/const _KG_STOP = new Set\([\s\S]*?\);/.exec(SRC)[0]}\n;return _KG_STOP;`)();
+const KG_TOKENS = load("_kgTokens", { _KG_STOP: KG_STOP });
+const KG_CLASSIFY = load("_kgClassify", {});
+const KG_INSERT = load("_kgInsert", { _kgTokens: KG_TOKENS, _kgClassify: KG_CLASSIFY });
+const KG_INFERRED = /const _KG_INFERRED = "([^"]+)"/.exec(SRC)[1];
+// 用户实测的病根不是记不住，是记太多、记错东西、并且把模型自己编的东西当用户说的
+// 存回去。下面每条都钉住一个具体的入库/召回口。
+
+test("记忆卫生·写入：一次性的话不该进长期库，模型归纳的条目要标出处", () => {
+  // ① 「下次」是"推迟这件事"，不是"从此每次"。它却曾是唯一能把一句推迟语送进
+  //    全局库的词——进去以后换任何项目、任何一轮都会带上。
+  const stores = new Map();
+  const capture = load("_autoMemoryCapture", {
+    _kgLoad: (root) => stores.get(root) || [],
+    _kgSave: (root, notes) => stores.set(root, notes),
+    _kgPrune: () => {},
+    _kgInsert: KG_INSERT,
+  });
+  capture("/repo", "这个问题下次再看");
+  assert.equal(stores.has(""), false, "一句推迟语被写进了全局库，会污染所有项目");
+
+  // ② 入库内容不带 [项目要求]/[用户长期偏好] 前缀：项目还是全局由存储 key 表达。
+  //    前缀会让分类器把普通句子判成 preference（白拿常驻名额），还给每条笔记塞进
+  //    项目/目要/要求 三个共享 tag，召回一条就拖出一串。
+  stores.clear();
+  capture("/repo", "这个项目必须用 pnpm 装依赖，别用 npm");
+  const saved = stores.get("/repo") || [];
+  assert.equal(saved.length, 1, "该记的没记住");
+  assert.doesNotMatch(saved[0].content, /^\[(?:项目要求|用户长期偏好)\]/, "自动沉淀不该再加身份前缀");
+
+  // ③ 模型 run 收尾归纳出来的条目必须带来源戳，否则注入时和用户亲口说的同形，
+  //    用户会看到它在不相干的项目里说"按你一贯的深色扁平风格"。
+  const added = [];
+  const reflect = load("_applyMemoryReflectionOutput", {
+    _kgAddNote: (root, content) => { added.push({ root, content }); return true; },
+    _kgLoad: () => [],
+    _kgTokens: KG_TOKENS,
+    _KG_INFERRED: KG_INFERRED,
+    _kgSupersede: () => { throw new Error("不该走到覆盖分支"); },
+    saveChatHistory: () => {},
+  });
+  reflect("/repo", "源文本", [{ action: "add", content: "用户偏好深色扁平的按钮风格" }]);
+  assert.equal(added.length, 1);
+  assert.match(added[0].content, /据本轮归纳/, "模型归纳的记忆没标出处，注入时会被当成用户原话");
+});
+
+test("记忆卫生·写入：模型的归纳不能把用户亲口说的记忆标成已作废", () => {
+  const userNote = { id: "n1", content: "前端一律用 Tailwind", tags: [], created: 1 };
+  const inferred = { id: "n2", content: `${KG_INFERRED} 前端用原生 CSS 写`, tags: [], created: 2 };
+  const calls = { supersede: [], add: [] };
+  const mk = (notes) => load("_applyMemoryReflectionOutput", {
+    _kgAddNote: (root, content) => { calls.add.push(content); return true; },
+    _kgLoad: () => notes,
+    _kgTokens: KG_TOKENS,
+    _KG_INFERRED: KG_INFERRED,
+    _kgSupersede: (root, id, content) => { calls.supersede.push(id); return { incorrect: "x", corrected: content }; },
+    saveChatHistory: () => {},
+  });
+
+  // 用户原话：不许覆盖，降级成新增一条（时间序仲裁，最新那条在最上面）。
+  mk([userNote])("/repo", "src", [{ action: "correct", old_id: "p:n1", content: "前端用原生 CSS 写" }]);
+  assert.deepEqual(calls.supersede, [], "模型的归纳把用户原话作废了——用户重申都推不翻");
+  assert.equal(calls.add.length, 1, "该降级成新增，不能整条丢掉");
+
+  // 自己归纳的、且说的是同一件事：允许覆盖。
+  calls.supersede.length = 0; calls.add.length = 0;
+  mk([inferred])("/repo", "src", [{ action: "correct", old_id: "p:n2", content: "前端用原生 CSS 写样式" }]);
+  assert.deepEqual(calls.supersede, ["n2"], "归纳改归纳应当放行");
+
+  // 自己归纳的、但说的是八竿子打不着的事：schema 里只有 correct，模型会随手抓一条
+  //    旧笔记来顶（用户见过"包管理器规则被圆角按钮取代"）。降级成新增。
+  calls.supersede.length = 0; calls.add.length = 0;
+  mk([{ id: "n3", content: `${KG_INFERRED} 以后一律用 pnpm，别用 npm`, tags: [], created: 3 }])(
+    "/repo", "src", [{ action: "correct", old_id: "p:n3", content: "按钮统一用圆角" }]);
+  assert.deepEqual(calls.supersede, [], "毫不相干的覆盖被放行了");
+  assert.equal(calls.add.length, 1);
+});
+
+test("记忆卫生·写入：随口一句「不是蓝色是绿色」不该改长期记忆", () => {
+  const superseded = [];
+  const deps = {
+    extractExplicitCorrection,
+    _kgTokens: KG_TOKENS,
+    _KG_INFERRED: KG_INFERRED,
+    _kgSupersededIds: () => new Set(),
+    _kgLoad: () => [{ id: "n1", content: "图标用蓝色", tags: KG_TOKENS("图标用蓝色"), created: 1 }],
+    _kgSupersede: (root, id) => { superseded.push(id); return { ok: true }; },
+  };
+  const apply = load("_applyExplicitMemoryCorrection", deps);
+  assert.equal(apply("/repo", "这个图标不是蓝色，是绿色"), null, "一次性描述改写了持久记忆");
+  assert.deepEqual(superseded, []);
+  // 带长期信号词的仍然照改——不能因为收紧就把真需求也挡掉。
+  assert.ok(apply("/repo", "以后图标不是蓝色，是绿色"));
+  assert.deepEqual(superseded, ["n1"]);
+});
+
+test("记忆卫生·召回：无条件塞进来的条目必须和检索命中分开标注", () => {
+  const notes = [
+    { id: "hit", content: "构建用 vite", tags: ["vite", "构建"], type: "fact", created: 5, links: [] },
+    { id: "carry", content: "别用黄色", tags: ["黄色"], type: "preference", created: 9, links: [] },
+  ];
+  const retrieve = load("_kgRetrieve", {
+    _kgSupersededIds: () => new Set(),
+    _kgLoad: () => notes,
+    _kgTokens: KG_TOKENS,
+    _kgKey: () => "k",
+    _kgCacheStore: () => {},
+    _perfPhase: () => {},
+    localStorage: { setItem: () => {} },
+  });
+  const picked = retrieve("/repo", "vite 构建怎么配");
+  assert.ok(picked.relevantIds?.has("hit"), "真命中的没被标出来");
+  assert.ok(!picked.relevantIds?.has("carry"), "无条件保底的被冒充成了检索命中");
+
+  // 已经有命中时，"最近 3 条"不该再挤进来——那是零命中时的兜底。用一条 type=fact 的
+  // 闲话（不吃 preference/convention/pitfall 的保底名额）来验：它比命中的那条更新，
+  // 无条件兜底一旦回来，它就会被顶到最高注意力位置。
+  const chatter = { id: "chatter", content: "昨天聊到周末去哪玩", tags: ["周末"], type: "fact", created: 99, links: [] };
+  const withChatter = load("_kgRetrieve", {
+    _kgSupersededIds: () => new Set(),
+    _kgLoad: () => [...notes, chatter],
+    _kgTokens: KG_TOKENS,
+    _kgKey: () => "k",
+    _kgCacheStore: () => {},
+    _perfPhase: () => {},
+    localStorage: { setItem: () => {} },
+  })("/repo", "vite 构建怎么配");
+  assert.ok(!withChatter.some((n) => n.id === "chatter"),
+    "有命中时最近的闲话又被无条件塞进来了");
+
+  const recentOnly = notes.filter((n) => n.id === "carry");
+  assert.ok(picked.some((n) => n.id === "hit"));
+  const noHit = load("_kgRetrieve", {
+    _kgSupersededIds: () => new Set(),
+    _kgLoad: () => recentOnly,
+    _kgTokens: KG_TOKENS,
+    _kgKey: () => "k",
+    _kgCacheStore: () => {},
+    _perfPhase: () => {},
+    localStorage: { setItem: () => {} },
+  })("/repo", "完全不相干的问题");
+  assert.equal(noHit.length, 1, "零命中时该兜底带上最近的");
+  assert.equal(noHit.relevantIds.size, 0);
+
+  const seenQuery = [];
+  const block = load("_kgRetrieveBlock", {
+    _kgRetrieve: () => picked,
+    _kgActiveCorrections: (root, limit, q) => { seenQuery.push(q); return []; },
+    _kgClampLines: load("_kgClampLines", {}),
+  })("/repo", "vite 构建怎么配", false);
+  assert.deepEqual(seenQuery, ["vite 构建怎么配"],
+    "纠错账本没拿到本轮问题，会按时间全量塞——用户问包管理器，顶上却挂着按钮圆角");
+  assert.doesNotMatch(block, /按本次任务相关性/, "表头还在骗模型说条条都相关");
+  assert.match(block, /常驻长期约束·非本轮检索结果/, "无条件带上的条目没有单独分段");
+  assert.match(block, /从新到旧/, "缺少时间序仲裁说明，多份副本会靠数量压倒最新那条");
+  assert.doesNotMatch(block, /- \[(?:fact|preference|convention|pitfall|command)\]/,
+    "机器猜的类型标签又进上下文了");
+  assert.ok(block.indexOf("构建用 vite") < block.indexOf("常驻长期约束"), "命中条目该排在常驻块之前");
+
+  // 超预算时整块要走整行丢弃：旧写法 lines.join().slice(0,4000) 会把一条事实从
+  // 中间切断且不留任何记号，模型读到的是一句残缺的断言。
+  const many = Array.from({ length: 60 }, (_, i) => ({
+    id: `b${i}`, content: `构建约定第 ${i} 条：` + "细节".repeat(60), tags: ["构建"], type: "fact", created: i, links: [],
+  }));
+  many.relevantIds = new Set(many.map((n) => n.id));
+  const big = load("_kgRetrieveBlock", {
+    _kgRetrieve: () => many,
+    _kgActiveCorrections: () => [],
+    _kgClampLines: load("_kgClampLines", {}),
+  })("/repo", "构建", false);
+  assert.match(big, /另有 \d+ 条较旧记忆因篇幅未列出/, "又在静默切半句了");
+  for (const line of big.split("\n")) {
+    if (!line.startsWith("- 构建约定第")) continue;
+    assert.ok(line.endsWith("细节"), `一条事实被切成了半句：${line.slice(-30)}`);
+  }
+});
+
+test("记忆卫生·召回：超预算按整行丢并说明，不把事实截成半句", () => {
+  const clamp = load("_kgClampLines", {});
+  const lines = ["- " + "甲".repeat(50), "- " + "乙".repeat(50), "- " + "丙".repeat(50)];
+  const out = clamp(lines, 60);
+  assert.ok(out.includes("甲".repeat(50)), "第一条该完整保留");
+  assert.doesNotMatch(out, /乙{1,49}$/m, "把一条事实从中间切断了");
+  assert.match(out, /另有 2 条较旧记忆因篇幅未列出/, "静默丢弃，模型不知道这里被截过");
+});
+
+test("记忆卫生·召回：纠错账本按本轮问题过滤，但最新两条永远保底", () => {
+  const rows = [
+    { id: "c1", created: 5, incorrectId: "a", incorrect: "用蓝色", corrected: "用绿色" },
+    { id: "c2", created: 4, incorrectId: "b", incorrect: "按钮直角", corrected: "按钮圆角" },
+    { id: "c3", created: 1, incorrectId: "c", incorrect: "用 npm 装", corrected: "用 pnpm 装" },
+  ];
+  const active = load("_kgActiveCorrections", {
+    _kgCorrectionLoad: () => rows,
+    _kgTokens: KG_TOKENS,
+  });
+  assert.deepEqual(active("/repo", 8).map((r) => r.id), ["c1", "c2", "c3"], "不带 query 时保持全量");
+  const ids = active("/repo", 8, "装依赖该用 npm 还是别的").map((r) => r.id);
+  assert.ok(ids.includes("c3"), "和本轮问题真相关的那条没被带上");
+  assert.deepEqual(ids.slice(0, 2), ["c1", "c2"], "最新两条要无条件保底，否则刚纠正完就被话题切换挤掉");
+});
+
+test("记忆卫生·面板保存要连纠错账本一起作废", () => {
+  const src = stripJsComments(extractFn("_saveKgText"));
+  assert.match(src, /_kgCorrectionSave\(root, \[\]\)/,
+    "用户在面板里删掉的记忆，会以「已作废X；当前有效Y」继续每轮注入");
+  assert.ok(src.indexOf("_kgCorrectionSave") > src.indexOf("_kgSave(root, notes)"),
+    "得在重建之后清，否则又被写回去");
+});
+
+test("记忆卫生·需求账本不再自称「全部仍然有效」", () => {
+  const at = SRC.indexOf("const _demandLedgerBlock = (effectiveMode");
+  assert.ok(at > 0);
+  const block = stripJsComments(SRC.slice(at, at + 700));
+  assert.doesNotMatch(block, /全部仍然有效/, "历史消息被当成待办清单整本压给模型");
+  assert.doesNotMatch(block, /_demandLedger\.slice\(0, -1\)/,
+    "push 比这里晚，slice(0,-1) 砍掉的是上一轮——正好是用户刚做出的那次纠正");
+  assert.match(block, /不是待办清单/);
+});
+
+test("记忆卫生·项目日志与工作流不再声称没发生过的事", () => {
+  assert.match(SRC, /（改了 \$\{files\}）` : "（未改动文件）"/,
+    "纯调研轮也记 ✓ 且括号缺席，模型只能去猜东西到底做出来没有");
+  const wf = SRC.slice(SRC.indexOf("💡 **"), SRC.indexOf("💡 **") + 300);
+  assert.doesNotMatch(wf, /已复用/, "那个 N 是归纳时的相似任务数，不是被复用次数");
+  assert.match(wf, /未经验证/);
+});
+
+test("记忆卫生·项目档案有过期时间，不再永远说「已装好别重装」", () => {
+  const src = extractFn("_seedProjectProfile");
+  assert.match(stripJsComments(src), /Date\.now\(\) - \(n\.created \|\| 0\) < _SEED_TTL/,
+    "只看有没有、不看多久以前，首次抓到的依赖清单就永不更新");
+  assert.ok(src.includes("_kgSave(root, notes.filter"), "重播前不删旧的，近似去重会把新笔记吞掉");
+  assert.doesNotMatch(stripJsComments(src), /别重复安装/, "祈使句会被照办到清单过期之后");
+});
+
+test("记忆卫生·上轮思考结论只收已定结论，不收猜想", () => {
+  const src = stripJsComments(extractFn("_extractThinkingConclusion"));
+  assert.doesNotMatch(src, /决定\|选择\|因此\|所以\|方案\|根因\|结论\|应该\|需要/,
+    "「应该/需要」是推理中段的情态词，不是结论");
+  assert.match(src, /hedgeRe/, "缺少猜想词过滤，没验证的假设会被当成既成前提注入");
+});
+
+test("记忆卫生·一句「不对」不该把上一条完整回复整段判成已作废", () => {
+  const mem = new ConversationMemory();
+  mem.push({ role: "user", content: "把登录页改一下" });
+  mem.push({ role: "assistant", content: "我读了 src/auth.js，改了登录逻辑，然后跑了测试。" });
+  assert.equal(mem.recordUserCorrection("不对，我说的是注册页"), null,
+    "泛泛的一句纠正把上一条回复登记成了作废事实，模型之后会刻意绕开它刚做对的事");
+  // 显式替换仍然照常登记——不能因为收紧就把真纠正也挡掉。
+  assert.ok(mem.recordUserCorrection("不是蓝色，是绿色"));
+});
+
+test("记忆卫生·纠错前缀按本轮问题挑，且最新两条保底", () => {
+  const mem = new ConversationMemory();
+  // 老到排不进保底名额、又和本轮问题毫无关系的那几条，是"胡言乱语"的直接燃料：
+  // 它们以「优先于普通记忆」的口吻在场，模型就会去迁就。
+  for (const [bad, good] of [
+    ["用 npm 装", "用 pnpm 装"],
+    ["页脚居左", "页脚居中"],
+    ["字号 12px", "字号 14px"],
+    ["按钮直角", "按钮圆角"],
+    ["图标蓝色", "图标绿色"],
+  ]) {
+    mem.recordCorrection({ kind: "user", incorrect: bad, corrected: good, confidence: 1 });
+  }
+  mem.push({ role: "user", content: "帮我把依赖用 npm 装一下" });
+  const block = mem.prefixMessages().find((m) => String(m.content).includes("纠错记忆"));
+  assert.ok(block, "纠错前缀不见了");
+  assert.match(block.content, /用 pnpm 装/, "和本轮问题真相关的那条没被带上");
+  assert.match(block.content, /图标绿色/, "最新两条要无条件保底");
+  assert.doesNotMatch(block.content, /页脚居中/, "既老又不相关的纠正还在无条件塞");
+  assert.doesNotMatch(block.content, /字号 14px/, "既老又不相关的纠正还在无条件塞");
+
+  // reflection 那条记的是这一轮正常的工具动作串，不是"不该做的事"。
+  const m2 = new ConversationMemory();
+  m2.recordCorrection({ kind: "reflection", incorrect: "读取 src/main.js → 编辑 src/main.js", corrected: "先确认改动点再动手" });
+  m2.push({ role: "user", content: "继续改 src/main.js" });
+  const text = m2.prefixMessages().find((m) => String(m.content).includes("纠错记忆")).content;
+  assert.doesNotMatch(text, /避免重复/, "把正常动作串当禁令下发，模型会开始不读它必须读的文件");
+  assert.match(text, /是建议不是禁令/);
+  assert.doesNotMatch(text, /读取 src\/main\.js/);
 });
