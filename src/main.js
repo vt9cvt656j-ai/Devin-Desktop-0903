@@ -36490,12 +36490,28 @@ function _newTechResearchIssue(run, call) {
     "web", "websearch", "search_tools", "knowledge",
   ]);
   const used = Array.isArray(run._toolTypesUsed) ? run._toolTypesUsed : [];
-  if (used.some((t) => RESEARCH.has(String(t)))) return "";
+  const didResearch = used.some((t) => RESEARCH.has(String(t)));
+
+  // 查过了，但**查的是不是这个包**？
+  //
+  // "本轮做过调研"这个判据太松：模型可以先搜一个无关的东西，然后照样把一个自己编出来的
+  // 依赖写进清单。用户要的是"用最主流最新的库"——那就得针对**它正在选的那个东西**去查。
+  // 抠得出包名才做这一层；抠不出就退回宽松判定（抠错了会把正当批次拦死，比漏判贵）。
+  const wanted = _addedPackageNames(String(call.content ?? call.new_string ?? ""));
+  const queries = (Array.isArray(run._researchQueries) ? run._researchQueries : []).join(" ").toLowerCase();
+  if (didResearch && (!wanted.length || wanted.some((n) => queries.includes(String(n).toLowerCase())))) return "";
+  if (didResearch && wanted.length) {
+    return "[BLOCKED_TECH_RESEARCH] 本轮是做过调研，但**没有一次是针对你正在加的这几个**："
+      + `${wanted.slice(0, 6).join("、")}。\n`
+      + "先查它们本身：还在维护吗？最新版本是多少？这件事现在主流用的是不是它？\n"
+      + "（package_search / github_repo / developer_community_search 都在手边。）\n"
+      + "查完直接继续，不用再问我。";
+  }
   return "[BLOCKED_TECH_RESEARCH] 这一步在**选技术**（新建项目 / 往依赖清单里加东西），"
     + "而本轮还没有做过任何外部调研。\n"
     + "先花一次调用确认三件事，再回来写：\n"
     + "· 这个包/框架**真的存在**、名字拼对了 —— package_search 或 package_source\n"
-    + "· 它现在**还有人维护**、版本是活的 —— github_repo / package_search\n"
+    + "· 它现在**还有人维护**，最新版本是多少（别照着记忆里的旧版本写）—— github_repo / package_search\n"
     + "· 这件事**主流是怎么做的**，有没有更合适的选择 —— developer_community_search / web_search\n"
     + "查完直接继续，不用再问我。";
 }
@@ -40995,6 +41011,51 @@ function _isBenignRunCommand(command) {
   ];
   const segments = raw.split(/\s*&&\s*/).map((s) => s.trim()).filter(Boolean);
   return segments.length > 0 && segments.every((seg) => benign.some((re) => re.test(seg)));
+}
+
+/**
+ * 从依赖清单的新增内容里抠出包名。
+ *
+ * 只求"抠得出"，不求"抠得全"：抠不出就退回宽松判定（本轮做过任何调研即可），
+ * 抠错了会把一个正当的批次拦死，比漏判贵得多。
+ */
+function _addedPackageNames(text) {
+  const src = String(text || "");
+  const names = new Set();
+  // package.json / composer.json：  "axios": "^1.6.0"
+  for (const m of src.matchAll(/"([@a-zA-Z][\w.@/-]{1,60})"\s*:\s*"[~^>=<*\d]/g)) names.add(m[1]);
+  // requirements.txt / pyproject：  axios==1.2  /  fastapi>=0.1
+  for (const m of src.matchAll(/^\s*([a-zA-Z][\w.-]{1,60})\s*(?:[=<>~!]=|>=|<=)/gm)) names.add(m[1]);
+  // Cargo.toml / go.mod：  serde = "1"   /   github.com/foo/bar v1.2.3
+  for (const m of src.matchAll(/^\s*([a-zA-Z][\w-]{1,60})\s*=\s*[{"]/gm)) names.add(m[1]);
+  for (const m of src.matchAll(/^\s*([\w.-]+\/[\w./-]+)\s+v\d/gm)) names.add(m[1]);
+  // 明显不是包名的（版本号字段、脚本名）剔掉
+  for (const junk of ["version", "name", "scripts", "dependencies", "devDependencies", "require", "python"]) names.delete(junk);
+  return [...names];
+}
+
+/**
+ * 计划先行：从零建东西之前，先把步骤写出来。
+ *
+ * 用户原话："用 plan 模式去写，不然就会很垃圾。"
+ *
+ * 这个函数以前是 `return false`，注释写着"计划是思考辅助，不是运行时权限闸门"——那是一条
+ * 有意的设计决定，现在被用户明确推翻了。但推翻的是"要不要拦"，不是"能不能循环"：
+ * **一个 run 只拦一次**，而且只拦从零建东西的第一次落盘。改已有代码一概不拦——
+ * 那种任务写计划是负担不是帮助。
+ */
+function _planBeforeBuildIssue(run, call) {
+  if (!run || run.mode !== "agent" || run._planStopUsed) return "";
+  if (!_implementationGroundingCandidate(call) && !_introducesNewTech(call)) return "";
+  const p = run.engineering || {};
+  // 只对"从零建一个东西"生效：改 bug、改已有代码不在此列。
+  if (!(p.projectScope || p.fromZeroUiProject || p.fullWebsite || p.substantial)) return "";
+  const steps = Array.isArray(run._planSteps) ? run._planSteps : [];
+  if (steps.length) return "";
+  return "[BLOCKED_PLAN_FIRST] 这是从零建一个东西的第一次落盘，而本轮还没有计划。\n"
+    + "先用 update_plan 把步骤写出来（要做哪几步、每步的产出是什么、怎么验证），再动手。\n"
+    + "理由不是流程：没有计划的从零构建会边写边改方向，最后交出一堆互相不搭的文件。\n"
+    + "写完直接继续，不用问我。";
 }
 
 function _toolRequiresPlanGate(call) {
@@ -48355,9 +48416,10 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
           // 选技术之前先去外面看一眼。这条是**真拦**（一个 run 只一次），不是提示：
           // 本地取证门回答不了"这个包存不存在、还有没有人维护、是不是主流做法"，
           // 而编一个不存在的依赖会一路写下去，直到装不上才暴露。
-          const techIssue = _newTechResearchIssue(run, it.call);
+          const techIssue = _planBeforeBuildIssue(run, it.call) || _newTechResearchIssue(run, it.call);
           if (techIssue) {
-            run._techResearchStopUsed = true;
+            if (techIssue.startsWith("[BLOCKED_PLAN_FIRST]")) run._planStopUsed = true;
+            else run._techResearchStopUsed = true;
             const blocked = {
               type: it.call.type, path: it.call.path || "", ok: false,
               failure: { code: "tech_research" }, content: techIssue,
@@ -48869,6 +48931,12 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
         if (_ok && t) {
           run._toolTypesUsed = Array.isArray(run._toolTypesUsed) ? run._toolTypesUsed : [];
           if (!run._toolTypesUsed.includes(t)) run._toolTypesUsed.push(t);
+          // 查了什么也要记：光知道"查过"不够，还要能判断"查的是不是它正在选的那个包"。
+          const _q = String(it.call.query || it.call.path || it.call.name || it.call.repo || "").trim();
+          if (_q) {
+            run._researchQueries = Array.isArray(run._researchQueries) ? run._researchQueries : [];
+            if (run._researchQueries.length < 60) run._researchQueries.push(_q.slice(0, 120));
+          }
         }
         if ((t === "edit" || t === "multiedit") && _ok) didEdit = true;
         // Model-initiated verification is credited only after settlement stamped a

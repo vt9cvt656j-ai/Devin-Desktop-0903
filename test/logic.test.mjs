@@ -22730,8 +22730,11 @@ test("重复提问闸门真的接进了 ask_user，答案也真的记进了会�
 });
 
 test("加依赖 / 建项目之前必须真的做过外部调研", () => {
-  const issue = load("_newTechResearchIssue", { _introducesNewTech: load("_introducesNewTech") });
-  const agent = (used) => ({ mode: "agent", _toolTypesUsed: used });
+  const issue = load("_newTechResearchIssue", {
+    _introducesNewTech: load("_introducesNewTech"),
+    _addedPackageNames: load("_addedPackageNames"),
+  });
+  const agent = (used, queries) => ({ mode: "agent", _toolTypesUsed: used, _researchQueries: queries || [] });
 
   const blocked = issue(agent([]), { type: "edit", path: "/p/package.json", new_string: '"axios":"^1"' });
   assert.ok(blocked, "往依赖清单里加东西 = 在选技术，而本轮一次外部调研都没做");
@@ -22743,6 +22746,21 @@ test("加依赖 / 建项目之前必须真的做过外部调研", () => {
   // 判据是**执行事实**：真的调用过外部调研工具才算。
   assert.equal(issue(agent(["package_search"]), { type: "edit", path: "/p/package.json", content: "x" }), "");
   assert.equal(issue(agent(["developer_community_search"]), { type: "edit", path: "r/requirements.txt", content: "x" }), "");
+
+  // 更严的一层：查过了，但**查的不是这个包**。"本轮做过调研"这个判据太松 ——
+  // 模型可以先搜一个无关的东西，然后照样把一个自己编出来的依赖写进清单。
+  const wrongTarget = issue(
+    agent(["package_search"], ["react hooks"]),
+    { type: "edit", path: "/p/package.json", new_string: '"axios": "^1.6.0"' },
+  );
+  assert.ok(wrongTarget, "查的是 react，加的是 axios —— 这不叫为这次选型做过调研");
+  assert.match(wrongTarget, /axios/, "要点名是哪几个包没查过");
+  // 查对了就放行。
+  assert.equal(issue(agent(["package_search"], ["axios npm"]),
+    { type: "edit", path: "/p/package.json", new_string: '"axios": "^1.6.0"' }), "");
+  // 抠不出包名时退回宽松判定：抠错了会把正当批次拦死，比漏判贵得多。
+  assert.equal(issue(agent(["package_search"], ["随便什么"]),
+    { type: "edit", path: "/p/package.json", content: "一段抠不出包名的散文" }), "");
   assert.ok(issue(agent(["read", "list"]), { type: "edit", path: "go.mod", content: "x" }),
     "只读了本地文件不算调研——本地取证回答不了「这个包存不存在」");
 
@@ -22760,9 +22778,39 @@ test("加依赖 / 建项目之前必须真的做过外部调研", () => {
   assert.equal(issue({ mode: "chat" }, { type: "edit", path: "package.json", content: "x" }), "");
 });
 
+test("从零建东西之前先写计划——但只拦一次，且不碰改已有代码的任务", () => {
+  // 用户原话："用 plan 模式去写，不然就会很垃圾。"
+  // _toolRequiresPlanGate 以前是 `return false`，注释写着"计划是思考辅助，不是运行时权限闸门"
+  // ——那是一条有意的设计决定，被用户明确推翻了。但推翻的是"要不要拦"，不是"能不能循环"。
+  const gate = load("_planBeforeBuildIssue", {
+    _implementationGroundingCandidate: (c) => c?.type === "write" || c?.type === "edit",
+    _introducesNewTech: load("_introducesNewTech"),
+  });
+  const build = (extra) => ({ mode: "agent", engineering: { projectScope: true }, ...extra });
+  const write = { type: "write", path: "src/app.ts", content: "x" };
+
+  const blocked = gate(build(), write);
+  assert.ok(blocked, "从零建项目的第一次落盘，本轮却没有计划");
+  assert.match(blocked, /update_plan/);
+  assert.match(blocked, /不用问我/, "写完直接继续，别把闸门变成一次提问");
+
+  // 有计划就放行。
+  assert.equal(gate(build({ _planSteps: [{ status: "pending" }] }), write), "");
+  // 一个 run 只拦一次。
+  assert.equal(gate(build({ _planStopUsed: true }), write), "");
+  // **改已有代码不拦**：那种任务写计划是负担不是帮助。
+  assert.equal(gate({ mode: "agent", engineering: { bug: true } }, write), "");
+  assert.equal(gate({ mode: "agent", engineering: {} }, write), "");
+  // 非落盘动作不拦；非 agent 轮不拦。
+  assert.equal(gate(build(), { type: "read", path: "a" }), "");
+  assert.equal(gate({ mode: "chat", engineering: { projectScope: true } }, write), "");
+});
+
 test("技术调研门真的接进了执行链，而且台账记的是执行事实", () => {
-  assert.match(SRC, /const techIssue = _newTechResearchIssue\(run, it\.call\);/,
+  assert.match(SRC, /const techIssue = _planBeforeBuildIssue\(run, it\.call\) \|\| _newTechResearchIssue\(run, it\.call\);/,
     "没接进去就又是一个零调用点，而测试照样全绿");
+  assert.match(SRC, /run\._researchQueries\.push\(_q\.slice\(0, 120\)\)/,
+    "查询词没记的话，「查的是不是这个包」永远判不出来");
   assert.match(SRC, /run\._techResearchStopUsed = true;/, "一个 run 只拦一次，绝不能变成死循环");
   // 台账只记**成功**的调用：模型说自己查过不算数。
   assert.match(SRC, /if \(_ok && t\) \{[\s\S]{0,220}run\._toolTypesUsed\.push\(t\)/,
