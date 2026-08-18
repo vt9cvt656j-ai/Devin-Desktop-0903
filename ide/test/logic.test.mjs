@@ -16329,8 +16329,8 @@ test("gateway compression makes the local LLM compaction stand down", () => {
   // Additive, matching the gateway's capacity_for_native (server/src/compression.rs): the tier is
   // granted ON TOP of the model's own window. Taking the larger of the two contradicted the
   // buttons, which have always been priced additively.
-  assert.match(SRC, /function _effectiveContextLimit\(modelId\)[\s\S]{0,1400}return _ctxNativeDefault\(modelId\) \+ tier;/,
-    "网关接管时本地按 原生+档位 裁剪，与 capacity_for_native 一致");
+  assert.match(SRC, /function _effectiveContextLimit\(modelId\)[\s\S]{0,1600}return Math\.max\(_ctxNativeDefault\(modelId\), _ctxSeenMax\(modelId\)\) \+ tier;/,
+    "网关接管时本地按 原生+档位 裁剪，与 capacity_for_native 一致；原生取「目录默认」和「实测下限」的较大者");
   // 加法一旦退回成 max，两个数在 1M 原生模型上重合，整排档位按钮又变成空操作。
   assert.doesNotMatch(SRC, /function _effectiveContextLimit\(modelId\)[\s\S]{0,1400}Math\.max\(\s*native,\s*tierMax/,
     "档位又变成取较大值了，付费档位在 1M 原生模型上会整排失效");
@@ -21338,6 +21338,7 @@ test("context-window choice clamps to what is actually deliverable", () => {
     // 单窗口模型：目录里没有 beta 条目，所以够得着的上限就是默认窗口本身。
     _modelCatalogEntry: () => ({ contextLimit: 200_000, contextWindows: [{ tokens: 200_000 }] }),
     _ctxNativeDefault: () => 200_000,
+    _ctxSeenMax: () => 0,
   };
   const mkEff = (store, user, compress) => load("_effectiveContextLimit", {
     ...win,
@@ -21357,10 +21358,36 @@ test("context-window choice clamps to what is actually deliverable", () => {
   assert.equal(mkEff(1_200_000, tier5m, true)("m"), 1_200_000, "the 1M button narrows within membership");
   assert.equal(mkEff(5_200_000, tier5m, true)("m"), 5_200_000, "the paid top tier must be reachable");
   assert.equal(mkEff(200_000, tier5m, true)("m"), 200_000, "native is always selectable");
-  assert.equal(mkEff(5_200_000, null, true)("m"), 200_000,
+  // 会员没了之后那一档不再产生一个虚构的窗口 —— 但这道防线现在在 **_ctxChoiceFor** 那一层
+  // （_ctxSnapToOpenChoice 归位），不在这里：用户显式点的档位在本函数里一律原样生效，
+  // 因为夹取用的上限来自目录，而目录对某些模型根本没有数据，夹的就是一个猜测。
+  // 这条测试把归位那层桩掉了（_ctxChoiceFor: () => store），所以在这儿断言等于测了个寂寞。
+  const win2 = {
+    _modelContextLimit: () => 200_000,
+    _ctxNativeDefault: () => 200_000,
+    _ctxNativeCeiling: () => 200_000,
+    _modelCatalogEntry: () => ({ contextLimit: 200_000, contextWindows: [{ tokens: 200_000, beta: null }] }),
+    _michaelUser: null,
+    _gatewayHandlesCompression: () => false,
+    _tokenShort: (n) => String(n),
+    _MC_TIER_OPTIONS: [["1M", 1_000_000], ["5M", 5_000_000]],
+  };
+  const choiceFor = load("_ctxChoiceFor", {
+    ...win2,
+    _ctxChoiceRecord: () => ({ kind: "modified", tokens: 5_200_000 }),
+    _nativeWindowsFor: () => [200_000],
+    _ctxSnapToOpenChoice: load("_ctxSnapToOpenChoice", {
+      ...win2,
+      _ctxChoiceOptions: load("_ctxChoiceOptions", win2),
+    }),
+  });
+  assert.equal(choiceFor("m"), 200_000,
     "membership gone → a stored tier silently falls back to native, never a fictional window");
-  assert.equal(mkEff(1_200_000, tier5m, false)("m"), 200_000,
-    "gateway compression off → tiers are not deliverable, clamp to native");
+  // 网关压缩没开时那一档确实交付不了 —— 但同样地，拦它的是 _ctxChoiceFor 的归位
+  // （_ctxChoiceOptions 会把买不到的档标成 locked，归位就落不到它上面），不是这一层。
+  // 这条测试把 _ctxChoiceFor 桩成了 () => store，所以在这儿断言测不到那道防线。
+  assert.equal(mkEff(1_200_000, tier5m, false)("m"), 1_200_000,
+    "用户显式选的档位在这一层原样生效；能不能买到由 _ctxChoiceFor 归位时判");
 
   const mkOpts = (user, compress, windows = null) => {
     const env = {
@@ -25375,6 +25402,8 @@ const ctxEnv = (choice) => ({
   _nativeWindowsFor: () => [1_000_000, 512_000, 262_144, 202_752, 96_890],
   // _ctxNativeCeiling 会调它，所以要在这一层就有——ctxFn 那层补的是给被测函数用的。
   _ctxNativeDefault: () => 96_890,
+  // 实测下限：默认没观测过（单独一条测试盖它）。
+  _ctxSeenMax: () => 0,
 });
 const ctxFn = (name, choice) => load(name, {
   ...ctxEnv(choice),
@@ -25458,7 +25487,7 @@ test("上下文读数要进存盘指纹——否则只有它变时 checkpoint �
 
 test("上下文仪表只吃上游真实上报的数，任何本地估算都不许画上去", () => {
   const paints = [];
-  const env = { _setContextMeter: (x) => paints.push(x) };
+  const env = { _setContextMeter: (x) => paints.push(x), _noteCtxSeen: () => {} };
   const apply = load("_applyContextReading", env);
   const paint = load("_setContextMeterFromReading", env);
   const sess = {};
@@ -25523,10 +25552,74 @@ test("用户点的那一档就是他要的——不许用一个猜错的判据�
   // 结果 glm-5.2 的 202.8k/262.1k/512k/1.0M 四档全被锁死，滑块只剩一格 —— 用户报的"拖不动"。
   assert.equal(ctxFn("_contextMeterLimit", 262_144)("glm-5.2"), 262_144, "用户点的档位又被否决了");
   assert.equal(ctxFn("_effectiveContextLimit", 262_144)("glm-5.2"), 262_144);
-  // 夹取上限是目录列出的最宽原生窗口——放宽不能超过模型给得出的。
-  assert.equal(ctxFn("_contextMeterLimit", 9_000_000)("glm-5.2"), 1_000_000, "夹取上限丢了");
+  // 不再夹：夹取用的上限来自目录，而目录对某些模型根本没有数据（glm-5.3 就是），
+  // 那时候夹的是一个猜出来的数 —— 等于用猜测否决用户的明确选择。用户点的档位本来就
+  // 只能从我们给出的档位表里选，不会是凭空的数。
+  assert.equal(ctxFn("_contextMeterLimit", 1_000_000)("glm-5.2"), 1_000_000, "用户点的档位没原样生效");
   // 没选过仍然按默认窗口记账（这一半是对的，别一起退掉）。
   assert.equal(ctxFn("_contextMeterLimit", 0)("glm-5.2"), 96_890);
+});
+
+test("实测下限：上游报过读了多少，窗口就不可能比它小", () => {
+  // 实拍：上游报了这一轮读了 181.4k，而分母写着 128.0k、144% —— 模型明明吃下去了，
+  // 那个 128k 是客户端按模型名正则猜的，已经被现实当场证伪。既然读得进 181.4k，
+  // 窗口就不可能小于 181.4k。这是这条链上唯一不用任何人填表、也不用猜的事实来源。
+  const meter = (dflt, seen, choice) => load("_contextMeterLimit", {
+    _ctxChoiceFor: () => choice,
+    _ctxNativeDefault: () => dflt,
+    _ctxSeenMax: () => seen,
+  })("glm-5.3");
+  assert.equal(meter(128_000, 0, 0), 128_000, "没观测过就还是目录/兜底那个数");
+  assert.equal(meter(128_000, 184_802, 0), 184_802,
+    "上游报过读了 184,802，分母还写 128k → 会算出 144% 这种不可能的数");
+  assert.equal(meter(200_000, 128_000, 0), 200_000, "实测只抬下限，不会把已知的窗口压小");
+  // 用户显式选过时，以他选的为准（他知道自己这条线路能吃多少）。
+  assert.equal(meter(128_000, 184_802, 262_144), 262_144);
+
+  // 读得对不等于写得对：真实读数落地时必须把观测值记下来，否则上面几条永远是 0。
+  const seen = new Map();
+  const apply = load("_applyContextReading", {
+    _noteCtxSeen: (id, n) => { seen.set(id, Math.max(seen.get(id) || 0, n)); },
+  });
+  const sess = {};
+  apply(sess, { input: 181_400, output: 3_400, model: "glm-5.3", requestId: "r1" });
+  assert.equal(seen.get("glm-5.3"), 184_800, "真实读数落地时没记观测值 —— 分母永远停在猜的那个数");
+
+  // 落盘/读回的真函数：只抬不降，脏数据不写。
+  const store = {};
+  const env = {
+    // 模块级常量不会被 load() 自动带进来；不注它，函数里就是 ReferenceError → 被 catch 成 0，
+    // 断言看起来"跑过了"其实什么都没测到。
+    _CTX_SEEN_KEY: loadConst("_CTX_SEEN_KEY"),
+    localStorage: {
+      getItem: (k) => store[k] ?? null,
+      setItem: (k, v) => { store[k] = String(v); },
+    },
+  };
+  const note = load("_noteCtxSeen", env);
+  const read = load("_ctxSeenMax", env);
+  note("glm-5.3", 184_802);
+  assert.equal(read("glm-5.3"), 184_802);
+  note("glm-5.3", 120_000);
+  assert.equal(read("glm-5.3"), 184_802, "观测值只抬不降");
+  note("glm-5.3", 0);
+  note("", 999);
+  assert.equal(read("glm-5.3"), 184_802);
+  assert.equal(read("没见过的模型"), 0);
+});
+
+test("选中的窗口要真发给网关——否则滑块是纯装饰", () => {
+  // 目录查不到窗口的模型在客户端和网关**两边**都退回同一个 128k 猜测
+  // （网关：official_context(...).unwrap_or(128_000)）。不发这个头，用户把窗口拖到 262k，
+  // 压缩仍然按 128k 切。用户原话："我想调到用哪个就用哪个"。
+  assert.match(SRC, /_turnConfig\.ideContextWindow = _contextMeterLimit\(/,
+    "agent 回合没把选中的窗口塞进请求配置");
+  assert.match(SRC, /_h\["x-ide-context-window"\] = String\(Math\.round\(Number\(config\.ideContextWindow\)\)\)/,
+    "web/直连那条路没带这个头");
+  const ai = readFileSync(new URL("../src-tauri/src/ai.rs", import.meta.url), "utf8");
+  assert.match(ai, /pub ide_context_window: Option<u64>/, "桌面传输层没有这个字段");
+  assert.match(ai, /rb\.header\("x-ide-context-window", w\.to_string\(\)\)/, "桌面传输层没发这个头");
+  assert.match(ai, /\(1_000\.\.=20_000_000\)\.contains\(n\)/, "缺区间检查");
 });
 
 test("原生档一律可选——滑块不能只剩一格", () => {

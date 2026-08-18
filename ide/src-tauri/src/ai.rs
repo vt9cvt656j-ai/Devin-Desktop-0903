@@ -182,6 +182,11 @@ pub struct AiConfig {
     /// byte-for-byte unchanged behavior.
     #[serde(default)]
     pub ide_mode: Option<String>,
+    /// 用户在模型卡片上选中的上下文窗口（token）。目录查不到窗口的模型在客户端和网关**两边**
+    /// 都退回同一个猜测（128k），于是那个滑块拖了不算数。把选中的值原样带过去，网关的压缩
+    /// 就按它切 —— 用户的原话是"我想调到用哪个就用哪个"。
+    #[serde(default)]
+    pub ide_context_window: Option<u64>,
     #[serde(default)]
     pub ide_tools: Option<String>,
     /// Versioned semantic routing decisions produced by the IDE's model-backed engineering
@@ -679,6 +684,12 @@ fn with_ide_headers(rb: reqwest::RequestBuilder, config: &AiConfig) -> reqwest::
     }
     if config.ide_power_route == Some(true) {
         rb = rb.header("x-ide-power-route", "1");
+    }
+    if let Some(w) = config
+        .ide_context_window
+        .filter(|n| (1_000..=20_000_000).contains(n))
+    {
+        rb = rb.header("x-ide-context-window", w.to_string());
     }
     if let Some(m) = config.ide_mode.as_deref().filter(|s| !s.is_empty()) {
         rb = rb.header("x-ide-mode", m);

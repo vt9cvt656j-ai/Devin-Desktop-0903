@@ -6133,7 +6133,7 @@ pub async fn chat_completions(
                     // `mc_prefix` 必须由 apply 先读取。旧顺序在调用 apply 之前就把它删了，
                     // 导致服务端永远拿不到客户端回传的前缀，Redis 只写不读。
                     compression_prefix =
-                        apply_michael_compression(&state, &mut body, &model_id, tier, uid).await?;
+                        apply_michael_compression(&state, &mut body, &model_id, tier, uid, client_context_window(&headers)).await?;
                     compression_applied = Some(tier);
                 }
                 None => {
@@ -11733,12 +11733,32 @@ const COMPRESSION_CACHE_NAMESPACE: &str = "mc-any-v1";
 /// 还没撞窗口也提前准备摘要/前缀。这样 1M 原生窗口的模型不会等请求体逼近 3.5MB 才启动。
 const COMPRESSION_PREFIX_TRIGGER_MAX_TOKENS: usize = 400_000;
 
+/// 客户端在模型卡片上选中的上下文窗口（`x-ide-context-window`，单位 token）。
+///
+/// 为什么要收这个：目录查不到窗口的模型（实测 glm-5.3：OpenRouter 没收录、后台
+/// model_caps_override 也没填）在**两边**都退回同一个猜测 —— 客户端按模型名正则给 128k，
+/// 这里 `official_context(...).unwrap_or(128_000)` 也给 128k。于是用户在卡片上把窗口拖到
+/// 262k，压缩仍然按 128k 切，滑块是个纯装饰。用户的原话是"我想调到用哪个就用哪个"。
+///
+/// 用户显式点的那一档就是他知道自己这条线路能吃多少，比任何猜测都更接近事实，所以它优先。
+/// 只做区间检查，不做"合不合理"的二次判断 —— 那又会变成一个替用户改主意的猜测。
+fn client_context_window(headers: &HeaderMap) -> Option<usize> {
+    const MIN: usize = 1_000;
+    const MAX: usize = 20_000_000;
+    headers
+        .get("x-ide-context-window")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|n| (MIN..=MAX).contains(n))
+}
+
 async fn apply_michael_compression(
     state: &AppState,
     body: &mut serde_json::Value,
     model_id: &str,
     tier: crate::compression::Tier,
     uid: uuid::Uuid,
+    client_window: Option<usize>,
 ) -> Result<Option<(String, usize)>, AppError> {
     use crate::compression as mc;
 
@@ -11760,7 +11780,11 @@ async fn apply_michael_compression(
         return Ok(None);
     }
 
-    let native = official_context(model_id).unwrap_or(128_000).max(1) as usize;
+    // 优先级：用户在卡片上选的 > 目录/后台配置 > 兜底猜测。前两者都是"有人知道这个数"，
+    // 最后一个是"没人知道，先给个数别崩"——它不该盖过前面任何一个。
+    let native = client_window
+        .unwrap_or_else(|| official_context(model_id).unwrap_or(128_000).max(1) as usize)
+        .max(1);
     let window_budget = mc::window_budget(native);
     let fixed_overhead = compression_fixed_overhead_tokens(body, pinned);
     let budget = window_budget.saturating_sub(fixed_overhead);

@@ -751,6 +751,9 @@ async function _realAiFetch(config, messages, tools, onEvent) {
     // leaving the agent prompt-less and tool-less.
     const _h = { "Content-Type": "application/json", Authorization: "Bearer " + (key || "") };
     if (config.idePowerRoute === true) _h["x-ide-power-route"] = "1";
+    if (Number.isFinite(Number(config.ideContextWindow)) && Number(config.ideContextWindow) >= 1000) {
+      _h["x-ide-context-window"] = String(Math.round(Number(config.ideContextWindow)));
+    }
     if (config.ideMode) _h["x-ide-mode"] = String(config.ideMode);
     if (config.ideTools) _h["x-ide-tools"] = String(config.ideTools);
     if (config.ideSemanticProfile) _h["x-ide-semantic-profile"] = String(config.ideSemanticProfile).slice(0, 1024);
@@ -13810,6 +13813,34 @@ function _ctxNativeCeiling(modelId) {
   // 猜错的判据替他否决。
   return Math.max(_modelContextLimit(modelId), _nativeWindowsFor(modelId)[0] || 0);
 }
+const _CTX_SEEN_KEY = "michael_ctx_seen_v1";
+/**
+ * 这个模型**实测**被喂进去过多少 token —— 上游自己报的，不是算的。
+ *
+ * 目录查不到窗口的模型两边都退回同一个猜测（客户端按名正则、网关 unwrap_or(128_000)）。
+ * 而猜测会被现实当场证伪：实拍截图里上游报了这一轮读了 181.4k，分母却写着 128.0k、144%——
+ * 模型明明吃下去了。既然它读得进 181.4k，窗口就不可能小于 181.4k。
+ *
+ * 所以拿观测值当分母的**下限**。这是这条链上唯一不需要任何人填表、也不需要猜的事实来源。
+ */
+function _ctxSeenMax(modelId) {
+  try {
+    const map = JSON.parse(localStorage.getItem(_CTX_SEEN_KEY) || "{}") || {};
+    return Math.max(0, Math.round(Number(map[String(modelId || "")]) || 0));
+  } catch { return 0; }
+}
+function _noteCtxSeen(modelId, tokens) {
+  const id = String(modelId || "").trim();
+  const n = Math.max(0, Math.round(Number(tokens) || 0));
+  if (!id || n <= 0) return;
+  try {
+    const map = JSON.parse(localStorage.getItem(_CTX_SEEN_KEY) || "{}") || {};
+    if (Math.max(0, Number(map[id]) || 0) >= n) return;
+    map[id] = n;
+    localStorage.setItem(_CTX_SEEN_KEY, JSON.stringify(map));
+  } catch {}
+}
+
 function _ctxNativeDefault(modelId) {
   return Math.max(1, Math.round(Number(_modelContextLimit(modelId)) || 0));
 }
@@ -13824,8 +13855,9 @@ function _effectiveContextLimit(modelId) {
   // The choice may narrow the window below entitlement (a cost dial) but never widen it past
   // what native-or-membership actually delivers — budgeting against a fictional window is how
   // requests die upstream as context-length 400s.
-  if (choice > 0) return Math.max(1, Math.min(choice, _ctxNativeCeiling(modelId) + tier));
-  return _ctxNativeDefault(modelId) + tier;
+  // 同上：用户选的那一档直接生效（它本来就是从我们给出的档位表里点的，不会是凭空的数）。
+  if (choice > 0) return Math.max(1, choice);
+  return Math.max(_ctxNativeDefault(modelId), _ctxSeenMax(modelId)) + tier;
 }
 
 // 上下文注入预算随档位适度伸缩，封顶 2 倍。档位（1M/2M/5M）的真正价值是**历史容量**：
@@ -17951,13 +17983,15 @@ function _tokenExact(n) {
  * choice is a real narrowing and still counts, but it cannot exceed what the model can read.
  */
 function _contextMeterLimit(modelId) {
-  // 没选过就用**默认窗口**，不是最宽的那个（见 _ctxNativeDefault 上方那段）。用最宽的
-  // 当分母，仪表在 glm-5.2 这类模型上按 1.0M 记一个 96,890 的窗口，指针永远抬不起来。
-  // 用户点过某一档时仍按最宽夹住——那是他自己要的，卡片和仪表读的是同一个数。
+  // **用户选了哪一档就是哪一档**，不再夹。夹取用的上限来自目录，而目录对这个模型可能
+  // 根本没有数据（glm-5.3 就是），那时候夹的是一个猜出来的数——等于用猜测否决用户的明确
+  // 选择，滑块就成了装饰。选中的值现在也会随 x-ide-context-window 发给网关，压缩按它切。
+  //
+  // 没选过时：目录默认窗口，再取实测下限。上游报过读了 181.4k，窗口就不可能是 128k ——
+  // 那是唯一不需要任何人填表、也不用猜的事实来源。
   const choice = _ctxChoiceFor(modelId);
-  return choice > 0
-    ? Math.max(1, Math.min(choice, _ctxNativeCeiling(modelId)))
-    : _ctxNativeDefault(modelId);
+  if (choice > 0) return Math.max(1, choice);
+  return Math.max(1, _ctxNativeDefault(modelId), _ctxSeenMax(modelId));
 }
 function _contextMeterSnapshot(input = {}) {
   const cfg = (() => { try { return loadConfig(); } catch { return {}; } })();
@@ -18045,6 +18079,8 @@ function _applyContextReading(session, reading = {}) {
   const prev = session._ctxRealFloor;
   const sameRequest = prev && reading.requestId && prev.requestId === reading.requestId;
   if (sameRequest && Math.max(0, Number(prev.total) || 0) >= total) return false;
+  // 上游自己报的"这一轮读了多少" —— 记下来当这个模型窗口的实测下限。
+  _noteCtxSeen(reading.model, total);
   session._ctxRealFloor = {
     total,
     input,
@@ -41318,6 +41354,9 @@ async function _agentModelTurn({ config, messages, toolSchemas, toolRegistry = n
           if (_n && _stat.has(_n)) _names.push(_n); else if (_t) _keep.push(_t);
         }
         _turnConfig.ideMode = _isSub ? "subagent" : ideMode;
+        // 用户在卡片上选中的窗口要真的发出去。目录查不到窗口的模型在客户端和网关两边都退回
+        // 同一个 128k 猜测，不发这个头，滑块就是纯装饰（用户原话："我想调到用哪个就用哪个"）。
+        _turnConfig.ideContextWindow = _contextMeterLimit(_turnConfig.model || config.model || "");
         _turnConfig.ideTools = _names.join(",");
         _l0Tools = _keep;
         // Model-family tuning, user language/adaptive preferences, and the authorization
