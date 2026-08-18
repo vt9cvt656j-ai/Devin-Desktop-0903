@@ -188,78 +188,75 @@ fn allowed_static_tool(mode: &str, name: &str) -> bool {
                 | "live_environment"
                 | "ask_user"
         ),
-        "plan" => matches!(
+        // 只读三模式（plan / explorer / reviewer）：**拒绝清单**，不复刻客户端那份允许清单。
+        //
+        // 这道门只加不减 —— inject_static_tools 把 tools.json 里的 schema 补回 body.tools。
+        // release 构建把工具描述整段剥空以省 token，客户端只在 x-ide-tools 里报名字，靠这里
+        // 回填。所以被拒的工具不是"被禁止使用"，而是**在请求里彻底不存在**：客户端刚用
+        // search_tools 跟模型说「已加载 view_image，可直接调用」，下一轮那个工具连名字都没有。
+        //
+        // 原来这里抄了一份允许清单，然后就漂了：实测 138 个工具里删掉 63 个**非改动类**工具，
+        // view_image / update_plan / think / recall_conversation / read_terminal / lsp_hover /
+        // package_source / git_show 全在内；还有 await_subagent —— run_subagent 放行而收结果
+        // 的被删，派出去就收不回来。同一个文件里 subagent 那条分支的注释早就写过这个道理：
+        // 「在服务端抄一份必然漂移，那正是『两份工具目录』那个老坑」。
+        //
+        // 真正的权限边界在客户端 agent/tool-policy.js 的 blockedInReadOnlyMode —— 那里才决定
+        // 能不能执行。这里只负责别把描述弄丢，所以拒绝清单只要覆盖"客户端本来就不会执行的"
+        // 那些即可，并且逐字对齐客户端的 _STRICT_MUTATING_TOOL_NAMES（有测试钉着不许漂）。
+        "plan" | "explorer" | "reviewer" => !matches!(
             name,
-            "update_plan"
-                | "ask_user"
-                | "list_dir"
-                | "read_file"
-                | "find_files"
-                | "search"
-                | "semantic_search"
-                | "lsp_symbols"
-                | "find_symbol"
-                | "lsp_definition"
-                | "lsp_references"
-                | "knowledge_search"
-                | "developer_community_search"
-                | "github_repo"
-                | "gitlab_repo"
-                | "gitee_repo"
-                | "codeberg_repo"
-                | "wiki_search"
-                | "arxiv_search"
-                | "crossref_search"
-                | "openalex_search"
-                | "pubmed_search"
-                | "pubchem_search"
-                | "clinical_trials_search"
-                | "steam_search"
-                | "web_search"
-                | "web_fetch"
-                | "local_discovery"
-                | "live_environment"
-                | "research_project"
-                | "run_subagent"
-        ),
-        "explorer" | "reviewer" => matches!(
-            name,
-            "ask_user"
-                | "list_dir"
-                | "read_file"
-                | "find_files"
-                | "search"
-                | "semantic_search"
-                | "lsp_symbols"
-                | "find_symbol"
-                | "lsp_definition"
-                | "lsp_references"
-                | "get_diagnostics"
-                | "git_status"
-                | "git_diff"
-                | "git_log"
-                | "git_blame"
-                | "git_conflicts"
-                | "knowledge_search"
-                | "developer_community_search"
-                | "github_repo"
-                | "gitlab_repo"
-                | "gitee_repo"
-                | "codeberg_repo"
-                | "wiki_search"
-                | "arxiv_search"
-                | "crossref_search"
-                | "openalex_search"
-                | "pubmed_search"
-                | "pubchem_search"
-                | "clinical_trials_search"
-                | "steam_search"
-                | "web_search"
-                | "web_fetch"
-                | "local_discovery"
-                | "live_environment"
-                | "research_project"
-                | "run_subagent"
+            // ── 客户端 _STRICT_MUTATING_TOOL_NAMES 逐字镜像 ──
+            "write_file"
+                | "edit_file"
+                | "multi_edit"
+                | "delete_path"
+                | "move_path"
+                | "run_worker"
+                | "create_dir"
+                | "copy_path"
+                | "format_file"
+                | "run_cmd"
+                | "run_in_terminal"
+                | "deploy_site"
+                | "worktree"
+                | "git_commit"
+                | "git_branch"
+                | "git_push"
+                | "git_clone"
+                | "git_pull"
+                | "git_stash"
+                | "git_stash_pop"
+                | "gh_pr_create"
+                | "gh_pr_reply"
+                | "generate_wiki"
+                | "game_scaffold"
+                | "web_scaffold"
+                | "generate_image"
+                | "generate_3d"
+                | "generate_sound"
+                | "generate_music"
+                | "generate_voice"
+                | "auto_rig"
+                | "generate_motion"
+                | "generate_texture"
+                | "download_file"
+                | "download_asset"
+                | "automation"
+                | "ui_click"
+                | "db_query"
+                | "remote"
+                // ── 客户端 blockedInReadOnlyMode 里、上面那份没有的几个 ──
+                // create_project 会在用户主目录下建目录并把工作区顶掉；browser 能执行任意 JS、
+                // 读会话 cookie、上传本机文件；docker_compose_up 起一整套容器；capture_replay
+                // 是 http 审批门的旁路；capture_start 改**操作系统级**代理；system 开 App、
+                // 切前台窗口。这六个在只读模式下客户端都会拒，描述也就不必回填。
+                | "create_project"
+                | "browser"
+                | "docker_compose_up"
+                | "capture_replay"
+                | "capture_start"
+                | "system"
         ),
         // Agent mode can request mutating tools, but still goes through a server-side cap.
         "agent" | "ui" => true,
@@ -308,13 +305,26 @@ fn allowed_static_tool(mode: &str, name: &str) -> bool {
     }
 }
 
-fn requested_static_tools(mode: &str, names: &str) -> Vec<String> {
+/// `catalog` = tools.json 里真实存在的工具名。`None` 表示不做存在性检查（测试用）。
+///
+/// 只读模式改用拒绝清单之后，"目录里根本没有这个名字"不再会被模式策略顺手挡掉，
+/// 所以存在性要单独判一次：不判的话，客户端报上来的错名会白占 MAX_STATIC_TOOLS_PER_REQUEST
+/// 的名额，把真工具挤掉。集合由 inject_static_tools 传进来，全程只读一次盘。
+fn requested_static_tools_in(
+    mode: &str,
+    names: &str,
+    catalog: Option<&HashSet<String>>,
+) -> Vec<String> {
     let mut seen = HashSet::new();
     let mut accepted = Vec::new();
     let mut rejected = Vec::new();
 
     for name in names.split(',').map(str::trim).filter(|s| !s.is_empty()) {
         if !seen.insert(name.to_string()) {
+            continue;
+        }
+        if catalog.is_some_and(|c| !c.contains(name)) {
+            rejected.push(name.to_string());
             continue;
         }
         if allowed_static_tool(mode, name) {
@@ -338,6 +348,12 @@ fn requested_static_tools(mode: &str, names: &str) -> Vec<String> {
     }
 
     accepted
+}
+
+/// 不做存在性检查的旧入口：只在测试里用，真实请求一律走 `requested_static_tools_in`。
+#[cfg(test)]
+fn requested_static_tools(mode: &str, names: &str) -> Vec<String> {
+    requested_static_tools_in(mode, names, None)
 }
 
 fn tool_function_name(tool: &serde_json::Value) -> Option<&str> {
@@ -3438,8 +3454,7 @@ fn ide_semantic_profile(headers: &HeaderMap) -> Option<HashSet<String>> {
 /// 抽成独立函数是为了让 `subagent` 那条「只要工具、不要提示词」的早退路径能复用同一段逻辑，
 /// 而不是复制一份出来慢慢漂移。
 fn inject_static_tools(mode: &str, names: &str, body: &mut serde_json::Value) {
-    let want = requested_static_tools(mode, names);
-    if want.is_empty() {
+    if names.trim().is_empty() {
         return;
     }
     let Ok(text) = read_tools_file() else { return };
@@ -3453,6 +3468,12 @@ fn inject_static_tools(mode: &str, names: &str, body: &mut serde_json::Value) {
                         .map(|name| (name, tool))
                 })
                 .collect();
+            // 目录读出来之后再做筛选：模式策略 + "这个名字真的存在"，一次读盘两件事都办了。
+            let known: HashSet<String> = catalog.keys().cloned().collect();
+            let want = requested_static_tools_in(mode, names, Some(&known));
+            if want.is_empty() {
+                return;
+            }
             // Resolve from the ordered request, not registry order. This makes the
             // behavior stable even if tools.json is reorganized later.
             let picked: Vec<serde_json::Value> =
@@ -4880,11 +4901,30 @@ mod tests {
         assert!(required
             .iter()
             .any(|value| value.as_str() == Some("source")));
-        assert!(required
-            .iter()
-            .any(|value| value.as_str() == Some("target")));
+        // target **不是**必填，这是有意的：不该逼模型为「把这个仓库拉下来」编一个目录名。
+        // 缺省时客户端按仓库名推断，再由 _resolveCloneTarget 接到工作区根上变成绝对路径
+        // （少了那一步就是必然失败：推出来的是裸名，而 Rust 侧只认绝对路径）。
+        // 所以这里反过来钉：target 不许被重新标成必填，而且说明里要讲清缺省时会发生什么。
+        assert!(
+            !required.iter().any(|value| value.as_str() == Some("target")),
+            "target 又被标成必填了 —— 模型会为此编一个目录名，或者干脆不敢调这个工具"
+        );
+        let target_desc = clone
+            .pointer("/function/parameters/properties/target/description")
+            .and_then(|d| d.as_str())
+            .unwrap_or_default();
+        assert!(
+            !target_desc.is_empty(),
+            "target 是可选的，就更要说清不填会怎样，否则模型只能猜"
+        );
         assert_eq!(requested_static_tools("agent", "git_clone"), ["git_clone"]);
-        assert!(requested_static_tools("plan", "git_clone").is_empty());
+        // git_clone 会往磁盘写一整个仓库，只读三模式一律不回填它的描述。
+        for mode in ["plan", "explorer", "reviewer"] {
+            assert!(
+                requested_static_tools(mode, "git_clone").is_empty(),
+                "{mode} 模式不该拿到 git_clone"
+            );
+        }
     }
 
     #[test]
@@ -5406,10 +5446,21 @@ mod tests {
 
     #[test]
     fn read_only_engineering_modes_keep_community_search_but_reject_writes() {
+        // 目录里真实存在的名字才做得了数：academic_search / smzdm_search / xianyu_search /
+        // zhuanzhuan_search / unknown_tool 都不在 tools.json 里，被"存在性"那一层拦掉，
+        // 而不再是靠模式允许清单顺手挡住（只读模式现在用的是拒绝清单）。
+        let known: std::collections::HashSet<String> = [
+            "developer_community_search", "pubmed_search", "pubchem_search",
+            "clinical_trials_search", "steam_search", "write_file", "run_cmd",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
         for mode in ["plan", "explorer", "reviewer"] {
-            let result = requested_static_tools(
+            let result = super::requested_static_tools_in(
                 mode,
                 "developer_community_search,academic_search,pubmed_search,pubchem_search,clinical_trials_search,steam_search,smzdm_search,xianyu_search,zhuanzhuan_search,write_file,run_cmd,unknown_tool",
+                Some(&known),
             );
             assert_eq!(
                 result,
@@ -7443,5 +7494,111 @@ mod shadcn_delivery_tests {
             sys.contains("禁止") || sys.contains("不是照着样子写"),
             "必须明确禁止手写 shadcn 风格组件"
         );
+    }
+}
+
+#[cfg(test)]
+mod readonly_tool_injection_tests {
+    use super::{allowed_static_tool, requested_static_tools};
+    use std::collections::HashSet;
+
+    fn repo_root() -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("server 的上一级就是仓库根")
+            .to_path_buf()
+    }
+
+    /// 客户端声明的"强改动工具"名单，从 ide/src/main.js 现取。
+    fn client_strict_names() -> HashSet<String> {
+        let src = std::fs::read_to_string(repo_root().join("ide/src/main.js"))
+            .expect("读不到 ide/src/main.js");
+        let at = src
+            .find("const _STRICT_MUTATING_TOOL_NAMES = new Set([")
+            .expect("客户端那份名单改名了，这条守卫要跟着改");
+        let body = &src[at..at + src[at..].find("]);").expect("名单未闭合")];
+        body.split('"')
+            .skip(1)
+            .step_by(2)
+            .filter(|s| !s.is_empty() && !s.contains(' '))
+            .map(str::to_string)
+            .collect()
+    }
+
+    fn catalog_names() -> Vec<String> {
+        let text = std::fs::read_to_string(repo_root().join("server/prompts/tools.json"))
+            .expect("读不到 tools.json");
+        let all: Vec<serde_json::Value> = serde_json::from_str(&text).expect("tools.json 不是数组");
+        all.iter()
+            .filter_map(|t| t.pointer("/function/name").and_then(|v| v.as_str()))
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// 只读模式的注入门是**描述回填**，不是权限边界 —— 它只加不减。被它拒掉的工具不是
+    /// "不许用"，而是在请求里彻底不存在：客户端刚用 search_tools 告诉模型「已加载，可直接
+    /// 调用」，下一轮那个工具连名字都没有。
+    ///
+    /// 所以判据只有一条：**非改动类工具一个都不许丢**。原来这里抄了一份允许清单，然后漂到
+    /// 138 个工具里删掉 63 个只读工具（view_image / update_plan / think / recall_conversation
+    /// / read_terminal / lsp_hover / package_source / git_show …）。
+    #[test]
+    fn readonly_modes_keep_every_non_mutating_tool() {
+        let strict = client_strict_names();
+        assert!(strict.len() > 30, "客户端名单只解析出 {} 个，取法多半坏了", strict.len());
+        for mode in ["plan", "explorer", "reviewer"] {
+            let dropped: Vec<String> = catalog_names()
+                .into_iter()
+                .filter(|n| !strict.contains(n) && !allowed_static_tool(mode, n))
+                .collect();
+            // 客户端只读模式也会拒的那几个（见实现里的说明），丢掉描述是对的。
+            let deliberate: HashSet<&str> = [
+                "create_project", "browser", "docker_compose_up",
+                "capture_replay", "capture_start", "system",
+            ]
+            .into_iter()
+            .collect();
+            let unexplained: Vec<&String> = dropped
+                .iter()
+                .filter(|n| !deliberate.contains(n.as_str()))
+                .collect();
+            assert!(
+                unexplained.is_empty(),
+                "{mode} 模式把这些**非改动类**工具的描述整个丢了，模型在请求里根本看不到它们：{unexplained:?}"
+            );
+        }
+    }
+
+    /// run_subagent 放行而 await_subagent 被拒 = 派得出去、收不回来。
+    #[test]
+    fn dispatching_a_subagent_implies_being_able_to_collect_it() {
+        for mode in ["plan", "explorer", "reviewer", "agent"] {
+            if allowed_static_tool(mode, "run_subagent") {
+                assert!(
+                    allowed_static_tool(mode, "await_subagent"),
+                    "{mode}：能派出子智能体却拿不到收结果的工具，是个收不回来的死结"
+                );
+            }
+        }
+    }
+
+    /// 改动类工具在只读模式下不该被回填描述 —— 拒绝清单必须逐字覆盖客户端那份。
+    #[test]
+    fn readonly_modes_still_refuse_every_mutating_tool() {
+        let catalog: HashSet<String> = catalog_names().into_iter().collect();
+        for name in client_strict_names() {
+            if !catalog.contains(&name) {
+                continue; // 客户端有、网关目录里没有的，不归这条管
+            }
+            for mode in ["plan", "explorer", "reviewer"] {
+                assert!(
+                    !allowed_static_tool(mode, &name),
+                    "{mode} 模式把改动类工具 {name} 放进来了 —— 两份清单又漂开了"
+                );
+            }
+        }
+        // 走一遍真实入口，确认过滤发生在 requested_static_tools 这一层。
+        let picked = requested_static_tools("reviewer", "read_file,write_file,view_image,await_subagent");
+        assert_eq!(picked, vec!["read_file", "view_image", "await_subagent"]);
     }
 }

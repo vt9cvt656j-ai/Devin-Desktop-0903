@@ -8437,9 +8437,17 @@ mod billing_tests {
             let body = body.as_str();
             // 三个准入口现在共用 admit_billing：分开写过一次，代价是同一个免费模型从
             // IDE 能用、从 /v1/responses 被判成"请先开通会员或充值额度"。
+            // 判据是"这个入口在走付费门之前先问过免费池"，不是某一行的具体写法。
+            // 原来钉的是 `free_here && free_points_balance(...)` 那串字面量，而那一行必须改：
+            // 池子"还剩不剩一点"和结算问的不是同一个问题（见 free_pool_covers_call）。
             let pool = body
-                .find("let free_pool_has_room = free_here && free_points_balance")
+                .find("let free_pool_has_room = free_here")
                 .unwrap_or_else(|| panic!("{entry} 没有检查每日点数池"));
+            assert!(
+                body[pool..].starts_with("let free_pool_has_room = free_here\n        && free_pool_covers_call(")
+                    || body[pool..pool + 400].contains("free_pool_covers_call("),
+                "{entry}：准入门必须问「这一次付得起吗」，不是「还剩不剩一点」",
+            );
             let gate = body
                 .find("admit_billing(")
                 .unwrap_or_else(|| panic!("{entry} 没有走统一的准入判定"));
