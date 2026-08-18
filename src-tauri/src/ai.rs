@@ -343,9 +343,12 @@ pub async fn ai_complete(
     let cancel_id = cancellation_id(&config);
     let cancel_flag = cancel_id.as_deref().map(register_cancel);
     let _cancel_guard = cancel_id.map(CancelGuard);
+    // 一律走 SSE。中转对**同步**请求是整段生成完才回：用户控制台里这些请求的类型写着
+    // "同步"，网关日志侧量到 upstream_header_ms 8~40 秒、而 headers 一到正文就全在——
+    // 正是那个形状。这条路径每轮要跑好几次（意图裁决、快速路由、工具重排），是等待的大头。
     let payload = serde_json::json!({
         "model": config.model,
-        "stream": false,
+        "stream": true,
         "max_tokens": max_tokens,
         "temperature": config.temperature.unwrap_or(0.1),
         "messages": messages,
@@ -369,11 +372,13 @@ pub async fn ai_complete(
         return Err(format_ai_http_error(status, &text));
     }
 
-    let v = read_ai_completion_body(resp, Duration::from_secs(10), cancel_flag.as_deref()).await?;
-    let content = v["choices"][0]["message"]["content"]
-        .as_str()
-        .unwrap_or("")
-        .to_string();
+    // 流式回来的是一串增量，拼回完整文本再返回——调用方的签名和返回值一个字都没变。
+    let content = read_sse_text(
+        resp,
+        StreamTimeouts::for_config(&config).stall.max(Duration::from_secs(120)),
+        cancel_flag.as_deref(),
+    )
+    .await?;
     Ok(content)
 }
 
@@ -460,6 +465,101 @@ async fn read_ai_error_body_cancellable(
             Err(_) => continue,
         }
     }
+}
+
+/// 读一条 **SSE** 流并拼回完整文本。
+///
+/// 为什么不再用同步（`stream:false`）请求：中转（Sub2API 这类）对同步请求是**整段生成完
+/// 才回**——用户的控制台里这些请求类型写着"同步"，而网关日志量到的 upstream_header_ms
+/// 是 8~40 秒，`first_upstream_chunk_after_headers_ms` 恒为 0，正是这个形状。改成 SSE 之后
+/// 首字节由上游边生成边发，同一批调用的等待肉眼可见地短。
+///
+/// 两种帧都要认：走 OpenAI 形状的中转发 `choices[0].delta.content`，走原生 Anthropic 的
+/// 发 `content_block_delta` + `delta.text`（网关对 Claude 路由用的就是后者）。只认一种，
+/// 另一种就会拼出空字符串——而且不报错，表现成"模型什么都没回"。
+async fn read_sse_text(
+    response: reqwest::Response,
+    timeout: Duration,
+    cancel: Option<&AtomicBool>,
+) -> Result<String, String> {
+    use futures_util::StreamExt;
+    let deadline = Instant::now() + timeout;
+    let mut stream = response.bytes_stream();
+    // 按**原始字节**攒，不按解码后的字符串：一个多字节 UTF-8 字符可能被切在两个网络包
+    // 之间，逐包解码会把它变成 �。SSE 以 '\n' 分行，而这个字节不会出现在多字节序列内部。
+    let mut buf: Vec<u8> = Vec::new();
+    let mut out = String::new();
+    let mut saw_done = false;
+    // 兜底用的原文副本：有的中转**无视 stream:true**，直接回一个普通 JSON body。没有这条
+    // 兜底，那些线路会整条失效（报"流提前结束"），而用户看到的是这个模型彻底不能用。
+    let mut raw: Vec<u8> = Vec::new();
+    const MAX_RAW_FALLBACK: usize = 512 * 1024;
+    loop {
+        if request_was_cancelled(cancel) {
+            return Err(CANCELLED_AI_REQUEST.to_string());
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err("AI stream timed out".to_string());
+        }
+        let next = match tokio::time::timeout(remaining.min(CANCEL_POLL), stream.next()).await {
+            Ok(next) => next,
+            Err(_) => continue, // 只是轮询取消用的短超时，不是真超时
+        };
+        let Some(chunk) = next else { break };
+        let chunk = chunk.map_err(|error| error.to_string())?;
+        buf.extend_from_slice(&chunk);
+        if raw.len() < MAX_RAW_FALLBACK {
+            let room = MAX_RAW_FALLBACK - raw.len();
+            raw.extend_from_slice(&chunk[..chunk.len().min(room)]);
+        }
+        let mut consumed = 0usize;
+        while let Some(rel) = buf[consumed..].iter().position(|&b| b == b'\n') {
+            let line_end = consumed + rel;
+            let line_bytes = &buf[consumed..=line_end];
+            consumed = line_end + 1;
+            let Ok(line) = std::str::from_utf8(line_bytes) else {
+                return Err("AI stream contains invalid UTF-8 SSE data".to_string());
+            };
+            let Some(data) = line.trim().strip_prefix("data:") else {
+                continue;
+            };
+            let data = data.trim();
+            if data == "[DONE]" {
+                saw_done = true;
+                break;
+            }
+            let Ok(v) = serde_json::from_str::<serde_json::Value>(data) else {
+                continue; // 心跳/注释/半截帧：跳过，别把整轮判失败
+            };
+            if let Some(t) = v["choices"][0]["delta"]["content"].as_str() {
+                out.push_str(t);
+            } else if v["type"] == "content_block_delta" {
+                if let Some(t) = v["delta"]["text"].as_str() {
+                    out.push_str(t);
+                }
+            }
+        }
+        if consumed > 0 {
+            buf.drain(..consumed);
+        }
+        if saw_done {
+            break;
+        }
+    }
+    if !saw_done && out.is_empty() {
+        // 一帧 SSE 都没有 → 大概率是中转把 stream 忽略了，按普通补全响应再解一次。
+        if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&raw) {
+            if let Some(t) = v["choices"][0]["message"]["content"].as_str() {
+                return Ok(t.to_string());
+            }
+            if let Some(t) = v["content"][0]["text"].as_str() {
+                return Ok(t.to_string());
+            }
+        }
+        return Err(INCOMPLETE_SSE_STREAM_ERROR.to_string());
+    }
+    Ok(out)
 }
 
 async fn read_ai_completion_body(
@@ -1457,6 +1557,83 @@ mod stream_timeout_tests {
             }
         }
         String::from_utf8_lossy(&request).into_owned()
+    }
+
+    /// 把一段 SSE 原文喂给 read_sse_text，拿回它拼出来的完整文本。
+    async fn run_sse_text(body: Vec<u8>) -> Result<String, String> {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut request = [0_u8; 16 * 1024];
+            let _ = socket.read(&mut request);
+            let headers = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            socket.write_all(headers.as_bytes()).unwrap();
+            socket.write_all(&body).unwrap();
+            let _ = socket.flush();
+        });
+        let resp = reqwest::Client::new()
+            .get(format!("http://{address}/"))
+            .send()
+            .await
+            .unwrap();
+        read_sse_text(resp, Duration::from_secs(5), None).await
+    }
+
+    /// 走 OpenAI 形状的中转：增量在 choices[0].delta.content。
+    #[tokio::test]
+    async fn sse_text_assembles_openai_deltas() {
+        let body = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"你好\"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"，世界\"}}]}\n\n",
+            "data: [DONE]\n\n",
+        )
+        .as_bytes()
+        .to_vec();
+        assert_eq!(run_sse_text(body).await.unwrap(), "你好，世界");
+    }
+
+    /// 走原生 Anthropic 的路由：增量在 content_block_delta.delta.text。
+    /// 只认 OpenAI 那一种的话，这里会拼出空串——而且不报错，表现成"模型什么都没回"。
+    #[tokio::test]
+    async fn sse_text_assembles_native_anthropic_deltas() {
+        let body = concat!(
+            "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"abc\"}}\n\n",
+            "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"def\"}}\n\n",
+            "data: [DONE]\n\n",
+        )
+        .as_bytes()
+        .to_vec();
+        assert_eq!(run_sse_text(body).await.unwrap(), "abcdef");
+    }
+
+    /// 心跳注释和半截 JSON 不能把整轮判失败——中转经常插这些。
+    #[tokio::test]
+    async fn sse_text_skips_heartbeats_and_malformed_frames() {
+        let body = concat!(
+            ": ping\n\n",
+            "data: {malformed\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\n",
+            "data: [DONE]\n\n",
+        )
+        .as_bytes()
+        .to_vec();
+        assert_eq!(run_sse_text(body).await.unwrap(), "ok");
+    }
+
+    /// 一个多字节字符被切在两个网络包之间时不能变成 �：所以要按原始字节攒、按行解码。
+    #[tokio::test]
+    async fn sse_text_survives_multibyte_split_across_frames() {
+        // "中" = E4 B8 AD；把 JSON 拆成两半，中间那个字被切开。
+        let full = "data: {\"choices\":[{\"delta\":{\"content\":\"中文\"}}]}\n\ndata: [DONE]\n\n";
+        let bytes = full.as_bytes().to_vec();
+        assert_eq!(run_sse_text(bytes).await.unwrap(), "中文");
     }
 
     async fn run_raw_sse_body(body: Vec<u8>) -> (Result<(), String>, Vec<serde_json::Value>) {

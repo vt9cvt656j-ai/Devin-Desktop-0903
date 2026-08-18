@@ -27,7 +27,7 @@
 //   3. Every check names the real defect it would have caught.
 import test from "node:test";
 import assert from "node:assert/strict";
-import { readFileSync, writeFileSync } from "node:fs";
+import { readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
@@ -1457,6 +1457,31 @@ test("前端调的每个后端命令，Rust 侧都注册了", () => {
   const missing = invoked.filter((c) => !registered.has(c));
   assert.deepEqual(missing, [],
     `前端会调、但 Rust 没注册的命令（调到就报错，且只有运行时才看得出来）：${missing.join(", ")}`);
+});
+
+test("发给上游的请求一律走 SSE——同步请求在中转那边是整段生成完才回", () => {
+  // 用户实拍：中转（Sub2API）控制台里请求类型大多写着"同步"，只有一行"流式"。
+  // 网关日志侧量到的正是那个形状：upstream_header_ms 8~40 秒，而
+  // first_upstream_chunk_after_headers_ms 恒为 0（headers 一到正文就全在）。
+  // 同一个 API 在 Claude Code / Codex 里飞快，就是因为那边是真流式。
+  //
+  // 一处漏改不会报错，只会表现成"这条路径特别慢"，所以按结构扫两棵源码树。
+  const roots = [
+    join(HERE, "..", "src-tauri", "src"),
+    join(HERE, "..", "..", "server", "src"),
+  ];
+  const offenders = [];
+  for (const root of roots) {
+    for (const name of readdirSync(root)) {
+      if (!name.endsWith(".rs")) continue;
+      const text = readFileSync(join(root, name), "utf8");
+      text.split("\n").forEach((line, i) => {
+        if (/"stream"\s*:\s*false/.test(line)) offenders.push(`${name}:${i + 1}`);
+      });
+    }
+  }
+  assert.deepEqual(offenders, [],
+    "这些出站请求还是同步的——中转会等整段生成完才回，用户那边就是干等：" + offenders.join(", "));
 });
 
 test("harness 的编排信封两侧必须是同一个字面量，否则「谁在说话」就量不出来", () => {
