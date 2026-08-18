@@ -4295,6 +4295,21 @@ pub fn free_points_needed(micro_usd: i64) -> i64 {
     milli_points_for_micro_usd(micro_usd).max(1)
 }
 
+/// 准入门该问的问题：**这一次调用**免费池付得起吗——不是"池子里还剩不剩一点"。
+///
+/// 结算是全额扣或一点不扣（见 `bill()` 的 free 分支：`cur.avail >= want` 才减，否则
+/// 一分不动）。于是 `balance > 0` 和结算问的不是同一件事：按次计费的免费模型每次 60
+/// 毫点，池里剩 40 时结算一点都不扣，余数就永远挂在那儿直到明天日切——而门看到 40 > 0
+/// 仍然放行，`admit_billing` 一路 `return Ok(true)`，它后面的"改走会员额度/钱包"和两条
+/// 402 整段不可达。后果是双向的：用户要的"免费用完接着扣余额和订阅"到不了；没有余额
+/// 的用户也永远收不到 402，欠款无上限地记进钱包。
+///
+/// 按次费用在准入时就是确定的，直接拿它比。按量计费的免费模型在上游回话之前算不出成本，
+/// `free_points_needed(0)` 退到地板 1，等价于旧的 `> 0` —— 那一类不引入任何行为变化。
+pub fn free_pool_covers_call(balance: i64, per_call_micro_usd: i64) -> bool {
+    balance >= free_points_needed(per_call_micro_usd)
+}
+
 /// 三个准入口（chat / chat_completions / responses）共用的判定。
 ///
 /// 分开写过一次，代价是同一个免费模型从 IDE 能用、从走 /v1/responses 的客户端被判成
@@ -5942,7 +5957,16 @@ pub async fn chat_completions(
     // connection; if ANY route that could serve this request bills from the pool, the pool is
     // what must have room.
     let free_here = candidates.iter().any(|c| effective_billing(c, &model_id).2);
-    let free_pool_has_room = free_here && free_points_balance(&state, uid).await > 0;
+    // 取最便宜的那条免费线路的单次费用——和上面 `any` 同一个口径：只要有一条免费线路
+    // 付得起，就还算"免费池能付"。0 = 按量计费，free_pool_covers_call 会退到地板 1。
+    let free_call_micro = candidates
+        .iter()
+        .filter(|c| effective_billing(c, &model_id).2)
+        .map(|c| effective_billing_micro(c, &model_id).3)
+        .min()
+        .unwrap_or(0);
+    let free_pool_has_room = free_here
+        && free_pool_covers_call(free_points_balance(&state, uid).await, free_call_micro);
     admit_billing(
         free_fallback_to_paid(), free_here, free_pool_has_room, quota_ok, credits,
         plan_active, q_total, q_window, q_weekly_cap, q_week_used,
@@ -7131,7 +7155,11 @@ pub async fn responses_proxy(
     // 能用，从任何走 /v1/responses 的客户端就被判成"请先开通会员或充值额度"。同一份后台配置，
     // 两个接口两种结果。
     let free_here = effective_billing(&conn, &model_id).2;
-    let free_pool_has_room = free_here && free_points_balance(&state, uid).await > 0;
+    let free_pool_has_room = free_here
+        && free_pool_covers_call(
+            free_points_balance(&state, uid).await,
+            effective_billing_micro(&conn, &model_id).3,
+        );
     admit_billing(
         free_fallback_to_paid(), free_here, free_pool_has_room, quota_ok, credits,
         plan_active, q_total, q_window, q_weekly_cap, q_week_used,
@@ -8038,6 +8066,42 @@ mod billing_tests {
     /// 之前是硬 402：免费池见底那一刻，免费模型既扣不到钱也不再让用，而用户的钱包和
     /// 会员额度明明还有。开关关掉时回到老行为。
     #[test]
+    #[test]
+    /// 准入门问的问题，必须和结算答的问题是同一个。
+    ///
+    /// 结算全额扣或一点不扣；门却只看 `balance > 0`。于是按次计费的免费模型（60 毫点/次）
+    /// 在池里剩 40 时：结算一分不扣，余数挂到明天日切，而门看到 40 > 0 一路放行——
+    /// `admit_billing` 直接 `return Ok(true)`，它后面的"改走会员额度/钱包"和两条 402
+    /// 整段不可达。用户要的"免费用完接着扣余额和订阅"到不了，没余额的用户也永远收不到
+    /// 402，欠款无上限地记进钱包。
+    fn admission_asks_the_same_question_settlement_answers() {
+        // 每次 60 毫点的免费模型：$0.003 = 3000 micro-USD，按 50 micro-USD/毫点换算正好 60。
+        let per_call_micro = 3_000;
+        assert_eq!(super::free_points_needed(per_call_micro), 60, "换算口径变了，这条要重算");
+
+        assert!(super::free_pool_covers_call(60, per_call_micro), "刚好够要放行");
+        assert!(super::free_pool_covers_call(61, per_call_micro));
+        assert!(
+            !super::free_pool_covers_call(40, per_call_micro),
+            "池里 40 而这次要 60：结算一分不扣，门就不能说「免费池能付」——\
+             这正是余数永远清不空、402 整段不可达的那条路"
+        );
+        assert!(!super::free_pool_covers_call(0, per_call_micro));
+
+        // 按量计费的免费模型在上游回话前算不出成本，退回地板 1 —— 等价于旧的 `> 0`，
+        // 那一类的行为一个字节都不变。
+        assert!(super::free_pool_covers_call(1, 0));
+        assert!(!super::free_pool_covers_call(0, 0));
+
+        // 接上门本身：池子盖不住这一次 → 有会员额度就该改走付费，没有就该 402。
+        let admit = |room: bool, quota: bool, credits: i64| {
+            super::admit_billing(true, true, room, quota, credits, quota, 100, 100, 0, 0)
+        };
+        assert_eq!(admit(false, true, 0).ok(), Some(false), "盖不住时要落到付费路径");
+        assert!(admit(false, false, 0).is_err(), "既盖不住又没付费资源，必须 402");
+        assert_eq!(admit(true, false, 0).ok(), Some(true), "盖得住仍由免费池付");
+    }
+
     fn free_pool_exhaustion_falls_back_to_paid_balances() {
         // 池子还有 → 由池子付
         let ok = |r: Result<bool, super::AppError>| match r {
