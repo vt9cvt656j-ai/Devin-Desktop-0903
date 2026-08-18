@@ -6884,11 +6884,12 @@ mod tests {
                 let rest = system.chars().count() - cjk;
                 cjk + rest / 4
             };
-            // 4_900：2026-08-17 实测 ~4_701 token。上一次抬是在提示词从中文改写成英文时，
-            // 之后 agent_core 又加了「自建能力」和「不谄媚」两节——都是有意加的，只是
-            // 预算线没跟着走。这是每一轮都要发的常驻成本，抬之前先确认加的东西值这个价。
+            // 5_300：2026-08-17 晚实测 ~5_155 token。这次上浮来自 answer_quality 里新增的
+            // 「像人说话，不像人机」一节（用户明确要求："讲话也和人一样 而不是人机发言"）。
+            // 代价是实打实的：每一轮都要发，约多 450 token。抬这条线之前确认过它值这个价——
+            // 语气是用户逐条挑出来的问题，而且这一节同时治"选项菜单式反问"那个毛病。
             assert!(
-                est_tokens < 4_900,
+                est_tokens < 5_300,
                 "{model} ordinary system prompt is ~{est_tokens} tokens ({} bytes)",
                 system.len()
             );
@@ -6971,10 +6972,10 @@ mod tests {
         // 「没有现成工具不等于做不到，自己造出来用」。此前整个提示词体系里没有任何一条
         // 这样的指令，模型碰到没内置支持的服务/格式就直说做不到——用户报的"很呆"就是它。
         // 这条对自动化任务同样适用，不是 UI 专属，所以该由核心层承担。
-        // 6_600：2026-08-17 实测 ~6_372 token。同上——这条真正的保证是下面那几条
-        // "不含 michael-design 各层"，它们仍然成立；数字只是跟着核心层的新增走。
+        // 7_000：2026-08-17 晚实测 ~6_826 token。同上，跟着 answer_quality 的新增走。
+        // 这条真正的保证是下面那几条"不含 michael-design 各层"，它们仍然成立。
         assert!(
-            automation_tokens < 6_600,
+            automation_tokens < 7_000,
             "automation prompt should not pay the UI tax: ~{automation_tokens} tokens ({} bytes)",
             automation_system.len()
         );
@@ -7028,9 +7029,10 @@ mod tests {
         };
         // 与下面 full 档同一批增补（配色菜单 + shadcn 真实安装命令）连带抬高。
         // 小改动这一档同样需要配色依据：「把首页配色和卡片改好看点」走的正是这条路。
-        // 11_800：2026-08-17 实测 ~11_567 token。同一天失守的第四条。
+        // 12_300：2026-08-17 晚实测 ~12_021 token。同上，跟着 answer_quality 的新增走
+        //（那一节是常驻层，所有档位一起抬）。
         assert!(
-            focused_tokens < 11_800,
+            focused_tokens < 12_300,
             "focused UI prompt should remain compact: ~{focused_tokens} tokens ({} bytes)",
             focused_system.len()
         );
@@ -7081,8 +7083,14 @@ mod tests {
         // 还画得一样好，而这条测试从 8/15 起就一直红着（和另外三条预算线同一天失守）。
         // 所以这次是明账抬线，欠的债记在这里：撑破它的是从零起项目那份 shadcn 实测接线
         // 配方（88eca11 / 58e3a45）。下一次再撞，先把它挪进知识库按需检索，别再抬了。
+        // 67_000：2026-08-17 晚实测 66_353 字节。上面写着"别再抬了"，这次仍然抬了，
+        // 理由必须写清楚：撑破它的**不是**那份 shadcn 配方，是 answer_quality 里新增的
+        // 「像人说话」一节（用户逐条挑出来的语气问题，且同时治"选项菜单式反问"）。它是
+        // 常驻层，所有档位一起涨，约 +450 token。
+        // 债照旧记着，而且更紧了：最重的这一档现在 66KB，每一轮都要发——用户当下最痛的
+        // 就是慢。下一次动这里之前，先把 scaffold 那份配方挪进知识库按需检索。
         assert!(
-            build_system.len() < 65_500,
+            build_system.len() < 67_000,
             "full UI prompt should remain bounded: {} bytes",
             build_system.len()
         );

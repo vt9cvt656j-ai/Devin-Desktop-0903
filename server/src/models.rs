@@ -1048,6 +1048,58 @@ fn json_object_from_model_text(text: &str) -> Option<serde_json::Value> {
     serde_json::from_str(&s[start..=end]).ok()
 }
 
+/// 把上游返回的 body 解成 `(文本, usage)`——SSE 和普通 JSON 都认。
+///
+/// 为什么这里也要改流式：中转（Sub2API 这类）对**同步**请求是整段生成完才回，用户控制台
+/// 里这些请求的类型写着"同步"，而本网关日志侧量到的 upstream_header_ms 是 8~40 秒、
+/// first_upstream_chunk_after_headers_ms 恒为 0——正是那个形状。
+///
+/// usage 必须一起捞回来：视觉那条路径要靠它计费，丢了就是**按 0 结账**（本文件里另有一段
+/// 注释记着这条路曾经被白嫖过）。SSE 的 usage 在最后一帧，所以请求侧要带
+/// `stream_options.include_usage = true`，这里取最后见到的那个。
+fn text_and_usage_from_body(body: &str) -> (String, Option<serde_json::Value>) {
+    let mut text = String::new();
+    let mut usage: Option<serde_json::Value> = None;
+    let mut saw_frame = false;
+    for line in body.lines() {
+        let Some(data) = line.trim().strip_prefix("data:") else {
+            continue;
+        };
+        let data = data.trim();
+        if data == "[DONE]" {
+            saw_frame = true;
+            continue;
+        }
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(data) else {
+            continue;
+        };
+        saw_frame = true;
+        if let Some(t) = v["choices"][0]["delta"]["content"].as_str() {
+            text.push_str(t);
+        } else if v["type"] == "content_block_delta" {
+            if let Some(t) = v["delta"]["text"].as_str() {
+                text.push_str(t);
+            }
+        }
+        if v.get("usage").map(|u| !u.is_null()).unwrap_or(false) {
+            usage = v.get("usage").cloned();
+        }
+    }
+    if saw_frame {
+        return (text, usage);
+    }
+    // 中转无视了 stream:true，回的是普通 JSON。没有这条兜底，那些线路会整个失效。
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(body) {
+        let t = v.pointer("/choices/0/message/content")
+            .and_then(|x| x.as_str())
+            .or_else(|| v.pointer("/content/0/text").and_then(|x| x.as_str()))
+            .unwrap_or("")
+            .to_string();
+        return (t, v.get("usage").cloned());
+    }
+    (String::new(), None)
+}
+
 fn i18n_pack_payload(
     model_id: &str,
     source_locale: &str,
@@ -1057,7 +1109,9 @@ fn i18n_pack_payload(
     json!({
         "model": model_id,
         "temperature": 0.1,
-        "stream": false,
+        // SSE：同步请求在中转那边是整段生成完才回，见 text_and_usage_from_body 上的注释。
+        "stream": true,
+        "stream_options": { "include_usage": true },
         "messages": [
             {
                 "role": "system",
@@ -1136,13 +1190,11 @@ async fn i18n_pack_from_model(
             safe_upstream_error_excerpt(&text)
         ));
     }
-    let data: serde_json::Value = serde_json::from_str(&text)
-        .map_err(|_| format!("{} / {} 返回非 JSON", m.label, model_id))?;
-    let content = data
-        .pointer("/choices/0/message/content")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-    let parsed = json_object_from_model_text(content)
+    let (content, _usage) = text_and_usage_from_body(&text);
+    if content.trim().is_empty() {
+        return Err(format!("{} / {} 返回空内容", m.label, model_id));
+    }
+    let parsed = json_object_from_model_text(&content)
         .ok_or_else(|| format!("{} / {} 没有返回可解析语言包 JSON", m.label, model_id))?;
     let raw = parsed
         .get("translations")
@@ -2920,7 +2972,13 @@ async fn vision_preprocess(state: &AppState, uid: uuid::Uuid, body: &mut serde_j
             "text": "请详细、客观地描述这些图片的全部内容（文字、数据、图表、代码、界面元素、布局、配色等），让一个无法读图的模型也能据此完成工作。只输出描述本身。"
         })];
         vcontent.extend(images.clone());
-        let payload = json!({ "model": "gpt-5.5", "messages": [{ "role": "user", "content": vcontent }], "stream": false });
+        // SSE + include_usage：usage 必须一起回来，这条路径要靠它计费（丢了就是按 0 结账）。
+        let payload = json!({
+            "model": "gpt-5.5",
+            "messages": [{ "role": "user", "content": vcontent }],
+            "stream": true,
+            "stream_options": { "include_usage": true }
+        });
         if let Ok(client) = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(90))
             .build()
@@ -2933,7 +2991,12 @@ async fn vision_preprocess(state: &AppState, uid: uuid::Uuid, body: &mut serde_j
                 .send()
                 .await
             {
-                if let Ok(d) = r.json::<serde_json::Value>().await {
+                if let Ok(_body) = r.text().await {
+                    let (_vtext, _vusage) = text_and_usage_from_body(&_body);
+                    let d = json!({
+                        "choices": [{ "message": { "content": _vtext } }],
+                        "usage": _vusage,
+                    });
                     /*
                      * 立刻结账，**在返回之前**。
                      *
@@ -7647,6 +7710,39 @@ pub async fn image_generations(
 
 #[cfg(test)]
 mod billing_tests {
+
+    /// SSE 拼文本 + 捞 usage。usage 丢了这条路径就是按 0 结账。
+    #[test]
+    fn sse_body_yields_text_and_usage() {
+        let body = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"你好\"}}]}\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"世界\"}}]}\n",
+            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":11,\"completion_tokens\":7}}\n",
+            "data: [DONE]\n",
+        );
+        let (text, usage) = super::text_and_usage_from_body(body);
+        assert_eq!(text, "你好世界");
+        assert_eq!(usage.unwrap()["prompt_tokens"], 11);
+    }
+
+    /// 原生 Anthropic 帧也要认——网关对 Claude 路由用的就是这种形状。
+    #[test]
+    fn sse_body_reads_native_anthropic_frames() {
+        let body = concat!(
+            "data: {\"type\":\"content_block_delta\",\"delta\":{\"text\":\"ab\"}}\n",
+            "data: [DONE]\n",
+        );
+        assert_eq!(super::text_and_usage_from_body(body).0, "ab");
+    }
+
+    /// 中转无视 stream:true 直接回 JSON 时按普通补全解析——没有兜底那些线路会整个失效。
+    #[test]
+    fn plain_json_body_still_parses() {
+        let body = r#"{"choices":[{"message":{"content":"ok"}}],"usage":{"prompt_tokens":3}}"#;
+        let (text, usage) = super::text_and_usage_from_body(body);
+        assert_eq!(text, "ok");
+        assert_eq!(usage.unwrap()["prompt_tokens"], 3);
+    }
     use super::{
         anthropic_beta_header, anthropic_effort_word, anthropic_thinking, anthropic_to_oai,
         oai_to_anthropic_with_cache, chat_upstream_attempt_suffix,
