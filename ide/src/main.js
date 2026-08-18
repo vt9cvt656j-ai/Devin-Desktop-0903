@@ -13709,10 +13709,19 @@ function _nativeWindowsFor(modelId) {
 function _ctxSnapToOpenChoice(modelId, stored) {
   const want = Math.max(0, Math.round(Number(stored) || 0));
   if (!want) return 0;
+  // **收窄永远算数，不需要任何资格。** 比默认窗口更小的选择是纯粹的成本旋钮，任何时候都
+  // 交付得了。上一版少了这一条，于是存着的 200k（在一个 1M 模型上）既不在选项表里、
+  // 又没有更小的可选档，fits 为空返回 0，而 0 被 _ctxChoiceFor 翻译成"没选过" → 满窗 1M。
+  // 用户明明调窄了，读数却被放大 5 倍，而且永不自愈、界面不给任何提示。
+  // v1 记录迁移过来正好会造出这条坏记录。
+  const dflt = _ctxNativeDefault(modelId);
+  if (want <= dflt) return want;
   const open = _ctxChoiceOptions(modelId).filter((o) => !o.locked).map((o) => Math.round(o.value));
   if (open.includes(want)) return want;
+  // 放宽超出当前买得到的范围时才向下吸附；一个都不剩就退回默认窗口（不是 0——0 会被
+  // 上层当成"没选过"）。
   const fits = open.filter((v) => v > 0 && v <= want);
-  return fits.length ? Math.max(...fits) : 0;
+  return fits.length ? Math.max(...fits) : dflt;
 }
 function _ctxChoiceFor(modelId) {
   const rec = _ctxChoiceRecord(modelId);
@@ -13751,15 +13760,11 @@ function _ctxChoiceOptions(modelId) {
   // list — an older gateway, or a third-party direct connection with no catalogue at all.
   const listed = (_modelCatalogEntry(modelId)?.contextWindows || []).filter((w) => w.tokens > 0);
   const natives = listed.length ? listed : [{ tokens: native, beta: null }];
-  // 拿不到的原生窗口要锁掉，不能只是"选了之后被夹回去"——那又是一次"显示的和用的不一样"。
-  // 判据和 _ctxNativeCeiling 同一条：网关只会替你去要带 beta 标记的窗口。
-  const reach = _ctxNativeCeiling(modelId);
+  // 原生档一律可选。上一版按 beta 标记锁掉"够不着的"，而那个判据是错的（见 _ctxNativeCeiling）：
+  // 线上目录一条 beta 都没有，于是除默认档外全被锁死，滑块只剩一格 —— 用户报的"拖不动"。
   const opts = natives.map((w) => ({
-    value: w.tokens, label: _tokenShort(w.tokens), locked: w.tokens > reach, native: true, kind: "native",
+    value: w.tokens, label: _tokenShort(w.tokens), locked: false, native: true, kind: "native",
     beta: w.beta || null,
-    lockHint: w.tokens > reach
-      ? `目录里有别家端点提供 ${_tokenShort(w.tokens)}，但这条连接不会去申请它——选中只会让本地按一个拿不到的窗口做预算`
-      : "",
   }));
   // Every tier is DISPLAYED regardless of membership; only those the membership grants are
   // selectable. Locked tiers say what would unlock them instead of silently hiding.
@@ -13791,17 +13796,19 @@ function _ctxChoiceOptions(modelId) {
  * 分开之后：没选过 = 默认窗口（真实生效的那个）；选过 = 用户点的那个，仍按最宽夹住。
  */
 function _ctxNativeCeiling(modelId) {
-  // 目录里的 context_windows 是"这个模型在各家端点上出现过的窗口"，不是"本连接给得到的"。
-  // 网关只会主动去要**带 beta 标记**的那几个（server/src/models.rs 的 wants_1m 无条件带上
-  // context-1m 头），客户端连"我要多大窗口"这个字段都不发。把不带标记的更宽条目当上限，
-  // 等于让用户拖一下滑块就把裁剪预算调成真实窗口的十倍（glm-5.2 默认 96,890，目录里另有
-  // 1.0M），历史按拿不到的窗口留，最后在上游炸成 context-length 400。
-  const dflt = _ctxNativeDefault(modelId);
-  const unlockable = (_modelCatalogEntry(modelId)?.contextWindows || [])
-    .filter((w) => w?.beta)
-    .map((w) => Math.round(Number(w?.tokens) || 0))
-    .filter((n) => n > 0);
-  return Math.max(dflt, ...unlockable);
+  // 用户显式选择时的夹取上限 = 目录列出的最宽原生窗口。
+  //
+  // 这里**曾经**拿 `beta` 标记当"够不够得着"的判据，理由是"网关只替带 beta 的窗口去申请"。
+  // 那个判据是错的，而且错得很彻底：线上目录 29 个模型里**一条 beta 都没有**（context_beta_header
+  // 只对 sonnet-4 返回 Some，而目录里根本没有 sonnet-4），网关的 wants_1m 判的又是
+  // `tokens >= 1M`、压根不看 beta。于是 ceiling 恒等于默认窗口，glm-5.2 的 202.8k/262.1k/
+  // 512k/1.0M 四档和 deepseek 的 1.0M 全被锁死 —— 客户端锁掉了网关本来给得到的窗口，
+  // 用户看到的就是"滑块只有一格、拖了没反应"。
+  //
+  // 客户端没有任何途径知道这条连接真正能拿到多宽（那需要网关回报实际窗口，见 TODO）。
+  // 在不知道的前提下，**用户显式点的那一档就是他要的**：收窄永远安全，放宽也不该由一个
+  // 猜错的判据替他否决。
+  return Math.max(_modelContextLimit(modelId), _nativeWindowsFor(modelId)[0] || 0);
 }
 function _ctxNativeDefault(modelId) {
   return Math.max(1, Math.round(Number(_modelContextLimit(modelId)) || 0));
@@ -15285,15 +15292,26 @@ function showModelInfoCard(m, anchorEl) {
     _bindMicSlider(ctxSl, (want, commit) => {
       let at = want;
       if (ctxOpts[at]?.locked) {
-        let open = -1;
-        ctxOpts.forEach((o, i) => { if (!o.locked) open = i; });
-        at = Math.max(0, open);
+        // 弹到**最近**的未锁档。上一版取的是最后一个未锁下标（也就是最大的那一档）：
+        // 用户想在 glm-5.2 上选 202,752，手一滑碰到锁住的刻度，写进去的却是 5,096,890
+        // ——25 倍，而且方向正好相反。
+        let nearest = -1;
+        ctxOpts.forEach((o, i) => {
+          if (o.locked) return;
+          if (nearest < 0 || Math.abs(i - want) < Math.abs(nearest - want)) nearest = i;
+        });
+        at = Math.max(0, nearest);
         showToast(ctxOpts[want]?.lockHint || "该档位需更高会员");
       }
       const o = ctxOpts[at];
       // commit=false 是拖动途中，只回读数不落盘——每像素写一次 localStorage 会把
       // 界面顿住好几秒。
-      if (o && commit) _setCtxChoice(m.id, o.value, o.kind === "native" ? "native" : "modified");
+      if (o && commit) {
+        _setCtxChoice(m.id, o.value, o.kind === "native" ? "native" : "modified");
+        // 选完立刻重画仪表。少了这一步，分母已经变了而圆环要等到下一次按键或切标签页
+        // 才跟上 —— 用户拖完看不到任何变化，只会认为"滑动切换没用"。
+        try { _refreshContextMeterFromDraft({ force: true }); } catch {}
+      }
       return { index: at, valueLabel: o?.valueLabel || "" };
     });
   }
@@ -17239,6 +17257,11 @@ function _sessionPersistFingerprint(s) {
       history.length, pending.length, String(lastPending.text || "").length,
       Array.isArray(s?._planSteps) ? s._planSteps.map((p) => p?.status).join(",") : "",
       demands.length, thinks.length, (thinks[thinks.length - 1] || {}).turn ?? "",
+      // 上下文读数也要进指纹。它是这条会话里**唯一无法本地重算**的数（只有上游报得出来），
+      // 而只有它变了、会话内容没变时，指纹不变 → checkpoint 走缓存 → 落盘的对象里根本没有
+      // ctxFloor。读写点各有两个、四条路都是通的，漏的是它们上面这层缓存：重启之后仪表回到
+      // 空白，而那个数是重算不出来的。
+      Number(s?._ctxRealFloor?.total) || 0, String(s?._ctxRealFloor?.requestId || ""),
       String(last.role || "") + ":" + (typeof last.content === "string" ? last.content.length : 0),
       _intentJson, _lastRunJson,
     ].join("\u0001");
@@ -17949,6 +17972,15 @@ function _contextMeterSnapshot(input = {}) {
   // 把一个正常工作的功能显示成没工作。档位现在进 tooltip —— 那才是"我的 5M 到底开没开"
   // 该被回答的地方，而且旁边就是真实用量，比一个孤零零的大数字有用。
   const limit = Math.max(1, Number(input.limit) || _contextMeterLimit(model));
+  // 这个分母是上游给的，还是客户端按模型名猜的？
+  //
+  // 目录里查不到窗口的模型（实测 glm-5.3：OpenRouter 没收录，后台的 model_caps_override
+  // 也没填），_fallbackModelContextLimit 会按名字正则给一个数（/qwen|glm/ → 128k）。
+  // 拿它当分母算出"91%、接近满载"，看上去和真实读数一样确定，其实是猜的 —— 而用户刚说过
+  // 「全部都走真实的」。所以标出来：数照给（不给分母就没法裁剪历史），但别冒充真值。
+  const windowReported = (() => {
+    try { return Number(_modelCatalogEntry(model)?.contextLimit) > 0; } catch { return false; }
+  })();
   const tierLimit = Math.max(0, Number(_effectiveContextLimit(model)) || 0);
   const prompt = Math.max(0, Math.round(Number(input.promptTokens ?? input.prompt_tokens ?? input.prompt ?? 0) || 0));
   const completion = Math.max(0, Math.round(Number(input.completionTokens ?? input.completion_tokens ?? input.completion ?? 0) || 0));
@@ -17962,6 +17994,7 @@ function _contextMeterSnapshot(input = {}) {
   const pct = Math.max(0, Math.min(999, Math.round((total / limit) * 100)));
   return {
     prompt, completion, cached, cacheWrite, total, pct, limit, tierLimit, model,
+    windowReported,
     estimated: input.estimated !== false,
     source: String(input.source || (input.estimated === false ? "usage" : "estimate")),
     anyReal: input.estimated === false || !!input.anyReal,
@@ -18187,14 +18220,24 @@ function _recordUsage(ev, opts = {}) {
     // reading for this same request already landed and is exact; keeping the larger of the two
     // is what stops this later, blunter copy from walking the meter backwards.
     const cacheWrite = Number(ev.cacheCreationTokens ?? ev.cache_creation_tokens) || 0;
-    _applyContextReading(opts.session, {
-      input: _contextInputTokens({ prompt: pin, cacheRead: hasCacheInfo ? cached : null, cacheWrite }),
-      output: out,
-      cacheRead: hasCacheInfo ? cached : null,
-      cacheWrite,
-      model: String(ev.model || ""),
-      requestId: String(opts.requestId || ev.requestId || ""),
-    });
+    // 结算这一份是**更钝**的拷贝：它把两种上游形状合并进同一个 cached_tokens 列，
+    // 已经证明不了是哪种形状产生的。同 requestId 时上面的"保大值"能挡住它，但跨 requestId
+    // 挡不住 —— 只要某一轮的流式 usage 没到（用户按了停、断线、上游末帧不带 usage），
+    // 晚到的结算就会带着一个新 requestId 和 prompt=2 把 123,567 顶成 518，而且**存进盘里**，
+    // 重启读回来还是 518。所以：结算只许把读数抬上去，不许压下去。
+    // 真正的收缩（网关压缩掉了历史）由流式那一侧上报，它知道自己是什么形状。
+    const _settleInput = _contextInputTokens({ prompt: pin, cacheRead: hasCacheInfo ? cached : null, cacheWrite });
+    const _settleTotal = Math.max(0, _settleInput) + Math.max(0, out);
+    if (_settleTotal >= (Math.max(0, Number(opts.session._ctxRealFloor?.total) || 0))) {
+      _applyContextReading(opts.session, {
+        input: _settleInput,
+        output: out,
+        cacheRead: hasCacheInfo ? cached : null,
+        cacheWrite,
+        model: String(ev.model || ""),
+        requestId: String(opts.requestId || ev.requestId || ""),
+      });
+    }
     if (opts.session === _currentSession()) _setContextMeterFromReading(opts.session._ctxRealFloor, 0);
   } catch { /* never let accounting break a turn */ }
 }
@@ -18670,6 +18713,11 @@ function _renderTokenMeter() {
   // the 来源 line already said, and a box wide enough to cover the conversation behind it.
   // Line one is the whole answer; everything below it is detail for someone who wants it.
   const lines = [`上下文 ${_tokenExact(state.total)} / ${k(state.limit)} · ${pct}%`];
+  // 分母是猜的就得说出来，否则 91% 看上去和真实读数一样确定。后台把 model_caps_override
+  // 填上（或目录收录了这个模型），这一行自动消失。
+  if (state.windowReported === false && state.total > 0) {
+    lines.push(`窗口未上报 · ${k(state.limit)} 是按模型名推的，百分比仅供参考`);
+  }
   if (state.estimated) {
     lines.push("本地估算 · 供应商尚未上报本轮用量");
   } else if ((state.prompt || 0) > 0 || (state.completion || 0) > 0) {
@@ -41312,7 +41360,13 @@ async function _agentModelTurn({ config, messages, toolSchemas, toolRegistry = n
       //
       // 现在的规则只有一条：**没有真数就不画数**。有上一份真实读数就原样留着（它是这一刻
       // 唯一成立的事实），一次都还没上报过就如实说"尚未上报"，而不是拿一个算出来的数顶上。
-      if (Number(session?._ctxRealFloor?.total) > 0) {
+      // 只画**当前这个标签页**的。少了这道门：后台标签页起一轮会把它的读数画到你正看着的
+      // 标签页上；而一个还没上报过的会话起步，会把你眼前的真实读数顶成 pending/0。
+      // 记账那一侧（_recordUsage / _recordStreamUsage）早就有这道门，这里漏了。
+      const _ctxPaintable = typeof _currentSession === "function" ? session === _currentSession() : true;
+      if (!_ctxPaintable) {
+        /* 别的标签页的事，不动这里的仪表 */
+      } else if (Number(session?._ctxRealFloor?.total) > 0) {
         _setContextMeterFromReading(session._ctxRealFloor, 0);
       } else {
         _setContextMeter({ promptTokens: 0, completionTokens: 0, cachedTokens: null, estimated: true, source: "pending" });
