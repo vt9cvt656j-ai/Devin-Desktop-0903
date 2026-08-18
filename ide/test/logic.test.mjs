@@ -27754,3 +27754,73 @@ test("自动改重复标点不许碰别的语言的合法语法", () => {
     assert.match(tbl, pat, why);
   }
 });
+
+test("会删东西的 find 不许被判成只读命令，批量删除必须弹确认", () => {
+  // 只读判定在审批链里排在 mustAsk **前面**并直接 return true，所以一旦某条命令被判成
+  // 只读，它连「改动前审批」都绕得过去——用户自己打开的闸对它无效。而 find 的动作谓词
+  // 就长在参数里（-delete / -exec / -ok / -fprint），白名单原来那句「参数不含 ; & | < > 反引号
+  // 就算安全」对它根本不成立。再加上 shell 删除不进 checkpoint，「全部撤销」也救不回来。
+  const roSrc = SRC.slice(SRC.indexOf("function _looksLikeReadOnlyCommand"));
+  const roBody = roSrc.slice(0, roSrc.indexOf("\nfunction "));
+  const isReadOnly = new Function("command", roBody.slice(roBody.indexOf("{") + 1, roBody.lastIndexOf("}")).replace(/_looksLikeReadOnlyCommand/g, "arguments.callee") + "");
+  // 直接用源码里的谓词判据做断言，避免把整个递归函数搬进沙箱。
+  assert.match(roSrc, /const findIsDestructive = \(segment\) =>/,
+    "find 的破坏性谓词判断没了——-delete / -exec 会重新被当成只读命令");
+  assert.match(roSrc, /-\(\?:delete\|exec\|execdir\|ok\|okdir\|fls\|fprint\|fprintf\)/,
+    "破坏性谓词名单不完整");
+  assert.match(roSrc, /!findIsDestructive\(segment\) &&/,
+    "谓词判断没有真正接到 segmentOk 上——写了等于没写");
+  void isReadOnly;
+
+  // auto 模式下唯一会弹确认框的是 _DANGEROUS_CMD_RE，批量不可逆删除必须在里面。
+  const m = /const _DANGEROUS_CMD_RE = (\/.*\/i);/.exec(SRC);
+  assert.ok(m, "找不到 _DANGEROUS_CMD_RE");
+  const RE = eval(m[1]);
+  for (const cmd of [
+    "find . -name '*.js' -delete",
+    "find . -type f -exec rm -rf {} +",
+    "git clean -xfd",
+    "git clean -f -d",
+    "rm -rf .",
+    "rm -rf ~/Documents",
+  ]) {
+    assert.ok(RE.test(cmd), `批量不可逆删除没有被标成危险，auto 模式下会静默执行：${cmd}`);
+  }
+  // 反向：日常操作不能被误报，否则确认框常亮、然后就没人看了。
+  for (const cmd of ["find . -name '*.ts'", "rm -rf node_modules", "git clean -n", "git status", "ls -la"]) {
+    assert.ok(!RE.test(cmd), `日常操作被误报成危险，确认框会变成噪声：${cmd}`);
+  }
+});
+
+test("edit_file 的空白容错不许把 Python 代码块挪进/挪出一层缩进", () => {
+  // _recoverEditMatch 有两条容错路径，安全等级不同：
+  //   lineWise   —— 归一化后逐行比对；曾经带一个 `(s) => s.trim()`，把**行首缩进**也剥掉
+  //   indentNorm —— 校验「每行缩进差值一致」，一致才返回公共前缀让调用方补回去
+  // 调用方是 `if (rec.indent) _editReplacement = _reindentReplacement(...)`，
+  // 所以不返回 indent 就等于按模型自己的缩进写入。lineWise 排在 indentNorm 前面先 return，
+  // 于是那套防护被整个绕过：模型缩进错一级也"匹配成功"，写进去的代码被静默挪进/挪出
+  // 一层 if——Python/YAML 语法仍然合法，语义变了，没有任何报错。
+  const src = SRC.slice(SRC.indexOf("function _recoverEditMatch(text, needle)"));
+  const body = src.slice(0, src.indexOf("\n/// 给 new_string"));
+  // 断言钉在**实现**上，不能钉在"源码里不许出现 s.trim()"——上面那段注释里就引用了
+  // 这个写法，doesNotMatch 会被自己的注释喂到而误红。改成正面断言归一化数组只剩一项。
+  const normArr = /for \(const norm of \[([\s\S]*?)\]\) \{/.exec(body);
+  assert.ok(normArr, "找不到 lineWise 的归一化数组");
+  assert.equal(normArr[1].split("=>").length - 1, 1,
+    "lineWise 的归一化只能有「去行尾空白」一项；带上剥行首缩进的那项会绕过 indentNorm 的安全校验");
+  assert.match(normArr[1], /\[ \\t\]\+\$/,
+    "保留下来的那一项必须是去**行尾**空白");
+
+  // 先切再替换：replace 会改变长度，拿原串的下标去 slice 会切歪，得到一段语法不全的
+  // 函数体，new Function 直接抛 SyntaxError。
+  const fn = new Function("text", "needle",
+    body.slice(body.indexOf("{") + 1, body.lastIndexOf("}")).replace(/_stripLineNoPrefix\(needle\)/, "null"));
+  // 文件里这段在 if 之内（缩进 8），模型给的 old_string 少一级（缩进 4）。
+  const file = ["def run(cfg):", "    if cfg.enabled:", "        total = 0", "        total += 1", "    return total"].join("\n");
+  const needle = ["    total = 0", "    total += 1"].join("\n");
+  const r = fn(file, needle);
+  if (r) {
+    assert.equal(r.indent, "    ",
+      "缩进容错命中却没返回要补回的公共前缀——调用方会按模型的缩进写入，把代码挪出 if");
+  }
+});
