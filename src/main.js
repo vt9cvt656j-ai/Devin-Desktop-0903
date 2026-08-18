@@ -41614,6 +41614,31 @@ function _runFileEvidenceAliases(root, ...paths) {
   return { root: evidenceRoot, entries };
 }
 
+/**
+ * clone 的落地目录：相对路径按工作区根解析成绝对路径。
+ *
+ * 少了这一步，「把这个仓库拉下来」是**必然失败**，一次都成功不了：schema 里 target 不是
+ * 必填（这是对的，不该逼模型编一个目录名），mapper 缺省时按仓库名推断，推出来的是裸名
+ * （github.com/foo/bar → "bar"）；而 Rust 侧 require_inside_workspace 只认绝对路径，
+ * 拿到 "bar" 走"路径不存在"那条分支，base 退化成空串，canonicalize("") 直接报错。
+ * 中间没有任何一环把裸名接到工作区根上——mapper 那句注释写着"落在工作区根下"，
+ * 而它压根拿不到根路径，那一步只能在这里做。
+ *
+ * 返回空串 = 没有工作区可依附且给的是相对路径，调用方要报一句能照做的错，而不是
+ * 把空串继续往下传。
+ */
+function _resolveCloneTarget(target, root) {
+  const t = String(target || "").trim();
+  if (!t) return "";
+  // 绝对路径原样放行。Windows 两种形态都要认：盘符（C:\\ 或 C:/）和 UNC（\\\\server\\share）。
+  if (t.startsWith("/") || /^[A-Za-z]:[\\/]/.test(t) || t.startsWith("\\\\")) return t;
+  const base = String(root || "").trim();
+  if (!base) return "";
+  // 分隔符跟着根路径走：根是 Windows 形态就用反斜杠，免得拼出 C:\\ws/bar 这种混合路径。
+  const sep = /^[A-Za-z]:[\\/]/.test(base) || base.startsWith("\\\\") ? "\\" : "/";
+  return base.replace(/[\\/]+$/, "") + sep + t.replace(/^[\\/]+/, "");
+}
+
 function _gitNonRepoGuidance(root, candidates = [], op = "status", mutating = false) {
   const requested = String(root || "").trim() || "(未打开工作区)";
   const operation = String(op || "status").trim() || "status";
@@ -53484,8 +53509,19 @@ async function _executeToolStepInner(step, call, root, run) {
       try {
         if (isClone) {
           const source = String(call.source || "").trim();
-          const target = String(call.target || "").trim();
-          if (!source || !target) { res.className = "atc-result atc-result--err"; res.textContent = "缺仓库或目标路径"; return { type: "git", path: "clone", content: "[ERROR] git_clone 需要 source 和 target（尚不存在的绝对目录）。" }; }
+          // 推断出来的目录名是裸名，而后端只收绝对路径——不在这儿接上工作区根，
+          // 「把这个仓库拉下来」一次都成功不了（见 _resolveCloneTarget）。
+          const rawTarget = String(call.target || "").trim();
+          const target = _resolveCloneTarget(rawTarget, gitRoot);
+          if (!source || !target) {
+            res.className = "atc-result atc-result--err";
+            res.textContent = !source ? "缺仓库地址" : "无法确定落地目录";
+            // 两种失败要分开说，否则模型收到同一句话、只会把同样的参数再发一遍。
+            const why = !source
+              ? "[ERROR] git_clone 需要 source（仓库地址）。"
+              : `[ERROR] 当前没有打开工作区，无法把相对目录「${rawTarget}」解析成绝对路径。请改传绝对路径作为 target，或先打开一个工作区。`;
+            return { type: "git", path: "clone", content: why };
+          }
           const cloned = await backend.gitClone(source, target);
           res.className = "atc-result atc-result--ok"; res.textContent = "已克隆";
           if (vp) vp.innerHTML = `<pre>${_escHtml(String(cloned || target))}</pre>`;

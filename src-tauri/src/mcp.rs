@@ -2433,9 +2433,11 @@ pub fn restrict_to_current_user(path: &std::path::Path, dir: bool) -> Result<(),
         if who.trim().is_empty() {
             return Err("无法确定当前用户名，未能收紧配置文件权限".into());
         }
-        let out = crate::process_util::resolve_command("icacls")
-            .map(std::process::Command::new)
-            .unwrap_or_else(|| std::process::Command::new("icacls"))
+        // resolve_command 收两个参数、返回 String（找不到就退回原名，本来就是兜底）。
+        // 上一版按 `Option<String>` 用它、还只传了一个参数——两个编译错误，于是整个
+        // Windows 构建都出不来，这道闸门一次都没运行过。
+        let icacls = crate::process_util::resolve_command("icacls", None);
+        let out = std::process::Command::new(icacls)
             .arg(path)
             .arg("/inheritance:r")
             .arg("/grant:r")
@@ -2766,6 +2768,92 @@ async fn disconnect_at(key: SessionKey) -> Result<(), String> {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicBool, Ordering};
+
+    /// `#[cfg(windows)]` 里的代码在 macOS 上**一行都不会被编译**——这是 Windows 构建
+    /// 悄悄坏掉的唯一原因：restrict_to_current_user 里 `resolve_command("icacls")` 少传一个
+    /// 参数、又把返回的 String 当 Option 用（E0061 + E0599），两个错在本机 386 个测试
+    /// 全绿的情况下躺了整整一轮，而 Windows 包根本出不来、那道权限闸门一次都没跑过。
+    ///
+    /// 整个 crate 交叉编译走不通（ring 要 Windows 的 C 头文件），但这两个函数是纯 Rust。
+    /// 把它们的**原文**抠出来，用 windows-msvc 目标单独 `--emit=metadata`（不链接、不碰 C）
+    /// 类型检查一遍。抠原文而不是抄一份，是为了改了实现这里必须跟着动。
+    ///
+    /// 目标没装就跳过（打印原因），不让本机测试因为工具链缺件而红。
+    #[test]
+    fn windows_only_code_actually_compiles_for_windows() {
+        const TARGET: &str = "x86_64-pc-windows-msvc";
+        let installed = std::process::Command::new("rustc")
+            .args(["--print", "target-libdir", "--target", TARGET])
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| std::path::PathBuf::from(String::from_utf8_lossy(&o.stdout).trim().to_string()))
+            .is_some_and(|d| d.exists());
+        if !installed {
+            eprintln!("跳过：没装 {TARGET}（rustup target add {TARGET} 就能开启这条）");
+            return;
+        }
+
+        /// 从 `sig` 开始，按大括号配对取出整个函数的原文。
+        fn grab(src: &str, sig: &str, nth: usize) -> String {
+            let mut from = 0;
+            for _ in 0..nth {
+                from = src[from..].find(sig).expect("找不到函数签名") + from + sig.len();
+            }
+            let at = src[from..].find(sig).expect("找不到函数签名") + from;
+            let open = src[at..].find('{').expect("函数没有左大括号") + at;
+            let (mut depth, bytes) = (0usize, src.as_bytes());
+            for i in open..src.len() {
+                match bytes[i] {
+                    b'{' => depth += 1,
+                    b'}' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            return src[at..=i].to_string();
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            panic!("函数未闭合");
+        }
+
+        let mcp = include_str!("mcp.rs");
+        let putil = include_str!("process_util.rs");
+        // resolve_command 有 unix / windows 两份同名实现，windows 那份是第二个。
+        let resolve = grab(putil, "pub fn resolve_command", 1);
+        assert!(resolve.contains("PATHEXT"), "抓到的不是 windows 版 resolve_command");
+        let restrict = grab(mcp, "pub fn restrict_to_current_user", 0);
+        assert!(restrict.contains("icacls"), "抓到的不是那个函数");
+
+        let harness = format!(
+            "#![allow(dead_code, unused_imports, unused_variables)]\n\
+             mod process_util {{\n{}\n\
+                 pub fn windows_command_is_explicit(c: &str) -> bool {{ c.contains('/') }}\n\
+                 pub fn windows_command_candidates(c: &str, _p: &str) -> Vec<String> {{ vec![c.to_string()] }}\n\
+                 pub fn augmented_path(_w: Option<&str>) -> String {{ String::new() }}\n\
+             }}\n{}\n",
+            resolve.replace("crate::process_util::", "process_util::"),
+            restrict.replace("crate::process_util::", "process_util::"),
+        );
+
+        let dir = std::env::temp_dir().join(format!("mrday-wincheck-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("建临时目录");
+        let src = dir.join("lib.rs");
+        std::fs::write(&src, harness).expect("写临时源码");
+        let out = std::process::Command::new("rustc")
+            .args(["--target", TARGET, "--crate-type", "lib", "--emit=metadata", "-o"])
+            .arg(dir.join("out.rmeta"))
+            .arg(&src)
+            .output()
+            .expect("跑 rustc");
+        let err = String::from_utf8_lossy(&out.stderr).to_string();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            out.status.success(),
+            "Windows 目标下的代码编译不过 —— Windows 包会出不来，而本机测试全绿看不出来：\n{err}"
+        );
+    }
 
     struct SlotDropProbe {
         slot: std::sync::Weak<Mutex<Option<SlotDropProbe>>>,

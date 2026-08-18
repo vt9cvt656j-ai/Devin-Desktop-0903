@@ -24868,6 +24868,45 @@ test("一档都发不出去时交还内置表，不能让用户没档位可选",
   assert.deepEqual(p.levels, base.levels, "把档位清空了，用户没有档位可选");
 });
 
+// ── clone 的落地目录 ──────────────────────────────────────────────────────
+//
+// 「把这个仓库拉下来」曾经是**必然失败**，一次都成功不了：schema 里 target 不必填（对的，
+// 不该逼模型编目录名），缺省时按仓库名推断，推出来是裸名 "bar"；而 Rust 侧只认绝对路径，
+// 拿到 "bar" 走"路径不存在"分支，base 退化成空串，canonicalize("") 直接报错。
+// mapper 的注释写着"落在工作区根下"，可它拿不到工作区根——那一步谁都没做。
+const cloneTarget = load("_resolveCloneTarget");
+
+test("clone 的裸目录名要接到工作区根上，否则后端一律拒收", () => {
+  assert.equal(cloneTarget("bar", "/Users/m/ws"), "/Users/m/ws/bar");
+  assert.equal(cloneTarget("bar", "/Users/m/ws/"), "/Users/m/ws/bar", "根带尾斜杠不能拼出双斜杠");
+  assert.equal(cloneTarget("./bar", "/Users/m/ws"), "/Users/m/ws/./bar");
+});
+
+test("已经是绝对路径的原样放行——三种形态都算绝对", () => {
+  assert.equal(cloneTarget("/abs/where", "/Users/m/ws"), "/abs/where");
+  assert.equal(cloneTarget("C:\\proj\\x", "C:\\ws"), "C:\\proj\\x", "Windows 盘符");
+  assert.equal(cloneTarget("C:/proj/x", "C:\\ws"), "C:/proj/x", "盘符 + 正斜杠也是绝对");
+  assert.equal(cloneTarget("\\\\srv\\share\\r", "C:\\ws"), "\\\\srv\\share\\r", "UNC");
+});
+
+test("分隔符跟着工作区根走，不拼出混合路径", () => {
+  // C:\ws/bar 这种在 Windows 上能用但会一路带到日志和错误信息里，也让后续的前缀比较失手。
+  assert.equal(cloneTarget("bar", "C:\\ws"), "C:\\ws\\bar");
+  assert.equal(cloneTarget("bar", "\\\\srv\\share"), "\\\\srv\\share\\bar");
+});
+
+test("没有工作区又给相对路径时返回空串——调用方要报一句能照做的错", () => {
+  assert.equal(cloneTarget("bar", ""), "", "没有根可依附时不能硬拼出一个假路径");
+  assert.equal(cloneTarget("", "/Users/m/ws"), "");
+  // 执行点必须把「没给仓库地址」和「解析不出目录」分开说：两句一样的话，
+  // 模型只会把同样的参数原样再发一遍。
+  const at = SRC.indexOf("const rawTarget = String(call.target");
+  assert.ok(at > 0, "clone 执行点改写了，这条守卫要跟着改");
+  const block = SRC.slice(at, at + 900);
+  assert.match(block, /_resolveCloneTarget\(rawTarget, gitRoot\)/, "执行点没把裸名接到工作区根上");
+  assert.match(block, /当前没有打开工作区/, "解析失败时要说清为什么，不能只说“缺参数”");
+});
+
 test("上游的 none 映射成本地的 off", () => {
   assert.deepEqual(liveLevels()("gpt-5.4"), ["xhigh", "high", "medium", "low", "off"]);
   assert.equal(liveLevels()("glm-5"), null, "空档位要交还内置表");
