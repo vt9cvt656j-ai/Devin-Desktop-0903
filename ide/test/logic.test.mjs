@@ -13063,8 +13063,14 @@ test("redacted placeholders are written back to real content, never landing lite
   // 安全底线：两个不同密钥打码后同形 → 无法唯一还原 → 返回 null，由调用方拒绝。
   const twoKeys = 'A = "sk-aaaaaaaaaaaaaaaaaaaaaaaa";\nB = "sk-bbbbbbbbbbbbbbbbbbbbbbbb";\n';
   // 造一个两行打码后完全同形的场景：同一前缀 + 同长度 → slice(0,6)+…[REDACTED] 相同。
-  const rr = redact('KEY = "sk-1111111111111111111111";\nKEY = "sk-2222222222222222222222";\n');
-  assert.equal(restore('KEY = "sk-1111111111111111111111";\nKEY = "sk-2222222222222222222222";\n', rr), null,
+  // 两个密钥必须**前 6 个字符相同、长度相同**才会打码成同一个形态（打码是
+  // `slice(0, 6) + "…[REDACTED]"`）。原来这里用的是 sk-111… / sk-222…，它们前 6 字符
+  // 不同，本该是可区分的；当时之所以同形，是因为按名字打码那条规则会把**已经打码过**
+  // 的文本再打一遍、削成 `sk…[REDACTED]`——即"重复脱敏"这个 bug 本身。那个 bug 修掉之后
+  // 这条用例就不再触及它要守的性质了，所以把输入换成真正同形的一对。
+  const _amb = 'KEY = "sk-abcdef1111111111111111";\nKEY = "sk-abcdef2222222222222222";\n';
+  const rr = redact(_amb);
+  assert.equal(restore(_amb, rr), null,
     "two distinct secrets that redact to the same form cannot be uniquely restored");
   void twoKeys;
 
@@ -27701,4 +27707,50 @@ test("改写用户标识符必须是用户主动打开的，不能默认替他�
     "_fixKeywordTypos 必须被 autoFixTypos 开关挡着，而不是无条件执行");
   assert.match(SRC, /\{ key: "autoFixTypos", labelKey: "feature\.settings\.autoFixTypos\.label"/,
     "这个开关必须出现在设置里——藏起来的默认值等于没得选");
+});
+
+test("脱敏不许改坏普通源码——模型读到的必须还是用户的代码", () => {
+  // 按名字打码那条规则匹配的是**任何以 key/token/secret 结尾的标识符**，于是普通源码
+  // 被大面积改坏（修复前 ide/src 下 26% 的文件），而这份被改坏的文本正是喂给模型的那一份
+  // （当前打开文件、read_file 正文、所有工具结果三条通道都过 _redactSecrets）。
+  // 模型读到的不是用户的代码，却要基于它改代码——这是"智能体写出来的东西用不了"的
+  // 直接机器原因之一。
+  const src = SRC.slice(SRC.indexOf("function _redactSecrets(text, opts)"));
+  const body = src.slice(0, src.indexOf("\nfunction "));
+  const redact = new Function("text", "opts", body.slice(body.indexOf("{") + 1, body.lastIndexOf("}")) + "\nreturn t;");
+
+  for (const code of [
+    "const key = styleKey(cell.s);",
+    "const token = parser.nextToken();",
+    "cacheKey: computeHash(input)",
+    "const apiKey = process.env.API_KEY;",
+    "password: currentPassword",
+    "let token = ++preloadToken;",
+  ]) {
+    assert.equal(redact(code), code, `普通源码被脱敏改坏了：${code}`);
+  }
+
+  // 反向：真凭据仍然必须被打掉，否则这条"修复"就是把密钥泄漏当成了代码兼容。
+  for (const secret of [
+    'API_KEY=sk_live_abc123def456',
+    'password: "hunter2"',
+    "DB_PASSWORD=p4ssw0rd-x9",
+  ]) {
+    assert.notEqual(redact(secret), secret, `真凭据没有被打码：${secret}`);
+  }
+});
+
+test("自动改重复标点不许碰别的语言的合法语法", () => {
+  // _fixDoublePunctuation 扫的是**整个文件每一行**，既不看语言也不看改动范围，
+  // 唯一的闸是「4000 行以上跳过」。`::` `..` `;;` 三条改写在 Rust/C++/Lua/PHP 里是纯破坏：
+  // std::collections → std:collections、0..10 → 0.10、for(;;) → for(;)、Lua 的 a..b → a.b。
+  // 改完 1.2 秒防抖触发、随后自动保存落盘，全程零提示零开关。
+  const tbl = SRC.slice(SRC.indexOf("const _DOUBLE_SYMBOLS = ["), SRC.indexOf("const _BRACKET_PAIRS"));
+  for (const [pat, why] of [
+    [/\[\/::\(\?!:\)\/g, null\]/, ":: 必须保持 null（Rust/C++/PHP 的路径分隔符）"],
+    [/\[\/\\\.\\\.\(\?!\\\.\)\/g, null\]/, ".. 必须保持 null（Rust 区间 / Lua 连接）"],
+    [/\[\/;;\/g, null\]/, ";; 必须保持 null（C 的 for(;;)）"],
+  ]) {
+    assert.match(tbl, pat, why);
+  }
 });
