@@ -2758,15 +2758,27 @@ test("deny beats ask beats allow, so no scope can loosen another's restriction",
   assert.equal(verdict({ allow: [], ask: [], deny: [] }, call), "", "no match defers to the default policy");
 });
 
+// _PERM_SCOPE_FILES 现在由 _stateRels 生成（目录改名后每个作用域有新旧两个候选），
+// 所以要连着 _stateRels 一起从源码里取——在测试里另抄一份数组，就等于这条断言
+// 再也看不见真实定义变了。
+function _permScopeFilesFromSource() {
+  const rels = SRC.match(/const _stateRels = [^\n]*\n/)[0];
+  const dirs = SRC.match(/const _STATE_DIR = "[^"]*";\nconst _LEGACY_STATE_DIR = "[^"]*";/)[0];
+  const arr = SRC.match(/const _PERM_SCOPE_FILES = (\[[\s\S]*?\n\]);/)[1];
+  return new Function(`${dirs}\n${rels}\nreturn ${arr};`)();
+}
+
 test("权限作用域：收紧处处合并，放宽只认用户自己的", async () => {
   const files = {
-    "/repo/.michael/settings.json": JSON.stringify({ permissions: { deny: ["Read(./.env)"], allow: ["Bash(npm test)"] } }),
-    "/repo/.michael/settings.local.json": JSON.stringify({ permissions: { allow: ["Bash(npm run build)"] } }),
+    "/repo/.mrdayone/settings.json": JSON.stringify({ permissions: { deny: ["Read(./.env)"], allow: ["Bash(npm test)"] } }),
+    "/repo/.mrdayone/settings.local.json": JSON.stringify({ permissions: { allow: ["Bash(npm run build)"] } }),
   };
+  const fileBackend = (map) => ({ readTextFile: async (p) => { if (map[p]) return map[p]; throw new Error("no file"); } });
   const rules = await load("_loadPermissionRules", {
     _permRulesCache: { root: null, ts: 0, rules: null },
-    _PERM_SCOPE_FILES: new Function("return " + SRC.match(/const _PERM_SCOPE_FILES = (\[[\s\S]*?\n\]);/)[1])(),
-    backend: { readTextFile: async (p) => { if (files[p]) return files[p]; throw new Error("no file"); } },
+    _PERM_SCOPE_FILES: _permScopeFilesFromSource(),
+    _readFirstExisting: load("_readFirstExisting", { backend: fileBackend(files) }),
+    backend: fileBackend(files),
     localStorage: { getItem: () => JSON.stringify({ permissions: { deny: ["Bash(sudo *)"] } }) },
     Date: { now: () => 1 },
   })("/repo");
@@ -2777,7 +2789,7 @@ test("权限作用域：收紧处处合并，放宽只认用户自己的", async
   // `["Bash(npm run build)", "Bash(npm test)"]`，也就是接受工作区文件里的 allow——
   // 而那正是一个洞，不是一个特性：
   //
-  //   · `.michael/settings.json` 和 `.michael/settings.local.json` 默认都不在 gitignore
+  //   · `.mrdayone/settings.json` 和 `.mrdayone/settings.local.json` 默认都不在 gitignore
   //     里，都能被提交、跟着 git clone 一起到用户机器上（`.local` 只是个命名约定，
   //     不是关于「谁写的」的事实）；
   //   · `_approveToolCall` 里 `if (ruleVerdict === "allow") return true` **排在
@@ -2789,18 +2801,51 @@ test("权限作用域：收紧处处合并，放宽只认用户自己的", async
   // 这条测试把相反的那一版钉住了。现在两者对齐。
   //
   // 代价是「项目级白名单」这个用法没了：要为某个项目常放行某条命令，写进你自己的
-  // ~/.michael/settings.json——那是一次明确的、由你本人做出的采纳动作。
+  // ~/.mrdayone/settings.json——那是一次明确的、由你本人做出的采纳动作。
   assert.deepEqual(rules.allow, [], "工作区文件里的 allow 必须被丢弃");
   // Malformed or absent files are skipped, never fatal — a broken settings file must not
   // take the whole permission layer down with it.
   const empty = await load("_loadPermissionRules", {
     _permRulesCache: { root: null, ts: 0, rules: null },
-    _PERM_SCOPE_FILES: new Function("return " + SRC.match(/const _PERM_SCOPE_FILES = (\[[\s\S]*?\n\]);/)[1])(),
+    _PERM_SCOPE_FILES: _permScopeFilesFromSource(),
+    _readFirstExisting: load("_readFirstExisting", { backend: { readTextFile: async () => "{ not json" } }),
     backend: { readTextFile: async () => "{ not json" },
     localStorage: { getItem: () => "also not json" },
     Date: { now: () => 1 },
   })("/repo");
   assert.deepEqual(empty, { allow: [], ask: [], deny: [] });
+});
+
+test("目录从 .michael/ 改名到 .mrdayone/：老配置照样生效，新的一旦存在就完全盖过老的", async () => {
+  // 这次改名的全部风险就在这一条上。改错的表现不是报错，是**某天打开 IDE 发现
+  // 自己写的权限规则全没了**——工具突然全要审批，或者更糟：突然都不问了。
+  const load3 = (files) => load("_loadPermissionRules", {
+    _permRulesCache: { root: null, ts: 0, rules: null },
+    _PERM_SCOPE_FILES: _permScopeFilesFromSource(),
+    _readFirstExisting: load("_readFirstExisting", {
+      backend: { readTextFile: async (p) => { if (files[p]) return files[p]; throw new Error("no file"); } },
+    }),
+    backend: { readTextFile: async (p) => { if (files[p]) return files[p]; throw new Error("no file"); } },
+    localStorage: { getItem: () => "" },
+    Date: { now: () => 1 },
+  })("/repo");
+
+  // ① 只有老目录：必须照样读到。
+  const legacyOnly = await load3({
+    "/repo/.michael/settings.json": JSON.stringify({ permissions: { deny: ["Read(./.env)"] } }),
+  });
+  assert.deepEqual(legacyOnly.deny, ["Read(./.env)"],
+    "老目录里的规则读不到了——已经在用的人，改名当天权限规则会静默失效");
+
+  // ② 两个都在：新的赢，老的**一条都不能漏进来**。合并两份是错的：老文件里一条
+  //    deny 会永远压住用户刚在新文件里改宽的同一条（判定是 deny 优先），而他根本
+  //    不知道还有一份旧的在生效，删都不知道删哪。
+  const both = await load3({
+    "/repo/.michael/settings.json": JSON.stringify({ permissions: { deny: ["Bash(npm test)"] } }),
+    "/repo/.mrdayone/settings.json": JSON.stringify({ permissions: { deny: ["Read(./.env)"] } }),
+  });
+  assert.deepEqual(both.deny, ["Read(./.env)"],
+    "新旧两份被合并了——老文件里的 deny 会变成删不掉的幽灵规则");
 });
 
 test("configured rules run ahead of every other check in the gate", async () => {
@@ -16677,7 +16722,7 @@ test("agent preview tabs are evicted unless the user claims them", () => {
 });
 
 test("repo-provided hooks need explicit approval before they run", () => {
-  // `.michael/hooks.json` 同样跟着仓库分发，且比 MCP 更隐蔽：执行时 stepEl 传的是
+  // `.mrdayone/hooks.json` 同样跟着仓库分发，且比 MCP 更隐蔽：执行时 stepEl 传的是
   // null，界面上看不到命令、看不到输出、没有终端卡片；而 on_run_end 连纯只读问答跑完
   // 都会触发。（MCP 走的是另一条路——仓库自带的配置现在根本不读，见上一条测试。）
   assert.match(SRC, /async function _approveWorkspaceExecConfig\(kind, path, text, details\)/);
@@ -25952,11 +25997,11 @@ test("chat 模式中断也能从断点继续，不是让用户把整条消息重
 test("规则拦下的不能写成「用户已拒绝」——用户根本没点过", async () => {
   const denied = load("_userDeniedToolResult", {});
   // 规则拦：要说清是规则、并指出哪份文件；给模型的建议也不同（别绕，去让用户改规则）
-  const byRule = denied({ type: "cmd", command: "npm test" }, { by: "rule", detail: ".michael/settings.json" });
+  const byRule = denied({ type: "cmd", command: "npm test" }, { by: "rule", detail: ".mrdayone/settings.json" });
   assert.equal(byRule.blockedBy, "rule");
   assert.equal(byRule.userDenied, false, "标成用户拒绝会让失败记忆把仓库规则记成用户的决定");
   assert.match(byRule.content, /权限规则/);
-  assert.match(byRule.content, /\.michael\/settings\.json/, "不说在哪，用户还得自己翻三个作用域");
+  assert.match(byRule.content, /\.mrdayone\/settings\.json/, "不说在哪，用户还得自己翻三个作用域");
   assert.doesNotMatch(byRule.content, /用户拒绝了这次调用/);
   // 技能范围外：既不是用户不同意，也不是规则
   const bySkill = denied({ type: "web" }, { by: "skill", detail: "docx" });

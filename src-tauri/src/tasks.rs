@@ -176,7 +176,10 @@ fn add_configured_tasks(root: &Path, rel: &str, source: &str, out: &mut Vec<Task
 
 fn discover_tasks(root: &Path) -> Vec<TaskDefinition> {
     let mut out = Vec::new();
-    add_configured_tasks(root, ".michael/tasks.json", "Michael", &mut out);
+    // 目录改名（.michael → .mrdayone）后两处都发现：任务清单是**加法**，不像权限规则那样
+    // 有"旧的压住新的"的风险，所以不做二选一——旧文件里的任务不会因为改名就从面板消失。
+    add_configured_tasks(root, ".mrdayone/tasks.json", "Mr. Day One", &mut out);
+    add_configured_tasks(root, ".michael/tasks.json", "Mr. Day One", &mut out);
     add_configured_tasks(root, ".vscode/tasks.json", "VS Code", &mut out);
     add_package_tasks(root, &mut out);
     add_cargo_tasks(root, &mut out);
@@ -591,6 +594,24 @@ mod tests {
         let tasks = discover_tasks(&root);
         assert!(tasks.iter().any(|task| task.command == "cargo check"));
         assert!(tasks.iter().any(|task| task.command == "cargo test"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// 目录改名之后，新目录里的任务必须被发现——否则用户按提示把 tasks.json 放进
+    /// `.mrdayone/`，面板里什么都不出现，而且不报错。
+    #[test]
+    fn discovers_configured_tasks_in_renamed_dir() {
+        let root = temp_root("configured-renamed");
+        std::fs::create_dir_all(root.join(".mrdayone")).unwrap();
+        std::fs::write(
+            root.join(".mrdayone/tasks.json"),
+            r#"{"tasks":[{"label":"Lint","command":"npm","args":["run","lint"]}]}"#,
+        )
+        .unwrap();
+
+        let tasks = discover_tasks(&root);
+        let task = tasks.iter().find(|task| task.label == "Lint").unwrap();
+        assert_eq!(task.command, "npm run lint");
         let _ = std::fs::remove_dir_all(root);
     }
 

@@ -19,7 +19,7 @@ import {
   userToolShortName,
 } from "../src/agent/capabilities.js";
 
-const ok = (raw, source = "~/.michael/settings.json") => normalizeCapabilities(raw, source);
+const ok = (raw, source = "~/.mrdayone/settings.json") => normalizeCapabilities(raw, source);
 
 test("一段 JSON 就能加一个工具，不用改代码", () => {
   const caps = ok({

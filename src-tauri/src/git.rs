@@ -573,7 +573,7 @@ fn select_push_remote(remotes: &[String]) -> Result<String, String> {
 }
 
 /// best-of-N 隔离：建一个 git worktree，让一个并行候选在独立工作树里改仓库、不碰主 checkout。
-/// 返回 worktree 的绝对路径。工作树放在 `<root>/.michael/worktrees/<name>`，挂一条临时分支
+/// 返回 worktree 的绝对路径。工作树放在 `<root>/.mrdayone/worktrees/<name>`，挂一条临时分支
 /// `michael/bon-<name>`（HEAD 派生）。同名残留先强制清掉。**撤销该候选 = git_worktree_remove。**
 /// 注意：worktree 不含被 gitignore 的依赖（如 node_modules）——上层若要在里面跑测试，需自行
 /// symlink/复用主仓库的依赖（前端 flow 已写明）。
@@ -591,7 +591,7 @@ pub fn git_worktree_add(root: String, name: String) -> Result<String, String> {
     if !inside.status.success() {
         return Err("不是 git 仓库——best-of-N 的并行隔离需要 git worktree；先 `git init` 或改用基于 checkpoint 的顺序尝试。".into());
     }
-    let abs = format!("{}/.michael/worktrees/{}", root.trim_end_matches('/'), safe);
+    let abs = format!("{}/.mrdayone/worktrees/{}", root.trim_end_matches('/'), safe);
     let branch = format!("michael/bon-{safe}");
 
     // 同名残留原来是这么"清掉"的：

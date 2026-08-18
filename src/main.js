@@ -9580,7 +9580,7 @@ function _isDependencyCachePath(path) {
 }
 function _isGeneratedDependencyDiagnosticPath(path) {
   const p = _normalizeFsPath(String(path || ""));
-  return /(^|\/)(package-lock\.json|npm-shrinkwrap\.json|pnpm-lock\.yaml|yarn\.lock|bun\.lockb?|bun\.lock|node_modules|\.michael-ide-types)(\/|$)/.test(p);
+  return /(^|\/)(package-lock\.json|npm-shrinkwrap\.json|pnpm-lock\.yaml|yarn\.lock|bun\.lockb?|bun\.lock|node_modules|\.mrdayone-ide-types)(\/|$)/.test(p);
 }
 function _isDependencyResolutionDiagnostic(marker) {
   const msg = String(marker?.message || "");
@@ -10242,7 +10242,7 @@ async function refreshProjectCaches(root = rootPath, reason = "项目刷新") {
           disposers.push(d.addExtraLib(realType.content, monaco.Uri.file(realType.path).toString()));
         }
       }
-      const shimPath = `${targetRoot}/node_modules/.michael-ide-types/${specifier.replace(/[^\w.-]+/g, "__")}.d.ts`;
+      const shimPath = `${targetRoot}/node_modules/.mrdayone-ide-types/${specifier.replace(/[^\w.-]+/g, "__")}.d.ts`;
       // 真类型覆盖到的名字不再垫——垫了就会盖住它，类型检查对这个包彻底失效。
       const shim = _makeInstalledPackageShim(specifier, details, realType?.exports || null);
       // 一个名字都不用补时就别加这份 ambient 声明：加了照样会遮蔽真解析。
@@ -19926,18 +19926,54 @@ function _isDangerousCmd(cmd) { const c = String(cmd || ""); return _DANGEROUS_C
 // `*` 匹配同层任意字符，`**` 跨目录。规则来自三个作用域，**合并**而不是覆盖，
 // 因为任何一层的收紧都必须生效：
 //
-//     user     ~/.michael/settings.json            个人，跨项目
-//     project  <root>/.michael/settings.json        进版本库，团队共享
-//     local    <root>/.michael/settings.local.json  本地覆盖，不进库
+//     user     ~/.mrdayone/settings.json            个人，跨项目
+//     project  <root>/.mrdayone/settings.json        进版本库，团队共享
+//     local    <root>/.mrdayone/settings.local.json  本地覆盖，不进库
 //
 // 缓存 10s：改完配置最多十秒后生效，不需要重启，也不用给每次工具调用付一次读盘。
 //
 // 判定顺序 deny → ask → allow：deny 永远赢，这样一条规则被写下来之后，没有任何
 // 其他作用域能把它放宽。
+// 产品目录：以前叫 `.michael/`（作者名），2026-08-17 改成 `.mrdayone/`，和记忆目录
+// `.mrdayone/memory.md`、全局目录 `~/.mrdayone` 统一。
+//
+// 改名一律带**读旧写新**：老目录继续读得到，新建的一律落在新目录。settings 里是用户
+// 一条条写下来的权限规则，直接改名等于某天打开 IDE 发现规则全没了——而且不会报错，
+// 只会变成"怎么突然什么都要审批 / 怎么突然什么都不问了"。
+const _STATE_DIR = ".mrdayone";
+const _LEGACY_STATE_DIR = ".michael";
+/** 一个状态文件的全部候选相对路径，新的在前。 */
+// 两份都读是**不行**的：老文件里一条 deny 会永远压住用户在新文件里刚改宽的同一条规则
+// （判定是 deny 优先），而且他删不掉——他根本不知道还有一份旧的在生效。所以每个作用域
+// 只取**第一个存在的**：新的一旦存在，旧的完全不看。
+const _stateRels = (name) => [`${_STATE_DIR}/${name}`, `${_LEGACY_STATE_DIR}/${name}`];
+// 装进技能目录里的安装元数据（头像、来源仓库）。同样改名读旧写新——已经装好的技能
+// 目录里躺的还是旧文件名，读不到它只是头像和来源消失，不会报错，最难被发现。
+const _SKILL_META_NAME = ".mrdayone-skill.json";
+const _LEGACY_SKILL_META_NAME = ".michael-skill.json";
+async function _readSkillMeta(dir) {
+  for (const name of [_SKILL_META_NAME, _LEGACY_SKILL_META_NAME]) {
+    try {
+      const text = await backend.readTextFile(`${dir}/${name}`);
+      if (text) return text;
+    } catch { /* 下一个候选 */ }
+  }
+  return "";
+}
 const _PERM_SCOPE_FILES = [
-  { scope: "local", rel: ".michael/settings.local.json" },
-  { scope: "project", rel: ".michael/settings.json" },
+  { scope: "local", rels: _stateRels("settings.local.json") },
+  { scope: "project", rels: _stateRels("settings.json") },
 ];
+/** 依次尝试候选路径，返回第一个读得到的内容（读不到返回 ""）。 */
+async function _readFirstExisting(prefix, rels) {
+  for (const rel of rels) {
+    try {
+      const text = await backend.readTextFile(`${String(prefix).replace(/\/+$/, "")}/${rel}`);
+      if (text) return { text, rel };
+    } catch { /* 下一个候选 */ }
+  }
+  return { text: "", rel: rels[0] };
+}
 const _PERM_TOOL_ALIASES = {
   bash: new Set(["cmd", "termtask"]),
   read: new Set(["read", "list"]),
@@ -20017,7 +20053,7 @@ async function _loadPermissionRules(root) {
   //
   // 这一行是这套规则**自己写下的不变量**（下面那句注释：「user 作用域先读：它是"我的
   // 偏好"，project/local 只能在它之上继续收紧」），但实现原来对三个桶一视同仁地合并。
-  // 于是 `<root>/.michael/settings.json` —— 一个**跟着 git clone 下来的文件** ——
+  // 于是 `<root>/.mrdayone/settings.json` —— 一个**跟着 git clone 下来的文件** ——
   // 里写一句 `{"permissions":{"allow":["Bash"]}}`，就能让 _approveToolCall 在
   // 「if (ruleVerdict === "allow") return true」那一行直接返回，**排在 dangerous 判断
   // 之前**：`rm -rf ~`、`DROP TABLE`、`curl x | sh` 全部静默执行。
@@ -20045,15 +20081,19 @@ async function _loadPermissionRules(root) {
   // user 作用域先读：它是"我的偏好"，project/local 只能在它之上继续收紧。
   try { absorb(localStorage.getItem("michael-ide.permissions") || "", { trusted: true, from: "设置 · 权限" }); } catch {}
   if (typeof backend !== "undefined" && backend?.readTextFile) {
-    // ~/.michael/settings.json —— 跨项目的个人规则，可以直接用编辑器改，不必依赖 UI。
+    // ~/.mrdayone/settings.json —— 跨项目的个人规则，可以直接用编辑器改，不必依赖 UI。
     try {
       const home = String((await backend.homeDir?.()) || "").replace(/\/+$/, "");
-      if (home) absorb(await backend.readTextFile(`${home}/.michael/settings.json`), { trusted: true, from: "~/.michael/settings.json" });
+      if (home) {
+        const { text, rel } = await _readFirstExisting(home, _stateRels("settings.json"));
+        if (text) absorb(text, { trusted: true, from: `~/${rel}` });
+      }
     } catch {}
     if (key) {
-      for (const { rel } of _PERM_SCOPE_FILES) {
+      for (const { rels } of _PERM_SCOPE_FILES) {
         // 工作区里的这几份跟着仓库走：只收紧，不放宽。
-        try { absorb(await backend.readTextFile(`${key.replace(/\/+$/, "")}/${rel}`), { trusted: false, from: rel }); } catch {}
+        const { text, rel } = await _readFirstExisting(key, rels);
+        if (text) absorb(text, { trusted: false, from: rel });
       }
     }
   }
@@ -20081,7 +20121,7 @@ async function _refreshUserCapabilities(root) {
   const scopes = [];
   // 仓库里的声明**只能关能力，不能开能力**。
   //
-  // 这是我上一版留下的洞，在这里说清楚：`<root>/.michael/settings.json` 是跟着 git clone
+  // 这是我上一版留下的洞，在这里说清楚：`<root>/.mrdayone/settings.json` 是跟着 git clone
   // 下来的文件。我当时给 userhttp 设了 needsApproval: true，并在提交信息里写「一律要
   // 审批」——**那句话在默认模式下是错的**：_approveToolCall 里 `mustAsk` 只在
   // `mode === "approve"` 时才看 needsApproval，而默认模式是 auto。于是 clone 一个仓库
@@ -20090,7 +20130,7 @@ async function _refreshUserCapabilities(root) {
   //
   // 所以：加能力（tools / knowledge / roles / commands）只认用户自己的作用域；仓库里的
   // 声明只保留 disabled（关掉某个内置工具）——那是收紧，任何来源都该允许。
-  // 仓库想共享一套工具，把它抄进 ~/.michael/settings.json 即可，那是一次明确的采纳动作。
+  // 仓库想共享一套工具，把它抄进 ~/.mrdayone/settings.json 即可，那是一次明确的采纳动作。
   const absorb = (raw, source, { trusted }) => {
     let parsed = null;
     try { parsed = JSON.parse(raw || "{}"); } catch { return; }
@@ -20103,7 +20143,7 @@ async function _refreshUserCapabilities(root) {
       errors: dropped
         ? [...one.errors, `${source}：来自仓库的声明里有 ${dropped} 项能力（工具/知识库/角色/命令）**没有启用**——`
           + `跟着 git clone 下来的文件不能给自己加能力，否则打开一个别人的仓库就等于让它往外发数据。`
-          + `确实要用的话，把那几段抄进你自己的 ~/.michael/settings.json。（这里的 disabled 照常生效，关能力任何来源都允许。）`]
+          + `确实要用的话，把那几段抄进你自己的 ~/.mrdayone/settings.json。（这里的 disabled 照常生效，关能力任何来源都允许。）`]
         : one.errors,
     });
   };
@@ -20111,12 +20151,16 @@ async function _refreshUserCapabilities(root) {
   if (typeof backend !== "undefined" && backend?.readTextFile) {
     try {
       const home = String((await backend.homeDir?.()) || "").replace(/\/+$/, "");
-      if (home) absorb(await backend.readTextFile(`${home}/.michael/settings.json`), "~/.michael/settings.json", { trusted: true });
+      if (home) {
+        const { text, rel } = await _readFirstExisting(home, _stateRels("settings.json"));
+        if (text) absorb(text, `~/${rel}`, { trusted: true });
+      }
     } catch {}
     if (key) {
-      for (const { rel } of _PERM_SCOPE_FILES) {
+      for (const { rels } of _PERM_SCOPE_FILES) {
         // 仓库里的：只认 disabled。
-        try { absorb(await backend.readTextFile(`${key.replace(/\/+$/, "")}/${rel}`), rel, { trusted: false }); } catch {}
+        const { text, rel } = await _readFirstExisting(key, rels);
+        if (text) absorb(text, rel, { trusted: false });
       }
     }
   }
@@ -20161,7 +20205,7 @@ function _permissionRuleVerdict(rules, call) {
 // 渲染的调用，都经过那里）。判定刻意保留本 IDE"不替模型做否决"的取向 —— 门只**问**，
 // 不静默拦截，用户点允许后模型照样拿到真实结果：
 //
-//   0. 配置规则（`.michael/settings.json` 的 permissions.deny/ask/allow）先判：deny 直接
+//   0. 配置规则（`.mrdayone/settings.json` 的 permissions.deny/ask/allow）先判：deny 直接
 //      拒绝、连问都不问；ask 强制询问；allow 直接放行。这一层是唯一能**否决**而不是
 //      询问的地方，因为它是用户自己事先写下的策略，不是 harness 的猜测。
 //   1. 只读命令（grep / find / cat / git diff 之类）直接放行，任何模式下都不打扰。
@@ -23704,7 +23748,7 @@ async function _runDirectImageGen(text, config, sess, attachments = []) {
     const root = rootPath || workspaceRoots[0] || "";
     if (!root) throw new Error("请先打开一个文件夹（生成的图片会存进工作区）");
     const ts = (new Date()).toISOString().replace(/[:.]/g, "-").slice(0, 19);
-    const dest = ".michael-images/img-" + ts + ".png";
+    const dest = ".mrdayone-images/img-" + ts + ".png";
     const enrichedPrompt = _enrichImagePrompt(text);
     const out = await backend.invoke("generate_image_chat", { root, baseUrl: config.baseUrl || MICHAEL_API, apiKey: config.apiKey || "", model: config.model, prompt: enrichedPrompt, dest, width: null, height: null, requestId: config.requestId || null });
     try { reloadDir(parentDir(root + "/" + dest)); } catch {}
@@ -27770,7 +27814,7 @@ function _workspaceAncestorRoots(projectRoot, maxDepth = 3) {
 
 // ---- 可执行的工作区配置：按内容指纹的一次性确认 ----
 //
-// `.mcp.json` / `.cursor/mcp.json` / `.michael/hooks.json` 都是**跟着 git 仓库分发的
+// `.mcp.json` / `.cursor/mcp.json` / `.mrdayone/hooks.json` 都是**跟着 git 仓库分发的
 // 普通文件**，内容却会被直接拿去 spawn 进程。此前它们在「打开文件夹」时就被静默执行，
 // 唯一的门 checkWorkspaceTrust 是个恒真桩 —— clone 一个仓库、打开它，就等于执行了
 // 作者写在那些文件里的任意命令。
@@ -29050,10 +29094,12 @@ async function _openBrowserPanel() {
 /** 声明文件的候选位置，按读取顺序。面板照这个顺序展示，用户才知道谁盖过谁。 */
 function _capabilityScopePaths(home, root) {
   const out = [];
-  if (home) out.push({ label: "个人（所有项目通用）", path: `${home}/.michael/settings.json` });
+  // 面板只指向**新目录**：这是"该往哪写"的答案，不是"读过哪些"的清单。老目录仍然读得到
+  // （见 _readFirstExisting），但不该再教人往那儿写。
+  if (home) out.push({ label: "个人（所有项目通用）", path: `${home}/${_STATE_DIR}/settings.json` });
   if (root) {
-    out.push({ label: "项目（跟着仓库走，团队共享）", path: `${root.replace(/\/+$/, "")}/.michael/settings.json` });
-    out.push({ label: "项目 · 只属于你（别提交）", path: `${root.replace(/\/+$/, "")}/.michael/settings.local.json` });
+    out.push({ label: "项目（跟着仓库走，团队共享）", path: `${root.replace(/\/+$/, "")}/${_STATE_DIR}/settings.json` });
+    out.push({ label: "项目 · 只属于你（别提交）", path: `${root.replace(/\/+$/, "")}/${_STATE_DIR}/settings.local.json` });
   }
   return out;
 }
@@ -29291,7 +29337,7 @@ function _findSkillByName(catalog, want) {
  *
  * 事实全部来自命中的技能对象（_parseSkillDocument 的产物：desc 来自 frontmatter、
  * tools 来自 allowed-tools、baseDir 是资源基准目录；repo 由 _refreshFileSkills 从
- * .michael-skill.json 补上）加上这次读取的真实长度。
+ * .mrdayone-skill.json 补上）加上这次读取的真实长度。
  *
  * 「为什么读它」只画模型自己声明的 why。技能自述**不顶**这个位置——见 _toolStepWhyLine
  * 里的同一条理由：两个作者的两句话，混起来用户就分不清哪句是模型的判断。
@@ -29670,7 +29716,7 @@ async function _refreshFileSkills(root) {
         const skill = _parseSkillDocument(text, dir + "/SKILL.md");
         if (skill) {
           try {
-            const meta = JSON.parse(await backend.readTextFile(dir + "/.michael-skill.json"));
+            const meta = JSON.parse(await _readSkillMeta(dir));
             if (meta && typeof meta === "object" && !Array.isArray(meta)) {
               skill._installMeta = meta;
               skill.avatar = String(meta.avatar || "");
@@ -32306,7 +32352,7 @@ function _buildAgentToolSchemas(includeWrite, mcpTools = []) {
       { type: "function", function: { name: "figma", description: "**Give you a Figma design file in structured form — read the real design data rather than copying a screenshot.** Use it when the user supplies a Figma link and wants \"build this / recreate this design / turn it into code / extract the palette, spacing and type scale\"; never copy pixels screen by screen with browser. It returns two things: (1) colour tokens — the colours used in Figma converted to OKLCH (a perceptually uniform colour space), mapped by hue band onto shadcn/ui semantic variables (brand colour → --primary, red → --destructive, green → --success, orange → --warning, and neutrals assigned by area to --background/--card/--muted/--border), with contrast-compliant -foreground pairings, ready to paste straight into globals.css (registered with @theme inline under Tailwind v4, and shadcn components read the CSS variables and pick it up with no change to component source); (2) structured layout — the hierarchy tree with Auto Layout (direction/spacing/padding/alignment), sizes, corner radii, real copy, font size and weight, and fill colours, enough to recreate it precisely in React + Tailwind + shadcn. Colour extraction has three fallback tiers: the Variables API first (named semantics, the most accurate) → named colour styles → clustering the real fills (most handoff and community files only have this tier, and it still yields a usable theme). Choose action: design (the default, theme + layout in one call, the common case) / tokens (just the shadcn colour theme) / inspect (just the layout; raise depth for more detail) / image (render a node to a PNG reference image, returning a temporary link you can persist with download_file) / variables (export the raw named tokens). **Works in both the desktop and web versions** (each over its own network channel; Figma allows CORS). First use requires a Figma personal access token in Settings (figma.com → Settings → Security → Personal access tokens, with File content read permission); without one the tool says so. Figma rate-limits by cost, and the tool already has session caching, a depth ceiling and graceful 429 backoff built in — do not repeatedly re-fetch everything in a short window.", parameters: { type: "object", properties: { url: { type: "string", description: "The Figma file / frame URL (of the form https://www.figma.com/design/<key>/name?node-id=1-2), or just the file key. To resolve one specific frame or component rather than the whole file: right-click that frame in Figma → Copy link to selection; the copied URL carries the node-id, which is both precise and easy on your quota." }, action: { type: "string", enum: ["design", "tokens", "inspect", "image", "variables"], description: "design = colour theme + structured layout in one call (default, the common case); tokens = just the shadcn/Tailwind colour theme; inspect = just the structured layout (pair with a larger depth to see deeper levels); image = render the given node to a PNG reference image; variables = export the raw named design tokens." }, node: { type: "string", description: "Optional; an explicit node id (overriding the node-id in the URL), of the form 123:456." }, depth: { type: "integer", description: "Optional; layout parsing depth, default 14. Deeper shows finer levels of the hierarchy but is slower and consumes more of the Figma quota. For overall structure only, use a small value (e.g. 4); to recreate details precisely, use a larger one." } }, required: ["url"] } } },
       { type: "function", function: { name: "background_monitor", description: "**Whenever a step needs the user to do something by hand or depends on an external condition, you must call this tool: first tell the user what to do (paste the link, give the command, list the steps), then immediately park in the background and wait automatically, so that when the condition is met you resume and carry on without the user having to come back and say \"done\".** Typical cases: a verification code is needed → tell the user to enter it and monitor the result; something must be installed → give the install command and monitor `which xxx` returning 0; a service must be started → give the start command and monitor the port; the user must act in a browser → give the link and monitor the outcome with capture/url/file. Six check types are available; **prefer the ones that detect automatically (port/file/command/url/capture) — manual is the last resort.**", parameters: { type: "object", properties: { message: { type: "string", description: "Tell the user what is being waited on (shown in the chat)" }, check_type: { type: "string", enum: ["capture", "file", "manual", "command", "url", "port"], description: "manual = wait for the user to click continue; file = wait for a file to appear (with file_pattern, wait for its contents to match); capture = watch captured traffic for pattern; command = re-run a command until it exits 0; url = re-request a URL until HTTP 200; port = wait for a port to be listening" }, pattern: { type: "string", description: "capture: keyword/regex to match; file: file path; command: shell command; url: full URL; port: port number such as 3000" }, file_pattern: { type: "string", description: "file type only: match on file content (keyword or regex); once set, it checks not just that the file exists but that its contents contain this pattern" }, timeout: { type: "integer", description: "Timeout in seconds, default 300" } }, required: ["check_type"] } } },
       { type: "function", function: { name: "start_demo", description: "Start recording the operations that follow as a **feature demonstration / real screen recording**. Once started, walk through the key flow of the feature you just built for real using browser / computer / screenshot (open the page → click the button → fill the form → see the result…), and **every action is automatically recorded as a real screenshot frame**. Use it when a feature is finished and you want to show the user what it looks like running.", parameters: { type: "object", properties: { title: { type: "string", description: "Title for this demonstration, e.g. Sign-in flow walkthrough" } } } } },
-      { type: "function", function: { name: "stop_demo", description: "End the recording and **play the captured steps back to the user one step at a time** (a playable player appears directly in the chat), while saving the demonstration to the workspace as an HTML recording that can be double-clicked and played. Use it to close out each finished feature once you have walked the flow.", parameters: { type: "object", properties: { path: { type: "string", description: "Optional; where to save the HTML (relative to the workspace root); default .michael-demos/demo-<timestamp>.html" } } } } },
+      { type: "function", function: { name: "stop_demo", description: "End the recording and **play the captured steps back to the user one step at a time** (a playable player appears directly in the chat), while saving the demonstration to the workspace as an HTML recording that can be double-clicked and played. Use it to close out each finished feature once you have walked the flow.", parameters: { type: "object", properties: { path: { type: "string", description: "Optional; where to save the HTML (relative to the workspace root); default .mrdayone-demos/demo-<timestamp>.html" } } } } },
       { type: "function", function: { name: "preview_choices", description: "**Show the user a live preview of several candidate approaches inside the chat.** Two modes are supported: (1) **front-end visual options** — genuinely rendered CSS animations/effects/components/palette cards (the animation actually moves, the shadow actually glows); (2) **back-end or architecture options** — explained as a comic storyboard (character dialogue + everyday analogy + frame-by-frame animation), so a user who does not read code still gets it at a glance. **A back-end option must use an everyday analogy**: JWT → a passport, Session → a hotel key card, Cache → a convenience-store shelf, DB → a warehouse, a shared table → an open-plan office, schema isolation → an apartment building, database isolation → a detached house. Build it from the system's built-in CSS classes .pv-scene (scene panel) + .pv-avatar (character portrait) + .pv-bubble (speech bubble) + .pv-verdict (pros/cons tag) + .pv-speed (speed comparison bar), and add a data-t attribute to control entry timing (the system fades the frames in, in time order, automatically). See the HTML structure template in the system prompt.", parameters: { type: "object", properties: { title: { type: "string", description: "Preview title, e.g. \"Choose a sign-in method\" or \"How should the data load faster\"" }, target: { type: "string", description: "Target element / scenario, e.g. \"user authentication\" or \"product list caching strategy\"" }, variants: { type: "array", minItems: 2, maxItems: 8, items: { type: "object", properties: { name: { type: "string", description: "Option name (use the analogy): \"Passport method (JWT)\", \"Hotel key card (Session)\", \"Convenience store (cache)\"" }, html: { type: "string", description: "Front-end: the demo HTML. Back-end: build a comic storyboard from the built-in classes pv-scene/pv-avatar/pv-bubble/pv-verdict/pv-speed (see the system prompt template), with data-t to control entry timing" }, css: { type: "string", description: "CSS for a front-end option (scoped automatically); the back-end comic mode usually needs no extra CSS (the built-in classes are enough)" }, code: { type: "string", description: "The final code written into the project once the user picks this option (React/Vue component code + Tailwind class names, not bare HTML/CSS)" }, description: { type: "string", description: "One sentence, using the everyday analogy: \"The user carries a passport; verification is very fast but losing it is trouble\"" } }, required: ["name", "html", "css"] } } }, required: ["variants"] } } },
       { type: "function", function: { name: "visual_explain", description: "**Comic explainer: have the AI draw a cute-character comic to explain a concept to the user.** When the user asks a comprehension question — \"what is X\", \"why does Y\", \"how does Z work\" — do not answer in plain prose; use this tool to generate an AI-drawn teaching comic (cute characters + speech bubbles + step-by-step scenes) so someone with no background gets it at a glance. You only describe what the comic shows; the system calls the image model and produces the real picture.", parameters: { type: "object", properties: { title: { type: "string", description: "The topic being explained, e.g. \"What is JWT authentication\" or \"How does caching make things faster\"" }, prompt: { type: "string", description: "Description of the comic panels (English is more precise): describe 3-4 panels — who is in each one, what they say, what they do. For example 'Panel 1: A cute round character asks a server guard for data. Panel 2: The guard checks a list. Panel 3: Guard gives a green ticket (JWT token). Panel 4: Character shows the ticket to other services.' Make the imagery concrete and story-like." }, summary: { type: "string", description: "A one-sentence summary (shown beneath the image)" } }, required: ["prompt"] } } },
     );
@@ -36787,8 +36833,9 @@ function _kgPrune(notes) {
 // 什么""这个坑已经踩过"这类最不该丢的东西。用户的话：能实时扶正项目内容、锁定项目目标不偏航、
 // 把遇到的错误放进去不再犯。
 //
-// 所以镜像一份到 <root>/.mrdayone/memory.md（目录按产品名，对应 Claude Code 的 .claude/；
-// IDE 其它状态还在历史名 .michael/ 下，那是另一次迁移的事）：
+// 所以镜像一份到 <root>/.mrdayone/memory.md（目录按产品名，对应 Claude Code 的 .claude/。
+// IDE 其余状态——settings / hooks / launch / tasks / worktrees——已在同一次改名里跟过来，
+// 旧的 .michael/ 仍然读得到，见 _stateRels）：
 //   · 写入时同步落盘 —— 文件是人可读、可手改的真相；
 //   · 打开项目时若 localStorage 为空则从文件读回 —— 换机器、清数据、重装都还在；
 //   · 检索/排序/纠错账本/篇幅裁剪那一整套逻辑**一行不动**，文件只当持久层。
@@ -50509,11 +50556,11 @@ function _dbResultToText(o) {
   return `${o.driver} 执行成功：${o.rows_affected ?? 0} 行受影响（${o.elapsed_ms ?? "?"}ms）。`;
 }
 
-// --- Hooks / 事件系统：工作区 `.michael/hooks.json` 可在工具调用前后与运行结束时挂
+// --- Hooks / 事件系统：工作区 `.mrdayone/hooks.json` 可在工具调用前后与运行结束时挂
 // 自定义命令（仿 Claude Code hooks）。支持三个事件：pre_tool_use（exit 2 ⇒ 拦下这次
 // 调用；其他非零 ⇒ 附一条 advisory 但照常执行）、post_tool_use、on_run_end（后两个
 // fire-and-forget）。每项形如
-// { "match": "run_cmd|write_file", "command": "sh .michael/check.sh" }，命令收到一个
+// { "match": "run_cmd|write_file", "command": "sh .mrdayone/check.sh" }，命令收到一个
 // JSON 参数（tool/path/command）。
 let _hooksCache = { root: null, ts: 0, cfg: null };
 async function _loadHooks(root) {
@@ -50522,8 +50569,8 @@ async function _loadHooks(root) {
   if (_hooksCache.root === root && now - _hooksCache.ts < 15000) return _hooksCache.cfg;
   let cfg = null;
   try {
-    const hooksPath = root.replace(/\/+$/, "") + "/.michael/hooks.json";
-    const raw = await backend.readTextFile(hooksPath);
+    const { text: raw, rel: _hooksRel } = await _readFirstExisting(root, _stateRels("hooks.json"));
+    const hooksPath = root.replace(/\/+$/, "") + "/" + _hooksRel;
     const j = JSON.parse(raw);
     if (j && typeof j === "object") {
       // 这个文件跟着 git 仓库分发，内容却会被原样交给 shell —— 而且 hook 执行时
@@ -54984,7 +55031,7 @@ return { type: call.type, path: call.query || "", content: `[失败] ${call.type
       if (inTauri) {
         const dlRoot = root || rootPath || workspaceRoots[0] || "";
         if (dlRoot) {
-          const rel = (call.path && call.path.trim()) || `.michael-demos/demo-${Date.now()}.html`;
+          const rel = (call.path && call.path.trim()) || `.mrdayone-demos/demo-${Date.now()}.html`;
           const fp = rel.startsWith("/") ? rel : dlRoot + "/" + rel;
           try { await _commitDiskTextIfUnchanged(fp, null, _demoHtml(frames, title)); savedPath = rel; try { reloadDir(parentDir(fp)); } catch {} } catch { savedPath = ""; }
         }
@@ -55049,7 +55096,7 @@ return { type: call.type, path: call.query || "", content: `[失败] ${call.type
       step.classList.add("is-open");
       res.className = "atc-result"; res.innerHTML = `<span class="atc-spin"></span> 用 ${_escHtml(_exModel)} 画漫画中…`;
       const _exTs = (new Date()).toISOString().replace(/[:.]/g, "-").slice(0, 19);
-      const _exDest = ".michael-images/explain-" + _exTs + ".png";
+      const _exDest = ".mrdayone-images/explain-" + _exTs + ".png";
       const _exPrompt = _enrichExplainPrompt(call.prompt, call.title);
       try {
         const out = await backend.invoke("generate_image_chat", { root: _exRoot, baseUrl: _exCfg.baseUrl || MICHAEL_API, apiKey: _exCfg.apiKey || "", model: _exModel, prompt: _exPrompt, dest: _exDest, width: 1536, height: 1024, requestId: run?._reqId || null });
@@ -58819,7 +58866,7 @@ async function _skillInstallDir(repoFull, branch, dirPath, destName, onProgress,
   }
   if (meta && typeof meta === "object") {
     try {
-      await backend.writeTextFile(`${destBase}/.michael-skill.json`, JSON.stringify({
+      await backend.writeTextFile(`${destBase}/${_SKILL_META_NAME}`, JSON.stringify({
         ...meta,
         repoFull,
         branch,
@@ -61171,7 +61218,7 @@ async function runTaskWithProblems(task) {
 }
 
 function renderTasksTool(body) {
-  createToolHeader(body, "任务运行器", "自动发现 npm、Cargo、Makefile、.michael/tasks.json 和 .vscode/tasks.json 里的任务。可在终端运行，或用「问题」面板捕获输出、把编译器/检查器的报错汇总到问题面板。");
+  createToolHeader(body, "任务运行器", "自动发现 npm、Cargo、Makefile、.mrdayone/tasks.json 和 .vscode/tasks.json 里的任务。可在终端运行，或用「问题」面板捕获输出、把编译器/检查器的报错汇总到问题面板。");
   const actions = document.createElement("div");
   actions.className = "tool-actions";
   const refresh = document.createElement("button");
@@ -61203,7 +61250,7 @@ function renderTasksTool(body) {
       const tasks = await backend.tasksList(rootPath);
       list.innerHTML = "";
       if (!tasks.length) {
-        list.appendChild(createEmptyState("未发现任务。可添加 package.json scripts、Cargo.toml、Makefile、.michael/tasks.json 或 .vscode/tasks.json。"));
+        list.appendChild(createEmptyState("未发现任务。可添加 package.json scripts、Cargo.toml、Makefile、.mrdayone/tasks.json 或 .vscode/tasks.json。"));
         return;
       }
       for (const task of tasks) {
@@ -61913,7 +61960,7 @@ async function startDebugForActiveFile() {
 
 async function loadLaunchConfigs() {
   const configs = [];
-  for (const rel of [".vscode/launch.json", ".michael/launch.json"]) {
+  for (const rel of [".vscode/launch.json", ..._stateRels("launch.json")]) {
     if (!rootPath) break;
     try {
       const raw = await backend.readTextFile(`${rootPath}/${rel}`);
@@ -69865,7 +69912,7 @@ async function checkWorkspaceTrust(path) {
     title: "信任这个文件夹的作者吗？",
     detail: `${path}\n\n`
       + `信任后，Mr. Day One 会使用这个仓库自带的开发工具（例如 node_modules 里的\n`
-      + `语言服务器版本），并允许它的 .michael/hooks.json 运行。\n\n`
+      + `语言服务器版本），并允许它的 .mrdayone/hooks.json 运行。\n\n`
       + `不信任也能正常打开、阅读和编辑代码，你自己敲的命令照常执行——\n`
       + `只是不会去运行这个仓库提供的程序。\n\n`
       + `⚠️ 如果这是从网上 clone 来的、你还没读过的代码，请选择"不信任"。`,
