@@ -3613,7 +3613,9 @@ async function _runAutoCorrections(editor, changedLines) {
   // an O(lines) main-thread scan on every typing pause — skip it past 4000 lines (the other fixes are
   // already changed-line scoped and cheap). Prevents the "编辑大文件发烫" burn.
   const doubleFixes = model.getLineCount() <= 4000 ? _fixDoublePunctuation(model) : [];
-  const typoFixes = _fixKeywordTypos(model, changedLines);
+  // 标识符改写默认关：它会把 `elf` 改成 `elif`、`wit` 改成 `with`，分不出「拼错的关键字」
+  // 和「我就是要叫这个名字」。改的是用户已经写下的源码且无提示，必须由用户主动打开。
+  const typoFixes = effectivePrefs().autoFixTypos ? _fixKeywordTypos(model, changedLines) : [];
   const colonFixes = _fixPythonMissingColon(model, changedLines);
   const spaceFixes = _fixExtraSpaces(model, changedLines);
   const lspFixes = await _fixFromLspDiagnostics(editor);
@@ -3863,6 +3865,18 @@ const DEFAULT_EDITOR_SETTINGS = {
   cursorBlinking: "smooth",
   bracketColorization: true,
   autoSave: true,
+  // 打字停顿后自动改写**标识符拼写**。默认关。
+  //
+  // 它的判据是「和某个关键字/模块 API 的 Levenshtein 距离恰好为 1」，作用对象是任何
+  // 长度≥3、全字母、非驼峰、不含下划线、非全大写的小写词。`retrun`→`return` 是它想做的；
+  // 但 Python 里一个叫 `elf` 的变量会被改成 `elif`、`wit` 会被改成 `with`——它分不出
+  // 「拼错的关键字」和「我就是要叫这个名字的短变量」。
+  //
+  // 改的是**用户已经写下的源码**，而且没有提示、和普通输入一起进 undo 栈，
+  // 事后极难发现是谁干的。这种事必须是用户主动打开，不能默认替他做主。
+  // （其余自动修正——重复标点、Python 漏冒号、多余空格、LSP 诊断驱动的修复——
+  //   都只动明显笔误或有编译器背书，不受这个开关影响。）
+  autoFixTypos: false,
 };
 
 /*
@@ -60787,6 +60801,7 @@ const SETTINGS_SCHEMA = [
       { key: "minimap", labelKey: "feature.settings.minimap.label", type: "toggle" },
       { key: "stickyScroll", labelKey: "feature.settings.stickyScroll.label", type: "toggle" },
       { key: "bracketColorization", labelKey: "feature.settings.bracketColorization.label", type: "toggle" },
+      { key: "autoFixTypos", labelKey: "feature.settings.autoFixTypos.label", hintKey: "feature.settings.autoFixTypos.hint", type: "toggle" },
     ],
   },
   {

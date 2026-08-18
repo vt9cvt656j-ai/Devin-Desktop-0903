@@ -27687,3 +27687,18 @@ test("审批框要给真实 diff，不能只说「修改文件？src/auth.js」"
     "普通分支和「规则要求确认」分支要各拼一次，只改一个的话另一条路上预览会静静消失");
   assert.match(gate, /catch \{ _diffPreview = ""; \}/, "读盘失败必须降级成没有预览，不能让整道门挂掉");
 });
+
+test("改写用户标识符必须是用户主动打开的，不能默认替他做主", () => {
+  // _fixKeywordTypos 的判据是「和某个关键字/模块 API 的 Levenshtein 距离恰好为 1」，
+  // 作用对象是任何长度≥3、全字母、非驼峰、不含下划线的小写词。它分不出「拼错的关键字」
+  // 和「我就是要叫这个名字的短变量」——Python 里叫 elf 的变量会被改成 elif、wit 改成 with。
+  //
+  // 而它改的是**用户已经写下的源码**，无提示、和普通输入一起进 undo 栈，事后极难发现
+  // 是谁干的。所以默认必须是关，且必须在设置里能看见、能开。
+  assert.match(SRC, /autoFixTypos:\s*false\s*,/,
+    "自动改写标识符必须默认关闭——它会把用户自己起的短变量名改掉");
+  assert.match(SRC, /effectivePrefs\(\)\.autoFixTypos \? _fixKeywordTypos\(/,
+    "_fixKeywordTypos 必须被 autoFixTypos 开关挡着，而不是无条件执行");
+  assert.match(SRC, /\{ key: "autoFixTypos", labelKey: "feature\.settings\.autoFixTypos\.label"/,
+    "这个开关必须出现在设置里——藏起来的默认值等于没得选");
+});
