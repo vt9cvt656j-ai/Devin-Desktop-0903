@@ -23611,6 +23611,22 @@ async function _agentRuntimeStateBlock(root = "") {
   const terminalLines = _formatAgentTerminalLines(12);
   if (terminalLines.length) {
     parts.push(`IDE终端（普通终端 + Agent任务终端，按最近活动排序）:\n${terminalLines.map((line) => "  - " + line).join("\n")}`);
+    // 已退出的终端要附上真实输出尾巴。
+    //
+    // 这一块原来只有元数据（编号 / 状态 / 标签 / 命令行 / URL / cwd），**一个字节输出都没有**。
+    // 于是 `npm run dev` 崩了之后，模型下一轮看到的是「#2 [已退出] 任务终端 · $ npm run dev」
+    // ——它知道进程没了，却不知道为什么，然后继续往下写。真输出只在 read_terminal /
+    // read_logs 那条「拉」的路径上，可模型得先意识到有问题才会去拉。
+    //
+    // 只贴已退出的（运行中的服务日志会刷屏且多半是正常输出），每个截 600 字尾巴。
+    const _dead = _agentTerminalEntries()
+      .sort((a, b) => b.lastActivityAt - a.lastActivityAt)
+      .filter((it) => it.status === "已退出" && String(it.recent || "").trim())
+      .slice(0, 3);
+    for (const it of _dead) {
+      const tail = _redactSecrets(String(it.recent).trim().slice(-600));
+      parts.push(`终端 #${it.index + 1}「${it.label}」已退出，最后输出:\n${tail}`);
+    }
     const urls = [];
     for (const item of _agentTerminalEntries().sort((a, b) => b.lastActivityAt - a.lastActivityAt)) {
       for (const url of item.urls) if (!urls.includes(url)) urls.push(url);
@@ -23620,6 +23636,29 @@ async function _agentRuntimeStateBlock(root = "") {
   } else {
     parts.push("IDE终端: 当前没有打开的终端；需要看运行报错时先用 run_cmd/read_logs，长期服务用 run_in_terminal。");
   }
+  // git 现场。模型原来完全看不到分支和自己改脏了哪些文件——refreshGitStatus 的 20 个
+  // 调用点全是 UI 侧，零上下文注入。唯一能拿到 git 事实的路径是它主动调 probe_env，
+  // 而那个只给「分支 X，未提交 N 个文件」，**没有文件清单**。
+  // 于是它不知道自己这一轮动过哪些文件、也不知道有没有别人的未提交改动混在里面。
+  try {
+    const _gitFiles = Array.isArray(_lastGitFiles) ? _lastGitFiles : [];
+    // 分支名没有单独的状态变量，它只落在 git 面板那个 DOM 节点上（refreshGitStatus 里
+    // `gitBranchNameEl.textContent = status.branch`）。读它比再发一次 git_status 便宜，
+    // 而且和用户看到的一定一致。"—" 是它的空态占位。
+    let _branch = "";
+    try { _branch = String(gitBranchNameEl?.textContent || "").trim(); } catch {}
+    if (_branch === "—") _branch = "";
+    if (_branch || _gitFiles.length) {
+      const names = _gitFiles
+        .map((f) => String(f?.path || f?.rel || f || "") + (f?.staged ? "(已暂存)" : ""))
+        .filter((n) => n && n !== "(已暂存)");
+      parts.push(`Git: ${_branch ? `分支 ${_branch}` : "（分支未知）"}`
+        + (names.length
+          ? ` · ${names.length} 个未提交改动: ${names.slice(0, 12).join(", ")}${names.length > 12 ? " 等" : ""}`
+          : " · 工作区干净"));
+    }
+  } catch { /* git 面板还没就绪 */ }
+
   const serviceHints = await _agentProjectServiceHints(root);
   if (serviceHints) parts.push(serviceHints);
   else parts.push("项目后端/API/DB线索: 本块的启发式扫描未命中（只代表扫描器没认出来，绝不等于目录为空或没有后端）——判断项目内容一律以项目上下文里的目录树和 list_dir 真实结果为准。");
@@ -47481,7 +47520,17 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
       // 最坏 1.6 秒被超时兜底整轮吃掉。10 轮的任务白多 16 秒，改一个字符串这种只需要
       // 两三轮的活也照付。用户感觉是"它每做一步都要愣一下"。
       // 这些事实只在**工作区真的变了**之后才会不同，run._fsMutTick 已经在维护这个信号。
-      const _fsTickNow = run._fsMutTick || 0;
+      // 缓存键不能只看文件变化。这一块现在还带着**终端状态**（已退出的终端 + 它的最后输出）
+      // 和 git 现场，而 `npm run dev` 崩掉时一个文件都不会动——只用 _fsMutTick 当键的话，
+      // 进程死了、输出也有了，模型整轮拿到的仍是那份写着「运行中」的旧快照。
+      // 把终端的最近活动时间叠进键里：终端一有动静（启动/输出/退出）就重建。
+      let _termTick = 0;
+      try {
+        for (const it of _agentTerminalEntries()) {
+          _termTick = Math.max(_termTick, Number(it.lastActivityAt) || 0, it.status === "已退出" ? 1 : 0);
+        }
+      } catch {}
+      const _fsTickNow = `${run._fsMutTick || 0}:${_termTick}`;
       if (run._rtStateTick !== _fsTickNow) {
         run._rtState = await _promiseOrFallbackWithin(_agentRuntimeStateBlock(root), 1600, "");
         run._rtStateTick = _fsTickNow;
