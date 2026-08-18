@@ -72,6 +72,26 @@ export function isSupportedLocale(locale) {
   return !!BASE_LANGUAGE_TO_SUPPORTED_TAG[localeLanguageCode(tag, "")];
 }
 
+export function systemPreferredLocale(fallback = "zh-CN") {
+  // 首启没有用户显式选择时的默认语言：跟随操作系统/浏览器语言，而不是硬编码 zh-CN。
+  // 只有我们**真正支持**的语言才跟随（navigator.languages 是按用户偏好排序的，取第一条命中的）；
+  // 都不支持时才落回 fallback。这样中文系统开出中文、日文系统开出日文，而法语这类未支持的
+  // 语言不会被 coerce 静默塞成某个随机支持项——它明确走 fallback。用户一旦手动选过语言，
+  // 上层用 saved 覆盖本函数，这里永不生效。
+  try {
+    const nav = (typeof navigator !== "undefined") ? navigator : null;
+    if (nav) {
+      const candidates = Array.isArray(nav.languages) && nav.languages.length
+        ? nav.languages
+        : (nav.language ? [nav.language] : []);
+      for (const cand of candidates) {
+        if (isSupportedLocale(cand)) return coerceSupportedLocale(cand, fallback);
+      }
+    }
+  } catch {}
+  return coerceSupportedLocale(fallback, "zh-CN");
+}
+
 export function localeDisplayName(locale, displayLocale = "zh-CN") {
   const tag = coerceSupportedLocale(locale);
   if (LABEL_OVERRIDES[tag]) return LABEL_OVERRIDES[tag];
