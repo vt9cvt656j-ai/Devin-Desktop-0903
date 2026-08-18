@@ -11526,12 +11526,14 @@ test("natural-language capability queries are routed by the semantic tool orches
     recommendToolsForIntent: load("recommendToolsForIntent"),
     _buildScenarioSignature: scenarioSignature,
     _toolExpRetrieve: load("_toolExpRetrieve", { _buildScenarioSignature: scenarioSignature }),
-    fetch: async (_url, options) => {
-      request = JSON.parse(options.body);
-      return { ok: true, json: async () => ({ choices: [{ message: { content: JSON.stringify({
+    // 这条测试关心的是**编排逻辑**，不是传输。传输（SSE 拼装 / JSON 兜底）另有专门的
+    // 测试，这里直接给它定稿文本，顺便捕获真正发出去的请求体。
+    _fetchCompletionText: async (_url, _headers, payload) => {
+      request = payload;
+      return JSON.stringify({
         tools: ["local_discovery", "not_registered"],
         instruction: "Use the local structured-data tool for the requested nearby-place evidence.",
-      }) } }] }) };
+      });
     },
   });
   const decision = await route({
@@ -17722,14 +17724,15 @@ test("语义收尾评审工具仍可独立使用，但 quiet turn 不会被评�
     _chatCompletionsUrl: () => "https://gateway.example/v1/chat/completions",
     _safeJsonLoose: JSON.parse,
     enrichedCatalogLine,
-    fetch: async (_url, options) => {
-      reviewRequest = JSON.parse(options.body);
-      return { ok: true, json: async () => ({ choices: [{ message: { content: JSON.stringify({
+    // 同上：这条测试关心评审逻辑，不关心传输。给定稿文本，顺便捕获请求体。
+    _fetchCompletionText: async (_url, _headers, payload) => {
+      reviewRequest = payload;
+      return JSON.stringify({
         done: false,
         verified: false,
         instruction: "Start isolated capture, drive the login flow, then inspect the captured request before retrying.",
         tools: ["capture_start", "browser", "capture_flows", "background_monitor", "not_registered"],
-      }) } }] }) };
+      });
     },
   });
   const verdict = await critic({
@@ -22573,6 +22576,49 @@ test("交付事实来自执行记录，不做任何推断", () => {
   );
   // 没动代码就没什么可核对的，不制造噪音。
   assert.equal(facts({ _mutatedFiles: new Set(["README.md"]), _executionEvidence: [] }), "");
+});
+
+test("客户端直连网关的那几条也要走 SSE——同步请求在中转那边是整段生成完才回", async () => {
+  // 之前那次"全部改 SSE"只扫了两棵 Rust 源码树，漏了 main.js 里的**直连 fetch**：
+  // _semanticToolOrchestrator（每轮都跑的工具编排）、_wrapUpCritic、_predictNextAsk。
+  // 用户 Sub2API 控制台里那些"同步"请求，大头正是它们。
+  const sse = (body, ctype = "text/event-stream") => async () => ({
+    ok: true,
+    headers: { get: () => ctype },
+    body: {
+      getReader() {
+        let sent = false;
+        return {
+          read: async () => (sent ? { done: true } : (sent = true, { done: false, value: new TextEncoder().encode(body) })),
+          cancel: async () => {},
+        };
+      },
+    },
+  });
+  const run = (fetchImpl) => load("_fetchCompletionText", { fetch: fetchImpl })(
+    "https://gw.test/v1/chat/completions", {}, { model: "m", messages: [] }, undefined);
+
+  // OpenAI 形状
+  assert.equal(await run(sse('data: {"choices":[{"delta":{"content":"你好"}}]}\ndata: {"choices":[{"delta":{"content":"世界"}}]}\ndata: [DONE]\n')), "你好世界");
+  // 原生 Anthropic 形状（网关对 Claude 路由用的就是它）
+  assert.equal(await run(sse('data: {"type":"content_block_delta","delta":{"text":"ab"}}\ndata: [DONE]\n')), "ab");
+  // 心跳和半截 JSON 不能把整轮判失败
+  assert.equal(await run(sse(': ping\ndata: {malformed\ndata: {"choices":[{"delta":{"content":"ok"}}]}\ndata: [DONE]\n')), "ok");
+  // 中转无视 stream:true 直接回 JSON —— 没有这条兜底，那些线路会整条失效
+  assert.equal(
+    await run(async () => ({ ok: true, headers: { get: () => "application/json" }, json: async () => ({ choices: [{ message: { content: "plain" } }] }) })),
+    "plain");
+  // 桩式响应（没有 headers / body）也要走兜底，而不是抛出去变成"这条能力静默失灵"
+  assert.equal(await run(async () => ({ ok: true, json: async () => ({ choices: [{ message: { content: "bare" } }] }) })), "bare");
+  // 请求体里必须真的带上 stream:true，否则改了个寂寞
+  let sentBody = null;
+  await run(async (_u, o) => { sentBody = JSON.parse(o.body); return { ok: true, json: async () => ({}) }; });
+  assert.equal(sentBody.stream, true, "没带 stream:true —— 中转还是会整段生成完才回");
+
+  // 源码层面：客户端不许再有同步出站（注释里提到的字样除外）。
+  const src = stripJsComments(SRC);
+  assert.doesNotMatch(src, /stream:\s*false/,
+    "又出现同步出站请求了——中转会等整段生成完才回，用户那边就是干等");
 });
 
 test("剥注释的顺序不能反——一条注释里的 glob 曾经吞掉 45KB 代码", () => {
