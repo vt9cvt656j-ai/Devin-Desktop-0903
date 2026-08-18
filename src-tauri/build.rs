@@ -32,12 +32,42 @@ fn assert_sidecar_is_authenticated() {
         .join("binaries")
         .join(format!("automation-server-{target}{suffix}"));
     println!("cargo:rerun-if-changed={}", path.display());
+    // crate 源码也要盯着。Tauri **不会**自动重编 automation-framework（它是独立 crate、
+    // 没有依赖边），所以改了那边的源码、只重编本 crate，跑起来的还是旧二进制 ——
+    // 改了等于没改，而且不报错。这是本仓库记录在案的坑，实测踩过。
+    let crate_src = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../automation-framework/src");
+    println!("cargo:rerun-if-changed={}", crate_src.display());
+
     let Ok(bytes) = std::fs::read(&path) else {
         // 文件不存在是 Tauri 自己的 externalBin 检查该报的错，这里不越俎代庖。
         return;
     };
+
+    // 源码比二进制新 = 这份二进制是旧的。这里必须**拦下来**：让它安静地打进包，
+    // 用户拿到的就是一个"你以为修好了"的版本。
+    if let (Ok(bin_time), Some(src_time)) = (
+        std::fs::metadata(&path).and_then(|m| m.modified()),
+        newest_mtime(&crate_src),
+    ) {
+        if src_time > bin_time {
+            panic!(
+                "\n\n  {} 比它自己的源码旧。\n\
+                 \n  automation-framework 是独立 crate，Tauri 不会替你重编它 —— 直接打包的话，\
+                 \n  你对那份源码做的任何修改都不会出现在产品里，而且一声不响。\
+                 \n\n  重新构建：\
+                 \n      cd automation-framework && cargo build --release --target {target} --bin automation-server\
+                 \n      cp target/{target}/release/automation-server{} ../src-tauri/binaries/automation-server-{target}{}\n\n",
+                path.display(),
+                suffix,
+                suffix,
+            );
+        }
+    }
     let has = |needle: &str| bytes.windows(needle.len()).any(|w| w == needle.as_bytes());
-    if !has("MICHAEL_AUTOMATION_TOKEN") || !has("unauthorized") {
+    // `mouse.move` 是 RPC 方法名，只有真的 automation-server 才有。仓库里出现过一个
+    // 名字体积都像真的、里面却是 Rust std 空壳的 Windows 二进制——只验鉴权字符串挡不住它。
+    if !has("MICHAEL_AUTOMATION_TOKEN") || !has("unauthorized") || !has("mouse.move") {
         panic!(
             "\n\n  {} 里没有鉴权痕迹。\n\
              \n  这个 sidecar 能合成真实键鼠事件；没有鉴权 = 本机任意进程（含浏览器里的网页）\
@@ -50,6 +80,26 @@ fn assert_sidecar_is_authenticated() {
             suffix,
         );
     }
+}
+
+/// 目录下最新的修改时间（递归）。
+fn newest_mtime(dir: &std::path::Path) -> Option<std::time::SystemTime> {
+    let mut newest: Option<std::time::SystemTime> = None;
+    let entries = std::fs::read_dir(dir).ok()?;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let t = if path.is_dir() {
+            newest_mtime(&path)
+        } else {
+            entry.metadata().and_then(|m| m.modified()).ok()
+        };
+        if let Some(t) = t {
+            if newest.is_none_or(|n| t > n) {
+                newest = Some(t);
+            }
+        }
+    }
+    newest
 }
 
 fn main() {

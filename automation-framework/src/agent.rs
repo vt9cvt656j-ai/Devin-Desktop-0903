@@ -145,6 +145,17 @@ impl Agent {
         sys.mouse_location()
     }
 
+    /// 拍屏幕。`region` 为 None 就是整屏。返回 PNG 的 data URL。
+    #[cfg(feature = "system")]
+    pub fn screen_capture(&mut self, region: Option<(i32, i32, i32, i32)>) -> Result<String> {
+        self.system_init()?;
+        let sys = self.system.as_ref()
+            .ok_or_else(|| Error::System("系统自动化未初始化".to_string()))?
+            .lock()
+            .map_err(|e| Error::System(format!("Mutex 中毒: {}", e)))?;
+        sys.screen_capture(region)
+    }
+
     #[cfg(feature = "system")]
     pub fn mouse_click(&mut self, button: Option<&str>) -> Result<()> {
         self.system_init()?;
