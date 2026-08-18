@@ -1024,6 +1024,14 @@ pub async fn me(State(state): State<AppState>, claims: Claims) -> ApiResult<Json
             "free_points_daily".into(),
             json!(crate::models::free_points_daily()),
         );
+        // 免费池扣完之后会不会接着扣钱包/会员额度。客户端必须知道这一条才能把话说对：
+        // 池子见底那句原来写的是「今日已用完 · 明天 0 点重置（付费模型不受影响）」——
+        // 只说了付费模型不受影响，一个字都没提免费模型此刻正在扣余额。开关在服务端
+        // （MICHAEL_FREE_FALLBACK_PAID），客户端猜不到，所以随资料一起下发。
+        obj.insert(
+            "free_fallback_to_paid".into(),
+            json!(crate::models::free_fallback_to_paid()),
+        );
         // 面值分母随资料一起下发。客户端与两个管理页原先各自硬编码 663，其中三处还在
         // 写路径上（管理员输入的美元由前端乘 663 变成存库的真实分），改一处不改其余就会
         // "发出去多少"和"显示多少"对不上。现在只有服务端有这个数。

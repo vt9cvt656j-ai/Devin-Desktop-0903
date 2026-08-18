@@ -14209,9 +14209,19 @@ function _freePointsMetric(metric, _usd, u) {
   // display would sit at "40 点" through dozens of calls and look broken. Trim trailing
   // zeros so a full pool still reads "40 点", not "40.00 点".
   const shown = (Math.round(pts * 100) / 100).toString();
+  // 池子扣完之后免费模型会不会接着扣钱包/会员额度 —— 服务端开关，随资料下发。
+  // 老网关不发这个字段：那种情况下按旧行为（扣完就停）说话，不去猜。
+  const fallsBack = u?.free_fallback_to_paid === true;
+  // 这句话原来在两头都说错了：还剩零头时写「仅限免费模型」，而此刻**每一次调用都在扣钱包**
+  // （零头盖不住一次调用，结算就整笔落到付费路径）；见底时写「付费模型不受影响」，只说了
+  // 付费模型，一个字都没提免费模型正在扣余额。用户第一次发现是在账单上。
   const sub = pts > 0
-    ? `仅限免费模型 · 每日 0 点重置为 ${daily} 点（约 ${yuan(daily)}）`
-    : "今日已用完 · 明天 0 点重置（付费模型不受影响）";
+    ? (fallsBack
+      ? `每日 0 点重置为 ${daily} 点（约 ${yuan(daily)}）· 扣完后免费模型改用余额 / 会员额度`
+      : `仅限免费模型 · 每日 0 点重置为 ${daily} 点（约 ${yuan(daily)}）`)
+    : (fallsBack
+      ? "今日已用完 · 免费模型现在扣的是余额 / 会员额度 · 明天 0 点重置"
+      : "今日已用完 · 明天 0 点重置（付费模型不受影响）");
   return metric("免费额度", shown + " 点", pct, sub, true);
 }
 
@@ -21281,7 +21291,12 @@ const _aiIntentInflight = new Map(); // key -> 物理请求 Promise；前台窗�
 // 抬高这个数**没有代价**，这一点是关键：它是 Promise.race 的超时臂，裁决一落定就立刻放行。
 // 所以 8000 → 15000 只在「裁决慢到 8 秒以上」（也就是现在本来就失败）的那些轮次多等，
 // 快的轮次一毫秒都不多花。上限存在的意义只剩一个：上游卡死时别把一轮无限期挂住。
-const _INTENT_FOREGROUND_WAIT_MS = 15000;
+// 6 秒，不是 15 秒：这个上限只在「裁决比它慢」的轮次才起作用，而那正是要止损的场景。
+// 上面那段"抬高没有代价"的推理漏了一件事——**上游慢的时候裁决必然赶不上**，于是这个
+// 数字就成了每一轮实打实多付的墙钟时间（配合下面改成"等过就算付过"，现在整个会话最多
+// 付一次）。生产实测：健康时裁决 6.9~7.6 秒到响应头，上游拥堵时 19.8 秒。6 秒能接住
+// 健康时的快通道，接不住的那些本来也不该把用户的每一条消息都拖住。
+const _INTENT_FOREGROUND_WAIT_MS = 6000;
 // 新会话第一轮愿意为意图裁决多等多久。整个会话只付一次：拿到裁决之后画像就粘住了。
 //
 // 这个值必须 >= 前台窗口，否则这道等待是**恒定失败**的：裁决用的是用户选的那个模型
@@ -25369,7 +25384,17 @@ async function sendPrompt(text, attachments = [], readyConfig = null, opts = {})
     } catch {}
     if (_waitTimer) clearTimeout(_waitTimer);
     // 裁决落定即记账：零 flag 也算付过了。超时没落定的不记，下一轮还值得再等一次。
-    if (_turnIntentState.settled) sess._intentWaitPaid = true;
+    // 付款按「等过一次」算，不按「等到了」算。
+    //
+    // 原来只有 settled 才记账，看着更严谨，实际是个复利陷阱：裁决走的是用户选的那个模型，
+    // 上游慢的时候它本来就赶不上（这段注释上面自己写着"实测 19.8 秒"，而窗口 15 秒）。
+    // 于是 settled 永远为假 → 永远记不上账 → **每一轮都再干等一个完整窗口**。用户那边
+    // 量到的就是：同一个 API 在别的软件里飞快，在这里每条消息都先卡十几秒。
+    //
+    // 等不到不影响正确性：裁决在后台继续跑，落定后由 _applyLateIntentIfLanded 在循环
+    // 边界补上，行为闸门照样只认它。代价仅仅是这一轮的画像弱一点、前缀缓存作废一次——
+    // 那是一次性的，而旧写法是每轮一次的。
+    sess._intentWaitPaid = true;
     if (_turnIntentState.settled && _turnIntentState.verdict) {
       const _base = _semanticEngineeringEvidence(text);
       _base._isAgentMode = effectiveMode === "agent";

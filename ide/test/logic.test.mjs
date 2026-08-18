@@ -21333,6 +21333,27 @@ test("context-window choice clamps to what is actually deliverable", () => {
 // exactly 40 点. The first cut stored raw provider cents and rendered them through the
 // credit-dollar denominator (663 raw cents = $1.00), which showed a ¥2 allowance as "$3.02" —
 // a real number in the wrong currency. Points are the unit; render them as such.
+test("免费池的文案要说清扣完之后扣的是谁的钱", () => {
+  // 两头都说错过：还剩零头时写「仅限免费模型」，而此刻每一次调用都在扣钱包（零头盖不住
+  // 一次调用，结算整笔落到付费路径）；见底时写「付费模型不受影响」，只说了付费模型，
+  // 一个字都没提免费模型正在扣余额——用户第一次发现是在账单上。
+  const metric = (_label, _val, _pct, sub) => sub;
+  const fp = load("_freePointsMetric", {});
+  const u = (points, fallback) => ({ free_points: points, free_points_daily: 40, free_fallback_to_paid: fallback });
+
+  assert.match(fp(metric, 0, u(0, true)), /免费模型现在扣的是余额 \/ 会员额度/,
+    "池子见底、且网关开了回落 —— 必须说清现在扣谁的钱");
+  assert.match(fp(metric, 0, u(0.04, true)), /扣完后免费模型改用余额 \/ 会员额度/,
+    "还剩零头时也要提前说，不能写「仅限免费模型」");
+  assert.doesNotMatch(fp(metric, 0, u(0.04, true)), /仅限免费模型/);
+
+  // 网关没开回落（或是老网关不发这个字段）时保持旧话术，不去猜。
+  assert.match(fp(metric, 0, u(0, false)), /付费模型不受影响/);
+  assert.match(fp(metric, 0, u(0.04, false)), /仅限免费模型/);
+  assert.match(fp(metric, 0, { free_points: 0, free_points_daily: 40 }), /付费模型不受影响/,
+    "老网关不发这个字段就按旧行为说话");
+});
+
 test("free allowance renders in 点 and never through the dollar denominator", () => {
   const fn = load("_freePointsMetric");
   const seen = [];
@@ -25820,6 +25841,31 @@ test("journal 跑在 checkpoint 前面时，要把那截真正补回模型上下
 
   const src = stripJsComments(extractFn("_ensureSessionTranscript"));
   assert.match(src, /adoptJournalTail/, "恢复时只对齐计数、不补内容，等于让模型停在旧 checkpoint");
+});
+
+test("崩溃恢复补上的那批消息，溢出的头部要归档而不是凭空消失", () => {
+  // 这条路正好是崩溃重开那条：日志比 checkpoint 跑得远，恢复时把差额补进来。原来补完
+  // 直接 `slice(-RECENT_WINDOW)`，超出窗口的头部一刀切掉——而这批消息**同时**从模型上下文
+  // 和 recall_conversation 里消失。别的丢弃路径都归档，只有这里没有，于是"崩溃前聊过的
+  // 那一段"成了谁都找不回来的黑洞，偏偏那是用户最需要它还在的时刻。
+  const mem = new ConversationMemory();
+  const msg = (i) => ({ role: i % 2 ? "assistant" : "user", content: `第 ${i} 条消息，内容要够长才看得出被归档到哪里去了。` });
+  // 先把 recent 填到接近上限
+  for (let i = 0; i < 96; i++) mem.push(msg(i));
+  const archivedBefore = mem.archive.length;
+  const before = mem.totalTurns;
+
+  // 崩溃恢复：日志比 checkpoint 多出 20 条
+  const journal = Array.from({ length: 20 }, (_, i) => msg(100 + i));
+  const added = mem.adoptJournalTail(journal, before + 20);
+  assert.equal(added, 20, "该补的都补上了");
+  assert.ok(mem.recent.length <= 100, "recent 仍然有界");
+  assert.ok(mem.archive.length > archivedBefore,
+    "溢出的头部被直接扔了——它同时从模型上下文和 recall_conversation 里消失了");
+
+  // 被挤出去的那几条要真的能被回忆到（按内容找，不是只看条数）。
+  const archivedText = mem.archive.map((a) => a.text).join("\n");
+  assert.match(archivedText, /第 0 条消息/, "最早那条既不在 recent 也不在归档里 = 永久丢失");
 });
 
 test("落盘文本预算按会话分配，且用尽时也不得写成空串", () => {

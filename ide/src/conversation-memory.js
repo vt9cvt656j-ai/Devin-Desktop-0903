@@ -446,9 +446,17 @@ export class ConversationMemory {
     const missing = Math.min(tail.length, target - known);
     if (missing <= 0) return 0;
     const added = tail.slice(tail.length - missing);
-    this.recent = [...this.recent, ...added].slice(-RECENT_WINDOW);
+    this.recent = [...this.recent, ...added];
     this._recentChars = this.recent.reduce((total, message) => total + ConversationMemory._messageChars(message), 0);
     this.totalTurns = target;
+    // 溢出的头部要**归档**，不能直接 slice 掉。
+    //
+    // 这条路正好是崩溃重开那条：日志比 checkpoint 跑得远（流式期间 saveChatHistory 降级、
+    // 不写 checkpoint，但每条消息都进了 SQLite），恢复时把差额补进来。`slice(-RECENT_WINDOW)`
+    // 一刀切掉超出的头部，而这批消息**同时**从模型上下文和 recall_conversation 里消失——
+    // 别的丢弃路径（push / fromJSON / truncate）都走 _compressOldestBatch 归档，只有这里没走。
+    // 于是"崩溃前聊过的那一段"变成谁都找不回来的黑洞，而这正是用户最需要它还在的时刻。
+    while (this.recent.length > RECENT_WINDOW) this._compressOldestBatch();
     if (!this.transcript.length) this.transcriptOffset = target;
     return added.length;
   }

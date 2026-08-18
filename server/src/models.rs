@@ -2428,11 +2428,18 @@ pub async fn chat(
         .filter(|s| !s.is_empty())
         .map(String::from)
         .unwrap_or_else(|| model.model_id.clone().unwrap_or_default());
-    let (_pre_mode, _pre_percall, pre_free) = effective_billing(&model, &_pre_mid);
+    let (_pre_mode, _pre_percall, pre_free, _pre_micro) = effective_billing_micro(&model, &_pre_mid);
+    // 这条路由此前**用订阅额度放行、却用钱包结算**：admit_billing 收到 quota_ok=true 就放行，
+    // 而下面 bill(..., use_quota=false, ...) 只扣钱包。只有会员额度、钱包是 0 的用户，
+    // 每一次调用都在把钱包记成负数——声明里的"扣订阅额度"在这条路由上从没发生过。
+    let mut use_quota = false;
     if pre_free {
         // 免费池空了不再直接拒绝：改用会员额度/钱包继续。这道门要和另外两个准入口
         // 同一条规则，否则又会出现"同一个免费模型，从这个接口能用、从那个接口说没额度"。
-        if free_points_balance(&state, uid).await <= 0 {
+        //
+        // 判据必须是"这一次付得起吗"，不是"还剩不剩一点"：结算全额扣或一点不扣，
+        // 余数永远清不空，`<= 0` 当天就再也为真不了（和另外两个入口同一个坑）。
+        if !free_pool_covers_call(free_points_balance(&state, uid).await, _pre_micro) {
             let (plan, plan_exp, q_total, q_window, q_weekly_cap, q_week_used, credits): (
                 String, Option<chrono::DateTime<chrono::Utc>>, i64, i64, i64, i64, i64,
             ) = sqlx::query_as(
@@ -2452,6 +2459,8 @@ pub async fn chat(
                 free_fallback_to_paid(), true, false, quota_ok, credits,
                 plan_active, q_total, q_window, q_weekly_cap, q_week_used,
             )?;
+            // 放行靠的是哪个池子，结算就得扣哪个。
+            use_quota = quota_ok;
         }
     } else {
         let not_free = model.rate > 0.0
@@ -2550,7 +2559,7 @@ pub async fn chat(
     // model_usage with NULL mode/tool_turn and the routing report silently under-counts.
     tokens.mode = step_mode(&headers);
     tokens.tool_turn = step_is_tool_turn(&body);
-    bill(&state, uid, model.id, cost, false, &tokens, free_pool, free_micro).await;
+    bill(&state, uid, model.id, cost, use_quota, &tokens, free_pool, free_micro).await;
     Ok(Json(data))
 }
 
@@ -4310,6 +4319,18 @@ pub fn free_pool_covers_call(balance: i64, per_call_micro_usd: i64) -> bool {
     balance >= free_points_needed(per_call_micro_usd)
 }
 
+/// 亚分零头进位：`(这次要扣的整分, 留到下次的零头)`。
+///
+/// 钱包和会员额度都是整分，而免费模型常常按次计价到亚分（实测 $0.003/次 = 3000 micro-USD）。
+/// 免费池空了之后这类调用落到付费路径，换算成整分是 0 —— 于是**两边都不扣**，模型变成
+/// 真正的无限免费。四舍五入到 1 分是 3.3 倍溢价，不收是白送；累计到攒够一分再扣才两头都对。
+///
+/// 只处理零头：整分部分照旧走 requested_cost，这里不重复收。
+pub fn carry_to_cents(carry: i64, add_micro_usd: i64) -> (i64, i64) {
+    let total = carry.max(0).saturating_add(add_micro_usd.max(0));
+    (total / MICRO_USD_PER_CENT, total % MICRO_USD_PER_CENT)
+}
+
 /// 三个准入口（chat / chat_completions / responses）共用的判定。
 ///
 /// 分开写过一次，代价是同一个免费模型从 IDE 能用、从走 /v1/responses 的客户端被判成
@@ -4422,6 +4443,30 @@ async fn bill(
         }
         // 落下去，按普通付费调用结算（quota → 钱包）。
     }
+    // 亚分零头：免费模型常按次计价到亚分（$0.003 = 3000 micro-USD），而 requested_cost 是
+    // 整分。掉到这里时它换算成整分往往是 0 —— 于是免费池空了之后两边都不扣，模型变成真正的
+    // 无限免费。把零头累计起来，攒够一分才真的扣一分（carry_to_cents），余下的留到下一次。
+    // 只对**从免费分支掉下来的**调用生效：普通付费模型的价格本来就是整分，不该被改口径。
+    let mut carried_cents = 0i64;
+    if free_pool && free_micro_usd > 0 && free_fallback_to_paid() {
+        let prior: Option<(i64,)> =
+            sqlx::query_as("SELECT micro_usd_carry FROM users WHERE id = $1 FOR UPDATE")
+                .bind(uid)
+                .fetch_optional(&mut *tx)
+                .await
+                .unwrap_or(None);
+        let (cents, rest) = carry_to_cents(prior.map(|(c,)| c).unwrap_or(0), free_micro_usd);
+        carried_cents = cents;
+        if let Err(error) = sqlx::query("UPDATE users SET micro_usd_carry = $1 WHERE id = $2")
+            .bind(rest)
+            .bind(uid)
+            .execute(&mut *tx)
+            .await
+        {
+            tracing::error!(%error, "failed to persist sub-cent carry");
+        }
+    }
+    let requested_cost = requested_cost + carried_cents;
     let charge = if requested_cost == 0 {
         FusedCharge::default()
     } else {
@@ -8074,6 +8119,82 @@ mod billing_tests {
     /// `admit_billing` 直接 `return Ok(true)`，它后面的"改走会员额度/钱包"和两条 402
     /// 整段不可达。用户要的"免费用完接着扣余额和订阅"到不了，没余额的用户也永远收不到
     /// 402，欠款无上限地记进钱包。
+    #[test]
+    /// 亚分零头要累计，不能既不四舍五入也不收。
+    ///
+    /// 钱包和会员额度都是整分，而免费模型常按次计价到亚分（$0.003 = 3000 micro-USD）。
+    /// 免费池空了之后这类调用落到付费路径，换算成整分是 0 —— 两边都不扣，模型变成真正的
+    /// 无限免费。进位到 1 分是 3.3 倍溢价，不收是白送；攒够一分再扣才两头都对。
+    fn sub_cent_fees_accumulate_instead_of_vanishing() {
+        let micro = 3_000; // $0.003/次
+        // 前三次都不该扣：3000 / 6000 / 9000 都不到一分。
+        let (c1, r1) = super::carry_to_cents(0, micro);
+        assert_eq!((c1, r1), (0, 3_000));
+        let (c2, r2) = super::carry_to_cents(r1, micro);
+        assert_eq!((c2, r2), (0, 6_000));
+        let (c3, r3) = super::carry_to_cents(r2, micro);
+        assert_eq!((c3, r3), (0, 9_000));
+        // 第四次跨过一分：扣 1 分，余 2000 留着。
+        let (c4, r4) = super::carry_to_cents(r3, micro);
+        assert_eq!((c4, r4), (1, 2_000), "攒够一分就要真的扣一分");
+
+        // 十次总共 30000 micro = 3 分，一分不多一分不少。
+        let (mut carry, mut cents) = (0i64, 0i64);
+        for _ in 0..10 {
+            let (c, rest) = super::carry_to_cents(carry, micro);
+            cents += c;
+            carry = rest;
+        }
+        assert_eq!(cents, 3, "十次 $0.003 就是 3 分");
+        assert_eq!(carry, 0);
+
+        // 一整分的费用直接扣，不留零头；负数和 0 不产生扣费也不产生负零头。
+        assert_eq!(super::carry_to_cents(0, super::MICRO_USD_PER_CENT), (1, 0));
+        assert_eq!(super::carry_to_cents(0, 0), (0, 0));
+        assert_eq!(super::carry_to_cents(-5, -5), (0, 0), "脏数据不许变成负债");
+
+        // 纯函数对了不等于接进去了 —— 这一步单独钉住，否则把 `+ carried_cents` 删掉
+        // 上面每一条都还是绿的，而免费池空了以后依旧一分不扣。
+        let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/models.rs"))
+            .expect("read models.rs");
+        let at = src.find("async fn bill(").expect("bill 改名了");
+        let body: String = src[at..].chars().take(12_000).collect();
+        assert!(
+            body.contains("let requested_cost = requested_cost + carried_cents;"),
+            "零头算出来了却没加进这次的扣费——免费池空了之后仍然一分不扣",
+        );
+        assert!(
+            body.contains("if free_pool && free_micro_usd > 0 && free_fallback_to_paid()"),
+            "零头累计的条件变了：它只该对**从免费分支掉下来**的调用生效，普通付费模型的价格本来就是整分",
+        );
+    }
+
+    #[test]
+    /// 放行靠哪个池子，结算就得扣哪个。
+    ///
+    /// /api/models/:id/chat 用 quota_ok 放行、却写死 use_quota=false 只扣钱包：只有会员额度、
+    /// 钱包是 0 的用户每次调用都在把钱包记成负数，"扣订阅额度"在这条路由上从没发生过。
+    fn per_model_chat_route_settles_against_what_admitted_it() {
+        let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/models.rs"))
+            .expect("read models.rs");
+        let at = src.find("let (_pre_mode, _pre_percall, pre_free, _pre_micro)").expect("准入块改写了");
+        let body: String = src[at..].chars().take(6_000).collect();
+        assert!(
+            body.contains("use_quota = quota_ok;"),
+            "放行用的是会员额度，结算却没带上——钱包会被记成负数",
+        );
+        let bill_at = body.find("bill(&state, uid, model.id, cost,").expect("结算调用改名了");
+        assert!(
+            body[bill_at..].starts_with("bill(&state, uid, model.id, cost, use_quota,"),
+            "结算又写死成 false 了",
+        );
+        // 同一个坑的另一半：池子空不空要问"这一次付得起吗"。
+        assert!(
+            body.contains("!free_pool_covers_call(free_points_balance("),
+            "这条路由又退回 `<= 0` 判空了——余数永远清不空，402 和付费判定整段不可达",
+        );
+    }
+
     fn admission_asks_the_same_question_settlement_answers() {
         // 每次 60 毫点的免费模型：$0.003 = 3000 micro-USD，按 50 micro-USD/毫点换算正好 60。
         let per_call_micro = 3_000;
