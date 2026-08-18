@@ -12102,6 +12102,98 @@ function toggleBlame() {
   }
 }
 
+// ── 跳转历史（Alt+← / Alt+→）───────────────────────────────────────────────
+//
+// 连点三次「转到定义」之后回不到原处，只能重新 ⌘P 摸回去——这是 F12 能用之后最直接的
+// 日常卡点。monaco-editor **不自带**这个：navigateBack 在 VS Code 里属于 workbench 层，
+// 不在 monaco 包里，所以得自己实现。
+//
+// 实现方式是**只挂一个光标监听**，而不是去 20 个跳转点各插一行。跳转发生在很多地方
+// （F12 转定义、⇧F12 查引用、⌘P、搜索结果、大纲、问题面板、find_symbol），逐个插桩必然
+// 漏掉一些，而且以后新增跳转点又会忘。这里按「位置发生了**大跳**」来判定：换了文件、
+// 或同文件内跨了 _NAV_MIN_JUMP 行——这正是 VS Code 的判据。
+const _NAV_MAX = 60;         // 栈深上限，防止无限增长
+const _NAV_MIN_JUMP = 10;    // 同文件内跨这么多行才算一次「跳转」，免得逐行移动也进栈
+let _navStack = [];          // [{ path, line, column }]
+let _navIndex = -1;          // 当前所在位置在栈里的下标
+let _navRestoring = false;   // 正在执行前进/后退——此时的光标移动不该再入栈
+let _navLast = null;         // 上一次已知位置，用来算跳了多远
+
+function _navSnapshot() {
+  const pos = monacoEditor.getPosition();
+  if (!activePath || !pos) return null;
+  return { path: activePath, line: pos.lineNumber, column: pos.column };
+}
+
+function _navSame(a, b) {
+  return !!a && !!b && a.path === b.path && Math.abs(a.line - b.line) < 1;
+}
+
+/// 把「跳转前」的位置压栈。只在真的发生大跳时调用。
+function _navPush(from) {
+  if (!from) return;
+  const top = _navStack[_navIndex];
+  if (_navSame(top, from)) return;         // 同一处不重复入栈
+  _navStack = _navStack.slice(0, _navIndex + 1);   // 从中间往回走之后又跳，前进分支作废
+  _navStack.push(from);
+  if (_navStack.length > _NAV_MAX) _navStack.shift();
+  _navIndex = _navStack.length - 1;
+}
+
+async function _navGoTo(entry) {
+  if (!entry) return;
+  _navRestoring = true;
+  try {
+    if (entry.path !== activePath) {
+      const f = openFiles.get(entry.path);
+      // 文件可能已经被关掉或删掉了。openFile 找不到会自己报错，这里吞掉——
+      // 历史里指向一个不存在的文件不该弹错误，跳过它继续往前退才是对的。
+      try { await openFile(entry.path, f?.name || basename(entry.path)); } catch { return; }
+    }
+    const model = monacoEditor.getModel();
+    // 文件被外部改短了，原来的行号可能已经越界。
+    const line = model ? Math.min(entry.line, model.getLineCount()) : entry.line;
+    monacoEditor.setPosition({ lineNumber: line, column: entry.column || 1 });
+    monacoEditor.revealLineInCenter(line);
+    monacoEditor.focus();
+    _navLast = { path: entry.path, line, column: entry.column || 1 };
+  } finally {
+    // 让本次程序化移动产生的光标事件先跑完，再恢复记录。
+    setTimeout(() => { _navRestoring = false; }, 0);
+  }
+}
+
+function navigateBack() {
+  if (_navIndex < 0) return;
+  // 第一次后退时，要先把「现在所在的位置」存成前进目标，否则退回去就再也前进不回来。
+  if (_navIndex === _navStack.length - 1) {
+    const here = _navSnapshot();
+    if (here && !_navSame(_navStack[_navIndex], here)) {
+      _navStack.push(here);
+    }
+  }
+  if (_navIndex <= 0 && _navStack.length <= 1) return;
+  _navIndex = Math.max(0, _navIndex - 1);
+  void _navGoTo(_navStack[_navIndex]);
+}
+
+function navigateForward() {
+  if (_navIndex >= _navStack.length - 1) return;
+  _navIndex += 1;
+  void _navGoTo(_navStack[_navIndex]);
+}
+
+monacoEditor.onDidChangeCursorPosition(() => {
+  if (_navRestoring || _imeComposing) return;
+  const now = _navSnapshot();
+  if (!now) return;
+  const prev = _navLast;
+  _navLast = now;
+  if (!prev) return;
+  const jumped = prev.path !== now.path || Math.abs(prev.line - now.line) >= _NAV_MIN_JUMP;
+  if (jumped) _navPush(prev);
+});
+
 let _blameRAF = 0;
 monacoEditor.onDidChangeCursorPosition(() => {
   if (blameEnabled && !_blameRAF && !_imeComposing) {
@@ -61600,6 +61692,8 @@ const ACTION_LABELS = {
   "commandPalette": "命令面板",
   "view.splitEditor": "切换分屏编辑",
   "code.runCurrentFile": "运行当前文件",
+  "nav.back": "返回上一个位置",
+  "nav.forward": "前进到下一个位置",
   "view.markdownPreview": "切换 Markdown 预览",
   "view.zoomIn": "界面放大",
   "view.zoomOut": "界面缩小",
@@ -68522,6 +68616,16 @@ function _defaultKeybindings() {
     "mod+shift+p": "commandPalette",
     "mod+\\": "view.splitEditor",
     "mod+r": "code.runCurrentFile",
+    // 跳转历史，键位按平台分——和 VS Code 一致，而且**必须**这么分：
+    // macOS 上 Option+←/→ 是 Monaco 的「按词移动光标」，是每天都在用的键，抢掉就是
+    // 弄坏一个正在工作的功能（这一轮已经因为同样的理由放弃过 ⇧⌘B，那个键归书签）。
+    // 所以 mac 走 VS Code 的 ⌃- / ⌃⇧-（cmd+- 是界面缩放，ctrl+- 是空的），
+    // Windows/Linux 才用 Alt+←/→。
+    // 键名用 arrowleft/arrowright：keyCombo 取的是 e.key.toLowerCase()，方向键是
+    // "ArrowLeft" 而不是 "Left"，写成 "alt+left" 永远匹配不上。
+    ...(mac
+      ? { "ctrl+-": "nav.back", "ctrl+shift+-": "nav.forward" }
+      : { "alt+arrowleft": "nav.back", "alt+arrowright": "nav.forward" }),
     "mod+shift+i": "memory.manage",
     "mod+shift+b": "view.bookmarks",
     "mod+shift+x": "view.extensions",
@@ -68573,6 +68677,8 @@ const KB_ACTIONS = {
   "commandPalette": () => palette.open(),
   "view.splitEditor": () => toggleSplitEditor(),
   "code.runCurrentFile": () => runCurrentFile(),
+  "nav.back": () => navigateBack(),
+  "nav.forward": () => navigateForward(),
   "view.markdownPreview": () => _toggleMarkdownPreviewAction(),
   "view.zoomIn": () => _applyUiZoom(_uiZoom + 0.1),
   "view.zoomOut": () => _applyUiZoom(_uiZoom - 0.1),
