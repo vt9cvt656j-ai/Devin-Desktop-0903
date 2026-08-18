@@ -23345,7 +23345,9 @@ test("模型重试用指数退避 + equal jitter，且默认上限已从 10 收�
   // 瞬时路径：base = DELAY × 2^n 封顶 CAP，等待 = random(0, base)（full jitter）。
   assert.match(SRC, /const _base = Math\.min\(_AI_MODEL_RETRY_BACKOFF_CAP_MS, _AI_MODEL_RETRY_DELAY_MS \* Math\.pow\(2, retriesUsed\)\);/,
     "瞬时重试必须指数退避，且封顶");
-  assert.match(SRC, /const _delayMs = Math\.round\(_base \/ 2 \+ Math\.random\(\) \* \(_base \/ 2\)\);/,
+  // 上下文溢出压缩过之后立刻重发（负载已经变小，不是在等上游恢复），其余情况仍是
+  // equal jitter。断言允许这个短路，但 jitter 那半必须原样保留。
+  assert.match(SRC, /const _delayMs = squeezedForOverflow \? 0 : Math\.round\(_base \/ 2 \+ Math\.random\(\) \* \(_base \/ 2\)\);/,
     "瞬时重试必须 equal jitter（base/2 + random(0,base/2)）：打散客户端二次浪，且保留下限不背靠背");
   assert.match(SRC, /const _until = Date\.now\(\) \+ _delayMs;/,
     "等待用抖动后的 _delayMs，而不是固定常量");
@@ -28073,4 +28075,30 @@ test("实时诊断块要说清这不是模型自己的账", () => {
   const fn = SRC.slice(SRC.indexOf("function agentDiagnosticsBlock"), SRC.indexOf("function problemCountText"));
   assert.match(fn, /包含你动手之前就存在的问题/, "没有说清计数包含历史遗留");
   assert.match(fn, /只对你这次改动引入的那些负责/, "没有划清责任范围");
+});
+
+test("上下文溢出要压缩后重试，而不是拿同一份超长负载连撞十次", () => {
+  // _isContextOverflowAiError 和 _squeezeMessagesForContext 都写好了，但**两个都是零调用点**——
+  // 整套溢出恢复从没被接上过。溢出走的是通用错误路径：_isRetryableAiError 不认它
+  // （既不是 5xx 也不是掉线），于是一次都不重试直接报错；就算认了，重发的也是同一份
+  // 超长负载，十次重试十次爆。表现就是「长对话到后期突然一直失败，重开会话就好了」。
+  const loop = SRC.slice(SRC.indexOf("async function _runModelRequestWithRetry"),
+                         SRC.indexOf("async function _runModelRequestWithRetry") + 12000);
+  assert.match(loop, /typeof _isContextOverflowAiError === "function" && _isContextOverflowAiError\(attemptError\)/,
+    "重试循环没有识别上下文溢出（或漏了 typeof 兜底——沙箱里会 ReferenceError 把循环带崩）");
+  assert.match(loop, /squeezedForOverflow \|\| _isRetryableAiError\(attemptError\)/,
+    "压缩成功后没有放行重试——负载已经变了，不该再按「原样重放」拦住");
+  assert.match(loop, /squeezedForOverflow \? 0 :/,
+    "压缩后还在退避空等：退避是等上游恢复，而这次是我们自己的负载太大、现在已经变小了");
+
+  // 调用点必须真的把 messages 压掉，否则回调恒 false、等于没接。
+  assert.match(SRC, /onContextOverflow: \(\) => _squeezeMessagesForContext\(_l0Msgs\)/,
+    "agent 主循环没有提供压缩回调");
+
+  // 压缩本身的两条不变量：最近几条交换必须留原文（模型要靠它接续），压无可压要回 false
+  // （否则十次重试全花在空转上）。
+  const sq = SRC.slice(SRC.indexOf("function _squeezeMessagesForContext"));
+  const body = sq.slice(0, sq.indexOf("\n  return changed;\n}") + 22);
+  assert.match(body, /i !== lastToolsIdx/, "最后一组 assistant+tool 配对被压了，模型没法接续");
+  assert.match(body, /return changed;/, "压缩没有回报「有没有压掉东西」");
 });

@@ -40179,6 +40179,11 @@ async function _runModelRequestWithRetry({
    * 返回 null / 未提供该回调 → 维持原来的行为（报错收尾）。
    */
   buildResumeInvoke = null,
+  /**
+   * 上下文溢出时压缩消息本体。返回 true 表示"确实压掉了东西、值得再试一次"，
+   * 返回 false 表示"已经压无可压"——那就别再空转，直接收尾报错。
+   */
+  onContextOverflow = () => false,
   resumeLimit = _AI_MODEL_RESUME_LIMIT,
   retryLimit = _AI_MODEL_RETRY_LIMIT,
 } = {}) {
@@ -40241,10 +40246,28 @@ async function _runModelRequestWithRetry({
     // duplicate prose, tool calls, writes, and billing. Only a pre-progress,
     // transient route failure may consume one of the ten retries.
     const retriesUsed = attemptIndex;
+    // 上下文溢出是**唯一一种「原样重试必然再爆、但压一压就能过」**的失败。
+    //
+    // 在这之前它走的是通用错误路径：_isRetryableAiError 不认它（既不是 5xx 也不是掉线），
+    // 于是一次都不重试，整轮直接报错收尾；就算认了，重发的也是同一份超长负载，
+    // 十次重试十次爆。而项目里明明写好了 _isContextOverflowAiError 和
+    // _squeezeMessagesForContext（历史工具参数换成保留 path 的摘要桩、更早的长结果硬截断），
+    // 两个函数**都是零调用点**——整套溢出恢复从没被接上过。
+    //
+    // 表现就是「长对话到后期突然一直失败，重开一个会话就好了」。
+    // typeof 兜底：这个函数会被单独装进测试沙箱跑（load("_runModelRequestWithRetry", {…})
+    // 只注入显式列出的依赖），裸引用会直接抛 ReferenceError 把整个重试循环带崩。
+    // 本仓库别处也是这个写法（见 _looksLikeReadOnlyCommand 里的 _isWin）。
+    let squeezedForOverflow = false;
+    if (!attemptProgress && !hadModelProgress
+        && typeof _isContextOverflowAiError === "function" && _isContextOverflowAiError(attemptError)) {
+      try { squeezedForOverflow = !!onContextOverflow(); } catch { squeezedForOverflow = false; }
+    }
     const canRetry = !attemptProgress
       && !hadModelProgress
       && retriesUsed < boundedRetryLimit
-      && _isRetryableAiError(attemptError);
+      // 压缩成功过就允许重试：负载已经变了，不是"原样重放"。
+      && (squeezedForOverflow || _isRetryableAiError(attemptError));
     if (canRetry) {
       const retry = retriesUsed + 1;
       // 指数退避 + equal jitter。固定 2s 的问题只在规模上显现：几千万客户端若撞同一个上游
@@ -40253,8 +40276,10 @@ async function _runModelRequestWithRetry({
       // 既跨客户端解相关，又保留「至少等 base/2」的下限——full jitter 会偶尔抽到近 0，退回单
       // 客户端背靠背捶上游那个老 bug。base 逐次翻倍 2s→4s→8s…封顶 30s。这是产出前的瞬时失败
       // 专用；限流 429 走下面预算独立的长退避。
+      // 压缩过就立刻重发：退避是为了等上游从抖动里恢复，而这次失败的原因是我们自己的
+      // 负载太大、现在已经变小了——干等只是让用户多看几秒转圈。
       const _base = Math.min(_AI_MODEL_RETRY_BACKOFF_CAP_MS, _AI_MODEL_RETRY_DELAY_MS * Math.pow(2, retriesUsed));
-      const _delayMs = Math.round(_base / 2 + Math.random() * (_base / 2));
+      const _delayMs = squeezedForOverflow ? 0 : Math.round(_base / 2 + Math.random() * (_base / 2));
       try { onRetry({ retry, retryLimit: boundedRetryLimit, nextAttempt: attempt + 1, error: attemptError, delayMs: _delayMs }); } catch {}
       // 分片等待是为了「停止」能立刻生效——一次 setTimeout(_delayMs) 会让用户按下停止之后
       // 还要干等一整段，而且等完还会再发一次。
@@ -42180,6 +42205,12 @@ async function _agentModelTurn({ config, messages, toolSchemas, toolRegistry = n
       await _runModelRequestWithRetry({
         invoke: (cb) => backend.aiChatWithTools(_turnConfig, _l0Msgs, _l0Tools, cb),
         isLive: _live,
+        // 上下文溢出时就地压缩这一轮要发的消息，然后让重试带着更小的负载再来一次。
+        // 压不动了就返回 false，别再空转十次。
+        // 压缩掉的读取结果不用在这里另行登记：_squeezeMessagesForContext 硬截断 tool 结果时
+        // 会把该条的 _ideMeta.contextAvailable 置 false，读取覆盖账本据此自纠。
+        // （这个作用域里也拿不到 run —— _agentModelTurn 的签名里没有它。）
+        onContextOverflow: () => _squeezeMessagesForContext(_l0Msgs),
         onAttempt: () => {
           _activeStreamDiag.attemptStartedAt = Date.now();
           _agentTimelineStartAttempt(_timelineTurn, _activeStreamDiag.attemptStartedAt);
