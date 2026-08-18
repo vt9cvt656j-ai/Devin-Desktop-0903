@@ -2007,6 +2007,13 @@ fn find_matches_in_line<'a>(
 struct ProjectSearch {
     files: Vec<FileMatches>,
     scanned_files: usize,
+    /// 这次搜索是不是**没搜完**就被上限截断了。
+    ///
+    /// 遍历会在 `SEARCH_MAX_RESULTS`(2000) 或 `SEARCH_MAX_SCANNED_FILES`(20000) 处 break。
+    /// 在这之前这个事实没有任何出口——调用方拿到的和"整个仓库就这些命中"长得一模一样。
+    /// 于是在大仓里搜一个符号、扫到第两万个文件就停，界面照常显示「N 个结果」，
+    /// 开发者据此得出"项目里没有这个"的**错误结论**。搜索给出假阴性比搜索慢严重得多。
+    truncated: bool,
 }
 
 fn search_project_scope(
@@ -2043,10 +2050,14 @@ fn search_project_scope(
     let mut results: Vec<FileMatches> = Vec::new();
     let mut total = 0usize;
     let mut scanned_files = 0usize;
+    let mut truncated = false;
     let mut stack: Vec<PathBuf> = vec![root_path.clone()];
 
     while let Some(path) = stack.pop() {
         if total >= SEARCH_MAX_RESULTS || scanned_files >= SEARCH_MAX_SCANNED_FILES {
+            // 提前收工 = 结果不完整。记下来，别让它和"搜完了，就这些"长一个样。
+            // `stack` 里还剩东西也算——那些目录一个字节都没读过。
+            truncated = true;
             break;
         }
 
@@ -2102,6 +2113,11 @@ fn search_project_scope(
         let mut file_matches: Vec<SearchMatch> = Vec::new();
         for (line_index, line) in content.lines().enumerate() {
             if file_matches.len() >= SEARCH_MAX_PER_FILE || total >= SEARCH_MAX_RESULTS {
+                // 这个文件（或整次搜索）的命中没列全。只在 while 循环顶部标记是不够的：
+                // 那里只有「还有下一个目录要弹栈」时才会被执行，而命中上限最常见的触发点
+                // 恰恰在文件**内部**——单文件命中爆表、或者刚好在栈空时触顶，两种情况
+                // 都会绕过顶部那道判断，于是又变回"谎称搜完了"。
+                truncated = true;
                 break;
             }
             let mut hits = find_matches_in_line(line, &matcher).peekable();
@@ -2117,6 +2133,7 @@ fn search_project_scope(
             };
             for (column, start, end) in hits {
                 if file_matches.len() >= SEARCH_MAX_PER_FILE || total >= SEARCH_MAX_RESULTS {
+                    truncated = true;
                     break;
                 }
                 file_matches.push(SearchMatch {
@@ -2168,6 +2185,7 @@ fn search_project_scope(
     Ok(ProjectSearch {
         files: results,
         scanned_files,
+        truncated,
     })
 }
 
@@ -2182,10 +2200,29 @@ pub fn search_in_project(
     query: String,
     case_sensitive: bool,
     mode: Option<String>,
-) -> Result<Vec<FileMatches>, String> {
+) -> Result<SearchResponse, String> {
     let search = search_project_scope(&root, &query, case_sensitive, mode.as_deref())?;
     debug_assert!(search.scanned_files > 0);
-    Ok(search.files)
+    Ok(SearchResponse {
+        files: search.files,
+        scanned_files: search.scanned_files,
+        truncated: search.truncated,
+    })
+}
+
+/// `search_in_project` 的返回值。
+///
+/// 以前直接返回 `Vec<FileMatches>`，于是「搜完了」和「扫到两万个文件就不搜了」在调用方
+/// 眼里**完全一样**——大仓里搜一个真实存在的符号，可能返回 0 命中，而界面照常显示
+/// 「没有结果」。那不是慢，那是**假阴性**，开发者会据此得出"项目里没有这个"的错误判断。
+///
+/// 前端包装函数会把 `files` 摊回数组（数组也是对象，truncated 挂在上面），
+/// 所以既有调用方一行都不用改。
+#[derive(Serialize)]
+pub struct SearchResponse {
+    files: Vec<FileMatches>,
+    scanned_files: usize,
+    truncated: bool,
 }
 
 #[derive(Serialize)]
@@ -3085,6 +3122,33 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(root);
         let _ = std::fs::remove_dir_all(empty);
+    }
+
+    #[test]
+    /// 截断必须**被报告出来**，而不是和「搜完了」长成一个样。
+    ///
+    /// 守的是一个假阴性：遍历在 SEARCH_MAX_RESULTS / SEARCH_MAX_SCANNED_FILES 处 break，
+    /// 而在加上 `truncated` 之前，调用方拿到的结果和「整个仓库就这些命中」无法区分。
+    /// 大仓里搜一个确实存在的符号，可能只返回前 2000 条，界面照常说「N 个结果」——
+    /// 开发者据此以为自己看到了全部。
+    fn project_search_reports_early_stop_instead_of_pretending_it_finished() {
+        let root = temp_file("search-truncation-hit");
+        std::fs::create_dir(&root).unwrap();
+        let mut body = String::new();
+        for _ in 0..(SEARCH_MAX_RESULTS + 500) {
+            body.push_str("needle\n");
+        }
+        std::fs::write(root.join("many.txt"), &body).unwrap();
+        let hit = search_project_scope(&root.to_string_lossy(), "needle", false, Some("literal")).unwrap();
+        assert!(hit.truncated, "命中数超过上限却报告成搜完了——这正是假阴性的来源");
+
+        // 反过来：没触到上限时不能谎报截断，否则提示常亮，然后就没人看了。
+        let small = temp_file("search-truncation-none");
+        std::fs::create_dir(&small).unwrap();
+        std::fs::write(small.join("a.txt"), "needle once\n").unwrap();
+        let ok = search_project_scope(&small.to_string_lossy(), "needle", false, Some("literal")).unwrap();
+        assert!(!ok.truncated, "搜完了却报告成截断——提示会常亮，然后就没人看了");
+        assert_eq!(ok.files.len(), 1);
     }
 
     #[test]
