@@ -11526,14 +11526,12 @@ test("natural-language capability queries are routed by the semantic tool orches
     recommendToolsForIntent: load("recommendToolsForIntent"),
     _buildScenarioSignature: scenarioSignature,
     _toolExpRetrieve: load("_toolExpRetrieve", { _buildScenarioSignature: scenarioSignature }),
-    // 这条测试关心的是**编排逻辑**，不是传输。传输（SSE 拼装 / JSON 兜底）另有专门的
-    // 测试，这里直接给它定稿文本，顺便捕获真正发出去的请求体。
-    _fetchCompletionText: async (_url, _headers, payload) => {
-      request = payload;
-      return JSON.stringify({
+    fetch: async (_url, options) => {
+      request = JSON.parse(options.body);
+      return { ok: true, json: async () => ({ choices: [{ message: { content: JSON.stringify({
         tools: ["local_discovery", "not_registered"],
         instruction: "Use the local structured-data tool for the requested nearby-place evidence.",
-      });
+      }) } }] }) };
     },
   });
   const decision = await route({
@@ -17724,15 +17722,14 @@ test("语义收尾评审工具仍可独立使用，但 quiet turn 不会被评�
     _chatCompletionsUrl: () => "https://gateway.example/v1/chat/completions",
     _safeJsonLoose: JSON.parse,
     enrichedCatalogLine,
-    // 同上：这条测试关心评审逻辑，不关心传输。给定稿文本，顺便捕获请求体。
-    _fetchCompletionText: async (_url, _headers, payload) => {
-      reviewRequest = payload;
-      return JSON.stringify({
+    fetch: async (_url, options) => {
+      reviewRequest = JSON.parse(options.body);
+      return { ok: true, json: async () => ({ choices: [{ message: { content: JSON.stringify({
         done: false,
         verified: false,
         instruction: "Start isolated capture, drive the login flow, then inspect the captured request before retrying.",
         tools: ["capture_start", "browser", "capture_flows", "background_monitor", "not_registered"],
-      });
+      }) } }] }) };
     },
   });
   const verdict = await critic({
@@ -22541,6 +22538,57 @@ test("_freshBuildFailure finds a declared verification that exited nonzero at th
 // 刻意**不**做的事：不强迫再跑一轮。"没验证"观测到的是缺席，缺席不等于工作是坏的（改动很小、
 // 项目没有构建系统、用户明说别跑，都是正当理由）。所以只陈述事实，判断留给人 —— 但事实必须
 // 摆在他眼前，而且同一行也要喂回给模型，否则它下一轮照样这么干。
+// ── 能看见真实桌面 ──────────────────────────────────────────────────────
+//
+// 在这之前，整套系统**没有任何一条通路能拿到屏幕像素**：screenshot 工具只会用无头浏览器
+// 渲染一个 http(s) 网址，于是模型对任何原生应用、游戏、Canvas、视频、PDF 都是全盲的——
+// 动完手没法看一眼确认自己做成没有。而工具描述还在教它"用 screenshot 验证结果"。
+// automation-framework 里那段真能拍桌面的代码（screenshot_region）写好了、零调用点、
+// 还会先把鼠标挪到区域起点（截图顺手改变悬停态）。
+test("子智能体也要真的看到图——它的工具返回写着「图已回传给你看」", () => {
+  // 主循环一直在把 result.image 变成图像块，_runSubAgent 这条路**从来没做**：图被整个丢掉。
+  // 而子体的工具清单里明晃晃给了 screenshot / view_image / ui_extract / read_screen，
+  // 那些工具的返回原文就是"图已回传给你看"。于是子体照着那句话装作看过图、编出视觉结论，
+  // 主智能体再把它当事实汇总给用户。963 条测试当时没有一条守这个。
+  const sub = extractFn("_runSubAgent");
+  assert.match(sub, /if \(result\?\.image\)/, "子智能体仍然把返回里的图丢掉了");
+  assert.match(sub, /_buildImageFeedback\(\s*\[result\.image\]/,
+    "要走和主循环同一个构建器：视觉模型拿原生图像块，纯文本模型自动转写");
+  // 位置要在把工具结果 push 进消息之后——否则图会跑到它解释的那条结果前面。
+  assert.ok(sub.indexOf("messages.push(toolMessage)") < sub.indexOf("_buildImageFeedback"),
+    "图必须跟在它所解释的那条工具结果后面");
+  // 看不到图不该让整个子任务失败。
+  const at = sub.indexOf("_buildImageFeedback");
+  assert.match(sub.slice(at - 200, at + 400), /catch \{/, "缺少兜底：转写失败会把子任务一起带崩");
+});
+
+test("screen.capture 端到端接通：白名单、目录、图像通道", () => {
+  // ① 映射层白名单——不在里面的 method 会被显式拒绝（而不是静默降级成 screen.info）
+  const methods = loadConst("_COMPUTER_METHODS");
+  assert.ok(methods.includes("screen.capture"), "白名单里没有它，模型调了会被拒");
+
+  // ② 两份工具目录都要有，且描述逐字一致（运行时以网关那份为准）
+  const reg = buildRegisteredToolSchemas().find((t) => t.function?.name === "computer");
+  const enumSrc = reg.function.parameters.properties.method.enum;
+  assert.ok(enumSrc.includes("screen.capture"), "源码注册表的 enum 里没有");
+  const gw = JSON.parse(readFileSync(new URL("../../server/prompts/tools.json", import.meta.url), "utf8"))
+    .find((t) => t.function?.name === "computer");
+  assert.deepEqual(gw.function.parameters.properties.method.enum, enumSrc, "两份目录的动作表漂了");
+
+  // ③ 图必须走 image 通道，绝不能跟着 JSON.stringify 进正文：
+  //    实测 400×300 一张就 270KB base64，塞进正文既灌爆上下文、模型又根本看不见。
+  const at = SRC.indexOf("const _dataUrl = r && typeof r === \"object\"");
+  assert.ok(at > 0, "automation 分支没有识别 data_url");
+  const block = SRC.slice(at, at + 900);
+  assert.match(block, /image: _dataUrl/, "图没走 image 通道，模型看不见");
+  assert.match(block, /delete _meta\.data_url/, "正文里还留着整串 base64");
+
+  // ④ 拍屏幕是纯观察，不该被判成有外部副作用
+  const effect = load("_toolMayProduceExternalEffect", {});
+  assert.equal(effect({ type: "automation", method: "screen.capture" }), false, "看一眼也被当成副作用了");
+  assert.equal(effect({ type: "automation", method: "mouse.click" }), true, "点击必须仍算副作用");
+});
+
 test("交付事实来自执行记录，不做任何推断", () => {
   const facts = load("_deliveryFactsLine", {
     _CODE_FILE_RE: loadConst("_CODE_FILE_RE"),
@@ -22576,49 +22624,6 @@ test("交付事实来自执行记录，不做任何推断", () => {
   );
   // 没动代码就没什么可核对的，不制造噪音。
   assert.equal(facts({ _mutatedFiles: new Set(["README.md"]), _executionEvidence: [] }), "");
-});
-
-test("客户端直连网关的那几条也要走 SSE——同步请求在中转那边是整段生成完才回", async () => {
-  // 之前那次"全部改 SSE"只扫了两棵 Rust 源码树，漏了 main.js 里的**直连 fetch**：
-  // _semanticToolOrchestrator（每轮都跑的工具编排）、_wrapUpCritic、_predictNextAsk。
-  // 用户 Sub2API 控制台里那些"同步"请求，大头正是它们。
-  const sse = (body, ctype = "text/event-stream") => async () => ({
-    ok: true,
-    headers: { get: () => ctype },
-    body: {
-      getReader() {
-        let sent = false;
-        return {
-          read: async () => (sent ? { done: true } : (sent = true, { done: false, value: new TextEncoder().encode(body) })),
-          cancel: async () => {},
-        };
-      },
-    },
-  });
-  const run = (fetchImpl) => load("_fetchCompletionText", { fetch: fetchImpl })(
-    "https://gw.test/v1/chat/completions", {}, { model: "m", messages: [] }, undefined);
-
-  // OpenAI 形状
-  assert.equal(await run(sse('data: {"choices":[{"delta":{"content":"你好"}}]}\ndata: {"choices":[{"delta":{"content":"世界"}}]}\ndata: [DONE]\n')), "你好世界");
-  // 原生 Anthropic 形状（网关对 Claude 路由用的就是它）
-  assert.equal(await run(sse('data: {"type":"content_block_delta","delta":{"text":"ab"}}\ndata: [DONE]\n')), "ab");
-  // 心跳和半截 JSON 不能把整轮判失败
-  assert.equal(await run(sse(': ping\ndata: {malformed\ndata: {"choices":[{"delta":{"content":"ok"}}]}\ndata: [DONE]\n')), "ok");
-  // 中转无视 stream:true 直接回 JSON —— 没有这条兜底，那些线路会整条失效
-  assert.equal(
-    await run(async () => ({ ok: true, headers: { get: () => "application/json" }, json: async () => ({ choices: [{ message: { content: "plain" } }] }) })),
-    "plain");
-  // 桩式响应（没有 headers / body）也要走兜底，而不是抛出去变成"这条能力静默失灵"
-  assert.equal(await run(async () => ({ ok: true, json: async () => ({ choices: [{ message: { content: "bare" } }] }) })), "bare");
-  // 请求体里必须真的带上 stream:true，否则改了个寂寞
-  let sentBody = null;
-  await run(async (_u, o) => { sentBody = JSON.parse(o.body); return { ok: true, json: async () => ({}) }; });
-  assert.equal(sentBody.stream, true, "没带 stream:true —— 中转还是会整段生成完才回");
-
-  // 源码层面：客户端不许再有同步出站（注释里提到的字样除外）。
-  const src = stripJsComments(SRC);
-  assert.doesNotMatch(src, /stream:\s*false/,
-    "又出现同步出站请求了——中转会等整段生成完才回，用户那边就是干等");
 });
 
 test("剥注释的顺序不能反——一条注释里的 glob 曾经吞掉 45KB 代码", () => {

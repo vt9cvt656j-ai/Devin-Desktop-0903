@@ -230,6 +230,30 @@ impl RpcServer {
                 Ok(serde_json::json!({"status": "ok"}))
             }
             
+            // 屏幕像素。这是整套系统里唯一能"看一眼真实桌面"的通路 —— 在它之前，
+            // screenshot 工具只会用无头浏览器渲染一个网址，模型对任何原生应用都是全盲的，
+            // 而工具描述还在教它"用 screenshot 验证结果"。
+            #[cfg(feature = "system")]
+            "screen.capture" => {
+                let num = |k: &str| params.get(k).and_then(|v| v.as_f64()).map(|n| n as i32);
+                // 四个都给才算区域；给一半是参数写错了，宁可报错也别悄悄拍整屏。
+                let region = match (num("x"), num("y"), num("width"), num("height")) {
+                    (Some(x), Some(y), Some(w), Some(h)) => Some((x, y, w, h)),
+                    (None, None, None, None) => None,
+                    _ => return Err(crate::error::Error::System(
+                        "区域截图要同时给 x/y/width/height 四个参数；一个都不给就是整屏".into(),
+                    )),
+                };
+                let data_url = agent.screen_capture(region)?;
+                // 坐标系和 mouse.move / screen.info 是同一套（屏幕点、左上原点），
+                // 一并回给调用方，免得它再去猜要不要乘 scale_factor。
+                Ok(serde_json::json!({
+                    "data_url": data_url,
+                    "region": region.map(|(x, y, w, h)| serde_json::json!({"x": x, "y": y, "width": w, "height": h})),
+                    "coordinate_space": "screen_points_top_left"
+                }))
+            }
+
             #[cfg(feature = "system")]
             "mouse.position" => {
                 let (x, y) = agent.mouse_location()?;

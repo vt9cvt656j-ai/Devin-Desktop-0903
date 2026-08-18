@@ -37,6 +37,75 @@ impl SystemAutomation {
     /// 相对移动鼠标
     /// 指针当前位置。此前整个框架只能"盲发"移动和点击，无从确认落点——
     /// 出了偏差既查不出来，模型也没法自我纠正。
+    /// 拍下屏幕像素，回 PNG 的 data URL。
+    ///
+    /// 这是整套系统里**唯一**能拿到真实桌面像素的通路。在它之前，`screenshot` 工具只会用
+    /// 无头浏览器渲染一个 http(s) 网址 —— 也就是说模型对任何原生应用、游戏、Canvas、视频、
+    /// PDF 都是全盲的：动完手没法看一眼确认自己做成没有。而工具描述还在教它"用 screenshot
+    /// 验证结果"，那条路必然报错。
+    ///
+    /// 三件事是刻意的：
+    /// · **不移动鼠标**。crate 里原有的 screenshot_region 会先把指针挪到区域起点，那会改变
+    ///   悬停态——截图本该是纯观察，不该顺手改变被观察的东西。（那个函数零调用点，从没跑过。）
+    /// · **落私有临时目录再删**，不是相对路径。原来写的是 `format!("region_{}...png")`，
+    ///   相对当前工作目录，落在哪儿完全不确定。
+    /// · **回 data URL 而不是路径**。路径对模型没用——它要的是图本身。
+    #[cfg(target_os = "macos")]
+    pub fn screen_capture(&self, region: Option<(i32, i32, i32, i32)>) -> Result<String> {
+        use std::io::Read;
+        let dir = std::env::temp_dir().join("mrdayone-screen");
+        std::fs::create_dir_all(&dir)
+            .map_err(|e| Error::System(format!("建临时目录失败：{e}")))?;
+        // 截图可能含密码、私信、密钥。0700：同机其他账户读不到。
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+        }
+        let path = dir.join(format!(
+            "shot-{}.png",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let mut cmd = std::process::Command::new("screencapture");
+        cmd.arg("-x"); // 不发快门音
+        if let Some((x, y, w, h)) = region {
+            if w <= 0 || h <= 0 {
+                return Err(Error::System("截图区域的宽高必须为正".into()));
+            }
+            cmd.arg("-R").arg(format!("{x},{y},{w},{h}"));
+        }
+        let status = cmd
+            .arg(&path)
+            .status()
+            .map_err(|e| Error::System(format!("screencapture 起不来：{e}")))?;
+        if !status.success() {
+            let _ = std::fs::remove_file(&path);
+            // 没授权"屏幕录制"时 screencapture 也会失败。这句必须说清是权限，否则模型会
+            // 反复重试一个永远不会成功的调用。
+            return Err(Error::System(
+                "截屏失败（退出码非 0）。最常见的原因是没给「屏幕录制」权限：                 系统设置 → 隐私与安全性 → 屏幕录制，勾上本应用后需要重启它。"
+                    .into(),
+            ));
+        }
+        let mut buf = Vec::new();
+        std::fs::File::open(&path)
+            .and_then(|mut f| f.read_to_end(&mut buf))
+            .map_err(|e| Error::System(format!("读截图失败：{e}")))?;
+        let _ = std::fs::remove_file(&path); // 图已经在内存里，别把它留在盘上
+        if buf.is_empty() {
+            return Err(Error::System("截屏得到 0 字节——多半是屏幕录制权限没给".into()));
+        }
+        Ok(format!("data:image/png;base64,{}", base64_encode(&buf)))
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    pub fn screen_capture(&self, _region: Option<(i32, i32, i32, i32)>) -> Result<String> {
+        Err(Error::System("这个平台还没有实现屏幕截图".into()))
+    }
+
     pub fn mouse_location(&self) -> Result<(i32, i32)> {
         self.enigo.location()
             .map_err(|e| Error::System(format!("读取指针位置失败: {}", e)))
@@ -345,5 +414,46 @@ impl SystemAutomation {
         };
         
         Ok(enigo_key)
+    }
+}
+
+/// 标准 base64（RFC 4648），只为把截图变成 data URL。
+///
+/// 不引 base64 crate：sidecar 是独立编译、独立分发的二进制，为一个 20 行的编码器多一条
+/// 依赖不划算，而且这条链路上任何一次 `cargo update` 都可能让二进制和源码悄悄对不上
+/// （本仓库记录过：Tauri 不会自动重编这个 crate）。
+fn base64_encode(bytes: &[u8]) -> String {
+    const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity((bytes.len() + 2) / 3 * 4);
+    for chunk in bytes.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = *chunk.get(1).unwrap_or(&0) as u32;
+        let b2 = *chunk.get(2).unwrap_or(&0) as u32;
+        let n = (b0 << 16) | (b1 << 8) | b2;
+        out.push(T[(n >> 18 & 63) as usize] as char);
+        out.push(T[(n >> 12 & 63) as usize] as char);
+        out.push(if chunk.len() > 1 { T[(n >> 6 & 63) as usize] as char } else { '=' });
+        out.push(if chunk.len() > 2 { T[(n & 63) as usize] as char } else { '=' });
+    }
+    out
+}
+
+#[cfg(test)]
+mod screen_capture_tests {
+    use super::base64_encode;
+
+    #[test]
+    fn base64_matches_the_reference_vectors() {
+        // RFC 4648 的测试向量。自己写的编码器必须对着标准验，不然 data URL 会静默损坏，
+        // 而模型只会说"这张图看不清"。
+        assert_eq!(base64_encode(b""), "");
+        assert_eq!(base64_encode(b"f"), "Zg==");
+        assert_eq!(base64_encode(b"fo"), "Zm8=");
+        assert_eq!(base64_encode(b"foo"), "Zm9v");
+        assert_eq!(base64_encode(b"foob"), "Zm9vYg==");
+        assert_eq!(base64_encode(b"fooba"), "Zm9vYmE=");
+        assert_eq!(base64_encode(b"foobar"), "Zm9vYmFy");
+        // 二进制字节（PNG 头）必须原样编出来，别被当成 UTF-8。
+        assert_eq!(base64_encode(&[0x89, 0x50, 0x4E, 0x47]), "iVBORw==");
     }
 }

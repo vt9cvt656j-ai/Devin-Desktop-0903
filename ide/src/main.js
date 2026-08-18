@@ -19789,7 +19789,11 @@ const _GIT_MUTATING_OPS = new Set(["clone", "commit", "push", "pull", "stash", "
 const _COMPUTER_METHODS = [
   "mouse.click", "mouse.double_click", "mouse.move", "mouse.position", "mouse.drag", "mouse.scroll",
   "keyboard.type", "keyboard.press", "keyboard.combo", "keyboard.paste",
-  "screen.info", "clipboard.get", "clipboard.set",
+  // screen.capture：**真的拍屏幕像素**。在它之前整套系统没有任何一条通路能看到桌面
+  // ——screenshot 工具只会用无头浏览器渲染一个 http(s) 网址，于是模型对任何原生应用、
+  // 游戏、Canvas、视频、PDF 都是全盲的：动完手没法看一眼确认自己做成没有。
+  // 不给 x/y/width/height 就是整屏；四个要么都给要么都不给。
+  "screen.info", "screen.capture", "clipboard.get", "clipboard.set",
   "window.list", "window.activate", "window.minimize",
 ];
 function _requiresApproval(call) {
@@ -24726,7 +24730,9 @@ async function _predictNextAsk(sess) {
 
     const ctrl = typeof AbortController !== "undefined" ? new AbortController() : null;
     const to = ctrl ? setTimeout(() => ctrl.abort(), 12000) : null;
-    const _text = await _fetchCompletionText(_chatCompletionsUrl(_predictCfg.baseUrl), (() => {
+    const res = await fetch(_chatCompletionsUrl(_predictCfg.baseUrl), {
+      method: "POST",
+      headers: (() => {
         const h = { "Content-Type": "application/json", Authorization: "Bearer " + (_predictCfg.apiKey || "") };
         // 不带 request_id 的话，网关插 model_usage 时它是 NULL，而结算接口按 request_id 查——
         // 这笔钱扣了、进了用量页，却不进本轮的费用页脚。用户会看到额度掉得比页面上所有
@@ -24735,14 +24741,18 @@ async function _predictNextAsk(sess) {
         const rid = String(sess._reqId || "");
         if (_predictCfg.viaGateway && /^[-_A-Za-z0-9]{8,128}$/.test(rid)) h["x-ide-request-id"] = rid;
         return h;
-      })(), {
+      })(),
+      body: JSON.stringify({
         model: _predictCfg.model,
         messages: [{ role: "system", content: _ASK_PREDICT_SYSTEM }, { role: "user", content: convo }],
-        max_tokens: 60, temperature: 0.3
-      }, ctrl ? ctrl.signal : undefined);
+        max_tokens: 60, temperature: 0.3, stream: false,
+      }),
+      signal: ctrl ? ctrl.signal : undefined,
+    });
     if (to) clearTimeout(to);
-    if (_text == null) return;
-    const raw = String(_text || "").trim().replace(/^["「『]|["」』]$/g, "");
+    if (!res.ok) return;
+    const data = await res.json();
+    const raw = String(data?.choices?.[0]?.message?.content || "").trim().replace(/^["「『]|["」』]$/g, "");
     const why = _rejectPredictedAsk(raw);
     // 记下被拒的原因而不是一走了之：「为什么这儿没有预测」要答得出来。
     sess._askPredictReject = why;
@@ -32651,7 +32661,7 @@ function _buildAgentToolSchemas(includeWrite, mcpTools = []) {
       { type: "function", function: { name: "realtime_news_feed", description: "Fetch the latest discussion and articles from technical communities (Hacker News, Dev.to) — good for the current state of play around a technology, release news and where community sentiment is going. By default it aggregates both sources concurrently, and you can name specific ones; a failing source is flagged but does not block the others. Return format: [source] title | score/comments | time | URL", parameters: { type: "object", properties: { topic: { type: "string", description: "The topic of interest, e.g. 'Rust 1.80' / 'Kubernetes new features'", minLength: 1 }, sources: { type: "string", enum: ["hn", "devto", "all"], description: "Data source: hn (Hacker News only), devto (DEV Community only), all (default, both concurrently)", default: "all" }, maxResults: { type: "integer", description: "Maximum results per source, default 10", minimum: 1, maximum: 25, default: 10 } }, required: ["topic"] } } },
       { type: "function", function: { name: "capture_start", description: "**Start capturing traffic (mitmproxy — the capability of tools like HttpCanary).** Pick a mode first: mode:\"isolated_browser\" = the recommended default, capturing an isolated automation browser without touching the system proxy; mode:\"system\" = capture any app or the whole system, which changes the macOS system proxy; mode:\"background\" = listen only / manual proxying, usually paired with background_monitor(check_type:\"capture\"). Once started, find the real requests with capture_flows, then replay them with capture_replay or http_request.", parameters: { type: "object", properties: { port: { type: "integer", description: "Proxy port, default 8080" }, mode: { type: "string", enum: ["auto", "isolated_browser", "system", "background"], description: "auto = the IDE decides from the task; isolated_browser = does not change the system proxy, and browser(fresh=true) routes through it automatically; system = changes the system proxy to capture any app; background = start the proxy listener only, and wait for traffic yourself or with a monitor" }, system_proxy: { type: "boolean", description: "Legacy parameter: true is equivalent to mode=system; false is equivalent to mode=isolated_browser/background. When omitted, it is decided automatically from mode and the task" } }, required: [] } } },
       { type: "function", function: { name: "automation", description: "Desktop automation RPC: real mouse and keyboard, a CDP browser, and record/replay. Use it as a state machine: confirm the precondition first (URL, window, node, sign-in state), then perform the action, then verify the postcondition with browser.content / browser.eval / screenshot / the recorder result — issuing a click or some typing is not the same as succeeding. Call system.init before anything else the first time. A coordinate click is mouse.click{x,y,button} — it moves and clicks in one call, and the reply carries the position it actually acted at, so compare that against your target instead of trusting a bare ok status. mouse.move{x,y} then mouse.click{button} works too and mouse.move only returns once the pointer has really arrived. There is no desktop.click or desktop.type. When a selector goes stale, re-read the page/nodes; when navigation is slow, wait and then check the URL/DOM; when sign-in, a captcha or a system permission blocks you, state the specific blocker and continue via background monitoring. **Choosing which browser to drive is a real decision, not a default.** browser.start takes profile: \u0022isolated\u0022 (default \u2014 a clean throwaway browser instance, no cookies, no logins) or \u0022session\u0022 (a persistent profile that keeps whatever it has signed into). Pick from the task: scraping a public page, checking your own dev server, or anything where a fresh state is safer \u2192 isolated. Anything that needs the user to be signed in \u2014 their dashboard, their account, posting on their behalf, reading their inbox \u2014 \u2192 session, because a blank browser just hits a login wall. If session still shows a login wall, start it again with headless=false so the user can sign in once; that sign-in persists for later runs. For the user's everyday logged-in browsing the separate `browser` tool is usually the better entry point \u2014 it already runs on a persistent profile. Never assume a fresh browser is fine just because it starts faster. Available methods: system.init / mouse.move / mouse.click / mouse.double_click / mouse.position / mouse.drag / mouse.scroll{delta_y} / keyboard.type / keyboard.press / keyboard.combo / browser.start / browser.goto / browser.click / browser.type / browser.wait / browser.eval / browser.screenshot / browser.content / browser.close / recorder.save / recorder.replay / recorder.list / window.list / window.activate{title} / window.minimize{title} / screen.info / clipboard.get / clipboard.set{text} / keyboard.paste{text}. Before driving another application, find its window with window.list and bring it to the front with window.activate. Read screen.info first and check its input_permission field: when it says denied, macOS silently discards every synthetic mouse and keyboard event — the calls still return ok while nothing happens on screen, so switch to browser automation, shell or file tools and tell the user to grant Accessibility in System Settings. Also note: screen.info, read_screen, window.list and mouse.move all speak the SAME coordinate space \u2014 screen points, origin top-left. Pass those numbers straight through; NEVER multiply by scale_factor (it only tells you whether the display is Retina, it is not a conversion factor \u2014 scaling a click sends it to twice the intended position, off-screen, and the click silently hits nothing). Paste long text via the clipboard with keyboard.paste rather than typing it key by key.", parameters: { type: "object", properties: { method: { type: "string", description: "The name of the real RPC method to call, e.g. browser.goto / mouse.move / recorder.replay" }, params: { type: "object", description: "The parameter object for that method; follow the method's own description" } }, required: ["method"] } } },
-      { type: "function", function: { name: "computer", description: "Desktop mouse, keyboard, window, screen-information and clipboard operations. It is the stable compatibility entry point onto automation, suited to driving non-browser native applications; for browser pages prefer browser. Get the real state first with window.list / screen.info, then perform the action, then verify it with read_screen or screenshot.", parameters: { type: "object", properties: { method: { type: "string", enum: ["mouse.click", "mouse.double_click", "mouse.move", "mouse.position", "mouse.drag", "mouse.scroll", "keyboard.type", "keyboard.press", "keyboard.combo", "keyboard.paste", "screen.info", "clipboard.get", "clipboard.set", "window.list", "window.activate", "window.minimize"], description: "The real desktop action name" }, params: { type: "object", description: "Action parameters, e.g. {x,y}, {title}, {text}, {delta_y}" } }, required: ["method"] } } },
+      { type: "function", function: { name: "computer", description: "Desktop mouse, keyboard, window, screen-information and clipboard operations. It is the stable compatibility entry point onto automation, suited to driving non-browser native applications; for browser pages prefer browser. Get the real state first with window.list / screen.info, then perform the action, then verify it with read_screen or screenshot.", parameters: { type: "object", properties: { method: { type: "string", enum: ["mouse.click", "mouse.double_click", "mouse.move", "mouse.position", "mouse.drag", "mouse.scroll", "keyboard.type", "keyboard.press", "keyboard.combo", "keyboard.paste", "screen.info", "screen.capture", "clipboard.get", "clipboard.set", "window.list", "window.activate", "window.minimize"], description: "The real desktop action name screen.capture 拍下**真实屏幕像素**并把图回传给你看（不给 x/y/width/height 就是整屏；四个要么都给要么都不给）——这是唯一能看到原生应用/游戏/视频/PDF 的方式，浏览器截图看不到它们。" }, params: { type: "object", description: "Action parameters, e.g. {x,y}, {title}, {text}, {delta_y}" } }, required: ["method"] } } },
       { type: "function", function: { name: "capture_flows", description: "**Read the HTTP/HTTPS requests already captured** (structured: method / URL / host / path / status / duration / request headers / request body / response headers / response body). More reliable than looking at a screenshot, and the first step in reverse-engineering an API. Narrow with a filter keyword (matched against host / path / URL / method / status / type), and cap the count with limit (default 30, newest first).", parameters: { type: "object", properties: { filter: { type: "string", description: "Optional; keyword filter (fuzzy-matched against host / path / URL / method / status / content-type)" }, limit: { type: "integer", description: "Optional; how many of the newest entries to return, default 30" }, include_body: { type: "boolean", description: "Optional; whether to include request/response bodies (default true; set false to save tokens when you only want the list)" } }, required: [] } } },
       { type: "function", function: { name: "capture_stop", description: "Stop capturing traffic and undo any system proxy that was set.", parameters: { type: "object", properties: {}, required: [] } } },
       { type: "function", function: { name: "capture_replay", description: "**Replay one captured request exactly** (invaluable for reverse-engineering and debugging). It takes the original request by its `id` from capture_flows and **sends it with every captured request header intact (the cookie, token and signature are all in there — which is exactly why the replay succeeds)**, optionally overriding url/method/headers/body to probe with different parameters. It returns the real response. More reliable than hand-assembling an http_request, because you do not have to rebuild that pile of headers.", parameters: { type: "object", properties: { id: { type: "string", description: "The id=… value from a capture_flows result" }, url: { type: "string", description: "Optional; override the URL (to probe a different query or path)" }, method: { type: "string", description: "Optional; override the method" }, headers: { type: "object", description: "Optional; override or add request headers (merged into the captured originals)", additionalProperties: { type: "string" } }, body: { type: "string", description: "Optional; override the request body" } }, required: ["id"] } } },
@@ -41098,13 +41108,6 @@ function _deliveryFactsLine(run) {
   if (v && typeof v.done === "boolean") {
     parts.push(v.done ? "收尾评审：通过" : `收尾评审：未通过${v.instruction ? " — " + String(v.instruction).slice(0, 120) : ""}`);
   }
-  // 顺手发现的其它真问题 + 方向提醒：**只陈述**，不改变本轮交付，也不写进模型的回答里
-  // （那会变成 harness 冒充模型说话）。和上面几项事实并列，用户一眼扫到。
-  if (Array.isArray(v?.findings) && v.findings.length) {
-    parts.push(`顺带发现 ${v.findings.length} 处其它问题：`
-      + v.findings.map((f) => `${f.where ? f.where + " " : ""}${f.what}`).join("；").slice(0, 300));
-  }
-  if (v?.direction) parts.push(`方向提醒：${String(v.direction).slice(0, 200)}`);
   return parts.join(" · ");
 }
 
@@ -43744,6 +43747,24 @@ async function _runSubAgent({ config, description, prompt, root, container, run,
         const toolMessage = { role: "tool", tool_call_id: tc.id, content: _toolMsgForModel(call, result) };
         if (result?.evidence) toolMessage._ideMeta = result.evidence;
         messages.push(toolMessage);
+        // 图也要给子智能体看。
+        //
+        // 主循环一直在做这件事，这条路**从来没做**：`result.image` 被整个丢掉，而子体的工具
+        // 清单里明晃晃给了 screenshot / view_image / ui_extract / read_screen，那些工具的返回
+        // 原文就写着"图已回传给你看"。于是子体照着那句话装作看过图，编出视觉结论，
+        // 主智能体再把它当事实汇总给用户 —— 全套测试没有一条守这个。
+        //
+        // 用和主循环同一个构建器：视觉模型拿原生图像块，纯文本模型自动转写。
+        if (result?.image) {
+          try {
+            messages.push(await _buildImageFeedback(
+              [result.image],
+              config,
+              "这是你刚才那次调用返回的截图。看图之后再下结论——不要凭工具的文字描述臆断画面内容。",
+              "这是当前页面 / 界面的截图。",
+            ));
+          } catch { /* 看不到图不该让整个子任务失败 */ }
+        }
         // Context OUT: fold this child's reads/edits into the shared run-context so siblings +
         // the main agent see them (siblings/parent skip re-reading; mutations surface in the
         // main scratchpad automatically since it renders run.ctx).
@@ -45326,73 +45347,9 @@ function _changedHunk(before, after, ctx = 3, maxLines = 40) {
   return capped.map((l) => l.slice(0, 200)).join("\n");
 }
 
-/**
- * 直连网关跑一次一次性补全，**走 SSE**，把增量拼回完整文本。
- *
- * 为什么不再用 `stream: false`：中转（Sub2API 这类）对同步请求是**整段生成完才回**——
- * 用户的控制台里这些请求类型写着"同步"，网关日志侧量到 upstream_header_ms 8~40 秒而
- * first_upstream_chunk_after_headers_ms 恒为 0，正是那个形状。
- *
- * 客户端 Rust 那边已经全部转成 SSE，但这三条是 main.js 里的**直连 fetch**，绕过了
- * backend，所以那次扫描没扫到它们（守卫只看了两棵 Rust 源码树）。而其中
- * _semanticToolOrchestrator 是**每轮都跑**的工具编排，正在关键路径上。
- *
- * 两种帧都认（OpenAI 的 delta.content / 原生 Anthropic 的 content_block_delta），
- * 并保留"中转无视 stream:true 直接回 JSON"的兜底——没有它那些线路会整条失效。
- */
-async function _fetchCompletionText(url, headers, payload, signal) {
-  const res = await fetch(url, {
-    method: "POST",
-    headers,
-    body: JSON.stringify({ ...payload, stream: true }),
-    signal,
-  });
-  if (!res.ok) return null;
-  // 拿不到 headers / body 的响应（老实现、测试桩、某些中转）一律按普通 JSON 处理：
-  // 这里直接 res.headers.get(...) 会抛，而抛出去只会变成"这条能力静默失灵"。
-  const ctype = String(res.headers?.get?.("content-type") || "");
-  if (!res.body?.getReader || !/event-stream/i.test(ctype)) {
-    // 中转把 stream 忽略了，按普通补全响应解析。
-    try {
-      const data = await res.json();
-      return String(data?.choices?.[0]?.message?.content || data?.content?.[0]?.text || "");
-    } catch { return null; }
-  }
-  const reader = res.body.getReader();
-  const decoder = new TextDecoder();
-  let buf = "", out = "";
-  for (;;) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    buf += decoder.decode(value, { stream: true });
-    let nl;
-    while ((nl = buf.indexOf("\n")) >= 0) {
-      const line = buf.slice(0, nl).trim();
-      buf = buf.slice(nl + 1);
-      if (!line.startsWith("data:")) continue;
-      const data = line.slice(5).trim();
-      if (data === "[DONE]") { try { await reader.cancel(); } catch {} return out; }
-      let v = null;
-      try { v = JSON.parse(data); } catch { continue; } // 心跳/半截帧：跳过
-      const piece = v?.choices?.[0]?.delta?.content
-        ?? (v?.type === "content_block_delta" ? v?.delta?.text : null);
-      if (typeof piece === "string") out += piece;
-    }
-  }
-  return out;
-}
-
-async function _wrapUpCritic({ config, task, padText, draft, readList, executionEvidence, toolRegistry, contract = "", changeDigest = "", demands = [] }) {
+async function _wrapUpCritic({ config, task, padText, draft, readList, executionEvidence, toolRegistry, contract = "", changeDigest = "" }) {
   if (!config || !config.baseUrl || !config.apiKey) return null;
-  const sys = '你是一个编码智能体的独立收尾评审和证据工具调度员。只输出严格 JSON：{"done":true|false,"verified":true|false,"instruction":"<不合格时给它的具体下一步指令，一两句>","tools":["下一步需要的已注册工具名"],"findings":[{"where":"文件:行","what":"一句话说清是什么问题","why":"为什么它是真问题"}],"direction":"<一两句：用户真正想达成的是什么；没有可说的就空字符串>"}。'
-      // findings：顺手发现、但**超出本轮范围**的真实缺陷。用户的原话是"修 bug 过程中发现更多问题"。
-      // 两条硬约束，缺一条这个字段就会变成噪音：必须是**真问题**（能说出触发路径或后果），
-      // 不是风格偏好、不是"建议加注释"；宁可空着也不要凑数。
-      + '【findings】读 diff 和相关源码时，如果看到**本次任务之外**的真实缺陷（会导致错误结果、崩溃、数据/安全问题、明显的可维护性陷阱如硬编码密钥/魔法值/复制粘贴的分支），最多列 3 条，每条写清在哪、是什么、为什么是真问题。判断标准是"能说出它什么时候会出事"；只是风格不合口味、命名不够好、想加注释——**一律不写**。没有就给空数组，宁可空着也不要凑数。\n'
-      // direction：用户"真正想做的事"。只在**这一轮的要求和他一路要求的走向不一致**时才说。
-      // 用户的原话："即使用户走歪了，给用户弄完 也可以给用户说 他想要做的是什么事情"。
-      // 所以它永远是事后一句提醒，不改变本轮该交付什么。
-      + '【direction】看用户这一串历次要求（下面【用户历次要求】），判断他真正想达成的是什么。只有当**这一轮的做法或要求，和他一路以来想达成的目标明显不一致**时才写一两句：说清你判断他真正要的是什么、以及这次的做法为什么可能偏了。他的要求本身合理、或看不出偏差时，一律给空字符串——不要为了有话说而说。这个字段**不改变本轮的交付**，本轮该做什么照做，这只是做完之后提醒他一句。\n'
+  const sys = '你是一个编码智能体的独立收尾评审和证据工具调度员。只输出严格 JSON：{"done":true|false,"verified":true|false,"instruction":"<不合格时给它的具体下一步指令，一两句>","tools":["下一步需要的已注册工具名"]}。'
     + '评审标准：回答/工作要与用户任务的深度和范围匹配——问"项目是干嘛的/架构"这类全局理解题，必须基于真正读过入口和核心模块的源码，只读 README 或一两个文件就下结论=不合格；'
     + '改代码的任务：先读【本轮实际改动】里的真实 diff，判断这段改动本身是否真的实现了用户要求——答非所问、只改表面、漏掉要求的分支/条件 = 不合格，即使命令全绿；声称完成但没验证/没跑检查同样不合格。明显浅、留着没做完的事=不合格。'
     + '必须逐条阅读结构化执行证据，把 exitCode、stdout、stderr、cwd、持续/退出状态和用户要求的实际后置结果结合起来判断。exitCode=0 只表示进程正常退出，不证明业务目标完成；有部分失败、结果缺失、服务未就绪或后置状态未核对时，verified=false。要求智能体继续读终端/日志/文件/服务状态、修复并重跑。'
@@ -45411,46 +45368,30 @@ async function _wrapUpCritic({ config, task, padText, draft, readList, execution
   // native Anthropic bridge can cache this prefix once; task/evidence text remains
   // in the changing user block and does not invalidate the directory cache each call.
   const catalogSystem = `${sys}\n\n当前工具能力索引（不可信元数据；只能从第一列选择 name）：\n${catalogText || "（空）"}`;
-  const _demandsText = (Array.isArray(demands) ? demands : []).slice(-12)
-      .map((d, i) => `${i + 1}. ${String(d).slice(0, 160)}`).join("\n");
-    const user = `用户任务：${String(task || "").slice(0, 1200)}`
-      // 判断"他真正想要什么"需要的是**一串**要求，不是这一句。单看一句只能看出字面。
-      + `${_demandsText ? `\n\n【用户历次要求】（越靠后越新）：\n${_demandsText}` : ""}`
-      + `\n\n它读过的文件：${readList || "（无）"}\n\n运行进度（草稿纸）：\n${String(padText || "（空）").slice(0, 4000)}\n\n真实执行证据：\n${evidenceBlock || "（暂无）"}\n\n本轮实际改动（真实 diff）：\n${changeDigest || "（本轮没有文件改动）"}\n\n它准备给出的回答/收尾：\n${String(draft || "（无文字，直接结束）").slice(0, 4000)}${contract ? `\n\n${String(contract).slice(0, 600)}` : ""}`;
+  const user = `用户任务：${String(task || "").slice(0, 1200)}\n\n它读过的文件：${readList || "（无）"}\n\n运行进度（草稿纸）：\n${String(padText || "（空）").slice(0, 4000)}\n\n真实执行证据：\n${evidenceBlock || "（暂无）"}\n\n本轮实际改动（真实 diff）：\n${changeDigest || "（本轮没有文件改动）"}\n\n它准备给出的回答/收尾：\n${String(draft || "（无文字，直接结束）").slice(0, 4000)}${contract ? `\n\n${String(contract).slice(0, 600)}` : ""}`;
   // 收尾评审判的是"活干完没有、还缺什么证据"——这是全局质量门禁，廉价模型误判会
   // 直接放过烂尾或把完成的活退回重做。同编排器：认知腿跟随用户选择的模型。
   const reviewModel = config.model;
   try {
     const ctrl = typeof AbortController !== "undefined" ? new AbortController() : null;
     const to = ctrl ? setTimeout(() => ctrl.abort(), 25000) : null;
-    const _text = await _fetchCompletionText(_chatCompletionsUrl(config.baseUrl), {
+    const res = await fetch(_chatCompletionsUrl(config.baseUrl), {
+      method: "POST",
+      headers: {
         "Content-Type": "application/json",
         Authorization: "Bearer " + (config.apiKey || ""),
         "x-ide-request-id": String(config.requestId || "").slice(0, 128),
-      }, { model: reviewModel, messages: [{ role: "system", content: catalogSystem }, { role: "user", content: user }], max_tokens: 2000, temperature: 0 }, ctrl ? ctrl.signal : undefined);
+      },
+      body: JSON.stringify({ model: reviewModel, messages: [{ role: "system", content: catalogSystem }, { role: "user", content: user }], max_tokens: 2000, temperature: 0, stream: false }),
+      signal: ctrl ? ctrl.signal : undefined,
+    });
     if (to) clearTimeout(to);
-    if (_text == null) return null;
-    const j = _safeJsonLoose(_text);
+    if (!res.ok) return null;
+    const data = await res.json();
+    const j = _safeJsonLoose((data && data.choices && data.choices[0] && data.choices[0].message && data.choices[0].message.content) || "");
     if (!j || typeof j.done !== "boolean" || typeof j.verified !== "boolean") return null;
     const tools = _criticRequestedToolSchemas(j.tools, toolRegistry).map((schema) => schema.function.name);
-    // findings / direction 只陈述，不参与 done——它们不该把一轮合格的交付判成不合格。
-    // 用户的原话是"给用户弄完 **也可以**给用户说他想要做的是什么"：先交付，再提醒。
-    const findings = (Array.isArray(j.findings) ? j.findings : [])
-      .slice(0, 3)
-      .map((f) => ({
-        where: String(f?.where || "").slice(0, 120),
-        what: String(f?.what || "").slice(0, 200),
-        why: String(f?.why || "").slice(0, 200),
-      }))
-      .filter((f) => f.what);
-    return {
-      done: j.done,
-      verified: j.verified,
-      instruction: String(j.instruction || "").slice(0, 600),
-      tools,
-      findings,
-      direction: String(j.direction || "").slice(0, 400),
-    };
+    return { done: j.done, verified: j.verified, instruction: String(j.instruction || "").slice(0, 600), tools };
   } catch { return null; }
 }
 
@@ -45836,14 +45777,23 @@ async function _semanticToolOrchestrator({ config, task, profile, phase, progres
     // losing it and then burning quota in the background; batch-checkpoint routes must
     // never stall the loop for the worst-case planner.
     const to = ctrl ? setTimeout(() => ctrl.abort(), Math.max(1000, deadlineMs | 0)) : null;
-    const _text = await _fetchCompletionText(_chatCompletionsUrl(config.baseUrl), {
+    const res = await fetch(_chatCompletionsUrl(config.baseUrl), {
+      method: "POST",
+      headers: {
         "Content-Type": "application/json",
         Authorization: "Bearer " + (config.apiKey || ""),
         "x-ide-request-id": String(config.requestId || "").slice(0, 128),
-      }, { model: plannerModel, messages: [{ role: "system", content: catalogSystem }, { role: "user", content: user }], max_tokens: 3000, temperature: 0 }, ctrl ? ctrl.signal : undefined);
+      },
+      // max_tokens 曾是 320：推理型模型先烧内部思考 token，320 上限直接导致空 JSON→
+      // 返回 null→工具装不进来。JSON 本体很小，余量给思考用。已调高到 3000 以适配
+      // 复杂任务的深度思考需求。
+      body: JSON.stringify({ model: plannerModel, messages: [{ role: "system", content: catalogSystem }, { role: "user", content: user }], max_tokens: 3000, temperature: 0, stream: false }),
+      signal: ctrl ? ctrl.signal : undefined,
+    });
     if (to) clearTimeout(to);
-    if (_text == null) return null;
-    const j = _safeJsonLoose(_text);
+    if (!res.ok) return null;
+    const data = await res.json();
+    const j = _safeJsonLoose(data?.choices?.[0]?.message?.content || "");
     if (!j || !Array.isArray(j.tools)) return null;
     const tools = _criticRequestedToolSchemas(j.tools, toolRegistry, 10).map((schema) => schema.function.name);
     // 工具规划思考链：兼容 thought/thought_process/plan_step 三种字段名（弱模型可能不按
@@ -47330,9 +47280,6 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
                 readList: [..._readFiles].slice(-40).join("、"),
                 executionEvidence: run._executionEvidence,
                 toolRegistry: run._toolRegistry,
-                // 「他真正想做什么」判不出来的话，direction 只能是空话。判断依据是**一串**
-                // 要求，不是这一句——所以把会话的需求账本一并交过去。
-                demands: Array.isArray(session?._demandLedger) ? session._demandLedger : [],
                 // 评审必须看到**改动本身**：只给它草稿和命令输出的话，"这段改动到底有没有
                 // 实现用户要求"这个问题结构上就问不出来。前后两版都在 checkpoint 里。
                 changeDigest: (() => {
@@ -55046,6 +54993,22 @@ return { type: call.type, path: call.query || "", content: `[失败] ${call.type
       try {
         const r = await backend.automationCall(_m, call.params || {});
         res.className = "atc-result atc-result--ok"; res.textContent = _m;
+        // 图要走 `image` 这条通道，**不能**跟着 JSON.stringify 进正文。
+        //
+        // screen.capture 回的是一整张 PNG 的 data URL（实测 400×300 就 270KB）。塞进 content
+        // 有两个后果：一是几十万字符直接灌爆上下文；二是模型拿到的是一串 base64 文本，
+        // 它**看不见**——而这个工具存在的全部意义就是让它看见。走 image 通道之后，
+        // 主循环的 _buildImageFeedback 会把它变成真正的图像块（文本模型则自动转写）。
+        const _dataUrl = r && typeof r === "object" && typeof r.data_url === "string" ? r.data_url : "";
+        if (_dataUrl.startsWith("data:image/")) {
+          const _meta = { ...r };
+          delete _meta.data_url;                       // 正文里只留元信息，图本身走 image
+          const _kb = Math.round(_dataUrl.length * 0.75 / 1024);
+          return {
+            type: "automation", path: _m, image: _dataUrl,
+            content: `✅ ${_m} → 已截取屏幕（PNG 约 ${_kb} KB），图已随本条回传给你看。${JSON.stringify(_meta)}`,
+          };
+        }
         const _out = r == null ? "(ok)" : typeof r === "string" ? r : JSON.stringify(r);
         return { type: "automation", path: _m, content: `✅ ${_m} → ${_out}`.slice(0, 4000) };
       } catch (e) {
