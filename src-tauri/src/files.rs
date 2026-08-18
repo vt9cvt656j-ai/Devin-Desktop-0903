@@ -1,6 +1,7 @@
 use std::io::{Read, Seek, SeekFrom, Write};
+use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use once_cell::sync::Lazy;
 use regex::{Regex, RegexBuilder};
@@ -70,6 +71,59 @@ const IGNORED_DOT_DIRS: &[&str] = &[
     ".netlify",
     ".DS_Store",
 ];
+
+/// 工作区根 → 该根的 .gitignore 匹配器。
+///
+/// 用 ripgrep 同款的 `ignore` crate，而不是手搓正则：gitignore 的语义（否定 `!`、
+/// 锚定 `/a`、目录限定 `a/`、`**`、字符类）细节很多，写错的方向是**把用户自己的源码
+/// 误藏**——那比多显示一个 node_modules 严重得多。
+///
+/// 只读工作区根那一份 .gitignore（外加 .git/info/exclude），**不递归读子目录里的**。
+/// 这是有意的取舍：漏读嵌套规则的后果是"显示得比 git 多一点"，属于安全方向；而为了
+/// 嵌套规则在每个目录重建匹配器，会让搜索那种上万次目录遍历慢得没法用。
+static GITIGNORE_CACHE: Lazy<Mutex<HashMap<PathBuf, (std::time::Instant, Arc<ignore::gitignore::Gitignore>)>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
+const GITIGNORE_TTL: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// 这个路径落在哪个已注册的工作区根下面（取最深的那个，多根嵌套时才对得上）。
+fn workspace_root_for(path: &Path) -> Option<PathBuf> {
+    let roots = ALLOWED_ROOTS.lock().ok()?;
+    roots
+        .iter()
+        .filter(|r| path.starts_with(r))
+        .max_by_key(|r| r.components().count())
+        .cloned()
+}
+
+fn gitignore_for_root(root: &Path) -> Arc<ignore::gitignore::Gitignore> {
+    if let Ok(cache) = GITIGNORE_CACHE.lock() {
+        if let Some((at, gi)) = cache.get(root) {
+            if at.elapsed() < GITIGNORE_TTL {
+                return Arc::clone(gi);
+            }
+        }
+    }
+    let mut builder = ignore::gitignore::GitignoreBuilder::new(root);
+    // add() 返回 Option<Error>：解析不了就当没有这条规则，绝不能因此 panic 或
+    // 把整棵树判成 ignored。
+    let _ = builder.add(root.join(".gitignore"));
+    let _ = builder.add(root.join(".git/info/exclude"));
+    let gi = Arc::new(builder.build().unwrap_or_else(|_| ignore::gitignore::Gitignore::empty()));
+    if let Ok(mut cache) = GITIGNORE_CACHE.lock() {
+        cache.insert(root.to_path_buf(), (std::time::Instant::now(), Arc::clone(&gi)));
+    }
+    gi
+}
+
+/// 这个路径被它所属工作区的 .gitignore 排除了吗。
+///
+/// 找不到所属工作区、或没有 .gitignore 时一律返回 false —— 判不出来就**不标记**，
+/// 宁可多显示也不要藏掉用户要找的东西。
+fn path_is_git_ignored(path: &Path, is_dir: bool) -> bool {
+    let Some(root) = workspace_root_for(path) else { return false };
+    let gi = gitignore_for_root(&root);
+    matches!(gi.matched_path_or_any_parents(path, is_dir), ignore::Match::Ignore(_))
+}
 
 /// 遍历时要不要跳过这个条目。目录看名单，文件一律保留。
 ///
@@ -699,7 +753,11 @@ pub fn read_dir(path: String) -> Result<Vec<DirEntry>, String> {
             .map(|m| m.is_dir())
             .or_else(|_| entry.file_type().map(|t| t.is_dir()))
             .unwrap_or(false);
-        let ignored = skip_walk_entry(&name, is_dir);
+        // 两个来源取并集：写死的噪声名单（.git / node_modules / target …）+ **项目自己的
+        // .gitignore**。后者才是真正的判据——合法提交 dist/ 的项目不会把它写进 .gitignore，
+        // 于是它不会被压暗；反过来项目自己声明忽略的 build_out/、*.generated.ts 也能跟着灰下去，
+        // 而这些是写死名单永远猜不到的。
+        let ignored = skip_walk_entry(&name, is_dir) || path_is_git_ignored(&p, is_dir);
         entries.push(DirEntry {
             name,
             path: p.to_string_lossy().to_string(),
@@ -3144,6 +3202,33 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(root);
         let _ = std::fs::remove_dir_all(empty);
+    }
+
+    #[test]
+    /// 文件树的忽略判据要跟着**项目自己的 .gitignore**走，而不是只认写死的名单。
+    ///
+    /// 写死名单永远猜不到项目自己的产物目录（build_out/、*.generated.ts），
+    /// 也会冤枉那些合法提交 dist/ 的项目。gitignore 才是用户自己的声明。
+    fn read_dir_marks_entries_the_project_itself_gitignores() {
+        let root = temp_file("read-dir-gitignore");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join(".gitignore"), "build_out/\n*.generated.ts\n!keep.generated.ts\n").unwrap();
+        std::fs::create_dir(root.join("build_out")).unwrap();
+        std::fs::create_dir(root.join("src")).unwrap();
+        std::fs::write(root.join("api.generated.ts"), "x").unwrap();
+        std::fs::write(root.join("keep.generated.ts"), "x").unwrap();
+        std::fs::write(root.join("main.ts"), "x").unwrap();
+
+        register_workspace_root(root.to_string_lossy().to_string()).ok();
+        let out = read_dir(root.to_string_lossy().to_string()).unwrap();
+        let ig = |n: &str| out.iter().find(|e| e.name == n).expect(n).ignored;
+
+        assert!(ig("build_out"), "项目自己 gitignore 的目录没有被标记");
+        assert!(ig("api.generated.ts"), "gitignore 的通配规则没生效");
+        // 否定规则必须被尊重——手写正则最容易在这儿把用户明确要留的文件也藏掉。
+        assert!(!ig("keep.generated.ts"), "!否定规则没生效，用户明确要留的文件被标成噪声了");
+        assert!(!ig("src"), "src 被误标");
+        assert!(!ig("main.ts"), "main.ts 被误标");
     }
 
     #[test]
