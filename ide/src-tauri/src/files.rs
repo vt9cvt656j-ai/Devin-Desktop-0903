@@ -669,6 +669,13 @@ pub struct DirEntry {
     name: String,
     path: String,
     is_dir: bool,
+    /// 这一项属于「构建产物 / 依赖目录」这类噪声（判据和搜索用的是同一份
+    /// `skip_walk_entry`，此前文件树一份都不用，三处忽略规则各自为政）。
+    ///
+    /// 只**标记**、不过滤：打开 Node 项目第一眼就是几万条 node_modules 确实难用，但直接
+    /// 在这里删掉更糟——没有「显示隐藏文件」开关，`.vscode/`、`dist/` 会变得完全够不到，
+    /// 而合法提交 `dist/` 的项目是存在的。让前端把它们置灰、排到最后，用户仍然点得进去。
+    ignored: bool,
 }
 
 /// List the immediate children of a directory, directories first, then by name.
@@ -684,17 +691,32 @@ pub fn read_dir(path: String) -> Result<Vec<DirEntry>, String> {
         let entry = entry.map_err(|e| e.to_string())?;
         let name = entry.file_name().to_string_lossy().to_string();
         let p = entry.path();
-        let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
+        // 用 metadata() 而不是 file_type()：前者跟随符号链接，后者不跟。
+        // 不跟随的后果是**软链目录被当成文件**——点开是空的、也展不开，而 pnpm 的
+        // node_modules、monorepo 的 packages 链接、`~/src` 之类的惯用软链全是这种。
+        // 失败时回落到 file_type()（断链的软链 metadata 会 Err，此时按非目录处理是对的）。
+        let is_dir = std::fs::metadata(&p)
+            .map(|m| m.is_dir())
+            .or_else(|_| entry.file_type().map(|t| t.is_dir()))
+            .unwrap_or(false);
+        let ignored = skip_walk_entry(&name, is_dir);
         entries.push(DirEntry {
             name,
             path: p.to_string_lossy().to_string(),
             is_dir,
+            ignored,
         });
     }
-    entries.sort_by(|a, b| match (a.is_dir, b.is_dir) {
-        (true, false) => std::cmp::Ordering::Less,
-        (false, true) => std::cmp::Ordering::Greater,
-        _ => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
+    // 噪声排最后：目录优先的规则之上再叠一层「被忽略的沉底」，于是打开 Node 项目
+    // 第一眼看到的是自己的代码，而不是 node_modules。它们仍然在列表里、仍然点得进去。
+    entries.sort_by(|a, b| match (a.ignored, b.ignored) {
+        (false, true) => std::cmp::Ordering::Less,
+        (true, false) => std::cmp::Ordering::Greater,
+        _ => match (a.is_dir, b.is_dir) {
+            (true, false) => std::cmp::Ordering::Less,
+            (false, true) => std::cmp::Ordering::Greater,
+            _ => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
+        },
     });
     Ok(entries)
 }
@@ -3122,6 +3144,44 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(root);
         let _ = std::fs::remove_dir_all(empty);
+    }
+
+    #[test]
+    /// 文件树：软链目录要认得出来，噪声目录要沉底但**不能消失**。
+    ///
+    /// 软链——原来用 entry.file_type()，它不跟随符号链接，于是软链目录被当成文件：
+    /// 点开是空的、也展不开。pnpm 的 node_modules、monorepo 的 packages 链接全中招。
+    ///
+    /// 噪声——文件树此前一份忽略规则都不用（搜索用 skip_walk_entry、TS 预加载用另一份），
+    /// 打开 Node 项目第一眼就是几万条 node_modules。现在标记 + 沉底，但仍然在列表里：
+    /// 直接删掉会让 `.vscode/`、`dist/` 完全够不到，而合法提交 dist 的项目是存在的。
+    fn read_dir_follows_symlinked_dirs_and_sinks_noise_without_hiding_it() {
+        let root = temp_file("read-dir-tree");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::create_dir(root.join("src")).unwrap();
+        std::fs::create_dir(root.join("node_modules")).unwrap();
+        std::fs::create_dir(root.join("real_pkg")).unwrap();
+        std::fs::write(root.join("README.md"), "hi").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(root.join("real_pkg"), root.join("linked_pkg")).unwrap();
+
+        register_workspace_root(root.to_string_lossy().to_string()).ok();
+        let out = read_dir(root.to_string_lossy().to_string()).unwrap();
+        let by = |n: &str| out.iter().find(|e| e.name == n).expect(n).clone();
+
+        #[cfg(unix)]
+        assert!(by("linked_pkg").is_dir, "软链目录被当成了文件——展不开，pnpm/monorepo 直接废");
+
+        assert!(by("node_modules").ignored, "node_modules 没有被标成噪声");
+        assert!(!by("src").ignored, "src 被误标成噪声了");
+
+        // 噪声仍然在列表里（不是删掉），但排在所有非噪声之后。
+        let names: Vec<&str> = out.iter().map(|e| e.name.as_str()).collect();
+        assert!(names.contains(&"node_modules"), "噪声目录被直接删掉了——用户再也点不进去");
+        let nm = names.iter().position(|n| *n == "node_modules").unwrap();
+        let src = names.iter().position(|n| *n == "src").unwrap();
+        let readme = names.iter().position(|n| *n == "README.md").unwrap();
+        assert!(nm > src && nm > readme, "噪声没有沉底：第一眼看到的还是 node_modules");
     }
 
     #[test]

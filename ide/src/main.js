@@ -10846,7 +10846,10 @@ async function renderChildren(path, container) {
   for (const entry of entries) {
     const item = { ...entry, path: _treePath(entry.path), name: entry.name || basename(entry.path) };
     const row = document.createElement("div");
-    row.className = "row";
+    // 构建产物 / 依赖目录置灰（后端 read_dir 已经按搜索那份规则标好 ignored，并把它们排到
+    // 最后）。**只弱化不隐藏**：没有"显示隐藏文件"开关，直接过滤掉会让 .vscode/、dist/
+    // 彻底够不到，而合法提交 dist 的项目是存在的。
+    row.className = item.ignored ? "row row--ignored" : "row";
     row.dataset.path = item.path;
     // Draggable → drop onto the AI composer to @-reference this file/dir (see the composer drop handler).
     // Mouse-based drag → drop on the AI composer to @-reference it. (HTML5 drag-drop is swallowed
