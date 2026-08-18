@@ -22,6 +22,8 @@ import {
   isFileMutation,
   mutatesWorkspace,
   needsApproval,
+  needsApprovalFor,
+  BROWSER_OBSERVE_ACTIONS,
   readOnlyBlockedTypes,
   toolPolicy,
   workerScopeField,
@@ -355,16 +357,41 @@ test("每一种工具调用类型都必须被归类——没登记也算漏，�
 });
 
 test("四个有外部副作用的工具已经在审批门内——它们曾经整整一轮都在门外", () => {
-  for (const t of ["browser", "docker_compose_up", "capture_replay", "system"]) {
+  for (const t of ["docker_compose_up", "capture_replay", "system"]) {
     assert.equal(needsApproval(t), true, `${t} 又掉出审批门了`);
   }
-  // browser 的只读模式判据按 action 分：看页面是观察，动会话/文件/执行/提交是副作用。
-  for (const action of ["eval", "cookies", "storage", "upload", "autofill", "click", "type"]) {
-    assert.equal(blockedInReadOnlyMode("browser", { type: "browser", action }), true, action);
+  // browser 是按 action 判的，所以它的 needsApproval 是个函数而不是 true。
+  assert.equal(typeof needsApproval("browser"), "function",
+    "browser 又变回一刀切了——看一眼页面也要弹框，用起来就是「做点事就撞门」");
+
+  // 真有副作用的动作：审批门要问，只读模式要挡。
+  for (const action of ["eval", "cookies", "storage", "upload", "autofill", "click", "type", "fill", "batch"]) {
+    const call = { type: "browser", action };
+    assert.equal(needsApprovalFor("browser", call), true, `${action} 该问却没问`);
+    assert.equal(blockedInReadOnlyMode("browser", call), true, `${action} 在只读模式该挡`);
   }
-  for (const action of ["navigate", "screenshot", "read", "text", "back", "forward", "close"]) {
-    assert.equal(blockedInReadOnlyMode("browser", { type: "browser", action }), false, action);
+  // 纯观察：两道门都不该拦。observe / inspect / network 是"看页面"的主力动作，
+  // 上一版把它们漏在名单外，于是 Plan / Explorer 里连看都看不了。
+  for (const action of ["navigate", "observe", "inspect", "network", "nodes", "screenshot", "scroll", "close"]) {
+    const call = { type: "browser", action };
+    assert.equal(needsApprovalFor("browser", call), false, `${action} 是观察，不该弹框`);
+    assert.equal(blockedInReadOnlyMode("browser", call), false, `${action} 是观察，只读模式不该挡`);
   }
+});
+
+test("browser 的观察动作名单必须来自 schema 的 action 枚举，不能手打", () => {
+  // 上一版就是手打的：里面 read / text / back / forward 四个动作**在 schema 里根本不存在**，
+  // 而真正的 observe / inspect / network / nodes 一个都没列——名单写错了不会有任何报错，
+  // 只会表现成"只读模式下它连页面都看不了"和"看一眼也弹框"。
+  const raw = JSON.parse(readFileSync(join(HERE, "../../server/prompts/tools.json"), "utf8"));
+  const list = Array.isArray(raw) ? raw : (raw.tools || Object.values(raw)[0]);
+  const fn = list.map((e) => e.function || e).find((f) => f.name === "browser");
+  assert.ok(fn, "tools.json 里找不到 browser——这条断言失去落点");
+  const actions = new Set(fn.parameters?.properties?.action?.enum || []);
+  assert.ok(actions.size > 20, `action 枚举只剩 ${actions.size} 个，正则或 schema 变了`);
+
+  const ghosts = [...BROWSER_OBSERVE_ACTIONS].filter((a) => !actions.has(a));
+  assert.deepEqual(ghosts, [], "观察名单里这些动作 schema 里不存在（写了也永远不会命中）");
 });
 
 test("会改工作区的工具，开了审批就必须问——豁免只能是有名有姓的那一个", () => {
