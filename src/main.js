@@ -20209,7 +20209,18 @@ function _toolApprovalDialog({ title, detail, onceLabel = "允许", alwaysLabel 
 // Command risk tagging. These patterns used to hard-block commands; the IDE now
 // lets Agent run them and surfaces a visible risk marker + real exit/stdout/stderr
 // instead. The model must learn from real results rather than a frontend veto.
-const _DANGEROUS_CMD_RE = /\brm\s+-rf?\s+(\/|~)(\s|$|\*)|:\(\)\s*\{\s*:\s*\|\s*:|\bmkfs\.|\bdd\s+if=\S+\s+of=\/dev\/(sd|nvme|disk)|>\s*\/dev\/(sd|nvme|disk)/i;
+// 这张表在 auto 模式下是**唯一**会弹确认框的判据（mustAsk = ruleVerdict==="ask" || dangerous
+// || (mode==="approve" && …)），所以"批量不可逆删除"必须进来，否则默认设置下一声不吭就删完了。
+// 而且 shell 删除不进 checkpoint，「全部撤销」救不回来。
+//
+// 补进来的三类，都是实测会静默通过的：
+//   · find 的破坏性谓词：`find . -name '*.js' -delete`、`find . -type f -exec rm -rf {} +`
+//     （它此前更糟——被判成"只读命令"，连 approve 模式都绕过去了，见 _looksLikeReadOnlyCommand）
+//   · git clean -fd / -xfd：一次抹掉所有未跟踪文件，包括还没 add 的新代码和本地 .env
+//   · rm -rf 打在整棵树上：`rm -rf .`、`rm -rf *`、`rm -rf ~/Documents`
+//     （原来只认字面量 `rm -rf /` 和 `rm -rf ~`，多一层子目录就漏）
+// 刻意**不**收 `rm -rf node_modules` 这类日常操作，否则提示会常亮、然后就没人看了。
+const _DANGEROUS_CMD_RE = /\brm\s+-rf?\s+(\/|~)(\s|$|\*)|\brm\s+-[a-z]*r[a-z]*f?\s+(?:\.|\*|~\/\S+)(?:\s|$)|\bfind\b[^\n]*\s-(?:delete|exec|execdir|ok|okdir|fls|fprint|fprintf)\b|\bgit\s+clean\b(?=[^\n]*\s-[a-z]*f)(?=[^\n]*\s-[a-z]*[dx])|:\(\)\s*\{\s*:\s*\|\s*:|\bmkfs\.|\bdd\s+if=\S+\s+of=\/dev\/(sd|nvme|disk)|>\s*\/dev\/(sd|nvme|disk)/i;
 function _cmdList(key) { try { const v = JSON.parse(localStorage.getItem(key) || "[]"); return Array.isArray(v) ? v : []; } catch { return []; } }
 function _matchCmdList(cmd, list) { const c = String(cmd || ""); return Array.isArray(list) && list.some((p) => p && c.indexOf(String(p)) >= 0); }
 function _isDangerousCmd(cmd) { const c = String(cmd || ""); return _DANGEROUS_CMD_RE.test(c) || _matchCmdList(c, _cmdList("michael-ide.deny-cmds")); }
@@ -40643,7 +40654,24 @@ function _looksLikeReadOnlyCommand(command) {
       && _looksLikeReadOnlyCommand(parts[0])
       && parts.slice(1).every(pipeSegmentOk);
   }
-  const segmentOk = (segment) => /^(?:cd\s+(?:"[^"]+"|'[^']+'|\S+)|test\s+-[defrs]\s+\S+|\[\s+-[defrs]\s+\S+\s+\]|echo\b|pwd|ls|find|rg|grep|cat|head|tail|wc|du|df|tree|file|stat|which|type|whereis|lsof|ps|uname|sw_vers|date|whoami|env|printenv|jq\b|dir|where|findstr|more|ver|systeminfo|tasklist|set|chdir|attrib|sed\s+-n\b|git\s+(?:status|diff|log|show|blame|branch|remote|stash\s+list|rev-parse|describe|config\s+--get)\b|(?:node|npm|pnpm|yarn|bun|python\d*|cargo|rustc|go|java|mvn|gradle\w*|dotnet)\s+(?:--version|-V|version)\b|(?:npm|pnpm|yarn|bun)\s+(?:list|ls|why|outdated)\b)(?:\s+[^;&|<>`]*)?$/i.test(segment);
+  /*
+   * `find` 能自己删东西，白名单的「参数里不含 ; & | < > 反引号就算安全」对它不成立。
+   *
+   * find 的动作谓词就长在参数里：`-delete` 直接删，`-exec` / `-execdir` / `-ok` / `-okdir`
+   * 能跑任意命令，`-fls` / `-fprint` / `-fprintf` 往任意路径写文件。于是
+   *
+   *     find . -name '*.js' -delete
+   *     find . -type f -exec rm -rf {} +
+   *
+   * 会被判成**只读命令**。而只读判定在审批链里排在 mustAsk **前面**并直接 return true，
+   * 所以这两条命令**即使用户打开了「改动前审批」也不会弹框**——一个能绕过用户自己设的
+   * 闸的路径。加上 shell 删除不进 checkpoint，「全部撤销」也救不回来。
+   *
+   * 这里只拦 find 的破坏性谓词，普通的 `find . -name '*.ts'` 照旧算只读。
+   */
+  const findIsDestructive = (segment) =>
+    /^find\b/i.test(segment) && /\s-(?:delete|exec|execdir|ok|okdir|fls|fprint|fprintf)\b/i.test(segment);
+  const segmentOk = (segment) => !findIsDestructive(segment) && /^(?:cd\s+(?:"[^"]+"|'[^']+'|\S+)|test\s+-[defrs]\s+\S+|\[\s+-[defrs]\s+\S+\s+\]|echo\b|pwd|ls|find|rg|grep|cat|head|tail|wc|du|df|tree|file|stat|which|type|whereis|lsof|ps|uname|sw_vers|date|whoami|env|printenv|jq\b|dir|where|findstr|more|ver|systeminfo|tasklist|set|chdir|attrib|sed\s+-n\b|git\s+(?:status|diff|log|show|blame|branch|remote|stash\s+list|rev-parse|describe|config\s+--get)\b|(?:node|npm|pnpm|yarn|bun|python\d*|cargo|rustc|go|java|mvn|gradle\w*|dotnet)\s+(?:--version|-V|version)\b|(?:npm|pnpm|yarn|bun)\s+(?:list|ls|why|outdated)\b)(?:\s+[^;&|<>`]*)?$/i.test(segment);
   const segments = raw.split(/\s*&&\s*/).map((segment) => segment.trim()).filter(Boolean);
   return segments.length > 0 && segments.every(segmentOk);
 }

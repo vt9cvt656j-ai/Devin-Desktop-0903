@@ -27754,3 +27754,40 @@ test("自动改重复标点不许碰别的语言的合法语法", () => {
     assert.match(tbl, pat, why);
   }
 });
+
+test("会删东西的 find 不许被判成只读命令，批量删除必须弹确认", () => {
+  // 只读判定在审批链里排在 mustAsk **前面**并直接 return true，所以一旦某条命令被判成
+  // 只读，它连「改动前审批」都绕得过去——用户自己打开的闸对它无效。而 find 的动作谓词
+  // 就长在参数里（-delete / -exec / -ok / -fprint），白名单原来那句「参数不含 ; & | < > 反引号
+  // 就算安全」对它根本不成立。再加上 shell 删除不进 checkpoint，「全部撤销」也救不回来。
+  const roSrc = SRC.slice(SRC.indexOf("function _looksLikeReadOnlyCommand"));
+  const roBody = roSrc.slice(0, roSrc.indexOf("\nfunction "));
+  const isReadOnly = new Function("command", roBody.slice(roBody.indexOf("{") + 1, roBody.lastIndexOf("}")).replace(/_looksLikeReadOnlyCommand/g, "arguments.callee") + "");
+  // 直接用源码里的谓词判据做断言，避免把整个递归函数搬进沙箱。
+  assert.match(roSrc, /const findIsDestructive = \(segment\) =>/,
+    "find 的破坏性谓词判断没了——-delete / -exec 会重新被当成只读命令");
+  assert.match(roSrc, /-\(\?:delete\|exec\|execdir\|ok\|okdir\|fls\|fprint\|fprintf\)/,
+    "破坏性谓词名单不完整");
+  assert.match(roSrc, /!findIsDestructive\(segment\) &&/,
+    "谓词判断没有真正接到 segmentOk 上——写了等于没写");
+  void isReadOnly;
+
+  // auto 模式下唯一会弹确认框的是 _DANGEROUS_CMD_RE，批量不可逆删除必须在里面。
+  const m = /const _DANGEROUS_CMD_RE = (\/.*\/i);/.exec(SRC);
+  assert.ok(m, "找不到 _DANGEROUS_CMD_RE");
+  const RE = eval(m[1]);
+  for (const cmd of [
+    "find . -name '*.js' -delete",
+    "find . -type f -exec rm -rf {} +",
+    "git clean -xfd",
+    "git clean -f -d",
+    "rm -rf .",
+    "rm -rf ~/Documents",
+  ]) {
+    assert.ok(RE.test(cmd), `批量不可逆删除没有被标成危险，auto 模式下会静默执行：${cmd}`);
+  }
+  // 反向：日常操作不能被误报，否则确认框常亮、然后就没人看了。
+  for (const cmd of ["find . -name '*.ts'", "rm -rf node_modules", "git clean -n", "git status", "ls -la"]) {
+    assert.ok(!RE.test(cmd), `日常操作被误报成危险，确认框会变成噪声：${cmd}`);
+  }
+});
