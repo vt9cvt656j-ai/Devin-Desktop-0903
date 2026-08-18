@@ -2816,6 +2816,41 @@ test("权限作用域：收紧处处合并，放宽只认用户自己的", async
   assert.deepEqual(empty, { allow: [], ask: [], deny: [] });
 });
 
+test("在新目录里第一次建配置文件时，老配置被搬过来，而不是被示例顶掉", async () => {
+  // 改名带来的第二个静默丢失点，比第一个更隐蔽：读取端是"新的存在就完全不看老的"，
+  // 所以只要有任何东西往新路径写了一个字节，老配置当场失效。设置面板的「新建」按钮
+  // 原来就会往那儿写一份示例模板——界面显示"已建好一份示例"，用户以为自己什么都没丢。
+  const dirs = SRC.match(/const _STATE_DIR = "[^"]*";\nconst _LEGACY_STATE_DIR = "[^"]*";/)[0];
+  const seed = (files) => new Function("_STATE_DIR", "_LEGACY_STATE_DIR", "backend",
+    `${extractFn("_seedFromLegacyScopeFile")}\n;return _seedFromLegacyScopeFile;`,
+  )(
+    new Function(`${dirs}\nreturn _STATE_DIR;`)(),
+    new Function(`${dirs}\nreturn _LEGACY_STATE_DIR;`)(),
+    { readTextFile: async (p) => { if (files[p]) return files[p]; throw new Error("no file"); } },
+  );
+
+  const mine = JSON.stringify({ permissions: { deny: ["Bash(rm *)"] } });
+  assert.equal(
+    await seed({ "/repo/.michael/settings.json": mine })("/repo/.mrdayone/settings.json"),
+    mine,
+    "老配置没被搬过来——面板会往新路径写示例，用户那份真配置从此静默失效");
+  // 老的没有 / 是空文件 → 让调用方照常写示例。
+  assert.equal(await seed({})("/repo/.mrdayone/settings.json"), "");
+  assert.equal(
+    await seed({ "/repo/.michael/settings.json": "   \n " })("/repo/.mrdayone/settings.json"), "");
+  // 不在新目录下的路径直接不管。少了这道判断，替换是空操作 → 它会去读**同一个路径**，
+  // 于是"从自己身上搬配置"，把一份本该新建的文件变成复制品。
+  assert.equal(await seed({ "/repo/.vscode/settings.json": mine })("/repo/.vscode/settings.json"), "",
+    "路径不在新目录下时还去读——等于从目标文件自己身上取内容");
+
+  // 面板那次调用没有纯函数出口（在 UI 事件处理器里），只能钉源码：写进去的内容必须是
+  // 「搬来的 或者 示例」，不能绕过搬迁直接写示例。
+  const panel = stripJsComments(SRC);
+  assert.match(panel, /content: seeded \|\| _CAPABILITY_STARTER/,
+    "面板绕过了搬迁直接写示例——老配置会在用户点「新建」的那一刻失效");
+  assert.match(panel, /const seeded = await _seedFromLegacyScopeFile\(s\.path\)/);
+});
+
 test("目录从 .michael/ 改名到 .mrdayone/：老配置照样生效，新的一旦存在就完全盖过老的", async () => {
   // 这次改名的全部风险就在这一条上。改错的表现不是报错，是**某天打开 IDE 发现
   // 自己写的权限规则全没了**——工具突然全要审批，或者更糟：突然都不问了。
@@ -22174,6 +22209,32 @@ test("_freshBuildFailure finds a declared verification that exited nonzero at th
   assert.equal(fresh({}, 1), null);
 });
 
+test("一条绿命令只能替它自己作证，盖不住另一条命令的红", () => {
+  // 用户实拍过的那种「说自己解决了、实际没解决」，而且是最难发现的一种：每一步都有
+  // 真实执行证据。模型跑 `npm test` 挂了（退出 1），接着跑 `npx tsc --noEmit` 过了，
+  // 而 last-write-wins 是**全局**的——倒序扫描先撞上 tsc、返回 null，整轮判成 success，
+  // 那条失败的测试连提都不会被提起。跑一次格式化也能达到同样效果。
+  const fresh = load("_freshBuildFailure");
+  const ev = (command, exitCode) => ({
+    verifierRecognized: true, implementationVersion: 1, timedOut: false, exitCode, command, cwd: "/ws",
+  });
+  const at = (records) => fresh({ _executionEvidence: records }, 1);
+
+  assert.equal(at([ev("npm test", 1), ev("npx tsc --noEmit", 0)])?.command, "npm test",
+    "另一条无关命令的绿把红盖掉了 —— 带失败测试的一轮会被判成成功");
+  assert.equal(at([ev("npm test", 1), ev("npm test", 0)]), null,
+    "同一条命令改好后重跑变绿，本来就该放行（last-write-wins 的原意）");
+  assert.equal(at([ev("npm test", 0), ev("npm test", 1)])?.command, "npm test",
+    "同一条命令绿转红，要以最近一次为准");
+  assert.equal(at([ev("npm test", 1), ev("tsc", 0), ev("npm test", 0)]), null,
+    "红→（别的命令）→同命令绿：这条命令确实修好了");
+  assert.equal(at([ev("npm test", 1), ev("npm test", 0), ev("cargo test", 1)])?.command, "cargo test",
+    "任何一条命令最近一次是红的，门就得开");
+  assert.equal(at([ev("npm  test", 1), ev("npm test", 0)]), null,
+    "只有空格差异的是同一条命令，不该被当成两条");
+  assert.equal(at([ev("npm test", 0), ev("tsc", 0)]), null);
+});
+
 test("the agent loop keeps fixing a red build, bounded, then finishes honestly", () => {
   const loop = extractFn("_runAgenticLoop");
   // The build-failure signal drives a nudge + continue (keep fixing), like _diagnosticBlock.
@@ -24388,12 +24449,21 @@ test("连续静默立刻停 —— 这是唯一的死循环入口", () => {
 });
 
 test("绿证据要能盖住更早的红，否则改好了还被要求再修一遍", () => {
-  const fn = extractFn("_freshBuildFailure");
   // 原来只在 exitCode !== 0 时返回、绿的继续往前找 → 「跑红 → 改好 → 再跑绿」之后
-  // 那条更早的红仍然开门。倒序扫描的语义本来就是"最近一次说了算"。
-  assert.match(fn, /if \(typeof e\.exitCode === "number"\) return e\.exitCode === 0 \? null : e;/);
-  assert.doesNotMatch(fn, /if \(typeof e\.exitCode === "number" && e\.exitCode !== 0\) return e;/,
-    "又变回「遇绿不停」了");
+  // 那条更早的红仍然开门，模型被要求再修一遍一个已经绿了的构建。
+  //
+  // 这条断言过源码文本（钉住那一行的写法），而那一行后来必须改：全局的
+  // last-write-wins 会让**另一条无关命令**的绿也盖住红（见上面那条守卫）。
+  // 意图不变、实现变了，所以判据改成行为——源码怎么写不重要，行为对就行。
+  const fresh = load("_freshBuildFailure");
+  const ev = (command, exitCode) => ({
+    verifierRecognized: true, implementationVersion: 1, timedOut: false, exitCode, command, cwd: "/ws",
+  });
+  assert.equal(
+    fresh({ _executionEvidence: [ev("tsc -b", 2), ev("tsc -b", 0)] }, 1),
+    null,
+    "又变回「遇红就返回、不看后面有没有改好」了",
+  );
 });
 
 // ══ 死路扫描剩余 6 条 ═══════════════════════════════════════════════════════

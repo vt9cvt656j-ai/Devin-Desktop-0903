@@ -19951,6 +19951,27 @@ const _stateRels = (name) => [`${_STATE_DIR}/${name}`, `${_LEGACY_STATE_DIR}/${n
 // 目录里躺的还是旧文件名，读不到它只是头像和来源消失，不会报错，最难被发现。
 const _SKILL_META_NAME = ".mrdayone-skill.json";
 const _LEGACY_SKILL_META_NAME = ".michael-skill.json";
+/**
+ * 新建某个作用域的配置文件时，该往里写什么。
+ *
+ * 目录改名（.michael → .mrdayone）留下的一个**静默数据丢失点**：老目录里有配置、新的还
+ * 没有时，如果直接写一份示例模板进新路径，而读取端的规则是"新的存在就完全不看老的"，
+ * 那么从这一刻起用户那份真配置彻底失效——界面上还显示"已建好一份示例"，不报任何错。
+ *
+ * 所以：老的有内容就原样返回它（调用方据此改文案、并提示旧文件还在）；否则返回空串，
+ * 由调用方写示例。
+ */
+async function _seedFromLegacyScopeFile(path) {
+  const p = String(path || "");
+  if (!p.includes(`/${_STATE_DIR}/`)) return "";
+  const legacy = p.replace(`/${_STATE_DIR}/`, `/${_LEGACY_STATE_DIR}/`);
+  try {
+    const old = await backend.readTextFile(legacy);
+    return String(old || "").trim() ? old : "";
+  } catch {
+    return "";
+  }
+}
 async function _readSkillMeta(dir) {
   for (const name of [_SKILL_META_NAME, _LEGACY_SKILL_META_NAME]) {
     try {
@@ -29205,11 +29226,15 @@ async function _openCapabilitiesPanel() {
           return;
         }
       } catch { /* 不存在，正常往下建 */ }
+      // 老目录里有配置就先搬过来，别拿示例把它顶掉——原因见 _seedFromLegacyScopeFile。
+      const seeded = await _seedFromLegacyScopeFile(s.path);
       try {
-        await backend.invoke("write_text_file", { path: s.path, content: _CAPABILITY_STARTER });
+        await backend.invoke("write_text_file", { path: s.path, content: seeded || _CAPABILITY_STARTER });
         await openFile(s.path, s.path.split("/").pop());
         m.close();
-        showToast("已建好一份示例，改成你自己的接口即可");
+        showToast(seeded
+          ? `已把你原来 ${_LEGACY_STATE_DIR}/ 里的配置搬到这里，内容一字未改；旧文件还在，确认没问题后可以删掉`
+          : "已建好一份示例，改成你自己的接口即可");
       } catch (e) {
         showToast(`建不了：${String(e?.message || e).slice(0, 120)}`);
       }
@@ -40605,6 +40630,8 @@ function _executionEvidenceFromTool(call, result, root) {
 // still forces another fix pass instead of a "clean" finish on a broken tree.
 function _freshBuildFailure(run, implOps) {
   const ev = run && Array.isArray(run._executionEvidence) ? run._executionEvidence : [];
+  const settled = new Set();
+  let newestFailure = null;
   for (let i = ev.length - 1; i >= 0; i--) {
     const e = ev[i];
     if (!e) continue;
@@ -40620,16 +40647,24 @@ function _freshBuildFailure(run, implOps) {
     if (e.verifierRecognized !== true) continue;
     if (e.implementationVersion !== implOps) continue; // only the current artifact may drive another fix pass
     if (e.timedOut === true) continue;
-    // 遇到**当前版本**的第一条有退出码的验证记录就地裁决（last-write-wins）。
+    if (typeof e.exitCode !== "number") continue;
+    // last-write-wins 是**按命令**算的，不是全局的。
     //
-    // 原来这里只在 `exitCode !== 0` 时返回、绿的就继续往前找——于是
-    // 「跑一次红 → 改好 → 再跑同一条命令绿」之后，那条**更早的红**仍然会把这道门打开，
-    // 模型被要求再修一遍一个已经绿了的构建。倒序扫描的语义本来就是"最近一次说了算"，
-    // 绿的时候不停下来等于把这个语义丢了。
-    // 纯收紧：不放宽任何路径，只是让更晚的绿能盖住更早的红。
-    if (typeof e.exitCode === "number") return e.exitCode === 0 ? null : e;
+    // 全局版的原意没错：「跑一次红 → 改好 → 再跑同一条命令绿」之后，那条更早的红不该
+    // 再把门打开。但它遇到任何一条绿就整体收工，于是**另一条无关的命令**也能替红的作证：
+    // 模型跑 `npm test` 挂了（退出 1），接着跑 `npx tsc --noEmit` 过了（退出 0），倒序扫描
+    // 先撞上 tsc、返回 null，整轮判成 success——失败的测试连提都不会被提起。
+    // 这正是"说自己解决了、实际没解决"里最难发现的一种：每一步都有真实执行证据。
+    //
+    // 一条绿只能替它自己作证。同一条命令的更晚记录压住更早的；不同命令各算各的，
+    // 只要还有任何一条命令最近一次是红的，这道门就得开。
+    const key = `${e.cwd || ""}\u0000${String(e.command || "").replace(/\s+/g, " ").trim()}`;
+    if (settled.has(key)) continue; // 这条命令更晚的那次已经裁决过了
+    settled.add(key);
+    // 倒序扫描，所以第一条没被压住的红就是"最近一次失败"。继续扫完，别的命令可能也红。
+    if (e.exitCode !== 0 && !newestFailure) newestFailure = e;
   }
-  return null;
+  return newestFailure;
 }
 
 function _executionEvidenceReviewBlock(records) {
