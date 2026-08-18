@@ -10252,8 +10252,12 @@ test("reference-site UI tasks keep learning and fetch schemas lazy", () => {
     _buildAgentToolSchemas: () => ["browser", "screenshot", "learn_design", "web_fetch", "knowledge_search", "db_query", "read_file"].map(schema),
   });
   const names = select(true, "照着 https://linear.app 重做官网", []).map((tool) => tool.function.name);
-  assert.deepEqual(names, ["read_file", "search_tools"]);
-  for (const deferred of ["web_fetch", "learn_design", "knowledge_search", "browser", "screenshot"]) {
+  // web_fetch 现在在固定核心里（2026-08-18 扩窗），其余照旧懒加载——这条测的是
+  // "**不按任务文本**猜着塞工具"，那个保证没变：learn_design / browser / screenshot
+  // 这类要等真实证据指出需要才装。
+  // 顺序跟着目录走（select 是按 all 过滤的），不是按核心表的书写顺序。
+  assert.deepEqual(names, ["web_fetch", "read_file", "search_tools"]);
+  for (const deferred of ["learn_design", "knowledge_search", "browser", "screenshot"]) {
     assert.ok(!names.includes(deferred), `${deferred} must not expand the first-turn schema payload`);
   }
 });
@@ -10407,9 +10411,14 @@ test("task profiles do not expand the minimal first-turn tool schema payload", (
     "查清楚依赖版本兼容",
     "做一个完整网站",
   ]) {
+    // 这条测的是「**画像**不许把窗口撑大」——它守的是"别按关键词猜任务类型然后塞工具"，
+    // 这个保证仍然成立、也仍然重要。变的只是**固定核心**本身：取外部资源那五个已经进了
+    // 核心（2026-08-18，用户点名），所以期望值跟着核心走，而不是回到 read_file 一个。
+    // 关键不变量还在：同一批工具，不随 request 文本变化。
+    const got = select(true, request, []).map((tool) => tool.function.name);
     assert.deepEqual(
-      select(true, request, []).map((tool) => tool.function.name),
-      ["read_file", "search_tools"],
+      got,
+      ["read_file", "package_search", "developer_community_search", "web_search", "web_fetch", "search_tools"],
       `profile must not eagerly expand schemas for: ${request}`,
     );
   }
@@ -11287,6 +11296,44 @@ test("external source tools stay real but load on demand", () => {
   // 一轮取 schema"而永远不用。判断权仍在模型和编排器手里——装进窗口 ≠ 每轮都要用。
   assert.doesNotMatch(SRC, /_TOOL_BUNDLES|_DEFERRED_TOOL_NAMES/,
     "lazy loading must derive from the live registry instead of a second static tool table");
+});
+
+test("Agent 开局窗口 16 个：取外部资源那一族必须在里面", () => {
+  // 用户 2026-08-18 点名："把初始化编排工具从 11 提升到 16，把那些加进来"。
+  // 为什么是结构性的：窗口里的工具零成本可调，不在窗口里的要先花一轮 search_tools 取
+  // schema。两条路结果差不多时模型走便宜的那条——于是"能查 GitHub / 开发者社区"在真正
+  // 需要它的难任务上永远轮不到。装进窗口 ≠ 每轮都用，判断权仍在模型和编排器。
+  const core = /agent: \["read_file"[\s\S]*?\],/.exec(SRC);
+  assert.ok(core, "agent 核心表被改名或挪走了，这条断言失去落点");
+  const names = [...core[0].matchAll(/"([a-z_]+)"/g)].map((m) => m[1]);
+  assert.equal(names.length + 1, 16, `开局窗口是 ${names.length + 1} 个（含 search_tools），不是 16`);
+  for (const t of ["web_search", "web_fetch", "github_search", "developer_community_search", "package_search"]) {
+    assert.ok(names.includes(t), `取资源的 ${t} 不在开局窗口——它就只能等 search_tools，等于不会被用`);
+  }
+  // 原有十件不能被挤掉。
+  for (const t of ["read_file", "list_dir", "search", "find_files", "update_plan",
+                   "ask_user", "write_file", "edit_file", "multi_edit", "run_cmd"]) {
+    assert.ok(names.includes(t), `核心工具 ${t} 被挤掉了`);
+  }
+});
+
+test("编排器要按难度调整「最小集合」——难任务第一轮就把取证面铺开", () => {
+  // 「只选最小集合」对简单任务是对的，对难任务恰好相反：难任务开局最缺的就是材料。
+  // 画像里的难度字段本来就在传给编排器，只是从没人说过它该怎么改变答案。
+  const src = stripJsComments(SRC);
+  assert.match(src, /按难度调整这个"最小"/, "编排器仍然无条件要最小集合，难任务会一次只递一个工具、来回七八轮");
+  assert.match(src, /industrialProject \/ largeProject \/ substantial \/ projectScope \/ longTask/,
+    "没点名画像里的难度字段，模型无从判断该不该铺开");
+  assert.match(src, /真实不确定性/);
+  // 反方向同样要写死，否则它会变成"每轮都铺开"，那是另一种浪费。
+  assert.match(src, /任务简单明确、或者证据已经够了，就保持最小/,
+    "缺了收敛的那一半，铺开取证会变成每轮的仪式");
+
+  // 交付律里也要有对应的一条，否则只有编排器知道、干活的模型不知道。
+  const laws = SRC.slice(SRC.indexOf("function _agentDecisionFrameBlock")).slice(0, 9000);
+  assert.match(laws, /难度自适应律：越难的任务，动手前要想得越透/);
+  assert.match(laws, /先把不确定的地方查清楚再动手/);
+  assert.match(laws, /github_search 看别人的真实实现/);
 });
 
 test("Agent initial tools keep the role nucleus independent of intent profile", () => {

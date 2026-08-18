@@ -28,8 +28,12 @@ function topLevelFn(name) {
   return SRC.slice(at, end + 2);
 }
 
+// 和 main.js 的 agent 核心表保持一致。2026-08-18 扩窗：取外部资源那五个进了核心
+// （用户点名——不进窗口就意味着"要多花一轮取 schema"，模型在难任务上永远不会选它们）。
+// 这个文件守的是"MCP 不许挤爆窗口"，那个保证与扩窗无关，仍然成立。
 const CORE = ["read_file", "list_dir", "search", "find_files", "update_plan", "ask_user",
-              "write_file", "edit_file", "multi_edit", "run_cmd"];
+              "write_file", "edit_file", "multi_edit", "run_cmd",
+              "web_search", "web_fetch", "github_search", "developer_community_search", "package_search"];
 
 function selector() {
   return new Function(
@@ -38,7 +42,8 @@ function selector() {
     "const _INITIAL_MCP_MAX_TOOLS = 8;" +
     "const _INITIAL_MCP_MAX_BYTES = 12000;" +
     "const _buildAgentToolSchemas = (w, mcp) =>" +
-    "  [...CORE, 'web_fetch', 'http_request', 'browser'].map((n) => ({type:'function',function:{name:n}}))" +
+    // web_fetch 已经在 CORE 里（扩窗后），这里再列一次会让过滤结果出现重复项。
+    "  [...CORE, 'http_request', 'browser'].map((n) => ({type:'function',function:{name:n}}))" +
     "    .concat(mcp || []);" +
     topLevelFn("_utf8ByteLength") +
     topLevelFn("_mcpServersForInitialWindow") +
@@ -117,7 +122,9 @@ test("放行是确定性的：同样输入、不同顺序，结果一致", () =>
 });
 
 test("非 mcp__ 前缀的东西不会被这段逻辑误放进来", () => {
-  const out = names(select(true, "任务", [mcp("web_fetch"), mcp("mcp_no_double_underscore")]));
+  // 举例不能用核心工具名：web_fetch 扩窗后进了 CORE，拿它当"假 MCP 工具"会把真正的
+  // 核心项挤掉，测出来的就不是这条断言想守的东西了。
+  const out = names(select(true, "任务", [mcp("plain_not_mcp"), mcp("mcp_no_double_underscore")]));
   assert.deepEqual(out, [...CORE, "search_tools"]);
 });
 
