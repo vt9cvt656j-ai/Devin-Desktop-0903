@@ -36980,6 +36980,45 @@ async function _snapshotCmdScope(root) {
   return { files, truncated };
 }
 
+/// 删目录之前，把里面的文本文件读出来存进 checkpoint，让「全部撤销」能把整棵树写回去。
+///
+/// 为什么需要：delete_path 在 Rust 侧是 remove_dir_all——没有回收站、没有备份。而此前
+/// 只有**单个文本文件**会进 checkpoint（读得出 readTextFile 的那条分支），目录和二进制
+/// 走 deletePath，一条快照都不留。于是 agent 一句 `delete_path("src/legacy")` 之后，
+/// 「全部撤销」按钮对它完全无效，而按钮本身照常显示"已撤销 N 个"。
+///
+/// 有意做成**有上限**的：快照是把内容读进内存，对着 node_modules 这种目录做等于把内存吃爆。
+/// 触到上限时**不静默**——返回 truncated，调用方要把"这次删除撤不回来"明确说出来，
+/// 而不是让用户以为撤销还管用。
+const _UNDO_SNAPSHOT_MAX_FILES = 400;
+const _UNDO_SNAPSHOT_MAX_BYTES = 8 * 1024 * 1024;
+
+async function _snapshotDirForUndo(dirPath) {
+  const files = [];
+  let bytes = 0;
+  let truncated = false;
+  const stack = [dirPath];
+  while (stack.length) {
+    if (files.length >= _UNDO_SNAPSHOT_MAX_FILES || bytes >= _UNDO_SNAPSHOT_MAX_BYTES) { truncated = true; break; }
+    const dir = stack.pop();
+    let entries;
+    try { entries = await backend.readDir(dir); } catch { truncated = true; continue; }
+    for (const e of entries) {
+      if (files.length >= _UNDO_SNAPSHOT_MAX_FILES || bytes >= _UNDO_SNAPSHOT_MAX_BYTES) { truncated = true; break; }
+      const p = _treePath(e.path);
+      if (e.is_dir) { stack.push(p); continue; }
+      let content = null;
+      // 读不出来的（二进制、超大、权限）跳过，但要记成 truncated——它们撤不回来，
+      // 这一点必须能传到用户面前。
+      try { content = await backend.readTextFile(p); } catch { truncated = true; continue; }
+      if (content == null) { truncated = true; continue; }
+      bytes += content.length;
+      files.push({ path: p, content });
+    }
+  }
+  return { files, truncated };
+}
+
 function _checkpointRecord(cp, absPath, existed, content) {
   cp = cp || _runCheckpoint;
   if (!absPath || cp.has(absPath)) return;
@@ -53908,11 +53947,21 @@ async function _executeToolStepInner(step, call, root, run) {
         if (!(await _closeOpenFilesUnder(fp))) throw new Error("目标仍在编辑器中打开，已阻止删除");
         let oldText = null;
         try { oldText = await backend.readTextFile(fp); } catch { /* dir/binary */ }
+        // 删目录之前先把里面的文本文件快照进 checkpoint，否则「全部撤销」对目录完全无效——
+        // 此前只有单个文本文件进 checkpoint，`deletePath` 删掉的整棵树一条快照都不留，
+        // 而 delete_path 在 Rust 侧是 remove_dir_all，没有回收站、没有备份。
+        let dirSnapshot = null;
+        if (oldText == null) dirSnapshot = await _snapshotDirForUndo(fp);
         if (oldText != null) await backend.deleteTextFileIfUnchanged(fp, oldText);
         else await backend.deletePath(fp);
         if (oldText != null) {
           _checkpointRecord(_cp, fp, true, oldText);
           _checkpointMarkCurrent(_cp, fp, null);
+        } else if (dirSnapshot && dirSnapshot.files.length) {
+          for (const f of dirSnapshot.files) {
+            _checkpointRecord(_cp, f.path, true, f.content);
+            _checkpointMarkCurrent(_cp, f.path, null);
+          }
         }
         _invalidateRead(p); _agentReadCache.delete(fp);
         _resetReadProgress(run, fp, p); // gone → don't report it as "已读"
@@ -53921,7 +53970,20 @@ async function _executeToolStepInner(step, call, root, run) {
         // keeps steering the model to symbols in a file that no longer exists.
         try { void refreshSymbolIndexFor(fp); } catch {}
         res.className = "atc-result atc-result--ok"; res.textContent = "已删除";
-        return { type: "delete", path: p, content: `已删除 ${p}` };
+        // 撤销能力要如实说。删目录时如果快照没做全（文件数/字节触顶、或含读不出的
+        // 二进制），「全部撤销」就只能还原其中一部分——不说清楚的话，模型会以为这一步
+        // 随时可回退，进而更放手地删下去。
+        let undoNote = "";
+        if (oldText == null && dirSnapshot) {
+          if (!dirSnapshot.files.length) {
+            undoNote = "\n注意：这次删除**无法撤销**（目录里没有可快照的文本文件，二进制与超大文件不做快照）。";
+          } else if (dirSnapshot.truncated) {
+            undoNote = `\n注意：只快照了其中 ${dirSnapshot.files.length} 个文本文件，**其余内容无法撤销**（触到快照上限，或含二进制/超大/读不出的文件）。`;
+          } else {
+            undoNote = `\n（已快照 ${dirSnapshot.files.length} 个文本文件，可用「全部撤销」还原。）`;
+          }
+        }
+        return { type: "delete", path: p, content: `已删除 ${p}${undoNote}` };
       } catch (e) {
         for (const tab of openBeforeDelete) {
           if (!openFiles.has(tab.openPath)) await openFile(tab.openPath, tab.name, tab.active);
