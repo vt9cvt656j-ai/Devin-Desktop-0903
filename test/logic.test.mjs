@@ -22174,6 +22174,32 @@ test("_freshBuildFailure finds a declared verification that exited nonzero at th
   assert.equal(fresh({}, 1), null);
 });
 
+test("一条绿命令只能替它自己作证，盖不住另一条命令的红", () => {
+  // 用户实拍过的那种「说自己解决了、实际没解决」，而且是最难发现的一种：每一步都有
+  // 真实执行证据。模型跑 `npm test` 挂了（退出 1），接着跑 `npx tsc --noEmit` 过了，
+  // 而 last-write-wins 是**全局**的——倒序扫描先撞上 tsc、返回 null，整轮判成 success，
+  // 那条失败的测试连提都不会被提起。跑一次格式化也能达到同样效果。
+  const fresh = load("_freshBuildFailure");
+  const ev = (command, exitCode) => ({
+    verifierRecognized: true, implementationVersion: 1, timedOut: false, exitCode, command, cwd: "/ws",
+  });
+  const at = (records) => fresh({ _executionEvidence: records }, 1);
+
+  assert.equal(at([ev("npm test", 1), ev("npx tsc --noEmit", 0)])?.command, "npm test",
+    "另一条无关命令的绿把红盖掉了 —— 带失败测试的一轮会被判成成功");
+  assert.equal(at([ev("npm test", 1), ev("npm test", 0)]), null,
+    "同一条命令改好后重跑变绿，本来就该放行（last-write-wins 的原意）");
+  assert.equal(at([ev("npm test", 0), ev("npm test", 1)])?.command, "npm test",
+    "同一条命令绿转红，要以最近一次为准");
+  assert.equal(at([ev("npm test", 1), ev("tsc", 0), ev("npm test", 0)]), null,
+    "红→（别的命令）→同命令绿：这条命令确实修好了");
+  assert.equal(at([ev("npm test", 1), ev("npm test", 0), ev("cargo test", 1)])?.command, "cargo test",
+    "任何一条命令最近一次是红的，门就得开");
+  assert.equal(at([ev("npm  test", 1), ev("npm test", 0)]), null,
+    "只有空格差异的是同一条命令，不该被当成两条");
+  assert.equal(at([ev("npm test", 0), ev("tsc", 0)]), null);
+});
+
 test("the agent loop keeps fixing a red build, bounded, then finishes honestly", () => {
   const loop = extractFn("_runAgenticLoop");
   // The build-failure signal drives a nudge + continue (keep fixing), like _diagnosticBlock.
@@ -24388,12 +24414,21 @@ test("连续静默立刻停 —— 这是唯一的死循环入口", () => {
 });
 
 test("绿证据要能盖住更早的红，否则改好了还被要求再修一遍", () => {
-  const fn = extractFn("_freshBuildFailure");
   // 原来只在 exitCode !== 0 时返回、绿的继续往前找 → 「跑红 → 改好 → 再跑绿」之后
-  // 那条更早的红仍然开门。倒序扫描的语义本来就是"最近一次说了算"。
-  assert.match(fn, /if \(typeof e\.exitCode === "number"\) return e\.exitCode === 0 \? null : e;/);
-  assert.doesNotMatch(fn, /if \(typeof e\.exitCode === "number" && e\.exitCode !== 0\) return e;/,
-    "又变回「遇绿不停」了");
+  // 那条更早的红仍然开门，模型被要求再修一遍一个已经绿了的构建。
+  //
+  // 这条断言过源码文本（钉住那一行的写法），而那一行后来必须改：全局的
+  // last-write-wins 会让**另一条无关命令**的绿也盖住红（见上面那条守卫）。
+  // 意图不变、实现变了，所以判据改成行为——源码怎么写不重要，行为对就行。
+  const fresh = load("_freshBuildFailure");
+  const ev = (command, exitCode) => ({
+    verifierRecognized: true, implementationVersion: 1, timedOut: false, exitCode, command, cwd: "/ws",
+  });
+  assert.equal(
+    fresh({ _executionEvidence: [ev("tsc -b", 2), ev("tsc -b", 0)] }, 1),
+    null,
+    "又变回「遇红就返回、不看后面有没有改好」了",
+  );
 });
 
 // ══ 死路扫描剩余 6 条 ═══════════════════════════════════════════════════════
