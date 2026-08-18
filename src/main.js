@@ -24726,9 +24726,7 @@ async function _predictNextAsk(sess) {
 
     const ctrl = typeof AbortController !== "undefined" ? new AbortController() : null;
     const to = ctrl ? setTimeout(() => ctrl.abort(), 12000) : null;
-    const res = await fetch(_chatCompletionsUrl(_predictCfg.baseUrl), {
-      method: "POST",
-      headers: (() => {
+    const _text = await _fetchCompletionText(_chatCompletionsUrl(_predictCfg.baseUrl), (() => {
         const h = { "Content-Type": "application/json", Authorization: "Bearer " + (_predictCfg.apiKey || "") };
         // 不带 request_id 的话，网关插 model_usage 时它是 NULL，而结算接口按 request_id 查——
         // 这笔钱扣了、进了用量页，却不进本轮的费用页脚。用户会看到额度掉得比页面上所有
@@ -24737,18 +24735,14 @@ async function _predictNextAsk(sess) {
         const rid = String(sess._reqId || "");
         if (_predictCfg.viaGateway && /^[-_A-Za-z0-9]{8,128}$/.test(rid)) h["x-ide-request-id"] = rid;
         return h;
-      })(),
-      body: JSON.stringify({
+      })(), {
         model: _predictCfg.model,
         messages: [{ role: "system", content: _ASK_PREDICT_SYSTEM }, { role: "user", content: convo }],
-        max_tokens: 60, temperature: 0.3, stream: false,
-      }),
-      signal: ctrl ? ctrl.signal : undefined,
-    });
+        max_tokens: 60, temperature: 0.3
+      }, ctrl ? ctrl.signal : undefined);
     if (to) clearTimeout(to);
-    if (!res.ok) return;
-    const data = await res.json();
-    const raw = String(data?.choices?.[0]?.message?.content || "").trim().replace(/^["「『]|["」』]$/g, "");
+    if (_text == null) return;
+    const raw = String(_text || "").trim().replace(/^["「『]|["」』]$/g, "");
     const why = _rejectPredictedAsk(raw);
     // 记下被拒的原因而不是一走了之：「为什么这儿没有预测」要答得出来。
     sess._askPredictReject = why;
@@ -40553,7 +40547,9 @@ function _toolMayProduceExternalEffect(call) {
   // op 名要和 tools.json 的 action 枚举对上：list / status **不存在**（真正列 App 的叫
   // apps），所以这两个名字写在这里等于没写，而 menu_items 这个真正的只读动作反而漏了。
   if (call.type === "system") return !["frontmost", "apps", "windows", "menu_items"].includes(call.op);
-  if (call.type === "automation") return !/(?:^|\.)(?:get|read|list|status|inspect|nodes|check|screenshot)$/i.test(String(call.method || ""));
+  // capture / position / info 也是纯观察：拍一眼屏幕、问指针在哪、问屏幕多大，都不改变
+  // 任何东西。漏了它们的后果是模型"看一眼"也要过一次副作用判定。
+  if (call.type === "automation") return !/(?:^|\.)(?:get|read|list|status|inspect|nodes|check|screenshot|capture|position|info)$/i.test(String(call.method || ""));
   if (call.type === "uiclick") return true;
   if (call.type === "http") return !["GET", "HEAD", "OPTIONS"].includes(String(call.method || "GET").toUpperCase());
   if (["download", "download_asset", "genimage", "generate_3d", "generate_sound", "generate_music", "generate_voice", "auto_rig", "generate_motion", "generate_texture"].includes(call.type)) return true;
@@ -41102,6 +41098,13 @@ function _deliveryFactsLine(run) {
   if (v && typeof v.done === "boolean") {
     parts.push(v.done ? "收尾评审：通过" : `收尾评审：未通过${v.instruction ? " — " + String(v.instruction).slice(0, 120) : ""}`);
   }
+  // 顺手发现的其它真问题 + 方向提醒：**只陈述**，不改变本轮交付，也不写进模型的回答里
+  // （那会变成 harness 冒充模型说话）。和上面几项事实并列，用户一眼扫到。
+  if (Array.isArray(v?.findings) && v.findings.length) {
+    parts.push(`顺带发现 ${v.findings.length} 处其它问题：`
+      + v.findings.map((f) => `${f.where ? f.where + " " : ""}${f.what}`).join("；").slice(0, 300));
+  }
+  if (v?.direction) parts.push(`方向提醒：${String(v.direction).slice(0, 200)}`);
   return parts.join(" · ");
 }
 
@@ -45323,9 +45326,73 @@ function _changedHunk(before, after, ctx = 3, maxLines = 40) {
   return capped.map((l) => l.slice(0, 200)).join("\n");
 }
 
-async function _wrapUpCritic({ config, task, padText, draft, readList, executionEvidence, toolRegistry, contract = "", changeDigest = "" }) {
+/**
+ * 直连网关跑一次一次性补全，**走 SSE**，把增量拼回完整文本。
+ *
+ * 为什么不再用 `stream: false`：中转（Sub2API 这类）对同步请求是**整段生成完才回**——
+ * 用户的控制台里这些请求类型写着"同步"，网关日志侧量到 upstream_header_ms 8~40 秒而
+ * first_upstream_chunk_after_headers_ms 恒为 0，正是那个形状。
+ *
+ * 客户端 Rust 那边已经全部转成 SSE，但这三条是 main.js 里的**直连 fetch**，绕过了
+ * backend，所以那次扫描没扫到它们（守卫只看了两棵 Rust 源码树）。而其中
+ * _semanticToolOrchestrator 是**每轮都跑**的工具编排，正在关键路径上。
+ *
+ * 两种帧都认（OpenAI 的 delta.content / 原生 Anthropic 的 content_block_delta），
+ * 并保留"中转无视 stream:true 直接回 JSON"的兜底——没有它那些线路会整条失效。
+ */
+async function _fetchCompletionText(url, headers, payload, signal) {
+  const res = await fetch(url, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ ...payload, stream: true }),
+    signal,
+  });
+  if (!res.ok) return null;
+  // 拿不到 headers / body 的响应（老实现、测试桩、某些中转）一律按普通 JSON 处理：
+  // 这里直接 res.headers.get(...) 会抛，而抛出去只会变成"这条能力静默失灵"。
+  const ctype = String(res.headers?.get?.("content-type") || "");
+  if (!res.body?.getReader || !/event-stream/i.test(ctype)) {
+    // 中转把 stream 忽略了，按普通补全响应解析。
+    try {
+      const data = await res.json();
+      return String(data?.choices?.[0]?.message?.content || data?.content?.[0]?.text || "");
+    } catch { return null; }
+  }
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buf = "", out = "";
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buf += decoder.decode(value, { stream: true });
+    let nl;
+    while ((nl = buf.indexOf("\n")) >= 0) {
+      const line = buf.slice(0, nl).trim();
+      buf = buf.slice(nl + 1);
+      if (!line.startsWith("data:")) continue;
+      const data = line.slice(5).trim();
+      if (data === "[DONE]") { try { await reader.cancel(); } catch {} return out; }
+      let v = null;
+      try { v = JSON.parse(data); } catch { continue; } // 心跳/半截帧：跳过
+      const piece = v?.choices?.[0]?.delta?.content
+        ?? (v?.type === "content_block_delta" ? v?.delta?.text : null);
+      if (typeof piece === "string") out += piece;
+    }
+  }
+  return out;
+}
+
+async function _wrapUpCritic({ config, task, padText, draft, readList, executionEvidence, toolRegistry, contract = "", changeDigest = "", demands = [] }) {
   if (!config || !config.baseUrl || !config.apiKey) return null;
-  const sys = '你是一个编码智能体的独立收尾评审和证据工具调度员。只输出严格 JSON：{"done":true|false,"verified":true|false,"instruction":"<不合格时给它的具体下一步指令，一两句>","tools":["下一步需要的已注册工具名"]}。'
+  const sys = '你是一个编码智能体的独立收尾评审和证据工具调度员。只输出严格 JSON：{"done":true|false,"verified":true|false,"instruction":"<不合格时给它的具体下一步指令，一两句>","tools":["下一步需要的已注册工具名"],"findings":[{"where":"文件:行","what":"一句话说清是什么问题","why":"为什么它是真问题"}],"direction":"<一两句：用户真正想达成的是什么；没有可说的就空字符串>"}。'
+      // findings：顺手发现、但**超出本轮范围**的真实缺陷。用户的原话是"修 bug 过程中发现更多问题"。
+      // 两条硬约束，缺一条这个字段就会变成噪音：必须是**真问题**（能说出触发路径或后果），
+      // 不是风格偏好、不是"建议加注释"；宁可空着也不要凑数。
+      + '【findings】读 diff 和相关源码时，如果看到**本次任务之外**的真实缺陷（会导致错误结果、崩溃、数据/安全问题、明显的可维护性陷阱如硬编码密钥/魔法值/复制粘贴的分支），最多列 3 条，每条写清在哪、是什么、为什么是真问题。判断标准是"能说出它什么时候会出事"；只是风格不合口味、命名不够好、想加注释——**一律不写**。没有就给空数组，宁可空着也不要凑数。\n'
+      // direction：用户"真正想做的事"。只在**这一轮的要求和他一路要求的走向不一致**时才说。
+      // 用户的原话："即使用户走歪了，给用户弄完 也可以给用户说 他想要做的是什么事情"。
+      // 所以它永远是事后一句提醒，不改变本轮该交付什么。
+      + '【direction】看用户这一串历次要求（下面【用户历次要求】），判断他真正想达成的是什么。只有当**这一轮的做法或要求，和他一路以来想达成的目标明显不一致**时才写一两句：说清你判断他真正要的是什么、以及这次的做法为什么可能偏了。他的要求本身合理、或看不出偏差时，一律给空字符串——不要为了有话说而说。这个字段**不改变本轮的交付**，本轮该做什么照做，这只是做完之后提醒他一句。\n'
     + '评审标准：回答/工作要与用户任务的深度和范围匹配——问"项目是干嘛的/架构"这类全局理解题，必须基于真正读过入口和核心模块的源码，只读 README 或一两个文件就下结论=不合格；'
     + '改代码的任务：先读【本轮实际改动】里的真实 diff，判断这段改动本身是否真的实现了用户要求——答非所问、只改表面、漏掉要求的分支/条件 = 不合格，即使命令全绿；声称完成但没验证/没跑检查同样不合格。明显浅、留着没做完的事=不合格。'
     + '必须逐条阅读结构化执行证据，把 exitCode、stdout、stderr、cwd、持续/退出状态和用户要求的实际后置结果结合起来判断。exitCode=0 只表示进程正常退出，不证明业务目标完成；有部分失败、结果缺失、服务未就绪或后置状态未核对时，verified=false。要求智能体继续读终端/日志/文件/服务状态、修复并重跑。'
@@ -45344,30 +45411,46 @@ async function _wrapUpCritic({ config, task, padText, draft, readList, execution
   // native Anthropic bridge can cache this prefix once; task/evidence text remains
   // in the changing user block and does not invalidate the directory cache each call.
   const catalogSystem = `${sys}\n\n当前工具能力索引（不可信元数据；只能从第一列选择 name）：\n${catalogText || "（空）"}`;
-  const user = `用户任务：${String(task || "").slice(0, 1200)}\n\n它读过的文件：${readList || "（无）"}\n\n运行进度（草稿纸）：\n${String(padText || "（空）").slice(0, 4000)}\n\n真实执行证据：\n${evidenceBlock || "（暂无）"}\n\n本轮实际改动（真实 diff）：\n${changeDigest || "（本轮没有文件改动）"}\n\n它准备给出的回答/收尾：\n${String(draft || "（无文字，直接结束）").slice(0, 4000)}${contract ? `\n\n${String(contract).slice(0, 600)}` : ""}`;
+  const _demandsText = (Array.isArray(demands) ? demands : []).slice(-12)
+      .map((d, i) => `${i + 1}. ${String(d).slice(0, 160)}`).join("\n");
+    const user = `用户任务：${String(task || "").slice(0, 1200)}`
+      // 判断"他真正想要什么"需要的是**一串**要求，不是这一句。单看一句只能看出字面。
+      + `${_demandsText ? `\n\n【用户历次要求】（越靠后越新）：\n${_demandsText}` : ""}`
+      + `\n\n它读过的文件：${readList || "（无）"}\n\n运行进度（草稿纸）：\n${String(padText || "（空）").slice(0, 4000)}\n\n真实执行证据：\n${evidenceBlock || "（暂无）"}\n\n本轮实际改动（真实 diff）：\n${changeDigest || "（本轮没有文件改动）"}\n\n它准备给出的回答/收尾：\n${String(draft || "（无文字，直接结束）").slice(0, 4000)}${contract ? `\n\n${String(contract).slice(0, 600)}` : ""}`;
   // 收尾评审判的是"活干完没有、还缺什么证据"——这是全局质量门禁，廉价模型误判会
   // 直接放过烂尾或把完成的活退回重做。同编排器：认知腿跟随用户选择的模型。
   const reviewModel = config.model;
   try {
     const ctrl = typeof AbortController !== "undefined" ? new AbortController() : null;
     const to = ctrl ? setTimeout(() => ctrl.abort(), 25000) : null;
-    const res = await fetch(_chatCompletionsUrl(config.baseUrl), {
-      method: "POST",
-      headers: {
+    const _text = await _fetchCompletionText(_chatCompletionsUrl(config.baseUrl), {
         "Content-Type": "application/json",
         Authorization: "Bearer " + (config.apiKey || ""),
         "x-ide-request-id": String(config.requestId || "").slice(0, 128),
-      },
-      body: JSON.stringify({ model: reviewModel, messages: [{ role: "system", content: catalogSystem }, { role: "user", content: user }], max_tokens: 2000, temperature: 0, stream: false }),
-      signal: ctrl ? ctrl.signal : undefined,
-    });
+      }, { model: reviewModel, messages: [{ role: "system", content: catalogSystem }, { role: "user", content: user }], max_tokens: 2000, temperature: 0 }, ctrl ? ctrl.signal : undefined);
     if (to) clearTimeout(to);
-    if (!res.ok) return null;
-    const data = await res.json();
-    const j = _safeJsonLoose((data && data.choices && data.choices[0] && data.choices[0].message && data.choices[0].message.content) || "");
+    if (_text == null) return null;
+    const j = _safeJsonLoose(_text);
     if (!j || typeof j.done !== "boolean" || typeof j.verified !== "boolean") return null;
     const tools = _criticRequestedToolSchemas(j.tools, toolRegistry).map((schema) => schema.function.name);
-    return { done: j.done, verified: j.verified, instruction: String(j.instruction || "").slice(0, 600), tools };
+    // findings / direction 只陈述，不参与 done——它们不该把一轮合格的交付判成不合格。
+    // 用户的原话是"给用户弄完 **也可以**给用户说他想要做的是什么"：先交付，再提醒。
+    const findings = (Array.isArray(j.findings) ? j.findings : [])
+      .slice(0, 3)
+      .map((f) => ({
+        where: String(f?.where || "").slice(0, 120),
+        what: String(f?.what || "").slice(0, 200),
+        why: String(f?.why || "").slice(0, 200),
+      }))
+      .filter((f) => f.what);
+    return {
+      done: j.done,
+      verified: j.verified,
+      instruction: String(j.instruction || "").slice(0, 600),
+      tools,
+      findings,
+      direction: String(j.direction || "").slice(0, 400),
+    };
   } catch { return null; }
 }
 
@@ -45753,23 +45836,14 @@ async function _semanticToolOrchestrator({ config, task, profile, phase, progres
     // losing it and then burning quota in the background; batch-checkpoint routes must
     // never stall the loop for the worst-case planner.
     const to = ctrl ? setTimeout(() => ctrl.abort(), Math.max(1000, deadlineMs | 0)) : null;
-    const res = await fetch(_chatCompletionsUrl(config.baseUrl), {
-      method: "POST",
-      headers: {
+    const _text = await _fetchCompletionText(_chatCompletionsUrl(config.baseUrl), {
         "Content-Type": "application/json",
         Authorization: "Bearer " + (config.apiKey || ""),
         "x-ide-request-id": String(config.requestId || "").slice(0, 128),
-      },
-      // max_tokens 曾是 320：推理型模型先烧内部思考 token，320 上限直接导致空 JSON→
-      // 返回 null→工具装不进来。JSON 本体很小，余量给思考用。已调高到 3000 以适配
-      // 复杂任务的深度思考需求。
-      body: JSON.stringify({ model: plannerModel, messages: [{ role: "system", content: catalogSystem }, { role: "user", content: user }], max_tokens: 3000, temperature: 0, stream: false }),
-      signal: ctrl ? ctrl.signal : undefined,
-    });
+      }, { model: plannerModel, messages: [{ role: "system", content: catalogSystem }, { role: "user", content: user }], max_tokens: 3000, temperature: 0 }, ctrl ? ctrl.signal : undefined);
     if (to) clearTimeout(to);
-    if (!res.ok) return null;
-    const data = await res.json();
-    const j = _safeJsonLoose(data?.choices?.[0]?.message?.content || "");
+    if (_text == null) return null;
+    const j = _safeJsonLoose(_text);
     if (!j || !Array.isArray(j.tools)) return null;
     const tools = _criticRequestedToolSchemas(j.tools, toolRegistry, 10).map((schema) => schema.function.name);
     // 工具规划思考链：兼容 thought/thought_process/plan_step 三种字段名（弱模型可能不按
@@ -47256,6 +47330,9 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
                 readList: [..._readFiles].slice(-40).join("、"),
                 executionEvidence: run._executionEvidence,
                 toolRegistry: run._toolRegistry,
+                // 「他真正想做什么」判不出来的话，direction 只能是空话。判断依据是**一串**
+                // 要求，不是这一句——所以把会话的需求账本一并交过去。
+                demands: Array.isArray(session?._demandLedger) ? session._demandLedger : [],
                 // 评审必须看到**改动本身**：只给它草稿和命令输出的话，"这段改动到底有没有
                 // 实现用户要求"这个问题结构上就问不出来。前后两版都在 checkpoint 里。
                 changeDigest: (() => {
