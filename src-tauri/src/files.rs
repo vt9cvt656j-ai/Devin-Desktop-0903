@@ -779,6 +779,92 @@ pub fn read_dir(path: String) -> Result<Vec<DirEntry>, String> {
     Ok(entries)
 }
 
+/// 列出工作区里「人会想打开」的文件，供 ⌘P 快速打开用。
+///
+/// 替掉前端原来那套：从 rootPath 开始逐目录 `readDir`，**每个目录一次 IPC 往返**、
+/// 串行、无缓存、上限 5000，而且带着全仓第 4 份写死的忽略名单（10 项，和搜索那份、
+/// 文件树那份、TS 预加载那份互不相同）。大仓里第一次按 ⌘P 要等上千次往返。
+///
+/// 这里用 ignore crate 的 WalkBuilder 一次走完：它**原生支持嵌套 .gitignore**
+/// （read_dir 那条路为了性能只读根目录那份，这里没有这个限制，因为只走一次），
+/// 顺带把 .git 之类也排掉。于是 ⌘P 的候选里不再混进 node_modules 的几万个文件。
+///
+/// `limit` 是硬上限，触到就停并回报 truncated——和搜索那条一样，**截断必须说出来**，
+/// 否则用户搜不到一个确实存在的文件，会以为它不在项目里。
+#[tauri::command(async)]
+pub fn list_project_files(root: String, limit: Option<usize>) -> Result<ProjectFileList, String> {
+    let root_path = require_inside_workspace(&root, false)?;
+    let cap = limit.unwrap_or(20_000).min(200_000);
+    let mut files = Vec::new();
+    let mut truncated = false;
+
+    let walker = ignore::WalkBuilder::new(&root_path)
+        .hidden(false)          // 点号文件自己判断：.github/.env 是要能搜到的
+        .git_ignore(true)       // 跟随项目自己的 .gitignore（含嵌套）
+        .git_global(false)      // 不吃用户全局配置——同一个仓库在两台机器上结果要一致
+        .git_exclude(true)      // .git/info/exclude
+        // 没有 .git 目录也照样认 .gitignore。ignore crate 默认 require_git=true——
+        // 只在 git 仓库里才应用忽略规则。而 IDE 打开的目录不一定是仓库（下载的源码包、
+        // 还没 git init 的新项目），那些目录里的 .gitignore 同样代表用户的意图。
+        .require_git(false)
+        .parents(true)
+        .follow_links(false)    // 软链不跟进：monorepo 里会绕成环、也会把同一批文件列两遍
+        // 名单里的目录要在**遍历时剪掉**，不能只在产出时过滤：只过滤的话 walker 照样会
+        // 走进 node_modules 把里面几万个文件一个个 yield 出来（它们自己的名字不在名单里），
+        // 既慢又会挤满候选。没有 .gitignore 的项目全靠这一层。
+        .filter_entry(|e| {
+            let name = e.file_name().to_string_lossy().to_string();
+            let is_dir = e.file_type().map(|t| t.is_dir()).unwrap_or(false);
+            !skip_walk_entry(&name, is_dir)
+        })
+        .build();
+
+    for entry in walker {
+        if files.len() >= cap {
+            truncated = true;
+            break;
+        }
+        let Ok(entry) = entry else { continue };
+        if entry.depth() == 0 {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().to_string();
+        let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
+        // 写死名单仍然叠一层：.gitignore 不写 .git/ 自己，也有项目根本没有 .gitignore。
+        if skip_walk_entry(&name, is_dir) {
+            continue;
+        }
+        if is_dir {
+            continue;
+        }
+        let path = entry.path();
+        let rel = path
+            .strip_prefix(&root_path)
+            .unwrap_or(path)
+            .to_string_lossy()
+            .replace('\\', "/");
+        files.push(ProjectFile {
+            path: path.to_string_lossy().to_string(),
+            name,
+            rel,
+        });
+    }
+    Ok(ProjectFileList { files, truncated })
+}
+
+#[derive(Serialize)]
+pub struct ProjectFile {
+    path: String,
+    name: String,
+    rel: String,
+}
+
+#[derive(Serialize)]
+pub struct ProjectFileList {
+    files: Vec<ProjectFile>,
+    truncated: bool,
+}
+
 /// Translate a raw IO error into a friendly, actionable message instead of
 /// leaking `os error N` straight to the UI (see PATH_RESOLUTION_DIAGNOSIS.md).
 fn friendly_read_error(path: &str, e: &std::io::Error) -> String {
@@ -3202,6 +3288,42 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(root);
         let _ = std::fs::remove_dir_all(empty);
+    }
+
+    #[test]
+    /// ⌘P 的候选列表要跟随 .gitignore，并且截断必须上报。
+    ///
+    /// 原来前端逐目录 readDir、带一份自己的 10 项写死名单，于是 node_modules 里的几万个
+    /// 文件会挤满候选；而上限 5000 是**静默**的——搜不到一个确实存在的文件时，用户会
+    /// 以为它不在项目里（和搜索那条假阴性是同一类问题）。
+    fn list_project_files_follows_gitignore_and_reports_truncation() {
+        let root = temp_file("qo-list");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join(".gitignore"), "build_out/\n*.log\n").unwrap();
+        std::fs::create_dir(root.join("src")).unwrap();
+        std::fs::create_dir(root.join("build_out")).unwrap();
+        std::fs::create_dir(root.join("node_modules")).unwrap();
+        std::fs::write(root.join("src/main.ts"), "x").unwrap();
+        std::fs::write(root.join("build_out/bundle.js"), "x").unwrap();
+        std::fs::write(root.join("node_modules/dep.js"), "x").unwrap();
+        std::fs::write(root.join("debug.log"), "x").unwrap();
+        std::fs::write(root.join("README.md"), "x").unwrap();
+
+        register_workspace_root(root.to_string_lossy().to_string()).ok();
+        let out = list_project_files(root.to_string_lossy().to_string(), None).unwrap();
+        let rels: Vec<&str> = out.files.iter().map(|f| f.rel.as_str()).collect();
+
+        assert!(rels.contains(&"src/main.ts"), "自己的源码没被列出来");
+        assert!(rels.contains(&"README.md"));
+        assert!(!rels.iter().any(|r| r.starts_with("build_out/")), "项目自己 gitignore 的目录进了候选");
+        assert!(!rels.contains(&"debug.log"), "gitignore 的通配规则没生效");
+        assert!(!rels.iter().any(|r| r.starts_with("node_modules/")), "node_modules 挤进了候选");
+        assert!(!out.truncated, "没触到上限却报告成截断");
+
+        // 触到上限必须**说出来**，不能静默返回一份不完整的列表。
+        let small = list_project_files(root.to_string_lossy().to_string(), Some(1)).unwrap();
+        assert_eq!(small.files.len(), 1);
+        assert!(small.truncated, "截断了却没上报——用户会以为项目里就这么几个文件");
     }
 
     #[test]
