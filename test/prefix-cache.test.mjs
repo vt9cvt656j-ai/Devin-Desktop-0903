@@ -605,10 +605,11 @@ const ctxInput = load("_contextInputTokens", ["_contextInputTokens"]);
 const applyReading = load("_applyContextReading", ["_applyContextReading"]);
 const readingForStorage = load("_ctxReadingForStorage", ["_ctxReadingForStorage"]);
 const readingFromStorage = load("_ctxReadingFromStorage", ["_ctxReadingFromStorage"]);
+// 单窗口模型：目录里就一条、且不带 beta，所以够得着的上限 = 默认窗口。
 const meterLimit = (native, choice) => new Function(
-  "_modelContextLimit", "_ctxChoiceFor", "_nativeWindowsFor",
+  "_modelContextLimit", "_ctxChoiceFor", "_nativeWindowsFor", "_modelCatalogEntry",
   `${grab("_ctxNativeCeiling")}\n${grab("_ctxNativeDefault")}\n${grab("_contextMeterLimit")}\nreturn _contextMeterLimit("m");`,
-)(() => native, () => choice, () => [native]);
+)(() => native, () => choice, () => [native], () => ({ contextWindows: [{ tokens: native, beta: null }] }));
 
 test("context counts the cached prompt, which is where the whole conversation lives", () => {
   // This is why the meter looked frozen. Anthropic reports `input_tokens` EXCLUDING everything
@@ -912,9 +913,10 @@ test("the paid tier stacks on the model's own window, in the client as in the ga
   // so on any 1M-native model every tier resolved back to 1M: the whole row was a no-op and the
   // top tier a subscriber pays for could never light up. The two lines disagreed by construction.
   const eff = (native, tierMax, choice) => new Function(
-    "_modelContextLimit", "_nativeWindowsFor", "_michaelUser", "_gatewayHandlesCompression", "_ctxChoiceFor",
+    "_modelContextLimit", "_nativeWindowsFor", "_michaelUser", "_gatewayHandlesCompression", "_ctxChoiceFor", "_modelCatalogEntry",
     `${grab("_ctxNativeCeiling")}\n${grab("_ctxNativeDefault")}\n${grab("_effectiveContextLimit")}\nreturn _effectiveContextLimit("m");`,
-  )(() => native, () => [native], { michael_compression: { max_input_tokens: tierMax } }, () => tierMax > 0, () => choice);
+  )(() => native, () => [native], { michael_compression: { max_input_tokens: tierMax } }, () => tierMax > 0, () => choice,
+    () => ({ contextWindows: [{ tokens: native, beta: null }] }));
 
   assert.equal(eff(1_000_000, 5_000_000, 0), 6_000_000, "1M native + a 5M tier is 6M, not 5M");
   assert.equal(eff(1_000_000, 5_000_000, 6_000_000), 6_000_000, "the top tier must be reachable");
@@ -930,10 +932,20 @@ test("a native window the user picked is the one that takes effect", () => {
   // The stored record kept only the KIND, so a model with two native windows — Sonnet 4.5 has
   // 200K by default and 1M behind the context-1m beta — always resolved back to the default and
   // the 1M button could never do anything.
+  // 更宽的那个窗口带 beta 标记 —— Sonnet 4.5 的 1M 真的是这样，而"带标记"正是
+  // _ctxNativeCeiling 用来判断"这条连接够不够得着"的依据（网关会无条件带上那个头）。
+  // 不带标记的更宽窗口是别家端点才有的，选中只会让本地按一个拿不到的窗口做预算。
   const choiceFor = (rec, windows, dflt) => new Function(
-    "_ctxChoiceRecord", "_modelContextLimit", "_modelCatalogEntry",
-    `${grab("_nativeWindowsFor")}\n${grab("_ctxChoiceFor")}\nreturn _ctxChoiceFor("m");`,
-  )(() => rec, () => dflt, () => ({ contextWindows: windows.map((t) => ({ tokens: t })) }));
+    "_ctxChoiceRecord", "_modelContextLimit", "_modelCatalogEntry", "_michaelUser",
+    "_gatewayHandlesCompression", "_tokenShort", "_MC_TIER_OPTIONS",
+    `${grab("_nativeWindowsFor")}\n${grab("_ctxNativeDefault")}\n${grab("_ctxNativeCeiling")}\n`
+      + `${grab("_ctxChoiceOptions")}\n${grab("_ctxSnapToOpenChoice")}\n${grab("_ctxChoiceFor")}\n`
+      + `return _ctxChoiceFor("m");`,
+  )(
+    () => rec, () => dflt,
+    () => ({ contextLimit: dflt, contextWindows: windows.map((t) => ({ tokens: t, beta: t > dflt ? "context-1m-2025-08-07" : null })) }),
+    null, () => false, (n) => String(n), [],
+  );
 
   const twoWindows = [200_000, 1_000_000];
   assert.equal(choiceFor({ kind: "native", tokens: 1_000_000 }, twoWindows, 200_000), 1_000_000);

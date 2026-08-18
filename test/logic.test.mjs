@@ -13673,6 +13673,8 @@ test("Michael Design 只有一个条件化技术栈规则", () => {
 test("档位是叠加在原生之上的，任何模型上都不会变成 no-op", () => {
   const mk = (native) => load("_ctxChoiceOptions", {
     _modelContextLimit: () => native,
+    // 原生窗口只有一个（_modelCatalogEntry 给 null），所以够得着的上限就是它自己。
+    _ctxNativeCeiling: () => native,
     _michaelUser: { michael_compression: { max_input_tokens: 5_000_000 } },
     _gatewayHandlesCompression: () => true,
     _tokenShort: (n) => String(n),
@@ -21207,7 +21209,13 @@ test("Tier-2 fold invalidates duplicate-read stubs for the same file", () => {
 // choice may NARROW the window (a cost dial) but must never budget past what native-or-
 // membership actually delivers — a fictional window dies upstream as context-length 400s.
 test("context-window choice clamps to what is actually deliverable", () => {
-  const win = { _modelContextLimit: () => 200_000, _nativeWindowsFor: () => [200_000] };
+  const win = {
+    _modelContextLimit: () => 200_000,
+    _nativeWindowsFor: () => [200_000],
+    // 单窗口模型：目录里没有 beta 条目，所以够得着的上限就是默认窗口本身。
+    _modelCatalogEntry: () => ({ contextLimit: 200_000, contextWindows: [{ tokens: 200_000 }] }),
+    _ctxNativeDefault: () => 200_000,
+  };
   const mkEff = (store, user, compress) => load("_effectiveContextLimit", {
     ...win,
     _ctxNativeCeiling: load("_ctxNativeCeiling", win),
@@ -21231,16 +21239,21 @@ test("context-window choice clamps to what is actually deliverable", () => {
   assert.equal(mkEff(1_200_000, tier5m, false)("m"), 200_000,
     "gateway compression off → tiers are not deliverable, clamp to native");
 
-  const mkOpts = (user, compress, windows = null) => load("_ctxChoiceOptions", {
-    _modelContextLimit: () => 200_000,
-    // No catalogue entry -> falls back to the single resolved native (the third-party-direct
-    // path). Pass `windows` to exercise a model that genuinely has more than one.
-    _modelCatalogEntry: () => (windows ? { contextWindows: windows } : null),
-    _michaelUser: user,
-    _gatewayHandlesCompression: () => compress,
-    _tokenShort: (n) => n >= 1_000_000 ? (n / 1_000_000) + "m" : (n / 1000) + "k",
-    _MC_TIER_OPTIONS: [["1M", 1_000_000], ["2M", 2_000_000], ["5M", 5_000_000]],
-  });
+  const mkOpts = (user, compress, windows = null) => {
+    const env = {
+      _modelContextLimit: () => 200_000,
+      // No catalogue entry -> falls back to the single resolved native (the third-party-direct
+      // path). Pass `windows` to exercise a model that genuinely has more than one.
+      _modelCatalogEntry: () => (windows ? { contextWindows: windows } : null),
+      _ctxNativeDefault: () => 200_000,
+      _michaelUser: user,
+      _gatewayHandlesCompression: () => compress,
+      _tokenShort: (n) => n >= 1_000_000 ? (n / 1_000_000) + "m" : (n / 1000) + "k",
+      _MC_TIER_OPTIONS: [["1M", 1_000_000], ["2M", 2_000_000], ["5M", 5_000_000]],
+    };
+    // 真函数，不是桩：原生档要不要上锁全看它，桩掉就测不到"够不着的窗口不许选"。
+    return load("_ctxChoiceOptions", { ...env, _ctxNativeCeiling: load("_ctxNativeCeiling", env) });
+  };
   const opts1m = mkOpts({ michael_compression: { tier: "1m", max_input_tokens: 1_000_000 } }, true)("m");
   assert.equal(opts1m.length, 4, "native + ALL three tiers are displayed regardless of membership");
   assert.equal(opts1m[0].native, true);
@@ -25190,6 +25203,8 @@ const ctxEnv = (choice) => ({
     _modelCatalogEntry: () => ({ contextLimit: 96_890 }),
   }),
   _nativeWindowsFor: () => [1_000_000, 512_000, 262_144, 202_752, 96_890],
+  // _ctxNativeCeiling 会调它，所以要在这一层就有——ctxFn 那层补的是给被测函数用的。
+  _ctxNativeDefault: () => 96_890,
 });
 const ctxFn = (name, choice) => load(name, {
   ...ctxEnv(choice),
@@ -25202,23 +25217,140 @@ test("没选过窗口时，按连接真正给的默认窗口记账，不是目�
   assert.equal(ctxFn("_effectiveContextLimit", 0)("glm-5.2"), 96_890, "裁剪预算按一个拿不到的窗口留历史");
 });
 
-test("用户显式选过的窗口原样生效，仍按最宽窗口夹住", () => {
-  assert.equal(ctxFn("_contextMeterLimit", 262_144)("glm-5.2"), 262_144, "用户点的档位没生效");
-  assert.equal(ctxFn("_effectiveContextLimit", 262_144)("glm-5.2"), 262_144);
-  // 夹取上限仍是最宽的原生窗口——收窄是成本旋钮，放宽不能超过模型给得出的。
-  assert.equal(ctxFn("_contextMeterLimit", 9_000_000)("glm-5.2"), 1_000_000, "夹取上限丢了");
+test("够得着的窗口才算数——目录列了但这条连接不去申请的，不能当上限", () => {
+  // 目录里的 context_windows 是"这个模型在各家端点上出现过的窗口"，不是"本连接给得到的"。
+  // 网关只会主动去要带 beta 标记的那几个（models.rs 的 wants_1m），客户端连"我要多大窗口"
+  // 这个字段都不发。把不带标记的更宽条目当夹取上限，用户拖一下滑块预算就变成真实窗口的
+  // 十倍，历史按拿不到的窗口留，最后在上游炸成 context-length 400。
+  assert.equal(ctxFn("_contextMeterLimit", 262_144)("glm-5.2"), 96_890,
+    "glm-5.2 目录里没有任何 beta 窗口，够得着的只有默认那个");
+  assert.equal(ctxFn("_contextMeterLimit", 9_000_000)("glm-5.2"), 96_890, "夹取上限丢了");
+
+  // 带 beta 标记的更宽窗口是**真的**够得着：网关无条件带上那个头（Sonnet 4.5 的 1M）。
+  const betaEnv = (choice) => ({
+    ...ctxEnv(choice),
+    _modelCatalogEntry: () => ({
+      contextLimit: 200_000,
+      contextWindows: [{ tokens: 200_000, beta: null }, { tokens: 1_000_000, beta: "context-1m-2025-08-07" }],
+    }),
+    _modelContextLimit: () => 200_000,
+    _nativeWindowsFor: () => [1_000_000, 200_000],
+    _ctxNativeDefault: () => 200_000,
+  });
+  const betaFn = (name, choice) => load(name, {
+    ...betaEnv(choice),
+    _ctxNativeCeiling: load("_ctxNativeCeiling", betaEnv(choice)),
+    _ctxNativeDefault: load("_ctxNativeDefault", betaEnv(choice)),
+  });
+  assert.equal(betaFn("_contextMeterLimit", 0)("claude-sonnet-4-5"), 200_000, "没选就是默认窗口");
+  assert.equal(betaFn("_contextMeterLimit", 1_000_000)("claude-sonnet-4-5"), 1_000_000,
+    "带 beta 的窗口网关会替你去要，选了就该生效");
 });
 
-test("卡片高亮的那一档和仪表用的窗口是同一个数", () => {
-  // 卡片用 _effectiveContextLimit 去 opts 里找高亮位（_modelContextRows），仪表用
-  // _contextMeterLimit。会员档位不介入时两者必须逐值相等，否则"显示的"和"用的"就是两个数。
-  for (const choice of [0, 262_144, 1_000_000]) {
-    assert.equal(
-      ctxFn("_contextMeterLimit", choice)("glm-5.2"),
-      ctxFn("_effectiveContextLimit", choice)("glm-5.2"),
-      `choice=${choice} 时卡片和仪表读出两个不同的窗口`,
-    );
+test("够不着的原生档在滑块上要锁掉，而不是选了再被悄悄夹回去", () => {
+  // 「选得到、但选了等于没选」是同一类 bug 的另一种长相：显示的和用的又不是一个数。
+  const env = {
+    _modelContextLimit: () => 96_890,
+    _ctxNativeDefault: () => 96_890,
+    _modelCatalogEntry: () => ({
+      contextLimit: 96_890,
+      contextWindows: [96_890, 202_752, 1_000_000].map((tokens) => ({ tokens, beta: null })),
+    }),
+    _michaelUser: null,
+    _gatewayHandlesCompression: () => false,
+    _tokenShort: (n) => String(n),
+    _MC_TIER_OPTIONS: [["1M", 1_000_000]],
+  };
+  const opts = load("_ctxChoiceOptions", { ...env, _ctxNativeCeiling: load("_ctxNativeCeiling", env) })("glm-5.2");
+  const natives = opts.filter((o) => o.native);
+  assert.equal(natives.length, 3, "够不着的档位仍然要显示——藏起来会让人以为模型没这个能力");
+  assert.equal(natives[0].locked, false, "默认窗口永远可选");
+  assert.ok(natives[1].locked && natives[2].locked, "够不着的两档必须上锁");
+  assert.match(natives[2].lockHint, /不会去申请/, "锁住要说清为什么，不能只是拖不动");
+});
+
+test("会员降档之后，存着的那一档要落回当前买得到的档位", () => {
+  // 用户在 M5 档给 glm-5.2 选了「5M」，随后会员降到 M1。存的那个数既不在选项里、也拿不到：
+  // 卡片按值找高亮找不到就回退到第 0 格（显示 96.9k），而预算仍按夹取后的 2,000,000 算——
+  // 显示的和用的差 20 倍。归位之后两边永远落在同一格。
+  const env = (tierMax) => ({
+    _modelContextLimit: () => 96_890,
+    _ctxNativeDefault: () => 96_890,
+    _modelCatalogEntry: () => ({ contextLimit: 96_890, contextWindows: [{ tokens: 96_890, beta: null }] }),
+    _michaelUser: { michael_compression: { max_input_tokens: tierMax } },
+    _gatewayHandlesCompression: () => true,
+    _tokenShort: (n) => String(n),
+    _MC_TIER_OPTIONS: [["1M", 1_000_000], ["2M", 2_000_000], ["5M", 5_000_000]],
+  });
+  const snap = (tierMax, stored) => {
+    const e = env(tierMax);
+    return load("_ctxSnapToOpenChoice", {
+      ...e,
+      _ctxNativeCeiling: load("_ctxNativeCeiling", e),
+      _ctxChoiceOptions: load("_ctxChoiceOptions", { ...e, _ctxNativeCeiling: load("_ctxNativeCeiling", e) }),
+    })("glm-5.2", stored);
+  };
+  assert.equal(snap(5_000_000, 5_096_890), 5_096_890, "会员还在时原样生效");
+  assert.equal(snap(1_000_000, 5_096_890), 1_096_890, "降到 M1 → 落到当时买得到的最大一档");
+  assert.equal(snap(0, 5_096_890), 96_890, "会员没了 → 落回原生窗口");
+  assert.equal(snap(5_000_000, 0), 0, "没存过就是没存过");
+});
+
+test("归位要发生在 _ctxChoiceFor 这一层——预算和卡片都只读它", () => {
+  // 上一条测的是归位函数本身；这条测它真的被接进了取值链。少了这一跳，会员降档之后
+  // _effectiveContextLimit 仍然拿存着的旧数去算，而卡片按值找高亮找不到、回退到第 0 格。
+  const env = {
+    _modelContextLimit: () => 96_890,
+    _ctxNativeDefault: () => 96_890,
+    _modelCatalogEntry: () => ({ contextLimit: 96_890, contextWindows: [{ tokens: 96_890, beta: null }] }),
+    _michaelUser: { michael_compression: { max_input_tokens: 1_000_000 } },
+    _gatewayHandlesCompression: () => true,
+    _tokenShort: (n) => String(n),
+    _MC_TIER_OPTIONS: [["1M", 1_000_000], ["2M", 2_000_000], ["5M", 5_000_000]],
+  };
+  const ceil = load("_ctxNativeCeiling", env);
+  const opts = load("_ctxChoiceOptions", { ...env, _ctxNativeCeiling: ceil });
+  const choiceFor = (rec) => load("_ctxChoiceFor", {
+    ...env,
+    _ctxChoiceRecord: () => rec,
+    _ctxNativeCeiling: ceil,
+    _ctxChoiceOptions: opts,
+    _nativeWindowsFor: () => [96_890],
+    _ctxSnapToOpenChoice: load("_ctxSnapToOpenChoice", { ...env, _ctxNativeCeiling: ceil, _ctxChoiceOptions: opts }),
+  })("glm-5.2");
+
+  // M5 时代存下来的「5M」档，在 M1 会员上既不在选项里也拿不到。
+  assert.equal(choiceFor({ kind: "modified", tokens: 5_096_890 }), 1_096_890,
+    "加档没归位——预算会按一个买不到的窗口算，而卡片高亮回退到第 0 格");
+  assert.equal(choiceFor({ kind: "modified", tokens: 1_096_890 }), 1_096_890, "买得到的那一档原样生效");
+  assert.equal(choiceFor(null), 0);
+});
+
+test("上下文滑块的绑定不许待在「这个模型支持思考深度」的分支里", () => {
+  // 位置不对的表现很怪：不支持思考深度的模型（画图模型等）上下文滑块画得出来却拖不动，
+  // 看上去像界面卡了。上下文和思考本来就是两件事，绑定得在那个 if 之外。
+  const at = SRC.indexOf("  if (supports) {");
+  assert.ok(at > 0, "showModelInfoCard 的 supports 分支改写了，这条守卫要跟着改");
+  let depth = 0, end = -1;
+  for (let i = SRC.indexOf("{", at); i < SRC.length; i++) {
+    if (SRC[i] === "{") depth++;
+    else if (SRC[i] === "}") { depth--; if (depth === 0) { end = i; break; } }
   }
+  // if 之后还挂着 else，一并跳过——两条分支里都不该出现上下文滑块。
+  const elseAt = SRC.indexOf("else", end);
+  if (elseAt > 0 && elseAt < end + 12) {
+    depth = 0;
+    for (let i = SRC.indexOf("{", elseAt); i < SRC.length; i++) {
+      if (SRC[i] === "{") depth++;
+      else if (SRC[i] === "}") { depth--; if (depth === 0) { end = i; break; } }
+    }
+  }
+  const ctxAt = SRC.indexOf("const ctxSl =");
+  assert.ok(ctxAt > 0, "上下文滑块的绑定没了");
+  assert.ok(ctxAt > end,
+    "上下文滑块的绑定又落回 if (supports) 里了——不支持思考的模型滑块拖不动");
+  // 思考深度那条**应该**在里面：没有档位可选时它本来就不该绑。
+  assert.ok(SRC.indexOf("const thinkSl =") < end, "思考滑块跑到 supports 分支外面了");
 });
 
 test("成长页下半部分和上半部分是同一套卡片语言", () => {

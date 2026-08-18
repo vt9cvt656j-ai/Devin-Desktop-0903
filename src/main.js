@@ -15220,26 +15220,6 @@ function showModelInfoCard(m, anchorEl) {
       options: think,
       index: Math.max(0, levels.indexOf(current)),
     });
-    // 上下文滑块。买不到的档位照样占一个刻度（藏起来会让人以为没这个档），
-    // 拖到那儿弹回最高可选档并说清为什么。
-    const ctxSl = card.querySelector('.mic-ctx .mic-sl[data-sl="ctx"]');
-    if (ctxSl) {
-      const ctxOpts = _modelContextChoices(m.id);
-      _bindMicSlider(ctxSl, (want, commit) => {
-        let at = want;
-        if (ctxOpts[at]?.locked) {
-          let open = -1;
-          ctxOpts.forEach((o, i) => { if (!o.locked) open = i; });
-          at = Math.max(0, open);
-          showToast(ctxOpts[want]?.lockHint || "该档位需更高会员");
-        }
-        const o = ctxOpts[at];
-        // commit=false 是拖动途中，只回读数不落盘——每像素写一次 localStorage 会把
-        // 界面顿住好几秒。
-        if (o && commit) _setCtxChoice(m.id, o.value, o.kind === "native" ? "native" : "modified");
-        return { index: at, valueLabel: o?.valueLabel || "" };
-      });
-    }
     // 思考深度滑块。
     const thinkSl = thinkEl.querySelector('.mic-sl[data-sl="think"]');
     if (thinkSl) {
@@ -15251,6 +15231,30 @@ function showModelInfoCard(m, anchorEl) {
     }
   } else {
     thinkEl.innerHTML = `<div class="mic-plabel">${_escHtml(t("model.thinkingDepth"))}</div><div class="mic-row mic-row--hint"><span class="mic-u">${_escHtml(profile.disabledReason || profile.hint || t("model.thinking.unsupported"))}</span></div>`;
+  }
+  // 上下文滑块。**必须在 if (supports) 之外**：.mic-ctx 是无条件渲染的，而这段绑定原来
+  // 关在"这个模型支持思考深度"的分支里——于是画图模型、以及任何没有公开推理旋钮的模型，
+  // 上下文滑块画得出来却拖不动，看上去像界面卡了。上下文和思考本来就是两件事。
+  //
+  // 买不到 / 拿不到的档位照样占一个刻度（藏起来会让人以为没这个档），拖到那儿弹回
+  // 最高可选档并说清为什么。
+  const ctxSl = card.querySelector('.mic-ctx .mic-sl[data-sl="ctx"]');
+  if (ctxSl) {
+    const ctxOpts = _modelContextChoices(m.id);
+    _bindMicSlider(ctxSl, (want, commit) => {
+      let at = want;
+      if (ctxOpts[at]?.locked) {
+        let open = -1;
+        ctxOpts.forEach((o, i) => { if (!o.locked) open = i; });
+        at = Math.max(0, open);
+        showToast(ctxOpts[want]?.lockHint || "该档位需更高会员");
+      }
+      const o = ctxOpts[at];
+      // commit=false 是拖动途中，只回读数不落盘——每像素写一次 localStorage 会把
+      // 界面顿住好几秒。
+      if (o && commit) _setCtxChoice(m.id, o.value, o.kind === "native" ? "native" : "modified");
+      return { index: at, valueLabel: o?.valueLabel || "" };
+    });
   }
   // Position: prefer LEFT of the menu, vertically near the hovered row; clamp to viewport.
   card.hidden = false;

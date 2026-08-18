@@ -960,13 +960,16 @@ test("档位滑块：拖动要真的落到档位上，且拖出卡片边界不�
   // 2) 两个滑块都绑了处理器。只渲染不绑定 = 拖得动、但存不进去。
   // 窗口必须**切在两个滑块之间**：从上下文那段一路读到思考深度那段的话，
   // 上下文的绑定被剪掉了也照样能在隔壁读到 _bindMicSlider——自己喂饱自己。
+  // 先后不重要（上下文那条已挪到 `if (supports)` 之外），各自成段才重要。
   const ctxAt = SRC.indexOf("const ctxSl =");
   const thinkAt2 = SRC.indexOf("const thinkSl =");
-  assert.ok(ctxAt !== -1 && thinkAt2 > ctxAt, "两个滑块的绑定段没了或顺序变了");
-  const bind = SRC.slice(ctxAt, thinkAt2);
+  const posAt = SRC.indexOf("// Position:", Math.max(ctxAt, thinkAt2));
+  assert.ok(ctxAt !== -1 && thinkAt2 !== -1 && posAt > Math.max(ctxAt, thinkAt2),
+    "两个滑块的绑定段没了");
+  const seg = (from) => SRC.slice(from, Math.min(...[ctxAt, thinkAt2, posAt].filter((n) => n > from)));
+  const bind = seg(ctxAt);
   assert.match(bind, /_bindMicSlider\(/, "上下文滑块没绑处理器，拖了不存");
-  const tEnd = SRC.indexOf("// Position:", thinkAt2);
-  const tbind0 = SRC.slice(thinkAt2, tEnd > thinkAt2 ? tEnd : thinkAt2 + 1600);
+  const tbind0 = seg(thinkAt2);
   assert.match(tbind0, /_bindMicSlider\(/, "思考深度滑块没绑处理器，拖了不存");
   assert.match(bind, /_setCtxChoice\(/, "上下文滑块没写入选择");
   assert.match(tbind0, /_setThinkingPref\(/, "思考深度滑块没写入选择");
@@ -1413,11 +1416,16 @@ test("拖滑块时不许每一帧都落盘", () => {
   // 两个调用方都必须认这个 commit 参数：只要有一个不认，那一条滑块照旧每帧写盘。
   // 窗口必须**切在两条滑块之间**：从上下文那段一路读到思考深度那段的话，上下文的
   // `&& commit` 被删掉了也照样能在隔壁读到——自己喂饱自己。
+  // 两段的**先后不重要**，重要的是各自成段：上下文那条已经被挪到 `if (supports)` 之外
+  // （不支持思考深度的模型此前滑块画得出来却拖不动），所以顺序反过来了。按各自的起点
+  // 到"下一个起点或收尾"来切，谁在前都能测。
   const ctxAt = SRC.indexOf("const ctxSl =");
   const thinkAt = SRC.indexOf("const thinkSl =");
-  const endAt = SRC.indexOf("// Position:", thinkAt);
-  assert.ok(ctxAt !== -1 && thinkAt > ctxAt && endAt > thinkAt, "两条滑块的绑定段没了或顺序变了");
-  for (const [seg, who] of [[SRC.slice(ctxAt, thinkAt), "上下文"], [SRC.slice(thinkAt, endAt), "思考深度"]]) {
+  const endAt = SRC.indexOf("// Position:", Math.max(ctxAt, thinkAt));
+  assert.ok(ctxAt !== -1 && thinkAt !== -1 && endAt > Math.max(ctxAt, thinkAt),
+    "两条滑块的绑定段没了");
+  const cut = (from) => SRC.slice(from, Math.min(...[ctxAt, thinkAt, endAt].filter((n) => n > from)));
+  for (const [seg, who] of [[cut(ctxAt), "上下文"], [cut(thinkAt), "思考深度"]]) {
     assert.match(seg, /\(want, commit\) =>/, `${who}滑块没接 commit 参数`);
     assert.match(seg, /&& commit\)/, `${who}滑块拖动途中仍在落盘`);
   }
