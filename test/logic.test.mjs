@@ -27933,3 +27933,27 @@ test("⌘P 走一次后端调用并缓存，文件增删后必须失效", () => 
   assert.match(SRC, /async function _collectProjectFilesFallback\(\)/,
     "没有回落路径——浏览器模式或老版本后端下 ⌘P 会直接不可用");
 });
+
+test("跳转历史存在，且键位不许抢 macOS 的按词移动", () => {
+  // monaco-editor 不自带这个：navigateBack 在 VS Code 里属于 workbench 层。
+  // 连点三次「转到定义」之后回不去，只能重新 ⌘P 摸回原文件。
+  assert.match(SRC, /function navigateBack\(\)/, "跳转历史的后退没实现");
+  assert.match(SRC, /function navigateForward\(\)/, "跳转历史的前进没实现");
+  assert.match(SRC, /"nav\.back": \(\) => navigateBack\(\)/, "nav.back 没接到 KB_ACTIONS");
+
+  const kb = SRC.slice(SRC.indexOf("function _defaultKeybindings"), SRC.indexOf("const DEFAULT_KEYBINDINGS"));
+  // macOS 上 Option+←/→ 是 Monaco 的「按词移动光标」，每天都在用。抢掉就是弄坏一个
+  // 正在工作的功能，所以 mac 必须走 VS Code 的 ⌃- / ⌃⇧-。
+  assert.doesNotMatch(kb, /\bmac \? \{ "alt\+arrow/, "mac 分支不该用 Option+方向键");
+  assert.match(kb, /mac[\s\S]{0,80}?"ctrl\+-": "nav\.back"/,
+    "mac 上跳转历史必须用 ⌃-，不能抢 Option+← 的按词移动");
+  assert.match(kb, /"alt\+arrowleft": "nav\.back"/,
+    "非 mac 用 Alt+←；键名必须是 arrowleft——keyCombo 取的是 e.key.toLowerCase()，写 left 永远匹配不上");
+
+  // 记录必须挂在光标监听上，而不是去各个跳转点插桩——插桩必然漏，而且以后新增跳转点会忘。
+  assert.match(SRC, /onDidChangeCursorPosition\(\(\) => \{[\s\S]{0,400}?if \(jumped\) _navPush\(prev\);/,
+    "跳转记录没有挂在光标监听上");
+  // 前进/后退时不能再记录，否则一按后退就把自己压进栈，永远退不动。
+  assert.match(SRC, /if \(_navRestoring \|\| _imeComposing\) return;/,
+    "恢复位置时没有抑制记录——会把后退动作本身当成一次新跳转");
+});
