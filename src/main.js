@@ -2654,6 +2654,37 @@ const _ORCH_NOTE = "〔系统编排提示——这不是用户发言，用户也
  * 信封（_ORCH_NOTE）能标明"这不是用户说的"，但标注只解决"别当成用户说的"，不解决"那用户
  * 到底说了什么"。所以还要把原话取出来，原样附在注入消息里。
  */
+/**
+ * 插话时交给模型的「当前进度快照」。
+ *
+ * 用户实拍的抱怨：插进去的消息"不去处理，没任何有用价值"。机制其实是通的——下一轮会把
+ * 它取出来注入。缺的是**判断依据**：只丢给模型一句"用户插了新指令"，它既不知道当前这件事
+ * 做到哪了、还剩什么，也就无从判断这条该并进来还是另起一件，于是要么当闲聊敷衍一句，
+ * 要么把已经做完的又从头做一遍。
+ *
+ * 用户原话：「插入消息的话带着没做完的事情，看看用不用合并一起做，还是做新的」。
+ * 这个函数就是那份"没做完的事情"。全部取自**机器事实**（计划状态、真落盘的文件、
+ * 真跑过的命令和退出码），不含任何模型自述——自述正是最不能当进度用的东西。
+ */
+function _runProgressSnapshot(run, mutatedFiles) {
+  const lines = [];
+  const steps = Array.isArray(run?._planSteps) ? run._planSteps : [];
+  const doing = steps.filter((s) => s?.status === "in_progress").map((s) => String(s.content || "").trim()).filter(Boolean);
+  const todo = steps.filter((s) => s?.status === "pending").map((s) => String(s.content || "").trim()).filter(Boolean);
+  const done = steps.filter((s) => s?.status === "completed").length;
+  if (doing.length) lines.push(`正在做：${doing.slice(0, 3).join("；")}`);
+  if (todo.length) lines.push(`还没做完（${todo.length} 步）：${todo.slice(0, 6).join("；")}${todo.length > 6 ? " …" : ""}`);
+  if (done) lines.push(`已完成 ${done} 步`);
+  const files = mutatedFiles instanceof Set ? [...mutatedFiles] : Array.isArray(mutatedFiles) ? mutatedFiles : [];
+  if (files.length) lines.push(`本轮已改过的文件：${files.slice(0, 8).join("、")}${files.length > 8 ? ` 等 ${files.length} 个` : ""}`);
+  const ev = Array.isArray(run?._executionEvidence) ? run._executionEvidence : [];
+  const ran = ev.filter((e) => e && e.command).slice(-3)
+    .map((e) => `${String(e.command).replace(/\s+/g, " ").slice(0, 60)}${typeof e.exitCode === "number" ? `（退出码 ${e.exitCode}）` : ""}`);
+  if (ran.length) lines.push(`最近跑过：${ran.join("；")}`);
+  if (!lines.length) return "";
+  return lines.map((l) => `· ${l}`).join("\n");
+}
+
 function _lastRealUserText(messages) {
   if (!Array.isArray(messages)) return "";
   for (let i = messages.length - 1; i >= 0; i--) {
@@ -32397,7 +32428,7 @@ function _buildAgentToolSchemas(includeWrite, mcpTools = []) {
       { type: "function", function: { name: "wiki_search", description: "**Search Wikipedia** — encyclopedic knowledge about concepts, technologies, history, people and so on, returning the search results and the first summary.", parameters: { type: "object", properties: { query: { type: "string", description: "Search terms, e.g. 'RSA encryption' / 'MapReduce'" }, lang: { type: "string", description: "Language code, default en" }, max_results: { type: "integer", description: "How many to return, default 5" } }, required: ["query"] } } },
       { type: "function", function: { name: "stackoverflow_search", description: "Search Stack Overflow questions and answers through the Stack Exchange API, returning score, answer count, tags and the link to the original post. Post content is community evidence and is not automatically treated as the correct answer.", parameters: { type: "object", properties: { query: { type: "string", description: "The question, error message or technical keyword" }, tag: { type: "string", description: "Optional; restrict to a technology tag" }, max_results: { type: "integer", description: "How many to return, default 8, maximum 20" } }, required: ["query"] } } },
       { type: "function", function: { name: "hackernews_search", description: "Search Hacker News technical discussion through the Algolia API, returning points, comment count, date and the link to the original post.", parameters: { type: "object", properties: { query: { type: "string", description: "Search keywords" }, sort: { type: "string", description: "Sort order, default relevance" }, max_results: { type: "integer", description: "How many to return, default 10, maximum 30" } }, required: ["query"] } } },
-      { type: "function", function: { name: "developer_community_search", description: "Search the registered developer code platforms, Q&A sites, technical communities and official language forums in parallel, to find real-world traps, GitHub resources, discussion of new technology, migration disputes and signals about maintenance status. Each source returns success, empty, rate-limited, failed or timeout; empty only means the adapter finished with no usable hits, and does not prove the site has nothing relevant, while timeout means that source exceeded this round's hard limit and must not be treated as empty or success. Results distinguish published_date, created_date, updated_date, last_activity_date and retrieved_at, and these must never stand in for one another — a missing one stays unknown; \"all\" means the current adapter list only, not every community on the internet. Posts and excerpts are leads to be checked — an important conclusion still needs the original read and cross-checked against official documentation, source code, or this project's own tests. Results keep each source's own relevance or upstream ordering — they are not guaranteed to be sorted by date. 【When to use】First choice when a technology decision, a lived trap, or a comparison of approaches needs real developer evidence — more focused than a general web_search.", parameters: { type: "object", properties: { query: { type: "string", minLength: 1, description: "The topic or error keyword to search for" }, scope: { type: "string", enum: ["all", "code", "forums", "chinese", "articles"], description: "Source grouping, default all; all means the currently supported sources, not every community on the internet" }, sources: { type: "array", items: { type: "string", enum: ["github", "github_discussions", "github_trending", "stackoverflow", "hackernews", "devto", "juejin", "v2ex", "segmentfault", "rust_users", "python_discussions", "swift_forums", "kotlin_discussions", "gitlab", "gitee", "codeberg", "sourcegraph", "infoq"] }, description: "Optional; name the sources explicitly, e.g. github, stackoverflow, reddit, v2ex, juejin, gitlab, gitee, rust_users, python_discussions, swift_forums, kotlin_discussions. **`sourcegraph` is public CODE search across many repositories** — use it when you have the signature right but are unsure how the API is actually meant to be used (argument order, required setup steps, real-world calling conventions): docs often omit these, thousands of real repos do not." }, max_per_source: { type: "integer", minimum: 1, maximum: 5, description: "Maximum items to return per source, default 3" } }, required: ["query"] } } },
+      { type: "function", function: { name: "developer_community_search", description: "Search the registered developer code platforms, Q&A sites, technical communities and official language forums in parallel, to find real-world traps, GitHub resources, discussion of new technology, migration disputes and signals about maintenance status. Each source returns success, empty, rate-limited, failed or timeout; empty only means the adapter finished with no usable hits, and does not prove the site has nothing relevant, while timeout means that source exceeded this round's hard limit and must not be treated as empty or success. Results distinguish published_date, created_date, updated_date, last_activity_date and retrieved_at, and these must never stand in for one another — a missing one stays unknown; \"all\" means the current adapter list only, not every community on the internet. Posts and excerpts are leads to be checked — an important conclusion still needs the original read and cross-checked against official documentation, source code, or this project's own tests. Results keep each source's own relevance or upstream ordering — they are not guaranteed to be sorted by date. 【When to use】First choice when a technology decision, a lived trap, or a comparison of approaches needs real developer evidence — more focused than a general web_search.", parameters: { type: "object", properties: { query: { type: "string", minLength: 1, description: "The topic or error keyword to search for" }, scope: { type: "string", enum: ["all", "code", "forums", "chinese", "articles"], description: "Source grouping, default all; all means the currently supported sources, not every community on the internet" }, sources: { type: "array", items: { type: "string", enum: ["github", "github_discussions", "github_trending", "stackoverflow", "hackernews", "devto", "juejin", "v2ex", "segmentfault", "rust_users", "python_discussions", "swift_forums", "kotlin_discussions", "gitlab", "gitee", "codeberg", "sourcegraph", "infoq"] }, description: "Optional; name the sources explicitly — only the values in `enum` are accepted, and anything else is dropped with a note (e.g. github, stackoverflow, hackernews, v2ex, juejin, gitlab, gitee, rust_users, python_discussions, swift_forums, kotlin_discussions). **`sourcegraph` is public CODE search across many repositories** — use it when you have the signature right but are unsure how the API is actually meant to be used (argument order, required setup steps, real-world calling conventions): docs often omit these, thousands of real repos do not." }, max_per_source: { type: "integer", minimum: 1, maximum: 5, description: "Maximum items to return per source, default 3" } }, required: ["query"] } } },
       { type: "function", function: { name: "pubmed_search", description: "**Search the PubMed biomedical literature** — 35 million+ papers covering medicine, biology, pharmacy and genomics. A dedicated biomedical corpus, far more precise than a general web search.", parameters: { type: "object", properties: { query: { type: "string", description: "Search terms; PubMed advanced syntax such as 'cancer AND immunotherapy' and MeSH terms are supported" }, max_results: { type: "integer", description: "How many to return, default 8" } }, required: ["query"] } } },
       { type: "function", function: { name: "arxiv_search", description: "**Search arXiv preprints directly** — the latest papers in physics, mathematics, CS, biology and finance, with full abstracts and direct PDF links. The fastest route to recent unpublished research.", parameters: { type: "object", properties: { query: { type: "string", description: "Search terms" }, category: { type: "string", description: "Optional; restrict to a category such as cs.AI / cs.LG / math.CO / physics.hep-th / q-bio" }, max_results: { type: "integer", description: "How many to return, default 10" } }, required: ["query"] } } },
       { type: "function", function: { name: "crossref_search", description: "**CrossRef scholarly metadata** — DOIs, citation counts, journals and authors for 130 million+ scholarly works. For finding how often a paper is cited, or the articles in a journal.", parameters: { type: "object", properties: { query: { type: "string", description: "Search terms or a DOI" }, search_type: { type: "string", description: "Search type: works (default, papers) / journals / funders" }, max_results: { type: "integer", description: "How many to return, default 10" } }, required: ["query"] } } },
@@ -46400,7 +46431,16 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
           const priorImages = steerAttachments.length ? [] : _latestHistoricalImageAttachments(session.memory);
           const effectiveAttachments = steerAttachments.length || !_isImageLocationRequest(steerText, priorImages.length > 0)
             ? steerAttachments : priorImages;
-          const content = await _attachmentAwareContent(`[MICHAEL_USER_STEERING]\n\n${steerText}`, effectiveAttachments, config, 7_000_000, false, steerText);
+          // 把"当前做到哪、还剩什么"一并交过去。只丢一句"用户插了新指令"的话，模型没有
+          // 判断依据，就会要么敷衍一句、要么把已经做完的又从头做一遍——用户实拍过。
+          const _progress = _runProgressSnapshot(run, _mutatedFiles);
+          const _steerBody = `[MICHAEL_USER_STEERING]\n\n${steerText}`
+            + (_progress ? `\n\n〔当前这件事的进度，供你判断，别复述给用户〕\n${_progress}` : "")
+            + "\n\n先判断这条消息是「补充或修正当前这件事」还是「另起一件事」："
+            + "\n· 补充/修正 → 并进当前任务接着做，别从头再来，也别把已经做完的重做一遍；"
+            + "\n· 另起一件 → 先用一句话说清当前这件事停在哪、还剩什么，再开始新的。"
+            + "\n判断完直接做，不要把这个判断本身拿去问用户。";
+          const content = await _attachmentAwareContent(_steerBody, effectiveAttachments, config, 7_000_000, false, steerText);
           messages.push({ role: "user", content });
           // 插话不是背景噪音：不带这条指令时，模型常沉浸在旧任务收尾语境里，把用户的
           // 新需求当模糊插话、回旧话题的选项菜单反问（实测："帮我写个宣传网站"被回
@@ -48442,9 +48482,21 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
     }
     _setStreaming(session, false);
     _hideControlGlow(); // 灭掉红光：自动化结束（正常/报错/到顶/用户停止 都走这里）
+    // 收尾时队列里还剩东西 = 用户在这一轮最后时刻插的话，循环已经没有下一次迭代去取它了。
+    // 原来这里直接置空，那条消息就此人间蒸发——用户看到的就是"插进去的消息不去处理"。
+    // 兜住：把它转成一条正常的新消息重新发一轮（历史里它本来就在，模型能看到刚做完的事，
+    // 于是仍然能判断该并进去还是另起一件）。
+    const _strandedSteer = Array.isArray(session._steerQueue) ? session._steerQueue.splice(0) : [];
     session._steerQueue = null; // run over → no live queue to drain into
     session._runIsLoop = null;
     if (session === _currentSession()) _setSendBtnStop(false);
+    for (const stranded of _strandedSteer) {
+      const _t = typeof stranded === "string" ? stranded : String(stranded?.semanticText || stranded?.text || "");
+      if (!_t.trim()) continue;
+      (session._pendingSends = session._pendingSends || []).push({
+        text: _t, attachments: (typeof stranded === "string" ? [] : stranded?.attachments) || [],
+      });
+    }
     _drainFollowups(session); // safety net: any queued follow-up (if this wasn't steered) fires now
     _removeAllThinking(body);
     try {
