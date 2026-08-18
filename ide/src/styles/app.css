@@ -7719,6 +7719,33 @@ button.agent-plan__fold--toggle:focus-visible { outline: 2px solid #1a73e8; outl
 .dark .turn-stats {
   color: #6b7280;
 }
+/* 交付事实行：这一轮改了什么、验没验、有没有测试。
+   只陈述事实，不判断对错 —— 存在的理由是模型说"能用了"时，屏幕上得有一行让人核对。
+   验证过 = 和用量脚注同一个灰度，不喧哗；没验证 = 一条琥珀色左边线，看得见但不吓人。 */
+.turn-facts {
+  margin-top: 6px;
+  font-size: 12.5px;
+  line-height: 1.5;
+  color: #8b8fa3;
+  user-select: text;
+  text-align: center;
+}
+.turn-facts--unverified {
+  color: #a16207;
+  background: rgba(245, 158, 11, 0.08);
+  border-left: 2px solid rgba(245, 158, 11, 0.55);
+  border-radius: 0 6px 6px 0;
+  padding: 4px 10px;
+  text-align: left;
+}
+[data-theme="dark"] .turn-facts,
+.dark .turn-facts { color: #6b7280; }
+[data-theme="dark"] .turn-facts--unverified,
+.dark .turn-facts--unverified {
+  color: #fbbf24;
+  background: rgba(245, 158, 11, 0.12);
+}
+
 .turn-stats--live {
   animation: turn-stats-pulse 2s ease-in-out infinite;
 }
