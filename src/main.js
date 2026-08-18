@@ -610,7 +610,12 @@ async function tauriBackend() {
   };
 }
 
-const _AI_MODEL_RETRY_LIMIT = 10;
+const _AI_MODEL_RETRY_LIMIT = 4;
+// 产出前的瞬时线路失败（5xx/网络抖动）一轮里最多重试几次——**默认值**，真正生效的是
+// boundedRetryLimit 里 min(10,…) 的调用方入参。以前默认 10：配上下面的退避，一次坏线路
+// 会连打 10 次、拖住小半分钟才交还用户；而真正短暂的抖动 3-4 次内就恢复，连 4 次都不恢复
+// 基本就是线路真不通，继续重发只是把同一个失败拖长、还在给已经在喘的上游加压。限流(429)
+// 与已产出后的续传各走独立预算，不受这个数影响。
 // 一轮里最多从断点续几次。给得少是故意的：连着断三次说明线路真的不通，
 // 这时候继续续传只是把同一个失败拖长，不如把话说清楚交还给用户。
 const _AI_MODEL_RESUME_LIMIT = 3;
@@ -621,6 +626,8 @@ const _AI_MODEL_RESUME_LIMIT = 3;
 /// "同一个请求 id 每两秒重来一次、连打六小时"就是这么来的（那两秒还只是请求本身的往返，
 /// 不是我们在等）。间隔本身就是治疗——给上游喘一口的时间，比立刻重试更可能成功。
 const _AI_MODEL_RETRY_DELAY_MS = 2_000;
+/// 退避封顶：指数退避 base = DELAY × 2^n 增长，但单次等待不超过这个数。
+const _AI_MODEL_RETRY_BACKOFF_CAP_MS = 30_000;
 /// 撞限流时"等一会儿再来"的次数与起步退避。
 ///
 /// 限流**不能**并进普通重试集合——见 _isRateLimitedAiError 上面那段：它每发一次都带完整
@@ -24477,6 +24484,9 @@ const _INCOMPLETE_LABELS = {
   // 用户按停也是一种"没做完"。少了这一行，建议行会退回泛泛的「继续完成剩余部分」，
   // send 串里还会写成「因 user_stopped 未完成」——把内部枚举名甩给用户看。
   user_stopped: "接着上次的进度继续",
+  // 最后一个动作轮里有工具明确报了失败（部署/命令/mcp/http 退出非零、被拒、冲突……），
+  // 模型却收了尾。给一句能照做的下一步，而不是把 last_action_failed 这个枚举名甩给用户。
+  last_action_failed: "上一步有工具报错，先把它弄好",
 };
 
 function _runStateNextActionSuggestions(sess, { maxAgeMs = 5 * 60_000 } = {}) {
@@ -39942,10 +39952,18 @@ async function _runModelRequestWithRetry({
       && _isRetryableAiError(attemptError);
     if (canRetry) {
       const retry = retriesUsed + 1;
-      try { onRetry({ retry, retryLimit: boundedRetryLimit, nextAttempt: attempt + 1, error: attemptError, delayMs: _AI_MODEL_RETRY_DELAY_MS }); } catch {}
-      // 等一下再重发。分片等待是为了「停止」能立刻生效——一次 setTimeout(2000) 会让
-      // 用户按下停止之后还要干等两秒，而且等完还会再发一次。
-      const _until = Date.now() + _AI_MODEL_RETRY_DELAY_MS;
+      // 指数退避 + equal jitter。固定 2s 的问题只在规模上显现：几千万客户端若撞同一个上游
+      // 抖动，会在 2s 后**齐步**重发，制造一个把网关顶死的二次浪。抖动把它们打散。用 equal
+      // jitter（base/2 + random(0, base/2)，即 [base/2, base]）而不是 full jitter（[0, base]）：
+      // 既跨客户端解相关，又保留「至少等 base/2」的下限——full jitter 会偶尔抽到近 0，退回单
+      // 客户端背靠背捶上游那个老 bug。base 逐次翻倍 2s→4s→8s…封顶 30s。这是产出前的瞬时失败
+      // 专用；限流 429 走下面预算独立的长退避。
+      const _base = Math.min(_AI_MODEL_RETRY_BACKOFF_CAP_MS, _AI_MODEL_RETRY_DELAY_MS * Math.pow(2, retriesUsed));
+      const _delayMs = Math.round(_base / 2 + Math.random() * (_base / 2));
+      try { onRetry({ retry, retryLimit: boundedRetryLimit, nextAttempt: attempt + 1, error: attemptError, delayMs: _delayMs }); } catch {}
+      // 分片等待是为了「停止」能立刻生效——一次 setTimeout(_delayMs) 会让用户按下停止之后
+      // 还要干等一整段，而且等完还会再发一次。
+      const _until = Date.now() + _delayMs;
       while (Date.now() < _until) {
         if (!isLive()) return { attempts: attempt, cancelled: true, error: "", hadModelProgress, resumes: resumesUsed };
         await new Promise((r) => setTimeout(r, Math.min(150, _until - Date.now())));
@@ -39963,7 +39981,11 @@ async function _runModelRequestWithRetry({
       && _isRateLimitedAiError(attemptError);
     if (canWaitOutRateLimit) {
       rateLimitWaitsUsed += 1;
-      const _waitMs = Math.min(60_000, _AI_MODEL_RATE_LIMIT_DELAY_MS * rateLimitWaitsUsed);
+      // 退避基数不变（15s→30s，封顶 60s），但叠一档 ±20% 抖动：几千万客户端若在同一秒被
+      // 限流，精确的 15000ms 会让它们下一秒又集体撞回来、把限流顶穿。抖动打散这个二次浪，
+      // 同时保留「至少等这么久」的下限——限流不能像瞬时失败那样近乎 0 秒重试。
+      const _baseWait = Math.min(60_000, _AI_MODEL_RATE_LIMIT_DELAY_MS * rateLimitWaitsUsed);
+      const _waitMs = Math.round(_baseWait * (0.8 + Math.random() * 0.4));
       try {
         onRetry({
           retry: rateLimitWaitsUsed, retryLimit: _AI_MODEL_RATE_LIMIT_WAITS,
@@ -47709,6 +47731,13 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
           continue;
         }
         if (_pendingPlan.length) run._incompleteReason = run._incompleteReason || `plan_steps_pending:${_pendingPlan.length}`;
+        // 收尾诚实：最后一个动作轮有工具明确报失败（部署/命令/mcp/http 退出非零、被拒、冲突…），
+        // 模型却安静收尾——「没启动也说启动了」的机器成因。只记账、不补回合（同上诸门哲学）；
+        // 排在最后，更具体的原因靠 !run._incompleteReason 先占位；用 lastTurnHadFailure（只看最后
+        // 一个动作轮，非 runHadTrouble 粘滞位），故「先失败后自愈再收尾」不误判。详见对应测试。
+        if (lastTurnHadFailure && run.mode === "agent" && !run._incompleteReason) {
+          run._incompleteReason = `last_action_failed:${lastFailKinds || "tool"}`.slice(0, 120);
+        }
         break; // truly done
       }
 

@@ -23,7 +23,7 @@ import {
 } from "../src/agent/capabilities.js";
 import { ansiToText } from "../src/agent/ansi.js";
 import { ConversationMemory, extractExplicitCorrection, serializeMessagesForPersistence } from "../src/conversation-memory.js";
-import { GLOBAL_LANGUAGE_TAGS, buildLanguageOptions, coerceSupportedLocale, isSupportedLocale, localeLanguageCode, normalizeLocaleTag } from "../src/locales.js";
+import { GLOBAL_LANGUAGE_TAGS, buildLanguageOptions, coerceSupportedLocale, isSupportedLocale, localeLanguageCode, normalizeLocaleTag, systemPreferredLocale } from "../src/locales.js";
 import { compactToolExampleArgs, compactToolGuide, enrichedCatalogLine, toolCapabilityIndex, TOOL_METADATA } from "../src/tool-guides.js";
 import * as toolPolicy from "../src/agent/tool-policy.js";
 
@@ -340,6 +340,7 @@ AUTO_LOAD_DEPS = {
   _AI_MODEL_RESUME_LIMIT: Number(/const _AI_MODEL_RESUME_LIMIT = ([\d_]+);/.exec(SRC)[1].replace(/_/g, "")),
   _AI_MODEL_RETRY_LIMIT: Number(/const _AI_MODEL_RETRY_LIMIT = ([\d_]+);/.exec(SRC)[1].replace(/_/g, "")),
   _AI_MODEL_RETRY_DELAY_MS: Number(/const _AI_MODEL_RETRY_DELAY_MS = ([\d_]+);/.exec(SRC)[1].replace(/_/g, "")),
+  _AI_MODEL_RETRY_BACKOFF_CAP_MS: Number(/const _AI_MODEL_RETRY_BACKOFF_CAP_MS = ([\d_]+);/.exec(SRC)[1].replace(/_/g, "")),
   _isRetryableAiError: load("_isRetryableAiError", {
     _isRateLimitedAiError: load("_isRateLimitedAiError", { _stripAiRetryPrefix: load("_stripAiRetryPrefix", {}) }),
     _isProviderGatewayStatusError: load("_isProviderGatewayStatusError", { _stripAiRetryPrefix: load("_stripAiRetryPrefix", {}) }),
@@ -3307,6 +3308,54 @@ test("Advanced Tools settings exposes the supported IDE language preference", ()
     "每一轮都要遵守语言偏好——不再有绕过它的精简路径");
   assert.match(SRC, /language:\s*args\.language \? String\(args\.language\) : _preferredLanguageCode\(\)/,
     "local discovery defaults should follow the selected language");
+});
+
+test("首启默认语言跟随系统语言：支持的就跟随，不支持的才落 zh-CN", () => {
+  // navigator 是 configurable 的全局 getter（Node 24），可覆盖；每例测完恢复原状。
+  const orig = Object.getOwnPropertyDescriptor(globalThis, "navigator");
+  const setNav = (val) => {
+    if (val === undefined) { try { delete globalThis.navigator; } catch {} return; }
+    Object.defineProperty(globalThis, "navigator", { value: val, configurable: true, writable: true });
+  };
+  try {
+    // 支持的系统语言 → 跟随（按 languages 的偏好序取第一条命中的）
+    setNav({ languages: ["ja-JP", "en"], language: "ja-JP" });
+    assert.equal(systemPreferredLocale(), "ja");
+    setNav({ languages: ["en-US"], language: "en-US" });
+    assert.equal(systemPreferredLocale(), "en");
+    // 中文任意子标签都归到我们唯一的中文包 zh-CN
+    setNav({ languages: ["zh-TW"], language: "zh-TW" });
+    assert.equal(systemPreferredLocale(), "zh-CN");
+    // languages 里第一条不支持、第二条支持 → 跳到第二条，而不是被 coerce 塞成随机项
+    setNav({ languages: ["fr-FR", "de-DE"], language: "fr-FR" });
+    assert.equal(systemPreferredLocale(), "de");
+    // 全都不支持 → 明确落回 fallback（zh-CN），不静默塞成某个支持项
+    setNav({ languages: ["fr-FR", "it-IT"], language: "fr-FR" });
+    assert.equal(systemPreferredLocale(), "zh-CN");
+    // 没有 navigator（非浏览器/极早启动）→ fallback
+    setNav(undefined);
+    assert.equal(systemPreferredLocale(), "zh-CN");
+    // 显式 fallback 参数可改（供未来非中文默认场景）
+    setNav({ languages: ["it-IT"], language: "it-IT" });
+    assert.equal(systemPreferredLocale("en"), "en");
+  } finally {
+    if (orig) Object.defineProperty(globalThis, "navigator", orig);
+    else { try { delete globalThis.navigator; } catch {} }
+  }
+});
+
+test("initLocale 不再硬编码 zh-CN——无 saved 时走 systemPreferredLocale", () => {
+  // 反漂移：initLocale 的默认值必须是 systemPreferredLocale()，而不是字面量 "zh-CN"。
+  assert.match(I18N, /import \{[^}]*\bsystemPreferredLocale\b[^}]*\} from "\.\/locales\.js"/,
+    "i18n.js 必须导入 systemPreferredLocale");
+  assert.match(I18N, /currentLocale = coerceSupportedLocale\(saved \|\| systemPreferredLocale\(\)\)/,
+    "首启默认语言必须跟随系统语言，不能再硬编码 saved || \"zh-CN\"");
+  assert.doesNotMatch(I18N, /coerceSupportedLocale\(saved \|\| "zh-CN"\)/,
+    "旧的硬编码 zh-CN 默认值必须已被替换");
+  // locales.js 侧：只有真正支持的语言才跟随（用 isSupportedLocale 判过再 coerce）。
+  assert.match(LOCALES_SRC, /export function systemPreferredLocale\(fallback = "zh-CN"\)/);
+  assert.match(LOCALES_SRC, /if \(isSupportedLocale\(cand\)\) return coerceSupportedLocale\(cand, fallback\)/,
+    "systemPreferredLocale 必须先判 isSupportedLocale 再 coerce，否则未支持语言会被静默塞成随机项");
 });
 
 test("loose UI translation cannot storm /api/i18n/pack again", () => {
@@ -6413,7 +6462,7 @@ test("model orchestration retries ten pre-progress failures and never replays pa
   assert.match(SRC, /x-ide-response-deadline-ms/);
   assert.match(SRC, /activeAttemptController\?\.abort\(\)/,
     "the browser fetch must actively cancel a timed-out provider request");
-  assert.match(SRC, /const _AI_MODEL_RETRY_LIMIT = 10;/);
+  assert.match(SRC, /const _AI_MODEL_RETRY_LIMIT = 4;/);
   assert.match(SRC, /模型线路出现问题，当前将重试第 \$\{retry\}\/\$\{retryLimit\} 次/);
   assert.match(SRC, /_THINK_CARD_HTML\("思考中…"\)/);
 });
@@ -12147,7 +12196,7 @@ test("each of the ten model retries gets one sixty-second pre-progress deadline"
     "tool-schema repair keeps its independent three-response bound");
   assert.doesNotMatch(SRC, /_isTransientTurnErr\(turn\.error\)|_waitForAiRecovery\(/,
     "the outer Agent loop must not multiply the bounded request policy");
-  assert.match(SRC, /const _AI_MODEL_RETRY_LIMIT = 10;/);
+  assert.match(SRC, /const _AI_MODEL_RETRY_LIMIT = 4;/);
   assert.match(SRC, /const _AI_MODEL_ATTEMPT_TIMEOUT_MS = 60_000;/);
   assert.match(TAURI_AI, /const RESPONSE_HEADERS_TIMEOUT_SECS: u64 = 60;/);
   assert.match(TAURI_AI, /const STANDARD_FIRST_STREAM_PROGRESS_TIMEOUT_SECS: u64 = 60;/);
@@ -23244,10 +23293,63 @@ test("a quiet turn is the model's completion decision except for real bounded wo
   // 用户重新定义了任务，之前的欠账账本作废——否则旧任务的提醒会继续推着模型跑。
   assert.match(quiet, /run\._quietResumePool = 3;/, "插话后要把全局预算恢复");
   // 预算 3 → 2：全局池只有 3，单门占 3 会把另外两道门饿死。
-  assert.match(quiet, /\(run\._planFinishNudges \|\| 0\) < 2[\s\S]{0,700}continue;[\s\S]{0,500}break; \/\/ truly done/,
+  // 窗口 500→1200：plan 门 continue 与最终 break 之间现在合法地多了一道 account-only 的
+  // last_action_failed 诚实门（见下一条专项测试）。守的属性不变——plan 门续跑、最终诚实收尾。
+  assert.match(quiet, /\(run\._planFinishNudges \|\| 0\) < 2[\s\S]{0,700}continue;[\s\S]{0,1200}break; \/\/ truly done/,
     "an open plan re-enters, boundedly, and then the run ends honestly");
   assert.match(quiet, /run\._incompleteReason \|\| `plan_steps_pending:/,
     "a run that gives up on its plan must not be recorded as a clean finish");
+});
+
+test("收尾诚实：最后一个动作轮有工具失败时，安静收尾必须记 last_action_failed（只记账、不补回合）", () => {
+  const loop = extractFn("_runAgenticLoop");
+  const quietStart = loop.indexOf("if (!turn.toolCalls.length)");
+  const quietEnd = loop.indexOf("// Render every tool step up front", quietStart);
+  const quiet = loop.slice(quietStart, quietEnd);
+  assert.ok(quietStart >= 0 && quietEnd > quietStart, "quiet-turn 分支要能切出来");
+  // 收尾门必须真的读 lastTurnHadFailure，并写进 incompleteReason。
+  assert.match(quiet, /if \(lastTurnHadFailure && run\.mode === "agent" && !run\._incompleteReason\) \{[\s\S]{0,200}run\._incompleteReason = `last_action_failed:\$\{lastFailKinds \|\| "tool"\}`/,
+    "最后一个动作轮报了失败、模型却收尾 → 必须记 last_action_failed，让'已完成'说真话");
+  // 只记账：这一句和 break 之间不许有 _pushNudge / continue（否则就成了强制补回合，
+  // 违反'quiet turn 是模型的收尾决定'那条钉死的哲学）。
+  const gateAt = quiet.indexOf("lastTurnHadFailure && run.mode");
+  const breakAt = quiet.indexOf("break; // truly done", gateAt);
+  assert.ok(gateAt >= 0 && breakAt > gateAt, "last_action_failed 门必须在 truly-done break 之前");
+  const tail = quiet.slice(gateAt, breakAt);
+  assert.doesNotMatch(tail, /_pushNudge\(|continue;/,
+    "last_action_failed 只记账——不推提醒、不 continue、不代跑");
+  // 用 lastTurnHadFailure（只看最后一个动作轮），不用 runHadTrouble（一坏到底的粘滞位），
+  // 否则'先失败、下一轮自愈、再收尾'会被误判成 partial。
+  assert.doesNotMatch(tail, /runHadTrouble/,
+    "收尾诚实门必须只看最后一个动作轮，不能用 runHadTrouble 粘滞位");
+  // 放在 plan 门之后：更具体的原因靠 !run._incompleteReason 先占位、优先。
+  assert.ok(quiet.indexOf("plan_steps_pending:${_pendingPlan.length}", 0) < gateAt,
+    "last_action_failed 必须排在 plan/build/diag 等更具体的门之后，只兜没人记的失败");
+  // 建议行要认得这个枚举——给一句能照做的下一步，而不是把枚举名甩给用户。
+  assert.match(SRC, /last_action_failed: "[^"]+"/,
+    "_INCOMPLETE_LABELS 必须给 last_action_failed 一个人话标签");
+});
+
+test("模型重试用指数退避 + equal jitter，且默认上限已从 10 收到 4", () => {
+  // 默认重试上限：产出前的瞬时线路失败一轮最多几次。10 → 4，配上退避避免拖住小半分钟。
+  assert.match(SRC, /const _AI_MODEL_RETRY_LIMIT = 4;/,
+    "默认重试上限应为 4（真正生效的仍是 min(10,调用方入参)）");
+  assert.match(SRC, /const _AI_MODEL_RETRY_BACKOFF_CAP_MS = 30_000;/,
+    "退避封顶常量应存在");
+  // 瞬时路径：base = DELAY × 2^n 封顶 CAP，等待 = random(0, base)（full jitter）。
+  assert.match(SRC, /const _base = Math\.min\(_AI_MODEL_RETRY_BACKOFF_CAP_MS, _AI_MODEL_RETRY_DELAY_MS \* Math\.pow\(2, retriesUsed\)\);/,
+    "瞬时重试必须指数退避，且封顶");
+  assert.match(SRC, /const _delayMs = Math\.round\(_base \/ 2 \+ Math\.random\(\) \* \(_base \/ 2\)\);/,
+    "瞬时重试必须 equal jitter（base/2 + random(0,base/2)）：打散客户端二次浪，且保留下限不背靠背");
+  assert.match(SRC, /const _until = Date\.now\(\) \+ _delayMs;/,
+    "等待用抖动后的 _delayMs，而不是固定常量");
+  assert.doesNotMatch(SRC, /const _until = Date\.now\(\) \+ _AI_MODEL_RETRY_DELAY_MS;/,
+    "固定 2s 的旧等待必须已被替换");
+  // 限流路径：基数不变（15s→30s 封顶 60s），叠 ±20% 抖动打散二次浪、保留下限。
+  assert.match(SRC, /const _baseWait = Math\.min\(60_000, _AI_MODEL_RATE_LIMIT_DELAY_MS \* rateLimitWaitsUsed\);/,
+    "限流退避基数保持 15s→30s 封顶 60s");
+  assert.match(SRC, /const _waitMs = Math\.round\(_baseWait \* \(0\.8 \+ Math\.random\(\) \* 0\.4\)\);/,
+    "限流等待必须叠 ±20% 抖动（保留下限，不能像瞬时失败那样近乎 0 秒重试）");
 });
 
 // ---------------------------------------------------------------------------
@@ -24386,10 +24488,17 @@ test("模型重试之间要等两秒，不能背靠背连打把上游打成 502"
   });
   assert.equal(stamps.length, 4, "1 次首发 + 3 次重试");
   assert.equal(r.attempts, 4);
+  // equal jitter + 指数退避：base = DELAY × 2^n，等待 ∈ [base/2, base]。注入 DELAY=120 →
+  // 三次重试 base = 120/240/480，下限 = 60/120/240。定时器只会晚触发、不会早，故实测间隔 ≥ 下限。
+  const floors = [60, 120, 240];
   for (let i = 1; i < stamps.length; i++) {
-    assert.ok(stamps[i] - stamps[i - 1] >= 100,
-      `第 ${i} 次重试只隔了 ${stamps[i] - stamps[i - 1]}ms，应当等满间隔`);
+    const gap = stamps[i] - stamps[i - 1];
+    assert.ok(gap >= floors[i - 1] - 15,   // 15ms 容差给定时器分片/取整
+      `第 ${i} 次重试只隔了 ${gap}ms，低于 equal-jitter 下限 ${floors[i - 1]}ms（不能背靠背）`);
   }
+  // 退避确实在涨：第三次重试的间隔要明显大于第一次（下限 240 vs 120），证明是指数而非固定。
+  assert.ok(stamps[3] - stamps[2] > stamps[1] - stamps[0],
+    "指数退避：越往后等得越久，不是固定间隔");
 
   // 间隔要能被「停止」打断：一次性 setTimeout 会让用户按下停止后还得干等，等完还再发一次。
   let calls = 0, live = true;
@@ -24404,9 +24513,12 @@ test("模型重试之间要等两秒，不能背靠背连打把上游打成 502"
 });
 
 test("重试节奏的三个数字是有意选的，不是碰巧", () => {
-  // 10 次、每次 60 秒窗口、间隔 2 秒。
-  assert.match(SRC, /const _AI_MODEL_RETRY_LIMIT = 10;/);
+  // 默认 4 次、每次 60 秒窗口、退避 base 2 秒（指数 ×2^n 封顶 30 秒 + full jitter，见
+  // 「模型重试用指数退避 + full jitter」那条）。默认从 10 收到 4：配上退避，坏线路不再连打
+  // 十次拖住小半分钟；真瞬时抖动 3-4 次内就恢复。真正生效的仍是 min(10, 调用方入参)。
+  assert.match(SRC, /const _AI_MODEL_RETRY_LIMIT = 4;/);
   assert.match(SRC, /const _AI_MODEL_RETRY_DELAY_MS = 2_000;/);
+  assert.match(SRC, /const _AI_MODEL_RETRY_BACKOFF_CAP_MS = 30_000;/);
   assert.match(SRC, /const _AI_MODEL_ATTEMPT_TIMEOUT_MS = 60_000;/);
   // 桌面侧的每次尝试窗口也必须是 60 秒，两条传输层不能各说各话
   const AI_RS = readFileSync(new URL("../src-tauri/src/ai.rs", import.meta.url), "utf8");

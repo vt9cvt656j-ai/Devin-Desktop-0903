@@ -1,4 +1,4 @@
-import { coerceSupportedLocale, isSupportedLocale } from "./locales.js";
+import { coerceSupportedLocale, isSupportedLocale, systemPreferredLocale } from "./locales.js";
 
 const EN = {
   "titlebar.open": "Open",
@@ -2446,7 +2446,7 @@ export function applyToDOM(root) {
 
 export function initLocale() {
   const saved = localStorage.getItem("michael-ide-locale");
-  currentLocale = coerceSupportedLocale(saved || "zh-CN");
+  currentLocale = coerceSupportedLocale(saved || systemPreferredLocale());
   if (saved !== currentLocale) {
     try { localStorage.setItem("michael-ide-locale", currentLocale); } catch {}
   }
