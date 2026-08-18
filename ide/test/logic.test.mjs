@@ -16205,10 +16205,12 @@ test("流式聊天渲染 O(n²) 根治：≥90ms 节流 + 分叉回滚 + 取证�
   assert.equal((SRC.match(/if \(flushRaf\) \{ cancelAnimationFrame\(flushRaf\); flushRaf = 0; \}/g) || []).length, 2,
     "plain chat 和 Agent 收尾都必须取消动画帧，防终渲染后被旧帧覆盖");
   // settle 时的完整终渲染保留：两条路径都在流结束后用 renderMarkdownInto 全量重渲染一次。
-  assert.match(SRC, /renderMarkdownInto\(streamEl, cleanFinal, \{ streaming: false, highlighter: highlightCode \}\)/,
-    "agent 路径流结束必须做一次完整终渲染");
-  assert.match(SRC, /renderMarkdownInto\(body\._chatStreamEl, _cc, \{ highlighter: highlightCode \}\)/,
-    "plain-chat 路径流结束必须做一次完整终渲染");
+  // 终渲染用的是豁免入口 highlightCodeFinal：受闸的那个在整个 run 结束前一律返回 null，
+  // 于是这次"完整终渲染"渲了个寂寞——代码块没颜色，重启才有。
+  assert.match(SRC, /renderMarkdownInto\(streamEl, cleanFinal, \{ streaming: false, highlighter: highlightCodeFinal \}\)/,
+    "agent 路径流结束必须做一次完整终渲染，而且要真的上色");
+  assert.match(SRC, /renderMarkdownInto\(body\._chatStreamEl, _cc, \{ highlighter: highlightCodeFinal \}\)/,
+    "plain-chat 路径流结束必须做一次完整终渲染，而且要真的上色");
   // 取证维度：highlightCode 带块量级、restoreChatHistory 带消息数。
   assert.match(SRC, /highlightCode len=\$\{code \? code\.length : 0\} lines=\$\{code \? code\.split\("\\n"\)\.length : 0\}/,
     "highlightCode 相位必须带块长/行数");
@@ -20579,12 +20581,30 @@ test("#89-1 _cleanAgentText 缓存：同输入直接返回，避免重复正则"
 });
 
 test("#89-2 highlightCode 流式期间跳过 + 并发限流", () => {
-  assert.match(SRC, /if \(Array\.isArray\(_chatSessions\) && _chatSessions\.some\(\(s\) => s && s\.streaming\)\) return null;/,
-    "流式期间必须跳过 highlightCode");
+  // 这道闸防的是**逐帧上色**叠加卡主线程，是对的。但它原来没有豁免口，而"最终渲染"
+  // 发生在每个模型回合结束时、session.streaming 要等整个运行结束才清——于是智能体跑动
+  // 期间每一次最终渲染都仍然看到"正在流式"，一律返回 null。用户实拍：代码块从头到尾
+  // 没有颜色，只有重启软件、历史被重新渲染（那时没人在流式）才有色。
+  // 而且它查的是**所有**会话：别的标签页在跑，也会把这个标签页的定稿一起掐掉。
+  assert.match(SRC, /if \(!opts\.final && Array\.isArray\(_chatSessions\) && _chatSessions\.some\(\(s\) => s && s\.streaming\)\) return null;/,
+    "流式期间必须跳过逐帧上色，但最终渲染要有豁免口——没有豁免口它就是恒定生效的");
   assert.match(SRC, /_HIGHLIGHT_MAX_CONCURRENT/,
     "必须有并发限流常量");
   assert.match(SRC, /if \(_highlightActive >= _HIGHLIGHT_MAX_CONCURRENT\)/,
     "超过并发上限必须排队");
+
+  // 规则：renderMarkdownInto = 定稿 = 一律上色；renderMarkdownStream = 逐帧 = 保留闸门。
+  // 一处漏改，那条消息的代码块就永远是灰的，而且不报任何错。
+  const intoCalls = [...SRC.matchAll(/renderMarkdownInto\((?:[^()]|\([^()]*\))*\)/g)].map((m) => m[0]);
+  assert.ok(intoCalls.length > 10, `只扫到 ${intoCalls.length} 个 renderMarkdownInto —— 正则失效了`);
+  const guarded = intoCalls.filter((c) => /highlighter: highlightCode\b/.test(c));
+  assert.deepEqual(guarded.map((c) => c.slice(0, 70)), [],
+    "这些定稿渲染还在用受闸的 highlightCode：跑动期间它一律返回 null，代码块不会有颜色");
+  const streamCalls = [...SRC.matchAll(/renderMarkdownStream\((?:[^()]|\([^()]*\))*\)/g)].map((m) => m[0]);
+  assert.ok(streamCalls.length > 3);
+  assert.deepEqual(
+    streamCalls.filter((c) => /highlightCodeFinal/.test(c)).map((c) => c.slice(0, 70)), [],
+    "逐帧渲染不许用豁免入口——那正是当初要防的主线程卡顿");
 });
 
 test("#89-3 scheduleSymbolIndex 流式期间延迟启动", () => {

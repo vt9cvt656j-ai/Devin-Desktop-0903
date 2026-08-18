@@ -8107,7 +8107,7 @@ function showMarkdownPreview(model) {
   const body = _mdPreviewEl.querySelector(".md-preview__body");
   function render() {
     // 传高亮器：预览曾是全局唯一没传 highlighter 的调用点——代码块永远纯白无高亮。
-    renderMarkdownInto(body, model.getValue(), { highlighter: highlightCode });
+    renderMarkdownInto(body, model.getValue(), { highlighter: highlightCodeFinal });
     if (!_mdPreviewOpen) _renderMdThumb();
   }
   render();
@@ -16382,7 +16382,7 @@ async function _renderMsgRange(session, from, to, options = {}) {
         card.dataset.open = "0";
         card.innerHTML = _THINK_CARD_HTML("已思考");
         const tb = card.querySelector(".think-body");
-        if (tb) { tb.dataset.rawText = m.reasoning; try { renderMarkdownInto(tb, m.reasoning, { streaming: false, highlighter: highlightCode }); } catch { tb.textContent = m.reasoning; } }
+        if (tb) { tb.dataset.rawText = m.reasoning; try { renderMarkdownInto(tb, m.reasoning, { streaming: false, highlighter: highlightCodeFinal }); } catch { tb.textContent = m.reasoning; } }
         body.prepend(card);
       }
       _appendLargeTranscriptControl(body, session, m._michaelTranscript);
@@ -18775,15 +18775,23 @@ document.addEventListener("click", (e) => {
   }
 });
 
-async function highlightCode(code, lang) {
+async function highlightCode(code, lang, opts = {}) {
   // 取证维度：块长/行数进相位名，冻结时能直接看出是哪种量级的块在 tokenize。
   try { _perfPhase(`highlightCode len=${code ? code.length : 0} lines=${code ? code.split("\n").length : 0}`); } catch {}
   // monaco.editor.colorize tokenizes on the main thread — a very large block can
   // freeze the UI for hundreds of ms, and a code-heavy reply triggers many at
   // once. Skip highlighting oversized blocks (plain text reads fine).
   if (!code || code.length > 20000 || code.split("\n").length > 600) return null;
-  // 流式期间跳过：最终渲染统一补色，避免流式期间多个 colorize 叠加阻塞主线程。
-  if (Array.isArray(_chatSessions) && _chatSessions.some((s) => s && s.streaming)) return null;
+  // 流式期间跳过逐帧上色（多个 colorize 叠加会卡住主线程），把颜色留给最终渲染。
+  //
+  // 但"最终渲染"必须显式豁免，否则这道闸是**恒定生效**的：那次最终渲染发生在每个模型
+  // 回合结束时，而 session.streaming 要等**整个运行**结束才清掉。于是智能体跑动期间的
+  // 每一次最终渲染都仍然看到"正在流式"，一律返回 null——代码块从头到尾没有颜色，只有
+  // 重启软件、历史被重新渲染（那时没人在流式）才会有色。用户实拍到的就是这个。
+  //
+  // 顺带另一半：这里查的是**所有**会话，别的标签页在跑也会把这个标签页的最终渲染一起
+  // 掐掉。豁免同样解决它。
+  if (!opts.final && Array.isArray(_chatSessions) && _chatSessions.some((s) => s && s.streaming)) return null;
   // 并发限流：超过 2 路排队，让出主线程。
   if (_highlightActive >= _HIGHLIGHT_MAX_CONCURRENT) {
     await new Promise((resolve) => _highlightQueue.push(resolve));
@@ -18799,6 +18807,9 @@ async function highlightCode(code, lang) {
     if (_highlightQueue.length) { const next = _highlightQueue.shift(); next(); }
   }
 }
+
+/** 最终渲染专用：绕过"流式期间跳过上色"那道闸——它防的是逐帧上色，不该连定稿也一起掐。 */
+const highlightCodeFinal = (code, lang) => highlightCode(code, lang, { final: true });
 
 // Label for the USER's own messages: show the signed-in account (email) instead of a generic "你".
 // Falls back to the localized "你" when signed out.
@@ -19034,7 +19045,7 @@ function addMessage(role, text, forSession, attachments = [], options = {}) {
           const segs = _parseStreamSegments(text);
           for (let si = 0; si < segs.length; si++) _renderAgentSegStatic(pre.body, segs[si], segs, si);
         } else {
-          renderMarkdownInto(pre.body, text, { highlighter: highlightCode });
+          renderMarkdownInto(pre.body, text, { highlighter: highlightCodeFinal });
         }
       }
       return pre.body;
@@ -19060,7 +19071,7 @@ function addMessage(role, text, forSession, attachments = [], options = {}) {
           _renderAgentSegStatic(body, segs[si], segs, si);
         }
       } else {
-        renderMarkdownInto(body, text, { highlighter: highlightCode });
+        renderMarkdownInto(body, text, { highlighter: highlightCodeFinal });
       }
     }
   } else {
@@ -19275,7 +19286,7 @@ function _mergeTrailingThinkCards(body) {
       run[k].remove();
     }
     fb.dataset.rawText = merged;
-    try { renderMarkdownInto(fb, merged, { streaming: false, highlighter: typeof highlightCode === "function" ? highlightCode : undefined }); }
+    try { renderMarkdownInto(fb, merged, { streaming: false, highlighter: typeof highlightCodeFinal === "function" ? highlightCodeFinal : undefined }); }
     catch { fb.textContent = merged; }
     if (totalMs > 0) {
       first._durMs = totalMs;
@@ -19300,7 +19311,7 @@ function _appendToolPlanCard(body, thought, tools) {
       + (Array.isArray(tools) && tools.length ? `\n\n**选定工具**：${tools.join("、")}` : "");
     if (b) {
       b.dataset.rawText = text;
-      try { renderMarkdownInto(b, text, { streaming: false, highlighter: typeof highlightCode === "function" ? highlightCode : undefined }); }
+      try { renderMarkdownInto(b, text, { streaming: false, highlighter: typeof highlightCodeFinal === "function" ? highlightCodeFinal : undefined }); }
       catch { b.textContent = text; }
     }
     // 把卡插在当前末尾的转圈占位（.thinking）之前，不打断「思考中…」的视觉连续性。
@@ -26047,7 +26058,7 @@ async function sendPrompt(text, attachments = [], readyConfig = null, opts = {})
     const tb = reasoningEl.querySelector(".think-body");
     if (tb && (reasoning || tb.dataset.rawText)) {
       tb.dataset.rawText = String(reasoning || tb.dataset.rawText || "");
-      try { renderMarkdownInto(tb, tb.dataset.rawText, { streaming: false, highlighter: highlightCode }); } catch {}
+      try { renderMarkdownInto(tb, tb.dataset.rawText, { streaming: false, highlighter: highlightCodeFinal }); } catch {}
     }
     reasoningEl.dataset.open = "0";
     reasoningEl.classList.remove("streaming");
@@ -26372,7 +26383,7 @@ async function sendPrompt(text, attachments = [], readyConfig = null, opts = {})
               if (acc.trim()) {
                 const seg = document.createElement("div");
                 seg.className = "agent-seg";
-                renderMarkdownInto(seg, acc.trim(), { streaming: false, highlighter: highlightCode });
+                renderMarkdownInto(seg, acc.trim(), { streaming: false, highlighter: highlightCodeFinal });
                 body.appendChild(seg);
                 acc = ""; _shown = 0; body._lastLen = 0;
               }
@@ -26448,7 +26459,7 @@ async function sendPrompt(text, attachments = [], readyConfig = null, opts = {})
             body._chatStreamEl.className = "chat-stream-wrap";
             body.appendChild(body._chatStreamEl);
           }
-          renderMarkdownInto(body._chatStreamEl, _cc, { highlighter: highlightCode });
+          renderMarkdownInto(body._chatStreamEl, _cc, { highlighter: highlightCodeFinal });
         }
         if (_cc) { const _msg = { role: "assistant", content: err ? _cc + "\n\n（本次回复因上游中断未完成）" : _cc }; if (reasoningAll && reasoningAll.trim()) _msg.reasoning = reasoningAll; sess.memory.push(_msg); saveChatHistory({ immediate: true }); if (!err) _maybeRenderChoices(sess, _cc); }
       }
@@ -27174,7 +27185,7 @@ function _renderAgentSegStatic(container, seg, allSegs, idx) {
     if (!clean) return;
     const div = document.createElement("div");
     div.className = "agent-seg";
-    renderMarkdownInto(div, clean, { highlighter: highlightCode });
+    renderMarkdownInto(div, clean, { highlighter: highlightCodeFinal });
     container.appendChild(div);
   } else if (seg.type === "code") {
     if (!seg.content || !seg.content.trim()) return;
@@ -27212,7 +27223,7 @@ function _renderAgentSegStatic(container, seg, allSegs, idx) {
       const fenceInfo = seg.lang ? seg.lang : "";
       const div = document.createElement("div");
       div.className = "agent-seg";
-      renderMarkdownInto(div, "```" + fenceInfo + "\n" + seg.content + "\n```", { highlighter: highlightCode });
+      renderMarkdownInto(div, "```" + fenceInfo + "\n" + seg.content + "\n```", { highlighter: highlightCodeFinal });
       container.appendChild(div);
     }
   } else if (seg.type === "cmd") {
@@ -27246,7 +27257,7 @@ function _renderAgentSeg(container, seg, allSegs, idx, root, promises) {
     if (!clean) return;
     const div = document.createElement("div");
     div.className = "agent-seg";
-    renderMarkdownInto(div, clean, { highlighter: highlightCode });
+    renderMarkdownInto(div, clean, { highlighter: highlightCodeFinal });
     container.appendChild(div);
   } else if (seg.type === "code") {
     if (!seg.content || !seg.content.trim()) return;
@@ -27260,7 +27271,7 @@ function _renderAgentSeg(container, seg, allSegs, idx, root, promises) {
       const fenceInfo = seg.lang ? seg.lang : "";
       const div = document.createElement("div");
       div.className = "agent-seg";
-      renderMarkdownInto(div, "```" + fenceInfo + "\n" + seg.content + "\n```", { highlighter: highlightCode });
+      renderMarkdownInto(div, "```" + fenceInfo + "\n" + seg.content + "\n```", { highlighter: highlightCodeFinal });
       container.appendChild(div);
     }
   } else if (seg.type === "cmd") {
@@ -41168,7 +41179,7 @@ async function _agentModelTurn({ config, messages, toolSchemas, toolRegistry = n
   const settleReasoning = () => {
     if (!reasoningEl) return;
     const b = reasoningEl.querySelector(".think-body");
-    if (b && b.dataset.rawText) { try { renderMarkdownInto(b, b.dataset.rawText, { streaming: false, highlighter: typeof highlightCode === "function" ? highlightCode : undefined }); } catch {} }
+    if (b && b.dataset.rawText) { try { renderMarkdownInto(b, b.dataset.rawText, { streaming: false, highlighter: typeof highlightCodeFinal === "function" ? highlightCodeFinal : undefined }); } catch {} }
     reasoningEl.dataset.open = "0";
     reasoningEl.classList.remove("streaming");
     const tt = reasoningEl.querySelector(".think-title"); if (tt) tt.textContent = "已思考";
@@ -41727,14 +41738,14 @@ async function _agentModelTurn({ config, messages, toolSchemas, toolRegistry = n
   const _keepProse = (!_hasNonControlToolCall || !!err) && cleanFinal.trim();
   if (streamEl) {
     if (_keepProse) {
-      renderMarkdownInto(streamEl, cleanFinal, { streaming: false, highlighter: highlightCode });
+      renderMarkdownInto(streamEl, cleanFinal, { streaming: false, highlighter: highlightCodeFinal });
       _agentTimelineMarkVisible(timeline, _timelineTurn, "text");
     }
     else streamEl.remove();
   } else if (_keepProse) {
     const el = document.createElement("div");
     el.className = "agent-seg";
-    renderMarkdownInto(el, cleanFinal, { streaming: false, highlighter: highlightCode });
+    renderMarkdownInto(el, cleanFinal, { streaming: false, highlighter: highlightCodeFinal });
     body.appendChild(el);
     _agentTimelineMarkVisible(timeline, _timelineTurn, "text");
   }
