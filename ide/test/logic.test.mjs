@@ -27915,3 +27915,21 @@ test("删目录之前要快照，撤不回来的部分必须说出来", async ()
   assert.match(SRC, /for \(const f of dirSnapshot\.files\) \{[\s\S]{0,200}?_checkpointRecord\(_cp, f\.path, true, f\.content\)/,
     "快照没有写进 checkpoint——存了等于没存，撤销仍然还原不了");
 });
+
+test("⌘P 走一次后端调用并缓存，文件增删后必须失效", () => {
+  // 原来 qoOpen 每次都从 rootPath 逐目录 `await backend.readDir(dir)`——每个目录一次 IPC
+  // 往返、串行、无缓存、上限 5000（静默），还带着全仓第 4 份写死的忽略名单。
+  // 大仓里第一次按 ⌘P 要等上千次往返，候选里还混着 node_modules 的几万个文件。
+  assert.match(SRC, /backend\.invoke\("list_project_files"/,
+    "⌘P 没有改走一次性的后端列举，还在逐目录 IPC");
+  assert.match(SRC, /if \(_qoCache\.root === rootPath && _qoCache\.files\) return _qoCache\.files;/,
+    "没有缓存——每次按 ⌘P 都重扫全仓");
+  // 缓存必须失效，否则新建的文件搜不到、删掉的文件还能被选中然后打开一个不存在的路径。
+  assert.match(SRC, /function _refreshTreeFor\(absPath\) \{[\s\S]{0,260}?_invalidateProjectFileCache\(\);/,
+    "文件增删后没有让 ⌘P 缓存失效");
+  assert.match(SRC, /function setActiveWorkspaceRoot\(path\) \{\n  _invalidateProjectFileCache\(\);/,
+    "切换工作区后没有丢掉旧缓存");
+  // 后端不可用时要有回落，不能让 ⌘P 直接失灵。
+  assert.match(SRC, /async function _collectProjectFilesFallback\(\)/,
+    "没有回落路径——浏览器模式或老版本后端下 ⌘P 会直接不可用");
+});

@@ -9452,6 +9452,7 @@ function _syncWorkspaceRootLabel() {
 }
 
 function setActiveWorkspaceRoot(path) {
+  _invalidateProjectFileCache();
   path = _toPosix(path);
   rootPath = path;
   _launchConfigsCache = null;
@@ -36891,6 +36892,9 @@ function _resetReadProgress(run, ...keys) {
 // which only reloads already-expanded dirs and can miss a freshly-written file.
 function _refreshTreeFor(absPath) {
   if (!absPath) return;
+  // 文件增删了，⌘P 那份缓存就过期了。不失效的话新建的文件在快速打开里搜不到，
+  // 而删掉的文件还能被选中——然后打开一个不存在的路径。
+  _invalidateProjectFileCache();
   const dir = parentDir(absPath);
   try {
     if (dir && (workspaceRoots.includes(dir) || dirNodes.has(dir))) reloadDir(dir);
@@ -67798,8 +67802,36 @@ let qoFiles = [];
 let qoFiltered = [];
 let qoCursor = 0;
 
+// ⌘P 的候选文件列表：一次后端调用 + 缓存，而不是逐目录 IPC。
+//
+// 原来是从 rootPath 开始 `while (stack.length)` 逐目录 `await backend.readDir(dir)`——
+// **每个目录一次 IPC 往返**、串行、无缓存（qoOpen 每次都重扫）、上限 5000，还带着全仓
+// 第 4 份写死的忽略名单（10 项，和搜索/文件树/TS 预加载那三份互不相同）。大仓里第一次
+// 按 ⌘P 要等上千次往返，而且候选里混着 node_modules 的几万个文件。
+//
+// 现在交给后端的 list_project_files（ignore crate 的 WalkBuilder，原生支持嵌套
+// .gitignore）一次走完。缓存按 root 存，文件增删时失效——见 _invalidateProjectFileCache。
+let _qoCache = { root: null, files: null, truncated: false };
+function _invalidateProjectFileCache() { _qoCache = { root: null, files: null, truncated: false }; }
+
 async function collectProjectFiles() {
   if (!rootPath) return [];
+  if (_qoCache.root === rootPath && _qoCache.files) return _qoCache.files;
+  let files = [];
+  let truncated = false;
+  try {
+    const res = await backend.invoke("list_project_files", { root: rootPath, limit: 20000 });
+    files = (res?.files || []).map((f) => ({ path: _treePath(f.path), name: f.name, rel: f.rel }));
+    truncated = !!res?.truncated;
+  } catch {
+    // 后端不可用（浏览器模式 / 老版本）时回落到逐目录扫描，别让 ⌘P 直接失灵。
+    return await _collectProjectFilesFallback();
+  }
+  _qoCache = { root: rootPath, files, truncated };
+  return files;
+}
+
+async function _collectProjectFilesFallback() {
   const result = [];
   const skip = new Set(["node_modules", ".git", "dist", "build", "out", "target", ".next", "coverage", ".cache", "vendor"]);
   const stack = [rootPath];

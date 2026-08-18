@@ -280,6 +280,7 @@ pub fn run() {
             files::copy_path,
             files::delete_path,
             files::search_in_project,
+            files::list_project_files,
             files::replace_in_file,
             files::replace_in_project,
             conversation_store::conversation_snapshot_save,
