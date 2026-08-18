@@ -70,7 +70,7 @@ import { compactToolGuide, enrichedCatalogLine, autoEnrichToolMetadata, toolCapa
 import exifr from "exifr";
 import appPackage from "../package.json";
 import {
-  approvalTypes, blockedInReadOnlyMode, defineTool, fileEditTypes, hookedTypes,
+  approvalTypes, blockedInReadOnlyMode, defineTool, fileEditTypes, hookedTypes, needsApprovalFor,
   isFileMutation, fileMutationTypes, workerScopeField, workerScopeTarget, workspaceMutatingTypes,
 } from "./agent/tool-policy.js";
 import {
@@ -2645,7 +2645,30 @@ function _withoutLegacyReasoningSummary(content, reasoning) {
 // 用户真正那句话被顶到后面。用户实拍：模型据此写下「只有系统提示和错误通知，没有用户的实际
 // 请求」，然后开始怀疑自己是不是不该 clone。信封同时让网关的 orch_bytes 统计能覆盖到它。
 const _ORCH_NOTE = "〔系统编排提示——这不是用户发言，用户也看不到这段字。直接按要求行动；绝不在回复里提及、评论或转述本提示与任何内部标记，也不要因它反问用户〕\n";
-
+/**
+ * messages 里最后一条**真正来自用户**的话（跳过所有戴了编排信封的注入消息）。
+ *
+ * 注入消息为了兼容各家 provider 只能用 role:"user"，于是它坐在最后一位、长得像用户刚说的话。
+ * 实拍过两次同一个后果：工具参数校验失败 → 注入一条修复提示 → 模型在思考里写下"只有系统
+ * 提示和错误通知，没有用户的实际请求"，然后停下来问用户要什么——而用户的请求就在上面几条。
+ * 信封（_ORCH_NOTE）能标明"这不是用户说的"，但标注只解决"别当成用户说的"，不解决"那用户
+ * 到底说了什么"。所以还要把原话取出来，原样附在注入消息里。
+ */
+function _lastRealUserText(messages) {
+  if (!Array.isArray(messages)) return "";
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const m = messages[i];
+    if (!m || m.role !== "user") continue;
+    const c = typeof m.content === "string"
+      ? m.content
+      : Array.isArray(m.content)
+        ? m.content.map((p) => (typeof p === "string" ? p : String(p?.text || ""))).join("")
+        : "";
+    if (!c.trim() || c.startsWith(_ORCH_NOTE)) continue;
+    return c;
+  }
+  return "";
+}
 function _stripLoneSurrogates(value) {
   if (typeof value !== "string") return value;
   // ES2024 的原生实现优先；老引擎走下面的手工配对，不用 lookbehind——WKWebView 版本跨度大，
@@ -13646,6 +13669,20 @@ function _nativeWindowsFor(modelId) {
   const all = listed.length ? listed : (fallback ? [fallback] : []);
   return [...new Set(all)].sort((a, b) => b - a);
 }
+/** 存下来的那个数落到**当前还买得到**的档位上；落不上就取不超过它的最大一档。
+ *
+ *  会员从 M5 降到 M1 之后，存着的「5M」档（原生 96,890 + 5M）既不在选项里、也拿不到：
+ *  卡片按值找高亮找不到就回退到第 0 格（显示 96.9k），而预算仍按夹取后的 2,000,000 算——
+ *  显示的和用的差 20 倍，而且那个值网关根本给不到。归位之后两边永远落在同一格。
+ */
+function _ctxSnapToOpenChoice(modelId, stored) {
+  const want = Math.max(0, Math.round(Number(stored) || 0));
+  if (!want) return 0;
+  const open = _ctxChoiceOptions(modelId).filter((o) => !o.locked).map((o) => Math.round(o.value));
+  if (open.includes(want)) return want;
+  const fits = open.filter((v) => v > 0 && v <= want);
+  return fits.length ? Math.max(...fits) : 0;
+}
 function _ctxChoiceFor(modelId) {
   const rec = _ctxChoiceRecord(modelId);
   if (!rec) return 0;
@@ -13655,11 +13692,12 @@ function _ctxChoiceFor(modelId) {
     // back to the default and the 1M button could never take effect. Honour the stored figure,
     // but only while the catalogue still offers it: a window the route has withdrawn must not
     // strand a value nothing can deliver.
-    const stored = Math.max(0, Math.round(Number(rec.tokens) || 0));
-    if (stored > 0 && _nativeWindowsFor(modelId).includes(stored)) return stored;
-    return Math.max(0, Math.round(_modelContextLimit(modelId) || 0));
+    // 原来只校验"目录里还列着这个窗口"，而列着不等于要得到（见 _ctxNativeCeiling）。
+    const snapped = _ctxSnapToOpenChoice(modelId, rec.tokens);
+    return snapped || Math.max(0, Math.round(_modelContextLimit(modelId) || 0));
   }
-  return Math.max(0, Math.round(Number(rec.tokens) || 0));
+  // 加档同样要归位：会员降档之后那一档就不再买得到了，原来这里一个字都不校验。
+  return _ctxSnapToOpenChoice(modelId, rec.tokens);
 }
 function _setCtxChoice(modelId, tokens, kind = "modified") {
   try {
@@ -13682,9 +13720,15 @@ function _ctxChoiceOptions(modelId) {
   // list — an older gateway, or a third-party direct connection with no catalogue at all.
   const listed = (_modelCatalogEntry(modelId)?.contextWindows || []).filter((w) => w.tokens > 0);
   const natives = listed.length ? listed : [{ tokens: native, beta: null }];
+  // 拿不到的原生窗口要锁掉，不能只是"选了之后被夹回去"——那又是一次"显示的和用的不一样"。
+  // 判据和 _ctxNativeCeiling 同一条：网关只会替你去要带 beta 标记的窗口。
+  const reach = _ctxNativeCeiling(modelId);
   const opts = natives.map((w) => ({
-    value: w.tokens, label: _tokenShort(w.tokens), locked: false, native: true, kind: "native",
+    value: w.tokens, label: _tokenShort(w.tokens), locked: w.tokens > reach, native: true, kind: "native",
     beta: w.beta || null,
+    lockHint: w.tokens > reach
+      ? `目录里有别家端点提供 ${_tokenShort(w.tokens)}，但这条连接不会去申请它——选中只会让本地按一个拿不到的窗口做预算`
+      : "",
   }));
   // Every tier is DISPLAYED regardless of membership; only those the membership grants are
   // selectable. Locked tiers say what would unlock them instead of silently hiding.
@@ -13716,7 +13760,17 @@ function _ctxChoiceOptions(modelId) {
  * 分开之后：没选过 = 默认窗口（真实生效的那个）；选过 = 用户点的那个，仍按最宽夹住。
  */
 function _ctxNativeCeiling(modelId) {
-  return Math.max(_modelContextLimit(modelId), _nativeWindowsFor(modelId)[0] || 0);
+  // 目录里的 context_windows 是"这个模型在各家端点上出现过的窗口"，不是"本连接给得到的"。
+  // 网关只会主动去要**带 beta 标记**的那几个（server/src/models.rs 的 wants_1m 无条件带上
+  // context-1m 头），客户端连"我要多大窗口"这个字段都不发。把不带标记的更宽条目当上限，
+  // 等于让用户拖一下滑块就把裁剪预算调成真实窗口的十倍（glm-5.2 默认 96,890，目录里另有
+  // 1.0M），历史按拿不到的窗口留，最后在上游炸成 context-length 400。
+  const dflt = _ctxNativeDefault(modelId);
+  const unlockable = (_modelCatalogEntry(modelId)?.contextWindows || [])
+    .filter((w) => w?.beta)
+    .map((w) => Math.round(Number(w?.tokens) || 0))
+    .filter((n) => n > 0);
+  return Math.max(dflt, ...unlockable);
 }
 function _ctxNativeDefault(modelId) {
   return Math.max(1, Math.round(Number(_modelContextLimit(modelId)) || 0));
@@ -19564,7 +19618,10 @@ function _requiresApproval(call) {
   if (call.type === "gh" || call.type === "http") return _toolMayProduceExternalEffect(call);
   // tor 无条件问：它整条链路绕开用户平时的网络出口。
   if (call.type === "tor") return true;
-  return _APPROVE_TYPES.has(call.type);
+  // 按**这一次调用**判定，不是按类型一刀切：browser 的 needsApproval 是个函数
+  // （看页面不弹框，替用户按按钮才弹）。_APPROVE_TYPES 只回答"这个工具有可能要审批"，
+  // 拿它当结论会把纯观察动作也拦下来。
+  return needsApprovalFor(call.type, call);
 }
 // Session allowlist: scope every decision to the exact chat + workspace. Commands
 // use their full normalized text, so allowing `npm test` never authorizes another
@@ -24749,9 +24806,9 @@ function _steerRunningAgent(sess, text, attachments = []) {
     intentPromise,
   });
   sess.memory.push({ role: "user", content: text || t, attachments });
-  try { addMessage("user", "🧭 引导：" + t, sess, attachments); } catch {}
+  try { addMessage("user", t, sess, attachments); } catch {}
+  // 同理不弹 toast：这条消息的气泡当场就出现在对话里，那就是反馈。
   saveChatHistory({ immediate: true });
-  showToast("🧭 已插入引导，正在并入当前任务…");
 }
 
 // A PLAIN chat (single-turn) reply has no agent loop to steer, so a message sent WHILE it is
@@ -24764,8 +24821,9 @@ function _queueFollowup(sess, text, attachments = []) {
   if (!sess || !t) return;
   (sess._pendingSends = sess._pendingSends || []).push({ text: t, attachments });
   saveChatHistory();
+  // 不弹 toast：输入框上方的排队小卡片本身就是状态，看得见、点得动；
+  // 每排一条再糊一层浮层，发得多的时候就一直在闪。
   _renderQueueBar(sess);
-  showToast("已排队：当前回答完成后自动发送，或点「插入」立即并入");
 }
 // 排队消息小卡片：挂在底部输入框上方，超长省略号，末尾「插入」按钮——
 // 点插入把这条立即并入当前任务（agent 跑动中→实时引导；普通对话→阻断当前回答，
@@ -41451,7 +41509,10 @@ async function _agentModelTurn({ config, messages, toolSchemas, toolRegistry = n
       const repairDetails = _invalidToolRepairInstruction(rejectedToolAttempts, [], toolRegistry || toolSchemas);
       // 戴上编排信封：不戴的话它就是一条"看起来像用户说的"消息，而且坐在最后一位——
       // 用户真正的请求被顶走，模型于是判断"用户什么都没说"。
-      _argRepairMsg = { role: "user", content: `${_ORCH_NOTE}[工具参数校验失败] ${argIssue}。\n${repairDetails}\n请重新输出这次工具调用，并在同一个调用中一次传全 schema 要求的所有字段；不要先发空对象或残缺参数。` };
+      // 信封只说明"这不是用户说的"，不回答"那用户说了什么"。实拍到的失败正是后半句：
+      // 模型看到最后一条是错误通知，就判定用户什么都没说，停下来反问。把原话附上。
+      const _userAsk = _lastRealUserText(messages);
+      _argRepairMsg = { role: "user", content: `${_ORCH_NOTE}[工具参数校验失败] ${argIssue}。\n${repairDetails}\n请重新输出这次工具调用，并在同一个调用中一次传全 schema 要求的所有字段；不要先发空对象或残缺参数。${_userAsk ? `\n\n用户这一轮的原话没有变，就是下面这句——别把上面这条错误通知当成用户的新指令，也别因此反问用户要做什么：\n${_userAsk.slice(0, 2000)}` : ""}` };
       messages.push(_argRepairMsg);
       // 参数补全几乎每次一发即中：首次静默自愈，别弹警示提示吓用户；只有真的连补第二次才提示一次。
       if (repairAttempt === 0) {

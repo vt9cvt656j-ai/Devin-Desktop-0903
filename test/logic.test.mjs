@@ -284,6 +284,9 @@ const RUN_RECORD_KNOWN_SIGNATURE = load("_recordRunKnownSignature", {
   _runFileEvidenceAliases: EVIDENCE_ALIASES,
 });
 AUTO_LOAD_DEPS = {
+  // 审批门现在按**这一次调用**判定（browser 的 needsApproval 是个函数：看页面不弹框，
+  // 替用户按按钮才弹）。用真实现，不用桩——桩会让"哪些动作要审批"这件事在测试里失真。
+  needsApprovalFor: toolPolicy.needsApprovalFor,
   // 限流等待用的独立预算：_runModelRequestWithRetry 现在会读它们。少了是 ReferenceError，
   // 表现成"这个测试挂了"而不是"退避没生效"。从源码取真值，抄一份会漂。
   _AI_MODEL_RATE_LIMIT_WAITS: Number(/const _AI_MODEL_RATE_LIMIT_WAITS = (\d+);/.exec(SRC)[1]),
@@ -2814,6 +2817,59 @@ test("权限作用域：收紧处处合并，放宽只认用户自己的", async
     Date: { now: () => 1 },
   })("/repo");
   assert.deepEqual(empty, { allow: [], ask: [], deny: [] });
+});
+
+test("审批门按这一次调用判：看页面不弹框，替用户按按钮才弹", () => {
+  // 「做点事就撞门」的直接成因：browser 整个工具被一刀切进审批门，于是打开一个网页、
+  // 截个图、读一下网络面板都要用户点一次确认。判据改成按 action 走之后，观察不再拦，
+  // 真有副作用的一个都不放。
+  const requires = load("_requiresApproval", {
+    _APPROVE_TYPES: toolPolicy.approvalTypes(),
+    _GIT_MUTATING_OPS: new Set(["commit", "push"]),
+    _toolMayProduceExternalEffect: () => true,
+    needsApprovalFor: toolPolicy.needsApprovalFor,
+  });
+  for (const action of ["navigate", "observe", "inspect", "network", "screenshot"]) {
+    assert.equal(requires({ type: "browser", action }), false,
+      `browser.${action} 只是看，却要用户点确认——这就是「做点事就撞门」`);
+  }
+  for (const action of ["eval", "click", "type", "upload", "cookies", "storage"]) {
+    assert.equal(requires({ type: "browser", action }), true, `browser.${action} 必须过审批门`);
+  }
+  // 其它类型仍然按类型判，没被这次改动放宽。
+  assert.equal(requires({ type: "system", action: "open" }), true);
+  assert.equal(requires({ type: "capture_replay" }), true);
+});
+
+test("工具参数被打回时，注入的修复提示要带上用户的原话", () => {
+  // 实拍两次的同一个后果：工具参数校验失败 → 注入一条修复提示（为了兼容各家 provider
+  // 只能用 role:"user"，于是它坐在最后一位、长得像用户刚说的话）→ 模型在思考里写下
+  // 「只有系统提示和错误通知，没有用户的实际请求」，然后停下来反问用户要做什么。
+  // 用户的原话就在上面几条里，它却当作没有。
+  const ORCH = /const _ORCH_NOTE = "([^"]+)"/.exec(SRC)[1];
+  const last = load("_lastRealUserText", { _ORCH_NOTE: ORCH });
+
+  assert.equal(last([{ role: "user", content: "把这个仓库拉下来" }]), "把这个仓库拉下来");
+  // 注入消息不算用户说的话——这正是要跳过的那条。
+  assert.equal(
+    last([
+      { role: "user", content: "把这个仓库拉下来" },
+      { role: "assistant", content: "" },
+      { role: "user", content: `${ORCH}[工具参数校验失败] 缺少 source` },
+    ]),
+    "把这个仓库拉下来",
+    "取到的是注入消息而不是用户原话——模型于是判定「用户什么都没说」");
+  // 多模态：内容是分片数组时也要取得出来。
+  assert.equal(
+    last([{ role: "user", content: [{ type: "text", text: "读一下这张图" }] }]),
+    "读一下这张图");
+  assert.equal(last([{ role: "user", content: `${ORCH}只有注入消息` }]), "");
+  assert.equal(last(null), "");
+
+  // 注入点真的带上了原话，而且明说"别把错误通知当成新指令"。
+  const src = stripJsComments(SRC);
+  assert.match(src, /const _userAsk = _lastRealUserText\(messages\)/);
+  assert.match(src, /用户这一轮的原话没有变/);
 });
 
 test("在新目录里第一次建配置文件时，老配置被搬过来，而不是被示例顶掉", async () => {

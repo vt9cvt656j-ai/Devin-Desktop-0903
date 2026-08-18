@@ -81,6 +81,21 @@ const FILE_CONTENT_OP = { ...FILE_OP, fileEdit: true, scopeField: "path" };
 const GENERATOR = { mutatesWorkspace: true, needsApproval: true };
 /** an execution tool: side effects the harness cannot verify, but no `mutated` report. */
 const EXEC = { needsApproval: true, hooked: true };
+/**
+ * browser 工具里**纯观察**的动作：看页面、量视口、截图、读网络面板、滚动、悬停。
+ * 它们不改页面状态、不动会话、不碰本机文件，所以只读模式该放行、审批门也不必拦。
+ *
+ * 其余动作都算副作用，要过审批、只读模式挡下：click / type / fill / autofill 这类替用户
+ * 按下按钮的，eval 任意 JS，upload 传**本机绝对路径**的文件，cookies / storage 直接读走
+ * 登录态，batch 一次跑一串（里面可以是任何动作）。
+ *
+ * 名单必须照着 schema 里 action 的枚举写——手打会漏，上一版就漏了一半还多写了四个
+ * 不存在的动作。ide/test/tool-policy.test.mjs 有断言比对两边。
+ */
+export const BROWSER_OBSERVE_ACTIONS = new Set([
+  "navigate", "observe", "viewport", "screenshot", "design", "network", "inspect",
+  "nodes", "assert", "check", "wait", "scroll", "wheel", "swipe", "hover", "focus", "blur", "close",
+]);
 
 const REGISTRY = new Map();
 
@@ -174,11 +189,12 @@ function seed() {
   //   ~/.ssh/id_rsa），"autofill"+提交能替用户按下不可撤销的按钮。同一时刻写一个文件
   //   要弹框，这些不弹——这不是权衡，是漏登记。只读模式下同样要拦：读 cookie 不是"只读"。
   defineTool("browser", {
-    needsApproval: true,
-    // 纯导航/截图/读页面是观察，不该在只读模式里被一刀切；动到会话、文件、执行和提交的
-    // 那几个 action 才是副作用。审批门则一律要过——观察别人的登录态浏览器也该让人知情。
-    readOnlyModeBlocked: (call) => !["navigate", "screenshot", "read", "text", "back", "forward", "close"]
-      .includes(String(call?.action || "")),
+    // 按**动作**分辨，不是整个工具一刀切。上一版这里写死了一份手打的名单，里面
+    // `read` / `text` / `back` / `forward` 四个动作**在 schema 里根本不存在**，而真正的
+    // 观察动作 observe / inspect / network / nodes 一个都没列进去——于是只读模式下它连
+    // 看一眼页面都被拦，审批模式下看一眼也要弹框。名单改成照着 schema 的 action 枚举来。
+    needsApproval: (call) => !BROWSER_OBSERVE_ACTIONS.has(String(call?.action || "")),
+    readOnlyModeBlocked: (call) => !BROWSER_OBSERVE_ACTIONS.has(String(call?.action || "")),
   });
   // docker_compose_up：直接起一整套容器（`docker compose up -d`），占端口、挂卷、
   //   长期后台运行，停不停得掉不归本轮管。这是执行，不是读。
@@ -239,6 +255,19 @@ export const needsApproval = (type) => toolPolicy(type).needsApproval;
  * **可能有副作用**处理——MCP 规范里这个提示是可选的，多数服务不写，宁可挡住也不能
  * 在只读模式里替用户改了东西。
  */
+/**
+ * 这一次调用要不要过审批门。`needsApproval` 可以是布尔，也可以是按 call 判定的函数
+ * （browser 就是后者：看页面不必弹框，替用户按按钮必须）。
+ *
+ * 注意别拿 `approvalTypes()` 当这个用：那份集合只回答"这个工具**有可能**需要审批"，
+ * 函数值在它眼里恒为真，于是纯观察动作也会被判成要审批。
+ */
+export const needsApprovalFor = (type, call) => {
+  const need = toolPolicy(type).needsApproval;
+  if (typeof need === "function") return !!need(call);
+  return !!need;
+};
+
 export const blockedInReadOnlyMode = (type, call) => {
   const blocked = toolPolicy(type).readOnlyModeBlocked;
   if (typeof blocked === "function") return blocked(call);
