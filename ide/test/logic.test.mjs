@@ -28041,3 +28041,36 @@ test("模型要能看到崩掉的终端说了什么，以及 git 现场", () => 
   assert.match(fn, /parts\.push\(`Git: /, "上下文里没有 git 现场");
   assert.match(fn, /gitBranchNameEl\?\.textContent/, "分支没有取自 git 面板的真实值");
 });
+
+test("状态栏格子要么真能点，要么别在 tooltip 里承诺动作", () => {
+  // 四个格子原来都只传两个参数——setStatusBarItem 只有拿到第三个参数才建 <button> 并挂
+  // onclick，否则建 <span>。于是 tooltip 写着 "Go to Line" / "Select Language Mode"，
+  // 点下去什么都不发生。和当初状态栏那个 LSP 指示器是同一个毛病。
+  // 结束锚点要取**在 updateStatusBar 之后**的那个符号：problemCountText 在文件里排得
+  // 更靠前，用它做终点会切出一段空字符串，于是所有 match 断言全部误红（这一轮踩过）。
+  const _at = SRC.indexOf("function updateStatusBar()");
+  assert.ok(_at > 0, "找不到 updateStatusBar");
+  const fn = SRC.slice(_at, SRC.indexOf("\nfunction ", _at + 30));
+  assert.ok(fn.length > 200, "切出来的函数体不对");
+  assert.doesNotMatch(fn, /tooltip: "Go to Line"/, "又退回英文占位 tooltip 且不可点");
+  assert.match(fn, /setStatusBarItem\("_cursor",[\s\S]{0,200}?editor\.action\.gotoLine/,
+    "行号格子不可点——tooltip 承诺了跳转到行");
+  assert.match(fn, /setStatusBarItem\("_lang",[\s\S]{0,120}?\}, \(e\) => \{/,
+    "语言模式格子不可点");
+  assert.match(fn, /monaco\.editor\.setModelLanguage\(model, id\)/, "语言选单没有真的切语言");
+  assert.match(fn, /model\.pushEOL\(next\)/,
+    "行尾符切换要走 pushEOL（能被 ⌘Z 撤销），不是 setEOL");
+  // 编码是写死的 UTF-8、后端也只支持 UTF-8，所以它**不该**可点——承诺一个连后端都
+  // 没有的能力，比没有这个格子更糟。
+  assert.match(fn, /setStatusBarItem\("_encoding", \{ text: "UTF-8"[^}]*\}\);/,
+    "编码格子不该挂 onClick——后端只支持 UTF-8，点了也做不了什么");
+});
+
+test("实时诊断块要说清这不是模型自己的账", () => {
+  // 这里报的是编辑器当前全部诊断，其中多数是仓库本来就有的。原文案只说"这些是真实
+  // 错误，修复时必须以它们为证据"——模型会把历史遗留当成自己捅的，跑去改一堆无关代码，
+  // 或者因为总数没降而认为自己没修好。真正做 baseline 抵扣的是收尾那道阻断门。
+  const fn = SRC.slice(SRC.indexOf("function agentDiagnosticsBlock"), SRC.indexOf("function problemCountText"));
+  assert.match(fn, /包含你动手之前就存在的问题/, "没有说清计数包含历史遗留");
+  assert.match(fn, /只对你这次改动引入的那些负责/, "没有划清责任范围");
+});
