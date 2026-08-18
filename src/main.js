@@ -2369,7 +2369,7 @@ const monacoEditor = monaco.editor.create(editorEl, {
   suggest: {
     showStatusBar: true,
     shareSuggestSelections: true,
-    showWords: false,
+    showWords: true,   // 同上：没有语言服务时，"本文件里出现过的词"总好过一个空框
     filterGraceful: true,
     snippetsPreventQuickSuggestions: false,
     localityBonus: true,
@@ -2402,7 +2402,11 @@ const monacoEditor = monaco.editor.create(editorEl, {
   quickSuggestionsDelay: 50,
   suggestOnTriggerCharacters: true,
   acceptSuggestionOnCommitCharacter: false,
-  wordBasedSuggestions: "off",
+  // VS Code 默认是 "matchingDocuments"。关掉的后果是：写 markdown / sql / toml / ini /
+  // Makefile / 纯文本时，⌃空格 弹出来是**空的**——这类文件恰恰最需要重复长标识符
+  // （环境变量名、表名、字段名）。有 LSP 的 23 种语言不受影响（LSP 的补全优先级更高），
+  // 这一层只是给没有语言服务的文件一个廉价兜底。
+  wordBasedSuggestions: "matchingDocuments",
   parameterHints: { enabled: true, cycle: true },
   inlineSuggest: { enabled: true, mode: "subwordSmart" },
   fontSize: 13,
@@ -45320,7 +45324,19 @@ function _agentDecisionFrameBlock(text, profile = _engineeringProfileWithAiInten
   if (p.needsCommunityResearch) _finishChecks.push("已取得开发者社区真实证据（原帖正文，搜索标题不算）");
   if (p.ui || p.uiProject) _finishChecks.push("改过前端就用真实浏览器验过受影响的点（首次交付=桌面+手机完整矩阵，之后只验受影响点）");
   if (_finishChecks.length || p.applies) {
-    lines.push(`🏁 收尾验收契约（harness 收尾时会逐项核对真实证据；把它们当作任务的一部分提前做掉，而不是收尾被动补课）：${_finishChecks.length ? _finishChecks.map((check, index) => `${index + 1}. ${check}`).join("；") + "；" : ""}改过代码时收尾会自动跑本项目探测到的验证命令（只跑本机真实存在的）——你自己先把真实运行/测试跑通，收尾就是零补课。确实做不到的项，收尾如实写明未完成及原因。`);
+    // 这里原来写着「改过代码时收尾会自动跑本项目探测到的验证命令」——**那是假的**。
+    // `_runApprovedVerification` 只有定义、零调用点（见 62535 及 23301/47901 两处注释），
+    // 它包着的 `_interleavedTest` 也只被那个死函数调用。
+    //
+    // 更糟的是同一份上下文里 `_formatStackHint`（23313-23314）已经改成了正确的说法：
+    // 「改完必须你自己跑这条，没有任何东西会替你自动跑」。于是模型在同一轮里读到两条
+    // 关于同一台机器的**互相矛盾**的陈述——而它会理性地采信"有人替我跑"那条，
+    // 把编译/测试外包出去，改完直接收尾。收尾时没有验证证据，只记一行
+    // code_delivered_unverified，用户拿到的是一份没编译过的代码加一行小字。
+    //
+    // 这是"写出来的代码用不了"最直接的一条机器原因。修法只有两条：把机器真接上，
+    // 或者别再承诺它。先选后者——承诺一个不存在的能力，比没有这个能力糟得多。
+    lines.push(`🏁 收尾验收契约（harness 收尾时会逐项核对真实证据；把它们当作任务的一部分提前做掉，而不是收尾被动补课）：${_finishChecks.length ? _finishChecks.map((check, index) => `${index + 1}. ${check}`).join("；") + "；" : ""}改过代码就**自己跑一遍**本项目的构建/测试命令（没有任何东西会替你自动跑，也不会有失败报告自动送到你面前）——退出码就是结论。确实做不到的项，收尾如实写明未完成及原因。`);
   }
   return lines.join("\n");
 }
@@ -64929,8 +64945,28 @@ $("gitCommitMsg").addEventListener("keydown", (e) => {
   }
 });
 $("diffClose").addEventListener("click", () => closeDiffView());
-$("newFileBtn").addEventListener("click", () => rootPath && newEntry(rootPath, false));
-$("newFolderBtn").addEventListener("click", () => rootPath && newEntry(rootPath, true));
+/// 侧栏「＋」该建在**你正在看的地方**，而不是永远建在项目根。
+///
+/// 这两个按钮原来写死 `newEntry(rootPath, …)`：在树上选中 src/components/ 再点 ＋，
+/// 文件落在项目根，只能删了重来。而同一个功能的另一个入口——右键菜单的
+/// `newEntry(targetDir, …)`（main.js:11129 附近）——一直是对的。同一件事两个入口
+/// 两种行为，用户会以为是随机的。
+///
+/// 取值顺序：树上选中的目录 → 选中项所在目录 → 当前打开文件所在目录 → 项目根。
+function _targetDirForNew() {
+  for (const p of _treeSel) {
+    if (dirNodes.has(p)) return p;          // 选中的就是目录
+    const d = parentDir(p);
+    if (d) return d;                        // 选中的是文件，就建在它旁边
+  }
+  if (activePath) {
+    const d = parentDir(activePath);
+    if (d) return d;
+  }
+  return rootPath;
+}
+$("newFileBtn").addEventListener("click", () => { const d = _targetDirForNew(); if (d) newEntry(d, false); });
+$("newFolderBtn").addEventListener("click", () => { const d = _targetDirForNew(); if (d) newEntry(d, true); });
 $("refreshTreeBtn").addEventListener("click", () => rootPath && reloadDir(rootPath));
 treeEl.addEventListener("contextmenu", (e) => {
   if (!rootPath) return;

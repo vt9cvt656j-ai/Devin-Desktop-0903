@@ -27957,3 +27957,33 @@ test("跳转历史存在，且键位不许抢 macOS 的按词移动", () => {
   assert.match(SRC, /if \(_navRestoring \|\| _imeComposing\) return;/,
     "恢复位置时没有抑制记录——会把后退动作本身当成一次新跳转");
 });
+
+test("不许告诉模型「收尾会自动跑验证」——那台机器是死的", () => {
+  // _runApprovedVerification 只有定义、零调用点，它包着的 _interleavedTest 也只被那个
+  // 死函数调用。而 _formatStackHint 已经改成了正确说法「没有任何东西会替你自动跑」。
+  // 两条关于同一台机器的陈述同时在一份上下文里，模型会理性地采信「有人替我跑」那条，
+  // 把编译/测试外包出去、改完直接收尾——这是"写出来的代码用不了"最直接的机器原因。
+  const frame = SRC.slice(SRC.indexOf("🏁 收尾验收契约"), SRC.indexOf("🏁 收尾验收契约") + 700);
+  assert.doesNotMatch(frame, /收尾会自动跑/,
+    "又在承诺一个不存在的能力：收尾并不会自动跑验证命令");
+  assert.match(frame, /没有任何东西会替你自动跑/,
+    "收尾契约必须明说没人替它跑，和 _formatStackHint 的说法保持一致");
+});
+
+test("侧栏「＋」建在你正在看的目录，不是永远建在项目根", () => {
+  // 写死 rootPath 的后果：在树上选中 src/components/ 再点 ＋，文件落在项目根。
+  // 而右键菜单的 newEntry(targetDir, …) 一直是对的——同一件事两个入口两种行为。
+  assert.match(SRC, /function _targetDirForNew\(\)/, "没有解析目标目录的辅助函数");
+  assert.doesNotMatch(SRC, /\$\("newFileBtn"\)\.addEventListener\("click", \(\) => rootPath && newEntry\(rootPath/,
+    "＋ 又写死成建在项目根了");
+  assert.match(SRC, /\$\("newFileBtn"\)\.addEventListener\("click", \(\) => \{ const d = _targetDirForNew\(\);/,
+    "新建文件没有走目标目录解析");
+});
+
+test("没有语言服务的文件也要有词补全，不能弹一个空框", () => {
+  // 写 markdown / sql / toml / ini / Makefile 时按 ⌃空格 是空的——这类文件恰恰最需要
+  // 重复长标识符（环境变量名、表名、字段名）。VS Code 默认就是 matchingDocuments。
+  assert.match(SRC, /wordBasedSuggestions: "matchingDocuments"/,
+    "词补全被关掉了——无 LSP 的语言里补全框会是空的");
+  assert.match(SRC, /showWords: true,/, "建议列表里不显示词条目");
+});
