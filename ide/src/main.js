@@ -13221,14 +13221,18 @@ function _modelContextChoices(id) {
   if (!_modelContextLimit(id)) return [];
   return _ctxChoiceOptions(id)
     .slice()
-    .sort((a, b) => a.value - b.value || (a.kind === "native" ? -1 : 1))
+    // 先按"是不是窗口"分组：窗口那段在左、档位那段在右。原来纯按数值排，档位 1M 会插进
+    // 原生 512k 和 1.0M 中间，滑轨上两条轴交错在一起，谁也看不出自己拖的是哪个量。
+    .sort((a, b) => (a.kind === "native" ? 0 : 1) - (b.kind === "native" ? 0 : 1) || a.value - b.value)
     // 标签就是**运维在卖的那套档位名**，不是算出来的合计。
     //
     // 档位在网关侧是叠加的（compression.rs: capacity_for_native = native + tier），
     // 所以 1M 原生配 2M 档真实容量是 3M —— 数字没错，但那不是后台卖的名字，卡片上冒出
     // 3M / 6M 会让人以为自己买的档位对不上。原生显示它真实的数字，加档原样用档位名。
     .map((o) => {
-      const label = o.kind === "native" ? _tokenShort(o.value) : String(o.tier || "");
+      // 两条轴在同一条滑轨上，标签必须一眼分得开：原生「1.0M」和档位「1M」几乎长一样。
+      // 档位统一带个"档"字 —— 它不是窗口，是网关替你留多少历史。
+      const label = o.kind === "native" ? _tokenShort(o.value) : `${o.tier || ""} 档`;
       return { ...o, label, valueLabel: label };
     });
 }
@@ -13726,31 +13730,75 @@ function _ctxSnapToOpenChoice(modelId, stored) {
   const fits = open.filter((v) => v > 0 && v <= want);
   return fits.length ? Math.max(...fits) : dflt;
 }
+/**
+ * 用户选中的**窗口**（token）。0 = 没选过，按目录默认走。
+ *
+ * 只认窗口那条轴：档位（tier）归 _ctxTierChoice 管，它不是窗口，混进来就会让仪表分母
+ * 变成"原生 + 档位"那个谁也认不出的数（用户实拍：选 2M 得到 2,096,890）。
+ */
 function _ctxChoiceFor(modelId) {
   const rec = _ctxChoiceRecord(modelId);
   if (!rec) return 0;
-  if (rec.kind === "native") {
-    // Which native window was clicked used to be thrown away — the record stored only the kind,
-    // so a model with two of them (Sonnet 4.5: 200K default, 1M behind the beta) always resolved
-    // back to the default and the 1M button could never take effect. Honour the stored figure,
-    // but only while the catalogue still offers it: a window the route has withdrawn must not
-    // strand a value nothing can deliver.
-    // 原来只校验"目录里还列着这个窗口"，而列着不等于要得到（见 _ctxNativeCeiling）。
-    const snapped = _ctxSnapToOpenChoice(modelId, rec.tokens);
-    return snapped || Math.max(0, Math.round(_modelContextLimit(modelId) || 0));
+  const stored = Math.max(0, Math.round(Number(rec.tokens) || 0));
+  if (!stored) return 0;
+  if (rec.kind === "tier") return 0;             // 选的是档位，窗口保持默认
+  if (rec.kind === "modified") {
+    // 老格式：可能是"收窄窗口"（<= 默认），也可能是"原生 + 档位"（> 默认）。
+    // 后者的窗口部分就是默认窗口，档位那一半由 _ctxTierChoice 还原。
+    return stored <= _ctxNativeDefault(modelId) ? stored : 0;
   }
-  // 加档同样要归位：会员降档之后那一档就不再买得到了，原来这里一个字都不校验。
-  return _ctxSnapToOpenChoice(modelId, rec.tokens);
+  // 目录还列着就照用；不列了（换了线路/模型改了）就退回默认，别钉死一个交付不了的数。
+  const listed = _nativeWindowsFor(modelId);
+  if (listed.includes(stored)) return stored;
+  return 0;
 }
-function _setCtxChoice(modelId, tokens, kind = "modified") {
+
+/**
+ * 两条轴，一条滑轨。
+ *
+ * `native` = **窗口**：模型这一轮真正能读多少。仪表的分母、发给网关的 x-ide-context-window
+ *            都是它。
+ * `tier`   = **留存档位**：网关替你保留多少历史，压缩后仍旧送进上面那个窗口。它不是窗口，
+ *            所以永远不该出现在仪表分母里。
+ *
+ * 这两个量以前被合成一个数存着（`modified` = 原生 + 档位）。标签写 2M、实际值 2,096,890，
+ * 用户选了 2M 却拿到一个谁也认不出的数 —— 加法本身没错（网关的 capacity_for_native 就是
+ * 原生+档位），错在把**结算时**才该做的加法提前写进了"用户选了什么"里。
+ */
+function _setCtxChoice(modelId, tokens, kind = "native") {
   try {
     const map = JSON.parse(localStorage.getItem(_CTX_CHOICE_KEY) || "{}") || {};
     const key = String(modelId || "");
-    if (kind === "native") map[key] = { kind: "native", tokens: Math.max(0, Math.round(tokens) || 0) };
-    else if (tokens > 0) map[key] = { kind: "modified", tokens: Math.round(tokens) };
-    else delete map[key];
+    const n = Math.max(0, Math.round(Number(tokens) || 0));
+    if (!n) delete map[key];
+    else map[key] = { kind: kind === "tier" ? "tier" : "native", tokens: n };
     localStorage.setItem(_CTX_CHOICE_KEY, JSON.stringify(map));
   } catch {}
+}
+
+/**
+ * 用户选中的留存档位（token）。0 = 没单独选过，按会员自身的档位走。
+ *
+ * 老记录（`modified`，存的是"原生 + 档位"）在这里就地还原成档位本身：减掉默认窗口再吸附到
+ * 最近的档。不还原的话，那条记录会被下面的窗口解析当成一个巨大的窗口选择。
+ */
+function _ctxTierChoice(modelId) {
+  const rec = _ctxChoiceRecord(modelId);
+  if (!rec) return 0;
+  const stored = Math.max(0, Math.round(Number(rec.tokens) || 0));
+  if (!stored) return 0;
+  let want = 0;
+  if (rec.kind === "tier") want = stored;
+  else if (rec.kind === "modified") {
+    const dflt = _ctxNativeDefault(modelId);
+    want = stored > dflt ? stored - dflt : 0;   // 老格式：减掉原生那一半
+  }
+  if (want <= 0) return 0;
+  const tierMax = Number(_michaelUser?.michael_compression?.max_input_tokens) || 0;
+  const open = _MC_TIER_OPTIONS.map(([, t]) => t).filter((t) => _gatewayHandlesCompression() && t <= tierMax);
+  if (!open.length) return 0;                    // 会员没了 / 没开压缩 → 档位不生效
+  const fits = open.filter((t) => t <= want);
+  return fits.length ? Math.max(...fits) : Math.min(...open);
 }
 const _MC_TIER_OPTIONS = [["1M", 1_000_000], ["2M", 2_000_000], ["5M", 5_000_000]];
 function _ctxChoiceOptions(modelId) {
@@ -13858,9 +13906,12 @@ function _effectiveContextLimit(modelId) {
   // The choice may narrow the window below entitlement (a cost dial) but never widen it past
   // what native-or-membership actually delivers — budgeting against a fictional window is how
   // requests die upstream as context-length 400s.
-  // 同上：用户选的那一档直接生效（它本来就是从我们给出的档位表里点的，不会是凭空的数）。
-  if (choice > 0) return Math.max(1, choice);
-  return Math.max(_ctxNativeDefault(modelId), _ctxSeenMax(modelId)) + tier;
+  // **加法只发生在这里**：留存容量 = 窗口 + 档位（与网关 capacity_for_native 一致）。
+  // 窗口那一半来自用户选的窗口（没选就是目录默认，再取实测下限）；档位那一半优先用用户
+  // 单独选的档，没选就用会员自身的档。两个数各自都认得出来，没有"原生+档位"那种合成值。
+  const window = choice > 0 ? choice : Math.max(_ctxNativeDefault(modelId), _ctxSeenMax(modelId));
+  const picked = _ctxTierChoice(modelId);
+  return Math.max(1, window + (picked > 0 ? picked : tier));
 }
 
 // 上下文注入预算随档位适度伸缩，封顶 2 倍。档位（1M/2M/5M）的真正价值是**历史容量**：
@@ -15342,7 +15393,7 @@ function showModelInfoCard(m, anchorEl) {
       // commit=false 是拖动途中，只回读数不落盘——每像素写一次 localStorage 会把
       // 界面顿住好几秒。
       if (o && commit) {
-        _setCtxChoice(m.id, o.value, o.kind === "native" ? "native" : "modified");
+        _setCtxChoice(m.id, o.value, o.kind === "tier" ? "tier" : "native");
         // 选完立刻重画仪表。少了这一步，分母已经变了而圆环要等到下一次按键或切标签页
         // 才跟上 —— 用户拖完看不到任何变化，只会认为"滑动切换没用"。
         try { _refreshContextMeterFromDraft({ force: true }); } catch {}

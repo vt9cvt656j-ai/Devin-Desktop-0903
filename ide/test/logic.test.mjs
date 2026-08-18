@@ -13788,33 +13788,32 @@ test("Michael Design 只有一个条件化技术栈规则", () => {
     "web_scaffold 默认必须是 react——默认 vue 会让模型照着 React 提示却拿到 Vue 项目");
 });
 
-test("档位是叠加在原生之上的，任何模型上都不会变成 no-op", () => {
-  const mk = (native) => load("_ctxChoiceOptions", {
-    _modelContextLimit: () => native,
-    // 原生窗口只有一个（_modelCatalogEntry 给 null），所以够得着的上限就是它自己。
-    _ctxNativeCeiling: () => native,
-    _michaelUser: { michael_compression: { max_input_tokens: 5_000_000 } },
-    _gatewayHandlesCompression: () => true,
-    _tokenShort: (n) => String(n),
-    _modelCatalogEntry: () => null,
-    _MC_TIER_OPTIONS: [["1M", 1_000_000], ["2M", 2_000_000], ["5M", 5_000_000]],
-  })("m");
-  // 1M 原生：1M 档 = 原生 + 1M = 2M。绝对值语义下这里是 1M，等于白买。
-  const big = mk(1_000_000).filter((o) => o.kind === "modified");
-  assert.equal(big.find((t) => t.tier === "1M").value, 2_000_000, "1M 档在 1M 原生上必须给到 2M");
-  assert.equal(big.find((t) => t.tier === "5M").value, 6_000_000);
-  // 200K 原生：同一档位仍然是 +1M
-  const small = mk(200_000).filter((o) => o.kind === "modified");
-  assert.equal(small.find((t) => t.tier === "1M").value, 1_200_000, "小窗口上 1M 档也是 +1M");
-  // 每个档位在任何原生窗口下都必须严格大于原生——不存在“买了不多给”的档位
-  for (const native of [128_000, 200_000, 400_000, 1_000_000, 2_000_000]) {
-    for (const t of mk(native).filter((o) => o.kind === "modified")) {
-      assert.ok(t.value > native,
-        `原生 ${native} 上 ${t.tier} 档必须严格更大，否则就是把 no-op 当升级卖`);
-    }
-  }
-  // 提示里要把加法讲清楚
-  assert.match(big.find((t) => t.tier === "2M").lockHint, /原生 .* \+ 本档 2M = 实际 3000000/);
+test("加法只发生在结算那一步：留存容量 = 窗口 + 档位", () => {
+  // 网关 capacity_for_native 确实是原生+档位，所以加法必须还在——只是它属于**结算**，
+  // 不属于"用户选了什么"。选项、存储、仪表分母里都不该出现合成数。
+  const eff = (tierMax, rec) => {
+    const base = {
+      _modelContextLimit: () => 200_000,
+      _ctxNativeDefault: () => 200_000,
+      _ctxSeenMax: () => 0,
+      _nativeWindowsFor: () => [200_000],
+      _modelCatalogEntry: () => ({ contextLimit: 200_000, contextWindows: [{ tokens: 200_000, beta: null }] }),
+      _michaelUser: tierMax ? { michael_compression: { max_input_tokens: tierMax } } : null,
+      _gatewayHandlesCompression: () => tierMax > 0,
+      _tokenShort: (n) => String(n),
+      _MC_TIER_OPTIONS: loadConst("_MC_TIER_OPTIONS"),
+      _ctxChoiceRecord: () => rec,
+    };
+    return load("_effectiveContextLimit", {
+      ...base,
+      _ctxChoiceFor: load("_ctxChoiceFor", base),
+      _ctxTierChoice: load("_ctxTierChoice", base),
+    })("m");
+  };
+  assert.equal(eff(5_000_000, null), 5_200_000, "没单独选档位就用会员自身的档：200k + 5M");
+  assert.equal(eff(5_000_000, { kind: "tier", tokens: 1_000_000 }), 1_200_000, "选了 1M 档：200k + 1M");
+  assert.equal(eff(5_000_000, { kind: "native", tokens: 200_000 }), 5_200_000, "只选窗口时档位仍按会员走");
+  assert.equal(eff(0, null), 200_000, "没会员就只有窗口本身");
 });
 
 test("前缀续传的校验必须认得网关真正签发的 token", () => {
@@ -13860,9 +13859,10 @@ test("上下文选择存的是意图而不是数字，原生窗口修正后不�
     "迁移必须拿该模型当前的原生值比对，而不是用 1M/2M/5M 硬清单——Gemini 的原生就是 1M，" +
     "按清单判会把选了原生的 Gemini 用户误判成选了档位");
   const setter = extractFn("_setCtxChoice");
-  assert.match(setter, /kind === "native"/, "必须能存下「跟随原生」这个意图");
+  assert.match(setter, /kind === "tier" \? "tier" : "native"/,
+    "两条轴要分开存：native=窗口、tier=留存档位。合成一个数就会出现「选 2M 得到 2,096,890」");
   const getter = extractFn("_ctxChoiceFor");
-  assert.match(getter, /rec\.kind === "native"/, "读取时原生要重新解析成当前真实值");
+  assert.match(getter, /rec\.kind === "tier"/, "窗口那条轴必须把档位排除掉，否则档位会变成窗口");
   // 「原生」和「加档」曾经是两行分段按钮、靠 data-ctx-kind 属性把意图带到点击处；
   // 现在合成了一条滑块，意图改由档位表里的 kind 字段一路带到写入处。**不变量没变**：
   // 存进去的必须是意图，不是一个数字。所以断言跟着挪到新位置，而不是跟着删掉。
@@ -13876,8 +13876,9 @@ test("上下文选择存的是意图而不是数字，原生窗口修正后不�
   assert.match(SRC.slice(SRC.indexOf("const ctxSl =")), /_modelContextChoices\(m\.id\)/,
     "拖动处理没用共用档位表，会和渲染错位");
   assert.match(SRC.slice(SRC.indexOf("const ctxSl ="), SRC.indexOf("const ctxSl =") + 1400),
-    /_setCtxChoice\(m\.id, o\.value, o\.kind === "native" \? "native" : "modified"\)/,
-    "拖到某一档时没把「跟随原生」这个意图存下去，只存了数字——原生值一被修正就把用户钉死");
+    /_setCtxChoice\(m\.id, o\.value, o\.kind === "tier" \? "tier" : "native"\)/,
+    "拖到某一档时要连**是哪条轴**一起存下去：窗口和留存档位是两个量，"
+    + "合成一个数存就会出现「选 2M 得到 2,096,890」");
 });
 
 test("空闲期卡死：点文件不再拖着整段对话过 JSON，重复镜像不再重写", () => {
@@ -16344,8 +16345,13 @@ test("gateway compression makes the local LLM compaction stand down", () => {
   // Additive, matching the gateway's capacity_for_native (server/src/compression.rs): the tier is
   // granted ON TOP of the model's own window. Taking the larger of the two contradicted the
   // buttons, which have always been priced additively.
-  assert.match(SRC, /function _effectiveContextLimit\(modelId\)[\s\S]{0,1600}return Math\.max\(_ctxNativeDefault\(modelId\), _ctxSeenMax\(modelId\)\) \+ tier;/,
-    "网关接管时本地按 原生+档位 裁剪，与 capacity_for_native 一致；原生取「目录默认」和「实测下限」的较大者");
+  // 加法还在（与网关 capacity_for_native 一致），但它现在只发生在**结算**这一步：
+  // 窗口那一半来自窗口那条轴，档位那一半来自档位那条轴，两个数各自都认得出来。
+  // 以前是把加法的结果当成"用户选了什么"存起来，于是选 2M 得到 2,096,890。
+  assert.match(SRC, /function _effectiveContextLimit\(modelId\)[\s\S]{0,1800}return Math\.max\(1, window \+ \(picked > 0 \? picked : tier\)\);/,
+    "网关接管时本地按 窗口+档位 裁剪，与 capacity_for_native 一致");
+  assert.match(SRC, /function _effectiveContextLimit\(modelId\)[\s\S]{0,1800}const picked = _ctxTierChoice\(modelId\);/,
+    "档位那一半必须走它自己的解析，不能再从窗口那条轴里读");
   // 加法一旦退回成 max，两个数在 1M 原生模型上重合，整排档位按钮又变成空操作。
   assert.doesNotMatch(SRC, /function _effectiveContextLimit\(modelId\)[\s\S]{0,1400}Math\.max\(\s*native,\s*tierMax/,
     "档位又变成取较大值了，付费档位在 1M 原生模型上会整排失效");
@@ -21347,62 +21353,40 @@ test("Tier-2 fold invalidates duplicate-read stubs for the same file", () => {
 // choice may NARROW the window (a cost dial) but must never budget past what native-or-
 // membership actually delivers — a fictional window dies upstream as context-length 400s.
 test("context-window choice clamps to what is actually deliverable", () => {
-  const win = {
-    _modelContextLimit: () => 200_000,
-    _nativeWindowsFor: () => [200_000],
-    // 单窗口模型：目录里没有 beta 条目，所以够得着的上限就是默认窗口本身。
-    _modelCatalogEntry: () => ({ contextLimit: 200_000, contextWindows: [{ tokens: 200_000 }] }),
-    _ctxNativeDefault: () => 200_000,
-    _ctxSeenMax: () => 0,
+  // 两条轴：窗口（模型这一轮读多少）和留存档位（网关替你留多少历史）。加法只发生在结算，
+  // 与网关 capacity_for_native 一致；存储和显示里都不该出现"原生+档位"那个合成数
+  // （用户实拍：选 2M 得到 2,096,890）。
+  const mk = (tierMax, rec, compress = true) => {
+    const base = {
+      _modelContextLimit: () => 200_000,
+      _ctxNativeDefault: () => 200_000,
+      _ctxSeenMax: () => 0,
+      _nativeWindowsFor: () => [200_000],
+      _modelCatalogEntry: () => ({ contextLimit: 200_000, contextWindows: [{ tokens: 200_000, beta: null }] }),
+      _michaelUser: tierMax ? { michael_compression: { max_input_tokens: tierMax } } : null,
+      _gatewayHandlesCompression: () => compress,
+      _tokenShort: (n) => String(n),
+      _MC_TIER_OPTIONS: loadConst("_MC_TIER_OPTIONS"),
+      _ctxChoiceRecord: () => rec,
+    };
+    return load("_effectiveContextLimit", {
+      ...base,
+      _ctxChoiceFor: load("_ctxChoiceFor", base),
+      _ctxTierChoice: load("_ctxTierChoice", base),
+    })("m");
   };
-  const mkEff = (store, user, compress) => load("_effectiveContextLimit", {
-    ...win,
-    _ctxNativeCeiling: load("_ctxNativeCeiling", win),
-    _ctxNativeDefault: load("_ctxNativeDefault", win),
-    _michaelUser: user,
-    _gatewayHandlesCompression: () => compress,
-    _ctxChoiceFor: () => store,
-  });
-  const tier5m = { michael_compression: { tier: "5m", max_input_tokens: 5_000_000 } };
+  const tier5m = 5_000_000;
 
-  // The tier stacks on the model's own window — 200K native + a 5M tier is 5.2M, which is exactly
-  // what the 5M button emits and what the gateway's capacity_for_native enforces. This test used
-  // to assert 5_000_000 and store 2_000_000, neither of which any button can produce; mocking away
-  // the additive half is how the two halves disagreed for so long without a test noticing.
-  assert.equal(mkEff(0, tier5m, true)("m"), 5_200_000, "no choice → membership default");
-  assert.equal(mkEff(1_200_000, tier5m, true)("m"), 1_200_000, "the 1M button narrows within membership");
-  assert.equal(mkEff(5_200_000, tier5m, true)("m"), 5_200_000, "the paid top tier must be reachable");
-  assert.equal(mkEff(200_000, tier5m, true)("m"), 200_000, "native is always selectable");
-  // 会员没了之后那一档不再产生一个虚构的窗口 —— 但这道防线现在在 **_ctxChoiceFor** 那一层
-  // （_ctxSnapToOpenChoice 归位），不在这里：用户显式点的档位在本函数里一律原样生效，
-  // 因为夹取用的上限来自目录，而目录对某些模型根本没有数据，夹的就是一个猜测。
-  // 这条测试把归位那层桩掉了（_ctxChoiceFor: () => store），所以在这儿断言等于测了个寂寞。
-  const win2 = {
-    _modelContextLimit: () => 200_000,
-    _ctxNativeDefault: () => 200_000,
-    _ctxNativeCeiling: () => 200_000,
-    _modelCatalogEntry: () => ({ contextLimit: 200_000, contextWindows: [{ tokens: 200_000, beta: null }] }),
-    _michaelUser: null,
-    _gatewayHandlesCompression: () => false,
-    _tokenShort: (n) => String(n),
-    _MC_TIER_OPTIONS: [["1M", 1_000_000], ["5M", 5_000_000]],
-  };
-  const choiceFor = load("_ctxChoiceFor", {
-    ...win2,
-    _ctxChoiceRecord: () => ({ kind: "modified", tokens: 5_200_000 }),
-    _nativeWindowsFor: () => [200_000],
-    _ctxSnapToOpenChoice: load("_ctxSnapToOpenChoice", {
-      ...win2,
-      _ctxChoiceOptions: load("_ctxChoiceOptions", win2),
-    }),
-  });
-  assert.equal(choiceFor("m"), 200_000,
-    "membership gone → a stored tier silently falls back to native, never a fictional window");
-  // 网关压缩没开时那一档确实交付不了 —— 但同样地，拦它的是 _ctxChoiceFor 的归位
-  // （_ctxChoiceOptions 会把买不到的档标成 locked，归位就落不到它上面），不是这一层。
-  // 这条测试把 _ctxChoiceFor 桩成了 () => store，所以在这儿断言测不到那道防线。
-  assert.equal(mkEff(1_200_000, tier5m, false)("m"), 1_200_000,
-    "用户显式选的档位在这一层原样生效；能不能买到由 _ctxChoiceFor 归位时判");
+  assert.equal(mk(tier5m, null), 5_200_000, "没单独选过 → 窗口 200k + 会员 5M 档");
+  assert.equal(mk(tier5m, { kind: "tier", tokens: 1_000_000 }), 1_200_000, "选 1M 档 → 200k + 1M");
+  assert.equal(mk(tier5m, { kind: "tier", tokens: 5_000_000 }), 5_200_000, "顶档要够得着");
+  assert.equal(mk(tier5m, { kind: "native", tokens: 200_000 }), 5_200_000, "只选窗口时档位仍按会员走");
+  assert.equal(mk(0, { kind: "tier", tokens: 5_000_000 }), 200_000,
+    "会员没了 → 档位不生效，只剩窗口本身，绝不产生一个虚构的数");
+  assert.equal(mk(tier5m, { kind: "tier", tokens: 5_000_000 }, false), 200_000,
+    "网关压缩没开 → 档位交付不了");
+  // 老记录（原生 + 档位）读回来仍然等价，不会把那一半当成窗口。
+  assert.equal(mk(tier5m, { kind: "modified", tokens: 1_200_000 }), 1_200_000, "老格式没等价还原");
 
   const mkOpts = (user, compress, windows = null) => {
     const env = {
@@ -25429,6 +25413,8 @@ const ctxEnv = (choice) => ({
   _ctxNativeDefault: () => 96_890,
   // 实测下限：默认没观测过（单独一条测试盖它）。
   _ctxSeenMax: () => 0,
+  // 留存档位是另一条轴：这一族测的是窗口，档位一律按"没单独选过"。
+  _ctxTierChoice: () => 0,
 });
 const ctxFn = (name, choice) => load(name, {
   ...ctxEnv(choice),
@@ -25692,61 +25678,75 @@ test("收窄永远算数——存着的窄窗口不许被放大回满窗", () =>
   assert.equal(snap("m", 9_000_000), 1_000_000);
 });
 
-test("会员降档之后，存着的那一档要落回当前买得到的档位", () => {
-  // 用户在 M5 档给 glm-5.2 选了「5M」，随后会员降到 M1。存的那个数既不在选项里、也拿不到：
-  // 卡片按值找高亮找不到就回退到第 0 格（显示 96.9k），而预算仍按夹取后的 2,000,000 算——
-  // 显示的和用的差 20 倍。归位之后两边永远落在同一格。
-  const env = (tierMax) => ({
+test("滑轨上两条轴要分得开：窗口在左、档位在右，档位带「档」字", () => {
+  // 原生「1.0M」和档位「1M」在同一条滑轨上几乎长一样，而且纯按数值排的话档位 1M 会插进
+  // 原生 512k 和 1.0M 中间 —— 两条轴交错，谁也看不出自己拖的是哪个量。
+  const choices = load("_modelContextChoices", {
     _modelContextLimit: () => 96_890,
-    _ctxNativeDefault: () => 96_890,
-    _modelCatalogEntry: () => ({ contextLimit: 96_890, contextWindows: [{ tokens: 96_890, beta: null }] }),
-    _michaelUser: { michael_compression: { max_input_tokens: tierMax } },
-    _gatewayHandlesCompression: () => true,
-    _tokenShort: (n) => String(n),
-    _MC_TIER_OPTIONS: [["1M", 1_000_000], ["2M", 2_000_000], ["5M", 5_000_000]],
-  });
-  const snap = (tierMax, stored) => {
-    const e = env(tierMax);
-    return load("_ctxSnapToOpenChoice", {
-      ...e,
-      _ctxNativeCeiling: load("_ctxNativeCeiling", e),
-      _ctxChoiceOptions: load("_ctxChoiceOptions", { ...e, _ctxNativeCeiling: load("_ctxNativeCeiling", e) }),
-    })("glm-5.2", stored);
-  };
-  assert.equal(snap(5_000_000, 5_096_890), 5_096_890, "会员还在时原样生效");
-  assert.equal(snap(1_000_000, 5_096_890), 1_096_890, "降到 M1 → 落到当时买得到的最大一档");
-  assert.equal(snap(0, 5_096_890), 96_890, "会员没了 → 落回原生窗口");
-  assert.equal(snap(5_000_000, 0), 0, "没存过就是没存过");
+    _ctxChoiceOptions: () => [
+      // 关键：档位 1M/2M 的数值**夹在**原生 512k 和 2.0M 中间。纯按数值排会把两条轴
+      // 交错成 512k → 1M档 → 1.0M... —— 用这组数据才测得到分组。
+      { value: 96_890, kind: "native", locked: false },
+      { value: 2_000_000, kind: "native", locked: false },
+      { value: 512_000, kind: "native", locked: false },
+      { value: 1_000_000, kind: "tier", tier: "1M", locked: false },
+      { value: 1_500_000, kind: "tier", tier: "1.5M", locked: false },
+    ],
+    _tokenShort: (n) => (n >= 1e6 ? `${(n / 1e6).toFixed(1)}M` : `${(n / 1000).toFixed(1)}k`),
+  })("m");
+  assert.deepEqual(choices.map((o) => o.label), ["96.9k", "512.0k", "2.0M", "1M 档", "1.5M 档"],
+    "窗口那段必须整段在左、档位整段在右，且档位要看得出是档位");
+  assert.deepEqual(choices.map((o) => o.kind), ["native", "native", "native", "tier", "tier"]);
 });
 
-test("归位要发生在 _ctxChoiceFor 这一层——预算和卡片都只读它", () => {
-  // 上一条测的是归位函数本身；这条测它真的被接进了取值链。少了这一跳，会员降档之后
-  // _effectiveContextLimit 仍然拿存着的旧数去算，而卡片按值找高亮找不到、回退到第 0 格。
-  const env = {
+test("档位存的就是档位本身——不再是「原生 + 档位」那个合成数", () => {
+  // 用户实拍："我选择 2m 和 5m 他居然会变成叠加的数字很离谱"。标签写 2M、存的却是
+  // 原生 96,890 + 2M = 2,096,890，而上一轮我把"用户选的原样生效"接通之后，这个怪数
+  // 直接成了仪表分母。加法本身没错（网关 capacity_for_native 就是原生+档位），错在把
+  // **结算时**才该做的加法，提前写进了"用户选了什么"。
+  const base = {
     _modelContextLimit: () => 96_890,
     _ctxNativeDefault: () => 96_890,
     _modelCatalogEntry: () => ({ contextLimit: 96_890, contextWindows: [{ tokens: 96_890, beta: null }] }),
-    _michaelUser: { michael_compression: { max_input_tokens: 1_000_000 } },
     _gatewayHandlesCompression: () => true,
     _tokenShort: (n) => String(n),
-    _MC_TIER_OPTIONS: [["1M", 1_000_000], ["2M", 2_000_000], ["5M", 5_000_000]],
+    _MC_TIER_OPTIONS: loadConst("_MC_TIER_OPTIONS"),
   };
-  const ceil = load("_ctxNativeCeiling", env);
-  const opts = load("_ctxChoiceOptions", { ...env, _ctxNativeCeiling: ceil });
-  const choiceFor = (rec) => load("_ctxChoiceFor", {
-    ...env,
-    _ctxChoiceRecord: () => rec,
-    _ctxNativeCeiling: ceil,
-    _ctxChoiceOptions: opts,
-    _nativeWindowsFor: () => [96_890],
-    _ctxSnapToOpenChoice: load("_ctxSnapToOpenChoice", { ...env, _ctxNativeCeiling: ceil, _ctxChoiceOptions: opts }),
-  })("glm-5.2");
+  const opts = load("_ctxChoiceOptions", { ...base, _michaelUser: { michael_compression: { max_input_tokens: 5_000_000 } }, _ctxNativeCeiling: () => 96_890 })("m");
+  const tiers = opts.filter((o) => o.kind === "tier");
+  assert.deepEqual(tiers.map((o) => o.value), [1_000_000, 2_000_000, 5_000_000],
+    "档位的值必须是档位本身，不是原生+档位");
+  assert.deepEqual(tiers.map((o) => o.label), ["1M", "2M", "5M"]);
 
-  // M5 时代存下来的「5M」档，在 M1 会员上既不在选项里也拿不到。
-  assert.equal(choiceFor({ kind: "modified", tokens: 5_096_890 }), 1_096_890,
-    "加档没归位——预算会按一个买不到的窗口算，而卡片高亮回退到第 0 格");
-  assert.equal(choiceFor({ kind: "modified", tokens: 1_096_890 }), 1_096_890, "买得到的那一档原样生效");
-  assert.equal(choiceFor(null), 0);
+  // 解析：选中的档位原样还原；会员降档后落回当时买得到的最大档；会员没了就不生效。
+  const tierFor = (rec, tierMax) => load("_ctxTierChoice", {
+    ...base,
+    _michaelUser: tierMax ? { michael_compression: { max_input_tokens: tierMax } } : null,
+    _ctxChoiceRecord: () => rec,
+  })("m");
+  assert.equal(tierFor({ kind: "tier", tokens: 5_000_000 }, 5_000_000), 5_000_000);
+  assert.equal(tierFor({ kind: "tier", tokens: 5_000_000 }, 1_000_000), 1_000_000, "会员降档 → 落回买得到的");
+  assert.equal(tierFor({ kind: "tier", tokens: 5_000_000 }, 0), 0, "会员没了 → 档位不生效");
+  assert.equal(tierFor(null, 5_000_000), 0);
+  // 老记录（原生 + 档位）就地还原成档位本身，不会被当成一个巨大的窗口。
+  assert.equal(tierFor({ kind: "modified", tokens: 2_096_890 }, 5_000_000), 2_000_000, "老格式没还原");
+});
+
+test("窗口那条轴只认窗口——档位混进来就会变成那个合成数", () => {
+  const base = {
+    _modelContextLimit: () => 96_890,
+    _ctxNativeDefault: () => 96_890,
+    _nativeWindowsFor: () => [1_000_000, 262_144, 96_890],
+    _modelCatalogEntry: () => ({ contextLimit: 96_890 }),
+  };
+  const win = (rec) => load("_ctxChoiceFor", { ...base, _ctxChoiceRecord: () => rec })("m");
+  assert.equal(win({ kind: "native", tokens: 262_144 }), 262_144, "选中的窗口没生效");
+  assert.equal(win({ kind: "tier", tokens: 2_000_000 }), 0, "选档位时窗口该保持默认");
+  assert.equal(win({ kind: "native", tokens: 777_777 }), 0, "目录不再列出的窗口要退回默认");
+  assert.equal(win(null), 0);
+  // 老格式：收窄仍算窗口；"原生+档位"那种只算档位（窗口回默认）。
+  assert.equal(win({ kind: "modified", tokens: 50_000 }), 50_000, "老的收窄记录不能丢");
+  assert.equal(win({ kind: "modified", tokens: 2_096_890 }), 0);
 });
 
 test("上下文滑块的绑定不许待在「这个模型支持思考深度」的分支里", () => {
