@@ -7386,6 +7386,42 @@ test("dynamic time and bulky file context stay out of the cached system prefix",
   assert.match(SRC, /entries\.filter\(\(en\) => !en\.is_dir\)\.slice\(0, 3\)/);
 });
 
+test("换着工具找同一个不存在的东西，也算原地打转", () => {
+  // 用户实拍：view_image image.png 读不到 → 接着 find `**/image*.png` 无匹配 →
+  // 再换别的工具。两次是**不同的调用**、各失败一次，所以按签名计数的那道闸（同一调用
+  // 连失败 3 次）一次都没响，模型就一直换工具找同一个根本不存在的文件，烧掉 205k token。
+  const loop = stripJsComments(extractFn("_runAgenticLoop"));
+  assert.match(loop, /const spinTarget = \(\(\) => \{/,
+    "没有记录这次调用冲着哪个目标去——就没法识别跨工具追同一个东西");
+  // 归一化必须去掉目录和通配符，否则 "image.png" 和 "**\/image*.png" 对不上，等于没做。
+  assert.match(loop, /replace\(\/\[\*\?\\\[\\\]\]\/g, ""\)/,
+    "目标名没去掉通配符，两次调用永远对不上");
+  assert.match(loop, /targetFailSigs\[e\.spinTarget\] \|\|= new Set\(\)/,
+    "要按「同一目标上失败过的**不同**调用数」计数，不是按次数");
+  // 必须钉在**触发条件**那一行：只查字符串存在会被文案分支里的同一句话骗过去
+  //（第一次写这条断言就是这么漏的）。
+  assert.match(loop, /dupReads >= 2 \|\| maxTargetToolFails >= 2/,
+    "触发条件里没有这一项，闸门还是不会响——文案写得再好也永远不会被用到");
+  // 文案要说清是「这东西不存在」，泛泛喊「别打转」它会再换第三个工具找同一个文件。
+  assert.match(loop, /都没找到「\$\{stuckTarget\}」/);
+  assert.match(loop, /根本不存在/);
+  assert.match(loop, /停止换工具找它/);
+});
+
+test("有专用工具的事就别走终端——撞上时当场说，而不是写在常驻提示词里", () => {
+  // 用户原话：「该用什么就用什么，而不是有能用的工具就一直走终端，然后终端命令也
+  // 输入不对导致报错」。查过：撞上这件事时整个仓库没有任何一处提醒过模型。
+  // 行为断言在 Rust 侧（shell_shadows_tool_advice 的两条测试）；这里只钉住"它真的接在
+  // 命令结果上"，以及"提示只加在结果里、没有塞进每轮都发的提示词"。
+  const tasks = readFileSync(new URL("../src-tauri/src/tasks.rs", import.meta.url), "utf8");
+  assert.match(tasks, /fn shell_shadows_tool_advice/);
+  assert.match(tasks, /if let Some\(tip\) = shell_shadows_tool_advice\(&command\)/,
+    "写了函数却没接到命令结果上，等于没做");
+  for (const tool of ["read_file", "list_dir", "search", "find_files", "edit_file", "web_fetch"]) {
+    assert.ok(tasks.includes(tool), `提示里没点名 ${tool}`);
+  }
+});
+
 test("harness 以「用户」身份塞进去的每一条，都必须戴编排信封", () => {
   // 这是今天被实拍到四次的同一个病根。провider 兼容性逼得这些注入只能用 role:"user"，
   // 于是它们长得就像用户刚说的话，而且**排在用户真正的请求后面**（最后一位是注意力最高的
@@ -22446,6 +22482,75 @@ test("_freshBuildFailure finds a declared verification that exited nonzero at th
     { purpose: "run", command: "node crawler.js", exitCode: 1, implementationVersion: 3 },
   ] }, 3), null);
   assert.equal(fresh({}, 1), null);
+});
+
+// ── 「改完就说能用」：把事实摆到眼前 ──────────────────────────────────────
+//
+// 用户原话：「开发项目也不管能不能用，也不知道用测试文件写测试之类、或者终端之类方式进行
+// 测试，就给用户说能用」。harness 其实一直记着 code_delivered_unverified，但它唯一的出口是
+// 一个可选的建议按钮 —— 屏幕上没有任何东西反驳模型那句"能用了"。
+//
+// 刻意**不**做的事：不强迫再跑一轮。"没验证"观测到的是缺席，缺席不等于工作是坏的（改动很小、
+// 项目没有构建系统、用户明说别跑，都是正当理由）。所以只陈述事实，判断留给人 —— 但事实必须
+// 摆在他眼前，而且同一行也要喂回给模型，否则它下一轮照样这么干。
+test("交付事实来自执行记录，不做任何推断", () => {
+  const facts = load("_deliveryFactsLine", {
+    _CODE_FILE_RE: loadConst("_CODE_FILE_RE"),
+    _looksLikeTestFile: load("_looksLikeTestFile"),
+    _deliveryFacts: load("_deliveryFacts", {
+      _CODE_FILE_RE: loadConst("_CODE_FILE_RE"),
+      _looksLikeTestFile: load("_looksLikeTestFile"),
+    }),
+  });
+  const ev = (command, exitCode, verifierRecognized) => ({ command, exitCode, verifierRecognized });
+
+  assert.match(
+    facts({ _mutatedFiles: new Set(["src/app.ts", "src/db.ts"]), _executionEvidence: [] }),
+    /改了 2 个源码文件 · 本轮没有跑过任何命令 · 没有新增或改动测试文件/,
+    "改了代码却一条命令都没跑 —— 这正是「说能用」最该被核对的那一轮",
+  );
+  assert.match(
+    facts({ _mutatedFiles: new Set(["src/app.ts"]), _executionEvidence: [ev("ls", 0, false)] }),
+    /跑过 1 条命令，但没有一条被识别为验证/,
+    "跑了 ls 不等于验证过 —— 这两件事必须分开说",
+  );
+  assert.match(
+    facts({ _mutatedFiles: new Set(["src/app.ts", "src/app.test.ts"]), _executionEvidence: [ev("npm test", 0, true)] }),
+    /验证 `npm test` 退出 0 · 测试文件 1 个/,
+  );
+  assert.match(
+    facts({ _mutatedFiles: new Set(["src/a.ts"]), _executionEvidence: [ev("pytest", 1, true)] }),
+    /退出 1/,
+    "验证失败要照实说退出码，不能只说「验证过」",
+  );
+  // 没动代码就没什么可核对的，不制造噪音。
+  assert.equal(facts({ _mutatedFiles: new Set(["README.md"]), _executionEvidence: [] }), "");
+});
+
+test("测试文件识别覆盖各语言主流约定，宁可漏判不可误判", () => {
+  // 误判成"写了测试"比漏判更糟：那正好把这条事实变成一句假话，而这块东西存在的意义
+  // 就是不让"说能用"变成没人核对的话。
+  const isTest = load("_looksLikeTestFile");
+  for (const p of ["src/app.test.ts", "a/b.spec.js", "tests/test_db.py", "x/foo_test.py",
+                   "pkg/x_test.go", "src/FooTest.java", "src/BarSpec.kt", "spec/user_spec.rb",
+                   "__tests__/a.js", "e2e/login.ts", "cypress/x.js"]) {
+    assert.equal(isTest(p), true, `${p} 应该算测试文件`);
+  }
+  for (const p of ["src/app.ts", "src/latest.py", "src/contest.go", "lib/protest.rb", "README.md", ""]) {
+    assert.equal(isTest(p), false, `${p} 不该被当成测试文件`);
+  }
+  // Windows 反斜杠路径也要认。
+  assert.equal(isTest("src\\tests\\a.ts"), true);
+});
+
+test("这条事实要同时送到用户眼前和模型手里", () => {
+  assert.match(SRC, /_appendDeliveryFactsBar\(body, run\);/,
+    "答案下面没有这一行 —— 用户看不到，「说能用」就永远没人核对");
+  assert.match(SRC, /parts\.push\(`本轮交付事实（执行记录，非推断）: \$\{facts\}`\)/,
+    "没喂回模型 —— 它下一轮照样改完就说能用");
+  // 没验证时要看得出来（样式上区分），但不是弹窗、不是拦截。
+  assert.match(SRC, /turn-facts--unverified/);
+  assert.match(APP_CSS, /\.turn-facts--unverified \{/);
 });
 
 test("一条绿命令只能替它自己作证，盖不住另一条命令的红", () => {
