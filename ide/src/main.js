@@ -14252,7 +14252,7 @@ async function showProfile() {
       <span class="pf-close" id="pfClose">&times;</span>
     </div>
     <div class="pf-body">
-      ${metric("小时额度", usd(u.quota_window_cents), pct(u.quota_window_cents, u.quota_window_cap_cents), "每 5.5 小时刷新 · 下次 " + fmtT(u.quota_window_reset_at), false)}
+      ${metric("小时额度", usd(u.quota_window_cents), pct(u.quota_window_cents, u.quota_window_cap_cents), "每 30 分钟刷新 · 下次 " + fmtT(u.quota_window_reset_at), false)}
       ${metric("周额度", weeklyTxt, u.quota_weekly_cap_cents > 0 ? pct(Math.max(0, u.quota_weekly_cap_cents - u.quota_week_used_cents), u.quota_weekly_cap_cents) : 100, u.quota_weekly_cap_cents > 0 ? ("本周已用 " + usd(u.quota_week_used_cents)) : "本套餐无周上限", false)}
       ${metric("总额度", usd(u.quota_total_cents), pct(u.quota_total_cents, planTotals[u.plan] || u.quota_total_cents || 1), active ? ("会员到期 " + fmtT(u.plan_expires_at)) : "未开通会员", false)}
       ${metric("钱包额度", usd(u.credits_cents), 100, "不受套餐限制 · 随时可用" + (active ? "（会员额度用尽后启用）" : ""), true)}
@@ -36448,6 +36448,58 @@ function _runRootConfirmedEmptyForImplementation(run, root = "") {
   return matches(run._emptyWorkspaceRootsAtStart) || matches(run._emptyWorkspaceRoots);
 }
 
+/** 这次调用是不是「引入一项新技术」——加依赖、或从零铺一个项目。 */
+function _introducesNewTech(call) {
+  if (!call) return false;
+  const type = String(call.type || "");
+  if (type === "createproject" || type === "web_scaffold" || type === "game_scaffold") return true;
+  // 依赖清单：改它就等于在选技术栈。
+  const p = String(call.path || "").replace(/\\/g, "/").toLowerCase();
+  const name = p.slice(p.lastIndexOf("/") + 1);
+  const MANIFESTS = new Set([
+    "package.json", "requirements.txt", "pyproject.toml", "cargo.toml", "go.mod",
+    "gemfile", "composer.json", "pubspec.yaml", "build.gradle", "build.gradle.kts",
+    "pom.xml", "package-swift", "package.swift", "podfile", "mix.exs",
+  ]);
+  if (!MANIFESTS.has(name)) return false;
+  // 只有**新增**才算选型；删依赖、改版本号不需要重新调研。
+  const added = String(call.content ?? call.new_string ?? "");
+  return added.length > 0;
+}
+
+/**
+ * 「选技术之前先去外面看一眼」——这条是真闸门，一个 run 只拦一次。
+ *
+ * 用户原话："写项目只管写，也不判断写的是不是主流技术、写的到底合理不" /
+ * "先调研项目、技术社区、GitHub、开发者社区"。
+ *
+ * 本地取证门（_implementationMutationGroundingIssue）要求的是"先读懂**这个**项目"，
+ * 它回答不了"这个包存不存在、还有没有人维护、是不是这件事的主流做法"。而模型编一个不存在
+ * 的依赖、或者挑一个三年没更新的库，恰恰是最常见也最贵的一类错——它一路写下去，
+ * 直到装不上或跑不起来才暴露。
+ *
+ * 判据是**执行事实**，不是意图：本轮有没有真的调用过外部调研工具。没有就拦一次，说清要查什么。
+ * 一个 run 只拦一次（run._techResearchStopUsed）：这是提醒，不是路障，绝不能变成死循环。
+ */
+function _newTechResearchIssue(run, call) {
+  if (!run || run.mode !== "agent" || run._techResearchStopUsed) return "";
+  if (!_introducesNewTech(call)) return "";
+  const RESEARCH = new Set([
+    "package_search", "package_source", "github_search", "github_repo",
+    "developer_community_search", "stackoverflow_search", "hackernews_search",
+    "web", "websearch", "search_tools", "knowledge",
+  ]);
+  const used = Array.isArray(run._toolTypesUsed) ? run._toolTypesUsed : [];
+  if (used.some((t) => RESEARCH.has(String(t)))) return "";
+  return "[BLOCKED_TECH_RESEARCH] 这一步在**选技术**（新建项目 / 往依赖清单里加东西），"
+    + "而本轮还没有做过任何外部调研。\n"
+    + "先花一次调用确认三件事，再回来写：\n"
+    + "· 这个包/框架**真的存在**、名字拼对了 —— package_search 或 package_source\n"
+    + "· 它现在**还有人维护**、版本是活的 —— github_repo / package_search\n"
+    + "· 这件事**主流是怎么做的**，有没有更合适的选择 —— developer_community_search / web_search\n"
+    + "查完直接继续，不用再问我。";
+}
+
 function _implementationMutationGroundingIssue(run, call, root = "") {
   if (!run || run.mode !== "agent" || !_implementationGroundingCandidate(call)) return "";
   const profile = run.engineering || {};
@@ -48239,6 +48291,24 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
         // Preserve ordered dependency semantics, but treat investigation quality as
         // advice. Pending probes and missing evidence never replace a real tool result.
         if (!it._eagerEntry && !_isMergedToolItem(it)) {
+          // 选技术之前先去外面看一眼。这条是**真拦**（一个 run 只一次），不是提示：
+          // 本地取证门回答不了"这个包存不存在、还有没有人维护、是不是主流做法"，
+          // 而编一个不存在的依赖会一路写下去，直到装不上才暴露。
+          const techIssue = _newTechResearchIssue(run, it.call);
+          if (techIssue) {
+            run._techResearchStopUsed = true;
+            const blocked = {
+              type: it.call.type, path: it.call.path || "", ok: false,
+              failure: { code: "tech_research" }, content: techIssue,
+            };
+            it.rawResult = blocked;
+            if (!it.step) {
+              it.step = _createToolStep({ ...it.call, _toolName: it.tc.name });
+              body.appendChild(it.step);
+            }
+            _settleToolStep(it.step, blocked, "先查一下再选");
+            return _toolMsgForModel(it.call, blocked);
+          }
           const batchBlock = _implementationMutationBatchBlockResult(run, items, index)
             || _commandBatchBlockResult(run, items, index);
           if (batchBlock) {
@@ -48732,6 +48802,12 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
             ? `read:${meta.canonicalPath}:${meta.signature}:${meta.from}-${meta.to}`
             : `${_stableToolCallSignature(it.call)}@${_resultFingerprint(it.rawResult?.content || "")}`;
           if (!_evidenceSeen.has(evidenceKey)) { _evidenceSeen.add(evidenceKey); _novelEvidenceCount++; }
+        }
+        // 本轮真正**成功调用过**哪些工具类型。技术调研门读它 —— 判据必须是执行事实，
+        // 不是模型说自己查过。
+        if (_ok && t) {
+          run._toolTypesUsed = Array.isArray(run._toolTypesUsed) ? run._toolTypesUsed : [];
+          if (!run._toolTypesUsed.includes(t)) run._toolTypesUsed.push(t);
         }
         if ((t === "edit" || t === "multiedit") && _ok) didEdit = true;
         // Model-initiated verification is credited only after settlement stamped a

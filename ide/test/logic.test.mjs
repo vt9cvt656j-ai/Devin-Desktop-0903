@@ -22653,6 +22653,54 @@ test("screen.capture 端到端接通：白名单、目录、图像通道", () =>
 // 用户原话："一下丢好几个命令然后报错好几个……错了就及时思考用不用停止还是继续，不然就很蠢。"
 // 已有的批次闸门只覆盖"会改工作区"的命令（purpose=mutate/scaffold 或判成 workspace-write），
 // 构建 / 测试 / 运行 / 安装这些最常见、也最容易连环失败的全不在内。
+// ── 选技术之前先去外面看一眼 ─────────────────────────────────────────────
+//
+// 用户原话："写项目只管写，也不判断写的是不是主流技术、写的到底合理不" /
+// "先调研项目、技术社区、GitHub、开发者社区"。
+//
+// 本地取证门（_implementationMutationGroundingIssue）要求的是"先读懂**这个**项目"，它回答不了
+// "这个包存不存在、还有没有人维护、是不是这件事的主流做法"。而模型编一个不存在的依赖、
+// 或挑一个三年没更新的库，会一路写下去，直到装不上才暴露——那时候已经写了一堆。
+test("加依赖 / 建项目之前必须真的做过外部调研", () => {
+  const issue = load("_newTechResearchIssue", { _introducesNewTech: load("_introducesNewTech") });
+  const agent = (used) => ({ mode: "agent", _toolTypesUsed: used });
+
+  const blocked = issue(agent([]), { type: "edit", path: "/p/package.json", new_string: '"axios":"^1"' });
+  assert.ok(blocked, "往依赖清单里加东西 = 在选技术，而本轮一次外部调研都没做");
+  assert.match(blocked, /真的存在/);
+  assert.match(blocked, /还有人维护/);
+  assert.match(blocked, /主流是怎么做的/);
+  assert.match(blocked, /不用再问我/, "要让它查完直接继续，别把闸门变成一次提问");
+
+  // 判据是**执行事实**：真的调用过外部调研工具才算。
+  assert.equal(issue(agent(["package_search"]), { type: "edit", path: "/p/package.json", content: "x" }), "");
+  assert.equal(issue(agent(["developer_community_search"]), { type: "edit", path: "r/requirements.txt", content: "x" }), "");
+  assert.ok(issue(agent(["read", "list"]), { type: "edit", path: "go.mod", content: "x" }),
+    "只读了本地文件不算调研——本地取证回答不了「这个包存不存在」");
+
+  // 各语言的依赖清单都算；从零建项目也算。
+  for (const p of ["package.json", "requirements.txt", "Cargo.toml", "go.mod", "pyproject.toml", "composer.json"]) {
+    assert.ok(issue(agent([]), { type: "edit", path: `x/${p}`, content: "dep" }), `${p} 没被认成依赖清单`);
+  }
+  assert.ok(issue(agent([]), { type: "createproject", name: "x" }));
+  assert.ok(issue(agent([]), { type: "web_scaffold" }));
+
+  // 不该拦的：改普通源码、删依赖（没有新增内容）、一个 run 已经拦过一次、非 agent 轮。
+  assert.equal(issue(agent([]), { type: "edit", path: "src/app.ts", new_string: "x" }), "");
+  assert.equal(issue(agent([]), { type: "edit", path: "package.json" }), "", "没有新增内容就不是选型");
+  assert.equal(issue({ mode: "agent", _techResearchStopUsed: true }, { type: "edit", path: "package.json", content: "x" }), "");
+  assert.equal(issue({ mode: "chat" }, { type: "edit", path: "package.json", content: "x" }), "");
+});
+
+test("技术调研门真的接进了执行链，而且台账记的是执行事实", () => {
+  assert.match(SRC, /const techIssue = _newTechResearchIssue\(run, it\.call\);/,
+    "没接进去就又是一个零调用点，而测试照样全绿");
+  assert.match(SRC, /run\._techResearchStopUsed = true;/, "一个 run 只拦一次，绝不能变成死循环");
+  // 台账只记**成功**的调用：模型说自己查过不算数。
+  assert.match(SRC, /if \(_ok && t\) \{[\s\S]{0,220}run\._toolTypesUsed\.push\(t\)/,
+    "工具使用台账没记，或者把失败的调用也记了");
+});
+
 test("同一轮里前面的命令失败，后面的命令不许再跑", () => {
   const block = load("_commandBatchBlockResult", {
     // 忠实于真函数：`if (!call || !result) return false` —— 没有结果算**失败**。
