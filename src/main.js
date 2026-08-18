@@ -34711,13 +34711,25 @@ function _resumeHandoffBlock(session) {
 
     const done = steps.filter((x) => x?.status === "completed").map((x) => String(x.content || "").slice(0, 90));
     const todo = open.map((x) => String(x.content || "").slice(0, 90));
-    const lines = ["〔上一轮没有跑完，这一轮是接着上次继续——不是新任务〕"];
+    // 这段**只是上一轮的残留状态**，不是本轮的指令。
+    //
+    // 它以前的开头是「这一轮是接着上次继续——不是新任务」，并接着说「直接从第一个未完成的
+    // 步骤接着做」。那是在用户开口之前就替他把这一轮定了性。用户实拍：上一轮让它做诊断、
+    // 它列了 10 个问题在等决定（于是留下未完成步骤），下一轮用户问的是「我的项目是干嘛用的」，
+    // 模型却回了一份"上一轮已交付诊断报告，现在等你决定：要立即修/要看某条/……"的菜单——
+    // 问什么答什么这件最基本的事，被这段话顶掉了。
+    //
+    // 残留该留，判断权要还给用户这次说的话。
+    const lines = ["〔上一轮没跑完，留下这些——这是背景，不是本轮要做的事〕"];
     if (last?.task) lines.push(`上次在做：${String(last.task).slice(0, 200)}`);
     if (last?.incompleteReason) lines.push(`中断在：${String(last.incompleteReason).slice(0, 160)}`);
-    if (done.length) lines.push(`已完成的步骤（别重做）：${done.slice(-8).join("、")}`);
-    lines.push(`还没做的步骤（照这份走，别重新规划）：${todo.slice(0, 8).join("、")}`);
-    lines.push("直接从第一个未完成的步骤接着做。已经读过的文件见下面的证据账本——"
-      + "文件没变就用已有结论，不要重新 search 定位、也不要整份重读；只有确实缺某段原文时才按范围精读。");
+    if (done.length) lines.push(`已完成的步骤（真要接着做的话别重做）：${done.slice(-8).join("、")}`);
+    lines.push(`还没做的步骤：${todo.slice(0, 8).join("、")}`);
+    lines.push("本轮做什么，一律以下面 📌 里用户这次说的话为准：");
+    lines.push("· 他这次就是要接着做 → 从第一个未完成的步骤继续，别重新规划；"
+      + "已经读过的文件见下面的证据账本，文件没变就用已有结论，不要重新 search 定位、也不要整份重读。");
+    lines.push("· 他这次问的、要的是别的事 → 就回答/去做他现在要的那件。"
+      + "这些残留留着不动，别拿它顶掉他的话，也别反过来问他「要不要继续上次那个」。");
     return lines.join("\n");
   } catch { return ""; }
 }

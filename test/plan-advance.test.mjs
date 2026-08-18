@@ -136,10 +136,28 @@ const PLAN = [
 
 test("中断之后要把计划和进度交接给模型——不然它只能重新规划", () => {
   const out = resumeBlock()({ _planSteps: PLAN, _lastRunState: { outcome: "partial", task: "把卡片做完", incompleteReason: "用户中断" } });
-  assert.match(out, /接着上次继续——不是新任务/);
-  assert.match(out, /已完成的步骤（别重做）：读取现有实现、补上隔离/);
-  assert.match(out, /还没做的步骤（照这份走，别重新规划）：给失败分支补卡片、跑完整测试/);
+  assert.match(out, /上次在做：把卡片做完/);
+  assert.match(out, /中断在：用户中断/);
+  assert.match(out, /已完成的步骤（真要接着做的话别重做）：读取现有实现、补上隔离/);
+  assert.match(out, /还没做的步骤：给失败分支补卡片、跑完整测试/);
   assert.match(out, /不要重新 search 定位、也不要整份重读/, "没有明说别重读，它就会重读");
+});
+
+test("残留计划不许替用户把这一轮定性成「接着上次做」", () => {
+  // 用户实拍：上一轮让它诊断，它列了 10 个问题在等决定（于是留下未完成步骤）；
+  // 下一轮用户问「我的项目是干嘛用的」，模型回的却是"上一轮已交付诊断报告，现在等你
+  // 决定：要立即修 / 要看某条 / ……"——问什么答什么这件最基本的事被这段话顶掉了。
+  const out = resumeBlock()({ _planSteps: PLAN, _lastRunState: { outcome: "partial", task: "把卡片做完" } });
+  assert.doesNotMatch(out, /这一轮是接着上次继续/,
+    "又在用户开口之前替他把这一轮定性了——他这次问别的，就会被顶掉");
+  assert.doesNotMatch(out, /直接从第一个未完成的步骤接着做。/,
+    "无条件命令它接着做，等于覆盖用户这次真正说的话");
+  assert.match(out, /这是背景，不是本轮要做的事/);
+  assert.match(out, /本轮做什么，一律以下面 📌 里用户这次说的话为准/,
+    "必须把判断权交回给用户这次说的话");
+  assert.match(out, /他这次问的、要的是别的事 → 就回答\/去做他现在要的那件/);
+  assert.match(out, /别反过来问他「要不要继续上次那个」/,
+    "不写这句，它就会用一份选项菜单反问，而不是回答问题");
 });
 
 test("正常收尾之后开的新任务，不能被上一轮的旧计划粘住", () => {
