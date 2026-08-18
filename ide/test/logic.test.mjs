@@ -5532,8 +5532,16 @@ test("context pressure may be estimated while billing settles off the model-turn
   assert.ok(estRequest(l0Messages, tinyTools) < estRequest(fullMessages, staticTools) / 50);
   assert.match(SRC, /let _lastRequestEstimateTokens = 0/);
   assert.match(SRC, /_lastRequestEstimateTokens = _estRequestTokens\(_l0Msgs, _l0Tools\)/);
-  assert.match(SRC, /_setContextMeter\(\{ promptTokens: _lastRequestEstimateTokens, completionTokens: 0, cachedTokens: null, estimated: true, source: "prepared" \}\)/,
-    "估算态的缓存必须是 null（未上报），不能渲染成误导排查的「缓存 0」");
+  // 这一行原来断言"发请求前把估算画到仪表上"。用户实拍那正是「一发消息上下文就重置回 0」，
+  // 并明确要求「不要估算 全部都走真实的」——所以估算**不再进入仪表**，判据也跟着反过来：
+  // 估算只服务请求预算（上面 _enforceModelRequestBudget 用的就是它），一个像素都不许画。
+  assert.doesNotMatch(
+    SRC.replace(/\/\/[^\n]*/g, ""),
+    /_setContextMeter\(\{ promptTokens: _lastRequestEstimateTokens/,
+    "估算又被画到上下文仪表上了",
+  );
+  assert.match(SRC, /promptTokens: 0, completionTokens: 0, cachedTokens: null, estimated: true, source: "pending"/,
+    "一次都没上报过时要如实空着——缓存写 null（未上报），不能渲染成误导排查的「缓存 0」");
   assert.match(SRC, /const settlementTask = \(async \(\) => \{[\s\S]{0,120}await _fetchGatewaySettlement\(_turnConfig, _turnReqId\)/);
   assert.match(SRC, /if \(Array\.isArray\(settlementTasks\)\) settlementTasks\.push\(settlementTask\);[\s\S]{0,60}else await settlementTask;/,
     "agent loops should track settlements without blocking the next tool/model turn");
@@ -5556,7 +5564,9 @@ test("token cache meter is a persistent context ring beside the composer voice b
   assert.match(SRC, /const _CONTEXT_RING_WARN_PCT = 65/);
   assert.match(SRC, /const _CONTEXT_RING_DANGER_PCT = 85/);
   assert.match(SRC, /_refreshContextMeterFromDraft\(\{ force: true \}\)/);
-  assert.match(SRC, /_setContextMeter\(\{ promptTokens: pin, completionTokens: out, cachedTokens: hasCacheInfo \? cached : null, estimated: est/,
+  // `est` 那一支已经不再画仪表（用户要求「不要估算 全部都走真实的」），所以这里改成
+  // 断言真实那一支：仍然要区分「上游没报缓存字段」（null）与「真的是 0」。
+  assert.match(SRC, /_setContextMeter\(\{ promptTokens: pin, completionTokens: out, cachedTokens: hasCacheInfo \? cached : null, estimated: false, source: "真实 usage" \}\)/,
     "真实 usage 也要区分「上游没报缓存字段」与真 0");
   assert.match(SRC, /el\.style\.setProperty\("--cache-ring-offset", String\(Math\.max\(0, Math\.min\(100, 100 - ringPct\)\)\)\)/);
   // The ring carries the token count; the arc carries how full the window is. A percentage in
@@ -25370,6 +25380,74 @@ const ctxFn = (name, choice) => load(name, {
   ...ctxEnv(choice),
   _ctxNativeCeiling: load("_ctxNativeCeiling", ctxEnv(choice)),
   _ctxNativeDefault: load("_ctxNativeDefault", ctxEnv(choice)),
+});
+
+// ── 上下文仪表：只显示上游真实上报的数 ───────────────────────────────────
+//
+// 用户实拍：「这个上下文 我下次对话 上下文会立马重置从0开始」「上下文对话那里也不会实时更新」，
+// 随后明确要求：「不要估算 全部都走真实的，不要模拟计算」。
+//
+// 根因是每次发请求前 _setContextMeter 被无条件重画成**本地估算**。估算必然远小于真实值：
+// 它看不见网关注入的系统提示词，更关键的是 release 构建把工具描述整段剥空由网关按名回填
+// （strip-tool-ip），打包版里 JSON.stringify(tools) 只有真实体积的一小截。
+// **dev 构建不剥，所以这个 bug 在本地永远复现不出来。**
+//
+// 现在的规则只有一条：没有真数就不画数。代价要认：两次上报之间仪表就是不动——那段时间
+// 本来就没有任何真实数据，用算出来的数把它填上只是让它"看起来在动"。
+test("上下文仪表只吃上游真实上报的数，任何本地估算都不许画上去", () => {
+  const paints = [];
+  const env = { _setContextMeter: (x) => paints.push(x) };
+  const apply = load("_applyContextReading", env);
+  const paint = load("_setContextMeterFromReading", env);
+  const sess = {};
+
+  apply(sess, { input: 48_000, output: 900, requestId: "r1" });
+  paint(sess._ctxRealFloor, 0);
+  assert.equal(paints.at(-1).promptTokens, 48_000);
+  assert.equal(paints.at(-1).estimated, false, "真实上报不能被标成估算");
+
+  // 读数里不许再出现任何"发出时的估算"之类的字段——那条增量链路整条撤掉了。
+  assert.equal(sess._ctxRealFloor.estAt, undefined, "estAt 是估算残留，不该再存在");
+  assert.equal(sess._ctxEstAtSend, undefined);
+
+  // 打字不改变这个数：草稿的 token 是估出来的，要到下一次真实上报才算数。
+  paint(sess._ctxRealFloor, 0);
+  assert.equal(paints.at(-1).promptTokens, 48_000, "草稿估算被叠上去了");
+});
+
+test("发请求前不许拿估算盖掉已有的真实读数——那就是「一发消息就重置」", () => {
+  const at = SRC.indexOf("_lastRequestEstimateTokens = _estRequestTokens(");
+  assert.ok(at > 0, "发送前那段改写了，这条守卫要跟着改");
+  const block = SRC.slice(at, at + 1600);
+  // 有真实读数 → 原样保持；一次都没上报过 → 如实空着，不拿算出来的数顶上。
+  assert.match(block, /if \(Number\(session\?\._ctxRealFloor\?\.total\) > 0\) \{[\s\S]{0,200}_setContextMeterFromReading\(session\._ctxRealFloor, 0\);/,
+    "又变回用估算重画了 —— 每发一条消息上下文就塌一次");
+  assert.match(block, /promptTokens: 0[\s\S]{0,80}source: "pending"/,
+    "没有真实读数时要如实空着，而不是显示一个算出来的数");
+  assert.doesNotMatch(
+    block.replace(/\/\/[^\n]*/g, ""),
+    /_setContextMeter\(\{ promptTokens: _lastRequestEstimateTokens/,
+    "估算又被画到仪表上了",
+  );
+});
+
+test("上游没上报的那轮，仪表宁可不动也不显示估算", () => {
+  const paints = [];
+  const record = load("_recordUsage", {
+    _setContextMeter: (x) => paints.push(x),
+    _applyContextReading: () => true,
+    _setContextMeterFromReading: (r) => paints.push({ real: true, promptTokens: r?.input }),
+    _currentSession: () => null,
+    _contextInputTokens: load("_contextInputTokens"),
+    _tok: { in: 0, out: 0, cached: 0, inWithCacheInfo: 0, anyCacheInfo: false, anyReal: false },
+    _lastReasoningTok: 0,
+    _lastThinkChars: 0,
+  });
+  record({ prompt_tokens: 900, completion_tokens: 10, estimated: true }, {});
+  assert.equal(paints.length, 0, "估算来源的用量事件不该画到上下文仪表上");
+  record({ prompt_tokens: 48_000, completion_tokens: 900, estimated: false }, {});
+  assert.equal(paints.length, 1, "真实上报要画");
+  assert.equal(paints[0].estimated, false);
 });
 
 test("没选过窗口时，按连接真正给的默认窗口记账，不是目录里最宽的那个", () => {

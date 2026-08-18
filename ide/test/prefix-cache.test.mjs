@@ -716,13 +716,18 @@ test("once the provider has reported, the local estimate is out of the loop", ()
   // Mixing them was the earlier design. A local assemble() sees neither the system prompt nor the
   // tool schemas nor what the gateway compressed away, so it can only distort a number that is
   // already exact — and it re-derived the whole transcript on a keystroke timer to do it.
+  // 这条原来断言"估算是兜底"。用户实拍那个兜底正是「一发消息上下文重置回 0」的来源，
+  // 并明确要求「不要估算 全部都走真实的」——所以估算不再是兜底，而是**整条被移出仪表**：
+  // 会话级估算器已删除，兜底改成如实空着。判据跟着从"顺序对不对"变成"它还在不在"。
   const refresh = grab("_refreshContextMeterFromDraft");
-  assert.match(refresh, /if \(Math\.max\(0, Number\(real\?\.total\) \|\| 0\) > 0\) \{[\s\S]*?_setContextMeterFromReading\(real, draftTokens\);\s*\n\s*return;/,
-    "a real reading paints the meter and returns before the estimator is consulted");
-  assert.ok(refresh.indexOf("_setContextMeterFromReading") < refresh.indexOf("_estimateActiveSessionContextTokens"),
-    "the estimate is the fallback, not the default");
-  assert.doesNotMatch(grab("_estimateActiveSessionContextTokens"), /_ctxRealFloor/,
-    "the estimator no longer reaches for the real reading at all");
+  assert.match(refresh, /_setContextMeterFromReading\(real, 0\);/,
+    "有真实读数就原样画它，且不许再叠草稿估算");
+  assert.doesNotMatch(refresh.replace(/\/\/[^\n]*/g, ""), /_estimateActiveSessionContextTokens|_estRequestTokens/,
+    "估算又回到仪表这条路上了");
+  assert.match(refresh, /source: "pending"/,
+    "一次都没上报过时要如实空着，而不是显示一个算出来的数");
+  assert.ok(!/function _estimateActiveSessionContextTokens\(/.test(SRC),
+    "会话级估算器没有消费者了，留着只会让人以为仪表还在用估算");
 });
 
 test("the percentage measures the window the model reads, so it can actually move", () => {
