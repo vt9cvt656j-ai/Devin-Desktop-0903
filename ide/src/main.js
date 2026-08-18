@@ -23125,6 +23125,12 @@ function _formatStackHint(s) {
   // 改成祈使句：验证是**模型自己的活**，而且说清"没人替你跑"。
   if (s.checkCmd) lines.push(`✅ 快速校验: \`${s.checkCmd}\`（编译/类型检查）——**改完必须你自己跑这条**，没有任何东西会替你自动跑。退出码就是结论。${_unverified(s.checkCmd)}`);
   if (s.testCmd) lines.push(`🧪 测试: \`${s.testCmd}\`——**改完必须你自己跑**，同样没人会替你跑，也不会有失败报告自动送到你面前。${_unverified(s.testCmd)}`);
+  // 有套件就说清位置。只给命令不给位置，模型就会在根目录另起一个脚本——实测如此。
+  if (s.testDir) {
+    lines.push(`📁 测试套件在 \`${s.testDir}/\`${s.testSubs?.length ? `（${s.testSubs.join(" / ")}）` : ""}`
+      + `——新测试**写进这个目录**、沿用它现有的组织方式和命名，不要在项目根目录另起 test_*.py / *_test.js 之类的散文件。`
+      + `临时验证用的一次性脚本可以随便写，但**用完必须删掉**，别留在仓库里。`);
+  }
   if (s.devCmd) lines.push(`🚀 启动 dev: \`${s.devCmd}\``);
   if (s.buildCmd) lines.push(`🔨 构建: \`${s.buildCmd}\``);
   if (s.lintCmd) lines.push(`🔧 lint: \`${s.lintCmd}\``);
@@ -23688,6 +23694,25 @@ async function _gatherAgentContext(query, sessionRoot) {
   const _keyReadsPromise = Promise.all(keyFiles.map(name =>
     backend.readTextFile(root + "/" + name).catch(() => null).then(c => c?.trim() ? [name, c] : null)
   ));
+  // 测试套件在**哪个目录**，和"用什么命令跑"是两件事，而以前只告诉了后者。
+  //
+  // 实证（用户的 ThesisX）：项目有标准 pytest 套件 tests/ + conftest.py + unit/ +
+  // integration/，模型却在**根目录**另起了 _temp_test.py / simple_test.py /
+  // run_final_test.py / verify_optimization.py，一个都没进 tests/，也一个都没删。
+  // 它不是不肯用套件——是从来没人告诉过它套件在哪。
+  const _testDirPromise = (async () => {
+    const cands = ["tests", "test", "__tests__", "spec", "src/test", "src/__tests__"];
+    for (const d of cands) {
+      try {
+        const entries = await backend.readDir(root + "/" + d);
+        if (Array.isArray(entries) && entries.length) {
+          const subs = entries.filter((e) => e?.is_dir).map((e) => e.name).slice(0, 4);
+          return { dir: d, subs };
+        }
+      } catch { /* 没这个目录 */ }
+    }
+    return null;
+  })().catch(() => null);
   const lockFiles = ["pnpm-lock.yaml", "yarn.lock", "bun.lock", "bun.lockb", "package-lock.json"];
   const _lockReadsPromise = Promise.all(lockFiles.map((name) =>
     backend.readTextFile(root + "/" + name).then(() => name).catch(() => null)));
@@ -23788,6 +23813,12 @@ async function _gatherAgentContext(query, sessionRoot) {
   // Stack hints FIRST (high-priority, model sees it before raw file dumps).
   const stack = _extractStackHints(fileMap);
   if (stack.lang) _projectStacks.set(root, { ...stack, root }); else _projectStacks.delete(root);
+  // 套件位置紧跟在栈提示后面：它回答的是"新测试写到哪去"，而 testCmd 只回答"怎么跑"。
+  const _testDir = await _testDirPromise;
+  if (_testDir) {
+    stack.testDir = _testDir.dir;
+    stack.testSubs = _testDir.subs;
+  }
   const stackHint = _formatStackHint(stack);
   if (stackHint) {
     // Insert near the top, right after osBlock and workspace path.
@@ -41014,6 +41045,36 @@ function _deliveryFacts(run) {
   return { code, tests, ran: withCode, verifiers };
 }
 
+/**
+ * 这一轮新建的、**散在测试套件之外**的一次性验证脚本。
+ *
+ * 交付律里早就写着"临时脚本用完删掉"，但从来没有任何东西核对过。实证（用户的 ThesisX）：
+ * 项目有标准 pytest 套件 tests/，模型却在根目录留下 _temp_test.py / simple_test.py /
+ * run_final_test.py / verify_optimization.py / benchmark_performance.py，一个都没删。
+ * 中转站那边留了 test_api.py、RETRY_DEMO.md。
+ *
+ * 规则写得对，缺的是**观测者**——今天修的每一个 bug 都是这个形状。
+ *
+ * 只列出来交给模型自己收，不替用户删文件：删是不可逆的，而"看着像临时脚本"永远是启发式。
+ */
+function _strayScratchFiles(run, testDir) {
+  const mutated = [...(run?._mutatedFiles || [])].map(String);
+  const suite = String(testDir || "").replace(/^\/+|\/+$/g, "");
+  return mutated.filter((p) => {
+    const rel = p.replace(/^\/+/, "");
+    // 已经在套件里的不算——那正是我们希望它写的地方。
+    if (suite && (rel === suite || rel.startsWith(suite + "/"))) return false;
+    const base = rel.split("/").pop() || rel;
+    // 一次性验证脚本的常见长相：测试/验证/基准/临时/调试。宁可漏判不可误判——
+    // 误判会催模型去删真正的源码文件。
+    return /^(_?temp|tmp)[-_.]/i.test(base)
+      || /^(test|spec)[-_.]/i.test(base)
+      || /[-_.](test|spec)\.[a-z]+$/i.test(base)
+      || /^(verify|check|benchmark|bench|debug|demo|scratch|try)[-_.]/i.test(base)
+      || /^run_.*test/i.test(base);
+  });
+}
+
 function _deliveryFactsLine(run) {
   const { code, tests, ran, verifiers } = _deliveryFacts(run);
   if (!code.length) return "";           // 没动代码就没什么可核对的
@@ -41027,6 +41088,11 @@ function _deliveryFactsLine(run) {
     parts.push("本轮没有跑过任何命令");
   }
   parts.push(tests.length ? `测试文件 ${tests.length} 个` : "没有新增或改动测试文件");
+  // 散落在套件之外的一次性脚本：说出来，别让它留在仓库里当垃圾。
+  const stray = _strayScratchFiles(run, _projectStacks.get(run?.root)?.testDir);
+  if (stray.length) {
+    parts.push(`另有 ${stray.length} 个疑似一次性脚本留在套件之外（${stray.slice(0, 4).join("、")}${stray.length > 4 ? " 等" : ""}）`);
+  }
   // 收尾评审的结论（_wrapUpCritic 读了真实 diff 之后的判断）。它**只陈述、不拦截**，
   // 所以放在这一行的末尾和别的事实并列 —— 用户一眼看到"评审说这段改动没实现你要的东西"，
   // 比看到模型自己说"已完成"有用得多。
@@ -44603,7 +44669,7 @@ function _agentDecisionFrameBlock(text, profile = _engineeringProfileWithAiInten
     //   ③「每一步先想」——每写一个文件之前想清楚要达成什么、影响谁、怎么验证。
     lines.push("交付规格律：默认按**完整可用**交付，不降级、不做演示版。禁止留 TODO/占位实现/假数据/写死分支充数，不省错误处理、边界情况、加载与空状态，不把多处调用改成只改一处。需求过大就拆成**有序的完整切片**逐个交付，每片都真能用——不是砍功能凑一个能跑的壳。ask_user 只在你真的读不懂用户要什么时才用（两种读法会导向完全不同的东西），不要拿它去问「要不要先做个简版」。已有代码沿用现存的分层、命名、错误处理和测试方式，不因为自己顺手就把别人的写法改烂或绕开。");
     lines.push("先读懂再动手律：改代码或加功能之前，先把这块真正读懂——依赖与版本、入口与启动方式、模块边界与调用方、现有约定，以及这个 bug 的**真实成因**（不是症状）。要改的文件必须先 read_file 读过，不靠记忆和猜测下手；读不到证据就先取证，别先写。读懂之后**反推一遍**：用户没说但这件事显然需要的、这次改动会牵连到的地方、以及读代码时顺手发现的其它真实缺陷——属于本次目标的直接做掉，超出范围的在收尾时一句话点出来，别装作没看见。改动落盘之后，先前读到的内容就过期了：要再用就重新读，不拿旧快照当现状，也不沿用已经被替换掉的老文件。");
-    lines.push("逐步思考律：每写一个文件、每走一步之前，先想清楚这一步要达成什么、会影响谁、怎么验证；写完立刻用真实结果（诊断/命令退出码/真实输出）验证再走下一步。一口气连写多个文件不验证，是本项目里出 bug 最多的方式。光看代码不算验证——现成的测试就跑现成的，没有就**自己写一个测试文件或临时脚本**去真跑一遍（覆盖正常路径和你刚碰过的边界），拿退出码和输出当证据。临时脚本用完删掉，真正有价值的测试留在项目里并说明放在哪。");
+    lines.push("逐步思考律：每写一个文件、每走一步之前，先想清楚这一步要达成什么、会影响谁、怎么验证；写完立刻用真实结果（诊断/命令退出码/真实输出）验证再走下一步。一口气连写多个文件不验证，是本项目里出 bug 最多的方式。光看代码不算验证——现成的测试就跑现成的，没有就**自己写一个测试文件或临时脚本**去真跑一遍（覆盖正常路径和你刚碰过的边界），拿退出码和输出当证据。**修 bug 时先写一个能复现它的测试**：先看着它红，再动手修，修完变绿才算数——没红过的测试证明不了你修的是这个 bug。新测试写进项目自带的测试目录、沿用它的组织方式，别在根目录另起散文件；一次性验证脚本用完**当轮就删掉**，别留在仓库里。**永远不许删掉或注释掉既有测试来让构建变绿**——那是把失败藏起来，不是修好；测试确实过时了就说明理由，让用户决定。");
     lines.push("项目工程律：所有项目任务默认工程级，不管大小都走最短可靠证据链。小改动=真实文件/诊断 → 最小改动 → 真实验证；项目级改动先建立项目地图（package/workspace、入口、脚本、服务、配置、CI、数据库、部署线索）、模块边界和现有约定，再动代码。");
     lines.push("变更半径律：动手前识别调用方、API/数据契约、状态/缓存/权限/跨服务影响；不全仓盲改，不一次性重写无关模块；按薄切片交付，每个切片都有可验证结果。验证矩阵按影响选择 unit/typecheck/lint/build/integration/e2e/contract/migration/smoke，命令输出和 exit code 才算证据。");
     lines.push("可维护升级律：任何项目默认要好维护、好升级：清晰目录/模块边界、配置/env 集中、类型/schema/接口明确、组件/服务可复用、扩展点可替换、测试与 README/用法说明齐全；禁止把业务规则、颜色、端口、密钥、路径和魔法值散落硬编码。");

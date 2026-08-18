@@ -179,9 +179,18 @@ function extractFn(name) {
 // by prose. extractFn returns comments verbatim, and the comments explaining a perf fix routinely
 // quote the very code the fix removed.
 function stripJsComments(source) {
+  // 顺序**必须**是先行注释、后块注释。反过来会出人命：
+  //
+  // 2026-08-17 实测，一条 `//` 注释里写着 glob `**\/AGENTS.md`，里面那个 `/` `*` 组合被
+  // 块注释正则当成开头，一口吞掉 **45,375 个字符**——那一整段代码在所有基于本函数的断言
+  // 眼里根本不存在。assert.match 静默变红（我就是这么撞上的），更糟的是 assert.doesNotMatch
+  // 会**静默变绿**：一条本该守着的禁令，在那片区域里等于没写。
+  //
+  // 先把整行 `//` 注释去掉，那个假开头就随行消失了。行注释正则前面的 `[^:]` 守着
+  // `https://` 这类真实字符串，不会误伤。
   return String(source)
-    .replace(/\/\*[\s\S]*?\*\//g, "")
-    .replace(/(^|[^:])\/\/[^\n]*/g, "$1");
+    .replace(/(^|[^:])\/\/[^\n]*/g, "$1")
+    .replace(/\/\*[\s\S]*?\*\//g, "");
 }
 // Build the real function with its module-level deps injected as parameters.
 let AUTO_LOAD_DEPS = Object.create(null);
@@ -22501,6 +22510,9 @@ test("交付事实来自执行记录，不做任何推断", () => {
       _CODE_FILE_RE: loadConst("_CODE_FILE_RE"),
       _looksLikeTestFile: load("_looksLikeTestFile"),
     }),
+    // 散落的一次性脚本也要清点：用真实现，桩会让"有没有清点"这件事在测试里失真。
+    _strayScratchFiles: load("_strayScratchFiles"),
+    _projectStacks: new Map(),
   });
   const ev = (command, exitCode, verifierRecognized) => ({ command, exitCode, verifierRecognized });
 
@@ -22525,6 +22537,91 @@ test("交付事实来自执行记录，不做任何推断", () => {
   );
   // 没动代码就没什么可核对的，不制造噪音。
   assert.equal(facts({ _mutatedFiles: new Set(["README.md"]), _executionEvidence: [] }), "");
+});
+
+test("剥注释的顺序不能反——一条注释里的 glob 曾经吞掉 45KB 代码", () => {
+  // 实测撞到的：`// 只有 **\/AGENTS.md 这类子包约定读不到` 这行注释里，glob 中的
+  // `/` `*` 被块注释正则当成开头，一口吞到下一个 `*/`，中间 45,375 个字符在所有
+  // 基于 stripJsComments 的断言眼里凭空消失。
+  //
+  // assert.match 会当场变红（还能发现），assert.doesNotMatch 会**静默变绿**——
+  // 一条本该守着的禁令，在那片区域里等于没写过。这才是真正危险的那一半。
+  const src = [
+    'const a = 1;',
+    '// 子包约定：**/AGENTS.md 这类文件读不到',
+    'const KEEP_ME = "not swallowed";',
+    '/* 真正的块注释 */',
+    'const b = 2;',
+  ].join("\n");
+  const out = stripJsComments(src);
+  assert.match(out, /KEEP_ME/, "glob 里的 /* 又把后面的代码吞掉了");
+  assert.match(out, /const b = 2;/);
+  assert.doesNotMatch(out, /真正的块注释/, "块注释还是要剥掉");
+  assert.doesNotMatch(out, /子包约定/, "行注释还是要剥掉");
+  // URL 里的 // 不许被当成注释——那会把整行代码剪掉。
+  assert.match(stripJsComments('const u = "https://x.test/a";'), /https:\/\/x\.test\/a/);
+});
+
+test("这一轮留下的一次性脚本要被清点出来——规则早就写了「用完删掉」，但没人核对", () => {
+  // 实证（用户的 ThesisX）：项目有标准 pytest 套件 tests/ + conftest.py + unit/ +
+  // integration/，模型却在**根目录**留下 _temp_test.py / simple_test.py /
+  // run_final_test.py / verify_optimization.py / benchmark_performance.py，
+  // 一个都没进套件、一个都没删。交付律里"临时脚本用完删掉"写了很久，问题是零观测。
+  const stray = load("_strayScratchFiles");
+  const run = (files) => ({ _mutatedFiles: new Set(files) });
+
+  const found = stray(run([
+    "_temp_test.py", "simple_test.py", "run_final_test.py",
+    "verify_optimization.py", "benchmark_performance.py", "debug_js.html",
+    "src/main.py",                 // 正经源码，不算
+    "tests/unit/test_parser.py",   // 已经在套件里，正是我们希望它写的地方
+  ]), "tests");
+  assert.ok(found.includes("_temp_test.py"));
+  assert.ok(found.includes("simple_test.py"));
+  assert.ok(found.includes("run_final_test.py"));
+  assert.ok(found.includes("verify_optimization.py"));
+  assert.ok(found.includes("benchmark_performance.py"));
+  assert.ok(!found.includes("src/main.py"), "把正经源码算成一次性脚本会催模型去删源码");
+  assert.ok(!found.includes("tests/unit/test_parser.py"),
+    "写进套件里的测试不该被清点——那正是我们希望它做的");
+
+  // 没有套件时，套件外这个条件退化成"全都算"，但仍然只认长得像一次性脚本的。
+  const noSuite = stray(run(["test_api.py", "app.py"]), "");
+  assert.deepEqual(noSuite, ["test_api.py"]);
+
+  // 清点结果必须真的出现在收尾那行事实里——只写函数不接线，等于没做。
+  const line = load("_deliveryFactsLine", {
+    _CODE_FILE_RE: loadConst("_CODE_FILE_RE"),
+    _looksLikeTestFile: load("_looksLikeTestFile"),
+    _deliveryFacts: load("_deliveryFacts", {
+      _CODE_FILE_RE: loadConst("_CODE_FILE_RE"),
+      _looksLikeTestFile: load("_looksLikeTestFile"),
+    }),
+    _strayScratchFiles: stray,
+    _projectStacks: new Map([["/proj", { testDir: "tests" }]]),
+  })({ root: "/proj", _mutatedFiles: new Set(["src/app.py", "_temp_test.py"]), _executionEvidence: [] });
+  assert.match(line, /疑似一次性脚本留在套件之外/,
+    "清点了却没接进收尾那行事实——用户永远看不到，模型也永远不知道该收");
+  assert.match(line, /_temp_test\.py/);
+});
+
+test("有测试套件就要告诉模型它在哪——只给命令不给位置，它就在根目录另起散文件", () => {
+  const fmt = load("_formatStackHint");
+  const withSuite = fmt({ lang: "Python", testCmd: "pytest", testDir: "tests", testSubs: ["unit", "integration"] });
+  assert.match(withSuite, /测试套件在 `tests\/`/, "没告诉模型套件在哪");
+  assert.match(withSuite, /unit \/ integration/, "子目录也要说，它才知道往哪一层放");
+  assert.match(withSuite, /不要在项目根目录另起/, "不写死这句，它照样在根目录建 test_xxx.py");
+  assert.match(withSuite, /用完必须删掉/, "一次性脚本的回收要和套件位置一起说");
+  // 没探测到套件时不要硬编一句——那会变成假信息。
+  assert.doesNotMatch(fmt({ lang: "Python", testCmd: "pytest" }), /测试套件在/);
+
+  // 上下文构建那一侧：探测到了要真写进 stack，否则上面这段文案永远不会被触发。
+  // 这一段在异步上下文组装里，抠不出纯函数，只能钉源码。
+  const src = stripJsComments(SRC);
+  assert.match(src, /const _testDirPromise = \(async \(\) => \{/, "套件探测没了");
+  assert.match(src, /stack\.testDir = _testDir\.dir;/,
+    "探测到了却没写进 stack——文案分支永远进不去，等于没探测");
+  assert.match(src, /stack\.testSubs = _testDir\.subs;/);
 });
 
 test("测试文件识别覆盖各语言主流约定，宁可漏判不可误判", () => {
@@ -22569,6 +22666,9 @@ test("评审结论只陈述、不拦回合", () => {
       _CODE_FILE_RE: loadConst("_CODE_FILE_RE"),
       _looksLikeTestFile: load("_looksLikeTestFile"),
     }),
+    // 散落的一次性脚本也要清点：用真实现，桩会让"有没有清点"这件事在测试里失真。
+    _strayScratchFiles: load("_strayScratchFiles"),
+    _projectStacks: new Map(),
   });
   const run = (verdict) => ({
     _mutatedFiles: new Set(["src/a.ts"]),
