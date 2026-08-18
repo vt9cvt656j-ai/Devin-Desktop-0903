@@ -3341,17 +3341,29 @@ fn compute_cost(
     //      目录明确给 0（缓存读免费的模型）也照用，None 才算"目录没有这个数"。
     //   ③ 目录也没有 → 最后才按输入价 × 倍数推算兜底。
     let live_cache = crate::model_catalog::lookup(model_id);
+    // 用目录的**真实倍率 × 你实际计费的输入价**，不是照搬目录的绝对缓存价。
+    //
+    // 关键：off_in 是**你收用户的价**（每模型覆盖 / 连接价），常常在目录成本价上加了价——
+    // 线上 claude-opus-5 目录 $5、你收 $15（3×）。缓存价该跟着你的输入价走：照搬目录 $6.25
+    // （那是按目录 $5 算的）会把加价模型的缓存按**成本价**收，少收好几倍，而缓存写入恰恰
+    // 是单价最贵的一类 token。倍率取自目录（cache/input），比写死的 0.1/1.25 准——实测
+    // deepseek 缓存读真实 0.2×、不是默认 0.1×。目录明确给 0（免费缓存）→ 倍率 0 → 收 0。
+    let live_in = live_cache.as_ref().and_then(|e| e.input_price).filter(|p| *p > 0.0);
+    let cache_ratio = |cache: Option<f64>| match (cache, live_in) {
+        (Some(c), Some(ci)) => Some(c / ci),
+        _ => None,
+    };
     let read_price = if !price_is_per_model && cache_read_price > 0.0 {
         cache_read_price
-    } else if let Some(p) = live_cache.as_ref().and_then(|e| e.cache_read_price) {
-        p
+    } else if let Some(ratio) = cache_ratio(live_cache.as_ref().and_then(|e| e.cache_read_price)) {
+        off_in * ratio
     } else {
         off_in * CACHE_READ_FACTOR
     };
     let write_price = if !price_is_per_model && cache_create_price > 0.0 {
         cache_create_price
-    } else if let Some(p) = live_cache.as_ref().and_then(|e| e.cache_write_price) {
-        p
+    } else if let Some(ratio) = cache_ratio(live_cache.as_ref().and_then(|e| e.cache_write_price)) {
+        off_in * ratio
     } else {
         off_in * CACHE_WRITE_FACTOR
     };
@@ -8764,6 +8776,71 @@ mod billing_tests {
             compute_cost(Some(&read_usage), "cache-live-model", 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0),
             50,
             "缓存读也要用实时 $0.5，而不是推算的 $0.4"
+        );
+    }
+
+    /// 加价模型：你把输入价从目录的 $5 覆盖成 $15（3×），缓存价必须跟着放大到 3×，
+    /// 不能照搬目录按 $5 算出的绝对值——那会把最贵的缓存写入按成本价收，少收 3 倍。
+    /// 这是 2026-08-18 修的核心。
+    #[test]
+    fn marked_up_input_scales_cache_price_by_the_catalog_ratio() {
+        seed_catalog();
+        use crate::model_catalog::{seed_for_test, Entry};
+        // 目录成本价：输入 $5、缓存写 $6.25（倍率 1.25×）、缓存读 $0.5（0.1×）。
+        seed_for_test(&[(
+            "markup-model",
+            Entry {
+                input_price: Some(5.0),
+                output_price: Some(25.0),
+                cache_read_price: Some(0.5),
+                cache_write_price: Some(6.25),
+                ..Entry::default()
+            },
+        )]);
+        // 每模型覆盖把输入价加到 $15（compute_cost 的 model_in 参数）。
+        let write_usage = serde_json::json!({
+            "input_tokens": 1, "output_tokens": 0,
+            "cache_read_input_tokens": 0, "cache_creation_input_tokens": 1_000_000,
+        });
+        // 缓存写：倍率 1.25 × 你的 $15 = $18.75 = 1875 分。照搬目录只有 625 分（少收 3×）。
+        assert_eq!(
+            compute_cost(Some(&write_usage), "markup-model", 1.0, 0.0, 0.0, 0.0, 0.0, 15.0, 25.0),
+            1875,
+            "加价模型的缓存写没跟着放大——按成本价收了，少收 3 倍"
+        );
+        // 不加价（off_in 就用目录 $5）时，倍率 × 输入 = 目录绝对值，结果不变（625 分）。
+        assert_eq!(
+            compute_cost(Some(&write_usage), "markup-model", 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0),
+            625,
+            "不加价时应当正好等于目录绝对值"
+        );
+    }
+
+    /// 目录里真实倍率 ≠ 默认 0.1 的模型（deepseek 缓存读 0.2×），要用真实倍率不是写死的 0.1。
+    #[test]
+    fn cache_ratio_uses_the_real_catalog_ratio_not_the_hardcoded_factor() {
+        seed_catalog();
+        use crate::model_catalog::{seed_for_test, Entry};
+        // 输入 $1、缓存读 $0.2 → 真实倍率 0.2×（默认写死的是 0.1×）。
+        seed_for_test(&[(
+            "ratio-model",
+            Entry {
+                input_price: Some(1.0),
+                output_price: Some(2.0),
+                cache_read_price: Some(0.2),
+                cache_write_price: None,
+                ..Entry::default()
+            },
+        )]);
+        let read_usage = serde_json::json!({
+            "input_tokens": 1, "output_tokens": 0,
+            "cache_read_input_tokens": 1_000_000, "cache_creation_input_tokens": 0,
+        });
+        // 100 万缓存读 × 真实 $0.2 = 20 分；写死 0.1 只会算 10 分。
+        assert_eq!(
+            compute_cost(Some(&read_usage), "ratio-model", 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0),
+            20,
+            "没用目录的真实倍率 0.2，用了写死的 0.1"
         );
     }
 
