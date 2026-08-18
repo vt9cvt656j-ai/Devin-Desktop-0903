@@ -18685,6 +18685,27 @@ async function _revertRunChanges(cp) {
 }
 
 /// 轮末在 footer 旁边挂一条「改了 N 个文件 · 全部撤销」。
+/**
+ * 把"这一轮改了什么、验没验、有没有测试"摆在答案下面。
+ *
+ * 这条**不判断对错**，只陈述事实。它存在的唯一理由是：模型说"能用了"的时候，屏幕上要有
+ * 一行东西让人一眼看出它到底验没验过 —— 在此之前这条信息只进了一个可选的建议按钮，
+ * 用户看不到，于是"说能用"从来没人核对。
+ */
+function _appendDeliveryFactsBar(body, run) {
+  try {
+    if (!body || body.querySelector(":scope > .turn-facts")) return;
+    const line = _deliveryFactsLine(run);
+    if (!line) return;
+    const { verifiers, code } = _deliveryFacts(run);
+    const el = document.createElement("div");
+    // 没验证时给一个"待核对"的样子；验证过就是普通事实行，不喧哗。
+    el.className = "turn-facts" + (code.length && !verifiers.length ? " turn-facts--unverified" : "");
+    el.textContent = line;
+    body.appendChild(el);
+  } catch { /* 事实行不该弄坏一条回复 */ }
+}
+
 function _appendRunRevertBar(body, run) {
   try {
     const cp = run?.checkpoint;
@@ -40978,6 +40999,62 @@ function _freshBuildFailure(run, implOps) {
   return newestFailure;
 }
 
+/**
+ * 一个路径看起来是不是测试文件。
+ *
+ * 覆盖各语言的主流约定，宁可漏判不可误判：误判成"写了测试"比漏判更糟——那正好把这条
+ * 事实变成一句假话，而这整块东西存在的意义就是不让"说能用"变成没人核对的话。
+ */
+function _looksLikeTestFile(path) {
+  const p = String(path || "").replace(/\\/g, "/");
+  if (!p) return false;
+  const name = p.slice(p.lastIndexOf("/") + 1);
+  return /(^|\/)(?:tests?|__tests__|spec|specs|e2e|cypress|playwright)(?:\/|$)/i.test(p)
+    || /\.(?:test|spec)\.[A-Za-z0-9]+$/.test(name)   // foo.test.ts / foo.spec.js
+    || /^test_[^/]+\.py$/i.test(name) || /_test\.py$/i.test(name)
+    || /_test\.go$/.test(name)
+    || /(?:Test|Tests|Spec)\.(?:java|kt|kts|cs|scala)$/.test(name)
+    || /_spec\.rb$/.test(name) || /_test\.rb$/.test(name)
+    || /^tests?\.rs$/.test(name);
+}
+
+/**
+ * 这一轮到底改了什么、验没验、有没有测试 —— **全部来自真实执行事实**，一个推断都不做。
+ *
+ * 用户反复报的是同一件事："改完不管能不能用、也不写测试、也不去终端跑，就跟我说能用。"
+ * harness 其实一直记着 `code_delivered_unverified`，但它唯一的出口是一个可选的建议按钮，
+ * 屏幕上没有任何东西反驳模型那句"能用了"。这里把它变成每一轮都看得见的事实。
+ *
+ * 刻意**不**做的事：不强迫再跑一轮。"没验证"观测到的是缺席，缺席不等于工作是坏的
+ * （改动很小、项目没有构建系统、用户明说别跑，都是正当理由）。所以这里只陈述事实，
+ * 判断留给人 —— 但事实必须摆在他眼前。
+ */
+function _deliveryFacts(run) {
+  const mutated = [...(run?._mutatedFiles || [])].map(String);
+  const code = mutated.filter((p) => _CODE_FILE_RE.test(p));
+  const tests = mutated.filter(_looksLikeTestFile);
+  const ev = Array.isArray(run?._executionEvidence) ? run._executionEvidence : [];
+  const withCode = ev.filter((e) => e && typeof e.exitCode === "number");
+  const verifiers = withCode.filter((e) => e.verifierRecognized === true);
+  return { code, tests, ran: withCode, verifiers };
+}
+
+function _deliveryFactsLine(run) {
+  const { code, tests, ran, verifiers } = _deliveryFacts(run);
+  if (!code.length) return "";           // 没动代码就没什么可核对的
+  const parts = [`改了 ${code.length} 个源码文件`];
+  if (verifiers.length) {
+    const last = verifiers[verifiers.length - 1];
+    parts.push(`验证 \`${String(last.command || "").slice(0, 60)}\` 退出 ${last.exitCode}`);
+  } else if (ran.length) {
+    parts.push(`跑过 ${ran.length} 条命令，但没有一条被识别为验证`);
+  } else {
+    parts.push("本轮没有跑过任何命令");
+  }
+  parts.push(tests.length ? `测试文件 ${tests.length} 个` : "没有新增或改动测试文件");
+  return parts.join(" · ");
+}
+
 function _executionEvidenceReviewBlock(records) {
   const list = Array.isArray(records) ? records.slice(-5) : [];
   if (!list.length) return "";
@@ -46495,6 +46572,11 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
     }
     const executionBlock = _executionEvidenceReviewBlock(run._executionEvidence);
     if (executionBlock) parts.push(executionBlock);
+    // 同一行事实也给模型看一遍。用户那一侧已经能看见它（答案下面那条），模型这边不给的话，
+    // 它下一轮照样"改完就说能用"——而这行是纯事实，不是劝告：改了几个源码文件、跑没跑过
+    // 验证、有没有动测试文件，全部来自这一轮的真实执行记录。
+    const facts = _deliveryFactsLine(run);
+    if (facts) parts.push(`本轮交付事实（执行记录，非推断）: ${facts}`);
     return parts.join("\n");
   }
 
@@ -48588,7 +48670,18 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
         // A deduped re-read ("别重读" / "死循环") = the model tried to re-read an unchanged file it
         // already has. Two of those = spinning, a stuck signal on par with repeated failures.
         const dupRead = /\[别重读\]|\[停止·你在死循环\]/.test(_tmsg) && !/命令失败后的当前磁盘版本复核|失败后的当前磁盘\/日志复核/.test(_tmsg);
-        _callLog.push({ sig, resultSig, failed, dupRead });
+        // 这次调用冲着**哪个东西**去的。用于识别"换着工具找同一个不存在的东西"：
+        // 用户实拍——view_image image.png 读不到，接着 find **/image*.png 无匹配，
+        // 两次是**不同的调用**、各失败一次，所以按签名计数的那道闸一次都没响，模型继续换
+        // 工具找同一个根本不存在的文件。归一化到"去掉目录和通配符的名字"，两次才对得上。
+        const spinTarget = (() => {
+          const c = items[i]?.call || {};
+          const raw = String(c.path || c.pattern || c.query || c.name || "").trim();
+          if (!raw) return "";
+          const base = raw.split("/").filter(Boolean).pop() || raw;
+          return base.replace(/[*?\[\]]/g, "").toLowerCase().slice(0, 60);
+        })();
+        _callLog.push({ sig, resultSig, failed, dupRead, spinTarget });
         // ── 步数效率（step efficiency）──────────────────────────────────────
         // `_callLog` 是给死循环检测用的 12 条滑动窗口，问不出"这个 run 整体绕了多少路"。
         // 这里另记一份**累计**账：总调用、失败、重复签名、重复读取。
@@ -48610,6 +48703,8 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
         const counts = {};
         const failCounts = {};
         let maxRepeat = 0, maxFailRepeat = 0, fails = 0, dupReads = 0;
+        const targetFailSigs = {};
+        let maxTargetToolFails = 0, stuckTarget = "";
         for (const e of win) {
           // 「调用相同 **且** 结果也相同」才算原地打转。只看调用会把正当轮询
           // （比如构建跑着的时候反复 read_terminal）判成死循环；只看结果则什么都不是。
@@ -48623,12 +48718,20 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
             // 差异不该让它逃过计数——这正是原来那套拼接签名最容易漏掉的情形。
             failCounts[e.sig] = (failCounts[e.sig] || 0) + 1;
             if (failCounts[e.sig] > maxFailRepeat) maxFailRepeat = failCounts[e.sig];
+            // 同一个目标上，有几个**不同**的调用失败过。≥2 就说明不是"这个工具不行"，
+            // 是这个东西根本不在——再换工具也没用。
+            if (e.spinTarget) {
+              (targetFailSigs[e.spinTarget] ||= new Set()).add(e.sig);
+              const n = targetFailSigs[e.spinTarget].size;
+              if (n > maxTargetToolFails) { maxTargetToolFails = n; stuckTarget = e.spinTarget; }
+            }
           }
         }
         // STRONGER triggers: same call FAILED 3+ times (true stuck), OR 4+ total failures, OR same
         // call repeated 6+ times even if succeeding, OR 2+ deduped re-reads (the model re-reading a
         // file it already has = classic spin — intervene at 2, don't wait for 6 blind re-reads).
-        if ((maxFailRepeat >= 3 || fails >= 4 || maxRepeat >= 6 || dupReads >= 2) && stuckNudges < 2 && _live()) {
+        if ((maxFailRepeat >= 3 || fails >= 4 || maxRepeat >= 6 || dupReads >= 2 || maxTargetToolFails >= 2)
+          && stuckNudges < 2 && _live()) {
           stuckNudges++;
           runHadTrouble = true;
           _stuckNudgedNow = true;
@@ -48637,7 +48740,11 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
           if (stuckNudges >= 2) {
             // De-subagent'd (refactor 2026-07-05): spawning a "卡点诊断" sub-agent when stuck was more
             // "子智能体" noise + latency. Just tell the model plainly to stop, rethink, or ask the user.
-            _pushNudge("stuck", "还在原地打转（同样的动作 / 连续失败）。**停**——别再原样重试了。只有两条路：① 退一步写下这几次失败的**共同根因**（哪个假设 / 前提错了），换一条**完全不同**的思路或工具再来；② 如果是需求 / 方向定不下来、或你缺个前提（跑不起来、平台不对、缺信息），别空转——直接 **ask_user** 把卡点和你需要什么一句话问用户。");
+            // 跨工具追同一个目标，要说清楚是"这东西不在"，而不是泛泛地喊别打转——
+            // 泛泛地喊，它会再换第三个工具找同一个文件。
+            if (maxTargetToolFails >= 2 && stuckTarget) {
+              _pushNudge("stuck", `已经有两个**不同的工具**都没找到「${stuckTarget}」——那说明它很可能**根本不存在**，不是这个工具不好使。**停止换工具找它。** 只有三条路：① 它本来就该由你创建，那就直接创建；② 你把名字或位置记错了，回到已经确认存在的证据（列一次目录、看一眼真实文件名）重新定位；③ 确实需要用户提供，用 ask_user 一句话问清它在哪。`);
+            } else _pushNudge("stuck", "还在原地打转（同样的动作 / 连续失败）。**停**——别再原样重试了。只有两条路：① 退一步写下这几次失败的**共同根因**（哪个假设 / 前提错了），换一条**完全不同**的思路或工具再来；② 如果是需求 / 方向定不下来、或你缺个前提（跑不起来、平台不对、缺信息），别空转——直接 **ask_user** 把卡点和你需要什么一句话问用户。");
           } else {
             _pushNudge("stuck", "你在**重复同样的动作 / 连续失败**，看起来卡住了。别再原样重试。先找这些失败共同依赖的错误假设，然后换一种真正不同的策略：目标文件已知就直接使用已有读取证据或精读具体范围；只有位置未知才换工具定位一次；外部 API 不确定才查官方文档。方向确实无法从现有证据确定时再 ask_user。");
           }
@@ -48895,6 +49002,7 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
         settlement: _finalRunSettlement(_ru),
         timeline: run.timeline,
       });
+      _appendDeliveryFactsBar(body, run);
       _appendRunRevertBar(body, run);
     } catch {}
     finally {

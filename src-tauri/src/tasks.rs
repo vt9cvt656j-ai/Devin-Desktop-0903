@@ -58,6 +58,53 @@ fn missing_dependency_advice(stdout: &str, stderr: &str) -> Option<&'static str>
     )
 }
 
+/// 这条 shell 命令是不是在做某个**已有专用工具**的事。是的话把工具名说出来。
+///
+/// 用户实拍的原话：「终端和工具和我的智能体各种工具，该用什么就用什么，而不是有能用的
+/// 工具就一直走终端，然后终端命令也输入不对导致报错」。
+///
+/// 查过了：整个仓库**没有任何一处**告诉过模型这件事。工具目录里当然写着 read_file、
+/// search 存在，但没人在它敲 `cat` 的那一刻说「这件事有工具」。于是它继续敲 shell，
+/// 而 shell 要自己拼路径、自己转义、自己处理分页——第三个抱怨"命令输错导致报错"，
+/// 大半是从这里来的。
+///
+/// 只提示、不拦截：管道、组合命令、构建脚本里 shell 才是对的。所以只在命令**整体就是
+/// 那一件事**时才出声，并且只出一句。
+fn shell_shadows_tool_advice(command: &str) -> Option<&'static str> {
+    let c = command.trim();
+    // 取最后一段（`cd x && cat y` 里真正干活的是后半截），再取首个动词。
+    let last = c.rsplit("&&").next().unwrap_or(c).trim();
+    let verb = last.split_whitespace().next().unwrap_or("").to_ascii_lowercase();
+    let verb = verb.rsplit('/').next().unwrap_or(&verb).to_string();
+    // 带管道/重定向的是真·组合活，交给 shell 没问题。
+    let composed = last.contains('|') || last.contains('>') || last.contains('<');
+    let tip: Option<&'static str> = match verb.as_str() {
+        "cat" | "head" | "tail" | "less" | "more" if !composed => Some(
+            "读文件用 read_file（可带 offset/limit 精读），别用 cat/head/tail：它拿不到行号、\
+             大文件会把上下文塞爆，路径转义也容易出错。",
+        ),
+        "ls" | "dir" if !composed => Some("列目录用 list_dir，它带类型和大小，比 ls 的输出好解析。"),
+        "grep" | "rg" | "ag" | "ack" if !composed => Some(
+            "在代码里找东西用 search（按内容）或 find_files（按文件名），别用 grep/rg：\
+             专用工具带行号和上下文，也不会被 shell 的引号和通配符坑到。",
+        ),
+        "find" if !composed => Some("按文件名找用 find_files，别用 find：它的语法最容易写错，而且各平台不一样。"),
+        "sed" | "awk" if last.contains("-i") => Some(
+            "改文件内容用 edit_file / multi_edit，别用 sed -i：它没有预览、没有审批、改错了没法回滚。",
+        ),
+        "curl" | "wget" if !composed => Some(
+            "取网页用 web_fetch，调接口用 http_request，别用 curl/wget：\
+             专用工具会处理编码、重定向和超时，也会把结果整理成模型能用的形状。",
+        ),
+        "git" if !composed => Some(
+            "git 的常用操作都有专用工具（git_status / git_diff / git_log / git_commit / \
+             git_show 等），比在 shell 里拼参数更稳，也会进审批门。",
+        ),
+        _ => None,
+    };
+    tip
+}
+
 fn timeout_advice_for(command: &str, stdout: &str, stderr: &str) -> &'static str {
     let out_lower = format!("{stdout}{stderr}").to_ascii_lowercase();
     let output_says_server = [
@@ -567,6 +614,10 @@ fn task_run_capture_inner(
             stderr.push_str(&format!("\n[{dep}]"));
         }
     }
+    // 有专用工具却走了 shell：提示一句。成功也提示——重点正是"这次本来就不该用终端"。
+    if let Some(tip) = shell_shadows_tool_advice(&command) {
+        stderr.push_str(&format!("\n[{tip}]"));
+    }
     let combined = format!("{stdout}{stderr}");
     // Only claim a denial when the command actually FAILED and ran confined. A successful
     // command whose output happens to mention "operation not permitted" (a test asserting an
@@ -622,6 +673,47 @@ fn read_capped<R: std::io::Read>(r: &mut R, out: &mut Vec<u8>, cap: usize) {
 
 #[cfg(test)]
 mod tests {
+
+    /// 用户实拍的原话：「该用什么就用什么，而不是有能用的工具就一直走终端」。
+    /// 查过：撞上这件事时整个仓库没有任何一处提醒过模型，所以它没理由改。
+    #[test]
+    fn shell_that_shadows_a_real_tool_says_so() {
+        let cases = [
+            ("cat main.py", "read_file"),
+            ("cd /x && head -50 src/app.ts", "read_file"),
+            ("ls -la src", "list_dir"),
+            ("grep -rn TODO src", "search"),
+            ("rg fastapi", "search"),
+            ("find . -name '*.py'", "find_files"),
+            ("sed -i '' 's/a/b/' x.py", "edit_file"),
+            ("curl https://example.com", "web_fetch"),
+            ("git status", "git_status"),
+        ];
+        for (cmd, want) in cases {
+            let tip = shell_shadows_tool_advice(cmd)
+                .unwrap_or_else(|| panic!("`{cmd}` 该提示用 {want}，却什么都没说"));
+            assert!(tip.contains(want), "`{cmd}` 的提示没点名 {want}：{tip}");
+        }
+    }
+
+    /// 只提示、不越权：真正的组合活（管道、重定向）和构建/测试命令交给 shell 是对的，
+    /// 乱提示会把模型往错的方向推。
+    #[test]
+    fn real_shell_work_is_left_alone() {
+        for cmd in [
+            "cat a.txt | grep x | wc -l",
+            "npm run build",
+            "cargo test --release",
+            "python3 main.py",
+            "pip install -r requirements.txt",
+            "grep -c foo bar.txt > out.txt",
+        ] {
+            assert!(
+                shell_shadows_tool_advice(cmd).is_none(),
+                "`{cmd}` 本来就该走 shell，不该被提示"
+            );
+        }
+    }
 
     /// 用户实拍：跑项目撞上 `ModuleNotFoundError: No module named 'fastapi'`，它却去查
     /// pip list、查 sys.path、反复重跑，就是不去装。缺依赖时下一步必须当场说清楚。
