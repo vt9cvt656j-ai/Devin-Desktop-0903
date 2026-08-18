@@ -48,10 +48,6 @@ pub struct Settings {
     pub free_points_daily: i64,
     /// 1 人民币分 折合多少美元分，万分比。佣金账本以美元计量，人民币销售在记账时折一次。
     pub usd_per_cny_bps: i64,
-    /// 缓存计费「便宜模式」。默认 false = 按真实价（缓存写照收贵的那笔）。
-    /// true = 灰产/便宜渠道用：把最贵的缓存写入降到和缓存读同一个便宜价，普通输入照常。
-    /// 语义见 compute_cost 里的用法：cheap 时 write_price = read_price。
-    pub cache_billing_cheap: bool,
 }
 
 impl Default for Settings {
@@ -60,7 +56,6 @@ impl Default for Settings {
             raw_cents_per_credit_usd: DEFAULT_RAW_CENTS_PER_CREDIT_USD,
             free_points_daily: DEFAULT_FREE_POINTS_DAILY,
             usd_per_cny_bps: DEFAULT_USD_PER_CNY_BPS,
-            cache_billing_cheap: false,
         }
     }
 }
@@ -134,11 +129,6 @@ pub fn current() -> Settings {
 }
 
 /// 面值分母：多少真实计费分等于客户看到的 $1.00 额度。
-/// 缓存计费是否走「便宜模式」（灰产渠道用）。true = 缓存写降到缓存读价。
-pub fn cache_billing_cheap() -> bool {
-    CACHE.read().map(|g| g.cache_billing_cheap).unwrap_or(false)
-}
-
 pub fn raw_cents_per_credit_usd() -> i64 {
     current()
         .raw_cents_per_credit_usd
@@ -197,23 +187,21 @@ pub fn plan_rank(plan: &str) -> i32 {
 /// 从数据库装载进缓存。启动时调用一次，每次写入后再调用一次。
 /// 读不到就保留当前缓存（首次即默认值），不让网关起不来。
 pub async fn load(db: &sqlx::PgPool) {
-    match sqlx::query_as::<_, (i32, i32, i32, bool)>(
-        "SELECT raw_cents_per_credit_usd, free_points_daily, usd_per_cny_bps, \
-                COALESCE(cache_billing_cheap, false) \
+    match sqlx::query_as::<_, (i32, i32, i32)>(
+        "SELECT raw_cents_per_credit_usd, free_points_daily, usd_per_cny_bps \
          FROM app_settings WHERE id = 1",
     )
     .fetch_optional(db)
     .await
     {
-        Ok(Some((raw, free, fx, cheap))) => {
+        Ok(Some((raw, free, fx))) => {
             let next = Settings {
                 raw_cents_per_credit_usd: (raw as i64)
                     .clamp(MIN_RAW_CENTS_PER_CREDIT_USD, MAX_RAW_CENTS_PER_CREDIT_USD),
                 free_points_daily: (free as i64)
                     .clamp(MIN_FREE_POINTS_DAILY, MAX_FREE_POINTS_DAILY),
                 usd_per_cny_bps: (fx as i64).clamp(MIN_USD_PER_CNY_BPS, MAX_USD_PER_CNY_BPS),
-                cache_billing_cheap: cheap,
-            };
+                };
             if let Ok(mut g) = CACHE.write() {
                 *g = next;
             }
@@ -305,7 +293,6 @@ pub struct PlanPatch {
 pub struct SettingsPatch {
     pub raw_cents_per_credit_usd: Option<i64>,
     pub free_points_daily: Option<i64>,
-    pub cache_billing_cheap: Option<bool>,
     pub plans: Option<Vec<PlanPatch>>,
 }
 
@@ -355,21 +342,17 @@ pub async fn admin_put(
         .await
         .map_err(|e| AppError::internal(format!("开启事务失败: {e}")))?;
 
-    if req.raw_cents_per_credit_usd.is_some() || req.free_points_daily.is_some()
-        || req.cache_billing_cheap.is_some()
-    {
+    if req.raw_cents_per_credit_usd.is_some() || req.free_points_daily.is_some() {
         sqlx::query(
             "UPDATE app_settings SET \
                raw_cents_per_credit_usd = COALESCE($1, raw_cents_per_credit_usd), \
                free_points_daily = COALESCE($2, free_points_daily), \
-               cache_billing_cheap = COALESCE($4, cache_billing_cheap), \
                updated_at = now(), updated_by = $3 \
              WHERE id = 1",
         )
         .bind(req.raw_cents_per_credit_usd.map(|v| v as i32))
         .bind(req.free_points_daily.map(|v| v as i32))
         .bind(&claims.sub)
-        .bind(req.cache_billing_cheap)
         .execute(&mut *tx)
         .await
         .map_err(|e| AppError::internal(format!("写入设置失败: {e}")))?;

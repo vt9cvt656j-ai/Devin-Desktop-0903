@@ -736,6 +736,8 @@ pub struct Model {
     pub cache_read_price: f64,
     /// Per 1M CACHE-CREATE/write tokens (premium). 0 = not set → fall back to 1.25× input_price.
     pub cache_create_price: f64,
+    /// 每线路开关：true = 关闭缓存计费，缓存读/写都不收钱（输入输出照常）。灰产/便宜渠道用。
+    pub cache_disabled: bool,
     /// Optional admin blurb shown in the IDE picker's hover card.
     pub description: String,
     pub active: bool,
@@ -938,7 +940,7 @@ fn resolve_cost(
     cache_create_price: f64,
     model_in: f64,
     model_out: f64,
-    cheap_cache: bool,
+    cache_disabled: bool,
 ) -> i64 {
     if billing_mode == "per_call" {
         let c = per_call_cents.max(0);
@@ -955,7 +957,7 @@ fn resolve_cost(
         cache_create_price,
         model_in,
         model_out,
-        cheap_cache,
+        cache_disabled,
     )
 }
 
@@ -1764,7 +1766,7 @@ pub async fn admin_model_estimate(
         model.cache_create_price,
         model_in,
         model_out,
-        crate::settings::cache_billing_cheap(),
+        model.cache_disabled,
     );
     let calls = req.calls as f64;
     let provider_usd_total = provider_usd_per_call * calls;
@@ -1904,6 +1906,8 @@ pub async fn admin_quota_estimate(
 #[derive(Deserialize)]
 pub struct ModelReq {
     pub label: String,
+    #[serde(default)]
+    pub cache_disabled: Option<bool>,
     pub provider: Option<String>,
     pub base_url: String,
     pub model_id: Option<String>,
@@ -1943,8 +1947,8 @@ pub async fn admin_create(
     // 启用模型要走 admin_update，那条路上有零费率闸门。但运营填了价、保存成功、价没了，
     // 下一次编辑还得重填一遍——而且一旦没注意到，闸门看到的就是 0。
     let id: uuid::Uuid = sqlx::query_scalar(
-        "INSERT INTO models (label, provider, base_url, model_id, api_key, rate, input_price, output_price, description, sort, billing_mode, per_call_cents, cache_read_price, cache_create_price, per_call_micro_usd) \
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15) RETURNING id",
+        "INSERT INTO models (label, provider, base_url, model_id, api_key, rate, input_price, output_price, description, sort, billing_mode, per_call_cents, cache_read_price, cache_create_price, per_call_micro_usd, cache_disabled) \
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16) RETURNING id",
     )
     .bind(req.label.trim())
     .bind(req.provider.unwrap_or_default())
@@ -1961,6 +1965,7 @@ pub async fn admin_create(
     .bind(req.cache_read_price.unwrap_or(0.0).max(0.0))
     .bind(req.cache_create_price.unwrap_or(0.0).max(0.0))
     .bind(req.per_call_micro_usd.unwrap_or(0).max(0))
+    .bind(req.cache_disabled.unwrap_or(false))
     .fetch_one(&state.db)
     .await?;
     Ok(Json(json!({ "ok": true, "id": id })))
@@ -2079,6 +2084,7 @@ pub struct UpdateReq {
     pub output_price: Option<f64>,
     pub cache_read_price: Option<f64>,
     pub cache_create_price: Option<f64>,
+    pub cache_disabled: Option<bool>,
     pub description: Option<String>,
     pub active: Option<bool>,
     pub sort: Option<i32>,
@@ -2219,7 +2225,7 @@ pub async fn admin_update(
     };
     // 没传就保持原值——和上面 protocol 一样的语义，别让一次只改价格的保存把开关关掉。
     let effort_passthrough = req.effort_passthrough.unwrap_or(m.effort_passthrough);
-    sqlx::query("UPDATE models SET label=$1, provider=$2, base_url=$3, api_key=$4, rate=$5, active=$6, sort=$7, enabled_models=$8, input_price=$9, output_price=$10, description=$11, billing_mode=$12, per_call_cents=$13, model_names=$14, cache_read_price=$15, cache_create_price=$16, model_prices=$17, protocol=$18, model_billing=$20, per_call_micro_usd=$21, effort_passthrough=$22, model_caps=$23, power_route=$24 WHERE id=$19")
+    sqlx::query("UPDATE models SET label=$1, provider=$2, base_url=$3, api_key=$4, rate=$5, active=$6, sort=$7, enabled_models=$8, input_price=$9, output_price=$10, description=$11, billing_mode=$12, per_call_cents=$13, model_names=$14, cache_read_price=$15, cache_create_price=$16, model_prices=$17, protocol=$18, model_billing=$20, per_call_micro_usd=$21, effort_passthrough=$22, model_caps=$23, power_route=$24, cache_disabled=$25 WHERE id=$19")
         .bind(&label)
         .bind(&provider)
         .bind(&base_url)
@@ -2244,6 +2250,7 @@ pub async fn admin_update(
         .bind(effort_passthrough)
         .bind(req.model_caps.clone().unwrap_or_else(|| m.model_caps.clone()))
         .bind(req.power_route.unwrap_or(m.power_route))
+        .bind(req.cache_disabled.unwrap_or(m.cache_disabled))
         .execute(&state.db)
         .await?;
     Ok(Json(json!({ "ok": true })))
@@ -2611,7 +2618,7 @@ pub async fn chat(
         model.cache_create_price,
         model_in,
         model_out,
-        crate::settings::cache_billing_cheap(),
+        model.cache_disabled,
     );
     let mut tokens = extract_bill_tokens(
         usage_val.filter(|_| usage_reported),
@@ -3282,7 +3289,7 @@ fn compute_cost(
     cache_create_price: f64,
     model_in: f64,
     model_out: f64,
-    cheap_cache: bool,
+    cache_disabled: bool,
 ) -> i64 {
     const COST_CEILING_CENTS: f64 = 5000.0; // $50/call backstop — no legit single call hits this
     let u = match usage {
@@ -3379,10 +3386,10 @@ fn compute_cost(
     } else {
         off_in * CACHE_WRITE_FACTOR
     };
-    // 便宜模式（灰产/便宜渠道）：把最贵的缓存**写入**降到和缓存**读**同一个便宜价，
-    // 普通输入照常。用户："我设置开缓存就是实时真实价，不开就是便宜许多那种。"
-    // 保证「关」永远 ≤「开」：只砍写入那笔溢价，读的折扣照留。
-    let write_price = if cheap_cache { read_price } else { write_price };
+    // 关闭缓存计费（每线路开关）：缓存读、缓存写都**不收钱**，普通输入照常。
+    // 用户："我拉取的模型自带价格和缓存价……新增一个关闭缓存的开关，关闭的话价格一样、
+    // 不收缓存钱。" 灰产/便宜渠道用——缓存那点钱干脆不算，输入输出价一分不动。
+    let (read_price, write_price) = if cache_disabled { (0.0, 0.0) } else { (read_price, write_price) };
     // Split input into plain (full price) + cache-read + cache-create, bill each at its own
     // unit price; output at off_out. Then × 倍率. Anthropic reports input EXCLUDING cached;
     // OpenAI/DeepSeek report prompt INCLUDING cached reads (and no separate write count).
@@ -7051,7 +7058,7 @@ pub async fn chat_completions(
                 cache_create_price,
                 model_in,
                 model_out,
-                crate::settings::cache_billing_cheap(),
+                conn.cache_disabled,
             );
             let mut tokens = extract_bill_tokens(
                 usage_reported.then_some(&usage),
@@ -7176,7 +7183,7 @@ pub async fn chat_completions(
                 conn.cache_create_price,
                 model_in,
                 model_out,
-                crate::settings::cache_billing_cheap(),
+                conn.cache_disabled,
             );
             let mut tokens = extract_bill_tokens(
                 usage_val.filter(|_| usage_reported),
@@ -7489,7 +7496,7 @@ pub async fn responses_proxy(
                 conn.cache_create_price,
                 model_in,
                 model_out,
-                crate::settings::cache_billing_cheap(),
+                conn.cache_disabled,
             );
             let mut tokens =
                 extract_bill_tokens(usage.filter(|_| usage_reported), &model_id, !usage_reported);
@@ -8803,19 +8810,19 @@ mod billing_tests {
         );
     }
 
-    /// 便宜模式（灰产/便宜渠道）：最贵的缓存写入降到和缓存读同一个便宜价，普通输入照常，
-    /// 缓存读的折扣照留。保证「关」永远 ≤「开」。用户 2026-08-18 要的开关。
+    /// 关闭缓存计费（每线路开关）：缓存读、缓存写都**不收钱**，普通输入照常。用户 2026-08-18
+    /// 要的："我拉取的模型自带价格和缓存价，新增一个关闭缓存的开关，关了价格一样、不收缓存钱。"
     #[test]
-    fn cheap_cache_mode_drops_write_to_read_price() {
+    fn cache_disabled_bills_zero_for_cache_tokens() {
         seed_catalog();
         use crate::model_catalog::{seed_for_test, Entry};
         seed_for_test(&[(
-            "cheap-test-model",
+            "cache-off-model",
             Entry {
                 input_price: Some(5.0),
                 output_price: Some(25.0),
-                cache_read_price: Some(0.5),   // 0.1×
-                cache_write_price: Some(6.25), // 1.25×（贵）
+                cache_read_price: Some(0.5),
+                cache_write_price: Some(6.25),
                 ..Entry::default()
             },
         )]);
@@ -8823,27 +8830,35 @@ mod billing_tests {
             "input_tokens": 1, "output_tokens": 0,
             "cache_read_input_tokens": 0, "cache_creation_input_tokens": 1_000_000,
         });
-        // 开（cheap=false）：100 万缓存写 × $6.25 = 625 分。
+        // 开缓存（cache_disabled=false）：100 万缓存写 × $6.25 = 625 分。
         assert_eq!(
-            compute_cost(Some(&write_usage), "cheap-test-model", 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, false),
+            compute_cost(Some(&write_usage), "cache-off-model", 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, false),
             625,
-            "开缓存模式应按真实写入价 $6.25 收"
+            "开缓存应按真实写入价收"
         );
-        // 关（cheap=true）：写入降到读价 $0.5 = 50 分。便宜 12.5 倍。
+        // 关缓存（cache_disabled=true）：缓存写不收钱 = 0（只剩那 1 个普通 input token，几乎 0）。
         assert_eq!(
-            compute_cost(Some(&write_usage), "cheap-test-model", 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, true),
-            50,
-            "关缓存模式应把写入降到缓存读价 $0.5"
+            compute_cost(Some(&write_usage), "cache-off-model", 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, true),
+            0,
+            "关缓存应当缓存写一分不收"
         );
-        // 缓存**读**在两种模式下都便宜、都一样（关模式不动读的折扣）。
+        // 缓存**读**：关了也不收钱。
         let read_usage = serde_json::json!({
             "input_tokens": 1, "output_tokens": 0,
             "cache_read_input_tokens": 1_000_000, "cache_creation_input_tokens": 0,
         });
-        let read_on = compute_cost(Some(&read_usage), "cheap-test-model", 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, false);
-        let read_off = compute_cost(Some(&read_usage), "cheap-test-model", 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, true);
-        assert_eq!(read_on, read_off, "缓存读在开/关两种模式下应当一致（都便宜）");
-        assert_eq!(read_on, 50, "缓存读 $0.5 = 50 分");
+        assert_eq!(
+            compute_cost(Some(&read_usage), "cache-off-model", 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, true),
+            0,
+            "关缓存应当缓存读也不收"
+        );
+        // 普通输入/输出**不受开关影响**：给 100 万普通 input，关缓存照样按 $5 收 = 500 分。
+        let plain_usage = serde_json::json!({ "input_tokens": 1_000_000, "output_tokens": 0 });
+        assert_eq!(
+            compute_cost(Some(&plain_usage), "cache-off-model", 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, true),
+            500,
+            "关缓存不该动普通输入价"
+        );
     }
 
     /// 加价模型：你把输入价从目录的 $5 覆盖成 $15（3×），缓存价必须跟着放大到 3×，
@@ -12579,7 +12594,7 @@ async fn bill_vision_call(
         vconn.cache_create_price,
         model_in,
         model_out,
-        crate::settings::cache_billing_cheap(),
+        vconn.cache_disabled,
     );
     // 单独打标，和聊天、压缩三者在用量表里分得开。
     let mut tokens = extract_bill_tokens(usage.filter(|_| reported), "michael-vision/gpt-5.5", !reported);
@@ -12608,7 +12623,7 @@ async fn bill_compression_call(
         conn.cache_create_price,
         model_in,
         model_out,
-        crate::settings::cache_billing_cheap(),
+        conn.cache_disabled,
     );
     let mut tokens = extract_bill_tokens(
         usage.filter(|_| reported),

@@ -96,6 +96,7 @@ type Conn = {
   output_price?: number;
   cache_read_price?: number;
   cache_create_price?: number;
+  cache_disabled?: boolean;
   description?: string;
   enabled_models?: string[];
   billing_mode?: string;
@@ -949,10 +950,9 @@ function ConnectionDialog({
   const [description, setDescription] = useState(conn?.description || "");
   const [mode, setMode] = useState(conn?.billing_mode === "per_call" ? "per_call" : "rate");
   const [rate, setRate] = useState(String(conn?.rate ?? 1));
-  const [inPrice, setInPrice] = useState(String(conn?.input_price ?? 0));
-  const [outPrice, setOutPrice] = useState(String(conn?.output_price ?? 0));
-  const [cacheRead, setCacheRead] = useState(String(conn?.cache_read_price ?? 0));
-  const [cacheCreate, setCacheCreate] = useState(String(conn?.cache_create_price ?? 0));
+  // 输入/输出/缓存价的兜底字段已从编辑器移除（2026-08-18）：拉取的模型自带价格和缓存价，
+  // 单模型价在下面「开放的模型」列表里逐个设。后端那几列留着（默认 0 = 用目录价），这里不再暴露。
+  const [cacheDisabled, setCacheDisabled] = useState(Boolean(conn?.cache_disabled));
   // 「Claude 强力版」：勾上之后，IDE 里打开强力版开关的那一轮请求只会落到这条线路上。
   const [powerRoute, setPowerRoute] = useState(Boolean(conn?.power_route));
   const [perCall, setPerCall] = useState(String(conn ? channelFeeUsd(conn) : 0.2));
@@ -1045,10 +1045,7 @@ function ConnectionDialog({
       billing_mode: mode,
       rate: rateVal,
       power_route: powerRoute,
-      input_price: nz(inPrice),
-      output_price: nz(outPrice),
-      cache_read_price: nz(cacheRead),
-      cache_create_price: nz(cacheCreate),
+      cache_disabled: cacheDisabled,
       // Both units stay in sync: the paid path still settles whole cents, free models read micro.
       per_call_micro_usd: Math.round(usd * 1_000_000),
       per_call_cents: Math.max(0, Math.round(usd * 100)),
@@ -1220,27 +1217,19 @@ function ConnectionDialog({
             <option value="per_call">按次（每次调用固定收费）</option>
           </Select>
           {mode === "rate" ? (
-            <div className="mt-4 grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
-              <div>
+            <div className="mt-4 space-y-4">
+              <div className="sm:max-w-56">
                 <Label htmlFor="cd-rate">倍率</Label>
                 <Input id="cd-rate" type="number" min="0" step="0.1" value={rate} onChange={(e) => setRate(e.target.value)} />
               </div>
-              <div>
-                <Label htmlFor="cd-in">输入价 $/1M</Label>
-                <Input id="cd-in" type="number" min="0" step="0.01" value={inPrice} onChange={(e) => setInPrice(e.target.value)} />
-              </div>
-              <div>
-                <Label htmlFor="cd-out">输出价 $/1M</Label>
-                <Input id="cd-out" type="number" min="0" step="0.01" value={outPrice} onChange={(e) => setOutPrice(e.target.value)} />
-              </div>
-              <div>
-                <Label htmlFor="cd-cr">缓存读取 $/1M</Label>
-                <Input id="cd-cr" type="number" min="0" step="0.01" value={cacheRead} onChange={(e) => setCacheRead(e.target.value)} />
-              </div>
-              <div>
-                <Label htmlFor="cd-cc">缓存写入 $/1M</Label>
-                <Input id="cd-cc" type="number" min="0" step="0.01" value={cacheCreate} onChange={(e) => setCacheCreate(e.target.value)} />
-              </div>
+              <label className="flex items-center gap-2 text-sm">
+                <input
+                  type="checkbox"
+                  checked={cacheDisabled}
+                  onChange={(e) => setCacheDisabled(e.target.checked)}
+                />
+                关闭缓存计费（缓存读/写都不收钱，输入输出价照常）
+              </label>
             </div>
           ) : (
             <div className="mt-4 sm:max-w-56">
@@ -1256,9 +1245,9 @@ function ConnectionDialog({
             </div>
           )}
           <p className="mt-3 text-xs text-muted-foreground">
-            倍率是加价，3 = 按真实成本的 3 倍收；留空按 1 算，填 0 就是一分不收。
-            输入价 / 输出价是「兜底价」：内置价目表收录的模型一律按官方价算，只有没收录的才用这里的数。
-            缓存读取默认 0.1× 输入价，缓存写入默认 1.25× 输入价。
+            倍率是加价，3 = 按真实成本的 3 倍收；留空按 1 算，填 0 就是一分不收。价格和缓存价一律取自
+            拉取的模型目录；单模型价在下面逐个设。勾上「关闭缓存计费」= 这条线路的缓存读/写都不收钱
+            （灰产/便宜渠道用），输入输出价不受影响。
           </p>
         </div>
 
