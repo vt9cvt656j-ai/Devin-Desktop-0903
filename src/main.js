@@ -51494,7 +51494,16 @@ function _recoverEditMatch(text, needle) {
   // (and must avoid) a partial-line span — that would corrupt indentation.
   const lineWise = (cand) => {
     const needleLines = cand.replace(/\n$/, "").split("\n");
-    for (const norm of [(s) => s.replace(/[ \t]+$/, ""), (s) => s.trim()]) {
+    // 只归一化**行尾**空白。原来这里还有一个 `(s) => s.trim()`，它把**行首缩进**也剥掉——
+    // 于是模型给的缩进错一级也能命中，而 lineWise 不返回 indent，调用方
+    // （`if (rec.indent) _editReplacement = _reindentReplacement(…)`）就不会补缩进，
+    // 直接把模型自己的缩进写进文件。对 Python / YAML 这类缩进即语法的语言，结果是
+    // **静默改坏代码**：语法仍然合法，代码块被挪进或挪出一层 if，没有任何报错。
+    //
+    // 缩进差异本来就有专门的安全路径 indentNorm（就在下面）：它校验「每一行的缩进差值
+    // 必须一致」，一致才返回公共前缀让调用方补回去，不一致就拒绝、落回"找不到
+    // old_string"让模型照原文重试。但 lineWise 排在它前面先 return，那套防护被整个绕过。
+    for (const norm of [(s) => s.replace(/[ \t]+$/, "")]) {
       const nNorm = needleLines.map(norm);
       if (nNorm.every((l) => l === "")) continue;
       const at = [];

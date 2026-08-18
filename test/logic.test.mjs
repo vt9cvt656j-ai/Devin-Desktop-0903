@@ -27791,3 +27791,36 @@ test("会删东西的 find 不许被判成只读命令，批量删除必须弹�
     assert.ok(!RE.test(cmd), `日常操作被误报成危险，确认框会变成噪声：${cmd}`);
   }
 });
+
+test("edit_file 的空白容错不许把 Python 代码块挪进/挪出一层缩进", () => {
+  // _recoverEditMatch 有两条容错路径，安全等级不同：
+  //   lineWise   —— 归一化后逐行比对；曾经带一个 `(s) => s.trim()`，把**行首缩进**也剥掉
+  //   indentNorm —— 校验「每行缩进差值一致」，一致才返回公共前缀让调用方补回去
+  // 调用方是 `if (rec.indent) _editReplacement = _reindentReplacement(...)`，
+  // 所以不返回 indent 就等于按模型自己的缩进写入。lineWise 排在 indentNorm 前面先 return，
+  // 于是那套防护被整个绕过：模型缩进错一级也"匹配成功"，写进去的代码被静默挪进/挪出
+  // 一层 if——Python/YAML 语法仍然合法，语义变了，没有任何报错。
+  const src = SRC.slice(SRC.indexOf("function _recoverEditMatch(text, needle)"));
+  const body = src.slice(0, src.indexOf("\n/// 给 new_string"));
+  // 断言钉在**实现**上，不能钉在"源码里不许出现 s.trim()"——上面那段注释里就引用了
+  // 这个写法，doesNotMatch 会被自己的注释喂到而误红。改成正面断言归一化数组只剩一项。
+  const normArr = /for \(const norm of \[([\s\S]*?)\]\) \{/.exec(body);
+  assert.ok(normArr, "找不到 lineWise 的归一化数组");
+  assert.equal(normArr[1].split("=>").length - 1, 1,
+    "lineWise 的归一化只能有「去行尾空白」一项；带上剥行首缩进的那项会绕过 indentNorm 的安全校验");
+  assert.match(normArr[1], /\[ \\t\]\+\$/,
+    "保留下来的那一项必须是去**行尾**空白");
+
+  // 先切再替换：replace 会改变长度，拿原串的下标去 slice 会切歪，得到一段语法不全的
+  // 函数体，new Function 直接抛 SyntaxError。
+  const fn = new Function("text", "needle",
+    body.slice(body.indexOf("{") + 1, body.lastIndexOf("}")).replace(/_stripLineNoPrefix\(needle\)/, "null"));
+  // 文件里这段在 if 之内（缩进 8），模型给的 old_string 少一级（缩进 4）。
+  const file = ["def run(cfg):", "    if cfg.enabled:", "        total = 0", "        total += 1", "    return total"].join("\n");
+  const needle = ["    total = 0", "    total += 1"].join("\n");
+  const r = fn(file, needle);
+  if (r) {
+    assert.equal(r.indent, "    ",
+      "缩进容错命中却没返回要补回的公共前缀——调用方会按模型的缩进写入，把代码挪出 if");
+  }
+});
