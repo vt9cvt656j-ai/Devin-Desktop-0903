@@ -27873,3 +27873,45 @@ test("文件树把构建产物压暗并沉底，但不许把它们藏起来", ()
   assert.match(APP_CSS, /\.row--ignored \.name/,
     "压暗样式没了，class 加了也看不出区别");
 });
+
+test("删目录之前要快照，撤不回来的部分必须说出来", async () => {
+  // delete_path 在 Rust 侧是 remove_dir_all——没有回收站、没有备份。而此前只有**单个
+  // 文本文件**会进 checkpoint，目录和二进制走 deletePath，一条快照都不留。于是 agent
+  // 一句 delete_path("src/legacy") 之后「全部撤销」对它完全无效，而按钮照常显示"已撤销"。
+  let src = SRC.slice(SRC.indexOf("const _UNDO_SNAPSHOT_MAX_FILES"));
+  src = src.slice(0, src.indexOf("\nfunction _checkpointRecord"));
+
+  const tree = {
+    "/r": [{ name: "a.js", path: "/r/a.js", is_dir: false },
+           { name: "sub", path: "/r/sub", is_dir: true },
+           { name: "img.png", path: "/r/img.png", is_dir: false }],
+    "/r/sub": [{ name: "b.ts", path: "/r/sub/b.ts", is_dir: false }],
+  };
+  const contents = { "/r/a.js": "AAA", "/r/sub/b.ts": "BBB" };
+  const backend = {
+    readDir: async (d) => tree[d] || [],
+    readTextFile: async (p) => { if (!(p in contents)) throw new Error("binary"); return contents[p]; },
+  };
+  const snap = new Function("backend", "_treePath", src + "; return _snapshotDirForUndo;")(backend, (x) => x);
+
+  const r = await snap("/r");
+  assert.deepEqual(r.files.map((f) => f.path).sort(), ["/r/a.js", "/r/sub/b.ts"],
+    "没有递归进子目录——撤销只能还原顶层");
+  assert.equal(r.files.find((f) => f.path === "/r/sub/b.ts").content, "BBB");
+  assert.equal(r.truncated, true,
+    "有读不出的文件（二进制）却没报告 truncated——用户会以为整棵树都能撤回来");
+
+  // 全部可读时不能谎报 truncated，否则提示常亮、然后就没人看了。
+  const clean = new Function("backend", "_treePath", src + "; return _snapshotDirForUndo;")(
+    { readDir: async (d) => (d === "/c" ? [{ name: "x.js", path: "/c/x.js", is_dir: false }] : []),
+      readTextFile: async () => "X" }, (x) => x);
+  assert.equal((await clean("/c")).truncated, false, "全部快照成功却报告成 truncated");
+
+  // 删除结果必须把撤销能力如实告诉模型。
+  assert.match(SRC, /无法撤销/, "删目录时没有把「撤不回来」写进给模型的结果");
+  // 条件要一起钉住：只断言"这行存在"的话，把它改成 `if (false) …` 也照样匹配。
+  assert.match(SRC, /if \(oldText == null\) dirSnapshot = await _snapshotDirForUndo\(fp\);/,
+    "删目录前没有做快照（或快照被条件关掉了）");
+  assert.match(SRC, /for \(const f of dirSnapshot\.files\) \{[\s\S]{0,200}?_checkpointRecord\(_cp, f\.path, true, f\.content\)/,
+    "快照没有写进 checkpoint——存了等于没存，撤销仍然还原不了");
+});
