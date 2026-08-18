@@ -4690,7 +4690,23 @@ async fn bill_inner(
                 .fetch_optional(&mut *tx)
                 .await
                 .unwrap_or(None);
-        let (cents, rest) = carry_to_cents(prior.map(|(c,)| c).unwrap_or(0), free_micro_usd);
+        // **只进位零头**，别把整分部分再收一遍。
+        //
+        // `requested_cost` 已经是这笔调用的整分费用（per_call 模式下 resolve_cost 直接返回
+        // per_call_cents），而 `free_micro_usd` 是**同一笔费用**的 micro-USD 写法
+        // （per_call_micro_usd，或没配 micro 时的 per_call_cents × 10_000）。整笔丢进
+        // carry_to_cents 等于把它换算成分之后再加一次：
+        //
+        //     $0.05/次  → requested_cost 5¢ + carry 5¢ = 10¢     （2 倍）
+        //     $0.003/次 → 每次 1¢（后台把任何非零费用抬到 ≥1 分）+ 每 3.34 次再 1¢ ≈ 4.3 倍
+        //
+        // 上面那段注释写的就是本意：「requested_cost 是整分……把**零头**累计起来」。
+        // 代码没兑现这个不变量。唯一不出错的情形是连接级费用 < $0.005（换算成整分被
+        // Math.round 舍成 0）——而那恰好是既有测试假设的场景，所以测试全绿也挡不住。
+        //
+        // free_fallback_to_paid 默认开，超收会经 split_fused_charge 记成真实负债。
+        let carry_input = (free_micro_usd - requested_cost.saturating_mul(MICRO_USD_PER_CENT)).max(0);
+        let (cents, rest) = carry_to_cents(prior.map(|(c,)| c).unwrap_or(0), carry_input);
         carried_cents = cents;
         if let Err(error) = sqlx::query("UPDATE users SET micro_usd_carry = $1 WHERE id = $2")
             .bind(rest)
@@ -8433,6 +8449,53 @@ mod billing_tests {
     /// `admit_billing` 直接 `return Ok(true)`，它后面的"改走会员额度/钱包"和两条 402
     /// 整段不可达。用户要的"免费用完接着扣余额和订阅"到不了，没余额的用户也永远收不到
     /// 402，欠款无上限地记进钱包。
+    #[test]
+    /// 整分那部分不许被收第二遍。
+    ///
+    /// requested_cost 已经是这笔调用的整分费用（per_call 模式下 resolve_cost 直接返回
+    /// per_call_cents），而 free_micro_usd 是**同一笔费用**的 micro-USD 写法。把整笔丢进
+    /// carry_to_cents 等于换算成分之后再加一次：$0.05/次 收 10¢（2 倍），
+    /// $0.003/次 因为后台把任何非零费用抬到 ≥1 分，实收约 1.3¢（4.3 倍）。
+    ///
+    /// 既有的 sub_cent 测试覆盖不到这个：它假设的场景是费用 < $0.005、换算成整分是 0，
+    /// 那时 requested_cost 为 0，减不减都一样。所以那条全绿也挡不住这个 bug。
+    fn whole_cent_part_is_not_charged_twice() {
+        const MICRO: i64 = super::MICRO_USD_PER_CENT;
+        // 进位的输入必须是「micro 总额减去已经按整分收掉的部分」。
+        let carry_input = |free_micro: i64, requested_cents: i64| -> i64 {
+            (free_micro - requested_cents.saturating_mul(MICRO)).max(0)
+        };
+
+        // $0.05/次：requested_cost 已收 5¢，micro 也是 50000 → 零头应为 0，不再加收。
+        assert_eq!(carry_input(50_000, 5), 0, "整分费用被收了第二遍（2 倍）");
+        assert_eq!(super::carry_to_cents(0, carry_input(50_000, 5)), (0, 0));
+
+        // $0.003/次：后台把它抬成 1¢ 收掉，而 micro 只有 3000 → 已经多收了，零头必须为 0，
+        // 绝不能再攒着以后又扣一分。
+        assert_eq!(carry_input(3_000, 1), 0, "已经超收了还要再攒零头（4.3 倍）");
+
+        // $0.015/次：整分收 1¢，micro 15000 → 只剩 5000 零头该攒着。
+        assert_eq!(carry_input(15_000, 1), 5_000, "零头算错了");
+        assert_eq!(super::carry_to_cents(6_000, carry_input(15_000, 1)), (1, 1_000));
+
+        // 真正的亚分场景（requested_cost 为 0）行为不变——这是既有测试覆盖的那条路。
+        assert_eq!(carry_input(3_000, 0), 3_000);
+
+        // 接线：实现必须真的减掉整分部分，否则上面全是纯函数演算、代码照旧双收。
+        let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/models.rs"))
+            .expect("read models.rs");
+        let at = src.find("async fn bill(").expect("bill 改名了");
+        let body: String = src[at..].chars().take(14_000).collect();
+        assert!(
+            body.contains("let carry_input = (free_micro_usd - requested_cost.saturating_mul(MICRO_USD_PER_CENT)).max(0);"),
+            "进位的输入仍然是整笔 free_micro_usd —— 整分部分会被收第二遍",
+        );
+        assert!(
+            body.contains("carry_to_cents(prior.map(|(c,)| c).unwrap_or(0), carry_input)"),
+            "算出来的 carry_input 没有被真的用上",
+        );
+    }
+
     #[test]
     /// 亚分零头要累计，不能既不四舍五入也不收。
     ///
