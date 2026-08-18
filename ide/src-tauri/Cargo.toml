@@ -41,6 +41,10 @@ zip = { version = "2", default-features = false, features = ["deflate"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 portable-pty = "0.9.0"
+# .gitignore 语义（否定 !、锚定 /、目录限定 xx/、**、嵌套 .gitignore、全局 excludes）
+# 自己手写极易把用户**自己的源码**误藏——那比显示 node_modules 严重得多。用 ripgrep
+# 同款实现，别赌手搓正则。
+ignore = "0.4"
 notify = "7"
 notify-debouncer-mini = "0.5"
 once_cell = "1"
