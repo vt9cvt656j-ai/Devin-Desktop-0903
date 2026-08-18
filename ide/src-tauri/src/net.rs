@@ -1094,7 +1094,9 @@ async fn try_chat_image_api(
     };
     let body = serde_json::json!({
         "model": model.trim(),
-        "stream": false,
+        // 一律走 SSE：中转对同步请求是整段生成完才回（用户控制台里这些请求类型写着"同步"）。
+        // 出图本身耗时在生成，不在传输，但同步请求在这条中转上还要额外排队。
+        "stream": true,
         "messages": [{ "role": "user", "content": prompt }],
         "max_tokens": 1500,
     });
@@ -1121,8 +1123,14 @@ async fn try_chat_image_api(
             text.chars().take(200).collect::<String>()
         ));
     }
-    let v: serde_json::Value =
-        serde_json::from_str(&text).map_err(|e| format!("chat 响应解析失败: {e}"))?;
+    // SSE 回来的是一串增量。**不能只拼文本**：extract_image_ref 还要读 message.images
+    // 这类非文本字段，只拼字符串会把图丢掉、然后报"回复里没找到图片"。所以把增量合并回
+    // 一个完整的 choices[0].message 再交给它。中转若无视 stream:true 直接回 JSON，
+    // merge_sse_chat_message 返回 None，走下面原来的整体解析。
+    let v: serde_json::Value = match merge_sse_chat_message(&text) {
+        Some(merged) => merged,
+        None => serde_json::from_str(&text).map_err(|e| format!("chat 响应解析失败: {e}"))?,
+    };
     let img = extract_image_ref(&v).ok_or_else(|| {
         let snippet: String = v["choices"][0]["message"]["content"]
             .as_str()
@@ -1160,6 +1168,54 @@ async fn try_chat_image_api(
 
 /// Pull an image reference out of a chat-completions response (string content with
 /// markdown/URL/data-URL, multimodal image_url parts, or an `images[]` field).
+/// 把一段 SSE 原文合并回 `{"choices":[{"message":{...}}]}` 的形状。
+///
+/// 只拼 `delta.content` 是不够的：出图的中转经常把图片放在 `images`、或者把 content 发成
+/// 分片数组。丢了那些字段的表现是"回复里没找到图片"——看起来像模型没出图，其实是解析丢了。
+/// 不是 SSE（中转无视了 stream:true）时返回 None，让调用方按普通 JSON 解析。
+fn merge_sse_chat_message(text: &str) -> Option<serde_json::Value> {
+    let mut saw_frame = false;
+    let mut content = String::new();
+    let mut message = serde_json::Map::new();
+    for line in text.lines() {
+        let Some(data) = line.trim().strip_prefix("data:") else {
+            continue;
+        };
+        let data = data.trim();
+        if data == "[DONE]" {
+            saw_frame = true;
+            continue;
+        }
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(data) else {
+            continue;
+        };
+        saw_frame = true;
+        let delta = &v["choices"][0]["delta"];
+        if let Some(t) = delta["content"].as_str() {
+            content.push_str(t);
+        }
+        // 文本以外的字段（images / 分片数组形式的 content / tool 之类）原样保留：
+        // 后到的覆盖先到的，缺省不动。
+        if let Some(obj) = delta.as_object() {
+            for (k, val) in obj {
+                if k == "content" && val.is_string() {
+                    continue;
+                }
+                if !val.is_null() {
+                    message.insert(k.clone(), val.clone());
+                }
+            }
+        }
+    }
+    if !saw_frame {
+        return None;
+    }
+    if !content.is_empty() {
+        message.insert("content".into(), serde_json::Value::String(content));
+    }
+    Some(serde_json::json!({ "choices": [{ "message": serde_json::Value::Object(message) }] }))
+}
+
 fn extract_image_ref(v: &serde_json::Value) -> Option<String> {
     let msg = &v["choices"][0]["message"];
     if let Some(s) = msg["content"].as_str() {
@@ -1278,6 +1334,46 @@ fn b64_decode_limited(s: &str, limit: usize) -> Result<Vec<u8>, String> {
 
 #[cfg(test)]
 mod img_tests {
+
+    /// SSE 合并不能只拼文本：出图的中转常把图片放在 images 字段或分片 content 里，
+    /// 丢了它们的表现是"回复里没找到图片"——看着像模型没出图，其实是解析把它扔了。
+    #[test]
+    fn sse_merge_keeps_non_text_fields() {
+        let body = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"生成好了：\"}}]}\n",
+            "data: {\"choices\":[{\"delta\":{\"images\":[{\"url\":\"https://x.test/a.png\"}]}}]}\n",
+            "data: [DONE]\n",
+        );
+        let merged = merge_sse_chat_message(body).expect("应认出这是 SSE");
+        assert_eq!(merged["choices"][0]["message"]["content"], "生成好了：");
+        assert_eq!(
+            extract_image_ref(&merged).as_deref(),
+            Some("https://x.test/a.png")
+        );
+    }
+
+    /// 中转无视 stream:true、直接回 JSON 时返回 None，让调用方按整体 JSON 解析——
+    /// 没有这条兜底，那些线路会整个用不了。
+    #[test]
+    fn sse_merge_returns_none_for_plain_json() {
+        let body = r#"{"choices":[{"message":{"content":"https://x.test/b.png"}}]}"#;
+        assert!(merge_sse_chat_message(body).is_none());
+    }
+
+    /// 纯文本增量：图片地址写在正文里的那种中转。
+    #[test]
+    fn sse_merge_assembles_text_only_frames() {
+        let body = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"https://x.test/\"}}]}\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"c.png\"}}]}\n",
+            "data: [DONE]\n",
+        );
+        let merged = merge_sse_chat_message(body).unwrap();
+        assert_eq!(
+            extract_image_ref(&merged).as_deref(),
+            Some("https://x.test/c.png")
+        );
+    }
     use super::*;
     use serde_json::json;
 
