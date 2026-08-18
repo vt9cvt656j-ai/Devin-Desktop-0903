@@ -24276,6 +24276,9 @@ const _INCOMPLETE_LABELS = {
   subagent_results_pending: "收拢子任务结果",
   ui_verification_missing: "在界面上验一遍",
   iteration_limit: "接着上次的进度继续",
+  // 空转断路器拦下的：它连着十几轮既没产出也没拿到新证据。让用户看到的是"卡住了"，
+  // 而不是内部枚举名，并且给一句真能照做的下一步——换个说法往往就走出去了。
+  no_progress: "换个说法或给个更具体的目标再试",
   // 用户按停也是一种"没做完"。少了这一行，建议行会退回泛泛的「继续完成剩余部分」，
   // send 串里还会写成「因 user_stopped 未完成」——把内部枚举名甩给用户看。
   user_stopped: "接着上次的进度继续",
@@ -24948,7 +24951,7 @@ async function _drainFollowups(sess) {
     saveChatHistory();
     const sent = typeof next === "string"
       ? sendPrompt(next, [], config)
-      : sendPrompt(next.text, next.attachments || [], config);
+      : sendPrompt(next.text, next.attachments || [], config, { alreadyInTranscript: !!next.alreadyInTranscript });
     Promise.resolve(sent).catch(() => {});
     _renderQueueBar(sess);
   } catch {}
@@ -25145,7 +25148,7 @@ function _withoutModelToken(text) {
   return String(text || "").replace(/(?:^|\s)@model:[^\s@]+\s*/, " ").replace(/\s{2,}/g, " ").trim();
 }
 
-async function sendPrompt(text, attachments = [], readyConfig = null) {
+async function sendPrompt(text, attachments = [], readyConfig = null, opts = {}) {
   const _taskStartedAt = Date.now();
   const config = readyConfig || await _readyAiConfig();
   if (!config) return;
@@ -25273,7 +25276,9 @@ async function sendPrompt(text, attachments = [], readyConfig = null) {
   // 诊断 / git）是无状态的，它不知道刚才发生过什么——"解释 database.py" 发完、模型
   // 答完，它照样把同一句再推一次，看着就像预测从来不更新。
   try { sess._recentSent = [text, ...(sess._recentSent || [])].slice(0, 5); } catch {}
-  addMessage("user", text, sess, attachments);
+  // opts.alreadyInTranscript：气泡和记忆在别处已经落过了——收尾时被搁下的插话走这条路
+  // 重发一轮，再画一次就是同一句话在对话里出现两遍。
+  if (!opts.alreadyInTranscript) addMessage("user", text, sess, attachments);
   // 直接把「真正的助手消息壳」（头像+消息框+思考卡）提前上屏——和流式开始时那张是同一张，
   // 而不是先塞一个裸转圈占位（没有消息框结构、跟上文挤在一起，1-2 秒后又被真卡替换）。
   // 下游所有 addMessage("assistant", …) 通过 sess._preTurnAssistant 复用这个壳。
@@ -25769,7 +25774,7 @@ async function sendPrompt(text, attachments = [], readyConfig = null) {
     + _uiVisualEvidenceHint;
   const userContent = await _attachmentAwareContent(_userText, attachments, config, 7_000_000, false, text);
   messages.push({ role: "user", content: userContent });
-  sess.memory.push({ role: "user", content: text, attachments });
+  if (!opts.alreadyInTranscript) sess.memory.push({ role: "user", content: text, attachments });
   // 会话需求账本：用户每条实质要求入账（接续词/纯寒暄不записыв入），每轮开工整本
   // 注入——治"项目多轮对话失忆，不知道我具体需求"：老要求在几百条工具结果里被
   // 稀释/折叠后，模型注意力捞不回来；账本把历次要求压缩成清单常驻眼前。
@@ -40721,6 +40726,28 @@ function _executionEvidenceFromTool(call, result, root) {
 // newest verification the model DECLARED and that FAILED at the current edit count, so a
 // red build the LSP never mirrored (tsc -b project refs, a Makefile, a custom checker)
 // still forces another fix pass instead of a "clean" finish on a broken tree.
+/**
+ * 空转多少轮就收手。
+ *
+ * 步数天花板是**有意**去掉的：结束由模型自主判定（做完 → 静默 → finish gate），给一个
+ * 固定上限会把正当的长任务拦腰砍断。但"没有天花板"被读成了"没有任何下限"——实测一个 run
+ * 可以几十上百轮既不产出、也不取得任何新证据，用户看到的就是"1-2 分钟的事跑了半天"。
+ *
+ * 所以拦的不是"步数多"，是"步数多但什么都没发生"。12 轮是照着真实节奏取的：一次正常的
+ * 探索-实现循环里，读几个文件、跑一条命令，进展计数每一两轮就会动一次；连着 12 轮纹丝不动
+ * 只有一种情况——它在原地打转。
+ *
+ * 可配置（设置里的 agentIdleLimit）：填 0 关掉这道闸门，填正数改阈值（下限 2）。
+ * 注释里提过的"兜底开关"以前全代码库都没有写入点，这就是那个开关。
+ */
+function _idleIterLimit() {
+  let raw = NaN;
+  try { raw = Number(loadConfig()?.agentIdleLimit); } catch {}
+  if (!Number.isFinite(raw)) return 12;
+  if (raw === 0) return Infinity;             // 明确填 0 = 关掉
+  return raw > 0 ? Math.max(2, Math.round(raw)) : 12;
+}
+
 function _freshBuildFailure(run, implOps) {
   const ev = run && Array.isArray(run._executionEvidence) ? run._executionEvidence : [];
   const settled = new Set();
@@ -45835,6 +45862,16 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
   run._narrativeSeen = new Set();
   const _editCounts = new Map();   // path → how many times edited this run (churn detector)
   const _churnNudged = new Set();  // files we've already churn-warned (once each)
+  // 空转断路器。步数天花板是有意去掉的（结束由模型自主判定），但"没有天花板"被读成了
+  // "没有任何下限"：实测一整个 run 可以几十上百轮既不产出、也不取得任何新证据，用户看到的
+  // 就是"1-2 分钟能解决的事跑了半天"。已有的 implLoop / churn / planNudge 三条都只是提示词，
+  // 模型可以完全不理。
+  //
+  // 这里拦的**不是步数多**，是"步数多但什么都没发生"——产出（改文件/跑命令/外部副作用）
+  // 和证据（新的读取/搜索）任意一样有进展就清零，所以正当的长任务一步都不会被砍掉。
+  let _idleIters = 0;
+  let _idleProgressMark = -1;
+  const _IDLE_ITER_LIMIT = _idleIterLimit();
   // 步数预算已拆除：结束由 AI 自主判定（做完→静默→finish gate），不设步数天花板。
   // budget 仅作为 token 预算超限时的收尾钳位句柄（Math.min(Infinity, iter+3) 有效）。
   let budget = Infinity;
@@ -48258,6 +48295,18 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
         runHadTrouble = true;
         _pushNudge("implLoop", `⚠️ 你已经取得 ${_novelEvidenceCount} 份新的读取/搜索证据，**仍没有实际改动**。调查是手段，不是产出；如果这是修复/实现任务，现在基于已掌握内容直接 write_file / edit_file，别继续追加相似搜索。只有纯查询/解释任务才应直接给结论收尾。`);
       }
+      // 空转断路器：连续 _IDLE_ITER_LIMIT 轮既无产出也无新证据 → 如实收尾，别再烧下去。
+      // 只在 agent 模式生效；对话/规划这些本来就不产出的模式不适用。
+      {
+        const _progressNow = _anyProgressOps + _novelEvidenceCount;
+        if (_progressNow > _idleProgressMark) { _idleProgressMark = _progressNow; _idleIters = 0; }
+        else if (run.mode === "agent") _idleIters++;
+        if (_idleIters >= _IDLE_ITER_LIMIT && _live()) {
+          run._incompleteReason = "no_progress";
+          runHadTrouble = true;
+          break;
+        }
+      }
       if (_mutatedFiles.size >= 3 && !planSteps && !planNudged && _live()) {
         planNudged = true;
         _pushNudge("planNudge", "这已经动了好几个文件、还在扩大——先停一下整合剩余工作：直接列清还要改哪些、要验证哪些，然后继续用 edit/write/run 收敛，别散着改、改漏了。");
@@ -48494,7 +48543,9 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
       const _t = typeof stranded === "string" ? stranded : String(stranded?.semanticText || stranded?.text || "");
       if (!_t.trim()) continue;
       (session._pendingSends = session._pendingSends || []).push({
-        text: _t, attachments: (typeof stranded === "string" ? [] : stranded?.attachments) || [],
+        text: _t,
+        attachments: (typeof stranded === "string" ? [] : stranded?.attachments) || [],
+        alreadyInTranscript: true, // 气泡和记忆在 _steerRunningAgent 里已经落过
       });
     }
     _drainFollowups(session); // safety net: any queued follow-up (if this wasn't steered) fires now
