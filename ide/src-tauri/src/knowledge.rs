@@ -198,10 +198,19 @@ fn canonical_community_source(source: &str) -> Option<&'static str> {
     }
 }
 
+/// 返回 (选中的源, 被丢掉的源名)。丢掉的那些要**告诉模型**，不能只写进日志：
+/// 它看不见就会把同样的参数原样再发一遍。
 fn select_developer_sources(
     scope: Option<&str>,
     requested: Option<&[String]>,
 ) -> Result<Vec<&'static str>, String> {
+    select_developer_sources_reporting(scope, requested).map(|(picked, _)| picked)
+}
+
+fn select_developer_sources_reporting(
+    scope: Option<&str>,
+    requested: Option<&[String]>,
+) -> Result<(Vec<&'static str>, Vec<String>), String> {
     if let Some(requested) = requested.filter(|items| !items.is_empty()) {
         let mut selected = Vec::new();
         let mut unknown = Vec::new();
@@ -212,7 +221,14 @@ fn select_developer_sources(
                 None => unknown.push(source.trim().to_string()),
             }
         }
-        if !unknown.is_empty() {
+        // 一个不认识的源名不该把整条调用毙掉。模型按参数说明写 ["github","stackoverflow",
+        // "reddit"]，前两个完全有效，却因为第三个一条结果都拿不到 —— 而它下一轮多半是把
+        // **同样的参数**再发一遍。认得的照查，不认得的在结果里说清楚，这是"有一半答案"
+        // 和"什么都没有"的区别。
+        //
+        // 一个都不认得才是真的失败：那种情况下继续跑等于悄悄换成了默认全量搜索，
+        // 模型会以为自己指定的范围生效了。
+        if selected.is_empty() {
             let supported = DEVELOPER_COMMUNITY_SOURCES
                 .iter()
                 .map(|(name, _)| *name)
@@ -223,7 +239,10 @@ fn select_developer_sources(
                 unknown.join(", ")
             ));
         }
-        return Ok(selected);
+        if !unknown.is_empty() {
+            tracing::info!(dropped = ?unknown, kept = ?selected, "dropped unknown developer sources");
+        }
+        return Ok((selected, unknown));
     }
 
     let selected = match scope.unwrap_or("all").trim().to_lowercase().as_str() {
@@ -261,7 +280,7 @@ fn select_developer_sources(
             ))
         }
     };
-    Ok(selected)
+    Ok((selected, Vec::new()))
 }
 
 fn url_query_component(value: &str) -> String {
@@ -2864,7 +2883,8 @@ pub async fn developer_community_search(
         return Err("搜索词不能为空，请输入关键词".into());
     }
 
-    let selected = select_developer_sources(scope.as_deref(), sources.as_deref())?;
+    let (selected, dropped_sources) =
+        select_developer_sources_reporting(scope.as_deref(), sources.as_deref())?;
     let limit = max_per_source.unwrap_or(3).clamp(1, 5);
     let mut pending: FuturesUnordered<CommunitySearchFuture> = FuturesUnordered::new();
 
@@ -2999,12 +3019,23 @@ pub async fn developer_community_search(
     while let Some(response) = pending.next().await {
         responses.push((response.0, response.1, response.2, retrieved_at()));
     }
-    Ok(format_developer_community_results(
-        &query,
-        &selected,
-        responses,
-        &retrieved_at(),
-    ))
+    let mut out = format_developer_community_results(&query, &selected, responses, &retrieved_at());
+    if !dropped_sources.is_empty() {
+        // 说清"没去找"，而不是让模型以为它指定的范围全都查过了。放在最前面，因为它改变
+        // 的是**这次结果的覆盖范围**，读到后面才发现就晚了。
+        let supported = DEVELOPER_COMMUNITY_SOURCES
+            .iter()
+            .map(|(name, _)| *name)
+            .collect::<Vec<_>>()
+            .join(", ");
+        out = format!(
+            "dropped_sources: {}\nThese source names are not supported and were NOT searched; \
+             the results below cover only: {}. Supported sources: {supported}\n\n{out}",
+            dropped_sources.join(", "),
+            selected.join(", "),
+        );
+    }
+    Ok(out)
 }
 
 fn format_developer_community_results(
@@ -5605,6 +5636,37 @@ mod tests {
                 "kotlin_discussions"
             ]
         );
+    }
+
+    /// 一个不认识的源名不该把整条调用毙掉。
+    ///
+    /// 模型照参数说明写 ["github","stackoverflow","reddit"]（说明里曾经真的举了 reddit
+    /// 这个例子，而它 2026-08-05 已下线），前两个完全有效，却一条结果都拿不到——而模型
+    /// 下一轮多半把**同样的参数**再发一遍。认得的照查，不认得的在结果最前面说清楚。
+    #[test]
+    fn one_dead_source_name_does_not_kill_the_whole_call() {
+        let req = |names: &[&str]| {
+            names.iter().map(|s| s.to_string()).collect::<Vec<_>>()
+        };
+        let (kept, dropped) =
+            super::select_developer_sources_reporting(None, Some(&req(&["github", "stackoverflow", "reddit"])))
+                .expect("有一半有效就不该整条失败");
+        assert_eq!(kept, vec!["github", "stackoverflow"]);
+        assert_eq!(dropped, vec!["reddit".to_string()]);
+
+        // 一个都不认得才是真的失败：那时候继续跑等于悄悄换成默认全量搜索，
+        // 模型会以为自己指定的范围生效了。
+        let err = super::select_developer_sources_reporting(None, Some(&req(&["reddit", "twitter"])))
+            .expect_err("一个都不认得必须失败");
+        assert!(err.contains("reddit") && err.contains("twitter"), "要点名是哪几个：{err}");
+        assert!(err.contains("github"), "还要列出支持哪些：{err}");
+
+        // 全都认得时不产生任何"丢掉了"的噪音。
+        let (kept, dropped) =
+            super::select_developer_sources_reporting(None, Some(&req(&["github", "gh", "v2ex"])))
+                .expect("全有效");
+        assert_eq!(kept, vec!["github", "v2ex"], "别名去重");
+        assert!(dropped.is_empty());
     }
 
     #[test]
