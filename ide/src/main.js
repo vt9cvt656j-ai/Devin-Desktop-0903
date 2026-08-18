@@ -13772,16 +13772,19 @@ function _ctxChoiceOptions(modelId) {
   // Every tier is DISPLAYED regardless of membership; only those the membership grants are
   // selectable. Locked tiers say what would unlock them instead of silently hiding.
   for (const [name, tokens] of _MC_TIER_OPTIONS) {
-    // Tiers stack ON TOP of the model's own window: the 1M tier means "+1M", so on a 1M-native
-    // model it delivers 2M. That is why no tier is redundant any more — an absolute ceiling
-    // decayed to nothing as models grew, an additive one is worth the same forever.
-    const total = native + tokens;
+    // 档位的值就是档位本身（2M 就是 2,000,000），**不再存"原生 + 档位"**。
+    //
+    // 原来存的是 native + tokens：标签写着 2M，实际值是 2,096,890。上一轮我把"用户选的原样
+    // 生效"接通之后，这个怪数就直接成了仪表分母 —— 用户看到的是"我选 2M，它给我一个
+    // 2,096,890"。加法本身没错（网关的 capacity_for_native 确实是原生+档位），错在把加法的
+    // 结果当成"用户选了什么"存起来：用户选的是**档位**，加法是**结算时**的事。
+    // 现在加法只发生在 _effectiveContextLimit 里，存的和显示的都是档位本身。
     const locked = !(compress && tokens <= tierMax);
     opts.push({
-      value: total, label: name, locked, tier: name, kind: "modified",
+      value: tokens, label: name, locked, tier: name, kind: "tier",
       lockHint: locked
         ? (tierMax > 0 ? `需 ${name} 及以上会员档位（当前 ${_tokenShort(tierMax)}）` : "需开通 michael-compression 会员")
-        : `michael-compression ${name} 档：原生 ${_tokenShort(native)} + 本档 ${name} = 实际 ${_tokenShort(total)}`,
+        : `michael-compression ${name} 档：可留存的历史，网关压缩后仍送进模型自己的 ${_tokenShort(native)} 窗口`,
     });
   }
   return opts;
@@ -24423,9 +24426,19 @@ function _runStateNextActionSuggestions(sess, { maxAgeMs = 5 * 60_000 } = {}) {
     const incomplete = run.incompleteReason || "";
     // 枚举带 ":N" 后缀（plan_steps_pending:3），取冒号前的基名查表。
     const incompleteBase = incomplete.split(":")[0];
-    picks.push({ 
-      label: _INCOMPLETE_LABELS[incompleteBase] || `继续完成剩余部分`, 
-      send: `本轮已完成${types ? types + "文件" : "部分"}的修改 (${run.mutatedFileCount || 0}个)，但因${incomplete || "未知原因"}未完成。请继续：${String(run.result || "").slice(0, 200)}...` 
+    // send 串里**不许**再把模型上一轮的回答（run.result）截 200 字塞进来。
+    //
+    // 用户实拍：上一轮它用 run_cmd 起了个服务、10 秒被杀，却写了"服务已经成功启动"；
+    // 这句原样被塞进输入框，变成「请继续：服务已经**成功启动**了……」——一句模型自己的
+    // 错话，被 harness 包装成用户的指令递回去。用户看到的是"没启动也说启动了"。
+    // 而且那串还带着 "(0个)" 和"因未知原因未完成"这种内部枚举残渣。
+    //
+    // 这里要说的只有一件事：接着做哪件没做完的事。哪件没做完由 incompleteReason 这个
+    // **闭合枚举**决定（真实执行事实写入的），翻译成人话就够了，不需要复述上一轮的话。
+    const _todoLabel = _INCOMPLETE_LABELS[incompleteBase] || "继续没做完的部分";
+    picks.push({
+      label: _todoLabel,
+      send: types ? `${_todoLabel}（上一轮改过 ${types} 文件）` : _todoLabel,
     });
   }
 
