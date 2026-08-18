@@ -10563,7 +10563,17 @@ function agentDiagnosticsBlock(root = rootPath, active = activePath) {
   }
   const activeLine = active ? `当前文件 ${pathForDiagnosticsDisplay(active, root)}: ${activeErr} error / ${activeWarn} warning\n` : "";
   const details = formatDiagnosticsForAgent(markers, root, { activePath: active, max: 14 });
-  return `--- 实时诊断（编辑器/LSP，Agent 必须参考）---\n总计: ${err} error / ${warn} warning\n${activeLine}这些是当前 Monaco/LSP 的真实错误/警告。回答或修复时报错原因必须以这些诊断、对应代码行和项目配置为证据；修完后用 get_diagnostics 或真实构建/测试复查。\n${details}`;
+  // 说清这份计数**不是模型的账**。
+  //
+  // 这里报的是编辑器里当前全部的 error/warning，其中绝大多数往往是仓库本来就有的
+  // （用户自己的历史遗留、第三方类型不全、lint 口味差异）。此前的文案只说"这些是真实
+  // 错误/警告，修复时必须以它们为证据"——模型会把这 30 个错当成自己捅的，然后跑去
+  // "修"一堆和本次任务无关的代码，或者反过来因为总数没降而认为自己没修好。
+  //
+  // 真正做过 baseline 抵扣的是收尾那道阻断门（_interleavedDiagnostics 按
+  // baselineCounts 逐条抵扣，只报新增）。这里不重复那套匹配——两边的路径归一化方式
+  // 不同，跨表匹配 identity 很容易给出**错误的"新增"标注**，那比不标更糟。
+  return `--- 实时诊断（编辑器/LSP，Agent 必须参考）---\n总计: ${err} error / ${warn} warning（这是**整个工程当前的全部诊断**，包含你动手之前就存在的问题，不等于你引入的）\n${activeLine}这些是当前 Monaco/LSP 的真实错误/警告。用它们定位问题、作为报错原因的证据；但**只对你这次改动引入的那些负责**——不要顺手去改和本次任务无关的历史问题，也不要因为总数没降就认为自己没修好。修完用 get_diagnostics 或真实构建/测试复查。\n${details}`;
 }
 function problemCountText(err, warn) {
   const parts = [];
@@ -69899,22 +69909,50 @@ function updateStatusBar() {
       const selCount = model ? model.getValueInRange(sel).length : 0;
       if (selCount > 0) posText += ` (${selCount} selected)`;
     }
-    setStatusBarItem("_cursor", { text: posText, tooltip: "Go to Line", order: 40 });
+    // 这四个格子原来都**只传两个参数**——setStatusBarItem 只有拿到第三个参数才建 <button>
+    // 并挂 onclick，否则建 <span>。于是 tooltip 写着 "Go to Line" / "Select Language Mode"，
+    // 点下去什么都不发生：又是一处"承诺一个不存在的动作"（和状态栏那个 LSP 指示器
+    // 当初被摘掉 onClick 是同一个毛病，只是那次的处理是把承诺也一起删掉）。
+    setStatusBarItem("_cursor", { text: posText, tooltip: "跳转到行（⌃G）", order: 40 },
+      () => { monacoEditor.focus(); monacoEditor.getAction?.("editor.action.gotoLine")?.run(); });
   }
 
   if (model) {
     const langId = model.getLanguageId();
     const langLabel = langId.charAt(0).toUpperCase() + langId.slice(1);
-    setStatusBarItem("_lang", { text: langLabel, tooltip: "Select Language Mode", order: 50 });
+    setStatusBarItem("_lang", { text: langLabel, tooltip: "选择语言模式", order: 50 }, (e) => {
+      // 真正需要手动切的是**无扩展名的脚本**（deploy / run）和**后缀说谎的文件**
+      // （.txt 里写 shell、.log 里放 JSON）——它们会落进 plaintext，没有高亮也没有诊断。
+      const cur = model.getLanguageId();
+      const langs = (monaco.languages.getLanguages() || [])
+        .map((l) => l.id)
+        .filter(Boolean)
+        .sort((a, b) => (a === cur ? -1 : b === cur ? 1 : a.localeCompare(b)));
+      const rect = e?.currentTarget?.getBoundingClientRect?.();
+      renderMenuAt(rect ? rect.left : 0, rect ? rect.top : 0, langs.slice(0, 40).map((id) => ({
+        label: id === cur ? `${id}  ✓` : id,
+        action: () => { monaco.editor.setModelLanguage(model, id); updateStatusBar(); },
+      })));
+    });
   } else {
     removeStatusBarItem("_lang");
   }
 
-  setStatusBarItem("_encoding", { text: "UTF-8", tooltip: "Select Encoding", order: 30 });
+  // 编码是**写死的字符串**，不是探测结果：后端 read_text_file 对非 UTF-8 直接
+  // String::from_utf8 失败拒开，所以这里永远只可能是 UTF-8。原来的 tooltip 写着
+  // "Select Encoding"，那是在承诺一个连后端都不支持的动作。改成陈述事实、且不可点
+  // ——不传 onClick，setStatusBarItem 就渲染成 <span>，手型光标和点击一起没有。
+  setStatusBarItem("_encoding", { text: "UTF-8", tooltip: "本编辑器以 UTF-8 读写文件（暂不支持其它编码）", order: 30 });
 
   if (model) {
     const eol = model.getEOL() === "\r\n" ? "CRLF" : "LF";
-    setStatusBarItem("_eol", { text: eol, tooltip: "Select End of Line", order: 60 });
+    setStatusBarItem("_eol", { text: eol, tooltip: "切换行尾符（LF / CRLF）", order: 60 }, () => {
+      const next = model.getEOL() === "\r\n"
+        ? monaco.editor.EndOfLineSequence.LF
+        : monaco.editor.EndOfLineSequence.CRLF;
+      model.pushEOL(next);   // 走 pushEOL 而不是 setEOL：这一步要能被 ⌘Z 撤销
+      updateStatusBar();
+    });
   }
 
   // LSP badge is owned SOLELY by updateLspStatusBar() (key "lsp"), which distinguishes
