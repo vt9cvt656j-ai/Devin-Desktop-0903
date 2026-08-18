@@ -41052,6 +41052,13 @@ function _deliveryFactsLine(run) {
     parts.push("本轮没有跑过任何命令");
   }
   parts.push(tests.length ? `测试文件 ${tests.length} 个` : "没有新增或改动测试文件");
+  // 收尾评审的结论（_wrapUpCritic 读了真实 diff 之后的判断）。它**只陈述、不拦截**，
+  // 所以放在这一行的末尾和别的事实并列 —— 用户一眼看到"评审说这段改动没实现你要的东西"，
+  // 比看到模型自己说"已完成"有用得多。
+  const v = run?._wrapUpVerdict;
+  if (v && typeof v.done === "boolean") {
+    parts.push(v.done ? "收尾评审：通过" : `收尾评审：未通过${v.instruction ? " — " + String(v.instruction).slice(0, 120) : ""}`);
+  }
   return parts.join(" · ");
 }
 
@@ -47178,6 +47185,52 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
         //
         // 真话要求的不是「强迫它再跑一轮」，而是**这一轮的收尾绝不能看起来像验证过了**。
         // 那件事由下面这个 incompleteReason 承担，它会进结果卡片。
+        // ── 收尾评审：这段改动到底有没有实现用户要的东西 ──────────────────────
+        //
+        // `_wrapUpCritic` 一直在源码里，却**零调用点**——它是 2026-08-08 那次"重连权限链"
+        // 的提交顺手删掉的（那次提交的目的根本不是删它），而函数、三条测试、以及一句断言
+        // 它在跑的注释都留着。于是测试全绿、功能一次没跑过，用户看到的就是"只管写，
+        // 没人判断写得对不对、思路顺不顺"。
+        //
+        // 按现在这套哲学重接：它**只出结论，不拦回合**。老那套 _semanticPending 门控是
+        // 智能体循环重构时有意拆掉的（配套状态已全部不存在），不复原——拿一个评审的意见
+        // 去强行覆盖模型的收尾判断，正是那次重构要根除的东西。
+        //
+        // 结论进交付事实行：用户看得见，模型下一轮也看得见。只在**改过代码**的 agent 轮
+        // 跑一次，一个 run 最多一次（多花一次模型调用，这是它的全部成本）。
+        // 可关：设置里 agentWrapUpReview = false。
+        if (_mutatedCode && run.mode === "agent" && !run._wrapUpReviewed) {
+          let _reviewOn = true;
+          try { _reviewOn = loadConfig()?.agentWrapUpReview !== false; } catch {}
+          if (_reviewOn) {
+            run._wrapUpReviewed = true;
+            try {
+              run._wrapUpVerdict = await _wrapUpCritic({
+                config,
+                task,
+                padText: _padText(),
+                draft: String(turn?.text || ""),
+                readList: [..._readFiles].slice(-40).join("、"),
+                executionEvidence: run._executionEvidence,
+                toolRegistry: run._toolRegistry,
+                // 评审必须看到**改动本身**：只给它草稿和命令输出的话，"这段改动到底有没有
+                // 实现用户要求"这个问题结构上就问不出来。前后两版都在 checkpoint 里。
+                changeDigest: (() => {
+                  try {
+                    const cp = run?.checkpoint;
+                    if (!cp || typeof cp.entries !== "function") return "";
+                    return [...cp.entries()].slice(-6)
+                      .map(([abs, st]) => {
+                        const hunk = _changedHunk(st?.existed ? (st.content || "") : "", st?.current || "");
+                        return hunk ? `--- ${_normRel(abs, root)} ---\n${hunk}` : "";
+                      })
+                      .filter(Boolean).join("\n").slice(0, 3000);
+                  } catch { return ""; }
+                })(),
+              });
+            } catch { /* 评审失败不该弄坏一轮交付 */ }
+          }
+        }
         if (_codeDeliveredUnverified && !run._incompleteReason) {
           // 改了代码、整轮零验证证据。这里**只记账，不代跑**——这是刻意的。
           //

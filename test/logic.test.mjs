@@ -22543,6 +22543,52 @@ test("测试文件识别覆盖各语言主流约定，宁可漏判不可误判",
   assert.equal(isTest("src\\tests\\a.ts"), true);
 });
 
+test("收尾评审员必须真的被调用——它曾经零调用点，而三条测试把它测得全绿", () => {
+  // `_wrapUpCritic` 会读真实 diff 判断"这段改动到底有没有实现用户要求"，是回答"写得对不对、
+  // 思路顺不顺"的那个东西。它在 2026-08-08 那次"重连权限链"的提交里被顺手删掉了调用点
+  // （那次提交的目的根本不是删它），函数、测试和一句断言它在跑的注释都留着 ——
+  // 于是测试全绿、功能一次没跑过。这条守的就是"它真的被调用"。
+  const callSites = (SRC.match(/await _wrapUpCritic\(\{/g) || []).length;
+  assert.ok(callSites >= 1, "_wrapUpCritic 又变回死代码了：测试会全绿，而没有任何东西判断写得对不对");
+  const at = SRC.indexOf("await _wrapUpCritic({");
+  const call = SRC.slice(at, at + 1400);
+  assert.match(call, /changeDigest:/,
+    "不给它看真实 diff 的话，「这段改动有没有实现用户要求」这个问题结构上就问不出来");
+  assert.match(call, /executionEvidence: run\._executionEvidence/);
+  // 只在改过代码的 agent 轮跑，一个 run 最多一次，且可关 —— 它多花一次模型调用。
+  const guard = SRC.slice(Math.max(0, at - 900), at);
+  assert.match(guard, /_mutatedCode && run\.mode === "agent" && !run\._wrapUpReviewed/);
+  assert.match(guard, /agentWrapUpReview !== false/, "缺少关掉它的开关");
+});
+
+test("评审结论只陈述、不拦回合", () => {
+  const facts = load("_deliveryFactsLine", {
+    _CODE_FILE_RE: loadConst("_CODE_FILE_RE"),
+    _looksLikeTestFile: load("_looksLikeTestFile"),
+    _deliveryFacts: load("_deliveryFacts", {
+      _CODE_FILE_RE: loadConst("_CODE_FILE_RE"),
+      _looksLikeTestFile: load("_looksLikeTestFile"),
+    }),
+  });
+  const run = (verdict) => ({
+    _mutatedFiles: new Set(["src/a.ts"]),
+    _executionEvidence: [{ command: "npm test", exitCode: 0, verifierRecognized: true }],
+    _wrapUpVerdict: verdict,
+  });
+  assert.match(facts(run({ done: false, verified: false, instruction: "登录接口没接上真实鉴权" })),
+    /收尾评审：未通过 — 登录接口没接上真实鉴权/,
+    "评审说没做完，用户必须看得到 —— 比模型自己说「已完成」有用得多");
+  assert.match(facts(run({ done: true, verified: true, instruction: "" })), /收尾评审：通过/);
+  assert.doesNotMatch(facts(run(null)), /收尾评审/, "没跑评审就别凭空写一行");
+
+  // 它**不**改变收尾判断：这是刻意的，老那套 _semanticPending 门控在智能体循环重构时
+  // 已经有意拆掉，不复原 —— 拿评审意见强行覆盖模型的收尾判断正是那次重构要根除的。
+  const at = SRC.indexOf("await _wrapUpCritic({");
+  const after = SRC.slice(at, at + 2200);
+  assert.doesNotMatch(after, /_wrapUpVerdict[\s\S]{0,200}continue;/,
+    "评审结论又开始强行补回合了");
+});
+
 test("这条事实要同时送到用户眼前和模型手里", () => {
   assert.match(SRC, /_appendDeliveryFactsBar\(body, run\);/,
     "答案下面没有这一行 —— 用户看不到，「说能用」就永远没人核对");
