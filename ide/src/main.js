@@ -40550,7 +40550,9 @@ function _toolMayProduceExternalEffect(call) {
   if (call.type === "worktree") return ["add", "remove"].includes(call.action);
   if (call.type === "db") return _dbCallMayMutate(call);
   if (call.type === "remote") return ["connect", "disconnect"].includes(call.op);
-  if (call.type === "system") return !["frontmost", "list", "status", "windows"].includes(call.op);
+  // op 名要和 tools.json 的 action 枚举对上：list / status **不存在**（真正列 App 的叫
+  // apps），所以这两个名字写在这里等于没写，而 menu_items 这个真正的只读动作反而漏了。
+  if (call.type === "system") return !["frontmost", "apps", "windows", "menu_items"].includes(call.op);
   if (call.type === "automation") return !/(?:^|\.)(?:get|read|list|status|inspect|nodes|check|screenshot)$/i.test(String(call.method || ""));
   if (call.type === "uiclick") return true;
   if (call.type === "http") return !["GET", "HEAD", "OPTIONS"].includes(String(call.method || "GET").toUpperCase());

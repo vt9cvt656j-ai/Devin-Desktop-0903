@@ -357,12 +357,27 @@ test("每一种工具调用类型都必须被归类——没登记也算漏，�
 });
 
 test("四个有外部副作用的工具已经在审批门内——它们曾经整整一轮都在门外", () => {
-  for (const t of ["docker_compose_up", "capture_replay", "system"]) {
+  for (const t of ["docker_compose_up", "capture_replay"]) {
     assert.equal(needsApproval(t), true, `${t} 又掉出审批门了`);
   }
-  // browser 是按 action 判的，所以它的 needsApproval 是个函数而不是 true。
-  assert.equal(typeof needsApproval("browser"), "function",
-    "browser 又变回一刀切了——看一眼页面也要弹框，用起来就是「做点事就撞门」");
+  // browser 和 system 都是按动作判的，所以 needsApproval 是函数而不是 true。
+  for (const t of ["browser", "system"]) {
+    assert.equal(typeof needsApproval(t), "function",
+      `${t} 又变回一刀切了——看一眼/问一句也要弹框，用起来就是「做点事就撞门」`);
+  }
+  // system 的纯读动作：问"现在开着什么、哪个在前台、这个 App 有哪些菜单项"不该弹框，
+  // 更不该在 Explorer / Plan / Reviewer 里被挡 —— 那三个模式本来就只看不动，
+  // 一刀切正好把「了如指掌」卡死在最需要它的地方。
+  for (const op of ["apps", "windows", "frontmost", "menu_items"]) {
+    const call = { type: "system", op };
+    assert.equal(needsApprovalFor("system", call), false, `system.${op} 是纯读，不该弹框`);
+    assert.equal(blockedInReadOnlyMode("system", call), false, `system.${op} 在只读模式里该能用`);
+  }
+  for (const op of ["open", "focus", "menu"]) {
+    const call = { type: "system", op };
+    assert.equal(needsApprovalFor("system", call), true, `system.${op} 会动真格，必须问`);
+    assert.equal(blockedInReadOnlyMode("system", call), true);
+  }
 
   // 真有副作用的动作：审批门要问，只读模式要挡。
   for (const action of ["eval", "cookies", "storage", "upload", "autofill", "click", "type", "fill", "batch"]) {

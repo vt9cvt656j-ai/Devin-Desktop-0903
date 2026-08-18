@@ -50,9 +50,54 @@ function extractFn(name) {
  * logic.test.mjs 顶部有同名工具，理由一模一样。
  */
 function stripJsComments(source) {
-  return String(source)
-    .replace(/\/\*[\s\S]*?\*\//g, "")
-    .replace(/(^|[^:])\/\/[^\n]*/g, "$1");
+  // 必须**按上下文扫描**，不能用正则。
+  //
+  // 上一版是两条正则：先去行注释、再去块注释。它认不出**正则字面量**里的 `/`，于是
+  // `!/Chrome|Chromium|Edg\//.test(ua)` 这样的真代码里那个 `\//` 被当成行注释开头，
+  // 从那儿一路吃到行尾。实测在 main.js 上吃掉 21.7%（821KB）真代码。
+  //
+  // 后果是双向的，而且反向更危险：assert.match 会静默变红（还能发现），
+  // 而 assert.doesNotMatch 在被吃掉的那片区域里**静默变绿** —— 一条本该守着的禁令
+  // 等于没写。本仓库 70 处 doesNotMatch(stripJsComments(SRC), ...) 都建立在这上面。
+  //
+  // 现在逐字符扫，认得字符串 / 模板串 / 正则字面量三种上下文。`/` 前面若是标识符、数字、
+  // `)` 或 `]`，那是除号；否则是正则开头 —— 这是 JS 词法里区分这两者的标准启发式。
+  const s = String(source);
+  let out = "", i = 0, prev = "";
+  const regexCanStart = (p) => !/[A-Za-z0-9_$)\]]/.test(p);
+  while (i < s.length) {
+    const c = s[i], d = s[i + 1];
+    if (c === "/" && d === "/") { while (i < s.length && s[i] !== "\n") i++; continue; }
+    if (c === "/" && d === "*") { const e = s.indexOf("*/", i + 2); i = e < 0 ? s.length : e + 2; continue; }
+    if (c === '"' || c === "'" || c === "`") {
+      const q = c; out += c; i++;
+      while (i < s.length) {
+        const ch = s[i]; out += ch;
+        if (ch === "\\") { i++; if (i < s.length) out += s[i]; i++; continue; }
+        i++;
+        if (ch === q) break;
+      }
+      prev = q; continue;
+    }
+    if (c === "/" && regexCanStart(prev)) {
+      out += c; i++;
+      let inClass = false;
+      while (i < s.length) {
+        const ch = s[i]; out += ch;
+        if (ch === "\\") { i++; if (i < s.length) out += s[i]; i++; continue; }
+        i++;
+        if (ch === "[") inClass = true;
+        else if (ch === "]") inClass = false;
+        else if (ch === "/" && !inClass) break;
+        else if (ch === "\n") break;
+      }
+      prev = "/"; continue;
+    }
+    out += c;
+    if (!/\s/.test(c)) prev = c;
+    i++;
+  }
+  return out;
 }
 
 function load(name, deps = {}) {
