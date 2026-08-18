@@ -27211,10 +27211,20 @@ test("实现版本在工具落定那一刻盖章，不能等到执行之后", ()
 });
 
 test("每轮重扫整个项目要按工作区变更缓存，别每步都愣一下", () => {
-  const at = SRC.indexOf("const _fsTickNow = run._fsMutTick || 0;");
+  const at = SRC.indexOf("const _fsTickNow = ");
   assert.ok(at > 0, "运行状态块没有加缓存");
   const block = stripJsComments(SRC.slice(at - 200, at + 400));
-  assert.match(block, /run\._rtStateTick !== _fsTickNow/, "缓存键必须是工作区变更 tick");
+  assert.match(block, /run\._rtStateTick !== _fsTickNow/, "缓存键必须是变更 tick");
+  // 键里必须同时有文件变更和终端活动。这一块带着「已退出的终端 + 最后输出」和 git 现场，
+  // 而 `npm run dev` 崩掉时一个文件都不会动——只看 _fsMutTick 的话，进程死了、输出也有了，
+  // 模型整轮拿到的仍是那份写着「运行中」的旧快照。
+  // 断言钉在**键表达式本身**上。只检查这一片源码里出现过 _termTick 是不够的——
+  // 把赋值改回 `run._fsMutTick || 0`、而上面那段计算 _termTick 的循环原样留着，
+  // 那种写法照样匹配得到（这一轮真踩过）。
+  const keyExpr = /const _fsTickNow = ([^;]+);/.exec(block);
+  assert.ok(keyExpr, "找不到缓存键的赋值");
+  assert.match(keyExpr[1], /run\._fsMutTick/, "缓存键丢了文件变更信号");
+  assert.match(keyExpr[1], /_termTick/, "缓存键没有终端活动——服务崩了整轮不刷新");
   assert.doesNotMatch(
     stripJsComments(SRC.slice(at, at + 600)).replace(/if \(run\._rtStateTick[\s\S]*?\n      \}/, ""),
     /await _promiseOrFallbackWithin\(_agentRuntimeStateBlock/,
@@ -28013,4 +28023,21 @@ test("阻断性诊断门要覆盖有语言服务的语言，而不是只认 JS/T
   assert.doesNotMatch(fn, /setTimeout\(r, 900\)/, "又退回固定 900ms 等待了");
   assert.match(fn, /_INTERLEAVED_DIAG_MAX_WAIT_MS/, "没有改成轮询等诊断");
   assert.match(fn, /slice\(0, _INTERLEAVED_DIAG_MAX_FILES\)/, "一轮能检查的文件数仍然写死");
+});
+
+test("模型要能看到崩掉的终端说了什么，以及 git 现场", () => {
+  // 运行状态块原来只有元数据（编号/状态/标签/命令行/URL/cwd），**一个字节输出都没有**。
+  // `npm run dev` 崩了之后模型看到的是「#2 [已退出] 任务终端 · $ npm run dev」——
+  // 它知道进程没了，却不知道为什么，然后继续往下写。真输出只在 read_terminal/read_logs
+  // 那条「拉」的路径上，可模型得先意识到有问题才会去拉。
+  const fn = SRC.slice(SRC.indexOf("async function _agentRuntimeStateBlock"),
+                       SRC.indexOf("// memoryRoot 与 root 分家"));
+  assert.match(fn, /it\.status === "已退出"/, "没有挑出已退出的终端");
+  assert.match(fn, /已退出，最后输出/, "已退出的终端没有附上真实输出");
+  assert.match(fn, /_redactSecrets\(String\(it\.recent\)/, "终端输出进上下文前没有脱敏");
+
+  // git 现场：refreshGitStatus 的 20 个调用点全是 UI 侧，零上下文注入。模型不知道分支、
+  // 也不知道自己改脏了哪些文件；probe_env 只给「未提交 N 个文件」，没有清单。
+  assert.match(fn, /parts\.push\(`Git: /, "上下文里没有 git 现场");
+  assert.match(fn, /gitBranchNameEl\?\.textContent/, "分支没有取自 git 面板的真实值");
 });
