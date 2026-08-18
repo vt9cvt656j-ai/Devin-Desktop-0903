@@ -19951,6 +19951,27 @@ const _stateRels = (name) => [`${_STATE_DIR}/${name}`, `${_LEGACY_STATE_DIR}/${n
 // 目录里躺的还是旧文件名，读不到它只是头像和来源消失，不会报错，最难被发现。
 const _SKILL_META_NAME = ".mrdayone-skill.json";
 const _LEGACY_SKILL_META_NAME = ".michael-skill.json";
+/**
+ * 新建某个作用域的配置文件时，该往里写什么。
+ *
+ * 目录改名（.michael → .mrdayone）留下的一个**静默数据丢失点**：老目录里有配置、新的还
+ * 没有时，如果直接写一份示例模板进新路径，而读取端的规则是"新的存在就完全不看老的"，
+ * 那么从这一刻起用户那份真配置彻底失效——界面上还显示"已建好一份示例"，不报任何错。
+ *
+ * 所以：老的有内容就原样返回它（调用方据此改文案、并提示旧文件还在）；否则返回空串，
+ * 由调用方写示例。
+ */
+async function _seedFromLegacyScopeFile(path) {
+  const p = String(path || "");
+  if (!p.includes(`/${_STATE_DIR}/`)) return "";
+  const legacy = p.replace(`/${_STATE_DIR}/`, `/${_LEGACY_STATE_DIR}/`);
+  try {
+    const old = await backend.readTextFile(legacy);
+    return String(old || "").trim() ? old : "";
+  } catch {
+    return "";
+  }
+}
 async function _readSkillMeta(dir) {
   for (const name of [_SKILL_META_NAME, _LEGACY_SKILL_META_NAME]) {
     try {
@@ -29205,11 +29226,15 @@ async function _openCapabilitiesPanel() {
           return;
         }
       } catch { /* 不存在，正常往下建 */ }
+      // 老目录里有配置就先搬过来，别拿示例把它顶掉——原因见 _seedFromLegacyScopeFile。
+      const seeded = await _seedFromLegacyScopeFile(s.path);
       try {
-        await backend.invoke("write_text_file", { path: s.path, content: _CAPABILITY_STARTER });
+        await backend.invoke("write_text_file", { path: s.path, content: seeded || _CAPABILITY_STARTER });
         await openFile(s.path, s.path.split("/").pop());
         m.close();
-        showToast("已建好一份示例，改成你自己的接口即可");
+        showToast(seeded
+          ? `已把你原来 ${_LEGACY_STATE_DIR}/ 里的配置搬到这里，内容一字未改；旧文件还在，确认没问题后可以删掉`
+          : "已建好一份示例，改成你自己的接口即可");
       } catch (e) {
         showToast(`建不了：${String(e?.message || e).slice(0, 120)}`);
       }

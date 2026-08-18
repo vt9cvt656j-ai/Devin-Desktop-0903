@@ -2816,6 +2816,41 @@ test("权限作用域：收紧处处合并，放宽只认用户自己的", async
   assert.deepEqual(empty, { allow: [], ask: [], deny: [] });
 });
 
+test("在新目录里第一次建配置文件时，老配置被搬过来，而不是被示例顶掉", async () => {
+  // 改名带来的第二个静默丢失点，比第一个更隐蔽：读取端是"新的存在就完全不看老的"，
+  // 所以只要有任何东西往新路径写了一个字节，老配置当场失效。设置面板的「新建」按钮
+  // 原来就会往那儿写一份示例模板——界面显示"已建好一份示例"，用户以为自己什么都没丢。
+  const dirs = SRC.match(/const _STATE_DIR = "[^"]*";\nconst _LEGACY_STATE_DIR = "[^"]*";/)[0];
+  const seed = (files) => new Function("_STATE_DIR", "_LEGACY_STATE_DIR", "backend",
+    `${extractFn("_seedFromLegacyScopeFile")}\n;return _seedFromLegacyScopeFile;`,
+  )(
+    new Function(`${dirs}\nreturn _STATE_DIR;`)(),
+    new Function(`${dirs}\nreturn _LEGACY_STATE_DIR;`)(),
+    { readTextFile: async (p) => { if (files[p]) return files[p]; throw new Error("no file"); } },
+  );
+
+  const mine = JSON.stringify({ permissions: { deny: ["Bash(rm *)"] } });
+  assert.equal(
+    await seed({ "/repo/.michael/settings.json": mine })("/repo/.mrdayone/settings.json"),
+    mine,
+    "老配置没被搬过来——面板会往新路径写示例，用户那份真配置从此静默失效");
+  // 老的没有 / 是空文件 → 让调用方照常写示例。
+  assert.equal(await seed({})("/repo/.mrdayone/settings.json"), "");
+  assert.equal(
+    await seed({ "/repo/.michael/settings.json": "   \n " })("/repo/.mrdayone/settings.json"), "");
+  // 不在新目录下的路径直接不管。少了这道判断，替换是空操作 → 它会去读**同一个路径**，
+  // 于是"从自己身上搬配置"，把一份本该新建的文件变成复制品。
+  assert.equal(await seed({ "/repo/.vscode/settings.json": mine })("/repo/.vscode/settings.json"), "",
+    "路径不在新目录下时还去读——等于从目标文件自己身上取内容");
+
+  // 面板那次调用没有纯函数出口（在 UI 事件处理器里），只能钉源码：写进去的内容必须是
+  // 「搬来的 或者 示例」，不能绕过搬迁直接写示例。
+  const panel = stripJsComments(SRC);
+  assert.match(panel, /content: seeded \|\| _CAPABILITY_STARTER/,
+    "面板绕过了搬迁直接写示例——老配置会在用户点「新建」的那一刻失效");
+  assert.match(panel, /const seeded = await _seedFromLegacyScopeFile\(s\.path\)/);
+});
+
 test("目录从 .michael/ 改名到 .mrdayone/：老配置照样生效，新的一旦存在就完全盖过老的", async () => {
   // 这次改名的全部风险就在这一条上。改错的表现不是报错，是**某天打开 IDE 发现
   // 自己写的权限规则全没了**——工具突然全要审批，或者更糟：突然都不问了。
