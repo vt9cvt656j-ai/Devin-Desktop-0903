@@ -36,6 +36,7 @@ mod referral;
 mod repo_sync;
 mod sessions;
 mod settings;
+mod settlement;
 mod skills;
 mod stripe;
 mod update;
@@ -135,6 +136,8 @@ async fn main() -> anyhow::Result<()> {
     // 把存量明文敏感字段（上游 key、OAuth 令牌、提现账户/QR）加密回去。只在配了
     // FIELD_ENC_KEY 时跑，幂等，逐行条件更新。见 field_backfill.rs。
     field_backfill::spawn(state.clone());
+    // 结算恢复：补扣「已服务却因结算失败没扣到钱」的调用，幂等、绝不双扣。
+    settlement::spawn(state.clone());
     // 模型能力目录：实时抓上下文档位和推理档位，取代手写表。
     // 抓不到不影响启动——它有三级降级（内存 → 库里上次的值 → 硬编码表）。
     model_catalog::spawn(state.clone());

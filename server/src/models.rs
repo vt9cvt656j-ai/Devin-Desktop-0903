@@ -4495,6 +4495,19 @@ pub fn admit_billing(
     })
 }
 
+/// 一笔结算的结局。resettle/恢复 worker 据此决定队列行是了结还是累加 attempts。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum BillOutcome {
+    /// 扣费成功（含免费池扣点、零费记账、付费提交）。
+    Settled,
+    /// 认领冲突：这笔已被扣过（模糊提交或并发恢复），跳过——**绝不双扣**。
+    AlreadySettled,
+    /// 结算失败，已（尝试）入队待恢复。
+    Deferred,
+}
+
+/// 正常计费入口：**保持原签名不变**（4 个调用点与源断言零改动）。每次生成唯一 settlement_id，
+/// 失败则入队后台恢复。返回值在 fire-and-forget 调用点被忽略，但 resettle 会用到。
 async fn bill(
     state: &AppState,
     uid: uuid::Uuid,
@@ -4505,6 +4518,71 @@ async fn bill(
     free_pool: bool,
     free_micro_usd: i64,
 ) {
+    let settlement_id = uuid::Uuid::new_v4();
+    let _ = bill_inner(
+        state, uid, conn_id, cost, use_quota, tokens, free_pool, free_micro_usd, settlement_id, false,
+    )
+    .await;
+}
+
+/// 从队列重跑一笔失败结算：**复用**存下的 settlement_id（认领幂等，重跑绝不双扣），
+/// 且 `from_recovery=true`——恢复时跳过免费分支、失败不重复入队（worker 记 attempts）。
+pub(crate) async fn resettle(state: &AppState, row: &crate::settlement::UnsettledRow) -> BillOutcome {
+    let tokens = BillTokens {
+        prompt: row.prompt_tokens,
+        completion: row.completion_tokens,
+        cached: row.cached_tokens,
+        cache_creation: row.cache_creation_tokens,
+        model_name: row.model_name.clone(),
+        estimated: row.estimated,
+        request_id: row.request_id.clone(),
+        mode: row.ide_mode.clone(),
+        tool_turn: row.is_tool_turn,
+        emitted_tool: row.emitted_tool.clone(),
+    };
+    bill_inner(
+        state, row.user_id, row.conn_id, row.cost_cents, row.use_quota, &tokens, row.free_pool,
+        row.free_micro_usd, row.settlement_id, true,
+    )
+    .await
+}
+
+async fn bill_inner(
+    state: &AppState,
+    uid: uuid::Uuid,
+    conn_id: uuid::Uuid,
+    cost: i64,
+    use_quota: bool,
+    tokens: &BillTokens,
+    free_pool: bool,
+    free_micro_usd: i64,
+    settlement_id: uuid::Uuid,
+    // 是否来自后台恢复重跑。它同时决定两件事：恢复时**跳过免费点分支**（免费扣点在
+    // settled_requests 账本之外，重跑会双扣——见对抗审查 finding 1/3/5），以及失败时不重复入队。
+    from_recovery: bool,
+) -> BillOutcome {
+    // 入队一笔失败结算的快照：把当前输入原样交给 settlement::queue（无 request_id 的它会自行不入队）。
+    let queue_input = |stage: &'static str| crate::settlement::QueueInput {
+        settlement_id,
+        uid,
+        conn_id,
+        request_id: tokens.request_id.clone(),
+        cost,
+        use_quota,
+        free_pool,
+        free_micro_usd,
+        prompt: tokens.prompt,
+        completion: tokens.completion,
+        cached: tokens.cached,
+        cache_creation: tokens.cache_creation,
+        model_name: tokens.model_name.clone(),
+        estimated: tokens.estimated,
+        mode: tokens.mode.clone(),
+        tool_turn: tokens.tool_turn,
+        emitted_tool: tokens.emitted_tool.clone(),
+        stage,
+    };
+
     let mut tx = match state.db.begin().await {
         Ok(tx) => tx,
         Err(error) => {
@@ -4515,7 +4593,10 @@ async fn bill(
                 event = "billing_settlement_failed",
                 "failed to begin billing transaction (call served, NOT charged)"
             );
-            return;
+            if !from_recovery {
+                crate::settlement::queue(state, queue_input("begin_tx")).await;
+            }
+            return BillOutcome::Deferred;
         }
     };
     let requested_cost = cost.max(0);
@@ -4524,7 +4605,10 @@ async fn bill(
     // lands in this one branch, and the model_usage row below is still written (so usage
     // history and the routing report stay complete — free is a payment source, not a
     // shadow-billing hole).
-    if free_pool {
+    // 恢复重跑时**不走免费分支**：队列行必然是付费路径失败（免费成功从不入队），而免费扣点
+    // 用的是 &state.db 独立提交、从不写 settled_requests 账本，重跑会在账本之外再扣一次点
+    // （跨日切池子回满时尤其明显），甚至升级成「先扣点后扣钱」。恢复一律走下面的付费认领路径。
+    if free_pool && !from_recovery {
         // Prefer the model's own micro-USD fee (per-call billing, which may be sub-cent);
         // otherwise convert the token-billed cost up from whole cents. Volume billing and
         // per-call billing therefore both convert to 点 through one path.
@@ -4549,15 +4633,50 @@ async fn bill(
             // free_points_spent carries what the user actually paid, in 点.
             record_usage_row(state, uid, conn_id, requested_cost, spent, tokens).await;
             let _ = tx.rollback().await;
-            return;
+            return BillOutcome::Settled;
         }
         if !free_fallback_to_paid() {
             // 开关关掉时保持老行为：池子空了也只走池子，扣不到就记 0。
             record_usage_row(state, uid, conn_id, requested_cost, 0, tokens).await;
             let _ = tx.rollback().await;
-            return;
+            return BillOutcome::Settled;
         }
         // 落下去，按普通付费调用结算（quota → 钱包）。
+    }
+    // ── 幂等认领（付费路径专用）───────────────────────────────────────────────
+    // 到这里说明这笔要走付费结算（不是免费池扣点）。往账本认领这个 settlement_id：
+    //   · 正常调用 settlement_id 每次新生成 → 必然插入成功（1 行）→ 继续扣费；
+    //   · 恢复重跑、且原始那次的提交其实已落库（「模糊提交」：commit 报错但数据提交了）→
+    //     ON CONFLICT 命中（0 行）→ 立刻回滚返回 AlreadySettled，**绝不第二次扣钱**。
+    // 认领和下面的扣减/记账在同一个事务里，于是「扣了钱」与「记了账本」共命运：
+    // 一起提交或一起回滚，不会出现扣了钱却没账本、或有账本却没扣钱。
+    match sqlx::query("INSERT INTO settled_requests (settlement_id) VALUES ($1) ON CONFLICT DO NOTHING")
+        .bind(settlement_id)
+        .execute(&mut *tx)
+        .await
+    {
+        Ok(claim) if claim.rows_affected() == 0 => {
+            tracing::info!(
+                %uid, %conn_id, %settlement_id,
+                "settlement already claimed (ambiguous-commit or concurrent recovery); skipping to avoid double charge"
+            );
+            let _ = tx.rollback().await;
+            return BillOutcome::AlreadySettled;
+        }
+        Ok(_) => {}
+        Err(error) => {
+            tracing::error!(
+                %error, %uid, %conn_id, cost, %settlement_id,
+                request_id = tokens.request_id.as_deref().unwrap_or("-"),
+                model = %tokens.model_name,
+                event = "billing_settlement_failed",
+                "failed to claim settlement id (call served, NOT charged)"
+            );
+            if !from_recovery {
+                crate::settlement::queue(state, queue_input("claim")).await;
+            }
+            return BillOutcome::Deferred;
+        }
     }
     // 亚分零头：免费模型常按次计价到亚分（$0.003 = 3000 micro-USD），而 requested_cost 是
     // 整分。掉到这里时它换算成整分往往是 0 —— 于是免费池空了之后两边都不扣，模型变成真正的
@@ -4604,7 +4723,10 @@ async fn bill(
                     event = "billing_settlement_failed",
                     "failed to lock balances for billing (call served, NOT charged)"
                 );
-                return;
+                if !from_recovery {
+                    crate::settlement::queue(state, queue_input("lock_balances")).await;
+                }
+                return BillOutcome::Deferred;
             }
         };
         match balances {
@@ -4644,12 +4766,15 @@ async fn bill(
                 event = "billing_settlement_failed",
                 "failed to deduct fused quota and credits (call served, NOT charged; tx rolled back)"
             );
-            return;
+            if !from_recovery {
+                crate::settlement::queue(state, queue_input("deduct")).await;
+            }
+            return BillOutcome::Deferred;
         }
     }
     if let Err(error) = sqlx::query(
-        "INSERT INTO model_usage (user_id, model_id, cost_cents, prompt_tokens, completion_tokens, cached_tokens, cache_creation_tokens, model_name, estimated, request_id, ide_mode, is_tool_turn, emitted_tool) \
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)",
+        "INSERT INTO model_usage (user_id, model_id, cost_cents, prompt_tokens, completion_tokens, cached_tokens, cache_creation_tokens, model_name, estimated, request_id, ide_mode, is_tool_turn, emitted_tool, settlement_id) \
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)",
     )
     .bind(uid)
     .bind(conn_id)
@@ -4664,27 +4789,39 @@ async fn bill(
     .bind(tokens.mode.as_deref())
     .bind(tokens.tool_turn)
     .bind(tokens.emitted_tool.as_deref())
+    .bind(settlement_id)
     .execute(&mut *tx)
     .await
     {
         tracing::error!(
-            %error, %uid, %conn_id, actual_cost,
+            %error, %uid, %conn_id, actual_cost, %settlement_id,
             request_id = tokens.request_id.as_deref().unwrap_or("-"),
             model = %tokens.model_name,
             event = "billing_settlement_failed",
             "failed to insert billing settlement (tx rolled back; call served, NOT charged)"
         );
-        return;
+        if !from_recovery {
+            crate::settlement::queue(state, queue_input("insert_usage")).await;
+        }
+        return BillOutcome::Deferred;
     }
     if let Err(error) = tx.commit().await {
+        // 提交失败 ≈ 事务回滚（没扣到钱）——入队补扣。唯一的例外是「模糊提交」：COMMIT 其实
+        // 在服务端落了库、只是回执丢了。那种情况账本里已有这条 settlement_id，恢复时会先查到
+        // 它并跳过、绝不第二次扣——所以这里放心入队。
         tracing::error!(
-            %error, %uid, %conn_id, actual_cost,
+            %error, %uid, %conn_id, actual_cost, %settlement_id,
             request_id = tokens.request_id.as_deref().unwrap_or("-"),
             model = %tokens.model_name,
             event = "billing_settlement_failed",
-            "failed to commit billing transaction (tx rolled back; call served, NOT charged)"
+            "failed to commit billing transaction (call served; queued for idempotent recovery)"
         );
+        if !from_recovery {
+            crate::settlement::queue(state, queue_input("commit")).await;
+        }
+        return BillOutcome::Deferred;
     }
+    BillOutcome::Settled
 }
 
 // ============ Anthropic protocol bridge (OpenAI ⇄ Anthropic Messages API) ============
@@ -8395,6 +8532,132 @@ mod billing_tests {
             .expect("零头分支不见了");
         let carry_log = &body[body[..carry_i].rfind("tracing::error!(").unwrap()..carry_i];
         assert!(carry_log.contains("%uid"), "零头丢失日志也要带 uid");
+    }
+
+    #[test]
+    /// 幂等结算：付费路径在**扣任何钱之前**先往 settled_requests 认领 settlement_id；认领冲突
+    /// （模糊提交或并发恢复）必须回滚返回 AlreadySettled、绝不扣第二次。这是「不重复扣钱」的核心。
+    fn paid_settlement_claims_ledger_before_charging_and_bails_on_conflict() {
+        let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/models.rs"))
+            .expect("read models.rs");
+        let at = src.find("async fn bill_inner(").expect("bill_inner 改名了");
+        let end = src[at..]
+            .find("// ============ Anthropic protocol bridge")
+            .map(|e| e + at)
+            .expect("bill_inner 后的分隔注释不见了");
+        let body = &src[at..end];
+
+        // 认领：ON CONFLICT DO NOTHING 往 settled_requests 写。
+        let claim = body
+            .find("INSERT INTO settled_requests (settlement_id) VALUES ($1) ON CONFLICT DO NOTHING")
+            .expect("付费路径必须认领 settlement_id");
+        // 扣减 users 余额那条 UPDATE。
+        let deduct = body
+            .find("UPDATE users SET quota_total_cents")
+            .expect("扣减语句不见了");
+        assert!(claim < deduct, "必须**先认领、后扣费**——否则模糊提交时恢复会重复扣");
+
+        // 认领冲突（0 行）→ 回滚 + AlreadySettled，且这一段里不能出现扣减。
+        let conflict = body
+            .find("claim.rows_affected() == 0")
+            .expect("必须判认领是否冲突");
+        let after = &body[conflict..deduct];
+        assert!(
+            after.contains("BillOutcome::AlreadySettled") && after.contains("rollback"),
+            "认领冲突必须回滚并返回 AlreadySettled，绝不往下扣费",
+        );
+
+        // 记账行要带 settlement_id，端到端可追。
+        assert!(
+            body.contains("emitted_tool, settlement_id) \\\n")
+                || body.contains("emitted_tool, settlement_id)"),
+            "model_usage 插入必须带 settlement_id 列",
+        );
+        assert!(
+            body.contains(".bind(settlement_id)"),
+            "model_usage 插入必须绑定 settlement_id",
+        );
+
+        // 提交失败也入队（模糊提交由恢复端先查账本兜住，不会双扣）。
+        assert!(
+            body.contains("queue_input(\"commit\")"),
+            "提交失败必须入队恢复",
+        );
+        // 五个致命失败分支都要入队。
+        for stage in ["begin_tx", "claim", "lock_balances", "deduct", "insert_usage", "commit"] {
+            assert!(
+                body.contains(&format!("queue_input(\"{stage}\")")),
+                "失败分支 {stage} 没有入队恢复",
+            );
+        }
+    }
+
+    #[test]
+    /// 恢复重跑**不得走免费点分支**：免费扣点在 settled_requests 账本之外（用 &state.db 独立提交），
+    /// 重跑会在账本外再扣一次点、甚至升级成先扣点后扣钱。队列行必然是付费路径失败，恢复一律走付费认领。
+    /// （对抗审查 finding 1/3/5）
+    fn recovery_never_takes_the_unledgered_free_points_branch() {
+        let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/models.rs"))
+            .expect("read models.rs");
+        let at = src.find("async fn bill_inner(").expect("bill_inner 改名了");
+        let end = src[at..]
+            .find("// ============ Anthropic protocol bridge")
+            .map(|e| e + at)
+            .expect("分隔注释不见了");
+        let body = &src[at..end];
+        // 免费分支必须被 from_recovery 守住。
+        assert!(
+            body.contains("if free_pool && !from_recovery {"),
+            "免费点分支必须加 `&& !from_recovery`——否则恢复重跑会在账本之外重复扣免费点（双扣）",
+        );
+        // resettle 必须以 from_recovery=true 调 bill_inner（走上面那道守卫）。
+        let r = src.find("pub(crate) async fn resettle(").expect("resettle 不见了");
+        let rbody = &src[r..src[r..].find("\n}\n").map(|e| e + r).unwrap_or(src.len())];
+        assert!(rbody.contains("row.settlement_id, true,"), "resettle 必须 from_recovery=true");
+    }
+
+    #[test]
+    /// bill() 薄壳保持 fire-and-forget 且每次新 settlement_id；resettle 复用存下的 id、不重复入队。
+    fn bill_wrapper_and_resettle_wire_settlement_id_correctly() {
+        let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/models.rs"))
+            .expect("read models.rs");
+        // 薄壳：新 uuid + from_recovery = false（正常计费，失败要入队）。
+        let w = src.find("async fn bill(\n").expect("bill 薄壳不见了");
+        let wbody = &src[w..src[w..].find("\n}\n").map(|e| e + w).unwrap_or(src.len())];
+        assert!(wbody.contains("let settlement_id = uuid::Uuid::new_v4();"), "每次计费要新生成 settlement_id");
+        assert!(wbody.contains("settlement_id, false,"), "正常计费 from_recovery=false（失败要入队）");
+        // resettle：复用行里的 settlement_id + from_recovery = true（跳免费分支、不重复入队）。
+        let r = src.find("pub(crate) async fn resettle(").expect("resettle 不见了");
+        let rbody = &src[r..src[r..].find("\n}\n").map(|e| e + r).unwrap_or(src.len())];
+        assert!(rbody.contains("row.settlement_id, true,"), "恢复重跑必须复用 settlement_id 且 from_recovery=true");
+        assert!(rbody.contains("request_id: row.request_id.clone()"), "重建 tokens 要带回 request_id");
+    }
+
+    #[test]
+    /// bill_inner 的 model_usage 插入：列数 == 占位符 == bind 数（运行时 SQL，cargo 查不出对不上）。
+    fn model_usage_insert_arity_agrees_in_bill_inner() {
+        let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/models.rs"))
+            .expect("read models.rs");
+        let at = src.find("async fn bill_inner(").expect("bill_inner 改名了");
+        let stmt_at = src[at..].find("INSERT INTO model_usage").expect("记账插入不见了") + at;
+        // 切到 .execute( 为止（全 ASCII，不会切进多字节中文注释里）——列表/占位/bind 都在它之前。
+        let stmt_end = src[stmt_at..].find(".execute(").map(|e| stmt_at + e).expect("no execute");
+        let stmt = &src[stmt_at..stmt_end];
+        let lp = stmt.find('(').unwrap();
+        let rp = stmt[lp..].find(')').unwrap() + lp;
+        let cols = stmt[lp + 1..rp].matches(',').count() + 1;
+        // 最大 $N。
+        let mut max_ph = 0usize;
+        for tok in stmt.split('$').skip(1) {
+            let n: String = tok.chars().take_while(|c| c.is_ascii_digit()).collect();
+            if let Ok(v) = n.parse::<usize>() {
+                max_ph = max_ph.max(v);
+            }
+        }
+        let binds = stmt.matches(".bind(").count();
+        assert_eq!(cols, 14, "model_usage 列数变了");
+        assert_eq!(max_ph, 14, "占位符和列数对不上");
+        assert_eq!(binds, 14, ".bind() 和列数对不上——结算会运行时报错");
     }
 
     #[test]
