@@ -338,7 +338,7 @@ test("Rust 侧：三处会被当成结论的空值", () => {
 // ── 安全边界：clone 一个仓库不该等于交出这台机器 ──────────────────────
 //
 // 这三条是同一个根因的三种形态：**信任是按文件名猜的，不是按来源定的**。
-// `.michael/settings.json`、`.michael/settings.local.json`、`.mcp.local.json` 默认都不在
+// `.mrdayone/settings.json`、`.mrdayone/settings.local.json`、`.mcp.local.json` 默认都不在
 // gitignore 里，都能被提交、跟着 clone 到受害者机器上。
 
 test("仓库里的 permissions.allow 必须被丢弃——它会短路唯一那道高危弹窗", () => {

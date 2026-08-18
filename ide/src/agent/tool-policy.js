@@ -142,7 +142,7 @@ function seed() {
   //
   // 只读判定按**这一次调用**来：list 是纯读取，只读模式里该能用（"先看看有哪些候选"正是
   // Plan 要做的事）；add / remove 动磁盘，挡住。
-  // 不设 needsApproval：它只在 <root>/.michael/worktrees/ 下面动，是 IDE 自己的目录，
+  // 不设 needsApproval：它只在 <root>/.mrdayone/worktrees/ 下面动，是 IDE 自己的目录，
   // 每建一个候选都弹一次窗会把 best-of-N 这件事变得没法用。真正的数据风险（重名时
   // --force 销毁上一个候选）已经在 git.rs 的 git_worktree_add 里从根上去掉了。
   defineTool("worktree", {

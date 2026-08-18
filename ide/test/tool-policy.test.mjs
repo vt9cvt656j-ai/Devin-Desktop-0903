@@ -53,7 +53,7 @@ test("workspace-mutating set matches the pre-refactor literal exactly", () => {
     "generate_texture",
     // 新增：真的会在磁盘上建目录（~/MrDayOne/<name>）并切换工作区。
     "createproject",
-    // 新增：git worktree。它在 <root>/.michael/worktrees/ 下面建目录、建分支，remove
+    // 新增：git worktree。它在 <root>/.mrdayone/worktrees/ 下面建目录、建分支，remove
     // 还会连未提交的改动一起删。原来完全没登记，拿的是默认策略。
     "worktree",
   ])));
@@ -92,7 +92,7 @@ test("approval set matches the pre-refactor literal exactly", () => {
     // system 能开 App、切前台窗口、触发任意 App 的菜单项。
     "browser", "docker_compose_up", "capture_replay", "system",
   ])));
-  // worktree 是**有意**不问的：它只在 <root>/.michael/worktrees/ 下动，是 IDE 自己的
+  // worktree 是**有意**不问的：它只在 <root>/.mrdayone/worktrees/ 下动，是 IDE 自己的
   // 目录，best-of-N 每建一个候选弹一次窗就没法用了。这条豁免要留着，也要看得见。
   assert.equal(approvalTypes().has("worktree"), false, "worktree 的豁免是有意的，见 tool-policy 里的说明");
 });
@@ -289,7 +289,7 @@ test("worktree 没带 action 时按 list 处理（工具定义里 list 就是默
   assert.equal(blockedInReadOnlyMode("worktree", { type: "worktree" }), false);
 });
 
-test("worktree 算改动工作区——它在 <root>/.michael/worktrees 下面造东西", () => {
+test("worktree 算改动工作区——它在 <root>/.mrdayone/worktrees 下面造东西", () => {
   assert.equal(mutatesWorkspace("worktree"), true);
   assert.ok(workspaceMutatingTypes().has("worktree"));
 });
@@ -375,6 +375,6 @@ test("会改工作区的工具，开了审批就必须问——豁免只能是�
   const gaps = [...workspaceMutatingTypes()].filter((t) => !ask.has(t)).sort();
   assert.deepEqual(gaps, ["worktree"],
     "这些工具会往工作区写东西，但开了「改动前审批」也不问：" + gaps.join(", ")
-    + "\n（worktree 是唯一有意的豁免：只动 IDE 自己的 .michael/worktrees/，"
+    + "\n（worktree 是唯一有意的豁免：只动 IDE 自己的 .mrdayone/worktrees/，"
     + "best-of-N 每建一个候选弹一次窗就没法用了。）");
 });
