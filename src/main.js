@@ -36462,6 +36462,48 @@ function _implementationMutationGroundingIssue(run, call, root = "") {
   return "[BLOCKED_IMPLEMENTATION_GROUNDING] 当前项目不是已确认的空目录，但本轮还没有读取真实项目结构、源码或诊断。先用 list_dir/find_files 定位，再 read_file 读取相关入口/调用方（或 get_diagnostics/find_symbol 取得真实证据），拿到结果后的下一轮再写入。不要凭文件名和旧对话猜技术栈，也不要用 shell 绕过。";
 }
 
+/**
+ * 同一轮里前面的命令真失败了 → 停掉后面的命令，把决定权交回模型。
+ *
+ * 用户原话："一下丢好几个命令然后报错好几个……错了就及时思考用不用停止还是继续，不然就很蠢。"
+ *
+ * 为什么"停"是对的：这一轮的每一条命令都是在**看到任何结果之前**一次性决定的。第一条一挂，
+ * 后面每一条都建立在一个刚刚被证伪的前提上——继续跑只会把一个错误放大成一排错误，而模型
+ * 拿到那排错误还得先分辨哪个是根因。停下来、把失败原样交回去，它下一轮是带着事实做决定。
+ *
+ * 已有的 _implementationMutationBatchBlockResult 只覆盖"会改工作区"的命令
+ * （purpose=mutate/scaffold 或被判成 workspace-write）。构建、测试、运行、安装这些最常见的
+ * 全不在内——而它们恰恰是最容易连环失败的那一类。
+ *
+ * **只读探测失败不算前提塌了**：`which python` 没有、`cat 某个可能不存在的文件` 失败，
+ * 都是信息本身，同批的其它探测照跑。这条豁免是为了不把"一次性探环境"这种正当批次拦死。
+ */
+function _commandBatchBlockResult(run, items, index) {
+  if (!run || run.mode !== "agent" || !Array.isArray(items) || index <= 0) return null;
+  const current = items[index];
+  const isCmd = (call) => call && (call.type === "cmd" || call.type === "termtask");
+  if (!isCmd(current?.call) || current._eagerEntry || current.merged != null || current._unknown) return null;
+  const failed = items.slice(0, index).find((item) => isCmd(item?.call)
+    && !item._unknown && item.merged == null
+    && item.rawResult != null
+    && !_toolExecutionSucceeded(item.call, item.rawResult)
+    && !_callIsReadOnlyCommand(item.call));
+  if (!failed) return null;
+  const cmd = String(failed.call.command || "").slice(0, 120);
+  return {
+    type: current.call.type,
+    path: current.call.command || "",
+    ok: false,
+    failure: { code: "command_batch" },
+    content: "[BLOCKED_COMMAND_BATCH] **这条没有执行。**\n"
+      + `同一轮里更早的一条命令失败了：\`${cmd}\`\n`
+      + "本轮这些命令是在看到任何结果之前一次性决定的，所以后面每一条都建立在一个刚刚被证伪的"
+      + "前提上——继续跑只会把一个错误变成一排错误。\n"
+      + "先读上面那条失败的真实输出，判断：是要修掉它再跑，还是这条本来就和它无关、可以单独重发。"
+      + "无论哪种，都请**一次只发一条**，拿到结果再决定下一条。",
+  };
+}
+
 function _implementationMutationBatchBlockResult(run, items, index) {
   if (!run || run.mode !== "agent" || !Array.isArray(items) || index <= 0) return null;
   const current = items[index];
@@ -48197,7 +48239,8 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
         // Preserve ordered dependency semantics, but treat investigation quality as
         // advice. Pending probes and missing evidence never replace a real tool result.
         if (!it._eagerEntry && !_isMergedToolItem(it)) {
-          const batchBlock = _implementationMutationBatchBlockResult(run, items, index);
+          const batchBlock = _implementationMutationBatchBlockResult(run, items, index)
+            || _commandBatchBlockResult(run, items, index);
           if (batchBlock) {
             it.rawResult = batchBlock;
             if (!it.step) {
