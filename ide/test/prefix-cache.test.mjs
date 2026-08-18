@@ -109,9 +109,19 @@ test("a brand-new session waits, briefly and once, before sending an empty profi
   assert.match(SRC, /const _FIRST_TURN_INTENT_WAIT_MS = _INTENT_FOREGROUND_WAIT_MS;/,
     "the first-turn wait must be derived from the foreground window, not an independent literal"
     + " — two separate numbers is how it drifted into a race the timer always wins");
+  // 上面那段"必须够得上裁决"的推理，被 2026-08-18 的生产日志推翻了一半：上游首响应头
+  // 延迟是 claude-opus-5 平均 8.3s、gpt-5.5 平均 10.8s、gpt-5.6-sol 平均 18.4s（且 45%
+  // 以 502 结束）。裁决走同一个模型，所以"够得上"意味着窗口要开到十几二十秒——而窗口只在
+  // 裁决赶不上的轮次才生效，于是它就变成每条消息实打实多付的墙钟时间。用户实拍："同一个
+  // API 在 Claude Code / Codex 里飞快，在我软件里巨慢"，这就是我们自己加在上游之上的那一段。
+  //
+  // 正确的不变量因此换了一条：窗口**有界且小**，赶不上就照常发车，由下面那条
+  // _applyLateIntentIfLanded 在循环边界补齐。第一轮画像弱一点是一次性代价，
+  // 每轮多等十几秒不是。
   const windowMs = Number(/const _INTENT_FOREGROUND_WAIT_MS = (\d+);/.exec(SRC)[1]);
-  assert.ok(windowMs >= 8000,
-    `the classifier measured 6931ms/7607ms upstream — a ${windowMs}ms window never catches it`);
+  assert.ok(windowMs > 0 && windowMs <= 8000,
+    `${windowMs}ms window: this arm only fires when the verdict is slower than it — sizing it for`
+    + " the slow case means every message pays that wall-clock time on top of an already slow upstream");
 
   const guard = /if \(_turnIntentState && !\(sess\._semanticProfileFlags \|\| \[\]\)\.length && !sess\._intentWaitPaid\) \{/;
   assert.match(SRC, guard,
