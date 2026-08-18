@@ -27987,3 +27987,30 @@ test("没有语言服务的文件也要有词补全，不能弹一个空框", ()
     "词补全被关掉了——无 LSP 的语言里补全框会是空的");
   assert.match(SRC, /showWords: true,/, "建议列表里不显示词条目");
 });
+
+test("阻断性诊断门要覆盖有语言服务的语言，而不是只认 JS/TS", () => {
+  // 这张表同时是三道卡口的判据（建 baseline、进检查集、_interleavedDiagnostics 内部过滤）。
+  // 只有 JS/TS 八个扩展名时，模型改坏 .py/.rs/.go 引入语法或类型错误，
+  // [BLOCKING_NEW_DIAGNOSTICS] 永不触发，收尾门直接放行——而 lsp-client 明明管着
+  // 23 种语言的真诊断，断的只是"拿不拿它当收尾门的依据"。
+  const tbl = SRC.slice(SRC.indexOf("const _LINTABLE_EXT = new Set(["), SRC.indexOf("const _TS_EXT"));
+  for (const ext of ["rs", "py", "go", "java", "rb", "php", "swift", "kt", "cs"]) {
+    assert.match(tbl, new RegExp('"' + ext + '"'), `诊断门漏了 .${ext}——改坏了拦不住`);
+  }
+
+  const fn = SRC.slice(SRC.indexOf("async function _interleavedDiagnostics"), SRC.indexOf("\n// Run the project's test command"));
+  // 建 model 必须用真实语言 id：写死 typescript/javascript 的话，.py 会被当成 JS 分析，
+  // 报一堆无意义的错，而真正的 Python 诊断永远不会附到这个 model 上。
+  assert.match(fn, /const langId = _lintableLangId\(rel\)/,
+    "建 model 还在写死 typescript/javascript");
+  // 只建 model 不 didOpen 的话，语言服务器根本不知道这个文件存在——等多久都读不到 marker，
+  // 扩展名补齐了门却仍然恒放行。
+  assert.match(fn, /lspManager\?\.didOpen\(abs, model\)/,
+    "没有 didOpen——语言服务器不知道这个文件，诊断永远不会来");
+  assert.match(fn, /lspManager\?\.didClose\(/,
+    "用完没有 didClose——每轮都往服务器里塞一份永不关闭的文档");
+  // LSP 冷启动远超 900ms，固定等待等于"还没出结果就读成无错误"。
+  assert.doesNotMatch(fn, /setTimeout\(r, 900\)/, "又退回固定 900ms 等待了");
+  assert.match(fn, /_INTERLEAVED_DIAG_MAX_WAIT_MS/, "没有改成轮询等诊断");
+  assert.match(fn, /slice\(0, _INTERLEAVED_DIAG_MAX_FILES\)/, "一轮能检查的文件数仍然写死");
+});
