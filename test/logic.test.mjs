@@ -25394,6 +25394,68 @@ const ctxFn = (name, choice) => load(name, {
 //
 // 现在的规则只有一条：没有真数就不画数。代价要认：两次上报之间仪表就是不动——那段时间
 // 本来就没有任何真实数据，用算出来的数把它填上只是让它"看起来在动"。
+test("分母是猜的就得说出来——不能让 91% 看上去和真实读数一样确定", () => {
+  // 目录里查不到窗口的模型（实测 glm-5.3：OpenRouter 没收录、后台 model_caps_override 也没填），
+  // 客户端按模型名正则给一个数（/qwen|glm/ → 128k）。拿它算出"91%、接近满载"是在冒充真值。
+  const snap = (entry) => load("_contextMeterSnapshot", {
+    loadConfig: () => ({ model: "glm-5.3" }),
+    _modelCatalogEntry: () => entry,
+    _contextMeterLimit: () => 128_000,
+    _effectiveContextLimit: () => 128_000,
+  })({ promptTokens: 116_406, completionTokens: 0, estimated: false });
+
+  assert.equal(snap(null).windowReported, false, "目录没这个模型 = 分母是猜的");
+  assert.equal(snap({ contextLimit: 0 }).windowReported, false, "上报了 0 也等于没上报");
+  assert.equal(snap({ contextLimit: 200_000 }).windowReported, true);
+
+  const render = SRC.slice(SRC.indexOf("const lines = [`上下文"), SRC.indexOf("const lines = [`上下文") + 700);
+  assert.match(render, /state\.windowReported === false && state\.total > 0/,
+    "猜出来的分母没有任何标注");
+  assert.match(render, /窗口未上报/);
+});
+
+test("拖滑块要当场重画仪表，并且弹到最近的未锁档", () => {
+  const at = SRC.indexOf("const ctxSl = card.querySelector");
+  assert.ok(at > 0, "上下文滑块的绑定改写了");
+  const block = SRC.slice(at, at + 1600);
+  assert.match(block, /_refreshContextMeterFromDraft\(\{ force: true \}\)/,
+    "选完不重画 —— 分母变了而圆环要等下一次按键才跟上，用户只会认为「滑动切换没用」");
+  assert.match(block, /Math\.abs\(i - want\) < Math\.abs\(nearest - want\)/,
+    "又变回「弹到最大的未锁档」了：想选 202,752 会写进 5,096,890，25 倍且方向相反");
+});
+
+test("后台标签页的回合不许画到你正看着的标签页上", () => {
+  const at = SRC.indexOf("const _ctxPaintable =");
+  assert.ok(at > 0, "缺少「只画当前标签页」这道门");
+  const block = SRC.slice(at, at + 500);
+  assert.match(block, /session === _currentSession\(\)/);
+  assert.match(block, /if \(!_ctxPaintable\)/,
+    "没有这道门：后台标签页起一轮会把它的读数画到前台，没上报过的会话还会把前台顶成 0");
+});
+
+test("结算只许把读数抬上去，不许压下去", () => {
+  // 结算是更钝的那份拷贝。某一轮流式 usage 没到（按停/断线/末帧不带 usage）时，晚到的结算
+  // 会带着新 requestId 和 prompt=2 把 123,567 顶成 518，而且写进盘里，重启还是 518。
+  const at = SRC.indexOf("const _settleInput = _contextInputTokens(");
+  assert.ok(at > 0, "结算那条路改写了");
+  const block = SRC.slice(at, at + 700);
+  assert.match(block, /if \(_settleTotal >= \(Math\.max\(0, Number\(opts\.session\._ctxRealFloor\?\.total\) \|\| 0\)\)\)/,
+    "结算又能把读数压下去了");
+});
+
+test("上下文读数要进存盘指纹——否则只有它变时 checkpoint 走缓存，落盘里根本没有它", () => {
+  const fp = extractFn("_sessionPersistFingerprint");
+  assert.match(fp, /_ctxRealFloor\?\.total/,
+    "读数不在指纹里：它是这条会话唯一无法本地重算的数，重启之后仪表回到空白");
+  assert.match(fp, /_ctxRealFloor\?\.requestId/);
+  // 行为验：只有读数变了，指纹必须跟着变。
+  const build = load("_sessionPersistFingerprint");
+  const base = { id: "s1", memory: { recent: [], summaries: [], milestones: [], fileEvidence: [], archive: [], corrections: [] }, history: [] };
+  const a = build({ ...base, _ctxRealFloor: { total: 100, requestId: "r1" } });
+  const b = build({ ...base, _ctxRealFloor: { total: 123_567, requestId: "r2" } });
+  assert.notEqual(a, b, "只有读数变化时指纹没变 —— checkpoint 会命中缓存，ctxFloor 落不了盘");
+});
+
 test("上下文仪表只吃上游真实上报的数，任何本地估算都不许画上去", () => {
   const paints = [];
   const env = { _setContextMeter: (x) => paints.push(x) };
@@ -25455,41 +25517,23 @@ test("没选过窗口时，按连接真正给的默认窗口记账，不是目�
   assert.equal(ctxFn("_effectiveContextLimit", 0)("glm-5.2"), 96_890, "裁剪预算按一个拿不到的窗口留历史");
 });
 
-test("够得着的窗口才算数——目录列了但这条连接不去申请的，不能当上限", () => {
-  // 目录里的 context_windows 是"这个模型在各家端点上出现过的窗口"，不是"本连接给得到的"。
-  // 网关只会主动去要带 beta 标记的那几个（models.rs 的 wants_1m），客户端连"我要多大窗口"
-  // 这个字段都不发。把不带标记的更宽条目当夹取上限，用户拖一下滑块预算就变成真实窗口的
-  // 十倍，历史按拿不到的窗口留，最后在上游炸成 context-length 400。
-  assert.equal(ctxFn("_contextMeterLimit", 262_144)("glm-5.2"), 96_890,
-    "glm-5.2 目录里没有任何 beta 窗口，够得着的只有默认那个");
-  assert.equal(ctxFn("_contextMeterLimit", 9_000_000)("glm-5.2"), 96_890, "夹取上限丢了");
-
-  // 带 beta 标记的更宽窗口是**真的**够得着：网关无条件带上那个头（Sonnet 4.5 的 1M）。
-  const betaEnv = (choice) => ({
-    ...ctxEnv(choice),
-    _modelCatalogEntry: () => ({
-      contextLimit: 200_000,
-      contextWindows: [{ tokens: 200_000, beta: null }, { tokens: 1_000_000, beta: "context-1m-2025-08-07" }],
-    }),
-    _modelContextLimit: () => 200_000,
-    _nativeWindowsFor: () => [1_000_000, 200_000],
-    _ctxNativeDefault: () => 200_000,
-  });
-  const betaFn = (name, choice) => load(name, {
-    ...betaEnv(choice),
-    _ctxNativeCeiling: load("_ctxNativeCeiling", betaEnv(choice)),
-    _ctxNativeDefault: load("_ctxNativeDefault", betaEnv(choice)),
-  });
-  assert.equal(betaFn("_contextMeterLimit", 0)("claude-sonnet-4-5"), 200_000, "没选就是默认窗口");
-  assert.equal(betaFn("_contextMeterLimit", 1_000_000)("claude-sonnet-4-5"), 1_000_000,
-    "带 beta 的窗口网关会替你去要，选了就该生效");
+test("用户点的那一档就是他要的——不许用一个猜错的判据把它否决", () => {
+  // 上一版拿 `beta` 标记当"够不够得着"的判据，锁掉了所有不带标记的更宽窗口。那个判据是错的：
+  // 线上目录 29 个模型**一条 beta 都没有**，而网关的 wants_1m 判的是 tokens>=1M、根本不看 beta。
+  // 结果 glm-5.2 的 202.8k/262.1k/512k/1.0M 四档全被锁死，滑块只剩一格 —— 用户报的"拖不动"。
+  assert.equal(ctxFn("_contextMeterLimit", 262_144)("glm-5.2"), 262_144, "用户点的档位又被否决了");
+  assert.equal(ctxFn("_effectiveContextLimit", 262_144)("glm-5.2"), 262_144);
+  // 夹取上限是目录列出的最宽原生窗口——放宽不能超过模型给得出的。
+  assert.equal(ctxFn("_contextMeterLimit", 9_000_000)("glm-5.2"), 1_000_000, "夹取上限丢了");
+  // 没选过仍然按默认窗口记账（这一半是对的，别一起退掉）。
+  assert.equal(ctxFn("_contextMeterLimit", 0)("glm-5.2"), 96_890);
 });
 
-test("够不着的原生档在滑块上要锁掉，而不是选了再被悄悄夹回去", () => {
-  // 「选得到、但选了等于没选」是同一类 bug 的另一种长相：显示的和用的又不是一个数。
+test("原生档一律可选——滑块不能只剩一格", () => {
   const env = {
     _modelContextLimit: () => 96_890,
     _ctxNativeDefault: () => 96_890,
+    _ctxNativeCeiling: () => 1_000_000,
     _modelCatalogEntry: () => ({
       contextLimit: 96_890,
       contextWindows: [96_890, 202_752, 1_000_000].map((tokens) => ({ tokens, beta: null })),
@@ -25499,12 +25543,35 @@ test("够不着的原生档在滑块上要锁掉，而不是选了再被悄悄�
     _tokenShort: (n) => String(n),
     _MC_TIER_OPTIONS: [["1M", 1_000_000]],
   };
-  const opts = load("_ctxChoiceOptions", { ...env, _ctxNativeCeiling: load("_ctxNativeCeiling", env) })("glm-5.2");
-  const natives = opts.filter((o) => o.native);
-  assert.equal(natives.length, 3, "够不着的档位仍然要显示——藏起来会让人以为模型没这个能力");
-  assert.equal(natives[0].locked, false, "默认窗口永远可选");
-  assert.ok(natives[1].locked && natives[2].locked, "够不着的两档必须上锁");
-  assert.match(natives[2].lockHint, /不会去申请/, "锁住要说清为什么，不能只是拖不动");
+  const natives = load("_ctxChoiceOptions", env)("glm-5.2").filter((o) => o.native);
+  assert.equal(natives.length, 3);
+  assert.deepEqual(natives.map((o) => o.locked), [false, false, false],
+    "原生档被锁了 —— 那是按 beta 判的，而线上一条 beta 都没有");
+});
+
+test("收窄永远算数——存着的窄窗口不许被放大回满窗", () => {
+  // 这条最要命：存 200k（在一个 1M 模型上），上一版既不在选项表里、又没有更小的可选档，
+  // fits 为空返回 0，而 0 被 _ctxChoiceFor 当成"没选过" → 满窗 1M。用户明明调窄了，
+  // 读数却被放大 5 倍，永不自愈、界面没有任何提示。v1 记录迁移过来正好会造出这条坏记录。
+  const env = {
+    _modelContextLimit: () => 1_000_000,
+    _ctxNativeDefault: () => 1_000_000,
+    _ctxNativeCeiling: () => 1_000_000,
+    _modelCatalogEntry: () => ({ contextLimit: 1_000_000, contextWindows: [{ tokens: 1_000_000, beta: null }] }),
+    _michaelUser: null,
+    _gatewayHandlesCompression: () => false,
+    _tokenShort: (n) => String(n),
+    _MC_TIER_OPTIONS: [["1M", 1_000_000]],
+  };
+  const snap = load("_ctxSnapToOpenChoice", {
+    ...env,
+    _ctxChoiceOptions: load("_ctxChoiceOptions", env),
+  });
+  assert.equal(snap("m", 200_000), 200_000, "收窄被丢掉了 —— 读数会被放大 5 倍");
+  assert.equal(snap("m", 1_000_000), 1_000_000);
+  assert.equal(snap("m", 0), 0, "没存过就是没存过");
+  // 放宽超出买得到的范围才吸附；一个都不剩要退回默认窗口，不能返回 0（0 会被当成没选过）。
+  assert.equal(snap("m", 9_000_000), 1_000_000);
 });
 
 test("会员降档之后，存着的那一档要落回当前买得到的档位", () => {
