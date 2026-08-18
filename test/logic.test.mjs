@@ -11271,11 +11271,20 @@ test("external source tools stay real but load on demand", () => {
     _SEARCH_TOOLS_SCHEMA: searchSchema,
   });
   const names = select(true, "fix this project").map((tool) => tool.function.name);
-  assert.deepEqual(names, ["read_file", "search_tools"]);
+  // 2026-08-18：取外部资源那一族（web_search / web_fetch / github_search /
+  // developer_community_search / package_search）**进开局窗口**了，用户点名要的。
+  // 理由是结构性的：窗口里的工具零成本可调，不在窗口里的要先花一轮 search_tools 取
+  // schema——两条路结果差不多时模型当然走便宜的那条，于是"能查 GitHub / 社区"这件事
+  // 在真正需要它的难任务上永远轮不到。
+  assert.deepEqual(names, [
+    "read_file", "web_search", "web_fetch", "developer_community_search", "github_search", "search_tools",
+  ]);
+  // 但**没被点名**的外部源工具照旧懒加载——扩的是有明确用途的那五个，不是把目录敞开。
   assert.ok(!names.includes("knowledge_search"), "knowledge schemas also load through the meta-tool");
-  assert.ok(!names.includes("local_discovery"), "domain tools load only when the task profile requests them");
-  assert.ok(!names.includes("web_search"), "public web search requires a concrete evidence gap");
-  assert.ok(!names.includes("developer_community_search"), "community search is not a first-turn reflex");
+  assert.ok(!names.includes("local_discovery"), "没点名的外部源工具仍然按需加载");
+  // 这三条是旧设计的原话（"公开搜索要先有具体证据缺口""社区搜索不是第一轮反射"）。
+  // 用户 2026-08-18 明确改了这个取舍：宁可开局就够得着，也不要它在难任务上因为"要多花
+  // 一轮取 schema"而永远不用。判断权仍在模型和编排器手里——装进窗口 ≠ 每轮都要用。
   assert.doesNotMatch(SRC, /_TOOL_BUNDLES|_DEFERRED_TOOL_NAMES/,
     "lazy loading must derive from the live registry instead of a second static tool table");
 });
@@ -11526,12 +11535,14 @@ test("natural-language capability queries are routed by the semantic tool orches
     recommendToolsForIntent: load("recommendToolsForIntent"),
     _buildScenarioSignature: scenarioSignature,
     _toolExpRetrieve: load("_toolExpRetrieve", { _buildScenarioSignature: scenarioSignature }),
-    fetch: async (_url, options) => {
-      request = JSON.parse(options.body);
-      return { ok: true, json: async () => ({ choices: [{ message: { content: JSON.stringify({
+    // 这条测试关心的是**编排逻辑**，不是传输。传输（SSE 拼装 / JSON 兜底）另有专门的
+    // 测试，这里直接给它定稿文本，顺便捕获真正发出去的请求体。
+    _fetchCompletionText: async (_url, _headers, payload) => {
+      request = payload;
+      return JSON.stringify({
         tools: ["local_discovery", "not_registered"],
         instruction: "Use the local structured-data tool for the requested nearby-place evidence.",
-      }) } }] }) };
+      });
     },
   });
   const decision = await route({
@@ -17722,14 +17733,15 @@ test("语义收尾评审工具仍可独立使用，但 quiet turn 不会被评�
     _chatCompletionsUrl: () => "https://gateway.example/v1/chat/completions",
     _safeJsonLoose: JSON.parse,
     enrichedCatalogLine,
-    fetch: async (_url, options) => {
-      reviewRequest = JSON.parse(options.body);
-      return { ok: true, json: async () => ({ choices: [{ message: { content: JSON.stringify({
+    // 同上：这条测试关心评审逻辑，不关心传输。给定稿文本，顺便捕获请求体。
+    _fetchCompletionText: async (_url, _headers, payload) => {
+      reviewRequest = payload;
+      return JSON.stringify({
         done: false,
         verified: false,
         instruction: "Start isolated capture, drive the login flow, then inspect the captured request before retrying.",
         tools: ["capture_start", "browser", "capture_flows", "background_monitor", "not_registered"],
-      }) } }] }) };
+      });
     },
   });
   const verdict = await critic({
@@ -22626,6 +22638,49 @@ test("交付事实来自执行记录，不做任何推断", () => {
   assert.equal(facts({ _mutatedFiles: new Set(["README.md"]), _executionEvidence: [] }), "");
 });
 
+test("客户端直连网关的那几条也要走 SSE——同步请求在中转那边是整段生成完才回", async () => {
+  // 之前那次"全部改 SSE"只扫了两棵 Rust 源码树，漏了 main.js 里的**直连 fetch**：
+  // _semanticToolOrchestrator（每轮都跑的工具编排）、_wrapUpCritic、_predictNextAsk。
+  // 用户 Sub2API 控制台里那些"同步"请求，大头正是它们。
+  const sse = (body, ctype = "text/event-stream") => async () => ({
+    ok: true,
+    headers: { get: () => ctype },
+    body: {
+      getReader() {
+        let sent = false;
+        return {
+          read: async () => (sent ? { done: true } : (sent = true, { done: false, value: new TextEncoder().encode(body) })),
+          cancel: async () => {},
+        };
+      },
+    },
+  });
+  const run = (fetchImpl) => load("_fetchCompletionText", { fetch: fetchImpl })(
+    "https://gw.test/v1/chat/completions", {}, { model: "m", messages: [] }, undefined);
+
+  // OpenAI 形状
+  assert.equal(await run(sse('data: {"choices":[{"delta":{"content":"你好"}}]}\ndata: {"choices":[{"delta":{"content":"世界"}}]}\ndata: [DONE]\n')), "你好世界");
+  // 原生 Anthropic 形状（网关对 Claude 路由用的就是它）
+  assert.equal(await run(sse('data: {"type":"content_block_delta","delta":{"text":"ab"}}\ndata: [DONE]\n')), "ab");
+  // 心跳和半截 JSON 不能把整轮判失败
+  assert.equal(await run(sse(': ping\ndata: {malformed\ndata: {"choices":[{"delta":{"content":"ok"}}]}\ndata: [DONE]\n')), "ok");
+  // 中转无视 stream:true 直接回 JSON —— 没有这条兜底，那些线路会整条失效
+  assert.equal(
+    await run(async () => ({ ok: true, headers: { get: () => "application/json" }, json: async () => ({ choices: [{ message: { content: "plain" } }] }) })),
+    "plain");
+  // 桩式响应（没有 headers / body）也要走兜底，而不是抛出去变成"这条能力静默失灵"
+  assert.equal(await run(async () => ({ ok: true, json: async () => ({ choices: [{ message: { content: "bare" } }] }) })), "bare");
+  // 请求体里必须真的带上 stream:true，否则改了个寂寞
+  let sentBody = null;
+  await run(async (_u, o) => { sentBody = JSON.parse(o.body); return { ok: true, json: async () => ({}) }; });
+  assert.equal(sentBody.stream, true, "没带 stream:true —— 中转还是会整段生成完才回");
+
+  // 源码层面：客户端不许再有同步出站（注释里提到的字样除外）。
+  const src = stripJsComments(SRC);
+  assert.doesNotMatch(src, /stream:\s*false/,
+    "又出现同步出站请求了——中转会等整段生成完才回，用户那边就是干等");
+});
+
 test("剥注释的顺序不能反——一条注释里的 glob 曾经吞掉 45KB 代码", () => {
   // 实测撞到的：`// 只有 **\/AGENTS.md 这类子包约定读不到` 这行注释里，glob 中的
   // `/` `*` 被块注释正则当成开头，一口吞到下一个 `*/`，中间 45,375 个字符在所有
@@ -26010,6 +26065,50 @@ test("收窄永远算数——窗口那条轴直接认目录里列着的值", ()
     "目录不再列出的值退回默认，而不是钉死一个交付不了的数");
   // 而且这条链上不该再有那个已删掉的吸附器 —— 它没有消费者，留着就是"测试全绿、功能是死的"。
   assert.ok(!/function _ctxSnapToOpenChoice\(/.test(SRC), "死函数又回来了");
+});
+
+test("选了哪一格就停在哪一格——不许一重画就退回去", () => {
+  // 用户实拍："我选择 1M 档次后还会自动退回去"。两条轴拆开之后 _effectiveContextLimit 是
+  // 二者之**和**（128.0k + 1M 档 = 1,128,000），而档位选项的 value 是档位本身（1,000,000）。
+  // 卡片当时还在用那个和去选项表里找高亮位，一个都对不上 → 回落到 idx = 0 →
+  // 用户选了 1M 档，卡片一重画就跳回最左边的 128.0k。
+  const box = { rec: null };
+  const env = {
+    _modelCatalogEntry: () => ({ contextLimit: 0, contextWindows: [] }),   // 目录没这个模型 → 按名猜 128k
+    _fallbackModelContextLimit: () => 128_000,
+    _customModelById: () => null,
+    loadConfig: () => ({}),
+    _michaelUser: { michael_compression: { max_input_tokens: 5_000_000 } },
+    _gatewayHandlesCompression: () => true,
+    _tokenShort: (n) => (n >= 1e6 ? `${(n / 1e6).toFixed(1)}M` : `${(n / 1000).toFixed(1)}k`),
+    _MC_TIER_OPTIONS: loadConst("_MC_TIER_OPTIONS"),
+    _ctxChoiceRecord: () => box.rec,
+    _ctxSeenMax: () => 0,
+    _micSliderHtml: (o) => o,
+  };
+  // 分层构建：后面的函数要用到前面的，一次性用同一个 env 加载会互相看不见。
+  const l1 = { ...env, _modelContextLimit: load("_modelContextLimit", env) };
+  const l2 = { ...l1, _nativeWindowsFor: load("_nativeWindowsFor", l1), _ctxNativeDefault: load("_ctxNativeDefault", l1) };
+  const deps = { ...l2, _ctxNativeCeiling: load("_ctxNativeCeiling", l2) };
+  const opts = load("_modelContextChoices", { ...deps, _ctxChoiceOptions: load("_ctxChoiceOptions", deps) });
+  const rows = load("_modelContextRows", {
+    ...deps,
+    _modelContextChoices: opts,
+    _ctxChoiceFor: load("_ctxChoiceFor", deps),
+    _ctxTierChoice: load("_ctxTierChoice", deps),
+  });
+  const list = opts("glm-5.3");
+  assert.deepEqual(list.map((o) => o.label), ["128.0k", "1M 档", "2M 档", "5M 档"]);
+
+  for (const o of list) {
+    box.rec = { kind: o.kind === "tier" ? "tier" : "native", tokens: o.value };
+    const idx = rows({ id: "glm-5.3" }).index;
+    assert.equal(list[idx].label, o.label,
+      `选了「${o.label}」，重画之后却停在「${list[idx].label}」——这就是用户报的自动退回`);
+  }
+  // 没选过时停在这个模型的**默认窗口**上，而不是无脑第 0 格。
+  box.rec = null;
+  assert.equal(list[rows({ id: "glm-5.3" }).index].label, "128.0k");
 });
 
 test("滑轨上两条轴要分得开：窗口在左、档位在右，档位带「档」字", () => {
