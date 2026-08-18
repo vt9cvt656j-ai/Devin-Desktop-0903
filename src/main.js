@@ -18086,24 +18086,13 @@ function _setContextMeter(input = {}) {
   if (input.estimated === false) _ctxMeter.anyReal = true;
   _renderTokenMeter();
 }
-// 会话基础上下文估算缓存：旧版每敲一个字就 memory.assemble() 重组全部消息再对 120 条
-// 做 token 估算——长对话里光打字就卡。基础量只在会话内容变化时重算，每键只叠加草稿估算。
-let _ctxBaseCache = { key: "", tokens: 0 };
-function _estimateActiveSessionContextTokens(draftText = "") {
-  try {
-    const session = (typeof _currentSession === "function") ? _currentSession() : null;
-    const key = session
-      ? `${session.id}:${Number(session.memory?.totalTurns) || 0}:${session.memory?.recent?.length || 0}:${session.history?.length || 0}`
-      : "none";
-    if (_ctxBaseCache.key !== key) {
-      const messages = session?.memory ? session.memory.assemble() : (Array.isArray(session?.history) ? session.history.slice() : []);
-      _ctxBaseCache = { key, tokens: _estRequestTokens(messages.slice(-120), []) };
-    }
-    const draft = String(draftText || "");
-    const draftTokens = draft.trim() ? Math.max(1, _estRequestTokens([{ role: "user", content: draft }], [])) : 0;
-    return _ctxBaseCache.tokens + draftTokens;
-  } catch { return 0; }
-}
+// 会话级上下文估算器已删除（2026-08-17）。
+//
+// 它是「打字时把整条会话重新估一遍 token」那套东西，唯一的消费者是上下文仪表的兜底分支。
+// 而仪表现在只显示上游真实上报的数（用户原话：「不要估算 全部都走真实的，不要模拟计算」），
+// 那条兜底分支没了，它就没有消费者了 —— 留着的死代码只会让下一个人以为仪表还在用估算。
+// 请求预算那条路用的是另一个函数（_estRequestTokens），不受影响。
+
 function _refreshContextMeterFromDraft(options = {}) {
   try {
     const force = !!options.force;
@@ -18117,8 +18106,9 @@ function _refreshContextMeterFromDraft(options = {}) {
     // while the user typed. The draft is added on top because those tokens are real too: they
     // go up with the next send.
     if (Math.max(0, Number(real?.total) || 0) > 0) {
-      const draftTokens = draft.trim() ? Math.max(1, _estRequestTokens([{ role: "user", content: draft }], [])) : 0;
-      _setContextMeterFromReading(real, draftTokens);
+      // 草稿的 token 数也是估出来的，同样不许叠到仪表上：这个数只表示"上游说这轮读了多少"。
+      // 你打的字要到下一次上报才算数 —— 那时候它是真的。
+      _setContextMeterFromReading(real, 0);
       return;
     }
     // Empty composer after a completed turn keeps the last real/estimated pressure
@@ -18127,8 +18117,9 @@ function _refreshContextMeterFromDraft(options = {}) {
       _renderTokenMeter();
       return;
     }
-    const prompt = _estimateActiveSessionContextTokens(draft);
-    _setContextMeter({ promptTokens: prompt, completionTokens: 0, cachedTokens: null, estimated: true, source: draft.trim() ? "draft" : "session" });
+    // 一次都还没上报过：如实空着。原来这里拿 _estimateActiveSessionContextTokens 顶上，
+    // 那是个纯本地估算（看不见系统提示词和工具 schema），显示出来只会让人以为是真的。
+    _setContextMeter({ promptTokens: 0, completionTokens: 0, cachedTokens: null, estimated: true, source: "pending" });
   } catch { _renderTokenMeter(); }
 }
 
@@ -18184,7 +18175,11 @@ function _recordUsage(ev, opts = {}) {
     // 主对话几十 k 的读数直接“归零”，用户看到的就是每轮重置。
     if (opts.aux) return;
     if (est || !opts.session) {
-      _setContextMeter({ promptTokens: pin, completionTokens: out, cachedTokens: hasCacheInfo ? cached : null, estimated: est, source: est ? "估算" : "真实 usage" });
+      // 估算来源的用量（上游没上报、由本地推出来的）不许画到上下文仪表上：这个数的含义是
+      // "上游说这一轮读了多少"，掺进估算就不再是那个意思了。累计账（_tok）照记不误。
+      if (!est) {
+        _setContextMeter({ promptTokens: pin, completionTokens: out, cachedTokens: hasCacheInfo ? cached : null, estimated: false, source: "真实 usage" });
+      }
       return;
     }
     // The settlement merges the two provider shapes into one `cached_tokens` column, so it can
@@ -41305,8 +41300,23 @@ async function _agentModelTurn({ config, messages, toolSchemas, toolRegistry = n
       const _mcSourceMessages = _l0Msgs;
       if (_mcTier && !_isSub) _l0Msgs = _applyCompressionPrefix(_l0Msgs, _turnConfig, session);
       _l0Msgs = _enforceModelRequestBudget(_l0Msgs, _l0Tools, _MODEL_REQUEST_BODY_BYTE_CAP);
+      // 预算判定仍然要这个估算（_enforceModelRequestBudget 上面已经用过），但**它不许画到仪表上**。
       _lastRequestEstimateTokens = _estRequestTokens(_l0Msgs, _l0Tools);
-      _setContextMeter({ promptTokens: _lastRequestEstimateTokens, completionTokens: 0, cachedTokens: null, estimated: true, source: "prepared" });
+      // 上下文仪表只显示上游真实上报的数。
+      //
+      // 这行原来无条件把仪表重画成本地估算，于是每发一条消息、以及 agent run 里的每一轮，
+      // 读数都先塌回一个小得多的数 —— 用户看到的就是「一发消息就重置回 0」。估算必然偏小：
+      // 它看不见网关注入的系统提示词，更关键的是 release 构建把工具描述整段剥空由网关按名
+      // 回填（strip-tool-ip），打包版里 JSON.stringify(_l0Tools) 只有真实体积的一小截。
+      // dev 构建不剥 —— 这就是它在本地永远复现不出来的原因。
+      //
+      // 现在的规则只有一条：**没有真数就不画数**。有上一份真实读数就原样留着（它是这一刻
+      // 唯一成立的事实），一次都还没上报过就如实说"尚未上报"，而不是拿一个算出来的数顶上。
+      if (Number(session?._ctxRealFloor?.total) > 0) {
+        _setContextMeterFromReading(session._ctxRealFloor, 0);
+      } else {
+        _setContextMeter({ promptTokens: 0, completionTokens: 0, cachedTokens: null, estimated: true, source: "pending" });
+      }
       await _runModelRequestWithRetry({
         invoke: (cb) => backend.aiChatWithTools(_turnConfig, _l0Msgs, _l0Tools, cb),
         isLive: _live,
