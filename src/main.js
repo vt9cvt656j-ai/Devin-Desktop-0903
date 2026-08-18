@@ -14209,9 +14209,19 @@ function _freePointsMetric(metric, _usd, u) {
   // display would sit at "40 点" through dozens of calls and look broken. Trim trailing
   // zeros so a full pool still reads "40 点", not "40.00 点".
   const shown = (Math.round(pts * 100) / 100).toString();
+  // 池子扣完之后免费模型会不会接着扣钱包/会员额度 —— 服务端开关，随资料下发。
+  // 老网关不发这个字段：那种情况下按旧行为（扣完就停）说话，不去猜。
+  const fallsBack = u?.free_fallback_to_paid === true;
+  // 这句话原来在两头都说错了：还剩零头时写「仅限免费模型」，而此刻**每一次调用都在扣钱包**
+  // （零头盖不住一次调用，结算就整笔落到付费路径）；见底时写「付费模型不受影响」，只说了
+  // 付费模型，一个字都没提免费模型正在扣余额。用户第一次发现是在账单上。
   const sub = pts > 0
-    ? `仅限免费模型 · 每日 0 点重置为 ${daily} 点（约 ${yuan(daily)}）`
-    : "今日已用完 · 明天 0 点重置（付费模型不受影响）";
+    ? (fallsBack
+      ? `每日 0 点重置为 ${daily} 点（约 ${yuan(daily)}）· 扣完后免费模型改用余额 / 会员额度`
+      : `仅限免费模型 · 每日 0 点重置为 ${daily} 点（约 ${yuan(daily)}）`)
+    : (fallsBack
+      ? "今日已用完 · 免费模型现在扣的是余额 / 会员额度 · 明天 0 点重置"
+      : "今日已用完 · 明天 0 点重置（付费模型不受影响）");
   return metric("免费额度", shown + " 点", pct, sub, true);
 }
 

@@ -21333,6 +21333,27 @@ test("context-window choice clamps to what is actually deliverable", () => {
 // exactly 40 点. The first cut stored raw provider cents and rendered them through the
 // credit-dollar denominator (663 raw cents = $1.00), which showed a ¥2 allowance as "$3.02" —
 // a real number in the wrong currency. Points are the unit; render them as such.
+test("免费池的文案要说清扣完之后扣的是谁的钱", () => {
+  // 两头都说错过：还剩零头时写「仅限免费模型」，而此刻每一次调用都在扣钱包（零头盖不住
+  // 一次调用，结算整笔落到付费路径）；见底时写「付费模型不受影响」，只说了付费模型，
+  // 一个字都没提免费模型正在扣余额——用户第一次发现是在账单上。
+  const metric = (_label, _val, _pct, sub) => sub;
+  const fp = load("_freePointsMetric", {});
+  const u = (points, fallback) => ({ free_points: points, free_points_daily: 40, free_fallback_to_paid: fallback });
+
+  assert.match(fp(metric, 0, u(0, true)), /免费模型现在扣的是余额 \/ 会员额度/,
+    "池子见底、且网关开了回落 —— 必须说清现在扣谁的钱");
+  assert.match(fp(metric, 0, u(0.04, true)), /扣完后免费模型改用余额 \/ 会员额度/,
+    "还剩零头时也要提前说，不能写「仅限免费模型」");
+  assert.doesNotMatch(fp(metric, 0, u(0.04, true)), /仅限免费模型/);
+
+  // 网关没开回落（或是老网关不发这个字段）时保持旧话术，不去猜。
+  assert.match(fp(metric, 0, u(0, false)), /付费模型不受影响/);
+  assert.match(fp(metric, 0, u(0.04, false)), /仅限免费模型/);
+  assert.match(fp(metric, 0, { free_points: 0, free_points_daily: 40 }), /付费模型不受影响/,
+    "老网关不发这个字段就按旧行为说话");
+});
+
 test("free allowance renders in 点 and never through the dollar denominator", () => {
   const fn = load("_freePointsMetric");
   const seen = [];
