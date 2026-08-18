@@ -36500,6 +36500,67 @@ function _newTechResearchIssue(run, call) {
     + "查完直接继续，不用再问我。";
 }
 
+/** 归一化一个问题，用来判"是不是同一个问题"：去标点空白、统一大小写。 */
+function _normalizeQuestion(q) {
+  return String(q || "").toLowerCase()
+    .replace(/[\s\u3000]+/g, "")
+    .replace(/[，。！？、；：""''（）()[\]{}<>~`!?.,;:'"|/\\-]+/g, "");
+}
+
+/** 两个问题的相似度（按字符集合算交并比）。中文没有空格，按词切不可靠，按字更稳。 */
+function _questionSimilarity(a, b) {
+  const x = _normalizeQuestion(a);
+  const y = _normalizeQuestion(b);
+  if (!x || !y) return 0;
+  if (x === y) return 1;
+  if (x.includes(y) || y.includes(x)) return 0.95;
+  const sx = new Set(x), sy = new Set(y);
+  let inter = 0;
+  for (const c of sx) if (sy.has(c)) inter++;
+  return inter / (sx.size + sy.size - inter);
+}
+
+/**
+ * 「这个问题你已经问过了，用户答过了」——跨轮的重复提问拦截。
+ *
+ * 用户原话："明明他也知道那个是我想要的，一直问没完了，我也一直回答同样内容。"
+ *
+ * 已有的提问预算是**按 run 计数**的（第 1 次放行、第 3 次拦下）。而用户每发一条新消息就是
+ * 一个新 run，计数当场归零 —— 所以模型可以每一轮都问同一个问题，永远撞不到那道门。
+ * 用户经历的正是这个：问一次、答一次、下一轮再问一次，没完。
+ *
+ * 台账挂在**会话**上，跨 run 存活。命中时不弹卡片，直接把用户上次的原话交回去 ——
+ * 它要的信息本来就已经有了，再问一次只是让用户对着界面又干等两分钟。
+ */
+function _repeatedQuestionAnswer(session, question) {
+  const ledger = Array.isArray(session?._askedLedger) ? session._askedLedger : [];
+  if (!ledger.length) return null;
+  const q = String(question || "").trim();
+  if (!q) return null;
+  let best = null;
+  for (const entry of ledger) {
+    // 0.65 是标定出来的，不是拍的：拿两组真实问法量过 ——
+    //   同一个问题换种说法（"要不要加测试" vs "需要加测试吗"）最低 0.71；
+    //   不同问题（"这个文件要删掉吗" vs "要重命名吗"）最高 0.55。
+    // 取中间留足余量。判错的代价不对称：漏判只是多问一次，误判会把一个**新**问题
+    // 用旧答案顶掉，那更糟——所以宁可靠近异类那一侧。
+    const score = _questionSimilarity(q, entry?.q);
+    if (score >= 0.65 && (!best || score > best.score)) best = { ...entry, score };
+  }
+  return best && best.answer ? best : null;
+}
+
+function _rememberAskedQuestion(session, question, answer) {
+  if (!session) return;
+  const q = String(question || "").trim();
+  const a = String(answer || "").trim();
+  // 取消 / 超时不是答案，记下来会把"用户其实没答"当成"答过了"。
+  if (!q || !a || a.startsWith("[已取消]") || a.startsWith("[超时]")) return;
+  session._askedLedger = Array.isArray(session._askedLedger) ? session._askedLedger : [];
+  session._askedLedger.push({ q, answer: a.slice(0, 600), at: Date.now() });
+  if (session._askedLedger.length > 40) session._askedLedger.splice(0, session._askedLedger.length - 40);
+}
+
 function _implementationMutationGroundingIssue(run, call, root = "") {
   if (!run || run.mode !== "agent" || !_implementationGroundingCandidate(call)) return "";
   const profile = run.engineering || {};
@@ -49341,8 +49402,13 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
         settlement: _finalRunSettlement(_ru),
         timeline: run.timeline,
       });
-      _appendDeliveryFactsBar(body, run);
-      _appendRunRevertBar(body, run);
+      // 「改了 N 个文件·没验证·没测试」这条事实横幅 + 「本轮改了 N 个文件·全部撤销」这条
+      // 撤销条，2026-08-18 用户点名删掉——它俩是糊在回答下面的 harness footer / 文件清单，
+      // 正是「不要在模型回答下面写 harness 文字」那条老规矩。
+      //
+      // 只删**显示**：同一条交付事实照样喂给模型（见 _deliveryFactsLine 的另一处调用，
+      // 拼进「本轮交付事实」那段），所以"改完别谎报能用"的机制一点没动，只是不再占屏。
+      // 撤销能力也没删——checkpoint 还在，需要时可另开入口，只是不再默认挂一条 UI。
     } catch {}
     finally {
       _liveStats.stop();
@@ -53412,6 +53478,23 @@ async function _executeToolStepInner(step, call, root, run) {
       //                告诉它按最合理的方案继续，并把假设写进回答。
       //   连着问 —— 两次提问之间一个别的工具都没调，那不是在收集信息，是在原地停摆。
       //                这种情况直接按第 3 级处理，不等它问满三次。
+      // 跨轮重复提问：这个问题本会话已经问过、用户也答过了。
+      //
+      // 下面那套预算是**按 run 计数**的，而用户每发一条新消息就是一个新 run，计数当场归零
+      // —— 所以模型可以每一轮都问同一个问题，永远撞不到那道门。用户经历的正是这个：
+      // 问一次、答一次、下一轮再问一次，没完，而且每次都要对着界面干等两分钟。
+      const _auPrior = _repeatedQuestionAnswer(run?.session, q);
+      if (_auPrior) {
+        res.className = "atc-result atc-result--blocked";
+        res.textContent = "这个已经问过了";
+        return { type: "askuser", path: "", content:
+          `[ALREADY_ANSWERED] 这个问题你在本次会话里已经问过，用户答过了——没有再弹卡片。\n\n`
+          + `你这次问的：「${q.slice(0, 120)}」\n`
+          + `上次问的：「${String(_auPrior.q).slice(0, 120)}」\n`
+          + `**用户当时的原话：「${String(_auPrior.answer).slice(0, 400)}」**\n\n`
+          + `按这个答案继续做。它如果没有覆盖你现在真正卡住的那一点，说明你要问的是**另一件事**——`
+          + `那就把问题重写成那件事本身，别把同一个问题换个说法再问一遍。` };
+      }
       const _auN = (run._askUserCount = (run._askUserCount || 0) + 1);
       const _auBackToBack = run._lastToolWasAsk === true;
       run._lastToolWasAsk = true;
@@ -53450,6 +53533,8 @@ async function _executeToolStepInner(step, call, root, run) {
           _releaseInteraction();
           vp.innerHTML = `<div class="au-done">${_escHtml(label || answer)}</div>`;
           res.className = "atc-result atc-result--ok"; res.textContent = "已回复";
+          // 记进**会话级**台账（跨 run 存活），下次再问同一个问题时直接把这句话交回去。
+          _rememberAskedQuestion(run?.session, q, answer);
           resolve({ type: "askuser", path: "", content: answer + _auRepeatNote });
         };
         _releaseInteraction = _registerRunInteraction(run, () => {

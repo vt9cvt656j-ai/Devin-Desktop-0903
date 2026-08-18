@@ -1448,6 +1448,12 @@ test("拖滑块时不许每一帧都落盘", () => {
 // 它只保证一件事——**不再新增**。接好一个就从名单里删一个（删了会更绿）；新写一个能力
 // 忘了接线，这条当场红。
 const KNOWN_UNCALLED = new Set([
+  // 有意保留、暂无调用点（这一段要写清为什么，别混进上面那份存量）：
+  // 这两条 UI 横幅 2026-08-18 由用户点名删掉——它们是糊在模型回答下面的 harness 文字，
+  // 正是"不要在回答下面写 harness 内容"那条规矩。删的只是**显示**：同一条交付事实照样
+  // 喂给模型（_deliveryFactsLine 另有调用点），撤销能力也还在（checkpoint 没动），
+  // 只是不再默认挂一条 UI。渲染器留着，将来若另开入口可以直接复用。
+  "_appendDeliveryFactsBar", "_appendRunRevertBar",
   "_activeAiProviderMode", "_adaptiveEnabled", "_addDroppedRef",
   "_agentAllowsDependencyRestore", "_agentAllowsExternalKind", "_agentAllowsRuntimeKind",
   "_agentAllowsWorkspaceMutation", "_agentQuestionNeedsWorkspaceEvidence",

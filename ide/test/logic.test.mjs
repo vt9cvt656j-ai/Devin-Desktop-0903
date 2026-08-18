@@ -22661,6 +22661,74 @@ test("screen.capture 端到端接通：白名单、目录、图像通道", () =>
 // 本地取证门（_implementationMutationGroundingIssue）要求的是"先读懂**这个**项目"，它回答不了
 // "这个包存不存在、还有没有人维护、是不是这件事的主流做法"。而模型编一个不存在的依赖、
 // 或挑一个三年没更新的库，会一路写下去，直到装不上才暴露——那时候已经写了一堆。
+// ── 同一个问题不许问第二遍 ───────────────────────────────────────────────
+//
+// 用户原话："明明他也知道那个是我想要的，一直问没完了，我也一直回答同样内容。"
+//
+// 已有的提问预算是**按 run 计数**的（第 1 次放行、第 3 次拦下）。而用户每发一条新消息就是
+// 一个新 run，计数当场归零 —— 所以模型可以每一轮都问同一个问题，永远撞不到那道门，
+// 而用户每次都要对着卡片干等最多两分钟再答一遍同样的话。台账必须挂在**会话**上。
+test("跨轮重复提问：直接把用户上次的原话交回去，不再弹卡片", () => {
+  // 分层：_questionSimilarity 自己要用 _normalizeQuestion，一次性用同一个 env 加载会互相看不见。
+  const norm = load("_normalizeQuestion");
+  const find = load("_repeatedQuestionAnswer", {
+    _normalizeQuestion: norm,
+    _questionSimilarity: load("_questionSimilarity", { _normalizeQuestion: norm }),
+  });
+  const note = load("_rememberAskedQuestion", {});
+  const sess = {};
+
+  assert.equal(find(sess, "这个功能要不要加测试？"), null, "第一次问必须放行");
+  note(sess, "这个功能要不要加测试？", "要加，用 vitest");
+
+  const hit = find(sess, "这个功能需要加测试吗？");
+  assert.ok(hit, "换个说法再问一遍 —— 这正是用户报的「一直回答同样内容」");
+  assert.equal(hit.answer, "要加，用 vitest", "要把用户的原话交回去，而不是只说「你问过了」");
+
+  assert.equal(find(sess, "用哪个数据库？"), null, "别的问题照常问");
+  // 取消 / 超时不是答案：记下来会把「用户其实没答」当成「答过了」。
+  const s2 = {};
+  note(s2, "要备份吗", "[已取消] 当前等待已因任务停止");
+  assert.equal(find(s2, "要备份吗"), null);
+  // 台账有界，长会话不会无限增长。
+  const s3 = {};
+  for (let i = 0; i < 60; i++) note(s3, `问题${i}`, `答${i}`);
+  assert.ok(s3._askedLedger.length <= 40);
+});
+
+test("相似度阈值是标定出来的：同一问题的改写要命中，不同问题不许误判", () => {
+  const sim = load("_questionSimilarity", { _normalizeQuestion: load("_normalizeQuestion") });
+  // 误判比漏判更糟：漏判只是多问一次，误判会拿旧答案顶掉一个**新**问题。
+  const SAME = [
+    ["这个功能要不要加测试？", "这个功能需要加测试吗？"],
+    ["要不要用 TypeScript 重写", "是否用 TypeScript 重写"],
+    ["需要我先备份吗", "要先备份吗？"],
+    ["部署到哪台服务器", "部署到哪台服务器上呢"],
+  ];
+  const DIFF = [
+    ["用哪个数据库？", "要不要加测试？"],
+    ["前端用 React 还是 Vue", "后端用 Go 还是 Rust"],
+    ["这个文件要删掉吗", "这个文件要重命名吗"],
+    ["要不要加测试", "要不要加文档"],
+  ];
+  for (const [a, b] of SAME) assert.ok(sim(a, b) >= 0.65, `「${a}」和「${b}」是同一个问题，却没命中：${sim(a, b)}`);
+  for (const [a, b] of DIFF) assert.ok(sim(a, b) < 0.65, `「${a}」和「${b}」是两件事，却被判成同一个：${sim(a, b)}`);
+  // 两类之间要留得下余量，别贴着阈值。
+  const lo = Math.min(...SAME.map(([a, b]) => sim(a, b)));
+  const hi = Math.max(...DIFF.map(([a, b]) => sim(a, b)));
+  assert.ok(lo - hi > 0.1, `同类最低 ${lo} 和异类最高 ${hi} 挨太近，阈值不稳`);
+});
+
+test("重复提问闸门真的接进了 ask_user，答案也真的记进了会话台账", () => {
+  assert.match(SRC, /const _auPrior = _repeatedQuestionAnswer\(run\?\.session, q\);/,
+    "没接进去就又是一个零调用点");
+  assert.match(SRC, /_rememberAskedQuestion\(run\?\.session, q, answer\);/,
+    "不记账的话第二次永远命中不了");
+  // 台账必须挂在 session 上（跨 run 存活），挂 run 上等于没做。
+  assert.doesNotMatch(SRC, /_rememberAskedQuestion\(run, /, "台账挂到 run 上了，每条新消息就归零");
+  assert.match(SRC, /ALREADY_ANSWERED/);
+});
+
 test("加依赖 / 建项目之前必须真的做过外部调研", () => {
   const issue = load("_newTechResearchIssue", { _introducesNewTech: load("_introducesNewTech") });
   const agent = (used) => ({ mode: "agent", _toolTypesUsed: used });
@@ -22968,14 +23036,16 @@ test("评审结论只陈述、不拦回合", () => {
     "评审结论又开始强行补回合了");
 });
 
-test("这条事实要同时送到用户眼前和模型手里", () => {
-  assert.match(SRC, /_appendDeliveryFactsBar\(body, run\);/,
-    "答案下面没有这一行 —— 用户看不到，「说能用」就永远没人核对");
+test("交付事实只喂模型，不再糊在答案下面", () => {
+  // 2026-08-18 用户点名删掉答案下面那条「改了 N 文件·没验证·没测试」横幅——它是糊在
+  // 模型回答下面的 harness footer，正是「不要在回答下面写 harness 文字」那条老规矩。
+  // 删的是**显示**：同一条事实照旧喂回模型，"改完别谎报能用"的机制一点没动。
   assert.match(SRC, /parts\.push\(`本轮交付事实（执行记录，非推断）: \$\{facts\}`\)/,
     "没喂回模型 —— 它下一轮照样改完就说能用");
-  // 没验证时要看得出来（样式上区分），但不是弹窗、不是拦截。
-  assert.match(SRC, /turn-facts--unverified/);
-  assert.match(APP_CSS, /\.turn-facts--unverified \{/);
+  const footer = SRC.slice(SRC.indexOf("elapsedMs: Date.now() - run._recStart"), 
+                          SRC.indexOf("elapsedMs: Date.now() - run._recStart") + 500);
+  assert.doesNotMatch(footer, /_appendDeliveryFactsBar\(body, run\)/,
+    "又把事实横幅糊回答案下面了 —— 用户点名不要这条");
 });
 
 test("一条绿命令只能替它自己作证，盖不住另一条命令的红", () => {
@@ -27370,10 +27440,12 @@ test("一键全撤：不许覆盖你事后自己改过的文件", async () => {
   assert.deepEqual(deleted, ["/r/new.js"], "本轮新建的文件应当删除，而不是写空");
   assert.equal(out.reverted, 3);
 
-  // 快照里那两个字段以前**一个消费点都没有**——白攒了一路。
-  const call = `_appendRunRevertBar(${"body"}, run)`;
-  const agentFooter = SRC.slice(SRC.indexOf("elapsedMs: Date.now() - run._recStart"));
-  assert.ok(agentFooter.slice(0, 400).includes(call), "轮末没有挂上汇总条");
+  // 撤销**逻辑**（写回本轮前内容、删新建文件、先确认后动手）仍然要正确——2026-08-18
+  // 只删了轮末默认挂那条 UI，函数和 checkpoint 都留着，需要时可另开入口。
+  const agentFooter = SRC.slice(SRC.indexOf("elapsedMs: Date.now() - run._recStart"), 
+                               SRC.indexOf("elapsedMs: Date.now() - run._recStart") + 500);
+  assert.doesNotMatch(agentFooter, /_appendRunRevertBar\(body, run\)/,
+    "又把撤销条挂回轮末了 —— 用户点名不要这条");
   const bar = stripJsComments(extractFn("_appendRunRevertBar"));
   assert.match(bar, /_toolApprovalDialog/, "写回是破坏性的，必须先确认");
   assert.match(bar, /if \(ok !== "once"\) return;/,
