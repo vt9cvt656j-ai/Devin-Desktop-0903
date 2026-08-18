@@ -524,6 +524,10 @@ fn read_ui_snapshot() -> UiSnapshot {
     UiSnapshot {
         target: None,
         elements: read_ui_elements(),
+        // 这条路径是同步读、没有 osascript 那种超时/起不来/输出不合法的独立失败信号，
+        // 所以「读取本身没完成」这回事不存在 —— 和 OCR 路径一样填 None。
+        // （macOS 版 read_ui_snapshot 在 329 行，各失败分支各自填 read_error。）
+        read_error: None,
     }
 }
 
