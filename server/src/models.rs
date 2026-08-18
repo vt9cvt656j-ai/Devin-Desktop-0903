@@ -2254,18 +2254,25 @@ pub async fn admin_update(
 /// 卡片要显示缓存价时若各写一遍，两处迟早会分叉——而分叉的表现是卡片上写一个价、
 /// 账单上按另一个价扣，用户对不上账还查不出原因。
 fn cache_prices_for(model: &Model, model_id: &str, input_price: f64) -> (f64, f64) {
+    // 必须和 compute_cost 的三级完全同口径，否则这个预览/展示会显示一个和真实扣费不一样
+    // 的缓存价——用户拿它核对账单时反而会以为扣错了。手填 > 目录真实倍率×计费输入价 > 推算。
     let live = crate::model_catalog::lookup(model_id);
+    let live_in = live.as_ref().and_then(|e| e.input_price).filter(|p| *p > 0.0);
+    let ratio = |cache: Option<f64>| match (cache, live_in) {
+        (Some(c), Some(ci)) => Some(c / ci),
+        _ => None,
+    };
     let read = if model.cache_read_price > 0.0 {
         model.cache_read_price
-    } else if let Some(p) = live.as_ref().and_then(|e| e.cache_read_price) {
-        p
+    } else if let Some(r) = ratio(live.as_ref().and_then(|e| e.cache_read_price)) {
+        input_price * r
     } else {
         input_price * CACHE_READ_FACTOR
     };
     let write = if model.cache_create_price > 0.0 {
         model.cache_create_price
-    } else if let Some(p) = live.as_ref().and_then(|e| e.cache_write_price) {
-        p
+    } else if let Some(r) = ratio(live.as_ref().and_then(|e| e.cache_write_price)) {
+        input_price * r
     } else {
         input_price * CACHE_WRITE_FACTOR
     };
