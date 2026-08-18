@@ -14,6 +14,51 @@ pub struct TaskDefinition {
     problem_matcher: Option<String>,
 }
 
+/// 超时被杀之后，给模型的那句建议。抽成独立函数只为一件事：能被测试直接打。
+///
+/// 判据**输出优先**。原来只按命令字符串猜（dev/serve/watch/start…），用户实拍的那次
+/// 跑的是 `python3 main.py`，一个关键词都不沾，于是走进"这是会退出的命令"那一支——而
+/// 那一支明确写着「不要改用 run_in_terminal」。模型照做了：反复重跑、查 sys.path、查
+/// pip list，就是不换终端。而证据一直在手里：输出里白纸黑字写着
+/// `Uvicorn running on http://0.0.0.0:8000` 和 `Application startup complete`。
+/// 服务起没起来，看它自己说了什么最准——命令可以叫任何名字，启动横幅骗不了人。
+fn timeout_advice_for(command: &str, stdout: &str, stderr: &str) -> &'static str {
+    let out_lower = format!("{stdout}{stderr}").to_ascii_lowercase();
+    let output_says_server = [
+        "running on http://",
+        "listening on",
+        "server running at",
+        "press ctrl+c to quit",
+        "application startup complete",
+        "started server process",
+        "local:   http://",
+        "ready in ",
+        "compiled successfully",
+        "watching for file changes",
+    ]
+    .iter()
+    .any(|marker| out_lower.contains(marker));
+    let looks_like_service = output_says_server || {
+        let c = command.to_ascii_lowercase();
+        c.contains("dev")
+            || c.contains("serve")
+            || c.contains("watch")
+            || c.contains("start")
+            || c.contains("nodemon")
+            || c.contains("http-server")
+            || c.contains("tail -f")
+    };
+    if looks_like_service {
+        "这是长驻服务。**它已经被杀掉了，现在没有在运行、端口也没在监听**——刚才那几行启动日志\
+         说明它起来过，不代表它现在还活着。所以：不要对用户说「服务已启动」，也不要给他地址让他去打开。\
+         要让它真正持续运行，用 run_in_terminal 在真实终端里重新起（那条路进程不会被杀），\
+         再用 read_terminal / background_monitor 看输出和端口。"
+    } else {
+        "这看起来是一条会退出的命令，只是没跑完。**不要**因此改用 run_in_terminal——那是给服务用的，\
+         而且长命令拿不到退出码，你要的验证结论就没了。直接重跑并把 timeout_secs 调大（上限 600）。"
+    }
+}
+
 fn group_for_name(name: &str) -> &'static str {
     let lower = name.to_lowercase();
     if matches!(lower.as_str(), "build" | "compile" | "bundle") {
@@ -476,23 +521,7 @@ fn task_run_capture_inner(
         //
         // 现在按命令形态分两种说法，并且明确告诉它"可以把 timeout_secs 调大"——这个参数
         // 后端一直支持（TASK_TIMEOUT_SECS 上限 600），只是以前没有暴露给模型。
-        let looks_like_service = {
-            let c = command.to_ascii_lowercase();
-            c.contains("dev")
-                || c.contains("serve")
-                || c.contains("watch")
-                || c.contains("start")
-                || c.contains("nodemon")
-                || c.contains("http-server")
-                || c.contains("tail -f")
-        };
-        let advice = if looks_like_service {
-            "这条命令看起来是长驻服务/监听（dev/serve/watch/start 之类）。run_cmd 只能跑会退出的命令；\
-             服务请改用 run_in_terminal 在真实终端里起，再用 read_terminal / background_monitor 看输出。"
-        } else {
-            "这看起来是一条会退出的命令，只是没跑完。**不要**因此改用 run_in_terminal——那是给服务用的，\
-             而且长命令拿不到退出码，你要的验证结论就没了。直接重跑并把 timeout_secs 调大（上限 600）。"
-        };
+        let advice = timeout_advice_for(&command, &stdout, &stderr);
         stderr.push_str(&format!(
             "\n[已超时 {timeout_secs}s，命令及其子进程已被终止。{advice}]"
         ));
@@ -552,6 +581,44 @@ fn read_capped<R: std::io::Read>(r: &mut R, out: &mut Vec<u8>, cap: usize) {
 
 #[cfg(test)]
 mod tests {
+
+    /// 用户实拍：`python3 main.py` 起了个 FastAPI 服务，10 秒被杀，而超时建议却说
+    /// 「这看起来是一条会退出的命令，**不要**改用 run_in_terminal」——模型照做，于是
+    /// 反复重跑、查 sys.path、查 pip list，就是不换终端。判据只按命令名猜，而命令名里
+    /// 一个关键词都没有；证据其实在输出里。
+    #[test]
+    fn timeout_advice_reads_the_output_not_just_the_command_name() {
+        let out = timeout_advice_for(
+            "cd /x && python3 main.py",
+            "INFO:     Uvicorn running on http://0.0.0.0:8000 (Press CTRL+C to quit)\nINFO:     Application startup complete.\n",
+            "",
+        );
+        assert!(
+            out.contains("长驻服务"),
+            "输出里明说了服务已启动，还被判成一次性命令：{out}"
+        );
+        assert!(
+            out.contains("已经被杀掉"),
+            "必须点明它现在没在运行，否则模型会说「服务已启动」并把地址给用户：{out}"
+        );
+        assert!(
+            out.contains("run_in_terminal"),
+            "必须指路到 run_in_terminal：{out}"
+        );
+    }
+
+    /// 反过来也要成立：真正会退出的长命令（冷编译、跑测试）不许被误判成服务，
+    /// 否则模型改用 run_in_terminal，就永远拿不到它要的退出码。
+    #[test]
+    fn slow_one_shot_command_is_not_mistaken_for_a_service() {
+        let out = timeout_advice_for(
+            "cargo build --release",
+            "   Compiling serde v1.0\n   Compiling tokio v1.0\n",
+            "",
+        );
+        assert!(out.contains("会退出的命令"), "{out}");
+        assert!(out.contains("timeout_secs"), "应该提示调大超时：{out}");
+    }
     use super::*;
     use std::time::{SystemTime, UNIX_EPOCH};
 
