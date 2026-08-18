@@ -62421,8 +62421,36 @@ async function ensureModelForPath(absPath) {
 // Languages whose diagnostics Monaco's BUNDLED worker computes with no external
 // LSP. JS/JSX get syntax-only (checkJs:false → rock-solid signal); TS/TSX get
 // syntax+semantic.
-const _LINTABLE_EXT = new Set(["js", "jsx", "mjs", "cjs", "ts", "tsx", "mts", "cts"]);
+// 会产出真实诊断的扩展名。
+//
+// 这张表原来只有 JS/TS 八个，而它同时是**三道卡口**的判据（建 baseline、进检查集、
+// _interleavedDiagnostics 内部过滤）。后果：模型改坏 .py / .rs / .go 引入语法或类型
+// 错误，`[BLOCKING_NEW_DIAGNOSTICS]` **永不触发**，收尾门直接放行。
+//
+// 而能力一直是有的——lsp-client.js 管着 23 种语言的真 LSP 诊断。断的只是"拿不拿它
+// 当收尾门的依据"。所以这里补上那 23 种语言的常见扩展名；判断某个文件到底有没有
+// 语言服务，交给 _lintableLangId() 按 extLang() 的真实结果决定，而不是在这里猜。
+const _LINTABLE_EXT = new Set([
+  "js", "jsx", "mjs", "cjs", "ts", "tsx", "mts", "cts",
+  // 以下靠 lsp-client 的 MANAGED_LANGS 提供诊断（装了对应语言服务器才有）
+  "rs", "py", "pyi", "go", "c", "h", "cc", "cpp", "cxx", "hpp", "hh", "m", "mm",
+  "java", "rb", "php", "lua", "sh", "bash", "zsh", "yaml", "yml",
+  "cs", "kt", "kts", "swift", "dart", "ex", "exs", "clj", "cljs", "scala", "sc",
+  "tf", "tfvars", "graphql", "gql", "vue",
+]);
+
+/// 这个文件该用哪个 Monaco language id 建 model。
+///
+/// 原来写死 `isTs ? "typescript" : "javascript"`——于是就算把 .py 放进检查集，
+/// 建出来的也是个 JavaScript model，Monaco 的 TS worker 对它报一堆无意义的错，
+/// 而真正的 Python 诊断（走 lsp-client）永远不会附到这个 model 上。
+function _lintableLangId(rel) {
+  const id = extLang(String(rel).split("/").pop());
+  return id && id !== "plaintext" ? id : null;
+}
 const _TS_EXT = new Set(["ts", "tsx", "mts", "cts"]);
+const _INTERLEAVED_DIAG_MAX_FILES = 16;
+const _INTERLEAVED_DIAG_MAX_WAIT_MS = 4000;
 // After the agent changes JS/TS files, ask Monaco's built-in worker whether the
 // edits introduced ERRORS — surfaced immediately for self-correction. Side-effect
 // free: open models are read-only (never setValue → never falsely marked dirty);
@@ -62432,7 +62460,9 @@ const _TS_EXT = new Set(["ts", "tsx", "mts", "cts"]);
 async function _interleavedDiagnostics(editedRelPaths, root = "", baselineCounts = null) {
   if (!editedRelPaths.length || typeof monaco === "undefined") return { ran: false, report: "", counts: new Map(), newErrorCount: 0 };
   const targets = []; // { rel, model, created, isTs }
-  for (const rel of editedRelPaths.slice(0, 6)) {
+  // 上限原来是 6：一轮改超过 6 个文件，第 7 个起**完全不检查**，而且不声张。
+  // 一次重构动十几个文件是常态。
+  for (const rel of editedRelPaths.slice(0, _INTERLEAVED_DIAG_MAX_FILES)) {
     const ext = (rel.split(".").pop() || "").toLowerCase();
     if (!_LINTABLE_EXT.has(ext)) continue;
     let abs = rel;
@@ -62444,13 +62474,32 @@ async function _interleavedDiagnostics(editedRelPaths, root = "", baselineCounts
     if (!model) {
       let content = "";
       try { content = await backend.readTextFile(abs); } catch { continue; }
-      try { model = monaco.editor.createModel(content, isTs ? "typescript" : "javascript", uri); created = true; } catch { continue; }
+      const langId = _lintableLangId(rel) || (isTs ? "typescript" : "javascript");
+      try { model = monaco.editor.createModel(content, langId, uri); created = true; } catch { continue; }
+      // 光建 Monaco model 不够：TS/JS 由 Monaco 自带 worker 分析，**其余语言的诊断来自
+      // 语言服务器**，而服务器只会分析它被 didOpen 告知过的文档。模型刚写完、从没被打开
+      // 过的 .py/.rs/.go，服务器根本不知道它存在，于是这里等多久都读不到 marker——
+      // 扩展名补齐了、语言 id 也对了，门却仍然恒放行。
+      try { lspManager?.didOpen(abs, model); } catch {}
     }
     targets.push({ rel: _normRel(abs, root), model, created, isTs });
   }
   if (!targets.length) return { ran: false, report: "", counts: new Map(), newErrorCount: 0 };
-  // Semantic analysis is async — give the worker a bounded moment to publish.
-  await new Promise((r) => setTimeout(r, 900));
+  // 诊断是异步来的，而且两条来源的延迟差一个数量级：Monaco 自带的 TS worker 通常几百
+  // 毫秒，真 LSP（rust-analyzer / pyright / gopls）冷启动要好几秒。原来固定等 900ms，
+  // 对 LSP 语言等于"还没出结果就读，读到空的，判成无新增错误"——门看着在跑，实际恒放行。
+  // 改成轮询：任一目标出现 marker 就收，最多等 _INTERLEAVED_DIAG_MAX_WAIT_MS。
+  {
+    const deadline = Date.now() + _INTERLEAVED_DIAG_MAX_WAIT_MS;
+    for (;;) {
+      await new Promise((r) => setTimeout(r, 150));
+      let any = false;
+      for (const t of targets) {
+        try { if (monaco.editor.getModelMarkers({ resource: t.model.uri }).length) { any = true; break; } } catch {}
+      }
+      if (any || Date.now() >= deadline) break;
+    }
+  }
   const reports = [];
   const counts = new Map();
   let newErrorCount = 0;
@@ -62473,7 +62522,13 @@ async function _interleavedDiagnostics(editedRelPaths, root = "", baselineCounts
     }
   }
   // Dispose only the models WE created — never touch ones the user has open.
-  for (const t of targets) { if (t.created) { try { t.model.dispose(); } catch {} } }
+  // 我们建的 model 用完要还回去：先告诉服务器关掉（否则每轮检查都往服务器里塞一份
+  // 永不关闭的文档，内存和诊断都会越积越脏），再 dispose。用户自己开着的绝不碰。
+  for (const t of targets) {
+    if (!t.created) continue;
+    try { lspManager?.didClose(t.model?.uri?.fsPath || t.model?.uri?.path || ""); } catch {}
+    try { t.model.dispose(); } catch {}
+  }
   return { ran: true, report: reports.join("\n\n"), counts, newErrorCount };
 }
 
