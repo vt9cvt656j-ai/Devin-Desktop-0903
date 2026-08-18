@@ -21,6 +21,7 @@ use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
+use std::sync::OnceLock;
 
 // The bundled registry currently contains ~159 tools (kept in sync with the client
 // registry `_buildAgentToolSchemas` via ide/build/sync-tools-json.mjs). Keep a bounded
@@ -130,6 +131,51 @@ fn read_tools_file() -> Result<String, String> {
     std::fs::read_to_string(&path).map_err(|err| {
         tracing::warn!(path = %path.display(), %err, "failed to load prompts/tools.json");
         format!("tools.json load failed: {err}")
+    })
+}
+
+/// 解析一次、常驻的工具目录。`inject_static_tools` 走的是**每请求热路径**：以前它每来一个
+/// 请求就 read_tools_file()（~155KB）+ from_str 全量解析 + 建一张 HashMap，纯属重复劳动
+/// ——tools.json 只有重建镜像/重新部署时才变，而那必然重启进程、OnceLock 自然重取。缓存
+/// 解析结果后，每请求只 clone 被点名的那十几个 schema，不再解析全表。与 knowledge.rs 的
+/// `static INDEX: OnceLock` 同一套做法。
+struct ToolCatalog {
+    /// function-name → 完整工具 schema（注入时按需 clone 出被点名的）。
+    by_name: HashMap<String, serde_json::Value>,
+    /// 目录里存在的全部工具名，供 `requested_static_tools_in` 的存在性检查复用，
+    /// 免得每请求再从 by_name.keys() 克隆一份 HashSet。
+    names: HashSet<String>,
+}
+
+fn tool_catalog() -> &'static ToolCatalog {
+    static CATALOG: OnceLock<ToolCatalog> = OnceLock::new();
+    CATALOG.get_or_init(|| {
+        let by_name: HashMap<String, serde_json::Value> = match read_tools_file() {
+            Ok(text) => match serde_json::from_str::<serde_json::Value>(&text) {
+                Ok(serde_json::Value::Array(all)) => all
+                    .into_iter()
+                    .filter_map(|tool| {
+                        tool_function_name(&tool)
+                            .map(str::to_string)
+                            .map(|name| (name, tool))
+                    })
+                    .collect(),
+                // 初始化期解析失败会被永久缓存成空表——这是部署完整性事故（tools.json 缺失/损坏），
+                // 用 error 级别叫出来，而不是每请求一条 warn 淹没日志。
+                Ok(_) => {
+                    tracing::error!("prompts/tools.json is not a JSON array (catalog init)");
+                    HashMap::new()
+                }
+                Err(err) => {
+                    tracing::error!(%err, "failed to parse prompts/tools.json (catalog init)");
+                    HashMap::new()
+                }
+            },
+            // read_tools_file 内部已经 warn 过路径；这里不重复。
+            Err(_) => HashMap::new(),
+        };
+        let names = by_name.keys().cloned().collect();
+        ToolCatalog { by_name, names }
     })
 }
 
@@ -3457,44 +3503,38 @@ fn inject_static_tools(mode: &str, names: &str, body: &mut serde_json::Value) {
     if names.trim().is_empty() {
         return;
     }
-    let Ok(text) = read_tools_file() else { return };
-    match serde_json::from_str::<serde_json::Value>(&text) {
-        Ok(serde_json::Value::Array(all)) => {
-            let mut catalog: HashMap<String, serde_json::Value> = all
-                .into_iter()
-                .filter_map(|tool| {
-                    tool_function_name(&tool)
-                        .map(str::to_string)
-                        .map(|name| (name, tool))
-                })
-                .collect();
-            // 目录读出来之后再做筛选：模式策略 + "这个名字真的存在"，一次读盘两件事都办了。
-            let known: HashSet<String> = catalog.keys().cloned().collect();
-            let want = requested_static_tools_in(mode, names, Some(&known));
-            if want.is_empty() {
-                return;
-            }
-            // Resolve from the ordered request, not registry order. This makes the
-            // behavior stable even if tools.json is reorganized later.
-            let picked: Vec<serde_json::Value> =
-                want.iter().filter_map(|name| catalog.remove(name)).collect();
-            if picked.is_empty() {
-                tracing::warn!(mode, requested = ?want, "no matching static tools found");
-                return;
-            }
-            // MERGE, don't overwrite: the client may ship MCP/runtime tools in body.tools
-            // that we have no schema for — keep those, append the static schemas we injected.
-            // The final L0 budget dedupes the complete list while preserving runtime priority.
-            let mut merged = match body.get_mut("tools").and_then(|t| t.as_array_mut()) {
-                Some(arr) => std::mem::take(arr),
-                None => Vec::new(),
-            };
-            merged.extend(picked);
-            body["tools"] = serde_json::Value::Array(merged);
-        }
-        Ok(_) => tracing::warn!("prompts/tools.json is not a JSON array"),
-        Err(err) => tracing::warn!(%err, "failed to parse prompts/tools.json"),
+    // 常驻目录：解析发生在进程首次用到时，不在每请求热路径上（见 tool_catalog）。
+    let catalog = tool_catalog();
+    if catalog.by_name.is_empty() {
+        // 初始化失败已在 tool_catalog 里以 error 记过；这里静默返回，不每请求再刷屏。
+        return;
     }
+    // 模式策略 + "这个名字真的存在" 一并筛掉；存在性用缓存好的 names 集合，不再每请求重建。
+    let want = requested_static_tools_in(mode, names, Some(&catalog.names));
+    if want.is_empty() {
+        return;
+    }
+    // Resolve from the ordered request, not registry order. This makes the behavior stable
+    // even if tools.json is reorganized later. get().cloned() 而非 remove()：目录是共享只读的，
+    // 每请求 clone 出被点名的那十几个 schema；want 已由 requested_static_tools_in 去重，故与
+    // 旧的 remove 语义等价（不会重复注入同名）。
+    let picked: Vec<serde_json::Value> = want
+        .iter()
+        .filter_map(|name| catalog.by_name.get(name).cloned())
+        .collect();
+    if picked.is_empty() {
+        tracing::warn!(mode, requested = ?want, "no matching static tools found");
+        return;
+    }
+    // MERGE, don't overwrite: the client may ship MCP/runtime tools in body.tools that we have
+    // no schema for — keep those, append the static schemas we injected. The final L0 budget
+    // dedupes the complete list while preserving runtime priority.
+    let mut merged = match body.get_mut("tools").and_then(|t| t.as_array_mut()) {
+        Some(arr) => std::mem::take(arr),
+        None => Vec::new(),
+    };
+    merged.extend(picked);
+    body["tools"] = serde_json::Value::Array(merged);
 }
 
 
@@ -4508,6 +4548,39 @@ mod tests {
         assert!(
             body.contains(r#"get("name")"#),
             "it should project names explicitly rather than reserializing entries"
+        );
+    }
+
+    /// tools.json 是每请求热路径上的静态资源：inject_static_tools 必须走常驻缓存，不能每来一个
+    /// 请求就 read_tools_file() 全量 from_str 再建 HashMap（几千万请求 × 155KB 解析纯属重复劳动）。
+    /// 这条钉住缓存没被改回逐请求读盘。
+    #[test]
+    fn static_tool_injection_uses_the_cached_catalog_not_a_per_request_read() {
+        let src = include_str!("prompts.rs");
+        assert!(
+            src.contains("fn tool_catalog() -> &'static ToolCatalog"),
+            "常驻工具目录访问器 tool_catalog() 不见了",
+        );
+        assert!(
+            src.contains("static CATALOG: OnceLock<ToolCatalog> = OnceLock::new();"),
+            "工具目录必须用 OnceLock 缓存，一次解析常驻",
+        );
+        let start = src
+            .find("fn inject_static_tools(")
+            .expect("inject_static_tools 改名了");
+        let end = src[start..]
+            .find("pub fn assemble_into")
+            .map(|e| e + start)
+            .unwrap_or(src.len());
+        let body = &src[start..end];
+        assert!(body.contains("tool_catalog()"), "注入必须走缓存目录");
+        assert!(
+            !body.contains("read_tools_file()"),
+            "inject_static_tools 又在每请求读 tools.json 了——缓存被绕过",
+        );
+        assert!(
+            !body.contains("serde_json::from_str"),
+            "inject_static_tools 又在每请求解析整张 tools.json 了",
         );
     }
 

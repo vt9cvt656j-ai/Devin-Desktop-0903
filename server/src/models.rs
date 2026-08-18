@@ -4508,7 +4508,13 @@ async fn bill(
     let mut tx = match state.db.begin().await {
         Ok(tx) => tx,
         Err(error) => {
-            tracing::error!(%error, "failed to begin billing transaction");
+            tracing::error!(
+                %error, %uid, %conn_id, cost, use_quota, free_pool,
+                request_id = tokens.request_id.as_deref().unwrap_or("-"),
+                model = %tokens.model_name,
+                event = "billing_settlement_failed",
+                "failed to begin billing transaction (call served, NOT charged)"
+            );
             return;
         }
     };
@@ -4573,7 +4579,7 @@ async fn bill(
             .execute(&mut *tx)
             .await
         {
-            tracing::error!(%error, "failed to persist sub-cent carry");
+            tracing::error!(%error, %uid, carry_cents = rest, "failed to persist sub-cent carry");
         }
     }
     let requested_cost = requested_cost + carried_cents;
@@ -4591,7 +4597,13 @@ async fn bill(
         {
             Ok(row) => row,
             Err(error) => {
-                tracing::error!(%error, "failed to lock balances for billing");
+                tracing::error!(
+                    %error, %uid, %conn_id, cost = requested_cost, use_quota,
+                    request_id = tokens.request_id.as_deref().unwrap_or("-"),
+                    model = %tokens.model_name,
+                    event = "billing_settlement_failed",
+                    "failed to lock balances for billing (call served, NOT charged)"
+                );
                 return;
             }
         };
@@ -4624,7 +4636,14 @@ async fn bill(
         .execute(&mut *tx)
         .await
         {
-            tracing::error!(%error, "failed to deduct fused quota and credits");
+            tracing::error!(
+                %error, %uid, %conn_id,
+                quota_cents = charge.quota_cents, wallet_cents = charge.wallet_cents, actual_cost,
+                request_id = tokens.request_id.as_deref().unwrap_or("-"),
+                model = %tokens.model_name,
+                event = "billing_settlement_failed",
+                "failed to deduct fused quota and credits (call served, NOT charged; tx rolled back)"
+            );
             return;
         }
     }
@@ -4648,11 +4667,23 @@ async fn bill(
     .execute(&mut *tx)
     .await
     {
-        tracing::error!(%error, "failed to insert billing settlement");
+        tracing::error!(
+            %error, %uid, %conn_id, actual_cost,
+            request_id = tokens.request_id.as_deref().unwrap_or("-"),
+            model = %tokens.model_name,
+            event = "billing_settlement_failed",
+            "failed to insert billing settlement (tx rolled back; call served, NOT charged)"
+        );
         return;
     }
     if let Err(error) = tx.commit().await {
-        tracing::error!(%error, "failed to commit billing transaction");
+        tracing::error!(
+            %error, %uid, %conn_id, actual_cost,
+            request_id = tokens.request_id.as_deref().unwrap_or("-"),
+            model = %tokens.model_name,
+            event = "billing_settlement_failed",
+            "failed to commit billing transaction (tx rolled back; call served, NOT charged)"
+        );
     }
 }
 
@@ -8313,6 +8344,57 @@ mod billing_tests {
             body.contains("if free_pool && free_micro_usd > 0 && free_fallback_to_paid()"),
             "零头累计的条件变了：它只该对**从免费分支掉下来**的调用生效，普通付费模型的价格本来就是整分",
         );
+    }
+
+    #[test]
+    /// 结算失败 = 用户被服务了却没扣到钱。日志必须能对账到「谁、哪笔请求、多少钱」，否则一次
+    /// DB 抖动就是一笔查无对象的漏收。bill() 是 fire-and-forget，日志是唯一的追账凭证，所以每条
+    /// 致命失败分支都要带 uid/conn_id/request_id + 统一事件标记，供告警与重对账脚本 grep。
+    fn billing_settlement_failures_are_reconcilable() {
+        let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/models.rs"))
+            .expect("read models.rs");
+        let at = src.find("async fn bill(").expect("bill 改名了");
+        // 只在 bill() 函数体内找，别扫到别处的 tracing。
+        let end = src[at..]
+            .find("// ============ Anthropic protocol bridge")
+            .map(|e| e + at)
+            .expect("bill() 后面的分隔注释不见了");
+        let body = &src[at..end];
+
+        // 五个「已服务却没扣费」的致命分支：逐条确认带上全部对账字段。
+        for needle in [
+            "failed to begin billing transaction",
+            "failed to lock balances for billing",
+            "failed to deduct fused quota and credits",
+            "failed to insert billing settlement",
+            "failed to commit billing transaction",
+        ] {
+            let i = body
+                .find(needle)
+                .unwrap_or_else(|| panic!("结算失败分支不见了: {needle}"));
+            // tracing 宏把字段写在消息**之前**：取这条 error! 调用从宏名到消息之间的片段。
+            let call_start = body[..i]
+                .rfind("tracing::error!(")
+                .expect("失败消息不在 error! 调用里");
+            let log = &body[call_start..i];
+            assert!(log.contains("%uid"), "{needle}: 日志缺 uid，无法对账到人");
+            assert!(log.contains("%conn_id"), "{needle}: 日志缺 conn_id，无法对账到连接");
+            assert!(
+                log.contains("request_id = tokens.request_id.as_deref()"),
+                "{needle}: 日志缺 request_id，无法对账到具体那笔请求",
+            );
+            assert!(
+                log.contains(r#"event = "billing_settlement_failed""#),
+                "{needle}: 缺统一事件标记，告警/对账脚本 grep 不到",
+            );
+        }
+
+        // 亚分零头没落盘是**非致命**（不 return、只丢一点零头），日志更轻——但至少要能对到人。
+        let carry_i = body
+            .find("failed to persist sub-cent carry")
+            .expect("零头分支不见了");
+        let carry_log = &body[body[..carry_i].rfind("tracing::error!(").unwrap()..carry_i];
+        assert!(carry_log.contains("%uid"), "零头丢失日志也要带 uid");
     }
 
     #[test]
