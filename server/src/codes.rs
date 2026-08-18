@@ -1,4 +1,5 @@
 use axum::extract::{Path, State};
+use crate::auth::QUOTA_WINDOW_REFRESH;
 use axum::Json;
 use rand::Rng;
 use serde::{Deserialize, Serialize};
@@ -249,16 +250,16 @@ pub(crate) async fn apply_plan(
 
         // Note what is deliberately NOT reset here: quota_week_used_cents and the
         // window/week reset timestamps. Zeroing them on every grant let a user clear a
-        // spent weekly cap (or refresh the 5.5h window) by redeeming any cheap code.
+        // spent weekly cap (or refresh the 30-minute window) by redeeming any cheap code.
         // The access gate already rolls both windows over when their deadline passes.
         sqlx::query(
-            "UPDATE users SET plan = $1, \
+            &format!("UPDATE users SET plan = $1, \
              plan_expires_at = GREATEST(COALESCE(plan_expires_at, now()), now()) + ($2 * interval '1 day'), \
              quota_total_cents = $3, quota_window_cap_cents = $4, quota_window_cents = $5, \
-             quota_window_reset_at = COALESCE(quota_window_reset_at, now() + interval '5 hours 30 minutes'), \
+             quota_window_reset_at = COALESCE(quota_window_reset_at, now() + interval '{QUOTA_WINDOW_REFRESH}'), \
              quota_weekly_cap_cents = $6, \
              quota_week_reset_at = COALESCE(quota_week_reset_at, now() + interval '7 days'), \
-             updated_at = now() WHERE id = $7",
+             updated_at = now() WHERE id = $7"),
         )
         .bind(&new_plan)
         .bind(dur)
@@ -502,11 +503,11 @@ pub async fn admin_set_plan(
     } else if req.reset_quotas {
         if let Some((total, window, weekly, _)) = plan_spec(plan) {
             sqlx::query(
-                "UPDATE users SET plan = $1, plan_expires_at = $2, \
+                &format!("UPDATE users SET plan = $1, plan_expires_at = $2, \
                  quota_total_cents = $3, quota_window_cap_cents = $4, quota_window_cents = LEAST($4, $3), \
-                 quota_window_reset_at = now() + interval '5 hours 30 minutes', \
+                 quota_window_reset_at = now() + interval '{QUOTA_WINDOW_REFRESH}', \
                  quota_weekly_cap_cents = $5, quota_week_used_cents = 0, quota_week_reset_at = now() + interval '7 days', \
-                 updated_at = now() WHERE id = $6",
+                 updated_at = now() WHERE id = $6"),
             )
             .bind(plan)
             .bind(req.expires_at)
@@ -536,12 +537,12 @@ pub async fn admin_set_plan(
         // 已经有额度的用户仍然一分不动——那才是这个选项存在的意义。
         if let Some((total, window, weekly, _)) = plan_spec(plan) {
             sqlx::query(
-                "UPDATE users SET plan = $1, plan_expires_at = $2, \
+                &format!("UPDATE users SET plan = $1, plan_expires_at = $2, \
                  quota_total_cents = $3, quota_window_cap_cents = $4, quota_window_cents = LEAST($4, $3), \
-                 quota_window_reset_at = COALESCE(quota_window_reset_at, now() + interval '5 hours 30 minutes'), \
+                 quota_window_reset_at = COALESCE(quota_window_reset_at, now() + interval '{QUOTA_WINDOW_REFRESH}'), \
                  quota_weekly_cap_cents = $5, \
                  quota_week_reset_at = COALESCE(quota_week_reset_at, now() + interval '7 days'), \
-                 updated_at = now() WHERE id = $6",
+                 updated_at = now() WHERE id = $6"),
             )
             .bind(plan)
             .bind(req.expires_at)
@@ -629,7 +630,7 @@ mod plan_spec_tests {
     /// (auth.rs + three sites in models.rs) and the serve gate is
     /// `plan_active && q_total > 0 && q_window > 0 && ...`. With a cap of 0 the window
     /// refills to 0, `quota_ok` is false forever, and every member on that plan is refused
-    /// with "本时段额度已用完，请等待刷新（每 5.5 小时）" — a refresh that can never help.
+    /// with "本时段额度已用完，请等待刷新（每 30 分钟）" — a refresh that can never help.
     ///
     /// This landed once already, on all five plans at once, and would have taken down
     /// every paying account on deploy. The invariant is cheap to assert, so assert it.
@@ -740,7 +741,7 @@ mod plan_spec_tests {
         }
     }
 
-    /// The window is a per-5.5h slice of the total, so a cap above the total is a
+    /// The window is a per-30-minute slice of the total, so a cap above the total is a
     /// typo — LEAST() would silently clamp it and the advertised figure would be fiction.
     #[test]
     fn plan_spec_window_cap_never_exceeds_total() {

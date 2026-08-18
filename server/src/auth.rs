@@ -12,6 +12,18 @@ use crate::config::Config;
 use crate::error::{ApiResult, AppError};
 use crate::AppState;
 
+/// 窗口额度多久回满一次（PostgreSQL interval 字面量）。
+///
+/// 2026-08-18 从 `5 hours 30 minutes` 改成 `30 minutes`：用户的原话是"感觉有点拉"。
+///
+/// 这个窗口是**节流阀，不是预算**——花钱时 `quota_total_cents` 和 `quota_window_cents`
+/// 一起扣（见 models.rs 的结算 UPDATE），而回满值是 `LEAST(窗口上限, 剩余总额度)`。
+/// 所以缩短它不会让任何人多花一分钱，只是让人能按自己的节奏用掉本来就有的额度，
+/// 而不是撞上"本时段已用完，等 5 个半小时"。
+///
+/// 抽成常量而不是散在 7 条 SQL 里：这个值散落多处然后各自漂移，是本仓库最常见的一类 bug。
+pub const QUOTA_WINDOW_REFRESH: &str = "30 minutes";
+
 // ---- models ----------------------------------------------------------------
 
 #[derive(Debug, Serialize, sqlx::FromRow)]
@@ -963,14 +975,14 @@ pub async fn logout(State(state): State<AppState>, claims: Claims) -> ApiResult<
 
 pub async fn me(State(state): State<AppState>, claims: Claims) -> ApiResult<Json<serde_json::Value>> {
     let id = uuid::Uuid::parse_str(&claims.sub).map_err(|_| AppError::unauthorized("令牌损坏"))?;
-    // Apply the 5h30m window refill + weekly reset so the profile shows current quota.
+    // Apply the 30-minute window refill + weekly reset so the profile shows current quota.
     let _ = sqlx::query(
-        "UPDATE users SET \
+        &format!("UPDATE users SET \
          quota_window_cents = CASE WHEN (quota_window_reset_at IS NULL OR quota_window_reset_at <= now()) AND quota_total_cents > 0 THEN LEAST(quota_window_cap_cents, quota_total_cents) ELSE quota_window_cents END, \
-         quota_window_reset_at = CASE WHEN (quota_window_reset_at IS NULL OR quota_window_reset_at <= now()) AND quota_total_cents > 0 THEN now() + interval '5 hours 30 minutes' ELSE quota_window_reset_at END, \
+         quota_window_reset_at = CASE WHEN (quota_window_reset_at IS NULL OR quota_window_reset_at <= now()) AND quota_total_cents > 0 THEN now() + interval '{QUOTA_WINDOW_REFRESH}' ELSE quota_window_reset_at END, \
          quota_week_used_cents = CASE WHEN quota_week_reset_at IS NULL OR quota_week_reset_at <= now() THEN 0 ELSE quota_week_used_cents END, \
          quota_week_reset_at = CASE WHEN quota_week_reset_at IS NULL OR quota_week_reset_at <= now() THEN now() + interval '7 days' ELSE quota_week_reset_at END \
-         WHERE id = $1",
+         WHERE id = $1"),
     )
     .bind(id)
     .execute(&state.db)
@@ -1245,6 +1257,26 @@ pub async fn delete_user(
         return Err(AppError::bad("用户不存在"));
     }
     Ok(Json(json!({ "ok": true })))
+}
+
+#[cfg(test)]
+mod quota_window_tests {
+    use super::QUOTA_WINDOW_REFRESH;
+
+    /// 窗口回满间隔必须只有一个源。2026-08-18 从 5.5 小时改 30 分钟时，它散在 7 条 SQL 里
+    /// （auth / codes / models 三个文件），漏改一条就会出现"有的账号 30 分钟刷、有的还是
+    /// 5.5 小时"这种谁都查不明白的 bug——本仓库最常见的一类。抽成常量之后，这条钉住它。
+    #[test]
+    fn refresh_interval_is_a_single_source_of_truth() {
+        assert_eq!(QUOTA_WINDOW_REFRESH, "30 minutes");
+        // 必须是合法的 PostgreSQL interval 字面量（数字 + 单位），别写成 "30min" 之类。
+        assert!(
+            QUOTA_WINDOW_REFRESH.contains("minute")
+                || QUOTA_WINDOW_REFRESH.contains("hour")
+                || QUOTA_WINDOW_REFRESH.contains("day"),
+            "不是合法的 interval 单位：{QUOTA_WINDOW_REFRESH}"
+        );
+    }
 }
 
 #[cfg(test)]

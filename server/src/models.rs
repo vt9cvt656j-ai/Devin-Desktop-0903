@@ -1,4 +1,5 @@
 use axum::body::Body;
+use crate::auth::QUOTA_WINDOW_REFRESH;
 use axum::extract::{Multipart, Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -4431,7 +4432,7 @@ pub fn admit_billing(
     let tail = if plan_active && q_total <= 0 {
         "总额度已用完"
     } else if plan_active && q_window <= 0 {
-        "本时段额度已用完，请等待刷新（每 5.5 小时）"
+        "本时段额度已用完，请等待刷新（每 30 分钟）"
     } else if plan_active && q_weekly_cap > 0 && q_week_used >= q_weekly_cap {
         "本周额度已用完"
     } else {
@@ -6031,14 +6032,14 @@ pub async fn chat_completions(
         .cloned()
         .ok_or_else(|| AppError::bad(format!("模型 {model_id} 不可用")))?;
 
-    // Refill the 5h30m window + reset the weekly counter when due.
+    // Refill the 30-minute window + reset the weekly counter when due.
     sqlx::query(
-        "UPDATE users SET \
+        &format!("UPDATE users SET \
          quota_window_cents = CASE WHEN (quota_window_reset_at IS NULL OR quota_window_reset_at <= now()) AND quota_total_cents > 0 THEN LEAST(quota_window_cap_cents, quota_total_cents) ELSE quota_window_cents END, \
-         quota_window_reset_at = CASE WHEN (quota_window_reset_at IS NULL OR quota_window_reset_at <= now()) AND quota_total_cents > 0 THEN now() + interval '5 hours 30 minutes' ELSE quota_window_reset_at END, \
+         quota_window_reset_at = CASE WHEN (quota_window_reset_at IS NULL OR quota_window_reset_at <= now()) AND quota_total_cents > 0 THEN now() + interval '{QUOTA_WINDOW_REFRESH}' ELSE quota_window_reset_at END, \
          quota_week_used_cents = CASE WHEN quota_week_reset_at IS NULL OR quota_week_reset_at <= now() THEN 0 ELSE quota_week_used_cents END, \
          quota_week_reset_at = CASE WHEN quota_week_reset_at IS NULL OR quota_week_reset_at <= now() THEN now() + interval '7 days' ELSE quota_week_reset_at END \
-         WHERE id = $1",
+         WHERE id = $1"),
     )
     .bind(uid)
     .execute(&state.db)
@@ -7226,12 +7227,12 @@ pub async fn responses_proxy(
 
     // Same quota refill + check as image_generations.
     sqlx::query(
-        "UPDATE users SET \
+        &format!("UPDATE users SET \
          quota_window_cents = CASE WHEN (quota_window_reset_at IS NULL OR quota_window_reset_at <= now()) AND quota_total_cents > 0 THEN LEAST(quota_window_cap_cents, quota_total_cents) ELSE quota_window_cents END, \
-         quota_window_reset_at = CASE WHEN (quota_window_reset_at IS NULL OR quota_window_reset_at <= now()) AND quota_total_cents > 0 THEN now() + interval '5 hours 30 minutes' ELSE quota_window_reset_at END, \
+         quota_window_reset_at = CASE WHEN (quota_window_reset_at IS NULL OR quota_window_reset_at <= now()) AND quota_total_cents > 0 THEN now() + interval '{QUOTA_WINDOW_REFRESH}' ELSE quota_window_reset_at END, \
          quota_week_used_cents = CASE WHEN quota_week_reset_at IS NULL OR quota_week_reset_at <= now() THEN 0 ELSE quota_week_used_cents END, \
          quota_week_reset_at = CASE WHEN quota_week_reset_at IS NULL OR quota_week_reset_at <= now() THEN now() + interval '7 days' ELSE quota_week_reset_at END \
-         WHERE id = $1",
+         WHERE id = $1"),
     )
     .bind(uid)
     .execute(&state.db)
@@ -7509,12 +7510,12 @@ pub async fn image_generations(
 
     // Quota refill + check (same as chat_completions).
     sqlx::query(
-        "UPDATE users SET \
+        &format!("UPDATE users SET \
          quota_window_cents = CASE WHEN (quota_window_reset_at IS NULL OR quota_window_reset_at <= now()) AND quota_total_cents > 0 THEN LEAST(quota_window_cap_cents, quota_total_cents) ELSE quota_window_cents END, \
-         quota_window_reset_at = CASE WHEN (quota_window_reset_at IS NULL OR quota_window_reset_at <= now()) AND quota_total_cents > 0 THEN now() + interval '5 hours 30 minutes' ELSE quota_window_reset_at END, \
+         quota_window_reset_at = CASE WHEN (quota_window_reset_at IS NULL OR quota_window_reset_at <= now()) AND quota_total_cents > 0 THEN now() + interval '{QUOTA_WINDOW_REFRESH}' ELSE quota_window_reset_at END, \
          quota_week_used_cents = CASE WHEN quota_week_reset_at IS NULL OR quota_week_reset_at <= now() THEN 0 ELSE quota_week_used_cents END, \
          quota_week_reset_at = CASE WHEN quota_week_reset_at IS NULL OR quota_week_reset_at <= now() THEN now() + interval '7 days' ELSE quota_week_reset_at END \
-         WHERE id = $1",
+         WHERE id = $1"),
     )
     .bind(uid)
     .execute(&state.db)
@@ -7545,7 +7546,7 @@ pub async fn image_generations(
         let msg = if plan_active && q_total <= 0 {
             "总额度已用完"
         } else if plan_active && q_window <= 0 {
-            "本时段额度已用完，请等待刷新（每 5.5 小时）"
+            "本时段额度已用完，请等待刷新（每 30 分钟）"
         } else if plan_active && q_weekly_cap > 0 && q_week_used >= q_weekly_cap {
             "本周额度已用完"
         } else {
