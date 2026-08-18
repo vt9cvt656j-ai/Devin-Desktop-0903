@@ -25822,6 +25822,31 @@ test("journal 跑在 checkpoint 前面时，要把那截真正补回模型上下
   assert.match(src, /adoptJournalTail/, "恢复时只对齐计数、不补内容，等于让模型停在旧 checkpoint");
 });
 
+test("崩溃恢复补上的那批消息，溢出的头部要归档而不是凭空消失", () => {
+  // 这条路正好是崩溃重开那条：日志比 checkpoint 跑得远，恢复时把差额补进来。原来补完
+  // 直接 `slice(-RECENT_WINDOW)`，超出窗口的头部一刀切掉——而这批消息**同时**从模型上下文
+  // 和 recall_conversation 里消失。别的丢弃路径都归档，只有这里没有，于是"崩溃前聊过的
+  // 那一段"成了谁都找不回来的黑洞，偏偏那是用户最需要它还在的时刻。
+  const mem = new ConversationMemory();
+  const msg = (i) => ({ role: i % 2 ? "assistant" : "user", content: `第 ${i} 条消息，内容要够长才看得出被归档到哪里去了。` });
+  // 先把 recent 填到接近上限
+  for (let i = 0; i < 96; i++) mem.push(msg(i));
+  const archivedBefore = mem.archive.length;
+  const before = mem.totalTurns;
+
+  // 崩溃恢复：日志比 checkpoint 多出 20 条
+  const journal = Array.from({ length: 20 }, (_, i) => msg(100 + i));
+  const added = mem.adoptJournalTail(journal, before + 20);
+  assert.equal(added, 20, "该补的都补上了");
+  assert.ok(mem.recent.length <= 100, "recent 仍然有界");
+  assert.ok(mem.archive.length > archivedBefore,
+    "溢出的头部被直接扔了——它同时从模型上下文和 recall_conversation 里消失了");
+
+  // 被挤出去的那几条要真的能被回忆到（按内容找，不是只看条数）。
+  const archivedText = mem.archive.map((a) => a.text).join("\n");
+  assert.match(archivedText, /第 0 条消息/, "最早那条既不在 recent 也不在归档里 = 永久丢失");
+});
+
 test("落盘文本预算按会话分配，且用尽时也不得写成空串", () => {
   const budget = { remaining: 10, perValue: 1000 };
   const long = "甲".repeat(500);
