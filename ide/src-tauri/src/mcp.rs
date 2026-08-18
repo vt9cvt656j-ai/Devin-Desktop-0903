@@ -631,10 +631,16 @@ impl Session {
         wait_for_elicitation(&token, &self.cancel, ELICITATION_WAIT)
     }
 
-    fn respond_to_server_request(&mut self, request: &Value) {
+    /// 返回这次**等人**花掉的时间。调用方要把它从静默预算里刨掉：那段时间服务没有失联，
+    /// 是我们在等用户填表。不刨掉的话，用户读完说明、去翻一个 API Key、70 秒后点提交——
+    /// 答案确实送回了服务端（服务端继续干活），而客户端同一圈回到开头发现预算已耗尽，
+    /// 返回「MCP 请求超时（tools/call）」并发出 notifications/cancelled。
+    /// 用户看到的是：我明明填了，工具却报超时。
+    fn respond_to_server_request(&mut self, request: &Value) -> Duration {
         let Some(id) = request.get("id").cloned() else {
-            return;
+            return Duration::ZERO;
         };
+        let mut human_wait = Duration::ZERO;
         let method = request.get("method").and_then(Value::as_str).unwrap_or("");
         let response = match method {
             "ping" => json!({"jsonrpc":"2.0","id":id,"result":{}}),
@@ -645,7 +651,10 @@ impl Session {
             }),
             "elicitation/create" => {
                 let params = request.get("params").cloned().unwrap_or_else(|| json!({}));
-                json!({"jsonrpc":"2.0","id":id,"result": self.await_elicitation(&params)})
+                let started = Instant::now();
+                let result = self.await_elicitation(&params);
+                human_wait = started.elapsed();
+                json!({"jsonrpc":"2.0","id":id,"result": result})
             }
             _ => json!({
                 "jsonrpc":"2.0",
@@ -656,6 +665,7 @@ impl Session {
         if let Ok(line) = serde_json::to_string(&response) {
             let _ = self.wire.send_line(&line);
         }
+        human_wait
     }
 
     /// 超时之后，告诉服务「这条别做了」。
@@ -838,7 +848,11 @@ impl Session {
                                 deadline = Instant::now() + Duration::from_secs(idle_secs);
                             }
                             Absorbed::Noted => {}
-                            Absorbed::Passthrough => self.respond_to_server_request(&v),
+                            Absorbed::Passthrough => {
+                                // 等人填表的那段时间不算"服务失联"——原样加回预算。
+                                let waited = self.respond_to_server_request(&v);
+                                deadline += waited;
+                            }
                         }
                         continue;
                     }
@@ -1067,25 +1081,81 @@ fn spawn_http_session(
                 .get(reqwest::header::CONTENT_TYPE)
                 .and_then(|v| v.to_str().ok())
                 .is_some_and(|v| v.contains("text/event-stream"));
-            let body = response.text().unwrap_or_default();
             if !status.is_success() {
+                let body = response.text().unwrap_or_default();
                 // 4xx/5xx 的正文往往就是服务给的解释（鉴权、协议版本），别丢。
                 push_server_log(&log, format!("HTTP {status}: {}", body.chars().take(400).collect::<String>()));
-                let _ = tx.send(format!(
-                    "{MCP_FRAME_ERROR_PREFIX}HTTP {status}（服务拒绝了这次请求）"
-                ));
+                // 401 是这条路唯一真正做不到的事：直连没有 OAuth，不会开浏览器、不会写
+                // ~/.mcp-auth。而它替换掉的那条路（mcp-remote）恰恰只干这个。所以别只报一句
+                // 冷冰冰的状态码，把出路一并说了——否则用户面对的是一个没有下一步的死胡同。
+                let hint = if status.as_u16() == 401 {
+                    "：这个服务要 OAuth，而原生 HTTP 直连不支持授权流程。\
+                     取消 MICHAEL_MCP_NATIVE_HTTP=1 改回默认路径（经 mcp-remote），它会开浏览器完成授权。"
+                } else {
+                    "（服务拒绝了这次请求）"
+                };
+                let _ = tx.send(format!("{MCP_FRAME_ERROR_PREFIX}HTTP {status}{hint}"));
                 break;
             }
+            if is_sse {
+                // SSE 必须**边收边发**。原来这里一律 response.text()，要等整条流关闭才返回：
+                // 服务端在同一次 tools/call 的流里先发 elicitation/create 再等回答 → 那一帧
+                // 永远进不了 rx，弹窗不会出现，60 秒后 tools/call 超时；每 20 秒一次的进度
+                // 通知同理一条都收不到，静默预算续不上。是结构性失效，不是调参问题。
+                use std::io::{BufRead, BufReader};
+                let mut reader = BufReader::new(response);
+                let mut event = String::new();
+                let mut line = String::new();
+                let mut broken = false;
+                loop {
+                    line.clear();
+                    match reader.read_line(&mut line) {
+                        Ok(0) => break, // 流结束
+                        Ok(_) => {}
+                        Err(error) => {
+                            push_server_log(&log, format!("SSE 读取中断：{error}"));
+                            break;
+                        }
+                    }
+                    // 空行 = 一个事件结束，就地交出去，别攒到流关闭。
+                    if line.trim_end_matches(['\r', '\n']).is_empty() {
+                        for frame in parse_sse_frames(&event) {
+                            if tx.send(frame).is_err() {
+                                broken = true;
+                                break;
+                            }
+                        }
+                        event.clear();
+                        if broken {
+                            break;
+                        }
+                        continue;
+                    }
+                    event.push_str(&line);
+                }
+                if !broken && !event.trim().is_empty() {
+                    // 结尾没有空行的最后一个事件也要交出去。
+                    for frame in parse_sse_frames(&event) {
+                        if tx.send(frame).is_err() {
+                            broken = true;
+                            break;
+                        }
+                    }
+                }
+                if broken {
+                    alive_thread.store(false, Ordering::SeqCst);
+                    return;
+                }
+                continue;
+            }
+            let body = response.text().unwrap_or_default();
             // 202 Accepted 是通知的正常回应：没有正文，也不该产生帧。
             if body.trim().is_empty() {
                 continue;
             }
-            let frames = if is_sse { parse_sse_frames(&body) } else { vec![body] };
-            for frame in frames {
-                if tx.send(frame).is_err() {
-                    alive_thread.store(false, Ordering::SeqCst);
-                    return;
-                }
+            if tx.send(body).is_err() {
+                alive_thread.store(false, Ordering::SeqCst);
+                return;
             }
         }
         alive_thread.store(false, Ordering::SeqCst);
@@ -2779,6 +2849,115 @@ mod tests {
     /// 类型检查一遍。抠原文而不是抄一份，是为了改了实现这里必须跟着动。
     ///
     /// 目标没装就跳过（打印原因），不让本机测试因为工具链缺件而红。
+    /// 原生 HTTP 直连必须**边收边发**，否则 elicitation 和进度通知在这条路上结构性失效。
+    ///
+    /// 原来一律 `response.text()`：要等整条 SSE 流关闭才返回。服务端在同一次 tools/call 的
+    /// 流里先发 elicitation/create 再等回答 → 那一帧永远进不了 rx，弹窗不会出现，60 秒后
+    /// tools/call 超时；每 20 秒一次的进度通知同理一条都收不到，静默预算续不上。
+    ///
+    /// 这条按源码结构判：这段代码要真跑起来得有一个说 SSE 的远端服务，本机测试起不来。
+    #[test]
+    fn the_native_http_wire_streams_sse_instead_of_buffering_it() {
+        let src = include_str!("mcp.rs");
+        let at = src.find("let is_sse = response").expect("HTTP 传输改写了");
+        let body: String = src[at..].chars().take(3_500).collect();
+
+        // 成功分支里不许再出现整段读取。窗口必须**按大括号配对**切在这条臂的末尾：
+        // 按字符数截会一路读到下面那条非 SSE 分支，而那里本来就该有 response.text()
+        // —— 断言于是自己喂饱了自己，删掉流式代码也照样绿。
+        let sse_at = body.find("if is_sse {").expect("SSE 分支没了");
+        let sse_arm = {
+            let bytes = body.as_bytes();
+            let open = sse_at + body[sse_at..].find('{').expect("臂没有左大括号");
+            let mut depth = 0usize;
+            let mut end = body.len();
+            for i in open..body.len() {
+                match bytes[i] {
+                    b'{' => depth += 1,
+                    b'}' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            end = i + 1;
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            body[sse_at..end].to_string()
+        };
+        assert!(sse_arm.len() > 400 && sse_arm.len() < 2_500, "臂的边界取错了：{} 字节", sse_arm.len());
+        // 注释里会引用被改掉的旧写法（"原来这里一律 response.text()"），不剥掉的话
+        // doesNotMatch 类断言会被说明文字喂到 —— 这个仓库反复踩的那个坑。
+        let code_only: String = sse_arm
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !code_only.contains("response.text()"),
+            "SSE 分支又整段读了 —— elicitation 那一帧要等流关闭才到，等于永远不到",
+        );
+        assert!(
+            code_only.contains("read_line(&mut line)"),
+            "要按行增量读，才可能边收边发",
+        );
+        assert!(
+            code_only.contains("parse_sse_frames(&event)") && code_only.contains("event.clear();"),
+            "每遇到一个空行就该把攒好的事件交出去，而不是攒到最后",
+        );
+
+        // 401 是这条路唯一真做不到的事，报错要带出路。
+        assert!(
+            body.contains("MICHAEL_MCP_NATIVE_HTTP"),
+            "401 只报状态码等于把用户堵在没有下一步的死胡同里：直连没有 OAuth，\
+             而它替换掉的那条路（mcp-remote）恰恰只干这个",
+        );
+    }
+
+    /// 等人填表的那段时间不能算进"服务失联"的静默预算里。
+    ///
+    /// 用户读完说明、去翻一个 API Key、70 秒后点提交：答案确实送回了服务端（服务端继续
+    /// 干活），而客户端同一圈回到开头发现 60 秒预算已耗尽，返回「MCP 请求超时（tools/call）」
+    /// 并发出 notifications/cancelled。用户看到的是：我明明填了，工具却报超时。
+    ///
+    /// 这条守两件事：① 那段时间被原样加回预算；② 加回的只有**等人**那一段，
+    /// 服务端自己慢不该被豁免（否则超时预算整个失效）。
+    #[test]
+    fn a_human_filling_a_form_does_not_burn_the_silence_budget() {
+        let src = include_str!("mcp.rs");
+        let at = src
+            .find("fn respond_to_server_request")
+            .expect("respond_to_server_request 改名了");
+        let body: String = src[at..].chars().take(1_800).collect();
+        assert!(
+            body.contains("-> Duration"),
+            "它必须报告等人等了多久，否则调用方无从豁免",
+        );
+        // 计时只包住 await_elicitation 这一段：ping / roots/list 是我们立刻答的，
+        // 把它们也算进去等于凭空延长预算。
+        let el = body.find("\"elicitation/create\"").expect("elicitation 分支没了");
+        let arm: String = body[el..].chars().take(400).collect();
+        assert!(
+            arm.contains("let started = Instant::now();") && arm.contains("human_wait = started.elapsed();"),
+            "只有等人那一段该被计时：{arm}",
+        );
+
+        let loop_at = src.find("Absorbed::Passthrough => {").expect("Passthrough 分支改写了");
+        let loop_arm: String = src[loop_at..].chars().take(400).collect();
+        assert!(
+            loop_arm.contains("deadline += waited;"),
+            "等人的时间没有加回预算 —— 填完表照样报超时",
+        );
+        // 服务端自己的沉默仍然要被抓住：进度通知才重置预算，别的一律不动。
+        let absorb_at = src.find("Absorbed::OurProgress => {").expect("OurProgress 分支改写了");
+        let absorb_arm: String = src[absorb_at..].chars().take(200).collect();
+        assert!(
+            absorb_arm.contains("deadline = Instant::now() + Duration::from_secs(idle_secs);"),
+            "进度续期没了",
+        );
+    }
+
     #[test]
     fn windows_only_code_actually_compiles_for_windows() {
         const TARGET: &str = "x86_64-pc-windows-msvc";
