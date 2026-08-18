@@ -3332,17 +3332,28 @@ fn compute_cost(
     // 那是 Sonnet 的写入价（1.25×3），于是 Opus 的缓存写入按 3.75 计，正确值是 6.25；Fable
     // 应当是 12.5。实测 30 天里仅这一项就少收约 $119，而缓存写入恰恰是单价最贵的一类 token。
     //
-    // 所以：只要这个模型有自己的输入价（每模型覆盖或官方目录），就按倍数推导；连接级那两列
-    // 退回成"这个模型压根没有输入价"时的兜底。倍数不对的模型仍可在每模型价里单独校正。
-    let read_price = if price_is_per_model || cache_read_price <= 0.0 {
-        off_in * CACHE_READ_FACTOR
-    } else {
+    // 缓存价三级（2026-08-18 用户要求补上中间那级）：
+    //   ① 我手填了 → 用我的。但只在**和输入价同一配置层**时（!price_is_per_model）——
+    //      连接级那两列是一条连接上所有模型共用的一个数，给每模型/目录定价的模型用它就是
+    //      上面 $119 那个 bug，所以那种情况故意不认它。
+    //   ② 我没填 → 用 OpenRouter 对**这个模型**的实时目录价。这是用户点名要的：
+    //      「没写就用 openrouter 实时获取的」，比按输入价拍脑袋推算准得多。
+    //      目录明确给 0（缓存读免费的模型）也照用，None 才算"目录没有这个数"。
+    //   ③ 目录也没有 → 最后才按输入价 × 倍数推算兜底。
+    let live_cache = crate::model_catalog::lookup(model_id);
+    let read_price = if !price_is_per_model && cache_read_price > 0.0 {
         cache_read_price
-    };
-    let write_price = if price_is_per_model || cache_create_price <= 0.0 {
-        off_in * CACHE_WRITE_FACTOR
+    } else if let Some(p) = live_cache.as_ref().and_then(|e| e.cache_read_price) {
+        p
     } else {
+        off_in * CACHE_READ_FACTOR
+    };
+    let write_price = if !price_is_per_model && cache_create_price > 0.0 {
         cache_create_price
+    } else if let Some(p) = live_cache.as_ref().and_then(|e| e.cache_write_price) {
+        p
+    } else {
+        off_in * CACHE_WRITE_FACTOR
     };
     // Split input into plain (full price) + cache-read + cache-create, bill each at its own
     // unit price; output at off_out. Then × 倍率. Anthropic reports input EXCLUDING cached;
@@ -8709,6 +8720,66 @@ mod billing_tests {
             compute_cost(Some(&usage), "some-unlisted-model", 1.0, 2.0, 8.0, 0.0, 3.75, 0.0, 0.0),
             375,
             "只有连接级输入价时，连接级缓存价仍然兜底"
+        );
+    }
+
+    /// 2026-08-18 用户要求：没手填缓存价时，用 OpenRouter 对**这个模型**的实时目录价，
+    /// 而不是按输入价 × 倍数拍脑袋推算。这里给目录种一个明确的实时缓存价，验证它被采用。
+    #[test]
+    fn unset_cache_price_uses_live_catalog_not_the_estimate() {
+        seed_catalog();
+        use crate::model_catalog::{seed_for_test, Entry};
+        // 一个输入价 $4、但缓存写入实时价 $9 的模型。按旧逻辑（推算）写入 = 1.25×4 = $5；
+        // 实时目录说 $9 —— 用户要的是后者。
+        seed_for_test(&[(
+            "cache-live-model",
+            Entry {
+                input_price: Some(4.0),
+                output_price: Some(16.0),
+                cache_read_price: Some(0.5),
+                cache_write_price: Some(9.0),
+                ..Entry::default()
+            },
+        )]);
+        let write_usage = serde_json::json!({
+            // input_tokens 必须 >0，否则 compute_cost 的 prompt<=0&&completion<=0 早返回守卫
+            // 会在计价前就返回 0。1 个 token 在 $4/M 下不足 0.001 分，不影响整数分断言。
+            "input_tokens": 1, "output_tokens": 0,
+            "cache_read_input_tokens": 0, "cache_creation_input_tokens": 1_000_000,
+        });
+        // 连接级缓存价传 0（没手填）。100 万写入 token、倍率 1 → 应当按实时 $9 = 900 分，
+        // 不是推算的 500 分。
+        assert_eq!(
+            compute_cost(Some(&write_usage), "cache-live-model", 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0),
+            900,
+            "没手填缓存价时应当用实时目录 $9，而不是推算的 1.25×$4=$5"
+        );
+
+        let read_usage = serde_json::json!({
+            "input_tokens": 1, "output_tokens": 0,
+            "cache_read_input_tokens": 1_000_000, "cache_creation_input_tokens": 0,
+        });
+        // 缓存读实时价 $0.5 → 50 分；推算是 0.1×$4 = $0.4 = 40 分。
+        assert_eq!(
+            compute_cost(Some(&read_usage), "cache-live-model", 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0),
+            50,
+            "缓存读也要用实时 $0.5，而不是推算的 $0.4"
+        );
+    }
+
+    /// 目录也没有缓存价时（cache_*_price = None），才掉到按输入价推算——最后的兜底不变。
+    #[test]
+    fn cache_price_falls_back_to_estimate_only_when_catalog_lacks_it() {
+        seed_catalog(); // priced(...) 建的条目 cache_*_price 都是 None
+        let usage = serde_json::json!({
+            "input_tokens": 1, "output_tokens": 0,
+            "cache_read_input_tokens": 0, "cache_creation_input_tokens": 1_000_000,
+        });
+        // claude-fable-5 输入价 $10、目录无缓存价 → 推算写入 1.25×$10 = $12.5 = 1250 分。
+        assert_eq!(
+            compute_cost(Some(&usage), "claude-fable-5", 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0),
+            1250,
+            "目录没有缓存价时，仍按输入价 × 倍数兜底"
         );
     }
 
