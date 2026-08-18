@@ -1140,6 +1140,8 @@ mod ide_header_tests {
             model: "test-model".into(),
             max_tokens: None,
             temperature: None,
+            // 上一次给 AiConfig 加字段时没跟上，HEAD 的 lib test 整个编不过。
+            ide_context_window: None,
             reasoning_effort: None,
             thinking_budget: None,
             thinking_effort: None,
@@ -1513,6 +1515,8 @@ mod stream_timeout_tests {
             model: "test-model".into(),
             max_tokens: None,
             temperature: None,
+            // 上一次给 AiConfig 加字段时没跟上，HEAD 的 lib test 整个编不过。
+            ide_context_window: None,
             reasoning_effort: reasoning_effort.map(str::to_string),
             thinking_budget,
             thinking_effort: None,

@@ -9478,7 +9478,22 @@ test("agent next-step chips use completed run memory and survive suggestion fail
   assert.ok(gen({
     _lastRunState: { outcome: "partial", task: "x", result: "", incompleteReason: "something_new",
       mutatedFileCount: 1, mutatedFileTypes: new Set(["src"]), updatedAt: now }
-  }).some((c) => c.label === "继续完成剩余部分"));
+  }).some((c) => c.label === "继续没做完的部分"));
+  // 预填进输入框的那句**不许复述模型上一轮的回答**。用户实拍：上一轮它用 run_cmd 起服务、
+  // 10 秒被杀却写了"服务已经成功启动"，这句被原样塞进输入框变成「请继续：服务已经成功
+  // 启动了…」——模型自己的错话被包装成用户的指令递回去，用户看到的就是"没启动也说启动了"。
+  {
+    const chip = gen({
+      _lastRunState: { outcome: "partial", task: "x", incompleteReason: "iteration_limit",
+        result: "服务已经**成功启动**了，运行在 http://0.0.0.0:8000",
+        mutatedFileCount: 0, mutatedFileTypes: new Set(), updatedAt: now }
+    }).find((c) => c.label === "接着上次的进度继续");
+    assert.ok(chip, "没给出接着做的建议");
+    assert.doesNotMatch(chip.send, /成功启动/,
+      "又把模型上一轮的话塞回输入框了——它说错的那句会变成用户的指令");
+    assert.doesNotMatch(chip.send, /未知原因|\(0个\)/,
+      "内部枚举残渣不该出现在用户要发出去的话里");
+  }
   // 智能体举着问题等人答时，没有"下一步"——不拦的话场景 4 会在没人回答的问题上面
   // 喊「继续执行计划」（awaitingUserReply 和 plan_steps_pending 是同时打的标）。
   assert.deepEqual(gen({
@@ -24180,9 +24195,19 @@ test("timeout_secs 两份目录都有——只改客户端等于没改", () => {
 
 test("超时文案按命令形态分两种，不再把「编译太慢」诊断成「你该去终端起服务」", () => {
   const tasks = readFileSync(new URL("../src-tauri/src/tasks.rs", import.meta.url), "utf8");
-  assert.match(tasks, /let looks_like_service = \{/);
-  // 服务型：指向终端是对的
-  assert.match(tasks, /服务请改用 run_in_terminal/);
+  // 判据改成**输出优先**：先看进程自己说了什么（Uvicorn running on… / listening on…），
+  // 命令名只作兜底。用户实拍的那次跑的是 `python3 main.py`——按命令名一个关键词都不沾，
+  // 于是被判成"会退出的命令"，而那一支明确写着"不要改用 run_in_terminal"，模型照做，
+  // 反复重跑却始终不换终端。行为断言在 Rust 侧（timeout_advice_for 的两条测试）。
+  assert.match(tasks, /let looks_like_service = output_says_server \|\| \{/);
+  assert.match(tasks, /"application startup complete"/, "输出判据没了，又会退回按命令名猜");
+  // 服务型：指向终端，并且必须说清"现在没在运行"——不说这句就会出现"没启动也说启动了"
+  assert.match(tasks, /用 run_in_terminal 在真实终端里重新起/);
+  assert.match(tasks, /它已经被杀掉了，现在没有在运行/);
+  assert.match(tasks, /不要对用户说「服务已启动」/);
+  // 缺依赖：当场给下一步，别让它去 pip list / sys.path 反复确认
+  assert.match(tasks, /fn missing_dependency_advice/);
+  assert.match(tasks, /别停下来问用户/);
   // 一次性命令：明确劝阻改用终端，并给出可执行的下一步
   assert.match(tasks, /\*\*不要\*\*因此改用 run_in_terminal/);
   assert.match(tasks, /把 timeout_secs 调大（上限 600）/);

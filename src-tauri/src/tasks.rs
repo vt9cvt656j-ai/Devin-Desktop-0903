@@ -22,6 +22,42 @@ pub struct TaskDefinition {
 /// pip list，就是不换终端。而证据一直在手里：输出里白纸黑字写着
 /// `Uvicorn running on http://0.0.0.0:8000` 和 `Application startup complete`。
 /// 服务起没起来，看它自己说了什么最准——命令可以叫任何名字，启动横幅骗不了人。
+/// 命令失败在"东西没装"上时，直接把下一步说清楚。
+///
+/// 用户实拍：让它跑一个 FastAPI 项目 → `ModuleNotFoundError: No module named 'fastapi'`
+/// → 它去查 `pip list`、查 `sys.path`、反复重跑，就是没去装。用户的话：「有没有安装
+/// 东西那些各种 lsp 之类不知道？」
+///
+/// 判断规则是**按项目自己的依赖清单**走，不靠猜：
+/// - 清单里有这一项（requirements.txt / package.json / Cargo.toml / go.mod）→ 那就是
+///   项目本来就要的，直接按清单装完继续，别停下来问；问了才是浪费用户时间。
+/// - 清单里没有 → 那是**新增依赖**，属于改项目，要先问过用户。
+///
+/// 这句话挂在工具结果上，而不是塞进常驻提示词：只有真撞上才出现，每轮不花一个 token。
+fn missing_dependency_advice(stdout: &str, stderr: &str) -> Option<&'static str> {
+    let out = format!("{stdout}{stderr}").to_ascii_lowercase();
+    let missing_module = out.contains("modulenotfounderror")
+        || out.contains("no module named")
+        || out.contains("cannot find module")
+        || out.contains("importerror")
+        || out.contains("command not found")
+        || out.contains("is not recognized as an internal or external command")
+        || out.contains("no such file or directory: 'python")
+        || out.contains("could not find a version that satisfies")
+        || out.contains("unresolved import");
+    if !missing_module {
+        return None;
+    }
+    Some(
+        "缺的是依赖，不是代码问题。先看项目自己的依赖清单（requirements.txt / package.json / \
+         Cargo.toml / go.mod / pyproject.toml）：\
+         ① 清单里**有**这一项 → 直接按清单装（pip install -r requirements.txt、npm install、\
+         cargo fetch、go mod download 之类），装完把刚才那条命令重跑一遍，别停下来问用户；\
+         ② 清单里**没有** → 那是给项目新增依赖，先问用户要不要加，别自作主张装。\
+         不要用 pip list / sys.path 反复确认——装一次再跑一次，结果自己会说话。",
+    )
+}
+
 fn timeout_advice_for(command: &str, stdout: &str, stderr: &str) -> &'static str {
     let out_lower = format!("{stdout}{stderr}").to_ascii_lowercase();
     let output_says_server = [
@@ -526,6 +562,11 @@ fn task_run_capture_inner(
             "\n[已超时 {timeout_secs}s，命令及其子进程已被终止。{advice}]"
         ));
     }
+    if code != 0 {
+        if let Some(dep) = missing_dependency_advice(&stdout, &stderr) {
+            stderr.push_str(&format!("\n[{dep}]"));
+        }
+    }
     let combined = format!("{stdout}{stderr}");
     // Only claim a denial when the command actually FAILED and ran confined. A successful
     // command whose output happens to mention "operation not permitted" (a test asserting an
@@ -581,6 +622,39 @@ fn read_capped<R: std::io::Read>(r: &mut R, out: &mut Vec<u8>, cap: usize) {
 
 #[cfg(test)]
 mod tests {
+
+    /// 用户实拍：跑项目撞上 `ModuleNotFoundError: No module named 'fastapi'`，它却去查
+    /// pip list、查 sys.path、反复重跑，就是不去装。缺依赖时下一步必须当场说清楚。
+    #[test]
+    fn missing_dependency_gets_a_concrete_next_step() {
+        let advice = missing_dependency_advice(
+            "",
+            "ModuleNotFoundError: No module named 'fastapi'\n",
+        )
+        .expect("撞上缺模块却没给下一步");
+        assert!(advice.contains("requirements.txt"), "{advice}");
+        assert!(advice.contains("别停下来问用户"), "清单里有的依赖不该反问用户：{advice}");
+        assert!(advice.contains("先问用户"), "清单里没有的属于新增依赖，必须问：{advice}");
+        assert!(
+            advice.contains("不要用 pip list"),
+            "不写这句它就会反复确认而不是直接装：{advice}"
+        );
+    }
+
+    /// node / 可执行文件缺失也算同一类。
+    #[test]
+    fn missing_dependency_covers_node_and_missing_binaries() {
+        assert!(missing_dependency_advice("", "Error: Cannot find module 'express'").is_some());
+        assert!(missing_dependency_advice("", "bash: uvicorn: command not found").is_some());
+    }
+
+    /// 普通失败（测试挂了、编译错误）不该被扣上"缺依赖"的帽子——那会把模型推去装东西，
+    /// 而真正该做的是读错误。
+    #[test]
+    fn ordinary_failures_get_no_dependency_advice() {
+        assert!(missing_dependency_advice("", "AssertionError: expected 1 got 2").is_none());
+        assert!(missing_dependency_advice("", "error[E0308]: mismatched types").is_none());
+    }
 
     /// 用户实拍：`python3 main.py` 起了个 FastAPI 服务，10 秒被杀，而超时建议却说
     /// 「这看起来是一条会退出的命令，**不要**改用 run_in_terminal」——模型照做，于是
