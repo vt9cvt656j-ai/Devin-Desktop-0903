@@ -45937,7 +45937,7 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
       : "michael-design 后台检索没有可用命中；已明确注入不可用状态，不能伪造其内容。");
     if (preflight.brief && Array.isArray(messages) && !run._michaelDesignBriefInjected) {
       run._michaelDesignBriefInjected = true;
-      messages.push({ role: "user", content: preflight.brief });
+      messages.push({ role: "user", content: _ORCH_NOTE + preflight.brief });
     }
     return true;
   };
@@ -46243,7 +46243,7 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
   if (_mustUseWorkspaceToolsNow()) {
     messages.push({
       role: "user",
-      content: _agentAnswerOnlyInspection(run.engineering)
+      content: _ORCH_NOTE + _agentAnswerOnlyInspection(run.engineering)
         ? "[AGENT_MODE_TOOL_REQUIRED]\n本轮是项目评价/解释型只读任务。只用 read_file、list_dir、search、find_files、代码导航、诊断或 Git 只读工具取得最小充分事实；不得运行命令、启动服务、安装依赖、修改文件、操作浏览器或做知识库/公网预取。读到目录、清单/入口和少量关键源码后直接回答并结束。"
         : "[AGENT_MODE_TOOL_REQUIRED]\n本轮明确指向当前项目。先用与结构化目标一致的最直接工具取得真实证据，再完成修改、运行或回答；不得把可能有用的动作扩展成用户没有要求的工作。",
     });
@@ -46251,7 +46251,7 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
   if (run.engineering?.interactiveWait || run.engineering?.longRunningRuntime) {
     messages.push({
       role: "user",
-      content: "[AGENT_INTERACTIVE_WAIT]\n本轮含持续进程、后台监听、用户/外部条件等待或服务 ready 验证。先判断该用 run_in_terminal 还是 run_cmd：会长期运行的 dev server/watch/守护进程必须 run_in_terminal，随后 read_logs/read_terminal 看日志/URL/退出状态；需要等端口、URL、文件、命令、抓包或人工操作时用 background_monitor 挂后台自动轮询，条件满足后继续。不要让前台 run_cmd 硬等到超时，也不要在 monitor 超时后直接放弃——先检查真实状态再继续。",
+      content: _ORCH_NOTE + "[AGENT_INTERACTIVE_WAIT]\n本轮含持续进程、后台监听、用户/外部条件等待或服务 ready 验证。先判断该用 run_in_terminal 还是 run_cmd：会长期运行的 dev server/watch/守护进程必须 run_in_terminal，随后 read_logs/read_terminal 看日志/URL/退出状态；需要等端口、URL、文件、命令、抓包或人工操作时用 background_monitor 挂后台自动轮询，条件满足后继续。不要让前台 run_cmd 硬等到超时，也不要在 monitor 超时后直接放弃——先检查真实状态再继续。",
     });
   }
   // 方案C：验收契约前置——开工首轮把已抽取的需求清单立成思考靶子（只进本 run 消息流，
@@ -46403,11 +46403,11 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
       // so it drops them immediately instead of waiting for its own update_plan.
       if (run._planPendingCancel && run._planPendingCancel.length) {
         const list = run._planPendingCancel.splice(0).map((c) => "・" + c).join("\n");
-        messages.push({ role: "user", content: `用户在任务计划里**手动取消了这些步骤，别再做、也别把它们加回计划**：\n${list}\n继续完成计划里剩下的步骤即可。` });
+        messages.push({ role: "user", content: _ORCH_NOTE + `用户在任务计划里**手动取消了这些步骤，别再做、也别把它们加回计划**：\n${list}\n继续完成计划里剩下的步骤即可。` });
       }
       if (run._planPendingRestore && run._planPendingRestore.length) {
         const list = run._planPendingRestore.splice(0).map((c) => "・" + c).join("\n");
-        messages.push({ role: "user", content: `用户恢复了之前取消的这些步骤，请继续执行它们：\n${list}` });
+        messages.push({ role: "user", content: _ORCH_NOTE + `用户恢复了之前取消的这些步骤，请继续执行它们：\n${list}` });
       }
       // Real-time steering ("引导/Guide"): the user injected new instructions mid-run via
       // the composer while this task was running — splice them in NOW so the model adapts
@@ -46587,7 +46587,16 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
         if (_evidenceBlock) _parts.push(_evidenceBlock);
         if (_latestDiagBlock) _parts.push(_latestDiagBlock);
         _parts.push("目标文件/终端/API/DB线索已经知道时直接用对应工具读取，不要再用 search/find/cd/ls 绕一圈；只有位置未知时才搜索一次定位。若实时诊断、终端、日志、HTTP 或数据库返回 error，先解释根因并修掉再收尾；不要带着红线/红日志声称完成。接着完成尚未完成的动作。");
-        _selfMemMsg = { role: "user", content: _parts.join("\n") };
+        // 这一条是**每轮都在、而且总排在最后**的那块。最后一位是模型注意力最高的位置，
+        // 用户真正的请求反而被顶到上面去了——实拍后果：模型在思考里逐条讨论这里的规则，
+        // 最后写下"这一轮没有新的用户指令"，然后回了一段跟提问毫无关系的收尾话。
+        // （网关侧量到的同一件事：编排消息 3~6KB 时，"末条用户消息"就是它，不是用户的话。）
+        // 所以这块的末尾必须把用户这轮的原话原样带回来。
+        const _selfMemAsk = _lastRealUserText(messages);
+        if (_selfMemAsk) {
+          _parts.push(`\n用户这一轮真正要的是下面这句，别被上面这些运行状态带偏，也别据此判断"用户没有新指令"：\n${_selfMemAsk.slice(-1200)}`);
+        }
+        _selfMemMsg = { role: "user", content: _ORCH_NOTE + _parts.join("\n") };
         messages.push(_selfMemMsg);
       }
       // 流完即写：write_file 参数一流完整（严格 JSON + 校验通过）就立刻真实落盘，
@@ -46748,7 +46757,7 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
         if (_cap > 0 && run._tokens > _cap && !run._tokenCapNudged) {
           run._tokenCapNudged = true;
           budget = Math.min(budget, iter + 3); // 留 2-3 轮收尾，不再延展
-          messages.push({ role: "user", content: `[系统：本次运行 token 预算已用完（约 ${Math.round(run._tokens / 1000)}k / 上限 ${Math.round(_cap / 1000)}k）。立即收尾：不再开新任务，把已完成的和未完成的如实总结。]` });
+          messages.push({ role: "user", content: _ORCH_NOTE + `[系统：本次运行 token 预算已用完（约 ${Math.round(run._tokens / 1000)}k / 上限 ${Math.round(_cap / 1000)}k）。立即收尾：不再开新任务，把已完成的和未完成的如实总结。]` });
           showToast(`Token 预算已用完（${Math.round(run._tokens / 1000)}k），智能体收尾中`);
         }
       }
@@ -48018,7 +48027,7 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
           if (messages[i].role === "user" && typeof messages[i].content === "string" && messages[i].content.startsWith("[运行进度草稿纸")) { messages.splice(i, 1); break; }
         }
         const padTxt = _padText();
-        if (padTxt) messages.push({ role: "user", content: padTxt });
+        if (padTxt) messages.push({ role: "user", content: _ORCH_NOTE + padTxt });
       }
 
       // Tool-RAG (B) — anti-forgetting refresh: on a long run, re-surface the full

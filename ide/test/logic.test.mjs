@@ -7376,6 +7376,46 @@ test("dynamic time and bulky file context stay out of the cached system prefix",
   assert.match(SRC, /entries\.filter\(\(en\) => !en\.is_dir\)\.slice\(0, 3\)/);
 });
 
+test("harness 以「用户」身份塞进去的每一条，都必须戴编排信封", () => {
+  // 这是今天被实拍到四次的同一个病根。провider 兼容性逼得这些注入只能用 role:"user"，
+  // 于是它们长得就像用户刚说的话，而且**排在用户真正的请求后面**（最后一位是注意力最高的
+  // 位置）。模型的反应有据可查：思考里逐条讨论 harness 的规则，最后写下「这一轮没有新的
+  // 用户指令」，然后回一段跟提问无关的收尾话。
+  //
+  // 网关侧量到的同一件事：编排消息存在的那些请求里，"末条用户消息"的字节数恰好等于编排
+  // 消息的字节数——模型看到的最后一句"用户发言"，就是 harness 自己。
+  //
+  // 一条一条盯没用（今天查出来 10 处里有 8 处没戴）。这条断言按结构扫：循环里每一个
+  // role:"user" 的注入都要么戴信封，要么在下面这份**有名有姓**的白名单里。
+  const loop = extractFn("_runAgenticLoop");
+  const ALLOW = [
+    // 引导：内容就是用户自己打的字，本来就该以用户身份出现，不戴信封是对的。
+    "content });",
+  ];
+  const naked = [];
+  for (const m of loop.matchAll(/\{\s*role:\s*"user",\s*content:\s*([^\n]{0,80})/g)) {
+    const tail = m[1].trim();
+    if (tail.includes("_ORCH_NOTE")) continue;
+    if (ALLOW.some((a) => tail.startsWith(a))) continue;
+    naked.push(tail.slice(0, 60));
+  }
+  assert.deepEqual(naked, [],
+    "这些 harness 注入没戴编排信封，模型会把它们当成用户说的话，并据此判断「用户没有新指令」：\n"
+    + naked.map((x) => "  · " + x).join("\n"));
+});
+
+test("每轮排在最后的那块运行状态，必须把用户这轮的原话带回来", () => {
+  // 光戴信封只解决"这不是用户说的"，不解决"那用户说了什么"——同一个坑今天在工具参数
+  // 修复那条路上已经踩过一次。最后一位既然被运行状态占着，就必须由它把原话带回来。
+  const src = stripJsComments(SRC);
+  assert.match(src, /const _selfMemAsk = _lastRealUserText\(messages\)/,
+    "最后那块运行状态没有取回用户原话");
+  assert.match(src, /用户这一轮真正要的是下面这句/);
+  assert.match(src, /别据此判断"用户没有新指令"/,
+    "要明说这件事——实拍到的就是模型据此判定用户没说话");
+  assert.match(src, /_selfMemMsg = \{ role: "user", content: _ORCH_NOTE \+ _parts\.join/);
+});
+
 test("插进去的消息要带着「没做完的事」一起交给模型，并让它判断合并还是另起", () => {
   // 用户实拍的抱怨：插入的消息"不去处理，没任何有用价值"。机制其实是通的——下一轮会取。
   // 缺的是判断依据：只丢一句"用户插了新指令"，模型不知道当前做到哪、还剩什么，于是要么
@@ -9847,8 +9887,10 @@ test("michael-design runs in the background and is injected only at loop boundar
   const loop = extractFn("_runAgenticLoop");
   assert.match(loop, /const _consumeMichaelDesignPreflight = \(\) =>/);
   assert.match(loop, /const preflight = run\._michaelDesignPreflightResult/);
-  assert.match(loop, /messages\.push\(\{ role: "user", content: preflight\.brief \}\)/,
-    "only the synchronous boundary consumer may mutate provider messages");
+  // 简报也必须戴编排信封：不戴它就长得像"用户刚说的话"，而它坐在用户请求后面——
+  // 实拍到的后果是模型在思考里逐条讨论 harness 的规则，然后判定"这一轮没有新的用户指令"。
+  assert.match(loop, /messages\.push\(\{ role: "user", content: _ORCH_NOTE \+ preflight\.brief \}\)/,
+    "only the synchronous boundary consumer may mutate provider messages, and it must wear the envelope");
   const startAt = loop.indexOf("_startMichaelDesignPreflight({ run, body, isLive: _live });");
   const firstTurnAt = loop.indexOf("let turn = await _agentModelTurn", startAt);
   const turnDoneAt = loop.indexOf("_firstModelTurnCompleted = true;", firstTurnAt);
