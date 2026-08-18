@@ -1236,6 +1236,20 @@ body.is-win .tbtn { font-weight: var(--wt-medium); }
   user-select: none;
   -webkit-user-select: none;
 }
+/* 构建产物 / 依赖目录（node_modules、target、dist、.git…）——后端 read_dir 标 ignored、
+   排到最后，这里把它们压暗。**不隐藏**：没有"显示隐藏文件"开关，过滤掉等于让 .vscode/
+   和合法提交的 dist/ 彻底够不到。压暗之后第一眼看到的是自己的代码，需要时仍然点得进去。 */
+.row--ignored .name,
+.row--ignored .ic,
+.row--ignored img {
+  opacity: 0.45;
+}
+.row--ignored:hover .name,
+.row--ignored:hover .ic,
+.row--ignored:hover img {
+  opacity: 0.75;
+}
+
 .row {
   position: relative;
   isolation: isolate;

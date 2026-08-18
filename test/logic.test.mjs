@@ -27858,3 +27858,18 @@ test("跨文件替换必须如实报告失败，不许静默跳过或谎报成�
   assert.match(fn, /if \(!parts\.length\) parts\.push/, "全部失败时没有兜底文案");
   assert.match(fn, /\n  showToast\(parts\.join/, "toast 必须无条件发出——全失败时静默是最坏的结果");
 });
+
+test("文件树把构建产物压暗并沉底，但不许把它们藏起来", () => {
+  // 打开 Node 项目第一眼就是几万条 node_modules——文件树此前一份忽略规则都不用
+  // （搜索用 skip_walk_entry、TS 预加载用 PRELOAD_SKIP_DIRS，树里一份都没有）。
+  // 后端现在标 ignored 并把它们排到最后，前端压暗。
+  //
+  // 关键是**不能过滤掉**：没有「显示隐藏文件」开关，直接删掉会让 .vscode/ 和
+  // 合法提交的 dist/ 彻底够不到——那是又一次静默移除。
+  assert.match(SRC, /row\.className = item\.ignored \? "row row--ignored" : "row";/,
+    "ignored 标记没有接到行的 class 上——后端标了等于没标");
+  assert.doesNotMatch(SRC, /entries\.filter\(\(e\) => !e\.ignored\)/,
+    "被忽略的条目不许从文件树里过滤掉，只能压暗");
+  assert.match(APP_CSS, /\.row--ignored \.name/,
+    "压暗样式没了，class 加了也看不出区别");
+});
