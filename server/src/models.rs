@@ -938,6 +938,7 @@ fn resolve_cost(
     cache_create_price: f64,
     model_in: f64,
     model_out: f64,
+    cheap_cache: bool,
 ) -> i64 {
     if billing_mode == "per_call" {
         let c = per_call_cents.max(0);
@@ -954,6 +955,7 @@ fn resolve_cost(
         cache_create_price,
         model_in,
         model_out,
+        cheap_cache,
     )
 }
 
@@ -1762,6 +1764,7 @@ pub async fn admin_model_estimate(
         model.cache_create_price,
         model_in,
         model_out,
+        crate::settings::cache_billing_cheap(),
     );
     let calls = req.calls as f64;
     let provider_usd_total = provider_usd_per_call * calls;
@@ -2608,6 +2611,7 @@ pub async fn chat(
         model.cache_create_price,
         model_in,
         model_out,
+        crate::settings::cache_billing_cheap(),
     );
     let mut tokens = extract_bill_tokens(
         usage_val.filter(|_| usage_reported),
@@ -3278,6 +3282,7 @@ fn compute_cost(
     cache_create_price: f64,
     model_in: f64,
     model_out: f64,
+    cheap_cache: bool,
 ) -> i64 {
     const COST_CEILING_CENTS: f64 = 5000.0; // $50/call backstop — no legit single call hits this
     let u = match usage {
@@ -3374,6 +3379,10 @@ fn compute_cost(
     } else {
         off_in * CACHE_WRITE_FACTOR
     };
+    // 便宜模式（灰产/便宜渠道）：把最贵的缓存**写入**降到和缓存**读**同一个便宜价，
+    // 普通输入照常。用户："我设置开缓存就是实时真实价，不开就是便宜许多那种。"
+    // 保证「关」永远 ≤「开」：只砍写入那笔溢价，读的折扣照留。
+    let write_price = if cheap_cache { read_price } else { write_price };
     // Split input into plain (full price) + cache-read + cache-create, bill each at its own
     // unit price; output at off_out. Then × 倍率. Anthropic reports input EXCLUDING cached;
     // OpenAI/DeepSeek report prompt INCLUDING cached reads (and no separate write count).
@@ -7042,6 +7051,7 @@ pub async fn chat_completions(
                 cache_create_price,
                 model_in,
                 model_out,
+                crate::settings::cache_billing_cheap(),
             );
             let mut tokens = extract_bill_tokens(
                 usage_reported.then_some(&usage),
@@ -7166,6 +7176,7 @@ pub async fn chat_completions(
                 conn.cache_create_price,
                 model_in,
                 model_out,
+                crate::settings::cache_billing_cheap(),
             );
             let mut tokens = extract_bill_tokens(
                 usage_val.filter(|_| usage_reported),
@@ -7478,6 +7489,7 @@ pub async fn responses_proxy(
                 conn.cache_create_price,
                 model_in,
                 model_out,
+                crate::settings::cache_billing_cheap(),
             );
             let mut tokens =
                 extract_bill_tokens(usage.filter(|_| usage_reported), &model_id, !usage_reported);
@@ -8081,13 +8093,13 @@ mod billing_tests {
     fn free_mode_still_costs_and_maps_to_a_real_cost_mode() {
         // free + a configured per-call fee bills that flat fee (against points)
         assert_eq!(
-            resolve_cost("per_call", 3, None, "free-model", 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0),
+            resolve_cost("per_call", 3, None, "free-model", 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, false),
             3,
         );
         // free with no fee falls through to token billing, which with zero prices is 0 —
         // legitimately free, and the points pool is simply untouched.
         assert_eq!(
-            resolve_cost("rate", 0, None, "free-model", 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0),
+            resolve_cost("rate", 0, None, "free-model", 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, false),
             0,
         );
     }
@@ -8571,7 +8583,8 @@ mod billing_tests {
                 0.0,
                 0.0,
                 0.0,
-                0.0
+                0.0,
+                false,
             ),
             20
         );
@@ -8588,13 +8601,14 @@ mod billing_tests {
                 0.0,
                 0.0,
                 0.0,
-                0.0
+                0.0,
+                false,
             ),
             35
         );
         // Negative per_call_cents floored to 0.
         assert_eq!(
-            resolve_cost("per_call", -5, None, "x", 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0),
+            resolve_cost("per_call", -5, None, "x", 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, false),
             0
         );
     }
@@ -8617,7 +8631,8 @@ mod billing_tests {
                 0.0,
                 0.0,
                 0.0,
-                0.0
+                0.0,
+                false,
             ),
             16
         );
@@ -8634,7 +8649,8 @@ mod billing_tests {
                 0.0,
                 0.0,
                 0.0,
-                0.0
+                0.0,
+                false,
             ),
             48
         );
@@ -8651,7 +8667,8 @@ mod billing_tests {
                 0.0,
                 0.0,
                 0.0,
-                0.0
+                0.0,
+                false,
             ),
             16
         );
@@ -8717,7 +8734,7 @@ mod billing_tests {
             "cache_read_input_tokens": 0, "cache_creation_input_tokens": 1_000_000,
         });
         let cents = |model: &str, conn_write: f64| {
-            compute_cost(Some(&usage), model, 1.0, 0.0, 0.0, 0.0, conn_write, 0.0, 0.0)
+            compute_cost(Some(&usage), model, 1.0, 0.0, 0.0, 0.0, conn_write, 0.0, 0.0, false)
         };
         // 100 万缓存写入 token，倍率 1：应当 = 1.25 × 该模型输入价，单位美分。
         assert_eq!(cents("claude-opus-4-8", 3.75), 625, "Opus 写入应为 1.25×$5=$6.25");
@@ -8731,12 +8748,12 @@ mod billing_tests {
         );
         // 但模型没有输入价时，它仍然是兜底（否则就成了白送）。
         assert_eq!(
-            compute_cost(Some(&usage), "some-unlisted-model", 1.0, 0.0, 0.0, 0.0, 3.75, 0.0, 0.0),
+            compute_cost(Some(&usage), "some-unlisted-model", 1.0, 0.0, 0.0, 0.0, 3.75, 0.0, 0.0, false),
             0,
             "没有输入价也没有连接价 → 0（这是另一个已知洞，此处只固定现状）"
         );
         assert_eq!(
-            compute_cost(Some(&usage), "some-unlisted-model", 1.0, 2.0, 8.0, 0.0, 3.75, 0.0, 0.0),
+            compute_cost(Some(&usage), "some-unlisted-model", 1.0, 2.0, 8.0, 0.0, 3.75, 0.0, 0.0, false),
             375,
             "只有连接级输入价时，连接级缓存价仍然兜底"
         );
@@ -8769,7 +8786,7 @@ mod billing_tests {
         // 连接级缓存价传 0（没手填）。100 万写入 token、倍率 1 → 应当按实时 $9 = 900 分，
         // 不是推算的 500 分。
         assert_eq!(
-            compute_cost(Some(&write_usage), "cache-live-model", 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0),
+            compute_cost(Some(&write_usage), "cache-live-model", 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, false),
             900,
             "没手填缓存价时应当用实时目录 $9，而不是推算的 1.25×$4=$5"
         );
@@ -8780,10 +8797,53 @@ mod billing_tests {
         });
         // 缓存读实时价 $0.5 → 50 分；推算是 0.1×$4 = $0.4 = 40 分。
         assert_eq!(
-            compute_cost(Some(&read_usage), "cache-live-model", 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0),
+            compute_cost(Some(&read_usage), "cache-live-model", 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, false),
             50,
             "缓存读也要用实时 $0.5，而不是推算的 $0.4"
         );
+    }
+
+    /// 便宜模式（灰产/便宜渠道）：最贵的缓存写入降到和缓存读同一个便宜价，普通输入照常，
+    /// 缓存读的折扣照留。保证「关」永远 ≤「开」。用户 2026-08-18 要的开关。
+    #[test]
+    fn cheap_cache_mode_drops_write_to_read_price() {
+        seed_catalog();
+        use crate::model_catalog::{seed_for_test, Entry};
+        seed_for_test(&[(
+            "cheap-test-model",
+            Entry {
+                input_price: Some(5.0),
+                output_price: Some(25.0),
+                cache_read_price: Some(0.5),   // 0.1×
+                cache_write_price: Some(6.25), // 1.25×（贵）
+                ..Entry::default()
+            },
+        )]);
+        let write_usage = serde_json::json!({
+            "input_tokens": 1, "output_tokens": 0,
+            "cache_read_input_tokens": 0, "cache_creation_input_tokens": 1_000_000,
+        });
+        // 开（cheap=false）：100 万缓存写 × $6.25 = 625 分。
+        assert_eq!(
+            compute_cost(Some(&write_usage), "cheap-test-model", 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, false),
+            625,
+            "开缓存模式应按真实写入价 $6.25 收"
+        );
+        // 关（cheap=true）：写入降到读价 $0.5 = 50 分。便宜 12.5 倍。
+        assert_eq!(
+            compute_cost(Some(&write_usage), "cheap-test-model", 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, true),
+            50,
+            "关缓存模式应把写入降到缓存读价 $0.5"
+        );
+        // 缓存**读**在两种模式下都便宜、都一样（关模式不动读的折扣）。
+        let read_usage = serde_json::json!({
+            "input_tokens": 1, "output_tokens": 0,
+            "cache_read_input_tokens": 1_000_000, "cache_creation_input_tokens": 0,
+        });
+        let read_on = compute_cost(Some(&read_usage), "cheap-test-model", 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, false);
+        let read_off = compute_cost(Some(&read_usage), "cheap-test-model", 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, true);
+        assert_eq!(read_on, read_off, "缓存读在开/关两种模式下应当一致（都便宜）");
+        assert_eq!(read_on, 50, "缓存读 $0.5 = 50 分");
     }
 
     /// 加价模型：你把输入价从目录的 $5 覆盖成 $15（3×），缓存价必须跟着放大到 3×，
@@ -8811,13 +8871,13 @@ mod billing_tests {
         });
         // 缓存写：倍率 1.25 × 你的 $15 = $18.75 = 1875 分。照搬目录只有 625 分（少收 3×）。
         assert_eq!(
-            compute_cost(Some(&write_usage), "markup-model", 1.0, 0.0, 0.0, 0.0, 0.0, 15.0, 25.0),
+            compute_cost(Some(&write_usage), "markup-model", 1.0, 0.0, 0.0, 0.0, 0.0, 15.0, 25.0, false),
             1875,
             "加价模型的缓存写没跟着放大——按成本价收了，少收 3 倍"
         );
         // 不加价（off_in 就用目录 $5）时，倍率 × 输入 = 目录绝对值，结果不变（625 分）。
         assert_eq!(
-            compute_cost(Some(&write_usage), "markup-model", 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0),
+            compute_cost(Some(&write_usage), "markup-model", 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, false),
             625,
             "不加价时应当正好等于目录绝对值"
         );
@@ -8845,7 +8905,7 @@ mod billing_tests {
         });
         // 100 万缓存读 × 真实 $0.2 = 20 分；写死 0.1 只会算 10 分。
         assert_eq!(
-            compute_cost(Some(&read_usage), "ratio-model", 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0),
+            compute_cost(Some(&read_usage), "ratio-model", 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, false),
             20,
             "没用目录的真实倍率 0.2，用了写死的 0.1"
         );
@@ -8861,7 +8921,7 @@ mod billing_tests {
         });
         // claude-fable-5 输入价 $10、目录无缓存价 → 推算写入 1.25×$10 = $12.5 = 1250 分。
         assert_eq!(
-            compute_cost(Some(&usage), "claude-fable-5", 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0),
+            compute_cost(Some(&usage), "claude-fable-5", 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, false),
             1250,
             "目录没有缓存价时，仍按输入价 × 倍数兜底"
         );
@@ -8881,7 +8941,8 @@ mod billing_tests {
                 0.0,
                 0.0,
                 0.0,
-                0.0
+                0.0,
+                false,
             ),
             48
         ); // ×3
@@ -8895,7 +8956,8 @@ mod billing_tests {
                 0.0,
                 0.0,
                 0.0,
-                0.0
+                0.0,
+                false,
             ),
             16
         ); // ×1 = real cost
@@ -8909,7 +8971,8 @@ mod billing_tests {
                 0.0,
                 0.0,
                 0.0,
-                0.0
+                0.0,
+                false,
             ),
             32
         ); // ×2
@@ -8945,6 +9008,7 @@ mod billing_tests {
                 6.25,
                 0.0,
                 0.0,
+                false,
             ),
             72
         );
@@ -8970,7 +9034,7 @@ mod billing_tests {
         seed_catalog();
         let usage = json!({"prompt_tokens": 22000, "completion_tokens": 2000});
         assert_eq!(
-            compute_cost(Some(&usage), "gpt-5.5", 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0),
+            compute_cost(Some(&usage), "gpt-5.5", 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, false),
             17
         );
     }
@@ -8993,7 +9057,8 @@ mod billing_tests {
                 0.0,
                 0.0,
                 0.0,
-                0.0
+                0.0,
+                false,
             ),
             0
         );
@@ -9007,7 +9072,8 @@ mod billing_tests {
                 0.0,
                 0.0,
                 0.0,
-                0.0
+                0.0,
+                false,
             ),
             // 1 而不是 3：旧硬编码表把 deepseek-v4-flash 写成 0.14/0.28，真实价是
             // 0.06146/0.12292（便宜一半多）。这条测试原本钉的是那个错价算出来的数。
@@ -9031,7 +9097,8 @@ mod billing_tests {
                 0.0,
                 0.0,
                 0.0,
-                0.0
+                0.0,
+                false,
             ),
             6
         );
@@ -9046,7 +9113,8 @@ mod billing_tests {
                 0.0,
                 0.0,
                 0.0,
-                0.0
+                0.0,
+                false,
             ),
             0
         );
@@ -9068,7 +9136,8 @@ mod billing_tests {
                 0.0,
                 0.0,
                 1.0,
-                2.0
+                2.0,
+                false,
             ),
             3
         );
@@ -9082,7 +9151,8 @@ mod billing_tests {
                 0.0,
                 0.0,
                 1.0,
-                2.0
+                2.0,
+                false,
             ),
             8
         ); // ×3 → 7.8→8
@@ -9097,7 +9167,8 @@ mod billing_tests {
                 0.0,
                 0.0,
                 0.0,
-                0.0
+                0.0,
+                false,
             ),
             16
         );
@@ -10026,7 +10097,7 @@ mod billing_tests {
     #[test]
     fn no_usage_is_zero() {
         assert_eq!(
-            compute_cost(None, "claude-opus-4-8", 3.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0),
+            compute_cost(None, "claude-opus-4-8", 3.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, false),
             0
         );
         assert_eq!(
@@ -10039,7 +10110,8 @@ mod billing_tests {
                 0.0,
                 0.0,
                 0.0,
-                0.0
+                0.0,
+                false,
             ),
             0
         );
@@ -10137,7 +10209,8 @@ mod billing_tests {
                 0.0,
                 0.0,
                 0.0,
-                0.0
+                0.0,
+                false,
             ),
             16
         );
@@ -10160,7 +10233,8 @@ mod billing_tests {
                 0.0,
                 0.0,
                 0.0,
-                0.0
+                0.0,
+                false,
             ),
             1
         );
@@ -10181,7 +10255,8 @@ mod billing_tests {
                 0.0,
                 0.0,
                 0.0,
-                0.0
+                0.0,
+                false,
             ),
             5000
         );
@@ -10205,7 +10280,8 @@ mod billing_tests {
                 0.0,
                 0.0,
                 0.0,
-                0.0
+                0.0,
+                false,
             ),
             48
         );
@@ -10386,6 +10462,7 @@ mod cache_price_tests {
             6.5,
             0.0,
             0.0,
+            false,
         );
         assert_eq!(c, 2, "explicit cache prices: got {}", c);
         // with cache prices = 0 → falls back to factors (read 0.1*5=0.5, write 1.25*5=6.25)
@@ -10400,6 +10477,7 @@ mod cache_price_tests {
             0.0,
             0.0,
             0.0,
+            false,
         );
         assert_eq!(c2, 2, "factor fallback: got {}", c2);
     }
@@ -10484,6 +10562,7 @@ data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_d
             0.0,
             0.0,
             0.0,
+            false,
         );
         assert_eq!(cost, 0);
     }
@@ -12500,6 +12579,7 @@ async fn bill_vision_call(
         vconn.cache_create_price,
         model_in,
         model_out,
+        crate::settings::cache_billing_cheap(),
     );
     // 单独打标，和聊天、压缩三者在用量表里分得开。
     let mut tokens = extract_bill_tokens(usage.filter(|_| reported), "michael-vision/gpt-5.5", !reported);
@@ -12528,6 +12608,7 @@ async fn bill_compression_call(
         conn.cache_create_price,
         model_in,
         model_out,
+        crate::settings::cache_billing_cheap(),
     );
     let mut tokens = extract_bill_tokens(
         usage.filter(|_| reported),
