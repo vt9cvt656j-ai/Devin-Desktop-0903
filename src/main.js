@@ -2467,6 +2467,8 @@ monacoEditor.onDidChangeModelContent((e) => {
   if (_punctFixing || _imeComposing) return;
   const model = monacoEditor.getModel();
   if (!model) return;
+  // 和其它自动修正一致：智能体流式预览的半截内容不归改标点的管，它由诊断+修复循环自己负责。
+  if (_autoFixSuppressed(model)) return;
   const lang = model.getLanguageId();
   if (lang === "markdown" || lang === "plaintext") return;
 
@@ -2490,6 +2492,23 @@ monacoEditor.onDidChangeModelContent((e) => {
         line = startLine + newlines;
         col = idx - before.lastIndexOf("\n");
       }
+      // 只在**代码位置**上改。字符串和注释里的中文标点是内容，不是笔误。
+      //
+      // 这条链路原来一个位置守卫都没有（同文件其它自动修正都调 _isInString），后果最重的
+      // 是引号：`“”‘’` 会被换成 `"` / `'`，于是在 .js 里写一句中文文案——
+      //
+      //     const msg = "他说：“你好”";   →   const msg = "他说:"你好"";
+      //
+      // ——字符串字面量当场被截断，语法错误。轻一点的是 `，。；：（）！？` 被换成半角，
+      // 用户面向界面的中文文案被静默改写。而且它没有防抖、即时生效，`e.changes` 也包含
+      // 粘贴，所以贴一段中文文档进来会被整段改掉。
+      //
+      // 改完之后这个功能反而更准了：留下的正是「本该是英文标点却打成全角」的场景，
+      // 比如 `if (a == b)：`、`foo（）`。
+      const lineText = model.getLineContent(line);
+      const trimmed = lineText.trimStart();
+      if (trimmed.startsWith("//") || trimmed.startsWith("#") || trimmed.startsWith("*") || trimmed.startsWith("--")) continue;
+      if (_isInString(lineText, col - 1)) continue;
       edits.push({
         range: new monaco.Range(line, col, line, col + 1),
         text: _CN_PUNCT_MAP[match[0]],
@@ -68306,17 +68325,32 @@ async function replaceInFiles(replaceAll) {
   const replacement = replaceInputEl.value;
   if (!query || !rootPath) return;
 
+  // 每一条失败都要能说出来。这个函数原来只有成功路径会 ++，失败全部落进空 catch：
+  // 搜索失败 → 直接 return（点了按钮什么都没发生）；读文件失败 → continue；文件有未保存
+  // 改动 → continue；CAS 冲突时那句精心写好的「编辑期间内容变化，替换已撤销」被
+  // `catch { /* skip */ }` 原地吃掉。最后 `if (totalCount > 0)` 还没有 else——**全部失败时
+  // 连一个 toast 都不弹**。
+  //
+  // 于是用户看到「已替换 40 处 / 8 个文件」，实际有几个文件根本没写进去，带着半改的代码
+  // 去提交；或者按钮点下去毫无反应，看起来像坏了。跨文件替换是不可逆的批量操作，
+  // 谎报成功比失败本身严重。
   let totalCount = 0, fileCount = 0;
+  const skippedDirty = [];   // 有未保存改动，故意不动
+  const failed = [];         // { rel, why }
   let files;
   try {
     files = await backend.searchInProject(rootPath, query, searchCaseSensitive);
-  } catch { return; }
+  } catch (e) {
+    showToast(`替换没能开始：搜索失败（${String(e?.message || e).slice(0, 80)}）`);
+    return;
+  }
 
   for (const f of files) {
     if (!replaceAll && totalCount > 0) break;
     const filePath = _coherentFilePath(f.path);
     let content;
-    try { content = await backend.readTextFile(filePath); } catch { continue; }
+    try { content = await backend.readTextFile(filePath); }
+    catch (e) { failed.push({ rel: f.rel || filePath, why: `读不出来（${String(e?.message || e).slice(0, 60)}）` }); continue; }
     const regex = searchCaseSensitive
       ? new RegExp(query.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "g")
       : new RegExp(query.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "gi");
@@ -68324,7 +68358,9 @@ async function replaceInFiles(replaceAll) {
     if (newContent !== content) {
       try {
         const open = openFiles.get(filePath);
-        if (open?.dirty) continue;
+        // 跳过有未保存改动的文件是对的（不该覆盖用户正在编辑的内容），但必须说出来，
+        // 否则用户以为整个项目都替换过了。
+        if (open?.dirty) { skippedDirty.push(f.rel || filePath); continue; }
         await backend.writeTextFileIfUnchanged(filePath, content, newContent);
         if (open) {
           const sync = _applyDiskContentToOpenFile(filePath, newContent);
@@ -68338,17 +68374,26 @@ async function replaceInFiles(replaceAll) {
         const count = (content.match(regex) || []).length;
         totalCount += count;
         fileCount++;
-      } catch { /* skip */ }
+      } catch (e) {
+        // 这里原来是 `catch { /* skip */ }`，把上面那句写得很清楚的冲突原因也一起吃掉了。
+        failed.push({ rel: f.rel || filePath, why: String(e?.message || e).slice(0, 60) });
+      }
     }
     if (!replaceAll) break;
   }
+
+  // 无论成败都出一条 toast——全部失败时静默是最坏的结果，用户会以为按钮坏了或者以为做完了。
+  const parts = [];
   if (totalCount > 0) {
-    showToast(replaceAll
+    parts.push(replaceAll
       ? t("search.replaced", { count: totalCount, s: totalCount === 1 ? "" : "s", files: fileCount, s2: fileCount === 1 ? "" : "s" })
-      : t("search.replacedInFile", { count: totalCount, s: totalCount === 1 ? "" : "s" })
-    );
-    runSearch();
+      : t("search.replacedInFile", { count: totalCount, s: totalCount === 1 ? "" : "s" }));
   }
+  if (skippedDirty.length) parts.push(`跳过 ${skippedDirty.length} 个有未保存改动的文件（${skippedDirty.slice(0, 3).join("、")}${skippedDirty.length > 3 ? " 等" : ""}）`);
+  if (failed.length) parts.push(`${failed.length} 个失败：${failed.slice(0, 2).map((x) => `${x.rel}（${x.why}）`).join("；")}${failed.length > 2 ? " 等" : ""}`);
+  if (!parts.length) parts.push(`没有替换任何内容——${files.length ? "命中的文件都没能写入" : "没有匹配的文件"}`);
+  showToast(parts.join(" · "));
+  if (totalCount > 0) runSearch();
 }
 
 replaceSingleBtn.addEventListener("click", () => replaceInFiles(false));

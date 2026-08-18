@@ -27824,3 +27824,37 @@ test("edit_file 的空白容错不许把 Python 代码块挪进/挪出一层缩�
       "缩进容错命中却没返回要补回的公共前缀——调用方会按模型的缩进写入，把代码挪出 if");
   }
 });
+
+test("中文标点重写只许动代码位置，不许动字符串和注释里的内容", () => {
+  // 这条链路（onDidChangeModelContent 里的 _CN_PUNCT_MAP 全表替换）原来一个位置守卫都没有，
+  // 而同文件其它自动修正都调 _isInString。最重的后果是引号：`“”` 会被换成 `"`，于是
+  //     const msg = "他说：“你好”";  ->  const msg = "他说:"你好"";
+  // 字符串字面量当场被截断。轻一点的是中文文案/注释里的标点被静默改成半角。
+  // 它还没有防抖、即时生效，且 e.changes 包含粘贴——贴一段中文文档进来会被整段改掉。
+  const i = SRC.indexOf("const _CN_PUNCT_MAP");
+  const seg = SRC.slice(i, SRC.indexOf("// ---- Smart Rename", i));
+  assert.match(seg, /if \(_isInString\(lineText, col - 1\)\) continue;/,
+    "字符串里的中文标点必须跳过——否则中文文案里的引号会截断字符串字面量");
+  assert.match(seg, /trimmed\.startsWith\("\/\/"\)/,
+    "注释行必须跳过——注释里的中文标点是内容不是笔误");
+  assert.match(seg, /if \(_autoFixSuppressed\(model\)\) return;/,
+    "智能体流式预览的半截内容不该被改标点，和其它自动修正保持一致");
+});
+
+test("跨文件替换必须如实报告失败，不许静默跳过或谎报成功", () => {
+  // 原来只有成功路径会 ++，失败全部落进空 catch：搜索失败直接 return（点了没反应）、
+  // 读文件失败 continue、有未保存改动 continue、CAS 冲突那句写好的原因被 `catch { /* skip */ }`
+  // 吃掉；最后 `if (totalCount > 0)` 没有 else，**全部失败时一条 toast 都不弹**。
+  // 用户看到「已替换 40 处」却有文件没写进去，带着半改的代码去提交。
+  const i = SRC.indexOf("async function replaceInFiles");
+  const fn = SRC.slice(i, SRC.indexOf("\nasync function ", i + 10));
+  // 正面断言实现，别写成"源码里不许出现空 catch"——上面那段解释注释里就引用了那个写法，
+  // doesNotMatch 会被自己的注释喂到而误红（这一轮已经踩过一次）。
+  assert.match(fn, /catch \(e\) \{[\s\S]{0,400}?failed\.push\(/,
+    "写入失败的分支必须把原因记进 failed，而不是原地吞掉");
+  assert.match(fn, /const failed = \[\]/, "没有记录失败项");
+  assert.match(fn, /const skippedDirty = \[\]/, "没有记录被跳过的脏文件");
+  // 关键：toast 必须无条件发出，不能再挂在 totalCount > 0 上。
+  assert.match(fn, /if \(!parts\.length\) parts\.push/, "全部失败时没有兜底文案");
+  assert.match(fn, /\n  showToast\(parts\.join/, "toast 必须无条件发出——全失败时静默是最坏的结果");
+});
