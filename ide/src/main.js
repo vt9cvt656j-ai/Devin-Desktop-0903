@@ -444,10 +444,20 @@ async function tauriBackend() {
     renamePath: (from, to) => core.invoke("rename_path", { from, to }),
     deletePath: (path) => core.invoke("delete_path", { path }),
     searchInProject: async (root, query, caseSensitive, mode = "literal") => {
-      const results = await core.invoke("search_in_project", { root, query, caseSensitive, mode });
-      return Array.isArray(results)
-        ? results.map((result) => (result && typeof result.path === "string" ? { ...result, path: _toPosix(result.path) } : result))
-        : results;
+      const raw = await core.invoke("search_in_project", { root, query, caseSensitive, mode });
+      // 后端现在回的是 { files, scanned_files, truncated }。这里摊回数组，既有调用方
+      // （UI 两处、智能体工具执行器、知识库检索）一行都不用改；截断信息挂在数组对象上
+      // ——数组也是对象，`Array.isArray` 仍为真、`.length`/`.map` 全照旧。
+      //
+      // 为什么非要把 truncated 带出来：遍历会在 2000 条命中或 20000 个文件处 break，
+      // 在此之前这个事实没有出口，「搜完了」和「没搜完」返回的东西一模一样。大仓里
+      // 就会出现**假阴性**——符号明明在，界面说没有。
+      const results = Array.isArray(raw) ? raw : (raw?.files ?? []);
+      const mapped = results.map((result) =>
+        result && typeof result.path === "string" ? { ...result, path: _toPosix(result.path) } : result);
+      mapped.truncated = !Array.isArray(raw) && !!raw?.truncated;
+      mapped.scannedFiles = Array.isArray(raw) ? undefined : raw?.scanned_files;
+      return mapped;
     },
     gitStatus: (root) => core.invoke("git_status", { root }),
     gitWorktreeAdd: (root, name) => core.invoke("git_worktree_add", { root, name }),
@@ -11345,13 +11355,20 @@ async function runSearch() {
 
 function renderSearchResults(files, metaEl, resultsEl) {
   resultsEl.innerHTML = "";
+  // 搜索被上限截断时必须说出来。「没有结果」和「没搜完，已搜的部分没有结果」对开发者
+  // 是完全不同的两件事：前者可以据此断定项目里没有，后者据此断定就是错的。
+  // 大仓里扫到第 20000 个文件就 break，而在此之前界面照样只说「没有结果」。
+  const _truncated = !!files?.truncated;
+  const _note = _truncated ? "（未搜完，已达上限）" : "";
   if (!files.length) {
-    metaEl.textContent = t("search.noResults");
+    metaEl.textContent = _truncated
+      ? t("search.noResults") + " —— 但这次没搜完（已达扫描上限），不代表项目里没有。缩小范围或换更具体的词再试。"
+      : t("search.noResults");
     return;
   }
   let total = 0;
   for (const f of files) total += f.matches.length;
-  metaEl.textContent = t("search.resultsMeta", { total, s1: total === 1 ? "" : "s", files: files.length, s2: files.length === 1 ? "" : "s" });
+  metaEl.textContent = t("search.resultsMeta", { total, s1: total === 1 ? "" : "s", files: files.length, s2: files.length === 1 ? "" : "s" }) + _note;
   for (const f of files) {
     const group = document.createElement("div");
     group.className = "sr-group";
@@ -55134,8 +55151,18 @@ async function _executeToolStepInner(step, call, root, run) {
         try { dir = String((await backend.homeDir?.()) || "").replace(/\/+$/, "") + dir.slice(1); } catch {}
       }
       try {
-        const hits = await backend.invoke("search_in_project", { root: dir, query: q, caseSensitive: false, mode: "text" });
-        const files = Array.isArray(hits) ? hits : [];
+        // mode 必须是 "literal" 或 "regex"。这里原本写的是 "text"——后端
+        // （files.rs:1983）对认不出的 mode 直接返回 [INVALID_SEARCH_MODE]，于是**每一次**
+        // 知识库检索都抛异常、100% 失败；而下面 catch 的文案把原因说成「确认目录存在且可读」，
+        // 把一个拼错的常量伪装成用户的目录配错了。用户按文案去查目录，永远查不出问题。
+        //
+        // 用户输入的是自然语言检索词，不是正则，所以是 literal（后端会 regex::escape）。
+        const hits = await backend.invoke("search_in_project", { root: dir, query: q, caseSensitive: false, mode: "literal" });
+        // 这里走的是裸 invoke（不是 backend.searchInProject 那个包装），所以拿到的是
+        // 后端原始的 { files, truncated }。只写 `Array.isArray(hits) ? hits : []` 会在
+        // 新形状下**恒取到空数组**——检索永远"没找到"，而且不报错。
+        const files = Array.isArray(hits) ? hits : (hits?.files ?? []);
+        const _truncated = !Array.isArray(hits) && !!hits?.truncated;
         const total = files.reduce((n, f) => n + (f?.matches?.length || 0), 0);
         res.className = total ? "atc-result atc-result--ok" : "atc-result atc-result--err";
         res.textContent = total ? `${total} 处` : "没找到";
@@ -55148,13 +55175,28 @@ async function _executeToolStepInner(step, call, root, run) {
         if (vp) vp.innerHTML = `<pre>${_escHtml(lines.slice(0, 40).join("\n") || "（没有命中）")}</pre>`;
         return {
           type: "knowledge", path: def.name, ok: total > 0,
+          // 截断必须告诉模型。否则它拿着一份不完整的结果，会像人一样得出
+          // 「这个库里没有」的结论，然后基于这个错误前提继续往下做。
           content: total
             ? `知识库「${def.name}」检索「${q}」，命中 ${total} 处（目录 ${dir}）：\n${lines.slice(0, 40).join("\n")}`
-            : `知识库「${def.name}」里没有找到「${q}」（目录 ${dir}）。换个说法再试一次，或者确认这份资料确实在这个库里。`,
+              + (_truncated ? `\n\n注意：这次检索**没有搜完**（触到扫描上限就停了），以上不是全部命中。想找的东西没出现在里面时，请缩小检索范围或换更具体的词，不要据此断定它不存在。` : "")
+            : (_truncated
+              ? `知识库「${def.name}」检索「${q}」**没有搜完**就触到了扫描上限，已搜过的部分里没有命中（目录 ${dir}）。这**不等于**这个库里没有——请换更具体的词或缩小范围再试。`
+              : `知识库「${def.name}」里没有找到「${q}」（目录 ${dir}）。换个说法再试一次，或者确认这份资料确实在这个库里。`),
         };
       } catch (e) {
         res.className = "atc-result atc-result--err"; res.textContent = "检索失败";
-        return { type: "knowledge", path: def.name, content: `[失败] 知识库「${def.name}」检索出错：${String(e?.message || e).slice(0, 200)}（确认目录 ${dir} 存在且可读）` };
+        // 别替后端猜原因。原来这里无条件补一句「确认目录存在且可读」，把**任何**失败都
+        // 说成目录问题——上面那个 mode 拼错的 bug 之所以能活这么久，就是因为它一直在
+        // 指着一个没问题的目录喊。后端的错误码已经说清是什么了，照实转述；只有确实
+        // 像路径问题时才提目录。
+        const _msg = String(e?.message || e);
+        const _looksLikePath = /No such file|not found|os error 2|不存在|Permission denied|os error 13/i.test(_msg);
+        return {
+          type: "knowledge", path: def.name,
+          content: `[失败] 知识库「${def.name}」检索出错：${_msg.slice(0, 200)}`
+            + (_looksLikePath ? `（确认目录 ${dir} 存在且可读）` : ""),
+        };
       }
 
     } else if (call.type === "http" || call.type === "userhttp") {
