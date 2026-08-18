@@ -13707,35 +13707,10 @@ function _nativeWindowsFor(modelId) {
   const all = listed.length ? listed : (fallback ? [fallback] : []);
   return [...new Set(all)].sort((a, b) => b - a);
 }
-/** 存下来的那个数落到**当前还买得到**的档位上；落不上就取不超过它的最大一档。
- *
- *  会员从 M5 降到 M1 之后，存着的「5M」档（原生 96,890 + 5M）既不在选项里、也拿不到：
- *  卡片按值找高亮找不到就回退到第 0 格（显示 96.9k），而预算仍按夹取后的 2,000,000 算——
- *  显示的和用的差 20 倍，而且那个值网关根本给不到。归位之后两边永远落在同一格。
- */
-function _ctxSnapToOpenChoice(modelId, stored) {
-  const want = Math.max(0, Math.round(Number(stored) || 0));
-  if (!want) return 0;
-  // **收窄永远算数，不需要任何资格。** 比默认窗口更小的选择是纯粹的成本旋钮，任何时候都
-  // 交付得了。上一版少了这一条，于是存着的 200k（在一个 1M 模型上）既不在选项表里、
-  // 又没有更小的可选档，fits 为空返回 0，而 0 被 _ctxChoiceFor 翻译成"没选过" → 满窗 1M。
-  // 用户明明调窄了，读数却被放大 5 倍，而且永不自愈、界面不给任何提示。
-  // v1 记录迁移过来正好会造出这条坏记录。
-  const dflt = _ctxNativeDefault(modelId);
-  if (want <= dflt) return want;
-  const open = _ctxChoiceOptions(modelId).filter((o) => !o.locked).map((o) => Math.round(o.value));
-  if (open.includes(want)) return want;
-  // 放宽超出当前买得到的范围时才向下吸附；一个都不剩就退回默认窗口（不是 0——0 会被
-  // 上层当成"没选过"）。
-  const fits = open.filter((v) => v > 0 && v <= want);
-  return fits.length ? Math.max(...fits) : dflt;
-}
-/**
- * 用户选中的**窗口**（token）。0 = 没选过，按目录默认走。
- *
- * 只认窗口那条轴：档位（tier）归 _ctxTierChoice 管，它不是窗口，混进来就会让仪表分母
- * 变成"原生 + 档位"那个谁也认不出的数（用户实拍：选 2M 得到 2,096,890）。
- */
+// （_ctxSnapToOpenChoice 已删除：窗口和留存档位拆成两条轴之后，窗口那侧改成"目录还列着
+//   就照用、不列了退回默认"，档位那侧在 _ctxTierChoice 里按会员自己归位——它没有消费者了。
+//   留着的死代码 + 还在直接测它的测试，正是本仓库反复出现的"测试全绿、功能是死的"那个模式。）
+
 function _ctxChoiceFor(modelId) {
   const rec = _ctxChoiceRecord(modelId);
   if (!rec) return 0;

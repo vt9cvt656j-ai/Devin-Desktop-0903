@@ -25804,29 +25804,25 @@ test("原生档一律可选——滑块不能只剩一格", () => {
     "原生档被锁了 —— 那是按 beta 判的，而线上一条 beta 都没有");
 });
 
-test("收窄永远算数——存着的窄窗口不许被放大回满窗", () => {
-  // 这条最要命：存 200k（在一个 1M 模型上），上一版既不在选项表里、又没有更小的可选档，
-  // fits 为空返回 0，而 0 被 _ctxChoiceFor 当成"没选过" → 满窗 1M。用户明明调窄了，
-  // 读数却被放大 5 倍，永不自愈、界面没有任何提示。v1 记录迁移过来正好会造出这条坏记录。
-  const env = {
+test("收窄永远算数——窗口那条轴直接认目录里列着的值", () => {
+  // 旧实现（_ctxSnapToOpenChoice）会把"不在选项表里"的窄窗口吸附掉，一个都不剩时返回 0，
+  // 而 0 被上层当成"没选过"→ 满窗：用户明明调窄了，读数却被放大 5 倍。
+  // 两条轴拆开之后这段逻辑没有了——窗口那侧只问"目录还列着这个值吗"，收窄天然成立。
+  const win = (rec, listed) => load("_ctxChoiceFor", {
+    _ctxChoiceRecord: () => rec,
     _modelContextLimit: () => 1_000_000,
     _ctxNativeDefault: () => 1_000_000,
-    _ctxNativeCeiling: () => 1_000_000,
-    _modelCatalogEntry: () => ({ contextLimit: 1_000_000, contextWindows: [{ tokens: 1_000_000, beta: null }] }),
-    _michaelUser: null,
-    _gatewayHandlesCompression: () => false,
-    _tokenShort: (n) => String(n),
-    _MC_TIER_OPTIONS: [["1M", 1_000_000]],
-  };
-  const snap = load("_ctxSnapToOpenChoice", {
-    ...env,
-    _ctxChoiceOptions: load("_ctxChoiceOptions", env),
-  });
-  assert.equal(snap("m", 200_000), 200_000, "收窄被丢掉了 —— 读数会被放大 5 倍");
-  assert.equal(snap("m", 1_000_000), 1_000_000);
-  assert.equal(snap("m", 0), 0, "没存过就是没存过");
-  // 放宽超出买得到的范围才吸附；一个都不剩要退回默认窗口，不能返回 0（0 会被当成没选过）。
-  assert.equal(snap("m", 9_000_000), 1_000_000);
+    _modelCatalogEntry: () => ({ contextLimit: 1_000_000 }),
+    _nativeWindowsFor: () => listed,
+  })("m");
+  assert.equal(win({ kind: "native", tokens: 200_000 }, [1_000_000, 200_000]), 200_000,
+    "目录里列着的窄窗口必须原样生效");
+  assert.equal(win({ kind: "modified", tokens: 200_000 }, [1_000_000]), 200_000,
+    "老格式的收窄记录（<= 默认窗口）也要留住，不能被当成档位丢掉");
+  assert.equal(win({ kind: "native", tokens: 777_777 }, [1_000_000]), 0,
+    "目录不再列出的值退回默认，而不是钉死一个交付不了的数");
+  // 而且这条链上不该再有那个已删掉的吸附器 —— 它没有消费者，留着就是"测试全绿、功能是死的"。
+  assert.ok(!/function _ctxSnapToOpenChoice\(/.test(SRC), "死函数又回来了");
 });
 
 test("滑轨上两条轴要分得开：窗口在左、档位在右，档位带「档」字", () => {
