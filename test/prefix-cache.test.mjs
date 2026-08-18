@@ -612,14 +612,17 @@ test("the account dropdown shows the same identity and avatar as the card", () =
 });
 
 const ctxInput = load("_contextInputTokens", ["_contextInputTokens"]);
-const applyReading = load("_applyContextReading", ["_applyContextReading"]);
+// _applyContextReading 现在会把"上游报过读了多少"记成这个模型窗口的实测下限；
+// 这一族测试只关心读数本身，把落盘那一步桩掉。
+const applyReading = new Function("_noteCtxSeen",
+  `${grab("_applyContextReading")}\nreturn _applyContextReading;`)(() => {});
 const readingForStorage = load("_ctxReadingForStorage", ["_ctxReadingForStorage"]);
 const readingFromStorage = load("_ctxReadingFromStorage", ["_ctxReadingFromStorage"]);
 // 单窗口模型：目录里就一条、且不带 beta，所以够得着的上限 = 默认窗口。
 const meterLimit = (native, choice) => new Function(
-  "_modelContextLimit", "_ctxChoiceFor", "_nativeWindowsFor", "_modelCatalogEntry",
+  "_modelContextLimit", "_ctxChoiceFor", "_nativeWindowsFor", "_modelCatalogEntry", "_ctxSeenMax",
   `${grab("_ctxNativeCeiling")}\n${grab("_ctxNativeDefault")}\n${grab("_contextMeterLimit")}\nreturn _contextMeterLimit("m");`,
-)(() => native, () => choice, () => [native], () => ({ contextWindows: [{ tokens: native, beta: null }] }));
+)(() => native, () => choice, () => [native], () => ({ contextWindows: [{ tokens: native, beta: null }] }), () => 0);
 
 test("context counts the cached prompt, which is where the whole conversation lives", () => {
   // This is why the meter looked frozen. Anthropic reports `input_tokens` EXCLUDING everything
@@ -739,7 +742,10 @@ test("the percentage measures the window the model reads, so it can actually mov
 
   // An explicit window choice is a real narrowing and counts; it cannot exceed what the model reads.
   assert.equal(meterLimit(200_000, 64_000), 64_000);
-  assert.equal(meterLimit(200_000, 5_000_000), 200_000);
+  // 不再夹到原生窗口：用户显式点的档位原样生效。夹取用的上限来自目录，而目录对某些模型
+  // 根本没有窗口数据（glm-5.3 就是），夹的就是一个猜出来的数——等于用猜测否决用户的选择，
+  // 而这个值现在还会随 x-ide-context-window 发给网关、压缩真按它切。
+  assert.equal(meterLimit(200_000, 5_000_000), 5_000_000, "用户点的档位没原样生效");
   assert.equal(meterLimit(0, 0), 1, "an unknown model still divides by something");
 
   // The tier stays visible, in the tooltip. An earlier build divided by the native window and a
@@ -928,15 +934,21 @@ test("the paid tier stacks on the model's own window, in the client as in the ga
   // so on any 1M-native model every tier resolved back to 1M: the whole row was a no-op and the
   // top tier a subscriber pays for could never light up. The two lines disagreed by construction.
   const eff = (native, tierMax, choice) => new Function(
-    "_modelContextLimit", "_nativeWindowsFor", "_michaelUser", "_gatewayHandlesCompression", "_ctxChoiceFor", "_modelCatalogEntry",
+    "_modelContextLimit", "_nativeWindowsFor", "_michaelUser", "_gatewayHandlesCompression", "_ctxChoiceFor", "_modelCatalogEntry", "_ctxSeenMax",
     `${grab("_ctxNativeCeiling")}\n${grab("_ctxNativeDefault")}\n${grab("_effectiveContextLimit")}\nreturn _effectiveContextLimit("m");`,
   )(() => native, () => [native], { michael_compression: { max_input_tokens: tierMax } }, () => tierMax > 0, () => choice,
-    () => ({ contextWindows: [{ tokens: native, beta: null }] }));
+    () => ({ contextWindows: [{ tokens: native, beta: null }] }), () => 0);
 
   assert.equal(eff(1_000_000, 5_000_000, 0), 6_000_000, "1M native + a 5M tier is 6M, not 5M");
   assert.equal(eff(1_000_000, 5_000_000, 6_000_000), 6_000_000, "the top tier must be reachable");
   assert.equal(eff(200_000, 1_000_000, 1_200_000), 1_200_000);
-  assert.equal(eff(1_000_000, 0, 6_000_000), 1_000_000, "no membership → never a fictional window");
+  // 「会员没了就不该产生一个虚构窗口」这道防线现在在 _ctxChoiceFor 那一层（归位到当前
+  // 买得到的档），不在这里 —— 本函数里用户显式点的档位一律原样生效，因为夹取用的上限
+  // 来自目录，而目录对某些模型根本没有数据（glm-5.3 就是），夹的就是一个猜测。
+  // 这条测试把 _ctxChoiceFor 整个桩掉了（() => choice），在这儿断言测不到那道防线。
+  // 归位本身由 logic.test.mjs 的「会员降档之后…」和「收窄永远算数…」两条覆盖。
+  assert.equal(eff(1_000_000, 0, 6_000_000), 6_000_000,
+    "用户显式选的档位在这一层原样生效；防虚构窗口是 _ctxChoiceFor 的职责");
 
   const RS = fs.readFileSync("../server/src/compression.rs", "utf8");
   assert.match(RS, /pub fn capacity_for_native\(self, native: usize\) -> usize \{\s*\n\s*native\.saturating_add\(self\.max_input_tokens\(\)\)/,
