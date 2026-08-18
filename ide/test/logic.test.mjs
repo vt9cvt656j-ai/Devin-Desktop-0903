@@ -22648,6 +22648,48 @@ test("screen.capture 端到端接通：白名单、目录、图像通道", () =>
   assert.equal(effect({ type: "automation", method: "mouse.click" }), true, "点击必须仍算副作用");
 });
 
+// ── 一条命令挂了，别把后面几条也跑完 ─────────────────────────────────────
+//
+// 用户原话："一下丢好几个命令然后报错好几个……错了就及时思考用不用停止还是继续，不然就很蠢。"
+// 已有的批次闸门只覆盖"会改工作区"的命令（purpose=mutate/scaffold 或判成 workspace-write），
+// 构建 / 测试 / 运行 / 安装这些最常见、也最容易连环失败的全不在内。
+test("同一轮里前面的命令失败，后面的命令不许再跑", () => {
+  const block = load("_commandBatchBlockResult", {
+    // 忠实于真函数：`if (!call || !result) return false` —— 没有结果算**失败**。
+    // 桩要是把 null 判成成功，`rawResult != null` 那道检查就测不到了（第一版就是这么假绿的）。
+    _toolExecutionSucceeded: (call, res) => !!res && res.ok !== false,
+    _callIsReadOnlyCommand: (c) => /^(?:which|ls|cat|echo|pwd)\b/.test(String(c.command || "")),
+  });
+  const run = { mode: "agent" };
+  const item = (command, ok) => ({ call: { type: "cmd", command }, rawResult: ok === undefined ? null : { ok } });
+
+  const stopped = block(run, [item("npm run build", false), item("npm test")], 1);
+  assert.ok(stopped, "构建挂了还去跑测试——用户收到的就是一排错，还得自己分辨哪个是根因");
+  assert.match(stopped.content, /这条没有执行/);
+  assert.match(stopped.content, /npm run build/, "要指名道姓是哪条挂了");
+  assert.match(stopped.content, /一次只发一条/, "要给出下一步怎么做");
+  assert.equal(stopped.ok, false);
+
+  // 第三条同样拦住——一个错误不该滚成三个。
+  assert.ok(block(run, [item("npm run build", false), item("npm test"), item("node app.js")], 2));
+
+  // 不该拦的三种：前面成功、前面还没结果、前面只是只读探测失败。
+  assert.equal(block(run, [item("npm run build", true), item("npm test")], 1), null);
+  assert.equal(block(run, [item("npm run build"), item("npm test")], 1), null,
+    "还没跑出结果不算失败，别把正常批次拦死");
+  assert.equal(block(run, [item("which python", false), item("which node")], 1), null,
+    "只读探测失败是信息本身，不是前提塌了——一次性探环境是正当批次");
+
+  // 只对 agent 轮生效，且第一条永远放行。
+  assert.equal(block({ mode: "chat" }, [item("a", false), item("b")], 1), null);
+  assert.equal(block(run, [item("npm run build", false)], 0), null);
+});
+
+test("命令批次闸门真的接进了执行链——不是又一个零调用点", () => {
+  assert.match(SRC, /_implementationMutationBatchBlockResult\(run, items, index\)\s*\n\s*\|\| _commandBatchBlockResult\(run, items, index\)/,
+    "没接进去的话它就是个死函数，而测试照样全绿（本仓库反复踩的那个坑）");
+});
+
 test("交付事实来自执行记录，不做任何推断", () => {
   const facts = load("_deliveryFactsLine", {
     _CODE_FILE_RE: loadConst("_CODE_FILE_RE"),
