@@ -3031,12 +3031,26 @@ monacoEditor.onDidChangeModelContent(() => {
 let _autoFixTimer = null;
 const _AUTO_FIX_DEBOUNCE = 1200;
 
+// null = 认得这个双字符，但**故意不动它**（它在某些语言里是合法语法，不是手滑）。
+//
+// `;;` `..` `::` 三条原来是会改的，那是按「JS/TS/Python 里的手滑」写的规则——可
+// _fixDoublePunctuation 扫的是**整个文件的每一行**，既不看语言也不看改动范围，而
+// _runAutoCorrections 唯一的闸是「4000 行以上跳过」。于是在别的语言里它是纯破坏：
+//
+//     Rust    std::collections::HashMap  →  std:collections:HashMap
+//     Rust    for i in 0..10             →  for i in 0.10
+//     C/C++   for (;;)                   →  for (;)
+//     Lua     a .. b（字符串连接）        →  a . b
+//     PHP     Foo::bar()                 →  Foo:bar()
+//
+// 改完 1.2 秒防抖触发、0.8 秒后自动保存落盘，全程零提示零开关——用户看到的是
+// 「我就敲了个空格，怎么整个文件都红了、git diff 说我改了全文」。
 const _DOUBLE_SYMBOLS = [
-  [/;;/g, ";"],
+  [/;;/g, null],
   [/,,/g, ","],
   [/\.\.\./g, null],
-  [/\.\.(?!\.)/g, "."],
-  [/::(?!:)/g, ":"],
+  [/\.\.(?!\.)/g, null],
+  [/::(?!:)/g, null],
   [/\+\+(?!\+)/g, null],
   [/--(?!-|>)/g, null],
 ];
@@ -35624,6 +35638,34 @@ function _redactSecrets(text, opts) {
   // （跨行私钥块可编辑、双密钥同形不歧义的根基）。只在「读文件返回给模型」的路径传 map；
   // 其余调用点（日志尾部/搜索片段/展示脱敏）不传，输出与历史格式逐字一致。
   // 同一原文片段复用同一序号，重复读取编号不漂移。
+  // 这个「值」是代码，不是凭据字面量 —— 判据见下。
+  //
+  // 按名字打码的那条规则匹配的是**任何以 key/token/secret 结尾的标识符**，于是普通源码
+  // 被大面积改坏（实测 ide/src 下 26% 的文件）：
+  //     const key = styleKey(cell.s);      ->  const key = st…[REDACTED];
+  //     <li key={item.id} …>               ->  <li key={i…[REDACTED] …>
+  //     const token = parser.nextToken();  ->  const token = pa…[REDACTED];
+  // 而这份被改坏的文本正是**喂给模型**的那一份（当前打开文件、read_file 正文、所有工具
+  // 结果三条通道都过这里）。模型读到的根本不是用户的代码，却要基于它改代码。
+  //
+  // 凭据是**字面量**，不是表达式、也不是变量引用：
+  //  · 含括号/花括号/尖括号 -> 函数调用、JSX、下标
+  //  · 以运算符开头 -> `++preloadToken`
+  //  · `a.b` / `a.b.c` -> 成员路径（`process.env.API_KEY`、`item.id`）
+  //  · 纯字母 -> 变量名；真密钥几乎总带数字或分隔符，而 `password = myPassword`
+  //    里的值本来就是个变量，不该打码
+  //
+  // 定义在函数**内部**：外面那层 `catch { return text; }` 会把 ReferenceError 一起吞掉，
+  // 于是一个不在作用域里的辅助函数不会报错，只会让整段脱敏**静默失效**（真密钥照发）。
+  // 放在里面，抽出来单独跑也自洽。
+  const _valueLooksLikeCode = (v) => {
+    if (!v) return false;
+    if (/[(){}[\]<>\\]/.test(v)) return true;
+    if (/^[+\-*/!~&|=]/.test(v)) return true;
+    if (/^[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)+$/.test(v)) return true;
+    if (/^[A-Za-z_$]+$/.test(v)) return true;
+    return false;
+  };
   const map = opts && opts.map instanceof Map ? opts.map : null;
   const _mk = (orig, render) => {
     // 前一条规则的打码产物被后一条再命中（如密钥赋值行的值先被 token 规则打码）时
@@ -35642,7 +35684,8 @@ function _redactSecrets(text, opts) {
     t = t.replace(/\beyJ[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{4,}/g, (m) => _mk(m, (n) => `eyJ…[REDACTED_JWT${n}]`));
     // 任何以 KEY / SECRET / TOKEN / PASSWORD / PASSWD 结尾的标识符，不只是含 "api"
     // 的那几个 —— `STRIPE_KEY=`、`SENTRY_TOKEN=`、`DB_PASSWORD=` 此前全都漏网。
-    t = t.replace(/((?:[A-Za-z0-9_.-]*(?:secret|token|password|passwd|pwd|key)|database[_-]?url|conn(?:ection)?[_-]?string)["']?\s*[:=]\s*["']?)([^\s"'`,;]{6,})/gi, (m, k, v) => k + _mk(v, (n) => v.slice(0, 2) + `…[REDACTED${n}]`));
+    t = t.replace(/((?:[A-Za-z0-9_.-]*(?:secret|token|password|passwd|pwd|key)|database[_-]?url|conn(?:ection)?[_-]?string)["']?\s*[:=]\s*["']?)([^\s"'`,;]{6,})/gi,
+      (m, k, v) => (_valueLooksLikeCode(v) ? m : k + _mk(v, (n) => v.slice(0, 2) + `…[REDACTED${n}]`)));
     // .netrc / .authinfo 是空格分隔而不是 = 分隔，上面那条匹配不到。
     t = t.replace(/\b(password|account)\s+(\S{4,})/gi, (m, k, v) => `${k} ${_mk(v, (n) => v.slice(0, 2) + `…[REDACTED${n}]`)}`);
     // Stripe / Twilio / SendGrid / npm 等常见服务的固定前缀。
@@ -52777,7 +52820,12 @@ async function _executeToolStepInner(step, call, root, run) {
         // P1: Store redacted version in checkpoint for security — actual undo uses `old` variable,
         // not snap.current, so no impact on rollback integrity. Prevents plaintext secrets
         // from being persisted in memory checkpoints.
-        _checkpointMarkCurrent(_cp, fp, _redactSecrets(newContent));
+        // checkpoint 存**真实内容**，不能存打码后的副本。
+        // 它是内部状态、不进模型上下文；而 _revertRunChanges 用「磁盘内容 !== 记录的 current」
+        // 判断「用户事后自己改过、别覆盖他」。存打码副本的话，凡是被打码规则碰过的文件两者
+        // 必然不等 → 撤销时被跳过，UI 还打成「已撤销 N 个 · 跳过 M 个（你之后改过）」——
+        // 用户根本没碰过那些文件，撤销失败被伪装成"在保护你的编辑"。
+        _checkpointMarkCurrent(_cp, fp, newContent);
         _invalidateRead(call.path);
         _agentReadCache.set(fp, newContent); // keep cache coherent with the new content
         _resetReadProgress(run, fp, call.path);
@@ -52961,7 +53009,12 @@ async function _executeToolStepInner(step, call, root, run) {
         }
         _checkpointRecord(_cp, fp, true, old); // only successful mutations belong in revert-all
         // P1: Redact secrets in checkpoint (same rationale as single write/edit above)
-        _checkpointMarkCurrent(_cp, fp, _redactSecrets(newContent));
+        // checkpoint 存**真实内容**，不能存打码后的副本。
+        // 它是内部状态、不进模型上下文；而 _revertRunChanges 用「磁盘内容 !== 记录的 current」
+        // 判断「用户事后自己改过、别覆盖他」。存打码副本的话，凡是被打码规则碰过的文件两者
+        // 必然不等 → 撤销时被跳过，UI 还打成「已撤销 N 个 · 跳过 M 个（你之后改过）」——
+        // 用户根本没碰过那些文件，撤销失败被伪装成"在保护你的编辑"。
+        _checkpointMarkCurrent(_cp, fp, newContent);
         _invalidateRead(call.path);
         _agentReadCache.set(fp, newContent);
         _resetReadProgress(run, fp, call.path);
