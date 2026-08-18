@@ -934,21 +934,22 @@ test("the paid tier stacks on the model's own window, in the client as in the ga
   // so on any 1M-native model every tier resolved back to 1M: the whole row was a no-op and the
   // top tier a subscriber pays for could never light up. The two lines disagreed by construction.
   const eff = (native, tierMax, choice) => new Function(
-    "_modelContextLimit", "_nativeWindowsFor", "_michaelUser", "_gatewayHandlesCompression", "_ctxChoiceFor", "_modelCatalogEntry", "_ctxSeenMax",
+    "_modelContextLimit", "_nativeWindowsFor", "_michaelUser", "_gatewayHandlesCompression", "_ctxChoiceFor", "_modelCatalogEntry", "_ctxSeenMax", "_ctxTierChoice",
     `${grab("_ctxNativeCeiling")}\n${grab("_ctxNativeDefault")}\n${grab("_effectiveContextLimit")}\nreturn _effectiveContextLimit("m");`,
   )(() => native, () => [native], { michael_compression: { max_input_tokens: tierMax } }, () => tierMax > 0, () => choice,
-    () => ({ contextWindows: [{ tokens: native, beta: null }] }), () => 0);
+    () => ({ contextWindows: [{ tokens: native, beta: null }] }), () => 0, () => 0);
 
+  // 加法只发生在结算：窗口 + 档位。第三个参数现在是**窗口**那条轴（不再是合成数）。
   assert.equal(eff(1_000_000, 5_000_000, 0), 6_000_000, "1M native + a 5M tier is 6M, not 5M");
-  assert.equal(eff(1_000_000, 5_000_000, 6_000_000), 6_000_000, "the top tier must be reachable");
-  assert.equal(eff(200_000, 1_000_000, 1_200_000), 1_200_000);
+  assert.equal(eff(1_000_000, 5_000_000, 1_000_000), 6_000_000, "选中原生窗口后档位照旧叠加");
+  assert.equal(eff(200_000, 1_000_000, 200_000), 1_200_000);
   // 「会员没了就不该产生一个虚构窗口」这道防线现在在 _ctxChoiceFor 那一层（归位到当前
   // 买得到的档），不在这里 —— 本函数里用户显式点的档位一律原样生效，因为夹取用的上限
   // 来自目录，而目录对某些模型根本没有数据（glm-5.3 就是），夹的就是一个猜测。
   // 这条测试把 _ctxChoiceFor 整个桩掉了（() => choice），在这儿断言测不到那道防线。
   // 归位本身由 logic.test.mjs 的「会员降档之后…」和「收窄永远算数…」两条覆盖。
-  assert.equal(eff(1_000_000, 0, 6_000_000), 6_000_000,
-    "用户显式选的档位在这一层原样生效；防虚构窗口是 _ctxChoiceFor 的职责");
+  assert.equal(eff(1_000_000, 0, 1_000_000), 1_000_000,
+    "没会员就只有窗口本身 —— 绝不产生一个虚构的数");
 
   const RS = fs.readFileSync("../server/src/compression.rs", "utf8");
   assert.match(RS, /pub fn capacity_for_native\(self, native: usize\) -> usize \{\s*\n\s*native\.saturating_add\(self\.max_input_tokens\(\)\)/,
@@ -959,31 +960,30 @@ test("a native window the user picked is the one that takes effect", () => {
   // The stored record kept only the KIND, so a model with two native windows — Sonnet 4.5 has
   // 200K by default and 1M behind the context-1m beta — always resolved back to the default and
   // the 1M button could never do anything.
-  // 更宽的那个窗口带 beta 标记 —— Sonnet 4.5 的 1M 真的是这样，而"带标记"正是
-  // _ctxNativeCeiling 用来判断"这条连接够不够得着"的依据（网关会无条件带上那个头）。
-  // 不带标记的更宽窗口是别家端点才有的，选中只会让本地按一个拿不到的窗口做预算。
+  // 窗口那条轴只解析窗口：目录还列着就照用，不列了就退回默认（0 = 跟随默认），
+  // 绝不钉死一个交付不了的数。留存档位是另一条轴，归 _ctxTierChoice 管。
   const choiceFor = (rec, windows, dflt) => new Function(
-    "_ctxChoiceRecord", "_modelContextLimit", "_modelCatalogEntry", "_michaelUser",
-    "_gatewayHandlesCompression", "_tokenShort", "_MC_TIER_OPTIONS",
-    `${grab("_nativeWindowsFor")}\n${grab("_ctxNativeDefault")}\n${grab("_ctxNativeCeiling")}\n`
-      + `${grab("_ctxChoiceOptions")}\n${grab("_ctxSnapToOpenChoice")}\n${grab("_ctxChoiceFor")}\n`
-      + `return _ctxChoiceFor("m");`,
+    "_ctxChoiceRecord", "_modelContextLimit", "_modelCatalogEntry", "_ctxNativeDefault",
+    `${grab("_nativeWindowsFor")}\n${grab("_ctxChoiceFor")}\nreturn _ctxChoiceFor("m");`,
   )(
     () => rec, () => dflt,
-    () => ({ contextLimit: dflt, contextWindows: windows.map((t) => ({ tokens: t, beta: t > dflt ? "context-1m-2025-08-07" : null })) }),
-    null, () => false, (n) => String(n), [],
+    () => ({ contextLimit: dflt, contextWindows: windows.map((t) => ({ tokens: t, beta: null })) }),
+    () => dflt,
   );
 
   const twoWindows = [200_000, 1_000_000];
-  assert.equal(choiceFor({ kind: "native", tokens: 1_000_000 }, twoWindows, 200_000), 1_000_000);
+  assert.equal(choiceFor({ kind: "native", tokens: 1_000_000 }, twoWindows, 200_000), 1_000_000,
+    "点中的那个窗口必须生效");
   assert.equal(choiceFor({ kind: "native", tokens: 200_000 }, twoWindows, 200_000), 200_000);
-  // A window the route has withdrawn must not strand a value nothing can deliver.
-  assert.equal(choiceFor({ kind: "native", tokens: 1_000_000 }, [200_000], 200_000), 200_000);
-  // Records written before the figure was stored still load.
-  assert.equal(choiceFor({ kind: "native" }, twoWindows, 200_000), 200_000);
+  // 线路撤掉了这个窗口 → 退回默认（0），而不是钉死一个交付不了的数。
+  assert.equal(choiceFor({ kind: "native", tokens: 1_000_000 }, [200_000], 200_000), 0);
+  // 老记录只存了 kind、没存数字。
+  assert.equal(choiceFor({ kind: "native" }, twoWindows, 200_000), 0);
+  // 档位那条轴不许被当成窗口——这正是"选 2M 得到 2,096,890"的来源。
+  assert.equal(choiceFor({ kind: "tier", tokens: 2_000_000 }, twoWindows, 200_000), 0);
 
-  assert.match(SRC, /if \(kind === "native"\) map\[key\] = \{ kind: "native", tokens: Math\.max\(0, Math\.round\(tokens\) \|\| 0\) \};/,
-    "the click has to record WHICH window was clicked");
+  assert.match(SRC, /map\[key\] = \{ kind: kind === "tier" \? "tier" : "native", tokens: n \};/,
+    "点击要连**是哪条轴**一起记下来");
 });
 
 test("off is said out loud, because silence means the opposite on the 5 series", () => {
