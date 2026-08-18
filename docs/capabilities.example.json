@@ -1,10 +1,11 @@
 {
   "_说明": [
     "把这份文件的内容合并进下面任一处，Mr. Day One 就会自动认到（10 秒内生效，不用重启）：",
-    "  ~/.michael/settings.json              —— 你个人的，所有项目都有",
-    "  <项目>/.michael/settings.json         —— 跟着仓库走，团队共享",
-    "  <项目>/.michael/settings.local.json   —— 只属于你，别提交",
+    "  ~/.mrdayone/settings.json             —— 你个人的，所有项目都有",
+    "  <项目>/.mrdayone/settings.json        —— 跟着仓库走，团队共享",
+    "  <项目>/.mrdayone/settings.local.json  —— 只属于你，别提交",
     "同名的以先读到的为准（个人 > 项目）；disabled 是并集——任何一层说「别用这个」都算数。",
+    "（以前叫 .michael/。老目录仍然读得到；同一处新旧都在时，只认新的那份。）",
     "删掉某一段，那个能力就没了。不用改代码，不用重新发版。"
   ],
 

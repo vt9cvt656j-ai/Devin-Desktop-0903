@@ -691,9 +691,9 @@ any scope survives all the others:
 | Scope | File |
 |---|---|
 | user (localStorage) | `michael-ide.permissions` |
-| user (file) | `~/.michael/settings.json` |
-| project | `<root>/.michael/settings.json` — checks into git |
-| local | `<root>/.michael/settings.local.json` |
+| user (file) | `~/.mrdayone/settings.json` |
+| project | `<root>/.mrdayone/settings.json` — checks into git |
+| local | `<root>/.mrdayone/settings.local.json` |
 
 `Tool` names cover families, so `Write(src/**)` catches `write`/`edit`/`multi_edit`/
 `delete`/`move`/`copy`/`mkdir` and `Bash(...)` catches both `run_cmd` and `run_in_terminal` —
