@@ -179,18 +179,54 @@ function extractFn(name) {
 // by prose. extractFn returns comments verbatim, and the comments explaining a perf fix routinely
 // quote the very code the fix removed.
 function stripJsComments(source) {
-  // 顺序**必须**是先行注释、后块注释。反过来会出人命：
+  // 必须**按上下文扫描**，不能用正则。
   //
-  // 2026-08-17 实测，一条 `//` 注释里写着 glob `**\/AGENTS.md`，里面那个 `/` `*` 组合被
-  // 块注释正则当成开头，一口吞掉 **45,375 个字符**——那一整段代码在所有基于本函数的断言
-  // 眼里根本不存在。assert.match 静默变红（我就是这么撞上的），更糟的是 assert.doesNotMatch
-  // 会**静默变绿**：一条本该守着的禁令，在那片区域里等于没写。
+  // 上一版是两条正则：先去行注释、再去块注释。它认不出**正则字面量**里的 `/`，于是
+  // `!/Chrome|Chromium|Edg\//.test(ua)` 这样的真代码里那个 `\//` 被当成行注释开头，
+  // 从那儿一路吃到行尾。实测在 main.js 上吃掉 21.7%（821KB）真代码。
   //
-  // 先把整行 `//` 注释去掉，那个假开头就随行消失了。行注释正则前面的 `[^:]` 守着
-  // `https://` 这类真实字符串，不会误伤。
-  return String(source)
-    .replace(/(^|[^:])\/\/[^\n]*/g, "$1")
-    .replace(/\/\*[\s\S]*?\*\//g, "");
+  // 后果是双向的，而且反向更危险：assert.match 会静默变红（还能发现），
+  // 而 assert.doesNotMatch 在被吃掉的那片区域里**静默变绿** —— 一条本该守着的禁令
+  // 等于没写。本仓库 70 处 doesNotMatch(stripJsComments(SRC), ...) 都建立在这上面。
+  //
+  // 现在逐字符扫，认得字符串 / 模板串 / 正则字面量三种上下文。`/` 前面若是标识符、数字、
+  // `)` 或 `]`，那是除号；否则是正则开头 —— 这是 JS 词法里区分这两者的标准启发式。
+  const s = String(source);
+  let out = "", i = 0, prev = "";
+  const regexCanStart = (p) => !/[A-Za-z0-9_$)\]]/.test(p);
+  while (i < s.length) {
+    const c = s[i], d = s[i + 1];
+    if (c === "/" && d === "/") { while (i < s.length && s[i] !== "\n") i++; continue; }
+    if (c === "/" && d === "*") { const e = s.indexOf("*/", i + 2); i = e < 0 ? s.length : e + 2; continue; }
+    if (c === '"' || c === "'" || c === "`") {
+      const q = c; out += c; i++;
+      while (i < s.length) {
+        const ch = s[i]; out += ch;
+        if (ch === "\\") { i++; if (i < s.length) out += s[i]; i++; continue; }
+        i++;
+        if (ch === q) break;
+      }
+      prev = q; continue;
+    }
+    if (c === "/" && regexCanStart(prev)) {
+      out += c; i++;
+      let inClass = false;
+      while (i < s.length) {
+        const ch = s[i]; out += ch;
+        if (ch === "\\") { i++; if (i < s.length) out += s[i]; i++; continue; }
+        i++;
+        if (ch === "[") inClass = true;
+        else if (ch === "]") inClass = false;
+        else if (ch === "/" && !inClass) break;
+        else if (ch === "\n") break;
+      }
+      prev = "/"; continue;
+    }
+    out += c;
+    if (!/\s/.test(c)) prev = c;
+    i++;
+  }
+  return out;
 }
 // Build the real function with its module-level deps injected as parameters.
 let AUTO_LOAD_DEPS = Object.create(null);

@@ -114,6 +114,11 @@ export function defineTool(type, policy = {}) {
   return REGISTRY.get(name);
 }
 
+/** system 工具里**纯读**的那几个动作。取自 tools.json 的 action 枚举
+ *  （open / menu / menu_items / apps / windows / focus / frontmost），读的是
+ *  apps、windows、frontmost、menu_items；open / focus / menu 会动真格。 */
+const SYSTEM_READ_OPS = new Set(["apps", "windows", "frontmost", "menu_items"]);
+
 /** Every declaration whose policy differs from the default. */
 function seed() {
   // ── structured file operations ────────────────────────────────────────────
@@ -202,9 +207,16 @@ function seed() {
   // capture_replay：可以指定任意 method / url / body 直接发出去，而且**不要求真有一条
   //   抓包记录**——等于绕开 http_request 那道审批门的一条完整旁路。同门同待遇。
   defineTool("capture_replay", { needsApproval: true, readOnlyModeBlocked: true });
-  // system：开 App、切前台窗口、触发任意 App 的菜单项。main.js 另一处早已把它判成
-  //   「有外部副作用」，只有这张表不知道。
-  defineTool("system", { needsApproval: true, readOnlyModeBlocked: true });
+  // system：开 App、切前台窗口、触发任意 App 的菜单项 —— 那几个确实是副作用。
+  //   但 apps / windows / frontmost / menu_items 是**纯读**：它们回答的是"现在开着什么、
+  //   哪个在前台、这个 App 有哪些菜单项"。一刀切成"要审批 + 只读模式拦"之后，
+  //   Explorer / Plan / Reviewer 这三个**本来就只看不动**的模式里，连"现在开着什么"
+  //   都问不出来 —— 恰恰把"了如指掌"卡死在最需要它的地方。
+  //   隔壁 browser 已经按 action 拆过，注释里还记着上次踩这个坑的事故；system 漏了。
+  defineTool("system", {
+    needsApproval: (call) => !SYSTEM_READ_OPS.has(String(call?.op || call?.action || "frontmost").toLowerCase()),
+    readOnlyModeBlocked: (call) => !SYSTEM_READ_OPS.has(String(call?.op || call?.action || "frontmost").toLowerCase()),
+  });
 
   // ── generators that land assets in the workspace ──────────────────────────
   for (const t of [

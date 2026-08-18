@@ -1431,6 +1431,79 @@ test("拖滑块时不许每一帧都落盘", () => {
   }
 });
 
+// ── 死函数棘轮：写完了、没人接线，而且不报错 ─────────────────────────────
+//
+// 这是本仓库反复出现的一类事故，而且是**最贵**的一类，因为测试帮它掩护：
+//   · _wrapUpCritic（收尾评审员）零调用点，函数在、注释断言它在跑、三条测试直接测它 →
+//     全绿，功能一次没执行过。用户看到的是"没人判断写得对不对"。
+//   · _detectVerifyCmd 整族 117 行零调用点，注释还写着"两个门禁调用点都经过这层"。
+//   · 七个功能面板（抓包/任务/工作区/远程/冲突/调试器/市场）写好了没进渲染器分派表，
+//     用户根本打不开。
+//   · screenshot_region（真正能拍桌面的那段）零调用点。
+//
+// 现有测试全是"从源码抽出这个函数来跑"，所以"测的是真代码"这句话成立 —— 但"这段真代码
+// 有没有人调用"从来没有任何一条测试查过。wiring.test 守得住死文件，守不住死函数。
+//
+// 这条是**棘轮，不是体检报告**：下面这份名单是立这条守卫当天的存量，没有逐个复核过。
+// 它只保证一件事——**不再新增**。接好一个就从名单里删一个（删了会更绿）；新写一个能力
+// 忘了接线，这条当场红。
+const KNOWN_UNCALLED = new Set([
+  "_activeAiProviderMode", "_adaptiveEnabled", "_addDroppedRef",
+  "_agentAllowsDependencyRestore", "_agentAllowsExternalKind", "_agentAllowsRuntimeKind",
+  "_agentAllowsWorkspaceMutation", "_agentQuestionNeedsWorkspaceEvidence",
+  "_agentSideEffectIntentIssue", "_agentTimelineElapsed", "_agentTimelineRelative",
+  "_agentToolNameAllowedByProfile", "_agentTurnHasNonControlTools", "_agentUserIntentText",
+  "_aiConfigured", "_appendMemory", "_appendToolPlanCard", "_browserNeedsCapturePreflight",
+  "_countExistingModules", "_countOccurrences", "_executeInlineTools", "_expandDirNode",
+  "_fixTrailingWhitespace", "_fixUnbalancedBrackets", "_getIdentifierAtPosition",
+  "_hasContextOnlyLocationIntent", "_isCompressionPrefixInvalidError",
+  "_isContextOverflowAiError", "_isKnownThinkingModel", "_isLocalOrPrivateHttpUrl",
+  "_isSecretPath", "_looksLikeProjectExecutionCommand", "_memoryChoiceModel",
+  "_migrateCtxChoiceV1", "_modelNeedsCssGrounding", "_partialJsonString", "_planEffectForRun",
+  "_planStepDomain", "_readBeforeEditCoverageHint", "_readCoverageImpossible",
+  "_recordRunRead", "_screenshotModePreflightIssue", "_sessionHistoryEntries",
+  "_sessionLibraryTotals", "_setStreamBtnForActive", "_settingsSelectedProviderMode",
+  "_skillIcon", "_skillIconMarkup", "_skillImgFromFile", "_splitFileName",
+  "_squeezeMessagesForContext", "_stickToBottom", "_structureReadinessHint", "_thinkTip",
+  "_toolRequiresPlanGate", "_translateToEnglish", "_updateEarlierHistoryControl",
+  "_userScopeMcpConfigPath", "_workspaceRelativePath", "_writeGateBypass",
+  "checkExtensionRecommendation", "checkToolForLanguage", "refreshOutline",
+  "refreshTestExplorer", "renderCaptureTool", "renderConflictsTool", "renderDebuggerTool",
+  "renderMarketplaceTool", "renderRemoteTool", "renderTasksTool", "renderWorkspaceTool",
+  "saveKeybinding", "showAiDiffPreview", "updateMinimapSearchHighlights",
+]);
+
+test("新写的能力必须有人调用——死函数只减不增", () => {
+  const names = [...new Set(
+    [...SRC.matchAll(/^(?:async\s+)?function\s+(_?[A-Za-z0-9_]+)\s*\(/gm)].map((m) => m[1]),
+  )];
+  assert.ok(names.length > 1500, `只解析出 ${names.length} 个顶层函数——取法坏了，这条等于没跑`);
+
+  // 统计整个 src/ 目录里每个标识符出现多少次：==1 就是"只有定义那一次"，零引用。
+  // 整个 src/ 目录（含子目录），而不是只有 main.js —— 调用点可能在别的模块里。
+  const walk = (dir) => readdirSync(dir, { withFileTypes: true }).flatMap((e) => {
+    const full = join(dir, e.name);
+    if (e.isDirectory()) return walk(full);
+    return /\.(?:js|jsx|html)$/.test(e.name) ? [full] : [];
+  });
+  const blob = walk(join(HERE, "../src")).map((f) => readFileSync(f, "utf8")).join("\n");
+  const seen = new Map();
+  for (const m of blob.matchAll(/[A-Za-z_$][A-Za-z0-9_$]*/g)) {
+    seen.set(m[0], (seen.get(m[0]) || 0) + 1);
+  }
+  const dead = names.filter((n) => (seen.get(n) || 0) <= 1);
+  const added = dead.filter((n) => !KNOWN_UNCALLED.has(n)).sort();
+  assert.deepEqual(added, [],
+    "这些函数写完了但**没有任何人调用**——它们不会报错，只是永远不发生：\n  "
+    + added.join(", ")
+    + "\n接上调用点，或者删掉它。如果确实是有意保留的，加进 KNOWN_UNCALLED 并写清为什么。");
+
+  // 棘轮的另一半：名单里已经接好的要及时删掉，否则它会慢慢变成一张没人看的清单。
+  const revived = [...KNOWN_UNCALLED].filter((n) => (seen.get(n) || 0) > 1).sort();
+  assert.deepEqual(revived, [],
+    "这些已经有调用点了，请从 KNOWN_UNCALLED 里删掉（名单是要缩短的）：\n  " + revived.join(", "));
+});
+
 test("前端调的每个后端命令，Rust 侧都注册了", () => {
   // wiring.test 上面那几条守的是 schema → _mapToolCall → 处理器这条链。它管不到最后一跳：
   // 处理器里 `invoke("some_command")` 的那个命令名，Rust 的 generate_handler! 里到底有没有。
