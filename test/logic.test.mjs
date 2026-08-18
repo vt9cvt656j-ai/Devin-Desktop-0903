@@ -5407,7 +5407,10 @@ test("historical image lookup selects the latest image turn and ignores a later 
   assert.equal(images[0], recentImage);
   assert.deepEqual(images.map((item) => item.name), ["recent.jpg", "second.jpg"]);
   assert.match(SRC, /_latestHistoricalImageAttachments\(session\.memory\)/);
-  assert.match(SRC, /_attachmentAwareContent\(`\[MICHAEL_USER_STEERING\]\\n\\n\$\{steerText\}`,[\s\S]{0,160}false, steerText\)/);
+  // 插话正文现在还会带上「当前进度 + 合并还是另起」，所以不再是一整个模板字面量参数。
+  // 守的是两件没变的事：正文以标记 + 用户原话开头；语义文本仍按原话传下去（图片定位用）。
+  assert.match(SRC, /const _steerBody = `\[MICHAEL_USER_STEERING\]\\n\\n\$\{steerText\}`/);
+  assert.match(SRC, /_attachmentAwareContent\(_steerBody,[\s\S]{0,160}false, steerText\)/);
 });
 
 test("model request budget drops older media before the current visual turn", () => {
@@ -7373,8 +7376,56 @@ test("dynamic time and bulky file context stay out of the cached system prefix",
   assert.match(SRC, /entries\.filter\(\(en\) => !en\.is_dir\)\.slice\(0, 3\)/);
 });
 
+test("插进去的消息要带着「没做完的事」一起交给模型，并让它判断合并还是另起", () => {
+  // 用户实拍的抱怨：插入的消息"不去处理，没任何有用价值"。机制其实是通的——下一轮会取。
+  // 缺的是判断依据：只丢一句"用户插了新指令"，模型不知道当前做到哪、还剩什么，于是要么
+  // 敷衍一句，要么把已经做完的从头再做一遍。用户原话：「插入消息的话带着没做完的事情，
+  // 看看用不用合并一起做，还是做新的」。
+  const snap = load("_runProgressSnapshot", {});
+
+  const text = snap({
+    _planSteps: [
+      { content: "读懂现有登录流程", status: "completed" },
+      { content: "改 auth.js 的会话校验", status: "in_progress" },
+      { content: "补一个失效 token 的测试", status: "pending" },
+      { content: "跑一遍测试", status: "pending" },
+    ],
+    _executionEvidence: [{ command: "npm test", exitCode: 1 }],
+  }, new Set(["src/auth.js"]));
+  assert.match(text, /正在做：改 auth\.js 的会话校验/);
+  assert.match(text, /还没做完（2 步）/);
+  assert.match(text, /已完成 1 步/);
+  assert.match(text, /本轮已改过的文件：src\/auth\.js/);
+  assert.match(text, /最近跑过：npm test（退出码 1）/, "跑过什么、过没过，是模型判断该不该重做的依据");
+
+  // 什么都没发生时不硬凑一段空话——空快照就不往插话里塞那一节。
+  assert.equal(snap({}, new Set()), "");
+  assert.equal(snap(null, null), "");
+
+  const src = stripJsComments(SRC);
+  assert.match(src, /const _progress = _runProgressSnapshot\(run, _mutatedFiles\)/,
+    "插话注入点没带上进度——模型又要凭空判断了");
+  assert.match(src, /当前这件事的进度/);
+  assert.match(src, /补充或修正当前这件事.*另起一件事|另起一件事[\s\S]{0,80}补充/,
+    "没有把「合并还是另起」这个判断交给模型");
+  assert.match(src, /别从头再来，也别把已经做完的重做一遍/);
+});
+
+test("收尾那一刻插进来的消息不会被丢掉——转成下一轮，而且不会在对话里出现两遍", () => {
+  // 循环结束时原来直接把插话队列置空。用户在最后一秒插的那条就此人间蒸发，
+  // 界面上看到的就是"插进去的消息不处理"。
+  const src = stripJsComments(SRC);
+  assert.match(src, /const _strandedSteer = Array\.isArray\(session\._steerQueue\) \? session\._steerQueue\.splice\(0\) : \[\]/,
+    "收尾时没有把残留的插话取出来——它会被下一行置空丢掉");
+  assert.match(src, /alreadyInTranscript: true/);
+  // 重发时不能再画一遍气泡/记忆：_steerRunningAgent 已经落过了。
+  assert.match(src, /if \(!opts\.alreadyInTranscript\) addMessage\("user", text, sess, attachments\)/);
+  assert.match(src, /if \(!opts\.alreadyInTranscript\) sess\.memory\.push\(\{ role: "user"/);
+  assert.match(src, /sendPrompt\(next\.text, next\.attachments \|\| \[\], config, \{ alreadyInTranscript: !!next\.alreadyInTranscript \}\)/);
+});
+
 test("real-time user steering is marked separately from agent continuation nudges", () => {
-  assert.match(SRC, /const content = await _attachmentAwareContent\(`\[MICHAEL_USER_STEERING\]\\n\\n\$\{steerText\}`/);
+  assert.match(SRC, /const content = await _attachmentAwareContent\(_steerBody,/);
   assert.match(SRC, /const steerAttachments = typeof queued === "string" \? \[\] : \(queued\?\.attachments \|\| \[\]\)/);
   assert.match(SRC, /_steerRunningAgent\(sess, text, atts\)/);
 });
@@ -22302,6 +22353,32 @@ test("一条绿命令只能替它自己作证，盖不住另一条命令的红",
   assert.equal(at([ev("npm  test", 1), ev("npm test", 0)]), null,
     "只有空格差异的是同一条命令，不该被当成两条");
   assert.equal(at([ev("npm test", 0), ev("tsc", 0)]), null);
+});
+
+test("空转要有下限——没有天花板不等于没有底线", () => {
+  // 用户反复报的"1-2 分钟能解决的事跑半天"。步数天花板是**有意**去掉的（结束由模型自主
+  // 判定），但它被读成了"没有任何下限"：一个 run 可以几十上百轮既不产出、也不取得任何新
+  // 证据。原有的 implLoop / churn / planNudge 三条都只是提示词，模型可以完全不理。
+  const limit = load("_idleIterLimit", { loadConfig: () => ({}) });
+  assert.equal(limit(), 12, "默认阈值没了");
+  assert.equal(load("_idleIterLimit", { loadConfig: () => ({ agentIdleLimit: 0 }) })(), Infinity,
+    "填 0 要能关掉这道闸门——注释里提过的兜底开关就是它");
+  assert.equal(load("_idleIterLimit", { loadConfig: () => ({ agentIdleLimit: 30 }) })(), 30);
+  assert.equal(load("_idleIterLimit", { loadConfig: () => ({ agentIdleLimit: 1 }) })(), 2, "下限 2，别把自己锁死");
+  assert.equal(load("_idleIterLimit", { loadConfig: () => ({ agentIdleLimit: "x" }) })(), 12, "填了垃圾回默认");
+
+  const loop = extractFn("_runAgenticLoop");
+  // 拦的是"什么都没发生"，不是"步数多"：产出或证据任意一样有进展就必须清零，
+  // 否则正当的长任务会被拦腰砍断——那正是当初去掉步数天花板的原因。
+  assert.match(loop, /const _progressNow = _anyProgressOps \+ _novelEvidenceCount;/,
+    "进展信号要同时算产出和新证据");
+  assert.match(loop, /_idleProgressMark[\s\S]{0,120}_idleIters = 0;/, "有进展必须清零");
+  assert.match(loop, /_idleIters >= _IDLE_ITER_LIMIT[\s\S]{0,200}_incompleteReason = "no_progress"[\s\S]{0,80}break;/,
+    "到阈值要如实收尾并跳出，不能只发一句提示——提示模型可以不理");
+  // 只在 agent 模式计数：对话/规划本来就不产出文件。
+  assert.match(loop, /else if \(run\.mode === "agent"\) _idleIters\+\+;/);
+  // 用户看到的是人话，不是内部枚举名。
+  assert.match(SRC, /no_progress: "换个说法或给个更具体的目标再试"/);
 });
 
 test("the agent loop keeps fixing a red build, bounded, then finishes honestly", () => {
