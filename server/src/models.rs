@@ -357,6 +357,57 @@ const ANTHROPIC_EFFORT_BETA: &str = "effort-2025-11-24";
 /// standalone header used to omit the two capabilities its API-key path needs in order
 /// to preserve adaptive/interleaved thinking and `output_config.effort`. Never include
 /// `redact-thinking`: that capability intentionally removes visible thinking text.
+/// 不带 `context-1m` 时上游实际允许的输入上限。
+///
+/// **不从目录取。** 目录（`official_contexts`）描述的是 Anthropic 自己的行为——它对
+/// Opus 4.6+/Sonnet 4.6+/Fable 原生就给 1M，所以那边的条目是「1M，不需要 beta」。而中转商
+/// 把 1M 挡在和 Sonnet 4/4.5 同一个 beta 后面（实测原文：`400 {"error":"1m context is
+/// fully available; please enable 1m context and retry"}`）。也就是说：不发这个 flag 时，
+/// 我们实际能用的是 Anthropic 的经典窗口，不是目录上那个数。
+const ANTHROPIC_CONTEXT_WITHOUT_1M_BETA_TOKENS: usize = 200_000;
+
+/// 触发 `context-1m` 的正文字节阈值。
+///
+/// 任何 BPE 分词器在 UTF-8 上都满足 **token 数 ≤ 字符数 ≤ 字节数**，所以「正文字节数 < N」
+/// 可以*证明* token 数 < N —— 是硬上界，不是经验估计。取 150k 而不是 200k，是给工具
+/// schema、系统提示词模板这类不在正文字符串里、但会进 token 账的部分留 25% 余量。
+///
+/// 方向是刻意选的：多发一次这个 flag 只是回到改动前的行为，而少发一次会换来一个硬 400
+/// （而且 400 不会 failover），所以一切模糊地带都往「发」的方向倒。图片正是这样一个
+/// 模糊地带——base64 字节巨大、token 很少，于是它天然把我们推向多发，正合适。
+const ANTHROPIC_1M_BETA_TEXT_BYTES: usize = 150_000;
+
+/// 请求体里所有字符串内容的字节数之和。
+///
+/// 只数字符串值：JSON 的键名和结构字符不进模型，不该算进 token 账。深度由 serde_json
+/// 解析时的递归上限兜住（默认 128 层），所以这里的递归是有界的。
+fn body_text_bytes(value: &serde_json::Value) -> usize {
+    match value {
+        serde_json::Value::String(text) => text.len(),
+        serde_json::Value::Array(items) => items.iter().map(body_text_bytes).sum(),
+        serde_json::Value::Object(fields) => fields.values().map(body_text_bytes).sum(),
+        _ => 0,
+    }
+}
+
+/// 这一次请求要不要发 `context-1m`。
+///
+/// 以前的判据只有「这个模型支不支持 1M」，于是**每一个** Claude 请求都带着它——包括一个
+/// 354 token 的请求。实测（近 7 天 11,990 次 Claude 调用）真正超过 20 万 token 的只有 93 次，
+/// 占 0.78%：另外 99.2% 都在把一个溢价通道标记发给一个用不上它的请求。
+///
+/// 现在加一道体积判据：模型支持 1M **且** 这一次的正文大到可能超出标准窗口，才发。
+fn wants_1m_context(model_id: &str, upstream_body: &serde_json::Value) -> bool {
+    let model_supports_1m = official_contexts(model_id)
+        .iter()
+        .any(|(tokens, _)| *tokens >= 1_000_000);
+    if !model_supports_1m {
+        return false;
+    }
+    debug_assert!(ANTHROPIC_1M_BETA_TEXT_BYTES < ANTHROPIC_CONTEXT_WITHOUT_1M_BETA_TOKENS);
+    body_text_bytes(upstream_body) >= ANTHROPIC_1M_BETA_TEXT_BYTES
+}
+
 fn anthropic_beta_header(body: &serde_json::Value, wants_1m: bool) -> Option<String> {
     let mut betas = Vec::with_capacity(3);
     if wants_1m {
@@ -429,10 +480,20 @@ const CHAT_UPSTREAM_STALL_MEMORY: Duration = Duration::from_secs(120);
 
 /// 对一条最近卡满过的线路，单次表头等待的上限。
 ///
-/// 取 25 秒的依据是实测的表头延迟分布（2026-08-19，786 个样本）：p50 9.4s、p90 21.7s。
-/// 25 秒能兜住绝大多数**真的在干活**的请求，所以一条只是偶尔慢的线路不会被这条规则
-/// 误伤；而对一条真的挂住的线路，用户从等 57 秒变成等 25 秒，且 60 秒的客户端预算里
-/// 还剩得下一次完整重试。
+/// 这个数是两个方向夹出来的，两边都用实测表头延迟分布定标（2026-08-19，786 个成功样本：
+/// p50 9.4s、p90 21.7s、p95 31.9s）：
+///
+///   * **下限**——必须高于健康响应的 p90，否则一条只是慢的线路会被这条规则routinely
+///     误伤：它每被截断一次就又记一次卡死，自己把自己按死在短预算上。25s > 21.7s，
+///     大约 8% 的健康响应会被切掉；而一次成功就撤销记号（`clear_route_stall`），
+///     所以真正只是慢的线路一两个请求内就自己恢复完整预算。
+///   * **上限**——必须显著低于完整预算才有意义。客户端最多重试 4 次、退避 2/4/8/16s，
+///     所以一轮彻底失败的总耗时从 57×5+30 ≈ 315 秒（5 分 15 秒）降到 25×5+30 ≈ 155 秒
+///     （2 分 35 秒）。
+///
+/// 注意**不是**「让客户端的重试得以发生」——客户端那个 60 秒是每次尝试各自一份，不是
+/// 整轮共用一份，57 秒的回答本来就不会吃掉后续重试。这里买到的是等待时间腰斩，不是
+/// 重试次数。
 const CHAT_UPSTREAM_STALLED_PROBE_WAIT: Duration = Duration::from_secs(25);
 // 中转丢块自愈：jgy 等聚合中转在深思考超过 ~7.5K token 后会丢掉后面的 text/tool_use
 // 块并谎报 end_turn（对照实验：budget 6000 → thinking+text+tool_use 正常；budget 24000
@@ -714,6 +775,16 @@ fn chat_upstream_attempt_suffix(
         )
     } else if route_count <= 1 {
         format!("（已请求 {attempts} 次；当前只有 1 条同模型线路；最后状态 {last_status}）")
+    } else if (attempts as usize) < route_count {
+        // 「已请求 1 次 / 2 条同模型线路」读起来是"两条都试过了、都不行"，而实际上另一条
+        // 健康线路一次都没碰过——一个 inbound 请求只发一次上游（CHAT_UPSTREAM_MAX_ROUTES_
+        // PER_REQUEST = 1），换线是**跨请求**发生的：这次失败会给这条线路记冷却，下一次
+        // 发送就自动排到别的线路上。用户实拍到的正是这个误读：他以为线路全废了，其实
+        // 重发一次就好。把没试过的那几条说出来，并把"重发一次"这个出口讲明白。
+        let untried = route_count - attempts as usize;
+        format!(
+            "（本次只试了 1 条线路，同模型另有 {untried} 条没试过；这条已被记下冷却，直接重发一次就会自动改走其它线路；最后状态 {last_status}）"
+        )
     } else {
         format!("（已请求 {attempts} 次 / {route_count} 条同模型线路；最后状态 {last_status}）")
     }
@@ -760,7 +831,13 @@ fn upstream_friendly_message(status: u16, low: &str) -> String {
     {
         "请求过于频繁，请稍后再试。".into()
     } else if status == 401 || low.contains("unauthorized") || low.contains("invalid api key") {
-        "上游密钥无效。请在后台「模型系统」更新该连接的 API Key。".into()
+        // 「模型系统」这个页面早就没了——控制台左侧现在是「模型线路 → 线路」
+        // （admin-ui 的 NAV，group "routing"）。更要紧的是：这句话会原样发给**每一个**用户，
+        // 而控制台要求 role=admin、nginx 还有一层 auth_request，普通用户点进去只会看到 404。
+        // 把运维指令当成用户指引群发出去，等于告诉大部分人"去一个你打不开的页面"。
+        // 所以两句话都给：管理员知道去哪改，普通用户知道自己现在能做什么。
+        "上游密钥无效（这条线路的 key 不对，重发多少次都一样）。换个模型可以继续用；管理员请到控制台「模型线路 → 线路」更新该连接的 API Key。"
+            .into()
     } else if status == 400 {
         let detail = safe_upstream_error_excerpt(low);
         if detail.is_empty() {
@@ -6858,10 +6935,8 @@ pub async fn chat_completions(
                     "route recently dropped post-thinking blocks; thinking budget clipped for this request"
                 );
             }
-            let wants_1m = candidate_anthropic
-                && official_contexts(&model_id)
-                    .iter()
-                    .any(|(tokens, _)| *tokens >= 1_000_000);
+            let wants_1m =
+                candidate_anthropic && wants_1m_context(&model_id, &candidate_upstream_body);
             let candidate_anthropic_beta = candidate_anthropic
                 .then(|| anthropic_beta_header(&candidate_upstream_body, wants_1m))
                 .flatten();
@@ -6875,6 +6950,9 @@ pub async fn chat_completions(
                     thinking_type = telemetry_thinking_type(&candidate_upstream_body),
                     output_config_effort = telemetry_output_config_effort(&candidate_upstream_body),
                     beta_context_1m = wants_1m,
+                    // 体积判据的输入。留着是为了能在线上直接验证这道门有没有按预期开合，
+                    // 而不用从"beta 发没发"反推。
+                    body_text_bytes = body_text_bytes(&candidate_upstream_body),
                     beta_interleaved_thinking = candidate_anthropic_beta
                         .as_deref()
                         .is_some_and(|value| value.contains(ANTHROPIC_INTERLEAVED_THINKING_BETA)),
@@ -8217,6 +8295,8 @@ mod billing_tests {
     }
     use super::{
         anthropic_beta_header, anthropic_effort_word, anthropic_thinking, anthropic_to_oai,
+        body_text_bytes, wants_1m_context, ANTHROPIC_1M_BETA_TEXT_BYTES,
+        ANTHROPIC_CONTEXT_WITHOUT_1M_BETA_TOKENS,
         oai_to_anthropic_with_cache, chat_upstream_attempt_suffix,
         chat_upstream_retry_base_delay_ms, claude_generation, clip_thinking_budget, compute_cost,
         is_image_gen_model, official_max_output, official_contexts, model_caps_override,
@@ -8416,6 +8496,43 @@ mod billing_tests {
         assert_eq!(
             chat_upstream_attempt_suffix(3, 12, 504, false),
             "（已请求 12 次 / 3 条同模型线路；最后状态 504）"
+        );
+    }
+
+    /// 面向用户的报错不许指向一个不存在的页面。
+    ///
+    /// 「模型系统」这个后台页早就没了（控制台左侧现在是「模型线路 → 线路」），而这句话
+    /// 会原样发给**每一个**用户——控制台要求 role=admin、nginx 还有一层 auth_request，
+    /// 普通用户点进去只会看到 404。一条自信、具体、而且用户照做不了的指引。
+    #[test]
+    fn the_auth_failure_message_points_somewhere_that_exists() {
+        let msg = super::friendly_upstream_for_test(401, "invalid api key");
+        assert!(
+            !msg.contains("模型系统"),
+            "这个后台页面已经不存在了，别再把用户指过去：{msg}"
+        );
+        assert!(msg.contains("模型线路"), "要指向控制台里真实存在的那一项：{msg}");
+        // 普通用户进不了控制台，必须同时给他一条自己能走的路。
+        assert!(
+            msg.contains("换个模型"),
+            "这句话会发给所有用户，不能只写给管理员看：{msg}"
+        );
+        // 并且要说清重发无用——否则用户会一直重试一条永远不会好的线路。
+        assert!(msg.contains("重发"), "要说明重发解决不了配置问题：{msg}");
+    }
+
+    /// 「已请求 1 次 / 2 条同模型线路」读起来是"两条都不行"，而实际上另一条一次都没碰过。
+    /// 用户据此以为线路全废了，其实重发一次就会自动换线。
+    #[test]
+    fn chat_gateway_error_suffix_does_not_imply_every_route_was_tried() {
+        let msg = chat_upstream_attempt_suffix(2, 1, 401, false);
+        assert!(msg.contains("只试了 1 条"), "{msg}");
+        assert!(msg.contains("1 条没试过"), "{msg}");
+        assert!(msg.contains("重发"), "要把出口说出来：重发一次就会自动换线。{msg}");
+        // 真的把所有线路都试过时，不许再说"还有没试过的"
+        assert_eq!(
+            chat_upstream_attempt_suffix(2, 2, 502, false),
+            "（已请求 2 次 / 2 条同模型线路；最后状态 502）"
         );
     }
 
@@ -10549,6 +10666,67 @@ mod billing_tests {
             "message_start"
         );
         assert_eq!(telemetry_anthropic_event_kind(Some("provider_private")), "other");
+    }
+
+    /// `context-1m` 按这一次请求的实际体积发，而不是按"这个模型支不支持 1M"发。
+    ///
+    /// 改之前每一个 Claude 请求都带着它，包括一个 354 token 的请求——近 7 天 11,990 次
+    /// Claude 调用里真正超过 20 万 token 的只有 93 次（0.78%）。
+    #[test]
+    fn the_1m_beta_follows_the_actual_request_size() {
+        seed_catalog();
+
+        let small = json!({"messages": [{"role": "user", "content": "写个 hello world"}]});
+        assert!(
+            !wants_1m_context("claude-fable-5", &small),
+            "小请求不该被派到 1M 那条溢价通道上"
+        );
+
+        let big = json!({
+            "messages": [{
+                "role": "user",
+                "content": "x".repeat(ANTHROPIC_1M_BETA_TEXT_BYTES),
+            }]
+        });
+        assert!(
+            wants_1m_context("claude-fable-5", &big),
+            "真的可能超出标准窗口时必须发，否则换来一个硬 400（而且 400 不会 failover）"
+        );
+
+        // 模型本身不支持 1M 的，多大都不发。
+        let huge = json!({
+            "messages": [{"role": "user", "content": "x".repeat(ANTHROPIC_1M_BETA_TEXT_BYTES * 2)}]
+        });
+        assert!(
+            !wants_1m_context("claude-haiku-4-5", &huge),
+            "目录说这个模型只有 200k，发 1M flag 没有意义"
+        );
+    }
+
+    /// 阈值的安全性是可以**证明**的，不是估的：任何 BPE 分词器在 UTF-8 上都满足
+    /// token ≤ 字符 ≤ 字节，所以正文字节数低于阈值就意味着 token 数低于阈值。
+    /// 阈值本身再低于「不带 beta 时的窗口」，这道门就不可能漏发。
+    #[test]
+    fn the_size_gate_cannot_underestimate_the_token_count() {
+        assert!(
+            ANTHROPIC_1M_BETA_TEXT_BYTES < ANTHROPIC_CONTEXT_WITHOUT_1M_BETA_TOKENS,
+            "阈值必须低于不带 beta 的窗口，否则存在漏发区间",
+        );
+
+        // 只数字符串值：键名和 JSON 结构字符不进模型，不该算进 token 账。
+        let body = json!({
+            "model": "claude-fable-5",
+            "max_tokens": 1024,
+            "messages": [
+                {"role": "user", "content": "abcd"},
+                {"role": "assistant", "content": [{"type": "text", "text": "efg"}]}
+            ]
+        });
+        // 值：claude-fable-5(14) + user(4) + abcd(4) + assistant(9) + text(4) + efg(3) = 38。
+        // max_tokens 是数字不算；`"text": "efg"` 里的**键**也不算——只有那个 `"type"` 的
+        // 值 "text" 进账。
+        assert_eq!(body_text_bytes(&body), 38);
+        assert_eq!(body_text_bytes(&json!({"n": 1, "b": true, "z": null})), 0);
     }
 
     #[test]
@@ -13514,14 +13692,16 @@ mod route_cooldown_tests {
             header_wait_for_route(base, id, Instant::now()),
             CHAT_UPSTREAM_STALLED_PROBE_WAIT
         );
+        // 上限：要显著更短，否则这条规则什么也没做。取一半以下，保证等待时间真的腰斩。
         assert!(
-            CHAT_UPSTREAM_STALLED_PROBE_WAIT < STANDARD_MAX_HEADER_WAIT,
-            "短探测预算必须真的更短，否则这条规则什么也没做"
+            CHAT_UPSTREAM_STALLED_PROBE_WAIT * 2 <= STANDARD_MAX_HEADER_WAIT,
+            "短探测预算不够短，省不下多少等待时间"
         );
-        // 而且要短到客户端 60 秒的耐心里还塞得下一次完整重试。
+        // 下限：必须高于健康响应的 p90（实测 21.7s），否则一条只是慢的线路会被反复截断，
+        // 每次截断又记一次卡死，自己把自己按死在短预算上。
         assert!(
-            CHAT_UPSTREAM_STALLED_PROBE_WAIT * 2 < CLIENT_HEADER_TIMEOUT,
-            "被截断一次之后必须还剩得下一次重试，否则用户还是只等到一条错误"
+            CHAT_UPSTREAM_STALLED_PROBE_WAIT >= Duration::from_secs(22),
+            "短探测预算低于健康响应的 p90，会把「慢」误判成「挂了」"
         );
     }
 
