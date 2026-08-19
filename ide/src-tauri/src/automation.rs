@@ -52,6 +52,21 @@ fn server_bin() -> Option<std::path::PathBuf> {
     None
 }
 
+/// 端口上那个服务，是不是**我们自己刚起的那个 sidecar**。
+///
+/// 这里以前有两个错，合起来让「先占住 127.0.0.1:3037 就能接管全部桌面自动化」一直成立：
+///
+///   1. 只看 HTTP 200。冒充者不运行我们的代码，它想回什么状态码就回什么。
+///      而当时的注释写着「冒充者不知道这个一次性 token，健康检查会失败」——
+///      那句话描述的是一个从没实现过的校验。
+///   2. **把 token 发给了尚未验明身份的一方**。请求头里带着 x-automation-token 去问
+///      "你是谁"，等于先把一次性密钥交到冒充者手上，它随后可以拿着它满足任何后续校验。
+///
+/// 接管之后流过去的包括 keyboard.type 的正文（用户正在输入的密码）、clipboard.get、
+/// browser.content —— 而这一层还能合成真实键鼠，也就是能开终端敲任意命令。
+///
+/// 现在改成挑战应答：我们发一个随机 nonce（明文，不是凭据），sidecar 回
+/// SHA-256("<token>:<nonce>")。只有真持有 token 的一方算得出来，而 token 从不出本进程。
 async fn health_ok() -> bool {
     let client = match reqwest::Client::builder()
         .timeout(Duration::from_millis(600))
@@ -60,17 +75,47 @@ async fn health_ok() -> bool {
         Ok(c) => c,
         Err(_) => return false,
     };
-    // 健康检查也带 token：它同时是「这个端口上的服务是不是**我们自己刚起的那个**」的
-    // 判据。此前只要有任何进程在 3037 上回 200，ensure_server 就认它 —— 本机任意程序
-    // 抢先占住这个固定端口即可冒充 sidecar，把后续所有自动化调用（含键鼠合成的参数）
-    // 全部截走。冒充者不知道这个一次性 token，健康检查会失败。
-    client
+    let nonce = uuid::Uuid::new_v4().simple().to_string();
+    let expected = health_challenge_response(AUTOMATION_TOKEN.as_str(), &nonce);
+    let Ok(resp) = client
         .get(format!("http://127.0.0.1:{PORT}/health"))
-        .header("x-automation-token", AUTOMATION_TOKEN.as_str())
+        .header("x-automation-nonce", &nonce)
         .send()
         .await
-        .map(|r| r.status().is_success())
-        .unwrap_or(false)
+    else {
+        return false;
+    };
+    if !resp.status().is_success() {
+        return false;
+    }
+    let Ok(body) = resp.text().await else { return false };
+    // 常量时间比较：这条路每次失败都会重试，时序差异是可观测的。
+    constant_time_eq(body.trim().as_bytes(), expected.as_bytes())
+}
+
+/// 和 sidecar 侧 `health_challenge_response` 必须逐字节一致（automation-framework/src/rpc.rs）。
+fn health_challenge_response(token: &str, nonce: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(token.as_bytes());
+    hasher.update(b":");
+    hasher.update(nonce.as_bytes());
+    hasher
+        .finalize()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
 }
 
 /// 与本次进程的 automation-server 共享的一次性密钥。
@@ -285,5 +330,53 @@ mod tests {
         let mut child = command.spawn().expect("test child should start");
         terminate_child(&mut child);
         assert!(child.try_wait().unwrap().is_some());
+    }
+}
+
+#[cfg(test)]
+mod health_probe_tests {
+    /// 健康探测**不许把 token 发出去**，且必须校验应答内容而不是只看状态码。
+    ///
+    /// 这两点各自失守都足以让「先占住 127.0.0.1:3037」接管全部桌面自动化：
+    ///   · 只看 200 —— 冒充者不运行我们的代码，想回什么状态码就回什么；
+    ///   · 发 token —— 请求是发给尚未验明身份的一方的，等于把一次性密钥送上门。
+    #[test]
+    fn probe_never_sends_the_token_and_verifies_the_answer() {
+        let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/automation.rs"))
+            .expect("read automation.rs");
+        let at = src.find("async fn health_ok()").expect("health_ok 改名了");
+        let body: String = src[at..].chars().take(1_600).collect();
+        // 剥注释：解释性注释里会提到 x-automation-token，不剥的话断言会被自己的注释喂到。
+        let code: String = body
+            .lines()
+            .map(|l| match l.find("//") { Some(i) => &l[..i], None => l })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(
+            !code.contains("x-automation-token"),
+            "健康探测又把 token 发给未验明身份的一方了",
+        );
+        assert!(code.contains("x-automation-nonce"), "没有发送挑战用的 nonce");
+        assert!(
+            code.contains("health_challenge_response(AUTOMATION_TOKEN.as_str(), &nonce)"),
+            "没有算出期望应答",
+        );
+        assert!(
+            code.contains("constant_time_eq(body.trim().as_bytes(), expected.as_bytes())"),
+            "没有校验应答内容——只看状态码等于没验",
+        );
+    }
+
+    /// 两侧的构造必须逐字节一致，否则真 sidecar 也会被自己判成冒充者。
+    #[test]
+    fn challenge_matches_the_sidecar_implementation() {
+        // SHA-256("tok:n1")，与 automation-framework/src/rpc.rs 的同名函数同源。
+        let ours = super::health_challenge_response("tok", "n1");
+        assert_eq!(ours.len(), 64);
+        assert_ne!(ours, super::health_challenge_response("tok", "n2"));
+        assert_ne!(ours, super::health_challenge_response("other", "n1"));
+        assert!(super::constant_time_eq(ours.as_bytes(), ours.as_bytes()));
+        assert!(!super::constant_time_eq(b"ok", ours.as_bytes()));
     }
 }

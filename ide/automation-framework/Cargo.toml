@@ -14,6 +14,8 @@ enigo = { version = "0.2", features = ["serde"], optional = true }
 arboard = { version = "3.4", optional = true }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+# /health 的挑战应答要算 SHA-256。工作区锁文件里已有 sha2 v0.10，加它不引入新的下载。
+sha2 = "0.10"
 thiserror = "2.0"
 anyhow = "1.0"
 tracing = "0.1"
