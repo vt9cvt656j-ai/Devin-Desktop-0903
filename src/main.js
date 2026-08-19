@@ -23887,7 +23887,12 @@ async function _gatherAgentContext(query, sessionRoot) {
 
   const osBlock = `操作系统：${osDetail.os} ${osDetail.version} (${osDetail.arch})\nShell: ${osDetail.shell}`;
   
-  if (!root) return `${osBlock}\n(未打开工作区文件夹。请提示用户先打开文件夹，不要尝试读取或列出文件。)` + _kgRetrieveBlock("", query || "", true);
+  // 这段上下文主智能体和只读子体共用（调用点：主循环、预热、_runSubAgent）。原来写的是
+  // 「请提示用户先打开文件夹」——把活推回给用户，而主循环那边同一情形写的恰好相反
+  // （「先调 create_project 建一个目录……别停下来问用户」）。两句话会同时出现在主智能体的
+  // 上下文里，互相打架；对没有 create_project 的只读子体，它更是唯一的指示，于是子体的
+  // 简报就只剩一句「让用户打开文件夹」。改成对两边都成立的说法。
+  if (!root) return `${osBlock}\n(未打开工作区文件夹。不要凭空猜路径或去列目录。要动文件：主智能体直接用 create_project 建一个目录（给个描述性名字），它会立刻成为当前工作区——别停下来问用户；只读子任务没有这个工具，就做不依赖磁盘的那部分分析，并在简报里写明「需要主智能体先 create_project」。)` + _kgRetrieveBlock("", query || "", true);
 
   // Knowledge-graph memory is retrieved per-query (relevant subgraph), so it lives
   // OUTSIDE the cached project context and is appended fresh on every call.
@@ -52289,6 +52294,11 @@ async function _executeToolStepInner(step, call, root, run) {
   // 传整个 call 而不只是 type：MCP 要按**这一次调用**判——服务自己声明了只读的那些工具
   // （查文档、读表结构）恰恰是 Plan 模式最需要的，不该和"写文件"一起被一刀切掉。
   if (readOnlyMode && blockedInReadOnlyMode(call.type, call)) {
+    // R0 关闸里那条「撞过模式墙就别把它推回去再撞」（run._readOnlyBlocked）一直没有写入点。
+    // 今天它恰好不可达——只读是模式，而关闸第一条 `run.mode !== "agent"` 已经把这三种模式
+    // 全关掉了。但它是这条意图**唯一**的落点：哪天只读变成 agent 模式下的一个开关（而不是
+    // 独立模式），没有这一行就又是一个「写了意图、机制不认」。一行的代价，换掉那个可能。
+    if (run) run._readOnlyBlocked = true;
     const modeName = _mode === "explorer" ? "Explorer" : _mode === "plan" ? "Plan" : "Reviewer";
     const what = call.type === "cmd" || call.type === "termtask" ? "运行命令"
       : call.type === "mcp" ? "执行 MCP 工具"
@@ -57848,6 +57858,11 @@ async function _executeToolStep(step, call, root, run) {
   // 同一个工具锁死。
   if (!(await _approveToolCall(call, run))) {
     const denied = _userDeniedToolResult(call, _takeRefusal());
+    // R0 全局关闸的 `run._userDenied` 一直**只被读、从没被写过**。于是「用户点了拒绝」这件事
+    // 在机制上等于没发生：红构建门、诊断门、计划门照旧把模型逼回去做同一件他刚否决掉的事，
+    // 用户只能一遍遍再点拒绝。这里补上唯一的写入点——它就在唯一的授权检查点旁边。
+    // 只认**用户**这一档：规则拦截和技能 allowed-tools 不是用户的决定，不该顺带把所有门关掉。
+    if (run && denied.blockedBy !== "rule" && denied.blockedBy !== "skill") run._userDenied = true;
     try {
       const res = step?.querySelector?.(".atc-result");
       if (res) {

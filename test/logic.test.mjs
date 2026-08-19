@@ -28181,3 +28181,34 @@ test("只读子体的人格提示词与它真实的工具集对得上", () => {
   assert.match(text, /one further layer of sub-agents/, "没告诉它可以再派一层，并行调研就永远不会发生");
   assert.match(text, /never change a file/, "「不许改文件」这条是真的，必须留着");
 });
+
+// ---- R0 关闸的两个判据必须真的有写入点 ----
+//
+// 上面那条断言只钉了「_gatesOff 读了它们」。而这两个字段长期**只被读、从没被写过**：
+// 用户点了「拒绝」，红构建门 / 诊断门 / 计划门照旧把模型逼回去做同一件他刚否决掉的事——
+// 用户只能一遍遍再点拒绝，那个按钮在机制上等于没接。
+test("用户拒绝过 / 撞过模式墙，这两条关闸判据不许只被读不被写", () => {
+  assert.match(SRC, /if \(run && denied\.blockedBy !== "rule" && denied\.blockedBy !== "skill"\) run\._userDenied = true;/,
+    "用户拒绝没有落到 run._userDenied —— 那道关闸等于没接");
+  assert.match(SRC, /if \(run\) run\._readOnlyBlocked = true;/,
+    "模式墙拦了一次，却没落到 run._readOnlyBlocked");
+  // 只认用户这一档：规则拦截和技能 allowed-tools 不是用户的决定，不该顺带把所有门关掉。
+  const at = SRC.indexOf("const denied = _userDeniedToolResult(call, _takeRefusal());");
+  assert.ok(at > 0, "唯一的授权检查点挪走了");
+  const block = SRC.slice(at, at + 1200);
+  assert.match(block, /blockedBy !== "rule"/, "规则拦截被当成了用户拒绝");
+  assert.match(block, /blockedBy !== "skill"/, "技能白名单拦截被当成了用户拒绝");
+});
+
+// ---- 没打开工作区时，不许把活推回给用户 ----
+test("无工作区的共用上下文：自己建目录，不要让用户去开文件夹", () => {
+  // 这段上下文主智能体和只读子体共用。原话是「请提示用户先打开文件夹」，而主循环那边同一
+  // 情形写的恰好相反（先调 create_project、别停下来问用户）——两句会同时进主智能体的上下文。
+  // 剥注释再断言：上面那段说明里就引用了这句旧话术，不剥的话断言匹配的是注释而不是代码。
+  assert.doesNotMatch(stripJsComments(SRC), /请提示用户先打开文件夹/, "又变回让用户自己去开文件夹了");
+  const at = SRC.indexOf("未打开工作区文件夹。不要凭空猜路径");
+  assert.ok(at > 0, "共用的那段无工作区上下文找不到了");
+  const text = SRC.slice(at, at + 500);
+  assert.match(text, /create_project/, "主智能体该自己建目录");
+  assert.match(text, /只读子任务/, "子体没有 create_project，得给它另一条出路，而不是让它去催用户");
+});
