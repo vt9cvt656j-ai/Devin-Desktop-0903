@@ -449,12 +449,37 @@ fn launch() -> Result<Session, String> {
         } else {
             format!("本机当前没有开着的 {}，没有可接管的实例", kind.label)
         };
+        // Dock 里两个一模一样的图标——这件事在只装了一个 Chromium 浏览器时，从图标上
+        // 解决不了：macOS 同一个 App 的多个实例共用一个 Dock 图标，除非换个 App。
+        // 所以别装作能解决，而是把**能照做的两条**说清楚，并且只在真的会混淆时才说
+        // （用户此刻确实开着同一个牌子）。窗口里那条黄条「Chrome 正受到自动测试软件的控制」
+        // 是它唯一稳定的身份标记，先指给用户看。
+        let others: Vec<&str> = crate::capture::installed_browsers()
+            .into_iter()
+            .map(|(k, _)| k.label)
+            .filter(|l| *l != kind.label)
+            .collect();
+        let tell_apart = if browser_running {
+            format!(
+                "\n\n**怎么分清哪个是你自己的**：自动化那个窗口顶部有一条黄色提示「Chrome 正受到自动测试软件的控制」，\
+你自己的没有。Dock 图标分不开是 macOS 的限制——同一个 App 的多个实例共用一个图标。\
+真要一眼分清，{}",
+                if others.is_empty() {
+                    "装一个别的 Chromium 浏览器（Edge / Brave / Chromium 任一），在设置里把自动化指过去，两个图标就彻底分开了。".to_string()
+                } else {
+                    format!("在设置里把自动化改用 {}——本机已经装了。", others.join(" 或 "))
+                }
+            )
+        } else {
+            String::new()
+        };
         format!(
             "自动化用的是 **{}**，是新起的一个实例（Dock 里多出来的那个图标就是它）。\
 原因：先扫了 9222-9229 调试端口没找到可接管的实例——{why}。\
 它用的是独立配置 ~/.mrdayone/{profile_name}：全新、没登录过，\
 所以像 Google 这类站点更容易弹人机验证。\
-**在这个窗口里登录一次会被记住**，下次直接就是登录态——这是让它少弹验证的正路。",
+**在这个窗口里登录一次会被记住**，下次直接就是登录态——这是让它少弹验证的正路。\
+{tell_apart}",
             kind.label
         )
     };
@@ -1177,13 +1202,33 @@ where
 /// fresh browser instead of surfacing a dead-connection error to the user)?
 fn is_dead_browser(e: &str) -> bool {
     let s = e.to_lowercase();
+    // 先排除**页面层**的错误。它们读起来都像"没了"，但没了的是一个节点、一个执行上下文，
+    // 不是浏览器。判错的代价极大：这个函数返回 true 就会把整个浏览器杀掉重开，
+    // 用户当前那一页、滚动位置、填了一半的表单全没，Dock 里还多一个新窗口。
+    //
+    // 用户的原话：「如果做错一步 我的浏览器就会被关闭 他又重新开新的 没必要」。
+    // 成因就在下面两条裸匹配上：
+    //   · `no longer`  → 命中 "Node is no longer attached to the DOM"。页面刚重绘之后点击
+    //                    几乎必然报这句，是最普通不过的一次重试，却被当成"浏览器死了"。
+    //   · `channel`    → 谁的错误文本里带这个词都算，包括页面自己的报错、URL 里的
+    //                    /channel/、eval 出来的业务异常。
+    // 两条都收紧成它们**真正想匹配的那句整话**。
+    if s.contains("no longer attached")
+        || s.contains("node with given id")
+        || s.contains("could not find node")
+        || s.contains("cannot find context")
+        || s.contains("execution context was destroyed")
+        || s.contains("execution context is not available")
+    {
+        return false;
+    }
     s.contains("underlying connection is closed")
         || s.contains("connection is closed")
         || s.contains("connection closed")
         || s.contains("not connected")
-        || s.contains("websocket")
-        || s.contains("channel")
-        || s.contains("no longer")
+        || s.contains("websocket connection closed")   // 原来是裸的 "websocket"
+        || s.contains("channel closed")                // 原来是裸的 "channel"
+        || s.contains("no longer connected")           // 原来是裸的 "no longer"
         || s.contains("session with given id not found")
         || s.contains("target closed")
         || s.contains("browser process")
@@ -2239,6 +2284,46 @@ mod tests {
         assert_eq!(uniq.len(), all.len(), "两个浏览器指向了同一个配置目录");
     }
 
+    /// 「做错一步，浏览器就被关掉重开」——判死判得太宽。
+    ///
+    /// 这个函数返回 true 的后果是把整个浏览器杀掉重开：当前页、滚动位置、填了一半的表单
+    /// 全没，Dock 里再多一个新窗口。所以它只该认**传输层真的断了**，不能认页面层的错误。
+    #[test]
+    fn 页面层的错误不许被判成浏览器死了() {
+        // 日常操作里再普通不过的错误，重试一下就好，绝不该导致重开浏览器
+        for page_level in [
+            "Node is no longer attached to the DOM",
+            "element is no longer attached to the document",
+            "Could not find node with given id",
+            "Cannot find context with specified id",
+            "Execution context was destroyed, most likely because of a navigation",
+            // 页面自己的报错顺着 eval 冒上来——以前裸的 "websocket" / "channel" 会全部命中
+            "Uncaught Error: WebSocket handshake failed on /api/channel/42",
+            "TypeError: channel is undefined",
+            // "no longer" 的其它说法：排除清单里没有它们，靠的是把裸匹配收成
+            // "no longer connected"。少了这几条，裸匹配放回去测试也不会红。
+            "the element is no longer visible",
+            "target frame no longer exists",
+            "this handle is no longer valid",
+            "navigation to https://example.com/channel/live timed out",
+        ] {
+            assert!(!is_dead_browser(page_level), "页面层错误被判成浏览器死了：{page_level}");
+        }
+        // 真的断了还得认得出来，别把闸收过头
+        for really_dead in [
+            "The underlying connection is closed",
+            "connection closed before message could be sent",
+            "WebSocket connection closed unexpectedly",
+            "channel closed",
+            "the browser is no longer connected",
+            "Not connected to the browser",
+            "session with given id not found",
+            "Target closed",
+            "browser process exited",
+        ] {
+            assert!(is_dead_browser(really_dead), "真的掉线没被认出来：{really_dead}");
+        }
+    }
     #[test]
     fn 接管到谁就说谁_认不出来也不许默认说成_chrome() {
         assert_eq!(brand_from_version(Some("Edg/126.0.2592.87")), "Microsoft Edge");
