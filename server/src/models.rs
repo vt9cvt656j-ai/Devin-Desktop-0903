@@ -24,8 +24,16 @@ use crate::AppState;
 /// to a host pays the handshake. No global timeout: streamed chat responses are
 /// open-ended; only the connect phase is bounded (per-request timeouts are added
 /// for the non-streaming calls that need them).
+/// 发给上游的 `User-Agent`。
+///
+/// reqwest 不配置就一个字节都不发，而"没有 User-Agent 的 POST"正是各家 WAF / CDN
+/// 最先挑出来限速或挂起的特征之一。上游是转卖商，前面挂什么中间层不由我们决定，
+/// 所以这里给一个稳定、可识别、带版本的标识——出问题时对方也能在自己日志里找到我们。
+const GATEWAY_USER_AGENT: &str = concat!("MichaelIDE-Gateway/", env!("CARGO_PKG_VERSION"));
+
 static GW_HTTP: LazyLock<reqwest::Client> = LazyLock::new(|| {
     reqwest::Client::builder()
+        .user_agent(GATEWAY_USER_AGENT)
         .connect_timeout(Duration::from_secs(15))
         .pool_idle_timeout(Duration::from_secs(90))
         .pool_max_idle_per_host(16)
@@ -41,6 +49,7 @@ static GW_HTTP: LazyLock<reqwest::Client> = LazyLock::new(|| {
 /// drops that connection, and the retry below can open a genuinely fresh one.
 fn build_chat_http_client(pool_idle_per_host: usize) -> reqwest::Client {
     reqwest::Client::builder()
+        .user_agent(GATEWAY_USER_AGENT)
         .http1_only()
         .connect_timeout(Duration::from_secs(5))
         .pool_idle_timeout(Duration::from_secs(30))
@@ -75,6 +84,24 @@ const MAX_ERROR_BODY_WAIT: Duration = Duration::from_secs(2);
 const ROUTE_BUDGET: Duration = Duration::from_secs(58);
 const CLIENT_DEADLINE_MARGIN: Duration = Duration::from_millis(750);
 const RESPONSE_DEADLINE_HEADER: &str = "x-ide-response-deadline-ms";
+/// 同一件事的**相对**说法："从我发出这一刻算，我还等这么多毫秒"。
+///
+/// 和上面那个绝对时间戳并存，因为两者的失效模式完全不同：绝对时间戳天然把上传耗时
+/// 算了进去，但它是**客户端墙上时钟**的时间戳，必须和服务端墙上时钟相减；相对预算
+/// 不牵涉任何时钟比对，只要客户端自己的定时器是对的，它就是对的。
+const RESPONSE_BUDGET_HEADER: &str = "x-ide-response-budget-ms";
+/// 两个头都在时，允许的时钟分歧。超过这个数就认定客户端时钟不可信，只采信相对预算。
+///
+/// 正常情况下这个差值就是「上传+排队耗时」的负值（几百毫秒到几秒），5 秒足够覆盖；
+/// 真正的时钟偏差通常是几十秒到几分钟量级，不会落在这个窗口里。
+const MAX_TRUSTED_CLOCK_SKEW: Duration = Duration::from_secs(5);
+/// 只有绝对时间戳（老客户端）时，低于这个剩余量就判定这个头不可信。
+///
+/// 客户端自己的耐心是 CLIENT_HEADER_TIMEOUT（60s）。请求还没被处理就已经烧掉一半
+/// 以上的耐心，"上传花了 30 秒"和"这台机器的时钟不准"这两种解释里，后者常见得多——
+/// 而真的已经超时的客户端会 abort 连接，我们根本收不到它。两种解释都指向同一个动作：
+/// 把这个头当不存在，退回网关自己的预算。
+const MIN_TRUSTED_ABSOLUTE_REMAINING: Duration = Duration::from_secs(30);
 
 /// Total time the gateway may spend hunting for a working upstream route before it
 /// must answer the client.
@@ -104,25 +131,131 @@ fn unix_time_ms() -> u64 {
         .min(u64::MAX as u128) as u64
 }
 
-fn route_budget_with_client_deadline(
+/// 客户端在两个头里表达的"我还能等多久"。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct ClientPatience {
+    /// `x-ide-response-budget-ms` —— 相对，不牵涉时钟。
+    budget_ms: Option<u64>,
+    /// `x-ide-response-deadline-ms` —— 绝对，是客户端墙上时钟的时间戳。
+    deadline_ms: Option<u64>,
+}
+
+/// 预算是怎么定下来的。只用于日志：把"这台机器的时钟不对"变成看得见的东西，
+/// 而不是变成"就他一个人用不了，日志里什么都没有"。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ClientPatienceVerdict {
+    /// 两个头都没有（BYOK、网页调试、更老的客户端）。
+    Absent,
+    /// 只有相对预算。
+    RelativeOnly,
+    /// 两个都有且互相印证：取更紧的那个（绝对那个把上传耗时也算了进去）。
+    ClocksAgree { skew_ms: i64 },
+    /// 两个都有但对不上：丢掉绝对时间戳，只用相对预算。
+    ClockSkewed { skew_ms: i64 },
+    /// 只有绝对时间戳，落在合理范围内。
+    AbsoluteOnly,
+    /// 只有绝对时间戳，且算出来的剩余量荒谬 —— 当作没有这个头。
+    AbsoluteUntrusted { remaining_ms: u64 },
+}
+
+/// 这一轮允许花在"找一条能用的线路"上的总时间。
+///
+/// 绝对截止时间戳曾经是唯一判据，而它有一个静默的致命失效模式：用户机器的时钟慢上
+/// 一两分钟（NTP 被挡、虚拟机休眠唤醒、装机时没对时），`deadline_ms` 就永远小于
+/// `now_ms`，预算恒为零 —— 那台机器上**每一次**请求都在开出上游调用之前就判死，而且
+/// 永远如此。服务端只看得到"这个人什么都发不出去"，看不出为什么。
+///
+/// 现在的判据分三层，每一层的理由不同：
+///   * 相对预算不牵涉时钟比对，所以它是**上限**，永远采信；
+///   * 绝对时间戳只用来**收紧**上限，且只在两个时钟对得上时才收紧（它的价值是把上传
+///     耗时算了进去，这一点相对预算做不到）；
+///   * 只有绝对时间戳的老客户端无法验证时钟，于是做合理性检查：算出来的剩余量少于
+///     客户端总耐心的一半，就当这个头不存在。
+///
+/// 判不准时宁可**多开**一次上游调用：客户端断开会 drop 掉这个 future，调用随即取消
+/// （见表头等待那一段的注释），代价是一次可能被放弃的转发；而判死的代价是一台机器
+/// 永久不可用。
+fn route_budget_with_client_patience(
     deep_thinking: bool,
-    client_deadline_ms: Option<u64>,
+    patience: ClientPatience,
     now_ms: u64,
-) -> Duration {
+) -> (Duration, ClientPatienceVerdict) {
     let fallback = route_budget_for(deep_thinking);
-    let Some(deadline_ms) = client_deadline_ms else {
-        return fallback;
+    let tighten = |limit: Duration| fallback.min(limit.saturating_sub(CLIENT_DEADLINE_MARGIN));
+
+    match (patience.budget_ms, patience.deadline_ms) {
+        (Some(budget_ms), Some(deadline_ms)) => {
+            let derived_ms = deadline_ms.saturating_sub(now_ms);
+            // 正常情况下这个差值就是上传耗时的负值；真正的时钟偏差要大一个量级。
+            let skew_ms = derived_ms as i64 - budget_ms as i64;
+            let relative = Duration::from_millis(budget_ms);
+            if skew_ms.unsigned_abs() <= MAX_TRUSTED_CLOCK_SKEW.as_millis() as u64 {
+                let absolute = Duration::from_millis(derived_ms);
+                (
+                    tighten(relative.min(absolute)),
+                    ClientPatienceVerdict::ClocksAgree { skew_ms },
+                )
+            } else {
+                (
+                    tighten(relative),
+                    ClientPatienceVerdict::ClockSkewed { skew_ms },
+                )
+            }
+        }
+        (Some(budget_ms), None) => (
+            tighten(Duration::from_millis(budget_ms)),
+            ClientPatienceVerdict::RelativeOnly,
+        ),
+        (None, Some(deadline_ms)) => {
+            let remaining = Duration::from_millis(deadline_ms.saturating_sub(now_ms));
+            if remaining < MIN_TRUSTED_ABSOLUTE_REMAINING {
+                (
+                    fallback,
+                    ClientPatienceVerdict::AbsoluteUntrusted {
+                        remaining_ms: remaining.as_millis().min(u64::MAX as u128) as u64,
+                    },
+                )
+            } else {
+                (tighten(remaining), ClientPatienceVerdict::AbsoluteOnly)
+            }
+        }
+        (None, None) => (fallback, ClientPatienceVerdict::Absent),
+    }
+}
+
+fn client_patience_from_headers(headers: &HeaderMap) -> ClientPatience {
+    let read = |name: &str| {
+        headers
+            .get(name)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.trim().parse::<u64>().ok())
     };
-    let remaining = Duration::from_millis(deadline_ms.saturating_sub(now_ms));
-    fallback.min(remaining.saturating_sub(CLIENT_DEADLINE_MARGIN))
+    ClientPatience {
+        budget_ms: read(RESPONSE_BUDGET_HEADER),
+        deadline_ms: read(RESPONSE_DEADLINE_HEADER),
+    }
 }
 
 fn route_budget_for_headers(headers: &HeaderMap, deep_thinking: bool) -> Duration {
-    let client_deadline_ms = headers
-        .get(RESPONSE_DEADLINE_HEADER)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.trim().parse::<u64>().ok());
-    route_budget_with_client_deadline(deep_thinking, client_deadline_ms, unix_time_ms())
+    let patience = client_patience_from_headers(headers);
+    let (budget, verdict) =
+        route_budget_with_client_patience(deep_thinking, patience, unix_time_ms());
+    match verdict {
+        // 这两条是"这台机器的时钟不对"的唯一可见证据，必须留痕：否则它只会表现为
+        // 某个用户莫名其妙什么都发不出去。
+        ClientPatienceVerdict::ClockSkewed { skew_ms } => tracing::warn!(
+            skew_ms,
+            budget_secs = budget.as_secs(),
+            "客户端时钟与服务端相差过大，已忽略绝对截止时间戳，改用相对预算"
+        ),
+        ClientPatienceVerdict::AbsoluteUntrusted { remaining_ms } => tracing::warn!(
+            remaining_ms,
+            budget_secs = budget.as_secs(),
+            "绝对截止时间戳算出的剩余量不可信（多半是客户端时钟不准），已退回网关预算"
+        ),
+        _ => {}
+    }
+    budget
 }
 
 /// Does this request ask the model to think before answering?
@@ -273,6 +406,34 @@ async fn wait_for_upstream_retry(delay: Duration, deadline: Instant) -> bool {
 
 static CHAT_UPSTREAM_ROUTE_COOLDOWNS: LazyLock<Mutex<HashMap<uuid::Uuid, Instant>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// 「这条线路最近把表头预算整整耗满才失败」的记号。
+///
+/// 和上面那张冷却表分开记，因为它们回答的是两个不同的问题：
+///   * 冷却表：这一轮**该不该优先绕开**它。只有在还有别的同模型线路时才有意义
+///     —— `route_count > 1` 那道判据就是这个意思。
+///   * 这张表：**绕不开的时候**（这个模型只有这一条线，或者用户点了强力版把候选
+///     压成了一条）该给它多少耐心。
+///
+/// 少了这一层，一条只会挂着不回话的线路，会让每一个落到它上面的请求都垫满 57 秒。
+/// 而客户端自己的耐心是 60 秒 —— 一次就烧光了，它那套 4 次重试一次都轮不上，用户
+/// 等一分钟只换回一条错误。记下来之后同一条线路改用短探测预算：仍然每次都试
+/// （所以上游一恢复就自动恢复，不需要任何人去后台改配置），但失败得起，客户端
+/// 的重试预算还剩得下。
+static CHAT_UPSTREAM_ROUTE_STALLS: LazyLock<Mutex<HashMap<uuid::Uuid, Instant>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// 记号的有效期。比冷却长得多：冷却是"这一轮换条线走"，而这个是"这条线的脾气"，
+/// 需要跨越好几轮请求才看得出来。
+const CHAT_UPSTREAM_STALL_MEMORY: Duration = Duration::from_secs(120);
+
+/// 对一条最近卡满过的线路，单次表头等待的上限。
+///
+/// 取 25 秒的依据是实测的表头延迟分布（2026-08-19，786 个样本）：p50 9.4s、p90 21.7s。
+/// 25 秒能兜住绝大多数**真的在干活**的请求，所以一条只是偶尔慢的线路不会被这条规则
+/// 误伤；而对一条真的挂住的线路，用户从等 57 秒变成等 25 秒，且 60 秒的客户端预算里
+/// 还剩得下一次完整重试。
+const CHAT_UPSTREAM_STALLED_PROBE_WAIT: Duration = Duration::from_secs(25);
 // 中转丢块自愈：jgy 等聚合中转在深思考超过 ~7.5K token 后会丢掉后面的 text/tool_use
 // 块并谎报 end_turn（对照实验：budget 6000 → thinking+text+tool_use 正常；budget 24000
 // → 只回 thinking 就 end_turn；官方 API 绝不会思考完直接收尾）。检出签名后该线路记
@@ -452,6 +613,50 @@ fn mark_route_cooldown_auth(id: uuid::Uuid) {
     }
 }
 
+/// 这条线路在记忆窗口内卡满过表头预算吗。
+fn route_recently_stalled(id: uuid::Uuid, now: Instant) -> bool {
+    let Ok(mut guard) = CHAT_UPSTREAM_ROUTE_STALLS.lock() else {
+        return false;
+    };
+    match guard.get(&id).copied() {
+        Some(until) if until > now => true,
+        Some(_) => {
+            guard.remove(&id);
+            false
+        }
+        None => false,
+    }
+}
+
+fn mark_route_stall(id: uuid::Uuid) {
+    if let Ok(mut guard) = CHAT_UPSTREAM_ROUTE_STALLS.lock() {
+        guard.insert(id, Instant::now() + CHAT_UPSTREAM_STALL_MEMORY);
+    }
+}
+
+/// 拿到表头就立刻清记号。
+///
+/// 这一条是"自愈"的全部机制：上游一旦恢复，第一个成功的请求就把短探测预算撤掉，
+/// 后面的请求拿回完整的 57 秒。没有它，短探测会自我延续 —— 被 25 秒截断的失败又写一
+/// 次记号，一条只是慢的线路会被永远按在 25 秒上。
+fn clear_route_stall(id: uuid::Uuid) {
+    if let Ok(mut guard) = CHAT_UPSTREAM_ROUTE_STALLS.lock() {
+        guard.remove(&id);
+    }
+}
+
+/// 这一次给这条线路多少表头耐心。
+///
+/// 正常情况就是按请求形态算出来的上限；只有当这条线路最近整整卡满过一次时，才压到
+/// 短探测预算。注意这是**减少**耐心，不是跳过 —— 请求照发，上游恢复了就照常拿到结果。
+fn header_wait_for_route(base: Duration, route_id: uuid::Uuid, now: Instant) -> Duration {
+    if route_recently_stalled(route_id, now) {
+        base.min(CHAT_UPSTREAM_STALLED_PROBE_WAIT)
+    } else {
+        base
+    }
+}
+
 fn thinking_clip_active(id: uuid::Uuid) -> bool {
     let Ok(mut guard) = THINKING_CLIP_ROUTES.lock() else {
         return false;
@@ -491,8 +696,23 @@ fn clip_thinking_budget(upstream_body: &mut serde_json::Value) -> bool {
     false
 }
 
-fn chat_upstream_attempt_suffix(route_count: usize, attempts: u32, last_status: u16) -> String {
-    if route_count <= 1 {
+/// 失败信息尾巴。`power_route` 是这一轮有没有带 `x-ide-power-route`。
+///
+/// 分出这一支是因为"只有 1 条同模型线路"在两种情况下含义完全不同：后台确实只配了一条，
+/// 用户无能为力；而带了强力版开关时是**这个开关自己**把候选压成了一条 —— 关掉它立刻就有
+/// 别的线路可走。不说清楚的话，用户看到的是一条自己没法处理的报错，而实际上出口就在
+/// 他刚点亮的那个图标上。
+fn chat_upstream_attempt_suffix(
+    route_count: usize,
+    attempts: u32,
+    last_status: u16,
+    power_route: bool,
+) -> String {
+    if power_route && route_count <= 1 {
+        format!(
+            "（已请求 {attempts} 次；「强力版」把这一轮限定在这 1 条线路上，关掉它可改走其它同模型线路；最后状态 {last_status}）"
+        )
+    } else if route_count <= 1 {
         format!("（已请求 {attempts} 次；当前只有 1 条同模型线路；最后状态 {last_status}）")
     } else {
         format!("（已请求 {attempts} 次 / {route_count} 条同模型线路；最后状态 {last_status}）")
@@ -6728,7 +6948,9 @@ pub async fn chat_completions(
                 // `send()` resolves as soon as the status line and headers arrive, so the
                 // response body/stream that follows is untouched. That is the piece
                 // reqwest's own `.timeout()` cannot express for a streaming response.
-                let header_wait = remaining.min(max_header_wait);
+                // 最近卡满过的线路只给短探测预算，见 header_wait_for_route。
+                let header_wait =
+                    remaining.min(header_wait_for_route(max_header_wait, candidate.id, Instant::now()));
                 let send_started = Instant::now();
                 let sent = match tokio::time::timeout(header_wait, req.send()).await {
                     Ok(result) => {
@@ -6745,7 +6967,9 @@ pub async fn chat_completions(
                                     upstream_header_ms = header_ms,
                                     gateway_request_elapsed_ms = gateway_request_started_at.elapsed().as_millis(),
                                     "upstream response headers received"
-                                )
+                                );
+                                // 这条线路又能回话了 —— 撤掉短探测预算，下一次拿回完整耐心。
+                                clear_route_stall(candidate.id);
                             }
                             Err(error) => tracing::warn!(
                                 request_id = request_id.as_deref().unwrap_or(""),
@@ -6778,6 +7002,7 @@ pub async fn chat_completions(
                             gateway_request_elapsed_ms = gateway_request_started_at.elapsed().as_millis(),
                             "upstream stalled before response headers"
                         );
+                        mark_route_stall(candidate.id);
                         route_failed_transient = true;
                         break;
                     }
@@ -6920,7 +7145,12 @@ pub async fn chat_completions(
                 let msg = format!(
                     "【{model_name}】{}{}",
                     friendly_upstream(err_status, &err_low),
-                    chat_upstream_attempt_suffix(route_count, attempted_sends, err_status)
+                    chat_upstream_attempt_suffix(
+                        route_count,
+                        attempted_sends,
+                        err_status,
+                        want_power
+                    )
                 );
                 if headers.contains_key("x-ide-mode") {
                     return Response::builder()
@@ -8180,12 +8410,26 @@ mod billing_tests {
     #[test]
     fn chat_gateway_error_suffix_reports_single_route_retries() {
         assert_eq!(
-            chat_upstream_attempt_suffix(1, 6, 502),
+            chat_upstream_attempt_suffix(1, 6, 502, false),
             "（已请求 6 次；当前只有 1 条同模型线路；最后状态 502）"
         );
         assert_eq!(
-            chat_upstream_attempt_suffix(3, 12, 504),
+            chat_upstream_attempt_suffix(3, 12, 504, false),
             "（已请求 12 次 / 3 条同模型线路；最后状态 504）"
+        );
+    }
+
+    /// 被强力版开关压成一条线路时，报错要把出口说出来。
+    #[test]
+    fn chat_gateway_error_suffix_names_the_power_toggle() {
+        let msg = chat_upstream_attempt_suffix(1, 1, 504, true);
+        assert!(msg.contains("强力版"), "{msg}");
+        assert!(msg.contains("关掉它"), "{msg}");
+
+        // 强力版开着但本来就有多条线路时不提它 —— 那时它不是原因。
+        assert_eq!(
+            chat_upstream_attempt_suffix(3, 3, 502, true),
+            "（已请求 3 次 / 3 条同模型线路；最后状态 502）"
         );
     }
 
@@ -11469,23 +11713,121 @@ mod upstream_timeout_tests {
         assert!(DEEP_MAX_HEADER_WAIT < ROUTE_BUDGET);
     }
 
+    fn patience(budget_ms: Option<u64>, deadline_ms: Option<u64>) -> ClientPatience {
+        ClientPatience {
+            budget_ms,
+            deadline_ms,
+        }
+    }
+
     #[test]
-    fn absolute_client_deadline_caps_every_gateway_retry() {
+    fn client_patience_caps_the_gateway_budget_when_the_clocks_agree() {
         let now_ms = 1_000_000;
+
+        // 两个头都在、只差一次上传的往返：绝对时间戳把上传耗时算了进去，所以它更紧，
+        // 取它。60s 预算 - 3s 上传 - 750ms 余量 = 56.25s，仍在 ROUTE_BUDGET 之下。
+        let (budget, verdict) = route_budget_with_client_patience(
+            false,
+            patience(Some(60_000), Some(now_ms + 57_000)),
+            now_ms,
+        );
+        assert_eq!(budget, Duration::from_millis(56_250));
+        assert_eq!(verdict, ClientPatienceVerdict::ClocksAgree { skew_ms: -3_000 });
+
+        // 客户端说自己只剩 4 秒：这是它自己的定时器，不牵涉任何时钟比对，照办。
+        let (budget, verdict) =
+            route_budget_with_client_patience(false, patience(Some(4_000), None), now_ms);
+        assert_eq!(budget, Duration::from_millis(3_250));
+        assert_eq!(verdict, ClientPatienceVerdict::RelativeOnly);
+
+        // 两个头都没有：网关自己的预算。
+        let (budget, verdict) = route_budget_with_client_patience(false, patience(None, None), now_ms);
+        assert_eq!(budget, ROUTE_BUDGET);
+        assert_eq!(verdict, ClientPatienceVerdict::Absent);
+    }
+
+    /// 时钟不准的机器**必须**还能用。
+    ///
+    /// 这是这一组里最重要的一条。绝对截止时间戳是客户端墙上时钟的时间戳，机器慢两分钟
+    /// 就恒小于服务端的 now_ms，旧判据算出预算 0 —— 那台机器上每一次请求都在开出上游
+    /// 调用之前判死，而且永远如此，服务端日志里还看不出原因。
+    #[test]
+    fn a_skewed_client_clock_never_zeroes_the_budget() {
+        let now_ms = 1_000_000_000;
+
+        // 慢两分钟 + 带相对预算（新客户端）：丢掉绝对时间戳，用相对预算。
+        let (budget, verdict) = route_budget_with_client_patience(
+            true,
+            patience(Some(60_000), Some(now_ms - 120_000)),
+            now_ms,
+        );
+        assert_eq!(budget, ROUTE_BUDGET.min(Duration::from_millis(59_250)));
+        assert!(
+            matches!(verdict, ClientPatienceVerdict::ClockSkewed { .. }),
+            "时钟差两分钟必须被认出来，而不是当成「这个请求已经过期」"
+        );
+
+        // 慢两分钟 + 只有绝对时间戳（尚未升级的客户端）：合理性检查兜住，退回网关预算。
+        let (budget, verdict) =
+            route_budget_with_client_patience(true, patience(None, Some(now_ms - 120_000)), now_ms);
+        assert_eq!(budget, ROUTE_BUDGET);
         assert_eq!(
-            route_budget_with_client_deadline(false, Some(now_ms + 4_000), now_ms),
-            Duration::from_millis(3_250),
+            verdict,
+            ClientPatienceVerdict::AbsoluteUntrusted { remaining_ms: 0 }
+        );
+
+        // 快两分钟：算出来的剩余量远超客户端自己的耐心，被 ROUTE_BUDGET 封顶即可。
+        let (budget, _) =
+            route_budget_with_client_patience(false, patience(None, Some(now_ms + 120_000)), now_ms);
+        assert_eq!(budget, ROUTE_BUDGET);
+    }
+
+    /// 合理性检查的边界：刚好卡在门槛上的绝对时间戳仍然采信，低于门槛才丢弃。
+    #[test]
+    fn only_an_implausibly_small_absolute_remaining_is_discarded() {
+        let now_ms = 1_000_000;
+        let threshold_ms = MIN_TRUSTED_ABSOLUTE_REMAINING.as_millis() as u64;
+
+        let (budget, verdict) = route_budget_with_client_patience(
+            false,
+            patience(None, Some(now_ms + threshold_ms)),
+            now_ms,
         );
         assert_eq!(
-            route_budget_with_client_deadline(true, Some(now_ms - 1), now_ms),
-            Duration::ZERO,
-            "an already-expired desktop request must not open an upstream call"
+            budget,
+            Duration::from_millis(threshold_ms) - CLIENT_DEADLINE_MARGIN
         );
+        assert_eq!(verdict, ClientPatienceVerdict::AbsoluteOnly);
+
+        let (budget, verdict) = route_budget_with_client_patience(
+            false,
+            patience(None, Some(now_ms + threshold_ms - 1)),
+            now_ms,
+        );
+        assert_eq!(budget, ROUTE_BUDGET);
+        assert!(matches!(
+            verdict,
+            ClientPatienceVerdict::AbsoluteUntrusted { .. }
+        ));
+    }
+
+    #[test]
+    fn client_patience_reads_both_headers() {
+        let mut headers = HeaderMap::new();
+        headers.insert(RESPONSE_BUDGET_HEADER, "60000".parse().unwrap());
+        headers.insert(RESPONSE_DEADLINE_HEADER, "1700000000000".parse().unwrap());
         assert_eq!(
-            route_budget_with_client_deadline(false, None, now_ms),
-            ROUTE_BUDGET,
-            "older/BYOK clients use the bounded gateway fallback"
+            client_patience_from_headers(&headers),
+            ClientPatience {
+                budget_ms: Some(60_000),
+                deadline_ms: Some(1_700_000_000_000),
+            }
         );
+
+        // 垃圾值不得被当成 0（0 会被解读成「一点耐心都没有」）。
+        let mut junk = HeaderMap::new();
+        junk.insert(RESPONSE_BUDGET_HEADER, "abc".parse().unwrap());
+        assert_eq!(client_patience_from_headers(&junk), ClientPatience::default());
     }
 }
 
@@ -13152,6 +13494,59 @@ mod route_cooldown_tests {
         mark_route_cooldown(id);
         let second = route_cooldown_remaining(id, Instant::now()).unwrap();
         assert!(second + Duration::from_secs(2) >= first, "冷却被缩短了");
+    }
+
+    /// 一条挂着不回话的线路，不该让每一个请求都垫满整段表头预算。
+    ///
+    /// 冷却表管不到这件事：`route_count > 1` 那道判据决定的是"这一轮换条线走"，而这里
+    /// 说的正是**换不了**的情形（模型只有一条线，或强力版把候选压成了一条）。
+    #[test]
+    fn a_stalling_route_gets_a_short_probe_instead_of_the_full_budget() {
+        let id = uuid::Uuid::new_v4();
+        let base = STANDARD_MAX_HEADER_WAIT;
+
+        // 没有前科：完整预算。
+        assert_eq!(header_wait_for_route(base, id, Instant::now()), base);
+
+        // 卡满过一次之后：压到短探测预算——仍然会发，只是失败得起。
+        mark_route_stall(id);
+        assert_eq!(
+            header_wait_for_route(base, id, Instant::now()),
+            CHAT_UPSTREAM_STALLED_PROBE_WAIT
+        );
+        assert!(
+            CHAT_UPSTREAM_STALLED_PROBE_WAIT < STANDARD_MAX_HEADER_WAIT,
+            "短探测预算必须真的更短，否则这条规则什么也没做"
+        );
+        // 而且要短到客户端 60 秒的耐心里还塞得下一次完整重试。
+        assert!(
+            CHAT_UPSTREAM_STALLED_PROBE_WAIT * 2 < CLIENT_HEADER_TIMEOUT,
+            "被截断一次之后必须还剩得下一次重试，否则用户还是只等到一条错误"
+        );
+    }
+
+    /// 自愈：拿到一次表头就撤销短探测，不需要任何人去后台动配置。
+    #[test]
+    fn one_successful_response_restores_the_full_header_budget() {
+        let id = uuid::Uuid::new_v4();
+        mark_route_stall(id);
+        assert!(route_recently_stalled(id, Instant::now()));
+
+        clear_route_stall(id);
+        assert!(!route_recently_stalled(id, Instant::now()));
+        assert_eq!(
+            header_wait_for_route(STANDARD_MAX_HEADER_WAIT, id, Instant::now()),
+            STANDARD_MAX_HEADER_WAIT
+        );
+    }
+
+    /// 记号会自己过期，不会把一条早就恢复的线路永远按在短探测上。
+    #[test]
+    fn the_stall_mark_expires_on_its_own() {
+        let id = uuid::Uuid::new_v4();
+        mark_route_stall(id);
+        let after_memory = Instant::now() + CHAT_UPSTREAM_STALL_MEMORY + Duration::from_secs(1);
+        assert!(!route_recently_stalled(id, after_memory));
     }
 }
 

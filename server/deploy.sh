@@ -63,17 +63,52 @@ fi
 # 它在 set -e 下也是安全的。
 ssh_run() {
   local attempt status
-  for attempt in 1 2 3; do
+  for attempt in 1 2 3 4 5; do
     status=0
     ssh "${SSH_ARGS[@]}" "$REMOTE" "$@" || status=$?
     if [ "$status" -eq 0 ]; then
       return 0
     fi
-    echo "  remote step failed (exit ${status}); retrying" >&2
+    # 255 是 ssh **自己**失败（握手掉线/连不上/认证不过），不是远端命令的返回值。
+    # 这台机器的握手会随机以 "banner exchange ... invalid format" 掉，所以传输失败
+    # 多给几次；远端命令自己报的错重试没意义，早点把真实退出码交出去。
+    if [ "$status" -ne 255 ]; then
+      echo "  remote step failed (exit ${status}); retrying" >&2
+      [ "$attempt" -ge 3 ] && break
+    else
+      echo "  SSH 握手失败（第 ${attempt} 次，exit 255），重试…" >&2
+    fi
     sleep $((attempt * 2))
   done
-  echo "remote step failed after 3 attempts (last exit ${status})" >&2
+  echo "remote step failed after ${attempt} attempts (last exit ${status})" >&2
   return "$status"
+}
+
+# 远端真值探测：把「SSH 没连上」和「远端命令回答『否』」彻底分开。
+#
+# ssh 用 **255** 表示它自己失败；任何其它退出码都是远端命令自己的返回值。原来 .env
+# 那道检查用的是 ssh_run，两者一律当成"远端说否"——于是这台机器上偶发的
+# "banner exchange ... invalid format" 被翻译成了「服务器上没有 .env」。那是一条自信、
+# 具体、而且完全错误的结论：.env 好端端地在那儿，照着这条提示去做（复制 .env.example
+# 覆盖上去）会把生产的密码和密钥直接抹掉。
+#
+# 2026-08-19 实拍：连掉三次 → 脚本报 "No .env exists on the server" → 部署中止。
+# 传输故障绝不能变成关于远端状态的断言；连不上就说连不上，什么都不判断。
+ssh_true() {
+  local attempt status
+  for attempt in 1 2 3 4 5 6; do
+    status=0
+    ssh "${SSH_ARGS[@]}" "$REMOTE" "$@" >/dev/null 2>&1 || status=$?
+    if [ "$status" -ne 255 ]; then
+      return "$status"   # 远端真的回答了：0 = 是，非 0 = 否
+    fi
+    echo "  SSH 握手失败（第 ${attempt} 次），重试…" >&2
+    sleep $((attempt * 3))
+  done
+  echo "" >&2
+  echo "SSH 连不上 ${REMOTE}:${SERVER_PORT}（连续 6 次握手失败）。" >&2
+  echo "这不是远端的状态，是连接问题——本次没有做任何判断，也没有改动服务器上任何东西。" >&2
+  exit 2
 }
 
 RSYNC_RSH="ssh -p $(printf '%q' "$SERVER_PORT") -o BatchMode=yes -o ConnectTimeout=10 -o ConnectionAttempts=3"
@@ -137,7 +172,7 @@ rsync_run() {
 rsync_run
 
 echo "checking for ${REMOTE_DIR}/${ENV_FILE} on the server"
-if ! ssh_run "test -f $REMOTE_Q/$(printf '%q' "$ENV_FILE")"; then
+if ! ssh_true "test -f $REMOTE_Q/$(printf '%q' "$ENV_FILE")"; then
   echo "No ${ENV_FILE} exists on the server. Copy .env.example to ${ENV_FILE} and fill in"
   echo "   JWT_SECRET / POSTGRES_PASSWORD / QQ_SMTP_* before the first run."
   if [ "$TARGET" = "test" ]; then
