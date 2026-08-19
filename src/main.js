@@ -788,6 +788,17 @@ async function _realAiFetch(config, messages, tools, onEvent) {
       activeAttemptController = typeof AbortController !== "undefined" ? new AbortController() : null;
       const deadlineAt = Date.now() + _AI_RESPONSE_HEADERS_DEADLINE_MS;
       _h["x-ide-response-deadline-ms"] = String(deadlineAt);
+      // 同一件事的相对说法，两个一起发。
+      //
+      // 上面那个是 Date.now() —— **本机墙上时钟**的时间戳，而网关要拿它减自己的时钟才
+      // 能算出"还剩多久"。机器时钟慢上一两分钟（NTP 被挡、虚拟机休眠唤醒、装机没对时），
+      // 这个差就永远是负的，网关那边算出的预算恒为零：那台机器上每一次请求都在发往上游
+      // 之前就被判死，而且永远如此，两边日志里都看不出为什么。
+      //
+      // 相对预算不牵涉任何时钟比对 —— 它就是本地定时器的那个数（下面 setTimeout 用的
+      // 同一个常量），所以时钟准不准都不影响它。网关优先采信这一个，绝对时间戳只用来
+      // 收紧（它的价值是把上传耗时也算进去了），且只在两个时钟对得上时才收紧。
+      _h["x-ide-response-budget-ms"] = String(_AI_RESPONSE_HEADERS_DEADLINE_MS);
       let timer = null;
       if (activeAttemptController) timer = setTimeout(() => activeAttemptController.abort(), _AI_RESPONSE_HEADERS_DEADLINE_MS);
       try {
@@ -26755,7 +26766,10 @@ async function sendPrompt(text, attachments = [], readyConfig = null, opts = {})
           // prefill 结尾不许有空白，否则上游直接 400。
           const partial = String(acc || "").replace(/\s+$/, "");
           if (!partial) return null;   // 一个字都没出过 → 那是普通重试的场景，不是续传
-          const resumeMsgs = [...requestMessages, { role: "assistant", content: partial }];
+          // 同 agent 那条：prefill 语义只在原生 Anthropic 线路成立，把要求显式写出来。
+          const resumeMsgs = [...requestMessages,
+            { role: "user", content: _ORCH_NOTE + "[断点续写] 紧接着的下一条 assistant 消息是被网络截断的**半句话**，不是一个已经说完的回合。直接从它的最后一个字往下接着写：不要重述任务、不要重新开场、不要说「明白」「我这就开始」，也不要重复任何已经写过的内容。如果中断时你正在发出一次工具调用，把那次调用完整地重新发一遍。" },
+            { role: "assistant", content: partial }];
           showAgentRetryToast(
             `连接中断，正在从断点继续（${resume}/${resumeLimit}）——已生成的内容会保留，不重发整条消息`,
             true,
@@ -40215,7 +40229,22 @@ function _isRateLimitedAiError(msg) {
   const raw = _stripAiRetryPrefix(msg);
   return /\b429\b|too many requests|rate.?limit|并发请求过多|请求过于频繁|过于频繁/i.test(raw);
 }
+/**
+ * 上游的**配置性**失败：重发多少次都不会变好。
+ *
+ * key 无效、未授权、账户异常、没有可用账号、余额不足——这些是后台配置或账务问题，
+ * 不是网络抖动。以前它们里有几条会被下面 _isRetryableAiError 的第二条正则认领
+ * （"上游暂不可用（供应商未授权 / 账户异常）"、"上游暂无可用账号"），于是同一个 401，
+ * 网关换个措辞就变成"可以续传"，用户白等三轮续传再看到同一条错误。
+ * 判据挂在措辞上是不对的，但网关的措辞就是我们唯一能拿到的东西——那就把它认全，
+ * 并且放在最前面，让它压过所有"看起来像网络问题"的词。
+ */
+function _isUnrecoverableUpstreamError(msg) {
+  const t = String(msg || "");
+  return /424|Failed Dependency|密钥无效|key\s*无效|未授权|账户异常|暂无可用账号|额度不足|余额不足|欠费|无可用线路/i.test(t);
+}
 function _isRetryableAiError(msg) {
+  if (_isUnrecoverableUpstreamError(msg)) return false;
   if (_isRateLimitedAiError(msg)) return false;
   if (_isProviderGatewayStatusError(msg)) return true;
   const m = String(msg || "").toLowerCase();
@@ -40312,6 +40341,7 @@ async function _runModelRequestWithRetry({
   let attemptsRun = 0;
   let currentInvoke = invoke;
   let resumesUsed = 0;
+  let stallResumesUsed = 0;   // 停滞类单独记账：它的预算只有 1，见下面 canResume
   let rateLimitWaitsUsed = 0;
 
   // 续传不消耗重试配额：重试是"这次请求没能开始"，续传是"请求好好地开始了、中途断了"，
@@ -40440,9 +40470,20 @@ async function _runModelRequestWithRetry({
 
     // 已经产出过内容 + 断的是连接 → 从断点接着写。不重放提示，因此不会重复正文、
     // 不会重复执行工具、也不会把这一轮的钱再花一遍（提示走缓存）。
+    //
+    // 但「停滞」和「掉线」不是一回事，而这里以前把它们当成了一回事——代价是用户实拍的
+    // 那 7 分 10 秒：桌面端停滞看门狗自己抛出「模型连续 90 秒没有继续生成有效内容」，
+    // 这句话又正好被 _isRetryableAiError 的最后一条正则（"没有(?:继续)?生成有效内容"）
+    // 认领，于是每一次超时都触发一次续传，每一次续传又开一个全新的 90 秒空窗。
+    // 三个续传名额烧完 = 4 × 90 秒，全程只产出四句"我这就开始写"，一个文件都没有。
+    //
+    // 掉线值得续：连接没了，换一条重新接上多半就好。停滞不值得续三次：上游正卡着不出字，
+    // 带着同一份上下文再问一遍，它大概率继续卡。给 1 次机会（可能真是偶发），不给 3 次。
+    const _stalled = _isStalledAiError(attemptError);
     const canResume = hadModelProgress
       && typeof buildResumeInvoke === "function"
       && resumesUsed < boundedResumeLimit
+      && !(_stalled && stallResumesUsed >= 1)
       && _isRetryableAiError(attemptError);
     if (canResume) {
       let next = null;
@@ -40456,6 +40497,7 @@ async function _runModelRequestWithRetry({
       if (!isLive()) return { attempts: attempt, cancelled: true, error: "", hadModelProgress, resumes: resumesUsed };
       if (typeof next === "function") {
         resumesUsed += 1;
+        if (_stalled) stallResumesUsed += 1;
         currentInvoke = next;
         try { onResume({ resume: resumesUsed, resumeLimit: boundedResumeLimit, error: attemptError }); } catch {}
         continue;   // 不推进 attemptIndex：续传不占重试配额
@@ -42448,7 +42490,16 @@ async function _agentModelTurn({ config, messages, toolSchemas, toolRegistry = n
             // 重画进一个新段落，于是同一段话出现两次。把孤儿节点撤掉，让这一次重画成为唯一的一份。
             _suppressNarrativeForTools = false;
             if (_degradedProseEl) { try { _degradedProseEl.remove(); } catch {} _degradedProseEl = null; }
-            const resumeMsgs = [..._l0Msgs, { role: "assistant", content: partial }];
+            // 光把半截正文当末条 assistant 挂上去是不够的。那套「末条 assistant = 续写
+            // （prefill）」的语义只在**原生 Anthropic 线路**上成立，而这一层看不见网关最终
+            // 选了哪条线路——走 OpenAI 兼容透传时，末条 assistant 就是一条已完成的历史轮次，
+            // 模型会**回复**它而不是接着它写。用户实拍到的正是这个形状：续传之后模型说
+            // 「明白，你在等我完成上一轮的任务」——那是在答话，不是在续写。
+            // 所以把要求显式说出来，放在 assistant 之前（末位仍是 assistant，原生 prefill
+            // 语义一点没变），两种线路上都能拿到正确行为。
+            const resumeMsgs = [..._l0Msgs,
+              { role: "user", content: _ORCH_NOTE + "[断点续写] 紧接着的下一条 assistant 消息是被网络截断的**半句话**，不是一个已经说完的回合。直接从它的最后一个字往下接着写：不要重述任务、不要重新开场、不要说「明白」「我这就开始」，也不要重复任何已经写过的内容。如果中断时你正在发出一次工具调用，把那次调用完整地重新发一遍。" },
+              { role: "assistant", content: partial }];
             _recoveryLine(body, `连接中断，正在从断点继续（${resume}/${resumeLimit}）——已生成的内容会保留`);
             showAgentRetryToast(
               `连接中断，正在从断点继续（${resume}/${resumeLimit}）——已生成的内容会保留，不重跑本轮`,

@@ -16,6 +16,23 @@ const HIGH_STREAM_STALL_TIMEOUT_SECS: u64 = 90;
 const EXTENDED_FIRST_STREAM_PROGRESS_TIMEOUT_SECS: u64 = 60;
 const EXTENDED_EMPTY_STREAM_PROGRESS_TIMEOUT_SECS: u64 = 60;
 const EXTENDED_STREAM_STALL_TIMEOUT_SECS: u64 = 120;
+/// 「连接还活着，但模型半天不吐字」时的兜底上限。
+///
+/// 上面那些 stall 档位回答的是**连接是不是死了**，而这个问题只有在一个字节都收不到时才
+/// 成立。网关每 15 秒推一次 SSE 心跳（`: ping`）正是为了穿过运营商 NAT——心跳照常到达时，
+/// 连接显然是好的，模型只是在憋一段长输出或在想。此时用 90 秒把它掐掉，等于客户端替
+/// 网关做了它做不了的判断：只有网关分得清"上游沉默"和"连接断了"，也只有它能给出真实
+/// 原因（`upstream stream stalled for N seconds`）。客户端抢先开枪，那句诊断就永远到不了
+/// 用户手里，用户看到的是一句无从下手的"连接中断"。
+///
+/// 所以有字节在流动时改用这一档。取值高于网关对普通请求的空闲守卫（180s），
+/// 让网关先说话；思考类请求网关给到 600s，但让用户对着一个没有任何输出的界面等十分钟
+/// 同样不可接受，所以这里封在 300 秒——一个"连接活着却五分钟零产出"的请求，客户端有理由
+/// 自己收手。这是刻意的取舍，不是照抄网关的数。
+const STANDARD_CONTENT_BACKSTOP_SECS: u64 = 200;
+const THINKING_CONTENT_BACKSTOP_SECS: u64 = 300;
+/// 多久收不到任何字节就认定连接真的没了。网关心跳 15 秒一次，连丢 4 次不是抖动。
+const STREAM_LIVENESS_SECS: u64 = 60;
 
 const FIRST_STREAM_PROGRESS_TIMEOUT_ENV: &str = "MICHAEL_AI_FIRST_PROGRESS_TIMEOUT_SECS";
 const EMPTY_STREAM_PROGRESS_TIMEOUT_ENV: &str = "MICHAEL_AI_EMPTY_STREAM_TIMEOUT_SECS";
@@ -34,6 +51,13 @@ const MAX_AI_ERROR_BODY_BYTES: usize = 64 * 1024;
 const CANCEL_POLL: Duration = Duration::from_millis(100);
 const CANCELLED_AI_REQUEST: &str = "AI request cancelled";
 const RESPONSE_DEADLINE_HEADER: &str = "x-ide-response-deadline-ms";
+/// 同一个截止时间的相对说法，和上面那个一起发。
+///
+/// 绝对时间戳是**本机墙上时钟**的值，网关要减自己的时钟才能算出"还剩多久"。机器时钟
+/// 慢上一两分钟（NTP 被挡、虚拟机休眠唤醒、装机没对时），这个差就永远是负的，网关算出
+/// 的预算恒为零 —— 那台机器上每一次请求都在发往上游之前就被判死，而且永远如此，两边
+/// 日志里都看不出为什么。相对预算不牵涉时钟比对，网关优先采信它。
+const RESPONSE_BUDGET_HEADER: &str = "x-ide-response-budget-ms";
 const MICHAEL_GATEWAY_HEALTH_URL: &str = "https://code.mrday.one/health";
 const GATEWAY_TRANSPORT_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(50);
 const GATEWAY_TRANSPORT_WARMUP_TIMEOUT: Duration = Duration::from_secs(5);
@@ -778,7 +802,16 @@ fn with_response_deadline_header(
     request: reqwest::RequestBuilder,
     deadline: ResponseHeadersDeadline,
 ) -> reqwest::RequestBuilder {
-    request.header(RESPONSE_DEADLINE_HEADER, deadline.unix_ms.to_string())
+    request
+        .header(RESPONSE_DEADLINE_HEADER, deadline.unix_ms.to_string())
+        .header(
+            RESPONSE_BUDGET_HEADER,
+            deadline
+                .budget
+                .as_millis()
+                .min(u64::MAX as u128)
+                .to_string(),
+        )
 }
 
 fn request_was_cancelled(cancel: Option<&AtomicBool>) -> bool {
@@ -818,6 +851,8 @@ struct StreamTimeouts {
     first_progress: Duration,
     empty_stream: Duration,
     stall: Duration,
+    /// 有字节在流动时的内容停滞上限，见 STANDARD_CONTENT_BACKSTOP_SECS。
+    content_backstop: Duration,
 }
 
 impl StreamTimeouts {
@@ -857,6 +892,7 @@ impl StreamTimeouts {
                 EXTENDED_FIRST_STREAM_PROGRESS_TIMEOUT_SECS,
                 EXTENDED_EMPTY_STREAM_PROGRESS_TIMEOUT_SECS,
                 EXTENDED_STREAM_STALL_TIMEOUT_SECS,
+                THINKING_CONTENT_BACKSTOP_SECS,
             )
         } else if effort.eq_ignore_ascii_case("high")
             || ui_effort.eq_ignore_ascii_case("high")
@@ -867,6 +903,7 @@ impl StreamTimeouts {
                 HIGH_FIRST_STREAM_PROGRESS_TIMEOUT_SECS,
                 HIGH_EMPTY_STREAM_PROGRESS_TIMEOUT_SECS,
                 HIGH_STREAM_STALL_TIMEOUT_SECS,
+                THINKING_CONTENT_BACKSTOP_SECS,
             )
         } else {
             (
@@ -874,6 +911,7 @@ impl StreamTimeouts {
                 STANDARD_FIRST_STREAM_PROGRESS_TIMEOUT_SECS,
                 STANDARD_EMPTY_STREAM_PROGRESS_TIMEOUT_SECS,
                 STANDARD_STREAM_STALL_TIMEOUT_SECS,
+                STANDARD_CONTENT_BACKSTOP_SECS,
             )
         };
 
@@ -897,6 +935,7 @@ impl StreamTimeouts {
                 STREAM_STALL_TIMEOUT_MIN_SECS,
                 STREAM_STALL_TIMEOUT_MAX_SECS,
             ),
+            content_backstop: Duration::from_secs(defaults.4),
         }
     }
 }
@@ -972,6 +1011,8 @@ async fn send_with_response_headers_deadline(
 #[derive(Debug)]
 struct StreamProgressDeadline {
     last_progress: Instant,
+    /// 最后一次收到任何字节的时刻（含心跳）。区分"连接死了"和"模型没在吐字"。
+    last_byte: Instant,
     first_activity: Option<Instant>,
     has_progress: bool,
     timeouts: StreamTimeouts,
@@ -981,6 +1022,7 @@ impl StreamProgressDeadline {
     fn new(now: Instant, timeouts: StreamTimeouts) -> Self {
         Self {
             last_progress: now,
+            last_byte: now,
             first_activity: None,
             has_progress: false,
             timeouts,
@@ -991,6 +1033,12 @@ impl StreamProgressDeadline {
         if self.first_activity.is_none() {
             self.first_activity = Some(now);
         }
+    }
+
+    /// 任何原始字节——**包括 SSE 心跳注释**。它只回答"连接还通不通"，
+    /// 不回答"模型有没有在产出"，这正是它和 record() 的分工。
+    fn record_bytes(&mut self, now: Instant) {
+        self.last_byte = now;
     }
 
     fn record(&mut self, now: Instant) {
@@ -1006,9 +1054,23 @@ impl StreamProgressDeadline {
         true
     }
 
-    fn limit_and_anchor(&self) -> (Duration, Instant) {
+    fn limit_and_anchor(&self, now: Instant) -> (Duration, Instant) {
         if self.has_progress {
-            (self.timeouts.stall, self.last_progress)
+            // 活性和产出是两个问题，混成一个就会掐掉健康的流。
+            //
+            // 网关每 15 秒推一次 SSE 心跳，而心跳是 SSE **注释**、没有 data 负载，永远走不到
+            // record()。于是一个正在憋大段 write_file 参数、或者单纯在想的模型，会被客户端
+            // 判成"连接中断"——而字节其实一直在到。浏览器那条路早就修过这一层
+            // （main.js 的 LIVENESS_MS / CONTENT_BACKSTOP_MS），桌面端这条一直没有，
+            // 用户实拍的 90 秒掐断走的正是这里。
+            let heartbeat_alive =
+                now.duration_since(self.last_byte) < Duration::from_secs(STREAM_LIVENESS_SECS);
+            let limit = if heartbeat_alive {
+                self.timeouts.stall.max(self.timeouts.content_backstop)
+            } else {
+                self.timeouts.stall
+            };
+            (limit, self.last_progress)
         } else {
             // Response headers, SSE comments, and empty control frames do not buy
             // another timeout window. One physical attempt has sixty seconds from
@@ -1018,13 +1080,13 @@ impl StreamProgressDeadline {
     }
 
     fn remaining(&self, now: Instant) -> Option<Duration> {
-        let (limit, anchor) = self.limit_and_anchor();
+        let (limit, anchor) = self.limit_and_anchor(now);
         let elapsed = now.duration_since(anchor);
         (elapsed < limit).then(|| limit - elapsed)
     }
 
-    fn error_message(&self) -> String {
-        let (limit, _) = self.limit_and_anchor();
+    fn error_message(&self, now: Instant) -> String {
+        let (limit, _) = self.limit_and_anchor(now);
         let seconds = duration_seconds_label(limit);
         if self.has_progress {
             format!("模型连续 {seconds} 秒没有继续生成有效内容，已停止本轮，请重试。")
@@ -1719,6 +1781,7 @@ mod stream_timeout_tests {
             first_progress: Duration::from_secs(60),
             empty_stream: Duration::from_secs(60),
             stall: Duration::from_secs(60),
+            content_backstop: Duration::from_secs(STANDARD_CONTENT_BACKSTOP_SECS),
         };
         assert_eq!(timeouts(Some("medium"), None), standard);
         assert_eq!(timeouts(Some("low"), None), standard);
@@ -1734,6 +1797,7 @@ mod stream_timeout_tests {
                 first_progress: Duration::from_secs(60),
                 empty_stream: Duration::from_secs(60),
                 stall: Duration::from_secs(90),
+                content_backstop: Duration::from_secs(THINKING_CONTENT_BACKSTOP_SECS),
             }
         );
         let extended = StreamTimeouts {
@@ -1741,6 +1805,7 @@ mod stream_timeout_tests {
             first_progress: Duration::from_secs(60),
             empty_stream: Duration::from_secs(60),
             stall: Duration::from_secs(120),
+            content_backstop: Duration::from_secs(THINKING_CONTENT_BACKSTOP_SECS),
         };
         assert_eq!(timeouts(Some("max"), None), extended);
         // gpt-5.6 系把 xhigh 原样透传——它必须和 max 同档。
@@ -1762,6 +1827,7 @@ mod stream_timeout_tests {
                 first_progress: Duration::from_secs(60),
                 empty_stream: Duration::from_secs(60),
                 stall: Duration::from_secs(90),
+                content_backstop: Duration::from_secs(THINKING_CONTENT_BACKSTOP_SECS),
             },
             "adaptive Claude thinking gets the same full per-attempt pre-progress window"
         );
@@ -1784,6 +1850,7 @@ mod stream_timeout_tests {
                 first_progress: Duration::from_secs(60),
                 empty_stream: Duration::from_secs(60),
                 stall: Duration::from_secs(61),
+                content_backstop: Duration::from_secs(THINKING_CONTENT_BACKSTOP_SECS),
             }
         );
 
@@ -1853,6 +1920,78 @@ mod stream_timeout_tests {
         );
     }
 
+    /// 用户实拍：模型在写一份长文档，连接一直好好的（网关每 15 秒推心跳），桌面端却在
+    /// 90 秒时单方面宣布「连接中断」，然后续传三次、每次再空烧 90 秒，7 分钟零产出。
+    ///
+    /// 活性（连接通不通）和产出（模型吐不吐字）是两个问题。心跳是 SSE 注释、没有 data
+    /// 负载，永远走不到 record()，所以只看 stall 的话，一个正在憋长输出的模型和一条死掉的
+    /// 连接长得一模一样。浏览器那条路早就分开了，桌面端这条一直没有。
+    #[test]
+    fn heartbeats_keep_a_live_stream_from_being_called_a_disconnect() {
+        let timeouts = timeouts(Some("medium"), None); // stall 60s / backstop 200s
+        let started = Instant::now();
+        let mut progress = StreamProgressDeadline::new(started, timeouts);
+        progress.record(started); // 出过字了，进入 stall 判据
+
+        // 心跳每 15 秒一次，一直在到 —— 连接是好的，不许按 60 秒掐。
+        for tick in 1..=8 {
+            progress.record_bytes(started + Duration::from_secs(15 * tick));
+        }
+        let now = started + Duration::from_secs(120);
+        assert!(
+            progress.remaining(now).is_some(),
+            "心跳还在到就说明连接是通的，120 秒不该被判成掉线",
+        );
+        // 但兜底仍然有界：不是无限等。
+        assert_eq!(
+            progress.remaining(started + timeouts.content_backstop),
+            None,
+            "兜底档到期照样收手，别变成无限等",
+        );
+
+        // 对照：心跳停了 → 连接真的没了 → 回到 stall 那一档，早点告诉用户。
+        // 注意判死时刻要真的越过活性窗（最后一个字节 + 60s），否则测的还是心跳活着那条路。
+        let mut dead = StreamProgressDeadline::new(started, timeouts);
+        dead.record(started);
+        dead.record_bytes(started + Duration::from_secs(5));
+        assert!(
+            dead.remaining(started + Duration::from_secs(50)).is_some(),
+            "字节刚断 5 秒还在活性窗内，不该这么早判死",
+        );
+        assert_eq!(
+            dead.remaining(started + Duration::from_secs(70)),
+            None,
+            "超过 60 秒一个字节都没有 = 连接真没了，按 stall 判死，不能用兜底档拖着",
+        );
+    }
+
+    /// 活性和产出必须在**调用点**就分开，不只是在结构体里分开。
+    ///
+    /// 原始 chunk 那一行如果写成 record() 而不是 record_bytes()，心跳就变成了"模型在产出"：
+    /// last_progress 每 15 秒被刷新一次，停滞看门狗永远打不响，一条真的挂死的流会一直挂着，
+    /// 而且 has_progress 会被心跳提前置真、跳过 first_progress 那一档。
+    /// 结构体的单元测试看不见这个错误——它发生在流循环里，所以这条钉源码。
+    #[test]
+    fn raw_chunks_record_liveness_not_progress() {
+        const SRC: &str = include_str!("ai.rs");
+        // 需要的串一律**拼**出来：include_str! 读的是整个文件，包含本测试模块自己。
+        // 写成字面量的话，find 会先命中这段测试代码，窗口取到的是测试自己而不是生产代码
+        // ——断言照样绿，却什么都没守住。（同文件里另一条源码断言的注释已经记过这个坑。）
+        let needle = format!("raw_stream_bytes = raw_stream_bytes.{}(chunk.len() as u64);", "saturating_add");
+        let at = SRC.find(&needle).expect("原始 chunk 计数点不见了");
+        let window = &SRC[at..(at + 400).min(SRC.len())];
+        let liveness = format!("progress.{}(", "record_bytes");
+        let productivity = format!("progress.{}(", "record");
+        assert!(
+            window.contains(&liveness),
+            "每个原始 chunk（含心跳）都要记活性，否则心跳豁免拿不到信号",
+        );
+        assert!(
+            !window.contains(&productivity),
+            "心跳不是产出：写成 record() 会让停滞看门狗永远打不响",
+        );
+    }
+
     #[test]
     fn only_non_empty_model_deltas_reset_progress() {
         let timeouts = timeouts(Some("medium"), None);
@@ -1902,6 +2041,7 @@ mod stream_timeout_tests {
             first_progress: Duration::from_secs(81),
             empty_stream: Duration::from_secs(17),
             stall: Duration::from_secs(97),
+            content_backstop: Duration::from_secs(THINKING_CONTENT_BACKSTOP_SECS),
         };
         assert_eq!(
             response_headers_timeout_error(timeouts.response_headers, Duration::from_secs(73)),
@@ -1911,18 +2051,26 @@ mod stream_timeout_tests {
         let started = Instant::now();
         let mut progress = StreamProgressDeadline::new(started, timeouts);
         assert_eq!(
-            progress.error_message(),
+            progress.error_message(started),
             "模型在 81 秒内没有生成有效内容，已停止本轮，请重试。"
         );
         progress.record_activity(started + Duration::from_secs(1));
         assert_eq!(
-            progress.error_message(),
+            progress.error_message(started + Duration::from_secs(1)),
             "上游已开始流式传输，但 81 秒内没有生成有效内容，已停止本轮，请重试。"
         );
         progress.record(started + Duration::from_secs(1));
+        // 心跳早就断了（last_byte 还停在 started）→ 报的是"连接死了"那一档：stall。
         assert_eq!(
-            progress.error_message(),
+            progress.error_message(started + Duration::from_secs(200)),
             "模型连续 97 秒没有继续生成有效内容，已停止本轮，请重试。"
+        );
+        // 心跳还在到 → 连接是好的，只是模型没吐字，这时报的必须是兜底那一档，
+        // 而不是把一个健康的流说成"连接中断"。
+        progress.record_bytes(started + Duration::from_secs(190));
+        assert_eq!(
+            progress.error_message(started + Duration::from_secs(200)),
+            "模型连续 300 秒没有继续生成有效内容，已停止本轮，请重试。"
         );
     }
 
@@ -2348,6 +2496,10 @@ mod stream_timeout_tests {
             let read = socket.read(&mut request).unwrap();
             let request = String::from_utf8_lossy(&request[..read]).to_ascii_lowercase();
             assert!(request.contains("x-ide-response-deadline-ms:"));
+            assert!(
+                request.contains("x-ide-response-budget-ms:"),
+                "相对预算头必须和绝对时间戳一起上线，否则时钟不准的机器仍然没有出路"
+            );
             std::thread::sleep(Duration::from_millis(100));
         });
 
@@ -2371,6 +2523,43 @@ mod stream_timeout_tests {
             "response-header deadline was not applied once: {elapsed:?}"
         );
         server.join().unwrap();
+    }
+
+    /// 相对预算头的值只由本地定时器决定，和本机时钟对不对完全无关。
+    ///
+    /// 这是"时钟慢两分钟的机器一次请求都发不出去"那条故障的根治点：绝对时间戳仍然发
+    /// （网关在时钟对得上时用它收紧预算，因为它把上传耗时也算了进去），但网关不再**只有**
+    /// 它可用。
+    #[test]
+    fn the_budget_header_does_not_depend_on_the_local_clock() {
+        let budget = Duration::from_secs(60);
+        let deadline = ResponseHeadersDeadline::new(Instant::now(), budget);
+        let request = with_response_deadline_header(
+            reqwest::Client::new().post("http://127.0.0.1:1/v1/chat/completions"),
+            deadline,
+        )
+        .build()
+        .expect("request builds");
+
+        let sent = |name: &str| {
+            request
+                .headers()
+                .get(name)
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_owned)
+        };
+
+        assert_eq!(
+            sent(RESPONSE_BUDGET_HEADER).as_deref(),
+            Some("60000"),
+            "相对预算必须就是本地定时器用的那个数"
+        );
+        // 绝对时间戳照旧发出：网关拿它和相对预算互相印证，两者一致时用更紧的那个。
+        let absolute: u64 = sent(RESPONSE_DEADLINE_HEADER)
+            .expect("绝对时间戳仍然要发")
+            .parse()
+            .expect("是一个毫秒时间戳");
+        assert_eq!(absolute, deadline.unix_ms);
     }
 
     #[tokio::test]
@@ -2697,7 +2886,7 @@ async fn ai_chat_inner(
         }
         let Some(remaining) = progress.remaining(Instant::now()) else {
             let _ = on_event.send(AiEvent::Error {
-                message: progress.error_message(),
+                message: progress.error_message(Instant::now()),
             });
             let _ = on_event.send(AiEvent::Done);
             return Ok(());
@@ -2728,7 +2917,7 @@ async fn ai_chat_inner(
             Err(_elapsed) => {
                 if progress.remaining(Instant::now()).is_none() {
                     let _ = on_event.send(AiEvent::Error {
-                        message: progress.error_message(),
+                        message: progress.error_message(Instant::now()),
                     });
                     let _ = on_event.send(AiEvent::Done);
                     return Ok(());
@@ -2739,6 +2928,8 @@ async fn ai_chat_inner(
         // 只统计字节；activity 的判定放到 SSE 行解析处——`: ping` 心跳注释和
         // 空 role 预热帧不能算"开始输出"，否则 first_progress 大窗会被降级成 empty_stream 小窗。
         raw_stream_bytes = raw_stream_bytes.saturating_add(chunk.len() as u64);
+        // 心跳也算——它证明的是连接还通，正是 limit_and_anchor 要的那个信号。
+        progress.record_bytes(Instant::now());
         if !sent_first_chunk_metric {
             sent_first_chunk_metric = true;
             last_bytes_metric_at = Instant::now();
@@ -3028,7 +3219,7 @@ async fn ai_chat_inner(
         // enforce the same real-progress deadline after every parsed network chunk.
         if progress.remaining(Instant::now()).is_none() {
             let _ = on_event.send(AiEvent::Error {
-                message: progress.error_message(),
+                message: progress.error_message(Instant::now()),
             });
             let _ = on_event.send(AiEvent::Done);
             return Ok(());

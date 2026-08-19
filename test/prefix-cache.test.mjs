@@ -1245,7 +1245,7 @@ test("读取失败时说得出「这个目录是空的」", () => {
 test("传输层掉线要能被认出来，否则续传那一整套机制根本不会被调用", () => {
   // 用真函数跑，不是读正则 —— 这条判据决定 canResume 走不走，读错一个字就是整套机制静默失效。
   const isRetryable = load("_isRetryableAiError",
-    ["_stripAiRetryPrefix", "_isRateLimitedAiError", "_isProviderGatewayStatusError", "_isRetryableAiError"]);
+    ["_stripAiRetryPrefix", "_isRateLimitedAiError", "_isProviderGatewayStatusError", "_isRetryableAiError", "_isUnrecoverableUpstreamError"]);
 
   // 网关校验出被截断的工具参数时，会把已经 200 的响应体中途 abort，桌面端因此发出这一句。
   // 它以前不匹配任何一条规则：network / connection reset 全是英文。
@@ -1256,6 +1256,17 @@ test("传输层掉线要能被认出来，否则续传那一整套机制根本�
   // 真正不该重试的还是不重试：模型名写错重试一百次也是错。
   assert.equal(isRetryable("AI request failed (400): invalid model name"), false);
   assert.equal(isRetryable("AI request failed (429): rate limited"), false, "限流单独处理，不走重试");
+  // 上游的**配置性**失败重发多少次都不会好。以前网关这几句里有两句会被第二条正则认领
+  // （"未授权"、"账户异常"、"暂无可用账号"），于是同一个 401 换个措辞就变成"可以续传"，
+  // 用户白等三轮续传再看到同一条错误。
+  assert.equal(isRetryable("【claude-opus-5】上游密钥无效。请在后台更新该连接的 API Key。"), false);
+  assert.equal(isRetryable("【claude-opus-5】上游暂不可用（供应商未授权 / 账户异常）。"), false);
+  assert.equal(isRetryable("【claude-opus-5】上游暂无可用账号。"), false);
+  assert.equal(isRetryable("AI request failed (424 Failed Dependency)"), false);
+  assert.equal(isRetryable("余额不足，请充值后再试"), false);
+  // 但真的瞬时故障仍然要能重试——别把这道闸开得太宽
+  assert.equal(isRetryable("AI request failed (502 Bad Gateway)"), true);
+  assert.equal(isRetryable("连接中断（网络波动），已保留生成的部分。"), true);
 });
 
 test("续传成功了要画得出来，正文不能在工具开始时被删掉", () => {

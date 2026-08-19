@@ -342,6 +342,7 @@ AUTO_LOAD_DEPS = {
   _AI_MODEL_RETRY_DELAY_MS: Number(/const _AI_MODEL_RETRY_DELAY_MS = ([\d_]+);/.exec(SRC)[1].replace(/_/g, "")),
   _AI_MODEL_RETRY_BACKOFF_CAP_MS: Number(/const _AI_MODEL_RETRY_BACKOFF_CAP_MS = ([\d_]+);/.exec(SRC)[1].replace(/_/g, "")),
   _isRetryableAiError: load("_isRetryableAiError", {
+    _isUnrecoverableUpstreamError: load("_isUnrecoverableUpstreamError"),
     _isRateLimitedAiError: load("_isRateLimitedAiError", { _stripAiRetryPrefix: load("_stripAiRetryPrefix", {}) }),
     _isProviderGatewayStatusError: load("_isProviderGatewayStatusError", { _stripAiRetryPrefix: load("_stripAiRetryPrefix", {}) }),
   }),
@@ -6402,6 +6403,7 @@ test("one browser fetch remains one physical attempt", async () => {
 test("model orchestration retries ten pre-progress failures and never replays partial output", async () => {
   const progress = load("_modelEventHasProgress");
   const run = load("_runModelRequestWithRetry", {
+    _isStalledAiError: load("_isStalledAiError"),
     _modelEventHasProgress: progress,
     _AI_MODEL_RETRY_LIMIT: 10,
     _AI_MODEL_RESUME_LIMIT: 3,
@@ -6470,6 +6472,7 @@ test("model orchestration retries ten pre-progress failures and never replays pa
 test("model retry progress follows the turn consumer's one-way reasoning phase", async () => {
   const progress = load("_modelEventHasProgress");
   const run = load("_runModelRequestWithRetry", {
+    _isStalledAiError: load("_isStalledAiError"),
     _modelEventHasProgress: progress,
     _AI_MODEL_RETRY_LIMIT: 2,
     _AI_MODEL_RESUME_LIMIT: 3,
@@ -12148,7 +12151,7 @@ test("each of the ten model retries gets one sixty-second pre-progress deadline"
   assert.equal(stalled("429 rate limit"), false);
   const strip = load("_stripAiRetryPrefix");
   const providerGateway = load("_isProviderGatewayStatusError", { _stripAiRetryPrefix: strip });
-  const retryable = load("_isRetryableAiError", { _isProviderGatewayStatusError: providerGateway, _stripAiRetryPrefix: strip, _isRateLimitedAiError: load("_isRateLimitedAiError", { _stripAiRetryPrefix: strip }) });
+  const retryable = load("_isRetryableAiError", { _isProviderGatewayStatusError: providerGateway, _stripAiRetryPrefix: strip, _isRateLimitedAiError: load("_isRateLimitedAiError", { _stripAiRetryPrefix: strip }) , _isUnrecoverableUpstreamError: load("_isUnrecoverableUpstreamError") });
   assert.equal(retryable("模型在 60 秒内没有生成有效内容"), true);
   assert.match(SRC, /const repairableToolArgs = !!argIssue && !turnErr && !truncated;[\s\S]{0,100}const retryLimit = repairableToolArgs \? 3 : 0/,
     "tool-schema repair keeps its independent three-response bound");
@@ -17284,6 +17287,7 @@ test("paid and rate-limited failures are never silently retried", () => {
     "503 是真的瞬时故障，不能误判成限流");
 
   const retryable = load("_isRetryableAiError", {
+    _isUnrecoverableUpstreamError: load("_isUnrecoverableUpstreamError"),
     _isProviderGatewayStatusError: () => false,
     _stripAiRetryPrefix: strip,
     _isRateLimitedAiError: rateLimited,
@@ -24449,6 +24453,7 @@ test("模型重试之间要等两秒，不能背靠背连打把上游打成 502"
   // 上游正忙不过来的时候，这等于对着一个已经在喘的服务连打十拳。网关日志里那种"同一个请求
   // 每两秒重来一次、连打六小时"就是这么来的（那两秒还只是请求本身的往返，不是我们在等）。
   const run = load("_runModelRequestWithRetry", {
+    _isStalledAiError: load("_isStalledAiError"),
     _AI_MODEL_RESUME_LIMIT: 3,
     _AI_MODEL_RETRY_LIMIT: 10,
     _AI_MODEL_RETRY_DELAY_MS: 120,        // 测试里缩短，只验"确实等了"而不是等满两秒
@@ -27456,6 +27461,7 @@ test("撞限流不再直接判死：等一会儿自动重来，但预算极小�
 
   // 普通重试的判据里必须**仍然**把限流排除，否则它会同时吃两份预算，风暴就回来了。
   const retryable = load("_isRetryableAiError", {
+    _isUnrecoverableUpstreamError: load("_isUnrecoverableUpstreamError"),
     _isRateLimitedAiError: load("_isRateLimitedAiError", { _stripAiRetryPrefix: load("_stripAiRetryPrefix", {}) }),
     _isProviderGatewayStatusError: load("_isProviderGatewayStatusError", { _stripAiRetryPrefix: load("_stripAiRetryPrefix", {}) }),
   });
@@ -27466,7 +27472,7 @@ test("撞限流不再直接判死：等一会儿自动重来，但预算极小�
   // 行为验证：第一次限流 → 等待 → 自动重来 → 第二次成功，全程不需要用户发「继续」。
   // 退避按依赖注入压到 10ms：这里验的是"会不会自动重来"这个**行为**，真实退避时长由上面
   // 那两条常量断言守着。不压的话这一条测试会真等 15 秒，把整个套件从 5 秒拖到 20 秒。
-  const runWithRetry = load("_runModelRequestWithRetry", { _AI_MODEL_RATE_LIMIT_DELAY_MS: 10 });
+  const runWithRetry = load("_runModelRequestWithRetry", { _AI_MODEL_RATE_LIMIT_DELAY_MS: 10, _isStalledAiError: load("_isStalledAiError") });
   let attempts = 0;
   const seen = [];
   const result = await runWithRetry({
@@ -27497,9 +27503,26 @@ test("chat 模式中断也能从断点继续，不是让用户把整条消息重
 
   assert.match(call, /buildResumeInvoke: async \(\{ resume, resumeLimit \}\) => \{/,
     "chat 模式没接断点续传——中断就报错收场，用户只能整条重发");
-  // prefill：把已出的正文作为最后一条 assistant 消息，模型接着写而不是重新开始。
-  assert.match(call, /\[\.\.\.requestMessages, \{ role: "assistant", content: partial \}\]/,
+  // prefill：原始消息原样带上（不重放），且**最后一条**必须是已出正文的 assistant 消息。
+  // 钉的是不变量而不是某一种写法：中间允许插入续写指令，但 assistant 必须压在末位，
+  // 否则原生 Anthropic 线路上的 prefill 语义就没了。
+  assert.match(call, /\[\.\.\.requestMessages,[\s\S]{0,600}?\{ role: "assistant", content: partial \}\]/,
     "续传必须以已生成的正文作 prefill——否则就是重放，会把已经出过的字再写一遍");
+  {
+    const _ctor = call.slice(call.indexOf("[...requestMessages,"));
+    const _end = _ctor.indexOf("];");
+    assert.ok(_end > 0, "找不到 resumeMsgs 的结尾");
+    const _body = _ctor.slice(0, _end);
+    assert.ok(
+      _body.lastIndexOf('role: "assistant"') > _body.lastIndexOf('role: "user"'),
+      "assistant prefill 必须是最后一条——它前面可以有指令，后面不能有任何东西",
+    );
+  }
+  // prefill 的语义只在原生 Anthropic 线路上成立；走 OpenAI 兼容透传时，末条 assistant
+  // 是一条已完成的历史轮次，模型会**回复**它而不是接着写（用户实拍："明白，你在等我
+  // 完成上一轮的任务"）。所以要求必须显式写出来，不能只靠那条语义约定。
+  assert.match(call, /\[断点续写\]/,
+    "续传必须显式要求模型接着写——只靠 prefill 约定，在非 Anthropic 线路上模型会重新开场");
   assert.match(call, /String\(acc \|\| ""\)\.replace\(\/\\s\+\$\/, ""\)/,
     "prefill 结尾不能留空白，上游会直接 400");
   assert.match(call, /if \(!partial\) return null;/,
