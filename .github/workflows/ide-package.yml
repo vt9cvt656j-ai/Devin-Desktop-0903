@@ -140,6 +140,35 @@ jobs:
           echo "APPLE_SIGNING_IDENTITY=$IDENTITY" >> "$GITHUB_ENV"
           echo "签名身份已就位：$IDENTITY"
 
+      - name: Decide whether to notarize
+        if: runner.os == 'macOS'
+        shell: bash
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          set -euo pipefail
+          # 只有三个**都非空**时才把它们放进后续步骤的环境。
+          #
+          # 不能直接在 tauri-action 的 env 里写 `${{ secrets.APPLE_ID }}`：secret 缺失时
+          # 那是**空字符串**，而 Tauri 判的是"变量在不在"，空串照样算在——它于是认为你要
+          # 公证，然后在校验 Team ID 时报 `Team ID must be at least 3 characters` 直接失败。
+          # 本机构建之所以正常，是因为那三个变量**根本没定义**，Tauri 打一句"跳过公证"就过了。
+          # 这里复现本机那个语义：要么三个都给，要么一个都不给。
+          if [ -n "${APPLE_ID:-}" ] && [ -n "${APPLE_PASSWORD:-}" ] && [ -n "${APPLE_TEAM_ID:-}" ]; then
+            {
+              echo "APPLE_ID=$APPLE_ID"
+              echo "APPLE_PASSWORD=$APPLE_PASSWORD"
+              echo "APPLE_TEAM_ID=$APPLE_TEAM_ID"
+            } >> "$GITHUB_ENV"
+            echo "公证凭据齐全，本次会走公证。"
+          else
+            echo "::notice::没有配齐 APPLE_ID / APPLE_PASSWORD / APPLE_TEAM_ID，跳过公证。"
+            echo "::notice::包仍然用固定证书签名（隐私授权跨版本有效），只是用户首次打开时"
+            echo "::notice::Gatekeeper 会提示「来自身份不明的开发者」，右键打开即可。"
+          fi
+
       - name: Verify updater signing secrets
         shell: pwsh
         env:
@@ -224,10 +253,11 @@ jobs:
           # 上一步按有没有证书解析出来的身份（真实 Developer ID，或 ad-hoc 的 `-`）。
           # 它覆盖 tauri.conf.json 里那个只在本机存在的 `Mr Day One Local Signing`。
           APPLE_SIGNING_IDENTITY: ${{ env.APPLE_SIGNING_IDENTITY }}
-          # 公证凭据：配了才公证，没配就跳过（Tauri 只在三个都有时才走公证）。
-          APPLE_ID: ${{ secrets.APPLE_ID }}
-          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
-          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          # 公证凭据**不在这里传**，见上面那个 "Decide whether to notarize" 步骤：
+          # 在这里写 `APPLE_ID: ${{ secrets.APPLE_ID }}`，secret 缺失时得到的是**空字符串**，
+          # 而 Tauri 判的是"这个变量在不在"，空串照样算在——于是它当成"你要公证"，
+          # 走到校验就炸 `Team ID must be at least 3 characters`。实测 2026-08-19，
+          # 两个 macOS 任务都是编译签名全过、最后死在这一步。
         with:
           projectPath: ide
           args: --target ${{ matrix.rust_target }} --config src-tauri/tauri.package.conf.json --ci
