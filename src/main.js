@@ -824,7 +824,9 @@ async function _realAiFetch(config, messages, tools, onEvent) {
       } catch (error) {
         errorText = String(error?.message || error || "");
       }
-      onEvent({ kind: "error", message: _formatAiHttpError(resp.status, resp.statusText, errorText) });
+      // status 必须结构化带上：下游的重试/续传/收尾文案全靠它分类，从文案里反解析
+      // 是这套机制上一版最脆的地方（见 _aiFailureKind 上面那段）。
+      onEvent({ kind: "error", message: _formatAiHttpError(resp.status, resp.statusText, errorText), status: resp.status });
       onEvent({ kind: "done" });
       return;
     }
@@ -836,7 +838,7 @@ async function _realAiFetch(config, messages, tools, onEvent) {
       } catch (error) {
         t = String(error?.message || error || "");
       }
-      onEvent({ kind: "error", message: _formatAiHttpError(resp.status, resp.statusText, t) });
+      onEvent({ kind: "error", message: _formatAiHttpError(resp.status, resp.statusText, t), status: resp.status });
       onEvent({ kind: "done" });
       return;
     }
@@ -40227,6 +40229,61 @@ async function _agentFindFiles(root, pattern, limit) {
 function _stripAiRetryPrefix(msg) {
   return String(msg || "").replace(/^\[(?:(?:fast|turn|tool-stream)-retry-exhausted)\]\s*/i, "").trim();
 }
+/**
+ * 网关这一次回的 HTTP 状态码。**结构化拿，不从文案里猜。**
+ *
+ * `_formatAiHttpError(resp.status, …)` 拼字符串的时候手里就有这个数，可之后每一处判据
+ * 都在拿正则把它从中文文案里捞回来：`_isProviderGatewayStatusError` 捞一次、
+ * `_formatAgentFinalError` 再捞一次，而 `_isUnrecoverableUpstreamError` 干脆改成匹配
+ * 「密钥无效 / 账户异常 / 暂无可用账号」这些**措辞**——它上面那段注释写着「判据挂在措辞上
+ * 是不对的，但网关的措辞就是我们唯一能拿到的东西」。后半句不成立：状态码一直都在，
+ * 只是在事件里被丢掉了。
+ *
+ * 代价是真实的，注释里也记着：同一个 401，网关换一句措辞就会从「配置问题」漂成
+ * 「网络抖动」，用户白等三轮续传，再看到同一条错误。文案会变，状态码不会。
+ *
+ * 现在错误事件带着 `status` 一路传下来；这个函数只在拿不到它时（传输层断线、停滞看门狗
+ * 这类根本没有 HTTP 响应的失败）才退回去解析文案。
+ */
+function _aiStatusFromMessage(msg) {
+  const m = /ai request failed\s*\(\s*(\d{3})\b/i.exec(_stripAiRetryPrefix(msg));
+  return m ? Number(m[1]) : 0;
+}
+
+/**
+ * 这一次失败属于哪一类。返回空串表示「没有 HTTP 状态码可依据」，交回文案判据。
+ *
+ *   auth       401 —— 登录过期。清掉 token、弹登录框；重登之后可以直接接着发。
+ *   payment    402 —— **用户自己**的额度用完了。给充值 / 开通路径。
+ *   upstream   424 —— 上游账号问题（key 无效 / 没有可用账号 / 供应商欠费）。
+ *                     这是运营侧的问题，用户重试多少次都没用，唯一有效动作是换模型。
+ *   rate       429 —— 限流。独立的长退避预算，重试只会加深它。
+ *   transient  5xx / 408 / 409 / 425 —— 可以重试。
+ *   permanent  400 / 413 / 422 —— 请求本身有问题，原样重发必然再失败。
+ */
+function _aiFailureKind(msg, status = 0) {
+  const code = Number(status) || _aiStatusFromMessage(msg);
+  // 上游会把**容量**错误包在 400 + invalid_request_error 里发出来。实测原文：
+  //   {"error":{"message":"请稍后重试，暂无可用渠道，或切换模型 (request id: …)",
+  //             "type":"invalid_request_error"}}
+  // 它自己都在说「请稍后重试」，却因为外面套着 invalid_request_error 被两边同时判成
+  // 「请求写错了」：网关不换线路（`upstream rejected the request body; not failing over`），
+  // 客户端也不重试。一个本该几秒后就好的容量问题，变成了用户面前的死路。
+  if (code === 400 && /暂无可用|没有可用|no available channel|请稍后重试|try again later/i.test(String(msg || ""))) {
+    return "transient";
+  }
+  switch (code) {
+    case 401: return "auth";
+    case 402: return "payment";
+    case 424: return "upstream";
+    case 429: return "rate";
+    case 408: case 409: case 425:
+    case 500: case 502: case 503: case 504: return "transient";
+    case 400: case 413: case 422: return "permanent";
+    default: return "";
+  }
+}
+
 function _isProviderGatewayStatusError(msg) {
   const raw = _stripAiRetryPrefix(msg);
   const low = raw.toLowerCase();
@@ -40240,7 +40297,11 @@ function _isProviderGatewayStatusError(msg) {
 /// —— 每一发都带完整上下文，既加深限流又实打实消耗配额。此前它被归进可重试集合，加上
 /// 探活探针把「任何 HTTP 响应」都当成链路已恢复（退避实际为 0），内外两层重试相乘，
 /// 25 秒内能对一个已经限流的网关打出 18 次全上下文请求。
-function _isRateLimitedAiError(msg) {
+function _isRateLimitedAiError(msg, status = 0) {
+  // 有确定的分类就只信它：文案匹配在这里是兜底，不是补充——两条同时生效的话，
+  // 一句含「请稍后再试」的 503 文案会被误判成限流，然后白等 15 秒起步的长退避。
+  const kind = _aiFailureKind(msg, status);
+  if (kind) return kind === "rate";
   const raw = _stripAiRetryPrefix(msg);
   return /\b429\b|too many requests|rate.?limit|并发请求过多|请求过于频繁|过于频繁/i.test(raw);
 }
@@ -40254,11 +40315,19 @@ function _isRateLimitedAiError(msg) {
  * 判据挂在措辞上是不对的，但网关的措辞就是我们唯一能拿到的东西——那就把它认全，
  * 并且放在最前面，让它压过所有"看起来像网络问题"的词。
  */
-function _isUnrecoverableUpstreamError(msg) {
+function _isUnrecoverableUpstreamError(msg, status = 0) {
+  // 401 / 402 / 424 / 400 / 413 / 422：重发都不会变好，但**原因和出路各不相同**，
+  // 由 _formatAgentFinalError 按 kind 分开说。这里只回答「还要不要再发一次」。
+  const kind = _aiFailureKind(msg, status);
+  if (kind) return kind === "auth" || kind === "payment" || kind === "upstream" || kind === "permanent";
   const t = String(msg || "");
   return /424|Failed Dependency|密钥无效|key\s*无效|未授权|账户异常|暂无可用账号|额度不足|余额不足|欠费|无可用线路/i.test(t);
 }
-function _isRetryableAiError(msg) {
+function _isRetryableAiError(msg, status = 0) {
+  // 有状态码 → 分类说了算。没有状态码的失败（流中途断掉、停滞看门狗、fetch 抛错）
+  // 本来就没有 HTTP 响应可依据，才轮到下面那些文案判据——续传（canResume）走的正是这条路。
+  const kind = _aiFailureKind(msg, status);
+  if (kind) return kind === "transient";
   if (_isUnrecoverableUpstreamError(msg)) return false;
   if (_isRateLimitedAiError(msg)) return false;
   if (_isProviderGatewayStatusError(msg)) return true;
@@ -40353,6 +40422,8 @@ async function _runModelRequestWithRetry({
   const maxAttempts = boundedRetryLimit + 1;
   let hadModelProgress = false;
   let lastError = "";
+  // 和 lastError 配对：收尾时要按它分类，不能再从文案里反解析。
+  let lastStatus = 0;
   let attemptsRun = 0;
   let currentInvoke = invoke;
   let resumesUsed = 0;
@@ -40367,11 +40438,13 @@ async function _runModelRequestWithRetry({
     attemptsRun = attempt;
     try { onAttempt({ attempt, maxAttempts, retry: attemptIndex, retryLimit: boundedRetryLimit }); } catch {}
     let attemptError = "";
+    let attemptStatus = 0;
     let attemptProgress = false;
     try {
       await currentInvoke((ev) => {
         if (ev?.kind === "error") {
           attemptError = String(ev.message || "模型线路出现问题");
+          attemptStatus = Number(ev.status) || 0;
           return;
         }
         if (ev?.kind === "done") return;
@@ -40403,6 +40476,7 @@ async function _runModelRequestWithRetry({
     }
 
     lastError = attemptError;
+    lastStatus = attemptStatus;
     // Once any real model event has escaped to the UI, replaying the prompt can
     // duplicate prose, tool calls, writes, and billing. Only a pre-progress,
     // transient route failure may consume one of the ten retries.
@@ -40428,7 +40502,7 @@ async function _runModelRequestWithRetry({
       && !hadModelProgress
       && retriesUsed < boundedRetryLimit
       // 压缩成功过就允许重试：负载已经变了，不是"原样重放"。
-      && (squeezedForOverflow || _isRetryableAiError(attemptError));
+      && (squeezedForOverflow || _isRetryableAiError(attemptError, attemptStatus));
     if (canRetry) {
       const retry = retriesUsed + 1;
       // 指数退避 + equal jitter。固定 2s 的问题只在规模上显现：几千万客户端若撞同一个上游
@@ -40459,7 +40533,7 @@ async function _runModelRequestWithRetry({
     const canWaitOutRateLimit = !attemptProgress
       && !hadModelProgress
       && rateLimitWaitsUsed < _AI_MODEL_RATE_LIMIT_WAITS
-      && _isRateLimitedAiError(attemptError);
+      && _isRateLimitedAiError(attemptError, attemptStatus);
     if (canWaitOutRateLimit) {
       rateLimitWaitsUsed += 1;
       // 退避基数不变（15s→30s，封顶 60s），但叠一档 ±20% 抖动：几千万客户端若在同一秒被
@@ -40499,7 +40573,7 @@ async function _runModelRequestWithRetry({
       && typeof buildResumeInvoke === "function"
       && resumesUsed < boundedResumeLimit
       && !(_stalled && stallResumesUsed >= 1)
-      && _isRetryableAiError(attemptError);
+      && _isRetryableAiError(attemptError, attemptStatus);
     if (canResume) {
       let next = null;
       try {
@@ -40521,9 +40595,40 @@ async function _runModelRequestWithRetry({
     break;
   }
 
-  onEvent({ kind: "error", message: lastError || "模型线路出现问题" });
+  onEvent({ kind: "error", message: lastError || "模型线路出现问题", status: lastStatus });
   onEvent({ kind: "done" });
-  return { attempts: attemptsRun, cancelled: false, error: lastError || "模型线路出现问题", hadModelProgress, resumes: resumesUsed };
+  return { attempts: attemptsRun, cancelled: false, error: lastError || "模型线路出现问题", status: lastStatus, hadModelProgress, resumes: resumesUsed };
+}
+
+/**
+ * 失败之后用户**能做什么**。只在收尾时调用一次（重试全部用完、这一轮确定失败）。
+ *
+ * 在这之前，401 和 402 在对话里都只是一条红字。token 过期的人看到的是一句「线路出现
+ * 问题」，于是去换模型、去重试——而真正要做的只是重新登录一次。那个动作
+ * `michaelAccessGate()` 早就写好了，可它只跑在**发起之前**：一轮请求发出去之后才过期，
+ * 就没有任何人再管了。这个函数补的就是「发出去之后」那一半。
+ *
+ * 返回是否真的做了动作，供调用方决定文案。
+ */
+function _recoverFromAiFailure(kind) {
+  if (kind === "auth") {
+    // 和 michaelAccessGate 里那条 401 分支做同样的事，不多不少：清凭据、刷新登录态、
+    // 把登录框摆到人面前。少做一步（比如只弹框不清 token），下一轮还会拿着同一个
+    // 过期 token 再撞一次 401。
+    try { localStorage.removeItem("michael_token"); } catch {}
+    _loggedInEmail = null;
+    try { _setMichaelUserProfile(null); } catch {}
+    try { _updateLoginUI(); } catch {}
+    try { openLoginDialog(); } catch {}
+    return true;
+  }
+  if (kind === "payment") {
+    // 额度耗尽是「不充值就走不下去」的状态，直接把充值/开通那一屏打开——让用户自己
+    // 从一条红字里猜出该点哪儿，是这套流程以前最没道理的一段。
+    try { _showBillingPanel(); } catch {}
+    return true;
+  }
+  return false;
 }
 
 function _formatAgentFinalError(err) {
@@ -40531,6 +40636,27 @@ function _formatAgentFinalError(err) {
   const partialStream = /^\[tool-stream-retry-exhausted\]/i.test(tagged);
   const raw = _stripAiRetryPrefix(tagged);
   if (!raw) return "";
+  // 先按状态码分。401 / 402 / 424 / 400 以前全都落到下面那句「线路出现问题（…）：…。
+  // 自动重试已达到 4 次，本轮停止。」——那句话对这四种情况一句都不成立：
+  //   · 401 一次都没重试过（它本来就不可重试），说「已达到 4 次」是假的；
+  //   · 402 不是线路问题，是这个账号自己的额度空了；
+  //   · 424 是运营侧的配置问题，用户再试一万次也一样；
+  //   · 400 是请求本身被拒，重发同样的内容必然同样失败。
+  // 四种原因、四条出路，不该共用一句话。
+  const kind = _aiFailureKind(raw);
+  const upstreamWords = raw.replace(/^AI request failed\s*\([^)]+\):\s*/i, "").trim().slice(0, 200);
+  if (kind === "auth") {
+    return "登录已过期，这一轮没有发出去。已经把登录框打开了——重新登录后再发一次就行，你写的内容都还在。";
+  }
+  if (kind === "payment") {
+    return `额度用完了：会员额度、钱包余额、今日免费点数三样都是空的。免费点数每天 0 点重置；也可以开通会员或充值后继续。已经为你打开账户页。${upstreamWords ? `\n服务端原话：${upstreamWords}` : ""}`;
+  }
+  if (kind === "upstream") {
+    return `上游供应商那边的账号出了问题（密钥失效 / 没有可用账号 / 供应商欠费）。这是服务端的配置问题，重试不会变好——换一个模型通常立刻就能用。${upstreamWords ? `\n服务端原话：${upstreamWords}` : ""}`;
+  }
+  if (kind === "permanent") {
+    return `这次请求被上游拒绝了，原样重发不会变好。${upstreamWords ? `\n原因：${upstreamWords}` : ""}`;
+  }
   if (/连接中断（网络波动）|网络波动|连接提前结束/.test(raw)) {
     if (partialStream) return "模型连接在输出过程中中断。已经写出的内容和已完成的文件改动都保留了；被打断的那次工具调用参数不完整，没有执行，也不会重放。";
     return `模型线路出现问题：${raw}。自动重试已达到 ${_AI_MODEL_RETRY_LIMIT} 次，本轮停止。`;
@@ -50087,6 +50213,9 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
       // to continue. The old scary "卡在原地" message made users think the agent broke.
     }
     if (finalErr) {
+      // 先把能自动做的做掉（401 弹登录、402 弹账户页），再把文案渲染出来——文案里
+      // 写着"已经为你打开…"，动作必须真的发生过。
+      try { _recoverFromAiFailure(_aiFailureKind(_stripAiRetryPrefix(String(finalErr)))); } catch {}
       const note = document.createElement("div");
       note.className = "msg__error";
       note.textContent = "⚠️ " + _formatAgentFinalError(finalErr);

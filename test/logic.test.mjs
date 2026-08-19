@@ -328,7 +328,18 @@ const RUN_BIND_FILE_PATH = load("_bindRunFilePath", {
 const RUN_RECORD_KNOWN_SIGNATURE = load("_recordRunKnownSignature", {
   _runFileEvidenceAliases: EVIDENCE_ALIASES,
 });
+// 状态码判据。四个消费者（_isRetryableAiError / _isRateLimitedAiError /
+// _isUnrecoverableUpstreamError / _formatAgentFinalError）都要它，而沙箱只注入显式列出的
+// 依赖——漏一个就是 ReferenceError，表现成"这个测试挂了"而不是"少了个依赖"。
+// 放进 AUTO_LOAD_DEPS 而不是逐个测试补：它们是纯函数、无副作用，且属于**判据基座**，
+// 每一处错误分类都要经过它。
+const _autoStripAiRetryPrefix = load("_stripAiRetryPrefix", {});
+const _autoAiStatusFromMessage = load("_aiStatusFromMessage", { _stripAiRetryPrefix: _autoStripAiRetryPrefix });
+const _autoAiFailureKind = load("_aiFailureKind", { _aiStatusFromMessage: _autoAiStatusFromMessage });
+
 AUTO_LOAD_DEPS = {
+  _aiStatusFromMessage: _autoAiStatusFromMessage,
+  _aiFailureKind: _autoAiFailureKind,
   // 审批门现在按**这一次调用**判定（browser 的 needsApproval 是个函数：看页面不弹框，
   // 替用户按按钮才弹）。用真实现，不用桩——桩会让"哪些动作要审批"这件事在测试里失真。
   needsApprovalFor: toolPolicy.needsApprovalFor,
@@ -336,14 +347,15 @@ AUTO_LOAD_DEPS = {
   // 表现成"这个测试挂了"而不是"退避没生效"。从源码取真值，抄一份会漂。
   _AI_MODEL_RATE_LIMIT_WAITS: Number(/const _AI_MODEL_RATE_LIMIT_WAITS = (\d+);/.exec(SRC)[1]),
   _AI_MODEL_RATE_LIMIT_DELAY_MS: Number(/const _AI_MODEL_RATE_LIMIT_DELAY_MS = ([\d_]+);/.exec(SRC)[1].replace(/_/g, "")),
-  _isRateLimitedAiError: load("_isRateLimitedAiError", { _stripAiRetryPrefix: load("_stripAiRetryPrefix", {}) }),
+  _isRateLimitedAiError: load("_isRateLimitedAiError", { _stripAiRetryPrefix: load("_stripAiRetryPrefix", {}), _aiFailureKind: _autoAiFailureKind }),
   _AI_MODEL_RESUME_LIMIT: Number(/const _AI_MODEL_RESUME_LIMIT = ([\d_]+);/.exec(SRC)[1].replace(/_/g, "")),
   _AI_MODEL_RETRY_LIMIT: Number(/const _AI_MODEL_RETRY_LIMIT = ([\d_]+);/.exec(SRC)[1].replace(/_/g, "")),
   _AI_MODEL_RETRY_DELAY_MS: Number(/const _AI_MODEL_RETRY_DELAY_MS = ([\d_]+);/.exec(SRC)[1].replace(/_/g, "")),
   _AI_MODEL_RETRY_BACKOFF_CAP_MS: Number(/const _AI_MODEL_RETRY_BACKOFF_CAP_MS = ([\d_]+);/.exec(SRC)[1].replace(/_/g, "")),
   _isRetryableAiError: load("_isRetryableAiError", {
-    _isUnrecoverableUpstreamError: load("_isUnrecoverableUpstreamError"),
-    _isRateLimitedAiError: load("_isRateLimitedAiError", { _stripAiRetryPrefix: load("_stripAiRetryPrefix", {}) }),
+    _aiFailureKind: _autoAiFailureKind,
+    _isUnrecoverableUpstreamError: load("_isUnrecoverableUpstreamError", { _aiFailureKind: _autoAiFailureKind }),
+    _isRateLimitedAiError: load("_isRateLimitedAiError", { _stripAiRetryPrefix: load("_stripAiRetryPrefix", {}), _aiFailureKind: _autoAiFailureKind }),
     _isProviderGatewayStatusError: load("_isProviderGatewayStatusError", { _stripAiRetryPrefix: load("_stripAiRetryPrefix", {}) }),
   }),
   // 出站消息的代理对修复：_sanitizeProviderMessages 现在会调它们（被截断的 emoji 会让
@@ -12157,7 +12169,7 @@ test("each of the ten model retries gets one sixty-second pre-progress deadline"
   assert.equal(stalled("429 rate limit"), false);
   const strip = load("_stripAiRetryPrefix");
   const providerGateway = load("_isProviderGatewayStatusError", { _stripAiRetryPrefix: strip });
-  const retryable = load("_isRetryableAiError", { _isProviderGatewayStatusError: providerGateway, _stripAiRetryPrefix: strip, _isRateLimitedAiError: load("_isRateLimitedAiError", { _stripAiRetryPrefix: strip }) , _isUnrecoverableUpstreamError: load("_isUnrecoverableUpstreamError") });
+  const retryable = load("_isRetryableAiError", { _isProviderGatewayStatusError: providerGateway, _stripAiRetryPrefix: strip, _isRateLimitedAiError: load("_isRateLimitedAiError", { _stripAiRetryPrefix: strip }) , _isUnrecoverableUpstreamError: load("_isUnrecoverableUpstreamError", { _aiFailureKind: _autoAiFailureKind }) });
   assert.equal(retryable("模型在 60 秒内没有生成有效内容"), true);
   assert.match(SRC, /const repairableToolArgs = !!argIssue && !turnErr && !truncated;[\s\S]{0,100}const retryLimit = repairableToolArgs \? 3 : 0/,
     "tool-schema repair keeps its independent three-response bound");
@@ -17293,7 +17305,7 @@ test("paid and rate-limited failures are never silently retried", () => {
     "503 是真的瞬时故障，不能误判成限流");
 
   const retryable = load("_isRetryableAiError", {
-    _isUnrecoverableUpstreamError: load("_isUnrecoverableUpstreamError"),
+    _isUnrecoverableUpstreamError: load("_isUnrecoverableUpstreamError", { _aiFailureKind: _autoAiFailureKind }),
     _isProviderGatewayStatusError: () => false,
     _stripAiRetryPrefix: strip,
     _isRateLimitedAiError: rateLimited,
@@ -27467,8 +27479,8 @@ test("撞限流不再直接判死：等一会儿自动重来，但预算极小�
 
   // 普通重试的判据里必须**仍然**把限流排除，否则它会同时吃两份预算，风暴就回来了。
   const retryable = load("_isRetryableAiError", {
-    _isUnrecoverableUpstreamError: load("_isUnrecoverableUpstreamError"),
-    _isRateLimitedAiError: load("_isRateLimitedAiError", { _stripAiRetryPrefix: load("_stripAiRetryPrefix", {}) }),
+    _isUnrecoverableUpstreamError: load("_isUnrecoverableUpstreamError", { _aiFailureKind: _autoAiFailureKind }),
+    _isRateLimitedAiError: load("_isRateLimitedAiError", { _stripAiRetryPrefix: load("_stripAiRetryPrefix", {}), _aiFailureKind: _autoAiFailureKind }),
     _isProviderGatewayStatusError: load("_isProviderGatewayStatusError", { _stripAiRetryPrefix: load("_stripAiRetryPrefix", {}) }),
   });
   assert.equal(retryable("ai request failed (429 too many requests)"), false,
@@ -28112,7 +28124,7 @@ test("上下文溢出要压缩后重试，而不是拿同一份超长负载连�
                          SRC.indexOf("async function _runModelRequestWithRetry") + 12000);
   assert.match(loop, /typeof _isContextOverflowAiError === "function" && _isContextOverflowAiError\(attemptError\)/,
     "重试循环没有识别上下文溢出（或漏了 typeof 兜底——沙箱里会 ReferenceError 把循环带崩）");
-  assert.match(loop, /squeezedForOverflow \|\| _isRetryableAiError\(attemptError\)/,
+  assert.match(loop, /squeezedForOverflow \|\| _isRetryableAiError\(attemptError(?:, attemptStatus)?\)/,
     "压缩成功后没有放行重试——负载已经变了，不该再按「原样重放」拦住");
   assert.match(loop, /squeezedForOverflow \? 0 :/,
     "压缩后还在退避空等：退避是等上游恢复，而这次是我们自己的负载太大、现在已经变小了");
@@ -28344,6 +28356,147 @@ test("只读模式够得着的检索工具，不许被关进 includeWrite 块", 
     `这些工具只读安全（_READ_TOOLS 里就有），却被关在 includeWrite 块里——只读模式的注册表没有它们，search_tools 也搜不到：${trapped.join(", ")}`);
   // 反向确认判据没失效：块内必须仍有写类工具，否则上面那条等于空跑。
   assert.ok(inBlock.has("edit_file") && inBlock.has("multi_edit"), "includeWrite 块里连写类工具都没了，判据坏了");
+});
+
+// ── 网关错误码 → IDE 里的处置 ─────────────────────────────────────────────
+//
+// 这一组守的是一条结构性质：**分类以 HTTP 状态码为准，文案只是兜底**。
+//
+// 在这之前每一处判据都在拿正则从网关的中文文案里捞关键词，而状态码在
+// `_formatAiHttpError(resp.status, …)` 手里就有、只是被拼进字符串后丢掉了。代价记在
+// `_isUnrecoverableUpstreamError` 上面那段注释里：同一个 401，网关换一句措辞就会从
+// 「配置问题」漂成「网络抖动」，用户白等三轮续传再看到同一条错误。
+
+test("六个网关错误码各自落到正确的处置类别", () => {
+  const kind = load("_aiFailureKind");
+  assert.equal(kind("", 401), "auth", "登录过期");
+  assert.equal(kind("", 402), "payment", "用户自己的额度用完");
+  assert.equal(kind("", 424), "upstream", "上游账号问题——运营侧，用户重试无用");
+  assert.equal(kind("", 429), "rate");
+  assert.equal(kind("", 502), "transient");
+  assert.equal(kind("", 503), "transient");
+  assert.equal(kind("", 504), "transient");
+  assert.equal(kind("", 400), "permanent");
+  // 没有 HTTP 响应的失败（流中途断掉、停滞看门狗）——交回文案判据，不能瞎归类。
+  assert.equal(kind("连接中断（网络波动），已保留生成的部分。"), "", "无状态码时必须让位给文案判据");
+});
+
+test("状态码压过文案：网关换措辞不该改变处置", () => {
+  const kind = load("_aiFailureKind");
+  // 503 的正文里出现「密钥无效」不该把它变成不可恢复——它是瞬时的，就该重试。
+  assert.equal(kind("AI request failed (503 Service Unavailable): 上游密钥无效", 503), "transient");
+  // 反过来：424 的正文里写着「请稍后再试」也不该被当成瞬时——上游账号坏了，再试一万次也一样。
+  assert.equal(kind("AI request failed (424 Failed Dependency): 请稍后再试", 424), "upstream");
+  // 状态码没显式传进来时，从 _formatAiHttpError 的固定前缀里解析，结论必须一致。
+  assert.equal(kind("AI request failed (402 Payment Required): 额度已用完"), "payment");
+});
+
+test("上游把容量错误包在 400 里发出来时，两边都不许当成「请求写错了」", () => {
+  const kind = load("_aiFailureKind");
+  // 线上实测原文（deepseek-v4-pro，2026-08-19）：
+  //   400 {"error":{"message":"请稍后重试，暂无可用渠道，或切换模型 (request id: …)",
+  //                 "type":"invalid_request_error"}}
+  // 它自己都在说「请稍后重试」，却因为外面套着 invalid_request_error 被两边同时判成永久失败：
+  // 网关不换线路，客户端也不重试——一个几秒后就会好的容量问题变成用户面前的死路。
+  assert.equal(
+    kind("AI request failed (400 Bad Request): 请稍后重试，暂无可用渠道，或切换模型", 400),
+    "transient",
+    "「暂无可用渠道 / 请稍后重试」是容量问题，不是请求格式问题",
+  );
+  // 真正的格式错误仍然是永久的：重发同一份必然同样失败。
+  assert.equal(
+    kind('AI request failed (400 Bad Request): "thinking.type.enabled" is not supported for this model.', 400),
+    "permanent",
+  );
+});
+
+test("每个码的重试决定：只有瞬时类会消耗重试预算", () => {
+  const retryable = load("_isRetryableAiError");
+  const rateLimited = load("_isRateLimitedAiError");
+  const unrecoverable = load("_isUnrecoverableUpstreamError");
+
+  for (const code of [500, 502, 503, 504]) {
+    assert.equal(retryable("", code), true, `${code} 该重试`);
+  }
+  for (const code of [400, 401, 402, 413, 422, 424]) {
+    assert.equal(retryable("", code), false, `${code} 重发不会变好，不该烧重试预算`);
+    assert.equal(unrecoverable("", code), true, `${code} 属于不可恢复`);
+  }
+  // 限流走独立的长退避预算，既不算可重试也不算不可恢复。
+  assert.equal(rateLimited("", 429), true);
+  assert.equal(retryable("", 429), false, "限流重试只会加深限流");
+  assert.equal(unrecoverable("", 429), false, "限流会自己好，不是配置问题");
+  // 容量型 400 要真的走到重试上。
+  assert.equal(retryable("请稍后重试，暂无可用渠道", 400), true);
+});
+
+test("401 / 402 / 424 不许再共用那句「自动重试已达到 4 次」", () => {
+  const format = load("_formatAgentFinalError", {
+    _stripAiRetryPrefix: load("_stripAiRetryPrefix", {}),
+    _isProviderGatewayStatusError: load("_isProviderGatewayStatusError", { _stripAiRetryPrefix: load("_stripAiRetryPrefix", {}) }),
+  });
+  const auth = format("AI request failed (401 Unauthorized): 登录已失效");
+  const pay = format("AI request failed (402 Payment Required): 额度已用完");
+  const up = format("AI request failed (424 Failed Dependency): 上游暂无可用账号");
+
+  // 三条必须互不相同，且都不能声称重试过——它们一次都没重试（本来就不可重试），
+  // 那句话是假的。
+  assert.notEqual(auth, pay);
+  assert.notEqual(pay, up);
+  for (const [name, msg] of [["401", auth], ["402", pay], ["424", up]]) {
+    assert.ok(!/自动重试已达到/.test(msg), `${name} 不该谎称重试过：${msg}`);
+  }
+  // 每条都要给出**这一种**情况下真正有效的动作。
+  assert.match(auth, /登录/, "401 要指向重新登录");
+  assert.match(pay, /充值|开通|免费点数/, "402 要指向充值/开通");
+  assert.match(up, /换一个模型|换个模型/, "424 是运营侧问题，用户唯一有效动作是换模型");
+  assert.match(up, /重试不会变好|重试不会好/, "424 不能让用户以为多试几次就行");
+
+  // 瞬时失败仍然走原来那条（它确实重试过）。
+  assert.match(format("AI request failed (502 Bad Gateway): error code: 502"), /自动重试已达到/);
+});
+
+test("401 和 402 要真的把恢复路径摆到人面前，而不是只留一条红字", () => {
+  const removed = [];
+  let loginOpened = 0;
+  let billingOpened = 0;
+  const recover = load("_recoverFromAiFailure", {
+    localStorage: { removeItem: (k) => removed.push(k) },
+    _loggedInEmail: "a@b.c",
+    _setMichaelUserProfile: () => {},
+    _updateLoginUI: () => {},
+    openLoginDialog: () => { loginOpened += 1; },
+    _showBillingPanel: () => { billingOpened += 1; },
+  });
+
+  assert.equal(recover("auth"), true);
+  assert.deepEqual(removed, ["michael_token"], "过期 token 必须清掉——不清的话下一轮拿着它再撞一次 401");
+  assert.equal(loginOpened, 1);
+
+  assert.equal(recover("payment"), true);
+  assert.equal(billingOpened, 1);
+
+  // 其余类别不该有副作用：424 是运营侧问题，弹登录框或充值页都是把锅甩给用户。
+  assert.equal(recover("upstream"), false);
+  assert.equal(recover("transient"), false);
+  assert.equal(recover(""), false);
+  assert.equal(loginOpened, 1);
+  assert.equal(billingOpened, 1);
+});
+
+test("状态码要结构化传下来，不能再从文案里反解析", () => {
+  // 产生点：两处 HTTP 错误事件都要带 status。
+  const emits = SRC.match(/onEvent\(\{ kind: "error", message: _formatAiHttpError\([^)]*\)[^}]*\}\)/g) || [];
+  assert.ok(emits.length >= 2, "没找到 HTTP 错误事件的产生点");
+  for (const e of emits) {
+    assert.match(e, /status: resp\.status/, `错误事件漏带状态码：${e}`);
+  }
+  // 驱动器：捕获、随 lastError 一起留存、并传给三处判据。
+  const loop = extractFn("_runModelRequestWithRetry");
+  assert.match(loop, /attemptStatus = Number\(ev\.status\) \|\| 0/, "驱动器没有捕获状态码");
+  assert.match(loop, /lastStatus = attemptStatus/, "收尾时状态码丢了");
+  assert.match(loop, /_isRetryableAiError\(attemptError, attemptStatus\)/);
+  assert.match(loop, /_isRateLimitedAiError\(attemptError, attemptStatus\)/);
 });
 
 // ---- 落盘台账不许用手写正则判成败 ----
