@@ -11604,6 +11604,7 @@ test("natural-language capability queries are routed by the semantic tool orches
   let request = null;
   const scenarioSignature = load("_buildScenarioSignature");
   const route = load("_semanticToolOrchestrator", {
+    _cognitiveLegEffort: load("_cognitiveLegEffort"),
     _criticToolCatalog: catalog,
     _criticRequestedToolSchemas: requested,
     _chatCompletionsUrl: () => "https://gateway.example/v1/chat/completions",
@@ -17811,6 +17812,7 @@ test("语义收尾评审工具仍可独立使用，但 quiet turn 不会被评�
 
   let reviewRequest = null;
   const critic = load("_wrapUpCritic", {
+    _cognitiveLegEffort: load("_cognitiveLegEffort"),
     _executionEvidenceReviewBlock: () => "run_cmd: exitCode=0; stdout=the remote request did not produce the requested artifact",
     _criticToolCatalog: catalog,
     _criticRequestedToolSchemas: requested,
@@ -25489,6 +25491,32 @@ test("连续静默立刻停 —— 这是唯一的死循环入口", () => {
   // 上一轮的提醒必须清掉，否则它挂在消息尾部，而模型被禁止提及它——
   // 唯一合规动作就是把答案换个说法重写，这就是"再空转一轮"的机器成因
   assert.match(quiet, /if \(quietTurns >= 2\) _clearNudges\(\);/);
+});
+
+// 用户：「要全部走思考通道，不要老走快速。」
+//
+// 收尾评审（这活干完没有）和工具编排（下一步装哪些工具）是两次真实付费的判断，
+// 而它们手搓 body、只带了 model，用户拨的思考档位一路丢在外面——他在转盘上选了「极限」，
+// 这两条腿照样在零思考的状态下做判断，而且界面上完全无痕。
+test("认知腿要跟随用户选的思考档位，档位关了也要跟着关", () => {
+  const legEffort = load("_cognitiveLegEffort");
+  // 用户选了档位 → 带上
+  assert.deepEqual(legEffort({ reasoningEffort: "high" }), { reasoning_effort: "high" });
+  assert.deepEqual(legEffort({ thinkingEffort: "max" }), { reasoning_effort: "max" });
+  // reasoningEffort 优先（那是已经过 _applyThinkingToConfig 映射后的实际值）
+  assert.deepEqual(legEffort({ reasoningEffort: "xhigh", thinkingEffort: "low" }), { reasoning_effort: "xhigh" });
+  // **用户显式关了思考 → 认知腿也要关**，不能背着他偷偷开一份
+  assert.deepEqual(legEffort({ thinkingEffort: "off" }), {});
+  assert.deepEqual(legEffort({ reasoningEffort: "OFF" }), {});
+  // 没有档位信息 → 什么都不加，保持原样（别凭空造一个默认深度出来花钱）
+  assert.deepEqual(legEffort({}), {});
+  assert.deepEqual(legEffort(null), {});
+  assert.deepEqual(legEffort({ model: "claude-opus-5" }), {});
+
+  // 两个调用点都要真的用上它——写好了零调用点是这个仓库的常见失败模式
+  const hits = (SRC.match(/\.\.\._cognitiveLegEffort\(config\)/g) || []).length;
+  assert.equal(hits, 2,
+    "收尾评审和工具编排两处都要带上档位，只带一处等于一半判断仍在零思考");
 });
 
 test("退出码 0 但一个用例都没跑，不算验证", () => {
