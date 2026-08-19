@@ -46052,7 +46052,7 @@ ${greenfieldRule}
 - 大厂风格直出：用户点名"腾讯/谷歌/蚂蚁/字节那种风格"→ 直接用该公司官方开源设计体系，绝不用 shadcn 手仿——谷歌风=Material 3（MUI 或 @material/web + M3 color roles/五级 elevation/display→label 字阶），腾讯风=TDesign（tdesign-react/tdesign-vue-next + 官方令牌 --td-brand-color:#0052D9），蚂蚁=antd v5 theme token，字节=Arco；官方文档查当前用法，同一个站只用一家体系不混搭。
 - 参考纪律（禁靠记忆手糊）：商用级页面动手前先学真实标杆——**首选 learn_design(url) 真正学一套**（抓 styles.refero.design 的 style 页内嵌的完整设计系统：色板 hex+每色真实用途/频率、字阶/字体、dos/donts 纪律，落盘 reference/ 文档+tokens.css，实现时逐条对照：dos 照做、donts 不犯；没链接就 web_search "site:styles.refero.design 品类" 挑了再学）；或 design_research / browser 打开同品类真站抓 design/nodes 看信息架构/密度/节奏；拿不准的 API/组件用法查当前文档，不凭记忆写过时写法。
 - 实现纪律：先复用项目现有组件、样式约定和构建脚本；无网站且无可沿用/用户指定栈时优先 web_scaffold 创建 React + Tailwind CSS + shadcn/ui；大段 UI 按现有模块边界或 section/component/data 拆分，样式围绕语义 token 和组件角色，不堆无法维护的魔法数。
-- 视觉验收：构建通过不等于好看。启动真实 dev server 后只做一次完整矩阵：browser fresh 打开真实 URL，1440x900 与 390x844 分别 check，batch 完成关键交互并 assert；只在最终视觉验收时各截一张检查层级、内容密度、媒体加载、动画触发、横向溢出和文字截断。修补后只复验改动点一次，证据够了立即停止，不重复 fresh/navigate/screenshot。`;
+- 视觉验收：构建通过不等于好看。启动真实 dev server 后只做一次完整矩阵：browser fresh 打开真实 URL，然后**每个视口各走一遍闭环**：1440x900 与 390x844 各走一遍闭环——viewport(1440,900) → check → 关键交互 → assert，再 viewport(390,844,mobile:true) → check → 交互 → assert。**check 不会切视口**，只有 action:"viewport" 会；验收记账也只认这两次精确的 viewport 调用，给 check 传宽高/mobile 既不生效也不记账；只在最终视觉验收时各截一张检查层级、内容密度、媒体加载、动画触发、横向溢出和文字截断。修补后只复验改动点一次，证据够了立即停止，不重复 fresh/navigate/screenshot。`;
 }
 
 // ============================================================================
@@ -57870,6 +57870,15 @@ return { type: call.type, path: call.query || "", content: `[失败] ${call.type
       } else if ((act === "autofill" || act === "fill") && state.result != null && state.result !== "") {
         content += `\n**表单智能填充结果**（字段语义匹配 + 原生 value setter + input/change 事件 + HTML5 校验）。看 \`filled\` 确认填了哪些，\`missing\` 是没找到的字段，\`invalid\` 是浏览器明确报的校验失败字段；如果出现“请填写此字段”，必须根据 invalid 补字段，不能靠截图猜：\n${state.result}`;
       } else if (act === "check" && state.result != null && state.result !== "") {
+        // 参数被静默丢掉是这条坑真正的放大器：模型照着「在 1440x900 和 390x844 各 check 一次」
+        // 传了宽高，视口从没变过，验收记账（只认 action:"viewport" 的那两次精确调用）也一次都
+        // 没记上——于是每个改过界面的 run 都以 ui_verification_missing 收场，模型被反复催着再
+        // 验一遍，而它以为自己已经验过两个视口了。说出来，它下一步就会去调 viewport。
+        if ([call.width, call.height, call.mobile].some((v) => v !== undefined && v !== null && v !== "")) {
+          content += `\n⚠️ check 不接受 width/height/mobile，也不切换视口：这一次是在**当前**视口上跑的。`
+            + `要换视口用 browser action:"viewport"（1440x900 桌面 / 390x844 且 mobile:true 移动），`
+            + `验收记账只认那两次调用；顺序是 viewport → check → 交互 → assert，两个视口各走一遍。`;
+        }
         content += `\n**页面体检（一次性融合：控制台错误 + 网络/接口失败 + 关键视觉缺陷 + 可交互节点数）**。\`healthy\`=总体是否正常、\`verdict\`=结论；\`consoleErrors\`=JS 报错(按钮没反应/页面坏了的头号原因，截图根本看不出来)、\`networkFailures\`/\`apiFailures\`=加载或接口失败、\`visualDefects\`=坏图等。**有问题先修这些再继续**；要细节按 \`drillDown\` 用 network/inspect/nodes/assert 深挖：\n${state.result}`;
       } else if (act === "cookies" && state.result != null && state.result !== "") {
         content += `\n**Cookies（含 HttpOnly，通过 CDP 协议直接读取——不需要用户开 F12）**：\n${state.result}`;
