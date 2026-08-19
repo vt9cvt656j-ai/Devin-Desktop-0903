@@ -4024,6 +4024,12 @@ test("invalid file mutation arguments recover by reading target context once", (
     "if arg-repair recurs, the toast should calmly explain param completion, not a brittle fixed 1\/2 counter");
   assert.match(SRC, /renderRejectedToolAttempts: false/,
     "agent loop should recover invalid tool arguments before rendering red rejected cards");
+  // 但「先自愈」的前提是**自愈得了**。救不回来时那条静默规则就变成另一件事：用户眼看着
+  // 正在生成的文档从屏幕上消失（流式卡片轮末被 remove），没有任何解释，然后模型接着说话——
+  // 这正是「它说保存好了，我什么都没看到、文件也不在」的显示侧那一半。所以补救用尽的那一支
+  // 必须有唯一一次显示。
+  assert.match(SRC, /_renderRejectedToolAttempts\(body, attempts,\s*\n?\s*"工具参数在自动补救耗尽后仍不完整/,
+    "补救用尽后仍然一个字都不显示——用户会看着内容凭空消失");
 });
 
 // Workspace `pre_tool_use` hooks carried two CONTRADICTORY contracts: the block comment
@@ -28338,4 +28344,24 @@ test("只读模式够得着的检索工具，不许被关进 includeWrite 块", 
     `这些工具只读安全（_READ_TOOLS 里就有），却被关在 includeWrite 块里——只读模式的注册表没有它们，search_tools 也搜不到：${trapped.join(", ")}`);
   // 反向确认判据没失效：块内必须仍有写类工具，否则上面那条等于空跑。
   assert.ok(inBlock.has("edit_file") && inBlock.has("multi_edit"), "includeWrite 块里连写类工具都没了，判据坏了");
+});
+
+// ---- 落盘台账不许用手写正则判成败 ----
+//
+// eager 写完之后记的这笔账会走到「这一轮已经真实写入磁盘：X」那句交付事实里，每轮无条件
+// 喂给模型。判错一次，harness 就**自己造出一条假事实**，模型照着它如实转述「已保存到 X」，
+// 而磁盘上没有那个文件——用户看到的是模型撒谎，实际是我们骗了它。
+test("eager 落盘台账走权威失败判定，不是手写的三词正则", () => {
+  const loop = extractFn("_runAgenticLoop");
+  assert.match(loop, /const _landedOk = _toolExecutionSucceeded\(call, result\);/,
+    "落盘台账又改回手写正则了——[CONFLICT]/[interrupted]/mutated:false 全会被记成写入成功");
+  assert.doesNotMatch(loop, /const _landedOk = !\/\^\\\[\(\?:ERROR\|BLOCKED\|DENIED\)/,
+    "那条只认三个词、还锚定行首的正则不许回来");
+  // 权威判定认得的失败形态，必须真的比那条正则多。
+  const match = load("_toolFailureMatch");
+  for (const text of ["[CONFLICT] 用户在写入期间编辑了这个文件", "[interrupted] 用户中断",
+                      "[写入失败] 磁盘只读", "[不可用] 只能在桌面 App 里用"]) {
+    assert.ok(match(text), `权威判定漏了这种失败形态：${text}`);
+    assert.ok(!/^\[(?:ERROR|BLOCKED|DENIED)\]/.test(text), `这条正好是旧正则漏掉的：${text}`);
+  }
 });
