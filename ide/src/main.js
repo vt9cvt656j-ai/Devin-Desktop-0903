@@ -33233,6 +33233,14 @@ function _selectInitialTools(includeWrite, taskText, mcpTools = [], mode = inclu
     // 注册表里没有的名字会被下面的 filter 自动跳过，不受影响）。
     agent: ["read_file", "list_dir", "search", "find_files", "update_plan", "ask_user",
             "write_file", "edit_file", "multi_edit", "run_cmd", "run_in_terminal", "read_logs",
+            // save_skill / mcp_server 也在这里，理由和上面那两条一样，只是更极端：
+            //   · save_skill 的时机在**收尾**——刚摸清一套还会再用的流程。模型绝不会为一件
+            //     可选的事先花一轮 search_tools 去取 schema，于是"把学到的留住"永远不发生。
+            //   · mcp_server 的时机是"注册表里没有我要的能力"——而换路清单正好在那一刻点名
+            //     推荐它。文案点名的工具必须在手里，否则又是一次「引导模型去调一个没装载的
+            //     工具」（下面那条注释就是这条规矩的原文）。
+            // 两个都不给子体（不在 _READ_TOOLS 里）：只读子体本来就不写文件、不注册服务。
+            "save_skill", "mcp_server",
             "web_search", "web_fetch", "github_search", "developer_community_search", "package_search"],
   };
   
