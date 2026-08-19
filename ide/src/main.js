@@ -33197,8 +33197,17 @@ function _selectInitialTools(includeWrite, taskText, mcpTools = [], mode = inclu
     // package_search 确认版本与依赖事实。
     //
     // 装进窗口 ≠ 每轮都要用。判断权仍然在模型和编排器手里；这里只保证"想用的时候够得着"。
+    //
+    // run_in_terminal + read_logs 在这里，是因为 harness 自己会**硬拒**并点名要它们：
+    // timeout 包住的 dev server（[工具选择]）、前台长命令（[not executed]）、需要真 TTY 的
+    // 交互程序（_needsRealTtyHint）——三处都不执行，回执叫模型改用 run_in_terminal。可它当轮
+    // 不在窗口里，模型手上唯一的执行手刚被打回、被指去用一个它没有的工具，于是最省事的出口
+    // 就是把命令贴出来让用户自己去终端敲——正是用户抱怨的那句「IDE 不支持」。而「绝不要把
+    // 命令甩回给用户，这个 IDE 终端是真终端」这句话，恰恰写在那个没被声明的工具的描述里。
+    // read_logs 配套：起完服务看不到日志，就没法确认到底起没起来（网页版没有 run_in_terminal，
+    // 注册表里没有的名字会被下面的 filter 自动跳过，不受影响）。
     agent: ["read_file", "list_dir", "search", "find_files", "update_plan", "ask_user",
-            "write_file", "edit_file", "multi_edit", "run_cmd",
+            "write_file", "edit_file", "multi_edit", "run_cmd", "run_in_terminal", "read_logs",
             "web_search", "web_fetch", "github_search", "developer_community_search", "package_search"],
   };
   
