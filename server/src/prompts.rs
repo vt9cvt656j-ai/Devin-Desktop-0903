@@ -1375,6 +1375,29 @@ fn is_context_only_location_statement(query: &str) -> bool {
         return false;
     }
 
+    // 工程否决：判据是「开头像在报位置」+「句中有任意 ASCII 数字或省市区路街道…任一字」。
+    // 这两条在工程语境里几乎必然同时成立 —— 「路由」「路径」「网络」里都有「路」，「知道」
+    // 「管道」里有「道」，「区别」里有「区」，而行号、版本号、端口号全是数字。实测「我在改这
+    // 个模块的路径解析」「我在 main.js 第 350 行加一句日志」「我们在用 vite 5 做构建」全部命中。
+    // 下面这些信号只要出现一个，就说明这句话在谈工程，不是在报位置。
+    let looks_technical = [
+        "代码", "函数", "文件", "路由", "路径", "接口", "项目", "模块", "组件", "构建",
+        "编译", "报错", "部署", "提交", "分支", "终端", "命令", "脚本", "数据库", "端口",
+        "依赖", "版本", "测试", "日志", "页面", "样式", "变量", "参数", "仓库", "服务器",
+        "前端", "后端", "重构", "调试", "配置", "接入",
+        ".js", ".ts", ".tsx", ".py", ".rs", ".go", ".json", ".md", ".yml", ".toml", "```",
+        "npm", "git ", "cargo", "docker", "build", "error", "line ", "step ", "commit",
+        "branch", "deploy", "api", "code", "file", "function", "server", "localhost",
+    ]
+    .iter()
+    .any(|signal| lower.contains(signal))
+        || value.contains('/')
+        || value.contains('\\')
+        || value.contains('`');
+    if looks_technical {
+        return false;
+    }
+
     let address_shape = value.chars().any(|ch| ch.is_ascii_digit())
         || [
             "省",
@@ -3587,6 +3610,11 @@ pub fn assemble_into(headers: &HeaderMap, body: &mut serde_json::Value) -> Resul
     // byte-identical from turn 1 to turn N. `user_request` (latest) remains correct for anything
     // that is about THIS turn — the context-only check below, and runtime context placement.
     let anchor_request = session_anchor_request(body);
+    // 注意这条早退有多重：命中就**摘掉整份工具表**，只发一句「不要扩展成……文件操作或其他
+    // 任务」，并且在 read_prompt_graph() 之前 return —— agent_core（含「没有内置工具不是做不到
+    // 的理由」那条）一个字节都发不出去。对真的只报了个地址的用户，这是刻意的（下面
+    // address_context_does_not_activate_research_or_unrelated_specializations 钉着）；
+    // 危险的是**误命中**，所以判据里那道工程否决不能删。
     let context_only = user_request
         .as_deref()
         .is_some_and(is_context_only_location_statement);
@@ -5843,6 +5871,31 @@ mod tests {
         assert!(system.contains("# michael-design data and business state layer"));
         assert!(system.contains("# michael-design verification layer"));
         assert!(!system.contains("# michael-design scaffold layer"));
+    }
+
+    #[test]
+    fn engineering_statements_are_never_context_only_location() {
+        // 这条早退会摘掉整份工具表并在读提示词图之前 return，所以误命中 = 这一轮智能体赤手
+        // 空拳，连 agent_core 的「没有内置工具不是做不到的理由」都收不到。而判据是「开头像在
+        // 报位置」+「有任意 ASCII 数字或省市区路街道…任一字」——「路由」「路径」里有「路」，
+        // 「知道」「管道」里有「道」，行号版本号端口号全是数字，工程句几乎必然同时命中。
+        for statement in [
+            "我在这个项目的路由里加一个登录接口",
+            "我在 main.js 第 350 行加一句日志",
+            "我在改这个模块的路径解析",
+            "我们在用 vite 5 做构建",
+            "我在写 src/app.ts 的测试",
+            "我在看这个报错的日志",
+            "I'm at step 3 and the build crashes",
+        ] {
+            assert!(
+                !is_context_only_location_statement(statement),
+                "工程句被当成纯位置陈述，这一轮会被摘掉全部工具：{statement}"
+            );
+        }
+        // 真的只报了个位置，仍然要命中——上面那条早退对它是刻意的。
+        assert!(is_context_only_location_statement("我目前在上海胶州路282号"));
+        assert!(is_context_only_location_statement("我现在在北京朝阳区"));
     }
 
     #[test]
