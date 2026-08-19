@@ -20753,9 +20753,9 @@ function _skillAllowedTools() {
  *  名字（Read / Grep / Bash…），这里的工具名是 read_file / grep / run_cmd，做一次映射。 */
 const _SKILL_TOOL_ALIASES = {
   read: ["read_file", "read_skill", "list_dir"],
-  write: ["write_file", "apply_patch", "edit_file"],
-  edit: ["apply_patch", "edit_file", "write_file"],
-  bash: ["run_cmd", "run_command", "terminal"],
+  write: ["write_file", "apply_patch", "edit_file", "multi_edit", "create_dir"],
+  edit: ["apply_patch", "edit_file", "write_file", "multi_edit"],
+  bash: ["run_cmd", "run_command", "terminal", "run_in_terminal"],
   grep: ["search", "grep", "search_in_project"],
   glob: ["find", "find_files", "list_dir"],
   webfetch: ["web_fetch"],
@@ -20857,10 +20857,24 @@ async function _approveToolCall(call, run) {
   // typeof 守卫：这个闸会被测试单独抽出来跑（沙箱里只注入它显式声明的依赖），
   // 直接引用会 ReferenceError 把整道闸打挂。文件里其它可选依赖也是这个写法。
   const skillGate = typeof _skillAllowedTools === "function" ? _skillAllowedTools() : null;
-  if (skillGate && typeof _skillToolAllowed === "function"
-      && !_skillToolAllowed(skillGate.allow, call.name || call.tool || call.type)) {
+  // 一次工具调用同时有好几个名字：注册名（`_toolName`，例如 run_cmd）、映射后的内部类型
+  // （`type`，例如 cmd）、MCP 的裸工具名（`tool`）。allowed-tools 里写的是**注册名**或
+  // Claude Code 那套别名，而这里原来取的是 `call.name || call.tool || call.type`：
+  //
+  //   · run_cmd 映射完根本没有 name，于是拿 type「cmd」去比 —— 白名单里的「run_cmd」对不上，
+  //     别名表 bash→["run_cmd","run_command","terminal"] 也对不上（它的值是注册名，不是 type）。
+  //     结果：只要有一个常驻技能声明了 allowed-tools，写文件、跑命令就被静默拒，而技能自己
+  //     可能正好声明了它们。装一个市场技能就会踩上——装完 `_skillPostInstall` 直接置为常驻。
+  //   · read_skill 更糟：它的 `call.name` 是**技能名**，所以 `_skillAllowedTools` 里那句
+  //     「read_skill 永远放行」一次都没兑现，技能把自己锁死，模型连正文都读不到。
+  //
+  // 改成把这次调用的几个名字都试一遍：它们指的是**同一个工具**，能匹配上任何一个就是它，
+  // 不会把别的工具放进来，所以这道闸没有变松；没有任何名字时维持原样（放行）。
+  const _skillGateNames = [call._toolName, call.tool, call.type].filter(Boolean);
+  if (skillGate && typeof _skillToolAllowed === "function" && _skillGateNames.length
+      && !_skillGateNames.some((n) => _skillToolAllowed(skillGate.allow, n))) {
     try {
-      showToast(`「${skillGate.names[0]}」声明了 allowed-tools，${call.name || "这个工具"} 不在其中`);
+      showToast(`「${skillGate.names[0]}」声明了 allowed-tools，${call._toolName || call.type || "这个工具"} 不在其中`);
     } catch {}
     _noteRefusal("skill", skillGate.names[0] || "");
     return false;
