@@ -125,6 +125,9 @@ async fn main() -> anyhow::Result<()> {
     // Start measuring model reachability. Runs on its own timer and writes to
     // model_health; nothing in the request path waits on it.
     health::spawn(state.clone());
+    // 线路健康巡检：给没有真实流量的线路补一次最小真实请求，然后评估告警。
+    // 单独一个任务，不挂在探针 tick 上——那个循环串行、每条 10 秒超时，一轮最坏 100 秒。
+    route_health::spawn(state.clone());
 
     // Catch payments the webhook never delivered. Every grant in this service hangs off a
     // single webhook call; without this, one missed delivery means a customer paid and got
