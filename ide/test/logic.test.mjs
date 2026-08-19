@@ -28312,3 +28312,30 @@ test("save_skill 没有工作区时指向 create_project，而不是让用户去
   assert.match(exec, /_fileSkillsCacheKey = "";/,
     "没清技能目录缓存 —— 这一轮写的技能要等换工作区才会被发现，而提示词承诺了下一轮生效");
 });
+
+// ---- 纯读检索工具不许待在 includeWrite 块里 ----
+//
+// 只读三模式（Explorer / Plan / Reviewer）的注册表就是 _buildToolRegistry(isAgent) 建的，
+// isAgent 为假 → includeWrite 块整段跳过。这 25 个检索工具一度落在块内，于是那三个模式里
+// 它们**不存在**：模型只剩 web_search + web_fetch，而 search_tools 查的就是这份注册表，
+// 返回的却是「内置工具里没有专用的，注册表是起手包不是能力边界」——在只读模式下这是假话。
+// 判据取 _READ_TOOLS 的交集（本仓库给只读子体的名单），不另手抄一份。
+test("只读模式够得着的检索工具，不许被关进 includeWrite 块", () => {
+  const fn = extractFn("_buildAgentToolSchemas");
+  const at = fn.indexOf("  if (includeWrite) {");
+  assert.ok(at > 0, "includeWrite 块找不到了，这条断言失去落点");
+  // 括号配平取块范围，别用行数猜。
+  let depth = 0, end = at;
+  for (; end < fn.length; end++) {
+    const c = fn[end];
+    if (c === "{") depth++;
+    else if (c === "}") { depth--; if (!depth) break; }
+  }
+  const inBlock = new Set([...fn.slice(at, end).matchAll(/name: "([a-z_0-9]+)"/g)].map((m) => m[1]));
+  const readTools = new Set([...(/const _READ_TOOLS = \[[^\]]*\]/.exec(SRC)[0].matchAll(/"([a-z_0-9]+)"/g))].map((m) => m[1]));
+  const trapped = [...inBlock].filter((n) => readTools.has(n)).sort();
+  assert.deepEqual(trapped, [],
+    `这些工具只读安全（_READ_TOOLS 里就有），却被关在 includeWrite 块里——只读模式的注册表没有它们，search_tools 也搜不到：${trapped.join(", ")}`);
+  // 反向确认判据没失效：块内必须仍有写类工具，否则上面那条等于空跑。
+  assert.ok(inBlock.has("edit_file") && inBlock.has("multi_edit"), "includeWrite 块里连写类工具都没了，判据坏了");
+});

@@ -7558,6 +7558,42 @@ mod resourcefulness_tests {
     /// 于是碰到没内置支持的服务、没人认的文件格式、想固化的工作流，模型就直说做不到——
     /// 而它手上其实有 http_request、有 run_cmd、有写文件的能力。
     #[test]
+    fn read_only_mode_prompts_do_not_deny_tools_they_actually_have() {
+        // explorer.txt / plan.txt 一度用**闭合枚举**告诉模型「你只有这四个工具」：
+        //   - read_file / list_dir / search / find_files
+        // 而只读模式实际挡住的只有改动族（写/改/删/移/建目录/复制/格式化/命令/终端/点界面），
+        // 其余每一个未登记类型都照常可用——Reviewer 的开局窗口里就摆着 get_diagnostics 和
+        // git_diff，而那句话说它们不存在。客户端早就把同一句判定为假并改掉了（[BLOCKED] 的
+        // 回执里写着「读取与取证类工具全部可用」），网关这两份没跟上。
+        //
+        // 后果不是被拦住，是**被自己的系统提示词说服了自己没有这些工具**：Explorer 里问
+        // 「谁调用了这个函数」，模型只 grep，不碰 lsp_references，然后把「搜不到」说成「没有」。
+        let explorer = read_prompt("explorer").expect("explorer.txt");
+        for tool in ["get_diagnostics", "lsp_references", "search_tools", "package_search"] {
+            assert!(
+                explorer.contains(tool),
+                "explorer.txt 没提 {tool} —— 只读模式真有它，不提等于告诉模型它不存在"
+            );
+        }
+        assert!(
+            !explorer.contains("- read_file(path): read a file"),
+            "四件套闭合清单又回来了：它会让模型放弃自己本来做得到的取证"
+        );
+        let plan = read_prompt("plan").expect("plan.txt");
+        for tool in ["get_diagnostics", "lsp_references", "search_tools"] {
+            assert!(plan.contains(tool), "plan.txt 没提 {tool}，方案里的证据摘要就会缺这一类");
+        }
+
+        // worker 的硬规则里「不许再派」只对 **worker** 成立：嵌套子体强制只读、scope 收在父
+        // 范围内，所以只读调查兵是允许的，而 _canNest 也确实把三件套推给了 worker。
+        let worker = read_prompt("worker_system").expect("worker_system.txt");
+        assert!(
+            worker.contains("run_subagent"),
+            "worker 手里有 run_subagent 的 schema（token 也付了），提示词却一个字不提"
+        );
+    }
+
+    #[test]
     fn 核心层写明没有现成工具也要自己造() {
         let core = read_prompt("agent_core").expect("agent_core.txt");
         assert!(
