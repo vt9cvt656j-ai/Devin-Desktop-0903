@@ -19,14 +19,105 @@ pub struct BrowserKind {
     /// 进程名，用来判断用户此刻是不是正开着它。以前这个判断写死成 "Google Chrome"，
     /// 一旦选了别的浏览器就永远判错——profile 锁的判断也就跟着错。
     pub process_name: &'static str,
+    /// macOS 的 bundle id，用来认出系统默认浏览器（LaunchServices 记的就是这个）。
+    pub bundle_id: &'static str,
+    /// Windows 注册表里 https 的 ProgId 前缀（真实值形如 `ChromeHTML.5G4...`，只比前缀）。
+    pub win_progid: &'static str,
+    /// Linux `xdg-settings get default-web-browser` 返回的 .desktop 文件名（不含后缀）。
+    pub linux_desktop: &'static str,
+}
+
+/// 系统默认浏览器，转成本名录里的 id。
+///
+/// 为什么要有它：`resolve_browser(None)` 以前直接取「装了的里面的第一个」，而那个顺序是
+/// BROWSER_KINDS 的书写顺序（chrome 排头）。于是一个日常用 Edge 的用户，自动化照样去开
+/// Chrome —— 用户从来没选过 Chrome，是这份名单替他选的。系统默认浏览器是**用户已经表达
+/// 过的选择**，没有理由不听。
+///
+/// 认不出、或者默认的是 Safari / Firefox（都不能用 CDP 驱动）时返回 None，
+/// 由调用方回落到原来的顺序 —— 这一层只增加信息，不制造新的失败。
+pub fn system_default_browser() -> Option<&'static str> {
+    let ident = default_browser_identifier()?.to_ascii_lowercase();
+    #[cfg(target_os = "macos")]
+    let matches = |k: &BrowserKind| ident == k.bundle_id;
+    #[cfg(target_os = "windows")]
+    let matches = |k: &BrowserKind| ident.starts_with(&k.win_progid.to_ascii_lowercase());
+    #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
+    let matches = |k: &BrowserKind| {
+        ident == k.linux_desktop || ident == format!("{}.desktop", k.linux_desktop)
+    };
+    BROWSER_KINDS.iter().find(|k| matches(k)).map(|k| k.id)
+}
+
+/// 系统层面记的「https 用什么打开」。各平台记法不同，这里只负责把那个原始标识取出来。
+fn default_browser_identifier() -> Option<String> {
+    #[cfg(target_os = "macos")]
+    {
+        // LaunchServices 的偏好是二进制 plist，交给系统自带的 plutil 转 JSON 再解析，
+        // 比自己解二进制格式稳。找 URLScheme == https 的那条。
+        let home = std::env::var_os("HOME")?;
+        let path = Path::new(&home)
+            .join("Library/Preferences/com.apple.LaunchServices/com.apple.launchservices.secure.plist");
+        let out = crate::process_util::command("plutil")
+            .args(["-convert", "json", "-o", "-", "--"])
+            .arg(&path)
+            .output()
+            .ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        let v: serde_json::Value = serde_json::from_slice(&out.stdout).ok()?;
+        let handlers = v.get("LSHandlers")?.as_array()?;
+        handlers
+            .iter()
+            .find(|h| h.get("LSHandlerURLScheme").and_then(|s| s.as_str()) == Some("https"))
+            .and_then(|h| h.get("LSHandlerRoleAll").and_then(|s| s.as_str()))
+            .map(|s| s.to_string())
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let out = crate::process_util::command("reg")
+            .args([
+                "query",
+                r"HKCU\Software\Microsoft\Windows\Shell\Associations\UrlAssociations\https\UserChoice",
+                "/v",
+                "ProgId",
+            ])
+            .output()
+            .ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        let text = String::from_utf8_lossy(&out.stdout);
+        text.lines()
+            .find(|l| l.trim_start().starts_with("ProgId"))
+            .and_then(|l| l.split_whitespace().last())
+            .map(|s| s.to_string())
+    }
+    #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
+    {
+        let out = crate::process_util::command("xdg-settings")
+            .args(["get", "default-web-browser"])
+            .output()
+            .ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        (!s.is_empty()).then_some(s)
+    }
 }
 
 /// 支持的浏览器，同时也是「没指定时」的尝试顺序。
 pub const BROWSER_KINDS: &[BrowserKind] = &[
-    BrowserKind { id: "chrome", label: "Google Chrome", process_name: "Google Chrome" },
-    BrowserKind { id: "edge", label: "Microsoft Edge", process_name: "Microsoft Edge" },
-    BrowserKind { id: "brave", label: "Brave Browser", process_name: "Brave Browser" },
-    BrowserKind { id: "chromium", label: "Chromium", process_name: "Chromium" },
+    BrowserKind { id: "chrome", label: "Google Chrome", process_name: "Google Chrome",
+        bundle_id: "com.google.chrome", win_progid: "ChromeHTML", linux_desktop: "google-chrome" },
+    BrowserKind { id: "edge", label: "Microsoft Edge", process_name: "Microsoft Edge",
+        bundle_id: "com.microsoft.edgemac", win_progid: "MSEdgeHTM", linux_desktop: "microsoft-edge" },
+    BrowserKind { id: "brave", label: "Brave Browser", process_name: "Brave Browser",
+        bundle_id: "com.brave.browser", win_progid: "BraveHTML", linux_desktop: "brave-browser" },
+    BrowserKind { id: "chromium", label: "Chromium", process_name: "Chromium",
+        bundle_id: "org.chromium.chromium", win_progid: "ChromiumHTM", linux_desktop: "chromium" },
 ];
 
 /// 某个浏览器在本机可能的可执行文件位置。
@@ -115,16 +206,41 @@ pub fn installed_browsers() -> Vec<(&'static BrowserKind, String)> {
 /// 返回值第三项带上没找到的那个名字，让调用方如实告诉用户——默默换一个正是这套
 /// 代码以前最让人困惑的地方（同一句话，装没装 Chrome 行为完全不同，用户无从预期）。
 pub fn resolve_browser(pref: Option<&str>) -> Option<(&'static BrowserKind, String, Option<String>)> {
+    pick_browser(&installed_browsers(), pref, system_default_browser())
+}
+
+/// 选择本身，抽成纯函数：三个输入全从参数来，一个也不去问环境。
+///
+/// 不抽的话这条规则测不动——本机的系统默认浏览器恰好就是名单里的第一个，
+/// 于是「听系统默认」和「取名单第一个」在这台机器上永远同一个答案，断言怎么写都绿。
+/// 守不住东西的测试比没有更糟：它让人以为守住了。
+fn pick_browser<'a>(
+    installed: &[(&'a BrowserKind, String)],
+    pref: Option<&str>,
+    system_default: Option<&str>,
+) -> Option<(&'a BrowserKind, String, Option<String>)> {
     let want = pref.map(|p| p.trim().to_ascii_lowercase()).filter(|p| !p.is_empty());
-    let installed = installed_browsers();
     if let Some(ref want) = want {
         if let Some((k, p)) = installed.iter().find(|(k, _)| k.id == want) {
             return Some((k, p.clone(), None));
         }
-        let (k, p) = installed.into_iter().next()?;
-        return Some((k, p, Some(want.clone())));
+        // 选了但没装：**不静默改用别的**，把没找到的那个名字带回去让调用方如实说。
+        let (k, p) = installed.first()?;
+        return Some((k, p.clone(), Some(want.clone())));
     }
-    installed.into_iter().next().map(|(k, p)| (k, p, None))
+    // 没有显式选择时，先问系统默认浏览器。
+    //
+    // 这一层以前不存在，取的是 BROWSER_KINDS 的**书写顺序**（chrome 排头）。于是一个日常
+    // 用 Edge 的人，自动化照样去开 Chrome——他从来没选过 Chrome，是这份名单替他选的。
+    // 系统默认是用户已经表达过的选择，优先级理应高于一份写死的顺序、低于他在设置里的
+    // 显式指定。认不出、或默认的是 Safari / Firefox（都驱动不了 CDP）时上游给 None，
+    // 照旧回落——这一层只增加信息，不制造新的失败路径。
+    if let Some(def) = system_default {
+        if let Some((k, p)) = installed.iter().find(|(k, _)| k.id == def) {
+            return Some((k, p.clone(), None));
+        }
+    }
+    installed.first().map(|(k, p)| (*k, p.clone(), None))
 }
 
 /// 运行期设定的浏览器偏好（来自设置界面）。`None` = 没设过，回落到环境变量。
@@ -504,6 +620,59 @@ mod tests {
         let (k, _, missing) = resolve_browser(Some(&format!("  {}  ", first.id.to_uppercase()))).unwrap();
         assert_eq!(k.id, first.id);
         assert_eq!(missing, None);
+    }
+
+    /// 系统默认浏览器必须真的参与「没显式选择时用哪个」这个决定。
+    ///
+    /// 以前这一层不存在：取的是 BROWSER_KINDS 的书写顺序（chrome 排头），于是日常用 Edge
+    /// 的人，自动化照样去开 Chrome。用户的原话是「喜欢一直用自己的调试浏览器，而不是选择
+    /// 用户默认的浏览器」。
+    #[test]
+    fn 没显式选择时要听系统默认浏览器() {
+        // 名录里每一项都得能被系统标识认出来，否则这条链在那个浏览器上是断的。
+        for k in BROWSER_KINDS {
+            assert!(!k.bundle_id.is_empty(), "{} 缺 macOS bundle id", k.id);
+            assert!(!k.win_progid.is_empty(), "{} 缺 Windows ProgId", k.id);
+            assert!(!k.linux_desktop.is_empty(), "{} 缺 Linux desktop 名", k.id);
+            assert_eq!(k.bundle_id, k.bundle_id.to_ascii_lowercase(), "bundle id 按小写比对");
+        }
+        // 认出来的必须是名录里的 id，不能是随便一个字符串。
+        if let Some(id) = system_default_browser() {
+            assert!(BROWSER_KINDS.iter().any(|k| k.id == id), "认出了名录外的 id：{id}");
+        }
+        // 下面用合成输入测决策本身。**不能用本机的真实情况**：这台机器的系统默认浏览器
+        // 恰好就是名单里的第一个，「听系统默认」和「取第一个」答案永远相同，断言怎么写都绿。
+        let kind = |id: &str| BROWSER_KINDS.iter().find(|k| k.id == id).unwrap();
+        // 装了 chrome 和 edge（chrome 在名单里排头），系统默认是 edge。
+        let installed = vec![
+            (kind("chrome"), "/chrome".to_string()),
+            (kind("edge"), "/edge".to_string()),
+        ];
+
+        // ① 没显式选择 → 听系统默认，而不是名单顺序。这条是本次修复的全部要点。
+        let (k, _, missing) = pick_browser(&installed, None, Some("edge")).unwrap();
+        assert_eq!(k.id, "edge", "无偏好时必须听系统默认，不能回到名单顺序里的 chrome");
+        assert_eq!(missing, None);
+
+        // ② 显式选择压过系统默认——这一层只填「没选」的空，不许覆盖用户自己的选择。
+        let (k, _, _) = pick_browser(&installed, Some("chrome"), Some("edge")).unwrap();
+        assert_eq!(k.id, "chrome", "用户明确选了 chrome，系统默认不该把它顶掉");
+
+        // ③ 系统默认是 Safari/Firefox 这类驱动不了 CDP 的（上游给 None）→ 回落名单顺序。
+        let (k, _, _) = pick_browser(&installed, None, None).unwrap();
+        assert_eq!(k.id, "chrome", "认不出默认浏览器时照旧回落，不许因此失败");
+
+        // ④ 系统默认那个没装 → 同样回落，不能选出一个装都没装的。
+        let (k, _, _) = pick_browser(&installed, None, Some("brave")).unwrap();
+        assert_eq!(k.id, "chrome");
+
+        // ⑤ 选了没装的 → 如实带回没找到的名字（既有约定，别被这次改动弄丢）。
+        let (k, _, missing) = pick_browser(&installed, Some("netscape"), Some("edge")).unwrap();
+        assert_eq!(k.id, "chrome", "回落取名单第一个");
+        assert_eq!(missing.as_deref(), Some("netscape"), "必须如实说没找到，不能默默换一个");
+
+        // ⑥ 一个都没装 → None，别硬编一个路径出来。
+        assert!(pick_browser(&[], None, Some("chrome")).is_none());
     }
 
     #[test]

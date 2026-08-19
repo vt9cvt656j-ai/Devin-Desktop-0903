@@ -500,6 +500,45 @@ test("检测到启动错误就不能再算启动成功", () => {
     "content 要以方括号失败标记开头，_toolFailureMatch 才认得，计划才不会被打勾");
 });
 
+// 用户：「喜欢一直用自己的调试浏览器，而不是选择用户默认的浏览器。」
+//
+// 只是要让用户看一眼页面（刚起好的 dev server、部署好的站点、一份文档），根本不需要
+// 自动化——交给他自己的默认浏览器就行：他的标签页、登录态、扩展全在，也不多一个 Dock 图标，
+// 而且默认浏览器是 Safari/Firefox 也照样能开（CDP 驱动不了它们，这条路不受影响）。
+// 通道本来就是通的（tauri opener），只是 agent 侧一直没有入口。
+test("browser 要有一条「交给用户自己的浏览器」的路，而且是真的生效那一份", () => {
+  // ① 执行器认得这个动作，并且**不启动任何会话**（走 openUrl，不碰 CDP）
+  const at = SRC.indexOf('if (act === "open") {');
+  assert.ok(at > 0, "browser 执行器里没有 open 动作");
+  // 切片只到 open 块本身为止：再往后是 close 分支，那里本来就有 invoke("browser_close")，
+  // 切进去会让下面那条"不许碰会话"的断言永远红——断言切错范围和断言写错一样坏。
+  const implEnd = SRC.indexOf('if (act === "close") {', at);
+  assert.ok(implEnd > at, "找不到 open 块的结尾");
+  const impl = SRC.slice(at, implEnd);
+  assert.match(impl, /backend\.openUrl\(/, "open 必须交给系统默认浏览器，而不是自己起浏览器");
+  assert.doesNotMatch(impl, /browser_(?:navigate|launch|attach)|invoke\("browser/,
+    "open 这条路不许碰浏览器会话——碰了就还是会弹自动化窗口");
+  assert.match(impl, /\^https\?/, "只放 http/https，别把 file:// 之类交给系统去开");
+  assert.match(impl, /你看不到这个页面的内容|看不到/,
+    "要明说模型读不到页面，否则它会拿 open 当 navigate 用，然后凭空编页面内容");
+
+  // ② **生效的那份**枚举里要有 open。
+  //    schema 字面量里那份会被下面这行覆盖：browserProps.action.enum = wantedActions;
+  //    只改字面量等于没改——这次就先踩了一次，所以这条断言钉的是覆盖用的那份。
+  const wa = SRC.indexOf("const wantedActions = [");
+  assert.ok(wa > 0, "wantedActions 不见了");
+  const list = SRC.slice(wa, SRC.indexOf("]", wa));
+  assert.match(list, /"open"/, "真正生效的动作枚举里没有 open，模型根本调不到它");
+  // 覆盖那行必须还在它后面（否则这条断言钉错了地方）
+  assert.ok(SRC.indexOf("browserProps.action.enum = wantedActions;", wa) > wa,
+    "覆盖点没了，这条断言失去意义——请重新确认哪份枚举才是生效的");
+  // ③ 覆盖用的说明也要讲清楚什么时候用 open，否则模型没有判据
+  const descAt = SRC.indexOf('browserProps.action.description = "');
+  assert.ok(descAt > 0);
+  const desc = SRC.slice(descAt, descAt + 1600);
+  assert.match(desc, /open = hand the URL/, "生效的 action 说明里没有 open 的用法指引");
+});
+
 // 「我先这样改了，需要我跑一下测试验证吗？」——用一个问号收尾，就把"改了代码没验证"
 // 这个事实一笔勾销。而这恰恰是最像"已经做完了"的收尾形态。
 test("末尾问一句话不能抹掉「改了代码没验证」这个事实", () => {

@@ -248,11 +248,27 @@ pub struct BrowserState {
 /// 进程名去问，答案永远是错的，跟着错的是「真实 profile 能不能共享」这个判断。
 #[cfg(target_os = "macos")]
 fn is_browser_running(process_name: &str) -> bool {
-    std::process::Command::new("pgrep")
-        .args(["-x", process_name])
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+    // 「用户开着浏览器吗」问的是**他自己那个**，不能把我们自己起的实例算进去。
+    //
+    // 原来是 `pgrep -x "Google Chrome"`：-x 比的是进程**名**，而我们的自动化实例进程名
+    // 一模一样。于是这个函数在一台只开着自动化窗口、用户自己一个 Chrome 都没开的机器上
+    // 照样返回 true。答错的代价是给用户一句假话——"你现在确实开着 Chrome，只是没开调试
+    // 端口"，而他压根没开，多出来那个正是我们自己的孤儿。
+    //
+    // 改成读全命令行，把带我们 profile 标记的那些剔掉（判据和孤儿清理共用同一条，
+    // 两处不会漂）。ps 拿不到时返回 false：宁可少说一句，也不说错。
+    let Ok(out) = std::process::Command::new("ps").args(["-Ao", "args="]).output() else {
+        return false;
+    };
+    let Ok(re) = regex::Regex::new(ORPHAN_PROFILE_PATTERN) else {
+        return false;
+    };
+    String::from_utf8_lossy(&out.stdout).lines().any(|line| {
+        line.contains(process_name)
+            // 只认主进程：helper 走的是 Contents/Frameworks/ 下的可执行文件。
+            && !line.contains("Contents/Frameworks/")
+            && !re.is_match(line)
+    })
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -416,10 +432,22 @@ fn launch() -> Result<Session, String> {
         // 这里只说**已经证实**的原因，不推荐没验证过的开关。
         // 真实 profile 那条路（MICHAEL_BROWSER_USE_REAL_PROFILE）在浏览器运行时必定
         // 失败（配置目录被 SingletonLock 锁着），所以它不是一条能推荐的路，别写成建议。
+        // 这句话要**分情况**说，因为用户问的正是「我明明开着浏览器，你为什么不用」。
+        //
+        // 原来不管开没开，说的都是同一句泛泛的"接管已开实例需要调试端口"。开着的人觉得
+        // 答非所问（我开着啊），没开的人更莫名其妙（我没开你解释什么）。而这两件事我们
+        // 是**测得出来**的：is_browser_running 看进程、try_connect_existing 已经扫过端口。
+        // 有事实就别说套话。
         let why = if use_real_profile && browser_running {
             format!("你已开着 {}，它把配置目录锁住了，共享不了", kind.label)
+        } else if browser_running {
+            format!(
+                "你现在确实开着 {}，但那个实例启动时没有带 --remote-debugging-port，\
+而调试端口是**启动期**参数、进程跑起来之后加不上，所以它接管不了——这不是没去找，是找了、够不着",
+                kind.label
+            )
         } else {
-            "接管一个已经开着的浏览器，需要那个实例在启动时就开了调试端口，而端口是启动期参数，跑起来之后加不上".to_string()
+            format!("本机当前没有开着的 {}，没有可接管的实例", kind.label)
         };
         format!(
             "自动化用的是 **{}**，是新起的一个实例（Dock 里多出来的那个图标就是它）。\
@@ -524,6 +552,19 @@ fn launch() -> Result<Session, String> {
     }
     let opts = LaunchOptionsBuilder::default()
         .path(Some(std::path::PathBuf::from(&path)))
+        // 空闲多久就当浏览器死了。**这一行以前不存在**，于是吃的是 headless_chrome 的默认
+        // 30 秒（process.rs:187），而那 30 秒是这样花掉的：transport 用
+        // `messages_rx.recv_timeout(idle_browser_timeout)` 等 CDP 入站消息，超时就 break；
+        // 而 configure_new_tab 一个事件域都没 enable，一个静止的页面几乎零入站消息。
+        //
+        // 结果：模型点一下浏览器 → 转头去读代码/跑测试（超过 30 秒是常态）→ 回来再点，
+        // 连接已经断了 → is_dead_browser 命中 → close_on_drop 把进程杀掉 → 重开一个新窗口，
+        // 当前页面连同登录态一起丢。用户看到的就是"它老是自己弹一个新的调试浏览器出来"。
+        //
+        // 30 分钟：远长于任何一次合理的动作间隔，又仍然有界（真被遗忘的实例不会永远挂着，
+        // 而且孤儿清理那条也修好了）。真正的掉线不靠这个超时发现——进程退出、websocket
+        // 关闭都会立刻报错，那些才是"浏览器真的没了"的信号。
+        .idle_browser_timeout(std::time::Duration::from_secs(30 * 60))
         .headless(headless)
         .sandbox(false)
         .ignore_certificate_errors(true)
@@ -572,12 +613,166 @@ fn launch() -> Result<Session, String> {
     })
 }
 
+/// 一个**正在跑**、而且开着调试端口的浏览器实例。
+#[derive(Debug, Clone)]
+struct LiveBrowser {
+    pid: u32,
+    port: u16,
+    /// 是不是我们自己起的（profile 目录带我们的标记）。用户自己那个优先接管。
+    ours: bool,
+}
+
+/// 找出本机所有开着调试端口的浏览器实例。
+///
+/// 为什么不能只扫 9222-9229：那六个端口是**约定**，不是事实。真实情况里
+///   · 用户自己带 `--remote-debugging-port=9333` 起的浏览器 → 扫不到
+///   · `--remote-debugging-port=0`（让系统随便挑一个，很多工具的默认做法）→ 扫不到，
+///     实测本机两个实例就是这样，分别落在 63180 和 53130
+/// 于是「先试着接管已开实例」这一步在绝大多数真实场景里是空转，直接掉进"新开一个"。
+/// 用户看到的就是"它老是弹自己那个调试浏览器"。
+///
+/// 改成从进程本身读：命令行里写着端口，`port=0` 时再去它的 user-data-dir 读
+/// `DevToolsActivePort`（Chromium 自己就是这么把真实端口告诉外界的）。
+#[cfg(not(windows))]
+fn discover_debuggable_browsers() -> Vec<LiveBrowser> {
+    let Ok(out) = std::process::Command::new("ps").args(["-Ao", "pid=,args="]).output() else {
+        return Vec::new();
+    };
+    let ours_re = regex::Regex::new(ORPHAN_PROFILE_PATTERN).ok();
+    let mut found = Vec::new();
+    for line in String::from_utf8_lossy(&out.stdout).lines() {
+        let line = line.trim_start();
+        let Some((pid_str, args)) = line.split_once(char::is_whitespace) else { continue };
+        let Ok(pid) = pid_str.trim().parse::<u32>() else { continue };
+        // 只看主进程。helper（GPU/渲染/网络）走的是 Contents/Frameworks/ 下的可执行文件，
+        // 它们继承了同一份命令行，不剔掉就会把同一个实例数出七八遍。
+        if args.contains("Contents/Frameworks/") || args.contains("--type=") {
+            continue;
+        }
+        if !crate::capture::BROWSER_KINDS.iter().any(|k| args.contains(k.process_name)) {
+            continue;
+        }
+        let Some(port) = debug_port_from_args(args) else { continue };
+        if port == 0 {
+            continue;
+        }
+        // 端口上的监听者必须**就是这个进程**。没有这一步，本机任意程序抢先占住一个端口
+        // 就能把整套浏览器自动化接过去（同 get_cdp_ws_url 那段注释说的威胁，这里是
+        // 在更前面一层堵住它）。查不出来就跳过——判据拿不到时宁可不接管。
+        if !listener_belongs_to(pid, port) {
+            continue;
+        }
+        let ours = ours_re.as_ref().map(|re| re.is_match(args)).unwrap_or(true);
+        found.push(LiveBrowser { pid, port, ours });
+    }
+    // 用户自己那个排前面：接管它才是"用你正开着的浏览器做事"。
+    found.sort_by_key(|b| b.ours);
+    found
+}
+
+#[cfg(windows)]
+fn discover_debuggable_browsers() -> Vec<LiveBrowser> {
+    // Windows 上没有 ps；用 CIM 拿命令行。拿不到就返回空，回落到端口扫描那条老路。
+    let Ok(out) = crate::process_util::command("powershell")
+        .args([
+            "-NoProfile",
+            "-Command",
+            "Get-CimInstance Win32_Process -Filter \"Name='chrome.exe' or Name='msedge.exe' or Name='brave.exe' or Name='chromium.exe'\" | ForEach-Object { \"$($_.ProcessId) $($_.CommandLine)\" }",
+        ])
+        .output()
+    else {
+        return Vec::new();
+    };
+    let ours_re = regex::Regex::new(ORPHAN_PROFILE_PATTERN).ok();
+    let mut found = Vec::new();
+    for line in String::from_utf8_lossy(&out.stdout).lines() {
+        let line = line.trim();
+        let Some((pid_str, args)) = line.split_once(' ') else { continue };
+        let Ok(pid) = pid_str.parse::<u32>() else { continue };
+        if args.contains("--type=") {
+            continue;
+        }
+        let Some(port) = debug_port_from_args(args) else { continue };
+        if port == 0 || !listener_belongs_to(pid, port) {
+            continue;
+        }
+        let ours = ours_re.as_ref().map(|re| re.is_match(args)).unwrap_or(true);
+        found.push(LiveBrowser { pid, port, ours });
+    }
+    found.sort_by_key(|b| b.ours);
+    found
+}
+
+/// 从命令行里取调试端口。`--remote-debugging-port=0` 表示"系统随便挑一个"，
+/// 真实端口写在 user-data-dir 下的 `DevToolsActivePort` 第一行——不读它就等于没发现。
+fn debug_port_from_args(args: &str) -> Option<u16> {
+    let raw = args
+        .split_whitespace()
+        .find_map(|t| t.strip_prefix("--remote-debugging-port="))?;
+    let port: u16 = raw.trim().parse().ok()?;
+    if port != 0 {
+        return Some(port);
+    }
+    let dir = args.split_whitespace().find_map(|t| {
+        t.strip_prefix("--user-data-dir=")
+            .or_else(|| t.strip_prefix("user-data-dir="))
+    })?;
+    let text = std::fs::read_to_string(std::path::Path::new(dir).join("DevToolsActivePort")).ok()?;
+    text.lines().next()?.trim().parse().ok()
+}
+
+/// 这个端口上监听的，是不是就是这个进程。
+///
+/// 判据拿不到时返回 **false**（fail closed）：接管一个来路不明的调试端口，代价是
+/// 对方看得到之后每一个页面、每一次输入。宁可多开一个自己的窗口。
+#[cfg(not(windows))]
+fn listener_belongs_to(pid: u32, port: u16) -> bool {
+    std::process::Command::new("lsof")
+        .args([
+            "-nP",
+            "-p",
+            &pid.to_string(),
+            "-a",
+            &format!("-iTCP:{port}"),
+            "-sTCP:LISTEN",
+        ])
+        .output()
+        .map(|o| o.status.success() && !o.stdout.is_empty())
+        .unwrap_or(false)
+}
+
+#[cfg(windows)]
+fn listener_belongs_to(pid: u32, port: u16) -> bool {
+    let Ok(out) = crate::process_util::command("netstat").args(["-ano"]).output() else {
+        return false;
+    };
+    let needle = format!(":{port}");
+    String::from_utf8_lossy(&out.stdout).lines().any(|l| {
+        l.contains(&needle)
+            && l.to_ascii_uppercase().contains("LISTENING")
+            && l.split_whitespace().last() == Some(pid.to_string().as_str())
+    })
+}
+
 /// Try to attach to a user's already-running Chrome that has remote debugging
 /// enabled (e.g. launched with `--remote-debugging-port=9222`).  This lets the
 /// agent drive the user's REAL browser — with all their cookies, logged-in
 /// sessions, and extensions — instead of a separate automation instance.
 fn try_connect_existing() -> Option<Session> {
-    for port in [9222u16, 9223, 9224, 9225, 9226, 9229] {
+    // 候选顺序：**先按进程发现**（用户自己那个排最前），再退回固定端口扫描。
+    //
+    // 固定端口那条以前是唯一的判据，而它只是个约定：真实实例常跑在别的端口上，
+    // `--remote-debugging-port=0` 更是让系统随便挑（实测本机两个实例落在 63180/53130）。
+    // 于是"先试着接管已开实例"这一步在真实场景里几乎必然空转，直接掉进"新开一个"——
+    // 用户看到的就是"它老是弹自己那个调试浏览器"。老那条留着当兜底，不删。
+    let discovered: Vec<u16> = discover_debuggable_browsers().into_iter().map(|b| b.port).collect();
+    let mut candidates = discovered;
+    for p in [9222u16, 9223, 9224, 9225, 9226, 9229] {
+        if !candidates.contains(&p) {
+            candidates.push(p);
+        }
+    }
+    for port in candidates {
         let (ws_url, brand) = match get_cdp_ws_url(port) {
             Some(pair) => pair,
             None => continue,
@@ -1813,6 +2008,19 @@ pub fn close_all() {
     }
 }
 
+/// 认「这个浏览器进程是我们造的」的判据：命令行里出现我们自己造的 profile 目录。
+///
+/// 每一条都独特到不可能撞上用户自己的浏览器——他的 profile 在
+/// `~/Library/Application Support/Google/Chrome`（macOS）/ `%LOCALAPPDATA%\Google\Chrome`
+/// （Windows）下，不含这里任何一个词。杀进程的判据宁可漏，不可错。
+const ORPHAN_PROFILE_PATTERN: &str = concat!(
+    "rust-headless-chrome-profile",          // headless_chrome 老版本的临时名
+    "|michael-ide-browser",                  // browser.rs 的兜底临时 profile
+    "|\\.mrdayone/browser-profile",           // 持久 profile（主力，含 -edge/-brave/-chromium）
+    "|rust_automation_browser_",             // automation-framework 的临时 profile
+    "|\\.mrday-browser-session",              // automation-framework 的持久 profile
+);
+
 /// Kill orphaned Chrome processes from previous IDE sessions.
 /// headless_chrome spawns a process tree (main + GPU + renderer + utility); if the IDE
 /// crashes or the webview reloads without dropping the Session, the children become
@@ -1823,8 +2031,22 @@ pub fn kill_orphaned_browsers() {
         #[cfg(not(windows))]
         {
             let my_pid = std::process::id().to_string();
+            // 匹配模式必须覆盖**我们实际会造出来的每一种** profile 目录，否则清理是空转。
+            //
+            // 原来只有两条：`rust-headless-chrome-profile`（headless_chrome 老版本的临时名，
+            // 现在这条路径压根不产生它）和 `michael-ide-browser`（只对得上 browser.rs:570
+            // 那个兜底临时 profile）。真正天天在用的三种一条都没覆盖：
+            //   · ~/.mrdayone/browser-profile[-edge|-brave|-chromium]  ← 持久 profile，主力
+            //   · <tmp>/rust_automation_browser_<pid>                 ← automation-framework
+            //   · ~/.mrday-browser-session                            ← automation-framework 持久
+            // 于是孤儿从来没被清掉过。实测这台机器上挂着两个，分别跑了 1 天和 5 天——
+            // 每一个都是 Dock 里一个多出来的图标，也是用户说"老是弹自己那个浏览器"的一部分。
+            //
+            // 每一条都带着足够独特的路径片段（.mrdayone/ 、rust_automation_browser_、
+            // .mrday-browser-session），不可能撞上用户自己的 Chrome——他的 profile 在
+            // ~/Library/Application Support/Google/Chrome 下，不含这里任何一个词。
             let out = match std::process::Command::new("pgrep")
-                .args(["-f", "rust-headless-chrome-profile|michael-ide-browser"])
+                .args(["-f", ORPHAN_PROFILE_PATTERN])
                 .output()
             {
                 Ok(o) => o,
@@ -1921,6 +2143,91 @@ mod tests {
     fn 每个浏览器一份独立配置_chrome_保留原路径() {
         // 共用一个目录会把 profile 写坏（Chrome 和 Edge 的格式不互通），
         // 而给 chrome 也加后缀则会让已经登录过的人平白丢一次登录态。
+        // 调试端口要从**进程自己**读，不能只认约定的 9222-9229。
+        //
+        // `--remote-debugging-port=0` 是"系统随便挑一个"，很多工具的默认做法——真实端口写在
+        // user-data-dir 下的 DevToolsActivePort 第一行。不读它，这类实例就等于不存在，
+        // 「先试着接管已开的浏览器」这一步在真实场景里必然空转，直接掉进"新开一个"。
+        // 实测这台机器上两个实例正是这样，端口落在 63180 和 53130。
+        {
+            assert_eq!(
+                debug_port_from_args("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome --remote-debugging-port=9222"),
+                Some(9222),
+            );
+            // 没有这个参数 = 接管不了，必须是 None 而不是猜一个默认值
+            assert_eq!(
+                debug_port_from_args("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"),
+                None,
+                "用户日常那个浏览器没带端口，不能凭空当成能接管",
+            );
+            // port=0 且拿不到 user-data-dir → 只能是 None，不许瞎猜
+            assert_eq!(debug_port_from_args("chrome --remote-debugging-port=0"), None);
+            // port=0 + DevToolsActivePort：真实端口读得出来
+            let dir = std::env::temp_dir().join(format!("mrday-devtools-probe-{}", std::process::id()));
+            let _ = std::fs::create_dir_all(&dir);
+            let _ = std::fs::write(dir.join("DevToolsActivePort"), "63180\n/devtools/browser/abc\n");
+            let d = dir.display();
+            // 两种写法都要认：实测 automation-framework 那条命令行里是**不带 -- 的** user-data-dir=
+            assert_eq!(
+                debug_port_from_args(&format!("chrome --remote-debugging-port=0 --user-data-dir={d}")),
+                Some(63180),
+            );
+            assert_eq!(
+                debug_port_from_args(&format!("chrome --remote-debugging-port=0 user-data-dir={d}")),
+                Some(63180),
+                "实测的命令行里没有前导 --，只认带 -- 的写法就等于认不出来",
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        // 空闲超时必须被显式配置。不配就是 headless_chrome 的默认 30 秒，而 30 秒是
+        // 「模型点一下浏览器、转头去读代码、回来再点」的常态间隔——连接死掉、进程被杀、
+        // 窗口重开、当前页面丢失，用户看到的就是"它老是自己弹一个新的调试浏览器"。
+        // 这条钉源码：这个调用埋在一个上千行的函数里，抽不出来单测。
+        {
+            const SRC: &str = include_str!("browser.rs");
+            // 需要的串拼出来找：include_str! 读的是整个文件、包含本测试模块自己，
+            // 写成字面量的话断言会匹配到自己，永远绿。
+            let needle = format!(".{}(", "idle_browser_timeout");
+            assert!(
+                SRC.contains(&needle),
+                "LaunchOptions 没有配 idle_browser_timeout —— 会退回默认 30 秒，浏览器会被反复杀掉重开",
+            );
+            // 而且必须明显长于一次动作间隔。30 秒那一档等于没配。
+            let at = SRC.find(&needle).unwrap();
+            let call = &SRC[at..(at + 120).min(SRC.len())];
+            assert!(
+                call.contains("60") || call.contains("min"),
+                "空闲超时看起来还是秒级；这道门要的是分钟级：{call}",
+            );
+        }
+
+        // 孤儿清理的判据要覆盖**每一种**我们会造出来的 profile 目录，
+        // 又绝不能匹配用户自己的浏览器——这是个 kill -9 的判据，错一次就是杀掉用户的窗口。
+        {
+            let pat = ORPHAN_PROFILE_PATTERN;
+            let re = regex::Regex::new(pat).expect("孤儿判据不是合法正则");
+            // 我们自己造的，每一种都必须认得
+            for ours in [
+                "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome --user-data-dir=/Users/x/.mrdayone/browser-profile",
+                "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome --user-data-dir=/Users/x/.mrdayone/browser-profile-edge",
+                "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome --user-data-dir=/var/folders/T/rust_automation_browser_2811",
+                "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome --user-data-dir=/Users/x/.mrday-browser-session",
+                "/tmp/michael-ide-browser-123",
+                "/tmp/rust-headless-chrome-profile-abc",
+            ] {
+                assert!(re.is_match(ours), "认不出自己造的 profile：{ours}");
+            }
+            // 用户自己的，一个都不许匹配
+            for theirs in [
+                "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+                "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome --user-data-dir=/Users/x/Library/Application Support/Google/Chrome",
+                "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome --profile-directory=Default",
+                "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
+            ] {
+                assert!(!re.is_match(theirs), "会误杀用户自己的浏览器：{theirs}");
+            }
+        }
         assert_eq!(profile_dir_name("chrome"), "browser-profile");
         assert_eq!(profile_dir_name("edge"), "browser-profile-edge");
         assert_eq!(profile_dir_name("brave"), "browser-profile-brave");
