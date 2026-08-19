@@ -14,6 +14,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::auth::Claims;
 use crate::error::{ApiResult, AppError};
+use crate::route_health;
 use crate::AppState;
 
 /// Shared, pooled HTTP client for upstream model calls. Building a fresh
@@ -7152,12 +7153,19 @@ pub async fn chat_completions(
                             "upstream stalled before response headers"
                         );
                         mark_route_stall(candidate.id);
+                        // 卡满整段预算才失败，是最该被面板看见的一种坏 —— 这次事故那条线
+                        // 44 小时全是这个形状。
+                        route_health::spawn_fail(&state, candidate.id, 504);
                         route_failed_transient = true;
                         break;
                     }
                 };
                 match sent {
                     Ok(r) if r.status().is_success() => {
+                        // 真实流量的健康信号。口径是「接得通、认得凭据、开始回话」，
+                        // 不是「这一轮流式完整结束」—— 流中途断掉在 agentic IDE 里多半是
+                        // 用户按了停止，算成线路故障会把好线路刷红、然后告警被静音。
+                        route_health::spawn_ok(&state, candidate.id);
                         success = Some(r);
                         selected_conn = Some(candidate.clone());
                         break 'routes;
@@ -7166,6 +7174,7 @@ pub async fn chat_completions(
                         // 上游把话说完了：它没跑模型，也不会为这一次计费 —— 换线是安全的。
                         upstream_answered_with_error = true;
                         err_status = r.status().as_u16();
+                        route_health::spawn_fail(&state, candidate.id, err_status);
                         let error_body_wait = route_deadline
                             .saturating_duration_since(Instant::now())
                             .min(MAX_ERROR_BODY_WAIT);
@@ -7243,6 +7252,7 @@ pub async fn chat_completions(
                     Err(e) => {
                         err_status = 502;
                         err_low = e.to_string().to_lowercase();
+                        route_health::spawn_fail(&state, candidate.id, 502);
                         if attempt + 1 >= candidate_max_attempts {
                             route_failed_transient = true;
                             break;

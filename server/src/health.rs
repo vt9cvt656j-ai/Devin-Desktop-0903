@@ -191,12 +191,25 @@ pub async fn status(
 
         let latest = samples.first();
         let ping_ms = latest.and_then(|s| s.1);
-        let state_word = match latest {
+        let front_door_word = match latest {
             None => "unknown",
             Some((false, _, _)) => "error",
             Some((true, Some(ms), _)) if (*ms as i64) > SLOW_MS => "degraded",
             Some((true, _, _)) => "ok",
         };
+
+        // **面板上的状态改由真实流量决定，探针只留作「前门通不通」。**
+        //
+        // 上面那个 `front_door_word` 是探针的结论，而探针发的是一个不带凭据的 GET，
+        // 十条线路又共用同一个上游域名 —— 它测的是同一次 TCP 握手，测十遍。
+        // 2026-08-19 那次事故里，「Claude 强力版」连续 44 小时零成功，这个词一直是 ok。
+        //
+        // route_health 用的是这条线路真实请求的结局：连败次数 + 上次成功时刻。
+        // 刻意不用「成功率 + 时间窗」：这台机器每条线路每小时只有个位数请求，任何
+        // 带样本量门槛的判据都会退到更长的窗，而长窗里装的是故障**之前**的成功，
+        // 只会把结论往好看的方向拉。
+        let rh = crate::route_health::snapshot(&state, id).await;
+        let state_word = crate::route_health::classify(&rh, chrono::Utc::now().timestamp());
 
         cards.push(json!({
             "id": id,
@@ -205,6 +218,14 @@ pub async fn status(
             "model": model_id.unwrap_or_default(),
             "state": state_word,
             "ping_ms": ping_ms,
+            // 只增不改：既有的键含义一个都没动（ping_ms 仍是探针握手耗时，availability
+            // 仍是探针可达率），新的事实全部走新键，这样没升级的前端 bundle 不会把
+            // 秒级数字渲染进「Endpoint response」那一格。
+            "front_door": front_door_word,
+            "consecutive_failures": rh.consecutive_failures,
+            "last_ok_at": rh.last_ok_at,
+            "last_attempt_at": rh.last_attempt_at,
+            "last_fail_status": rh.last_fail_status,
             "availability": availability,
             "window_days": days,
             "checked_at": latest.map(|s| s.2),
@@ -223,7 +244,9 @@ pub async fn status(
         "error"
     } else if cards.iter().any(|c| c["state"] == "degraded") {
         "degraded"
-    } else if cards.iter().all(|c| c["state"] == "unknown") {
+    } else if cards.iter().any(|c| c["state"] == "unknown") {
+        // 有一条说不清就整体说不清。原来是「只要不全是 unknown 就报 ok」——
+        // 9 条不知道 + 1 条好，整体报好，这正是「没有证据当成好消息」的老毛病。
         "unknown"
     } else {
         "ok"

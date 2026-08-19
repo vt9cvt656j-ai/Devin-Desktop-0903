@@ -19,6 +19,7 @@ mod error;
 mod game;
 mod handoff;
 mod health;
+mod route_health;
 mod integrations;
 mod knowledge;
 mod model_catalog;
