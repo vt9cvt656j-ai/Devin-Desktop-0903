@@ -361,6 +361,154 @@ test("every quiet-turn re-entry is latched or counted", () => {
     `${continues} re-entry points in the quiet-turn branch — every one needs a latch listed above`);
 });
 
+// 用户实拍：「今天好几次任务没有执行，Agent 说执行完毕」。这是它的机器成因之一。
+//
+// 装配阶段会对每条工具调用做一次独立复核，不过关就 `return null`。拒绝执行是对的——
+// 带残缺参数落盘比不落盘更糟。错的是**不出声**：重试循环判定参数没问题（没有
+// fatalToolArgIssue），装配却把调用全吃了，于是 toolCalls 空、err 空。而上层 agent 循环
+// 读「这一轮没有工具调用」只有一种解释——模型自己决定收尾——所以模型那句"已经改好了"
+// 被原样端给用户，那次写盘根本没发生。差额被当成了收尾意图。
+//
+// 这道门不改拒绝的决定，只要求它出声：并回既有的 [tool-args-invalid] 修复机器。
+test("装配把工具调用全吃掉时，绝不能表现成模型自己收尾", () => {
+  // 直接锚在源码上：fnBody 的括号配平对这个上千行、满是模板串的函数不可靠，
+  // 会截出一段不含装配点的残体，让这条断言变成"永远绿"。
+  const at = SRC.indexOf("let toolCalls = (fatalToolArgIssue || err)");
+  const end = SRC.indexOf("const _hasNonControlToolCall", at);
+  assert.ok(at > 0 && end > at, "工具调用装配点必须还在");
+  assert.equal(count(SRC, /let toolCalls = \(fatalToolArgIssue \|\| err\)/g), 1, "装配点必须唯一，否则这条断言可能钉错地方");
+  const tail = SRC.slice(at, end);
+  // 判据必须是三个事实同时成立：声明了带 name 的调用 × 存活 0 条 × 无错误。
+  // 只看 toolCalls 空会把纯文字回答也判成矛盾——那才是真正的安静收尾，不能动。
+  assert.match(tail, /if \(!toolCalls\.length && !err\) \{[\s\S]{0,400}?byIndex\.values\(\)[\s\S]{0,200}?filter\(\(e\) => e\?\.name\)/,
+    "判据要对照『流里声明了带 name 的调用』与『存活 0 条』，不能只看 toolCalls 空");
+  // 上层只认这个前缀（_runAgenticLoop 里的 tool-args-invalid 分支），换个前缀就等于没接线
+  assert.match(tail, /err = `\[tool-args-invalid\]/,
+    "要走既有的 [tool-args-invalid] 修复路径，模型才会被要求重发调用而不是收尾");
+  assert.match(tail, /fatalRejectedToolAttempts = _declared\.map/,
+    "被吃掉的调用要交给上层做参数补全，否则只剩一条没法照做的报错");
+  // 修复路径的落点：补不出参数时推的那条提醒必须明写不许收尾，否则模型照样宣布完成
+  assert.match(SRC, /不要收尾，不要声称已完成/,
+    "参数修复提醒必须明确禁止收尾");
+});
+
+// 同一个病的另一条路径，而且更隐蔽：这里连一条错误都没有。
+//
+// toolMsgs 是稀疏数组（`new Array(items.length)`）。调度器 _runOrderedToolSegments 的循环条件
+// 是 `index < items.length && isLive()`，某一项抛异常也会中断整批——两种情况都留下空洞。
+// 只有 !_live() 那条分支补过空洞；活路径直接 `for (const m of toolMsgs) messages.push(m)`，
+// 把空洞当 undefined 推进消息流。于是模型的转录里，它调过的工具没有任何结果反驳它，
+// 它就默认成功并写下「已改好」——那次调用其实没跑。
+test("没跑成的工具调用必须如实回一条结果，不能在转录里留白", () => {
+  const at = SRC.indexOf("const toolMsgs = new Array(items.length);");
+  assert.ok(at > 0, "toolMsgs 还是稀疏数组的话，补齐就仍是必需的");
+  // 活路径的推送点（不是 !_live() 那条——它自带 [interrupted] 补齐后 break）
+  const pushAt = SRC.indexOf("for (const m of toolMsgs) messages.push(m);\n      if (turn._invalidToolRepairInstruction", at);
+  assert.ok(pushAt > at, "活路径的推送点没找到——这条断言可能钉错了地方");
+  const before = SRC.slice(at, pushAt);
+  // 补齐必须紧挨着推送点之前，且覆盖每一个 item
+  assert.match(before, /for \(let j = 0; j < items\.length; j\+\+\) \{[\s\S]{0,200}?if \(toolMsgs\[j\]\) continue;[\s\S]{0,600}?toolMsgs\[j\] = \{ role: "tool", tool_call_id: items\[j\]\.tc\.id/,
+    "活路径推送前必须把没跑的那些补成如实结果，否则转录里是 undefined 空洞");
+  // 内容必须明说没执行、且明确否掉"已完成"——只留个空字符串等于没补
+  assert.match(before, /\[未执行\][^"]*不要把它当成已完成/,
+    "补的这条要明说没执行、没改动、别当成已完成");
+  // 标记 _notAttempted：三处失败归因/恢复分析按它排除，不标就会把"没跑"算成"跑失败了"
+  assert.match(before, /items\[j\]\._notAttempted = true;/,
+    "补齐的同时要标 _notAttempted");
+  assert.equal(count(SRC, /_notAttempted = true/g), 1, "_notAttempted 只该在补齐处写入");
+  assert.ok(count(SRC, /\?\._notAttempted/g) >= 3, "失败归因/恢复分析仍要按 _notAttempted 排除未执行项");
+  // UI 上不能把"未执行"显示成绿色的成功
+  assert.match(SRC, /const failed = \/\\\[\(\?:ERROR\|BLOCKED\|DENIED\|失败\|不可用\|interrupted\|未执行\)/,
+    "[未执行] 必须被判成非成功态，否则卡片显示绿勾");
+});
+
+// ── 2026-08-19：「说执行完毕，其实没执行」专项。以下五条都是执行事实层面的谎报。 ──
+
+// 最贴合时间线的一条，而且是自伤：08-18 删掉答案下面那条「改了 N 个文件·没验证·没测试」
+// 横幅（删得对，harness 不该在模型回答下面写字），但删除时留的注释声称"同一条事实照样喂给
+// 模型"——而喂给模型的唯一入口是运行进度草稿纸，那块要 iter >= 6 才注入。改两三个文件、
+// 跑三五轮就收尾的 run 根本到不了。于是那次删除同时关掉了两个出口，模型下一轮照旧
+// "改完就说能用"。这条守住：交付事实必须有一条不受 iter 门槛约束的注入。
+test("交付事实必须每轮喂给模型，不能只挂在 iter>=6 的草稿纸上", () => {
+  const gate = SRC.indexOf("if ((iter >= 6 && (iter % 3 === 0 || iter >= 20)) || run._compactedThisTurn) {");
+  assert.ok(gate > 0, "草稿纸门槛还在——那么交付事实就必须有自己的出口");
+  const after = SRC.slice(gate, gate + 3000);
+  // 注入点必须存在，且**不在**那个 iter 条件的花括号里：判据是它读的是自己的标签常量
+  assert.match(after, /_DELIVERY_FACTS_TAG/,
+    "交付事实要有独立注入，不能继续寄生在草稿纸里");
+  assert.match(after, /const _facts = run\.mode === "agent" && !_padInjectedThisTurn \? _deliveryFactsLine\(run\) : ""/,
+    "独立注入要直接读 _deliveryFactsLine，并且只在草稿纸没注入时补位（避免同轮重复）");
+  assert.match(after, /messages\.push\(\{ role: "user", content: `\$\{_ORCH_NOTE\}\$\{_DELIVERY_FACTS_TAG\}/,
+    "事实要真的进 messages，并戴编排信封（否则会被当成用户新指令）");
+  // 每轮替换上一条，否则长 run 里越堆越多
+  assert.match(after, /messages\[i\]\.content\.includes\(_DELIVERY_FACTS_TAG\)[\s\S]{0,80}?messages\.splice\(i, 1\)/,
+    "注入前要先摘掉上一条，别在上下文里堆积");
+  // 自带闸门：没动代码就返回空串 → 纯问答/只读 run 不受打扰。这是"执行事实"而非"意图分类"。
+  const dfl = SRC.slice(SRC.indexOf("function _deliveryFactsLine(run) {"), SRC.indexOf("function _deliveryFactsLine(run) {") + 400);
+  assert.match(dfl, /if \(!code\.length\) return "";/,
+    "没动过源码就必须返回空串——否则纯问答的 run 会被塞一条无关事实");
+  // 显示侧那条规矩不许被这次修复带回来
+  // 它现在只剩定义、零调用点，正是 08-18 那次删除的结果。这一条守住"别挂回去"：
+  // 排除 `function _appendDeliveryFactsBar(` 这处声明后，调用点必须仍然是 0。
+  assert.equal(count(SRC, /(?<!function )_appendDeliveryFactsBar\(/g), 0,
+    "不许把事实横幅重新挂回答案下面——用户 2026-08-18 点名删过");
+});
+
+// harness 自己说出口的那句「✅ 任务完成」，此前完全不看结局。
+test("任务完成通知必须说真实结局，不能写死成功", () => {
+  assert.match(SRC, /_notifyTaskDone\(sess, text, sess\?\._lastRunState\?\.outcome \|\| "success"\)/,
+    "通知要读真实 outcome；写死 true 等于 harness 自己谎报完成");
+  assert.equal(count(SRC, /_notifyTaskDone\(sess, text, true\)/g), 0, "字面量 true 不许回来");
+  const fn = SRC.slice(SRC.indexOf("async function _notifyTaskDone("), SRC.indexOf("async function _notifyTaskDone(") + 1200);
+  for (const [oc, why] of [["partial", "没做完"], ["failed", "失败"], ["awaiting_user", "在等用户回话"]]) {
+    assert.match(fn, new RegExp(`${oc}:\\s*\\[`), `${why} 要有自己的标题，不能并进"任务完成"`);
+  }
+});
+
+// 子体把轮次预算跑满被截断时，简报第一句就写着「这是中间状态，不是结论」，
+// 而状态却落进 done → 主体收到的标签是「完成」。标签在前更醒目，半成品被当结论。
+test("子智能体轮次用尽不能标成完成", () => {
+  assert.equal(count(SRC, /job\.status = "truncated"/g), 2, "两处分类点都要认得这个出口");
+  assert.equal(count(SRC, /else if \(\/\^\\\[轮次用尽·未完成\\\]\/\.test\(job\.result\)\)/g), 2,
+    "判据要钉在子体自己打的前缀上");
+  assert.match(SRC, /j\.status === "truncated" \? "未完成·轮次用尽/,
+    "标签要说清这是未完成");
+  assert.match(SRC, /j\.status === "done" \|\| j\.status === "failed" \|\| j\.status === "timeout" \|\| j\.status === "truncated"/,
+    "truncated 也是已落定的作业，要被消化掉，否则挂到最后被一律标 cancelled");
+});
+
+// 一个字节都没写进 PTY 的调用，此前回「已在运行中」并判成功、还给计划打勾。
+test("复用终端的调用要说清这次什么都没执行", () => {
+  const branch = SRC.slice(SRC.indexOf("if (r.alreadyRunning) {"), SRC.indexOf("if (r.alreadyRunning) {") + 2200);
+  assert.ok(branch.length > 100, "复用分支还在");
+  assert.doesNotMatch(branch, /termWrite/, "这条分支确实没有向 PTY 写任何东西——前提没变");
+  assert.match(branch, /本次调用\*\*没有执行任何命令\*\*/,
+    "必须明说这次没执行任何命令，否则模型据此认定服务在跑");
+  assert.match(branch, /PTY 存活，不等于这条命令本身还在跑/,
+    "首次启动那条有的免责声明，真正什么都没做的这条更需要");
+});
+
+// 检测到 EADDRINUSE / cannot find module 却仍然判成功、仍然给计划打勾。
+test("检测到启动错误就不能再算启动成功", () => {
+  assert.match(SRC, /if \(_rdHit\.failed\) \{ _startupFailed = true;/,
+    "命中失败模式要置标志，光追加一句 ⚠️ 提示改变不了成功语义");
+  assert.match(SRC, /\$\{_startupFailed \? "\[启动失败\]/,
+    "content 要以方括号失败标记开头，_toolFailureMatch 才认得，计划才不会被打勾");
+});
+
+// exit 0 不等于验证过：go/jest/pytest/cargo 空跑全是 exit 0。
+test("空跑的绿色不能盖验证章", () => {
+  const stamp = SRC.indexOf("const _verificationExitRaw = result?.exitCode ?? result?.code;");
+  assert.ok(stamp > 0, "盖章点还在");
+  const block = SRC.slice(stamp, stamp + 2000);
+  assert.match(block, /if \(_verifierRanNoTests\(_vOut\)\) \{/,
+    "盖章前必须先排除空跑");
+  assert.match(block, /\[未构成验证\]/,
+    "不盖章还要明确告诉模型，否则它只看到 exit 0 照样写「测试通过」");
+  assert.match(block, /\} else \{[\s\S]{0,200}?call\.verification = true;/,
+    "盖章只能落在 else 分支里");
+});
+
 // ─────────────────────────────────────────────────────────────────────────────
 // 5. The linker's own honesty check
 // ─────────────────────────────────────────────────────────────────────────────
