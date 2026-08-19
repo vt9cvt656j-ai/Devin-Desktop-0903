@@ -26735,7 +26735,19 @@ async function sendPrompt(text, attachments = [], readyConfig = null, opts = {})
         requestConfig.ideTimezone = turnTime.timeZone;
         requestConfig.ideUtcOffsetMinutes = turnTime.utcOffsetMinutes;
         requestConfig.ideRegion = _ideRegionCode();
-        delete requestConfig.ideTools;
+        // 聊天模式也报工具名。原来这里是 `delete requestConfig.ideTools`，于是网关那份
+        // **专为 chat 挑的只读清单**（web_search / web_fetch / knowledge_search / wiki /
+        // arxiv / crossref / openalex / pubmed / pubchem / clinical_trials / steam /
+        // local_discovery / live_environment / ask_user，见 allowed_static_tool 的 "chat" 分支，
+        // 还有两条 Rust 测试守着）永远收不到——一条谁也走不到的路。
+        //
+        // 而 chat.txt 第一句就是「你什么都能聊、什么都能答……问附近的店就去查」，真实性纪律
+        // 又要求动态事实必须有真实来源。没有工具时这两条只能互相打架：模型要么编，要么每次
+        // 都回一句"我查不了"。
+        //
+        // 报的是**全部静态工具名**，不在客户端另抄一份 chat 白名单：网关的 allowed_static_tool
+        // 会按 mode 过滤，那才是唯一真源。多抄一份必然漂（本仓库为此吃过好几次亏）。
+        requestConfig.ideTools = [..._staticToolNames()].join(",");
         // userRulesBlock 必须在这里出现。_l0MessagesWithSkills 会把原来那条 system 消息
         // **整条丢掉**、只用 clientBlocks + skillsBlock 重建，所以任何没列进来的块，
         // 在 L0（走网关，也就是默认线路）下就等于没发。用户规则/习惯此前正是漏在这里：
@@ -26862,11 +26874,12 @@ async function sendPrompt(text, attachments = [], readyConfig = null, opts = {})
           if (entry.args.trimEnd().endsWith("}")) try {
             const parsed = JSON.parse(entry.args);
             const toolName = entry.name;
-            let call;
-            if (toolName === "read_file") call = { type: "read", path: parsed.path };
-            else if (toolName === "list_dir") call = { type: "list", path: parsed.path, depth: parsed.depth };
-            else if (toolName === "run_cmd") call = { type: "cmd", command: parsed.command };
-            else if (toolName === "write_file") call = { type: "write", path: parsed.path, content: parsed.content };
+            // 原来这里手写四个分支（read_file / list_dir / run_cmd / write_file），别的工具
+            // 一律 call 为 undefined → **静默丢弃**：模型调了 web_search，用户这边没有卡片、
+            // 没有结果、也没有报错，只看到它凭空换了个话题。而 chat 真正被允许的恰恰是那些
+            // 检索工具（见上面报工具名那处的注释），一个都不在这四个里。
+            // 改用真正的映射器：注册表里有的都能落地，参数归一化也跟主路径同一套。
+            const call = _mapToolCall(toolName, parsed);
             if (call) {
               _removeWritePreview(entry); // hand off from the live preview to the real card
               _removeAllThinking(body);
@@ -44446,7 +44459,17 @@ async function _runSubAgent({ config, description, prompt, root, container, run,
     : `\n\n# 你的可改范围(scope)\n你**只能修改**下面这些路径内的文件（相对工作区根），其余文件只读：\n${scopeRel.map((s) => "- " + s).join("\n")}`;
   const sysPrompt = (write
     ? _WORKER_SYSTEM + _scopeGuidance
-    : _SUBAGENT_SYSTEM) + _agentRoleBlock(role) + (run?.skillsBlock ?? _skillsSystemBlock())
+    : _SUBAGENT_SYSTEM)
+    // 只读模式（Explorer / Plan / Reviewer）下派出的子体：上面那份人格无条件说「run_cmd is
+    // yours」，而这一轮它真的没有这个工具（名字和类型两侧都收回去了）。把话说准，别让它
+    // 照着一句已经不成立的许诺去撞墙。
+    + (_parentReadOnlyMode
+      ? "\n\n**这一次没有 run_cmd**：主智能体当前处在只读模式（Explorer / Plan / Reviewer），"
+        + "命令执行整条都不可用，这是用户在模式选择器上亲手选的，不要绕。"
+        + "用 search / find_files / find_symbol / lsp_references / get_diagnostics / read_logs 取证——"
+        + "它们在只读模式下始终可用，而且比 grep 管道更准。"
+      : "")
+    + _agentRoleBlock(role) + (run?.skillsBlock ?? _skillsSystemBlock())
     + _SUBAGENT_TRUTH;
   // Retrieval is ranked by the CHILD'S OWN TASK, not an empty string. The empty query
   // silently disabled three paths at once: _buildRepoMap degraded to pure symbol-count
@@ -44573,6 +44596,20 @@ async function _runSubAgent({ config, description, prompt, root, container, run,
   const _allow = write
     ? [..._READ_TOOLS, "write_file", "edit_file", "multi_edit", "run_cmd", "format_file", "create_dir"]
     : [..._READ_TOOLS, "run_cmd"]; // P0.2: 子智能体可运行纯探索命令
+  // 只读**模式**（Explorer / Plan / Reviewer）下派出去的子体：把 run_cmd 收回去。
+  //
+  // 它继承父 run 的 mode（execRun 是 `{ ...run, _subRole: role }`，只有 worker 才改写成
+  // "agent"），而执行侧的只读门读的正是 run.mode —— 于是工具表给了它、_execTypes 也给了它、
+  // 系统提示词还刚跟它说「run_cmd is yours」，一调却是 [BLOCKED]。三处许诺、一处拒绝。
+  //
+  // 修的方向是**收回许诺**而不是放开门：只读是用户在模式选择器上亲手选的，父体自己都不许跑
+  // 命令（tool-policy 里 cmd/termtask 的 readOnlyModeBlocked 有测试正面钉着），让子体绕过去
+  // 等于那个选择白选。收回之后模型看不见这个工具，也就不会撞上那堵墙。
+  const _parentReadOnlyMode = !write && ["explorer", "plan", "reviewer"].includes(String(run?.mode || ""));
+  if (_parentReadOnlyMode) {
+    const _i = _allow.indexOf("run_cmd");
+    if (_i >= 0) _allow.splice(_i, 1);
+  }
   // research/security always keep the network tools (idempotent — the read set already
   // has them; this survives a future allowlist tightening).
   if (["research", "security"].includes(String(role || "").toLowerCase())) {
@@ -44603,6 +44640,12 @@ async function _runSubAgent({ config, description, prompt, root, container, run,
   const _execTypes = write
     ? [..._READ_TYPES, "write", "edit", "multiedit", "cmd", "format", "mkdir"]
     : [..._READ_TYPES, "cmd"]; // P0.2: 允许只读模式执行 cmd
+  // 名字那侧（_allow）已经把只读模式下的 run_cmd 收回去了，类型这侧必须同步——两张表漂了
+  // 就是"给了一把打不开门的钥匙"，这个文件里已经为此写过一次注释（read_logs / read_skill）。
+  if (_parentReadOnlyMode) {
+    const _ti = _execTypes.indexOf("cmd");
+    if (_ti >= 0) _execTypes.splice(_ti, 1);
+  }
   // Role tool matrix, execution side: admit the same role tools' TYPES that _allow admitted
   // by name (from the identical _roleCaps), so a specialist's tool is both visible AND
   // executable. Per-op safety gates (db mutation, http external-effect) still apply downstream.

@@ -20960,8 +20960,11 @@ test("#92: list_dir depth 参数解析与传递", () => {
   assert.match(SRC, /case\s+"list_dir".*depth:\s*args\.depth/,
     "_parseAgentToolCall 必须传递 depth");
   // inline tool 解析也传递 depth
-  assert.match(SRC, /toolName\s*===\s*"list_dir".*depth:\s*parsed\.depth/,
-    "inline tool 解析必须传递 depth");
+  // 聊天路径原来手写四个分支（read_file/list_dir/run_cmd/write_file）自己传 depth，别的工具
+  // 一律静默丢弃。现在它委托给真正的映射器 _mapToolCall——同一份归一化逻辑不再抄两遍，
+  // 而且 chat 被网关允许的那些检索工具也终于能落地。钉委托，别再钉那份手抄。
+  assert.match(SRC, /const call = _mapToolCall\(toolName, parsed\);/,
+    "聊天路径又改回手写分支了——注册表里其余工具会被静默丢弃");
   // handler 里读取 call.depth
   assert.match(SRC, /Number\(call\.depth\)/,
     "handler 必须读取 call.depth");
@@ -28658,4 +28661,47 @@ test("没有生产者的判据腿必须去掉，别留一个永远 undefined 的
   }
   // 反向确认判据本身还在：难度信号不能被一起删光。
   assert.match(src, /const complexReadOnly = !!run\.engineering\?\.projectScope;/);
+});
+
+// ---- 只读模式派出的子体：别给它一个执行侧会拒的 run_cmd ----
+test("只读父模式下的子体，工具表/类型表/人格三者一致地没有 run_cmd", () => {
+  const sub = extractFn("_runSubAgent");
+  assert.match(sub, /const _parentReadOnlyMode = !write && \["explorer", "plan", "reviewer"\]\.includes\(String\(run\?\.mode \|\| ""\)\)/,
+    "没有识别只读父模式——子体会继承它（execRun 只有 worker 才改写 mode），然后在执行侧撞墙");
+  // 名字这侧收回
+  assert.match(sub, /if \(_parentReadOnlyMode\) \{[\s\S]{0,160}?_allow\.indexOf\("run_cmd"\)/,
+    "工具表还给着 run_cmd —— 模型看得见、一调就是 [BLOCKED]");
+  // 类型这侧同步收回（两张表漂了就是「给了一把打不开门的钥匙」）
+  assert.match(sub, /if \(_parentReadOnlyMode\) \{[\s\S]{0,160}?_execTypes\.indexOf\("cmd"\)/,
+    "类型表没同步——两张手抄名单又漂了");
+  // 话也要说准：那份人格是无条件写着「run_cmd is yours」的
+  assert.match(sub, /_parentReadOnlyMode[\s\S]{0,200}?这一次没有 run_cmd/,
+    "人格里那句无条件的「run_cmd is yours」没有被这一轮的真实情况覆盖");
+  // 反向：普通 agent 模式下不许误伤
+  const build = new Function("write", "run", "_READ_TOOLS", `
+    const _allow = write ? [..._READ_TOOLS, "write_file", "run_cmd"] : [..._READ_TOOLS, "run_cmd"];
+    const _parentReadOnlyMode = !write && ["explorer", "plan", "reviewer"].includes(String(run?.mode || ""));
+    if (_parentReadOnlyMode) { const _i = _allow.indexOf("run_cmd"); if (_i >= 0) _allow.splice(_i, 1); }
+    return _allow;`);
+  assert.ok(build(false, { mode: "agent" }, ["read_file"]).includes("run_cmd"), "agent 模式的子体被误伤了");
+  assert.ok(!build(false, { mode: "plan" }, ["read_file"]).includes("run_cmd"), "plan 模式仍然给着 run_cmd");
+  assert.ok(build(true, { mode: "agent" }, ["read_file"]).includes("run_cmd"), "worker 被误伤了");
+});
+
+// ---- 聊天模式：网关给的工具要真的到得了，也要真的执行得了 ----
+test("chat 模式报工具名（由网关白名单裁决），并用真正的映射器落地", () => {
+  const src = stripJsComments(SRC);
+  // ① 不再把 ideTools 删掉——删掉的话网关那份专为 chat 挑的只读清单永远收不到。
+  assert.doesNotMatch(src, /delete requestConfig\.ideTools;/,
+    "聊天路径又把工具名删掉了：网关的 chat 白名单会重新变成一条谁也走不到的路");
+  assert.match(src, /requestConfig\.ideTools = \[\.\.\._staticToolNames\(\)\]\.join\(","\);/,
+    "要报全部静态工具名，由网关按 mode 过滤——客户端另抄一份 chat 白名单必然漂");
+  // ② 执行侧走真正的映射器，别再手写四个分支
+  assert.match(src, /const call = _mapToolCall\(toolName, parsed\);/,
+    "聊天路径的工具调用又改回手写分支——注册表里其余工具会被静默丢弃");
+  assert.doesNotMatch(src, /toolName === "read_file"\) call = \{ type: "read"/,
+    "那四个手写分支又回来了");
+  // ③ 网关那份白名单是唯一真源，客户端不许出现同名的第二份
+  assert.doesNotMatch(src, /"wiki_search"[\s\S]{0,80}"arxiv_search"[\s\S]{0,80}"crossref_search"/,
+    "客户端抄了一份 chat 工具白名单——两份必然漂，网关那份才是裁决者");
 });
