@@ -1104,10 +1104,26 @@ pub async fn download_asset(
         Ok(base) => base,
         Err(_) => return StatusCode::BAD_GATEWAY.into_response(),
     };
+    // 最后一段既可能是**资产文件名**，也可能是**资产的数字 id**。
+    //
+    // 后者不是假设，是实测：tauri-action 生成的 latest.json 里，url 有时是
+    // `…/releases/download/<tag>/<文件名>`，有时是 `…/releases/assets/<数字 id>`。
+    // 而 rewrite_manifest_urls 取的是 url 的最后一段——碰上第二种形态，重写出来的就是
+    // `/api/ide/update/download/<tag>/521088998`，拿它按文件名查表必然查不到。
+    //
+    // 后果不只是官网下载按钮 404：**自动更新走的就是这份清单里的地址**，
+    // 于是整条更新链路一起断，而两边都只表现为一个空的 404。2026-08-19 的 v0.4.9 实际中招。
+    //
+    // 数字 id 必须**属于本次 release** 才放行（下面 by_id 的判据），否则这个端点就成了
+    // 「拿任意 id 就能代理任意仓库资产」的洞。
+    let by_id = |map: &HashMap<String, u64>| -> Option<u64> {
+        let id = file.parse::<u64>().ok()?;
+        map.values().any(|v| *v == id).then_some(id)
+    };
     let mut asset_id = None;
     if let Some((fetched_at, map)) = ASSET_MAP_CACHE.read().await.get(&tag) {
         if fetched_at.elapsed() < ASSET_MAP_TTL {
-            asset_id = map.get(&file).copied();
+            asset_id = map.get(&file).copied().or_else(|| by_id(map));
         }
     }
     if asset_id.is_none() {
@@ -1128,7 +1144,7 @@ pub async fn download_asset(
             return StatusCode::NOT_FOUND.into_response();
         }
         let map = release_asset_map(&release);
-        asset_id = map.get(&file).copied();
+        asset_id = map.get(&file).copied().or_else(|| by_id(&map));
         ASSET_MAP_CACHE
             .write()
             .await
@@ -1175,6 +1191,40 @@ pub async fn download_asset(
 
 #[cfg(test)]
 mod tests {
+    /// 清单里的 url 有两种形态，代理必须都认。
+    ///
+    /// 实测 v0.4.9：tauri-action 生成的 latest.json 用的是 `…/releases/assets/<数字 id>`，
+    /// 而 rewrite_manifest_urls 取最后一段 → `/download/<tag>/521088998`。按文件名查表查不到，
+    /// 官网下载按钮和**自动更新**一起 404，两边都只表现为一个空的 404。
+    ///
+    /// 同时守住安全边界：数字 id 必须属于本次 release，否则这个端点就成了任意资产代理。
+    #[test]
+    fn 代理要同时认文件名和本次_release_的资产_id() {
+        const SRC: &str = include_str!("update.rs");
+        let prod = &SRC[..SRC.find("mod tests").expect("tests module")];
+        // 需要的串拼出来找：include_str! 读的是整个文件、包含本测试模块自己。
+        let parse = format!("file.parse::<{}>()", "u64");
+        assert!(prod.contains(&parse), "没有把最后一段当数字 id 解析 —— assets/<id> 形态一律 404");
+        // 归属校验：必须确认这个 id 在本次 release 的资产里
+        assert!(
+            prod.contains("map.values().any(|v| *v == id)"),
+            "缺少归属校验 —— 任意数字都能代理任意资产，是个洞",
+        );
+        // 两条分支（缓存命中 / 回源）都要接上，只接一条会随缓存状态时好时坏。
+        // 钉具体的调用表达式，**不数出现次数**：注释里也写着 by_id，数次数会被注释满足
+        // ——这个坑本轮已经踩过一次。
+        assert!(
+            prod.contains("or_else(|| by_id(map))"),
+            "缓存命中那条分支没接上 by_id",
+        );
+        assert!(
+            prod.contains("or_else(|| by_id(&map))"),
+            "回源那条分支没接上 by_id",
+        );
+        // 文件名那条路不能被挤掉
+        assert!(prod.contains("map.get(&file).copied()"), "按文件名查的老路必须保留");
+    }
+
     use super::{
         safe_release_path_segment, valid_github_repo, valid_workflow_name, validate_manifest,
         validate_publish_manifest, validate_release_tag,
