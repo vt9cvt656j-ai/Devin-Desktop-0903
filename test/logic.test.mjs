@@ -11293,7 +11293,7 @@ test("external source tools stay real but load on demand", () => {
     "lazy loading must derive from the live registry instead of a second static tool table");
 });
 
-test("Agent 开局窗口 18 个：取外部资源那一族、以及硬拒时点名的那两个，必须在里面", () => {
+test("Agent 开局窗口 20 个：取外部资源那一族、硬拒点名的、以及自己造能力的那两个，都要在里面", () => {
   // 用户 2026-08-18 点名："把初始化编排工具从 11 提升到 16，把那些加进来"（那五个取外部
   // 资源的）。后来又按同一条理由加了 run_in_terminal + read_logs：harness 自己有三处**硬拒**
   // 并点名要 run_in_terminal（timeout 包住的 dev server、前台长命令、需要真 TTY 的交互程序），
@@ -11305,9 +11305,14 @@ test("Agent 开局窗口 18 个：取外部资源那一族、以及硬拒时点�
   const core = /agent: \["read_file"[\s\S]*?\],/.exec(SRC);
   assert.ok(core, "agent 核心表被改名或挪走了，这条断言失去落点");
   const names = [...core[0].matchAll(/"([a-z_]+)"/g)].map((m) => m[1]);
-  assert.equal(names.length + 1, 18, `开局窗口是 ${names.length + 1} 个（含 search_tools），不是 18`);
+  assert.equal(names.length + 1, 20, `开局窗口是 ${names.length + 1} 个（含 search_tools），不是 20`);
   for (const t of ["run_in_terminal", "read_logs"]) {
     assert.ok(names.includes(t), `${t} 不在开局窗口——harness 硬拒时点名要它，模型却够不着`);
+  }
+  // save_skill 的时机在收尾、mcp_server 的时机在"注册表里没有我要的能力"——两者都不会为了
+  // 取一次 schema 多花一轮，不在窗口里就等于这两个工具不存在。
+  for (const t of ["save_skill", "mcp_server"]) {
+    assert.ok(names.includes(t), `${t} 不在开局窗口——加了工具却够不着，等于没加`);
   }
   for (const t of ["web_search", "web_fetch", "github_search", "developer_community_search", "package_search"]) {
     assert.ok(names.includes(t), `取资源的 ${t} 不在开局窗口——它就只能等 search_tools，等于不会被用`);
