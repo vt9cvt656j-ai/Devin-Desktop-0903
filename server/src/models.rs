@@ -931,6 +931,26 @@ fn safe_upstream_error_excerpt(low: &str) -> String {
     out.chars().take(220).collect()
 }
 
+/// 上游在说「我现在没有产能，等会儿再来」——不管它把这句话套在哪个状态码里。
+///
+/// 实测原文（deepseek-v4-pro，2026-08-19）：
+///   `400 {"error":{"message":"请稍后重试，暂无可用渠道，或切换模型 (request id: …)",
+///                  "type":"invalid_request_error"}}`
+///
+/// 它自己都在说「请稍后重试」，可外面套着 `invalid_request_error`，于是被判成「请求写错了」：
+/// 网关据此 `break 'routes` 不再换线，客户端的 `_isRetryableAiError` 也不认 400。一个几秒后
+/// 就会好的容量问题，两边同时把它变成了用户面前的死路。
+///
+/// 注意和「没有可用账号」（access_failure，→ 424）的区别：那是**账号/配置**坏了，重试无用；
+/// 这里是**产能**暂时不足，正是重试和换线该处理的情况。
+fn upstream_capacity_wording(low: &str) -> bool {
+    low.contains("暂无可用")
+        || low.contains("no available channel")
+        || low.contains("请稍后重试")
+        || low.contains("请稍后再试")
+        || low.contains("try again later")
+}
+
 fn upstream_failure_status(status: u16, low: &str) -> StatusCode {
     let access_failure = matches!(status, 401 | 403)
         || low.contains("forbidden")
@@ -958,6 +978,10 @@ fn upstream_failure_status(status: u16, low: &str) -> StatusCode {
             // client's own retry loop re-sent them, which is how a single malformed
             // `thinking` block turned into a route-killing storm and a frozen IDE.
             // Pass the real status through so nobody retries it.
+            //
+            // 唯一的例外：上游把**容量**错误包在 400 里发出来（见 upstream_capacity_wording）。
+            // 那是暂时的，照 400 发下去等于告诉客户端「别再试了」——正好和上游的原话相反。
+            400 if upstream_capacity_wording(low) => StatusCode::SERVICE_UNAVAILABLE,
             400 => StatusCode::BAD_REQUEST,
             413 => StatusCode::PAYLOAD_TOO_LARGE,
             422 => StatusCode::UNPROCESSABLE_ENTITY,
@@ -7146,6 +7170,7 @@ pub async fn chat_completions(
                         // real upstream message reach them. (401/403 still fail over — those
                         // are per-route credentials, and another route may well be fine.)
                         if err_status == 400
+                            && !upstream_capacity_wording(&err_low)
                             && (err_low.contains("invalid_request_error")
                                 || err_low.contains("is not supported for this model")
                                 || err_low.contains("extra inputs are not permitted")
@@ -8310,7 +8335,7 @@ mod billing_tests {
     }
     use super::{
         anthropic_beta_header, anthropic_effort_word, anthropic_thinking, anthropic_to_oai,
-        body_text_bytes, wants_1m_context, ANTHROPIC_1M_BETA_TEXT_BYTES,
+        body_text_bytes, upstream_capacity_wording, wants_1m_context, ANTHROPIC_1M_BETA_TEXT_BYTES,
         ANTHROPIC_CONTEXT_WITHOUT_1M_BETA_TOKENS,
         oai_to_anthropic_with_cache, chat_upstream_attempt_suffix,
         chat_upstream_retry_base_delay_ms, claude_generation, clip_thinking_budget, compute_cost,
@@ -8562,6 +8587,35 @@ mod billing_tests {
         assert_eq!(
             chat_upstream_attempt_suffix(3, 3, 502, true),
             "（已请求 3 次 / 3 条同模型线路；最后状态 502）"
+        );
+    }
+
+    /// 上游把**容量**错误包在 400 + invalid_request_error 里发出来时，不许当成永久失败。
+    ///
+    /// 实测原文：`请稍后重试，暂无可用渠道，或切换模型`。它自己都在说稍后重试，而旧判据
+    /// 只看外面那层 `invalid_request_error`，于是网关不换线路、客户端也不重试——一个几秒后
+    /// 就会好的问题变成死路。
+    #[test]
+    fn a_capacity_error_wearing_a_400_is_still_transient() {
+        assert!(upstream_capacity_wording("请稍后重试，暂无可用渠道，或切换模型"));
+        assert!(upstream_capacity_wording("no available channel, try again later"));
+        assert_eq!(
+            upstream_failure_status(400, "请稍后重试，暂无可用渠道，或切换模型"),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "容量型 400 要以可重试的状态下发，否则等于替上游告诉用户「别再试了」",
+        );
+
+        // 真正的请求格式错误不受影响：重发同一份必然同样失败。
+        assert_eq!(
+            upstream_failure_status(400, "\"thinking.type.enabled\" is not supported for this model."),
+            StatusCode::BAD_REQUEST,
+        );
+        assert!(!upstream_capacity_wording("extra inputs are not permitted"));
+
+        // 和「没有可用**账号**」划清界限：那是配置/账务问题（→424），重试无用。
+        assert_eq!(
+            upstream_failure_status(500, "no available provider account"),
+            StatusCode::FAILED_DEPENDENCY,
         );
     }
 

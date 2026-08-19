@@ -42,7 +42,14 @@ services:
       retries: 5
     logging: *default-logging
 
-  backend:
+  # 蓝绿部署：两种颜色共用这份定义，只有发布端口不同。
+  #
+  # 绿色挂在 profile 后面，平时**不启动**——`docker compose up -d` 不带 --profile 时
+  # 它根本不存在，所以这份改动对现有部署方式是完全惰性的。deploy.sh 在切换时才把它拉起来。
+  #
+  # 共用 image 标签：两个服务的 `build:` 上下文相同，指同一个标签能让镜像只构建一次，
+  # 也保证切换前后跑的是**同一个**镜像，而不是两次构建出的两个。
+  backend: &backend
     build: .
     restart: unless-stopped
     # The server does not currently expose a graceful shutdown hook. Keep
@@ -58,6 +65,17 @@ services:
       - no-new-privileges:true
     cap_drop:
       - ALL
+    # 文件描述符上限。不写的话继承 Docker 默认的**软**上限 1024（实测容器内
+    # /proc/1/limits 就是 1024），而这是一个网关：每个在途请求同时占着一条下行连接和
+    # 一条到上游的连接，再加数据库连接池、Redis、日志。1024 在当前量级（峰值 45 次/分钟）
+    # 远远够用，但它是这台机器上**第一个**会在真实高并发下撞到的天花板，而撞上时的表现
+    # 是 accept 失败、请求被拒，不是优雅降级。
+    #
+    # 硬上限保持 1048576（Docker 默认），只把软上限抬到和 nginx 同一量级。
+    ulimits:
+      nofile:
+        soft: 65535
+        hard: 1048576
     # 走变量而不是让测试环境用覆盖文件改：Compose 合并 `env_file` 这类**列表**字段
     # 同样是**拼接**，覆盖里写 `.env.test` 的结果是它同时去读 `.env` 和 `.env.test`，
     # 而测试目录里没有 `.env` → "env file not found" 直接失败。（和 ports 一个坑。）
@@ -82,6 +100,14 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/health', timeout=3)"]
+      interval: 30s
+      timeout: 5s
+      start_period: 20s
+      retries: 3
+    logging: *default-logging
+    image: ${BACKEND_IMAGE:-server-backend:latest}
     ports:
       # Loopback-only: nginx (on the host) proxies to 127.0.0.1:8080. Publishing on
       # 0.0.0.0 exposed the backend to the public internet, bypassing the 8443 TLS
@@ -92,13 +118,13 @@ services:
       # `- "127.0.0.1:8081:8080"` 的话，最终配置会同时发布 8080 和 8081 ——
       # 直接和生产抢 8080，两套环境一起崩。用变量就完全绕开合并语义。
       - "127.0.0.1:${BACKEND_PORT:-8080}:8080"
-    healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/health', timeout=3)"]
-      interval: 30s
-      timeout: 5s
-      start_period: 20s
-      retries: 3
-    logging: *default-logging
+
+  # 绿色。除了端口和 profile，一切继承蓝色。
+  backend-green:
+    <<: *backend
+    profiles: ["green"]
+    ports:
+      - "127.0.0.1:${BACKEND_GREEN_PORT:-8090}:8080"
 
 volumes:
   pgdata:

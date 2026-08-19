@@ -194,7 +194,19 @@ echo "validating, updating and health-checking containers (serialized)"
 # 不参与插值。生产靠目录里那个 `.env` 被 Compose 自动加载，测试目录里没有 `.env`，
 # 必须显式指过去，否则所有 ${VAR} 都会插成空串（表现是一堆 "variable is not set"）。
 DC="docker compose -p $COMPOSE_PROJECT --env-file $ENV_FILE $COMPOSE_FILES"
-REMOTE_DEPLOY_CMD="cd $REMOTE_Q && $DC config --quiet && $DC up -d --build && for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30; do if curl -fsS http://127.0.0.1:${HEALTH_PORT}/health >/dev/null; then $DC ps; exit 0; fi; sleep 2; done; $DC logs --tail=100 backend; exit 1"
+if [ "$TARGET" = "prod" ]; then
+  # 生产走蓝绿：先起新颜色、验康健、再切 nginx 的 upstream、最后停旧的。
+  # 完整理由和失败时的行为写在 rollout.sh 顶部。
+  #
+  # 换掉的是原来的 `up -d --build` —— 它**先毁后建**：在确认新镜像跑得起来之前就把正在
+  # 服务的容器销毁了。线上两周 1,499 次 `connect() failed (111)` / `upstream prematurely
+  # closed`，**每一次都落在部署时刻**，日常运行零次。而且新版起不来时没有回滚可言。
+  REMOTE_DEPLOY_CMD="cd $REMOTE_Q && COMPOSE_PROJECT='$COMPOSE_PROJECT' ENV_FILE='$ENV_FILE' COMPOSE_FILES='$COMPOSE_FILES' bash ./rollout.sh"
+else
+  # 测试环境保持就地替换：它前面没有 nginx（不对公网开放，靠 SSH 端口转发访问），
+  # 没有可切换的 upstream，蓝绿在这里既无处可切也无人受益。
+  REMOTE_DEPLOY_CMD="cd $REMOTE_Q && $DC config --quiet && $DC up -d --build && for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30; do if curl -fsS http://127.0.0.1:${HEALTH_PORT}/health >/dev/null; then $DC ps; exit 0; fi; sleep 2; done; $DC logs --tail=100 backend; exit 1"
+fi
 REMOTE_DEPLOY_CMD_Q="$(printf '%q' "$REMOTE_DEPLOY_CMD")"
 ssh_run "flock -w $DEPLOY_LOCK_TIMEOUT_SECS $REMOTE_LOCK_Q bash -c $REMOTE_DEPLOY_CMD_Q"
 if [ "$TARGET" = "prod" ]; then
