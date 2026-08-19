@@ -11286,15 +11286,22 @@ test("external source tools stay real but load on demand", () => {
     "lazy loading must derive from the live registry instead of a second static tool table");
 });
 
-test("Agent 开局窗口 16 个：取外部资源那一族必须在里面", () => {
-  // 用户 2026-08-18 点名："把初始化编排工具从 11 提升到 16，把那些加进来"。
+test("Agent 开局窗口 18 个：取外部资源那一族、以及硬拒时点名的那两个，必须在里面", () => {
+  // 用户 2026-08-18 点名："把初始化编排工具从 11 提升到 16，把那些加进来"（那五个取外部
+  // 资源的）。后来又按同一条理由加了 run_in_terminal + read_logs：harness 自己有三处**硬拒**
+  // 并点名要 run_in_terminal（timeout 包住的 dev server、前台长命令、需要真 TTY 的交互程序），
+  // 而它当轮不在窗口里——模型唯一的执行手刚被打回、又被指去用一个它没有的工具，最省事的
+  // 出口就是把命令甩回给用户，正是用户抱怨的「IDE 不支持」。read_logs 配套确认服务起没起来。
   // 为什么是结构性的：窗口里的工具零成本可调，不在窗口里的要先花一轮 search_tools 取
   // schema。两条路结果差不多时模型走便宜的那条——于是"能查 GitHub / 开发者社区"在真正
   // 需要它的难任务上永远轮不到。装进窗口 ≠ 每轮都用，判断权仍在模型和编排器。
   const core = /agent: \["read_file"[\s\S]*?\],/.exec(SRC);
   assert.ok(core, "agent 核心表被改名或挪走了，这条断言失去落点");
   const names = [...core[0].matchAll(/"([a-z_]+)"/g)].map((m) => m[1]);
-  assert.equal(names.length + 1, 16, `开局窗口是 ${names.length + 1} 个（含 search_tools），不是 16`);
+  assert.equal(names.length + 1, 18, `开局窗口是 ${names.length + 1} 个（含 search_tools），不是 18`);
+  for (const t of ["run_in_terminal", "read_logs"]) {
+    assert.ok(names.includes(t), `${t} 不在开局窗口——harness 硬拒时点名要它，模型却够不着`);
+  }
   for (const t of ["web_search", "web_fetch", "github_search", "developer_community_search", "package_search"]) {
     assert.ok(names.includes(t), `取资源的 ${t} 不在开局窗口——它就只能等 search_tools，等于不会被用`);
   }
@@ -11347,7 +11354,7 @@ test("Agent initial tools keep the role nucleus independent of intent profile", 
   });
   assert.deepEqual(greeting, [
     "read_file", "list_dir", "search", "find_files", "update_plan", "ask_user",
-    "edit_file", "multi_edit", "write_file", "run_cmd", "search_tools",
+    "edit_file", "multi_edit", "write_file", "run_cmd", "read_logs", "run_in_terminal", "search_tools",
   ], "profile must not remove registered Agent capabilities from the initial schema");
 
   const assessment = namesFor({
@@ -28121,4 +28128,20 @@ test("编排器返回 null 时退到本地匹配，不空手而归", () => {
   assert.match(loop, /_fallbackPicks[\s\S]{0,240}!hit\.alreadyLoaded/, "已经装上的工具不必再装一次");
   assert.match(loop, /if \(!_fallbackPicks\.length\) return null;/,
     "本地也匹配不到就仍然空手——不硬塞不相干的工具");
+});
+
+// ---- harness 硬拒时点名的工具，必须当轮就在模型手里 ----
+test("被硬拒时点名要用的工具，不能是模型手上没有的", () => {
+  const core = /agent: \["read_file"[\s\S]*?\],\n  \};/.exec(SRC);
+  assert.ok(core, "agent 核心工具表改名或挪走了，这条断言失去落点");
+  // run_cmd 有三处**不执行**并改指 run_in_terminal：timeout 包住的 dev server、前台长命令、
+  // 需要真 TTY 的交互程序。被拒那一轮它若不在窗口里，模型唯一的执行手刚被打回、又被指去用
+  // 一个它没有的工具，最省事的出口就是把命令甩回给用户。
+  assert.match(SRC, /\[工具选择\][^"]*run_in_terminal/, "timeout 包 dev server 的改指文案没了");
+  assert.match(SRC, /\[not executed\][\s\S]{0,240}run_in_terminal/, "前台长命令的改指文案没了");
+  assert.match(SRC, /function _needsRealTtyHint/, "真 TTY 提示没了");
+  assert.match(core[0], /"run_in_terminal"/,
+    "三处硬拒都叫模型改用 run_in_terminal，它却不在开局工具窗口——这正是「把命令甩给用户」的成因");
+  assert.match(core[0], /"read_logs"/,
+    "起完服务看不到日志就没法确认起没起来，而提示词要求启动后用 read_logs/read_terminal 确认");
 });

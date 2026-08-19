@@ -32,7 +32,7 @@ function topLevelFn(name) {
 // （用户点名——不进窗口就意味着"要多花一轮取 schema"，模型在难任务上永远不会选它们）。
 // 这个文件守的是"MCP 不许挤爆窗口"，那个保证与扩窗无关，仍然成立。
 const CORE = ["read_file", "list_dir", "search", "find_files", "update_plan", "ask_user",
-              "write_file", "edit_file", "multi_edit", "run_cmd",
+              "write_file", "edit_file", "multi_edit", "run_cmd", "run_in_terminal", "read_logs",
               "web_search", "web_fetch", "github_search", "developer_community_search", "package_search"];
 
 function selector() {
