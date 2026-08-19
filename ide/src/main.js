@@ -17121,7 +17121,6 @@ function _disposeChatSession(session) {
     session._pendingSends = [];
     session._steerQueue = null;
     session._runIsLoop = null;
-    session._followupDraining = false;
     session._planActive = false;
     session._planSteps = [];
     session._htmlSnapshot = "";
@@ -25702,6 +25701,9 @@ async function sendPrompt(text, attachments = [], readyConfig = null, opts = {})
   config.requestId = _billingScopeId;
   config.ideRunId = _turnRunId;
   sess._reqId = _billingScopeId;
+  // 挂在会话上是给**别的代码路径**取当前这一轮时间线用的（本函数体内一律用局部
+  // _turnTimeline）。目前没有任何读者——留着它本身没有害处，但守卫会把它算成只写不读，
+  // 所以在下面那张基线表里登记，而不是留一个看不见的空写。
   sess._turnTimeline = _turnTimeline;
   const _turnEngineeringEarly = _semanticEngineeringEvidence(text);
   // 本轮最终画像由语义工程决策覆盖；本地只保留精确 URL 等非意图事实。

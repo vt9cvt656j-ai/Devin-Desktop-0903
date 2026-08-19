@@ -312,6 +312,30 @@ test("no NEW write-only run field is introduced", () => {
     `new write-only run state — wire it up, or delete it: ${fresh.join(", ")}`);
 });
 
+// 同一道守卫，另一半作用域。原来只查 `run._*`——而会话级状态（session._* / sess._*，同一个
+// 对象两个别名）一样会出现"写了没人读"：写的时候以为接上了，读的那一侧从来没写出来，
+// 于是那个状态永远不影响任何决定。实测抓到两个（_followupDraining 只有一次赋值、
+// 一个读者都没有；_turnTimeline 挂在会话上但没人取）。
+//
+// **必须把 sess 别名一起算上**：这个文件里同一个会话对象既叫 session 也叫 sess，只数
+// session. 会把 sess. 那侧的读全漏掉，于是一堆活字段被误判成死的（第一版就是这么误报了 6 个）。
+const KNOWN_SESSION_WRITE_ONLY = new Set([
+  // 给别的代码路径取当前轮时间线用的挂载点，目前没有读者；留着无害，但要在明面上登记。
+  "turnTimeline",
+]);
+test("会话级状态也不许只写不读", () => {
+  const written = new Set([...SRC.matchAll(/(?:session|sess)\._([A-Za-z0-9_]+)\s*=(?!=)/g)].map((m) => m[1]));
+  assert.ok(written.size > 20, `只扫出 ${written.size} 个会话字段——取法坏了，这条等于没跑`);
+  const fresh = [];
+  for (const field of written) {
+    const all = (SRC.match(new RegExp(`(?:session|sess)\\??\\._${field}\\b`, "g")) || []).length;
+    const writes = (SRC.match(new RegExp(`(?:session|sess)\\._${field}\\s*=(?!=)`, "g")) || []).length;
+    if (all - writes === 0 && !KNOWN_SESSION_WRITE_ONLY.has(field)) fresh.push(`session._${field}`);
+  }
+  assert.deepEqual(fresh, [],
+    `新的只写不读会话状态——接上读者，或者删掉它：${fresh.join(", ")}`);
+});
+
 test("the diagnostics gate field carries content, not only clears", () => {
   // The exact regression: three `= ""` assignments and no fourth, so the gate was vacuous.
   const clears = count(SRC, /run\._diagnosticBlock\s*=\s*""/g);
@@ -1661,6 +1685,17 @@ const KNOWN_UNCALLED = new Set([
   // 正是"不要在回答下面写 harness 内容"那条规矩。删的只是**显示**：同一条交付事实照样
   // 喂给模型（_deliveryFactsLine 另有调用点），撤销能力也还在（checkpoint 没动），
   // 只是不再默认挂一条 UI。渲染器留着，将来若另开入口可以直接复用。
+  // ── 剥注释统计之后新暴露的 9 个（2026-08-19）──────────────────────────────
+  // 它们一直是死的，只是**注释里提了一次名字**、把出现次数顶到 2，于是这道守卫看不见。
+  // 全部核过，都属于"已知且有意"，不是新写的漏接：
+  //   · _evidenceGradingHint / _structureReadinessHint 一族、_runApprovedVerification、
+  //     _detectVerifyCmd、空根拦截三件（_emptyRootSkipMessage / _refreshEmptyRootBeforeSkip /
+  //     _emptyExploreSkipMessage）——早先审计已判定为刻意保留的纯函数/备用件；
+  //   · _ctxNativeCeiling、recommendToolsForIntent、renderLspTool——同上，留着备用的渲染/推荐件。
+  // 新加的函数仍然一个都不许进这张表：它守的是"只减不增"。
+  "_ctxNativeCeiling", "_detectVerifyCmd", "_emptyExploreSkipMessage", "_emptyRootSkipMessage",
+  "_evidenceGradingHint", "_refreshEmptyRootBeforeSkip", "_runApprovedVerification",
+  "recommendToolsForIntent", "renderLspTool",
   "_appendDeliveryFactsBar", "_appendRunRevertBar",
   "_activeAiProviderMode", "_adaptiveEnabled", "_addDroppedRef",
   "_agentAllowsDependencyRestore", "_agentAllowsExternalKind", "_agentAllowsRuntimeKind",
@@ -1687,6 +1722,57 @@ const KNOWN_UNCALLED = new Set([
   "saveKeybinding", "showAiDiffPreview", "updateMinimapSearchHighlights",
 ]);
 
+function stripJsComments(source) {
+  // 必须**按上下文扫描**，不能用正则。
+  //
+  // 上一版是两条正则：先去行注释、再去块注释。它认不出**正则字面量**里的 `/`，于是
+  // `!/Chrome|Chromium|Edg\//.test(ua)` 这样的真代码里那个 `\//` 被当成行注释开头，
+  // 从那儿一路吃到行尾。实测在 main.js 上吃掉 21.7%（821KB）真代码。
+  //
+  // 后果是双向的，而且反向更危险：assert.match 会静默变红（还能发现），
+  // 而 assert.doesNotMatch 在被吃掉的那片区域里**静默变绿** —— 一条本该守着的禁令
+  // 等于没写。本仓库 70 处 doesNotMatch(stripJsComments(SRC), ...) 都建立在这上面。
+  //
+  // 现在逐字符扫，认得字符串 / 模板串 / 正则字面量三种上下文。`/` 前面若是标识符、数字、
+  // `)` 或 `]`，那是除号；否则是正则开头 —— 这是 JS 词法里区分这两者的标准启发式。
+  const s = String(source);
+  let out = "", i = 0, prev = "";
+  const regexCanStart = (p) => !/[A-Za-z0-9_$)\]]/.test(p);
+  while (i < s.length) {
+    const c = s[i], d = s[i + 1];
+    if (c === "/" && d === "/") { while (i < s.length && s[i] !== "\n") i++; continue; }
+    if (c === "/" && d === "*") { const e = s.indexOf("*/", i + 2); i = e < 0 ? s.length : e + 2; continue; }
+    if (c === '"' || c === "'" || c === "`") {
+      const q = c; out += c; i++;
+      while (i < s.length) {
+        const ch = s[i]; out += ch;
+        if (ch === "\\") { i++; if (i < s.length) out += s[i]; i++; continue; }
+        i++;
+        if (ch === q) break;
+      }
+      prev = q; continue;
+    }
+    if (c === "/" && regexCanStart(prev)) {
+      out += c; i++;
+      let inClass = false;
+      while (i < s.length) {
+        const ch = s[i]; out += ch;
+        if (ch === "\\") { i++; if (i < s.length) out += s[i]; i++; continue; }
+        i++;
+        if (ch === "[") inClass = true;
+        else if (ch === "]") inClass = false;
+        else if (ch === "/" && !inClass) break;
+        else if (ch === "\n") break;
+      }
+      prev = "/"; continue;
+    }
+    out += c;
+    if (!/\s/.test(c)) prev = c;
+    i++;
+  }
+  return out;
+}
+
 test("新写的能力必须有人调用——死函数只减不增", () => {
   const names = [...new Set(
     [...SRC.matchAll(/^(?:async\s+)?function\s+(_?[A-Za-z0-9_]+)\s*\(/gm)].map((m) => m[1]),
@@ -1700,7 +1786,10 @@ test("新写的能力必须有人调用——死函数只减不增", () => {
     if (e.isDirectory()) return walk(full);
     return /\.(?:js|jsx|html)$/.test(e.name) ? [full] : [];
   });
-  const blob = walk(join(HERE, "../src")).map((f) => readFileSync(f, "utf8")).join("\n");
+  // **剥掉注释再数**：这是这道守卫最大的一个盲区。注释里提一次函数名，出现次数就变成 2，
+  // 于是一个零调用点的函数看起来"有人用"。实测这样被遮住 9 个——而且恰恰是那种"注释长篇
+  // 解释它在干什么、代码里一次都没跑"的，正是这条守卫最该抓的形状。
+  const blob = walk(join(HERE, "../src")).map((f) => stripJsComments(readFileSync(f, "utf8"))).join("\n");
   const seen = new Map();
   for (const m of blob.matchAll(/[A-Za-z_$][A-Za-z0-9_$]*/g)) {
     seen.set(m[0], (seen.get(m[0]) || 0) + 1);
