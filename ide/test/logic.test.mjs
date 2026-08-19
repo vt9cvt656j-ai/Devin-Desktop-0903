@@ -28558,3 +28558,64 @@ test("写入没落盘要说出来，而纯问答/只改文档的 run 照旧不�
   assert.match(mixed, /改了 1 个源码文件/);
   assert.match(mixed, /没有落盘/, "有源码改动时就把落空的写入吞掉了");
 });
+
+// ---- 落盘还在飞的时候，别把展示它的标签页关掉 ----
+test("轮末回滚不许碰已经走过「流完即写」的条目", () => {
+  const turn = extractFn("_agentModelTurn");
+  const at = turn.indexOf("const _executablePreviewEntries");
+  assert.ok(at > 0, "轮末回滚那段挪走了，这条断言失去落点");
+  const block = turn.slice(at, at + 1600);
+  assert.match(block, /if \(e && e\._eagerDone\) continue;/,
+    "eager 条目又被轮末回滚碰了——它的落盘还在飞，回滚会把展示它的标签页 closeFile(force, discardBuffer) 关掉");
+  // 跳过必须发生在那次 _removeWritePreview 之前，否则等于没跳。
+  const skipAt = block.indexOf("if (e && e._eagerDone) continue;");
+  const removeAt = block.indexOf("_removeWritePreview(e,");
+  assert.ok(skipAt >= 0 && removeAt > skipAt, "跳过写在回滚之后了，顺序反了等于没写");
+  // 交接不置 committed，所以这次回滚**真的**会生效——这正是必须跳过的原因，一并钉住。
+  const handoff = extractFn("_handoffLiveEditorWritePreview");
+  assert.doesNotMatch(handoff, /committed\s*=\s*true/,
+    "交接改成置 committed 了？那上面那条跳过的理由要重写（回滚本来就会被 committed 挡住）");
+  assert.match(extractFn("_rollbackLiveEditorWritePreview"), /if \(preview\.createdTab && openFiles\.get\(preview\.path\) === preview\.file\)/,
+    "回滚不再关 IDE 自建的标签页了？那这条竞态的后果变了，重新评估");
+});
+
+test("开箱默认模型由网关指定，不再是字母序碰出来的那个", () => {
+  // 原来直接取列表第一个，而那个顺序是网关按线路 enabled_models 的字母序排的 ——
+  // 于是每个新用户都落在 claude-fable-5 上，而它是在售模型里硬失败率最高的一档
+  // （2026-08-19 实测 40 小时 18.8%；claude-opus-5 是 3.6%、glm-5.3 是 0%）。
+  const groups = [
+    { label: "Claude", models: [
+      { id: "claude-fable-5", isDefault: false },
+      { id: "claude-opus-5", isDefault: true },
+    ] },
+    { label: "GPT", models: [{ id: "gpt-5.6-sol", isDefault: false }] },
+  ];
+  const pick = load("_firstGatewayModelId", { MODEL_GROUPS: groups });
+  assert.deepEqual(pick(), { id: "claude-opus-5", group: "Claude" },
+    "网关标了默认就该用它，而不是列表里排在前面的那个");
+
+  // 老网关不下发这个字段 → 一个都没标 → 沿用旧行为，行为不变。
+  const legacy = [{ label: "Claude", models: [{ id: "claude-fable-5" }, { id: "claude-opus-5" }] }];
+  assert.deepEqual(load("_firstGatewayModelId", { MODEL_GROUPS: legacy })(),
+    { id: "claude-fable-5", group: "Claude" }, "网关没标时必须退回旧行为");
+
+  assert.deepEqual(load("_firstGatewayModelId", { MODEL_GROUPS: [] })(), { id: "", group: "" });
+
+  // 目录组装处要真的把这一位读进来，否则上面的偏好永远是死的。
+  assert.match(SRC, /isDefault: it\.default === true/,
+    "网关下发的 default 字段没被读进客户端目录");
+});
+
+// ---- 写入落空要有用户侧的出口 ----
+test("尝试写了没落盘时，结局里必须留下 writes_failed", () => {
+  const loop = extractFn("_runAgenticLoop");
+  assert.match(loop, /run\._incompleteReason \|\|= `writes_failed:\$\{_failedWrites\.length\}`/,
+    "写入落空在结局里没有任何出口——用户看到的收尾卡片一个字都不会提这件事");
+  assert.match(loop, /\(Array\.isArray\(run\._eagerLanded\) \? run\._eagerLanded : \[\]\)\.filter\(\(a\) => a && a\.ok === false\)/,
+    "判据要读执行记录（每次写入尝试的成败），不是从措辞里猜");
+  // 闭合枚举必须认得它，否则界面回落到那句无意义的「继续没做完的部分」。
+  const labels = loadConst("_INCOMPLETE_LABELS");
+  assert.equal(labels.writes_failed, "重写那几个没写成的文件");
+  // 标签按冒号前的基名查表，`writes_failed:2` 要能查到。
+  assert.equal(labels["writes_failed:2".split(":")[0]], "重写那几个没写成的文件");
+});

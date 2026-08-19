@@ -13553,6 +13553,8 @@ async function loadBackendModels() {
         // 压成布尔的话，离线或网关旧版时按钮会集体消失，而那是"不知道"，不是"没有"。
         powerRouteAvailable:
           typeof it.power_route_available === "boolean" ? it.power_route_available : null,
+        // 运维在网关里指定的开箱默认模型。老网关不下发这个字段 → 全 false → 沿用旧行为。
+        isDefault: it.default === true,
         desc: it.description || "", group: label,
       });
     }
@@ -13571,7 +13573,23 @@ async function loadBackendModels() {
   }
 }
 
+/**
+ * 新装（或从没选过模型）时开箱用哪个。
+ *
+ * 原来直接取列表第一个 —— 而那个顺序是网关按线路的 enabled_models 字母序排出来的，
+ * 于是每一个新用户都落在 `claude-fable-5` 上，而它是在售模型里硬失败率最高的一档
+ * （2026-08-19 实测 40 小时 18.8%；对照 claude-opus-5 3.6%、glm-5.3 0%）。
+ * 「模型老是用不了」对新用户来说是开箱即得的，而原因只是字母序。
+ *
+ * 现在优先认网关标的那一个（app_settings.default_model，运维可改、不用发版）；
+ * 网关没标就退回旧行为，行为不变。
+ */
 function _firstGatewayModelId() {
+  for (const group of MODEL_GROUPS) {
+    for (const model of group.models || []) {
+      if (model?.id && model.isDefault === true) return { id: model.id, group: group.label || "" };
+    }
+  }
   for (const group of MODEL_GROUPS) {
     for (const model of group.models || []) {
       if (model?.id) return { id: model.id, group: group.label || "" };
@@ -24745,6 +24763,8 @@ const _INCOMPLETE_LABELS = {
   plan_steps_pending: "继续没做完的步骤",
   subagent_results_pending: "收拢子任务结果",
   ui_verification_missing: "在界面上验一遍",
+  // 「说保存好了，而文件不在」的用户侧出口。写的是动作，不是内部枚举名。
+  writes_failed: "重写那几个没写成的文件",
   iteration_limit: "接着上次的进度继续",
   // 空转断路器拦下的：它连着十几轮既没产出也没拿到新证据。让用户看到的是"卡住了"，
   // 而不是内部枚举名，并且给一句真能照做的下一步——换个说法往往就走出去了。
@@ -43076,6 +43096,20 @@ async function _agentModelTurn({ config, messages, toolSchemas, toolRegistry = n
 
   const _executablePreviewEntries = new Set(toolCalls.map((call) => call._streamEntry).filter(Boolean));
   for (const [, e] of byIndex) {
+    // 走过「流完即写」的条目在这里**一概不碰**：它的预览在 eager 启动的那一刻就已经交接过
+    // （_removeWritePreview(entry, "execute")），而真正的落盘是 fire-and-forget、此刻很可能
+    // 还在飞——等它的 _settleEagerWritesForBreak 要到本函数返回之后才被调用。
+    //
+    // 不跳过的话这里会按**本轮的错误状态**再判一次：eager 条目通常已不在 toolCalls 里
+    // （它已经执行过了，不进批处理），于是 _executablePreviewEntries 里没有它 → 走 rollback；
+    // 这一轮但凡以错误收场（err 为真），更是所有条目一律 rollback。而交接**不置 committed**，
+    // 所以那次 rollback 照样生效：_rollbackLiveEditorWritePreview 会把 IDE 自己开的那个标签页
+    // closeFile(force, discardBuffer) 关掉。文件几百毫秒后成功写进磁盘，展示它的标签页已经没了
+    // ——用户报的「内容建完就没了」「有时候在有时候不在」正是这个竞态。
+    //
+    // 失败路径不会因此失守：eager 那条链自己会建工具卡、落结果，失败也由它如实呈现，
+    // 另外还有交接时装的 120 秒兜底回滚定时器。
+    if (e && e._eagerDone) continue;
     _removeWritePreview(e, !err && _live() && _executablePreviewEntries.has(e) ? "execute" : "rollback");
   }
   if (timeline && _timelineTurn) {
@@ -50194,6 +50228,14 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
     }
     if (run.engineering?.ui && didMutate && !uiVerificationPassed) {
       run._incompleteReason ||= "ui_verification_missing";
+    }
+    // 尝试写了、没落盘：这是**用户侧**唯一的出口。模型那边已经在交付事实里收到这条
+    // （见 _deliveryFactsLine 里的落空写入），但用户看的是结局卡片——而这一整条链路上
+    // 原来没有任何一处告诉他「你以为生成好的那个文件此刻不在磁盘上」。判据是纯执行记录
+    // （run._eagerLanded 逐条记着每次写入尝试的成败），不读模型的任何措辞。
+    {
+      const _failedWrites = (Array.isArray(run._eagerLanded) ? run._eagerLanded : []).filter((a) => a && a.ok === false);
+      if (_failedWrites.length) run._incompleteReason ||= `writes_failed:${_failedWrites.length}`;
     }
     _setStreaming(session, false);
     _hideControlGlow(); // 灭掉红光：自动化结束（正常/报错/到顶/用户停止 都走这里）
