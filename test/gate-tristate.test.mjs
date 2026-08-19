@@ -33,8 +33,6 @@ const REVIEWED = new Map([
     { direction: "ceremony", why: "缺席 → 不算复杂只读任务 → 少一道计划仪式，不影响能力" }],
   ["return !!run.engineering?.requiresPlan;",
     { direction: "ceremony", why: "缺席 → 不强制先出计划 → 少一道仪式，倒向放行" }],
-  ['return run.engineering?.applies ? "mutate" : "answer";',
-    { direction: "ceremony", why: "缺席 → 按「答疑」判，收尾不强求交付物证据；宽松方向，不夺能力" }],
   ["const _quick = () => task.trim().length < 80 && !run.engineering?.applies && !_mustUseWorkspaceToolsNow();",
     { direction: "ceremony", why: "缺席 + 短消息 → 走轻量路径，不注入验收契约；只影响仪式" }],
   ["if (!run.engineering?.designKnowledgeRequired || !preflight.required) return false;",

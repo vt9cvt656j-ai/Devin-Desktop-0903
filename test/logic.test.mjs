@@ -9025,101 +9025,40 @@ test("semantic profile merging derives engineering gates from structured fields"
   assert.doesNotMatch(SRC, /function _externalObligationsForTask\(/);
 });
 
-test("mutation effect routing consumes only the structured semantic contract", () => {
-  const required = load("_runRequiredEffect");
-  const target = load("_effectTargetForTask");
-  const runTarget = load("_runEffectTarget", { _effectTargetForTask: target });
-  const contract = load("_requiredEffectContract", {
-    _runRequiredEffect: required,
-    _RUNTIME_OBLIGATION_ORDER: RUNTIME_OBLIGATION_ORDER,
-    _EXTERNAL_OBLIGATION_ORDER: EXTERNAL_OBLIGATION_ORDER,
-    _runEffectTarget: runTarget,
-  });
+// ---- 阶段 2c：效果契约整条拆除（AGENT_LOOP_REBUILD.md）----
+//
+// `_requiredEffectContract` 算的是「分类器认为这个任务应该产生哪些效果」。2a/2b 把它从收尾
+// 记账里摘掉之后只剩一个活消费点：用户插话后重算一次契约，一旦多出 external 类效果，就把这
+// 一轮改写成需要计划的重活 —— 拿预测驱动控制流，正是这次重构要拆的那一层。何况插话紧接着
+// 就用新裁决重跑了 _mergeAiIntentProfile，要不要计划模型自己已经声明过。
+test("效果契约与它的上游全部删除，插话不再按预测改写任务", () => {
+  for (const fn of ["_requiredEffectContract", "_runRequiredEffect", "_runEffectTarget",
+                    "_effectTargetForTask", "_planEffectForRun"]) {
+    // 钉实现特征（函数声明），不钉名字：注释里还会提到它们，钉名字会被自己的说明文字喂到。
+    assert.doesNotMatch(SRC, new RegExp(`function ${fn}\\(`), `${fn} 又长回来了（阶段 2c 删的）`);
+  }
+  assert.doesNotMatch(SRC, /addedEffects/, "插话又开始按效果差分改写任务了");
+  assert.doesNotMatch(SRC, /run\.engineering\.requiresPlan = true;\n\s*run\.engineering\.substantial = true;/,
+    "harness 又拿猜出来的效果差分盖掉模型自己声明的 requiresPlan");
+  assert.doesNotMatch(SRC, /run\._cancelledEffectKinds\s*=/,
+    "契约是 _cancelledEffectKinds 唯一的读者，删了契约还留着它就是纯写状态");
 
-  assert.equal(required({ mode: "agent", engineering: { applies: true } }), "mutate");
-  assert.equal(required({ mode: "agent", engineering: { explicitMutation: true } }), "mutate");
-  assert.equal(required({ mode: "agent", engineering: { implementation: true, explicitMutation: false, applies: true } }), "inspect");
-  assert.equal(target("push deploy words are ignored", { workspaceAction: "modify" }), "workspace");
-  assert.equal(target("edit words are ignored", { runtimeObligations: ["build"] }), "runtime");
-  assert.equal(target("build words are ignored", { externalObligations: ["push"] }), "external");
-  assert.equal(target("修复并部署", {}), "none");
+  // 有独立消费点的那部分必须留下：义务清单仍然喂提示词，写入义务判定仍然读插话标记。
+  assert.match(SRC, /\.\.\.\(run\?\._addedRuntimeObligations \|\| \[\]\)/, "运行义务清单不再喂提示词");
+  assert.match(SRC, /\.\.\.\(run\?\._addedExternalObligations \|\| \[\]\)/, "外部义务清单不再喂提示词");
+  assert.match(SRC, /run\?\._steeredWorkspaceRequired \|\| profile\?\.explicitWorkspaceMutation/,
+    "插话声明的写入义务没人读了");
 
-  // `_requiredEffectContract` survives — it feeds the steer effect-diff and plan-quality — so
-  // its structured-only derivation is still under test. What it FED (`_missingRequiredEffects`,
-  // which labelled a run incomplete against this predicted contract) is deleted in stage 2b, so
-  // the reconciliation + `required_effect_missing:` label assertions moved out with it.
-  const run = {
-    mode: "agent",
-    engineering: {
-      explicitMutation: true,
-      explicitWorkspaceMutation: true,
-      workspaceAction: "modify",
-      runtimeObligations: ["build", "test"],
-      externalObligations: ["push"],
-    },
-  };
-  assert.deepEqual(contract(run), { workspace: true, runtime: ["build", "test"], external: ["push"] });
-
+  // 2a/2b 的反漂移守卫原样保留：关键词推导义务、预测型未完成标签，都不许长回来。
   assert.doesNotMatch(SRC, /function _runtimeObligationsForTask\(/);
   assert.doesNotMatch(SRC, /function _externalObligationsForTask\(/);
   assert.doesNotMatch(SRC, /function _negatedEffectKindsForTask\(/);
+  assert.doesNotMatch(SRC, /function _missingRequiredEffects\(/);
   assert.doesNotMatch(SRC, /run\._incompleteReason = "pending_plan"/);
-  // The prediction-derived incomplete label is gone: nothing SETS it, and the function that
-  // computed it is deleted. (Comments may still name it in prose; the guard is on the setter.)
   assert.doesNotMatch(SRC, /run\._incompleteReason\s*(?:=|\|\|=)\s*`required_effect_missing/);
   assert.doesNotMatch(SRC, /run\._incompleteReason\s*(?:=|\|\|=)\s*`research_evidence_missing/);
-  assert.doesNotMatch(SRC, /function _missingRequiredEffects\(/);
 });
 
-test("compound obligations and later cancellations reconcile by exact structured effect type", () => {
-  const required = load("_runRequiredEffect");
-  const target = load("_effectTargetForTask");
-  const runTarget = load("_runEffectTarget", { _effectTargetForTask: target });
-  const contract = load("_requiredEffectContract", {
-    _runRequiredEffect: required,
-    _RUNTIME_OBLIGATION_ORDER: RUNTIME_OBLIGATION_ORDER,
-    _EXTERNAL_OBLIGATION_ORDER: EXTERNAL_OBLIGATION_ORDER,
-    _runEffectTarget: runTarget,
-  });
-  const makeRun = (engineering, cancelled = []) => ({
-    mode: "agent",
-    engineering: { explicitMutation: true, ...engineering },
-    _cancelledEffectKinds: new Set(cancelled),
-  });
-
-  // Still testing `_requiredEffectContract`'s structured derivation and its exact-type
-  // cancellation — the surviving consumers (steer diff, plan-quality) depend on both. The
-  // `_missingRequiredEffects` reconciliation this used to also assert went out with the
-  // function in stage 2b.
-  const compound = makeRun({
-    explicitWorkspaceMutation: true,
-    workspaceAction: "modify",
-    runtimeObligations: ["build", "run"],
-    externalObligations: ["commit", "push"],
-  });
-  assert.deepEqual(contract(compound), {
-    workspace: true,
-    runtime: ["build", "run"],
-    external: ["commit", "push"],
-  });
-
-  const narrowed = makeRun({
-    explicitWorkspaceMutation: true,
-    workspaceAction: "modify",
-    runtimeObligations: ["build", "run"],
-    externalObligations: ["commit", "push", "deploy"],
-  }, ["runtime:run", "external:push", "external:deploy"]);
-  assert.deepEqual(contract(narrowed), {
-    workspace: true,
-    runtime: ["build"],
-    external: ["commit"],
-  });
-  assert.deepEqual(contract(makeRun({ externalObligations: ["database"] })), {
-    workspace: false,
-    runtime: [],
-    external: ["database"],
-  });
-});
 
 test("agent semantic profiles do not authorize or deny real tool execution", () => {
   const issue = load("_agentSideEffectIntentIssue");
