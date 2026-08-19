@@ -28152,3 +28152,32 @@ test("被硬拒时点名要用的工具，不能是模型手上没有的", () =>
   assert.match(core[0], /"read_logs"/,
     "起完服务看不到日志就没法确认起没起来，而提示词要求启动后用 read_logs/read_terminal 确认");
 });
+
+// ---- 子体的提示词不许否认代码实际给了它的能力 ----
+//
+// 原话是「never change a file, run a command, or spawn a further subagent」。后两条是假的：
+//   · `_allow` 的只读分支是 `[..._READ_TOOLS, "run_cmd"]` —— run_cmd 一直在（本文件另一条
+//     断言钉着），执行侧只是把写盘类命令挡掉，纯探索和只读验证照跑；
+//   · `_canNest = _childDepth < 2`，深度 1 的子体会被追加 run_subagent/run_worker/
+//     await_subagent，能再派一层（嵌套强制只读、scope 收敛）。
+// 而它列出来的 `browser` 恰恰不在 _READ_TOOLS 里（那条也有断言钉着不许加）——一调就是
+// [BLOCKED]。等于把有的说成没有、把没有的说成有，两头都让它以为自己做不到。
+test("只读子体的人格提示词与它真实的工具集对得上", () => {
+  const sub = extractFn("_runSubAgent");
+  // 先确认代码这一侧仍然是这么给的；变严了就该同时改提示词，这条断言会把人带到这里。
+  assert.match(sub, /\[\.\.\._READ_TOOLS, "run_cmd"\]/, "只读子体不再有 run_cmd，提示词要跟着改");
+  assert.match(sub, /const _canNest = _childDepth < 2;/, "嵌套规则变了，提示词要跟着改");
+  assert.match(sub, /if \(_canNest\) for \(const t of \["run_subagent", "run_worker", "await_subagent"\]\)/,
+    "派发工具不再追加给子体，提示词要跟着改");
+  assert.doesNotMatch(SRC, /const _READ_TOOLS = \[[^\]]*"browser"/, "browser 进了只读集合（另有断言，这里只是提醒同步提示词）");
+
+  const prompt = /const _SUBAGENT_SYSTEM = _P\("subagent_system", `[\s\S]*?`\);/.exec(SRC);
+  assert.ok(prompt, "_SUBAGENT_SYSTEM 改名或挪走了");
+  const text = prompt[0];
+  assert.ok(!/browser/.test(text), "提示词还在让它用 browser —— 它没有这个工具，一调就是 [BLOCKED]");
+  assert.doesNotMatch(text, /run a command, or spawn a further subagent/,
+    "又把它真有的两样能力说成禁止的了");
+  assert.match(text, /run_cmd is available/, "没告诉它 run_cmd 可用，它就会绕远路或直接说做不到");
+  assert.match(text, /one further layer of sub-agents/, "没告诉它可以再派一层，并行调研就永远不会发生");
+  assert.match(text, /never change a file/, "「不许改文件」这条是真的，必须留着");
+});
