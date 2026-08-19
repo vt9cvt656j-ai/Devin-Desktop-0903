@@ -1672,7 +1672,7 @@ const KNOWN_UNCALLED = new Set([
   "_fixTrailingWhitespace", "_fixUnbalancedBrackets", "_getIdentifierAtPosition",
   "_hasContextOnlyLocationIntent", "_isCompressionPrefixInvalidError",
   "_isKnownThinkingModel", "_isLocalOrPrivateHttpUrl",
-  "_isSecretPath", "_looksLikeProjectExecutionCommand", "_memoryChoiceModel",
+  "_looksLikeProjectExecutionCommand", "_memoryChoiceModel",
   "_migrateCtxChoiceV1", "_modelNeedsCssGrounding", "_partialJsonString",
   "_planStepDomain", "_readBeforeEditCoverageHint", "_readCoverageImpossible",
   "_recordRunRead", "_screenshotModePreflightIssue", "_sessionHistoryEntries",

@@ -29,7 +29,7 @@ const SRC = readFileSync(join(HERE, "..", "src", "main.js"), "utf8");
 const REVIEWED = new Map([
   ["const readOnly = !!run.engineering?.explicitReadOnly;",
     { direction: "ceremony", why: "缺席 → 不视为只读 → 允许更多动作，倒向放行" }],
-  ["const complexReadOnly = !!run.engineering?.projectScope || !!run.engineering?.longTask;",
+  ["const complexReadOnly = !!run.engineering?.projectScope;",
     { direction: "ceremony", why: "缺席 → 不算复杂只读任务 → 少一道计划仪式，不影响能力" }],
   ["return !!run.engineering?.requiresPlan;",
     { direction: "ceremony", why: "缺席 → 不强制先出计划 → 少一道仪式，倒向放行" }],
