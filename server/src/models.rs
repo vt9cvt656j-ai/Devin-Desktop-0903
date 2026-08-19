@@ -5704,6 +5704,21 @@ fn oai_to_anthropic_with_cache(
                         .cloned()
                         .unwrap_or_else(|| json!({"type":"object","properties":{}})),
                 );
+                // 细粒度工具流式（fine-grained tool streaming）。**不设它，Anthropic 会把工具
+                // 入参的 JSON 攒完、校验合法之后才发**——对 write_file 这种把整份文件塞在
+                // `content` 里的调用，用户就是盯着一张空的「正在写…」卡片等上几十秒到几分钟，
+                // 而客户端那套逐 delta 刷新的实时预览再灵也没东西可显示。这不是我们的 bug，
+                // 是 Anthropic 的默认行为，也正是「Claude 写代码要等很久才看得见」的机制成因。
+                //
+                // 打开之后 input_json_delta 逐段就发，本文件下面的转换会把每段原样转成
+                // OpenAI 的 tool_calls[].function.arguments 增量，客户端 _streamWriteContent
+                // 就能边收边把正文画进代码卡——和 Anthropic 自家产品里看到的一样。
+                //
+                // 代价是**中途的 JSON 可能不合法**（这正是缓冲要消除的东西）。客户端本来就按
+                // 这个前提写的：增量扫描器容忍半截转义，_settleWritePreview 只在 JSON.parse
+                // 成功时才定格，落盘前还有截断判据（finish_reason == "length"）与参数校验。
+                // 注意这不是 beta：没有 anthropic-beta 头，就是工具定义上的一个布尔字段。
+                a.insert("eager_input_streaming".into(), json!(true));
                 Some(serde_json::Value::Object(a))
             })
             .collect();
@@ -10097,6 +10112,14 @@ mod billing_tests {
         assert_eq!(msgs[2]["content"][0]["tool_use_id"], "c1");
         assert_eq!(a["tools"][0]["name"], "read_file");
         assert!(a["tools"][0]["input_schema"]["properties"]["path"].is_object()); // parameters → input_schema
+        // 细粒度工具流式必须一直开着：关掉它 Anthropic 就会把整个工具入参攒完才发，
+        // write_file 那种把整份文件塞进 content 的调用会让用户对着空卡片干等几十秒到几分钟。
+        // 客户端的实时预览是逐 delta 画的，没有增量就没有画面——这条是那套 UI 的前提。
+        assert_eq!(
+            a["tools"][0]["eager_input_streaming"],
+            serde_json::json!(true),
+            "工具入参又变回缓冲发送了：Claude 写文件时用户会长时间看不到任何内容"
+        );
         assert!(a["tools"][0].get("parameters").is_none());
     }
 
