@@ -6163,6 +6163,30 @@ impl AnthSse {
         self.saw_answer_block && self.thinking_telemetry.thinking_utf8_chars == 0
     }
 
+    /// 「思考块**开了**，里面却是空的」—— 这才是能归罪于线路的那一种。
+    ///
+    /// 和上面那条**故意分开**，因为两个用途对判据的要求不同：
+    ///
+    ///   · 上面那条服务**缓存排除**：任何零思考的响应都不该被缓存一小时反复重放，
+    ///     不管零思考的原因是什么。宽一点是对的。
+    ///   · 这条服务**线路降权**：只有"上游把思考吞了"才算这条线路的问题。而
+    ///     adaptive 这一轮自己决定不想，是 Claude 5 一族的**正常行为**——一个 377 token
+    ///     的澄清回复不思考再正常不过。
+    ///
+    /// 两者刚好被 `saw_thinking_block` 分开：被吞时 thinking 的 content_block 照常开
+    /// （见 saw_thinking_block 的两个置位点），只是文本是空串；adaptive 决定不想时
+    /// **一个 thinking 块都没有**。
+    ///
+    /// 不分开的代价是实拍过的：2026-08-19 给静音记号接上选路时用了上面那条宽判据，于是
+    /// 每一个正常的不思考轮次都把一条**健康线路**降权 30 分钟，下一轮被迫换线，换到的
+    /// 线路若不是原生 Anthropic 协议就补不上 display、思考文本变空串——"偶尔不出思考卡"
+    /// 被这个修复本身放大成了"越用越不出"。
+    fn thinking_swallowed_by_upstream(&self) -> bool {
+        self.saw_thinking_block
+            && self.saw_answer_block
+            && self.thinking_telemetry.thinking_utf8_chars == 0
+    }
+
     fn thinking_telemetry(&self) -> ThinkingStreamTelemetry {
         self.thinking_telemetry
     }
@@ -7657,7 +7681,14 @@ pub async fn chat_completions(
                 && conv
                     .as_ref()
                     .is_some_and(|c| c.thinking_requested_but_none_returned());
-            if thinking_went_missing {
+            // 降权只认「块开了却是空的」那一种 —— 见 thinking_swallowed_by_upstream 的注释：
+            // adaptive 自己决定不想是正常行为，拿它去降权会把健康线路踢出轮换。
+            let thinking_swallowed = complete
+                && thinking_clip_probe
+                && conv
+                    .as_ref()
+                    .is_some_and(|c| c.thinking_swallowed_by_upstream());
+            if thinking_swallowed {
                 // 记下来，让选路绕开它 —— 只打日志的话，下一次请求照样落到同一条线路上。
                 mark_thinking_mute(cid);
                 tracing::warn!(
@@ -7665,7 +7696,7 @@ pub async fn chat_completions(
                     route_id = %cid,
                     "upstream returned no thinking despite an explicit thinking request; not caching this response and de-prioritising this route for thinking requests"
                 );
-            } else if complete && thinking_clip_probe {
+            } else if complete && thinking_clip_probe && !thinking_went_missing {
                 // 这一轮要了思考、也真的回了 —— 撤掉记号。上游恢复后第一个成功的请求就
                 // 让这条线路回到正常轮换，不需要任何人去后台动手。
                 clear_thinking_mute(cid);
@@ -8728,6 +8759,61 @@ mod billing_tests {
             chat_upstream_attempt_suffix(2, 2, 502, false),
             "（已请求 2 次 / 2 条同模型线路；最后状态 502）"
         );
+    }
+
+    /// 判据必须分得清「上游吞了思考」和「adaptive 这轮自己决定不想」。
+    ///
+    /// 分不清的代价不是少报一条日志，而是**把健康线路降权**：每一个正常的不思考轮次都会
+    /// 触发静音记号 → 下一轮被迫换线 → 换到的线路补不上 display → 思考文本变空串。
+    /// 于是「偶尔不出思考卡」被自己的修复放大成「越用越不出」。2026-08-19 实际发生过。
+    #[test]
+    fn adaptive_自己不想_不能被判成上游吞了思考() {
+        let mk = |saw_thinking: bool, saw_answer: bool, chars: usize| {
+            let mut c = super::AnthSse::new("claude-opus-5");
+            c.saw_thinking_block = saw_thinking;
+            c.saw_answer_block = saw_answer;
+            c.thinking_telemetry.thinking_utf8_chars = chars;
+            c
+        };
+        // 两个判据必须**分别**接到各自的用途上，接反了两边都坏：
+        //   降权用宽判据 → 健康线路被踢出轮换；缓存用窄判据 → 零思考响应被缓存一小时重放。
+        {
+            const SRC: &str = include_str!("models.rs");
+            let prod = &SRC[..SRC.find("mod billing_tests").expect("tests module")];
+            let mute = format!("{}()", "thinking_swallowed_by_upstream");
+            assert!(prod.contains(&mute), "降权判据没接上");
+            // 降权那一处读的必须是窄判据。窗口要小：往前取太多会把上面那行
+            // `let thinking_swallowed = …` 的**声明**也圈进来，于是不管 if 判的是谁
+            // 这条都绿——断言切错范围和断言写错一样坏（本轮已经踩过一次）。
+            // 只看紧邻的那个 if。
+            let at = prod.find("mark_thinking_mute(cid)").expect("记号点");
+            let head = prod[..at].rfind("if ").expect("记号点前面没有 if");
+            let cond = &prod[head..at];
+            assert!(
+                cond.contains("thinking_swallowed"),
+                "降权用的还是宽判据 —— adaptive 正常不思考会把健康线路降权：{cond}",
+            );
+            // 缓存那一处读的必须是宽判据（零思考一律不缓存，不管什么原因）
+            assert!(
+                prod.contains("&& !thinking_went_missing &&"),
+                "缓存判据没接上宽判据",
+            );
+        }
+
+        // adaptive 决定不想：一个 thinking 块都没有 → **不是**上游的问题，不许记号
+        assert!(
+            !mk(false, true, 0).thinking_swallowed_by_upstream(),
+            "adaptive 正常跳过思考被判成上游吞了 —— 健康线路会被无谓降权 30 分钟"
+        );
+        // 上游吞了：thinking 块开了、文本是空串 → 这才是要记号的那种
+        assert!(
+            mk(true, true, 0).thinking_swallowed_by_upstream(),
+            "上游真的吞了思考，必须认出来"
+        );
+        // 正常回了思考 → 不记号
+        assert!(!mk(true, true, 1200).thinking_swallowed_by_upstream());
+        // 只有思考没有正文 → 那是另一条签名（thinking_only_end_turn），这里不该命中
+        assert!(!mk(true, false, 0).thinking_swallowed_by_upstream());
     }
 
     /// 「问问题他不会去思考」——同模型三条线路里有一条稳定吞掉思考，而用户每次都先撞上它。
