@@ -24725,6 +24725,9 @@ const _INCOMPLETE_LABELS = {
   // 最后一个动作轮里有工具明确报了失败（部署/命令/mcp/http 退出非零、被拒、冲突……），
   // 模型却收了尾。给一句能照做的下一步，而不是把 last_action_failed 这个枚举名甩给用户。
   last_action_failed: "上一步有工具报错，先把它弄好",
+  // 收尾说做了改动，而这一轮一个文件都没改、一条命令都没成功跑过。提醒过一次仍未纠正，
+  // 如实记这一笔——它会进"接下来"的建议里，而不是糊在回答下面。
+  claimed_without_doing: "上一轮似乎没真正动手，确认一下再让它重做",
 };
 
 function _runStateNextActionSuggestions(sess, { maxAgeMs = 5 * 60_000 } = {}) {
@@ -30025,18 +30028,20 @@ function _activeSkillsBlock() {
 /*
  * 技能只从**这个 IDE 自己的目录**发现，两处：
  *
- *   <工作区及其父目录>/.claude/skills/<名字>/SKILL.md   ← 技能市场的安装落点（见
+ *   <工作区及其父目录>/.mrdayone/skills/<名字>/SKILL.md ← 技能市场的安装落点（见
  *                                                        destBase，「安装」按钮就写这里）
  *   ~/.mrdayone/skills/<名字>/SKILL.md               ← 自己的家目录技能库，和
  *                                                        ~/.mrdayone/mcp.json 同一个命名空间
  *
  * 这里曾经还会扫 .cursor/skills、.codex/skills、.agents/skills、~/.codex/plugins/cache、
- * ~/.claude/plugins。按用户要求全部去掉了：那些是别的工具的目录，不该在这个 IDE 里生效。
+ * ~/.claude/plugins，工作区那条也一度是 .claude/skills。按用户要求全部去掉了：那些是别的
+ * 工具的目录，不该在这个 IDE 里生效——技能只落在**自己的**产品目录 `_STATE_DIR` 下，
+ * 工作区和家目录同名（2026-08-18 用户点名：「全部用我自己目录」）。
  * 想用那边的某个技能，把它复制到上面两个位置之一——那一次是明确的采纳，而不是默默继承。
  */
 function _skillDiscoveryBases(projectRoot, home) {
-  const bases = _workspaceAncestorRoots(projectRoot).map((root) => `${root}/.claude/skills`);
-  if (home) bases.push(`${String(home).replace(/\/+$/, "")}/.mrdayone/skills`);
+  const bases = _workspaceAncestorRoots(projectRoot).map((root) => `${root}/${_STATE_DIR}/skills`);
+  if (home) bases.push(`${String(home).replace(/\/+$/, "")}/${_STATE_DIR}/skills`);
   return [...new Set(bases)];
 }
 
@@ -30421,7 +30426,7 @@ async function _loadSkills() {
 async function _saveSkills(list) { _saveSkillsLocal(list); await _skillsApi("PUT", list); }
 function _skillWorkspaceInstallRoot(root) {
   const base = String(root || "").replace(/\\/g, "/").replace(/\/+$/, "");
-  return base ? base + "/.claude/skills" : "";
+  return base ? `${base}/${_STATE_DIR}/skills` : "";
 }
 function _skillIsWorkspaceInstalled(skill, root) {
   const baseDir = String(skill?.baseDir || "").replace(/\\/g, "/").replace(/\/+$/, "");
@@ -33311,7 +33316,7 @@ const _CAPABILITY_ROUTES = "外部服务或 API → web_search/web_fetch 读官�
   + "本地格式或批处理 → write_file 写个脚本 + run_cmd 跑（这是正路，不算绕过专用工具）；"
   + "要跑起来看的服务/TUI → run_in_terminal 起，read_logs 看日志；"
   + "工作区里的 .db/.sqlite 文件 → db_query 传 driver=sqlite、url=sqlite:///绝对路径（路径本身就是连接串，不用问用户要）；"
-  + "值得复用的流程 → 写成 <工作区>/.claude/skills/<名字>/SKILL.md 存下来，下一轮它就在你的技能清单里。";
+  + "值得复用的流程 → 写成 <工作区>/.mrdayone/skills/<名字>/SKILL.md 存下来，下一轮它就在你的技能清单里。";
 
 function _searchToolsFuzzyMatch(query, registry, loadedNames) {
   const q = String(query || "").toLowerCase().trim();
@@ -40681,7 +40686,7 @@ function _blockedToolRecoveryInstruction(content, call = null, result = null) {
     write_conflict: () => mk("write_conflict", "HANDLE_FILE_CONFLICT",
       `存在用户编辑或磁盘版本冲突。暂停覆盖写入，先让用户保存/处理冲突，或重新 read_file 读取当前磁盘版本后做局部 edit_file / multi_edit；不能强行覆盖。`),
     generic_tool_failure: () => mk("generic_tool_failure", "CLASSIFY_AND_FIX",
-    `先判断这次失败的真实原因，再选择最小安全动作修复；不要换旁门左道，也不要在没有新证据时重复同一个失败工具调用。`)
+    `先判断这次失败的真实原因，再选择最小安全动作修复。分清两种失败：被**保护门**拦下（[BLOCKED_*]、需要授权、需要先取证）时不要绕过去，按提示补证据或征得同意；而如果够不着的是**能力或外部资源本身**（没有专用工具、站点抓不到、该工具在此环境不可用），换一条路是正路、不是旁门左道：${_CAPABILITY_ROUTES}。两种情况都不要在没有新证据时重复同一个失败的工具调用。`)
   };
 
   // 结构化失败码优先。工具显式告诉我们它是怎么失败的时候，就不该再去猜它的措辞。
@@ -51299,6 +51304,11 @@ function _relCandidates(rawPath, fallbackRoot) {
 function _resolveRel(rel, preferredRoot = "") {
   if (!rel) return rel;
   rel = _normalizeFsPath(String(rel));
+  // `~/…` 要和 read_file 认一样的东西（那边一直在展开）。不展开的话它会被当成**相对路径**
+  // 拼到工作区下，在磁盘上造出一个字面量 `~` 目录，而写入照样**返回成功** —— 模型于是照实
+  // 告诉用户「已经存成技能了，下次生效」，而下次它不在任何会被扫描的地方。写不写得进去是
+  // 另一回事（后端仍然拒绝工作区之外的家目录写入），但那会是一条明确的报错，不是一句谎话。
+  if (rel.startsWith("~/") && _cachedHomeDir) rel = _cachedHomeDir + rel.slice(1);
   if (rel.startsWith("/") || /^[A-Za-z]:\//.test(rel)) return _coherentFilePath(rel);
   const clean = rel.replace(/^\.\//, "").replace(/^\/+/, "");
   const roots = _allRoots(preferredRoot);
@@ -60392,7 +60402,7 @@ async function _skillRegPrefetch(query = "", fromPage = 1) {
   }
 }
 
-// 把仓库里含 SKILL.md 的目录整个装进工作区 .claude/skills/<name>/（跳过二进制和超大文件）。
+// 把仓库里含 SKILL.md 的目录整个装进工作区 .mrdayone/skills/<name>/（跳过二进制和超大文件）。
 async function _skillInstallDir(repoFull, branch, dirPath, destName, onProgress, preTree = null, meta = null) {
   const root = (rootPath || workspaceRoots[0] || "").replace(/\/$/, "");
   if (!root) throw new Error("先打开一个工作区文件夹");
@@ -60405,7 +60415,7 @@ async function _skillInstallDir(repoFull, branch, dirPath, destName, onProgress,
   // SKILL.md 优先，其余按路径序，上限 40 个文件。
   files.sort((a, b) => (a.path === prefix + "SKILL.md" ? -1 : b.path === prefix + "SKILL.md" ? 1 : a.path.localeCompare(b.path)));
   files = files.slice(0, 40);
-  const destBase = `${root}/.claude/skills/${destName}`;
+  const destBase = `${root}/${_STATE_DIR}/skills/${destName}`;
   let n = 0;
   for (const f of files) {
     const rel = f.path.slice(prefix.length);
@@ -60481,7 +60491,7 @@ function renderSkillsTool(body) {
       <div class="mcpfp-head">
         <div>
           <h3>Skills 技能</h3>
-          <p class="mcpfp-sub">技能一直对模型可见，它按需自己读正文；「常驻」是把全文钉进每次请求。装在工作区 <code>.claude/skills/</code> 或 <code>~/.mrdayone/skills/</code>。</p>
+          <p class="mcpfp-sub">技能一直对模型可见，它按需自己读正文；「常驻」是把全文钉进每次请求。装在工作区 <code>.mrdayone/skills/</code> 或 <code>~/.mrdayone/skills/</code>。</p>
         </div>
         <button type="button" class="ctp-btn ctp-btn--primary" data-skfp="add-skill">＋ 添加技能</button>
       </div>
@@ -60729,7 +60739,7 @@ function renderSkillsTool(body) {
     try {
       const r = await run();
       await _skillPostInstall(r.skillMdPath);
-      showToast(`已安装并启用（${r.fileCount} 个文件 → .claude/skills/）`);
+      showToast(`已安装并启用（${r.fileCount} 个文件 → ${_STATE_DIR}/skills/）`);
     } catch (err) {
       showToast("安装失败：" + String(err?.message || err).slice(0, 140));
     }
