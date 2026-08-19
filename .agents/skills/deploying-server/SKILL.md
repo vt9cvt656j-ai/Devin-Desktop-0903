@@ -7,6 +7,17 @@ description: How to deploy the server/ gateway — the separate test and product
 
 完整说明在 [`docs/OPERATIONS.md`](../../../docs/OPERATIONS.md)。这里是动手前必须知道的部分。
 
+## 先看这里：当前实际状态（2026-08-19）
+
+- **测试环境当前是拆掉的**（容器/卷/目录全删，拆前确认过库是空的）。`TARGET=test` 那条路
+  代码没动，随时可以重新拉起来一套——下面写的隔离规则在重建时仍然全部适用。
+- **API key 存储迁移第一步已上生产**：13 个 key 全部完成哈希+密文回填。**第二步
+  （`API_KEY_PURGE_PLAINTEXT=1` 清除明文）还没做**，什么时候做要有人明确决定。
+- **远端判断一律用 `ssh_true`，不要用 `ssh_run`。** 这台机器的 SSH 握手会随机掉
+  （`banner exchange ... invalid format`），而 ssh 的 255 是它自己失败、不是远端命令的
+  返回值。混用会把"连不上"报成"远端没有这个文件"——已经真实发生过一次，差点照着提示
+  把生产的 `.env` 覆盖掉。
+
 ## 有两套环境，别搞混
 
 ```bash
