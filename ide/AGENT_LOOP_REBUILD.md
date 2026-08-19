@@ -81,12 +81,21 @@ equal, and the whole rebuild rests on separating them:
      predicted mattered); now it triggers on total observed progress being zero
      (`_implOps + _runtimeEffects + _externalEffects === 0`), which needs no prediction and
      fires strictly less often. Dropped two ledger consumers.
-   - **2b (todo).** Remove the same two prediction labels from the cap/exception
-     final-accounting path, then delete `_missingRequiredEffects` (its last consumer).
-   - **2c (todo).** Untangle `_requiredEffectContract`'s remaining consumers — the
-     steer-message effect diff (sets `requiresPlan`) and plan-quality (`_planEffectForRun`)
-     — then delete it and its feeders (`_runRequiredEffect`, `_runEffectTarget`,
-     `_effectTargetForTask`).
+   - **2b (done).** Removed the same two prediction labels from the cap/exception
+     final-accounting path and deleted `_missingRequiredEffects` (its last consumer).
+     Only execution-fact labels remain.
+   - **2c (done).** The contract's last live consumer was the steer-message effect diff:
+     after an interjection it recomputed `_requiredEffectContract`, and any newly added
+     `external:` effect rewrote the run as `requiresPlan = true; substantial = true` — a
+     prediction driving control flow, and redundant besides: the same block re-runs
+     `_mergeAiIntentProfile` on the fresh steer verdict a few lines above, so the model has
+     already declared whether a plan is needed. Removed that diff, then deleted
+     `_requiredEffectContract`, `_runRequiredEffect`, `_runEffectTarget`,
+     `_effectTargetForTask` and the already-dead `_planEffectForRun`. `_cancelledEffectKinds`
+     went with them (the contract was its only reader; keeping it would leave write-only
+     state). Kept what has independent consumers: `_addedRuntimeObligations` /
+     `_addedExternalObligations` still feed the prompt's obligation list, and
+     `run._steeredWorkspaceRequired` is still read by the write-obligation check.
    - The pre-write research gate (`_missingResearchEvidence` at the write site) is a
      non-blocking nudge + tool-loading, not a finish obligation — it belongs to stage 3's
      "inject context / rank tools" question, evaluated there, not rushed here.

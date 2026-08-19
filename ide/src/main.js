@@ -45444,7 +45444,7 @@ function _agentDecisionFrameBlock(text, profile = _engineeringProfileWithAiInten
   // 收尾验收契约前置（Anthropic《Effective harnesses for long-running agents》模式：
   // 完成标准开局就交给模型自主奔着做，而不是收尾时用 nudge 突袭补课——突袭 =
   // 多烧轮次 + 被动挨打）。与收尾门禁**同源**：run.engineering 就是这份 resolved
-  // profile，门禁（_requiredEffectContract/_missingResearchEvidence/UI 验证）只是本契约
+  // profile，门禁（执行事实 + _missingResearchEvidence/UI 验证）只是本契约
   // 的复核，永不出现模型没被告知过的新要求。门禁本身保留（零回退纪律）。
   const _finishChecks = [];
   const _finishEffectLabels = {
@@ -45914,17 +45914,6 @@ function _recLabel(call) {
   }
 }
 
-// Effect routing consumes the structured semantic contract. It never infers an
-// authorization or completion obligation from words in the user's message.
-function _effectTargetForTask(task, engineering = null) {
-  void task;
-  const profile = engineering || {};
-  if (profile.workspaceAction === "modify" || profile.explicitWorkspaceMutation) return "workspace";
-  if ((profile.runtimeObligations || []).length) return "runtime";
-  if ((profile.externalObligations || []).length) return "external";
-  if (profile.workspaceAction === "inspect") return "workspace";
-  return "none";
-}
 // LLM 自省批判器（收尾把关）：不写死规则/阈值/正则——把「答得够不够深、任务真完成没有」
 // 的判断交给一次独立的模型调用。它看到：用户任务、运行草稿纸（读过/改过/发现）、准备给出的
 // 回答草稿、真实命令证据和当前完整工具目录，返回 {done, verified, instruction, tools}。
@@ -46548,59 +46537,20 @@ async function _semanticToolOrchestrator({ config, task, profile, phase, progres
 }
 
 
-function _runRequiredEffect(run) {
-  if (!run || run.mode !== "agent") return "inspect";
-  if (run.engineering?.explicitMutation) return "mutate";
-  if (run.engineering?.explicitReadOnly) return "inspect";
-  if (run.engineering?.implementation && run.engineering?.applies) return "inspect";
-  return run.engineering?.applies ? "mutate" : "answer";
-}
-function _runEffectTarget(run) {
-  const engineering = run?.engineering || {};
-  if (engineering.explicitWorkspaceMutation) return "workspace";
-  if ((engineering.runtimeObligations || []).length) return "runtime";
-  if ((engineering.externalObligations || []).length) return "external";
-  return _effectTargetForTask("", engineering);
-}
-
-function _requiredEffectContract(run) {
-  const empty = { workspace: false, runtime: [], external: [] };
-  if (!run || _runRequiredEffect(run) !== "mutate") return empty;
-  const engineering = run.engineering || {};
-  const cancelled = run._cancelledEffectKinds instanceof Set ? run._cancelledEffectKinds : new Set(run._cancelledEffectKinds || []);
-  const runtime = Array.from(new Set([
-    ...(engineering.runtimeObligations || []),
-    ...(run._addedRuntimeObligations || []),
-  ]))
-    .filter((kind) => _RUNTIME_OBLIGATION_ORDER.includes(kind) && !cancelled.has(`runtime:${kind}`));
-  const external = Array.from(new Set([
-    ...(engineering.externalObligations || []),
-    ...(run._addedExternalObligations || []),
-  ]))
-    .filter((kind) => _EXTERNAL_OBLIGATION_ORDER.includes(kind) && !cancelled.has(`external:${kind}`));
-  let workspace = !cancelled.has("workspace")
-    && (!!engineering.explicitWorkspaceMutation || !!run._steeredWorkspaceRequired)
-    && (engineering.workspaceAction === "modify" || !!run._steeredWorkspaceRequired);
-  if (!workspace && !runtime.length && !external.length && cancelled.size === 0) {
-    const fallback = _runEffectTarget({ ...run, engineering });
-    workspace = fallback === "workspace";
-    if (fallback === "external") external.push("external");
-    if (fallback === "runtime" && !runtime.length) runtime.push("run");
-  }
-  return { workspace, runtime, external };
-}
-
-// `_missingRequiredEffects` removed (AGENT_LOOP_REBUILD.md stage 2b). It compared the
-// classifier's predicted effect contract against observed evidence to label a run incomplete —
-// the "the task should have done X" prediction the rebuild removes. Its two call sites (quiet
-// finish, cap/exception finish) now label only on observed facts. `_requiredEffectContract`
-// survives: it still feeds the steer-message effect diff and plan-quality (stage 2c untangles
-// those).
-
-function _planEffectForRun(run) {
-  if (_runRequiredEffect(run) !== "mutate") return "inspect";
-  return _requiredEffectContract(run).workspace ? "mutate" : "execute";
-}
+// 效果契约（`_requiredEffectContract` 与它的上游 `_runRequiredEffect` / `_runEffectTarget` /
+// `_effectTargetForTask`，以及只由它喂的 `_planEffectForRun`）已删除 —— AGENT_LOOP_REBUILD.md
+// 阶段 2c；阶段 2b 删掉 `_missingRequiredEffects` 的那条记录并到这里。
+//
+// 它算的是「分类器认为这个任务应该产生哪些效果」。2a/2b 把它从收尾记账里摘掉后，只剩用户插话
+// 那条路还在用：插话后重算一次契约，发现多出 external 类效果，就把这一轮改写成
+// `requiresPlan = true; substantial = true`。那是**拿预测驱动控制流**——重构要拆的正是这一层。
+// 何况它在紧邻几行下面就被架空了：插话会用新裁决重跑 `_mergeAiIntentProfile`，要不要计划、
+// 是不是重活，模型自己已经在 run.engineering 里声明过一遍；harness 再按契约覆盖一次，等于拿
+// 猜的盖掉声明的。
+//
+// 留下的是有独立消费点的那部分：`_addedRuntimeObligations` / `_addedExternalObligations` 仍然
+// 喂提示词里的义务清单，`run._steeredWorkspaceRequired` 仍被写入义务判定读。只有
+// `_cancelledEffectKinds` 随契约一起走 —— 它唯一的读者就是契约本身，留着就是纯写状态。
 
 function _callCanBypassPlanGate(call) {
   if (!call) return true;
@@ -46671,11 +46621,10 @@ function _applyLateIntentIfLanded(run, config, task, session, body, isLive, mess
   run.engineering = late;
   // Sticky: a late verdict may classify this turn more narrowly than the session already is.
   config.ideSemanticProfile = _sessionStableSemanticProfile(session, _ideSemanticProfile(run.engineering));
-  run._cancelledEffectKinds = run._cancelledEffectKinds instanceof Set ? run._cancelledEffectKinds : new Set(run._cancelledEffectKinds || []);
   run._addedRuntimeObligations = run._addedRuntimeObligations instanceof Set ? run._addedRuntimeObligations : new Set(run._addedRuntimeObligations || []);
   run._addedExternalObligations = run._addedExternalObligations instanceof Set ? run._addedExternalObligations : new Set(run._addedExternalObligations || []);
-  for (const kind of run.engineering.runtimeObligations || []) { run._addedRuntimeObligations.add(kind); run._cancelledEffectKinds.delete(`runtime:${kind}`); }
-  for (const kind of run.engineering.externalObligations || []) { run._addedExternalObligations.add(kind); run._cancelledEffectKinds.delete(`external:${kind}`); }
+  for (const kind of run.engineering.runtimeObligations || []) run._addedRuntimeObligations.add(kind);
+  for (const kind of run.engineering.externalObligations || []) run._addedExternalObligations.add(kind);
   run._syncAgentToolWindowToProfile?.();
   if (late.designKnowledgeRequired && !run._michaelDesignEvidence) {
     _startMichaelDesignPreflight({ run, body, isLive });
@@ -47519,8 +47468,6 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
         for (const queued of session._steerQueue.splice(0)) {
           const steerText = typeof queued === "string" ? queued : String(queued?.text || "");
           const steerAttachments = typeof queued === "string" ? [] : (queued?.attachments || []);
-          run._cancelledEffectKinds = run._cancelledEffectKinds instanceof Set
-            ? run._cancelledEffectKinds : new Set(run._cancelledEffectKinds || []);
           run._addedRuntimeObligations = run._addedRuntimeObligations instanceof Set
             ? run._addedRuntimeObligations : new Set(run._addedRuntimeObligations || []);
           run._addedExternalObligations = run._addedExternalObligations instanceof Set
@@ -47534,7 +47481,6 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
             ? steerText
             : String(queued?.semanticText || steerText);
           {
-            const beforeContract = _requiredEffectContract(run);
             run._steeringText = `${run._steeringText || ""}\n${steerText}`.trim().slice(-12000);
             // 插话与正常消息同权：入需求账本 + 长期记忆自动沉淀（此前只有 sendPrompt 入口有）
             try {
@@ -47569,7 +47515,6 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
             );
             if (_steerVerdict) _commitAiIntentState(session, _steerVerdict, _steerSemanticText, _steerIntentContext);
             config.ideSemanticProfile = _sessionStableSemanticProfile(session, _ideSemanticProfile(run.engineering));
-            run._cancelledEffectKinds.clear();
             run._addedRuntimeObligations.clear();
             run._addedExternalObligations.clear();
             for (const kind of run.engineering.runtimeObligations || []) {
@@ -47579,21 +47524,10 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
               run._addedExternalObligations.add(kind);
             }
             run._steeredWorkspaceRequired = !!run.engineering.explicitWorkspaceMutation;
-            const afterContract = _requiredEffectContract(run);
-            const beforeEffects = new Set([
-              ...(beforeContract.workspace ? ["workspace"] : []),
-              ...beforeContract.runtime.map((kind) => `runtime:${kind}`),
-              ...beforeContract.external.map((kind) => `external:${kind}`),
-            ]);
-            const addedEffects = [
-              ...(afterContract.workspace ? ["workspace"] : []),
-              ...afterContract.runtime.map((kind) => `runtime:${kind}`),
-              ...afterContract.external.map((kind) => `external:${kind}`),
-            ].filter((effect) => !beforeEffects.has(effect));
-            if (addedEffects.some((effect) => effect.startsWith("external:"))) {
-              run.engineering.requiresPlan = true;
-              run.engineering.substantial = true;
-            }
+            // 这里原本再算一次效果契约、和插话前对比，一旦多出 external 类效果就把任务改写成
+            // 「需要计划的重活」。删了（阶段 2c）：上面几行刚用新裁决重跑过 `_mergeAiIntentProfile`，
+            // requiresPlan / substantial 是模型对这次插话的声明，harness 不该拿分类器预测出来的
+            // 效果差分去盖掉它。
             run._syncAgentToolWindowToProfile?.();
             run._requirementsChecklist = _mergeRequirementsChecklist(
               run._requirementsChecklist,
