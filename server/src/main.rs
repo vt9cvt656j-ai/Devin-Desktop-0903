@@ -1,4 +1,5 @@
 mod agent_trace;
+mod api_key_store;
 mod auth;
 mod changelog;
 mod channel_rates;
@@ -136,6 +137,9 @@ async fn main() -> anyhow::Result<()> {
     // 把存量明文敏感字段（上游 key、OAuth 令牌、提现账户/QR）加密回去。只在配了
     // FIELD_ENC_KEY 时跑，幂等，逐行条件更新。见 field_backfill.rs。
     field_backfill::spawn(state.clone());
+    // 存量 api_key 明文的清除。默认**不跑**——只有显式设了 API_KEY_PURGE_PLAINTEXT=1
+    // 的那一次部署才会执行，而且只清已经补齐哈希+密文的行。见 docs/OPERATIONS.md。
+    api_key_store::spawn_purge(state.clone());
     // 结算恢复：补扣「已服务却因结算失败没扣到钱」的调用，幂等、绝不双扣。
     settlement::spawn(state.clone());
     // 模型能力目录：实时抓上下文档位和推理档位，取代手写表。

@@ -20,6 +20,7 @@ yarn-error.log*
 # Env / secrets
 .env
 .env.*
+!server/.env.test.example  # 模板，无密钥
 .mcp.local.json
 **/.mcp.local.json
 

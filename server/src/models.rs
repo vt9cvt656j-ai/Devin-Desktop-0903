@@ -2847,9 +2847,18 @@ pub async fn admin_create_apikey(
         }
     };
     let key = gen_api_key();
-    sqlx::query("INSERT INTO api_keys (user_id, api_key, label) VALUES ($1,$2,$3)")
+    // 三列一起写：摘要（鉴权索引）、密文（回显）、明文（默认 None，见 api_key_store）。
+    // 明文只在 API_KEY_KEEP_PLAINTEXT=1 时才有值——那个开关是留给"需要回滚到旧二进制"
+    // 的极端情况的，默认新 key 从一开始就不落明文。
+    let (digest, enc, plain) = crate::api_key_store::columns_for_new(&key);
+    sqlx::query(
+        "INSERT INTO api_keys (user_id, api_key, api_key_sha256, api_key_enc, label) \
+         VALUES ($1,$2,$3,$4,$5)",
+    )
         .bind(uid)
-        .bind(&key)
+        .bind(plain)
+        .bind(&digest)
+        .bind(&enc)
         .bind(req.label.unwrap_or_default())
         .execute(&state.db)
         .await?;
@@ -2863,14 +2872,17 @@ pub async fn admin_list_apikeys(
 ) -> ApiResult<Json<serde_json::Value>> {
     admin_only(&claims)?;
     let rows = sqlx::query_as::<_, ApiKeyRow>(
-        "SELECT k.id, k.label, k.api_key, u.email, k.created_at, k.last_used_at \
+        // 取密文列优先。明文清除之后 k.api_key 会是 NULL，直接选它会在解码时报错
+        // （ApiKeyRow.api_key 是 String）——列名保持 api_key 以便沿用同一个行类型。
+        "SELECT k.id, k.label, COALESCE(k.api_key_enc, k.api_key, '') AS api_key, \
+                u.email, k.created_at, k.last_used_at \
          FROM api_keys k LEFT JOIN users u ON u.id = k.user_id ORDER BY k.created_at DESC LIMIT 200",
     )
     .fetch_all(&state.db)
     .await?;
     let list: Vec<serde_json::Value> = rows
         .iter()
-        .map(|r| json!({ "id": r.id, "label": r.label, "email": r.email, "key_masked": mask_key(&r.api_key), "created_at": r.created_at, "last_used_at": r.last_used_at }))
+        .map(|r| json!({ "id": r.id, "label": r.label, "email": r.email, "key_masked": mask_key(&crate::field_crypto::decrypt_or_raw(&r.api_key, crate::api_key_store::API_KEY_CTX)), "created_at": r.created_at, "last_used_at": r.last_used_at }))
         .collect();
     Ok(Json(json!(list)))
 }
@@ -2904,19 +2916,33 @@ pub async fn ide_key(
     claims: Claims,
 ) -> ApiResult<Json<serde_json::Value>> {
     let uid = uuid::Uuid::parse_str(&claims.sub).map_err(|_| AppError::unauthorized("令牌损坏"))?;
-    let existing: Option<String> = sqlx::query_scalar("SELECT api_key FROM api_keys WHERE user_id = $1 AND label = 'ide-auto' ORDER BY created_at LIMIT 1")
+    // 这个接口必须把**同一把 key 原样还回去**（IDE 自动配置，跨设备跨会话要稳定），
+    // 所以取的是密文列再解密，而不是哈希——哈希是单向的。
+    // COALESCE：过渡期里旧行可能还只有明文，新行则只有密文。
+    let existing: Option<String> = sqlx::query_scalar(
+        "SELECT COALESCE(api_key_enc, api_key) FROM api_keys \
+         WHERE user_id = $1 AND label = 'ide-auto' AND COALESCE(api_key_enc, api_key) IS NOT NULL \
+         ORDER BY created_at LIMIT 1",
+    )
         .bind(uid)
         .fetch_optional(&state.db)
         .await?;
     let key = match existing {
-        Some(k) => k,
+        // decrypt_or_raw：存的是密文就解开，是过渡期遗留的明文就原样用。
+        Some(stored) => {
+            crate::field_crypto::decrypt_or_raw(&stored, crate::api_key_store::API_KEY_CTX)
+        }
         None => {
             let k = gen_api_key();
+            let (digest, enc, plain) = crate::api_key_store::columns_for_new(&k);
             sqlx::query(
-                "INSERT INTO api_keys (user_id, api_key, label) VALUES ($1, $2, 'ide-auto')",
+                "INSERT INTO api_keys (user_id, api_key, api_key_sha256, api_key_enc, label) \
+                 VALUES ($1, $2, $3, $4, 'ide-auto')",
             )
             .bind(uid)
-            .bind(&k)
+            .bind(plain)
+            .bind(&digest)
+            .bind(&enc)
             .execute(&state.db)
             .await?;
             k
@@ -3817,11 +3843,9 @@ pub(crate) async fn auth_any_user(
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .ok_or_else(|| AppError::unauthorized("缺少 API Key"))?;
-    match sqlx::query_scalar::<_, uuid::Uuid>("SELECT user_id FROM api_keys WHERE api_key = $1")
-        .bind(&token)
-        .fetch_optional(&state.db)
-        .await?
-    {
+    // 走 api_key_store：先查哈希（唯一索引），查不到再查明文并顺手补齐该行。
+    // 详见 api_key_store.rs —— 明文列是过渡期产物，清除由单独一次部署完成。
+    match crate::api_key_store::lookup_user(&state.db, &token).await {
         Some(u) => Ok(u),
         None => crate::auth::user_from_jwt(&state.db, &state.cfg, &token).await
             .ok_or_else(|| AppError::unauthorized("登录已失效或密钥无效")),
@@ -6069,13 +6093,7 @@ pub async fn audio_transcriptions(
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .ok_or_else(|| AppError::unauthorized("缺少 API Key"))?;
-    let _uid: uuid::Uuid = match sqlx::query_scalar::<_, uuid::Uuid>(
-        "SELECT user_id FROM api_keys WHERE api_key = $1",
-    )
-    .bind(&token)
-    .fetch_optional(&state.db)
-    .await?
-    {
+    let _uid: uuid::Uuid = match crate::api_key_store::lookup_user(&state.db, &token).await {
         Some(u) => u,
         None => crate::auth::user_from_jwt(&state.db, &state.cfg, &token).await
             .ok_or_else(|| AppError::unauthorized("登录已失效或密钥无效"))?,
@@ -6186,18 +6204,9 @@ pub async fn chat_completions(
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .ok_or_else(|| AppError::unauthorized("缺少 API Key"))?;
-    let uid: uuid::Uuid = match sqlx::query_scalar::<_, uuid::Uuid>(
-        "SELECT user_id FROM api_keys WHERE api_key = $1",
-    )
-    .bind(&token)
-    .fetch_optional(&state.db)
-    .await?
-    {
+    let uid: uuid::Uuid = match crate::api_key_store::lookup_user(&state.db, &token).await {
         Some(u) => {
-            let _ = sqlx::query("UPDATE api_keys SET last_used_at = now() WHERE api_key = $1")
-                .bind(&token)
-                .execute(&state.db)
-                .await;
+            crate::api_key_store::touch_last_used(&state.db, &token).await;
             u
         }
         // Also accept the login JWT directly (the IDE authenticates with it).
@@ -7440,18 +7449,9 @@ pub async fn responses_proxy(
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .ok_or_else(|| AppError::unauthorized("缺少 API Key"))?;
-    let uid: uuid::Uuid = match sqlx::query_scalar::<_, uuid::Uuid>(
-        "SELECT user_id FROM api_keys WHERE api_key = $1",
-    )
-    .bind(&token)
-    .fetch_optional(&state.db)
-    .await?
-    {
+    let uid: uuid::Uuid = match crate::api_key_store::lookup_user(&state.db, &token).await {
         Some(u) => {
-            let _ = sqlx::query("UPDATE api_keys SET last_used_at = now() WHERE api_key = $1")
-                .bind(&token)
-                .execute(&state.db)
-                .await;
+            crate::api_key_store::touch_last_used(&state.db, &token).await;
             u
         }
         None => crate::auth::user_from_jwt(&state.db, &state.cfg, &token).await
@@ -7724,18 +7724,9 @@ pub async fn image_generations(
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .ok_or_else(|| AppError::unauthorized("缺少 API Key"))?;
-    let uid: uuid::Uuid = match sqlx::query_scalar::<_, uuid::Uuid>(
-        "SELECT user_id FROM api_keys WHERE api_key = $1",
-    )
-    .bind(&token)
-    .fetch_optional(&state.db)
-    .await?
-    {
+    let uid: uuid::Uuid = match crate::api_key_store::lookup_user(&state.db, &token).await {
         Some(u) => {
-            let _ = sqlx::query("UPDATE api_keys SET last_used_at = now() WHERE api_key = $1")
-                .bind(&token)
-                .execute(&state.db)
-                .await;
+            crate::api_key_store::touch_last_used(&state.db, &token).await;
             u
         }
         None => crate::auth::user_from_jwt(&state.db, &state.cfg, &token).await

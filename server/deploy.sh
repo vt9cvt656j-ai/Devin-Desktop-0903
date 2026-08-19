@@ -10,10 +10,41 @@ set -euo pipefail
 SERVER_PORT="${SERVER_PORT:-22}"
 SERVER_USER="${SERVER_USER:-root}"
 SERVER_KEY="${SERVER_KEY:-}"
-REMOTE_DIR="${REMOTE_DIR:-/opt/michael-ide-deploy/server}"
+# 部署目标：prod（默认）或 test。
+#
+#   ./deploy.sh          → 生产
+#   TARGET=test ./deploy.sh   → 测试环境（另一套容器、另一块数据库盘、另一个端口）
+#
+# 两套环境**必须**在这三样上分开，少一样就会踩到生产：
+#   · REMOTE_DIR   —— rsync 的落点。同一个目录的话，一次测试部署就把生产的代码覆盖了。
+#   · COMPOSE_PROJECT —— 容器名/网络/**卷名**的前缀。它决定 pgdata 是两块盘还是一块。
+#   · BACKEND_PORT / SITES_DIR —— 宿主端口与静态站目录（走 .env，见 docker-compose.yml）。
+TARGET="${TARGET:-prod}"
+case "$TARGET" in
+  prod)
+    REMOTE_DIR="${REMOTE_DIR:-/opt/michael-ide-deploy/server}"
+    COMPOSE_PROJECT="server"
+    COMPOSE_FILES="-f docker-compose.yml"
+    ENV_FILE=".env"
+    HEALTH_PORT="8080"
+    ;;
+  test)
+    REMOTE_DIR="${REMOTE_DIR:-/opt/michael-ide-deploy/server-test}"
+    COMPOSE_PROJECT="server-test"
+    COMPOSE_FILES="-f docker-compose.yml -f docker-compose.test.yml"
+    ENV_FILE=".env.test"
+    HEALTH_PORT="8081"
+    ;;
+  *)
+    echo "TARGET 只能是 prod 或 test（收到：$TARGET）" >&2
+    exit 1
+    ;;
+esac
+echo "部署目标：$TARGET（项目 $COMPOSE_PROJECT，端口 $HEALTH_PORT，目录 $REMOTE_DIR）"
 REMOTE="${SERVER_USER}@${SERVER_HOST}"
 REMOTE_Q="$(printf '%q' "$REMOTE_DIR")"
-REMOTE_LOCK="${REMOTE_LOCK:-/var/lock/michael-ide-deploy.lock}"
+# 锁按目标分开：测试环境的一次构建不该把生产的发布挡在门外。
+REMOTE_LOCK="${REMOTE_LOCK:-/var/lock/michael-ide-deploy-${TARGET}.lock}"
 REMOTE_LOCK_Q="$(printf '%q' "$REMOTE_LOCK")"
 DEPLOY_LOCK_TIMEOUT_SECS="${DEPLOY_LOCK_TIMEOUT_SECS:-900}"
 
@@ -101,10 +132,14 @@ rsync_run() {
 }
 rsync_run
 
-echo "checking for ${REMOTE_DIR}/.env on the server"
-if ! ssh_run "test -f $REMOTE_Q/.env"; then
-  echo "No .env exists on the server. Copy .env.example to .env and fill in"
+echo "checking for ${REMOTE_DIR}/${ENV_FILE} on the server"
+if ! ssh_run "test -f $REMOTE_Q/$(printf '%q' "$ENV_FILE")"; then
+  echo "No ${ENV_FILE} exists on the server. Copy .env.example to ${ENV_FILE} and fill in"
   echo "   JWT_SECRET / POSTGRES_PASSWORD / QQ_SMTP_* before the first run."
+  if [ "$TARGET" = "test" ]; then
+    echo "   测试环境还必须设 BACKEND_PORT=8081 和 SITES_DIR=/var/www/michael-sites-test，"
+    echo "   否则它会去抢生产的端口、往生产的静态站目录里写。"
+  fi
   exit 1
 fi
 
@@ -115,7 +150,13 @@ echo "validating, updating and health-checking containers (serialized)"
 # replacement and health check so only one rollout can touch the project at a
 # time. The lock is operational coordination only; it does not change request
 # handling or access policy.
-REMOTE_DEPLOY_CMD="cd $REMOTE_Q && docker compose -p server config --quiet && docker compose -p server up -d --build && for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30; do if curl -fsS http://127.0.0.1:8080/health >/dev/null; then docker compose -p server ps; exit 0; fi; sleep 2; done; docker compose -p server logs --tail=100 backend; exit 1"
+DC="docker compose -p $COMPOSE_PROJECT $COMPOSE_FILES"
+REMOTE_DEPLOY_CMD="cd $REMOTE_Q && $DC config --quiet && $DC up -d --build && for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30; do if curl -fsS http://127.0.0.1:${HEALTH_PORT}/health >/dev/null; then $DC ps; exit 0; fi; sleep 2; done; $DC logs --tail=100 backend; exit 1"
 REMOTE_DEPLOY_CMD_Q="$(printf '%q' "$REMOTE_DEPLOY_CMD")"
 ssh_run "flock -w $DEPLOY_LOCK_TIMEOUT_SECS $REMOTE_LOCK_Q bash -c $REMOTE_DEPLOY_CMD_Q"
-echo "deployment healthy at https://code.mrday.one/health"
+if [ "$TARGET" = "prod" ]; then
+  echo "deployment healthy at https://code.mrday.one/health"
+else
+  echo "测试环境已就绪：ssh -L ${HEALTH_PORT}:127.0.0.1:${HEALTH_PORT} 上去之后开 http://127.0.0.1:${HEALTH_PORT}/health"
+  echo "（它不对公网开放，宿主 nginx 不代理这个端口）"
+fi

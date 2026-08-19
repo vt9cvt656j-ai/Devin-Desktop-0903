@@ -70,7 +70,8 @@ services:
       # DEPLOY_ALLOWLIST: 逗号分隔的账号 id；admin 永远可部署，其他账号须在此白名单里（在 .env 配）。
     volumes:
       # 部署上传的静态站落到这里（按账号隔离），host 上 nginx 的 /s/ 服务它。
-      - /var/www/michael-sites:/var/www/michael-sites
+      # 同样走变量：测试环境必须指到别的目录，否则会往生产的静态站目录里写。
+      - ${SITES_DIR:-/var/www/michael-sites}:/var/www/michael-sites
       # MusicGen weights are downloaded once on first use and survive image rebuilds.
       - musiccache:/var/cache/michael/huggingface
     depends_on:
@@ -82,7 +83,12 @@ services:
       # Loopback-only: nginx (on the host) proxies to 127.0.0.1:8080. Publishing on
       # 0.0.0.0 exposed the backend to the public internet, bypassing the 8443 TLS
       # vhost — close that. Bind to 127.0.0.1 so only the local nginx can reach it.
-      - "127.0.0.1:8080:8080"
+      #
+      # 端口和静态站目录走变量，而不是让测试环境用覆盖文件去改：Compose 对
+      # **列表**字段（ports 就是）的合并语义是**拼接**，不是替换。测试那份写
+      # `- "127.0.0.1:8081:8080"` 的话，最终配置会同时发布 8080 和 8081 ——
+      # 直接和生产抢 8080，两套环境一起崩。用变量就完全绕开合并语义。
+      - "127.0.0.1:${BACKEND_PORT:-8080}:8080"
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/health', timeout=3)"]
       interval: 30s
