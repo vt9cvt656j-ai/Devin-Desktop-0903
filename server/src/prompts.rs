@@ -6038,8 +6038,16 @@ mod tests {
         assert!(core.contains("michael-design"));
         assert!(components.contains("Lucide"));
         assert!(components.contains("semantic classes"));
-        assert!(verification.contains("1440x900"));
-        assert!(verification.contains("390x844"));
+        // 钉的是「两个视口都要求验」这件事，不是某一种写法。
+        // 提示词 2026-08-19 从 `1440x900` 改成了 `browser viewport(width:1440, height:900)`
+        // （commit 8bfa29d），断言还在找旧字面量，于是这条测试红了——而它要守的属性一点没变。
+        // 判据换成两个视口的数字都在，写法怎么演进都不影响。
+        for wanted in ["1440", "900", "390", "844"] {
+            assert!(
+                verification.contains(wanted),
+                "验收提示词里少了视口尺寸 {wanted}——桌面/手机双视口的验收矩阵就凑不齐了"
+            );
+        }
     }
 
     #[test]
