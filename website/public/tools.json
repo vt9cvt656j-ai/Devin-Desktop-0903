@@ -323,129 +323,9 @@
       "desktopOnly": false
     },
     {
-      "name": "edit_file",
-      "group": "Files",
-      "desktopOnly": false
-    },
-    {
-      "name": "multi_edit",
-      "group": "Files",
-      "desktopOnly": false
-    },
-    {
-      "name": "write_file",
-      "group": "Files",
-      "desktopOnly": false
-    },
-    {
-      "name": "run_cmd",
-      "group": "Terminal & system",
-      "desktopOnly": false
-    },
-    {
-      "name": "deploy_site",
-      "group": "Deploy",
-      "desktopOnly": false
-    },
-    {
-      "name": "delete_path",
-      "group": "Files",
-      "desktopOnly": false
-    },
-    {
-      "name": "move_path",
-      "group": "Files",
-      "desktopOnly": false
-    },
-    {
-      "name": "git_commit",
-      "group": "Git & GitHub",
-      "desktopOnly": false
-    },
-    {
-      "name": "git_branch",
-      "group": "Git & GitHub",
-      "desktopOnly": false
-    },
-    {
-      "name": "git_push",
-      "group": "Git & GitHub",
-      "desktopOnly": false
-    },
-    {
-      "name": "git_clone",
-      "group": "Git & GitHub",
-      "desktopOnly": false
-    },
-    {
-      "name": "git_pull",
-      "group": "Git & GitHub",
-      "desktopOnly": false
-    },
-    {
-      "name": "create_dir",
-      "group": "Files",
-      "desktopOnly": false
-    },
-    {
-      "name": "copy_path",
-      "group": "Files",
-      "desktopOnly": false
-    },
-    {
-      "name": "format_file",
-      "group": "Files",
-      "desktopOnly": false
-    },
-    {
-      "name": "run_in_terminal",
-      "group": "Terminal & system",
-      "desktopOnly": true
-    },
-    {
-      "name": "system",
-      "group": "Terminal & system",
-      "desktopOnly": true
-    },
-    {
-      "name": "browser",
-      "group": "Web & browser",
-      "desktopOnly": true
-    },
-    {
-      "name": "git_stash",
-      "group": "Git & GitHub",
-      "desktopOnly": false
-    },
-    {
-      "name": "git_stash_pop",
-      "group": "Git & GitHub",
-      "desktopOnly": false
-    },
-    {
-      "name": "stop_terminal",
-      "group": "Terminal & system",
-      "desktopOnly": true
-    },
-    {
-      "name": "http_request",
-      "group": "Web & browser",
-      "desktopOnly": true
-    },
-    {
-      "name": "tor_request",
-      "group": "Web & browser",
-      "desktopOnly": true
-    },
-    {
       "name": "package_search",
       "group": "Research",
       "desktopOnly": true
-    },
-    {
-      "name": "package_source",
-      "group": "Knowledge",
-      "desktopOnly": false
     },
     {
       "name": "github_search",
@@ -563,6 +443,131 @@
       "desktopOnly": true
     },
     {
+      "name": "search_game_assets",
+      "group": "Design & media",
+      "desktopOnly": true
+    },
+    {
+      "name": "edit_file",
+      "group": "Files",
+      "desktopOnly": false
+    },
+    {
+      "name": "multi_edit",
+      "group": "Files",
+      "desktopOnly": false
+    },
+    {
+      "name": "write_file",
+      "group": "Files",
+      "desktopOnly": false
+    },
+    {
+      "name": "run_cmd",
+      "group": "Terminal & system",
+      "desktopOnly": false
+    },
+    {
+      "name": "deploy_site",
+      "group": "Deploy",
+      "desktopOnly": false
+    },
+    {
+      "name": "delete_path",
+      "group": "Files",
+      "desktopOnly": false
+    },
+    {
+      "name": "move_path",
+      "group": "Files",
+      "desktopOnly": false
+    },
+    {
+      "name": "git_commit",
+      "group": "Git & GitHub",
+      "desktopOnly": false
+    },
+    {
+      "name": "git_branch",
+      "group": "Git & GitHub",
+      "desktopOnly": false
+    },
+    {
+      "name": "git_push",
+      "group": "Git & GitHub",
+      "desktopOnly": false
+    },
+    {
+      "name": "git_clone",
+      "group": "Git & GitHub",
+      "desktopOnly": false
+    },
+    {
+      "name": "git_pull",
+      "group": "Git & GitHub",
+      "desktopOnly": false
+    },
+    {
+      "name": "create_dir",
+      "group": "Files",
+      "desktopOnly": false
+    },
+    {
+      "name": "copy_path",
+      "group": "Files",
+      "desktopOnly": false
+    },
+    {
+      "name": "format_file",
+      "group": "Files",
+      "desktopOnly": false
+    },
+    {
+      "name": "run_in_terminal",
+      "group": "Terminal & system",
+      "desktopOnly": true
+    },
+    {
+      "name": "system",
+      "group": "Terminal & system",
+      "desktopOnly": true
+    },
+    {
+      "name": "browser",
+      "group": "Web & browser",
+      "desktopOnly": true
+    },
+    {
+      "name": "git_stash",
+      "group": "Git & GitHub",
+      "desktopOnly": false
+    },
+    {
+      "name": "git_stash_pop",
+      "group": "Git & GitHub",
+      "desktopOnly": false
+    },
+    {
+      "name": "stop_terminal",
+      "group": "Terminal & system",
+      "desktopOnly": true
+    },
+    {
+      "name": "http_request",
+      "group": "Web & browser",
+      "desktopOnly": true
+    },
+    {
+      "name": "tor_request",
+      "group": "Web & browser",
+      "desktopOnly": true
+    },
+    {
+      "name": "package_source",
+      "group": "Knowledge",
+      "desktopOnly": false
+    },
+    {
       "name": "download_file",
       "group": "Files",
       "desktopOnly": true
@@ -659,11 +664,6 @@
     },
     {
       "name": "generate_texture",
-      "group": "Design & media",
-      "desktopOnly": true
-    },
-    {
-      "name": "search_game_assets",
       "group": "Design & media",
       "desktopOnly": true
     },
