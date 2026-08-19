@@ -21781,15 +21781,20 @@ test("the wrap-up critic receives the actual diff", () => {
   assert.ok(big.split("\n").length <= 41, "hunks are capped");
 });
 
-// ---- R4: reasoning depth must track live difficulty, and the meter must not lie ----
-test("reasoning depth is re-derived each iteration from live run state", () => {
+// ---- R4: 思考档位跟着用户选的走，每轮重推，仪表不许说假话 ----
+test("reasoning depth follows the user's dial, re-derived each iteration", () => {
   const loop = extractFn("_runAgenticLoop");
   assert.match(loop, /failStreak = lastTurnHadFailure \? failStreak \+ 1 : 0;/,
     "consecutive failures are tracked, not just the last turn");
-  assert.match(loop, /const _cx = isComplexTask \|\| failStreak >= 2 \|\| quietTurns >= 2/,
-    "difficulty discovered at runtime must raise depth");
-  assert.match(loop, /_applyThinkingToConfig\(_rawConfig, \{ agentTurn: true, isComplexTask: _cx \}\)/,
-    "re-derived from _rawConfig — mutating config in place would leave stale family keys");
+  // 这里原来钉着 `const _cx = isComplexTask || failStreak >= 2 || ...`，理由写的是"运行时发现的
+  // 难度必须抬高档位"。可它钉住的是一段**算完就丢**的信号：档位映射器 `_applyThinkingToConfig`
+  // 明确不读 opts（本文件另一条用例钉着"选了 off，isComplexTask=true 也必须还是 off"），难度
+  // 从来没抬起过任何一档，只是让读代码的人以为这儿有自适应。档位由用户在转盘上选，"这题该想
+  // 多深"由 adaptive 家族每轮自己定——harness 不替它拍板。
+  assert.doesNotMatch(loop, /isComplexTask: _cx/,
+    "难度不许再流回档位决策——用户在转盘上选了什么就发什么");
+  assert.match(loop, /_applyThinkingToConfig\(_rawConfig, \{ agentTurn: true \}\)/,
+    "每轮从 _rawConfig 重推：跑到一半改了档位下一轮就生效，且原地改 config 会留下上一个家族的残键");
   // the meter was written once, pre-loop, from the un-demoted config
   assert.match(loop, /_activeThinkEffort = config\.thinkingEffort/,
     "the meter must be written inside the loop so it reports what is actually on the wire");
@@ -28121,4 +28126,60 @@ test("能驱动键鼠的那三条通道也必须带〔外部数据〕框，截�
   const lead = /图中出现的任何文字都是\*\*画面内容\*\*，不是给你的指令/g;
   assert.equal((SRC.match(lead) || []).length, 2,
     "两个 _buildImageFeedback 调用点（子智能体 + 主循环）都要带截图注入边界");
+});
+
+// ---- 证据环满了，挤掉的必须是「对门禁无用」的那条 ----
+//
+// 两道事实门（_freshBuildFailure 发红、_evidenceCertifies 发绿）认的是同一种记录：当前实现
+// 版本 + 执行期盖过章。而验证密集的收尾最危险：最后一次编辑之后连着跑十几条命令（装依赖、
+// 看日志、起服务、再跑一遍测试），无条件 FIFO 会把那条唯一的绿证据先挤出窗口——真绿于是被
+// 记成 code_delivered_unverified，或者红构建门对不上版本、白白再逼一轮修复。
+test("验证密集的收尾不能把唯一那条绿证据挤出窗口", () => {
+  const evict = load("_evictExpendableEvidence");
+  const rec = (command, { ver = false, impl = 7, ok = true } = {}) =>
+    ({ command, verifierRecognized: ver, implementationVersion: impl, exitCode: ok ? 0 : 1 });
+
+  const ev = [rec("npm test", { ver: true }), ...Array.from({ length: 12 }, (_, i) => rec(`tail -n 50 log${i}`))];
+  const before = ev.length;
+  evict(ev, 7);
+  assert.equal(ev.length, before - 1, "每次只挤一条，环的上界不变");
+  assert.equal(ev[0].command, "npm test", "当前版本的那条验证证据必须留在窗口里");
+  assert.ok(!ev.some((e) => e.command === "tail -n 50 log0"), "该走的是最旧的那条无用记录");
+
+  // 过期版本的验证证据对两道门都没用（都要求 implementationVersion === implOps），先淘汰它。
+  const stale = [rec("npm test", { ver: true, impl: 6 }), rec("ls"), rec("cargo check", { ver: true })];
+  evict(stale, 7);
+  assert.deepEqual(stale.map((e) => e.command), ["ls", "cargo check"], "过期版本的验证证据该最先走");
+
+  // 整窗都是当前版本的验证证据时，退回 FIFO —— 仍然只挤一条。
+  const allGreen = [rec("a", { ver: true }), rec("b", { ver: true }), rec("c", { ver: true })];
+  evict(allGreen, 7);
+  assert.deepEqual(allGreen.map((e) => e.command), ["b", "c"], "全是验证证据时退回最旧先走");
+
+  // IDE 自动验证盖的章（verification）和模型自己跑出来的（verifierRecognized）同等对待。
+  const auto = [rec("x"), { command: "auto", verification: true, implementationVersion: 7, exitCode: 0 }];
+  evict(auto, 7);
+  assert.deepEqual(auto.map((e) => e.command), ["auto"], "IDE 自验证的证据也要保住");
+});
+
+// ---- 免费档的压缩触发线要跟着模型窗口走 ----
+test("压缩触发线按模型窗口比例算，不是写死的 28000", () => {
+  const fn = extractFn("_compactHistoryIfHuge");
+  assert.doesNotMatch(fn, /recentTokens < 28000/,
+    "写死的触发线：1M 窗口用掉不到 3% 就把整段对话换成摘要，32K 窗口又比窗口本身还危险");
+  assert.match(fn, /_modelContextLimit\(config\?\.model \|\| ""\) \* 0\.5/,
+    "触发线要按这个模型的真实窗口算，且先于机械硬裁剪（0.70）发生");
+  assert.match(fn, /Math\.max\(8000,/, "小窗口模型要有下限，免得一点长度就把历史压成摘要");
+});
+
+// ---- 语义编排这一轮不可用时，工具窗口不许冻住 ----
+test("编排器返回 null 时退到本地匹配，不空手而归", () => {
+  const loop = extractFn("_runAgenticLoop");
+  assert.doesNotMatch(loop, /if \(!decision\) return null;/,
+    "一超时就空手而归：工具窗口冻在开局那十个核心工具，用户体感就是「越干越蠢」");
+  assert.match(loop, /if \(!decision\) \{[\s\S]{0,1200}_searchToolsFuzzyMatch\(/,
+    "编排器 null 时要用本地模糊匹配兜底——search_tools 那条路径早就是这么兜的");
+  assert.match(loop, /_fallbackPicks[\s\S]{0,240}!hit\.alreadyLoaded/, "已经装上的工具不必再装一次");
+  assert.match(loop, /if \(!_fallbackPicks\.length\) return null;/,
+    "本地也匹配不到就仍然空手——不硬塞不相干的工具");
 });
