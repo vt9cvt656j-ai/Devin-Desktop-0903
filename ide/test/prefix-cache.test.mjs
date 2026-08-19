@@ -1245,7 +1245,9 @@ test("读取失败时说得出「这个目录是空的」", () => {
 test("传输层掉线要能被认出来，否则续传那一整套机制根本不会被调用", () => {
   // 用真函数跑，不是读正则 —— 这条判据决定 canResume 走不走，读错一个字就是整套机制静默失效。
   const isRetryable = load("_isRetryableAiError",
-    ["_stripAiRetryPrefix", "_isRateLimitedAiError", "_isProviderGatewayStatusError", "_isRetryableAiError", "_isUnrecoverableUpstreamError"]);
+    ["_stripAiRetryPrefix", "_isRateLimitedAiError", "_isProviderGatewayStatusError", "_isRetryableAiError", "_isUnrecoverableUpstreamError",
+     // 判据现在以状态码为准、文案兜底，所以这两个也要进沙箱；漏了就是 ReferenceError。
+     "_aiStatusFromMessage", "_aiFailureKind"]);
 
   // 网关校验出被截断的工具参数时，会把已经 200 的响应体中途 abort，桌面端因此发出这一句。
   // 它以前不匹配任何一条规则：network / connection reset 全是英文。
