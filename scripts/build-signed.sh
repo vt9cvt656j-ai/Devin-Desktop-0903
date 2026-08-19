@@ -117,7 +117,12 @@ while IFS= read -r _dev; do
   fi
 done < <(hdiutil info 2>/dev/null | grep -F -A2 "$_rw_prefix" | grep -oE '^/dev/disk[0-9]+' || true)
 
-_stale_files=$(find target/release/bundle/macos -maxdepth 1 -name 'rw.*.dmg' 2>/dev/null | wc -l | tr -d ' ')
+# `2>/dev/null` 只挡错误输出，挡不住退出码。目录还不存在时（**任何一棵干净的构建树**都是
+# 这样）find 返回 1，pipefail 让整条管道返回 1，而这是个没有 `|| true` 兜底的赋值——
+# 于是 set -e 在这里把脚本静默杀掉：退出码 1，日志停在"目标架构"那一行，一个字的原因都没有。
+# 主树里这个目录早被历次构建建好了，所以这条路一直没人走到。实测：从 git worktree 打包，
+# 每一次都在这里死掉，而外层看到的只是"构建没产出"。把 find 的失败吸收在子 shell 里。
+_stale_files=$( { find target/release/bundle/macos -maxdepth 1 -name 'rw.*.dmg' 2>/dev/null || true; } | wc -l | tr -d ' ')
 find target/release/bundle/macos -maxdepth 1 -name 'rw.*.dmg' -delete 2>/dev/null || true
 if [ "$_stale_mounts" -gt 0 ] || [ "${_stale_files:-0}" -gt 0 ]; then
   echo "预清 DMG 残留：卸载 $_stale_mounts 个挂载、删除 ${_stale_files:-0} 个临时映像"
