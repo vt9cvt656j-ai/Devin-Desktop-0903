@@ -33300,6 +33300,19 @@ function _searchToolsLookup(query, registry, loadedNames) {
 // 路由的第一腿仍是 _semanticToolOrchestrator，本函数的命中只作(a)编排器的候选提示
 // (b) 编排器不可用时的降级回退，不新增任何替代语义判断的硬路由分支。
 // 返回按得分降序的 [{name, schema, score, matchedOn}]，精确匹配路径不受影响（向后兼容）。
+// 能力缺口时的**换路清单**。四个出口共用同一份：模型编了个不存在的工具名、注册表里确实没有、
+// 语义编排本次不可用、抓页面失败——这几处都是同一件事「你想要的能力没有现成工具」，而模型此刻
+// 最需要知道的是**换哪条路**，不是「再搜一次」或「检查网络」。
+//
+// 抽出来是因为它原本被手抄了两份，另外两个出口压根没有：web_fetch 失败只说「检查 URL 是否正确、
+// 网络是否畅通」，web_search 失败只说「换个关键词试试」——而 agent_core 第 5 条把「web_search +
+// web_fetch 读官方文档」定为造能力的第一步，那一步倒下时唯一的指示是去检查网络。
+const _CAPABILITY_ROUTES = "外部服务或 API → web_search/web_fetch 读官方文档，再用 http_request 打通；"
+  + "本地格式或批处理 → write_file 写个脚本 + run_cmd 跑（这是正路，不算绕过专用工具）；"
+  + "要跑起来看的服务/TUI → run_in_terminal 起，read_logs 看日志；"
+  + "工作区里的 .db/.sqlite 文件 → db_query 传 driver=sqlite、url=sqlite:///绝对路径（路径本身就是连接串，不用问用户要）；"
+  + "值得复用的流程 → 写成 <工作区>/.claude/skills/<名字>/SKILL.md 存下来，下一轮它就在你的技能清单里。";
+
 function _searchToolsFuzzyMatch(query, registry, loadedNames) {
   const q = String(query || "").toLowerCase().trim();
   if (!q || !registry || typeof registry.entries !== "function") return [];
@@ -48276,7 +48289,7 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
             `主智能体尝试调用未注册工具：${attemptedName || "（无名称）"}。参数：${JSON.stringify(it.tc.parsedArgs || {}).slice(0, 1800)}`,
           );
           const alternatives = (recovery?.newlyLoaded?.length ? recovery.newlyLoaded : recovery?.available || []).slice(0, 4);
-          const r = { type: "unknown", path: "", content: `[ERROR] 未知工具: ${attemptedName || "(无名称)"}。${alternatives.length ? `语义编排已从真实注册表装载：${alternatives.join("、")}。请按实际 schema 重新调用。` : `没有通过词形、关键词或相似度猜测替代工具；请用 search_tools 描述当前所需能力，或按已注册工具名重试。`}` };
+          const r = { type: "unknown", path: "", content: `[ERROR] 未知工具: ${attemptedName || "(无名称)"}。${alternatives.length ? `语义编排已从真实注册表装载：${alternatives.join("、")}。请按实际 schema 重新调用。` : `没有通过词形、关键词或相似度猜测替代工具——注册表是起手包，不是能力边界。别再换名重试，按目标组合出来：${_CAPABILITY_ROUTES}`}` };
           it.rawResult = r;
           _settleToolStep(step, r, alternatives.length ? `未知工具 · 已动态装载 ${alternatives[0]}` : "未知工具");
           return r.content;
@@ -48348,12 +48361,12 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
           else if (exact?.schema && loaded.has(exact.name)) { content = `工具已加载：\n· ${compactToolGuide(exact.schema)}`; label = "已在手上"; }
           // 「没有这个工具」是能力缺口，不是查询写错了。以前这句到此为止，模型就把它当
           // 「IDE 不支持」回给用户——用户说的"很呆"正是这个。指路要跟着结论一起给。
-          else if (exact && !exact.schema) { content = `当前注册表没有名为 ${exact.name} 的工具——注册表是起手包，不是能力边界。别再换词搜，直接按目标组合出来：外部服务/API → web_search+web_fetch 读官方文档再用 http_request 打通；本地格式或批处理 → write_file 写脚本 + run_cmd 跑；工作区里的 .db/.sqlite → db_query 传 driver=sqlite、url=sqlite:///绝对路径；值得复用的流程 → 写成 <工作区>/.claude/skills/<名字>/SKILL.md，下一轮就在你的技能清单里。`; label = "注册表里没有"; }
+          else if (exact && !exact.schema) { content = `当前注册表没有名为 ${exact.name} 的工具——注册表是起手包，不是能力边界。别再换词搜，直接按目标组合出来：${_CAPABILITY_ROUTES}`; label = "注册表里没有"; }
           else if (adds.length) { content = `语义调度选出 ${adds.length} 个工具，但当前 128 tools / 512 KiB 窗口无法装入，未加载。请缩小当前阶段后重试。`; label = "窗口装不下"; }
           else if (semanticDecision?.instruction) { content = `语义调度未要求增加新 schema；当前工具已足够。${thoughtNote}\n下一步：${semanticDecision.instruction}`; label = "无需新增"; }
           else if (fuzzyHits.length && fuzzyHits.every((h) => h.alreadyLoaded)) { content = `相关工具均已加载，可直接调用：\n${fuzzyHits.slice(0, 8).map((h) => `· ${h.name}${_toolMetaGuideSuffix(h.name)}`).join("\n")}`; label = "已在手上"; }
           else if (mcpFailureNote) { content = `没有找到匹配的新工具；部分 MCP 服务在后台发现时失败。\n\n${mcpFailureNote}`; label = "MCP 连接失败"; }
-          else { content = "语义工具调度本次不可用，且模糊匹配无命中。这**不是检索失败，是内置工具里没有专用的**（⚠️ 如果本轮 MCP 服务发现还没完成，已连接服务提供的工具不在这次检索范围内——过几步再调一次 search_tools 确认）——注册表是起手包，不是能力边界。别再换词空搜，按目标改走组合路径：外部服务或 API → web_search/web_fetch 读官方文档，再用 http_request 打通；本地格式或批处理 → write_file 写个脚本 + run_cmd 跑（这是正路，不算绕过专用工具）；工作区里的 .db/.sqlite 文件 → db_query 传 driver=sqlite、url=sqlite:///绝对路径（路径本身就是连接串，不用问用户要）；值得复用的流程 → 写成 <工作区>/.claude/skills/<名字>/SKILL.md 存下来，下一轮它就在你的技能清单里。"; label = "无匹配"; }
+          else { content = "语义工具调度本次不可用，且模糊匹配无命中。这**不是检索失败，是内置工具里没有专用的**（⚠️ 如果本轮 MCP 服务发现还没完成，已连接服务提供的工具不在这次检索范围内——过几步再调一次 search_tools 确认）——注册表是起手包，不是能力边界。别再换词空搜，按目标改走组合路径：" + _CAPABILITY_ROUTES; label = "无匹配"; }
           const r = { type: "search_tools", path: "", content };
           it.rawResult = r;
           _settleToolStep(step, r, label);
@@ -54481,7 +54494,7 @@ async function _executeToolStepInner(step, call, root, run) {
           const retryNote = e?.retryInfo ? `（${e.retryInfo}）` : "";
           res.className = "atc-result atc-result--err";
           res.textContent = msg.slice(0, 80);
-          return { type: "web", path: call.path, content: `[ERROR] 网页抓取失败: ${msg}${retryNote}。检查 URL 是否正确、网络是否畅通；如果是内网地址请确认 VPN/代理已连接。` };
+          return { type: "web", path: call.path, content: `[ERROR] 网页抓取失败: ${msg}${retryNote}。检查 URL 是否正确、网络是否畅通；内网地址确认 VPN/代理已连接。抓不到更常见的原因是反爬、需要 JS 渲染或需要登录——别就此判定「拿不到」：换 http_request 自带 header 直取，或 browser 打开真实页面，纯文本也可以 run_cmd 跑 curl。` };
         }
       }
       const chars = text.length;
@@ -54502,7 +54515,7 @@ async function _executeToolStepInner(step, call, root, run) {
           const msg = String(e?.message || e).slice(0, 160);
           res.className = "atc-result atc-result--err";
           res.textContent = msg.slice(0, 80);
-          return { type: "websearch", path: call.path, content: `[ERROR] 联网搜索失败: ${msg}。检查搜索词是否合理、网络是否畅通；换个关键词试试。` };
+          return { type: "websearch", path: call.path, content: `[ERROR] 联网搜索失败: ${msg}。检查搜索词是否合理、网络是否畅通。通道不通时别只换关键词空转：已知站点直接 web_fetch/http_request 打官网，代码问题用 github_search/package_search/developer_community_search。` };
         }
       }
       const hits = (text.match(/^\s*\d+\.\s/gm) || []).length;
