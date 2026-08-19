@@ -23855,6 +23855,8 @@ test("每个注册 schema 的最小示例都能映射且不产生 _error", () =>
   const schemas = buildRegisteredToolSchemas();
   const names = new Set(schemas.map((schema) => schema.function.name));
   const mapCall = load("_mapToolCall", {
+    // save_skill 归一化时要拼技能落点；产品目录名在 main.js 里只有一份，取那一份。
+    _STATE_DIR: loadConst("_STATE_DIR"),
     _applyToolArgDefaults: undefined,
     _normalizeArgKeys: (args) => args,
     _STR_ARG_KEYS: new Set(),
@@ -28241,4 +28243,44 @@ test("无工作区的共用上下文：自己建目录，不要让用户去开�
   const text = SRC.slice(at, at + 500);
   assert.match(text, /create_project/, "主智能体该自己建目录");
   assert.match(text, /只读子任务/, "子体没有 create_project，得给它另一条出路，而不是让它去催用户");
+});
+
+// ---- 模型自己加的 MCP 服务，绝不能落成零审批 ----
+//
+// `_mcpServerApprovalMode` 的默认规则是：仓库自带的 → "ask"，用户作用域的 → "auto"（零审批
+// 直接执行）。那条 auto 是给「用户自己手写配置」定的。而 mcp_server 写的正是用户作用域的
+// 文件——如果不显式钉 ask，模型就顺着这条默认给自己开了一扇「注册任意命令行并零审批执行」
+// 的门。2026-08-18 那次安全修复刚从另一个方向堵掉同一类洞（非 git 目录的 .mcp.local.json）。
+test("模型加的 MCP 服务必须钉 approve:ask，且只碰用户自己的配置", () => {
+  const at = SRC.indexOf('} else if (call.type === "mcpconfig") {');
+  assert.ok(at > 0, "mcp_server 的执行分支找不到了");
+  const exec = SRC.slice(at, SRC.indexOf('} else if (call.type ===', at + 40));
+  const addBranch = exec.slice(exec.indexOf('if (_act === "add")'), exec.indexOf('if (_act === "remove")'));
+  assert.ok(addBranch.length > 100, "add 分支的形状变了，这条断言失去落点");
+  assert.match(addBranch, /entry\.__michael = \{ approve: "ask", addedBy: "agent" \};/,
+    "没钉 ask —— 用户作用域默认是 auto，模型就给自己开了一扇零审批执行任意命令行的门");
+  // 那条默认规则本身也别被改坏（钉 ask 的前提就是它）。
+  assert.match(SRC, /return _mcpServerIsRepoProvided\(scope\) \? "ask" : "auto";/,
+    "审批默认规则变了，上面那条钉 ask 的理由要重新评估");
+  // 落盘只走「自己的配置」这一条路：绝不用通用写文件去碰 .mcp.json / .mcp.local.json。
+  assert.match(exec, /_writeOwnMcpConfig\(_cfg\)/, "没走自己的配置写入函数");
+  assert.doesNotMatch(exec, /backend\.writeTextFile|save_user_config_at/,
+    "绕开 _writeOwnMcpConfig 直接写文件了 —— 那条函数带着 parseError 保护，绕过去会覆盖掉读不出来的内容");
+  // list 是只读的：这一段里不许出现任何写入调用。
+  const listBranch = exec.slice(exec.indexOf('if (_act === "list")'), exec.indexOf('if (!_nm)'));
+  assert.doesNotMatch(listBranch, /_writeOwnMcpConfig|_setMcpServerDisabled/, "list 里出现了写入");
+});
+
+// ---- 存技能没有工作区时，自己建，别把活推回给用户 ----
+test("save_skill 没有工作区时指向 create_project，而不是让用户去开文件夹", () => {
+  const at = SRC.indexOf('} else if (call.type === "saveskill") {');
+  assert.ok(at > 0, "save_skill 的执行分支找不到了");
+  const exec = SRC.slice(at, SRC.indexOf('} else if (call.type ===', at + 40));
+  assert.match(exec, /create_project/, "没告诉它自己建目录，这一步就会被推回给用户");
+  assert.doesNotMatch(stripJsComments(exec), /请用户|让用户打开|提示用户先打开/, "又把活推回给用户了");
+  // 落点必须用产品目录常量拼，不许再手写别人的目录名。
+  assert.match(exec, /\$\{_STATE_DIR\}\/skills\//, "技能落点没走产品目录常量");
+  // 写完要让下一轮真的重扫，否则「下一轮生效」这句话又是空的。
+  assert.match(exec, /_fileSkillsCacheKey = "";/,
+    "没清技能目录缓存 —— 这一轮写的技能要等换工作区才会被发现，而提示词承诺了下一轮生效");
 });

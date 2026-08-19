@@ -128,6 +128,18 @@ function seed() {
   // a lint hook on every auto-format was noise.
   defineTool("format", { ...FILE_CONTENT_OP, hooked: false });
   defineTool("mkdir", { ...FILE_OP, scopeField: "path" });
+  // 存技能会在工作区落一个 SKILL.md：算工作区改动、要审批、只读模式挡住、worker 按 path
+  // 收作用域。但它**不是结构化文件操作**（和 genimage 同类）——不进 fileMutation/fileEdit，
+  // 那两族的语义是"八件结构化文件工具"，掺进来会让 diff 复核和诊断链路跟着错位。
+  defineTool("saveskill", { ...GENERATOR, hooked: true, readOnlyModeBlocked: true, recoverableBlock: true, scopeField: "path" });
+  // 改 MCP 配置：不是工作区文件改动，但是**持久化配置** + 注册一条可执行命令行。
+  // list 是只读的，不该弹框；其余四个动作一律要用户点头。只读模式下一概不许改配置。
+  defineTool("mcpconfig", {
+    needsApproval: (call) => String(call?.action || "list").trim().toLowerCase() !== "list",
+    hooked: true,
+    readOnlyModeBlocked: (call) => String(call?.action || "list").trim().toLowerCase() !== "list",
+    recoverableBlock: true,
+  });
   defineTool("copy", { ...FILE_OP, scopeField: "path" });
   // delete/move are refused outright for workers rather than scope-checked (a parallel child
   // deleting or relocating files is a conflict source no scope can make safe), so they carry

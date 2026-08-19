@@ -1,7 +1,7 @@
 {
   "generatedFrom": "ide/src/main.js · _buildAgentToolSchemas",
   "generatedAt": null,
-  "count": 138,
+  "count": 140,
   "groups": [
     "Agents",
     "Code intelligence",
@@ -161,6 +161,16 @@
       "name": "read_skill",
       "group": "Knowledge",
       "desktopOnly": false
+    },
+    {
+      "name": "save_skill",
+      "group": "Knowledge",
+      "desktopOnly": false
+    },
+    {
+      "name": "mcp_server",
+      "group": "Knowledge",
+      "desktopOnly": true
     },
     {
       "name": "get_diagnostics",

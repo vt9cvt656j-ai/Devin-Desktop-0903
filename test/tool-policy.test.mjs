@@ -58,6 +58,8 @@ test("workspace-mutating set matches the pre-refactor literal exactly", () => {
     // 新增：git worktree。它在 <root>/.mrdayone/worktrees/ 下面建目录、建分支，remove
     // 还会连未提交的改动一起删。原来完全没登记，拿的是默认策略。
     "worktree",
+    // 新增：save_skill 在 <root>/.mrdayone/skills/<名字>/ 下落一个 SKILL.md。
+    "saveskill",
   ])));
   // The subtle one: a shell command may change the workspace but never REPORTS it, so it is
   // not in this set. Adding it would make `mutated === false` look like proof of a no-op.
@@ -93,6 +95,9 @@ test("approval set matches the pre-refactor literal exactly", () => {
     // capture_replay 能指定任意 method/url/body 直发，是 http 那道门的完整旁路；
     // system 能开 App、切前台窗口、触发任意 App 的菜单项。
     "browser", "docker_compose_up", "capture_replay", "system",
+      // 新增：save_skill 往工作区写文件；mcp_server 改**持久化配置**并注册一条可执行命令行
+    // （list 是只读的，按调用逐次判，见下面的细则断言）。
+    "saveskill", "mcpconfig",
   ])));
   // worktree 是**有意**不问的：它只在 <root>/.mrdayone/worktrees/ 下动，是 IDE 自己的
   // 目录，best-of-N 每建一个候选弹一次窗就没法用了。这条豁免要留着，也要看得见。
@@ -105,6 +110,8 @@ test("hooked set matches the pre-refactor literal exactly, including format's ab
     // docker_compose_up 借用 EXEC（needsApproval + hooked）：它和 cmd 一样是把一串命令
     // 交给 shell，钩子该看得到它。另三个不是 shell 执行，不进这个集合。
     "docker_compose_up",
+      // 新增：这两个都会改磁盘上的东西（技能文件 / 用户 MCP 配置），钩子该看得到。
+    "saveskill", "mcpconfig",
   ])));
   // `format` writes content but is intentionally NOT hooked. It is the single element that
   // makes this set differ from the file-mutation family, and it was easy to lose.
@@ -128,6 +135,8 @@ test("read-only-mode block matches the pre-refactor chain, plus the closed termt
     // 是观察，只读模式该放行；动会话、传文件、执行 JS、按提交才是副作用。另三个一刀切挡住：
     // 起容器、发任意 HTTP、开 App 切窗口，没有一种能叫"只读"。
     "browser", "docker_compose_up", "capture_replay", "system",
+      // 新增：只读模式里不许存技能、不许改 MCP 配置（mcp_server 的 list 仍放行，逐次判）。
+    "saveskill", "mcpconfig",
   ])));
   // 上一版这里断言的是 `false`，并写着「补掉的时候这一行要在同一个提交里翻成 true」——
   // 这就是那个提交。termtask 就是 run_in_terminal，命令串由模型给出、原样执行，和 cmd
@@ -164,6 +173,8 @@ test("worker scope targets match the pre-refactor list", () => {
   const scoped = sorted(new Set(Object.keys(allPolicies()).filter((t) => workerScopeField(t))));
   assert.deepEqual(scoped, sorted(new Set([
     "write", "edit", "multiedit", "mkdir", "copy", "format",
+    // 新增：save_skill 落的是文件，worker 的 scope 要照着 path 收。
+    "saveskill",
   ])));
   // delete/move are refused for workers outright rather than scope-checked.
   assert.equal(workerScopeField("delete"), "");
@@ -419,4 +430,19 @@ test("会改工作区的工具，开了审批就必须问——豁免只能是�
     "这些工具会往工作区写东西，但开了「改动前审批」也不问：" + gaps.join(", ")
     + "\n（worktree 是唯一有意的豁免：只动 IDE 自己的 .mrdayone/worktrees/，"
     + "best-of-N 每建一个候选弹一次窗就没法用了。）");
+});
+
+// mcp_server 是**逐次**判定：list 只是读自己的配置，弹框纯属摩擦；其余四个动作都在改
+// 持久化配置、而一条 MCP 配置就是一条会被执行的命令行，必须让用户点头。
+test("mcp_server：list 只读不弹框，改配置的四个动作一律要用户点头", () => {
+  assert.equal(needsApprovalFor("mcpconfig", { action: "list" }), false, "只看一眼配置也要弹框，用户会把审批直接关掉");
+  for (const action of ["add", "remove", "enable", "disable"]) {
+    assert.equal(needsApprovalFor("mcpconfig", { action }), true, `${action} 没要审批——它在改会被执行的配置`);
+  }
+  // 缺 action 时按最严处理：默认值是 list，但拼错/漏填不能顺势变成免审批。
+  assert.equal(needsApprovalFor("mcpconfig", { action: "LIST" }), false, "大小写要归一，否则用户看到无意义的弹框");
+  assert.equal(needsApprovalFor("mcpconfig", { action: "adD" }), true, "大小写混写就绕过了审批");
+  // 只读模式同理：看得，改不得。
+  assert.equal(blockedInReadOnlyMode("mcpconfig", { action: "list" }), false);
+  assert.equal(blockedInReadOnlyMode("mcpconfig", { action: "add" }), true);
 });

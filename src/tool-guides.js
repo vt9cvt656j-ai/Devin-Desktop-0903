@@ -18,6 +18,20 @@ const TOOL_METADATA = Object.freeze({
     priority: 'medium',
     usage_note: '【何时用】决策前记一条内部结论。【何时不用】不要拿它当回复用户的话。'
   },
+  save_skill: {
+    category: 'planning',
+    use_cases: ['刚摸清一套以后还会再用的流程，要留住不重来'],
+    triggers: ['查通了一个没文档的接口', '写出了某种格式的解析步骤', '定下了构建/部署的固定顺序'],
+    example_call: "save_skill(name='deploy-gateway', description='改完网关怎么发布', body='1. ...')",
+    priority: 'medium',
+  },
+  mcp_server: {
+    category: 'planning',
+    use_cases: ['要用的能力有现成 MCP 服务，而注册表里没有对应工具'],
+    triggers: ['需要接一个外部服务的官方 MCP', '要看/停用/删掉自己配过的 MCP 服务'],
+    example_call: "mcp_server(action='list', why='先看用户已经配了哪些')",
+    priority: 'medium',
+  },
   read_skill: {
     category: 'planning',
     use_cases: ['系统提示里列出的技能与当前任务对上了'],

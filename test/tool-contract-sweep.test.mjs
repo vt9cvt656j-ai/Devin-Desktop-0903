@@ -61,6 +61,9 @@ function buildCatalog() {
 function buildMapToolCall(catalog) {
   const prelude = [
     extractConst("_COMPUTER_METHODS"),
+    // save_skill 的归一化要拼出技能落点（<工作区>/<产品目录>/skills/…）。产品目录名在
+    // main.js 里只有一份（_STATE_DIR），沙箱按需注入它，别在测试里另写一个字面量。
+    extractConst("_STATE_DIR"),
     extractFn("_normalizeArgKeys"),
     extractFn("_applyToolArgDefaults"),
     extractFn("_canonicalToolName"),
