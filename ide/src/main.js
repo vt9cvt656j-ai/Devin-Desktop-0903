@@ -42031,8 +42031,32 @@ function _strayScratchFiles(run, testDir) {
 const _DELIVERY_FACTS_TAG = "[本轮交付事实]";
 function _deliveryFactsLine(run) {
   const { code, tests, ran, verifiers } = _deliveryFacts(run);
-  if (!code.length) return "";           // 没动代码就没什么可核对的
+  // 落空的写入尝试：**比"改了几个文件"更要紧的一条**。
+  //
+  // 用户实撞（2026-08-19）：模型答「已生成执行计划文档并保存到 .doc/implementation-plan.md」，
+  // 而磁盘上没有那个文件。`run._eagerLanded` 里逐条记着每一次写入尝试和它到底落没落盘——
+  // 纯执行记录，不需要去猜模型的措辞。它一次都没被说出来过，于是模型在写收尾那句话的时候，
+  // 手上没有任何与之矛盾的事实。把它说出来，模型自己就会改口。
+  //
+  // 只报**失败**的尝试：成功的那些本来就由下面的 mutated 计数覆盖，重复说只会占预算。
+  const _attempts = Array.isArray(run?._eagerLanded) ? run._eagerLanded : [];
+  const _failed = [...new Set(_attempts.filter((a) => a && a.ok === false).map((a) => String(a.path || "")).filter(Boolean))];
+  const _failedLine = _failed.length
+    ? `有 ${_failed.length} 次写入**没有落盘**（${_failed.slice(0, 4).join("、")}${_failed.length > 4 ? " 等" : ""}）——这些文件此刻不在磁盘上，不要说它们已保存/已生成`
+    : "";
+  if (!code.length) {
+    // 没动源码就没什么可核对的（纯问答、只读排查、只改文档的 run 完全不受打扰）——
+    // 但"尝试写入却没落盘"是必须说的事实，它和有没有动源码无关。
+    if (!_failedLine) return "";
+    const v0 = run?._wrapUpVerdict;
+    const bits = [_failedLine];
+    if (v0 && typeof v0.done === "boolean") {
+      bits.push(v0.done ? "收尾评审：通过" : `收尾评审：未通过${v0.instruction ? " — " + String(v0.instruction).slice(0, 120) : ""}`);
+    }
+    return bits.join(" · ");
+  }
   const parts = [`改了 ${code.length} 个源码文件`];
+  if (_failedLine) parts.push(_failedLine);
   if (verifiers.length) {
     const last = verifiers[verifiers.length - 1];
     parts.push(`验证 \`${String(last.command || "").slice(0, 60)}\` 退出 ${last.exitCode}`);
