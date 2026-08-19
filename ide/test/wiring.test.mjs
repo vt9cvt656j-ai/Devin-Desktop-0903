@@ -496,6 +496,23 @@ test("检测到启动错误就不能再算启动成功", () => {
     "content 要以方括号失败标记开头，_toolFailureMatch 才认得，计划才不会被打勾");
 });
 
+// 「我先这样改了，需要我跑一下测试验证吗？」——用一个问号收尾，就把"改了代码没验证"
+// 这个事实一笔勾销。而这恰恰是最像"已经做完了"的收尾形态。
+test("末尾问一句话不能抹掉「改了代码没验证」这个事实", () => {
+  const at = SRC.indexOf('run._incompleteReason ||= "code_delivered_unverified";');
+  assert.ok(at > 0, "记账点还在");
+  const block = SRC.slice(at - 400, at + 300);
+  assert.match(block, /if \(_codeNeedsVerification && !_currentCodeVerified\) \{/,
+    "记账判据只看执行事实，不该再被 awaitingUserReply 豁免");
+  assert.doesNotMatch(block, /!awaitingUserReply && _codeNeedsVerification/,
+    "问号收尾不许再豁免这条记账");
+  assert.doesNotMatch(block, /!awaitingUserReply && run\.engineering\?\.ui/,
+    "UI 验证缺失同理");
+  // 界面侧那条刻意的抑制要保留：举着一个没人答的问题时不该喊"继续执行计划"
+  assert.match(SRC, /if \(run\.outcome === "awaiting_user"\) return \[\];/,
+    "awaiting_user 仍然不出建议 chip——这是所有者的既有决定，不要顺手改掉");
+});
+
 // exit 0 不等于验证过：go/jest/pytest/cargo 空跑全是 exit 0。
 test("空跑的绿色不能盖验证章", () => {
   const stamp = SRC.indexOf("const _verificationExitRaw = result?.exitCode ?? result?.code;");

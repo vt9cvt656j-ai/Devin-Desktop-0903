@@ -49907,11 +49907,17 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
       // Non-UI work has no browser obligation.
       uiVerificationPassed = true;
     }
-    if (!awaitingUserReply && _codeNeedsVerification && !_currentCodeVerified) {
+    // 这两条是**记账**，不是拦截，所以不该被"模型末尾问了句话"豁免掉。
+    // 原来带着 !awaitingUserReply：模型只要用一个问号收尾（「我先这样改了，需要我跑一下
+    // 测试验证吗？」），改了代码没验证这个事实就一笔勾销——而这恰恰是最像"已经做完了"的
+    // 收尾形态。判据本身是执行事实（改没改代码、验没验过），和它怎么措辞无关。
+    // 界面上不加东西：awaiting_user 仍然不出建议 chip（举着问题时喊"继续执行计划"是错的，
+    // 那条判断保留），变的只是这一轮在 _lastRunState / 情景记忆里被如实记下来。
+    if (_codeNeedsVerification && !_currentCodeVerified) {
       verificationPassed = false;
       run._incompleteReason ||= "code_delivered_unverified";
     }
-    if (!awaitingUserReply && run.engineering?.ui && didMutate && !uiVerificationPassed) {
+    if (run.engineering?.ui && didMutate && !uiVerificationPassed) {
       run._incompleteReason ||= "ui_verification_missing";
     }
     _setStreaming(session, false);
