@@ -28518,3 +28518,43 @@ test("eager 落盘台账走权威失败判定，不是手写的三词正则", ()
     assert.ok(!/^\[(?:ERROR|BLOCKED|DENIED)\]/.test(text), `这条正好是旧正则漏掉的：${text}`);
   }
 });
+
+// ---- 写入落空必须进交付事实：模型收尾时手上要有与「已保存」矛盾的那条事实 ----
+test("写入没落盘要说出来，而纯问答/只改文档的 run 照旧不受打扰", () => {
+  const line = load("_deliveryFactsLine", {
+    _CODE_FILE_RE: loadConst("_CODE_FILE_RE"),
+    _looksLikeTestFile: load("_looksLikeTestFile"),
+    _deliveryFacts: load("_deliveryFacts", {
+      _CODE_FILE_RE: loadConst("_CODE_FILE_RE"),
+      _looksLikeTestFile: load("_looksLikeTestFile"),
+    }),
+    _strayScratchFiles: load("_strayScratchFiles"),
+    _projectStacks: new Map(),
+  });
+
+  // 纯问答：什么都没写、也没尝试过 → 一个字都不该塞给模型。
+  assert.equal(line({ _mutatedFiles: new Set(), _executionEvidence: [] }), "");
+  // 只改文档：本文件另一条用例钉着它返回空串，这里一并守住，别被这次改动带偏。
+  assert.equal(line({ _mutatedFiles: new Set(["README.md"]), _executionEvidence: [] }), "");
+
+  // 用户实撞的那个形状：尝试写一份 .md，没落盘，而且没动过任何源码。
+  const phantom = line({
+    _mutatedFiles: new Set(), _executionEvidence: [],
+    _eagerLanded: [{ path: ".doc/implementation-plan.md", ok: false }],
+  });
+  assert.match(phantom, /没有落盘/, "写入落空了却一个字不说——模型只能照着自己的印象说「已保存」");
+  assert.match(phantom, /implementation-plan\.md/, "要点名是哪个文件，否则模型不知道该改口说哪一句");
+  assert.match(phantom, /不要说它们已保存/, "要直说结论，别让模型自己去推");
+
+  // 成功落盘的不重复报（下面那行的 mutated 计数已经覆盖）。
+  const ok = line({ _mutatedFiles: new Set(), _executionEvidence: [], _eagerLanded: [{ path: "a.md", ok: true }] });
+  assert.equal(ok, "", "落盘成功的尝试不该再单独说一遍");
+
+  // 动过源码时，落空的写入要和源码计数并列出现，不能被挤掉。
+  const mixed = line({
+    _mutatedFiles: new Set(["src/a.ts"]), _executionEvidence: [],
+    _eagerLanded: [{ path: "src/b.ts", ok: false }],
+  });
+  assert.match(mixed, /改了 1 个源码文件/);
+  assert.match(mixed, /没有落盘/, "有源码改动时就把落空的写入吞掉了");
+});

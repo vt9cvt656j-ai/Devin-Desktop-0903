@@ -444,9 +444,13 @@ test("交付事实必须每轮喂给模型，不能只挂在 iter>=6 的草稿�
   assert.match(after, /messages\[i\]\.content\.includes\(_DELIVERY_FACTS_TAG\)[\s\S]{0,80}?messages\.splice\(i, 1\)/,
     "注入前要先摘掉上一条，别在上下文里堆积");
   // 自带闸门：没动代码就返回空串 → 纯问答/只读 run 不受打扰。这是"执行事实"而非"意图分类"。
-  const dfl = SRC.slice(SRC.indexOf("function _deliveryFactsLine(run) {"), SRC.indexOf("function _deliveryFactsLine(run) {") + 400);
-  assert.match(dfl, /if \(!code\.length\) return "";/,
-    "没动过源码就必须返回空串——否则纯问答的 run 会被塞一条无关事实");
+  const dfl = SRC.slice(SRC.indexOf("function _deliveryFactsLine(run) {"), SRC.indexOf("function _deliveryFactsLine(run) {") + 2000);
+  // 闸门还在，但多了一个**必须**的例外：写入尝试落空了要说。用户实撞过「它说已保存到
+  // .doc/xxx.md，而文件不在」——那次模型手上没有任何与之矛盾的事实，因为这一行整个是空的。
+  // 落空的写入是纯执行记录（run._eagerLanded 逐条记着），不是对措辞的猜测。
+  assert.match(dfl, /if \(!code\.length\) \{[\s\S]{0,400}?if \(!_failedLine\) return "";/,
+    "没动过源码、也没有落空的写入时，必须仍然返回空串——纯问答的 run 不该被塞无关事实");
+  assert.match(dfl, /run\?\._eagerLanded/, "落空的写入没有被说出来，模型收尾时手上就没有与之矛盾的事实");
   // 显示侧那条规矩不许被这次修复带回来
   // 它现在只剩定义、零调用点，正是 08-18 那次删除的结果。这一条守住"别挂回去"：
   // 排除 `function _appendDeliveryFactsBar(` 这处声明后，调用点必须仍然是 0。
