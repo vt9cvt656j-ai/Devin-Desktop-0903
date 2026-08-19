@@ -549,6 +549,52 @@ const THINKING_CLIP_COOLDOWN: Duration = Duration::from_secs(30 * 60);
 const THINKING_CLIP_SAFE_BUDGET: i64 = 6000;
 static THINKING_CLIP_ROUTES: LazyLock<Mutex<HashMap<uuid::Uuid, Instant>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// 「要了思考，一个字都没回」的线路。
+///
+/// 这件事**早就检测出来了**（见 thinking_requested_but_none_returned 那条 warn），但检测完
+/// 只做了两件事：打一条日志、不进缓存。选路完全不知道有这回事，于是下一次请求照样落到
+/// 同一条线路上，用户照样看不到「已思考」。实测：claude-opus-5 的三条同模型线路里，
+/// 排头那条（label "Claude"）稳定吞掉思考，而用户每次都先撞上它——他的原话是
+/// 「问问题他不会去思考」。
+///
+/// 有别的同模型线路可走时，把它排到后面。**不是拉黑**：到期自动再探一次，
+/// 上游哪天恢复了第一个成功返回思考的请求就把记号撤掉（见 clear_thinking_mute），
+/// 不需要任何人去后台改配置。
+static THINKING_MUTE_ROUTES: LazyLock<Mutex<HashMap<uuid::Uuid, Instant>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// 记号有效期。取 30 分钟，和思考钳位同一档：这是「这条线路的脾气」，
+/// 要跨越好几轮请求才看得出来，比一轮换线的冷却长得多。
+const THINKING_MUTE_MEMORY: Duration = Duration::from_secs(30 * 60);
+
+fn mark_thinking_mute(id: uuid::Uuid) {
+    if let Ok(mut guard) = THINKING_MUTE_ROUTES.lock() {
+        guard.insert(id, Instant::now() + THINKING_MUTE_MEMORY);
+    }
+}
+
+/// 这条线路回过思考了 —— 撤掉记号。这是自愈的全部机制：没有它，记号只会越积越多，
+/// 一条只是偶尔抽风的线路会被永久排到后面。
+fn clear_thinking_mute(id: uuid::Uuid) {
+    if let Ok(mut guard) = THINKING_MUTE_ROUTES.lock() {
+        guard.remove(&id);
+    }
+}
+
+fn route_mutes_thinking(id: uuid::Uuid, now: Instant) -> bool {
+    let Ok(mut guard) = THINKING_MUTE_ROUTES.lock() else {
+        return false;
+    };
+    match guard.get(&id).copied() {
+        Some(until) if until > now => true,
+        Some(_) => {
+            guard.remove(&id);
+            false
+        }
+        None => false,
+    }
+}
 /// The i18n pack cache is bounded because each entry holds a full ~630KB response
 /// body and the key is a hash of (locale, entries) — a caller who varies one
 /// character misses every time, so an unbounded map OOMs the gateway before the
@@ -6940,8 +6986,19 @@ pub async fn chat_completions(
         let route_deadline = now + route_budget;
         let mut ordered_candidates: Vec<&Model> = Vec::with_capacity(candidates.len());
         let mut cooled_candidates: Vec<&Model> = Vec::new();
+        // 这一轮到底要不要思考。只有要思考时，「会吞思考的线路」才算缺点——
+        // 不要思考的请求走那条线路一点问题都没有，凭空排后面只会白白打乱轮换。
+        let wants_thinking = body
+            .get("thinking")
+            .and_then(|t| t.get("type"))
+            .and_then(|t| t.as_str())
+            .is_some_and(|t| t != "disabled");
         for candidate in &candidates {
-            if route_count > 1 && route_cooldown_remaining(candidate.id, now).is_some() {
+            let cooled = route_cooldown_remaining(candidate.id, now).is_some();
+            // 要了思考却一个字都不回的线路：有别的同模型线路可走时排到后面。
+            // 和冷却一样只是**重排**，不是排除——到期自动再探，上游恢复了就自己回来。
+            let mutes = wants_thinking && route_mutes_thinking(candidate.id, now);
+            if route_count > 1 && (cooled || mutes) {
                 cooled_candidates.push(candidate);
             } else {
                 ordered_candidates.push(candidate);
@@ -7601,11 +7658,17 @@ pub async fn chat_completions(
                     .as_ref()
                     .is_some_and(|c| c.thinking_requested_but_none_returned());
             if thinking_went_missing {
+                // 记下来，让选路绕开它 —— 只打日志的话，下一次请求照样落到同一条线路上。
+                mark_thinking_mute(cid);
                 tracing::warn!(
                     model = %req_model,
                     route_id = %cid,
-                    "upstream returned no thinking despite an explicit thinking request; not caching this response"
+                    "upstream returned no thinking despite an explicit thinking request; not caching this response and de-prioritising this route for thinking requests"
                 );
+            } else if complete && thinking_clip_probe {
+                // 这一轮要了思考、也真的回了 —— 撤掉记号。上游恢复后第一个成功的请求就
+                // 让这条线路回到正常轮换，不需要任何人去后台动手。
+                clear_thinking_mute(cid);
             }
             if relay_dropped_blocks {
                 mark_thinking_clip(cid);
@@ -8665,6 +8728,66 @@ mod billing_tests {
             chat_upstream_attempt_suffix(2, 2, 502, false),
             "（已请求 2 次 / 2 条同模型线路；最后状态 502）"
         );
+    }
+
+    /// 「问问题他不会去思考」——同模型三条线路里有一条稳定吞掉思考，而用户每次都先撞上它。
+    ///
+    /// 这件事早就检测出来了（thinking_requested_but_none_returned），但只打日志、不影响选路，
+    /// 于是下一次请求照样落到同一条上。这条测的是记号的生命周期：记得下、会过期、能自愈。
+    #[test]
+    fn 吞掉思考的线路要被记下来_并且能自愈() {
+        use std::time::{Duration, Instant};
+        let route = uuid::Uuid::new_v4();
+        let now = Instant::now();
+        // 没记过 → 不影响任何东西
+        assert!(!super::route_mutes_thinking(route, now));
+
+        // 要了思考却一个字没回 → 记下
+        super::mark_thinking_mute(route);
+        assert!(super::route_mutes_thinking(route, Instant::now()));
+
+        // 记号有效期是「这条线路的脾气」那一档，得跨越好几轮请求
+        assert!(super::THINKING_MUTE_MEMORY >= Duration::from_secs(10 * 60));
+
+        // 上游恢复、真的回了思考 → 记号立刻撤掉。没有这一条，一条偶尔抽风的线路
+        // 会被永久排到后面，而且没有任何人工入口能把它放回来。
+        super::clear_thinking_mute(route);
+        assert!(!super::route_mutes_thinking(route, Instant::now()));
+
+        // 光有这几个函数不算数——它们得**真的被调用**。这个仓库里"写好了、零调用点、
+        // 而且不报错"是反复出现的失败模式，所以这三条钉的是调用点本身。
+        // 需要的串一律拼出来找：include_str! 读的是整个文件、包含本测试模块自己。
+        {
+            const SRC: &str = include_str!("models.rs");
+            let mark = format!("{}(cid);", "mark_thinking_mute");
+            let clear = format!("{}(cid);", "clear_thinking_mute");
+            let read = format!("{}(candidate.id, now)", "route_mutes_thinking");
+            assert!(
+                SRC.contains(&mark),
+                "检测到吞思考却不记号 —— 下一次请求照样落到同一条线路上，等于只打了条日志"
+            );
+            assert!(
+                SRC.contains(&clear),
+                "没有撤销记号的调用点 —— 上游恢复了也回不到轮换里，记号会永久生效"
+            );
+            assert!(
+                SRC.contains(&read),
+                "选路没有读这个记号 —— 记了也白记，用户照样撞上那条吞思考的线路"
+            );
+            // 只有要思考的请求才该受影响：不要思考的请求走那条线路毫无问题，
+            // 凭空排后面只会白白打乱轮换。
+            assert!(
+                SRC.contains("wants_thinking && "),
+                "记号必须只在这一轮真的要思考时才参与排序"
+            );
+        }
+
+        // 到期自己失效：即使没人撤，记号也不会永久生效（再探一次是自愈的另一半）
+        super::mark_thinking_mute(route);
+        assert!(!super::route_mutes_thinking(
+            route,
+            Instant::now() + super::THINKING_MUTE_MEMORY + Duration::from_secs(1)
+        ));
     }
 
     /// 被强力版开关压成一条线路时，报错要把出口说出来。
