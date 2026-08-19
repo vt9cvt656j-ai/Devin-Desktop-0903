@@ -163,11 +163,13 @@ test("技能：正文不被腰斩、描述不被提前砍死、allowed-tools 真
     "没有声明的技能也参与收窄了");
 
   // ④ 只扫自有目录。这一条以前是反的（断言"要扫到 Claude Code 的插件市场"）——
-  //    按用户要求，别的工具的目录一个都不扫了。
+  //    按用户要求，别的工具的目录一个都不扫了。2026-08-18 用户再次点名「全部用我自己
+  //    目录」：工作区那条从 .claude/skills 也一并改到自有产品目录，两处同名。
   const bases = SRC.slice(SRC.indexOf("function _skillDiscoveryBases"), SRC.indexOf("function _skillDiscoveryBases") + 700);
-  assert.match(bases, /\$\{root\}\/\.claude\/skills/, "工作区的 .claude/skills 是安装落点，必须扫");
-  assert.match(bases, /\/\.mrdayone\/skills/, "家目录那份自有技能库没扫");
-  for (const foreign of ["plugins", ".cursor", ".codex", ".agents"]) {
+  assert.match(bases, /\$\{root\}\/\$\{_STATE_DIR\}\/skills/, "工作区技能没扫，或又手写成了别人的目录名");
+  assert.match(bases, /\$\{_STATE_DIR\}\/skills/, "家目录那份自有技能库没扫");
+  // .claude 现在也在这张黑名单里：技能只落自己的目录。
+  for (const foreign of ["plugins", ".cursor", ".codex", ".agents", ".claude"]) {
     assert.ok(!bases.includes(foreign), `还在扫别的工具的目录：${foreign}`);
   }
 
@@ -187,7 +189,7 @@ test("技能正文进模型时剥掉 frontmatter，且开关的名字要说实�
   //    出现三遍，占的还是最贵的那块预算（常驻 10k、read_skill 24k）。
   const doc = parseSkill(
     ["---", "name: docx", "description: 处理 Word 文档", "allowed-tools: Read, Grep", "---", "", "# 正文", "第一步：先读模板。"].join("\n"),
-    "/w/.claude/skills/docx/SKILL.md",
+    "/w/.mrdayone/skills/docx/SKILL.md",
   );
   assert.equal(doc.name, "docx");
   assert.equal(doc.desc, "处理 Word 文档");
@@ -198,7 +200,7 @@ test("技能正文进模型时剥掉 frontmatter，且开关的名字要说实�
   }
   // 但整份文件只有 frontmatter 时不能剥成空串——那会让这个技能从清单里凭空消失，
   // 比多几行元数据糟得多。
-  const bare = parseSkill(["---", "name: 空的", "description: 没有正文", "---"].join("\n"), "/w/.claude/skills/bare/SKILL.md");
+  const bare = parseSkill(["---", "name: 空的", "description: 没有正文", "---"].join("\n"), "/w/.mrdayone/skills/bare/SKILL.md");
   assert.ok(bare.prompt.trim().length > 0, "剥成空串了，这个技能会从清单里消失");
 
   // ② 开关文案必须说实话。这几条打的是设置面板那一页（renderSkillsTool）——

@@ -7619,10 +7619,10 @@ test("standard SKILL.md frontmatter is parsed with a stable source identity", ()
   assert.equal(skill.baseDir, "/repo/.agents/skills/release");
   assert.equal(skill._readonly, true);
   assert.match(skill.prompt, /Run the full test suite/);
-  // 技能只从自有位置发现：工作区（含上级仓库）的 .claude/skills 和家目录的
-  // ~/.michael-ide/skills。.cursor / .codex / .agents 以及两个插件市场缓存都不再扫。
-  assert.match(SRC, /\$\{root\}\/\.claude\/skills/);
-  assert.match(SRC, /\/\.mrdayone\/skills/);
+  // 技能只从自有位置发现：工作区（含上级仓库）和家目录，两处都是自有产品目录
+  // `.mrdayone/skills`。.cursor / .codex / .agents / .claude 以及插件市场缓存都不扫。
+  assert.match(SRC, /\$\{root\}\/\$\{_STATE_DIR\}\/skills/);
+  assert.match(SRC, /const _STATE_DIR = "\.mrdayone";/);
 });
 
 test("workspace SKILL.md discovery reads a real skill directory", async () => {
@@ -7630,11 +7630,11 @@ test("workspace SKILL.md discovery reads a real skill directory", async () => {
   const backend = {
     homeDir: async () => "/home/tester",
     readTextFile: async (path) => {
-      if (path === "/repo/.claude/skills/release/SKILL.md") return "---\nname: Release\ndescription: Verify releases\n---\nRun tests.";
+      if (path === "/repo/.mrdayone/skills/release/SKILL.md") return "---\nname: Release\ndescription: Verify releases\n---\nRun tests.";
       throw new Error("missing");
     },
     readDir: async (path) => {
-      if (path === "/repo/.claude/skills") return [{ name: "release", path: "/repo/.claude/skills/release", is_dir: true }];
+      if (path === "/repo/.mrdayone/skills") return [{ name: "release", path: "/repo/.mrdayone/skills/release", is_dir: true }];
       return [];
     },
   };
@@ -7645,7 +7645,10 @@ test("workspace SKILL.md discovery reads a real skill directory", async () => {
     _fileSkillsCacheKey: "",
     _fileSkillsLoadedAt: 0,
     _parseSkillDocument: parse,
-    _skillDiscoveryBases: load("_skillDiscoveryBases", { _workspaceAncestorRoots: load("_workspaceAncestorRoots") }),
+    _skillDiscoveryBases: load("_skillDiscoveryBases", {
+      _workspaceAncestorRoots: load("_workspaceAncestorRoots"),
+      _STATE_DIR: loadConst("_STATE_DIR"),
+    }),
     _activeSkillIds: new Set(),
     _saveActiveSkills: () => {},
     _updateSkillBadge: () => {},
@@ -7653,19 +7656,23 @@ test("workspace SKILL.md discovery reads a real skill directory", async () => {
   const found = await refresh("/repo");
   assert.equal(found.length, 1);
   assert.equal(found[0].name, "Release");
-  assert.equal(found[0].sourcePath, "/repo/.claude/skills/release/SKILL.md");
+  assert.equal(found[0].sourcePath, "/repo/.mrdayone/skills/release/SKILL.md");
 });
 
 test("技能只从自有目录发现：上级仓库算，别的工具的目录一个都不算", () => {
   const ancestorRoots = load("_workspaceAncestorRoots");
-  const bases = load("_skillDiscoveryBases", { _workspaceAncestorRoots: ancestorRoots })("/repo/apps/ide", "/home/tester");
-  // 工作区自己和上级仓库的 .claude/skills —— 那是技能市场「安装」按钮的落点。
-  assert.ok(bases.includes("/repo/apps/ide/.claude/skills"), bases.join(" "));
-  assert.ok(bases.includes("/repo/.claude/skills"), "上级仓库的也要算，monorepo 里技能常放顶层");
+  const bases = load("_skillDiscoveryBases", {
+    _workspaceAncestorRoots: ancestorRoots,
+    _STATE_DIR: loadConst("_STATE_DIR"),  // 取源码里那一份，测试里不另写一个字面量
+  })("/repo/apps/ide", "/home/tester");
+  // 工作区自己和上级仓库的自有技能目录 —— 那是技能市场「安装」按钮的落点。
+  assert.ok(bases.includes("/repo/apps/ide/.mrdayone/skills"), bases.join(" "));
+  assert.ok(bases.includes("/repo/.mrdayone/skills"), "上级仓库的也要算，monorepo 里技能常放顶层");
   // 家目录那份技能库，和 ~/.michael-ide/mcp.json 同一个命名空间。
   assert.ok(bases.includes("/home/tester/.mrdayone/skills"), bases.join(" "));
   // 别的工具的目录一个都不扫——用户明确要求只加载自己的。
-  for (const foreign of [".cursor", ".codex", ".agents", "plugins"]) {
+  // .claude 也进黑名单：2026-08-18 用户点名「全部用我自己目录」。
+  for (const foreign of [".cursor", ".codex", ".agents", "plugins", ".claude"]) {
     assert.ok(!bases.some((b) => b.includes(foreign)), `还在扫 ${foreign}：${bases.join(" ")}`);
   }
   // 家目录不该再冒出一个 .claude/skills（那是 Claude Code 的共享库，不是这个 IDE 的）。
