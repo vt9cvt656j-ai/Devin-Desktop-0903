@@ -201,7 +201,12 @@ if [ "$TARGET" = "prod" ]; then
   # 换掉的是原来的 `up -d --build` —— 它**先毁后建**：在确认新镜像跑得起来之前就把正在
   # 服务的容器销毁了。线上两周 1,499 次 `connect() failed (111)` / `upstream prematurely
   # closed`，**每一次都落在部署时刻**，日常运行零次。而且新版起不来时没有回滚可言。
-  REMOTE_DEPLOY_CMD="cd $REMOTE_Q && COMPOSE_PROJECT='$COMPOSE_PROJECT' ENV_FILE='$ENV_FILE' COMPOSE_FILES='$COMPOSE_FILES' bash ./rollout.sh"
+  # 先装 nginx 配置、再切颜色。两件事的顺序是刻意的：
+  #   · 配置与颜色无关，先装完就不会和切换互相干扰；
+  #   · 配置校验不过时**容器一个都还没动**，这次部署干干净净地失败。
+  # 在这之前 /etc/nginx 下的那几份是手工拷过去的副本，deploy.sh 完全不碰 —— 于是
+  # 「改了仓库不生效」和「改了线上不留痕」两个方向的漂移都没人发现。
+  REMOTE_DEPLOY_CMD="cd $REMOTE_Q && bash ./install-nginx.sh && COMPOSE_PROJECT='$COMPOSE_PROJECT' ENV_FILE='$ENV_FILE' COMPOSE_FILES='$COMPOSE_FILES' bash ./rollout.sh"
 else
   # 测试环境保持就地替换：它前面没有 nginx（不对公网开放，靠 SSH 端口转发访问），
   # 没有可切换的 upstream，蓝绿在这里既无处可切也无人受益。
