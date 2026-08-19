@@ -24713,6 +24713,10 @@ function _renderSuggestionChips(sess, items, label) {
 // 验证命令非零退出，new_diagnostics_unresolved = 诊断真的多出来了）。所以"哪里没做完"
 // 不需要让模型重读对话去猜——猜最好也只是复述，最坏是编一个不同的。这张表把枚举翻译成
 // 人话；泛泛的「继续完成剩余部分」正是用户点名不要的那种废话。
+/// 这段收尾文字在**声称自己动手做了事**吗。
+///
+/// 只认强断言（"已修改/已创建/已部署/执行完毕"），不认建议式（"可以/建议/需要/接下来"），
+/// 也不认纯读取（"已读取/已查看"）——那些在纯问答里是正常的，误报会让模型被无端追问。
 const _INCOMPLETE_LABELS = {
   build_failing: "修复构建失败",
   code_delivered_unverified: "跑一遍验证刚才的改动",
@@ -24730,9 +24734,6 @@ const _INCOMPLETE_LABELS = {
   // 最后一个动作轮里有工具明确报了失败（部署/命令/mcp/http 退出非零、被拒、冲突……），
   // 模型却收了尾。给一句能照做的下一步，而不是把 last_action_failed 这个枚举名甩给用户。
   last_action_failed: "上一步有工具报错，先把它弄好",
-  // 收尾说做了改动，而这一轮一个文件都没改、一条命令都没成功跑过。提醒过一次仍未纠正，
-  // 如实记这一笔——它会进"接下来"的建议里，而不是糊在回答下面。
-  claimed_without_doing: "上一轮似乎没真正动手，确认一下再让它重做",
 };
 
 function _runStateNextActionSuggestions(sess, { maxAgeMs = 5 * 60_000 } = {}) {
@@ -26346,7 +26347,11 @@ async function sendPrompt(text, attachments = [], readyConfig = null, opts = {})
         timeline: _turnTimeline,
       });
       // 异步 agent：任务在后台跑完时，若 app 没聚焦 / 用户已切到别的会话 → 弹通知 + 闪标题来叫你。
-      try { if (!document.hasFocus() || (typeof _currentSession === "function" && _currentSession() !== sess)) void _notifyTaskDone(sess, text, true).catch(() => {}); } catch (_e) {}
+      // 结局是算出来的，别写死。这里原来是字面量 true —— 系统通知和闪烁标题一律显示
+      // 「✅ 任务完成」，哪怕这一轮 partial/failed/还在等你回话。用户切走干别的、被通知
+      // 叫回来，看到的第一句话就是 harness 自己说的"任务完成"，比模型那句更权威。
+      // _runAgenticLoop 收尾时已经把真实结局写进 session._lastRunState.outcome（见那里）。
+      try { if (!document.hasFocus() || (typeof _currentSession === "function" && _currentSession() !== sess)) void _notifyTaskDone(sess, text, sess?._lastRunState?.outcome || "success").catch(() => {}); } catch (_e) {}
       const postRunMessages = Array.isArray(sess.memory) && sess.memory.length ? sess.memory : messages;
       _maybeRenderChoices(sess, postRunMessages); // if the answer offered A/B/C… options → clickable chips
       _maybeSuggestNext(sess, postRunMessages, config); // Codex-style: offer 2-4 clickable next steps from the completed run
@@ -40873,6 +40878,44 @@ function _normalizedVerifierCommand(command) {
 // deterministic IDE-known checker or an exact command declared by the inspected project.
 // This keeps echo ok / arbitrary scripts from minting a green build while still allowing
 // custom project check commands that came from package scripts or stack inspection.
+// 退出码 0 但一个用例都没跑 —— 「已验证」里最常见的那种空头支票。
+//
+// `go test ./...` 在没有测试文件的包里全部 [no test files]、`jest --passWithNoTests`、
+// pytest 收集到 0 个、`cargo test` 跑 0 个，统统 exit 0，而验证盖章此前只看退出码，
+// 于是这些一个断言都没执行的命令照样盖上 verification 章，收尾门据此认为"已验证"。
+//
+// 判据是命令自己的输出，不是模型的措辞——和整套设计一致：执行事实说了算。
+// 保守方向：只有在「出现了空跑信号」且「没有任何一处跑出正数用例」时才判空跑。
+// 多包/多 crate 工作区里某个包 0 个用例是常态，那不叫空跑。
+function _verifierRanNoTests(output) {
+  const t = String(output || "");
+  if (!t.trim()) return false; // 没有输出就没有证据，不改变原判
+  const ZERO = [
+    /\[no test files\]/i,                    // go
+    /no tests? (?:ran|found|were found)/i,    // pytest / jest / vitest
+    /No test files found/i,                   // vitest
+    /No test is available/i,                  // dotnet
+    /collected 0 items/i,                     // pytest
+    /Tests:\s+0 total/i,                      // jest 汇总行
+    /running 0 tests/i,                       // cargo
+    /\b0 (?:passing|passed|examples?|tests?)\b/i, // mocha / rspec / 通用
+    /(?:^|\s)(?:#|ℹ)?\s*tests 0(?:\s|$)/im,   // node --test
+  ];
+  if (!ZERO.some((re) => re.test(t))) return false;
+  const POSITIVE = [
+    /\b[1-9]\d* (?:passing|passed|examples?)\b/i,
+    /running [1-9]\d* tests?/i,
+    /collected [1-9]\d* items/i,
+    /Tests:\s+(?:\d+ failed, )?[1-9]\d* passed/i,
+    /(?:^|\s)(?:#|ℹ)?\s*(?:tests|pass) [1-9]\d*(?:\s|$)/im,
+    /ok \d+ - /i,                             // TAP：真的跑了用例
+    // go：`go test ./...` 常见形态是「有测试的包 ok+耗时」和「没测试的包 [no test files]」
+    // 混排。只看到后者就判空跑会误伤——前者证明确实跑过用例。
+    /^ok\s+\S+\s+(?:[\d.]+m?s|\(cached\))/im,
+    /--- (?:PASS|FAIL):/,
+  ];
+  return !POSITIVE.some((re) => re.test(t));
+}
 function _isRecognizedVerifierCommand(command, stack = null) {
   const normalized = _normalizedVerifierCommand(command);
   if (!normalized) return false;
@@ -41767,6 +41810,8 @@ function _strayScratchFiles(run, testDir) {
   });
 }
 
+// 交付事实注入消息的标签：每轮替换上一条，避免在长 run 里越堆越多。
+const _DELIVERY_FACTS_TAG = "[本轮交付事实]";
 function _deliveryFactsLine(run) {
   const { code, tests, ran, verifiers } = _deliveryFacts(run);
   if (!code.length) return "";           // 没动代码就没什么可核对的
@@ -42689,6 +42734,34 @@ async function _agentModelTurn({ config, messages, toolSchemas, toolRegistry = n
   if (!toolCalls.length && !err) {
     const fromText = _parseTextToolCalls(acc, toolRegistry || toolSchemas, null, null, finalArgDefaultContext);
     if (fromText.length) { toolCalls = fromText; acc = _stripParsedToolCalls(acc); }
+  }
+  // 「模型明明调了工具，IDE 一个都没执行，却谁也没出声」。
+  //
+  // 装配阶段会对每条调用做一次独立复核，不过关的 `return null` 掉——拒绝执行是对的
+  // （带残缺参数落盘比不落盘更糟），错的是**不出声**：重试循环判定没问题（没有
+  // fatalToolArgIssue），装配把调用全吃了，结果 toolCalls 空、err 空。上层 agent 循环
+  // 读「这一轮没有工具调用」只有一种解释——模型自己决定收尾——于是模型那句"已经改好了"
+  // 原样端给用户，而那次写盘/那条命令根本没发生。这就是"任务没有执行、Agent 说执行完毕"
+  // 的机器成因：两个校验器不一致，差额被当成了模型的收尾意图。
+  //
+  // 判据是事实对照、不是猜：流里有带 name 的调用（模型声明了动作）× 存活 0 条 × 无错误。
+  // 三者同时成立才叫矛盾；纯文字回答（byIndex 空）照常安静收尾，不受影响。
+  // 并回既有的 [tool-args-invalid] 修复机器：能补参数就补一次，补不了就推那条明写着
+  // "不要收尾，不要声称已完成"的提醒——绝不让它退化成一次安静收尾。
+  if (!toolCalls.length && !err) {
+    const _declared = [...byIndex.values()].filter((e) => e?.name);
+    if (_declared.length) {
+      fatalRejectedToolAttempts = _declared.map((entry) => ({
+        name: entry.name,
+        argsRaw: entry.args || "",
+        parsedArgs: _safeJsonLoose(entry.args || "") || {},
+        issue: _toolArgIssue(entry.name, (entry.args && entry.args.trim()) ? entry.args.trim() : "{}",
+          toolRegistry || toolSchemas, finalArgDefaultContext) || "参数复核未通过，IDE 拒绝执行",
+      }));
+      fatalToolArgIssue = fatalRejectedToolAttempts[0].issue;
+      err = `[tool-args-invalid] ${fatalToolArgIssue}；IDE 已拒绝执行这次工具调用，未写盘。`;
+      if (renderRejectedToolAttempts) _renderRejectedToolAttempts(body, fatalRejectedToolAttempts, fatalToolArgIssue);
+    }
   }
   const _hasNonControlToolCall = _suppressNarrativeForTools
     || toolCalls.some((call) => !_agentToolCallIsNarrativeControl(call?.name))
@@ -47408,9 +47481,11 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
     }
     const executionBlock = _executionEvidenceReviewBlock(run._executionEvidence);
     if (executionBlock) parts.push(executionBlock);
-    // 同一行事实也给模型看一遍。用户那一侧已经能看见它（答案下面那条），模型这边不给的话，
-    // 它下一轮照样"改完就说能用"——而这行是纯事实，不是劝告：改了几个源码文件、跑没跑过
-    // 验证、有没有动测试文件，全部来自这一轮的真实执行记录。
+    // 同一行事实也给模型看一遍。这行是纯事实、不是劝告：改了几个源码文件、跑没跑过验证、
+    // 有没有动测试文件，全部来自这一轮的真实执行记录。
+    // 注意：用户侧那条横幅已于 2026-08-18 删除（harness 不在回答下面写字），所以这里
+    // **不是**"用户已经看到了、再给模型看一遍"。模型侧的主入口现在是每轮独立注入的
+    // _DELIVERY_FACTS_TAG 那块；草稿纸带上这一行只是为了让被折叠的长 run 也保有它。
     const facts = _deliveryFactsLine(run);
     if (facts) parts.push(`本轮交付事实（执行记录，非推断）: ${facts}`);
     return parts.join("\n");
@@ -47456,13 +47531,15 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
       // 多个完成的合并成一条 nudge；单条注入总量 ~3K 字，每作业复用 #43 的
       // _clipPreservingErrors 1200 字+错误行豁免出口。cancelled 作业在取消传播处已标 consumed。
       if (run._subAgentJobs instanceof Map) {
-        const _settledJobs = [...run._subAgentJobs.values()].filter((j) => !j.consumed && (j.status === "done" || j.status === "failed" || j.status === "timeout"));
+        const _settledJobs = [...run._subAgentJobs.values()].filter((j) => !j.consumed && (j.status === "done" || j.status === "failed" || j.status === "timeout" || j.status === "truncated"));
         if (_settledJobs.length) {
           const _jobBudget = Math.max(300, Math.floor(3000 / _settledJobs.length));
           const _jobParts = [];
           for (const j of _settledJobs) {
             j.consumed = true;
-            const _jobTag = j.status === "done" ? "完成" : (j.status === "timeout" ? "超时(部分结果)" : "失败");
+            const _jobTag = j.status === "done" ? "完成"
+              : (j.status === "timeout" ? "超时(部分结果)"
+              : (j.status === "truncated" ? "未完成·轮次用尽(中间状态，不是结论)" : "失败"));
             _jobParts.push(`[子智能体 job#${j.id} ${_jobTag}·${j.desc}] ${_clipPreservingErrors(String(j.result || "（无产出）").replace(/\s+/g, " "), Math.min(1200, _jobBudget))}`);
           }
           _pushNudge("subagentResult", _jobParts.join("\n").slice(0, 3200));
@@ -48516,8 +48593,17 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
             && _toolExecutionSucceeded(call, result)
             && _verificationExitRaw != null
             && Number(_verificationExitRaw) === 0) {
-          call.verification = true;
-          if (result && typeof result === "object") result.verification = true;
+          // 退出码 0 还不够：一个用例都没跑的绿色不是验证（见 _verifierRanNoTests）。
+          const _vOut = `${result?.stdout || ""}\n${result?.stderr || ""}\n${result?.content || ""}`;
+          if (_verifierRanNoTests(_vOut)) {
+            // 不盖章，并且**明确告诉模型**——否则它只看到 exit 0，照样写"测试通过"。
+            if (result && typeof result === "object") {
+              result.content = `${String(result.content || "")}\n\n[未构成验证] 这条命令退出码是 0，但输出显示一个测试用例都没有真正执行（空跑）。它不能作为"已验证"的依据：要么测试没被发现（路径/匹配模式不对），要么这个目标下根本没有测试。先让它真的跑起来，再说验证通过。`;
+            }
+          } else {
+            call.verification = true;
+            if (result && typeof result === "object") result.verification = true;
+          }
         }
         it.rawResult = result; // keep the raw result so the loop can pick up e.g. screenshot images
         // 工作区改动事实 tick：任何成功的改动类工具（含改文件命令）都 +1，供失败命令
@@ -48705,6 +48791,10 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
               // 把一份完整报告标成「超时(部分结果)」，主体据此重派一遍，再烧一份子体的钱。
               else if (/^\[TIMEOUT\]/.test(job.result)) job.status = "timeout";
               else if (/^\[ERROR\]/.test(job.result)) job.status = "failed";
+              // 子体的第三种出口：工具预算跑满被截断，简报里写着「截止当时的中间状态，不是结论」。
+              // 这两条正则都不匹配它，于是它一路落到 done，主体收到的标签是「完成」——
+              // 标签和正文互相打架，而标签在前更醒目，主体就拿一份半成品当结论往下写。
+              else if (/^\[轮次用尽·未完成\]/.test(job.result)) job.status = "truncated";
               else job.status = "done";
               try {
                 _globalSharedStore.updateJobStatus(`sm_${storeId}`, job.status === "done" ? "completed" : job.status, 100);
@@ -48818,6 +48908,7 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
             // 把一份完整报告标成「超时(部分结果)」，主体据此重派一遍，再烧一份子体的钱。
             else if (/^\[TIMEOUT\]/.test(job.result)) job.status = "timeout";
             else if (/^\[ERROR\]/.test(job.result)) job.status = "failed";
+            else if (/^\[轮次用尽·未完成\]/.test(job.result)) job.status = "truncated";  // 同上：半成品不算完成
             else job.status = "done";
             return job.result;
           }).catch((error) => {
@@ -48984,6 +49075,22 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
         break;
       }
 
+      // 每个 tool_call 都必须有结果回去——它既是协议单元，也是模型判断「我到底做没做」的
+      // 唯一依据。toolMsgs 是稀疏数组，调度器在某一项抛异常、或段中途 isLive() 转假时会留下
+      // 空洞，而下面这行 for...of 把空洞当 undefined 原样推进消息流。两种后果都很糟：严格
+      // 网关判转录不合法；或者模型看到自己调了工具、却没有任何结果反驳它，于是默认成功、
+      // 写下「已改好」——而那次调用根本没跑。这是「任务没有执行、Agent 说执行完毕」的
+      // 另一条机器成因，且比参数被吃掉更隐蔽：这里连一条错误都没有。
+      //
+      // 补成一条如实的「未执行」，并标记 _notAttempted——下面的失败归因与恢复分析本来就
+      // 按这个字段排除它们（三处读，此前全代码没有一处写），免得把「没跑」误算成「跑失败了」。
+      for (let j = 0; j < items.length; j++) {
+        if (toolMsgs[j]) continue;
+        items[j]._notAttempted = true;
+        toolMsgs[j] = { role: "tool", tool_call_id: items[j].tc.id,
+          content: "[未执行] 这次调用没有被执行，没有产生任何结果，也没有改动任何东西。不要把它当成已完成——仍然需要的话，重新发起这次调用。" };
+        _settleToolStep(items[j].step, { content: "[未执行]" }, "未执行");
+      }
       for (const m of toolMsgs) messages.push(m);
       if (turn._invalidToolRepairInstruction && _live()) {
         _pushNudge("toolRepair", turn._invalidToolRepairInstruction + "\n现在基于上方真实工具结果继续执行，不要再重复同一个残缺工具调用。");
@@ -49191,12 +49298,38 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
       // 折叠发生的那一轮必须补一张草稿纸，不管 iter 是几：折叠可以在第 3 轮就开始，
       // 而这里第一次注入要等到第 6 轮——中间几轮是「历史已经被折叠、草稿纸还没出生」。
       // 36827 那个写完就没人读的 _compactedThisTurn 正是为此存在。
+      let _padInjectedThisTurn = false;
       if ((iter >= 6 && (iter % 3 === 0 || iter >= 20)) || run._compactedThisTurn) {
         for (let i = messages.length - 1; i >= 0; i--) {
           if (messages[i].role === "user" && typeof messages[i].content === "string" && messages[i].content.startsWith("[运行进度草稿纸")) { messages.splice(i, 1); break; }
         }
         const padTxt = _padText();
-        if (padTxt) messages.push({ role: "user", content: _ORCH_NOTE + padTxt });
+        if (padTxt) { messages.push({ role: "user", content: _ORCH_NOTE + padTxt }); _padInjectedThisTurn = true; }
+      }
+
+      // 交付事实每轮都要进模型上下文——这是「改完别谎报能用」唯一的事实来源。
+      //
+      // 2026-08-18 用户点名删掉了答案下面那条「改了 N 个文件·没验证·没测试」横幅。删得对，
+      // 那是 harness 糊在模型回答下面的字，那条规矩不动。但删除时留的注释写着「只删显示，
+      // 同一条交付事实照样喂给模型」——这后半句当时就不成立：喂给模型的唯一入口是上面那块
+      // 草稿纸，而它要 iter >= 6 才注入。改两三个文件、跑三五轮就收尾的 run（也就是最常见的
+      // 那种）iter 永远到不了 6。于是那一次删除同时关掉了两个出口：用户看不到，模型也看不到，
+      // 模型下一轮照旧「改完就说能用」。这是「任务没有执行/没验证，Agent 说执行完毕」里
+      // 最贴合时间线的一条成因。
+      //
+      // 这里把它从草稿纸里拆出来单独注入，不受 iter 门槛约束。显示侧一个字都不加。
+      // 自带闸门：_deliveryFactsLine 在「本轮没动过源码文件」时返回空串，所以纯问答、
+      // 只读排查的 run 完全不受打扰——判据是执行记录，不是对模型措辞的猜测。
+      // 它同时是 _wrapUpCritic 那次付费评审结论（run._wrapUpVerdict）唯一的出口。
+      {
+        for (let i = messages.length - 1; i >= 0; i--) {
+          if (messages[i].role === "user" && typeof messages[i].content === "string" && messages[i].content.includes(_DELIVERY_FACTS_TAG)) { messages.splice(i, 1); break; }
+        }
+        const _facts = run.mode === "agent" && !_padInjectedThisTurn ? _deliveryFactsLine(run) : "";
+        if (_facts) {
+          messages.push({ role: "user", content: `${_ORCH_NOTE}${_DELIVERY_FACTS_TAG}（本轮真实执行记录，不是推断）: ${_facts}\n`
+            + "照着事实说话：没跑过验证就别说「已验证」「能用了」「跑通了」；该验证就现在去验证，别把没做的事写成做完了。" });
+        }
       }
 
       // Tool-RAG (B) — anti-forgetting refresh: on a long run, re-surface the full
@@ -49927,8 +50060,14 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
       // 撤销条，2026-08-18 用户点名删掉——它俩是糊在回答下面的 harness footer / 文件清单，
       // 正是「不要在模型回答下面写 harness 文字」那条老规矩。
       //
-      // 只删**显示**：同一条交付事实照样喂给模型（见 _deliveryFactsLine 的另一处调用，
-      // 拼进「本轮交付事实」那段），所以"改完别谎报能用"的机制一点没动，只是不再占屏。
+      // 只删**显示**：同一条交付事实照样喂给模型，"改完别谎报能用"的机制不受影响。
+      //
+      // 【2026-08-19 更正】上面这句当时写错了，而且错了一整天。删除时喂给模型的唯一入口是
+      // 运行进度草稿纸，那块要 iter >= 6 才注入；改两三个文件、跑三五轮就收尾的 run 根本到
+      // 不了。于是那次删除实际关掉了两个出口——用户看不到，模型也看不到——模型下一轮照旧
+      // "改完就说能用"，这正是用户 08-18/19 反复撞见的「没执行/没验证却说执行完毕」。
+      // 现已把交付事实拆成独立注入（搜 _DELIVERY_FACTS_TAG），每轮无条件喂给模型，
+      // 不再依赖草稿纸的 iter 门槛。显示侧仍然一个字都不加。
       // 撤销能力也没删——checkpoint 还在，需要时可另开入口，只是不再默认挂一条 UI。
     } catch {}
     finally {
@@ -51127,7 +51266,7 @@ function _settleToolStep(step, result, label = "") {
     return false;
   }
   const content = String(result?.content || "");
-  const failed = /\[(?:ERROR|BLOCKED|DENIED|失败|不可用|interrupted)\]|失败|缺参数|未知工具|已停止/i.test(content);
+  const failed = /\[(?:ERROR|BLOCKED|DENIED|失败|不可用|interrupted|未执行)\]|失败|缺参数|未知工具|已停止/i.test(content);
   res.className = `atc-result ${failed ? "atc-result--err" : "atc-result--ok"}`;
   res.textContent = label || (failed ? "失败" : "完成");
   if (failed) step?.classList?.add?.("agent-tool-step--rejected");
@@ -55479,7 +55618,11 @@ async function _executeToolStepInner(step, call, root, run) {
         return {
           type: "termtask", path: label, command: cmd, cwd: r.entry.cwd || root || "",
           running: true, completed: false, stdout: _cur, stderr: "",
-          content: `该命令已经在 IDE 终端 tab「${label}」里运行中——**已复用现有终端，没有重复开新终端**。要看它当前输出用 read_terminal；确需重跑先 stop_terminal 停掉再启动。\n$ ${cmd}\n\n当前输出:\n${_cur || "(暂无输出)"}`,
+          // 这条分支**没有向 PTY 写入任何东西**——它只是发现同名命令的 tab 还开着就返回了。
+          // 首次启动那条带着「PTY 存活 ≠ 你的命令还在跑」的免责声明，而真正什么都没做的
+          // 恰恰是这一条，它却一句都没有：模型据此判定服务在跑、计划那一步被打勾，
+          // 而 dev server 可能三分钟前就因端口占用崩了（shell 还活着，exited 永远 false）。
+          content: `本次调用**没有执行任何命令**：检测到同一条命令的终端 tab「${label}」还开着，于是直接复用，没有重开、也没有重跑。\n$ ${cmd}\n\n**注意：tab 开着只表示 PTY 存活，不等于这条命令本身还在跑**——命令自己退出了（编译失败、端口被占、进程崩溃）shell 仍然活着，这里照样显示"运行中"。要确认它真的在服务，读一次 read_terminal 看输出，或直接访问它应该提供的地址；确需重跑先 stop_terminal 停掉再启动。\n\n该 tab 当前输出:\n${_cur || "(暂无输出)"}`,
         };
       }
       await new Promise((res2) => setTimeout(res2, 3500)); // let it print startup output
@@ -55490,6 +55633,10 @@ async function _executeToolStepInner(step, call, root, run) {
       // （约 12 秒）；会话停止/换轮立即退场（同 background_monitor 的代际快照判据）。
       // 只是附加信息，background_monitor 的现有行为完全不受影响。
       let _readyNote = "";
+      // 检测到 EADDRINUSE / cannot find module / fatal 这类启动错误时，原来只在结果末尾
+      // 追加一句 ⚠️ 提示，整条 content 里没有任何方括号失败标记 → _toolFailureMatch 不命中
+      // → _toolExecutionSucceeded 判成功 → 计划那一步被打勾。检测到了，却没改变成功语义。
+      let _startupFailed = false;
       if (!exited && _looksLikeServiceCommand(cmd)) {
         const _rdSess = run?.session || null;
         const _rdGen = _rdSess?._runGen || 0;
@@ -55505,7 +55652,7 @@ async function _executeToolStepInner(step, call, root, run) {
         // 轮询期间可能又打印了新输出/退出了，用最新状态组装结果。
         out = (r.entry.recentOut || "").trim().slice(-3000);
         exited = !!r.entry.exited;
-        if (_rdHit.failed) _readyNote = `\n\n⚠️ 检测到启动错误 (匹配: ${_rdHit.pattern})，请查看终端日志`;
+        if (_rdHit.failed) { _startupFailed = true; _readyNote = `\n\n⚠️ 检测到启动错误 (匹配: ${_rdHit.pattern})，请查看终端日志`; }
         else if (_rdHit.ready) _readyNote = `\n\n✅ 检测到服务已就绪 (匹配: ${_rdHit.pattern})`;
         else if (_rdLive() && !exited) _readyNote = "\n\nℹ️ 12 秒内未检测到明确的 ready 信号，服务可能仍在启动，可用 read_terminal 查看";
       }
@@ -55533,7 +55680,7 @@ async function _executeToolStepInner(step, call, root, run) {
         stderr: "",
         content: (r.reused ? "（已复用现有终端 tab 原地重跑，未新开）\n" : "") + (exited
         ? `[ERROR] 命令在 IDE 终端「${label}」启动后很快退出，未形成持续运行任务。一次性命令应改用 run_cmd 取得真实退出码；持续服务请根据下面输出修复后重启：\n$ ${cmd}\n输出:\n${out || "(无)"}${_readyNote}`
-        : `已在 IDE 终端 tab「${label}」启动持续任务并保持运行：\n$ ${cmd}\n\n启动后输出（前几秒）:\n${out || "(暂无输出)"}\n\n该任务在 IDE 终端里持续运行、用户可见可手动停止。**注意：running 只表示这个终端标签页还开着（PTY 存活），不等于你这条命令本身还在跑**——命令自己退出了（编译失败、端口被占、进程崩溃），shell 仍然活着，这里照样显示运行中。要确认它真的在服务，读一次 read_terminal 看输出，或直接访问它应该提供的地址。${devServerUrl ? `本 run 检测到的 dev server：${devServerUrl}` : "尚未从该终端识别出本地 URL；用 read_logs/read_terminal 读取后续日志。"}${_readyNote}`),
+        : `${_startupFailed ? "[启动失败] 输出里检测到明确的启动错误（见下方 ⚠️），这条服务没有正常起来——先按输出修，别当成已启动。\n" : ""}已在 IDE 终端 tab「${label}」启动持续任务并保持运行：\n$ ${cmd}\n\n启动后输出（前几秒）:\n${out || "(暂无输出)"}\n\n该任务在 IDE 终端里持续运行、用户可见可手动停止。**注意：running 只表示这个终端标签页还开着（PTY 存活），不等于你这条命令本身还在跑**——命令自己退出了（编译失败、端口被占、进程崩溃），shell 仍然活着，这里照样显示运行中。要确认它真的在服务，读一次 read_terminal 看输出，或直接访问它应该提供的地址。${devServerUrl ? `本 run 检测到的 dev server：${devServerUrl}` : "尚未从该终端识别出本地 URL；用 read_logs/read_terminal 读取后续日志。"}${_readyNote}`),
       };
 
     } else if (call.type === "termread") {
@@ -56847,7 +56994,7 @@ return { type: call.type, path: call.query || "", content: `[失败] ${call.type
       for (const j of _targets) {
         if (j.status === "running") { _parts.push(`[job#${j.id}·${j.desc}] ⏱ 等待超时仍未落定（内部 5min 超时会自行终止，稍后结果自动送达）`); continue; }
         j.consumed = true;
-        const _tag = j.status === "done" ? "完成" : (j.status === "timeout" ? "超时 (部分结果)" : (j.status === "cancelled" ? "已取消" : "失败"));
+        const _tag = j.status === "done" ? "完成" : (j.status === "timeout" ? "超时 (部分结果)" : (j.status === "truncated" ? "未完成 (轮次用尽)" : (j.status === "cancelled" ? "已取消" : "失败")));
         _parts.push(`[job#${j.id} ${_tag}·${j.desc}] ${_clipPreservingErrors(String(j.result || "（无产出）").replace(/\s+/g, " "), Math.min(1200, _budget))}`);
       }
       res.className = "atc-result atc-result--ok"; res.textContent = t("subagent.jobsSettled", { count: _targets.length });
@@ -58934,11 +59081,21 @@ function _flashTitle(prefix) {
  *
  * 应用内卡片只留一条退路：在浏览器里跑（没有 Tauri）时用它，否则连个提示都没有。
  */
-async function _notifyTaskDone(sess, taskText, ok) {
+async function _notifyTaskDone(sess, taskText, outcome) {
   const t = String(taskText || "任务").replace(/\s+/g, " ").trim();
   const short = t.slice(0, 44) + (t.length > 44 ? "…" : "");
-  const title = ok === false ? "⚠️ 任务结束（有问题）" : "✅ 任务完成";
-  _flashTitle(ok === false ? "⚠️ 任务结束" : "✅ 任务完成");
+  // outcome 来自 _lastRunState（success / partial / failed / awaiting_user）。老签名收的是
+  // 布尔 ok，调用方一直传字面量 true——于是这条通知永远说"任务完成"。保留布尔兼容，
+  // 但四种结局各说各话：没做完就别写完成，在等回话就说在等回话。
+  const _oc = outcome === false ? "failed" : outcome === true ? "success" : String(outcome || "success");
+  const _titles = {
+    success: ["✅ 任务完成", "✅ 任务完成"],
+    partial: ["⚠️ 任务未完成", "⚠️ 未完成"],
+    failed: ["⚠️ 任务结束（有问题）", "⚠️ 任务结束"],
+    awaiting_user: ["❓ 需要你回一句", "❓ 等你回话"],
+  };
+  const [title, flash] = _titles[_oc] || _titles.success;
+  _flashTitle(flash);
 
   if (inTauri) {
     try {

@@ -25451,6 +25451,36 @@ test("连续静默立刻停 —— 这是唯一的死循环入口", () => {
   assert.match(quiet, /if \(quietTurns >= 2\) _clearNudges\(\);/);
 });
 
+test("退出码 0 但一个用例都没跑，不算验证", () => {
+  const noTests = load("_verifierRanNoTests");
+  // ── 真·空跑：exit 0，零断言。这些以前一律被盖上 verification 章 ──
+  assert.equal(noTests("?   \tgithub.com/foo/bar\t[no test files]"), true, "go：没有测试文件");
+  assert.equal(noTests("No tests found, exiting with code 0"), true, "jest --passWithNoTests");
+  assert.equal(noTests("collected 0 items\n\n=== no tests ran in 0.01s ==="), true, "pytest 收集到 0 个");
+  assert.equal(noTests("running 0 tests\n\ntest result: ok. 0 passed; 0 failed"), true, "cargo 跑 0 个");
+  assert.equal(noTests("ℹ tests 0\nℹ pass 0\nℹ fail 0"), true, "node --test 零用例");
+  assert.equal(noTests("Tests:       0 total\nSnapshots:   0 total"), true, "jest 汇总 0");
+  assert.equal(noTests("  0 passing (2ms)"), true, "mocha 0 passing");
+
+  // ── 真的跑了：绝不能误判成空跑，否则合法的绿色验证被拒绝盖章 ──
+  assert.equal(noTests("collected 12 items\n\n12 passed in 0.4s"), false, "pytest 跑了 12 个");
+  assert.equal(noTests("running 8 tests\ntest result: ok. 8 passed; 0 failed"), false, "cargo 跑了 8 个");
+  assert.equal(noTests("ℹ tests 1712\nℹ pass 1712\nℹ fail 0"), false, "node --test 跑了一堆");
+  assert.equal(noTests("  24 passing (1s)"), false, "mocha 24 passing");
+  assert.equal(noTests("Tests:       3 failed, 41 passed, 44 total"), false, "jest 有红有绿也是跑过了");
+  // 混排是 go 的常态：一部分包有测试、一部分没有。只看到 [no test files] 就判空跑会误伤。
+  assert.equal(
+    noTests("ok  \tgithub.com/foo/bar\t0.012s\n?   \tgithub.com/foo/baz\t[no test files]"),
+    false,
+    "go 混排：有包真的跑过用例，就不算空跑",
+  );
+  assert.equal(noTests("=== RUN   TestX\n--- PASS: TestX (0.00s)\nPASS\n?   \tgithub.com/foo/baz\t[no test files]"), false, "go：PASS 明证");
+
+  // ── 没有输出 = 没有证据，不改变原判（保守方向：不制造新的拒绝） ──
+  assert.equal(noTests(""), false, "空输出不作数");
+  assert.equal(noTests("Build succeeded."), false, "没有任何空跑信号就不判空跑");
+});
+
 test("绿证据要能盖住更早的红，否则改好了还被要求再修一遍", () => {
   // 原来只在 exitCode !== 0 时返回、绿的继续往前找 → 「跑红 → 改好 → 再跑绿」之后
   // 那条更早的红仍然开门，模型被要求再修一遍一个已经绿了的构建。
