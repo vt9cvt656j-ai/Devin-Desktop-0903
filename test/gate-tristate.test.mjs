@@ -94,10 +94,10 @@ test("工具编排的闸门必须区分「裁决未到」和「裁决说不适�
 
 // ── 提醒的淘汰顺序 ───────────────────────────────────────────────────────
 //
-// 同轮最多挂 2 条提醒（这个上限本身是对的：并排挂五条，模型会逐条表态，输出又长又自我横跳）。
-// 但淘汰原来是"清最旧的那条"——而最旧和最不重要没有关系。一条 [BUILD_FAILED]、一条
-// "你改了从没读过的文件"、一条子智能体带回来的 3200 字结果，都可能被一条"建议先调研"挤掉。
-// 挤掉的是**事实**，留下的是建议：事实丢了模型就按错误图景继续干活，建议丢了只少一句提点。
+// 同轮挂太多提醒，模型会逐条表态，输出又长又自我横跳——所以要有上限。但"总数 ≤2"把病治过
+// 头了：一条 [BUILD_FAILED]、一条"你改了从没读过的文件"、一条子智能体带回来的结论，是三份
+// 互不替代的**现场**，丢哪一条模型都会照着错误的图景继续干活；而"逐条表态"的病根在建议类。
+// 所以建议只留 1 条、总额 4 条，超额时按重要性挑（先建议、再最旧的事实）。
 test("提醒按重要性淘汰，不是按先来后到", () => {
   const factsSrc = /const _NUDGE_FACTS = new Set\(\[[\s\S]*?\]\);/.exec(SRC);
   const rankSrc = /const _nudgeRank = \(cat\) => [^;]+;/.exec(SRC);
@@ -115,23 +115,39 @@ test("提醒按重要性淘汰，不是按先来后到", () => {
     "没登记的新提醒必须默认按建议类——要保命就得显式登记，不能靠默认捡到便宜");
 
   // 拿**源码里真实的那段淘汰循环**跑，不照抄一份：照抄的话我改了源码它照样绿。
-  const loopSrc = /while \(_nudgeReg\.size >= 2\) \{[\s\S]*?\n    \}/.exec(SRC);
-  assert.ok(loopSrc, "淘汰循环的形状变了，这条断言失去落点");
+  // 拿**源码里真实的那段淘汰逻辑**跑，不照抄一份：照抄的话我改了源码它照样绿。
+  const loopSrc = /const _dropNudge = \(victim\) => \{[\s\S]*?\n    \}\n/.exec(SRC);
+  assert.ok(loopSrc, "淘汰逻辑的形状变了，这条断言失去落点");
   assert.match(loopSrc[0], /_nudgeRank\(key\) > _nudgeRank\(worst\)/,
-    "淘汰没有按 _nudgeRank 挑——又回到了按先来后到");
+    "超额淘汰没有按 _nudgeRank 挑——又回到了按先来后到");
 
   const evict = new Function("_nudgeReg", "messages", "cat", "_nudgeRank", `${loopSrc[0]}\nreturn [..._nudgeReg.keys()];`);
-  // 先进来一条事实、再一条建议，然后第三条要挤掉一个：该走的是建议，不是先来的那条事实。
-  const reg = new Map([["buildFix", { c: "fact" }], ["researchFirst", { c: "advice" }]]);
-  const msgs = [reg.get("buildFix"), reg.get("researchFirst")];
-  const left = evict(reg, msgs, "diag", rank);
-  assert.deepEqual(left, ["buildFix"], "被挤掉的应当是建议类，事实类要留下");
-  assert.equal(msgs.length, 1, "被淘汰的那条也要从消息列表里摘掉，不能只从注册表删");
+  const mk = (names) => {
+    const reg = new Map(names.map((n) => [n, { c: n }]));
+    return { reg, msgs: names.map((n) => reg.get(n)) };
+  };
 
-  // steer 永远不被挤。
-  const reg2 = new Map([["steer", { c: "steer" }], ["researchFirst", { c: "advice" }]]);
-  const msgs2 = [reg2.get("steer"), reg2.get("researchFirst")];
-  assert.deepEqual(evict(reg2, msgs2, "diag", rank), ["steer"], "用户实时插话被挤掉了");
+  // ① 事实不再被事实挤掉：三条事实 + 一条建议，第四条事实进来时该走的是建议。
+  const a = mk(["buildFix", "diag", "blindEdit", "researchFirst"]);
+  assert.deepEqual(evict(a.reg, a.msgs, "subagentResult", rank),
+    ["buildFix", "diag", "blindEdit"],
+    "第四条事实到达时挤掉的必须是建议——构建失败、盲改警告、子智能体结论互不替代");
+  assert.equal(a.msgs.length, 3, "被淘汰的那条也要从消息列表里摘掉，不能只从注册表删");
+
+  // ② 总额仍然有界：全是事实且已满额时，最旧的那条事实才让位。
+  const b = mk(["buildFix", "diag", "blindEdit", "cmdFail"]);
+  assert.deepEqual(evict(b.reg, b.msgs, "recovery", rank),
+    ["diag", "blindEdit", "cmdFail"], "满额时让位的是最旧的事实，且总数收敛");
+
+  // ③ 建议同时只留 1 条（正在推入的那条就是这 1 条），事实不受牵连。
+  const c = mk(["buildFix", "researchFirst"]);
+  assert.deepEqual(evict(c.reg, c.msgs, "planNudge", rank), ["buildFix"],
+    "两条建议不能同时挂着，而事实要留下");
+
+  // ④ steer 永远不被挤。
+  const d = mk(["steer", "buildFix", "diag", "blindEdit", "cmdFail"]);
+  assert.deepEqual(evict(d.reg, d.msgs, "recovery", rank),
+    ["steer", "diag", "blindEdit", "cmdFail"], "用户实时插话被挤掉了");
 });
 
 test("默认完整交付、先读懂再动手、每一步先想", () => {
