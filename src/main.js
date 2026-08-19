@@ -47927,7 +47927,17 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
           // byIndex 里，外面够不着。于是一个**真的落了盘**的文件：不进消息历史（没有工具
           // 结果消息）、不进 run 摘要（累加在 break 下面）、不进任何账本。下一轮模型完全
           // 不知道自己写过它，撤销也不知道。磁盘变了而所有记录都说没变，这是最坏的一种不一致。
-          const _landedOk = !/^\[(?:ERROR|BLOCKED|DENIED)\]/.test(String(result?.content || ""));
+          // 这里曾经手写一条正则 `^\[(?:ERROR|BLOCKED|DENIED)\]`：只认三个词、还锚定行首。
+          // 而全系统权威的失败判定（_toolExecutionSucceeded → _toolFailureMatch）认的是
+          // 失败|ERROR|BLOCKED|CONFLICT|DENIED|NEEDS_REPO|不可用|未执行|权限问题|interrupted，
+          // 不锚行首，另外还看结构化的 failure.code / ok === false / mutated === false。
+          //
+          // 漏判一次的后果不是少记一笔，是**harness 自己造出一条假事实**：这条台账会走到
+          // 「这一轮已经真实写入磁盘：X」那句交付事实里，每轮无条件喂给模型；模型照着它
+          // 如实转述「已保存到 X」，而磁盘上没有那个文件。用户看到的是模型在撒谎，
+          // 实际是我们骗了它。写入冲突（[CONFLICT]）、被中断（[interrupted]）、
+          // mutated:false 的空操作，全是这条正则漏掉而权威判定认得的形态。
+          const _landedOk = _toolExecutionSucceeded(call, result);
           (run._eagerLanded = run._eagerLanded || []).push({ path: call.path, ok: _landedOk });
         })();
         // 在途集合：出错/停止时要等它们落定再收尾，否则 run 都结束了写入还在飞。
@@ -47983,6 +47993,21 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
           _pushNudge("toolRepair", _invalidToolRepairInstruction(attempts, [], run._toolRegistry) + "\n现在继续任务；不要收尾，不要声称已完成。");
           clearAgentRetryToast();
           continue;
+        }
+        // 走到这里＝**补救已经用尽**（救不回来，或补救次数到顶）。这一次写入被 IDE 拒绝执行、
+        // 一个字节都没落盘。
+        //
+        // agent 模式刻意不渲染红卡（renderRejectedToolAttempts: false），那条静默规则是对的
+        // ——第一次参数不全就弹一张红卡只会吓人，而循环通常自己就补回来了。但它的前提是
+        // 「循环会把它救回来」；救不回来时它就变成了另一件事：用户眼睁睁看着那段正在生成的
+        // 文档从屏幕上消失（流式卡片在轮末被 remove），没有任何解释，然后模型接着往下说。
+        // 这正是用户报的「它说保存好了，而我什么都没看到、文件也不在」的显示侧那一半。
+        // 所以只在这一刻——静默自愈已经失败——补上唯一一次显示。
+        if (attempts.length && _live()) {
+          try {
+            _renderRejectedToolAttempts(body, attempts,
+              "工具参数在自动补救耗尽后仍不完整，IDE 已拒绝执行这次调用，未写入任何文件");
+          } catch {}
         }
       }
       if (turn.error) {
