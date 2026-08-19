@@ -288,3 +288,32 @@ test("allowed-tools 比对的必须是工具注册名，不是映射后的内部
   assert.doesNotMatch(gate, /_skillToolAllowed\(skillGate\.allow, call\.name/,
     "call.name 对 read_skill 是技能名，拿它当工具名会让技能自锁");
 });
+
+// save_skill 写出来的 SKILL.md，必须能被**真正的**技能解析器读回来。
+// 拼装和解析是两处独立代码：拼错一个字段名（allowed_tools vs allowed-tools、缺空行），
+// 文件照样写成功、模型照样跟用户说「已经存好了」，而下一轮它在清单里是一条没有描述、
+// 甚至根本解析不出来的废条目。所以这条把两头接起来跑一遍。
+test("save_skill 写出的 SKILL.md 能被真正的技能解析器读回来", () => {
+  const exec = SRC.slice(SRC.indexOf('} else if (call.type === "saveskill") {'));
+  const docSrc = /const _doc = \[[\s\S]*?\.join\("\\n"\);/.exec(exec);
+  assert.ok(docSrc, "SKILL.md 的拼装代码改形状了，这条断言失去落点");
+  const build = new Function("_name", "_desc", "_fmTools", "_body", `${docSrc[0]}\nreturn _doc;`);
+
+  const doc = build("deploy-gateway", "改完网关之后怎么发布", ["run_cmd", "read_file"], "1. 先跑测试\n2. 再部署");
+  const skill = parseSkill(doc, "/w/.mrdayone/skills/deploy-gateway/SKILL.md");
+  assert.equal(skill.name, "deploy-gateway", "name 没被解析出来——清单里会是一条无名条目");
+  assert.equal(skill.desc, "改完网关之后怎么发布", "desc 是模型以后唯一的判断依据（解析器把它放在 desc 而不是 description）");
+  assert.deepEqual(skill.tools, ["run_cmd", "read_file"], "allowed-tools 没解析出来");
+  assert.match(skill.prompt, /先跑测试/, "正文丢了");
+  assert.doesNotMatch(skill.prompt, /^---/, "frontmatter 又混进正文了");
+
+  // 不给 allowed_tools 时**不许**凭空写一行：它是收窄语义，凭空加上会让这个技能常驻时
+  // 把别的工具全挡掉（本文件上面那条闸的测试就是这个后果）。
+  const bare = build("release-notes", "怎么写发布说明", [], "照模板填");
+  assert.doesNotMatch(bare, /allowed-tools/, "没声明工具却写了 allowed-tools —— 等于凭空给技能加了一道收窄");
+  const bareSkill = parseSkill(bare, "/w/.mrdayone/skills/release-notes/SKILL.md");
+  assert.equal(bareSkill.name, "release-notes");
+  // 解析器只在真有 allowed-tools 时才带 tools 键（`...(tools.length ? { tools } : {})`），
+  // 所以"没声明"的正确形状是这个键根本不存在，而不是一个空数组。
+  assert.equal(bareSkill.tools, undefined, "没声明却带出了工具约束键");
+});

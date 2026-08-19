@@ -20086,6 +20086,14 @@ function _approvalLabel(call) {
     case "move": return { title: "移动 / 重命名？", detail: (call.path || "") + "  →  " + (call.to || "") };
     case "copy": return { title: "复制？", detail: (call.path || "") + "  →  " + (call.to || "") };
     case "mkdir": return { title: "新建目录？", detail: call.path || "" };
+    case "saveskill": return { title: "保存为技能？", detail: `${call.name || ""}\n${String(call.description || "").slice(0, 160)}\n→ ${call.path || ""}` };
+    // MCP 服务就是一条任意命令行。框上必须把命令原文摆出来，否则用户等于闭着眼点同意。
+    case "mcpconfig": return {
+      title: call.action === "add" ? "把这个 MCP 服务写进你的配置？"
+        : call.action === "remove" ? "从你的配置里删掉这个 MCP 服务？"
+        : call.action === "enable" ? "启用这个 MCP 服务？" : "停用这个 MCP 服务？",
+      detail: `${call.name || ""}${call.command ? `\n${call.command} ${(call.args || []).join(" ")}`.trimEnd() : ""}${call.url ? `\n${call.url}` : ""}${call.env && Object.keys(call.env).length ? `\nenv: ${Object.keys(call.env).join(", ")}` : ""}`,
+    };
     case "format": return { title: "格式化文件？", detail: call.path || "" };
     case "automation": return { title: "桌面自动化？", detail: (call.method || "") + (call.params ? "  " + JSON.stringify(call.params).slice(0, 120) : "") };
     case "uiclick": return { title: "操作前台应用？", detail: `${call.action || "press"} ref=${Number.isInteger(call.ref) ? call.ref : "?"}` };
@@ -32848,6 +32856,8 @@ function _buildAgentToolSchemas(includeWrite, mcpTools = []) {
     // 渐进式披露的另一半：技能目录常驻上下文（_skillCatalogBlock），正文靠这个按需取。
     // 全部正文一起塞是 33k token，目录只要 970——差 34 倍，所以正文必须按需。
     { type: "function", function: { name: "read_skill", description: "Read the FULL text of one skill from the user's installed skill library. The system prompt lists every available skill as `name: description`; when one of them matches the task at hand, call this to get its complete instructions and then follow them. Read-only, needs no authorization. Read only the skill you actually need — reading irrelevant ones wastes the context window. If a skill is already marked 常驻 its full text is already in the system prompt; do not re-read it.", parameters: { type: "object", properties: { name: { type: "string", description: "The skill's name, exactly as listed in the available-skills catalogue" }, why: { type: "string", description: "One short sentence, in the user's language, shown to the user verbatim on the tool card. Name the concrete thing in THIS request that made you reach for this skill — the file type, the format they asked for, the words they used. Write it for them, not for yourself: 「用户要把这份周报导出成 .docx，这个技能里带了模板和写入脚本」, not 「docx 技能用于处理 Word 文档」. Never restate the skill's own description, and never write filler like 「为了更好地完成任务」 — the user already knows you are trying to help; what they cannot see is what you noticed. If you cannot point at something in the request, do not read this skill." } }, required: ["name", "why"] } } },
+    { type: "function", function: { name: "save_skill", description: "Save a procedure you just worked out as a SKILL, so it survives past this run. Writes `<workspace>/.mrdayone/skills/<name>/SKILL.md` — that exact path is what this IDE scans, so from the next turn on it appears in your available-skills catalogue and read_skill can fetch its full text. Reach for it when you had to figure something out that will be needed again: a build/deploy sequence, an API you reverse-engineered from docs, a file format you wrote a parser for, a workaround with a non-obvious gotcha. Write the steps, the real commands and the traps — not a summary of what you did. Do NOT use it to store findings about this one task, to leave notes for the user, or in place of your reply. Needs an open workspace: with none, call create_project first. 【vs alternatives】read_skill reads an existing skill; remember stores a user preference; a one-off script belongs in the repo via write_file.", parameters: { type: "object", properties: { name: { type: "string", description: "Skill name, short and task-shaped (e.g. \"deploy-gateway\"). Becomes the directory name; it is how you and the user refer to it later." }, description: { type: "string", description: "One line, in the user's language. This is the ONLY thing you see in the catalogue later, so it must say when to reach for this skill — the trigger, not the topic." }, body: { type: "string", description: "The skill's full instructions in Markdown: the ordered steps, the exact commands, the paths, what to verify, and the gotchas you hit. Written for a future run that has none of your current context." }, allowed_tools: { type: "array", items: { type: "string" }, description: "Optional. Tool names this skill needs (e.g. [\"run_cmd\",\"read_file\"]). Leave it out unless you mean to NARROW capability: while a skill declaring this is resident, tools outside the list are refused." }, why: { type: "string", description: "One short sentence, in the user's language, shown verbatim on the tool card: what in THIS task makes it worth keeping." } }, required: ["name", "description", "body", "why"] } } },
+    { type: "function", function: { name: "mcp_server", description: "Inspect and manage the user's own MCP servers (`~/.mrdayone/mcp.json`). `list` reports what is configured, what is disabled and how each was added — read-only, no authorization. `add` registers a new server (command + args, or url for a remote one); its tools join your registry on the next run. `remove` / `disable` / `enable` change ONLY the user's own config — a server that arrived with the repository is never touched. Reach for this when the capability you need exists as a published MCP server and nothing in your registry covers it: add it, then tell the user what you added, that it lands next run, and that its tool calls will ask for confirmation. Servers you add are written with approve:\"ask\" — an MCP server is an arbitrary command line, so the user is asked before each of its tool calls. 【vs alternatives】For a one-off HTTP API just use http_request; to look for a capability that may already be registered use search_tools.", parameters: { type: "object", properties: { action: { type: "string", enum: ["list", "add", "remove", "enable", "disable"], description: "What to do. Start with list when you are not sure what is already there." }, name: { type: "string", description: "Server name (the key in mcpServers). Required for everything except list." }, command: { type: "string", description: "For add, a local server: the executable, e.g. \"npx\" or \"uvx\"." }, args: { type: "array", items: { type: "string" }, description: "For add: the command's arguments, e.g. [\"-y\",\"@modelcontextprotocol/server-filesystem\",\"/path\"]." }, env: { type: "object", description: "For add: environment variables the server needs. Never put a real secret here — name the variable and tell the user what to paste." }, url: { type: "string", description: "For add, a remote server: its SSE/HTTP endpoint. Give either command or url, not both." }, why: { type: "string", description: "One short sentence, in the user's language, shown verbatim on the tool card: which capability this is for and why the registry does not already cover it." } }, required: ["action", "why"] } } },
     { type: "function", function: { name: "get_diagnostics", description: "Read the editor/LSP live diagnostics for a file (errors and warnings), returning file:line:column, source/code, nearby code, likely cause and direction of the fix. It is a read-only evidence tool, not a command, and needs no extra authorization this round. When the user asks \"which files have bugs / why is this erroring / how do I fix this error\", reach for it first to read the errors that already exist; after changing code, use it as a quick self-check. Omit path to get diagnostics for every open file.", parameters: { type: "object", properties: { path: { type: "string", description: "Optional; the file path to check. Omit to check every open file" } } } } },
     { type: "function", function: { name: "read_logs", description: "Read the tail of the latest terminal output or of a log file. Use it to look straight at the cause when a backend/API/build fails; it is a read-only evidence tool, starts no new command, and needs no extra authorization this round. When the error output names an npm debug log or a .log/.out/.err path, pass that as path; with no path it aggregates the recent task terminals and the workspace's usual logs. 【vs alternatives】For the live state of a long-running task terminal use read_terminal; for live editor/LSP diagnostics use get_diagnostics.", parameters: { type: "object", properties: { path: { type: "string", description: "Optional; the log file whose tail to read" }, paths: { type: "array", description: "Optional; several log file paths", items: { type: "string" } }, name: { type: "string", description: "Optional; the task name given to run_in_terminal" }, lines: { type: "integer", description: "How many trailing lines to read, default 200" }, include_terminal: { type: "boolean", description: "Whether to include task terminal output as well, default true" } } } } },
     { type: "function", function: { name: "git_status", description: "Show the git repository status: current branch, and the staged / unstaged / untracked file lists. Use it to learn which files were touched, or before committing. 【vs alternatives】For the actual line-by-line difference use git_diff; for commit history use git_log.", parameters: { type: "object", properties: {} } } },
@@ -33032,7 +33042,7 @@ function _buildAgentToolSchemas(includeWrite, mcpTools = []) {
   let _galleryMode = false;
   try { _galleryMode = !inTauri && new URLSearchParams(location.search).get("play") === "tools"; } catch {}
   if (!inTauri && !_galleryMode) {
-    const desktopOnly = new Set(["run_in_terminal", "read_terminal", "list_terminals", "stop_terminal", "browser", "screenshot", "http_request", "download_file", "decode_qr", "remote", "system", "capture_start", "capture_flows", "capture_stop", "capture_replay", "automation", "computer", "read_screen", "ui_click", "background_monitor", "local_discovery", "live_environment", "game_scaffold", "web_scaffold", "generate_3d", "generate_sound", "generate_music", "generate_voice", "auto_rig", "generate_motion", "generate_texture", "search_game_assets", "download_asset",
+    const desktopOnly = new Set(["mcp_server", "run_in_terminal", "read_terminal", "list_terminals", "stop_terminal", "browser", "screenshot", "http_request", "download_file", "decode_qr", "remote", "system", "capture_start", "capture_flows", "capture_stop", "capture_replay", "automation", "computer", "read_screen", "ui_click", "background_monitor", "local_discovery", "live_environment", "game_scaffold", "web_scaffold", "generate_3d", "generate_sound", "generate_music", "generate_voice", "auto_rig", "generate_motion", "generate_texture", "search_game_assets", "download_asset",
   // 这 40 个的执行器里都以 `if (!inTauri) return "[不可用] 只能在桌面 App 里用"` 开头，
   // 却一直照样把 schema 发给模型：网页版里模型手上摆着 arxiv_search、db_query、
   // gh_pr_view，选中一个就是一轮白烧，search_tools 也照样能把它们装进工具窗口、
@@ -33326,7 +33336,8 @@ const _CAPABILITY_ROUTES = "外部服务或 API → web_search/web_fetch 读官�
   + "本地格式或批处理 → write_file 写个脚本 + run_cmd 跑（这是正路，不算绕过专用工具）；"
   + "要跑起来看的服务/TUI → run_in_terminal 起，read_logs 看日志；"
   + "工作区里的 .db/.sqlite 文件 → db_query 传 driver=sqlite、url=sqlite:///绝对路径（路径本身就是连接串，不用问用户要）；"
-  + "值得复用的流程 → 写成 <工作区>/.mrdayone/skills/<名字>/SKILL.md 存下来，下一轮它就在你的技能清单里。";
+  + "外部服务有官方 MCP → mcp_server(action=\"add\") 把它接进来（下一轮生效，它的工具调用会先问用户）；"
+  + "值得复用的流程 → save_skill 存成技能（落在 <工作区>/.mrdayone/skills/<名字>/SKILL.md），下一轮它就在你的技能清单里。";
 
 function _searchToolsFuzzyMatch(query, registry, loadedNames) {
   const q = String(query || "").toLowerCase().trim();
@@ -34360,6 +34371,21 @@ function _mapToolCall(name, args, mcpToolMap = _mcpToolMap) {
     case "remember": return { type: "memory", path: (args.scope === "global" ? "全局记忆" : "项目记忆"), content: args.content || "", scope: args.scope === "global" ? "global" : "project" };
     case "recall_conversation": return { type: "recall", query: args.query || args.q || args.keyword || "", limit: Number.isFinite(+args.max_results) ? Math.max(1, Math.min(20, +args.max_results)) : 6 };
     case "read_skill": return { type: "skill", name: String(args.name || args.skill || args.id || ""), why: String(args.why || args.reason || args.purpose || "").replace(/\s+/g, " ").trim().slice(0, 200) };
+    case "save_skill": {
+      const _slug = String(args.name || "").trim().toLowerCase().replace(/[^\w.-]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 60);
+      const _tools = Array.isArray(args.allowed_tools) ? args.allowed_tools.map((t) => String(t || "").trim()).filter(Boolean)
+        : String(args.allowed_tools || "").split(/[,\s]+/).map((t) => t.trim()).filter(Boolean);
+      return { type: "saveskill", slug: _slug, name: String(args.name || "").trim(), description: String(args.description || "").trim(),
+        body: String(args.body || ""), allowedTools: _tools,
+        // path 一并带上：作用域检查、卡片显示、写入记账都读它。
+        path: _slug ? `${_STATE_DIR}/skills/${_slug}/SKILL.md` : "",
+        why: String(args.why || "").replace(/\s+/g, " ").trim().slice(0, 200) };
+    }
+    case "mcp_server": return { type: "mcpconfig", action: String(args.action || "list").trim().toLowerCase(),
+      name: String(args.name || "").trim(), command: String(args.command || "").trim(),
+      args: Array.isArray(args.args) ? args.args.map((a) => String(a == null ? "" : a)) : [],
+      env: (args.env && typeof args.env === "object" && !Array.isArray(args.env)) ? args.env : null,
+      url: String(args.url || "").trim(), why: String(args.why || "").replace(/\s+/g, " ").trim().slice(0, 200) };
     case "get_diagnostics": return { type: "diag", path: args.path || "" };
     case "delete_path": { const _p = String(args.path || "").trim(); if (!_p) return { type: "delete", _error: "path 不能为空" }; return { type: "delete", path: _p }; }
     case "move_path": { const _f = String(args.from || "").trim(); const _t = String(args.to || "").trim(); if (!_f) return { type: "move", _error: "from 不能为空" }; if (!_t) return { type: "move", _error: "to 不能为空" }; return { type: "move", path: _f, to: _t }; }
@@ -51194,7 +51220,7 @@ function _createToolStep(call) {
   const step = document.createElement("div");
   step.className = `agent-tool-step agent-tool-step--${call.type}${_isKSearch ? " agent-tool-step--ksearch" : ""}${call.type === "current_time" ? " agent-tool-step--current_time" : ""}${call.type === "game_scaffold" ? " agent-tool-step--game_scaffold" : ""}${call.type === "generate_3d" || call.type === "generate_sound" || call.type === "generate_music" || call.type === "generate_voice" || call.type === "auto_rig" || call.type === "generate_motion" || call.type === "generate_texture" || call.type === "search_game_assets" || call.type === "download_asset" ? " agent-tool-step--game_asset" : ""}`;
 
-  const _nonClickable = call.type === "cmd" || call.type === "search" || call.type === "find" || call.type === "web" || call.type === "websearch" || call.type === "localdiscovery" || call.type === "liveenvironment" || call.type === "readscreen" || call.type === "uiclick" || call.type === "search_tools" || call.type === "skill" || call.type === "unknown" || call.type === "vizcompare" || call.type === "memory" || call.type === "recall" || call.type === "think" || call.type === "delete" || call.type === "move" || call.type === "diag" || call.type === "git" || call.type === "gh" || call.type === "findsymbol" || call.type === "semsearch" || call.type === "knowledge" || call.type === "lsp" || call.type === "mkdir" || call.type === "copy" || call.type === "termtask" || call.type === "termread" || call.type === "termlist" || call.type === "termstop" || call.type === "http" || call.type === "download" || call.type === "genimage" || call.type === "mcp" || call.type === "demostart" || call.type === "demostop" || call.type === "screenshot" || call.type === "browser" || call.type === "db" || call.type === "qr" || call.type === "remote" || call.type === "system" || call.type === "automation" || call.type === "askuser" || call.type === "current_time" || _isAwaitSub || call.type === "game_scaffold" || call.type === "generate_3d" || call.type === "generate_sound" || call.type === "generate_music" || call.type === "generate_voice" || call.type === "auto_rig" || call.type === "generate_motion" || call.type === "generate_texture" || call.type === "search_game_assets" || call.type === "download_asset" || _isKSearch;
+  const _nonClickable = call.type === "cmd" || call.type === "search" || call.type === "find" || call.type === "web" || call.type === "websearch" || call.type === "localdiscovery" || call.type === "liveenvironment" || call.type === "readscreen" || call.type === "uiclick" || call.type === "search_tools" || call.type === "skill" || call.type === "unknown" || call.type === "vizcompare" || call.type === "memory" || call.type === "recall" || call.type === "think" || call.type === "delete" || call.type === "move" || call.type === "diag" || call.type === "git" || call.type === "gh" || call.type === "findsymbol" || call.type === "semsearch" || call.type === "knowledge" || call.type === "lsp" || call.type === "mkdir" || call.type === "copy" || call.type === "termtask" || call.type === "termread" || call.type === "termlist" || call.type === "termstop" || call.type === "http" || call.type === "download" || call.type === "genimage" || call.type === "mcp" || call.type === "mcpconfig" || call.type === "demostart" || call.type === "demostop" || call.type === "screenshot" || call.type === "browser" || call.type === "db" || call.type === "qr" || call.type === "remote" || call.type === "system" || call.type === "automation" || call.type === "askuser" || call.type === "current_time" || _isAwaitSub || call.type === "game_scaffold" || call.type === "generate_3d" || call.type === "generate_sound" || call.type === "generate_music" || call.type === "generate_voice" || call.type === "auto_rig" || call.type === "generate_motion" || call.type === "generate_texture" || call.type === "search_game_assets" || call.type === "download_asset" || _isKSearch;
   let pathHtml = _nonClickable
     ? `<span class="atc-path atc-path--text">${_escHtml(pathDisplay)}</span>`
     : `<span class="atc-path atc-path--clickable" data-filepath="${_escAttr(pathDisplay)}">${dirPath ? '<span class="atc-dir">' + _escHtml(dirPath) + '/</span>' : ''}<span class="atc-file">${_escHtml(fileName)}</span></span>`;
@@ -53964,6 +53990,105 @@ async function _executeToolStepInner(step, call, root, run) {
       const content = `当前时间: ${timeStr}\n时区: ${tz}\nUnix: ${unix}\nISO: ${now.toISOString()}`;
       res.className = "atc-result atc-result--title"; res.textContent = timeStr;
       return { type: "current_time", path: "", content };
+
+    } else if (call.type === "saveskill") {
+      const _slug = String(call.slug || "").trim();
+      const _name = String(call.name || "").trim();
+      const _desc = String(call.description || "").trim().replace(/\s+/g, " ");
+      const _body = String(call.body || "").trim();
+      if (!_slug || !_name || !_desc || !_body) {
+        res.className = "atc-result atc-result--err"; res.textContent = "参数不全";
+        return { type: "saveskill", path: "", content: "[ERROR] save_skill 需要 name（字母/数字/连字符）、description（一句话说清什么时候该用它）和 body（完整步骤）。" };
+      }
+      if (!root) {
+        res.className = "atc-result atc-result--blocked"; res.textContent = "⛔ 未打开工作区";
+        return { type: "saveskill", path: "", content: "[BLOCKED] 技能要落在工作区里（<工作区>/" + _STATE_DIR + "/skills/），当前没有工作区根目录。先用 create_project 建一个目录，它会立刻成为当前工作区，然后重试——别把这一步推回给用户。" };
+      }
+      const _rel = `${_STATE_DIR}/skills/${_slug}/SKILL.md`;
+      const fp = _resolveRel(_rel, root);
+      call._resolvedPath = fp;
+      _setToolStepResolvedPath(step, fp);
+      // frontmatter 的三个字段是解析器认的全部（见 _parseSkillDocument）。allowed-tools 只在
+      // 模型显式给了才写：它是**收窄**语义，凭空加上会让这个技能常驻时把别的工具全挡掉。
+      const _fmTools = (Array.isArray(call.allowedTools) ? call.allowedTools : []).filter(Boolean);
+      const _doc = ["---", `name: ${_name}`, `description: ${_desc}`,
+        ...(_fmTools.length ? [`allowed-tools: ${_fmTools.join(", ")}`] : []), "---", "", _body, ""].join("\n");
+      try {
+        await backend.writeTextFile(fp, _doc);
+        // 技能目录是按 cacheKey 缓存的快照。不清掉的话，这一轮刚写的技能要等到 cacheKey
+        // 变化（换工作区）才会被发现——那正是「存了却用不上」，而提示词刚承诺了下一轮生效。
+        _fileSkillsCacheKey = "";
+        res.className = "atc-result atc-result--ok"; res.textContent = _name;
+        return { type: "saveskill", path: fp, content: `技能「${_name}」已存到 ${fp}。下一轮它就在你的技能清单里，可以用 read_skill 按名字读全文。收尾时告诉用户存在哪、以及下次什么情形会用到它。` };
+      } catch (e) {
+        res.className = "atc-result atc-result--err"; res.textContent = "写入失败";
+        return { type: "saveskill", path: fp, content: `[ERROR] 写入技能失败: ${String(e?.message || e)}` };
+      }
+
+    } else if (call.type === "mcpconfig") {
+      if (!inTauri) { res.className = "atc-result atc-result--err"; res.textContent = "桌面专用"; return { type: "mcpconfig", path: "", content: "[不可用] 只能在桌面 App 里用。" }; }
+      const _act = String(call.action || "list").trim().toLowerCase();
+      const _nm = String(call.name || "").trim();
+      let _cfg = null;
+      try { _cfg = await _readOwnMcpConfig(); }
+      catch (e) { res.className = "atc-result atc-result--err"; res.textContent = "读配置失败"; return { type: "mcpconfig", path: "", content: `[ERROR] 读取你的 MCP 配置失败: ${String(e?.message || e)}` }; }
+      const _own = (_cfg && _cfg.mcpServers && typeof _cfg.mcpServers === "object") ? _cfg.mcpServers : {};
+      const _cfgPath = String(_cfg?.path || "") || "~/" + _STATE_DIR + "/mcp.json";
+      if (_act === "list") {
+        const _off = new Set((Array.isArray(_cfg.disabled) ? _cfg.disabled : []).map((x) => String(x || "").trim().toLowerCase()));
+        const _names = Object.keys(_own);
+        const _lines = _names.map((k) => {
+          const v = _own[k] || {};
+          const how = v.url ? String(v.url) : [v.command, ...(Array.isArray(v.args) ? v.args : [])].filter(Boolean).join(" ");
+          const marks = [_off.has(k.toLowerCase()) ? "已停用" : "已启用"];
+          if (String(v.__michael?.approve || "").toLowerCase() === "ask") marks.push("每次调用先问用户");
+          if (String(v.__michael?.addedBy || "") === "agent") marks.push("由你添加");
+          return `- ${k}: ${how || "(没写命令/URL)"} [${marks.join("、")}]`;
+        });
+        res.className = "atc-result atc-result--title"; res.textContent = `${_names.length} 个服务`;
+        return { type: "mcpconfig", path: "", content: _lines.length
+          ? `你自己的 MCP 配置（${_cfgPath}）:\n${_lines.join("\n")}\n\n仓库自带的 .mcp.json / .mcp.local.json 不在这份里，这个工具也不会去改它们。`
+          : `你自己的 MCP 配置里还没有任何服务（${_cfgPath}）。仓库自带的 .mcp.json 不在这份里，也不由这个工具管理。` };
+      }
+      if (!_nm) { res.className = "atc-result atc-result--err"; res.textContent = "缺 name"; return { type: "mcpconfig", path: "", content: `[ERROR] action=${_act} 需要 name（mcpServers 里的键名）。先用 action=list 看现有的。` }; }
+      try {
+        if (_act === "add") {
+          if (!call.command && !call.url) return { type: "mcpconfig", path: "", content: "[ERROR] add 需要 command（本地服务）或 url（远端服务）之一。" };
+          if (call.command && call.url) return { type: "mcpconfig", path: "", content: "[ERROR] command 和 url 只能给一个：本地进程用 command，远端端点用 url。" };
+          const entry = call.url ? { url: call.url }
+            : { command: call.command, ...(Array.isArray(call.args) && call.args.length ? { args: call.args } : {}) };
+          if (call.env && Object.keys(call.env).length) entry.env = call.env;
+          // 一律钉 approve:"ask"。用户作用域的默认是 auto（零审批直接执行），那条默认是给
+          // "用户自己手写的配置"定的——一条 MCP 配置就是一条任意命令行，不能让模型顺着
+          // 那个默认给自己开一扇零审批的门。用户想免审批，自己在条目里写 approve:"auto"。
+          entry.__michael = { approve: "ask", addedBy: "agent" };
+          const existed = Object.prototype.hasOwnProperty.call(_own, _nm);
+          _cfg.mcpServers = { ..._own, [_nm]: entry };
+          await _writeOwnMcpConfig(_cfg);
+          res.className = "atc-result atc-result--ok"; res.textContent = _nm;
+          return { type: "mcpconfig", path: _cfgPath, content: `${existed ? "已覆盖" : "已加入"}服务「${_nm}」（写在 ${_cfgPath}）。它的工具**下一轮**才会进你的注册表——本轮不要再等它。每次调用它的工具会先问用户（approve:"ask"）。收尾时告诉用户加了什么、以及它下次生效。` };
+        }
+        if (_act === "remove") {
+          if (!Object.prototype.hasOwnProperty.call(_own, _nm)) return { type: "mcpconfig", path: "", content: `[ERROR] 你自己的配置里没有「${_nm}」。仓库自带的服务不由这个工具删——它们跟着 git 仓库来，要停用请用 action=disable。` };
+          const next = { ..._own }; delete next[_nm];
+          _cfg.mcpServers = next;
+          await _writeOwnMcpConfig(_cfg);
+          res.className = "atc-result atc-result--ok"; res.textContent = "已删除";
+          return { type: "mcpconfig", path: _cfgPath, content: `已从 ${_cfgPath} 删掉服务「${_nm}」。已经连上的进程要到下次启动才完全退出。` };
+        }
+        if (_act === "enable" || _act === "disable") {
+          const ok = await _setMcpServerDisabled(_nm, _act === "disable");
+          res.className = ok ? "atc-result atc-result--ok" : "atc-result atc-result--err";
+          res.textContent = ok ? (_act === "disable" ? "已停用" : "已启用") : "失败";
+          return { type: "mcpconfig", path: _cfgPath, content: ok
+            ? `服务「${_nm}」已${_act === "disable" ? "停用" : "启用"}（写在 ${_cfgPath} 的 disabled 清单）。下一轮生效。`
+            : `[ERROR] 改「${_nm}」的启用状态失败。` };
+        }
+        return { type: "mcpconfig", path: "", content: `[ERROR] 不认识的 action「${_act}」。可用：list / add / remove / enable / disable。` };
+      } catch (e) {
+        res.className = "atc-result atc-result--err"; res.textContent = "写配置失败";
+        return { type: "mcpconfig", path: "", content: `[ERROR] 写你的 MCP 配置失败: ${String(e?.message || e)}` };
+      }
 
     } else if (call.type === "game_scaffold") {
       if (!inTauri) { res.className = "atc-result atc-result--err"; res.textContent = "桌面专用"; return { type: "game_scaffold", path: "", content: "[不可用] 游戏脚手架只能在桌面 App 里用。" }; }
