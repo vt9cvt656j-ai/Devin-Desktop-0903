@@ -104,7 +104,7 @@ jobs:
           IDENTITY="${APPLE_SIGNING_IDENTITY_SECRET:-$CONFIG_ID}"
 
           if [ -z "${APPLE_CERTIFICATE:-}" ]; then
-            echo "::error::缺少 APPLE_CERTIFICATE secret，无法用固定身份「$IDENTITY」签名。"
+            echo "::error::缺少 APPLE_CERTIFICATE secret，无法用固定身份「${IDENTITY}」签名。"
             echo "::error::拒绝改用 ad-hoc 签名——那样打出来的包会让用户每次更新后隐私授权失效，"
             echo "::error::而系统设置里的开关仍然显示为打开，几乎不可能被发现。"
             echo "::error::在本机跑一次即可修好：ide/scripts/setup-ci-signing-secrets.sh"
@@ -132,7 +132,7 @@ jobs:
           # 名字对得上还不够，得真的能拿它签。私钥没导进去时 codesign 会在十几分钟编译
           # 之后的最后一步才失败——那时机器时间已经白烧了。这里先花 0.1 秒问一句。
           if ! security find-identity -p codesigning "$KEYCHAIN" | grep -qF "$IDENTITY"; then
-            echo "::error::证书导入了，但钥匙串里找不到可用于签名的身份「$IDENTITY」。"
+            echo "::error::证书导入了，但钥匙串里找不到可用于签名的身份「${IDENTITY}」。"
             security find-identity -p codesigning "$KEYCHAIN" || true
             exit 1
           fi
@@ -249,7 +249,7 @@ jobs:
           set -euo pipefail
           APP="ide/target/${{ matrix.rust_target }}/release/bundle/macos/Mr. Day One.app"
           if [ ! -d "$APP" ]; then
-            echo "::error::找不到 $APP，无法校验签名。"
+            echo "::error::找不到 ${APP}，无法校验签名。"
             ls -la "ide/target/${{ matrix.rust_target }}/release/bundle/macos" || true
             exit 1
           fi
