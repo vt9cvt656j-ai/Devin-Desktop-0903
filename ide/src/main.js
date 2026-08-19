@@ -28503,13 +28503,29 @@ async function _userScopeMcpConfigPath() {
 const _mcpLocalTrackedCache = new Map();
 async function _mcpLocalFileIsTracked(base) {
   if (_mcpLocalTrackedCache.has(base)) return _mcpLocalTrackedCache.get(base);
-  let tracked = false;
+  // **git 答不上来就按"来自仓库"处理**（fail-closed）。
+  //
+  // 这条判据的全部依据就是 git 能回答。原来写的是 `code === 0 && stdout 非空`，于是
+  // 三种情况都落到 tracked=false → scope "local" → _mcpServerApprovalMode 返回 "auto"
+  // → 工具调用零弹窗：
+  //   · 目录根本不是 git 仓库（GitHub 的 Download ZIP、npm pack、别人发来的 tar，
+  //     解压出来都没有 .git，照样携带 .mcp.local.json）
+  //   · git 不在 PATH
+  //   · taskRunCapture 抛异常
+  // 而一条 MCP 配置就是一条任意命令行——打开文件夹即执行。
+  //
+  // 上面那段注释写明这道判据是为了挡「攻击者把 .mcp.local.json 提交进仓库」，
+  // git 缺席时恰恰**不能**排除这种可能，只能按更严的一侧走。
+  // 代价是非 git 目录里用户自己配的也要过一次确认，逃生口是服务条目里写
+  // `"__michael": { "approve": "auto" }`。
+  let tracked = true;
   try {
     // 故意不用 --error-unmatch：它对"没跟踪"和"根本不是 git 仓库"都返回非零，分不开。
     // 这样写时 code===0 就代表 git 确实回答了，stdout 非空即被跟踪。
     const r = await backend.taskRunCapture(base, "git ls-files -- .mcp.local.json");
-    tracked = r?.code === 0 && !!String(r.stdout || "").trim();
-  } catch { tracked = false; }
+    // 只有 git 明确回答了「没跟踪」，才认定它是用户自己的本地配置。
+    if (r?.code === 0) tracked = !!String(r.stdout || "").trim();
+  } catch { tracked = true; }
   _mcpLocalTrackedCache.set(base, tracked);
   return tracked;
 }
@@ -38858,7 +38874,14 @@ async function _compactHistoryIfHuge(config, session) {
   const mem = sess?.memory;
   if (!mem) return;
   const recentTokens = mem.estimateRecentTokens();
-  if (recentTokens < 28000 || mem.recent.length < 8) return;
+  // 触发线按**这个模型的窗口**算，不是一个写死的数。28000 是窗口普遍 128K 的年代定的：搬到
+  // 1M 窗口的模型上，用掉不到 3% 就把整段对话换成一份摘要（还顺带打穿前缀缓存）；搬到 32K 的
+  // 小模型上，它又比窗口本身还危险。旁边那条机械裁剪早就按比例算了（_trimMessagesIfHuge 软
+  // 0.45 / 硬 0.70），这里取 0.5：先于硬裁剪发生，又不至于一有点长度就把历史压成摘要。
+  // estimateRecentTokens 只统计对话本身（不含系统提示词与工具 schema），实际占用比这条线更高，
+  // 比例取保守正是为此。
+  const _compactAtTok = Math.max(8000, Math.round(_modelContextLimit(config?.model || "") * 0.5));
+  if (recentTokens < _compactAtTok || mem.recent.length < 8) return;
   // 单飞：压缩要好几秒，期间条件仍然成立，不设标记就会并发起第二次，两次各自按自己
   // 的快照去压同一段历史，后落地的那次会覆盖前一次。
   if (sess._compactPromise) return sess._compactPromise;
@@ -41607,6 +41630,25 @@ function _freshBuildFailure(run, implOps) {
     if (e.exitCode !== 0 && !newestFailure) newestFailure = e;
   }
   return newestFailure;
+}
+
+// 证据环满了要挤掉一条时，挑**对门禁无用**的那条，不是一律挤最老的。
+//
+// 两道事实门（`_freshBuildFailure` 发红、`_evidenceCertifies` 发绿）认的是同一种记录：
+// 当前实现版本 + 执行期盖过 verifierRecognized/verification。而验证密集的收尾恰恰最危险：
+// 最后一次编辑之后连着跑十几条命令（装依赖、看日志、起服务、再跑一遍测试），无条件 FIFO
+// 会把那条唯一的绿证据先挤出窗口 —— 于是真绿被记成 code_delivered_unverified，或者红构建门
+// 对不上版本、白白再逼一轮修复。证据环同时还是给模型看的现场回顾，验证结果也是其中信息量
+// 最高的一类，两个用途指向同一个策略。
+//
+// 所以：先淘汰最老的「非当前版本 / 没盖过章」的记录；只有整窗都是当前版本的验证证据时，才
+// 退回原来的 FIFO。任何一次调用都只挤一条，环的上界不变。
+function _evictExpendableEvidence(ev, implOps) {
+  if (!Array.isArray(ev) || !ev.length) return;
+  const idx = ev.findIndex((e) => !(e
+    && (e.verifierRecognized === true || e.verification === true)
+    && e.implementationVersion === implOps));
+  ev.splice(idx >= 0 ? idx : 0, 1);
 }
 
 /**
@@ -47002,23 +47044,28 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
   const _pushNudge = (cat, content) => {
     const prev = _nudgeReg.get(cat);
     if (prev) { const i = messages.indexOf(prev); if (i !== -1) messages.splice(i, 1); }
-    // 同轮活跃上限：不同类别的提醒同时挂在尾部（planStale+verify+honesty+…），模型会
-    // 逐条表态——输出又长又自我横跳（用户实测骂"痴呆"）。上限 2 条：steer 是用户实时插话的
-    // 护送指令，永远不清。
+    // 同轮活跃上限：不同类别的提醒同时挂在尾部（planStale+verify+honesty+…），模型会逐条
+    // 表态——输出又长又自我横跳（用户实测骂"痴呆"）。steer 是用户实时插话的护送指令，永不清。
     //
-    // 淘汰顺序按**重要性**，不按先来后到。原来是"清最旧的那条"，而最旧和最不重要没有关系：
-    // 一条 [BUILD_FAILED]、一条"你改了从没读过的文件"、一条子智能体带回来的 3200 字结果，
-    // 都可能被一条"建议先调研"挤掉——挤掉的那些是**事实**，留下的是建议。事实丢了模型就
-    // 按错误图景继续干活，建议丢了只是少一句提点。同级再按先来后到。
-    while (_nudgeReg.size >= 2) {
-      const victims = [..._nudgeReg.keys()].filter((key) => key !== "steer" && key !== cat);
-      if (!victims.length) break;
-      // Map 的键序就是插入序，reduce 用严格大于 → 同级里保留最先遇到的那个，也就是最旧的先走。
-      const victim = victims.reduce((worst, key) => (_nudgeRank(key) > _nudgeRank(worst) ? key : worst));
+    // 但"总数 ≤2"把病治过头了：淘汰虽然按重要性挑（建议先走），可只要第三条**事实**到达，
+    // 同级里最旧的那条事实照样被挤掉。一条 [BUILD_FAILED] 的真实 stderr、一条"你改了从没读过
+    // 的文件"、一份子智能体带回的结论——这三条不是重复表态，是三份互不替代的现场，丢哪一条
+    // 模型都会照着错误的图景继续干活。而"逐条表态"的病根在建议类：它们每条都在要求模型表态。
+    // 所以分开算：建议仍然只留 1 条，总额放到 4 条，超额时按重要性挑（先建议、再最旧的事实）。
+    const _dropNudge = (victim) => {
       const oldMsg = _nudgeReg.get(victim);
       const oi = messages.indexOf(oldMsg);
       if (oi !== -1) messages.splice(oi, 1);
       _nudgeReg.delete(victim);
+    };
+    const _incomingRank = _nudgeRank(cat);
+    for (;;) {
+      const others = [..._nudgeReg.keys()].filter((key) => key !== "steer" && key !== cat);
+      const advice = others.filter((key) => _nudgeRank(key) === 2);
+      if (advice.length > (_incomingRank === 2 ? 0 : 1)) { _dropNudge(advice[0]); continue; }
+      if (others.length + 1 <= 4) break;
+      // Map 的键序就是插入序，reduce 用严格大于 → 同级里保留最先遇到的那个，也就是最旧的先走。
+      _dropNudge(others.reduce((worst, key) => (_nudgeRank(key) > _nudgeRank(worst) ? key : worst)));
     }
     const m = { role: "user", content: _ORCH_NOTE + content };
     _nudgeReg.set(cat, m);
@@ -47111,7 +47158,7 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
     if (_toolRoutingState.signatures.has(signature)) return null;
     _toolRoutingState.signatures.add(signature);
     _toolRoutingState.runs++;
-    const decision = await _semanticToolOrchestrator({
+    let decision = await _semanticToolOrchestrator({
       config,
       task: routeTask,
       profile: run.engineering,
@@ -47128,7 +47175,25 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
       // bounded; steering is the user actively waiting.
       deadlineMs: phase === "initial" ? 2800 : phase === "after_tools" ? 12000 : 8000,
     });
-    if (!decision) return null;
+    if (!decision) {
+      // 编排器这一轮不可用（超时 / 502 / JSON 解析失败 → null）时不能空手而归。这条腿失败的
+      // 代价是不对称的：工具窗口冻在开局那十个核心工具，模型手里没有 web_search、
+      // knowledge_search、git、db_query、browser……用户的体感就是"越干越蠢"——它不是变笨，是
+      // 手里真的什么都没有；而长任务后期（验证、部署、修复）恰恰是旗舰编排最容易超时的时候。
+      // 同一条规则本仓库已经在 search_tools 那条路径上用了：编排器 null 才用本地模糊命中兜底，
+      // 编排器正常返回（含 tools=[]）时一律尊重它的语义判断。这里沿用同一条，不另立规矩。
+      const _fallbackPicks = _searchToolsFuzzyMatch(String(routeTask || "").slice(-1200), run._toolRegistry, loadedBefore)
+        .filter((hit) => hit && hit.score >= 3 && !hit.alreadyLoaded)
+        .slice(0, 5)
+        .map((hit) => hit.name);
+      if (!_fallbackPicks.length) return null;
+      decision = {
+        tools: _fallbackPicks,
+        instruction: "",
+        reason: "语义编排本轮未返回（超时或上游失败），已按本地匹配装载候选工具；不合适就用 search_tools 明确要",
+        thought: "",
+      };
+    }
     // 工具规划思考链可视化已关闭：不再渲染独立的🧠工具规划卡片，消除冗余思考和 UI 噪音。
     // 保留 decision 数据供后续工具调度使用，但去掉 thought 字段的强制输出
     // 编排结果先过硬性合理性检查：收敛列表（不 reject），notes 拼进下方 nudge 让主模型知情
@@ -47371,20 +47436,21 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
       _startInitialToolRoutingAfterFirstTurn();
       _startMichaelDesignPreflight({ run, body, isLive: _live });
       _consumeMichaelDesignPreflight();
-      // === Reasoning depth is a per-iteration function of live state, not a one-shot verdict ===
-      // isComplexTask was decided once from an AI verdict racing an 8s timeout; a late verdict
-      // demoted the whole run to medium and — alone among the run's derived state — never
-      // self-healed, though the self-heal block runs a few lines above. Difficulty that shows
-      // up as repeated failures or stalled turns now raises depth for the turns that need it.
+      // === 每轮按用户当前选的档位重铺一遍思考配置 ===
+      // 这里曾经算一个 `_cx`（isComplexTask || failStreak>=2 || quietTurns>=2 || 大工程标记）传进
+      // 映射器，注释还写着"运行时发现的难度会抬高档位"——那是句假话：`_applyThinkingToConfig`
+      // 明确不读 opts（理由见那边的长注释），档位只由用户选的 pref 决定，同文件的用例也钉着
+      // "选了 off，isComplexTask=true 也必须还是 off"。算完就丢的信号最坑人：它让每个后来读这段
+      // 代码的人以为这里有自适应。真要抬也不该在这儿抬——用户在转盘上选了什么就该发什么，而
+      // "这题该想多深"本就是 adaptive 家族每轮自己决定的事，harness 替它提前拍板正是这个代码库
+      // 反复在拆的"拿预测代替事实"。删掉之后，这段只剩两个**真实**作用：
+      //   ① 用户跑到一半改了思考档位，下一轮立刻生效（pref 是每次现读的）；
+      //   ② 仪表按真正发出去的那份配置写，而不是开跑前那一份。
       //
-      // Re-derived from _rawConfig on purpose: _applyThinkingToConfig deletes and rebuilds the
-      // family-specific fields, so mutating `config` in place would leave stale keys from the
-      // previous family shape. Going through the single mapper also keeps the per-family
-      // thinking table authoritative (adaptive vs explicit budget) by construction.
+      // 从 _rawConfig 重推而不是原地改 config：映射器会删掉并重建各家族专属字段，原地改会留下
+      // 上一个家族形状的残键。
       {
-        const _cx = isComplexTask || failStreak >= 2 || quietTurns >= 2
-          || !!(run.engineering?.industrialProject || run.engineering?.largeProject || run.engineering?.substantial);
-        Object.assign(config, _applyThinkingToConfig(_rawConfig, { agentTurn: true, isComplexTask: _cx }));
+        Object.assign(config, _applyThinkingToConfig(_rawConfig, { agentTurn: true }));
         // The meter was written once, before the loop, from the UN-demoted config — so it
         // reported "high" for entire runs that were on the wire at "medium". Write it here and
         // it tells the truth.
@@ -48510,7 +48576,7 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
           };
           run._executionEvidence.push(_executionEvidenceRecord);
           it._executionEvidence = _executionEvidenceRecord;
-          if (run._executionEvidence.length > 12) run._executionEvidence.shift();
+          if (run._executionEvidence.length > 12) _evictExpendableEvidence(run._executionEvidence, _implOps);
         }
         _settleToolStep(step, result);
         // Live plan tracking: advance the plan the moment each tool settles, so the

@@ -1328,12 +1328,30 @@ test("用户自己配的（git 没跟踪）仍然是 local，不给他多弹一�
   assert.equal(_mcpServerApprovalMode(doc.serverScopes.db, {}), "auto");
 });
 
-test("不是 git 仓库时算用户自己的——没有版本库就没有 clone 这条投递路径", async () => {
+test("git 答不上来就按仓库自带处理——「没有 .git 就没有投递路径」不成立", async () => {
+  // 这条原来断言的是反面：「不是 git 仓库时算用户自己的——没有版本库就没有 clone 这条
+  // 投递路径」。那个前提**不完整**：clone 不是唯一的投递方式。
+  //
+  //   · GitHub 的 Download ZIP、npm pack、别人发来的 tar —— 解压出来就是一个**没有 .git**
+  //     的目录，照样可以携带 .mcp.local.json
+  //   · git 不在 PATH，或 taskRunCapture 抛异常
+  //
+  // 三种情况原来都落到 tracked=false → scope "local" → approve "auto" → 零弹窗执行
+  // 任意命令行，打开文件夹即中招。而这道判据存在的**全部理由**就是挡"文件跟着别人的
+  // 项目一起来"，git 缺席时恰恰不能排除它，只能按更严的一侧走。
+  //
+  // 代价是非 git 目录里用户自己配的也要过一次确认。有明确的逃生口：在服务条目里写
+  // `"__michael": { "approve": "auto" }`（_mcpServerApprovalMode 优先读它）。
   const read = makeDoc({
     files: { "/work/a/.mcp.local.json": JSON.stringify({ mcpServers: { db: { command: "node" } } }) },
     noGit: ["/work/a"],
   });
-  assert.equal((await read("/work/a")).serverScopes.db, "local");
+  const doc = await read("/work/a");
+  assert.equal(doc.serverScopes.db, "repo", "git 答不上来却仍按「用户自己配的」放行");
+  assert.equal(_mcpServerApprovalMode(doc.serverScopes.db, {}), "ask");
+  // 逃生口必须真的有效，否则这条改动就是纯粹的骚扰。
+  assert.equal(_mcpServerApprovalMode(doc.serverScopes.db, { __michael: { approve: "auto" } }), "auto",
+    "用户明确写了 approve:auto 就该直接跑");
 });
 
 test("父目录那份被跟踪、子目录那份没有——两份各判各的", async () => {

@@ -2406,7 +2406,14 @@ pub async fn list_for_client(State(state): State<AppState>) -> ApiResult<Json<se
                 "cache_read_price": cache_read,
                 "cache_write_price": cache_write,
                 "price_source": price_source,
-                "rate": m.rate,
+                // `rate` **不下发**。它是运营方的加价倍率，本文件对它的定义原文就是
+                // "the operator's margin, hidden from users"——而这个接口没有任何鉴权
+                // （main.rs 的路由上没有 Claims 提取器，nginx 的 location / 也不拦），
+                // 于是一条 curl 就能把它和加价前的 input_price/output_price 一起取走，
+                // 两者相除即毛利率，还能顺带枚举 conn_id。
+                //
+                // 客户端拿它没用：13182 行只是把它读进定价对象，全仓库没有任何一处把它
+                // 渲染出来。删掉对界面零影响。
                 "description": m.description,
                 // 每模型真实上下文窗口（tokens）：客户端上下文表和棘轮压缩阈值都靠它，
                 // 不下发就只能靠客户端猜（GPT-5 曾被猜成 128K，白扔 3/4 窗口）。
@@ -2592,9 +2599,19 @@ pub async fn chat(
         .await
         .unwrap_or_else(|_| json!({ "error": "上游返回非 JSON" }));
     if !status.is_success() {
+        // 上游报错**不能原样透传**给用户。`data` 是上游的完整 JSON：里面可能有中转商的
+        // 主机名、请求 URL，部分中转商还会把 Authorization 原样回显。同一份代码别处早就
+        // 走了 safe_upstream_error_excerpt（剥 URL、剥各家 key 形态、循环剥到没有匹配，
+        // 并且配了断言测试），只有这条路绕过去——而它对**任何登录用户**开放。
+        // 502 在 error.rs 里是刻意不做统一脱敏的，所以必须在这里脱。
+        let raw = data.to_string();
         return Err(AppError {
             status: axum::http::StatusCode::BAD_GATEWAY,
-            msg: format!("模型供应商错误 {}: {}", status.as_u16(), data),
+            msg: format!(
+                "模型供应商错误 {}: {}",
+                status.as_u16(),
+                safe_upstream_error_excerpt(&raw.to_lowercase())
+            ),
         });
     }
 
@@ -8449,6 +8466,65 @@ mod billing_tests {
     /// `admit_billing` 直接 `return Ok(true)`，它后面的"改走会员额度/钱包"和两条 402
     /// 整段不可达。用户要的"免费用完接着扣余额和订阅"到不了，没余额的用户也永远收不到
     /// 402，欠款无上限地记进钱包。
+    #[test]
+    /// 未鉴权的 /api/models 不许下发运营方的加价倍率，上游报错也不许原样透传。
+    ///
+    /// `rate` 的定义原文就是 "the operator's margin, hidden from users"，而这个接口
+    /// 没有任何鉴权（路由上没有 Claims 提取器，nginx 的 location / 也不拦）——
+    /// 一条 curl 就能连着加价前的 input_price/output_price 一起取走，两者相除即毛利率。
+    ///
+    /// 上游报错那条：`data` 是上游完整 JSON，可能含中转商主机名、请求 URL，
+    /// 部分中转商还会回显 Authorization。同一份代码别处早就走 safe_upstream_error_excerpt，
+    /// 只有这条 502 绕过去，而它对任何登录用户开放。
+    fn client_model_list_hides_margin_and_upstream_errors_are_sanitized() {
+        let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/models.rs"))
+            .expect("read models.rs");
+
+        let at = src.find("pub async fn list_for_client").expect("list_for_client 改名了");
+        let body: String = src[at..].chars().take(9_000).collect();
+        assert!(
+            !body.contains("\"rate\": m.rate"),
+            "未鉴权接口又开始下发加价倍率——一条 curl 即可还原毛利率",
+        );
+        // 客户端确实要用 price_source 画定价卡片，别顺手删掉。
+        assert!(body.contains("\"price_source\": price_source"), "price_source 被误删，定价卡片会缺信息");
+
+        // 两个坑都在这一条上踩过：
+        // ① 不要按字节偏移去切中文源码——`src[chat_at - 600..]` 会落在 UTF-8 字符中间直接 panic。
+        // ② 搜索范围必须**排除测试模块自身**：断言里写的那段字面量也在这个文件里，
+        //    拿整份 src 去 contains 就是自己喂自己，改坏了实现也照样绿（实测漏掉了一次变异）。
+        // 用 rfind 找测试模块，不能用 find：文件里 590 行附近还有一个 #[cfg(test)] 的
+        // 辅助函数，按 find 切会把整份生产代码都切没，断言就永远失败。
+        let prod_raw = &src[..src.rfind("#[cfg(test)]").unwrap_or(src.len())];
+        // **先剥注释再断言**。这一条上一版是被自己的注释喂到的：解释性注释里也写着
+        // safe_upstream_error_excerpt，于是把实现改回原样透传，contains 照样命中、测试照样绿
+        // （变异测试实测漏掉了一次）。这个坑本轮已经踩过好几次，这里一次性剥干净。
+        let prod: String = prod_raw
+            .lines()
+            .map(|l| match l.find("//") {
+                Some(i) => &l[..i],
+                None => l,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        // 钉的是**这一处**的形状，不是"文件里出现过这个函数名"——同文件另有几处已经正确
+        // 走了这个 sanitizer，只 contains 的话它们会替被改坏的那处背书（实测漏掉一次变异）。
+        let site = prod
+            .find("模型供应商错误 {}: {}")
+            .expect("找不到上游错误文案");
+        let window: String = prod[site..].chars().take(200).collect();
+        assert!(
+            window.contains("safe_upstream_error_excerpt"),
+            "上游报错又原样透传了：中转商主机名/回显的 Authorization 会直达任何登录用户",
+        );
+        assert!(
+            // 只钉这一处（模型供应商错误）。同文件 1259 / 2023 行另有两处同形拼接，
+            // 属于别的处理器，不在这条断言的范围里。
+            !prod.contains("\"模型供应商错误 {}: {}\", status.as_u16(), data)"),
+            "又把上游完整 JSON 原样拼进错误消息了",
+        );
+    }
+
     #[test]
     /// 整分那部分不许被收第二遍。
     ///
