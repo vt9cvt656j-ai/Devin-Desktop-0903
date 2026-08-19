@@ -19293,7 +19293,11 @@ test("#51-4 子智能体白名单：web_search 在场 + git 只读四件套 + op
   // gh 和 git 同构：单 type 多 op，其中 pr_create / pr_reply 会**不可逆地推到 GitHub**。
   // 把只读的三个放给子体、类型随之放行之后，必须补上同样的 op 闸门。
   // 只按名字挡不住：模型会调它没被展示过的工具（这个仓库还专门为此做了自愈加载）。
-  assert.match(sub, /const _GH_READ_OPS = \["pr_view", "pr_review_comments", "pr_checks", "actions_log"\]/);
+  // _GH_READ_OPS 提到了**模块级**：并行判据（_isReadOnlyParallel）也要用它。原来它只定义在
+  // _runSubAgent 函数体内，别处引用就是运行时 ReferenceError，而抄第二份必然漂——pr_create /
+  // pr_reply 是不可逆的对外动作，漏一次就是真的发出去了。所以钉在 SRC 上，不再钉在 sub 上。
+  assert.match(SRC, /^const _GH_READ_OPS = \["pr_view", "pr_review_comments", "pr_checks", "actions_log"\];/m,
+    "gh 只读 op 表要留在模块级，两个消费者共用一份");
   assert.match(sub, /call\.type === "gh" && !_GH_READ_OPS\.includes\(call\.op\)/);
   assert.match(sub, /\|\| _ghWriteBlocked\b/, "gh 把关必须接进拒绝门禁条件");
   assert.doesNotMatch(sub, /_GH_READ_OPS = \[[^\]]*"pr_create"/, "pr_create 绝不能进只读名单");
@@ -25268,7 +25272,8 @@ test("放权之后轮数上限跟着放开，但墙钟上限没动", () => {
 
 test("gh 的只读 op 放行了，但建 PR / 回复评论仍然拒绝", () => {
   const sub = extractFn("_runSubAgent");
-  const ops = sub.match(/const _GH_READ_OPS = \[([^\]]*)\]/)[1];
+  // 常量提到了模块级（并行判据也要用），所以从 SRC 取；把关逻辑仍在 _runSubAgent 里。
+  const ops = SRC.match(/^const _GH_READ_OPS = \[([^\]]*)\];/m)[1];
   assert.ok(ops.includes('"pr_view"') && ops.includes('"actions_log"'));
   assert.ok(!ops.includes("pr_create") && !ops.includes("pr_reply"),
     "不可逆的对外动作绝不能进只读名单");
@@ -28704,4 +28709,37 @@ test("chat 模式报工具名（由网关白名单裁决），并用真正的映
   // ③ 网关那份白名单是唯一真源，客户端不许出现同名的第二份
   assert.doesNotMatch(src, /"wiki_search"[\s\S]{0,80}"arxiv_search"[\s\S]{0,80}"crossref_search"/,
     "客户端抄了一份 chat 工具白名单——两份必然漂，网关那份才是裁决者");
+});
+
+// ---- 用户自定义角色：类型要从工具名推导，别给一把打不开门的钥匙 ----
+test("自定义角色声明的工具，执行侧类型必须能对上", () => {
+  const fn = extractFn("_userRoleMap");
+  assert.match(fn, /_mapToolCall\(n, \{\}\)\?\.type/,
+    "类型还是原样透传用户写的——名字过了注册表校验、类型没有，那件工具一调就是 [BLOCKED]");
+  assert.match(fn, /\.\.\.\(Array\.isArray\(r\.types\) \? r\.types : \[\]\)/,
+    "用户显式声明的 types 要并进来，不能被推导覆盖掉");
+  // 推导用的是 _mapToolCall——名字→类型的唯一权威映射。它本身的正确性由契约全量扫描
+  // （test/tool-contract-sweep.test.mjs：给目录里每个工具按自己的 schema 合成一次调用）覆盖，
+  // 这里只钉「角色确实走了它」，不重复那套。
+  assert.match(SRC, /case "db_query": return \{ type: "db"/,
+    "映射器里 db_query 的类型变了，上面那条推导跟着变——角色准入要重新核");
+});
+
+// ---- 两份「只读」名单不许再漂 ----
+test("子体认定的纯只读类型，并行判据也必须认", () => {
+  const readTypes = new Set([...(/const _READ_TYPES = \[([^\]]*)\]/.exec(SRC)[1].matchAll(/"([a-z_0-9]+)"/g))].map((m) => m[1]));
+  const parallel = new Set([...(/const _READ_ONLY_TYPES = new Set\(\[([\s\S]*?)\]\);/.exec(SRC)[1].matchAll(/"([a-z_0-9]+)"/g))].map((m) => m[1]));
+  // 这几类是**单 type 多 op**：并行判据里按 op 逐次判（git checkout 会换掉整棵工作树，
+  // gh pr_create 是不可逆的对外动作），所以它们出现在 _READ_TYPES 而不在这份集合里是对的。
+  const opGated = new Set(["git", "gh", "http", "db", "mcp", "userhttp"]);
+  // 被排除的那几个必须真的**在判据里按 op 判**，否则这条排除就成了免检通道。
+  const par = extractFn("_isReadOnlyParallel");
+  assert.match(par, /if \(t === "gh"\) return _GH_READ_OPS\.includes\(String\(call\.op \|\| ""\)\);/,
+    "gh 又变成一刀切了——要么把只读的 pr_view 白白串行化，要么把不可逆的 pr_create 放进并行段");
+  assert.match(par, /if \(t === "git"\)/, "git 的 op 级把关没了");
+  assert.match(par, /if \(t === "http"\)/, "http 的 method 级把关没了");
+  assert.match(par, /if \(t === "db"\)/, "db 的可变判定没了");
+  const missing = [...readTypes].filter((t) => !parallel.has(t) && !opGated.has(t) && !t.endsWith("_search") && t !== "knowledge");
+  assert.deepEqual(missing, [],
+    `这些类型本仓库自己认定只读（_READ_TYPES 里就有），却被并行判据漏掉、白白串行化：${missing.join(", ")}`);
 });

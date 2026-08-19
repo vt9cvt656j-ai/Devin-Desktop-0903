@@ -42215,11 +42215,22 @@ function _tauriSearchInvokeArgs(call) {
 // db queries and terminal reads — so a turn that batches many such calls finishes in
 // one round-trip. Every workspace-writing tool, including asset generation, stays
 // strictly sequential even when two calls happen to name different destinations.
-const _READ_ONLY_TYPES = new Set(["read", "list", "search", "find", "web", "websearch", "lsp", "screenshot", "diag", "think", "recall", "termread", "termlist", "logs", "search_tools", "skill", "current_time", "localdiscovery", "liveenvironment", "github_repo", "gitlab_repo", "gitee_repo", "codeberg_repo"]);
+const _READ_ONLY_TYPES = new Set(["read", "list", "search", "find", "web", "websearch", "lsp", "screenshot", "diag", "think", "recall", "termread", "termlist", "logs", "search_tools", "skill", "current_time", "localdiscovery", "liveenvironment", "github_repo", "gitlab_repo", "gitee_repo", "codeberg_repo",
+  // 下面这几个本来就在 `_READ_TYPES`（子体的只读类型表，本仓库自己认定的"这些只读"）里，
+  // 却漏在这份并行判据外——于是它们被无谓地串行化：语义检索、找符号、看图、探环境、
+  // 抽 UI、读屏，每一个都得等前一个跑完。两份手写名单漂了，这是第 N 次。
+  "semsearch", "findsymbol", "viewimage", "probeenv", "uiextract", "readscreen",
+  // 名字不以 _search 结尾，但同样是纯检索。
+  "search_game_assets"]);
 const _MUTATING_FILE_TOOL_TYPES = fileEditTypes();
 function _isMergedToolItem(item) {
   return item?.merged != null;
 }
+// gh 的只读 op。**模块级**：并行判据（_isReadOnlyParallel）和子体的执行白名单都要用它，
+// 原来它只定义在 _runSubAgent 函数体内，别处引用就是运行时 ReferenceError——而 node --check
+// 查不出这种错。抄第二份更糟：pr_create / pr_reply 是不可逆的对外动作，两份名单漂了就会漏。
+const _GH_READ_OPS = ["pr_view", "pr_review_comments", "pr_checks", "actions_log"];
+
 function _isReadOnlyParallel(call) {
   if (!call) return false;
   const t = call.type;
@@ -42238,6 +42249,9 @@ function _isReadOnlyParallel(call) {
     if (op === "branch") return !call.branch && !call.create;
     return /^(status|diff|log|blame|conflicts|stash_list)$/.test(op);
   }
+  // gh 和 git 同形：单 type 多 op，只读那几个可以并行，pr_create / pr_reply 这类对外
+  // 不可逆动作绝不能。判据复用 _GH_READ_OPS，不另抄一份。
+  if (t === "gh") return _GH_READ_OPS.includes(String(call.op || ""));
   if (t === "http") return /^(get|head)$/i.test((call.method || "GET").trim());
   // WITH/PRAGMA/EXPLAIN are not provably read-only: writable CTEs, assignment
   // pragmas, and EXPLAIN ANALYZE can all execute mutations.
@@ -43970,7 +43984,19 @@ function _userRoleMap() {
     out.set(r.name, {
       prompt: r.prompt,
       tools: r.tools.filter(isRealTool),
-      types: r.types,
+      // 类型必须**从工具名推导**，不能原样透传用户写的。
+      //
+      // 名字这侧按真实注册表校验过（isRealTool），类型这侧却直接用 r.types——而执行侧的
+      // 准入判的是**类型**。用户在自己的角色里写了 tools: ["db_query"] 却没写（或写错）
+      // 对应的 types，那件工具就进了模型的清单、一调就是 [BLOCKED]：给了一把打不开门的
+      // 钥匙。这个文件里已经为同一个形状写过注释（_READ_TOOLS / _READ_TYPES 两份手抄）。
+      //
+      // _mapToolCall 是名字→类型的唯一权威映射，用它推导；用户显式写的 types 仍然并进来
+      // （他可能声明了某个我们推不出来的形状），只是不再是唯一来源。
+      types: [...new Set([
+        ...(Array.isArray(r.types) ? r.types : []),
+        ...r.tools.filter(isRealTool).map((n) => { try { return _mapToolCall(n, {})?.type || ""; } catch { return ""; } }).filter(Boolean),
+      ])],
       source: r.source,
     });
   }
@@ -44591,7 +44617,6 @@ async function _runSubAgent({ config, description, prompt, root, container, run,
   // 和 CI 日志是调研的常规动作），类型就必须放行，于是必须补上同样的把关。
   // 只按名字挡不住：模型会调它没被展示过的工具（这个仓库还专门为此做了"工具不丢失"的
   // 自愈加载），真正的边界只能在执行侧。
-  const _GH_READ_OPS = ["pr_view", "pr_review_comments", "pr_checks", "actions_log"];
   // P0.2: 只读 subagent 额外授予 run_cmd 权限，但仅限纯探索类命令（ls/cat/grep 等）
   const _allow = write
     ? [..._READ_TOOLS, "write_file", "edit_file", "multi_edit", "run_cmd", "format_file", "create_dir"]
