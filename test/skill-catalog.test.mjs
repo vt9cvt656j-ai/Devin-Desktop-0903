@@ -149,7 +149,9 @@ test("技能：正文不被腰斩、描述不被提前砍死、allowed-tools 真
   // 只钉文本的话照样绿。
   assert.match(gate.slice(0, 1400), /const skillGate = typeof _skillAllowedTools === "function" \? _skillAllowedTools\(\) : null;/,
     "审批闸没接技能白名单，allowed-tools 又变回纯装饰");
-  assert.match(gate.slice(0, 1600), /!_skillToolAllowed\(skillGate\.allow,/, "闸没真的去查白名单");
+  // 形状变了（改成把这次调用的几个名字都试一遍，见本文件末尾那条行为测试），但意思不变：
+  // 闸必须真的去查白名单。切片放宽是因为那处补了一大段说明为什么不能按单一字段比对。
+  assert.match(gate.slice(0, 3200), /_skillToolAllowed\(skillGate\.allow, n\)/, "闸没真的去查白名单");
   // 取并集不取交集：启用两个技能时两边的工具都该可用，交集会让"启用越多能干越少"。
   const allow = SRC.slice(SRC.indexOf("function _skillAllowedTools"));
   assert.match(allow.slice(0, 900), /for \(const s of declaring\) for \(const t of s\.tools\)/,
@@ -248,4 +250,39 @@ test("界面上不再有任何「启用 / 未启用」的说法", () => {
   }
   assert.match(skillsPage, /on \? "常驻" : "按需"/, "状态标签没改成说实话的那个");
   assert.match(skillsPage, /on \? "已常驻" : "设为常驻"/, "切换按钮还在说「启用」");
+});
+
+// 上面第 ③ 条钉的是「闸接上了没有」——全是源码文本断言，所以下面这个 bug 一直是绿的：
+// 闸接上了，比对的字段却是错的。这条真的把闸跑一遍。
+test("allowed-tools 比对的必须是工具注册名，不是映射后的内部类型", () => {
+  const aliases = /const _SKILL_TOOL_ALIASES = \{[\s\S]*?\n\};/.exec(SRC);
+  const fn = /function _skillToolAllowed\(allow, toolName\) \{[\s\S]*?\n\}/.exec(SRC);
+  assert.ok(aliases && fn, "别名表或 _skillToolAllowed 改名/挪走了，这条断言失去落点");
+  const allowed = new Function(`${aliases[0]}\n${fn[0]}\nreturn _skillToolAllowed;`)();
+  const A = (...names) => new Set(names);
+
+  // 病根：run_cmd 映射完是 { type: "cmd" }，没有 name。闸原来取 call.name || call.tool || call.type，
+  // 于是拿「cmd」去比白名单里的「run_cmd」——对不上，静默拒。
+  assert.equal(allowed(A("run_cmd"), "run_cmd"), true, "技能声明了 run_cmd 却放不行 run_cmd");
+  assert.equal(allowed(A("run_cmd"), "cmd"), false,
+    "「cmd」不该被放行——它证明当年传错字段时这道闸会把技能自己声明的工具拒掉");
+
+  // 别名表的值是**注册名**，所以传 type 进来时别名这条路同样断掉。
+  assert.equal(allowed(A("bash"), "run_cmd"), true, "Claude Code 风格的 bash 没映到 run_cmd");
+  assert.equal(allowed(A("bash"), "run_in_terminal"), true, "bash 要能覆盖 IDE 终端，否则长驻服务起不来");
+  assert.equal(allowed(A("write"), "multi_edit"), true, "write 覆盖不到 multi_edit，多处改写会被拒");
+  assert.equal(allowed(A("read"), "read_file"), true);
+
+  // read_skill 的 call.name 是**技能名**，所以「永远放行」那句以前一次都没兑现。
+  assert.equal(allowed(A("read", "read_skill"), "read_skill"), true, "技能把自己锁死了，模型读不到正文");
+
+  // 闸没有变松：没声明的工具照样拒。
+  assert.equal(allowed(A("read"), "run_cmd"), false, "allowed-tools 不再是真约束了");
+
+  // 钉实现特征：闸必须拿注册名去比，且不许再用 call.name（那对 read_skill 是技能名）。
+  const gate = SRC.slice(SRC.indexOf("async function _approveToolCall"), SRC.indexOf("async function _approveToolCall") + 2600);
+  assert.match(gate, /\[call\._toolName, call\.tool, call\.type\]\.filter\(Boolean\)/,
+    "闸又改回按单一字段比对了——run_cmd/write_file 会被自己声明它们的技能拒掉");
+  assert.doesNotMatch(gate, /_skillToolAllowed\(skillGate\.allow, call\.name/,
+    "call.name 对 read_skill 是技能名，拿它当工具名会让技能自锁");
 });
