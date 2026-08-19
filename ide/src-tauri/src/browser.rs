@@ -1982,6 +1982,80 @@ pub async fn browser_storage(storage_type: Option<String>) -> Result<BrowserStat
 }
 
 /// Close the browser and free the session.
+/// 用户**自己那个**浏览器里现在开着什么。
+///
+/// 为什么需要它：CDP 接管不了一个没带调试端口启动的浏览器（端口是启动期参数，进程跑起来
+/// 加不上）——这条已经查证过两次，绕不过去。但用户问的不是"接管"，是
+/// 「我自己开着浏览器，你也不判断内容，也不判断要用哪个」。**看一眼**和**接管**是两件事，
+/// 而看一眼在 macOS 上根本不需要 CDP：Chrome 的 AppleScript 字典直接给标签页、标题和 URL。
+///
+/// 实测（2026-08-19，Chrome 151，用户日常那个从 Dock 起的实例）：
+///   · 窗口数 / 标签页 / 标题 / URL / 哪个是当前标签 —— **开箱可读，不需要任何设置**
+///   · 页面正文（execute javascript）—— 被 Chrome 挡着，要用户在
+///     「查看 → 开发者 → 允许 Apple 事件中的 JavaScript」里打开一次
+/// 所以这里只做能稳定拿到的那部分，并在读不到正文时**说清楚那一步怎么开**，
+/// 而不是假装拿不到就是没有。
+///
+/// 拿不到就返回空列表，绝不阻断：这只是给模型多一份判断依据。
+#[tauri::command]
+pub async fn browser_user_tabs() -> Result<serde_json::Value, String> {
+    #[cfg(target_os = "macos")]
+    {
+        let mut browsers = Vec::new();
+        for kind in crate::capture::BROWSER_KINDS {
+            // 只问**正在跑**的，否则 AppleScript 会把没开的那个也启动起来——
+            // 一个"看看你开着什么"的调用把浏览器开起来，比不看还糟。
+            if !is_browser_running(kind.process_name) {
+                continue;
+            }
+            let script = format!(
+                r#"tell application "{}"
+  set out to ""
+  repeat with w from 1 to (count of windows)
+    repeat with t from 1 to (count of tabs of window w)
+      set out to out & w & tab & t & tab & (title of tab t of window w) & tab & (URL of tab t of window w) & linefeed
+    end repeat
+  end repeat
+  return out
+end tell"#,
+                kind.process_name
+            );
+            let Ok(out) = std::process::Command::new("osascript")
+                .args(["-e", &script])
+                .output()
+            else {
+                continue;
+            };
+            if !out.status.success() {
+                continue;
+            }
+            let mut tabs = Vec::new();
+            for line in String::from_utf8_lossy(&out.stdout).lines() {
+                let cols: Vec<&str> = line.split('\t').collect();
+                if cols.len() < 4 {
+                    continue;
+                }
+                tabs.push(serde_json::json!({
+                    "window": cols[0].trim(),
+                    "tab": cols[1].trim(),
+                    "title": cols[2],
+                    "url": cols[3],
+                }));
+            }
+            if !tabs.is_empty() {
+                browsers.push(serde_json::json!({ "browser": kind.label, "tabs": tabs }));
+            }
+        }
+        return Ok(serde_json::json!({ "browsers": browsers }));
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        // Windows/Linux 没有等价的、开箱可用的进程外读法（UIA/AT-SPI 拿得到标题但拿不到 URL，
+        // 而 URL 才是这件事的价值所在）。诚实返回空，别给一份半真的清单。
+        Ok(serde_json::json!({ "browsers": [], "unsupported": true }))
+    }
+}
+
 #[tauri::command]
 pub async fn browser_close() -> Result<(), String> {
     tauri::async_runtime::spawn_blocking(|| {
@@ -2282,6 +2356,37 @@ mod tests {
             .collect();
         let uniq: std::collections::HashSet<_> = all.iter().collect();
         assert_eq!(uniq.len(), all.len(), "两个浏览器指向了同一个配置目录");
+    }
+
+    /// 「我自己开着浏览器，你也不判断内容，也不判断要用哪个」。
+    ///
+    /// 看一眼和接管是两件事。接管确实做不到（调试端口是启动期参数），但**看一眼**在 macOS 上
+    /// 根本不需要 CDP——Chrome 的 AppleScript 字典直接给标签页、标题和 URL，实测开箱可读。
+    /// 这条钉住这个能力真的接出去了，别又变成"写好了、零调用点"。
+    #[test]
+    fn 读用户自己浏览器这条命令要真的接进命令表() {
+        const SRC: &str = include_str!("browser.rs");
+        const LIB: &str = include_str!("lib.rs");
+        // 需要的串拼出来找：include_str! 读的是整个文件、包含本测试模块自己。
+        let cmd = format!("pub async fn {}(", "browser_user_tabs");
+        assert!(SRC.contains(&cmd), "命令没了");
+        let reg = format!("browser::{},", "browser_user_tabs");
+        assert!(
+            LIB.contains(&reg),
+            "命令没注册进 invoke_handler —— 前端调它只会拿到 'command not found'"
+        );
+        // 只问**正在跑**的浏览器：AppleScript 对一个没开的应用发指令会把它**启动起来**，
+        // 一个"看看你开着什么"的调用反而开出一个浏览器，比不看还糟。
+        let guard = format!("if !{}(kind.process_name)", "is_browser_running");
+        assert!(
+            SRC.contains(&guard),
+            "少了「只问正在跑的」这道判据 —— 会把没开的浏览器启动起来",
+        );
+        // 拿不到就返回空，绝不阻断：这只是给模型多一份判断依据，不是必需品。
+        assert!(
+            SRC.contains("\"unsupported\": true"),
+            "非 macOS 要诚实返回空 + 标记，不能假装拿到了",
+        );
     }
 
     /// 「做错一步，浏览器就被关掉重开」——判死判得太宽。

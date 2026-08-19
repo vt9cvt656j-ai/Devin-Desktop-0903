@@ -33089,9 +33089,9 @@ function _buildAgentToolSchemas(includeWrite, mcpTools = []) {
       // "open" 排头：它是**默认该先想到的那个**——只是要让用户看一眼页面时，交给他自己的
       // 默认浏览器，不起自动化窗口。这份名单会覆盖上面 schema 字面量里的 enum，
       // 只改那边等于没改（这次就先踩了一次）。
-      const wantedActions = ["open", "navigate", "observe", "viewport", "click", "dblclick", "rightclick", "longpress", "type", "clear", "append", "autofill", "fill", "hover", "drag", "slide", "swipe", "wheel", "toggle", "uncheck", "select", "focus", "blur", "press", "scroll", "wait", "eval", "screenshot", "design", "network", "inspect", "nodes", "assert", "check", "batch", "upload", "cookies", "storage", "close"];
+      const wantedActions = ["mytabs", "open", "navigate", "observe", "viewport", "click", "dblclick", "rightclick", "longpress", "type", "clear", "append", "autofill", "fill", "hover", "drag", "slide", "swipe", "wheel", "toggle", "uncheck", "select", "focus", "blur", "press", "scroll", "wait", "eval", "screenshot", "design", "network", "inspect", "nodes", "assert", "check", "batch", "upload", "cookies", "storage", "close"];
       browserProps.action.enum = wantedActions;
-      browserProps.action.description = "The browser action to perform. **open = hand the URL to the USER'S OWN default browser for them to look at** — their tabs, their logins, their extensions; no automation session, no second Dock icon, works even if their default is Safari or Firefox. You do not see the page. Use it whenever the point is for the user to look (the dev server you just started, a deployed site, a doc, a link); use navigate and the rest only when YOU need to read, click or verify the page. observe = structured observation of the page (ready/active/iframe/shadow/nodes); check only performs a page health check; for checkboxes and switches use toggle + checked:true/false (or batch op:check/uncheck). For sequential or complex operations prefer batch (real pointer/mouse events, dblclick/rightclick/longpress, hover, drag/slide/swipe, wheel, focus/blur, clear/append, deep targeting through Shadow DOM and same-origin iframes, occlusion detection, candidate recovery, native setters, settling after each action, expect* acceptance checks); for forms prefer autofill/fill (fields={email,password,...}, optionally submit:true/submitText to submit, returning filled/missing/invalid with the validation reason). upload sends a file to an <input type=file>: use selector to pick the file input and path/paths for the absolute local file path.";
+      browserProps.action.description = "The browser action to perform. **mytabs = look at what the user already has open in their OWN browser** (titles and URLs, macOS only, no automation window involved) — check this FIRST whenever the task touches a page the user might already be on, so you decide from what is actually open instead of reflexively launching a window. It returns titles and URLs only, never page text. **open = hand the URL to the USER'S OWN default browser for them to look at** — their tabs, their logins, their extensions; no automation session, no second Dock icon, works even if their default is Safari or Firefox. You do not see the page. Use it whenever the point is for the user to look (the dev server you just started, a deployed site, a doc, a link); use navigate and the rest only when YOU need to read, click or verify the page. observe = structured observation of the page (ready/active/iframe/shadow/nodes); check only performs a page health check; for checkboxes and switches use toggle + checked:true/false (or batch op:check/uncheck). For sequential or complex operations prefer batch (real pointer/mouse events, dblclick/rightclick/longpress, hover, drag/slide/swipe, wheel, focus/blur, clear/append, deep targeting through Shadow DOM and same-origin iframes, occlusion detection, candidate recovery, native setters, settling after each action, expect* acceptance checks); for forms prefer autofill/fill (fields={email,password,...}, optionally submit:true/submitText to submit, returning filled/missing/invalid with the validation reason). upload sends a file to an <input type=file>: use selector to pick the file input and path/paths for the absolute local file path.";
     }
     browserProps.width = { type: "integer", description: "For viewport: viewport width, e.g. 1440 on desktop, 390 on a phone" };
     browserProps.height = { type: "integer", description: "For viewport: viewport height, e.g. 900 on desktop, 844 on a phone" };
@@ -57693,6 +57693,43 @@ return { type: call.type, path: call.query || "", content: `[失败] ${call.type
           type: "browser", path: "open", url: _u,
           content: `已在**用户自己的默认浏览器**里打开 ${_u}（他的登录态、扩展、书签都在），没有启动任何自动化会话，也没有多出一个自动化窗口。\n`
             + `**你看不到这个页面的内容**——这条路只负责把页面交到用户眼前。需要自己读页面、点按钮、截图验收时，用 navigate 等自动化动作。`,
+        };
+      }
+      // 「我自己开着浏览器，你也不判断内容，也不判断要用哪个」。
+      //
+      // 接管确实做不到（调试端口是启动期参数，进程跑起来加不上，这条查证过两次）。但用户
+      // 要的不是接管，是**先看一眼再决定**。而看一眼不需要 CDP：macOS 上 Chrome 的
+      // AppleScript 字典直接给标签页、标题和 URL，实测开箱可读、不需要任何设置。
+      //
+      // 有了这一步，模型才有判据：他已经开着那一页 → 让他自己看就行（用 open）；
+      // 需要登录态/需要点来点去 → 才动自动化窗口。以前模型手上一份信息都没有，
+      // 只能一律新开一个。
+      if (act === "mytabs") {
+        let _r = null;
+        try { _r = await backend.invoke("browser_user_tabs"); }
+        catch (e) {
+          res.className = "atc-result atc-result--err"; res.textContent = "读不到";
+          return { type: "browser", path: "mytabs", content: `[失败] 读不到用户浏览器的标签页：${String(e?.message || e).slice(0, 200)}` };
+        }
+        const _bs = Array.isArray(_r?.browsers) ? _r.browsers : [];
+        const _n = _bs.reduce((a, b) => a + ((b.tabs || []).length), 0);
+        res.className = "atc-result atc-result--ok"; res.textContent = _n ? `${_n} 个标签页` : "没开浏览器";
+        if (_r?.unsupported) {
+          return { type: "browser", path: "mytabs", content: "[不可用] 读取用户自己的浏览器目前只在 macOS 上支持。判断该不该新开窗口时，按「没有可参考信息」处理。" };
+        }
+        if (!_n) {
+          return { type: "browser", path: "mytabs", content: "用户当前**没有开着**任何受支持的浏览器。要给他看页面就用 open（会用他的默认浏览器打开）；要你自己操作页面就用 navigate。" };
+        }
+        const _lines = _bs.map((b) => `【${b.browser}】\n`
+          + (b.tabs || []).map((t) => `  · ${String(t.title || "").slice(0, 80)}\n    ${t.url}`).join("\n")).join("\n");
+        return {
+          type: "browser", path: "mytabs", userTabs: _bs,
+          content: `用户自己的浏览器现在开着这些（共 ${_n} 个标签页）：\n${_lines}\n\n`
+            + `**据此决定，别一律新开窗口**：他已经开着你要的那一页 → 用 open 把它带到他眼前，或者直接根据这个信息回答；`
+            + `需要你自己读页面内容、点按钮、填表单、截图验收 → 才用 navigate 起自动化窗口。\n`
+            + `注意：这里只有标题和网址，**读不到页面正文**（Chrome 默认禁止 Apple 事件执行 JavaScript）。`
+            + `要读正文得让用户在 Chrome 菜单「查看 → 开发者 → 允许 Apple 事件中的 JavaScript」里打开一次——`
+            + `没打开就别猜页面里写了什么。`,
         };
       }
       if (act === "close") {

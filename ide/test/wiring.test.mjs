@@ -534,9 +534,10 @@ test("browser 要有一条「交给用户自己的浏览器」的路，而且是
   // ① 执行器认得这个动作，并且**不启动任何会话**（走 openUrl，不碰 CDP）
   const at = SRC.indexOf('if (act === "open") {');
   assert.ok(at > 0, "browser 执行器里没有 open 动作");
-  // 切片只到 open 块本身为止：再往后是 close 分支，那里本来就有 invoke("browser_close")，
-  // 切进去会让下面那条"不许碰会话"的断言永远红——断言切错范围和断言写错一样坏。
-  const implEnd = SRC.indexOf('if (act === "close") {', at);
+  // 切片只到 open 块本身为止：再往后的分支各自有自己的 invoke（close 有 browser_close、
+  // mytabs 有 browser_user_tabs），切进去会让下面那条"不许碰会话"的断言永远红——
+  // 断言切错范围和断言写错一样坏。所以取**下一个** act 分支的起点，而不是写死某一个。
+  const implEnd = SRC.indexOf('if (act === "', at + 20);
   assert.ok(implEnd > at, "找不到 open 块的结尾");
   const impl = SRC.slice(at, implEnd);
   assert.match(impl, /backend\.openUrl\(/, "open 必须交给系统默认浏览器，而不是自己起浏览器");
@@ -561,6 +562,39 @@ test("browser 要有一条「交给用户自己的浏览器」的路，而且是
   assert.ok(descAt > 0);
   const desc = SRC.slice(descAt, descAt + 1600);
   assert.match(desc, /open = hand the URL/, "生效的 action 说明里没有 open 的用法指引");
+});
+
+// 用户第三次说同一件事：「我自己开着浏览器，他也不判断内容，也不判断要用哪个」。
+//
+// 接管做不到（调试端口是启动期参数，跑起来加不上，查证过两次）。但**看一眼**和**接管**
+// 是两件事，而看一眼在 macOS 上不需要 CDP——Chrome 的 AppleScript 字典直接给标签页、
+// 标题和 URL，实测开箱可读。有了这一步，模型才有判据去决定"要不要新开窗口"。
+test("模型要能先看一眼用户自己开着什么，再决定要不要新开窗口", () => {
+  const at = SRC.indexOf('if (act === "mytabs") {');
+  assert.ok(at > 0, "browser 没有「看用户自己的标签页」这个动作");
+  const impl = SRC.slice(at, SRC.indexOf('if (act === "', at + 20));
+  assert.match(impl, /invoke\("browser_user_tabs"\)/, "要调到那个真的读得到标签页的命令");
+  // 这条路绝不能起浏览器：它的全部意义就是"先别开窗口"
+  assert.doesNotMatch(impl, /browser_navigate|current_or_launch|aiChatWithTools/,
+    "看一眼的路不许启动任何浏览器会话——起了就失去意义了");
+  // 结果必须把「据此决定」讲明白，否则模型拿到一堆标题也不知道要干嘛
+  assert.match(impl, /据此决定，别一律新开窗口/,
+    "要明确告诉模型拿这份信息去做什么判断");
+  // 读不到正文这件事要说清楚，否则模型会凭标题编页面内容
+  assert.match(impl, /读不到页面正文/,
+    "必须说明只有标题和网址——不说的话模型会拿标题去猜正文");
+  // 而且要给出打开正文读取的确切路径，让这件事可解决而不是死路
+  assert.match(impl, /允许 Apple 事件中的 JavaScript/,
+    "要给出用户能照做的那一步，别只说做不到");
+
+  // **生效的那份**枚举里要有它。schema 字面量那份会被 wantedActions 整个覆盖，
+  // 只改字面量等于没改（这个坑本会话已经踩过一次）。
+  const wa = SRC.indexOf("const wantedActions = [");
+  const list = SRC.slice(wa, SRC.indexOf("]", wa));
+  assert.match(list, /"mytabs"/, "真正生效的动作枚举里没有 mytabs，模型调不到");
+  const descAt = SRC.indexOf('browserProps.action.description = "');
+  assert.match(SRC.slice(descAt, descAt + 2200), /mytabs = look at/,
+    "生效的 action 说明里没有 mytabs 的用法指引，模型不知道该先看一眼");
 });
 
 // 「我先这样改了，需要我跑一下测试验证吗？」——用一个问号收尾，就把"改了代码没验证"
