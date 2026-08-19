@@ -114,8 +114,12 @@ rsync_run() {
   local attempt status
   for attempt in 1 2 3 4 5; do
     status=0
+    # 注意 `--exclude '.env*'` 而不是 `--exclude .env`：rsync 带 --delete-delay，
+    # 只排除 `.env` 的话，服务器上的 `.env.test`（本地没有这个文件）会被当成"多余文件"
+    # **删掉** —— 表现是第一次测试部署报「No .env.test exists」，而它其实是刚被这次
+    # rsync 删的。（注释必须写在命令**外面**：写在续行反斜杠后面会把命令截断。）
     rsync -az --delete-delay -e "$RSYNC_RSH" \
-      --exclude target --exclude .env --exclude .git \
+      --exclude target --exclude '.env*' --exclude .git \
       --exclude .DS_Store --exclude node_modules \
       --exclude '*.tsbuildinfo' \
       --filter 'protect backups' \
@@ -150,7 +154,11 @@ echo "validating, updating and health-checking containers (serialized)"
 # replacement and health check so only one rollout can touch the project at a
 # time. The lock is operational coordination only; it does not change request
 # handling or access policy.
-DC="docker compose -p $COMPOSE_PROJECT $COMPOSE_FILES"
+# `--env-file` 是给 **${VAR} 插值**用的（POSTGRES_USER / BACKEND_PORT / SITES_DIR 这些
+# 写在 compose 文件里的占位）。它和服务里的 `env_file:` 是两件事：后者只把变量注入容器，
+# 不参与插值。生产靠目录里那个 `.env` 被 Compose 自动加载，测试目录里没有 `.env`，
+# 必须显式指过去，否则所有 ${VAR} 都会插成空串（表现是一堆 "variable is not set"）。
+DC="docker compose -p $COMPOSE_PROJECT --env-file $ENV_FILE $COMPOSE_FILES"
 REMOTE_DEPLOY_CMD="cd $REMOTE_Q && $DC config --quiet && $DC up -d --build && for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30; do if curl -fsS http://127.0.0.1:${HEALTH_PORT}/health >/dev/null; then $DC ps; exit 0; fi; sleep 2; done; $DC logs --tail=100 backend; exit 1"
 REMOTE_DEPLOY_CMD_Q="$(printf '%q' "$REMOTE_DEPLOY_CMD")"
 ssh_run "flock -w $DEPLOY_LOCK_TIMEOUT_SECS $REMOTE_LOCK_Q bash -c $REMOTE_DEPLOY_CMD_Q"

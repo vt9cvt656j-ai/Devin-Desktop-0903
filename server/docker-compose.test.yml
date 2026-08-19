@@ -26,7 +26,6 @@ services:
       POSTGRES_DB: ${POSTGRES_DB}
 
   backend:
-    env_file: .env.test
     environment:
       DATABASE_URL: postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
       REDIS_URL: redis://redis:6379
@@ -36,7 +35,7 @@ services:
       # 让运行中的进程自己知道身在何处：日志、健康页、以及任何"别在生产上干这个"的
       # 判断都可以读它。生产不设这个变量。
       MICHAEL_ENV: "test"
-    # 端口和静态站目录**不在这里覆盖**，靠 .env.test 里的 BACKEND_PORT / SITES_DIR。
+    # 端口、静态站目录、env 文件名**都不在这里覆盖**，靠 .env.test 里的 BACKEND_PORT / SITES_DIR。
     # 原因：Compose 合并 ports 这类列表字段时是**拼接**不是替换，在这里写一行
     # `- "127.0.0.1:8081:8080"` 会让最终配置同时发布 8080 和 8081，直接和生产抢端口。
     # volumes 按挂载点合并（同 target 会被替换），本来可以写在这里，但为了让"两个环境

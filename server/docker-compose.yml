@@ -58,7 +58,10 @@ services:
       - no-new-privileges:true
     cap_drop:
       - ALL
-    env_file: .env
+    # 走变量而不是让测试环境用覆盖文件改：Compose 合并 `env_file` 这类**列表**字段
+    # 同样是**拼接**，覆盖里写 `.env.test` 的结果是它同时去读 `.env` 和 `.env.test`，
+    # 而测试目录里没有 `.env` → "env file not found" 直接失败。（和 ports 一个坑。）
+    env_file: ${ENV_FILE_NAME:-.env}
     environment:
       DATABASE_URL: postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
       REDIS_URL: redis://redis:6379
