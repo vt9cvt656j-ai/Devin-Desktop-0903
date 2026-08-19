@@ -11350,7 +11350,9 @@ test("编排器要按难度调整「最小集合」——难任务第一轮就�
   // 画像里的难度字段本来就在传给编排器，只是从没人说过它该怎么改变答案。
   const src = stripJsComments(SRC);
   assert.match(src, /按难度调整这个"最小"/, "编排器仍然无条件要最小集合，难任务会一次只递一个工具、来回七八轮");
-  assert.match(src, /industrialProject \/ largeProject \/ substantial \/ projectScope \/ longTask/,
+  // longTask 从这串里去掉了：它没有任何生产者（不在 _AI_INTENT_DIMENSIONS 里），
+  // 点名一个模型永远不会输出的字段，只会让读提示词的人以为它在起作用。
+  assert.match(src, /industrialProject \/ largeProject \/ substantial \/ projectScope/,
     "没点名画像里的难度字段，模型无从判断该不该铺开");
   assert.match(src, /真实不确定性/);
   // 反方向同样要写死，否则它会变成"每轮都铺开"，那是另一种浪费。
@@ -28618,4 +28620,42 @@ test("尝试写了没落盘时，结局里必须留下 writes_failed", () => {
   assert.equal(labels.writes_failed, "重写那几个没写成的文件");
   // 标签按冒号前的基名查表，`writes_failed:2` 要能查到。
   assert.equal(labels["writes_failed:2".split(":")[0]], "重写那几个没写成的文件");
+});
+
+// ---- 承诺了却零调用点的三条，接上/拆掉之后钉住 ----
+test("密钥文件不进主动发现的项目树（显式读取不受影响）", () => {
+  // 这棵树每轮自动注入进模型上下文。仓库里一个 server.key / credentials.json / id_rsa
+  // 会被原样端到模型面前（进而进上游请求）。_isSecretPath 就是为这件事写的，却一直零调用点。
+  const fn = extractFn("_workspaceTreeSnapshot");
+  const m = /\.filter\(\(entry\) => \{[\s\S]*?\n      \}\)/.exec(fn);
+  assert.ok(m, "项目树的过滤器形状变了，这条断言失去落点");
+  const filter = new Function("_agentDirEntryName", "_agentDirEntryIsDir", "_AGENT_CONTEXT_SKIP_DIRS",
+    "_isSecretPath", "options", "entries", `return entries${m[0]};`);
+  const secret = load("_isSecretPath");
+  const run = (names) => filter((e) => e.name, (e) => !!e.dir, new Set(["node_modules"]), secret, {},
+    names.map((n) => ({ name: n }))).map((e) => e.name);
+  const out = run(["src", "server.key", "credentials.json", "id_rsa", "app.pem", ".env", "index.ts"]);
+  for (const gone of ["server.key", "credentials.json", "id_rsa", "app.pem"]) {
+    assert.ok(!out.includes(gone), `${gone} 被主动端进上下文了`);
+  }
+  // .env 是刻意放行的：它另有安全设计（只抽键名、按基础设施关键词过滤、值一律隐藏）。
+  assert.ok(out.includes(".env"), ".env 被一起挡掉了——项目上下文那条键名线索会跟着消失");
+  assert.ok(out.includes("index.ts") && out.includes("src"), "普通文件被误伤");
+});
+
+test("判成用户自己的 .mcp.local.json 之后，真的把它写进 .git/info/exclude", () => {
+  // 两处注释拿它当已经在跑的机制解释整条信任链，而它一直零调用点。
+  const src = stripJsComments(SRC);
+  assert.match(src, /if \(!tracked\) \{ try \{ await _protectLocalMcpConfig\(base\); \} catch \{\} \}/,
+    "信任链判据（git 有没有跟踪它）没有被保护——配置一旦被误 commit，审批档位就从 auto 掉到 ask");
+});
+
+test("没有生产者的判据腿必须去掉，别留一个永远 undefined 的 ||", () => {
+  const src = stripJsComments(SRC);
+  for (const dead of ["longTask", "semanticGoal"]) {
+    assert.ok(!new RegExp(`engineering\\?\\.${dead}`).test(src),
+      `${dead} 没有任何生产者（不在 _AI_INTENT_DIMENSIONS 里），读它等于读 undefined`);
+  }
+  // 反向确认判据本身还在：难度信号不能被一起删光。
+  assert.match(src, /const complexReadOnly = !!run\.engineering\?\.projectScope;/);
 });
