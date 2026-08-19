@@ -95,6 +95,11 @@ fn default_plans() -> Vec<PlanQuota> {
 }
 
 static CACHE: LazyLock<RwLock<Settings>> = LazyLock::new(|| RwLock::new(Settings::default()));
+/// 新装客户端开箱选哪个模型。空串 = 不指定，客户端沿用「取列表第一个」的旧行为。
+///
+/// 单独放一个静态量而不是塞进 `Settings`：那个结构是 `Copy` 的，加一个 String 会把
+/// 它整个降级，而它被逐字段拷贝的地方不少。
+static DEFAULT_MODEL: LazyLock<RwLock<String>> = LazyLock::new(|| RwLock::new(String::new()));
 static PLANS: LazyLock<RwLock<Vec<PlanQuota>>> = LazyLock::new(|| RwLock::new(default_plans()));
 
 /// 测试专用：把套餐缓存换成给定的一组，返回原来的那组以便还原。
@@ -186,7 +191,30 @@ pub fn plan_rank(plan: &str) -> i32 {
 
 /// 从数据库装载进缓存。启动时调用一次，每次写入后再调用一次。
 /// 读不到就保留当前缓存（首次即默认值），不让网关起不来。
+/// 运维指定的开箱默认模型。空串表示没指定 —— 客户端沿用「取列表第一个」的旧行为。
+pub fn default_model() -> String {
+    DEFAULT_MODEL
+        .read()
+        .map(|g| g.clone())
+        .unwrap_or_default()
+}
+
 pub async fn load(db: &sqlx::PgPool) {
+    match sqlx::query_as::<_, (String,)>("SELECT default_model FROM app_settings WHERE id = 1")
+        .fetch_optional(db)
+        .await
+    {
+        Ok(Some((model,))) => {
+            if let Ok(mut g) = DEFAULT_MODEL.write() {
+                *g = model.trim().to_owned();
+            }
+        }
+        Ok(None) => {}
+        // 这一列是后加的：老库还没跑迁移时读它会报错，那就沿用空串（＝旧行为），
+        // 不能让整个设置加载因此中断。
+        Err(e) => tracing::warn!("default_model 读取失败，沿用「取列表第一个」的旧行为: {e}"),
+    }
+
     match sqlx::query_as::<_, (i32, i32, i32)>(
         "SELECT raw_cents_per_credit_usd, free_points_daily, usd_per_cny_bps \
          FROM app_settings WHERE id = 1",
@@ -293,6 +321,8 @@ pub struct PlanPatch {
 pub struct SettingsPatch {
     pub raw_cents_per_credit_usd: Option<i64>,
     pub free_points_daily: Option<i64>,
+    /// 新装客户端开箱选哪个模型。空串 = 不指定（客户端沿用「取列表第一个」）。
+    pub default_model: Option<String>,
     pub plans: Option<Vec<PlanPatch>>,
 }
 
@@ -316,6 +346,22 @@ pub async fn admin_put(
             return Err(AppError::bad(format!(
                 "每日赠送需在 {MIN_FREE_POINTS_DAILY}~{MAX_FREE_POINTS_DAILY} 之间"
             )));
+        }
+    }
+    if let Some(v) = &req.default_model {
+        let v = v.trim();
+        // 模型 id 的字符集就这些（目录里 52 个用过的名字全部符合）。收紧不是为了防注入
+        // （参数是绑定的），是为了让填错的人当场看到原因，而不是等到某个新用户开箱时
+        // 客户端匹配不上、静默退回字母序第一个。
+        if !v.is_empty()
+            && (v.len() > 64
+                || !v
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | ':' | '/')))
+        {
+            return Err(AppError::bad(
+                "默认模型只能填模型 id（字母数字和 . - _ : /），留空表示不指定",
+            ));
         }
     }
     if let Some(list) = &req.plans {
@@ -342,17 +388,22 @@ pub async fn admin_put(
         .await
         .map_err(|e| AppError::internal(format!("开启事务失败: {e}")))?;
 
-    if req.raw_cents_per_credit_usd.is_some() || req.free_points_daily.is_some() {
+    if req.raw_cents_per_credit_usd.is_some()
+        || req.free_points_daily.is_some()
+        || req.default_model.is_some()
+    {
         sqlx::query(
             "UPDATE app_settings SET \
                raw_cents_per_credit_usd = COALESCE($1, raw_cents_per_credit_usd), \
                free_points_daily = COALESCE($2, free_points_daily), \
+               default_model = COALESCE($4, default_model), \
                updated_at = now(), updated_by = $3 \
              WHERE id = 1",
         )
         .bind(req.raw_cents_per_credit_usd.map(|v| v as i32))
         .bind(req.free_points_daily.map(|v| v as i32))
         .bind(&claims.sub)
+        .bind(req.default_model.as_ref().map(|v| v.trim().to_owned()))
         .execute(&mut *tx)
         .await
         .map_err(|e| AppError::internal(format!("写入设置失败: {e}")))?;

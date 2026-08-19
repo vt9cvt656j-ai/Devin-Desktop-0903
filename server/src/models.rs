@@ -63,7 +63,21 @@ fn build_chat_http_client(pool_idle_per_host: usize) -> reqwest::Client {
 static GW_CHAT_HTTP: LazyLock<reqwest::Client> = LazyLock::new(|| build_chat_http_client(8));
 
 const CHAT_UPSTREAM_MAX_ATTEMPTS_PER_ROUTE: u32 = 1;
-const CHAT_UPSTREAM_MAX_ROUTES_PER_REQUEST: usize = 1;
+/// 上游**明确回了一个错误响应**时，允许再换一条同模型线路。
+///
+/// 「一次请求只发一次」这条规矩是对的，理由写在下面循环里：传输层失败也可能发生在上游
+/// 已经收下 body 之后，重发会重复跑模型、重复计费。但它此前被套用在了两种性质完全不同的
+/// 失败上：
+///
+///   · **表头卡死 / 发送出错** —— 什么都没回来，上游可能正在跑。不能重发，维持原样。
+///   · **完整的错误响应**（502/503/401/…）—— 上游用自己的话说了「我失败了」。它没跑模型，
+///     也不会为此计费。这时候换一条线路既安全，又正是用户要的。
+///
+/// 线上代价是可量的：40 小时里 48 次 GPT 502 全部写着 `route_count=2 attempted_sends=1`
+/// ——旁边那条同模型线路一次都没试过。那把失效的 key（`invalid_api_key` → 424）也是同一回事：
+/// 落到它上面的请求直接判死，而循环里那句注释写着「401/403 仍然会换线，那是每条线路各自的
+/// 凭据」——在 MAX_ROUTES=1 之下，这句话从来没成立过。
+const CHAT_UPSTREAM_MAX_ROUTES_WHEN_ANSWERED: usize = 2;
 const CHAT_UPSTREAM_ROUTE_COOLDOWN: Duration = Duration::from_secs(20);
 
 /// What the IDE waits for response headers before it gives up. The upstream relay
@@ -2645,6 +2659,8 @@ pub async fn list_for_client(State(state): State<AppState>) -> ApiResult<Json<se
      * 是运维在卖的东西（线上"特价开业福利"和"Claude"就是这么配的，sonnet 一个 10 一个 5）。
      * 去重会把那份价格选择一起铲掉。
      */
+    // 运维指定的开箱默认模型，整批只读一次。
+    let default_model_id = crate::settings::default_model();
     let power_ids: std::collections::HashSet<String> = rows
         .iter()
         .filter(|m| m.power_route)
@@ -2713,6 +2729,18 @@ pub async fn list_for_client(State(state): State<AppState>) -> ApiResult<Json<se
                 // 按 model id 索引的目录，同一个 id 可能挂在好几条线路下，逐条判断会得出
                 // 一个取决于排序的随机答案。这个式子和派单那边的筛选条件必须是同一个。
                 "power_route_available": power_ids.contains(&mid),
+                // 新装客户端开箱选谁。运维在设置里指定（app_settings.default_model），
+                // 没指定就一个都不标、客户端沿用「取列表第一个」的旧行为。
+                //
+                // 为什么要有这一位：客户端原来取的就是列表第一个，而那个顺序是路线的
+                // enabled_models 按字母排出来的——于是每个新用户开箱都落在 claude-fable-5 上，
+                // 而它是在售模型里硬失败率最高的一档（2026-08-19 实测 18.8%，对照
+                // claude-opus-5 的 3.6%、glm-5.3 的 0%）。「模型老是用不了」对新用户来说
+                // 是开箱即得的。
+                //
+                // 走配置而不是在客户端写死模型名：这张目录里用过的名字已经有 52 个，
+                // 写死意味着每换一次默认都要发一版桌面端。
+                "default": !default_model_id.is_empty() && mid == default_model_id,
                 "provider": m.provider,
                 "model_id": mid.clone(),
                 "name": name,
@@ -6920,10 +6948,14 @@ pub async fn chat_completions(
         }
         ordered_candidates.extend(cooled_candidates);
 
+        // 取到「答复过一次错误」允许的上限；真正能不能走到第二条，由每一轮末尾那句
+        // `upstream_answered_with_error` 决定——卡死和发送出错仍然只发一次就收手。
         'routes: for candidate in ordered_candidates
             .into_iter()
-            .take(CHAT_UPSTREAM_MAX_ROUTES_PER_REQUEST)
+            .take(CHAT_UPSTREAM_MAX_ROUTES_WHEN_ANSWERED)
         {
+            // 这条线路是不是**完整地回了一个错误响应**。只有它为真时才允许换下一条。
+            let mut upstream_answered_with_error = false;
             // protocol="anthropic" → native /v1/messages with translated OpenAI⇄Anthropic body;
             // else OpenAI-compat /chat/completions passthrough. Route ordering still prefers a
             // non-cooled line, but one inbound chat request selects exactly one line and sends once.
@@ -7131,6 +7163,8 @@ pub async fn chat_completions(
                         break 'routes;
                     }
                     Ok(r) => {
+                        // 上游把话说完了：它没跑模型，也不会为这一次计费 —— 换线是安全的。
+                        upstream_answered_with_error = true;
                         err_status = r.status().as_u16();
                         let error_body_wait = route_deadline
                             .saturating_duration_since(Instant::now())
@@ -7246,6 +7280,21 @@ pub async fn chat_completions(
                     "chat upstream route exhausted transient retries; cooling route"
                 );
             }
+            // 只有「上游把话说完了」才允许再换一条。
+            //
+            // 卡死（什么都没回来）和发送出错（可能已经发出去了一半）都在这里收手：那两种情况下
+            // 上游**可能正在跑这次请求**，再发一次就是重复跑模型、重复计费。这条判据就是
+            // 「一次请求只发一次」那条规矩真正想表达的东西——它以前被粗暴地实现成
+            // 「一条线路都不许换」，连上游明确说了「我失败了」的情况也一并禁掉。
+            if !upstream_answered_with_error {
+                break 'routes;
+            }
+            tracing::info!(
+                model = %model_id,
+                route_id = %candidate.id,
+                status = err_status,
+                "upstream answered with an error; trying the next same-model route"
+            );
         }
         match (success, selected_conn) {
             (Some(r), Some(c)) => (r, c),
@@ -8347,7 +8396,7 @@ mod billing_tests {
         telemetry_thinking_type,
         tool_argument_rules, upstream_failure_status, validate_openai_sse_eof,
         validate_openai_sse_with_rules, AnthSse, FusedCharge, OpenAiSseValidator,
-        CHAT_UPSTREAM_MAX_ATTEMPTS_PER_ROUTE, CHAT_UPSTREAM_MAX_ROUTES_PER_REQUEST,
+        CHAT_UPSTREAM_MAX_ATTEMPTS_PER_ROUTE, CHAT_UPSTREAM_MAX_ROUTES_WHEN_ANSWERED,
         THINKING_CLIP_ROUTES, THINKING_CLIP_SAFE_BUDGET,
     };
 
@@ -8521,10 +8570,42 @@ mod billing_tests {
         assert_eq!(chat_upstream_retry_base_delay_ms(99), 4_000);
     }
 
+    /// 同一条线路上，一次用户请求只发一次 —— 这条不许松。
+    ///
+    /// 理由在循环里：传输层失败也可能发生在上游**已经收下 body 之后**，重发会重复跑模型、
+    /// 重复计费。所以每条线路只发一次，而且卡死 / 发送出错之后**不换线**。
     #[test]
-    fn chat_gateway_opens_at_most_one_upstream_send_per_request() {
-        assert_eq!(CHAT_UPSTREAM_MAX_ROUTES_PER_REQUEST, 1);
+    fn one_send_per_route_and_no_failover_when_nothing_came_back() {
         assert_eq!(CHAT_UPSTREAM_MAX_ATTEMPTS_PER_ROUTE, 1);
+
+        // 换线由 `upstream_answered_with_error` 一处判定，且只在收到完整错误响应时置位。
+        let loop_src = include_str!("models.rs");
+        assert!(
+            loop_src.contains("if !upstream_answered_with_error {"),
+            "换线的闸门不见了：卡死/发送出错必须当场收手，不能换线重发",
+        );
+        // 用 concat! 拆开写，否则这段断言**自己**也会被 include_str! 数进去（源码里就有这串字面量），
+        // 计数永远比真实的多一。
+        let set_site = concat!("upstream_answered_with_error", " = true");
+        assert_eq!(
+            loop_src.matches(set_site).count(),
+            1,
+            "只允许在「收到完整错误响应」那一支置位；多一处就等于把卡死也放进了换线路径",
+        );
+    }
+
+    /// 上游**明确回了错误**时要换一条同模型线路。
+    ///
+    /// 这是原来那条规矩被套错了地方的部分：40 小时里 48 次 GPT 502 全都写着
+    /// `route_count=2 attempted_sends=1`，旁边那条线路一次都没试过；那把失效的 key
+    /// （`invalid_api_key` → 424）同理，落到它上面的请求直接判死。
+    #[test]
+    fn an_answered_error_may_fail_over_to_one_more_route() {
+        assert_eq!(CHAT_UPSTREAM_MAX_ROUTES_WHEN_ANSWERED, 2);
+        assert!(
+            CHAT_UPSTREAM_MAX_ROUTES_WHEN_ANSWERED > 1,
+            "只取一条候选的话，上面那句换线判定永远走不到",
+        );
     }
 
     #[test]
@@ -14371,6 +14452,18 @@ mod power_route_tests {
         assert!(
             src.contains("\"power_route_available\": power_ids.contains(&mid)"),
             "没下发这个模型有没有强力线路，客户端只能靠猜模型名，按钮会画在没有强力线路的模型上"
+        );
+        // 开箱默认模型也要下发。不下发的话客户端只能取列表第一个，而那是 enabled_models
+        // 的字母序 —— 每个新用户都会落在 claude-fable-5 上（实测硬失败率 18.8%，在售最高）。
+        assert!(
+            src.contains("\"default\": !default_model_id.is_empty() && mid == default_model_id"),
+            "没下发开箱默认模型，新用户仍然由字母序决定用哪个模型"
+        );
+        // 空设置必须等于"一个都不标"，让客户端沿用旧行为——不能因为没配置就把第一个
+        // 模型标成默认，那等于把这个坑原样保留还多一层伪装。
+        assert!(
+            src.contains("!default_model_id.is_empty()"),
+            "没配置时不许标任何模型为默认"
         );
     }
 
