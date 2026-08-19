@@ -153,7 +153,27 @@ async fn ensure_server() -> Result<(), String> {
             command
                 .arg(PORT.to_string())
                 .env("MICHAEL_AUTOMATION_TOKEN", AUTOMATION_TOKEN.as_str())
-                .env("PATH", crate::process_util::augmented_path(None))
+                .env("PATH", crate::process_util::augmented_path(None));
+            // 两套浏览器自动化必须用**同一个**浏览器。
+            //
+            // sidecar 是独立进程，读不到主进程里那份运行期偏好（capture::BROWSER_PREF），
+            // 而它自己还有**第三份**手写浏览器表（automation-framework 的 find_browser）。
+            // 结果：用户在设置里选了 Edge、或者系统默认就是 Edge，`browser` 工具走 Edge，
+            // `automation` 工具照样开 Chrome——同一个 IDE 里两套自动化开两个不同牌子的浏览器，
+            // Dock 里三个图标，而用户从头到尾只选过一次。
+            //
+            // 不去同步第三份名单（同步出来的第二份、第三份必然漂，这个仓库反复吃过这个亏），
+            // 而是把**已经解析好的可执行文件路径**传过去：sidecar 的 find_browser 第一件事
+            // 就是认 MICHAEL_BROWSER_PATH，认到就直接返回，它那份表退化成纯兜底。
+            // 一处决定，两处生效。
+            if let Some((kind, path, _missing)) =
+                crate::capture::resolve_browser(crate::capture::browser_pref().as_deref())
+            {
+                command
+                    .env("MICHAEL_BROWSER_PATH", &path)
+                    .env("MICHAEL_BROWSER", kind.id);
+            }
+            command
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null());
             #[cfg(unix)]
@@ -291,6 +311,36 @@ pub fn stop() {
 
 #[cfg(test)]
 mod tests {
+    /// 两套浏览器自动化必须用**同一个**浏览器。
+    ///
+    /// CDP 那套（browser.rs）和 sidecar 那套（automation-framework）是两个进程，
+    /// 各有各的浏览器选择逻辑，sidecar 还有第三份手写表。不把选择传过去的话，用户选了
+    /// Edge、`browser` 走 Edge，`automation` 照样开 Chrome——同一个 IDE 开两个牌子，
+    /// Dock 里三个图标，而他只选过一次。
+    ///
+    /// 传的是**已经解析好的路径**而不是再同步一份名单：同步出来的第二份、第三份必然漂。
+    #[test]
+    fn sidecar_要拿到和_cdp_那套一样的浏览器选择() {
+        const SRC: &str = include_str!("automation.rs");
+        // 需要的串拼出来找：include_str! 读的是整个文件、包含本测试模块自己。
+        let env_path = format!(".env(\"{}\"", "MICHAEL_BROWSER_PATH");
+        assert!(
+            SRC.contains(&env_path),
+            "起 sidecar 时没把浏览器路径传过去 —— 它会用自己那份表另选一个",
+        );
+        let resolver = format!("crate::capture::{}(", "resolve_browser");
+        assert!(
+            SRC.contains(&resolver),
+            "路径必须来自 capture::resolve_browser —— 那是唯一一处懂「用户显式选择 > 系统默认 > 表序」的地方",
+        );
+        // 必须读运行期偏好，而不是只读环境变量：设置界面写的是前者
+        let pref = format!("crate::capture::{}()", "browser_pref");
+        assert!(
+            SRC.contains(&pref),
+            "没读运行期偏好 —— 用户在设置里选的那个浏览器传不到 sidecar",
+        );
+    }
+
     use super::{packaged_server_filename, parse_rpc_response, terminate_child};
 
     #[test]

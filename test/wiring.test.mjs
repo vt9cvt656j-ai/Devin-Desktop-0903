@@ -597,6 +597,31 @@ test("模型要能先看一眼用户自己开着什么，再决定要不要新�
     "生效的 action 说明里没有 mytabs 的用法指引，模型不知道该先看一眼");
 });
 
+// 用户：「有一个 cdp 和一个自动化浏览器，2 个都是浏览器自动化，根据不同规则去用。」
+//
+// 两套确实并存：browser 走 CDP 读 DOM，automation 走 sidecar 合成真实键鼠事件。
+// 但"什么时候用哪个"以前没有一条能照做的判据，模型只能凭感觉挑——挑错的表现是
+// 拿坐标去点一个本来能按节点号定位的网页元素，或者在 CDP 够得着的地方绕去桌面自动化。
+test("两套浏览器自动化要有一条能照做的选择判据，而且两边都写着", () => {
+  const rule = "Target lives INSIDE a web page";
+  // 两份描述都要有：模型先看到哪一份是不确定的
+  assert.equal(count(SRC, new RegExp(rule, "g")), 2,
+    "选择判据必须同时写在 browser 和 automation 两份描述里，只写一边等于一半场景没judgment");
+  // 判据要按**目标在哪儿**分，不是按"哪个更快""哪个更强"这类没法验证的说法
+  assert.match(SRC, /Target lives OUTSIDE the page/,
+    "判据要给出反面那一半，否则模型只知道什么时候用 browser，不知道什么时候该换");
+  assert.match(SRC, /an OS dialog, a native file picker, the menu bar, another application/,
+    "要举出具体的「不在网页里」的目标，抽象说法模型对不上号");
+  // 明确堵住最常见的两种误用
+  assert.match(SRC, /Do not reach for automation just because a click failed in browser/,
+    "点击失败就换工具是最常见的误用，要点名");
+  assert.match(SRC, /do not drive a web page through automation coordinates when browser can address it by node/,
+    "拿坐标点网页是另一种误用，同样要点名");
+  // 两套用同一个浏览器这件事也要说，否则模型会以为它们各开各的
+  assert.match(SRC, /Both drive the same browser brand/,
+    "要说明两套共用一个浏览器选择，否则模型不知道换牌子是一处生效");
+});
+
 // 「我先这样改了，需要我跑一下测试验证吗？」——用一个问号收尾，就把"改了代码没验证"
 // 这个事实一笔勾销。而这恰恰是最像"已经做完了"的收尾形态。
 test("末尾问一句话不能抹掉「改了代码没验证」这个事实", () => {
