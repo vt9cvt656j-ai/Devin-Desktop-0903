@@ -44,6 +44,23 @@ pub struct RpcServer {
 }
 
 /// 常量时间比较，避免用响应时间逐字节试出 token。
+/// `/health` 挑战应答：SHA-256("<token>:<nonce>") 的十六进制。
+///
+/// 用意是让**持有 token 的一方证明自己持有它**，而调用方不必先把 token 交出去。
+/// nonce 每次现生成，所以观察到一次应答也没法拿去冒充下一次。
+pub fn health_challenge_response(token: &str, nonce: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(token.as_bytes());
+    hasher.update(b":");
+    hasher.update(nonce.as_bytes());
+    hasher
+        .finalize()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;
@@ -507,6 +524,12 @@ impl RpcServer {
 
     fn handle_conn(&self, stream: &mut std::net::TcpStream) -> std::io::Result<()> {
         use std::io::{Read, Write, BufRead, BufReader};
+        // 读写都要超时：这个服务在**一条线程上串行**处理连接（自动化本就串行），
+        // 一个连上来却不发数据的连接会把它整个堵死——后面所有自动化调用只能干等到
+        // IDE 侧那 120 秒超时。本机任意进程都能连上 127.0.0.1，成本极低。
+        let io_timeout = std::time::Duration::from_secs(15);
+        let _ = stream.set_read_timeout(Some(io_timeout));
+        let _ = stream.set_write_timeout(Some(io_timeout));
         let mut reader = BufReader::new(stream.try_clone()?);
         let mut line = String::new();
         reader.read_line(&mut line)?;
@@ -516,6 +539,7 @@ impl RpcServer {
         // 读到空行为止，抓 Content-Length + 鉴权/来源判定所需的头
         let mut content_len = 0usize;
         let mut token: Option<String> = None;
+        let mut nonce: Option<String> = None;
         let mut browser_origin = false;
         loop {
             let mut h = String::new();
@@ -528,6 +552,10 @@ impl RpcServer {
             if let Some(v) = low.strip_prefix("x-automation-token:") {
                 token = Some(v.trim().to_string());
             }
+            // 挑战应答的随机数（见下面 /health）。它不是凭据，明文即可。
+            if let Some(v) = low.strip_prefix("x-automation-nonce:") {
+                nonce = Some(v.trim().to_string());
+            }
             // 浏览器一定会带上这些头之一；本地父进程（reqwest）一个都不带。
             if low.starts_with("origin:")
                 || low.starts_with("referer:")
@@ -537,11 +565,6 @@ impl RpcServer {
                 browser_origin = true;
             }
         }
-        let body = if content_len > 0 {
-            let mut buf = vec![0u8; content_len];
-            reader.read_exact(&mut buf)?;
-            buf
-        } else { Vec::new() };
 
         // ── 鉴权 ──────────────────────────────────────────────────────────────
         //
@@ -561,11 +584,28 @@ impl RpcServer {
         //
         // ACAO 头也一并删掉：它此前额外解锁了「读回响应」的能力（browser.content 等），
         // 让攻击从盲写升级成可读写。注意只删 ACAO 不能修掉 RCE —— 写侧根本不需要读响应。
-        let authed = match (&self.token, &token) {
-            (Some(expected), Some(got)) => constant_time_eq(expected.as_bytes(), got.as_bytes()),
-            // 没配 token 时保持旧行为（本地开发直接跑 sidecar），但依然拒绝浏览器来源。
-            (None, _) => true,
-            (Some(_), None) => false,
+        // `/health` 是**挑战应答**，不要求调用方出示 token —— 恰恰相反，它必须**不出示**。
+        //
+        // 这个端点的用途是回答「占着这个端口的，是不是我自己刚起的那个 sidecar」。
+        // 原来的做法是客户端把 token 放在请求头里发过去、只看 HTTP 200 —— 两头都错：
+        //   · 只看 200：冒充者不运行我们的代码，它想回什么状态码就回什么；
+        //   · 发 token：请求是发给**尚未验明身份**的一方的，等于把一次性密钥直接
+        //     交到冒充者手上，它随后可以拿着这个 token 去满足任何后续校验。
+        // 于是「先占住 127.0.0.1:3037 就能接管全部桌面自动化」这条路一直是通的，
+        // 而后续流过去的包括 keyboard.type 的正文（用户密码）、剪贴板、网页正文。
+        //
+        // 改成：客户端发一个随机 nonce（明文，不是凭据），我们回 SHA-256(token:nonce)。
+        // 只有真的持有 token 的一方算得出来，而 token 从不离开本进程。
+        let health_probe = path == "/health";
+        let authed = if health_probe {
+            true
+        } else {
+            match (&self.token, &token) {
+                (Some(expected), Some(got)) => constant_time_eq(expected.as_bytes(), got.as_bytes()),
+                // 没配 token 时保持旧行为（本地开发直接跑 sidecar），但依然拒绝浏览器来源。
+                (None, _) => true,
+                (Some(_), None) => false,
+            }
         };
         if !authed || browser_origin {
             let body = b"{\"error\":\"unauthorized\"}";
@@ -579,8 +619,33 @@ impl RpcServer {
             return Ok(());
         }
 
-        let resp_body: Vec<u8> = if path == "/health" {
-            b"ok".to_vec()
+        // 鉴权之后才读 body。原来读在鉴权**之前**：一个未鉴权的连接报一个撒谎的
+        // Content-Length，就能让我们在验明身份前先按它说的大小申请内存；而这个服务是
+        // 单线程串行处理的，一个不发数据的连接还能把后面所有自动化调用一起堵死。
+        const MAX_BODY: usize = 8 * 1024 * 1024;
+        if content_len > MAX_BODY {
+            let body = b"{\"error\":\"payload too large\"}";
+            let header = format!(
+                "HTTP/1.1 413 Payload Too Large\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            stream.write_all(header.as_bytes())?;
+            stream.write_all(body)?;
+            stream.flush()?;
+            return Ok(());
+        }
+        let body = if content_len > 0 {
+            let mut buf = vec![0u8; content_len];
+            reader.read_exact(&mut buf)?;
+            buf
+        } else { Vec::new() };
+
+        let resp_body: Vec<u8> = if health_probe {
+            // 持有 token 才算得出这个值；没配 token（本地开发）时维持旧的 "ok"。
+            match (&self.token, &nonce) {
+                (Some(tok), Some(n)) => health_challenge_response(tok, n).into_bytes(),
+                _ => b"ok".to_vec(),
+            }
         } else if http_method == "POST" && path == "/rpc" {
             match serde_json::from_slice::<RpcRequest>(&body) {
                 Ok(req) => serde_json::to_vec(&self.handle_request(req)).unwrap_or_default(),
@@ -659,5 +724,32 @@ mod coord_tests {
         assert_eq!(RpcServer::coord(&p, "x"), Some(0.0));
         assert_eq!(RpcServer::coord(&p, "y"), Some(-3.0), "负坐标是合法的多显示器坐标");
         assert_eq!(RpcServer::coord(&p, "big"), Some(1728.0));
+    }
+}
+
+#[cfg(test)]
+mod health_challenge_tests {
+    use super::health_challenge_response;
+
+    /// `/health` 必须是**挑战应答**，不能只回一个固定串。
+    ///
+    /// 修复前客户端只看 HTTP 200，而且还把 token 放在请求头里发给尚未验明身份的一方。
+    /// 于是本机任意进程抢先占住 127.0.0.1:3037，对任何请求回 200 就能冒充 sidecar，
+    /// 接管之后流过去的包括 keyboard.type 的正文（用户密码）、剪贴板、网页正文——
+    /// 而这一层能合成真实键鼠，也就是能开终端敲任意命令。
+    #[test]
+    fn response_depends_on_both_token_and_nonce() {
+        let a = health_challenge_response("tok", "n1");
+        // 同 token 换 nonce → 不同（否则观察一次应答就能重放）
+        assert_ne!(a, health_challenge_response("tok", "n2"), "换了 nonce 应答却不变，可被重放");
+        // 同 nonce 换 token → 不同（否则不知道 token 的人也能算出来）
+        assert_ne!(a, health_challenge_response("other", "n1"), "换了 token 应答却不变");
+        // 稳定可复现（客户端和服务端各算一次要对得上）
+        assert_eq!(a, health_challenge_response("tok", "n1"));
+        // 就是 SHA-256("tok:n1") 的十六进制，两侧实现必须逐字节一致
+        assert_eq!(a.len(), 64, "应当是 32 字节 SHA-256 的十六进制");
+        assert!(a.chars().all(|c| c.is_ascii_hexdigit()));
+        // 固定串（冒充者最容易回的那个）绝不可能命中
+        assert_ne!(a, "ok");
     }
 }
