@@ -23392,9 +23392,11 @@ test("a quiet turn is the model's completion decision except for real bounded wo
   // 用户重新定义了任务，之前的欠账账本作废——否则旧任务的提醒会继续推着模型跑。
   assert.match(quiet, /run\._quietResumePool = 3;/, "插话后要把全局预算恢复");
   // 预算 3 → 2：全局池只有 3，单门占 3 会把另外两道门饿死。
-  // 窗口 500→1200：plan 门 continue 与最终 break 之间现在合法地多了一道 account-only 的
-  // last_action_failed 诚实门（见下一条专项测试）。守的属性不变——plan 门续跑、最终诚实收尾。
-  assert.match(quiet, /\(run\._planFinishNudges \|\| 0\) < 2[\s\S]{0,700}continue;[\s\S]{0,1200}break; \/\/ truly done/,
+  // 窗口 1200→2600：plan 门 continue 与最终 break 之间现在住着四道**只记账、不补回合**的
+  // 诚实门——last_action_failed、没读过还把一大半覆写没了（overwrote_unread）、
+  // 新引入的占位（stub_delivery），每加一道这段就长一截。守的属性一个字没变：
+  // plan 门有界续跑、最终诚实收尾。窗口只是这条断言的取景框，不是被守护的性质本身。
+  assert.match(quiet, /\(run\._planFinishNudges \|\| 0\) < 2[\s\S]{0,700}continue;[\s\S]{0,2600}break; \/\/ truly done/,
     "an open plan re-enters, boundedly, and then the run ends honestly");
   assert.match(quiet, /run\._incompleteReason \|\| `plan_steps_pending:/,
     "a run that gives up on its plan must not be recorded as a clean finish");
@@ -29150,6 +29152,27 @@ test("方向检查提前到中途，但闸门要紧，且绝不顶掉收尾那�
   // 它是**一个模型的意见**，不是执行事实，不该和红构建争保命位——所以不登记进事实类。
   const facts = SRC.slice(SRC.indexOf("const _NUDGE_FACTS = new Set(["), SRC.indexOf("const _NUDGE_FACTS = new Set([") + 900);
   assert.doesNotMatch(facts, /"directionCheck"/, "方向是意见不是事实，按建议类可丢");
+});
+
+
+test("整文件重写把内容写没了，必须当场说出来", () => {
+  // 用户原话：「弄项目老把项目弄烂，项目动不动被写坏」。最典型的形态就是模型凭记忆
+  // 重写一个它没完整读过的文件，没记住的部分直接消失。此前全程没有任何判据——
+  // added/removed 只画在界面上给人看，工具结果里一个字都不提，模型自己也不知道
+  // 刚才把一个 480 行的文件写成了 90 行。行数是不会撒谎的，这是最便宜的执行事实。
+  assert.match(SRC, /const _lostLines = existed && _oldLines >= 40 && _newLines < _oldLines \* 0\.5/,
+    "只在「原来够大、且少了一半以上」时才报，避免噪音");
+  assert.match(SRC, /\*\*少了 \$\{_lostLines\} 行\*\*/, "要把数字摆出来");
+  assert.match(SRC, /linesLost: _lostLines/, "结构化带出去，下游才用得上");
+  // 只报事实、不拦截：删掉半个文件有时是对的（清理死代码）。
+  const loop = extractFn("_runAgenticLoop");
+  assert.doesNotMatch(SRC, /_lostLines[\s\S]{0,200}?\[BLOCKED\]/, "不许拦截");
+  // 但「没读过 + 少了一大半」是近乎确定的破坏，要落到用户看得见的结局里。
+  assert.match(loop, /Number\(it\.rawResult\?\.linesLost\) > 0 && !_runHasRead\(run, root, it\.call\.path\)/,
+    "两条判据都必须是执行事实，缺一条都不能算破坏");
+  assert.match(loop, /run\._incompleteReason \|\| `overwrote_unread:\$\{run\._blindOverwrites\.length\}`/);
+  const labels = loadConst("_INCOMPLETE_LABELS");
+  assert.equal(labels.overwrote_unread, "看一眼被覆写的文件，确认没把内容写没");
 });
 
 // ---- 写入落空要有用户侧的出口 ----
