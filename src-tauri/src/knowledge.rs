@@ -5332,9 +5332,11 @@ pub async fn infoq_search(query: String, max_results: Option<u32>) -> Result<Str
         return Ok(format!(
             "InfoQ articles for '{query}':\nretrieved_at: {retrieved}\n\n\
              search_status: unusable\n\
-             InfoQ 的搜索页是客户端渲染的：/search.action 对任何查询词都返回同一张页面，\
-             抓到的 {} 条全是首页最新文章，**跟 '{query}' 没有关系**，已经不列出来——\
+             抓回来 {} 条，**没有一条的标题或链接跟 '{query}' 对得上**，所以不列出来——\
              列出来你会把它们当成检索结果引用。\n\
+             最可能的原因：InfoQ 的搜索页是客户端渲染的，/search.action 对任何查询词都返回\
+             同一张页面（实测 2026-08-20），抓到的其实是首页最新文章。也可能只是这个词在\
+             infoq.com 上确实没有命中——这两种在这里分不出来。\n\
              改用 web_search 加 site:infoq.com，或用 browser 打开下面这个地址等页面渲染完再读。\n{search_url}",
             hits.len()
         ));
@@ -6408,6 +6410,16 @@ mod infoq_shell_page_tests {
         assert!(
             body.contains("search_status: unusable"),
             "核对不过时没有据实报状态"
+        );
+        // 每次调用能确证的只有「抓回来的这些跟查询词对不上」。至于是壳页还是这个词
+        // 真的没命中（比如拿中文词搜英文站），这里分不出来——不能断言成前者。
+        assert!(
+            body.contains("没有一条的标题或链接跟"),
+            "没有说清能确证的到底是什么"
+        );
+        assert!(
+            body.contains("这两种在这里分不出来"),
+            "把「多半是壳页」写成了「就是壳页」"
         );
         assert!(
             body.contains("web_search") && body.contains("site:infoq.com"),
