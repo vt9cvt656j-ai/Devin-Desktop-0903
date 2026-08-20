@@ -17812,6 +17812,7 @@ test("语义收尾评审工具仍可独立使用，但 quiet turn 不会被评�
 
   let reviewRequest = null;
   const critic = load("_wrapUpCritic", {
+    _cognitiveLegDeadlineMs: () => 60_000,
     _cognitiveLegEffort: load("_cognitiveLegEffort"),
     _executionEvidenceReviewBlock: () => "run_cmd: exitCode=0; stdout=the remote request did not produce the requested artifact",
     _criticToolCatalog: catalog,
@@ -28916,4 +28917,41 @@ test("收尾评审判定没实现要求时,结论落进运行状态并变成一�
   assert.ok(at > 0);
   assert.doesNotMatch(SRC.slice(at, at + 320), /_incompleteReason|run\.outcome\s*=[^=]/,
     "评审是**意见**不是执行事实,不许拿它去改那个只认执行事实的结局枚举");
+});
+
+// ---- 把思考调高，收尾评审就悄悄不响了 ----
+//
+// 评审通过 _cognitiveLegEffort 把用户选的 reasoning_effort 原样带给上游，期限却曾经硬编码
+// 25 秒——比传输层判定「这个模型算慢了」的窗口（_browserAiStreamTimeouts 最低一档 60 秒）
+// 还短。于是深度思考档下它在传输层认为慢之前就自己 abort，catch 里静默 return null，
+// instruction / findings / direction 三样一起丢，用户只看到「评审好像从来不响」。
+test("认知腿的期限跟着思考档位走，且不短于传输层认定「慢」的窗口", () => {
+  const critic = extractFn("_wrapUpCritic");
+  assert.doesNotMatch(critic, /ctrl\.abort\(\), ?\d{4,}/,
+    "评审的期限又被写死成一个数了——用户把思考调高之后它会先于传输层自己掐掉");
+  assert.match(critic, /_cognitiveLegDeadlineMs\(config\)/, "期限没跟着这一轮的 config 走");
+  // 期限必须**从分档函数取**，不另立一套数字，否则两边会漂。
+  const deadline = extractFn("_cognitiveLegDeadlineMs");
+  assert.match(deadline, /_browserAiStreamTimeouts/,
+    "又自己写了一套档位数字——和传输层那套迟早对不上");
+  // 真跑一遍：深度档必须拿到比基础档更长的期限，且基础档不短于 60 秒。
+  const dl = load("_cognitiveLegDeadlineMs", { _browserAiStreamTimeouts: load("_browserAiStreamTimeouts", { _AI_MODEL_ATTEMPT_TIMEOUT_MS: 60_000 }) });
+  const base = dl({});
+  const deep = dl({ reasoningEffort: "max" });
+  const high = dl({ reasoningEffort: "high" });
+  assert.ok(base >= 60_000, `基础档期限 ${base}ms 比传输层认定「慢」的窗口还短，等于评审先自己掐`);
+  assert.ok(deep > base, `深度思考档 ${deep}ms 没有比基础档 ${base}ms 更长——调高思考反而更容易超时`);
+  assert.ok(high >= base && deep >= high, "档位之间的期限没有单调递增");
+  // config 缺席/畸形时要有保底，不能返回 0 或 NaN 把 abort 变成立刻触发。
+  for (const bad of [null, undefined, { reasoningEffort: 123 }]) {
+    const v = dl(bad);
+    assert.ok(Number.isFinite(v) && v >= 60_000, `畸形 config 下期限成了 ${v}——abort 会立刻触发，评审必然拿不到结果`);
+  }
+  // 分档函数本身抛了 / 返回垃圾时，保底不许落到 0 或 NaN：那会让 abort 立刻触发，
+  // 表现和「评审永远不响」一模一样，而且更难查。
+  for (const broken of [() => { throw new Error("boom"); }, () => null, () => ({ stallMs: 0 }), () => ({ stallMs: "x" })]) {
+    const v = load("_cognitiveLegDeadlineMs", { _browserAiStreamTimeouts: broken })({});
+    assert.ok(Number.isFinite(v) && v >= 60_000,
+      `分档函数坏掉时保底成了 ${v}——abort 立刻触发，评审必然拿不到结果`);
+  }
 });
