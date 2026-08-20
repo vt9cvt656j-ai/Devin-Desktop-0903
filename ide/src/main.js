@@ -44647,6 +44647,14 @@ async function _runSubAgent({ config, description, prompt, root, container, run,
     // 东西却唯独少了规则块，是漏不是设计。
     // 位置在 _SUBAGENT_TRUTH 之前：真话下限必须压轴（truthfulness 那条测试钉着）。
     + _userRulesBlock()
+    // 语言与风格：同样是用户在设置面板里**亲手选下**的值，同样只有这一条补给路。
+    // _agentModelTurn 那边把 clientBlocks（规则 + 语言 + 风格 + …）算出来后，
+    // `if (!_isSub)` 一到子体就整个丢弃，旁边那句注释写着「它的系统提示词是本地的、已经对了」
+    // —— 而这份本地提示词里这两块原本是缺的。子体交回来的简报是**直接渲染给用户看**的，
+    // 语言不对当场就看得出来；做联网调研的子体还要按用户设的国家/地区去理解价格、时间、单位。
+    // （只补这两块：_authContextBlock / _modelFamilyTuning 整段照搬会和 worker 人格打架，
+    //   那是能力问题不是「用户写下的规则被吃掉」，不在这条修的范围里。）
+    + _languagePreferenceBlock() + _adaptivePromptBlock()
     + _SUBAGENT_TRUTH;
   // Retrieval is ranked by the CHILD'S OWN TASK, not an empty string. The empty query
   // silently disabled three paths at once: _buildRepoMap degraded to pure symbol-count
