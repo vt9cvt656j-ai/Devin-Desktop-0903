@@ -28998,6 +28998,18 @@ test("反复提问的判据是账本数出来的次数，不是「是不是第�
   assert.match(validate, /真正只有用户能拍板的/);
 });
 
+
+test("快通道也要给出为什么是这几个——可见推理不因为走得快就消失", () => {
+  const loop = extractFn("_runAgenticLoop");
+  // 慢路径那条 🧠 来自编排器的一句推理；快通道不发那次调用，理由就没了。
+  // 本地这条不是编出来的解释，是判定当场用的那几个数。
+  assert.match(loop, /🧠 本地判定：\$\{top\.name\} 命中/);
+  assert.match(loop, /比第二名（\$\{second\.name\}）高 \$\{top\.score - second\.score\} 分/,
+    "要报真实分差，那正是快通道敢不发网络的判据");
+  assert.match(loop, /usedFastPath \? _fastReason\(\) : thoughtNote/,
+    "快慢两条路都要有理由，不能只有一条有");
+});
+
 // ---- 写入落空要有用户侧的出口 ----
 test("尝试写了没落盘时，结局里必须留下 writes_failed", () => {
   const loop = extractFn("_runAgenticLoop");

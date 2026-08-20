@@ -49009,9 +49009,21 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
           // 排查时这两者的下一步完全相反，界面却分不出来，只能靠猜。所以标签跟着分支走。
           let label;
           if (lines.length) {
+            // 快通道也要给出**为什么是这几个**。慢路径那条 🧠 来自编排器的一句推理，
+            // 快通道不发那次调用，理由就没了——可见推理不该因为走得快就消失。
+            // 本地这条不是编出来的解释，是判定当场用的那几个数：命中了哪个维度、领先多少分。
+            const _fastReason = () => {
+              const top = (fuzzyHits || []).filter((h) => !h.alreadyLoaded)[0];
+              if (!top) return "";
+              const dims = { name: "工具名", trigger: "触发条件", use_case: "使用场景", desc: "描述" };
+              const hit = [...new Set(top.matchedOn || [])].map((d) => dims[d] || d).join("／");
+              const second = (fuzzyHits || []).filter((h) => !h.alreadyLoaded)[1];
+              const gap = second ? `，比第二名（${second.name}）高 ${top.score - second.score} 分` : "，无并列候选";
+              return `\n🧠 本地判定：${top.name} 命中${hit ? `「${hit}」` : "查询词"}${gap}——判据明确，未再调用语义编排。`;
+            };
             const _how = usedFuzzyFallback
               ? "\n（语义调度本次不可用，以上为多维度模糊匹配结果，按推荐场景自行判断适用性）"
-              : usedFastPath ? "" : thoughtNote;
+              : usedFastPath ? _fastReason() : thoughtNote;
             content = "已加载 " + lines.length + " 个工具，现在可直接调用：\n" + lines.join("\n") + _how + rejectedNote;
             // 标签分快慢：快通道零毫秒本地判定，慢通道等过 MCP 发现并发了一次编排器调用。
             // 排查"为什么这次搜索花了半分钟"时，这一个字就够定位。
