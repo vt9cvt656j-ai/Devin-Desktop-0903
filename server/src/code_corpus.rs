@@ -156,16 +156,11 @@ async fn npm_dist(client: &reqwest::Client, name: &str, want: Option<&str>) -> R
     if !host_allowed(&url) {
         return Err(anyhow!("registry host not allowed"));
     }
-    let meta: serde_json::Value = client
-        .get(&url)
-        .send()
+    // 限流是**预期内**的（在白嫖公共注册表），退避重试三次；一次 429 不该让这个包
+    // 进台账吃 30 天冷却——实测 crates 就是这么一口气丢掉 2115 个的。
+    let meta = get_json_retry(client, &url)
         .await
-        .context("fetch registry metadata")?
-        .error_for_status()
-        .context("registry returned an error status")?
-        .json()
-        .await
-        .context("registry metadata is not JSON")?;
+        .ok_or_else(|| anyhow!("registry metadata unavailable (rate-limited or missing)"))?;
 
     let version = match want {
         Some(v) if !v.is_empty() => v.to_string(),
@@ -742,10 +737,9 @@ async fn pypi_dist(client: &reqwest::Client, name: &str) -> Result<(String, Stri
     if !host_allowed(&url) {
         return Err(anyhow!("pypi host not allowed"));
     }
-    let meta: serde_json::Value = client
-        .get(&url).send().await.context("fetch pypi metadata")?
-        .error_for_status().context("pypi returned an error status")?
-        .json().await.context("pypi metadata is not JSON")?;
+    let meta = get_json_retry(client, &url)
+        .await
+        .ok_or_else(|| anyhow!("pypi metadata unavailable (rate-limited or missing)"))?;
     let version = meta.pointer("/info/version").and_then(|v| v.as_str()).unwrap_or("").to_string();
     let urls = meta.get("urls").and_then(|v| v.as_array()).cloned().unwrap_or_default();
     // sdist 里有真源码和 docstring；wheel 常常只有编译产物，但总比没有强。
@@ -766,10 +760,9 @@ async fn crates_dist(client: &reqwest::Client, name: &str) -> Result<(String, St
     if !host_allowed(&url) {
         return Err(anyhow!("crates host not allowed"));
     }
-    let meta: serde_json::Value = client
-        .get(&url).send().await.context("fetch crates metadata")?
-        .error_for_status().context("crates returned an error status")?
-        .json().await.context("crates metadata is not JSON")?;
+    let meta = get_json_retry(client, &url)
+        .await
+        .ok_or_else(|| anyhow!("crates metadata unavailable (rate-limited or missing)"))?;
     let version = meta.pointer("/crate/max_stable_version")
         .or_else(|| meta.pointer("/crate/newest_version"))
         .and_then(|v| v.as_str())
@@ -1564,8 +1557,10 @@ pub async fn seed_all(db: sqlx::PgPool, npm_per_term: usize, per_eco_max: usize)
                     record_failure_eco(&db, eco, &name, "", &e.to_string()).await;
                 }
             }
-            // 对前台让路。300ms 一个 ≈ 每小时 12000 个，跑满一轮几小时，代价是几乎无感。
-            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            // 对前台让路，也对上游客气。crates.io 的限流明显比 npm 严
+            // （实测一口气 429 了 2115 个），单独放慢一档。
+            let pace = if eco == Eco::Crates { 900 } else { 300 };
+            tokio::time::sleep(std::time::Duration::from_millis(pace)).await;
         }
         tracing::info!(eco = eco.as_str(), done, failed, skipped, "code corpus: ecosystem finished");
     }
@@ -1716,6 +1711,10 @@ declare function notExported(): void;
         let prod = &src[..src.find("mod tests").expect("tests module")];
         assert_eq!(prod.matches("fallback()").count(), 4,
             "discover_pypi 的每条失败路径都要回落，不能有一条直接返回空");
+        // 逐包抓取也必须走重试：只给发现阶段加重试时，crates 一口气 429 了 2115 个，
+        // 而它们随即进台账吃 30 天冷却——一次限流换来一个月的覆盖缺口。
+        assert_eq!(prod.matches("get_json_retry(client, &url)").count(), 5,
+            "三个生态的元数据抓取 + npm/crates 两处发现，五处都要带退避重试");
     }
 
     #[test]
