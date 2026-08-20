@@ -836,12 +836,27 @@ impl std::fmt::Display for ImageAttemptError {
 /// 连不上 = 这个端点在这台中转站上根本不存在，换下一个是对的。
 /// **超时不一样**：请求已经打进去了，上游很可能正在画——这时候换端点重来
 /// 就是花两份钱等两遍。网关那边的计费路径也是按这条规矩写的。
+///
+/// 实测过 reqwest 0.12 的分类边界（2026-08-20，本机）：
+///   NXDOMAIN            → is_connect = true
+///   连接被拒            → is_connect = true
+///   连上了但不回        → is_connect = false, is_timeout = true
+///   主机不可达超时      → is_connect = false, is_timeout = true   ← 和上一条无法区分
+/// 最后两条在客户端这边长得**完全一样**，所以这里判断不了「到底画没画」。
+/// 试过给客户端加 connect_timeout 想把连接阶段单独分出来——**更糟**：两种情况
+/// 双双塌成 `connect=false, timeout=false` 的 "connection closed before message
+/// completed"，连 is_timeout 都不再触发。所以不加，别再往这个方向改。
+///
+/// 分不出来的时候按「可能已计费」处理（宁可少画一张，不肯多收一次钱），
+/// 但**文案不能把猜测说成事实**：不知道就说不知道。
 fn image_send_error(stage: &str, e: reqwest::Error) -> ImageAttemptError {
     if e.is_connect() {
-        ImageAttemptError::route(format!("{stage} 请求失败: {e}"))
+        ImageAttemptError::route(format!("{stage} 请求失败（没连上，上游没收到这次请求）: {e}"))
     } else {
         ImageAttemptError::billed(format!(
-            "{stage} 请求已发出但没拿到完整响应（上游可能已经出图并计费，不再换端点重试）: {e}"
+            "{stage} 请求发出后没拿到完整响应，**判断不了上游有没有出图**\
+             （连接阶段就超时、和上游正在画，在客户端这边长得一样）。\
+             按可能已计费处理，不再换端点重画: {e}"
         ))
     }
 }
@@ -1868,6 +1883,17 @@ mod image_billing_tests {
         assert!(
             rest.contains("ImageAttemptError::billed") && !rest.contains("ImageAttemptError::route"),
             "超时 / 读响应体失败被当成可以免费换端点重试 —— 那是让用户为一次生图付两次钱"
+        );
+        // 分不出来就不能把猜测说成事实：主机不可达的连接超时，和上游正在画，
+        // 在 reqwest 这边长得完全一样（实测见函数文档）。这时候说「上游可能已经
+        // 出图并计费」，对一个域名都没连上的失败来说就是一句假话。
+        assert!(
+            rest.contains("判断不了上游有没有出图"),
+            "分不出来的情况被写成了断言式的「已经出图并计费」"
+        );
+        assert!(
+            !rest.contains("上游可能已经出图并计费"),
+            "又把猜测写成了结论"
         );
     }
 
