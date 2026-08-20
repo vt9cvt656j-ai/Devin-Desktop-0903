@@ -16607,6 +16607,23 @@ function _removeRenderedHistoryMessage(message) {
   _releaseBlobMediaInNode(message);
   message.remove();
 }
+// 「接下来」建议块是**一轮**级的瞬时 UI，却和 .msg 平级挂在会话容器上，而三处裁剪都只认
+// .msg —— 于是消息被裁掉了，它那块建议按钮还留着。跑 60 轮实测：消息剩 56 条、建议块 60 块，
+// 其中 32 块的主人已经没了，最老的几个节点清一色是这种孤儿，连成一片贴在对话最上面：
+// 用户往上滚看到一排排按钮，点下去发的是几十轮前那件事。
+//
+// 只清「排在第一条存活消息之前」的那些：那正好是孤儿所在的区间，而且绝不会碰到末尾那块
+// ——末尾那块属于当前轮，轮末还要靠它来合并两组建议（有测试钉着）。
+function _dropOrphanSuggestionBlocks(container) {
+  if (!container || !container.querySelectorAll) return;
+  try {
+    const firstMsg = container.querySelector(":scope > .msg");
+    for (const el of Array.from(container.querySelectorAll(":scope > .next-steps"))) {
+      if (!firstMsg) { el.remove(); continue; }        // 一条消息都不剩，那全是孤儿
+      if (el.compareDocumentPosition(firstMsg) & 4) el.remove(); // firstMsg 在它后面 → 它是孤儿
+    }
+  } catch { /* 清不掉就算了，绝不能因此打断裁剪 */ }
+}
 function _trimRenderedHistoryWindow(session, edge) {
   const messages = Array.from(session?.container?.querySelectorAll?.(":scope > .msg") || []);
   const excess = Math.max(0, messages.length - _RENDER_LIMIT);
@@ -16617,6 +16634,7 @@ function _trimRenderedHistoryWindow(session, edge) {
     session._historyAtLatest = false;
   } else {
     messages.slice(0, excess).forEach(_removeRenderedHistoryMessage);
+    _dropOrphanSuggestionBlocks(session?.container);
     session._historyVisibleStart = Math.min(_sessionHistoryLength(session), (Number(session._historyVisibleStart) || 0) + excess);
   }
   return excess;
@@ -16729,7 +16747,9 @@ function _updateHistoryControls(session) {
 async function _renderLatestHistoryWindow(session) {
   const container = session?.container;
   if (!container || session._historyAtLatest !== false) return;
-  container.querySelectorAll(":scope > .msg, :scope > .chat-history-page").forEach((node) => {
+  // 选择器要带上 .next-steps：否则清空之后容器里剩下的全是历史建议块，重渲染的消息追加在
+  // 它们**后面**，整堆废按钮浮到全文最上方（实测清完还剩 60 个节点，全是 next-steps）。
+  container.querySelectorAll(":scope > .msg, :scope > .chat-history-page, :scope > .next-steps").forEach((node) => {
     if (node.classList?.contains("msg")) _removeRenderedHistoryMessage(node);
     else node.remove();
   });
@@ -19261,6 +19281,9 @@ function addMessage(role, text, forSession, attachments = [], options = {}) {
       _removeRenderedHistoryMessage(msgs[i]);
       removed++;
     }
+    // 主人被裁掉之后，它那块「接下来」建议按钮不会跟着走（三处裁剪都只认 .msg）。
+    // 只清排在第一条存活消息之前的那些，末尾那块属于当前轮、轮末还要用来合并。
+    if (removed) _dropOrphanSuggestionBlocks(target);
     if (session) {
       const historyLength = _sessionHistoryLength(session);
       session._historyAtLatest = true;
@@ -35164,6 +35187,19 @@ function _planWindowControlsHtml(view) {
     if (!view.collapsible) return "";
     return `<button type="button" class="agent-plan__fold agent-plan__fold--toggle" data-plan-expand="0" aria-label="收起计划步骤" title="收起为紧凑视图"><span class="agent-plan__page-spacer"></span><span>已展开全部 ${view.total} 项 · 点击收起</span>${chevron("up")}</button>`;
   }
+  // 只有**真的折得起来**（步骤数超过单卡上限）才出这个按钮。
+  //
+  // 原来这里只看「还有没有没显示出来的行」，而渐进展开动画期间必然有 —— 于是 4 步的计划卡
+  // 上也会写着「其余 3 项已折叠 · 点击展开」，其实一项都没折叠。穷举 1..6 步的所有组合，
+  // 七成以上吐的是这句假话。
+  //
+  // 更糟的是点下去的后果：它把「永远展开」写进 run 和 session，并且跨重启持久化
+  // （见 _togglePlanExpanded 和快照里的 planExpanded）——用户为了消掉一句假提示，
+  // 把这个会话的计划卡永久设成了展开态。而 ≤ 上限的卡在展开分支里 return ""，
+  // 连「收起」都没有，退不回去。
+  //
+  // 折不起来的时候什么都不出：那几行本来就在 110ms 一行地长出来，不到一秒就齐了。
+  if (!view?.collapsible) return "";
   const hidden = (view?.before || 0) + (view?.after || 0);
   if (!hidden) return "";
   return `<button type="button" class="agent-plan__fold agent-plan__fold--toggle" data-plan-expand="1" aria-label="展开全部计划步骤" title="展开全部计划步骤"><span class="agent-plan__page-spacer"></span><span>其余 ${hidden} 项已折叠 · 点击展开</span>${chevron("down")}</button>`;

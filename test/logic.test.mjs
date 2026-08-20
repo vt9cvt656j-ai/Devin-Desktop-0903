@@ -30265,3 +30265,88 @@ test("旧计划的两个继承入口都要打标，而且第二个不许共享�
   assert.match(loop, /if \(_pendingPlan\.length && _planActionable\) run\._incompleteReason/,
     "记账没按认领判据把关 —— 一次干净问答会被记成 partial，下一步建议变成「继续没做完的步骤」");
 });
+
+// ---- 「其余 N 项已折叠 · 点击展开」不许说假话 ----
+//
+// 折叠那一支原来只看「还有没有没显示出来的行」，而渐进展开动画期间必然有 —— 于是 4 步的
+// 计划卡上也写着「其余 3 项已折叠」，其实一项都没折叠。更糟的是点下去的后果：它把
+// 「永远展开」写进 run 和 session 并跨重启持久化，而 ≤ 上限的卡在展开分支里 return ""、
+// 连「收起」都没有 —— 用户为了消掉一句假提示，把这个会话的计划卡永久设成了展开态，退不回去。
+test("折叠提示只在真的折得起来时才出现", () => {
+  const win = load("_planVisibleWindow", {
+    _PLAN_MAX_RENDERED_STEPS: loadConst("_PLAN_MAX_RENDERED_STEPS"),
+    _planCurrentStepIndex: () => 0,
+  });
+  const controls = load("_planWindowControlsHtml");
+  const cap = loadConst("_PLAN_MAX_RENDERED_STEPS");
+
+  let fake = 0, real = 0;
+  for (let total = 1; total <= cap + 4; total++) {
+    for (let vis = 1; vis <= Math.min(total, cap); vis++) {
+      const steps = Array.from({ length: total }, (_, i) => ({ content: "s" + i, status: "pending" }));
+      const v = win({ _planVisibleCount: vis }, steps);
+      const html = controls(v);
+      if (!html) continue;
+      if (v.collapsible) real++; else fake++;
+    }
+  }
+  assert.equal(fake, 0,
+    `有 ${fake} 种情形吐出了假的折叠提示 —— 计划根本没超过单卡上限，却写着「其余 N 项已折叠」`);
+  assert.ok(real > 0, "真正需要折叠的情形一个都不出按钮了 —— 把功能一起弄没了");
+
+  // 判据必须在源码里，而且要在算 hidden 之前就短路。
+  const src = extractFn("_planWindowControlsHtml");
+  assert.match(src, /if \(!view\?\.collapsible\) return "";/,
+    "折叠分支又不看 collapsible 了 —— 渐进展开动画期间会再吐假话");
+});
+
+// ---- 长对话顶上堆着一排排「接下来」按钮，点了发的是几十轮前那件事 ----
+//
+// 「接下来」建议块是**一轮**级的瞬时 UI，却和 .msg 平级挂在会话容器上，而三处裁剪都只认
+// .msg —— 消息被裁掉了，它那块按钮还留着。跑 60 轮实测：消息剩 56 条、建议块 60 块，
+// 其中 32 块的主人已经没了，最老的几个节点清一色是这种孤儿，连成一片贴在最上面。
+test("消息被裁掉之后，它那块「接下来」按钮不许留下当孤儿", () => {
+  const mk = (cls = "") => ({
+    className: cls, children: [], parentNode: null,
+    get classList() { return { contains: (c) => this.className.split(" ").includes(c) }; },
+    appendChild(c) { c.parentNode = this; this.children.push(c); return c; },
+    remove() { if (this.parentNode) this.parentNode.children = this.parentNode.children.filter((x) => x !== this); },
+    querySelector(sel) { return this.querySelectorAll(sel)[0] || null; },
+    querySelectorAll(sel) {
+      const wants = sel.split(",").map((x) => x.trim().replace(":scope > .", ""));
+      return this.children.filter((c) => wants.includes(c.className));
+    },
+    compareDocumentPosition(other) {
+      const p = this.parentNode; if (!p) return 0;
+      return p.children.indexOf(other) > p.children.indexOf(this) ? 4 : 2;
+    },
+  });
+  const drop = load("_dropOrphanSuggestionBlocks", { _releaseBlobMediaInNode: () => {} });
+
+  const container = mk();
+  for (let i = 0; i < 60; i++) {
+    container.appendChild(mk("msg")); container.appendChild(mk("msg")); container.appendChild(mk("next-steps"));
+  }
+  // 模拟现有裁剪：只删 .msg，留 56 条
+  const msgs = container.children.filter((c) => c.className === "msg");
+  msgs.slice(0, msgs.length - 56).forEach((m) => m.remove());
+  const firstMsgIdx = container.children.findIndex((c) => c.className === "msg");
+  const orphans = container.children.slice(0, firstMsgIdx).filter((c) => c.className === "next-steps").length;
+  assert.ok(orphans > 0, "构造失败：没造出孤儿，这条断言等于没跑");
+
+  const before = container.children.filter((c) => c.className === "next-steps").length;
+  drop(container);
+  const after = container.children.filter((c) => c.className === "next-steps").length;
+  assert.equal(after, before - orphans,
+    "孤儿没被清干净 —— 用户往上滚会看到一排排按钮，点下去发的是几十轮前那件事");
+  assert.equal(container.children[container.children.length - 1].className, "next-steps",
+    "把末尾那块也删了 —— 那块属于当前轮，轮末还要用它来合并两组建议");
+
+  // 三处裁剪都要覆盖到。
+  assert.match(extractFn("_trimRenderedHistoryWindow"), /_dropOrphanSuggestionBlocks\(session\?\.container\)/,
+    "历史窗口裁剪没清孤儿");
+  assert.match(SRC, /if \(removed\) _dropOrphanSuggestionBlocks\(target\);/,
+    "追加消息时的裁剪没清孤儿");
+  assert.match(extractFn("_renderLatestHistoryWindow"), /:scope > \.next-steps/,
+    "重渲染最新窗口时没清 —— 清完剩下的全是建议块，新消息会追加在它们后面，整堆废按钮浮到最上面");
+});
