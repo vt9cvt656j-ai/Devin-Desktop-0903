@@ -3522,10 +3522,25 @@ function _fixExtraSpaces(model, changedLines) {
   return edits;
 }
 
-async function _fixFromLspDiagnostics(editor) {
+async function _fixFromLspDiagnostics(editor, changedLines) {
+  // 这条和 _fixKeywordTypos 是同一类东西：改的是用户**已经写下**的标识符，
+  // 而且 clangd 的 "did you mean" 在缺 compile_commands.json 时给的只是作用域里
+  // 最相似的那个名字，不是编译器背书的正确答案。_fixKeywordTypos 因此被判定
+  // 「必须由用户主动打开」并默认关，这一条却默认开、还扫全文。
+  //
+  // 更糟的是它有一条**不需要用户敲任何字**的触发路径（诊断一到就排定时器）：
+  // 打开一个还没生成 compile_commands.json 的 C 工程文件，clangd 首轮诊断满屏
+  // "did you mean"，用户一个键都没按，磁盘上的源码就被几十处猜测重命名改写，
+  // 然后自动保存直接落盘——没有提示、没有 diff、没有确认。
+  if (!effectivePrefs().autoFixTypos) return [];
   const model = editor.getModel();
   if (!model) return [];
-  const markers = monaco.editor.getModelMarkers({ resource: model.uri });
+  // 只看用户刚动过的那几行，和同批其余三个改写器一致。没动过任何一行就一个字都不改。
+  const scope = changedLines instanceof Set ? changedLines : new Set(changedLines || []);
+  if (scope.size === 0) return [];
+  const markers = monaco.editor
+    .getModelMarkers({ resource: model.uri })
+    .filter((m) => scope.has(m.startLineNumber));
   if (markers.length === 0) return [];
   const actionableMarkers = markers.filter((m) => !_isGeneratedDependencyDiagnostic(m));
   if (actionableMarkers.length === 0) return [];
@@ -3568,7 +3583,7 @@ async function _runAutoCorrections(editor, changedLines) {
   const typoFixes = effectivePrefs().autoFixTypos ? _fixKeywordTypos(model, changedLines) : [];
   const colonFixes = _fixPythonMissingColon(model, changedLines);
   const spaceFixes = _fixExtraSpaces(model, changedLines);
-  const lspFixes = await _fixFromLspDiagnostics(editor);
+  const lspFixes = await _fixFromLspDiagnostics(editor, changedLines);
 
   const allEdits = [...doubleFixes, ...typoFixes, ...colonFixes, ...spaceFixes, ...lspFixes];
   if (allEdits.length === 0) return;
@@ -3594,11 +3609,17 @@ function _autoFixSuppressed(model) {
   } catch {}
   return false;
 }
+// 诊断驱动的修正不是由输入事件触发的（诊断自己回来就会触发），所以它没有
+// 「用户改了哪几行」这个信息。在这里记一份，让那条路也只能碰用户真动过的行。
+let _recentUserEditLines = new Set();
+monacoEditor.onDidChangeModel(() => { _recentUserEditLines = new Set(); });
+
 monacoEditor.onDidChangeModelContent((e) => {
   if (_imeComposing || _punctFixing) return;
   if (_autoFixSuppressed(monacoEditor.getModel())) return;
   if (_autoFixTimer) clearTimeout(_autoFixTimer);
   const lines = e.changes.map((c) => c.range.startLineNumber);
+  for (const ln of lines) _recentUserEditLines.add(ln);
   _autoFixTimer = setTimeout(() => _runAutoCorrections(monacoEditor, lines), _AUTO_FIX_DEBOUNCE);
 });
 
@@ -3611,7 +3632,12 @@ monaco.editor.onDidChangeMarkers((uris) => {
   if (!uris.some((u) => u.toString() === modelUri)) return;
   if (_lspFixTimer) clearTimeout(_lspFixTimer);
   _lspFixTimer = setTimeout(async () => {
-    const lspFixes = await _fixFromLspDiagnostics(monacoEditor);
+    // 排程时记下的是 model A，2 秒里用户可能已经切到 B。而下面算替换范围时
+    // 取的是**当前**的 model——于是按 B 算出来的行列被打进 A，改坏另一个文件。
+    // 两道都要：一道挡切标签页，一道挡 await 期间切走。
+    if (monacoEditor.getModel() !== model) return;
+    const lspFixes = await _fixFromLspDiagnostics(monacoEditor, _recentUserEditLines);
+    if (monacoEditor.getModel() !== model) return;
     if (lspFixes.length > 0) {
       _punctFixing = true;
       model.pushEditOperations([], lspFixes, () => null);
@@ -17131,7 +17157,8 @@ function _scrubResidue(root) {
     // .run-revert-btn = 已移除的「撤销本轮全部改动」按钮；.agent-files-bar/.agent-files-list =
     // 已移除的「N Files」汇总条：旧会话快照里已经序列化了它们，
     // 恢复后是没有监听器的死 UI，这里一并清掉（保存+恢复两路都走）。
-    // .run-revert-btn 现在是**活的**（轮末的「本轮改了 N 个文件 · 全部撤销」），
+    // .run-revert-btn 现在是**死的**：它长在 _appendDeliveryFactsBar 上，而那个函数
+    //   自从交付事实页脚被去掉之后就零调用点了。checkpoint 数据还在，出口没有。
     // 但恢复出来的那份没有监听器、快照里也没有 run.checkpoint——按钮点了什么都不会
     // 发生。所以仍然在保存/恢复时清掉：它是本轮的东西，不该跨重启假装还能用。
     root.querySelectorAll(".md-caret, .md-stream-tail, .next-steps, .run-revert-btn, .agent-files-bar, .agent-files-list").forEach((e) => e.remove());
@@ -33045,7 +33072,7 @@ function _buildAgentToolSchemas(includeWrite, mcpTools = []) {
        * 装好的那份比任何全球索引都准——读的就是 lock 文件锁死的那一版。
        */
       { type: "function", function: { name: "package_source", description: "**Read the REAL API of a dependency as installed on this machine** — resolves the package inside the project's node_modules / site-packages and returns its installed version plus actual source. Two modes: without `symbol` you get `name@installedVersion`, the real on-disk path and the list of exported names; with `symbol` you get the definition body (signature + surrounding doc comment). 【When to use】BEFORE writing any call into a third-party library whose exact API you are not certain about — a signature you remember may belong to a different major version than the one installed here. This is the only tool that reads the version this project actually locked. 【How it differs】`package_search` answers \"does it exist / what versions / deprecated?\" from the registry and returns NO signatures. context7 (if connected) answers \"how do the official docs describe it?\". This one answers \"what is actually on disk\". Typical order: package_search → package_source → context7. 【Not installed? Still answerable】When the package is not on this machine, this tool now falls back to the gateway's OWN code corpus, which holds the real exported declarations (signature + doc comment) extracted from the package's published tarball; if that package is not indexed yet it is fetched and indexed on the spot. So \"not installed\" is no longer a dead end — but the result is the PUBLISHED version's API, not the version this project locks, and the reply says which. 【Note】Ordinary search / find_files / semantic_search deliberately skip node_modules, so they can never answer this — use this tool instead of trying to grep dependencies.", parameters: { type: "object", properties: { package: { type: "string", description: "Package name as imported, e.g. 'zod' / '@tanstack/react-query' / 'pydantic'" }, symbol: { type: "string", description: "Optional. Exported function / class / type to look up; omit for an overview of what the package exports" }, root: { type: "string", description: "Optional workspace root when several are open" } }, required: ["package"] } } },
-      { type: "function", function: { name: "download_file", description: "Download a file from an http/https URL and save it inside the workspace (images, fonts, datasets, binaries and so on). dest is a path relative to the workspace root (or an absolute path inside the workspace) and must land inside the workspace. Maximum 200MB per file. It will NOT overwrite: if dest already exists the download is refused and nothing is written — pick another name, or delete_path it first (that step leaves a checkpoint you can undo).", parameters: { type: "object", properties: { url: { type: "string", description: "The http/https URL to download" }, dest: { type: "string", description: "Where to save it, relative to the workspace root, e.g. assets/logo.png" } }, required: ["url", "dest"] } } },
+      { type: "function", function: { name: "download_file", description: "Download a file from an http/https URL and save it inside the workspace (images, fonts, datasets, binaries and so on). dest is a path relative to the workspace root (or an absolute path inside the workspace) and must land inside the workspace. Maximum 200MB per file. It will NOT overwrite: if dest already exists the download is refused and nothing is written — pick another name, or delete_path it first (note: that deletion cannot be undone from the UI).", parameters: { type: "object", properties: { url: { type: "string", description: "The http/https URL to download" }, dest: { type: "string", description: "Where to save it, relative to the workspace root, e.g. assets/logo.png" } }, required: ["url", "dest"] } } },
       { type: "function", function: { name: "realtime_news_feed", description: "Fetch the latest discussion and articles from technical communities (Hacker News, Dev.to) — good for the current state of play around a technology, release news and where community sentiment is going. By default it aggregates both sources concurrently, and you can name specific ones; a failing source is flagged but does not block the others. Return format: [source] title | score/comments | time | URL", parameters: { type: "object", properties: { topic: { type: "string", description: "The topic of interest, e.g. 'Rust 1.80' / 'Kubernetes new features'", minLength: 1 }, sources: { type: "string", enum: ["hn", "devto", "all"], description: "Data source: hn (Hacker News only), devto (DEV Community only), all (default, both concurrently)", default: "all" }, maxResults: { type: "integer", description: "Maximum results per source, default 10", minimum: 1, maximum: 25, default: 10 } }, required: ["topic"] } } },
       { type: "function", function: { name: "capture_start", description: "**Start capturing traffic (mitmproxy — the capability of tools like HttpCanary).** Pick a mode first: mode:\"isolated_browser\" = the recommended default, capturing an isolated automation browser without touching the system proxy; mode:\"system\" = capture any app or the whole system, which changes the macOS system proxy; mode:\"background\" = listen only / manual proxying, usually paired with background_monitor(check_type:\"capture\"). Once started, find the real requests with capture_flows, then replay them with capture_replay or http_request.", parameters: { type: "object", properties: { port: { type: "integer", description: "Proxy port, default 8080" }, mode: { type: "string", enum: ["auto", "isolated_browser", "system", "background"], description: "auto = the IDE decides from the task; isolated_browser = does not change the system proxy, and browser(fresh=true) routes through it automatically; system = changes the system proxy to capture any app; background = start the proxy listener only, and wait for traffic yourself or with a monitor" }, system_proxy: { type: "boolean", description: "Legacy parameter: true is equivalent to mode=system; false is equivalent to mode=isolated_browser/background. When omitted, it is decided automatically from mode and the task" } }, required: [] } } },
       { type: "function", function: { name: "automation", description: "**\u3010browser \u8fd8\u662f automation\uff1a\u6309\u76ee\u6807\u5728\u54ea\u513f\u5206\uff0c\u4e0d\u9760\u731c\u3011** Target lives INSIDE a web page (DOM nodes, forms, buttons, text, page screenshots, network/console) \u2192 use **browser**: it reads the DOM, targets by node number, and is far more reliable and cheaper than pixels. Target lives OUTSIDE the page \u2014 an OS dialog, a native file picker, the menu bar, another application, drag-and-drop between apps \u2014 or the page actively blocks CDP \u2192 use **automation**: it synthesises real OS mouse and keyboard events, which is the only thing that reaches non-web UI. Both drive the same browser brand (one setting decides for both). Do not reach for automation just because a click failed in browser \u2014 re-read the nodes first; and do not drive a web page through automation coordinates when browser can address it by node. Desktop automation RPC: real mouse and keyboard, a CDP browser, and record/replay. Use it as a state machine: confirm the precondition first (URL, window, node, sign-in state), then perform the action, then verify the postcondition with browser.content / browser.eval / screenshot / the recorder result — issuing a click or some typing is not the same as succeeding. Call system.init before anything else the first time. A coordinate click is mouse.click{x,y,button} — it moves and clicks in one call, and the reply carries the position it actually acted at, so compare that against your target instead of trusting a bare ok status. mouse.move{x,y} then mouse.click{button} works too and mouse.move only returns once the pointer has really arrived. There is no desktop.click or desktop.type. When a selector goes stale, re-read the page/nodes; when navigation is slow, wait and then check the URL/DOM; when sign-in, a captcha or a system permission blocks you, state the specific blocker and continue via background monitoring. **Choosing which browser to drive is a real decision, not a default.** browser.start takes profile: \u0022isolated\u0022 (default \u2014 a clean throwaway browser instance, no cookies, no logins) or \u0022session\u0022 (a persistent profile that keeps whatever it has signed into). Pick from the task: scraping a public page, checking your own dev server, or anything where a fresh state is safer \u2192 isolated. Anything that needs the user to be signed in \u2014 their dashboard, their account, posting on their behalf, reading their inbox \u2014 \u2192 session, because a blank browser just hits a login wall. If session still shows a login wall, start it again with headless=false so the user can sign in once; that sign-in persists for later runs. For the account the user is already signed into in their OWN everyday browser, neither these browser.* methods nor the separate `browser` tool can reach it \u2014 CDP attaches only to instances it launched itself. That case goes through system open \u2192 read_screen \u2192 ui_click instead; the `browser` tool's description spells it out. Never assume a fresh browser is fine just because it starts faster. Available methods: system.init / mouse.move / mouse.click / mouse.double_click / mouse.position / mouse.drag / mouse.scroll{delta_y} / sleep{ms} / keyboard.type / keyboard.press / keyboard.combo / keyboard.down{key} / keyboard.up{key} / browser.start / browser.goto / browser.click / browser.type / browser.wait / browser.eval / browser.screenshot / browser.content / browser.close / recorder.save / recorder.replay / recorder.list / window.list / window.activate{title} / window.minimize{title} / screen.info / clipboard.get / clipboard.set{text} / keyboard.paste{text}. Before driving another application, find its window with window.list and bring it to the front with window.activate. Read screen.info first and check its input_permission field: when it says denied, macOS silently discards every synthetic mouse and keyboard event — the calls still return ok while nothing happens on screen, so switch to browser automation, shell or file tools and tell the user to grant Accessibility in System Settings. Also note: screen.info, read_screen, window.list and mouse.move all speak the SAME coordinate space \u2014 screen points, origin top-left. Pass those numbers straight through; NEVER multiply by scale_factor (it only tells you whether the display is Retina, it is not a conversion factor \u2014 scaling a click sends it to twice the intended position, off-screen, and the click silently hits nothing). Paste long text via the clipboard with keyboard.paste rather than typing it key by key.", parameters: { type: "object", properties: { method: { type: "string", description: "The name of the real RPC method to call, e.g. browser.goto / mouse.move / recorder.replay" }, params: { type: "object", description: "The parameter object for that method; follow the method's own description" } }, required: ["method"] } } },
@@ -56210,10 +56237,16 @@ async function _executeToolStepInner(step, call, root, run) {
         if (oldText == null && dirSnapshot) {
           if (!dirSnapshot.files.length) {
             undoNote = "\n注意：这次删除**无法撤销**（目录里没有可快照的文本文件，二进制与超大文件不做快照）。";
-          } else if (dirSnapshot.truncated) {
-            undoNote = `\n注意：只快照了其中 ${dirSnapshot.files.length} 个文本文件，**其余内容无法撤销**（触到快照上限，或含二进制/超大/读不出的文件）。`;
           } else {
-            undoNote = `\n（已快照 ${dirSnapshot.files.length} 个文本文件，可用「全部撤销」还原。）`;
+            // 这里原来说「可用『全部撤销』还原」。那个按钮长在轮末的交付事实条上，
+            // 而那条页脚已按用户要求从渲染路径里去掉了——_appendDeliveryFactsBar
+            // 全文只剩一个定义、零调用点。快照数据还躺在 checkpoint 里，但界面上
+            // **没有任何入口**能把它写回去。
+            //
+            // 这句假承诺的作用恰恰是让模型觉得删除随时可回退，于是更放手地删下去，
+            // 而用户一个文件都找不回来。删目录在系统侧是 remove_dir_all：没有回收站、
+            // 没有磁盘备份。所以两种情况都只能说实话。
+            undoNote = `\n注意：删目录在系统侧是 remove_dir_all，**无法撤销**——没有回收站、没有备份，界面上也没有撤销入口。已在内存里快照了 ${dirSnapshot.files.length} 个文本文件${dirSnapshot.truncated ? "（触到上限，未快照全）" : ""}，但目前没有出口能还原它们。未提交、被 .gitignore 挡住的内容（本地 .env、开发配置、生成的资源）删掉即永久丢失。`;
           }
         }
         return { type: "delete", path: p, content: `已删除 ${p}${undoNote}` };
@@ -70999,7 +71032,12 @@ async function replaceInFiles(replaceAll) {
     const regex = searchCaseSensitive
       ? new RegExp(query.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "g")
       : new RegExp(query.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "gi");
-    const newContent = content.replace(regex, replacement);
+    // 替换文本必须按**字面量**插入。传字符串给 replace 时，$& $' $` $$ $1 $<name>
+    // 全是替换模式：把 SEP 换成 IFS=$'\n' 时，$' 会展开成「匹配点之后的全部内容」，
+    // 于是每个命中点插进一整份文件尾部——文件成倍膨胀、语法全毁，写盘还成功，
+    // toast 照报「已替换 N 处」。SQL 的 $$、Makefile 的 $$VAR 同理。
+    // 传函数则返回值原样插入，不做任何模式解释。
+    const newContent = content.replace(regex, () => replacement);
     if (newContent !== content) {
       try {
         const open = openFiles.get(filePath);
