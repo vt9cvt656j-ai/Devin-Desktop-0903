@@ -29579,3 +29579,33 @@ test("硬拦的计划门只认模型直接声明的维度，不认 harness 派�
       + "模型填了也会被覆盖。唯一一道硬拦回合的门不许由预测驱动");
   }
 });
+
+// ---- 风险面不等于规模：改登录页一个错别字不该走大工程流程 ----
+//
+// 提示词明令「涉及权限、鉴权、支付/金额、租户归属、对外接口……都要标 securityRisk
+// （写一个登录功能同样要标）」。而 securityRisk 会滚进 industrialProject → substantial →
+// requiresPlan。于是「把登录页那个错别字改了」被一路抬成大工程：先弹一份只有一步的计划卡，
+// 再灌一套「先按架构边界拆服务/模块/数据流/队列/缓存」，而「小任务律：直接用最短证据链
+// 完成」被压掉。面属性直接当规模属性用，两个正交维度串了线。
+test("纯风险面单独出现时不产出 substantial，除非模型自己声明了更大的 changeScope", () => {
+  const src = extractFn("_mergeAiIntentProfile")
+    .split("\n").filter((l) => !l.trim().startsWith("//")).join("\n");
+  // 下限必须存在，且判据是模型声明的 changeScope。
+  assert.match(src, /const _riskSurface = /, "风险面没有被单独拎出来");
+  assert.match(src, /_riskSurface && !\["none", "local"\]\.includes\(changeScope\)/,
+    "风险面没有 changeScope 下限——改一个字也会被当成大工程");
+  // 下限只加给风险面：真规模信号必须仍然无条件抬升。
+  assert.match(src, /const _scaleSignal = /, "真规模信号没有和风险面分开");
+  for (const scale of ["largeProject", "multiService", "featureCompleteness", "websiteDelivery"]) {
+    assert.match(src, new RegExp(`_scaleSignal[\\s\\S]{0,320}m\\.${scale}`),
+      `${scale} 是真规模信号，不该掉进要看 changeScope 的那一组`);
+  }
+  for (const risk of ["securityRisk", "businessLogic", "businessRisk", "architectureQuality",
+                      "qualityFloor", "productionReadiness"]) {
+    assert.match(src, new RegExp(`_riskSurface = [\\s\\S]{0,260}m\\.${risk}`),
+      `${risk} 是风险/质量面，不该无条件当成规模`);
+  }
+  // 各自的律照常按面触发：不许顺手把它们从 industrialProject 里删掉。
+  assert.match(src, /m\.industrialProject = [\s\S]{0,400}m\.securityRisk/,
+    "把 securityRisk 从 industrialProject 里删掉了——业务漏洞/滥用律会跟着一起哑掉");
+});

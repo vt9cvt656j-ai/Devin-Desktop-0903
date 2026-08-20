@@ -21979,7 +21979,25 @@ function _mergeAiIntentProfile(base, intents, text, priorState = null) {
   m.engineeringGrade = m.projectEngineering;
   m.applies = !!(m.projectEngineering || m.bug || m.architecture || m.implementation || m.database
     || m.git || m.backendApi || m.packageVersion || (m.ui && m.projectScope) || orchestration);
-  m.substantial = m.applies && !!(m.industrialProject || projectSized || architectureMode === "design_new"
+  // 风险面 ≠ 规模。securityRisk / businessLogic / businessRisk / architectureQuality /
+  // qualityFloor / productionReadiness 说的是「这块地方碰了要小心」，不是「这活儿有多大」。
+  // 而提示词明令「涉及权限、鉴权、支付/金额、租户归属、对外接口……都要标 securityRisk
+  // （写一个登录功能同样要标）」——于是「改登录页那个错别字」会被这条链路一路抬成大工程：
+  //     securityRisk → industrialProject → substantial → requiresPlan
+  // 用户看到的就是：改一个字，先弹一份只有一步的计划卡，还被灌一整套「先按架构边界拆
+  // 服务/模块/数据流/队列/缓存」的清单，而「小任务律：直接用最短证据链完成」被压掉了。
+  //
+  // 这里只给**纯风险/质量面**加一道下限：模型自己声明的 changeScope 高于 local 才算规模信号。
+  // 判据是模型的声明（changeScope 已由 _AI_CHANGE_SCOPES 校验），不是 harness 猜的。
+  // 注意**不是**把它们从 industrialProject 里删掉——工业级律 / 业务漏洞律 / 架构质量律
+  // 照常按面触发，一条不少；改的只是「要不要按大工程的流程走」。
+  const _riskSurface = !!(m.securityRisk || m.businessLogic || m.businessRisk
+    || m.architectureQuality || m.qualityFloor || m.productionReadiness);
+  const _scaleSignal = !!(m.largeProject || m.multiService || m.allProjectsEngineering
+    || m.promptRescue || m.vagueProjectRequest || m.maintainabilityUpgrade
+    || m.databaseOps || m.containerOps || m.featureCompleteness || m.websiteDelivery);
+  const _industrialScale = _scaleSignal || (_riskSurface && !["none", "local"].includes(changeScope));
+  m.substantial = m.applies && !!(_industrialScale || projectSized || architectureMode === "design_new"
     || architectureMode === "refactor_existing" || m.debugProject
     || m.databaseArchitecture || m.containerOps || m.featureCompleteness || m.websiteDelivery
     || (m.database && m.explicitWorkspaceMutation)
