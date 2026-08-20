@@ -29220,3 +29220,59 @@ test("researchMode 必须带判据，否则那道取证门永远不会触发", (
     "取证门在主循环里的调用点没了——门还在，但没人开");
   assert.match(loop, /_pushNudge\("researchFirst"/, "取证提醒没了");
 });
+
+// ---- 两本取证台账只写不读：页面文案全靠编，没有任何一处会察觉 ----
+//
+// 「网站内容取证律」是提示词里的硬要求：视觉实现前必须取得并记录一条真实内容证据。
+// harness 也真按执行事实记了账（工具真成功 + 正文 ≥80 字才算，搜索标题一律不收）。
+// 可这本台账全树只写不读 —— 对照同一批写入的设计证据台账，那份在三处被回读。
+// 于是一个 run 一条真实产品事实都没取过时，从第一次写页面到收尾，没有任何一处告诉模型
+// 「这一条是空的」，它拿训练记忆编产品文案不会遇到任何摩擦。
+test("写页面时取证台账为空，要按执行事实出声——两本台账都不许只写不读", () => {
+  const loop = extractFn("_runAgenticLoop");
+
+  // 一、网站内容取证台账
+  assert.match(loop, /_pushNudge\("websiteContent",/,
+    "内容取证台账仍然只写不读——页面文案全是编的，没有任何一处会察觉");
+  assert.match(loop, /!\(run\._websiteContentEvidence\?\.sources \|\| \[\]\)\.length/,
+    "判据不是「台账为空」了——会在已经取过证的 run 上白喊");
+  // 必须是**模型自己声明**这是完整网站，不是 harness 按关键词猜。
+  assert.match(loop, /run\.engineering\?\.fullWebsite/,
+    "触发条件不看模型的声明了——改后端/改文档也会被喊「产品事实是编的」");
+  // 必须真落盘了视觉源码才算「正在写页面」。
+  const wcAt = loop.indexOf('_pushNudge("websiteContent"');
+  assert.ok(wcAt > 0);
+  const wcBlock = loop.slice(Math.max(0, wcAt - 1200), wcAt);
+  assert.match(wcBlock, /_UI_SOURCE_EXT\.test\(path\)/, "没按视觉源码扩展名筛");
+  assert.match(wcBlock, /ERROR\|BLOCKED\|DENIED/, "写失败的也算「写了页面」");
+  assert.match(wcBlock, /run\._websiteContentStopUsed = true;/, "没有一次性开关，会变成每批唠叨");
+  // 必须给出路：那条律自己写明的兜底是先写 PRODUCT_BRIEF.md。没有出路的提醒会把模型卡死。
+  const wcText = loop.slice(wcAt, wcAt + 900);
+  assert.match(wcText, /PRODUCT_BRIEF\.md/,
+    "没给兜底出路——确实拿不到产品事实时，模型会被这条提醒卡住");
+  // 而且兜底出路要写成台账**真的收**的样子：write 分支除了路径像 PRODUCT_BRIEF，
+  // 还要求正文含「假设/待确认/原创内容」这类标记。提醒里少了标记，模型照做也填不上台账，
+  // 这道门就永远关不上。判据从台账自己那条正则取，不在测试里另写一份。
+  const evFn = extractFn("_websiteContentEvidenceFromResult");
+  const briefReSrc = /&&\s*(\/(?:[^/\\]|\\.)+\/i)\.test\(content\)/.exec(evFn);
+  assert.ok(briefReSrc, "取证台账收 brief 的判据找不到了，这条断言失去落点");
+  const briefRe = new Function(`return ${briefReSrc[1]};`)();
+  assert.ok(briefRe.test(wcText),
+    `提醒给的兜底出路，台账根本不收（判据 ${briefRe}）——模型照做也填不上账，门永远关不上`);
+  assert.doesNotMatch(loop.slice(wcAt, wcAt + 500), /\bcontinue;/, "这条只给事实，不许补回合");
+  // 事实类：丢了模型就按「内容没问题」继续铺。
+  const facts = new Set([...(/const _NUDGE_FACTS = new Set\(\[([\s\S]*?)\]\)/.exec(SRC)[1].matchAll(/"([a-zA-Z]+)"/g))].map((m) => m[1]));
+  assert.ok(facts.has("websiteContent"), "websiteContent 没登记进事实类，会被一条建议挤掉");
+
+  // 二、用户自己给的参考站
+  assert.match(loop, /_pushNudge\("referenceSite",/,
+    "参考站台账仍然只写不读——用户打出来的 URL 一个没读也没人提");
+  assert.match(loop, /run\.engineering\?\.referenceWebsiteUrls/,
+    "不看用户给的 URL 了——这条判据必须来自用户原话，不是 harness 猜的");
+  assert.match(loop, /run\._referenceWebsiteEvidence\?\.references/,
+    "不看「真读过哪几个」了——集合差算不出来，会在已经读过的 run 上白喊");
+  assert.match(loop, /run\._referenceSiteStopUsed = true;/, "没有一次性开关");
+  // 这条**故意不**进事实类：参考站律每轮都在提示词里，它只是兜底。
+  assert.ok(!facts.has("referenceSite"),
+    "referenceSite 被提成事实类了——参考站律每轮都在提示词里，它只该是兜底建议");
+});
