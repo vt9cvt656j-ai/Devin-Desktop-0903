@@ -47729,12 +47729,21 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
   // 另外原来是**共享引用**（run._planSteps = session._planSteps），于是下游自动打勾会
   // 直接改到会话那份并落盘 —— 用户会看到「已经不要的那份计划，在你做别的事的时候自己
   // 打上了勾」。改成拷贝。
-  if (isAgent && !run._planSteps && Array.isArray(session._planSteps) &&
+  //
+  // 用户在纠正或换目标时不许继承。这是「根本不懂用户」最字面的一种：
+  // 用户打「不是这个意思」，裁决把 continuation 判成 correct/replace，而这里照样把旧计划
+  // 捡起来——于是纠正在机器层面等于没发生，模型转头接着做被否掉的那件事。
+  // 判据用的是裁决自己声明的枚举，不是猜；旧计划仍留在 session 上，用户真想接着做时
+  // 下一条「继续」照样能捡回来。
+  const _planRel = String(_engineeringProfile?.intentSemantic?.continuation || "");
+  const _planDropped = _planRel === "correct" || _planRel === "replace";
+  if (isAgent && !run._planSteps && !_planDropped && Array.isArray(session._planSteps) &&
       session._planSteps.some((s) => s.status === "pending" || s.status === "in_progress")) {
     run._planSteps = session._planSteps.map((x) => ({ ...x }));
     run._planInherited = true;
     planSteps = run._planSteps;
   }
+  if (_planDropped) run._planDroppedByCorrection = _planRel;
   const _shotMsgs = []; // screenshot image messages currently in context (kept lean)
   // continueNudges / effectNudges / researchNudges / verifyNudges / honestyNudges /
   // deepReadNudges / codeVerifyNudges used to live here too, each appearing exactly once in the
@@ -48537,6 +48546,11 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
         }
         if (_readFiles.size) _parts.push(`本次运行已完整读取: ${[..._readFiles].slice(-12).join("、")}。文件未变化就直接使用已有内容；只缺某段原文时才按 offset/limit 精读。`);
         if (_planLine) _parts.push(_planLine);
+        // 旧计划因为用户在纠正/换目标而被丢掉——这件事必须说出来，否则模型只看到"没有计划"，
+        // 可能又把同一份旧计划重新列一遍，纠正在机器层面还是等于没发生。
+        if (run._planDroppedByCorrection) {
+          _parts.push(`上一轮的计划已经作废：这一轮判定为${run._planDroppedByCorrection === "replace" ? "换了目标" : "对上一轮的纠正"}，旧步骤不再自动继承。按用户这次的话重新定范围；确实还需要旧计划里的某几步，就重新列出来。`);
+        }
         if (_runtimeStateBlock) _parts.push(_runtimeStateBlock);
         if (_evidenceBlock) _parts.push(_evidenceBlock);
         if (_latestDiagBlock) _parts.push(_latestDiagBlock);
