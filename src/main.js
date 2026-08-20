@@ -37328,6 +37328,15 @@ function _commandBatchBlockResult(run, items, index) {
   const current = items[index];
   const isCmd = (call) => call && (call.type === "cmd" || call.type === "termtask");
   if (!isCmd(current?.call) || current._eagerEntry || current.merged != null || current._unknown) return null;
+  // 纯读命令照跑。
+  //
+  // 这道门自己的理由是「继续跑只会把一个错误变成一排错误」——那说的是会**改状态**的
+  // 命令。`_callIsReadOnlyCommand` 已经用在失败那一侧（读命令失败不拦后面），却没用在
+  // 被拦的这一侧：于是 [npm run build（失败）, git status, cat package.json, ls dist]
+  // 里后三条全被拦下，而它们恰恰是拿来看清这次失败的。模型被逼着一条一条重发，
+  // 一次排查要多烧三四轮——用户看到的就是「这工具一出错就变成固定流程」。
+  // 读命令改不了任何东西，拦它换不来一点安全。
+  if (_callIsReadOnlyCommand(current.call)) return null;
   const failed = items.slice(0, index).find((item) => isCmd(item?.call)
     && !item._unknown && item.merged == null
     && item.rawResult != null

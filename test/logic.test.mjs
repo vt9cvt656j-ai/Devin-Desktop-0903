@@ -23014,6 +23014,19 @@ test("同一轮里前面的命令失败，后面的命令不许再跑", () => {
   assert.equal(block(run, [item("which python", false), item("which node")], 1), null,
     "只读探测失败是信息本身，不是前提塌了——一次性探环境是正当批次");
 
+  // 被拦的这一侧是纯读命令时也要放行。
+  //
+  // 这道门自己的理由是「继续跑只会把一个错误变成一排错误」——那说的是会改状态的命令。
+  // _callIsReadOnlyCommand 一直只用在失败那一侧，没用在被拦这一侧：于是
+  // [npm run build（失败）, git status, cat package.json, ls dist] 里后三条全被拦下，
+  // 而它们恰恰是拿来看清这次失败的。模型被逼着一条一条重发，一次排查多烧三四轮。
+  for (const probe of ["cat package.json", "ls dist", "pwd"]) {
+    assert.equal(block(run, [item("npm run build", false), item(probe)], 1), null,
+      `读命令 \`${probe}\` 被拦了 —— 它改不了任何东西，拦它换不来一点安全`);
+  }
+  // 会改状态的照拦不误。
+  assert.ok(block(run, [item("npm run build", false), item("rm -rf dist")], 1));
+
   // 只对 agent 轮生效，且第一条永远放行。
   assert.equal(block({ mode: "chat" }, [item("a", false), item("b")], 1), null);
   assert.equal(block(run, [item("npm run build", false)], 0), null);
