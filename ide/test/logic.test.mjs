@@ -30124,3 +30124,229 @@ test("计划卡跨轮只有一张：新的一轮要复用上一轮那张，不�
   assert.match(src, /run\.session\._planEl/, "会话级指针没了 —— 下一轮又会新建一张");
   assert.match(src, /if \(run\) run\._planEl = el;/, "run 级指针没了 —— 本轮内的增量更新会失效");
 });
+
+// ---- 计划卡的另外两半：跨重启、以及展开进度 ----
+//
+// 上一条测试治的是「每问一轮多一张」。同一个病还有两半：
+//  · 卡本体会被写进持久化的 HTML 快照（_scrubResidue 的删除清单里没有 .agent-plan），
+//    而 run/session 上那两个指针都是内存里的 DOM 引用、序列化不进去 —— 指针没了、卡还在，
+//    于是**每关一次软件就多出一张**，画面和用户实拍那张一模一样。
+//  · 展开到第几行只挂 run，新的一轮必然 undefined —— 已经展开到 4 步的卡，一问下一句就
+//    缩回 1 行、把动画重放一遍。
+test("计划卡：跨重启不重建，展开进度跨轮保住，新任务仍从一行长起", () => {
+  const mkEl = (cls = "") => ({
+    className: cls, innerHTML: "", children: [], parentNode: null, isConnected: false,
+    get lastChild() { return this.children[this.children.length - 1] || null; },
+    appendChild(c) {
+      if (c.parentNode) c.parentNode.children = c.parentNode.children.filter((x) => x !== c);
+      c.parentNode = this; c.isConnected = true; this.children.push(c); return c;
+    },
+    querySelector(sel) {
+      const want = sel.replace(".", "");
+      const walk = (n) => { for (const c of n.children) { if (c.className === want) return c; const r = walk(c); if (r) return r; } return null; };
+      return walk(this);
+    },
+  });
+  let visible = null;
+  const render = new Function("document", "t", "_escHtml", "_PLAN_ICON", "_planVisibleWindow",
+    "_planRowHtml", "_planWindowControlsHtml", "_bindPlanWindow", "_syncPlanChip",
+    "_schedulePlanReveal", "_PLAN_MAX_RENDERED_STEPS",
+    `${extractFn("_renderPlan")}\nreturn _renderPlan;`)(
+    { createElement: () => mkEl() }, () => "", (x) => String(x), "",
+    (run, steps) => { visible = run && run._planVisibleCount; return { rows: steps.slice(0, visible), start: 0 }; },
+    () => "", () => "", () => {}, () => {}, () => {}, 8);
+  const countCards = (n) => (n.className === "agent-plan" ? 1 : 0)
+    + n.children.reduce((a, c) => a + countCards(c), 0);
+  const steps = [1, 2, 3, 4].map((i) => ({ content: "s" + i, status: "pending" }));
+
+  // ① 跨重启：每次「重启」都是新的 session 对象（内存指针没了），但容器里那张卡还在。
+  const chat = mkEl(); chat.isConnected = true;
+  for (let boot = 0; boot < 3; boot++) {
+    const body = mkEl(); chat.appendChild(body);
+    render(body, steps, undefined, { session: { container: chat } });
+  }
+  assert.equal(countCards(chat), 1,
+    "每重启一次就多出一张计划卡 —— 卡进了快照，指针没进，于是恢复后再建一张");
+
+  // ② 展开进度跨轮保住。
+  const chat2 = mkEl(); chat2.isConnected = true;
+  const sess2 = { container: chat2 };
+  const b1 = mkEl(); chat2.appendChild(b1);
+  const r1 = { session: sess2 };
+  render(b1, steps, undefined, r1);
+  // 用户展开到 4 行：**只**改 run 上那个值，会话级那份必须由渲染自己回写 ——
+  // 在这里手工替它写上，等于把「回写」那一步遮住了（第一版就是这么漏掉的）。
+  r1._planVisibleCount = 4;
+  render(b1, steps, r1._planEl, r1);                       // 同一轮内再渲染一次 → 应当回写会话
+  assert.equal(sess2._planVisibleCount, 4,
+    "展开进度没回写到会话上 —— 下一轮照样读不到，卡还是会缩回去");
+  const b2 = mkEl(); chat2.appendChild(b2);
+  render(b2, steps, undefined, { session: sess2 });        // 下一轮 = 新 run
+  assert.equal(visible, 4,
+    "下一轮把卡缩回去了 —— 展开进度只挂 run，卡却是跨轮复用的，每轮抖一次");
+
+  // ③ 但换任务的新计划仍然从 1 行长起来，别把动画一起弄没了。
+  const chat3 = mkEl(); chat3.isConnected = true;
+  const b3 = mkEl(); chat3.appendChild(b3);
+  render(b3, steps, undefined, { session: { container: chat3 } });
+  assert.equal(visible, 1, "全新会话的新计划应该从 1 行开始长");
+
+  // DOM 兜底必须从会话容器里查，不能查全局 —— 否则跨标签页串卡。
+  const src = extractFn("_renderPlan");
+  assert.match(src, /run\.session\.container\.querySelector\(\"\.agent-plan\"\)/,
+    "跨重启的 DOM 兜底没了");
+  assert.doesNotMatch(src, /document\.querySelector\(\"\.agent-plan\"\)/,
+    "从全局查会把别的会话那张卡抢过来");
+});
+
+// ---- 已经不要的那份计划，不许在你做别的事的时候自己打勾 ----
+//
+// 用户实拍的形状：上一个任务留了两步 pending，这一轮做的是完全不相干的事（读 README、
+// 跑 npm test），却因为证据类别恰好对得上（investigate / verify），把旧计划那两步分别打成
+// 完成、进度走到 2/2 —— 那些事根本没做。而且第二个继承入口是**共享引用**，打的勾会直接
+// 改到会话那份并落盘，用户下次打开还看得见。
+test("继承来的计划，在模型这一轮认领之前不许自动推进", () => {
+  const advance = load("_advancePlanFromTool", {
+    _planEvidenceKindsForTool: () => ["investigate"],
+    _planPrimeCurrentStep: (steps) => steps.map((x, i) => (i === 0 ? { ...x, status: "in_progress" } : x)),
+    _planStepMatchesEvidence: () => true,
+    _planStepActionKind: () => "investigate",
+    _renderPlan: () => null,
+    _syncPlanChip: () => {},
+  });
+  const mkRun = (over) => ({
+    _planSteps: [{ content: "调研 Monaco 中文输入法", status: "pending" },
+                 { content: "跑 npm test 验证", status: "pending" }],
+    ...over,
+  });
+  const call = { type: "read", path: "README.md" };
+
+  // 继承来、本轮没认领 → 一步都不许推进。
+  const inherited = mkRun({ _planInherited: true });
+  assert.equal(advance(inherited, call, {}), false,
+    "继承来的旧计划被一件不相干的活推进了 —— 用户会看到旧计划自己打勾");
+  assert.ok(inherited._planSteps.every((x) => x.status === "pending"),
+    "步骤状态被改了");
+
+  // 模型这一轮自己调过 update_plan（认领）→ 恢复正常推进。
+  assert.equal(advance(mkRun({ _planInherited: true, _planTouchedThisRun: true }), call, {}), true,
+    "认领之后还是不推进 —— 那就把正常的计划推进也弄坏了");
+  // 本轮自己建的计划（没打继承标）照常推进。
+  assert.equal(advance(mkRun({}), call, {}), true, "本轮自己建的计划不该被这道守卫拦住");
+});
+
+// ---- 问一句不相干的事，不该被硬顶着去做上个任务的旧步骤 ----
+//
+// 旧计划有**两个**继承入口：带 outcome 闸的那个（2026-08-14），和早它 332 个提交、
+// 一直没有闸的那个。上面那道闸拒绝时（outcome=success / awaiting_user / 没有 _lastRunState），
+// 下面那个照样继承 —— 等于那道闸对它想拦的每种情形都不生效。
+test("旧计划的两个继承入口都要打标，而且第二个不许共享引用", () => {
+  const loop = extractFn("_runAgenticLoop");
+  // 两处继承都要打继承标，否则下游的守卫认不出来。
+  assert.equal((loop.match(/run\._planInherited = true;/g) || []).length, 2,
+    "两个继承入口没有都打标 —— 漏掉哪个，哪个就绕过所有守卫");
+  // 第二个入口必须拷贝：共享引用会让自动打勾直接改到会话那份并落盘。
+  assert.match(loop, /run\._planSteps = session\._planSteps\.map\(\(x\) => \(\{ \.\.\.x \}\)\);/,
+    "第二个入口还是共享引用 —— 打的勾会写回会话并持久化");
+  assert.doesNotMatch(loop, /run\._planSteps = session\._planSteps;/, "共享引用还在");
+
+  // 认领只由执行事实置位：本轮模型真的调过 update_plan。
+  assert.match(loop, /run\._planTouchedThisRun = true;/, "没有认领标记");
+  const at = loop.indexOf("run._planTouchedThisRun = true;");
+  // 窗口要够宽：这一段中间夹着几行中文注释，400 字只覆盖到注释里。
+  assert.match(loop.slice(Math.max(0, at - 1200), at), /tc\.name !== "update_plan"/,
+    "认领标记不是由 update_plan 置的 —— 判据必须是执行事实");
+
+  // 硬顶回合和记账都要看认领。
+  assert.match(loop, /const _planActionable = !run\._planInherited \|\| run\._planTouchedThisRun;/,
+    "planFinish 那道门没有按认领判据把关");
+  assert.match(loop, /_pendingPlan\.length && _planActionable && _canResume/,
+    "继承来又没碰过的计划仍然会硬顶一个回合");
+  assert.match(loop, /if \(_pendingPlan\.length && _planActionable\) run\._incompleteReason/,
+    "记账没按认领判据把关 —— 一次干净问答会被记成 partial，下一步建议变成「继续没做完的步骤」");
+});
+
+// ---- 「其余 N 项已折叠 · 点击展开」不许说假话 ----
+//
+// 折叠那一支原来只看「还有没有没显示出来的行」，而渐进展开动画期间必然有 —— 于是 4 步的
+// 计划卡上也写着「其余 3 项已折叠」，其实一项都没折叠。更糟的是点下去的后果：它把
+// 「永远展开」写进 run 和 session 并跨重启持久化，而 ≤ 上限的卡在展开分支里 return ""、
+// 连「收起」都没有 —— 用户为了消掉一句假提示，把这个会话的计划卡永久设成了展开态，退不回去。
+test("折叠提示只在真的折得起来时才出现", () => {
+  const win = load("_planVisibleWindow", {
+    _PLAN_MAX_RENDERED_STEPS: loadConst("_PLAN_MAX_RENDERED_STEPS"),
+    _planCurrentStepIndex: () => 0,
+  });
+  const controls = load("_planWindowControlsHtml");
+  const cap = loadConst("_PLAN_MAX_RENDERED_STEPS");
+
+  let fake = 0, real = 0;
+  for (let total = 1; total <= cap + 4; total++) {
+    for (let vis = 1; vis <= Math.min(total, cap); vis++) {
+      const steps = Array.from({ length: total }, (_, i) => ({ content: "s" + i, status: "pending" }));
+      const v = win({ _planVisibleCount: vis }, steps);
+      const html = controls(v);
+      if (!html) continue;
+      if (v.collapsible) real++; else fake++;
+    }
+  }
+  assert.equal(fake, 0,
+    `有 ${fake} 种情形吐出了假的折叠提示 —— 计划根本没超过单卡上限，却写着「其余 N 项已折叠」`);
+  assert.ok(real > 0, "真正需要折叠的情形一个都不出按钮了 —— 把功能一起弄没了");
+
+  // 判据必须在源码里，而且要在算 hidden 之前就短路。
+  const src = extractFn("_planWindowControlsHtml");
+  assert.match(src, /if \(!view\?\.collapsible\) return "";/,
+    "折叠分支又不看 collapsible 了 —— 渐进展开动画期间会再吐假话");
+});
+
+// ---- 长对话顶上堆着一排排「接下来」按钮，点了发的是几十轮前那件事 ----
+//
+// 「接下来」建议块是**一轮**级的瞬时 UI，却和 .msg 平级挂在会话容器上，而三处裁剪都只认
+// .msg —— 消息被裁掉了，它那块按钮还留着。跑 60 轮实测：消息剩 56 条、建议块 60 块，
+// 其中 32 块的主人已经没了，最老的几个节点清一色是这种孤儿，连成一片贴在最上面。
+test("消息被裁掉之后，它那块「接下来」按钮不许留下当孤儿", () => {
+  const mk = (cls = "") => ({
+    className: cls, children: [], parentNode: null,
+    get classList() { return { contains: (c) => this.className.split(" ").includes(c) }; },
+    appendChild(c) { c.parentNode = this; this.children.push(c); return c; },
+    remove() { if (this.parentNode) this.parentNode.children = this.parentNode.children.filter((x) => x !== this); },
+    querySelector(sel) { return this.querySelectorAll(sel)[0] || null; },
+    querySelectorAll(sel) {
+      const wants = sel.split(",").map((x) => x.trim().replace(":scope > .", ""));
+      return this.children.filter((c) => wants.includes(c.className));
+    },
+    compareDocumentPosition(other) {
+      const p = this.parentNode; if (!p) return 0;
+      return p.children.indexOf(other) > p.children.indexOf(this) ? 4 : 2;
+    },
+  });
+  const drop = load("_dropOrphanSuggestionBlocks", { _releaseBlobMediaInNode: () => {} });
+
+  const container = mk();
+  for (let i = 0; i < 60; i++) {
+    container.appendChild(mk("msg")); container.appendChild(mk("msg")); container.appendChild(mk("next-steps"));
+  }
+  // 模拟现有裁剪：只删 .msg，留 56 条
+  const msgs = container.children.filter((c) => c.className === "msg");
+  msgs.slice(0, msgs.length - 56).forEach((m) => m.remove());
+  const firstMsgIdx = container.children.findIndex((c) => c.className === "msg");
+  const orphans = container.children.slice(0, firstMsgIdx).filter((c) => c.className === "next-steps").length;
+  assert.ok(orphans > 0, "构造失败：没造出孤儿，这条断言等于没跑");
+
+  const before = container.children.filter((c) => c.className === "next-steps").length;
+  drop(container);
+  const after = container.children.filter((c) => c.className === "next-steps").length;
+  assert.equal(after, before - orphans,
+    "孤儿没被清干净 —— 用户往上滚会看到一排排按钮，点下去发的是几十轮前那件事");
+  assert.equal(container.children[container.children.length - 1].className, "next-steps",
+    "把末尾那块也删了 —— 那块属于当前轮，轮末还要用它来合并两组建议");
+
+  // 三处裁剪都要覆盖到。
+  assert.match(extractFn("_trimRenderedHistoryWindow"), /_dropOrphanSuggestionBlocks\(session\?\.container\)/,
+    "历史窗口裁剪没清孤儿");
+  assert.match(SRC, /if \(removed\) _dropOrphanSuggestionBlocks\(target\);/,
+    "追加消息时的裁剪没清孤儿");
+  assert.match(extractFn("_renderLatestHistoryWindow"), /:scope > \.next-steps/,
+    "重渲染最新窗口时没清 —— 清完剩下的全是建议块，新消息会追加在它们后面，整堆废按钮浮到最上面");
+});

@@ -16607,6 +16607,23 @@ function _removeRenderedHistoryMessage(message) {
   _releaseBlobMediaInNode(message);
   message.remove();
 }
+// 「接下来」建议块是**一轮**级的瞬时 UI，却和 .msg 平级挂在会话容器上，而三处裁剪都只认
+// .msg —— 于是消息被裁掉了，它那块建议按钮还留着。跑 60 轮实测：消息剩 56 条、建议块 60 块，
+// 其中 32 块的主人已经没了，最老的几个节点清一色是这种孤儿，连成一片贴在对话最上面：
+// 用户往上滚看到一排排按钮，点下去发的是几十轮前那件事。
+//
+// 只清「排在第一条存活消息之前」的那些：那正好是孤儿所在的区间，而且绝不会碰到末尾那块
+// ——末尾那块属于当前轮，轮末还要靠它来合并两组建议（有测试钉着）。
+function _dropOrphanSuggestionBlocks(container) {
+  if (!container || !container.querySelectorAll) return;
+  try {
+    const firstMsg = container.querySelector(":scope > .msg");
+    for (const el of Array.from(container.querySelectorAll(":scope > .next-steps"))) {
+      if (!firstMsg) { el.remove(); continue; }        // 一条消息都不剩，那全是孤儿
+      if (el.compareDocumentPosition(firstMsg) & 4) el.remove(); // firstMsg 在它后面 → 它是孤儿
+    }
+  } catch { /* 清不掉就算了，绝不能因此打断裁剪 */ }
+}
 function _trimRenderedHistoryWindow(session, edge) {
   const messages = Array.from(session?.container?.querySelectorAll?.(":scope > .msg") || []);
   const excess = Math.max(0, messages.length - _RENDER_LIMIT);
@@ -16617,6 +16634,7 @@ function _trimRenderedHistoryWindow(session, edge) {
     session._historyAtLatest = false;
   } else {
     messages.slice(0, excess).forEach(_removeRenderedHistoryMessage);
+    _dropOrphanSuggestionBlocks(session?.container);
     session._historyVisibleStart = Math.min(_sessionHistoryLength(session), (Number(session._historyVisibleStart) || 0) + excess);
   }
   return excess;
@@ -16729,7 +16747,9 @@ function _updateHistoryControls(session) {
 async function _renderLatestHistoryWindow(session) {
   const container = session?.container;
   if (!container || session._historyAtLatest !== false) return;
-  container.querySelectorAll(":scope > .msg, :scope > .chat-history-page").forEach((node) => {
+  // 选择器要带上 .next-steps：否则清空之后容器里剩下的全是历史建议块，重渲染的消息追加在
+  // 它们**后面**，整堆废按钮浮到全文最上方（实测清完还剩 60 个节点，全是 next-steps）。
+  container.querySelectorAll(":scope > .msg, :scope > .chat-history-page, :scope > .next-steps").forEach((node) => {
     if (node.classList?.contains("msg")) _removeRenderedHistoryMessage(node);
     else node.remove();
   });
@@ -19261,6 +19281,9 @@ function addMessage(role, text, forSession, attachments = [], options = {}) {
       _removeRenderedHistoryMessage(msgs[i]);
       removed++;
     }
+    // 主人被裁掉之后，它那块「接下来」建议按钮不会跟着走（三处裁剪都只认 .msg）。
+    // 只清排在第一条存活消息之前的那些，末尾那块属于当前轮、轮末还要用来合并。
+    if (removed) _dropOrphanSuggestionBlocks(target);
     if (session) {
       const historyLength = _sessionHistoryLength(session);
       session._historyAtLatest = true;
@@ -35004,6 +35027,13 @@ function _planStepMatchesEvidence(step, evidenceKinds) {
 
 function _advancePlanFromTool(run, call, result) {
   if (!run || call?.type === "plan" || !Array.isArray(run._planSteps) || !run._planSteps.length) return false;
+  // 继承来的计划，在模型这一轮自己调过 update_plan「认领」之前，一律不许自动推进。
+  //
+  // 用户实拍的形状：上一个任务留了两步 pending，这一轮做的是完全不相干的事
+  // （读 README、跑 npm test），却因为证据类别恰好对得上（investigate / verify），
+  // 把旧计划的两步分别打成完成、进度走到 2/2 —— 那些事根本没做。
+  // 认领判据是执行事实：本轮模型真的调过 update_plan（run._planTouchedThisRun）。
+  if (run._planInherited && !run._planTouchedThisRun) return false;
   const evidenceKinds = _planEvidenceKindsForTool(call, result);
   if (!evidenceKinds.length) return false;
   let steps = _planPrimeCurrentStep(run._planSteps);
@@ -35157,6 +35187,19 @@ function _planWindowControlsHtml(view) {
     if (!view.collapsible) return "";
     return `<button type="button" class="agent-plan__fold agent-plan__fold--toggle" data-plan-expand="0" aria-label="收起计划步骤" title="收起为紧凑视图"><span class="agent-plan__page-spacer"></span><span>已展开全部 ${view.total} 项 · 点击收起</span>${chevron("up")}</button>`;
   }
+  // 只有**真的折得起来**（步骤数超过单卡上限）才出这个按钮。
+  //
+  // 原来这里只看「还有没有没显示出来的行」，而渐进展开动画期间必然有 —— 于是 4 步的计划卡
+  // 上也会写着「其余 3 项已折叠 · 点击展开」，其实一项都没折叠。穷举 1..6 步的所有组合，
+  // 七成以上吐的是这句假话。
+  //
+  // 更糟的是点下去的后果：它把「永远展开」写进 run 和 session，并且跨重启持久化
+  // （见 _togglePlanExpanded 和快照里的 planExpanded）——用户为了消掉一句假提示，
+  // 把这个会话的计划卡永久设成了展开态。而 ≤ 上限的卡在展开分支里 return ""，
+  // 连「收起」都没有，退不回去。
+  //
+  // 折不起来的时候什么都不出：那几行本来就在 110ms 一行地长出来，不到一秒就齐了。
+  if (!view?.collapsible) return "";
   const hidden = (view?.before || 0) + (view?.after || 0);
   if (!hidden) return "";
   return `<button type="button" class="agent-plan__fold agent-plan__fold--toggle" data-plan-expand="1" aria-label="展开全部计划步骤" title="展开全部计划步骤"><span class="agent-plan__page-spacer"></span><span>其余 ${hidden} 项已折叠 · 点击展开</span>${chevron("down")}</button>`;
@@ -35346,8 +35389,22 @@ function _renderPlan(container, steps, existingEl, run) {
   if (run) {
     const isFirstPlanRender = !Array.isArray(run._planSteps) || !run._planSteps.length;
     run._planSteps = steps;
-    if (isFirstPlanRender || !Number.isFinite(run._planVisibleCount)) run._planVisibleCount = steps.length ? 1 : 0;
-    else run._planVisibleCount = Math.min(Math.max(1, run._planVisibleCount), Math.min(steps.length || 1, _PLAN_MAX_RENDERED_STEPS));
+    // 展开到第几行也必须跟着**卡**走，不能只挂 run。
+    //
+    // 卡本身已经是会话级复用的（见下面的候选链）。而 _planVisibleCount 只挂 run，
+    // 新的一轮必然是 undefined → 上一轮已经展开到 4 步的那张卡，用户一问下一句就当场
+    // 缩回 1 行、再把展开动画重放一遍。每轮抖一次。隔壁 _planExpanded 早就做了会话镜像，
+    // 两个同类的 UI 状态一个镜像一个没镜像。
+    const _seededFromSession = !Number.isFinite(run._planVisibleCount)
+      && !!(run.session && run.session._planEl && Number.isFinite(run.session._planVisibleCount));
+    if (_seededFromSession) run._planVisibleCount = run.session._planVisibleCount;
+    // 换任务的新计划仍然从 1 行开始长（isFirstPlanRender 且没从会话播种到）。
+    if (!Number.isFinite(run._planVisibleCount) || (isFirstPlanRender && !_seededFromSession)) {
+      run._planVisibleCount = steps.length ? 1 : 0;
+    } else {
+      run._planVisibleCount = Math.min(Math.max(1, run._planVisibleCount), Math.min(steps.length || 1, _PLAN_MAX_RENDERED_STEPS));
+    }
+    if (run.session) run.session._planVisibleCount = run._planVisibleCount;
   }
 
   const done = steps.filter((s) => s.status === "completed").length;
@@ -35363,7 +35420,19 @@ function _renderPlan(container, steps, existingEl, run) {
   // 会话级的先例这个文件里已经有了（run.session._planExpanded，见 _planExpanded 那处）。
   // 复用到旧卡时下面那句 appendChild 会把它移到当前消息底部，正是这里注释写的
   // 「re-surface at the bottom」——那本来就是一张卡的设计，只是层级挂错了。
-  let el = existingEl || (run && run._planEl) || (run && run.session && run.session._planEl);
+  // 三级候选，一级比一级活得久：
+  //   run 级   —— 本轮内的增量更新
+  //   会话级   —— 同一次运行里的下一轮（修掉了「每问一轮多一张」）
+  //   DOM 级   —— **跨重启**。卡本体会被写进持久化的 HTML 快照（_scrubResidue 的删除清单里
+  //               没有 .agent-plan，恢复时原样 innerHTML 塞回去），而上面两个指针都是内存里的
+  //               DOM 引用、序列化不进 session.json。于是「指针没了、卡还在」= 再建一张：
+  //               每关一次软件，同一对话里就多出一张「任务计划」——和用户实拍那张图同样的画面，
+  //               只是触发条件从「每问一轮」变成「每重启一次」。
+  // 必须从 session.container 里查，不能查全局 document —— 否则会跨标签页把别的会话那张卡抢过来
+  //（「两个不同会话之间不许串卡」那条测试守着这一点）。
+  let el = existingEl || (run && run._planEl) || (run && run.session && run.session._planEl)
+    || (run && run.session && run.session.container && run.session.container.querySelector
+        ? run.session.container.querySelector(".agent-plan") : null);
   if (!el || !el.isConnected) {
     el = document.createElement("div");
     el.className = "agent-plan";
@@ -47509,6 +47578,7 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
         && _prevPlan.some((x) => x?.status === "pending" || x?.status === "in_progress")
         && (_prevOutcome === "failed" || _prevOutcome === "partial")) {
       run._planSteps = _prevPlan.map((x) => ({ ...x }));
+      run._planInherited = true; // 继承来的，不是模型这一轮自己建的
       planSteps = run._planSteps;
     }
   } catch {}
@@ -47528,9 +47598,18 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
   // A plan restored from a previous session (app restart) with unfinished steps
   // carries over into this run, so the agent picks the tasks back up instead of
   // losing them.
+  // 这是**第二个**继承入口，比上面那个（带 outcome 闸）早 300 多个提交，而且一直没有闸：
+  // 上面那道闸拒绝时（outcome 是 success / awaiting_user / 没有 _lastRunState），这里照样
+  // 继承，等于那道闸对它想拦的每种情形都不生效。实测四种 outcome 全部继承成功。
+  // 它真正该服务的只有一种情形：崩溃重启后 outcome 已经陈旧的恢复路径（见 d9c2d27）。
+  //
+  // 另外原来是**共享引用**（run._planSteps = session._planSteps），于是下游自动打勾会
+  // 直接改到会话那份并落盘 —— 用户会看到「已经不要的那份计划，在你做别的事的时候自己
+  // 打上了勾」。改成拷贝。
   if (isAgent && !run._planSteps && Array.isArray(session._planSteps) &&
       session._planSteps.some((s) => s.status === "pending" || s.status === "in_progress")) {
-    run._planSteps = session._planSteps;
+    run._planSteps = session._planSteps.map((x) => ({ ...x }));
+    run._planInherited = true;
     planSteps = run._planSteps;
   }
   const _shotMsgs = []; // screenshot image messages currently in context (kept lean)
@@ -48586,7 +48665,9 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
         }
         // Genuinely waiting now — but if steps are still open, say so in the accounting rather
         // than letting "awaiting_user" read as a clean finish.
-        if (_pendingPlan.length) run._incompleteReason = run._incompleteReason || `plan_steps_pending:${_pendingPlan.length}`;
+        if (_pendingPlan.length && (!run._planInherited || run._planTouchedThisRun)) {
+          run._incompleteReason = run._incompleteReason || `plan_steps_pending:${_pendingPlan.length}`;
+        }
         awaitingUserReply = true;
         _clearNudges();
         break;
@@ -48848,14 +48929,20 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
         const _pendingPlan = (Array.isArray(run._planSteps) ? run._planSteps : [])
           .filter((step) => step?.status === "pending" || step?.status === "in_progress");
         // 预算从 3 下调到 2，和另外两道门对齐——全局池只有 3，单门占 3 会把另外两道饿死。
-        if (_pendingPlan.length && _canResume && (run._planFinishNudges || 0) < 2) {
+        // 继承来、本轮模型压根没碰过的计划，不许拿它硬顶一个回合。
+        // 用户实拍：问一句跟上个任务不相干的话，答完了界面还自己多跑一轮，
+        // 最后下一步建议变成「继续没做完的步骤」—— 去做他已经不要的事。
+        const _planActionable = !run._planInherited || run._planTouchedThisRun;
+        if (_pendingPlan.length && _planActionable && _canResume && (run._planFinishNudges || 0) < 2) {
           run._planFinishNudges = (run._planFinishNudges || 0) + 1;
           run._quietResumePool--;
           _pushNudge("planFinish", `[计划未完成] 还有 ${_pendingPlan.length} 步没做完：${_pendingPlan.slice(0, 8).map((step) => step.content).join("、")}。`
             + `\n继续做下一步。某一步确实不该做，就用 update_plan 标 cancelled 并写明原因——不要在还有未完成步骤时静默收尾，也不要反问「要不要我继续」。`);
           continue;
         }
-        if (_pendingPlan.length) run._incompleteReason = run._incompleteReason || `plan_steps_pending:${_pendingPlan.length}`;
+        // 同上：继承来又没碰过的计划不该把一次干净的问答记成 partial（那会让下一步
+        // 建议冒出「继续没做完的步骤」，指向用户已经不要的事）。
+        if (_pendingPlan.length && _planActionable) run._incompleteReason = run._incompleteReason || `plan_steps_pending:${_pendingPlan.length}`;
         // 收尾诚实：最后一个动作轮有工具明确报失败（部署/命令/mcp/http 退出非零、被拒、冲突…），
         // 模型却安静收尾——「没启动也说启动了」的机器成因。只记账、不补回合（同上诸门哲学）；
         // 排在最后，更具体的原因靠 !run._incompleteReason 先占位；用 lastTurnHadFailure（只看最后
@@ -49378,6 +49465,9 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
         const completionIssue = _unprovenPlanCompletionIssue(it.call.steps, planEvidenceCount);
         if (completionIssue) it.call.steps = _guardUnprovenPlanCompletion(it.call.steps, planEvidenceCount);
         it.call.steps = _planPrimeCurrentStep(it.call.steps);
+        // 模型这一轮自己调了 update_plan —— 这就是「认领」：从此这份计划算它的，
+        // 自动推进和收尾记账都可以对它生效（见 _advancePlanFromTool 顶上的守卫）。
+        run._planTouchedThisRun = true;
         planEl = _renderPlan(body, it.call.steps, run._planEl || planEl, run);
         planSteps = run._planSteps || it.call.steps;
         // A second model used to review this plan here and, on "finding gaps", inject
