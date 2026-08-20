@@ -29535,3 +29535,47 @@ test("流式代码卡和写入预览：贴底判定必须先于内容写入", ()
   assert.doesNotMatch(SRC, /\.scrollTop = card\.querySelector\("pre"\)\.scrollHeight/,
     "还有一处无条件贴底没改");
 });
+
+// ---- 唯一一道硬拦回合的门，判据不许比只发提示的那道还宽 ----
+//
+// _planBeforeBuildIssue 是全系统唯一一处会把工具调用换成 [BLOCKED_PLAN_FIRST] 假结果打回去的
+// 门。它的注释写着「只对从零建一个东西生效：改 bug、改已有代码不在此列」——而条件里带着
+// p.substantial，那是 harness 的派生量（industrialProject 把 securityRisk / businessLogic /
+// architectureQuality 这些**风险面**也滚了进来）。于是「重构这个模块」「修这个 bug」
+// 「改登录页一个错别字」的第一次落盘都会被打回去，逼它先为一个 typo 写计划。
+// 硬拦的集合必须 ⊆ 软催单的集合。
+test("硬拦的计划门只认模型直接声明的维度，不认 harness 派生的 substantial", () => {
+  const gate = load("_planBeforeBuildIssue", {
+    _implementationGroundingCandidate: () => true,
+    _introducesNewTech: () => false,
+  });
+  const run = (engineering) => ({ mode: "agent", engineering, _planSteps: [] });
+  const call = { type: "write", path: "src/a.ts" };
+
+  // 该拦的照拦：从零建项目 / 从零建站。
+  assert.ok(gate(run({ projectScope: true }), call), "从零建项目的第一次落盘必须拦");
+  assert.ok(gate(run({ fromZeroUiProject: true }), call), "从零建站的第一次落盘必须拦");
+  assert.ok(gate(run({ fullWebsite: true }), call), "整站交付必须拦");
+
+  // 不该拦的：派生量 substantial 单独出现，不构成硬拦理由。
+  assert.equal(gate(run({ substantial: true, requiresPlan: true }), call), "",
+    "substantial 是 harness 派生量（风险面也会点亮它），拿它硬拦等于改个错别字也要先写计划");
+  // 注释里点名不在此列的三种，必须真的不在此列。
+  for (const d of ["bug", "debugProject", "explicitReadOnly"]) {
+    assert.equal(gate(run({ [d]: true, projectScope: true }), call), "",
+      `注释写着「${d} 不在此列」，就必须真的不拦——否则注释在骗人`);
+  }
+
+  // 判据必须全部来自模型直接声明的维度白名单：派生量不许再回到这道门里。
+  // 必须**剥掉注释**再扫：extractFn 取的是含注释的正文，而上面那段说明里正好写着
+  // 「条件里带着 p.substantial」——按原文扫会被自己的注释喂到（这个仓库栽过不止一次）。
+  const src = extractFn("_planBeforeBuildIssue")
+    .split("\n").filter((l) => !l.trim().startsWith("//")).join("\n");
+  const dims = new Set([...(/const _AI_INTENT_DIMENSIONS = \[([\s\S]*?)\];/.exec(SRC)[1]
+    .matchAll(/"([A-Za-z0-9_]+)"/g))].map((m) => m[1]));
+  for (const used of [...src.matchAll(/\bp\.([A-Za-z0-9_]+)/g)].map((m) => m[1])) {
+    assert.ok(dims.has(used),
+      `硬拦判据用了 p.${used}，而它不在 _AI_INTENT_DIMENSIONS 里 —— 那是 harness 自己派生的，`
+      + "模型填了也会被覆盖。唯一一道硬拦回合的门不许由预测驱动");
+  }
+});

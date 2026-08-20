@@ -41473,7 +41473,19 @@ function _planBeforeBuildIssue(run, call) {
   if (!_implementationGroundingCandidate(call) && !_introducesNewTech(call)) return "";
   const p = run.engineering || {};
   // 只对"从零建一个东西"生效：改 bug、改已有代码不在此列。
-  if (!(p.projectScope || p.fromZeroUiProject || p.fullWebsite || p.substantial)) return "";
+  //
+  // 上面这句注释以前是假的：条件里带着 p.substantial，而那是 harness 的**派生量**
+  // （m.substantial = applies && (industrialProject || …)，其中 industrialProject 把
+  // securityRisk / businessLogic / architectureQuality 这些**风险面**也滚了进来）。
+  // 于是「把这个模块重构一下」「修这个 bug」「改登录页一个错别字」的第一次落盘会被
+  // [BLOCKED_PLAN_FIRST] 打回去，逼它先为一个 typo 写一份计划——这是全系统唯一一道
+  // **硬拦回合**的门，判据却比下面那道只发提示的软催单还宽。
+  //
+  // 判据换成模型**直接声明**的维度（六个都在 _AI_INTENT_DIMENSIONS 白名单里）。
+  // substantial 反而不在白名单里：模型就算填了也会被 21982 那行无条件覆盖掉，
+  // 拿一个纯派生量当硬拦判据，正是这次重构要根除的「预测驱动控制流」。
+  if (p.bug || p.debugProject || p.explicitReadOnly) return "";
+  if (!(p.projectScope || p.fromZeroUiProject || p.fullWebsite)) return "";
   const steps = Array.isArray(run._planSteps) ? run._planSteps : [];
   if (steps.length) return "";
   return "[BLOCKED_PLAN_FIRST] 这是从零建一个东西的第一次落盘，而本轮还没有计划。\n"
