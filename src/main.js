@@ -24845,6 +24845,16 @@ function _runStateNextActionSuggestions(sess, { maxAgeMs = 5 * 60_000 } = {}) {
     });
   }
 
+  // falseGreen：跑过验证、也退出成功了，但评审读了那条命令的真实输出说它没证明结果。
+  // 记账是按「声明了 purpose=verify 且退出 0」记的，记账层面看不出这一层——所以这条只在
+  // 两边**打架**时出现。假绿灯比没验更坏：没验至少还有 code_delivered_unverified 拦着。
+  if (run.wrapUp && run.wrapUp.falseGreen) {
+    picks.push({
+      label: "评审说这次验证没真的证明结果",
+      send: `上一轮跑过验证命令、也退出成功了,但收尾评审读了那条命令的真实输出,认为它并没有证明我要的结果。\n\n重新验一次:先说清这次要证明的是哪一条要求,再挑一条真能证伪它的命令或流程去跑,把原始输出给我看。`,
+    });
+  }
+
   // 场景 2:部分完成→基于 mutatedFileTypes/incompleteReason 精确描述
   if (run.outcome === "partial") {
     const types = [...(run.mutatedFileTypes || [])].join("+");
@@ -50581,10 +50591,17 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
         // findings / direction 按设计**不参与 done**（"先交付，再提醒"），所以它们和
         // done 通过与否无关，通过的那轮同样要说。
         const direction = clean(v.direction, 300);
+        // verified：评审读完执行证据之后，对「结果到底有没有被证明」的判断。此前算了没人读。
+        // 它单独有价值的只有一种情形——和 harness 的记账**打架**：记账按「有一条 purpose=verify
+        // 的命令退出 0」就算验过了，而评审读了那条命令的真实输出，说它根本没证明用户要的结果。
+        // 那是假绿灯，也正是「写的东西都是报错、项目被写烂」的来法。
+        // 记账自己就知道没验的那些不进这里（已经有 code_delivered_unverified 那条路），只留分歧。
+        const falseGreen = v.verified === false && verificationPassed === true && didMutate === true;
         const findings = (Array.isArray(v.findings) ? v.findings : [])
           .map((f) => clean(`${f?.where ? f.where + " " : ""}${f?.what || ""}`, 160))
           .filter(Boolean).slice(0, 3);
-        return (instruction || direction || findings.length) ? { instruction, direction, findings } : null;
+        return (instruction || direction || findings.length || falseGreen)
+          ? { instruction, direction, findings, falseGreen } : null;
       })(),
       mutated: !!didMutate, // 「接下来」建议据此区分干活轮和纯问答轮
       toolStats: _toolLedgerStats(run._toolLedger?.entries || []),
