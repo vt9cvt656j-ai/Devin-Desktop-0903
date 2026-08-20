@@ -23399,8 +23399,8 @@ function _formatStackHint(s) {
   // 这两行原来向模型断言：「agent 会每改几个文件自动跑」「失败 agent 会自动注入失败报告」。
   // **那套机器根本不存在**——`_runApprovedVerification` 只有定义零调用点，它包着的
   // `_interleavedTest`（唯一会真去 taskRunCapture 跑命令的那个）因此也只在死代码里可达；
-  // `run._checkPendingPaths` / `_testPendingPaths` 这两个"待校验文件"账本只写不读，
-  // 全文件没有任何消费点，而那段注释还写着"推迟到收尾门"——收尾门里也没有。
+  // 那两个"待校验文件"账本从落盘第一天起就没有过读者，写入处的注释还写着"推迟到收尾门"
+  // ——收尾门里也没有。账本已删除（2026-08-20）。
   //
   // 后果不是"少了个功能"，是**机器主动给了模型一个错误的世界模型**：它每轮都在上下文
   // 顶部读到这句断言，于是理性地把跑构建/测试外包给 IDE，改完就收尾。什么都没跑。
@@ -48815,7 +48815,7 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
           //
           // 真正的病不在这里，在别处：栈提示每轮都在向模型断言「agent 会每改几个文件
           // 自动跑」「失败会自动注入报告」，而那套机器是死的（`_runApprovedVerification`
-          // 零调用点、`_checkPendingPaths`/`_testPendingPaths` 只写不读）。模型据此把
+          // 零调用点；那两个"待校验文件"账本从没有过读者，已删除）。模型据此把
           // 验证外包给了一个不存在的东西。谎话已经在 `_formatStackHint` 里去掉，
           // 改成祈使句"改完必须你自己跑，没有任何东西会替你跑"。
           run._incompleteReason = "code_delivered_unverified";
@@ -49179,11 +49179,11 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
           }
           try { await it.stageReady; } catch {}
         }
-        // Keep the signature as telemetry only. A model may intentionally repeat a read-only
-        // call after the workspace, remote service, or process state changed. Cross-turn history
-        // must never replace an explicit tool call with a synthetic result. Same-batch folding
-        // above is safe because the first identical call in that batch still executes for real.
-        const _sig = _stableToolCallSignature(call);
+        // Cross-turn history must never replace an explicit tool call with a synthetic result:
+        // a model may intentionally repeat a read-only call after the workspace, remote service,
+        // or process state changed. Same-batch folding above is safe because the first identical
+        // call in that batch still executes for real. Loop detection lives in `_callLog`
+        // (call signature + result fingerprint) and only nudges — it never blocks a call.
         let result;
         if (!_live()) result = { type: call.type, path: call.path, content: "[interrupted] 用户已停止任务。" };
         else {
@@ -49319,7 +49319,6 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
           it._planAdvanced = true;
           _advancePlanFromTool(run, call, result);
         }
-        if (run) { run._recentSigs = run._recentSigs || []; run._recentSigs.push(_sig); if (run._recentSigs.length > 8) run._recentSigs.shift(); }
         let _resultMsg = _toolMsgForModel(call, result);
         // 计划质检降级提示：只随本 run 第一条成功工具结果带给模型一次（见 plan gate 处）。
         // ask_user 首轮软建议（仅非空工作区）：随用户回答一并带回，提醒后续能自查的信息自查。
@@ -49438,7 +49437,6 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
             run._panelConfig = config;
             run._panelBody = body;
             run._subAgentJobs.set(jobId, job);
-            run._parallelDispatches = (run._parallelDispatches || 0) + 1;
             // 控制台可见性：同步登记到 SharedStore（面板/仪表盘读这里）
             try { _globalSharedStore.set(`jobs.sm_${storeId}`, { tool: "run_subagent", role: spec.role, description: desc, status: "running", progress: 0, findings: [], createdAt: Date.now() }); } catch {}
             job.promise = _runSubAgent({
@@ -49525,8 +49523,6 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
         // 单点派发前置劝阻（_shouldDispatchSubagent）已删除（AGENT_LOOP_REBUILD.md 阶段 3）：
         // 它拿计划预测去劝模型"这个调研本该自己直接做、别派子智能体"——又一处 harness 替模型拿
         // 主意。派不派是模型的判断；模型调了 run_subagent 就照常执行。
-        // 并行派发事实账本（收尾 auto-subagent 整合仍读它）：只记真派发。
-        if (isWorker || it.tc.name === "run_subagent") run._parallelDispatches = (run._parallelDispatches || 0) + 1;
         let workerMutated = false;
         it._workerMutationPaths = [];
         // P1 多子智能体并发：run_subagent 传入 tasks 数组（每项 {role, task}）时并行派发；
@@ -49900,12 +49896,6 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
           const actualPath = _resolveRel(path, root);
           if (!_successfulEdits.includes(actualPath)) _successfulEdits.push(actualPath);
         }
-      }
-      // Always retain pending paths, even after the bounded diagnostics budget is
-      // spent; otherwise later edits silently stop reaching check/test gates.
-      for (const p of _successfulEdits) {
-        run._testPendingPaths = (run._testPendingPaths || new Set()).add(p);
-        run._checkPendingPaths = (run._checkPendingPaths || new Set()).add(p);
       }
 
       // Compare every JS/TS mutation batch against the pre-run baseline. New
@@ -56153,7 +56143,6 @@ async function _executeToolStepInner(step, call, root, run) {
         gitCtx = await _gitResolveRepoContext(gitRoot, call);
         if (!gitCtx.isRepo) {
           const guidance = _gitNonRepoGuidance(gitCtx.requestedRoot || gitRoot, gitCtx.candidates, call.op, mutating);
-          if (run) run._gitRepoHints = [...new Set([...(run._gitRepoHints || []), ...((gitCtx.candidates || []).slice(0, 5))])];
           res.className = "atc-result atc-result--err"; res.textContent = "非 git 仓库";
           if (vp) vp.innerHTML = `<pre>${_escHtml(guidance)}</pre>`;
           return { type: "git", path: call.op, content: guidance };
@@ -56161,7 +56150,6 @@ async function _executeToolStepInner(step, call, root, run) {
         gitExecRoot = gitCtx.root || gitRoot;
         if (gitCtx.rerooted) {
           gitRerootNote = `\n[Git 仓库根已自动定位：${gitExecRoot}；原工作区：${gitCtx.requestedRoot || gitRoot}]`;
-          if (run) run._gitRepoHints = [...new Set([...(run._gitRepoHints || []), gitExecRoot])];
         }
       }
       try {

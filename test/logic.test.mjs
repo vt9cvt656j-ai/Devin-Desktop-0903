@@ -20899,7 +20899,11 @@ test("#89-7 _cleanAgentText 取证相位埋点", () => {
 test("跨轮重复和失败搜索历史不得 synthetic skip", () => {
   const loop = stripJsComments(extractFn("_runAgenticLoop"));
   const dispatch = loop.slice(
-    loop.indexOf("const _sig = _stableToolCallSignature(call)"),
+    // 锚点不能用 `const _sig = …`：那行随 run._recentSigs 一起删掉了（它是那个账本唯一的
+    // 消费者）。也不能用 `const _exec = async () => {`——它在守卫的历史插入点**下游**，
+    // 换过去等于把检测窗口整个挪开，这条测试就再也抓不到回归了。用插入点**上游**、
+    // 且在 _runAgenticLoop 里唯一的这一句。
+    loop.indexOf("try { await it.stageReady; } catch {}"),
     loop.indexOf("const executionEvidence = _executionEvidenceFromTool"),
   );
   assert.ok(dispatch.length > 0, "必须定位到工具 dispatch 区域");
