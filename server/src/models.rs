@@ -547,6 +547,8 @@ fn looks_like_relay_truncation(err: &str) -> bool {
 
 const THINKING_CLIP_COOLDOWN: Duration = Duration::from_secs(30 * 60);
 const THINKING_CLIP_SAFE_BUDGET: i64 = 6000;
+/// adaptive 一族没有 budget_tokens，深度靠 effort 表达 —— 这是它的安全档。
+const THINKING_CLIP_SAFE_EFFORT: &str = "medium";
 static THINKING_CLIP_ROUTES: LazyLock<Mutex<HashMap<uuid::Uuid, Instant>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
@@ -827,18 +829,60 @@ fn mark_thinking_clip(id: uuid::Uuid) {
 
 /// 钳位期内把已转换好的 Anthropic 请求体思考预算压到安全值。只降不升；
 /// 没有 thinking 或预算本就不超时不动。返回是否真的钳了。
+/// 「深思考丢块」钳位期要压低这一轮的思考深度。两族的表达方式不同，都要认。
+///
+/// 原来只认 `/thinking/budget_tokens`。而 Claude 5 一族（opus-5 / sonnet-5 / opus-4.8 /
+/// opus-4.7 / fable-5 / mythos-5）发的是 `{"type":"adaptive","display":"summarized"}` ——
+/// **根本没有这个字段**，于是这个函数对它们恒返回 false，调用处那个 `&&` 直接短路：
+/// 钳位不发生，连「已钳位」那条 info 日志都不打。也就是说这条自愈路径在**主力模型上
+/// 从来没生效过**，而且日志里看不出来。用户看到的是内容出一半就干等，重试还是一样。
+///
+/// 这一族的深度是用 `output_config.effort` 表达的（thinking.type=enabled 在它们上面会被
+/// 上游硬拒 400），所以钳位的等价动作是把 effort 压到安全档。
 fn clip_thinking_budget(upstream_body: &mut serde_json::Value) -> bool {
-    let Some(budget) = upstream_body
+    // 老家族：thinking.budget_tokens
+    if let Some(budget) = upstream_body
         .pointer("/thinking/budget_tokens")
         .and_then(|v| v.as_i64())
-    else {
-        return false;
-    };
-    if budget <= THINKING_CLIP_SAFE_BUDGET {
+    {
+        if budget <= THINKING_CLIP_SAFE_BUDGET {
+            return false;
+        }
+        if let Some(thinking) = upstream_body.get_mut("thinking").and_then(|t| t.as_object_mut()) {
+            thinking.insert("budget_tokens".into(), json!(THINKING_CLIP_SAFE_BUDGET));
+            return true;
+        }
         return false;
     }
-    if let Some(thinking) = upstream_body.get_mut("thinking").and_then(|t| t.as_object_mut()) {
-        thinking.insert("budget_tokens".into(), json!(THINKING_CLIP_SAFE_BUDGET));
+    // Claude 5 一族：adaptive + output_config.effort
+    if upstream_body
+        .pointer("/thinking/type")
+        .and_then(|v| v.as_str())
+        != Some("adaptive")
+    {
+        return false;
+    }
+    let rank = |e: &str| match e {
+        "low" => 0u8,
+        "medium" => 1,
+        "high" => 2,
+        "xhigh" => 3,
+        "max" => 4,
+        _ => 1,
+    };
+    let current = upstream_body
+        .pointer("/output_config/effort")
+        .and_then(|v| v.as_str())
+        .unwrap_or("medium")
+        .to_string();
+    if rank(&current) <= rank(THINKING_CLIP_SAFE_EFFORT) {
+        return false;
+    }
+    if let Some(oc) = upstream_body
+        .get_mut("output_config")
+        .and_then(|v| v.as_object_mut())
+    {
+        oc.insert("effort".into(), json!(THINKING_CLIP_SAFE_EFFORT));
         return true;
     }
     false
@@ -7446,7 +7490,12 @@ pub async fn chat_completions(
                 tracing::info!(
                     route_id = %candidate.id,
                     clipped_budget = THINKING_CLIP_SAFE_BUDGET,
-                    "route recently dropped post-thinking blocks; thinking budget clipped for this request"
+                    clipped_effort = THINKING_CLIP_SAFE_EFFORT,
+                    thinking_shape = %candidate_upstream_body
+                        .pointer("/thinking/type")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("none"),
+                    "route recently dropped post-thinking blocks; thinking depth clipped for this request"
                 );
             }
             let wants_1m =
@@ -8956,7 +9005,7 @@ mod billing_tests {
         tool_argument_rules, upstream_failure_status, validate_openai_sse_eof,
         validate_openai_sse_with_rules, AnthSse, FusedCharge, OpenAiSseValidator,
         CHAT_UPSTREAM_MAX_ATTEMPTS_PER_ROUTE, CHAT_UPSTREAM_MAX_ROUTES_WHEN_ANSWERED,
-        THINKING_CLIP_ROUTES, THINKING_CLIP_SAFE_BUDGET,
+        THINKING_CLIP_ROUTES, THINKING_CLIP_SAFE_BUDGET, THINKING_CLIP_SAFE_EFFORT,
     };
 
     /// 计费/预算这些逻辑需要一个**已知的**价格与窗口输入。生产代码里的硬编码能力表
@@ -11718,6 +11767,33 @@ mod billing_tests {
         // 没开思考不动。
         let mut off = json!({"model":"claude-opus-4-6","max_tokens":8192});
         assert!(!clip_thinking_budget(&mut off));
+        // Claude 5 一族：没有 budget_tokens，深度靠 output_config.effort。原来这里恒返回
+        // false —— 钳位在主力模型上从来没生效过，连日志都不打。
+        let mut adaptive = json!({
+            "model":"claude-opus-5",
+            "thinking":{"type":"adaptive","display":"summarized"},
+            "output_config":{"effort":"max"}
+        });
+        assert!(
+            clip_thinking_budget(&mut adaptive),
+            "adaptive 一族没被钳位 —— 这条自愈路径对主力模型是空操作"
+        );
+        assert_eq!(
+            adaptive.pointer("/output_config/effort"),
+            Some(&json!(THINKING_CLIP_SAFE_EFFORT))
+        );
+        // 本来就在安全档之下的不动。
+        let mut low = json!({
+            "model":"claude-opus-5",
+            "thinking":{"type":"adaptive"},
+            "output_config":{"effort":"low"}
+        });
+        assert!(!clip_thinking_budget(&mut low));
+        assert_eq!(low.pointer("/output_config/effort"), Some(&json!("low")));
+        // adaptive 但没带 output_config：不凭空造字段（默认档本来就等于安全档）。
+        let mut bare = json!({"model":"claude-opus-5","thinking":{"type":"adaptive"}});
+        assert!(!clip_thinking_budget(&mut bare));
+        assert!(bare.pointer("/output_config").is_none());
         assert!(off.get("thinking").is_none());
     }
 
