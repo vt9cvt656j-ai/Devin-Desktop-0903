@@ -21437,19 +21437,35 @@ function _estimateTokens(text) {
   return Math.ceil(cjk + (s.length - cjk) / 3.5);
 }
 
+/** 取头也取尾：中间省略。用于「不能只留最近几条」的那些清单。 */
+function _headAndTail(list, head, tail) {
+  const arr = Array.isArray(list) ? list : [];
+  if (arr.length <= head + tail) return arr.slice();
+  return [...arr.slice(0, head), `…（中间 ${arr.length - head - tail} 条略）`, ...arr.slice(-tail)];
+}
+
+/** 带工具的那几个模式。判「要不要给工具」和判「要不要给会话账本」读的是同一份。 */
+const _MODES_WITH_TOOLS = new Set(["agent", "explorer", "reviewer", "plan"]);
+
 function _fallbackConversationSummary(messages) {
   const userRequests = [], outcomes = [];
   for (const message of messages || []) {
     const content = String(message?.content || "").trim();
     if (!content) continue;
-    if (message.role === "user") userRequests.push(content.replace(/\s+/g, " ").slice(0, 220));
+    // 用户的话留 700 字，不是 220。这份摘要是**永久顶替**被移出的那几条消息的，之后
+    // 谁也回不去原文了；而一段正经需求（技术栈、接口前缀、金额单位、禁用哪个组件库）
+    // 通常就写在一段里，220 字砍完剩下的是句残句，却在此后每一轮都被当作"用户要的东西"。
+    // 助手侧仍按 260 留：结论句本来就短，且下面还有执行事实账本兜着。
+    if (message.role === "user") userRequests.push(content.replace(/\s+/g, " ").slice(0, 700));
     // 助手侧按角色+时序保留（事实筛选）；旧版用 /修复|完成|…/ 关键词猜“结果句”，
     // 不带这些词的关键结论整段丢失、带这些词的寒暄反而入选——语义筛选不归关键词。
     // 末尾 slice(-8) 已限幅，时序越近越可能是有效结论。
     else if (message.role === "assistant") outcomes.push(content.replace(/\s+/g, " ").slice(0, 260));
   }
   const parts = [];
-  if (userRequests.length) parts.push(`用户请求: ${userRequests.slice(-8).join("；")}`);
+  // 取头也取尾。原来只取最后 8 条，而这一批被压掉的恰恰是**最早**那几条——
+  // 也就是用户第一次把需求讲清楚的地方，是整份摘要里唯一不能丢的部分。
+  if (userRequests.length) parts.push(`用户请求: ${_headAndTail(userRequests, 3, 5).join("；")}`);
   if (outcomes.length) parts.push(`执行结果: ${outcomes.slice(-8).join("；")}`);
   return parts.join("\n") || `早期 ${messages?.length || 0} 条消息已压缩；文件读取版本与范围保留在证据账本。`;
 }
@@ -21474,8 +21490,20 @@ function _compactHistoryIfNeeded(session) {
     }
   }
 
-  const MAX_HISTORY_TOKENS = 16000;
-  const MAX_MESSAGES = 36;
+  // 两条上限按**这个模型的窗口**算，不再写死。写死的 16K/36 条有两个后果，方向一致：
+  //   · 用户第 1 轮写的那段需求，到第 6～7 轮就被这里连消息一起搬走、换成一份残缺摘要——
+  //     而它每一轮都还在被引用；
+  //   · 更隐蔽的一条：按重要性压缩的那条 LLM 腿，触发线是「窗口的一半」，而这里把 recent
+  //     永远摁在 16K 以下，于是那条腿在任何真实窗口的模型上都**永远跑不到**，
+  //     写得再好的压缩提示词也是死的。
+  // 取 0.6：高于 LLM 压缩的 0.5（让它先有机会按重要性压），低于逐请求机械裁剪的硬线 0.70
+  // （那条是非破坏性的，只改这一次发出去的消息数组）。这一条是**破坏性**的，所以排最后。
+  // 下限保持 16000，小窗口模型不会比原来更宽松；上限 24 万，免得关掉网关压缩时把几十万
+  // token 的历史一直堆在会话存储里。
+  const _ctxLimit = Math.max(0, Number(_modelContextLimit("")) || 0);
+  const MAX_HISTORY_TOKENS = Math.min(240000, Math.max(16000, Math.round(_ctxLimit * 0.6)));
+  // 条数上限跟着 token 上限等比放大：不然 36 条这道闸永远先响，token 那条形同虚设。
+  const MAX_MESSAGES = Math.min(400, Math.max(36, Math.round(36 * MAX_HISTORY_TOKENS / 16000)));
   const KEEP_RECENT = 8;
 
   let totalTokens = h.reduce((sum, m) => sum + _estimateTokens(m.content), 0);
@@ -24799,6 +24827,10 @@ function _renderSuggestionChips(sess, items, label) {
     const room = _NEXT_STEPS_MAX - (reuse ? reuse.querySelectorAll(".next-steps__chip").length : 0);
     if (room <= 0) return;
     const capped = list.slice(0, room);
+    // 记下卡片行此刻占了哪几条。输入框的灰字预测读的是同一份建议，得跳过已经摆在卡片上的，
+    // 否则同一句话在同一屏里说两遍。新起一块就重置，续接同一块就累加。
+    if (!reuse || !(sess._chipSends instanceof Set)) sess._chipSends = new Set();
+    for (const it of capped) sess._chipSends.add(typeof it === "string" ? it : (it.send || it.label));
     const wrap = reuse || document.createElement("div");
     wrap.className = "next-steps";
     if (label && !reuse) {
@@ -24961,11 +24993,22 @@ function _runStateNextActionSuggestions(sess, { maxAgeMs = 5 * 60_000 } = {}) {
   }
 
   // 场景 3:成功且有运行效果→提示验证
+  //
+  // 和场景 2 同一个病，同一个治法。原来这条 send 干了两件不该干的事：
+  //   · 把模型上一轮说的话截 200 字塞回输入框（"查看最新结果:…"）——那句话可能本身
+  //     就是错的（"服务已成功启动"，其实 10 秒就被杀了），却被 harness 包装成用户的指令；
+  //   · 端出一串写死的 npm/pytest/cargo/go 菜单，和用户这个项目一条都对不上。
+  // 这条串还会被输入框的灰字预测直接显示出来，所以它是用户**看得见**的废话。
+  // 改成读探测到的真实命令；探测不到就只说一句祈使句，不猜。
   if (run.outcome === "success" && run.runtimeEffects && run.runtimeEffects.length) {
     const effects = [...run.runtimeEffects].join(", ");
-    picks.push({ 
-      label: "运行验证改动", 
-      send: `已成功运行${effects},但建议立即测试验证改动:\n- npm test / pytest / go test -race\n- 构建命令:npm run build / cargo build\n- 查看最新结果:${String(run.result || "").slice(0, 200)}...` 
+    const _stack = _projectStacks.get(String(run.root || "")) || {};
+    const _cmds = [_stack.checkCmd, _stack.testCmd].filter(Boolean);
+    picks.push({
+      label: "运行验证改动",
+      send: _cmds.length
+        ? `已经跑起来了(${effects})。现在验一遍改动:${_cmds.map((c) => `\n- \`${c}\``).join("")}\n退出码就是结论,把真实输出给我看。`
+        : `已经跑起来了(${effects})。现在跑一遍这个项目的验证命令(构建/类型检查/测试),把真实输出给我看——退出码就是结论。`,
     });
   }
 
@@ -24987,10 +25030,6 @@ function _runStateNextActionSuggestions(sess, { maxAgeMs = 5 * 60_000 } = {}) {
 async function _maybeSuggestNext(sess, messages, config) {
   try {
     if (!sess) return;
-    // 输入框的灰字预测挂在这里，而不是另找一个收尾点：这是智能体轮跑完的**必经之处**，
-    // 而且它和下面的卡片行读的是同一份运行状态——两个界面永远不会各说各话。
-    // 不受 inTauri 限制：网页版同样需要预测，卡片行才是桌面端专属。
-    try { _renderComposerGhost(); } catch {}
     /*
      * 读对话的那一档：**智能体轮同样要算**。
      *
@@ -25006,8 +25045,15 @@ async function _maybeSuggestNext(sess, messages, config) {
     if (sess?._lastRunState?.outcome !== "awaiting_user") {
       try { void _predictNextAsk(sess); } catch {}
     }
-    if (!inTauri) return;
-    _renderSuggestionChips(sess, _runStateNextActionSuggestions(sess), t("chat.nextSteps"));
+    // 卡片行排在灰字**之前**。两处读的是同一份建议，而灰字的 "run" 档取的正是卡片行
+    // 第一张那条——先算灰字，同一句话就必然在同一屏里出现两次（卡片行第一格 + 输入框灰字）。
+    // 先渲染卡片、把它占掉的几条记在会话上，灰字才能挑一条别的说。
+    // 卡片行是桌面端专属，网页版没有它，所以那条路上灰字照旧取第一条。
+    if (inTauri) _renderSuggestionChips(sess, _runStateNextActionSuggestions(sess), t("chat.nextSteps"));
+    // 输入框的灰字预测挂在这里，而不是另找一个收尾点：这是智能体轮跑完的**必经之处**，
+    // 而且它和上面的卡片行读的是同一份运行状态——两个界面永远不会各说各话。
+    // 不受 inTauri 限制：网页版同样需要预测。
+    try { _renderComposerGhost(); } catch {}
   } catch {}
 }
 
@@ -25210,10 +25256,16 @@ function _composerPrediction(sess) {
     return { src: "ask", text: ask.text, send: ask.text };
   }
 
+  // 卡片行已经摆出来的那几条要跳过：两处读的是同一份建议，再说一遍就是同一屏里重复。
+  const _onChips = (s) => (sess._chipSends instanceof Set) && sess._chipSends.has(s);
+  const _pickFresh = (list) => (Array.isArray(list) ? list : []).find(
+    (p) => p && p.send && !_predictionAlreadyUsed(sess, p.send) && !_onChips(p.send)) || null;
+
   const fresh = _runStateNextActionSuggestions(sess);
   const planShaped = String(run?.incompleteReason || "").startsWith("plan_steps_pending");
   if (fresh.length && (run?.outcome === "failed" || !planShaped)) {
-    if (!_predictionAlreadyUsed(sess, fresh[0].send)) return { src: "run", text: fresh[0].label, send: fresh[0].send };
+    const _p = _pickFresh(fresh);
+    if (_p) return { src: "run", text: _p.label, send: _p.send };
   }
 
   const steps = Array.isArray(sess._planSteps) ? sess._planSteps : [];
@@ -25224,7 +25276,7 @@ function _composerPrediction(sess) {
     if (!_predictionAlreadyUsed(sess, _stepSend)) return { src: "plan", text: _stepSend, send: _stepSend };
   }
 
-  if (fresh.length && !_predictionAlreadyUsed(sess, fresh[0].send)) return { src: "run", text: fresh[0].label, send: fresh[0].send };
+  { const _p = _pickFresh(fresh); if (_p) return { src: "run", text: _p.label, send: _p.send }; }
 
   // 「继续上次」这一档传的是 maxAgeMs: Infinity —— 它是给**打开软件那一刻**用的
   // （上面 _runStateNextActionSuggestions 的注释写明了这一点）。但它永不过期，于是
@@ -25236,10 +25288,8 @@ function _composerPrediction(sess) {
   // 它只在**这个会话里用户还没发过话**时成立：那才是"接着上次继续"真正有意义的一刻。
   // 一旦用户开口，当前正在看的东西就是比一个陈旧运行状态更新鲜的证据。
   if (!(Array.isArray(sess._recentSent) ? sess._recentSent : []).length) {
-    const old = _runStateNextActionSuggestions(sess, { maxAgeMs: Infinity });
-    if (old.length && !_predictionAlreadyUsed(sess, old[0].send)) {
-      return { src: "resume", text: "继续上次：" + old[0].label, send: old[0].send };
-    }
+    const _p = _pickFresh(_runStateNextActionSuggestions(sess, { maxAgeMs: Infinity }));
+    if (_p) return { src: "resume", text: "继续上次：" + _p.label, send: _p.send };
   }
 
   try {
@@ -26357,7 +26407,12 @@ async function sendPrompt(text, attachments = [], readyConfig = null, opts = {})
   // 推翻的、以及只是提问或抱怨的历史消息，每一轮都作为待办重新压给模型。
   // slice(0, -1) 也是错的——push 在 24767，比这里晚，账本里本来就不含当轮消息，
   // 砍掉的是上一轮，也就是用户刚做出的那次纠正。
-  const _demandLedgerBlock = (effectiveMode === "agent"
+  // 模式判据从「只有 agent」放宽到**所有带工具的模式**。这本账是发送路径上无条件记的
+  // （不分模式），却只在 agent 模式注入：用户在同一个会话里陆续提过「金额一律用分」
+  // 「不要引第三方 UI 库」「接口走 /api/v2」，然后切到 Plan 说「先给我个重构方案」——
+  // 这一轮的前导里一条都没有，方案自然把这些全违反了。Plan 恰恰是最依赖
+  // 「用户到底要什么」的那个模式。
+  const _demandLedgerBlock = (_MODES_WITH_TOOLS.has(effectiveMode)
     && Array.isArray(sess._demandLedger) && sess._demandLedger.length)
     ? `--- 本会话历次用户消息（按时间先后，仅供回忆上下文，不是待办清单）---\n${sess._demandLedger.map((d, i) => `${i + 1}. ${d}`).join("\n")}\n（本轮真正要做的事只看下方 📌。上表里：越靠后的越新，后条对同一件事的说法直接作废前条；已完成、已撤销、以及只是提问或抱怨的，都不要再执行。）\n\n`
     : "";
@@ -26455,13 +26510,10 @@ async function sendPrompt(text, attachments = [], readyConfig = null, opts = {})
   }
 
   const isAgent = effectiveMode === "agent";
-  const isExplorer = effectiveMode === "explorer";
-  const isReviewer = effectiveMode === "reviewer";
-  const isPlan = effectiveMode === "plan";
   // Plan joins the read-only tool modes so the architect can actually investigate
   // the codebase (read / search / find / web) before proposing a design — it gets
   // _buildAgentToolSchemas(false), i.e. no write/edit/run_cmd.
-  const hasToolAccess = isAgent || isExplorer || isReviewer || isPlan;
+  const hasToolAccess = _MODES_WITH_TOOLS.has(effectiveMode);
 
   // If the user hit Stop during the (bounded) pre-processing above, abort cleanly.
   if (!_turnLive()) {
@@ -26759,6 +26811,15 @@ async function sendPrompt(text, attachments = [], readyConfig = null, opts = {})
           if (countEl) countEl.textContent = `${lineCount} lines`;
 
           const codeEl = existingCard.querySelector("code");
+          // 「本来贴着底吗」必须在**改内容之前**量。
+          //
+          // 这里原来是先 textContent = 新内容、后量距底——而 textContent 一改，scrollHeight
+          // 立刻涨了这一帧新增的高度，再量就等于拿「新内容有多高」当「用户往上翻了多远」。
+          // 行高约 20px，一帧长 3 行就越过 48px 阈值，而这个距离只增不减：流式代码卡的跟随
+          // **当场永久掉线**，表现就是「它明明在写，我却看不到写到哪」。
+          // 上色回调（下面那个 .then）同理：它把 innerHTML 整个换掉，也要用改之前的这一次量。
+          const preEl = existingCard.querySelector("pre");
+          const _wasAtBottom = !!preEl && (preEl.scrollHeight - preEl.scrollTop - preEl.clientHeight) < 48;
           if (codeEl && codeEl._lastLen !== tail.content.length) {
             const _view = _clipStreamCode(tail.content).view; // 巨文件只渲染尾部窗口
             codeEl.textContent = _view;
@@ -26768,15 +26829,20 @@ async function sendPrompt(text, attachments = [], readyConfig = null, opts = {})
               codeEl._hlPending = true;
               const snapLen = tail.content.length;
               monaco.editor.colorize(_view, monoId, { tabSize: 2 })
-                .then(html => { if (html && codeEl._lastLen === snapLen) codeEl.innerHTML = html.replace(/<br\/?>\s*$/, ""); })
+                .then(html => {
+                  if (html && codeEl._lastLen === snapLen) {
+                    codeEl.innerHTML = html.replace(/<br\/?>\s*$/, "");
+                    // 上色换了 innerHTML，高度会变；只有本来贴着底的才跟回去。
+                    if (_wasAtBottom && preEl) preEl.scrollTop = preEl.scrollHeight;
+                  }
+                })
                 .catch(() => {})
                 .finally(() => { codeEl._hlPending = false; });
             }
           }
 
-          const preEl = existingCard.querySelector("pre");
           // 只有本来就贴着底才跟：用户在这张卡里往上翻着读时不该被拽回去。
-          if (preEl && preEl.scrollHeight - preEl.scrollTop - preEl.clientHeight < 48) preEl.scrollTop = preEl.scrollHeight;
+          if (_wasAtBottom && preEl) preEl.scrollTop = preEl.scrollHeight;
         }
       }
     } else {
@@ -42328,8 +42394,11 @@ function _browserAssertionPassed(call, result) {
 function _browserActionPassed(call, result) {
   if (call?.type !== "browser" || !_toolExecutionSucceeded(call, result)) return false;
   if (["click", "type", "autofill", "fill", "press", "upload"].includes(call.action)) return true;
-  if (call.action !== "batch" || call._batchBroken) return false;
-  return Array.isArray(call.steps) && call.steps.some((step) =>
+  // 截断和中断一样，都是「你发的这批没跑完」。中断早就挡住了，截断没有——而截断的
+  // 尾巴恰恰是提交/保存这类关键动作最常待的位置（步骤是按先后写的）。
+  if (call.action !== "batch" || call._batchBroken || call._batchDropped > 0) return false;
+  const _steps = Array.isArray(call._executedSteps) ? call._executedSteps : call.steps;
+  return Array.isArray(_steps) && _steps.some((step) =>
     ["click", "tap", "type", "fill", "input", "press", "key"].includes(String(step?.op || step?.action || "").toLowerCase().trim()));
 }
 function _requiredUiViewportKind(call) {
@@ -50854,6 +50923,9 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
         return (instruction || direction || findings.length || falseGreen)
           ? { instruction, direction, findings, falseGreen } : null;
       })(),
+      // 这一轮的工作区根。「接下来」建议要按**这个项目探测到的真实命令**给验证提示，
+      // 而不是端一串写死的 npm/pytest/cargo 菜单出来——用户的项目大概率一条都不是。
+      root: String(root || "").replace(/\/+$/, ""),
       mutated: !!didMutate, // 「接下来」建议据此区分干活轮和纯问答轮
       toolStats: _toolLedgerStats(run._toolLedger?.entries || []),
       // 步数效率：这一轮总共调了多少次工具、其中多少是失败/重复/重读。是"定位改造有没有
@@ -51770,8 +51842,13 @@ function _scheduleWritePreviewColor(entry) {
       // Only apply if nothing newer was typed/colorized and the card still exists.
       if (entry.streamCard === card && entry._hlGen === gen && codeEl.isConnected
           && (entry._shownLen || 0) === snapLen) {
+        // 先量再改：上色会换掉整个 innerHTML、把高度顶上去，改完再量就永远量不出
+        // 「用户往上翻了多远」。而这个回调唯一的守卫是「流已经停了」——正好是用户
+        // 开始往上翻着读的那一刻，无条件拽到底等于每隔 130ms 把他拽回去一次。
+        const preEl = card.querySelector("pre");
+        const _wasAtBottom = !!preEl && (preEl.scrollHeight - preEl.scrollTop - preEl.clientHeight) < 48;
         codeEl.innerHTML = html;
-        if (card.querySelector("pre")) card.querySelector("pre").scrollTop = card.querySelector("pre").scrollHeight;
+        if (_wasAtBottom && preEl) preEl.scrollTop = preEl.scrollHeight;
       }
     }).catch(() => {});
   }, 130);
@@ -54454,11 +54531,20 @@ async function _executeToolStepInner(step, call, root, run) {
       const matchesByPath = new Map();
       const searchErrors = [];
       let successfulScopes = 0;
+      // 后端自己的截断。它有三道上限：单个文件最多收 50 处命中、整次检索 2000 处命中、
+      // 扫描 20000 个文件，触到任意一道就 break 并回报 truncated。这个事实原来在这里
+      // 被整个丢掉了——包装函数把它挂在返回的数组上，这条路径一次都没读过。
+      // 后果是**假阴性**：用户说「把这个变量所有调用点都改掉」，某个文件里有 80 处引用，
+      // 模型只看到前 50 处，然后按"一共就这么多"改完收工，剩下 30 处静静留在代码里。
+      let _backendTruncated = false;
+      let _scannedFiles = 0;
       for (const searchRoot of searchScopes) {
         let scopedMatches = [];
         try {
           scopedMatches = await backend.searchInProject(searchRoot, q, !!call.caseSensitive, call.mode || "literal") || [];
           successfulScopes++;
+          if (scopedMatches && scopedMatches.truncated) _backendTruncated = true;
+          _scannedFiles += Number(scopedMatches?.scannedFiles) || 0;
         } catch (error) {
           searchErrors.push(`${searchRoot}: ${String(error?.message || error).slice(0, 180)}`);
           continue;
@@ -54550,20 +54636,25 @@ async function _executeToolStepInner(step, call, root, run) {
       // 这正是最容易让人停止追查的一种假话。
       const _totalHits = fileMatches.reduce((n, f) => n + _hitsOf(f), 0);
       const _shownFiles = blocks.length;
-      const _truncated = hits < _totalHits || _shownFiles < fileMatches.length;
-      const _truncNote = _truncated
+      // 两种截断要分开说，因为补救动作不一样：前端这条是"我手上有更多、只是没全列"，
+      // 后端那条是"根本没搜完"，缩小范围重搜才拿得到。混成一句会让人以为换个词就够了。
+      const _frontTruncated = hits < _totalHits || _shownFiles < fileMatches.length;
+      const _truncNote = _frontTruncated
         ? `（**已截断**：命中 ${_totalHits} 处 / ${fileMatches.length} 个文件，这里只列出前 ${hits} 处 / ${_shownFiles} 个文件，按命中数排序。要看全需要缩小范围或换更精确的关键词——不要当成全部结果。）`
+        : "";
+      const _backendNote = _backendTruncated
+        ? `（**后端没搜完**：单文件命中上限 50 处，整次检索另有命中数与扫描文件数两道上限，触到就停${_scannedFiles ? `（已扫 ${_scannedFiles} 个文件）` : ""}。上面**不是全部命中**——重命名、改全部调用点这类要求"一个不漏"的活，必须按目录缩小范围分批重搜，不能据此认为已经找全。）`
         : "";
       const _ctxNote = ctxFiles < _shownFiles
         ? `（其中 ${_shownFiles - ctxFiles} 个文件只给了命中行、没带上下文：单轮读取文件数上限）`
         : "";
-      const summary = `${hits} 处匹配 · ${fileMatches.length} 个文件${ctxFiles ? "（►=命中行，带上下文）" : ""}${_truncNote}${_ctxNote}`;
+      const summary = `${hits} 处匹配 · ${fileMatches.length} 个文件${ctxFiles ? "（►=命中行，带上下文）" : ""}${_truncNote}${_backendNote}${_ctxNote}`;
       const partialNote = searchErrors.length ? `\n\n[ERROR] 部分搜索范围未完成:\n${searchErrors.join("\n")}` : "";
       res.className = fileMatches.length && !searchErrors.length ? "atc-result atc-result--ok" : "atc-result atc-result--err";
       res.textContent = fileMatches.length ? `${hits} 处匹配${searchErrors.length ? " · 部分范围失败" : ""}` : (searchErrors.length ? "无匹配 · 部分范围失败" : "无匹配");
       const _body = blocks.join("\n\n");
       vp.innerHTML = `<pre>${_escHtml((_body || "(无匹配)") + partialNote)}</pre>`;
-      return { type: "search", path: call.path, content: (blocks.length ? `搜索 "${q}" — ${summary}:\n${_redactSecrets(_body)}` : `搜索 "${q}"：在已扫描的范围里无匹配。**扫描范围不含点开头的目录和文件**（.github/.vscode/.env 这些整个不扫），也不含被忽略的目录——所以这不等于「工作区里没有」。要找 CI 配置、编辑器配置这类点开头路径下的内容，直接 read_file 指名读；否则换关键词、或用 semantic_search 按语义找、find_files 按文件名找。`) + partialNote };
+      return { type: "search", path: call.path, content: (blocks.length ? `搜索 "${q}" — ${summary}:\n${_redactSecrets(_body)}` : `搜索 "${q}"：${_backendTruncated ? "**这次没搜完**（触到后端的命中数/扫描文件数上限就停了），所以「没找到」不等于「不存在」——缩小到具体目录再搜一次。" : ""}在已扫描的范围里无匹配。**扫描范围不含点开头的目录和文件**（.github/.vscode/.env 这些整个不扫），也不含被忽略的目录——所以这不等于「工作区里没有」。要找 CI 配置、编辑器配置这类点开头路径下的内容，直接 read_file 指名读；否则换关键词、或用 semantic_search 按语义找、find_files 按文件名找。`) + partialNote };
 
     } else if (call.type === "find") {
       const requestedPattern = call.pattern || call.path || "";
@@ -58365,6 +58456,10 @@ return { type: call.type, path: call.query || "", content: `[失败] ${call.type
           const _allSteps = Array.isArray(call.steps) ? call.steps : [];
           const steps = _allSteps.slice(0, 25);
           call._batchDropped = Math.max(0, _allSteps.length - steps.length);
+          // 真正跑过的那一段。判「交互验证通过」的地方原来读 call.steps——那是模型**发来**的
+          // 全部步骤，不是执行过的步骤。32 步的批次里点提交在第 28 步，一个字都没跑，
+          // 而那道判定在完整数组里找到 click 就盖了章。
+          call._executedSteps = steps;
           if (!steps.length) { res.className = "atc-result atc-result--err"; res.textContent = "缺 steps"; return { type: "browser", path: "batch", content: "[ERROR] batch 需要 steps 数组。例：browser(action:\"batch\", steps:[{op:\"type\",node:3,text:\"user\"},{op:\"type\",node:5,text:\"pass\"},{op:\"click\",node:8},{op:\"wait\",ms:600}])。op ∈ click/type/press/scroll/wait/navigate；目标用 node=节点号（先 nodes 拿）或 index=红数字 或 selector。" }; }
           const fastOps = new Set(["observe", "click", "tap", "dblclick", "doubleclick", "rightclick", "contextmenu", "longpress", "hold", "hover", "move", "drag", "slide", "swipe", "wheel", "toggle", "check", "uncheck", "select", "choose", "type", "fill", "input", "clear", "append", "focus", "blur", "press", "key", "scroll", "wait"]);
           const canFastBatch = steps.every((s) => fastOps.has(String(s?.op || s?.action || "").toLowerCase().trim()));
@@ -58456,7 +58551,10 @@ return { type: call.type, path: call.query || "", content: `[失败] ${call.type
           content = `[失败] 批量自动化中断，后续步骤未执行。\n` + content;
         }
         if (call._batchDropped > 0) {
-          content += `\n\n[未全部执行] 你给了 ${call._batchDropped + 25} 个步骤，单次上限是 25——**后面 ${call._batchDropped} 步一个都没跑**。`
+          // 标记词要能被全系统那套失败判定认出来。原来写的是「未全部执行」——它的关键词表里
+          // 有「未执行」，而「未全部执行」里并没有这三个连着的字，于是一次被砍掉一半的批次
+          // 判成了干净的成功。
+          content += `\n\n[未执行完] 你给了 ${call._batchDropped + 25} 个步骤，单次上限是 25——**后面 ${call._batchDropped} 步一个都没跑**。`
             + `剩下的步骤请再发一次 batch；不要以为整个序列已经走完。`;
         }
         content += `\n**批量自动化结果**（${call._batchFast ? "fast batch：页面内一次执行多步，只截最终一次" : "兼容 batch：一次模型调用跑完多步"}，不要再为同一步骤补 screenshot）：\n${call._batchLog || "(无步骤)"}` + (state.result != null && state.result !== "" ? `\n\n**执行后的结构化状态**（已是最新状态；接着用 \`node=i\` 继续操作，或用 assert/check 验证。只有最终视觉排版验收才截图）：\n${state.result}` : "");
@@ -58549,7 +58647,7 @@ return { type: call.type, path: call.query || "", content: `[失败] ${call.type
           });
         }
       } catch {}
-      return { type: "browser", path: act, image: state.screenshot, browserResult: state.result, browserUrl: state.url || "", runOwnedDevUrl, content, ok: !call._batchBroken };
+      return { type: "browser", path: act, image: state.screenshot, browserResult: state.result, browserUrl: state.url || "", runOwnedDevUrl, content, ok: !call._batchBroken && !(call._batchDropped > 0) };
     } else if (call.type === "system") {
       if (!inTauri) { res.className = "atc-result atc-result--err"; res.textContent = "桌面专用"; return { type: "system", path: call.op, content: "[不可用] system（系统控制）只能在 Mr. Day One 桌面 App 里用。" }; }
       const sop = call.op || "frontmost";

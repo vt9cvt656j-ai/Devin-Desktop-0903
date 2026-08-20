@@ -16,6 +16,14 @@ import assert from "node:assert/strict";
 const HERE = dirname(fileURLToPath(import.meta.url));
 const SRC = readFileSync(join(HERE, "..", "src", "main.js"), "utf8");
 const TRUTH = readFileSync(join(HERE, "..", "..", "server", "prompts", "truthfulness.txt"), "utf8");
+const PLAN = readFileSync(join(HERE, "..", "..", "server", "prompts", "plan.txt"), "utf8");
+
+/** 取一个具名函数的开头一段源码，用来对结构下断言。 */
+function fnBody(name, len = 1400) {
+  const i = SRC.indexOf(`function ${name}(`);
+  assert.ok(i >= 0, `${name} 不见了`);
+  return SRC.slice(i, i + len);
+}
 
 /** 本地兜底那条共用尾巴——五个模式都拼它。 */
 function fallbackTail() {
@@ -302,11 +310,35 @@ test("gh / git：退出码就是结论，不能把原始输出原样丢回去", 
   assert.match(SRC, /git diff 没有输出/, "git_diff 的空输出仍然说成「无改动」");
 });
 
+test("plan 模式不再被提示词逼着以「切到 Agent 模式」收尾", () => {
+  // 回答一渲染完，正下方就挂着一个「用 Agent 执行此方案」的按钮——点一下自动切模式并
+  // 发起实施。而提示词强制模型每次都写一句"做完了建议你切到 Agent 模式来实现"，
+  // 讲的正是那个按钮已经在做的事。这是提示词层面**强制**产出的结尾废话。
+  assert.doesNotMatch(PLAN, /suggest the user switch to Agent mode/i,
+    "每一份方案的结尾都被逼着写一句纯套话");
+  assert.match(SRC, /用 Agent 执行此方案/, "切模式的入口是那个按钮，它必须还在");
+  // 方案本身「不改文件、不跑命令」的约束不能跟着一起删掉。
+  assert.match(PLAN, /Plan only — do not change files, do not run commands\./);
+});
+
 test("检索类：说清楚「没找到」还是「没去找」", () => {
   assert.match(SRC, /扫描没走完/, "find_files 扫到上限仍然说「无匹配文件」");
   assert.match(SRC, /符号索引只覆盖/, "find_symbol 不说索引作用域");
   assert.match(SRC, /在\*\*已建索引的部分\*\*里/, "semantic_search 不说索引作用域");
   assert.match(SRC, /扫描范围不含点开头的目录和文件/, "search 不说它从不扫点开头的路径");
+  // 后端的截断标志要真的被读。它有三道上限（单文件 50 处命中、整次 2000 处、扫 20000 个
+  // 文件），触到就 break 并回报 truncated——而智能体那条搜索路径原来一次都没读过它。
+  // 后果是假阴性：「把这个变量所有调用点都改掉」，某文件里 80 处引用只看到前 50 处，
+  // 模型按"一共就这么多"改完收工。
+  assert.match(SRC, /if \(scopedMatches && scopedMatches\.truncated\) _backendTruncated = true;/,
+    "后端的截断标志在智能体搜索路径上被丢掉了");
+  assert.match(SRC, /\*\*后端没搜完\*\*：单文件命中上限 50 处/,
+    "没搜完要说出来，且要说清补救动作是缩小范围重搜");
+  // 0 命中那条分支也要改口——「没找到」和「没去找」在这里最容易被当成同一件事。
+  assert.match(SRC, /\*\*这次没搜完\*\*（触到后端的命中数\/扫描文件数上限就停了）/,
+    "没搜完时的 0 命中仍然说成「无匹配」");
+  // 两种截断分开说：前端是"我手上有更多没列"，后端是"根本没搜完"，补救动作不同。
+  assert.match(SRC, /const _frontTruncated = hits < _totalHits/);
   assert.match(SRC, /这只是这一个域的结论/, "knowledge_search 不说它只查了一个域");
   assert.match(SRC, /环形缓冲的当前长度，不是本次抓包的总量/, "capture_flows 拿缓冲长度冒充总量");
 });
@@ -316,6 +348,22 @@ test("动作没发生就不许报成功", () => {
   assert.match(SRC, /这次什么都没做/, "降级仍然没有变成显式失败");
   assert.match(SRC, /_batchDropped/, "browser batch 超限的步骤仍然被静默丢弃");
   assert.match(SRC, /后面 \$\{call\._batchDropped\} 步一个都没跑/);
+  // 说出来还不够：这条文案的标记词必须能被权威失败判定认出来，否则一次被砍掉一半的批次
+  // 仍然算「执行成功」，后面的交互验证照样盖章。「未全部执行」里没有连着的「未执行」三个字。
+  assert.doesNotMatch(SRC, /\[未全部执行\]/, "标记词躲开了失败判定的关键词表");
+  const failMatch = fnBody("_toolFailureMatch", 600);
+  assert.ok(/未执行/.test(failMatch), "失败判定认「未执行」");
+  assert.match(SRC, /\[未执行完\] 你给了/, "截断的批次要被判成失败");
+  // 结构化的 ok 也要跟上——文案匹配只是兜底。
+  assert.match(SRC, /ok: !call\._batchBroken && !\(call\._batchDropped > 0\)/,
+    "截断的批次不能返回 ok:true");
+  // 而「交互已验证」这道章：只能盖在真正跑过的那一段上，且截断时一律不盖。
+  const passed = fnBody("_browserActionPassed", 900);
+  assert.match(passed, /call\._batchBroken \|\| call\._batchDropped > 0/,
+    "截断的批次不能certify交互验证");
+  assert.match(passed, /Array\.isArray\(call\._executedSteps\) \? call\._executedSteps : call\.steps/,
+    "要在执行过的步骤里找交互，不是模型发来的全部步骤");
+  assert.match(SRC, /call\._executedSteps = steps;/, "执行过的那一段要挂出来给判定读");
   assert.match(SRC, /轮次用尽·未完成/, "子智能体轮次用尽仍然冒充最终简报");
   assert.match(SRC, /running 只表示这个终端标签页还开着/, "run_in_terminal 仍拿 PTY 当命令");
   assert.match(SRC, /这次没有查成.{0,10}不是「没有引用」/, "lsp_references 定位失败仍落到「未找到」");
