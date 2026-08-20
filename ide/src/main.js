@@ -37430,7 +37430,12 @@ async function _snapshotDirForUndo(dirPath) {
 function _removedDeclarationsUnchecked(run, searchedTerms, maxItems = 6) {
   const cp = run?.checkpoint;
   if (!cp || typeof cp.forEach !== "function") return [];
-  const DECL = /^\s*(?:export\s+)?(?:async\s+)?(?:function|class)\s+([A-Za-z_$][\w$]*)|^\s*export\s+(?:const|let|var)\s+([A-Za-z_$][\w$]*)|^\s*(?:pub\s+)?fn\s+([A-Za-z_$][\w$]*)|^\s*def\s+([A-Za-z_$][\w$]*)/;
+  // **只认对外可见的声明**。文件内部的私有 helper 删掉是安全的——它只可能被这个文件用到，
+  // 而这个文件的全文刚刚被智能体重写过。放进来会造成一类很常见的误报：读完整个文件、
+  // 把只此一处用到的小函数内联掉、删了原声明——完全正当，却会被判成"没查引用就删"。
+  // 一次误报把正常成功变成"未完成"，代价不比漏报小。
+  //   JS/TS：必须带 export     Rust：必须带 pub     Python：必须是顶格 def（模块级即对外）
+  const DECL = /^export\s+(?:async\s+)?(?:function|class)\s+([A-Za-z_$][\w$]*)|^export\s+(?:const|let|var)\s+([A-Za-z_$][\w$]*)|^pub\s+(?:async\s+)?fn\s+([A-Za-z_$][\w$]*)|^def\s+([A-Za-z_$][\w$]*)/;
   const names = (text) => {
     const out = new Set();
     for (const line of String(text || "").split("\n")) {

@@ -29214,6 +29214,15 @@ test("删掉一个导出却没查过谁在用，要当场点名", () => {
   assert.deepEqual(scan(mk([["/p/b.ts", { existed: false, content: "", current: "" }]]), new Set()), []);
   // 没删东西不报。
   assert.deepEqual(scan(mk([["/p/c.ts", { existed: true, content: before, current: before + "\n// x" }]]), new Set()), []);
+  // 文件内部的私有 helper 删掉是安全的——它只可能被这个文件用到，而全文刚被重写过。
+  // 不排除的话会造成一类很常见的误报：读完整个文件、把只此一处用到的小函数内联掉、
+  // 删了原声明——完全正当，却被判成"没查引用就删"。一次误报把正常成功变成"未完成"。
+  assert.deepEqual(
+    scan(mk([["/p/d.ts", { existed: true, content: "function helper() {}\nexport const X = 1;", current: "export const X = 1;" }]]), new Set()),
+    [], "私有 helper 不该被算成对外声明");
+  assert.deepEqual(
+    scan(mk([["/p/e.rs", { existed: true, content: "fn inner() {}\npub fn outer() {}", current: "pub fn outer() {}" }]]), new Set()),
+    [], "非 pub 的 fn 不算对外");
 
   const loop = extractFn("_runAgenticLoop");
   assert.match(loop, /run\._incompleteReason \|\| `removed_unchecked:\$\{_gone\.length\}`/);
