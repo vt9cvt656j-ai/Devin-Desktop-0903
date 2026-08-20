@@ -25937,7 +25937,15 @@ async function sendPrompt(text, attachments = [], readyConfig = null, opts = {})
         : false;
       const explicitlyAboutCurrent = !!selected || !!f.dirty
         || /(?:当前|这个|这段|这里|刚才|上面|打开的).{0,8}(?:文件|代码|报错|函数|组件|页面)|(?:current|this|open)\s+(?:file|code|error|function|component)/i.test(text);
-      const includeFull = explicitlyAboutCurrent || (!prior && _turnEngineeringResolved.applies);
+      // 同 _agentContextForQuery 里那处：applies=false 的常见原因是**裁决还没回来**
+      // （8–20 秒，前台只等 6 秒且每会话一次），不是模型判定了「这轮不用碰项目」。
+      // 拿它去扣留用户**正开着的那个文件的正文**，是 gate-tristate 点名禁止的「夺走能力」，
+      // 而且专挑最含糊的那些消息下手：explicitlyAboutCurrent 的正则要求「这个/当前/这里」
+      // 后 8 字内出现「文件/代码/报错/函数」——「这个不行」「登录挂了」一个都不命中。
+      // 于是用户越说不清，它越看不到眼前那个文件。裁决没回来时不许扣。
+      const _ctxVerdictLanded = _turnEngineeringResolved?.intentSource === "ai";
+      const includeFull = explicitlyAboutCurrent
+        || (!prior && (!_ctxVerdictLanded || _turnEngineeringResolved.applies));
       if (includeFull) {
         const currentLimit = explicitlyAboutCurrent ? 6000 : 4000;
         // 注入**脱敏后**的正文。此前这里发的是逐字符原文，而 `_redactSecrets(content)`

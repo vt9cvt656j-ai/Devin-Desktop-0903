@@ -39,6 +39,14 @@ const REVIEWED = new Map([
     { direction: "ceremony", why: "这是**消费**预取结果的一侧；预取本身由正向闸门启动，缺席时压根没启动，这里返回 false 是自洽的" }],
   ["run._steeredWorkspaceRequired = !!run.engineering.explicitWorkspaceMutation;",
     { direction: "ceremony", why: "缺席 → 不额外声明写入义务；赋值而非否决" }],
+  // 下面两条是 2026-08-20 扩了扫描器（按 .applies 认）之后才浮出来的。同一天修掉的那两处
+  // 夺能力的判断（代码检索、当前打开文件正文）已经各自加了 intentSource 守卫，不在这张表里。
+  ["if (profile.applies) {",
+    { direction: "ceremony", why: "现在它只包着「所有模型共用的工程约束」那段散文和外部参考预取；"
+      + "缺席 → 少发一段仪式性说明，能力不受影响。真正的证据（BM25 命中的代码片段）已经挪到"
+      + "上面那个带 _verdictLanded 守卫的分支里，裁决没回来照给" }],
+  ["if (_finishChecks.length || p.applies) {",
+    { direction: "ceremony", why: "缺席 → 少列一份收尾自检清单；不夺任何能力" }],
 ]);
 
 function denialSites(src) {
@@ -46,11 +54,19 @@ function denialSites(src) {
   src.split("\n").forEach((line, index) => {
     const s = line.trim();
     if (!s || s.startsWith("//") || s.startsWith("*")) return;
-    if (!/run\.engineering\??\.[a-zA-Z]/.test(s)) return;
+    // 按名字认会漏：同一份工程画像在别处叫 profile / _turnEngineeringResolved / p，
+    // 于是「裁决没回来就扣掉代码检索」和「扣掉当前打开文件的正文」两处夺能力的判断，
+    // 从立这条守卫那天起就没被看见过（2026-08-20 查出并修掉）。
+    // 所以再按**字段名**认一道：`.applies` 是那道能力闸的关键字段，谁持有它都算。
+    // 不放宽到裸 `profile.*`——这个仓库里 profile 还指思考档位画像和自适应画像，会淹掉。
+    if (!/run\.engineering\??\.[a-zA-Z]|\w\??\.applies\b/.test(s)) return;
     // 否决形状：对画像取非，或者拿画像字段做三元降级。
-    const denies = /!\s*run\.engineering/.test(s) || /run\.engineering\??\.\w+\s*\?/.test(s);
+    const denies = /!\s*run\.engineering/.test(s) || /run\.engineering\??\.\w+\s*\?/.test(s)
+      || /!\s*\w+\??\.applies\b/.test(s) || /\w\??\.applies\s*\?/.test(s)
+      || /(?:if|&&|\|\|)\s*\(?\s*\w+\??\.applies\b/.test(s);
     if (!denies) return;
-    out.push({ line: index + 1, text: s.replace(/\s+/g, " "), guarded: /intentSource|_verdictLanded/.test(s) });
+    out.push({ line: index + 1, text: s.replace(/\s+/g, " "),
+      guarded: /intentSource|_verdictLanded|_ctxVerdictLanded/.test(s) });
   });
   return out;
 }
@@ -302,4 +318,25 @@ test("schema 不许比实现更严——模型不填就整轮失败", () => {
   // 不填就派出一个不知道要干什么的子智能体——这里保持严格是对的，别被上面那条扫描带走。
   assert.ok(req("run_subagent").includes("description"),
     "run_subagent 的 description 是任务本身，必须保持必填");
+});
+
+// 登记表按**文本**认，拦不住「这行没变、但它里面装的东西变了」。
+// 实测：把代码检索挪回 `if (profile.applies) {` 里面，上面那条守卫一声不响——因为那行文本
+// 已经登记成「仪式」。所以对**具体那件能力**再钉一条：证据必须在带裁决守卫的分支里取。
+test("代码检索是能力不是仪式：裁决没回来时照给", () => {
+  // 认 `await …` 那处**调用**，别撞上同名的函数定义（定义在前，indexOf 会先命中它）。
+  const at = SRC.indexOf("await _buildRetrievedCodeContext(query, root");
+  assert.ok(at > 0, "首答路径上的代码检索调用不见了");
+  // 往上找最近的那个 if，必须带裁决守卫。
+  const before = SRC.slice(Math.max(0, at - 600), at);
+  const lastIf = before.lastIndexOf("if (");
+  assert.ok(lastIf >= 0, "取不到它所在的分支");
+  const branch = before.slice(lastIf, before.indexOf("\n", lastIf) + 1 || undefined);
+  assert.match(branch, /_verdictLanded/,
+    "代码检索又被裸 applies 包住了 —— 裁决实测 8–20 秒、前台只等 6 秒，"
+    + "那意味着「裁决还没回来」的常态下就把已经在内存里的证据扣着不给。"
+    + "gate-tristate 的规矩写着：夺走一样能力（工具、**检索**、知识）必须加 intentSource 守卫");
+  // 守卫的语义也要对：是「没落地就照给」，不是「没落地就不给」。
+  assert.match(branch, /!_verdictLanded \|\|/,
+    "守卫方向反了 —— 应该是「裁决没落地 → 照给」，不是「落地了才给」");
 });
