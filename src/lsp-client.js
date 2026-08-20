@@ -1881,12 +1881,25 @@ export function createLspManager(options) {
     // ---- agent navigation tools (managed languages only; null = use a fallback) ----
     // Document outline: [{ name, kind, line, depth }] (1-based line). Handles both
     // hierarchical DocumentSymbol[] and flat SymbolInformation[].
+    // 三种结局要分开，不能合并成一个空数组：
+    //   null            —— 这个语言压根没有符号服务（调用方会说「[无 LSP]」）
+    //   { unanswered }  —— 服务在，但这次**没答上来**（超时 / 发送失败 / JSON-RPC error）
+    //   数组（可能为空）—— 服务真的答了，空就是真的没有符号
+    //
+    // 原来中间那种被压成 []，于是「刚打开一个 Rust/Go 项目、语言服务还在建索引」被说成
+    // 「这个文件里没有符号」—— 一个**肯定判断**。模型据此认为文件是空的，转头凭记忆写代码
+    // 或者直接删东西。request() 在超时、发送失败、JSON-RPC error 三条路上一律 resolve(null)，
+    // 到这里的 null 有四种来源，只有一种是「服务器真说没有」。
+    //
+    // 不动 request() 的默认行为：全仓 36 处 await 依赖它 resolve(null)，改成 reject 会复现
+    // 「initialize 超时 → capabilities={} 却 initialized=true」那个老 bug。
     async agentDocumentSymbols(path) {
       const ctx = await _agentEnsureDoc(path);
       if (!ctx || !ctx.client.supports("documentSymbol")) return null;
       let result;
       try { result = await ctx.client.request("textDocument/documentSymbol", { textDocument: { uri: ctx.uri } }); }
-      catch { return null; }
+      catch { return { unanswered: true }; }
+      if (result == null) return { unanswered: true };
       if (!Array.isArray(result)) return [];
       const out = [];
       const walk = (items, depth) => {

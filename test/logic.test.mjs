@@ -30611,3 +30611,96 @@ test("消息被裁掉之后，它那块「接下来」按钮不许留下当孤�
   assert.match(extractFn("_renderLatestHistoryWindow"), /:scope > \.next-steps/,
     "重渲染最新窗口时没清 —— 清完剩下的全是建议块，新消息会追加在它们后面，整堆废按钮浮到最上面");
 });
+
+// ---- 四条「回执在骗模型」的修复 ----
+
+test("读不了的文件不许说成「找不到」，而且错误码要被失败识别器认出来", () => {
+  const src = SRC.slice(SRC.indexOf("} else if (unreadableMatches.length === 1) {"));
+  // 必须是**无条件**返回：只比字符串在不在的话，包一层 if (false) 照样绿（第一版就这么漏的）。
+  assert.match(src.slice(0, 1600),
+    /usedPath = unreadableMatches\[0\]\.path;[\s\S]{0,600}?\n        return \{ type: "read", path: usedPath, content:/,
+    "那一支不是无条件返回了 —— 一旦被条件包住，就又会掉回「找不到唯一文件」那条分支");
+  assert.match(src.slice(0, 1600), /\[ERROR\/UNREADABLE\] 文件确实存在/,
+    "文件存在只是读不了，却仍然掉进「找不到唯一文件」那条分支 —— 模型会去 find_files，"
+    + "搜到同一个路径、再读、同一句话，要么死循环要么对用户断言「项目里没有这个文件」");
+  assert.match(src.slice(0, 1600), /别再 find_files/, "没告诉模型别再去找路径");
+  assert.match(src.slice(0, 1600), /run_cmd/, "没给可行动的替代办法");
+  // 错误码必须落在失败识别器的枚举里，否则这次失败会被算成**成功**。
+  const failMatch = load("_toolFailureMatch");
+  assert.ok(failMatch("[ERROR/UNREADABLE] 文件确实存在: /a/b.db"),
+    "这个错误码不被失败识别器认得 —— 一次失败会被翻成成功，比原来的 bug 更糟");
+  assert.ok(!failMatch("[UNREADABLE] 文件确实存在: /a/b.db"),
+    "构造前提变了：如果裸 [UNREADABLE] 现在也被认得，上面那条断言就失去意义");
+});
+
+test("日志截断要说真实总量，不能让下游报出一个精确的假数字", () => {
+  const seg = /const _joined = chunks\.join[\s\S]*?_joined\.slice\(0, _LOG_BUDGET\);/.exec(SRC);
+  assert.ok(seg, "日志截断那段不见了");
+  const f = new Function("chunks", seg[0].replace("const _joined", "let _joined"));
+  const chunks = Array.from({ length: 8 }, (_, i) => "--- 日志文件: a" + i + ".log ---\n" + "x".repeat(12000));
+  const out = f(chunks);
+  const real = chunks.join("\n\n").length;
+  assert.match(out, new RegExp(`实际共 ${real} 字`),
+    "没给真实总量 —— 下游那句「中间约 N 字不在上下文里」用的是砍完之后的长度，会低报几千倍");
+  assert.ok(out.startsWith("[日志已截断]"),
+    "说明放在末尾了 —— 那是被下游再截时第一个被砍掉的东西");
+  assert.ok(out.length < 30000,
+    "返回正好顶到下游预算，恰恰是让那个假标记必然触发的值；要留出抬头和外部数据标记的位置");
+  assert.match(out, /read_logs\(path=/, "没告诉模型缺的那几份怎么单独取");
+  // 没超预算时原样返回，别平白加一句。
+  assert.equal(f(["short"]), "short");
+});
+
+test("CI 日志：第一行就是错因时不许说「没匹配到失败关键词」，抬头的行数要从实际交付反推", () => {
+  const seg = /const _total = lines\.length;[\s\S]*?content: `gh run view \$\{runId\} --log-failed（\$\{_howReal\}）:\\n\$\{_clipped\}` \};/.exec(SRC);
+  assert.ok(seg, "CI 日志那段不见了");
+  const clip = load("_clip");
+  const run = (lines) => new Function("lines", "_clip", "res", "vp", "_escHtml", "runId", "out", seg[0])(
+    lines, clip, {}, null, (x) => x, "1", "");
+
+  // ① gh 自己失败：输出只有一行，那一行就是错因（findIndex 返回 0）。
+  const single = run(["failed to get run: HTTP 404"]);
+  assert.doesNotMatch(single.content, /没有匹配到任何失败关键词/,
+    "差一错位：findIndex 命中第一行返回 0 被当成没命中 —— 唯一那行就是错因，却被告知这里没有错误");
+
+  // ② 任务名里带 fail（e2e-failover）不许让匹配恒中第 0 行。
+  // 错误行必须放在**前 80 行之外**：整行匹配会让 failIdx 恒为 0、取 0..79 行，
+  // 如果错误行在那个窗口里，两种实现都能命中，这条断言就白写了（第一版就这么漏的）。
+  const lines = Array.from({ length: 231 }, (_, i) =>
+    `e2e-failover\tRun tests\t2026-08-20T09:00:00Z ` + (i === 150 ? "Error: expected 200 got 500" : "ok " + i));
+  const big = run(lines);
+  assert.match(big.content, /expected 200 got 500/,
+    "整行匹配 —— job 名含 fail 就恒中第 0 行，这个工具在那种仓库里永远只会说「没匹配到失败关键词」");
+
+  // ③ 抬头承诺的行数必须等于实交行数（原来先承诺 85 行再裸切 3500 字，实交 24 行还是半句）。
+  const promised = Number(/实际给出 (\d+) 行/.exec(big.content)?.[1]);
+  const delivered = big.content.split("\n").length - 1;
+  assert.equal(promised, delivered,
+    `抬头说给了 ${promised} 行，实际给了 ${delivered} 行 —— 用户看到的是「日志都给它了它还找不到原因」`);
+  assert.match(big.content, /\[已截断\]/, "截断了却没有标记");
+});
+
+test("LSP 没答上来 ≠ 这个文件里没有符号", () => {
+  const LSP = readFileSync(join(HERE, "..", "src", "lsp-client.js"), "utf8");
+  const seg = /async agentDocumentSymbols\(path\) \{[\s\S]*?\n    \},/.exec(LSP);
+  assert.ok(seg, "agentDocumentSymbols 不见了");
+  const mk = (reply) => new Function("_agentEnsureDoc", "LSP_SYMBOL_KIND_NAMES",
+    `return ({ ${seg[0].replace(/,$/, "")} });`)(
+    async () => ({ uri: "file:///x", client: { supports: () => true, request: reply } }), {});
+  const kindOf = async (reply) => {
+    const r = await mk(reply).agentDocumentSymbols("/x.rs");
+    return Array.isArray(r) ? (r.length ? "symbols" : "empty") : (r && r.unanswered ? "unanswered" : "none");
+  };
+  return Promise.all([
+    kindOf(async () => []).then((k) => assert.equal(k, "empty", "服务器真说没有，应当是空数组")),
+    kindOf(async () => null).then((k) => assert.equal(k, "unanswered",
+      "回 null（超时 / 正在建索引 / JSON-RPC error 三条路都走这里）被压成了空数组 —— "
+      + "「这个文件里没有符号」是个假的肯定判断，模型会据此认为文件是空的")),
+    kindOf(async () => { throw new Error("socket closed"); }).then((k) => assert.equal(k, "unanswered", "抛异常也要算没答上来")),
+    kindOf(async () => [{ name: "main", kind: 12, range: { start: { line: 0 } } }])
+      .then((k) => assert.equal(k, "symbols", "真有符号的情形被弄坏了")),
+  ]).then(() => {
+    // 调用方要把这一档说清楚。
+    assert.match(SRC, /这不代表这个文件里没有符号/, "调用方没有把「没查成」和「没有符号」分开说");
+  });
+});
