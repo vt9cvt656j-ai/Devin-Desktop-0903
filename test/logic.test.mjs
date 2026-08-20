@@ -22874,6 +22874,11 @@ test("相似度阈值是标定出来的：同一问题的改写要命中，不�
     ["前端用 React 还是 Vue", "后端用 Go 还是 Rust"],
     ["这个文件要删掉吗", "这个文件要重命名吗"],
     ["要不要加测试", "要不要加文档"],
+    // 拉丁文样本：这 8 对原来**一对都没有**，所以「字符集合 Jaccard 对英文恒高」这个坑
+    // 一直没被标定测试踩到 —— 英文用户问第二个完全不同的问题就吃 [ALREADY_ANSWERED]。
+    ["Which database should I use for this project?", "Should the login page support social sign-in?"],
+    ["Do you want dark mode enabled by default?", "Which package manager should the project use?"],
+    ["Should I add end-to-end tests now?", "What is the deploy target for this build?"],
   ];
   for (const [a, b] of SAME) assert.ok(sim(a, b) >= 0.65, `「${a}」和「${b}」是同一个问题，却没命中：${sim(a, b)}`);
   for (const [a, b] of DIFF) assert.ok(sim(a, b) < 0.65, `「${a}」和「${b}」是两件事，却被判成同一个：${sim(a, b)}`);
@@ -31011,4 +31016,44 @@ test("没有工作区时，从零建项目那族要给出路而不是死路", ()
   const failMatch = load("_toolFailureMatch");
   assert.ok(failMatch("[BLOCKED] 当前没有工作区根目录。**下一步直接调 create_project({name:\"x\"})**"),
     "错误码不被失败识别器认得");
+});
+
+// ---- 英文用户一次会话只能被问一次 ----
+//
+// 相似度用的是**字符集合** Jaccard。中文可用（字多、集合稀疏），拉丁文恒高：26 个字母的
+// 语言里任意两句长英文的字符集几乎全覆盖。配 0.65 阈值，英文用户问第二个**完全不同**的
+// 问题时会被判成「你已经问过了」，直接吃到 [ALREADY_ANSWERED]。
+// 原来那组标定样本 8 对里**没有一对是拉丁文为主的**，所以这个坑一直没人踩到。
+test("英文问两个完全不同的问题，不许被判成重复", () => {
+  const sim = load("_questionSimilarity", { _normalizeQuestion: load("_normalizeQuestion") });
+  const DUP = 0.65; // 与 _alreadyAnsweredQuestion 里的阈值一致
+
+  // 完全不同 → 必须判成新问题（这是这条修复的靶子）
+  for (const [a, b] of [
+    ["Which database should I use for this project?", "Should the login page support social sign-in?"],
+    ["Do you want dark mode enabled by default?", "Which package manager should the project use?"],
+    ["Should I add end-to-end tests now?", "What is the deploy target for this build?"],
+  ]) {
+    assert.ok(sim(a, b) < DUP, `英文两个完全不同的问题被判成重复：${sim(a, b).toFixed(3)}\n  ${a}\n  ${b}`);
+  }
+
+  // 中文侧一字不动：完全不同仍判新问题，真改写仍判重复。
+  assert.ok(sim("这个项目用哪个数据库？", "登录页要不要支持第三方登录？") < DUP, "中文完全不同被判成重复");
+  assert.ok(sim("这个项目用哪个数据库？", "这个项目要用什么数据库？") >= DUP, "中文真改写不再判重复 —— 中文侧不该受影响");
+
+  // 逐字相同 / 包含关系的快路不受影响。
+  assert.equal(sim("Use postgres?", "Use postgres?"), 1);
+  assert.ok(sim("Use postgres for this?", "Use postgres") >= 0.9, "包含关系的快路没了");
+
+  // **取舍写明**：英文的真改写会掉到阈值之下，模型因此多问一次 —— 这是这个函数注释
+  // 自己定的方向（漏判只多问一次，误判会拿旧答案顶掉新问题）。钉住它，免得后人
+  // 「顺手调高召回」把误判那一侧放回来。
+  const rewrite = sim("Which database should I use?", "What database should I use?");
+  assert.ok(rewrite < DUP,
+    "英文真改写又被判成重复了 —— 方向错了：误判的代价是拿旧答案顶掉新问题");
+  assert.ok(rewrite > 0.4, `英文真改写掉得太狠（${rewrite.toFixed(3)}），相似度已经失去意义`);
+
+  // 分派必须在**原始串**上做：_normalizeQuestion 把空格也删了，在它之后按词切永远是空集。
+  const src = extractFn("_questionSimilarity");
+  assert.match(src, /_words\(a\)/, "按词切用的不是原始串 —— 空格已经被规范化删掉了");
 });
