@@ -29014,6 +29014,34 @@ test("快通道也要给出为什么是这几个——可见推理不因为走�
     "快慢两条路都要有理由，不能只有一条有");
 });
 
+
+// ---- 有项目反而不调研：整文件覆写此前不受任何「没读就写」的闸门管 ----
+test("覆写一个已有文件算盲改，和 edit 一样要被点名", () => {
+  const loop = extractFn("_runAgenticLoop");
+  // 用户原话：「我如果有项目内容的话 他就会变蠢了 不会去调研 就会一股无脑写内容」。
+  // 机器成因：两道「没读就写」的闸门都只认 edit/multiedit，而 write_file 整文件覆写
+  // 一个已有文件——破坏性最大的那种——一次都不响。edit 至少要求 old_string 对得上，
+  // 对不上会报错；整文件覆写不校验任何东西，没读过的部分直接消失。
+  assert.match(loop, /it\.call\.type === "write" && it\.rawResult\?\.overwroteExisting/,
+    "盲改判据要认整文件覆写");
+  assert.match(loop, /t === "write" && it\.rawResult\?\.overwroteExisting/,
+    "「改了别人的代码」这个事实也要认覆写，否则 investigate 那道闸一次都不响");
+  // 判据必须来自执行事实，不是从中文文案里猜。
+  assert.match(SRC, /overwroteExisting: !!existed/,
+    "「写的是本来就存在的文件」要结构化带出来");
+  // 后台检索设计知识库不等于读过这个项目的代码。didInvestigate 唯一的读者是那道
+  // 「你还没摸过相关代码就动手改了」的闸门，管的是**项目源码**；让 harness 自己的
+  // 知识库预取去置它，等于给模型记一笔它没做过的功，那道闸门在所有设计任务上永远哑掉。
+  assert.doesNotMatch(loop, /preflight\.results\) && preflight\.results\.length\) didInvestigate = true/,
+    "后台知识库预取不许冒充「读过代码」");
+  assert.match(loop, /didInvestigate = true/, "真正的读取/搜索仍然要记这一笔");
+  // 新建文件不需要先读——别把这条闸门变成"写任何文件前都得读一遍"。
+  assert.doesNotMatch(loop, /it\.call\.type === "write"\)\s*\|\|\s*!it\.call\.path/,
+    "不能把新建文件也算成盲改");
+  // 文案要说清覆写的后果，不能沿用 old_string 那套（覆写没有 old_string）。
+  assert.match(loop, /你没读过的部分已经直接消失了/);
+});
+
 // ---- 写入落空要有用户侧的出口 ----
 test("尝试写了没落盘时，结局里必须留下 writes_failed", () => {
   const loop = extractFn("_runAgenticLoop");
@@ -30047,4 +30075,52 @@ test("打字预取的闸门：只在能省下等待的时候跑，且不许把�
   assert.match(SRC.slice(at, at + 160), /_prefetchIntentFromComposer\(\)/, "定时器里调的不是预取");
   assert.match(SRC.slice(Math.max(0, at - 200), at), /clearTimeout\(_intentPrefetchTimer\)/,
     "没有防抖 —— 每敲一个键就发一次请求");
+});
+
+// ---- 每问一轮就多出一张计划卡 ----
+//
+// 用户实拍：同一份计划（同样 4 步、同样 0/4）在一个对话里连出三张，分别显示 2 / 3 / 4 步。
+// 病根是层级挂错了：计划卡记在 run._planEl 上，而**一个 run = 用户的一次提问**，计划却是
+// 跨轮持续的东西。于是每问一轮 run._planEl 都是空的 → 新建一张，上一轮那张还留在上面。
+test("计划卡跨轮只有一张：新的一轮要复用上一轮那张，不是再建一张", () => {
+  const mkEl = () => ({
+    className: "", innerHTML: "", children: [], parentNode: null, isConnected: false,
+    get lastChild() { return this.children[this.children.length - 1] || null; },
+    appendChild(c) {
+      if (c.parentNode) c.parentNode.children = c.parentNode.children.filter((x) => x !== c);
+      c.parentNode = this; c.isConnected = true; this.children.push(c); return c;
+    },
+  });
+  const render = new Function("document", "t", "_escHtml", "_PLAN_ICON", "_planVisibleWindow",
+    "_planRowHtml", "_planWindowControlsHtml", "_bindPlanWindow", "_syncPlanChip",
+    "_schedulePlanReveal", "_PLAN_MAX_RENDERED_STEPS",
+    `${extractFn("_renderPlan")}\nreturn _renderPlan;`)(
+    { createElement: () => mkEl() }, () => "", (x) => String(x), "",
+    (run, steps) => ({ rows: steps, start: 0 }), () => "", () => "", () => {}, () => {}, () => {}, 8);
+
+  const countCards = (node) => (node.className === "agent-plan" ? 1 : 0)
+    + node.children.reduce((a, c) => a + countCards(c), 0);
+  const steps = [{ content: "a", status: "pending" }, { content: "b", status: "pending" }];
+
+  // 三轮提问，每轮一个新的 run 和一个新的消息容器 —— 正是用户实拍的场景。
+  const session = {};
+  const chat = mkEl(); chat.isConnected = true;
+  for (let turn = 0; turn < 3; turn++) {
+    const body = mkEl(); chat.appendChild(body);
+    render(body, steps, undefined, { session });
+  }
+  assert.equal(countCards(chat), 1,
+    "每问一轮就多一张计划卡 —— 卡挂在 run 上，而 run 是一次提问，计划却是跨轮的");
+
+  // 两个不同会话之间不许串卡。
+  const chatB = mkEl(); chatB.isConnected = true;
+  const bodyB = mkEl(); chatB.appendChild(bodyB);
+  render(bodyB, steps, undefined, { session: {} });
+  assert.equal(countCards(chatB), 1, "新会话没有自己的计划卡");
+  assert.equal(countCards(chat), 1, "另一个会话的卡被抢走了");
+
+  // 层级必须两边都挂：run 级供本轮增量更新，会话级供下一轮复用。
+  const src = extractFn("_renderPlan");
+  assert.match(src, /run\.session\._planEl/, "会话级指针没了 —— 下一轮又会新建一张");
+  assert.match(src, /if \(run\) run\._planEl = el;/, "run 级指针没了 —— 本轮内的增量更新会失效");
 });
