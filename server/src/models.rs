@@ -8554,7 +8554,11 @@ pub async fn responses_proxy(
                     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                 }
                 Err(e) => {
-                    if attempt == 2 {
+                // 超时**不重试**：请求已经到了上游，它很可能还在干活（生图/长推理经常
+                // 超过这里的超时）。重试等于让上游把同一件事做第二遍 —— 运营方付两次钱，
+                // 用户只拿到一份结果。只有「压根没连上」才是安全可重的：那时请求根本没到。
+                let safe_to_retry = e.is_connect();
+                    if attempt == 2 || !safe_to_retry {
                         return Err((0, e.to_string()));
                     }
                     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
@@ -8802,8 +8806,12 @@ pub async fn image_generations(
                     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                 }
                 Err(e) => {
+                // 超时**不重试**：请求已经到了上游，它很可能还在干活（生图/长推理经常
+                // 超过这里的超时）。重试等于让上游把同一件事做第二遍 —— 运营方付两次钱，
+                // 用户只拿到一份结果。只有「压根没连上」才是安全可重的：那时请求根本没到。
+                let safe_to_retry = e.is_connect();
                     last_err = e.to_string();
-                    if attempt == 2 {
+                    if attempt == 2 || !safe_to_retry {
                         break;
                     }
                     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
@@ -11751,6 +11759,39 @@ mod billing_tests {
         assert_eq!(
             progress.first_model_progress_ms(),
             progress.first_nonempty_thinking_delta_ms
+        );
+    }
+
+    /// 计费路径上的重试判据：超时不许重试。
+    ///
+    /// 超时意味着请求**已经到了上游**，它很可能还在干活（生图/长推理经常超过 120 秒）。
+    /// 重试等于让上游把同一件事做第二遍 —— 运营方付两次钱，用户只拿到一份结果。
+    /// 只有「压根没连上」才是安全可重的。这条钉的是判据本身：源码里那两处必须用
+    /// `e.is_connect()`，不能退回成「任何传输错误都重试」。
+    #[test]
+    fn billed_paths_never_retry_a_timeout() {
+        // 只数**生产代码**那一段：include_str! 会把这条测试自己的字符串字面量也数进去
+        // （第一版就这么自己喂到自己，数出 3）。切到测试模块之前为止。
+        let whole = include_str!("models.rs");
+        let src = match whole.find("mod billing_tests") {
+            Some(i) => &whole[..i],
+            None => whole,
+        };
+        let hits = src.matches("let safe_to_retry = e.is_connect();").count();
+        assert_eq!(
+            hits, 2,
+            "responses_proxy 和 image_generations 两条计费路径都必须只在连不上时重试；\
+             现在只找到 {hits} 处 —— 超时被当成可重试，上游会把同一件事做两遍"
+        );
+        assert_eq!(
+            src.matches("if attempt == 2 || !safe_to_retry {").count(),
+            2,
+            "判据算出来了却没用上"
+        );
+        // 反向：不许再出现「任何传输错误都重试」的裸形态。
+        assert!(
+            !src.contains("Err(e) => {\n                    last_err = e.to_string();\n                    if attempt == 2 {"),
+            "image_generations 又退回成任何错误都重试了"
         );
     }
 
