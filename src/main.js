@@ -33402,7 +33402,13 @@ function _selectInitialTools(includeWrite, taskText, mcpTools = [], mode = inclu
             //     工具」（下面那条注释就是这条规矩的原文）。
             // 两个都不给子体（不在 _READ_TOOLS 里）：只读子体本来就不写文件、不注册服务。
             "save_skill", "mcp_server",
-            "web_search", "web_fetch", "github_search", "developer_community_search", "package_search"],
+            // github_repo 和 github_search 必须成对进窗口：搜索只给标题和链接，而
+            // _researchEvidenceCategory 明说「搜索结果标题只算发现，不算证据」——真正记进
+            // 取证账本的是 github_repo（读仓库真实内容）。只放搜索那一半，模型会去 GitHub
+            // 搜一圈、自我感觉查过了，取证账上却仍然是零，那道取证门于是一直判它没查。
+            // 对照 web_search→web_fetch：那一对本来就是配齐的，这一对漏了后手。
+            "web_search", "web_fetch", "github_search", "github_repo",
+            "developer_community_search", "package_search"],
   };
   
   // Get base tools from role or default
