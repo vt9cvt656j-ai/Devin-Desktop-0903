@@ -28851,18 +28851,54 @@ test("收尾评审判定没实现要求时,结论落进运行状态并变成一�
   assert.ok(chip, "评审判了「没实现」,用户这边却什么都没有——那次付费调用等于白花");
   assert.match(chip.send, /登录接口仍然写死返回 true/,
     "卡片没把评审那句**具体**指令带上,点了等于让模型重新猜一遍");
-  // 通过 / 没结论时不许冒出来。
-  for (const wrapUp of [{ done: true }, null, undefined, { instruction: "" }]) {
+  // 没结论时不许冒出来。
+  for (const wrapUp of [null, undefined, { instruction: "" }]) {
     assert.ok(!gen({ _lastRunState: { outcome: "success", task: "x", updatedAt: now, wrapUp } })
-      .some((c) => /评审/.test(c.label)), "评审没说「没实现」时不该冒卡片");
+      .some((c) => /评审|顺带/.test(c.label)), "评审什么都没说时不该冒卡片");
   }
-  // 落进运行状态那一步:只在 done === false 时落,且必须带 instruction。
+
+  // direction:拿【用户历次要求】对这一轮的走向,不一致才出声——这套东西里唯一一处
+  // 「你真正想做的是不是另一件事」的检测器,当初是用户点名要的。它按设计**不参与 done**,
+  // 所以评审通过的那一轮同样要说。
+  const dirChips = gen({ _lastRunState: { outcome: "success", task: "x", updatedAt: now,
+    wrapUp: { instruction: "", direction: "你一路在要的是把登录整条链路打通,不是逐个页面补样式", findings: [] } } });
+  const dir = dirChips.find((c) => /真正想做/.test(c.label));
+  assert.ok(dir, "direction 没出口——它正是「读没读懂用户要什么」的检测器,哑掉等于白算");
+  assert.match(dir.send, /登录整条链路打通/, "卡片没把评审那句判断带上");
+  assert.match(dir.send, /不对就当没说|按我的原话/,
+    "没给否决的余地——评审只是提醒,不能变成替用户改需求");
+
+  // findings:顺手发现的、本次任务之外的真实缺陷。同样是用户点名要的,同样不参与 done。
+  const fdChips = gen({ _lastRunState: { outcome: "success", task: "x", updatedAt: now,
+    wrapUp: { instruction: "", direction: "", findings: ["auth.js:88 token 过期没续签", "db 连接没设超时"] } } });
+  const fd = fdChips.find((c) => /顺带/.test(c.label));
+  assert.ok(fd, "findings 没出口");
+  assert.match(fd.label, /2/, "标签没说有几处");
+  assert.match(fd.send, /token 过期没续签[\s\S]*没设超时/, "只带了一条,另一条丢了");
+  assert.match(fd.send, /别直接动手/,
+    "超出本轮范围的问题不许自动开修——修不修是用户的事");
+
+  // 落进运行状态那一步。
   const persist = /wrapUp: \(\(\) => \{([\s\S]*?)\}\)\(\),/.exec(SRC);
   assert.ok(persist, "运行状态里没有 wrapUp——评审结论根本到不了卡片那一层");
-  assert.match(persist[1], /v\.done !== false/,
+  assert.match(persist[1], /v\.done === false \? clean\(v\.instruction/,
     "判据不对：done 缺席(评审没跑成)会被当成「没实现」,那是凭空冤枉自己");
-  assert.match(persist[1], /instruction \? \{ instruction \} : null/,
-    "没指令的空结论也落了,会弹出一张点了没用的卡");
+  assert.match(persist[1], /const direction = clean\(v\.direction/,
+    "direction 没落进运行状态");
+  assert.match(persist[1], /Array\.isArray\(v\.findings\)/, "findings 没落进运行状态");
+  // 评审最多吐几条，就得落几条——上限比它小等于悄悄丢掉几条真问题。数字不写死，
+  // 从评审自己那个上限推出来。
+  const criticCap = Number(/const findings = \(Array\.isArray\(j\.findings\)[\s\S]{0,120}?\.slice\(0, (\d+)\)/.exec(SRC)?.[1]);
+  const persistCap = Number(/\.filter\(Boolean\)\.slice\(0, (\d+)\)/.exec(persist[1])?.[1]);
+  assert.ok(Number.isFinite(criticCap) && Number.isFinite(persistCap), "两侧的上限都得看得见");
+  assert.ok(persistCap >= criticCap,
+    `评审最多给 ${criticCap} 条，落进运行状态只留 ${persistCap} 条——剩下的悄悄丢了`);
+  // 三样都空时不许留一个空壳,否则卡片层要靠猜。
+  assert.match(persist[1], /instruction \|\| direction \|\| findings\.length/,
+    "空结论也落了,会弹出一张点了没用的卡");
+  // done 通过并不代表 direction/findings 该被吞掉——它们按设计不参与 done。
+  assert.doesNotMatch(persist[1], /if \(!v \|\| v\.done/,
+    "又拿 done 把 direction/findings 一起挡掉了,那两样按设计和 done 无关");
   // 红线仍在：这条出口不许顺手变成「自动补一轮」。
   const at = SRC.indexOf("if (run.wrapUp && run.wrapUp.instruction)");
   assert.ok(at > 0);
