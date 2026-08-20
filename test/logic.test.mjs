@@ -29126,6 +29126,32 @@ test("占位交付要有用户侧的出口，且不发红灯也不发绿灯", ()
     "占位扫描不许影响验证学分");
 });
 
+
+// ---- 走偏要在还来得及的时候发现 ----
+test("方向检查提前到中途，但闸门要紧，且绝不顶掉收尾那份裁定", () => {
+  const loop = extractFn("_runAgenticLoop");
+  // 「你真正想做的是另一件事」此前只在模型已决定收尾时跑一次——判错方向的代价是
+  // 用户读完一整轮、打字纠正、再跑一轮。用户原话：「走偏 或者 走错 都需要调研」。
+  assert.match(loop, /run\._directionChecked/, "中途方向检查要有");
+  assert.match(loop, /\[方向检查·现在还来得及改\]/);
+  // 闸门收紧：没靶子不查、短任务不查、每 run 只一次、占收尾评审那两个名额。
+  assert.match(loop, /iter >= 6 && _implOps >= 2/, "短任务和纯调研轮不该被打扰");
+  assert.match(loop, /Array\.isArray\(run\._requirementsChecklist\) && run\._requirementsChecklist\.length/,
+    "没有验收契约就无所谓偏不偏");
+  assert.match(loop, /run\._directionChecked[\s\S]{0,200}?run\._wrapUpReviews = \(run\._wrapUpReviews \|\| 0\) \+ 1/,
+    "要占用已有预算，不能白开一个新口子");
+  // 绝不写 _wrapUpVerdict：那是用户建议卡的来源，中途一份不完整的裁定会顶掉收尾那份好结论。
+  const _dcAt = loop.indexOf("run._directionChecked");
+  const seg = loop.slice(_dcAt, _dcAt + 2600);
+  assert.doesNotMatch(seg, /run\._wrapUpVerdict\s*=/, "中途版不许写裁定");
+  // 评审挑好的工具要真的装上——「走偏了→去看真实作品」这条路此前整条断在这里。
+  assert.match(seg, /_criticRequestedToolSchemas\(_dir\?\.tools, run\._toolRegistry, 4\)/);
+  assert.match(seg, /_applyToolPayloadWindow\(toolSchemas, _dirTools, run\._toolCoreNames\)/);
+  // 它是**一个模型的意见**，不是执行事实，不该和红构建争保命位——所以不登记进事实类。
+  const facts = SRC.slice(SRC.indexOf("const _NUDGE_FACTS = new Set(["), SRC.indexOf("const _NUDGE_FACTS = new Set([") + 900);
+  assert.doesNotMatch(facts, /"directionCheck"/, "方向是意见不是事实，按建议类可丢");
+});
+
 // ---- 写入落空要有用户侧的出口 ----
 test("尝试写了没落盘时，结局里必须留下 writes_failed", () => {
   const loop = extractFn("_runAgenticLoop");
