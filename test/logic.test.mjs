@@ -29710,3 +29710,74 @@ test("纠正值的长度地板不许把四字母工具名挡在外面", () => {
     "地板还是 5 —— pnpm / yarn / bun / uv 这类最常见的纠正值全部存不进去");
   assert.match(src, /corrected\.length < 2/, "地板不见了或改成了别的值");
 });
+
+// ---- 返工配对：让日志里的 ✓ 诚实一点 ----
+//
+// ✓ 只表示「这一轮正常收尾了」，不表示东西做出来了 —— 源码渲染处的注释早就承认了这个洞。
+// 而这份日志每轮无条件注入：模型看见一串 ✓，学到的是「上次那么干是对的」，其中混着
+// 「其实没做出来」的那些，它学的是假的。
+// 唯一能不靠打分戳破它的执行事实：上一轮记了 ✓，你隔了没多久又提了同一件事。
+test("返工配对只认执行事实，宁可漏配也不错扣一个 ✓", () => {
+  const mark = load("_markReworkIfAny", {
+    _taskWords: load("_taskWords", { _EP_STOP: loadConst("_EP_STOP") }),
+    _taskSim: load("_taskSim", { _taskWords: load("_taskWords", { _EP_STOP: loadConst("_EP_STOP") }) }),
+    _REWORK_WINDOW_MS: loadConst("_REWORK_WINDOW_MS"),
+    _REWORK_SIM: loadConst("_REWORK_SIM"),
+  });
+  const ep = (ts, task, outcome) => ({ ts, task, outcome });
+  const pair = (prev, next) => { const eps = [{ ...prev }]; mark(eps, next); return eps[0]; };
+
+  // 该配的：隔得不久 + 同一件事 + 上一轮是 ✓
+  const hit = pair(ep("2026-08-20T10:00:00", "修登录跳转 auth", "success"),
+                   ep("2026-08-20T10:07:00", "修登录跳转 auth 还是不对", "failed"));
+  assert.ok(hit.reworkedAt, "隔 7 分钟又提同一件事没被配上 —— 这把尺子等于没有");
+  assert.match(String(hit.reworkPrompt), /还是不对/, "没把用户当时的原话带上");
+
+  // 不该配的三种。错扣一个 ✓ 比漏配严重得多：会让模型不敢再用一个本来对的做法。
+  assert.ok(!pair(ep("2026-08-20T10:00:00", "修登录跳转 auth", "success"),
+                  ep("2026-08-20T10:05:00", "写个 readme 文档", "failed")).reworkedAt,
+    "不相关的下一件事被当成了返工");
+  assert.ok(!pair(ep("2026-08-20T10:00:00", "修登录跳转 auth", "success"),
+                  ep("2026-08-20T12:30:00", "修登录跳转 auth", "failed")).reworkedAt,
+    "隔了两个半小时还配 —— 那是下一件事，不是返工");
+  assert.ok(!pair(ep("2026-08-20T10:00:00", "修登录跳转 auth", "failed"),
+                  ep("2026-08-20T10:05:00", "修登录跳转 auth", "failed")).reworkedAt,
+    "上一轮本来就记了 ✗，不存在「假 ✓」，不该再配");
+
+  // 阈值必须比「检索相似经验」那条严得多，否则会大面积错扣。
+  assert.ok(loadConst("_REWORK_SIM") > 0.3,
+    "相似度阈值太松，会把「接着往下做」误判成返工");
+
+  // 红线：**不许**拿它去改结局枚举（那个只认执行事实，「用户又提了一遍」是判断不是事实）。
+  const src = extractFn("_markReworkIfAny");
+  assert.doesNotMatch(src, /\.outcome\s*=[^=]/,
+    "拿返工去改 outcome 了 —— 那是 harness 替模型下结论，结局枚举只认执行事实");
+
+  // 渲染必须把两条事实**并列**给出，并带上用户原话；算出来了不拼进输出等于没做。
+  const journal = extractFn("_projectJournalBlock");
+  assert.match(journal, /e\.reworkedAt/, "日志没读返工事实");
+  assert.match(journal, /\$\{rework\}/, "返工事实算出来了却没拼进输出行");
+  assert.match(journal, /reworkPrompt/, "没把用户当时的原话一起显示 —— 配错时模型无从判断");
+});
+
+// 返工率：整套「内部迭代」里唯一一把能直接读出来的尺子。
+test("返工率按执行事实算，不需要谁打分", () => {
+  const rate = load("_reworkRate", {
+    _epLoad: (() => {
+      const eps = [];
+      for (let i = 0; i < 8; i++) eps.push({ outcome: "success", reworkedAt: i < 2 ? "x" : null });
+      eps.push({ outcome: "failed" }); // 失败轮不进分母
+      return () => eps;
+    })(),
+  });
+  const r = rate("/repo", 30);
+  assert.equal(r.total, 8, "分母必须只数 ✓ —— 失败轮本来就不是「假 ✓」");
+  assert.equal(r.reworked, 2);
+  assert.ok(Math.abs(r.rate - 0.25) < 1e-9);
+
+  // 光算出来不算数：必须真的进模型看得到的上下文，否则又是一条「算了没人读」。
+  const journal = extractFn("_projectJournalBlock");
+  assert.match(journal, /_reworkRate\(root, 30\)/, "返工率没接进项目日志 —— 算了没人读");
+  assert.match(journal, /\+ rrLine/, "算出来了却没拼进输出");
+  assert.match(journal, /rr\.reworked > 0/, "没有返工时也要说一句，那是噪音");
+});
