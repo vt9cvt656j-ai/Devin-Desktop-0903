@@ -33,10 +33,34 @@ import jsonWorker from "monaco-editor/esm/vs/language/json/json.worker?worker";
 import cssWorker from "monaco-editor/esm/vs/language/css/css.worker?worker";
 import htmlWorker from "monaco-editor/esm/vs/language/html/html.worker?worker";
 import tsWorker from "monaco-editor/esm/vs/language/typescript/ts.worker?worker";
-import { Terminal } from "@xterm/xterm";
-import { FitAddon } from "@xterm/addon-fit";
-import { WebglAddon } from "@xterm/addon-webgl";
-import { WebLinksAddon } from "@xterm/addon-web-links";
+// xterm 一族 456KB。它已经是独立 chunk，但**静态 import 会把它排进启动预取清单** ——
+// 终端从没打开过的用户，冷启动一样要付这份下载和解析。
+// 两个使用点（_openRemoteSshPanel / createTermTab）都在 async 函数里，用时再取即可。
+// 样式表留在静态导入里：几 KB，而且要保证终端一出现就是有样式的。
+let _xtermMod = null;
+async function _loadXterm() {
+  if (!_xtermMod) {
+    const [x, fit, webgl, links] = await Promise.all([
+      import("@xterm/xterm"),
+      import("@xterm/addon-fit"),
+      import("@xterm/addon-webgl"),
+      import("@xterm/addon-web-links"),
+      // 样式表也必须在这里取。vite.config 的 manualChunks 把「id 里含 @xterm」的模块一律
+      // 归进 xterm 这个 chunk —— CSS 也算 —— 于是顶部那行静态的 CSS import 会把整个 456KB
+      // 的 JS chunk 一起**静态拉住**。实测过：只把四个 JS import 改成动态、CSS 留在顶上，
+      // 启动时 xterm chunk 照样被请求（浏览器网络面板里数出来的）。
+      import("@xterm/xterm/css/xterm.css"),
+    ]);
+    _xtermMod = {
+      Terminal: x.Terminal,
+      FitAddon: fit.FitAddon,
+      WebglAddon: webgl.WebglAddon,
+      WebLinksAddon: links.WebLinksAddon,
+    };
+  }
+  return _xtermMod;
+}
+
 import "./styles/app.css";
 // shadcn 组件语汇层。必须排在 app.css 之后 —— 它是对现有组件选择器的重写，
 // 靠源码顺序（而不是 !important）取胜，颠倒顺序就整层失效。
@@ -44,7 +68,6 @@ import "./styles/shadcn.css";
 // React 岛：真正的 shadcn 组件（Radix 行为 + Tailwind）。这一行同时把 Tailwind 的
 // 样式带进来。控制台敲 showUIGallery() 看全部组件在当前配色下的样子。
 import "./ui/mount-gallery.jsx";
-import "@xterm/xterm/css/xterm.css";
 import { renderMarkdownInto, renderMarkdownStream, langLabel, monacoLang, langIcon } from "./markdown.js";
 import { ExtensionHost } from "./ext/host.js";
 import { createExtensionManager } from "./ext/manager.js";
@@ -9012,6 +9035,12 @@ let _envLoadTimer = null;
 let _modApiTimer = null;
 
 const _idleRun = (fn) => (window.requestIdleCallback || ((f) => setTimeout(f, 30)))(fn);
+// xterm 空闲预取：启动关键路径上不要它（456KB，终端没打开过的用户不该付），但也别让
+// 第一次开终端干等下载。放在 idle 里 —— 启动那阵子主线程本来就忙，这一下不和它抢。
+// **必须写在 _idleRun 定义之后**：写在上面会在模块顶层读到还没初始化的 const，
+// 抛 TDZ 被 try/catch 静默吞掉，预取从不发生（仓库里那条「顶层不能读未初始化 const」
+// 的守卫当场抓到过这一版）。
+_idleRun(() => { _loadXterm().catch(() => {}); });
 function _onFileOpened(model) {
   if (!model) return;
   // Defer identifier extraction so it runs AFTER the file paints — never block the open.
@@ -68495,6 +68524,7 @@ async function _openRemoteSshPanel(value, remoteRoot = "", password = "") {
 
   const hostEl = panelEl.querySelector("._sshTerm");
   const stateEl = panelEl.querySelector("._sshState");
+  const { Terminal, FitAddon, WebglAddon, WebLinksAddon } = await _loadXterm();
   const term = new Terminal({
     fontSize: 13,
     fontFamily: MONO_STACK,
@@ -71212,6 +71242,7 @@ async function createTermTab(customLabel, cwdOverride = "") {
   container.hidden = activeTermTab >= 0;
   termBody.appendChild(container);
 
+  const { Terminal, FitAddon, WebglAddon, WebLinksAddon } = await _loadXterm();
   const term = new Terminal({
     fontSize: 13,
     fontFamily: MONO_STACK,

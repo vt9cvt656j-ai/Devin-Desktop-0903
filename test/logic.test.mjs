@@ -16698,7 +16698,10 @@ test("closing a terminal before termOpen resolves reaps the late PTY without tou
   const create = load("createTermTab", {
     _dbgConsoleActive: false, _dbgConsoleEl: null, termTabs, termSeq: 0, rootPath: "/workspace",
     document: { createElement: () => container }, termBody: { appendChild() {} },
-    Terminal: FakeTerminal, FitAddon: FakeFitAddon, WebglAddon: FakeWebglAddon, WebLinksAddon: FakeWebLinksAddon,
+    // xterm 现在是懒加载的（456KB，终端没打开过的用户不该付），所以注入的是加载器本身。
+    _loadXterm: async () => ({
+      Terminal: FakeTerminal, FitAddon: FakeFitAddon, WebglAddon: FakeWebglAddon, WebLinksAddon: FakeWebLinksAddon,
+    }),
     termTheme: () => ({}),
     termResizeObserver: { observe() {} }, activeTermTab: -1, clearTermGhost() {}, backend,
     trackTermInput() {}, acceptTermGhost() {}, scheduleTermGhost() {}, switchTermTab() {},
@@ -16712,6 +16715,10 @@ test("closing a terminal before termOpen resolves reaps the late PTY without tou
   });
 
   const pending = create();
+  // xterm 现在是懒加载的，createTermTab 在建终端之前多了一个 await —— 账本登记因此晚一个
+  // 微任务（容器本身仍然是同步插进面板的，用户不会看到空白）。这条测试要验的是「termOpen
+  // 还没回来就关掉」，不是同步登记，所以等一拍再断言。
+  await Promise.resolve();
   assert.equal(termTabs.length, 1);
   const entry = termTabs[0];
   close(0);
@@ -17117,8 +17124,11 @@ test("a terminal that fails to start stays on screen with the reason", async () 
   const create = load("createTermTab", {
     _dbgConsoleActive: false, _dbgConsoleEl: null, termTabs, termSeq: 0, rootPath: "/workspace",
     document: { createElement: () => container }, termBody: { appendChild() {} },
-    Terminal: FakeTerminal, FitAddon: class { fit() {} },
-    WebglAddon: class { onContextLoss() {} dispose() {} }, WebLinksAddon: class {},
+    // 同上：注入懒加载器而不是四个类。
+    _loadXterm: async () => ({
+      Terminal: FakeTerminal, FitAddon: class { fit() {} },
+      WebglAddon: class { onContextLoss() {} dispose() {} }, WebLinksAddon: class {},
+    }),
     termTheme: () => ({}), termResizeObserver: { observe() {} }, activeTermTab: -1,
     clearTermGhost() {}, trackTermInput() {}, acceptTermGhost() {}, scheduleTermGhost() {},
     switchTermTab() {}, navigator: { platform: "MacIntel" }, _releaseTauriChannel() {},
@@ -30758,4 +30768,32 @@ test("冷启动第一句不许把记忆块和项目日志各注入两遍", () =>
   assert.match(extractFn("_gatherAgentContext"),
     /_agentContextForQuery\(baseContext, query \|\| "", root, undefined, undefined, _sizeState,/,
     "内层没有把身份根透传下去 —— 内外两层会取到两套不同的记忆");
+});
+
+// ---- xterm 456KB 不该压在启动关键路径上 ----
+//
+// 终端从没打开过的用户，冷启动一样要付这份下载和解析。两个使用点都在 async 函数里，
+// 用时再取即可。**CSS 也必须一起懒加载**：vite.config 的 manualChunks 把「id 里含 @xterm」
+// 的模块一律归进同一个 chunk —— CSS 也算 —— 所以只改 JS、CSS 留在顶上的话，那行静态的
+// CSS import 会把整个 456KB 的 JS chunk 一起静态拉住（实测过：改完 JS 之后启动仍然请求它）。
+test("xterm 一族一律懒加载，包括它的样式表", () => {
+  const top = SRC.slice(0, SRC.indexOf("\n// ---") > 0 ? 8000 : 8000);
+  assert.doesNotMatch(top, /^import \{[^}]*\} from "@xterm\//m,
+    "xterm 又被静态 import 了 —— 终端没打开过的用户也要付这 456KB");
+  assert.doesNotMatch(top, /^import "@xterm\/xterm\/css/m,
+    "样式表还是静态导入 —— manualChunks 会把它和 JS 归进同一个 chunk，等于没懒加载");
+  const loader = extractFn("_loadXterm");
+  for (const m of ["@xterm/xterm", "@xterm/addon-fit", "@xterm/addon-webgl",
+                   "@xterm/addon-web-links", "@xterm/xterm/css/xterm.css"]) {
+    assert.ok(loader.includes(`import("${m}")`), `${m} 没在懒加载器里`);
+  }
+  // 缓存住，别每次开终端都重新 import。
+  assert.match(loader, /if \(!_xtermMod\)/, "没缓存 —— 每开一个终端都会重新解析一遍");
+  // 两个使用点都要先 await 加载器。
+  const uses = [...SRC.matchAll(/const term = new Terminal\(\{/g)].map((m) => m.index);
+  assert.equal(uses.length, 2, "xterm 的使用点数量变了，这条断言要跟着更新");
+  for (const at of uses) {
+    assert.match(SRC.slice(Math.max(0, at - 200), at), /await _loadXterm\(\)/,
+      "有个使用点没先 await 懒加载器 —— 会 ReferenceError");
+  }
 });
