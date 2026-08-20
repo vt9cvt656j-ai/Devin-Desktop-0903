@@ -29313,6 +29313,26 @@ test("以点开头的目录/文件，相对路径要解析到它自己", () => {
   assert.doesNotMatch(fn, /replace\(\/\^\\\.\?\\\/\?\//, "点和斜杠都可选会把隐藏路径的点吃掉");
 });
 
+
+test("一条坏存档只丢它自己，而且不许覆盖完整的那份", () => {
+  // 用户原话：「重启软件 或者 重新打开软件的话，也应该正常加载上次的对话内容 要全部保留」。
+  // 恢复循环此前没有任何 try/catch：某条会话抛一次，整个 for 就断了，它后面的全部会话
+  // 一起消失，而外层 catch 把异常吞掉——用户看到内容少了一大截，还找不到报错。
+  const restore = extractFn("restoreChatHistory");
+  assert.match(restore, /for \(const sData of \(Array\.isArray\(saved\.sessions\)[\s\S]{0,80}?\n\s*try \{/,
+    "每条会话各自兜住异常");
+  assert.match(restore, /_restoreBroken\+\+/);
+  // 第二跳才是真正致命的：残缺状态一旦写回磁盘，临时读取失败就变成永久数据丢失。
+  assert.match(restore, /_chatArchiveIncomplete = true/);
+  assert.match(SRC, /if \(_chatArchiveIncomplete\) \{[\s\S]{0,400}?return;/,
+    "没完整读出来就不许写回主存档");
+  // 应急镜像照常写——它每次全量重建，不会把残缺状态固化。
+  const save = SRC.slice(SRC.indexOf("if (_chatArchiveIncomplete)"), SRC.indexOf("if (_chatArchiveIncomplete)") + 600);
+  assert.match(save, /localStorage 镜像照常写/);
+  // 而且要让用户知道，不能默默跳过。
+  assert.match(restore, /条会话存档读不出来/);
+});
+
 // ---- 写入落空要有用户侧的出口 ----
 test("尝试写了没落盘时，结局里必须留下 writes_failed", () => {
   const loop = extractFn("_runAgenticLoop");

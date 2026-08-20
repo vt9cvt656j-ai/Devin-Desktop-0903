@@ -15686,6 +15686,9 @@ let _chatSeq = 0; // monotonic counter for auto-naming so "Chat N" never repeats
 // button); the running loop tracks its own `session.streaming`.
 function _isStreaming() { return !!_currentSession()?.streaming; }
 const CHAT_STORE_KEY = "michael-ide.chat-sessions";
+/// 这次启动有没有完整读出聊天存档。为真时禁止把当前状态写回主存档——
+/// 残缺状态一旦覆盖上去，一次临时的读取失败就变成永久的数据丢失。
+let _chatArchiveIncomplete = false;
 const RECENT_PROJECTS_KEY = "michael-ide.recent-projects";
 const MAX_RECENT = 8;
 // localStorage is only the synchronous emergency mirror. Share one aggregate
@@ -17615,6 +17618,12 @@ async function _persistChatHistoryOnce(freshSnapshots, lightweightOnly = false) 
     closedSessions: fullClosedData,
     activeIdx: _activeChatIdx,
   };
+  if (_chatArchiveIncomplete) {
+    // 这次启动没能完整读出存档：写回去就是拿残缺状态覆盖完整的那份。
+    // localStorage 镜像照常写（它本来就是应急用的、每次全量重建），只跳过主存档。
+    console.warn("[chat] 存档未完整读出，跳过主存档写回以免覆盖");
+    return;
+  }
   try {
     const store = await loadStore("session.json");
     await store.set(CHAT_STORE_KEY, rich);
@@ -17751,7 +17760,17 @@ async function restoreChatHistory() {
         .slice(0, 80);
       const usedNames = new Set();
       let restoreSliceStart = Date.now();
+      // 一条坏存档只丢它自己。
+      //
+      // 这个 for 的循环体此前没有任何 try/catch：某条会话在 fromJSON / 字段读取里抛一次，
+      // 整个循环就断了，**它后面的全部会话一起消失**，而外层 catch 把异常吞掉——
+      // 用户看到的是「重开软件对话内容少了一大截」，还找不到任何报错。
+      //
+      // 更狠的是第二跳：残缺状态一旦进了 _chatSessions，下一次保存就把它写回磁盘，
+      // 于是一次**临时**的读取失败变成**永久**的数据丢失。所以下面还要拦住写回。
+      let _restoreBroken = 0;
       for (const sData of (Array.isArray(saved.sessions) ? saved.sessions : [])) {
+       try {
         // 大存档逐会话 fromJSON 也是同步长任务：每 50ms 让路一次，恢复期间 UI 可响应。
         if (Date.now() - restoreSliceStart >= _RENDER_SLICE_BUDGET_MS) {
           await new Promise((resolve) => setTimeout(resolve, 0));
@@ -17817,6 +17836,16 @@ async function restoreChatHistory() {
         session._pendingSends = _pendingSendsForStorage(sData.pendingSends);
         session._restored = true; // first time each restored tab is shown → jump to newest message
         _chatSessions.push(session);
+       } catch (err) {
+         _restoreBroken++;
+         console.warn("[chat] 一条会话存档读不出来，已跳过（其余照常恢复）:", err);
+       }
+      }
+      if (_restoreBroken) {
+        // 没能完整读出来 → 这一轮禁止把当前（残缺的）状态写回主存档，
+        // 否则一次临时读取失败就把那几条会话永久抹掉。
+        _chatArchiveIncomplete = true;
+        try { showToast(`有 ${_restoreBroken} 条会话存档读不出来，已跳过；为避免覆盖，本次不会写回存档`, { duration: 8000 }); } catch {}
       }
       // 中断草稿恢复：上次进程死在流式中途（dev 重载/崩溃/强退），流到一半的回复
       // 从未进过持久历史。查重后把残留草稿补成一条带标注的 assistant 消息落账，
