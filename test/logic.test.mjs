@@ -29157,3 +29157,45 @@ test("裁决迟到落定时，契约要真的送进对话，而不是只更新�
   assert.equal((SRC.match(/session-inherited/g) || []).length, 0,
     "session-inherited 全仓没有生产者，留着就是一句永不成立的说明");
 });
+
+// ---- 那道取证门建得挺完整，判据却永远为假 ----
+//
+// 首次落盘时有一道「取证告知（不拦截）」：工程语义要求外部参考却还没取证，就当场装载
+// package_search / github_repo / developer_community_search / web_search 的 schema 并推一条提醒。
+// 它的开关是 profile.needsOfficialResearch / needsCommunityResearch，而这两个全由分类器声明的
+// researchMode 决定。问题出在教分类器怎么填的那句话上：同段里 constraints / successCriteria /
+// ambiguities / restatedTask / researchTopics 都带判据，唯独 researchMode **只列了四个取值**，
+// 一个字的判据都没有——而 "none" 既是默认值又排在第一个。于是这道门的判据结构性地永远为假，
+// 表现就是用户说的「根本不看 github 和开发者社区，也不用主流的库，上去就开写」。
+test("researchMode 必须带判据，否则那道取证门永远不会触发", () => {
+  const line = SRC.split("\n").find((l) => l.includes("researchMode=none/official"));
+  assert.ok(line, "分类器的工程字段说明不见了");
+  const seg = /researchMode=none\/official\/community\/official_and_community([\s\S]*?)；designMode=/.exec(line);
+  assert.ok(seg, "researchMode 的说明段落对不上");
+  assert.ok(seg[1].length > 60,
+    "researchMode 又变回光列取值、没有判据了——分类器没有判据就会一直填 none（默认值+第一个选项），"
+    + "那道取证门的开关就永远为假");
+  // 判据必须点名「引入/升级依赖」和「选栈」这两个最常见的触发场景，否则等于没说。
+  // 断言挑的是**触发句自己**的字样，不是随便一个含「升级」的词——同段末尾那句
+  // 「不新增也不升级任何外部依赖」也含「升级」，用 /引入|升级/ 这种松写法会被它喂到。
+  assert.match(seg[1], /引入或升级/, "判据没点名「引入或升级依赖」这个最常见的触发场景");
+  assert.match(seg[1], /新项目选技术栈/, "判据没覆盖「起新项目选栈」");
+  assert.match(seg[1], /官方文档|注册表/, "判据没说清什么才算「官方事实来源」");
+  assert.match(seg[1], /还有没有人维护|主流做法|现成实现/,
+    "判据没覆盖社区那一档——用户抱怨的正是「不看开发者社区、不用主流的库」");
+  // 也必须写清什么时候**不用**查——否则普通任务会被联网门禁拖慢（本文件另有一条钉着这点）。
+  assert.match(seg[1], /才填 none/, "没说清什么时候该填 none，普通任务会被无谓拖慢");
+
+  // 开关到门的那条链要还在：researchMode → needs*Research → _missingResearchEvidence → 取证提醒。
+  assert.match(SRC, /m\.needsOfficialResearch = researchMode === "official" \|\| researchMode === "official_and_community";/,
+    "researchMode 到取证开关的映射断了");
+  const gate = extractFn("_missingResearchEvidence");
+  assert.match(gate, /profile\?\.needsOfficialResearch/, "取证门不再读官方取证开关");
+  assert.match(gate, /profile\?\.needsCommunityResearch/, "取证门不再读社区取证开关");
+  // 门必须按**执行事实**判「查过没有」，不能问模型自己说查没查过。
+  assert.match(gate, /evidence\?\.official instanceof Set/, "取证判据不是执行事实了");
+  const loop = extractFn("_runAgenticLoop");
+  assert.match(loop, /_missingResearchEvidence\(run\.engineering, _researchEvidence\)/,
+    "取证门在主循环里的调用点没了——门还在，但没人开");
+  assert.match(loop, /_pushNudge\("researchFirst"/, "取证提醒没了");
+});
