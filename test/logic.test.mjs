@@ -28771,3 +28771,32 @@ test("子体认定的纯只读类型，并行判据也必须认", () => {
   assert.deepEqual(missing, [],
     `这些类型本仓库自己认定只读（_READ_TYPES 里就有），却被并行判据漏掉、白白串行化：${missing.join(", ")}`);
 });
+
+// ---- 改完就该验：出声的时刻是「刚落盘那一下」，不是收尾 ----
+//
+// 收尾那道「改了代码、零验证证据」刻意只记账不补回合（两条测试钉着：模型安静一轮就是它的
+// 收尾判断，harness 不拿「缺席」去覆盖）。但那意味着**全程没有任何一处在正确的时刻出过声**：
+// 栈提示里那句「改完必须自己跑」是每轮都贴的静态文本，贴到模型不再看它；等到收尾才发现没验
+// 已经太晚——它那时已经认定做完了。
+test("刚改完代码且当前版本没验证证据时，推一条带具体命令的事实提醒", () => {
+  const loop = extractFn("_runAgenticLoop");
+  assert.match(loop, /_pushNudge\("verifyNow",/, "改完之后没有任何一处提醒去验");
+  // 判据必须是执行事实，不是猜：当前实现版本有没有验证证据。
+  assert.match(loop, /_verifiedAtImplOps < _implOps && _lastVerifyNudgeAtImplOps < _implOps/,
+    "判据不对——要按「当前实现版本未验证」且「这个版本还没提醒过」，否则要么不响要么每轮唠叨");
+  assert.match(loop, /verifyNudges < 2/, "没有上界，会变成每轮骚扰");
+  // 要给出这个项目**具体**的命令，不能只喊一句「去验证」。
+  assert.match(loop, /_stack\.checkCmd \|\| _stack\.testCmd/, "没有把项目真实的验证命令给出去");
+  assert.match(loop, /purpose="verify"/, "没告诉它怎么调才会被记成验证证据——不声明 purpose 就拿不到验证学分");
+  // 事实类：不能被建议类挤掉（本文件另一条用例钉着淘汰顺序）。
+  // 钉的是**那张表里有它**，不是"源码里出现过这个词"——`_pushNudge("verifyNow"` 本身就含这个
+  // 子串，按子串断言会被推送那行自己喂到（这一轮已经踩过一次同样的坑）。
+  const facts = new Set([...(/const _NUDGE_FACTS = new Set\(\[([\s\S]*?)\]\)/.exec(SRC)[1].matchAll(/"([a-zA-Z]+)"/g))].map((m) => m[1]));
+  assert.ok(facts.has("verifyNow"),
+    "verifyNow 没登记进事实类——会被一条「建议先调研」挤掉，而它是执行记账里的硬事实");
+  // **不许**在这里补回合：那是收尾门的红线，两条测试钉着。
+  const at = loop.indexOf('_pushNudge("verifyNow"');
+  assert.ok(at > 0);
+  assert.doesNotMatch(loop.slice(at, at + 400), /\bcontinue;/,
+    "在这里补回合就把「安静一轮＝模型的收尾判断」那条设计推翻了——这条提醒只给事实，不抢判断");
+});

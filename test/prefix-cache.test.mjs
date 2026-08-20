@@ -1139,7 +1139,12 @@ test("the loop stops advertising continuation machinery it does not have", () =>
   // true anywhere in the file.
   // Declarations and assignments, not every mention: the comment that records this deletion names
   // them, and a test that counts bare occurrences fails on its own explanation.
-  for (const dead of ["continueNudges", "effectNudges", "researchNudges", "verifyNudges",
+  // verifyNudges 从这张表里移出去了：它按本条断言自己的说法「delete it or wire it」被**接上了**
+  // ——不是在收尾处（那里只记账不补回合，两条测试钉着，是刻意的），而是在**刚落盘那一下**推
+  // 一条事实提醒：刚改了哪些文件、当前版本还没有任何验证证据、这个项目的验证命令是哪一条。
+  // 它不抢模型的收尾判断，只是在正确的时刻给事实；有界（每 run 2 次，且只在实现版本推进后
+  // 重新武装）。见下面 live 那一组。
+  for (const dead of ["continueNudges", "effectNudges", "researchNudges",
                       "honestyNudges", "deepReadNudges", "codeVerifyNudges"]) {
     assert.doesNotMatch(SRC, new RegExp("(?:let|const|var)[^\\n;]*\\b" + dead + "\\b"),
       `${dead} is declared and never used — delete it or wire it`);
@@ -1147,7 +1152,8 @@ test("the loop stops advertising continuation machinery it does not have", () =>
       `${dead} is written to but never read`);
   }
   // The ones that survived are the ones that actually fire.
-  for (const live of ["planGateNudges", "toolReminders", "recoveryNudges", "invalidArgNudges"]) {
+  for (const live of ["planGateNudges", "toolReminders", "recoveryNudges", "invalidArgNudges",
+                      "verifyNudges"]) {
     assert.ok((SRC.match(new RegExp("\\b" + live + "\\b", "g")) || []).length > 1, live);
   }
 });

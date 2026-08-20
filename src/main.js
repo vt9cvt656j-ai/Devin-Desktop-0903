@@ -47387,6 +47387,7 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
   // times we've AUTO-RUN the project's verify check (so it CONVERGES to green).
   let didInvestigate = false, didEdit = false, investigateNudged = false, planNudged = false, verifyRuns = 0;
   let buildFixAttempts = 0; // bounded red-build → fix → rerun loop (Cursor caps at 8; we allow 6)
+  let verifyNudges = 0, _lastVerifyNudgeAtImplOps = -1;
   let _verifiedAtImplOps = -1, _prevVerifyErrs = null, _noProgressVerify = 0; // auto-verify convergence state (re-verify after new edits; stop once errors stop dropping)
   let _verifyExhausted = false; // real verify budget genuinely spent (10 runs, or no check cmd after 2 nudges) → allow an honest finish even if later edits bump _implOps
   let _uiVerifiedAtImplOps = -1, uiVerifyNudges = 0, _browserViewportKind = "";
@@ -47504,6 +47505,8 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
   const _NUDGE_FACTS = new Set([
     "toolRepair", "cmdFail", "buildFix", "diag", "diagFinish", "bugEvidence",
     "blindEdit", "subagentResult", "recovery", "emptyHistoryFact",
+    // 「刚改完、这个版本还没验过」是执行记账里的硬事实，丢了模型就会照着"应该没问题"收尾。
+    "verifyNow",
   ]);
   const _nudgeRank = (cat) => (cat === "steer" ? 0 : _NUDGE_FACTS.has(cat) ? 1 : 2);
   const _pushNudge = (cat, content) => {
@@ -50060,6 +50063,45 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
         if (_blind.length) {
           blindEditNudges++;
           _pushNudge("blindEdit", `你改了 ${_blind.join("、")} 但**这个 run 里从没 read_file 读过它**——old_string 很可能和文件实际内容不匹配。规则：**edit 之前必须先 read_file**。如果刚才的 edit 报错了，先 read_file 读一遍原文、确认实际内容，再重新 edit。`);
+        }
+      }
+
+      // ── 改完就该验：在**刚改完那一下**说，不是等到收尾 ────────────────────────
+      //
+      // 收尾那道「改了代码、零验证证据」是**只记账、不补回合**的，而且被两条测试正面钉着
+      // （见下面 _codeDeliveredUnverified 那段注释）。那条设计是对的：模型安静一轮就是它的
+      // 收尾判断，harness 不该拿「缺席」去覆盖它。
+      //
+      // 但那意味着**从头到尾没有任何一处在正确的时刻出过声**。栈提示里那句「改完必须你自己
+      // 跑」是每轮都贴的静态文本，贴在哪一轮都一样、贴到模型不再看它；而收尾时才发现没验，
+      // 已经太晚——它那时已经认定做完了，逼它是对抗。
+      //
+      // 正确的时刻是**刚落盘的这一下**：它还在干活，这时候给的是事实不是命令，也不用抢它的
+      // 收尾判断。所以这里推一条事实类提醒（事实类不会被建议类挤掉），说清三件事：
+      // 刚改了哪些文件、当前这个版本还没有任何验证证据、这个项目的验证命令具体是哪一条。
+      //
+      // 有界：每个 run 最多 2 次，且只在**实现版本推进**之后才重新武装——同一个版本不重复
+      // 唠叨，改一次说一次。
+      if (verifyNudges < 2 && _live() && run.mode === "agent"
+          && _implOps > 0 && _verifiedAtImplOps < _implOps && _lastVerifyNudgeAtImplOps < _implOps) {
+        const _justChanged = items
+          .filter((it) => it.call && _WORKSPACE_MUTATING_TYPES.has(it.call.type) && it.call.path
+            && !/\[(ERROR|BLOCKED|DENIED)\]/.test((it.rawResult && it.rawResult.content) || ""))
+          .map((it) => String(it.call.path))
+          .filter((path) => _CODE_FILE_RE.test(path));
+        if (_justChanged.length) {
+          const _stack = _projectStacks.get(root) || {};
+          const _cmd = _stack.checkCmd || _stack.testCmd || "";
+          verifyNudges++;
+          _lastVerifyNudgeAtImplOps = _implOps;
+          _pushNudge("verifyNow",
+            `[未验证] 刚改了 ${[...new Set(_justChanged)].slice(0, 4).join("、")}`
+            + `${_justChanged.length > 4 ? ` 等 ${_justChanged.length} 个文件` : ""}，`
+            + `**当前这个版本还没有任何验证证据**。`
+            + (_cmd
+              ? `这个项目的验证命令是 \`${_cmd}\`——现在跑它（run_cmd，purpose="verify"），拿到退出码再往下走。`
+              : `跑一遍这个项目自己的编译/类型检查/测试；没有现成命令就用最直接的那条（能跑起来入口、或 tsc --noEmit 之类）。`)
+            + `没有任何东西会替你跑：不跑就交付，等于把没编译过的代码交给用户。`);
         }
       }
 
