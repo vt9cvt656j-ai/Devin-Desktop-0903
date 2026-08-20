@@ -53471,15 +53471,43 @@ function _dbResultToText(o) {
 // { "match": "run_cmd|write_file", "command": "sh .mrdayone/check.sh" }，命令收到一个
 // JSON 参数（tool/path/command）。
 let _hooksCache = { root: null, ts: 0, cfg: null };
+let _hooksParseWarned = "";
 async function _loadHooks(root) {
   if (!root || !inTauri) return null;
   const now = Date.now();
   if (_hooksCache.root === root && now - _hooksCache.ts < 15000) return _hooksCache.cfg;
   let cfg = null;
+  // 「没有这个文件」和「文件在、但读不懂」必须分开。
+  //
+  // 原来两者共用一个 catch：hooks.json 里多一个逗号 → JSON.parse 抛 → cfg = null →
+  // **整套 hook 静默失效**，一个字都不提示。用户写了条 pre_tool_use 拦 rm -rf，
+  // 以为防线在，实际早就没了。这是这个文件里唯一一处「静默失败会直接削掉一道安全防线」的地方。
+  let raw = null, _hooksRel = null;
   try {
-    const { text: raw, rel: _hooksRel } = await _readFirstExisting(root, _stateRels("hooks.json"));
+    const found = await _readFirstExisting(root, _stateRels("hooks.json"));
+    raw = found.text; _hooksRel = found.rel;
+  } catch {
+    // 没有 hooks.json —— 绝大多数工作区都是这样，照旧安静。
+    _hooksCache = { root, ts: now, cfg: null };
+    return null;
+  }
+  try {
     const hooksPath = root.replace(/\/+$/, "") + "/" + _hooksRel;
-    const j = JSON.parse(raw);
+    let j;
+    try {
+      j = JSON.parse(raw);
+    } catch (e) {
+      // 文件确实在，只是读不懂。这时候必须吵——沉默等于让用户以为防线还在。
+      // 按内容指纹去重，避免每 15 秒（缓存窗口）弹一次。
+      const _sig = `${root}|${String(raw).length}|${String(e && e.message || e).slice(0, 80)}`;
+      if (_hooksParseWarned !== _sig) {
+        _hooksParseWarned = _sig;
+        console.error("[hooks] parse failed:", _hooksRel, e);
+        showToast(`${_hooksRel} 格式有误，本工作区的 hooks 全部未生效：${String(e && e.message || e).slice(0, 80)}`, 8000);
+      }
+      _hooksCache = { root, ts: now, cfg: null };
+      return null;
+    }
     if (j && typeof j === "object") {
       // 这个文件跟着 git 仓库分发，内容却会被原样交给 shell —— 而且 hook 执行时
       // stepEl 传的是 null，界面上**看不到命令、看不到输出、没有终端卡片**。
