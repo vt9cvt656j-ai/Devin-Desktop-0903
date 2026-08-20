@@ -1391,7 +1391,7 @@ pub(crate) fn model_key(stored: &str) -> String {
     crate::field_crypto::decrypt(stored, MODEL_KEY_CTX).unwrap_or_default()
 }
 
-fn allowed_ids(m: &Model) -> Vec<String> {
+pub(crate) fn allowed_ids(m: &Model) -> Vec<String> {
     if !m.enabled_models.is_empty() {
         return m.enabled_models.clone();
     }
@@ -5402,6 +5402,26 @@ fn claude_generation(model_lower: &str) -> f64 {
 }
 
 fn anthropic_thinking(model: &str, effort: Option<&str>) -> Option<serde_json::Value> {
+    anthropic_thinking_with_display(
+        model,
+        effort,
+        std::env::var("MICHAEL_THINKING_DISPLAY").ok().as_deref(),
+    )
+}
+
+/// `anthropic_thinking` 的纯函数版：`display` 由调用方给，不读进程环境。
+///
+/// 分出来是因为**测试改进程环境会串台**。原来那条测试用 set_var/remove_var 验证
+/// 反悔开关，注释还写着「no other test reads this variable」——而每一个调用
+/// `anthropic_thinking` 的测试都读它。cargo test 默认多线程跑，于是它把
+/// MICHAEL_THINKING_DISPLAY=omitted 短暂灌给了并行的别的测试：实测 HEAD 上
+/// `cargo test thinking` 连跑 5 次全红，红的还不是它自己。
+/// 现在环境只在这一层读一次，判断逻辑本身可以被直接测，谁也不用改全局状态。
+fn anthropic_thinking_with_display(
+    model: &str,
+    effort: Option<&str>,
+    display_override: Option<&str>,
+) -> Option<serde_json::Value> {
     if std::env::var("MICHAEL_ANTHROPIC_THINKING").ok().as_deref() == Some("0") {
         return None;
     }
@@ -5500,8 +5520,7 @@ fn anthropic_thinking(model: &str, effort: Option<&str>) -> Option<serde_json::V
         // The downside is bounded: the failure this replaces is "no thinking text", and the worst
         // the old measurement predicts is "no thinking text". Set MICHAEL_THINKING_DISPLAY=omitted
         // to go back without shipping a build, and read thinking_utf8_chars to see which won.
-        let display = std::env::var("MICHAEL_THINKING_DISPLAY")
-            .unwrap_or_else(|_| "summarized".to_string());
+        let display = display_override.unwrap_or("summarized");
         if display == "omitted" || display.is_empty() {
             return Some(json!({"type":"adaptive"}));
         }
@@ -6021,6 +6040,9 @@ struct AnthToolStream {
 struct ThinkingStreamTelemetry {
     nonempty_thinking_deltas: u64,
     thinking_utf8_chars: usize,
+    /// 可见正文字符数。和 thinking_utf8_chars 一起，才能把「模型没思考」和「思考了但
+    /// 文本没回来」分开：前者 output_tokens ≈ 正文量，后者 output_tokens 远大于正文量。
+    visible_text_utf8_chars: usize,
     first_native_event_kind: &'static str,
     first_native_event_ms: Option<u64>,
     first_nonempty_thinking_delta_ms: Option<u64>,
@@ -6034,6 +6056,7 @@ impl Default for ThinkingStreamTelemetry {
         Self {
             nonempty_thinking_deltas: 0,
             thinking_utf8_chars: 0,
+            visible_text_utf8_chars: 0,
             first_native_event_kind: "absent",
             first_native_event_ms: None,
             first_nonempty_thinking_delta_ms: None,
@@ -6189,6 +6212,26 @@ impl AnthSse {
 
     fn thinking_telemetry(&self) -> ThinkingStreamTelemetry {
         self.thinking_telemetry
+    }
+
+    /// 诊断用：上游到底**开没开**思考块。
+    ///
+    /// 这是把「模型这一轮没思考」和「思考块开了但文本是空串（display 的问题）」分开的
+    /// 唯一判据 —— 两者的 thinking_utf8_chars 都是 0，日志里长得一模一样。线上 48 小时
+    /// 里 ~330 条零思考流一次 `thinking_swallowed_by_upstream` 都没触发，只能推断没开块，
+    /// 而推断不该当证据用：直接把它记下来。
+    fn saw_thinking_block(&self) -> bool {
+        self.saw_thinking_block
+    }
+
+    /// 诊断用：上游自报的输出 token 数。Anthropic 把思考算进 output_tokens，所以
+    /// 「output_tokens 远大于可见正文字符数」= 确实思考了、只是文本没回来。
+    fn output_tokens(&self) -> i64 {
+        self.output_tokens
+    }
+
+    fn stop_reason_label(&self) -> &str {
+        &self.stop_reason
     }
 
     fn validated_tool_arguments(&self, block: &AnthToolStream) -> Result<String, String> {
@@ -6365,6 +6408,8 @@ impl AnthSse {
                                     self.thinking_telemetry
                                         .first_nonempty_text_delta_ms
                                         .get_or_insert(event_elapsed_ms);
+                                    self.thinking_telemetry.visible_text_utf8_chars +=
+                                        t.chars().count();
                                 }
                                 self.saw_answer_block = true;
                                 self.ensure_role(&mut out);
@@ -7112,6 +7157,30 @@ pub async fn chat_completions(
                     beta_effort = candidate_anthropic_beta
                         .as_deref()
                         .is_some_and(|value| value.contains(ANTHROPIC_EFFORT_BETA)),
+                    // 请求**形状**（不是内容）。合成请求在这条线路上 89/89 都回了思考，
+                    // 而线上同模型同线路只有 ~15% —— 差别只可能在形状里。这几个字段是
+                    // 用来把那两群请求区分开的，全部是计数/枚举，不含任何提示词文本。
+                    messages_count = candidate_upstream_body
+                        .get("messages")
+                        .and_then(|m| m.as_array())
+                        .map_or(0, |m| m.len()),
+                    system_text_bytes = candidate_upstream_body
+                        .get("system")
+                        .map_or(0, body_text_bytes),
+                    tools_count = candidate_upstream_body
+                        .get("tools")
+                        .and_then(|t| t.as_array())
+                        .map_or(0, |t| t.len()),
+                    max_tokens = candidate_upstream_body
+                        .get("max_tokens")
+                        .and_then(|v| v.as_i64())
+                        .unwrap_or(0),
+                    step_kind = step_mode(&headers).unwrap_or_else(|| "absent".into()),
+                    step_tool_turn = step_is_tool_turn(&candidate_upstream_body)
+                        .map_or("unknown", |t| if t { "yes" } else { "no" }),
+                    compression_tier = compression_applied
+                        .as_ref()
+                        .map_or("none", |t| t.as_str()),
                     "thinking telemetry: native Anthropic request"
                 );
             }
@@ -7746,6 +7815,14 @@ pub async fn chat_completions(
                     thinking_utf8_chars = thinking.thinking_utf8_chars,
                     forwarded_reasoning_content_chunks = thinking.nonempty_thinking_deltas,
                     forwarded_reasoning_content_utf8_chars = thinking.thinking_utf8_chars,
+                    // 「零思考」的三种成因在旧日志里完全同形，靠这三个字段分开：
+                    //   saw_thinking_block=false            → 模型这一轮压根没思考
+                    //   =true 且 chars=0                    → 块开了、文本空（display 侧）
+                    //   =false 但 output_tokens >> 正文字符 → 思考了、整块都没回来
+                    saw_thinking_block = converter.saw_thinking_block(),
+                    visible_text_utf8_chars = thinking.visible_text_utf8_chars,
+                    upstream_output_tokens = converter.output_tokens(),
+                    stop_reason = converter.stop_reason_label(),
                     first_native_event_kind = thinking.first_native_event_kind,
                     first_native_event_total_ms = thinking.first_native_event_ms,
                     first_model_progress_total_ms = thinking.first_model_progress_ms(),
@@ -8487,7 +8564,8 @@ mod billing_tests {
         assert_eq!(usage.unwrap()["prompt_tokens"], 3);
     }
     use super::{
-        anthropic_beta_header, anthropic_effort_word, anthropic_thinking, anthropic_to_oai,
+        anthropic_beta_header, anthropic_effort_word, anthropic_thinking,
+        anthropic_thinking_with_display, anthropic_to_oai,
         body_text_bytes, upstream_capacity_wording, wants_1m_context, ANTHROPIC_1M_BETA_TEXT_BYTES,
         ANTHROPIC_CONTEXT_WITHOUT_1M_BETA_TOKENS,
         oai_to_anthropic_with_cache, chat_upstream_attempt_suffix,
@@ -10523,11 +10601,17 @@ mod billing_tests {
             );
         }
         // The escape hatch has to work, or the next person measuring is blocked on a deploy.
-        // SAFETY: single-threaded assertion block; no other test reads this variable.
-        unsafe { std::env::set_var("MICHAEL_THINKING_DISPLAY", "omitted") };
-        let reverted = anthropic_thinking("claude-opus-5", Some("high")).unwrap();
+        // 走纯函数版：改进程环境会漏给并行跑的其它测试（见 anthropic_thinking_with_display）。
+        let reverted =
+            anthropic_thinking_with_display("claude-opus-5", Some("high"), Some("omitted")).unwrap();
         assert!(reverted.get("display").is_none(), "the kill switch must actually revert");
-        unsafe { std::env::remove_var("MICHAEL_THINKING_DISPLAY") };
+        // 而且 env 这一层必须真的接在那个参数上，否则线上那个开关是死的。
+        let src = include_str!("models.rs");
+        let production = &src[..src.find("mod billing_tests").expect("tests module")];
+        assert!(
+            production.contains("std::env::var(\"MICHAEL_THINKING_DISPLAY\").ok().as_deref()"),
+            "kill switch must still be wired to the environment"
+        );
         // 4.6 takes the older explicit-budget branch, whose display default is already
         // summarized — it must NOT gain a display field.
         let t46 = anthropic_thinking("claude-opus-4-6", Some("high")).expect("4.6 requests thinking");
@@ -10954,6 +11038,50 @@ mod billing_tests {
         let production = &src[..src.find("mod billing_tests").expect("tests module")];
         assert!(production.contains("&& !thinking_went_missing &&"), "缓存判据没接上");
         assert!(production.contains("thinking_requested_but_none_returned()"), "探测没接上");
+    }
+
+    /// 「零思考」有三种成因，旧日志里它们**完全同形**（thinking_utf8_chars 都是 0）。
+    ///
+    /// 线上 48 小时：同一条线路、同一批模型，合成请求 89/89 都回了思考，真实 IDE 流量
+    /// 只有 ~15%。要往下查就必须先能分开这三种：
+    ///   · 模型这一轮压根没思考           → 没有 thinking 块
+    ///   · 块开了但文本是空串（display）  → 有 thinking 块、chars=0
+    ///   · 思考了但整块没回来（中转吞掉）→ 没有块，但 output_tokens 远大于可见正文
+    /// 前两种靠 saw_thinking_block 分，第三种靠 output_tokens vs 可见正文字符数分。
+    #[test]
+    fn zero_thinking_streams_are_distinguishable_by_block_and_token_evidence() {
+        // 一、没有 thinking 块：模型没思考。output_tokens 和正文量相称。
+        let mut none = AnthSse::new("claude-opus-5");
+        let _ = none.push(b"data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n").unwrap();
+        let _ = none.push("data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Release the lock.\"}}\n\n".as_bytes()).unwrap();
+        let _ = none.push(b"data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":6}}\n\n").unwrap();
+        assert!(!none.saw_thinking_block(), "没有 thinking 块就该报 false");
+        assert_eq!(none.thinking_telemetry().visible_text_utf8_chars, 17);
+        assert_eq!(none.output_tokens(), 6, "token 数要如实带出来");
+
+        // 二、块开了、文本是空串：display 侧的问题，不是「没思考」。
+        let mut empty = AnthSse::new("claude-opus-5");
+        let _ = empty.push(b"data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"\"}}\n\n").unwrap();
+        let _ = empty.push(b"data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"\"}}\n\n").unwrap();
+        assert!(empty.saw_thinking_block(), "块开了就必须是 true —— 这正是两者的分界");
+        assert_eq!(empty.thinking_telemetry().thinking_utf8_chars, 0);
+
+        // 可见正文只数**非空** text_delta，且按字符不按字节（中文一个字算一个）。
+        let mut cjk = AnthSse::new("claude-opus-5");
+        let _ = cjk.push(b"data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"\"}}\n\n").unwrap();
+        let _ = cjk.push("data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"a中\"}}\n\n".as_bytes()).unwrap();
+        assert_eq!(cjk.thinking_telemetry().visible_text_utf8_chars, 2);
+
+        // 三个字段必须真的进了那条日志，否则线上还是分不开 —— 这条修复就是空的。
+        let src = include_str!("models.rs");
+        let production = &src[..src.find("mod billing_tests").expect("tests module")];
+        for field in [
+            "saw_thinking_block = converter.saw_thinking_block()",
+            "visible_text_utf8_chars = thinking.visible_text_utf8_chars",
+            "upstream_output_tokens = converter.output_tokens()",
+        ] {
+            assert!(production.contains(field), "遥测没接上：{field}");
+        }
     }
 
     #[test]

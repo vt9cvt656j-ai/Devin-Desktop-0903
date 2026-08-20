@@ -217,16 +217,21 @@ fn canary_enabled() -> bool {
     std::env::var("ROUTE_CANARY").ok().as_deref() != Some("0")
 }
 
-/// 对一条线路发一次最小真实请求。返回 (成功, 状态码)。
-async fn canary_once(m: &crate::models::Model) -> (bool, u16) {
-    let http = match reqwest::Client::builder().timeout(CANARY_TIMEOUT).build() {
-        Ok(c) => c,
-        Err(_) => return (false, 0),
-    };
-    let Some(model_id) = m.enabled_models.first() else {
-        // 一个模型都没开的线路无从探起。不产生证据，也不产生结论。
-        return (true, 0);
-    };
+/// 对一条线路发一次最小真实请求。
+///
+/// 返回 `None` = **这一次没有产生任何证据**，调用方必须什么都不记。
+///
+/// 这个区分是必须显式表达的：第一版这里在「无从探起」时返回了 `(true, 0)`，而调用方看到
+/// `ok=true` 就 `record_ok` —— 凭空造了一次成功、把连败计数清零、点亮绿灯。注释当时写的是
+/// 「不产生证据，也不产生结论」，代码做的却是相反的事。这正是这套监控要消灭的东西
+/// （没有证据不许报绿），结果在它自己身上重演了一遍。
+///
+/// 探哪个模型要和**派单口径一致**（`allowed_ids`）：`enabled_models` 为空时派单会回落到
+/// `model_id`，那种线路照样在接真实流量，不能因为第一个字段是空的就当它不存在。
+async fn canary_once(m: &crate::models::Model) -> Option<(bool, u16)> {
+    let http = reqwest::Client::builder().timeout(CANARY_TIMEOUT).build().ok()?;
+    let ids = crate::models::allowed_ids(m);
+    let model_id = ids.first()?;
     let key = crate::models::model_key(&m.api_key);
     let base = crate::models::api_base(&m.base_url);
     let req = if m.protocol == "anthropic" {
@@ -250,10 +255,10 @@ async fn canary_once(m: &crate::models::Model) -> (bool, u16) {
     match req.send().await {
         Ok(r) => {
             let s = r.status().as_u16();
-            (r.status().is_success(), s)
+            Some((r.status().is_success(), s))
         }
         // 超时/连不上：和派单路径上的卡死是同一种坏，用同一个码，面板上读起来一致。
-        Err(_) => (false, 504),
+        Err(_) => Some((false, 504)),
     }
 }
 
@@ -488,14 +493,23 @@ pub fn spawn(state: AppState) {
                 // 有新鲜的真实流量就不探 —— 那是免费且更真实的证据。
                 if !fresh && canary_enabled() && probed < CANARY_MAX_PER_ROUND {
                     probed += 1;
-                    let (ok, status) = canary_once(m).await;
-                    if ok {
-                        record_ok(&state, m.id).await;
-                    } else {
-                        record_fail(&state, m.id, status).await;
+                    match canary_once(m).await {
+                        Some((ok, status)) => {
+                            if ok {
+                                record_ok(&state, m.id).await;
+                            } else {
+                                record_fail(&state, m.id, status).await;
+                            }
+                            tracing::info!(route = %m.label, ok, status, "线路探活（最小真实请求）");
+                            h = snapshot(&state, m.id).await;
+                        }
+                        // 无从探起（这条线路一个模型都没开）——什么都不记。
+                        // 记成功就是伪造证据，记失败就是诬告一条没被用到的线路。
+                        None => tracing::warn!(
+                            route = %m.label,
+                            "线路探活跳过：这条线路没有任何可用模型 id，本轮不产生证据"
+                        ),
                     }
-                    tracing::info!(route = %m.label, ok, status, "线路探活（最小真实请求）");
-                    h = snapshot(&state, m.id).await;
                 }
 
                 let word = classify(&h, now_secs());
@@ -690,6 +704,46 @@ mod tests {
             "起点没有落到持久存储上；存进程内存的话，发一次版就清零、蓝绿两版还各记各的",
         );
         assert!(head.contains("\"NX\""), "起点不是用 NX 写的，会被每轮刷新重置");
+    }
+
+    /// 「没东西可探」绝不能被记成一次成功。
+    ///
+    /// 第一版在这里返回 `(true, 0)`，调用方看到 ok=true 就 record_ok —— 凭空造一次成功、
+    /// 把连败清零、点亮绿灯。而 `enabled_models` 为空的线路**照样在接真实流量**
+    /// （派单的 allowed_ids 会回落到 model_id），所以它可以是真坏的。
+    /// 这正是这套监控要消灭的东西（没有证据不许报绿），当时在它自己身上重演了一遍。
+    #[test]
+    fn nothing_to_probe_must_not_be_recorded_as_success() {
+        let src = include_str!("route_health.rs");
+        let body = src
+            .split("async fn canary_once")
+            .nth(1)
+            .and_then(|s| s.split("\n// ").next())
+            .expect("canary_once 不见了");
+
+        assert!(
+            body.contains("-> Option<(bool, u16)>"),
+            "返回类型必须能表达「这一次没有证据」，否则调用方只能在成功和失败里二选一",
+        );
+        assert!(
+            !body.contains("return (true,"),
+            "又把「无从探起」当成功返回了——那是伪造证据",
+        );
+        // 探的模型必须和派单口径一致，否则会漏掉 enabled_models 为空、但正在接流量的线路。
+        assert!(
+            body.contains("allowed_ids"),
+            "探测用的模型 id 和派单不是同一个口径",
+        );
+
+        // 调用方必须对 None 什么都不记。
+        let loop_src = src
+            .split("pub fn spawn(")
+            .nth(1)
+            .expect("spawn 不见了");
+        assert!(
+            loop_src.contains("None =>") && !loop_src.contains("None => record_ok"),
+            "调用方没有为「没有证据」留一条什么都不做的分支",
+        );
     }
 
     /// `users.email` 并不保证是邮箱 —— 线上有个 admin 的值是用户名。
