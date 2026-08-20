@@ -30966,3 +30966,23 @@ test("五种「存在但读不了」不许被说成文件不存在", () => {
   assert.ok((SRC.match(/别改用 write_file|别再 find_files/g) || []).length >= 2,
     "没告诉模型别走那两条死路");
 });
+
+// ---- 抓到 0 字节不许写进缓存 ----
+//
+// 「搜索 → 打开原文」这条链断在几处，这是其中最狠的一处：抓到空串（跳转壳回 204、
+// 反爬页、服务端拒给正文）还把它缓存下来 —— 同一会话里第二次抓同一个 URL 直接返回
+// 缓存的空串，**连网络都不碰**。模型「再抓一次确认」这条自救路彻底断掉，
+// 只能得出「这一页就是空的」。
+test("空的抓取结果不进缓存，别把「再试一次」这条路堵死", () => {
+  const store = new Map();
+  const put = load("_webCachePut", { _agentWebCache: store });
+  put("https://a", "");
+  put("https://b", "   \n  ");
+  put("https://c", null);
+  assert.equal(store.size, 0, "空结果被缓存了 —— 下次再抓会直接返回空串，连网络都不碰");
+  put("https://d", "real content");
+  assert.equal(store.get("https://d"), "real content", "正常内容不该被拦住");
+  // 上限仍在。
+  for (let i = 0; i < 70; i++) put("k" + i, "x");
+  assert.ok(store.size <= 60, "缓存上限失效");
+});

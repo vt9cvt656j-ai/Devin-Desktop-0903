@@ -3462,6 +3462,15 @@ pub async fn web_fetch(url: String) -> Result<String, String> {
     if !status.is_success() {
         return Err(format!("HTTP {}", code));
     }
+    // 204/205 属于 2xx，但按定义**没有正文**。当成成功会返回空串，界面渲染成绿色的
+    // 「0 chars」，模型据此认为「这一页就是空的」—— 而真实原因往往是这个 URL 是个跳转壳
+    // （Bing 结果链接就是），或者服务端拒绝给内容。说出来，别装成成功。
+    if code == 204 || code == 205 {
+        return Err(format!(
+            "HTTP {code}（服务端明确表示没有正文）。这多半是个跳转/追踪链接，不是文章页 —— \
+             换成真实站点的地址再抓；如果这条 URL 来自搜索结果，用结果里给出的原始域名。"
+        ));
+    }
 
     let ct = resp
         .headers()
@@ -3536,6 +3545,66 @@ fn ddg_unwrap(href: &str) -> String {
     } else {
         String::new()
     }
+}
+
+/// Bing 的结果链接是跳转壳，不是真实站点。
+///
+/// 形如 `https://www.bing.com/ck/a?!&&&p=…&u=a1<base64url>&ntb=1`，而且 href 在 HTML 里是
+/// 实体转义过的（`&amp;`）。直接把它交给 web_fetch：实测 **HTTP 204、0 字节、0 次重定向**，
+/// 前端还把它渲染成绿色的 `0 chars` —— 模型以为「这一页就是空的」，整条
+/// 「搜索 → 打开原文」的链在这里断掉。
+///
+/// 只做实体解码也不够：解码后能拿到 200，但正文是一句 JS 跳转提示（65 字符），
+/// 过不了下游的长度门。必须把 `u=a1` 后面那段 base64url 解出来才是真实 URL。
+/// 实测：实时 HTML 里 10 条结果 10 条都是壳，解码后 10/10 全部还原成真实站点。
+///
+/// 解不出来时**回落到实体解码后的原 href，绝不返回空串** —— 调用处后面有
+/// `starts_with("http")` 过滤，返回空会把整条结果丢掉，比不解还糟。
+fn html_unescape_attr(s: &str) -> String {
+    s.replace("&amp;", "&")
+        .replace("&#38;", "&")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+}
+
+/// base64url 解码（无填充，`-`/`_` 字母表）。不引新依赖。
+fn base64url_decode(input: &str) -> Option<String> {
+    let mut bits: u32 = 0;
+    let mut nbits: u32 = 0;
+    let mut out: Vec<u8> = Vec::new();
+    for c in input.bytes() {
+        let v = match c {
+            b'A'..=b'Z' => c - b'A',
+            b'a'..=b'z' => c - b'a' + 26,
+            b'0'..=b'9' => c - b'0' + 52,
+            b'-' | b'+' => 62,
+            b'_' | b'/' => 63,
+            b'=' => break,
+            _ => return None,
+        } as u32;
+        bits = (bits << 6) | v;
+        nbits += 6;
+        if nbits >= 8 {
+            nbits -= 8;
+            out.push(((bits >> nbits) & 0xFF) as u8);
+        }
+    }
+    String::from_utf8(out).ok()
+}
+
+fn bing_unwrap(href: &str) -> String {
+    let decoded = html_unescape_attr(href);
+    if let Some(p) = decoded.find("u=a1") {
+        let enc = decoded[p + 4..].split('&').next().unwrap_or("");
+        if let Some(real) = base64url_decode(enc) {
+            if real.starts_with("http") {
+                return real;
+            }
+        }
+    }
+    decoded
 }
 
 fn parse_ddg_results(html: &str) -> Vec<(String, String, String)> {
@@ -3671,7 +3740,11 @@ fn search_client() -> Option<reqwest::Client> {
 /// an upstream error page or an accidentally unbounded response consume the
 /// process heap before the 8-second search deadline can take effect.
 async fn read_search_response_text(response: reqwest::Response) -> Result<String, reqwest::Error> {
-    if !response.status().is_success() {
+    // is_success() 放行整个 2xx，而 DuckDuckGo 的**反爬挑战页**回的是 202 —— 它有正文、
+    // 有 HTML，只是里面一条结果都没有。当成正常结果页去解析，得到 0 条，
+    // 和「这个词真的没搜到」不可区分。202/204/205 一律不当结果页。
+    let st = response.status().as_u16();
+    if !response.status().is_success() || st == 202 || st == 204 || st == 205 {
         return Ok(String::new());
     }
 
@@ -3991,7 +4064,8 @@ fn parse_bing(html: &str) -> Vec<(String, String, String)> {
                     let s2 = &s[g + 1..];
                     s2.find("</a>").map(|e| html_to_text(&s2[..e]))
                 })?;
-                Some((href, title))
+                // 解壳 + 实体解码：拿到真实站点 URL，否则整条「搜索 → 打开原文」的链是断的。
+                Some((bing_unwrap(&href), title))
             })
             .unwrap_or_default();
         let snippet = region
@@ -4174,5 +4248,55 @@ mod web_fetch_redirect_tests {
         // 注释和代码要对得上：原来写着 "no redirects" 而代码在跟 5 跳（这条对**原文**判断）
         let stale_doc = format!("/// no {}), bounds time/size", "redirects");
         assert!(!raw.contains(&stale_doc), "注释还在说不跟重定向");
+    }
+}
+
+
+#[cfg(test)]
+mod bing_unwrap_tests {
+    use super::{base64url_decode, bing_unwrap, html_unescape_attr};
+
+    /// Bing 的结果链接是跳转壳。直接交给 web_fetch 得到 HTTP 204 / 0 字节，
+    /// 整条「搜索 → 打开原文」的链在这里断掉。
+    #[test]
+    fn bing_wrapper_urls_unwrap_to_the_real_site() {
+        // 真实形态：href 在 HTML 里是实体转义的，u=a1 后面是无填充的 base64url。
+        let real = "https://doc.rust-lang.org/book/ch10-01-syntax.html";
+        let enc = {
+            // 就地编码一份，避免把长串写死进测试
+            const T: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+            let b = real.as_bytes();
+            let mut o = String::new();
+            for c in b.chunks(3) {
+                let n = (c[0] as u32) << 16
+                    | (*c.get(1).unwrap_or(&0) as u32) << 8
+                    | (*c.get(2).unwrap_or(&0) as u32);
+                let take = c.len() + 1;
+                for i in 0..take {
+                    o.push(T[((n >> (18 - i * 6)) & 63) as usize] as char);
+                }
+            }
+            o
+        };
+        let href = format!("https://www.bing.com/ck/a?!&amp;&amp;&amp;p=abc&amp;u=a1{enc}&amp;ntb=1");
+        assert_eq!(bing_unwrap(&href), real, "跳转壳没解开 —— web_fetch 会拿到 204 / 0 字节");
+
+        // 解不出来时回落到实体解码后的原 href，**绝不返回空串**：
+        // 调用处后面有 starts_with("http") 过滤，返回空会把整条结果整个丢掉，比不解还糟。
+        let bad = "https://www.bing.com/ck/a?p=1&amp;u=a1@@@notbase64@@@&amp;ntb=1";
+        let got = bing_unwrap(bad);
+        assert!(got.starts_with("http"), "解不出来时返回了空串，整条结果会被丢掉");
+        assert!(!got.contains("&amp;"), "实体没解码");
+
+        // 本来就是真实 URL 的（有些结果不走壳）原样通过。
+        assert_eq!(bing_unwrap("https://example.com/a?x=1&amp;y=2"), "https://example.com/a?x=1&y=2");
+    }
+
+    #[test]
+    fn base64url_decoder_handles_unpadded_and_rejects_garbage() {
+        assert_eq!(base64url_decode("aGVsbG8").as_deref(), Some("hello"), "无填充要能解");
+        assert_eq!(base64url_decode("aGVsbG8=").as_deref(), Some("hello"), "带填充也要能解");
+        assert!(base64url_decode("@@@").is_none(), "垃圾输入必须返回 None，不能吐半截字符串");
+        assert_eq!(html_unescape_attr("a&amp;b&quot;c"), "a&b\"c");
     }
 }

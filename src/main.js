@@ -35735,6 +35735,12 @@ async function _hideControlGlow() {
 // Bounded LRU-ish put: evict the oldest entry past the cap so a long session of
 // web_fetch/web_search can't grow this cache without limit.
 function _webCachePut(key, val) {
+  // **空结果不进缓存。**
+  //
+  // 抓到 0 字节（跳转壳回 204、反爬页、服务端拒给正文）时把空串缓存下来，会让
+  // 「再抓一次确认」这条自救路彻底断掉：同一会话里第二次抓同一个 URL 直接返回缓存的空串，
+  // 连网络都不碰。模型只能得出「这一页就是空的」。取不到就别记，让它下次真的再试一次。
+  if (!String(val || "").trim()) return;
   _agentWebCache.set(key, val);
   if (_agentWebCache.size > 60) _agentWebCache.delete(_agentWebCache.keys().next().value);
 }
