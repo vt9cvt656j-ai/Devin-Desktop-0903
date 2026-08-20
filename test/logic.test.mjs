@@ -1585,11 +1585,17 @@ test("empty-root explore helpers classify telemetry without entering the executo
 // 真实就绪状态，且 #9 的自动 ready 检测只对 run_in_terminal 生效，验证形同虚设。
 test("#54 timeout-wrapped dev server is stripped, recognized as a service, and steered to run_in_terminal", () => {
   const stripTimeout = load("_stripTimeoutWrapper");
-  const looksLikeService = load("_looksLikeServiceCommand");
-  // 最终触发谓词：跟 run_cmd 分支里一致（剥出内层命令 && 内层是服务型）。
+  // 触发谓词换成**精确**的那个。原来用的 _looksLikeServiceCommand 判据里有个裸词 `run`，
+  // 把 `npm run <任何脚本>` 整片吃掉（lint / typecheck / migrate 全被拒绝执行），
+  // 同时又漏判 vite / http.server / nodemon 这些真服务 —— 过宽和过窄同时存在。
+  // 「不重造判定」这条意图不变：复用的仍是仓库现成的谓词，只是换了更合适的那个。
+  const _startsServer54 = load("_commandStartsLongRunningServer", {
+    _LONG_RUNNING_HEADS: loadConst("_LONG_RUNNING_HEADS"),
+    _LONG_RUNNING_PAIRS: loadConst("_LONG_RUNNING_PAIRS"),
+  });
   const timeoutWrappedService = (cmd) => {
     const inner = stripTimeout(cmd);
-    return !!inner && looksLikeService(inner);
+    return !!inner && _startsServer54(inner);
   };
 
   // ---- _stripTimeoutWrapper：剥离各种 timeout 形式，取出内层命令 ----
@@ -1613,6 +1619,16 @@ test("#54 timeout-wrapped dev server is stripped, recognized as a service, and s
   assert.equal(timeoutWrappedService("timeout 30 npm run build"), false, "build 不是服务型");
   assert.equal(timeoutWrappedService("timeout 5 sleep 1"), false, "sleep 不是服务型");
   assert.equal(timeoutWrappedService("timeout 10 curl http://localhost:3000"), false, "curl 不是服务型");
+  // 误伤：这五条以前全被拒绝执行，回执还谎称「你用 timeout 包住了 dev server」。
+  for (const cmd of ["timeout 60 npm run lint", "timeout 60 npm run typecheck",
+                     "timeout 60 npm run migrate", "timeout 30 bash scripts/run-tests.sh",
+                     "timeout 60 make run-tests"]) {
+    assert.equal(timeoutWrappedService(cmd), false, `${cmd} 不是服务，不该被拒绝执行`);
+  }
+  // 漏判：这三条是真服务，以前放行了。
+  for (const cmd of ["timeout 30 vite", "timeout 30 python3 -m http.server", "timeout 30 nodemon app.js"]) {
+    assert.equal(timeoutWrappedService(cmd), true, `${cmd} 是真服务，应当引导去 run_in_terminal`);
+  }
   // 裸 npm run dev（无 timeout）不走新分支，交给既有长命令门
   assert.equal(timeoutWrappedService("npm run dev"), false, "裸命令不归新分支，由既有 isLongRunning 门拦");
 
@@ -1640,8 +1656,8 @@ test("#54 timeout-wrapped dev server is stripped, recognized as a service, and s
   assert.ok(idxTimeout > 0, "run_cmd 分支应接入 timeoutWrappedService");
   assert.ok(idxLong > 0, "isLongRunning 分支应保留");
   assert.ok(idxTimeout < idxLong, "timeoutWrappedService 分支必须在 isLongRunning 之前，否则被它遮蔽");
-  assert.match(SRC, /const timeoutWrappedService = !!_innerAfterTimeout && _looksLikeServiceCommand\(_innerAfterTimeout\);/,
-    "必须复用 #9 的 _looksLikeServiceCommand，不重造判定");
+  assert.match(SRC, /const timeoutWrappedService = !!_innerAfterTimeout && _commandStartsLongRunningServer\(_innerAfterTimeout\);/,
+    "必须复用现成的精确谓词，不重造判定；也不能退回那个裸词 run 会吃掉 npm run 全家的宽谓词");
   assert.match(SRC, /\[工具选择\][^"]*run_in_terminal/, "引导文案必须指向 run_in_terminal");
 });
 
@@ -30832,4 +30848,68 @@ test("xterm 一族一律懒加载，包括它的样式表", () => {
     assert.match(SRC.slice(Math.max(0, at - 200), at), /await _loadXterm\(\)/,
       "有个使用点没先 await 懒加载器 —— 会 ReferenceError");
   }
+});
+
+// ---- 命令跑通了不许判成没跑通 ----
+//
+// 退出码是执行事实，文案匹配只是兜底（函数头上的注释早就这么写了）—— 但代码里文案匹配
+// 排在退出码**前面**。于是命令 exit 0、只要输出里有方括号包着的 ERROR/失败（nginx 日志、
+// logback、Go log、测试自己打的错误日志、甚至 harness 上一轮注入的报错行），整次调用被判失败：
+// 计划那步不推进、purpose:"verify" 不盖章、收尾门一直要你再验一次。
+// read_logs 更死：它的唯一用途就是取回含错误的日志 —— 取证被判失败 → 取证证据不成立 →
+// 硬拦首次修改并指名叫模型去用 read_logs 取证 → 再被判失败。死循环。
+test("退出码优先于文案；日志类工具的正文里出现 ERROR 是内容不是结局", () => {
+  const succeeded = load("_toolExecutionSucceeded", {
+    _WORKSPACE_MUTATING_TYPES: new Set(["write", "edit"]),
+    _toolFailureMatch: load("_toolFailureMatch"),
+    _toolFailureMarkerAtHead: load("_toolFailureMarkerAtHead"),
+  });
+  const cases = [
+    ["命令 exit 0、输出含 [ERROR] 日志行", { type: "cmd" },
+      { code: 0, content: "2026-08-20T10:00:01Z [ERROR] connect ECONNREFUSED\n[INFO] retrying" }, true],
+    ["命令 exit 1", { type: "cmd" }, { code: 1, content: "boom" }, false],
+    // 没有退出码的三种 cmd 结果（空命令 / 只读子体被拦 / 子体超时）仍要靠文案兜底。
+    ["cmd 无退出码 + 首行 [BLOCKED]", { type: "cmd" }, { content: "[BLOCKED] 只读子体不许跑命令" }, false],
+    ["read_logs 取回含 [ERROR] 的日志", { type: "logs" },
+      { content: "〔外部数据〕\n2026-08-20 [ERROR] nginx upstream timed out\nmore" }, true],
+    ["read_logs 自己失败（首行标记）", { type: "logs" }, { content: "[ERROR] 读不到任何日志" }, false],
+    ["读终端：正文含 ERROR", { type: "termread" }, { content: "$ npm test\n[ERROR] 1 failing\n" }, true],
+    // 反向：别的工具的失败标记出现在正文中段，仍然必须判失败（不许全局锚行首）。
+    ["写文件失败、标记在正文中段", { type: "write" },
+      { content: "写入 a.ts\n[CONFLICT] file was created by another task" }, false],
+  ];
+  for (const [name, call, res, want] of cases) {
+    assert.equal(succeeded(call, res), want, name);
+  }
+  // 顺序本身要钉住：退出码那一行必须在文案匹配之前。
+  const src = extractFn("_toolExecutionSucceeded")
+    .split("\n").filter((l) => !l.trim().startsWith("//")).join("\n");
+  const codeAt = src.indexOf('call.type === "cmd" && Number.isFinite(Number(result.code))');
+  const proseAt = src.indexOf("const _failed =");
+  assert.ok(codeAt > 0 && proseAt > 0 && codeAt < proseAt,
+    "文案匹配又排到退出码前面去了 —— 跑通的命令会被判成没跑通");
+});
+
+// ---- 后台配了 dall-e-3，生图三件套却说「没有生图模型」 ----
+//
+// _autoImageModel 只认名字带 gpt-image 的。用户配了 dall-e-3 / flux / seedream / SD /
+// gemini-*-image 任一个，generate_image / visual_explain / design_board 全部拒绝，
+// 系统提示词还反过来教模型「generate_image 暂不可用，用 picsum 占位」。
+// 而同一个文件里，用户手动选中 dall-e-3 时走的是同一条后端路径、照常工作 ——
+// 后端本来就是模型无关的。
+test("生图模型白名单认得住主流生成模型，也别把「看图」模型当成能画图的", () => {
+  const src = extractFn("_autoImageModel");
+  const pick = (ids) => new Function("MODEL_GROUPS", `${src}\nreturn _autoImageModel;`)(
+    [{ models: ids.map((id) => ({ id })) }])();
+  assert.equal(pick(["gpt-4o", "dall-e-3"]), "dall-e-3", "配了 dall-e-3 仍然说没有生图模型");
+  assert.equal(pick(["gpt-4o", "flux-1.1-pro"]), "flux-1.1-pro");
+  assert.equal(pick(["seedream-4"]), "seedream-4");
+  assert.equal(pick(["stable-diffusion-3.5"]), "stable-diffusion-3.5");
+  assert.equal(pick(["gemini-3-pro-image"]), "gemini-3-pro-image");
+  // 优先级不许乱：gpt-image 系列在前。
+  assert.equal(pick(["dall-e-3", "gpt-image-2"]), "gpt-image-2", "优先级乱了");
+  // 反向两条，比正向更要紧：
+  assert.equal(pick(["gpt-4o", "claude-opus-5"]), "", "没有生图模型时必须照旧拒绝");
+  assert.equal(pick(["gpt-4o-image-understanding", "qwen-vl-image"]), "",
+    "把「看图」模型当成能画图的了 —— 真被选中会三端点依次撞墙、熬满超时");
 });

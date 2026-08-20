@@ -24278,7 +24278,27 @@ function _isImageModel(id) {
 function _autoImageModel() {
   try {
     const all = MODEL_GROUPS.flatMap((g) => g.models.map((m) => m.id));
-    return all.find((id) => /gpt-image-2/i.test(id)) || all.find((id) => /gpt-image/i.test(id)) || "";
+    const pick = (re) => all.find((id) => re.test(id));
+    // 只认 gpt-image 是不对的：后台配了 dall-e-3 / flux / seedream / SD / gemini-*-image
+    // 任一个，三个生图工具（generate_image / visual_explain / design_board）全部拒绝，
+    // 说「后台模型列表里没有生图模型」，系统提示词还反过来教模型用 picsum 占位。
+    // 而同一个文件里，用户在模型选择器里**手动选中** dall-e-3 时走的是同一条后端路径，
+    // 照常工作 —— 后端本来就是模型无关的（三端点依次试，没有任何 gpt-image 硬编码）。
+    //
+    // 这里是**接受**过滤器，所以必须逐族点名，不能借用那个「是不是图像模型」的判据：
+    // 那个是**拒绝**过滤器（误判成真是安全方向），拿来当接受用就把方向倒过来了 ——
+    // 它对 gpt-4o-image-understanding / qwen-vl-image / llava-image 也返回真，
+    // 那些是「看图」不是「画图」，真被选中会三端点依次撞墙、最长熬满超时。
+    return pick(/gpt-image-2/i)
+      || pick(/gpt-image/i)
+      || pick(/dall-?e/i)
+      || pick(/\bflux\b/i)
+      || pick(/seedream/i)
+      || pick(/imagen|midjourney/i)
+      || pick(/stable.?diffusion|sdxl|sd-?3\b/i)
+      || pick(/kolors|cogview/i)
+      || pick(/gemini[\w.-]*-image\b|grok[\w.-]*-image\b/i)
+      || "";
   }
   catch { return ""; }
 }
@@ -27387,7 +27407,20 @@ async function _agentRunInTerminal(root, command, stepEl, explicitTimeoutSecs) {
     // 同一套 _looksLikeServiceCommand 判服务型（不重造判定）；timeout 包住 test/build/curl/
     // sleep 等非服务命令不命中，不误伤。
     const _innerAfterTimeout = _stripTimeoutWrapper(cmd);
-    const timeoutWrappedService = !!_innerAfterTimeout && _looksLikeServiceCommand(_innerAfterTimeout);
+    // 这里必须用**精确**谓词，不能用 _looksLikeServiceCommand。
+    //
+    // 后者的判据是 /\b(?:dev|serve|start|preview|run)\b/ —— 那个裸词 `run` 把
+    // `npm run <任何脚本>` 整片吃掉：`timeout 60 npm run lint` / `typecheck` / `migrate` /
+    // `timeout 30 bash scripts/run-tests.sh` 全被**拒绝执行**，回执还谎称「你用 timeout
+    // 包住了 dev server」，并把模型指向 run_in_terminal —— 而那条路对一次性命令拿不到退出码，
+    // 还会带 [ERROR] 被判失败、文案又指回 run_cmd，来回弹。
+    // 同一个判据还**漏判**真服务：timeout 30 vite / python3 -m http.server / nodemon app.js 都不命中。
+    // 过宽和过窄同时存在。
+    //
+    // 不动 _looksLikeServiceCommand 本体：它另一个调用点是 ready 轮询，那里过宽只多轮询
+    // 十几秒，代价极小 —— 它本来就是个「宁滥勿缺才合算」的谓词，只是被搬到了这个
+    // 「宁缺勿滥才合算」的位置上。
+    const timeoutWrappedService = !!_innerAfterTimeout && _commandStartsLongRunningServer(_innerAfterTimeout);
     // Fast-path reading a file: `cat` (Unix) or `type` (Windows) → read directly.
     const isCatCmd = /^\s*cat\s/.test(cmd) || (_win && /^\s*type\s/.test(cmd));
 
@@ -41071,6 +41104,12 @@ function _toolCategoryOf(toolName, callType) {
   if (/^lsp/.test(k)) return "lsp";
   return "other";
 }
+// 只认**首行**的方括号失败标记。给日志/终端读取用：它们的正文是别人写的日志，
+// 正文里的 [ERROR] 是内容不是结局。允许前面有 〔外部数据〕 抬头和空白。
+function _toolFailureMarkerAtHead(content) {
+  const head = String(content || "").replace(/^\s*〔外部数据〕\s*/, "").split("\n", 1)[0] || "";
+  return /^\s*\[[^\]\n]{0,80}(失败|ERROR|BLOCKED|CONFLICT|DENIED|NEEDS_REPO|不可用|未执行|权限问题|interrupted)[^\]\n]{0,80}\]/i.test(head);
+}
 function _toolFailureMatch(content) {
   const text = String(content || "");
   return text.match(/\[[^\]\n]{0,80}(失败|ERROR|BLOCKED|CONFLICT|DENIED|NEEDS_REPO|不可用|未执行|权限问题|interrupted)[^\]\n]{0,80}\]/i)
@@ -41275,9 +41314,25 @@ function _toolExecutionSucceeded(call, result) {
   if (result.ok === false) return false;
   if (result?.evidence?.resultKind === "duplicate" || result?.mutated === false && _WORKSPACE_MUTATING_TYPES.has(call.type)) return false;
   const content = String(result.content || "");
-  if (_toolFailureMatch(content)) return false;
-  if (/\[已合并\]|内容未变化|\(.*内容未变化\)/.test(content)) return false;
+  // **退出码优先于文案。** 顺序反了会把成功判成失败：
+  // 命令 exit 0，只要输出里有方括号包着的 ERROR/失败（nginx 日志、logback、Go log、
+  // 测试自己打的错误日志、甚至 harness 上一轮注入的报错行），整次调用就被判失败 ——
+  // 计划那步不推进、purpose:"verify" 不盖章、收尾门一直要你再验一次。
+  // 退出码是执行事实，文案匹配只是**兜底**（注释在函数头上已经这么写了，代码没照做）。
+  // Number.isFinite 守卫必须留：空命令、只读子体的 [BLOCKED]、子体超时这三种 cmd 结果
+  // 不带 code，那些仍然要靠文案兜底。
   if (call.type === "cmd" && Number.isFinite(Number(result.code))) return Number(result.code) === 0;
+  // 日志/终端读取的正文**本来就是别人写的日志**，里面出现 [ERROR] 是它的内容，不是它的结局。
+  // read_logs 的唯一用途就是取回含错误的日志，按正文判失败会死循环：取证被判失败 →
+  // 取证证据不成立 → 硬拦首次修改并指名叫模型去用 read_logs 取证 → 再被判失败。
+  // 这两类只认**首行**的方括号标记（允许 〔外部数据〕 抬头）。
+  // 不全局锚行首：browser 批量 / git / write 那批喂进来的是已格式化文本，全局锚定会让
+  // 真失败漏判，比现在更糟。
+  const _failed = (call.type === "logs" || call.type === "termread")
+    ? _toolFailureMarkerAtHead(content)
+    : _toolFailureMatch(content);
+  if (_failed) return false;
+  if (/\[已合并\]|内容未变化|\(.*内容未变化\)/.test(content)) return false;
   if (call.type === "http" || call.type === "tor") {
     const status = Number(result.status);
     return result.ok === true && Number.isFinite(status) && status >= 200 && status < 400;
