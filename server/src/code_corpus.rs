@@ -1030,9 +1030,135 @@ pub async fn seed(db: sqlx::PgPool, per_term: usize, max_packages: usize) -> Res
     Ok(())
 }
 
-/// 文档仓库的下载上限。比包大得多——一份官方文档站动辄几十 MB，
-/// 但一次预热只下一遍，之后是本地检索。
-const MAX_DOC_TARBALL_BYTES: u64 = 80 * 1024 * 1024;
+/// 文档仓库的下载超时。
+///
+/// 不是 30 秒能下完的量级：mdn/content 是 53 MB，实测从境外拉要 4 分钟。
+/// 上一版整套用同一个 30 秒超时，于是 MDN **每次都在下载途中被掐**，
+/// 台账里记的是「read docs tarball」——看着像网络抖动，其实是我自己的超时。
+const DOC_HTTP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(900);
+
+/// 流式解包时允许流过的总字节数。
+///
+/// 和「整份读进内存」的上限不是一回事：这里的字节是**流过**，不是**占住**——
+/// 内存只被下面那个有界通道占着（≈8 MB），所以这个数可以给得大方些。
+const MAX_DOC_STREAM_BYTES: u64 = 400 * 1024 * 1024;
+
+/// 把异步字节流桥接成同步 `Read`。
+///
+/// tar 和 flate2 都是同步接口，而 reqwest 给的是异步流。整份 `.bytes().await` 下来最简单，
+/// 但那意味着 195 MB 的 tailwind 要**整个占住内存**才能开始解包。
+/// 用一个有界通道把两边接起来：下载在异步任务里推，解包在 spawn_blocking 里拉，
+/// 内存占用就被通道容量钉死，和仓库大小无关。
+struct ChannelReader {
+    rx: std::sync::mpsc::Receiver<std::io::Result<bytes::Bytes>>,
+    cur: bytes::Bytes,
+    pos: usize,
+}
+
+impl std::io::Read for ChannelReader {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        loop {
+            if self.pos < self.cur.len() {
+                let n = (self.cur.len() - self.pos).min(buf.len());
+                buf[..n].copy_from_slice(&self.cur[self.pos..self.pos + n]);
+                self.pos += n;
+                return Ok(n);
+            }
+            match self.rx.recv() {
+                Ok(Ok(chunk)) => {
+                    self.cur = chunk;
+                    self.pos = 0;
+                }
+                Ok(Err(e)) => return Err(e),
+                // 发送端关闭 = 流正常结束。tar 见到 EOF 自己收尾。
+                Err(_) => return Ok(0),
+            }
+        }
+    }
+}
+
+/// 流式下载 + 解包，只留下 `prefix` 下的 markdown。
+///
+/// 返回 (文件列表, 流过的字节数)。内存占用与仓库大小无关——由通道容量决定。
+async fn stream_docs_tarball(
+    client: &reqwest::Client,
+    url: &str,
+    prefix: &str,
+) -> Result<(Vec<(String, String)>, u64)> {
+    use futures_util::StreamExt;
+
+    if !host_allowed(url) {
+        return Err(anyhow!("doc host not allowed"));
+    }
+    let resp = client
+        .get(url).send().await.context("start docs download")?
+        .error_for_status().context("docs download returned an error status")?;
+
+    // 容量 8：每块通常 8~64 KB，所以驻留内存是几百 KB 级，和 195 MB 的仓库无关。
+    let (tx, rx) = std::sync::mpsc::sync_channel::<std::io::Result<bytes::Bytes>>(8);
+    let counted = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let counted_tx = counted.clone();
+
+    let pump = tokio::spawn(async move {
+        let mut stream = resp.bytes_stream();
+        while let Some(chunk) = stream.next().await {
+            match chunk {
+                Ok(b) => {
+                    let total = counted_tx
+                        .fetch_add(b.len() as u64, std::sync::atomic::Ordering::Relaxed)
+                        + b.len() as u64;
+                    if total > MAX_DOC_STREAM_BYTES {
+                        let _ = tx.send(Err(std::io::Error::other("docs tarball over the stream cap")));
+                        return;
+                    }
+                    // 接收端提前收工（解包出错/够了）时 send 会失败——停下即可。
+                    if tx.send(Ok(b)).is_err() {
+                        return;
+                    }
+                }
+                Err(e) => {
+                    let _ = tx.send(Err(std::io::Error::other(e.to_string())));
+                    return;
+                }
+            }
+        }
+    });
+
+    let prefix_owned = prefix.to_string();
+    let files = tokio::task::spawn_blocking(move || -> Result<Vec<(String, String)>> {
+        let reader = ChannelReader { rx, cur: bytes::Bytes::new(), pos: 0 };
+        let gz = flate2::read::GzDecoder::new(reader);
+        let mut archive = tar::Archive::new(gz);
+        let mut out = Vec::new();
+        for entry in archive.entries().context("read docs tar")? {
+            let mut entry = entry.context("bad docs tar entry")?;
+            if !entry.header().entry_type().is_file() { continue; }
+            let path = entry.path().context("bad docs entry path")?.to_string_lossy().to_string();
+            // GitHub tarball 顶层是 `<repo>-<ref>/`，剥掉再比路径。
+            let rel = match path.split_once('/') { Some((_, r)) => r.to_string(), None => continue };
+            if !rel.starts_with(&prefix_owned) { continue; }
+            let lower = rel.to_ascii_lowercase();
+            if !(lower.ends_with(".md") || lower.ends_with(".mdx")) { continue; }
+            if entry.header().size().unwrap_or(0) as usize > MAX_ENTRY_BYTES { continue; }
+            let mut buf = String::new();
+            if std::io::Read::read_to_string(&mut entry, &mut buf).is_err() { continue; }
+            out.push((rel, buf));
+            if out.len() > MAX_DOC_FILES { break; }
+        }
+        Ok(out)
+    })
+    .await
+    .context("docs untar task panicked")??;
+
+    // 解包可能提前 break，pump 会因为 send 失败自己退出；这里只是收尸。
+    pump.abort();
+    let bytes = counted.load(std::sync::atomic::Ordering::Relaxed);
+    Ok((files, bytes))
+}
+
+/// 一个文档源最多取多少个 markdown 文件。MDN 有好几万个，全收会把这张表灌爆。
+const MAX_DOC_FILES: usize = 12000;
+
 
 /// 官方文档源。
 ///
@@ -1048,9 +1174,8 @@ const MAX_DOC_TARBALL_BYTES: u64 = 80 * 1024 * 1024;
 /// 检索结果能一路追回原文出处（这些内容各有各的许可，出处必须留着）。
 ///
 /// (语料名, 仓库, 分支, 只取这个路径下的)
-/// 注意：`nodejs/node`（整个 Node 源码仓，200MB+）和 `mdn/content`（更大）**不在**清单里。
-/// 它们的文档很有价值，但为了 doc/api 那一小块去拉整仓既撞上限又浪费带宽——
-/// 等抽取改成流式解包（边下边丢弃不要的条目）再收。
+/// MDN 和 Node 现在收得进来了：抽取改成流式之后，内存占用与仓库大小无关，
+/// 而且文档专用的长超时不会再把大仓掐在半路（实测 mdn/content 53 MB、要几分钟）。
 const DOC_SOURCES: &[(&str, &str, &str, &str)] = &[
     ("react",      "reactjs/react.dev",           "main", "src/content/"),
     ("vue",        "vuejs/docs",                  "main", "src/"),
@@ -1061,6 +1186,11 @@ const DOC_SOURCES: &[(&str, &str, &str, &str)] = &[
     ("astro",      "withastro/docs",              "main", "src/content/docs/en/"),
     ("prisma",     "prisma/docs",                 "main", "content/"),
     ("fastapi",    "fastapi/fastapi",             "master", "docs/en/docs/"),
+    // Web 平台那一整块：JS / CSS / HTML / HTTP / Web API。前端问题里占比最大的一块，
+    // 而且是唯一权威出处。files/ 下是示例资源，只取 web/ 的正文。
+    ("mdn",        "mdn/content",                 "main", "files/en-us/web/"),
+    // Node 官方 API 文档。整仓是 Node 源码，流式解包只留 doc/api/ 那几十个 markdown。
+    ("node",       "nodejs/node",                 "main", "doc/api/"),
 ];
 
 /// markdown 按 `##` 切节 —— 和手写语料库同一套切法，切出来的每一节都能独立读懂。
@@ -1129,43 +1259,16 @@ pub async fn ingest_doc_source(
     prefix: &str,
 ) -> Result<IngestReport> {
     let url = format!("https://codeload.github.com/{repo}/tar.gz/refs/heads/{git_ref}");
-    if !host_allowed(&url) {
-        return Err(anyhow!("doc host not allowed"));
-    }
-    let client = http()?;
-    let resp = client
-        .get(&url).send().await.context("download docs tarball")?
-        .error_for_status().context("docs tarball returned an error status")?;
-    let bytes = resp.bytes().await.context("read docs tarball")?;
-    if bytes.len() as u64 > MAX_DOC_TARBALL_BYTES {
-        return Err(anyhow!("docs tarball is {} bytes, over the cap", bytes.len()));
-    }
-    let downloaded = bytes.len() as u64;
-
-    let prefix_owned = prefix.to_string();
-    let files = tokio::task::spawn_blocking(move || -> Result<Vec<(String, String)>> {
-        let gz = flate2::read::GzDecoder::new(std::io::Cursor::new(bytes));
-        let mut archive = tar::Archive::new(gz);
-        let mut out = Vec::new();
-        for entry in archive.entries().context("read docs tar")? {
-            let mut entry = entry.context("bad docs tar entry")?;
-            if !entry.header().entry_type().is_file() { continue; }
-            let path = entry.path().context("bad docs entry path")?.to_string_lossy().to_string();
-            // GitHub 的 tarball 顶层是 `<repo>-<ref>/`，剥掉再比路径。
-            let rel = match path.split_once('/') { Some((_, r)) => r.to_string(), None => continue };
-            if !rel.starts_with(&prefix_owned) { continue; }
-            let lower = rel.to_ascii_lowercase();
-            if !(lower.ends_with(".md") || lower.ends_with(".mdx")) { continue; }
-            if entry.header().size().unwrap_or(0) as usize > MAX_ENTRY_BYTES { continue; }
-            let mut buf = String::new();
-            if entry.read_to_string(&mut buf).is_err() { continue; }
-            out.push((rel, buf));
-            if out.len() > 6000 { break; }
-        }
-        Ok(out)
-    })
-    .await
-    .context("docs untar task panicked")??;
+    // 文档仓单独一个客户端：包那套 30 秒超时下不完一份文档站。
+    // mdn/content 是 53 MB，实测拉一次要几分钟——上一版就是被自己的超时掐掉的，
+    // 而台账里记成「read docs tarball」，看着像网络抖动。
+    let client = reqwest::Client::builder()
+        .timeout(DOC_HTTP_TIMEOUT)
+        .user_agent("michael-ide-code-corpus/1.0")
+        .build()
+        .context("build docs http client")?;
+    // 流式解包：内存占用由通道容量决定，和仓库大小无关。
+    let (files, downloaded) = stream_docs_tarball(&client, &url, prefix).await?;
 
     let mut written = 0usize;
     for (rel, body) in &files {
@@ -1456,6 +1559,42 @@ declare function notExported(): void;
         // 空查询要能安全地退化成「什么都不匹配」，而不是拼出坏语法。
         assert_eq!(or_form("   "), "");
         assert_eq!(or_form("!!! ???"), "");
+    }
+
+    #[test]
+    fn the_stream_bridge_reassembles_chunks_and_reports_errors() {
+        use std::io::Read;
+        // tar/flate2 是同步接口，reqwest 给的是异步流。桥接错了会静默地把包解坏，
+        // 所以这里把三件事钉死：跨块拼接、EOF、错误传播。
+        let (tx, rx) = std::sync::mpsc::sync_channel::<std::io::Result<bytes::Bytes>>(4);
+        tx.send(Ok(bytes::Bytes::from_static(b"hello "))).unwrap();
+        tx.send(Ok(bytes::Bytes::from_static(b"world"))).unwrap();
+        drop(tx);
+        let mut r = ChannelReader { rx, cur: bytes::Bytes::new(), pos: 0 };
+        let mut s = String::new();
+        r.read_to_string(&mut s).unwrap();
+        assert_eq!(s, "hello world", "跨块内容必须原样拼回来");
+
+        // 一次 read 只给一小段时，剩下的要留着下次接着给（不能丢）。
+        let (tx, rx) = std::sync::mpsc::sync_channel::<std::io::Result<bytes::Bytes>>(4);
+        tx.send(Ok(bytes::Bytes::from_static(b"abcdef"))).unwrap();
+        drop(tx);
+        let mut r = ChannelReader { rx, cur: bytes::Bytes::new(), pos: 0 };
+        let mut two = [0u8; 2];
+        assert_eq!(r.read(&mut two).unwrap(), 2);
+        assert_eq!(&two, b"ab");
+        let mut rest = String::new();
+        r.read_to_string(&mut rest).unwrap();
+        assert_eq!(rest, "cdef", "块内剩余部分不能丢");
+
+        // 发送端报错要变成 Read 错误，而不是被当成正常 EOF —— 否则半份包会被当完整包解。
+        let (tx, rx) = std::sync::mpsc::sync_channel::<std::io::Result<bytes::Bytes>>(4);
+        tx.send(Ok(bytes::Bytes::from_static(b"partial"))).unwrap();
+        tx.send(Err(std::io::Error::other("boom"))).unwrap();
+        drop(tx);
+        let mut r = ChannelReader { rx, cur: bytes::Bytes::new(), pos: 0 };
+        let mut buf = Vec::new();
+        assert!(r.read_to_end(&mut buf).is_err(), "中途出错必须报错，不能当 EOF");
     }
 
     #[test]
