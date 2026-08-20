@@ -3418,7 +3418,7 @@
     "type": "function",
     "function": {
       "name": "read_screen",
-      "description": "Read the accessibility elements the frontmost native application actually exposes (role, name, value, whether it is enabled, and screen coordinates). When the result is empty you must report honestly that permission is missing or that the application exposes no elements. ocr=true is a macOS on-screen text-recognition fallback; an OCR ref is not an actionable AX node.",
+      "description": "Read the accessibility elements the frontmost application actually exposes (role, name, value, whether it is enabled, and screen coordinates). **A browser is one of those applications, and its tree includes the rendered page** — links, buttons, form fields and text, each with real screen coordinates. That is how you operate the user's own already-running browser, the one CDP cannot attach to: bring it to the front, read it here, then click and type by these coordinates. When the result is empty, do not guess why — the tool names the cause (missing permission / the read did not complete / every window minimized / the app genuinely exposes nothing). Only the last one means a retry is pointless; the rest are fixable, usually by bringing the window to the front and reading again. ocr=true is a macOS on-screen text-recognition fallback; an OCR ref is not an actionable AX node.",
       "parameters": {
         "type": "object",
         "properties": {
