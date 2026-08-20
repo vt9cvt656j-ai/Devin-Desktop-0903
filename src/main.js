@@ -45880,6 +45880,29 @@ function _latestHistoricalImageAttachments(memory) {
 // Build the message that feeds screenshots/images back to the model — natively
 // (image blocks) for vision models, or as transcribed TEXT for text-only models.
 async function _buildImageFeedback(imgs, config, leadText, perImageHint) {
+  // 工具结果里的图从来没过消毒。用户拖进来的附件走 _attachmentImageInputs，那条路
+  // 一直在调 _downscaleImageForVision；工具这条路（screenshot / view_image /
+  // ui_extract / read_screen）是把原始 data URL 直接塞进 image_url。
+  // 两个后果：
+  //  ① view_image 收 .svg，回来的是 data:image/svg+xml —— 三家视觉接口一个都不收。
+  //     图被丢掉，而工具回执写着「图已回传给你看」，模型照着那句话编视觉结论。
+  //  ② 4K 截图的 base64 有五到十兆，撞上载荷上限被整块剥掉，同样是"以为看过了"。
+  const _visionImgs = [];
+  let _visionDropped = 0;
+  for (const u of Array.isArray(imgs) ? imgs : []) {
+    const _s = await _downscaleImageForVision(u, 1568, true);
+    if (_s) _visionImgs.push(_s); else _visionDropped++;
+  }
+  // 丢了就得说。悄悄少给一张，模型只会以为那张图不存在，而不是「我没看到」。
+  const _dropNote = _visionDropped
+    ? `\n（有 ${_visionDropped} 张图没能转成模型可读的格式，**你没有看到它们**——`
+      + `别对这些图下任何结论；需要的话让用户导出成 png 再看。）`
+    : "";
+  if (!_visionImgs.length) {
+    return { role: "user", content: `${leadText}${_dropNote}\n实际一张图都没能送进来，别假装看过。` };
+  }
+  imgs = _visionImgs;
+  leadText = `${leadText}${_dropNote}`;
   if (_modelSeesImages(config && config.model)) {
     const content = [{ type: "text", text: leadText }];
     for (const u of imgs) content.push({ type: "image_url", image_url: { url: u } });
@@ -70043,7 +70066,14 @@ function _attachmentLocationEvidenceContext(attachment) {
 // else JPEG. Small images pass through untouched (best fidelity). Never throws.
 function _downscaleImageForVision(dataUrl, maxDim = 1568, stripMetadata = false) {
   return new Promise((resolve) => {
-    const decodeFallback = () => resolve(stripMetadata ? "" : dataUrl);
+    // SVG 必须栅格化：三家视觉接口（OpenAI / Anthropic / Gemini）都不收
+    // image/svg+xml，原样送过去要么整条请求报错、要么被悄悄丢掉。
+    // 这个标志原来在 onload 里才算，而**结尾那行又把栅格结果扔了**：
+    // `out.length < dataUrl.length ? out : dataUrl` —— SVG 是文本，几乎永远比它
+    // 自己的 PNG 小，于是每次都退回原来那份 SVG。强制栅格化写了，等于没写。
+    // 栅格失败时也不能退回 SVG：那是一张模型看不了的图，宁可当作没有。
+    const needsRaster = String(dataUrl).startsWith("data:image/svg+xml");
+    const decodeFallback = () => resolve(stripMetadata || needsRaster ? "" : dataUrl);
     try {
       const img = new Image();
       img.onload = () => {
@@ -70052,7 +70082,6 @@ function _downscaleImageForVision(dataUrl, maxDim = 1568, stripMetadata = false)
           const long = Math.max(w, h);
           if (!long) return decodeFallback();
           // Already small enough → keep original bytes.
-          const needsRaster = String(dataUrl).startsWith("data:image/svg+xml");
           if (!stripMetadata && !needsRaster && long <= maxDim && String(dataUrl).length < 1_300_000) return resolve(dataUrl);
           const scale = long > maxDim ? maxDim / long : 1;
           const cw = Math.max(1, Math.round(w * scale)), ch = Math.max(1, Math.round(h * scale));
@@ -70063,7 +70092,10 @@ function _downscaleImageForVision(dataUrl, maxDim = 1568, stripMetadata = false)
           cx.drawImage(img, 0, 0, cw, ch);
           let out = cv.toDataURL("image/png");
           if (out.length > 1_500_000) out = cv.toDataURL("image/jpeg", 0.9); // bound big/photographic
-          resolve(stripMetadata ? (out || "") : (out && out.length < String(dataUrl).length ? out : dataUrl));
+          // needsRaster 时不比大小：比出来的结论一定是「SVG 更小」，而 SVG 送过去没用。
+          resolve(stripMetadata || needsRaster
+            ? (out || "")
+            : (out && out.length < String(dataUrl).length ? out : dataUrl));
         } catch { decodeFallback(); }
       };
       img.onerror = decodeFallback;

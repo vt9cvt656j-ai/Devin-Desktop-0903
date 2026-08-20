@@ -31316,3 +31316,42 @@ test("生成类资产：后端认出扩展名不对时，回执必须把这句�
   assert.match(wrong.content, /⚠ 上游返回的其实是 zip/,
     "后端已经认出文件不是 glb，这句却没转给模型");
 });
+
+// view_image 收 .svg，返回的是 data:image/svg+xml —— OpenAI / Anthropic / Gemini
+// 三家视觉接口一个都不收。而工具结果这条路从来没过消毒（用户拖进来的附件那条一直有），
+// 于是图被丢掉，工具回执却写着「图已回传给你看」，模型照着那句话编视觉结论。
+test("送给模型的图必须先消毒：SVG 要栅格化，送不进去的要说出来", async () => {
+  // ① _downscaleImageForVision：needsRaster 时不许退回原来那份 SVG。
+  //    原来结尾写的是 `out.length < dataUrl.length ? out : dataUrl`，
+  //    而 SVG 是文本、几乎永远比它自己的 PNG 小 —— 强制栅格化写了等于没写。
+  const src = extractFn("_downscaleImageForVision");
+  assert.match(src, /const needsRaster = String\(dataUrl\)\.startsWith\("data:image\/svg\+xml"\)/);
+  // 只看**结尾那次 resolve**：decodeFallback 那行长得很像，用整份源码匹配会被它顶掉。
+  const tail = src.slice(src.indexOf("let out = cv.toDataURL"));
+  assert.match(tail, /resolve\(stripMetadata \|\| needsRaster/,
+    "栅格化的结果又被大小比较扔了 —— SVG 是文本，几乎永远比它自己的 PNG 小，每次都会退回原样");
+  assert.match(src, /const decodeFallback = \(\) => resolve\(stripMetadata \|\| needsRaster \? "" : dataUrl\)/,
+    "SVG 解码失败时退回了 SVG —— 那是一张模型看不了的图");
+
+  // ② _buildImageFeedback：每张图都要过消毒，丢掉的必须报出来。
+  const build = load("_buildImageFeedback", {
+    _modelSeesImages: () => true,
+    _downscaleImageForVision: async (u) => (u.startsWith("data:image/svg+xml") ? "" : u + "#clean"),
+    _describeImageForTextModel: async () => "",
+  });
+
+  const ok = await build(["data:image/png;base64,AAA"], { model: "m" }, "看图", "hint");
+  assert.deepEqual(ok.content[1], { type: "image_url", image_url: { url: "data:image/png;base64,AAA#clean" } },
+    "工具结果里的图没过消毒 —— 4K 截图会撞上载荷上限被整块剥掉");
+
+  const mixed = await build(
+    ["data:image/png;base64,AAA", "data:image/svg+xml;base64,BBB"], { model: "m" }, "看图", "hint");
+  assert.equal(mixed.content.filter((c) => c.type === "image_url").length, 1);
+  assert.match(mixed.content[0].text, /有 1 张图没能转成模型可读的格式/,
+    "悄悄少给一张，模型只会以为那张图不存在，而不是「我没看到」");
+  assert.match(mixed.content[0].text, /你没有看到它们/);
+
+  const none = await build(["data:image/svg+xml;base64,BBB"], { model: "m" }, "看图", "hint");
+  assert.equal(typeof none.content, "string");
+  assert.match(none.content, /一张图都没能送进来，别假装看过/);
+});
