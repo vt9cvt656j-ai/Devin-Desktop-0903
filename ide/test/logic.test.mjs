@@ -28900,6 +28900,17 @@ test("收尾评审判定没实现要求时,结论落进运行状态并变成一�
   assert.ok(iDir < iCont,
     "「方向反了」排在「接着继续」后面会被名额挤掉，也拿不到输入框那条灰字预测");
 
+  // 假绿灯：跑过验证、退出成功，但评审读了真实输出说没证明结果。这条只在两边**打架**时
+  // 出现——记账自己就知道没验的那些另有 code_delivered_unverified 拦着，不该在这里重复。
+  const fg = gen({ _lastRunState: { outcome: "success", task: "x", updatedAt: now,
+    wrapUp: { instruction: "", direction: "", findings: [], falseGreen: true } } })
+    .find((c) => /没真的证明/.test(c.label));
+  assert.ok(fg, "假绿灯没出口——跑了个证明不了结果的命令却算验过，正是项目被写烂的来法");
+  assert.match(fg.send, /哪一条要求/, "没要求说清这次要证明的是哪条，重验还是会白验");
+  assert.ok(!gen({ _lastRunState: { outcome: "success", task: "x", updatedAt: now,
+    wrapUp: { instruction: "", direction: "", findings: [], falseGreen: false } } })
+    .some((c) => /没真的证明/.test(c.label)), "两边不打架时不该冒这张卡");
+
   // 落进运行状态那一步。
   const persist = /wrapUp: \(\(\) => \{([\s\S]*?)\}\)\(\),/.exec(SRC);
   assert.ok(persist, "运行状态里没有 wrapUp——评审结论根本到不了卡片那一层");
@@ -28916,8 +28927,12 @@ test("收尾评审判定没实现要求时,结论落进运行状态并变成一�
   assert.ok(persistCap >= criticCap,
     `评审最多给 ${criticCap} 条，落进运行状态只留 ${persistCap} 条——剩下的悄悄丢了`);
   // 三样都空时不许留一个空壳,否则卡片层要靠猜。
-  assert.match(persist[1], /instruction \|\| direction \|\| findings\.length/,
+  assert.match(persist[1], /instruction \|\| direction \|\| findings\.length \|\| falseGreen/,
     "空结论也落了,会弹出一张点了没用的卡");
+  // 假绿灯的判据必须是**分歧**：评审说没证明 + 记账说验过了 + 这一轮真改过东西。
+  // 少任何一项都会把「本来就知道没验」的情况重复报一遍。
+  assert.match(persist[1], /v\.verified === false && verificationPassed === true && didMutate === true/,
+    "假绿灯的判据不是分歧了——会和 code_delivered_unverified 那条路重复报");
   // done 通过并不代表 direction/findings 该被吞掉——它们按设计不参与 done。
   assert.doesNotMatch(persist[1], /if \(!v \|\| v\.done/,
     "又拿 done 把 direction/findings 一起挡掉了,那两样按设计和 done 无关");
