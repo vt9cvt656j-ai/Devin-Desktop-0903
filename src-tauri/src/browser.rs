@@ -1382,7 +1382,21 @@ pub async fn browser_click(selector: String) -> Result<BrowserState, String> {
                 }
                 let _ = first_err;
             }
-            Err(_) => {}
+            Err(reason) => {
+                // 只有「真找不到元素」才允许降级到坐标兜底。
+                //
+                // click_via_eval / type 的失败是有内容的：disabled …／not_visible …／covered by …，
+                // 而这里原来是 `Err(_) => {}` 全吞掉，然后照样按坐标操作——被 cookie 横幅或模态
+                // 遮罩盖住时，那一下作用在遮罩上，工具却报成功。模型于是换五种选择器重试，
+                // 而真正该做的是先关掉遮罩；disabled 时该做的是先满足启用它的前置条件。
+                // 把原文带回去，这三种情形模型自己就判得出下一步。
+                let r = reason.trim().to_string();
+                if r.starts_with("disabled") || r.starts_with("not_visible") || r.starts_with("covered by") {
+                    return Err(format!(
+                        "[失败] 操作不到「{selector}」：{r}。这不是选择器写错——元素找到了。covered by 说明它被别的元素盖住（先关掉那个遮罩/弹层），not_visible 说明它在页面上不可见，disabled 说明它当前不可操作（先满足启用它的前置条件）。"
+                    ));
+                }
+            }
         }
         let el = match tab.find_element(&selector) {
             Ok(el) => el,
@@ -1432,7 +1446,21 @@ pub async fn browser_type(selector: String, text: String) -> Result<BrowserState
                 }
                 let _ = first_err;
             }
-            Err(_) => {}
+            Err(reason) => {
+                // 只有「真找不到元素」才允许降级到坐标兜底。
+                //
+                // click_via_eval / type 的失败是有内容的：disabled …／not_visible …／covered by …，
+                // 而这里原来是 `Err(_) => {}` 全吞掉，然后照样按坐标操作——被 cookie 横幅或模态
+                // 遮罩盖住时，那一下作用在遮罩上，工具却报成功。模型于是换五种选择器重试，
+                // 而真正该做的是先关掉遮罩；disabled 时该做的是先满足启用它的前置条件。
+                // 把原文带回去，这三种情形模型自己就判得出下一步。
+                let r = reason.trim().to_string();
+                if r.starts_with("disabled") || r.starts_with("not_visible") || r.starts_with("covered by") {
+                    return Err(format!(
+                        "[失败] 操作不到「{selector}」：{r}。这不是选择器写错——元素找到了。covered by 说明它被别的元素盖住（先关掉那个遮罩/弹层），not_visible 说明它在页面上不可见，disabled 说明它当前不可操作（先满足启用它的前置条件）。"
+                    ));
+                }
+            }
         }
         let el = match tab.find_element(&selector) {
             Ok(el) => el,
