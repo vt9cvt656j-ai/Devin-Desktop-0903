@@ -23114,6 +23114,14 @@ test("收尾评审员必须真的被调用——它曾经零调用点，而三�
   // 账要真记下去，否则上界形同虚设、或者每个安静轮都重审一次。
   assert.match(guard, /run\._wrapUpReviewedAtImplOps = _implOps/, "没记下这次评审对应哪一版实现");
   assert.match(guard, /run\._wrapUpReviews = \(run\._wrapUpReviews \|\| 0\) \+ 1/, "没给上界记数");
+  // 既然会重审，就不能直接赋值：评审超时/回垃圾 JSON 时返回 null，直接赋值会把第一次
+  // 那份好结论覆盖成 null——一次成功的评审被一次失败的重审抹掉，用户那几张卡一起消失。
+  // 窗口要往前含一点：赋值写在 `await` 左边，从 at 起切会把它切在窗口外（刚踩过）。
+  const after = SRC.slice(Math.max(0, at - 200), at + 2200);
+  assert.doesNotMatch(after, /run\._wrapUpVerdict = await _wrapUpCritic/,
+    "重审直接赋值：一次失败的重审会把上一次的好结论抹成 null");
+  assert.match(after, /if \(_newVerdict\) run\._wrapUpVerdict = _newVerdict;/,
+    "拿到 null 也照换——好结论会被抹掉");
 });
 
 test("评审结论只陈述、不拦回合", () => {
