@@ -598,8 +598,18 @@ async fn refresh(state: &AppState) -> anyhow::Result<usize> {
         if map.contains_key(&key) {
             continue; // 目录里有，用目录的（免费而且更准）
         }
-        if lookup(model).is_some_and(|e| !e.contexts.is_empty()) {
-            continue; // 上一轮已经探到过，长期沿用
+        // 「长期沿用」必须真的把它**写进这一轮的新表**。
+        //
+        // 这里原来只是 continue：不重探是对的（探测烧真 token），但整轮结束时是
+        // `*c = map` **整表替换**，而这条沿用的记录从没进过 map —— 于是每 6 小时刷新一次，
+        // 上一轮探到的窗口就被抹一次。同一个模型今天是 200K、明天是「不知道」，
+        // 客户端的上下文预算和压缩阈值跟着抖。注释写的是「长期沿用」，代码干的是每轮丢弃。
+        if let Some(prev) = lookup(model).filter(|e| !e.contexts.is_empty()) {
+            source_ids
+                .entry(key.clone())
+                .or_insert_with(|| format!("probed:{model}"));
+            map.insert(key, prev);
+            continue;
         }
         let Some((base_url, api_key)) = route_for_model(state, model).await else {
             continue;
@@ -1136,5 +1146,38 @@ mod tests {
                 panic!("{id} 和 {prev} 归一化后撞成同一个 key");
             }
         }
+    }
+}
+
+
+#[cfg(test)]
+mod carry_forward_tests {
+    /// 探到的窗口必须**跨刷新存活**。
+    ///
+    /// 刷新一轮结束时是 `*c = map` 整表替换。「上一轮探到过就跳过重探」如果只是 continue，
+    /// 那条记录根本没进新表 —— 每 6 小时抹一次，同一个模型今天 200K、明天「不知道」，
+    /// 客户端的上下文预算和压缩阈值跟着抖。注释写的是「长期沿用」，代码得真的沿用。
+    ///
+    /// 刷新本身要打网络，测不了；这里钉的是**那一步有没有写回新表**这个形状。
+    #[test]
+    fn probed_windows_survive_a_catalog_refresh() {
+        let whole = include_str!("model_catalog.rs");
+        let src = match whole.find("mod carry_forward_tests") {
+            Some(i) => &whole[..i],
+            None => whole,
+        };
+        assert!(
+            src.contains("if let Some(prev) = lookup(model).filter(|e| !e.contexts.is_empty()) {"),
+            "沿用分支不见了"
+        );
+        assert!(
+            src.contains("map.insert(key, prev);"),
+            "跳过重探却没把上一轮的结果写进新表 —— 整表替换时会被抹掉，每 6 小时丢一次"
+        );
+        // 反向：不许退回成「只 continue，不写回」。
+        assert!(
+            !src.contains("if lookup(model).is_some_and(|e| !e.contexts.is_empty()) {\n            continue;"),
+            "又退回成只跳过不写回了"
+        );
     }
 }

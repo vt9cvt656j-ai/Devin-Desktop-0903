@@ -24076,7 +24076,9 @@ async function _gatherAgentContext(query, sessionRoot, boundaryRoot = "") {
   // 重建时把规模状态存进缓存，命中路径读取并透传给 _agentContextForQuery 第 6 参
   const _sizeState = { isEmpty: _emptyRootTop, isDrasticallyShrunk: !!_sizeDeltaWarning };
   _agentContextCache = { rootsKey, root, activeKey, ts: Date.now(), data: baseContext, rootFp, sizeState: _sizeState };
-  return _agentContextForQuery(baseContext, query || "", root, undefined, undefined, _sizeState);
+  // 记忆一律按会话身份根取，和读取那侧对齐（否则同一轮里内外两层用两个不同的抽屉）。
+  return _agentContextForQuery(baseContext, query || "", root, undefined, undefined, _sizeState,
+    String(boundaryRoot || "").replace(/\/+$/, "") || root);
 }
 
 async function _agentContextSnapshotForTurn(query, sessionRoot, profile = null, options = {}) {
@@ -24157,10 +24159,11 @@ async function _agentContextSnapshotForTurn(query, sessionRoot, profile = null, 
         new Promise((r) => setTimeout(() => r(""), coldWaitMs)),
       ]);
       if (_full && String(_full).trim().length > 200) {
-        return _full
-          + (stackHint ? `\n${stackHint}` : "")
-          + _memoryBlocks(memoryRoot, query || "", { isEmpty: false })
-          + _projectJournalBlock(memoryRoot);
+        // **不要**在这里再拼一遍记忆块和项目日志：_gatherAgentContext 的返回值结尾本来就带着
+        // 它们（_agentContextForQuery 最后一行）。原来这里又拼一次，于是冷启动的第一句话里，
+        // 上下文最末尾——注意力最高的位置——连着出现两份记忆和两份项目日志，而且因为内外两层
+        // 当时用的是两个不同的记忆根，两份内容还可能不一样。白烧 token，还把真正的问题往后压。
+        return _full + (stackHint ? `\n${stackHint}` : "");
       }
     } catch {}
   }
@@ -43463,7 +43466,17 @@ function _resolveCloneTarget(target, root) {
   return base.replace(/[\\/]+$/, "") + sep + t.replace(/^[\\/]+/, "");
 }
 
-function _gitNonRepoGuidance(root, candidates = [], op = "status", mutating = false) {
+// probeError 非空 = git 探测**根本没跑成**（没装 git / macOS 上 xcode-select 没配好 /
+// 二进制不可执行）。那时候说「这里不是 Git 仓库」是一句关于仓库的假话，用户会去折腾一个
+// 本来没问题的仓库。真实原因和真实出路都在环境上，直接说出来。
+function _gitNonRepoGuidance(root, candidates = [], op = "status", mutating = false, probeError = "") {
+  if (probeError) {
+    return `[ERROR] git 没跑起来：${probeError}`
+      + `\n**这不代表「${String(root || "").trim()}」不是 Git 仓库** —— 是这台机器上的 git 用不了。`
+      + `\n先确认环境：\`git --version\` 能不能跑；macOS 上如果报 "xcrun: error"，`
+      + `需要 \`xcode-select --install\`（要用户自己在终端里装，会弹系统对话框）。`
+      + `\n装好之前所有 git 工具都用不了，别改用别的方式硬猜仓库状态。`;
+  }
   const requested = String(root || "").trim() || "(未打开工作区)";
   const operation = String(op || "status").trim() || "status";
   const seen = new Set();
@@ -43561,7 +43574,13 @@ async function _gitRepoCandidateRoots(root) {
 async function _gitResolveRepoContext(root, call) {
   const requestedRoot = _normalizeFsPath(String(root || "")).replace(/\/+$/, "");
   let status = null;
-  try { status = await backend.invoke("git_status", { root: requestedRoot }); } catch {}
+  // git 探测**失败**和「探测成功、结论是不是仓库」是两回事，原来共用一个吞掉的 catch。
+  // 一台没装 git、或者 macOS 上 xcode-select 没配好的机器，这里会抛 —— status 留在 null，
+  // 于是下面返回 isRepo:false，工具回执说「当前工作区不是 Git 仓库（没有 .git）」。
+  // 那是一句关于**仓库**的假话，真实原因在环境上：用户会去折腾一个本来没问题的仓库。
+  let probeError = "";
+  try { status = await backend.invoke("git_status", { root: requestedRoot }); }
+  catch (e) { probeError = String(e && e.message || e || "").slice(0, 200); }
   if (status?.is_repo) {
     const top = await _gitTopLevel(requestedRoot);
     const actualRoot = top || requestedRoot;
@@ -43582,7 +43601,7 @@ async function _gitResolveRepoContext(root, call) {
       }
     } catch {}
   }
-  return { isRepo: false, requestedRoot, root: requestedRoot, status, candidates };
+  return { isRepo: false, requestedRoot, root: requestedRoot, status, candidates, probeError };
 }
 
 function _gitPathForRepo(path, repoRoot, requestedRoot) {
@@ -56725,7 +56744,7 @@ async function _executeToolStepInner(step, call, root, run) {
       if (!isClone) {
         gitCtx = await _gitResolveRepoContext(gitRoot, call);
         if (!gitCtx.isRepo) {
-          const guidance = _gitNonRepoGuidance(gitCtx.requestedRoot || gitRoot, gitCtx.candidates, call.op, mutating);
+          const guidance = _gitNonRepoGuidance(gitCtx.requestedRoot || gitRoot, gitCtx.candidates, call.op, mutating, gitCtx.probeError);
           res.className = "atc-result atc-result--err"; res.textContent = "非 git 仓库";
           if (vp) vp.innerHTML = `<pre>${_escHtml(guidance)}</pre>`;
           return { type: "git", path: call.op, content: guidance };
@@ -56758,7 +56777,7 @@ async function _executeToolStepInner(step, call, root, run) {
         } else if (call.op === "status") {
           const st = gitCtx?.status || await backend.invoke("git_status", { root: gitExecRoot });
           if (!st || !st.is_repo) {
-            const guidance = _gitNonRepoGuidance(gitExecRoot, gitCtx?.candidates || [], "status", false);
+            const guidance = _gitNonRepoGuidance(gitExecRoot, gitCtx?.candidates || [], "status", false, gitCtx?.probeError);
             res.className = "atc-result atc-result--err"; res.textContent = "非 git 仓库"; if (vp) vp.innerHTML = `<pre>${_escHtml(guidance)}</pre>`; return { type: "git", path: "status", content: guidance };
           }
           const files = st.files || [];
