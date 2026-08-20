@@ -2544,10 +2544,6 @@ const _CN_CHAR_RE = /[\u4e00-\u9fff]/;
 let _renameTimer = null;
 let _lastRenamePos = "";
 
-function _hasChinese(text) {
-  return _CN_CHAR_RE.test(text);
-}
-
 // 思考摘要按「段」下发（gpt-5.x 每段是 **标题**+正文），上游拼接时段与段之间没有分隔，
 // 渲染出来就是「…verificationUpdating plan…」这种加粗标题拼死的样子。这里对累积文本做
 // 修复而不是赌分片边界：不管一段的开头落在哪个 delta 里，拼进累积串后模式必然完整出现。
@@ -2824,75 +2820,6 @@ function _collectSymbolNames(model) {
   return names;
 }
 
-async function _translateToEnglish(chineseName, context, existingNames) {
-  const config = loadConfig();
-  if (!config.baseUrl || !config.apiKey || !config.model) return null;
-
-  const namesStr = [...existingNames].slice(0, 50).join(", ");
-  const msgs = [
-    {
-      role: "system",
-      content: `You translate Chinese code identifiers to English. Rules:
-1. Output ONLY the English name, nothing else.
-2. Use snake_case for Python/C, camelCase for JS/Java, PascalCase for classes.
-3. Keep it concise (1-3 words).
-4. If the name would conflict with these existing names, add a suffix: ${namesStr}`,
-    },
-    {
-      role: "user",
-      content: `Context: ${context}\nTranslate: "${chineseName}"`,
-    },
-  ];
-
-  try {
-    const aiConfig = {
-      baseUrl: config.baseUrl.replace(/\/+$/, ""),
-      apiKey: config.apiKey,
-      model: config.baseUrl?.includes("deepseek") ? "deepseek-v4-flash" : config.model,
-      maxTokens: 256,
-      temperature: 0,
-    };
-    const result = await new Promise((resolve) => {
-      let buf = "";
-      backend.aiChat(aiConfig, _enforceModelRequestBudget(msgs), (ev) => {
-        if (ev.kind === "token") buf += ev.delta;
-        else if (ev.kind === "done") resolve(buf.trim());
-        else if (ev.kind === "error") resolve("");
-      }).catch(() => resolve(""));
-      setTimeout(() => resolve(buf.trim()), 10000);
-    });
-    if (!result || _CN_CHAR_RE.test(result)) return null;
-    // 模型没照格式回（"I'm ready to translate…"这类客套话）时，剥掉标点后会变成一条
-    // 上百字符的"合法标识符"直接进文件——按句子特征拒收：多词长句/超长一律作废。
-    if (result.split(/\s+/).length > 4 || result.length > 60) return null;
-    let name = result.replace(/[^a-zA-Z0-9_]/g, "").replace(/^_+|_+$/g, "");
-    if (!name || name.length > 32) return null;
-    if (existingNames.has(name)) {
-      for (let i = 2; i < 100; i++) {
-        const candidate = `${name}_${i}`;
-        if (!existingNames.has(candidate)) { name = candidate; break; }
-      }
-    }
-    return name;
-  } catch {
-    return null;
-  }
-}
-
-function _getIdentifierAtPosition(model, position) {
-  const word = model.getWordAtPosition(position);
-  if (!word) return null;
-  const text = word.word;
-  if (!_hasChinese(text)) return null;
-  return {
-    text,
-    range: new monaco.Range(
-      position.lineNumber, word.startColumn,
-      position.lineNumber, word.endColumn,
-    ),
-  };
-}
-
 function _isInCommentOrString(line, offset, langId) {
   const before = line.slice(0, offset);
   if (/^\s*(#|\/\/|--|%)/.test(line)) return true;
@@ -3091,8 +3018,6 @@ const _DOUBLE_SYMBOLS = [
   [/--(?!-|>)/g, null],
 ];
 
-const _BRACKET_PAIRS = { "(": ")", "[": "]", "{": "}" };
-const _CLOSE_TO_OPEN = { ")": "(", "]": "[", "}": "{" };
 
 function _fixDoublePunctuation(model) {
   const edits = [];
@@ -3131,61 +3056,6 @@ function _isInString(line, pos) {
     else if (ch === "`" && !inSingle && !inDouble) inBacktick = !inBacktick;
   }
   return inSingle || inDouble || inBacktick;
-}
-
-function _fixUnbalancedBrackets(model) {
-  const edits = [];
-  const total = model.getLineCount();
-  const stack = [];
-
-  for (let ln = 1; ln <= total; ln++) {
-    const line = model.getLineContent(ln);
-    for (let i = 0; i < line.length; i++) {
-      if (_isInString(line, i)) continue;
-      const ch = line[i];
-      if (_BRACKET_PAIRS[ch]) {
-        stack.push({ ch, ln, col: i + 1 });
-      } else if (_CLOSE_TO_OPEN[ch]) {
-        const expected = _CLOSE_TO_OPEN[ch];
-        if (stack.length > 0 && stack[stack.length - 1].ch === expected) {
-          stack.pop();
-        } else {
-          edits.push({
-            range: new monaco.Range(ln, i + 1, ln, i + 2),
-            text: "",
-          });
-        }
-      }
-    }
-  }
-
-  for (const unclosed of stack) {
-    const closer = _BRACKET_PAIRS[unclosed.ch];
-    const ln = unclosed.ln;
-    const lineContent = model.getLineContent(ln);
-    const endCol = lineContent.length + 1;
-    edits.push({
-      range: new monaco.Range(ln, endCol, ln, endCol),
-      text: closer,
-    });
-  }
-  return edits;
-}
-
-function _fixTrailingWhitespace(model, changedLines) {
-  const edits = [];
-  for (const ln of changedLines) {
-    if (ln < 1 || ln > model.getLineCount()) continue;
-    const line = model.getLineContent(ln);
-    const trimmed = line.replace(/\s+$/, "");
-    if (trimmed.length < line.length) {
-      edits.push({
-        range: new monaco.Range(ln, trimmed.length + 1, ln, line.length + 1),
-        text: "",
-      });
-    }
-  }
-  return edits;
 }
 
 const _LANG_KEYWORDS = new Set([
@@ -13875,31 +13745,6 @@ function _gatewayHandlesCompression() {
 // membership downgrade silently falls back instead of budgeting against a window the gateway
 // will no longer honor.
 const _CTX_CHOICE_KEY = "michael-ide.ctx-choice.v2";
-const _CTX_CHOICE_KEY_V1 = "michael-ide.ctx-choice.v1";
-// v1 stored the raw token count the button carried, which silently breaks the moment a native
-// window is corrected: the choice stays pinned to the stale number and the card shows no active
-// button at all (the active test is `o.value === eff`). v2 stores the user's INTENT —
-// {kind:"native"} follows the model wherever its real window lands; {kind:"modified",tokens}
-// pins a michael-compression tier. Reading still yields a plain number, so every consumer is
-// unchanged.
-function _migrateCtxChoiceV1() {
-  try {
-    const raw = localStorage.getItem(_CTX_CHOICE_KEY_V1);
-    if (!raw || localStorage.getItem(_CTX_CHOICE_KEY)) return;
-    const old = JSON.parse(raw) || {};
-    const out = {};
-    for (const [id, value] of Object.entries(old)) {
-      const n = Math.round(Number(value) || 0);
-      if (!(n > 0)) continue;
-      // Disambiguate by comparing against THIS model's native window, not against the tier list.
-      // A bare "is it 1M/2M/5M?" test misreads every Gemini pick, because Gemini's native window
-      // IS 1M (and gemini-1.5-pro's is 2M) — those users chose 原生, not a tier.
-      out[id] = (n === _modelContextLimit(id)) ? { kind: "native" } : { kind: "modified", tokens: n };
-    }
-    localStorage.setItem(_CTX_CHOICE_KEY, JSON.stringify(out));
-    localStorage.removeItem(_CTX_CHOICE_KEY_V1);
-  } catch {}
-}
 function _ctxChoiceRecord(modelId) {
   try {
     const map = JSON.parse(localStorage.getItem(_CTX_CHOICE_KEY) || "{}") || {};
@@ -30147,20 +29992,6 @@ const _SIC = (bg, glyph) =>
   '<path d="M0 11A11 11 0 0 1 11 0h18a11 11 0 0 1 11 11v9H0z" fill="#fff" fill-opacity=".16"/>' +
   '<g transform="translate(8 8)" fill="none" stroke="#fff" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round">' + glyph + '</g>' +
   '</svg>';
-const _SKILL_ICONS = {
-  sparkles: _SIC('#8b5cf6', '<path d="M9.94 15.5A2 2 0 0 0 8.5 14.06l-6.14-1.58a.5.5 0 0 1 0-.96L8.5 9.94A2 2 0 0 0 9.94 8.5l1.58-6.14a.5.5 0 0 1 .96 0L14.06 8.5A2 2 0 0 0 15.5 9.94l6.14 1.58a.5.5 0 0 1 0 .96L15.5 14.06a2 2 0 0 0-1.44 1.44l-1.58 6.14a.5.5 0 0 1-.96 0Z"/><path d="M20 3v4"/><path d="M22 5h-4"/><path d="M4 17v2"/><path d="M5 18H3"/>'),
-  book: _SIC('#3b82f6', '<path d="M2 3h6a4 4 0 0 1 4 4v14a3 3 0 0 0-3-3H2z"/><path d="M22 3h-6a4 4 0 0 0-4 4v14a3 3 0 0 1 3-3h7z"/>'),
-  search: _SIC('#0ea5e9', '<circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/>'),
-  code: _SIC('#4f46e5', '<path d="m16 18 6-6-6-6"/><path d="m8 6-6 6 6 6"/>'),
-  doc: _SIC('#0d9488', '<path d="M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7z"/><path d="M14 2v5h5"/><path d="M16 13H8"/><path d="M16 17H8"/>'),
-  commit: _SIC('#16a34a', '<circle cx="12" cy="12" r="3"/><path d="M3 12h6"/><path d="M15 12h6"/>'),
-  bolt: _SIC('#f59e0b', '<path d="M4 14a1 1 0 0 1-.78-1.63l9.9-10.2a.5.5 0 0 1 .86.46l-1.92 6.02A1 1 0 0 0 13 10h7a1 1 0 0 1 .78 1.63l-9.9 10.2a.5.5 0 0 1-.86-.46l1.92-6.02A1 1 0 0 0 11 14z"/>'),
-  terminal: _SIC('#334155', '<path d="m4 17 6-6-6-6"/><path d="M12 19h8"/>'),
-  chat: _SIC('#db2777', '<path d="M7.9 20A9 9 0 1 0 4 16.1L2 22Z"/>'),
-  pen: _SIC('#e11d48', '<path d="M17 3a2.85 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5Z"/><path d="m15 5 4 4"/>'),
-  wrench: _SIC('#ea580c', '<path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z"/>'),
-  rocket: _SIC('#dc2626', '<path d="M4.5 16.5c-1.5 1.26-2 5-2 5s3.74-.5 5-2c.71-.84.7-2.13-.09-2.91a2.18 2.18 0 0 0-2.91-.09z"/><path d="M12 15l-3-3a22 22 0 0 1 2-3.95A12.88 12.88 0 0 1 22 2c0 2.72-.78 7.5-6 11a22.35 22.35 0 0 1-4 2z"/><path d="M9 12H4s.55-3.03 2-4c1.62-1.08 5 0 5 0"/><path d="M12 15v5s3.03-.55 4-2c1.08-1.62 0-5 0-5"/>'),
-};
 // Default skill icon — a game-style skill badge: green tile + embossed white plus. Solid colors only
 // (no gradient <defs>/url() — shared ids break across removed DOM subtrees in WKWebView). The preset
 // icon picker was removed, so every non-uploaded skill shows this; uploaded skills show their image.
@@ -37294,22 +37125,6 @@ function _checkpointMarkCurrent(cp, absPath, content) {
 // per-workspace in localStorage and auto-injected into the agent's context so it
 // carries knowledge across turns and sessions (like CLAUDE.md, but agent-authored). ---
 function _memoryKey(root) { return "michael-ide.memory:" + (root || "_global"); }
-function _loadMemory(root) {
-  try { return localStorage.getItem(_memoryKey(root)) || ""; } catch { return ""; }
-}
-function _appendMemory(root, note) {
-  const clean = String(note || "").trim().replace(/\n+/g, " ");
-  if (!clean) return false;
-  let lines = _loadMemory(root).split("\n").filter(Boolean);
-  lines.push("- " + clean);
-  if (lines.length > 60) lines = lines.slice(-60); // keep the most recent notes
-  let mem = lines.join("\n");
-  if (mem.length > 8000) mem = mem.slice(mem.length - 8000);
-  try { localStorage.setItem(_memoryKey(root), mem); } catch {}
-  _agentContextCache = { root: null, ts: 0, data: "" }; // force context rebuild so the note shows
-  return true;
-}
-
 // --- Knowledge-graph memory (A-MEM / Zettelkasten): the agent's `remember` notes
 // become atomic, auto-linked nodes — entities = extracted tags, edges = shared
 // tags. On insert a note auto-links to related notes (self-evolving graph). On
@@ -38137,57 +37952,6 @@ function _mcGlobeInit(wrapEl, containerEl, _tip, getData, onNodeClick) {
       globe = null;
     },
   };
-}
-
-function _memoryChoiceModel(root, session) {
-  const stats = typeof _sessionMemoryStats === "function"
-    ? _sessionMemoryStats(session || {})
-    : { totalTurns: 0, recentCount: 0, summaryCount: 0, milestoneCount: 0, fileEvidenceCount: 0 };
-  const sessionLabel = typeof _sessionMemoryLabel === "function"
-    ? _sessionMemoryLabel(stats)
-    : `${stats.totalTurns || stats.recentCount || 0} 轮`;
-  const activeCount = (memoryRoot) => {
-    const superseded = _kgSupersededIds(memoryRoot);
-    return _kgLoad(memoryRoot).filter((item) => !superseded.has(item.id)).length;
-  };
-  const projectCount = root ? activeCount(root) : 0;
-  const globalCount = activeCount("");
-  const projectCorrections = root ? _kgActiveCorrections(root, 20).length : 0;
-  const globalCorrections = _kgActiveCorrections("", 20).length;
-  return [
-    {
-      id: "session",
-      title: "当前会话记忆",
-      badge: sessionLabel,
-      source: "Michael 会话摘要",
-      desc: "适合本轮任务进度、刚聊过的文件、临时上下文。长聊会自动压缩成历史摘要，不需要用户手动选择。",
-      inject: "只跟随当前聊天 Tab；换会话不会污染别的任务。",
-    },
-    {
-      id: "project",
-      title: "项目长期记忆",
-      badge: `${projectCount} 条${projectCorrections ? ` · ${projectCorrections} 次纠正` : ""}`,
-      source: "Michael 项目知识图谱：自动/手动沉淀项目事实",
-      desc: "适合项目架构、踩坑、命令、约定、文件位置。智能体每次按任务相关性召回知识图谱子图。",
-      inject: "只在当前项目自动注入；跨会话保留。",
-    },
-    {
-      id: "global",
-      title: "全局用户偏好",
-      badge: `${globalCount} 条${globalCorrections ? ` · ${globalCorrections} 次纠正` : ""}`,
-      source: "Michael 用户偏好记忆：用户级偏好/工作习惯",
-      desc: "适合你的长期偏好、通用风格、常用决策原则。不要放项目私有路径和一次性信息。",
-      inject: "所有项目都会自动带上；适合“以后都这样”。",
-    },
-    {
-      id: "rules",
-      title: "项目规则 / 团队约定",
-      badge: "自动识别",
-      source: "Michael 项目规则：团队级硬约定",
-      desc: "适合团队强规则、不可违反的构建/测试/代码风格。IDE 会自动识别常见工程规则文件并注入项目上下文。",
-      inject: "项目打开后优先注入，规则比普通记忆更硬。",
-    },
-  ];
 }
 
 // Memory panel: view / edit / clear the agent's project memory for the current
@@ -41463,31 +41227,6 @@ function _parseHttpUrlForPreflight(value) {
   }
 }
 
-function _httpHostnameIsLocalOrPrivate(hostname) {
-  const host = String(hostname || "").trim().toLowerCase().replace(/^\[|\]$/g, "").replace(/\.$/, "");
-  if (!host) return false;
-  if (host === "localhost" || host.endsWith(".localhost") || host === "host.docker.internal") return true;
-  if (!host.includes(".") && !host.includes(":")) return true; // docker/k8s/dev-service names are not public Internet APIs.
-  if (host === "::1" || host === "0:0:0:0:0:0:0:1" || host === "::") return true;
-  if (/^(?:fc|fd)[0-9a-f]{0,2}:|^fe80:/i.test(host)) return true;
-  const m = host.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
-  if (!m) return false;
-  const parts = m.slice(1).map((x) => Number(x));
-  if (parts.some((x) => !Number.isInteger(x) || x < 0 || x > 255)) return false;
-  const [a, b] = parts;
-  return a === 10
-    || a === 127
-    || a === 0
-    || (a === 172 && b >= 16 && b <= 31)
-    || (a === 192 && b === 168)
-    || (a === 169 && b === 254);
-}
-
-function _isLocalOrPrivateHttpUrl(url) {
-  const parsed = _parseHttpUrlForPreflight(url);
-  return !!parsed && _httpHostnameIsLocalOrPrivate(parsed.hostname);
-}
-
 function _canonicalHttpEvidenceUrl(url, includeQuery = true) {
   const parsed = _parseHttpUrlForPreflight(url);
   if (!parsed) return "";
@@ -41555,15 +41294,6 @@ function _resolveCaptureStartMode(call, run = null) {
   return { mode, systemProxy, label, next };
 }
 
-function _browserNeedsCapturePreflight(call, run = null, captureRunning = false) {
-  // Capture ordering is a model strategy, not an execution permission. Browser
-  // actions run normally; capture_flows reports the factual not-running state.
-  void call;
-  void run;
-  void captureRunning;
-  return "";
-}
-
 function _browserRepeatedStableOperation(log, action, selector = "") {
   if (!Array.isArray(log) || log.length < 2) return false;
   const expected = `${action}|${selector || ""}`;
@@ -41578,14 +41308,6 @@ function _browserRepeatedStableOperation(log, action, selector = "") {
 function _needsIsolatedCaptureBrowserRestart(run, captureRunning, currentMode, fresh) {
   if (!fresh || !captureRunning || !run?._captureStarted || run._captureBrowserReady) return false;
   return _normalizeCaptureModeName(run._captureMode || currentMode || "auto") === "isolated_browser";
-}
-
-function _screenshotModePreflightIssue(call, run = null) {
-  // A screenshot can be partial evidence without being an invalid tool call. Let
-  // the backend return the real image and let the model decide what follows.
-  void call;
-  void run;
-  return "";
 }
 
 function _httpRedirectBlock(method, url, response) {

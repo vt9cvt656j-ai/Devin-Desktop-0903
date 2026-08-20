@@ -4908,27 +4908,9 @@ test("closed chat tabs stay in the session library and can be restored", () => {
 });
 
 test("memory center uses Michael-owned labels and hides competitor implementation details", () => {
-  const model = load("_memoryChoiceModel", {
-    _kgLoad: (root) => root ? [{ content: "project rule" }] : [{ content: "global pref" }, { content: "global style" }],
-    _kgSupersededIds: () => new Set(),
-    _kgActiveCorrections: (root) => root ? [{ id: "project-correction" }] : [],
-    _sessionMemoryStats: () => ({ totalTurns: 42, recentCount: 8, summaryCount: 2, milestoneCount: 1, fileEvidenceCount: 3 }),
-    _sessionMemoryLabel: () => "42 turns · 8 msgs · 2 summaries",
-  });
-  const cards = model("/repo", {});
-  assert.deepEqual(cards.map((card) => card.id), ["session", "project", "global", "rules"]);
-  assert.match(cards[0].title, /当前会话记忆/);
-  assert.match(cards[0].badge, /42 turns/);
-  assert.match(cards[1].source, /Michael 项目知识图谱/);
-  assert.match(cards[1].badge, /1 次纠正/);
-  assert.match(cards[1].inject, /当前项目/);
-  assert.match(cards[2].source, /Michael 用户偏好记忆/);
-  assert.match(cards[2].inject, /所有项目/);
-  assert.match(cards[3].source, /Michael 项目规则/);
-  assert.match(cards[3].desc, /自动识别常见工程规则文件/);
-  assert.doesNotMatch(cards.map((card) => `${card.title} ${card.badge} ${card.source} ${card.desc}`).join("\n"),
-    /Windsurf|Claude|Copilot|AGENTS\.md|CLAUDE\.md|\.cursorrules|copilot-instructions/i,
-    "memory center cards must not expose competitor names or underlying compatibility filenames");
+  // 这条测试原来先构造 _memoryChoiceModel 的四张卡片再逐项断言。那个函数是零调用点
+  // （记忆中心的面板走 openMemoryCenterIsland 那条 React 岛路径，不经过它），
+  // 2026-08-20 随存量清理删除。下面对面板本体和 MEMORY_SRC 的断言才是这条测试的活体部分。
 
   // The panel is a React island (src/ui/memory-center.jsx) using shadcn Dialog/Tabs/Button.
   // main.js keeps ownership of the data and of the globe's imperative WebGL lifecycle.
@@ -11720,17 +11702,10 @@ test("natural-language capability queries are routed by the semantic tool orches
 
 test("HTTP execution no longer blocks model-selected public URLs with guessed-API heuristics", () => {
   const parse = load("_parseHttpUrlForPreflight");
-  const localHost = load("_httpHostnameIsLocalOrPrivate");
-  const localUrl = load("_isLocalOrPrivateHttpUrl", {
-    _parseHttpUrlForPreflight: parse,
-    _httpHostnameIsLocalOrPrivate: localHost,
-  });
   const canonical = load("_canonicalHttpEvidenceUrl", { _parseHttpUrlForPreflight: parse });
   const remember = load("_rememberHttpEvidenceFromTool", { _canonicalHttpEvidenceUrl: canonical });
   const redirectBlock = load("_httpRedirectBlock");
 
-  assert.equal(localUrl("http://127.0.0.1:3000/api/health"), true);
-  assert.equal(localUrl("https://api.example.test/v1/data"), false);
   assert.equal(canonical("https://example.test/path/?q=1#section", true), "https://example.test/path/?q=1");
   assert.equal(canonical("https://example.test/path/?q=1#section", false), "https://example.test/path");
 
@@ -11761,10 +11736,9 @@ test("browser and screenshot strategy never preflight-blocks real calls", () => 
   const resolveMode = load("_resolveCaptureStartMode", {
     _normalizeCaptureModeName: normalizeMode,
   });
-  const browserCaptureIssue = load("_browserNeedsCapturePreflight", {
-    _resolveCaptureStartMode: resolveMode,
-  });
-  const screenshotIssue = load("_screenshotModePreflightIssue");
+  // 这条测试原来还测两个预检桩（_browserNeedsCapturePreflight / _screenshotModePreflightIssue）。
+  // 两个都是零调用点、从来没跑过的桩件，2026-08-20 随存量清理删除；同测试里
+  // resolveMode / normalizeMode / needsCaptureRestart / emptyCapture 那几组仍然覆盖真实路径。
   const emptyCaptureInfo = load("_captureFlowsEmptyInfo", {
     _normalizeCaptureModeName: normalizeMode,
   });
@@ -11793,38 +11767,6 @@ test("browser and screenshot strategy never preflight-blocks real calls", () => 
   assert.equal(resolveMode({ systemProxy: true }, { engineering: {} }).mode, "system");
   assert.equal(resolveMode({ systemProxy: false }, { engineering: {} }).mode, "isolated_browser");
 
-  assert.equal(
-    browserCaptureIssue({ type: "browser", action: "navigate", url: "https://example.test" }, {
-      engineering: { capture: true, captureMode: "isolated_browser", browserGoal: "network_capture" },
-    }, false),
-    "",
-    "capture order is guidance; browser navigation still reaches the backend",
-  );
-  assert.equal(
-    browserCaptureIssue({ type: "browser", action: "navigate" }, {
-      engineering: { capture: true, captureMode: "isolated_browser", browserGoal: "network_capture" },
-      _captureStarted: true,
-    }, false),
-    "",
-    "once capture_start succeeded in this run, browser can produce the traffic",
-  );
-  assert.equal(
-    browserCaptureIssue({ type: "browser", action: "navigate" }, {
-      engineering: { capture: true, captureMode: "isolated_browser", browserGoal: "network_capture" },
-    }, true),
-    "",
-    "an already-running capture proxy should also allow browser navigation",
-  );
-  assert.equal(
-    screenshotIssue({ type: "screenshot", url: "http://localhost:3000" }, { engineering: { browserGoal: "interactive" } }),
-    "",
-    "a partial screenshot is still real evidence and must execute",
-  );
-  assert.equal(
-    screenshotIssue({ type: "screenshot", url: "http://localhost:3000" }, { engineering: { browserGoal: "static" } }),
-    "",
-    "static visual checks should keep using headless screenshot",
-  );
   assert.match(
     emptyCapture({ _captureMode: "isolated_browser" }, "", 0, true, 8080),
     /\[BLOCKED_CAPTURE_EMPTY\][\s\S]*browser navigate\(fresh:true\)[\s\S]*capture_flows/,
@@ -14108,10 +14050,8 @@ test("第三方直连的兜底窗口表本身要准——它是那条链路唯�
 test("上下文选择存的是意图而不是数字，原生窗口修正后不会把用户钉死", () => {
   // 旧版存的是按钮上的 token 数。原生值一旦被修正，选过「原生」的用户永远钉在旧数字上，
   // 而且卡片一个高亮按钮都不会有（判定是 o.value === eff）。
-  const mig = extractFn("_migrateCtxChoiceV1");
-  assert.match(mig, /n === _modelContextLimit\(id\)/,
-    "迁移必须拿该模型当前的原生值比对，而不是用 1M/2M/5M 硬清单——Gemini 的原生就是 1M，" +
-    "按清单判会把选了原生的 Gemini 用户误判成选了档位");
+  // v1→v2 的一次性迁移（_migrateCtxChoiceV1）2026-08-20 随零调用点存量一起删了：
+  // 它只有定义、没有任何调用者，迁移从来没发生过。下面两条轴的断言才是这条测试的本体。
   const setter = extractFn("_setCtxChoice");
   assert.match(setter, /kind === "tier" \? "tier" : "native"/,
     "两条轴要分开存：native=窗口、tier=留存档位。合成一个数就会出现「选 2M 得到 2,096,890」");
@@ -27956,7 +27896,14 @@ test("自动改重复标点不许碰别的语言的合法语法", () => {
   // 唯一的闸是「4000 行以上跳过」。`::` `..` `;;` 三条改写在 Rust/C++/Lua/PHP 里是纯破坏：
   // std::collections → std:collections、0..10 → 0.10、for(;;) → for(;)、Lua 的 a..b → a.b。
   // 改完 1.2 秒防抖触发、随后自动保存落盘，全程零提示零开关。
-  const tbl = SRC.slice(SRC.indexOf("const _DOUBLE_SYMBOLS = ["), SRC.indexOf("const _BRACKET_PAIRS"));
+  // 终点锚点要挑**和这张表同生共死**的东西。原来用的是 const _BRACKET_PAIRS —— 那是
+  // _fixUnbalancedBrackets 的私产、和这张表无关；那个函数一删，indexOf 返回 -1，
+  // slice(start, -1) 就变成「从表头一路切到文件末尾」，下面三条断言在全文件上恒真：
+  // 守卫静默失效，而测试照样绿。改用这张表的**唯一消费者**当终点。
+  const _tblStart = SRC.indexOf("const _DOUBLE_SYMBOLS = [");
+  const _tblEnd = SRC.indexOf("function _fixDoublePunctuation");
+  assert.ok(_tblStart >= 0 && _tblEnd > _tblStart, "双符号表或它的消费者挪走了，这条断言失去落点");
+  const tbl = SRC.slice(_tblStart, _tblEnd);
   for (const [pat, why] of [
     [/\[\/::\(\?!:\)\/g, null\]/, ":: 必须保持 null（Rust/C++/PHP 的路径分隔符）"],
     [/\[\/\\\.\\\.\(\?!\\\.\)\/g, null\]/, ".. 必须保持 null（Rust 区间 / Lua 连接）"],
