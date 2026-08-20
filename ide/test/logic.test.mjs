@@ -16191,7 +16191,10 @@ test("memory correction is immediate, append-only, and outside foreground genera
   assert.match(extractFn("_kgRetrieve"), /JSON\.stringify\(allNotes\)/,
     "usage-count persistence must not accidentally overwrite storage with only active nodes");
 
-  const runEnd = SRC.indexOf("try { await _recordEpisode(run, task, root, _runOutcome, config, session); }");
+  // 锚点只认「调用发生在哪」，不认参数怎么写：参数已经从 root 换成 memoryRoot（记忆一律按
+  // 会话身份根存取，否则写入和读取连到两个不同的抽屉）。这条断言守的是**顺序**，不是签名。
+  const runEnd = SRC.indexOf("await _recordEpisode(run, task,");
+  assert.ok(runEnd > 0, "收尾反思的调用点不见了，这条顺序断言失去落点");
   const streamingEnd = SRC.lastIndexOf("_setStreaming(session, false)", runEnd);
   const assistantPersist = SRC.lastIndexOf("session.memory.push({ role: \"assistant\"", runEnd);
   assert.ok(streamingEnd >= 0 && assistantPersist >= 0 && streamingEnd < assistantPersist && assistantPersist < runEnd,
@@ -29654,4 +29657,186 @@ test("纯风险面单独出现时不产出 substantial，除非模型自己声�
   // 各自的律照常按面触发：不许顺手把它们从 industrialProject 里删掉。
   assert.match(src, /m\.industrialProject = [\s\S]{0,400}m\.securityRisk/,
     "把 securityRisk 从 industrialProject 里删掉了——业务漏洞/滥用律会跟着一起哑掉");
+});
+
+// ---- 记忆的写入根和读取根必须是同一个 ----
+//
+// 读取那侧早就改对了（26231：「经验/工作流也按会话身份存取，别跟着打开的文件漂」），
+// 写入那侧却一直传会漂的 _contextRoot。在「父仓套 ide 仓、website/ 和 src-tauri/ 各自带
+// 项目标记」这种形状里，两头连的是两个不同的抽屉：写进去 120 条，读出来 0 条，
+// 而且 _epLoad 失败只返回空数组，全程一声不响——整条「干过的活 → 下次参考」就断在这。
+test("经验/工作流的写入根必须是会话身份根，不能跟着打开的文件漂", () => {
+  const loop = extractFn("_runAgenticLoop");
+  assert.match(loop, /await _recordEpisode\(run, task, memoryRoot \|\| root,/,
+    "写入还在用会漂的 root —— 写进去的经验读取那侧永远取不回来，而且不会报错");
+  assert.match(SRC, /async function _runAgenticLoop\(\{ config: _rawConfig, messages, root, memoryRoot = ""/,
+    "循环没收下身份根这个参数");
+  // 调用方必须真的传身份根，而不是把 root 原样再传一遍。
+  const at = SRC.indexOf("await _runAgenticLoop({");
+  assert.ok(at > 0);
+  const callSite = SRC.slice(at, at + 700);
+  assert.match(callSite, /memoryRoot: _identityRoot/,
+    "调用点没传会话身份根 —— 参数加了等于没加");
+  assert.doesNotMatch(callSite, /memoryRoot: _contextRoot/,
+    "又把会漂的那个根传成记忆根了");
+  // 读取那侧不许倒回去用 root。
+  assert.match(SRC, /const _expRoot = _identityRoot;/, "读取侧的身份根被改回去了");
+});
+
+// ---- 「连续失败」不能靠把成败拆进分组键来算 ----
+//
+// 原分组键是 `${e.tool}|${e.ok ? "ok" : "fail"}`：fail 桶里装的全是失败，于是「最近 3 条
+// 全是失败」**恒真**。任何历史上失败过 3 次的工具都会被打上「近期屡次失败，考虑替代方案」，
+// 哪怕它 45 次成功、3 次失败、最近 5 次全成。模型据此绕开一个本来好用的工具——学的是反的。
+test("工具成败账：连续失败要按时间序看最近三条，不是按成败分桶", () => {
+  const src = extractFn("_toolExpRetrieve")
+    .split("\n").filter((l) => !l.trim().startsWith("//")).join("\n");
+  assert.doesNotMatch(src, /\$\{e\.ok \? "ok" : "fail"\}/,
+    "又把成败拆进分组键了——fail 桶里「最近三条全失败」恒真，好用的工具会被打成屡次失败");
+  assert.match(src, /grouped\.set\(e\.tool, \[\]\)/, "没有按工具名分组");
+  assert.match(src, /sort\(\(a, b\) => \(Number\(a\.ts\) \|\| 0\) - \(Number\(b\.ts\) \|\| 0\)\)/,
+    "没有按时间排序——「最近三条」就无从谈起");
+  assert.match(src, /tail\.every\(\(x\) => !x\.ok\)/, "判据本身没了");
+});
+
+// ---- 「以后一律用 pnpm」里的那个 pnpm 存不进去 ----
+//
+// 纠正值的长度地板是 5，而 pnpm / yarn / bun / uv / vite 全是 4 个字符及以下：
+// 两道语义闸全过，最后死在长度上，账本一行不写，而且完全静默。
+// 「以后不要用 X，改用 Y」里最常见的那个 Y，就是这么丢的。
+test("纠正值的长度地板不许把四字母工具名挡在外面", () => {
+  const src = extractFn("_kgRecordCorrection");
+  assert.doesNotMatch(src, /corrected\.length < 5/,
+    "地板还是 5 —— pnpm / yarn / bun / uv 这类最常见的纠正值全部存不进去");
+  assert.match(src, /corrected\.length < 2/, "地板不见了或改成了别的值");
+});
+
+// ---- 返工配对：让日志里的 ✓ 诚实一点 ----
+//
+// ✓ 只表示「这一轮正常收尾了」，不表示东西做出来了 —— 源码渲染处的注释早就承认了这个洞。
+// 而这份日志每轮无条件注入：模型看见一串 ✓，学到的是「上次那么干是对的」，其中混着
+// 「其实没做出来」的那些，它学的是假的。
+// 唯一能不靠打分戳破它的执行事实：上一轮记了 ✓，你隔了没多久又提了同一件事。
+test("返工配对只认执行事实，宁可漏配也不错扣一个 ✓", () => {
+  const mark = load("_markReworkIfAny", {
+    _taskWords: load("_taskWords", { _EP_STOP: loadConst("_EP_STOP") }),
+    _taskSim: load("_taskSim", { _taskWords: load("_taskWords", { _EP_STOP: loadConst("_EP_STOP") }) }),
+    _REWORK_WINDOW_MS: loadConst("_REWORK_WINDOW_MS"),
+    _REWORK_SIM: loadConst("_REWORK_SIM"),
+  });
+  const ep = (ts, task, outcome) => ({ ts, task, outcome });
+  const pair = (prev, next) => { const eps = [{ ...prev }]; mark(eps, next); return eps[0]; };
+
+  // 该配的：隔得不久 + 同一件事 + 上一轮是 ✓
+  const hit = pair(ep("2026-08-20T10:00:00", "修登录跳转 auth", "success"),
+                   ep("2026-08-20T10:07:00", "修登录跳转 auth 还是不对", "failed"));
+  assert.ok(hit.reworkedAt, "隔 7 分钟又提同一件事没被配上 —— 这把尺子等于没有");
+  assert.match(String(hit.reworkPrompt), /还是不对/, "没把用户当时的原话带上");
+
+  // 不该配的三种。错扣一个 ✓ 比漏配严重得多：会让模型不敢再用一个本来对的做法。
+  assert.ok(!pair(ep("2026-08-20T10:00:00", "修登录跳转 auth", "success"),
+                  ep("2026-08-20T10:05:00", "写个 readme 文档", "failed")).reworkedAt,
+    "不相关的下一件事被当成了返工");
+  assert.ok(!pair(ep("2026-08-20T10:00:00", "修登录跳转 auth", "success"),
+                  ep("2026-08-20T12:30:00", "修登录跳转 auth", "failed")).reworkedAt,
+    "隔了两个半小时还配 —— 那是下一件事，不是返工");
+  assert.ok(!pair(ep("2026-08-20T10:00:00", "修登录跳转 auth", "failed"),
+                  ep("2026-08-20T10:05:00", "修登录跳转 auth", "failed")).reworkedAt,
+    "上一轮本来就记了 ✗，不存在「假 ✓」，不该再配");
+
+  // 阈值必须比「检索相似经验」那条严得多，否则会大面积错扣。
+  assert.ok(loadConst("_REWORK_SIM") > 0.3,
+    "相似度阈值太松，会把「接着往下做」误判成返工");
+
+  // 红线：**不许**拿它去改结局枚举（那个只认执行事实，「用户又提了一遍」是判断不是事实）。
+  const src = extractFn("_markReworkIfAny");
+  assert.doesNotMatch(src, /\.outcome\s*=[^=]/,
+    "拿返工去改 outcome 了 —— 那是 harness 替模型下结论，结局枚举只认执行事实");
+
+  // 渲染必须把两条事实**并列**给出，并带上用户原话；算出来了不拼进输出等于没做。
+  const journal = extractFn("_projectJournalBlock");
+  assert.match(journal, /e\.reworkedAt/, "日志没读返工事实");
+  assert.match(journal, /\$\{rework\}/, "返工事实算出来了却没拼进输出行");
+  assert.match(journal, /reworkPrompt/, "没把用户当时的原话一起显示 —— 配错时模型无从判断");
+});
+
+// 返工率：整套「内部迭代」里唯一一把能直接读出来的尺子。
+test("返工率按执行事实算，不需要谁打分", () => {
+  const rate = load("_reworkRate", {
+    _epLoad: (() => {
+      const eps = [];
+      for (let i = 0; i < 8; i++) eps.push({ outcome: "success", reworkedAt: i < 2 ? "x" : null });
+      eps.push({ outcome: "failed" }); // 失败轮不进分母
+      return () => eps;
+    })(),
+  });
+  const r = rate("/repo", 30);
+  assert.equal(r.total, 8, "分母必须只数 ✓ —— 失败轮本来就不是「假 ✓」");
+  assert.equal(r.reworked, 2);
+  assert.ok(Math.abs(r.rate - 0.25) < 1e-9);
+
+  // 光算出来不算数：必须真的进模型看得到的上下文，否则又是一条「算了没人读」。
+  const journal = extractFn("_projectJournalBlock");
+  assert.match(journal, /_reworkRate\(root, 30\)/, "返工率没接进项目日志 —— 算了没人读");
+  assert.match(journal, /\+ rrLine/, "算出来了却没拼进输出");
+  assert.match(journal, /rr\.reworked > 0/, "没有返工时也要说一句，那是噪音");
+});
+
+// ---- 离线通道：跨几百轮才显形的规律，轮内学习结构上看不见 ----
+//
+// 收尾那次蒸馏只有一次模型调用、几秒超时、输出限死一句；热区只存 120 条，超了就扔。
+// 「这个项目每次改路由都忘了改测试」这种规律在单轮里是噪声，在两百轮里才是信号。
+test("滚出热区的运行记录进档案，不再直接丢掉", () => {
+  const src = extractFn("_epSave");
+  assert.match(src, /_epArchivePush\(root, eps\.slice\(0, eps\.length - 120\)\)/,
+    "超出热区的记录还是被直接扔了 —— 离线通道就没有原料");
+  const push = extractFn("_epArchivePush");
+  assert.match(push, /slice\(-_EP_ARCHIVE_CAP\)/, "档案没有上限，会无限涨");
+  assert.ok(loadConst("_EP_ARCHIVE_CAP") >= 1000,
+    "档案上限太小 —— 跨轮规律要几百轮才显形，存不下就白搭");
+});
+
+test("离线蒸馏：不进前台、不常跑、只写带得出数的事实", () => {
+  const src = extractFn("_offlineDistillIfDue");
+  // 不常跑：攒够一批才跑一次，而且先记账再干活（失败也不许变成重试风暴）。
+  assert.match(src, /total - last < _DISTILL_EVERY/, "没有攒批闸门，会每轮都发一次模型调用");
+  assert.ok(loadConst("_DISTILL_EVERY") >= 20, "攒批阈值太小，成本会失控");
+  const markAt = src.indexOf("localStorage.setItem(_distillMarkKey(root)");
+  const fetchAt = src.indexOf("_fetchCompletionText");
+  assert.ok(markAt > 0 && fetchAt > 0 && markAt < fetchAt,
+    "要先记账再发请求 —— 否则失败一次就会每轮重试，变成重试风暴");
+  // 不重入。
+  // 认的是**那道闸本身**，不是这个名字出现过 —— finally 里的复位赋值也含这个名字，
+  // 按名字断言会被它自己喂到（这个仓库栽过不止一次）。
+  assert.match(src, /if \(window\._distillRunning\) return;/,
+    "没有并发闸，两轮同时结束会重复发请求");
+  const setAt = src.indexOf("window._distillRunning = true;");
+  assert.ok(setAt > 0 && setAt < src.indexOf("_fetchCompletionText"),
+    "并发标志要在发请求之前置位，否则闸门形同虚设");
+  // 只写事实：提示词里必须明令禁止空话，并要求带支持次数。
+  assert.match(src, /禁止空话/, "没禁空话 —— 「建议加强测试」这种对模型基本无效");
+  assert.match(src, /support/, "没要求给出支持次数，就无法分辨规律和臆测");
+  // 落点要走已有的长期记忆路径，别另造一套没人读的存储。
+  assert.match(src, /_kgAddNoteRecord\(root, `〔跨轮规律〕/,
+    "结论没落进长期记忆 —— 又会变成一条算了没人读的线");
+
+  // 不进前台：调用点不许 await，异常不许冒泡。
+  const loop = extractFn("_runAgenticLoop");
+  assert.match(loop, /void _offlineDistillIfDue\(memoryRoot \|\| root, config\)/,
+    "离线蒸馏被 await 了或没接上 —— 前者会拖慢收尾，后者等于没做");
+  const at = loop.indexOf("_offlineDistillIfDue");
+  assert.match(loop.slice(Math.max(0, at - 120), at + 80), /try \{/,
+    "调用点没有 try —— 离线通道的异常会打断这一轮的收尾");
+  // 用的是身份根，不是会漂的那个（和经验管道同一条命）。
+  assert.doesNotMatch(loop, /_offlineDistillIfDue\(root,/,
+    "又用回会漂的 root 了 —— 档案会散落在多个抽屉里");
+});
+
+test("蒸馏摘要要带上返工事实，否则一串 ✓ 会把规律盖住", () => {
+  const src = extractFn("_distillDigest");
+  assert.match(src, /e\.reworkedAt/,
+    "摘要里没有返工标记 —— 模型看到的又是一串 ✓，跨轮规律里最值钱的那类就丢了");
+  assert.match(src, /_epArchiveLoad\(root\)\.concat\(_epLoad\(root\)\)/,
+    "只看热区不看档案，等于没有离线视野");
+  assert.match(src, /slice\(-240\)/, "摘要没有上限，会把一次调用撑爆");
 });

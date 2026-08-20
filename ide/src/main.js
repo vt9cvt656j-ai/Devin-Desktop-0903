@@ -26346,6 +26346,9 @@ async function sendPrompt(text, attachments = [], readyConfig = null, opts = {})
         config,
         messages,
         root: _contextRoot,
+        // 记忆一律按会话身份根存取：root 会跟着编辑器里打开的文件下沉到子目录，
+        // 拿它当记忆键会让写入和读取连到两个不同的抽屉（见 _recordEpisode 头注释）。
+        memoryRoot: _identityRoot,
         session: sess,
         mode: effectiveMode,
         task: text,
@@ -37420,7 +37423,10 @@ function _kgRecordCorrection(root, input = {}) {
   const incorrect = String(input.incorrect || "").trim().replace(/\s+/g, " ").slice(0, 240);
   const correctedId = String(input.correctedId || "").trim();
   const corrected = String(input.corrected || "").trim().replace(/\s+/g, " ").slice(0, 240);
-  if (!incorrectId || corrected.length < 5) return null;
+  // 地板不能是 5：「以后不要用 npm，改用 pnpm」这类纠正里，corrected 恰恰是
+  // pnpm / yarn / bun / uv / vite 这种四字母工具名 —— 两道语义闸全过，最后死在长度上，
+  // 账本一行不写，而且完全静默。「以后一律用 X」里最常见的那个 X 就是这么丢的。
+  if (!incorrectId || corrected.length < 2) return null;
   const corrections = _kgCorrectionLoad(root);
   const duplicate = corrections.find((item) => item.incorrectId === incorrectId
     && String(item.corrected || "").toLowerCase() === corrected.toLowerCase());
@@ -45892,8 +45898,29 @@ const _EPISODE_STORE = "memory-episodes.json";
 const _EP_STOP = new Set(["the","a","an","to","of","in","on","for","and","or","is","it","this","that","with","my","me","please","help","我","你","的","了","把","给","帮","一下","一个","这个","那个","请","让","和","与","怎么","如何","需要","想","要","现在","然后","看看","就是","可以"]);
 function _epKey(root) { return "michael-ide.episodes:" + (root || "_global"); }
 function _epLoad(root) { try { return JSON.parse(localStorage.getItem(_epKey(root)) || "[]") || []; } catch { return []; } }
+// 滚出热区的 episode 不再直接丢掉，先进档案。
+//
+// 真正值钱的模式全是跨几百轮才显形的（「这个项目每次改路由都忘了改测试」「用 sed 改 JSON
+// 必失败，用 node 一次就过」）——它们在单轮里是噪声，在两百轮里才是信号。热区只有 120 条、
+// 超了就扔，结构上就看不见这一层。档案是离线通道的原料。
+const _EP_ARCHIVE_CAP = 2000;
+function _epArchiveKey(root) { return "michael-ide.ep-archive:" + (root || "_global"); }
+function _epArchiveLoad(root) {
+  try { return JSON.parse(localStorage.getItem(_epArchiveKey(root)) || "[]") || []; } catch { return []; }
+}
+function _epArchivePush(root, evicted) {
+  if (!Array.isArray(evicted) || !evicted.length) return;
+  try {
+    let arc = _epArchiveLoad(root).concat(evicted);
+    if (arc.length > _EP_ARCHIVE_CAP) arc = arc.slice(-_EP_ARCHIVE_CAP);
+    localStorage.setItem(_epArchiveKey(root), JSON.stringify(arc));
+    if (inTauri) (async () => {
+      try { const st = await loadStore(_EPISODE_STORE); await st.set("arc:" + (root || "_global"), arc); await st.save(); } catch {}
+    })();
+  } catch (e) { console.warn("[ep] archive failed:", e); }
+}
 function _epSave(root, eps) {
-  if (eps.length > 120) eps = eps.slice(-120);
+  if (eps.length > 120) { _epArchivePush(root, eps.slice(0, eps.length - 120)); eps = eps.slice(-120); }
   try { localStorage.setItem(_epKey(root), JSON.stringify(eps)); } catch (e) { console.warn("[ep] local save failed:", e); }
   if (inTauri) (async () => { try { const s = await loadStore(_EPISODE_STORE); await s.set("ep:" + (root || "_global"), eps); await s.save(); } catch (e) { console.warn("[ep] file mirror failed:", e); } })();
 }
@@ -45927,6 +45954,122 @@ function _taskSim(aWords, b) {
   let inter = 0; for (const w of aWords) if (bw.has(w)) inter++;
   return inter / Math.sqrt(aWords.size * bw.size); // cosine-ish over content words
 }
+// ── 返工配对 ────────────────────────────────────────────────────────────
+// 日志里的 ✓ 只表示「这一轮正常收尾了」，**不表示东西做出来了**（下面渲染处的注释早就
+// 承认了这个洞）。而这份日志是每轮无条件注入的：模型看见一串 ✓，学到的是「上次那么干是
+// 对的」——一串里混着「其实没做出来」的那些，它学的是假的。
+//
+// 唯一能不靠打分就把它戳破的，是一个执行事实：上一轮记了 ✓，而你隔了没多久又提了同一件事。
+// 两个都是事实，谁都不用下判断。
+//
+// **不改 outcome 枚举**：那个枚举只认执行事实，「用户又提了一遍」是一次判断、不是事实，
+// 拿它去改结局就成了 harness 替模型下结论。只在那条 episode 上**并列挂一个事实**，
+// 渲染时两条事实并排给模型看，结论让它自己得。
+//
+// 阈值宁高勿低：宁可漏配几条，也不能错扣一个 ✓ —— 错扣会让模型不敢再用一个本来对的做法。
+// 而且渲染时把你当时的原话一起显示，即使配错了，模型看到原话也能自己判断。
+const _REWORK_WINDOW_MS = 30 * 60 * 1000; // 隔太久就不是返工，是下一件事
+const _REWORK_SIM = 0.35;                 // _retrieveEpisodes 判「相似」用 0.14，这里要严得多
+function _markReworkIfAny(eps, ep) {
+  try {
+    const prev = eps[eps.length - 1];
+    if (!prev || prev.outcome !== "success" || prev.reworkedAt) return;
+    const gap = Date.parse(String(ep.ts || "") + "Z") - Date.parse(String(prev.ts || "") + "Z");
+    if (!Number.isFinite(gap) || gap < 0 || gap > _REWORK_WINDOW_MS) return;
+    if (_taskSim(_taskWords(prev.task), ep.task) < _REWORK_SIM) return;
+    prev.reworkedAt = ep.ts;
+    prev.reworkPrompt = String(ep.task || "").slice(0, 60);
+  } catch { /* 配不上就算了：绝不能因为配对失败丢掉这条 episode */ }
+}
+function _reworkGapText(fromTs, toTs) {
+  const ms = Date.parse(String(toTs || "") + "Z") - Date.parse(String(fromTs || "") + "Z");
+  if (!Number.isFinite(ms) || ms < 0) return "不久";
+  const min = Math.round(ms / 60000);
+  return min < 1 ? "不到 1 分钟" : `${min} 分钟`;
+}
+// 返工率 = 最近 N 条 ✓ 里被配上返工的比例。这是整套「内部迭代」里唯一一把能直接读出来的
+// 尺子：命中率上去了不等于活干得更好，返工率下来了才是。完全由执行事实算出，不用谁打分。
+function _reworkRate(root, n = 30) {
+  try {
+    const eps = _epLoad(root).filter((e) => e && e.outcome === "success").slice(-n);
+    if (!eps.length) return null;
+    const reworked = eps.filter((e) => e.reworkedAt).length;
+    return { total: eps.length, reworked, rate: reworked / eps.length };
+  } catch { return null; }
+}
+// ── 离线通道 ─────────────────────────────────────────────────────────────
+// 现在所有学习都被压在一轮之内，而且压在「不能拖慢首字」这个预算里：收尾那次蒸馏只有一次
+// 模型调用、几秒超时、输出限死一句。一句话能装下的只有结论，装不下事实。更要命的是样本量
+// ——热区 120 条，超了就扔。
+//
+// 而真正值钱的模式全是跨几百轮才显形的：
+//   · 「这个项目每次改路由都会忘了改测试」
+//   · 「用 sed 改这个项目的 JSON 必失败，用 node 一次就过」
+//   · 「用户说『简单点』之后，返工大多来自我又加了一层抽象」
+// 这三条在单轮里都是噪声，在两百轮里都是信号。轮内学习**结构上**看不见它们 —— 不是没做好，
+// 是没有那个视野。这条通道就是补这个视野：攒档案 → 隔一阵批量看一次 → 结论落进长期记忆，
+// 由已有的检索路径（_kgRetrieveBlock）在相关时自己捞回来。
+//
+// 三条约束：
+//   · **不进前台**：fire-and-forget，任何异常都不许冒泡到这一轮的收尾。
+//   · **不常跑**：攒够 _DISTILL_EVERY 条新记录才跑一次，一次一个模型调用。
+//   · **只写事实**：每条结论必须带「几次里出现过几次」，禁止「建议加强测试」这类空话——
+//     形容词对模型基本无效，能用的是「这个项目最近 12 次改 router 里有 9 次没跟着改测试」。
+const _DISTILL_EVERY = 40;
+function _distillMarkKey(root) { return "michael-ide.ep-distill-at:" + (root || "_global"); }
+function _distillDigest(root) {
+  const all = _epArchiveLoad(root).concat(_epLoad(root));
+  return all.slice(-240).map((e) => {
+    const tag = e.outcome === "failed" ? "✗" : e.outcome === "partial" ? "△" : "✓";
+    const files = (e.files || []).slice(0, 4).join(",");
+    return `${tag} ${String(e.task || "").slice(0, 70)}`
+      + (files ? ` | 改:${files}` : " | 未改文件")
+      + (e.reworkedAt ? " | 用户随后又提了同一件事" : "")
+      + (e.insight ? ` | 当时小结:${String(e.insight).slice(0, 60)}` : "");
+  }).join("\n");
+}
+async function _offlineDistillIfDue(root, config) {
+  try {
+    if (!config || !config.baseUrl || !config.apiKey) return;
+    if (window._distillRunning) return;
+    const total = _epArchiveLoad(root).length + _epLoad(root).length;
+    const last = Number(localStorage.getItem(_distillMarkKey(root)) || 0);
+    if (total - last < _DISTILL_EVERY) return;
+    window._distillRunning = true;
+    localStorage.setItem(_distillMarkKey(root), String(total)); // 先记账：失败也不要重试风暴
+    const digest = _distillDigest(root);
+    if (!digest.trim()) return;
+    const sys = "你在读一个开发者 IDE 的历史运行记录，任务是找出**跨很多轮才看得出来**的规律。"
+      + "只输出严格 JSON：{\"lessons\":[{\"fact\":\"...\",\"support\":\"N 次中 M 次\"}]}，最多 5 条，可以是空数组。"
+      + "硬要求："
+      + "① 每条必须是**这个项目的具体事实**，带得出数（几次里几次）。"
+      + "② 禁止空话：「建议加强测试」「注意代码质量」这类一条都不要，宁可返回空数组。"
+      + "③ 只写单轮里看不出来、要攒很多轮才显形的规律；单轮就能发现的不写。"
+      + "④ 每条 ≤80 字，写成下次能直接照做的说法。";
+    const user = `历史运行记录（每行一轮，✓/△/✗ 是收尾状态，不代表活干成了）：\n${digest}`;
+    const ctrl = typeof AbortController !== "undefined" ? new AbortController() : null;
+    const to = ctrl ? setTimeout(() => ctrl.abort(), 40000) : null;
+    const text = await _fetchCompletionText(_chatCompletionsUrl(config.baseUrl), {
+      "Content-Type": "application/json",
+      Authorization: "Bearer " + (config.apiKey || ""),
+      "x-ide-request-id": String(config.requestId || "").slice(0, 128),
+    }, { model: config.model, messages: [{ role: "system", content: sys }, { role: "user", content: user }], max_tokens: 800 },
+      ctrl ? ctrl.signal : undefined);
+    if (to) clearTimeout(to);
+    const j = _safeJsonLoose(text || "");
+    const lessons = Array.isArray(j?.lessons) ? j.lessons : [];
+    let written = 0;
+    for (const l of lessons.slice(0, 5)) {
+      const fact = String(l?.fact || "").trim();
+      if (fact.length < 8) continue; // 太短的多半是空话
+      const support = String(l?.support || "").trim();
+      _kgAddNoteRecord(root, `〔跨轮规律〕${fact}${support ? `（${support}）` : ""}`, true);
+      written++;
+    }
+    if (written) console.log(`[distill] 从 ${total} 条运行记录里沉淀了 ${written} 条跨轮规律`);
+  } catch (e) { console.warn("[distill] skipped:", e?.message || e); }
+  finally { try { window._distillRunning = false; } catch {} }
+}
 function _retrieveEpisodes(task, root, k) {
   const eps = _epLoad(root); if (!eps.length) return [];
   const tw = _taskWords(task); if (!tw.size) return [];
@@ -45959,13 +46102,33 @@ function _projectJournalBlock(root) {
       // ✓ 只表示这一轮正常收尾了，不表示东西做出来了。纯聊天/纯调研的轮次也记 ✓，
       // 括号缺席全靠模型去猜——明写"未改动文件"，"登录页并没有被写出来"就成了
       // 上下文里的显式事实，而不是一个需要推断的空白。
-      return `- ${String(e.ts || "").slice(0, 10)} ${tag} ${String(e.task || "").slice(0, 60)}${files ? `（改了 ${files}）` : "（未改动文件）"}`;
+      // 返工事实和 ✓ 并列显示，不合并成一个结论。模型看见两条事实自己判断；
+      // 你当时的原话也一起给出，万一配错了它也能看出来。
+      const rework = e.reworkedAt
+        ? `〔${_reworkGapText(e.ts, e.reworkedAt)}后你又提了同一件事：「${String(e.reworkPrompt || "").slice(0, 40)}」〕`
+        : "";
+      return `- ${String(e.ts || "").slice(0, 10)} ${tag} ${String(e.task || "").slice(0, 60)}${files ? `（改了 ${files}）` : "（未改动文件）"}${rework}`;
     });
-    return "\n--- 项目日志（本项目最近干过的活，以工作区文件实况为准）---\n" + lines.join("\n");
+    // 返工率作为一条**执行事实**并列在日志末尾：不下结论、不打分，只说数。
+    // 只在真有返工时才说 —— 0 次的时候说一句「返工率 0%」是噪音。
+    const rr = _reworkRate(root, 30);
+    const rrLine = rr && rr.reworked > 0
+      ? `\n（最近 ${rr.total} 次收尾里，有 ${rr.reworked} 次用户在半小时内又提了同一件事）`
+      : "";
+    return "\n--- 项目日志（本项目最近干过的活，以工作区文件实况为准）---\n" + lines.join("\n") + rrLine;
   } catch { return ""; }
 }
 // (Store+reflect) at run end: persist the episode (Storage) and distill a reusable
 // insight (Reflection→Experience; for a FAILED run, a Reflexion "what to avoid").
+// root 这里必须是**会话身份根**，不是跟着打开的文件漂的那个上下文根。
+//
+// 读取那侧（_episodeHintBlock / _projectJournalBlock / _workflowHintBlock）早就改对了，
+// 26231 行那句注释写着「经验/工作流也按会话身份存取，别跟着打开的文件漂」——但写入这侧
+// 没跟着改，调用点一直传的是 _contextRoot。在「父仓套 ide 仓、website/ 和 src-tauri/ 各自
+// 带项目标记」这种形状里，两头连的是两个不同的抽屉：写进去 120 条，读出来 0 条，
+// 而且 _epLoad 失败只返回空数组，全程一声不响。
+//
+// 整条经验管道（干过的活 → 下次参考）就断在这一个参数上。
 async function _recordEpisode(run, task, root, outcome, config, session = null) {
   try {
     if (!task || !run || !Array.isArray(run.recording) || run.recording.length < 2) return; // skip trivial
@@ -45977,7 +46140,9 @@ async function _recordEpisode(run, task, root, outcome, config, session = null) 
       task: String(task).slice(0, 160), outcome, steps: steps.length, files,
       approach: steps.slice(0, 12).map((s) => s.label).filter(Boolean).join(" → ").slice(0, 280), insight: "",
     };
-    const eps = _epLoad(root); eps.push(ep); _epSave(root, eps); // Storage stage (immediate)
+    const eps = _epLoad(root);
+    _markReworkIfAny(eps, ep); // 上一条 ✓ 如果被这一轮返工了，就地挂一条并列事实
+    eps.push(ep); _epSave(root, eps); // Storage stage (immediate)
 
     // ONE model call per finished run, covering both learning stages.
     //
@@ -46611,19 +46776,25 @@ function _toolExpRetrieve(profileKeys, limit = 8) {
     try { arr = JSON.parse(localStorage.getItem(key) || "[]") || []; } catch { return ""; }
     const matchings = arr.filter((e) => e.sig === sig).slice(-50); // recent same-sig history
     if (matchings.length === 0) return "";
-    // 按 sig+tool 分组，计算连续失败次数
+    // 按 tool 分组——**不能把成败拆进 key**。
+    //
+    // 原来的分组键是 `${e.tool}|${e.ok ? "ok" : "fail"}`，于是 fail 桶里装的全是失败，
+    // 下面那句「最近 3 条全是失败」**恒真**：任何一个历史上失败过 3 次的工具都会被打上
+    // 「近期屡次失败」——哪怕它 45 次成功、3 次失败、最近 5 次全成。模型据此绕开一个
+    // 本来好用的工具，学到的是**反的**。注释写的是「连续失败」，代码算的不是。
+    //
+    // 正确判据：同一个工具的记录按时间排好，看**最近 3 条**是不是都失败。
     const grouped = new Map();
     for (const e of matchings) {
-      const k = `${e.tool}|${e.ok ? "ok" : "fail"}`;
-      if (!grouped.has(k)) grouped.set(k, []);
-      grouped.get(k).push(e);
+      if (!grouped.has(e.tool)) grouped.set(e.tool, []);
+      grouped.get(e.tool).push(e);
     }
-    // 检测同一 sig+tool 组合的最近连续失败≥3 次
     const warnings = new Set();
-    for (const [k, items] of grouped) {
+    for (const [toolName, items] of grouped) {
       if (items.length < 3) continue;
-      const tail = items.slice(-3);
-      if (tail.every((x) => !x.ok)) warnings.add(k.split("|")[0]);
+      const ordered = [...items].sort((a, b) => (Number(a.ts) || 0) - (Number(b.ts) || 0));
+      const tail = ordered.slice(-3);
+      if (tail.every((x) => !x.ok)) warnings.add(toolName);
     }
     // 按工具名聚合：总调用、成功、失败、失败类别分布、警告标记
     const summary = new Map();
@@ -46918,7 +47089,7 @@ function _applyLateIntentIfLanded(run, config, task, session, body, isLive, mess
   return true;
 }
 
-async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mode, task, engineering = null, intentState = null, skillsBlock = "", billingTasks = [], taskStartedAt = Date.now(), timeline = null }) {
+async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot = "", session, mode, task, engineering = null, intentState = null, skillsBlock = "", billingTasks = [], taskStartedAt = Date.now(), timeline = null }) {
   _clearPlanChip(); // drop any stale plan chip from a previous task before this run starts
   // session/root 先解析：意图画像要读本会话刚确认的语义帧，必须拿到真 session。
   session = session || _currentSession();
@@ -50450,7 +50621,11 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
     if (!awaitingUserReply && run.mode === "agent" && task) {
       // The visible response is already rendered and streaming has ended above.
       // Reflection therefore cannot delay first-token or live output latency.
-      try { await _recordEpisode(run, task, root, _runOutcome, config, session); } catch {}
+      // 传身份根，不传会漂的 root —— 否则写进去的经验读取那侧永远取不回来（见函数头注释）。
+      try { await _recordEpisode(run, task, memoryRoot || root, _runOutcome, config, session); } catch {}
+      // 离线通道：攒够一批就在后台批量看一次历史，沉淀跨轮规律。不 await——它跟这一轮的
+      // 交付无关，任何异常都不许冒泡进收尾。
+      try { void _offlineDistillIfDue(memoryRoot || root, config); } catch {}
       // on_run_end hook（fire-and-forget）：工作区可在运行结束时挂通知/清理命令。
       _fireHooks(root, "on_run_end", { tool: "run_end", outcome: _runOutcome, task: String(task).slice(0, 200), files: [...(_mutatedFiles || [])].slice(0, 20) }).catch(() => {});
     }
