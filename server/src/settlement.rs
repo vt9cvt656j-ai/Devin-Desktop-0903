@@ -282,25 +282,41 @@ async fn drain_redis(state: &AppState) -> anyhow::Result<()> {
 async fn recover_pending(state: &AppState) -> anyhow::Result<(u64, u64)> {
     let mut resolved = 0u64;
     let mut deferred = 0u64;
+    // 本轮已经试过的行。**这一条是整个重试节奏的关键**。
+    //
+    // 查询取的是「最老的、attempts 未到顶的那一行」，而补扣失败只把 attempts +1 ——
+    // 那一行**依然是最老的**。没有这个集合，下一次循环会立刻再选中它：200 次循环的额度里，
+    // 10 次重试在几毫秒内全部烧光，这笔账当场变死信。
+    //
+    // 也就是说 MAX_ATTEMPTS × RECOVERY_INTERVAL 那 5 分钟的重试窗口（本文件 SETTLED_RETENTION_DAYS
+    // 的注释正是这么写的）从来没有发生过：数据库抖 2 秒，钱就永久收不回来。线上实测到的
+    // settlement 2fa0de51（12 分，卡在 insert_usage，attempts=10）就是这么死的。
+    //
+    // 记下试过的，本轮不再碰 —— 每行每轮至多一次，10 次重试才真的摊在 10 个 tick 上。
+    let mut attempted_this_tick: std::collections::HashSet<uuid::Uuid> = Default::default();
     for _ in 0..BATCH_PER_TICK {
         // 每条独立事务 T1：`FOR UPDATE SKIP LOCKED` 认领一行，别的 worker 会跳过它。
         let mut t1 = state.db.begin().await?;
+        let skip: Vec<uuid::Uuid> = attempted_this_tick.iter().copied().collect();
         let row: Option<UnsettledRow> = sqlx::query_as(
             "SELECT settlement_id, user_id, conn_id, request_id, cost_cents, use_quota, free_pool, \
                     free_micro_usd, prompt_tokens, completion_tokens, cached_tokens, cache_creation_tokens, \
                     model_name, estimated, ide_mode, is_tool_turn, emitted_tool \
              FROM unsettled_charges \
-             WHERE resolved_at IS NULL AND attempts < $1 \
+             WHERE resolved_at IS NULL AND attempts < $1 AND settlement_id <> ALL($2) \
              ORDER BY created_at \
              LIMIT 1 FOR UPDATE SKIP LOCKED",
         )
         .bind(MAX_ATTEMPTS)
+        .bind(&skip)
         .fetch_optional(&mut *t1)
         .await?;
         let Some(row) = row else {
             let _ = t1.rollback().await;
             break; // 没有待处理的了
         };
+
+        attempted_this_tick.insert(row.settlement_id);
 
         // 模糊提交兜底：原始结算若其实已落库（账本里有它），绝不再扣第二次。
         // 取真实列（uuid）而不是 `SELECT 1`——后者是 int4，映射成 (i64,) 会在**运行时**类型报错，
@@ -320,23 +336,37 @@ async fn recover_pending(state: &AppState) -> anyhow::Result<(u64, u64)> {
 
         match outcome {
             crate::models::BillOutcome::Settled | crate::models::BillOutcome::AlreadySettled => {
+                let label = if outcome == crate::models::BillOutcome::AlreadySettled {
+                    "already_settled"
+                } else {
+                    "recovered"
+                };
                 sqlx::query(
                     "UPDATE unsettled_charges SET resolved_at = now(), last_error = $2 WHERE settlement_id = $1",
                 )
                 .bind(row.settlement_id)
-                .bind(match outcome {
-                    crate::models::BillOutcome::AlreadySettled => "already_settled",
-                    _ => "recovered",
-                })
+                .bind(label)
                 .execute(&mut *t1)
                 .await?;
                 resolved += 1;
             }
-            crate::models::BillOutcome::Deferred => {
+            crate::models::BillOutcome::Deferred { stage, error } => {
+                // 记下**这一次**失败在哪、为什么。原来这里写死一个 'resettle_failed'，
+                // 把真实原因盖掉了：告警让人去人工对账，人打开一看只有这个常量，没有任何线索。
+                // stage 也要跟着走 —— 原来那一列固定停在首次入队时的失败点，重试改在别处失败
+                // 也看不出来。错误文本掐短，队列行不是日志，别让一条 500KB 的报错撑爆它。
+                let mut detail = format!("{stage}: {error}");
+                if detail.len() > 500 {
+                    detail.truncate(500);
+                }
                 sqlx::query(
-                    "UPDATE unsettled_charges SET attempts = attempts + 1, last_error = 'resettle_failed' WHERE settlement_id = $1",
+                    "UPDATE unsettled_charges \
+                     SET attempts = attempts + 1, stage = $2, last_error = $3 \
+                     WHERE settlement_id = $1",
                 )
                 .bind(row.settlement_id)
+                .bind(stage)
+                .bind(&detail)
                 .execute(&mut *t1)
                 .await?;
                 deferred += 1;
@@ -349,8 +379,20 @@ async fn recover_pending(state: &AppState) -> anyhow::Result<(u64, u64)> {
 
 /// 清理：账本旧行、已了结的队列行、以及已放弃（attempts 到顶）的死信只留错、不删（留给人工）。
 async fn prune(state: &AppState) -> anyhow::Result<()> {
+    // 账本行是「这笔已经扣过了」的唯一证据，也是**不重复扣钱**那条硬约束的支点。
+    //
+    // 只按时间删是不够的：死信行是故意永久保留、等人工对账的，而账本 7 天就清。于是
+    // 「模糊提交」（钱其实扣了、commit 报错了）那一笔，8 天后人工重置 attempts 重跑恢复时，
+    // 账本里已经查不到它 —— 下面那句「先查账本再补扣」查了个空，于是**再扣一次**。
+    // 保留期是给自动恢复（约 5 分钟）留的，从来没考虑过没有时间上限的死信。
+    //
+    // 所以加一条：还有未了结队列行指着的账本，不管多旧都不删。
     let _ = sqlx::query(&format!(
-        "DELETE FROM settled_requests WHERE settled_at < now() - interval '{SETTLED_RETENTION_DAYS} days'"
+        "DELETE FROM settled_requests s \
+         WHERE s.settled_at < now() - interval '{SETTLED_RETENTION_DAYS} days' \
+           AND NOT EXISTS ( \
+                 SELECT 1 FROM unsettled_charges u \
+                  WHERE u.settlement_id = s.settlement_id AND u.resolved_at IS NULL)"
     ))
     .execute(&state.db)
     .await?;
@@ -360,17 +402,29 @@ async fn prune(state: &AppState) -> anyhow::Result<()> {
     ))
     .execute(&state.db)
     .await?;
-    // 死信（attempts 到顶还没了结）不删，叫一声让人看见。
-    let dead: Option<(i64,)> = sqlx::query_as(
-        "SELECT COUNT(*) FROM unsettled_charges WHERE resolved_at IS NULL AND attempts >= $1",
+    // 死信（attempts 到顶还没了结）不删——它要留给人工对账。但**只叫一次**。
+    //
+    // 原来这里每个 tick 都 COUNT 一遍再打一条 ERROR，而行又永远不删，于是一笔卡住的账
+    // 每 30 秒叫一次、跨容器重启继续叫：线上那笔 12 分的死账已经这么叫了一整天。
+    // 而且它只报个数字，真出现新死信时日志上只是 count=1 变 count=2，淹在两千多条重复里
+    // 根本看不出来——又吵又没用。
+    //
+    // 改成认领式：把还没叫过的挑出来，逐条报清楚（谁、多少钱、卡在哪、为什么），
+    // 然后盖上 alerted_at。于是一条 ERROR 精确对应一笔新死信。
+    let newly_dead: Vec<(uuid::Uuid, i64, String, String, Option<String>)> = sqlx::query_as(
+        "UPDATE unsettled_charges SET alerted_at = now() \
+          WHERE resolved_at IS NULL AND alerted_at IS NULL AND attempts >= $1 \
+          RETURNING settlement_id, cost_cents, model_name, stage, last_error",
     )
     .bind(MAX_ATTEMPTS)
-    .fetch_optional(&state.db)
+    .fetch_all(&state.db)
     .await?;
-    if let Some((n,)) = dead {
-        if n > 0 {
-            tracing::error!(count = n, "settlement: {n} charges gave up after max attempts (dead-letter, need manual reconcile)");
-        }
+    for (settlement_id, cost_cents, model_name, stage, last_error) in &newly_dead {
+        tracing::error!(
+            %settlement_id, cost_cents, model = %model_name, stage = %stage,
+            last_error = last_error.as_deref().unwrap_or("-"),
+            "settlement: charge gave up after max attempts (dead-letter, need manual reconcile)"
+        );
     }
     Ok(())
 }
@@ -442,6 +496,54 @@ mod tests {
         assert!(
             body.contains(".bind(request_id.as_deref())"),
             "request_id 应以 Option 形式绑定（None → NULL），照常入队",
+        );
+    }
+
+    /// 重试节奏：每行每轮至多一次。
+    ///
+    /// 少了这条，查询「最老的、attempts 未到顶的那一行」会在同一轮里把同一行反复选中，
+    /// 10 次重试几毫秒烧光、当场变死信——数据库抖 2 秒，钱就永久收不回来。线上实测到的
+    /// settlement 2fa0de51（12 分，insert_usage，attempts=10）就是这么死的。
+    #[test]
+    fn each_charge_gets_at_most_one_attempt_per_tick() {
+        let src = include_str!("settlement.rs");
+        let at = src.find("async fn recover_pending(").expect("recover_pending 改名了");
+        let body = &src[at..src[at..].find("\nasync fn ").map(|e| e + at).unwrap_or(src.len())];
+        assert!(
+            body.contains("attempted_this_tick"),
+            "本轮试过的行必须记下来，否则同一行会在一轮里被选满 MAX_ATTEMPTS 次",
+        );
+        assert!(
+            body.contains("settlement_id <> ALL($2)"),
+            "跳过集合必须真的进 SQL 的 WHERE，只在内存里记不影响选行",
+        );
+        let claim = body.find("attempted_this_tick.insert(").expect("必须登记已认领的行");
+        let charge = body.find("crate::models::resettle").expect("恢复要能补扣");
+        assert!(claim < charge, "要在补扣**之前**登记，否则补扣 panic/早返回时这一行仍会被重选");
+    }
+
+    /// 死信只叫一次，而且要说清楚为什么。
+    #[test]
+    fn dead_letters_alert_once_and_carry_their_reason() {
+        let src = include_str!("settlement.rs");
+        let at = src.find("async fn prune(").expect("prune 改名了");
+        let body = &src[at..src[at..].find("\n#[cfg(test)]").map(|e| e + at).unwrap_or(src.len())];
+        assert!(
+            body.contains("alerted_at IS NULL") && body.contains("SET alerted_at = now()"),
+            "必须认领式告警：挑没叫过的、叫完盖戳，否则一笔死账每 30 秒刷一条到世界末日",
+        );
+        assert!(
+            !body.contains("SELECT COUNT(*) FROM unsettled_charges"),
+            "别退回只报一个数字——新死信会淹在重复告警里看不出来",
+        );
+        assert!(
+            body.contains("last_error") && body.contains("cost_cents"),
+            "告警要带上钱数和失败原因，人工对账才有得查",
+        );
+        // 账本不能把还有人指着的行删掉，否则人工补扣时那道防重扣的门是空的。
+        assert!(
+            body.contains("NOT EXISTS") && body.contains("u.resolved_at IS NULL"),
+            "还有未了结队列行指着的账本行不许删——否则模糊提交那笔会被重复扣钱",
         );
     }
 
