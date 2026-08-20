@@ -24729,6 +24729,8 @@ const _INCOMPLETE_LABELS = {
   stub_delivery: "把留下的占位实现换成真的",
   // 「没读过就整文件覆写、还少了一大半」——这不是没做完，是把项目写坏了。
   overwrote_unread: "看一眼被覆写的文件，确认没把内容写没",
+  // 删了一个导出却没查过谁在用——「细节处理不够」里最常见也最能精确检测的一种。
+  removed_unchecked: "查一下被删掉的那几个还有谁在用",
   // 「说改完了，工作区一个字节没动」。写成祈使句，用户可以直接发出去当催办。
   // 排在表尾是刻意的：plan-advance 有条断言按「表头 600 字符内必须出现 user_stopped」
   // 检查，插在中间会把它挤出窗口——那条守卫是对的，让位的该是新条目。
@@ -37415,6 +37417,47 @@ async function _snapshotDirForUndo(dirPath) {
 ///   · **只报有原文佐证的字面命中**：给得出文件+行号+这一行的原文。不做语义猜测，
 ///     不去判断"这个函数是不是真的实现了"。
 ///   · **只陈述，不发红灯也不发绿灯**：它进交付事实行和未完成原因，不参与验证学分。
+/// 这一轮**删掉或改名**了哪些导出/函数声明，而且从没查过谁在用它们。
+///
+/// 「项目动不动被写坏」「细节处理不够」里，最常见也最可精确检测的一种：改一个文件时
+/// 顺手把某个函数/导出去掉了，而它在别处被引用着。提示词里写着「改已有文件前必须知道
+/// 它的调用方」，可全仓没有任何东西检查过这件事——lsp_references 摆在那儿，用不用全凭自觉。
+///
+/// 判据全部是执行事实，两条都必须成立才报：
+///   · 改前的原文里有这条声明，改后没有了（基线相减，和诊断只认新增错误同一套哲学）；
+///   · 本 run 里从没出现过这个名字的检索（search / lsp_references / find_symbol 的查询词）。
+/// 单独一条都可能正当——删死代码是对的，查过之后删也是对的。两条同时成立才是"没看就删"。
+function _removedDeclarationsUnchecked(run, searchedTerms, maxItems = 6) {
+  const cp = run?.checkpoint;
+  if (!cp || typeof cp.forEach !== "function") return [];
+  const DECL = /^\s*(?:export\s+)?(?:async\s+)?(?:function|class)\s+([A-Za-z_$][\w$]*)|^\s*export\s+(?:const|let|var)\s+([A-Za-z_$][\w$]*)|^\s*(?:pub\s+)?fn\s+([A-Za-z_$][\w$]*)|^\s*def\s+([A-Za-z_$][\w$]*)/;
+  const names = (text) => {
+    const out = new Set();
+    for (const line of String(text || "").split("\n")) {
+      const m = DECL.exec(line);
+      if (m) out.add(m[1] || m[2] || m[3] || m[4]);
+    }
+    return out;
+  };
+  const searched = new Set([...(searchedTerms instanceof Set ? searchedTerms : [])].map((x) => String(x || "").toLowerCase()));
+  const out = [];
+  cp.forEach((snap, absPath) => {
+    if (out.length >= maxItems) return;
+    const cur = snap?.current;
+    if (typeof cur !== "string" || !snap?.existed || !_CODE_FILE_RE.test(String(absPath))) return;
+    const after = names(cur);
+    for (const name of names(snap.content)) {
+      if (out.length >= maxItems) break;
+      if (after.has(name)) continue;
+      // 查过就不算。判据放宽到"检索词里出现过这个名字"——精确匹配太严，
+      // 模型常搜 "renderPlan(" 或 "调用 renderPlan" 这类形态。
+      if ([...searched].some((q) => q.includes(name.toLowerCase()))) continue;
+      out.push({ path: String(absPath).split("/").slice(-2).join("/"), name });
+    }
+  });
+  return out;
+}
+
 function _stubDeliveryFindings(run, maxItems = 8) {
   const cp = run?.checkpoint;
   if (!cp || typeof cp.forEach !== "function") return [];
@@ -42160,6 +42203,11 @@ function _deliveryFactsLine(run) {
   // 这一轮**新引入**的占位实现。和上面那条同一个性质：纯执行记录（读的是自己落盘的内容，
   // 基线相减，只报有原文佐证的字面命中），不去猜"这个函数实现得够不够"。
   // 说出来模型才有与「已经做好了」相矛盾的事实——用户原话「完成真正的产品而不是虚假的」。
+  // 删掉的声明也一起说：模型不知道自己刚把别人还在用的东西删了，下一轮不会去补。
+  const _gone = Array.isArray(run?._removedDecls) ? run._removedDecls : [];
+  const _goneLine = _gone.length
+    ? `这一轮删掉了 ${_gone.length} 个还没查过引用的声明（${_gone.slice(0, 3).map((g) => `${g.name}@${g.path}`).join("、")}${_gone.length > 3 ? " 等" : ""}）——先用 lsp_references / search 确认没人还在用，再说这块改完了`
+    : "";
   const _stubs = Array.isArray(run?._stubFindings) ? run._stubFindings : [];
   const _stubLine = _stubs.length
     ? `这一轮新写进去 ${_stubs.length} 处占位（${_stubs.slice(0, 3).map((s) => `${s.path}:${s.line} ${s.kind}`).join("；")}${_stubs.length > 3 ? " 等" : ""}）——这些地方现在是空的，别把它们算进"已完成"`
@@ -42167,9 +42215,9 @@ function _deliveryFactsLine(run) {
   if (!code.length) {
     // 没动源码就没什么可核对的（纯问答、只读排查、只改文档的 run 完全不受打扰）——
     // 但"尝试写入却没落盘"是必须说的事实，它和有没有动源码无关。
-    if (!_failedLine && !_stubLine) return "";
+    if (!_failedLine && !_stubLine && !_goneLine) return "";
     const v0 = run?._wrapUpVerdict;
-    const bits = [_failedLine, _stubLine].filter(Boolean);
+    const bits = [_failedLine, _stubLine, _goneLine].filter(Boolean);
     if (v0 && typeof v0.done === "boolean") {
       bits.push(v0.done ? "收尾评审：通过" : `收尾评审：未通过${v0.instruction ? " — " + String(v0.instruction).slice(0, 120) : ""}`);
     }
@@ -42177,6 +42225,7 @@ function _deliveryFactsLine(run) {
   }
   const parts = [`改了 ${code.length} 个源码文件`];
   if (_stubLine) parts.push(_stubLine);
+  if (_goneLine) parts.push(_goneLine);
   if (_failedLine) parts.push(_failedLine);
   if (verifiers.length) {
     const last = verifiers[verifiers.length - 1];
@@ -49095,6 +49144,29 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
         // 一个动作轮，非 runHadTrouble 粘滞位），故「先失败后自愈再收尾」不误判。详见对应测试。
         if (lastTurnHadFailure && run.mode === "agent" && !run._incompleteReason) {
           run._incompleteReason = `last_action_failed:${lastFailKinds || "tool"}`.slice(0, 120);
+        }
+        // 删掉/改名了一个导出，却从没查过谁在用它。判据两条都来自执行事实：
+        // 基线相减（改前有、改后没有）+ 本 run 的检索词里从没出现过这个名字。
+        // 搜索词从已有的工具账本现取，不新增状态。
+        if (run.mode === "agent") {
+          // 这一段到下面那个 break 之间是"只记账区"：有一条测试禁止循环跳转和推提醒的
+          // token 出现在这里（防的是把记账悄悄变成强制补回合）。所以下面用 filter/forEach
+          // 表达跳过，而不是 for 循环里的跳转语句。写注释时也别把那两个 token 打出来——
+          // 断言扫的是源码文本，注释里出现同样会被算上。
+          const _terms = new Set();
+          (run._toolLedger?.entries || [])
+            .filter((e) => /^(?:search|find_symbol|lsp_references|lsp_definition|semantic_search|grep)/.test(String(e?.tool || "")))
+            .forEach((e) => {
+              try {
+                const a = JSON.parse(e.args || "{}");
+                [a.query, a.name, a.pattern, a.symbol].forEach((v) => { if (v) _terms.add(String(v)); });
+              } catch {}
+            });
+          const _gone = _removedDeclarationsUnchecked(run, _terms);
+          if (_gone.length) {
+            run._removedDecls = _gone;
+            run._incompleteReason = run._incompleteReason || `removed_unchecked:${_gone.length}`;
+          }
         }
         // 「没读过、还把一大半写没了」——近乎确定的破坏，必须落到用户看得见的结局里。
         // 两个判据都是执行事实：linesLost 由写入时的真实行数算出，_runHasRead 读的是本 run
