@@ -48582,14 +48582,24 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
         // 智能体循环重构时有意拆掉的（配套状态已全部不存在），不复原——拿一个评审的意见
         // 去强行覆盖模型的收尾判断，正是那次重构要根除的东西。
         //
-        // 结论进交付事实行：用户看得见，模型下一轮也看得见。只在**改过代码**的 agent 轮
-        // 跑一次，一个 run 最多一次（多花一次模型调用，这是它的全部成本）。
-        // 可关：设置里 agentWrapUpReview = false。
-        if (_mutatedCode && run.mode === "agent" && !run._wrapUpReviewed) {
+        // 只在**改过代码**的 agent 轮跑，可关：设置里 agentWrapUpReview = false。
+        //
+        // 重审的判据是执行事实，不是「跑过没有」。原来 _wrapUpReviewed 一置真就永不复位，
+        // 而评审下面还有三道闸门（诊断 / 构建 / 计划）会把回合补回来：
+        // 「评审说还没实现 X → 闸门补一轮 → 模型顺手把 X 也做了 → 没人重审」，
+        // run._wrapUpVerdict 就停在改之前那一版。它现在是用户那几张建议卡的来源，
+        // 停在旧版＝卡片叫用户去做一件已经做完的事，比不出卡片更糟。
+        //
+        // 所以判据换成「这一版实现比上次评审时更新」（_implOps 是成功落盘的实现次数，
+        // 由真实执行事实累加）。成本那条约束没松：上界仍在，一个 run 最多两次。
+        const _reviewedAtImplOps = Number.isFinite(run._wrapUpReviewedAtImplOps) ? run._wrapUpReviewedAtImplOps : -1;
+        if (_mutatedCode && run.mode === "agent"
+            && (run._wrapUpReviews || 0) < 2 && _implOps > _reviewedAtImplOps) {
           let _reviewOn = true;
           try { _reviewOn = loadConfig()?.agentWrapUpReview !== false; } catch {}
           if (_reviewOn) {
-            run._wrapUpReviewed = true;
+            run._wrapUpReviews = (run._wrapUpReviews || 0) + 1;
+            run._wrapUpReviewedAtImplOps = _implOps;
             try {
               run._wrapUpVerdict = await _wrapUpCritic({
                 config,

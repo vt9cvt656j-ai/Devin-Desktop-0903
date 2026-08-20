@@ -23101,10 +23101,19 @@ test("收尾评审员必须真的被调用——它曾经零调用点，而三�
   assert.match(call, /changeDigest:/,
     "不给它看真实 diff 的话，「这段改动有没有实现用户要求」这个问题结构上就问不出来");
   assert.match(call, /executionEvidence: run\._executionEvidence/);
-  // 只在改过代码的 agent 轮跑，一个 run 最多一次，且可关 —— 它多花一次模型调用。
-  const guard = SRC.slice(Math.max(0, at - 900), at);
-  assert.match(guard, /_mutatedCode && run\.mode === "agent" && !run\._wrapUpReviewed/);
+  // 只在改过代码的 agent 轮跑，有成本上界，且可关 —— 它多花一次模型调用。
+  const guard = SRC.slice(Math.max(0, at - 1800), at);
+  assert.match(guard, /_mutatedCode && run\.mode === "agent"/, "又变成不改代码也评审了");
   assert.match(guard, /agentWrapUpReview !== false/, "缺少关掉它的开关");
+  assert.match(guard, /run\._wrapUpReviews \|\| 0\) < \d/, "评审的成本上界没了——它每次都多花一次模型调用");
+  // 上界要在，但不能是「跑过就永不再跑」：评审下面还有三道闸门（诊断/构建/计划）会把
+  // 回合补回来，模型在补回来的那一轮把问题修掉之后，旧结论会原封不动变成用户建议卡上的
+  // 假话——叫用户去做一件已经做完的事，比不出卡片更糟。判据必须是执行事实。
+  assert.match(guard, /_implOps > _reviewedAtImplOps/,
+    "又回到「跑过就永不再跑」——闸门补回合修掉问题之后，旧结论会变成卡片上的假话");
+  // 账要真记下去，否则上界形同虚设、或者每个安静轮都重审一次。
+  assert.match(guard, /run\._wrapUpReviewedAtImplOps = _implOps/, "没记下这次评审对应哪一版实现");
+  assert.match(guard, /run\._wrapUpReviews = \(run\._wrapUpReviews \|\| 0\) \+ 1/, "没给上界记数");
 });
 
 test("评审结论只陈述、不拦回合", () => {
