@@ -5220,8 +5220,15 @@ mod tests {
             "决定性的那一步必须排在结论之前，不能先断言再回头找证据"
         );
         assert!(
-            system.contains("reading source and searching the knowledge base is wasted effort"),
-            "阻塞项没解除时（依赖没装、构建起不来），外围取证必须让路"
+            system.contains("fix that before reading or searching more"),
+            "自己跑出来的失败没修掉时，外围取证必须让路"
+        );
+        // 判据必须是「你跑出来的失败」，不是「环境还没搭好」。原文括号里写的是
+        // 「依赖没装、构建跑不起来」——从零起一个项目的第一分钟这两条恒为真，
+        // 于是这句话直接把计划第 1 步（调研/选型）定性成浪费时间，模型跳过它是合规的。
+        assert!(
+            system.contains("a project not set up yet is not that blocker"),
+            "从零起项目时正是最该查资料的时候，不能被当成阻塞"
         );
         assert!(
             system.contains("an unverified cause is not a conclusion"),
