@@ -36569,7 +36569,24 @@ async function _agentReadLogs(call, root = "", run = null) {
   if (!chunks.length) {
     return "当前没有可读的 Agent 终端日志，也没有在工作区常见日志位置发现 .log/.out/.err。若报错输出里给了日志路径，调用 read_logs(path=那个路径) 读取尾部。";
   }
-  return chunks.join("\n\n").slice(0, 30000);
+  // 裸切会让下游报出一个**精确的假数字**。
+  //
+  // 下游 _headTailModelText 的「中间约 N 字不在上下文里」用的是**入参**长度 —— 而入参已经是
+  // 这里砍完的 30000。实测：真实聚合 96222 字 → 这里返回 30000 → 静默丢掉 66222 字（8 份日志
+  // 只剩 3 份），而模型收到的说明是「约 7 字不在上下文里」，低报 9461 倍。模型据此认为
+  // 基本拿全了，不再追问、直接下结论。
+  //
+  // 三条约束缺一不可：
+  //  ① 说明放**抬头**——末尾的标记是被下游再截时第一个被砍掉的东西（另有测试钉着这条）。
+  //  ② 上限要压到 30000 **以下**，给抬头和外部数据标记让出位置：返回正好 30000 恰恰是让那个
+  //     假标记必然触发的值。
+  //  ③ 给真实总量，并说清「缺的那几份日志怎么单独取」——真正的伤害是整份文件消失，而那是
+  //     可行动的。
+  const _joined = chunks.join("\n\n");
+  const _LOG_BUDGET = 29000;
+  if (_joined.length <= _LOG_BUDGET) return _joined;
+  return `[日志已截断] 实际共 ${_joined.length} 字、${chunks.length} 份，下面只有前 ${_LOG_BUDGET} 字。`
+    + `缺的那几份用 read_logs(path=...) 单独取。\n\n` + _joined.slice(0, _LOG_BUDGET);
 }
 
 function _markCommandFailureRecovery(run, root, diagnostics) {
@@ -52749,7 +52766,13 @@ function _relCandidates(rawPath, fallbackRoot) {
     }
     return out;
   }
-  const clean = rawPath.replace(/^\.?\/?/, "").replace(/^\/+/, "");
+  // 只剥真正的 "./" 前缀。原来写的是 /^\.?\/?/ —— 点和斜杠**都可选**，于是
+  // ".mrdayone" 匹配到「只有点、没有斜杠」那一支，点被吃掉，变成 "mrdayone"。
+  // 后果是**所有以点开头的相对路径都读不到**：.mrdayone / .env / .github / .vscode /
+  // .gitignore / .mcp.local.json 全部解析到一个不存在的同名路径，报「目录不存在或无法读取」。
+  // 用户实拍：侧栏里 .mrdayone 明明在、当前打开的文件就在它下面，list_dir 说不存在。
+  // 旁边那行 `rel.replace(/^\.\//, "")` 才是对的写法。
+  const clean = rawPath.replace(/^\.\//, "").replace(/^\/+/, "");
   let rootQualified = false;
   for (const r of roots) {
     const base = r.split("/").pop();
@@ -53934,8 +53957,24 @@ async function _executeToolStepInner(step, call, root, run) {
         isDir = true;
         usedPath = dirMatches[0];
       } else if (unreadableMatches.length === 1) {
+        // 文件**确实存在**，只是编辑器读不了它（太大 / 二进制）。这不是路径问题。
+        //
+        // 原来这里只设 readError 就继续往下走，最终落进「找不到唯一文件」那条分支 —— 而同一条
+        // 回执里还列着这个目录、里面就有这个文件名。模型据此去 find_files，搜到同一个路径、
+        // 再读、同一句话：要么死循环，要么对用户断言「项目里没有这个文件」。
+        // （上面那段注释早就写着「File FOUND at this candidate but unreadable — that IS the
+        //   real reason」，只是真原因最后只进了界面徽章，没进给模型的那条回执。）
+        //
+        // 错误码里必须含 ERROR：失败识别器认的是 [ERROR|BLOCKED|DENIED|…] 那张枚举，
+        // 自造一个 [UNREADABLE] 会让这次失败被算成**成功**，比现状更糟。
         usedPath = unreadableMatches[0].path;
         readError = unreadableMatches[0].message;
+        res.className = "atc-result atc-result--err"; res.textContent = "读不了";
+        return { type: "read", path: usedPath, content:
+          `[ERROR/UNREADABLE] 文件确实存在: ${usedPath} —— 编辑器读不了它（${String(readError).slice(0, 200)}）。`
+          + `\n这不是路径问题，别再 find_files / list_dir 去找它。`
+          + `\n要看内容改用 run_cmd：\`wc -c\` 看大小、\`file\` 看类型、\`head -c 2000\` 看开头、`
+          + `\`strings\` 抽可读文本、\`sqlite3 <db> .schema\` 看库结构；日志尾部用 read_logs。` };
       }
 
       if (isDir) {
@@ -56530,11 +56569,22 @@ async function _executeToolStepInner(step, call, root, run) {
       try {
         if (call.op === "symbols") {
           let syms = null;
-          try { syms = await (lspManager && lspManager.agentDocumentSymbols ? lspManager.agentDocumentSymbols(fp) : null); } catch {}
+          let _lspUnanswered = false;
+          try {
+            const _r = await (lspManager && lspManager.agentDocumentSymbols ? lspManager.agentDocumentSymbols(fp) : null);
+            // 「没答上来」和「答了但是空」必须分开：前者说成「这个文件里没有符号」是一个
+            // 假的肯定判断，模型会据此认为文件是空的。
+            if (_r && _r.unanswered === true) _lspUnanswered = true; else syms = _r;
+          } catch {}
           if (!syms) { try { syms = await _tsWorkerSymbols(fp); } catch {} }
           if (!syms || !syms.length) {
             res.className = "atc-result atc-result--err"; res.textContent = syms ? "无符号" : "无 LSP";
             if (vp) vp.innerHTML = `<pre>${_escHtml(syms ? "(无符号)" : "该语言无可用语言服务")}</pre>`;
+            if (_lspUnanswered) {
+              return { type: "lsp", path: rel, content:
+                `[ERROR] ${rel}：这次**没有查成**——语言服务超时或还在建索引（刚打开项目的头一分钟很常见）。`
+                + `\n**这不代表这个文件里没有符号。** 过一会儿再试一次，或者先用 read_file / search 看结构。` };
+            }
             return { type: "lsp", path: rel, content: syms ? `${rel} 未解析到符号。` : `[无 LSP] ${rel} 的语言没有可用的符号服务（可能未装语言服务器）。改用 read_file / search。` };
           }
           const lines = syms.map(s => `${"  ".repeat(Math.min(s.depth || 0, 6))}${s.kind ? "[" + s.kind + "] " : ""}${s.name}${s.line ? "  :" + s.line : ""}`);
@@ -56987,18 +57037,33 @@ async function _executeToolStepInner(step, call, root, run) {
           // 一行都没命中时的**日志开头 100 行**（很可能全是环境准备，一条错误都没有）、
           // 或者命令本身失败时的错误输出。模型对着开头 100 行找不到失败原因，就会开始编。
           const _total = lines.length;
-          const failIdx = lines.findIndex((l) => /error|fail|✗|exception|panic/i.test(l));
+          // 匹配要**剥掉 job/step 两列**再做。gh --log-failed 每行是 `job\tstep\t正文`，
+          // 而任务名本身常含 fail（e2e-failover、fail-fast、test-failures…）→ 整行匹配会让
+          // findIndex 恒为 0，这个工具在那种仓库里永远只会说「没有匹配到任何失败关键词」。
+          const _body = (l) => { const p = String(l).split("\t"); return p.length >= 3 ? p.slice(2).join("\t") : String(l); };
+          const failIdx = lines.findIndex((l) => /error|fail|✗|exception|panic/i.test(_body(l)));
           let _how = "";
-          if (failIdx > 0) {
+          // `> 0` 是差一错位：findIndex 命中**第一行**时返回 0，被当成没命中。
+          // 实拍：gh 自己失败时输出只有一行 `failed to get run: HTTP 404`，那一行就是错因，
+          // 模型收到的却是「整份日志里没有匹配到任何失败关键词……别在这段里找根因」。
+          if (failIdx >= 0) {
             out = lines.slice(Math.max(0, failIdx - 5), failIdx + 80).join("\n");
             _how = `已定位到第 ${failIdx + 1} 行的第一处失败迹象，下面是它前 5 行到后 80 行（日志共 ${_total} 行，**其余部分包括可能存在的后续失败 job 都没有列出**）`;
           } else {
             out = lines.slice(0, 100).join("\n");
             _how = `⚠️ 整份日志里**没有匹配到任何失败关键词**，下面是日志的**开头 100 行**（共 ${_total} 行）——这多半是环境准备阶段，不是失败原因所在。别在这段里找根因，换个 run_id 或直接看完整日志。`;
           }
+          // 抬头必须**从实际交付反推**，不能先承诺 80 行再裸切 3500 字。
+          // 实测 231 行真实形态日志：抬头声明 85 行 / 12675 字，实交 24 行 / 3500 字，末行还是
+          // 半句，而真正的报错栈和第二个失败 job 全在被切掉的那 57 行里。而且这是**结构性**的：
+          // 85 行塞 3500 字要求平均行宽 ≤41，光 `job\tstep\t<ISO 时间戳> ` 前缀就 37 字，
+          // 任何真实日志都兑现不了那句话。
+          const _clipped = _clip(out, 3500, "这段日志");
+          const _got = _clipped.split("\n").length;
+          const _howReal = `${_how}；实际给出 ${_got} 行`;
           res.className = "atc-result"; res.textContent = `run ${runId}`;
-          if (vp) vp.innerHTML = `<pre>${_escHtml(out.slice(0, 3500))}</pre>`;
-          return { type: "gh", path: "actions_log", content: `gh run view ${runId} --log-failed（${_how}）:\n${out.slice(0, 3500)}` };
+          if (vp) vp.innerHTML = `<pre>${_escHtml(_clipped)}</pre>`;
+          return { type: "gh", path: "actions_log", content: `gh run view ${runId} --log-failed（${_howReal}）:\n${_clipped}` };
         }
         if (call.op === "pr_review_comments") {
           if (!Number.isFinite(call.number)) return { type: "gh", path: "pr_review_comments", content: "[ERROR] 需要 number（PR 编号）。" };
