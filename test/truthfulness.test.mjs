@@ -443,3 +443,37 @@ test("打开外部链接不许经过 shell", () => {
   // 路径来自我们自己的后端，但转义这件事不能因为"这次可控"就省掉——那是给后人留先例。
   assert.doesNotMatch(openBlock, /\$\{p\}/, "又把裸路径插进 shell 串了");
 });
+
+// 工具描述也算提示词，而且是**运行时会覆盖本地那份**的提示词：
+// _applyCloudToolDescs 按名字用 server/prompts/tools.json 里的 description + parameters
+// 顶掉 main.js 里的兜底。所以描述里的假话，比回执里的假话传得更远——模型在**调用之前**
+// 就照着它规划。sync-tools-json.mjs 的 --check 只拦「两边写得不一样」，
+// 两边写着同一句假话它是不会响的。
+test("工具描述里的三句假话：stash 清空工作区 / auto_rig 一定出 glb / git_log 看全部分支", () => {
+  const CATALOG = readFileSync(join(HERE, "..", "..", "server", "prompts", "tools.json"), "utf8");
+  const both = [["main.js", SRC], ["tools.json", CATALOG]];
+
+  for (const [where, text] of both) {
+    // ① git stash **不带走未跟踪文件**，工作区不会被清空。实测：只有未跟踪文件时
+    //    git 照样印 "No local changes to save"，文件原地不动。
+    assert.doesNotMatch(text, /Stash the current working-tree changes onto the stash stack and clear the working tree/,
+      `${where}: git_stash 又说自己会清空工作区 —— 未跟踪的新文件根本不会被带走`);
+    assert.match(text, /\*\*Untracked \(new\) files are NOT taken and the working tree is not left clean\*\*/,
+      `${where}: git_stash 没说清未跟踪文件不会被带走`);
+
+    // ② auto_rig 的落盘扩展名是写死的 glb，而上游可能返回打包的 FBX；
+    //    后端会按魔数改名，描述不能承诺一定是 .glb。
+    assert.doesNotMatch(text, /outputs an animatable \.glb\./,
+      `${where}: auto_rig 又承诺一定输出 .glb —— 上游给 zip/fbx 时文件会按真实格式改名`);
+    assert.match(text, /go by the path in the receipt, not by the extension you expected/,
+      `${where}: auto_rig 没告诉模型以回执里的路径为准`);
+
+    // ③ git_log 现在只看当前分支（后端 all 默认 false）。
+    assert.match(text, /Show recent commit history \*\*on the current branch\*\*/,
+      `${where}: git_log 没说清只看当前分支 —— 模型会以为这是全仓最近的提交`);
+
+    // ④ stash pop 撞冲突时 stash 条目会保留，回执里带完整冲突报告。
+    assert.match(text, /git keeps the stash entry in place and the receipt carries the full conflict report/,
+      `${where}: git_stash_pop 没说冲突时条目还留着，模型会重复 pop 或直接 drop`);
+  }
+});
