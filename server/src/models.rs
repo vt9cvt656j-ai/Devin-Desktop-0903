@@ -6690,7 +6690,15 @@ pub async fn audio_transcriptions(
         .multipart(form)
         .send()
         .await
-        .map_err(|e| AppError::bad(format!("转写上游连接失败: {e}")))?;
+        // reqwest 的 Display 会在末尾追加 ` for url (<完整请求 URL>)`，而这条错误是
+        // AppError::bad（400）—— error.rs 的统一脱敏只覆盖 500，所以 msg 会原样进响应体，
+        // 任何登录用户打一次就知道转写上游是谁。和 chat 那条路用同一个脱敏函数。
+        .map_err(|e| {
+            AppError::bad(format!(
+                "转写上游连接失败: {}",
+                safe_upstream_error_excerpt(&e.to_string().to_lowercase())
+            ))
+        })?;
 
     let status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
     let ctype = resp
@@ -6702,7 +6710,30 @@ pub async fn audio_transcriptions(
     let body = resp
         .bytes()
         .await
-        .map_err(|e| AppError::bad(format!("转写上游读取失败: {e}")))?;
+        .map_err(|e| {
+            AppError::bad(format!(
+                "转写上游读取失败: {}",
+                safe_upstream_error_excerpt(&e.to_string().to_lowercase())
+            ))
+        })?;
+
+    // 成功的转写结果原样透传（那正是这个接口的产物）。
+    //
+    // **失败的响应体不能原样透传。** 上游的错误 JSON 里会带供应商名字、账号状态、
+    // 有时还有 key 的片段，而这个接口只要求「已登录 + 余额为正」，等于把这些发给任何用户。
+    // chat 那条路一直是先经 safe_upstream_error_excerpt 再发的，这里是 models.rs 里唯一
+    // 绕过它的上游调用。
+    if !status.is_success() {
+        let raw = String::from_utf8_lossy(&body).to_lowercase();
+        return Err(AppError {
+            status,
+            msg: format!(
+                "转写上游返回 {}：{}",
+                status.as_u16(),
+                safe_upstream_error_excerpt(&raw)
+            ),
+        });
+    }
 
     Ok(Response::builder()
         .status(status)
@@ -14947,6 +14978,42 @@ mod power_route_tests {
         assert_eq!(
             effective_cache_prices("claude-opus-5", 15.0, 0.5, 3.75, false, true),
             (0.0, 0.0),
+        );
+    }
+
+    /// 转写接口不许把上游的 URL 和错误原文发给用户。
+    ///
+    /// 它此前是 models.rs 里**唯一**绕过 safe_upstream_error_excerpt 的上游调用：
+    /// reqwest 的 Display 会追加 ` for url (<完整 URL>)`，而这两条错误造的是 400、
+    /// error.rs 的统一脱敏只覆盖 500，于是 msg 原样进响应体；非 2xx 时上游的错误 JSON
+    /// （供应商名、账号状态、有时是 key 片段）也是整份透传。而这个接口只要求
+    /// 「已登录 + 余额为正」。
+    #[test]
+    fn 转写接口的上游错误必须脱敏() {
+        let src = dispatch_src();
+        let body = src
+            .split("POST /v1/audio/transcriptions")
+            .nth(1)
+            .and_then(|s| s.split("pub async fn chat_completions").next())
+            .expect("转写接口不见了");
+
+        // 两条 reqwest 错误都要过脱敏。
+        assert!(
+            !body.contains("转写上游连接失败: {e}"),
+            "连接失败原样带上了 reqwest 的 Display —— 末尾就是完整上游 URL",
+        );
+        assert!(
+            !body.contains("转写上游读取失败: {e}"),
+            "读取失败原样带上了 reqwest 的 Display",
+        );
+        assert!(
+            body.matches("safe_upstream_error_excerpt").count() >= 3,
+            "三条路径（连接失败 / 读取失败 / 非 2xx 响应体）没有都过脱敏",
+        );
+        // 非 2xx 的响应体不许原样透传。
+        assert!(
+            body.contains("if !status.is_success()"),
+            "失败的上游响应体仍然整份透传给用户",
         );
     }
 

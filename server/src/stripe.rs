@@ -1166,8 +1166,18 @@ async fn user_for_subscription(
     Ok(found.map(|(uid,)| uid))
 }
 
-/// End a subscription: the plan and every quota column go back to nothing, through the
-/// same `codes::clear_plan` an operator cancel uses.
+/// End a subscription.
+///
+/// **只有当这个账号再没有别的活订阅时，才清空 plan 和额度。**
+///
+/// 额度是加法累积的（`codes::apply_plan`：new_total = cur_total + total），所以一个账号的
+/// quota_total_cents 可以由多笔付款叠出来——先订 basic，再走 checkout 买 pro（每次 checkout
+/// 都新建一条 Stripe subscription，代码里没有任何地方取消上一条）。线上已经有这样的账号。
+///
+/// 而取消原来是无条件 `clear_plan`：用户在 Stripe 客户门户把已经用不上的那条旧订阅退掉，
+/// 把**还在付钱的那条**的额度一起赔进去了。减法被做成了归零。
+///
+/// 现在先把这条订阅记成已结束，再看还有没有别的活着的；有就只记账、不动额度。
 async fn end_subscription(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     subscription: &serde_json::Value,
@@ -1179,6 +1189,34 @@ async fn end_subscription(
         tracing::warn!("Stripe cancellation for unknown subscription {sub}");
         return Ok(None);
     };
+
+    // 幂等：Stripe 会重投事件，重复标记不改变结果（只写第一次的时间）。
+    sqlx::query(
+        "UPDATE orders SET subscription_ended_at = COALESCE(subscription_ended_at, now()) \
+         WHERE stripe_subscription_id = $1",
+    )
+    .bind(sub)
+    .execute(&mut **tx)
+    .await?;
+
+    let (others,): (i64,) = sqlx::query_as(
+        "SELECT count(DISTINCT stripe_subscription_id) FROM orders \
+         WHERE user_id = $1 AND stripe_subscription_id IS NOT NULL \
+           AND stripe_subscription_id <> $2 AND subscription_ended_at IS NULL",
+    )
+    .bind(uid)
+    .bind(sub)
+    .fetch_one(&mut **tx)
+    .await?;
+
+    if others > 0 {
+        tracing::info!(
+            %uid, subscription = sub, still_active = others,
+            "订阅已结束，但这个账号还有别的活订阅——保留 plan 与额度，不清零"
+        );
+        return Ok(Some(uid));
+    }
+
     crate::codes::clear_plan(tx, uid).await?;
     Ok(Some(uid))
 }
@@ -1658,6 +1696,40 @@ async fn grant(
 
 #[cfg(test)]
 mod tests {
+    /// 取消一条订阅，不许把账号上别的订阅的额度一起清零。
+    ///
+    /// 额度是加法累积的（apply_plan：new_total = cur_total + total），一个账号可以由多笔
+    /// 付款叠出来——线上已经有挂着多条订阅的账号。而取消原来是无条件 clear_plan：
+    /// 用户在 Stripe 客户门户退掉一条用不上的旧订阅，把还在付钱的那条的额度一起赔进去。
+    #[test]
+    fn cancelling_one_subscription_must_not_wipe_the_others() {
+        let src = include_str!("stripe.rs");
+        let body = src
+            .split("async fn end_subscription")
+            .nth(1)
+            .and_then(|s| s.split("\n/// ").next())
+            .expect("end_subscription 不见了");
+
+        // 必须先把这条订阅记成已结束——否则「还有没有别的活订阅」这句问不出正确答案。
+        assert!(
+            body.contains("subscription_ended_at"),
+            "没有记录订阅结束，无法判断账号上还有没有别的活订阅",
+        );
+        // 必须真的去数别的活订阅。
+        assert!(
+            body.contains("stripe_subscription_id <> $2") && body.contains("subscription_ended_at IS NULL"),
+            "没有排除自己、也没有只数活着的——这个判断会得出错的答案",
+        );
+        // 有别的活订阅时必须**提前返回**，不能走到 clear_plan。
+        let guard = body.find("if others > 0").expect("缺少「还有别的活订阅就不清零」这道闸");
+        let clear = body.find("clear_plan").expect("clear_plan 不见了");
+        assert!(guard < clear, "闸门排在 clear_plan 之后，等于没有");
+        assert!(
+            body[guard..clear].contains("return Ok(Some(uid))"),
+            "闸门里没有提前返回，额度照样会被清零",
+        );
+    }
+
     use super::*;
 
     /// The claim on `stripe_events` must never commit independently of the grant.

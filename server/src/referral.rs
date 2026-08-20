@@ -1082,12 +1082,19 @@ const METHODS: [&str; 4] = ["alipay", "wechat", "bank", "paypal"];
 /// discovers it while sending the second.
 async fn withdrawable(state: &AppState, uid: uuid::Uuid) -> ApiResult<i64> {
     /*
-     * 两个排除条件，各堵一条重复支付的路。
+     * 三个排除条件：两条堵重复支付，一条是冻结期。
      *
      * settled_by <> 'auto'：自动结算在写这条佣金的同时，已经把等额的钱加进了
      * users.credits_cents（见 award）。如果这里还把它算作可提现，同一笔佣金就被发了两次 ——
      * 一次进余额，一次转成现金。20260823 的迁移注释写着「自动结算之后没有可提的东西」，
      * 但在这之前，全服务器没有一行代码执行这句话：侧栏只是把入口藏起来了，接口照收。
+     *
+     * mature_at <= now()：**冻结期**。award 写佣金时带上 mature_at = now() + 冻结天数
+     * （默认 14 天），它存在的理由是退款窗口——这段时间里订单还可能被退，reverse() 才追得回。
+     * 批量打款那条路一直在看它（按 mature_at 把金额劈成「冻结中」和「可提」两笔），
+     * 而**手动提现这条路从来没看过**：佣金入账当天就能提走真金，之后订单一退，钱已经出去了，
+     * reverse() 只能打个标记。冻结期在这条路上等于不存在。
+     * NULL 视为已到期：这一列是后加的，更早的行没有值，不能因为加了一列把旧佣金锁死。
      *
      * reversed_at IS NULL：订单退款之后，reverse() 对已经付过的那些行只打标记、
      * 保留 status='settled'（因为钱确实已经出去了，改账本不会把钱变回来）。但"已经付过"
@@ -1096,7 +1103,8 @@ async fn withdrawable(state: &AppState, uid: uuid::Uuid) -> ApiResult<i64> {
     let settled: i64 = sqlx::query_scalar(
         "SELECT COALESCE(SUM(commission_cents), 0)::bigint FROM commissions \
          WHERE referrer_user_id = $1 AND status = 'settled' \
-           AND reversed_at IS NULL",
+           AND reversed_at IS NULL \
+           AND (mature_at IS NULL OR mature_at <= now())",
     )
     .bind(uid)
     .fetch_one(&state.db)
@@ -1970,6 +1978,38 @@ pub async fn admin_grant(
 
 #[cfg(test)]
 mod tests {
+    /// 手动提现必须和批量打款看同一个冻结期。
+    ///
+    /// 冻结期存在的理由是退款窗口：这段时间里订单还可能被退，reverse() 才追得回来。
+    /// 批量那条路一直按 mature_at 把金额劈成「冻结中」和「可提」，而手动提现从来没看过
+    /// ——佣金入账当天就能提走真金，之后订单一退钱已经出去了，reverse() 只能打个标记。
+    #[test]
+    fn manual_withdrawal_respects_the_same_hold_period_as_batch_payout() {
+        let src = include_str!("referral.rs");
+        let body = src
+            .split("async fn withdrawable")
+            .nth(1)
+            .and_then(|s| s.split("\nasync fn ").next())
+            .expect("withdrawable 不见了");
+
+        assert!(
+            body.contains("mature_at"),
+            "手动提现没有看冻结期——佣金入账当天就能提走，退款窗口形同虚设",
+        );
+        assert!(
+            body.contains("mature_at <= now()"),
+            "冻结期的判据不对：必须是「已到期才可提」",
+        );
+        // 这一列是后加的，旧佣金没有值；把 NULL 当成未到期会把它们永久锁死。
+        assert!(
+            body.contains("mature_at IS NULL OR"),
+            "NULL 没有当成已到期——加一列会把历史佣金锁死",
+        );
+        // 另外两条堵重复支付的条件不许在这次改动里丢掉。
+        assert!(body.contains("reversed_at IS NULL"), "退款后仍可提的洞被放回来了");
+        assert!(body.contains("status = 'settled'"), "状态过滤丢了");
+    }
+
     use super::*;
 
     #[test]
