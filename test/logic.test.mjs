@@ -28987,3 +28987,51 @@ test("认知腿的期限跟着思考档位走，且不短于传输层认定「�
       `分档函数坏掉时保底成了 ${v}——abort 立刻触发，评审必然拿不到结果`);
   }
 });
+
+// ---- 落盘的那半和读取的那半必须对得上 ----
+//
+// 评审结论要跨两段代码：_runAgenticLoop 收尾时把它写进 session._lastRunState.wrapUp，
+// _runStateNextActionSuggestions 再读出来做卡片。两边各自有测试，但**字段名对不对得上**
+// 谁都测不到——写进去 { instruction } 而读的是 .direction，两边的正则断言照样全绿，
+// 卡片却永远不出现。这条把真实的落盘表达式抠出来跑一遍，再把结果喂给真实的卡片函数。
+test("评审结论从落盘到卡片走一趟真的通", () => {
+  const expr = /wrapUp: (\(\(\) => \{[\s\S]*?\}\)\(\)),/.exec(SRC);
+  assert.ok(expr, "落盘那一步不见了");
+  // 落盘表达式吃三个闭包变量：run（带评审结论）、verificationPassed、didMutate。
+  const persist = new Function("run", "verificationPassed", "didMutate", `return ${expr[1]};`);
+  const gen = load("_runStateNextActionSuggestions", { _INCOMPLETE_LABELS: loadConst("_INCOMPLETE_LABELS") });
+  const chipsFor = (verdict, { verified = true, mutated = true } = {}) => gen({
+    _lastRunState: {
+      outcome: "success", task: "x", updatedAt: Date.now(),
+      wrapUp: persist({ _wrapUpVerdict: verdict }, verified, mutated),
+    },
+  }).map((c) => c.label);
+
+  // 判「没实现」+ 方向不一致 + 顺手发现问题：三张卡都要真的出来。
+  const full = chipsFor({
+    done: false, verified: true,
+    instruction: "登录接口还写死返回 true",
+    direction: "我一路要的是整条鉴权链路打通",
+    findings: [{ where: "db.js:20", what: "连接没设超时" }],
+  });
+  assert.ok(full.some((l) => /真正想做/.test(l)), `direction 没走通，实际拿到：${full.join(" / ")}`);
+  assert.ok(full.some((l) => /没做到/.test(l)), `instruction 没走通，实际拿到：${full.join(" / ")}`);
+  // 名额只有 3，findings 排在后面会被挤掉——这里单独喂一遍确认它自己走得通。
+  const onlyFindings = chipsFor({ done: true, verified: true, instruction: "", direction: "", findings: [{ where: "", what: "连接没设超时" }] });
+  assert.ok(onlyFindings.some((l) => /顺带/.test(l)), `findings 没走通，实际拿到：${onlyFindings.join(" / ")}`);
+
+  // 假绿灯：评审说没证明 + 记账说验过了 + 真改过东西 → 出卡；缺一项就不出。
+  const fgVerdict = { done: true, verified: false, instruction: "", direction: "", findings: [] };
+  assert.ok(chipsFor(fgVerdict).some((l) => /没真的证明/.test(l)), "假绿灯没走通");
+  assert.ok(!chipsFor(fgVerdict, { verified: false }).some((l) => /没真的证明/.test(l)),
+    "记账自己就知道没验的情况不该在这里重复报");
+  assert.ok(!chipsFor(fgVerdict, { mutated: false }).some((l) => /没真的证明/.test(l)),
+    "没改过东西也报假绿灯");
+
+  // 评审没跑成（返回 null）时，整个 wrapUp 必须是 null，不能留个空壳让卡片层去猜。
+  assert.equal(persist({ _wrapUpVerdict: null }, true, true), null);
+  assert.equal(persist({ _wrapUpVerdict: { done: true, verified: true, instruction: "", direction: "", findings: [] } }, true, true), null);
+  // done 缺席（评审回了畸形 JSON）不许被当成「没实现」。
+  const noDone = persist({ _wrapUpVerdict: { verified: true, instruction: "缺了鉴权", direction: "", findings: [] } }, true, true);
+  assert.ok(!noDone || !noDone.instruction, "done 缺席时把 instruction 当成了「没实现」——凭空冤枉自己");
+});
