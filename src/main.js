@@ -66793,8 +66793,55 @@ promptEl.addEventListener("input", () => {
   _ctxMeterInputTimer = setTimeout(() => _refreshContextMeterFromDraft(), 250);
   _updateAtMenu();
   _updateSlashMenu();
+  // 打字停顿时先把这一轮的意图裁决跑起来（见 _prefetchIntentFromComposer）。
+  clearTimeout(_intentPrefetchTimer);
+  _intentPrefetchTimer = setTimeout(() => { try { _prefetchIntentFromComposer(); } catch {} }, 1200);
 });
 let _ctxMeterInputTimer = 0;
+let _intentPrefetchTimer = 0;
+let _intentPrefetchedText = "";
+// ── 打字时预取意图裁决 ───────────────────────────────────────────────────
+//
+// 病根：分类器在 sendPrompt 里发出去，画像**紧接着同步取**——中间一个 await 都没有，
+// 裁决不可能已经回来。唯一的等待窗口只在会话第一轮付一次（_intentWaitPaid 无条件记账）。
+// 而第二轮起同步取画像的两条路必然落空：一条比的是**上一轮**原文，一条的缓存键含**本轮**
+// 新原文。所以「从第二轮开始，每一轮，上下文装配那一刻裁决一定是空的」——不是常态，是必然。
+//
+// 下游因此全线降级：契约块整块不渲染、代码检索被扣、当前打开文件的正文被扣、注入预算
+// 从 8000 掉到 5000。今天这些症状是从三个方向分别查进去的，最后落到同一个根上。
+//
+// 这里从根上治：用户打字停顿 1.2 秒就把裁决跑起来。缓存键由「最近 8 条对话 + 工作区 +
+// 技术栈」算出，**不含时间戳、不含轮次计数** —— 打字那一刻和按回车那一刻是同一个键，
+// 所以按下回车时它已经在缓存里（或在途）。
+//
+// 成本不翻倍：_aiIntentProfile 自带缓存 + _aiIntentInflight 单飞去重，发送路径本来就优先
+// 复用同键的在途请求。净效果是把同一次调用**提前**，不是多发一次。
+// 用户改了字 → 键不同 → 预取作废，退回今天的行为，无害（epoch/key 守卫保证陈旧结果不会提交）。
+function _prefetchIntentFromComposer() {
+  if (!inTauri || !_lastGoodAiConfig) return;              // 没跑过一轮就没有可复用的凭证
+  if (_normalizeAiMode(_currentAiMode) !== "agent") return; // 纯聊天本来就不发这个请求
+  const sess = _currentSession();
+  if (!sess || sess.streaming) return;                      // 正在流式输出时别插队
+  if (!_atMenu.hidden || !_slashMenu.hidden) return;        // 菜单开着＝还在选文件/命令，不是一句稳定的话
+  // 有附件时不预取：发送路径会把附件名拼进上下文，键必然不同，预取纯浪费。
+  if ((typeof _droppedRefs !== "undefined" && _droppedRefs && _droppedRefs.length)
+      || (typeof _pastedImages !== "undefined" && _pastedImages && _pastedImages.length)) return;
+  const t = String(_ceSerialize(promptEl) || "").trim().replace(/\s+/g, " ");
+  if (t.length < 12 || t.length > 800) return;              // 太短还在打，太长发送路径自己会截
+  if (t === _intentPrefetchedText) return;                  // 同一句话只预取一次
+  const root = String(sess.project || _knownWorkspaceRoots()[0] || "").replace(/\/+$/, "");
+  // 上下文必须和 sendPrompt 里那份**逐字段一致**，否则指纹不同、键对不上，预取白跑。
+  const ctx = _aiIntentContextForTurn(sess, t, {
+    root,
+    activePath: activePath && (!root || _pathIsAtOrUnder(activePath, root)) ? activePath : "",
+    attachments: [],
+    workspaceEvidence: _aiIntentWorkspaceEvidence(root),
+  });
+  const key = _aiIntentCacheKey(t, ctx.sessionId || sess.id, _aiIntentContextFingerprint(ctx));
+  if (_aiIntentCache.get(key) || _aiIntentInflight.get(key)) return; // 已有结果或已在途
+  _intentPrefetchedText = t;
+  _aiIntentProfile(t, _lastGoodAiConfig, sess, ctx).catch(() => {});
+}
 // At module load there is no session yet, so this reads 0. Sessions restore asynchronously after
 // it and nothing recomputed — which is why reopening the app showed an empty context for a
 // conversation that plainly had one. Recompute once the restore has settled.

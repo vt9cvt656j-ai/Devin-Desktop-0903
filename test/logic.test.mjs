@@ -29986,3 +29986,65 @@ test("蒸馏摘要要带上返工事实，否则一串 ✓ 会把规律盖住", 
     "只看热区不看档案，等于没有离线视野");
   assert.match(src, /slice\(-240\)/, "摘要没有上限，会把一次调用撑爆");
 });
+
+// ---- 打字时预取意图裁决：从根上治「第二轮起裁决永远是空的」 ----
+//
+// 分类器在 sendPrompt 里发出去，画像**紧接着同步取**——中间一个 await 都没有，裁决不可能
+// 已经回来。唯一的等待窗口只在会话第一轮付一次。而第二轮起同步取画像的两条路必然落空：
+// 一条比的是上一轮原文，一条的缓存键含本轮新原文。所以不是「常态」，是**必然**。
+// 下游因此全线降级：契约块不渲染、代码检索被扣、当前文件被扣、注入预算 8000→5000。
+test("预取用的缓存键必须和发送时逐字节相同，否则预取白跑", () => {
+  const ctxOf = load("_aiIntentContextForTurn", {
+    _aiIntentText: load("_aiIntentText"),
+    _aiIntentList: load("_aiIntentList", { _aiIntentText: load("_aiIntentText") }),
+  });
+  const fp = load("_aiIntentContextFingerprint");
+  const keyOf = load("_aiIntentCacheKey");
+  const sess = { id: "s1", project: "/repo", memory: { recent: [
+    { role: "user", content: "先帮我把登录页做出来" },
+    { role: "assistant", content: "做好了" },
+  ] } };
+  const opts = { root: "/repo", activePath: "/repo/src/auth.ts", attachments: [],
+    workspaceEvidence: { hasWorkspace: true, snapshotReady: true, topLevel: ["src"],
+      stack: { lang: "ts", framework: "react", packageManager: "pnpm", test: "vitest" } } };
+  const mk = (text, o) => { const c = ctxOf(sess, text, o); return keyOf(text, c.sessionId || sess.id, fp(c)); };
+  const t = "这个登录还是跳不过去，你看看";
+
+  assert.equal(mk(t, opts), mk(t, opts),
+    "同一句话、同一上下文算不出同一个键 —— 预取根本不会被发送路径复用");
+  assert.notEqual(mk(t, opts), mk(t + "，急", opts),
+    "改了字键还一样 —— 会拿旧文本的裁决去指导新请求");
+  assert.notEqual(mk(t, opts), mk(t, { ...opts, attachments: ["image:a.png"] }),
+    "附件不进指纹 —— 那预取和发送的键会错配");
+
+  // 指纹里不许出现时间戳/轮次计数：那会让打字那一刻和按回车那一刻算出不同的键。
+  const ctxSrc = extractFn("_aiIntentContextForTurn");
+  assert.doesNotMatch(ctxSrc, /Date\.now\(\)|new Date\(|\bturnIndex\b|\btotalTurns\b/,
+    "上下文里混进了时间/轮次 —— 键会随时间漂，预取必然错过");
+});
+
+test("打字预取的闸门：只在能省下等待的时候跑，且不许把成本翻倍", () => {
+  const src = extractFn("_prefetchIntentFromComposer");
+  // 只在 agent 模式：纯聊天本来就不发这个请求。
+  assert.match(src, /_normalizeAiMode\(_currentAiMode\) !== "agent"/, "纯聊天也预取，白烧钱");
+  // 已有结果或已在途就不发——这是「不翻倍」的关键。
+  assert.match(src, /_aiIntentCache\.get\(key\) \|\| _aiIntentInflight\.get\(key\)/,
+    "没查缓存和在途表 —— 同一句话会被反复发出去");
+  // 同一句话只预取一次。
+  assert.match(src, /t === _intentPrefetchedText/, "同一句话会被重复预取");
+  // 有附件时不预取：键必然不同（上一条测试钉着），预取纯浪费。
+  assert.match(src, /_droppedRefs|_pastedImages/, "有附件时照样预取，键对不上，纯浪费");
+  // 太短的还在打字，别急着算。
+  assert.match(src, /t\.length < 12/, "没有长度下限，打两个字就发请求");
+  // 流式输出时别插队。
+  assert.match(src, /sess\.streaming/, "正在输出时还插队发请求");
+  // @ / 斜杠菜单开着说明还在选东西，不是一句稳定的话。
+  assert.match(src, /_atMenu\.hidden|_slashMenu\.hidden/, "菜单开着也预取");
+
+  // 必须真的挂在输入事件上，而且带防抖。算了没接上等于没做。
+  const at = SRC.indexOf("_intentPrefetchTimer = setTimeout");
+  assert.ok(at > 0, "预取没挂到输入事件上 —— 写了个永远不会被调用的函数");
+  assert.match(SRC.slice(at, at + 160), /_prefetchIntentFromComposer\(\)/, "定时器里调的不是预取");
+  assert.match(SRC.slice(Math.max(0, at - 200), at), /clearTimeout\(_intentPrefetchTimer\)/,
+    "没有防抖 —— 每敲一个键就发一次请求");
+});
