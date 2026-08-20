@@ -29175,6 +29175,24 @@ test("整文件重写把内容写没了，必须当场说出来", () => {
   assert.equal(labels.overwrote_unread, "看一眼被覆写的文件，确认没把内容写没");
 });
 
+
+test("用户说「不是这个意思」时，旧计划不许被自动捡回来接着做", () => {
+  const loop = extractFn("_runAgenticLoop");
+  // 用户原话：「根本不懂用户」。最字面的一种：裁决把这一轮判成 correct/replace，
+  // 而第二处计划继承没有任何守卫，照样把旧计划捡起来——纠正在机器层面等于没发生，
+  // 模型转头接着做被否掉的那件事。
+  assert.match(loop, /_planRel === "correct" \|\| _planRel === "replace"/,
+    "判据用裁决自己声明的枚举，不是猜");
+  assert.match(loop, /!run\._planSteps && !_planDropped && Array\.isArray\(session\._planSteps\)/,
+    "纠正/换目标时不许继承");
+  // 但必须说出来：只看到"没有计划"，模型可能又把同一份旧计划重列一遍。
+  assert.match(loop, /上一轮的计划已经作废/);
+  assert.match(loop, /run\._planDroppedByCorrection/, "这个事实要有真读者，不能只写不读");
+  // 旧计划仍留在 session 上——用户真想接着做时，下一条「继续」照样捡得回来。
+  assert.doesNotMatch(loop, /_planDropped[\s\S]{0,200}?session\._planSteps = \[\]/,
+    "不许把会话里那份也删掉");
+});
+
 // ---- 写入落空要有用户侧的出口 ----
 test("尝试写了没落盘时，结局里必须留下 writes_failed", () => {
   const loop = extractFn("_runAgenticLoop");
