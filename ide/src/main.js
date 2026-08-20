@@ -46616,6 +46616,24 @@ function _cognitiveLegEffort(config) {
   return pref && pref !== "off" ? { reasoning_effort: pref } : {};
 }
 
+// 认知腿的期限跟着**同一份 config 的思考档位**走，而不是写死一个数。
+//
+// 起因：收尾评审吃 _cognitiveLegEffort 把用户选的 reasoning_effort 原样带上去，期限却
+// 硬编码 25 秒 —— 比传输层判定「这个模型算慢了」的窗口（60 秒起）还短。于是把思考调到
+// max/xhigh 之后，这条评审在传输层认为慢之前就自己 abort 了，catch 里静默 return null，
+// 三样结论（instruction / findings / direction）一起丢，而且没有任何地方记一笔。用户看到的是
+// 「评审这个功能好像从来不响」。
+//
+// 期限是**上限不是固定等待**：抬高它只在原本完全拿不到结果的那些回合里多花时间，
+// 20 秒答完的照样 20 秒。分档直接问 _browserAiStreamTimeouts 要，不另立一套数，否则两边会漂。
+function _cognitiveLegDeadlineMs(config) {
+  try {
+    const ms = Number(_browserAiStreamTimeouts(config || {})?.stallMs);
+    if (Number.isFinite(ms) && ms > 0) return ms;
+  } catch { /* 分档拿不到就用保底 */ }
+  return 60_000;
+}
+
 async function _wrapUpCritic({ config, task, padText, draft, readList, executionEvidence, toolRegistry, contract = "", changeDigest = "", demands = [] }) {
   if (!config || !config.baseUrl || !config.apiKey) return null;
   const sys = '你是一个编码智能体的独立收尾评审和证据工具调度员。只输出严格 JSON：{"done":true|false,"verified":true|false,"instruction":"<不合格时给它的具体下一步指令，一两句>","tools":["下一步需要的已注册工具名"],"findings":[{"where":"文件:行","what":"一句话说清是什么问题","why":"为什么它是真问题"}],"direction":"<一两句：用户真正想达成的是什么；没有可说的就空字符串>"}。'
@@ -46656,7 +46674,7 @@ async function _wrapUpCritic({ config, task, padText, draft, readList, execution
   const reviewModel = config.model;
   try {
     const ctrl = typeof AbortController !== "undefined" ? new AbortController() : null;
-    const to = ctrl ? setTimeout(() => ctrl.abort(), 25000) : null;
+    const to = ctrl ? setTimeout(() => ctrl.abort(), _cognitiveLegDeadlineMs(config)) : null;
     const _text = await _fetchCompletionText(_chatCompletionsUrl(config.baseUrl), {
         "Content-Type": "application/json",
         Authorization: "Bearer " + (config.apiKey || ""),
