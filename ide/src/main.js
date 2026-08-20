@@ -24839,6 +24839,18 @@ function _runStateNextActionSuggestions(sess, { maxAgeMs = 5 * 60_000 } = {}) {
     });
   }
 
+  // 场景 2.5:收尾评审读了真实 diff,判定这段改动没实现用户要的东西。
+  //
+  // 全局只有这一处拿**改动本身**去对"用户到底要什么"。它按设计不拦回合(一个模型的
+  // 意见不该覆盖另一个模型的收尾判断,那正是那次重构要根除的东西),但"不拦"不等于
+  // "该丢掉"——做成建议,用户点了才生效,指令原样递给模型,决定权在用户手里。
+  if (run.wrapUp && run.wrapUp.instruction) {
+    picks.push({
+      label: "补上评审说没做到的部分",
+      send: `上一轮的收尾评审读了改动本身,判定还没实现要求。它给的具体指令是:\n${run.wrapUp.instruction}\n\n先核对这条说得对不对(以我的原话为准),对就照着补完。`,
+    });
+  }
+
   // 场景 3:成功且有运行效果→提示验证
   if (run.outcome === "success" && run.runtimeEffects && run.runtimeEffects.length) {
     const effects = [...run.runtimeEffects].join(", ");
@@ -42132,15 +42144,16 @@ function _deliveryFactsLine(run) {
   if (stray.length) {
     parts.push(`另有 ${stray.length} 个疑似一次性脚本留在套件之外（${stray.slice(0, 4).join("、")}${stray.length > 4 ? " 等" : ""}）`);
   }
-  // 收尾评审的结论（_wrapUpCritic 读了真实 diff 之后的判断）。它**只陈述、不拦截**，
-  // 所以放在这一行的末尾和别的事实并列 —— 用户一眼看到"评审说这段改动没实现你要的东西"，
-  // 比看到模型自己说"已完成"有用得多。
+  // 收尾评审的结论（_wrapUpCritic 读了真实 diff 之后的判断）。它**只陈述、不拦截**。
+  // 这一行如今只喂模型（用户那条交付事实横幅已按要求删掉），而评审又不拦回合，所以在
+  // 常见的"一轮跑完就结束"里模型压根没有下一轮来读它 —— 结论真正到得了用户手上的出口
+  // 是 _lastRunState.wrapUp 那个建议卡片，别把这里当成用户看得见的地方。
   const v = run?._wrapUpVerdict;
   if (v && typeof v.done === "boolean") {
     parts.push(v.done ? "收尾评审：通过" : `收尾评审：未通过${v.instruction ? " — " + String(v.instruction).slice(0, 120) : ""}`);
   }
   // 顺手发现的其它真问题 + 方向提醒：**只陈述**，不改变本轮交付，也不写进模型的回答里
-  // （那会变成 harness 冒充模型说话）。和上面几项事实并列，用户一眼扫到。
+  // （那会变成 harness 冒充模型说话）。同上：这是喂给模型的事实，不是用户界面。
   if (Array.isArray(v?.findings) && v.findings.length) {
     parts.push(`顺带发现 ${v.findings.length} 处其它问题：`
       + v.findings.map((f) => `${f.where ? f.where + " " : ""}${f.what}`).join("；").slice(0, 300));
@@ -47388,6 +47401,7 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
   let didInvestigate = false, didEdit = false, investigateNudged = false, planNudged = false, verifyRuns = 0;
   let buildFixAttempts = 0; // bounded red-build → fix → rerun loop (Cursor caps at 8; we allow 6)
   let verifyNudges = 0, _lastVerifyNudgeAtImplOps = -1;
+  let _lastUiNudgeAtImplOps = -1;
   let _verifiedAtImplOps = -1, _prevVerifyErrs = null, _noProgressVerify = 0; // auto-verify convergence state (re-verify after new edits; stop once errors stop dropping)
   let _verifyExhausted = false; // real verify budget genuinely spent (10 runs, or no check cmd after 2 nudges) → allow an honest finish even if later edits bump _implOps
   let _uiVerifiedAtImplOps = -1, uiVerifyNudges = 0, _browserViewportKind = "";
@@ -47506,7 +47520,7 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
     "toolRepair", "cmdFail", "buildFix", "diag", "diagFinish", "bugEvidence",
     "blindEdit", "subagentResult", "recovery", "emptyHistoryFact",
     // 「刚改完、这个版本还没验过」是执行记账里的硬事实，丢了模型就会照着"应该没问题"收尾。
-    "verifyNow",
+    "verifyNow", "uiLook",
   ]);
   const _nudgeRank = (cat) => (cat === "steer" ? 0 : _NUDGE_FACTS.has(cat) ? 1 : 2);
   const _pushNudge = (cat, content) => {
@@ -50105,6 +50119,35 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
         }
       }
 
+      // ── 改了界面就该看一眼：同样放在刚落盘那一下 ──────────────────────────────
+      //
+      // 和上面那条同形，只是换成视觉这一侧。收尾时的 ui_verification_missing 也是只记账
+      // （而且它的提醒计数器 uiVerifyNudges 一直是死的：只被重置、从没加过、也没人读），
+      // 于是「改了界面、一次都没看」全程无人出声——用户拿到的是没人看过一眼的界面。
+      //
+      // 触发同样全是执行事实：这一轮真的落盘了前端源码文件（_UI_SOURCE_EXT），而当前实现
+      // 版本还没有完整的视觉验收证据（_uiVerifiedAtImplOps < _implOps）。
+      // 顺序按本仓库自己的记账规则给全——记账只认 action:"viewport" 那两次精确调用，
+      // 说不清顺序等于让它白跑一趟（design_verification 那条坑刚修过）。
+      if (uiVerifyNudges < 2 && _live() && run.mode === "agent"
+          && _implOps > 0 && _uiVerifiedAtImplOps < _implOps && _lastUiNudgeAtImplOps < _implOps) {
+        const _uiChanged = items
+          .filter((it) => it.call && _WORKSPACE_MUTATING_TYPES.has(it.call.type) && it.call.path
+            && !/\[(ERROR|BLOCKED|DENIED)\]/.test((it.rawResult && it.rawResult.content) || ""))
+          .map((it) => String(it.call.path))
+          .filter((path) => _UI_SOURCE_EXT.test(path));
+        if (_uiChanged.length) {
+          uiVerifyNudges++;
+          _lastUiNudgeAtImplOps = _implOps;
+          _pushNudge("uiLook",
+            `[没看过] 刚改了界面文件 ${[...new Set(_uiChanged)].slice(0, 4).join("、")}`
+            + `${_uiChanged.length > 4 ? ` 等 ${_uiChanged.length} 个` : ""}，`
+            + `**当前这个版本还没有人在浏览器里看过一眼**。构建通过不等于好看，更不等于能用。`
+            + `起真实 dev server 之后按这个顺序走一遍（记账只认 action:"viewport" 那两次精确调用）：`
+            + `viewport(1440,900) → check → 关键交互 → assert，再 viewport(390,844,mobile:true) → check → 交互 → assert。`);
+        }
+      }
+
       // ── 调查死循环断路器：「一直查/读，就是不实现」──────────────────────────
       // churn 的反面：智能体把 search/read 当成了任务本身，查了一大堆却一行不写。
       //
@@ -50469,6 +50512,16 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
       task: String(task || "").replace(/\s+/g, " ").trim().slice(0, 700),
       result: String(summaryText || finalErr || "").replace(/\s+/g, " ").trim().slice(0, 1000),
       incompleteReason: String(run._incompleteReason || (hitCap ? "iteration_limit" : "")).slice(0, 260),
+      // 收尾评审（_wrapUpCritic 那次付费调用）判"这段改动没实现用户要的东西"时,结论
+      // 原来只进交付事实行——而那行如今只喂模型,且评审按设计**不拦回合**,所以运行通常
+      // 就在这里结束,没有"下一轮"来读它。等于每次改代码都花一次模型调用,算出一个
+      // 没人收得到的结论。落到这里,它才能变成一个用户点得动的建议。
+      wrapUp: (() => {
+        const v = run?._wrapUpVerdict;
+        if (!v || v.done !== false) return null;
+        const instruction = String(v.instruction || "").replace(/\s+/g, " ").trim().slice(0, 300);
+        return instruction ? { instruction } : null;
+      })(),
       mutated: !!didMutate, // 「接下来」建议据此区分干活轮和纯问答轮
       toolStats: _toolLedgerStats(run._toolLedger?.entries || []),
       // 步数效率：这一轮总共调了多少次工具、其中多少是失败/重复/重读。是"定位改造有没有

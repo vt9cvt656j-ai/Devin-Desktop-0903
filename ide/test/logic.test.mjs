@@ -28800,3 +28800,72 @@ test("刚改完代码且当前版本没验证证据时，推一条带具体命�
   assert.doesNotMatch(loop.slice(at, at + 400), /\bcontinue;/,
     "在这里补回合就把「安静一轮＝模型的收尾判断」那条设计推翻了——这条提醒只给事实，不抢判断");
 });
+
+// ---- 改了界面就得真去看一眼 ----
+//
+// 和「改完就该验」同一个病：静态提示里那句「改了界面要看」每轮都贴，贴到模型不再看它；
+// 而收尾那道视觉验收门刻意只记账不补回合。于是「改了界面、一次都没看过」全程无人出声。
+test("刚落盘前端源码且当前版本没有视觉验收证据时,推一条带具体顺序的事实提醒", () => {
+  const loop = extractFn("_runAgenticLoop");
+  assert.match(loop, /_pushNudge\("uiLook",/, "改了界面之后没有任何一处提醒去看一眼");
+  // 判据必须是执行事实：当前实现版本有没有视觉验收证据,以及这个版本提醒过没有。
+  assert.match(loop, /_uiVerifiedAtImplOps < _implOps && _lastUiNudgeAtImplOps < _implOps/,
+    "判据不对——要按「当前实现版本没被看过」且「这个版本还没提醒过」,否则要么不响要么每轮唠叨");
+  assert.match(loop, /uiVerifyNudges < 2/, "没有上界,会变成每轮骚扰");
+  // 只有真的改了前端源码才响：改后端/文档时弹「去浏览器看一眼」是纯噪音。
+  assert.match(loop, /_UI_SOURCE_EXT\.test\(path\)/,
+    "没按前端源码扩展名筛——改 .rs / .md 也会被喊去浏览器看,那是噪音");
+  // 落盘失败的写入不算「改了界面」。
+  const uiAt = loop.indexOf('_pushNudge("uiLook"');
+  assert.ok(uiAt > 0);
+  const uiBlock = loop.slice(Math.max(0, uiAt - 900), uiAt);
+  assert.match(uiBlock, /ERROR\|BLOCKED\|DENIED/,
+    "没排除写失败的那些——文件根本没落盘却喊「去看看你改的界面」");
+  // 记账只认 action:"viewport" 那两次精确调用,提醒里必须把顺序说全,否则它白跑一趟。
+  assert.match(loop.slice(uiAt, uiAt + 800), /viewport/,
+    "没告诉它按什么顺序走,跑完也拿不到视觉验收学分");
+  // 事实类：不能被一条「建议」挤掉。同样按解析那张表判,不按子串——`_pushNudge("uiLook"`
+  // 自己就含这个子串。
+  const facts = new Set([...(/const _NUDGE_FACTS = new Set\(\[([\s\S]*?)\]\)/.exec(SRC)[1].matchAll(/"([a-zA-Z]+)"/g))].map((m) => m[1]));
+  assert.ok(facts.has("uiLook"), "uiLook 没登记进事实类,会被建议类挤掉");
+  // 不许在这里补回合：收尾门的红线。
+  assert.doesNotMatch(loop.slice(uiAt, uiAt + 400), /\bcontinue;/,
+    "在这里补回合就推翻了「安静一轮＝模型的收尾判断」");
+});
+
+// ---- 那次付费评审不能算完就扔 ----
+//
+// _wrapUpCritic 是全局唯一一处拿**改动本身**去对「用户到底要什么」的判断,每个改过代码的
+// agent 轮都花掉一次模型调用。它按设计**不拦回合**(一个模型的意见不该覆盖另一个模型的收尾
+// 判断),结论原来只进交付事实行——而那行如今只喂模型。两件事凑在一起的结果是:常见的
+// 「一轮跑完就结束」里根本没有下一轮来读它,于是每次都花钱算一个没人收得到的结论。
+// 出口必须是用户点得动的东西,而且点不点由用户决定。
+test("收尾评审判定没实现要求时,结论落进运行状态并变成一张用户点得动的建议卡", () => {
+  const gen = load("_runStateNextActionSuggestions", { _INCOMPLETE_LABELS: loadConst("_INCOMPLETE_LABELS") });
+  const now = Date.now();
+  const chips = gen({ _lastRunState: {
+    outcome: "success", task: "接上真实鉴权", updatedAt: now,
+    wrapUp: { instruction: "登录接口仍然写死返回 true,没接上真实鉴权" },
+  } });
+  const chip = chips.find((c) => /评审/.test(c.label));
+  assert.ok(chip, "评审判了「没实现」,用户这边却什么都没有——那次付费调用等于白花");
+  assert.match(chip.send, /登录接口仍然写死返回 true/,
+    "卡片没把评审那句**具体**指令带上,点了等于让模型重新猜一遍");
+  // 通过 / 没结论时不许冒出来。
+  for (const wrapUp of [{ done: true }, null, undefined, { instruction: "" }]) {
+    assert.ok(!gen({ _lastRunState: { outcome: "success", task: "x", updatedAt: now, wrapUp } })
+      .some((c) => /评审/.test(c.label)), "评审没说「没实现」时不该冒卡片");
+  }
+  // 落进运行状态那一步:只在 done === false 时落,且必须带 instruction。
+  const persist = /wrapUp: \(\(\) => \{([\s\S]*?)\}\)\(\),/.exec(SRC);
+  assert.ok(persist, "运行状态里没有 wrapUp——评审结论根本到不了卡片那一层");
+  assert.match(persist[1], /v\.done !== false/,
+    "判据不对：done 缺席(评审没跑成)会被当成「没实现」,那是凭空冤枉自己");
+  assert.match(persist[1], /instruction \? \{ instruction \} : null/,
+    "没指令的空结论也落了,会弹出一张点了没用的卡");
+  // 红线仍在：这条出口不许顺手变成「自动补一轮」。
+  const at = SRC.indexOf("if (run.wrapUp && run.wrapUp.instruction)");
+  assert.ok(at > 0);
+  assert.doesNotMatch(SRC.slice(at, at + 320), /_incompleteReason|run\.outcome\s*=[^=]/,
+    "评审是**意见**不是执行事实,不许拿它去改那个只认执行事实的结局枚举");
+});
