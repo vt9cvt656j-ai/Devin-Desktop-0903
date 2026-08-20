@@ -15,6 +15,23 @@ impl MacOSControl {
     }
 }
 
+/// 当前前台应用名。切前台失败时光说「没成功」没法排查，得说出是谁占着前台。
+fn frontmost_app_name() -> Option<String> {
+    unsafe {
+        let workspace: id = msg_send![class!(NSWorkspace), sharedWorkspace];
+        let app: id = msg_send![workspace, frontmostApplication];
+        if app == nil {
+            return None;
+        }
+        let name: id = msg_send![app, localizedName];
+        if name == nil {
+            return None;
+        }
+        let ptr: *const i8 = msg_send![name, UTF8String];
+        Some(std::ffi::CStr::from_ptr(ptr).to_string_lossy().to_string())
+    }
+}
+
 impl WindowControl for MacOSControl {
     fn enumerate_windows(&self) -> Result<Vec<WindowInfo>> {
         let mut windows = Vec::new();
@@ -79,7 +96,30 @@ impl WindowControl for MacOSControl {
                 
                 if name.contains(title) {
                     let _: () = msg_send![app, activateWithOptions: 0];
-                    return Ok(());
+                    // 激活是异步的，而合成按键和点击只会投给**当前**前台应用。
+                    // 发完就回 Ok 等于把「请求已发出」当成「已经切过去了」——冷启动、
+                    // 跨 Space、被对话框截胡时它根本没切成，而后面每一次 keyboard.type
+                    // 都打进上一个应用，并且一路返回成功。所以这里必须回读。
+                    let deadline =
+                        std::time::Instant::now() + std::time::Duration::from_millis(2500);
+                    loop {
+                        let active: bool = msg_send![app, isActive];
+                        if active {
+                            return Ok(());
+                        }
+                        if std::time::Instant::now() >= deadline {
+                            break;
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(60));
+                    }
+                    let front = frontmost_app_name()
+                        .unwrap_or_else(|| "（读不到）".to_string());
+                    return Err(Error::Timeout(format!(
+                        "已向「{}」发出激活请求，但 2.5 秒后它仍不在前台，当前前台是「{}」。\
+合成按键和点击只进前台应用，此刻继续 keyboard.type / mouse.click 会打进「{}」。\
+先处理挡在前面的东西（对话框、权限提示、另一个 Space），或改用 system open。",
+                        name, front, front
+                    )));
                 }
             }
         }

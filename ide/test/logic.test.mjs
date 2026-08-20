@@ -31251,3 +31251,68 @@ test("git_log 只看当前分支，并且说清是哪条分支", () => {
   assert.match(run(e, "—").content, /当前分支的最近/);
   assert.equal(run([], "main").content, "(无提交历史)", "没有提交时别硬扣一个抬头");
 });
+
+// gh_pr_review_comments 的抬头报 arr.length（--paginate 会取全），正文却先 slice(0,30)
+// 再 slice(0,3500) 字符 —— 40 条评论的 PR，抬头写「(40)」而正文只塞得下十来条，
+// 后面的连截断标记都没有。模型据此回「40 条 review 意见都处理了」。
+test("gh_pr_review_comments：抬头的条数必须是正文里真有的条数", () => {
+  const seg = SRC.slice(SRC.indexOf('if (call.op === "pr_review_comments") {'),
+                        SRC.indexOf('if (call.op === "pr_reply") {'));
+  // seg 一直切到下一个 if 之前，尾巴上带着本块的收尾 `}`，去掉才能当函数体用。
+  const body = seg.slice(seg.indexOf("const raw = (r.stdout")).replace(/\s*\}\s*$/, "");
+  const run = (r) => new Function("r", "call", "res", "vp", "_escHtml", body)(
+    r, { number: 7 }, {}, null, (x) => x);
+
+  const mk = (n, len) => JSON.stringify(Array.from({ length: n }, (_, i) => ({
+    user: { login: "rev" }, path: "a.ts", line: i, body: "x".repeat(len),
+  })));
+
+  // 放得下：抬头就是全部条数。
+  const small = run({ code: 0, stdout: mk(3, 40) });
+  assert.match(small.content, /review 评论 \(3\)/);
+  assert.doesNotMatch(small.content, /只有最早的/);
+
+  // 放不下：抬头必须报真实显示条数 + 剩余条数，且给出取剩下的办法。
+  const big = run({ code: 0, stdout: mk(40, 280) });
+  const shown = (big.content.match(/\[rev\] a\.ts:/g) || []).length;
+  assert.ok(shown < 40, "这组样本没触发截断，测试就没测到东西");
+  assert.ok(big.content.includes(`共 40 条，**下面只有最早的 ${shown} 条**`),
+    `抬头说的条数和正文里真有的 ${shown} 条对不上：${big.content.slice(0, 90)}`);
+  assert.ok(big.content.includes(`还有 ${40 - shown} 条没在这里`));
+  assert.ok(big.content.length < 4200,
+    `正文没有字符预算了（${big.content.length} 字）—— 一条 review 意见能写很长，30 条足够把上下文冲垮`);
+  assert.match(big.content, /gh api repos/, "没给取剩下那些的办法");
+  assert.match(big.content, /别按「都看完了」下结论/);
+
+  // 30 条上限也要走同一条抬头。
+  const many = run({ code: 0, stdout: mk(60, 20) });
+  assert.ok(many.content.includes("共 60 条，**下面只有最早的 30 条**"));
+
+  // 解析失败 ≠ 没有评论：命令带了 2>&1，gh 的提示行会把 JSON 弄坏，退出码却是 0。
+  const dirty = run({ code: 0, stdout: "note: something\n" + mk(2, 10) });
+  assert.match(dirty.content, /\[ERROR\]/, "解析不了却报成「确实是空的」");
+  assert.match(dirty.content, /这不等于没有评论/);
+
+  assert.match(run({ code: 0, stdout: "[]" }).content, /确实是空的/);
+  assert.match(run({ code: 1, stdout: "gh: not found" }).content, /\[ERROR\][\s\S]*退出码 1/);
+});
+
+// 3D / 音频 / 贴图的落盘扩展名是每个命令写死的（auto_rig、generate_motion 一律 glb），
+// 而后端的内容类型闸门明摆着放行 zip / octet-stream / image/*。上游给一个打包好的 FBX，
+// 文件就叫 rigged.glb，回执照样写「已生成骨骼绑定并保存到 assets/models/rigged.glb」——
+// 之后加载器抛一句看不懂的解析错误，模型只会去改加载代码。
+test("生成类资产：后端认出扩展名不对时，回执必须把这句转给模型", () => {
+  const seg = SRC.slice(SRC.indexOf("const _taskNote = _returnedTaskId ?"),
+                        SRC.indexOf("} catch (e) {", SRC.indexOf("const _taskNote = _returnedTaskId ?")));
+  const run = (out) => new Function(
+    "_returnedTaskId", "call", "_gaPath", "_gaOut", "_gaLabels", seg,
+  )("", { type: "auto_rig" }, "assets/models/rigged.glb", out, { auto_rig: "骨骼绑定" });
+
+  const clean = run({ bytes: 1234 });
+  assert.match(clean.content, /已生成骨骼绑定并保存到 assets\/models\/rigged\.glb/);
+  assert.doesNotMatch(clean.content, /⚠/, "没问题的时候别平白加一句警告");
+
+  const wrong = run({ bytes: 1234, ext_note: "上游返回的其实是 zip，不是 glb；文件已按真实格式改名保存。" });
+  assert.match(wrong.content, /⚠ 上游返回的其实是 zip/,
+    "后端已经认出文件不是 glb，这句却没转给模型");
+});

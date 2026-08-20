@@ -316,8 +316,19 @@ impl Agent {
     
     #[cfg(feature = "system")]
     pub fn quick_paste(&mut self, text: &str) -> Result<()> {
+        // 粘贴要借道剪贴板，但剪贴板是用户的东西。原来这里直接覆盖且从不还原——
+        // 用户复制了一段待用的内容，被自动化悄悄换掉，事后完全无从察觉。
+        // 先存后还，还原前多等一会儿：目标应用是在处理 Cmd+V 时才去读剪贴板的，
+        // 还得太快会把粘贴本身弄坏（paste_from_clipboard 已经等了 100ms）。
+        let saved = self.clipboard_get_text().ok();
         self.clipboard_set_text(text)?;
-        self.paste_from_clipboard()
+        let pasted = self.paste_from_clipboard();
+        if let Some(prev) = saved {
+            std::thread::sleep(Duration::from_millis(250));
+            // 还原失败不该盖掉粘贴本身的结果
+            let _ = self.clipboard_set_text(&prev);
+        }
+        pasted
     }
     
     // ==================== 浏览器自动化 ====================

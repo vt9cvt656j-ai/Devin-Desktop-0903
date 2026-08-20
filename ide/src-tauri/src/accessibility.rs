@@ -705,8 +705,21 @@ const AX_ACTION_JS: &str = r##"(function(){
       }
       return JSON.stringify({ok:true, action:'set_value', role:role, name:String(name).slice(0,60), value:String(nv).slice(0,140)});
     } else if (ACT === 'focus') {
-      var f=false; try { el.focused = true; f=true; } catch(e) {}
-      return JSON.stringify({ok:f, action:'focus', role:role, name:String(name).slice(0,60)});
+      // 赋值没抛异常 != 焦点真的落到这个元素上。紧挨着的 set_value 是回读比对过的，
+      // 只有 focus 这一支光看抛不抛——而很多元素会接受赋值却根本拿不到焦点
+      // （不可聚焦的容器、被遮挡的输入框、跨窗口的元素）。焦点没到却报成功，
+      // 后面那次 keyboard.type 就打进了别的地方，而且全链路一路 ok。
+      try { el.focused = true; } catch(e) {
+        return JSON.stringify({ok:false, err:'AX focus was rejected: '+String(e), action:'focus', role:role, name:String(name).slice(0,60)});
+      }
+      var got=false;
+      try { got = !!el.focused(); } catch(e) {
+        return JSON.stringify({ok:false, err:'AX focus could not be verified: '+String(e), action:'focus', role:role, name:String(name).slice(0,60)});
+      }
+      if(!got) {
+        return JSON.stringify({ok:false, err:'element accepted the assignment but did not take focus', action:'focus', role:role, name:String(name).slice(0,60)});
+      }
+      return JSON.stringify({ok:true, action:'focus', role:role, name:String(name).slice(0,60)});
     } else if (ACT === 'press') {
       var pressed=false;
       try { el.click(); pressed=true; } catch(e) {}
