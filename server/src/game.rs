@@ -8,6 +8,31 @@ use serde_json::json;
 use crate::error::AppError;
 use crate::AppState;
 
+/// 重型本地生成（MusicGen / TRELLIS）的**全局**并发上限。
+///
+/// 原来唯一的闸是「每用户每小时 60 次」——它数频率，不数并发。这两条路会在网关
+/// 容器里直接起 python 子进程，单个就能吃满 CPU 和几个 G 内存；一个账号并发打满
+/// 就能把同一个容器里的聊天网关一起压垮，而计数器一次都没触发（60 次远没用完）。
+///
+/// 所以要的是全局并发上限，不是更严的频率。占不到名额就当场拒，不排队：排队等于
+/// 把请求挂在那里继续占连接和内存，压垮的方式换了个样子而已。
+static HEAVY_GEN_SLOTS: std::sync::LazyLock<tokio::sync::Semaphore> =
+    std::sync::LazyLock::new(|| {
+        let n = std::env::var("MICHAEL_HEAVY_GEN_CONCURRENCY")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|v| *v > 0)
+            .unwrap_or(2);
+        tokio::sync::Semaphore::new(n)
+    });
+
+fn heavy_gen_slot() -> Result<tokio::sync::SemaphorePermit<'static>, AppError> {
+    HEAVY_GEN_SLOTS.try_acquire().map_err(|_| AppError {
+        status: StatusCode::SERVICE_UNAVAILABLE,
+        msg: "本地生成正在满负荷运行，请稍后再试".into(),
+    })
+}
+
 static HTTP: std::sync::LazyLock<reqwest::Client> = std::sync::LazyLock::new(|| {
     reqwest::Client::builder()
         .user_agent("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36")
@@ -430,6 +455,7 @@ async fn neural_3d(image_url: &str) -> Result<Vec<u8>, AppError> {
         "[generate_3d] neural: spawning trellis_gen.py, img_url_len={}",
         image_url.len()
     );
+    let _slot = heavy_gen_slot()?;
     let child = tokio::process::Command::new("python3")
         .arg("/app/trellis_gen.py")
         .arg(image_url)
@@ -605,6 +631,7 @@ async fn local_musicgen(prompt: &str, duration: f64) -> Result<Vec<u8>, AppError
         "[generate_music] local MusicGen: ~{dur:.0}s, prompt_len={}",
         prompt.len()
     );
+    let _slot = heavy_gen_slot()?;
     let child = tokio::process::Command::new("python3")
         .arg("/app/music_gen.py")
         .arg(prompt)

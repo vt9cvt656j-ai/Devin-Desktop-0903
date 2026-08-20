@@ -4265,6 +4265,34 @@ fn gw_cache_key(uid: uuid::Uuid, body: &serde_json::Value) -> String {
     format!("gwc:{:x}", h.finalize())
 }
 
+/// 这份 200 响应到底是不是一个**能用的回答**。
+///
+/// 上游「HTTP 200 但内容不是正常回复」是很常见的一类故障：中转把错误包成 200、
+/// 内容过滤把正文吞掉、把 error 对象直接塞进 200 的 body。原来这里一律当成功：
+/// 客户端拿到一次空回答，而且这份空壳还会被写进 Redis 存一小时——此后一小时内
+/// 同样的请求直接命中缓存，一次上游都不打。一次抖动因此变成一小时的持续故障。
+fn usable_completion(data: &serde_json::Value) -> bool {
+    if data.get("error").is_some_and(|e| !e.is_null()) {
+        return false;
+    }
+    let Some(choices) = data.get("choices").and_then(|c| c.as_array()) else {
+        return false;
+    };
+    let Some(first) = choices.first() else {
+        return false;
+    };
+    let msg = first.get("message");
+    let has_text = msg
+        .and_then(|m| m.get("content"))
+        .and_then(|c| c.as_str())
+        .is_some_and(|c| !c.trim().is_empty());
+    let has_tools = msg
+        .and_then(|m| m.get("tool_calls"))
+        .and_then(|t| t.as_array())
+        .is_some_and(|t| !t.is_empty());
+    has_text || has_tools
+}
+
 fn response_cache_safe(bytes: &[u8]) -> bool {
     // Tool-call arguments contain the user's full tracking number. The native tool
     // masks its result, but caching the model response would retain the original
@@ -7172,10 +7200,33 @@ pub async fn chat_completions(
         .unwrap_or(0);
     let free_pool_has_room = free_here
         && free_pool_covers_call(free_points_balance(&state, uid).await, free_call_micro);
-    admit_billing(
+    // 返回值以前被丢掉（写作 `admit_billing(...)?;`），而它正是「这次靠哪个池子放行」
+    // 的唯一答案。
+    //
+    // 这里的准入判据是「**任意一条**候选线路免费」（上面那个 any），而结算看的是
+    // 「**实际选中**的那条」。两者不是同一条时，一个零余额零套餐的用户被免费池放行，
+    // 却按付费线路全额扣进钱包：credits_cents 被扣成负数，免费池一点没动。
+    // （/v1/responses 那条路没这个毛病——它的 free_here 就是按单条 conn 算的。）
+    //
+    // 选中哪条线路要等上游跑完才定，那时再拦已经晚了。所以在**尝试线路之前**收窄候选：
+    // 除了免费池没有别的付款方式的人，只让走免费线路，结算就必然落在免费线路上。
+    // 有余额/有套餐的用户行为不变（免费线路挂了照样回退到付费线路）。
+    let admitted_free = admit_billing(
         free_fallback_to_paid(), free_here, free_pool_has_room, quota_ok, credits,
         plan_active, q_total, q_window, q_weekly_cap, q_week_used,
     )?;
+    if admitted_free && !quota_ok && credits <= 0 {
+        let free_only: Vec<Model> = candidates
+            .iter()
+            .filter(|c| effective_billing(c, &model_id).2)
+            .cloned()
+            .collect();
+        // admitted_free 为真蕴含 free_here 为真，所以这里不会空；真空了就不动，
+        // 交给原有逻辑，不因为一道保护把请求打死。
+        if !free_only.is_empty() {
+            candidates = free_only;
+        }
+    }
 
     // The gate above only proves the balance is positive, not that it covers this
     // call, and settlement happens after the upstream responds. Serially that lets a
@@ -8311,9 +8362,28 @@ pub async fn chat_completions(
         // `"{}"` with the actual JSON, producing `'{}{"path":"."}'` which clients then
         // parse as `{}` (silent empty args). Strip leading `{}` when followed by `{`.
         fix_tool_call_arguments(&mut data);
+        // 带 error 的 200 是上游在用成功的外壳报错。照原样返回等于把一次上游故障
+        // 洗成一次「模型什么都没说」——客户端无从分辨，只能当模型不配合。
+        if data.get("error").is_some_and(|e| !e.is_null()) {
+            return Err(AppError {
+                status: StatusCode::BAD_GATEWAY,
+                msg: format!(
+                    "模型供应商返回 200 但内容是错误: {}",
+                    data.get("error")
+                        .map(|e| e.to_string())
+                        .unwrap_or_default()
+                        .chars()
+                        .take(300)
+                        .collect::<String>()
+                ),
+            });
+        }
         // Cache the successful response for identical future requests.
+        // 只缓存**能用的**回答：空回答被缓存一小时之后，一次上游抖动就变成一小时的
+        // 持续故障，期间一次上游都不会再打。空回答本身照旧返回（模型确实可能因为
+        // 内容过滤等原因给出空正文），但绝不留存。
         if let Ok(bytes) = serde_json::to_vec(&data) {
-            if !bytes.is_empty() && bytes.len() < 1_000_000 && response_cache_safe(&bytes) {
+            if !bytes.is_empty() && bytes.len() < 1_000_000 && response_cache_safe(&bytes) && usable_completion(&data) {
                 let mut rconn = state.redis.clone();
                 let _: Result<(), redis::RedisError> = redis::cmd("SET")
                     .arg(&ckey)
