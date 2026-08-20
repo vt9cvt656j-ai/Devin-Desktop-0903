@@ -9668,6 +9668,38 @@ test("code delivery without build/test evidence is reported without forcing anot
     "an inferred verification preference must not override the model's end-turn decision");
 });
 
+test("a run that declared a workspace change but landed nothing is not reported as success", () => {
+  // 用户实拍的症状：模型回一整页「删除了 refreshAll()、新增 loadStats()」，工作区一个
+  // 字节没动，而这一轮被记成 success、通知栏打「✅ 任务完成」，于是同一个问题要说 3-4 轮。
+  //
+  // 静默轮（模型不调工具就收尾）按设计是它的收尾决定，harness 只在机器事实与之矛盾时
+  // 才推翻。一次工具都没调过的轮次，那四样机器事实（退出码/诊断增量/用户插话/计划状态）
+  // 一个都不存在——所以这条路原来完全没人管。
+  const loop = extractFn("_runAgenticLoop");
+  assert.match(loop, /run\.mode === "agent" && !didMutate && _agentAllowsWorkspaceMutation\(run\) && !_stoppedEarly/,
+    "声明要改工作区却零落盘，必须在收尾记账里被认出来");
+  assert.match(loop, /run\._incompleteReason \|\|= "declared_mutation_not_delivered"/,
+    "记账要落到 incompleteReason，结局才会从 success 变成 partial");
+  assert.match(SRC, /declared_mutation_not_delivered: "/,
+    "闭合枚举必须有对应的人话标签，不能把枚举名甩给用户");
+
+  // 判据只用「模型自己的声明 + 落盘账本」，不许退回读正文措辞——那条路走过，
+  // 12 条基于正文的判据全部被反例打掉（见静默轮注释）。
+  const gate = loop.slice(loop.indexOf("declared_mutation_not_delivered") - 1600,
+                          loop.indexOf("declared_mutation_not_delivered") + 200);
+  assert.doesNotMatch(gate, /summaryText|acc\.match|\/已(?:修改|创建|完成)\//,
+    "不许靠模型正文里的措辞来判断有没有干活");
+
+  // 而且不许把删掉的那条**预测型**闸门借尸还魂：它是按关键词推效果，和模型自己的声明
+  // 是两回事，反漂移断言在本文件另一处钉着。
+  assert.doesNotMatch(SRC, /function _missingRequiredEffects\(/);
+  assert.doesNotMatch(SRC, /run\._incompleteReason\s*(?:=|\|\|=)\s*`required_effect_missing/);
+
+  // 只记账、不补回合：这条规矩和 code_delivered_unverified 一样，不许推提醒续跑。
+  assert.doesNotMatch(loop, /_pushNudge\("declaredMutation/,
+    "缺席只记账，永不制造回合去覆盖模型的收尾判断");
+});
+
 test("dynamic URLs and third-party fields require real evidence instead of guessing", () => {
   assert.match(SRC, /Dynamic facts — URLs, endpoints, redirects, field meanings, products, prices, stock, stream or playback addresses, rankings, live status — must come from a real page, a real HTTP\/network response, a real file sample, an official or structured API, or data the user authorized/,
     "truthfulness prompt must forbid guessing dynamic facts and URLs");
@@ -10017,7 +10049,10 @@ test("michael-design runs in the background and is injected only at loop boundar
   assert.match(SRC, /domain: "michael-design", query: plan\.query, topK: 6/);
   assert.match(SRC, /await _searchKnowledgeBase\(call\)/);
   assert.match(SRC, /run\._michaelDesignEvidence = _mergeMichaelDesignEvidence/);
-  assert.match(SRC, /run\._michaelDesignBrief = brief/);
+  // 简报的**真实载体**是这个函数的返回值——下面那条钉着 `_ORCH_NOTE + preflight.brief`
+  // 被真正消费。原来这里钉的是 `run._michaelDesignBrief = brief`：一份写完没人读的副本，
+  // 它唯一的作用就是让这条断言有东西可匹配（副本已删）。
+  assert.match(SRC, /return \{ required: true, brief, results, evidence \};/);
   const loop = extractFn("_runAgenticLoop");
   assert.match(loop, /const _consumeMichaelDesignPreflight = \(\) =>/);
   assert.match(loop, /const preflight = run\._michaelDesignPreflightResult/);
@@ -21879,10 +21914,12 @@ test("the diagnostic block and auto-verify convergence loop are actually wired",
   // exactly the regression this test exists to catch.
   // _live() → _canResume：现在这道门还要过全局关闸（只读模式/用户拒绝过/撞过模式墙）
   // 和全局预算池，不再只看"流还活着"。
-  assert.match(loop, /if \(run\._diagnosticBlock && _canResume\)[\s\S]{0,900}?continue;/,
+  assert.match(loop, /if \(run\._diagnosticBlock\) \{\n\s*if \(_canResume\)[\s\S]{0,1200}?continue;/,
     "a populated block must send the model back to fix, not just sit there");
-  assert.match(loop, /run\._incompleteReason = run\._incompleteReason \|\| "new_diagnostics_unresolved"/,
-    "once the bounded retries are spent the run must finish HONESTLY, not silently");
+  // 记账必须在续跑闸门**外面**。写在里面的话，闸门一关（静默轮重复 / 用户中途拒过一次调用 /
+  // 池被别的门用完）就连账都不记，收尾时未完成原因是空的，整轮被判成功——正是「没做却说做完了」。
+  assert.match(loop, /continue;\n\s*\}\n\s*\}\n\s*run\._incompleteReason = run\._incompleteReason \|\| "new_diagnostics_unresolved";/,
+    "记账要落在闸门之外：补不了一轮时，新增错误这个事实照样要进未完成原因");
 
   // the summary field that was permanently false now has a source
   assert.match(loop, /hadDiagnostics: !!_prevVerifyErrs/, "run summary reads the tracked count");
@@ -23260,11 +23297,16 @@ test("the agent loop keeps fixing a red build, bounded, then finishes honestly",
   const loop = extractFn("_runAgenticLoop");
   // The build-failure signal drives a nudge + continue (keep fixing), like _diagnosticBlock.
   assert.match(loop, /const _buildFail = _freshBuildFailure\(run, _implOps\);/);
-  assert.match(loop, /if \(buildFixAttempts < 2\) \{[\s\S]{0,900}_pushNudge\("buildFix"[\s\S]{0,400}continue;/,
+  assert.match(loop, /if \(_canResume && buildFixAttempts < 2\) \{[\s\S]{0,900}_pushNudge\("buildFix"[\s\S]{0,400}continue;/,
     "a fresh red build must feed stderr back and continue, not finish");
   // Bounded: past the budget it records an honest incomplete instead of thrashing.
   assert.match(loop, /run\._incompleteReason = "build_failing"/,
     "an unfixable build must converge to an honest incomplete");
+  // …而这句记账不能被续跑闸门罩住。罩住的话，闸门关闭时红构建连账都不记，收尾判成功。
+  assert.doesNotMatch(loop, /if \(_buildFail && _canResume\)/,
+    "红构建的记账不能挂在续跑闸门上——退出码是执行事实，与还能不能补一轮无关");
+  assert.match(loop, /if \(_buildFail\) \{\n\s*if \(_canResume && buildFixAttempts < 2\)/,
+    "闸门只该管补不补一轮");
   // The nudge carries the real exit code and BOTH streams — facts, not a keyword guess.
   assert.match(loop, /退出码 \$\{_buildFail\.exitCode\}/);
   // 短路 || 是错的：pytest / vitest / go test / cargo test / node --test 都把
@@ -28661,20 +28703,20 @@ test("写入没落盘要说出来，而纯问答/只改文档的 run 照旧不�
   // 用户实撞的那个形状：尝试写一份 .md，没落盘，而且没动过任何源码。
   const phantom = line({
     _mutatedFiles: new Set(), _executionEvidence: [],
-    _eagerLanded: [{ path: ".doc/implementation-plan.md", ok: false }],
+    _writeLedger: [{ path: ".doc/implementation-plan.md", ok: false }],
   });
   assert.match(phantom, /没有落盘/, "写入落空了却一个字不说——模型只能照着自己的印象说「已保存」");
   assert.match(phantom, /implementation-plan\.md/, "要点名是哪个文件，否则模型不知道该改口说哪一句");
   assert.match(phantom, /不要说它们已保存/, "要直说结论，别让模型自己去推");
 
   // 成功落盘的不重复报（下面那行的 mutated 计数已经覆盖）。
-  const ok = line({ _mutatedFiles: new Set(), _executionEvidence: [], _eagerLanded: [{ path: "a.md", ok: true }] });
+  const ok = line({ _mutatedFiles: new Set(), _executionEvidence: [], _writeLedger: [{ path: "a.md", ok: true }] });
   assert.equal(ok, "", "落盘成功的尝试不该再单独说一遍");
 
   // 动过源码时，落空的写入要和源码计数并列出现，不能被挤掉。
   const mixed = line({
     _mutatedFiles: new Set(["src/a.ts"]), _executionEvidence: [],
-    _eagerLanded: [{ path: "src/b.ts", ok: false }],
+    _writeLedger: [{ path: "src/b.ts", ok: false }],
   });
   assert.match(mixed, /改了 1 个源码文件/);
   assert.match(mixed, /没有落盘/, "有源码改动时就把落空的写入吞掉了");
@@ -28732,13 +28774,26 @@ test("尝试写了没落盘时，结局里必须留下 writes_failed", () => {
   const loop = extractFn("_runAgenticLoop");
   assert.match(loop, /run\._incompleteReason \|\|= `writes_failed:\$\{_failedWrites\.length\}`/,
     "写入落空在结局里没有任何出口——用户看到的收尾卡片一个字都不会提这件事");
-  assert.match(loop, /\(Array\.isArray\(run\._eagerLanded\) \? run\._eagerLanded : \[\]\)\.filter\(\(a\) => a && a\.ok === false\)/,
+  assert.match(loop, /\(Array\.isArray\(run\._writeLedger\) \? run\._writeLedger : \[\]\)\.filter\(\(a\) => a && a\.ok === false\)/,
     "判据要读执行记录（每次写入尝试的成败），不是从措辞里猜");
   // 闭合枚举必须认得它，否则界面回落到那句无意义的「继续没做完的部分」。
   const labels = loadConst("_INCOMPLETE_LABELS");
   assert.equal(labels.writes_failed, "重写那几个没写成的文件");
   // 标签按冒号前的基名查表，`writes_failed:2` 要能查到。
   assert.equal(labels["writes_failed:2".split(":")[0]], "重写那几个没写成的文件");
+
+  // 台账的**入口**要覆盖全部写入类型。原来只有流式那个钩子往里写，而它第一行就按工具名
+  // 把 write_file 之外的挡掉了：edit_file 因 old_string 对不上整体没写、multi_edit 撞上
+  // 编辑器里未保存的改动被拦（CONFLICT），这两类失败一次都不进账，于是既不出 writes_failed，
+  // 也不进每轮喂给模型的交付事实——模型手上没有与「已经改好了」相矛盾的事实。
+  assert.match(loop, /\(t === "write" \|\| t === "edit" \|\| t === "multiedit"\)[\s\S]{0,200}?run\._writeLedger = run\._writeLedger \|\| \[\]\)\.push\(\{ path: it\.call\.path, ok: _ok \}\)/,
+    "批处理这条腿也要记账，否则 edit/multi_edit 的失败永远不进台账");
+  // 流式那条腿记过的条目要跳过，否则同一次写入记两笔，writes_failed 的计数会被吹大。
+  assert.match(loop, /if \(!it\._eagerEntry && !it\._skipped && \(t === "write"/,
+    "同一次写入不能记两笔");
+  // 判成败必须用全系统那套权威判定，和钩子那条一致——手写正则漏判会造出一条假事实。
+  const hook = loop.slice(loop.indexOf("_landedOk"));
+  assert.match(hook.slice(0, 300), /_toolExecutionSucceeded\(call, result\)/);
 });
 
 // ---- 承诺了却零调用点的三条，接上/拆掉之后钉住 ----

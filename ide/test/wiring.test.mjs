@@ -292,10 +292,21 @@ test("decision functions have their verdict consumed, not discarded", () => {
 // follow. Fixing them all today would be a large unrelated change; letting the set GROW is
 // how the next `_diagnosticBlock` gets in. So: the list may shrink freely, never grow.
 // Names are stored WITHOUT the leading underscore: the capture group starts after `run._`.
+// 2026-08-20：这份存量从 11 缩到 2。缩掉的九个分两类——
+//   · 七个是**写完没人读的记账**，已连同写入点一并删除：michaelDesignPreflight /
+//     michaelDesignBrief（真实载体是函数返回值 preflight.brief）、implementationGrounded、
+//     emptyRootProbe + emptyRootProbePending（探测按注释是**刻意**发射后不管的，
+//     那两个句柄从没人 await / 检查）、emptyBuildIntercepted（它那句注释描述的
+//     「收尾只拦 1 次」机制根本不存在）、capturePort（模块级 _capturePort 才是真在用的）、
+//     uiDeliveryAuditUnresolved（整套「界面交付审计」只有账本没有主体：三个计数器里两个
+//     全仓再无第二次出现，未决清单只被清空、从不装东西）。
+//   · compactedThisTurn 早就被接上了（读点在主循环的中途小结判据里），只是名单没跟着缩。
+// 剩下这两个是**通过局部别名读的**，文本扫描跟不上，不是债：
 const KNOWN_WRITE_ONLY = new Set([
-  "michaelDesignPreflight", "michaelDesignBrief", "implementationGrounded", "compactedThisTurn",
-  "emptyRootProbePending", "emptyRootProbe", "researchEvidence", "emptyBuildIntercepted",
-  "toolRoutingState", "uiDeliveryAuditUnresolved", "capturePort",
+  // run._researchEvidence = _researchEvidence，取证门读的是那个局部量
+  "researchEvidence",
+  // run._toolRoutingState = _toolRoutingState，路由逻辑读的是那个局部量
+  "toolRoutingState",
 ]);
 
 // 「读」的定义要经得起两种伪装，否则一个死账本能一直挂着不被发现：
@@ -505,10 +516,10 @@ test("交付事实必须每轮喂给模型，不能只挂在 iter>=6 的草稿�
   const dfl = SRC.slice(SRC.indexOf("function _deliveryFactsLine(run) {"), SRC.indexOf("function _deliveryFactsLine(run) {") + 2000);
   // 闸门还在，但多了一个**必须**的例外：写入尝试落空了要说。用户实撞过「它说已保存到
   // .doc/xxx.md，而文件不在」——那次模型手上没有任何与之矛盾的事实，因为这一行整个是空的。
-  // 落空的写入是纯执行记录（run._eagerLanded 逐条记着），不是对措辞的猜测。
+  // 落空的写入是纯执行记录（run._writeLedger 逐条记着），不是对措辞的猜测。
   assert.match(dfl, /if \(!code\.length\) \{[\s\S]{0,400}?if \(!_failedLine\) return "";/,
     "没动过源码、也没有落空的写入时，必须仍然返回空串——纯问答的 run 不该被塞无关事实");
-  assert.match(dfl, /run\?\._eagerLanded/, "落空的写入没有被说出来，模型收尾时手上就没有与之矛盾的事实");
+  assert.match(dfl, /run\?\._writeLedger/, "落空的写入没有被说出来，模型收尾时手上就没有与之矛盾的事实");
   // 显示侧那条规矩不许被这次修复带回来
   // 它现在只剩定义、零调用点，正是 08-18 那次删除的结果。这一条守住"别挂回去"：
   // 排除 `function _appendDeliveryFactsBar(` 这处声明后，调用点必须仍然是 0。
@@ -1792,7 +1803,7 @@ const KNOWN_UNCALLED = new Set([
   "_appendDeliveryFactsBar", "_appendRunRevertBar",
   "_activeAiProviderMode", "_adaptiveEnabled", "_addDroppedRef",
   "_agentAllowsDependencyRestore", "_agentAllowsExternalKind", "_agentAllowsRuntimeKind",
-  "_agentAllowsWorkspaceMutation", "_agentQuestionNeedsWorkspaceEvidence",
+  "_agentQuestionNeedsWorkspaceEvidence",
   "_agentSideEffectIntentIssue", "_agentTimelineElapsed", "_agentTimelineRelative",
   "_agentToolNameAllowedByProfile", "_agentTurnHasNonControlTools", "_agentUserIntentText",
   "_aiConfigured", "_appendMemory", "_appendToolPlanCard", "_browserNeedsCapturePreflight",

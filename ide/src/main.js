@@ -22862,7 +22862,6 @@ async function _runMichaelDesignPreflight({ run, body = null, isLive = () => tru
   }
 
   const researchPlan = _michaelDesignResearchPlan(run._originalText || "", profile);
-  run._michaelDesignPreflight = { status: "running", researchPlan, startedAt: Date.now() };
 
   const searches = researchPlan.map(async (plan) => {
     if (!isLive()) return null;
@@ -22899,13 +22898,6 @@ async function _runMichaelDesignPreflight({ run, body = null, isLive = () => tru
   const evidence = run._michaelDesignEvidence || null;
   const brief = _michaelDesignBrief(researchPlan, evidence, results, profile);
   const hitCount = results.filter((item) => item.evidence).length;
-  run._michaelDesignPreflight = {
-    status: hitCount ? "complete" : "unavailable",
-    researchPlan,
-    results: results.map((item) => ({ id: item.plan.id, hitCount: item.evidence?.hitCount || 0, error: !item.evidence })),
-    completedAt: Date.now(),
-  };
-  run._michaelDesignBrief = brief;
   return { required: true, brief, results, evidence };
 }
 
@@ -24840,10 +24832,10 @@ function _renderSuggestionChips(sess, items, label) {
 // 验证命令非零退出，new_diagnostics_unresolved = 诊断真的多出来了）。所以"哪里没做完"
 // 不需要让模型重读对话去猜——猜最好也只是复述，最坏是编一个不同的。这张表把枚举翻译成
 // 人话；泛泛的「继续完成剩余部分」正是用户点名不要的那种废话。
-/// 这段收尾文字在**声称自己动手做了事**吗。
-///
-/// 只认强断言（"已修改/已创建/已部署/执行完毕"），不认建议式（"可以/建议/需要/接下来"），
-/// 也不认纯读取（"已读取/已查看"）——那些在纯问答里是正常的，误报会让模型被无端追问。
+// （这里原先挂着一段「这段收尾文字在声称自己动手做了事吗」的函数文档，而那个函数早已
+// 不在——按正文措辞判断有没有干活那条路是被**主动放弃**的，见静默轮那段注释里 12 条判据
+// 全被反例打掉的记录。留一段描述不存在的函数的注释，只会让下一个人以为这套检测还在，
+// 而本文件的反漂移断言跑的就是源文本，注释里的旧代码会把断言喂歪。）
 const _INCOMPLETE_LABELS = {
   build_failing: "修复构建失败",
   code_delivered_unverified: "跑一遍验证刚才的改动",
@@ -24863,6 +24855,10 @@ const _INCOMPLETE_LABELS = {
   // 最后一个动作轮里有工具明确报了失败（部署/命令/mcp/http 退出非零、被拒、冲突……），
   // 模型却收了尾。给一句能照做的下一步，而不是把 last_action_failed 这个枚举名甩给用户。
   last_action_failed: "上一步有工具报错，先把它弄好",
+  // 「说改完了，工作区一个字节没动」。写成祈使句，用户可以直接发出去当催办。
+  // 排在表尾是刻意的：plan-advance 有条断言按「表头 600 字符内必须出现 user_stopped」
+  // 检查，插在中间会把它挤出窗口——那条守卫是对的，让位的该是新条目。
+  declared_mutation_not_delivered: "这一轮没有真的改动文件，请直接动手改",
 };
 
 function _runStateNextActionSuggestions(sess, { maxAgeMs = 5 * 60_000 } = {}) {
@@ -37171,10 +37167,7 @@ function _implementationMutationGroundingIssue(run, call, root = "") {
       || profile.uiProject || profile.bug || profile.debugProject)) return "";
   const currentRoot = root || call?._runRoot || run.root || "";
   if (_runRootConfirmedEmptyForImplementation(run, currentRoot)) return "";
-  if (_runHasImplementationGrounding(run, currentRoot)) {
-    run._implementationGrounded = true;
-    return "";
-  }
+  if (_runHasImplementationGrounding(run, currentRoot)) return "";
   return "[BLOCKED_IMPLEMENTATION_GROUNDING] 当前项目不是已确认的空目录，但本轮还没有读取真实项目结构、源码或诊断。先用 list_dir/find_files 定位，再 read_file 读取相关入口/调用方（或 get_diagnostics/find_symbol 取得真实证据），拿到结果后的下一轮再写入。不要凭文件名和旧对话猜技术栈，也不要用 shell 绕过。";
 }
 
@@ -38843,7 +38836,10 @@ function _smartCompress(text, budget) {
 /// 写入可能还在飞（run 都结束了它才落地），而且落了盘的文件在消息历史、run 摘要、
 /// 账本里一个记录都没有——磁盘变了，所有记录都说没变。
 ///
-/// 返回一句给 run 摘要用的说明；没有任何即时写入时返回空串。
+/// 台账本身是 run 级的（每一次写入尝试都进账，不分轮次），所以这里的措辞也按整次运行说，
+/// 不说「这一轮」——否则前几轮的写入会被安到中断的这一轮头上。
+///
+/// 返回一句给 run 摘要用的说明；没有任何写入尝试时返回空串。
 async function _settleEagerWritesForBreak(run) {
   if (!run) return "";
   const pending = run._eagerPending;
@@ -38856,15 +38852,15 @@ async function _settleEagerWritesForBreak(run) {
       ]);
     } catch {}
   }
-  const landed = Array.isArray(run._eagerLanded) ? run._eagerLanded : [];
+  const landed = Array.isArray(run._writeLedger) ? run._writeLedger : [];
   if (!landed.length) return "";
   const ok = landed.filter((x) => x && x.ok).map((x) => x.path).filter(Boolean);
   const bad = landed.filter((x) => x && !x.ok).map((x) => x.path).filter(Boolean);
   const parts = [];
-  if (ok.length) parts.push(`这一轮已经真实写入磁盘：${[...new Set(ok)].join("、")}`);
+  if (ok.length) parts.push(`本次运行已经真实写入磁盘：${[...new Set(ok)].join("、")}`);
   if (bad.length) parts.push(`尝试写入但失败：${[...new Set(bad)].join("、")}`);
   if (pending && pending.size) parts.push(`还有 ${pending.size} 个写入未在 8 秒内落定，状态未知`);
-  return parts.length ? `〔本轮中断前的写入结果〕${parts.join("；")}` : "";
+  return parts.length ? `〔中断前的写入结果〕${parts.join("；")}` : "";
 }
 
 function _trimMessagesIfHuge(messages, run = null, root = "", contextLimitTok = 0) {
@@ -42251,12 +42247,12 @@ function _deliveryFactsLine(run) {
   // 落空的写入尝试：**比"改了几个文件"更要紧的一条**。
   //
   // 用户实撞（2026-08-19）：模型答「已生成执行计划文档并保存到 .doc/implementation-plan.md」，
-  // 而磁盘上没有那个文件。`run._eagerLanded` 里逐条记着每一次写入尝试和它到底落没落盘——
+  // 而磁盘上没有那个文件。`run._writeLedger` 里逐条记着每一次写入尝试和它到底落没落盘——
   // 纯执行记录，不需要去猜模型的措辞。它一次都没被说出来过，于是模型在写收尾那句话的时候，
   // 手上没有任何与之矛盾的事实。把它说出来，模型自己就会改口。
   //
   // 只报**失败**的尝试：成功的那些本来就由下面的 mutated 计数覆盖，重复说只会占预算。
-  const _attempts = Array.isArray(run?._eagerLanded) ? run._eagerLanded : [];
+  const _attempts = Array.isArray(run?._writeLedger) ? run._writeLedger : [];
   const _failed = [...new Set(_attempts.filter((a) => a && a.ok === false).map((a) => String(a.path || "")).filter(Boolean))];
   const _failedLine = _failed.length
     ? `有 ${_failed.length} 次写入**没有落盘**（${_failed.slice(0, 4).join("、")}${_failed.length > 4 ? " 等" : ""}）——这些文件此刻不在磁盘上，不要说它们已保存/已生成`
@@ -47474,8 +47470,7 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
     // is short-circuited. Only trust the snapshot if nothing mutated while we waited.
     const _emptyProbeTick = run._fsMutTick || 0;
     const _emptyProbeRoot = _normalizeFsPath(root).replace(/\/+$/, "");
-    run._emptyRootProbePending = true;
-    run._emptyRootProbe = Promise.resolve().then(() => backend.readDir(root))
+    void Promise.resolve().then(() => backend.readDir(root))
       .then((entries) => {
         if (run._didMutate || (run._fsMutTick || 0) !== _emptyProbeTick) return;
         if (Array.isArray(entries)) {
@@ -47490,8 +47485,7 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
           }
         }
       })
-      .catch(() => {})
-      .finally(() => { run._emptyRootProbePending = false; });
+      .catch(() => {});
   }
   // Keep the complete registry and MCP routing state on the run. Only the per-turn model payload
   // is windowed; search_tools/direct-by-name can swap an omitted schema into that bounded window.
@@ -47617,7 +47611,6 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
   let _uiVerifiedAtImplOps = -1, uiVerifyNudges = 0, _browserViewportKind = "";
   // UI verification phase machine: 'idle' | 'running' | 'completed'. Prevent reset-on-mutation loops by only clearing nudges on first entry into running.
   let _uiVerifyPhase = "idle", _uiVerifyTotal = 0;
-  let _uiDeliveryAuditedAtImplOps = -1, uiDeliveryAuditRuns = 0, uiDeliveryAuditNudges = 0;
   let _uiFreshNavigated = false, _uiActionPassed = false, _uiInteractionPassed = false;
   const _uiPassedViewports = new Set();
   const _uiInteractionViewports = new Set();
@@ -47685,7 +47678,6 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
   const _emptyBuildIntent = () => !!(run.engineering && (run.engineering.substantial || run.engineering.projectScope
     || run.engineering.fromZeroUiProject || run.engineering.uiProject || run.engineering.fullWebsite || run.engineering.implementation));
   run._emptyBuildNudges = 0;        // 行动催促次数（整 run 上限 2，防死循环）
-  run._emptyBuildIntercepted = false; // 收尾拦截只拦 1 次，第二次放行走既有诚实收尾约束
   run._emptyExploreCount = 0;       // 空目录探索计数：第 1 次 list/纯探索命令放行取证，第 2 次起机制层短路（_emptyExploreSkipMessage）
   const _quick = () => task.trim().length < 80 && !run.engineering?.applies && !_mustUseWorkspaceToolsNow();
   const _pad = { goal: (task || "").slice(0, 200), requirements: run._requirementsChecklist, modified: new Map(), errors: [], findings: [] };  // done[] retired: the plan lane renders run._planSteps directly
@@ -48467,7 +48459,7 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
           // 实际是我们骗了它。写入冲突（[CONFLICT]）、被中断（[interrupted]）、
           // mutated:false 的空操作，全是这条正则漏掉而权威判定认得的形态。
           const _landedOk = _toolExecutionSucceeded(call, result);
-          (run._eagerLanded = run._eagerLanded || []).push({ path: call.path, ok: _landedOk });
+          (run._writeLedger = run._writeLedger || []).push({ path: call.path, ok: _landedOk });
         })();
         // 在途集合：出错/停止时要等它们落定再收尾，否则 run 都结束了写入还在飞。
         (run._eagerPending = run._eagerPending || new Set()).add(entry._eagerPromise);
@@ -48566,7 +48558,7 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
         // 或者收尾时说"我没有改动文件"。和上面两条 break 完全一样地先收账。
         const _eagerNote = await _settleEagerWritesForBreak(run);
         if (_eagerNote) summaryText += (summaryText ? "\n\n" : "") + _eagerNote;
-        for (const item of (Array.isArray(run._eagerLanded) ? run._eagerLanded : [])) {
+        for (const item of (Array.isArray(run._writeLedger) ? run._writeLedger : [])) {
           if (item?.ok && item.path) _mutatedFiles.add(_normRel(item.path, root));
         }
         continue;
@@ -48836,19 +48828,26 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
         // fresh-error count reaches zero, and the convergence counter above stops
         // populating it after two rounds without progress — so an unfixable diagnostic
         // converges to an honest incomplete instead of looping forever.
-        if (run._diagnosticBlock && _canResume) {
-          run._diagnosticNudges = (run._diagnosticNudges || 0) + 1;
-          if (run._diagnosticNudges <= 2) {
-            run._quietResumePool--;
-            // 上一轮已经推过一次、而这一轮模型没有产生任何新的成功编辑 → 说明提醒没起作用，
-            // _diagnosticBlock 又只在有成功编辑时才重算，再推就是拿一个陈旧值反复烧钱。
-            if (run._diagnosticNudges >= 2 && !(Array.isArray(_successfulEdits) && _successfulEdits.length)) {
-              run._quietResumePool++;   // 没真的开火，把刚扣的还回去
-              run._incompleteReason = run._incompleteReason || "new_diagnostics_unresolved";
-            } else
-            _pushNudge("diagFinish", "[BLOCKING_NEW_DIAGNOSTICS] 收尾前还有你这次改动引入的新增错误没清零。先定位并修掉，再确认它们消失；不要在这个状态下宣布完成：\n\n"
-              + String(run._diagnosticBlock).slice(0, 2400));
-            continue;
+        // 记账在闸门外边。这两道门原来是「能续跑才记账」：一旦续跑闸门关上——静默轮重复、
+        // 用户中途拒过一次工具调用（那个标记置真之后整个 run 不再复位）、或者续跑池已经被
+        // 别的门用完——「有新增错误」「构建是红的」这些**已经观测到**的执行事实就连账都不记，
+        // 收尾时那份未完成原因是空的，于是整轮被判成功、对用户说做完了。判「要不要补一轮」
+        // 才看闸门，判「要不要如实记账」只看事实本身。下面的计划门本来就是这个形状。
+        if (run._diagnosticBlock) {
+          if (_canResume) {
+            run._diagnosticNudges = (run._diagnosticNudges || 0) + 1;
+            if (run._diagnosticNudges <= 2) {
+              run._quietResumePool--;
+              // 上一轮已经推过一次、而这一轮模型没有产生任何新的成功编辑 → 说明提醒没起作用，
+              // _diagnosticBlock 又只在有成功编辑时才重算，再推就是拿一个陈旧值反复烧钱。
+              if (run._diagnosticNudges >= 2 && !(Array.isArray(_successfulEdits) && _successfulEdits.length)) {
+                run._quietResumePool++;   // 没真的开火，把刚扣的还回去
+                run._incompleteReason = run._incompleteReason || "new_diagnostics_unresolved";
+              } else
+              _pushNudge("diagFinish", "[BLOCKING_NEW_DIAGNOSTICS] 收尾前还有你这次改动引入的新增错误没清零。先定位并修掉，再确认它们消失；不要在这个状态下宣布完成：\n\n"
+                + String(run._diagnosticBlock).slice(0, 2400));
+              continue;
+            }
           }
           run._incompleteReason = run._incompleteReason || "new_diagnostics_unresolved";
         }
@@ -48858,8 +48857,8 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
         // which is the "开发服务器在跑但页面不可见 / 13 个 TS 错误" symptom. Bounded so an
         // unfixable build converges to an honest incomplete instead of thrashing forever.
         const _buildFail = _freshBuildFailure(run, _implOps);
-        if (_buildFail && _canResume) {
-          if (buildFixAttempts < 2) {
+        if (_buildFail) {
+          if (_canResume && buildFixAttempts < 2) {
             buildFixAttempts++;
             run._quietResumePool--;
             // 两路都要给，不能二选一。pytest / vitest / go test / cargo test /
@@ -48873,7 +48872,8 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
             _pushNudge("buildFix", `[BUILD_FAILED] 上次声明为验证的命令 \`${_buildFail.command}\` 退出码 ${_buildFail.exitCode}——构建/测试没过，代码现在跑不起来。这是交付前必须清零的硬事实（退出码即结论）。先读下面的真实错误、定位并修掉根因，再重新运行同一条验证命令确认退出 0；在拿到绿色之前不要收尾、不要转去做别的：\n\n${_tail}`);
             continue;
           }
-          // Budget spent: stop nudging, record the truth so the finish is honest.
+          // 预算用完、或者续跑闸门本来就是关着的：两种情况都不再推提醒，但账一样要记。
+          // 退出码是执行事实，和「还能不能再补一轮」无关。
           run._incompleteReason = "build_failing";
         }
         // B — procedural memory: removed (2026-07-05). Model remembers on its own.
@@ -50018,6 +50018,19 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
           });
         }
         const _ok = _toolExecutionSucceeded(it.call, it.rawResult);
+        // 写入台账：**每一次**写入尝试都进账，不只是流完即写的那条腿。
+        //
+        // 这本账有两个读者——每轮无条件喂给模型的「本轮交付事实」，和收尾时的
+        // writes_failed 未完成原因。可在此之前，唯一往里写的是流式那个钩子，而它第一行
+        // 就按工具名把 write_file 之外的全挡掉了。于是 edit_file 因为 old_string 对不上
+        // 整体没写、multi_edit 被编辑器里未保存的用户改动挡下（CONFLICT），这些失败一次
+        // 都不进账：模型手上没有任何与「已经改好了」相矛盾的事实，于是照说了。
+        // 判成败用的是全系统那套权威判定，和钩子那条一致；流式已经记过的条目跳过，
+        // 免得同一次写入记两笔把 writes_failed 的计数吹大。
+        if (!it._eagerEntry && !it._skipped && (t === "write" || t === "edit" || t === "multiedit")
+          && it.call.path && _toolExecutionAttempted(it.rawResult)) {
+          (run._writeLedger = run._writeLedger || []).push({ path: it.call.path, ok: _ok });
+        }
         const _workspaceMutated = _ok && (it._wikiMutated || _toolMutatesWorkspace(it.call, it.rawResult));
         if (_ok) {
           if (!it._skipped) {
@@ -50068,8 +50081,6 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
               _uiActionPassed = false;
               _uiInteractionPassed = false;
               _uiInteractionViewports.clear();
-              _uiDeliveryAuditedAtImplOps = -1;
-              run._uiDeliveryAuditUnresolved = [];
               // Reset nudge counter and phase on verified completion → next mutation re-arms
               if (_hadVerifiedUi) {
                 uiVerifyNudges = 0;
@@ -50136,8 +50147,6 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
             _uiActionPassed = false;
             _uiInteractionPassed = false;
             _uiInteractionViewports.clear();
-            _uiDeliveryAuditedAtImplOps = -1;
-            run._uiDeliveryAuditUnresolved = [];
             // Reset nudge counter and phase on verified completion → next mutation re-arms
             if (_hadVerifiedUi) {
               uiVerifyNudges = 0;
@@ -50711,10 +50720,36 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
     // 尝试写了、没落盘：这是**用户侧**唯一的出口。模型那边已经在交付事实里收到这条
     // （见 _deliveryFactsLine 里的落空写入），但用户看的是结局卡片——而这一整条链路上
     // 原来没有任何一处告诉他「你以为生成好的那个文件此刻不在磁盘上」。判据是纯执行记录
-    // （run._eagerLanded 逐条记着每次写入尝试的成败），不读模型的任何措辞。
+    // （run._writeLedger 逐条记着每次写入尝试的成败），不读模型的任何措辞。
     {
-      const _failedWrites = (Array.isArray(run._eagerLanded) ? run._eagerLanded : []).filter((a) => a && a.ok === false);
+      const _failedWrites = (Array.isArray(run._writeLedger) ? run._writeLedger : []).filter((a) => a && a.ok === false);
       if (_failedWrites.length) run._incompleteReason ||= `writes_failed:${_failedWrites.length}`;
+    }
+    // 声明了要改工作区，一个文件都没落盘 —— 第七条谎报路径。
+    //
+    // 用户实拍：「都他妈没改，给我来个优化完了」「同一个问题我要给他说 3-4 轮才能改好」。
+    // 模型回了一整页「删除了原来的 refreshAll()、新增 loadStats()、新增 loadCustomerList()」，
+    // 工作区一个字节没动，而这一轮被记成 success、通知栏打出「✅ 任务完成」。
+    //
+    // 为什么之前没人拦：静默轮（模型不调工具就收尾）按设计是**它的收尾决定**，harness 只在
+    // 「机器产生的事实」与之矛盾时才推翻——命令退出码、诊断增量、用户插话、update_plan 状态。
+    // 而一次工具都没调过的轮次，这四样一个都不存在，于是一段漂亮的完成叙述直接通过。
+    //
+    // 判据仍然**不读模型的正文措辞**（那条路走过：12 条基于正文的判据全部被反例打掉，
+    // 见静默轮那段注释）。这里用的是同一套「声明 + 执行事实」：
+    //   · 声明——`workspaceAction === "modify"`，模型自己的结构化判定。它已经被信任到
+    //     用来**授权**写操作（_agentAllowsWorkspaceMutation 就是这个函数）；可信到能发写权限，
+    //     就可信到能发现写从没发生。
+    //   · 事实——didMutate，落盘账本。
+    // 这**不是**被删掉的 required_effect_missing：那条是 _missingRequiredEffects 按关键词
+    // 推出来的效果预测（连同 _runtimeObligationsForTask 一族一起删的，有反漂移断言钉着），
+    // 和模型自己的声明是两回事。
+    //
+    // 只记账，不补回合——「缺席只记账、永不续跑」那条规矩原样遵守。变的只是这一轮不再
+    // 冒充 success：结局记成 partial，建议行给一句用户能照做的下一步。
+    // 排在最后，更具体的原因（写入失败、构建红、诊断新增）靠 ||= 先占位。
+    if (run.mode === "agent" && !didMutate && _agentAllowsWorkspaceMutation(run) && !_stoppedEarly) {
+      run._incompleteReason ||= "declared_mutation_not_delivered";
     }
     _setStreaming(session, false);
     _hideControlGlow(); // 灭掉红光：自动化结束（正常/报错/到顶/用户停止 都走这里）
@@ -57018,7 +57053,6 @@ return { type: call.type, path: call.query || "", content: `[失败] ${call.type
         if (run) {
           run._captureStarted = true;
           run._captureMode = captureMode.mode;
-          run._capturePort = port;
           run._captureBrowserReady = false;
         }
         let sys = "";
