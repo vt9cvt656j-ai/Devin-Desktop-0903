@@ -9901,7 +9901,16 @@ test("UI design craft guidance is injected only for front-end work", () => {
   assert.match(ui, /已有项目实现：先读取 package\/lock\/build config/);
   assert.match(ui, /所有网站\/UI 项目都必须先使用本轮 IDE 已预取的 michael-design 三轨证据/);
   assert.match(ui, /hover\/focus-visible\/active\/disabled\/loading/);
-  assert.match(ui, /1440x900 (?:和|与) 390x844/);
+  // 视口判据从两个精确像素点改成档位：项目真实断点是 1280 或 1024 时，逼模型去量一个
+  // 这个产品根本不存在的宽度，它学到的只会是「先补两次仪式性调用换学分」。
+  assert.match(ui, /桌面档与手机档各走一遍闭环/);
+  assert.match(ui, /宽 ≥1200、不带 mobile/);
+  assert.match(ui, /宽 ≤500 且 mobile:true/);
+  assert.doesNotMatch(ui, /1440x900 (?:和|与) 390x844/, "别退回精确像素点");
+  // 区块数量不是合格判据——「8-12 个差异化区块」和紧邻那句「区块由真实旅程决定、
+  // 禁止按固定块数凑数」直接打架，凑出来的区块恰恰最像模板。
+  assert.doesNotMatch(ui, /8-12 个差异化区块/, "区块配额会生产它自己声称要治的病");
+  assert.match(ui, /区块数量本身不是合格标准/);
   const marketplace = craft("做二手商品交易平台", { ui: true, uiProject: true, transactionalProduct: true });
   assert.match(marketplace, /交易产品硬约束/);
   assert.match(marketplace, /禁止用 localStorage、假 JSON 或“无后端”替代/);
@@ -12708,9 +12717,19 @@ test("Tauri Channel cleanup keeps late native events callable", () => {
 
 test("UI verification accepts only the required viewports and real visible assertions", () => {
   const viewport = load("_requiredUiViewportKind");
+  // 判据是**档位**，不是两个精确像素点：项目真实断点是 1280 或 1024 时，逼模型去量一个
+  // 这个产品根本不存在的宽度，它学到的只会是「先补两次仪式性调用换学分」。
   assert.equal(viewport({ type: "browser", action: "viewport", width: 1440, height: 900, mobile: false }), "desktop");
   assert.equal(viewport({ type: "browser", action: "viewport", width: 390, height: 844, mobile: true }), "mobile");
-  assert.equal(viewport({ type: "browser", action: "viewport", width: 1280, height: 800, mobile: false }), "");
+  assert.equal(viewport({ type: "browser", action: "viewport", width: 1280, height: 800, mobile: false }), "desktop",
+    "项目自己的桌面断点也要算数");
+  assert.equal(viewport({ type: "browser", action: "viewport", width: 1512, mobile: false }), "desktop",
+    "高度不该参与判定——窗口高 1000 的一次真实桌面验收不能不算数");
+  assert.equal(viewport({ type: "browser", action: "viewport", width: 360, mobile: true }), "mobile");
+  // 但档位有下界，别让一次窄窗口冒充手机档、或一次平板宽度冒充桌面档。
+  assert.equal(viewport({ type: "browser", action: "viewport", width: 1100, mobile: false }), "");
+  assert.equal(viewport({ type: "browser", action: "viewport", width: 760, mobile: true }), "");
+  // mobile 旗标必须对得上：手机宽度不带 mobile:true 不算手机档。
   assert.equal(viewport({ type: "browser", action: "viewport", width: 390, height: 844, mobile: false }), "");
 
   const succeeded = load("_toolExecutionSucceeded", { _toolFailureMatch: load("_toolFailureMatch") });
@@ -28817,6 +28836,33 @@ test("输入框灰字不重复卡片行已经摆出来的那条", () => {
   // 卡片行那侧要真的把占用记下来，否则上面这套判据没有输入。
   const chips = extractFn("_renderSuggestionChips");
   assert.match(chips, /sess\._chipSends\.add\(/, "卡片行没记下自己占了哪几条");
+});
+
+
+// ---- 打磨界面不该被 churn 断路器拦住；但盲改照旧要拦 ----
+test("churn 断路器拦的是盲改，不是「改→看→改」这个回路", () => {
+  const loop = extractFn("_runAgenticLoop");
+  // 计数语义：自上次真实观察以来。改一版看一眼再调，是界面变好看的唯一方式；
+  // 原来第 5 次落盘就推「先停下、合并成一次 write_file」，正好把那个回路判成违规。
+  assert.match(loop, /你已经连着改了 \*\*\$\{p\}\*\* \$\{n\} 次，中间一次都没跑验证、也没在浏览器里看过/,
+    "文案要只对盲改说话");
+  assert.doesNotMatch(loop, /先停一下并整合剩余工作/, "又变回「改得多就该停」了");
+  // 两个清零点都必须挂在**已结算的执行事实**上，不能因为模型说「我看过了」就清零。
+  assert.match(loop, /_evidenceCertifies\(_settledVerifyEvidence, _implOps\)\)[\s\S]{0,400}?_editCounts\.clear\(\); _churnNudged\.clear\(\);/,
+    "跑过验证要清零，且判据是已结算的执行证据");
+  assert.match(loop, /_browserHealthPassed\(it\.call, it\.rawResult\)\)[\s\S]{0,300}?_editCounts\.clear\(\); _churnNudged\.clear\(\);/,
+    "在浏览器里真看过要清零");
+  // 阈值不许抬，断路器本身不许删——盲改五次仍然要拦。
+  assert.match(loop, /if \(n >= 5 && !_churnNudged\.has\(p\)\)/);
+});
+
+// ---- 提示词不许威胁一个不存在的门禁 ----
+test("设计采用契约不再声称有个源码门禁会逐项检查", () => {
+  // 全树 grep 不到任何对应实现——这是提示词在说谎。留着它训练出来的是
+  // 「写空话没人查」这个经验，会顺带削弱它周围那些真闸门的分量。
+  assert.doesNotMatch(SRC, /源码门禁会逐项检查/, "威胁一个不存在的门禁");
+  assert.match(SRC, /收尾只核对执行事实（浏览器验收记账、落盘台账）/,
+    "要如实说清收尾到底核对什么");
 });
 
 // ---- 写入落空要有用户侧的出口 ----
