@@ -28960,6 +28960,44 @@ test("本地能定的工具搜索不发网络，也不为 MCP 目录干等", () 
     "二元组命中要归因到维度，否则快通道对中文全盲");
 });
 
+
+// ---- 该问就问，但别在已经知道用户要什么的时候问 ----
+test("裁决判定不含歧义时，这个正面事实要说给模型，而不是保持沉默", () => {
+  // 原来只在 ambiguities 非空时出声。可空数组本身就是一次有意义的申报——判定器读完
+  // 这句话、历次要求账本和当前工作区，明确判了"没有真会改变结果的歧义"，还给出了
+  // restatedTask。这个正面事实从没到过模型面前，于是它每一轮都要自己从零判断
+  // "我是不是该问一下"，偏保守就变成"知道用户需求还会问不停"。
+  assert.match(SRC, /Ambiguity check on this request: none found/,
+    "判定「不含歧义」时必须把这个结论说出来");
+  assert.match(SRC, /Number\(semantic\.confidence\) >= 0\.7/,
+    "判定器自己没把握时要保持沉默，不能拿一个低置信度的结论去劝阻提问");
+  // 劝阻不能盖过"真该问"的那一类：不可逆、花钱。
+  assert.match(SRC, /destroy work or spend money in a way you cannot take back/,
+    "真正该问的那类必须留出口");
+  // 有歧义那条原样保留。
+  assert.match(SRC, /Still ambiguous: \$\{semantic\.ambiguities\.join\("; "\)\}/);
+});
+
+test("反复提问的判据是账本数出来的次数，不是「是不是第一轮」", () => {
+  const validate = extractFn("validateToolCall");
+  // 原来只在 turnIndex === 0 出声，而"问不停"恰恰发生在第一轮之后：
+  // 问一次、拿到答案、过几轮又问，第二次起没有任何东西出声。
+  assert.match(validate, /toolName === 'ask_user' && Number\(priorAsks\) >= 1/,
+    "第二次起就该报事实");
+  assert.match(validate, /本次运行你已经问过用户 \$\{priorAsks\} 次/);
+  // 照旧不拦截——拦截式打回白烧一轮，这个产品已经撤过一次同形的硬禁。
+  // 只看 ask_user 那两段（后面「未知工具不在白名单」那条 allowed:false 是合法的）。
+  const askBranches = validate.slice(
+    validate.indexOf("toolName === 'ask_user'"),
+    validate.indexOf("P1: Whitelist check"));
+  assert.doesNotMatch(askBranches, /allowed: false/, "提问不许被物理拦截");
+  // 次数从执行事实里数，不从模型说法里读。
+  assert.match(SRC, /\(run\._toolLedger\.entries \|\| \[\]\)\.filter\(\(e\) => e\?\.tool === "ask_user"\)\.length/,
+    "次数必须从账本数出来");
+  // 真正只有用户能拍板的那类要留出口，别把该问的也劝没了。
+  assert.match(validate, /真正只有用户能拍板的/);
+});
+
 // ---- 写入落空要有用户侧的出口 ----
 test("尝试写了没落盘时，结局里必须留下 writes_failed", () => {
   const loop = extractFn("_runAgenticLoop");
