@@ -32886,7 +32886,7 @@ function _buildAgentToolSchemas(includeWrite, mcpTools = []) {
     { type: "function", function: { name: "live_environment", description: "Query structured public environment and hazard sources that need no API key: Open-Meteo weather / air quality / marine, USGS earthquakes, NASA EONET natural events. Each call returns records, per-source success/empty/failed, data_as_of, retrieved_at and the applicable limits. Open-Meteo is a time-stamped gridded model estimate and must not be described as an on-site sensor measurement; an empty result likewise does not mean there is no risk. weather/air_quality/marine require coordinates the user gave explicitly or authorized you to obtain — never infer a location from IP address or timezone.", parameters: { type: "object", properties: { kind: { type: "string", enum: ["weather", "air_quality", "marine", "earthquakes", "natural_hazards"] }, latitude: { type: "number", minimum: -90, maximum: 90 }, longitude: { type: "number", minimum: -180, maximum: 180 }, radius_km: { type: "integer", minimum: 1, maximum: 20000, description: "Optional radius for earthquakes" }, window: { type: "string", enum: ["hour", "day", "week", "month"], description: "Time window for earthquakes" }, minimum_magnitude: { type: "number", minimum: -1, maximum: 10 }, category: { type: "string", description: "NASA EONET category id, e.g. wildfires" }, limit: { type: "integer", minimum: 1, maximum: 50 } }, required: ["kind"], anyOf: [{ properties: { kind: { enum: ["weather", "air_quality", "marine"] } }, required: ["latitude", "longitude"] }, { properties: { kind: { enum: ["earthquakes", "natural_hazards"] } } }] } } },
     { type: "function", function: { name: "performance_profile", description: "Analyse a front-end page's performance metrics and produce a report. It drives the browser to inject the Performance API for timing data and pairs that with screenshots to confirm the page's state. Good for tracking down slow loads and render jank. 【When to use】When a page stutters or loads slowly, run this first to get real timing data and locate the bottleneck — do not read the code and guess \"it is probably rendering\".", parameters: { type: "object", properties: { url: { type: "string", description: "Target page URL (must start with http://localhost or http://127.0.0.1)" }, metrics: { type: "string", enum: ["cpu", "memory", "both"], description: "What to monitor: cpu = CPU usage, memory = memory usage, both = both", default: "both" }, timeoutSeconds: { type: "number", description: "Timeout in seconds, default 30", default: 30 } }, required: ["url"] } } },
     { type: "function", function: { name: "openapi_parser", description: "Extract the list of usable endpoints from a Swagger/OpenAPI JSON specification. Accepts a local file path (starting with ./) or a public URL, and can output the endpoint list, the schema, JSON, or curl examples.", parameters: { type: "object", properties: { url: { type: "string", description: "File path or URL of the OpenAPI JSON specification (local paths start with ./, public ones with https/http)" }, outputFormat: { type: "string", enum: ["list", "schema", "client"], description: "Output format: list = one endpoint per line, schema = the full JSON as escaped text, client = a curl example template", default: "list" } }, required: ["url"] } } },
-    { type: "function", function: { name: "read_screen", description: "Read the accessibility elements the frontmost native application actually exposes (role, name, value, whether it is enabled, and screen coordinates). When the result is empty you must report honestly that permission is missing or that the application exposes no elements. ocr=true is a macOS on-screen text-recognition fallback; an OCR ref is not an actionable AX node.", parameters: { type: "object", properties: { ocr: { type: "boolean", description: "Set true only when the frontmost application has no accessibility tree; may require Screen Recording permission" } }, required: [] } } },
+    { type: "function", function: { name: "read_screen", description: "Read the accessibility elements the frontmost application actually exposes (role, name, value, whether it is enabled, and screen coordinates). **A browser is one of those applications, and its tree includes the rendered page** — links, buttons, form fields and text, each with real screen coordinates. That is how you operate the user's own already-running browser, the one CDP cannot attach to: bring it to the front, read it here, then click and type by these coordinates. When the result is empty, do not guess why — the tool names the cause (missing permission / the read did not complete / every window minimized / the app genuinely exposes nothing). Only the last one means a retry is pointless; the rest are fixable, usually by bringing the window to the front and reading again. ocr=true is a macOS on-screen text-recognition fallback; an OCR ref is not an actionable AX node.", parameters: { type: "object", properties: { ocr: { type: "boolean", description: "Set true only when the frontmost application has no accessibility tree; may require Screen Recording permission" } }, required: [] } } },
     { type: "function", function: { name: "ui_click", description: "Perform press, set_value or focus on a real accessibility ref returned by read_screen. Only direct manipulation of macOS AX nodes is supported; re-run read_screen after the interface changes, and OCR refs may not be passed in.", parameters: { type: "object", properties: { ref: { type: "integer", minimum: 0, description: "The element ref returned by read_screen" }, action: { description: "press = click, set_value = set the value, focus = focus it", type: "string", enum: ["press", "set_value", "focus", "increment", "decrement", "show_menu", "confirm", "cancel", "pick"] }, value: { type: "string", description: "For set_value: the text to enter" } }, required: ["ref"] } } },
     {
       type: "function",
@@ -34474,12 +34474,35 @@ function _mapToolCall(name, args, mcpToolMap = _mcpToolMap) {
     case "think": return { type: "think", content: args.thought || args.thoughts || "" };
     case "ask_user": return { type: "askuser", question: args.question || args.q || args.prompt || args.text || "", options: Array.isArray(args.options) ? args.options : (Array.isArray(args.choices) ? args.choices : (Array.isArray(args.buttons) ? args.buttons : [])), recommended: Number.isFinite(+args.recommended) ? +args.recommended : -1, multiSelect: !!args.multi_select, confirmText: String(args.confirm_text || "") };
     case "run_subagent": {
-      // P1 多任务并发：容错解析 tasks 数组（每项 {role, task} 或纯字符串），
-      // 单任务/无 tasks 时保持原 prompt 路径不变。
-      const _tasks = Array.isArray(args.tasks)
-        ? args.tasks.map((t) => (typeof t === "string" ? { task: t, role: "" } : { task: String(t?.task || t?.prompt || ""), role: String(t?.role || "") })).filter((t) => t.task.trim())
+      // P1 多任务并发：容错解析 tasks 数组（每项 {role, task} 或纯字符串）。
+      const _rawTasks = Array.isArray(args.tasks) ? args.tasks : null;
+      const _tasks = _rawTasks
+        ? _rawTasks.map((t) => (typeof t === "string" ? { task: t, role: "" } : { task: String(t?.task || t?.prompt || ""), role: String(t?.role || "") })).filter((t) => t.task.trim())
         : null;
-      return { type: "subagent", path: args.description || "调研", description: args.description || "调研子任务", prompt: args.prompt || (_tasks && _tasks[0] ? _tasks[0].task : ""), role: args.role || "", tasks: _tasks && _tasks.length ? _tasks : undefined, wait: !!args.wait };
+      // 丢掉的任务必须报回去——和隔壁 spawn_multiple_agents 同一条规矩，这边一直没跟上。
+      // 静默丢弃的三条路：task 为空被过滤、超过 4 个被 slice、prompt 和 tasks 同时给。
+      // 模型那边以为六条线索都查了，照着"都覆盖了"下结论，实际只跑了四条。
+      const _kept = _tasks ? _tasks.length : 0;
+      const _dropped = [];
+      if (_rawTasks && _rawTasks.length > _kept) _dropped.push(`${_rawTasks.length - _kept} 个因为 task 为空被丢掉`);
+      if (_kept > 4) _dropped.push(`${_kept - 4} 个超出单次 4 个并发上限被截断`);
+      // 两个都给时以 tasks 为准。原来在 tasks 恰好只有 1 条时反过来让 prompt 赢，
+      // 于是同一份入参，2 条任务走 tasks、1 条任务走 prompt，那一条的正文凭空消失。
+      // args.prompt 不一定是模型写的：入参归一有 alias("prompt", "description", ...)，
+      // 所以只给了 description 时 prompt 会被填成同一个串。**这就是单任务 brief 消失的真凶**——
+      // 原来的 `args.prompt || tasks[0].task` 里 args.prompt 早被 description 顶上了，于是
+      // run_subagent({description:"查权限", tasks:[{task:"审一遍鉴权，重点看 JWT 过期"}]})
+      // 派出去的 prompt 是三个字的「查权限」，整段任务书原地蒸发，而且没人报错。
+      // alias 是**原样复制**，所以「值等于 description」就等于「它是 alias 来的」。
+      const _realPrompt = (args.prompt && args.prompt !== args.description) ? String(args.prompt) : "";
+      if (_realPrompt && _kept) _dropped.push("prompt 和 tasks 同时给了，本次按 tasks 执行，prompt 没有被用");
+      // 单任务的 role 原来被丢：多任务那条路取 task.role，单任务这条写死 args.role。
+      // 结果 run_subagent({tasks:[{role:"security", task:"..."}]}) 派出去的是个没有角色的
+      // 通用子体——模型指定了视角，子体压根不知道。
+      const _first = _tasks && _tasks[0];
+      return { type: "subagent", path: args.description || "调研", description: args.description || "调研子任务",
+        prompt: (_kept ? _first.task : (args.prompt || "")) || "", role: args.role || (_kept === 1 ? _first.role : "") || "",
+        tasks: _kept ? _tasks : undefined, dropped: _dropped, wait: !!args.wait };
     }
     case "await_subagent": return { type: "awaitsubagent", path: String(args.job || "all"), job: String(args.job || "all") };
     case "debate": {
@@ -50146,6 +50169,11 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
         const _multiTasks = !isWorker && it.tc.name === "run_subagent" && Array.isArray(it.call.tasks) && it.call.tasks.length > 1
           ? it.call.tasks.filter((t) => t && (typeof t === "string" ? t.trim() : String(t.task || "").trim())).slice(0, 4)
           : null;
+        // 被丢掉的任务必须说出来（同步/异步/多任务三条回执都要带）。参数映射会静默过滤
+        // task 为空的项、截断超出 4 个的部分，而模型这边以为六条线索都查了。
+        const _subDropNote = Array.isArray(it.call.dropped) && it.call.dropped.length
+          ? `\n⚠ 你给的 tasks 里有 ${it.call.dropped.join("；")}——这些**没有**被派出去。别当成已经查过了。`
+          : "";
         // 多任务并发派发+合并，提成局部函数供同步/异步两路复用（卡片渲染与 #42 节流不变）
         const _spawnMulti = async () => {
           const results = await Promise.allSettled(_multiTasks.map((task, idx) => _runSubAgent({
@@ -50196,12 +50224,12 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
             else job.status = "failed";
             return job.result;
           });
-          const message = `[子智能体已后台启动 job#${jobId}] ${desc}。它在后台工作，你继续推进当前任务；结果就绪后会自动送达，也可用 await_subagent 显式等待。⚠️ 不要立即 await——先推进计划里的其他步骤；若当前确实没有其他事可做，说明这个调研本该由你直接读文件完成（单个聚焦调查主智能体直接做更快更省）。`;
+          const message = `[子智能体已后台启动 job#${jobId}] ${desc}。它在后台工作，你继续推进当前任务；结果就绪后会自动送达，也可用 await_subagent 显式等待。⚠️ 不要立即 await——先推进计划里的其他步骤；若当前确实没有其他事可做，说明这个调研本该由你直接读文件完成（单个聚焦调查主智能体直接做更快更省）。` + _subDropNote;
           it.rawResult = { type: "subagent", path: it.call.description || "", content: message };
           return message;
         }
         if (_multiTasks && _multiTasks.length > 1) {
-          const merged = await _spawnMulti();
+          const merged = (await _spawnMulti()) + _subDropNote;
           it.rawResult = { type: "subagent", path: it.call.description || "", content: merged };
           return merged;
         }
@@ -50225,7 +50253,7 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
             message = "✅ 产品 Wiki 已生成并存到 " + wikiPath + "（" + report.length + " 字）。以后做官网 / 理解产品直接 read_file 读它，别重复调研。\n\n" + report;
           } catch (error) { message = "[Wiki 存盘失败: " + String(error?.message || error).slice(0, 80) + "]\n\n" + report; }
         }
-        message = message.slice(0, 8000);
+        message = message.slice(0, 8000) + (isWorker ? "" : _subDropNote);
         it.rawResult = { type: isWorker ? "worker" : "subagent", path: it._wikiPath || it.call.description || "", content: message };
         return message;
       };
