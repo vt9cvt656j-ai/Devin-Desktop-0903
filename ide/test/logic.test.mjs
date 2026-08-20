@@ -7987,7 +7987,18 @@ test("total tool payload keeps a bounded core and swaps requested MCP schemas fr
   assert.doesNotMatch(SRC, /await _startRunMcpDiscovery\(run, run\.mcpRoot\)/,
     "MCP discovery must not delay the first model turn");
   assert.match(extractFn("_waitForRunMcpDiscovery"), /_MCP_TOOL_SEARCH_WAIT_MS/);
-  assert.match(SRC, /if \(call && call\.type === "search_tools"\) \{[\s\S]{0,260}await _waitForRunMcpDiscovery\(run\)/);
+  // MCP 发现的等待挪到了**慢路径**：本地能确定的查询不该为一个用不上的 MCP 目录干等 8 秒。
+  // 但慢路径上它必须还在——不等完就发编排器调用，那次调用看到的目录是不全的。
+  assert.match(SRC, /if \(!exact\?\.schema && !fastAdds\) \{\n\s*await _waitForRunMcpDiscovery\(run\);/,
+    "慢路径必须仍然等 MCP 发现，否则编排器拿到的是不全的目录");
+  assert.match(SRC, /if \(call && call\.type === "search_tools"\) \{[\s\S]{0,1400}await _waitForRunMcpDiscovery\(run\)/,
+    "等待仍然属于 search_tools 这一支，没被挪到别处");
+  // 快通道：本地命中够硬时既不等 MCP，也不发那次编排器网络调用。
+  assert.match(SRC, /const _confident = _confidentFuzzyResolution\(fastHits\);/);
+  const confident = extractFn("_confidentFuzzyResolution");
+  assert.match(confident, /m === "name" \|\| m === "trigger" \|\| m === "use_case"/,
+    "只在描述正文里出现过不算数——那是弱信号，给错工具比慢更糟");
+  assert.match(confident, /top\.score - second\.score < 2/, "排名咬得紧说明查询有歧义，该让编排器上");
   assert.match(SRC, /run\._toolRegistry = _buildToolRegistry\(isAgent, run\.mcpToolCache\)/);
   assert.match(SRC, /const loadedAdds = adds\.filter/);
   assert.doesNotMatch(SRC, /toolSchemas\.push/);
@@ -28911,6 +28922,42 @@ test("回执点名了哪个工具，那个工具当场进窗口", () => {
   const refusal = extractFn("_looksLikeToolRefusal");
   assert.match(refusal, /_toolFailureMatch\(body\)/);
   assert.match(refusal, /not executed|工具选择/);
+});
+
+
+// ---- 搜索与调用要快：喊对名字不该被罚，本地能定的别发网络 ----
+test("模型喊对了工具名，直接执行，不再罚它两轮加一次网络编排", () => {
+  const loop = extractFn("_runAgenticLoop");
+  // 此前：未装载但真实存在的名字 → 浪费本轮 + 一次语义编排网络调用（上限 20 秒）
+  // + 回「未知工具，请重新调用」+ 模型再花一轮重调。喊对名字反而是最慢的一条路，
+  // 而带注解的能力名录恰恰就是要让它喊得出名字。
+  assert.match(loop, /const _healed = _canonicalToolName\(_attempted\) \|\| _attempted;/,
+    "别名要先自愈再查注册表");
+  assert.match(loop, /const _schema = _healed && _registry\.get\(_healed\);/,
+    "判据必须是真实注册表的精确命中，不是词形相似度猜测");
+  assert.match(loop, /_applyToolPayloadWindow\(toolSchemas, \[_schema\], run\._toolCoreNames\);[\s\S]{0,200}?it\._unknown = false;/,
+    "装进窗口之后要清掉 unknown，好让它落到正常执行路径上");
+  // 安全性不打折：走的仍是同一个执行点，不另开旁路。
+  assert.doesNotMatch(loop, /_healed[\s\S]{0,300}?backend\.invoke/,
+    "自愈后不许绕开 _executeToolStep 直接调后端");
+  // 猜测替代工具那条路仍然保留给**真的**不存在的名字。
+  assert.match(loop, /没有通过词形、关键词或相似度猜测替代工具/);
+});
+
+test("本地能定的工具搜索不发网络，也不为 MCP 目录干等", () => {
+  // 一次非精确 search_tools 最坏串行等 8 秒 MCP 发现 + 20 秒编排器 LLM 调用，
+  // 而且发生在模型回合内部，用户全程干等。
+  assert.match(SRC, /if \(!exact\?\.schema && !fastAdds\) \{\n\s*await _waitForRunMcpDiscovery\(run\);/,
+    "只有慢路径才等 MCP");
+  const conf = extractFn("_confidentFuzzyResolution");
+  // 判据刻意保守：给错工具比慢更糟。
+  assert.match(conf, /m === "name" \|\| m === "trigger" \|\| m === "use_case"/);
+  assert.match(conf, /top\.score - second\.score < 2/);
+  assert.match(conf, /return null/, "拿不准一律回 null 走原路");
+  // 二元组必须归因到具体维度——统一记 cjk 的话，上面那条判据对中文永远为假。
+  const fuzzy = extractFn("_searchToolsFuzzyMatch");
+  assert.match(fuzzy, /for \(const w of extraTokens\) \{\n\s*if \(lname\.includes\(w\)\) \{ score \+= 1; matchedOn\.push\("name"\); \}/,
+    "二元组命中要归因到维度，否则快通道对中文全盲");
 });
 
 // ---- 写入落空要有用户侧的出口 ----
