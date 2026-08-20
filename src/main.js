@@ -44574,6 +44574,17 @@ async function _runSubAgent({ config, description, prompt, root, container, run,
         + "它们在只读模式下始终可用，而且比 grep 管道更准。"
       : "")
     + _agentRoleBlock(role) + (run?.skillsBlock ?? _skillsSystemBlock())
+    // 用户规则 / 习惯：主智能体每轮都带，子智能体此前一个字都收不到。
+    //
+    // 而会写文件的 worker 正是很多代码的真实作者。用户写下「不许推 main」「改完必须跑测试」
+    // 「用 pnpm 不用 npm」，主智能体照做，转手派出去的 worker 根本不知道有这回事——
+    // 用户看到的就是「我定的规则不起效」，而且越是大活儿（越会派子体）越不起效。
+    //
+    // 这里不补就没有别处能补：网关对 subagent 模式明确「一个字的系统提示词都不加」
+    // （子体人格全部来自客户端本地这一份）。技能块本来就在上面进来了，同为用户自己写下的
+    // 东西却唯独少了规则块，是漏不是设计。
+    // 位置在 _SUBAGENT_TRUTH 之前：真话下限必须压轴（truthfulness 那条测试钉着）。
+    + _userRulesBlock()
     + _SUBAGENT_TRUTH;
   // Retrieval is ranked by the CHILD'S OWN TASK, not an empty string. The empty query
   // silently disabled three paths at once: _buildRepoMap degraded to pure symbol-count
