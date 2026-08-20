@@ -47625,6 +47625,11 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
     "blindEdit", "subagentResult", "recovery", "emptyHistoryFact",
     // 「刚改完、这个版本还没验过」是执行记账里的硬事实，丢了模型就会照着"应该没问题"收尾。
     "verifyNow", "uiLook",
+    // 「页面写了，可这个 run 一条真实产品事实都没取到过」同理：丢了它，模型就按
+    // "内容没问题" 的图景继续把编出来的文案铺满整站。判据是取证台账空不空，是硬事实。
+    // （referenceSite 故意**不**登记：参考站律每轮都在提示词里，模型收得到信号，
+    //   那条只是兜底，按默认建议类处理就够。）
+    "websiteContent",
   ]);
   const _nudgeRank = (cat) => (cat === "steer" ? 0 : _NUDGE_FACTS.has(cat) ? 1 : 2);
   const _pushNudge = (cat, content) => {
@@ -50263,6 +50268,68 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
             + `**当前这个版本还没有人在浏览器里看过一眼**。构建通过不等于好看，更不等于能用。`
             + `起真实 dev server 之后按这个顺序走一遍（记账只认 action:"viewport" 那两次精确调用）：`
             + `viewport(1440,900) → check → 关键交互 → assert，再 viewport(390,844,mobile:true) → check → 交互 → assert。`);
+        }
+      }
+
+      // ── 写页面之前，产品事实是不是全靠编的 ─────────────────────────────
+      //
+      // 「网站内容取证律」（提示词里那条硬要求）说：视觉实现前必须取得并记录一条真实内容
+      // 证据（工作区 README/产品文档 → 品牌官方主站 web_fetch 正文 → generate_wiki 从代码提取）。
+      // harness 也**真的按执行事实记了账**：_websiteContentEvidenceFromResult 要求工具真的执行
+      // 成功、正文 ≥80 字才算，搜索标题和竞品措辞一律不收。
+      //
+      // 断在这本台账全树**只写不读**。同一批写入的设计证据台账（_michaelDesignEvidence）在三处
+      // 被回读——决定要不要补预检、压成交接块给子智能体；内容证据台账一处都没有。于是一个
+      // run 从头到尾一条真实产品事实都没取过时，从第一次写页面到收尾，没有任何一处会告诉
+      // 模型「这一条是空的」，它拿训练记忆编产品文案不会遇到任何摩擦。
+      //
+      // 判据全是执行事实：模型自己声明这是完整网站（fullWebsite，模型的声明不是 harness 的猜测）
+      // + 本批次真的落盘了视觉源码 + 台账为空。只响一次；台账进过一条就永久关门；提醒指回那条
+      // 律自己写明的兜底出路（先写 PRODUCT_BRIEF.md 讲清哪些是假设），照做就把台账填上——
+      // 有出路，卡不死，也不拦回合。
+      if (!run._websiteContentStopUsed && _live() && run.mode === "agent"
+          && run.engineering?.fullWebsite
+          && !(run._websiteContentEvidence?.sources || []).length) {
+        const _pageWrites = items
+          .filter((it) => it.call && _WORKSPACE_MUTATING_TYPES.has(it.call.type) && it.call.path
+            && !/\[(ERROR|BLOCKED|DENIED)\]/.test((it.rawResult && it.rawResult.content) || ""))
+          .map((it) => String(it.call.path))
+          .filter((path) => _UI_SOURCE_EXT.test(path));
+        if (_pageWrites.length) {
+          run._websiteContentStopUsed = true;
+          _pushNudge("websiteContent",
+            `[内容无据] 刚写了 ${[...new Set(_pageWrites)].slice(0, 3).join("、")}`
+            + `${_pageWrites.length > 3 ? ` 等 ${_pageWrites.length} 个` : ""}，`
+            + `但**这个 run 到现在一条真实产品事实都没取到过**——页面上的文案现在全是编的。`
+            + `按取证律取一条真的：先 read_file 工作区的 README/产品文档/既有文案；`
+            + `品牌官网已知就 web_fetch 读正文；代码里已有功能就 generate_wiki 提取。`
+            + `（搜索标题和竞品措辞不算证据。）确实没有可验证的产品事实，就先写 PRODUCT_BRIEF.md`
+            + `讲清"原创内容/假设/待确认"，再按这些边界写文案——别把通用 AI 口号当成产品事实。`);
+        }
+      }
+      // 同一形状的第二处：用户自己打出来的参考站 URL。referenceWebsiteUrls 是用户原话里的
+      // 链接（不是 harness 猜的），参考站律要求逐个 web_fetch/learn_design 读正文；读成功的
+      // 才进 _referenceWebsiteEvidence.references。这本台账同样只写不读。
+      // 判据是纯集合差，不需要任何新机制：用户给了几个、真读过几个。
+      if (!run._referenceSiteStopUsed && _live() && run.mode === "agent") {
+        const _wantKeys = (Array.isArray(run.engineering?.referenceWebsiteUrls) ? run.engineering.referenceWebsiteUrls : [])
+          .map(_referenceWebsiteUrlKey).filter(Boolean);
+        const _readKeys = new Set((run._referenceWebsiteEvidence?.references || [])
+          .map((r) => String(r?.key || "")).filter(Boolean));
+        const _unread = [...new Set(_wantKeys.filter((k) => !_readKeys.has(k)))];
+        if (_unread.length) {
+          const _uiWrites = items
+            .filter((it) => it.call && _WORKSPACE_MUTATING_TYPES.has(it.call.type) && it.call.path
+              && !/\[(ERROR|BLOCKED|DENIED)\]/.test((it.rawResult && it.rawResult.content) || ""))
+            .filter((it) => _UI_SOURCE_EXT.test(String(it.call.path)));
+          if (_uiWrites.length) {
+            run._referenceSiteStopUsed = true;
+            _pushNudge("referenceSite",
+              `[参考站没读] 你已经在写界面了，但用户给的这几个参考站**一个都还没真读过**：`
+              + `${_unread.slice(0, 4).join("、")}${_unread.length > 4 ? ` 等 ${_unread.length} 个` : ""}。`
+              + `那些 URL 不是装饰性链接。先对每个调用 web_fetch 或 learn_design 读正文，`
+              + `把色板/字阶/密度、内容与信息架构、响应式与动效节奏记进 reference/，再往下写。`);
+          }
         }
       }
 
