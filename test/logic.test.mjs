@@ -29042,6 +29042,53 @@ test("覆写一个已有文件算盲改，和 edit 一样要被点名", () => {
   assert.match(loop, /你没读过的部分已经直接消失了/);
 });
 
+
+// ---- 项目级目标：契约不能每轮从一句话重新推导 ----
+test("验收契约的条目来自裁决算好的成功判据，不是文本切分器", () => {
+  const loop = extractFn("_runAgenticLoop");
+  // 用户原话：「依旧做不了完整项目，项目完成率很低，他自己不知道什么时候该做什么事情」。
+  // 机器成因：契约是 run 级、且每次从**一条消息**重新推导。实测
+  // _extractRequirementsChecklist("继续") → ["继续"]、("接着做") → ["做"]——
+  // 契约里唯一那条验收项必然被满足，等于给假完成开了一扇正门；
+  // 而「要有文件树、多标签、Monaco 和 Git 面板」压成一条（顿号和"和"都不在切分表里）。
+  const split = load("_extractRequirementsChecklist");
+  assert.deepEqual(split("继续"), ["继续"], "这就是那个坏掉的源，留着作对照");
+  // 现在优先用裁决每轮已经算好的 successCriteria ∪ constraints。
+  assert.match(loop, /Array\.isArray\(_sem\?\.successCriteria\) \? _sem\.successCriteria : \[\]/,
+    "成功判据一直在算，此前只打印给模型看一眼，从没进过契约");
+  assert.match(loop, /Array\.isArray\(_sem\?\.constraints\) \? _sem\.constraints : \[\]/);
+  assert.match(loop, /_declared\.length \? _declared : _extractRequirementsChecklist\(task\)/,
+    "裁决没算出东西时才回退文本切分");
+});
+
+test("契约跨 run 累积，但换方向时不许旧要求挟持新任务", () => {
+  const loop = extractFn("_runAgenticLoop");
+  // 契约是四条 run 级状态里唯一没接会话的那个——这正是「每 run 从零重新理解一遍」的成因。
+  assert.match(loop, /session\._acceptanceContract = \[\.\.\.run\._originalRequirementsChecklist\]/,
+    "契约要写回会话，否则下一轮又从零开始");
+  // 换向按裁决自己声明的 continuation 分流，不是拍脑袋。
+  assert.match(loop, /\(_rel === "new" \|\| _rel === "replace"\) \? \[\] :/,
+    "换了目标要清空重建，不能拿旧契约绑架用户");
+  assert.match(loop, /_rel === "correct" \? \[\] : _fromTask/,
+    "纠正时新条目不钉住——纠正常常是推翻，钉住会把一句「不是这个意思」变成永久义务");
+  // 上界沿用已有防线，不新造。
+  assert.match(loop, /_mergeRequirementsChecklist\(_carry, "", 12, 2000/);
+  // 跨重启也要活着。
+  assert.match(SRC, /contract: Array\.isArray\(s\?\._acceptanceContract\)/);
+  assert.match(SRC, /session\._acceptanceContract = sData\.contract\.map/);
+});
+
+test("那次付费评审必须真的收到验收契约", () => {
+  // _wrapUpCritic 早就有 contract 这个参数，调用点却从没传过——于是它自己提示词里
+  // 那条最硬的规则（「给出验收契约时必须逐条对照，有未满足条目时 done=false」）
+  // 结构上永远不可达，那次付费调用等于在裸评。
+  const critic = extractFn("_wrapUpCritic");
+  assert.match(critic, /contract = ""/, "参数一直在");
+  const loop = extractFn("_runAgenticLoop");
+  assert.match(loop, /contract: _acceptanceContractBlock\(run\._requirementsChecklist\)/,
+    "调用点要真的把契约传过去");
+});
+
 // ---- 写入落空要有用户侧的出口 ----
 test("尝试写了没落盘时，结局里必须留下 writes_failed", () => {
   const loop = extractFn("_runAgenticLoop");

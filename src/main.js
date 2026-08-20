@@ -17253,6 +17253,9 @@ function _chatSessionDataForStorage(s, mediaBudget, includeHtml = false, options
     pendingSends: _pendingSendsForStorage(s?._pendingSends || s?.pendingSends, budget, options.textBudget),
     plan: Array.isArray(s?._planSteps) && s._planSteps.length ? s._planSteps.map((p) => ({ content: p.content, status: p.status, ...(p.kind ? { kind: p.kind } : {}) })) : undefined,
     demands: Array.isArray(s?._demandLedger) && s._demandLedger.length ? s._demandLedger.slice(-40) : undefined,
+    // 验收契约跟着会话一起存：它是「这个项目要做成什么样」的唯一载体，
+    // 跨不过重启就等于每次开软件都把项目目标忘干净。
+    contract: Array.isArray(s?._acceptanceContract) && s._acceptanceContract.length ? s._acceptanceContract.slice(0, 12) : undefined,
     thinks: Array.isArray(s?._thinkLedger) && s._thinkLedger.length ? s._thinkLedger.slice(-6) : undefined, // 方案A：思考结论账本跨重启存活
     intentState: s?._intentState && typeof s._intentState === "object" ? s._intentState : undefined,
     semanticFlags: Array.isArray(s?._semanticProfileFlags) && s._semanticProfileFlags.length
@@ -17749,6 +17752,7 @@ async function restoreChatHistory() {
         }));
         if (sData.planExpanded) session._planExpanded = true; // 计划卡展开态跨重启存活
         if (Array.isArray(sData.demands) && sData.demands.length) session._demandLedger = sData.demands.map((d) => String(d)).filter(Boolean).slice(-40);
+        if (Array.isArray(sData.contract) && sData.contract.length) session._acceptanceContract = sData.contract.map((d) => String(d || "").trim()).filter(Boolean).slice(0, 12);
         // 方案A：思考结论账本恢复——重启后下一轮仍能"接着想"而不是从零重想
         if (Array.isArray(sData.thinks) && sData.thinks.length) session._thinkLedger = sData.thinks
           .map((t) => ({ turn: Math.max(0, Number(t?.turn) || 0), summary: String(t?.summary || "").slice(0, 400) }))
@@ -47419,8 +47423,39 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
   run.skillsBlock = skillsBlock;
   run.stack = _projectStacks.get(root) || null;
   run.engineering = _engineeringProfile;
-  run._originalRequirementsChecklist = _extractRequirementsChecklist(task);
-  run._requirementsChecklist = [...run._originalRequirementsChecklist];
+  // 验收契约：条目来自裁决算好的成功判据，且跨 run 累积。
+  //
+  // 原来是 `_extractRequirementsChecklist(task)`——一个纯文本切分器，只按换行、项目符号、
+  // 中文句末标点和「然后/还有/并且」切，而且只吃**发起这一轮的那条消息**。两个后果都是致命的：
+  //   · 实测 "继续" → ["继续"]、"接着做" → ["做"]。契约里唯一那条验收项必然被满足，
+  //     等于给假完成开了一扇正门；收尾那次付费评审在评「这段改动有没有实现『继续』」。
+  //   · 「要有文件树、多标签、Monaco 和 Git 面板」压成一条——顿号和"和"都不在切分表里。
+  // 而意图裁决每一轮都在算 successCriteria（"用户会据此判断完成的可观察结果"）和 constraints，
+  // 算完只在意图块里打印一行给模型看，从没进过契约。两套东西一直没接上。
+  //
+  // 跨 run 累积：契约是四条 run 级状态里唯一没接会话的那个——这正是「每 run 从零重新
+  // 理解一遍」的机器成因。换向按裁决自己声明的 continuation 分流，避免旧要求挟持新任务：
+  // new/replace 清空重建，correct 不进 pinned（让 FIFO 自然淘汰），continue/clarify 累积。
+  {
+    const _sem = _engineeringProfile?.intentSemantic || null;
+    const _declared = [
+      ...(Array.isArray(_sem?.successCriteria) ? _sem.successCriteria : []),
+      ...(Array.isArray(_sem?.constraints) ? _sem.constraints : []),
+    ].map((x) => String(x || "").trim()).filter(Boolean);
+    const _fromTask = _declared.length ? _declared : _extractRequirementsChecklist(task);
+    const _rel = String(_sem?.continuation || "");
+    const _carry = (_rel === "new" || _rel === "replace") ? [] : (Array.isArray(session._acceptanceContract) ? session._acceptanceContract : []);
+    run._originalRequirementsChecklist = _carry.length
+      ? _mergeRequirementsChecklist(_carry, "", 12, 2000, _rel === "correct" ? [] : _fromTask)
+      : _fromTask;
+    // correct（用户在纠正）时新条目不钉住，让它和旧条目一起走 FIFO——纠正常常是推翻，
+    // 钉住会把一句「不是这个意思」变成永久义务。
+    if (_rel === "correct" && _fromTask.length) {
+      run._originalRequirementsChecklist = _mergeRequirementsChecklist(run._originalRequirementsChecklist, _fromTask.join("\n"), 12, 2000, []);
+    }
+    run._requirementsChecklist = [...run._originalRequirementsChecklist];
+    session._acceptanceContract = [...run._originalRequirementsChecklist];
+  }
   // 取消支持：每个 run 一个唯一 id，塞进 config（→ Rust AiConfig.request_id）+ 挂到
   // session，这样用户点 Stop 时 _setStreaming(session,false) 能 cancel_ai 掉在飞的请求。
   run._reqId = /^[-_A-Za-z0-9]{8,128}$/.test(String(config.requestId || ""))
@@ -48815,6 +48850,10 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
                 // 「他真正想做什么」判不出来的话，direction 只能是空话。判断依据是**一串**
                 // 要求，不是这一句——所以把会话的需求账本一并交过去。
                 demands: Array.isArray(session?._demandLedger) ? session._demandLedger : [],
+                // 契约必须真的传过去。_wrapUpCritic 早就有这个参数，调用点却从没传过——
+                // 于是它自己提示词里那条最硬的规则（「用户块给出验收契约时必须逐条对照，
+                // 有未满足条目时 done=false」）结构上永远不可达，那次付费评审等于在裸评。
+                contract: _acceptanceContractBlock(run._requirementsChecklist),
                 // 评审必须看到**改动本身**：只给它草稿和命令输出的话，"这段改动到底有没有
                 // 实现用户要求"这个问题结构上就问不出来。前后两版都在 checkpoint 里。
                 changeDigest: (() => {
