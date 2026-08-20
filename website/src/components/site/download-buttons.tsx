@@ -89,6 +89,22 @@ function useRelease(): Release {
   useEffect(() => {
     let alive = true;
     void (async () => {
+      // 先问 DOWNLOADS，再回落到更新清单——**顺序不能反**。
+      //
+      // 这两个端点服务的是两类不同的人：DOWNLOADS 是专门为「给人下载」挑的，Mac 给 .dmg、
+      // Windows 给 NSIS 的 .exe（网关那边的注释原话是 "the NSIS installer is the one to
+      // hand a person"）；UPDATE_FEED 是给**自动更新器**用的清单，里面是 .app.tar.gz 这类
+      // 更新产物。原来先读清单，于是这两个按钮把更新器的压缩包递给了人——页面上却写着
+      // 「.dmg」和「.exe or .msi」。2026-08-19 实测：Mac 按钮下下来是 20.98MB 的
+      // .app.tar.gz 而不是 21.6MB 的 DMG，Windows 下到的是 MSI 而不是 15MB 的 exe。
+      //
+      // 清单仍然留作兜底：DOWNLOADS 只在有可安装产物时才回内容，真没有的时候
+      // 清单里可能还有东西，那时给个能装的总比什么都不给强。
+      const installers = await installersOrNone();
+      if (installers.state === "ready") {
+        if (alive) setRelease(installers);
+        return;
+      }
       try {
         const res = await mseFetch(UPDATE_FEED, { cache: "no-store" });
         // 204 means the gateway is healthy and simply has no published release. Sealed or
@@ -113,7 +129,8 @@ function useRelease(): Release {
       } catch {
         // No manifest is not the same as nothing to install. Ask what is actually
         // published before giving up and showing a sign-up link.
-        if (alive) setRelease(await installersOrNone());
+        // 走到这里说明 DOWNLOADS 和清单都没给出可装的东西。
+        if (alive) setRelease({ state: "none" });
       }
     })();
     return () => {
