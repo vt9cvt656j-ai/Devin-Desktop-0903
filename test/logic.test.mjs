@@ -29089,6 +29089,43 @@ test("那次付费评审必须真的收到验收契约", () => {
     "调用点要真的把契约传过去");
 });
 
+
+// ---- 交付是真的还是假的：判据来自落盘内容，且要基线相减 ----
+test("这一轮新引入的占位要被点名，文件里本来就有的不算账", () => {
+  const scan = load("_stubDeliveryFindings", { _CODE_FILE_RE: /\.(?:tsx?|jsx?|py|rs|go|java|rb|php|cs|swift|kt)$/i });
+  const mk = (pairs) => ({ checkpoint: new Map(pairs) });
+  // 基线相减：改前就有的 TODO 不算这次交付的账——和「诊断只认新增错误」同一套哲学。
+  const old = scan(mk([["/p/a.ts", { content: "// TODO: 以后再说\nexport const a = 1;", current: "// TODO: 以后再说\nexport const a = 2;" }]]));
+  assert.deepEqual(old, [], "文件里本来就有的占位不该算在这次交付头上");
+  // 新写进去的要报，且给得出文件、行号、原文。
+  const fresh = scan(mk([["/p/b.ts", { content: "export const b = 1;", current: "export const b = 1;\n// TODO: 接后端" }]]));
+  assert.equal(fresh.length, 1);
+  assert.equal(fresh[0].line, 2, "要给行号");
+  assert.match(fresh[0].text, /TODO/, "要给这一行的原文");
+  // 只看代码文件——README 里的 TODO 不是假交付。
+  assert.deepEqual(scan(mk([["/p/README.md", { content: "", current: "TODO" }]])), []);
+  // 几种典型的假：写死的假数据、声明未实现、lorem。
+  const kinds = scan(mk([["/p/c.ts", { content: "", current: "const mockUsers = [];\nthrow new Error('Not implemented');\nconst t = 'lorem ipsum dolor';" }]]));
+  assert.ok(kinds.length >= 3, `典型的假交付形态没认全：${JSON.stringify(kinds)}`);
+});
+
+test("占位交付要有用户侧的出口，且不发红灯也不发绿灯", () => {
+  const loop = extractFn("_runAgenticLoop");
+  // 只记账、不补回合，和其它几道门同哲学。
+  assert.match(loop, /run\._incompleteReason \|\| `stub_delivery:\$\{_stubs\.length\}`/);
+  // 排在最后：更具体的原因（红构建、写入落空）先占位。
+  const at = loop.indexOf("stub_delivery");
+  const bf = loop.indexOf('run._incompleteReason = "build_failing"');
+  assert.ok(bf >= 0 && bf < at, "红构建这类更具体的原因要先占位");
+  // 闭合枚举要认得它，否则界面回落到那句无意义的「继续没做完的部分」。
+  const labels = loadConst("_INCOMPLETE_LABELS");
+  assert.equal(labels.stub_delivery, "把留下的占位实现换成真的");
+  assert.equal(labels["stub_delivery:3".split(":")[0]], "把留下的占位实现换成真的");
+  // 判据不许进验证学分——它只是一条事实，不是"验证没过"。
+  assert.doesNotMatch(loop, /_stubs\.length[\s\S]{0,120}verificationPassed/,
+    "占位扫描不许影响验证学分");
+});
+
 // ---- 写入落空要有用户侧的出口 ----
 test("尝试写了没落盘时，结局里必须留下 writes_failed", () => {
   const loop = extractFn("_runAgenticLoop");

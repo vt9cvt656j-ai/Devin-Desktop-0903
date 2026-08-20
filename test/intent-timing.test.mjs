@@ -278,10 +278,19 @@ test("一轮都没跑的时候，那块执行状态整块都不许发", () => {
 
   assert.match(
     block,
-    /const _hasRunActivity = !!\(_mutatedFiles\.size \|\| _readFiles\.size \|\| _evidenceBlock \|\| _latestDiagBlock\);\s*\n\s*if \(_hasRunActivity\) \{/,
+    /const _hasRunActivity = !!\(_mutatedFiles\.size \|\| _readFiles\.size \|\| _evidenceBlock \|\| _latestDiagBlock \|\| _planLine\);\s*\n\s*if \(_hasRunActivity\) \{/,
     "整块必须只在**真有动作**时才发。曾经的写法是 `if (_hasRunActivity || _runtimeStateBlock)`——"
     + "而运行时状态对任何真实项目都非空，等于每轮必发，把用户的问题从最后一位挤走",
   );
+  // _planLine 是 2026-08-20 加进这个判据的第五项，理由要写清楚，因为它看起来像在放宽：
+  //   · 它不是"环境事实"。有计划意味着模型自己调过 update_plan，或继承了一份未完成的计划——
+  //     那本身就是已经发生过的动作，符合这块"描述已发生的事"的定位。
+  //   · 而它恰恰在这块原本发不出去的那一刻最要紧：用户打"继续"的第一次模型调用，
+  //     还没落盘、还没读文件，位置感为零——"不知道此刻该做什么"就是从这里开始的。
+  //   · 当初那次事故（模型把这块当成用户的话，得出"用户没提出具体问题"）的根因是位置，
+  //     补救是块尾无条件把用户原话带回最后一位。那条补救仍在，见下面那条断言。
+  assert.match(block, /用户这一轮真正要的是下面这句/,
+    "块尾必须把用户原话带回最后一位——这是上面那条判据能放宽的前提");
 
   // 那段"请求在上面的对话里"是上一版的补救，位置没动所以补救失败，且它本身把模型送去翻找。
   assert.doesNotMatch(block, /用户这一轮的请求就在上面的对话里/,

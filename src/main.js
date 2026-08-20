@@ -24724,6 +24724,9 @@ const _INCOMPLETE_LABELS = {
   // 最后一个动作轮里有工具明确报了失败（部署/命令/mcp/http 退出非零、被拒、冲突……），
   // 模型却收了尾。给一句能照做的下一步，而不是把 last_action_failed 这个枚举名甩给用户。
   last_action_failed: "上一步有工具报错，先把它弄好",
+  // 用户原话：「完成真正的产品而不是虚假的」。判据是落盘内容里**新增**的占位行，
+  // 不是猜"这个函数实现得够不够"——给得出文件、行号和那一行的原文。
+  stub_delivery: "把留下的占位实现换成真的",
   // 「说改完了，工作区一个字节没动」。写成祈使句，用户可以直接发出去当催办。
   // 排在表尾是刻意的：plan-advance 有条断言按「表头 600 字符内必须出现 user_stopped」
   // 检查，插在中间会把它挤出窗口——那条守卫是对的，让位的该是新条目。
@@ -37397,6 +37400,51 @@ async function _snapshotDirForUndo(dirPath) {
   return { files, truncated };
 }
 
+/// 落盘内容里**新引入**的占位实现。纯本地扫描，零模型调用。
+///
+/// 用户原话：「完成真正的产品而不是虚假的」。此前对"假交付"没有任何执行事实层面的判据——
+/// 判文件性质的几个函数全都只看路径，从没有一处看过内容，而本轮每个文件的完整终态
+/// 一直躺在 checkpoint 里（`content` 是改前原文，`current` 是智能体最后写进去的）。
+/// 于是「禁止留 TODO/占位/假数据」在提示词里是一句无人对账的劝告。
+///
+/// 三条纪律，缺一条就会变成噪音或冤枉人：
+///   · **基线相减**：只报 `current` 里有、而改前 `content` 里没有的那些行。文件里本来就有的
+///     TODO 不算这次交付的账——和「诊断只认新增错误」同一套哲学。
+///   · **只报有原文佐证的字面命中**：给得出文件+行号+这一行的原文。不做语义猜测，
+///     不去判断"这个函数是不是真的实现了"。
+///   · **只陈述，不发红灯也不发绿灯**：它进交付事实行和未完成原因，不参与验证学分。
+function _stubDeliveryFindings(run, maxItems = 8) {
+  const cp = run?.checkpoint;
+  if (!cp || typeof cp.forEach !== "function") return [];
+  const out = [];
+  const MARKS = [
+    [/\b(?:TODO|FIXME|XXX)\b/i, "TODO 占位"],
+    [/not\s*implemented|NotImplementedError|未实现|尚未实现|待实现/i, "声明未实现"],
+    [/lorem\s+ipsum/i, "lorem 假文案"],
+    [/\b(?:mock|fake|dummy|sample)(?:Data|List|Items|Users|Products|Response)\b|假数据|模拟数据|示例数据/, "写死的假数据"],
+    [/\bplaceholder\b.*=.*['"`]|占位实现/i, "占位实现"],
+  ];
+  cp.forEach((snap, absPath) => {
+    if (out.length >= maxItems) return;
+    const cur = String(snap?.current || "");
+    if (!cur || !_CODE_FILE_RE.test(String(absPath))) return;
+    // 改前原文按行建集合：只有新增的行才算这次交付引入的。
+    const before = new Set(String(snap?.content || "").split("\n").map((l) => l.trim()));
+    const lines = cur.split("\n");
+    for (let i = 0; i < lines.length && out.length < maxItems; i++) {
+      const raw = lines[i];
+      const trimmed = raw.trim();
+      if (!trimmed || before.has(trimmed)) continue;
+      for (const [re, kind] of MARKS) {
+        if (!re.test(trimmed)) continue;
+        out.push({ path: String(absPath).split("/").slice(-2).join("/"), line: i + 1, kind, text: trimmed.slice(0, 90) });
+        break;
+      }
+    }
+  });
+  return out;
+}
+
 function _checkpointRecord(cp, absPath, existed, content) {
   cp = cp || _runCheckpoint;
   if (!absPath || cp.has(absPath)) return;
@@ -42062,6 +42110,36 @@ function _strayScratchFiles(run, testDir) {
 const _DELIVERY_FACTS_TAG = "[本轮交付事实]";
 /// 计划位置的每轮标签。和交付事实同形：每轮替换上一条，不在长 run 里越堆越多。
 const _PLAN_STATE_TAG = "[任务计划·当前位置]";
+
+/// 「我在计划的哪一步」——每轮讲给模型听的一条事实。
+///
+/// 此前它在工具执行**之后**才 push，于是对本轮**第一次**模型调用根本不存在——
+/// 而「这一轮先干什么」恰恰在第一次调用里定。现在并进那块每轮都在、且排在模型调用
+/// 之前的〔执行状态〕里，位置感从第一次决策就在场。
+function _planStateLineText(run) {
+  const steps = Array.isArray(run?._planSteps) ? run._planSteps : [];
+  if (!steps.length) return "";
+  const done = steps.filter((s) => s?.status === "completed").length;
+  const cur = steps.findIndex((s) => s?.status === "in_progress");
+  const at = cur >= 0 ? cur : steps.findIndex((s) => s?.status === "pending");
+  if (at < 0) return "";
+  const next = steps.slice(at + 1).find((s) => s?.status === "pending");
+  const mm = run._planStepMismatch;
+  // 前面还欠着的步骤要点名。指针钉在最早未完成的那一步，模型看不到自己欠了几步。
+  const behind = steps.slice(0, at).filter((s) => s?.status === "pending" || s?.status === "in_progress");
+  return `${_PLAN_STATE_TAG} 共 ${steps.length} 步，已完成 ${done}。`
+    + `当前第 ${at + 1} 步：${String(steps[at]?.content || "").slice(0, 160)}`
+    + (next ? `（其后：${String(next.content || "").slice(0, 80)}）` : "（这是最后一步）")
+    + (behind.length ? `\n它前面还有 ${behind.length} 步没做：${behind.slice(0, 3).map((s) => String(s.content || "").slice(0, 40)).join("、")}。` : "")
+    + (mm
+      ? (mm.matchAt
+          ? `\n上一次动作其实属于第 ${mm.matchAt} 步（${mm.matchStep}）那一类，而你当前停在第 ${mm.at} 步，所以两边都没被勾上——打勾只认当前这一步。要么回来把第 ${mm.at} 步做掉，要么 update_plan 把它标 cancelled 并写明为什么不做。`
+          : mm.want
+            ? `\n上一次动作是「${mm.got}」类，而这一步要的是「${mm.want}」类，所以它没有被勾上。先把这一步做掉，或者 update_plan 标 cancelled 并写明原因。`
+            : `\n这一步没写清属于哪一类（读/写/跑/验），系统不会替你勾：在 update_plan 里给它补一个 kind，或者做完自己标 completed。`)
+      : "");
+}
+
 function _deliveryFactsLine(run) {
   const { code, tests, ran, verifiers } = _deliveryFacts(run);
   // 落空的写入尝试：**比"改了几个文件"更要紧的一条**。
@@ -42077,18 +42155,26 @@ function _deliveryFactsLine(run) {
   const _failedLine = _failed.length
     ? `有 ${_failed.length} 次写入**没有落盘**（${_failed.slice(0, 4).join("、")}${_failed.length > 4 ? " 等" : ""}）——这些文件此刻不在磁盘上，不要说它们已保存/已生成`
     : "";
+  // 这一轮**新引入**的占位实现。和上面那条同一个性质：纯执行记录（读的是自己落盘的内容，
+  // 基线相减，只报有原文佐证的字面命中），不去猜"这个函数实现得够不够"。
+  // 说出来模型才有与「已经做好了」相矛盾的事实——用户原话「完成真正的产品而不是虚假的」。
+  const _stubs = Array.isArray(run?._stubFindings) ? run._stubFindings : [];
+  const _stubLine = _stubs.length
+    ? `这一轮新写进去 ${_stubs.length} 处占位（${_stubs.slice(0, 3).map((s) => `${s.path}:${s.line} ${s.kind}`).join("；")}${_stubs.length > 3 ? " 等" : ""}）——这些地方现在是空的，别把它们算进"已完成"`
+    : "";
   if (!code.length) {
     // 没动源码就没什么可核对的（纯问答、只读排查、只改文档的 run 完全不受打扰）——
     // 但"尝试写入却没落盘"是必须说的事实，它和有没有动源码无关。
-    if (!_failedLine) return "";
+    if (!_failedLine && !_stubLine) return "";
     const v0 = run?._wrapUpVerdict;
-    const bits = [_failedLine];
+    const bits = [_failedLine, _stubLine].filter(Boolean);
     if (v0 && typeof v0.done === "boolean") {
       bits.push(v0.done ? "收尾评审：通过" : `收尾评审：未通过${v0.instruction ? " — " + String(v0.instruction).slice(0, 120) : ""}`);
     }
     return bits.join(" · ");
   }
   const parts = [`改了 ${code.length} 个源码文件`];
+  if (_stubLine) parts.push(_stubLine);
   if (_failedLine) parts.push(_failedLine);
   if (verifiers.length) {
     const last = verifiers[verifiers.length - 1];
@@ -48433,7 +48519,11 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
       //     Put the user's ACTUAL request LAST — recency = the model's highest-attention slot
       // 环境事实是锦上添花（省一轮瞎探），用户的问题在最后一位是刚需。真有活干到一半时这块
       // 才有意义——那时它描述的是**已经发生的事**，不会和用户的话争最后一位。
-      const _hasRunActivity = !!(_mutatedFiles.size || _readFiles.size || _evidenceBlock || _latestDiagBlock);
+      // 有计划就算「有活动」：一个从上一轮继承来的未完成计划，本身就是最该让模型
+      // 第一时间看见的位置信息，可它此前撑不起这块的触发条件（还没落盘、还没读文件时
+      // 整块不发），于是续跑的第一次决策永远在零位置感下做出。
+      const _planLine = run.mode === "agent" ? _planStateLineText(run) : "";
+      const _hasRunActivity = !!(_mutatedFiles.size || _readFiles.size || _evidenceBlock || _latestDiagBlock || _planLine);
       if (_hasRunActivity) {
         const _parts = [_ORCH_NOTE + "〔执行状态·不要从头重查〕"];
         if (_mutatedFiles.size) {
@@ -48444,6 +48534,7 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
           _parts.push(`本次运行已落盘: ${_mut.length > 20 ? `（共 ${_mut.length} 个，最近 20 个）` : ""}${_shown}。不要重复创建或重复应用同一修改。`);
         }
         if (_readFiles.size) _parts.push(`本次运行已完整读取: ${[..._readFiles].slice(-12).join("、")}。文件未变化就直接使用已有内容；只缺某段原文时才按 offset/limit 精读。`);
+        if (_planLine) _parts.push(_planLine);
         if (_runtimeStateBlock) _parts.push(_runtimeStateBlock);
         if (_evidenceBlock) _parts.push(_evidenceBlock);
         if (_latestDiagBlock) _parts.push(_latestDiagBlock);
@@ -48988,6 +49079,15 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
         // 一个动作轮，非 runHadTrouble 粘滞位），故「先失败后自愈再收尾」不误判。详见对应测试。
         if (lastTurnHadFailure && run.mode === "agent" && !run._incompleteReason) {
           run._incompleteReason = `last_action_failed:${lastFailKinds || "tool"}`.slice(0, 120);
+        }
+        // 交付里**新引入**的占位实现。判据是落盘内容本身（基线相减），不是模型的说法。
+        // 排在最后：更具体的原因（红构建、写入落空）靠 ||= 先占位。只记账不补回合。
+        if (run.mode === "agent") {
+          const _stubs = _stubDeliveryFindings(run);
+          if (_stubs.length) {
+            run._stubFindings = _stubs;
+            run._incompleteReason = run._incompleteReason || `stub_delivery:${_stubs.length}`;
+          }
         }
         break; // truly done
       }
@@ -50156,37 +50256,6 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
         if (_facts) {
           messages.push({ role: "user", content: `${_ORCH_NOTE}${_DELIVERY_FACTS_TAG}（本轮真实执行记录，不是推断）: ${_facts}\n`
             + "照着事实说话：没跑过验证就别说「已验证」「能用了」「跑通了」；该验证就现在去验证，别把没做的事写成做完了。" });
-        }
-        // 计划位置也每轮重注，和交付事实同一条通道。
-        //
-        // 此前计划**只**以「当初那次 update_plan 的工具结果」的形式存在于历史里，随着
-        // 对话变长就沉底了——于是模型列了一份很准的 9 步计划，然后跳过第 1 步（调研）
-        // 直接去做第 3 步（写 package.json）。用户看到的是"计划列得挺好，就是不照着走"。
-        //
-        // 这里只报事实（几步、完成几步、当前是哪一步），不带说教：催同步进度的话
-        // 已经有 planStale 那条按证据触发的提醒了，重复说只会更沉重。
-        // 模型每轮看见"当前第 1 步：调研…"而自己正在写 package.json，这个反差本身就够。
-        for (let i = messages.length - 1; i >= 0; i--) {
-          if (messages[i].role === "user" && typeof messages[i].content === "string" && messages[i].content.includes(_PLAN_STATE_TAG)) { messages.splice(i, 1); break; }
-        }
-        const _planNow = Array.isArray(run._planSteps) ? run._planSteps : [];
-        if (run.mode === "agent" && _planNow.length) {
-          const _doneN = _planNow.filter((s) => s?.status === "completed").length;
-          const _curIdx = _planNow.findIndex((s) => s?.status === "in_progress");
-          const _atIdx = _curIdx >= 0 ? _curIdx : _planNow.findIndex((s) => s?.status === "pending");
-          if (_atIdx >= 0) {
-            const _next = _planNow.slice(_atIdx + 1).find((s) => s?.status === "pending");
-            messages.push({ role: "user", content: `${_ORCH_NOTE}${_PLAN_STATE_TAG} 共 ${_planNow.length} 步，已完成 ${_doneN}。`
-              + `当前第 ${_atIdx + 1} 步：${String(_planNow[_atIdx]?.content || "").slice(0, 160)}`
-              + (_next ? `（其后：${String(_next.content || "").slice(0, 80)}）` : "（这是最后一步）")
-              + (run._planStepMismatch
-                ? (run._planStepMismatch.matchAt
-                    ? `\n上一次动作其实属于第 ${run._planStepMismatch.matchAt} 步（${run._planStepMismatch.matchStep}）那一类，而你当前停在第 ${run._planStepMismatch.at} 步，所以两边都没被勾上——打勾只认当前这一步。要么回来把第 ${run._planStepMismatch.at} 步做掉，要么 update_plan 把它标 cancelled 并写明为什么不做。`
-                    : run._planStepMismatch.want
-                      ? `\n上一次动作是「${run._planStepMismatch.got}」类，而这一步要的是「${run._planStepMismatch.want}」类，所以它没有被勾上。先把这一步做掉，或者 update_plan 标 cancelled 并写明原因。`
-                      : `\n这一步没写清属于哪一类（读/写/跑/验），系统不会替你勾：在 update_plan 里给它补一个 kind，或者做完自己标 completed。`)
-                : "") });
-          }
         }
       }
 
