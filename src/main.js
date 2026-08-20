@@ -49112,7 +49112,17 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
         if (turn.reasoning && turn.reasoning.trim()) reasoningAll += (reasoningAll ? "\n" : "") + turn.reasoning.trim();
         // 流完即写是在流式阶段就真落盘的，而这条 break 走在批处理之前——不收账的话，
         // 落了盘的文件在消息历史、run 摘要、账本里一个记录都没有。
-        { const _eagerNote = await _settleEagerWritesForBreak(run); if (_eagerNote) summaryText += (summaryText ? "\n\n" : "") + _eagerNote; }
+        {
+          const _eagerNote = await _settleEagerWritesForBreak(run);
+          if (_eagerNote) summaryText += (summaryText ? "\n\n" : "") + _eagerNote;
+          // 同上：这条 break 也绕过了批处理里的记账。落了盘就得认，否则收尾按
+          // 「本轮什么都没改」结算，未验证的代码被静默放行。
+          let _landed = 0;
+          for (const item of (Array.isArray(run._writeLedger) ? run._writeLedger : [])) {
+            if (item?.ok && item.path) { _mutatedFiles.add(_normRel(item.path, root)); _landed++; }
+          }
+          if (_landed) { didMutate = true; run._didMutate = true; _implOps++; }
+        }
         finalErr = turn.error; break;
       }
       clearAgentRetryToast();
@@ -49127,8 +49137,18 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
         // 或者收尾时说"我没有改动文件"。和上面两条 break 完全一样地先收账。
         const _eagerNote = await _settleEagerWritesForBreak(run);
         if (_eagerNote) summaryText += (summaryText ? "\n\n" : "") + _eagerNote;
+        let _landed = 0;
         for (const item of (Array.isArray(run._writeLedger) ? run._writeLedger : [])) {
-          if (item?.ok && item.path) _mutatedFiles.add(_normRel(item.path, root));
+          if (item?.ok && item.path) { _mutatedFiles.add(_normRel(item.path, root)); _landed++; }
+        }
+        // 补清单还不够：didMutate / run._didMutate / _implOps 是在**批处理**里置位的，
+        // 而这条 continue 整个跳过了那段。于是磁盘上多了一份没验证过的代码，收尾时
+        // didMutate 仍是 false —— 「改了代码要验证」那条记账根本不会触发，run 被判成
+        // 干干净净的 success。_implOps 也要加：新代码落盘之后，之前那次验证就过期了。
+        if (_landed) {
+          didMutate = true;
+          run._didMutate = true;
+          _implOps++;
         }
         continue;
       }
