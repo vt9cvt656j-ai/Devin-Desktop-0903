@@ -47538,9 +47538,16 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
   if (_mustUseWorkspaceToolsNow()) {
     messages.push({
       role: "user",
-      content: _ORCH_NOTE + _agentAnswerOnlyInspection(run.engineering)
+      // 括号是必需的：`+` 比 `?:` 结合得紧，写成 `_ORCH_NOTE + f() ? A : B` 会被解析成
+      // `(_ORCH_NOTE + f()) ? A : B`。_ORCH_NOTE 是非空常量，那个和**恒为真**——于是
+      // ① 永远选只读那条：每个开着工作区的回合，开口前都被告知「本轮是只读任务，
+      //    只准用 read_file/list_dir/search」，哪怕模型自己声明了 workspaceAction:"modify"。
+      //    表现就是「让它改，它读一圈、讲一通该怎么改、然后停下」。
+      // ② 信封被整个吞掉：这条 harness 指令以**裸用户消息**的形态到达，模型于是会说
+      //    「我只看到系统提示，没有用户的实际请求」，或者把内部标记原样念出来。
+      content: _ORCH_NOTE + (_agentAnswerOnlyInspection(run.engineering)
         ? "[AGENT_MODE_TOOL_REQUIRED]\n本轮是项目评价/解释型只读任务。只用 read_file、list_dir、search、find_files、代码导航、诊断或 Git 只读工具取得最小充分事实；不得运行命令、启动服务、安装依赖、修改文件、操作浏览器或做知识库/公网预取。读到目录、清单/入口和少量关键源码后直接回答并结束。"
-        : "[AGENT_MODE_TOOL_REQUIRED]\n本轮明确指向当前项目。先用与结构化目标一致的最直接工具取得真实证据，再完成修改、运行或回答；不得把可能有用的动作扩展成用户没有要求的工作。",
+        : "[AGENT_MODE_TOOL_REQUIRED]\n本轮明确指向当前项目。先用与结构化目标一致的最直接工具取得真实证据，再完成修改、运行或回答；不得把可能有用的动作扩展成用户没有要求的工作。"),
     });
   }
   if (run.engineering?.interactiveWait || run.engineering?.longRunningRuntime) {

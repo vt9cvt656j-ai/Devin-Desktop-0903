@@ -7541,13 +7541,37 @@ test("harness 以「用户」身份塞进去的每一条，都必须戴编排信
   const naked = [];
   for (const m of loop.matchAll(/\{\s*role:\s*"user",\s*content:\s*([^\n]{0,80})/g)) {
     const tail = m[1].trim();
-    if (tail.includes("_ORCH_NOTE")) continue;
+    // 「出现了 _ORCH_NOTE」不等于「戴上了信封」。
+    //
+    // 实拍：`content: _ORCH_NOTE + f() ? A : B`。`+` 比 `?:` 结合得紧，实际是
+    // `(_ORCH_NOTE + f()) ? A : B` —— 那个和恒为真，于是永远走 A 分支，而且**信封被整个
+    // 吞掉**：这条 harness 指令以裸用户消息的形态到达模型。这条断言当时按前缀跳过了它，
+    // 一个字都没报。所以要认的是「信封真的和内容拼在一起」这个形状：
+    // 要么 `_ORCH_NOTE + <后面没有裸三元>`，要么 `_ORCH_NOTE + (`。
+    if (/^_ORCH_NOTE\s*\+\s*\(/.test(tail)) continue;
+    if (tail.includes("_ORCH_NOTE") && !/\?/.test(tail)) continue;
     if (ALLOW.some((a) => tail.startsWith(a))) continue;
     naked.push(tail.slice(0, 60));
   }
   assert.deepEqual(naked, [],
     "这些 harness 注入没戴编排信封，模型会把它们当成用户说的话，并据此判断「用户没有新指令」：\n"
     + naked.map((x) => "  · " + x).join("\n"));
+
+  // 分流本身也要钉：这条注入有两个分支，只读画像拿只读那条、可改画像拿可改那条。
+  // 上面那个优先级 bug 的真正后果是**每一个**开着工作区的回合都被告知「本轮只读」——
+  // 让它改东西它不改，读一圈、讲一通该怎么改、然后停下。
+  const at = SRC.indexOf("content: _ORCH_NOTE + (_agentAnswerOnlyInspection");
+  assert.ok(at > 0, "工作区取证注入的分流不见了");
+  let expr = SRC.slice(at + "content: ".length, SRC.indexOf("\n    });", at)).trim().replace(/,$/, "");
+  const pick = (readOnly) => new Function("_ORCH_NOTE", "_agentAnswerOnlyInspection", "run",
+    "return " + expr + ";")("〔信封〕", () => readOnly, { engineering: {} });
+  for (const [readOnly, want] of [[true, "只读任务"], [false, "再完成修改"]]) {
+    const out = pick(readOnly);
+    assert.ok(out.startsWith("〔信封〕"),
+      `${readOnly ? "只读" : "可改"}画像那条丢了编排信封——会被模型当成用户发言`);
+    assert.ok(out.includes(want),
+      `${readOnly ? "只读" : "可改"}画像拿到了另一条分支的文案`);
+  }
 });
 
 test("每轮排在最后的那块运行状态，必须把用户这轮的原话带回来", () => {
