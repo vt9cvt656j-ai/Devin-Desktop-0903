@@ -1197,12 +1197,29 @@ pub fn git_resolve_conflict(root: String, rel: String, resolution: String) -> Re
     run_git_checked(&root, &["add", "--", &rel]).map(|_| ())
 }
 
+/// git 失败时的回执：**stdout 也要带上**。
+///
+/// `git stash pop` 撞冲突时退出码是 1，而整份冲突报告——哪个文件冲突、
+/// 「The stash entry is kept in case you need it again」——全在 **stdout**，
+/// stderr 是空的。原来四处都写成 `if err.is_empty() { "…failed" } else { err }`，
+/// 于是这份唯一有用的东西被整个扔掉，调用方只拿到五个词的 "git stash pop failed"：
+/// 不知道冲突在哪、也不知道 stash 还留着，接着就会去重复 pop 或直接 drop。
+fn git_failure_text(text: &str, err: &str, fallback: &str) -> String {
+    match (text.is_empty(), err.is_empty()) {
+        (true, true) => fallback.to_string(),
+        (true, false) => err.to_string(),
+        (false, true) => text.to_string(),
+        (false, false) => format!("{text}\n{err}"),
+    }
+}
+
 /// Stash the current working directory changes.
 #[tauri::command(async)]
 pub fn git_stash(root: String) -> Result<String, String> {
     require_git_root(&root, true)?;
     let out = run_git(&root, &["stash", "push", "-m", "Mr. Day One stash"])?;
     let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
     if out.status.success() {
         Ok(if text.is_empty() {
             "No local changes to stash.".into()
@@ -1210,7 +1227,7 @@ pub fn git_stash(root: String) -> Result<String, String> {
             text
         })
     } else {
-        Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
+        Err(git_failure_text(&text, &err, "git stash push failed"))
     }
 }
 
@@ -1235,11 +1252,7 @@ pub fn git_stash_pop(root: String, index: Option<usize>) -> Result<String, Strin
             text
         })
     } else {
-        Err(if err.is_empty() {
-            "git stash pop failed".into()
-        } else {
-            err
-        })
+        Err(git_failure_text(&text, &err, "git stash pop failed"))
     }
 }
 
@@ -1258,11 +1271,7 @@ pub fn git_stash_apply(root: String, index: usize) -> Result<String, String> {
             text
         })
     } else {
-        Err(if err.is_empty() {
-            "git stash apply failed".into()
-        } else {
-            err
-        })
+        Err(git_failure_text(&text, &err, "git stash apply failed"))
     }
 }
 
@@ -1281,11 +1290,7 @@ pub fn git_stash_drop(root: String, index: usize) -> Result<String, String> {
             text
         })
     } else {
-        Err(if err.is_empty() {
-            "git stash drop failed".into()
-        } else {
-            err
-        })
+        Err(git_failure_text(&text, &err, "git stash drop failed"))
     }
 }
 
@@ -1733,5 +1738,40 @@ mod git_show_tests {
         assert!(e.contains("git_log"), "错误信息没告诉模型下一步该干嘛：{e}");
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+}
+
+#[cfg(test)]
+mod git_failure_text_tests {
+    use super::git_failure_text;
+
+    /// `git stash pop` 撞冲突：退出码 1，冲突报告全在 stdout，stderr 空。
+    /// 原来的 `if err.is_empty() { fallback } else { err }` 把它整个扔掉。
+    #[test]
+    fn conflict_report_on_stdout_survives_a_nonzero_exit() {
+        let stdout = "Auto-merging f.txt\nCONFLICT (content): Merge conflict in f.txt\n\
+                      The stash entry is kept in case you need it again.";
+        let got = git_failure_text(stdout, "", "git stash pop failed");
+        assert!(got.contains("CONFLICT (content): Merge conflict in f.txt"));
+        assert!(
+            got.contains("The stash entry is kept"),
+            "「stash 还留着」被丢了，调用方会以为它已经没了"
+        );
+        assert_ne!(got, "git stash pop failed");
+    }
+
+    /// 越界的 stash 索引反过来：stderr 有话、stdout 空。
+    #[test]
+    fn stderr_only_failures_still_report_stderr() {
+        assert_eq!(
+            git_failure_text("", "error: stash@{9} is not a valid reference", "git stash drop failed"),
+            "error: stash@{9} is not a valid reference"
+        );
+    }
+
+    #[test]
+    fn both_streams_are_kept_and_a_silent_failure_still_says_something() {
+        assert_eq!(git_failure_text("out", "err", "fallback"), "out\nerr");
+        assert_eq!(git_failure_text("", "", "fallback"), "fallback");
     }
 }

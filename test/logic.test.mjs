@@ -31205,3 +31205,26 @@ test("run_subagent：丢掉的 task 要报回去，单任务的 role 不许吞�
   assert.equal((dispatch.match(/_subDropNote/g) || []).length, 4,
     "三条回执路径里有的没拼上丢弃提示 —— 走哪条路取决于 wait/条数，模型控制不了");
 });
+
+// git stash 什么都没存进去时照样退出 0，stdout 只印一句 "No local changes to save"，
+// 而前端无条件打「已 stash」、回执抬头也是 `git stash:` —— 读起来就是「存好了」。
+test("git_stash：什么都没存进去时不许说「已 stash」", () => {
+  const seg = SRC.slice(SRC.indexOf('} else if (call.op === "stash") {'),
+                        SRC.indexOf('} else if (call.op === "stash_pop") {'));
+  const run = (out) => {
+    const res = {};
+    const body = seg.slice(seg.indexOf("const _nothingStashed"));
+    return new Function("out", "res", "vp", "_escHtml", "gitRerootNote", body)(out, res, null, (x) => x, "");
+  };
+
+  const ok = run("Saved working directory and index state On main: Mr. Day One stash");
+  assert.match(ok.content, /Saved working directory/);
+  assert.doesNotMatch(ok.content, /什么都没存进去/);
+
+  const noop = run("No local changes to save");
+  assert.match(noop.content, /什么都没存进去/, "一句没存进去被报成了 stash 成功");
+  assert.match(noop.content, /拿不回任何东西/, "没说清后果：stash 栈上根本没有新条目");
+  // git stash 默认不带走未跟踪文件，所以「没有本地改动」≠ 工作区干净。
+  assert.match(noop.content, /不带走未跟踪的新文件/,
+    "模型会据此去 checkout / clean，动的正是它以为已经收好的东西");
+});

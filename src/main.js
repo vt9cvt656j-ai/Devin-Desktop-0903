@@ -57145,9 +57145,21 @@ async function _executeToolStepInner(step, call, root, run) {
         } else if (call.op === "stash") {
           const out = await backend.invoke("git_stash", { root: gitExecRoot });
           try { refreshGitStatus(); _clearAgentReadCache(); } catch {}
-          res.className = "atc-result atc-result--ok"; res.textContent = "已 stash";
+          // 什么都没存进去时 git 照样退出 0，只是 stdout 印一句 "No local changes to save"。
+          // 原来这里无条件打「已 stash」，回执抬头也是 `git stash:`——读起来就是「存好了」。
+          // 两处要命：① 之后 stash_pop 拿不回任何东西，而模型以为改动在栈上；
+          // ② `git stash push` **不带走未跟踪文件**，所以「没有本地改动」并不等于工作区干净，
+          // 模型据此去 checkout / clean，动的是它以为已经收好的东西。
+          const _nothingStashed = /No local changes to save/i.test(String(out || ""));
+          res.className = _nothingStashed ? "atc-result atc-result--info" : "atc-result atc-result--ok";
+          res.textContent = _nothingStashed ? "没有可 stash 的改动" : "已 stash";
           if (vp) vp.innerHTML = `<pre>${_escHtml(String(out || "").slice(0, 2000))}</pre>`;
-          return { type: "git", path: "stash", content: `git stash:\n${out || "(完成)"}${gitRerootNote}` };
+          return { type: "git", path: "stash", content: _nothingStashed
+            ? `git stash：**什么都没存进去**——没有已跟踪文件的改动。${out}\n`
+              + `stash 栈上没有新条目，等下 git_stash_pop 拿不回任何东西。\n`
+              + `注意 git stash 默认**不带走未跟踪的新文件**，所以这不等于工作区干净；`
+              + `要确认状态用 git_status 看一眼再决定。${gitRerootNote}`
+            : `git stash:\n${out || "(完成)"}${gitRerootNote}` };
         } else if (call.op === "stash_pop") {
           const idx = Number.isFinite(call.index) ? Math.floor(call.index) : null;
           const out = await backend.invoke("git_stash_pop", { root: gitExecRoot, index: idx });
