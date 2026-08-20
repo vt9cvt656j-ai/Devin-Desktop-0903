@@ -71646,160 +71646,11 @@ if (inTauri) {
 }
 
 // ---- Outline Panel ----
-let _outlineSortByName = false;
-let _outlineSymbols = [];
-
-async function refreshOutline() {
-  const tree = $("outlineTree");
-  if (!activePath) {
-    tree.innerHTML = '<div class="empty"><p>Open a file to see its outline.</p></div>';
-    $("outlineTimeline")?.removeAttribute("hidden");
-    refreshTimeline();
-    return;
-  }
-  const model = monacoEditor.getModel();
-  if (!model) return;
-  // monaco.languages.getDocumentSymbols 不是公开 API（0.55 的 editor.api 里不存在），
-  // 旧代码每次必抛 TypeError → 永远渲染 "No symbols found"（"大纲点了没内容"的根因）。
-  // 正路：LSP documentSymbol（本项目已有通道）；LSP 没起来/不支持时回退到内置正则解析，
-  // 保证大纲在任何语言环境下都至少有结果。
-  let symbols = null;
-  try {
-    if (typeof lspManager !== "undefined" && lspManager && lspManager.agentDocumentSymbols) {
-      symbols = await lspManager.agentDocumentSymbols(activePath); // [{name,kind,line,depth}] | null
-    }
-  } catch { symbols = null; }
-  if (!Array.isArray(symbols) || !symbols.length) symbols = _fallbackOutline(model);
-  _outlineSymbols = symbols;
-  renderOutlineTree(_outlineSymbols, tree);
-  $("outlineTimeline")?.removeAttribute("hidden");
-  refreshTimeline();
-}
-
-// LSP 不可用时的兜底大纲：按语言用正则抽 函数/类/结构 等顶层符号（1-based 行号）。
-function _fallbackOutline(model) {
-  const lang = model.getLanguageId();
-  const text = model.getValue();
-  const out = [];
-  const push = (name, kind, line, depth = 0, detail = "") => out.push({ name, kind, line, depth, detail });
-  const patterns = {
-    javascript: [
-      [/^\s*(?:export\s+)?(?:default\s+)?(?:async\s+)?function\s*\*?\s*([A-Za-z_$][\w$]*)/, "function"],
-      [/^\s*(?:export\s+)?(?:default\s+)?class\s+([A-Za-z_$][\w$]*)/, "class"],
-      [/^\s*(?:export\s+)?(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*(?:async\s*)?(?:\(|function\b|[A-Za-z_$][\w$]*\s*=>)/, "function"],
-    ],
-    python: [[/^\s*def\s+([A-Za-z_]\w*)/, "function"], [/^\s*class\s+([A-Za-z_]\w*)/, "class"]],
-    rust: [
-      [/^\s*(?:pub(?:\([^)]*\))?\s+)?(?:async\s+)?fn\s+([A-Za-z_]\w*)/, "function"],
-      [/^\s*(?:pub(?:\([^)]*\))?\s+)?(?:struct|enum|trait)\s+([A-Za-z_]\w*)/, "struct"],
-      [/^\s*impl(?:<[^>]*>)?\s+([A-Za-z_][\w:<>, ]*?)\s*[{]/, "class"],
-    ],
-    go: [[/^\s*func\s+(?:\([^)]*\)\s*)?([A-Za-z_]\w*)/, "function"], [/^\s*type\s+([A-Za-z_]\w*)/, "struct"]],
-    markdown: [[/^(#{1,6})\s+(.+)$/, "string"]],
-  };
-  const alias = { typescript: "javascript", javascriptreact: "javascript", typescriptreact: "javascript", mdx: "markdown" };
-  const rules = patterns[alias[lang] || lang] || patterns.javascript;
-  const lines = text.split("\n");
-  for (let i = 0; i < lines.length && out.length < 500; i++) {
-    for (const [re, kind] of rules) {
-      const m = re.exec(lines[i]);
-      if (!m) continue;
-      if (lang === "markdown" || alias[lang] === "markdown") push(m[2].trim(), kind, i + 1, m[1].length - 1);
-      else push(m[1], kind, i + 1);
-      break;
-    }
-  }
-  return out;
-}
-
-function renderOutlineTree(symbols, container) {
-  const filter = ($("outlineFilter")?.value || "").toLowerCase();
-  container.innerHTML = "";
-  if (!symbols.length) {
-    container.innerHTML = '<div class="empty"><p>No symbols found.</p></div>';
-    return;
-  }
-  // 扁平列表（LSP agentDocumentSymbols / 兜底解析统一形态）：depth 用缩进表达层级。
-  const sorted = [...symbols];
-  if (_outlineSortByName) sorted.sort((a, b) => a.name.localeCompare(b.name));
-  for (const sym of sorted) {
-    if (filter && !sym.name.toLowerCase().includes(filter)) continue;
-    const row = document.createElement("div");
-    row.className = "outline-row";
-    if (sym.depth) row.style.paddingLeft = `${8 + sym.depth * 14}px`;
-    const kindClass = _symbolKindClass(sym.kind);
-    row.innerHTML = `<span class="outline-icon outline-icon--${kindClass}"></span><span class="outline-name">${_escHtml(sym.name)}</span><span class="outline-detail">${_escHtml(sym.detail || "")}</span>`;
-    row.addEventListener("click", () => {
-      if (sym.line) {
-        monacoEditor.revealLineInCenter(sym.line);
-        monacoEditor.setPosition({ lineNumber: sym.line, column: 1 });
-        monacoEditor.focus();
-      }
-    });
-    container.appendChild(row);
-  }
-  if (!container.childElementCount) container.innerHTML = '<div class="empty"><p>No symbols found.</p></div>';
-}
-
-function _symbolKindClass(kind) {
-  if (typeof kind === "string" && kind) return kind.toLowerCase(); // LSP 通道给的已是名字
-  const map = { 1: "file", 2: "module", 3: "namespace", 4: "package", 5: "class", 6: "method",
-    7: "property", 8: "field", 9: "constructor", 10: "enum", 11: "interface", 12: "function",
-    13: "variable", 14: "constant", 15: "string", 16: "number", 17: "boolean", 18: "array",
-    19: "object", 20: "key", 21: "null", 22: "enummember", 23: "struct", 24: "event", 25: "operator", 26: "typeparam" };
-  return map[kind] || "variable";
-}
-
-$("outlineSortBtn")?.addEventListener("click", () => {
-  _outlineSortByName = !_outlineSortByName;
-});
-$("outlineFilter")?.addEventListener("input", () => {
-  const tree = $("outlineTree");
-  renderOutlineTree(_outlineSymbols, tree);
-});
 
 monacoEditor.onDidChangeModel(() => {
   // 只在大纲可见时刷新。旧写法 `!hidden === false` 运算符优先级写反：隐藏时白烧
   // 解析、可见时反而不刷——切到大纲页看到的是上个文件的旧结构（"点了没效果"之一）。
 });
-
-// ---- File Timeline ----
-async function refreshTimeline() {
-  const list = $("timelineList");
-  if (!list) return;
-  if (!activePath || !workspaceRoots.length) {
-    list.innerHTML = '<div class="empty"><p>No file selected.</p></div>';
-    return;
-  }
-  try {
-    const root = workspaceRoots[0];
-    const rel = activePath.startsWith(root) ? activePath.slice(root.length + 1) : activePath;
-    const log = await backend.gitLog(root);
-    const fileLog = log.filter(e => e.files?.includes(rel) || e.message?.includes(rel)).slice(0, 20);
-    if (!fileLog.length) {
-      const allLog = log.slice(0, 15);
-      renderTimelineEntries(allLog, list);
-    } else {
-      renderTimelineEntries(fileLog, list);
-    }
-  } catch {
-    list.innerHTML = '<div class="empty"><p>No git history.</p></div>';
-  }
-}
-
-function renderTimelineEntries(entries, container) {
-  container.innerHTML = "";
-  for (const e of entries) {
-    const row = document.createElement("div");
-    row.className = "timeline-row";
-    const date = e.date ? new Date(parseInt(e.date) * 1000).toLocaleDateString() : "";
-    row.innerHTML = `<span class="timeline-dot"></span><div class="timeline-info"><span class="timeline-msg">${_escHtml(e.message?.split("\n")[0] || "")}</span><span class="timeline-meta">${_escHtml(e.author || "")} · ${date}</span></div>`;
-    row.addEventListener("click", () => {
-      showToast(`Commit: ${e.hash?.slice(0, 8) || "?"}`);
-    });
-    container.appendChild(row);
-  }
-}
 
 $("timelineToggle")?.addEventListener("click", () => {
   const list = $("timelineList");
@@ -71851,159 +71702,6 @@ $("outputCloseBtn")?.addEventListener("click", () => toggleOutputPanel());
 // ---- Test Explorer ----
 // .mjs/.cjs 也算测试文件（本仓库自己的测试就是 test/*.test.mjs，旧模式漏掉 → 永远
 // "No test files detected"，测试页签点了像没反应）。
-const _TEST_PATTERNS = [
-  /\.(test|spec)\.[cm]?[jt]sx?$/, /_test\.go$/, /test_.*\.py$/, /.*_test\.py$/,
-  /Test\.java$/, /\.test\.rs$/
-];
-
-async function refreshTestExplorer() {
-  const tree = $("testTree");
-  if (!workspaceRoots.length) {
-    tree.innerHTML = '<div class="empty"><p>Open a project to detect tests.</p></div>';
-    return;
-  }
-  try {
-    const root = workspaceRoots[0];
-    const allFiles = await _collectTestFiles(root);
-    if (!allFiles.length) {
-      tree.innerHTML = '<div class="empty"><p>No test files detected.</p></div>';
-      return;
-    }
-    tree.innerHTML = "";
-    const groups = {};
-    for (const f of allFiles) {
-      const dir = f.path.split("/").slice(0, -1).join("/").replace(root + "/", "") || ".";
-      if (!groups[dir]) groups[dir] = [];
-      groups[dir].push(f);
-    }
-    for (const [dir, files] of Object.entries(groups)) {
-      const section = document.createElement("div");
-      section.className = "test-group";
-      section.innerHTML = `<div class="test-group__head"><svg class="ic"><use href="#i-folder" /></svg><span>${_escHtml(dir)}</span></div>`;
-      for (const f of files) {
-        const row = document.createElement("div");
-        row.className = "test-row";
-        row.innerHTML = `<span class="test-status test-status--pending">○</span><span class="test-name">${_escHtml(f.name)}</span>`;
-        row.addEventListener("click", () => openFile(f.path, f.name));
-        const runBtn = document.createElement("button");
-        runBtn.className = "iconbtn test-run-btn";
-        runBtn.title = "Run test";
-        runBtn.innerHTML = '<svg class="ic"><use href="#i-play" /></svg>';
-        runBtn.addEventListener("click", (e) => {
-          e.stopPropagation();
-          runTestFile(f.path, f.name, row);
-        });
-        row.appendChild(runBtn);
-        section.appendChild(row);
-      }
-      tree.appendChild(section);
-    }
-  } catch {
-    tree.innerHTML = '<div class="empty"><p>Error scanning tests.</p></div>';
-  }
-}
-
-async function _collectTestFiles(root, maxDepth = 4) {
-  const results = [];
-  async function scan(dir, depth) {
-    if (depth > maxDepth) return;
-    try {
-      const entries = await backend.readDir(dir);
-      for (const e of entries) {
-        if (e.is_dir) {
-          if (e.name === "node_modules" || e.name === ".git" || e.name === "target" || e.name === "__pycache__") continue;
-          await scan(e.path, depth + 1);
-        } else if (_TEST_PATTERNS.some(p => p.test(e.name))) {
-          results.push(e);
-        }
-      }
-    } catch { /* ignore inaccessible dirs */ }
-  }
-  await scan(root, 0);
-  return results;
-}
-
-async function runTestFile(path, name, rowEl) {
-  const statusEl = rowEl.querySelector(".test-status");
-  statusEl.textContent = "⏳";
-  statusEl.className = "test-status test-status--running";
-  const root = rootPath || workspaceRoots[0] || "";
-  try {
-    let cmd;
-    if (/\.(test|spec)\.[cm]js$/.test(name)) cmd = `node --test "${path}" 2>&1`; // node 内置 test runner（本仓库 *.test.mjs 用的就是它）
-    else if (/\.(test|spec)\.[jt]sx?$/.test(name)) cmd = `npx vitest run "${path}" 2>&1 || npx jest "${path}" --no-coverage 2>&1`;
-    else if (/_test\.go$/.test(name)) cmd = `go test -v "${path}" 2>&1`;
-    else if (/(^|\/)test_.*\.py$|_test\.py$|test.*\.py$/.test(name)) cmd = `python -m pytest "${path}" -v 2>&1`;
-    else if (/\.rs$/.test(name)) cmd = `cargo test 2>&1`;
-    else {
-      statusEl.textContent = "—"; statusEl.className = "test-status";
-      appendOutput("tasks", `[TEST] ${name}: 没有可用的测试运行器（支持 jest/vitest、pytest、go test、cargo test）`);
-      showToast(`没有 ${name} 的测试运行器`);
-      return;
-    }
-    if (!root) { statusEl.textContent = "—"; statusEl.className = "test-status"; showToast("未打开工作区"); return; }
-    appendOutput("tasks", `[TEST] ${name}: 运行中…  $ ${cmd}`);
-    // ACTUALLY run it and judge by the REAL exit code — no more unconditional ✓.
-    const r = await backend.taskRunCapture(root, cmd);
-    const out = (((r && r.stdout) || "") + ((r && r.stderr) ? "\n" + r.stderr : "")).trim();
-    const code = r && typeof r.code === "number" ? r.code : -1;
-    if (code === 0) {
-      statusEl.textContent = "✓"; statusEl.className = "test-status test-status--pass";
-      appendOutput("tasks", `[TEST] ${name}: PASSED (exit 0)\n${out.slice(-2000)}`);
-    } else {
-      statusEl.textContent = "✗"; statusEl.className = "test-status test-status--fail";
-      appendOutput("tasks", `[TEST] ${name}: FAILED (exit ${code})\n${out.slice(-3000)}`);
-    }
-  } catch (err) {
-    statusEl.textContent = "✗"; statusEl.className = "test-status test-status--fail";
-    appendOutput("tasks", `[TEST] ${name}: 运行出错 - ${err?.message || err}`);
-  }
-}
-
-// Run the WHOLE suite once (detected from the project), parse aggregate pass/fail,
-// show a summary banner + mark rows. Was: `row.click()` per row — which only OPENED
-// each file (the row handler is openFile), so "Run All" ran nothing at all.
-async function _testFileExists(p) { try { await backend.readTextFile(p); return true; } catch { return false; } }
-function _parseTestStats(out) {
-  const pass = out.match(/(\d+)\s+passed/i);
-  const fail = out.match(/(\d+)\s+failed/i);
-  const parts = [];
-  if (pass) parts.push(`${pass[1]} 通过`);
-  if (fail && +fail[1] > 0) parts.push(`${fail[1]} 失败`);
-  return parts.join("、");
-}
-async function runAllTests() {
-  const root = rootPath || workspaceRoots[0] || "";
-  const tree = $("testTree");
-  if (!root) { showToast("未打开工作区"); return; }
-  let cmd = "npm test 2>&1";
-  try {
-    if (await _testFileExists(root + "/Cargo.toml")) cmd = "cargo test 2>&1";
-    else if (await _testFileExists(root + "/go.mod")) cmd = "go test ./... 2>&1";
-    else if (await _testFileExists(root + "/package.json")) {
-      const pkg = JSON.parse(await backend.readTextFile(root + "/package.json"));
-      cmd = (pkg.scripts && pkg.scripts.test) ? "npm test --silent 2>&1" : "npx vitest run 2>&1 || npx jest 2>&1";
-    } else if (await _testFileExists(root + "/pyproject.toml") || await _testFileExists(root + "/pytest.ini") || await _testFileExists(root + "/setup.py")) cmd = "python -m pytest 2>&1";
-  } catch {}
-  let banner = tree.querySelector(".test-allbanner");
-  if (!banner) { banner = document.createElement("div"); banner.className = "test-allbanner"; banner.style.cssText = "padding:7px 10px;font-size:12px;border-bottom:1px solid var(--border,#e5e7eb);position:sticky;top:0;background:var(--bg-elevated,var(--panel,#fff));z-index:1"; tree.prepend(banner); }
-  banner.innerHTML = `<span class="atc-spin"></span> 运行全部测试…  <code style="opacity:.6">${_escHtml(cmd)}</code>`;
-  appendOutput("tasks", `[TEST] 运行全部：$ ${cmd}`);
-  try {
-    const r = await backend.taskRunCapture(root, cmd);
-    const out = (((r && r.stdout) || "") + ((r && r.stderr) ? "\n" + r.stderr : "")).trim();
-    const code = r && typeof r.code === "number" ? r.code : -1;
-    const stats = _parseTestStats(out);
-    const ok = code === 0;
-    banner.innerHTML = `${ok ? '<b style="color:var(--ok,#1e8e3e)">✓ 全部通过</b>' : '<b style="color:var(--err,#d93025)">✗ 有失败</b>'}${stats ? " · " + stats : ""} · exit ${code} <button class="lnk-btn" style="float:right;background:none;border:none;color:var(--accent,#1a73e8);cursor:pointer;font-size:12px">查看输出</button>`;
-    banner.querySelector("button")?.addEventListener("click", () => { appendOutput("tasks", out.slice(-6000)); toggleOutputPanel?.(); });
-    appendOutput("tasks", `[TEST] 全部完成 (exit ${code})\n${out.slice(-4000)}`);
-    for (const st of tree.querySelectorAll(".test-row .test-status")) { st.textContent = ok ? "✓" : "✗"; st.className = "test-status " + (ok ? "test-status--pass" : "test-status--fail"); }
-  } catch (e) {
-    banner.innerHTML = `<b style="color:var(--err,#d93025)">✗ 运行出错</b>：${_escHtml(String(e?.message || e).slice(0, 120))}`;
-  }
-}
-$("testRunAllBtn")?.addEventListener("click", () => runAllTests());
 
 // ---- Terminal Split ----
 $("termSplitBtn")?.addEventListener("click", async () => {
@@ -72394,45 +72092,9 @@ monacoEditor.addAction({
 });
 
 // ---- Minimap Search Highlight ----
-let _minimapSearchDecorations = [];
-
-function updateMinimapSearchHighlights(matches) {
-  const decos = (matches || []).map(m => ({
-    range: m.range,
-    options: {
-      minimap: { color: "#ffc107", position: monaco.editor.MinimapPosition.Inline },
-      overviewRuler: { color: "#ffc107", position: monaco.editor.OverviewRulerLane.Center },
-    },
-  }));
-  _minimapSearchDecorations = monacoEditor.deltaDecorations(_minimapSearchDecorations, decos);
-}
 
 // ---- Extension Recommendations ----
-const _EXT_RECOMMENDATIONS = {
-  ".py": { name: "Python", ext: "ms-python.python", desc: "Python language support" },
-  ".rs": { name: "Rust Analyzer", ext: "rust-lang.rust-analyzer", desc: "Rust language support" },
-  ".go": { name: "Go", ext: "golang.go", desc: "Go language support" },
-  ".vue": { name: "Vue", ext: "Vue.volar", desc: "Vue language support" },
-  ".svelte": { name: "Svelte", ext: "svelte.svelte-vscode", desc: "Svelte language support" },
-  ".dart": { name: "Dart", ext: "Dart-Code.dart-code", desc: "Dart language support" },
-  ".java": { name: "Java", ext: "redhat.java", desc: "Java language support" },
-  ".rb": { name: "Ruby", ext: "Shopify.ruby-lsp", desc: "Ruby language support" },
-};
 
-function checkExtensionRecommendation(fileName) {
-  const ext = "." + (fileName.split(".").pop() || "");
-  const rec = _EXT_RECOMMENDATIONS[ext];
-  if (!rec || _recommendedAlready.has(ext)) return;
-  _recommendedAlready.add(ext);
-  showNotification({
-    title: `推荐扩展：${rec.name}`,
-    message: rec.desc,
-    action: () => openMarketplaceModal(), // was showSide("explorer") — opened the file tree, not the marketplace
-    actionLabel: "查看扩展市场",
-    duration: 10000,
-  });
-}
-const _recommendedAlready = new Set();
 
 // ---- Custom Snippet Editor ----
 function openSnippetEditor() {
@@ -72480,10 +72142,6 @@ function openSnippetEditor() {
 // (⌘⌥K is Toggle Bookmark), so this is purely additive.
 // ============================================================================
 editorEl.style.position = "relative";
-function _aiConfigured() {
-  const c = loadConfig();
-  return !!(c.baseUrl && c.apiKey && c.model);
-}
 function _stripFence(s) {
   return String(s || "").replace(/^\s*```[\w-]*\n?/, "").replace(/\n?```\s*$/, "");
 }
@@ -72677,19 +72335,6 @@ function summarizeToolHistory(records, maxTurns = 8) {
 // ============================================================================
 // Docker Compose helper functions
 // ============================================================================
-
-function _workspaceRelativePath(filePath, preferredRoot = "") {
-  const normalized = _normalizeFsPath(String(filePath || ""));
-  const roots = _allRoots(preferredRoot).sort((a, b) => b.length - a.length);
-  for (const workspaceRoot of roots) {
-    const cleanRoot = _normalizeFsPath(workspaceRoot).replace(/\/+$/, "");
-    if (_pathIdentity(normalized) === _pathIdentity(cleanRoot)) return ".";
-    if (_pathIdentity(normalized).startsWith(_pathIdentity(cleanRoot) + "/")) {
-      return normalized.slice(cleanRoot.length + 1);
-    }
-  }
-  return normalized;
-}
 
 /** Run a single command without step rendering */
 async function _runSingleCommand(root, command, timeoutSecs = 60) {

@@ -1803,15 +1803,12 @@ const KNOWN_UNCALLED = new Set([
   "_appendDeliveryFactsBar", "_appendRunRevertBar", "_adaptiveEnabled", "_agentAllowsExternalKind", "_agentAllowsRuntimeKind",
   "_agentQuestionNeedsWorkspaceEvidence",
   "_agentSideEffectIntentIssue",
-  "_agentToolNameAllowedByProfile", "_agentUserIntentText",
-  "_aiConfigured", "_appendToolPlanCard",
+  "_agentToolNameAllowedByProfile", "_agentUserIntentText", "_appendToolPlanCard",
   "_hasContextOnlyLocationIntent", "_isCompressionPrefixInvalidError",
   "_looksLikeProjectExecutionCommand", "_readBeforeEditCoverageHint", "_readCoverageImpossible",
   "_stickToBottom", "_structureReadinessHint", "_thinkTip",
-  "_toolRequiresPlanGate", "_workspaceRelativePath", "_writeGateBypass",
-  "checkExtensionRecommendation", "refreshOutline",
-  "refreshTestExplorer", "renderCaptureTool", "renderConflictsTool", "renderDebuggerTool",
-  "renderMarketplaceTool", "renderRemoteTool", "renderTasksTool", "renderWorkspaceTool", "updateMinimapSearchHighlights",
+  "_toolRequiresPlanGate", "_writeGateBypass", "renderCaptureTool", "renderConflictsTool", "renderDebuggerTool",
+  "renderMarketplaceTool", "renderRemoteTool", "renderTasksTool", "renderWorkspaceTool",
 ]);
 
 function stripJsComments(source) {
