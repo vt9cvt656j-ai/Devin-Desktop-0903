@@ -311,17 +311,21 @@ const KNOWN_WRITE_ONLY = new Set([
 //          「`run._checkPendingPaths` 只写不读」的注释本身就把它保活了——一句说明它是死的
 //          的话，成了它还活着的唯一证据。剥注释用同文件下方那个上下文感知的 stripJsComments，
 //          不是文件头警告的那种朴素实现。
-const _readsOnly = (src) => src.replace(/run\._[A-Za-z][A-Za-z0-9_]*\s*=(?!=)[^;\n]*/g, (m) => {
-  const eq = m.indexOf("=");
-  return m.slice(0, eq); // 保住左边（含条件），挖掉右边的自引用
-});
+// 只抹**同名**的自引用，不是整段右值：`run._a = f(run._b)` 里 run._b 是一次真实读，
+// 整段挖会把它一起抹掉，于是 run._b 被误判成死字段 —— 棘轮式守卫的误报比漏报更难缠。
+const _selfRefBlanked = (src, field) => src.replace(
+  new RegExp(`run\\._${field}\\s*=(?!=)[^;\\n]*`, "g"),
+  (m) => {
+    const eq = m.indexOf("=");
+    return m.slice(0, eq) + m.slice(eq).replace(new RegExp(`run\\??\\._${field}\\b`, "g"), "");
+  });
 test("no NEW write-only run field is introduced", () => {
   const CODE = stripJsComments(SRC);
   const written = grab(CODE, /run\._([A-Za-z][A-Za-z0-9_]*)\s*=(?!=)/g);
   assert.ok(written.length > 40, `只扫出 ${written.length} 个 run 字段——取法坏了，这条等于没跑`);
-  const READS = _readsOnly(CODE);
   const fresh = [];
   for (const field of written) {
+    const READS = _selfRefBlanked(CODE, field);
     // Reads include optional chaining (`run?._x`), which the first version missed and which
     // would have produced false positives on fields that ARE read.
     // READS 里每处赋值只剩下等号左边的 `run._x`，所以减掉赋值条数，剩下的就是真实读。
@@ -345,14 +349,19 @@ const KNOWN_SESSION_WRITE_ONLY = new Set([
   "turnTimeline",
 ]);
 // 同上面两个洞：自引用记账 + 注释幽灵。会话侧一字不差地存在同样的问题。
-const _sessReadsOnly = (src) => src.replace(/(?:session|sess)\._[A-Za-z0-9_]+\s*=(?!=)[^;\n]*/g, (m) => m.slice(0, m.indexOf("=")));
+const _sessSelfRefBlanked = (src, field) => src.replace(
+  new RegExp(`(?:session|sess)\\._${field}\\s*=(?!=)[^;\\n]*`, "g"),
+  (m) => {
+    const eq = m.indexOf("=");
+    return m.slice(0, eq) + m.slice(eq).replace(new RegExp(`(?:session|sess)\\??\\._${field}\\b`, "g"), "");
+  });
 test("会话级状态也不许只写不读", () => {
   const CODE = stripJsComments(SRC);
   const written = new Set([...CODE.matchAll(/(?:session|sess)\._([A-Za-z0-9_]+)\s*=(?!=)/g)].map((m) => m[1]));
   assert.ok(written.size > 20, `只扫出 ${written.size} 个会话字段——取法坏了，这条等于没跑`);
-  const READS = _sessReadsOnly(CODE);
   const fresh = [];
   for (const field of written) {
+    const READS = _sessSelfRefBlanked(CODE, field);
     const all = (READS.match(new RegExp(`(?:session|sess)\\??\\._${field}\\b`, "g")) || []).length;
     const writes = (CODE.match(new RegExp(`(?:session|sess)\\._${field}\\s*=(?!=)`, "g")) || []).length;
     if (all - writes <= 0 && !KNOWN_SESSION_WRITE_ONLY.has(field)) fresh.push(`session._${field}`);
