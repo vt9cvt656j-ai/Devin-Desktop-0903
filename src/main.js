@@ -35004,6 +35004,13 @@ function _planStepMatchesEvidence(step, evidenceKinds) {
 
 function _advancePlanFromTool(run, call, result) {
   if (!run || call?.type === "plan" || !Array.isArray(run._planSteps) || !run._planSteps.length) return false;
+  // 继承来的计划，在模型这一轮自己调过 update_plan「认领」之前，一律不许自动推进。
+  //
+  // 用户实拍的形状：上一个任务留了两步 pending，这一轮做的是完全不相干的事
+  // （读 README、跑 npm test），却因为证据类别恰好对得上（investigate / verify），
+  // 把旧计划的两步分别打成完成、进度走到 2/2 —— 那些事根本没做。
+  // 认领判据是执行事实：本轮模型真的调过 update_plan（run._planTouchedThisRun）。
+  if (run._planInherited && !run._planTouchedThisRun) return false;
   const evidenceKinds = _planEvidenceKindsForTool(call, result);
   if (!evidenceKinds.length) return false;
   let steps = _planPrimeCurrentStep(run._planSteps);
@@ -47535,6 +47542,7 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
         && _prevPlan.some((x) => x?.status === "pending" || x?.status === "in_progress")
         && (_prevOutcome === "failed" || _prevOutcome === "partial")) {
       run._planSteps = _prevPlan.map((x) => ({ ...x }));
+      run._planInherited = true; // 继承来的，不是模型这一轮自己建的
       planSteps = run._planSteps;
     }
   } catch {}
@@ -47554,9 +47562,18 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
   // A plan restored from a previous session (app restart) with unfinished steps
   // carries over into this run, so the agent picks the tasks back up instead of
   // losing them.
+  // 这是**第二个**继承入口，比上面那个（带 outcome 闸）早 300 多个提交，而且一直没有闸：
+  // 上面那道闸拒绝时（outcome 是 success / awaiting_user / 没有 _lastRunState），这里照样
+  // 继承，等于那道闸对它想拦的每种情形都不生效。实测四种 outcome 全部继承成功。
+  // 它真正该服务的只有一种情形：崩溃重启后 outcome 已经陈旧的恢复路径（见 d9c2d27）。
+  //
+  // 另外原来是**共享引用**（run._planSteps = session._planSteps），于是下游自动打勾会
+  // 直接改到会话那份并落盘 —— 用户会看到「已经不要的那份计划，在你做别的事的时候自己
+  // 打上了勾」。改成拷贝。
   if (isAgent && !run._planSteps && Array.isArray(session._planSteps) &&
       session._planSteps.some((s) => s.status === "pending" || s.status === "in_progress")) {
-    run._planSteps = session._planSteps;
+    run._planSteps = session._planSteps.map((x) => ({ ...x }));
+    run._planInherited = true;
     planSteps = run._planSteps;
   }
   const _shotMsgs = []; // screenshot image messages currently in context (kept lean)
@@ -48612,7 +48629,9 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
         }
         // Genuinely waiting now — but if steps are still open, say so in the accounting rather
         // than letting "awaiting_user" read as a clean finish.
-        if (_pendingPlan.length) run._incompleteReason = run._incompleteReason || `plan_steps_pending:${_pendingPlan.length}`;
+        if (_pendingPlan.length && (!run._planInherited || run._planTouchedThisRun)) {
+          run._incompleteReason = run._incompleteReason || `plan_steps_pending:${_pendingPlan.length}`;
+        }
         awaitingUserReply = true;
         _clearNudges();
         break;
@@ -48874,14 +48893,20 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
         const _pendingPlan = (Array.isArray(run._planSteps) ? run._planSteps : [])
           .filter((step) => step?.status === "pending" || step?.status === "in_progress");
         // 预算从 3 下调到 2，和另外两道门对齐——全局池只有 3，单门占 3 会把另外两道饿死。
-        if (_pendingPlan.length && _canResume && (run._planFinishNudges || 0) < 2) {
+        // 继承来、本轮模型压根没碰过的计划，不许拿它硬顶一个回合。
+        // 用户实拍：问一句跟上个任务不相干的话，答完了界面还自己多跑一轮，
+        // 最后下一步建议变成「继续没做完的步骤」—— 去做他已经不要的事。
+        const _planActionable = !run._planInherited || run._planTouchedThisRun;
+        if (_pendingPlan.length && _planActionable && _canResume && (run._planFinishNudges || 0) < 2) {
           run._planFinishNudges = (run._planFinishNudges || 0) + 1;
           run._quietResumePool--;
           _pushNudge("planFinish", `[计划未完成] 还有 ${_pendingPlan.length} 步没做完：${_pendingPlan.slice(0, 8).map((step) => step.content).join("、")}。`
             + `\n继续做下一步。某一步确实不该做，就用 update_plan 标 cancelled 并写明原因——不要在还有未完成步骤时静默收尾，也不要反问「要不要我继续」。`);
           continue;
         }
-        if (_pendingPlan.length) run._incompleteReason = run._incompleteReason || `plan_steps_pending:${_pendingPlan.length}`;
+        // 同上：继承来又没碰过的计划不该把一次干净的问答记成 partial（那会让下一步
+        // 建议冒出「继续没做完的步骤」，指向用户已经不要的事）。
+        if (_pendingPlan.length && _planActionable) run._incompleteReason = run._incompleteReason || `plan_steps_pending:${_pendingPlan.length}`;
         // 收尾诚实：最后一个动作轮有工具明确报失败（部署/命令/mcp/http 退出非零、被拒、冲突…），
         // 模型却安静收尾——「没启动也说启动了」的机器成因。只记账、不补回合（同上诸门哲学）；
         // 排在最后，更具体的原因靠 !run._incompleteReason 先占位；用 lastTurnHadFailure（只看最后
@@ -49404,6 +49429,9 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
         const completionIssue = _unprovenPlanCompletionIssue(it.call.steps, planEvidenceCount);
         if (completionIssue) it.call.steps = _guardUnprovenPlanCompletion(it.call.steps, planEvidenceCount);
         it.call.steps = _planPrimeCurrentStep(it.call.steps);
+        // 模型这一轮自己调了 update_plan —— 这就是「认领」：从此这份计划算它的，
+        // 自动推进和收尾记账都可以对它生效（见 _advancePlanFromTool 顶上的守卫）。
+        run._planTouchedThisRun = true;
         planEl = _renderPlan(body, it.call.steps, run._planEl || planEl, run);
         planSteps = run._planSteps || it.call.steps;
         // A second model used to review this plan here and, on "finding gaps", inject

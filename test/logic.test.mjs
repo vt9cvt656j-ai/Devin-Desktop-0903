@@ -30198,3 +30198,70 @@ test("计划卡：跨重启不重建，展开进度跨轮保住，新任务仍�
   assert.doesNotMatch(src, /document\.querySelector\(\"\.agent-plan\"\)/,
     "从全局查会把别的会话那张卡抢过来");
 });
+
+// ---- 已经不要的那份计划，不许在你做别的事的时候自己打勾 ----
+//
+// 用户实拍的形状：上一个任务留了两步 pending，这一轮做的是完全不相干的事（读 README、
+// 跑 npm test），却因为证据类别恰好对得上（investigate / verify），把旧计划那两步分别打成
+// 完成、进度走到 2/2 —— 那些事根本没做。而且第二个继承入口是**共享引用**，打的勾会直接
+// 改到会话那份并落盘，用户下次打开还看得见。
+test("继承来的计划，在模型这一轮认领之前不许自动推进", () => {
+  const advance = load("_advancePlanFromTool", {
+    _planEvidenceKindsForTool: () => ["investigate"],
+    _planPrimeCurrentStep: (steps) => steps.map((x, i) => (i === 0 ? { ...x, status: "in_progress" } : x)),
+    _planStepMatchesEvidence: () => true,
+    _planStepActionKind: () => "investigate",
+    _renderPlan: () => null,
+    _syncPlanChip: () => {},
+  });
+  const mkRun = (over) => ({
+    _planSteps: [{ content: "调研 Monaco 中文输入法", status: "pending" },
+                 { content: "跑 npm test 验证", status: "pending" }],
+    ...over,
+  });
+  const call = { type: "read", path: "README.md" };
+
+  // 继承来、本轮没认领 → 一步都不许推进。
+  const inherited = mkRun({ _planInherited: true });
+  assert.equal(advance(inherited, call, {}), false,
+    "继承来的旧计划被一件不相干的活推进了 —— 用户会看到旧计划自己打勾");
+  assert.ok(inherited._planSteps.every((x) => x.status === "pending"),
+    "步骤状态被改了");
+
+  // 模型这一轮自己调过 update_plan（认领）→ 恢复正常推进。
+  assert.equal(advance(mkRun({ _planInherited: true, _planTouchedThisRun: true }), call, {}), true,
+    "认领之后还是不推进 —— 那就把正常的计划推进也弄坏了");
+  // 本轮自己建的计划（没打继承标）照常推进。
+  assert.equal(advance(mkRun({}), call, {}), true, "本轮自己建的计划不该被这道守卫拦住");
+});
+
+// ---- 问一句不相干的事，不该被硬顶着去做上个任务的旧步骤 ----
+//
+// 旧计划有**两个**继承入口：带 outcome 闸的那个（2026-08-14），和早它 332 个提交、
+// 一直没有闸的那个。上面那道闸拒绝时（outcome=success / awaiting_user / 没有 _lastRunState），
+// 下面那个照样继承 —— 等于那道闸对它想拦的每种情形都不生效。
+test("旧计划的两个继承入口都要打标，而且第二个不许共享引用", () => {
+  const loop = extractFn("_runAgenticLoop");
+  // 两处继承都要打继承标，否则下游的守卫认不出来。
+  assert.equal((loop.match(/run\._planInherited = true;/g) || []).length, 2,
+    "两个继承入口没有都打标 —— 漏掉哪个，哪个就绕过所有守卫");
+  // 第二个入口必须拷贝：共享引用会让自动打勾直接改到会话那份并落盘。
+  assert.match(loop, /run\._planSteps = session\._planSteps\.map\(\(x\) => \(\{ \.\.\.x \}\)\);/,
+    "第二个入口还是共享引用 —— 打的勾会写回会话并持久化");
+  assert.doesNotMatch(loop, /run\._planSteps = session\._planSteps;/, "共享引用还在");
+
+  // 认领只由执行事实置位：本轮模型真的调过 update_plan。
+  assert.match(loop, /run\._planTouchedThisRun = true;/, "没有认领标记");
+  const at = loop.indexOf("run._planTouchedThisRun = true;");
+  // 窗口要够宽：这一段中间夹着几行中文注释，400 字只覆盖到注释里。
+  assert.match(loop.slice(Math.max(0, at - 1200), at), /tc\.name !== "update_plan"/,
+    "认领标记不是由 update_plan 置的 —— 判据必须是执行事实");
+
+  // 硬顶回合和记账都要看认领。
+  assert.match(loop, /const _planActionable = !run\._planInherited \|\| run\._planTouchedThisRun;/,
+    "planFinish 那道门没有按认领判据把关");
+  assert.match(loop, /_pendingPlan\.length && _planActionable && _canResume/,
+    "继承来又没碰过的计划仍然会硬顶一个回合");
+  assert.match(loop, /if \(_pendingPlan\.length && _planActionable\) run\._incompleteReason/,
+    "记账没按认领判据把关 —— 一次干净问答会被记成 partial，下一步建议变成「继续没做完的步骤」");
+});
