@@ -30048,3 +30048,51 @@ test("打字预取的闸门：只在能省下等待的时候跑，且不许把�
   assert.match(SRC.slice(Math.max(0, at - 200), at), /clearTimeout\(_intentPrefetchTimer\)/,
     "没有防抖 —— 每敲一个键就发一次请求");
 });
+
+// ---- 每问一轮就多出一张计划卡 ----
+//
+// 用户实拍：同一份计划（同样 4 步、同样 0/4）在一个对话里连出三张，分别显示 2 / 3 / 4 步。
+// 病根是层级挂错了：计划卡记在 run._planEl 上，而**一个 run = 用户的一次提问**，计划却是
+// 跨轮持续的东西。于是每问一轮 run._planEl 都是空的 → 新建一张，上一轮那张还留在上面。
+test("计划卡跨轮只有一张：新的一轮要复用上一轮那张，不是再建一张", () => {
+  const mkEl = () => ({
+    className: "", innerHTML: "", children: [], parentNode: null, isConnected: false,
+    get lastChild() { return this.children[this.children.length - 1] || null; },
+    appendChild(c) {
+      if (c.parentNode) c.parentNode.children = c.parentNode.children.filter((x) => x !== c);
+      c.parentNode = this; c.isConnected = true; this.children.push(c); return c;
+    },
+  });
+  const render = new Function("document", "t", "_escHtml", "_PLAN_ICON", "_planVisibleWindow",
+    "_planRowHtml", "_planWindowControlsHtml", "_bindPlanWindow", "_syncPlanChip",
+    "_schedulePlanReveal", "_PLAN_MAX_RENDERED_STEPS",
+    `${extractFn("_renderPlan")}\nreturn _renderPlan;`)(
+    { createElement: () => mkEl() }, () => "", (x) => String(x), "",
+    (run, steps) => ({ rows: steps, start: 0 }), () => "", () => "", () => {}, () => {}, () => {}, 8);
+
+  const countCards = (node) => (node.className === "agent-plan" ? 1 : 0)
+    + node.children.reduce((a, c) => a + countCards(c), 0);
+  const steps = [{ content: "a", status: "pending" }, { content: "b", status: "pending" }];
+
+  // 三轮提问，每轮一个新的 run 和一个新的消息容器 —— 正是用户实拍的场景。
+  const session = {};
+  const chat = mkEl(); chat.isConnected = true;
+  for (let turn = 0; turn < 3; turn++) {
+    const body = mkEl(); chat.appendChild(body);
+    render(body, steps, undefined, { session });
+  }
+  assert.equal(countCards(chat), 1,
+    "每问一轮就多一张计划卡 —— 卡挂在 run 上，而 run 是一次提问，计划却是跨轮的");
+
+  // 两个不同会话之间不许串卡。
+  const chatB = mkEl(); chatB.isConnected = true;
+  const bodyB = mkEl(); chatB.appendChild(bodyB);
+  render(bodyB, steps, undefined, { session: {} });
+  assert.equal(countCards(chatB), 1, "新会话没有自己的计划卡");
+  assert.equal(countCards(chat), 1, "另一个会话的卡被抢走了");
+
+  // 层级必须两边都挂：run 级供本轮增量更新，会话级供下一轮复用。
+  const src = extractFn("_renderPlan");
+  assert.match(src, /run\.session\._planEl/, "会话级指针没了 —— 下一轮又会新建一张");
+  assert.match(src, /if \(run\) run\._planEl = el;/, "run 级指针没了 —— 本轮内的增量更新会失效");
+});

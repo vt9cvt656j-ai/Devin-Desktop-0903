@@ -35354,12 +35354,20 @@ function _renderPlan(container, steps, existingEl, run) {
   const canc = steps.filter((s) => s.status === "cancelled").length;
   const total = steps.length - canc;
   const allDone = total > 0 && done >= total;
-  let el = existingEl || (run && run._planEl);
+  // 计划卡必须挂在**会话**上，不能只挂在 run 上。
+  //
+  // 一个 run = 用户的一次提问，而计划是跨轮持续的东西。挂在 run 上的后果是：用户每问一轮，
+  // run._planEl 都是空的 → 新建一张卡，而上一轮那张还留在上面。用户实拍：同一份计划
+  // （同样 4 步、同样 0/4）在对话里连出三张，分别显示 2/3/4 步——每问一轮多一张。
+  //
+  // 会话级的先例这个文件里已经有了（run.session._planExpanded，见 _planExpanded 那处）。
+  // 复用到旧卡时下面那句 appendChild 会把它移到当前消息底部，正是这里注释写的
+  // 「re-surface at the bottom」——那本来就是一张卡的设计，只是层级挂错了。
+  let el = existingEl || (run && run._planEl) || (run && run.session && run.session._planEl);
   if (!el || !el.isConnected) {
     el = document.createElement("div");
     el.className = "agent-plan";
     container.appendChild(el); // INLINE at the current bottom — not pinned at the top
-    if (run) run._planEl = el;
   } else if (!allDone && container.lastChild !== el) {
     // On each update, RE-SURFACE the plan at the bottom (where the user is looking) so a
     // completed step "re-emits" near the latest activity instead of staying stuck above.
@@ -35368,6 +35376,10 @@ function _renderPlan(container, steps, existingEl, run) {
     // the user sees after the actual wrap-up text.
     container.appendChild(el);
   }
+  // 无论新建还是复用，两个层级都要指向同一张卡：run 级供本轮内的增量更新，
+  // 会话级供下一轮复用（否则下一轮又会新建一张）。
+  if (run) run._planEl = el;
+  if (run && run.session) run.session._planEl = el;
   const badge = t("plan.badgeDone", { done, total }) + (canc ? t("plan.badgeCancelled", { count: canc }) : "");
   const view = _planVisibleWindow(run, steps);
   el.innerHTML =
