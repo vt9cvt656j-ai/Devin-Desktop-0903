@@ -22668,7 +22668,7 @@ ${trackAdoption || "- 无"}
 
 ${compositionRecipe}
 
-执行要求：三轨是同时成立的采用契约，不允许只选第一轨的浅色、圆角和卡片后忽略动效/媒体轨。结构配色轨必须逐项写成“来源 section → 当前项目组件 primitive/variant/API → 当前项目语义 token/theme/style → 页面落点”；动效轨必须落实知识库命中的高级技术、至少两处区块触发、桌面/移动参数以及 reduced-motion；媒体图标轨必须落实真实图片/视频/GIF/头像 URL、加载失败态和“业务对象/动作/状态 → 具体图标”。已有网站保留框架、组件库、主题、样式入口和构建系统，不新增平行组件体系；${defaultStack ? "本轮是无栈场景，默认用 React + Tailwind CSS + shadcn/ui，并按 Tailwind v4 CSS-first 实现。" : "先读取工程文件确认真实栈，Michael Design 只迁移设计事实，不负责改写技术栈。"}按命中的布局规则决定卡片数量、跨列和移动端断点。先在计划中逐轨写明采用与弃用项，再实现；浏览器验收前源码门禁会逐项检查，不接受只在总结里承诺。
+执行要求：三轨是同时成立的采用契约，不允许只选第一轨的浅色、圆角和卡片后忽略动效/媒体轨。结构配色轨必须逐项写成“来源 section → 当前项目组件 primitive/variant/API → 当前项目语义 token/theme/style → 页面落点”；动效轨必须落实知识库命中的高级技术、至少两处区块触发、桌面/移动参数以及 reduced-motion；媒体图标轨必须落实真实图片/视频/GIF/头像 URL、加载失败态和“业务对象/动作/状态 → 具体图标”。已有网站保留框架、组件库、主题、样式入口和构建系统，不新增平行组件体系；${defaultStack ? "本轮是无栈场景，默认用 React + Tailwind CSS + shadcn/ui，并按 Tailwind v4 CSS-first 实现。" : "先读取工程文件确认真实栈，Michael Design 只迁移设计事实，不负责改写技术栈。"}按命中的布局规则决定卡片数量、跨列和移动端断点。先在计划中逐轨写明采用与弃用项，再实现；收尾只核对执行事实（浏览器验收记账、落盘台账），设计采用项写在计划里是给你自己对照用的。
 
 原始命中摘录（仅以下内容可当作知识库事实）：
 ${excerpts || "本轮 michael-design 没有返回命中；不要编造知识库规则，改为明确记录不可用原因并基于用户约束继续。"}`;
@@ -41881,10 +41881,20 @@ function _browserActionPassed(call, result) {
     ["click", "tap", "type", "fill", "input", "press", "key"].includes(String(step?.op || step?.action || "").toLowerCase().trim()));
 }
 function _requiredUiViewportKind(call) {
+  // 档位判据，不是两个精确像素点。
+  //
+  // 原来要求恰好 1440x900 和 390x844 才记学分。项目真实断点是 1280 或 1024 时，模型必须去量
+  // 一个这个产品根本不存在的宽度；用 1512（MacBook 默认）或 393（Pixel）也一样零学分。
+  // 它学到的于是不是「按项目形状验证」，而是「先补两次仪式性调用换学分」——做假动作，
+  // 真该验的断点没人验。高度更是纯陷阱：一次真实的桌面验收不该因为窗口高 1000 就不算数。
+  //
+  // 要求的证据一点没少：仍然必须是真实发生过的 action:"viewport" 调用，且 mobile 旗标要对得上
+  // （手机档不带 mobile:true 不算），后面照旧要 check healthy + 真实交互 + assert 命中。
   if (call?.type !== "browser" || call.action !== "viewport") return "";
-  const width = Number(call.width), height = Number(call.height);
-  if (width === 1440 && height === 900 && !call.mobile) return "desktop";
-  if (width === 390 && height === 844 && !!call.mobile) return "mobile";
+  const width = Number(call.width);
+  if (!Number.isFinite(width)) return "";
+  if (!!call.mobile && width <= 500) return "mobile";
+  if (!call.mobile && width >= 1200) return "desktop";
   return "";
 }
 
@@ -45846,7 +45856,7 @@ function _uiDesignCraftBlock(text, profile = null, opts = {}) {
     : "\n- 已有项目实现：先读取 package/lock/build config、组件目录、主题和样式入口，沿用现有框架、组件库、token/theme/style 与构建系统；不得新增平行组件体系或为了 Michael Design 迁移框架。";
   return `\n\n🎨 **前端设计工艺要求（UI/网页任务必须执行，不要复述）**
 - 所有网站/UI 项目都必须先使用本轮 IDE 已预取的 michael-design 三轨证据：信息架构/视觉样式/组件与状态事实，动效/响应式，媒体/头像/语义图标；仅覆盖有缺口时追加检索。每项实施计划必须写成“来源 section → 当前项目组件 primitive/variant/API → 当前项目 semantic token/theme/style → 页面落点”，不能只说“参考知识库”。
-- 企业大厂标准（硬性）：每个网站按上市公司官网水准交付，对照知识库 enterprise-standard 命中逐项自检：完整设计体系（间距/字阶/token/状态/variant）、企业级信息架构（8-12 个差异化区块+完整 footer）、信任信号（真实头像/具体数字/logo 墙/法律层）和交付前 polish 清单；配色必须采用知识库命中蓝本或 Curated Palette Library 的成套色值并记录来源，禁止凭模型印象编色；个人小作品感（四段式页面、单行 footer、首字母头像、散样式按钮）= 不合格。
+- 企业大厂标准：整站交付按上市公司官网水准，对照知识库 enterprise-standard 命中逐项自检：完整设计体系（间距/字阶/token/状态/variant）、信任信号（真实头像/具体数字/logo 墙/法律层）和交付前 polish 清单；企业级信息架构指的是**每个区块都在真实用户旅程里承担一步**——说不清它回答访客哪个问题的区块直接删，页脚层级与站点规模相称，**区块数量本身不是合格标准**（单一用途的工具站四个扎实区块可以合格，官网灌到十二个空区块仍然不合格）；配色必须采用知识库命中蓝本或 Curated Palette Library 的成套色值并记录来源，禁止凭模型印象编色；个人小作品感（每块同宽卡片墙、首字母头像、散样式按钮、没有状态的控件）= 不合格。
 ${referenceRule}
 ${transactionalRule}
 ${stackRule}
@@ -45866,7 +45876,7 @@ ${greenfieldRule}
 - 大厂风格直出：用户点名"腾讯/谷歌/蚂蚁/字节那种风格"→ 直接用该公司官方开源设计体系，绝不用 shadcn 手仿——谷歌风=Material 3（MUI 或 @material/web + M3 color roles/五级 elevation/display→label 字阶），腾讯风=TDesign（tdesign-react/tdesign-vue-next + 官方令牌 --td-brand-color:#0052D9），蚂蚁=antd v5 theme token，字节=Arco；官方文档查当前用法，同一个站只用一家体系不混搭。
 - 参考纪律（禁靠记忆手糊）：商用级页面动手前先学真实标杆——**首选 learn_design(url) 真正学一套**（抓 styles.refero.design 的 style 页内嵌的完整设计系统：色板 hex+每色真实用途/频率、字阶/字体、dos/donts 纪律，落盘 reference/ 文档+tokens.css，实现时逐条对照：dos 照做、donts 不犯；没链接就 web_search "site:styles.refero.design 品类" 挑了再学）；或 design_research / browser 打开同品类真站抓 design/nodes 看信息架构/密度/节奏；拿不准的 API/组件用法查当前文档，不凭记忆写过时写法。
 - 实现纪律：先复用项目现有组件、样式约定和构建脚本；无网站且无可沿用/用户指定栈时优先 web_scaffold 创建 React + Tailwind CSS + shadcn/ui；大段 UI 按现有模块边界或 section/component/data 拆分，样式围绕语义 token 和组件角色，不堆无法维护的魔法数。
-- 视觉验收：构建通过不等于好看。启动真实 dev server 后只做一次完整矩阵：browser fresh 打开真实 URL，然后**每个视口各走一遍闭环**：1440x900 与 390x844 各走一遍闭环——viewport(1440,900) → check → 关键交互 → assert，再 viewport(390,844,mobile:true) → check → 交互 → assert。**check 不会切视口**，只有 action:"viewport" 会；验收记账也只认这两次精确的 viewport 调用，给 check 传宽高/mobile 既不生效也不记账；只在最终视觉验收时各截一张检查层级、内容密度、媒体加载、动画触发、横向溢出和文字截断。修补后只复验改动点一次，证据够了立即停止，不重复 fresh/navigate/screenshot。`;
+- 视觉验收：构建通过不等于好看。启动真实 dev server 后只做一次完整矩阵：browser fresh 打开真实 URL，然后**桌面档与手机档各走一遍闭环**：viewport(宽 ≥1200、不带 mobile，优先用项目自己的断点如 1280) → check → 关键交互 → assert，再 viewport(宽 ≤500 且 mobile:true，如 390 或 360) → check → 交互 → assert。**check 不会切视口**，只有 action:"viewport" 会；验收记账认的是真实执行过的 viewport 调用宽度落在哪一档，给 check 传宽高/mobile 既不生效也不记账；只在最终视觉验收时各截一张检查层级、内容密度、媒体加载、动画触发、横向溢出和文字截断。修补后只复验改动点一次，证据够了立即停止，不重复 fresh/navigate/screenshot。`;
 }
 
 // ============================================================================
@@ -49749,6 +49759,9 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
             && _evidenceCertifies(_settledVerifyEvidence, _implOps)) {
           didVerify = true; verificationPassed = true; _verifiedAtImplOps = _implOps;
           run._diagnosticBlock = "";
+          // 跑过验证 → churn 计数清零。判据是这里已经结算过的那条执行证据
+          // （_evidenceCertifies），不是模型说自己验过了。
+          _editCounts.clear(); _churnNudged.clear();
         }
         if (t === "browser" && _ok) {
           if (it.rawResult?.browserUrl && !it.rawResult.runOwnedDevUrl) {
@@ -49770,6 +49783,8 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
           }
           if (_browserHealthPassed(it.call, it.rawResult)) {
             if (_browserViewportKind) _uiPassedViewports.add(_browserViewportKind);
+            // 在浏览器里真的看过了 → churn 计数清零（见上面那段说明：拦的是盲改，不是迭代）。
+            _editCounts.clear(); _churnNudged.clear();
           }
           if (_browserActionPassed(it.call, it.rawResult)) {
             _uiActionPassed = true;
@@ -50025,14 +50040,22 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
         }
       }
 
-      // Churn breaker: after several successful mutations to the same file, ask
-      // the model to consolidate the remaining changes. Do not force another read
-      // when the current version is still available in context.
+      // Churn breaker：拦的是**盲改**，不是「改得多」。
+      //
+      // 原来数的是「本 run 改过同一个文件几次」，第 5 次落盘就推一条「先停下、合并成一次
+      // write_file、不要继续零散追加」。这在修 bug 时是对的，在打磨界面时正好相反——
+      // 「改一版 → 看一眼 → 再调间距层级 → 再看」就是界面变好看的唯一方式，同一个
+      // globals.css 改七八次是干得对的样子，而这条规矩把那个反馈回路判成了违规。
+      //
+      // 计数因此改成「自上次对它的真实观察以来盲改了几次」：跑过验证、或在浏览器里
+      // check/assert/截图看过，就清零。清零只认**已结算的执行事实**（下面那两个清零点读的
+      // 都是 _toolExecutionSucceeded / _browserHealthPassed 这类判据），绝不因为模型正文里
+      // 说了「我看过了」就清零。阈值仍是 5：改→看→改可以无限迭代，改→改→改→改→改照旧拦。
       if (_live()) {
         for (const [p, n] of _editCounts) {
           if (n >= 5 && !_churnNudged.has(p)) {
             _churnNudged.add(p);
-            _pushNudge("churn:" + p, `你已经成功修改 **${p}** ${n} 次。先停一下并整合剩余工作：直接使用上下文里的当前版本；只有精确源码已经被上下文压缩掉时才重新 read_file。把还需要的修改合并成一个 multi_edit 或一次完整 write_file，然后运行真实诊断/测试确认，不要继续零散追加。`);
+            _pushNudge("churn:" + p, `你已经连着改了 **${p}** ${n} 次，中间一次都没跑验证、也没在浏览器里看过。先看一眼当前状态再决定下一刀怎么下——要么跑一次这个项目的验证命令，要么起 dev server 在浏览器里看实际效果；确认之后再改。`);
           }
         }
       }
@@ -58033,7 +58056,7 @@ return { type: call.type, path: call.query || "", content: `[失败] ${call.type
         // 验一遍，而它以为自己已经验过两个视口了。说出来，它下一步就会去调 viewport。
         if ([call.width, call.height, call.mobile].some((v) => v !== undefined && v !== null && v !== "")) {
           content += `\n⚠️ check 不接受 width/height/mobile，也不切换视口：这一次是在**当前**视口上跑的。`
-            + `要换视口用 browser action:"viewport"（1440x900 桌面 / 390x844 且 mobile:true 移动），`
+            + `要换视口用 browser action:"viewport"（桌面档宽 ≥1200 不带 mobile / 手机档宽 ≤500 且 mobile:true），`
             + `验收记账只认那两次调用；顺序是 viewport → check → 交互 → assert，两个视口各走一遍。`;
         }
         content += `\n**页面体检（一次性融合：控制台错误 + 网络/接口失败 + 关键视觉缺陷 + 可交互节点数）**。\`healthy\`=总体是否正常、\`verdict\`=结论；\`consoleErrors\`=JS 报错(按钮没反应/页面坏了的头号原因，截图根本看不出来)、\`networkFailures\`/\`apiFailures\`=加载或接口失败、\`visualDefects\`=坏图等。**有问题先修这些再继续**；要细节按 \`drillDown\` 用 network/inspect/nodes/assert 深挖：\n${state.result}`;

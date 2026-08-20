@@ -12,10 +12,13 @@
   --font-mono: 'JetBrains Mono', ui-monospace, monospace;
   --text-xs: .75rem; --text-sm: .875rem; --text-base: 1rem;
   --text-lg: 1.125rem; --text-xl: 1.25rem; --text-2xl: 1.5rem;
-  --leading-tight: 1.15; --leading-normal: 1.55;
-  /* 间距：4px 网格，只用这些值，禁止临时编 px */
+  --text-3xl: 1.875rem; --text-4xl: 2.25rem; --text-5xl: 3rem; --text-6xl: 3.75rem; --text-7xl: 4.5rem;
+  --leading-tight: 1.05; --leading-snug: 1.2; --leading-normal: 1.55;
+  --tracking-display: -.03em; --tracking-heading: -.015em; --tracking-body: 0; --tracking-eyebrow: .16em;
+  /* 间距：4px 网格。优先用这些阶，光学对齐等确有理由的偏离说明一句即可，别整页编 px */
   --sp-1: 4px; --sp-2: 8px; --sp-3: 12px; --sp-4: 16px;
   --sp-6: 24px; --sp-8: 32px; --sp-12: 48px; --sp-16: 64px;
+  --sp-24: 96px; --sp-32: 128px; --sp-40: 160px;
   --radius-sm: 4px; --radius-md: 8px; --radius-lg: 12px; --radius-full: 9999px;
   --shadow-sm: 0 1px 2px rgb(0 0 0 / .05);
   --shadow-md: 0 4px 6px -1px rgb(0 0 0 / .07), 0 2px 4px -2px rgb(0 0 0 / .05);
@@ -23,12 +26,13 @@
 }
 ```
 
+**层级靠跨度**：同屏最大字号与正文差 2.5 倍起，hero 可到 4 倍，中间档不必用满；标题配 display 字体+负字距+紧行高。
+**留白三档嵌套**：区块间 96/128/160（移动端 64/96）＞ 组间 32/48 ＞ 元素间 8/12/16。**整页同一个 24px 是 AI 味最明显的来源。**
+
 ## 配色：近黑白是默认；要上色，只能从知识库取
 
-**默认就是近黑白 + 一个利落的主色 CTA。** 页面 ≥90% 面积是中性色（白/浅灰/近黑文字），
-强调色只出现在主 CTA、链接、选中态、焦点环，以及每屏至多一处重点标记。section 底色只在
-白与最浅中性之间交替，**绝不整段彩色底**。拿不准就少用色——近黑白配一个利落主色的页面，
-永远比满页彩色高级。
+**默认就是近黑白 + 一个利落的主色 CTA。** 中性打底是**默认值，不是配额**（面积怎么用见 core 层的配色条）。
+**说不出依据的彩色底才是缺陷，颜色本身不是。**
 
 要偏离近黑白，配色**必须来自知识库命中**，不许自己编，也不许照搬任何品牌的固定色：
 

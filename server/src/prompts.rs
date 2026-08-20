@@ -951,7 +951,7 @@ fn design_color_direction_block(direction: DesignColorDirection) -> String {
              Evidence source: {} — quoted verbatim below, this is the operator's own palette library:\n\
              {}\n\
              Preferred search term within this category: `{}`. Type character: {}.\n\
-             Snap any bare hex above to its nearest Tailwind family+step before use, then define semantic tokens (background/foreground/primary/accent/muted) from them; feature components consume only tokens. The root canvas, cards, CTAs, links, active, focus ring and icon tint all derive from these roles; no hue other than a genuine status colour may be introduced. Keep at least 90% of the page neutral — near-monochrome with one crisp CTA colour beats a colourful page every time. Do not switch to violet/indigo, neon-on-black or full-page gradients on your own because something should feel \"premium\"; a cross-category hit may lend layout and motion only, never its palette.",
+             Snap any bare hex above to its nearest Tailwind family+step before use, then define semantic tokens (background/foreground/primary/accent/muted) from them; feature components consume only tokens. The root canvas, cards, CTAs, links, active, focus ring and icon tint all derive from these roles; no hue other than a genuine status colour may be introduced. Default to a mostly neutral page — near-monochrome with one crisp CTA colour — unless the palette quoted above, the user's stated request, or the category itself calls for large colour fields; when you do use them, say which of the three it came from and hold AA contrast. Do not switch to violet/indigo, neon-on-black or full-page gradients on your own because something should feel \"premium\"; a cross-category hit may lend layout and motion only, never its palette.",
             direction.category, direction.id, direction.source, line,
             direction.blueprint_query, direction.typography,
         );
@@ -6039,13 +6039,14 @@ mod tests {
         assert!(components.contains("Lucide"));
         assert!(components.contains("semantic classes"));
         // 钉的是「两个视口都要求验」这件事，不是某一种写法。
-        // 提示词 2026-08-19 从 `1440x900` 改成了 `browser viewport(width:1440, height:900)`
-        // （commit 8bfa29d），断言还在找旧字面量，于是这条测试红了——而它要守的属性一点没变。
-        // 判据换成两个视口的数字都在，写法怎么演进都不影响。
-        for wanted in ["1440", "900", "390", "844"] {
+        // 判据经历过两次演进：先是 `1440x900` 改成 `browser viewport(width:1440, height:900)`，
+        // 断言还找旧字面量所以红了；这次进一步从两个**精确像素点**改成**区间**——项目真实断点
+        // 是 1280 或 1024 时，逼模型去量一个这个产品根本不存在的宽度，学到的只会是"先补两次
+        // 仪式性调用换学分"。判据于是换成区间与档位本身，具体数字怎么演进都不影响。
+        for wanted in ["1200 or wider", "500 or narrower", "mobile:true"] {
             assert!(
                 verification.contains(wanted),
-                "验收提示词里少了视口尺寸 {wanted}——桌面/手机双视口的验收矩阵就凑不齐了"
+                "验收提示词里少了视口档位判据 {wanted}——桌面/手机双档的验收矩阵就凑不齐了"
             );
         }
     }
@@ -6676,7 +6677,9 @@ mod tests {
         assert!(system.contains("Count the cards before choosing the grid"));
         assert!(system.contains("business concept \u{2192} object/action/state \u{2192} icon name"));
         assert!(system.contains("the way a real product lead would"));
-        assert!(system.contains("real-browser hard budget"));
+        // 标题从「hard budget」改成「matrix and stop conditions」：预算仍在（按改动大小走），
+        // 但"硬上限"这个框架把品质迭代也一起封死了，而那正是界面变好看的方式。
+        assert!(system.contains("real-browser matrix and stop conditions"));
         assert!(system.contains("--- michael-design blueprint"));
         assert!(system.contains("421 pieces of production-grade UI knowledge"));
         assert!(system.contains("full page / whole-site packet"));
@@ -7165,8 +7168,19 @@ mod tests {
         // 小改动这一档同样需要配色依据：「把首页配色和卡片改好看点」走的正是这条路。
         // 12_300：2026-08-17 晚实测 ~12_021 token。同上，跟着 answer_quality 的新增走
         //（那一节是常驻层，所有档位一起抬）。
+        //
+        // 13_000（2026-08-20）：这一次抬闸买到的是四件模型**做不到而不是不想做**的事，
+        // 不是又一段劝导文字：
+        //   · 字阶原来最大只到 24px、且全局禁负字距 —— 大标题在物理上做不出来，
+        //     补到 --text-7xl 并按字号给出字距梯度；
+        //   · 间距阶最大 64px，而 design_core 自己要求区块 py-24/32（96/128px），
+        //     非 Tailwind 项目照字面执行只能把整页压扁 —— 补到 --sp-40；
+        //   · 「页面 ≥90% 面积中性」是硬配额，路由按品类取来的成套配色只能缩进一个按钮，
+        //     于是每个站长得一样 —— 改成默认值 + 具名例外；
+        //   · 「先数卡片定网格」写成唯一规则，和紧邻那句要求 bento/masonry 直接打架。
+        // 再往上加之前先问：这段是不是模型**已经会、只是没做**？是的话不该进常驻层。
         assert!(
-            focused_tokens < 12_300,
+            focused_tokens < 13_000,
             "focused UI prompt should remain compact: ~{focused_tokens} tokens ({} bytes)",
             focused_system.len()
         );
@@ -7223,8 +7237,24 @@ mod tests {
         // 常驻层，所有档位一起涨，约 +450 token。
         // 债照旧记着，而且更紧了：最重的这一档现在 66KB，每一轮都要发——用户当下最痛的
         // 就是慢。下一次动这里之前，先把 scaffold 那份配方挪进知识库按需检索。
+        //
+        // 69_000（2026-08-20）：第三次抬。上面那句「先挪配方」这次**试过了，走不通**——
+        // 把「默认栈」那段从 design_tokens 挪去 design_scaffold，会被
+        // `安装命令在普通_ui_任务里就能拿到而不只在greenfield` 正面打红，而那条测试守的是
+        // 一次实测事故：在已有文件的目录里起新站会被判成 existing，scaffold 层根本不加载，
+        // 模型只拿到命令拿不到前置条件，`shadcn init` 直接报 Could not find valid path aliases
+        // 退出，然后回去手写组件。所以这笔债真正要还的是**greenfield 判定不可靠**这件事，
+        // 不是搬一段文字；在那之前挪它只会换一个更坏的失败。
+        //
+        // 这次多出来的约 1.6KB 买的是四件模型「物理上做不到」而非「不想做」的事：
+        // 字阶原来封顶 24px 且全局禁负字距（大标题做不出来）、间距阶封顶 64px 而 core 自己
+        // 要求区块 96/128px（非 Tailwind 项目只能把整页压扁）、「≥90% 面积中性」把按品类
+        // 取来的成套配色锁死在一个按钮里（于是每个站长得一样）、「先数卡片定网格」与紧邻那句
+        // 要求 bento/masonry 直接打架。同时删掉了配色规则在三处的逐字复述。
+        //
+        // 下一次再撞这条线，别再抬了——先修 greenfield 判定，再把配方挪走。
         assert!(
-            build_system.len() < 67_000,
+            build_system.len() < 69_000,
             "full UI prompt should remain bounded: {} bytes",
             build_system.len()
         );
@@ -7325,8 +7355,11 @@ mod tests {
             "Decide the data strategy before coding",
             "GSAP + ScrollTrigger",
             "4.5:1",
-            "stays within 15 browser calls",
+            "Budget the matrix by what you are changing",
             "two consecutive observations show no new errors",
+            // 品质迭代是正当理由。原来这里是「只修叫得出名字的问题」+ 一次复看上限，
+            // 把"再看一眼调一版"训成了违规——而那正是界面变好看的唯一方式。
+            "Not good enough to ship yet",
         ] {
             assert!(
                 runtime.contains(marker),
@@ -7393,7 +7426,17 @@ mod design_palette_and_shadcn_tests {
             text.contains("默认就是近黑白"),
             "必须明确写出近黑白是默认，而不是众多选择里的一个"
         );
-        assert!(text.contains("90%"), "必须给出中性色占比这个可执行判据");
+        // 判据从「面积比例」换成「依据」：90% 这个数字不可核对，而且它把默认值写成了硬配额——
+        // 路由已经按品类把成套配色取来了，这条又禁止它落到面积上，取来的配色只能缩进一个按钮，
+        // 于是每个站长得一样。换成可核对的一件事：这块颜色的依据是哪一条。
+        assert!(
+            text.contains("说不出依据的彩色底才是缺陷"),
+            "必须给出「大面积上色要有具名依据」这个可核对判据"
+        );
+        assert!(
+            text.contains("默认值，不是配额"),
+            "中性打底必须写成默认值；写成配额会把命中的配色挡在面积之外"
+        );
         // 其余配色只能来自知识库
         assert!(text.contains("michael-design"), "偏离近黑白时必须指向知识库检索");
         assert!(
