@@ -29268,6 +29268,41 @@ test("历次要求只补对话里已经没有的那几条", () => {
   assert.match(SRC, /const _demandLedgerBlock = _fadedDemands\.length\s*\n?\s*\?/);
 });
 
+
+// ---- 点开头的相对路径不许把点吃掉 ----
+test("以点开头的目录/文件，相对路径要解析到它自己", () => {
+  // 用户实拍：侧栏里 .mrdayone 明明在、当前打开的文件就在它下面，list_dir 却报
+  // 「目录不存在或无法读取」。根因是一个正则写松了一位：/^\.?\/?/ 里点和斜杠**都可选**，
+  // 于是 ".mrdayone" 匹配到「只有点、没有斜杠」那一支，点被剥掉变成 "mrdayone"。
+  // 影响面是**所有隐藏文件**：.env / .github / .vscode / .gitignore / .mcp.local.json 全读不到。
+  const cands = load("_relCandidates", {
+    _allRoots: () => ["/R"],
+    _remote: { active: false, platform: "" },
+    openFiles: new Map(),
+    projectModels: new Map(),
+    _normalizeFsPath: load("_normalizeFsPath", { _toPosix: load("_toPosix") }),
+    _coherentFilePath: load("_coherentFilePath", {
+      _toPosix: load("_toPosix"),
+      _normalizeFsPath: load("_normalizeFsPath", { _toPosix: load("_toPosix") }),
+      _pathIdentity: (p) => String(p),
+      openFiles: new Map(),
+      projectModels: new Map(),
+    }),
+    _pathIdentity: (p) => String(p),
+  });
+  assert.deepEqual(cands(".mrdayone", "/R"), ["/R/.mrdayone"], "点被吃掉了");
+  assert.deepEqual(cands(".env", "/R"), ["/R/.env"]);
+  assert.deepEqual(cands(".github/workflows", "/R"), ["/R/.github/workflows"]);
+  // "./" 前缀照旧要剥——那才是这行代码本来的用途。
+  assert.deepEqual(cands("./src", "/R"), ["/R/src"]);
+  assert.deepEqual(cands("./.mrdayone", "/R"), ["/R/.mrdayone"]);
+  // 路径中段的点目录也不能动。
+  assert.deepEqual(cands("a/.b", "/R"), ["/R/a/.b"]);
+  // 判据本身：不许再写成两边都可选。
+  const fn = extractFn("_relCandidates");
+  assert.doesNotMatch(fn, /replace\(\/\^\\\.\?\\\/\?\//, "点和斜杠都可选会把隐藏路径的点吃掉");
+});
+
 // ---- 写入落空要有用户侧的出口 ----
 test("尝试写了没落盘时，结局里必须留下 writes_failed", () => {
   const loop = extractFn("_runAgenticLoop");
