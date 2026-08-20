@@ -276,9 +276,24 @@ test("一轮都没跑的时候，那块执行状态整块都不许发", () => {
   assert.ok(i > 0, "执行状态块的活动判据不见了");
   const block = CODE.slice(Math.max(0, i - 200), i + 2600);
 
+  // 判据里每一项都必须是「真的发生过某个动作」。崩溃恢复事实（run._resumeFact）
+  // 算数：它每个会话最多出现一次，且它陈述的正是上一轮**真的落了盘**的文件——
+  // 续跑的第一次决策此刻手里是张白纸，最容易把已经改好的文件从头再写一遍。
+  // 被点名禁止的是 _runtimeStateBlock 那类**对任何真实项目都非空**的东西：
+  // 放进来等于每轮必发，把用户的问题从最后一位挤走。
+  const _actExpr = block.match(/const _hasRunActivity = [^;]+;/)?.[0] || "";
+  assert.ok(_actExpr, "执行状态块的活动判据不见了");
+  assert.doesNotMatch(
+    _actExpr,
+    /_runtimeStateBlock/,
+    "运行时状态对任何真实项目都非空，放进活动判据等于每轮必发",
+  );
+  for (const term of ["_mutatedFiles.size", "_readFiles.size", "_evidenceBlock", "_latestDiagBlock", "_planLine"]) {
+    assert.ok(_actExpr.includes(term), `活动判据里少了 ${term}`);
+  }
   assert.match(
     block,
-    /const _hasRunActivity = !!\(_mutatedFiles\.size \|\| _readFiles\.size \|\| _evidenceBlock \|\| _latestDiagBlock \|\| _planLine\);\s*\n\s*if \(_hasRunActivity\) \{/,
+    /if \(_hasRunActivity\) \{/,
     "整块必须只在**真有动作**时才发。曾经的写法是 `if (_hasRunActivity || _runtimeStateBlock)`——"
     + "而运行时状态对任何真实项目都非空，等于每轮必发，把用户的问题从最后一位挤走",
   );

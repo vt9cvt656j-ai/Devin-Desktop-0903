@@ -3042,10 +3042,17 @@ const _DOUBLE_SYMBOLS = [
 ];
 
 
-function _fixDoublePunctuation(model) {
+function _fixDoublePunctuation(model, changedLines) {
+  // 同批四个改写器里，只有这一个原来扫**整个文件**。后果不是性能，是改坏别人的代码：
+  // `,,` 在 JS 里是合法的稀疏数组（`[1,,3]` 长度 3，中间是个洞），被改成 `[1,3]`
+  // 长度就变成 2 了。而这个函数扫全文，所以用户只是在文件某处敲了个空格，
+  // 几百行外一个他从没碰过的稀疏数组就被悄悄改掉，1.2 秒后自动保存直接落盘。
+  // 收到改动行范围内，和 _fixExtraSpaces / _fixPythonMissingColon 一致：
+  // 「刚敲出来的重复标点」照修，别人写好的代码不碰。
   const edits = [];
   const total = model.getLineCount();
-  for (let ln = 1; ln <= total; ln++) {
+  for (const ln of changedLines) {
+    if (ln < 1 || ln > total) continue;
     const line = model.getLineContent(ln);
     const trimmed = line.trimStart();
     if (trimmed.startsWith("//") || trimmed.startsWith("#") || trimmed.startsWith("*")) continue;
@@ -3515,10 +3522,25 @@ function _fixExtraSpaces(model, changedLines) {
   return edits;
 }
 
-async function _fixFromLspDiagnostics(editor) {
+async function _fixFromLspDiagnostics(editor, changedLines) {
+  // 这条和 _fixKeywordTypos 是同一类东西：改的是用户**已经写下**的标识符，
+  // 而且 clangd 的 "did you mean" 在缺 compile_commands.json 时给的只是作用域里
+  // 最相似的那个名字，不是编译器背书的正确答案。_fixKeywordTypos 因此被判定
+  // 「必须由用户主动打开」并默认关，这一条却默认开、还扫全文。
+  //
+  // 更糟的是它有一条**不需要用户敲任何字**的触发路径（诊断一到就排定时器）：
+  // 打开一个还没生成 compile_commands.json 的 C 工程文件，clangd 首轮诊断满屏
+  // "did you mean"，用户一个键都没按，磁盘上的源码就被几十处猜测重命名改写，
+  // 然后自动保存直接落盘——没有提示、没有 diff、没有确认。
+  if (!effectivePrefs().autoFixTypos) return [];
   const model = editor.getModel();
   if (!model) return [];
-  const markers = monaco.editor.getModelMarkers({ resource: model.uri });
+  // 只看用户刚动过的那几行，和同批其余三个改写器一致。没动过任何一行就一个字都不改。
+  const scope = changedLines instanceof Set ? changedLines : new Set(changedLines || []);
+  if (scope.size === 0) return [];
+  const markers = monaco.editor
+    .getModelMarkers({ resource: model.uri })
+    .filter((m) => scope.has(m.startLineNumber));
   if (markers.length === 0) return [];
   const actionableMarkers = markers.filter((m) => !_isGeneratedDependencyDiagnostic(m));
   if (actionableMarkers.length === 0) return [];
@@ -3552,16 +3574,16 @@ async function _runAutoCorrections(editor, changedLines) {
   const lang = model.getLanguageId();
   if (lang === "markdown" || lang === "plaintext") return;
 
-  // _fixDoublePunctuation scans the ENTIRE document (no changed-line scope), so on a large file it's
-  // an O(lines) main-thread scan on every typing pause — skip it past 4000 lines (the other fixes are
-  // already changed-line scoped and cheap). Prevents the "编辑大文件发烫" burn.
-  const doubleFixes = model.getLineCount() <= 4000 ? _fixDoublePunctuation(model) : [];
+  // 收到改动行之后，它和别的改写器一样只看用户刚动过的几行，所以那道
+  // 「4000 行以上跳过」的闸不再需要了——那道闸挡的是全文扫描带来的主线程开销，
+  // 而全文扫描本身才是问题（它会改到用户没碰过的地方）。
+  const doubleFixes = _fixDoublePunctuation(model, changedLines);
   // 标识符改写默认关：它会把 `elf` 改成 `elif`、`wit` 改成 `with`，分不出「拼错的关键字」
   // 和「我就是要叫这个名字」。改的是用户已经写下的源码且无提示，必须由用户主动打开。
   const typoFixes = effectivePrefs().autoFixTypos ? _fixKeywordTypos(model, changedLines) : [];
   const colonFixes = _fixPythonMissingColon(model, changedLines);
   const spaceFixes = _fixExtraSpaces(model, changedLines);
-  const lspFixes = await _fixFromLspDiagnostics(editor);
+  const lspFixes = await _fixFromLspDiagnostics(editor, changedLines);
 
   const allEdits = [...doubleFixes, ...typoFixes, ...colonFixes, ...spaceFixes, ...lspFixes];
   if (allEdits.length === 0) return;
@@ -3587,11 +3609,17 @@ function _autoFixSuppressed(model) {
   } catch {}
   return false;
 }
+// 诊断驱动的修正不是由输入事件触发的（诊断自己回来就会触发），所以它没有
+// 「用户改了哪几行」这个信息。在这里记一份，让那条路也只能碰用户真动过的行。
+let _recentUserEditLines = new Set();
+monacoEditor.onDidChangeModel(() => { _recentUserEditLines = new Set(); });
+
 monacoEditor.onDidChangeModelContent((e) => {
   if (_imeComposing || _punctFixing) return;
   if (_autoFixSuppressed(monacoEditor.getModel())) return;
   if (_autoFixTimer) clearTimeout(_autoFixTimer);
   const lines = e.changes.map((c) => c.range.startLineNumber);
+  for (const ln of lines) _recentUserEditLines.add(ln);
   _autoFixTimer = setTimeout(() => _runAutoCorrections(monacoEditor, lines), _AUTO_FIX_DEBOUNCE);
 });
 
@@ -3604,7 +3632,12 @@ monaco.editor.onDidChangeMarkers((uris) => {
   if (!uris.some((u) => u.toString() === modelUri)) return;
   if (_lspFixTimer) clearTimeout(_lspFixTimer);
   _lspFixTimer = setTimeout(async () => {
-    const lspFixes = await _fixFromLspDiagnostics(monacoEditor);
+    // 排程时记下的是 model A，2 秒里用户可能已经切到 B。而下面算替换范围时
+    // 取的是**当前**的 model——于是按 B 算出来的行列被打进 A，改坏另一个文件。
+    // 两道都要：一道挡切标签页，一道挡 await 期间切走。
+    if (monacoEditor.getModel() !== model) return;
+    const lspFixes = await _fixFromLspDiagnostics(monacoEditor, _recentUserEditLines);
+    if (monacoEditor.getModel() !== model) return;
     if (lspFixes.length > 0) {
       _punctFixing = true;
       model.pushEditOperations([], lspFixes, () => null);
@@ -17124,7 +17157,8 @@ function _scrubResidue(root) {
     // .run-revert-btn = 已移除的「撤销本轮全部改动」按钮；.agent-files-bar/.agent-files-list =
     // 已移除的「N Files」汇总条：旧会话快照里已经序列化了它们，
     // 恢复后是没有监听器的死 UI，这里一并清掉（保存+恢复两路都走）。
-    // .run-revert-btn 现在是**活的**（轮末的「本轮改了 N 个文件 · 全部撤销」），
+    // .run-revert-btn 现在是**死的**：它长在 _appendDeliveryFactsBar 上，而那个函数
+    //   自从交付事实页脚被去掉之后就零调用点了。checkpoint 数据还在，出口没有。
     // 但恢复出来的那份没有监听器、快照里也没有 run.checkpoint——按钮点了什么都不会
     // 发生。所以仍然在保存/恢复时清掉：它是本轮的东西，不该跨重启假装还能用。
     root.querySelectorAll(".md-caret, .md-stream-tail, .next-steps, .run-revert-btn, .agent-files-bar, .agent-files-list").forEach((e) => e.remove());
@@ -19892,7 +19926,7 @@ const _GIT_MUTATING_OPS = new Set(["clone", "commit", "push", "pull", "stash", "
 // 「不支持的动作」，还附一份同样漏掉它的清单，于是认定读不到指针位置。
 const _COMPUTER_METHODS = [
   "mouse.click", "mouse.double_click", "mouse.move", "mouse.position", "mouse.drag", "mouse.scroll",
-  "keyboard.type", "keyboard.press", "keyboard.combo", "keyboard.paste",
+  "keyboard.type", "keyboard.press", "keyboard.combo", "keyboard.down", "keyboard.up", "keyboard.paste",
   // screen.capture：**真的拍屏幕像素**。在它之前整套系统没有任何一条通路能看到桌面
   // ——screenshot 工具只会用无头浏览器渲染一个 http(s) 网址，于是模型对任何原生应用、
   // 游戏、Canvas、视频、PDF 都是全盲的：动完手没法看一眼确认自己做成没有。
@@ -32940,7 +32974,7 @@ function _buildAgentToolSchemas(includeWrite, mcpTools = []) {
     { type: "function", function: { name: "git_status", description: "Show the git repository status: current branch, and the staged / unstaged / untracked file lists. Use it to learn which files were touched, or before committing. 【vs alternatives】For the actual line-by-line difference use git_diff; for commit history use git_log.", parameters: { type: "object", properties: {} } } },
     { type: "function", function: { name: "git_diff", description: "Show the git diff of the changes (unified diff text). By default it shows unstaged working-tree changes against HEAD; staged=true shows the staged (--cached) ones; path limits it to a single file. Note: it does not show untracked new files — use git_status for those.", parameters: { type: "object", properties: { path: { type: "string", description: "Optional; show the diff for this file only" }, staged: { type: "boolean", description: "true to see the staged changes" } } } } },
       { type: "function", function: { name: "git_show", description: "Look at a PAST commit — either the commit itself (message, per-file stat and the full patch) or what one file looked like at that point. This is the step that turns `git_log` into an actual regression hunt: find the suspect commit with git_log, see what it changed with git_show, then read the file as it was before with git_show(rev, path). 【vs alternatives】git_diff only compares the working tree against HEAD and cannot see history; git_blame gives per-line attribution but not the surrounding change; git_log lists commits but not their contents.", parameters: { type: "object", properties: { rev: { type: "string", description: "The commit: a hash from git_log, or a branch/tag/relative ref — a1b2c3d, main~3, v1.2.0, HEAD^ all work" }, path: { type: "string", description: "Optional; path relative to the repository root. Given, returns that file's FULL contents as of that commit instead of the commit's patch. The path must be the one that existed in that commit — if the file was renamed later, check git_log first." } }, required: ["rev"] } } },
-    { type: "function", function: { name: "git_log", description: "Show recent commit history (short hash, author, time, message, branch/tag). 【When to use】To find what changed recently in a module, locate where a regression was introduced, or get the background of a commit git_blame pointed at. 【vs alternatives】To see who changed a specific line and in which commit, use git_blame; for current uncommitted changes use git_status/git_diff.", parameters: { type: "object", properties: { count: { type: "integer", description: "How many entries to return, default 20" } } } } },
+    { type: "function", function: { name: "git_log", description: "Show recent commit history **on the current branch** (short hash, author, time, message, branch/tag). Commits that live only on other branches do not appear here. 【When to use】To find what changed recently in a module, locate where a regression was introduced, or get the background of a commit git_blame pointed at. 【vs alternatives】To see who changed a specific line and in which commit, use git_blame; for current uncommitted changes use git_status/git_diff.", parameters: { type: "object", properties: { count: { type: "integer", description: "How many entries to return, default 20" } } } } },
     { type: "function", function: { name: "git_blame", description: "Show, for each line of a file, which commit last changed it, by whom, and when (git blame). Very useful for \"why is this line like this / when was it introduced\". 【When to use】When you see odd-looking code, first find when and by whom the line was introduced, then read that commit's message with git_log — do not guess at the reason. 【vs alternatives】For overall history use git_log; for current changes use git_diff.", parameters: { type: "object", properties: { path: { type: "string", description: "File path (relative to the workspace root, or absolute)" } }, required: ["path"] } } },
     { type: "function", function: { name: "git_stash_list", description: "List the entries currently on the git stash stack. 【When to use】When you stashed changes before switching branches and now want them back, or want to see what is stashed.", parameters: { type: "object", properties: {} } } },
     { type: "function", function: { name: "git_conflicts", description: "List the files that currently have unresolved merge conflicts. Use it after a merge, rebase or pull to see which conflicts are still outstanding.", parameters: { type: "object", properties: {} } } },
@@ -33027,8 +33061,8 @@ function _buildAgentToolSchemas(includeWrite, mcpTools = []) {
       { type: "function", function: { name: "run_in_terminal", description: "Run a command in the IDE's **real terminal tab (a true PTY / TTY)** — **you start the user's program yourself; you do not hand them a command to type**. Two kinds belong here: (1) long-running / continuous processes (dev server, watcher, daemon, listener); (2) **interactive or full-screen programs that need a real terminal** — bubbletea/ncurses TUIs, REPLs, vim/top (run_cmd is a pipe with no TTY, so those fail there with /dev/tty errors). The program runs inside this tab and the user watches and interacts with it there directly. **For an interactive or TUI program, starting successfully and rendering its interface IS the delivery** — do not demand log output of yourself to verify it, and **never say \"this cannot run in a non-interactive environment\" and push the command onto the user's own terminal: this IDE terminal is a real terminal**. After starting, confirm it came up with read_logs/read_terminal (for a service, the logs/URL; for a TUI, the first rendered frame); to wait for readiness, poll in the background with background_monitor. You can call it several times in parallel to run several tasks (each in its own terminal tab). 【vs alternatives】One-shot non-interactive commands that terminate (installing dependencies, tests, builds, git) use run_cmd.", parameters: { type: "object", properties: { command: { type: "string", description: "The command to keep running, e.g. npm run dev" }, name: { type: "string", description: "Optional; a short name for this task/terminal" }, purpose: { type: "string", enum: ["explore", "verify", "install", "mutate", "scaffold", "run"], description: "What this command is for: verify = build/test/typecheck/lint (the exit code is the conclusion); run = start the app/service to see its behaviour; mutate/scaffold = will change workspace files; install = installing dependencies; explore = read-only probing. Declare it honestly — verify + exit 0 is recorded as verification evidence." } }, required: ["command"] } } },
       { type: "function", function: { name: "system", description: "**System-level control: jump between applications instantly and drive their menus directly — far faster than screenshotting to find an icon and clicking it (when control feels slow, use this).** It is the fast path for \"move freely between application interfaces\": it calls the system APIs rather than relying on vision. action: **open (open/switch to an app, needs name, e.g. Finder/Safari/Mail — brought to the front instantly, launched if not running)** / **menu (trigger an app's menu item directly, needs a path array such as [\"File\",\"New Window\"] or [\"Format\",\"Font\",\"Bold\"] — almost every feature of an application lives in its menus, and this goes straight there, skipping the whole click-menu-bar → screenshot → find-item → click-again loop; omit app to use the current frontmost one)** / **menu_items (list the real item names at one menu level: path=[] lists the top level File/Edit/…, path=[\"File\"] lists everything under the File menu — when unsure what a menu is called, look it up here first, then call menu)** / **apps (list running apps plus the current frontmost)** / **windows (list all window titles of an app, needs name)** / **focus (switch to an app and raise the window whose title contains title, needs name, title optional)** / **frontmost (report the current frontmost app and window)**. **Typical play: to drive an application → system open to switch to it → system menu_items to see the menus → system menu to invoke the feature directly; only for things not in a menu, fall back to computer screenshot + node clicking.** Menu names must match exactly what the interface displays (including any ellipsis …). **Fully supported on macOS (Accessibility permission) and Windows (UI Automation); on Linux, open/list windows/switch/focus are supported (needs wmctrl + xdotool) and menus go through computer coordinates.**", parameters: { type: "object", properties: { action: { type: "string", enum: ["open", "menu", "menu_items", "apps", "windows", "focus", "frontmost"], description: "The system operation to perform" }, name: { type: "string", description: "For open/windows/focus: the app name (exactly as shown in Applications or the menu bar)" }, background: { type: "boolean", description: "For open (optional): true = launch in the background without stealing focus or interrupting the user (takes effect on macOS)" }, path: { type: "array", description: "For menu/menu_items: the menu path array, e.g. [\"File\",\"New\"] / [\"Format\",\"Font\",\"Bold\"]. Pass [] to menu_items to list the top-level menus", items: { type: "string" } }, title: { type: "string", description: "For focus (optional): the title of the window to raise (a substring is enough; omit for the first window)" }, app: { type: "string", description: "For menu/menu_items (optional): the target app name; omit = the current frontmost app" } }, required: ["action"] } } },
       { type: "function", function: { name: "browser", description: "Drive a real browser and return screenshots, interactive nodes and visible text. **It runs on a persistent profile, so whatever has been signed into stays signed in** \u2014 this is the right entry point whenever the task needs a session that survives across runs, and it is why you should not reach for a fresh throwaway browser there. Be precise about whose session that is: it is THIS browser's own profile, signed into once here — not the session in the user's everyday browser. When the task specifically needs the account the user is already signed into in their OWN browser, see the third case below. If the user's own browser is running with remote debugging enabled, it attaches to that instead — their real session, their logins, no second window; the run itself tells you which happened. Otherwise it uses a separate profile, and it has to: a Chromium-based browser locks its own profile while it is running, and a debugging port can only be opened at launch — it cannot be added to a process that is already running. Handing over every saved password would also be far more access than the task needs. Which browser it drives is configurable (Chrome / Edge / Brave / Chromium); the run itself tells you which one it actually opened. If a site still shows a login wall, say so and let the user sign in once in this browser; it persists afterwards. **\u3010browser \u8fd8\u662f automation\uff1a\u6309\u76ee\u6807\u5728\u54ea\u513f\u5206\uff0c\u4e0d\u9760\u731c\u3011** Target lives INSIDE a web page (DOM nodes, forms, buttons, text, page screenshots, network/console) \u2192 use **browser**: it reads the DOM, targets by node number, and is far more reliable and cheaper than pixels. Target lives OUTSIDE the page \u2014 an OS dialog, a native file picker, the menu bar, another application, drag-and-drop between apps \u2014 or the page actively blocks CDP \u2192 use **automation**: it synthesises real OS mouse and keyboard events, which is the only thing that reaches non-web UI. **【第三种情况：目标就在用户自己那个浏览器里】** CDP 只作用于它自己启动的实例，或用户主动带调试端口启动的实例；用户双击打开的那个，调试端口是启动期参数、事后加不上，接管不了。所以任务是「在用户已登录的那个浏览器里操作」时不要用 browser——它只会再弹一个陌生的、没登录的窗口，这正是用户抱怨的行为。改走 automation：`system open` 把它切到前台，`read_screen` 读可访问性树（浏览器会把网页内容——链接、按钮、输入框、文本——连同坐标暴露给 AX，是结构化元素，不是对着截图猜），再用 ui_click 按 ref 直接执行 AX 动作——网页里的链接、按钮、输入框、下拉框都支持 AXPress，所以这条路根本不碰坐标，不存在点偏；坐标点击只留给没有 AX 动作的东西。登录态就是用户自己的。代价是靠坐标、窗口必须在前台、拿不到 DOM，所以可重复的页面验收仍然走 browser。判据是**要谁的登录态**：要用户的 → automation；不要 → browser。 Both drive the same browser brand (one setting decides for both). Do not reach for automation just because a click failed in browser \u2014 re-read the nodes first; and do not drive a web page through automation coordinates when browser can address it by node. **\u3010\u5148\u60f3\u4e00\u4e0b\u662f\u8c01\u8981\u770b\u3011** If the point is for the USER to look at the page (showing them the dev server you just started, a deployed site, a doc, a link), use `open`: it hands the URL to **their own default browser** \u2014 their tabs, their logins, their extensions \u2014 and starts no automation session and no second Dock icon. It works even when their default browser is Safari or Firefox. You do not get to see the page that way, and that is the point. Use `navigate` and the rest only when YOU need to read the page, click through it, or verify it visually. Reaching for `navigate` just to show someone something is what makes an unfamiliar, logged-out automation window pop up for no reason. Supported: open, navigate, observe, viewport, click, dblclick, rightclick, longpress, type, clear, append, autofill/fill, hover, drag, slide, swipe, wheel, toggle/uncheck, select, focus/blur, press, scroll, wait, eval, screenshot, design, network, inspect, nodes, assert, check, batch, upload, cookies, storage and close. observe returns ready/active/iframe/shadow DOM/node state in structured form — on a complex page, observe/nodes first and then batch. check only performs a page health check; for checkboxes and switches use toggle + checked:true/false, or op:check/uncheck inside a batch. Browser sessions are sticky and reused by default: navigate/fresh will not close the browser for the sake of ceremony, and close only releases the task's hold on it — only close + force:true actually shuts it down. For complex UI, prefer batch: it uses real pointer/mouse events, dblclick/rightclick/longpress, hover, drag trajectories, dragging onto a target node or text, slider percent/value, wheel and scroll containers, custom select/combobox, focus/blur, clear/append, key combinations, deep targeting through Shadow DOM and same-origin iframes, occlusion detection, candidate recovery, React/Vue native value setters, and DOM/URL settling after each action, and it reports failure reasons such as blockedBy/value_not_applied/option_not_found/candidates/expect_*. After an action you can pass expectText/expectSelector/expectUrl/expectValue as an acceptance check; if it is not met, execution stops and reports why. For sign-in, sign-up, search and admin forms, prefer autofill to fill fields in one go and read back invalid/missing, rather than guessing from a screenshot which field was missed. Before delivering UI, decide from the project itself whether mobile matters: a public-facing site, marketing page, landing page or H5 → run viewport and check twice, desktop and phone; an explicitly desktop context (internal admin, a desktop tool, or the user asking only for desktop) → test desktop only and say why when you wrap up. Prefer clicking and filling by the node number that nodes returns; without one, use target/role to locate semantically by aria-label, placeholder, label or visible text. After acting, verify state with assert, nodes or check; diagnose styling with inspect and network problems with network. Requires a Chromium-based browser installed locally (Chrome, Edge, Brave or Chromium — which one it uses is configurable).", parameters: { type: "object", properties: { action: { type: "string", enum: ["open", "navigate", "viewport", "click", "type", "autofill", "fill", "press", "scroll", "wait", "eval", "screenshot", "design", "network", "inspect", "nodes", "assert", "check", "batch", "upload", "cookies", "storage", "close"], description: "要执行的浏览器动作。**只是要给用户看一眼页面就用 open**（交给他自己的默认浏览器，不起自动化窗口、你也读不到页面）；需要你自己读页面/点按钮/截图验收才用 navigate 那一套。连续/复杂操作优先用 batch；表单登录优先 autofill；screenshot 只用于最终视觉验收/排版肉眼检查。测手机端用 viewport 切换视口（width/height/mobile），不要给 screenshot 传宽高。" }, url: { type: "string", description: "For open / navigate: the URL. `open` hands it to the user's own default browser for them to look at; `navigate` drives the automation browser so you can read and act on the page." }, width: { type: "integer", description: "viewport 用：视口宽 px（如桌面 1440、手机 390）" }, height: { type: "integer", description: "viewport 用：视口高 px（如桌面 900、手机 844）" }, mobile: { type: "boolean", description: "viewport 用：true=移动端模拟（触摸/UA/DPR）" }, device_scale_factor: { type: "number", description: "viewport 用：设备像素比，手机常用 2-3" }, fresh: { type: "boolean", description: "For navigate: true = isolated semantics; within the same task and origin the current browser is kept and reused automatically rather than being closed on a whim" }, mode: { type: "string", enum: ["headed", "isolated"], description: "Optional semantic hint: headed = headed interaction (default); isolated = pair with fresh=true for an isolated session. For genuinely headless static rendering, use screenshot." }, force: { type: "boolean", description: "For close: only true actually shuts the browser down; by default close just releases the task's hold and leaves the browser open for reuse" }, paths: { type: "array", description: "For upload: absolute local paths of the files to upload (several allowed); for a single file you can use path instead", items: { type: "string" } }, fields: { type: "object", description: "For autofill: fill the form by field meaning, e.g. {\"email\":\"demo@example.com\",\"password\":\"123456\"}, {\"search\":\"keyword\"}, {\"title\":\"...\",\"content\":\"...\"}. Inputs are identified by label/placeholder/name/type/autocomplete, and missing/invalid are returned." }, submit: { type: "boolean", description: "For autofill: whether to click/submit the form once it is filled" }, submitText: { type: "string", description: "For autofill with submit: the submit button's text, e.g. Sign in / Submit / Save; omit to find the usual submit button automatically" }, steps: { type: "array", description: "For batch: the array of steps to run in sequence, each {op,node/index/selector/target/role,text/value/option,key,button,clickCount,modifiers,amount,dx,dy,x,y,toX,toY,toNode/toIndex/toSelector/toTarget,percent,duration,checked,clear,append,absent,expectText/expectSelector/expectUrl/expectValue/expectAbsent,ms}. op supports observe, click/tap/dblclick/rightclick/longpress, hover, type/fill/input/clear/append, select/choose (native select plus shadcn/Radix combobox/listbox), toggle/check/uncheck, drag (can drop onto a target node, text or selector), slide (slider, percent/value), swipe, wheel, focus/blur, press (supports Meta+K / Control+Shift+P), scroll, wait (absent=true waits for disappearance). Example: [{op:\"observe\"},{op:\"type\",target:\"Email\",text:\"a@b.com\",expectValue:\"a@b.com\"},{op:\"slide\",role:\"slider\",percent:80},{op:\"drag\",target:\"Card\",toTarget:\"Done column\"},{op:\"rightclick\",target:\"File\"},{op:\"press\",key:\"Meta+K\"},{op:\"wait\",target:\"Saved\",ms:1200,expectText:\"Saved\"}]. Getting node numbers from nodes first is the most reliable; you can also use target:\"Save\" to locate by accessible name or visible text. batch runs many steps at once, detects occlusion, waits for changes, and returns the reason for any failure.", items: { type: "object" } }, node: { type: "integer", description: "For click/type (preferred): the node number i from the nodes listing" }, index: { type: "integer", description: "For click/type: the number in the screenshot's element list (the red digits)" }, selector: { type: "string", description: "For click/type/wait (fallback): a CSS selector. **Text matching is also supported**: :has-text(\"Download\"), text=\"2.1.1.exe\" and :contains(\"Sign in\") all work (the system locates by visible text and polls until it renders). But **the most reliable route is nodes → node=i**; a selector is only the fallback when there is no node number. For inspect/assert (optional): the element to examine" }, target: { type: "string", description: "For click/type/wait (semantic fallback): the target's visible text, aria-label, placeholder, label or name, e.g. Save, Email, Search" }, role: { type: "string", description: "For click/type/wait (semantic fallback): a role hint for the target, such as button/textbox/link/tab/slider/switch/checkbox" }, text: { type: "string", description: "For type: the text to enter; for click/wait it can serve as the target text; for assert: the text to look for (confirming it appears/is visible)" }, key: { type: "string", description: "For press: the key name, e.g. Enter" }, amount: { type: "integer", description: "For scroll/wheel: scroll distance in pixels, positive = down, negative = up (e.g. 600 / -600)" }, ms: { type: "integer", description: "For wait: milliseconds to wait (used when no selector is given, default 1500)" }, script: { type: "string", description: "For eval: the JavaScript to run" } }, required: [] } } },
-      { type: "function", function: { name: "git_stash", description: "Stash the current working-tree changes onto the stash stack and clear the working tree (git stash push). Use it to set your current changes aside temporarily (for instance to switch branches and look at something else); retrieve them later with git_stash_pop.", parameters: { type: "object", properties: {} } } },
-      { type: "function", function: { name: "git_stash_pop", description: "Retrieve and apply the most recent (or a given index) stash entry from the stack (git stash pop).", parameters: { type: "object", properties: { index: { type: "integer", description: "Index of the stash entry to pop (0 is the newest); omit for the newest" } } } } },
+      { type: "function", function: { name: "git_stash", description: "Stash the tracked working-tree changes onto the stash stack (git stash push). **Untracked (new) files are NOT taken and the working tree is not left clean** — if there are no tracked changes at all, git stashes nothing and the receipt says so, which means a later git_stash_pop will bring nothing back. Check git_status before relying on the tree being clean. Use it to set your current changes aside temporarily (for instance to switch branches and look at something else); retrieve them later with git_stash_pop.", parameters: { type: "object", properties: {} } } },
+      { type: "function", function: { name: "git_stash_pop", description: "Retrieve and apply the most recent (or a given index) stash entry from the stack (git stash pop). If applying conflicts, git keeps the stash entry in place and the receipt carries the full conflict report (which files conflicted, and that the entry was kept) — read it before retrying or dropping anything.", parameters: { type: "object", properties: { index: { type: "integer", description: "Index of the stash entry to pop (0 is the newest); omit for the newest" } } } } },
       { type: "function", function: { name: "stop_terminal", description: "Stop / close a task terminal started by run_in_terminal (ending its process). Use it when a dev server or watcher is no longer needed, or to restart with a different command. Omit name to stop the most recently started one. 【When to use】When a background task is no longer needed, or a port conflict means an old process has to be killed. 【vs alternatives】To read output without stopping anything, use read_terminal.", parameters: { type: "object", properties: { name: { type: "string", description: "Terminal / task name to stop; omit for the most recent one" } } } } },
       { type: "function", function: { name: "http_request", description: "Call any HTTP API — the key capability for using online tools and services. method = GET/POST/PUT/PATCH/DELETE/HEAD, with optional headers and body; returns the status code, response headers and response body (text, up to 5MB). Typical uses: (1) test the local service you just started (http://127.0.0.1:<port>/api — send a request and see the real response); (2) call a public API (GitHub, weather, exchange rates, maps, any REST service); (3) fire a webhook. ⚠️ localhost and the LAN are allowed (so you can test your own service), but link-local and cloud metadata addresses (169.254.x.x) are blocked; only http/https are supported. 【vs alternatives】To read a web page's text use web_fetch (simpler); to find a page use web_search.", parameters: { type: "object", properties: { method: { type: "string", description: "HTTP method, e.g. GET, POST, PUT, DELETE" }, url: { type: "string", description: "A full http/https URL, which may be http://127.0.0.1:<port>/path" }, headers: { type: "object", description: "Optional; request header key/value pairs, e.g. {\"Authorization\":\"Bearer xxx\",\"Content-Type\":\"application/json\"}", additionalProperties: { type: "string" } }, body: { type: "string", description: "Optional; the request body (for POST/PUT etc.; to send JSON, pass a JSON string)" }, timeout_secs: { type: "integer", description: "Optional; timeout in seconds, default 30, maximum 120" } }, required: ["url"] } } },
       { type: "function", function: { name: "tor_request", description: "**Send an HTTP request through the Tor network — reach deep-web / dark-web .onion sites** (and optionally reach ordinary URLs anonymously). Use it to read .onion links, reach censored or hidden resources, and fetch anonymously. **Tor starts automatically** (it is brought up if not running; the first cold start takes about 10-30s, and only a machine with tor not installed at all needs brew install tor). This is how deep-web content gets read.", parameters: { type: "object", properties: { method: { type: "string", description: "HTTP method, e.g. GET, POST; omit for GET" }, url: { type: "string", description: "The full URL; .onion addresses (e.g. http://xxx.onion/path) and ordinary http/https are both supported" }, headers: { type: "object", description: "Optional; request header key/value pairs", additionalProperties: { type: "string" } }, body: { type: "string", description: "Optional; the request body" }, timeout_secs: { type: "integer", description: "Optional; timeout in seconds, default 60 (Tor is slow), maximum 300" } }, required: ["url"] } } },
@@ -33038,11 +33072,11 @@ function _buildAgentToolSchemas(includeWrite, mcpTools = []) {
        * 装好的那份比任何全球索引都准——读的就是 lock 文件锁死的那一版。
        */
       { type: "function", function: { name: "package_source", description: "**Read the REAL API of a dependency as installed on this machine** — resolves the package inside the project's node_modules / site-packages and returns its installed version plus actual source. Two modes: without `symbol` you get `name@installedVersion`, the real on-disk path and the list of exported names; with `symbol` you get the definition body (signature + surrounding doc comment). 【When to use】BEFORE writing any call into a third-party library whose exact API you are not certain about — a signature you remember may belong to a different major version than the one installed here. This is the only tool that reads the version this project actually locked. 【How it differs】`package_search` answers \"does it exist / what versions / deprecated?\" from the registry and returns NO signatures. context7 (if connected) answers \"how do the official docs describe it?\". This one answers \"what is actually on disk\". Typical order: package_search → package_source → context7. 【Not installed? Still answerable】When the package is not on this machine, this tool now falls back to the gateway's OWN code corpus, which holds the real exported declarations (signature + doc comment) extracted from the package's published tarball; if that package is not indexed yet it is fetched and indexed on the spot. So \"not installed\" is no longer a dead end — but the result is the PUBLISHED version's API, not the version this project locks, and the reply says which. 【Note】Ordinary search / find_files / semantic_search deliberately skip node_modules, so they can never answer this — use this tool instead of trying to grep dependencies.", parameters: { type: "object", properties: { package: { type: "string", description: "Package name as imported, e.g. 'zod' / '@tanstack/react-query' / 'pydantic'" }, symbol: { type: "string", description: "Optional. Exported function / class / type to look up; omit for an overview of what the package exports" }, root: { type: "string", description: "Optional workspace root when several are open" } }, required: ["package"] } } },
-      { type: "function", function: { name: "download_file", description: "Download a file from an http/https URL and save it inside the workspace (images, fonts, datasets, binaries and so on). dest is a path relative to the workspace root (or an absolute path inside the workspace) and must land inside the workspace. Maximum 200MB per file. It will NOT overwrite: if dest already exists the download is refused and nothing is written — pick another name, or delete_path it first (that step leaves a checkpoint you can undo).", parameters: { type: "object", properties: { url: { type: "string", description: "The http/https URL to download" }, dest: { type: "string", description: "Where to save it, relative to the workspace root, e.g. assets/logo.png" } }, required: ["url", "dest"] } } },
+      { type: "function", function: { name: "download_file", description: "Download a file from an http/https URL and save it inside the workspace (images, fonts, datasets, binaries and so on). dest is a path relative to the workspace root (or an absolute path inside the workspace) and must land inside the workspace. Maximum 200MB per file. It will NOT overwrite: if dest already exists the download is refused and nothing is written — pick another name, or delete_path it first (note: that deletion cannot be undone from the UI).", parameters: { type: "object", properties: { url: { type: "string", description: "The http/https URL to download" }, dest: { type: "string", description: "Where to save it, relative to the workspace root, e.g. assets/logo.png" } }, required: ["url", "dest"] } } },
       { type: "function", function: { name: "realtime_news_feed", description: "Fetch the latest discussion and articles from technical communities (Hacker News, Dev.to) — good for the current state of play around a technology, release news and where community sentiment is going. By default it aggregates both sources concurrently, and you can name specific ones; a failing source is flagged but does not block the others. Return format: [source] title | score/comments | time | URL", parameters: { type: "object", properties: { topic: { type: "string", description: "The topic of interest, e.g. 'Rust 1.80' / 'Kubernetes new features'", minLength: 1 }, sources: { type: "string", enum: ["hn", "devto", "all"], description: "Data source: hn (Hacker News only), devto (DEV Community only), all (default, both concurrently)", default: "all" }, maxResults: { type: "integer", description: "Maximum results per source, default 10", minimum: 1, maximum: 25, default: 10 } }, required: ["topic"] } } },
       { type: "function", function: { name: "capture_start", description: "**Start capturing traffic (mitmproxy — the capability of tools like HttpCanary).** Pick a mode first: mode:\"isolated_browser\" = the recommended default, capturing an isolated automation browser without touching the system proxy; mode:\"system\" = capture any app or the whole system, which changes the macOS system proxy; mode:\"background\" = listen only / manual proxying, usually paired with background_monitor(check_type:\"capture\"). Once started, find the real requests with capture_flows, then replay them with capture_replay or http_request.", parameters: { type: "object", properties: { port: { type: "integer", description: "Proxy port, default 8080" }, mode: { type: "string", enum: ["auto", "isolated_browser", "system", "background"], description: "auto = the IDE decides from the task; isolated_browser = does not change the system proxy, and browser(fresh=true) routes through it automatically; system = changes the system proxy to capture any app; background = start the proxy listener only, and wait for traffic yourself or with a monitor" }, system_proxy: { type: "boolean", description: "Legacy parameter: true is equivalent to mode=system; false is equivalent to mode=isolated_browser/background. When omitted, it is decided automatically from mode and the task" } }, required: [] } } },
-      { type: "function", function: { name: "automation", description: "**\u3010browser \u8fd8\u662f automation\uff1a\u6309\u76ee\u6807\u5728\u54ea\u513f\u5206\uff0c\u4e0d\u9760\u731c\u3011** Target lives INSIDE a web page (DOM nodes, forms, buttons, text, page screenshots, network/console) \u2192 use **browser**: it reads the DOM, targets by node number, and is far more reliable and cheaper than pixels. Target lives OUTSIDE the page \u2014 an OS dialog, a native file picker, the menu bar, another application, drag-and-drop between apps \u2014 or the page actively blocks CDP \u2192 use **automation**: it synthesises real OS mouse and keyboard events, which is the only thing that reaches non-web UI. Both drive the same browser brand (one setting decides for both). Do not reach for automation just because a click failed in browser \u2014 re-read the nodes first; and do not drive a web page through automation coordinates when browser can address it by node. Desktop automation RPC: real mouse and keyboard, a CDP browser, and record/replay. Use it as a state machine: confirm the precondition first (URL, window, node, sign-in state), then perform the action, then verify the postcondition with browser.content / browser.eval / screenshot / the recorder result — issuing a click or some typing is not the same as succeeding. Call system.init before anything else the first time. A coordinate click is mouse.click{x,y,button} — it moves and clicks in one call, and the reply carries the position it actually acted at, so compare that against your target instead of trusting a bare ok status. mouse.move{x,y} then mouse.click{button} works too and mouse.move only returns once the pointer has really arrived. There is no desktop.click or desktop.type. When a selector goes stale, re-read the page/nodes; when navigation is slow, wait and then check the URL/DOM; when sign-in, a captcha or a system permission blocks you, state the specific blocker and continue via background monitoring. **Choosing which browser to drive is a real decision, not a default.** browser.start takes profile: \u0022isolated\u0022 (default \u2014 a clean throwaway browser instance, no cookies, no logins) or \u0022session\u0022 (a persistent profile that keeps whatever it has signed into). Pick from the task: scraping a public page, checking your own dev server, or anything where a fresh state is safer \u2192 isolated. Anything that needs the user to be signed in \u2014 their dashboard, their account, posting on their behalf, reading their inbox \u2014 \u2192 session, because a blank browser just hits a login wall. If session still shows a login wall, start it again with headless=false so the user can sign in once; that sign-in persists for later runs. For the account the user is already signed into in their OWN everyday browser, neither these browser.* methods nor the separate `browser` tool can reach it \u2014 CDP attaches only to instances it launched itself. That case goes through system open \u2192 read_screen \u2192 ui_click instead; the `browser` tool's description spells it out. Never assume a fresh browser is fine just because it starts faster. Available methods: system.init / mouse.move / mouse.click / mouse.double_click / mouse.position / mouse.drag / mouse.scroll{delta_y} / sleep{ms} / keyboard.type / keyboard.press / keyboard.combo / browser.start / browser.goto / browser.click / browser.type / browser.wait / browser.eval / browser.screenshot / browser.content / browser.close / recorder.save / recorder.replay / recorder.list / window.list / window.activate{title} / window.minimize{title} / screen.info / clipboard.get / clipboard.set{text} / keyboard.paste{text}. Before driving another application, find its window with window.list and bring it to the front with window.activate. Read screen.info first and check its input_permission field: when it says denied, macOS silently discards every synthetic mouse and keyboard event — the calls still return ok while nothing happens on screen, so switch to browser automation, shell or file tools and tell the user to grant Accessibility in System Settings. Also note: screen.info, read_screen, window.list and mouse.move all speak the SAME coordinate space \u2014 screen points, origin top-left. Pass those numbers straight through; NEVER multiply by scale_factor (it only tells you whether the display is Retina, it is not a conversion factor \u2014 scaling a click sends it to twice the intended position, off-screen, and the click silently hits nothing). Paste long text via the clipboard with keyboard.paste rather than typing it key by key.", parameters: { type: "object", properties: { method: { type: "string", description: "The name of the real RPC method to call, e.g. browser.goto / mouse.move / recorder.replay" }, params: { type: "object", description: "The parameter object for that method; follow the method's own description" } }, required: ["method"] } } },
-      { type: "function", function: { name: "computer", description: "Desktop mouse, keyboard, window, screen-information and clipboard operations. It is the stable compatibility entry point onto automation, suited to driving non-browser native applications; for browser pages prefer browser — **except when the target is the user's own already-running browser**, which CDP cannot attach to (the debugging port is a launch-time argument and cannot be added to a live process). There the path is: bring it to the front with system open, read its accessibility tree with read_screen (a browser exposes its page content — links, buttons, fields, text — as real AX nodes), then act on those nodes by ref with ui_click, which presses the actual element rather than a screen position. Use this tool's mouse and keyboard for what has no AX action of its own: native dialogs, drag-and-drop, and key combinations. Get the real state first with window.list / screen.info, then perform the action, then verify it with read_screen or screenshot.", parameters: { type: "object", properties: { method: { type: "string", enum: ["mouse.click", "mouse.double_click", "mouse.move", "mouse.position", "mouse.drag", "mouse.scroll", "keyboard.type", "keyboard.press", "keyboard.combo", "keyboard.paste", "screen.info", "screen.capture", "clipboard.get", "clipboard.set", "window.list", "window.activate", "window.minimize"], description: "The real desktop action name screen.capture 拍下**真实屏幕像素**并把图回传给你看（不给 x/y/width/height 就是整屏；四个要么都给要么都不给）——这是唯一能看到原生应用/游戏/视频/PDF 的方式，浏览器截图看不到它们。" }, params: { type: "object", description: "Action parameters, e.g. {x,y}, {title}, {text}, {delta_y}" } }, required: ["method"] } } },
+      { type: "function", function: { name: "automation", description: "**\u3010browser \u8fd8\u662f automation\uff1a\u6309\u76ee\u6807\u5728\u54ea\u513f\u5206\uff0c\u4e0d\u9760\u731c\u3011** Target lives INSIDE a web page (DOM nodes, forms, buttons, text, page screenshots, network/console) \u2192 use **browser**: it reads the DOM, targets by node number, and is far more reliable and cheaper than pixels. Target lives OUTSIDE the page \u2014 an OS dialog, a native file picker, the menu bar, another application, drag-and-drop between apps \u2014 or the page actively blocks CDP \u2192 use **automation**: it synthesises real OS mouse and keyboard events, which is the only thing that reaches non-web UI. Both drive the same browser brand (one setting decides for both). Do not reach for automation just because a click failed in browser \u2014 re-read the nodes first; and do not drive a web page through automation coordinates when browser can address it by node. Desktop automation RPC: real mouse and keyboard, a CDP browser, and record/replay. Use it as a state machine: confirm the precondition first (URL, window, node, sign-in state), then perform the action, then verify the postcondition with browser.content / browser.eval / screenshot / the recorder result — issuing a click or some typing is not the same as succeeding. Call system.init before anything else the first time. A coordinate click is mouse.click{x,y,button} — it moves and clicks in one call, and the reply carries the position it actually acted at, so compare that against your target instead of trusting a bare ok status. mouse.move{x,y} then mouse.click{button} works too and mouse.move only returns once the pointer has really arrived. There is no desktop.click or desktop.type. When a selector goes stale, re-read the page/nodes; when navigation is slow, wait and then check the URL/DOM; when sign-in, a captcha or a system permission blocks you, state the specific blocker and continue via background monitoring. **Choosing which browser to drive is a real decision, not a default.** browser.start takes profile: \u0022isolated\u0022 (default \u2014 a clean throwaway browser instance, no cookies, no logins) or \u0022session\u0022 (a persistent profile that keeps whatever it has signed into). Pick from the task: scraping a public page, checking your own dev server, or anything where a fresh state is safer \u2192 isolated. Anything that needs the user to be signed in \u2014 their dashboard, their account, posting on their behalf, reading their inbox \u2014 \u2192 session, because a blank browser just hits a login wall. If session still shows a login wall, start it again with headless=false so the user can sign in once; that sign-in persists for later runs. For the account the user is already signed into in their OWN everyday browser, neither these browser.* methods nor the separate `browser` tool can reach it \u2014 CDP attaches only to instances it launched itself. That case goes through system open \u2192 read_screen \u2192 ui_click instead; the `browser` tool's description spells it out. Never assume a fresh browser is fine just because it starts faster. Available methods: system.init / mouse.move / mouse.click / mouse.double_click / mouse.position / mouse.drag / mouse.scroll{delta_y} / sleep{ms} / keyboard.type / keyboard.press / keyboard.combo / keyboard.down{key} / keyboard.up{key} / browser.start / browser.goto / browser.click / browser.type / browser.wait / browser.eval / browser.screenshot / browser.content / browser.close / recorder.save / recorder.replay / recorder.list / window.list / window.activate{title} / window.minimize{title} / screen.info / clipboard.get / clipboard.set{text} / keyboard.paste{text}. Before driving another application, find its window with window.list and bring it to the front with window.activate. Read screen.info first and check its input_permission field: when it says denied, macOS silently discards every synthetic mouse and keyboard event — the calls still return ok while nothing happens on screen, so switch to browser automation, shell or file tools and tell the user to grant Accessibility in System Settings. Also note: screen.info, read_screen, window.list and mouse.move all speak the SAME coordinate space \u2014 screen points, origin top-left. Pass those numbers straight through; NEVER multiply by scale_factor (it only tells you whether the display is Retina, it is not a conversion factor \u2014 scaling a click sends it to twice the intended position, off-screen, and the click silently hits nothing). Paste long text via the clipboard with keyboard.paste rather than typing it key by key.", parameters: { type: "object", properties: { method: { type: "string", description: "The name of the real RPC method to call, e.g. browser.goto / mouse.move / recorder.replay" }, params: { type: "object", description: "The parameter object for that method; follow the method's own description" } }, required: ["method"] } } },
+      { type: "function", function: { name: "computer", description: "Desktop mouse, keyboard, window, screen-information and clipboard operations. It is the stable compatibility entry point onto automation, suited to driving non-browser native applications; for browser pages prefer browser — **except when the target is the user's own already-running browser**, which CDP cannot attach to (the debugging port is a launch-time argument and cannot be added to a live process). There the path is: bring it to the front with system open, read its accessibility tree with read_screen (a browser exposes its page content — links, buttons, fields, text — as real AX nodes), then act on those nodes by ref with ui_click, which presses the actual element rather than a screen position. Use this tool's mouse and keyboard for what has no AX action of its own: native dialogs, drag-and-drop, and key combinations. Get the real state first with window.list / screen.info, then perform the action, then verify it with read_screen or screenshot.", parameters: { type: "object", properties: { method: { type: "string", enum: ["mouse.click", "mouse.double_click", "mouse.move", "mouse.position", "mouse.drag", "mouse.scroll", "keyboard.type", "keyboard.press", "keyboard.combo", "keyboard.down", "keyboard.up", "keyboard.paste", "screen.info", "screen.capture", "clipboard.get", "clipboard.set", "window.list", "window.activate", "window.minimize"], description: "The real desktop action name screen.capture 拍下**真实屏幕像素**并把图回传给你看（不给 x/y/width/height 就是整屏；四个要么都给要么都不给）——这是唯一能看到原生应用/游戏/视频/PDF 的方式，浏览器截图看不到它们。" }, params: { type: "object", description: "Action parameters, e.g. {x,y}, {title}, {text}, {delta_y}" } }, required: ["method"] } } },
       { type: "function", function: { name: "capture_flows", description: "**Read the HTTP/HTTPS requests already captured** (structured: method / URL / host / path / status / duration / request headers / request body / response headers / response body). More reliable than looking at a screenshot, and the first step in reverse-engineering an API. Narrow with a filter keyword (matched against host / path / URL / method / status / type), and cap the count with limit (default 30, newest first).", parameters: { type: "object", properties: { filter: { type: "string", description: "Optional; keyword filter (fuzzy-matched against host / path / URL / method / status / content-type)" }, limit: { type: "integer", description: "Optional; how many of the newest entries to return, default 30" }, include_body: { type: "boolean", description: "Optional; whether to include request/response bodies (default true; set false to save tokens when you only want the list)" } }, required: [] } } },
       { type: "function", function: { name: "capture_stop", description: "Stop capturing traffic and undo any system proxy that was set.", parameters: { type: "object", properties: {}, required: [] } } },
       { type: "function", function: { name: "capture_replay", description: "**Replay one captured request exactly** (invaluable for reverse-engineering and debugging). It takes the original request by its `id` from capture_flows and **sends it with every captured request header intact (the cookie, token and signature are all in there — which is exactly why the replay succeeds)**, optionally overriding url/method/headers/body to probe with different parameters. It returns the real response. More reliable than hand-assembling an http_request, because you do not have to rebuild that pile of headers.", parameters: { type: "object", properties: { id: { type: "string", description: "The id=… value from a capture_flows result" }, url: { type: "string", description: "Optional; override the URL (to probe a different query or path)" }, method: { type: "string", description: "Optional; override the method" }, headers: { type: "object", description: "Optional; override or add request headers (merged into the captured originals)", additionalProperties: { type: "string" } }, body: { type: "string", description: "Optional; override the request body" } }, required: ["id"] } } },
@@ -33055,7 +33089,7 @@ function _buildAgentToolSchemas(includeWrite, mcpTools = []) {
       { type: "function", function: { name: "generate_sound", description: "Generate a game sound effect with AI (.mp3). Text description → a sound file saved to assets/audio/. For explosions, footsteps, gunfire, impacts, ambience and so on. Built on ElevenLabs / AudioLDM2.", parameters: { type: "object", properties: { prompt: { description: "Sound description (e.g. \"metal impact\", \"rainy ambience\", \"laser gun shot\")", type: "string" }, name: { type: "string", description: "Filename (letters, e.g. metal-impact, rain-ambient)" }, duration: { description: "Length in seconds (default 5)", type: "number", minimum: 0.5, maximum: 300 } }, required: ["prompt"] } } },
       { type: "function", function: { name: "generate_music", description: "Generate game background music with AI (.mp3). Describe the style or mood in text → a BGM file saved to assets/music/. Built on ACE-Step / MusicGen.", parameters: { type: "object", properties: { prompt: { description: "Music description (e.g. \"epic orchestral battle BGM 120BPM\", \"gentle piano exploration score\", \"8-bit retro game music\")", type: "string" }, name: { type: "string", description: "Filename (letters, e.g. battle-epic, explore-calm)" }, duration: { description: "Length in seconds (default 30)", type: "number", minimum: 1, maximum: 600 } }, required: ["prompt"] } } },
       { type: "function", function: { name: "generate_voice", description: "AI speech synthesis (.mp3). Text → NPC dialogue, narration, voice-over. Built on Kokoro / XTTS-v2, with sub-200ms latency.", parameters: { type: "object", properties: { text: { description: "The text to be spoken", type: "string" }, name: { type: "string", description: "Filename (letters, e.g. npc-greeting, narrator-intro)" }, voice: { description: "Voice style (default/male/female/child/elder)", type: "string" } }, required: ["text"] } } },
-      { type: "function", function: { name: "auto_rig", description: "Automatic rigging. Rigs the skeleton for a task_id returned by generate_3d and outputs an animatable .glb.", parameters: { type: "object", properties: { task_id: { type: "string", description: "The real Tripo task_id returned by generate_3d" }, name: { type: "string", description: "Output filename (letters, e.g. character-rigged)" } }, required: [] } } },
+      { type: "function", function: { name: "auto_rig", description: "Automatic rigging. Rigs the skeleton for a task_id returned by generate_3d and outputs an animatable model. Usually .glb; when the upstream returns another format (a zipped FBX, for instance) the file is saved under its real extension and the receipt names it — go by the path in the receipt, not by the extension you expected.", parameters: { type: "object", properties: { task_id: { type: "string", description: "The real Tripo task_id returned by generate_3d" }, name: { type: "string", description: "Output filename (letters, e.g. character-rigged)" } }, required: [] } } },
       { type: "function", function: { name: "generate_motion", description: "Generate character animation / motion with AI. Produces an animation file for an existing character or model task_id, saved to assets/animations/.", parameters: { type: "object", properties: { prompt: { description: "Motion description (e.g. \"walk\", \"run\", \"sword attack\", \"dance\", \"crouch\")", type: "string" }, task_id: { type: "string", description: "The real Tripo task_id returned by auto_rig" }, name: { type: "string", description: "Filename (letters, e.g. walk, run, sword-attack)" }, duration: { description: "Animation length in seconds (default 3)", type: "number", minimum: 0.5, maximum: 120 } }, required: ["prompt"] } } },
       { type: "function", function: { name: "generate_texture", description: "Generate PBR texture maps with AI. Text description → the full albedo / normal / roughness / metallic set saved to assets/textures/. Built on MatFuse / Paint3D.", parameters: { type: "object", properties: { prompt: { description: "Texture description (e.g. \"rusty metal plate\", \"stone brick wall\", \"wooden floor\", \"lava ground\")", type: "string" }, name: { type: "string", description: "Filename (letters, e.g. rusty-metal, stone-brick)" }, resolution: { description: "Resolution (512/1024/2048/4096, default 1024)", type: "integer", enum: [512, 1024, 2048, 4096] } }, required: ["prompt"] } } },
       { type: "function", function: { name: "download_asset", description: "Download a game asset into the workspace. Used together with search_game_assets — pick one of the search results and download it.", parameters: { type: "object", properties: { url: { description: "Asset download URL (from a search_game_assets result)", type: "string" }, name: { type: "string", description: "Filename to save as (letters)" }, asset_type: { description: "Asset type (determines which subdirectory it goes to)", type: "string", enum: ["model", "sound", "music", "texture", "hdri", "animation"], default: "model" } }, required: ["url"] } } },
@@ -37321,6 +37355,15 @@ function _commandBatchBlockResult(run, items, index) {
   const current = items[index];
   const isCmd = (call) => call && (call.type === "cmd" || call.type === "termtask");
   if (!isCmd(current?.call) || current._eagerEntry || current.merged != null || current._unknown) return null;
+  // 纯读命令照跑。
+  //
+  // 这道门自己的理由是「继续跑只会把一个错误变成一排错误」——那说的是会**改状态**的
+  // 命令。`_callIsReadOnlyCommand` 已经用在失败那一侧（读命令失败不拦后面），却没用在
+  // 被拦的这一侧：于是 [npm run build（失败）, git status, cat package.json, ls dist]
+  // 里后三条全被拦下，而它们恰恰是拿来看清这次失败的。模型被逼着一条一条重发，
+  // 一次排查要多烧三四轮——用户看到的就是「这工具一出错就变成固定流程」。
+  // 读命令改不了任何东西，拦它换不来一点安全。
+  if (_callIsReadOnlyCommand(current.call)) return null;
   const failed = items.slice(0, index).find((item) => isCmd(item?.call)
     && !item._unknown && item.merged == null
     && item.rawResult != null
@@ -45880,6 +45923,29 @@ function _latestHistoricalImageAttachments(memory) {
 // Build the message that feeds screenshots/images back to the model — natively
 // (image blocks) for vision models, or as transcribed TEXT for text-only models.
 async function _buildImageFeedback(imgs, config, leadText, perImageHint) {
+  // 工具结果里的图从来没过消毒。用户拖进来的附件走 _attachmentImageInputs，那条路
+  // 一直在调 _downscaleImageForVision；工具这条路（screenshot / view_image /
+  // ui_extract / read_screen）是把原始 data URL 直接塞进 image_url。
+  // 两个后果：
+  //  ① view_image 收 .svg，回来的是 data:image/svg+xml —— 三家视觉接口一个都不收。
+  //     图被丢掉，而工具回执写着「图已回传给你看」，模型照着那句话编视觉结论。
+  //  ② 4K 截图的 base64 有五到十兆，撞上载荷上限被整块剥掉，同样是"以为看过了"。
+  const _visionImgs = [];
+  let _visionDropped = 0;
+  for (const u of Array.isArray(imgs) ? imgs : []) {
+    const _s = await _downscaleImageForVision(u, 1568, true);
+    if (_s) _visionImgs.push(_s); else _visionDropped++;
+  }
+  // 丢了就得说。悄悄少给一张，模型只会以为那张图不存在，而不是「我没看到」。
+  const _dropNote = _visionDropped
+    ? `\n（有 ${_visionDropped} 张图没能转成模型可读的格式，**你没有看到它们**——`
+      + `别对这些图下任何结论；需要的话让用户导出成 png 再看。）`
+    : "";
+  if (!_visionImgs.length) {
+    return { role: "user", content: `${leadText}${_dropNote}\n实际一张图都没能送进来，别假装看过。` };
+  }
+  imgs = _visionImgs;
+  leadText = `${leadText}${_dropNote}`;
   if (_modelSeesImages(config && config.model)) {
     const content = [{ type: "text", text: leadText }];
     for (const u of imgs) content.push({ type: "image_url", image_url: { url: u } });
@@ -48542,6 +48608,13 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
   // 智能体接着做而不是从头重做已落盘的部分。
   if (isAgent && session._wfInterrupted) {
     const w = session._wfInterrupted; delete session._wfInterrupted;
+    // 这条事实原来**只**进草稿纸，而草稿纸要 iter>=6 才注入模型。崩溃后的续跑
+    // 通常三五轮就收尾，于是「这几个文件上一轮已经改好并落盘了」一次都到不了模型——
+    // 它按最初的任务描述把那几个文件从头再生成一遍，把已经改好的内容（包括用户
+    // 重启后手动微调过的部分）整份覆写。而这一轮结束时 localStorage 里的检查点
+    // 就被删掉了，第二次「继续」连补救机会都没有。
+    // 所以同时挂到 run 上，走每轮无条件注入的〔执行状态〕那一块。
+    run._resumeFact = `上次运行在第 ${w.iter || "?"} 步中途中断（应用关闭/崩溃）${w.files && w.files.length ? "，当时这些文件已改好并落盘：" + w.files.join("、") : ""}。这些改动**已经在磁盘上了**，先读再判断，不要重做、不要整份重写。`;
     _pad.findings.push(`上次运行在第 ${w.iter || "?"} 步中途中断（应用关闭/崩溃），当时任务：「${w.task || ""}」${w.files && w.files.length ? "；当时已改好并落盘：" + w.files.join("、") : ""}。接着未完成的部分继续，已落盘的改动别重做。`);
   }
   function _padText() {
@@ -48849,9 +48922,12 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
       // 第一时间看见的位置信息，可它此前撑不起这块的触发条件（还没落盘、还没读文件时
       // 整块不发），于是续跑的第一次决策永远在零位置感下做出。
       const _planLine = run.mode === "agent" ? _planStateLineText(run) : "";
-      const _hasRunActivity = !!(_mutatedFiles.size || _readFiles.size || _evidenceBlock || _latestDiagBlock || _planLine);
+      const _hasRunActivity = !!(_mutatedFiles.size || _readFiles.size || _evidenceBlock || _latestDiagBlock || _planLine || run._resumeFact);
       if (_hasRunActivity) {
         const _parts = [_ORCH_NOTE + "〔执行状态·不要从头重查〕"];
+        // 崩溃恢复的事实排最前：续跑的第一次决策就是最危险的那次（此刻本次运行
+        // 还没有任何落盘记录，模型看到的是一张白纸，最容易从头再写一遍）。
+        if (run._resumeFact) _parts.push(run._resumeFact);
         if (_mutatedFiles.size) {
           // 长任务写几十个文件后这行会无界膨胀，挤占尾部最高注意力位：只报最近 20 个，
           // 其余给计数——“别重建旧文件”的约束靠近期清单就够，全量清单磁盘上随时可查。
@@ -49036,7 +49112,17 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
         if (turn.reasoning && turn.reasoning.trim()) reasoningAll += (reasoningAll ? "\n" : "") + turn.reasoning.trim();
         // 流完即写是在流式阶段就真落盘的，而这条 break 走在批处理之前——不收账的话，
         // 落了盘的文件在消息历史、run 摘要、账本里一个记录都没有。
-        { const _eagerNote = await _settleEagerWritesForBreak(run); if (_eagerNote) summaryText += (summaryText ? "\n\n" : "") + _eagerNote; }
+        {
+          const _eagerNote = await _settleEagerWritesForBreak(run);
+          if (_eagerNote) summaryText += (summaryText ? "\n\n" : "") + _eagerNote;
+          // 同上：这条 break 也绕过了批处理里的记账。落了盘就得认，否则收尾按
+          // 「本轮什么都没改」结算，未验证的代码被静默放行。
+          let _landed = 0;
+          for (const item of (Array.isArray(run._writeLedger) ? run._writeLedger : [])) {
+            if (item?.ok && item.path) { _mutatedFiles.add(_normRel(item.path, root)); _landed++; }
+          }
+          if (_landed) { didMutate = true; run._didMutate = true; _implOps++; }
+        }
         finalErr = turn.error; break;
       }
       clearAgentRetryToast();
@@ -49051,8 +49137,18 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
         // 或者收尾时说"我没有改动文件"。和上面两条 break 完全一样地先收账。
         const _eagerNote = await _settleEagerWritesForBreak(run);
         if (_eagerNote) summaryText += (summaryText ? "\n\n" : "") + _eagerNote;
+        let _landed = 0;
         for (const item of (Array.isArray(run._writeLedger) ? run._writeLedger : [])) {
-          if (item?.ok && item.path) _mutatedFiles.add(_normRel(item.path, root));
+          if (item?.ok && item.path) { _mutatedFiles.add(_normRel(item.path, root)); _landed++; }
+        }
+        // 补清单还不够：didMutate / run._didMutate / _implOps 是在**批处理**里置位的，
+        // 而这条 continue 整个跳过了那段。于是磁盘上多了一份没验证过的代码，收尾时
+        // didMutate 仍是 false —— 「改了代码要验证」那条记账根本不会触发，run 被判成
+        // 干干净净的 success。_implOps 也要加：新代码落盘之后，之前那次验证就过期了。
+        if (_landed) {
+          didMutate = true;
+          run._didMutate = true;
+          _implOps++;
         }
         continue;
       }
@@ -50487,8 +50583,27 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
       // Honesty: did any tool this turn report failure / unavailable / blocked?
       // The finish gate uses this to stop the model claiming fake success.
       {
+        // 执行判定优先于文案匹配。原来这里只做 _toolFailureMatch（读工具正文找失败措辞），
+        // 于是三类**结构化**的失败一律被读成成功：http 非 2xx、result.ok === false、
+        // result.failure.code。最后一个动作明明失败了，收尾门却看不见，run 被判 success。
+        // 同一个 bug 在 30 行之后的死循环判据里已经修过一次（那里是把易变文案揉进签名）。
+        //
+        // 「重复写入」和「没改动」不算失败——它们是执行事实不是故障，算进来会让
+        // failStreak 平白升高，反过来抬高下一轮的推理深度。所以只取硬失败。
+        const _hardFail = (idx) => {
+          const it = items[idx];
+          const r = it?.rawResult;
+          if (!it?.call || !r) return false;
+          if (r?.evidence?.resultKind === "duplicate" || r?.mutated === false) return false;
+          return !_toolExecutionSucceeded(it.call, r);
+        };
         const fails = toolMsgs
-          .map((m, idx) => items[idx]?._notAttempted ? null : _toolFailureMatch(m.content || ""))
+          .map((m, idx) => {
+            if (items[idx]?._notAttempted) return null;
+            const byText = _toolFailureMatch(m.content || "");
+            if (byText) return byText;
+            return _hardFail(idx) ? ["execution_failed"] : null;
+          })
           .filter(Boolean).map(x => x[0]);
         lastTurnHadFailure = fails.length > 0;
         // Consecutive failures, not just "did this turn fail" — two in a row is the signal
@@ -50498,7 +50613,7 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
         lastFailKinds = [...new Set(fails)].join(" ");
         if (lastTurnHadFailure) {
           runHadTrouble = true;
-          const errSnippet = toolMsgs.filter((m, idx) => !items[idx]?._notAttempted && _toolFailureMatch(m.content || ""))
+          const errSnippet = toolMsgs.filter((m, idx) => !items[idx]?._notAttempted && (_toolFailureMatch(m.content || "") || _hardFail(idx)))
             .map(m => String(m.content || "").split("\n")[0].slice(0, 80)).slice(0, 2);
           if (errSnippet.length) _pad.errors = errSnippet;
         } else if (_pad.errors.length) {
@@ -51436,6 +51551,16 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
     // 收尾形态。判据本身是执行事实（改没改代码、验没验过），和它怎么措辞无关。
     // 界面上不加东西：awaiting_user 仍然不出建议 chip（举着问题时喊"继续执行计划"是错的，
     // 那条判断保留），变的只是这一轮在 _lastRunState / 情景记忆里被如实记下来。
+    // 「没有可验证的东西」不等于「没验证」。只改了 README / Dockerfile / .csv /
+    // .svg / .gitignore 这类文件的 run，_codeNeedsVerification 本来就是假的——
+    // 可 verificationPassed 的初值是 false，而全文件只有「验证命令盖章」那一处会
+    // 把它置真。于是这类 run 必然落进下面收尾那句 didMutate && !verificationPassed，
+    // 被记成 partial：一次干干净净的文档改动被报成半成品，而模型下一轮还会被
+    // 「上次没做完」推着去补一个根本不存在的验证。
+    //
+    // 单独立一个标志，不去改 verificationPassed 的语义——它还要参与「评审说没验证
+    // 但记账说验过了」那道假绿检测，在这里置真会平白制造分歧。
+    run._nothingToVerify = !_codeNeedsVerification;
     if (_codeNeedsVerification && !_currentCodeVerified) {
       verificationPassed = false;
       run._incompleteReason ||= "code_delivered_unverified";
@@ -51548,7 +51673,7 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
     try { _thinkLedgerPush(session, _extractThinkingConclusion(reasoningAll), session.memory?.totalTurns || 0); } catch { /* 沉淀失败不影响收尾 */ }
     _streamDraftClear(session); // 本次运行已持久化收尾，流式草稿不再需要（只清本会话的槽）
     const _runOutcome = awaitingUserReply ? "awaiting_user" : finalErr ? "failed"
-      : (_stoppedEarly || run._incompleteReason || hitCap || (didMutate && (!verificationPassed || !uiVerificationPassed))) ? "partial" : "success";
+      : (_stoppedEarly || run._incompleteReason || hitCap || (didMutate && ((!verificationPassed && !run._nothingToVerify) || !uiVerificationPassed))) ? "partial" : "success";
     session._lastRunState = {
       outcome: _runOutcome,
       task: String(task || "").replace(/\s+/g, " ").trim().slice(0, 700),
@@ -56171,10 +56296,16 @@ async function _executeToolStepInner(step, call, root, run) {
         if (oldText == null && dirSnapshot) {
           if (!dirSnapshot.files.length) {
             undoNote = "\n注意：这次删除**无法撤销**（目录里没有可快照的文本文件，二进制与超大文件不做快照）。";
-          } else if (dirSnapshot.truncated) {
-            undoNote = `\n注意：只快照了其中 ${dirSnapshot.files.length} 个文本文件，**其余内容无法撤销**（触到快照上限，或含二进制/超大/读不出的文件）。`;
           } else {
-            undoNote = `\n（已快照 ${dirSnapshot.files.length} 个文本文件，可用「全部撤销」还原。）`;
+            // 这里原来说「可用『全部撤销』还原」。那个按钮长在轮末的交付事实条上，
+            // 而那条页脚已按用户要求从渲染路径里去掉了——_appendDeliveryFactsBar
+            // 全文只剩一个定义、零调用点。快照数据还躺在 checkpoint 里，但界面上
+            // **没有任何入口**能把它写回去。
+            //
+            // 这句假承诺的作用恰恰是让模型觉得删除随时可回退，于是更放手地删下去，
+            // 而用户一个文件都找不回来。删目录在系统侧是 remove_dir_all：没有回收站、
+            // 没有磁盘备份。所以两种情况都只能说实话。
+            undoNote = `\n注意：删目录在系统侧是 remove_dir_all，**无法撤销**——没有回收站、没有备份，界面上也没有撤销入口。已在内存里快照了 ${dirSnapshot.files.length} 个文本文件${dirSnapshot.truncated ? "（触到上限，未快照全）" : ""}，但目前没有出口能还原它们。未提交、被 .gitignore 挡住的内容（本地 .env、开发配置、生成的资源）删掉即永久丢失。`;
           }
         }
         return { type: "delete", path: p, content: `已删除 ${p}${undoNote}` };
@@ -57445,7 +57576,14 @@ async function _executeToolStepInner(step, call, root, run) {
           if (vp) vp.innerHTML = `<pre>${_escHtml(formatted)}</pre>`;
           return { type: "gh", path: "pr_review_comments", content: _rcRest
             ? `PR #${call.number} review 评论：共 ${arr.length} 条，**下面只有最早的 ${_rcShown.length} 条**，还有 ${_rcRest} 条没在这里。\n`
-              + `别按「都看完了」下结论；要取剩下的用 run_cmd 跑 \`gh api repos/{owner}/{repo}/pulls/${call.number}/comments --paginate --jq '.[${_rcShown.length}:]'\`。\n${formatted}`
+              + `别按「都看完了」下结论。要取剩下的，用 run_cmd 跑：\n`
+              + `\`gh api "repos/{owner}/{repo}/pulls/${call.number}/comments?per_page=100" --jq '.[${_rcShown.length}:]'\`\n`
+              // 这里**不能**加 --paginate：实测 gh 2.94 在 --paginate 下把 --jq 按**每一页**分别作用，
+              // 不是对合并后的数组。`--jq '.[30:]'` 于是变成「每页各跳过 30 条」，切出来的根本不是
+              // 你要的那批（40 条评论分两页时，第二页只有 10 条，`.[30:]` 直接给空数组）。
+              // 单页 per_page=100 就没有这个问题；超过 100 条再加 &page=2。
+              + `（**别加 --paginate**——加了之后 jq 是按每一页分别作用的，切出来的不是这一批；`
+              + `评论超过 100 条时在 URL 里加 &page=2。）\n${formatted}`
             : `PR #${call.number} review 评论 (${arr.length}):\n${formatted}` };
         }
         if (call.op === "pr_reply") {
@@ -59120,7 +59258,7 @@ return { type: call.type, path: call.query || "", content: `[失败] ${call.type
           return { type: "browser", path: "mytabs", content: "用户当前**没有开着**任何受支持的浏览器。要给他看页面就用 open（会用他的默认浏览器打开）；要你自己操作页面就用 navigate。" };
         }
         const _lines = _bs.map((b) => `【${b.browser}】\n`
-          + (b.tabs || []).map((t) => `  · ${String(t.title || "").slice(0, 80)}\n    ${t.url}`).join("\n")).join("\n");
+          + (b.tabs || []).map((t) => `  ${t.active ? (t.front_window ? "▶ 【用户正在看这一页】" : "▸ 该窗口的当前页") : "·"} ${String(t.title || "").slice(0, 80)}\n    ${t.url}`).join("\n")).join("\n");
         return {
           type: "browser", path: "mytabs", userTabs: _bs,
           content: `用户自己的浏览器现在开着这些（共 ${_n} 个标签页）：\n${_lines}\n\n`
@@ -70043,7 +70181,14 @@ function _attachmentLocationEvidenceContext(attachment) {
 // else JPEG. Small images pass through untouched (best fidelity). Never throws.
 function _downscaleImageForVision(dataUrl, maxDim = 1568, stripMetadata = false) {
   return new Promise((resolve) => {
-    const decodeFallback = () => resolve(stripMetadata ? "" : dataUrl);
+    // SVG 必须栅格化：三家视觉接口（OpenAI / Anthropic / Gemini）都不收
+    // image/svg+xml，原样送过去要么整条请求报错、要么被悄悄丢掉。
+    // 这个标志原来在 onload 里才算，而**结尾那行又把栅格结果扔了**：
+    // `out.length < dataUrl.length ? out : dataUrl` —— SVG 是文本，几乎永远比它
+    // 自己的 PNG 小，于是每次都退回原来那份 SVG。强制栅格化写了，等于没写。
+    // 栅格失败时也不能退回 SVG：那是一张模型看不了的图，宁可当作没有。
+    const needsRaster = String(dataUrl).startsWith("data:image/svg+xml");
+    const decodeFallback = () => resolve(stripMetadata || needsRaster ? "" : dataUrl);
     try {
       const img = new Image();
       img.onload = () => {
@@ -70052,7 +70197,6 @@ function _downscaleImageForVision(dataUrl, maxDim = 1568, stripMetadata = false)
           const long = Math.max(w, h);
           if (!long) return decodeFallback();
           // Already small enough → keep original bytes.
-          const needsRaster = String(dataUrl).startsWith("data:image/svg+xml");
           if (!stripMetadata && !needsRaster && long <= maxDim && String(dataUrl).length < 1_300_000) return resolve(dataUrl);
           const scale = long > maxDim ? maxDim / long : 1;
           const cw = Math.max(1, Math.round(w * scale)), ch = Math.max(1, Math.round(h * scale));
@@ -70063,7 +70207,10 @@ function _downscaleImageForVision(dataUrl, maxDim = 1568, stripMetadata = false)
           cx.drawImage(img, 0, 0, cw, ch);
           let out = cv.toDataURL("image/png");
           if (out.length > 1_500_000) out = cv.toDataURL("image/jpeg", 0.9); // bound big/photographic
-          resolve(stripMetadata ? (out || "") : (out && out.length < String(dataUrl).length ? out : dataUrl));
+          // needsRaster 时不比大小：比出来的结论一定是「SVG 更小」，而 SVG 送过去没用。
+          resolve(stripMetadata || needsRaster
+            ? (out || "")
+            : (out && out.length < String(dataUrl).length ? out : dataUrl));
         } catch { decodeFallback(); }
       };
       img.onerror = decodeFallback;
@@ -70944,7 +71091,12 @@ async function replaceInFiles(replaceAll) {
     const regex = searchCaseSensitive
       ? new RegExp(query.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "g")
       : new RegExp(query.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "gi");
-    const newContent = content.replace(regex, replacement);
+    // 替换文本必须按**字面量**插入。传字符串给 replace 时，$& $' $` $$ $1 $<name>
+    // 全是替换模式：把 SEP 换成 IFS=$'\n' 时，$' 会展开成「匹配点之后的全部内容」，
+    // 于是每个命中点插进一整份文件尾部——文件成倍膨胀、语法全毁，写盘还成功，
+    // toast 照报「已替换 N 处」。SQL 的 $$、Makefile 的 $$VAR 同理。
+    // 传函数则返回值原样插入，不做任何模式解释。
+    const newContent = content.replace(regex, () => replacement);
     if (newContent !== content) {
       try {
         const open = openFiles.get(filePath);

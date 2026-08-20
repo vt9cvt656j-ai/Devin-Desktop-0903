@@ -1070,7 +1070,10 @@ test("an interrupted turn keeps what the model already wrote", () => {
   // 3. The run loop broke on the error BEFORE the line that accumulates the prose into the run
   //    summary — which is the only thing persisted to history. This is the one that made it
   //    survive a restart as well as a repaint.
-  assert.match(SRC, /if \(turn\.error\) \{[\s\S]{0,900}summaryText \+= \(summaryText \? "\\n\\n" : ""\) \+ turn\.text\.trim\(\);[\s\S]{0,700}finalErr = turn\.error; break;/);
+  // 距离放宽到 1400：这个 break 之前现在还要补一段记账（didMutate / _implOps），
+  // 因为落了盘的文件不光要进清单，还得让「改了代码就要验证」那条记账触发得起来。
+  // 断言要守的仍然是同一件事——正文必须在 break **之前**被收进 run 摘要。
+  assert.match(SRC, /if \(turn\.error\) \{[\s\S]{0,900}summaryText \+= \(summaryText \? "\\n\\n" : ""\) \+ turn\.text\.trim\(\);[\s\S]{0,1400}finalErr = turn\.error; break;/);
   // 正文之外，**已经落盘的文件**也要收账再走。流完即写是在流式阶段就真写磁盘的，
   // 而这条 break 走在批处理之前：不收的话，落了盘的文件在消息历史、run 摘要、账本里
   // 一个记录都没有——磁盘变了，所有记录都说没变。

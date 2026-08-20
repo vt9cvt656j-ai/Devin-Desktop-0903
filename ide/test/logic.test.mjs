@@ -23014,6 +23014,19 @@ test("同一轮里前面的命令失败，后面的命令不许再跑", () => {
   assert.equal(block(run, [item("which python", false), item("which node")], 1), null,
     "只读探测失败是信息本身，不是前提塌了——一次性探环境是正当批次");
 
+  // 被拦的这一侧是纯读命令时也要放行。
+  //
+  // 这道门自己的理由是「继续跑只会把一个错误变成一排错误」——那说的是会改状态的命令。
+  // _callIsReadOnlyCommand 一直只用在失败那一侧，没用在被拦这一侧：于是
+  // [npm run build（失败）, git status, cat package.json, ls dist] 里后三条全被拦下，
+  // 而它们恰恰是拿来看清这次失败的。模型被逼着一条一条重发，一次排查多烧三四轮。
+  for (const probe of ["cat package.json", "ls dist", "pwd"]) {
+    assert.equal(block(run, [item("npm run build", false), item(probe)], 1), null,
+      `读命令 \`${probe}\` 被拦了 —— 它改不了任何东西，拦它换不来一点安全`);
+  }
+  // 会改状态的照拦不误。
+  assert.ok(block(run, [item("npm run build", false), item("rm -rf dist")], 1));
+
   // 只对 agent 轮生效，且第一条永远放行。
   assert.equal(block({ mode: "chat" }, [item("a", false), item("b")], 1), null);
   assert.equal(block(run, [item("npm run build", false)], 0), null);
@@ -28029,6 +28042,23 @@ test("自动改重复标点不许碰别的语言的合法语法", () => {
   }
 });
 
+test("自动改重复标点只许碰用户刚动过的那几行", () => {
+  // 同批四个改写器里只有它原来扫整个文件。后果不是性能是改坏别人的代码：
+  // `,,` 在 JS 里是合法的稀疏数组（长度里有个洞），被合并掉长度就变了。
+  // 全文扫描意味着用户在文件某处敲个空格，几百行外一个他从没碰过的数组
+  // 就被悄悄改掉，随后自动保存直接落盘、零提示。
+  // needle 拼出来，否则这个测试自己会被数进去。
+  const fnAt = SRC.indexOf("function " + "_fixDoublePunctuation");
+  assert.ok(fnAt >= 0, "改写器挪走了，这条断言失去落点");
+  const body = SRC.slice(fnAt, SRC.indexOf("\nfunction ", fnAt + 10));
+  assert.match(body, /_fixDoublePunctuation\(model, changedLines\)/,
+    "必须收改动行参数，不能只拿 model 就开扫");
+  assert.match(body, /for \(const ln of changedLines\)/,
+    "必须只遍历改动行");
+  assert.doesNotMatch(body, /for \(let ln = 1; ln <= total/,
+    "又变回全文扫描了——用户没碰过的行会被改掉并自动落盘");
+});
+
 test("会删东西的 find 不许被判成只读命令，批量删除必须弹确认", () => {
   // 只读判定在审批链里排在 mustAsk **前面**并直接 return true，所以一旦某条命令被判成
   // 只读，它连「改动前审批」都绕得过去——用户自己打开的闸对它无效。而 find 的动作谓词
@@ -31281,7 +31311,14 @@ test("gh_pr_review_comments：抬头的条数必须是正文里真有的条数",
   assert.ok(big.content.includes(`还有 ${40 - shown} 条没在这里`));
   assert.ok(big.content.length < 4200,
     `正文没有字符预算了（${big.content.length} 字）—— 一条 review 意见能写很长，30 条足够把上下文冲垮`);
-  assert.match(big.content, /gh api repos/, "没给取剩下那些的办法");
+  assert.match(big.content, /gh api "repos/, "没给取剩下那些的办法");
+  // 实测（gh 2.94）：--paginate 下 --jq 是按**每一页**分别作用的，不是对合并后的数组。
+  // `--jq '.[30:]'` 于是变成「每页各跳过 30 条」——40 条分两页时第二页只有 10 条，
+  // 切出来是空数组。给模型一条跑出错结果的命令，比不给更糟。
+  assert.doesNotMatch(big.content, /--paginate --jq|--jq[^\n]*--paginate/,
+    "又把 --paginate 和 --jq 写在一起了 —— jq 会按页作用，切出来不是这一批");
+  assert.match(big.content, /per_page=100/, "没有单页取，切片就没有意义");
+  assert.match(big.content, /别加 --paginate/, "没警告这个坑，模型很容易自己加回去");
   assert.match(big.content, /别按「都看完了」下结论/);
 
   // 30 条上限也要走同一条抬头。
@@ -31315,4 +31352,43 @@ test("生成类资产：后端认出扩展名不对时，回执必须把这句�
   const wrong = run({ bytes: 1234, ext_note: "上游返回的其实是 zip，不是 glb；文件已按真实格式改名保存。" });
   assert.match(wrong.content, /⚠ 上游返回的其实是 zip/,
     "后端已经认出文件不是 glb，这句却没转给模型");
+});
+
+// view_image 收 .svg，返回的是 data:image/svg+xml —— OpenAI / Anthropic / Gemini
+// 三家视觉接口一个都不收。而工具结果这条路从来没过消毒（用户拖进来的附件那条一直有），
+// 于是图被丢掉，工具回执却写着「图已回传给你看」，模型照着那句话编视觉结论。
+test("送给模型的图必须先消毒：SVG 要栅格化，送不进去的要说出来", async () => {
+  // ① _downscaleImageForVision：needsRaster 时不许退回原来那份 SVG。
+  //    原来结尾写的是 `out.length < dataUrl.length ? out : dataUrl`，
+  //    而 SVG 是文本、几乎永远比它自己的 PNG 小 —— 强制栅格化写了等于没写。
+  const src = extractFn("_downscaleImageForVision");
+  assert.match(src, /const needsRaster = String\(dataUrl\)\.startsWith\("data:image\/svg\+xml"\)/);
+  // 只看**结尾那次 resolve**：decodeFallback 那行长得很像，用整份源码匹配会被它顶掉。
+  const tail = src.slice(src.indexOf("let out = cv.toDataURL"));
+  assert.match(tail, /resolve\(stripMetadata \|\| needsRaster/,
+    "栅格化的结果又被大小比较扔了 —— SVG 是文本，几乎永远比它自己的 PNG 小，每次都会退回原样");
+  assert.match(src, /const decodeFallback = \(\) => resolve\(stripMetadata \|\| needsRaster \? "" : dataUrl\)/,
+    "SVG 解码失败时退回了 SVG —— 那是一张模型看不了的图");
+
+  // ② _buildImageFeedback：每张图都要过消毒，丢掉的必须报出来。
+  const build = load("_buildImageFeedback", {
+    _modelSeesImages: () => true,
+    _downscaleImageForVision: async (u) => (u.startsWith("data:image/svg+xml") ? "" : u + "#clean"),
+    _describeImageForTextModel: async () => "",
+  });
+
+  const ok = await build(["data:image/png;base64,AAA"], { model: "m" }, "看图", "hint");
+  assert.deepEqual(ok.content[1], { type: "image_url", image_url: { url: "data:image/png;base64,AAA#clean" } },
+    "工具结果里的图没过消毒 —— 4K 截图会撞上载荷上限被整块剥掉");
+
+  const mixed = await build(
+    ["data:image/png;base64,AAA", "data:image/svg+xml;base64,BBB"], { model: "m" }, "看图", "hint");
+  assert.equal(mixed.content.filter((c) => c.type === "image_url").length, 1);
+  assert.match(mixed.content[0].text, /有 1 张图没能转成模型可读的格式/,
+    "悄悄少给一张，模型只会以为那张图不存在，而不是「我没看到」");
+  assert.match(mixed.content[0].text, /你没有看到它们/);
+
+  const none = await build(["data:image/svg+xml;base64,BBB"], { model: "m" }, "看图", "hint");
+  assert.equal(typeof none.content, "string");
+  assert.match(none.content, /一张图都没能送进来，别假装看过/);
 });
