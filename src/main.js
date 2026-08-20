@@ -15843,7 +15843,10 @@ function _conversationSessionMetadata(session) {
     project: session?.project || "",
     anchorRoot: session?._anchorRoot || undefined,
     plan: Array.isArray(session?._planSteps) && session._planSteps.length
-      ? session._planSteps.map((step) => ({ content: step.content, status: step.status })) : undefined,
+      // kind 必须一起存。它是「声明优先、不猜」的地基：模型在 update_plan 里写下的类型是
+      // 事实，动词表只是猜。可它此前跨不过一次存盘——而长任务必然经历存取，于是这条最硬的
+      // 路在真实场景里基本不生效，全靠动词表兜底，判错就永远勾不上。
+      ? session._planSteps.map((step) => ({ content: step.content, status: step.status, ...(step.kind ? { kind: step.kind } : {}) })) : undefined,
     planExpanded: session?._planExpanded ? 1 : undefined, // 计划卡展开态跨重启存活
     demands: Array.isArray(session?._demandLedger) && session._demandLedger.length
       ? session._demandLedger.slice(-40) : undefined,
@@ -17228,7 +17231,7 @@ function _chatSessionDataForStorage(s, mediaBudget, includeHtml = false, options
       { textBudget: options.textBudget },
     ),
     pendingSends: _pendingSendsForStorage(s?._pendingSends || s?.pendingSends, budget, options.textBudget),
-    plan: Array.isArray(s?._planSteps) && s._planSteps.length ? s._planSteps.map((p) => ({ content: p.content, status: p.status })) : undefined,
+    plan: Array.isArray(s?._planSteps) && s._planSteps.length ? s._planSteps.map((p) => ({ content: p.content, status: p.status, ...(p.kind ? { kind: p.kind } : {}) })) : undefined,
     demands: Array.isArray(s?._demandLedger) && s._demandLedger.length ? s._demandLedger.slice(-40) : undefined,
     thinks: Array.isArray(s?._thinkLedger) && s._thinkLedger.length ? s._thinkLedger.slice(-6) : undefined, // 方案A：思考结论账本跨重启存活
     intentState: s?._intentState && typeof s._intentState === "object" ? s._intentState : undefined,
@@ -17718,7 +17721,12 @@ async function restoreChatHistory() {
         // _renderSessionHistory when this tab is first shown, restoring the full
         // visual instead of re-rendering plain text.
         if (typeof sData.html === "string" && sData.html) session._htmlSnapshot = sData.html;
-        if (Array.isArray(sData.plan) && sData.plan.length) session._planSteps = sData.plan.map((p) => ({ content: String(p.content || ""), status: p.status || "pending" }));
+        // 读回来的 kind 过一遍白名单：存档是磁盘上的普通文件，脏值不能直接进判定链。
+        if (Array.isArray(sData.plan) && sData.plan.length) session._planSteps = sData.plan.map((p) => ({
+          content: String(p.content || ""),
+          status: p.status || "pending",
+          ...(_PLAN_STEP_KINDS.has(String(p.kind || "").toLowerCase()) ? { kind: String(p.kind).toLowerCase() } : {}),
+        }));
         if (sData.planExpanded) session._planExpanded = true; // 计划卡展开态跨重启存活
         if (Array.isArray(sData.demands) && sData.demands.length) session._demandLedger = sData.demands.map((d) => String(d)).filter(Boolean).slice(-40);
         // 方案A：思考结论账本恢复——重启后下一轮仍能"接着想"而不是从零重想
@@ -35007,10 +35015,29 @@ function _advancePlanFromTool(run, call, result) {
     // 用户实拍：9 步计划的第 1 步是"调研"，模型直接去写 package.json（第 3 步的活），
     // 进度条停在 0/9——他看到的是"计划列得挺准，就是不照着走"。
     // 记在 run 上，供每轮那条计划位置行带一句，不新开提醒通道、不占提醒预算。
+    // 再往后找一步：刚做的这件事**其实对上了第几步**。
+    //
+    // 这一段修的是整个账本停摆的机制：指针永远钉在最早一个没做完的步（_planPrimeCurrentStep
+    // 取第一个 pending），而匹配器只看那一步。模型一旦不按顺序做——用户实拍就是跳过
+    // 第 1 步「调研」直奔第 3 步「搭建脚手架」——每个动作都拿去和「调研」比，必然对不上，
+    // 于是**任何一步都再也勾不上**，进度条永久钉死 0/9。这不是勾错，是停摆。
+    //
+    // 只算不勾：打勾入口仍然只有队头那一条路（自动勾非当前步就是假完成）。
+    // 算出来是为了把话说准——「你刚做的属于第 3 步那一类，而你当前停在第 1 步」，
+    // 比一句干巴巴的「对不上」有用得多，模型据此要么回去做第 1 步，要么 update_plan 调整。
+    let _matchIdx = -1;
+    for (let k = idx + 1; k < steps.length; k++) {
+      const st = steps[k];
+      if (st?.status === "completed" || st?.status === "cancelled") continue;
+      if (_planStepMatchesEvidence(st, evidenceKinds)) { _matchIdx = k; break; }
+    }
     run._planStepMismatch = {
       step: String(steps[idx]?.content || "").slice(0, 80),
+      at: idx + 1,
       want: _planStepActionKind(steps[idx]),
       got: [...new Set(evidenceKinds)].join("/"),
+      matchAt: _matchIdx >= 0 ? _matchIdx + 1 : 0,
+      matchStep: _matchIdx >= 0 ? String(steps[_matchIdx]?.content || "").slice(0, 60) : "",
     };
     if (changed) {
       run._planSteps = steps;
@@ -50003,7 +50030,11 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
               + `当前第 ${_atIdx + 1} 步：${String(_planNow[_atIdx]?.content || "").slice(0, 160)}`
               + (_next ? `（其后：${String(_next.content || "").slice(0, 80)}）` : "（这是最后一步）")
               + (run._planStepMismatch
-                ? `\n上一次动作是「${run._planStepMismatch.got}」类，而这一步要的是「${run._planStepMismatch.want}」类，所以它没有被勾上。两条路都行：先把这一步做掉，或者 update_plan 把它标 cancelled 并写明为什么不做——别让它一直停在这儿。`
+                ? (run._planStepMismatch.matchAt
+                    ? `\n上一次动作其实属于第 ${run._planStepMismatch.matchAt} 步（${run._planStepMismatch.matchStep}）那一类，而你当前停在第 ${run._planStepMismatch.at} 步，所以两边都没被勾上——打勾只认当前这一步。要么回来把第 ${run._planStepMismatch.at} 步做掉，要么 update_plan 把它标 cancelled 并写明为什么不做。`
+                    : run._planStepMismatch.want
+                      ? `\n上一次动作是「${run._planStepMismatch.got}」类，而这一步要的是「${run._planStepMismatch.want}」类，所以它没有被勾上。先把这一步做掉，或者 update_plan 标 cancelled 并写明原因。`
+                      : `\n这一步没写清属于哪一类（读/写/跑/验），系统不会替你勾：在 update_plan 里给它补一个 kind，或者做完自己标 completed。`)
                 : "") });
           }
         }
