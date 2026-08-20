@@ -23430,6 +23430,9 @@ test("late and steering intent adoption immediately reconcile the live tool wind
     // injecting a stub here would hide it if that ever stopped being true.
     _sessionStableSemanticProfile: load("_sessionStableSemanticProfile"),
     _startMichaelDesignPreflight: () => { throw new Error("design preflight must not run"); },
+    // 真实现，不打桩：裁决落定后要把契约送进对话，桩会把「到底送没送」这件事测糊。
+    _agentIntentExecutionBlock: load("_agentIntentExecutionBlock"),
+    _ORCH_NOTE: loadConst("_ORCH_NOTE"),
   });
   let syncs = 0;
   const run = {
@@ -29034,4 +29037,88 @@ test("评审结论从落盘到卡片走一趟真的通", () => {
   // done 缺席（评审回了畸形 JSON）不许被当成「没实现」。
   const noDone = persist({ _wrapUpVerdict: { verified: true, instruction: "缺了鉴权", direction: "", findings: [] } }, true, true);
   assert.ok(!noDone || !noDone.instruction, "done 缺席时把 instruction 当成了「没实现」——凭空冤枉自己");
+});
+
+// ---- 从第二轮起，模型根本没见过「这个人到底要什么」 ----
+//
+// 那道等裁决的窗口只在会话第一轮付一次（_intentWaitPaid 无条件记账）。第二轮起，同步取
+// 画像的两条路都不命中：sameTurn 比的是**上一轮**原文，缓存键含**本轮**新原文。于是
+// intentSemantic 为 null，_agentIntentExecutionBlock 开头 `if (!semantic) return ""` 整块不渲染——
+// 重述 / 约束 / 验收标准 /「哪里还不确定」一个字都到不了模型面前。裁决 19.8 秒后确实落定，
+// 但落定处只拿它更新闸门，然后 `void messages;` 把消息数组丢掉。分类器每轮付的那笔钱，
+// 模型从第二轮起就没读过——这正是「不理解用户真正需求」的根。
+test("裁决迟到落定时，契约要真的送进对话，而不是只更新闸门", () => {
+  const semantic = {
+    continuation: "new", restatedTask: "把登录接口接上真实鉴权，别再写死返回 true",
+    goal: "打通鉴权", action: "implement", target: "登录接口",
+    constraints: ["不能改动数据库表结构"], successCriteria: ["用错密码必须登录失败"],
+    ambiguities: ["用会话还是 JWT 没说"],
+  };
+  const lateProfile = {
+    intentSource: "ai", workspaceAction: "modify", deliverySurface: "code",
+    runtimeObligations: [], externalObligations: [], designKnowledgeRequired: false,
+    intentSemantic: semantic, intentEngineering: null,
+  };
+  const applyLate = load("_applyLateIntentIfLanded", {
+    _semanticEngineeringEvidence: () => ({ _isAgentMode: true }),
+    _mergeAiIntentProfile: () => lateProfile,
+    _engineeringProfileWithAiIntent: () => null,
+    _ideSemanticProfile: () => "semantic:modify",
+    _sessionStableSemanticProfile: load("_sessionStableSemanticProfile"),
+    _startMichaelDesignPreflight: () => {},
+    _agentIntentExecutionBlock: load("_agentIntentExecutionBlock"),
+    _ORCH_NOTE: loadConst("_ORCH_NOTE"),
+  });
+  const mkRun = () => ({ mode: "agent", engineering: { intentSource: "none" },
+    _intentState: { settled: true, verdict: { engineering: {} } } });
+
+  const messages = [];
+  assert.equal(applyLate(mkRun(), {}, "接上鉴权", {}, null, () => true, messages), true);
+  assert.equal(messages.length, 1, "裁决落定了却没送进对话——模型这一整轮都不知道用户要什么");
+  const sent = messages[0].content;
+  assert.match(sent, /写死返回 true/, "重述没送到");
+  assert.match(sent, /不能改动数据库表结构/, "约束没送到");
+  assert.match(sent, /用错密码必须登录失败/, "验收标准没送到");
+  assert.match(sent, /用会话还是 JWT 没说/, "「哪里还不确定」没送到——这条恰恰是最该让模型知道的");
+  // 必须走编排信封：这不是用户发言，用户也看不到。
+  assert.match(sent, /^〔系统编排提示/, "没套编排信封，会被当成用户自己说的话");
+  // 必须自报「我是迟到落定的」，否则模型无从判断这份重述和它已经在做的事哪个新。
+  assert.match(sent, /landed after the turn had already started/,
+    "没说明这是迟到落定的本轮裁决");
+  assert.doesNotMatch(sent, /classification timed out/,
+    "沿用了那句「分类超时、沿用旧目标」的死文案——它描述的是另一回事，等于让模型信一句假话");
+
+  // 闸门用的是 intentSource === "ai" 的精确比较，来源标签只许贴在渲染用的副本上。
+  const run2 = mkRun();
+  applyLate(run2, {}, "接上鉴权", {}, null, () => true, []);
+  assert.equal(run2.engineering.intentSource, "ai",
+    "把来源标签写回了 run.engineering —— 闸门那条精确比较会当场变哑");
+
+  // 一个 run 只注一次：上面那句 `intentSource === "ai"` 的早返回本来就保证了，
+  // 但标志位要把这条不变式写明。
+  const run3 = mkRun();
+  const msgs3 = [];
+  applyLate(run3, {}, "接上鉴权", {}, null, () => true, msgs3);
+  assert.equal(applyLate(run3, {}, "接上鉴权", {}, null, () => true, msgs3), false);
+  assert.equal(msgs3.length, 1, "同一个 run 里重复注入，会把同一份契约在对话里堆好几遍");
+  assert.equal(run3._lateIntentContractInjected, true);
+
+  // 没有语义可送时不许硬塞一条空的编排消息。
+  const bare = [];
+  const applyBare = load("_applyLateIntentIfLanded", {
+    _semanticEngineeringEvidence: () => ({ _isAgentMode: true }),
+    _mergeAiIntentProfile: () => ({ ...lateProfile, intentSemantic: null }),
+    _engineeringProfileWithAiIntent: () => null,
+    _ideSemanticProfile: () => "s",
+    _sessionStableSemanticProfile: load("_sessionStableSemanticProfile"),
+    _startMichaelDesignPreflight: () => {},
+    _agentIntentExecutionBlock: load("_agentIntentExecutionBlock"),
+    _ORCH_NOTE: loadConst("_ORCH_NOTE"),
+  });
+  applyBare(mkRun(), {}, "x", {}, null, () => true, bare);
+  assert.equal(bare.length, 0, "没有语义还硬塞一条空的编排消息，纯污染上下文");
+
+  // 那条被替换掉的死文案不许再有第二个消费者。
+  assert.equal((SRC.match(/session-inherited/g) || []).length, 0,
+    "session-inherited 全仓没有生产者，留着就是一句永不成立的说明");
 });

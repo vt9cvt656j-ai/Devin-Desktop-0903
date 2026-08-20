@@ -45811,7 +45811,7 @@ function _agentIntentExecutionBlock(profile) {
   };
   const lines = [
     "🎯 **This turn's intent contract (internal — do not recite the classification back to the user)**",
-    `Relation: ${relationLabels[semantic.continuation] || "to be confirmed"}${profile.intentSource === "session-inherited" ? " (classification timed out; inherited from a confirmed goal in this session — the user's own words this turn still take precedence)" : ""}`,
+    `Relation: ${relationLabels[semantic.continuation] || "to be confirmed"}${profile.intentSource === "ai-late" ? " (this turn's classification landed after the turn had already started — it IS this turn's verdict, not a carry-over from an earlier goal; the user's own words this turn still take precedence)" : ""}`,
   ];
   // Automatic prompt optimization: lead with the clarified restatement so the model acts on
   // an understood, complete version of a terse/ambiguous message — while the user's raw
@@ -47213,7 +47213,30 @@ function _applyLateIntentIfLanded(run, config, task, session, body, isLive, mess
   if (late.designKnowledgeRequired && !run._michaelDesignEvidence) {
     _startMichaelDesignPreflight({ run, body, isLive });
   }
-  void messages;
+  // 裁决落定了，就把它**送进对话**——否则从会话第二轮起，模型这一整轮都没见过
+  // 「这个人到底要什么」。
+  //
+  // 那道等裁决的窗口只在会话第一轮付一次（_intentWaitPaid 在 25943 无条件记账）。第二轮起
+  // 同步取画像的两条路都不命中：sameTurn 比的是**上一轮**原文，缓存键含**本轮**新原文。
+  // 于是 intentSemantic 为 null，而 _agentIntentExecutionBlock 开头就是
+  // `if (!semantic) return ""` —— 重述 / Goal / 约束 / 验收标准 / 「哪里还不确定」整块不渲染，
+  // 一个字都到不了模型面前。裁决本身 19.8 秒后确实落定了，这里原来只拿它更新闸门，
+  // 然后 `void messages;` 把消息数组显式丢掉。分类器每轮付的那笔钱，模型从第二轮起就没读过。
+  //
+  // 判据是执行事实：能走到这里意味着 late.intentSource === "ai"，即本轮裁决真的落地了
+  // （不是等待、不是估计）。注进去的是**模型自己产出的裁决**，不是 harness 的判断，
+  // 也不动任何闸门。上面那句 `run.engineering?.intentSource === "ai"` 的早返回天然保证
+  // 一个 run 最多注一次；标志位是把这条不变式写明，别让后来的改动无声地破掉它。
+  //
+  // 渲染时才贴 "ai-late" 这个来源标签，且只贴在**副本**上：闸门用的是
+  // `intentSource === "ai"` 的精确比较（gate-tristate 那条测试钉着），动了真值会把闸门弄哑。
+  if (Array.isArray(messages) && !run._lateIntentContractInjected) {
+    const _lateContract = _agentIntentExecutionBlock({ ...late, intentSource: "ai-late" });
+    if (_lateContract) {
+      run._lateIntentContractInjected = true;
+      messages.push({ role: "user", content: _ORCH_NOTE + _lateContract });
+    }
+  }
   return true;
 }
 
