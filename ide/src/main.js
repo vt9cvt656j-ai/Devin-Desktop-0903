@@ -21979,7 +21979,25 @@ function _mergeAiIntentProfile(base, intents, text, priorState = null) {
   m.engineeringGrade = m.projectEngineering;
   m.applies = !!(m.projectEngineering || m.bug || m.architecture || m.implementation || m.database
     || m.git || m.backendApi || m.packageVersion || (m.ui && m.projectScope) || orchestration);
-  m.substantial = m.applies && !!(m.industrialProject || projectSized || architectureMode === "design_new"
+  // 风险面 ≠ 规模。securityRisk / businessLogic / businessRisk / architectureQuality /
+  // qualityFloor / productionReadiness 说的是「这块地方碰了要小心」，不是「这活儿有多大」。
+  // 而提示词明令「涉及权限、鉴权、支付/金额、租户归属、对外接口……都要标 securityRisk
+  // （写一个登录功能同样要标）」——于是「改登录页那个错别字」会被这条链路一路抬成大工程：
+  //     securityRisk → industrialProject → substantial → requiresPlan
+  // 用户看到的就是：改一个字，先弹一份只有一步的计划卡，还被灌一整套「先按架构边界拆
+  // 服务/模块/数据流/队列/缓存」的清单，而「小任务律：直接用最短证据链完成」被压掉了。
+  //
+  // 这里只给**纯风险/质量面**加一道下限：模型自己声明的 changeScope 高于 local 才算规模信号。
+  // 判据是模型的声明（changeScope 已由 _AI_CHANGE_SCOPES 校验），不是 harness 猜的。
+  // 注意**不是**把它们从 industrialProject 里删掉——工业级律 / 业务漏洞律 / 架构质量律
+  // 照常按面触发，一条不少；改的只是「要不要按大工程的流程走」。
+  const _riskSurface = !!(m.securityRisk || m.businessLogic || m.businessRisk
+    || m.architectureQuality || m.qualityFloor || m.productionReadiness);
+  const _scaleSignal = !!(m.largeProject || m.multiService || m.allProjectsEngineering
+    || m.promptRescue || m.vagueProjectRequest || m.maintainabilityUpgrade
+    || m.databaseOps || m.containerOps || m.featureCompleteness || m.websiteDelivery);
+  const _industrialScale = _scaleSignal || (_riskSurface && !["none", "local"].includes(changeScope));
+  m.substantial = m.applies && !!(_industrialScale || projectSized || architectureMode === "design_new"
     || architectureMode === "refactor_existing" || m.debugProject
     || m.databaseArchitecture || m.containerOps || m.featureCompleteness || m.websiteDelivery
     || (m.database && m.explicitWorkspaceMutation)
@@ -41473,7 +41491,19 @@ function _planBeforeBuildIssue(run, call) {
   if (!_implementationGroundingCandidate(call) && !_introducesNewTech(call)) return "";
   const p = run.engineering || {};
   // 只对"从零建一个东西"生效：改 bug、改已有代码不在此列。
-  if (!(p.projectScope || p.fromZeroUiProject || p.fullWebsite || p.substantial)) return "";
+  //
+  // 上面这句注释以前是假的：条件里带着 p.substantial，而那是 harness 的**派生量**
+  // （m.substantial = applies && (industrialProject || …)，其中 industrialProject 把
+  // securityRisk / businessLogic / architectureQuality 这些**风险面**也滚了进来）。
+  // 于是「把这个模块重构一下」「修这个 bug」「改登录页一个错别字」的第一次落盘会被
+  // [BLOCKED_PLAN_FIRST] 打回去，逼它先为一个 typo 写一份计划——这是全系统唯一一道
+  // **硬拦回合**的门，判据却比下面那道只发提示的软催单还宽。
+  //
+  // 判据换成模型**直接声明**的维度（六个都在 _AI_INTENT_DIMENSIONS 白名单里）。
+  // substantial 反而不在白名单里：模型就算填了也会被 21982 那行无条件覆盖掉，
+  // 拿一个纯派生量当硬拦判据，正是这次重构要根除的「预测驱动控制流」。
+  if (p.bug || p.debugProject || p.explicitReadOnly) return "";
+  if (!(p.projectScope || p.fromZeroUiProject || p.fullWebsite)) return "";
   const steps = Array.isArray(run._planSteps) ? run._planSteps : [];
   if (steps.length) return "";
   return "[BLOCKED_PLAN_FIRST] 这是从零建一个东西的第一次落盘，而本轮还没有计划。\n"
@@ -47538,9 +47568,16 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
   if (_mustUseWorkspaceToolsNow()) {
     messages.push({
       role: "user",
-      content: _ORCH_NOTE + _agentAnswerOnlyInspection(run.engineering)
+      // 括号是必需的：`+` 比 `?:` 结合得紧，写成 `_ORCH_NOTE + f() ? A : B` 会被解析成
+      // `(_ORCH_NOTE + f()) ? A : B`。_ORCH_NOTE 是非空常量，那个和**恒为真**——于是
+      // ① 永远选只读那条：每个开着工作区的回合，开口前都被告知「本轮是只读任务，
+      //    只准用 read_file/list_dir/search」，哪怕模型自己声明了 workspaceAction:"modify"。
+      //    表现就是「让它改，它读一圈、讲一通该怎么改、然后停下」。
+      // ② 信封被整个吞掉：这条 harness 指令以**裸用户消息**的形态到达，模型于是会说
+      //    「我只看到系统提示，没有用户的实际请求」，或者把内部标记原样念出来。
+      content: _ORCH_NOTE + (_agentAnswerOnlyInspection(run.engineering)
         ? "[AGENT_MODE_TOOL_REQUIRED]\n本轮是项目评价/解释型只读任务。只用 read_file、list_dir、search、find_files、代码导航、诊断或 Git 只读工具取得最小充分事实；不得运行命令、启动服务、安装依赖、修改文件、操作浏览器或做知识库/公网预取。读到目录、清单/入口和少量关键源码后直接回答并结束。"
-        : "[AGENT_MODE_TOOL_REQUIRED]\n本轮明确指向当前项目。先用与结构化目标一致的最直接工具取得真实证据，再完成修改、运行或回答；不得把可能有用的动作扩展成用户没有要求的工作。",
+        : "[AGENT_MODE_TOOL_REQUIRED]\n本轮明确指向当前项目。先用与结构化目标一致的最直接工具取得真实证据，再完成修改、运行或回答；不得把可能有用的动作扩展成用户没有要求的工作。"),
     });
   }
   if (run.engineering?.interactiveWait || run.engineering?.longRunningRuntime) {

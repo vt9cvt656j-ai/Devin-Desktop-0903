@@ -7541,13 +7541,37 @@ test("harness 以「用户」身份塞进去的每一条，都必须戴编排信
   const naked = [];
   for (const m of loop.matchAll(/\{\s*role:\s*"user",\s*content:\s*([^\n]{0,80})/g)) {
     const tail = m[1].trim();
-    if (tail.includes("_ORCH_NOTE")) continue;
+    // 「出现了 _ORCH_NOTE」不等于「戴上了信封」。
+    //
+    // 实拍：`content: _ORCH_NOTE + f() ? A : B`。`+` 比 `?:` 结合得紧，实际是
+    // `(_ORCH_NOTE + f()) ? A : B` —— 那个和恒为真，于是永远走 A 分支，而且**信封被整个
+    // 吞掉**：这条 harness 指令以裸用户消息的形态到达模型。这条断言当时按前缀跳过了它，
+    // 一个字都没报。所以要认的是「信封真的和内容拼在一起」这个形状：
+    // 要么 `_ORCH_NOTE + <后面没有裸三元>`，要么 `_ORCH_NOTE + (`。
+    if (/^_ORCH_NOTE\s*\+\s*\(/.test(tail)) continue;
+    if (tail.includes("_ORCH_NOTE") && !/\?/.test(tail)) continue;
     if (ALLOW.some((a) => tail.startsWith(a))) continue;
     naked.push(tail.slice(0, 60));
   }
   assert.deepEqual(naked, [],
     "这些 harness 注入没戴编排信封，模型会把它们当成用户说的话，并据此判断「用户没有新指令」：\n"
     + naked.map((x) => "  · " + x).join("\n"));
+
+  // 分流本身也要钉：这条注入有两个分支，只读画像拿只读那条、可改画像拿可改那条。
+  // 上面那个优先级 bug 的真正后果是**每一个**开着工作区的回合都被告知「本轮只读」——
+  // 让它改东西它不改，读一圈、讲一通该怎么改、然后停下。
+  const at = SRC.indexOf("content: _ORCH_NOTE + (_agentAnswerOnlyInspection");
+  assert.ok(at > 0, "工作区取证注入的分流不见了");
+  let expr = SRC.slice(at + "content: ".length, SRC.indexOf("\n    });", at)).trim().replace(/,$/, "");
+  const pick = (readOnly) => new Function("_ORCH_NOTE", "_agentAnswerOnlyInspection", "run",
+    "return " + expr + ";")("〔信封〕", () => readOnly, { engineering: {} });
+  for (const [readOnly, want] of [[true, "只读任务"], [false, "再完成修改"]]) {
+    const out = pick(readOnly);
+    assert.ok(out.startsWith("〔信封〕"),
+      `${readOnly ? "只读" : "可改"}画像那条丢了编排信封——会被模型当成用户发言`);
+    assert.ok(out.includes(want),
+      `${readOnly ? "只读" : "可改"}画像拿到了另一条分支的文案`);
+  }
 });
 
 test("每轮排在最后的那块运行状态，必须把用户这轮的原话带回来", () => {
@@ -29510,4 +29534,78 @@ test("流式代码卡和写入预览：贴底判定必须先于内容写入", ()
   // 两处都不许再出现「不带条件的贴底」。
   assert.doesNotMatch(SRC, /\.scrollTop = card\.querySelector\("pre"\)\.scrollHeight/,
     "还有一处无条件贴底没改");
+});
+
+// ---- 唯一一道硬拦回合的门，判据不许比只发提示的那道还宽 ----
+//
+// _planBeforeBuildIssue 是全系统唯一一处会把工具调用换成 [BLOCKED_PLAN_FIRST] 假结果打回去的
+// 门。它的注释写着「只对从零建一个东西生效：改 bug、改已有代码不在此列」——而条件里带着
+// p.substantial，那是 harness 的派生量（industrialProject 把 securityRisk / businessLogic /
+// architectureQuality 这些**风险面**也滚了进来）。于是「重构这个模块」「修这个 bug」
+// 「改登录页一个错别字」的第一次落盘都会被打回去，逼它先为一个 typo 写计划。
+// 硬拦的集合必须 ⊆ 软催单的集合。
+test("硬拦的计划门只认模型直接声明的维度，不认 harness 派生的 substantial", () => {
+  const gate = load("_planBeforeBuildIssue", {
+    _implementationGroundingCandidate: () => true,
+    _introducesNewTech: () => false,
+  });
+  const run = (engineering) => ({ mode: "agent", engineering, _planSteps: [] });
+  const call = { type: "write", path: "src/a.ts" };
+
+  // 该拦的照拦：从零建项目 / 从零建站。
+  assert.ok(gate(run({ projectScope: true }), call), "从零建项目的第一次落盘必须拦");
+  assert.ok(gate(run({ fromZeroUiProject: true }), call), "从零建站的第一次落盘必须拦");
+  assert.ok(gate(run({ fullWebsite: true }), call), "整站交付必须拦");
+
+  // 不该拦的：派生量 substantial 单独出现，不构成硬拦理由。
+  assert.equal(gate(run({ substantial: true, requiresPlan: true }), call), "",
+    "substantial 是 harness 派生量（风险面也会点亮它），拿它硬拦等于改个错别字也要先写计划");
+  // 注释里点名不在此列的三种，必须真的不在此列。
+  for (const d of ["bug", "debugProject", "explicitReadOnly"]) {
+    assert.equal(gate(run({ [d]: true, projectScope: true }), call), "",
+      `注释写着「${d} 不在此列」，就必须真的不拦——否则注释在骗人`);
+  }
+
+  // 判据必须全部来自模型直接声明的维度白名单：派生量不许再回到这道门里。
+  // 必须**剥掉注释**再扫：extractFn 取的是含注释的正文，而上面那段说明里正好写着
+  // 「条件里带着 p.substantial」——按原文扫会被自己的注释喂到（这个仓库栽过不止一次）。
+  const src = extractFn("_planBeforeBuildIssue")
+    .split("\n").filter((l) => !l.trim().startsWith("//")).join("\n");
+  const dims = new Set([...(/const _AI_INTENT_DIMENSIONS = \[([\s\S]*?)\];/.exec(SRC)[1]
+    .matchAll(/"([A-Za-z0-9_]+)"/g))].map((m) => m[1]));
+  for (const used of [...src.matchAll(/\bp\.([A-Za-z0-9_]+)/g)].map((m) => m[1])) {
+    assert.ok(dims.has(used),
+      `硬拦判据用了 p.${used}，而它不在 _AI_INTENT_DIMENSIONS 里 —— 那是 harness 自己派生的，`
+      + "模型填了也会被覆盖。唯一一道硬拦回合的门不许由预测驱动");
+  }
+});
+
+// ---- 风险面不等于规模：改登录页一个错别字不该走大工程流程 ----
+//
+// 提示词明令「涉及权限、鉴权、支付/金额、租户归属、对外接口……都要标 securityRisk
+// （写一个登录功能同样要标）」。而 securityRisk 会滚进 industrialProject → substantial →
+// requiresPlan。于是「把登录页那个错别字改了」被一路抬成大工程：先弹一份只有一步的计划卡，
+// 再灌一套「先按架构边界拆服务/模块/数据流/队列/缓存」，而「小任务律：直接用最短证据链
+// 完成」被压掉。面属性直接当规模属性用，两个正交维度串了线。
+test("纯风险面单独出现时不产出 substantial，除非模型自己声明了更大的 changeScope", () => {
+  const src = extractFn("_mergeAiIntentProfile")
+    .split("\n").filter((l) => !l.trim().startsWith("//")).join("\n");
+  // 下限必须存在，且判据是模型声明的 changeScope。
+  assert.match(src, /const _riskSurface = /, "风险面没有被单独拎出来");
+  assert.match(src, /_riskSurface && !\["none", "local"\]\.includes\(changeScope\)/,
+    "风险面没有 changeScope 下限——改一个字也会被当成大工程");
+  // 下限只加给风险面：真规模信号必须仍然无条件抬升。
+  assert.match(src, /const _scaleSignal = /, "真规模信号没有和风险面分开");
+  for (const scale of ["largeProject", "multiService", "featureCompleteness", "websiteDelivery"]) {
+    assert.match(src, new RegExp(`_scaleSignal[\\s\\S]{0,320}m\\.${scale}`),
+      `${scale} 是真规模信号，不该掉进要看 changeScope 的那一组`);
+  }
+  for (const risk of ["securityRisk", "businessLogic", "businessRisk", "architectureQuality",
+                      "qualityFloor", "productionReadiness"]) {
+    assert.match(src, new RegExp(`_riskSurface = [\\s\\S]{0,260}m\\.${risk}`),
+      `${risk} 是风险/质量面，不该无条件当成规模`);
+  }
+  // 各自的律照常按面触发：不许顺手把它们从 industrialProject 里删掉。
+  assert.match(src, /m\.industrialProject = [\s\S]{0,400}m\.securityRisk/,
+    "把 securityRisk 从 industrialProject 里删掉了——业务漏洞/滥用律会跟着一起哑掉");
 });
