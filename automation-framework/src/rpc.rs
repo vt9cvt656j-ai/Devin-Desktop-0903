@@ -72,6 +72,19 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     diff == 0
 }
 
+/// 合成按键只会投给**当前前台应用**，而前台随时可能被用户、对话框或另一个
+/// 应用抢走。回执里不带这个，一次打进错误窗口和一次正常输入长得一模一样——
+/// 调用方拿到的都是 {"status":"ok"}。
+#[cfg(feature = "system")]
+fn frontmost_now() -> Option<String> {
+    crate::platform::get_window_controller()
+        .enumerate_windows()
+        .ok()?
+        .into_iter()
+        .find(|w| w.is_visible)
+        .map(|w| w.title)
+}
+
 impl RpcServer {
     /// 创建新的 RPC 服务器
     pub fn new(port: u16) -> Result<Self> {
@@ -340,7 +353,8 @@ impl RpcServer {
                     .and_then(|v| v.as_str())
                     .ok_or_else(|| Error::Other(anyhow::anyhow!("Missing 'text' parameter")))?;
                 agent.keyboard_type(text)?;
-                Ok(serde_json::json!({"status": "ok"}))
+                drop(agent);
+                Ok(serde_json::json!({"status": "ok", "delivered_to": frontmost_now()}))
             }
             
             #[cfg(feature = "system")]
@@ -349,7 +363,8 @@ impl RpcServer {
                     .and_then(|v| v.as_str())
                     .ok_or_else(|| Error::Other(anyhow::anyhow!("Missing 'key' parameter")))?;
                 agent.keyboard_press(key)?;
-                Ok(serde_json::json!({"status": "ok"}))
+                drop(agent);
+                Ok(serde_json::json!({"status": "ok", "delivered_to": frontmost_now()}))
             }
             
             #[cfg(feature = "system")]
@@ -361,7 +376,8 @@ impl RpcServer {
                     .filter_map(|v| v.as_str())
                     .collect();
                 agent.keyboard_combo(key_strs)?;
-                Ok(serde_json::json!({"status": "ok"}))
+                drop(agent);
+                Ok(serde_json::json!({"status": "ok", "delivered_to": frontmost_now()}))
             }
             
             #[cfg(feature = "system")]
@@ -436,6 +452,10 @@ impl RpcServer {
                 let list: Vec<serde_json::Value> = wins.iter().map(|w| serde_json::json!({
                     "title": w.title, "process": w.process_name,
                     "x": w.x, "y": w.y, "width": w.width, "height": w.height,
+                    // is_visible 里装的其实是 NSRunningApplication.isActive，也就是
+                    // 「它是不是前台」。名字对不上语义，模型没法知道能拿它回答
+                    // 「现在谁在前台」——而这正是合成按键会打进谁的唯一判据。
+                    "frontmost": w.is_visible,
                     "visible": w.is_visible, "minimized": w.is_minimized,
                 })).collect();
                 Ok(serde_json::json!({ "windows": list }))
@@ -446,7 +466,9 @@ impl RpcServer {
                     .ok_or_else(|| Error::Other(anyhow::anyhow!("Missing 'title' parameter")))?;
                 drop(agent);
                 crate::platform::get_window_controller().activate_window(title)?;
-                Ok(serde_json::json!({ "status": "ok" }))
+                // 到这里才代表**回读确认过**目标真在前台了（见 platform 层的轮询）。
+                // 把实际前台一并回出去，调用方不必再信一个光秃秃的 ok。
+                Ok(serde_json::json!({ "status": "ok", "frontmost": frontmost_now() }))
             }
             #[cfg(feature = "system")]
             "window.minimize" => {
@@ -501,7 +523,8 @@ impl RpcServer {
                 let text = params.get("text").and_then(|v| v.as_str())
                     .ok_or_else(|| Error::Other(anyhow::anyhow!("Missing 'text' parameter")))?;
                 agent.quick_paste(text)?;
-                Ok(serde_json::json!({ "status": "ok" }))
+                drop(agent);
+                Ok(serde_json::json!({ "status": "ok", "delivered_to": frontmost_now() }))
             }
             _ => Err(Error::Other(anyhow::anyhow!("Unknown method: {}", method))),
         }
