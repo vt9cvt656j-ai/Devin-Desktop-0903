@@ -31388,6 +31388,13 @@ test("送给模型的图必须先消毒：SVG 要栅格化，送不进去的要�
     "悄悄少给一张，模型只会以为那张图不存在，而不是「我没看到」");
   assert.match(mixed.content[0].text, /你没有看到它们/);
 
+  // http 图片地址原样放行：canvas 画跨域图会被污染、toDataURL 抛异常，消毒会返回空串，
+  // 那张**能用**的图就被静默吞了。各家接口本来就收 URL 形式的 image_url。
+  const remote = await build(["https://example.test/a.png"], { model: "m" }, "看图", "hint");
+  assert.deepEqual(remote.content[1], { type: "image_url", image_url: { url: "https://example.test/a.png" } },
+    "http 图片地址被消毒吞了 —— 它本来能用");
+  assert.doesNotMatch(remote.content[0].text, /没能转成模型可读的格式/);
+
   const none = await build(["data:image/svg+xml;base64,BBB"], { model: "m" }, "看图", "hint");
   assert.equal(typeof none.content, "string");
   assert.match(none.content, /一张图都没能送进来，别假装看过/);

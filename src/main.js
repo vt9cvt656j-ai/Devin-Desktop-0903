@@ -45933,6 +45933,11 @@ async function _buildImageFeedback(imgs, config, leadText, perImageHint) {
   const _visionImgs = [];
   let _visionDropped = 0;
   for (const u of Array.isArray(imgs) ? imgs : []) {
+    // 只消毒 data: 图。今天每条来源都是 data URL（截图走 bytes_to_jpeg_data_url、
+    // 读图走 readFileDataUrl），但万一将来有工具回一个 http 图片地址：
+    // canvas 画跨域图会被污染、toDataURL 直接抛，消毒返回空串——那张**能用**的图
+    // 就被这里静默吞了。原样放行给模型（各家接口本来就收 URL 形式的 image_url）。
+    if (typeof u === "string" && u && !u.startsWith("data:")) { _visionImgs.push(u); continue; }
     const _s = await _downscaleImageForVision(u, 1568, true);
     if (_s) _visionImgs.push(_s); else _visionDropped++;
   }
