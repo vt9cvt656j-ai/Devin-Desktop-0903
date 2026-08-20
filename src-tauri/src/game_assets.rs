@@ -147,6 +147,101 @@ async fn gateway_post(
 
 // Mirrors the gateway route plus the destination tuple; keeping these fields
 // explicit makes every Tauri command call site auditable.
+/// 按魔数认文件类型。
+///
+/// 保存用的扩展名是**每个命令写死的**（auto_rig/generate_motion 一律 glb、
+/// generate_sound 一律 mp3、generate_texture 一律 png），而
+/// `downloadable_asset_content_type` 明摆着放行 application/zip、
+/// application/octet-stream、image/*——上游给一个打包好的 FBX，落到盘上就叫
+/// `rigged.glb`。之后 three.js 的 GLTFLoader 抛一句看不懂的解析错误，而智能体
+/// 手上的回执写着「已生成骨骼绑定并保存到 assets/models/rigged.glb」，
+/// 它只会去改加载代码——错的地方根本不在那儿。
+///
+/// 只在**确凿**时返回 Some：认不出来就 None，保持声明的扩展名，绝不瞎猜。
+fn sniff_asset_ext(head: &[u8]) -> Option<&'static str> {
+    if head.starts_with(b"glTF") {
+        return Some("glb");
+    }
+    if head.starts_with(b"PK\x03\x04") {
+        return Some("zip");
+    }
+    if head.starts_with(b"Kaydara FBX Binary") {
+        return Some("fbx");
+    }
+    if head.starts_with(b"\x89PNG\r\n\x1a\n") {
+        return Some("png");
+    }
+    if head.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        return Some("jpg");
+    }
+    if head.starts_with(b"GIF87a") || head.starts_with(b"GIF89a") {
+        return Some("gif");
+    }
+    if head.starts_with(b"OggS") {
+        return Some("ogg");
+    }
+    if head.starts_with(b"fLaC") {
+        return Some("flac");
+    }
+    if head.starts_with(b"ID3") || head.starts_with(&[0xFF, 0xFB]) || head.starts_with(&[0xFF, 0xF3])
+    {
+        return Some("mp3");
+    }
+    // RIFF 是个容器，光看头四个字节分不出 wav / webp / avi。
+    if head.starts_with(b"RIFF") && head.len() >= 12 {
+        return match &head[8..12] {
+            b"WAVE" => Some("wav"),
+            b"WEBP" => Some("webp"),
+            _ => None,
+        };
+    }
+    // ftyp 盒：mp4 / m4a 一族，第 4..8 字节是 "ftyp"。
+    if head.len() >= 12 && &head[4..8] == b"ftyp" {
+        return match &head[8..11] {
+            b"M4A" => Some("m4a"),
+            _ => Some("mp4"),
+        };
+    }
+    None
+}
+
+/// 落盘之后按魔数复核扩展名；对不上就改名，并把这件事**说出去**。
+///
+/// 认不出来（None）时保持原样——不知道是什么就不要乱改，那会把一个能用的文件
+/// 改成一个没人认识的名字。
+fn correct_extension_after_write(target: &Path, declared: &str) -> (PathBuf, Option<String>) {
+    let mut head = [0u8; 16];
+    let read = match std::fs::File::open(target) {
+        Ok(mut f) => {
+            use std::io::Read;
+            f.read(&mut head).unwrap_or(0)
+        }
+        Err(_) => 0,
+    };
+    let Some(actual) = sniff_asset_ext(&head[..read]) else {
+        return (target.to_path_buf(), None);
+    };
+    if actual.eq_ignore_ascii_case(declared) {
+        return (target.to_path_buf(), None);
+    }
+    let renamed = target.with_extension(actual);
+    match std::fs::rename(target, &renamed) {
+        Ok(()) => (
+            renamed,
+            Some(format!(
+                "上游返回的其实是 {actual}，不是 {declared}；文件已按真实格式改名保存。                 按 {actual} 处理它，别当成 {declared}。"
+            )),
+        ),
+        // 改名失败也要说：内容和扩展名对不上这件事比改名本身重要。
+        Err(e) => (
+            target.to_path_buf(),
+            Some(format!(
+                "警告：文件内容其实是 {actual}，扩展名却是 {declared}，自动改名失败（{e}）。                 按 {actual} 处理它。"
+            )),
+        ),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn gateway_download(
     base_url: &str,
@@ -223,11 +318,15 @@ async fn gateway_download(
             }
             let target = safe_dest(root, sub_dir, name, ext)?;
             let written = stream_asset_to_path(response, &target).await?;
+            let (target, ext_note) = correct_extension_after_write(&target, ext);
             let rel = target.strip_prefix(root).unwrap_or(&target);
             let mut output = serde_json::json!({
                 "path": rel.to_string_lossy(),
                 "bytes": written,
             });
+            if let Some(note) = ext_note {
+                output["ext_note"] = serde_json::Value::String(note);
+            }
             if let Some(task_id) = task_id {
                 output["task_id"] = serde_json::Value::String(task_id);
             }
@@ -241,11 +340,15 @@ async fn gateway_download(
     }
     let target = safe_dest(root, sub_dir, name, ext)?;
     let written = stream_asset_to_path(resp, &target).await?;
+    let (target, ext_note) = correct_extension_after_write(&target, ext);
     let rel = target.strip_prefix(root).unwrap_or(&target);
     let mut output = serde_json::json!({
         "path": rel.to_string_lossy(),
         "bytes": written,
     });
+    if let Some(note) = ext_note {
+        output["ext_note"] = serde_json::Value::String(note);
+    }
     if let Some(task_id) = task_id {
         output["task_id"] = serde_json::Value::String(task_id);
     }
@@ -620,5 +723,92 @@ mod tests {
         .unwrap();
         assert_eq!(response.status(), reqwest::StatusCode::ACCEPTED);
         server.join().unwrap();
+    }
+}
+
+#[cfg(test)]
+mod asset_extension_tests {
+    use super::{correct_extension_after_write, sniff_asset_ext};
+
+    /// 函数写对了但没接上，等于没写。gateway_download 有**两个**落盘点
+    /// （JSON 里带 download_url 的那条、直接流式返回的那条），两条都要复核，
+    /// 而且 ext_note 都要塞进返回的 JSON——不然后端认出来了、模型收不到。
+    #[test]
+    fn both_write_paths_are_actually_wired() {
+        let src = include_str!("game_assets.rs");
+        let body = src
+            .split("async fn gateway_download(")
+            .nth(1)
+            .and_then(|s| s.split("\nfn downloadable_asset_content_type").next())
+            .expect("gateway_download 的函数体不见了");
+        assert_eq!(
+            body.matches("stream_asset_to_path").count(),
+            2,
+            "落盘点数量变了，这条断言的前提得重算"
+        );
+        assert_eq!(
+            body.matches("correct_extension_after_write").count(),
+            2,
+            "有落盘点没做扩展名复核"
+        );
+        assert_eq!(
+            body.matches("output[\"ext_note\"]").count(),
+            2,
+            "有落盘点没把 ext_note 塞回 JSON —— 后端认出来了，模型收不到"
+        );
+    }
+
+    #[test]
+    fn known_magics_are_recognised() {
+        assert_eq!(sniff_asset_ext(b"glTF\x02\x00\x00\x00"), Some("glb"));
+        assert_eq!(sniff_asset_ext(b"PK\x03\x04\x14\x00"), Some("zip"));
+        assert_eq!(sniff_asset_ext(b"Kaydara FBX Binary  \x00"), Some("fbx"));
+        assert_eq!(sniff_asset_ext(b"\x89PNG\r\n\x1a\n"), Some("png"));
+        assert_eq!(sniff_asset_ext(b"ID3\x03\x00"), Some("mp3"));
+        assert_eq!(sniff_asset_ext(b"RIFF\x24\x00\x00\x00WAVEfmt "), Some("wav"));
+        assert_eq!(sniff_asset_ext(b"RIFF\x24\x00\x00\x00WEBPVP8 "), Some("webp"));
+    }
+
+    /// 认不出来就必须是 None。瞎猜会把一个能用的文件改成没人认识的名字。
+    #[test]
+    fn unknown_bytes_are_left_alone() {
+        assert_eq!(sniff_asset_ext(b"\x00\x01\x02\x03"), None);
+        assert_eq!(sniff_asset_ext(b""), None);
+        assert_eq!(sniff_asset_ext(b"RIFF\x00\x00\x00\x00AVI "), None);
+    }
+
+    /// 这就是审计里那条：auto_rig 一律按 glb 存，上游给的其实是打包好的 FBX。
+    #[test]
+    fn a_zip_saved_as_glb_gets_renamed_and_reported() {
+        let dir = std::env::temp_dir().join(format!(
+            "mrday-asset-ext-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("rigged.glb");
+        std::fs::write(&target, b"PK\x03\x04rest of a zipped fbx").unwrap();
+
+        let (path, note) = correct_extension_after_write(&target, "glb");
+        assert_eq!(path.extension().and_then(|e| e.to_str()), Some("zip"));
+        assert!(path.exists(), "改名后的文件不在盘上");
+        assert!(!target.exists(), "旧的 .glb 还留着，会有两份");
+        let note = note.expect("扩展名对不上却一个字都不说");
+        assert!(note.contains("zip") && note.contains("glb"), "{note}");
+
+        // 对得上时不动、也不多话。
+        let ok = dir.join("model.glb");
+        std::fs::write(&ok, b"glTF\x02\x00\x00\x00").unwrap();
+        let (p2, n2) = correct_extension_after_write(&ok, "glb");
+        assert_eq!(p2, ok);
+        assert!(n2.is_none());
+
+        // 认不出来的字节：保持原样，不改名也不报警。
+        let unknown = dir.join("thing.glb");
+        std::fs::write(&unknown, b"\x00\x01\x02\x03").unwrap();
+        let (p3, n3) = correct_extension_after_write(&unknown, "glb");
+        assert_eq!(p3, unknown);
+        assert!(n3.is_none());
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

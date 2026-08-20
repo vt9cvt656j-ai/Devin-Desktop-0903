@@ -31296,3 +31296,23 @@ test("gh_pr_review_comments：抬头的条数必须是正文里真有的条数",
   assert.match(run({ code: 0, stdout: "[]" }).content, /确实是空的/);
   assert.match(run({ code: 1, stdout: "gh: not found" }).content, /\[ERROR\][\s\S]*退出码 1/);
 });
+
+// 3D / 音频 / 贴图的落盘扩展名是每个命令写死的（auto_rig、generate_motion 一律 glb），
+// 而后端的内容类型闸门明摆着放行 zip / octet-stream / image/*。上游给一个打包好的 FBX，
+// 文件就叫 rigged.glb，回执照样写「已生成骨骼绑定并保存到 assets/models/rigged.glb」——
+// 之后加载器抛一句看不懂的解析错误，模型只会去改加载代码。
+test("生成类资产：后端认出扩展名不对时，回执必须把这句转给模型", () => {
+  const seg = SRC.slice(SRC.indexOf("const _taskNote = _returnedTaskId ?"),
+                        SRC.indexOf("} catch (e) {", SRC.indexOf("const _taskNote = _returnedTaskId ?")));
+  const run = (out) => new Function(
+    "_returnedTaskId", "call", "_gaPath", "_gaOut", "_gaLabels", seg,
+  )("", { type: "auto_rig" }, "assets/models/rigged.glb", out, { auto_rig: "骨骼绑定" });
+
+  const clean = run({ bytes: 1234 });
+  assert.match(clean.content, /已生成骨骼绑定并保存到 assets\/models\/rigged\.glb/);
+  assert.doesNotMatch(clean.content, /⚠/, "没问题的时候别平白加一句警告");
+
+  const wrong = run({ bytes: 1234, ext_note: "上游返回的其实是 zip，不是 glb；文件已按真实格式改名保存。" });
+  assert.match(wrong.content, /⚠ 上游返回的其实是 zip/,
+    "后端已经认出文件不是 glb，这句却没转给模型");
+});

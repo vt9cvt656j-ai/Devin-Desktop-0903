@@ -55810,7 +55810,12 @@ async function _executeToolStepInner(step, call, root, run) {
         scheduleProjectCacheRefresh(_gaWs, "资源生成完成");
         const _gaPath = (_gaOut && _gaOut.path) || "";
         const _taskNote = _returnedTaskId ? "\n真实 Tripo task_id: " + _returnedTaskId : "";
-        return { type: call.type, path: _gaPath, task_id: _returnedTaskId || undefined, content: `已生成${_gaLabels[call.type]}并保存到 ${_gaPath}（${_gaOut && _gaOut.bytes ? _gaOut.bytes : "?"}字节）。${_taskNote}` };
+        // 落盘扩展名是每个命令写死的（auto_rig/generate_motion 一律 glb、音效一律 mp3、
+        // 贴图一律 png），后端按魔数复核过一遍；对不上时它会改名并给出 ext_note。
+        // 这句必须转出去：不然回执写着「已保存到 rigged.glb」而文件其实是个 zip，
+        // 模型只会去改加载代码，错的地方根本不在那儿。
+        const _extNote = String(_gaOut?.ext_note || "").trim();
+        return { type: call.type, path: _gaPath, task_id: _returnedTaskId || undefined, content: `已生成${_gaLabels[call.type]}并保存到 ${_gaPath}（${_gaOut && _gaOut.bytes ? _gaOut.bytes : "?"}字节）。${_extNote ? `\n⚠ ${_extNote}` : ""}${_taskNote}` };
       } catch (e) {
         res.className = "atc-result atc-result--err"; res.textContent = `${_gaLabels[call.type]}生成失败`;
         // 外层只兜到一句通用的"先判断真实原因、别换旁门左道"。可额度不足 / 模型暂不可用
