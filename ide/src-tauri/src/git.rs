@@ -708,15 +708,57 @@ pub fn git_show(root: String, rev: String, rel: Option<String>) -> Result<String
     Ok(text)
 }
 
+/// best-of-N 的候选工作树都建在这里（见 `git_worktree_add`）。remove 只允许动这个目录。
+const BON_WORKTREE_DIR: &str = ".mrdayone/worktrees";
+
+/// 把调用方给的 path 收敛成「**我们自己建的**那一个候选工作树」，否则拒绝。
+///
+/// 原来 remove 是把 path 原样交给 `git worktree remove --force`，一点校验都没有。
+/// 而这个工具在策略表里不需要审批、path 又来自模型（仓库里的文本能诱导它），于是
+/// 「用户自己 `git worktree add ../feature-x` 挂的、里面有一天没提交的改动」的那棵树，
+/// 一句 --force 就没了 —— `--force` 的语义正是「有未提交改动也删」。
+///
+/// add 那边只会建在 `{root}/.mrdayone/worktrees/{[A-Za-z0-9_-]+}`，所以 remove 的合法
+/// 输入集合就这么大。两边用同一条规则，不给它们漂开的机会。
+fn bon_worktree_path(root: &str, path: &str) -> Result<(String, String), String> {
+    let seg = path
+        .trim_end_matches('/')
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or("");
+    let safe: String = seg
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+        .collect();
+    if safe.is_empty() || safe != seg {
+        return Err(format!(
+            "只能移除本工具自己建的候选工作树（{BON_WORKTREE_DIR}/<名字>），拒绝：'{path}'"
+        ));
+    }
+    let root_trimmed = root.trim_end_matches('/');
+    let expected = format!("{root_trimmed}/{BON_WORKTREE_DIR}/{safe}");
+    // 允许调用方传绝对路径或只传名字，但两者都必须归到同一个位置上。
+    let given = if path.contains('/') || path.contains('\\') {
+        path.trim_end_matches('/').replace('\\', "/")
+    } else {
+        expected.clone()
+    };
+    if given != expected {
+        return Err(format!(
+            "只能移除本工具自己建的候选工作树（{BON_WORKTREE_DIR}/<名字>），拒绝：'{path}'"
+        ));
+    }
+    Ok((expected, safe))
+}
+
 /// 移除一个 worktree（并尽力删掉它的临时分支）= 丢弃这个候选。
 #[tauri::command(async)]
 pub fn git_worktree_remove(root: String, path: String) -> Result<String, String> {
     require_git_root(&root, true)?;
-    run_git_checked(&root, &["worktree", "remove", "--force", &path])?;
-    // 临时分支名从路径末段推回，best-effort 删除（删不掉不算错）。
-    if let Some(seg) = path.rsplit('/').next() {
-        let _ = run_git(&root, &["branch", "-D", &format!("michael/bon-{seg}")]);
-    }
+    let (abs, safe) = bon_worktree_path(&root, &path)?;
+    run_git_checked(&root, &["worktree", "remove", "--force", &abs])?;
+    // 临时分支名由**校验过的**末段推回，而不是从原始输入里切。
+    let _ = run_git(&root, &["branch", "-D", &format!("michael/bon-{safe}")]);
     Ok("removed".into())
 }
 
@@ -1350,6 +1392,41 @@ pub fn git_pull(root: String) -> Result<String, String> {
 
 #[cfg(test)]
 mod tests {
+    /// `--force` 只许落在本工具自己建的候选工作树上。
+    ///
+    /// 原来 remove 把模型给的 path 原样交给 `git worktree remove --force`，零校验；
+    /// 而这个工具不需要审批、path 又可以被仓库里的文本诱导。用户自己
+    /// `git worktree add ../feature-x` 挂的、里面有一天没提交改动的那棵树，一句就没了
+    /// ——`--force` 的语义正是「有未提交改动也删」。
+    #[test]
+    fn worktree_remove_only_accepts_worktrees_this_tool_created() {
+        let root = "/repo";
+        let good = format!("{root}/.mrdayone/worktrees/cand1");
+
+        // add 那边建出来的形状：放行，并且末段原样带出去给分支名用。
+        let (abs, safe) = super::bon_worktree_path(root, &good).expect("自己建的应当放行");
+        assert_eq!(abs, good);
+        assert_eq!(safe, "cand1");
+        // 只给名字也接受，归到同一个位置。
+        assert_eq!(super::bon_worktree_path(root, "cand1").unwrap().0, good);
+
+        // 用户自己挂的工作树、以及各种越界写法：一律拒绝。
+        for bad in [
+            "../feature-x",
+            "/Users/someone/work/feature-x",
+            "/repo/../feature-x",
+            "/repo/.mrdayone/worktrees/../../feature-x",
+            "/repo/src",
+            "",
+            "/repo/.mrdayone/worktrees/",
+        ] {
+            assert!(
+                super::bon_worktree_path(root, bad).is_err(),
+                "这个路径本不该被 --force 删掉：{bad}",
+            );
+        }
+    }
+
     use super::*;
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
