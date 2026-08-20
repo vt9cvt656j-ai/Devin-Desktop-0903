@@ -45593,7 +45593,20 @@ function _agentIntentExecutionBlock(profile) {
   if (semantic.action || semantic.target) lines.push(`Action/object: ${semantic.action || "handle"}${semantic.target ? ` → ${semantic.target}` : ""}`);
   if (semantic.constraints?.length) lines.push(`Constraints: ${semantic.constraints.join("; ")}`);
   if (semantic.successCriteria?.length) lines.push(`Success criteria: ${semantic.successCriteria.join("; ")}`);
-  if (semantic.ambiguities?.length) lines.push(`Still ambiguous: ${semantic.ambiguities.join("; ")}. Resolve it from project or conversation evidence first; ask the user only when it would materially change the result and cannot be established.`);
+  // 歧义这一维**两边都要说话**。
+  //
+  // 原来只在 ambiguities 非空时出声，空数组时一个字不说。可空数组本身就是一次有意义的
+  // 申报——判定器读完这句话、历次要求账本和当前工作区，明确判了"没有真会改变结果的歧义"，
+  // 还给出了 restatedTask。这个正面事实从没到过模型面前，于是它每一轮都要自己从零判断
+  // "我是不是该问一下"，答案偏保守就变成用户说的那句"知道用户需求还会问不停"。
+  //
+  // 这里不是新加一条规矩（ask_user 自己的描述已经写得很严了），是把已有的判定结果说出来。
+  // confidence 低时保持沉默：判定器自己都没把握，就不该拿它去劝阻提问。
+  if (semantic.ambiguities?.length) {
+    lines.push(`Still ambiguous: ${semantic.ambiguities.join("; ")}. Resolve it from project or conversation evidence first; ask the user only when it would materially change the result and cannot be established.`);
+  } else if (semantic.restatedTask && Number(semantic.confidence) >= 0.7) {
+    lines.push(`Ambiguity check on this request: none found — the restatement above is what is being asked for, and it was derived from this message plus the conversation and the workspace. So a question you feel like asking is almost certainly answerable without the user: look in the project, scroll the conversation, or spend one tool call. Ask only when acting on your own reading could destroy work or spend money in a way you cannot take back.`);
+  }
   const engineering = profile?.intentEngineering;
   if (engineering && typeof engineering === "object") {
     const projectLabel = { existing: "an existing project", greenfield: "a greenfield project", none: "no project", unknown: "inspect the project first" }[engineering.projectState] || engineering.projectState;
@@ -46721,7 +46734,7 @@ function recommendToolsForIntent(intentText, context = {}) {
  * 事实记账定位：只依据账本回合数、空目录事实与注册表事实做判定，不做任何语义路由判断。
  */
 function validateToolCall(toolName, context = {}) {
-  const { turnIndex, isEmptyWorkspace } = context;
+  const { turnIndex, isEmptyWorkspace, priorAsks = 0 } = context;
 
   // P0（改）：首轮 ask_user 事实门控——原为一刀切硬禁（allowed:false 物理拦截），实测把
   // 空文件夹里"问清需求方向"也拦死，逼模型瞎猜用户想要什么 → 过度思考、建错方向。
@@ -46729,6 +46742,17 @@ function validateToolCall(toolName, context = {}) {
   // - 空目录/未打开工作区（事实：无代码可调研）→ 首轮澄清需求方向是正确首步，直接放行；
   // - 工作区非空（事实：有代码可自查）→ 同样放行，但附一条建议性 advice，最终由模型权衡。
   // 任何分支都不再返回 allowed:false 去物理拦截首轮提问。
+  // 反复提问：判据从「是不是第一轮」换成「这一轮已经问过几次」。
+  //
+  // 原来这条建议只在 turnIndex === 0 出声，可用户抱怨的是"问不停"——那恰恰发生在
+  // 第一轮之后：问一次、拿到答案、过几轮又问，而第二次起没有任何东西出声。
+  // 这里报的是执行事实（账本里数出来的次数），不是又一条规矩；照旧不拦截。
+  if (toolName === 'ask_user' && Number(priorAsks) >= 1) {
+    return {
+      allowed: true,
+      advice: `本次运行你已经问过用户 ${priorAsks} 次，那几次的答案都在上面的对话里。再问之前先确认这一条是不是已经答过、或者自己查得到——把一次连贯的交付拆成好几段等待，比猜错的代价更大。真正只有用户能拍板的（产品方向、优先级、要不要花钱），问就是对的。`
+    };
+  }
   if (toolName === 'ask_user' && Number(turnIndex) === 0 && !isEmptyWorkspace) {
     return {
       allowed: true,
@@ -49018,6 +49042,8 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
           const _auValidation = validateToolCall("ask_user", {
             turnIndex: run._toolLedger.turnIndex,
             isEmptyWorkspace: !!(run._emptyRootAtStart || !root),
+            // 本次运行已经问过几次：从账本里数，不是从模型的说法里读。
+            priorAsks: (run._toolLedger.entries || []).filter((e) => e?.tool === "ask_user").length,
           });
           if (_auValidation.advice) it._auAdvice = `\n\n〔提示·不拦截〕${_auValidation.advice}`;
         }
