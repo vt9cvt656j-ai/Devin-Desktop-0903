@@ -10629,6 +10629,8 @@ test("plan steps advance from real tool evidence instead of waiting for another 
   });
   const advance = load("_advancePlanFromTool", {
     _planPrimeCurrentStep: load("_planPrimeCurrentStep"),
+    // 错配记账要读这个（把"刚做的和当前步对不上"这个已算出的事实留给每轮的计划位置行）
+    _planStepActionKind: load("_planStepActionKind"),
     _planEvidenceKindsForTool: planEvidenceKinds,
     _planStepMatchesEvidence: planStepMatchesEvidence,
     _renderPlan: (_container, steps, _existingEl, run) => { run._planSteps = steps; },
@@ -18215,6 +18217,8 @@ test("计划假完成门禁：install/mkdir 只算 execute 证据，implement �
   const planActionKind = load("_planStepActionKind");
   const advance = load("_advancePlanFromTool", {
     _planPrimeCurrentStep: load("_planPrimeCurrentStep"),
+    // 错配记账要读这个（把"刚做的和当前步对不上"这个已算出的事实留给每轮的计划位置行）
+    _planStepActionKind: load("_planStepActionKind"),
     _planEvidenceKindsForTool: kindsFor,
     _planStepMatchesEvidence: load("_planStepMatchesEvidence", { _planStepActionKind: planActionKind }),
     _renderPlan: (_container, steps, _existingEl, run) => { run._planSteps = steps; },

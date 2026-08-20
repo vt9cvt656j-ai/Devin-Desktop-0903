@@ -23603,13 +23603,29 @@ async function _agentContextForQuery(baseContext, query, root, referenceTimeoutM
     parts.push(`\n--- 工程索引状态（IDE 实测，非推断） ---\n${_missing.join("；")}。**索引缺失 ≠ 项目里没有这些东西**，绝不能据此断定项目结构、或说某个文件/符号不存在。需要全局定位就直接用 list_dir / find_files / find_symbol / semantic_search 读真实文件取证。`);
   }
   const stack = _projectStacks.get(root) || {};
-  if (profile.applies) {
+  // 「裁决缺席」不等于「这轮不是工程活」——这两件事在这里混成了一个条件。
+  //
+  // 完整裁决实测 8–20 秒，而前台只等 6 秒、每会话还只等一次，所以 applies=false 的常见原因
+  // 是**裁决还没回来**（intentSource === "pending"），不是模型判定了「这轮不用碰项目」。
+  // 拿一个还没回来的旁路调用去扣留**已经在内存里**的代码检索结果，正是 gate-tristate 那条
+  // 规矩点名禁止的形状：「夺走一样能力（工具、**检索**、知识）→ 必须加 intentSource 守卫」。
+  // 它一直没被那道守卫看见，只因为扫描器的正则认的是 `run.engineering` 这个名字，
+  // 而这里叫 profile。
+  //
+  // 净效果正好是反的：用户说得越含糊、越需要证据的那些轮次，拿到的证据反而越少。
+  //
+  // 所以拆开：**事实**（BM25 命中的真实代码片段）在裁决没回来时照给；**散文**（那段所有模型
+  // 共用的工程约束、以及外部参考预取）继续跟着 applies 走——少一道仪式是对的，扣证据不对。
+  const _verdictLanded = profile?.intentSource === "ai";
+  if (!_verdictLanded || profile.applies) {
     // Never build indexes or wait on community providers in the first-token path. A ready BM25
     // snapshot is free to use; explicit semantic_search/search_tools calls can wait on cold data.
     let localRefs = "";
     try { localRefs = await _buildRetrievedCodeContext(query, root, _ctxScale >= 4 ? 10 : 4, false); } catch {}
-    parts.push(`\n--- 所有模型共用的工程约束（由 IDE 编排层执行） ---\n1. 目标文件已知就直接读取；位置未知才搜索一次定位。改已有文件前必须读取真实源码和相关调用方。\n2. 多文件/架构任务先列可验证计划，复用项目现有模式；不得散落硬编码路径、密钥、颜色、端口或业务规则。\n3. 修改后必须按本项目真实脚本完成编译/类型检查与测试；命令非零、超时或未运行都不算通过。${profile.bug || profile.debugProject ? "\n4. Bug/调试任务必须先拿证据：复现或读取真实报错/日志/诊断，再沿调用链定位根因；修复用最小补丁并同步调用方，最后重跑同一失败路径或聚焦回归，不能靠猜或只跑泛泛构建。" : ""}${profile.ui ? "\n5. UI 任务构建通过后还必须用 browser 在桌面和移动视口验证真实页面、错误、资源、溢出与关键交互。" : ""}`);
     if (localRefs) parts.push(localRefs);
+  }
+  if (profile.applies) {
+    parts.push(`\n--- 所有模型共用的工程约束（由 IDE 编排层执行） ---\n1. 目标文件已知就直接读取；位置未知才搜索一次定位。改已有文件前必须读取真实源码和相关调用方。\n2. 多文件/架构任务先列可验证计划，复用项目现有模式；不得散落硬编码路径、密钥、颜色、端口或业务规则。\n3. 修改后必须按本项目真实脚本完成编译/类型检查与测试；命令非零、超时或未运行都不算通过。${profile.bug || profile.debugProject ? "\n4. Bug/调试任务必须先拿证据：复现或读取真实报错/日志/诊断，再沿调用链定位根因；修复用最小补丁并同步调用方，最后重跑同一失败路径或聚焦回归，不能靠猜或只跑泛泛构建。" : ""}${profile.ui ? "\n5. UI 任务构建通过后还必须用 browser 在桌面和移动视口验证真实页面、错误、资源、溢出与关键交互。" : ""}`);
     if (profile.needsReferences) {
       // 预取成果必须被消费：**同步**读缓存，命中即注入本轮（零 await、首 token 零延迟，
       // 守住"不阻塞首答"的既有守卫测试）；未命中则后台预热、下轮命中。旧版
@@ -32765,7 +32781,7 @@ function _buildAgentToolSchemas(includeWrite, mcpTools = []) {
     { type: "function", function: { name: "lsp_symbols", description: "List a file's code structure outline — the language service (LSP / Monaco TS) parses out functions, classes, methods, variables and other symbols with their line numbers. Faster than read_file for seeing a file's skeleton. Requires a language service for that language (JS/TS work out of the box; Python, Go, Rust and so on need their LSP installed). 【When to use】To get a quick sense of what a file exports and which functions and classes it holds, and to locate roughly where a symbol is. 【vs alternatives】To find a symbol's definition across the project use find_symbol; for its callers use lsp_references.", parameters: { type: "object", properties: { path: { type: "string", description: "File path" } }, required: ["path"] } } },
     { type: "function", function: { name: "find_symbol", description: "**Find a symbol across the whole project** — locate every definition of a function / class / interface / type / constant by name (file:line). It queries the workspace symbol index maintained in the background and **returns in milliseconds**, far faster than grepping the whole project. First choice in a large project for finding a definition, a name collision, or a duplicate implementation. Supports a kind filter (function/class/interface/type/enum/const/struct/trait/impl). The index is built in the background about 3 seconds after the IDE starts and covers JS/TS, Python, Rust, Go, Java/Kotlin, C/C++, Ruby, PHP and more. 【When to use】When you need a symbol's definition — faster and more precise than a full-text grep; to find its callers use lsp_references. 【vs alternatives】For callers use lsp_references; to search by meaning use semantic_search; for plain text matching use search.", parameters: { type: "object", properties: { name: { type: "string", description: "The symbol name (exact match; case-insensitive)" }, kind: { type: "string", description: "Optional; filter by symbol type: function / class / interface / type / enum / const / struct / trait / impl / method" }, limit: { type: "integer", description: "Maximum number of results to return (default 20)" } }, required: ["name"] } } },
     { type: "function", function: { name: "semantic_search", description: "**Find code by meaning** — not exact grep matching, but \"find the code that does this\" from a sentence of natural language. 【When to use】First choice when first exploring an unfamiliar codebase, or when you can describe the behaviour but cannot name a keyword — far faster than reading and grepping your way through guesses. 【vs alternatives】When you know the exact symbol name use find_symbol; when you know a keyword or string use search; to find files by name use find_files.", parameters: { type: "object", properties: { query: { type: "string", description: "A natural-language description of the code you want (the more specific the better)" }, top_k: { type: "integer", description: "How many of the most relevant code blocks to return (default 10, maximum 30)" } }, required: ["query"] } } },
-    { type: "function", function: { name: "knowledge_search", description: "**Query the platform's built-in professional knowledge base** — battle-tested best practices and common traps across specialist areas (front-end React/Next, back-end API design, database schema/indexing, application security, UI/UX design, DevOps deployment), distilled from senior experience. **When a domain task is unfamiliar or has to be right, look here first**: how to design a database schema, where a JWT should be stored, how to make UI look professional, how to use API status codes, how to prevent SQL injection or IDOR, how to write a Dockerfile, **which tool plus exact command to use to reverse-engineer or decompile a given format**, and so on. Follow the best practices you find rather than going from impressions. It now ALSO answers from this platform's own code corpus: the real exported signatures of published libraries (npm / PyPI / crates.io, extracted from the published package itself) and official documentation (MDN for the whole web platform, plus React / Vue / Svelte / TypeScript / Node / Rust / Astro / FastAPI). So it is the right first stop for \"what is this library's real API\" and \"what does the spec actually say\", not only for curated advice. Every passage is labelled by source: curated = distilled experience, real_api = the library's own declaration, official_docs = the official documentation. Prefer a labelled passage over recalling an API from memory: a signature you remember may belong to a different major version. It now ALSO answers from this platform's own code corpus: the real exported signatures of published libraries (npm / PyPI / crates.io, extracted from the published package itself) and official documentation (MDN for the whole web platform, plus React / Vue / Svelte / TypeScript / Node / Rust / Astro / FastAPI). So it is the right first stop for \"what is this library's real API\" and \"what does the spec actually say\", not only for curated advice. Every passage is labelled by source: curated = distilled experience, real_api = the library's own declaration, official_docs = the official documentation. Prefer a labelled passage over recalling an API from memory: a signature you remember may belong to a different major version. It returns the few most relevant passages. This is faster and more focused than a web search (it is already curated), and a second spent here before you start avoids many traps and noticeably raises the quality of the result.", parameters: { type: "object", properties: { query: { type: "string", description: "What you are doing / the best practice you want to confirm, e.g. \"how to build a database index\", \"jwt vs session\", \"how to unpack an NSIS installer\", \"pyinstaller decompile\", \"js deobfuscation\", \"radare2 disassembly\"" }, domain: { type: "string", description: "Optional; restrict to a domain. **michael-design** is the design blueprint corpus \u2014 441 production-grade, Tailwind-native page and section blueprints with real palettes, layout composition patterns, motion recipes and component coverage. Pass it for ANY visible UI work (website, web app, desktop GUI, dashboard, landing page, a single component) and build from what it returns instead of inventing colours and spacing from memory. Other domains: web-frontend / backend-api / database / security / ui-ux / devops / reverse-engineering / penetration-testing" }, top_k: { type: "integer", description: "How many passages to return (default 6, maximum 20)" } }, required: ["query"] } } },
+    { type: "function", function: { name: "knowledge_search", description: "**Query the platform's built-in professional knowledge base** — battle-tested best practices and common traps across specialist areas (front-end React/Next, back-end API design, database schema/indexing, application security, UI/UX design, DevOps deployment), distilled from senior experience. **When a domain task is unfamiliar or has to be right, look here first**: how to design a database schema, where a JWT should be stored, how to make UI look professional, how to use API status codes, how to prevent SQL injection or IDOR, how to write a Dockerfile, **which tool plus exact command to use to reverse-engineer or decompile a given format**, and so on. Follow the best practices you find rather than going from impressions. It now ALSO answers from this platform's own code corpus: the real exported signatures of published libraries (npm / PyPI / crates.io, extracted from the published package itself) and official documentation (MDN for the whole web platform, plus React / Vue / Svelte / TypeScript / Node / Rust / Astro / FastAPI). So it is the right first stop for \"what is this library's real API\" and \"what does the spec actually say\", not only for curated advice. Every passage is labelled by source: curated = distilled experience, real_api = the library's own declaration, official_docs = the official documentation. Prefer a labelled passage over recalling an API from memory: a signature you remember may belong to a different major version. It returns the few most relevant passages. This is faster and more focused than a web search (it is already curated), and a second spent here before you start avoids many traps and noticeably raises the quality of the result.", parameters: { type: "object", properties: { query: { type: "string", description: "What you are doing / the best practice you want to confirm, e.g. \"how to build a database index\", \"jwt vs session\", \"how to unpack an NSIS installer\", \"pyinstaller decompile\", \"js deobfuscation\", \"radare2 disassembly\"" }, domain: { type: "string", description: "Optional; restrict to a domain. **michael-design** is the design blueprint corpus \u2014 441 production-grade, Tailwind-native page and section blueprints with real palettes, layout composition patterns, motion recipes and component coverage. Pass it for ANY visible UI work (website, web app, desktop GUI, dashboard, landing page, a single component) and build from what it returns instead of inventing colours and spacing from memory. Other domains: web-frontend / backend-api / database / security / ui-ux / devops / reverse-engineering / penetration-testing" }, top_k: { type: "integer", description: "How many passages to return (default 6, maximum 20)" } }, required: ["query"] } } },
     { type: "function", function: { name: "lsp_definition", description: "Jump to a symbol's definition. Give the file the symbol appears in, its line number and the symbol name, and it returns file:line for the definition. It resolves semantically, so it is more accurate than guessing with search. Requires a language service for that language. 【When to use】When reading code and you want to jump precisely into an implementation (you already know an occurrence at path:line); if you do not know where it is, use find_symbol first, and for usages use lsp_references. 【vs alternatives】For callers use lsp_references; when the location is unknown start with find_symbol.", parameters: { type: "object", properties: { path: { type: "string", description: "The file where the symbol appears" }, line: { type: "integer", description: "The line the symbol is on (1-based)" }, symbol: { type: "string", description: "The symbol name (used to locate the column on that line)" } }, required: ["path", "line"] } } },
       { type: "function", function: { name: "lsp_hover", description: "**Ask the language server what a symbol's type/signature actually is**, at a given position — the same information the editor shows on hover: resolved signature plus doc comment, for the version actually installed here. 【When to use】When you are about to call something and are not sure of its exact signature, and you already have an occurrence at path:line (yours or existing code). This is the cheapest possible signature check — one round trip, no file reading. 【Limits】Needs a running language server for that language; if it returns nothing, fall back to package_source (for third-party APIs) or read the definition. Does NOT work for a symbol you have not written down anywhere yet — use find_symbol or package_source for that.", parameters: { type: "object", properties: { path: { type: "string", description: "File containing the occurrence" }, line: { type: "integer", description: "1-based line number of the occurrence" }, symbol: { type: "string", description: "The symbol name on that line (used to find the exact column)" } }, required: ["path", "line", "symbol"] } } },
     { type: "function", function: { name: "lsp_references", description: "Find every reference to / use of a symbol in the project. Give the file the symbol appears in, its line number and the symbol name, and it returns the reference list (file:line). It resolves semantically, so it is more accurate than a plain-text search (it distinguishes same-named but different things). Requires a language service for that language. 【When to use】To see who calls a function or variable and to gauge the blast radius of a change — more precise than a full-text grep, with semantic boundaries that do not report same-named false positives. 【vs alternatives】To jump to the definition use lsp_definition; to outline a whole file's symbols use lsp_symbols.", parameters: { type: "object", properties: { path: { type: "string", description: "The file where the symbol appears" }, line: { type: "integer", description: "The line the symbol is on (1-based)" }, symbol: { type: "string", description: "The symbol name (used to locate the column on that line)" } }, required: ["path", "line"] } } },
@@ -34877,11 +34893,44 @@ function _planStepActionKind(step) {
   if (_PLAN_STEP_KINDS.has(declared)) return declared;
   const text = String(step?.content || step?.title || step?.description || step || "").toLowerCase();
   if (!text) return "";
-  if (/(?:test|check|verify|validat|assert|build|compile|type.?check|lint|smoke|regression|screenshot|browser|viewport|health|exit\s*code|console|network|测试|检查|验证|校验|确认|复测|回归|构建|编译|截图|浏览器|视口|退出码|控制台|网络|验收)/i.test(text)) return "verify";
-  if (/(?:implement|edit|change|fix|add|create|refactor|write|update|integrat|migrat|wire|remove|replace|patch|scaffold|setup|install|config|初始化|搭建|脚手架|实现|修改|修复|新增|创建|生成|编辑|重构|编写|接入|迁移|改造|替换|删除|落地|补齐|安装|写入|更新|配置|设置|定义|设计|完善|调整|优化|加上|做一个|做个)/i.test(text)) return "implement";
-  if (/(?:execute|run|start|serve|preview|launch|wait|monitor|terminal|watch|daemon|background|deploy|执行|运行|启动|跑起来|跑通|跑一下|预览|等待|监听|监控|终端|持续任务|后台|守护进程|部署|上线)/i.test(text)) return "execute";
-  if (/(?:investigat|inspect|analy[sz]|reproduc|locat|trace|read|review|understand|diagnos|audit|map|inventory|log|error|stack|调用链|数据流|调查|检查|分析|复现|定位|追踪|读取|阅读|审查|梳理|摸清|确认|盘点|取证|诊断|日志|报错|根因)/i.test(text)) return "investigate";
-  return "";
+  // 谁**先出现**谁说了算，而不是谁先被测试。
+  //
+  // 原来是四条正则按 verify → implement → execute → investigate 顺序试，命中即返回。
+  // 用户实拍的九步计划里，这套判法错了两步：
+  //   ·「搭建 Electron + React + Vite 项目脚手架与构建配置」判成 verify——"搭建"是实现，
+  //     可后半句的"构建"属于 verify 表，而 verify 排在前面，于是后半句抢走了整步的定性。
+  //   ·「调研 Monaco Editor + …」判成 implement——英文动词表**没有词边界**，
+  //     `edit` 直接匹进了 "Editor"。产品名里带 editor / run / map / add 的步骤全会中招。
+  // 判错是双向的伤：该勾的勾不上（进度条永远难看），不该勾的可能被勾掉（假完成）。
+  // 两边都会让计划失去可信度，然后模型和用户一起不再当真。
+  //
+  // 改成按**最早出现的位置**定性：一句话的主动词在最前面，这比"表的排列顺序"可靠得多。
+  // 英文一律加词边界；中文保持原样（中文没有词边界问题，加了反而失配）。
+  const _KIND_PATTERNS = [
+    ["verify", /\b(?:test|check|verify|validat\w*|assert|build|compile|type-?check|lint|smoke|regression|screenshot|viewport|health|console)\b|测试|检查|验证|校验|复测|回归|构建|编译|截图|浏览器|视口|退出码|控制台|验收/i],
+    ["implement", /\b(?:implement\w*|edit|edits|editing|change|fix|add|adds|create|creates|refactor\w*|write|writes|update|updates|integrat\w*|migrat\w*|wire|remove|replace|patch|scaffold\w*|setup|install|config\w*)\b|初始化|搭建|脚手架|实现|修改|修复|新增|创建|生成|编辑|重构|编写|接入|集成|迁移|改造|替换|删除|落地|补齐|安装|写入|更新|配置|设置|定义|设计|完善|调整|优化|加上|做一个|做个/i],
+    ["execute", /\b(?:execute|run|runs|start|starts|serve|preview|launch|wait|monitor|terminal|watch|daemon|background|deploy)\b|执行|运行|启动|跑起来|跑通|跑一下|预览|等待|监听|监控|终端|持续任务|后台|守护进程|部署|上线/i],
+    // 中文里"调研/研究/探索/对比/选型/评估/摸底"是计划第一步最常用的词，原表一个都没有，
+    // 只有"调查"——于是"调研 X"这种最典型的开头步骤永远分不出类。
+    ["investigate", /\b(?:investigat\w*|inspect|analy[sz]\w*|reproduc\w*|locat\w*|trace|read|reads|review|understand|diagnos\w*|audit|inventory)\b|调用链|数据流|调研|调查|研究|探索|对比|选型|评估|摸底|分析|复现|定位|追踪|读取|阅读|审查|梳理|摸清|盘点|取证|诊断|根因/i],
+  ];
+  let best = "", bestAt = Infinity;
+  const matched = new Set();
+  for (const [kind, re] of _KIND_PATTERNS) {
+    const m = text.match(re);
+    if (!m) continue;
+    matched.add(kind);
+    if (m.index < bestAt) { best = kind; bestAt = m.index; }
+  }
+  // 重叠时倒向**更严**的那一类。
+  //
+  // 「运行测试并检查退出码」按位置定性会得到 execute（"运行"在最前），可 execute 是四类里
+  // 最宽松的——_planStepMatchesEvidence 让它同时接受 execute 和 verify 证据，于是一条
+  // `npm install` 就能把这一步勾掉。那是假完成。而 verify 只认 verify 证据。
+  // 位置解决的是"谁是主动词"，这一条解决的是"错了往哪边错"：宁可严到勾不上，
+  // 也不能松到假勾上——一步停在进行中只是看着慢，一个假勾会让用户以为事情做了。
+  if (best === "execute" && matched.has("verify")) return "verify";
+  return best;
 }
 
 function _planEvidenceKindsForTool(call, result) {
@@ -34946,6 +34995,15 @@ function _advancePlanFromTool(run, call, result) {
   let changed = steps !== run._planSteps;
   if (idx < 0) return false;
   if (!_planStepMatchesEvidence(steps[idx], evidenceKinds)) {
+    // 「刚做的事和当前这一步对不上」是这里**当场算出来的**事实，此前算完就扔。
+    // 用户实拍：9 步计划的第 1 步是"调研"，模型直接去写 package.json（第 3 步的活），
+    // 进度条停在 0/9——他看到的是"计划列得挺准，就是不照着走"。
+    // 记在 run 上，供每轮那条计划位置行带一句，不新开提醒通道、不占提醒预算。
+    run._planStepMismatch = {
+      step: String(steps[idx]?.content || "").slice(0, 80),
+      want: _planStepActionKind(steps[idx]),
+      got: [...new Set(evidenceKinds)].join("/"),
+    };
     if (changed) {
       run._planSteps = steps;
       if (run._planEl?.parentNode) _renderPlan(run._planEl.parentNode, steps, run._planEl, run);
@@ -34954,6 +35012,7 @@ function _advancePlanFromTool(run, call, result) {
     return changed;
   }
   // 事实记账：这个勾是哪个工具在本 run 第几次工具调用时推进的（供追责/调试，不进 UI）。
+  run._planStepMismatch = null;   // 对上了就把上一次的错配清掉
   const advancedBy = { tool: String(call?.type || ""), iter: Number(run?._toolStep) || 0 };
   steps = steps.map((step, i) => i === idx ? { ...step, status: "completed", advancedBy } : step);
   steps = _planPrimeCurrentStep(steps);
@@ -41881,6 +41940,8 @@ function _strayScratchFiles(run, testDir) {
 
 // 交付事实注入消息的标签：每轮替换上一条，避免在长 run 里越堆越多。
 const _DELIVERY_FACTS_TAG = "[本轮交付事实]";
+/// 计划位置的每轮标签。和交付事实同形：每轮替换上一条，不在长 run 里越堆越多。
+const _PLAN_STATE_TAG = "[任务计划·当前位置]";
 function _deliveryFactsLine(run) {
   const { code, tests, ran, verifiers } = _deliveryFacts(run);
   // 落空的写入尝试：**比"改了几个文件"更要紧的一条**。
@@ -45553,7 +45614,7 @@ function _buildToolHint(text, profile = _engineeringProfileWithAiIntent(text)) {
   // P0.2(#51): 场景→工具静态决策地图。必须保持**字节稳定**（纯字面量、零动态插值）——
   // 该文本随 system 前缀进 prompt cache，任何动态内容都会击穿缓存。精炼映射，不是禁令。
   return "\n\n🔧 **动态工具编排**：所有已注册工具都能由语义编排器随用户目标、新证据和当前阶段装入。别因为开局窗口里不显示某个工具就假设它不可用；根据真实结果继续执行，已知精确工具名时也可用 search_tools 请求装入（支持自然语言能力描述的模糊搜索，如「数据库查询」）。" +
-    "\n\n🗺️ **场景→工具直觉**：做/改任何看得见的界面（网站、Web 应用、桌面 GUI、控制面板、单个组件）→ 先 knowledge_search(domain 传 michael-design) 取本品类蓝图，照命中的配色与构图做，别凭印象编色和间距；查符号定义→find_symbol；查谁调用→lsp_references；第三方库的真实签名→package_source（读本项目实际装的那个版本；search/find_files/semantic_search 都跳过 node_modules，查不到）；**本机没装、或者要问「官方到底怎么说」→ knowledge_search**（平台自有语料库：npm/PyPI/crates 已发布版本的真实导出签名，加 MDN 整个 Web 平台与 React/Vue/Svelte/TypeScript/Node/Rust 官方文档。写任何一个你没十成把握的第三方调用之前先查一次——凭记忆写出来的签名很可能属于另一个大版本，而这一步只要一次工具调用）；**本机没装、或者要问「官方到底怎么说」→ knowledge_search**（平台自有语料库：npm/PyPI/crates 已发布版本的真实导出签名，加 MDN 整个 Web 平台与 React/Vue/Svelte/TypeScript/Node/Rust 官方文档。写任何一个你没十成把握的第三方调用之前先查一次——凭记忆写出来的签名很可能属于另一个大版本，而这一步只要一次工具调用）；签名对了但不确定怎么用→developer_community_search(sources=['sourcegraph']) 看真实仓库里怎么调；库的版本/废弃→package_search；代码历史/为什么这样写→git_blame/git_log；数据库结构→db_query 直连；技术选型/踩坑→developer_community_search；页面卡顿→performance_profile；已知工具名未装载→search_tools。用对专用工具比 read/grep 蛮力快数倍。" +
+    "\n\n🗺️ **场景→工具直觉**：做/改任何看得见的界面（网站、Web 应用、桌面 GUI、控制面板、单个组件）→ 先 knowledge_search(domain 传 michael-design) 取本品类蓝图，照命中的配色与构图做，别凭印象编色和间距；查符号定义→find_symbol；查谁调用→lsp_references；第三方库的真实签名→package_source（读本项目实际装的那个版本；search/find_files/semantic_search 都跳过 node_modules，查不到）；**本机没装、或者要问「官方到底怎么说」→ knowledge_search**（平台自有语料库：npm/PyPI/crates 已发布版本的真实导出签名，加 MDN 整个 Web 平台与 React/Vue/Svelte/TypeScript/Node/Rust 官方文档。写任何一个你没十成把握的第三方调用之前先查一次——凭记忆写出来的签名很可能属于另一个大版本，而这一步只要一次工具调用）；签名对了但不确定怎么用→developer_community_search(sources=['sourcegraph']) 看真实仓库里怎么调；库的版本/废弃→package_search；代码历史/为什么这样写→git_blame/git_log；数据库结构→db_query 直连；技术选型/踩坑→developer_community_search；页面卡顿→performance_profile；已知工具名未装载→search_tools。用对专用工具比 read/grep 蛮力快数倍。" +
     // 全量名录。没有它，开局窗口外的工具模型既叫不出名字、search_tools 又是精确名查找，
     // 于是够得着的只有开局那十来个。字节稳定，可以待在 cache 前缀里。
     "\n\n📚 **完整能力名录（全部可用，按名字直接调用即可自动装载；不在开局窗口里不代表不能用）**\n" +
@@ -49911,6 +49972,33 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
           messages.push({ role: "user", content: `${_ORCH_NOTE}${_DELIVERY_FACTS_TAG}（本轮真实执行记录，不是推断）: ${_facts}\n`
             + "照着事实说话：没跑过验证就别说「已验证」「能用了」「跑通了」；该验证就现在去验证，别把没做的事写成做完了。" });
         }
+        // 计划位置也每轮重注，和交付事实同一条通道。
+        //
+        // 此前计划**只**以「当初那次 update_plan 的工具结果」的形式存在于历史里，随着
+        // 对话变长就沉底了——于是模型列了一份很准的 9 步计划，然后跳过第 1 步（调研）
+        // 直接去做第 3 步（写 package.json）。用户看到的是"计划列得挺好，就是不照着走"。
+        //
+        // 这里只报事实（几步、完成几步、当前是哪一步），不带说教：催同步进度的话
+        // 已经有 planStale 那条按证据触发的提醒了，重复说只会更沉重。
+        // 模型每轮看见"当前第 1 步：调研…"而自己正在写 package.json，这个反差本身就够。
+        for (let i = messages.length - 1; i >= 0; i--) {
+          if (messages[i].role === "user" && typeof messages[i].content === "string" && messages[i].content.includes(_PLAN_STATE_TAG)) { messages.splice(i, 1); break; }
+        }
+        const _planNow = Array.isArray(run._planSteps) ? run._planSteps : [];
+        if (run.mode === "agent" && _planNow.length) {
+          const _doneN = _planNow.filter((s) => s?.status === "completed").length;
+          const _curIdx = _planNow.findIndex((s) => s?.status === "in_progress");
+          const _atIdx = _curIdx >= 0 ? _curIdx : _planNow.findIndex((s) => s?.status === "pending");
+          if (_atIdx >= 0) {
+            const _next = _planNow.slice(_atIdx + 1).find((s) => s?.status === "pending");
+            messages.push({ role: "user", content: `${_ORCH_NOTE}${_PLAN_STATE_TAG} 共 ${_planNow.length} 步，已完成 ${_doneN}。`
+              + `当前第 ${_atIdx + 1} 步：${String(_planNow[_atIdx]?.content || "").slice(0, 160)}`
+              + (_next ? `（其后：${String(_next.content || "").slice(0, 80)}）` : "（这是最后一步）")
+              + (run._planStepMismatch
+                ? `\n上一次动作是「${run._planStepMismatch.got}」类，而这一步要的是「${run._planStepMismatch.want}」类，所以它没有被勾上。两条路都行：先把这一步做掉，或者 update_plan 把它标 cancelled 并写明为什么不做——别让它一直停在这儿。`
+                : "") });
+          }
+        }
       }
 
       // Tool-RAG (B) — anti-forgetting refresh: on a long run, re-surface the full
@@ -50402,7 +50490,11 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
       if (planSteps && iter > 0 && iter % 8 === 0 && iter <= 40 && _live()) {
         const pending = Array.isArray(planSteps) ? planSteps.filter(s => s.status === "pending" || s.status === "in_progress") : [];
         if (pending.length) {
-          _pushNudge("planRefresh", `你已经执行了 ${iter} 步。快速回顾一下已完成和还缺什么，根据真实证据调整下一步；不用为了形式更新计划，直接继续完成剩余改动和验证。`);
+          // 原文的后半句是"不用为了形式更新计划，直接继续完成剩余改动和验证"——它在**劝退**：
+          // 一边每 8 轮提醒回顾计划，一边告诉模型别管计划。用户看到的就是"计划列得挺准，
+          // 但它不照着走，进度条一直是 0/N"。删掉那半句；剩下的话只报事实：还剩哪几步。
+          // 催同步进度已经有 planStale 那条按证据触发的提醒，这里不重复说。
+          _pushNudge("planRefresh", `你已经执行了 ${iter} 步，计划里还剩 ${pending.length} 步没做完：${pending.slice(0, 5).map((s) => s.content).join("、")}。对着真实证据看一眼：哪几步其实已经做到了（去 update_plan 标 completed）、哪几步查清之后不该做了（标 cancelled 并写明原因）、下一步该做哪个。`);
         }
       }
 
