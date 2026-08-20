@@ -1046,7 +1046,28 @@ pub async fn downloads(State(state): State<AppState>) -> Response {
             None
         };
 
-        let mac = pick(&[".dmg"]);
+        // 按架构挑 mac 包。流水线打的是 aarch64 和 x64 两个独立的 dmg，从不打
+        // universal——所以原来那句 pick(&[".dmg"]) 的落点是「资产列表里第一个 dmg」，
+        // 也就是两个构建任务谁先传完谁上，跟访客的 CPU 毫无关系。
+        //
+        // 给错的后果不对称：**arm64 的包在 Intel 机器上根本装不起来**，而 x86_64 的包
+        // 在 Apple Silicon 上能通过 Rosetta 正常跑。所以单链接的 `mac` 取 x86_64 优先，
+        // 保证谁点都能装；同时把两个架构分别暴露出去，站点想给 Apple Silicon 用户推
+        // 原生包时直接取 mac_arm64 即可（universal 若哪天真打了，仍然优先）。
+        let mac_named = |needles: &[&str]| -> Option<String> {
+            names.iter().find(|n| {
+                let l = n.to_ascii_lowercase();
+                l.ends_with(".dmg") && needles.iter().any(|k| l.contains(k))
+            }).map(|n| (*n).to_owned())
+        };
+        let mac_universal = mac_named(&["universal"]);
+        let mac_arm = mac_named(&["aarch64", "arm64"]);
+        let mac_x64 = mac_named(&["x86_64", "x64", "intel", "amd64"]);
+        let mac = mac_universal
+            .clone()
+            .or_else(|| mac_x64.clone())
+            .or_else(|| mac_arm.clone())
+            .or_else(|| pick(&[".dmg"]));
         // .exe first: the NSIS installer is the one to hand a person, with the .msi kept as
         // a fallback for machines where policy blocks it.
         let windows = pick(&[".exe", ".msi"]);
@@ -1063,6 +1084,9 @@ pub async fn downloads(State(state): State<AppState>) -> Response {
             "prerelease": release.get("prerelease").and_then(Value::as_bool).unwrap_or(false),
             "published_at": release.get("published_at"),
             "mac": mac.as_deref().map(&url),
+            // 站点按访客的真实架构选链接时用这两个；单链接场景继续用上面的 mac。
+            "mac_arm64": mac_universal.as_deref().or(mac_arm.as_deref()).map(&url),
+            "mac_x64": mac_universal.as_deref().or(mac_x64.as_deref()).map(&url),
             "windows": windows.as_deref().map(&url),
         });
 
@@ -1156,7 +1180,9 @@ pub async fn download_asset(
     let response = match github_asset_request(
         &state,
         state
-            .update_http
+            // 整包代理走 download_http：不设总死线，只设空闲超时。共用的 update_http
+            // 带 12 秒总死线，几十兆的安装包必然被从中间掐断，用户拿到截断的包。
+            .download_http
             .get(format!("{base}/releases/assets/{asset_id}")),
     )
     .send()

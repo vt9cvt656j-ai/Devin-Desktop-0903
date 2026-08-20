@@ -62,6 +62,8 @@ pub struct AppState {
     pub redis_client: redis::Client,          // for pub/sub (needs its own connection)
     pub cfg: Arc<config::Config>,
     pub update_http: reqwest::Client,
+    /// 安装包整包代理专用：不设总死线，只设空闲超时。见构造处的说明。
+    pub download_http: reqwest::Client,
     /// 应用层加密。持有静态密钥和派生缓存 —— 缓存必须跨请求活着，所以它在这里而不是
     /// 在中间件里现造。见 mse.rs。
     pub mse: Arc<mse::Mse>,
@@ -120,6 +122,17 @@ async fn main() -> anyhow::Result<()> {
         update_http: reqwest::Client::builder()
             .connect_timeout(std::time::Duration::from_secs(5))
             .timeout(std::time::Duration::from_secs(12))
+            .user_agent("Michael-IDE-Update-Service/1")
+            .build()?,
+        // 安装包代理必须用**另一个**客户端。上面那个 12 秒是 reqwest 的
+        // `timeout`——「从开始连接到响应体读完」的总死线，不是空闲超时。安装包
+        // 几十兆，而且响应体是被下游客户端反压着读的，所以只要下载超过 12 秒就会
+        // 从中间被掐断：用户拿到一个截断的 dmg/exe，更新装不上。
+        // 这里改成「不设总死线 + 空闲超时」：只要还在持续出数据就一直传，真卡住了
+        // 才断。上面那个客户端还有健康巡检、集成回调那些短请求在用，它的 12 秒是对的。
+        download_http: reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .read_timeout(std::time::Duration::from_secs(30))
             .user_agent("Michael-IDE-Update-Service/1")
             .build()?,
     };

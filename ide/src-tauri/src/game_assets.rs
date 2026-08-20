@@ -758,6 +758,37 @@ mod asset_extension_tests {
         );
     }
 
+    /// 短文件不能让嗅探 panic：ftyp 那条要读 head[4..8] 和 head[8..11]，
+    /// RIFF 那条要读 head[8..12]。真去构造 0/4/5/8/11 字节各跑一遍。
+    #[test]
+    fn short_files_do_not_panic() {
+        for len in 0..16usize {
+            let buf = vec![0u8; len];
+            let _ = sniff_asset_ext(&buf);
+        }
+        // 前缀刚好像 ftyp / RIFF 但长度不够的，最容易切在半路上。
+        assert_eq!(sniff_asset_ext(b"\x00\x00\x00\x00ftyp"), None, "ftyp 头但不足 12 字节");
+        assert_eq!(sniff_asset_ext(b"\x00\x00\x00\x00ftypM4A "), Some("m4a"), "刚好 12 字节要认得出");
+        assert_eq!(sniff_asset_ext(b"RIFF\x00\x00\x00\x00WAV"), None, "RIFF 头但不足 12 字节");
+        assert_eq!(sniff_asset_ext(b"\x00\x01\x02\x03\x04"), None);
+
+        // 落盘复核这一路也要能吃短文件（它只读前 16 字节）。
+        let dir = std::env::temp_dir().join(format!("mrday-short-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        for (name, bytes) in [
+            ("a.glb", &b"\x00\x01\x02\x03\x04"[..]),
+            ("b.glb", &b"RIFF"[..]),
+            ("c.glb", &b""[..]),
+        ] {
+            let f = dir.join(name);
+            std::fs::write(&f, bytes).unwrap();
+            let (p, note) = correct_extension_after_write(&f, "glb");
+            assert_eq!(p, f, "{name} 被无端改名了");
+            assert!(note.is_none(), "{name} 无端报了警告");
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[test]
     fn known_magics_are_recognised() {
         assert_eq!(sniff_asset_ext(b"glTF\x02\x00\x00\x00"), Some("glb"));
