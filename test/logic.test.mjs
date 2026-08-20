@@ -8600,8 +8600,9 @@ test("正则字面量免疫：编辑工具损坏形态禁止出现，惯犯站�
     "字符类里出现真换行 = 编辑工具损坏又发生了，立即修复");
   assert.ok((SRC.match(/\[\^\\u000a/g) || []).length >= 5,
     "惯犯站点必须保持 \\u000a 免疫写法");
-  assert.match(SRC, /const writePattern = \/\\\[TOOL:write_file\\\]\\s\*\\u000a\?/,
-    "writePattern 必须用 \\u000a 写法");
+  // 原来这里还点名 writePattern（文本协议非流式副本 _splitAgentResponse 里那条正则）。
+  // 那条路整条删掉了（零调用点存量清理），点名的站点不复存在；上面两条通用断言
+  // ——「字符类里不许出现真换行」+「免疫写法至少 5 处」——仍然覆盖这个卫生问题。
 });
 
 test("压缩档位注入预算适度伸缩，封顶 2 倍守住计费", () => {
@@ -15615,19 +15616,11 @@ test("agent streaming hides settled cross-turn narrative repeats", () => {
 
 test("tool turns suppress provisional narrative until a no-tool final answer", () => {
   const isControl = load("_agentToolCallIsNarrativeControl");
-  const hasWorkTools = load("_agentTurnHasNonControlTools", {
-    _agentToolCallIsNarrativeControl: isControl,
-  });
-
   assert.equal(isControl("update_plan"), true);
   assert.equal(isControl("think"), true);
   assert.equal(isControl("ask_user"), true);
   assert.equal(isControl("read_file"), false);
   assert.equal(isControl("write_file"), false);
-  assert.equal(hasWorkTools({ toolCalls: [{ name: "update_plan" }, { name: "think" }] }), false,
-    "plan/control-only turns keep their existing same-turn narrative behavior");
-  assert.equal(hasWorkTools({ toolCalls: [{ name: "read_file" }] }), true);
-  assert.equal(hasWorkTools({ toolCalls: [{ name: "update_plan" }, { name: "run_cmd" }] }), true);
 
   const agentTurn = extractFn("_agentModelTurn");
   assert.match(agentTurn, /let _suppressNarrativeForTools = false;/);
@@ -19663,15 +19656,10 @@ test("#56-4 空目录与历史事实不阻断显式工具调用", () => {
     "explicit reads must call the live backend");
   assert.doesNotMatch(executor, /_emptyExploreSkipMessage\(|_emptyRootSkipMessage\(/,
     "empty-root helpers must not be called from the executor");
-  // 计划的模块计数仍然只看计划路径事实，与空目录字段解耦。(The three orchestration-nudge
-  // functions this loop also checked — _splitGateNudgeMessage / _inferOrchestrationFromPlan /
-  // _shouldDispatchSubagent — were deleted in AGENT_LOOP_REBUILD.md stage 3.)
-  for (const fnName of ["_countExistingModules"]) {
-    const src = extractFn(fnName);
-    for (const field of ["_emptyRootAtStart", "fromZeroUiProject", "substantial", "projectScope", "greenfield", "changeScope", "uiProject"]) {
-      assert.ok(!src.includes(field), `${fnName} 不得读 ${field}`);
-    }
-  }
+  // 这个循环原来还检查 _countExistingModules（「计划的模块计数不得读空目录字段」），
+  // 以及更早被 AGENT_LOOP_REBUILD.md 阶段 3 删掉的三个编排劝阻函数
+  // （_splitGateNudgeMessage / _inferOrchestrationFromPlan / _shouldDispatchSubagent）。
+  // 2026-08-20 起 _countExistingModules 也删了（零调用点存量清理），循环里没有对象了。
 });
 
 // The IDE used to auto-spawn up to four file-writing sub-agents the model never requested when a

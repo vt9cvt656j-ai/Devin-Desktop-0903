@@ -21043,17 +21043,6 @@ function _isDependencyRestoreCommand(command) {
   return sawRestore;
 }
 
-function _agentAllowsDependencyRestore(run) {
-  if (!run || run.mode !== "agent") return false;
-  const profile = run.engineering || {};
-  const obligations = new Set([...(profile?.runtimeObligations || []), ...(run?._addedRuntimeObligations || [])]);
-  // Editing code is not permission to change the dependency graph. A bug fix may build
-  // and test with the dependencies already present, but install/restore must be part of
-  // this turn's structured runtime contract. This prevents a routine inspection or fix
-  // from silently running npm install just because node_modules happens to be missing.
-  return obligations.has("install");
-}
-
 function _agentAllowsExternalKind(run, kind) {
   const profile = run?.engineering || {};
   const obligations = new Set([...(profile?.externalObligations || []), ...(run?._addedExternalObligations || [])]);
@@ -25334,11 +25323,6 @@ function _agentToolCallIsNarrativeControl(name) {
   return ["update_plan", "think", "ask_user"].includes(String(name || ""));
 }
 
-function _agentTurnHasNonControlTools(turn) {
-  return !!turn && Array.isArray(turn.toolCalls)
-    && turn.toolCalls.some((call) => !_agentToolCallIsNarrativeControl(call?.name));
-}
-
 // A generic plain-text question must not let Agent mode skip the workspace work the
 // semantic profile already required. Intercept only the first such question, and only
 // until this run has successfully inspected the project; a second question or a question
@@ -27927,148 +27911,6 @@ function _renderAgentSeg(container, seg, allSegs, idx, root, promises) {
   }
 }
 
-async function _executeInlineTools(response, container) {
-  const segments = _splitAgentResponse(response);
-  const toolSegs = segments.filter(s => s.type !== "text");
-  if (!toolSegs.length) return;
-
-  const log = document.createElement("div");
-  log.className = "agent-tool-log";
-  container.appendChild(log);
-  const toolResults = [];
-  const root = rootPath || workspaceRoots[0] || "";
-
-  for (const seg of toolSegs) {
-    const step = _createToolStep(seg);
-    log.appendChild(step);
-    _chatFollow();
-    const tr = await _executeToolStep(step, seg, root);
-    if (tr) toolResults.push(tr);
-    await new Promise(r => setTimeout(r, 60));
-    _chatFollow();
-  }
-
-  if (toolResults.length) _agentFollowUp(toolResults, container);
-}
-
-function _splitAgentResponse(response) {
-  const segments = [];
-  let remaining = response;
-  const toolPattern = /\[TOOL:(read_file|write_file|run_cmd|list_dir)\]\s*\n?([^\n]+)/;
-  const bareToolPattern = /(?:^|\n)(read_file|list_dir|run_cmd)\s+(\/[^\s\n][^\n]*)/;
-  const writePattern = /\[TOOL:write_file\]\s*\u000a?([^\u000a]+)\u000a```(\w*)\u000a([\s\S]*?)```/;
-
-  const emojiFilePattern = /📄\s*([^\n]+)\n```(\w*)\n([\s\S]*?)```/;
-  const emojiCmdPattern = /📎\s*(.+?)(?:\n|$)/;
-
-  while (remaining.length > 0) {
-    const wm = remaining.match(writePattern);
-    const tm = remaining.match(toolPattern);
-    const bt = remaining.match(bareToolPattern);
-    const ef = remaining.match(emojiFilePattern);
-    const ec = remaining.match(emojiCmdPattern);
-
-    const candidates = [
-      wm && { m: wm, idx: remaining.indexOf(wm[0]), type: "wm" },
-      tm && { m: tm, idx: remaining.indexOf(tm[0]), type: "tm" },
-      bt && { m: [bt[0].replace(/^\n/, ""), bt[1], bt[2]], idx: Math.max(0, remaining.indexOf(bt[0]) + (bt[0].startsWith("\n") ? 1 : 0)), type: "tm" },
-      ef && { m: ef, idx: remaining.indexOf(ef[0]), type: "ef" },
-      ec && { m: ec, idx: remaining.indexOf(ec[0]), type: "ec" },
-    ].filter(Boolean).sort((a, b) => a.idx - b.idx);
-
-    if (!candidates.length) {
-      segments.push({ type: "text", content: remaining });
-      break;
-    }
-
-    const best = candidates[0];
-    if (best.idx > 0) segments.push({ type: "text", content: remaining.slice(0, best.idx) });
-
-    if (best.type === "wm") {
-      segments.push({ type: "write", path: best.m[1].trim(), content: best.m[2] });
-    } else if (best.type === "ef") {
-      segments.push({ type: "write", path: best.m[1].trim(), content: best.m[3] });
-    } else if (best.type === "ec") {
-      segments.push({ type: "cmd", command: best.m[1].trim() });
-    } else {
-      const cmd = best.m[1];
-      const arg = best.m[2].trim();
-      if (arg) {
-        if (cmd === "read_file") segments.push({ type: "read", path: arg });
-        else if (cmd === "list_dir") segments.push({ type: "list", path: arg });
-        else if (cmd === "run_cmd") segments.push({ type: "cmd", command: arg });
-        else if (cmd === "write_file") segments.push({ type: "write", path: arg, content: "" });
-      }
-    }
-
-    remaining = remaining.slice(best.idx + best.m[0].length);
-  }
-
-  const newSegs = [];
-  const langToFile = { python: "main.py", py: "main.py", javascript: "app.js", js: "app.js", typescript: "app.ts", ts: "app.ts", html: "index.html", css: "style.css", json: "data.json", yaml: "config.yaml", yml: "config.yml", shell: "script.sh", bash: "script.sh", sh: "script.sh", sql: "query.sql", go: "main.go", rust: "main.rs", rs: "main.rs", java: "Main.java", c: "main.c", cpp: "main.cpp", ruby: "app.rb", rb: "app.rb", php: "index.php", swift: "main.swift", kotlin: "main.kt", dart: "main.dart", vue: "App.vue", svelte: "App.svelte", jsx: "App.jsx", tsx: "App.tsx" };
-  const fileNamePat = /[`"']?([a-zA-Z0-9_\-./\\]+\.[a-zA-Z]{1,10})[`"']?\s*(?:[：:]\s*)?$/;
-
-  for (const seg of segments) {
-    if (seg.type !== "text") { newSegs.push(seg); continue; }
-    const allBlocks = [...seg.content.matchAll(/```(\w*)\n([\s\S]*?)```/g)];
-    if (!allBlocks.length) { newSegs.push(seg); continue; }
-
-    let txt = seg.content;
-    let lastEnd = 0;
-    const usedNames = new Set();
-
-    for (const m of allBlocks) {
-      const lang = m[1].toLowerCase();
-      const code = m[2];
-      if (code.split("\n").length < 3) continue;
-
-      const blockStart = txt.indexOf(m[0], lastEnd);
-      const textBefore = txt.slice(lastEnd, blockStart);
-
-      let fileName = "";
-      const allLines = textBefore.split("\n").reverse();
-      for (const line of allLines) {
-        const stripped = line.replace(/[`"'*#>\-📄]/g, "").trim();
-        const fm = stripped.match(/([a-zA-Z0-9_\-./\\]+\.[a-zA-Z]{1,10})\s*[:：]?\s*$/);
-        if (fm) { fileName = fm[1]; break; }
-        const fm2 = stripped.match(/(?:文件|创建|写入|新建|编写|修改)\s*[`"']*([a-zA-Z0-9_\-./\\]+\.[a-zA-Z]{1,10})/);
-        if (fm2) { fileName = fm2[1]; break; }
-      }
-
-      if (!fileName && code) {
-        if (/from flask import|Flask\(__name__\)|app\.route/.test(code)) fileName = "app.py";
-        else if (/class \w+\(.*(?:db\.Model|Base)\)/.test(code)) fileName = "models.py";
-        else if (/<!DOCTYPE|<html|<head|<body/.test(code)) fileName = "index.html";
-        else if (/import React|from ['"]react['"]|export default/.test(code)) fileName = "App.jsx";
-        else if (/import express|require\(['"]express/.test(code)) fileName = "server.js";
-        else if (/CREATE TABLE|ALTER TABLE/.test(code)) fileName = "schema.sql";
-        else if (/FROM\s+(node|python|golang|alpine|ubuntu)/.test(code)) fileName = "Dockerfile";
-        else if (/server\s*\{|location\s*\//.test(code)) fileName = "nginx.conf";
-        else if (lang && langToFile[lang]) {
-          let base = langToFile[lang]; let i = 1;
-          while (usedNames.has(base)) { base = base.replace(/(\.\w+)$/, `${++i}$1`); }
-          fileName = base;
-        }
-      }
-
-      if (!fileName) { newSegs.push({ type: "text", content: textBefore + m[0] }); lastEnd = blockStart + m[0].length; continue; }
-
-      usedNames.add(fileName);
-      if (textBefore.trim()) {
-        const cleanText = textBefore.replace(fileNamePat, "").trim();
-        if (cleanText) newSegs.push({ type: "text", content: cleanText });
-      }
-      newSegs.push({ type: "write", path: fileName, content: code });
-      lastEnd = blockStart + m[0].length;
-    }
-    if (lastEnd < txt.length) {
-      const rest = txt.slice(lastEnd).trim();
-      if (rest) newSegs.push({ type: "text", content: rest });
-    }
-  }
-  return newSegs.length > 0 ? newSegs : segments;
-}
-
 const _ATC_EXPAND_ICON = `<svg viewBox="0 0 12 12" width="12" height="12"><path d="M3 4.5l3 3 3-3" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></svg>`;
 
 // ============================================================================
@@ -30319,7 +30161,6 @@ const _SKILL_ICONS = {
   wrench: _SIC('#ea580c', '<path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z"/>'),
   rocket: _SIC('#dc2626', '<path d="M4.5 16.5c-1.5 1.26-2 5-2 5s3.74-.5 5-2c.71-.84.7-2.13-.09-2.91a2.18 2.18 0 0 0-2.91-.09z"/><path d="M12 15l-3-3a22 22 0 0 1 2-3.95A12.88 12.88 0 0 1 22 2c0 2.72-.78 7.5-6 11a22.35 22.35 0 0 1-4 2z"/><path d="M9 12H4s.55-3.03 2-4c1.62-1.08 5 0 5 0"/><path d="M12 15v5s3.03-.55 4-2c1.08-1.62 0-5 0-5"/>'),
 };
-function _skillIcon(key) { return _SKILL_ICONS[key] || _SKILL_ICONS.sparkles; }
 // Default skill icon — a game-style skill badge: green tile + embossed white plus. Solid colors only
 // (no gradient <defs>/url() — shared ids break across removed DOM subtrees in WKWebView). The preset
 // icon picker was removed, so every non-uploaded skill shows this; uploaded skills show their image.
@@ -30334,49 +30175,6 @@ const _ICON_EYE = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" st
 const _ICON_TRASH = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18"/><path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6"/><path d="M10 11v6"/><path d="M14 11v6"/></svg>';
 const _ICON_PENCIL = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4Z"/></svg>';
 const _ICON_IMPORT = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7z"/><path d="M14 2v5h5"/><path d="M12 18v-6"/><path d="m9 15 3 3 3-3"/></svg>';
-// A skill's `icon` is EITHER a "data:" image URL the user uploaded, OR anything else → the default badge.
-function _skillIconMarkup(icon) {
-  if (typeof icon === "string" && icon.slice(0, 5) === "data:") {
-    return '<img class="skill-tile skill-tile--img" src="' + _escAttr(icon) + '" alt="" draggable="false" />';
-  }
-  return _SKILL_DEFAULT_ICON;
-}
-// Read a user-picked image file, cover-crop to a square and re-encode small so it stays a few KB
-// (skills sync to the server as one JSON blob capped at 512KB — a raw photo would blow that instantly).
-function _skillImgFromFile(file) {
-  return new Promise((resolve, reject) => {
-    if (!file || !/^image\//.test(file.type || "")) { reject(new Error("请选择图片文件")); return; }
-    if (file.size > 12 * 1024 * 1024) { reject(new Error("图片太大（请小于 12MB）")); return; }
-    const fr = new FileReader();
-    fr.onerror = () => reject(fr.error || new Error("读取失败"));
-    fr.onload = () => {
-      const img = new Image();
-      img.onerror = () => reject(new Error("这不是有效的图片"));
-      img.onload = () => {
-        try {
-          const enc = (size, q) => {
-            const c = document.createElement("canvas"); c.width = size; c.height = size;
-            const ctx = c.getContext("2d");
-            const scale = Math.max(size / img.width, size / img.height); // cover
-            const w = img.width * scale, h = img.height * scale;
-            ctx.drawImage(img, (size - w) / 2, (size - h) / 2, w, h);
-            let out = "";
-            try { out = c.toDataURL("image/webp", q); } catch {}
-            if (!out || out.indexOf("data:image/webp") !== 0) { try { out = c.toDataURL("image/png"); } catch { out = ""; } }
-            return out;
-          };
-          let out = enc(128, 0.85);
-          if (out && out.length > 60000) out = enc(96, 0.72);   // still chunky (opaque PNG fallback) → shrink harder
-          if (out && out.length > 60000) out = enc(72, 0.6);
-          if (!out) { reject(new Error("图片编码失败")); return; }
-          resolve(out);
-        } catch (err) { reject(err); }
-      };
-      img.src = fr.result;
-    };
-    fr.readAsDataURL(file);
-  });
-}
 function _loadSkillsLocal() { try { const a = JSON.parse(localStorage.getItem(_SKILLS_KEY) || "null"); if (Array.isArray(a)) return a; } catch {} return []; }
 function _saveSkillsLocal(list) { try { localStorage.setItem(_SKILLS_KEY, JSON.stringify(list)); } catch {} }
 
@@ -52494,27 +52292,6 @@ function _probeLoopNudgeMessage(run, batch) {
   const list = win.flatMap((b) => Array.isArray(b.entries) ? b.entries : []).slice(-12)
     .map((e) => `${e.tool}${e.argsSummary ? " " + e.argsSummary : ""} ${e.ok ? "✓" : "✗"}`).join("；");
   return `[根因检查点] 你已连续 ${win.length} 个回合只做探测、无实质进展。探测清单: ${list}。停止逐个试错: ①先用 1-2 句写出当前故障最可能的根因假设 ②说明最小验证/修复动作再执行 ③若涉及安装/下载/网络类故障,考虑先 web_search 查该报错的已知解法 (如镜像源/环境变量),而不是继续翻本地文件。`;
-}
-
-// ── 计划涉及模块计数（纯事实采集，#56 规模启发）：从计划步骤文本里出现的文件/目录路径
-//    归并出「改动跨几个模块」——monorepo 的 packages/x、src/components 与 src/api、server 与
-//    web 都是不同模块；文件名段（带扩展名）不算目录，URL 先剥除。不读 substantial/projectScope/
-//    fromZeroUiProject 等 AI 规模评级字段：现有大项目「加功能」被 AI 判成 changeScope=module 时，
-//    多模块改动的事实仍由计划路径直接成立——拆分/规划触发与项目新旧解耦。
-function _countExistingModules(steps) {
-  const generic = new Set(["src", "source", "packages", "apps", "modules", "lib", "libs"]);
-  const modules = new Set();
-  for (const step of (Array.isArray(steps) ? steps : [])) {
-    const text = String(step?.content || step?.title || step || "").replace(/\bhttps?:\/\/\S+/gi, " ");
-    for (const match of text.matchAll(/[A-Za-z0-9_.@-]+(?:\/[A-Za-z0-9_.@-]+)+/g)) {
-      const segments = match[0].replace(/^\.+\//, "").split("/").filter(Boolean);
-      if (segments.length >= 2 && /\.[A-Za-z0-9]{1,8}$/.test(segments[segments.length - 1])) segments.pop(); // 文件名段不算目录
-      if (!segments.length) continue;
-      const head = segments[0].toLowerCase();
-      modules.add(generic.has(head) && segments.length >= 2 ? head + "/" + segments[1].toLowerCase() : head);
-    }
-  }
-  return modules.size;
 }
 
 // ── bug 修复异步取证门（一次性事实注入）：调试类任务写入前已有 ≥2 次失败/未找到类探测

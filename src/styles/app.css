@@ -986,10 +986,8 @@ body.is-win .tbtn { font-weight: var(--wt-medium); }
 .ctp-btn--on:hover { background: color-mix(in srgb, #16a34a 20%, transparent); }
 #capabilitiesBtn { position: relative; overflow: visible; }
 .skills-badge { position: absolute; top: -4px; right: -4px; min-width: 15px; height: 15px; padding: 0 3px; box-sizing: border-box; border-radius: 8px; background: #16a34a; color: #fff; font-size: 10px; font-weight: 700; line-height: 15px; text-align: center; box-shadow: 0 0 0 2px var(--panel, #fff); pointer-events: none; }
-.skill-row__icon { display: inline-flex; align-items: center; justify-content: center; width: 34px; height: 34px; flex-shrink: 0; }
 .skill-tile { display: block; border-radius: 9px; box-shadow: 0 1px 3px rgba(60,64,67,.22); }
 .skill-tile--img { object-fit: cover; background: var(--panel, #fff); }
-.skill-row__icon svg, .skill-row__icon .skill-tile { width: 32px; height: 32px; }
 .skill-iconpick { display: flex; flex-wrap: wrap; gap: 8px; }
 .skill-iconpick__btn { display: inline-flex; align-items: center; justify-content: center; width: 40px; height: 40px; border: 0; border-radius: 12px; background: transparent; cursor: pointer; padding: 4px; transition: transform .08s ease, background .12s; }
 .skill-iconpick__btn svg, .skill-iconpick__btn .skill-tile { width: 30px; height: 30px; }
@@ -1000,11 +998,6 @@ body.is-win .tbtn { font-weight: var(--wt-medium); }
 .skill-iconpick__btn--upload svg { width: 20px; height: 20px; }
 .skill-iconpick__btn--upload:hover { border-color: var(--accent, #1a73e8); color: var(--accent, #1a73e8); background: color-mix(in srgb, var(--accent, #1a73e8) 8%, transparent); transform: none; }
 /* Skills dialog: image-upload only (preset icon tiles removed). */
-.skill-upload { display: inline-flex; align-items: center; gap: 8px; height: 44px; padding: 0 16px; border: 1.5px dashed var(--line-strong, rgba(128,128,128,.45)); border-radius: 12px; background: transparent; color: var(--text-dim); cursor: pointer; font-size: 13px; font-weight: 500; transition: background .12s, border-color .12s, color .12s; }
-.skill-upload:hover { border-color: var(--accent, #1a73e8); color: var(--accent, #1a73e8); background: color-mix(in srgb, var(--accent, #1a73e8) 8%, transparent); }
-.skill-upload svg { width: 18px; height: 18px; }
-.skill-upload__preview { display: inline-flex; }
-.skill-upload__preview .skill-tile { width: 44px; height: 44px; }
 .skill-row__main, .mcp-row__main { flex: 1; min-width: 0; }
 .skill-row__name, .mcp-row__name { font-size: 13.5px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .skill-row__desc, .mcp-row__cmd { font-size: 11.5px; color: var(--text-dim); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; margin-top: 2px; }
