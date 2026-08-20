@@ -261,13 +261,16 @@ impl RpcServer {
                         "区域截图要同时给 x/y/width/height 四个参数；一个都不给就是整屏".into(),
                     )),
                 };
-                let data_url = agent.screen_capture(region)?;
+                let (data_url, scale_note) = agent.screen_capture(region)?;
                 // 坐标系和 mouse.move / screen.info 是同一套（屏幕点、左上原点），
                 // 一并回给调用方，免得它再去猜要不要乘 scale_factor。
                 Ok(serde_json::json!({
                     "data_url": data_url,
                     "region": region.map(|(x, y, w, h)| serde_json::json!({"x": x, "y": y, "width": w, "height": h})),
-                    "coordinate_space": "screen_points_top_left"
+                    "coordinate_space": "screen_points_top_left",
+                    // Retina 上图是像素、鼠标收的是点，比值在这里说清楚，
+                    // 免得模型拿图上量到的坐标直接去点，点到屏幕外。
+                    "scale_note": scale_note
                 }))
             }
 

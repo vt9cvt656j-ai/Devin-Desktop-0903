@@ -152,7 +152,32 @@ fn do_open(name: &str, bg: bool) -> Result<String, String> {
     };
     match run_cmd_bounded("open", args, 6000) {
         Ok(_) if bg => Ok(format!("✓ 已在后台启动「{name}」（不抢焦点、不打断你）。")),
-        Ok(_) => Ok(format!("✓ 已打开/切换到「{name}」。它现在是前台 App，可以用 system menu 直接走它的菜单，或 computer screenshot 看它的界面节点。")),
+        Ok(_) => {
+            // 切过去了没有，要**核实**，不能无条件宣布。
+            //
+            // `open -a` 成功只意味着命令被接受了：冷启动的重应用要好几秒才到前台，
+            // 有的应用会弹权限/更新对话框把焦点截走，有的干脆起在别的桌面空间。
+            // 而这里原来直接回「它现在是前台 App」——模型据此拿着旧界面继续操作，
+            // 后面每一步都作用在错误的应用上，而且这是最难自查的一类静默失败。
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+            let want = name.to_lowercase();
+            let mut seen = String::new();
+            loop {
+                if let Ok(front) = system_frontmost_inner() {
+                    seen = front.clone();
+                    if front.to_lowercase().contains(&want) {
+                        return Ok(format!("✓ 已切换到「{name}」，已核实它现在确实在前台（{front}）。可以用 system menu 走它的菜单，或 computer screenshot 看界面节点。"));
+                    }
+                }
+                if std::time::Instant::now() >= deadline {
+                    return Ok(format!(
+                        "⚠️ 已向系统发出打开「{name}」的请求，但 3 秒内它没有到前台——当前前台是「{}」。可能还在冷启动、被权限或更新对话框截了焦点、或者起在别的桌面空间。**先 computer screenshot 或 system frontmost 确认现在屏幕上是什么，再决定下一步**，别直接对着它操作。",
+                        if seen.is_empty() { "（读不到）" } else { seen.as_str() }
+                    ));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(120));
+            }
+        }
         Err(e) => {
             // fallback: activate an already-running process by exact name
             let njs = serde_json::to_string(name).unwrap_or_else(|_| "\"\"".into());

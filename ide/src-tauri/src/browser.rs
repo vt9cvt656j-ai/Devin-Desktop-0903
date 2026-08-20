@@ -443,7 +443,14 @@ fn launch() -> Result<Session, String> {
         } else if browser_running {
             format!(
                 "你现在确实开着 {}，但那个实例启动时没有带 --remote-debugging-port，\
-而调试端口是**启动期**参数、进程跑起来之后加不上，所以它接管不了——这不是没去找，是找了、够不着",
+而调试端口是**启动期**参数、进程跑起来之后加不上，所以它接管不了——这不是没去找，是找了、够不着。\
+\n\n**但「够不着」只是指 CDP 这条路。** 你那个浏览器仍然可以被完全自动化，走的是另一条：\
+用 `system open` 把它切到前台，`read_screen` 读它的可访问性树（macOS 上浏览器会把渲染出来的\
+网页内容——链接、按钮、输入框、文本——连同坐标一起暴露给 AX，所以这不是截图猜测，是结构化元素），\
+然后 `computer` 按坐标点击和输入。这条路的登录态就是你自己的，不需要重新登录。\
+\n两条路的取舍：CDP 那条给的是 DOM 选择器、能跑 JS、能断言，精确但只能作用在它自己启动的实例上；\
+桌面这条作用在**你正在用的那个浏览器**上，代价是要靠坐标、窗口必须在前台、拿不到 DOM。\
+要操作你已登录的账号，走桌面这条；要做可重复的页面验收，走 CDP 那条",
                 kind.label
             )
         } else {
@@ -612,6 +619,15 @@ fn launch() -> Result<Session, String> {
             let _ = std::fs::create_dir_all(&fresh);
             let opts2 = LaunchOptionsBuilder::default()
                 .path(Some(std::path::PathBuf::from(&path)))
+                // 这一行以前**只有上面那条主路径有**，回退路径漏了，于是它吃的是
+                // headless_chrome 的默认 30 秒空闲超时。症状和上面注释描述的一模一样：
+                // 起了窗口 → 模型转头去读代码/跑测试（超过 30 秒是常态）→ 回来连接已断
+                // → 杀掉进程 → 重开一个新窗口，什么都没操作。
+                //
+                // 而且它会**自我循环**：被杀掉的进程留下 profile 锁 → 下一次启动又落到这条
+                // 回退路径 → 又没有超时 → 又被杀。用户看到的就是「打开窗口卡在那里，
+                // 过一会开新的，就是不操作」，一直转圈出不来。
+                .idle_browser_timeout(std::time::Duration::from_secs(30 * 60))
                 .headless(headless)
                 .sandbox(false)
                 .ignore_certificate_errors(true)
@@ -1513,10 +1529,37 @@ pub async fn browser_upload_file(
 #[tauri::command]
 pub async fn browser_press(key: String) -> Result<BrowserState, String> {
     with_tab(move |tab| {
+        // 按键要报**它落在了谁身上**。原来只说"按了"，而按键有没有生效完全取决于焦点：
+        // 焦点在 body 上时 Enter 什么也不会提交，模型却以为提交了，接着去 assert 结果页。
+        // 前后各取一次 activeElement，两边都摆出来，模型自己就能判断要不要先 click 聚焦。
+        let focus_js = r#"(()=>{try{var a=document.activeElement;if(!a)return'(none)';
+var t=String(a.value||a.innerText||a.textContent||a.getAttribute('aria-label')||'').replace(/\s+/g,' ').trim().slice(0,40);
+return a.tagName.toLowerCase()+(a.id?'#'+a.id:'')+(t?' "'+t+'"':'')}catch(e){return'(unknown)'}})()"#;
+        let focus_of = |t: &Tab| -> String {
+            t.evaluate(focus_js, false)
+                .ok()
+                .and_then(|v| v.value.and_then(|x| x.as_str().map(String::from)))
+                .unwrap_or_default()
+        };
+        let before = focus_of(tab);
         tab.press_key(&key).map_err(|e| e.to_string())?;
         std::thread::sleep(Duration::from_millis(400));
         let _ = tab.wait_until_navigated();
-        Ok(None)
+        let after = focus_of(tab);
+        let note = if before.is_empty() && after.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "{{\"key\":\"{}\",\"focusBefore\":\"{}\",\"focusAfter\":\"{}\"{}}}",
+                key.replace('"', "'"),
+                before.replace('"', "'"),
+                after.replace('"', "'"),
+                if before.starts_with("body") || before == "(none)" {
+                    ",\"warn\":\"按键时焦点在 body/无焦点上——按键多半没落到任何输入框或按钮上；先 click 目标再按\""
+                } else { "" }
+            )
+        };
+        Ok(if note.is_empty() { None } else { Some(note) })
     })
     .await
 }
@@ -1859,10 +1902,36 @@ pub async fn browser_set_viewport(
 #[tauri::command]
 pub async fn browser_scroll(amount: i32) -> Result<BrowserState, String> {
     with_tab(move |tab| {
-        let js = format!("window.scrollBy(0, {});", amount);
-        let _ = tab.evaluate(&js, false);
+        // 滚动要报**实际滚了多少**。原来是 `let _ = tab.evaluate(...)`——结果整个丢掉，
+        // 于是「已经到底了」「页面根本不滚、真正滚的是某个 overflow 容器」「元素在模态里」
+        // 三种情形和成功滚动长得一模一样。模型据此以为内容已经翻过去了，接着去找下面的元素。
+        //
+        // 这里只报事实，不拦截：滚不动有时是正常的（内容本来就一屏）。
+        let js = format!(
+            r#"(()=>{{
+function box(){{var d=document.scrollingElement||document.documentElement||document.body;
+  if(d&&d.scrollHeight>d.clientHeight+1)return{{el:d,name:'document'}};
+  var all=[];try{{all=document.querySelectorAll('*')}}catch(e){{}}
+  for(var i=0;i<all.length;i++){{var e=all[i];try{{var cs=getComputedStyle(e);
+    if(/(auto|scroll)/.test(cs.overflowY)&&e.scrollHeight>e.clientHeight+1&&e.clientHeight>120)
+      return{{el:e,name:e.tagName.toLowerCase()+(e.id?'#'+e.id:'')}}}}catch(e2){{}}}}
+  return{{el:d,name:'document'}}}}
+var b=box(),el=b.el,before=el.scrollTop;
+try{{el.scrollBy?el.scrollBy(0,{amount}):(el.scrollTop=before+({amount}))}}catch(e){{el.scrollTop=before+({amount})}}
+var after=el.scrollTop;
+return JSON.stringify({{container:b.name,delta:after-before,scrollTop:after,
+  atTop:after<=0,atBottom:after+el.clientHeight>=el.scrollHeight-1,
+  scrollHeight:el.scrollHeight,clientHeight:el.clientHeight}})}})()"#
+        );
+        let report = tab
+            .evaluate(&js, false)
+            .ok()
+            .and_then(|v| v.value.and_then(|x| x.as_str().map(String::from)))
+            .unwrap_or_default();
         std::thread::sleep(Duration::from_millis(350)); // let lazy content / sticky bars settle
-        Ok(None)
+        // with_tab 的 Ok(Some(..)) 就是走 BrowserState.result 那条额外结果通道，
+        // 不需要全局变量。delta 为 0 时模型一眼能看出「这一下什么都没滚动」。
+        Ok(if report.is_empty() { None } else { Some(report) })
     })
     .await
 }
@@ -1879,15 +1948,45 @@ pub async fn browser_wait(
         // borrow (don't move) selector — the closure is Fn (may run twice on relaunch)
         match selector.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
             Some(sel) => {
-                let deadline = std::time::Instant::now() + Duration::from_secs(8);
+                // 等待要等出**结论**。原来三个问题叠在一起：
+                //   · 期限写死 8 秒，调用方传的 ms 根本不读；
+                //   · 判据是 tab.find_element —— 只查主文档，而且只判「存在」不判「可见」，
+                //     于是 display:none 的骨架屏、还没渲染完的容器都算命中；
+                //   · **超时也 break 出来返回 Ok** —— 超时和命中长得一模一样。
+                // 于是慢接口上这一步随机「成功」，模型接着去 assert 然后失败，
+                // 它无从判断是选择器写错了还是等得不够久，只能瞎换定位。
+                let deadline_ms = ms.unwrap_or(8000).clamp(100, 30000);
+                let started = std::time::Instant::now();
+                let sel_js = serde_json::to_string(sel).unwrap_or_else(|_| "\"\"".into());
+                // 可见性判据和 click 那条路对齐：穿透同源 iframe 与 shadow root，
+                // 要求真实占位（宽高 > 1）且非 hidden/display:none。
+                let probe = format!(
+                    r#"(()=>{{var s={sel_js};
+function roots(){{var out=[document],q=[document];while(q.length){{var d=q.shift();var fs=[];try{{fs=d.querySelectorAll('iframe')}}catch(e){{}}for(var k=0;k<fs.length;k++){{try{{if(fs[k].contentDocument){{out.push(fs[k].contentDocument);q.push(fs[k].contentDocument)}}}}catch(e){{}}}}var all=[];try{{all=d.querySelectorAll('*')}}catch(e){{}}for(var j=0;j<all.length;j++){{if(all[j].shadowRoot)out.push(all[j].shadowRoot)}}}}return out}}
+function vis(el){{try{{var r=el.getBoundingClientRect(),w=(el.ownerDocument&&el.ownerDocument.defaultView)||window,cs=w.getComputedStyle(el);return r.width>1&&r.height>1&&cs.visibility!=='hidden'&&cs.display!=='none'&&Number(cs.opacity||1)>0.01}}catch(e){{return false}}}}
+var rs=roots();for(var i=0;i<rs.length;i++){{try{{var el=rs[i].querySelector(s);if(el&&vis(el))return 'found'}}catch(e){{}}}}
+return 'no|'+(document.readyState||'')+'|'+(location.href||'')}})()"#
+                );
+                let mut last = String::new();
                 loop {
-                    if tab.find_element(sel).is_ok() {
-                        break;
+                    if let Ok(v) = tab.evaluate(&probe, false) {
+                        let got = v.value.and_then(|x| x.as_str().map(String::from)).unwrap_or_default();
+                        if got == "found" {
+                            return Ok(None);
+                        }
+                        last = got;
                     }
-                    if std::time::Instant::now() > deadline {
-                        break;
+                    if started.elapsed() >= Duration::from_millis(deadline_ms) {
+                        let mut parts = last.splitn(3, '|');
+                        let _ = parts.next();
+                        let ready = parts.next().unwrap_or("").to_string();
+                        let url = parts.next().unwrap_or("").to_string();
+                        return Err(format!(
+                            "[失败] 等待「{sel}」超时：实际等了 {} ms 仍没有**可见**的匹配元素（readyState={ready}，url={url}）。这是时序或渲染问题，不是选择器写错——先用 nodes 看它到底渲染出来没有，再决定是加长 ms 还是换定位方式。",
+                            started.elapsed().as_millis()
+                        ));
                     }
-                    std::thread::sleep(Duration::from_millis(250));
+                    std::thread::sleep(Duration::from_millis(120));
                 }
             }
             None => {
@@ -2340,13 +2439,28 @@ mod tests {
                 SRC.contains(&needle),
                 "LaunchOptions 没有配 idle_browser_timeout —— 会退回默认 30 秒，浏览器会被反复杀掉重开",
             );
-            // 而且必须明显长于一次动作间隔。30 秒那一档等于没配。
-            let at = SRC.find(&needle).unwrap();
-            let call = &SRC[at..(at + 120).min(SRC.len())];
+            // **每一处** LaunchOptions 都要配，不是有一处就算数。
+            //
+            // 这条断言原来只查「文件里出现过一次」，于是回退路径（profile 被残留进程锁住时
+            // 走的那条）漏配了它整整一直没被发现：那条路吃默认 30 秒，起了窗口就断，
+            // 断了杀进程、杀完留下锁、下次又落回退路径——自我循环，用户看到的是
+            // 「打开窗口卡在那里，过一会开新的，就是不操作」。
+            // 同上：拼出来找，别写成字面量——否则会匹配到本测试自己，把 2 处数成 3 处。
+            let builder_needle = format!("{}::default()", "LaunchOptionsBuilder");
+            let builders = SRC.matches(&builder_needle).count();
+            let configured = SRC.matches(&needle).count();
             assert!(
-                call.contains("60") || call.contains("min"),
-                "空闲超时看起来还是秒级；这道门要的是分钟级：{call}",
+                configured >= builders,
+                "有 {builders} 处 LaunchOptions，只有 {configured} 处配了空闲超时——漏配的那条会退回默认 30 秒",
             );
+            // 而且每一处都必须明显长于一次动作间隔。30 秒那一档等于没配。
+            for (at, _m) in SRC.match_indices(&needle) {
+                let call = &SRC[at..(at + 120).min(SRC.len())];
+                assert!(
+                    call.contains("60") || call.contains("min"),
+                    "位置 {at} 处的空闲超时看起来还是秒级；这道门要的是分钟级：{call}",
+                );
+            }
         }
 
         // 孤儿清理的判据要覆盖**每一种**我们会造出来的 profile 目录，

@@ -1585,11 +1585,17 @@ test("empty-root explore helpers classify telemetry without entering the executo
 // 真实就绪状态，且 #9 的自动 ready 检测只对 run_in_terminal 生效，验证形同虚设。
 test("#54 timeout-wrapped dev server is stripped, recognized as a service, and steered to run_in_terminal", () => {
   const stripTimeout = load("_stripTimeoutWrapper");
-  const looksLikeService = load("_looksLikeServiceCommand");
-  // 最终触发谓词：跟 run_cmd 分支里一致（剥出内层命令 && 内层是服务型）。
+  // 触发谓词换成**精确**的那个。原来用的 _looksLikeServiceCommand 判据里有个裸词 `run`，
+  // 把 `npm run <任何脚本>` 整片吃掉（lint / typecheck / migrate 全被拒绝执行），
+  // 同时又漏判 vite / http.server / nodemon 这些真服务 —— 过宽和过窄同时存在。
+  // 「不重造判定」这条意图不变：复用的仍是仓库现成的谓词，只是换了更合适的那个。
+  const _startsServer54 = load("_commandStartsLongRunningServer", {
+    _LONG_RUNNING_HEADS: loadConst("_LONG_RUNNING_HEADS"),
+    _LONG_RUNNING_PAIRS: loadConst("_LONG_RUNNING_PAIRS"),
+  });
   const timeoutWrappedService = (cmd) => {
     const inner = stripTimeout(cmd);
-    return !!inner && looksLikeService(inner);
+    return !!inner && _startsServer54(inner);
   };
 
   // ---- _stripTimeoutWrapper：剥离各种 timeout 形式，取出内层命令 ----
@@ -1613,6 +1619,16 @@ test("#54 timeout-wrapped dev server is stripped, recognized as a service, and s
   assert.equal(timeoutWrappedService("timeout 30 npm run build"), false, "build 不是服务型");
   assert.equal(timeoutWrappedService("timeout 5 sleep 1"), false, "sleep 不是服务型");
   assert.equal(timeoutWrappedService("timeout 10 curl http://localhost:3000"), false, "curl 不是服务型");
+  // 误伤：这五条以前全被拒绝执行，回执还谎称「你用 timeout 包住了 dev server」。
+  for (const cmd of ["timeout 60 npm run lint", "timeout 60 npm run typecheck",
+                     "timeout 60 npm run migrate", "timeout 30 bash scripts/run-tests.sh",
+                     "timeout 60 make run-tests"]) {
+    assert.equal(timeoutWrappedService(cmd), false, `${cmd} 不是服务，不该被拒绝执行`);
+  }
+  // 漏判：这三条是真服务，以前放行了。
+  for (const cmd of ["timeout 30 vite", "timeout 30 python3 -m http.server", "timeout 30 nodemon app.js"]) {
+    assert.equal(timeoutWrappedService(cmd), true, `${cmd} 是真服务，应当引导去 run_in_terminal`);
+  }
   // 裸 npm run dev（无 timeout）不走新分支，交给既有长命令门
   assert.equal(timeoutWrappedService("npm run dev"), false, "裸命令不归新分支，由既有 isLongRunning 门拦");
 
@@ -1640,8 +1656,8 @@ test("#54 timeout-wrapped dev server is stripped, recognized as a service, and s
   assert.ok(idxTimeout > 0, "run_cmd 分支应接入 timeoutWrappedService");
   assert.ok(idxLong > 0, "isLongRunning 分支应保留");
   assert.ok(idxTimeout < idxLong, "timeoutWrappedService 分支必须在 isLongRunning 之前，否则被它遮蔽");
-  assert.match(SRC, /const timeoutWrappedService = !!_innerAfterTimeout && _looksLikeServiceCommand\(_innerAfterTimeout\);/,
-    "必须复用 #9 的 _looksLikeServiceCommand，不重造判定");
+  assert.match(SRC, /const timeoutWrappedService = !!_innerAfterTimeout && _commandStartsLongRunningServer\(_innerAfterTimeout\);/,
+    "必须复用现成的精确谓词，不重造判定；也不能退回那个裸词 run 会吃掉 npm run 全家的宽谓词");
   assert.match(SRC, /\[工具选择\][^"]*run_in_terminal/, "引导文案必须指向 run_in_terminal");
 });
 
@@ -22004,8 +22020,17 @@ test("existing-file writes ignore the legacy read gate and retain objective conf
   const inner = extractFn("_executeToolStepInner");
   assert.doesNotMatch(inner, /_writeGateBypass\(|const hasCurrentRead =|if \(run && !hasCurrentRead\)/,
     "the executor must not ask a conversational ledger for write permission");
-  assert.match(inner, /try \{ old = await backend\.readTextFile\(fp\); existed = true; \} catch \{\}/,
+  // 仍然是「现读磁盘取基线」，只是 catch 不再把原因吞掉（读不出来 ≠ 文件不存在）。
+  assert.match(inner, /try \{ old = await backend\.readTextFile\(fp\); existed = true; \}/,
     "whole write and edit rebase on the current disk bytes");
+  assert.match(inner, /catch \(e\) \{ readErr = String\(e && e\.message \|\| e \|\| ""\); \}/,
+    "读失败的原因又被吞掉了 —— 「读不出来」会重新被说成「文件不存在」");
+  // **catch 里绝不许碰 existed**：写盘的 CAS 拿 existed ? old : null 当基线，
+  // 翻成 true 就是拿空串去比对，比对一放宽就能把一个 6MB 的 .db 截成 0 字节。
+  const _catchAt = inner.indexOf('catch (e) { readErr =');
+  assert.ok(_catchAt > 0);
+  assert.doesNotMatch(inner.slice(_catchAt, _catchAt + 120), /existed\s*=/,
+    "在读失败的 catch 里改了 existed —— 会让 CAS 拿空基线去比对");
   assert.match(inner, /_openFileWriteConflict\(fp\)/,
     "unsaved editor content remains an objective conflict");
   assert.match(inner, /writeTextFileIfUnchanged\(fp, existed \? old : null, newContent\)/,
@@ -22849,6 +22874,11 @@ test("相似度阈值是标定出来的：同一问题的改写要命中，不�
     ["前端用 React 还是 Vue", "后端用 Go 还是 Rust"],
     ["这个文件要删掉吗", "这个文件要重命名吗"],
     ["要不要加测试", "要不要加文档"],
+    // 拉丁文样本：这 8 对原来**一对都没有**，所以「字符集合 Jaccard 对英文恒高」这个坑
+    // 一直没被标定测试踩到 —— 英文用户问第二个完全不同的问题就吃 [ALREADY_ANSWERED]。
+    ["Which database should I use for this project?", "Should the login page support social sign-in?"],
+    ["Do you want dark mode enabled by default?", "Which package manager should the project use?"],
+    ["Should I add end-to-end tests now?", "What is the deploy target for this build?"],
   ];
   for (const [a, b] of SAME) assert.ok(sim(a, b) >= 0.65, `「${a}」和「${b}」是同一个问题，却没命中：${sim(a, b)}`);
   for (const [a, b] of DIFF) assert.ok(sim(a, b) < 0.65, `「${a}」和「${b}」是两件事，却被判成同一个：${sim(a, b)}`);
@@ -25516,8 +25546,13 @@ test("只读模式那句「只能用四个工具」是假的，已经换成真�
 test("没打开工作区时给出可执行的下一步，而不是求用户去点菜单", () => {
   // 工具描述和轮次开头的 contextBlock 都明写「别停下来问用户」，而这条刚发生的
   // 工具结果原来和它们唱反调，叫模型去求用户打开文件夹——模型做不到的事。
+  // 2026-08-20：从 4 处长到 8 处。原来只有 write/edit、mkdir、copy、format 给了出路；
+  // 从零建项目那族（game_scaffold / web_scaffold / generate_3d|sound|music|voice|motion|
+  // texture / auto_rig / download_asset）回的是「[错误] 请先打开一个工作区。」这条死路 ——
+  // 而 web_scaffold 自己的描述写着 "from scratch"、create_project 的描述明令「不要让用户
+  // 去开文件夹」。这条断言的意图是「每一处无工作区拦截都要给出路」，所以数字跟着长是对的。
   const n = (SRC.match(/\*\*下一步直接调 create_project/g) || []).length;
-  assert.equal(n, 4, `四处无工作区拦截都要给出路，实际 ${n} 处`);
+  assert.equal(n, 8, `每一处无工作区拦截都要给出路，实际 ${n} 处`);
   assert.doesNotMatch(SRC, /请先打开项目文件夹或给当前聊天标签设置工作目录/, "还在求用户");
   // 不能建议"改用绝对路径"——无根时写操作 fail-closed，那是第二条死路
   assert.match(SRC, /也不要改用绝对路径绕过去[\s\S]{0,60}那是第二条死路/);
@@ -30680,11 +30715,13 @@ test("读不了的文件不许说成「找不到」，而且错误码要被失�
 });
 
 test("日志截断要说真实总量，不能让下游报出一个精确的假数字", () => {
-  const seg = /const _joined = chunks\.join[\s\S]*?_joined\.slice\(0, _LOG_BUDGET\);/.exec(SRC);
+  // 切到 `return _body` 为止：中间那两个自由变量（call / _nameMiss）当参数注进去，
+  // 「点名的终端没匹配上」那条抬头有自己的测试，这里只看截断。
+  const seg = /const _joined = chunks\.join[\s\S]*?\n  return _body;/.exec(SRC);
   assert.ok(seg, "日志截断那段不见了");
-  const f = new Function("chunks", seg[0].replace("const _joined", "let _joined"));
+  const f = new Function("chunks", "call", "_nameMiss", seg[0].replace("const _joined", "let _joined"));
   const chunks = Array.from({ length: 8 }, (_, i) => "--- 日志文件: a" + i + ".log ---\n" + "x".repeat(12000));
-  const out = f(chunks);
+  const out = f(chunks, {}, "");
   const real = chunks.join("\n\n").length;
   assert.match(out, new RegExp(`实际共 ${real} 字`),
     "没给真实总量 —— 下游那句「中间约 N 字不在上下文里」用的是砍完之后的长度，会低报几千倍");
@@ -30694,7 +30731,7 @@ test("日志截断要说真实总量，不能让下游报出一个精确的假�
     "返回正好顶到下游预算，恰恰是让那个假标记必然触发的值；要留出抬头和外部数据标记的位置");
   assert.match(out, /read_logs\(path=/, "没告诉模型缺的那几份怎么单独取");
   // 没超预算时原样返回，别平白加一句。
-  assert.equal(f(["short"]), "short");
+  assert.equal(f(["short"], {}, ""), "short");
 });
 
 test("CI 日志：第一行就是错因时不许说「没匹配到失败关键词」，抬头的行数要从实际交付反推", () => {
@@ -30832,4 +30869,286 @@ test("xterm 一族一律懒加载，包括它的样式表", () => {
     assert.match(SRC.slice(Math.max(0, at - 200), at), /await _loadXterm\(\)/,
       "有个使用点没先 await 懒加载器 —— 会 ReferenceError");
   }
+});
+
+// ---- 命令跑通了不许判成没跑通 ----
+//
+// 退出码是执行事实，文案匹配只是兜底（函数头上的注释早就这么写了）—— 但代码里文案匹配
+// 排在退出码**前面**。于是命令 exit 0、只要输出里有方括号包着的 ERROR/失败（nginx 日志、
+// logback、Go log、测试自己打的错误日志、甚至 harness 上一轮注入的报错行），整次调用被判失败：
+// 计划那步不推进、purpose:"verify" 不盖章、收尾门一直要你再验一次。
+// read_logs 更死：它的唯一用途就是取回含错误的日志 —— 取证被判失败 → 取证证据不成立 →
+// 硬拦首次修改并指名叫模型去用 read_logs 取证 → 再被判失败。死循环。
+test("退出码优先于文案；日志类工具的正文里出现 ERROR 是内容不是结局", () => {
+  const succeeded = load("_toolExecutionSucceeded", {
+    _WORKSPACE_MUTATING_TYPES: new Set(["write", "edit"]),
+    _toolFailureMatch: load("_toolFailureMatch"),
+    _toolFailureMarkerAtHead: load("_toolFailureMarkerAtHead"),
+  });
+  const cases = [
+    ["命令 exit 0、输出含 [ERROR] 日志行", { type: "cmd" },
+      { code: 0, content: "2026-08-20T10:00:01Z [ERROR] connect ECONNREFUSED\n[INFO] retrying" }, true],
+    ["命令 exit 1", { type: "cmd" }, { code: 1, content: "boom" }, false],
+    // 没有退出码的三种 cmd 结果（空命令 / 只读子体被拦 / 子体超时）仍要靠文案兜底。
+    ["cmd 无退出码 + 首行 [BLOCKED]", { type: "cmd" }, { content: "[BLOCKED] 只读子体不许跑命令" }, false],
+    ["read_logs 取回含 [ERROR] 的日志", { type: "logs" },
+      { content: "〔外部数据〕\n2026-08-20 [ERROR] nginx upstream timed out\nmore" }, true],
+    ["read_logs 自己失败（首行标记）", { type: "logs" }, { content: "[ERROR] 读不到任何日志" }, false],
+    ["读终端：正文含 ERROR", { type: "termread" }, { content: "$ npm test\n[ERROR] 1 failing\n" }, true],
+    // 反向：别的工具的失败标记出现在正文中段，仍然必须判失败（不许全局锚行首）。
+    ["写文件失败、标记在正文中段", { type: "write" },
+      { content: "写入 a.ts\n[CONFLICT] file was created by another task" }, false],
+  ];
+  for (const [name, call, res, want] of cases) {
+    assert.equal(succeeded(call, res), want, name);
+  }
+  // 顺序本身要钉住：退出码那一行必须在文案匹配之前。
+  const src = extractFn("_toolExecutionSucceeded")
+    .split("\n").filter((l) => !l.trim().startsWith("//")).join("\n");
+  const codeAt = src.indexOf('call.type === "cmd" && Number.isFinite(Number(result.code))');
+  const proseAt = src.indexOf("const _failed =");
+  assert.ok(codeAt > 0 && proseAt > 0 && codeAt < proseAt,
+    "文案匹配又排到退出码前面去了 —— 跑通的命令会被判成没跑通");
+});
+
+// ---- 后台配了 dall-e-3，生图三件套却说「没有生图模型」 ----
+//
+// _autoImageModel 只认名字带 gpt-image 的。用户配了 dall-e-3 / flux / seedream / SD /
+// gemini-*-image 任一个，generate_image / visual_explain / design_board 全部拒绝，
+// 系统提示词还反过来教模型「generate_image 暂不可用，用 picsum 占位」。
+// 而同一个文件里，用户手动选中 dall-e-3 时走的是同一条后端路径、照常工作 ——
+// 后端本来就是模型无关的。
+test("生图模型白名单认得住主流生成模型，也别把「看图」模型当成能画图的", () => {
+  const src = extractFn("_autoImageModel");
+  const pick = (ids) => new Function("MODEL_GROUPS", `${src}\nreturn _autoImageModel;`)(
+    [{ models: ids.map((id) => ({ id })) }])();
+  assert.equal(pick(["gpt-4o", "dall-e-3"]), "dall-e-3", "配了 dall-e-3 仍然说没有生图模型");
+  assert.equal(pick(["gpt-4o", "flux-1.1-pro"]), "flux-1.1-pro");
+  assert.equal(pick(["seedream-4"]), "seedream-4");
+  assert.equal(pick(["stable-diffusion-3.5"]), "stable-diffusion-3.5");
+  assert.equal(pick(["gemini-3-pro-image"]), "gemini-3-pro-image");
+  // 优先级不许乱：gpt-image 系列在前。
+  assert.equal(pick(["dall-e-3", "gpt-image-2"]), "gpt-image-2", "优先级乱了");
+  // 反向两条，比正向更要紧：
+  assert.equal(pick(["gpt-4o", "claude-opus-5"]), "", "没有生图模型时必须照旧拒绝");
+  assert.equal(pick(["gpt-4o-image-understanding", "qwen-vl-image"]), "",
+    "把「看图」模型当成能画图的了 —— 真被选中会三端点依次撞墙、熬满超时");
+});
+
+// ---- 「读不出来」不等于「文件不存在」 ----
+//
+// GBK/Latin-1 的遗留源码、>5MB、二进制、root 属主、路径其实是目录 —— 这五种确实存在，
+// 却被 read_file / edit_file / multi_edit / format_file 一律说成「文件不存在」。
+// edit 还附一份「项目里有 1 个同名文件」的清单（里面就是这个文件自己）让模型先 read 它，
+// 而 read 会再给一次同样的话；multi_edit 让模型改用 write_file，撞 [CONFLICT]。
+// 两条路都是死的，没有一句话是真的。后端本来**专门**造了六种有区分度的错误串，全被抹平。
+test("五种「存在但读不了」不许被说成文件不存在", () => {
+  const isMissing = load("_isMissingFileError");
+  const cases = [
+    ["No such file or directory (os error 2)", true, "真的不存在"],
+    ["file is not valid UTF-8: assets/legacy.c", false, "非 UTF-8 的遗留源码"],
+    ["没有读取权限: /etc/shadow", false, "没有读权限"],
+    ["file too large (> 5 MB): dist/app.asar", false, "太大"],
+    ["binary file, refusing to read as text", false, "二进制"],
+    // os error 21 是「其实是目录」。判据里那个 `os error 2` 不加词边界会把 21 也吃掉。
+    ["Is a directory (os error 21)", false, "路径其实是目录"],
+  ];
+  for (const [msg, want, name] of cases) {
+    assert.equal(isMissing(msg), want, `${name}：${msg}`);
+  }
+
+  // 四个站点都要按这个判据分流，而且错误码必须含 ERROR（失败识别器认的是那张枚举，
+  // 自造一个 [UNREADABLE] 会让失败被算成成功，比原来的 bug 更糟）。
+  const failMatch = load("_toolFailureMatch");
+  assert.ok(failMatch("[ERROR/UNREADABLE] 这条路径读不出来: a.c"), "错误码不被失败识别器认得");
+  assert.equal((SRC.match(/\[ERROR\/UNREADABLE\]/g) || []).length >= 4, true,
+    "四个站点（read / edit / multi_edit / format）没有都改到 —— 漏一个就还是死胡同");
+  // 光有字符串不算数：分流条件必须真的在（包一层 if (false) 照样能让上面那条过）。
+  assert.match(SRC, /if \(!existed && readErr && !_isMissingFileError\(readErr\)\) \{/,
+    "edit 的「读不了」分支被条件包住或删了 —— 又会掉回「文件不存在」那条死路");
+  // multi_edit 和 format 各一处，按判据分流。数出现次数，别按 indexOf 取窗（那会命中
+  // 别的返回点，窗口对不上，变成假红）。
+  assert.equal((SRC.match(/!_isMissingFileError\(_msg\)/g) || []).length, 2,
+    "multi_edit / format 没有都按判据分流 —— 漏一个，读不了就仍然会被说成文件不存在");
+  // read_file 的「读不了」判据要认得非 UTF-8 和没权限。
+  const readSrc = SRC.slice(SRC.indexOf("const unreadableMatches = []"));
+  assert.match(readSrc.slice(0, 2000), /not valid UTF-8\|没有读取权限/,
+    "read_file 仍然把非 UTF-8 / 没权限当成「找不到」");
+  // 三处新分支都必须明确否掉 write_file 这条死路。
+  assert.ok((SRC.match(/别改用 write_file|别再 find_files/g) || []).length >= 2,
+    "没告诉模型别走那两条死路");
+});
+
+// ---- 抓到 0 字节不许写进缓存 ----
+//
+// 「搜索 → 打开原文」这条链断在几处，这是其中最狠的一处：抓到空串（跳转壳回 204、
+// 反爬页、服务端拒给正文）还把它缓存下来 —— 同一会话里第二次抓同一个 URL 直接返回
+// 缓存的空串，**连网络都不碰**。模型「再抓一次确认」这条自救路彻底断掉，
+// 只能得出「这一页就是空的」。
+test("空的抓取结果不进缓存，别把「再试一次」这条路堵死", () => {
+  const store = new Map();
+  const put = load("_webCachePut", { _agentWebCache: store });
+  put("https://a", "");
+  put("https://b", "   \n  ");
+  put("https://c", null);
+  assert.equal(store.size, 0, "空结果被缓存了 —— 下次再抓会直接返回空串，连网络都不碰");
+  put("https://d", "real content");
+  assert.equal(store.get("https://d"), "real content", "正常内容不该被拦住");
+  // 上限仍在。
+  for (let i = 0; i < 70; i++) put("k" + i, "x");
+  assert.ok(store.size <= 60, "缓存上限失效");
+});
+
+// ---- 没打开工作区 ≠ 死路 ----
+//
+// 从零开新项目的那十个工具（game_scaffold / web_scaffold / generate_3d|sound|music|voice|
+// motion|texture / auto_rig / download_asset）一律回「[错误] 请先打开一个工作区。」——
+// 而 web_scaffold 自己的描述写着 "Start a site … **from scratch** with this"，全文没有一句
+// 要工作区；create_project 的描述更是明令「不要让用户去开文件夹」。
+// 同一个文件里的对照组（write / edit / mkdir / copy / format）给的是正确做法：
+// 「下一步直接调 create_project({name})，它会立刻成为当前工作区，然后原样重试这一步」。
+test("没有工作区时，从零建项目那族要给出路而不是死路", () => {
+  assert.equal((SRC.match(/\[错误\] 请先打开一个工作区。/g) || []).length, 0,
+    "还有工具在回「请先打开一个工作区」这种死路 —— 用户说「给我做个落地页」时它就停在这儿了");
+  // 具体几处由上面那条「每一处无工作区拦截都要给出路」钉着，这里只钉措辞一致
+  //（模型已经认得对照组那句，新加的四处不该另造一套说法）。
+  assert.ok((SRC.match(/create_project\(\{name:"<描述性名字>"\}\)/g) || []).length >= 8,
+    "新加的四处没沿用对照组的措辞");
+  // 错误码要被失败识别器认出来，否则这次「没做成」会被算成成功。
+  const failMatch = load("_toolFailureMatch");
+  assert.ok(failMatch("[BLOCKED] 当前没有工作区根目录。**下一步直接调 create_project({name:\"x\"})**"),
+    "错误码不被失败识别器认得");
+});
+
+// ---- 英文用户一次会话只能被问一次 ----
+//
+// 相似度用的是**字符集合** Jaccard。中文可用（字多、集合稀疏），拉丁文恒高：26 个字母的
+// 语言里任意两句长英文的字符集几乎全覆盖。配 0.65 阈值，英文用户问第二个**完全不同**的
+// 问题时会被判成「你已经问过了」，直接吃到 [ALREADY_ANSWERED]。
+// 原来那组标定样本 8 对里**没有一对是拉丁文为主的**，所以这个坑一直没人踩到。
+test("英文问两个完全不同的问题，不许被判成重复", () => {
+  const sim = load("_questionSimilarity", { _normalizeQuestion: load("_normalizeQuestion") });
+  const DUP = 0.65; // 与 _alreadyAnsweredQuestion 里的阈值一致
+
+  // 完全不同 → 必须判成新问题（这是这条修复的靶子）
+  for (const [a, b] of [
+    ["Which database should I use for this project?", "Should the login page support social sign-in?"],
+    ["Do you want dark mode enabled by default?", "Which package manager should the project use?"],
+    ["Should I add end-to-end tests now?", "What is the deploy target for this build?"],
+  ]) {
+    assert.ok(sim(a, b) < DUP, `英文两个完全不同的问题被判成重复：${sim(a, b).toFixed(3)}\n  ${a}\n  ${b}`);
+  }
+
+  // 中文侧一字不动：完全不同仍判新问题，真改写仍判重复。
+  assert.ok(sim("这个项目用哪个数据库？", "登录页要不要支持第三方登录？") < DUP, "中文完全不同被判成重复");
+  assert.ok(sim("这个项目用哪个数据库？", "这个项目要用什么数据库？") >= DUP, "中文真改写不再判重复 —— 中文侧不该受影响");
+
+  // 逐字相同 / 包含关系的快路不受影响。
+  assert.equal(sim("Use postgres?", "Use postgres?"), 1);
+  assert.ok(sim("Use postgres for this?", "Use postgres") >= 0.9, "包含关系的快路没了");
+
+  // **取舍写明**：英文的真改写会掉到阈值之下，模型因此多问一次 —— 这是这个函数注释
+  // 自己定的方向（漏判只多问一次，误判会拿旧答案顶掉新问题）。钉住它，免得后人
+  // 「顺手调高召回」把误判那一侧放回来。
+  const rewrite = sim("Which database should I use?", "What database should I use?");
+  assert.ok(rewrite < DUP,
+    "英文真改写又被判成重复了 —— 方向错了：误判的代价是拿旧答案顶掉新问题");
+  assert.ok(rewrite > 0.4, `英文真改写掉得太狠（${rewrite.toFixed(3)}），相似度已经失去意义`);
+
+  // 分派必须在**原始串**上做：_normalizeQuestion 把空格也删了，在它之后按词切永远是空集。
+  const src = extractFn("_questionSimilarity");
+  assert.match(src, /_words\(a\)/, "按词切用的不是原始串 —— 空格已经被规范化删掉了");
+});
+
+// read_logs(name=...) 点名一个终端，没匹配上时代码**照样**往下走去读工作区里的日志文件。
+// 那些文件顶着 `--- 日志文件: ... ---` 的头交回模型，全程没有一个字说过「你点的名字没找到」。
+// 模型问的是「backend 那个终端在喊什么」，收到的是 vite.log 的尾巴，并且会当成答案用。
+// 修法是加抬头，不是改成失败——其它日志确实读到了，报失败会把一次有产出的调用抹成零产出。
+test("read_logs 点名的终端没匹配上，不许把别人的日志当成它的交回去", async () => {
+  const _agentReadLogs = load("_agentReadLogs", {
+    _terminalLogChunks: (name) => (name === "backend"
+      ? ["--- 终端日志: backend (运行中) ---\nlistening on 8080"]
+      : []),
+    _formatAgentTerminalLines: () => ["[0] frontend (运行中) cwd=/w cmd=npm run dev"],
+    _looksLikeLogFileName: () => true,
+    _workspaceLogCandidates: async () => ["/w/vite.log"],
+    _readLogTailForAgent: async (path) => ({ path, content: "vite ready in 300ms" }),
+  });
+
+  const hit = await _agentReadLogs({ name: "backend" }, "/w", null);
+  assert.match(hit, /listening on 8080/);
+  assert.doesNotMatch(hit, /终端没匹配上/, "匹配上了还报没匹配上");
+
+  const miss = await _agentReadLogs({ name: "worker" }, "/w", null);
+  assert.match(miss.split("\n")[0], /\[终端没匹配上\]/,
+    "点名的终端没找到，抬头第一行必须说出来——放末尾会被下游再截时第一个砍掉");
+  assert.match(miss, /worker/, "没说清是哪个名字没找到");
+  assert.match(miss, /frontend/, "没给出当前真实存在的终端，模型无从改口");
+  assert.match(miss, /\*\*不是\*\*「worker」的输出/,
+    "工作区日志照常给了，却没声明它们不是被点名那个终端的输出");
+  assert.match(miss, /vite ready in 300ms/, "抬头不该把已经读到的日志吞掉");
+
+  // 而且不许被判成一次失败：`[终端没匹配上]` 落在失败标记正则外，是有意的。
+  const _toolFailureMatch = load("_toolFailureMatch");
+  assert.equal(!!_toolFailureMatch(miss), false,
+    "抬头被判成工具失败了——其它日志真读到了，报失败等于把有产出的调用抹成零产出");
+
+  // 什么都没读到时，也要说是「名字没匹配上」，不是笼统的「没有日志」。
+  const empty = load("_agentReadLogs", {
+    _terminalLogChunks: () => [],
+    _formatAgentTerminalLines: () => [],
+    _looksLikeLogFileName: () => true,
+    _workspaceLogCandidates: async () => [],
+    _readLogTailForAgent: async () => ({ error: "not found" }),
+  });
+  const none = await empty({ name: "worker" }, "/w", null);
+  assert.match(none, /\[终端没匹配上\]/);
+  assert.match(none, /一个终端都没打开/);
+});
+
+// background_monitor 说自己开始等了，然后一次检查都没做。
+// 轮询循环里每条分支都是 `bmType === "file" && bmPat` 这种精确匹配，认不出来就一条都不进，
+// 只剩计时器在转：卡片显示「已检查 N 次」，超时回执说「等待…已超过 300 秒」——读起来像
+// 「条件一直没发生」，实际是条件一次都没被检查过。模型据此得出「服务没起来」的错结论。
+test("background_monitor：检查不了的条件必须当场说，别用 300 秒换一句假的「超时」", () => {
+  const normalize = load("_normalizeArgKeys");
+  const map = load("_mapToolCall", {
+    _mcpToolMap: new Map(), _normalizeArgKeys: normalize, _STR_ARG_KEYS: new Set(),
+    _KNOWN_TOOLS: new Set(["background_monitor"]), _canonicalToolName: () => "",
+  });
+  const call = (args) => map("background_monitor", args);
+
+  // 入参归一把 condition 并进了 check_type —— 而 condition 恰恰是模型最容易塞一整句
+  // 自然语言的字段。这就是「说开始了却什么都没检查」最主要的来源。
+  const leaked = call({ message: "等 dev server", condition: "dev server listening on 3000" });
+  assert.equal(leaked.checkType, "dev server listening on 3000",
+    "condition→check_type 这条归一没了的话，这个测试就不再覆盖它原本要覆盖的那条路");
+
+  const seg = /const _BM_CHECKS = new Set\(\[[\s\S]*?\n      \}\n/.exec(SRC);
+  assert.ok(seg, "background_monitor 的可检查性守卫不见了");
+  const guard = new Function("bmType", "bmPat", "bmTimeout", "res",
+    seg[0] + '\n;return null;');
+  const check = (c) => guard(c.checkType, c.pattern, 300, {});
+
+  const blocked = check(leaked);
+  assert.ok(blocked, "check_type 是一整句自然语言，照样开始等了");
+  assert.match(blocked.content, /\[BLOCKED_MONITOR_UNCHECKABLE\]/);
+  assert.match(blocked.content, /condition/, "没点破是 condition 被并进 check_type 的");
+  assert.match(blocked.content, /port|url|command/, "没给出可用的 check_type，模型无从改口");
+  assert.equal(blocked.failure.attempted, false, "一次都没检查，不能报成尝试过");
+
+  // 类型对但 pattern 空：file/command/url/port 四条分支都带 `&& bmPat`，同样一条都不进。
+  for (const t of ["file", "command", "url", "port"]) {
+    const r = check(call({ message: "等", check_type: t }));
+    assert.ok(r, `check_type=${t} 没给 pattern，照样空等到超时`);
+    assert.match(r.content, /pattern/);
+  }
+
+  // capture 和 manual 有意豁免。capture 空 pattern 匹配下一条新流量，是抓包恢复路径
+  // 明说的用法（CONFIGURE_BACKGROUND_PROXY 那条回执就是这么教模型的）；manual 不轮询。
+  assert.equal(check(call({ message: "等流量", check_type: "capture" })), null,
+    "capture 不带 pattern 被拦了 —— 抓包恢复路径正是这么教模型调的");
+  assert.equal(check(call({ message: "等用户登录" })), null, "manual 被拦了");
+  assert.equal(check(call({ message: "等端口", check_type: "port", pattern: "3000" })), null,
+    "写全了还被拦");
 });

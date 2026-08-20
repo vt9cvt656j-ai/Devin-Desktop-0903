@@ -8549,7 +8549,7 @@ function _clearAllMarkersForModel(model) {
 }
 
 function _isMissingFileError(error) {
-  return /No such file or directory|not found|does not exist|cannot find|ENOENT|os error 2|找不到(?:指定的)?文件|文件不存在/i.test(String(error?.message || error || ""));
+  return /No such file or directory|not found|does not exist|cannot find|ENOENT|os error 2\b|找不到(?:指定的)?文件|文件不存在/i.test(String(error?.message || error || ""));
 }
 
 function _dropProjectModel(path) {
@@ -24278,7 +24278,27 @@ function _isImageModel(id) {
 function _autoImageModel() {
   try {
     const all = MODEL_GROUPS.flatMap((g) => g.models.map((m) => m.id));
-    return all.find((id) => /gpt-image-2/i.test(id)) || all.find((id) => /gpt-image/i.test(id)) || "";
+    const pick = (re) => all.find((id) => re.test(id));
+    // 只认 gpt-image 是不对的：后台配了 dall-e-3 / flux / seedream / SD / gemini-*-image
+    // 任一个，三个生图工具（generate_image / visual_explain / design_board）全部拒绝，
+    // 说「后台模型列表里没有生图模型」，系统提示词还反过来教模型用 picsum 占位。
+    // 而同一个文件里，用户在模型选择器里**手动选中** dall-e-3 时走的是同一条后端路径，
+    // 照常工作 —— 后端本来就是模型无关的（三端点依次试，没有任何 gpt-image 硬编码）。
+    //
+    // 这里是**接受**过滤器，所以必须逐族点名，不能借用那个「是不是图像模型」的判据：
+    // 那个是**拒绝**过滤器（误判成真是安全方向），拿来当接受用就把方向倒过来了 ——
+    // 它对 gpt-4o-image-understanding / qwen-vl-image / llava-image 也返回真，
+    // 那些是「看图」不是「画图」，真被选中会三端点依次撞墙、最长熬满超时。
+    return pick(/gpt-image-2/i)
+      || pick(/gpt-image/i)
+      || pick(/dall-?e/i)
+      || pick(/\bflux\b/i)
+      || pick(/seedream/i)
+      || pick(/imagen|midjourney/i)
+      || pick(/stable.?diffusion|sdxl|sd-?3\b/i)
+      || pick(/kolors|cogview/i)
+      || pick(/gemini[\w.-]*-image\b|grok[\w.-]*-image\b/i)
+      || "";
   }
   catch { return ""; }
 }
@@ -27387,7 +27407,20 @@ async function _agentRunInTerminal(root, command, stepEl, explicitTimeoutSecs) {
     // 同一套 _looksLikeServiceCommand 判服务型（不重造判定）；timeout 包住 test/build/curl/
     // sleep 等非服务命令不命中，不误伤。
     const _innerAfterTimeout = _stripTimeoutWrapper(cmd);
-    const timeoutWrappedService = !!_innerAfterTimeout && _looksLikeServiceCommand(_innerAfterTimeout);
+    // 这里必须用**精确**谓词，不能用 _looksLikeServiceCommand。
+    //
+    // 后者的判据是 /\b(?:dev|serve|start|preview|run)\b/ —— 那个裸词 `run` 把
+    // `npm run <任何脚本>` 整片吃掉：`timeout 60 npm run lint` / `typecheck` / `migrate` /
+    // `timeout 30 bash scripts/run-tests.sh` 全被**拒绝执行**，回执还谎称「你用 timeout
+    // 包住了 dev server」，并把模型指向 run_in_terminal —— 而那条路对一次性命令拿不到退出码，
+    // 还会带 [ERROR] 被判失败、文案又指回 run_cmd，来回弹。
+    // 同一个判据还**漏判**真服务：timeout 30 vite / python3 -m http.server / nodemon app.js 都不命中。
+    // 过宽和过窄同时存在。
+    //
+    // 不动 _looksLikeServiceCommand 本体：它另一个调用点是 ready 轮询，那里过宽只多轮询
+    // 十几秒，代价极小 —— 它本来就是个「宁滥勿缺才合算」的谓词，只是被搬到了这个
+    // 「宁缺勿滥才合算」的位置上。
+    const timeoutWrappedService = !!_innerAfterTimeout && _commandStartsLongRunningServer(_innerAfterTimeout);
     // Fast-path reading a file: `cat` (Unix) or `type` (Windows) → read directly.
     const isCatCmd = /^\s*cat\s/.test(cmd) || (_win && /^\s*type\s/.test(cmd));
 
@@ -31538,7 +31571,10 @@ const _NODES_EXTRACT_JS = `(() => {
   try {
     var clean = function(s){ s=String(s||''); var out='', sp=false; for (var k=0;k<s.length;k++){ var ch=s[k]; if (ch===' '||ch==='\\n'||ch==='\\t'||ch==='\\r'){ if(!sp){ out+=' '; sp=true; } } else { out+=ch; sp=false; } } return out.trim(); };
     var rootList = function(){
-      var out = [], seen = [], iframeCount = 0, shadowCount = 0;
+      // blocked：**够不着**的 iframe（跨域）。此前它们被静默跳过，contexts.iframes 只数同源的，
+      // 模型看到 iframes:0 就以为页面没有嵌套内容，然后对着一个根本不在本文档里的元素
+      // 无穷换选择器。Stripe 支付、第三方登录、嵌入式播放器全是这个形态。
+      var out = [], seen = [], iframeCount = 0, shadowCount = 0, blocked = [];
       var push = function(root, depth){
         if (!root || seen.indexOf(root) >= 0 || depth > 5) return;
         seen.push(root); out.push(root);
@@ -31547,11 +31583,11 @@ const _NODES_EXTRACT_JS = `(() => {
         for (var i=0;i<all.length;i++){
           var el = all[i];
           try { if (el.shadowRoot) { shadowCount++; push(el.shadowRoot, depth + 1); } } catch(e1){}
-          try { if (el.tagName === 'IFRAME' && el.contentDocument) { iframeCount++; push(el.contentDocument, depth + 1); } } catch(e2){}
+          try { if (el.tagName === 'IFRAME') { if (el.contentDocument) { iframeCount++; push(el.contentDocument, depth + 1); } else { var _r = el.getBoundingClientRect(); blocked.push({ src: String(el.src || '').slice(0, 120), w: Math.round(_r.width), h: Math.round(_r.height) }); } } } catch(e2){ try { var _r2 = el.getBoundingClientRect(); blocked.push({ src: String(el.src || '').slice(0, 120), w: Math.round(_r2.width), h: Math.round(_r2.height) }); } catch(e3){} }
         }
       };
       push(document, 0);
-      out.iframeCount = iframeCount; out.shadowCount = shadowCount;
+      out.iframeCount = iframeCount; out.shadowCount = shadowCount; out.blockedFrames = blocked;
       return out;
     };
     var qsa = function(sel){
@@ -31597,8 +31633,8 @@ const _NODES_EXTRACT_JS = `(() => {
     var heads = qsa('h1,h2,h3').slice(0, 20)
       .map(function(h){ return { r:'h'+(h.tagName.charAt(1)), n:clean(h.innerText||'').slice(0,56) }; })
       .filter(function(h){ return h.n; }).slice(0,12);
-    return JSON.stringify({ url:location.href, title:clean(document.title).slice(0,80), ready:document.readyState, active:document.activeElement ? nameOf(document.activeElement) : '', contexts:{ roots:roots.length, iframes:roots.iframeCount||0, shadowRoots:roots.shadowCount||0 }, total:id, structure:heads, nodes:nodes,
-      legend:'i=节点号(用 browser click/type node=i 操作)·r=角色·n=名称·s=状态(disabled/checked/expanded/value/href)·off=1 表示在视口外(先 scroll 再点)·contexts=同源 iframe/shadow DOM 已纳入观察' });
+    return JSON.stringify({ url:location.href, title:clean(document.title).slice(0,80), ready:document.readyState, active:document.activeElement ? nameOf(document.activeElement) : '', contexts:{ roots:roots.length, iframes:roots.iframeCount||0, shadowRoots:roots.shadowCount||0, crossOriginFrames:(roots.blockedFrames||[]).slice(0,6) }, total:id, structure:heads, nodes:nodes,
+      legend:'i=节点号(用 browser click/type node=i 操作)·r=角色·n=名称·s=状态(disabled/checked/expanded/value/href)·off=1 表示在视口外(先 scroll 再点)·contexts.iframes/shadowRoots=同源的已纳入观察；contexts.crossOriginFrames=**够不着**的跨域 iframe，里面的元素在这份快照里一个都没有，别对它们换选择器——改成 navigate 到那个 src，或换用接口/其它路径' });
   } catch (e) { return JSON.stringify({ error: String(e) }); }
 })()`;
 
@@ -31882,7 +31918,10 @@ function _browserBatchFastJS(steps) {
     var clean = function(s){ s=String(s||''); var out='', sp=false; for (var k=0;k<s.length;k++){ var ch=s[k]; if (ch===' '||ch==='\\n'||ch==='\\t'||ch==='\\r'){ if(!sp){ out+=' '; sp=true; } } else { out+=ch; sp=false; } } return out.trim(); };
     var lower = function(s){ return clean(s).toLowerCase(); };
     var rootList = function(){
-      var out = [], seen = [], iframeCount = 0, shadowCount = 0;
+      // blocked：**够不着**的 iframe（跨域）。此前它们被静默跳过，contexts.iframes 只数同源的，
+      // 模型看到 iframes:0 就以为页面没有嵌套内容，然后对着一个根本不在本文档里的元素
+      // 无穷换选择器。Stripe 支付、第三方登录、嵌入式播放器全是这个形态。
+      var out = [], seen = [], iframeCount = 0, shadowCount = 0, blocked = [];
       var push = function(root, depth){
         if (!root || seen.indexOf(root) >= 0 || depth > 5) return;
         seen.push(root); out.push(root);
@@ -31891,11 +31930,11 @@ function _browserBatchFastJS(steps) {
         for (var i=0;i<all.length;i++){
           var el = all[i];
           try { if (el.shadowRoot) { shadowCount++; push(el.shadowRoot, depth + 1); } } catch(e1){}
-          try { if (el.tagName === 'IFRAME' && el.contentDocument) { iframeCount++; push(el.contentDocument, depth + 1); } } catch(e2){}
+          try { if (el.tagName === 'IFRAME') { if (el.contentDocument) { iframeCount++; push(el.contentDocument, depth + 1); } else { var _r = el.getBoundingClientRect(); blocked.push({ src: String(el.src || '').slice(0, 120), w: Math.round(_r.width), h: Math.round(_r.height) }); } } } catch(e2){ try { var _r2 = el.getBoundingClientRect(); blocked.push({ src: String(el.src || '').slice(0, 120), w: Math.round(_r2.width), h: Math.round(_r2.height) }); } catch(e3){} }
         }
       };
       push(document, 0);
-      out.iframeCount = iframeCount; out.shadowCount = shadowCount;
+      out.iframeCount = iframeCount; out.shadowCount = shadowCount; out.blockedFrames = blocked;
       return out;
     };
     var docs = function(){ return rootList().filter(function(r){ return r && r.nodeType === 9; }); };
@@ -32494,7 +32533,7 @@ function _browserBatchFastJS(steps) {
       var nodes=[], id=0, els=[]; try { els = qsa(SEL).slice(0, 1500); } catch(e){}
       for (var i=0;i<els.length && id<110;i++){ var el=els[i], r; try{ r=el.getBoundingClientRect(); }catch(e){ continue; } if(!visible(el)) continue; el.setAttribute('data-mnode', String(id)); var inView=!(r.bottom<=0||r.right<=0||r.top>=innerHeight||r.left>=innerWidth); var node={ i:id, r:roleOf(el), n:nameOf(el) }; var st=stateOf(el); for(var kk in st){ node.s=st; break; } if(!inView)node.off=1; nodes.push(node); id++; }
       var heads=[]; try { heads = qsa('h1,h2,h3').slice(0, 20).map(function(h){ return { r:'h'+(h.tagName.charAt(1)), n:clean(h.innerText||'').slice(0,56) }; }).filter(function(h){ return h.n; }).slice(0,12); } catch(e){}
-      return { url:location.href, title:clean(document.title).slice(0,80), ready:document.readyState, active:brief(document.activeElement), contexts:{ roots:roots.length, iframes:roots.iframeCount||0, shadowRoots:roots.shadowCount||0 }, total:id, structure:heads, nodes:nodes, legend:'fast_batch/observe 后的节点快照；i=节点号，用 browser click/type node=i 继续；off=1 先 scroll；contexts 表示已纳入同源 iframe/shadow DOM' };
+      return { url:location.href, title:clean(document.title).slice(0,80), ready:document.readyState, active:brief(document.activeElement), contexts:{ roots:roots.length, iframes:roots.iframeCount||0, shadowRoots:roots.shadowCount||0, crossOriginFrames:(roots.blockedFrames||[]).slice(0,6) }, total:id, structure:heads, nodes:nodes, legend:'fast_batch/observe 后的节点快照；i=节点号，用 browser click/type node=i 继续；off=1 先 scroll；contexts.iframes/shadowRoots=已纳入的同源上下文；contexts.crossOriginFrames=够不着的跨域 iframe，其内元素不在本快照里' };
     };
     return (async function(){
       var log = [], broken = false, failed = null;
@@ -32986,7 +33025,7 @@ function _buildAgentToolSchemas(includeWrite, mcpTools = []) {
       { type: "function", function: { name: "format_file", description: "Format an entire file using the language service (LSP / built-in TS); the result is written in an undoable way and shown as a diff. Use it to tidy formatting after changing code. When no formatting service is available, it suggests running prettier/rustfmt/gofmt via run_cmd instead. 【When to use】After changing code, to bring the formatting into line.", parameters: { type: "object", properties: { path: { type: "string", minLength: 1, description: "The file to format" } }, required: ["path"] } } },
       { type: "function", function: { name: "run_in_terminal", description: "Run a command in the IDE's **real terminal tab (a true PTY / TTY)** — **you start the user's program yourself; you do not hand them a command to type**. Two kinds belong here: (1) long-running / continuous processes (dev server, watcher, daemon, listener); (2) **interactive or full-screen programs that need a real terminal** — bubbletea/ncurses TUIs, REPLs, vim/top (run_cmd is a pipe with no TTY, so those fail there with /dev/tty errors). The program runs inside this tab and the user watches and interacts with it there directly. **For an interactive or TUI program, starting successfully and rendering its interface IS the delivery** — do not demand log output of yourself to verify it, and **never say \"this cannot run in a non-interactive environment\" and push the command onto the user's own terminal: this IDE terminal is a real terminal**. After starting, confirm it came up with read_logs/read_terminal (for a service, the logs/URL; for a TUI, the first rendered frame); to wait for readiness, poll in the background with background_monitor. You can call it several times in parallel to run several tasks (each in its own terminal tab). 【vs alternatives】One-shot non-interactive commands that terminate (installing dependencies, tests, builds, git) use run_cmd.", parameters: { type: "object", properties: { command: { type: "string", description: "The command to keep running, e.g. npm run dev" }, name: { type: "string", description: "Optional; a short name for this task/terminal" }, purpose: { type: "string", enum: ["explore", "verify", "install", "mutate", "scaffold", "run"], description: "What this command is for: verify = build/test/typecheck/lint (the exit code is the conclusion); run = start the app/service to see its behaviour; mutate/scaffold = will change workspace files; install = installing dependencies; explore = read-only probing. Declare it honestly — verify + exit 0 is recorded as verification evidence." } }, required: ["command"] } } },
       { type: "function", function: { name: "system", description: "**System-level control: jump between applications instantly and drive their menus directly — far faster than screenshotting to find an icon and clicking it (when control feels slow, use this).** It is the fast path for \"move freely between application interfaces\": it calls the system APIs rather than relying on vision. action: **open (open/switch to an app, needs name, e.g. Finder/Safari/Mail — brought to the front instantly, launched if not running)** / **menu (trigger an app's menu item directly, needs a path array such as [\"File\",\"New Window\"] or [\"Format\",\"Font\",\"Bold\"] — almost every feature of an application lives in its menus, and this goes straight there, skipping the whole click-menu-bar → screenshot → find-item → click-again loop; omit app to use the current frontmost one)** / **menu_items (list the real item names at one menu level: path=[] lists the top level File/Edit/…, path=[\"File\"] lists everything under the File menu — when unsure what a menu is called, look it up here first, then call menu)** / **apps (list running apps plus the current frontmost)** / **windows (list all window titles of an app, needs name)** / **focus (switch to an app and raise the window whose title contains title, needs name, title optional)** / **frontmost (report the current frontmost app and window)**. **Typical play: to drive an application → system open to switch to it → system menu_items to see the menus → system menu to invoke the feature directly; only for things not in a menu, fall back to computer screenshot + node clicking.** Menu names must match exactly what the interface displays (including any ellipsis …). **Fully supported on macOS (Accessibility permission) and Windows (UI Automation); on Linux, open/list windows/switch/focus are supported (needs wmctrl + xdotool) and menus go through computer coordinates.**", parameters: { type: "object", properties: { action: { type: "string", enum: ["open", "menu", "menu_items", "apps", "windows", "focus", "frontmost"], description: "The system operation to perform" }, name: { type: "string", description: "For open/windows/focus: the app name (exactly as shown in Applications or the menu bar)" }, background: { type: "boolean", description: "For open (optional): true = launch in the background without stealing focus or interrupting the user (takes effect on macOS)" }, path: { type: "array", description: "For menu/menu_items: the menu path array, e.g. [\"File\",\"New\"] / [\"Format\",\"Font\",\"Bold\"]. Pass [] to menu_items to list the top-level menus", items: { type: "string" } }, title: { type: "string", description: "For focus (optional): the title of the window to raise (a substring is enough; omit for the first window)" }, app: { type: "string", description: "For menu/menu_items (optional): the target app name; omit = the current frontmost app" } }, required: ["action"] } } },
-      { type: "function", function: { name: "browser", description: "Drive a real browser and return screenshots, interactive nodes and visible text. **It runs on a persistent profile, so whatever has been signed into stays signed in** \u2014 this is the right entry point whenever the task needs the user to be logged in (their dashboard, their account, their inbox), and it is why you should not reach for a fresh throwaway browser there. If the user's own browser is running with remote debugging enabled, it attaches to that instead — their real session, their logins, no second window; the run itself tells you which happened. Otherwise it uses a separate profile, and it has to: a Chromium-based browser locks its own profile while it is running, and a debugging port can only be opened at launch — it cannot be added to a process that is already running. Handing over every saved password would also be far more access than the task needs. Which browser it drives is configurable (Chrome / Edge / Brave / Chromium); the run itself tells you which one it actually opened. If a site still shows a login wall, say so and let the user sign in once in this browser; it persists afterwards. **\u3010browser \u8fd8\u662f automation\uff1a\u6309\u76ee\u6807\u5728\u54ea\u513f\u5206\uff0c\u4e0d\u9760\u731c\u3011** Target lives INSIDE a web page (DOM nodes, forms, buttons, text, page screenshots, network/console) \u2192 use **browser**: it reads the DOM, targets by node number, and is far more reliable and cheaper than pixels. Target lives OUTSIDE the page \u2014 an OS dialog, a native file picker, the menu bar, another application, drag-and-drop between apps \u2014 or the page actively blocks CDP \u2192 use **automation**: it synthesises real OS mouse and keyboard events, which is the only thing that reaches non-web UI. Both drive the same browser brand (one setting decides for both). Do not reach for automation just because a click failed in browser \u2014 re-read the nodes first; and do not drive a web page through automation coordinates when browser can address it by node. **\u3010\u5148\u60f3\u4e00\u4e0b\u662f\u8c01\u8981\u770b\u3011** If the point is for the USER to look at the page (showing them the dev server you just started, a deployed site, a doc, a link), use `open`: it hands the URL to **their own default browser** \u2014 their tabs, their logins, their extensions \u2014 and starts no automation session and no second Dock icon. It works even when their default browser is Safari or Firefox. You do not get to see the page that way, and that is the point. Use `navigate` and the rest only when YOU need to read the page, click through it, or verify it visually. Reaching for `navigate` just to show someone something is what makes an unfamiliar, logged-out automation window pop up for no reason. Supported: open, navigate, observe, viewport, click, dblclick, rightclick, longpress, type, clear, append, autofill/fill, hover, drag, slide, swipe, wheel, toggle/uncheck, select, focus/blur, press, scroll, wait, eval, screenshot, design, network, inspect, nodes, assert, check, batch, upload, cookies, storage and close. observe returns ready/active/iframe/shadow DOM/node state in structured form — on a complex page, observe/nodes first and then batch. check only performs a page health check; for checkboxes and switches use toggle + checked:true/false, or op:check/uncheck inside a batch. Browser sessions are sticky and reused by default: navigate/fresh will not close the browser for the sake of ceremony, and close only releases the task's hold on it — only close + force:true actually shuts it down. For complex UI, prefer batch: it uses real pointer/mouse events, dblclick/rightclick/longpress, hover, drag trajectories, dragging onto a target node or text, slider percent/value, wheel and scroll containers, custom select/combobox, focus/blur, clear/append, key combinations, deep targeting through Shadow DOM and same-origin iframes, occlusion detection, candidate recovery, React/Vue native value setters, and DOM/URL settling after each action, and it reports failure reasons such as blockedBy/value_not_applied/option_not_found/candidates/expect_*. After an action you can pass expectText/expectSelector/expectUrl/expectValue as an acceptance check; if it is not met, execution stops and reports why. For sign-in, sign-up, search and admin forms, prefer autofill to fill fields in one go and read back invalid/missing, rather than guessing from a screenshot which field was missed. Before delivering UI, decide from the project itself whether mobile matters: a public-facing site, marketing page, landing page or H5 → run viewport and check twice, desktop and phone; an explicitly desktop context (internal admin, a desktop tool, or the user asking only for desktop) → test desktop only and say why when you wrap up. Prefer clicking and filling by the node number that nodes returns; without one, use target/role to locate semantically by aria-label, placeholder, label or visible text. After acting, verify state with assert, nodes or check; diagnose styling with inspect and network problems with network. Requires a Chromium-based browser installed locally (Chrome, Edge, Brave or Chromium — which one it uses is configurable).", parameters: { type: "object", properties: { action: { type: "string", enum: ["open", "navigate", "viewport", "click", "type", "autofill", "fill", "press", "scroll", "wait", "eval", "screenshot", "design", "network", "inspect", "nodes", "assert", "check", "batch", "upload", "cookies", "storage", "close"], description: "要执行的浏览器动作。**只是要给用户看一眼页面就用 open**（交给他自己的默认浏览器，不起自动化窗口、你也读不到页面）；需要你自己读页面/点按钮/截图验收才用 navigate 那一套。连续/复杂操作优先用 batch；表单登录优先 autofill；screenshot 只用于最终视觉验收/排版肉眼检查。测手机端用 viewport 切换视口（width/height/mobile），不要给 screenshot 传宽高。" }, url: { type: "string", description: "For open / navigate: the URL. `open` hands it to the user's own default browser for them to look at; `navigate` drives the automation browser so you can read and act on the page." }, width: { type: "integer", description: "viewport 用：视口宽 px（如桌面 1440、手机 390）" }, height: { type: "integer", description: "viewport 用：视口高 px（如桌面 900、手机 844）" }, mobile: { type: "boolean", description: "viewport 用：true=移动端模拟（触摸/UA/DPR）" }, device_scale_factor: { type: "number", description: "viewport 用：设备像素比，手机常用 2-3" }, fresh: { type: "boolean", description: "For navigate: true = isolated semantics; within the same task and origin the current browser is kept and reused automatically rather than being closed on a whim" }, mode: { type: "string", enum: ["headed", "isolated"], description: "Optional semantic hint: headed = headed interaction (default); isolated = pair with fresh=true for an isolated session. For genuinely headless static rendering, use screenshot." }, force: { type: "boolean", description: "For close: only true actually shuts the browser down; by default close just releases the task's hold and leaves the browser open for reuse" }, paths: { type: "array", description: "For upload: absolute local paths of the files to upload (several allowed); for a single file you can use path instead", items: { type: "string" } }, fields: { type: "object", description: "For autofill: fill the form by field meaning, e.g. {\"email\":\"demo@example.com\",\"password\":\"123456\"}, {\"search\":\"keyword\"}, {\"title\":\"...\",\"content\":\"...\"}. Inputs are identified by label/placeholder/name/type/autocomplete, and missing/invalid are returned." }, submit: { type: "boolean", description: "For autofill: whether to click/submit the form once it is filled" }, submitText: { type: "string", description: "For autofill with submit: the submit button's text, e.g. Sign in / Submit / Save; omit to find the usual submit button automatically" }, steps: { type: "array", description: "For batch: the array of steps to run in sequence, each {op,node/index/selector/target/role,text/value/option,key,button,clickCount,modifiers,amount,dx,dy,x,y,toX,toY,toNode/toIndex/toSelector/toTarget,percent,duration,checked,clear,append,absent,expectText/expectSelector/expectUrl/expectValue/expectAbsent,ms}. op supports observe, click/tap/dblclick/rightclick/longpress, hover, type/fill/input/clear/append, select/choose (native select plus shadcn/Radix combobox/listbox), toggle/check/uncheck, drag (can drop onto a target node, text or selector), slide (slider, percent/value), swipe, wheel, focus/blur, press (supports Meta+K / Control+Shift+P), scroll, wait (absent=true waits for disappearance). Example: [{op:\"observe\"},{op:\"type\",target:\"Email\",text:\"a@b.com\",expectValue:\"a@b.com\"},{op:\"slide\",role:\"slider\",percent:80},{op:\"drag\",target:\"Card\",toTarget:\"Done column\"},{op:\"rightclick\",target:\"File\"},{op:\"press\",key:\"Meta+K\"},{op:\"wait\",target:\"Saved\",ms:1200,expectText:\"Saved\"}]. Getting node numbers from nodes first is the most reliable; you can also use target:\"Save\" to locate by accessible name or visible text. batch runs many steps at once, detects occlusion, waits for changes, and returns the reason for any failure.", items: { type: "object" } }, node: { type: "integer", description: "For click/type (preferred): the node number i from the nodes listing" }, index: { type: "integer", description: "For click/type: the number in the screenshot's element list (the red digits)" }, selector: { type: "string", description: "For click/type/wait (fallback): a CSS selector. **Text matching is also supported**: :has-text(\"Download\"), text=\"2.1.1.exe\" and :contains(\"Sign in\") all work (the system locates by visible text and polls until it renders). But **the most reliable route is nodes → node=i**; a selector is only the fallback when there is no node number. For inspect/assert (optional): the element to examine" }, target: { type: "string", description: "For click/type/wait (semantic fallback): the target's visible text, aria-label, placeholder, label or name, e.g. Save, Email, Search" }, role: { type: "string", description: "For click/type/wait (semantic fallback): a role hint for the target, such as button/textbox/link/tab/slider/switch/checkbox" }, text: { type: "string", description: "For type: the text to enter; for click/wait it can serve as the target text; for assert: the text to look for (confirming it appears/is visible)" }, key: { type: "string", description: "For press: the key name, e.g. Enter" }, amount: { type: "integer", description: "For scroll/wheel: scroll distance in pixels, positive = down, negative = up (e.g. 600 / -600)" }, ms: { type: "integer", description: "For wait: milliseconds to wait (used when no selector is given, default 1500)" }, script: { type: "string", description: "For eval: the JavaScript to run" } }, required: [] } } },
+      { type: "function", function: { name: "browser", description: "Drive a real browser and return screenshots, interactive nodes and visible text. **It runs on a persistent profile, so whatever has been signed into stays signed in** \u2014 this is the right entry point whenever the task needs the user to be logged in (their dashboard, their account, their inbox), and it is why you should not reach for a fresh throwaway browser there. If the user's own browser is running with remote debugging enabled, it attaches to that instead — their real session, their logins, no second window; the run itself tells you which happened. Otherwise it uses a separate profile, and it has to: a Chromium-based browser locks its own profile while it is running, and a debugging port can only be opened at launch — it cannot be added to a process that is already running. Handing over every saved password would also be far more access than the task needs. Which browser it drives is configurable (Chrome / Edge / Brave / Chromium); the run itself tells you which one it actually opened. If a site still shows a login wall, say so and let the user sign in once in this browser; it persists afterwards. **\u3010browser \u8fd8\u662f automation\uff1a\u6309\u76ee\u6807\u5728\u54ea\u513f\u5206\uff0c\u4e0d\u9760\u731c\u3011** Target lives INSIDE a web page (DOM nodes, forms, buttons, text, page screenshots, network/console) \u2192 use **browser**: it reads the DOM, targets by node number, and is far more reliable and cheaper than pixels. Target lives OUTSIDE the page \u2014 an OS dialog, a native file picker, the menu bar, another application, drag-and-drop between apps \u2014 or the page actively blocks CDP \u2192 use **automation**: it synthesises real OS mouse and keyboard events, which is the only thing that reaches non-web UI. **【第三种情况：目标就在用户自己那个浏览器里】** CDP 只作用于它自己启动的实例，或用户主动带调试端口启动的实例；用户双击打开的那个，调试端口是启动期参数、事后加不上，接管不了。所以任务是「在用户已登录的那个浏览器里操作」时不要用 browser——它只会再弹一个陌生的、没登录的窗口，这正是用户抱怨的行为。改走 automation：`system open` 把它切到前台，`read_screen` 读可访问性树（浏览器会把网页内容——链接、按钮、输入框、文本——连同坐标暴露给 AX，是结构化元素，不是对着截图猜），再按坐标点击输入；登录态就是用户自己的。代价是靠坐标、窗口必须在前台、拿不到 DOM，所以可重复的页面验收仍然走 browser。判据是**要谁的登录态**：要用户的 → automation；不要 → browser。 Both drive the same browser brand (one setting decides for both). Do not reach for automation just because a click failed in browser \u2014 re-read the nodes first; and do not drive a web page through automation coordinates when browser can address it by node. **\u3010\u5148\u60f3\u4e00\u4e0b\u662f\u8c01\u8981\u770b\u3011** If the point is for the USER to look at the page (showing them the dev server you just started, a deployed site, a doc, a link), use `open`: it hands the URL to **their own default browser** \u2014 their tabs, their logins, their extensions \u2014 and starts no automation session and no second Dock icon. It works even when their default browser is Safari or Firefox. You do not get to see the page that way, and that is the point. Use `navigate` and the rest only when YOU need to read the page, click through it, or verify it visually. Reaching for `navigate` just to show someone something is what makes an unfamiliar, logged-out automation window pop up for no reason. Supported: open, navigate, observe, viewport, click, dblclick, rightclick, longpress, type, clear, append, autofill/fill, hover, drag, slide, swipe, wheel, toggle/uncheck, select, focus/blur, press, scroll, wait, eval, screenshot, design, network, inspect, nodes, assert, check, batch, upload, cookies, storage and close. observe returns ready/active/iframe/shadow DOM/node state in structured form — on a complex page, observe/nodes first and then batch. check only performs a page health check; for checkboxes and switches use toggle + checked:true/false, or op:check/uncheck inside a batch. Browser sessions are sticky and reused by default: navigate/fresh will not close the browser for the sake of ceremony, and close only releases the task's hold on it — only close + force:true actually shuts it down. For complex UI, prefer batch: it uses real pointer/mouse events, dblclick/rightclick/longpress, hover, drag trajectories, dragging onto a target node or text, slider percent/value, wheel and scroll containers, custom select/combobox, focus/blur, clear/append, key combinations, deep targeting through Shadow DOM and same-origin iframes, occlusion detection, candidate recovery, React/Vue native value setters, and DOM/URL settling after each action, and it reports failure reasons such as blockedBy/value_not_applied/option_not_found/candidates/expect_*. After an action you can pass expectText/expectSelector/expectUrl/expectValue as an acceptance check; if it is not met, execution stops and reports why. For sign-in, sign-up, search and admin forms, prefer autofill to fill fields in one go and read back invalid/missing, rather than guessing from a screenshot which field was missed. Before delivering UI, decide from the project itself whether mobile matters: a public-facing site, marketing page, landing page or H5 → run viewport and check twice, desktop and phone; an explicitly desktop context (internal admin, a desktop tool, or the user asking only for desktop) → test desktop only and say why when you wrap up. Prefer clicking and filling by the node number that nodes returns; without one, use target/role to locate semantically by aria-label, placeholder, label or visible text. After acting, verify state with assert, nodes or check; diagnose styling with inspect and network problems with network. Requires a Chromium-based browser installed locally (Chrome, Edge, Brave or Chromium — which one it uses is configurable).", parameters: { type: "object", properties: { action: { type: "string", enum: ["open", "navigate", "viewport", "click", "type", "autofill", "fill", "press", "scroll", "wait", "eval", "screenshot", "design", "network", "inspect", "nodes", "assert", "check", "batch", "upload", "cookies", "storage", "close"], description: "要执行的浏览器动作。**只是要给用户看一眼页面就用 open**（交给他自己的默认浏览器，不起自动化窗口、你也读不到页面）；需要你自己读页面/点按钮/截图验收才用 navigate 那一套。连续/复杂操作优先用 batch；表单登录优先 autofill；screenshot 只用于最终视觉验收/排版肉眼检查。测手机端用 viewport 切换视口（width/height/mobile），不要给 screenshot 传宽高。" }, url: { type: "string", description: "For open / navigate: the URL. `open` hands it to the user's own default browser for them to look at; `navigate` drives the automation browser so you can read and act on the page." }, width: { type: "integer", description: "viewport 用：视口宽 px（如桌面 1440、手机 390）" }, height: { type: "integer", description: "viewport 用：视口高 px（如桌面 900、手机 844）" }, mobile: { type: "boolean", description: "viewport 用：true=移动端模拟（触摸/UA/DPR）" }, device_scale_factor: { type: "number", description: "viewport 用：设备像素比，手机常用 2-3" }, fresh: { type: "boolean", description: "For navigate: true = isolated semantics; within the same task and origin the current browser is kept and reused automatically rather than being closed on a whim" }, mode: { type: "string", enum: ["headed", "isolated"], description: "Optional semantic hint: headed = headed interaction (default); isolated = pair with fresh=true for an isolated session. For genuinely headless static rendering, use screenshot." }, force: { type: "boolean", description: "For close: only true actually shuts the browser down; by default close just releases the task's hold and leaves the browser open for reuse" }, paths: { type: "array", description: "For upload: absolute local paths of the files to upload (several allowed); for a single file you can use path instead", items: { type: "string" } }, fields: { type: "object", description: "For autofill: fill the form by field meaning, e.g. {\"email\":\"demo@example.com\",\"password\":\"123456\"}, {\"search\":\"keyword\"}, {\"title\":\"...\",\"content\":\"...\"}. Inputs are identified by label/placeholder/name/type/autocomplete, and missing/invalid are returned." }, submit: { type: "boolean", description: "For autofill: whether to click/submit the form once it is filled" }, submitText: { type: "string", description: "For autofill with submit: the submit button's text, e.g. Sign in / Submit / Save; omit to find the usual submit button automatically" }, steps: { type: "array", description: "For batch: the array of steps to run in sequence, each {op,node/index/selector/target/role,text/value/option,key,button,clickCount,modifiers,amount,dx,dy,x,y,toX,toY,toNode/toIndex/toSelector/toTarget,percent,duration,checked,clear,append,absent,expectText/expectSelector/expectUrl/expectValue/expectAbsent,ms}. op supports observe, click/tap/dblclick/rightclick/longpress, hover, type/fill/input/clear/append, select/choose (native select plus shadcn/Radix combobox/listbox), toggle/check/uncheck, drag (can drop onto a target node, text or selector), slide (slider, percent/value), swipe, wheel, focus/blur, press (supports Meta+K / Control+Shift+P), scroll, wait (absent=true waits for disappearance). Example: [{op:\"observe\"},{op:\"type\",target:\"Email\",text:\"a@b.com\",expectValue:\"a@b.com\"},{op:\"slide\",role:\"slider\",percent:80},{op:\"drag\",target:\"Card\",toTarget:\"Done column\"},{op:\"rightclick\",target:\"File\"},{op:\"press\",key:\"Meta+K\"},{op:\"wait\",target:\"Saved\",ms:1200,expectText:\"Saved\"}]. Getting node numbers from nodes first is the most reliable; you can also use target:\"Save\" to locate by accessible name or visible text. batch runs many steps at once, detects occlusion, waits for changes, and returns the reason for any failure.", items: { type: "object" } }, node: { type: "integer", description: "For click/type (preferred): the node number i from the nodes listing" }, index: { type: "integer", description: "For click/type: the number in the screenshot's element list (the red digits)" }, selector: { type: "string", description: "For click/type/wait (fallback): a CSS selector. **Text matching is also supported**: :has-text(\"Download\"), text=\"2.1.1.exe\" and :contains(\"Sign in\") all work (the system locates by visible text and polls until it renders). But **the most reliable route is nodes → node=i**; a selector is only the fallback when there is no node number. For inspect/assert (optional): the element to examine" }, target: { type: "string", description: "For click/type/wait (semantic fallback): the target's visible text, aria-label, placeholder, label or name, e.g. Save, Email, Search" }, role: { type: "string", description: "For click/type/wait (semantic fallback): a role hint for the target, such as button/textbox/link/tab/slider/switch/checkbox" }, text: { type: "string", description: "For type: the text to enter; for click/wait it can serve as the target text; for assert: the text to look for (confirming it appears/is visible)" }, key: { type: "string", description: "For press: the key name, e.g. Enter" }, amount: { type: "integer", description: "For scroll/wheel: scroll distance in pixels, positive = down, negative = up (e.g. 600 / -600)" }, ms: { type: "integer", description: "For wait: milliseconds to wait (used when no selector is given, default 1500)" }, script: { type: "string", description: "For eval: the JavaScript to run" } }, required: [] } } },
       { type: "function", function: { name: "git_stash", description: "Stash the current working-tree changes onto the stash stack and clear the working tree (git stash push). Use it to set your current changes aside temporarily (for instance to switch branches and look at something else); retrieve them later with git_stash_pop.", parameters: { type: "object", properties: {} } } },
       { type: "function", function: { name: "git_stash_pop", description: "Retrieve and apply the most recent (or a given index) stash entry from the stack (git stash pop).", parameters: { type: "object", properties: { index: { type: "integer", description: "Index of the stash entry to pop (0 is the newest); omit for the newest" } } } } },
       { type: "function", function: { name: "stop_terminal", description: "Stop / close a task terminal started by run_in_terminal (ending its process). Use it when a dev server or watcher is no longer needed, or to restart with a different command. Omit name to stop the most recently started one. 【When to use】When a background task is no longer needed, or a port conflict means an old process has to be killed. 【vs alternatives】To read output without stopping anything, use read_terminal.", parameters: { type: "object", properties: { name: { type: "string", description: "Terminal / task name to stop; omit for the most recent one" } } } } },
@@ -33002,7 +33041,7 @@ function _buildAgentToolSchemas(includeWrite, mcpTools = []) {
       { type: "function", function: { name: "realtime_news_feed", description: "Fetch the latest discussion and articles from technical communities (Hacker News, Dev.to) — good for the current state of play around a technology, release news and where community sentiment is going. By default it aggregates both sources concurrently, and you can name specific ones; a failing source is flagged but does not block the others. Return format: [source] title | score/comments | time | URL", parameters: { type: "object", properties: { topic: { type: "string", description: "The topic of interest, e.g. 'Rust 1.80' / 'Kubernetes new features'", minLength: 1 }, sources: { type: "string", enum: ["hn", "devto", "all"], description: "Data source: hn (Hacker News only), devto (DEV Community only), all (default, both concurrently)", default: "all" }, maxResults: { type: "integer", description: "Maximum results per source, default 10", minimum: 1, maximum: 25, default: 10 } }, required: ["topic"] } } },
       { type: "function", function: { name: "capture_start", description: "**Start capturing traffic (mitmproxy — the capability of tools like HttpCanary).** Pick a mode first: mode:\"isolated_browser\" = the recommended default, capturing an isolated automation browser without touching the system proxy; mode:\"system\" = capture any app or the whole system, which changes the macOS system proxy; mode:\"background\" = listen only / manual proxying, usually paired with background_monitor(check_type:\"capture\"). Once started, find the real requests with capture_flows, then replay them with capture_replay or http_request.", parameters: { type: "object", properties: { port: { type: "integer", description: "Proxy port, default 8080" }, mode: { type: "string", enum: ["auto", "isolated_browser", "system", "background"], description: "auto = the IDE decides from the task; isolated_browser = does not change the system proxy, and browser(fresh=true) routes through it automatically; system = changes the system proxy to capture any app; background = start the proxy listener only, and wait for traffic yourself or with a monitor" }, system_proxy: { type: "boolean", description: "Legacy parameter: true is equivalent to mode=system; false is equivalent to mode=isolated_browser/background. When omitted, it is decided automatically from mode and the task" } }, required: [] } } },
       { type: "function", function: { name: "automation", description: "**\u3010browser \u8fd8\u662f automation\uff1a\u6309\u76ee\u6807\u5728\u54ea\u513f\u5206\uff0c\u4e0d\u9760\u731c\u3011** Target lives INSIDE a web page (DOM nodes, forms, buttons, text, page screenshots, network/console) \u2192 use **browser**: it reads the DOM, targets by node number, and is far more reliable and cheaper than pixels. Target lives OUTSIDE the page \u2014 an OS dialog, a native file picker, the menu bar, another application, drag-and-drop between apps \u2014 or the page actively blocks CDP \u2192 use **automation**: it synthesises real OS mouse and keyboard events, which is the only thing that reaches non-web UI. Both drive the same browser brand (one setting decides for both). Do not reach for automation just because a click failed in browser \u2014 re-read the nodes first; and do not drive a web page through automation coordinates when browser can address it by node. Desktop automation RPC: real mouse and keyboard, a CDP browser, and record/replay. Use it as a state machine: confirm the precondition first (URL, window, node, sign-in state), then perform the action, then verify the postcondition with browser.content / browser.eval / screenshot / the recorder result — issuing a click or some typing is not the same as succeeding. Call system.init before anything else the first time. A coordinate click is mouse.click{x,y,button} — it moves and clicks in one call, and the reply carries the position it actually acted at, so compare that against your target instead of trusting a bare ok status. mouse.move{x,y} then mouse.click{button} works too and mouse.move only returns once the pointer has really arrived. There is no desktop.click or desktop.type. When a selector goes stale, re-read the page/nodes; when navigation is slow, wait and then check the URL/DOM; when sign-in, a captcha or a system permission blocks you, state the specific blocker and continue via background monitoring. **Choosing which browser to drive is a real decision, not a default.** browser.start takes profile: \u0022isolated\u0022 (default \u2014 a clean throwaway browser instance, no cookies, no logins) or \u0022session\u0022 (a persistent profile that keeps whatever it has signed into). Pick from the task: scraping a public page, checking your own dev server, or anything where a fresh state is safer \u2192 isolated. Anything that needs the user to be signed in \u2014 their dashboard, their account, posting on their behalf, reading their inbox \u2014 \u2192 session, because a blank browser just hits a login wall. If session still shows a login wall, start it again with headless=false so the user can sign in once; that sign-in persists for later runs. For the user's everyday logged-in browsing the separate `browser` tool is usually the better entry point \u2014 it already runs on a persistent profile. Never assume a fresh browser is fine just because it starts faster. Available methods: system.init / mouse.move / mouse.click / mouse.double_click / mouse.position / mouse.drag / mouse.scroll{delta_y} / keyboard.type / keyboard.press / keyboard.combo / browser.start / browser.goto / browser.click / browser.type / browser.wait / browser.eval / browser.screenshot / browser.content / browser.close / recorder.save / recorder.replay / recorder.list / window.list / window.activate{title} / window.minimize{title} / screen.info / clipboard.get / clipboard.set{text} / keyboard.paste{text}. Before driving another application, find its window with window.list and bring it to the front with window.activate. Read screen.info first and check its input_permission field: when it says denied, macOS silently discards every synthetic mouse and keyboard event — the calls still return ok while nothing happens on screen, so switch to browser automation, shell or file tools and tell the user to grant Accessibility in System Settings. Also note: screen.info, read_screen, window.list and mouse.move all speak the SAME coordinate space \u2014 screen points, origin top-left. Pass those numbers straight through; NEVER multiply by scale_factor (it only tells you whether the display is Retina, it is not a conversion factor \u2014 scaling a click sends it to twice the intended position, off-screen, and the click silently hits nothing). Paste long text via the clipboard with keyboard.paste rather than typing it key by key.", parameters: { type: "object", properties: { method: { type: "string", description: "The name of the real RPC method to call, e.g. browser.goto / mouse.move / recorder.replay" }, params: { type: "object", description: "The parameter object for that method; follow the method's own description" } }, required: ["method"] } } },
-      { type: "function", function: { name: "computer", description: "Desktop mouse, keyboard, window, screen-information and clipboard operations. It is the stable compatibility entry point onto automation, suited to driving non-browser native applications; for browser pages prefer browser. Get the real state first with window.list / screen.info, then perform the action, then verify it with read_screen or screenshot.", parameters: { type: "object", properties: { method: { type: "string", enum: ["mouse.click", "mouse.double_click", "mouse.move", "mouse.position", "mouse.drag", "mouse.scroll", "keyboard.type", "keyboard.press", "keyboard.combo", "keyboard.paste", "screen.info", "screen.capture", "clipboard.get", "clipboard.set", "window.list", "window.activate", "window.minimize"], description: "The real desktop action name screen.capture 拍下**真实屏幕像素**并把图回传给你看（不给 x/y/width/height 就是整屏；四个要么都给要么都不给）——这是唯一能看到原生应用/游戏/视频/PDF 的方式，浏览器截图看不到它们。" }, params: { type: "object", description: "Action parameters, e.g. {x,y}, {title}, {text}, {delta_y}" } }, required: ["method"] } } },
+      { type: "function", function: { name: "computer", description: "Desktop mouse, keyboard, window, screen-information and clipboard operations. It is the stable compatibility entry point onto automation, suited to driving non-browser native applications; for browser pages prefer browser — **except when the target is the user's own already-running browser**, which CDP cannot attach to (the debugging port is a launch-time argument and cannot be added to a live process). There this is the only path that works: bring it to the front with system open, read its accessibility tree with read_screen (a browser exposes page content — links, buttons, fields, text — with coordinates), then click and type by those coordinates. Get the real state first with window.list / screen.info, then perform the action, then verify it with read_screen or screenshot.", parameters: { type: "object", properties: { method: { type: "string", enum: ["mouse.click", "mouse.double_click", "mouse.move", "mouse.position", "mouse.drag", "mouse.scroll", "keyboard.type", "keyboard.press", "keyboard.combo", "keyboard.paste", "screen.info", "screen.capture", "clipboard.get", "clipboard.set", "window.list", "window.activate", "window.minimize"], description: "The real desktop action name screen.capture 拍下**真实屏幕像素**并把图回传给你看（不给 x/y/width/height 就是整屏；四个要么都给要么都不给）——这是唯一能看到原生应用/游戏/视频/PDF 的方式，浏览器截图看不到它们。" }, params: { type: "object", description: "Action parameters, e.g. {x,y}, {title}, {text}, {delta_y}" } }, required: ["method"] } } },
       { type: "function", function: { name: "capture_flows", description: "**Read the HTTP/HTTPS requests already captured** (structured: method / URL / host / path / status / duration / request headers / request body / response headers / response body). More reliable than looking at a screenshot, and the first step in reverse-engineering an API. Narrow with a filter keyword (matched against host / path / URL / method / status / type), and cap the count with limit (default 30, newest first).", parameters: { type: "object", properties: { filter: { type: "string", description: "Optional; keyword filter (fuzzy-matched against host / path / URL / method / status / content-type)" }, limit: { type: "integer", description: "Optional; how many of the newest entries to return, default 30" }, include_body: { type: "boolean", description: "Optional; whether to include request/response bodies (default true; set false to save tokens when you only want the list)" } }, required: [] } } },
       { type: "function", function: { name: "capture_stop", description: "Stop capturing traffic and undo any system proxy that was set.", parameters: { type: "object", properties: {}, required: [] } } },
       { type: "function", function: { name: "capture_replay", description: "**Replay one captured request exactly** (invaluable for reverse-engineering and debugging). It takes the original request by its `id` from capture_flows and **sends it with every captured request header intact (the cookie, token and signature are all in there — which is exactly why the replay succeeds)**, optionally overriding url/method/headers/body to probe with different parameters. It returns the real response. More reliable than hand-assembling an http_request, because you do not have to rebuild that pile of headers.", parameters: { type: "object", properties: { id: { type: "string", description: "The id=… value from a capture_flows result" }, url: { type: "string", description: "Optional; override the URL (to probe a different query or path)" }, method: { type: "string", description: "Optional; override the method" }, headers: { type: "object", description: "Optional; override or add request headers (merged into the captured originals)", additionalProperties: { type: "string" } }, body: { type: "string", description: "Optional; override the request body" } }, required: ["id"] } } },
@@ -35696,6 +35735,12 @@ async function _hideControlGlow() {
 // Bounded LRU-ish put: evict the oldest entry past the cap so a long session of
 // web_fetch/web_search can't grow this cache without limit.
 function _webCachePut(key, val) {
+  // **空结果不进缓存。**
+  //
+  // 抓到 0 字节（跳转壳回 204、反爬页、服务端拒给正文）时把空串缓存下来，会让
+  // 「再抓一次确认」这条自救路彻底断掉：同一会话里第二次抓同一个 URL 直接返回缓存的空串，
+  // 连网络都不碰。模型只能得出「这一页就是空的」。取不到就别记，让它下次真的再试一次。
+  if (!String(val || "").trim()) return;
   _agentWebCache.set(key, val);
   if (_agentWebCache.size > 60) _agentWebCache.delete(_agentWebCache.keys().next().value);
 }
@@ -36622,8 +36667,22 @@ async function _agentReadLogs(call, root = "", run = null) {
     explicit.push(...run._lastCommandFailure.paths.filter((p) => _looksLikeLogFileName(p)));
   }
   const chunks = [];
+  // 点了名却一个终端都没匹配上，下面**照样**会去读工作区里的日志文件——那些是别人的输出。
+  // 不加这行抬头的话，模型问的是「backend 那个终端在喊什么」，收到的是 vite.log 的尾巴，
+  // 顶着 `--- 日志文件: ... ---` 的头，全程没有一个字提过它点的名字没找到。这不是少给信息，
+  // 是给了会被当成答案的错信息。
+  // 抬头而不是失败：其它日志是真读到了，报失败会把一次有产出的调用抹成零产出。
+  let _nameMiss = "";
   if (!explicit.length || call?.includeTerminal || call?.name) {
-    chunks.push(..._terminalLogChunks(call?.name || "", call?.name ? 1 : 3));
+    const _terms = _terminalLogChunks(call?.name || "", call?.name ? 1 : 3);
+    if (call?.name && !_terms.length) {
+      const _avail = _formatAgentTerminalLines(8);
+      _nameMiss = `没找到 label / cwd / 最近命令匹配「${String(call.name).slice(0, 80)}」的 IDE 终端`
+        + (_avail.length
+          ? `。当前可读的终端是这些：\n${_avail.join("\n")}\n先用 list_terminals 核对名字再重来。`
+          : "；当前 IDE 一个终端都没打开——服务要跑起来才有终端输出可读。");
+    }
+    chunks.push(..._terms);
   }
   const paths = explicit.length ? [...new Set(explicit.map(String))] : await _workspaceLogCandidates(root, 6);
   for (const path of paths.slice(0, 8)) {
@@ -36635,6 +36694,7 @@ async function _agentReadLogs(call, root = "", run = null) {
     }
   }
   if (!chunks.length) {
+    if (_nameMiss) return `[终端没匹配上] ${_nameMiss}\n工作区常见日志位置也没有 .log/.out/.err 可读。`;
     return "当前没有可读的 Agent 终端日志，也没有在工作区常见日志位置发现 .log/.out/.err。若报错输出里给了日志路径，调用 read_logs(path=那个路径) 读取尾部。";
   }
   // 裸切会让下游报出一个**精确的假数字**。
@@ -36652,9 +36712,15 @@ async function _agentReadLogs(call, root = "", run = null) {
   //     可行动的。
   const _joined = chunks.join("\n\n");
   const _LOG_BUDGET = 29000;
-  if (_joined.length <= _LOG_BUDGET) return _joined;
-  return `[日志已截断] 实际共 ${_joined.length} 字、${chunks.length} 份，下面只有前 ${_LOG_BUDGET} 字。`
-    + `缺的那几份用 read_logs(path=...) 单独取。\n\n` + _joined.slice(0, _LOG_BUDGET);
+  const _body = _joined.length <= _LOG_BUDGET ? _joined
+    : `[日志已截断] 实际共 ${_joined.length} 字、${chunks.length} 份，下面只有前 ${_LOG_BUDGET} 字。`
+      + `缺的那几份用 read_logs(path=...) 单独取。\n\n` + _joined.slice(0, _LOG_BUDGET);
+  if (_nameMiss) {
+    return `[终端没匹配上] ${_nameMiss}\n`
+      + `下面这些是工作区里的日志文件，**不是**「${String(call.name).slice(0, 80)}」的输出，别当成它的。\n\n`
+      + _body;
+  }
+  return _body;
 }
 
 function _markCommandFailureRecovery(run, root, diagnostics) {
@@ -37134,7 +37200,25 @@ function _questionSimilarity(a, b) {
   if (!x || !y) return 0;
   if (x === y) return 1;
   if (x.includes(y) || y.includes(x)) return 0.95;
-  const sx = new Set(x), sy = new Set(y);
+  // 按书写系统分派 —— 和本仓模糊匹配层、BM25 用的是同一套既定做法。
+  //
+  // 字符集合 Jaccard 对中文可用（字多、集合稀疏），对拉丁文**恒高**：26 个字母的语言里
+  // 任意两句长英文的字符集几乎全覆盖。配上 0.65 的阈值，英文用户问第二个**完全不同**的
+  // 问题时会被判成「你已经问过了」，直接吃到 [ALREADY_ANSWERED] —— 一次会话只能被问一次。
+  //
+  // 两边都不含中日韩时改用**词集合**；含 CJK 时一字不动（现有标定测试钉着那组 margin）。
+  // 不整体换成 bigram：实测中文 SAME 最低 0.429、DIFF 最高 0.429，margin 归零，当场打挂标定。
+  // 代价是英文的**真**改写会掉到 0.3–0.4、模型多问一次 —— 这正是这个函数注释自己定的取舍
+  //（漏判只多问一次，误判会拿旧答案顶掉新问题）。
+  // 注意：_normalizeQuestion **把空格也删了**（中文按字比对时那样更稳），所以按词切必须
+  // 回到**原始串**上做，不能用 x / y。
+  const _hasCjk = (t) => /[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uac00-\ud7af]/.test(t);
+  const _cjk = _hasCjk(String(a)) || _hasCjk(String(b));
+  const _words = (raw) => new Set(
+    String(raw || "").toLowerCase().split(/[^a-z0-9]+/i).filter((w) => w.length > 1));
+  const sx = _cjk ? new Set(x) : _words(a);
+  const sy = _cjk ? new Set(y) : _words(b);
+  if (!sx.size || !sy.size) return 0;
   let inter = 0;
   for (const c of sx) if (sy.has(c)) inter++;
   return inter / (sx.size + sy.size - inter);
@@ -41071,6 +41155,12 @@ function _toolCategoryOf(toolName, callType) {
   if (/^lsp/.test(k)) return "lsp";
   return "other";
 }
+// 只认**首行**的方括号失败标记。给日志/终端读取用：它们的正文是别人写的日志，
+// 正文里的 [ERROR] 是内容不是结局。允许前面有 〔外部数据〕 抬头和空白。
+function _toolFailureMarkerAtHead(content) {
+  const head = String(content || "").replace(/^\s*〔外部数据〕\s*/, "").split("\n", 1)[0] || "";
+  return /^\s*\[[^\]\n]{0,80}(失败|ERROR|BLOCKED|CONFLICT|DENIED|NEEDS_REPO|不可用|未执行|权限问题|interrupted)[^\]\n]{0,80}\]/i.test(head);
+}
 function _toolFailureMatch(content) {
   const text = String(content || "");
   return text.match(/\[[^\]\n]{0,80}(失败|ERROR|BLOCKED|CONFLICT|DENIED|NEEDS_REPO|不可用|未执行|权限问题|interrupted)[^\]\n]{0,80}\]/i)
@@ -41275,9 +41365,25 @@ function _toolExecutionSucceeded(call, result) {
   if (result.ok === false) return false;
   if (result?.evidence?.resultKind === "duplicate" || result?.mutated === false && _WORKSPACE_MUTATING_TYPES.has(call.type)) return false;
   const content = String(result.content || "");
-  if (_toolFailureMatch(content)) return false;
-  if (/\[已合并\]|内容未变化|\(.*内容未变化\)/.test(content)) return false;
+  // **退出码优先于文案。** 顺序反了会把成功判成失败：
+  // 命令 exit 0，只要输出里有方括号包着的 ERROR/失败（nginx 日志、logback、Go log、
+  // 测试自己打的错误日志、甚至 harness 上一轮注入的报错行），整次调用就被判失败 ——
+  // 计划那步不推进、purpose:"verify" 不盖章、收尾门一直要你再验一次。
+  // 退出码是执行事实，文案匹配只是**兜底**（注释在函数头上已经这么写了，代码没照做）。
+  // Number.isFinite 守卫必须留：空命令、只读子体的 [BLOCKED]、子体超时这三种 cmd 结果
+  // 不带 code，那些仍然要靠文案兜底。
   if (call.type === "cmd" && Number.isFinite(Number(result.code))) return Number(result.code) === 0;
+  // 日志/终端读取的正文**本来就是别人写的日志**，里面出现 [ERROR] 是它的内容，不是它的结局。
+  // read_logs 的唯一用途就是取回含错误的日志，按正文判失败会死循环：取证被判失败 →
+  // 取证证据不成立 → 硬拦首次修改并指名叫模型去用 read_logs 取证 → 再被判失败。
+  // 这两类只认**首行**的方括号标记（允许 〔外部数据〕 抬头）。
+  // 不全局锚行首：browser 批量 / git / write 那批喂进来的是已格式化文本，全局锚定会让
+  // 真失败漏判，比现在更糟。
+  const _failed = (call.type === "logs" || call.type === "termread")
+    ? _toolFailureMarkerAtHead(content)
+    : _toolFailureMatch(content);
+  if (_failed) return false;
+  if (/\[已合并\]|内容未变化|\(.*内容未变化\)/.test(content)) return false;
   if (call.type === "http" || call.type === "tor") {
     const status = Number(result.status);
     return result.ok === true && Number.isFinite(status) && status >= 200 && status < 400;
@@ -50670,7 +50776,12 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
         // 有日志/报错就逼它照真实输出诊断——命令跑失败 → 硬把它拽回"照真实报错定位根因、直接改对应
         // 文件:行"，而不是凭记忆瞎推断、绕远改别处（治"10分钟的事绕40分钟还烧token"）。报错已在上一条
         // 工具结果里，这里只补一句硬指令，不重复贴。
+        // 判据同 _toolExecutionSucceeded：**执行事实优先**。
+        // 原来只看正文匹配，于是 exit 0 但输出里有 [ERROR]（或某条通过的测试打印了
+        // TypeError）也会被告知「上一条命令报错了」—— 和那条主 bug 是同一个病根，
+        // 只修主处会剩这一半继续误导模型。
         if ((t === "cmd" || t === "termtask" || t === "termread") && it.rawResult
+            && !_toolExecutionSucceeded(it.call, it.rawResult)
             && (_toolFailureMatch(it.rawResult.content || "") || /error TS\d|SyntaxError|TypeError|ReferenceError|Traceback|ModuleNotFound|ImportError|\bpanic|Exception|command not found|cannot find|No such file|编译失败|运行时错误|EADDRINUSE|ECONNREFUSED|\brefused\b|exit(ed)? (code|status)?\s*[1-9]/i.test(String(it.rawResult.content || "")))) {
           const evidence = it.rawResult.commandFailure;
           const paths = evidence?.paths?.length ? evidence.paths.join("、") : "";
@@ -53239,10 +53350,18 @@ async function _resolveExisting(rel, preferredRoot = "") {
   if (!rel) return rel;
   const exact = [];
   for (const cand of _relCandidates(rel, preferredRoot)) {
+    // 「读得动」不等于「存在」。拿 readTextFile 当存在性探针，会让**读不了但确实存在**的
+    // 文件（GBK 遗留源码、>5MB、二进制、root 属主）在多根工作区里永远解析不到真实路径 ——
+    // 和「四个工具说文件不存在」是同一个病根的第二处，只修回执不修这里，edit 连路径都定不到。
+    // 判据用同一个 _isMissingFileError：只有真的「找不到」才不算命中。
     try {
       await backend.readTextFile(cand);
       if (!exact.some((path) => _pathIdentity(path) === _pathIdentity(cand))) exact.push(_coherentFilePath(cand));
-    } catch {}
+    } catch (e) {
+      if (!_isMissingFileError(String(e && e.message || e || ""))) {
+        if (!exact.some((path) => _pathIdentity(path) === _pathIdentity(cand))) exact.push(_coherentFilePath(cand));
+      }
+    }
   }
   if (exact.length === 1) return exact[0];
   if (exact.length > 1) throw new Error(`[AMBIGUOUS_PATH] 「${rel}」在多个工作区都存在：${exact.join("、")}。请使用带工作区文件夹名的明确路径。`);
@@ -54049,7 +54168,11 @@ async function _executeToolStepInner(step, call, root, run) {
             // reason; STOP so a later non-existent fallback candidate can't overwrite it with a
             // misleading "No such file". (A 343MB app.asar showed "找不到文件" because the real error
             // "太大/二进制" got masked by the relative-path fallback's ENOENT.)
-            if (/too large|太大|过大|binary file|二进制|>\s*5\s*MB/i.test(msg)) { unreadableMatches.push({ path: fp, message: msg }); continue; }
+            // 「文件在、但读不出来」不止太大和二进制：非 UTF-8 的遗留源码（GBK/Latin-1）
+            // 和没有读权限（root 属主）也是 —— 这两种以前掉进下面的 candidateErrors，
+            // 最终被说成「找不到唯一文件」，把模型送回 find_files 的死循环。
+            // 只补这两串：它们都只可能由「已经打开并读到了这个 inode」产生。
+            if (/too large|太大|过大|binary file|二进制|>\s*5\s*MB|not valid UTF-8|没有读取权限/i.test(msg)) { unreadableMatches.push({ path: fp, message: msg }); continue; }
             candidateErrors.push({ path: fp, message: msg.slice(0, 200) });
           }
         }
@@ -54573,7 +54696,12 @@ async function _executeToolStepInner(step, call, root, run) {
       _setToolStepResolvedPath(step, fp);
       let old = "";
       let existed = false;
-      try { old = await backend.readTextFile(fp); existed = true; } catch {}
+      // 只多记一个原因，**绝不动 existed**：写盘的 CAS 吃它（writeTextFileIfUnchanged
+      // 拿 existed ? old : null 当基线），翻成 true 会拿空串去比对，将来比对一放宽就是
+      // 把一个 6MB 的 .db 截成 0 字节。有测试钉着这条。
+      let readErr = "";
+      try { old = await backend.readTextFile(fp); existed = true; }
+      catch (e) { readErr = String(e && e.message || e || ""); }
       const liveWritePreview = call.type === "write" ? call._liveWritePreview : null;
       const _previewStale = !!liveWritePreview && !liveWritePreview.userChanged && !liveWritePreview.rolledBack
         && (liveWritePreview.existed !== existed || (existed && liveWritePreview.originalContent !== old));
@@ -54664,6 +54792,19 @@ async function _executeToolStepInner(step, call, root, run) {
         // Previously blocked edits containing [REDACTED*], but user wants to be able to
         // operate on redacted files. Now we allow the edit to proceed — model may or may
         // not touch sensitive regions; IDE doesn't block either way.
+        if (!existed && readErr && !_isMissingFileError(readErr)) {
+          // 「读不出来」不等于「不存在」。GBK/Latin-1 的遗留源码、>5MB、二进制、root 属主、
+          // 路径其实是目录 —— 这五种确实存在，原来一律说成「文件不存在」，还附一份
+          // 「项目里有 1 个同名文件」的清单（里面就是这个文件自己）让模型「先 read 它」，
+          // 而 read 会再给一次同样的话。死胡同。
+          res.className = "atc-result atc-result--err";
+          res.textContent = "读不了";
+          return { type: "edit", path: call.path, content:
+            `[ERROR/UNREADABLE] 这条路径读不出来: ${call.path}（${readErr.slice(0, 200)}）。`
+            + `\n这不是路径问题，别再 find_files，也别改用 write_file（那会撞 [CONFLICT]）。`
+            + `\n用 run_cmd 先弄清它是什么：\`ls -l\` 看属主权限、\`file\` 看类型、`
+            + `\`wc -c\` 看大小、\`iconv -f gbk -t utf-8\` 转编码。` };
+        }
         if (!existed) {
           res.className = "atc-result atc-result--err";
           res.textContent = "文件不存在";
@@ -54896,8 +55037,22 @@ async function _executeToolStepInner(step, call, root, run) {
       _setToolStepResolvedPath(step, fp);
       let old = "";
       try { old = await backend.readTextFile(fp); }
-      catch {
-        res.className = "atc-result atc-result--err"; res.textContent = "文件不存在";
+      catch (e) {
+        // 「读不出来」不等于「不存在」。GBK/Latin-1 的遗留源码、>5MB、二进制、root 属主、
+        // 路径其实是目录 —— 这五种确实存在，却一律被说成「文件不存在。新建文件请用
+        // write_file」：而 write_file 会撞 [CONFLICT] file was created by another task。
+        // 两条路都是死的，没有一句话是真的。判据用仓库现成的 _isMissingFileError。
+        const _msg = String(e && e.message || e || "");
+        res.className = "atc-result atc-result--err";
+        if (!_isMissingFileError(_msg)) {
+          res.textContent = "读不了";
+          return { type: "multiedit", path: call.path, content:
+            `[ERROR/UNREADABLE] 这条路径读不出来: ${call.path}（${_msg.slice(0, 200)}）。`
+            + `\n这不是路径问题，别改用 write_file（会撞 [CONFLICT]），也别再 find_files。`
+            + `\n要弄清它到底是什么，用 run_cmd：\`ls -l\` 看属主权限、\`file\` 看类型、`
+            + `\`wc -c\` 看大小、\`iconv -f gbk -t utf-8\` 转编码、\`sed -n\` 按行取。` };
+        }
+        res.textContent = "文件不存在";
         return { type: "multiedit", path: call.path, content: `[ERROR] 文件不存在: ${call.path}。新建文件请用 write_file。` };
       }
       if (_openFileWriteConflict(fp)) {
@@ -55193,7 +55348,7 @@ async function _executeToolStepInner(step, call, root, run) {
       res.textContent = fileMatches.length ? `${hits} 处匹配${searchErrors.length ? " · 部分范围失败" : ""}` : (searchErrors.length ? "无匹配 · 部分范围失败" : "无匹配");
       const _body = blocks.join("\n\n");
       vp.innerHTML = `<pre>${_escHtml((_body || "(无匹配)") + partialNote)}</pre>`;
-      return { type: "search", path: call.path, content: (blocks.length ? `搜索 "${q}" — ${summary}:\n${_redactSecrets(_body)}` : `搜索 "${q}"：${_backendTruncated ? "**这次没搜完**（触到后端的命中数/扫描文件数上限就停了），所以「没找到」不等于「不存在」——缩小到具体目录再搜一次。" : ""}在已扫描的范围里无匹配。**扫描范围不含点开头的目录和文件**（.github/.vscode/.env 这些整个不扫），也不含被忽略的目录——所以这不等于「工作区里没有」。要找 CI 配置、编辑器配置这类点开头路径下的内容，直接 read_file 指名读；否则换关键词、或用 semantic_search 按语义找、find_files 按文件名找。`) + partialNote };
+      return { type: "search", path: call.path, content: (blocks.length ? `搜索 "${q}" — ${summary}:\n${_redactSecrets(_body)}` : `搜索 "${q}"：${_backendTruncated ? "**这次没搜完**（触到后端的命中数/扫描文件数上限就停了），所以「没找到」不等于「不存在」——缩小到具体目录再搜一次。" : ""}在已扫描的范围里无匹配。跳过的只有几个具名的构建/缓存目录（.git、.next、.venv、.gradle、.idea、.vscode、node_modules、target 这类）——**点开头的文件照常搜**（.env、.eslintrc、.gitignore、.prettierrc 都在扫描范围里），**.github 也照常搜**。所以「没找到」多半是关键词不对，不是范围不够：换关键词、用 semantic_search 按语义找、或 find_files 按文件名找。`) + partialNote };
 
     } else if (call.type === "find") {
       const requestedPattern = call.pattern || call.path || "";
@@ -55557,7 +55712,7 @@ async function _executeToolStepInner(step, call, root, run) {
     } else if (call.type === "game_scaffold") {
       if (!inTauri) { res.className = "atc-result atc-result--err"; res.textContent = "桌面专用"; return { type: "game_scaffold", path: "", content: "[不可用] 游戏脚手架只能在桌面 App 里用。" }; }
       const ws = (run && run.session && run.session.project) || root || "";
-      if (!ws) { res.className = "atc-result atc-result--err"; res.textContent = "无工作区"; return { type: "game_scaffold", path: "", content: "[错误] 请先打开一个工作区。" }; }
+      if (!ws) { res.className = "atc-result atc-result--err"; res.textContent = "无工作区"; return { type: "game_scaffold", path: "", content: `[BLOCKED] 当前没有工作区根目录。**下一步直接调 create_project({name:"<描述性名字>"})** 建一个目录，它会立刻成为当前工作区，然后原样重试这一步。不要停下来让用户去打开文件夹。` }; }
       try {
         const r = await backend.invoke("game_scaffold", { engine: call.engine || "godot", name: call.name || "my-game", workspace: ws });
         res.className = "atc-result atc-result--ok"; res.textContent = (call.name || "my-game");
@@ -55573,7 +55728,7 @@ async function _executeToolStepInner(step, call, root, run) {
     } else if (call.type === "web_scaffold") {
       if (!inTauri) { res.className = "atc-result atc-result--err"; res.textContent = "桌面专用"; return { type: "web_scaffold", path: "", content: "[不可用] 网站脚手架只能在桌面 App 里用。" }; }
       const ws = (run && run.session && run.session.project) || root || "";
-      if (!ws) { res.className = "atc-result atc-result--err"; res.textContent = "无工作区"; return { type: "web_scaffold", path: "", content: "[错误] 请先打开一个工作区。" }; }
+      if (!ws) { res.className = "atc-result atc-result--err"; res.textContent = "无工作区"; return { type: "web_scaffold", path: "", content: `[BLOCKED] 当前没有工作区根目录。**下一步直接调 create_project({name:"<描述性名字>"})** 建一个目录，它会立刻成为当前工作区，然后原样重试这一步。不要停下来让用户去打开文件夹。` }; }
       try {
         // Auto-wire the most recent learn_design tokens so the learned reference
         // system actually feeds the scaffold instead of sitting as a dead doc.
@@ -55601,7 +55756,7 @@ async function _executeToolStepInner(step, call, root, run) {
       if (call._error) { res.className = "atc-result atc-result--err"; res.textContent = "参数错误"; return { type: call.type, path: "", content: `[参数错误] ${call.type}: ${call._error}` }; }
       if (!inTauri) { res.className = "atc-result atc-result--err"; res.textContent = "桌面专用"; return { type: call.type, path: "", content: "[不可用] 只能在桌面 App 里用。" }; }
       const _gaWs = (run && run.session && run.session.project) || root || "";
-      if (!_gaWs) { res.className = "atc-result atc-result--err"; res.textContent = "无工作区"; return { type: call.type, path: "", content: "[错误] 请先打开一个工作区。" }; }
+      if (!_gaWs) { res.className = "atc-result atc-result--err"; res.textContent = "无工作区"; return { type: call.type, path: "", content: `[BLOCKED] 当前没有工作区根目录。**下一步直接调 create_project({name:"<描述性名字>"})** 建一个目录，它会立刻成为当前工作区，然后原样重试这一步。不要停下来让用户去打开文件夹。` }; }
       const _gaCfg = loadConfig();
       const _gaLabels = { generate_3d: "3D 模型", generate_sound: "音效", generate_music: "音乐", generate_voice: "语音", auto_rig: "骨骼绑定", generate_motion: "动画", generate_texture: "纹理" };
       res.className = "atc-result"; res.innerHTML = `<span class="atc-spin"></span> 生成${_gaLabels[call.type] || "资产"}中…`;
@@ -55665,7 +55820,7 @@ async function _executeToolStepInner(step, call, root, run) {
       if (call._error) { res.className = "atc-result atc-result--err"; res.textContent = "参数错误"; return { type: "download_asset", path: "", content: `[参数错误] download_asset: ${call._error}` }; }
       if (!inTauri) { res.className = "atc-result atc-result--err"; res.textContent = "桌面专用"; return { type: "download_asset", path: "", content: "[不可用] 只能在桌面 App 里用。" }; }
       const _daWs = (run && run.session && run.session.project) || root || "";
-      if (!_daWs) { res.className = "atc-result atc-result--err"; res.textContent = "无工作区"; return { type: "download_asset", path: "", content: "[错误] 请先打开一个工作区。" }; }
+      if (!_daWs) { res.className = "atc-result atc-result--err"; res.textContent = "无工作区"; return { type: "download_asset", path: "", content: `[BLOCKED] 当前没有工作区根目录。**下一步直接调 create_project({name:"<描述性名字>"})** 建一个目录，它会立刻成为当前工作区，然后原样重试这一步。不要停下来让用户去打开文件夹。` }; }
       res.className = "atc-result"; res.innerHTML = `<span class="atc-spin"></span> 下载资源…`;
       try {
         const _daOut = await backend.invoke("download_asset", { workspace: _daWs, url: call.url || "", name: call.name || "asset", assetType: call.asset_type });
@@ -56600,7 +56755,19 @@ async function _executeToolStepInner(step, call, root, run) {
       _setToolStepResolvedPath(step, fp);
       let old = "";
       try { old = await backend.readTextFile(fp); }
-      catch { res.className = "atc-result atc-result--err"; res.textContent = "文件不存在"; return { type: "format", path: rel, content: `[ERROR] 文件不存在: ${rel}` }; }
+      catch (e) {
+        // 同 multi_edit：「读不出来」不等于「不存在」。
+        const _msg = String(e && e.message || e || "");
+        res.className = "atc-result atc-result--err";
+        if (!_isMissingFileError(_msg)) {
+          res.textContent = "读不了";
+          return { type: "format", path: rel, content:
+            `[ERROR/UNREADABLE] 这条路径读不出来: ${rel}（${_msg.slice(0, 200)}）。`
+            + `\n这不是路径问题。用 run_cmd 的 \`ls -l\` / \`file\` / \`wc -c\` 先弄清它是什么。` };
+        }
+        res.textContent = "文件不存在";
+        return { type: "format", path: rel, content: `[ERROR] 文件不存在: ${rel}。` };
+      }
       if (_openFileWriteConflict(fp)) {
         res.className = "atc-result atc-result--blocked"; res.textContent = "⛔ 编辑器有未保存内容";
         return { type: "format", path: fp, content: `[CONFLICT] ${fp} 在编辑器里有尚未保存的用户改动，已阻止格式化，未写盘。` };
@@ -57984,6 +58151,37 @@ return { type: call.type, path: call.query || "", content: `[失败] ${call.type
       const bmFilePat = call.filePattern || "";
       const bmTimeout = Math.max(10, Math.min(call.timeout || 300, 600));
       const bmCwd = root || (_detectOS() === "Windows" ? "." : "/tmp");
+      // 轮询循环里每条分支都是 `bmType === "file" && bmPat` 这种精确匹配，**认不出来就一条都不进**，
+      // 只剩计时器在转。于是卡片显示「已检查 N 次」、超时那条回执说「等待…已超过 300 秒」——
+      // 读起来像「条件一直没发生」，实际是**条件一次都没被检查过**。两条路都会掉进来：
+      //  ① check_type 不认识。上面的入参归一把 `condition` 也并进了 check_type，而 condition
+      //     恰恰是模型最容易塞一整句自然语言的字段（condition:"dev server listening on 3000"）。
+      //  ② 类型认识但 pattern 是空的——file/command/url/port 四条分支都带 `&& bmPat`。
+      // 不猜：把事实回给模型让它重发一次，别用 300 秒换一个假答案。
+      // capture 和 manual 有意豁免：manual 不轮询；capture 空 pattern 匹配下一条新流量，
+      // 是抓包恢复路径明说的用法（logic.test.mjs 那条 CONFIGURE_BACKGROUND_PROXY 钉着）。
+      const _BM_CHECKS = new Set(["manual", "capture", "file", "command", "url", "port"]);
+      const _BM_NEEDS_PATTERN = new Set(["file", "command", "url", "port"]);
+      if (!_BM_CHECKS.has(bmType) || (_BM_NEEDS_PATTERN.has(bmType) && !bmPat)) {
+        // 这里还没走到 _registerRunInteraction，没有东西要释放；_bmRelease 也还在 TDZ 里。
+        res.className = "atc-result atc-result--err"; res.textContent = "条件没法检查";
+        const _why = !_BM_CHECKS.has(bmType)
+          ? `check_type 收到的是「${String(bmType).slice(0, 120)}」，不是可检查的类型。`
+            + `注意入参归一会把 condition / check / condition_type 都并进 check_type——`
+            + `如果你写的是一整句自然语言，它就原样变成了这里的 check_type。`
+          : `check_type="${bmType}" 必须配一个 pattern（${bmType === "file" ? "文件路径" : bmType === "command" ? "要跑的命令" : bmType === "url" ? "要探的 URL" : "端口号"}），这次是空的。`;
+        return {
+          type: "background_monitor",
+          path: bmType,
+          failure: { code: "monitor_uncheckable", attempted: false },
+          content: `[BLOCKED_MONITOR_UNCHECKABLE] ${_why}\n`
+            + `没有开始等待——真等下去的话这 ${bmTimeout} 秒里一次检查都不会发生，最后给你一句「超时」，`
+            + `你会当成「条件没发生」。\n`
+            + `可用的 check_type：port（pattern=端口号）、url（pattern=要探的 URL）、command（pattern=命令，exit 0 即满足）、`
+            + `file（pattern=文件路径，另可加 file_pattern 等内容匹配）、capture（pattern=流量关键词，可空）、manual（等用户点确认）。\n`
+            + `把条件写成 pattern，把类型写成上面其中之一，重发一次。`,
+        };
+      }
       const _bmTypeLabels = { manual: "等用户确认", capture: "监控抓包", file: bmFilePat ? "等文件内容匹配" : "等文件出现", command: "等命令成功", url: "等 URL 可达", port: "等端口监听" };
       res.className = "atc-result atc-result--ok"; res.textContent = `⏳ ${bmMsg}`;
       let _bmIv = null, _bmDone = false, _bmChecks = 0;

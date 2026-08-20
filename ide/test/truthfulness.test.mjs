@@ -325,7 +325,17 @@ test("检索类：说清楚「没找到」还是「没去找」", () => {
   assert.match(SRC, /扫描没走完/, "find_files 扫到上限仍然说「无匹配文件」");
   assert.match(SRC, /符号索引只覆盖/, "find_symbol 不说索引作用域");
   assert.match(SRC, /在\*\*已建索引的部分\*\*里/, "semantic_search 不说索引作用域");
-  assert.match(SRC, /扫描范围不含点开头的目录和文件/, "search 不说它从不扫点开头的路径");
+  // 这条原来钉的是一句**假话**：它和后端 skip_walk_entry 同 commit 写下，四小时后后端就
+  // 改成「文件一律保留」（那边的注释写得很清楚：.env / .eslintrc / .gitignore 恰恰是最常被
+  // 搜的那批配置），而这句话没人更新。.github 也从来不在跳过名单里。
+  // 后果比「少说一句」更糟：模型据此认为「搜不到是因为范围不够」，被推去猜路径直接 read_file。
+  assert.doesNotMatch(SRC, /扫描范围不含点开头的目录和文件/,
+    "又把「点开头的目录和文件全不扫」这句假话写回去了 —— 后端只跳几个具名目录，文件一律保留");
+  assert.match(SRC, /点开头的文件照常搜/, "search 没说清点开头的文件其实在扫描范围里");
+  assert.match(SRC, /跳过的只有几个具名的构建\/缓存目录/, "search 没说清到底跳了什么");
+  // 也不许换成另一句假话：search 根本不调 path_is_git_ignored。
+  assert.doesNotMatch(SRC, /被 \.gitignore 忽略的.{0,12}不搜/,
+    "用新假话替旧假话了 —— search 不查 .gitignore");
   // 后端的截断标志要真的被读。它有三道上限（单文件 50 处命中、整次 2000 处、扫 20000 个
   // 文件），触到就 break 并回报 truncated——而智能体那条搜索路径原来一次都没读过它。
   // 后果是假阴性：「把这个变量所有调用点都改掉」，某文件里 80 处引用只看到前 50 处，
