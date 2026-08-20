@@ -23960,7 +23960,7 @@ async function _nestedProjectGuides(root, options = {}) {
   return out;
 }
 
-async function _gatherAgentContext(query, sessionRoot) {
+async function _gatherAgentContext(query, sessionRoot, boundaryRoot = "") {
   try { _perfPhase("gatherAgentContext"); } catch {}
   const root = (sessionRoot || rootPath || workspaceRoots[0] || "").replace(/\/+$/, "");
   const osDetail = await _detectOSDetail();
@@ -24017,8 +24017,30 @@ async function _gatherAgentContext(query, sessionRoot) {
 
   // 异步并发：项目约定/主树/多根树/关键文件/锁文件五段互不依赖的 IO 旧版串行排队，
   // 现在开头一起起跑、按原顺序组装（发送前延迟 = 最慢一段而非总和）。
-  const _guidePromise = Promise.all(["AGENTS.md", "CLAUDE.md", ".cursorrules", ".github/copilot-instructions.md"]
-    .map((guide) => backend.readTextFile(root + "/" + guide).then((txt) => (txt && txt.trim() ? [guide, txt] : null)).catch(() => null)));
+  // 项目约定要沿 root → 会话工作区根这条**祖先链**读，不能只读 root 那一层。
+  //
+  // root 是跟着编辑器里当前打开的文件走的（_nearestProjectRootForPath 找最近的项目标记，
+  // 从不向上回溯）。于是在 monorepo / Tauri 应用 / 带独立 website 的仓库里，点开
+  // website/ 或 src-tauri/ 下的文件，root 就变成那个子目录，**仓库根那份 AGENTS.md
+  // 一个字都读不到**——而用户以为总纲一直在生效。这就是「有时候管用有时候不管用」的那个
+  // 「有时候」。这个仓库自己就是这个形状（根上有 AGENTS.md，website/ 和 src-tauri/ 各自带
+  // 项目标记），下面 24265 那条注释也已经记着 root 会漂，只是当时没算上约定这个受害者。
+  //
+  // 上界用调用方给的会话工作区根（memoryRoot，本来就是为了「记忆别跟着 root 漂」算的），
+  // 保证永远不会爬到工作区之外去读文件。没给上界就退回只读 root 那一层，行为和以前一致。
+  //
+  // 顺序是**近的在前**：预算先给最具体的那一份，别让远处的总纲把近处的细则挤掉。
+  // 冲突谁大写在标签里（越近越具体者为准），和下面子目录约定用的是同一套说法。
+  const _guideBound = String(boundaryRoot || "").replace(/\/+$/, "") || root;
+  const _guideDirs = (() => {
+    const bound = String(boundaryRoot || "").replace(/\/+$/, "");
+    if (!bound || !_pathIsAtOrUnder(root, bound)) return [root];
+    return [...new Set(_workspaceAncestorRoots(root, 6).filter((dir) => _pathIsAtOrUnder(dir, bound)))];
+  })();
+  const _guidePromise = Promise.all(_guideDirs.flatMap((dir) =>
+    ["AGENTS.md", "CLAUDE.md", ".cursorrules", ".github/copilot-instructions.md"]
+      .map((guide) => backend.readTextFile(dir + "/" + guide)
+        .then((txt) => (txt && txt.trim() ? [guide, txt, dir] : null)).catch(() => null))));
   const _treeScale = _contextBudgetScale();
   const _treePromise = _workspaceTreeSnapshot(root, { maxLines: _treeScale > 1 ? 640 : 180, maxDepth: _treeScale > 1 ? 4 : 3 }).catch(() => "");
   const _activeNorm = root.replace(/\/+$/, "");
@@ -24081,7 +24103,12 @@ async function _gatherAgentContext(query, sessionRoot) {
     const share = Math.min(_guideRoom, _GUIDE_PER_FILE_CAP);
     const body = _contextSnippet(hit[1], share, hit[0]);
     _guideRoom -= body.length;
-    parts.push(`\n--- 项目约定 (${hit[0]}，请遵守) ---\n${body}`);
+    // 标签里写清这份来自哪一层：同一个仓库里可能同时有根总纲和子项目的约定，
+    // 不说明白模型没法判断冲突时听谁的。
+    const _from = String(hit[2] || root) === root
+      ? ""
+      : (String(hit[2]).startsWith(_guideBound + "/") ? String(hit[2]).slice(_guideBound.length + 1) : String(hit[2])) + "/";
+    parts.push(`\n--- 项目约定 (${_from}${hit[0]}，请遵守${_from ? "；与更靠近改动位置的那份冲突时，以更近的为准" : ""}) ---\n${body}`);
   }
   let _nestedRoom = _GUIDE_NESTED_TOTAL;
   for (const [dir, name, text] of await _nestedGuidesPromise) {
@@ -24264,7 +24291,7 @@ async function _agentContextSnapshotForTurn(query, sessionRoot, profile = null, 
         ? Math.max(0, Math.min(4500, Number(options.coldWaitMs)))
         : 4500;
       const _full = await Promise.race([
-        _gatherAgentContext(query || "", root),
+        _gatherAgentContext(query || "", root, memoryRoot),
         new Promise((r) => setTimeout(() => r(""), coldWaitMs)),
       ]);
       if (_full && String(_full).trim().length > 200) {

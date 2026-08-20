@@ -23598,8 +23598,10 @@ test("_looksLikeUserQuestion: statements and rhetoric still do NOT pause the run
 test("cold context snapshot builds the real digest before the warming-up fallback", () => {
   const fn = extractFn("_agentContextSnapshotForTurn");
   // It must attempt the full gather, bounded by a race, on a non-empty cold workspace.
-  assert.match(fn, /await Promise\.race\(\[\s*_gatherAgentContext\(query \|\| "", root\),/,
-    "a cold miss must build README+tree+key-files, not just announce warming-up");
+  // 第三个参数是会话工作区根（上界）：项目约定要沿 root → 工作区根这条祖先链读，
+  // 不传就退回只读 root 那一层，点开 website/ 下的文件时仓库根那份 AGENTS.md 会整份读不到。
+  assert.match(fn, /await Promise\.race\(\[\s*_gatherAgentContext\(query \|\| "", root, memoryRoot\),/,
+    "a cold miss must build README+tree+key-files（并且要把会话工作区根当上界传下去）");
   assert.match(fn, /const coldWaitMs = Number\.isFinite\(Number\(options\?\.coldWaitMs\)\)/,
     "callers may choose a shorter foreground cold-cache window");
   assert.match(fn, /: 4500;[\s\S]{0,160}setTimeout\(\(\) => r\(""\), coldWaitMs\)/,
@@ -29293,4 +29295,46 @@ test("关标签页保存失败时写的备份必须带 base，否则重启必然
   // 陈旧闸本身必须还在——它是防止用旧缓冲覆盖更新文件的唯一一道。
   assert.match(SRC, /typeof u\.base !== "string" \|\| u\.base !== _bufferBaseStamp\(f\.diskContent\)/,
     "恢复时的陈旧闸不见了");
+});
+
+// ---- 点开子目录的文件，仓库根那份 AGENTS.md 就整份读不到 ----
+//
+// root 跟着编辑器里当前打开的文件走（_nearestProjectRootForPath 找最近的项目标记，从不向上
+// 回溯）。于是 monorepo / Tauri 应用 / 带独立 website 的仓库里，点开 website/ 或 src-tauri/
+// 下的文件，root 变成那个子目录，仓库根那份约定一个字都不读——而用户以为总纲一直在生效。
+// 这就是「有时候管用有时候不管用」的那个「有时候」。本仓库自己就是这个形状。
+test("项目约定要沿祖先链读到会话工作区根，不能只读当前那一层", () => {
+  const fn = extractFn("_gatherAgentContext");
+  const expr = /const _guideDirs = \(\(\) => \{[\s\S]*?\}\)\(\);/.exec(fn);
+  assert.ok(expr, "祖先链那段不见了，这条断言失去落点");
+  const dirs = new Function("root", "boundaryRoot", "_pathIsAtOrUnder", "_workspaceAncestorRoots",
+    `${expr[0]}\nreturn _guideDirs;`);
+  const atOrUnder = load("_pathIsAtOrUnder");
+  const ancestors = load("_workspaceAncestorRoots");
+
+  // 主场景：光标在子目录，工作区根在上面两层——两层都要读，近的在前（预算优先给最具体的）。
+  assert.deepEqual(dirs("/repo/website", "/repo", atOrUnder, ancestors), ["/repo/website", "/repo"]);
+  assert.deepEqual(dirs("/repo/packages/api", "/repo", atOrUnder, ancestors),
+    ["/repo/packages/api", "/repo/packages", "/repo"]);
+  // 不许爬到工作区根之上去读别人的文件。
+  for (const d of dirs("/repo/website", "/repo", atOrUnder, ancestors)) {
+    assert.ok(atOrUnder(d, "/repo"), `${d} 爬到工作区根之外了`);
+  }
+  // 没给上界（子智能体那条调用路径）就退回只读一层，行为和以前一致。
+  assert.deepEqual(dirs("/repo/website", "", atOrUnder, ancestors), ["/repo/website"]);
+  // root 不在上界之下（工作区刚切换的竞态）也退回一层，不去乱读。
+  assert.deepEqual(dirs("/other/proj", "/repo", atOrUnder, ancestors), ["/other/proj"]);
+  // root 就是工作区根时不许重复读同一层。
+  assert.deepEqual(dirs("/repo", "/repo", atOrUnder, ancestors), ["/repo"]);
+
+  // 光算出目录不算数，读取必须真的按这串目录展开。
+  assert.match(fn, /_guideDirs\.flatMap\(\(dir\) =>/,
+    "算了祖先链却仍然只读 root 那一层——等于没修");
+  assert.match(fn, /backend\.readTextFile\(dir \+ "\/" \+ guide\)/,
+    "读取路径没跟着祖先链走");
+  // 上界必须由调用方给（会话工作区根），不能在这里自己猜。
+  assert.match(fn, /async function _gatherAgentContext\(query, sessionRoot, boundaryRoot = ""\)/,
+    "上界参数没了，祖先链会失去边界");
+  // 标签要说清这份来自哪一层，否则模型碰上根总纲和子项目约定冲突时只能瞎猜。
+  assert.match(fn, /以更近的为准/, "多层约定冲突时谁大没写清");
 });
