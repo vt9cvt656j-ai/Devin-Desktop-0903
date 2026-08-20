@@ -298,15 +298,36 @@ const KNOWN_WRITE_ONLY = new Set([
   "toolRoutingState", "uiDeliveryAuditUnresolved", "capturePort",
 ]);
 
+// 「读」的定义要经得起两种伪装，否则一个死账本能一直挂着不被发现：
+//
+//   洞 A · 自引用：`run._x = [...new Set([...(run._x || []), y])]` / `= (run._x || 0) + 1`
+//          / `= (run._x || new Set()).add(p)`。等号**右边**那次出现是记账本身，不是消费——
+//          外面没有任何人看这个值，可它把 `all - writes` 顶到 1，于是溜过整道守卫。
+//          三个死账本（_gitRepoHints / _parallelDispatches / _testPendingPaths）正是这么活下来的。
+//          注意别把赋值行上的**真实读**误伤：`if (run._x.length > 5) run._x = _trim(run._x)`
+//          的条件在等号**之前**，照常算读。所以只挖掉「等号到本语句结束」这一段。
+//
+//   洞 B · 注释幽灵：这道守卫扫的是**没剥注释**的源码，于是一句
+//          「`run._checkPendingPaths` 只写不读」的注释本身就把它保活了——一句说明它是死的
+//          的话，成了它还活着的唯一证据。剥注释用同文件下方那个上下文感知的 stripJsComments，
+//          不是文件头警告的那种朴素实现。
+const _readsOnly = (src) => src.replace(/run\._[A-Za-z][A-Za-z0-9_]*\s*=(?!=)[^;\n]*/g, (m) => {
+  const eq = m.indexOf("=");
+  return m.slice(0, eq); // 保住左边（含条件），挖掉右边的自引用
+});
 test("no NEW write-only run field is introduced", () => {
-  const written = grab(SRC, /run\._([A-Za-z][A-Za-z0-9_]*)\s*=(?!=)/g);
+  const CODE = stripJsComments(SRC);
+  const written = grab(CODE, /run\._([A-Za-z][A-Za-z0-9_]*)\s*=(?!=)/g);
+  assert.ok(written.length > 40, `只扫出 ${written.length} 个 run 字段——取法坏了，这条等于没跑`);
+  const READS = _readsOnly(CODE);
   const fresh = [];
   for (const field of written) {
     // Reads include optional chaining (`run?._x`), which the first version missed and which
     // would have produced false positives on fields that ARE read.
-    const all = count(SRC, new RegExp(`run\\??\\._${field}\\b`, "g"));
-    const writes = count(SRC, new RegExp(`run\\._${field}\\s*=(?!=)`, "g"));
-    if (all - writes === 0 && !KNOWN_WRITE_ONLY.has(field)) fresh.push(`run._${field}`);
+    // READS 里每处赋值只剩下等号左边的 `run._x`，所以减掉赋值条数，剩下的就是真实读。
+    const all = count(READS, new RegExp(`run\\??\\._${field}\\b`, "g"));
+    const writes = count(CODE, new RegExp(`run\\._${field}\\s*=(?!=)`, "g"));
+    if (all - writes <= 0 && !KNOWN_WRITE_ONLY.has(field)) fresh.push(`run._${field}`);
   }
   assert.deepEqual(fresh, [],
     `new write-only run state — wire it up, or delete it: ${fresh.join(", ")}`);
@@ -323,14 +344,18 @@ const KNOWN_SESSION_WRITE_ONLY = new Set([
   // 给别的代码路径取当前轮时间线用的挂载点，目前没有读者；留着无害，但要在明面上登记。
   "turnTimeline",
 ]);
+// 同上面两个洞：自引用记账 + 注释幽灵。会话侧一字不差地存在同样的问题。
+const _sessReadsOnly = (src) => src.replace(/(?:session|sess)\._[A-Za-z0-9_]+\s*=(?!=)[^;\n]*/g, (m) => m.slice(0, m.indexOf("=")));
 test("会话级状态也不许只写不读", () => {
-  const written = new Set([...SRC.matchAll(/(?:session|sess)\._([A-Za-z0-9_]+)\s*=(?!=)/g)].map((m) => m[1]));
+  const CODE = stripJsComments(SRC);
+  const written = new Set([...CODE.matchAll(/(?:session|sess)\._([A-Za-z0-9_]+)\s*=(?!=)/g)].map((m) => m[1]));
   assert.ok(written.size > 20, `只扫出 ${written.size} 个会话字段——取法坏了，这条等于没跑`);
+  const READS = _sessReadsOnly(CODE);
   const fresh = [];
   for (const field of written) {
-    const all = (SRC.match(new RegExp(`(?:session|sess)\\??\\._${field}\\b`, "g")) || []).length;
-    const writes = (SRC.match(new RegExp(`(?:session|sess)\\._${field}\\s*=(?!=)`, "g")) || []).length;
-    if (all - writes === 0 && !KNOWN_SESSION_WRITE_ONLY.has(field)) fresh.push(`session._${field}`);
+    const all = (READS.match(new RegExp(`(?:session|sess)\\??\\._${field}\\b`, "g")) || []).length;
+    const writes = (CODE.match(new RegExp(`(?:session|sess)\\._${field}\\s*=(?!=)`, "g")) || []).length;
+    if (all - writes <= 0 && !KNOWN_SESSION_WRITE_ONLY.has(field)) fresh.push(`session._${field}`);
   }
   assert.deepEqual(fresh, [],
     `新的只写不读会话状态——接上读者，或者删掉它：${fresh.join(", ")}`);
