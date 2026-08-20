@@ -48611,7 +48611,10 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
             run._wrapUpReviews = (run._wrapUpReviews || 0) + 1;
             run._wrapUpReviewedAtImplOps = _implOps;
             try {
-              run._wrapUpVerdict = await _wrapUpCritic({
+              // 重审可能跑第二次，而评审超时/回垃圾 JSON 时返回的是 null。直接赋值会把
+              // 第一次那份**好结论**覆盖成 null —— 一次成功的评审被一次失败的重审抹掉，
+              // 用户那几张卡跟着一起消失。只有真拿到新结论才换。
+              const _newVerdict = await _wrapUpCritic({
                 config,
                 task,
                 padText: _padText(),
@@ -48637,6 +48640,7 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
                   } catch { return ""; }
                 })(),
               });
+              if (_newVerdict) run._wrapUpVerdict = _newVerdict;
             } catch { /* 评审失败不该弄坏一轮交付 */ }
           }
         }
