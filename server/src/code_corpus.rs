@@ -52,6 +52,8 @@ fn host_allowed(url: &str) -> bool {
         // crates.io：元数据在 crates.io，.crate 在 static.crates.io
         || host == "crates.io"
         || host == "static.crates.io"
+        // 官方文档仓库（开源 markdown）的 tarball
+        || host == "codeload.github.com"
 }
 
 /// 生态。每一支的差别只在「去哪拿包」和「从什么文件里抽签名」，其余共用。
@@ -94,6 +96,17 @@ struct Entry {
     symbol: String,
     title: String,
     body: String,
+}
+
+impl Entry {
+    /// 段内唯一锚点：有符号用符号，没符号（文档节 / README 节）用小节标题。
+    ///
+    /// 没有它，同一个源的所有无符号条目在唯一索引上撞成一条——实测 react 文档
+    /// 970 节只留下 1 条，而且入库计数还报 970（冲突跳过时 sqlx 仍返回 Ok）。
+    fn anchor(&self) -> String {
+        let a = if self.symbol.is_empty() { &self.title } else { &self.symbol };
+        a.chars().take(200).collect()
+    }
 }
 
 fn http() -> Result<reqwest::Client> {
@@ -423,22 +436,23 @@ pub async fn ingest_npm(
     for e in &entries {
         // 同包同版本同符号只留一条；重复抓取是 no-op。
         let res = sqlx::query(
-            "INSERT INTO code_corpus (kind, ecosystem, name, version, symbol, title, body, source_url) \
-             VALUES ($1,'npm',$2,$3,$4,$5,$6,$7) \
-             ON CONFLICT (ecosystem, name, version, kind, symbol) DO NOTHING",
+            "INSERT INTO code_corpus (kind, ecosystem, name, version, symbol, anchor, title, body, source_url) \
+             VALUES ($1,'npm',$2,$3,$4,$5,$6,$7,$8) \
+             ON CONFLICT (ecosystem, name, version, kind, anchor) DO NOTHING",
         )
         .bind(e.kind)
         .bind(name)
         .bind(&version)
         .bind(&e.symbol)
+        .bind(e.anchor())
         .bind(&e.title)
         .bind(&e.body)
         .bind(&tarball)
         .execute(db)
         .await;
-        if res.is_ok() {
-            written += 1;
-        }
+        // 只数**真的写进去了**的。冲突跳过时 sqlx 一样返回 Ok，拿 is_ok() 计数
+        // 会让日志报出一个从没发生过的数字（实测报 970、实入 1）。
+        written += res.map(|r| r.rows_affected() as usize).unwrap_or(0);
     }
 
     let _ = sqlx::query(
@@ -502,10 +516,31 @@ fn or_form(query: &str) -> String {
     words.join(" or ")
 }
 
+/// 这个查询像不像「一个标识符」。
+///
+/// 决定排序该偏向谁：问 `useEffect` 要的是那个符号的签名；问「useEffect 为什么在开发环境
+/// 跑两次」要的是官方文档里讲这件事的那一节。两者在同一个索引里争第一，靠权重分开。
+fn looks_like_identifier(query: &str) -> bool {
+    let q = query.trim();
+    !q.is_empty()
+        && q.len() <= 64
+        && !q.contains(' ')
+        && q.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '$' || c == '.' || c == ':')
+}
+
 /// 检索。内置全文排相关性；给了包名就把它限定住，避免同名符号跨包串味。
 ///
-/// 召回用 OR 式、排序偏向 AND 式：两个词都中的排在只中一个的前面，
-/// 而只中一个的仍然能被召回——这才是「找相关 API」要的行为。
+/// # 权重是按查询形态换的
+///
+/// tsvector 里 name/symbol 是 A、title 是 B、body 是 C。这套权重对「查符号」是对的，
+/// 对「问概念」是错的——实测问「useEffect 为什么在开发环境跑两次」，一个恰好导出
+/// `useEffect` 的第三方小包（symbol 命中，权重 A）压过了 React 官方文档讲这件事的整节
+/// 正文（权重 C）。答案在库里，只是排不上来。
+///
+/// `ts_rank` 的第一个参数就是权重数组 `{D,C,B,A}`，所以不用改索引、也不用拆表：
+///   · 标识符查询 → A 主导（符号命中最重要）
+///   · 自然语言查询 → C 主导（正文里讲清楚这件事的那一节最重要）
+/// trigram 的符号相似度同理，只在标识符查询时加权——拿一整句话去和符号名比相似度是噪音。
 pub async fn search(
     db: &sqlx::PgPool,
     query: &str,
@@ -514,15 +549,22 @@ pub async fn search(
 ) -> Result<Vec<CorpusHit>> {
     let limit = limit.clamp(1, 20);
     let or_q = or_form(query);
+    let ident = looks_like_identifier(query);
+    // {D, C, B, A}
+    let weights: Vec<f32> = if ident {
+        vec![0.1, 0.2, 0.4, 1.0]
+    } else {
+        vec![0.1, 1.0, 0.5, 0.15]
+    };
     let rows: Vec<(String, String, String, String, String, String, f32)> = sqlx::query_as(
         "SELECT ecosystem, name, version, symbol, title, body, \
-                (ts_rank(tsv, websearch_to_tsquery('english', $1)) * 2.0 \
-                  + ts_rank(tsv, websearch_to_tsquery('english', $5)) \
-                  + CASE WHEN symbol <> '' THEN similarity(symbol, $2) ELSE 0 END)::real AS score \
+                (ts_rank($6::float4[], tsv, websearch_to_tsquery('english', $1)) * 2.0 \
+                  + ts_rank($6::float4[], tsv, websearch_to_tsquery('english', $5)) \
+                  + CASE WHEN $7 AND symbol <> '' THEN similarity(symbol, $2) * 2.0 ELSE 0 END)::real AS score \
            FROM code_corpus \
           WHERE ($3 = '' OR name = $3) \
             AND ($5 <> '' AND tsv @@ websearch_to_tsquery('english', $5) \
-                 OR (symbol <> '' AND symbol % $2)) \
+                 OR ($7 AND symbol <> '' AND symbol % $2)) \
           ORDER BY score DESC, length(body) ASC \
           LIMIT $4",
     )
@@ -531,6 +573,8 @@ pub async fn search(
     .bind(package.unwrap_or(""))
     .bind(limit)
     .bind(&or_q)
+    .bind(&weights)
+    .bind(ident)
     .fetch_all(db)
     .await
     .context("code corpus search")?;
@@ -655,14 +699,14 @@ async fn write_entries(
     let mut written = 0usize;
     for e in entries {
         let res = sqlx::query(
-            "INSERT INTO code_corpus (kind, ecosystem, name, version, symbol, title, body, source_url) \
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8) \
-             ON CONFLICT (ecosystem, name, version, kind, symbol) DO NOTHING",
+            "INSERT INTO code_corpus (kind, ecosystem, name, version, symbol, anchor, title, body, source_url) \
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) \
+             ON CONFLICT (ecosystem, name, version, kind, anchor) DO NOTHING",
         )
         .bind(e.kind).bind(eco.as_str()).bind(name).bind(version)
-        .bind(&e.symbol).bind(&e.title).bind(&e.body).bind(url)
+        .bind(&e.symbol).bind(e.anchor()).bind(&e.title).bind(&e.body).bind(url)
         .execute(db).await;
-        if res.is_ok() { written += 1; }
+        written += res.map(|r| r.rows_affected() as usize).unwrap_or(0);
     }
     written
 }
@@ -986,6 +1030,217 @@ pub async fn seed(db: sqlx::PgPool, per_term: usize, max_packages: usize) -> Res
     Ok(())
 }
 
+/// 文档仓库的下载上限。比包大得多——一份官方文档站动辄几十 MB，
+/// 但一次预热只下一遍，之后是本地检索。
+const MAX_DOC_TARBALL_BYTES: u64 = 80 * 1024 * 1024;
+
+/// 官方文档源。
+///
+/// # 为什么是「文档」而不是「全网网页」
+///
+/// 抓整个互联网既做不到也没价值：模型缺的不是网页，是**权威且当下的事实**。
+/// 官方文档恰好是这份东西的最高密度形态，而且这些仓库本身就是开源 markdown，
+/// 可以整份取下来按节切开——不用爬、不用渲染、不用猜正文在哪。
+///
+/// # 选源标准
+///
+/// 只收**开源许可、以 markdown 形态发布**的官方文档。每一条都记下 source_url，
+/// 检索结果能一路追回原文出处（这些内容各有各的许可，出处必须留着）。
+///
+/// (语料名, 仓库, 分支, 只取这个路径下的)
+/// 注意：`nodejs/node`（整个 Node 源码仓，200MB+）和 `mdn/content`（更大）**不在**清单里。
+/// 它们的文档很有价值，但为了 doc/api 那一小块去拉整仓既撞上限又浪费带宽——
+/// 等抽取改成流式解包（边下边丢弃不要的条目）再收。
+const DOC_SOURCES: &[(&str, &str, &str, &str)] = &[
+    ("react",      "reactjs/react.dev",           "main", "src/content/"),
+    ("vue",        "vuejs/docs",                  "main", "src/"),
+    ("svelte",     "sveltejs/svelte",             "main", "documentation/"),
+    ("rust",       "rust-lang/book",              "main", "src/"),
+    ("typescript", "microsoft/TypeScript-Website","v2",   "packages/documentation/copy/en/"),
+    ("tailwind",   "tailwindlabs/tailwindcss.com","main", "src/docs/"),
+    ("astro",      "withastro/docs",              "main", "src/content/docs/en/"),
+    ("prisma",     "prisma/docs",                 "main", "content/"),
+    ("fastapi",    "fastapi/fastapi",             "master", "docs/en/docs/"),
+];
+
+/// markdown 按 `##` 切节 —— 和手写语料库同一套切法，切出来的每一节都能独立读懂。
+fn extract_markdown(path: &str, src: &str, out: &mut Vec<Entry>) {
+    // front-matter 里常有真正的标题，比文件名好看。
+    let mut doc_title = path
+        .rsplit('/')
+        .next()
+        .unwrap_or(path)
+        .trim_end_matches(".mdx")
+        .trim_end_matches(".md")
+        .to_string();
+    let body_src = if let Some(rest) = src.strip_prefix("---\n") {
+        if let Some(end) = rest.find("\n---\n") {
+            for line in rest[..end].lines() {
+                if let Some(t) = line.strip_prefix("title:") {
+                    doc_title = t.trim().trim_matches('"').trim_matches('\'').to_string();
+                }
+            }
+            &rest[end + 5..]
+        } else { src }
+    } else { src };
+
+    let mut section = String::new();
+    let mut heading = doc_title.clone();
+    let mut push = |heading: &str, body: &str, out: &mut Vec<Entry>| {
+        let body = body.trim();
+        // 太短的节（只有一个链接、一张图）没有检索价值。
+        if body.len() < 80 || out.len() >= MAX_DOC_SECTIONS {
+            return;
+        }
+        let body = if body.chars().count() > MAX_BODY_CHARS {
+            body.chars().take(MAX_BODY_CHARS).collect()
+        } else {
+            body.to_string()
+        };
+        out.push(Entry {
+            kind: "doc",
+            symbol: String::new(),
+            title: format!("{doc_title} · {heading}"),
+            body,
+        });
+    };
+    for line in body_src.lines() {
+        if let Some(h) = line.strip_prefix("## ") {
+            push(&heading, &section, out);
+            section.clear();
+            heading = h.trim().to_string();
+        } else {
+            section.push_str(line);
+            section.push('\n');
+        }
+    }
+    push(&heading, &section, out);
+}
+
+/// 一份文档最多收多少节。防一个巨型文档站把整张表灌满。
+const MAX_DOC_SECTIONS: usize = 4000;
+
+/// 抓一份官方文档并入库。
+pub async fn ingest_doc_source(
+    db: &sqlx::PgPool,
+    slug: &str,
+    repo: &str,
+    git_ref: &str,
+    prefix: &str,
+) -> Result<IngestReport> {
+    let url = format!("https://codeload.github.com/{repo}/tar.gz/refs/heads/{git_ref}");
+    if !host_allowed(&url) {
+        return Err(anyhow!("doc host not allowed"));
+    }
+    let client = http()?;
+    let resp = client
+        .get(&url).send().await.context("download docs tarball")?
+        .error_for_status().context("docs tarball returned an error status")?;
+    let bytes = resp.bytes().await.context("read docs tarball")?;
+    if bytes.len() as u64 > MAX_DOC_TARBALL_BYTES {
+        return Err(anyhow!("docs tarball is {} bytes, over the cap", bytes.len()));
+    }
+    let downloaded = bytes.len() as u64;
+
+    let prefix_owned = prefix.to_string();
+    let files = tokio::task::spawn_blocking(move || -> Result<Vec<(String, String)>> {
+        let gz = flate2::read::GzDecoder::new(std::io::Cursor::new(bytes));
+        let mut archive = tar::Archive::new(gz);
+        let mut out = Vec::new();
+        for entry in archive.entries().context("read docs tar")? {
+            let mut entry = entry.context("bad docs tar entry")?;
+            if !entry.header().entry_type().is_file() { continue; }
+            let path = entry.path().context("bad docs entry path")?.to_string_lossy().to_string();
+            // GitHub 的 tarball 顶层是 `<repo>-<ref>/`，剥掉再比路径。
+            let rel = match path.split_once('/') { Some((_, r)) => r.to_string(), None => continue };
+            if !rel.starts_with(&prefix_owned) { continue; }
+            let lower = rel.to_ascii_lowercase();
+            if !(lower.ends_with(".md") || lower.ends_with(".mdx")) { continue; }
+            if entry.header().size().unwrap_or(0) as usize > MAX_ENTRY_BYTES { continue; }
+            let mut buf = String::new();
+            if entry.read_to_string(&mut buf).is_err() { continue; }
+            out.push((rel, buf));
+            if out.len() > 6000 { break; }
+        }
+        Ok(out)
+    })
+    .await
+    .context("docs untar task panicked")??;
+
+    let mut written = 0usize;
+    for (rel, body) in &files {
+        let mut entries: Vec<Entry> = Vec::new();
+        extract_markdown(rel, body, &mut entries);
+        // 出处要能一路追回原文——这些内容各有各的许可，来源不能丢。
+        let src_url = format!("https://github.com/{repo}/blob/{git_ref}/{rel}");
+        for e in &entries {
+            let res = sqlx::query(
+                "INSERT INTO code_corpus (kind, ecosystem, name, version, symbol, anchor, title, body, source_url) \
+                 VALUES ($1,'docs',$2,$3,'',$4,$5,$6,$7) \
+                 ON CONFLICT (ecosystem, name, version, kind, anchor) DO NOTHING",
+            )
+            .bind(e.kind).bind(slug).bind(git_ref)
+            // 文档的锚点要带上路径：不同文件里同名的 `## Usage` 是不同的节。
+            .bind(format!("{rel}#{}", e.anchor()).chars().take(200).collect::<String>())
+            .bind(&e.title).bind(&e.body).bind(&src_url)
+            .execute(db).await;
+            written += res.map(|r| r.rows_affected() as usize).unwrap_or(0);
+        }
+    }
+
+    let _ = sqlx::query(
+        "INSERT INTO code_corpus_fetches (ecosystem, name, version, ok, entries, bytes) \
+         VALUES ('docs',$1,$2,true,$3,$4) \
+         ON CONFLICT (ecosystem, name, version) DO UPDATE \
+           SET ok = true, entries = EXCLUDED.entries, bytes = EXCLUDED.bytes, error = NULL, fetched_at = now()",
+    )
+    .bind(slug).bind(git_ref).bind(written as i32).bind(downloaded as i64)
+    .execute(db).await;
+
+    Ok(IngestReport { name: slug.to_string(), version: git_ref.to_string(), entries: written, bytes: downloaded })
+}
+
+/// 把所有官方文档源过一遍。
+pub async fn seed_docs(db: &sqlx::PgPool) {
+    for (slug, repo, git_ref, prefix) in DOC_SOURCES {
+        if recently_attempted_eco_named(db, "docs", slug).await {
+            continue;
+        }
+        match ingest_doc_source(db, slug, repo, git_ref, prefix).await {
+            Ok(r) => tracing::info!(source = %r.name, sections = r.entries, bytes = r.bytes,
+                "code corpus: doc source ingested"),
+            Err(e) => {
+                let msg = e.to_string();
+                tracing::warn!(source = %slug, error = %msg, "code corpus: doc source failed");
+                let _ = sqlx::query(
+                    "INSERT INTO code_corpus_fetches (ecosystem, name, version, ok, error) \
+                     VALUES ('docs',$1,$2,false,$3) \
+                     ON CONFLICT (ecosystem, name, version) DO UPDATE \
+                       SET ok = false, error = EXCLUDED.error, fetched_at = now()",
+                )
+                .bind(slug).bind(git_ref).bind(msg.chars().take(500).collect::<String>())
+                .execute(db).await;
+            }
+        }
+        // 对 GitHub 客气一点。
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    }
+}
+
+/// 这个源近期处理过吗。
+///
+/// 成功的 14 天不重来；**失败的也要退避 3 天**——否则一个永远太大的源会在每次重启时
+/// 重新下载几十 MB 再被上限拒掉，白烧带宽。3 天比 14 天短，是给临时故障留重试的机会。
+async fn recently_attempted_eco_named(db: &sqlx::PgPool, eco: &str, name: &str) -> bool {
+    sqlx::query_scalar::<_, i64>(
+        "SELECT count(*) FROM code_corpus_fetches \
+          WHERE ecosystem = $1 AND name = $2 \
+            AND fetched_at > now() - (CASE WHEN ok THEN interval '14 days' ELSE interval '3 days' END)",
+    )
+    .bind(eco).bind(name)
+    .fetch_one(db).await.map(|n| n > 0).unwrap_or(false)
+}
+
 /// crates.io 有官方的下载量排序，直接按热度翻页。
 async fn discover_crates(client: &reqwest::Client, want: usize) -> Vec<String> {
     let mut names = Vec::new();
@@ -1051,6 +1306,10 @@ pub async fn seed_all(db: sqlx::PgPool, npm_per_term: usize, per_eco_max: usize)
         npm = npm.len(), crates = crates.len(), pypi = pypi.len(),
         "code corpus: seeding discovered candidates"
     );
+
+    // 文档先跑：十几份官方文档就覆盖了最常问的框架，比几千个包更快见效，
+    // 而且它是「全网知识库」那一半的主体。
+    seed_docs(&db).await;
 
     let plan: Vec<(Eco, Vec<String>)> = vec![
         (Eco::Npm, npm.into_iter().take(per_eco_max).collect()),
@@ -1199,6 +1458,71 @@ declare function notExported(): void;
         assert_eq!(or_form("!!! ???"), "");
     }
 
+    #[test]
+    fn identifier_queries_and_prose_questions_rank_by_different_weights() {
+        // 查符号：一个词、没有空格。
+        assert!(looks_like_identifier("useEffect"));
+        assert!(looks_like_identifier("z.string"));
+        assert!(looks_like_identifier("std::vec::Vec"));
+        // 问概念：多个词。拿一整句话去和符号名比相似度是噪音，也不该让 symbol 的
+        // 权重 A 压过正文——实测就是这么让一个第三方小包压过 React 官方文档的。
+        assert!(!looks_like_identifier("why does useEffect run twice"));
+        assert!(!looks_like_identifier(""));
+        assert!(!looks_like_identifier("a".repeat(80).as_str()));
+
+        // 权重必须真的按形态换，而且 trigram 只在标识符查询时参与。
+        let src = include_str!("code_corpus.rs");
+        let prod = &src[..src.find("mod tests").expect("tests module")];
+        assert!(prod.contains("ts_rank($6::float4[], tsv"),
+            "排序必须用可切换的权重数组，而不是默认权重");
+        assert!(prod.contains("CASE WHEN $7 AND symbol <> '' THEN similarity"),
+            "符号相似度只该在标识符查询时加权");
+    }
+
+    #[test]
+    fn sectioned_entries_get_distinct_anchors_or_they_collapse_to_one_row() {
+        // 唯一索引里无符号条目全靠锚点区分。少了它，同一个源的几百节撞成一条——
+        // 实测 react 文档抽出 970 节、实际入库 1 条，而日志还报 970（冲突跳过时
+        // sqlx 一样返回 Ok，用 is_ok() 计数就会报出一个没发生过的数字）。
+        let a = Entry { kind: "doc", symbol: String::new(), title: "useEffect · Reference".into(), body: "x".into() };
+        let b = Entry { kind: "doc", symbol: String::new(), title: "useEffect · Caveats".into(), body: "y".into() };
+        assert_ne!(a.anchor(), b.anchor(), "同一文档的两节必须有不同锚点");
+        assert!(!a.anchor().is_empty(), "锚点不能为空，空的就等于没分开");
+
+        // 有符号的仍然以符号为锚——符号名比标题稳定。
+        let f = Entry { kind: "package_api", symbol: "parse".into(), title: "function parse".into(), body: "z".into() };
+        assert_eq!(f.anchor(), "parse");
+
+        // 超长标题要截断，否则撑爆索引键。
+        let long = Entry { kind: "doc", symbol: String::new(), title: "标".repeat(500), body: "z".into() };
+        assert!(long.anchor().chars().count() <= 200);
+
+        // 生产里三条 INSERT 都必须按锚点冲突、并且按真实影响行数计。
+        let src = include_str!("code_corpus.rs");
+        let prod = &src[..src.find("mod tests").expect("tests module")];
+        assert_eq!(prod.matches("ON CONFLICT (ecosystem, name, version, kind, anchor)").count(), 3,
+            "三条写入路径都要按锚点去重");
+        assert!(!prod.contains("if res.is_ok() { written += 1; }"),
+            "不许再用 is_ok() 当入库计数——冲突跳过时它也是 Ok");
+        assert_eq!(prod.matches("rows_affected() as usize").count(), 3,
+            "三条写入路径都要按真实影响行数计");
+    }
+    #[test]
+    fn markdown_is_chunked_by_heading_and_keeps_its_front_matter_title() {
+        let src = "---\ntitle: \"useEffect\"\nslug: reference/react/useEffect\n---\n\nIntro paragraph that is long enough to be worth indexing in the corpus at all.\n\n## Reference\n\n`useEffect(setup, dependencies?)` lets you synchronize a component with an external system and run side effects after render.\n\n## Caveats\n\nEffects only run on the client, never during server rendering, which surprises people often.\n";
+        let mut out = Vec::new();
+        extract_markdown("src/content/reference/react/useEffect.md", src, &mut out);
+        assert!(out.len() >= 2, "至少切出 Reference 和 Caveats 两节：{}", out.len());
+        // front-matter 的 title 要当文档名，比文件名可读。
+        assert!(out.iter().all(|e| e.title.starts_with("useEffect · ")),
+            "标题要带上文档名：{:?}", out.iter().map(|e| &e.title).collect::<Vec<_>>());
+        assert!(out.iter().any(|e| e.body.contains("synchronize a component")));
+        assert!(out.iter().all(|e| e.kind == "doc"));
+        // 太短的节不进语料——只有一个链接或一张图的节没有检索价值。
+        let mut tiny = Vec::new();
+        extract_markdown("x.md", "## A\n\nshort\n", &mut tiny);
+        assert!(tiny.is_empty(), "过短的节不该入库");
+    }
     #[test]
     fn python_declarations_and_their_docstrings_come_out() {
         // Python 的文档字符串在声明**之后**（缩进的三引号块），和 TS 正好相反——
