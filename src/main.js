@@ -8549,7 +8549,7 @@ function _clearAllMarkersForModel(model) {
 }
 
 function _isMissingFileError(error) {
-  return /No such file or directory|not found|does not exist|cannot find|ENOENT|os error 2|找不到(?:指定的)?文件|文件不存在/i.test(String(error?.message || error || ""));
+  return /No such file or directory|not found|does not exist|cannot find|ENOENT|os error 2\b|找不到(?:指定的)?文件|文件不存在/i.test(String(error?.message || error || ""));
 }
 
 function _dropProjectModel(path) {
@@ -31571,7 +31571,10 @@ const _NODES_EXTRACT_JS = `(() => {
   try {
     var clean = function(s){ s=String(s||''); var out='', sp=false; for (var k=0;k<s.length;k++){ var ch=s[k]; if (ch===' '||ch==='\\n'||ch==='\\t'||ch==='\\r'){ if(!sp){ out+=' '; sp=true; } } else { out+=ch; sp=false; } } return out.trim(); };
     var rootList = function(){
-      var out = [], seen = [], iframeCount = 0, shadowCount = 0;
+      // blocked：**够不着**的 iframe（跨域）。此前它们被静默跳过，contexts.iframes 只数同源的，
+      // 模型看到 iframes:0 就以为页面没有嵌套内容，然后对着一个根本不在本文档里的元素
+      // 无穷换选择器。Stripe 支付、第三方登录、嵌入式播放器全是这个形态。
+      var out = [], seen = [], iframeCount = 0, shadowCount = 0, blocked = [];
       var push = function(root, depth){
         if (!root || seen.indexOf(root) >= 0 || depth > 5) return;
         seen.push(root); out.push(root);
@@ -31580,11 +31583,11 @@ const _NODES_EXTRACT_JS = `(() => {
         for (var i=0;i<all.length;i++){
           var el = all[i];
           try { if (el.shadowRoot) { shadowCount++; push(el.shadowRoot, depth + 1); } } catch(e1){}
-          try { if (el.tagName === 'IFRAME' && el.contentDocument) { iframeCount++; push(el.contentDocument, depth + 1); } } catch(e2){}
+          try { if (el.tagName === 'IFRAME') { if (el.contentDocument) { iframeCount++; push(el.contentDocument, depth + 1); } else { var _r = el.getBoundingClientRect(); blocked.push({ src: String(el.src || '').slice(0, 120), w: Math.round(_r.width), h: Math.round(_r.height) }); } } } catch(e2){ try { var _r2 = el.getBoundingClientRect(); blocked.push({ src: String(el.src || '').slice(0, 120), w: Math.round(_r2.width), h: Math.round(_r2.height) }); } catch(e3){} }
         }
       };
       push(document, 0);
-      out.iframeCount = iframeCount; out.shadowCount = shadowCount;
+      out.iframeCount = iframeCount; out.shadowCount = shadowCount; out.blockedFrames = blocked;
       return out;
     };
     var qsa = function(sel){
@@ -31630,8 +31633,8 @@ const _NODES_EXTRACT_JS = `(() => {
     var heads = qsa('h1,h2,h3').slice(0, 20)
       .map(function(h){ return { r:'h'+(h.tagName.charAt(1)), n:clean(h.innerText||'').slice(0,56) }; })
       .filter(function(h){ return h.n; }).slice(0,12);
-    return JSON.stringify({ url:location.href, title:clean(document.title).slice(0,80), ready:document.readyState, active:document.activeElement ? nameOf(document.activeElement) : '', contexts:{ roots:roots.length, iframes:roots.iframeCount||0, shadowRoots:roots.shadowCount||0 }, total:id, structure:heads, nodes:nodes,
-      legend:'i=节点号(用 browser click/type node=i 操作)·r=角色·n=名称·s=状态(disabled/checked/expanded/value/href)·off=1 表示在视口外(先 scroll 再点)·contexts=同源 iframe/shadow DOM 已纳入观察' });
+    return JSON.stringify({ url:location.href, title:clean(document.title).slice(0,80), ready:document.readyState, active:document.activeElement ? nameOf(document.activeElement) : '', contexts:{ roots:roots.length, iframes:roots.iframeCount||0, shadowRoots:roots.shadowCount||0, crossOriginFrames:(roots.blockedFrames||[]).slice(0,6) }, total:id, structure:heads, nodes:nodes,
+      legend:'i=节点号(用 browser click/type node=i 操作)·r=角色·n=名称·s=状态(disabled/checked/expanded/value/href)·off=1 表示在视口外(先 scroll 再点)·contexts.iframes/shadowRoots=同源的已纳入观察；contexts.crossOriginFrames=**够不着**的跨域 iframe，里面的元素在这份快照里一个都没有，别对它们换选择器——改成 navigate 到那个 src，或换用接口/其它路径' });
   } catch (e) { return JSON.stringify({ error: String(e) }); }
 })()`;
 
@@ -31915,7 +31918,10 @@ function _browserBatchFastJS(steps) {
     var clean = function(s){ s=String(s||''); var out='', sp=false; for (var k=0;k<s.length;k++){ var ch=s[k]; if (ch===' '||ch==='\\n'||ch==='\\t'||ch==='\\r'){ if(!sp){ out+=' '; sp=true; } } else { out+=ch; sp=false; } } return out.trim(); };
     var lower = function(s){ return clean(s).toLowerCase(); };
     var rootList = function(){
-      var out = [], seen = [], iframeCount = 0, shadowCount = 0;
+      // blocked：**够不着**的 iframe（跨域）。此前它们被静默跳过，contexts.iframes 只数同源的，
+      // 模型看到 iframes:0 就以为页面没有嵌套内容，然后对着一个根本不在本文档里的元素
+      // 无穷换选择器。Stripe 支付、第三方登录、嵌入式播放器全是这个形态。
+      var out = [], seen = [], iframeCount = 0, shadowCount = 0, blocked = [];
       var push = function(root, depth){
         if (!root || seen.indexOf(root) >= 0 || depth > 5) return;
         seen.push(root); out.push(root);
@@ -31924,11 +31930,11 @@ function _browserBatchFastJS(steps) {
         for (var i=0;i<all.length;i++){
           var el = all[i];
           try { if (el.shadowRoot) { shadowCount++; push(el.shadowRoot, depth + 1); } } catch(e1){}
-          try { if (el.tagName === 'IFRAME' && el.contentDocument) { iframeCount++; push(el.contentDocument, depth + 1); } } catch(e2){}
+          try { if (el.tagName === 'IFRAME') { if (el.contentDocument) { iframeCount++; push(el.contentDocument, depth + 1); } else { var _r = el.getBoundingClientRect(); blocked.push({ src: String(el.src || '').slice(0, 120), w: Math.round(_r.width), h: Math.round(_r.height) }); } } } catch(e2){ try { var _r2 = el.getBoundingClientRect(); blocked.push({ src: String(el.src || '').slice(0, 120), w: Math.round(_r2.width), h: Math.round(_r2.height) }); } catch(e3){} }
         }
       };
       push(document, 0);
-      out.iframeCount = iframeCount; out.shadowCount = shadowCount;
+      out.iframeCount = iframeCount; out.shadowCount = shadowCount; out.blockedFrames = blocked;
       return out;
     };
     var docs = function(){ return rootList().filter(function(r){ return r && r.nodeType === 9; }); };
@@ -32527,7 +32533,7 @@ function _browserBatchFastJS(steps) {
       var nodes=[], id=0, els=[]; try { els = qsa(SEL).slice(0, 1500); } catch(e){}
       for (var i=0;i<els.length && id<110;i++){ var el=els[i], r; try{ r=el.getBoundingClientRect(); }catch(e){ continue; } if(!visible(el)) continue; el.setAttribute('data-mnode', String(id)); var inView=!(r.bottom<=0||r.right<=0||r.top>=innerHeight||r.left>=innerWidth); var node={ i:id, r:roleOf(el), n:nameOf(el) }; var st=stateOf(el); for(var kk in st){ node.s=st; break; } if(!inView)node.off=1; nodes.push(node); id++; }
       var heads=[]; try { heads = qsa('h1,h2,h3').slice(0, 20).map(function(h){ return { r:'h'+(h.tagName.charAt(1)), n:clean(h.innerText||'').slice(0,56) }; }).filter(function(h){ return h.n; }).slice(0,12); } catch(e){}
-      return { url:location.href, title:clean(document.title).slice(0,80), ready:document.readyState, active:brief(document.activeElement), contexts:{ roots:roots.length, iframes:roots.iframeCount||0, shadowRoots:roots.shadowCount||0 }, total:id, structure:heads, nodes:nodes, legend:'fast_batch/observe 后的节点快照；i=节点号，用 browser click/type node=i 继续；off=1 先 scroll；contexts 表示已纳入同源 iframe/shadow DOM' };
+      return { url:location.href, title:clean(document.title).slice(0,80), ready:document.readyState, active:brief(document.activeElement), contexts:{ roots:roots.length, iframes:roots.iframeCount||0, shadowRoots:roots.shadowCount||0, crossOriginFrames:(roots.blockedFrames||[]).slice(0,6) }, total:id, structure:heads, nodes:nodes, legend:'fast_batch/observe 后的节点快照；i=节点号，用 browser click/type node=i 继续；off=1 先 scroll；contexts.iframes/shadowRoots=已纳入的同源上下文；contexts.crossOriginFrames=够不着的跨域 iframe，其内元素不在本快照里' };
     };
     return (async function(){
       var log = [], broken = false, failed = null;
@@ -54104,7 +54110,11 @@ async function _executeToolStepInner(step, call, root, run) {
             // reason; STOP so a later non-existent fallback candidate can't overwrite it with a
             // misleading "No such file". (A 343MB app.asar showed "找不到文件" because the real error
             // "太大/二进制" got masked by the relative-path fallback's ENOENT.)
-            if (/too large|太大|过大|binary file|二进制|>\s*5\s*MB/i.test(msg)) { unreadableMatches.push({ path: fp, message: msg }); continue; }
+            // 「文件在、但读不出来」不止太大和二进制：非 UTF-8 的遗留源码（GBK/Latin-1）
+            // 和没有读权限（root 属主）也是 —— 这两种以前掉进下面的 candidateErrors，
+            // 最终被说成「找不到唯一文件」，把模型送回 find_files 的死循环。
+            // 只补这两串：它们都只可能由「已经打开并读到了这个 inode」产生。
+            if (/too large|太大|过大|binary file|二进制|>\s*5\s*MB|not valid UTF-8|没有读取权限/i.test(msg)) { unreadableMatches.push({ path: fp, message: msg }); continue; }
             candidateErrors.push({ path: fp, message: msg.slice(0, 200) });
           }
         }
@@ -54628,7 +54638,12 @@ async function _executeToolStepInner(step, call, root, run) {
       _setToolStepResolvedPath(step, fp);
       let old = "";
       let existed = false;
-      try { old = await backend.readTextFile(fp); existed = true; } catch {}
+      // 只多记一个原因，**绝不动 existed**：写盘的 CAS 吃它（writeTextFileIfUnchanged
+      // 拿 existed ? old : null 当基线），翻成 true 会拿空串去比对，将来比对一放宽就是
+      // 把一个 6MB 的 .db 截成 0 字节。有测试钉着这条。
+      let readErr = "";
+      try { old = await backend.readTextFile(fp); existed = true; }
+      catch (e) { readErr = String(e && e.message || e || ""); }
       const liveWritePreview = call.type === "write" ? call._liveWritePreview : null;
       const _previewStale = !!liveWritePreview && !liveWritePreview.userChanged && !liveWritePreview.rolledBack
         && (liveWritePreview.existed !== existed || (existed && liveWritePreview.originalContent !== old));
@@ -54719,6 +54734,19 @@ async function _executeToolStepInner(step, call, root, run) {
         // Previously blocked edits containing [REDACTED*], but user wants to be able to
         // operate on redacted files. Now we allow the edit to proceed — model may or may
         // not touch sensitive regions; IDE doesn't block either way.
+        if (!existed && readErr && !_isMissingFileError(readErr)) {
+          // 「读不出来」不等于「不存在」。GBK/Latin-1 的遗留源码、>5MB、二进制、root 属主、
+          // 路径其实是目录 —— 这五种确实存在，原来一律说成「文件不存在」，还附一份
+          // 「项目里有 1 个同名文件」的清单（里面就是这个文件自己）让模型「先 read 它」，
+          // 而 read 会再给一次同样的话。死胡同。
+          res.className = "atc-result atc-result--err";
+          res.textContent = "读不了";
+          return { type: "edit", path: call.path, content:
+            `[ERROR/UNREADABLE] 这条路径读不出来: ${call.path}（${readErr.slice(0, 200)}）。`
+            + `\n这不是路径问题，别再 find_files，也别改用 write_file（那会撞 [CONFLICT]）。`
+            + `\n用 run_cmd 先弄清它是什么：\`ls -l\` 看属主权限、\`file\` 看类型、`
+            + `\`wc -c\` 看大小、\`iconv -f gbk -t utf-8\` 转编码。` };
+        }
         if (!existed) {
           res.className = "atc-result atc-result--err";
           res.textContent = "文件不存在";
@@ -54951,8 +54979,22 @@ async function _executeToolStepInner(step, call, root, run) {
       _setToolStepResolvedPath(step, fp);
       let old = "";
       try { old = await backend.readTextFile(fp); }
-      catch {
-        res.className = "atc-result atc-result--err"; res.textContent = "文件不存在";
+      catch (e) {
+        // 「读不出来」不等于「不存在」。GBK/Latin-1 的遗留源码、>5MB、二进制、root 属主、
+        // 路径其实是目录 —— 这五种确实存在，却一律被说成「文件不存在。新建文件请用
+        // write_file」：而 write_file 会撞 [CONFLICT] file was created by another task。
+        // 两条路都是死的，没有一句话是真的。判据用仓库现成的 _isMissingFileError。
+        const _msg = String(e && e.message || e || "");
+        res.className = "atc-result atc-result--err";
+        if (!_isMissingFileError(_msg)) {
+          res.textContent = "读不了";
+          return { type: "multiedit", path: call.path, content:
+            `[ERROR/UNREADABLE] 这条路径读不出来: ${call.path}（${_msg.slice(0, 200)}）。`
+            + `\n这不是路径问题，别改用 write_file（会撞 [CONFLICT]），也别再 find_files。`
+            + `\n要弄清它到底是什么，用 run_cmd：\`ls -l\` 看属主权限、\`file\` 看类型、`
+            + `\`wc -c\` 看大小、\`iconv -f gbk -t utf-8\` 转编码、\`sed -n\` 按行取。` };
+        }
+        res.textContent = "文件不存在";
         return { type: "multiedit", path: call.path, content: `[ERROR] 文件不存在: ${call.path}。新建文件请用 write_file。` };
       }
       if (_openFileWriteConflict(fp)) {
@@ -56655,7 +56697,19 @@ async function _executeToolStepInner(step, call, root, run) {
       _setToolStepResolvedPath(step, fp);
       let old = "";
       try { old = await backend.readTextFile(fp); }
-      catch { res.className = "atc-result atc-result--err"; res.textContent = "文件不存在"; return { type: "format", path: rel, content: `[ERROR] 文件不存在: ${rel}` }; }
+      catch (e) {
+        // 同 multi_edit：「读不出来」不等于「不存在」。
+        const _msg = String(e && e.message || e || "");
+        res.className = "atc-result atc-result--err";
+        if (!_isMissingFileError(_msg)) {
+          res.textContent = "读不了";
+          return { type: "format", path: rel, content:
+            `[ERROR/UNREADABLE] 这条路径读不出来: ${rel}（${_msg.slice(0, 200)}）。`
+            + `\n这不是路径问题。用 run_cmd 的 \`ls -l\` / \`file\` / \`wc -c\` 先弄清它是什么。` };
+        }
+        res.textContent = "文件不存在";
+        return { type: "format", path: rel, content: `[ERROR] 文件不存在: ${rel}。` };
+      }
       if (_openFileWriteConflict(fp)) {
         res.className = "atc-result atc-result--blocked"; res.textContent = "⛔ 编辑器有未保存内容";
         return { type: "format", path: fp, content: `[CONFLICT] ${fp} 在编辑器里有尚未保存的用户改动，已阻止格式化，未写盘。` };

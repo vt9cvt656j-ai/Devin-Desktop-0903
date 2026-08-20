@@ -22020,8 +22020,17 @@ test("existing-file writes ignore the legacy read gate and retain objective conf
   const inner = extractFn("_executeToolStepInner");
   assert.doesNotMatch(inner, /_writeGateBypass\(|const hasCurrentRead =|if \(run && !hasCurrentRead\)/,
     "the executor must not ask a conversational ledger for write permission");
-  assert.match(inner, /try \{ old = await backend\.readTextFile\(fp\); existed = true; \} catch \{\}/,
+  // 仍然是「现读磁盘取基线」，只是 catch 不再把原因吞掉（读不出来 ≠ 文件不存在）。
+  assert.match(inner, /try \{ old = await backend\.readTextFile\(fp\); existed = true; \}/,
     "whole write and edit rebase on the current disk bytes");
+  assert.match(inner, /catch \(e\) \{ readErr = String\(e && e\.message \|\| e \|\| ""\); \}/,
+    "读失败的原因又被吞掉了 —— 「读不出来」会重新被说成「文件不存在」");
+  // **catch 里绝不许碰 existed**：写盘的 CAS 拿 existed ? old : null 当基线，
+  // 翻成 true 就是拿空串去比对，比对一放宽就能把一个 6MB 的 .db 截成 0 字节。
+  const _catchAt = inner.indexOf('catch (e) { readErr =');
+  assert.ok(_catchAt > 0);
+  assert.doesNotMatch(inner.slice(_catchAt, _catchAt + 120), /existed\s*=/,
+    "在读失败的 catch 里改了 existed —— 会让 CAS 拿空基线去比对");
   assert.match(inner, /_openFileWriteConflict\(fp\)/,
     "unsaved editor content remains an objective conflict");
   assert.match(inner, /writeTextFileIfUnchanged\(fp, existed \? old : null, newContent\)/,
@@ -30912,4 +30921,48 @@ test("生图模型白名单认得住主流生成模型，也别把「看图」�
   assert.equal(pick(["gpt-4o", "claude-opus-5"]), "", "没有生图模型时必须照旧拒绝");
   assert.equal(pick(["gpt-4o-image-understanding", "qwen-vl-image"]), "",
     "把「看图」模型当成能画图的了 —— 真被选中会三端点依次撞墙、熬满超时");
+});
+
+// ---- 「读不出来」不等于「文件不存在」 ----
+//
+// GBK/Latin-1 的遗留源码、>5MB、二进制、root 属主、路径其实是目录 —— 这五种确实存在，
+// 却被 read_file / edit_file / multi_edit / format_file 一律说成「文件不存在」。
+// edit 还附一份「项目里有 1 个同名文件」的清单（里面就是这个文件自己）让模型先 read 它，
+// 而 read 会再给一次同样的话；multi_edit 让模型改用 write_file，撞 [CONFLICT]。
+// 两条路都是死的，没有一句话是真的。后端本来**专门**造了六种有区分度的错误串，全被抹平。
+test("五种「存在但读不了」不许被说成文件不存在", () => {
+  const isMissing = load("_isMissingFileError");
+  const cases = [
+    ["No such file or directory (os error 2)", true, "真的不存在"],
+    ["file is not valid UTF-8: assets/legacy.c", false, "非 UTF-8 的遗留源码"],
+    ["没有读取权限: /etc/shadow", false, "没有读权限"],
+    ["file too large (> 5 MB): dist/app.asar", false, "太大"],
+    ["binary file, refusing to read as text", false, "二进制"],
+    // os error 21 是「其实是目录」。判据里那个 `os error 2` 不加词边界会把 21 也吃掉。
+    ["Is a directory (os error 21)", false, "路径其实是目录"],
+  ];
+  for (const [msg, want, name] of cases) {
+    assert.equal(isMissing(msg), want, `${name}：${msg}`);
+  }
+
+  // 四个站点都要按这个判据分流，而且错误码必须含 ERROR（失败识别器认的是那张枚举，
+  // 自造一个 [UNREADABLE] 会让失败被算成成功，比原来的 bug 更糟）。
+  const failMatch = load("_toolFailureMatch");
+  assert.ok(failMatch("[ERROR/UNREADABLE] 这条路径读不出来: a.c"), "错误码不被失败识别器认得");
+  assert.equal((SRC.match(/\[ERROR\/UNREADABLE\]/g) || []).length >= 4, true,
+    "四个站点（read / edit / multi_edit / format）没有都改到 —— 漏一个就还是死胡同");
+  // 光有字符串不算数：分流条件必须真的在（包一层 if (false) 照样能让上面那条过）。
+  assert.match(SRC, /if \(!existed && readErr && !_isMissingFileError\(readErr\)\) \{/,
+    "edit 的「读不了」分支被条件包住或删了 —— 又会掉回「文件不存在」那条死路");
+  // multi_edit 和 format 各一处，按判据分流。数出现次数，别按 indexOf 取窗（那会命中
+  // 别的返回点，窗口对不上，变成假红）。
+  assert.equal((SRC.match(/!_isMissingFileError\(_msg\)/g) || []).length, 2,
+    "multi_edit / format 没有都按判据分流 —— 漏一个，读不了就仍然会被说成文件不存在");
+  // read_file 的「读不了」判据要认得非 UTF-8 和没权限。
+  const readSrc = SRC.slice(SRC.indexOf("const unreadableMatches = []"));
+  assert.match(readSrc.slice(0, 2000), /not valid UTF-8\|没有读取权限/,
+    "read_file 仍然把非 UTF-8 / 没权限当成「找不到」");
+  // 三处新分支都必须明确否掉 write_file 这条死路。
+  assert.ok((SRC.match(/别改用 write_file|别再 find_files/g) || []).length >= 2,
+    "没告诉模型别走那两条死路");
 });
