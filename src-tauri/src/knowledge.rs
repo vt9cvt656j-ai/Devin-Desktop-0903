@@ -6395,6 +6395,30 @@ mod infoq_shell_page_tests {
         assert!(any_hit_matches_query("rust async", &slug_only));
     }
 
+    /// 核对不了就放行，但「放行」不能顺手把结果也漏出去：这条钉住 infoq_search
+    /// 真的走了核对这一步，而不是只把函数写在那儿。
+    #[test]
+    fn the_check_is_actually_wired_into_infoq_search() {
+        let src = include_str!("knowledge.rs");
+        let body = src
+            .split("pub async fn infoq_search(")
+            .nth(1)
+            .and_then(|s| s.split("\n#[cfg(test)]").next())
+            .expect("infoq_search 的函数体不见了");
+        assert!(
+            body.contains("if !any_hit_matches_query(&query, &hits)"),
+            "核对函数写了却没接上 —— 首页文章照样顶着「for '<查询词>'」交出去"
+        );
+        assert!(
+            body.contains("search_status: unusable"),
+            "核对不过时没有据实报状态"
+        );
+        assert!(
+            body.contains("web_search") && body.contains("site:infoq.com"),
+            "没给能用的替代路，模型只会换个词再搜一次"
+        );
+    }
+
     /// 查询词太短、切不出 >=3 的词时不能冤枉它——没法核对就放行。
     #[test]
     fn short_queries_are_not_punished() {
