@@ -132,7 +132,11 @@ test("回答质量模块要管「怎么说话」，不只管「说什么」", ()
   for (const [pattern, why] of [
     [/Open by restating the request/, "复述用户的问题当开场"],
     [/As an AI/, "「作为AI」这类套话"],
-    [/Anything else you'd like me to do/, "机械追问「还需要我做什么」"],
+    // 措辞收短了（和「验证状态尾巴」合并成一条仪式化结尾），点名的属性没变。
+    [/Anything else\?/, "机械追问「还需要我做什么」"],
+    // 用户 2026-08-20 逐条点名要禁的：免责一句 + 推荐一条命令 + 一个选项菜单式反问。
+    // 完整原文和理由在 ide/AGENTS.md 的「说话黑名单」一节（那里每轮零成本）。
+    [/verification-status footer/, "验证状态尾巴"],
     [/reads as translated English/, "中文翻译腔"],
     [/Summarise what you just said/, "总结自己刚说过的话"],
   ]) {
