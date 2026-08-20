@@ -22862,7 +22862,6 @@ async function _runMichaelDesignPreflight({ run, body = null, isLive = () => tru
   }
 
   const researchPlan = _michaelDesignResearchPlan(run._originalText || "", profile);
-  run._michaelDesignPreflight = { status: "running", researchPlan, startedAt: Date.now() };
 
   const searches = researchPlan.map(async (plan) => {
     if (!isLive()) return null;
@@ -22899,13 +22898,6 @@ async function _runMichaelDesignPreflight({ run, body = null, isLive = () => tru
   const evidence = run._michaelDesignEvidence || null;
   const brief = _michaelDesignBrief(researchPlan, evidence, results, profile);
   const hitCount = results.filter((item) => item.evidence).length;
-  run._michaelDesignPreflight = {
-    status: hitCount ? "complete" : "unavailable",
-    researchPlan,
-    results: results.map((item) => ({ id: item.plan.id, hitCount: item.evidence?.hitCount || 0, error: !item.evidence })),
-    completedAt: Date.now(),
-  };
-  run._michaelDesignBrief = brief;
   return { required: true, brief, results, evidence };
 }
 
@@ -37171,10 +37163,7 @@ function _implementationMutationGroundingIssue(run, call, root = "") {
       || profile.uiProject || profile.bug || profile.debugProject)) return "";
   const currentRoot = root || call?._runRoot || run.root || "";
   if (_runRootConfirmedEmptyForImplementation(run, currentRoot)) return "";
-  if (_runHasImplementationGrounding(run, currentRoot)) {
-    run._implementationGrounded = true;
-    return "";
-  }
+  if (_runHasImplementationGrounding(run, currentRoot)) return "";
   return "[BLOCKED_IMPLEMENTATION_GROUNDING] 当前项目不是已确认的空目录，但本轮还没有读取真实项目结构、源码或诊断。先用 list_dir/find_files 定位，再 read_file 读取相关入口/调用方（或 get_diagnostics/find_symbol 取得真实证据），拿到结果后的下一轮再写入。不要凭文件名和旧对话猜技术栈，也不要用 shell 绕过。";
 }
 
@@ -47474,8 +47463,7 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
     // is short-circuited. Only trust the snapshot if nothing mutated while we waited.
     const _emptyProbeTick = run._fsMutTick || 0;
     const _emptyProbeRoot = _normalizeFsPath(root).replace(/\/+$/, "");
-    run._emptyRootProbePending = true;
-    run._emptyRootProbe = Promise.resolve().then(() => backend.readDir(root))
+    void Promise.resolve().then(() => backend.readDir(root))
       .then((entries) => {
         if (run._didMutate || (run._fsMutTick || 0) !== _emptyProbeTick) return;
         if (Array.isArray(entries)) {
@@ -47490,8 +47478,7 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
           }
         }
       })
-      .catch(() => {})
-      .finally(() => { run._emptyRootProbePending = false; });
+      .catch(() => {});
   }
   // Keep the complete registry and MCP routing state on the run. Only the per-turn model payload
   // is windowed; search_tools/direct-by-name can swap an omitted schema into that bounded window.
@@ -47617,7 +47604,6 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
   let _uiVerifiedAtImplOps = -1, uiVerifyNudges = 0, _browserViewportKind = "";
   // UI verification phase machine: 'idle' | 'running' | 'completed'. Prevent reset-on-mutation loops by only clearing nudges on first entry into running.
   let _uiVerifyPhase = "idle", _uiVerifyTotal = 0;
-  let _uiDeliveryAuditedAtImplOps = -1, uiDeliveryAuditRuns = 0, uiDeliveryAuditNudges = 0;
   let _uiFreshNavigated = false, _uiActionPassed = false, _uiInteractionPassed = false;
   const _uiPassedViewports = new Set();
   const _uiInteractionViewports = new Set();
@@ -47685,7 +47671,6 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
   const _emptyBuildIntent = () => !!(run.engineering && (run.engineering.substantial || run.engineering.projectScope
     || run.engineering.fromZeroUiProject || run.engineering.uiProject || run.engineering.fullWebsite || run.engineering.implementation));
   run._emptyBuildNudges = 0;        // 行动催促次数（整 run 上限 2，防死循环）
-  run._emptyBuildIntercepted = false; // 收尾拦截只拦 1 次，第二次放行走既有诚实收尾约束
   run._emptyExploreCount = 0;       // 空目录探索计数：第 1 次 list/纯探索命令放行取证，第 2 次起机制层短路（_emptyExploreSkipMessage）
   const _quick = () => task.trim().length < 80 && !run.engineering?.applies && !_mustUseWorkspaceToolsNow();
   const _pad = { goal: (task || "").slice(0, 200), requirements: run._requirementsChecklist, modified: new Map(), errors: [], findings: [] };  // done[] retired: the plan lane renders run._planSteps directly
@@ -50068,8 +50053,6 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
               _uiActionPassed = false;
               _uiInteractionPassed = false;
               _uiInteractionViewports.clear();
-              _uiDeliveryAuditedAtImplOps = -1;
-              run._uiDeliveryAuditUnresolved = [];
               // Reset nudge counter and phase on verified completion → next mutation re-arms
               if (_hadVerifiedUi) {
                 uiVerifyNudges = 0;
@@ -50136,8 +50119,6 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
             _uiActionPassed = false;
             _uiInteractionPassed = false;
             _uiInteractionViewports.clear();
-            _uiDeliveryAuditedAtImplOps = -1;
-            run._uiDeliveryAuditUnresolved = [];
             // Reset nudge counter and phase on verified completion → next mutation re-arms
             if (_hadVerifiedUi) {
               uiVerifyNudges = 0;
@@ -57018,7 +56999,6 @@ return { type: call.type, path: call.query || "", content: `[失败] ${call.type
         if (run) {
           run._captureStarted = true;
           run._captureMode = captureMode.mode;
-          run._capturePort = port;
           run._captureBrowserReady = false;
         }
         let sys = "";

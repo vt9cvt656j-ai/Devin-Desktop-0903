@@ -10017,7 +10017,10 @@ test("michael-design runs in the background and is injected only at loop boundar
   assert.match(SRC, /domain: "michael-design", query: plan\.query, topK: 6/);
   assert.match(SRC, /await _searchKnowledgeBase\(call\)/);
   assert.match(SRC, /run\._michaelDesignEvidence = _mergeMichaelDesignEvidence/);
-  assert.match(SRC, /run\._michaelDesignBrief = brief/);
+  // 简报的**真实载体**是这个函数的返回值——下面那条钉着 `_ORCH_NOTE + preflight.brief`
+  // 被真正消费。原来这里钉的是 `run._michaelDesignBrief = brief`：一份写完没人读的副本，
+  // 它唯一的作用就是让这条断言有东西可匹配（副本已删）。
+  assert.match(SRC, /return \{ required: true, brief, results, evidence \};/);
   const loop = extractFn("_runAgenticLoop");
   assert.match(loop, /const _consumeMichaelDesignPreflight = \(\) =>/);
   assert.match(loop, /const preflight = run\._michaelDesignPreflightResult/);

@@ -292,10 +292,21 @@ test("decision functions have their verdict consumed, not discarded", () => {
 // follow. Fixing them all today would be a large unrelated change; letting the set GROW is
 // how the next `_diagnosticBlock` gets in. So: the list may shrink freely, never grow.
 // Names are stored WITHOUT the leading underscore: the capture group starts after `run._`.
+// 2026-08-20：这份存量从 11 缩到 2。缩掉的九个分两类——
+//   · 七个是**写完没人读的记账**，已连同写入点一并删除：michaelDesignPreflight /
+//     michaelDesignBrief（真实载体是函数返回值 preflight.brief）、implementationGrounded、
+//     emptyRootProbe + emptyRootProbePending（探测按注释是**刻意**发射后不管的，
+//     那两个句柄从没人 await / 检查）、emptyBuildIntercepted（它那句注释描述的
+//     「收尾只拦 1 次」机制根本不存在）、capturePort（模块级 _capturePort 才是真在用的）、
+//     uiDeliveryAuditUnresolved（整套「界面交付审计」只有账本没有主体：三个计数器里两个
+//     全仓再无第二次出现，未决清单只被清空、从不装东西）。
+//   · compactedThisTurn 早就被接上了（读点在主循环的中途小结判据里），只是名单没跟着缩。
+// 剩下这两个是**通过局部别名读的**，文本扫描跟不上，不是债：
 const KNOWN_WRITE_ONLY = new Set([
-  "michaelDesignPreflight", "michaelDesignBrief", "implementationGrounded", "compactedThisTurn",
-  "emptyRootProbePending", "emptyRootProbe", "researchEvidence", "emptyBuildIntercepted",
-  "toolRoutingState", "uiDeliveryAuditUnresolved", "capturePort",
+  // run._researchEvidence = _researchEvidence，取证门读的是那个局部量
+  "researchEvidence",
+  // run._toolRoutingState = _toolRoutingState，路由逻辑读的是那个局部量
+  "toolRoutingState",
 ]);
 
 // 「读」的定义要经得起两种伪装，否则一个死账本能一直挂着不被发现：
