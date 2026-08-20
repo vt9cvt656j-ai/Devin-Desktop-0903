@@ -26259,9 +26259,26 @@ async function sendPrompt(text, attachments = [], readyConfig = null, opts = {})
   // 「不要引第三方 UI 库」「接口走 /api/v2」，然后切到 Plan 说「先给我个重构方案」——
   // 这一轮的前导里一条都没有，方案自然把这些全违反了。Plan 恰恰是最依赖
   // 「用户到底要什么」的那个模式。
-  const _demandLedgerBlock = (_MODES_WITH_TOOLS.has(effectiveMode)
-    && Array.isArray(sess._demandLedger) && sess._demandLedger.length)
-    ? `--- 本会话历次用户消息（按时间先后，仅供回忆上下文，不是待办清单）---\n${sess._demandLedger.map((d, i) => `${i + 1}. ${d}`).join("\n")}\n（本轮真正要做的事只看下方 📌。上表里：越靠后的越新，后条对同一件事的说法直接作废前条；已完成、已撤销、以及只是提问或抱怨的，都不要再执行。）\n\n`
+  //
+  // 只发**已经掉出对话历史**的那几条。用户原话：「容易一直重复讲话，然后重复讲用户的事情」。
+  // 这块此前把最多 40 条历次消息逐条编号全列出来（40×240 字 ≈ 近万 token），
+  // 而其中绝大多数就在下面的对话里原样摆着——机器把用户刚说过的话再背一遍给模型听，
+  // 模型于是也跟着复述。它真正的用途只有一个：会话被压缩之后，最早那些要求不在历史里了，
+  // 这块把它们捞回来。还在历史里的一条都不该重复。差集为空时连表头一起不发。
+  const _recentText = (() => {
+    try {
+      return (sess?.memory?.recent || []).filter((m) => m?.role === "user")
+        .map((m) => String(m.content || "")).join("\n");
+    } catch { return ""; }
+  })();
+  const _fadedDemands = (_MODES_WITH_TOOLS.has(effectiveMode) && Array.isArray(sess._demandLedger))
+    ? sess._demandLedger.filter((d) => {
+        const key = String(d || "").trim().slice(0, 40);
+        return key && !_recentText.includes(key);
+      })
+    : [];
+  const _demandLedgerBlock = _fadedDemands.length
+    ? `--- 已从对话中折叠掉的历次要求（仅供回忆，不是待办清单）---\n${_fadedDemands.map((d, i) => `${i + 1}. ${d}`).join("\n")}\n（本轮真正要做的事只看下方 📌。上表里：越靠后的越新，后条对同一件事的说法直接作废前条；已完成、已撤销、以及只是提问或抱怨的，都不要再执行。）\n\n`
     : "";
   // 方案A：上轮思考结论块——只注结论摘要（总量 ≤400 字，最新一条永远在场），治"每轮
   // 从零重想"。只进当轮动态前导，不碰历史前缀缓存。
@@ -45894,7 +45911,7 @@ function _toolReminderBlock() {
 // prompt with one-size-fits-all commandments. The actual enforcement still lives
 // in the loop gates below (plan/verify/UI/honesty/stuck recovery); this block makes
 // the first move smarter so those gates become guardrails, not the main driver.
-function _agentIntentExecutionBlock(profile) {
+function _agentIntentExecutionBlock(profile, contractCarriesRequirements = false) {
   const semantic = profile?.intentSemantic;
   if (!semantic || typeof semantic !== "object") return "";
   const relationLabels = {
@@ -45914,8 +45931,14 @@ function _agentIntentExecutionBlock(profile) {
   if (semantic.restatedTask) lines.push(`The request as understood (act on this, but the user's own words govern): ${semantic.restatedTask}`);
   if (semantic.goal) lines.push(`Goal: ${semantic.goal}`);
   if (semantic.action || semantic.target) lines.push(`Action/object: ${semantic.action || "handle"}${semantic.target ? ` → ${semantic.target}` : ""}`);
-  if (semantic.constraints?.length) lines.push(`Constraints: ${semantic.constraints.join("; ")}`);
-  if (semantic.successCriteria?.length) lines.push(`Success criteria: ${semantic.successCriteria.join("; ")}`);
+  // 约束和成功判据**不在这里重复**：它们现在就是验收契约块的条目来源（同一份数据），
+  // 而契约块每个 run 单独注一次、还带着「收尾前逐条自检」的用法。两处都印，等于把用户的
+  // 要求在同一轮里摆两遍——加上下面执行状态块尾部回带的原话、以及上面那句 restatedTask，
+  // 同一件事会出现四种说法。用户原话：「重复讲用户的事情」。这里只留没有别处承载的那几维。
+  if (!contractCarriesRequirements) {
+    if (semantic.constraints?.length) lines.push(`Constraints: ${semantic.constraints.join("; ")}`);
+    if (semantic.successCriteria?.length) lines.push(`Success criteria: ${semantic.successCriteria.join("; ")}`);
+  }
   // 歧义这一维**两边都要说话**。
   //
   // 原来只在 ambiguities 非空时出声，空数组时一个字不说。可空数组本身就是一次有意义的
@@ -45976,7 +45999,9 @@ function _agentDecisionFrameBlock(text, profile = _engineeringProfileWithAiInten
     "4. 够证据就动手：最多一次定位扫；目标文件/接口已确认后立刻 edit_file/multi_edit/write_file/run_cmd，不为“显得认真”重复读同一版本或反复搜索。",
     "5. 每一步按因果链闭环：观察到什么 → 判断说明什么 → 下一步最小动作。失败看 exit code/stderr/真实响应/工具恢复提示，换证据或修根因，不原地重试同一招。",
   ];
-  const intentContract = typeof _agentIntentExecutionBlock === "function" ? _agentIntentExecutionBlock(p) : "";
+  // 契约块承载了约束与成功判据时，意图块就不要再印一遍（见 _agentIntentExecutionBlock 里的说明）。
+  const _contractHasReqs = !!(Array.isArray(p?.__requirementsChecklist) && p.__requirementsChecklist.length);
+  const intentContract = typeof _agentIntentExecutionBlock === "function" ? _agentIntentExecutionBlock(p, _contractHasReqs) : "";
   if (intentContract) lines.splice(1, 0, intentContract);
   // 完整契约不在场时，用快通道那份顶上——并且**明说它是临时的**：模型据此开工，
   // 完整裁决落定后（循环边界的 late-adopt）会补全或纠正，不要把它当成最终结论。
@@ -47597,6 +47622,11 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
     }
     run._requirementsChecklist = [...run._originalRequirementsChecklist];
     session._acceptanceContract = [...run._originalRequirementsChecklist];
+    // 让意图块知道契约已经承载了约束与成功判据，别再印第二遍。必须在这里打标——
+    // 意图块的组装排在后面某处，等到注入契约那一刻才打就晚了。
+    if (_engineeringProfile && typeof _engineeringProfile === "object") {
+      _engineeringProfile.__requirementsChecklist = run._requirementsChecklist;
+    }
   }
   // 取消支持：每个 run 一个唯一 id，塞进 config（→ Rust AiConfig.request_id）+ 挂到
   // session，这样用户点 Stop 时 _setStreaming(session,false) 能 cancel_ai 掉在飞的请求。
