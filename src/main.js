@@ -45898,8 +45898,29 @@ const _EPISODE_STORE = "memory-episodes.json";
 const _EP_STOP = new Set(["the","a","an","to","of","in","on","for","and","or","is","it","this","that","with","my","me","please","help","我","你","的","了","把","给","帮","一下","一个","这个","那个","请","让","和","与","怎么","如何","需要","想","要","现在","然后","看看","就是","可以"]);
 function _epKey(root) { return "michael-ide.episodes:" + (root || "_global"); }
 function _epLoad(root) { try { return JSON.parse(localStorage.getItem(_epKey(root)) || "[]") || []; } catch { return []; } }
+// 滚出热区的 episode 不再直接丢掉，先进档案。
+//
+// 真正值钱的模式全是跨几百轮才显形的（「这个项目每次改路由都忘了改测试」「用 sed 改 JSON
+// 必失败，用 node 一次就过」）——它们在单轮里是噪声，在两百轮里才是信号。热区只有 120 条、
+// 超了就扔，结构上就看不见这一层。档案是离线通道的原料。
+const _EP_ARCHIVE_CAP = 2000;
+function _epArchiveKey(root) { return "michael-ide.ep-archive:" + (root || "_global"); }
+function _epArchiveLoad(root) {
+  try { return JSON.parse(localStorage.getItem(_epArchiveKey(root)) || "[]") || []; } catch { return []; }
+}
+function _epArchivePush(root, evicted) {
+  if (!Array.isArray(evicted) || !evicted.length) return;
+  try {
+    let arc = _epArchiveLoad(root).concat(evicted);
+    if (arc.length > _EP_ARCHIVE_CAP) arc = arc.slice(-_EP_ARCHIVE_CAP);
+    localStorage.setItem(_epArchiveKey(root), JSON.stringify(arc));
+    if (inTauri) (async () => {
+      try { const st = await loadStore(_EPISODE_STORE); await st.set("arc:" + (root || "_global"), arc); await st.save(); } catch {}
+    })();
+  } catch (e) { console.warn("[ep] archive failed:", e); }
+}
 function _epSave(root, eps) {
-  if (eps.length > 120) eps = eps.slice(-120);
+  if (eps.length > 120) { _epArchivePush(root, eps.slice(0, eps.length - 120)); eps = eps.slice(-120); }
   try { localStorage.setItem(_epKey(root), JSON.stringify(eps)); } catch (e) { console.warn("[ep] local save failed:", e); }
   if (inTauri) (async () => { try { const s = await loadStore(_EPISODE_STORE); await s.set("ep:" + (root || "_global"), eps); await s.save(); } catch (e) { console.warn("[ep] file mirror failed:", e); } })();
 }
@@ -45975,6 +45996,79 @@ function _reworkRate(root, n = 30) {
     const reworked = eps.filter((e) => e.reworkedAt).length;
     return { total: eps.length, reworked, rate: reworked / eps.length };
   } catch { return null; }
+}
+// ── 离线通道 ─────────────────────────────────────────────────────────────
+// 现在所有学习都被压在一轮之内，而且压在「不能拖慢首字」这个预算里：收尾那次蒸馏只有一次
+// 模型调用、几秒超时、输出限死一句。一句话能装下的只有结论，装不下事实。更要命的是样本量
+// ——热区 120 条，超了就扔。
+//
+// 而真正值钱的模式全是跨几百轮才显形的：
+//   · 「这个项目每次改路由都会忘了改测试」
+//   · 「用 sed 改这个项目的 JSON 必失败，用 node 一次就过」
+//   · 「用户说『简单点』之后，返工大多来自我又加了一层抽象」
+// 这三条在单轮里都是噪声，在两百轮里都是信号。轮内学习**结构上**看不见它们 —— 不是没做好，
+// 是没有那个视野。这条通道就是补这个视野：攒档案 → 隔一阵批量看一次 → 结论落进长期记忆，
+// 由已有的检索路径（_kgRetrieveBlock）在相关时自己捞回来。
+//
+// 三条约束：
+//   · **不进前台**：fire-and-forget，任何异常都不许冒泡到这一轮的收尾。
+//   · **不常跑**：攒够 _DISTILL_EVERY 条新记录才跑一次，一次一个模型调用。
+//   · **只写事实**：每条结论必须带「几次里出现过几次」，禁止「建议加强测试」这类空话——
+//     形容词对模型基本无效，能用的是「这个项目最近 12 次改 router 里有 9 次没跟着改测试」。
+const _DISTILL_EVERY = 40;
+function _distillMarkKey(root) { return "michael-ide.ep-distill-at:" + (root || "_global"); }
+function _distillDigest(root) {
+  const all = _epArchiveLoad(root).concat(_epLoad(root));
+  return all.slice(-240).map((e) => {
+    const tag = e.outcome === "failed" ? "✗" : e.outcome === "partial" ? "△" : "✓";
+    const files = (e.files || []).slice(0, 4).join(",");
+    return `${tag} ${String(e.task || "").slice(0, 70)}`
+      + (files ? ` | 改:${files}` : " | 未改文件")
+      + (e.reworkedAt ? " | 用户随后又提了同一件事" : "")
+      + (e.insight ? ` | 当时小结:${String(e.insight).slice(0, 60)}` : "");
+  }).join("\n");
+}
+async function _offlineDistillIfDue(root, config) {
+  try {
+    if (!config || !config.baseUrl || !config.apiKey) return;
+    if (window._distillRunning) return;
+    const total = _epArchiveLoad(root).length + _epLoad(root).length;
+    const last = Number(localStorage.getItem(_distillMarkKey(root)) || 0);
+    if (total - last < _DISTILL_EVERY) return;
+    window._distillRunning = true;
+    localStorage.setItem(_distillMarkKey(root), String(total)); // 先记账：失败也不要重试风暴
+    const digest = _distillDigest(root);
+    if (!digest.trim()) return;
+    const sys = "你在读一个开发者 IDE 的历史运行记录，任务是找出**跨很多轮才看得出来**的规律。"
+      + "只输出严格 JSON：{\"lessons\":[{\"fact\":\"...\",\"support\":\"N 次中 M 次\"}]}，最多 5 条，可以是空数组。"
+      + "硬要求："
+      + "① 每条必须是**这个项目的具体事实**，带得出数（几次里几次）。"
+      + "② 禁止空话：「建议加强测试」「注意代码质量」这类一条都不要，宁可返回空数组。"
+      + "③ 只写单轮里看不出来、要攒很多轮才显形的规律；单轮就能发现的不写。"
+      + "④ 每条 ≤80 字，写成下次能直接照做的说法。";
+    const user = `历史运行记录（每行一轮，✓/△/✗ 是收尾状态，不代表活干成了）：\n${digest}`;
+    const ctrl = typeof AbortController !== "undefined" ? new AbortController() : null;
+    const to = ctrl ? setTimeout(() => ctrl.abort(), 40000) : null;
+    const text = await _fetchCompletionText(_chatCompletionsUrl(config.baseUrl), {
+      "Content-Type": "application/json",
+      Authorization: "Bearer " + (config.apiKey || ""),
+      "x-ide-request-id": String(config.requestId || "").slice(0, 128),
+    }, { model: config.model, messages: [{ role: "system", content: sys }, { role: "user", content: user }], max_tokens: 800 },
+      ctrl ? ctrl.signal : undefined);
+    if (to) clearTimeout(to);
+    const j = _safeJsonLoose(text || "");
+    const lessons = Array.isArray(j?.lessons) ? j.lessons : [];
+    let written = 0;
+    for (const l of lessons.slice(0, 5)) {
+      const fact = String(l?.fact || "").trim();
+      if (fact.length < 8) continue; // 太短的多半是空话
+      const support = String(l?.support || "").trim();
+      _kgAddNoteRecord(root, `〔跨轮规律〕${fact}${support ? `（${support}）` : ""}`, true);
+      written++;
+    }
+    if (written) console.log(`[distill] 从 ${total} 条运行记录里沉淀了 ${written} 条跨轮规律`);
+  } catch (e) { console.warn("[distill] skipped:", e?.message || e); }
+  finally { try { window._distillRunning = false; } catch {} }
 }
 function _retrieveEpisodes(task, root, k) {
   const eps = _epLoad(root); if (!eps.length) return [];
@@ -50529,6 +50623,9 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
       // Reflection therefore cannot delay first-token or live output latency.
       // 传身份根，不传会漂的 root —— 否则写进去的经验读取那侧永远取不回来（见函数头注释）。
       try { await _recordEpisode(run, task, memoryRoot || root, _runOutcome, config, session); } catch {}
+      // 离线通道：攒够一批就在后台批量看一次历史，沉淀跨轮规律。不 await——它跟这一轮的
+      // 交付无关，任何异常都不许冒泡进收尾。
+      try { void _offlineDistillIfDue(memoryRoot || root, config); } catch {}
       // on_run_end hook（fire-and-forget）：工作区可在运行结束时挂通知/清理命令。
       _fireHooks(root, "on_run_end", { tool: "run_end", outcome: _runOutcome, task: String(task).slice(0, 200), files: [...(_mutatedFiles || [])].slice(0, 20) }).catch(() => {});
     }

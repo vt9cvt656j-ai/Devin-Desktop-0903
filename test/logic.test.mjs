@@ -29781,3 +29781,62 @@ test("返工率按执行事实算，不需要谁打分", () => {
   assert.match(journal, /\+ rrLine/, "算出来了却没拼进输出");
   assert.match(journal, /rr\.reworked > 0/, "没有返工时也要说一句，那是噪音");
 });
+
+// ---- 离线通道：跨几百轮才显形的规律，轮内学习结构上看不见 ----
+//
+// 收尾那次蒸馏只有一次模型调用、几秒超时、输出限死一句；热区只存 120 条，超了就扔。
+// 「这个项目每次改路由都忘了改测试」这种规律在单轮里是噪声，在两百轮里才是信号。
+test("滚出热区的运行记录进档案，不再直接丢掉", () => {
+  const src = extractFn("_epSave");
+  assert.match(src, /_epArchivePush\(root, eps\.slice\(0, eps\.length - 120\)\)/,
+    "超出热区的记录还是被直接扔了 —— 离线通道就没有原料");
+  const push = extractFn("_epArchivePush");
+  assert.match(push, /slice\(-_EP_ARCHIVE_CAP\)/, "档案没有上限，会无限涨");
+  assert.ok(loadConst("_EP_ARCHIVE_CAP") >= 1000,
+    "档案上限太小 —— 跨轮规律要几百轮才显形，存不下就白搭");
+});
+
+test("离线蒸馏：不进前台、不常跑、只写带得出数的事实", () => {
+  const src = extractFn("_offlineDistillIfDue");
+  // 不常跑：攒够一批才跑一次，而且先记账再干活（失败也不许变成重试风暴）。
+  assert.match(src, /total - last < _DISTILL_EVERY/, "没有攒批闸门，会每轮都发一次模型调用");
+  assert.ok(loadConst("_DISTILL_EVERY") >= 20, "攒批阈值太小，成本会失控");
+  const markAt = src.indexOf("localStorage.setItem(_distillMarkKey(root)");
+  const fetchAt = src.indexOf("_fetchCompletionText");
+  assert.ok(markAt > 0 && fetchAt > 0 && markAt < fetchAt,
+    "要先记账再发请求 —— 否则失败一次就会每轮重试，变成重试风暴");
+  // 不重入。
+  // 认的是**那道闸本身**，不是这个名字出现过 —— finally 里的复位赋值也含这个名字，
+  // 按名字断言会被它自己喂到（这个仓库栽过不止一次）。
+  assert.match(src, /if \(window\._distillRunning\) return;/,
+    "没有并发闸，两轮同时结束会重复发请求");
+  const setAt = src.indexOf("window._distillRunning = true;");
+  assert.ok(setAt > 0 && setAt < src.indexOf("_fetchCompletionText"),
+    "并发标志要在发请求之前置位，否则闸门形同虚设");
+  // 只写事实：提示词里必须明令禁止空话，并要求带支持次数。
+  assert.match(src, /禁止空话/, "没禁空话 —— 「建议加强测试」这种对模型基本无效");
+  assert.match(src, /support/, "没要求给出支持次数，就无法分辨规律和臆测");
+  // 落点要走已有的长期记忆路径，别另造一套没人读的存储。
+  assert.match(src, /_kgAddNoteRecord\(root, `〔跨轮规律〕/,
+    "结论没落进长期记忆 —— 又会变成一条算了没人读的线");
+
+  // 不进前台：调用点不许 await，异常不许冒泡。
+  const loop = extractFn("_runAgenticLoop");
+  assert.match(loop, /void _offlineDistillIfDue\(memoryRoot \|\| root, config\)/,
+    "离线蒸馏被 await 了或没接上 —— 前者会拖慢收尾，后者等于没做");
+  const at = loop.indexOf("_offlineDistillIfDue");
+  assert.match(loop.slice(Math.max(0, at - 120), at + 80), /try \{/,
+    "调用点没有 try —— 离线通道的异常会打断这一轮的收尾");
+  // 用的是身份根，不是会漂的那个（和经验管道同一条命）。
+  assert.doesNotMatch(loop, /_offlineDistillIfDue\(root,/,
+    "又用回会漂的 root 了 —— 档案会散落在多个抽屉里");
+});
+
+test("蒸馏摘要要带上返工事实，否则一串 ✓ 会把规律盖住", () => {
+  const src = extractFn("_distillDigest");
+  assert.match(src, /e\.reworkedAt/,
+    "摘要里没有返工标记 —— 模型看到的又是一串 ✓，跨轮规律里最值钱的那类就丢了");
+  assert.match(src, /_epArchiveLoad\(root\)\.concat\(_epLoad\(root\)\)/,
+    "只看热区不看档案，等于没有离线视野");
+  assert.match(src, /slice\(-240\)/, "摘要没有上限，会把一次调用撑爆");
+});
