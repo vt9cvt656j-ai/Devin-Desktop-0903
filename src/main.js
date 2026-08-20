@@ -3042,10 +3042,17 @@ const _DOUBLE_SYMBOLS = [
 ];
 
 
-function _fixDoublePunctuation(model) {
+function _fixDoublePunctuation(model, changedLines) {
+  // 同批四个改写器里，只有这一个原来扫**整个文件**。后果不是性能，是改坏别人的代码：
+  // `,,` 在 JS 里是合法的稀疏数组（`[1,,3]` 长度 3，中间是个洞），被改成 `[1,3]`
+  // 长度就变成 2 了。而这个函数扫全文，所以用户只是在文件某处敲了个空格，
+  // 几百行外一个他从没碰过的稀疏数组就被悄悄改掉，1.2 秒后自动保存直接落盘。
+  // 收到改动行范围内，和 _fixExtraSpaces / _fixPythonMissingColon 一致：
+  // 「刚敲出来的重复标点」照修，别人写好的代码不碰。
   const edits = [];
   const total = model.getLineCount();
-  for (let ln = 1; ln <= total; ln++) {
+  for (const ln of changedLines) {
+    if (ln < 1 || ln > total) continue;
     const line = model.getLineContent(ln);
     const trimmed = line.trimStart();
     if (trimmed.startsWith("//") || trimmed.startsWith("#") || trimmed.startsWith("*")) continue;
@@ -3552,10 +3559,10 @@ async function _runAutoCorrections(editor, changedLines) {
   const lang = model.getLanguageId();
   if (lang === "markdown" || lang === "plaintext") return;
 
-  // _fixDoublePunctuation scans the ENTIRE document (no changed-line scope), so on a large file it's
-  // an O(lines) main-thread scan on every typing pause — skip it past 4000 lines (the other fixes are
-  // already changed-line scoped and cheap). Prevents the "编辑大文件发烫" burn.
-  const doubleFixes = model.getLineCount() <= 4000 ? _fixDoublePunctuation(model) : [];
+  // 收到改动行之后，它和别的改写器一样只看用户刚动过的几行，所以那道
+  // 「4000 行以上跳过」的闸不再需要了——那道闸挡的是全文扫描带来的主线程开销，
+  // 而全文扫描本身才是问题（它会改到用户没碰过的地方）。
+  const doubleFixes = _fixDoublePunctuation(model, changedLines);
   // 标识符改写默认关：它会把 `elf` 改成 `elif`、`wit` 改成 `with`，分不出「拼错的关键字」
   // 和「我就是要叫这个名字」。改的是用户已经写下的源码且无提示，必须由用户主动打开。
   const typoFixes = effectivePrefs().autoFixTypos ? _fixKeywordTypos(model, changedLines) : [];

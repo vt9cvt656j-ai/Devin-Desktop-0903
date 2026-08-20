@@ -28029,6 +28029,23 @@ test("自动改重复标点不许碰别的语言的合法语法", () => {
   }
 });
 
+test("自动改重复标点只许碰用户刚动过的那几行", () => {
+  // 同批四个改写器里只有它原来扫整个文件。后果不是性能是改坏别人的代码：
+  // `,,` 在 JS 里是合法的稀疏数组（长度里有个洞），被合并掉长度就变了。
+  // 全文扫描意味着用户在文件某处敲个空格，几百行外一个他从没碰过的数组
+  // 就被悄悄改掉，随后自动保存直接落盘、零提示。
+  // needle 拼出来，否则这个测试自己会被数进去。
+  const fnAt = SRC.indexOf("function " + "_fixDoublePunctuation");
+  assert.ok(fnAt >= 0, "改写器挪走了，这条断言失去落点");
+  const body = SRC.slice(fnAt, SRC.indexOf("\nfunction ", fnAt + 10));
+  assert.match(body, /_fixDoublePunctuation\(model, changedLines\)/,
+    "必须收改动行参数，不能只拿 model 就开扫");
+  assert.match(body, /for \(const ln of changedLines\)/,
+    "必须只遍历改动行");
+  assert.doesNotMatch(body, /for \(let ln = 1; ln <= total/,
+    "又变回全文扫描了——用户没碰过的行会被改掉并自动落盘");
+});
+
 test("会删东西的 find 不许被判成只读命令，批量删除必须弹确认", () => {
   // 只读判定在审批链里排在 mustAsk **前面**并直接 return true，所以一旦某条命令被判成
   // 只读，它连「改动前审批」都绕得过去——用户自己打开的闸对它无效。而 find 的动作谓词
