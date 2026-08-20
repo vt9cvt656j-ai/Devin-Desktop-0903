@@ -39071,8 +39071,33 @@ function _trimMessagesIfHuge(messages, run = null, root = "", contextLimitTok = 
       const mk = bk >= 0 ? bk : m.content.indexOf("📌");
       if (mk > 400 && m.content.includes("项目上下文")) {
         const request = m.content.slice(mk);
+        // 折叠前先把「用户自己写下的规矩」原样捞出来带走。
+        //
+        // 这一刀原本把 📌 之前的**全部内容**都丢掉，而那一段里除了目录树和当前文件转储，
+        // 还装着三样不该丢的东西：项目约定（AGENTS.md/CLAUDE.md/.cursorrules/copilot）、
+        // 子目录约定、以及本会话的需求账本（用户历次原话）。一个 run 只有这一个开场消息，
+        // 折掉之后**这一整轮后面全没了**——用户看到的就是「前十轮听话，越往后越像换了个人」。
+        //
+        // 替换文案承诺的补救是「要项目结构或文件内容就 list_dir / read_file」，那对目录树和
+        // 文件转储成立（本来就是为它们写的），对约定和账本不成立：模型根本不知道它们存在过，
+        // 账本更是压根不在磁盘上。所以这三段要原样保留，其余照折。
+        //
+        // 判据是执行事实：折叠这一刻，这条消息文本里**是否真的含有**这几个由上下文装配
+        // 亲手写进去的分段标记。在就保、不在就什么都不做——不猜模型接下来用不用得上。
+        const _head = m.content.slice(0, mk);
+        const _keepBlocks = [];
+        for (const marker of ["--- 项目约定 (", "--- 子目录约定 (", "--- 本会话历次用户消息（"]) {
+          let from = _head.indexOf(marker);
+          while (from >= 0) {
+            // 切到下一个分段标记为止（分段一律以行首 "--- " 起头）。
+            const next = _head.indexOf("\n--- ", from + marker.length);
+            _keepBlocks.push(_head.slice(from, next >= 0 ? next : _head.length).trimEnd());
+            from = _head.indexOf(marker, from + marker.length);
+          }
+        }
+        const _kept = _keepBlocks.length ? _keepBlocks.join("\n") + "\n\n" : "";
         const before = _msgSize(m);
-        messages[i] = { ...m, content: "[较早的项目上下文 / 当前文件已折叠省上下文——需要项目结构或某文件内容就用 list_dir / read_file 取回]\n\n" + request };
+        messages[i] = { ...m, content: _kept + "[较早的项目上下文 / 当前文件已折叠省上下文——需要项目结构或某文件内容就用 list_dir / read_file 取回]\n\n" + request };
         if (run?._contextPreambleAvailable) {
           run._contextPreambleAvailable = false;
           readContextChanged = true;
