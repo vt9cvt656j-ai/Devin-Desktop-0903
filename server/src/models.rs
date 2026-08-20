@@ -568,6 +568,32 @@ static THINKING_MUTE_ROUTES: LazyLock<Mutex<HashMap<uuid::Uuid, Instant>>> =
 /// 要跨越好几轮请求才看得出来，比一轮换线的冷却长得多。
 const THINKING_MUTE_MEMORY: Duration = Duration::from_secs(30 * 60);
 
+/// 连续多少次「要了思考、给了实质回答、却一个思考块都没开」才判这条线路当前是哑的。
+///
+/// 不能只看一次：adaptive 自己决定某一轮不想，是 Claude 5 一族的正常行为，
+/// 拿单次去降权会把健康线路踢出轮换（2026-08-19 实拍过，"偶尔不出思考卡"被放大成
+/// "越用越不出"）。而连着三次都不开块，就不是"这轮不想"，是这条线路当前不回思考。
+const THINKING_DEAD_STREAK: u32 = 3;
+static THINKING_ZERO_STREAK: LazyLock<Mutex<HashMap<uuid::Uuid, u32>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// 记一次「零思考」，返回是否已经连续到阈值。
+fn note_thinking_zero(id: uuid::Uuid) -> bool {
+    let Ok(mut guard) = THINKING_ZERO_STREAK.lock() else {
+        return false;
+    };
+    let n = guard.entry(id).or_insert(0);
+    *n = n.saturating_add(1);
+    *n >= THINKING_DEAD_STREAK
+}
+
+/// 这条线路回过思考了 —— 连击清零。
+fn clear_thinking_zero_streak(id: uuid::Uuid) {
+    if let Ok(mut guard) = THINKING_ZERO_STREAK.lock() {
+        guard.remove(&id);
+    }
+}
+
 fn mark_thinking_mute(id: uuid::Uuid) {
     if let Ok(mut guard) = THINKING_MUTE_ROUTES.lock() {
         guard.insert(id, Instant::now() + THINKING_MUTE_MEMORY);
@@ -6283,6 +6309,22 @@ impl AnthSse {
             && self.thinking_telemetry.thinking_utf8_chars == 0
     }
 
+    /// 「要了思考、答得好好的、一个思考块都没开」。
+    ///
+    /// 这才是这两条转卖线路的真实故障形态，而上面那条一次都没命中过：48 小时里
+    /// ~330 条零思考流，`thinking_swallowed_by_upstream` 触发 **0 次** —— 因为上游
+    /// 根本不开 thinking 块（新加的 saw_thinking_block 遥测把这件事钉死了：线上 18/18
+    /// 条有实质回答的多轮请求全是 block=false，且 output_tokens 和正文字数一一对上，
+    /// 模型是真没思考，不是文本被吞）。于是那套「绕开哑线路」的自愈是死代码。
+    ///
+    /// 单次不算数——adaptive 自己决定这轮不想是正常行为。调用方按线路数连击
+    /// （见 THINKING_DEAD_STREAK），连着三次才判哑。
+    fn thinking_block_never_opened(&self) -> bool {
+        !self.saw_thinking_block
+            && self.saw_answer_block
+            && self.thinking_telemetry.thinking_utf8_chars == 0
+    }
+
     fn thinking_telemetry(&self) -> ThinkingStreamTelemetry {
         self.thinking_telemetry
     }
@@ -7866,6 +7908,16 @@ pub async fn chat_completions(
                 && conv
                     .as_ref()
                     .is_some_and(|c| c.thinking_swallowed_by_upstream());
+            // 第二种哑法：**块根本不开**。上面那条要求「块开了但文本空」，而这两条转卖线路
+            // 从来不是那样——48 小时 ~330 条零思考流，它一次都没命中。真实形态由新加的
+            // saw_thinking_block 遥测钉死：block=false、正文正常、output_tokens 和正文字数对得上。
+            //
+            // 单次不降权（adaptive 这轮不想是正常的），连着 THINKING_DEAD_STREAK 次才判哑。
+            let thinking_never_opened = complete
+                && thinking_clip_probe
+                && conv
+                    .as_ref()
+                    .is_some_and(|c| c.thinking_block_never_opened());
             if thinking_swallowed {
                 // 记下来，让选路绕开它 —— 只打日志的话，下一次请求照样落到同一条线路上。
                 mark_thinking_mute(cid);
@@ -7874,10 +7926,21 @@ pub async fn chat_completions(
                     route_id = %cid,
                     "upstream returned no thinking despite an explicit thinking request; not caching this response and de-prioritising this route for thinking requests"
                 );
+            } else if thinking_never_opened {
+                if note_thinking_zero(cid) {
+                    mark_thinking_mute(cid);
+                    tracing::warn!(
+                        model = %req_model,
+                        route_id = %cid,
+                        streak = THINKING_DEAD_STREAK,
+                        "upstream opened no thinking block on N consecutive thinking requests; de-prioritising this route for thinking requests"
+                    );
+                }
             } else if complete && thinking_clip_probe && !thinking_went_missing {
-                // 这一轮要了思考、也真的回了 —— 撤掉记号。上游恢复后第一个成功的请求就
-                // 让这条线路回到正常轮换，不需要任何人去后台动手。
+                // 这一轮要了思考、也真的回了 —— 撤掉记号，连击也清零。上游恢复后第一个
+                // 成功的请求就让这条线路回到正常轮换，不需要任何人去后台动手。
                 clear_thinking_mute(cid);
+                clear_thinking_zero_streak(cid);
             }
             if relay_dropped_blocks {
                 mark_thinking_clip(cid);
@@ -11213,6 +11276,46 @@ mod billing_tests {
         let production = &src[..src.find("mod billing_tests").expect("tests module")];
         assert!(production.contains("&& !thinking_went_missing &&"), "缓存判据没接上");
         assert!(production.contains("thinking_requested_but_none_returned()"), "探测没接上");
+    }
+
+    /// 「块根本不开」这种哑法必须能被认出来，而且要连着几次才降权。
+    ///
+    /// 旧判据 `thinking_swallowed_by_upstream` 要求「块开了但文本是空的」，48 小时里
+    /// ~330 条零思考流一次都没命中——那套绕开哑线路的自愈因此是死代码。真实形态由
+    /// saw_thinking_block 遥测钉死：block=false、正文正常、output_tokens 和正文字数对得上。
+    #[test]
+    fn a_route_that_never_opens_a_thinking_block_is_demoted_after_a_streak() {
+        // 块没开 + 有正文 = 这条线路这一轮没思考。
+        let mut c = AnthSse::new("claude-opus-5");
+        let _ = c.push(b"data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n").unwrap();
+        let _ = c.push("data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Release the lock.\"}}\n\n".as_bytes()).unwrap();
+        assert!(c.thinking_block_never_opened(), "块没开、正文有 —— 必须认出来");
+        assert!(!c.thinking_swallowed_by_upstream(), "这不是「块开了但空」那一种，别混");
+
+        // 开了块的（哪怕文本是空的）不算这一种，走原来那条路。
+        let mut opened = AnthSse::new("claude-opus-5");
+        let _ = opened.push(b"data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"\"}}\n\n").unwrap();
+        let _ = opened.push("data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\"ok\"}}\n\n".as_bytes()).unwrap();
+        assert!(!opened.thinking_block_never_opened());
+        assert!(opened.thinking_swallowed_by_upstream());
+
+        // 连击：前 N-1 次不降权（adaptive 这轮不想是正常的），第 N 次才判哑。
+        let route = uuid::Uuid::new_v4();
+        for i in 1..super::THINKING_DEAD_STREAK {
+            assert!(!super::note_thinking_zero(route), "第 {i} 次就降权 = 又在拿单次盖健康线路");
+        }
+        assert!(super::note_thinking_zero(route), "连够 N 次必须判哑");
+
+        // 回过思考就清零：上游恢复后第一条成功请求让它回到正常轮换。
+        super::clear_thinking_zero_streak(route);
+        assert!(!super::note_thinking_zero(route), "清零之后连击要重新数");
+
+        // 生产里必须真的接上，否则这套自愈还是死的。
+        let src = include_str!("models.rs");
+        let production = &src[..src.find("mod billing_tests").expect("tests module")];
+        assert!(production.contains("thinking_block_never_opened()"), "新判据没接进收流那一段");
+        assert!(production.contains("if note_thinking_zero(cid)"), "连击计数没接上选路降权");
+        assert!(production.contains("clear_thinking_zero_streak(cid)"), "恢复后没有清零，线路会被永久压着");
     }
 
     /// 「零思考」有三种成因，旧日志里它们**完全同形**（thinking_utf8_chars 都是 0）。
