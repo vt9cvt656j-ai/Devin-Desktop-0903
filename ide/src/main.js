@@ -50737,6 +50737,51 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
         runHadTrouble = true;
         _pushNudge("implLoop", `⚠️ 你已经取得 ${_novelEvidenceCount} 份新的读取/搜索证据，**仍没有实际改动**。调查是手段，不是产出；如果这是修复/实现任务，现在基于已掌握内容直接 write_file / edit_file，别继续追加相似搜索。只有纯查询/解释任务才应直接给结论收尾。`);
       }
+      // 走偏检查：在**还来得及改**的时候问一次方向，而不是等收尾。
+      //
+      // 「你真正想做的是另一件事」这个判断此前只在模型已决定收尾、且这轮改过源码时跑一次。
+      // 判错方向的代价因此是：用户读完一整轮、打字纠正、再跑一轮。用户原话——
+      // 「走偏 或者 走错 都需要调研 或者 看真实作品」，说的正是这个时间点太晚。
+      //
+      // 闸门刻意收紧，不让每个 run 都多付一次模型调用：
+      //   · 必须有验收契约（没有靶子就无所谓偏不偏）；
+      //   · 已经真落过 2 次盘、且跑了 6 轮以上——短任务和纯调研轮完全不受打扰；
+      //   · 每个 run 只做一次，且占用收尾评审那 2 个名额里长期闲置的第二个。
+      // 只取 direction / instruction 推一条提醒，**绝不写 run._wrapUpVerdict**——
+      // 那是用户建议卡的来源，中途一份不完整的裁定会把收尾那份好结论顶掉。
+      if (run.mode === "agent" && _live() && !run._directionChecked
+          && iter >= 6 && _implOps >= 2
+          && Array.isArray(run._requirementsChecklist) && run._requirementsChecklist.length
+          && (run._wrapUpReviews || 0) < 2) {
+        let _dirOn = true;
+        try { _dirOn = loadConfig()?.agentWrapUpReview !== false; } catch {}
+        if (_dirOn) {
+          run._directionChecked = true;
+          run._wrapUpReviews = (run._wrapUpReviews || 0) + 1;
+          try {
+            const _dir = await _wrapUpCritic({
+              config,
+              task,
+              padText: _padText(),
+              draft: "",
+              readList: [..._readFiles].slice(-40).join("、"),
+              executionEvidence: run._executionEvidence,
+              toolRegistry: run._toolRegistry,
+              contract: _acceptanceContractBlock(run._requirementsChecklist),
+              demands: Array.isArray(session?._demandLedger) ? session._demandLedger : [],
+            });
+            const _msg = String(_dir?.direction || "").trim() || String(_dir?.instruction || "").trim();
+            if (_msg && _live()) {
+              _pushNudge("directionCheck", `[方向检查·现在还来得及改] 对着你历次的要求看，这一轮的走向可能不是你要的：${_msg.slice(0, 400)}\n判断对就现在调整；不对就当没说，按用户原话继续。`);
+            }
+            // 评审是拿真实注册表挑的工具名，此前 _wrapUpVerdict 的三个读者一个都不读 .tools——
+            // 「走偏了 → 去看真实作品/调研」这条执行路径整条断在这里。中途版把它接上：
+            // 被点名的工具当场装进窗口，模型下一轮直接能调。
+            const _dirTools = _criticRequestedToolSchemas(_dir?.tools, run._toolRegistry, 4);
+            if (_dirTools.length) _applyToolPayloadWindow(toolSchemas, _dirTools, run._toolCoreNames);
+          } catch {}
+        }
+      }
       // 空转断路器：连续 _IDLE_ITER_LIMIT 轮既无产出也无新证据 → 如实收尾，别再烧下去。
       // 只在 agent 模式生效；对话/规划这些本来就不产出的模式不适用。
       {
