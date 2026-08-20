@@ -8785,6 +8785,10 @@ test("intent context is bounded and isolated by session plus context fingerprint
   const context = contextForTurn(session, "还是不行", { root: "/repo-a", activePath: "/repo-a/src/login.ts" });
   assert.equal(context.currentMessage, "还是不行");
   assert.equal(context.priorTask.goal, "登录不再卡死");
+  // 上一轮它自己申报的「这里我还没读懂」也要投影过去：不投的话，分类器每轮都看不见
+  // 自己上一句说过什么没搞清——既没法确认已经被这句话消解掉，也没法接着申报。
+  assert.ok("ambiguities" in context.priorTask,
+    "上一轮申报的歧义没投影给分类器——它每轮都在失忆地重新猜「哪里没读懂」");
   assert.deepEqual(context.unfinishedPlan, ["修复取消状态"]);
   assert.equal(context.recentTurns.length, 2, "工具原始结果不进入意图快照");
   assert.ok(JSON.stringify(context).length < 6000, "意图上下文必须严格有界");
@@ -8803,6 +8807,14 @@ test("intent context is bounded and isolated by session plus context fingerprint
   assert.equal(correction.semantic.target, "登录请求", "短纠正省略对象时要解析回上一轮对象");
   assert.equal(correction.semantic.continuation, "correct");
   assert.equal(normalize({}, context), null, "an empty classifier response must not become a default route");
+  // 一个只回了自评置信度、什么内容都没有的回答，和 {} 是一回事。它此前算「有效裁决」，
+  // 于是产出一份全默认画像并把 intentSource 锁成 "ai"——而迟到落定那条补救路径开头就是
+  // `intentSource === "ai"` 就早返回，这一轮从此再无补救。
+  assert.equal(normalize({ semantic: { confidence: 0.3 } }, context), null,
+    "光有一个自评置信度就被当成裁决——会产出全默认画像，并把这一轮的补救路径永久关掉");
+  // 有内容的字段仍然算数（别把上一条写成"semantic 一律不算"）。
+  assert.ok(normalize({ semantic: { goal: "修登录", confidence: 0.3 } }, context),
+    "有真实内容的裁决被误杀了");
   assert.match(extractFn("_chatSessionDataForStorage"), /intentState:[\s\S]*lastRun:/,
     "会话重启后仍要保留已确认目标和上轮结果");
   assert.match(extractFn("restoreChatHistory"), /sData\.intentState[\s\S]*sData\.lastRun/);
@@ -23702,9 +23714,32 @@ test("the role matrix is wired into BOTH _allow and _execTypes from one source",
 test("restatedTask flows through classifier schema, normalizer, and render", () => {
   // Schema advertises it, so the model fills it.
   assert.match(SRC, /"ambiguities":\[\],"restatedTask":""/, "the classifier output schema must request it");
-  // Normalizer carries it, inheriting on a short continuation like the other fields.
-  assert.match(SRC, /restatedTask: _aiIntentText\(rawSemantic\.restatedTask \|\| \(followsPrior \? prior\.restatedTask : ""\), 600\)/,
-    "the normalizer must accept and inherit restatedTask");
+  // Normalizer 真跑一遍，不看源码长相。
+  //
+  // 这里原来是一条**源码正则**，断言 `|| (followsPrior ? prior.restatedTask : "")` 在场，
+  // 消息写着 "must accept and inherit"。而 priorTask 的投影里从来就没有 restatedTask，
+  // 那个回退永远取到 undefined —— 一个运行时不成立的信念，被源码正则钉成了绿灯。
+  // 现在钉执行事实：带过来的要留住，不带的就是空，**不许**从上一轮继承。
+  const dims2 = ["bug", "implementation", "projectScope"];
+  const iText = load("_aiIntentText");
+  const iList = load("_aiIntentList", { _aiIntentText: iText });
+  const norm = load("_normalizeAiIntentVerdict", aiIntentNormalizeDeps(dims2, iText, iList));
+  const ctx2 = {
+    currentMessage: "继续",
+    priorTask: { goal: "打通鉴权", action: "implement", target: "登录接口", locationIntent: "none",
+      constraints: [], successCriteria: [], ambiguities: [], lastUserText: "把登录接上真实鉴权" },
+    recentTurns: [],
+  };
+  const carried = norm({ semantic: { continuation: "new", restatedTask: "把登录接口接上真实鉴权" },
+    dimensions: { implementation: true } }, ctx2);
+  assert.equal(carried.semantic.restatedTask, "把登录接口接上真实鉴权", "带过来的重述没留住");
+  const short = norm({ semantic: { continuation: "continue", action: "implement" },
+    dimensions: { implementation: true } }, ctx2);
+  assert.equal(short.semantic.restatedTask, "",
+    "重述被从上一轮继承了——第一轮读错的那句会一路粘着，而渲染出去的措辞是「act on this」，"
+    + "等于让模型照着一句陈旧且错的重述行动，比没有这一行更糟");
+  // 同一次调用里，goal/target 这些**该**继承的仍然继承——别把这条测试写成"什么都不继承"。
+  assert.equal(short.semantic.goal, "打通鉴权", "该继承的目标反而丢了");
   // Render injects it, and the comment fixes the invariant that it augments, not replaces.
   const render = extractFn("_agentIntentExecutionBlock");
   assert.match(render, /semantic\.restatedTask/, "the execution block must render the restatement");
