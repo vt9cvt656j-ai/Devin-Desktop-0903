@@ -46,6 +46,38 @@ fn host_allowed(url: &str) -> bool {
         || host == "registry.yarnpkg.com"
         || host.ends_with(".npmjs.org")
         || host.ends_with(".npmjs.com")
+        // PyPI：元数据在 pypi.org，产物在 files.pythonhosted.org
+        || host == "pypi.org"
+        || host == "files.pythonhosted.org"
+        // crates.io：元数据在 crates.io，.crate 在 static.crates.io
+        || host == "crates.io"
+        || host == "static.crates.io"
+}
+
+/// 生态。每一支的差别只在「去哪拿包」和「从什么文件里抽签名」，其余共用。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Eco {
+    Npm,
+    PyPI,
+    Crates,
+}
+
+impl Eco {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Eco::Npm => "npm",
+            Eco::PyPI => "pypi",
+            Eco::Crates => "crates",
+        }
+    }
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "npm" => Some(Eco::Npm),
+            "pypi" | "pip" | "python" => Some(Eco::PyPI),
+            "crates" | "cargo" | "rust" => Some(Eco::Crates),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -529,6 +561,571 @@ pub async fn have_package(db: &sqlx::PgPool, name: &str) -> bool {
     .unwrap_or(false)
 }
 
+/// 抓一个包并入库，按生态分派。已经收录过同一版本时是 no-op（唯一索引兜底）。
+///
+/// 三支的差别只有两件事：去哪拿包、从什么文件里抽签名。入库、去重、台账全共用。
+pub async fn ingest(db: &sqlx::PgPool, eco: Eco, name: &str, version: Option<&str>) -> Result<IngestReport> {
+    match eco {
+        Eco::Npm => return ingest_npm(db, name, version).await,
+        _ => {}
+    }
+    if !valid_simple_name(name) {
+        return Err(anyhow!("not a valid package name"));
+    }
+    let client = http()?;
+    let (url, version, files, bytes) = match eco {
+        Eco::PyPI => {
+            let (href, ver, is_wheel) = pypi_dist(&client, name).await?;
+            let (files, bytes) = if is_wheel {
+                fetch_and_unzip(&client, &href, eco).await?
+            } else {
+                fetch_and_untar(&client, &href, eco).await?
+            };
+            (href, ver, files, bytes)
+        }
+        Eco::Crates => {
+            let (href, ver) = crates_dist(&client, name).await?;
+            let (files, bytes) = fetch_and_untar(&client, &href, eco).await?;
+            (href, ver, files, bytes)
+        }
+        Eco::Npm => unreachable!(),
+    };
+
+    let mut entries: Vec<Entry> = Vec::new();
+    for (rel, body) in &files {
+        let lower = rel.to_ascii_lowercase();
+        if lower.split('/').next_back().is_some_and(|f| f.starts_with("readme")) {
+            extract_readme(body, &mut entries);
+        } else {
+            match eco {
+                Eco::PyPI => extract_python(body, &mut entries),
+                Eco::Crates => extract_rust(body, &mut entries),
+                Eco::Npm => unreachable!(),
+            }
+        }
+        if entries.len() >= MAX_ENTRIES_PER_PACKAGE {
+            break;
+        }
+    }
+
+    let written = write_entries(db, eco, name, &version, &url, &entries).await;
+    let _ = sqlx::query(
+        "INSERT INTO code_corpus_fetches (ecosystem, name, version, ok, entries, bytes) \
+         VALUES ($1,$2,$3,true,$4,$5) \
+         ON CONFLICT (ecosystem, name, version) DO UPDATE \
+           SET ok = true, entries = EXCLUDED.entries, bytes = EXCLUDED.bytes, error = NULL, fetched_at = now()",
+    )
+    .bind(eco.as_str()).bind(name).bind(&version)
+    .bind(written as i32).bind(bytes as i64)
+    .execute(db).await;
+
+    Ok(IngestReport { name: name.to_string(), version, entries: written, bytes })
+}
+
+/// 下载并解 tar.gz（sdist / .crate 都是这个格式）。
+async fn fetch_and_untar(client: &reqwest::Client, url: &str, eco: Eco) -> Result<(Vec<(String, String)>, u64)> {
+    let bytes = download_capped(client, url).await?;
+    let downloaded = bytes.len() as u64;
+    let files = tokio::task::spawn_blocking(move || -> Result<Vec<(String, String)>> {
+        let gz = flate2::read::GzDecoder::new(std::io::Cursor::new(bytes));
+        let mut archive = tar::Archive::new(gz);
+        let mut out = Vec::new();
+        for entry in archive.entries().context("read tar entries")? {
+            let mut entry = entry.context("bad tar entry")?;
+            if !entry.header().entry_type().is_file() { continue; }
+            let rel = entry.path().context("bad entry path")?.to_string_lossy().to_string();
+            if !wanted_file_for(&rel, eco) { continue; }
+            if entry.header().size().unwrap_or(0) as usize > MAX_ENTRY_BYTES { continue; }
+            let mut buf = String::new();
+            if entry.read_to_string(&mut buf).is_err() { continue; }
+            out.push((rel, buf));
+            if out.len() > 600 { break; }
+        }
+        Ok(out)
+    })
+    .await
+    .context("untar task panicked")??;
+    Ok((files, downloaded))
+}
+
+/// 入库。抽出来多少条就写多少条，重复的靠唯一索引挡掉。
+async fn write_entries(
+    db: &sqlx::PgPool, eco: Eco, name: &str, version: &str, url: &str, entries: &[Entry],
+) -> usize {
+    let mut written = 0usize;
+    for e in entries {
+        let res = sqlx::query(
+            "INSERT INTO code_corpus (kind, ecosystem, name, version, symbol, title, body, source_url) \
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8) \
+             ON CONFLICT (ecosystem, name, version, kind, symbol) DO NOTHING",
+        )
+        .bind(e.kind).bind(eco.as_str()).bind(name).bind(version)
+        .bind(&e.symbol).bind(&e.title).bind(&e.body).bind(url)
+        .execute(db).await;
+        if res.is_ok() { written += 1; }
+    }
+    written
+}
+
+/// 包名字符集：PyPI / crates 的合法名比 npm 更窄，统一用这一条挡掉能注进 URL 的花样。
+fn valid_simple_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 128
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+}
+
+/// PyPI：元数据 → 优先 sdist（.tar.gz，带完整源码），没有就退而取 wheel（.whl，zip）。
+async fn pypi_dist(client: &reqwest::Client, name: &str) -> Result<(String, String, bool)> {
+    let url = format!("https://pypi.org/pypi/{name}/json");
+    if !host_allowed(&url) {
+        return Err(anyhow!("pypi host not allowed"));
+    }
+    let meta: serde_json::Value = client
+        .get(&url).send().await.context("fetch pypi metadata")?
+        .error_for_status().context("pypi returned an error status")?
+        .json().await.context("pypi metadata is not JSON")?;
+    let version = meta.pointer("/info/version").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let urls = meta.get("urls").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+    // sdist 里有真源码和 docstring；wheel 常常只有编译产物，但总比没有强。
+    let pick = urls.iter().find(|u| u.get("packagetype").and_then(|v| v.as_str()) == Some("sdist"))
+        .or_else(|| urls.iter().find(|u| u.get("packagetype").and_then(|v| v.as_str()) == Some("bdist_wheel")));
+    let Some(pick) = pick else { return Err(anyhow!("no downloadable artifact for {name}")) };
+    let href = pick.get("url").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let is_wheel = href.ends_with(".whl");
+    if !host_allowed(&href) {
+        return Err(anyhow!("artifact host not allowed: {href}"));
+    }
+    Ok((href, version, is_wheel))
+}
+
+/// crates.io：`.crate` 就是个 tar.gz。
+async fn crates_dist(client: &reqwest::Client, name: &str) -> Result<(String, String)> {
+    let url = format!("https://crates.io/api/v1/crates/{name}");
+    if !host_allowed(&url) {
+        return Err(anyhow!("crates host not allowed"));
+    }
+    let meta: serde_json::Value = client
+        .get(&url).send().await.context("fetch crates metadata")?
+        .error_for_status().context("crates returned an error status")?
+        .json().await.context("crates metadata is not JSON")?;
+    let version = meta.pointer("/crate/max_stable_version")
+        .or_else(|| meta.pointer("/crate/newest_version"))
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow!("crates metadata has no version"))?
+        .to_string();
+    let href = format!("https://static.crates.io/crates/{name}/{name}-{version}.crate");
+    Ok((href, version))
+}
+
+/// 下载一个 zip（wheel）并取出想要的文本文件。
+async fn fetch_and_unzip(client: &reqwest::Client, url: &str, eco: Eco) -> Result<(Vec<(String, String)>, u64)> {
+    let bytes = download_capped(client, url).await?;
+    let downloaded = bytes.len() as u64;
+    let files = tokio::task::spawn_blocking(move || -> Result<Vec<(String, String)>> {
+        let mut zip = zip::ZipArchive::new(std::io::Cursor::new(bytes)).context("open wheel zip")?;
+        let mut out = Vec::new();
+        for i in 0..zip.len() {
+            let mut f = zip.by_index(i).context("read zip entry")?;
+            if !f.is_file() { continue; }
+            let rel = f.name().to_string();
+            if !wanted_file_for(&rel, eco) { continue; }
+            if f.size() as usize > MAX_ENTRY_BYTES { continue; }
+            let mut buf = String::new();
+            if std::io::Read::read_to_string(&mut f, &mut buf).is_err() { continue; }
+            out.push((rel, buf));
+            if out.len() > 600 { break; }
+        }
+        Ok(out)
+    })
+    .await
+    .context("unzip task panicked")??;
+    Ok((files, downloaded))
+}
+
+/// 带上限的下载。Content-Length 可以缺席或撒谎，所以拿到实体之后再量一次。
+async fn download_capped(client: &reqwest::Client, url: &str) -> Result<bytes::Bytes> {
+    if !host_allowed(url) {
+        return Err(anyhow!("host not allowed"));
+    }
+    let resp = client.get(url).send().await.context("download")?
+        .error_for_status().context("download returned an error status")?;
+    if let Some(len) = resp.content_length() {
+        if len > MAX_TARBALL_BYTES {
+            return Err(anyhow!("artifact is {len} bytes, over the cap"));
+        }
+    }
+    let bytes = resp.bytes().await.context("read body")?;
+    if bytes.len() as u64 > MAX_TARBALL_BYTES {
+        return Err(anyhow!("artifact is {} bytes, over the cap", bytes.len()));
+    }
+    Ok(bytes)
+}
+
+/// 这个文件对该生态有没有抽取价值。
+fn wanted_file_for(rel: &str, eco: Eco) -> bool {
+    let lower = rel.to_ascii_lowercase();
+    if lower.contains("/test/") || lower.contains("/tests/") || lower.contains("/__tests__/") {
+        return false;
+    }
+    match eco {
+        Eco::Npm => wanted_file(rel),
+        // Python：类型存根优先，其次是源码；README 给包级说明。
+        Eco::PyPI => {
+            lower.ends_with(".pyi")
+                || (lower.ends_with(".py") && !lower.contains("/_vendor/"))
+                || lower.split('/').next_back().is_some_and(|f| f.starts_with("readme"))
+        }
+        // Rust：只看 src 下的 .rs，README 同上。
+        Eco::Crates => {
+            (lower.ends_with(".rs") && lower.contains("/src/"))
+                || lower.split('/').next_back().is_some_and(|f| f.starts_with("readme"))
+        }
+    }
+}
+
+/// PyPI：从 `.pyi` / `.py` 里抽顶层 `def` / `class` 签名和紧跟其后的 docstring。
+///
+/// 和 TS 不同，Python 的文档字符串在**声明之后**（缩进的三引号块），不是之前。
+/// 只收顶层（零缩进）声明：类里的方法跟着类一起出现在签名行里，单独抽会把语料灌爆。
+fn extract_python(src: &str, out: &mut Vec<Entry>) {
+    let lines: Vec<&str> = src.lines().collect();
+    let quotes = ["\"\"\"", "'''"];
+    let mut i = 0usize;
+    while i < lines.len() {
+        let line = lines[i];
+        let is_decl = line.starts_with("def ") || line.starts_with("class ") || line.starts_with("async def ");
+        if is_decl {
+            let kw = if line.starts_with("class ") { "class" } else { "def" };
+            let after = line
+                .trim_start_matches("async ")
+                .trim_start_matches("def ")
+                .trim_start_matches("class ");
+            let name: String = after.chars().take_while(|c| c.is_alphanumeric() || *c == '_').collect();
+            // 私有的不进语料：`_x` 是约定俗成的「别用我」。
+            if !name.is_empty() && !name.starts_with('_') {
+                // 签名可能跨行（参数表换行），读到以 `:` 结尾的那一行为止。
+                let mut sig = String::new();
+                let mut j = i;
+                while j < lines.len() && j < i + 12 {
+                    sig.push_str(lines[j].trim_end());
+                    sig.push('\n');
+                    if lines[j].trim_end().ends_with(':') { break; }
+                    j += 1;
+                }
+                // docstring 紧跟在声明之后。
+                let mut doc = String::new();
+                let mut k = j + 1;
+                while k < lines.len() && lines[k].trim().is_empty() { k += 1; }
+                if k < lines.len() {
+                    let t = lines[k].trim();
+                    if let Some(q) = quotes.iter().find(|q| t.starts_with(**q)) {
+                        let mut body = t.trim_start_matches(*q).to_string();
+                        if !body.trim_end().ends_with(q) {
+                            let mut m = k + 1;
+                            while m < lines.len() && !lines[m].contains(q) && m < k + 40 {
+                                body.push('\n');
+                                body.push_str(lines[m].trim());
+                                m += 1;
+                            }
+                        }
+                        doc = body.trim_end_matches(*q).trim().to_string();
+                    }
+                }
+                let mut body = sig.trim().to_string();
+                if !doc.is_empty() { body.push_str("\n\n"); body.push_str(&doc); }
+                if body.chars().count() > MAX_BODY_CHARS {
+                    body = body.chars().take(MAX_BODY_CHARS).collect();
+                }
+                out.push(Entry { kind: "package_api", symbol: name.clone(), title: format!("{kw} {name}"), body });
+                if out.len() >= MAX_ENTRIES_PER_PACKAGE { return; }
+            }
+        }
+        i += 1;
+    }
+}
+
+/// Rust：抽 `pub fn` / `pub struct` / `pub trait` / `pub enum`，连同紧贴在上面的 `///` 文档。
+fn extract_rust(src: &str, out: &mut Vec<Entry>) {
+    let lines: Vec<&str> = src.lines().collect();
+    for (i, raw) in lines.iter().enumerate() {
+        let line = raw.trim_start();
+        let Some(after) = line.strip_prefix("pub ") else { continue };
+        let after = after.strip_prefix("async ").unwrap_or(after);
+        const KWS: &[&str] = &["fn ", "struct ", "trait ", "enum ", "type ", "const "];
+        let Some(kw) = KWS.iter().find(|k| after.starts_with(**k)) else { continue };
+        let name: String = after[kw.len()..]
+            .chars().take_while(|c| c.is_alphanumeric() || *c == '_').collect();
+        if name.is_empty() { continue; }
+        // 签名读到 `{`、`;` 或参数表收尾为止。
+        let mut sig = String::new();
+        for l in lines.iter().skip(i).take(8) {
+            sig.push_str(l.trim_end());
+            sig.push('\n');
+            let t = l.trim_end();
+            if t.ends_with('{') || t.ends_with(';') || t.ends_with(')') { break; }
+        }
+        // `///` 文档注释在声明**之前**，往上收；属性宏和空行不打断文档块。
+        let mut doc_lines: Vec<&str> = Vec::new();
+        let mut k = i;
+        while k > 0 {
+            k -= 1;
+            let t = lines[k].trim();
+            if let Some(d) = t.strip_prefix("///") { doc_lines.push(d.trim()); }
+            else if t.starts_with("#[") || t.is_empty() { continue; }
+            else { break; }
+        }
+        doc_lines.reverse();
+        let mut body = sig.trim().to_string();
+        if !doc_lines.is_empty() { body.push_str("\n\n"); body.push_str(&doc_lines.join("\n")); }
+        if body.chars().count() > MAX_BODY_CHARS {
+            body = body.chars().take(MAX_BODY_CHARS).collect();
+        }
+        out.push(Entry { kind: "package_api", symbol: name.clone(), title: format!("{} {}", kw.trim(), name), body });
+        if out.len() >= MAX_ENTRIES_PER_PACKAGE { return; }
+    }
+}
+
+/// 批量预热的种子词。
+///
+/// npm 的搜索接口按流行度排序，但**必须给一个 text**，没法裸枚举整个注册表。
+/// 所以拿一组覆盖面广的词各翻几页，去重之后就是一份「常用包」清单。
+/// 选词的标准是**生态切面**而不是具体库名：框架、运行时、构建、测试、数据、云、
+/// 协议、语言工具——这样命中的是每个方向的头部包，而不是某一家的全家桶。
+const SEED_TERMS: &[&str] = &[
+    "react", "vue", "angular", "svelte", "next", "node", "express", "typescript",
+    "webpack", "vite", "rollup", "babel", "eslint", "prettier", "jest", "vitest",
+    "test", "cli", "http", "fetch", "axios", "database", "sql", "orm", "mongodb",
+    "redis", "postgres", "auth", "jwt", "crypto", "date", "time", "lodash", "utility",
+    "css", "tailwind", "styled", "animation", "chart", "table", "form", "validation",
+    "state", "router", "graphql", "grpc", "websocket", "queue", "logger", "config",
+    "aws", "azure", "google-cloud", "docker", "kubernetes", "stream", "parser",
+    "markdown", "json", "yaml", "csv", "image", "video", "pdf", "email", "i18n",
+];
+
+/// 从 npm 官方搜索接口按流行度收集包名。
+async fn discover_popular(client: &reqwest::Client, per_term: usize) -> Vec<String> {
+    use std::collections::BTreeSet;
+    let mut names: BTreeSet<String> = BTreeSet::new();
+    for term in SEED_TERMS {
+        let mut from = 0usize;
+        while from < per_term {
+            let size = 250.min(per_term - from);
+            let url = format!(
+                "https://registry.npmjs.org/-/v1/search?text={term}&size={size}&from={from}\
+                 &popularity=1.0&quality=0.0&maintenance=0.0"
+            );
+            if !host_allowed(&url) {
+                break;
+            }
+            let Ok(resp) = client.get(&url).send().await else { break };
+            let Ok(body) = resp.json::<serde_json::Value>().await else { break };
+            let objects = body.get("objects").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+            if objects.is_empty() {
+                break;
+            }
+            for o in &objects {
+                if let Some(n) = o.pointer("/package/name").and_then(|v| v.as_str()) {
+                    if valid_npm_name(n) {
+                        names.insert(n.to_string());
+                    }
+                }
+            }
+            from += size;
+            // 对官方接口客气一点：这是白嫖别人的服务，不是压测。
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        }
+    }
+    names.into_iter().collect()
+}
+
+/// 这个包最近抓过吗（不管成功失败）。抓过就跳过——预热要能中断、能重跑，
+/// 而不是每次从头再来一遍。
+async fn recently_attempted(db: &sqlx::PgPool, name: &str) -> bool {
+    sqlx::query_scalar::<_, i64>(
+        "SELECT count(*) FROM code_corpus_fetches \
+          WHERE ecosystem = 'npm' AND name = $1 AND fetched_at > now() - interval '30 days'",
+    )
+    .bind(name)
+    .fetch_one(db)
+    .await
+    .map(|n| n > 0)
+    .unwrap_or(false)
+}
+
+/// 批量预热：发现常用包 → 逐个抽取入库。
+///
+/// **串行 + 间隔**是刻意的：并发拉 npm 只会更快撞上限流，而这活本来就该慢慢跑在后台。
+/// 已经抓过的直接跳过，所以中断之后重跑会接着上次的进度走。
+pub async fn seed(db: sqlx::PgPool, per_term: usize, max_packages: usize) -> Result<()> {
+    let client = http()?;
+    let names = discover_popular(&client, per_term).await;
+    tracing::info!(discovered = names.len(), "code corpus: seeding started");
+    let mut done = 0usize;
+    let mut failed = 0usize;
+    for name in names.into_iter().take(max_packages) {
+        if recently_attempted(&db, &name).await {
+            continue;
+        }
+        match ingest_npm(&db, &name, None).await {
+            Ok(r) => {
+                done += 1;
+                if done % 50 == 0 {
+                    tracing::info!(done, failed, last = %r.name, "code corpus: seeding progress");
+                }
+            }
+            Err(e) => {
+                failed += 1;
+                record_failure(&db, &name, "", &e.to_string()).await;
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+    tracing::info!(done, failed, "code corpus: seeding finished");
+    Ok(())
+}
+
+/// crates.io 有官方的下载量排序，直接按热度翻页。
+async fn discover_crates(client: &reqwest::Client, want: usize) -> Vec<String> {
+    let mut names = Vec::new();
+    let mut page = 1usize;
+    while names.len() < want && page <= 100 {
+        let url = format!("https://crates.io/api/v1/crates?sort=downloads&per_page=100&page={page}");
+        if !host_allowed(&url) { break; }
+        let Ok(resp) = client.get(&url).send().await else { break };
+        let Ok(body) = resp.json::<serde_json::Value>().await else { break };
+        let arr = body.get("crates").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+        if arr.is_empty() { break; }
+        for c in &arr {
+            if let Some(n) = c.get("name").and_then(|v| v.as_str()) {
+                if valid_simple_name(n) { names.push(n.to_string()); }
+            }
+        }
+        page += 1;
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+    }
+    names.truncate(want);
+    names
+}
+
+/// PyPI 没有官方的「按下载量排序」接口（BigQuery 那份不算公开 API），
+/// 所以这一支用一份**明确的种子名单**打底：常用框架、数据科学、云 SDK、工具链。
+/// 名单之外的包仍然会被「按需入库」补进来——预热只是让常用的开箱即有。
+const PYPI_SEED: &[&str] = &[
+    "requests","urllib3","numpy","pandas","scipy","matplotlib","pillow","pydantic","fastapi",
+    "flask","django","starlette","uvicorn","gunicorn","httpx","aiohttp","sqlalchemy","alembic",
+    "psycopg2-binary","pymongo","redis","celery","click","typer","rich","tqdm","attrs","cattrs",
+    "pytest","hypothesis","mypy","ruff","black","isort","flake8","tox","poetry","setuptools",
+    "boto3","botocore","google-cloud-storage","azure-storage-blob","paramiko","cryptography",
+    "pyyaml","toml","jinja2","markupsafe","beautifulsoup4","lxml","scrapy","selenium","playwright",
+    "openai","anthropic","transformers","torch","tensorflow","scikit-learn","xgboost","lightgbm",
+    "polars","pyarrow","duckdb","dask","networkx","sympy","statsmodels","seaborn","plotly",
+    "python-dateutil","pytz","arrow","pendulum","orjson","ujson","msgpack","protobuf","grpcio",
+    "structlog","loguru","sentry-sdk","prometheus-client","opentelemetry-api","websockets",
+];
+
+/// 批量预热：三个生态一起。
+///
+/// # 为什么是串行 + 间隔
+///
+/// 用户明确要求「跑的过程中不影响使用」。并发拉包只会更快撞上注册表限流，而且会和真实
+/// 请求抢这台机器的出网带宽和 CPU（解包是 CPU 活）。这活本来就该慢慢跑在后台——
+/// 一次一个、每个之间歇一下，对前台几乎无感。
+///
+/// # 为什么能随时中断重跑
+///
+/// 抓过的（不管成功失败）30 天内不再抓，所以重启之后接着上次的进度走，不会从头再来。
+///
+/// # 入库即刻可用
+///
+/// 每个包抽完就 INSERT，检索读的是同一张表——不存在「攒够一批再生效」的窗口。
+/// 正在跑的时候搜到刚入库的包，是预期行为。
+pub async fn seed_all(db: sqlx::PgPool, npm_per_term: usize, per_eco_max: usize) -> Result<()> {
+    let client = http()?;
+
+    let npm = discover_popular(&client, npm_per_term).await;
+    let crates = discover_crates(&client, per_eco_max).await;
+    let pypi: Vec<String> = PYPI_SEED.iter().map(|s| s.to_string()).collect();
+    tracing::info!(
+        npm = npm.len(), crates = crates.len(), pypi = pypi.len(),
+        "code corpus: seeding discovered candidates"
+    );
+
+    let plan: Vec<(Eco, Vec<String>)> = vec![
+        (Eco::Npm, npm.into_iter().take(per_eco_max).collect()),
+        (Eco::PyPI, pypi),
+        (Eco::Crates, crates),
+    ];
+
+    for (eco, names) in plan {
+        let (mut done, mut failed, mut skipped) = (0usize, 0usize, 0usize);
+        for name in names {
+            if recently_attempted_eco(&db, eco, &name).await {
+                skipped += 1;
+                continue;
+            }
+            match ingest(&db, eco, &name, None).await {
+                Ok(r) => {
+                    done += 1;
+                    if done % 50 == 0 {
+                        tracing::info!(eco = eco.as_str(), done, failed, skipped, last = %r.name,
+                            "code corpus: seeding progress");
+                    }
+                }
+                Err(e) => {
+                    failed += 1;
+                    record_failure_eco(&db, eco, &name, "", &e.to_string()).await;
+                }
+            }
+            // 对前台让路。300ms 一个 ≈ 每小时 12000 个，跑满一轮几小时，代价是几乎无感。
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        }
+        tracing::info!(eco = eco.as_str(), done, failed, skipped, "code corpus: ecosystem finished");
+    }
+    tracing::info!("code corpus: seeding finished");
+    Ok(())
+}
+
+async fn recently_attempted_eco(db: &sqlx::PgPool, eco: Eco, name: &str) -> bool {
+    sqlx::query_scalar::<_, i64>(
+        "SELECT count(*) FROM code_corpus_fetches \
+          WHERE ecosystem = $1 AND name = $2 AND fetched_at > now() - interval '30 days'",
+    )
+    .bind(eco.as_str()).bind(name)
+    .fetch_one(db).await.map(|n| n > 0).unwrap_or(false)
+}
+
+async fn record_failure_eco(db: &sqlx::PgPool, eco: Eco, name: &str, version: &str, err: &str) {
+    let _ = sqlx::query(
+        "INSERT INTO code_corpus_fetches (ecosystem, name, version, ok, error) \
+         VALUES ($1,$2,$3,false,$4) \
+         ON CONFLICT (ecosystem, name, version) DO UPDATE \
+           SET ok = false, error = EXCLUDED.error, fetched_at = now()",
+    )
+    .bind(eco.as_str()).bind(name).bind(version)
+    .bind(err.chars().take(500).collect::<String>())
+    .execute(db).await;
+}
+
+/// 开机后自动开始预热。
+///
+/// `MICHAEL_CODE_CORPUS_SEED=0` 关掉。默认开：语料库空着对用户没有价值，
+/// 而它对前台的影响被上面那条 300ms 间隔压到几乎为零。
+pub fn spawn(db: sqlx::PgPool) {
+    if std::env::var("MICHAEL_CODE_CORPUS_SEED").ok().as_deref() == Some("0") {
+        tracing::info!("code corpus: seeding disabled by MICHAEL_CODE_CORPUS_SEED=0");
+        return;
+    }
+    tokio::spawn(async move {
+        // 让迁移和主要初始化先过去，别和启动抢资源。
+        tokio::time::sleep(std::time::Duration::from_secs(45)).await;
+        if let Err(err) = seed_all(db, 250, 20000).await {
+            tracing::warn!(%err, "code corpus: background seeding failed");
+        }
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -600,6 +1197,65 @@ declare function notExported(): void;
         // 空查询要能安全地退化成「什么都不匹配」，而不是拼出坏语法。
         assert_eq!(or_form("   "), "");
         assert_eq!(or_form("!!! ???"), "");
+    }
+
+    #[test]
+    fn python_declarations_and_their_docstrings_come_out() {
+        // Python 的文档字符串在声明**之后**（缩进的三引号块），和 TS 正好相反——
+        // 抽错方向就只剩签名、没有说明。
+        let src = "def connect(dsn: str, *, timeout: int = 30) -> Connection:\n    \"\"\"Open a connection.\n\n    Raises TimeoutError when the server does not answer.\n    \"\"\"\n    ...\n\nclass Pool:\n    \"\"\"A pool of connections.\"\"\"\n    pass\n\ndef _private():\n    pass\n";
+        let mut out = Vec::new();
+        extract_python(src, &mut out);
+        let names: Vec<&str> = out.iter().map(|e| e.symbol.as_str()).collect();
+        assert!(names.contains(&"connect"), "顶层函数要抽出来：{names:?}");
+        assert!(names.contains(&"Pool"), "顶层类要抽出来：{names:?}");
+        assert!(!names.contains(&"_private"), "下划线开头是约定的私有，不进语料");
+        let c = out.iter().find(|e| e.symbol == "connect").unwrap();
+        assert!(c.body.contains("timeout: int = 30"), "签名要完整：{}", c.body);
+        assert!(c.body.contains("Raises TimeoutError"), "docstring 要一起收：{}", c.body);
+    }
+
+    #[test]
+    fn rust_pub_items_and_their_doc_comments_come_out() {
+        let src = "/// Opens a store at `path`.\n///\n/// Returns an error when the path is not writable.\n#[inline]\npub fn open(path: &Path) -> Result<Store> {\n    todo!()\n}\n\npub struct Store {\n    inner: u8,\n}\n\nfn private_helper() {}\n";
+        let mut out = Vec::new();
+        extract_rust(src, &mut out);
+        let names: Vec<&str> = out.iter().map(|e| e.symbol.as_str()).collect();
+        assert!(names.contains(&"open"), "pub fn 要抽出来：{names:?}");
+        assert!(names.contains(&"Store"), "pub struct 要抽出来：{names:?}");
+        assert!(!names.contains(&"private_helper"), "非 pub 的不进语料");
+        let o = out.iter().find(|e| e.symbol == "open").unwrap();
+        assert!(o.body.contains("Returns an error when the path is not writable"),
+            "/// 文档要一起收，属性宏不能打断文档块：{}", o.body);
+    }
+
+    #[test]
+    fn each_ecosystem_only_unpacks_files_that_carry_its_api() {
+        assert!(wanted_file_for("dist/index.d.ts", Eco::Npm));
+        assert!(wanted_file_for("pkg/types.pyi", Eco::PyPI));
+        assert!(wanted_file_for("pkg/client.py", Eco::PyPI));
+        assert!(wanted_file_for("foo-1.0/src/lib.rs", Eco::Crates));
+        // 测试目录在三个生态里都不是 API 表面。
+        assert!(!wanted_file_for("foo/tests/test_x.py", Eco::PyPI));
+        assert!(!wanted_file_for("foo-1.0/tests/it.rs", Eco::Crates));
+        // 跨生态不串味：.py 不该被 npm 收，.d.ts 不该被 crates 收。
+        assert!(!wanted_file_for("pkg/client.py", Eco::Npm));
+        assert!(!wanted_file_for("dist/index.d.ts", Eco::Crates));
+    }
+
+    #[test]
+    fn the_new_registries_are_on_the_allowlist_and_nothing_else_is() {
+        for ok in [
+            "https://pypi.org/pypi/requests/json",
+            "https://files.pythonhosted.org/packages/x/requests-2.tar.gz",
+            "https://crates.io/api/v1/crates/serde",
+            "https://static.crates.io/crates/serde/serde-1.0.0.crate",
+        ] {
+            assert!(host_allowed(ok), "{ok} 应当放行");
+        }
+        for bad in ["https://pypi.org.evil.com/x", "http://crates.io/x", "https://crates.io:8080/x"] {
+            assert!(!host_allowed(bad), "{bad} 必须拒绝");
+        }
     }
 
     #[test]

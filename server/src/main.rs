@@ -148,6 +148,10 @@ async fn main() -> anyhow::Result<()> {
     api_key_store::spawn_purge(state.clone());
     // 结算恢复：补扣「已服务却因结算失败没扣到钱」的调用，幂等、绝不双扣。
     settlement::spawn(state.clone());
+    // 代码语料库预热：空着的语料库对用户没有价值，所以默认开。
+    // 串行 + 每个包之间 300ms 间隔，对前台几乎无感；MICHAEL_CODE_CORPUS_SEED=0 可关。
+    // 入库即刻可用——检索读的是同一张表，不存在「攒够一批才生效」的窗口。
+    code_corpus::spawn(state.db.clone());
     // 模型能力目录：实时抓上下文档位和推理档位，取代手写表。
     // 抓不到不影响启动——它有三级降级（内存 → 库里上次的值 → 硬编码表）。
     model_catalog::spawn(state.clone());
@@ -483,6 +487,8 @@ async fn main() -> anyhow::Result<()> {
         .route("/responses", post(models::responses_proxy))
         .route("/api/knowledge/search", post(models::knowledge_search))
         .route("/api/code-corpus/search", post(models::code_corpus_search))
+        .route("/api/code-corpus/seed", post(models::code_corpus_seed))
+        .route("/api/code-corpus/stats", get(models::code_corpus_stats))
         .route("/api/knowledge/domains", get(models::knowledge_domains))
         .route("/api/admin/events", get(realtime::recent_events))
         .route("/api/admin/stats", get(realtime::stats))

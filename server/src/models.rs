@@ -4486,8 +4486,15 @@ pub async fn code_corpus_search(
     // 按需入库：指名道姓要某个包、而库里还没有 → 现拉一次再答。
     // 抓取失败不算接口失败——语料是增益，答不出来也要把已有的结果给出去。
     if let Some(pkg) = package {
+        // 生态由调用方指明（客户端知道自己是在 node_modules 还是 site-packages 里找不到的）；
+        // 没指明就按 npm 办——这个 IDE 的主战场。
+        let eco = body
+            .get("ecosystem")
+            .and_then(|v| v.as_str())
+            .and_then(crate::code_corpus::Eco::parse)
+            .unwrap_or(crate::code_corpus::Eco::Npm);
         if !crate::code_corpus::have_package(&state.db, pkg).await {
-            match crate::code_corpus::ingest_npm(&state.db, pkg, None).await {
+            match crate::code_corpus::ingest(&state.db, eco, pkg, None).await {
                 Ok(report) => {
                     tracing::info!(
                         package = %report.name, version = %report.version,
@@ -4511,6 +4518,68 @@ pub async fn code_corpus_search(
         .await
         .map_err(|e| AppError::internal(format!("code corpus search failed: {e}")))?;
     Ok(Json(json!({ "results": hits, "ingested": ingested })))
+}
+
+/// POST /api/code-corpus/seed —— 批量预热（管理员）。
+///
+/// 按需生长要靠人一个个问出来，冷启动太慢。这个接口按流行度枚举常用包、逐个抽取入库，
+/// 让常用库开箱即有。跑在后台任务里立刻返回：一次预热是几十分钟量级的活，
+/// 不该占着一个 HTTP 连接，更不该被网关的响应超时掐断。
+///
+/// 可重入：已经抓过的包会跳过（见 recently_attempted），中断之后重跑接着上次走。
+pub async fn code_corpus_seed(
+    State(state): State<AppState>,
+    claims: crate::auth::Claims,
+    Json(body): Json<serde_json::Value>,
+) -> ApiResult<Json<serde_json::Value>> {
+    if claims.role != "admin" {
+        return Err(AppError::forbidden("需要管理员权限"));
+    }
+    // per_term 是每个种子词翻多少条；max 是这一轮最多抽多少个包。
+    // 默认值按「一次跑完不超过一小时」挑，运维要更多可以自己加大。
+    let per_term = body.get("per_term").and_then(|v| v.as_u64()).unwrap_or(250) as usize;
+    let max_packages = body.get("max").and_then(|v| v.as_u64()).unwrap_or(2000) as usize;
+    let db = state.db.clone();
+    tokio::spawn(async move {
+        if let Err(err) = crate::code_corpus::seed(db, per_term.min(2000), max_packages.min(20000)).await {
+            tracing::warn!(%err, "code corpus: seeding failed");
+        }
+    });
+    Ok(Json(json!({
+        "started": true, "per_term": per_term, "max": max_packages,
+        "note": "后台跑；进度看 code_corpus_fetches 表或日志 code corpus: seeding progress"
+    })))
+}
+
+/// GET /api/code-corpus/stats —— 语料库现状（管理员）。
+pub async fn code_corpus_stats(
+    State(state): State<AppState>,
+    claims: crate::auth::Claims,
+) -> ApiResult<Json<serde_json::Value>> {
+    if claims.role != "admin" {
+        return Err(AppError::forbidden("需要管理员权限"));
+    }
+    let (packages, entries): (i64, i64) = sqlx::query_as(
+        "SELECT count(DISTINCT name), count(*) FROM code_corpus",
+    )
+    .fetch_one(&state.db)
+    .await
+    .map_err(|e| AppError::internal(e.to_string()))?;
+    let (ok_n, fail_n): (i64, i64) = sqlx::query_as(
+        "SELECT count(*) FILTER (WHERE ok), count(*) FILTER (WHERE NOT ok) FROM code_corpus_fetches",
+    )
+    .fetch_one(&state.db)
+    .await
+    .map_err(|e| AppError::internal(e.to_string()))?;
+    let bytes: i64 = sqlx::query_scalar("SELECT pg_total_relation_size('code_corpus')")
+        .fetch_one(&state.db)
+        .await
+        .unwrap_or(0);
+    Ok(Json(json!({
+        "packages": packages, "entries": entries,
+        "fetches_ok": ok_n, "fetches_failed": fail_n,
+        "bytes": bytes,
+    })))
 }
 
 /// GET /api/knowledge/domains — list the available knowledge domains + their topics
