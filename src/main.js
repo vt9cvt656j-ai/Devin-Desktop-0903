@@ -23603,13 +23603,29 @@ async function _agentContextForQuery(baseContext, query, root, referenceTimeoutM
     parts.push(`\n--- 工程索引状态（IDE 实测，非推断） ---\n${_missing.join("；")}。**索引缺失 ≠ 项目里没有这些东西**，绝不能据此断定项目结构、或说某个文件/符号不存在。需要全局定位就直接用 list_dir / find_files / find_symbol / semantic_search 读真实文件取证。`);
   }
   const stack = _projectStacks.get(root) || {};
-  if (profile.applies) {
+  // 「裁决缺席」不等于「这轮不是工程活」——这两件事在这里混成了一个条件。
+  //
+  // 完整裁决实测 8–20 秒，而前台只等 6 秒、每会话还只等一次，所以 applies=false 的常见原因
+  // 是**裁决还没回来**（intentSource === "pending"），不是模型判定了「这轮不用碰项目」。
+  // 拿一个还没回来的旁路调用去扣留**已经在内存里**的代码检索结果，正是 gate-tristate 那条
+  // 规矩点名禁止的形状：「夺走一样能力（工具、**检索**、知识）→ 必须加 intentSource 守卫」。
+  // 它一直没被那道守卫看见，只因为扫描器的正则认的是 `run.engineering` 这个名字，
+  // 而这里叫 profile。
+  //
+  // 净效果正好是反的：用户说得越含糊、越需要证据的那些轮次，拿到的证据反而越少。
+  //
+  // 所以拆开：**事实**（BM25 命中的真实代码片段）在裁决没回来时照给；**散文**（那段所有模型
+  // 共用的工程约束、以及外部参考预取）继续跟着 applies 走——少一道仪式是对的，扣证据不对。
+  const _verdictLanded = profile?.intentSource === "ai";
+  if (!_verdictLanded || profile.applies) {
     // Never build indexes or wait on community providers in the first-token path. A ready BM25
     // snapshot is free to use; explicit semantic_search/search_tools calls can wait on cold data.
     let localRefs = "";
     try { localRefs = await _buildRetrievedCodeContext(query, root, _ctxScale >= 4 ? 10 : 4, false); } catch {}
-    parts.push(`\n--- 所有模型共用的工程约束（由 IDE 编排层执行） ---\n1. 目标文件已知就直接读取；位置未知才搜索一次定位。改已有文件前必须读取真实源码和相关调用方。\n2. 多文件/架构任务先列可验证计划，复用项目现有模式；不得散落硬编码路径、密钥、颜色、端口或业务规则。\n3. 修改后必须按本项目真实脚本完成编译/类型检查与测试；命令非零、超时或未运行都不算通过。${profile.bug || profile.debugProject ? "\n4. Bug/调试任务必须先拿证据：复现或读取真实报错/日志/诊断，再沿调用链定位根因；修复用最小补丁并同步调用方，最后重跑同一失败路径或聚焦回归，不能靠猜或只跑泛泛构建。" : ""}${profile.ui ? "\n5. UI 任务构建通过后还必须用 browser 在桌面和移动视口验证真实页面、错误、资源、溢出与关键交互。" : ""}`);
     if (localRefs) parts.push(localRefs);
+  }
+  if (profile.applies) {
+    parts.push(`\n--- 所有模型共用的工程约束（由 IDE 编排层执行） ---\n1. 目标文件已知就直接读取；位置未知才搜索一次定位。改已有文件前必须读取真实源码和相关调用方。\n2. 多文件/架构任务先列可验证计划，复用项目现有模式；不得散落硬编码路径、密钥、颜色、端口或业务规则。\n3. 修改后必须按本项目真实脚本完成编译/类型检查与测试；命令非零、超时或未运行都不算通过。${profile.bug || profile.debugProject ? "\n4. Bug/调试任务必须先拿证据：复现或读取真实报错/日志/诊断，再沿调用链定位根因；修复用最小补丁并同步调用方，最后重跑同一失败路径或聚焦回归，不能靠猜或只跑泛泛构建。" : ""}${profile.ui ? "\n5. UI 任务构建通过后还必须用 browser 在桌面和移动视口验证真实页面、错误、资源、溢出与关键交互。" : ""}`);
     if (profile.needsReferences) {
       // 预取成果必须被消费：**同步**读缓存，命中即注入本轮（零 await、首 token 零延迟，
       // 守住"不阻塞首答"的既有守卫测试）；未命中则后台预热、下轮命中。旧版
