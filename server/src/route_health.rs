@@ -273,29 +273,63 @@ const ALARM_AFTER_SECS: i64 = 5 * 60;
 /// 同一条线路两次通知之间的最小间隔。告警疲劳是这次事故没人看的真正成因。
 const ALARM_COOLDOWN_SECS: i64 = 6 * 3600;
 
-async fn alarm_recipients(state: &AppState) -> Vec<String> {
-    sqlx::query_scalar::<_, String>("SELECT email FROM users WHERE role = 'admin'")
-        .fetch_all(&state.db)
-        .await
-        .unwrap_or_default()
+/// 收件人只认**看起来像邮箱**的那些。
+///
+/// `users.email` 这一列并不保证是邮箱：线上实测有一个 admin 的值是 `fendoushaonian`
+/// —— 一个用户名，14 个字符、连 @ 都没有。原来不筛就直接发，结果每一轮巡检都往
+/// 邮件服务打一次必然失败的请求，日志里稳定刷 `email is not valid in to`，
+/// 真正的发送失败反而被埋在这堆噪声里。
+fn looks_like_email(s: &str) -> bool {
+    let s = s.trim();
+    let Some((user, domain)) = s.split_once('@') else {
+        return false;
+    };
+    !user.is_empty()
+        && domain.contains('.')
+        && !domain.starts_with('.')
+        && !domain.ends_with('.')
+        && s.len() <= 254
+        && !s.contains(char::is_whitespace)
+        && s.matches('@').count() == 1
 }
 
-async fn notify(state: &AppState, subject: &str, body: &str) {
+async fn alarm_recipients(state: &AppState) -> Vec<String> {
+    let all = sqlx::query_scalar::<_, String>("SELECT email FROM users WHERE role = 'admin'")
+        .fetch_all(&state.db)
+        .await
+        .unwrap_or_default();
+    let (good, bad): (Vec<_>, Vec<_>) = all.into_iter().partition(|e| looks_like_email(e));
+    if !bad.is_empty() {
+        // 不打印地址本身，只报数量：这行会进日志，而管理员的联系方式不该躺在那里。
+        tracing::warn!(
+            skipped = bad.len(),
+            usable = good.len(),
+            "有 admin 账号的 email 字段不是邮箱地址，已跳过（那是用户名，不是收件人）"
+        );
+    }
+    good
+}
+
+/// 发出去。返回**是否至少有一封成功** —— 调用方靠它决定要不要保留冷却。
+async fn notify(state: &AppState, subject: &str, body: &str) -> bool {
     if !state.cfg.mail_enabled() {
         tracing::error!(subject, "线路告警无法发出：邮件未配置（brevo_api_key / mail_from 为空）");
-        return;
+        return false;
     }
     let to = alarm_recipients(state).await;
     if to.is_empty() {
-        tracing::error!(subject, "线路告警无处可发：没有 role='admin' 的用户");
-        return;
+        tracing::error!(subject, "线路告警无处可发：没有 email 字段是有效邮箱的 admin 账号");
+        return false;
     }
+    let mut any_ok = false;
     for addr in to {
-        if let Err(err) = crate::email::send_mail(&state.cfg, &addr, subject, body, false).await {
+        match crate::email::send_mail(&state.cfg, &addr, subject, body, false).await {
+            Ok(()) => any_ok = true,
             // 发不出去也要留痕：静默失败等于没有告警，而这正是要修的东西。
-            tracing::error!(reason = %err.msg, addr, subject, "线路告警发送失败");
+            Err(err) => tracing::error!(reason = %err.msg, subject, "线路告警发送失败"),
         }
     }
+    any_ok
 }
 
 /// 判定一条线路要不要发告警 / 恢复通知。状态存 Redis，不存进程内存。
@@ -322,7 +356,7 @@ async fn evaluate_alarm(state: &AppState, route_id: Uuid, label: &str, word: &st
                 .query_async(&mut conn)
                 .await;
             if sent.is_some() {
-                notify(
+                let _ = notify(
                     state,
                     &format!("[恢复] 线路「{label}」又能用了"),
                     &format!("线路：{label}\n当前判定：{word}\n连败计数已清零。"),
@@ -378,7 +412,7 @@ async fn evaluate_alarm(state: &AppState, route_id: Uuid, label: &str, word: &st
         .last_ok_at
         .map(|t| format!("{:.1} 小时前", (now - t) as f64 / 3600.0))
         .unwrap_or_else(|| "有记录以来从未成功".into());
-    notify(
+    let delivered = notify(
         state,
         &format!("[告警] 线路「{label}」判定为不可用"),
         &format!(
@@ -395,6 +429,19 @@ async fn evaluate_alarm(state: &AppState, route_id: Uuid, label: &str, word: &st
         ),
     )
     .await;
+
+    // 一封都没发出去 → **把发送权还回去**，让下一轮再试。
+    //
+    // 原来是「先抢占再发」，发失败了冷却照样挂满 6 小时 —— 于是一次投递故障就能让这条
+    // 线路静音一整个冷却期，而运维那边什么都收不到。那正是这套东西要修的形态
+    //（「看起来有告警、其实一封都发不出」），不能在告警自己身上再造一遍。
+    if !delivered {
+        let _: Result<(), _> = redis::cmd("DEL")
+            .arg(key(route_id, "alarm_sent"))
+            .query_async(&mut conn)
+            .await;
+        tracing::error!(route = label, "线路告警一封都没送达，已释放冷却，下一轮重试");
+    }
 }
 
 /// 后台任务：给没有证据的线路补一次真实探测，然后评估告警。
@@ -643,6 +690,48 @@ mod tests {
             "起点没有落到持久存储上；存进程内存的话，发一次版就清零、蓝绿两版还各记各的",
         );
         assert!(head.contains("\"NX\""), "起点不是用 NX 写的，会被每轮刷新重置");
+    }
+
+    /// `users.email` 并不保证是邮箱 —— 线上有个 admin 的值是用户名。
+    #[test]
+    fn only_real_addresses_are_treated_as_recipients() {
+        assert!(looks_like_email("ops@example.com"));
+        assert!(looks_like_email("a.b+tag@mail.co.uk"));
+        // 线上实测的那一个：14 个字符、没有 @。往它发就是每轮白打一次必然失败的请求，
+        // 而真正的发送失败会被埋在这堆噪声里。
+        assert!(!looks_like_email("fendoushaonian"));
+        assert!(!looks_like_email(""));
+        assert!(!looks_like_email("@example.com"));
+        assert!(!looks_like_email("ops@localhost"));
+        assert!(!looks_like_email("ops@ example.com"));
+        assert!(!looks_like_email("a@b@c.com"));
+    }
+
+    /// 发送失败必须把冷却还回去。
+    ///
+    /// 原来是「先抢占再发」：一次投递故障就让这条线路静音整整 6 小时，而运维什么都收不到
+    /// —— 正是这套东西要修的那个形态，不能在告警自己身上再造一遍。
+    #[test]
+    fn a_failed_send_releases_the_cooldown() {
+        let src = include_str!("route_health.rs");
+        let body = src
+            .split("async fn evaluate_alarm")
+            .nth(1)
+            .expect("evaluate_alarm 不见了");
+        assert!(
+            body.contains("if !delivered {"),
+            "没有「一封都没送达就释放冷却」的分支",
+        );
+        let release = body.split("if !delivered {").nth(1).unwrap_or("");
+        assert!(
+            release.contains("DEL") && release.contains("alarm_sent"),
+            "释放分支没有真的把发送权删掉，冷却仍然会挂满",
+        );
+        // notify 必须回报结果，否则上面那个判断永远拿不到真相。
+        assert!(
+            src.contains("async fn notify(state: &AppState, subject: &str, body: &str) -> bool"),
+            "notify 不回报是否送达，调用方只能假设成功",
+        );
     }
 
     /// 阈值本身要站得住：3 连败在 16–20% 的常态失败率下会误报，5 连败不会。
