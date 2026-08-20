@@ -54,6 +54,8 @@ fn host_allowed(url: &str) -> bool {
         || host == "static.crates.io"
         // 官方文档仓库（开源 markdown）的 tarball
         || host == "codeload.github.com"
+        // PyPI 下载量排名快照（官方 BigQuery 数据集的第三方月度镜像）
+        || host == "raw.githubusercontent.com"
 }
 
 /// 生态。每一支的差别只在「去哪拿包」和「从什么文件里抽签名」，其余共用。
@@ -960,12 +962,28 @@ const SEED_TERMS: &[&str] = &[
     "state", "router", "graphql", "grpc", "websocket", "queue", "logger", "config",
     "aws", "azure", "google-cloud", "docker", "kubernetes", "stream", "parser",
     "markdown", "json", "yaml", "csv", "image", "video", "pdf", "email", "i18n",
+    // 第二批种子词：把发现面从 ~3000 铺宽。仍然按**生态切面**选词而不是具体库名——
+    // 这样命中的是每个方向的头部包，而不是某一家的全家桶。
+    "solid", "qwik", "remix", "astro", "nest", "fastify", "koa", "hono", "trpc",
+    "prisma", "drizzle", "sequelize", "typeorm", "knex", "sqlite", "mysql", "elasticsearch",
+    "kafka", "rabbitmq", "grpc-web", "protobuf", "openapi", "swagger", "zod", "joi", "yup",
+    "rxjs", "immer", "zustand", "redux", "mobx", "jotai", "recoil", "signals",
+    "storybook", "cypress", "playwright", "puppeteer", "selenium", "mock", "faker",
+    "monorepo", "turbo", "nx", "lerna", "changesets", "semver", "commander", "yargs",
+    "inquirer", "chalk", "ora", "boxen", "dotenv", "cron", "scheduler", "worker",
+    "canvas", "webgl", "three", "d3", "leaflet", "mapbox", "audio", "ffmpeg",
+    "compression", "archive", "upload", "s3", "oauth", "passport", "bcrypt", "helmet",
+    "rate-limit", "cors", "proxy", "ssr", "hydration", "islands", "pwa", "service-worker",
+    "wasm", "napi", "ffi", "electron", "tauri", "capacitor", "expo", "react-native",
+    "accessibility", "aria", "intl", "currency", "decimal", "uuid", "nanoid", "hash",
 ];
 
 /// 从 npm 官方搜索接口按流行度收集包名。
 async fn discover_popular(client: &reqwest::Client, per_term: usize) -> Vec<String> {
     use std::collections::BTreeSet;
     let mut names: BTreeSet<String> = BTreeSet::new();
+    // 被限流截断的种子词数。少收是可以接受的，**不知道自己少收了**不行。
+    let mut truncated = 0usize;
     for term in SEED_TERMS {
         let mut from = 0usize;
         while from < per_term {
@@ -977,8 +995,10 @@ async fn discover_popular(client: &reqwest::Client, per_term: usize) -> Vec<Stri
             if !host_allowed(&url) {
                 break;
             }
-            let Ok(resp) = client.get(&url).send().await else { break };
-            let Ok(body) = resp.json::<serde_json::Value>().await else { break };
+            let Some(body) = get_json_retry(client, &url).await else {
+                truncated += 1;
+                break;
+            };
             let objects = body.get("objects").and_then(|v| v.as_array()).cloned().unwrap_or_default();
             if objects.is_empty() {
                 break;
@@ -994,6 +1014,10 @@ async fn discover_popular(client: &reqwest::Client, per_term: usize) -> Vec<Stri
             // 对官方接口客气一点：这是白嫖别人的服务，不是压测。
             tokio::time::sleep(std::time::Duration::from_millis(250)).await;
         }
+    }
+    if truncated > 0 {
+        tracing::warn!(truncated, total = SEED_TERMS.len(),
+            "code corpus: npm discovery was rate-limited on some seed terms; coverage is short by that much");
     }
     names.into_iter().collect()
 }
@@ -1210,6 +1234,20 @@ const DOC_SOURCES: &[(&str, &str, &str, &str)] = &[
     ("mdn",        "mdn/content",                 "main", "files/en-us/web/"),
     // Node 官方 API 文档。整仓是 Node 源码，流式解包只留 doc/api/ 那几十个 markdown。
     ("node",       "nodejs/node",                 "main", "doc/api/"),
+    // 第二批：路径逐个核实过再加。写错路径的代价是「下载成功但一个文件都匹配不到」，
+    // 而台账只会记 ok=true entries=0 —— 看着像收录了，其实是空的（prisma 踩过一次）。
+    ("next",           "vercel/next.js",        "canary", "docs/"),
+    ("nuxt",           "nuxt/nuxt",             "main",   "docs/"),
+    ("angular",        "angular/angular",       "main",   "adev/src/content/"),
+    ("vite",           "vitejs/vite",           "main",   "docs/"),
+    ("playwright",     "microsoft/playwright",  "main",   "docs/src/"),
+    ("kubernetes",     "kubernetes/website",    "main",   "content/en/docs/"),
+    ("docker",         "docker/docs",           "main",   "content/"),
+    ("supabase",       "supabase/supabase",     "master", "apps/docs/content/"),
+    ("tanstack-query", "TanStack/query",        "main",   "docs/"),
+    ("bun",            "oven-sh/bun",           "main",   "docs/"),
+    ("deno",           "denoland/docs",         "main",   "runtime/"),
+    ("go",             "golang/website",        "master", "_content/doc/"),
 ];
 
 /// markdown 按 `##` 切节 —— 和手写语料库同一套切法，切出来的每一节都能独立读懂。
@@ -1363,6 +1401,36 @@ async fn recently_attempted_eco_named(db: &sqlx::PgPool, eco: &str, name: &str) 
     .fetch_one(db).await.map(|n| n > 0).unwrap_or(false)
 }
 
+/// 带重试的 JSON GET。
+///
+/// 发现阶段原来是「一失败就 break」——注册表限流时那一整个种子词/那一页之后的全部丢掉，
+/// **而且完全静默**：日志上只看到候选数变少，看不出是被限流截断的。实测 npm 只发现 2469、
+/// crates 只发现 2600（预期各上万），就是这么少的。
+///
+/// 限流是**预期内**的（我们在白嫖别人的公共接口），所以按预期处理：退避重试，
+/// 三次都不行才放弃这一页，并且如实计数、最后报出来。
+async fn get_json_retry(client: &reqwest::Client, url: &str) -> Option<serde_json::Value> {
+    for attempt in 0..3u32 {
+        if attempt > 0 {
+            // 1s → 4s。限流恢复通常只要几秒，不值得等更久。
+            tokio::time::sleep(std::time::Duration::from_millis(1000 * (1 << (2 * (attempt - 1))))).await;
+        }
+        let Ok(resp) = client.get(url).send().await else { continue };
+        // 429/5xx 值得重试；4xx（包名不存在之类）不值得，直接放弃。
+        let status = resp.status();
+        if status.is_client_error() && status.as_u16() != 429 {
+            return None;
+        }
+        if !status.is_success() {
+            continue;
+        }
+        if let Ok(v) = resp.json::<serde_json::Value>().await {
+            return Some(v);
+        }
+    }
+    None
+}
+
 /// crates.io 有官方的下载量排序，直接按热度翻页。
 async fn discover_crates(client: &reqwest::Client, want: usize) -> Vec<String> {
     let mut names = Vec::new();
@@ -1370,8 +1438,11 @@ async fn discover_crates(client: &reqwest::Client, want: usize) -> Vec<String> {
     while names.len() < want && page <= 100 {
         let url = format!("https://crates.io/api/v1/crates?sort=downloads&per_page=100&page={page}");
         if !host_allowed(&url) { break; }
-        let Ok(resp) = client.get(&url).send().await else { break };
-        let Ok(body) = resp.json::<serde_json::Value>().await else { break };
+        let Some(body) = get_json_retry(client, &url).await else {
+            tracing::warn!(page, collected = names.len(),
+                "code corpus: crates discovery stopped early (rate-limited)");
+            break;
+        };
         let arr = body.get("crates").and_then(|v| v.as_array()).cloned().unwrap_or_default();
         if arr.is_empty() { break; }
         for c in &arr {
@@ -1386,9 +1457,10 @@ async fn discover_crates(client: &reqwest::Client, want: usize) -> Vec<String> {
     names
 }
 
-/// PyPI 没有官方的「按下载量排序」接口（BigQuery 那份不算公开 API），
-/// 所以这一支用一份**明确的种子名单**打底：常用框架、数据科学、云 SDK、工具链。
-/// 名单之外的包仍然会被「按需入库」补进来——预热只是让常用的开箱即有。
+/// PyPI 的兜底种子名单。
+///
+/// 正常走 `discover_pypi`（真实下载量排名，15000 个）；那份取不到时才用这个，
+/// 保证离线或数据源挂掉时仍有常用包可收。
 const PYPI_SEED: &[&str] = &[
     "requests","urllib3","numpy","pandas","scipy","matplotlib","pillow","pydantic","fastapi",
     "flask","django","starlette","uvicorn","gunicorn","httpx","aiohttp","sqlalchemy","alembic",
@@ -1401,6 +1473,39 @@ const PYPI_SEED: &[&str] = &[
     "python-dateutil","pytz","arrow","pendulum","orjson","ujson","msgpack","protobuf","grpcio",
     "structlog","loguru","sentry-sdk","prometheus-client","opentelemetry-api","websockets",
 ];
+
+/// PyPI 按真实下载量排名的包名。
+///
+/// PyPI **不提供**按下载量排序的公开接口——官方数据在 Google BigQuery 的公共数据集里，
+/// 要凭证才能查。`hugovk/top-pypi-packages` 是从那份官方数据集每月生成的快照，
+/// 是这件事实际上的标准来源。**出处要说清楚**：它是官方数据的第三方镜像，不是官方接口；
+/// 取不到时回落到本文件里那份手写种子名单，预热照常进行，只是覆盖窄一些。
+async fn discover_pypi(client: &reqwest::Client, want: usize) -> Vec<String> {
+    let url = "https://raw.githubusercontent.com/hugovk/top-pypi-packages/main/top-pypi-packages.json";
+    let fallback = || -> Vec<String> {
+        tracing::warn!("code corpus: pypi ranking unavailable, falling back to the seed list");
+        PYPI_SEED.iter().map(|s| s.to_string()).collect()
+    };
+    if !host_allowed(url) {
+        return fallback();
+    }
+    let Ok(resp) = client.get(url).send().await else { return fallback() };
+    let Ok(body) = resp.json::<serde_json::Value>().await else { return fallback() };
+    let rows = body
+        .get("rows")
+        .or_else(|| body.get("data"))
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let names: Vec<String> = rows
+        .iter()
+        .filter_map(|r| r.get("project").and_then(|v| v.as_str()))
+        .filter(|n| valid_simple_name(n))
+        .map(|n| n.to_string())
+        .take(want)
+        .collect();
+    if names.is_empty() { fallback() } else { names }
+}
 
 /// 批量预热：三个生态一起。
 ///
@@ -1423,7 +1528,7 @@ pub async fn seed_all(db: sqlx::PgPool, npm_per_term: usize, per_eco_max: usize)
 
     let npm = discover_popular(&client, npm_per_term).await;
     let crates = discover_crates(&client, per_eco_max).await;
-    let pypi: Vec<String> = PYPI_SEED.iter().map(|s| s.to_string()).collect();
+    let pypi = discover_pypi(&client, per_eco_max).await;
     tracing::info!(
         npm = npm.len(), crates = crates.len(), pypi = pypi.len(),
         "code corpus: seeding discovered candidates"
@@ -1578,6 +1683,39 @@ declare function notExported(): void;
         // 空查询要能安全地退化成「什么都不匹配」，而不是拼出坏语法。
         assert_eq!(or_form("   "), "");
         assert_eq!(or_form("!!! ???"), "");
+    }
+
+    #[test]
+    fn every_doc_source_declares_a_path_that_could_actually_match() {
+        // 路径写错的代价是**静默的**：下载成功、一个文件都匹配不到，台账记 ok=true entries=0，
+        // 看着像收录了其实是空的。prisma 就这么空过一轮（正文在 apps/docs/content/，
+        // 而清单里写的是根下的 content/）。这里只能钉住形状，真实性靠上线后看 entries。
+        assert!(DOC_SOURCES.len() >= 20, "文档源太少了：{}", DOC_SOURCES.len());
+        let mut seen = std::collections::HashSet::new();
+        for (slug, repo, git_ref, prefix) in DOC_SOURCES {
+            assert!(seen.insert(*slug), "文档源 slug 重复：{slug}");
+            assert!(repo.contains('/') && !repo.starts_with('/'), "{slug}: 仓库名要是 owner/name");
+            assert!(!git_ref.is_empty(), "{slug}: 缺分支");
+            assert!(
+                prefix.ends_with('/') && !prefix.starts_with('/'),
+                "{slug}: 路径前缀必须以 / 结尾、不以 / 开头（要和 tar 里剥掉顶层后的相对路径对齐），实际 {prefix:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn pypi_falls_back_to_the_seed_list_rather_than_collecting_nothing() {
+        // 排名数据是官方 BigQuery 数据集的第三方月度镜像——不是官方接口，会挂。
+        // 挂了要退回种子名单继续预热，而不是让整个 PyPI 支收零个。
+        assert!(PYPI_SEED.len() >= 50, "兜底名单太短：{}", PYPI_SEED.len());
+        assert!(PYPI_SEED.iter().all(|n| valid_simple_name(n)), "兜底名单里有非法包名");
+        for must in ["requests", "numpy", "fastapi", "django"] {
+            assert!(PYPI_SEED.contains(&must), "兜底名单缺了 {must}");
+        }
+        let src = include_str!("code_corpus.rs");
+        let prod = &src[..src.find("mod tests").expect("tests module")];
+        assert_eq!(prod.matches("fallback()").count(), 4,
+            "discover_pypi 的每条失败路径都要回落，不能有一条直接返回空");
     }
 
     #[test]
