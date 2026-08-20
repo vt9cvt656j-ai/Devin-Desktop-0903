@@ -28289,6 +28289,52 @@ function _applyToolPayloadWindow(
   return window;
 }
 
+/// 回执里点了名的工具，当场装进窗口。
+///
+/// 修的是一个反复发生的死胡同：harness 硬拒一次调用、并**点名**叫模型改用另一个工具
+/// （timeout 包住的 dev server 指向 run_in_terminal、需要真 TTY 的交互程序、
+/// 「注册表里没有这个工具」之后的换路清单、证据不足时给出的取证路线），而那个被点名的
+/// 工具当轮**不在窗口里**。模型被打回、又被指去用一个它手上没有的工具，最省事的出口
+/// 就是把命令贴给用户自己去终端敲——正是「这 IDE 不支持」那句抱怨的机器来法。
+///
+/// 此前每发现一处死胡同，解法都是往 roleCoreMap 里再硬塞一个工具名。窗口从 11 涨到 20，
+/// 每个都按轮收注意力税，而下一处死胡同照样会冒出来。这里换成：**谁被点名谁进来**，
+/// 一次覆盖全部现有和将来的点名处，每轮成本为零（只在打回时才跑）。
+///
+/// 判据全部来自已有事实，不新建第四份手抄工具名清单：
+///   · 只在回执**像一次打回**时跑（权威失败判定，或几个结构化标记）；
+///   · 名字必须在 run._toolRegistry 这个真实注册表里；
+///   · 已经在窗口里的跳过，免得白重算前缀缓存。
+function _admitToolsNamedInText(text, toolSchemas, run, max = 4) {
+  const body = String(text || "");
+  if (!body || !Array.isArray(toolSchemas)) return 0;
+  const registry = run?._toolRegistry;
+  if (!(registry instanceof Map) || !registry.size) return 0;
+  const loaded = new Set(toolSchemas.map((s) => String(s?.function?.name || "")).filter(Boolean));
+  const adds = [];
+  const seen = new Set();
+  for (const m of body.matchAll(/\b([a-z][a-z0-9_]{2,31})\b/g)) {
+    const name = m[1];
+    if (seen.has(name)) continue;
+    seen.add(name);
+    if (loaded.has(name) || !registry.has(name)) continue;
+    adds.push(registry.get(name));
+    if (adds.length >= max) break;
+  }
+  if (!adds.length) return 0;
+  _applyToolPayloadWindow(toolSchemas, adds, run._toolCoreNames);
+  return adds.length;
+}
+
+/// 这条回执是不是一次「被打回」。只有打回才值得去扫工具名——正常成功回执里出现的
+/// 工具名多半是叙述，逐轮扫会把窗口搅动一遍，白白作废前缀缓存。
+function _looksLikeToolRefusal(text) {
+  const body = String(text || "");
+  if (!body) return false;
+  return !!_toolFailureMatch(body)
+    || /\[RECOVERY:|\[not executed\]|\[工具选择\]|\[needs a real terminal\]/.test(body);
+}
+
 function _workspaceAncestorRoots(projectRoot, maxDepth = 3) {
   const roots = [];
   let current = String(projectRoot || "").trim().replace(/\\/g, "/").replace(/\/+$/, "");
@@ -33217,6 +33263,16 @@ function _searchToolsFuzzyMatch(query, registry, loadedNames) {
   // 分词：空格/逗号分隔的多词查询逐词匹配；单字符噪声词丢弃，保留中文短词。
   const tokens = q.split(/[\s,，、]+/).filter((w) => w.length >= 2);
   if (!tokens.length) tokens.push(q);
+  // 中文不带空格，整句会变成**一个** token：「在浏览器里点一下按钮」要求某条 trigger
+  // 逐字包含这十个字才算命中，实际恒不命中。编排器超时时模糊层是唯一兜底，而用户
+  // 大多用中文提问——于是兜底在最需要它的时候恒为空。给 CJK 词补二字滑窗作为附加词；
+  // 整词命中仍按原分计，二元组只记 1 分，排序逻辑一个字不动。
+  const bigrams = [];
+  for (const w of tokens) {
+    if (w.length < 3 || !/[\u4e00-\u9fff]/.test(w)) continue;
+    for (let i = 0; i + 2 <= w.length; i++) bigrams.push(w.slice(i, i + 2));
+  }
+  const extraTokens = [...new Set(bigrams)].filter((b) => !tokens.includes(b));
   const hits = [];
   for (const [name, schema] of registry.entries()) {
     const fn = schema?.function;
@@ -33234,6 +33290,12 @@ function _searchToolsFuzzyMatch(query, registry, loadedNames) {
       if (triggers.some((t) => String(t).toLowerCase().includes(w))) { score += 2; matchedOn.push("trigger"); }
       if (useCases.some((u) => String(u).toLowerCase().includes(w))) { score += 2; matchedOn.push("use_case"); }
       if (desc.includes(w)) { score += 1; matchedOn.push("desc"); }
+    }
+    for (const w of extraTokens) {
+      if (lname.includes(w) || triggers.some((t) => String(t).toLowerCase().includes(w))
+        || useCases.some((u) => String(u).toLowerCase().includes(w)) || desc.includes(w)) {
+        score += 1; matchedOn.push("cjk");
+      }
     }
     if (score <= 0) continue;
     hits.push({
@@ -49053,6 +49115,11 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
         if (it._auAdvice) { _resultMsg += it._auAdvice; it._auAdvice = ""; }
         // 计划提示与 ask_user 软建议同通道：附在真实工具结果后，不替代结果。
         if (it._planAdvice) { _resultMsg += it._planAdvice; it._planAdvice = ""; }
+        // 被打回、且回执点名了别的工具 → 当场把那个工具装进窗口（见 _admitToolsNamedInText）。
+        // 不这么做的话，模型下一轮拿到的是「你该用 X」而手上没有 X，只能把命令甩回给用户。
+        if (_looksLikeToolRefusal(_resultMsg)) {
+          try { _admitToolsNamedInText(_resultMsg, toolSchemas, run); } catch {}
+        }
         return _resultMsg;
       };
 

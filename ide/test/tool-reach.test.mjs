@@ -84,7 +84,9 @@ test("每个工具的 category 都配了展示名", () => {
 // ---- 2. 完整能力名录 ------------------------------------------------------
 
 test("能力名录列出注册表里的每一个工具名", () => {
-  const listed = new Set(INDEX.split("\n").flatMap((line) => line.split(": ")[1]?.split(" ") || []));
+  // 名录现在是 `name(何时用)`，取名字要剥掉注解。
+  const listed = new Set(INDEX.split("\n").flatMap((line) =>
+    (line.split(": ")[1]?.split(" ") || []).map((entry) => entry.replace(/\(.*$/, ""))));
   const missing = [...REGISTERED, "search_tools"].filter((name) => !listed.has(name));
   assert.deepEqual(missing, [], `这些工具在名录里没有名字，模型无从调用：${missing.join(", ")}`);
 });
@@ -109,9 +111,29 @@ test("能力名录进了随 system 前缀发送的工具提示", () => {
 });
 
 test("能力名录的成本仍在预算内", () => {
-  // 全量 133 个名字约 560 token。它换来的是 121 个此前够不着的工具，很划算；
-  // 但如果哪天有人把整段描述塞进来，这条会红。
-  assert.ok(INDEX.length < 3000, `能力名录 ${INDEX.length} 字符，太大了——只该有名字，不该有描述`);
+  // 立场变过一次，理由写在这里。
+  //
+  // 原来是「只该有名字，不该有描述」，全量 133 个名字约 560 token。但光有名字，
+  // `probe_env` / `ui_extract` / `remote` / `system` / `capture_start` 这种模型看了
+  // 也不知道什么时候该伸手——于是那些能力结构性地永远轮不到，只能一个一个硬塞进
+  // 开局窗口（窗口从 11 涨到 20，每个都按轮收注意力税，而下一处死胡同照样冒出来）。
+  //
+  // 现在每个名字后面带一句 ≤16 字的「何时用」，文件系统那几个名字自解释的不带。
+  // 约 2000 token，换来 140 个能力都能被想到——不到硬塞那 20 个 schema
+  // （约 7500 token）的三分之一。
+  //
+  // 4200 这条线守的是「只许一句话，不许把整段描述塞进来」：注解上限是 16 字，
+  // 撞线说明有人在往里灌正文，那才是真的击穿预算。
+  assert.ok(INDEX.length < 4200,
+    `能力名录 ${INDEX.length} 字符，太大了——每条注解只该 ≤16 字，不该是整段描述`);
+  // 名字自解释的那几个不许带注解，否则就是白花钱。
+  assert.doesNotMatch(INDEX, /\bread_file\(/);
+  assert.doesNotMatch(INDEX, /\blist_dir\(/);
+  // 而名字说不清的那些必须带上，否则这次改动等于没做。
+  for (const name of ["probe_env", "ui_extract", "save_skill", "find_symbol"]) {
+    if (!INDEX.includes(name)) continue;
+    assert.match(INDEX, new RegExp(`\\b${name}\\(`), `${name} 光看名字想不到什么时候用，必须带注解`);
+  }
 });
 
 // ---- 3. 开局窗口保持最小 --------------------------------------------------

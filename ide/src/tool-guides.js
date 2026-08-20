@@ -759,13 +759,45 @@ let _capabilityIndexCache = "";
  * 返回值是**字节稳定**的（只依赖冻结的 TOOL_METADATA，不含任务文本），可以安全地
  * 待在 prompt cache 前缀里。
  */
+/// 名字已经说完了的那几个：清一色是文件系统基本操作，注解纯属浪费。
+/// 刻意写成显式名单而不是动词前缀规则——`save_skill` / `find_symbol` / `read_logs`
+/// 这些的价值恰恰**不在**名字上（存什么、找什么、哪儿的日志），漏掉注解就等于漏掉能力。
+const _SELF_EVIDENT = new Set([
+  'read_file', 'write_file', 'edit_file', 'multi_edit', 'format_file', 'view_image',
+  'list_dir', 'create_dir', 'delete_path', 'move_path', 'copy_path',
+]);
+
+/// 一句话注解：从 usage_note 的【何时用】取头一句，截到 12 字。
+///
+/// 名录原来只有名字。`probe_env` / `ui_extract` / `remote` / `system` / `capture_start`
+/// 这种名字，模型看了也不知道什么时候该伸手——于是那些能力结构性地永远轮不到，
+/// 只能一个一个硬塞进开局窗口（窗口从 11 涨到 20，每个都按轮收注意力税）。
+/// 带上注解之后 140 个能力都能被"想到"，代价约 +980 token/轮，
+/// 不到当前硬塞那 20 个 schema 成本（约 7500 token）的七分之一。
+function _capabilityNote(name, meta) {
+  if (_SELF_EVIDENT.has(String(name))) return '';
+  const usage = String(meta?.usage_note || '');
+  const raw = (usage.match(/【何时用】([^【]*)/) || [])[1] || (meta?.use_cases || [])[0] || '';
+  const clean = String(raw).replace(/\s+/g, '').split(/[；;。，,]/)[0];
+  let note = clean.slice(0, 16);
+  if (clean.length > note.length) {
+    // 别停在半截上：去掉尾部残缺的 ASCII 串、悬空的左括号和标点。
+    note = note.replace(/[A-Za-z0-9./-]+$/, '').replace(/[（(【\[/、]+$/, '');
+  }
+  // 括号成对：截断可能把右半边切走了。
+  if ((note.match(/（/g) || []).length !== (note.match(/）/g) || []).length) {
+    note = note.slice(0, note.lastIndexOf('（'));
+  }
+  return note ? `(${note})` : '';
+}
+
 export function toolCapabilityIndex() {
   if (_capabilityIndexCache) return _capabilityIndexCache;
   const byCategory = new Map();
   for (const [name, meta] of Object.entries(TOOL_METADATA)) {
     const cat = meta?.category || 'utility';
     if (!byCategory.has(cat)) byCategory.set(cat, []);
-    byCategory.get(cat).push(name);
+    byCategory.get(cat).push(name + _capabilityNote(name, meta));
   }
   const lines = [];
   for (const cat of Object.keys(CATEGORY_LABELS)) {

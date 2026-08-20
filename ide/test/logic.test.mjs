@@ -28868,6 +28868,51 @@ test("设计采用契约不再声称有个源码门禁会逐项检查", () => {
     "要如实说清收尾到底核对什么");
 });
 
+
+// ---- 中文提问要能搜到工具；被点名的工具要当场进窗口 ----
+test("中文能力描述能搜到工具，不再因为整句变一个词而恒不命中", () => {
+  const fuzzy = load("_searchToolsFuzzyMatch", {
+    TOOL_METADATA: loadConst ? {} : {},
+    autoEnrichToolMetadata: () => ({}),
+  });
+  const mk = (name, desc, triggers = []) => [name, {
+    function: { name, description: desc },
+  }];
+  const registry = new Map([
+    mk("browser", "在真实浏览器里导航、点击、输入、断言页面状态"),
+    mk("db_query", "连接数据库执行查询并返回结构化结果"),
+    mk("read_file", "读取一个文件的内容"),
+  ]);
+  // 中文不带空格：整句是一个 token，逐字 includes 恒不命中。
+  const hits = fuzzy("在浏览器里点一下按钮", registry, new Set());
+  assert.ok(hits.length > 0, "中文提问一条都搜不到——编排器超时时的唯一兜底是空的");
+  assert.equal(hits[0].name, "browser", "该排第一的没排第一");
+  const dbHits = fuzzy("我要看一眼数据库里的数据", registry, new Set());
+  assert.ok(dbHits.some((h) => h.name === "db_query"), "「数据库」这种最常见的说法都搜不到");
+  // 已经在窗口里的照样返回，但要标出来——调用方据此决定是"直接调"还是"先装载"，
+  // 一律说成"不在窗口里"会让模型白跑一趟 search_tools。
+  const loadedHit = fuzzy("在浏览器里点一下按钮", registry, new Set(["browser"]))
+    .find((h) => h.name === "browser");
+  assert.ok(loadedHit && loadedHit.alreadyLoaded === true, "已装载的要标 alreadyLoaded");
+});
+
+test("回执点名了哪个工具，那个工具当场进窗口", () => {
+  const loop = extractFn("_runAgenticLoop");
+  // 此前每发现一处「被打回、又被指去用一个手上没有的工具」，解法都是往 roleCoreMap
+  // 再硬塞一个名字——窗口从 11 涨到 20，每个都按轮收注意力税，而下一处照样会冒出来。
+  assert.match(loop, /if \(_looksLikeToolRefusal\(_resultMsg\)\)[\s\S]{0,200}?_admitToolsNamedInText\(_resultMsg, toolSchemas, run\)/,
+    "被打回的回执要扫一遍工具名并当场装载");
+  const admit = extractFn("_admitToolsNamedInText");
+  // 判据只认真实注册表，不另建第四份手抄工具名清单。
+  assert.match(admit, /registry\.has\(name\)/, "名字必须在真实注册表里");
+  assert.match(admit, /loaded\.has\(name\)/, "已经在窗口里的要跳过，别白重算前缀缓存");
+  assert.match(admit, /_applyToolPayloadWindow\(toolSchemas, adds, run\._toolCoreNames\)/);
+  // 只在打回时跑：正常成功回执里的工具名多半是叙述，逐轮扫会把窗口搅动一遍。
+  const refusal = extractFn("_looksLikeToolRefusal");
+  assert.match(refusal, /_toolFailureMatch\(body\)/);
+  assert.match(refusal, /not executed|工具选择/);
+});
+
 // ---- 写入落空要有用户侧的出口 ----
 test("尝试写了没落盘时，结局里必须留下 writes_failed", () => {
   const loop = extractFn("_runAgenticLoop");
