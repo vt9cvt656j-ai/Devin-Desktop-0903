@@ -705,6 +705,14 @@ pub async fn generate_image_chat(
     .await
     {
         Ok(ok) => ok,
+        // 只有在**上游肯定还没画**的时候才换下一条路。
+        //
+        // 三条端点是给中转站兜底的：有的只实现 /v1/images/generations，有的只走
+        // chat。但原来的写法是「上一条 Err 就试下一条」，而 Err 里混着一大类
+        // **200 已经回来、只是解析不出图**的情况（data 里没有 b64_json / 下载失败 /
+        // 轮询超时 / base64 坏了）。那些情况上游已经画完并计费了，再换端点就是
+        // 让用户为一次生图付两次、三次钱，最坏还要等 180s×3。
+        Err(e0) if e0.billed => return Err(e0.msg),
         Err(e0) => {
             match try_responses_api(
                 &client,
@@ -718,6 +726,9 @@ pub async fn generate_image_chat(
             .await
             {
                 Ok(ok) => ok,
+                Err(e1) if e1.billed => {
+                    return Err(format!("images: {e0} ｜responses: {e1}"));
+                }
                 Err(e1) => match try_chat_image_api(
                     &client,
                     b,
@@ -788,6 +799,68 @@ fn with_ide_request_id(
 /// OpenAI Codex / 中转站 (LaoZhang etc.) route — relay stations wrap gpt-image-2
 /// behind ChatGPT Plus accounts via this endpoint. The mainline `model` field is
 /// what the relay routes on; the image model itself is fixed by the tool.
+/// 一次生图尝试的失败，带一条**关键的**信息：上游有没有可能已经画了。
+///
+/// generate_image_chat 依次试三个端点（images / responses / chat），本意是照顾
+/// 那些只实现了其中一条路的中转站。问题在于原来三个函数都返回 `String`，调用方
+/// 分不出「这条路在这台中转站上不存在」和「200 回来了但我解析不出图」——后者
+/// 意味着**上游已经画完并计费**，而代码照样换个端点再画一次、再一次。
+/// 用户按一次生图，账单上是三张；最坏情况下还要等 180s×3。
+///
+/// `billed = true` 表示请求已经打进上游、图很可能已经出了，绝不能再换端点重画。
+#[derive(Debug)]
+pub(crate) struct ImageAttemptError {
+    pub(crate) billed: bool,
+    pub(crate) msg: String,
+}
+
+impl ImageAttemptError {
+    /// 这条路在这台中转站上走不通，换下一条是安全的（没画，没计费）。
+    fn route(msg: impl Into<String>) -> Self {
+        Self { billed: false, msg: msg.into() }
+    }
+    /// 上游可能已经出图并计费——到此为止，别再换端点。
+    fn billed(msg: impl Into<String>) -> Self {
+        Self { billed: true, msg: msg.into() }
+    }
+}
+
+impl std::fmt::Display for ImageAttemptError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.msg)
+    }
+}
+
+/// 发请求这一步失败了。
+///
+/// 连不上 = 这个端点在这台中转站上根本不存在，换下一个是对的。
+/// **超时不一样**：请求已经打进去了，上游很可能正在画——这时候换端点重来
+/// 就是花两份钱等两遍。网关那边的计费路径也是按这条规矩写的。
+fn image_send_error(stage: &str, e: reqwest::Error) -> ImageAttemptError {
+    if e.is_connect() {
+        ImageAttemptError::route(format!("{stage} 请求失败: {e}"))
+    } else {
+        ImageAttemptError::billed(format!(
+            "{stage} 请求已发出但没拿到完整响应（上游可能已经出图并计费，不再换端点重试）: {e}"
+        ))
+    }
+}
+
+/// 非 2xx。4xx = 请求被挡在出图之前（路由不存在、模型名不认、鉴权、限流），
+/// 换端点安全。5xx 说不准，上游可能画完了才炸——宁可不重画。
+fn image_http_error(stage: &str, status: reqwest::StatusCode, text: &str) -> ImageAttemptError {
+    let msg = format!(
+        "{stage} HTTP {}: {}",
+        status.as_u16(),
+        text.chars().take(200).collect::<String>()
+    );
+    if status.is_client_error() {
+        ImageAttemptError::route(msg)
+    } else {
+        ImageAttemptError::billed(msg)
+    }
+}
+
 async fn try_responses_api(
     client: &reqwest::Client,
     b: &str,
@@ -796,7 +869,7 @@ async fn try_responses_api(
     prompt: &str,
     size: &str,
     request_id: Option<&str>,
-) -> Result<(Vec<u8>, String), String> {
+) -> Result<(Vec<u8>, String), ImageAttemptError> {
     let url = if b.ends_with("/v1") {
         format!("{b}/responses")
     } else {
@@ -816,7 +889,7 @@ async fn try_responses_api(
         .json(&body)
         .send()
         .await
-        .map_err(|e| format!("responses 请求失败: {e}"))?;
+        .map_err(|e| image_send_error("responses", e))?;
     let status = resp.status();
     let text = response_text_limited(
         resp,
@@ -827,25 +900,30 @@ async fn try_responses_api(
         },
         "responses",
     )
-    .await?;
+    .await
+    // 读响应体失败。4xx 时读的是错误体（没出图）；否则 200 已经回来了。
+    .map_err(|e| if status.is_client_error() {
+        ImageAttemptError::route(e)
+    } else {
+        ImageAttemptError::billed(format!("{e}（响应已开始返回，上游可能已出图）"))
+    })?;
     if !status.is_success() {
-        return Err(format!(
-            "responses HTTP {}: {}",
-            status.as_u16(),
-            text.chars().take(200).collect::<String>()
-        ));
+        return Err(image_http_error("responses", status, &text));
     }
     let v: serde_json::Value =
-        serde_json::from_str(&text).map_err(|e| format!("responses 解析失败: {e}"))?;
+        serde_json::from_str(&text).map_err(|e| ImageAttemptError::billed(format!("responses 解析失败（200 已回，上游可能已出图）: {e}")))?;
     if let Some(err) = v.get("error") {
         let msg = err["message"]
             .as_str()
             .or(err.as_str())
             .unwrap_or("unknown");
-        return Err(format!(
+        // 200 里带 error 字段 = 上游明确拒了这次请求，通常在出图之前（模型名不认、
+        // 内容策略、参数不合法）。这种可以换端点：同一个模型在中转站上往往只有
+        // 某一条路支持。
+        return Err(ImageAttemptError::route(format!(
             "responses 上游报错: {}",
             msg.chars().take(200).collect::<String>()
-        ));
+        )));
     }
     // Walk the output array for an image_generation_call item with a base64 result.
     let output = v.get("output").and_then(|o| o.as_array());
@@ -859,7 +937,7 @@ async fn try_responses_api(
                         b64
                     };
                     let bytes = b64_decode_limited(raw, MAX_IMAGE_BYTES)
-                        .map_err(|error| format!("responses base64 解码失败: {error}"))?;
+                        .map_err(|error| ImageAttemptError::billed(format!("responses base64 解码失败（图已生成但取不出来）: {error}")))?;
                     return Ok((bytes, "image/png".into()));
                 }
                 if let Some(raw_url) = item["url"].as_str() {
@@ -873,11 +951,13 @@ async fn try_responses_api(
                         .header(reqwest::header::USER_AGENT, "Michael-IDE-Agent/1.0")
                         .send()
                         .await
-                        .map_err(|e| format!("下载生成图失败: {e}"))?;
+                        .map_err(|e| ImageAttemptError::billed(format!("下载生成图失败（图已生成）: {e}")))?;
                     if !r.status().is_success() {
-                        return Err(format!("下载生成图 HTTP {}", r.status().as_u16()));
+                        return Err(ImageAttemptError::billed(format!("下载生成图 HTTP {}（图已生成）", r.status().as_u16())));
                     }
-                    return generated_image_response(r, "下载生成图").await;
+                    return generated_image_response(r, "下载生成图")
+                        .await
+                        .map_err(|e| ImageAttemptError::billed(format!("{e}（图已生成）")));
                 }
             }
             // Some relays return image as a message-content image_url instead.
@@ -894,7 +974,9 @@ async fn try_responses_api(
                                 };
                                 let bytes =
                                     b64_decode_limited(raw, MAX_IMAGE_BYTES).map_err(|error| {
-                                        format!("responses base64 解码失败: {error}")
+                                        ImageAttemptError::billed(format!(
+                                            "responses base64 解码失败（图已生成但取不出来）: {error}"
+                                        ))
                                     })?;
                                 return Ok((bytes, "image/png".into()));
                             }
@@ -904,10 +986,10 @@ async fn try_responses_api(
             }
         }
     }
-    Err(format!(
-        "responses 响应里没有 image_generation_call 结果。片段：{}",
+    Err(ImageAttemptError::billed(format!(
+        "responses 响应里没有 image_generation_call 结果（200 已回，上游可能已出图）。片段：{}",
         text.chars().take(150).collect::<String>()
-    ))
+    )))
 }
 
 /// gpt-image / dall-e only accept a fixed size set — an unsupported size makes the
@@ -942,7 +1024,7 @@ async fn try_images_api(
     prompt: &str,
     size: &str,
     request_id: Option<&str>,
-) -> Result<(Vec<u8>, String), String> {
+) -> Result<(Vec<u8>, String), ImageAttemptError> {
     let url = if b.ends_with("/v1") {
         format!("{b}/images/generations")
     } else {
@@ -968,7 +1050,7 @@ async fn try_images_api(
         .json(&body)
         .send()
         .await
-        .map_err(|e| format!("images-api 请求失败: {e}"))?;
+        .map_err(|e| image_send_error("images-api", e))?;
     let status = resp.status();
     let text = response_text_limited(
         resp,
@@ -979,25 +1061,30 @@ async fn try_images_api(
         },
         "images-api",
     )
-    .await?;
+    .await
+    // 读响应体失败。4xx 时读的是错误体（没出图）；否则 200 已经回来了。
+    .map_err(|e| if status.is_client_error() {
+        ImageAttemptError::route(e)
+    } else {
+        ImageAttemptError::billed(format!("{e}（响应已开始返回，上游可能已出图）"))
+    })?;
     if !status.is_success() {
-        return Err(format!(
-            "images-api HTTP {}: {}",
-            status.as_u16(),
-            text.chars().take(200).collect::<String>()
-        ));
+        return Err(image_http_error("images-api", status, &text));
     }
     let v: serde_json::Value =
-        serde_json::from_str(&text).map_err(|e| format!("images-api 响应解析失败: {e}"))?;
+        serde_json::from_str(&text).map_err(|e| ImageAttemptError::billed(format!("images-api 响应解析失败（200 已回，上游可能已出图）: {e}")))?;
     if let Some(err) = v.get("error") {
         let msg = err["message"]
             .as_str()
             .or(err.as_str())
             .unwrap_or("unknown");
-        return Err(format!(
+        // 200 里带 error 字段 = 上游明确拒了这次请求，通常在出图之前（模型名不认、
+        // 内容策略、参数不合法）。这种可以换端点：同一个模型在中转站上往往只有
+        // 某一条路支持。
+        return Err(ImageAttemptError::route(format!(
             "images-api 上游报错: {}",
             msg.chars().take(200).collect::<String>()
-        ));
+        )));
     }
     let item = &v["data"][0];
     if let Some(b64) = item["b64_json"].as_str().or(item["image"].as_str()) {
@@ -1007,7 +1094,7 @@ async fn try_images_api(
             b64
         };
         let bytes = b64_decode_limited(raw, MAX_IMAGE_BYTES)
-            .map_err(|error| format!("images-api base64 解码失败: {error}"))?;
+            .map_err(|error| ImageAttemptError::billed(format!("images-api base64 解码失败（图已生成但取不出来）: {error}")))?;
         Ok((bytes, "image/png".into()))
     } else if let Some(raw_url) = item["url"].as_str() {
         let img_url = if raw_url.starts_with('/') {
@@ -1020,11 +1107,13 @@ async fn try_images_api(
             .header(reqwest::header::USER_AGENT, "Michael-IDE-Agent/1.0")
             .send()
             .await
-            .map_err(|e| format!("下载生成图失败: {e}"))?;
+            .map_err(|e| ImageAttemptError::billed(format!("下载生成图失败（图已生成）: {e}")))?;
         if !r.status().is_success() {
-            return Err(format!("下载生成图 HTTP {}", r.status().as_u16()));
+            return Err(ImageAttemptError::billed(format!("下载生成图 HTTP {}（图已生成）", r.status().as_u16())));
         }
-        generated_image_response(r, "下载生成图").await
+        generated_image_response(r, "下载生成图")
+            .await
+            .map_err(|e| ImageAttemptError::billed(format!("{e}（图已生成）")))
     } else if let Some(task_id) = v.get("task_id").and_then(|t| t.as_str()) {
         // Async task (custom sizes) — poll until completed.
         let poll_url = if b.ends_with("/v1") {
@@ -1039,18 +1128,21 @@ async fn try_images_api(
                 .bearer_auth(api_key.trim())
                 .send()
                 .await
-                .map_err(|e| format!("轮询任务失败: {e}"))?;
+                .map_err(|e| ImageAttemptError::billed(format!("轮询生图任务失败（任务已提交）: {e}")))?;
             if !pr.status().is_success() {
                 continue;
             }
             let pt: serde_json::Value =
-                response_json_limited(pr, MAX_IMAGE_API_JSON_BYTES, "生图轮询").await?;
+                response_json_limited(pr, MAX_IMAGE_API_JSON_BYTES, "生图轮询")
+                    .await
+                    .map_err(|e| ImageAttemptError::billed(format!("{e}（任务已提交）")))?;
             let status = pt["status"].as_str().unwrap_or("");
             if status == "failed" {
-                return Err(format!(
-                    "生图任务失败: {}",
+                // 任务已经排进去跑过了才报 failed——多数中转仍然计费。不换端点重画。
+                return Err(ImageAttemptError::billed(format!(
+                    "生图任务失败（任务已提交）: {}",
                     pt["error"].as_str().unwrap_or("unknown")
-                ));
+                )));
             }
             if status != "completed" {
                 continue;
@@ -1068,22 +1160,28 @@ async fn try_images_api(
                             .header(reqwest::header::USER_AGENT, "Michael-IDE-Agent/1.0")
                             .send()
                             .await
-                            .map_err(|e| format!("下载生成图失败: {e}"))?;
+                            .map_err(|e| ImageAttemptError::billed(format!("下载生成图失败（图已生成）: {e}")))?;
                         if !dr.status().is_success() {
-                            return Err(format!("下载生成图 HTTP {}", dr.status().as_u16()));
+                            return Err(ImageAttemptError::billed(format!("下载生成图 HTTP {}（图已生成）", dr.status().as_u16())));
                         }
-                        return generated_image_response(dr, "下载生成图").await;
+                        return generated_image_response(dr, "下载生成图")
+                            .await
+                            .map_err(|e| ImageAttemptError::billed(format!("{e}（图已生成）")));
                     }
                 }
             }
-            return Err("任务完成但无图片数据".into());
+            return Err(ImageAttemptError::billed(
+                "生图任务报了 completed 却没有图片数据（已计费）".to_string(),
+            ));
         }
-        Err("生图任务超时（3分钟）".into())
-    } else {
-        Err(format!(
-            "images-api 返回的 data 里没有 b64_json 或 url。响应片段：{}",
-            text.chars().take(150).collect::<String>()
+        Err(ImageAttemptError::billed(
+            "生图任务超时（轮询 3 分钟未完成；任务已提交并计费，不再换端点重画）".to_string(),
         ))
+    } else {
+        Err(ImageAttemptError::billed(format!(
+            "images-api 返回的 data 里没有 b64_json 或 url（200 已回，上游可能已出图）。响应片段：{}",
+            text.chars().take(150).collect::<String>()
+        )))
     }
 }
 
@@ -1096,7 +1194,7 @@ async fn try_chat_image_api(
     model: &str,
     prompt: &str,
     request_id: Option<&str>,
-) -> Result<(Vec<u8>, String), String> {
+) -> Result<(Vec<u8>, String), ImageAttemptError> {
     let url = if b.ends_with("/v1") {
         format!("{b}/chat/completions")
     } else {
@@ -1114,7 +1212,7 @@ async fn try_chat_image_api(
         .json(&body)
         .send()
         .await
-        .map_err(|e| format!("chat 请求失败: {e}"))?;
+        .map_err(|e| image_send_error("chat", e))?;
     let status = resp.status();
     let text = response_text_limited(
         resp,
@@ -1125,13 +1223,15 @@ async fn try_chat_image_api(
         },
         "chat",
     )
-    .await?;
+    .await
+    // 读响应体失败。4xx 时读的是错误体（没出图）；否则 200 已经回来了。
+    .map_err(|e| if status.is_client_error() {
+        ImageAttemptError::route(e)
+    } else {
+        ImageAttemptError::billed(format!("{e}（响应已开始返回，上游可能已出图）"))
+    })?;
     if !status.is_success() {
-        return Err(format!(
-            "chat HTTP {}: {}",
-            status.as_u16(),
-            text.chars().take(200).collect::<String>()
-        ));
+        return Err(image_http_error("chat", status, &text));
     }
     // SSE 回来的是一串增量。**不能只拼文本**：extract_image_ref 还要读 message.images
     // 这类非文本字段，只拼字符串会把图丢掉、然后报"回复里没找到图片"。所以把增量合并回
@@ -1139,7 +1239,7 @@ async fn try_chat_image_api(
     // merge_sse_chat_message 返回 None，走下面原来的整体解析。
     let v: serde_json::Value = match merge_sse_chat_message(&text) {
         Some(merged) => merged,
-        None => serde_json::from_str(&text).map_err(|e| format!("chat 响应解析失败: {e}"))?,
+        None => serde_json::from_str(&text).map_err(|e| ImageAttemptError::billed(format!("chat 响应解析失败（200 已回，上游可能已出图）: {e}")))?,
     };
     let img = extract_image_ref(&v).ok_or_else(|| {
         let snippet: String = v["choices"][0]["message"]["content"]
@@ -1148,16 +1248,19 @@ async fn try_chat_image_api(
             .chars()
             .take(150)
             .collect();
-        format!("chat 回复里没找到图片：{snippet}")
+        // 200 回来了、只是没在里面找到图——上游多半已经画了并计费，不换端点重画。
+        ImageAttemptError::billed(format!("chat 回复里没找到图片（200 已回）：{snippet}"))
     })?;
     if img.starts_with("data:") {
-        let comma = img.find(',').ok_or("data URL 无效")?;
+        let comma = img
+            .find(',')
+            .ok_or_else(|| ImageAttemptError::billed("data URL 无效（图已生成）".to_string()))?;
         let meta = &img[5..comma];
         let m = meta.split(';').next().unwrap_or("image/png").to_string();
         let data = &img[comma + 1..];
         Ok((
             b64_decode_limited(data, MAX_IMAGE_BYTES)
-                .map_err(|error| format!("base64 解码失败: {error}"))?,
+                .map_err(|error| ImageAttemptError::billed(format!("base64 解码失败（图已生成但取不出来）: {error}")))?,
             m,
         ))
     } else if img.starts_with("http://") || img.starts_with("https://") {
@@ -1166,13 +1269,17 @@ async fn try_chat_image_api(
             .header(reqwest::header::USER_AGENT, "Michael-IDE-Agent/1.0")
             .send()
             .await
-            .map_err(|e| format!("下载生成图失败: {e}"))?;
+            .map_err(|e| ImageAttemptError::billed(format!("下载生成图失败（图已生成）: {e}")))?;
         if !r.status().is_success() {
-            return Err(format!("下载生成图 HTTP {}", r.status().as_u16()));
+            return Err(ImageAttemptError::billed(format!("下载生成图 HTTP {}（图已生成）", r.status().as_u16())));
         }
-        generated_image_response(r, "下载生成图").await
+        generated_image_response(r, "下载生成图")
+            .await
+            .map_err(|e| ImageAttemptError::billed(format!("{e}（图已生成）")))
     } else {
-        Err("无法识别模型返回的图片引用".into())
+        Err(ImageAttemptError::billed(
+            "无法识别模型返回的图片引用（200 已回，上游可能已出图）".to_string(),
+        ))
     }
 }
 
@@ -1665,5 +1772,107 @@ mod download_overwrite_tests {
         refuse_existing_download_target(&dir).unwrap();
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod image_billing_tests {
+    use super::{image_http_error, ImageAttemptError};
+
+    /// 4xx = 请求在出图之前就被挡了（路由不存在、模型名不认、鉴权、限流）——
+    /// 换端点安全，这正是三端点级联存在的理由。
+    #[test]
+    fn client_errors_may_fall_through_to_the_next_endpoint() {
+        for code in [400u16, 401, 403, 404, 405, 429] {
+            let e = image_http_error(
+                "images-api",
+                reqwest::StatusCode::from_u16(code).unwrap(),
+                "nope",
+            );
+            assert!(!e.billed, "HTTP {code} 被当成已计费，级联白白断了");
+        }
+    }
+
+    /// 5xx 说不准：上游可能画完了才炸。宁可不重画。
+    #[test]
+    fn server_errors_do_not_trigger_a_redraw() {
+        for code in [500u16, 502, 503, 504] {
+            let e = image_http_error(
+                "images-api",
+                reqwest::StatusCode::from_u16(code).unwrap(),
+                "boom",
+            );
+            assert!(e.billed, "HTTP {code} 会去换端点重画一次");
+        }
+    }
+
+    /// 这条是审计里那一条的核心：级联必须看 billed，不能「上一条 Err 就试下一条」。
+    /// 生成路径没法在单测里发真请求，所以钉住级联那段源码的结构。
+    #[test]
+    fn the_cascade_stops_on_a_billed_failure() {
+        let src = include_str!("net.rs");
+        let body = src
+            .split("pub async fn generate_image_chat(")
+            .nth(1)
+            .and_then(|s| s.split("\n    if bytes.is_empty()").next())
+            .expect("generate_image_chat 的级联段不见了");
+        assert!(
+            body.contains("Err(e0) if e0.billed => return Err(e0.msg)"),
+            "第一条端点算过账了还会去试第二条 —— 用户一次生图付两次钱"
+        );
+        assert!(
+            body.contains("Err(e1) if e1.billed =>"),
+            "第二条端点算过账了还会去试第三条"
+        );
+    }
+
+    /// 200 之后的每一种解析失败都必须算「可能已计费」。
+    #[test]
+    fn post_two_hundred_failures_are_all_billed() {
+        let src = include_str!("net.rs");
+        for needle in [
+            "images-api 响应解析失败（200 已回",
+            "images-api 返回的 data 里没有 b64_json 或 url（200 已回",
+            "responses 响应里没有 image_generation_call 结果（200 已回",
+            "chat 回复里没找到图片（200 已回",
+            "生图任务超时（轮询 3 分钟未完成",
+        ] {
+            let at = src.find(needle).unwrap_or_else(|| panic!("{needle} 不见了"));
+            let before = &src[at.saturating_sub(220)..at];
+            assert!(
+                before.contains("ImageAttemptError::billed"),
+                "「{needle}」没被算成可能已计费 —— 会触发换端点重画"
+            );
+        }
+    }
+
+    /// 超时**不是**免费的重试机会：请求已经打进去了，上游很可能正在画。
+    /// 构造不出真的 reqwest::Error，就钉住分支结构——只有「连不上」那一支
+    /// 允许换端点。网关那边的计费路径也是按同一条规矩写的。
+    #[test]
+    fn a_timeout_is_not_a_free_retry() {
+        let src = include_str!("net.rs");
+        let body = src
+            .split("fn image_send_error(")
+            .nth(1)
+            .and_then(|s| s.split("\n}\n").next())
+            .expect("image_send_error 的函数体不见了");
+        let (connect_arm, rest) = body
+            .split_once("} else {")
+            .expect("is_connect 的分支结构变了，这条断言的前提得重算");
+        assert!(
+            connect_arm.contains("if e.is_connect() {")
+                && connect_arm.contains("ImageAttemptError::route"),
+            "连不上不再算「这条路不存在」，级联白白断了"
+        );
+        assert!(
+            rest.contains("ImageAttemptError::billed") && !rest.contains("ImageAttemptError::route"),
+            "超时 / 读响应体失败被当成可以免费换端点重试 —— 那是让用户为一次生图付两次钱"
+        );
+    }
+
+    #[test]
+    fn display_keeps_the_message() {
+        assert_eq!(ImageAttemptError::route("x").to_string(), "x");
     }
 }

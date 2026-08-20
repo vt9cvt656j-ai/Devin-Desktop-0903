@@ -274,9 +274,10 @@ pub async fn ui_click(
             | "confirm"
             | "cancel"
             | "pick"
+            | "scroll_to"
     ) {
         return Err(
-            "action must be press, set_value, focus, increment, decrement, show_menu, confirm, cancel, or pick"
+            "action must be press, set_value, focus, increment, decrement, show_menu, confirm, cancel, pick, or scroll_to"
                 .into(),
         );
     }
@@ -729,6 +730,17 @@ const AX_ACTION_JS: &str = r##"(function(){
       if(!pressed) return JSON.stringify({ok:false, err:'element does not respond to press/open/pick', role:role, name:String(name).slice(0,60)});
       var nv2=''; try { var vv=el.value(); if(typeof vv==='string') nv2=vv; } catch(e) {}
       return JSON.stringify({ok:true, action:'press', role:role, name:String(name).slice(0,60), value:String(nv2).slice(0,140)});
+    } else if (ACT === 'scroll_to') {
+      // 可访问性树只覆盖可见的那一屏，折叠以下的元素压根不在清单里。没有这个动作，
+      // 「滚下去再点」只能靠盲滚坐标，而坐标滚动量和目标位置之间没有任何对应关系。
+      // 注意滚动之后位置全变了：ref 签名里含 x/y，所以旧 ref 会全部作废，必须重读。
+      if(!axPerform(el,'AXScrollToVisible')) {
+        return JSON.stringify({ok:false, err:'element does not support scroll_to (AXScrollToVisible)', role:role, name:String(name).slice(0,60)});
+      }
+      var np=[0,0]; try { np=el.position(); } catch(e) {}
+      return JSON.stringify({ok:true, action:'scroll_to', role:role, name:String(name).slice(0,60),
+        x:np[0], y:np[1],
+        note:'滚动后这一屏的元素位置全变了，之前那批 ref 已经作废——先重新 read_screen 再操作。'});
     } else {
       var axName = ({increment:'AXIncrement',decrement:'AXDecrement',show_menu:'AXShowMenu',confirm:'AXConfirm',cancel:'AXCancel',pick:'AXPick'})[ACT];
       if(!axName) return JSON.stringify({ok:false, err:'unsupported action: '+String(ACT)});
