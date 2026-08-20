@@ -2544,10 +2544,6 @@ const _CN_CHAR_RE = /[\u4e00-\u9fff]/;
 let _renameTimer = null;
 let _lastRenamePos = "";
 
-function _hasChinese(text) {
-  return _CN_CHAR_RE.test(text);
-}
-
 // 思考摘要按「段」下发（gpt-5.x 每段是 **标题**+正文），上游拼接时段与段之间没有分隔，
 // 渲染出来就是「…verificationUpdating plan…」这种加粗标题拼死的样子。这里对累积文本做
 // 修复而不是赌分片边界：不管一段的开头落在哪个 delta 里，拼进累积串后模式必然完整出现。
@@ -2824,75 +2820,6 @@ function _collectSymbolNames(model) {
   return names;
 }
 
-async function _translateToEnglish(chineseName, context, existingNames) {
-  const config = loadConfig();
-  if (!config.baseUrl || !config.apiKey || !config.model) return null;
-
-  const namesStr = [...existingNames].slice(0, 50).join(", ");
-  const msgs = [
-    {
-      role: "system",
-      content: `You translate Chinese code identifiers to English. Rules:
-1. Output ONLY the English name, nothing else.
-2. Use snake_case for Python/C, camelCase for JS/Java, PascalCase for classes.
-3. Keep it concise (1-3 words).
-4. If the name would conflict with these existing names, add a suffix: ${namesStr}`,
-    },
-    {
-      role: "user",
-      content: `Context: ${context}\nTranslate: "${chineseName}"`,
-    },
-  ];
-
-  try {
-    const aiConfig = {
-      baseUrl: config.baseUrl.replace(/\/+$/, ""),
-      apiKey: config.apiKey,
-      model: config.baseUrl?.includes("deepseek") ? "deepseek-v4-flash" : config.model,
-      maxTokens: 256,
-      temperature: 0,
-    };
-    const result = await new Promise((resolve) => {
-      let buf = "";
-      backend.aiChat(aiConfig, _enforceModelRequestBudget(msgs), (ev) => {
-        if (ev.kind === "token") buf += ev.delta;
-        else if (ev.kind === "done") resolve(buf.trim());
-        else if (ev.kind === "error") resolve("");
-      }).catch(() => resolve(""));
-      setTimeout(() => resolve(buf.trim()), 10000);
-    });
-    if (!result || _CN_CHAR_RE.test(result)) return null;
-    // 模型没照格式回（"I'm ready to translate…"这类客套话）时，剥掉标点后会变成一条
-    // 上百字符的"合法标识符"直接进文件——按句子特征拒收：多词长句/超长一律作废。
-    if (result.split(/\s+/).length > 4 || result.length > 60) return null;
-    let name = result.replace(/[^a-zA-Z0-9_]/g, "").replace(/^_+|_+$/g, "");
-    if (!name || name.length > 32) return null;
-    if (existingNames.has(name)) {
-      for (let i = 2; i < 100; i++) {
-        const candidate = `${name}_${i}`;
-        if (!existingNames.has(candidate)) { name = candidate; break; }
-      }
-    }
-    return name;
-  } catch {
-    return null;
-  }
-}
-
-function _getIdentifierAtPosition(model, position) {
-  const word = model.getWordAtPosition(position);
-  if (!word) return null;
-  const text = word.word;
-  if (!_hasChinese(text)) return null;
-  return {
-    text,
-    range: new monaco.Range(
-      position.lineNumber, word.startColumn,
-      position.lineNumber, word.endColumn,
-    ),
-  };
-}
-
 function _isInCommentOrString(line, offset, langId) {
   const before = line.slice(0, offset);
   if (/^\s*(#|\/\/|--|%)/.test(line)) return true;
@@ -3091,8 +3018,6 @@ const _DOUBLE_SYMBOLS = [
   [/--(?!-|>)/g, null],
 ];
 
-const _BRACKET_PAIRS = { "(": ")", "[": "]", "{": "}" };
-const _CLOSE_TO_OPEN = { ")": "(", "]": "[", "}": "{" };
 
 function _fixDoublePunctuation(model) {
   const edits = [];
@@ -3131,61 +3056,6 @@ function _isInString(line, pos) {
     else if (ch === "`" && !inSingle && !inDouble) inBacktick = !inBacktick;
   }
   return inSingle || inDouble || inBacktick;
-}
-
-function _fixUnbalancedBrackets(model) {
-  const edits = [];
-  const total = model.getLineCount();
-  const stack = [];
-
-  for (let ln = 1; ln <= total; ln++) {
-    const line = model.getLineContent(ln);
-    for (let i = 0; i < line.length; i++) {
-      if (_isInString(line, i)) continue;
-      const ch = line[i];
-      if (_BRACKET_PAIRS[ch]) {
-        stack.push({ ch, ln, col: i + 1 });
-      } else if (_CLOSE_TO_OPEN[ch]) {
-        const expected = _CLOSE_TO_OPEN[ch];
-        if (stack.length > 0 && stack[stack.length - 1].ch === expected) {
-          stack.pop();
-        } else {
-          edits.push({
-            range: new monaco.Range(ln, i + 1, ln, i + 2),
-            text: "",
-          });
-        }
-      }
-    }
-  }
-
-  for (const unclosed of stack) {
-    const closer = _BRACKET_PAIRS[unclosed.ch];
-    const ln = unclosed.ln;
-    const lineContent = model.getLineContent(ln);
-    const endCol = lineContent.length + 1;
-    edits.push({
-      range: new monaco.Range(ln, endCol, ln, endCol),
-      text: closer,
-    });
-  }
-  return edits;
-}
-
-function _fixTrailingWhitespace(model, changedLines) {
-  const edits = [];
-  for (const ln of changedLines) {
-    if (ln < 1 || ln > model.getLineCount()) continue;
-    const line = model.getLineContent(ln);
-    const trimmed = line.replace(/\s+$/, "");
-    if (trimmed.length < line.length) {
-      edits.push({
-        range: new monaco.Range(ln, trimmed.length + 1, ln, line.length + 1),
-        text: "",
-      });
-    }
-  }
-  return edits;
 }
 
 const _LANG_KEYWORDS = new Set([
@@ -10946,20 +10816,6 @@ async function renderChildren(path, container) {
   }
 }
 
-// Open a dir node in place WITHOUT toggling — used to RESTORE expansion after a reload
-// (mirrors the row click handler). Lazy-loads children if not yet loaded.
-async function _expandDirNode(dirPath) {
-  dirPath = _treePath(dirPath);
-  _treeSetExpanded(dirPath, true);
-  const node = dirNodes.get(dirPath);
-  if (!node || !node.row) return;
-  node.row.classList.add("open");
-  node.kids.hidden = false;
-  const fimg = node.row.querySelector(".folder-ic");
-  if (fimg) fimg.src = folderIconUrl(dirPath.split("/").filter(Boolean).pop() || "", true);
-  if (!node.loaded) { node.loaded = true; await renderChildren(dirPath, node.kids); }
-}
-
 /** Re-read a directory and re-render its children (root or any expanded dir).
  *  PRESERVES the user's expanded sub-folders + tree scroll position, so an AI file
  *  write (fs-change → reloadDir) never collapses folders or jumps the tree under them
@@ -12936,10 +12792,6 @@ async function _fetchGatewaySettlement(config, requestId, attempts = 5) {
   return null;
 }
 
-function _activeAiProviderMode(config) {
-  return AI_PROVIDER_GATEWAY;
-}
-
 function _aiConfigForRuntime(raw) {
   raw = raw || {};
   const c = { ..._DEFAULT_AI_CONFIG, ...(raw || {}) };
@@ -13893,31 +13745,6 @@ function _gatewayHandlesCompression() {
 // membership downgrade silently falls back instead of budgeting against a window the gateway
 // will no longer honor.
 const _CTX_CHOICE_KEY = "michael-ide.ctx-choice.v2";
-const _CTX_CHOICE_KEY_V1 = "michael-ide.ctx-choice.v1";
-// v1 stored the raw token count the button carried, which silently breaks the moment a native
-// window is corrected: the choice stays pinned to the stale number and the card shows no active
-// button at all (the active test is `o.value === eff`). v2 stores the user's INTENT —
-// {kind:"native"} follows the model wherever its real window lands; {kind:"modified",tokens}
-// pins a michael-compression tier. Reading still yields a plain number, so every consumer is
-// unchanged.
-function _migrateCtxChoiceV1() {
-  try {
-    const raw = localStorage.getItem(_CTX_CHOICE_KEY_V1);
-    if (!raw || localStorage.getItem(_CTX_CHOICE_KEY)) return;
-    const old = JSON.parse(raw) || {};
-    const out = {};
-    for (const [id, value] of Object.entries(old)) {
-      const n = Math.round(Number(value) || 0);
-      if (!(n > 0)) continue;
-      // Disambiguate by comparing against THIS model's native window, not against the tier list.
-      // A bare "is it 1M/2M/5M?" test misreads every Gemini pick, because Gemini's native window
-      // IS 1M (and gemini-1.5-pro's is 2M) — those users chose 原生, not a tier.
-      out[id] = (n === _modelContextLimit(id)) ? { kind: "native" } : { kind: "modified", tokens: n };
-    }
-    localStorage.setItem(_CTX_CHOICE_KEY, JSON.stringify(out));
-    localStorage.removeItem(_CTX_CHOICE_KEY_V1);
-  } catch {}
-}
 function _ctxChoiceRecord(modelId) {
   try {
     const map = JSON.parse(localStorage.getItem(_CTX_CHOICE_KEY) || "{}") || {};
@@ -15282,10 +15109,6 @@ function _builtinThinkingProfileFor(id) {
 function _supportsThinking(id) {
   return _thinkingProfileFor(id).configurable === true;
 }
-// Predicate: this model is KNOWN to honor a configurable thinking parameter.
-function _isKnownThinkingModel(id) {
-  return _supportsThinking(id);
-}
 // User's saved choice, or a sensible default for this model.
 function _thinkingPrefFor(id) {
   const profile = _thinkingProfileFor(id);
@@ -15833,7 +15656,6 @@ let _chatSeq = 0; // monotonic counter for auto-naming so "Chat N" never repeats
 // concurrently. `_isStreaming()` reflects the ACTIVE tab (for the send/stop
 // button); the running loop tracks its own `session.streaming`.
 function _isStreaming() { return !!_currentSession()?.streaming; }
-function _setStreamBtnForActive() { _setSendBtnStop(_isStreaming()); }
 const CHAT_STORE_KEY = "michael-ide.chat-sessions";
 const RECENT_PROJECTS_KEY = "michael-ide.recent-projects";
 const MAX_RECENT = 8;
@@ -16573,9 +16395,6 @@ const _SNAPSHOT_MAX_MESSAGES = 64;
 const _SNAPSHOT_MAX_TOOL_STEPS = 96;
 const _HISTORY_AUTO_PAGE_EDGE_PX = 72;
 let _historyAutoPageRaf = 0;
-function _sessionHistoryEntries(session) {
-  return session?.memory?.transcriptEntries?.() || (Array.isArray(session?.history) ? session.history : []);
-}
 function _cacheTranscriptMessage(session, sequence, message) {
   if (!session || !Number.isFinite(sequence) || !message) return;
   if (!(session._historyCache instanceof Map)) session._historyCache = new Map();
@@ -16904,7 +16723,6 @@ function _updateHistoryControls(session) {
     newer.textContent = `更新的 ${Math.min(_RENDER_PAGE, length - end)} 条（剩余 ${length - end} 条）`;
   } else newer?.remove();
 }
-function _updateEarlierHistoryControl(session) { _updateHistoryControls(session); }
 async function _renderLatestHistoryWindow(session) {
   const container = session?.container;
   if (!container || session._historyAtLatest !== false) return;
@@ -17988,28 +17806,6 @@ const _WINDOW_ID = Date.now().toString(36) + Math.random().toString(36).slice(2,
 let _ipcChannel = null;
 const _ipcPeers = new Map();
 
-// 统一设置窗口标题：同时更新自绘标题栏 DOM 和原生窗口标题。之前只改 DOM，
-// macOS 的 Dock/调度中心/窗口菜单里所有窗口都叫 "Mr. Day One"，多窗口无法按项目区分。
-/**
- * Shorten from the middle, keeping both ends. For a filename the tail carries the extension and
- * usually the version or date — exactly what end-truncation throws away first. macOS shortens
- * paths this way for the same reason.
- */
-/**
- * Split a filename into the part that may be shortened and the part that must not. CSS can only
- * ellipsise at the end, which eats the extension — the one piece that says what the file is. So
- * the stem and the extension become separate elements: the stem shrinks, the extension never does.
- * Pixel-accurate and responsive, where truncating the string by character count is neither.
- */
-function _splitFileName(name) {
-  const value = String(name || "");
-  const dot = value.lastIndexOf(".");
-  // A leading dot is the whole name of a dotfile (.gitignore), not an extension. An extension
-  // longer than a few characters is usually a version fragment, not a type.
-  if (dot <= 0 || dot === value.length - 1 || value.length - dot > 12) return [value, ""];
-  return [value.slice(0, dot), value.slice(dot)];
-}
-
 /**
  * Put the whole filename in the element. Nothing is removed from the string.
  *
@@ -18684,18 +18480,6 @@ function _agentTimelineMarkVisible(timeline, turn, kind, at = Date.now()) {
     timeline.firstVisibleAt = eventAt;
     timeline.firstVisibleKind = String(kind || "text");
   }
-}
-
-function _agentTimelineElapsed(timeline, field) {
-  const startedAt = Number(timeline?.startedAt);
-  const at = Number(timeline?.[field]);
-  return Number.isFinite(startedAt) && Number.isFinite(at) && at >= startedAt ? at - startedAt : null;
-}
-
-function _agentTimelineRelative(timeline, at) {
-  const startedAt = Number(timeline?.startedAt);
-  const value = Number(at);
-  return Number.isFinite(startedAt) && Number.isFinite(value) && value >= startedAt ? value - startedAt : null;
 }
 
 function _turnStatsText({ elapsedMs = 0, settlement = null, timeline = null, live = false } = {}) {
@@ -21102,17 +20886,6 @@ function _isDependencyRestoreCommand(command) {
     return false;
   }
   return sawRestore;
-}
-
-function _agentAllowsDependencyRestore(run) {
-  if (!run || run.mode !== "agent") return false;
-  const profile = run.engineering || {};
-  const obligations = new Set([...(profile?.runtimeObligations || []), ...(run?._addedRuntimeObligations || [])]);
-  // Editing code is not permission to change the dependency graph. A bug fix may build
-  // and test with the dependencies already present, but install/restore must be part of
-  // this turn's structured runtime contract. This prevents a routine inspection or fix
-  // from silently running npm install just because node_modules happens to be missing.
-  return obligations.has("install");
 }
 
 function _agentAllowsExternalKind(run, kind) {
@@ -24799,11 +24572,6 @@ function _authContextBlock({ forSubAgent = false } = {}) {
   // 主路径拼出来必须和拆分前**逐字节一致**（拆分处的换行分别并进后两段的开头）。
   return forSubAgent ? _scope + _injection : _scope + _mainOnly + _injection;
 }
-function _modelNeedsCssGrounding(id) {
-  const f = _modelFamilyOf(id);
-  return f !== "claude" && f !== "gemini";
-}
-
 // Codex-style guidance: render a row of clickable suggestion chips into a chat session.
 // Clicking one sends it as the next prompt. Used for "next steps" (after a run) and for
 // "onboarding" (after opening a project).
@@ -25398,11 +25166,6 @@ function _agentTurnMustWaitForUser(turn) {
 // empty until a later no-tool completion can answer once.
 function _agentToolCallIsNarrativeControl(name) {
   return ["update_plan", "think", "ask_user"].includes(String(name || ""));
-}
-
-function _agentTurnHasNonControlTools(turn) {
-  return !!turn && Array.isArray(turn.toolCalls)
-    && turn.toolCalls.some((call) => !_agentToolCallIsNarrativeControl(call?.name));
 }
 
 // A generic plain-text question must not let Agent mode skip the workspace work the
@@ -27993,148 +27756,6 @@ function _renderAgentSeg(container, seg, allSegs, idx, root, promises) {
   }
 }
 
-async function _executeInlineTools(response, container) {
-  const segments = _splitAgentResponse(response);
-  const toolSegs = segments.filter(s => s.type !== "text");
-  if (!toolSegs.length) return;
-
-  const log = document.createElement("div");
-  log.className = "agent-tool-log";
-  container.appendChild(log);
-  const toolResults = [];
-  const root = rootPath || workspaceRoots[0] || "";
-
-  for (const seg of toolSegs) {
-    const step = _createToolStep(seg);
-    log.appendChild(step);
-    _chatFollow();
-    const tr = await _executeToolStep(step, seg, root);
-    if (tr) toolResults.push(tr);
-    await new Promise(r => setTimeout(r, 60));
-    _chatFollow();
-  }
-
-  if (toolResults.length) _agentFollowUp(toolResults, container);
-}
-
-function _splitAgentResponse(response) {
-  const segments = [];
-  let remaining = response;
-  const toolPattern = /\[TOOL:(read_file|write_file|run_cmd|list_dir)\]\s*\n?([^\n]+)/;
-  const bareToolPattern = /(?:^|\n)(read_file|list_dir|run_cmd)\s+(\/[^\s\n][^\n]*)/;
-  const writePattern = /\[TOOL:write_file\]\s*\u000a?([^\u000a]+)\u000a```(\w*)\u000a([\s\S]*?)```/;
-
-  const emojiFilePattern = /📄\s*([^\n]+)\n```(\w*)\n([\s\S]*?)```/;
-  const emojiCmdPattern = /📎\s*(.+?)(?:\n|$)/;
-
-  while (remaining.length > 0) {
-    const wm = remaining.match(writePattern);
-    const tm = remaining.match(toolPattern);
-    const bt = remaining.match(bareToolPattern);
-    const ef = remaining.match(emojiFilePattern);
-    const ec = remaining.match(emojiCmdPattern);
-
-    const candidates = [
-      wm && { m: wm, idx: remaining.indexOf(wm[0]), type: "wm" },
-      tm && { m: tm, idx: remaining.indexOf(tm[0]), type: "tm" },
-      bt && { m: [bt[0].replace(/^\n/, ""), bt[1], bt[2]], idx: Math.max(0, remaining.indexOf(bt[0]) + (bt[0].startsWith("\n") ? 1 : 0)), type: "tm" },
-      ef && { m: ef, idx: remaining.indexOf(ef[0]), type: "ef" },
-      ec && { m: ec, idx: remaining.indexOf(ec[0]), type: "ec" },
-    ].filter(Boolean).sort((a, b) => a.idx - b.idx);
-
-    if (!candidates.length) {
-      segments.push({ type: "text", content: remaining });
-      break;
-    }
-
-    const best = candidates[0];
-    if (best.idx > 0) segments.push({ type: "text", content: remaining.slice(0, best.idx) });
-
-    if (best.type === "wm") {
-      segments.push({ type: "write", path: best.m[1].trim(), content: best.m[2] });
-    } else if (best.type === "ef") {
-      segments.push({ type: "write", path: best.m[1].trim(), content: best.m[3] });
-    } else if (best.type === "ec") {
-      segments.push({ type: "cmd", command: best.m[1].trim() });
-    } else {
-      const cmd = best.m[1];
-      const arg = best.m[2].trim();
-      if (arg) {
-        if (cmd === "read_file") segments.push({ type: "read", path: arg });
-        else if (cmd === "list_dir") segments.push({ type: "list", path: arg });
-        else if (cmd === "run_cmd") segments.push({ type: "cmd", command: arg });
-        else if (cmd === "write_file") segments.push({ type: "write", path: arg, content: "" });
-      }
-    }
-
-    remaining = remaining.slice(best.idx + best.m[0].length);
-  }
-
-  const newSegs = [];
-  const langToFile = { python: "main.py", py: "main.py", javascript: "app.js", js: "app.js", typescript: "app.ts", ts: "app.ts", html: "index.html", css: "style.css", json: "data.json", yaml: "config.yaml", yml: "config.yml", shell: "script.sh", bash: "script.sh", sh: "script.sh", sql: "query.sql", go: "main.go", rust: "main.rs", rs: "main.rs", java: "Main.java", c: "main.c", cpp: "main.cpp", ruby: "app.rb", rb: "app.rb", php: "index.php", swift: "main.swift", kotlin: "main.kt", dart: "main.dart", vue: "App.vue", svelte: "App.svelte", jsx: "App.jsx", tsx: "App.tsx" };
-  const fileNamePat = /[`"']?([a-zA-Z0-9_\-./\\]+\.[a-zA-Z]{1,10})[`"']?\s*(?:[：:]\s*)?$/;
-
-  for (const seg of segments) {
-    if (seg.type !== "text") { newSegs.push(seg); continue; }
-    const allBlocks = [...seg.content.matchAll(/```(\w*)\n([\s\S]*?)```/g)];
-    if (!allBlocks.length) { newSegs.push(seg); continue; }
-
-    let txt = seg.content;
-    let lastEnd = 0;
-    const usedNames = new Set();
-
-    for (const m of allBlocks) {
-      const lang = m[1].toLowerCase();
-      const code = m[2];
-      if (code.split("\n").length < 3) continue;
-
-      const blockStart = txt.indexOf(m[0], lastEnd);
-      const textBefore = txt.slice(lastEnd, blockStart);
-
-      let fileName = "";
-      const allLines = textBefore.split("\n").reverse();
-      for (const line of allLines) {
-        const stripped = line.replace(/[`"'*#>\-📄]/g, "").trim();
-        const fm = stripped.match(/([a-zA-Z0-9_\-./\\]+\.[a-zA-Z]{1,10})\s*[:：]?\s*$/);
-        if (fm) { fileName = fm[1]; break; }
-        const fm2 = stripped.match(/(?:文件|创建|写入|新建|编写|修改)\s*[`"']*([a-zA-Z0-9_\-./\\]+\.[a-zA-Z]{1,10})/);
-        if (fm2) { fileName = fm2[1]; break; }
-      }
-
-      if (!fileName && code) {
-        if (/from flask import|Flask\(__name__\)|app\.route/.test(code)) fileName = "app.py";
-        else if (/class \w+\(.*(?:db\.Model|Base)\)/.test(code)) fileName = "models.py";
-        else if (/<!DOCTYPE|<html|<head|<body/.test(code)) fileName = "index.html";
-        else if (/import React|from ['"]react['"]|export default/.test(code)) fileName = "App.jsx";
-        else if (/import express|require\(['"]express/.test(code)) fileName = "server.js";
-        else if (/CREATE TABLE|ALTER TABLE/.test(code)) fileName = "schema.sql";
-        else if (/FROM\s+(node|python|golang|alpine|ubuntu)/.test(code)) fileName = "Dockerfile";
-        else if (/server\s*\{|location\s*\//.test(code)) fileName = "nginx.conf";
-        else if (lang && langToFile[lang]) {
-          let base = langToFile[lang]; let i = 1;
-          while (usedNames.has(base)) { base = base.replace(/(\.\w+)$/, `${++i}$1`); }
-          fileName = base;
-        }
-      }
-
-      if (!fileName) { newSegs.push({ type: "text", content: textBefore + m[0] }); lastEnd = blockStart + m[0].length; continue; }
-
-      usedNames.add(fileName);
-      if (textBefore.trim()) {
-        const cleanText = textBefore.replace(fileNamePat, "").trim();
-        if (cleanText) newSegs.push({ type: "text", content: cleanText });
-      }
-      newSegs.push({ type: "write", path: fileName, content: code });
-      lastEnd = blockStart + m[0].length;
-    }
-    if (lastEnd < txt.length) {
-      const rest = txt.slice(lastEnd).trim();
-      if (rest) newSegs.push({ type: "text", content: rest });
-    }
-  }
-  return newSegs.length > 0 ? newSegs : segments;
-}
-
 const _ATC_EXPAND_ICON = `<svg viewBox="0 0 12 12" width="12" height="12"><path d="M3 4.5l3 3 3-3" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></svg>`;
 
 // ============================================================================
@@ -28766,11 +28387,6 @@ async function _disabledMcpServers() {
     if (raw) out.set(raw.toLowerCase(), raw);
   }
   return out;
-}
-
-/// 自有全局配置的路径（面板保存的目标）。取不到就返回空串。
-async function _userScopeMcpConfigPath() {
-  return String((await _readOwnMcpUserConfig())?.path || "");
 }
 
 // `.mcp.local.json` 是不是**跟着仓库来的**。
@@ -30376,21 +29992,6 @@ const _SIC = (bg, glyph) =>
   '<path d="M0 11A11 11 0 0 1 11 0h18a11 11 0 0 1 11 11v9H0z" fill="#fff" fill-opacity=".16"/>' +
   '<g transform="translate(8 8)" fill="none" stroke="#fff" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round">' + glyph + '</g>' +
   '</svg>';
-const _SKILL_ICONS = {
-  sparkles: _SIC('#8b5cf6', '<path d="M9.94 15.5A2 2 0 0 0 8.5 14.06l-6.14-1.58a.5.5 0 0 1 0-.96L8.5 9.94A2 2 0 0 0 9.94 8.5l1.58-6.14a.5.5 0 0 1 .96 0L14.06 8.5A2 2 0 0 0 15.5 9.94l6.14 1.58a.5.5 0 0 1 0 .96L15.5 14.06a2 2 0 0 0-1.44 1.44l-1.58 6.14a.5.5 0 0 1-.96 0Z"/><path d="M20 3v4"/><path d="M22 5h-4"/><path d="M4 17v2"/><path d="M5 18H3"/>'),
-  book: _SIC('#3b82f6', '<path d="M2 3h6a4 4 0 0 1 4 4v14a3 3 0 0 0-3-3H2z"/><path d="M22 3h-6a4 4 0 0 0-4 4v14a3 3 0 0 1 3-3h7z"/>'),
-  search: _SIC('#0ea5e9', '<circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/>'),
-  code: _SIC('#4f46e5', '<path d="m16 18 6-6-6-6"/><path d="m8 6-6 6 6 6"/>'),
-  doc: _SIC('#0d9488', '<path d="M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7z"/><path d="M14 2v5h5"/><path d="M16 13H8"/><path d="M16 17H8"/>'),
-  commit: _SIC('#16a34a', '<circle cx="12" cy="12" r="3"/><path d="M3 12h6"/><path d="M15 12h6"/>'),
-  bolt: _SIC('#f59e0b', '<path d="M4 14a1 1 0 0 1-.78-1.63l9.9-10.2a.5.5 0 0 1 .86.46l-1.92 6.02A1 1 0 0 0 13 10h7a1 1 0 0 1 .78 1.63l-9.9 10.2a.5.5 0 0 1-.86-.46l1.92-6.02A1 1 0 0 0 11 14z"/>'),
-  terminal: _SIC('#334155', '<path d="m4 17 6-6-6-6"/><path d="M12 19h8"/>'),
-  chat: _SIC('#db2777', '<path d="M7.9 20A9 9 0 1 0 4 16.1L2 22Z"/>'),
-  pen: _SIC('#e11d48', '<path d="M17 3a2.85 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5Z"/><path d="m15 5 4 4"/>'),
-  wrench: _SIC('#ea580c', '<path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z"/>'),
-  rocket: _SIC('#dc2626', '<path d="M4.5 16.5c-1.5 1.26-2 5-2 5s3.74-.5 5-2c.71-.84.7-2.13-.09-2.91a2.18 2.18 0 0 0-2.91-.09z"/><path d="M12 15l-3-3a22 22 0 0 1 2-3.95A12.88 12.88 0 0 1 22 2c0 2.72-.78 7.5-6 11a22.35 22.35 0 0 1-4 2z"/><path d="M9 12H4s.55-3.03 2-4c1.62-1.08 5 0 5 0"/><path d="M12 15v5s3.03-.55 4-2c1.08-1.62 0-5 0-5"/>'),
-};
-function _skillIcon(key) { return _SKILL_ICONS[key] || _SKILL_ICONS.sparkles; }
 // Default skill icon — a game-style skill badge: green tile + embossed white plus. Solid colors only
 // (no gradient <defs>/url() — shared ids break across removed DOM subtrees in WKWebView). The preset
 // icon picker was removed, so every non-uploaded skill shows this; uploaded skills show their image.
@@ -30405,49 +30006,6 @@ const _ICON_EYE = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" st
 const _ICON_TRASH = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18"/><path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6"/><path d="M10 11v6"/><path d="M14 11v6"/></svg>';
 const _ICON_PENCIL = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4Z"/></svg>';
 const _ICON_IMPORT = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7z"/><path d="M14 2v5h5"/><path d="M12 18v-6"/><path d="m9 15 3 3 3-3"/></svg>';
-// A skill's `icon` is EITHER a "data:" image URL the user uploaded, OR anything else → the default badge.
-function _skillIconMarkup(icon) {
-  if (typeof icon === "string" && icon.slice(0, 5) === "data:") {
-    return '<img class="skill-tile skill-tile--img" src="' + _escAttr(icon) + '" alt="" draggable="false" />';
-  }
-  return _SKILL_DEFAULT_ICON;
-}
-// Read a user-picked image file, cover-crop to a square and re-encode small so it stays a few KB
-// (skills sync to the server as one JSON blob capped at 512KB — a raw photo would blow that instantly).
-function _skillImgFromFile(file) {
-  return new Promise((resolve, reject) => {
-    if (!file || !/^image\//.test(file.type || "")) { reject(new Error("请选择图片文件")); return; }
-    if (file.size > 12 * 1024 * 1024) { reject(new Error("图片太大（请小于 12MB）")); return; }
-    const fr = new FileReader();
-    fr.onerror = () => reject(fr.error || new Error("读取失败"));
-    fr.onload = () => {
-      const img = new Image();
-      img.onerror = () => reject(new Error("这不是有效的图片"));
-      img.onload = () => {
-        try {
-          const enc = (size, q) => {
-            const c = document.createElement("canvas"); c.width = size; c.height = size;
-            const ctx = c.getContext("2d");
-            const scale = Math.max(size / img.width, size / img.height); // cover
-            const w = img.width * scale, h = img.height * scale;
-            ctx.drawImage(img, (size - w) / 2, (size - h) / 2, w, h);
-            let out = "";
-            try { out = c.toDataURL("image/webp", q); } catch {}
-            if (!out || out.indexOf("data:image/webp") !== 0) { try { out = c.toDataURL("image/png"); } catch { out = ""; } }
-            return out;
-          };
-          let out = enc(128, 0.85);
-          if (out && out.length > 60000) out = enc(96, 0.72);   // still chunky (opaque PNG fallback) → shrink harder
-          if (out && out.length > 60000) out = enc(72, 0.6);
-          if (!out) { reject(new Error("图片编码失败")); return; }
-          resolve(out);
-        } catch (err) { reject(err); }
-      };
-      img.src = fr.result;
-    };
-    fr.readAsDataURL(file);
-  });
-}
 function _loadSkillsLocal() { try { const a = JSON.parse(localStorage.getItem(_SKILLS_KEY) || "null"); if (Array.isArray(a)) return a; } catch {} return []; }
 function _saveSkillsLocal(list) { try { localStorage.setItem(_SKILLS_KEY, JSON.stringify(list)); } catch {} }
 
@@ -37567,22 +37125,6 @@ function _checkpointMarkCurrent(cp, absPath, content) {
 // per-workspace in localStorage and auto-injected into the agent's context so it
 // carries knowledge across turns and sessions (like CLAUDE.md, but agent-authored). ---
 function _memoryKey(root) { return "michael-ide.memory:" + (root || "_global"); }
-function _loadMemory(root) {
-  try { return localStorage.getItem(_memoryKey(root)) || ""; } catch { return ""; }
-}
-function _appendMemory(root, note) {
-  const clean = String(note || "").trim().replace(/\n+/g, " ");
-  if (!clean) return false;
-  let lines = _loadMemory(root).split("\n").filter(Boolean);
-  lines.push("- " + clean);
-  if (lines.length > 60) lines = lines.slice(-60); // keep the most recent notes
-  let mem = lines.join("\n");
-  if (mem.length > 8000) mem = mem.slice(mem.length - 8000);
-  try { localStorage.setItem(_memoryKey(root), mem); } catch {}
-  _agentContextCache = { root: null, ts: 0, data: "" }; // force context rebuild so the note shows
-  return true;
-}
-
 // --- Knowledge-graph memory (A-MEM / Zettelkasten): the agent's `remember` notes
 // become atomic, auto-linked nodes — entities = extracted tags, edges = shared
 // tags. On insert a note auto-links to related notes (self-evolving graph). On
@@ -38410,57 +37952,6 @@ function _mcGlobeInit(wrapEl, containerEl, _tip, getData, onNodeClick) {
       globe = null;
     },
   };
-}
-
-function _memoryChoiceModel(root, session) {
-  const stats = typeof _sessionMemoryStats === "function"
-    ? _sessionMemoryStats(session || {})
-    : { totalTurns: 0, recentCount: 0, summaryCount: 0, milestoneCount: 0, fileEvidenceCount: 0 };
-  const sessionLabel = typeof _sessionMemoryLabel === "function"
-    ? _sessionMemoryLabel(stats)
-    : `${stats.totalTurns || stats.recentCount || 0} 轮`;
-  const activeCount = (memoryRoot) => {
-    const superseded = _kgSupersededIds(memoryRoot);
-    return _kgLoad(memoryRoot).filter((item) => !superseded.has(item.id)).length;
-  };
-  const projectCount = root ? activeCount(root) : 0;
-  const globalCount = activeCount("");
-  const projectCorrections = root ? _kgActiveCorrections(root, 20).length : 0;
-  const globalCorrections = _kgActiveCorrections("", 20).length;
-  return [
-    {
-      id: "session",
-      title: "当前会话记忆",
-      badge: sessionLabel,
-      source: "Michael 会话摘要",
-      desc: "适合本轮任务进度、刚聊过的文件、临时上下文。长聊会自动压缩成历史摘要，不需要用户手动选择。",
-      inject: "只跟随当前聊天 Tab；换会话不会污染别的任务。",
-    },
-    {
-      id: "project",
-      title: "项目长期记忆",
-      badge: `${projectCount} 条${projectCorrections ? ` · ${projectCorrections} 次纠正` : ""}`,
-      source: "Michael 项目知识图谱：自动/手动沉淀项目事实",
-      desc: "适合项目架构、踩坑、命令、约定、文件位置。智能体每次按任务相关性召回知识图谱子图。",
-      inject: "只在当前项目自动注入；跨会话保留。",
-    },
-    {
-      id: "global",
-      title: "全局用户偏好",
-      badge: `${globalCount} 条${globalCorrections ? ` · ${globalCorrections} 次纠正` : ""}`,
-      source: "Michael 用户偏好记忆：用户级偏好/工作习惯",
-      desc: "适合你的长期偏好、通用风格、常用决策原则。不要放项目私有路径和一次性信息。",
-      inject: "所有项目都会自动带上；适合“以后都这样”。",
-    },
-    {
-      id: "rules",
-      title: "项目规则 / 团队约定",
-      badge: "自动识别",
-      source: "Michael 项目规则：团队级硬约定",
-      desc: "适合团队强规则、不可违反的构建/测试/代码风格。IDE 会自动识别常见工程规则文件并注入项目上下文。",
-      inject: "项目打开后优先注入，规则比普通记忆更硬。",
-    },
-  ];
 }
 
 // Memory panel: view / edit / clear the agent's project memory for the current
@@ -41736,31 +41227,6 @@ function _parseHttpUrlForPreflight(value) {
   }
 }
 
-function _httpHostnameIsLocalOrPrivate(hostname) {
-  const host = String(hostname || "").trim().toLowerCase().replace(/^\[|\]$/g, "").replace(/\.$/, "");
-  if (!host) return false;
-  if (host === "localhost" || host.endsWith(".localhost") || host === "host.docker.internal") return true;
-  if (!host.includes(".") && !host.includes(":")) return true; // docker/k8s/dev-service names are not public Internet APIs.
-  if (host === "::1" || host === "0:0:0:0:0:0:0:1" || host === "::") return true;
-  if (/^(?:fc|fd)[0-9a-f]{0,2}:|^fe80:/i.test(host)) return true;
-  const m = host.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
-  if (!m) return false;
-  const parts = m.slice(1).map((x) => Number(x));
-  if (parts.some((x) => !Number.isInteger(x) || x < 0 || x > 255)) return false;
-  const [a, b] = parts;
-  return a === 10
-    || a === 127
-    || a === 0
-    || (a === 172 && b >= 16 && b <= 31)
-    || (a === 192 && b === 168)
-    || (a === 169 && b === 254);
-}
-
-function _isLocalOrPrivateHttpUrl(url) {
-  const parsed = _parseHttpUrlForPreflight(url);
-  return !!parsed && _httpHostnameIsLocalOrPrivate(parsed.hostname);
-}
-
 function _canonicalHttpEvidenceUrl(url, includeQuery = true) {
   const parsed = _parseHttpUrlForPreflight(url);
   if (!parsed) return "";
@@ -41828,15 +41294,6 @@ function _resolveCaptureStartMode(call, run = null) {
   return { mode, systemProxy, label, next };
 }
 
-function _browserNeedsCapturePreflight(call, run = null, captureRunning = false) {
-  // Capture ordering is a model strategy, not an execution permission. Browser
-  // actions run normally; capture_flows reports the factual not-running state.
-  void call;
-  void run;
-  void captureRunning;
-  return "";
-}
-
 function _browserRepeatedStableOperation(log, action, selector = "") {
   if (!Array.isArray(log) || log.length < 2) return false;
   const expected = `${action}|${selector || ""}`;
@@ -41851,14 +41308,6 @@ function _browserRepeatedStableOperation(log, action, selector = "") {
 function _needsIsolatedCaptureBrowserRestart(run, captureRunning, currentMode, fresh) {
   if (!fresh || !captureRunning || !run?._captureStarted || run._captureBrowserReady) return false;
   return _normalizeCaptureModeName(run._captureMode || currentMode || "auto") === "isolated_browser";
-}
-
-function _screenshotModePreflightIssue(call, run = null) {
-  // A screenshot can be partial evidence without being an invalid tool call. Let
-  // the backend return the real image and let the model decide what follows.
-  void call;
-  void run;
-  return "";
 }
 
 function _httpRedirectBlock(method, url, response) {
@@ -43685,14 +43134,6 @@ function _sameBatchRunFilePathBinding(run, root, requested) {
   // 这种陈旧绑定按过期放行——否则「等待读取结果」会把之后每一批写入都拦死。
   if (boundBatch > run._toolBatch + 2) return "";
   return boundBatch >= run._toolBatch ? (run._filePathBindings.get(key) || "") : "";
-}
-function _recordRunRead(run, root, ...paths) {
-  const reads = run?.ctx?.filesRead;
-  if (!reads || typeof reads.add !== "function") return;
-  for (const path of paths) {
-    const key = _normRel(path, root);
-    if (key) reads.add(key);
-  }
 }
 // === ANTI-HALLUCINATION PROTOCOL-C：证据分级（单份 .md 不作项目权威）===
 // 痛点：满是文件的项目里，模型只读了一份 `逆向分析报告.md` 就把它当项目事实下结论，
@@ -51016,37 +50457,6 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
   }
 }
 
-// Pull a string field out of a STILL-STREAMING (incomplete) JSON args buffer,
-// e.g. write_file's `content` before the closing quote/brace has arrived. Handles
-// the common JSON escapes so the live code preview reads correctly mid-stream.
-function _partialJsonString(buf, key) {
-  // Tolerate whitespace the model may put around the colon, e.g. `"content": "`.
-  // The old exact `"key":"` match silently failed on spaced JSON — which is why
-  // the live preview card appeared but never showed any content.
-  const m = buf.match(new RegExp(`"${key}"\\s*:\\s*"`));
-  if (!m) return null;
-  const s = buf.slice(m.index + m[0].length);
-  let out = "";
-  for (let j = 0; j < s.length; j++) {
-    const c = s[j];
-    if (c === "\\") {
-      const n = s[j + 1];
-      if (n === undefined) break; // dangling escape at the stream edge
-      if (n === "n") out += "\n";
-      else if (n === "t") out += "\t";
-      else if (n === "r") out += "\r";
-      else if (n === "u") { const h = s.slice(j + 2, j + 6); if (/^[0-9a-fA-F]{4}$/.test(h)) { out += String.fromCharCode(parseInt(h, 16)); j += 4; } }
-      else out += n;
-      j++;
-    } else if (c === '"') {
-      break; // closing quote → value complete
-    } else {
-      out += c;
-    }
-  }
-  return out;
-}
-
 // Decode only a COMPLETE JSON string field. In particular, a partially streamed
 // path must never resolve to a different file and briefly preview there.
 function _completeJsonString(buf, key) {
@@ -52606,45 +52016,6 @@ function _probeLoopNudgeMessage(run, batch) {
   return `[根因检查点] 你已连续 ${win.length} 个回合只做探测、无实质进展。探测清单: ${list}。停止逐个试错: ①先用 1-2 句写出当前故障最可能的根因假设 ②说明最小验证/修复动作再执行 ③若涉及安装/下载/网络类故障,考虑先 web_search 查该报错的已知解法 (如镜像源/环境变量),而不是继续翻本地文件。`;
 }
 
-// ── 计划涉及模块计数（纯事实采集，#56 规模启发）：从计划步骤文本里出现的文件/目录路径
-//    归并出「改动跨几个模块」——monorepo 的 packages/x、src/components 与 src/api、server 与
-//    web 都是不同模块；文件名段（带扩展名）不算目录，URL 先剥除。不读 substantial/projectScope/
-//    fromZeroUiProject 等 AI 规模评级字段：现有大项目「加功能」被 AI 判成 changeScope=module 时，
-//    多模块改动的事实仍由计划路径直接成立——拆分/规划触发与项目新旧解耦。
-function _countExistingModules(steps) {
-  const generic = new Set(["src", "source", "packages", "apps", "modules", "lib", "libs"]);
-  const modules = new Set();
-  for (const step of (Array.isArray(steps) ? steps : [])) {
-    const text = String(step?.content || step?.title || step || "").replace(/\bhttps?:\/\/\S+/gi, " ");
-    for (const match of text.matchAll(/[A-Za-z0-9_.@-]+(?:\/[A-Za-z0-9_.@-]+)+/g)) {
-      const segments = match[0].replace(/^\.+\//, "").split("/").filter(Boolean);
-      if (segments.length >= 2 && /\.[A-Za-z0-9]{1,8}$/.test(segments[segments.length - 1])) segments.pop(); // 文件名段不算目录
-      if (!segments.length) continue;
-      const head = segments[0].toLowerCase();
-      modules.add(generic.has(head) && segments.length >= 2 ? head + "/" + segments[1].toLowerCase() : head);
-    }
-  }
-  return modules.size;
-}
-
-// ── 计划步骤领域归类（纯事实罗列，不做决策）：拆分并行门用它把步骤文本按专业领域
-//    归档（frontend/backend/database/test/devops/docs/design），供模型判断 scope 能否清晰
-//    切分。关键词只作事实归档底座，拆不拆的语义判断权留给模型（AI 主判原则）。
-function _planStepDomain(step) {
-  const text = String(step?.content || step?.title || step || "");
-  if (!text) return "";
-  if (/(?:数据库|表结构|建表|迁移|索引|存储层|sql|schema|migration|\bdb\b|\borm\b|redis|mongo|postgres|sqlite)/i.test(text)) return "数据库";
-  if (/(?:测试|单测|用例|回归|断言|覆盖率|test|\be2e\b|\bspec\b|coverage)/i.test(text)) return "测试";
-  if (/(?:部署|上线|发布|容器|流水线|运维|deploy|docker|k8s|kubernetes|pipeline|nginx|devops|\bci\b)/i.test(text)) return "部署";
-  if (/(?:文档|说明书|readme|changelog|\bdocs?\b|wiki)/i.test(text)) return "文档";
-  if (/(?:设计稿|视觉方案|配色|原型|design system|figma)/i.test(text)) return "设计";
-  if (/(?:前端|页面|组件|界面|样式|布局|视图|交互|响应式|动效|\bui\b|\bcss\b|tailwind|react|vue|svelte|\bhtml\b|frontend|component|\bpage\b|layout)/i.test(text)) return "前端";
-  if (/(?:后端|服务端|接口|路由|中间件|鉴权|会话|\bapi\b|backend|server|endpoint|controller|middleware|\bauth\b|websocket)/i.test(text)) return "后端";
-  return "";
-}
-
-
-
 // ── bug 修复异步取证门（一次性事实注入）：调试类任务写入前已有 ≥2 次失败/未找到类探测
 //    （根因未明的事实，复用 probeLoop 的批次账本，不另起账）→ 提示取证可用后台子智能体
 //    并行推进。与 probeLoop 不同键；同批已有 stuck/probeLoop 干预时由调用方让行。
@@ -52874,19 +52245,6 @@ function _occurrenceLines(text, needle, cap = 8) {
     idx += Math.max(needle.length, 1);
   }
   return out;
-}
-
-function _countOccurrences(text, needle) {
-  const haystack = String(text ?? "");
-  const value = String(needle ?? "");
-  if (!value) return 0;
-  let count = 0;
-  let index = 0;
-  while ((index = haystack.indexOf(value, index)) !== -1) {
-    count++;
-    index += value.length;
-  }
-  return count;
 }
 
 function _recoverEditMatch(text, needle) {
@@ -59686,31 +59044,8 @@ monacoEditor.addAction({
   run: () => openInlineAssistant(),
 });
 
-// ---- AI Diff Preview ----
-function showAiDiffPreview(originalCode, modifiedCode, lang, filePath) {
-  const ed = ensureDiffEditor({ readOnly: true, originalEditable: false });
-  const original = monaco.editor.createModel(originalCode, lang || "plaintext");
-  const modified = monaco.editor.createModel(modifiedCode, lang || "plaintext");
-  const prev = ed.getModel();
-  ed.setModel({ original, modified });
-  if (prev) {
-    prev.original?.dispose();
-    prev.modified?.dispose();
-  }
-  _diffFilePath = filePath || null;
-  $("diffTitle").textContent = filePath ? filePath.split("/").pop() + " (AI Preview)" : "AI Diff Preview";
-  diffViewEl.hidden = false;
-  ed.layout();
-
-  ed.updateOptions({ readOnly: false, originalEditable: false });
-}
-
 // ---- settings dialog ----
 const settingsEl = $("settings");
-function _settingsSelectedProviderMode() {
-  return AI_PROVIDER_GATEWAY;
-}
-
 function _setSettingsProviderMode(mode) {
   const normalized = AI_PROVIDER_GATEWAY;
   const gateway = $("aiProviderGateway");
@@ -60348,32 +59683,6 @@ const TOOL_REQUIREMENTS = {
 };
 
 const _checkedLangs = new Set();
-async function checkToolForLanguage(lang) {
-  if (_checkedLangs.has(lang)) return;
-  const req = TOOL_REQUIREMENTS[lang];
-  if (!req) return;
-  _checkedLangs.add(lang);
-  try {
-    if (inTauri) {
-      const cmds = await backend.termListCommands();
-      if (cmds.includes(req.cmd)) return;
-    }
-    showNotification({
-      title: `缺少 ${req.name}`,
-      message: `安装后可获得 ${lang} 智能补全、跳转定义等功能`,
-      actionLabel: "安装",
-      duration: 15000,
-      action: async () => {
-        await openTerminal();
-        writeToActiveTerminal(req.install + "\n");
-        showToast(`正在自动安装 ${req.name}...`);
-      },
-    });
-  } catch (e) {
-    console.warn("[tool-check]", lang, e);
-  }
-}
-
 // ---- advanced feature panels (settings / growth / shortcuts) ----
 // ===== 抓包 (system-wide MITM capture, mitmproxy-backed; HttpCanary/小黄鸟-style) =====
 let _captureFlows = [];      // ring buffer of captured flows (untrusted data → render via textContent)
@@ -67038,14 +66347,6 @@ async function _dispatchComposerSubmission(draft) {
   return true;
 }
 
-function _addDroppedRef(info) {
-  if (!info || !info.path) return;
-  const rel = _pathToRel(info.path);
-  if (_droppedRefs.some((r) => r.rel === rel)) return; // dedupe
-  _droppedRefs.push({ path: info.path, rel, name: info.name || rel.split("/").pop() || rel, isDir: !!info.isDir });
-  _renderRefChips();
-  try { promptEl.focus(); } catch {}
-}
 // Drop a file/dir chip into the composer at the caret (from a tree drag). The chip is an atomic
 // contentEditable=false card; the @-mention regex the send path needs is satisfied by the VIRTUAL
 // spaces _ceSerialize emits around each chip — so nothing is inserted here but the chip itself.
@@ -68712,19 +68013,6 @@ async function _restoreArchivedSession(sessionId) {
   return _restoreClosedChatSession(0);
 }
 
-function _sessionLibraryTotals(entries) {
-  const out = { totalTurns: 0, recentCount: 0, summaryCount: 0, fileEvidenceCount: 0, correctionCount: 0 };
-  for (const { session } of entries || []) {
-    const st = _sessionMemoryStats(session);
-    out.totalTurns += st.totalTurns;
-    out.recentCount += st.recentCount;
-    out.summaryCount += st.summaryCount;
-    out.fileEvidenceCount += st.fileEvidenceCount;
-    out.correctionCount += st.correctionCount;
-  }
-  return out;
-}
-
 // Session picker (/sessions): browse every conversation in this workspace — name,
 // project, mode, message count, last-message preview — and jump into one to continue.
 async function _openSessionPicker() {
@@ -70192,13 +69480,6 @@ let userKeybindings = {};
 async function loadKeybindings() {
   const store = await getStore();
   userKeybindings = (await store.get("keybindings")) || {};
-}
-
-async function saveKeybinding(combo, action) {
-  userKeybindings[combo] = action;
-  const store = await getStore();
-  await store.set("keybindings", userKeybindings);
-  await store.save();
 }
 
 function getKeybindings() {
@@ -72365,160 +71646,11 @@ if (inTauri) {
 }
 
 // ---- Outline Panel ----
-let _outlineSortByName = false;
-let _outlineSymbols = [];
-
-async function refreshOutline() {
-  const tree = $("outlineTree");
-  if (!activePath) {
-    tree.innerHTML = '<div class="empty"><p>Open a file to see its outline.</p></div>';
-    $("outlineTimeline")?.removeAttribute("hidden");
-    refreshTimeline();
-    return;
-  }
-  const model = monacoEditor.getModel();
-  if (!model) return;
-  // monaco.languages.getDocumentSymbols 不是公开 API（0.55 的 editor.api 里不存在），
-  // 旧代码每次必抛 TypeError → 永远渲染 "No symbols found"（"大纲点了没内容"的根因）。
-  // 正路：LSP documentSymbol（本项目已有通道）；LSP 没起来/不支持时回退到内置正则解析，
-  // 保证大纲在任何语言环境下都至少有结果。
-  let symbols = null;
-  try {
-    if (typeof lspManager !== "undefined" && lspManager && lspManager.agentDocumentSymbols) {
-      symbols = await lspManager.agentDocumentSymbols(activePath); // [{name,kind,line,depth}] | null
-    }
-  } catch { symbols = null; }
-  if (!Array.isArray(symbols) || !symbols.length) symbols = _fallbackOutline(model);
-  _outlineSymbols = symbols;
-  renderOutlineTree(_outlineSymbols, tree);
-  $("outlineTimeline")?.removeAttribute("hidden");
-  refreshTimeline();
-}
-
-// LSP 不可用时的兜底大纲：按语言用正则抽 函数/类/结构 等顶层符号（1-based 行号）。
-function _fallbackOutline(model) {
-  const lang = model.getLanguageId();
-  const text = model.getValue();
-  const out = [];
-  const push = (name, kind, line, depth = 0, detail = "") => out.push({ name, kind, line, depth, detail });
-  const patterns = {
-    javascript: [
-      [/^\s*(?:export\s+)?(?:default\s+)?(?:async\s+)?function\s*\*?\s*([A-Za-z_$][\w$]*)/, "function"],
-      [/^\s*(?:export\s+)?(?:default\s+)?class\s+([A-Za-z_$][\w$]*)/, "class"],
-      [/^\s*(?:export\s+)?(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*(?:async\s*)?(?:\(|function\b|[A-Za-z_$][\w$]*\s*=>)/, "function"],
-    ],
-    python: [[/^\s*def\s+([A-Za-z_]\w*)/, "function"], [/^\s*class\s+([A-Za-z_]\w*)/, "class"]],
-    rust: [
-      [/^\s*(?:pub(?:\([^)]*\))?\s+)?(?:async\s+)?fn\s+([A-Za-z_]\w*)/, "function"],
-      [/^\s*(?:pub(?:\([^)]*\))?\s+)?(?:struct|enum|trait)\s+([A-Za-z_]\w*)/, "struct"],
-      [/^\s*impl(?:<[^>]*>)?\s+([A-Za-z_][\w:<>, ]*?)\s*[{]/, "class"],
-    ],
-    go: [[/^\s*func\s+(?:\([^)]*\)\s*)?([A-Za-z_]\w*)/, "function"], [/^\s*type\s+([A-Za-z_]\w*)/, "struct"]],
-    markdown: [[/^(#{1,6})\s+(.+)$/, "string"]],
-  };
-  const alias = { typescript: "javascript", javascriptreact: "javascript", typescriptreact: "javascript", mdx: "markdown" };
-  const rules = patterns[alias[lang] || lang] || patterns.javascript;
-  const lines = text.split("\n");
-  for (let i = 0; i < lines.length && out.length < 500; i++) {
-    for (const [re, kind] of rules) {
-      const m = re.exec(lines[i]);
-      if (!m) continue;
-      if (lang === "markdown" || alias[lang] === "markdown") push(m[2].trim(), kind, i + 1, m[1].length - 1);
-      else push(m[1], kind, i + 1);
-      break;
-    }
-  }
-  return out;
-}
-
-function renderOutlineTree(symbols, container) {
-  const filter = ($("outlineFilter")?.value || "").toLowerCase();
-  container.innerHTML = "";
-  if (!symbols.length) {
-    container.innerHTML = '<div class="empty"><p>No symbols found.</p></div>';
-    return;
-  }
-  // 扁平列表（LSP agentDocumentSymbols / 兜底解析统一形态）：depth 用缩进表达层级。
-  const sorted = [...symbols];
-  if (_outlineSortByName) sorted.sort((a, b) => a.name.localeCompare(b.name));
-  for (const sym of sorted) {
-    if (filter && !sym.name.toLowerCase().includes(filter)) continue;
-    const row = document.createElement("div");
-    row.className = "outline-row";
-    if (sym.depth) row.style.paddingLeft = `${8 + sym.depth * 14}px`;
-    const kindClass = _symbolKindClass(sym.kind);
-    row.innerHTML = `<span class="outline-icon outline-icon--${kindClass}"></span><span class="outline-name">${_escHtml(sym.name)}</span><span class="outline-detail">${_escHtml(sym.detail || "")}</span>`;
-    row.addEventListener("click", () => {
-      if (sym.line) {
-        monacoEditor.revealLineInCenter(sym.line);
-        monacoEditor.setPosition({ lineNumber: sym.line, column: 1 });
-        monacoEditor.focus();
-      }
-    });
-    container.appendChild(row);
-  }
-  if (!container.childElementCount) container.innerHTML = '<div class="empty"><p>No symbols found.</p></div>';
-}
-
-function _symbolKindClass(kind) {
-  if (typeof kind === "string" && kind) return kind.toLowerCase(); // LSP 通道给的已是名字
-  const map = { 1: "file", 2: "module", 3: "namespace", 4: "package", 5: "class", 6: "method",
-    7: "property", 8: "field", 9: "constructor", 10: "enum", 11: "interface", 12: "function",
-    13: "variable", 14: "constant", 15: "string", 16: "number", 17: "boolean", 18: "array",
-    19: "object", 20: "key", 21: "null", 22: "enummember", 23: "struct", 24: "event", 25: "operator", 26: "typeparam" };
-  return map[kind] || "variable";
-}
-
-$("outlineSortBtn")?.addEventListener("click", () => {
-  _outlineSortByName = !_outlineSortByName;
-});
-$("outlineFilter")?.addEventListener("input", () => {
-  const tree = $("outlineTree");
-  renderOutlineTree(_outlineSymbols, tree);
-});
 
 monacoEditor.onDidChangeModel(() => {
   // 只在大纲可见时刷新。旧写法 `!hidden === false` 运算符优先级写反：隐藏时白烧
   // 解析、可见时反而不刷——切到大纲页看到的是上个文件的旧结构（"点了没效果"之一）。
 });
-
-// ---- File Timeline ----
-async function refreshTimeline() {
-  const list = $("timelineList");
-  if (!list) return;
-  if (!activePath || !workspaceRoots.length) {
-    list.innerHTML = '<div class="empty"><p>No file selected.</p></div>';
-    return;
-  }
-  try {
-    const root = workspaceRoots[0];
-    const rel = activePath.startsWith(root) ? activePath.slice(root.length + 1) : activePath;
-    const log = await backend.gitLog(root);
-    const fileLog = log.filter(e => e.files?.includes(rel) || e.message?.includes(rel)).slice(0, 20);
-    if (!fileLog.length) {
-      const allLog = log.slice(0, 15);
-      renderTimelineEntries(allLog, list);
-    } else {
-      renderTimelineEntries(fileLog, list);
-    }
-  } catch {
-    list.innerHTML = '<div class="empty"><p>No git history.</p></div>';
-  }
-}
-
-function renderTimelineEntries(entries, container) {
-  container.innerHTML = "";
-  for (const e of entries) {
-    const row = document.createElement("div");
-    row.className = "timeline-row";
-    const date = e.date ? new Date(parseInt(e.date) * 1000).toLocaleDateString() : "";
-    row.innerHTML = `<span class="timeline-dot"></span><div class="timeline-info"><span class="timeline-msg">${_escHtml(e.message?.split("\n")[0] || "")}</span><span class="timeline-meta">${_escHtml(e.author || "")} · ${date}</span></div>`;
-    row.addEventListener("click", () => {
-      showToast(`Commit: ${e.hash?.slice(0, 8) || "?"}`);
-    });
-    container.appendChild(row);
-  }
-}
 
 $("timelineToggle")?.addEventListener("click", () => {
   const list = $("timelineList");
@@ -72570,159 +71702,6 @@ $("outputCloseBtn")?.addEventListener("click", () => toggleOutputPanel());
 // ---- Test Explorer ----
 // .mjs/.cjs 也算测试文件（本仓库自己的测试就是 test/*.test.mjs，旧模式漏掉 → 永远
 // "No test files detected"，测试页签点了像没反应）。
-const _TEST_PATTERNS = [
-  /\.(test|spec)\.[cm]?[jt]sx?$/, /_test\.go$/, /test_.*\.py$/, /.*_test\.py$/,
-  /Test\.java$/, /\.test\.rs$/
-];
-
-async function refreshTestExplorer() {
-  const tree = $("testTree");
-  if (!workspaceRoots.length) {
-    tree.innerHTML = '<div class="empty"><p>Open a project to detect tests.</p></div>';
-    return;
-  }
-  try {
-    const root = workspaceRoots[0];
-    const allFiles = await _collectTestFiles(root);
-    if (!allFiles.length) {
-      tree.innerHTML = '<div class="empty"><p>No test files detected.</p></div>';
-      return;
-    }
-    tree.innerHTML = "";
-    const groups = {};
-    for (const f of allFiles) {
-      const dir = f.path.split("/").slice(0, -1).join("/").replace(root + "/", "") || ".";
-      if (!groups[dir]) groups[dir] = [];
-      groups[dir].push(f);
-    }
-    for (const [dir, files] of Object.entries(groups)) {
-      const section = document.createElement("div");
-      section.className = "test-group";
-      section.innerHTML = `<div class="test-group__head"><svg class="ic"><use href="#i-folder" /></svg><span>${_escHtml(dir)}</span></div>`;
-      for (const f of files) {
-        const row = document.createElement("div");
-        row.className = "test-row";
-        row.innerHTML = `<span class="test-status test-status--pending">○</span><span class="test-name">${_escHtml(f.name)}</span>`;
-        row.addEventListener("click", () => openFile(f.path, f.name));
-        const runBtn = document.createElement("button");
-        runBtn.className = "iconbtn test-run-btn";
-        runBtn.title = "Run test";
-        runBtn.innerHTML = '<svg class="ic"><use href="#i-play" /></svg>';
-        runBtn.addEventListener("click", (e) => {
-          e.stopPropagation();
-          runTestFile(f.path, f.name, row);
-        });
-        row.appendChild(runBtn);
-        section.appendChild(row);
-      }
-      tree.appendChild(section);
-    }
-  } catch {
-    tree.innerHTML = '<div class="empty"><p>Error scanning tests.</p></div>';
-  }
-}
-
-async function _collectTestFiles(root, maxDepth = 4) {
-  const results = [];
-  async function scan(dir, depth) {
-    if (depth > maxDepth) return;
-    try {
-      const entries = await backend.readDir(dir);
-      for (const e of entries) {
-        if (e.is_dir) {
-          if (e.name === "node_modules" || e.name === ".git" || e.name === "target" || e.name === "__pycache__") continue;
-          await scan(e.path, depth + 1);
-        } else if (_TEST_PATTERNS.some(p => p.test(e.name))) {
-          results.push(e);
-        }
-      }
-    } catch { /* ignore inaccessible dirs */ }
-  }
-  await scan(root, 0);
-  return results;
-}
-
-async function runTestFile(path, name, rowEl) {
-  const statusEl = rowEl.querySelector(".test-status");
-  statusEl.textContent = "⏳";
-  statusEl.className = "test-status test-status--running";
-  const root = rootPath || workspaceRoots[0] || "";
-  try {
-    let cmd;
-    if (/\.(test|spec)\.[cm]js$/.test(name)) cmd = `node --test "${path}" 2>&1`; // node 内置 test runner（本仓库 *.test.mjs 用的就是它）
-    else if (/\.(test|spec)\.[jt]sx?$/.test(name)) cmd = `npx vitest run "${path}" 2>&1 || npx jest "${path}" --no-coverage 2>&1`;
-    else if (/_test\.go$/.test(name)) cmd = `go test -v "${path}" 2>&1`;
-    else if (/(^|\/)test_.*\.py$|_test\.py$|test.*\.py$/.test(name)) cmd = `python -m pytest "${path}" -v 2>&1`;
-    else if (/\.rs$/.test(name)) cmd = `cargo test 2>&1`;
-    else {
-      statusEl.textContent = "—"; statusEl.className = "test-status";
-      appendOutput("tasks", `[TEST] ${name}: 没有可用的测试运行器（支持 jest/vitest、pytest、go test、cargo test）`);
-      showToast(`没有 ${name} 的测试运行器`);
-      return;
-    }
-    if (!root) { statusEl.textContent = "—"; statusEl.className = "test-status"; showToast("未打开工作区"); return; }
-    appendOutput("tasks", `[TEST] ${name}: 运行中…  $ ${cmd}`);
-    // ACTUALLY run it and judge by the REAL exit code — no more unconditional ✓.
-    const r = await backend.taskRunCapture(root, cmd);
-    const out = (((r && r.stdout) || "") + ((r && r.stderr) ? "\n" + r.stderr : "")).trim();
-    const code = r && typeof r.code === "number" ? r.code : -1;
-    if (code === 0) {
-      statusEl.textContent = "✓"; statusEl.className = "test-status test-status--pass";
-      appendOutput("tasks", `[TEST] ${name}: PASSED (exit 0)\n${out.slice(-2000)}`);
-    } else {
-      statusEl.textContent = "✗"; statusEl.className = "test-status test-status--fail";
-      appendOutput("tasks", `[TEST] ${name}: FAILED (exit ${code})\n${out.slice(-3000)}`);
-    }
-  } catch (err) {
-    statusEl.textContent = "✗"; statusEl.className = "test-status test-status--fail";
-    appendOutput("tasks", `[TEST] ${name}: 运行出错 - ${err?.message || err}`);
-  }
-}
-
-// Run the WHOLE suite once (detected from the project), parse aggregate pass/fail,
-// show a summary banner + mark rows. Was: `row.click()` per row — which only OPENED
-// each file (the row handler is openFile), so "Run All" ran nothing at all.
-async function _testFileExists(p) { try { await backend.readTextFile(p); return true; } catch { return false; } }
-function _parseTestStats(out) {
-  const pass = out.match(/(\d+)\s+passed/i);
-  const fail = out.match(/(\d+)\s+failed/i);
-  const parts = [];
-  if (pass) parts.push(`${pass[1]} 通过`);
-  if (fail && +fail[1] > 0) parts.push(`${fail[1]} 失败`);
-  return parts.join("、");
-}
-async function runAllTests() {
-  const root = rootPath || workspaceRoots[0] || "";
-  const tree = $("testTree");
-  if (!root) { showToast("未打开工作区"); return; }
-  let cmd = "npm test 2>&1";
-  try {
-    if (await _testFileExists(root + "/Cargo.toml")) cmd = "cargo test 2>&1";
-    else if (await _testFileExists(root + "/go.mod")) cmd = "go test ./... 2>&1";
-    else if (await _testFileExists(root + "/package.json")) {
-      const pkg = JSON.parse(await backend.readTextFile(root + "/package.json"));
-      cmd = (pkg.scripts && pkg.scripts.test) ? "npm test --silent 2>&1" : "npx vitest run 2>&1 || npx jest 2>&1";
-    } else if (await _testFileExists(root + "/pyproject.toml") || await _testFileExists(root + "/pytest.ini") || await _testFileExists(root + "/setup.py")) cmd = "python -m pytest 2>&1";
-  } catch {}
-  let banner = tree.querySelector(".test-allbanner");
-  if (!banner) { banner = document.createElement("div"); banner.className = "test-allbanner"; banner.style.cssText = "padding:7px 10px;font-size:12px;border-bottom:1px solid var(--border,#e5e7eb);position:sticky;top:0;background:var(--bg-elevated,var(--panel,#fff));z-index:1"; tree.prepend(banner); }
-  banner.innerHTML = `<span class="atc-spin"></span> 运行全部测试…  <code style="opacity:.6">${_escHtml(cmd)}</code>`;
-  appendOutput("tasks", `[TEST] 运行全部：$ ${cmd}`);
-  try {
-    const r = await backend.taskRunCapture(root, cmd);
-    const out = (((r && r.stdout) || "") + ((r && r.stderr) ? "\n" + r.stderr : "")).trim();
-    const code = r && typeof r.code === "number" ? r.code : -1;
-    const stats = _parseTestStats(out);
-    const ok = code === 0;
-    banner.innerHTML = `${ok ? '<b style="color:var(--ok,#1e8e3e)">✓ 全部通过</b>' : '<b style="color:var(--err,#d93025)">✗ 有失败</b>'}${stats ? " · " + stats : ""} · exit ${code} <button class="lnk-btn" style="float:right;background:none;border:none;color:var(--accent,#1a73e8);cursor:pointer;font-size:12px">查看输出</button>`;
-    banner.querySelector("button")?.addEventListener("click", () => { appendOutput("tasks", out.slice(-6000)); toggleOutputPanel?.(); });
-    appendOutput("tasks", `[TEST] 全部完成 (exit ${code})\n${out.slice(-4000)}`);
-    for (const st of tree.querySelectorAll(".test-row .test-status")) { st.textContent = ok ? "✓" : "✗"; st.className = "test-status " + (ok ? "test-status--pass" : "test-status--fail"); }
-  } catch (e) {
-    banner.innerHTML = `<b style="color:var(--err,#d93025)">✗ 运行出错</b>：${_escHtml(String(e?.message || e).slice(0, 120))}`;
-  }
-}
-$("testRunAllBtn")?.addEventListener("click", () => runAllTests());
 
 // ---- Terminal Split ----
 $("termSplitBtn")?.addEventListener("click", async () => {
@@ -73113,45 +72092,9 @@ monacoEditor.addAction({
 });
 
 // ---- Minimap Search Highlight ----
-let _minimapSearchDecorations = [];
-
-function updateMinimapSearchHighlights(matches) {
-  const decos = (matches || []).map(m => ({
-    range: m.range,
-    options: {
-      minimap: { color: "#ffc107", position: monaco.editor.MinimapPosition.Inline },
-      overviewRuler: { color: "#ffc107", position: monaco.editor.OverviewRulerLane.Center },
-    },
-  }));
-  _minimapSearchDecorations = monacoEditor.deltaDecorations(_minimapSearchDecorations, decos);
-}
 
 // ---- Extension Recommendations ----
-const _EXT_RECOMMENDATIONS = {
-  ".py": { name: "Python", ext: "ms-python.python", desc: "Python language support" },
-  ".rs": { name: "Rust Analyzer", ext: "rust-lang.rust-analyzer", desc: "Rust language support" },
-  ".go": { name: "Go", ext: "golang.go", desc: "Go language support" },
-  ".vue": { name: "Vue", ext: "Vue.volar", desc: "Vue language support" },
-  ".svelte": { name: "Svelte", ext: "svelte.svelte-vscode", desc: "Svelte language support" },
-  ".dart": { name: "Dart", ext: "Dart-Code.dart-code", desc: "Dart language support" },
-  ".java": { name: "Java", ext: "redhat.java", desc: "Java language support" },
-  ".rb": { name: "Ruby", ext: "Shopify.ruby-lsp", desc: "Ruby language support" },
-};
 
-function checkExtensionRecommendation(fileName) {
-  const ext = "." + (fileName.split(".").pop() || "");
-  const rec = _EXT_RECOMMENDATIONS[ext];
-  if (!rec || _recommendedAlready.has(ext)) return;
-  _recommendedAlready.add(ext);
-  showNotification({
-    title: `推荐扩展：${rec.name}`,
-    message: rec.desc,
-    action: () => openMarketplaceModal(), // was showSide("explorer") — opened the file tree, not the marketplace
-    actionLabel: "查看扩展市场",
-    duration: 10000,
-  });
-}
-const _recommendedAlready = new Set();
 
 // ---- Custom Snippet Editor ----
 function openSnippetEditor() {
@@ -73199,10 +72142,6 @@ function openSnippetEditor() {
 // (⌘⌥K is Toggle Bookmark), so this is purely additive.
 // ============================================================================
 editorEl.style.position = "relative";
-function _aiConfigured() {
-  const c = loadConfig();
-  return !!(c.baseUrl && c.apiKey && c.model);
-}
 function _stripFence(s) {
   return String(s || "").replace(/^\s*```[\w-]*\n?/, "").replace(/\n?```\s*$/, "");
 }
@@ -73396,19 +72335,6 @@ function summarizeToolHistory(records, maxTurns = 8) {
 // ============================================================================
 // Docker Compose helper functions
 // ============================================================================
-
-function _workspaceRelativePath(filePath, preferredRoot = "") {
-  const normalized = _normalizeFsPath(String(filePath || ""));
-  const roots = _allRoots(preferredRoot).sort((a, b) => b.length - a.length);
-  for (const workspaceRoot of roots) {
-    const cleanRoot = _normalizeFsPath(workspaceRoot).replace(/\/+$/, "");
-    if (_pathIdentity(normalized) === _pathIdentity(cleanRoot)) return ".";
-    if (_pathIdentity(normalized).startsWith(_pathIdentity(cleanRoot) + "/")) {
-      return normalized.slice(cleanRoot.length + 1);
-    }
-  }
-  return normalized;
-}
 
 /** Run a single command without step rendering */
 async function _runSingleCommand(root, command, timeoutSecs = 60) {
