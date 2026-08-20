@@ -1480,7 +1480,7 @@
               "scaffold",
               "run"
             ],
-            "description": "What this command is for: explore = read-only probing; verify = a one-shot check such as build/test/typecheck/lint (the exit code is the conclusion); install = installing dependencies; mutate = will modify workspace files; scaffold = generates a project skeleton; run = run the app/script to see its behaviour. Declare it honestly — verify + exit 0 is recorded as verification evidence, and mutate/scaffold re-arm the verification obligation."
+            "description": "What this command is for: explore = read-only probing; verify = a one-shot check such as build/test/typecheck/lint (the exit code is the conclusion); install = installing dependencies; mutate = will modify workspace files; scaffold = generates a project skeleton; run = run the app/script to see its behaviour. Declare it honestly. Note what the declaration does and does not buy you: mutate/scaffold re-arm the verification obligation on your word alone, but verify does NOT grant verification credit by declaring it. Credit comes from the command itself being a recognised check (build/test/typecheck/lint) that exits 0 — declaring purpose=verify on a bare `echo done` or `ls` records nothing. So run the project's real check."
           },
           "timeout_secs": {
             "type": "integer",
@@ -1719,7 +1719,7 @@
               "scaffold",
               "run"
             ],
-            "description": "What this command is for: verify = build/test/typecheck/lint (the exit code is the conclusion); run = start the app/service to see its behaviour; mutate/scaffold = will change workspace files; install = installing dependencies; explore = read-only probing. Declare it honestly — verify + exit 0 is recorded as verification evidence."
+            "description": "What this command is for: verify = build/test/typecheck/lint (the exit code is the conclusion); run = start the app/service to see its behaviour; mutate/scaffold = will change workspace files; install = installing dependencies; explore = read-only probing. Declare it honestly. Note what the declaration does and does not buy you: mutate/scaffold re-arm the verification obligation on your word alone, but verify does NOT grant verification credit by declaring it. Credit comes from the command itself being a recognised check (build/test/typecheck/lint) that exits 0 — declaring purpose=verify on a bare `echo done` or `ls` records nothing. So run the project's real check."
           }
         },
         "required": [
