@@ -30715,11 +30715,13 @@ test("读不了的文件不许说成「找不到」，而且错误码要被失�
 });
 
 test("日志截断要说真实总量，不能让下游报出一个精确的假数字", () => {
-  const seg = /const _joined = chunks\.join[\s\S]*?_joined\.slice\(0, _LOG_BUDGET\);/.exec(SRC);
+  // 切到 `return _body` 为止：中间那两个自由变量（call / _nameMiss）当参数注进去，
+  // 「点名的终端没匹配上」那条抬头有自己的测试，这里只看截断。
+  const seg = /const _joined = chunks\.join[\s\S]*?\n  return _body;/.exec(SRC);
   assert.ok(seg, "日志截断那段不见了");
-  const f = new Function("chunks", seg[0].replace("const _joined", "let _joined"));
+  const f = new Function("chunks", "call", "_nameMiss", seg[0].replace("const _joined", "let _joined"));
   const chunks = Array.from({ length: 8 }, (_, i) => "--- 日志文件: a" + i + ".log ---\n" + "x".repeat(12000));
-  const out = f(chunks);
+  const out = f(chunks, {}, "");
   const real = chunks.join("\n\n").length;
   assert.match(out, new RegExp(`实际共 ${real} 字`),
     "没给真实总量 —— 下游那句「中间约 N 字不在上下文里」用的是砍完之后的长度，会低报几千倍");
@@ -30729,7 +30731,7 @@ test("日志截断要说真实总量，不能让下游报出一个精确的假�
     "返回正好顶到下游预算，恰恰是让那个假标记必然触发的值；要留出抬头和外部数据标记的位置");
   assert.match(out, /read_logs\(path=/, "没告诉模型缺的那几份怎么单独取");
   // 没超预算时原样返回，别平白加一句。
-  assert.equal(f(["short"]), "short");
+  assert.equal(f(["short"], {}, ""), "short");
 });
 
 test("CI 日志：第一行就是错因时不许说「没匹配到失败关键词」，抬头的行数要从实际交付反推", () => {
@@ -31056,4 +31058,50 @@ test("英文问两个完全不同的问题，不许被判成重复", () => {
   // 分派必须在**原始串**上做：_normalizeQuestion 把空格也删了，在它之后按词切永远是空集。
   const src = extractFn("_questionSimilarity");
   assert.match(src, /_words\(a\)/, "按词切用的不是原始串 —— 空格已经被规范化删掉了");
+});
+
+// read_logs(name=...) 点名一个终端，没匹配上时代码**照样**往下走去读工作区里的日志文件。
+// 那些文件顶着 `--- 日志文件: ... ---` 的头交回模型，全程没有一个字说过「你点的名字没找到」。
+// 模型问的是「backend 那个终端在喊什么」，收到的是 vite.log 的尾巴，并且会当成答案用。
+// 修法是加抬头，不是改成失败——其它日志确实读到了，报失败会把一次有产出的调用抹成零产出。
+test("read_logs 点名的终端没匹配上，不许把别人的日志当成它的交回去", async () => {
+  const _agentReadLogs = load("_agentReadLogs", {
+    _terminalLogChunks: (name) => (name === "backend"
+      ? ["--- 终端日志: backend (运行中) ---\nlistening on 8080"]
+      : []),
+    _formatAgentTerminalLines: () => ["[0] frontend (运行中) cwd=/w cmd=npm run dev"],
+    _looksLikeLogFileName: () => true,
+    _workspaceLogCandidates: async () => ["/w/vite.log"],
+    _readLogTailForAgent: async (path) => ({ path, content: "vite ready in 300ms" }),
+  });
+
+  const hit = await _agentReadLogs({ name: "backend" }, "/w", null);
+  assert.match(hit, /listening on 8080/);
+  assert.doesNotMatch(hit, /终端没匹配上/, "匹配上了还报没匹配上");
+
+  const miss = await _agentReadLogs({ name: "worker" }, "/w", null);
+  assert.match(miss.split("\n")[0], /\[终端没匹配上\]/,
+    "点名的终端没找到，抬头第一行必须说出来——放末尾会被下游再截时第一个砍掉");
+  assert.match(miss, /worker/, "没说清是哪个名字没找到");
+  assert.match(miss, /frontend/, "没给出当前真实存在的终端，模型无从改口");
+  assert.match(miss, /\*\*不是\*\*「worker」的输出/,
+    "工作区日志照常给了，却没声明它们不是被点名那个终端的输出");
+  assert.match(miss, /vite ready in 300ms/, "抬头不该把已经读到的日志吞掉");
+
+  // 而且不许被判成一次失败：`[终端没匹配上]` 落在失败标记正则外，是有意的。
+  const _toolFailureMatch = load("_toolFailureMatch");
+  assert.equal(!!_toolFailureMatch(miss), false,
+    "抬头被判成工具失败了——其它日志真读到了，报失败等于把有产出的调用抹成零产出");
+
+  // 什么都没读到时，也要说是「名字没匹配上」，不是笼统的「没有日志」。
+  const empty = load("_agentReadLogs", {
+    _terminalLogChunks: () => [],
+    _formatAgentTerminalLines: () => [],
+    _looksLikeLogFileName: () => true,
+    _workspaceLogCandidates: async () => [],
+    _readLogTailForAgent: async () => ({ error: "not found" }),
+  });
+  const none = await empty({ name: "worker" }, "/w", null);
+  assert.match(none, /\[终端没匹配上\]/);
+  assert.match(none, /一个终端都没打开/);
 });

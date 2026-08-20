@@ -359,8 +359,22 @@ fn read_ui_snapshot() -> UiSnapshot {
       if(T1[role])a1.push(rec);else if(T2[role])a2.push(rec);else if(T3[role])a3.push(rec);else a4.push(rec);
     };
     var wins; try{wins=proc.windows;}catch(e){wins=[];}
-    for(var wi=0;wi<wins.length&&wi<5;wi++){
-      var all; try{all=wins[wi].entireContents();}catch(e){all=[];}
+    // 只走用户真看得见、真点得到的窗口。浏览器这类应用会挂一个 1x1 的隐藏工具窗，
+    // 而最小化的窗口交出来的是失效坐标——照着点会落在空处，就是「点了没反应」。
+    // 这些元素混进来还会在末尾的截断里，把真窗口中能点的元素挤掉。
+    // 主窗口排最前，保证被截断时先留它。
+    var usable=[];
+    for(var wq=0;wq<wins.length;wq++){
+      var w=wins[wq],ws;
+      try{ws=w.size();}catch(e){continue;}
+      if(!ws||ws[0]<40||ws[1]<40) continue;
+      var hidden=false; try{hidden=!!w.attributes.byName('AXMinimized').value();}catch(e){}
+      if(hidden) continue;
+      var isMain=false; try{isMain=!!w.attributes.byName('AXMain').value();}catch(e){}
+      if(isMain) usable.unshift(w); else usable.push(w);
+    }
+    for(var wi=0;wi<usable.length&&wi<5;wi++){
+      var all; try{all=usable[wi].entireContents();}catch(e){all=[];}
       for(var k=0;k<all.length;k++){
         if(a1.length+a2.length+a3.length+a4.length>=CAP*3) break;
         var el=all[k],role; try{role=el.role();}catch(e){continue;}
@@ -377,7 +391,11 @@ fn read_ui_snapshot() -> UiSnapshot {
     }catch(e){}
     var merged=a1.concat(a2).concat(a3).concat(a4).slice(0,CAP);
     for(var n=0;n<merged.length;n++) merged[n].ref=n;
-    return JSON.stringify({target:{pid:pid,name:pname},elements:merged});
+    // 窗口都在、但一个都不可用（全最小化）时，空结果不是「没权限」也不是「这个应用不暴露树」，
+    // 而是唯一能补救的那种空。不说清楚，模型就会照描述里那两条去断言重试没意义。
+    var allHidden=(wins.length>0&&usable.length===0);
+    return JSON.stringify({target:{pid:pid,name:pname},elements:merged,
+      read_error: allHidden ? '这个应用的窗口当前全部处于最小化（或尺寸为零）状态，屏幕上没有可点的元素。先把它切到前台或还原窗口再读一次即可——这不是权限问题，也不是它不暴露辅助功能树。' : undefined});
   }catch(e){return JSON.stringify({target:null,elements:[]});}
 })()"##
         .replace("__SIGNATURE_BUILDERS__", AX_SIGNATURE_BUILDERS_JS);
@@ -618,8 +636,22 @@ const AX_ACTION_JS: &str = r##"(function(){
     var T3 = { AXGroup:1,AXScrollArea:1,AXSplitGroup:1,AXToolbar:1,AXList:1,AXTable:1,AXOutline:1,AXSheet:1,AXDialog:1,AXBrowser:1,AXDrawer:1,AXLayoutArea:1,AXMatte:1,AXRuler:1,AXSplitter:1,AXGrowArea:1 };
     var a1=[],a2=[],a3=[],a4=[];
     var wins; try{wins=proc.windows;}catch(e){wins=[];}
-    for(var wi=0;wi<wins.length&&wi<5;wi++){
-      var all; try{all=wins[wi].entireContents();}catch(e){all=[];}
+    // 只走用户真看得见、真点得到的窗口。浏览器这类应用会挂一个 1x1 的隐藏工具窗，
+    // 而最小化的窗口交出来的是失效坐标——照着点会落在空处，就是「点了没反应」。
+    // 这些元素混进来还会在末尾的截断里，把真窗口中能点的元素挤掉。
+    // 主窗口排最前，保证被截断时先留它。
+    var usable=[];
+    for(var wq=0;wq<wins.length;wq++){
+      var w=wins[wq],ws;
+      try{ws=w.size();}catch(e){continue;}
+      if(!ws||ws[0]<40||ws[1]<40) continue;
+      var hidden=false; try{hidden=!!w.attributes.byName('AXMinimized').value();}catch(e){}
+      if(hidden) continue;
+      var isMain=false; try{isMain=!!w.attributes.byName('AXMain').value();}catch(e){}
+      if(isMain) usable.unshift(w); else usable.push(w);
+    }
+    for(var wi=0;wi<usable.length&&wi<5;wi++){
+      var all; try{all=usable[wi].entireContents();}catch(e){all=[];}
       for(var k=0;k<all.length;k++){
         if(a1.length+a2.length+a3.length+a4.length>=CAP*3) break;
         var el=all[k],role; try{role=el.role();}catch(e){continue;}
@@ -1051,6 +1083,33 @@ return JSON.stringify({operated:operated,changed:changed});
     }
 
     #[cfg(target_os = "macos")]
+    #[test]
+    fn both_ax_scans_skip_windows_the_user_cannot_click() {
+        // 最小化的窗口交出来的是失效坐标，照着点会落在空处；浏览器还会挂 1x1 的隐藏工具窗。
+        // 两处扫描都必须先筛窗口再取内容，否则末尾的截断会拿点不到的元素挤掉真元素。
+        // 断言实现特征，不断言说明词——上面这段注释里同样有那些词，剥掉再数。
+        let src: String = include_str!("accessibility.rs")
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(
+            src.matches("AXMinimized").count(),
+            2,
+            "两处 JXA 扫描都要跳过最小化窗口"
+        );
+        assert_eq!(
+            src.matches("usable[wi].entireContents()").count(),
+            2,
+            "取内容必须走筛过的窗口列表，不能直接用 proc.windows"
+        );
+        assert_eq!(
+            src.matches("wins[wi].entireContents()").count(),
+            0,
+            "还有地方在直接遍历未筛选的窗口"
+        );
+    }
+
     #[test]
     fn same_pid_reordering_fails_signature_gate_before_operation() {
         let expected = AxElementSignature::from(&element(0));

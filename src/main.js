@@ -36667,8 +36667,22 @@ async function _agentReadLogs(call, root = "", run = null) {
     explicit.push(...run._lastCommandFailure.paths.filter((p) => _looksLikeLogFileName(p)));
   }
   const chunks = [];
+  // 点了名却一个终端都没匹配上，下面**照样**会去读工作区里的日志文件——那些是别人的输出。
+  // 不加这行抬头的话，模型问的是「backend 那个终端在喊什么」，收到的是 vite.log 的尾巴，
+  // 顶着 `--- 日志文件: ... ---` 的头，全程没有一个字提过它点的名字没找到。这不是少给信息，
+  // 是给了会被当成答案的错信息。
+  // 抬头而不是失败：其它日志是真读到了，报失败会把一次有产出的调用抹成零产出。
+  let _nameMiss = "";
   if (!explicit.length || call?.includeTerminal || call?.name) {
-    chunks.push(..._terminalLogChunks(call?.name || "", call?.name ? 1 : 3));
+    const _terms = _terminalLogChunks(call?.name || "", call?.name ? 1 : 3);
+    if (call?.name && !_terms.length) {
+      const _avail = _formatAgentTerminalLines(8);
+      _nameMiss = `没找到 label / cwd / 最近命令匹配「${String(call.name).slice(0, 80)}」的 IDE 终端`
+        + (_avail.length
+          ? `。当前可读的终端是这些：\n${_avail.join("\n")}\n先用 list_terminals 核对名字再重来。`
+          : "；当前 IDE 一个终端都没打开——服务要跑起来才有终端输出可读。");
+    }
+    chunks.push(..._terms);
   }
   const paths = explicit.length ? [...new Set(explicit.map(String))] : await _workspaceLogCandidates(root, 6);
   for (const path of paths.slice(0, 8)) {
@@ -36680,6 +36694,7 @@ async function _agentReadLogs(call, root = "", run = null) {
     }
   }
   if (!chunks.length) {
+    if (_nameMiss) return `[终端没匹配上] ${_nameMiss}\n工作区常见日志位置也没有 .log/.out/.err 可读。`;
     return "当前没有可读的 Agent 终端日志，也没有在工作区常见日志位置发现 .log/.out/.err。若报错输出里给了日志路径，调用 read_logs(path=那个路径) 读取尾部。";
   }
   // 裸切会让下游报出一个**精确的假数字**。
@@ -36697,9 +36712,15 @@ async function _agentReadLogs(call, root = "", run = null) {
   //     可行动的。
   const _joined = chunks.join("\n\n");
   const _LOG_BUDGET = 29000;
-  if (_joined.length <= _LOG_BUDGET) return _joined;
-  return `[日志已截断] 实际共 ${_joined.length} 字、${chunks.length} 份，下面只有前 ${_LOG_BUDGET} 字。`
-    + `缺的那几份用 read_logs(path=...) 单独取。\n\n` + _joined.slice(0, _LOG_BUDGET);
+  const _body = _joined.length <= _LOG_BUDGET ? _joined
+    : `[日志已截断] 实际共 ${_joined.length} 字、${chunks.length} 份，下面只有前 ${_LOG_BUDGET} 字。`
+      + `缺的那几份用 read_logs(path=...) 单独取。\n\n` + _joined.slice(0, _LOG_BUDGET);
+  if (_nameMiss) {
+    return `[终端没匹配上] ${_nameMiss}\n`
+      + `下面这些是工作区里的日志文件，**不是**「${String(call.name).slice(0, 80)}」的输出，别当成它的。\n\n`
+      + _body;
+  }
+  return _body;
 }
 
 function _markCommandFailureRecovery(run, root, diagnostics) {
