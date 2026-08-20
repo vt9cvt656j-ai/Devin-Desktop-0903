@@ -3309,13 +3309,7 @@ fn html_to_text(html: &str) -> String {
         out.push_str(&html[i..i + l]);
         i += l;
     }
-    let out = out
-        .replace("&nbsp;", " ")
-        .replace("&amp;", "&")
-        .replace("&lt;", "<")
-        .replace("&gt;", ">")
-        .replace("&quot;", "\"")
-        .replace("&#39;", "'");
+    let out = decode_html_entities(&out);
     out.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
@@ -3553,6 +3547,105 @@ fn ddg_unwrap(href: &str) -> String {
     }
 }
 
+/// HTML 实体解码。**一趟扫完**，不做顺序 replace。
+///
+/// 原来 html_to_text 只认 6 个具名实体，于是 `&#8217;`（右单引号）、`&mdash;`、
+/// `&rsquo;`、`&hellip;` 这些原样漏进模型读到的正文——`Don&#8217;t` 这种。
+/// 更糟的是它是顺序 replace：先把 `&amp;` 换成 `&`，再把 `&lt;` 换成 `<`，
+/// 于是页面上真实存在的字面量 `&amp;lt;` 被**二次解码**成了 `<`。
+/// 一趟扫描顺带修掉这条：每个实体只解一次。
+///
+/// 认不出来的实体原样留着（`AT&T is great;` 里的 `&T is great;` 不是实体）。
+pub(crate) fn decode_html_entities(input: &str) -> String {
+    if !input.contains('&') {
+        return input.to_string();
+    }
+    let mut out = String::with_capacity(input.len());
+    let mut rest = input;
+    while let Some(amp) = rest.find('&') {
+        out.push_str(&rest[..amp]);
+        let tail = &rest[amp..];
+        // 实体没有很长的。限个窗口，别把整篇正文当成一个实体去扫。
+        let semi = tail
+            .char_indices()
+            .take(12)
+            .find(|(_, c)| *c == ';')
+            .map(|(i, _)| i);
+        match semi.and_then(|e| html_entity_value(&tail[1..e])) {
+            Some(text) => {
+                out.push_str(&text);
+                rest = &tail[semi.unwrap_or(0) + 1..];
+            }
+            None => {
+                out.push('&');
+                rest = &tail[1..];
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+fn html_entity_value(body: &str) -> Option<String> {
+    if body.is_empty() {
+        return None;
+    }
+    if let Some(num) = body.strip_prefix('#') {
+        let code = match num.strip_prefix(['x', 'X']) {
+            Some(hex) => u32::from_str_radix(hex, 16).ok()?,
+            None => num.parse::<u32>().ok()?,
+        };
+        return char::from_u32(code).map(|c| c.to_string());
+    }
+    let named = match body {
+        "amp" => "&",
+        "lt" => "<",
+        "gt" => ">",
+        "quot" => "\"",
+        "apos" => "'",
+        "nbsp" | "ensp" | "emsp" | "thinsp" => " ",
+        "mdash" => "—",
+        "ndash" => "–",
+        "hellip" => "…",
+        "lsquo" => "\u{2018}",
+        "rsquo" => "\u{2019}",
+        "ldquo" => "\u{201c}",
+        "rdquo" => "\u{201d}",
+        "bull" => "•",
+        "middot" => "·",
+        "copy" => "©",
+        "reg" => "®",
+        "trade" => "™",
+        "deg" => "°",
+        "plusmn" => "±",
+        "times" => "×",
+        "divide" => "÷",
+        "frac12" => "½",
+        "laquo" => "«",
+        "raquo" => "»",
+        "euro" => "€",
+        "pound" => "£",
+        "yen" => "¥",
+        "cent" => "¢",
+        "sect" => "§",
+        "para" => "¶",
+        "dagger" => "†",
+        "Dagger" => "‡",
+        "permil" => "‰",
+        "larr" => "←",
+        "rarr" => "→",
+        "harr" => "↔",
+        "infin" => "∞",
+        "ne" => "≠",
+        "le" => "≤",
+        "ge" => "≥",
+        // 零宽 / 软连字：删掉，留着会把词切开。
+        "shy" | "zwnj" | "zwj" | "lrm" | "rlm" => "",
+        _ => return None,
+    };
+    Some(named.to_string())
+}
+
 /// Bing 的结果链接是跳转壳，不是真实站点。
 ///
 /// 形如 `https://www.bing.com/ck/a?!&&&p=…&u=a1<base64url>&ntb=1`，而且 href 在 HTML 里是
@@ -3567,12 +3660,7 @@ fn ddg_unwrap(href: &str) -> String {
 /// 解不出来时**回落到实体解码后的原 href，绝不返回空串** —— 调用处后面有
 /// `starts_with("http")` 过滤，返回空会把整条结果丢掉，比不解还糟。
 fn html_unescape_attr(s: &str) -> String {
-    s.replace("&amp;", "&")
-        .replace("&#38;", "&")
-        .replace("&quot;", "\"")
-        .replace("&#39;", "'")
-        .replace("&lt;", "<")
-        .replace("&gt;", ">")
+    decode_html_entities(s)
 }
 
 /// base64url 解码（无填充，`-`/`_` 字母表）。不引新依赖。
@@ -4323,5 +4411,86 @@ mod bing_unwrap_tests {
         assert_eq!(base64url_decode("aGVsbG8=").as_deref(), Some("hello"), "带填充也要能解");
         assert!(base64url_decode("@@@").is_none(), "垃圾输入必须返回 None，不能吐半截字符串");
         assert_eq!(html_unescape_attr("a&amp;b&quot;c"), "a&b\"c");
+    }
+}
+
+#[cfg(test)]
+mod html_entity_tests {
+    use super::decode_html_entities;
+
+    /// 原来 html_to_text 只认 6 个具名实体，数字实体全部原样漏进模型读到的正文。
+    #[test]
+    fn numeric_entities_are_decoded() {
+        assert_eq!(decode_html_entities("Don&#8217;t"), "Don\u{2019}t");
+        assert_eq!(decode_html_entities("&#x27;quoted&#x27;"), "'quoted'");
+        assert_eq!(decode_html_entities("&#39;"), "'");
+        assert_eq!(decode_html_entities("caf&#233;"), "café");
+    }
+
+    #[test]
+    fn common_named_entities_are_decoded() {
+        assert_eq!(
+            decode_html_entities("a &mdash; b &hellip; c&rsquo;s"),
+            "a — b … c\u{2019}s"
+        );
+        assert_eq!(decode_html_entities("&amp;&lt;&gt;&quot;&nbsp;x"), "&<>\" x");
+    }
+
+    /// 顺序 replace 的老毛病：先 &amp;→& 再 &lt;→<，页面上真实存在的字面量
+    /// `&amp;lt;` 被二次解码成了 `<`。一趟扫描每个实体只解一次。
+    #[test]
+    fn no_double_decoding() {
+        assert_eq!(decode_html_entities("&amp;lt;"), "&lt;");
+        assert_eq!(decode_html_entities("&amp;amp;"), "&amp;");
+    }
+
+    /// 认不出来的原样留着 —— `AT&T is great;` 里那段不是实体。
+    #[test]
+    fn non_entities_are_left_alone() {
+        assert_eq!(decode_html_entities("AT&T is great; really"), "AT&T is great; really");
+        assert_eq!(decode_html_entities("a & b"), "a & b");
+        assert_eq!(decode_html_entities("&notarealentity;"), "&notarealentity;");
+        // 没有分号的 & 不吃掉后面的内容。
+        assert_eq!(decode_html_entities("x&y&z"), "x&y&z");
+        assert_eq!(decode_html_entities("no ampersand here"), "no ampersand here");
+    }
+
+    /// 窗口是按**字符**数的，多字节字符不能把切片切在半个字符上。
+    #[test]
+    fn multibyte_text_does_not_panic() {
+        assert_eq!(decode_html_entities("中文&中文中文中文中文中文;后面"), "中文&中文中文中文中文中文;后面");
+        assert_eq!(decode_html_entities("表格&nbsp;里的中文"), "表格 里的中文");
+    }
+
+    /// 零宽 / 软连字要删掉，留着会把词切开。
+    #[test]
+    fn zero_width_entities_are_removed() {
+        assert_eq!(decode_html_entities("Java&shy;Script"), "JavaScript");
+        assert_eq!(decode_html_entities("a&zwnj;b"), "ab");
+    }
+
+    /// 三份手写解码器已经并成一份 —— 名单漂了就是三种不同的漏法。
+    #[test]
+    fn the_three_decoders_are_one() {
+        let ai = include_str!("ai.rs");
+        let attr = ai
+            .split("fn html_unescape_attr(")
+            .nth(1)
+            .and_then(|s| s.split("\n}\n").next())
+            .expect("html_unescape_attr 不见了");
+        assert!(
+            attr.contains("decode_html_entities(s)") && !attr.contains(".replace("),
+            "html_unescape_attr 又自己手写了一份实体名单"
+        );
+        let knowledge = include_str!("knowledge.rs");
+        let decode = knowledge
+            .split("fn html_decode(")
+            .nth(1)
+            .and_then(|s| s.split("\n}\n").next())
+            .expect("html_decode 不见了");
+        assert!(
+            decode.contains("crate::ai::decode_html_entities") && !decode.contains(".replace("),
+            "knowledge 的 html_decode 又自己手写了一份实体名单"
+        );
     }
 }

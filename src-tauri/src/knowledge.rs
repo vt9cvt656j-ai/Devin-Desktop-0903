@@ -5363,14 +5363,10 @@ fn ensure_provider_http_success(provider: &str, status: reqwest::StatusCode) -> 
     }
 }
 
+/// 第三份手写的实体解码，同样是部分覆盖（数字实体只认 &#39; 和 &#x27;）。
+/// 统一走 ai.rs 那个一趟扫完的解码器——三份名单漂了就是三种不同的漏法。
 fn html_decode(s: &str) -> String {
-    s.replace("&amp;", "&")
-        .replace("&lt;", "<")
-        .replace("&gt;", ">")
-        .replace("&quot;", "\"")
-        .replace("&#39;", "'")
-        .replace("&#x27;", "'")
-        .replace("&nbsp;", " ")
+    crate::ai::decode_html_entities(s)
 }
 
 fn format_codeberg_repository_item(item: &Value, index: usize, retrieved: &str) -> String {
