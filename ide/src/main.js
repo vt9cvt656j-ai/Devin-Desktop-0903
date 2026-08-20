@@ -24727,6 +24727,8 @@ const _INCOMPLETE_LABELS = {
   // 用户原话：「完成真正的产品而不是虚假的」。判据是落盘内容里**新增**的占位行，
   // 不是猜"这个函数实现得够不够"——给得出文件、行号和那一行的原文。
   stub_delivery: "把留下的占位实现换成真的",
+  // 「没读过就整文件覆写、还少了一大半」——这不是没做完，是把项目写坏了。
+  overwrote_unread: "看一眼被覆写的文件，确认没把内容写没",
   // 「说改完了，工作区一个字节没动」。写成祈使句，用户可以直接发出去当催办。
   // 排在表尾是刻意的：plan-advance 有条断言按「表头 600 字符内必须出现 user_stopped」
   // 检查，插在中间会把它挤出窗口——那条守卫是对的，让位的该是新条目。
@@ -49080,6 +49082,13 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
         if (lastTurnHadFailure && run.mode === "agent" && !run._incompleteReason) {
           run._incompleteReason = `last_action_failed:${lastFailKinds || "tool"}`.slice(0, 120);
         }
+        // 「没读过、还把一大半写没了」——近乎确定的破坏，必须落到用户看得见的结局里。
+        // 两个判据都是执行事实：linesLost 由写入时的真实行数算出，_runHasRead 读的是本 run
+        // 的读取台账。单独一条都可能是正当的（有意删死代码 / 读过之后精简），两条同时成立
+        // 才是"凭记忆重写把项目写坏"的签名。
+        if (run.mode === "agent" && Array.isArray(run._blindOverwrites) && run._blindOverwrites.length) {
+          run._incompleteReason = run._incompleteReason || `overwrote_unread:${run._blindOverwrites.length}`;
+        }
         // 交付里**新引入**的占位实现。判据是落盘内容本身（基线相减），不是模型的说法。
         // 排在最后：更具体的原因（红构建、写入落空）靠 ||= 先占位。只记账不补回合。
         if (run.mode === "agent") {
@@ -50580,6 +50589,10 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
           const _isBlindable = it.call && (it.call.type === "edit" || it.call.type === "multiedit"
             || (it.call.type === "write" && it.rawResult?.overwroteExisting));
           if (!_isBlindable || !it.call.path) continue;
+          // 顺手记一笔：这次覆写既没读过、又把一大半写没了。
+          if (it.call.type === "write" && Number(it.rawResult?.linesLost) > 0 && !_runHasRead(run, root, it.call.path)) {
+            (run._blindOverwrites = run._blindOverwrites || []).push(`${it.call.path}(-${it.rawResult.linesLost}行)`);
+          }
           if (/\[(ERROR|BLOCKED|DENIED)\]/.test((it.rawResult && it.rawResult.content) || "")) continue;
           if (!_runHasRead(run, root, it.call.path)) _blind.push(it.call.path);
         }
@@ -54577,10 +54590,24 @@ async function _executeToolStepInner(step, call, root, run) {
         });
       }
       const resolvedNote = fp !== _resolveRel(call.path, root) ? `；实际文件 ${fp}` : "";
+      // 整文件重写把内容写没了——「项目动不动被写坏」最典型的那种形态。
+      //
+      // 模型凭记忆重写一个它没完整读过的文件，没记住的部分直接消失。此前全程没有任何判据：
+      // added/removed 只画在界面上给人看，工具结果里一个字都不提，模型自己也不知道刚才
+      // 把一个 480 行的文件写成了 90 行。行数是不会撒谎的，这就是最便宜的执行事实。
+      //
+      // 只报事实、不拦截：删掉半个文件有时是对的（清理死代码）。但"少了多少行"必须说出来，
+      // 而"没读过还写掉一大半"是近乎确定的破坏——那一条另外记账（见循环里的 overwrote_unread）。
+      const _oldLines = existed ? String(old || "").split("\n").length : 0;
+      const _newLines = String(newContent || "").split("\n").length;
+      const _lostLines = existed && _oldLines >= 40 && _newLines < _oldLines * 0.5 ? _oldLines - _newLines : 0;
+      const _lostNote = _lostLines
+        ? `\n⚠️ 这次整文件覆写把 ${_oldLines} 行写成了 ${_newLines} 行，**少了 ${_lostLines} 行**。如果不是你有意删掉的，现在就 read_file 看一眼实际结果——凭记忆重写会把没记住的部分直接抹掉。`
+        : "";
       // overwroteExisting：把「这次写的是一个**本来就存在**的文件」这个事实结构化带出去。
       // 新建文件不需要先读，覆写已有文件需要——而下游那两道「没读就写」的闸门此前只能
       // 从中文文案里猜，于是干脆只管 edit/multi_edit，把破坏性最大的那种放过去了。
-      return { type: call.type, path: fp, mutated: true, overwroteExisting: !!existed, content: (existed ? `已修改 ${call.path}（+${added}/-${removed} 行${resolvedNote}）。` : `已新建 ${call.path}（${added} 行${resolvedNote}）。`) + (_editNote || "") + (_redactNote || "") };
+      return { type: call.type, path: fp, mutated: true, overwroteExisting: !!existed, linesLost: _lostLines, content: (existed ? `已修改 ${call.path}（+${added}/-${removed} 行${resolvedNote}）。` : `已新建 ${call.path}（${added} 行${resolvedNote}）。`) + _lostNote + (_editNote || "") + (_redactNote || "") };
 
     } else if (call.type === "multiedit") {
       const fp = _boundRunFilePath(run, root, call.path) || await _resolveExisting(call.path, root);
