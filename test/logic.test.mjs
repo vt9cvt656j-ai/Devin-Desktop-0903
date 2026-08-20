@@ -29193,6 +29193,36 @@ test("用户说「不是这个意思」时，旧计划不许被自动捡回来�
     "不许把会话里那份也删掉");
 });
 
+
+test("删掉一个导出却没查过谁在用，要当场点名", () => {
+  // 用户原话：「写代码、修复 bug 能力还是不行，细节处理还是不够好」。这是其中最常见、
+  // 也最能被精确检测的一种：改文件时顺手把某个函数/导出去掉了，而它在别处被引用着。
+  // 提示词里写着「改已有文件前必须知道它的调用方」，可全仓没有任何东西检查过这件事——
+  // lsp_references 摆在那儿，用不用全凭自觉。
+  const scan = load("_removedDeclarationsUnchecked", { _CODE_FILE_RE: /\.(?:tsx?|jsx?|py|rs|go)$/i });
+  const mk = (pairs) => ({ checkpoint: new Map(pairs) });
+  const before = "export function renderPlan() {}\nexport const KEEP = 1;";
+  // 删掉了、又没查过 → 报。
+  const hit = scan(mk([["/p/a.ts", { existed: true, content: before, current: "export const KEEP = 1;" }]]), new Set());
+  assert.equal(hit.length, 1);
+  assert.equal(hit[0].name, "renderPlan");
+  // 查过就不算——判据放宽到"检索词里出现过这个名字"，模型常搜 "renderPlan(" 这类形态。
+  assert.deepEqual(
+    scan(mk([["/p/a.ts", { existed: true, content: before, current: "export const KEEP = 1;" }]]), new Set(["renderPlan("])),
+    [], "查过引用之后再删是正当的");
+  // 新建文件不算（没有"改前"这回事）。
+  assert.deepEqual(scan(mk([["/p/b.ts", { existed: false, content: "", current: "" }]]), new Set()), []);
+  // 没删东西不报。
+  assert.deepEqual(scan(mk([["/p/c.ts", { existed: true, content: before, current: before + "\n// x" }]]), new Set()), []);
+
+  const loop = extractFn("_runAgenticLoop");
+  assert.match(loop, /run\._incompleteReason \|\| `removed_unchecked:\$\{_gone\.length\}`/);
+  const labels = loadConst("_INCOMPLETE_LABELS");
+  assert.equal(labels.removed_unchecked, "查一下被删掉的那几个还有谁在用");
+  // 搜索词从已有的工具账本现取，不新增状态。
+  assert.match(loop, /run\._toolLedger\?\.entries \|\| \[\]\)\s*\n?\s*\.filter\(\(e\) => \/\^\(\?:search\|find_symbol/);
+});
+
 // ---- 写入落空要有用户侧的出口 ----
 test("尝试写了没落盘时，结局里必须留下 writes_failed", () => {
   const loop = extractFn("_runAgenticLoop");

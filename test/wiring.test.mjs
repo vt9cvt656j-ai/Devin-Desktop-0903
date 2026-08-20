@@ -519,8 +519,10 @@ test("交付事实必须每轮喂给模型，不能只挂在 iter>=6 的草稿�
   // 落空的写入是纯执行记录（run._writeLedger 逐条记着），不是对措辞的猜测。
   // 例外现在有两个：落空的写入，和这一轮新写进去的占位。两者都是纯执行记录
   //（前者读 run._writeLedger，后者读落盘内容做基线相减），不是对措辞的猜测。
-  assert.match(dfl, /if \(!code\.length\) \{[\s\S]{0,600}?if \(!_failedLine && !_stubLine\) return "";/,
-    "没动过源码、没有落空写入、也没有新占位时，必须仍然返回空串——纯问答的 run 不该被塞无关事实");
+  assert.match(dfl, /if \(!code\.length\) \{[\s\S]{0,900}?if \(!_failedLine && !_stubLine && !_goneLine\) return "";/,
+    "没动过源码、没有落空写入、没有新占位、也没删掉未查引用的声明时，必须仍然返回空串");
+  assert.match(dfl, /这一轮删掉了 \$\{_gone\.length\} 个还没查过引用的声明/,
+    "删了还有人用的东西要说出来，否则模型下一轮不会去补");
   assert.match(dfl, /这一轮新写进去 \$\{_stubs\.length\} 处占位/,
     "新引入的占位要说出来，模型才有与「已经做好了」相矛盾的事实");
   assert.match(dfl, /run\?\._writeLedger/, "落空的写入没有被说出来，模型收尾时手上就没有与之矛盾的事实");
