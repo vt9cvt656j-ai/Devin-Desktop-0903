@@ -2100,25 +2100,28 @@ pub async fn admin_model_estimate(
     .ok_or_else(|| AppError::bad("渠道汇率不存在"))?;
 
     let (model_in, model_out) = model_price_override(&model.model_prices, model_id);
-    let (input_price, output_price, price_source) = if model_in > 0.0 || model_out > 0.0 {
-        (model_in, model_out, "model_override")
-    } else if let Some((input, output)) = official_price(model_id) {
-        (input, output, "official_catalog")
-    } else if model.input_price > 0.0 || model.output_price > 0.0 {
-        (model.input_price, model.output_price, "connection_fallback")
-    } else {
+    // 和扣费、和下发给客户端的报价共用同一条阶梯。这里原来自己写了第三份。
+    let (input_price, output_price, price_is_per_model, price_source) =
+        effective_token_prices(model_id, model.input_price, model.output_price, model_in, model_out);
+    if input_price <= 0.0 && output_price <= 0.0 {
         return Err(AppError::bad(
             "该模型没有可用价格，请在连接编辑里填写单模型输入/输出价",
         ));
-    };
+    }
 
     // 缓存价三级：管理员手填 > 实时目录的真实价 > 按输入价推算。
     //
     // 推算（×0.1 / ×1.25）以前是唯一来源，实测偏得很远：deepseek-v4-flash 缓存读真实
     // 0.0123 而推算 0.0061、glm-5 真实 0.12 而推算 0.06——都少算一半。少算缓存读价意味着
     // 按更便宜的价估成本、实际多付，而且账面上完全看不出来。
-    let (cache_read_price, cache_creation_price) =
-        cache_prices_for(&model, model_id, input_price);
+    let (cache_read_price, cache_creation_price) = effective_cache_prices(
+        model_id,
+        input_price,
+        model.cache_read_price,
+        model.cache_create_price,
+        price_is_per_model,
+        model.cache_disabled,
+    );
     let route_rate = model.rate.max(0.0);
     let provider_usd_per_call = projected_provider_usd(
         req.input_tokens,
@@ -2638,39 +2641,6 @@ pub async fn admin_update(
     Ok(Json(json!({ "ok": true })))
 }
 
-// ---------- IDE-facing: list active models (safe fields, no secrets) ----------
-/// GET /api/models — active models for the IDE (no api_key / base_url leaked).
-/// 缓存读 / 缓存写的单价，三级：管理员手填 > 实时目录的真实价 > 按输入价推算。
-///
-/// 抽成函数是因为**估价和展示必须读同一条规则**。这条规则本来只长在报价接口里，
-/// 卡片要显示缓存价时若各写一遍，两处迟早会分叉——而分叉的表现是卡片上写一个价、
-/// 账单上按另一个价扣，用户对不上账还查不出原因。
-fn cache_prices_for(model: &Model, model_id: &str, input_price: f64) -> (f64, f64) {
-    // 必须和 compute_cost 的三级完全同口径，否则这个预览/展示会显示一个和真实扣费不一样
-    // 的缓存价——用户拿它核对账单时反而会以为扣错了。手填 > 目录真实倍率×计费输入价 > 推算。
-    let live = crate::model_catalog::lookup(model_id);
-    let live_in = live.as_ref().and_then(|e| e.input_price).filter(|p| *p > 0.0);
-    let ratio = |cache: Option<f64>| match (cache, live_in) {
-        (Some(c), Some(ci)) => Some(c / ci),
-        _ => None,
-    };
-    let read = if model.cache_read_price > 0.0 {
-        model.cache_read_price
-    } else if let Some(r) = ratio(live.as_ref().and_then(|e| e.cache_read_price)) {
-        input_price * r
-    } else {
-        input_price * CACHE_READ_FACTOR
-    };
-    let write = if model.cache_create_price > 0.0 {
-        model.cache_create_price
-    } else if let Some(r) = ratio(live.as_ref().and_then(|e| e.cache_write_price)) {
-        input_price * r
-    } else {
-        input_price * CACHE_WRITE_FACTOR
-    };
-    (read, write)
-}
-
 pub async fn list_for_client(State(state): State<AppState>) -> ApiResult<Json<serde_json::Value>> {
     let rows = sqlx::query_as::<_, Model>(
         "SELECT * FROM models WHERE active = true ORDER BY sort, created_at",
@@ -2735,16 +2705,24 @@ pub async fn list_for_client(State(state): State<AppState>) -> ApiResult<Json<se
             }
             let name = display_name_for(&m.model_names, &mid);
             let (model_in, model_out) = model_price_override(&m.model_prices, &mid);
-            let (input_price, output_price, price_source) = if model_in > 0.0 || model_out > 0.0 {
-                (model_in, model_out, "model_override")
-            } else if m.input_price > 0.0 || m.output_price > 0.0 {
-                (m.input_price, m.output_price, "backend")
-            } else if let Some((official_in, official_out)) = official_price(&mid) {
-                (official_in, official_out, "catalog")
-            } else {
-                (0.0, 0.0, "unset")
-            };
-            let (cache_read, cache_write) = cache_prices_for(m, &mid, input_price);
+            // **和扣费共用同一个阶梯。** 这里原来自己写了一份，而且第 2、3 级和扣费是反的
+            // （展示先看连接兜底价、扣费先看官方目录），于是卡片写 $3/M、账单按 $5/M 扣。
+            let (input_price, output_price, price_is_per_model, price_source) =
+                effective_token_prices(&mid, m.input_price, m.output_price, model_in, model_out);
+            let (input_price, output_price, price_source) =
+                if input_price <= 0.0 && output_price <= 0.0 {
+                    (0.0, 0.0, "unset")
+                } else {
+                    (input_price, output_price, price_source)
+                };
+            let (cache_read, cache_write) = effective_cache_prices(
+                &mid,
+                input_price,
+                m.cache_read_price,
+                m.cache_create_price,
+                price_is_per_model,
+                m.cache_disabled,
+            );
             // 上下文档位：实时目录 → 后台手填 → 空。在 json! 外面算好——宏里放不下块表达式。
             let context_windows: Vec<serde_json::Value> = {
                 let mut tiers = official_contexts(&mid);
@@ -3715,6 +3693,73 @@ fn projected_provider_usd(
 /// `off_in/off_out` come from the per-model official catalog, falling back to the admin's
 /// per-connection input/output price override when a model isn't catalogued. `rate` is the
 /// connection's 倍率 (e.g. 3 = bill 3× the real cost; the operator's margin, hidden from
+/// 这个模型**实际按什么价计费**。展示和扣费必须共用这一个函数。
+///
+/// 之前是两份：`compute_cost` 一份、`list_for_client` 一份，而它们的第 2、3 级是**反的**——
+/// 扣费是「每模型覆盖 → 官方目录 → 连接兜底」，展示是「每模型覆盖 → 连接兜底 → 官方目录」。
+/// 后果不是抽象的：一条连接填了兜底价 input_price=3（后台把它当作「没单独定价的模型走这个」），
+/// 其上的 claude-opus-5 没有每模型覆盖、目录是 5/25 —— 模型卡片写「$3/M」，账单按 $5/M 扣。
+/// 用户拿卡片核对账单，对不上。
+///
+/// 返回 `price_is_per_model` 是给缓存价用的：它表示这一档价是不是来自「和连接级缓存价
+/// 不同的配置层」。同层才允许用连接级缓存价，否则会出现「输入按每模型的 $15 收、缓存却按
+/// 连接级的 $3.75 收」这种混搭。
+pub(crate) fn effective_token_prices(
+    model_id: &str,
+    admin_in: f64,
+    admin_out: f64,
+    model_in: f64,
+    model_out: f64,
+) -> (f64, f64, bool, &'static str) {
+    if model_in > 0.0 || model_out > 0.0 {
+        (model_in, model_out, true, "model_override")
+    } else if let Some((cat_in, cat_out)) = official_price(model_id) {
+        (cat_in, cat_out, true, "catalog")
+    } else {
+        (admin_in, admin_out, false, "backend")
+    }
+}
+
+/// 这个模型**实际按什么缓存价计费**。同样是展示和扣费共用。
+///
+/// 比原来的 `cache_prices_for` 多了 `price_is_per_model` 这道闸——`compute_cost` 一直有它，
+/// 展示侧一直没有。差别在于：连接级填了 cache_create_price=3.75（Sonnet 的写入价），而
+/// claude-opus-5 有每模型覆盖 input=15 时，扣费会**刻意忽略** 3.75（不同配置层不许混搭），
+/// 改用 15 × 目录倍率 = 18.75；展示侧却直接把 3.75 画上去。差五倍。
+pub(crate) fn effective_cache_prices(
+    model_id: &str,
+    input_price: f64,
+    conn_cache_read: f64,
+    conn_cache_write: f64,
+    price_is_per_model: bool,
+    cache_disabled: bool,
+) -> (f64, f64) {
+    if cache_disabled {
+        return (0.0, 0.0);
+    }
+    let live = crate::model_catalog::lookup(model_id);
+    let live_in = live.as_ref().and_then(|e| e.input_price).filter(|p| *p > 0.0);
+    let ratio = |cache: Option<f64>| match (cache, live_in) {
+        (Some(c), Some(ci)) => Some(c / ci),
+        _ => None,
+    };
+    let read = if !price_is_per_model && conn_cache_read > 0.0 {
+        conn_cache_read
+    } else if let Some(r) = ratio(live.as_ref().and_then(|e| e.cache_read_price)) {
+        input_price * r
+    } else {
+        input_price * CACHE_READ_FACTOR
+    };
+    let write = if !price_is_per_model && conn_cache_write > 0.0 {
+        conn_cache_write
+    } else if let Some(r) = ratio(live.as_ref().and_then(|e| e.cache_write_price)) {
+        input_price * r
+    } else {
+        input_price * CACHE_WRITE_FACTOR
+    };
+    (read, write)
+}
+
 /// users). Uses ONLY the upstream's authoritative `usage`; no usage / no price → 0 (never
 /// guesses). Cache-aware (cached input 0.1×). Hard $50/call ceiling.
 #[allow(clippy::too_many_arguments)]
@@ -3759,13 +3804,8 @@ fn compute_cost(
     // price. This lets each checked model be priced individually while keeping the catalog default.
     // 价格来自哪一层，决定了缓存价该跟谁：来自模型（每模型覆盖或官方目录）就按模型的输入价
     // 推导；只有当输入价本身就是连接级兜底时，连接级的缓存价才是同一层配置、才该生效。
-    let (off_in, off_out, price_is_per_model) = if model_in > 0.0 || model_out > 0.0 {
-        (model_in, model_out, true)
-    } else if let Some((cat_in, cat_out)) = official_price(model_id) {
-        (cat_in, cat_out, true)
-    } else {
-        (admin_in, admin_out, false)
-    };
+    let (off_in, off_out, price_is_per_model, _price_source) =
+        effective_token_prices(model_id, admin_in, admin_out, model_in, model_out);
     if off_in <= 0.0 && off_out <= 0.0 {
         return 0; // no known price for this model → can't compute a real cost
     }
@@ -3811,24 +3851,17 @@ fn compute_cost(
         (Some(c), Some(ci)) => Some(c / ci),
         _ => None,
     };
-    let read_price = if !price_is_per_model && cache_read_price > 0.0 {
-        cache_read_price
-    } else if let Some(ratio) = cache_ratio(live_cache.as_ref().and_then(|e| e.cache_read_price)) {
-        off_in * ratio
-    } else {
-        off_in * CACHE_READ_FACTOR
-    };
-    let write_price = if !price_is_per_model && cache_create_price > 0.0 {
-        cache_create_price
-    } else if let Some(ratio) = cache_ratio(live_cache.as_ref().and_then(|e| e.cache_write_price)) {
-        off_in * ratio
-    } else {
-        off_in * CACHE_WRITE_FACTOR
-    };
     // 关闭缓存计费（每线路开关）：缓存读、缓存写都**不收钱**，普通输入照常。
     // 用户："我拉取的模型自带价格和缓存价……新增一个关闭缓存的开关，关闭的话价格一样、
     // 不收缓存钱。" 灰产/便宜渠道用——缓存那点钱干脆不算，输入输出价一分不动。
-    let (read_price, write_price) = if cache_disabled { (0.0, 0.0) } else { (read_price, write_price) };
+    let (read_price, write_price) = effective_cache_prices(
+        model_id,
+        off_in,
+        cache_read_price,
+        cache_create_price,
+        price_is_per_model,
+        cache_disabled,
+    );
     // Split input into plain (full price) + cache-read + cache-create, bill each at its own
     // unit price; output at off_out. Then × 倍率. Anthropic reports input EXCLUDING cached;
     // OpenAI/DeepSeek report prompt INCLUDING cached reads (and no separate write count).
@@ -5583,11 +5616,50 @@ fn oai_to_anthropic(body: &serde_json::Value) -> Result<serde_json::Value, Strin
     oai_to_anthropic_with_cache(body, true, false)
 }
 
+/// 客户端这一轮到底要多深的思考：`reasoning_effort` 优先，没有就按 `thinking` 的形状推。
+///
+/// 单独成函数是因为**两处要用同一个答案**：助手轮要不要把 thinking 块重放回去（消息
+/// 遍历时判），以及最终发给上游的 thinking/effort 配置（遍历之后组装）。两边各写一份
+/// 必然漂。
+fn thinking_effort_for(body: &serde_json::Value) -> Option<&str> {
+    body.get("reasoning_effort")
+        .and_then(|v| v.as_str())
+        .or_else(|| {
+            // 客户端只发 thinking:{budget_tokens} 不发 reasoning_effort（IDE Claude 族的
+            // 真实形状）时，按预算推档——以前这里一律写死 "high"，用户转盘上的
+            // low/medium/max 全被压平成 high，max 的 64K 输出余量也永远打不中。
+            // 档位边界与 IDE budgets{low:4096, medium:12000, high:24000, max:32000} 对齐。
+            body.get("thinking").map(|t| {
+                // An explicit disable is the one thinking shape that means LESS, not more. It
+                // used to fall through to the bare-toggle arm and come out as "high".
+                if t.get("type").and_then(|v| v.as_str()) == Some("disabled") {
+                    return "off";
+                }
+                match t.get("budget_tokens").and_then(|v| v.as_i64()).unwrap_or(0) {
+                    b if b > 24000 => "max",
+                    b if b > 12000 => "high",
+                    b if b > 4096 => "medium",
+                    b if b > 0 => "low",
+                    _ => "high", // 无预算的裸 thinking 开关（Kimi/GLM 形状）保持旧行为
+                }
+            })
+        })
+}
+
 fn oai_to_anthropic_with_cache(
     body: &serde_json::Value,
     prompt_cache: bool,
     effort_passthrough: bool,
 ) -> Result<serde_json::Value, String> {
+    // 思考配置要在**遍历消息之前**就算出来：助手轮重放 thinking 块的判据用得上它
+    // （见下面 "assistant" 分支）。同一份推导只写一次，别在两处各算一遍慢慢漂。
+    let model_str = body.get("model").and_then(|v| v.as_str()).unwrap_or("");
+    let effort = thinking_effort_for(body);
+    let thinking = anthropic_thinking(model_str, effort);
+    let thinking_on = thinking
+        .as_ref()
+        .is_some_and(|t| t.get("type").and_then(|v| v.as_str()) != Some("disabled"));
+
     let mut system_parts: Vec<serde_json::Value> = Vec::new();
     let mut messages: Vec<serde_json::Value> = Vec::new();
     if let Some(msgs) = body.get("messages").and_then(|m| m.as_array()) {
@@ -5702,37 +5774,6 @@ fn oai_to_anthropic_with_cache(
     // `{"type":"enabled","budget_tokens":N}` format with a 400/502 — they require
     // `{"type":"adaptive"}` + `output_config.effort`. The IDE client may still send the old
     // format; the gateway normalises it here per-model.
-    let model_str = body.get("model").and_then(|v| v.as_str()).unwrap_or("");
-    let effort = body
-        .get("reasoning_effort")
-        .and_then(|v| v.as_str())
-        .or_else(|| {
-            // 客户端只发 thinking:{budget_tokens} 不发 reasoning_effort（IDE Claude 族的
-            // 真实形状）时，按预算推档——以前这里一律写死 "high"，用户转盘上的
-            // low/medium/max 全被压平成 high，max 的 64K 输出余量也永远打不中。
-            // 档位边界与 IDE budgets{low:4096, medium:12000, high:24000, max:32000} 对齐。
-            body.get("thinking").map(|t| {
-                // An explicit disable is the one thinking shape that means LESS, not more. It
-                // used to fall through to the bare-toggle arm and come out as "high".
-                if t.get("type").and_then(|v| v.as_str()) == Some("disabled") {
-                    return "off";
-                }
-                match t.get("budget_tokens").and_then(|v| v.as_i64()).unwrap_or(0) {
-                    b if b > 24000 => "max",
-                    b if b > 12000 => "high",
-                    b if b > 4096 => "medium",
-                    b if b > 0 => "low",
-                    _ => "high", // 无预算的裸 thinking 开关（Kimi/GLM 形状）保持旧行为
-                }
-            })
-        });
-    let thinking = anthropic_thinking(model_str, effort);
-    // An explicit `{"type":"disabled"}` IS a thinking key, and it means the opposite of on. The
-    // headroom floor below exists to give adaptive thinking room to stretch; handing it to a turn
-    // that will not think just inflates the ceiling.
-    let thinking_on = thinking
-        .as_ref()
-        .is_some_and(|t| t.get("type").and_then(|v| v.as_str()) != Some("disabled"));
     // Anthropic REQUIRES max_tokens. Map from OpenAI, else a generous default.
     let mut max_tokens = body
         .get("max_tokens")
@@ -14740,6 +14781,20 @@ mod relay_truncation_tests {
 
 #[cfg(test)]
 mod power_route_tests {
+    use super::{effective_cache_prices, effective_token_prices};
+
+    /// 价格测试要一个**已知的**目录输入。和 billing_tests 用同一份种子。
+    fn seed_catalog() {
+        use std::sync::Once;
+        static ONCE: Once = Once::new();
+        ONCE.call_once(|| {
+            use crate::model_catalog::{priced, seed_for_test};
+            seed_for_test(&[
+                ("claude-opus-5", priced(5.0, 25.0, 128_000, vec![1_000_000])),
+            ]);
+        });
+    }
+
     /// 只看派单函数那一段源码，别让本模块自己的字面量把断言喂饱。
     fn dispatch_src() -> String {
         let s = include_str!("models.rs");
@@ -14832,34 +14887,88 @@ mod power_route_tests {
         );
     }
 
+    /// 卡片上的价和账单扣的价必须是**同一个数**。
+    ///
+    /// 上一版这条测试只钉了「有没有一个共享函数」这个**形状**，没钉「两边算出来的数
+    /// 是否相同」这个**内容** —— 于是漂移在它眼皮底下活了下来：展示的阶梯是
+    /// 「每模型覆盖 → 连接兜底 → 目录」，扣费是「每模型覆盖 → 目录 → 连接兜底」，
+    /// 第 2、3 级正好反了。一条连接填了兜底价 3、目录是 5，卡片写 $3/M、账单按 $5/M 扣。
+    /// 现在断言的是数值本身。
     #[test]
-    fn 卡片上的缓存价必须和账单读同一条规则() {
-        // 缓存价有三级：管理员手填 > 实时目录的真实价 > 按输入价推算。这条规则本来只
-        // 长在报价接口里；卡片要显示缓存价，若各写一遍，两处迟早分叉——而分叉的表现是
-        // 卡片写一个价、账单按另一个价扣，用户对不上账还查不出原因。
+    fn 卡片上的价必须和账单扣的是同一个数() {
+        seed_catalog();
+        // 目录里 claude-opus-5 = 5/25（seed_catalog 里的值）。
+        // 连接填了兜底价 3/15，且没有每模型覆盖 —— 这正是出事的那种配置。
+        let (disp_in, disp_out, per_model, source) =
+            effective_token_prices("claude-opus-5", 3.0, 15.0, 0.0, 0.0);
+        assert_eq!(
+            (disp_in, disp_out),
+            (5.0, 25.0),
+            "连接兜底价盖过了目录价——卡片会写 $3/M 而账单按 $5/M 扣",
+        );
+        assert_eq!(source, "catalog");
+        assert!(per_model, "目录这一级和连接级缓存价不是同一配置层，混搭会算错缓存");
+
+        // 每模型覆盖仍然最优先。
+        assert_eq!(
+            effective_token_prices("claude-opus-5", 3.0, 15.0, 15.0, 75.0).0,
+            15.0,
+        );
+        // 目录里没有的模型才落到连接兜底价上。
+        let (fb_in, _, fb_per_model, fb_src) =
+            effective_token_prices("some-model-not-in-catalog", 3.0, 15.0, 0.0, 0.0);
+        assert_eq!((fb_in, fb_src), (3.0, "backend"));
+        assert!(!fb_per_model, "连接价和连接级缓存价是同一层，该允许混用");
+    }
+
+    /// 缓存价同理，而且它多一道 `price_is_per_model` 闸。
+    ///
+    /// 扣费一直有这道闸（不同配置层不许混搭），展示侧一直没有：连接级填了
+    /// cache_create_price=3.75（Sonnet 的写入价），而 claude-opus-5 有每模型覆盖 input=15 时，
+    /// 扣费刻意忽略 3.75、改用 15×目录倍率，展示却直接把 3.75 画上去。差好几倍。
+    #[test]
+    fn 卡片上的缓存价也必须和账单读同一条规则() {
+        seed_catalog();
+        // 同一配置层（连接价 + 连接级缓存价）→ 手填的缓存价生效。
+        let (read, write) =
+            effective_cache_prices("some-model-not-in-catalog", 3.0, 0.5, 3.75, false, false);
+        assert_eq!((read, write), (0.5, 3.75));
+
+        // 不同配置层（每模型覆盖的输入价 + 连接级缓存价）→ 手填的必须被忽略，
+        // 否则就是「输入按 $15 收、缓存按 $3.75 收」的混搭。
+        let (_, write_mixed) =
+            effective_cache_prices("claude-opus-5", 15.0, 0.5, 3.75, true, false);
+        assert_ne!(
+            write_mixed, 3.75,
+            "连接级缓存价在每模型覆盖之下仍然生效了——展示会比实扣低数倍",
+        );
+
+        // 关掉缓存计费 → 两个都是 0，输入输出价不受影响。
+        assert_eq!(
+            effective_cache_prices("claude-opus-5", 15.0, 0.5, 3.75, false, true),
+            (0.0, 0.0),
+        );
+    }
+
+    /// 三处调用点必须都走共享函数，不许再各写一份。
+    #[test]
+    fn 价格阶梯只有一份() {
         let src = dispatch_src();
         assert!(
-            src.contains("fn cache_prices_for("),
-            "缓存价的三级规则没抽成函数，展示和计费又会各写一份"
+            !src.contains("fn cache_prices_for("),
+            "旧的那份缓存价函数还在，它没有 price_is_per_model 这道闸",
         );
-        // 两边都得**调**它，而不是各自照抄一遍。
-        let n = src.matches("cache_prices_for(").count();
-        assert!(n >= 3, "cache_prices_for 只出现 {n} 次——有一侧没在调它");
+        // 扣费、下发报价、成本预估——三处都调同一个。
         assert!(
-            src.contains("\"cache_read_price\": cache_read"),
-            "缓存读价没下发，卡片上那一格永远是空的"
+            src.matches("effective_token_prices(").count() >= 4,
+            "有一侧没在调共享的价格阶梯（定义 1 次 + 至少 3 处调用）",
         );
         assert!(
-            src.contains("\"cache_write_price\": cache_write"),
-            "缓存写价没下发"
+            src.matches("effective_cache_prices(").count() >= 4,
+            "有一侧没在调共享的缓存价阶梯",
         );
-        // 三级里的每一级都得在那个函数里，少一级就意味着某种配置下卡片会显示 0。
-        let at = src.find("fn cache_prices_for(").unwrap();
-        let body = &src[at..(at + 1400).min(src.len())];
-        for level in ["model.cache_read_price", "e.cache_read_price", "CACHE_READ_FACTOR"] {
-            assert!(body.contains(level), "缓存价少了 {level} 这一级");
-        }
     }
+
 
     #[test]
     fn 开关必须能从后台存进来也读得出去() {
