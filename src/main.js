@@ -26346,6 +26346,9 @@ async function sendPrompt(text, attachments = [], readyConfig = null, opts = {})
         config,
         messages,
         root: _contextRoot,
+        // 记忆一律按会话身份根存取：root 会跟着编辑器里打开的文件下沉到子目录，
+        // 拿它当记忆键会让写入和读取连到两个不同的抽屉（见 _recordEpisode 头注释）。
+        memoryRoot: _identityRoot,
         session: sess,
         mode: effectiveMode,
         task: text,
@@ -37420,7 +37423,10 @@ function _kgRecordCorrection(root, input = {}) {
   const incorrect = String(input.incorrect || "").trim().replace(/\s+/g, " ").slice(0, 240);
   const correctedId = String(input.correctedId || "").trim();
   const corrected = String(input.corrected || "").trim().replace(/\s+/g, " ").slice(0, 240);
-  if (!incorrectId || corrected.length < 5) return null;
+  // 地板不能是 5：「以后不要用 npm，改用 pnpm」这类纠正里，corrected 恰恰是
+  // pnpm / yarn / bun / uv / vite 这种四字母工具名 —— 两道语义闸全过，最后死在长度上，
+  // 账本一行不写，而且完全静默。「以后一律用 X」里最常见的那个 X 就是这么丢的。
+  if (!incorrectId || corrected.length < 2) return null;
   const corrections = _kgCorrectionLoad(root);
   const duplicate = corrections.find((item) => item.incorrectId === incorrectId
     && String(item.corrected || "").toLowerCase() === corrected.toLowerCase());
@@ -45966,6 +45972,15 @@ function _projectJournalBlock(root) {
 }
 // (Store+reflect) at run end: persist the episode (Storage) and distill a reusable
 // insight (Reflection→Experience; for a FAILED run, a Reflexion "what to avoid").
+// root 这里必须是**会话身份根**，不是跟着打开的文件漂的那个上下文根。
+//
+// 读取那侧（_episodeHintBlock / _projectJournalBlock / _workflowHintBlock）早就改对了，
+// 26231 行那句注释写着「经验/工作流也按会话身份存取，别跟着打开的文件漂」——但写入这侧
+// 没跟着改，调用点一直传的是 _contextRoot。在「父仓套 ide 仓、website/ 和 src-tauri/ 各自
+// 带项目标记」这种形状里，两头连的是两个不同的抽屉：写进去 120 条，读出来 0 条，
+// 而且 _epLoad 失败只返回空数组，全程一声不响。
+//
+// 整条经验管道（干过的活 → 下次参考）就断在这一个参数上。
 async function _recordEpisode(run, task, root, outcome, config, session = null) {
   try {
     if (!task || !run || !Array.isArray(run.recording) || run.recording.length < 2) return; // skip trivial
@@ -46611,19 +46626,25 @@ function _toolExpRetrieve(profileKeys, limit = 8) {
     try { arr = JSON.parse(localStorage.getItem(key) || "[]") || []; } catch { return ""; }
     const matchings = arr.filter((e) => e.sig === sig).slice(-50); // recent same-sig history
     if (matchings.length === 0) return "";
-    // 按 sig+tool 分组，计算连续失败次数
+    // 按 tool 分组——**不能把成败拆进 key**。
+    //
+    // 原来的分组键是 `${e.tool}|${e.ok ? "ok" : "fail"}`，于是 fail 桶里装的全是失败，
+    // 下面那句「最近 3 条全是失败」**恒真**：任何一个历史上失败过 3 次的工具都会被打上
+    // 「近期屡次失败」——哪怕它 45 次成功、3 次失败、最近 5 次全成。模型据此绕开一个
+    // 本来好用的工具，学到的是**反的**。注释写的是「连续失败」，代码算的不是。
+    //
+    // 正确判据：同一个工具的记录按时间排好，看**最近 3 条**是不是都失败。
     const grouped = new Map();
     for (const e of matchings) {
-      const k = `${e.tool}|${e.ok ? "ok" : "fail"}`;
-      if (!grouped.has(k)) grouped.set(k, []);
-      grouped.get(k).push(e);
+      if (!grouped.has(e.tool)) grouped.set(e.tool, []);
+      grouped.get(e.tool).push(e);
     }
-    // 检测同一 sig+tool 组合的最近连续失败≥3 次
     const warnings = new Set();
-    for (const [k, items] of grouped) {
+    for (const [toolName, items] of grouped) {
       if (items.length < 3) continue;
-      const tail = items.slice(-3);
-      if (tail.every((x) => !x.ok)) warnings.add(k.split("|")[0]);
+      const ordered = [...items].sort((a, b) => (Number(a.ts) || 0) - (Number(b.ts) || 0));
+      const tail = ordered.slice(-3);
+      if (tail.every((x) => !x.ok)) warnings.add(toolName);
     }
     // 按工具名聚合：总调用、成功、失败、失败类别分布、警告标记
     const summary = new Map();
@@ -46918,7 +46939,7 @@ function _applyLateIntentIfLanded(run, config, task, session, body, isLive, mess
   return true;
 }
 
-async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mode, task, engineering = null, intentState = null, skillsBlock = "", billingTasks = [], taskStartedAt = Date.now(), timeline = null }) {
+async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot = "", session, mode, task, engineering = null, intentState = null, skillsBlock = "", billingTasks = [], taskStartedAt = Date.now(), timeline = null }) {
   _clearPlanChip(); // drop any stale plan chip from a previous task before this run starts
   // session/root 先解析：意图画像要读本会话刚确认的语义帧，必须拿到真 session。
   session = session || _currentSession();
@@ -50450,7 +50471,8 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
     if (!awaitingUserReply && run.mode === "agent" && task) {
       // The visible response is already rendered and streaming has ended above.
       // Reflection therefore cannot delay first-token or live output latency.
-      try { await _recordEpisode(run, task, root, _runOutcome, config, session); } catch {}
+      // 传身份根，不传会漂的 root —— 否则写进去的经验读取那侧永远取不回来（见函数头注释）。
+      try { await _recordEpisode(run, task, memoryRoot || root, _runOutcome, config, session); } catch {}
       // on_run_end hook（fire-and-forget）：工作区可在运行结束时挂通知/清理命令。
       _fireHooks(root, "on_run_end", { tool: "run_end", outcome: _runOutcome, task: String(task).slice(0, 200), files: [...(_mutatedFiles || [])].slice(0, 20) }).catch(() => {});
     }

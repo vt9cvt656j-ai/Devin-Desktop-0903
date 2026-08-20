@@ -16191,7 +16191,10 @@ test("memory correction is immediate, append-only, and outside foreground genera
   assert.match(extractFn("_kgRetrieve"), /JSON\.stringify\(allNotes\)/,
     "usage-count persistence must not accidentally overwrite storage with only active nodes");
 
-  const runEnd = SRC.indexOf("try { await _recordEpisode(run, task, root, _runOutcome, config, session); }");
+  // 锚点只认「调用发生在哪」，不认参数怎么写：参数已经从 root 换成 memoryRoot（记忆一律按
+  // 会话身份根存取，否则写入和读取连到两个不同的抽屉）。这条断言守的是**顺序**，不是签名。
+  const runEnd = SRC.indexOf("await _recordEpisode(run, task,");
+  assert.ok(runEnd > 0, "收尾反思的调用点不见了，这条顺序断言失去落点");
   const streamingEnd = SRC.lastIndexOf("_setStreaming(session, false)", runEnd);
   const assistantPersist = SRC.lastIndexOf("session.memory.push({ role: \"assistant\"", runEnd);
   assert.ok(streamingEnd >= 0 && assistantPersist >= 0 && streamingEnd < assistantPersist && assistantPersist < runEnd,
@@ -29654,4 +29657,56 @@ test("纯风险面单独出现时不产出 substantial，除非模型自己声�
   // 各自的律照常按面触发：不许顺手把它们从 industrialProject 里删掉。
   assert.match(src, /m\.industrialProject = [\s\S]{0,400}m\.securityRisk/,
     "把 securityRisk 从 industrialProject 里删掉了——业务漏洞/滥用律会跟着一起哑掉");
+});
+
+// ---- 记忆的写入根和读取根必须是同一个 ----
+//
+// 读取那侧早就改对了（26231：「经验/工作流也按会话身份存取，别跟着打开的文件漂」），
+// 写入那侧却一直传会漂的 _contextRoot。在「父仓套 ide 仓、website/ 和 src-tauri/ 各自带
+// 项目标记」这种形状里，两头连的是两个不同的抽屉：写进去 120 条，读出来 0 条，
+// 而且 _epLoad 失败只返回空数组，全程一声不响——整条「干过的活 → 下次参考」就断在这。
+test("经验/工作流的写入根必须是会话身份根，不能跟着打开的文件漂", () => {
+  const loop = extractFn("_runAgenticLoop");
+  assert.match(loop, /await _recordEpisode\(run, task, memoryRoot \|\| root,/,
+    "写入还在用会漂的 root —— 写进去的经验读取那侧永远取不回来，而且不会报错");
+  assert.match(SRC, /async function _runAgenticLoop\(\{ config: _rawConfig, messages, root, memoryRoot = ""/,
+    "循环没收下身份根这个参数");
+  // 调用方必须真的传身份根，而不是把 root 原样再传一遍。
+  const at = SRC.indexOf("await _runAgenticLoop({");
+  assert.ok(at > 0);
+  const callSite = SRC.slice(at, at + 700);
+  assert.match(callSite, /memoryRoot: _identityRoot/,
+    "调用点没传会话身份根 —— 参数加了等于没加");
+  assert.doesNotMatch(callSite, /memoryRoot: _contextRoot/,
+    "又把会漂的那个根传成记忆根了");
+  // 读取那侧不许倒回去用 root。
+  assert.match(SRC, /const _expRoot = _identityRoot;/, "读取侧的身份根被改回去了");
+});
+
+// ---- 「连续失败」不能靠把成败拆进分组键来算 ----
+//
+// 原分组键是 `${e.tool}|${e.ok ? "ok" : "fail"}`：fail 桶里装的全是失败，于是「最近 3 条
+// 全是失败」**恒真**。任何历史上失败过 3 次的工具都会被打上「近期屡次失败，考虑替代方案」，
+// 哪怕它 45 次成功、3 次失败、最近 5 次全成。模型据此绕开一个本来好用的工具——学的是反的。
+test("工具成败账：连续失败要按时间序看最近三条，不是按成败分桶", () => {
+  const src = extractFn("_toolExpRetrieve")
+    .split("\n").filter((l) => !l.trim().startsWith("//")).join("\n");
+  assert.doesNotMatch(src, /\$\{e\.ok \? "ok" : "fail"\}/,
+    "又把成败拆进分组键了——fail 桶里「最近三条全失败」恒真，好用的工具会被打成屡次失败");
+  assert.match(src, /grouped\.set\(e\.tool, \[\]\)/, "没有按工具名分组");
+  assert.match(src, /sort\(\(a, b\) => \(Number\(a\.ts\) \|\| 0\) - \(Number\(b\.ts\) \|\| 0\)\)/,
+    "没有按时间排序——「最近三条」就无从谈起");
+  assert.match(src, /tail\.every\(\(x\) => !x\.ok\)/, "判据本身没了");
+});
+
+// ---- 「以后一律用 pnpm」里的那个 pnpm 存不进去 ----
+//
+// 纠正值的长度地板是 5，而 pnpm / yarn / bun / uv / vite 全是 4 个字符及以下：
+// 两道语义闸全过，最后死在长度上，账本一行不写，而且完全静默。
+// 「以后不要用 X，改用 Y」里最常见的那个 Y，就是这么丢的。
+test("纠正值的长度地板不许把四字母工具名挡在外面", () => {
+  const src = extractFn("_kgRecordCorrection");
+  assert.doesNotMatch(src, /corrected\.length < 5/,
+    "地板还是 5 —— pnpm / yarn / bun / uv 这类最常见的纠正值全部存不进去");
+  assert.match(src, /corrected\.length < 2/, "地板不见了或改成了别的值");
 });
