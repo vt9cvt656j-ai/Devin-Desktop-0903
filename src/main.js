@@ -58151,6 +58151,37 @@ return { type: call.type, path: call.query || "", content: `[失败] ${call.type
       const bmFilePat = call.filePattern || "";
       const bmTimeout = Math.max(10, Math.min(call.timeout || 300, 600));
       const bmCwd = root || (_detectOS() === "Windows" ? "." : "/tmp");
+      // 轮询循环里每条分支都是 `bmType === "file" && bmPat` 这种精确匹配，**认不出来就一条都不进**，
+      // 只剩计时器在转。于是卡片显示「已检查 N 次」、超时那条回执说「等待…已超过 300 秒」——
+      // 读起来像「条件一直没发生」，实际是**条件一次都没被检查过**。两条路都会掉进来：
+      //  ① check_type 不认识。上面的入参归一把 `condition` 也并进了 check_type，而 condition
+      //     恰恰是模型最容易塞一整句自然语言的字段（condition:"dev server listening on 3000"）。
+      //  ② 类型认识但 pattern 是空的——file/command/url/port 四条分支都带 `&& bmPat`。
+      // 不猜：把事实回给模型让它重发一次，别用 300 秒换一个假答案。
+      // capture 和 manual 有意豁免：manual 不轮询；capture 空 pattern 匹配下一条新流量，
+      // 是抓包恢复路径明说的用法（logic.test.mjs 那条 CONFIGURE_BACKGROUND_PROXY 钉着）。
+      const _BM_CHECKS = new Set(["manual", "capture", "file", "command", "url", "port"]);
+      const _BM_NEEDS_PATTERN = new Set(["file", "command", "url", "port"]);
+      if (!_BM_CHECKS.has(bmType) || (_BM_NEEDS_PATTERN.has(bmType) && !bmPat)) {
+        // 这里还没走到 _registerRunInteraction，没有东西要释放；_bmRelease 也还在 TDZ 里。
+        res.className = "atc-result atc-result--err"; res.textContent = "条件没法检查";
+        const _why = !_BM_CHECKS.has(bmType)
+          ? `check_type 收到的是「${String(bmType).slice(0, 120)}」，不是可检查的类型。`
+            + `注意入参归一会把 condition / check / condition_type 都并进 check_type——`
+            + `如果你写的是一整句自然语言，它就原样变成了这里的 check_type。`
+          : `check_type="${bmType}" 必须配一个 pattern（${bmType === "file" ? "文件路径" : bmType === "command" ? "要跑的命令" : bmType === "url" ? "要探的 URL" : "端口号"}），这次是空的。`;
+        return {
+          type: "background_monitor",
+          path: bmType,
+          failure: { code: "monitor_uncheckable", attempted: false },
+          content: `[BLOCKED_MONITOR_UNCHECKABLE] ${_why}\n`
+            + `没有开始等待——真等下去的话这 ${bmTimeout} 秒里一次检查都不会发生，最后给你一句「超时」，`
+            + `你会当成「条件没发生」。\n`
+            + `可用的 check_type：port（pattern=端口号）、url（pattern=要探的 URL）、command（pattern=命令，exit 0 即满足）、`
+            + `file（pattern=文件路径，另可加 file_pattern 等内容匹配）、capture（pattern=流量关键词，可空）、manual（等用户点确认）。\n`
+            + `把条件写成 pattern，把类型写成上面其中之一，重发一次。`,
+        };
+      }
       const _bmTypeLabels = { manual: "等用户确认", capture: "监控抓包", file: bmFilePat ? "等文件内容匹配" : "等文件出现", command: "等命令成功", url: "等 URL 可达", port: "等端口监听" };
       res.className = "atc-result atc-result--ok"; res.textContent = `⏳ ${bmMsg}`;
       let _bmIv = null, _bmDone = false, _bmChecks = 0;

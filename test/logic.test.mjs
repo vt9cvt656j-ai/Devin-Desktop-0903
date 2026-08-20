@@ -31105,3 +31105,50 @@ test("read_logs 点名的终端没匹配上，不许把别人的日志当成它�
   assert.match(none, /\[终端没匹配上\]/);
   assert.match(none, /一个终端都没打开/);
 });
+
+// background_monitor 说自己开始等了，然后一次检查都没做。
+// 轮询循环里每条分支都是 `bmType === "file" && bmPat` 这种精确匹配，认不出来就一条都不进，
+// 只剩计时器在转：卡片显示「已检查 N 次」，超时回执说「等待…已超过 300 秒」——读起来像
+// 「条件一直没发生」，实际是条件一次都没被检查过。模型据此得出「服务没起来」的错结论。
+test("background_monitor：检查不了的条件必须当场说，别用 300 秒换一句假的「超时」", () => {
+  const normalize = load("_normalizeArgKeys");
+  const map = load("_mapToolCall", {
+    _mcpToolMap: new Map(), _normalizeArgKeys: normalize, _STR_ARG_KEYS: new Set(),
+    _KNOWN_TOOLS: new Set(["background_monitor"]), _canonicalToolName: () => "",
+  });
+  const call = (args) => map("background_monitor", args);
+
+  // 入参归一把 condition 并进了 check_type —— 而 condition 恰恰是模型最容易塞一整句
+  // 自然语言的字段。这就是「说开始了却什么都没检查」最主要的来源。
+  const leaked = call({ message: "等 dev server", condition: "dev server listening on 3000" });
+  assert.equal(leaked.checkType, "dev server listening on 3000",
+    "condition→check_type 这条归一没了的话，这个测试就不再覆盖它原本要覆盖的那条路");
+
+  const seg = /const _BM_CHECKS = new Set\(\[[\s\S]*?\n      \}\n/.exec(SRC);
+  assert.ok(seg, "background_monitor 的可检查性守卫不见了");
+  const guard = new Function("bmType", "bmPat", "bmTimeout", "res",
+    seg[0] + '\n;return null;');
+  const check = (c) => guard(c.checkType, c.pattern, 300, {});
+
+  const blocked = check(leaked);
+  assert.ok(blocked, "check_type 是一整句自然语言，照样开始等了");
+  assert.match(blocked.content, /\[BLOCKED_MONITOR_UNCHECKABLE\]/);
+  assert.match(blocked.content, /condition/, "没点破是 condition 被并进 check_type 的");
+  assert.match(blocked.content, /port|url|command/, "没给出可用的 check_type，模型无从改口");
+  assert.equal(blocked.failure.attempted, false, "一次都没检查，不能报成尝试过");
+
+  // 类型对但 pattern 空：file/command/url/port 四条分支都带 `&& bmPat`，同样一条都不进。
+  for (const t of ["file", "command", "url", "port"]) {
+    const r = check(call({ message: "等", check_type: t }));
+    assert.ok(r, `check_type=${t} 没给 pattern，照样空等到超时`);
+    assert.match(r.content, /pattern/);
+  }
+
+  // capture 和 manual 有意豁免。capture 空 pattern 匹配下一条新流量，是抓包恢复路径
+  // 明说的用法（CONFIGURE_BACKGROUND_PROXY 那条回执就是这么教模型的）；manual 不轮询。
+  assert.equal(check(call({ message: "等流量", check_type: "capture" })), null,
+    "capture 不带 pattern 被拦了 —— 抓包恢复路径正是这么教模型调的");
+  assert.equal(check(call({ message: "等用户登录" })), null, "manual 被拦了");
+  assert.equal(check(call({ message: "等端口", check_type: "port", pattern: "3000" })), null,
+    "写全了还被拦");
+});
