@@ -10446,7 +10446,9 @@ test("task profiles do not expand the minimal first-turn tool schema payload", (
     const got = select(true, request, []).map((tool) => tool.function.name);
     assert.deepEqual(
       got,
-      ["read_file", "package_search", "developer_community_search", "web_search", "web_fetch", "search_tools"],
+      // github_repo 跟着 github_search 成对进核心（搜索只给标题，标题不算取证证据）。
+      // 这个桩的可用清单里没有 github_search，所以这里只多出 github_repo 一个。
+      ["read_file", "package_search", "github_repo", "developer_community_search", "web_search", "web_fetch", "search_tools"],
       `profile must not eagerly expand schemas for: ${request}`,
     );
   }
@@ -11338,7 +11340,7 @@ test("Agent 开局窗口 20 个：取外部资源那一族、硬拒点名的、�
   const core = /agent: \["read_file"[\s\S]*?\],/.exec(SRC);
   assert.ok(core, "agent 核心表被改名或挪走了，这条断言失去落点");
   const names = [...core[0].matchAll(/"([a-z_]+)"/g)].map((m) => m[1]);
-  assert.equal(names.length + 1, 20, `开局窗口是 ${names.length + 1} 个（含 search_tools），不是 20`);
+  assert.equal(names.length + 1, 21, `开局窗口是 ${names.length + 1} 个（含 search_tools），不是 21`);
   for (const t of ["run_in_terminal", "read_logs"]) {
     assert.ok(names.includes(t), `${t} 不在开局窗口——harness 硬拒时点名要它，模型却够不着`);
   }
@@ -11347,9 +11349,28 @@ test("Agent 开局窗口 20 个：取外部资源那一族、硬拒点名的、�
   for (const t of ["save_skill", "mcp_server"]) {
     assert.ok(names.includes(t), `${t} 不在开局窗口——加了工具却够不着，等于没加`);
   }
-  for (const t of ["web_search", "web_fetch", "github_search", "developer_community_search", "package_search"]) {
+  for (const t of ["web_search", "web_fetch", "github_search", "github_repo",
+                   "developer_community_search", "package_search"]) {
     assert.ok(names.includes(t), `取资源的 ${t} 不在开局窗口——它就只能等 search_tools，等于不会被用`);
   }
+  // 「只负责发现」的工具，取证后手必须同在窗口里，否则模型搜一圈自我感觉查过了，
+  // 取证账本上仍然是零——_researchEvidenceCategory 明说搜索结果标题只算发现、不算证据。
+  // web_search→web_fetch 本来就是配齐的；github_search→github_repo 曾经漏了后手。
+  const official = new Set([...(/const _OFFICIAL_RESEARCH_EVIDENCE_TOOLS = new Set\(\[([\s\S]*?)\]\);/.exec(SRC)[1]
+    .matchAll(/"([a-z_]+)"/g))].map((m) => m[1]));
+  const community = new Set([...(/const _COMMUNITY_RESEARCH_EVIDENCE_TOOLS = new Set\(\[([\s\S]*?)\]\);/.exec(SRC)[1]
+    .matchAll(/"([a-z_]+)"/g))].map((m) => m[1]));
+  assert.ok(official.size && community.size, "取证证据工具表解析失败，这条断言失去落点");
+  for (const [discovery, evidence] of [["github_search", "github_repo"], ["web_search", "web_fetch"]]) {
+    if (!names.includes(discovery)) continue;
+    assert.ok(names.includes(evidence),
+      `${discovery} 在窗口里但取证后手 ${evidence} 不在——搜索只给标题，标题不算证据，`
+      + "模型会搜一圈就以为自己查过了");
+  }
+  assert.ok(names.some((n) => official.has(n)),
+    "开局窗口里一个能产出**官方**取证证据的工具都没有——取证门会永远判它没查");
+  assert.ok(names.some((n) => community.has(n)),
+    "开局窗口里一个能产出**社区**取证证据的工具都没有");
   // 原有十件不能被挤掉。
   for (const t of ["read_file", "list_dir", "search", "find_files", "update_plan",
                    "ask_user", "write_file", "edit_file", "multi_edit", "run_cmd"]) {

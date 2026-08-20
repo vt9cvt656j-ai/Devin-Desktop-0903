@@ -34,7 +34,8 @@ function topLevelFn(name) {
 const CORE = ["read_file", "list_dir", "search", "find_files", "update_plan", "ask_user",
               "write_file", "edit_file", "multi_edit", "run_cmd", "run_in_terminal", "read_logs",
               "save_skill", "mcp_server",
-              "web_search", "web_fetch", "github_search", "developer_community_search", "package_search"];
+              "web_search", "web_fetch", "github_search", "github_repo",
+              "developer_community_search", "package_search"];
 
 function selector() {
   return new Function(
