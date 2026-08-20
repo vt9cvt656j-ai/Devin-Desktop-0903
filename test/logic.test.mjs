@@ -6945,7 +6945,12 @@ test("工作区工具的判据来自语义裁决，不是用户话里的关键�
   assert.doesNotMatch(extractFn("sendPrompt"), /await\s+(?:Promise\.race\(\[)?_gatherAgentContext/,
     "the first-token path must not await a cold workspace scan");
   assert.match(SRC, /if \(_activeForSession\)/);
-  assert.match(SRC, /const hasToolAccess = isAgent \|\| isExplorer \|\| isReviewer \|\| isPlan/);
+  // 判据收敛成一份：判「给不给工具」和判「给不给会话账本」读的是同一个集合。
+  assert.match(SRC, /const _MODES_WITH_TOOLS = new Set\(\["agent", "explorer", "reviewer", "plan"\]\);/);
+  assert.match(SRC, /const hasToolAccess = _MODES_WITH_TOOLS\.has\(effectiveMode\);/);
+  // 历次要求的账本不能只在 agent 模式注入——Plan 是最依赖「用户到底要什么」的模式。
+  assert.match(SRC, /const _demandLedgerBlock = \(_MODES_WITH_TOOLS\.has\(effectiveMode\)/,
+    "切到 Plan/Explorer/Reviewer 就看不见自己历次提过的要求");
 });
 
 test("装完没装完问后端，不在前端拼一句只有 macOS 认的 shell", () => {
@@ -9559,7 +9564,7 @@ test("plan fold expands via delegated toggle and the expanded state survives re-
 });
 
 test("agent next-step chips use completed run memory and survive suggestion failures", () => {
-  const gen = load("_runStateNextActionSuggestions", { _INCOMPLETE_LABELS: loadConst("_INCOMPLETE_LABELS") });
+  const gen = load("_runStateNextActionSuggestions", { _INCOMPLETE_LABELS: loadConst("_INCOMPLETE_LABELS"), _projectStacks: new Map() });
   const now = Date.now();
   // **新版最多 3 个精确预测**:基于 failureCategory/mutatedFileTypes/runtimeEffects 等证据
   // 场景 1:失败且有 failureCategory → 针对性修复建议
@@ -11003,7 +11008,7 @@ test("long chat transcripts stay bounded while paging both directions", () => {
 });
 
 test("the composer prediction is grounded in real run state, and costs nothing", () => {
-  const gen = load("_runStateNextActionSuggestions", { _INCOMPLETE_LABELS: loadConst("_INCOMPLETE_LABELS") });
+  const gen = load("_runStateNextActionSuggestions", { _INCOMPLETE_LABELS: loadConst("_INCOMPLETE_LABELS"), _projectStacks: new Map() });
   const used = load("_predictionAlreadyUsed");
   const pred = load("_composerPrediction", {
     _runStateNextActionSuggestions: gen,
@@ -11087,10 +11092,16 @@ test("every turn-completion path refreshes the composer prediction", () => {
   assert.match(suggest, /_renderComposerGhost\(\)/,
     "智能体轮跑完必经 _maybeSuggestNext，预测必须挂在这里");
   // 灰字不能被桌面端限制挡住：卡片行才是桌面专属，网页版同样要有预测。
+  // 判据不是"位置排在 inTauri 之前"——灰字如今刻意排在卡片行**之后**（要先知道卡片
+  // 占了哪几条，才能挑一条别的说），位置判据会误伤。要钉的是：没有任何早退挡住它。
+  assert.doesNotMatch(suggest, /if \(!inTauri\) return;/,
+    "早退会让网页版彻底没有预测");
+  assert.match(suggest, /if \(inTauri\) _renderSuggestionChips\(/,
+    "桌面端限制只该管卡片行");
   const ghostAt = suggest.indexOf("_renderComposerGhost()");
-  const tauriAt = suggest.indexOf("inTauri");
-  assert.ok(ghostAt >= 0 && (tauriAt < 0 || ghostAt < tauriAt),
-    "预测必须排在 inTauri 提前返回之前");
+  const chipsAt = suggest.indexOf("_renderSuggestionChips(");
+  assert.ok(ghostAt >= 0 && chipsAt >= 0 && ghostAt > chipsAt,
+    "灰字要排在卡片行之后，否则两处会一字不差地说同一句");
 
   // 其余三个时机：打开软件、切标签、普通聊天轮结束。
   // 打开软件那一刻编辑器/诊断/当前文件可能都还没就绪，只算一次会得到空的，
@@ -27009,7 +27020,7 @@ test("记忆卫生·面板保存要连纠错账本一起作废", () => {
 });
 
 test("记忆卫生·需求账本不再自称「全部仍然有效」", () => {
-  const at = SRC.indexOf("const _demandLedgerBlock = (effectiveMode");
+  const at = SRC.indexOf("const _demandLedgerBlock = (_MODES_WITH_TOOLS");
   assert.ok(at > 0);
   const block = stripJsComments(SRC.slice(at, at + 700));
   assert.doesNotMatch(block, /全部仍然有效/, "历史消息被当成待办清单整本压给模型");
@@ -27548,7 +27559,8 @@ test("批量浏览器操作中断了就要报失败", () => {
   const block = SRC.slice(at, at + 700);
   assert.match(block, /call\._batchBroken/, "第 2 步点空、后面全没跑，模型却收到一条看起来正常的结果");
   assert.match(block, /\[失败\] 批量自动化中断/);
-  assert.match(SRC, /content, ok: !call\._batchBroken \}/, "ok:false 比文案匹配硬");
+  assert.match(SRC, /content, ok: !call\._batchBroken && !\(call\._batchDropped > 0\) \}/,
+    "ok:false 比文案匹配硬；截断（后面 N 步没跑）和中断一样都不是干净的成功");
   // 不认识的 op 不能只记一句「跳过」就继续
   const loopAt = SRC.indexOf("本路径不支持 op");
   assert.ok(loopAt > 0, "check/select 这些合法 op 被静默跳过，工具还报成功");
@@ -28769,6 +28781,87 @@ test("开箱默认模型由网关指定，不再是字母序碰出来的那个",
     "网关下发的 default 字段没被读进客户端目录");
 });
 
+// ---- 本地历史压缩：窗口要跟着模型走，最早那几条需求不能丢 ----
+test("本地压缩的两条上限跟着模型窗口走，且不把最早的需求砍掉", () => {
+  // 窗口比例化：写死 16K 有两个后果——用户第 1 轮的需求六七轮就被搬走换成残缺摘要；
+  // 更隐蔽的是它把 recent 永远摁在 16K 以下，而按重要性压缩的那条 LLM 腿触发线是
+  // 「窗口的一半」，于是那条腿在任何真实模型上都永远跑不到。
+  const fn = extractFn("_compactHistoryIfNeeded");
+  assert.doesNotMatch(fn, /const MAX_HISTORY_TOKENS = 16000;/,
+    "上限写死会让按重要性压缩那条腿永远触发不了");
+  assert.match(fn, /_modelContextLimit\(""\)/, "上限要按当前模型的窗口算");
+  assert.match(fn, /Math\.min\(240000, Math\.max\(16000, Math\.round\(_ctxLimit \* 0\.6\)\)\)/,
+    "0.6 要高于 LLM 压缩的 0.5、低于机械裁剪的硬线 0.70：破坏性的那条排最后");
+  // 条数上限也要等比放大，否则 36 条这道闸永远先响，token 那条形同虚设。
+  assert.match(fn, /36 \* MAX_HISTORY_TOKENS \/ 16000/, "条数上限没跟着放大等于没改");
+  // 那条 LLM 腿的触发线取的是同一个窗口的一半——两条线的先后关系是这次修复的全部意义。
+  const huge = extractFn("_compactHistoryIfHuge");
+  assert.match(huge, /_modelContextLimit\(config\?\.model \|\| ""\) \* 0\.5/);
+
+  // 摘要本身：它**永久顶替**被移走的消息，所以既要留得下一段需求，也不能只留最近几条。
+  const summary = load("_fallbackConversationSummary", { _headAndTail: load("_headAndTail") });
+  const long = "请用 React + Vite，接口一律走 /api/v2 前缀，金额全部用分做单位，" .repeat(12);
+  const out = summary([{ role: "user", content: long }]);
+  assert.ok(out.length > 400, `一段正经需求被砍成了残句：${out.length} 字`);
+  assert.ok(out.includes("金额全部用分做单位"), "需求里的关键约束丢了");
+
+  // 十条用户消息里，第 1 条（最早、也就是需求原文那条）必须还在。
+  const many = Array.from({ length: 10 }, (_, i) => ({ role: "user", content: `需求第${i}条` }));
+  const kept = summary(many);
+  assert.ok(kept.includes("需求第0条"), "最早那条需求被丢了——它恰恰是唯一不能丢的");
+  assert.ok(kept.includes("需求第9条"), "最近那条也要在");
+  assert.match(kept, /中间 \d+ 条略/, "省略要说出来，不能装作一共就这么多");
+});
+
+
+// ---- 「接下来」那条建议：不复述模型的话，不端无关的命令菜单，不和卡片行重复 ----
+test("「接下来」不复述模型刚说的话，也不端一串和这个项目无关的命令菜单", () => {
+  const now = Date.now();
+  const state = { outcome: "success", task: "起服务", result: "服务已经成功启动，可以访问了",
+    root: "/w", runtimeEffects: ["run"], updatedAt: now };
+  const stacks = new Map([["/w", { root: "/w", lang: "rust", checkCmd: "cargo check", testCmd: "cargo test" }]]);
+  const gen = load("_runStateNextActionSuggestions",
+    { _INCOMPLETE_LABELS: loadConst("_INCOMPLETE_LABELS"), _projectStacks: stacks });
+  const chip = gen({ _lastRunState: state }).find((c) => c.label === "运行验证改动");
+  assert.ok(chip, "有运行效果时要给一条验证建议");
+  // 上一轮模型自己的话不许塞回输入框：它可能本身就是错的（"服务已成功启动"，其实 10 秒
+  // 就被杀了），而这条串会被 harness 包装成用户的指令递回去，还会显示在输入框灰字里。
+  assert.ok(!chip.send.includes("服务已经成功启动"), "又把模型上一轮的回答复述回去了");
+  assert.ok(!chip.send.includes("查看最新结果"), "回声还在");
+  // 命令要来自这个项目探测到的真实命令，不是写死的菜单。
+  assert.ok(chip.send.includes("cargo check") && chip.send.includes("cargo test"),
+    "没读探测到的真实命令");
+  assert.doesNotMatch(chip.send, /npm test \/ pytest/, "写死的测试菜单和用户的项目对不上");
+  assert.doesNotMatch(chip.send, /npm run build \/ cargo build/, "写死的构建菜单同上");
+  // 探测不到就只给祈使句，不猜。
+  const blind = load("_runStateNextActionSuggestions",
+    { _INCOMPLETE_LABELS: loadConst("_INCOMPLETE_LABELS"), _projectStacks: new Map() });
+  const c2 = blind({ _lastRunState: state }).find((c) => c.label === "运行验证改动");
+  assert.ok(c2, "探测不到也要给建议");
+  assert.doesNotMatch(c2.send, /npm|pytest|cargo/, "探测不到就不许猜命令");
+  assert.match(c2.send, /验证命令/);
+});
+
+test("输入框灰字不重复卡片行已经摆出来的那条", () => {
+  // 两处读的是同一份建议：卡片行第一格和灰字的 "run" 档取的都是第一条，于是同一句话
+  // 在同一屏里出现两次。卡片行先渲染并记下自己占了哪几条，灰字据此挑一条别的。
+  const picks = [{ label: "A", send: "做 A" }, { label: "B", send: "做 B" }];
+  const pred = load("_composerPrediction", {
+    _runStateNextActionSuggestions: () => picks,
+    _predictionAlreadyUsed: () => false,
+    _dynamicChatChips: () => [],
+  });
+  const sess = { _lastRunState: { outcome: "success", updatedAt: Date.now() }, _recentSent: ["x"] };
+  assert.equal(pred(sess).send, "做 A", "卡片行还没摆时取第一条");
+  sess._chipSends = new Set(["做 A"]);
+  assert.equal(pred(sess).send, "做 B", "卡片行第一格已经是 A 了，灰字要说别的");
+  sess._chipSends = new Set(["做 A", "做 B"]);
+  assert.equal(pred(sess), null, "两条都摆出来了就不再重复");
+  // 卡片行那侧要真的把占用记下来，否则上面这套判据没有输入。
+  const chips = extractFn("_renderSuggestionChips");
+  assert.match(chips, /sess\._chipSends\.add\(/, "卡片行没记下自己占了哪几条");
+});
+
 // ---- 写入落空要有用户侧的出口 ----
 test("尝试写了没落盘时，结局里必须留下 writes_failed", () => {
   const loop = extractFn("_runAgenticLoop");
@@ -28979,7 +29072,7 @@ test("刚落盘前端源码且当前版本没有视觉验收证据时,推一条�
 // 「一轮跑完就结束」里根本没有下一轮来读它,于是每次都花钱算一个没人收得到的结论。
 // 出口必须是用户点得动的东西,而且点不点由用户决定。
 test("收尾评审判定没实现要求时,结论落进运行状态并变成一张用户点得动的建议卡", () => {
-  const gen = load("_runStateNextActionSuggestions", { _INCOMPLETE_LABELS: loadConst("_INCOMPLETE_LABELS") });
+  const gen = load("_runStateNextActionSuggestions", { _INCOMPLETE_LABELS: loadConst("_INCOMPLETE_LABELS"), _projectStacks: new Map() });
   const now = Date.now();
   const chips = gen({ _lastRunState: {
     outcome: "success", task: "接上真实鉴权", updatedAt: now,
@@ -29119,7 +29212,7 @@ test("评审结论从落盘到卡片走一趟真的通", () => {
   assert.ok(expr, "落盘那一步不见了");
   // 落盘表达式吃三个闭包变量：run（带评审结论）、verificationPassed、didMutate。
   const persist = new Function("run", "verificationPassed", "didMutate", `return ${expr[1]};`);
-  const gen = load("_runStateNextActionSuggestions", { _INCOMPLETE_LABELS: loadConst("_INCOMPLETE_LABELS") });
+  const gen = load("_runStateNextActionSuggestions", { _INCOMPLETE_LABELS: loadConst("_INCOMPLETE_LABELS"), _projectStacks: new Map() });
   const chipsFor = (verdict, { verified = true, mutated = true } = {}) => gen({
     _lastRunState: {
       outcome: "success", task: "x", updatedAt: Date.now(),
@@ -29448,4 +29541,40 @@ test("折叠开场消息时，用户写下的规矩和历次要求要原样带�
   // 光算出保留段不算数，必须真的拼回消息里。
   assert.match(fn, /content: _kept \+ "\[较早的项目上下文/,
     "保留段算出来了却没拼回消息——等于没修");
+});
+
+// ---- 「本来贴着底吗」必须在改内容之前量 ----
+//
+// 两处都栽在同一个顺序上：先把新内容写进 DOM，再量 scrollHeight - scrollTop - clientHeight。
+// 内容一改，scrollHeight 立刻涨了这一帧新增的高度，再量就等于拿「新内容有多高」当
+// 「用户往上翻了多远」。行高约 20px，一帧长 3 行就越过 48px 阈值，而这个距离只增不减 ——
+// 流式代码卡的跟随当场永久掉线（它在写，你看不到写到哪）。
+// 写入预览那处更直接：无条件拽到底，而唯一的守卫是「流已经停了」——正好是用户开始
+// 往上翻着读的那一刻，等于每隔 130ms 把他拽回去一次。
+// 活 DOM 几何没有任何测试能观察，所以这里钉的是**顺序**：量在改之前。
+test("流式代码卡和写入预览：贴底判定必须先于内容写入", () => {
+  // 一、流式代码卡
+  const at = SRC.indexOf('const _wasAtBottom = !!preEl && (preEl.scrollHeight - preEl.scrollTop - preEl.clientHeight) < 48;');
+  assert.ok(at > 0, "流式代码卡的贴底判定不见了");
+  const mutateAt = SRC.indexOf("codeEl.textContent = _view;", at - 2000);
+  assert.ok(mutateAt > at,
+    "贴底判定又跑到 textContent 写入后面去了——量到的是新内容的高度，跟随会当场永久掉线");
+  // 跟随必须走那次判定，不能再就地重量。
+  const region = SRC.slice(at, at + 3000);
+  assert.match(region, /if \(_wasAtBottom && preEl\) preEl\.scrollTop = preEl\.scrollHeight;/,
+    "跟随没有走改之前那次判定");
+  assert.doesNotMatch(region, /if \(preEl && preEl\.scrollHeight - preEl\.scrollTop - preEl\.clientHeight < 48\)/,
+    "又在改完之后就地重量了一次");
+
+  // 二、写入预览的上色回调
+  const pv = SRC.indexOf("const _wasAtBottom = !!preEl && (preEl.scrollHeight - preEl.scrollTop - preEl.clientHeight) < 48;", at + 1);
+  assert.ok(pv > 0, "写入预览的贴底判定不见了");
+  const pvMutate = SRC.indexOf("codeEl.innerHTML = html;", pv);
+  assert.ok(pvMutate > pv, "写入预览的贴底判定跑到 innerHTML 写入后面去了");
+  assert.doesNotMatch(SRC.slice(pv, pv + 800), /card\.querySelector\("pre"\)\.scrollTop = card\.querySelector\("pre"\)\.scrollHeight/,
+    "又变回无条件拽到底了——用户往上翻着读时会被每隔 130ms 拽回去");
+
+  // 两处都不许再出现「不带条件的贴底」。
+  assert.doesNotMatch(SRC, /\.scrollTop = card\.querySelector\("pre"\)\.scrollHeight/,
+    "还有一处无条件贴底没改");
 });
