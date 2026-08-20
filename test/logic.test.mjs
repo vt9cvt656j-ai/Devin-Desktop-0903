@@ -30124,3 +30124,77 @@ test("计划卡跨轮只有一张：新的一轮要复用上一轮那张，不�
   assert.match(src, /run\.session\._planEl/, "会话级指针没了 —— 下一轮又会新建一张");
   assert.match(src, /if \(run\) run\._planEl = el;/, "run 级指针没了 —— 本轮内的增量更新会失效");
 });
+
+// ---- 计划卡的另外两半：跨重启、以及展开进度 ----
+//
+// 上一条测试治的是「每问一轮多一张」。同一个病还有两半：
+//  · 卡本体会被写进持久化的 HTML 快照（_scrubResidue 的删除清单里没有 .agent-plan），
+//    而 run/session 上那两个指针都是内存里的 DOM 引用、序列化不进去 —— 指针没了、卡还在，
+//    于是**每关一次软件就多出一张**，画面和用户实拍那张一模一样。
+//  · 展开到第几行只挂 run，新的一轮必然 undefined —— 已经展开到 4 步的卡，一问下一句就
+//    缩回 1 行、把动画重放一遍。
+test("计划卡：跨重启不重建，展开进度跨轮保住，新任务仍从一行长起", () => {
+  const mkEl = (cls = "") => ({
+    className: cls, innerHTML: "", children: [], parentNode: null, isConnected: false,
+    get lastChild() { return this.children[this.children.length - 1] || null; },
+    appendChild(c) {
+      if (c.parentNode) c.parentNode.children = c.parentNode.children.filter((x) => x !== c);
+      c.parentNode = this; c.isConnected = true; this.children.push(c); return c;
+    },
+    querySelector(sel) {
+      const want = sel.replace(".", "");
+      const walk = (n) => { for (const c of n.children) { if (c.className === want) return c; const r = walk(c); if (r) return r; } return null; };
+      return walk(this);
+    },
+  });
+  let visible = null;
+  const render = new Function("document", "t", "_escHtml", "_PLAN_ICON", "_planVisibleWindow",
+    "_planRowHtml", "_planWindowControlsHtml", "_bindPlanWindow", "_syncPlanChip",
+    "_schedulePlanReveal", "_PLAN_MAX_RENDERED_STEPS",
+    `${extractFn("_renderPlan")}\nreturn _renderPlan;`)(
+    { createElement: () => mkEl() }, () => "", (x) => String(x), "",
+    (run, steps) => { visible = run && run._planVisibleCount; return { rows: steps.slice(0, visible), start: 0 }; },
+    () => "", () => "", () => {}, () => {}, () => {}, 8);
+  const countCards = (n) => (n.className === "agent-plan" ? 1 : 0)
+    + n.children.reduce((a, c) => a + countCards(c), 0);
+  const steps = [1, 2, 3, 4].map((i) => ({ content: "s" + i, status: "pending" }));
+
+  // ① 跨重启：每次「重启」都是新的 session 对象（内存指针没了），但容器里那张卡还在。
+  const chat = mkEl(); chat.isConnected = true;
+  for (let boot = 0; boot < 3; boot++) {
+    const body = mkEl(); chat.appendChild(body);
+    render(body, steps, undefined, { session: { container: chat } });
+  }
+  assert.equal(countCards(chat), 1,
+    "每重启一次就多出一张计划卡 —— 卡进了快照，指针没进，于是恢复后再建一张");
+
+  // ② 展开进度跨轮保住。
+  const chat2 = mkEl(); chat2.isConnected = true;
+  const sess2 = { container: chat2 };
+  const b1 = mkEl(); chat2.appendChild(b1);
+  const r1 = { session: sess2 };
+  render(b1, steps, undefined, r1);
+  // 用户展开到 4 行：**只**改 run 上那个值，会话级那份必须由渲染自己回写 ——
+  // 在这里手工替它写上，等于把「回写」那一步遮住了（第一版就是这么漏掉的）。
+  r1._planVisibleCount = 4;
+  render(b1, steps, r1._planEl, r1);                       // 同一轮内再渲染一次 → 应当回写会话
+  assert.equal(sess2._planVisibleCount, 4,
+    "展开进度没回写到会话上 —— 下一轮照样读不到，卡还是会缩回去");
+  const b2 = mkEl(); chat2.appendChild(b2);
+  render(b2, steps, undefined, { session: sess2 });        // 下一轮 = 新 run
+  assert.equal(visible, 4,
+    "下一轮把卡缩回去了 —— 展开进度只挂 run，卡却是跨轮复用的，每轮抖一次");
+
+  // ③ 但换任务的新计划仍然从 1 行长起来，别把动画一起弄没了。
+  const chat3 = mkEl(); chat3.isConnected = true;
+  const b3 = mkEl(); chat3.appendChild(b3);
+  render(b3, steps, undefined, { session: { container: chat3 } });
+  assert.equal(visible, 1, "全新会话的新计划应该从 1 行开始长");
+
+  // DOM 兜底必须从会话容器里查，不能查全局 —— 否则跨标签页串卡。
+  const src = extractFn("_renderPlan");
+  assert.match(src, /run\.session\.container\.querySelector\(\"\.agent-plan\"\)/,
+    "跨重启的 DOM 兜底没了");
+  assert.doesNotMatch(src, /document\.querySelector\(\"\.agent-plan\"\)/,
+    "从全局查会把别的会话那张卡抢过来");
+});

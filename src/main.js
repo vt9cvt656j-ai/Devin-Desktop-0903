@@ -35346,8 +35346,22 @@ function _renderPlan(container, steps, existingEl, run) {
   if (run) {
     const isFirstPlanRender = !Array.isArray(run._planSteps) || !run._planSteps.length;
     run._planSteps = steps;
-    if (isFirstPlanRender || !Number.isFinite(run._planVisibleCount)) run._planVisibleCount = steps.length ? 1 : 0;
-    else run._planVisibleCount = Math.min(Math.max(1, run._planVisibleCount), Math.min(steps.length || 1, _PLAN_MAX_RENDERED_STEPS));
+    // 展开到第几行也必须跟着**卡**走，不能只挂 run。
+    //
+    // 卡本身已经是会话级复用的（见下面的候选链）。而 _planVisibleCount 只挂 run，
+    // 新的一轮必然是 undefined → 上一轮已经展开到 4 步的那张卡，用户一问下一句就当场
+    // 缩回 1 行、再把展开动画重放一遍。每轮抖一次。隔壁 _planExpanded 早就做了会话镜像，
+    // 两个同类的 UI 状态一个镜像一个没镜像。
+    const _seededFromSession = !Number.isFinite(run._planVisibleCount)
+      && !!(run.session && run.session._planEl && Number.isFinite(run.session._planVisibleCount));
+    if (_seededFromSession) run._planVisibleCount = run.session._planVisibleCount;
+    // 换任务的新计划仍然从 1 行开始长（isFirstPlanRender 且没从会话播种到）。
+    if (!Number.isFinite(run._planVisibleCount) || (isFirstPlanRender && !_seededFromSession)) {
+      run._planVisibleCount = steps.length ? 1 : 0;
+    } else {
+      run._planVisibleCount = Math.min(Math.max(1, run._planVisibleCount), Math.min(steps.length || 1, _PLAN_MAX_RENDERED_STEPS));
+    }
+    if (run.session) run.session._planVisibleCount = run._planVisibleCount;
   }
 
   const done = steps.filter((s) => s.status === "completed").length;
@@ -35363,7 +35377,19 @@ function _renderPlan(container, steps, existingEl, run) {
   // 会话级的先例这个文件里已经有了（run.session._planExpanded，见 _planExpanded 那处）。
   // 复用到旧卡时下面那句 appendChild 会把它移到当前消息底部，正是这里注释写的
   // 「re-surface at the bottom」——那本来就是一张卡的设计，只是层级挂错了。
-  let el = existingEl || (run && run._planEl) || (run && run.session && run.session._planEl);
+  // 三级候选，一级比一级活得久：
+  //   run 级   —— 本轮内的增量更新
+  //   会话级   —— 同一次运行里的下一轮（修掉了「每问一轮多一张」）
+  //   DOM 级   —— **跨重启**。卡本体会被写进持久化的 HTML 快照（_scrubResidue 的删除清单里
+  //               没有 .agent-plan，恢复时原样 innerHTML 塞回去），而上面两个指针都是内存里的
+  //               DOM 引用、序列化不进 session.json。于是「指针没了、卡还在」= 再建一张：
+  //               每关一次软件，同一对话里就多出一张「任务计划」——和用户实拍那张图同样的画面，
+  //               只是触发条件从「每问一轮」变成「每重启一次」。
+  // 必须从 session.container 里查，不能查全局 document —— 否则会跨标签页把别的会话那张卡抢过来
+  //（「两个不同会话之间不许串卡」那条测试守着这一点）。
+  let el = existingEl || (run && run._planEl) || (run && run.session && run.session._planEl)
+    || (run && run.session && run.session.container && run.session.container.querySelector
+        ? run.session.container.querySelector(".agent-plan") : null);
   if (!el || !el.isConnected) {
     el = document.createElement("div");
     el.className = "agent-plan";
