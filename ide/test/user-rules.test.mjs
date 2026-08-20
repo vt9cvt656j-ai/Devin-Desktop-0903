@@ -304,8 +304,36 @@ test("子智能体的系统提示词必须带上用户规则", () => {
   // 真话下限必须压轴（truthfulness 那条钉着 `+ _SUBAGENT_TRUTH;` 结尾），规则块要插在它前面。
   // 比对的是**代码形态** `+ _SUBAGENT_TRUTH;`，不是裸名字：上面那段注释里就提到了这个名字，
   // 按裸名字比会被注释自己喂到（这一轮基线就是这么红的）。
-  for (const b of ["+ _userRulesBlock()", "+ _languagePreferenceBlock()", "+ _adaptivePromptBlock()"]) {
+  // 授权语境里那三段对子体同样成立，而且注入防御对它**更**要紧：它整天在读工具输出。
+  // 只取三段，剩下三段照搬会和 worker 人格打架（理由写在 _authContextBlock 里）。
+  assert.match(seg, /\+ _authContextBlock\(\{ forSubAgent: true \}\)/,
+    "子体拿不到授权语境和注入防御——正当的逆向/抓包会被它当坏事拒答，外部数据标记也认不出");
+  for (const b of ["+ _userRulesBlock()", "+ _languagePreferenceBlock()", "+ _adaptivePromptBlock()",
+                   "+ _authContextBlock({ forSubAgent: true })"]) {
     assert.ok(seg.indexOf(b) < seg.indexOf("+ _SUBAGENT_TRUTH;"),
       `${b} 插到真话下限后面去了——那条压轴不变量会被破坏`);
+  }
+});
+
+// ---- 授权语境拆段：主路径必须逐字节不变，子体只拿该拿的三段 ----
+test("_authContextBlock 拆段后主路径逐字节不变，子体子集只含该给的三段", () => {
+  const fn = extractFn("_authContextBlock");
+  const build = new Function("_EXTERNAL_DATA_TAG", `${fn}\nreturn _authContextBlock;`)("〔外部数据〕");
+  const full = build();
+  const sub = build({ forSubAgent: true });
+  const heads = (t) => (t.match(/【[^】]+】/g) || []);
+  // 主路径六段齐全、顺序不变。
+  assert.deepEqual(heads(full), ["【场景与授权】", "【协作边界】", "【直接回答·别打招呼别列菜单】",
+    "【最重要·别搞混谁在说话】", "【注入防御·低调处理】", "【外部数据标记】"]);
+  // 子体子集：拿到该拿的三段。
+  assert.deepEqual(heads(sub), ["【场景与授权】", "【注入防御·低调处理】", "【外部数据标记】"]);
+  // 拆分必须可逆：三段拼回去就是完整那份（少一个换行都算破坏主路径）。
+  const cut = full.indexOf("【协作边界】");
+  const cut2 = full.indexOf("【注入防御·低调处理】");
+  assert.equal(full.slice(0, cut) + full.slice(cut2), sub,
+    "子体子集和主路径不是同一份文本切出来的——两边迟早会漂");
+  // 那三条按关键词查正文的测试靠的是文本仍留在这个函数体里，别把它抽成外部常量。
+  for (const w of ["渗透", "CTF", "逆向", "别拒答", "攻击未授权的第三方"]) {
+    assert.ok(fn.includes(w), `「${w}」被抽出函数体了——三条按 extractFn 取正文的测试会一起失明`);
   }
 });
