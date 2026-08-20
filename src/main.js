@@ -57484,7 +57484,14 @@ async function _executeToolStepInner(step, call, root, run) {
           if (vp) vp.innerHTML = `<pre>${_escHtml(formatted)}</pre>`;
           return { type: "gh", path: "pr_review_comments", content: _rcRest
             ? `PR #${call.number} review 评论：共 ${arr.length} 条，**下面只有最早的 ${_rcShown.length} 条**，还有 ${_rcRest} 条没在这里。\n`
-              + `别按「都看完了」下结论；要取剩下的用 run_cmd 跑 \`gh api repos/{owner}/{repo}/pulls/${call.number}/comments --paginate --jq '.[${_rcShown.length}:]'\`。\n${formatted}`
+              + `别按「都看完了」下结论。要取剩下的，用 run_cmd 跑：\n`
+              + `\`gh api "repos/{owner}/{repo}/pulls/${call.number}/comments?per_page=100" --jq '.[${_rcShown.length}:]'\`\n`
+              // 这里**不能**加 --paginate：实测 gh 2.94 在 --paginate 下把 --jq 按**每一页**分别作用，
+              // 不是对合并后的数组。`--jq '.[30:]'` 于是变成「每页各跳过 30 条」，切出来的根本不是
+              // 你要的那批（40 条评论分两页时，第二页只有 10 条，`.[30:]` 直接给空数组）。
+              // 单页 per_page=100 就没有这个问题；超过 100 条再加 &page=2。
+              + `（**别加 --paginate**——加了之后 jq 是按每一页分别作用的，切出来的不是这一批；`
+              + `评论超过 100 条时在 URL 里加 &page=2。）\n${formatted}`
             : `PR #${call.number} review 评论 (${arr.length}):\n${formatted}` };
         }
         if (call.op === "pr_reply") {

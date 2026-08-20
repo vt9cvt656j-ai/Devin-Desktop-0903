@@ -31311,7 +31311,14 @@ test("gh_pr_review_comments：抬头的条数必须是正文里真有的条数",
   assert.ok(big.content.includes(`还有 ${40 - shown} 条没在这里`));
   assert.ok(big.content.length < 4200,
     `正文没有字符预算了（${big.content.length} 字）—— 一条 review 意见能写很长，30 条足够把上下文冲垮`);
-  assert.match(big.content, /gh api repos/, "没给取剩下那些的办法");
+  assert.match(big.content, /gh api "repos/, "没给取剩下那些的办法");
+  // 实测（gh 2.94）：--paginate 下 --jq 是按**每一页**分别作用的，不是对合并后的数组。
+  // `--jq '.[30:]'` 于是变成「每页各跳过 30 条」——40 条分两页时第二页只有 10 条，
+  // 切出来是空数组。给模型一条跑出错结果的命令，比不给更糟。
+  assert.doesNotMatch(big.content, /--paginate --jq|--jq[^\n]*--paginate/,
+    "又把 --paginate 和 --jq 写在一起了 —— jq 会按页作用，切出来不是这一批");
+  assert.match(big.content, /per_page=100/, "没有单页取，切片就没有意义");
+  assert.match(big.content, /别加 --paginate/, "没警告这个坑，模型很容易自己加回去");
   assert.match(big.content, /别按「都看完了」下结论/);
 
   // 30 条上限也要走同一条抬头。
