@@ -6648,7 +6648,6 @@ test("AI provider config is forced through the Michael gateway with no user rout
   assert.equal(chatUrl("https://api.openai.com/v1"), "https://api.openai.com/v1/chat/completions");
   assert.equal(chatUrl("https://api.openai.com/v1/chat/completions"), "https://api.openai.com/v1/chat/completions");
 
-  const activeMode = load("_activeAiProviderMode", { AI_PROVIDER_GATEWAY });
   const isGateway = load("_isGatewayConfig", { AI_PROVIDER_GATEWAY, MICHAEL_API, _cleanAiBaseUrl: clean });
   const baseDefault = {
     baseUrl: MICHAEL_API,
@@ -6664,7 +6663,6 @@ test("AI provider config is forced through the Michael gateway with no user rout
   const makeStorage = (_cfgCache, token = "") => load("_configForStorage", {
     _DEFAULT_AI_CONFIG: baseDefault,
     _cfgCache,
-    _activeAiProviderMode: activeMode,
     _cleanAiBaseUrl: clean,
     AI_PROVIDER_GATEWAY,
     MICHAEL_API,

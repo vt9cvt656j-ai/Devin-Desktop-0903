@@ -10946,20 +10946,6 @@ async function renderChildren(path, container) {
   }
 }
 
-// Open a dir node in place WITHOUT toggling — used to RESTORE expansion after a reload
-// (mirrors the row click handler). Lazy-loads children if not yet loaded.
-async function _expandDirNode(dirPath) {
-  dirPath = _treePath(dirPath);
-  _treeSetExpanded(dirPath, true);
-  const node = dirNodes.get(dirPath);
-  if (!node || !node.row) return;
-  node.row.classList.add("open");
-  node.kids.hidden = false;
-  const fimg = node.row.querySelector(".folder-ic");
-  if (fimg) fimg.src = folderIconUrl(dirPath.split("/").filter(Boolean).pop() || "", true);
-  if (!node.loaded) { node.loaded = true; await renderChildren(dirPath, node.kids); }
-}
-
 /** Re-read a directory and re-render its children (root or any expanded dir).
  *  PRESERVES the user's expanded sub-folders + tree scroll position, so an AI file
  *  write (fs-change → reloadDir) never collapses folders or jumps the tree under them
@@ -12934,10 +12920,6 @@ async function _fetchGatewaySettlement(config, requestId, attempts = 5) {
     finally { if (timer) clearTimeout(timer); }
   }
   return null;
-}
-
-function _activeAiProviderMode(config) {
-  return AI_PROVIDER_GATEWAY;
 }
 
 function _aiConfigForRuntime(raw) {
@@ -15282,10 +15264,6 @@ function _builtinThinkingProfileFor(id) {
 function _supportsThinking(id) {
   return _thinkingProfileFor(id).configurable === true;
 }
-// Predicate: this model is KNOWN to honor a configurable thinking parameter.
-function _isKnownThinkingModel(id) {
-  return _supportsThinking(id);
-}
 // User's saved choice, or a sensible default for this model.
 function _thinkingPrefFor(id) {
   const profile = _thinkingProfileFor(id);
@@ -15833,7 +15811,6 @@ let _chatSeq = 0; // monotonic counter for auto-naming so "Chat N" never repeats
 // concurrently. `_isStreaming()` reflects the ACTIVE tab (for the send/stop
 // button); the running loop tracks its own `session.streaming`.
 function _isStreaming() { return !!_currentSession()?.streaming; }
-function _setStreamBtnForActive() { _setSendBtnStop(_isStreaming()); }
 const CHAT_STORE_KEY = "michael-ide.chat-sessions";
 const RECENT_PROJECTS_KEY = "michael-ide.recent-projects";
 const MAX_RECENT = 8;
@@ -16573,9 +16550,6 @@ const _SNAPSHOT_MAX_MESSAGES = 64;
 const _SNAPSHOT_MAX_TOOL_STEPS = 96;
 const _HISTORY_AUTO_PAGE_EDGE_PX = 72;
 let _historyAutoPageRaf = 0;
-function _sessionHistoryEntries(session) {
-  return session?.memory?.transcriptEntries?.() || (Array.isArray(session?.history) ? session.history : []);
-}
 function _cacheTranscriptMessage(session, sequence, message) {
   if (!session || !Number.isFinite(sequence) || !message) return;
   if (!(session._historyCache instanceof Map)) session._historyCache = new Map();
@@ -16904,7 +16878,6 @@ function _updateHistoryControls(session) {
     newer.textContent = `更新的 ${Math.min(_RENDER_PAGE, length - end)} 条（剩余 ${length - end} 条）`;
   } else newer?.remove();
 }
-function _updateEarlierHistoryControl(session) { _updateHistoryControls(session); }
 async function _renderLatestHistoryWindow(session) {
   const container = session?.container;
   if (!container || session._historyAtLatest !== false) return;
@@ -17988,28 +17961,6 @@ const _WINDOW_ID = Date.now().toString(36) + Math.random().toString(36).slice(2,
 let _ipcChannel = null;
 const _ipcPeers = new Map();
 
-// 统一设置窗口标题：同时更新自绘标题栏 DOM 和原生窗口标题。之前只改 DOM，
-// macOS 的 Dock/调度中心/窗口菜单里所有窗口都叫 "Mr. Day One"，多窗口无法按项目区分。
-/**
- * Shorten from the middle, keeping both ends. For a filename the tail carries the extension and
- * usually the version or date — exactly what end-truncation throws away first. macOS shortens
- * paths this way for the same reason.
- */
-/**
- * Split a filename into the part that may be shortened and the part that must not. CSS can only
- * ellipsise at the end, which eats the extension — the one piece that says what the file is. So
- * the stem and the extension become separate elements: the stem shrinks, the extension never does.
- * Pixel-accurate and responsive, where truncating the string by character count is neither.
- */
-function _splitFileName(name) {
-  const value = String(name || "");
-  const dot = value.lastIndexOf(".");
-  // A leading dot is the whole name of a dotfile (.gitignore), not an extension. An extension
-  // longer than a few characters is usually a version fragment, not a type.
-  if (dot <= 0 || dot === value.length - 1 || value.length - dot > 12) return [value, ""];
-  return [value.slice(0, dot), value.slice(dot)];
-}
-
 /**
  * Put the whole filename in the element. Nothing is removed from the string.
  *
@@ -18684,18 +18635,6 @@ function _agentTimelineMarkVisible(timeline, turn, kind, at = Date.now()) {
     timeline.firstVisibleAt = eventAt;
     timeline.firstVisibleKind = String(kind || "text");
   }
-}
-
-function _agentTimelineElapsed(timeline, field) {
-  const startedAt = Number(timeline?.startedAt);
-  const at = Number(timeline?.[field]);
-  return Number.isFinite(startedAt) && Number.isFinite(at) && at >= startedAt ? at - startedAt : null;
-}
-
-function _agentTimelineRelative(timeline, at) {
-  const startedAt = Number(timeline?.startedAt);
-  const value = Number(at);
-  return Number.isFinite(startedAt) && Number.isFinite(value) && value >= startedAt ? value - startedAt : null;
 }
 
 function _turnStatsText({ elapsedMs = 0, settlement = null, timeline = null, live = false } = {}) {
@@ -24799,11 +24738,6 @@ function _authContextBlock({ forSubAgent = false } = {}) {
   // 主路径拼出来必须和拆分前**逐字节一致**（拆分处的换行分别并进后两段的开头）。
   return forSubAgent ? _scope + _injection : _scope + _mainOnly + _injection;
 }
-function _modelNeedsCssGrounding(id) {
-  const f = _modelFamilyOf(id);
-  return f !== "claude" && f !== "gemini";
-}
-
 // Codex-style guidance: render a row of clickable suggestion chips into a chat session.
 // Clicking one sends it as the next prompt. Used for "next steps" (after a run) and for
 // "onboarding" (after opening a project).
@@ -28766,11 +28700,6 @@ async function _disabledMcpServers() {
     if (raw) out.set(raw.toLowerCase(), raw);
   }
   return out;
-}
-
-/// 自有全局配置的路径（面板保存的目标）。取不到就返回空串。
-async function _userScopeMcpConfigPath() {
-  return String((await _readOwnMcpUserConfig())?.path || "");
 }
 
 // `.mcp.local.json` 是不是**跟着仓库来的**。
@@ -43686,14 +43615,6 @@ function _sameBatchRunFilePathBinding(run, root, requested) {
   if (boundBatch > run._toolBatch + 2) return "";
   return boundBatch >= run._toolBatch ? (run._filePathBindings.get(key) || "") : "";
 }
-function _recordRunRead(run, root, ...paths) {
-  const reads = run?.ctx?.filesRead;
-  if (!reads || typeof reads.add !== "function") return;
-  for (const path of paths) {
-    const key = _normRel(path, root);
-    if (key) reads.add(key);
-  }
-}
 // === ANTI-HALLUCINATION PROTOCOL-C：证据分级（单份 .md 不作项目权威）===
 // 痛点：满是文件的项目里，模型只读了一份 `逆向分析报告.md` 就把它当项目事实下结论，
 // 没核对真实源码，也没考虑这份 md 可能过期或是用户随手记。
@@ -51016,37 +50937,6 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
   }
 }
 
-// Pull a string field out of a STILL-STREAMING (incomplete) JSON args buffer,
-// e.g. write_file's `content` before the closing quote/brace has arrived. Handles
-// the common JSON escapes so the live code preview reads correctly mid-stream.
-function _partialJsonString(buf, key) {
-  // Tolerate whitespace the model may put around the colon, e.g. `"content": "`.
-  // The old exact `"key":"` match silently failed on spaced JSON — which is why
-  // the live preview card appeared but never showed any content.
-  const m = buf.match(new RegExp(`"${key}"\\s*:\\s*"`));
-  if (!m) return null;
-  const s = buf.slice(m.index + m[0].length);
-  let out = "";
-  for (let j = 0; j < s.length; j++) {
-    const c = s[j];
-    if (c === "\\") {
-      const n = s[j + 1];
-      if (n === undefined) break; // dangling escape at the stream edge
-      if (n === "n") out += "\n";
-      else if (n === "t") out += "\t";
-      else if (n === "r") out += "\r";
-      else if (n === "u") { const h = s.slice(j + 2, j + 6); if (/^[0-9a-fA-F]{4}$/.test(h)) { out += String.fromCharCode(parseInt(h, 16)); j += 4; } }
-      else out += n;
-      j++;
-    } else if (c === '"') {
-      break; // closing quote → value complete
-    } else {
-      out += c;
-    }
-  }
-  return out;
-}
-
 // Decode only a COMPLETE JSON string field. In particular, a partially streamed
 // path must never resolve to a different file and briefly preview there.
 function _completeJsonString(buf, key) {
@@ -52627,24 +52517,6 @@ function _countExistingModules(steps) {
   return modules.size;
 }
 
-// ── 计划步骤领域归类（纯事实罗列，不做决策）：拆分并行门用它把步骤文本按专业领域
-//    归档（frontend/backend/database/test/devops/docs/design），供模型判断 scope 能否清晰
-//    切分。关键词只作事实归档底座，拆不拆的语义判断权留给模型（AI 主判原则）。
-function _planStepDomain(step) {
-  const text = String(step?.content || step?.title || step || "");
-  if (!text) return "";
-  if (/(?:数据库|表结构|建表|迁移|索引|存储层|sql|schema|migration|\bdb\b|\borm\b|redis|mongo|postgres|sqlite)/i.test(text)) return "数据库";
-  if (/(?:测试|单测|用例|回归|断言|覆盖率|test|\be2e\b|\bspec\b|coverage)/i.test(text)) return "测试";
-  if (/(?:部署|上线|发布|容器|流水线|运维|deploy|docker|k8s|kubernetes|pipeline|nginx|devops|\bci\b)/i.test(text)) return "部署";
-  if (/(?:文档|说明书|readme|changelog|\bdocs?\b|wiki)/i.test(text)) return "文档";
-  if (/(?:设计稿|视觉方案|配色|原型|design system|figma)/i.test(text)) return "设计";
-  if (/(?:前端|页面|组件|界面|样式|布局|视图|交互|响应式|动效|\bui\b|\bcss\b|tailwind|react|vue|svelte|\bhtml\b|frontend|component|\bpage\b|layout)/i.test(text)) return "前端";
-  if (/(?:后端|服务端|接口|路由|中间件|鉴权|会话|\bapi\b|backend|server|endpoint|controller|middleware|\bauth\b|websocket)/i.test(text)) return "后端";
-  return "";
-}
-
-
-
 // ── bug 修复异步取证门（一次性事实注入）：调试类任务写入前已有 ≥2 次失败/未找到类探测
 //    （根因未明的事实，复用 probeLoop 的批次账本，不另起账）→ 提示取证可用后台子智能体
 //    并行推进。与 probeLoop 不同键；同批已有 stuck/probeLoop 干预时由调用方让行。
@@ -52874,19 +52746,6 @@ function _occurrenceLines(text, needle, cap = 8) {
     idx += Math.max(needle.length, 1);
   }
   return out;
-}
-
-function _countOccurrences(text, needle) {
-  const haystack = String(text ?? "");
-  const value = String(needle ?? "");
-  if (!value) return 0;
-  let count = 0;
-  let index = 0;
-  while ((index = haystack.indexOf(value, index)) !== -1) {
-    count++;
-    index += value.length;
-  }
-  return count;
 }
 
 function _recoverEditMatch(text, needle) {
@@ -59686,31 +59545,8 @@ monacoEditor.addAction({
   run: () => openInlineAssistant(),
 });
 
-// ---- AI Diff Preview ----
-function showAiDiffPreview(originalCode, modifiedCode, lang, filePath) {
-  const ed = ensureDiffEditor({ readOnly: true, originalEditable: false });
-  const original = monaco.editor.createModel(originalCode, lang || "plaintext");
-  const modified = monaco.editor.createModel(modifiedCode, lang || "plaintext");
-  const prev = ed.getModel();
-  ed.setModel({ original, modified });
-  if (prev) {
-    prev.original?.dispose();
-    prev.modified?.dispose();
-  }
-  _diffFilePath = filePath || null;
-  $("diffTitle").textContent = filePath ? filePath.split("/").pop() + " (AI Preview)" : "AI Diff Preview";
-  diffViewEl.hidden = false;
-  ed.layout();
-
-  ed.updateOptions({ readOnly: false, originalEditable: false });
-}
-
 // ---- settings dialog ----
 const settingsEl = $("settings");
-function _settingsSelectedProviderMode() {
-  return AI_PROVIDER_GATEWAY;
-}
-
 function _setSettingsProviderMode(mode) {
   const normalized = AI_PROVIDER_GATEWAY;
   const gateway = $("aiProviderGateway");
@@ -60348,32 +60184,6 @@ const TOOL_REQUIREMENTS = {
 };
 
 const _checkedLangs = new Set();
-async function checkToolForLanguage(lang) {
-  if (_checkedLangs.has(lang)) return;
-  const req = TOOL_REQUIREMENTS[lang];
-  if (!req) return;
-  _checkedLangs.add(lang);
-  try {
-    if (inTauri) {
-      const cmds = await backend.termListCommands();
-      if (cmds.includes(req.cmd)) return;
-    }
-    showNotification({
-      title: `缺少 ${req.name}`,
-      message: `安装后可获得 ${lang} 智能补全、跳转定义等功能`,
-      actionLabel: "安装",
-      duration: 15000,
-      action: async () => {
-        await openTerminal();
-        writeToActiveTerminal(req.install + "\n");
-        showToast(`正在自动安装 ${req.name}...`);
-      },
-    });
-  } catch (e) {
-    console.warn("[tool-check]", lang, e);
-  }
-}
-
 // ---- advanced feature panels (settings / growth / shortcuts) ----
 // ===== 抓包 (system-wide MITM capture, mitmproxy-backed; HttpCanary/小黄鸟-style) =====
 let _captureFlows = [];      // ring buffer of captured flows (untrusted data → render via textContent)
@@ -67038,14 +66848,6 @@ async function _dispatchComposerSubmission(draft) {
   return true;
 }
 
-function _addDroppedRef(info) {
-  if (!info || !info.path) return;
-  const rel = _pathToRel(info.path);
-  if (_droppedRefs.some((r) => r.rel === rel)) return; // dedupe
-  _droppedRefs.push({ path: info.path, rel, name: info.name || rel.split("/").pop() || rel, isDir: !!info.isDir });
-  _renderRefChips();
-  try { promptEl.focus(); } catch {}
-}
 // Drop a file/dir chip into the composer at the caret (from a tree drag). The chip is an atomic
 // contentEditable=false card; the @-mention regex the send path needs is satisfied by the VIRTUAL
 // spaces _ceSerialize emits around each chip — so nothing is inserted here but the chip itself.
@@ -68712,19 +68514,6 @@ async function _restoreArchivedSession(sessionId) {
   return _restoreClosedChatSession(0);
 }
 
-function _sessionLibraryTotals(entries) {
-  const out = { totalTurns: 0, recentCount: 0, summaryCount: 0, fileEvidenceCount: 0, correctionCount: 0 };
-  for (const { session } of entries || []) {
-    const st = _sessionMemoryStats(session);
-    out.totalTurns += st.totalTurns;
-    out.recentCount += st.recentCount;
-    out.summaryCount += st.summaryCount;
-    out.fileEvidenceCount += st.fileEvidenceCount;
-    out.correctionCount += st.correctionCount;
-  }
-  return out;
-}
-
 // Session picker (/sessions): browse every conversation in this workspace — name,
 // project, mode, message count, last-message preview — and jump into one to continue.
 async function _openSessionPicker() {
@@ -70192,13 +69981,6 @@ let userKeybindings = {};
 async function loadKeybindings() {
   const store = await getStore();
   userKeybindings = (await store.get("keybindings")) || {};
-}
-
-async function saveKeybinding(combo, action) {
-  userKeybindings[combo] = action;
-  const store = await getStore();
-  await store.set("keybindings", userKeybindings);
-  await store.save();
 }
 
 function getKeybindings() {

@@ -1800,30 +1800,23 @@ const KNOWN_UNCALLED = new Set([
   "_ctxNativeCeiling", "_detectVerifyCmd", "_emptyExploreSkipMessage", "_emptyRootSkipMessage",
   "_evidenceGradingHint", "_refreshEmptyRootBeforeSkip", "_runApprovedVerification",
   "recommendToolsForIntent", "renderLspTool",
-  "_appendDeliveryFactsBar", "_appendRunRevertBar",
-  "_activeAiProviderMode", "_adaptiveEnabled", "_addDroppedRef",
+  "_appendDeliveryFactsBar", "_appendRunRevertBar", "_adaptiveEnabled",
   "_agentAllowsDependencyRestore", "_agentAllowsExternalKind", "_agentAllowsRuntimeKind",
   "_agentQuestionNeedsWorkspaceEvidence",
-  "_agentSideEffectIntentIssue", "_agentTimelineElapsed", "_agentTimelineRelative",
+  "_agentSideEffectIntentIssue",
   "_agentToolNameAllowedByProfile", "_agentTurnHasNonControlTools", "_agentUserIntentText",
   "_aiConfigured", "_appendMemory", "_appendToolPlanCard", "_browserNeedsCapturePreflight",
-  "_countExistingModules", "_countOccurrences", "_executeInlineTools", "_expandDirNode",
+  "_countExistingModules", "_executeInlineTools",
   "_fixTrailingWhitespace", "_fixUnbalancedBrackets", "_getIdentifierAtPosition",
-  "_hasContextOnlyLocationIntent", "_isCompressionPrefixInvalidError",
-  "_isKnownThinkingModel", "_isLocalOrPrivateHttpUrl",
+  "_hasContextOnlyLocationIntent", "_isCompressionPrefixInvalidError", "_isLocalOrPrivateHttpUrl",
   "_looksLikeProjectExecutionCommand", "_memoryChoiceModel",
-  "_migrateCtxChoiceV1", "_modelNeedsCssGrounding", "_partialJsonString",
-  "_planStepDomain", "_readBeforeEditCoverageHint", "_readCoverageImpossible",
-  "_recordRunRead", "_screenshotModePreflightIssue", "_sessionHistoryEntries",
-  "_sessionLibraryTotals", "_setStreamBtnForActive", "_settingsSelectedProviderMode",
-  "_skillIcon", "_skillIconMarkup", "_skillImgFromFile", "_splitFileName",
+  "_migrateCtxChoiceV1", "_readBeforeEditCoverageHint", "_readCoverageImpossible", "_screenshotModePreflightIssue",
+  "_skillIcon", "_skillIconMarkup", "_skillImgFromFile",
   "_stickToBottom", "_structureReadinessHint", "_thinkTip",
-  "_toolRequiresPlanGate", "_translateToEnglish", "_updateEarlierHistoryControl",
-  "_userScopeMcpConfigPath", "_workspaceRelativePath", "_writeGateBypass",
-  "checkExtensionRecommendation", "checkToolForLanguage", "refreshOutline",
+  "_toolRequiresPlanGate", "_translateToEnglish", "_workspaceRelativePath", "_writeGateBypass",
+  "checkExtensionRecommendation", "refreshOutline",
   "refreshTestExplorer", "renderCaptureTool", "renderConflictsTool", "renderDebuggerTool",
-  "renderMarketplaceTool", "renderRemoteTool", "renderTasksTool", "renderWorkspaceTool",
-  "saveKeybinding", "showAiDiffPreview", "updateMinimapSearchHighlights",
+  "renderMarketplaceTool", "renderRemoteTool", "renderTasksTool", "renderWorkspaceTool", "updateMinimapSearchHighlights",
 ]);
 
 function stripJsComments(source) {
@@ -1909,6 +1902,14 @@ test("新写的能力必须有人调用——死函数只减不增", () => {
   const revived = [...KNOWN_UNCALLED].filter((n) => (seen.get(n) || 0) > 1).sort();
   assert.deepEqual(revived, [],
     "这些已经有调用点了，请从 KNOWN_UNCALLED 里删掉（名单是要缩短的）：\n  " + revived.join(", "));
+
+  // 棘轮的第三半：函数**删掉了**、名字还留在名单里。
+  // 上面两条都看不见这种：`added` 只看「不在名单里的死函数」，`revived` 只看「计数 > 1」，
+  // 而删掉的函数计数是 0 —— 名单会慢慢攒成一堆墓碑，下一个人读它时以为那些东西还在。
+  const tombstones = [...KNOWN_UNCALLED].filter((n) => !names.includes(n)).sort();
+  assert.deepEqual(tombstones, [],
+    "这些函数已经不存在了，名字却还留在 KNOWN_UNCALLED 里（名单只跟着真实存量走）：\n  "
+    + tombstones.join(", "));
 });
 
 test("前端调的每个后端命令，Rust 侧都注册了", () => {
