@@ -30704,3 +30704,58 @@ test("LSP 没答上来 ≠ 这个文件里没有符号", () => {
     assert.match(SRC, /这不代表这个文件里没有符号/, "调用方没有把「没查成」和「没有符号」分开说");
   });
 });
+
+// ---- 三条「回执/上下文在骗人或白烧」 ----
+
+test("hooks.json 读不懂时必须吵，读不到时必须安静", () => {
+  const seg = /let _hooksParseWarned = "";\nasync function _loadHooks\(root\)[\s\S]*?\n\}/.exec(SRC);
+  assert.ok(seg, "hooks 加载那段不见了");
+  const mk = (readImpl) => {
+    const toasts = [];
+    const f = new Function("inTauri", "_hooksCache", "_readFirstExisting", "_stateRels", "showToast",
+      "console", "checkWorkspaceTrust", "_approveWorkspaceExecConfig",
+      `${seg[0]}\nreturn _loadHooks;`)(
+      true, { root: null, ts: 0, cfg: null }, readImpl, () => ["hooks.json"],
+      (m) => toasts.push(m), { error: () => {} }, async () => true, async () => true);
+    return { f, toasts };
+  };
+  const noFile = mk(async () => { throw new Error("ENOENT"); });
+  const broken = mk(async () => ({ text: '{"pre_tool_use":[{"command":"echo"},]}', rel: ".mrdayone/hooks.json" }));
+  return Promise.all([noFile.f("/a"), broken.f("/b"), broken.f("/b"), broken.f("/b")]).then(() => {
+    assert.equal(noFile.toasts.length, 0, "没有 hooks.json 也弹提示 —— 绝大多数工作区都没有，会天天骚扰");
+    assert.equal(broken.toasts.length, 1,
+      broken.toasts.length === 0
+        ? "格式错了却一声不响 —— 用户写的 rm -rf 防线整套失效，而他以为还在"
+        : "同一个坏文件重复弹提示 —— 缓存窗口 15 秒，会一直刷");
+    assert.match(broken.toasts[0], /hooks 全部未生效/, "提示没说清后果");
+  });
+});
+
+test("git 跑不起来时不许说「这不是 Git 仓库」", () => {
+  const guide = load("_gitNonRepoGuidance");
+  const envBroken = guide("/repo", [], "status", false, "program not found: git");
+  assert.match(envBroken, /git 没跑起来/, "环境问题被说成了仓库问题");
+  assert.doesNotMatch(envBroken, /不是 Git 仓库（没有 \.git）/,
+    "还在说「这不是 Git 仓库」—— 用户会去折腾一个本来没问题的仓库");
+  assert.match(envBroken, /xcode-select/, "没给 macOS 上最常见的那条出路");
+  // 真的不是仓库时，原来那条照旧。
+  assert.match(guide("/repo", [], "status", false, ""), /\[GIT_NEEDS_REPO\]/,
+    "把真正「不是仓库」的情形也弄没了");
+});
+
+test("冷启动第一句不许把记忆块和项目日志各注入两遍", () => {
+  const snap = extractFn("_agentContextSnapshotForTurn");
+  const at = snap.indexOf("if (_full && String(_full).trim().length > 200) {");
+  assert.ok(at > 0, "冷启动那条路不见了");
+  // 只切**这个 if 块**：下面那条兜底返回（冷启动没赶上时走）本来就该拼记忆块，
+  // 窗口开大会把它一起算进来（第一版就这么误报的）。
+  const branch = snap.slice(at, snap.indexOf("\n      }", at));
+  assert.doesNotMatch(branch, /_memoryBlocks\(/,
+    "又在 _gatherAgentContext 的返回值上重拼了一遍记忆块 —— 它的结尾本来就带着；"
+    + "结果是上下文最末尾（注意力最高的位置）连着出现两份");
+  assert.doesNotMatch(branch, /_projectJournalBlock\(/, "项目日志同上，重复注入");
+  // 内层必须按会话身份根取记忆，别和外层用两个不同的抽屉。
+  assert.match(extractFn("_gatherAgentContext"),
+    /_agentContextForQuery\(baseContext, query \|\| "", root, undefined, undefined, _sizeState,/,
+    "内层没有把身份根透传下去 —— 内外两层会取到两套不同的记忆");
+});
