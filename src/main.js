@@ -8310,9 +8310,19 @@ async function closeFile(path, { force = false, discardBuffer = false } = {}) {
       let latest = snapshot;
       try { latest = f.model.getValue(); } catch {}
       try {
+        // **base 必须一起写。** 恢复那边的陈旧闸（restoreSession 里那句
+        // `typeof u.base !== "string"` → staleSkipped）明确拒绝没有 base 的条目：
+        // 它无法验证这份缓冲是从哪个磁盘状态改出来的，只能当成不可信而丢弃。
+        //
+        // 而这条分支恰恰是最需要备份生效的时刻（保存刚刚失败），原来却只写 {path, content}
+        // —— 于是备份 100% 会在下次启动时被丢掉，界面上那句「已备份当前内容」是假的，
+        // 两头都报安全，用户的改动无声消失。正常的 flush 路径一直是带 base 的，
+        // 这里少的就是同一个字段。
+        const _base = _bufferBaseStamp(f.diskContent);
         const bak = JSON.parse(localStorage.getItem("michael-ide.unsaved-buffers") || "[]");
         const i = bak.findIndex((b) => b.path === path);
-        if (i >= 0) bak[i].content = latest; else bak.push({ path, content: latest });
+        if (i >= 0) { bak[i].content = latest; bak[i].base = _base; }
+        else bak.push({ path, content: latest, base: _base });
         localStorage.setItem("michael-ide.unsaved-buffers", JSON.stringify(bak));
       } catch {}
       try { showToast("⚠ " + (f.name || path) + " 未能保存，已保留标签并备份当前内容"); } catch {}

@@ -432,31 +432,41 @@ fn refuse_existing_download_target(target: &Path) -> Result<(), String> {
 }
 
 
-/// Download a file from a URL into the workspace. `dest` is resolved relative to
-/// `root` (or absolute) and MUST stay inside `root`. Bounded to 200 MB.
-#[tauri::command]
-pub async fn download_file(root: String, url: String, dest: String) -> Result<String, String> {
-    let parsed = validate(&url).await?;
-
-    // Contain the write to the workspace.
-    let base = std::path::Path::new(&root);
-    let target = {
-        let d = std::path::Path::new(&dest);
-        if d.is_absolute() {
-            d.to_path_buf()
-        } else {
-            base.join(d)
-        }
-    };
+/// 把 `dest`（相对 `root` 或绝对）解析成一个**确认落在工作区内**的绝对路径。
+///
+/// 抽出来是为了能拿真实符号链接测它 —— download_file 本身要联网，测不动。
+fn resolve_download_target(root: &str, dest: &str) -> Result<std::path::PathBuf, String> {
+    let base = std::path::Path::new(root);
+    let d = std::path::Path::new(dest);
+    let target = if d.is_absolute() { d.to_path_buf() } else { base.join(d) };
     if target
         .components()
         .any(|c| matches!(c, std::path::Component::ParentDir))
     {
         return Err("目标路径不能包含 ..".into());
     }
-    if !base.as_os_str().is_empty() && !target.starts_with(base) {
-        return Err("只能下载到工作区目录内".into());
-    }
+    // 边界必须在**解析完符号链接之后**判，不能拿字面路径比前缀。
+    //
+    // 原来是 `target.starts_with(base)` —— 纯粹的字符串式组件比较。工作区里只要有一个
+    // 指向外部的目录符号链接（git 能原样存任意 symlink 目标，clone 一个仓库就带进来了），
+    // 比如 `assets -> ~/Library/LaunchAgents`，那么 `<root>/assets/x.plist` 字面上就在
+    // root 底下、两道检查全过，而写下去落在工作区之外。这是仓库内容就能诱导的越界写。
+    //
+    // require_inside_workspace 是这个进程里唯一一份做对了的边界：它先 canonicalize（对
+    // 还不存在的目标会解析到最深的已存在祖先再拼回去）、处理 macOS 的 firmlink，
+    // 并且对写操作要求落在**已打开的工作区**内而不只是 HOME 底下。它的注释原话就是
+    // 「拿原始路径比对会让工作区内的符号链接授权它指向的外部目标」。
+    // 不在这里另写一份 —— 两份边界迟早漂开，而漂开的那一刻没有任何东西会报警。
+    crate::files::require_inside_workspace(&target.to_string_lossy(), true)
+}
+
+/// Download a file from a URL into the workspace. `dest` is resolved relative to
+/// `root` (or absolute) and MUST stay inside `root`. Bounded to 200 MB.
+#[tauri::command]
+pub async fn download_file(root: String, url: String, dest: String) -> Result<String, String> {
+    let parsed = validate(&url).await?;
+
+    let target = resolve_download_target(&root, &dest)?;
 
     refuse_existing_download_target(&target)?;
 
@@ -1334,6 +1344,55 @@ fn b64_decode_limited(s: &str, limit: usize) -> Result<Vec<u8>, String> {
 
 #[cfg(test)]
 mod img_tests {
+    /// 工作区里一个指向外部的目录符号链接，不许把下载写到工作区外面。
+    ///
+    /// 原来的边界是 `target.starts_with(base)` —— 纯字符串比较。git 能原样存任意 symlink
+    /// 目标，所以 clone 一个仓库就能把 `assets -> ~/Library/LaunchAgents` 带进来；
+    /// 之后仓库里的文本诱导模型 `download_file(dest:"assets/x.plist")`，字面上它就在
+    /// root 底下、两道检查全过，写下去却落在工作区之外。这是仓库内容就能诱导的越界写。
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_inside_the_workspace_cannot_redirect_a_download_outside_it() {
+        use std::os::unix::fs::symlink;
+
+        // **不能用临时目录做逃逸目标。** 临时目录是刻意放行的暂存空间
+        // （files.rs 的 has_safe_prefix 会提前返回 Ok），拿它当"外面"测不出任何东西。
+        // 真实场景逃向的是 ~/Library/LaunchAgents 这类地方，所以这里两边都放在仓库的
+        // target/ 下面：它在 HOME 之内（读可以）但不在任何**已打开的工作区**里，
+        // 正是写操作该被拒的那种位置。
+        let parent = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join(format!("mi-dl-escape-{}", std::process::id()));
+        let root = parent.join("workspace");
+        let outside = parent.join("outside");
+        let _ = std::fs::remove_dir_all(&parent);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        symlink(&outside, root.join("assets")).unwrap();
+
+        crate::files::register_workspace_root(root.to_string_lossy().into_owned()).unwrap();
+
+        // 穿过符号链接 → 必须被拒。
+        let escaped = super::resolve_download_target(
+            &root.to_string_lossy(),
+            "assets/evil.plist",
+        );
+        assert!(
+            escaped.is_err(),
+            "符号链接把下载引到了工作区外面：{:?}",
+            escaped.map(|p| p.display().to_string()),
+        );
+
+        // 正常的工作区内路径仍然放行，别把边界收得连自己都用不了。
+        let ok = super::resolve_download_target(&root.to_string_lossy(), "sub/fine.txt");
+        assert!(ok.is_ok(), "工作区内的正常目标被误拒：{ok:?}");
+
+        // `..` 仍然当场拒绝，给的是更清楚的那条错。
+        assert!(super::resolve_download_target(&root.to_string_lossy(), "../evil").is_err());
+
+        let _ = std::fs::remove_dir_all(&parent);
+    }
+
 
     /// SSE 合并不能只拼文本：出图的中转常把图片放在 images 字段或分片 content 里，
     /// 丢了它们的表现是"回复里没找到图片"——看着像模型没出图，其实是解析把它扔了。

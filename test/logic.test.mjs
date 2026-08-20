@@ -29276,3 +29276,21 @@ test("写页面时取证台账为空，要按执行事实出声——两本台�
   assert.ok(!facts.has("referenceSite"),
     "referenceSite 被提成事实类了——参考站律每轮都在提示词里，它只该是兜底建议");
 });
+
+test("关标签页保存失败时写的备份必须带 base，否则重启必然被当陈旧丢掉", () => {
+  // 恢复那边的陈旧闸明确拒绝没有 base 的条目（restoreSession 里 `typeof u.base !== "string"`
+  // → staleSkipped）。而保存失败这条分支恰恰是最需要备份生效的时刻，原来只写
+  // {path, content} —— 备份 100% 会在下次启动被丢掉，而界面上那句「已备份当前内容」
+  // 两头都报安全，用户的改动无声消失。
+  // 注意别从 key 出现的位置往后切：`const _base = …` 写在它前面，切了就看不到。
+  const backup = extractFn("closeFile");
+  assert.ok(backup.includes("michael-ide.unsaved-buffers"), "closeFile 里没有备份逻辑了？");
+  assert.match(backup, /_bufferBaseStamp\(f\.diskContent\)/,
+    "保存失败时写的备份没有带 base，恢复时必然被丢弃");
+  assert.match(backup, /base: _base|\.base = _base/,
+    "base 没有真的写进条目里");
+
+  // 陈旧闸本身必须还在——它是防止用旧缓冲覆盖更新文件的唯一一道。
+  assert.match(SRC, /typeof u\.base !== "string" \|\| u\.base !== _bufferBaseStamp\(f\.diskContent\)/,
+    "恢复时的陈旧闸不见了");
+});
