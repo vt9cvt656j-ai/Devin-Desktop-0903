@@ -29333,6 +29333,22 @@ test("一条坏存档只丢它自己，而且不许覆盖完整的那份", () =>
   assert.match(restore, /条会话存档读不出来/);
 });
 
+
+// ---- 浏览器验收闸门自己的洞 ----
+test("assert 给了 node/index 却解析不出目标时，不许回落到全页匹配", () => {
+  // assert(node:12) 时 call.selector 是空的，而 _assertJS 里 `SEL || 'body *'`
+  // 会去匹配全页元素——只要页面上有那句文字（或压根没给文字），就 exists:true。
+  // 这是**验收闸门自己**的假通过，比任何一处误报都严重。
+  assert.match(SRC, /_assertJS\(_bsel \|\| "", call\.text \|\| "", call\.node != null \|\| call\.index != null \|\| !!call\.selector\)/,
+    "node/index 已经翻译成 _bsel 了，assert 必须用它");
+  const js = extractFn("_assertJS");
+  assert.match(js, /if \(HAD_LOCATOR && !SEL\) return JSON\.stringify\(\{ exists:false/,
+    "给了定位符却解析不出来 → 直接判不存在");
+  assert.match(js, /target_unresolved/);
+  // 但纯文本断言仍然正当：一个定位符都没给、只找那句话，'body *' 是对的。
+  assert.match(js, /SEL \|\| 'body \*'/, "纯文本断言不该被误伤");
+});
+
 // ---- 写入落空要有用户侧的出口 ----
 test("尝试写了没落盘时，结局里必须留下 writes_failed", () => {
   const loop = extractFn("_runAgenticLoop");

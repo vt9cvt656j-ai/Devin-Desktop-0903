@@ -31664,10 +31664,17 @@ async function _resolveBrowserSelector(rawSel) {
   return null; // genuinely not found after polling
 }
 
-function _assertJS(selector, text) {
+/// @param hadLocator 调用方**给了**定位符（selector / node / index）。
+///   给了却解析不出目标 → 直接判不存在，绝不回落到 'body *'。
+///   一个字都没给、只给了 text → 'body *' 是正当的（纯文本断言就是全页找那句话）。
+function _assertJS(selector, text, hadLocator = false) {
   return `(() => {
     try {
       var SEL = ${JSON.stringify(selector || "")}, TXT = ${JSON.stringify(text || "")};
+      var HAD_LOCATOR = ${hadLocator ? "true" : "false"};
+      // 给了定位符却是空串：node/index 没能翻成选择器，或选择器被清成了空。
+      // 这时回落到全页匹配就是凭空通过——直接如实说目标没解析出来。
+      if (HAD_LOCATOR && !SEL) return JSON.stringify({ exists:false, visible:false, reason:'target_unresolved', note:'给了 node/index/selector 但没能解析成目标；先用 nodes 拿当前节点号，别用这次结果下结论' });
       var clean = function(s){ s=String(s||''); var out='', sp=false; for (var k=0;k<s.length;k++){ var ch=s[k]; if (ch===' '||ch==='\\n'||ch==='\\t'||ch==='\\r'){ if(!sp){ out+=' '; sp=true; } } else { out+=ch; sp=false; } } return out.trim(); };
       var pool; try { pool = Array.prototype.slice.call(document.querySelectorAll(SEL || 'body *'), 0, 4000); } catch(e){ return JSON.stringify({ error:'无效 selector: '+SEL }); }
       var want = TXT ? TXT.toLowerCase() : '';
@@ -59026,7 +59033,11 @@ return { type: call.type, path: call.query || "", content: `[失败] ${call.type
         else if (act === "network") state = await backend.invoke("browser_eval", { script: _NETWORK_CAPTURE_JS });
         else if (act === "inspect") state = await backend.invoke("browser_eval", { script: _visualInspectJS(call.selector || "") });
         else if (act === "nodes") state = await backend.invoke("browser_eval", { script: _NODES_EXTRACT_JS });
-        else if (act === "assert") state = await backend.invoke("browser_eval", { script: _assertJS(call.selector || "", call.text || "") });
+        // assert 要用翻译过的 _bsel（node:N / index:N 已经在上面转成 CSS 了）。
+        // 此前这里只读 call.selector：模型写 assert(node:12) 时选择器是空的，
+        // 而 _assertJS 里 `SEL || 'body *'` 会去匹配全页元素——于是**凭空通过**。
+        // 这是验收闸门自己的洞，比任何一处误报都严重。
+        else if (act === "assert") state = await backend.invoke("browser_eval", { script: _assertJS(_bsel || "", call.text || "", call.node != null || call.index != null || !!call.selector) });
         else if (act === "check") state = await backend.invoke("browser_eval", { script: _checkJS() });
         else if (act === "cookies") state = await backend.invoke("browser_cookies", { domain: call.text || null });
         else if (act === "storage") state = await backend.invoke("browser_storage", { storageType: call.key || "local" });
