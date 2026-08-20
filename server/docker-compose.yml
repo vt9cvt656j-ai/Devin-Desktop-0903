@@ -52,11 +52,15 @@ services:
   backend: &backend
     build: .
     restart: unless-stopped
-    # The server does not currently expose a graceful shutdown hook. Keep
-    # replacement downtime bounded instead of waiting Docker's 10s default;
-    # this also keeps nginx's loopback upstream from returning a long burst of
-    # 502s during routine image updates.
-    stop_grace_period: 2s
+    # 收到 SIGTERM 之后要给它时间把手里的活干完，见 src/shutdown.rs。
+    #
+    # 原来是 2 秒，配的是「没有优雅退出」那个前提：既然一秒都等不到，不如早点杀掉、
+    # 把 nginx 那边的 502 窗口压短。现在进程会先停止接新连接、再等最多 20 秒让还没结算完
+    # 的请求把 bill(...) 跑完——2 秒会在它刚开始等的时候就 SIGKILL，等于优雅退出白写。
+    #
+    # 25 > 20，留一点余量给收尾日志。而部署本身早就不靠这个窗口了：蓝绿会先把流量切走、
+    # 等旧端口排空，再来停这个容器，所以这几十秒不对用户可见。
+    stop_grace_period: 25s
     # Hardest containment on the only public-facing service: no privilege escalation,
     # and drop ALL Linux capabilities (a Rust/axum HTTP server on :8080 needs none —
     # no <1024 bind, no chown/setuid). If this is ever RCE'd, the shell is unprivileged

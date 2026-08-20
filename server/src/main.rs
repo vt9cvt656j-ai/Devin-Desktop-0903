@@ -19,6 +19,7 @@ mod error;
 mod game;
 mod handoff;
 mod health;
+mod shutdown;
 mod route_health;
 mod integrations;
 mod knowledge;
@@ -510,7 +511,15 @@ async fn main() -> anyhow::Result<()> {
 
     let listener = tokio::net::TcpListener::bind(&bind_addr).await?;
     tracing::info!("Michael 总后台 listening on http://{bind_addr}");
-    axum::serve(listener, app).await?;
+    // 两段等待，缺一不可（理由见 shutdown.rs 顶部）：
+    //   · with_graceful_shutdown 停止接新连接、等在途 HTTP 连接结束；
+    //   · drain 再等**结算任务**——它们是 spawn 出去的，不挂在任何连接上，
+    //     服务器关掉之后照样在跑，而进程一 return 就全没了，那一笔的计费就此丢失。
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown::signal())
+        .await?;
+    shutdown::drain(std::time::Duration::from_secs(20)).await;
+    tracing::info!("已优雅退出");
     Ok(())
 }
 

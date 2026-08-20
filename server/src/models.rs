@@ -4685,9 +4685,11 @@ async fn record_usage_row(
     free_milli_points_spent: i64,
     tokens: &BillTokens,
 ) {
+    // model_id 走子查询，理由同下面付费那条：线路被删之后直接绑 conn_id 会撞外键，
+    // 这一行用量就永远记不进去。NULL 是这张表既有的「线路已删」表示法。
     if let Err(error) = sqlx::query(
         "INSERT INTO model_usage (user_id, model_id, cost_cents, prompt_tokens, completion_tokens, cached_tokens, cache_creation_tokens, model_name, estimated, request_id, ide_mode, is_tool_turn, emitted_tool, free_milli_points_spent) \
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)",
+         VALUES ($1,(SELECT id FROM models WHERE id = $2),$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)",
     )
     .bind(uid)
     .bind(conn_id)
@@ -4966,14 +4968,23 @@ pub fn admit_billing(
 }
 
 /// 一笔结算的结局。resettle/恢复 worker 据此决定队列行是了结还是累加 attempts。
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+///
+/// 不再是 Copy：Deferred 现在带着失败原因（String），而那正是死信行唯一的线索来源。
+#[derive(Clone, PartialEq, Eq, Debug)]
 pub(crate) enum BillOutcome {
     /// 扣费成功（含免费池扣点、零费记账、付费提交）。
     Settled,
     /// 认领冲突：这笔已被扣过（模糊提交或并发恢复），跳过——**绝不双扣**。
     AlreadySettled,
     /// 结算失败，已（尝试）入队待恢复。
-    Deferred,
+    ///
+    /// 带上失败点和原因：死信行是留给**人工对账**的，而原因原来只写进 tracing 日志——
+    /// 那是易失的，容器一换就没了（线上那笔 12 分的死账就是这样，两个容器里都查不到原因）。
+    /// 队列行是唯一活下来的东西，它必须自己说得清为什么失败。
+    Deferred {
+        stage: &'static str,
+        error: String,
+    },
 }
 
 /// 正常计费入口：**保持原签名不变**（4 个调用点与源断言零改动）。每次生成唯一 settlement_id，
@@ -5053,22 +5064,6 @@ async fn bill_inner(
         stage,
     };
 
-    let mut tx = match state.db.begin().await {
-        Ok(tx) => tx,
-        Err(error) => {
-            tracing::error!(
-                %error, %uid, %conn_id, cost, use_quota, free_pool,
-                request_id = tokens.request_id.as_deref().unwrap_or("-"),
-                model = %tokens.model_name,
-                event = "billing_settlement_failed",
-                "failed to begin billing transaction (call served, NOT charged)"
-            );
-            if !from_recovery {
-                crate::settlement::queue(state, queue_input("begin_tx")).await;
-            }
-            return BillOutcome::Deferred;
-        }
-    };
     let requested_cost = cost.max(0);
     // Free models bill against the daily points pool, never quota or wallet. Done here rather
     // than at each call site so no biller can forget it: every path that charges a free model
@@ -5102,17 +5097,44 @@ async fn bill_inner(
             // cost_cents stays the REAL provider cost (so operator-side reporting is honest);
             // free_points_spent carries what the user actually paid, in 点.
             record_usage_row(state, uid, conn_id, requested_cost, spent, tokens).await;
-            let _ = tx.rollback().await;
             return BillOutcome::Settled;
         }
         if !free_fallback_to_paid() {
             // 开关关掉时保持老行为：池子空了也只走池子，扣不到就记 0。
             record_usage_row(state, uid, conn_id, requested_cost, 0, tokens).await;
-            let _ = tx.rollback().await;
             return BillOutcome::Settled;
         }
         // 落下去，按普通付费调用结算（quota → 钱包）。
     }
+    // ── 事务从这里才开始（付费路径专用）─────────────────────────────────────
+    //
+    // **不能在函数开头就 begin。** 免费池那条分支里这个事务一次都用不到：
+    // try_spend_free_points 和 record_usage_row 都拿 `&state.db` 各自去要连接，
+    // 而 BEGIN 已经发出去了——于是一笔免费结算同时占着 3 条连接，其中一条纯粹是空转。
+    //
+    // 池子只有 20 条（config.rs 的默认值）。够多的免费结算同时发生时，20 条会被空事务
+    // 占满、20 个任务都在等第 21 条，一起挂到 sqlx 默认的 30 秒 acquire 超时——而这段时间里
+    // 每一个 chat 请求的结算都在排队。这不是理论：MAX_INFLIGHT_PER_USER=8，几个用户
+    // 并发跑免费模型就能凑够。
+    //
+    // 改成用得着才开：免费分支根本不碰数据库事务，付费分支照旧。
+    let mut tx = match state.db.begin().await {
+        Ok(tx) => tx,
+        Err(error) => {
+            tracing::error!(
+                %error, %uid, %conn_id, cost, use_quota, free_pool,
+                request_id = tokens.request_id.as_deref().unwrap_or("-"),
+                model = %tokens.model_name,
+                event = "billing_settlement_failed",
+                "failed to begin billing transaction (call served, NOT charged)"
+            );
+            if !from_recovery {
+                crate::settlement::queue(state, queue_input("begin_tx")).await;
+            }
+            return BillOutcome::Deferred { stage: "begin_tx", error: error.to_string() };
+        }
+    };
+
     // ── 幂等认领（付费路径专用）───────────────────────────────────────────────
     // 到这里说明这笔要走付费结算（不是免费池扣点）。往账本认领这个 settlement_id：
     //   · 正常调用 settlement_id 每次新生成 → 必然插入成功（1 行）→ 继续扣费；
@@ -5145,7 +5167,7 @@ async fn bill_inner(
             if !from_recovery {
                 crate::settlement::queue(state, queue_input("claim")).await;
             }
-            return BillOutcome::Deferred;
+            return BillOutcome::Deferred { stage: "claim", error: error.to_string() };
         }
     }
     // 亚分零头：免费模型常按次计价到亚分（$0.003 = 3000 micro-USD），而 requested_cost 是
@@ -5212,7 +5234,7 @@ async fn bill_inner(
                 if !from_recovery {
                     crate::settlement::queue(state, queue_input("lock_balances")).await;
                 }
-                return BillOutcome::Deferred;
+                return BillOutcome::Deferred { stage: "lock_balances", error: error.to_string() };
             }
         };
         match balances {
@@ -5255,12 +5277,22 @@ async fn bill_inner(
             if !from_recovery {
                 crate::settlement::queue(state, queue_input("deduct")).await;
             }
-            return BillOutcome::Deferred;
+            return BillOutcome::Deferred { stage: "deduct", error: error.to_string() };
         }
     }
+    // model_id 走子查询而不是直接绑 $2：线路被删掉时它取到 NULL，而不是撞外键。
+    //
+    // 后台删掉一条线路之后，这条线路上**还没结算完**的每一笔都再也插不进来——
+    // `model_usage_model_id_fkey` 每次都拒，补扣重试到上限，钱就这么静悄悄没了。
+    // 线上抓到的就是这一笔：settlement 2fa0de51（12 分，qwen3.8-max），它指向的线路
+    // 7552e2cc 已经不在 models 表里，于是它永远补不上。
+    //
+    // NULL 正是这张表**本来就在用**的「线路已删」表示法：外键是 ON DELETE SET NULL，
+    // 线上已经有 20708 行是这样。model_name 是 NOT NULL 的独立列，所以是哪个模型照样查得到，
+    // 账单和用量统计一个字都不少。
     if let Err(error) = sqlx::query(
         "INSERT INTO model_usage (user_id, model_id, cost_cents, prompt_tokens, completion_tokens, cached_tokens, cache_creation_tokens, model_name, estimated, request_id, ide_mode, is_tool_turn, emitted_tool, settlement_id) \
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)",
+         VALUES ($1,(SELECT id FROM models WHERE id = $2),$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)",
     )
     .bind(uid)
     .bind(conn_id)
@@ -5289,7 +5321,7 @@ async fn bill_inner(
         if !from_recovery {
             crate::settlement::queue(state, queue_input("insert_usage")).await;
         }
-        return BillOutcome::Deferred;
+        return BillOutcome::Deferred { stage: "insert_usage", error: error.to_string() };
     }
     if let Err(error) = tx.commit().await {
         // 提交失败 ≈ 事务回滚（没扣到钱）——入队补扣。唯一的例外是「模糊提交」：COMMIT 其实
@@ -5305,7 +5337,7 @@ async fn bill_inner(
         if !from_recovery {
             crate::settlement::queue(state, queue_input("commit")).await;
         }
-        return BillOutcome::Deferred;
+        return BillOutcome::Deferred { stage: "commit", error: error.to_string() };
     }
     BillOutcome::Settled
 }
@@ -7620,7 +7652,12 @@ pub async fn chat_completions(
         // finishes billing. Dropping the guard at handler return would have left the
         // whole streaming window — the case that actually matters — uncounted.
         let inflight = inflight_guard;
+        // 退出时要等得到这一笔。泵任务是 spawn 出去的、不挂在连接上，所以
+        // with_graceful_shutdown 等不到它——没有这个 guard，SIGTERM 会把还没执行的
+        // bill(...) 连任务一起杀掉：token 已经烧了、运营方账单已经记了，而用户额度分文未动。
+        let _settle = crate::shutdown::SettleGuard::new();
         tokio::spawn(async move {
+            let _settle = _settle;
             let _inflight = inflight;
             use futures_util::StreamExt;
             let mut upstream = Box::pin(resp.bytes_stream());
@@ -8511,91 +8548,126 @@ pub async fn image_generations(
         .await
         .unwrap_or_else(|_| json!({"error": "上游返回非 JSON"}));
 
-    // Async task support: some upstreams queue large-size requests and return a task_id.
-    if data.get("status").and_then(|s| s.as_str()) == Some("queued")
-        || data.get("status").and_then(|s| s.as_str()) == Some("running")
-    {
-        if let Some(task_id) = data
-            .get("task_id")
-            .and_then(|t| t.as_str())
-            .map(String::from)
+    // 轮询和计费整块搬进一个 spawn 出去的任务，理由和流式那条路一样：**客户端断开时
+    // 计费不能跟着消失**。
+    //
+    // 上游会把大尺寸请求排队，先回 {"status":"queued","task_id":...}，这里最多轮询
+    // 60 × 3 秒 = 180 秒；而 IDE 的响应头耐心是 60 秒。客户端一断，axum 就丢弃整个 handler
+    // future，轮询循环和它后面的 bill(...) 一起消失——上游那张图照常生成完、照常计在运营方
+    // 账上，而 model_usage 里一行都没有，用户额度分文未动。
+    //
+    // spawn 出去之后：handler 被丢弃只会丢掉 JoinHandle，任务本身照常跑完并结账。
+    // SettleGuard 让退出时也等得到它（见 shutdown.rs）。
+    let data = {
+        let st = state.clone();
+        let conn_task = conn.clone();
+        let conn_key_task = conn_key.clone();
+        let model_id_task = model_id.clone();
+        let request_id_task = request_id.clone();
+        let settle = crate::shutdown::SettleGuard::new();
+        let handle = tokio::spawn(async move {
+            let _settle = settle;
+            let state = st;
+            let conn = conn_task;
+            let conn_key = conn_key_task;
+            let model_id = model_id_task;
+            let request_id = request_id_task;
+            let mut data = data;
+        // Async task support: some upstreams queue large-size requests and return a task_id.
+        if data.get("status").and_then(|s| s.as_str()) == Some("queued")
+            || data.get("status").and_then(|s| s.as_str()) == Some("running")
         {
-            let poll_url = format!(
-                "{}/images/generations/{}",
-                api_base(&conn.base_url),
-                task_id
-            );
-            for _ in 0..60 {
-                tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-                if let Ok(pr) = GW_HTTP
-                    .get(&poll_url)
-                    .header("Authorization", format!("Bearer {}", conn_key))
-                    .timeout(std::time::Duration::from_secs(15))
-                    .send()
-                    .await
-                {
-                    if let Ok(pv) = pr.json::<serde_json::Value>().await {
-                        let st = pv.get("status").and_then(|s| s.as_str()).unwrap_or("");
-                        if st == "failed" {
-                            data = pv;
-                            break;
-                        }
-                        if st == "completed" {
-                            data = pv;
-                            break;
+            if let Some(task_id) = data
+                .get("task_id")
+                .and_then(|t| t.as_str())
+                .map(String::from)
+            {
+                let poll_url = format!(
+                    "{}/images/generations/{}",
+                    api_base(&conn.base_url),
+                    task_id
+                );
+                for _ in 0..60 {
+                    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                    if let Ok(pr) = GW_HTTP
+                        .get(&poll_url)
+                        .header("Authorization", format!("Bearer {}", conn_key))
+                        .timeout(std::time::Duration::from_secs(15))
+                        .send()
+                        .await
+                    {
+                        if let Ok(pv) = pr.json::<serde_json::Value>().await {
+                            let st = pv.get("status").and_then(|s| s.as_str()).unwrap_or("");
+                            if st == "failed" {
+                                data = pv;
+                                break;
+                            }
+                            if st == "completed" {
+                                data = pv;
+                                break;
+                            }
                         }
                     }
                 }
             }
         }
-    }
 
-    // Fix relative URLs: some upstreams return "/api/v1/gen/..." instead of full URLs.
-    if let Some(arr) = data.get_mut("data").and_then(|d| d.as_array_mut()) {
-        let origin = conn.base_url.trim_end_matches('/');
-        for item in arr.iter_mut() {
-            if let Some(u) = item.get("url").and_then(|v| v.as_str()).map(String::from) {
-                if u.starts_with('/') {
-                    item["url"] = json!(format!("{}{}", origin, u));
+        // Fix relative URLs: some upstreams return "/api/v1/gen/..." instead of full URLs.
+        if let Some(arr) = data.get_mut("data").and_then(|d| d.as_array_mut()) {
+            let origin = conn.base_url.trim_end_matches('/');
+            for item in arr.iter_mut() {
+                if let Some(u) = item.get("url").and_then(|v| v.as_str()).map(String::from) {
+                    if u.starts_with('/') {
+                        item["url"] = json!(format!("{}{}", origin, u));
+                    }
                 }
             }
         }
-    }
 
-    let has_error = data.get("error").is_some()
-        || data.get("status").and_then(|s| s.as_str()) == Some("failed");
+        let has_error = data.get("error").is_some()
+            || data.get("status").and_then(|s| s.as_str()) == Some("failed");
 
-    // Bill per image: per_call_cents × n_images (if set), else 30分 × n_images × 倍率.
-    let n_images = data
-        .get("data")
-        .and_then(|d| d.as_array())
-        .map(|a| a.len() as f64)
-        .unwrap_or(0.0);
-    if !has_error && n_images > 0.0 {
-        let cost = if conn.per_call_cents > 0 {
-            (conn.per_call_cents as f64 * n_images).round().min(5000.0) as i64
-        } else {
-            (30.0 * n_images * conn.rate).round().min(5000.0) as i64
-        };
-        if cost > 0 {
-            bill(
-                &state,
-                uid,
-                conn.id,
-                cost,
-                use_quota,
-                &BillTokens {
-                    model_name: model_id.clone(),
-                    estimated: true,
-                    request_id: request_id.clone(),
-                    ..Default::default()
-                },
-                false,
-                0,
-            )
-            .await;
+        // Bill per image: per_call_cents × n_images (if set), else 30分 × n_images × 倍率.
+        let n_images = data
+            .get("data")
+            .and_then(|d| d.as_array())
+            .map(|a| a.len() as f64)
+            .unwrap_or(0.0);
+        if !has_error && n_images > 0.0 {
+            let cost = if conn.per_call_cents > 0 {
+                (conn.per_call_cents as f64 * n_images).round().min(5000.0) as i64
+            } else {
+                (30.0 * n_images * conn.rate).round().min(5000.0) as i64
+            };
+            if cost > 0 {
+                bill(
+                    &state,
+                    uid,
+                    conn.id,
+                    cost,
+                    use_quota,
+                    &BillTokens {
+                        model_name: model_id.clone(),
+                        estimated: true,
+                        request_id: request_id.clone(),
+                        ..Default::default()
+                    },
+                    false,
+                    0,
+                )
+                .await;
+            }
         }
-    }
+            data
+        });
+        match handle.await {
+            Ok(v) => v,
+            Err(err) => {
+                tracing::error!(%err, "生图轮询任务异常结束");
+                return Err(AppError::internal("生图任务异常结束"));
+            }
+        }
+    };
 
     Ok(Json(data).into_response())
 }
@@ -9494,6 +9566,37 @@ mod billing_tests {
     }
 
     #[test]
+    /// 后台删掉一条线路，不能把那条线路上没结算完的钱一起弄没。
+    ///
+    /// `model_usage.model_id` 外键指向 models(id)。线路被删之后，指向它的那笔补扣每次
+    /// INSERT 都撞外键，重试到上限、进死信、钱静悄悄没了。线上真抓到过：settlement
+    /// 2fa0de51（12 分，qwen3.8-max），线路 7552e2cc 已不在表里，last_error 明写
+    /// `violates foreign key constraint "model_usage_model_id_fkey"`。
+    ///
+    /// 修法是让 model_id 在线路已删时落 NULL —— 这张表本来就是这么表示的（外键是
+    /// ON DELETE SET NULL，线上已有两万多行如此），model_name 是独立的 NOT NULL 列，
+    /// 是哪个模型照样查得到。
+    #[test]
+    fn a_deleted_route_must_not_strand_its_unsettled_charges() {
+        let src = include_str!("models.rs");
+        let production = &src[..src.find("mod billing_tests").expect("tests module")];
+        // 生产里有**两条**写 model_usage 的路径（免费点一条、付费结算一条），两条都要修：
+        // 只修一条的话，另一条上的漏收会以完全一样的方式静悄悄发生。
+        let mut checked = 0;
+        let mut rest = production;
+        while let Some(at) = rest.find("INSERT INTO model_usage") {
+            let stmt = &rest[at..(at + 700).min(rest.len())];
+            assert!(
+                stmt.contains("VALUES ($1,(SELECT id FROM models WHERE id = $2),$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)"),
+                "第 {} 条 model_usage 插入没走子查询：线路一删，这条路径上的钱就永远补不回来",
+                checked + 1,
+            );
+            checked += 1;
+            rest = &rest[at + "INSERT INTO model_usage".len()..];
+        }
+        assert_eq!(checked, 2, "生产里应有两条 model_usage 插入路径（免费点 + 付费结算）");
+    }
+
     /// 结算失败 = 用户被服务了却没扣到钱。日志必须能对账到「谁、哪笔请求、多少钱」，否则一次
     /// DB 抖动就是一笔查无对象的漏收。bill() 是 fire-and-forget，日志是唯一的追账凭证，所以每条
     /// 致命失败分支都要带 uid/conn_id/request_id + 统一事件标记，供告警与重对账脚本 grep。
@@ -14978,6 +15081,81 @@ mod power_route_tests {
         assert_eq!(
             effective_cache_prices("claude-opus-5", 15.0, 0.5, 3.75, false, true),
             (0.0, 0.0),
+        );
+    }
+
+    /// 免费池那条路不许握着一个用不到的事务再去要更多连接。
+    ///
+    /// 事务原来在 bill_inner 开头就 begin，而免费分支里它一次都用不到：
+    /// try_spend_free_points 和 record_usage_row 都拿 `&state.db` 各自去要连接。
+    /// 于是一笔免费结算同时占 3 条连接、其中一条纯空转；池子只有 20 条，够多的免费结算
+    /// 同时发生就会互相等到 sqlx 默认的 30 秒 acquire 超时——那段时间里每一个 chat 请求的
+    /// 结算都在排队。
+    #[test]
+    fn 免费结算不得握着空事务去抢连接() {
+        let src = dispatch_src();
+        let body = src
+            .split("async fn bill_inner")
+            .nth(1)
+            .expect("bill_inner 不见了");
+        let code: String = body
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let begin = code.find("state.db.begin()").expect("事务没了？");
+        let free_branch = code
+            .find("if free_pool && !from_recovery {")
+            .expect("免费分支不见了");
+        assert!(
+            begin > free_branch,
+            "事务仍然在免费分支之前就 begin —— 免费结算会握着一条空转的连接再去要两条",
+        );
+
+        // 免费分支里不该再有 rollback：那时候根本还没有事务。
+        let free_end = code[free_branch..]
+            .find("state.db.begin()")
+            .map(|i| free_branch + i)
+            .unwrap_or(code.len());
+        assert!(
+            !code[free_branch..free_end].contains("tx.rollback()"),
+            "免费分支里还在 rollback 一个尚未存在的事务",
+        );
+    }
+
+    /// 生图的轮询和计费不许挂在客户端连接上。
+    ///
+    /// 上游会把大尺寸请求排队，这里最多轮询 180 秒，而 IDE 的响应头耐心是 60 秒。
+    /// 客户端一断，axum 丢弃整个 handler future，轮询循环和它后面的 bill(...) 一起消失
+    /// ——图照常生成完、照常计在运营方账上，而 model_usage 里一行都没有。
+    /// 流式那条路早就把计费搬进 spawn 出去的泵任务了，这条一直没有。
+    #[test]
+    fn 生图的计费不能跟着客户端断开一起消失() {
+        let src = dispatch_src();
+        let region = src
+            .split("轮询和计费整块搬进一个 spawn 出去的任务")
+            .nth(1)
+            .expect("生图轮询没有搬进 spawn —— 客户端一断计费就消失");
+        let region = &region[..region.len().min(6000)];
+        // **先剥注释再断言。** 上面那段解释里逐字写着 `bill(...)`，不剥的话它的位置比
+        // spawn 还靠前，下面那条顺序断言会拿注释当代码、给出一个假的失败。
+        // 这个坑在本仓库反复出现，注释里也记了好几次。
+        let code: String = region
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(code.contains("tokio::spawn"), "没有真的 spawn 出去");
+        // bill 必须在任务**里面**，否则搬了个寂寞。
+        let spawn_at = code.find("tokio::spawn").unwrap();
+        let bill_at = code.find("bill(").expect("计费不在这一段里了");
+        assert!(bill_at > spawn_at, "bill 排在 spawn 之前，还是会跟着 handler 一起被丢弃");
+        // 退出时也要等得到它。
+        assert!(
+            code.contains("SettleGuard::new()"),
+            "没有登记结算在途，SIGTERM 会把它连同计费一起杀掉",
         );
     }
 

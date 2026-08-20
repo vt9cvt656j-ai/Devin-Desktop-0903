@@ -871,7 +871,11 @@ pub async fn webhook(
                     post_commit.push((
                         uid,
                         "order_paid",
-                        json!({ "via": "stripe", "product": label, "quantity": quantity }),
+                        // session 一并带上：提交之后要靠它精确找到这一笔订单去发回执。
+                        json!({
+                            "via": "stripe", "product": label, "quantity": quantity,
+                            "session": obj.get("id").and_then(|v| v.as_str()).unwrap_or_default(),
+                        }),
                     ));
                 }
             }
@@ -895,7 +899,10 @@ pub async fn webhook(
                         post_commit.push((
                             uid,
                             "order_paid",
-                            json!({ "via": "stripe", "product": label, "quantity": quantity }),
+                            json!({
+                                "via": "stripe", "product": label, "quantity": quantity,
+                                "session": session.get("id").and_then(|v| v.as_str()).unwrap_or_default(),
+                            }),
                         ));
                     }
                 }
@@ -1135,10 +1142,101 @@ pub async fn webhook(
     tx.commit().await?;
 
     for (uid, kind, payload) in post_commit {
+        // 付款成功要发回执。**必须在提交之后**——事务里发信的话，事务一回滚就成了
+        // 「钱没扣、回执已经发出去」。
+        //
+        // 在这之前 receipt::purchase_html 在整个 server/src 的生产代码里**零调用点**：
+        // 全仓构造 Receipt 的三处都在测试模块里。也就是说付了钱的用户手里没有任何
+        // 金额/额度/有效期/订单号的凭据，而退订页明确写着「回执照发」。
+        //
+        //（这段注释刻意不写出那个 cfg 属性的字面量：本文件里有一条测试用它来切分生产代码，
+        // 注释里出现一次就会把它的切点提前，让断言在错误的范围上求值。）
+        if kind == "order_paid" {
+            let session = payload
+                .get("session")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_owned();
+            if !session.is_empty() {
+                let st = state.clone();
+                // 分离出去：发信失败绝不能让 webhook 回非 2xx —— 那会让 Stripe 一直重投一个
+                // **已经完成**的事件，而重投什么都改变不了（幂等认领会直接跳过）。
+                tokio::spawn(async move { send_purchase_receipt(&st, uid, &session).await });
+            }
+        }
         crate::realtime::record_event(&state, Some(uid), kind, payload).await;
     }
 
     Ok(Json(json!({ "ok": true })))
+}
+
+/// 给刚付款成功的那一笔发一封回执。
+///
+/// 只读已提交的订单行，所以必须在事务提交之后调用。任何一步取不到就安静放弃：
+/// 回执是锦上添花，缺了不该影响入账，更不该让 webhook 回非 2xx。
+async fn send_purchase_receipt(state: &AppState, uid: uuid::Uuid, session: &str) {
+    if !state.cfg.mail_enabled() {
+        return;
+    }
+    let row: Option<(String, Option<String>, Option<i32>, i64, i64, Option<String>, uuid::Uuid)> =
+        sqlx::query_as(
+            "SELECT COALESCE(o.email, u.email), o.plan, o.duration_days, o.credits_cents, \
+                    COALESCE(NULLIF(o.charged_cents, 0), o.amount_cents), o.charged_currency, o.id \
+               FROM orders o LEFT JOIN users u ON u.id = o.user_id \
+              WHERE o.stripe_session_id = $1 LIMIT 1",
+        )
+        .bind(session)
+        .fetch_optional(&state.db)
+        .await
+        .ok()
+        .flatten();
+    let Some((email, plan, days, credits_cents, charged, currency, order_id)) = row else {
+        tracing::warn!(%uid, session, "找不到订单行，回执跳过");
+        return;
+    };
+    if email.trim().is_empty() {
+        return;
+    }
+
+    let cur = currency.unwrap_or_else(|| "usd".into()).to_uppercase();
+    let symbol = match cur.as_str() {
+        "CNY" => "¥",
+        "USD" => "$",
+        _ => "",
+    };
+    let amount = format!("{symbol}{:.2}", charged as f64 / 100.0);
+    let product = plan.clone().unwrap_or_else(|| "额度充值".into());
+    let granted = if credits_cents > 0 {
+        // 额度是按真实计费分存的，展示要折成用户看得懂的面值（settings 里那个分母）。
+        format!(
+            "${:.2} 额度",
+            credits_cents as f64 / crate::settings::raw_cents_per_credit_usd().max(1) as f64
+        )
+    } else {
+        format!("{product} 会员")
+    };
+    let duration = days.filter(|d| *d > 0).map(|d| format!("{d} 天"));
+    let base = state.cfg.public_base.trim_end_matches('/');
+    let html = crate::receipt::purchase_html(&crate::receipt::Receipt {
+        product: &product,
+        amount: &amount,
+        granted: &granted,
+        duration: duration.as_deref(),
+        order_id: &order_id.to_string(),
+        console_url: &format!("{base}/billing"),
+        logo_url: &format!("{base}/api/logo.png"),
+    });
+    if let Err(err) = crate::email::send_mail(
+        &state.cfg,
+        &email,
+        &format!("购买回执 · {product}"),
+        &html,
+        true,
+    )
+    .await
+    {
+        tracing::warn!(reason = %err.msg, %uid, "购买回执发送失败");
+    }
 }
 
 /// Statuses from which a subscription never comes back, so entitlement should end.
@@ -1696,6 +1794,41 @@ async fn grant(
 
 #[cfg(test)]
 mod tests {
+    /// 付款成功要真的发出回执。
+    ///
+    /// receipt::purchase_html 此前在整个 server/src 的生产代码里**零调用点**——付了钱的
+    /// 用户手里没有任何金额/额度/有效期/订单号的凭据，而退订页明确承诺「回执照发」。
+    #[test]
+    fn a_paid_order_actually_sends_a_receipt() {
+        let src = include_str!("stripe.rs");
+        let production = src.split_once("#[cfg(test)]").expect("测试模块").0;
+
+        assert!(
+            production.contains("receipt::purchase_html"),
+            "回执模块仍然没有任何生产调用点",
+        );
+        // 必须在**提交之后**发：事务里发信的话，事务一回滚就成了「钱没扣、回执已发」。
+        let commit = production
+            .find("for (uid, kind, payload) in post_commit")
+            .expect("post-commit 循环不见了");
+        let send = production
+            .find("send_purchase_receipt")
+            .expect("没有发回执的调用");
+        assert!(send > commit, "回执发在提交之前，回滚时会发出一封假回执");
+        // 发信失败不许让 webhook 回非 2xx —— Stripe 会一直重投一个已经完成的事件。
+        //
+        // 比位置，**不切片**：`find` 返回的是字节偏移，而这一段几乎全是中文注释，
+        // 按字节切窗口不但会短得离谱，还可能落在多字节字符中间直接 panic。
+        let spawn_at = production[commit..]
+            .find("tokio::spawn")
+            .map(|i| commit + i)
+            .expect("回执没有分离出去，发信失败会把 webhook 拖成非 2xx");
+        assert!(
+            spawn_at < send,
+            "spawn 排在发回执之后，等于没有分离",
+        );
+    }
+
     /// 取消一条订阅，不许把账号上别的订阅的额度一起清零。
     ///
     /// 额度是加法累积的（apply_plan：new_total = cur_total + total），一个账号可以由多笔
