@@ -49729,8 +49729,17 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
             ...executionEvidence,
             purpose: call.purpose || "",
             implementationVersion: _implOps,
+            // 空跑不算验证——这条腿此前漏了这一判，而收尾闸门读的正是这一条。
+            //
+            // 另一条腿（上面那段）已经在查 _verifierRanNoTests：一个用例都没跑的绿色不是验证，
+            // 它不盖章、还会明确告诉模型「[未构成验证]」。可这里只看「是不是公认的验证命令
+            // + 退出码 0」就盖 verifierRecognized，而 _evidenceCertifies 认的就是这个戳。
+            // 于是 `npm test -- --passWithNoTests`、pytest 收集到 0 个用例、jest 找不到测试文件，
+            // 全都退出 0、命令形态也认得——照样拿到「已验证」。这是这个产品最不该有的那种洞：
+            // 把没跑过的说成跑过了。两侧用同一个判据、同一份输出。
             verifierRecognized: (call.type === "cmd" || call.type === "termtask")
-              && _isRecognizedVerifierCommand(call.command, run?.stack),
+              && _isRecognizedVerifierCommand(call.command, run?.stack)
+              && !_verifierRanNoTests(`${result?.stdout || ""}\n${result?.stderr || ""}\n${result?.content || ""}`),
             // Exit status travels with the evidence: the finish gate matches on command
             // shape, so it cannot tell a green build from a red one without this.
             ok: _toolExecutionSucceeded(call, result),
