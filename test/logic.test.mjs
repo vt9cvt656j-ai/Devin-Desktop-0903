@@ -28878,6 +28878,18 @@ test("收尾评审判定没实现要求时,结论落进运行状态并变成一�
   assert.match(fd.send, /别直接动手/,
     "超出本轮范围的问题不许自动开修——修不修是用户的事");
 
+  // 排序也是判据的一部分：卡片名额和模型自己给的选项共享，而第一张还会变成输入框里的
+  // 灰字预测。「方向反了」排在「接着上次继续」后面就会被挤掉——沿着错方向继续，正是
+  // 这条机制要治的病。
+  const both = gen({ _lastRunState: { outcome: "partial", task: "x", result: "",
+    incompleteReason: "build_failing", mutatedFileTypes: new Set(["src"]), updatedAt: now,
+    wrapUp: { instruction: "", direction: "我要的是整条链路打通", findings: [] } } });
+  const iDir = both.findIndex((c) => /真正想做/.test(c.label));
+  const iCont = both.findIndex((c) => /修复构建失败/.test(c.label));
+  assert.ok(iDir >= 0 && iCont >= 0, `两张卡都该在，实际拿到：${both.map((c) => c.label).join(" / ")}`);
+  assert.ok(iDir < iCont,
+    "「方向反了」排在「接着继续」后面会被名额挤掉，也拿不到输入框那条灰字预测");
+
   // 落进运行状态那一步。
   const persist = /wrapUp: \(\(\) => \{([\s\S]*?)\}\)\(\),/.exec(SRC);
   assert.ok(persist, "运行状态里没有 wrapUp——评审结论根本到不了卡片那一层");
