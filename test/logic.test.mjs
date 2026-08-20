@@ -6929,8 +6929,11 @@ test("工作区工具的判据来自语义裁决，不是用户话里的关键�
   assert.match(SRC, /const _MODES_WITH_TOOLS = new Set\(\["agent", "explorer", "reviewer", "plan"\]\);/);
   assert.match(SRC, /const hasToolAccess = _MODES_WITH_TOOLS\.has\(effectiveMode\);/);
   // 历次要求的账本不能只在 agent 模式注入——Plan 是最依赖「用户到底要什么」的模式。
-  assert.match(SRC, /const _demandLedgerBlock = \(_MODES_WITH_TOOLS\.has\(effectiveMode\)/,
+  // 但只发已经掉出对话历史的那几条：还在上面摆着的重复列一遍，就是用户点名的
+  // 「重复讲用户的事情」。模式判据挪到了差集那一步。
+  assert.match(SRC, /const _fadedDemands = \(_MODES_WITH_TOOLS\.has\(effectiveMode\)/,
     "切到 Plan/Explorer/Reviewer 就看不见自己历次提过的要求");
+  assert.match(SRC, /已从对话中折叠掉的历次要求/, "标题要说清它只装折叠掉的那部分");
 });
 
 test("装完没装完问后端，不在前端拼一句只有 macOS 认的 shell", () => {
@@ -27009,8 +27012,12 @@ test("记忆卫生·面板保存要连纠错账本一起作废", () => {
 });
 
 test("记忆卫生·需求账本不再自称「全部仍然有效」", () => {
-  const at = SRC.indexOf("const _demandLedgerBlock = (_MODES_WITH_TOOLS");
+  const at = SRC.indexOf("const _fadedDemands = (_MODES_WITH_TOOLS");
   assert.ok(at > 0);
+  // 只发**已经掉出对话历史**的那几条：还在上面对话里摆着的，重复列一遍就是
+  // 「机器把用户刚说过的话再背一遍」——用户点名的「重复讲用户的事情」。
+  assert.match(SRC.slice(at, at + 700), /!_recentText\.includes\(key\)/,
+    "还在历史里的要求不许重复列出来");
   const block = stripJsComments(SRC.slice(at, at + 700));
   assert.doesNotMatch(block, /全部仍然有效/, "历史消息被当成待办清单整本压给模型");
   assert.doesNotMatch(block, /_demandLedger\.slice\(0, -1\)/,
@@ -29230,6 +29237,35 @@ test("删掉一个导出却没查过谁在用，要当场点名", () => {
   assert.equal(labels.removed_unchecked, "查一下被删掉的那几个还有谁在用");
   // 搜索词从已有的工具账本现取，不新增状态。
   assert.match(loop, /run\._toolLedger\?\.entries \|\| \[\]\)\s*\n?\s*\.filter\(\(e\) => \/\^\(\?:search\|find_symbol/);
+});
+
+
+// ---- 重复讲话：同一件事不许在一轮里摆好几遍 ----
+test("用户的要求不在同一轮里被复述四遍", () => {
+  // 用户原话：「容易一直重复讲话，然后重复讲用户的事情……也不去完成 就特别蠢」。
+  // 同一轮里，用户的请求此前有四种说法同时在场：意图块的 restatedTask/Goal/Constraints/
+  // Success criteria、验收契约块（条目就是 constraints ∪ successCriteria，同一份数据）、
+  // 执行状态块尾部回带的原话。模型看到任务被摆了四遍，自然也跟着复述一遍。
+  const blk = extractFn("_agentIntentExecutionBlock");
+  assert.match(blk, /if \(!contractCarriesRequirements\) \{/,
+    "契约块已经承载这两维时，意图块不许再印一遍");
+  // 但契约为空时仍要印——那时没有别处承载它们。
+  const fn = load("_agentIntentExecutionBlock");
+  const p = { intentSemantic: { continuation: "new", restatedTask: "做个登录页", constraints: ["金额用分"], successCriteria: ["能登录成功"] } };
+  assert.match(fn(p, false), /Constraints: 金额用分/, "没有契约时这两维必须还在");
+  assert.doesNotMatch(fn(p, true), /Success criteria:/, "有契约时不许重复");
+  // restatedTask 保留：它是「读懂了你要什么」的确认，契约块里没有对应物。
+  assert.match(fn(p, true), /The request as understood/);
+});
+
+test("历次要求只补对话里已经没有的那几条", () => {
+  // 这块此前把最多 40 条历次消息逐条编号全列出来（40×240 字 ≈ 近万 token），
+  // 而绝大多数就在下面的对话里原样摆着——机器把用户刚说过的话再背一遍给模型听。
+  assert.match(SRC, /const _fadedDemands = \(_MODES_WITH_TOOLS\.has\(effectiveMode\)/);
+  assert.match(SRC, /!_recentText\.includes\(key\)/, "还在历史里的一条都不该重复");
+  assert.match(SRC, /已从对话中折叠掉的历次要求/, "标题要说清它只装折叠掉的那部分");
+  // 差集为空时连表头一起不发。
+  assert.match(SRC, /const _demandLedgerBlock = _fadedDemands\.length\s*\n?\s*\?/);
 });
 
 // ---- 写入落空要有用户侧的出口 ----
