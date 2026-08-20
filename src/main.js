@@ -21800,6 +21800,12 @@ function _aiIntentContextForTurn(session, text, options = {}) {
       locationIntent: _aiIntentText(prior.semantic?.locationIntent, 40),
       constraints: _aiIntentList(prior.semantic?.constraints, 8, 220),
       successCriteria: _aiIntentList(prior.semantic?.successCriteria, 8, 220),
+      // 上一轮它自己申报的「这里我还没读懂」。此前不投影，于是分类器每轮都看不见自己
+      // 上一句说过什么没搞清 —— 既没法确认它已经被这一句话消解掉，也没法接着申报。
+      // 只投影、**不**做 followsPrior 机械继承：goal/target 那几个继承是因为一句「继续」
+      // 会把它们打空，而 ambiguities 的空数组本身就是有意义的申报（"没有不清楚的"），
+      // 机械继承会把已经被用户答复消解掉的歧义又翻出来。判不判由分类器说了算。
+      ambiguities: _aiIntentList(prior.semantic?.ambiguities, 6, 240),
       lastUserText: _aiIntentText(prior.lastUserText, 420),
     } : null,
     requirementLedger: _aiIntentList((session?._demandLedger || []).slice(-8), 8, 260),
@@ -21826,7 +21832,12 @@ function _normalizeAiIntentVerdict(value, context = {}) {
   const rawSemantic = value.semantic && typeof value.semantic === "object" ? value.semantic : value;
   const rawEngineering = value.engineering && typeof value.engineering === "object" ? value.engineering : null;
   const hasDimensionInput = _AI_INTENT_DIMENSIONS.some((dim) => typeof dimensionSource[dim] === "boolean");
-  const hasSemanticInput = ["goal", "action", "target", "locationIntent", "continuation", "confidence", "constraints", "successCriteria", "ambiguities"]
+  // confidence **不算**内容：一个只回了 {"semantic":{"confidence":0.3}} 的空答会被判成
+  // 「有效裁决」，产出一份全默认画像（goal 空、workspaceAction "none"），并把 intentSource
+  // 锁成 "ai" —— 而 _applyLateIntentIfLanded 开头就是 `intentSource === "ai"` 就早返回，
+  // 于是这一轮再也没有补救。下面那句注释说的正是这件事（"Otherwise {} becomes a
+  // plausible-looking answer"），一个自评标量恰恰是最像 {} 的东西。
+  const hasSemanticInput = ["goal", "action", "target", "locationIntent", "continuation", "constraints", "successCriteria", "ambiguities"]
     .some((field) => Object.prototype.hasOwnProperty.call(rawSemantic, field));
   const hasEngineeringInput = !!rawEngineering && [
     "projectState", "deliverySurface", "changeScope", "architectureMode", "dataStrategy",
@@ -21857,10 +21868,19 @@ function _normalizeAiIntentVerdict(value, context = {}) {
     confidence: Number.isFinite(confidence) ? Math.max(0, Math.min(1, confidence)) : 0.5,
     ambiguities: _aiIntentList(rawSemantic.ambiguities, 6, 240),
     // Automatic prompt optimization: the classifier's clarified restatement of the user's
-    // message (terse/typo'd/elliptical → complete, executable, first-person). Inherited on
-    // a short continuation like other fields. Injected ALONGSIDE the raw text at execution,
-    // never replacing it — the user's own words remain the ground truth.
-    restatedTask: _aiIntentText(rawSemantic.restatedTask || (followsPrior ? prior.restatedTask : ""), 600),
+    // message (terse/typo'd/elliptical → complete, executable, first-person). Injected
+    // ALONGSIDE the raw text at execution, never replacing it — the user's own words remain
+    // the ground truth.
+    //
+    // **每轮重算，不继承**（注意它和上面几个字段不一样）。这里原来挂着
+    // `|| (followsPrior ? prior.restatedTask : "")`，而 priorTask 的投影里压根没有
+    // restatedTask —— 那个回退永远取到 undefined，是死代码，注释却写着"像其它字段一样继承"，
+    // 还有一条按源码正则写的测试把这个不成立的信念钉成了绿灯。
+    // 补投影也不对：提示词要它重述的是**用户这句话**（见 schema 说明），不是任务；而且
+    // 渲染出去的措辞是"act on this"，让模型照着一句陈旧且可能读错的第一人称重述行动，
+    // 比没有这一行更糟——那正是"不理解用户真正需求"的放大器。短句「继续」也不缺料：
+    // 分类器手上有 priorTask.goal/target，就地重述得出来。
+    restatedTask: _aiIntentText(rawSemantic.restatedTask, 600),
   };
   const inferredProjectState = context?.workspaceEvidence?.hasWorkspace
     ? (context.workspaceEvidence.snapshotReady && context.workspaceEvidence.topLevel?.length ? "existing" : "unknown")
