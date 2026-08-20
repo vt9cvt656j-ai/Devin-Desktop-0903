@@ -16,10 +16,27 @@ struct AccessibilityTarget {
     name: String,
 }
 
+/// 前台窗口里那块网页的加载状态。路线 B（操作用户自己那个浏览器）原本没有任何
+/// 「页面加载完了没有」的信号——可访问性树只反映**此刻**渲染出来的东西，页面还在
+/// 加载时读到的就是半个页面。模型看不出区别，于是把「还没渲染出来」当成「这页
+/// 没有这个按钮」，然后基于这句假话往下决策。
+#[derive(Debug, Clone, Default, Deserialize)]
+struct PageState {
+    #[serde(default)]
+    title: String,
+    #[serde(default)]
+    loaded: bool,
+    #[serde(default)]
+    progress: f64,
+}
+
 #[derive(Debug, Default, Deserialize)]
 struct UiSnapshot {
     target: Option<AccessibilityTarget>,
     elements: Vec<UiElement>,
+    /// 前台是浏览器时才有；见 PageState。
+    #[serde(default)]
+    page: Option<PageState>,
     /// 这次**读取本身**为什么没完成（超时 / 起不来 / 输出不是合法 JSON）。
     ///
     /// 没有这个字段之前，三种失败都返回一个空快照，然后被下游断言成「权限没问题，
@@ -167,6 +184,7 @@ pub async fn read_screen(ocr: Option<bool>) -> Result<ReadScreenResponse, String
             UiSnapshot {
                 target: None,
                 elements: read_ocr_elements(),
+                page: None, // OCR 看的是像素，读不到网页的加载状态
                 read_error: None, // OCR 路径不经过 AX 读取，没有「读取没完成」这回事
             }
         } else {
@@ -233,6 +251,21 @@ pub async fn read_screen(ocr: Option<bool>) -> Result<ReadScreenResponse, String
             "This is the frontmost window's CURRENTLY VISIBLE area — an accessibility tree reports what is on screen, not the whole document. In a browser or any scrollable view, anything below the fold is simply absent from this list. So \"the element I need is not here\" usually means \"it has not been scrolled into view\", NOT \"it does not exist\": scroll and read again before concluding a control is missing."
                 .into(),
         );
+        // 前台是浏览器时，把「这一屏是在页面的哪个阶段读到的」说出来。可访问性树
+        // 反映的是**此刻**渲染出来的东西：页面还在加载，读到的就是半个页面，而它
+        // 和一个加载完的短页面长得一模一样。不说，模型就会把「还没渲染出来」当成
+        // 「这页没有这个按钮」。
+        if let Some(pg) = snapshot.page.as_ref() {
+            if !pg.loaded || pg.progress < 1.0 {
+                limitations.push(format!(
+                    "这一屏是在网页**还没加载完**的时候读到的（进度 {:.0}%{}）。现在找不到的元素很可能只是还没渲染出来 —— 等一下再 read_screen 一次，别据此断定页面上没有它。",
+                    pg.progress * 100.0,
+                    if pg.title.is_empty() { String::new() } else { format!("，页面「{}」", pg.title) }
+                ));
+            } else if !pg.title.is_empty() {
+                limitations.push(format!("读到的是已经加载完成的网页「{}」。", pg.title));
+            }
+        }
         // 截断必须说出来。500 上限静默生效时，一份被砍掉一半的清单看起来和一份完整的
         // 清单一模一样，模型没有任何办法察觉自己看到的是残缺的。
         if elements.len() >= 500 {
@@ -378,6 +411,7 @@ fn read_ui_snapshot() -> UiSnapshot {
       var rec=axElementSignature(el,role,p,s);
       if(T1[role])a1.push(rec);else if(T2[role])a2.push(rec);else if(T3[role])a3.push(rec);else a4.push(rec);
     };
+    var pageState=null;
     var wins; try{wins=proc.windows;}catch(e){wins=[];}
     // 只走用户真看得见、真点得到的窗口。浏览器这类应用会挂一个 1x1 的隐藏工具窗，
     // 而最小化的窗口交出来的是失效坐标——照着点会落在空处，就是「点了没反应」。
@@ -399,6 +433,15 @@ fn read_ui_snapshot() -> UiSnapshot {
         if(a1.length+a2.length+a3.length+a4.length>=CAP*3) break;
         var el=all[k],role; try{role=el.role();}catch(e){continue;}
         take(el,role);
+        // 网页的加载状态就挂在 AXWebArea 上（AXLoaded / AXLoadingProgress），
+        // 顺路读掉，不为它额外遍历一遍树。
+        if(!pageState && role==='AXWebArea'){
+          var gv=function(n){try{return el.attributes.byName(n).value();}catch(e){return null;}};
+          var ttl=''; try{ ttl=String(gv('AXTitle')||''); }catch(e){}
+          var lp=gv('AXLoadingProgress');
+          pageState={title:ttl.slice(0,120), loaded:(gv('AXLoaded')===true),
+                     progress:(typeof lp==='number'?lp:(lp===null?0:Number(lp)||0))};
+        }
       }
     }
     try{
@@ -414,7 +457,7 @@ fn read_ui_snapshot() -> UiSnapshot {
     // 窗口都在、但一个都不可用（全最小化）时，空结果不是「没权限」也不是「这个应用不暴露树」，
     // 而是唯一能补救的那种空。不说清楚，模型就会照描述里那两条去断言重试没意义。
     var allHidden=(wins.length>0&&usable.length===0);
-    return JSON.stringify({target:{pid:pid,name:pname},elements:merged,
+    return JSON.stringify({target:{pid:pid,name:pname},elements:merged,page:pageState,
       read_error: allHidden ? '这个应用的窗口当前全部处于最小化（或尺寸为零）状态，屏幕上没有可点的元素。先把它切到前台或还原窗口再读一次即可——这不是权限问题，也不是它不暴露辅助功能树。' : undefined});
   }catch(e){return JSON.stringify({target:null,elements:[]});}
 })()"##
@@ -1101,6 +1144,7 @@ return JSON.stringify({operated:operated,changed:changed});
                 name: "First".to_string(),
             }),
             elements: vec![element(7)],
+            page: None,
             read_error: None,
         };
         install_ax_snapshot(&mut first).expect("first snapshot should install");
@@ -1119,6 +1163,7 @@ return JSON.stringify({operated:operated,changed:changed});
                 name: "Second".to_string(),
             }),
             elements: vec![element(3)],
+            page: None,
             read_error: None,
         };
         install_ax_snapshot(&mut second).expect("second snapshot should install");

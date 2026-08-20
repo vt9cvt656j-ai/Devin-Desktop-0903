@@ -254,6 +254,31 @@ impl Agent {
     }
     
     #[cfg(feature = "system")]
+    /// 按下但不松开 / 松开。成对使用就能表达「按住 Shift 再点几下」「按住 Cmd
+    /// 拖拽」这类操作——底层一直有 key_down/key_up，只是从没暴露出去，于是路线 B
+    /// 里这类操作根本没法表达。松开务必配对，否则修饰键会一直卡住。
+    #[cfg(feature = "system")]
+    pub fn keyboard_down(&mut self, key: &str) -> Result<()> {
+        self.system_init()?;
+        let k = parse_key(key)?;
+        let mut sys = self.system.as_ref()
+            .ok_or_else(|| Error::System("系统自动化未初始化".to_string()))?
+            .lock()
+            .map_err(|e| Error::System(format!("Mutex 中毒: {}", e)))?;
+        sys.key_down(k)
+    }
+
+    #[cfg(feature = "system")]
+    pub fn keyboard_up(&mut self, key: &str) -> Result<()> {
+        self.system_init()?;
+        let k = parse_key(key)?;
+        let mut sys = self.system.as_ref()
+            .ok_or_else(|| Error::System("系统自动化未初始化".to_string()))?
+            .lock()
+            .map_err(|e| Error::System(format!("Mutex 中毒: {}", e)))?;
+        sys.key_up(k)
+    }
+
     pub fn keyboard_combo(&mut self, keys: Vec<&str>) -> Result<()> {
         self.system_init()?;
         let mut sys = self.system.as_ref()
@@ -584,6 +609,26 @@ fn parse_key(key: &str) -> Result<Key> {
         "ctrl" | "control" => Ok(Key::Control),
         "alt" | "option" => Ok(Key::Alt),
         "shift" => Ok(Key::Shift),
+        // 下面这些原来一个都不认，于是「按 F5 刷新」「按 Delete 删掉」「翻页」
+        // 这类再普通不过的操作，在路线 B 里直接报 Unknown key —— 底层
+        // （enigo）明明全都支持，只是这张白名单没写。
+        "delete" | "del" | "forwarddelete" => Ok(Key::Delete),
+        "home" => Ok(Key::Home),
+        "end" => Ok(Key::End),
+        "pageup" | "pgup" => Ok(Key::PageUp),
+        "pagedown" | "pgdn" => Ok(Key::PageDown),
+        "f1" => Ok(Key::F1),
+        "f2" => Ok(Key::F2),
+        "f3" => Ok(Key::F3),
+        "f4" => Ok(Key::F4),
+        "f5" => Ok(Key::F5),
+        "f6" => Ok(Key::F6),
+        "f7" => Ok(Key::F7),
+        "f8" => Ok(Key::F8),
+        "f9" => Ok(Key::F9),
+        "f10" => Ok(Key::F10),
+        "f11" => Ok(Key::F11),
+        "f12" => Ok(Key::F12),
         s if s.len() == 1 => {
             let ch = s.chars().next().unwrap();
             Ok(Key::Character(ch))

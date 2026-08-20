@@ -5212,6 +5212,39 @@ pub async fn github_trending(query: String, max_results: Option<u32>) -> Result<
     Ok(out)
 }
 
+/// 结果里有没有一条真和查询词沾边。
+///
+/// InfoQ 的 /search.action 现在只发一张客户端渲染的壳页：实测 kubernetes、
+/// rust ownership、以及一串乱码查询词，回来的都是 HTTP 200、~115KB、
+/// **文章链接一模一样**的同一张页面。抓出来的是首页最新文章，而回执的抬头写着
+/// 「InfoQ articles for 'rust ownership'」——模型会把这些文章当成检索结果引用。
+///
+/// 不写死「infoq 坏了」：核对一下命中项跟查询词有没有关系。哪天它恢复了，
+/// 这段自己就通了。
+fn any_hit_matches_query(query: &str, hits: &[(String, String)]) -> bool {
+    let q = query.to_lowercase();
+    let mut tokens: Vec<&str> = q
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|t| t.chars().count() >= 3)
+        .collect();
+    // 查询词本身很短（"go"、"k8s"）时没有 >=3 的分词，就拿整串比。
+    // 但整串得**有字母数字**才有比的意义：全是符号的话核对不了，那就不核对。
+    let trimmed = q.trim();
+    if tokens.is_empty()
+        && trimmed.chars().filter(|c| c.is_alphanumeric()).count() >= 2
+    {
+        tokens.push(trimmed);
+    }
+    if tokens.is_empty() {
+        return true; // 没法核对就不冤枉它。
+    }
+    hits.iter().any(|(title, path)| {
+        let t = title.to_lowercase();
+        let p = path.to_lowercase();
+        tokens.iter().any(|tok| t.contains(tok) || p.contains(tok))
+    })
+}
+
 #[tauri::command]
 pub async fn infoq_search(query: String, max_results: Option<u32>) -> Result<String, String> {
     let query = required_search_term(&query)?;
@@ -5234,7 +5267,8 @@ pub async fn infoq_search(query: String, max_results: Option<u32>) -> Result<Str
     ensure_provider_http_success("InfoQ", resp.status())?;
     let html = resp.text_capped().await.map_err(|e| e.to_string())?;
     let retrieved = retrieved_at();
-    let mut out = format!("InfoQ articles for '{query}':\nretrieved_at: {retrieved}\n\n");
+    // 先收集，核对过再渲染——原来是边抓边往 out 里拼，等于抓到什么就认什么。
+    let mut hits: Vec<(String, String)> = Vec::new();
     let mut count = 0;
     // Parse search result links: <a href="/articles/..." or <a href="/news/..."
     let patterns = ["href=\"/articles/", "href=\"/news/"];
@@ -5279,22 +5313,43 @@ pub async fn infoq_search(query: String, max_results: Option<u32>) -> Result<Str
                 continue;
             };
             count += 1;
-            out.push_str(&format!(
-                "{}. {}\n{}   https://www.infoq.com{}\n\n",
-                count,
-                title,
-                provider_date_lines(None, None, None, None, &retrieved),
-                path
-            ));
+            hits.push((title, path));
         }
     }
-    if count == 0 {
-        out.push_str("search_status: empty\nNo results found in the successful InfoQ response.\n");
-    }
-    out.push_str(&format!(
+    let search_url = format!(
         "InfoQ search: https://www.infoq.com/search/?q={}\n",
-        query.replace(' ', "+"),
-    ));
+        query.replace(' ', "+")
+    );
+    if hits.is_empty() {
+        return Ok(format!(
+            "InfoQ articles for '{query}':\nretrieved_at: {retrieved}\n\n\
+             search_status: empty\nNo results found in the successful InfoQ response.\n{search_url}"
+        ));
+    }
+    if !any_hit_matches_query(&query, &hits) {
+        // 一条都跟查询词沾不上边 = 拿到的是那张跟查询无关的壳页。照实说，别把首页
+        // 最新文章顶着「for '<查询词>'」交出去。
+        return Ok(format!(
+            "InfoQ articles for '{query}':\nretrieved_at: {retrieved}\n\n\
+             search_status: unusable\n\
+             InfoQ 的搜索页是客户端渲染的：/search.action 对任何查询词都返回同一张页面，\
+             抓到的 {} 条全是首页最新文章，**跟 '{query}' 没有关系**，已经不列出来——\
+             列出来你会把它们当成检索结果引用。\n\
+             改用 web_search 加 site:infoq.com，或用 browser 打开下面这个地址等页面渲染完再读。\n{search_url}",
+            hits.len()
+        ));
+    }
+    let mut out = format!("InfoQ articles for '{query}':\nretrieved_at: {retrieved}\n\n");
+    for (i, (title, path)) in hits.iter().enumerate() {
+        out.push_str(&format!(
+            "{}. {}\n{}   https://www.infoq.com{}\n\n",
+            i + 1,
+            title,
+            provider_date_lines(None, None, None, None, &retrieved),
+            path
+        ));
+    }
+    out.push_str(&search_url);
     Ok(out)
 }
 
@@ -6298,5 +6353,55 @@ mod tests {
             .await
             .expect("非 UTF-8 应兜底而不是失败");
         assert!(out.ends_with("hi"), "有效部分应保留: {out:?}");
+    }
+}
+
+#[cfg(test)]
+mod infoq_shell_page_tests {
+    use super::any_hit_matches_query;
+
+    /// 实测（2026-08-20）：InfoQ 的 /search.action 对 kubernetes、rust ownership、
+    /// 以及一串乱码查询词，都返回 HTTP 200、~115KB、**文章链接一模一样**的同一张页面。
+    /// 抓出来的是首页最新文章，而回执抬头写着「InfoQ articles for '<查询词>'」。
+    #[test]
+    fn the_shell_page_is_recognised_as_unrelated() {
+        let shell = [
+            (
+                "PostgreSQL Simulates a City".to_string(),
+                "/news/2026/08/pgsimcity/".to_string(),
+            ),
+            (
+                "GraphQL LLM Mocking Spec".to_string(),
+                "/news/2026/08/graphql-llm-mocking-spec/".to_string(),
+            ),
+        ];
+        assert!(
+            !any_hit_matches_query("rust ownership", &shell),
+            "首页最新文章被当成了 'rust ownership' 的检索结果"
+        );
+        assert!(!any_hit_matches_query("kubernetes", &shell));
+    }
+
+    /// 哪天 InfoQ 的搜索能抓了，这段自己就通——没有把「infoq 坏了」写死。
+    #[test]
+    fn real_results_still_pass() {
+        let real = [(
+            "Kubernetes 1.33 Released".to_string(),
+            "/news/2026/05/k8s-133/".to_string(),
+        )];
+        assert!(any_hit_matches_query("kubernetes", &real));
+        // 命中在 slug 里也算。
+        let slug_only = [("What's New This Month".to_string(), "/articles/rust-async/".to_string())];
+        assert!(any_hit_matches_query("rust async", &slug_only));
+    }
+
+    /// 查询词太短、切不出 >=3 的词时不能冤枉它——没法核对就放行。
+    #[test]
+    fn short_queries_are_not_punished() {
+        let hits = [("Something".to_string(), "/news/x/".to_string())];
+        assert!(any_hit_matches_query("!!", &hits), "核对不了却判成不可用");
+        assert!(!any_hit_matches_query("go", &hits), "两字查询要按整串比");
+        let go = [("Go 1.26 lands".to_string(), "/news/go126/".to_string())];
+        assert!(any_hit_matches_query("go", &go));
     }
 }

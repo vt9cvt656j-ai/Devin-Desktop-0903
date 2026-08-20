@@ -368,6 +368,23 @@ impl RpcServer {
             }
             
             #[cfg(feature = "system")]
+            "keyboard.down" => {
+                let key = params.get("key").and_then(|v| v.as_str())
+                    .ok_or_else(|| Error::Other(anyhow::anyhow!("Missing 'key' parameter")))?;
+                agent.keyboard_down(key)?;
+                drop(agent);
+                Ok(serde_json::json!({"status": "ok", "delivered_to": frontmost_now(),
+                    "note": "这个键现在是按住状态，用完必须 keyboard.up 松开，否则它会一直卡住影响之后所有输入。"}))
+            }
+            #[cfg(feature = "system")]
+            "keyboard.up" => {
+                let key = params.get("key").and_then(|v| v.as_str())
+                    .ok_or_else(|| Error::Other(anyhow::anyhow!("Missing 'key' parameter")))?;
+                agent.keyboard_up(key)?;
+                drop(agent);
+                Ok(serde_json::json!({"status": "ok", "delivered_to": frontmost_now()}))
+            }
+            #[cfg(feature = "system")]
             "keyboard.combo" => {
                 let keys = params.get("keys")
                     .and_then(|v| v.as_array())

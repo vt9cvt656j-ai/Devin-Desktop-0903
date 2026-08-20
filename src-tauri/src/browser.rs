@@ -2139,8 +2139,14 @@ pub async fn browser_user_tabs() -> Result<serde_json::Value, String> {
                 r#"tell application "{}"
   set out to ""
   repeat with w from 1 to (count of windows)
+    set aidx to 0
+    try
+      set aidx to active tab index of window w
+    end try
     repeat with t from 1 to (count of tabs of window w)
-      set out to out & w & tab & t & tab & (title of tab t of window w) & tab & (URL of tab t of window w) & linefeed
+      set act to "0"
+      if t = aidx then set act to "1"
+      set out to out & w & tab & t & tab & act & tab & (title of tab t of window w) & tab & (URL of tab t of window w) & linefeed
     end repeat
   end repeat
   return out
@@ -2159,14 +2165,20 @@ end tell"#,
             let mut tabs = Vec::new();
             for line in String::from_utf8_lossy(&out.stdout).lines() {
                 let cols: Vec<&str> = line.split('\t').collect();
-                if cols.len() < 4 {
+                if cols.len() < 5 {
                     continue;
                 }
+                // 「哪个是用户正在看的那一页」——同一个 AppleScript 里 active tab index
+                // 一直读得到，却从来没读。少了它，一份十几个标签页的平铺清单里，
+                // 模型没有任何依据挑出用户说的「这一页」，只能靠标题猜。
+                // window 1 在 AppleScript 的顺序里就是该应用的最前窗口。
                 tabs.push(serde_json::json!({
                     "window": cols[0].trim(),
                     "tab": cols[1].trim(),
-                    "title": cols[2],
-                    "url": cols[3],
+                    "active": cols[2].trim() == "1",
+                    "front_window": cols[0].trim() == "1",
+                    "title": cols[3],
+                    "url": cols[4],
                 }));
             }
             if !tabs.is_empty() {
