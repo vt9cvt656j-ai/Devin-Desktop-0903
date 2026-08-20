@@ -50737,7 +50737,12 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
         // 有日志/报错就逼它照真实输出诊断——命令跑失败 → 硬把它拽回"照真实报错定位根因、直接改对应
         // 文件:行"，而不是凭记忆瞎推断、绕远改别处（治"10分钟的事绕40分钟还烧token"）。报错已在上一条
         // 工具结果里，这里只补一句硬指令，不重复贴。
+        // 判据同 _toolExecutionSucceeded：**执行事实优先**。
+        // 原来只看正文匹配，于是 exit 0 但输出里有 [ERROR]（或某条通过的测试打印了
+        // TypeError）也会被告知「上一条命令报错了」—— 和那条主 bug 是同一个病根，
+        // 只修主处会剩这一半继续误导模型。
         if ((t === "cmd" || t === "termtask" || t === "termread") && it.rawResult
+            && !_toolExecutionSucceeded(it.call, it.rawResult)
             && (_toolFailureMatch(it.rawResult.content || "") || /error TS\d|SyntaxError|TypeError|ReferenceError|Traceback|ModuleNotFound|ImportError|\bpanic|Exception|command not found|cannot find|No such file|编译失败|运行时错误|EADDRINUSE|ECONNREFUSED|\brefused\b|exit(ed)? (code|status)?\s*[1-9]/i.test(String(it.rawResult.content || "")))) {
           const evidence = it.rawResult.commandFailure;
           const paths = evidence?.paths?.length ? evidence.paths.join("、") : "";
@@ -53306,10 +53311,18 @@ async function _resolveExisting(rel, preferredRoot = "") {
   if (!rel) return rel;
   const exact = [];
   for (const cand of _relCandidates(rel, preferredRoot)) {
+    // 「读得动」不等于「存在」。拿 readTextFile 当存在性探针，会让**读不了但确实存在**的
+    // 文件（GBK 遗留源码、>5MB、二进制、root 属主）在多根工作区里永远解析不到真实路径 ——
+    // 和「四个工具说文件不存在」是同一个病根的第二处，只修回执不修这里，edit 连路径都定不到。
+    // 判据用同一个 _isMissingFileError：只有真的「找不到」才不算命中。
     try {
       await backend.readTextFile(cand);
       if (!exact.some((path) => _pathIdentity(path) === _pathIdentity(cand))) exact.push(_coherentFilePath(cand));
-    } catch {}
+    } catch (e) {
+      if (!_isMissingFileError(String(e && e.message || e || ""))) {
+        if (!exact.some((path) => _pathIdentity(path) === _pathIdentity(cand))) exact.push(_coherentFilePath(cand));
+      }
+    }
   }
   if (exact.length === 1) return exact[0];
   if (exact.length > 1) throw new Error(`[AMBIGUOUS_PATH] 「${rel}」在多个工作区都存在：${exact.join("、")}。请使用带工作区文件夹名的明确路径。`);
@@ -55660,7 +55673,7 @@ async function _executeToolStepInner(step, call, root, run) {
     } else if (call.type === "game_scaffold") {
       if (!inTauri) { res.className = "atc-result atc-result--err"; res.textContent = "桌面专用"; return { type: "game_scaffold", path: "", content: "[不可用] 游戏脚手架只能在桌面 App 里用。" }; }
       const ws = (run && run.session && run.session.project) || root || "";
-      if (!ws) { res.className = "atc-result atc-result--err"; res.textContent = "无工作区"; return { type: "game_scaffold", path: "", content: "[错误] 请先打开一个工作区。" }; }
+      if (!ws) { res.className = "atc-result atc-result--err"; res.textContent = "无工作区"; return { type: "game_scaffold", path: "", content: `[BLOCKED] 当前没有工作区根目录。**下一步直接调 create_project({name:"<描述性名字>"})** 建一个目录，它会立刻成为当前工作区，然后原样重试这一步。不要停下来让用户去打开文件夹。` }; }
       try {
         const r = await backend.invoke("game_scaffold", { engine: call.engine || "godot", name: call.name || "my-game", workspace: ws });
         res.className = "atc-result atc-result--ok"; res.textContent = (call.name || "my-game");
@@ -55676,7 +55689,7 @@ async function _executeToolStepInner(step, call, root, run) {
     } else if (call.type === "web_scaffold") {
       if (!inTauri) { res.className = "atc-result atc-result--err"; res.textContent = "桌面专用"; return { type: "web_scaffold", path: "", content: "[不可用] 网站脚手架只能在桌面 App 里用。" }; }
       const ws = (run && run.session && run.session.project) || root || "";
-      if (!ws) { res.className = "atc-result atc-result--err"; res.textContent = "无工作区"; return { type: "web_scaffold", path: "", content: "[错误] 请先打开一个工作区。" }; }
+      if (!ws) { res.className = "atc-result atc-result--err"; res.textContent = "无工作区"; return { type: "web_scaffold", path: "", content: `[BLOCKED] 当前没有工作区根目录。**下一步直接调 create_project({name:"<描述性名字>"})** 建一个目录，它会立刻成为当前工作区，然后原样重试这一步。不要停下来让用户去打开文件夹。` }; }
       try {
         // Auto-wire the most recent learn_design tokens so the learned reference
         // system actually feeds the scaffold instead of sitting as a dead doc.
@@ -55704,7 +55717,7 @@ async function _executeToolStepInner(step, call, root, run) {
       if (call._error) { res.className = "atc-result atc-result--err"; res.textContent = "参数错误"; return { type: call.type, path: "", content: `[参数错误] ${call.type}: ${call._error}` }; }
       if (!inTauri) { res.className = "atc-result atc-result--err"; res.textContent = "桌面专用"; return { type: call.type, path: "", content: "[不可用] 只能在桌面 App 里用。" }; }
       const _gaWs = (run && run.session && run.session.project) || root || "";
-      if (!_gaWs) { res.className = "atc-result atc-result--err"; res.textContent = "无工作区"; return { type: call.type, path: "", content: "[错误] 请先打开一个工作区。" }; }
+      if (!_gaWs) { res.className = "atc-result atc-result--err"; res.textContent = "无工作区"; return { type: call.type, path: "", content: `[BLOCKED] 当前没有工作区根目录。**下一步直接调 create_project({name:"<描述性名字>"})** 建一个目录，它会立刻成为当前工作区，然后原样重试这一步。不要停下来让用户去打开文件夹。` }; }
       const _gaCfg = loadConfig();
       const _gaLabels = { generate_3d: "3D 模型", generate_sound: "音效", generate_music: "音乐", generate_voice: "语音", auto_rig: "骨骼绑定", generate_motion: "动画", generate_texture: "纹理" };
       res.className = "atc-result"; res.innerHTML = `<span class="atc-spin"></span> 生成${_gaLabels[call.type] || "资产"}中…`;
@@ -55768,7 +55781,7 @@ async function _executeToolStepInner(step, call, root, run) {
       if (call._error) { res.className = "atc-result atc-result--err"; res.textContent = "参数错误"; return { type: "download_asset", path: "", content: `[参数错误] download_asset: ${call._error}` }; }
       if (!inTauri) { res.className = "atc-result atc-result--err"; res.textContent = "桌面专用"; return { type: "download_asset", path: "", content: "[不可用] 只能在桌面 App 里用。" }; }
       const _daWs = (run && run.session && run.session.project) || root || "";
-      if (!_daWs) { res.className = "atc-result atc-result--err"; res.textContent = "无工作区"; return { type: "download_asset", path: "", content: "[错误] 请先打开一个工作区。" }; }
+      if (!_daWs) { res.className = "atc-result atc-result--err"; res.textContent = "无工作区"; return { type: "download_asset", path: "", content: `[BLOCKED] 当前没有工作区根目录。**下一步直接调 create_project({name:"<描述性名字>"})** 建一个目录，它会立刻成为当前工作区，然后原样重试这一步。不要停下来让用户去打开文件夹。` }; }
       res.className = "atc-result"; res.innerHTML = `<span class="atc-spin"></span> 下载资源…`;
       try {
         const _daOut = await backend.invoke("download_asset", { workspace: _daWs, url: call.url || "", name: call.name || "asset", assetType: call.asset_type });

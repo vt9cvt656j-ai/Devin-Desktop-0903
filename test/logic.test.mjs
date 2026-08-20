@@ -25541,8 +25541,13 @@ test("只读模式那句「只能用四个工具」是假的，已经换成真�
 test("没打开工作区时给出可执行的下一步，而不是求用户去点菜单", () => {
   // 工具描述和轮次开头的 contextBlock 都明写「别停下来问用户」，而这条刚发生的
   // 工具结果原来和它们唱反调，叫模型去求用户打开文件夹——模型做不到的事。
+  // 2026-08-20：从 4 处长到 8 处。原来只有 write/edit、mkdir、copy、format 给了出路；
+  // 从零建项目那族（game_scaffold / web_scaffold / generate_3d|sound|music|voice|motion|
+  // texture / auto_rig / download_asset）回的是「[错误] 请先打开一个工作区。」这条死路 ——
+  // 而 web_scaffold 自己的描述写着 "from scratch"、create_project 的描述明令「不要让用户
+  // 去开文件夹」。这条断言的意图是「每一处无工作区拦截都要给出路」，所以数字跟着长是对的。
   const n = (SRC.match(/\*\*下一步直接调 create_project/g) || []).length;
-  assert.equal(n, 4, `四处无工作区拦截都要给出路，实际 ${n} 处`);
+  assert.equal(n, 8, `每一处无工作区拦截都要给出路，实际 ${n} 处`);
   assert.doesNotMatch(SRC, /请先打开项目文件夹或给当前聊天标签设置工作目录/, "还在求用户");
   // 不能建议"改用绝对路径"——无根时写操作 fail-closed，那是第二条死路
   assert.match(SRC, /也不要改用绝对路径绕过去[\s\S]{0,60}那是第二条死路/);
@@ -30985,4 +30990,25 @@ test("空的抓取结果不进缓存，别把「再试一次」这条路堵死",
   // 上限仍在。
   for (let i = 0; i < 70; i++) put("k" + i, "x");
   assert.ok(store.size <= 60, "缓存上限失效");
+});
+
+// ---- 没打开工作区 ≠ 死路 ----
+//
+// 从零开新项目的那十个工具（game_scaffold / web_scaffold / generate_3d|sound|music|voice|
+// motion|texture / auto_rig / download_asset）一律回「[错误] 请先打开一个工作区。」——
+// 而 web_scaffold 自己的描述写着 "Start a site … **from scratch** with this"，全文没有一句
+// 要工作区；create_project 的描述更是明令「不要让用户去开文件夹」。
+// 同一个文件里的对照组（write / edit / mkdir / copy / format）给的是正确做法：
+// 「下一步直接调 create_project({name})，它会立刻成为当前工作区，然后原样重试这一步」。
+test("没有工作区时，从零建项目那族要给出路而不是死路", () => {
+  assert.equal((SRC.match(/\[错误\] 请先打开一个工作区。/g) || []).length, 0,
+    "还有工具在回「请先打开一个工作区」这种死路 —— 用户说「给我做个落地页」时它就停在这儿了");
+  // 具体几处由上面那条「每一处无工作区拦截都要给出路」钉着，这里只钉措辞一致
+  //（模型已经认得对照组那句，新加的四处不该另造一套说法）。
+  assert.ok((SRC.match(/create_project\(\{name:"<描述性名字>"\}\)/g) || []).length >= 8,
+    "新加的四处没沿用对照组的措辞");
+  // 错误码要被失败识别器认出来，否则这次「没做成」会被算成成功。
+  const failMatch = load("_toolFailureMatch");
+  assert.ok(failMatch("[BLOCKED] 当前没有工作区根目录。**下一步直接调 create_project({name:\"x\"})**"),
+    "错误码不被失败识别器认得");
 });

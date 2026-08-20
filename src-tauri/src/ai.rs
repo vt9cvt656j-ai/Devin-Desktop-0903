@@ -3410,7 +3410,13 @@ pub async fn web_fetch(url: String) -> Result<String, String> {
         .header(reqwest::header::USER_AGENT, "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36")
         .header(reqwest::header::ACCEPT, "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8")
         .header(reqwest::header::ACCEPT_LANGUAGE, "zh-CN,zh;q=0.9,en;q=0.8")
-        .header(reqwest::header::ACCEPT_ENCODING, "gzip, deflate, br")
+        // **不要手设 Accept-Encoding。**
+        //
+        // 这里原来声明 "gzip, deflate, br"，而 Cargo.toml 里 reqwest 的特性集只有 gzip ——
+        // 没有 brotli、没有 deflate。更要命的是：**手设这个 header 会关掉 reqwest 的自动解压**
+        // （它只对自己加的那个头负责）。于是 Cloudflare 那类默认用 br 的站点，抓回来的是
+        // 原始压缩字节 —— 模型拿到一段乱码，而不是正文。
+        // 交给 reqwest 自己加：它会按已编译进来的特性声明（gzip），并透明解压。
         .header("Sec-Fetch-Dest", "document")
         .header("Sec-Fetch-Mode", "navigate")
         .header("Sec-Fetch-Site", "none")
@@ -4290,6 +4296,25 @@ mod bing_unwrap_tests {
 
         // 本来就是真实 URL 的（有些结果不走壳）原样通过。
         assert_eq!(bing_unwrap("https://example.com/a?x=1&amp;y=2"), "https://example.com/a?x=1&y=2");
+    }
+
+    /// 别声明自己解不了的内容编码。
+    ///
+    /// 手设 Accept-Encoding 会**关掉 reqwest 的自动解压**（它只对自己加的那个头负责），
+    /// 而 Cargo.toml 的特性集里只有 gzip —— 声明 br 的结果是：Cloudflare 那类默认用 br 的
+    /// 站点抓回来是原始压缩字节，模型拿到一段乱码而不是正文。
+    #[test]
+    fn never_advertise_an_encoding_we_cannot_decode() {
+        let whole = include_str!("ai.rs");
+        let src = match whole.find("mod bing_unwrap_tests") {
+            Some(i) => &whole[..i],
+            None => whole,
+        };
+        assert!(
+            !src.contains("ACCEPT_ENCODING"),
+            "又手设了 Accept-Encoding —— 那会关掉自动解压；\
+             要支持 br/deflate 得先给 Cargo.toml 的 reqwest 加上对应特性"
+        );
     }
 
     #[test]
