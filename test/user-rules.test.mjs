@@ -294,9 +294,18 @@ test("子智能体的系统提示词必须带上用户规则", () => {
   // 技能块早就在里面了；同为用户自己写下的东西，规则块不该缺席。两者要么都在，要么这条
   // 断言就该跟着改——不许只剩技能块。
   assert.match(seg, /skillsBlock/, "技能块也不见了，这条对照失去意义");
+  // 语言和风格同样是用户在设置面板里亲手选的值，同样只有这一条补给路：_agentModelTurn 那边
+  // 的 clientBlocks 一到子体就被 `if (!_isSub)` 整个丢弃。子体的简报是直接渲染给用户看的，
+  // 语言不对当场就看得出来。
+  // 比的是**带加号的源码形态**——上面那段说明注释里会提到这些名字，按裸名字比会被注释喂到。
+  assert.match(seg, /\+ _languagePreferenceBlock\(\)/,
+    "子智能体收不到用户选的语言——它交回来的简报会用自己猜的语言写");
+  assert.match(seg, /\+ _adaptivePromptBlock\(\)/, "子智能体收不到用户选的风格档案");
   // 真话下限必须压轴（truthfulness 那条钉着 `+ _SUBAGENT_TRUTH;` 结尾），规则块要插在它前面。
   // 比对的是**代码形态** `+ _SUBAGENT_TRUTH;`，不是裸名字：上面那段注释里就提到了这个名字，
   // 按裸名字比会被注释自己喂到（这一轮基线就是这么红的）。
-  assert.ok(seg.indexOf("+ _userRulesBlock()") < seg.indexOf("+ _SUBAGENT_TRUTH;"),
-    "规则块插到真话下限后面去了——那条压轴不变量会被破坏");
+  for (const b of ["+ _userRulesBlock()", "+ _languagePreferenceBlock()", "+ _adaptivePromptBlock()"]) {
+    assert.ok(seg.indexOf(b) < seg.indexOf("+ _SUBAGENT_TRUTH;"),
+      `${b} 插到真话下限后面去了——那条压轴不变量会被破坏`);
+  }
 });
