@@ -1087,27 +1087,19 @@ return JSON.stringify({operated:operated,changed:changed});
     fn both_ax_scans_skip_windows_the_user_cannot_click() {
         // 最小化的窗口交出来的是失效坐标，照着点会落在空处；浏览器还会挂 1x1 的隐藏工具窗。
         // 两处扫描都必须先筛窗口再取内容，否则末尾的截断会拿点不到的元素挤掉真元素。
-        // 断言实现特征，不断言说明词——上面这段注释里同样有那些词，剥掉再数。
+        // 断言实现特征而不是说明词，并且 needle 要拼出来——写成完整字面量的话，
+        // 这个测试自己就会被数进去，两处变成三处。
         let src: String = include_str!("accessibility.rs")
             .lines()
             .filter(|l| !l.trim_start().starts_with("//"))
             .collect::<Vec<_>>()
             .join("\n");
-        assert_eq!(
-            src.matches("AXMinimized").count(),
-            2,
-            "两处 JXA 扫描都要跳过最小化窗口"
-        );
-        assert_eq!(
-            src.matches("usable[wi].entireContents()").count(),
-            2,
-            "取内容必须走筛过的窗口列表，不能直接用 proc.windows"
-        );
-        assert_eq!(
-            src.matches("wins[wi].entireContents()").count(),
-            0,
-            "还有地方在直接遍历未筛选的窗口"
-        );
+        let minimized = format!("{}{}", "AX", "Minimized");
+        let filtered = format!("usable[wi].{}()", "entireContents");
+        let raw = format!("wins[wi].{}()", "entireContents");
+        assert_eq!(src.matches(&minimized).count(), 2, "两处 JXA 扫描都要跳过最小化窗口");
+        assert_eq!(src.matches(&filtered).count(), 2, "取内容必须走筛过的窗口列表");
+        assert_eq!(src.matches(&raw).count(), 0, "还有地方在直接遍历未筛选的窗口");
     }
 
     #[test]
