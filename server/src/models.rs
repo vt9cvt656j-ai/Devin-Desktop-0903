@@ -4453,7 +4453,51 @@ pub async fn knowledge_search(
         .filter(|s| !s.is_empty());
     let top_k = body.get("top_k").and_then(|v| v.as_u64()).unwrap_or(6) as usize;
     let hits = crate::knowledge::search(query, domain, top_k);
-    Ok(Json(json!({ "results": hits })))
+
+    // 手写语料之外，再并上自有语料库（真实 API 签名 + 官方文档）。
+    //
+    // 为什么并进这个工具、而不是新开一个：**新工具最大的风险是模型不知道用它**。
+    // knowledge_search 已经在聊天模式白名单、子智能体提示词、设计流程里到处被调用，
+    // 并进来等于零新增接线点、立刻在所有已有路径上生效。
+    //
+    // 字段映射成 domain/topic/section/text —— 和手写语料同一套形状，客户端不用改一行。
+    //
+    // 指定了 domain 就**只给手写语料**：michael-design 那条设计流程要的是精选蓝本，
+    // 掺进几十万条 API 条目只会把它冲淡。
+    let mut merged: Vec<serde_json::Value> = hits
+        .iter()
+        .map(|h| json!({
+            "domain": h.domain, "topic": h.topic, "section": h.section,
+            "text": h.text, "score": h.score, "source": "curated",
+        }))
+        .collect();
+    if domain.is_none() {
+        // 手写语料是精选的，排在前面；语料库补足剩下的名额。
+        let want = top_k.saturating_sub(merged.len()).max(top_k / 2).min(12) as i64;
+        if want > 0 {
+            match crate::code_corpus::search(&state.db, query, None, want).await {
+                Ok(rows) => merged.extend(rows.into_iter().map(|h| {
+                    let topic = if h.version.is_empty() {
+                        h.name.clone()
+                    } else {
+                        format!("{}@{}", h.name, h.version)
+                    };
+                    json!({
+                        "domain": h.ecosystem,
+                        "topic": topic,
+                        "section": if h.symbol.is_empty() { h.title.clone() } else { h.symbol.clone() },
+                        "text": h.body,
+                        "score": h.score,
+                        // 让模型分得清「这是别人总结的经验」还是「这是那个库真实的声明」。
+                        "source": if h.ecosystem == "docs" { "official_docs" } else { "real_api" },
+                    })
+                })),
+                // 语料库查不了不该让整个知识库查询失败——手写那部分照常给。
+                Err(err) => tracing::warn!(%err, "knowledge_search: code corpus leg failed"),
+            }
+        }
+    }
+    Ok(Json(json!({ "results": merged })))
 }
 
 /// POST /api/code-corpus/search —— 自有代码语料库。

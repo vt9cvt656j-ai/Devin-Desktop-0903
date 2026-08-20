@@ -212,7 +212,7 @@ async fn fetch_and_unpack(client: &reqwest::Client, tarball: &str) -> Result<(Ve
         let mut archive = tar::Archive::new(gz);
         let mut out: Vec<(String, String)> = Vec::new();
         for entry in archive.entries().context("read tar entries")? {
-            let mut entry = entry.context("bad tar entry")?;
+            let Ok(mut entry) = entry else { continue };
             if !entry.header().entry_type().is_file() {
                 continue;
             }
@@ -550,6 +550,18 @@ pub async fn search(
     let limit = limit.clamp(1, 20);
     let or_q = or_form(query);
     let ident = looks_like_identifier(query);
+    // 查询里点了名的库要优先。
+    //
+    // 多词查询按正文权重排，而签名条目的正文往往只有一行——于是问
+    // 「zustand create store selector」时，zustand 自己的 `create` 反而排不过一段
+    // 正文冗长、只是碰巧提到 selector 的无关文档。用户明明把库名说出来了。
+    // 取查询里的词去和包名精确比对，命中就加权：这是查询里最强的一个信号。
+    let name_tokens: Vec<String> = query
+        .split(|c: char| !c.is_alphanumeric() && c != '-' && c != '_' && c != '.' && c != '@' && c != '/')
+        .filter(|w| w.len() >= 2)
+        .map(|w| w.to_ascii_lowercase())
+        .take(12)
+        .collect();
     // {D, C, B, A}
     let weights: Vec<f32> = if ident {
         vec![0.1, 0.2, 0.4, 1.0]
@@ -560,7 +572,8 @@ pub async fn search(
         "SELECT ecosystem, name, version, symbol, title, body, \
                 (ts_rank($6::float4[], tsv, websearch_to_tsquery('english', $1)) * 2.0 \
                   + ts_rank($6::float4[], tsv, websearch_to_tsquery('english', $5)) \
-                  + CASE WHEN $7 AND symbol <> '' THEN similarity(symbol, $2) * 2.0 ELSE 0 END)::real AS score \
+                  + CASE WHEN $7 AND symbol <> '' THEN similarity(symbol, $2) * 2.0 ELSE 0 END \
+                  + CASE WHEN lower(name) = ANY($8) THEN 3.0 ELSE 0 END)::real AS score \
            FROM code_corpus \
           WHERE ($3 = '' OR name = $3) \
             AND ($5 <> '' AND tsv @@ websearch_to_tsquery('english', $5) \
@@ -575,6 +588,7 @@ pub async fn search(
     .bind(&or_q)
     .bind(&weights)
     .bind(ident)
+    .bind(&name_tokens)
     .fetch_all(db)
     .await
     .context("code corpus search")?;
@@ -675,7 +689,7 @@ async fn fetch_and_untar(client: &reqwest::Client, url: &str, eco: Eco) -> Resul
         let mut archive = tar::Archive::new(gz);
         let mut out = Vec::new();
         for entry in archive.entries().context("read tar entries")? {
-            let mut entry = entry.context("bad tar entry")?;
+            let Ok(mut entry) = entry else { continue };
             if !entry.header().entry_type().is_file() { continue; }
             let rel = entry.path().context("bad entry path")?.to_string_lossy().to_string();
             if !wanted_file_for(&rel, eco) { continue; }
@@ -1131,7 +1145,10 @@ async fn stream_docs_tarball(
         let mut archive = tar::Archive::new(gz);
         let mut out = Vec::new();
         for entry in archive.entries().context("read docs tar")? {
-            let mut entry = entry.context("bad docs tar entry")?;
+            // 一个畸形条目不该把整份已经下载完的仓库作废。
+            // 实测 prisma/docs 里就有这么一条，`?` 让整个源报 "bad docs tar entry"、
+            // 457 节的 tailwind 能成而它 0 节——而问题只出在其中一个条目上。
+            let Ok(mut entry) = entry else { continue };
             if !entry.header().entry_type().is_file() { continue; }
             let path = entry.path().context("bad docs entry path")?.to_string_lossy().to_string();
             // GitHub tarball 顶层是 `<repo>-<ref>/`，剥掉再比路径。
@@ -1184,7 +1201,9 @@ const DOC_SOURCES: &[(&str, &str, &str, &str)] = &[
     ("typescript", "microsoft/TypeScript-Website","v2",   "packages/documentation/copy/en/"),
     ("tailwind",   "tailwindlabs/tailwindcss.com","main", "src/docs/"),
     ("astro",      "withastro/docs",              "main", "src/content/docs/en/"),
-    ("prisma",     "prisma/docs",                 "main", "content/"),
+    // 正文在 apps/docs/content/，不是根下的 content/ —— 上一版路径写错了，
+    // 于是就算下载成功也一个文件都匹配不到。
+    ("prisma",     "prisma/docs",                 "main", "apps/docs/content/"),
     ("fastapi",    "fastapi/fastapi",             "master", "docs/en/docs/"),
     // Web 平台那一整块：JS / CSS / HTML / HTTP / Web API。前端问题里占比最大的一块，
     // 而且是唯一权威出处。files/ 下是示例资源，只取 web/ 的正文。
@@ -1562,6 +1581,22 @@ declare function notExported(): void;
     }
 
     #[test]
+    fn one_malformed_tar_entry_must_not_discard_the_whole_archive() {
+        // 实测 prisma/docs 里有一个 tar 条目会让 `?` 直接中断——结果是整份已经下载完的
+        // 仓库 0 节入库，而问题只出在其中一个条目上。同一轮里 tailwind 靠流式解包成功
+        // 收了 457 节，prisma 却因为这一条全废。
+        let src = include_str!("code_corpus.rs");
+        let prod = &src[..src.find("mod tests").expect("tests module")];
+        assert!(!prod.contains(r#"entry.context("bad tar entry")?"#),
+            "坏条目不许中断整份归档（npm 路径）");
+        assert!(!prod.contains(r#"entry.context("bad docs tar entry")?"#),
+            "坏条目不许中断整份归档（文档路径）");
+        // 三条解包路径（npm tar / 通用 tar / 文档流式）都要跳过而不是中断。
+        assert_eq!(prod.matches("let Ok(mut entry) = entry else { continue };").count(), 3,
+            "三条解包路径都要对坏条目容错");
+    }
+
+    #[test]
     fn the_stream_bridge_reassembles_chunks_and_reports_errors() {
         use std::io::Read;
         // tar/flate2 是同步接口，reqwest 给的是异步流。桥接错了会静默地把包解坏，
@@ -1616,6 +1651,9 @@ declare function notExported(): void;
             "排序必须用可切换的权重数组，而不是默认权重");
         assert!(prod.contains("CASE WHEN $7 AND symbol <> '' THEN similarity"),
             "符号相似度只该在标识符查询时加权");
+        // 用户把库名说出来了，那是查询里最强的信号——不加权就会被冗长的无关正文压过去。
+        assert!(prod.contains("CASE WHEN lower(name) = ANY($8) THEN 3.0"),
+            "查询里点名的库必须加权，否则问 zustand 排不出 zustand");
     }
 
     #[test]
