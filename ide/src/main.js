@@ -32779,7 +32779,7 @@ function _buildAgentToolSchemas(includeWrite, mcpTools = []) {
        * 那个查"有没有、什么版本、废弃没"，这个查"我这台机器上装的这份长什么样"。
        * 装好的那份比任何全球索引都准——读的就是 lock 文件锁死的那一版。
        */
-      { type: "function", function: { name: "package_source", description: "**Read the REAL API of a dependency as installed on this machine** — resolves the package inside the project's node_modules / site-packages and returns its installed version plus actual source. Two modes: without `symbol` you get `name@installedVersion`, the real on-disk path and the list of exported names; with `symbol` you get the definition body (signature + surrounding doc comment). 【When to use】BEFORE writing any call into a third-party library whose exact API you are not certain about — a signature you remember may belong to a different major version than the one installed here. This is the only tool that reads the version this project actually locked. 【How it differs】`package_search` answers \"does it exist / what versions / deprecated?\" from the registry and returns NO signatures. context7 (if connected) answers \"how do the official docs describe it?\". This one answers \"what is actually on disk\". Typical order: package_search → package_source → context7. 【Note】Ordinary search / find_files / semantic_search deliberately skip node_modules, so they can never answer this — use this tool instead of trying to grep dependencies.", parameters: { type: "object", properties: { package: { type: "string", description: "Package name as imported, e.g. 'zod' / '@tanstack/react-query' / 'pydantic'" }, symbol: { type: "string", description: "Optional. Exported function / class / type to look up; omit for an overview of what the package exports" }, root: { type: "string", description: "Optional workspace root when several are open" } }, required: ["package"] } } },
+      { type: "function", function: { name: "package_source", description: "**Read the REAL API of a dependency as installed on this machine** — resolves the package inside the project's node_modules / site-packages and returns its installed version plus actual source. Two modes: without `symbol` you get `name@installedVersion`, the real on-disk path and the list of exported names; with `symbol` you get the definition body (signature + surrounding doc comment). 【When to use】BEFORE writing any call into a third-party library whose exact API you are not certain about — a signature you remember may belong to a different major version than the one installed here. This is the only tool that reads the version this project actually locked. 【How it differs】`package_search` answers \"does it exist / what versions / deprecated?\" from the registry and returns NO signatures. context7 (if connected) answers \"how do the official docs describe it?\". This one answers \"what is actually on disk\". Typical order: package_search → package_source → context7. 【Not installed? Still answerable】When the package is not on this machine, this tool now falls back to the gateway's OWN code corpus, which holds the real exported declarations (signature + doc comment) extracted from the package's published tarball; if that package is not indexed yet it is fetched and indexed on the spot. So \"not installed\" is no longer a dead end — but the result is the PUBLISHED version's API, not the version this project locks, and the reply says which. 【Note】Ordinary search / find_files / semantic_search deliberately skip node_modules, so they can never answer this — use this tool instead of trying to grep dependencies.", parameters: { type: "object", properties: { package: { type: "string", description: "Package name as imported, e.g. 'zod' / '@tanstack/react-query' / 'pydantic'" }, symbol: { type: "string", description: "Optional. Exported function / class / type to look up; omit for an overview of what the package exports" }, root: { type: "string", description: "Optional workspace root when several are open" } }, required: ["package"] } } },
       { type: "function", function: { name: "download_file", description: "Download a file from an http/https URL and save it inside the workspace (images, fonts, datasets, binaries and so on). dest is a path relative to the workspace root (or an absolute path inside the workspace) and must land inside the workspace. Maximum 200MB per file. It will NOT overwrite: if dest already exists the download is refused and nothing is written — pick another name, or delete_path it first (that step leaves a checkpoint you can undo).", parameters: { type: "object", properties: { url: { type: "string", description: "The http/https URL to download" }, dest: { type: "string", description: "Where to save it, relative to the workspace root, e.g. assets/logo.png" } }, required: ["url", "dest"] } } },
       { type: "function", function: { name: "realtime_news_feed", description: "Fetch the latest discussion and articles from technical communities (Hacker News, Dev.to) — good for the current state of play around a technology, release news and where community sentiment is going. By default it aggregates both sources concurrently, and you can name specific ones; a failing source is flagged but does not block the others. Return format: [source] title | score/comments | time | URL", parameters: { type: "object", properties: { topic: { type: "string", description: "The topic of interest, e.g. 'Rust 1.80' / 'Kubernetes new features'", minLength: 1 }, sources: { type: "string", enum: ["hn", "devto", "all"], description: "Data source: hn (Hacker News only), devto (DEV Community only), all (default, both concurrently)", default: "all" }, maxResults: { type: "integer", description: "Maximum results per source, default 10", minimum: 1, maximum: 25, default: 10 } }, required: ["topic"] } } },
       { type: "function", function: { name: "capture_start", description: "**Start capturing traffic (mitmproxy — the capability of tools like HttpCanary).** Pick a mode first: mode:\"isolated_browser\" = the recommended default, capturing an isolated automation browser without touching the system proxy; mode:\"system\" = capture any app or the whole system, which changes the macOS system proxy; mode:\"background\" = listen only / manual proxying, usually paired with background_monitor(check_type:\"capture\"). Once started, find the real requests with capture_flows, then replay them with capture_replay or http_request.", parameters: { type: "object", properties: { port: { type: "integer", description: "Proxy port, default 8080" }, mode: { type: "string", enum: ["auto", "isolated_browser", "system", "background"], description: "auto = the IDE decides from the task; isolated_browser = does not change the system proxy, and browser(fresh=true) routes through it automatically; system = changes the system proxy to capture any app; background = start the proxy listener only, and wait for traffic yourself or with a monitor" }, system_proxy: { type: "boolean", description: "Legacy parameter: true is equivalent to mode=system; false is equivalent to mode=isolated_browser/background. When omitted, it is decided automatically from mode and the task" } }, required: [] } } },
@@ -52565,6 +52565,40 @@ async function _fetchWithTimeout(url, options = {}, timeoutMs = 9000) {
   }
 }
 
+/**
+ * 问网关的**自有代码语料库**：某个公开包的真实导出签名和文档注释。
+ *
+ * 存在的理由是 package_source 的那句「未安装」。它只读本机 node_modules，
+ * 没装就没有下文；而 package_search 按它自己的说明「returns NO signatures」。
+ * 于是「这个没装的库，某个函数真实签名是什么」在整套工具里无解——模型只能靠记忆猜，
+ * 那正是它编 API 的地方。
+ *
+ * 语料库按需生长：网关没收录就现拉注册表 tarball、抽 .d.ts、入库，此后永久留下。
+ * 所以第一次问某个包会慢几秒，之后是本地查询。
+ */
+async function _searchCodeCorpus({ query, pkg, topK = 6 } = {}) {
+  const cfg = loadConfig();
+  const baseUrl = cfg.baseUrl || MICHAEL_API;
+  let apiKey = cfg.apiKey;
+  if (!apiKey) {
+    try {
+      const token = (typeof localStorage !== "undefined" && localStorage.getItem("michael_token")) || "";
+      const r = await _fetchWithTimeout(`${baseUrl}/api/ide-key`, {
+        headers: token ? { Authorization: `Bearer ${token}` } : {},
+      });
+      apiKey = (await r.json())?.api_key || "";
+    } catch {}
+  }
+  // 首次抓取要下载并解包 tarball，9 秒的默认超时不够；给它 60 秒。
+  const response = await _fetchWithTimeout(`${baseUrl}/api/code-corpus/search`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey || ""}` },
+    body: JSON.stringify({ query: query || pkg || "", package: pkg || undefined, top_k: topK }),
+  }, 60_000);
+  if (!response.ok) throw new Error(`HTTP ${response.status}`);
+  return await response.json();
+}
+
 async function _searchKnowledgeBase(call) {
   if (!call?.query || !String(call.query).trim()) {
     return { type: "knowledge", path: "", content: "[ERROR] knowledge_search 需要 query。" };
@@ -56320,10 +56354,35 @@ ${bodyPreview}`)}</pre>`;
         if (hit) break;
       }
       if (!hit) {
+        // 本机没装 —— 但"没装"不等于"查不到真实 API"。回落到网关的自有代码语料库：
+        // 那边收了公开包的真实导出签名和文档注释，没收录就现拉注册表 tarball 抽一份。
+        //
+        // 这条回落是这个工具最有价值的一半：以前走到这里就是死胡同，模型只剩下靠训练
+        // 记忆猜签名——而记忆里的签名很可能属于另一个大版本。
+        try {
+          const corpus = await _searchCodeCorpus({ query: wantSymbol || pkg, pkg, topK: wantSymbol ? 4 : 8 });
+          const hits = Array.isArray(corpus?.results) ? corpus.results : [];
+          if (hits.length) {
+            const ver = hits[0]?.version ? `@${hits[0].version}` : "";
+            res.className = "atc-result"; res.textContent = `语料库 ${hits.length} 条`;
+            const lines = hits.map((h) => {
+              const head = h.symbol ? `${h.symbol}` : (h.title || "(包级)");
+              return `── ${head}\n${String(h.body || "").trim()}`;
+            });
+            return { type: "package_source", path: pkg, ok: true,
+              content: `包「${pkg}」${ver}　来源：网关代码语料库（本机未安装，以下是公开发布版本的真实声明）\n`
+                + `注意：这是注册表上该版本的 API，**不是**本项目锁定的版本——真要落地前仍以 package.json/lock 为准。\n\n`
+                + lines.join("\n\n") };
+          }
+        } catch (e) {
+          // 语料库不可达不该把这个工具变成失败：下面那条明确的"未安装"仍然是有用的回答。
+          console.warn("[package_source] code corpus fallback failed:", e);
+        }
         res.className = "atc-result atc-result--err"; res.textContent = "未安装";
         // 说"没装"，不说"可能没装"——这里是确定的：所有候选目录都翻过了。
         return { type: "package_source", path: pkg, ok: false,
-          content: `[未安装] 这些工作区里都找不到「${pkg}」的实体目录（node_modules / site-packages 都翻过了）。`
+          content: `[未安装] 这些工作区里都找不到「${pkg}」的实体目录（node_modules / site-packages 都翻过了），`
+            + `网关的代码语料库里也没有它的公开声明。`
             + `\n它可能确实没装（先装依赖），也可能包名和 import 名不一致。`
             + `\n要确认这个包存不存在、最新什么版本，用 package_search；那是注册表元数据，和本机装没装无关。` };
       }

@@ -22,6 +22,7 @@ mod health;
 mod shutdown;
 mod route_health;
 mod integrations;
+mod code_corpus;
 mod knowledge;
 mod model_catalog;
 mod model_probe;
@@ -481,6 +482,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/v1/responses", post(models::responses_proxy))
         .route("/responses", post(models::responses_proxy))
         .route("/api/knowledge/search", post(models::knowledge_search))
+        .route("/api/code-corpus/search", post(models::code_corpus_search))
         .route("/api/knowledge/domains", get(models::knowledge_domains))
         .route("/api/admin/events", get(realtime::recent_events))
         .route("/api/admin/stats", get(realtime::stats))

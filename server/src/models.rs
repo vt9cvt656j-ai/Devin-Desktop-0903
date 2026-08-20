@@ -4456,6 +4456,63 @@ pub async fn knowledge_search(
     Ok(Json(json!({ "results": hits })))
 }
 
+/// POST /api/code-corpus/search —— 自有代码语料库。
+///
+/// 和 `knowledge_search` 的分工：那边是**手写经验**（怎么设计索引、JWT 放哪），
+/// 这边是**真实 API 事实**（这个导出的确切签名是什么、文档注释怎么说）。
+///
+/// 按需生长是这个接口的核心：问到一个还没收录的包，就现拉、抽取、入库，再回答。
+/// 于是语料按真实需求长，而且长在自己机器上——用得越久覆盖越全。
+pub async fn code_corpus_search(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<serde_json::Value>,
+) -> ApiResult<Json<serde_json::Value>> {
+    auth_any_user(&state, &headers).await?;
+    let query = body.get("query").and_then(|v| v.as_str()).unwrap_or("").trim();
+    let package = body
+        .get("package")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    if query.is_empty() && package.is_none() {
+        return Err(AppError::bad("缺少 query 或 package"));
+    }
+    let top_k = body.get("top_k").and_then(|v| v.as_u64()).unwrap_or(6) as i64;
+    // 没给 query 时用包名当查询词，这样「这个包都导出了什么」也能问。
+    let effective_query = if query.is_empty() { package.unwrap_or("") } else { query };
+
+    let mut ingested = serde_json::Value::Null;
+    // 按需入库：指名道姓要某个包、而库里还没有 → 现拉一次再答。
+    // 抓取失败不算接口失败——语料是增益，答不出来也要把已有的结果给出去。
+    if let Some(pkg) = package {
+        if !crate::code_corpus::have_package(&state.db, pkg).await {
+            match crate::code_corpus::ingest_npm(&state.db, pkg, None).await {
+                Ok(report) => {
+                    tracing::info!(
+                        package = %report.name, version = %report.version,
+                        entries = report.entries, bytes = report.bytes,
+                        "code corpus: ingested on demand"
+                    );
+                    ingested = json!({
+                        "name": report.name, "version": report.version, "entries": report.entries
+                    });
+                }
+                Err(err) => {
+                    let msg = err.to_string();
+                    crate::code_corpus::record_failure(&state.db, pkg, "", &msg).await;
+                    tracing::warn!(package = %pkg, error = %msg, "code corpus: on-demand ingest failed");
+                }
+            }
+        }
+    }
+
+    let hits = crate::code_corpus::search(&state.db, effective_query, package, top_k)
+        .await
+        .map_err(|e| AppError::internal(format!("code corpus search failed: {e}")))?;
+    Ok(Json(json!({ "results": hits, "ingested": ingested })))
+}
+
 /// GET /api/knowledge/domains — list the available knowledge domains + their topics
 /// so the agent (or the IDE) can see what's covered.
 pub async fn knowledge_domains(
