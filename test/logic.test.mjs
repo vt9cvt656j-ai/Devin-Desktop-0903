@@ -29014,6 +29014,34 @@ test("快通道也要给出为什么是这几个——可见推理不因为走�
     "快慢两条路都要有理由，不能只有一条有");
 });
 
+
+// ---- 有项目反而不调研：整文件覆写此前不受任何「没读就写」的闸门管 ----
+test("覆写一个已有文件算盲改，和 edit 一样要被点名", () => {
+  const loop = extractFn("_runAgenticLoop");
+  // 用户原话：「我如果有项目内容的话 他就会变蠢了 不会去调研 就会一股无脑写内容」。
+  // 机器成因：两道「没读就写」的闸门都只认 edit/multiedit，而 write_file 整文件覆写
+  // 一个已有文件——破坏性最大的那种——一次都不响。edit 至少要求 old_string 对得上，
+  // 对不上会报错；整文件覆写不校验任何东西，没读过的部分直接消失。
+  assert.match(loop, /it\.call\.type === "write" && it\.rawResult\?\.overwroteExisting/,
+    "盲改判据要认整文件覆写");
+  assert.match(loop, /t === "write" && it\.rawResult\?\.overwroteExisting/,
+    "「改了别人的代码」这个事实也要认覆写，否则 investigate 那道闸一次都不响");
+  // 判据必须来自执行事实，不是从中文文案里猜。
+  assert.match(SRC, /overwroteExisting: !!existed/,
+    "「写的是本来就存在的文件」要结构化带出来");
+  // 后台检索设计知识库不等于读过这个项目的代码。didInvestigate 唯一的读者是那道
+  // 「你还没摸过相关代码就动手改了」的闸门，管的是**项目源码**；让 harness 自己的
+  // 知识库预取去置它，等于给模型记一笔它没做过的功，那道闸门在所有设计任务上永远哑掉。
+  assert.doesNotMatch(loop, /preflight\.results\) && preflight\.results\.length\) didInvestigate = true/,
+    "后台知识库预取不许冒充「读过代码」");
+  assert.match(loop, /didInvestigate = true/, "真正的读取/搜索仍然要记这一笔");
+  // 新建文件不需要先读——别把这条闸门变成"写任何文件前都得读一遍"。
+  assert.doesNotMatch(loop, /it\.call\.type === "write"\)\s*\|\|\s*!it\.call\.path/,
+    "不能把新建文件也算成盲改");
+  // 文案要说清覆写的后果，不能沿用 old_string 那套（覆写没有 old_string）。
+  assert.match(loop, /你没读过的部分已经直接消失了/);
+});
+
 // ---- 写入落空要有用户侧的出口 ----
 test("尝试写了没落盘时，结局里必须留下 writes_failed", () => {
   const loop = extractFn("_runAgenticLoop");

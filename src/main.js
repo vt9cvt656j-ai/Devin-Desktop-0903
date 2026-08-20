@@ -47627,7 +47627,16 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
     if (!preflight || run._michaelDesignPreflightConsumed === preflight) return false;
     run._michaelDesignPreflightConsumed = preflight;
     if (!run.engineering?.designKnowledgeRequired || !preflight.required) return false;
-    if (Array.isArray(preflight.results) && preflight.results.length) didInvestigate = true;
+    // 这里原来有一句 `didInvestigate = true`——**后台检索设计知识库 ≠ 模型读过这个项目的代码**。
+    //
+    // didInvestigate 唯一的读者是那道「你还没用 read_file / search 摸过相关代码就动手改了」
+    // 的闸门，它管的是**项目源码**。而这次预取是 harness 自己在后台跑的 michael-design
+    // 知识库检索，和这个项目里有什么代码毫无关系。于是只要任务沾 UI/设计（`designKnowledgeRequired`），
+    // 那道闸门一次都不会响——用户实拍的正是这个：「我如果有项目内容的话他就会变蠢了，
+    // 不会去调研，就会一股无脑写内容」。
+    //
+    // 这是 harness 给模型记了一笔它没做过的功。预取这件事本身照旧记账（下面那条 findings），
+    // 只是不再冒充"读过代码"。
     _pad.findings.push(preflight.evidence
       ? `michael-design 已后台检索并注入：${(preflight.evidence.sourceSections || []).join("、") || "已命中但未返回 section"}`
       : "michael-design 后台检索没有可用命中；已明确注入不可用状态，不能伪造其内容。");
@@ -50253,7 +50262,10 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
             if (run._researchQueries.length < 60) run._researchQueries.push(_q.slice(0, 120));
           }
         }
-        if ((t === "edit" || t === "multiedit") && _ok) didEdit = true;
+        // 整文件覆写一个已有文件，和 edit 一样属于"改了别人的代码"。
+        // 此前只认 edit/multiedit，于是「有项目、直接 write_file 一路盖过去」这条路上
+        // investigate 那道闸一次都不响——正是用户说的"有项目内容反而不调研，一股无脑写"。
+        if ((t === "edit" || t === "multiedit" || (t === "write" && it.rawResult?.overwroteExisting)) && _ok) didEdit = true;
         // Model-initiated verification is credited only after settlement stamped a
         // recognized verifier and its structured evidence proves an explicit exit 0.
         // Use the exact record written at tool settlement. Reconstructing a fresh object
@@ -50365,13 +50377,21 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
       if (blindEditNudges < 2 && _live()) {
         const _blind = [];
         for (const it of items) {
-          if (!it.call || !(it.call.type === "edit" || it.call.type === "multiedit") || !it.call.path) continue;
+          // write 覆写已有文件也算盲改，而且后果更重：edit 至少要求 old_string 对得上，
+          // 对不上会报错；整文件覆写不校验任何东西，你没读过的部分直接消失。
+          const _isBlindable = it.call && (it.call.type === "edit" || it.call.type === "multiedit"
+            || (it.call.type === "write" && it.rawResult?.overwroteExisting));
+          if (!_isBlindable || !it.call.path) continue;
           if (/\[(ERROR|BLOCKED|DENIED)\]/.test((it.rawResult && it.rawResult.content) || "")) continue;
           if (!_runHasRead(run, root, it.call.path)) _blind.push(it.call.path);
         }
         if (_blind.length) {
           blindEditNudges++;
-          _pushNudge("blindEdit", `你改了 ${_blind.join("、")} 但**这个 run 里从没 read_file 读过它**——old_string 很可能和文件实际内容不匹配。规则：**edit 之前必须先 read_file**。如果刚才的 edit 报错了，先 read_file 读一遍原文、确认实际内容，再重新 edit。`);
+          const _hadOverwrite = items.some((x) => x?.call?.type === "write" && x?.rawResult?.overwroteExisting && _blind.includes(x.call.path));
+          _pushNudge("blindEdit", `你改了 ${_blind.join("、")} 但**这个 run 里从没 read_file 读过它**。`
+            + (_hadOverwrite
+              ? "其中有整文件覆写：write_file 不校验任何东西，你没读过的部分已经直接消失了——现在就 read_file 看一眼实际结果，确认没有把别人的代码盖掉。"
+              : "old_string 很可能和文件实际内容不匹配。先 read_file 读一遍原文、确认实际内容，再重新 edit。"));
         }
       }
 
@@ -54314,7 +54334,10 @@ async function _executeToolStepInner(step, call, root, run) {
         });
       }
       const resolvedNote = fp !== _resolveRel(call.path, root) ? `；实际文件 ${fp}` : "";
-      return { type: call.type, path: fp, mutated: true, content: (existed ? `已修改 ${call.path}（+${added}/-${removed} 行${resolvedNote}）。` : `已新建 ${call.path}（${added} 行${resolvedNote}）。`) + (_editNote || "") + (_redactNote || "") };
+      // overwroteExisting：把「这次写的是一个**本来就存在**的文件」这个事实结构化带出去。
+      // 新建文件不需要先读，覆写已有文件需要——而下游那两道「没读就写」的闸门此前只能
+      // 从中文文案里猜，于是干脆只管 edit/multi_edit，把破坏性最大的那种放过去了。
+      return { type: call.type, path: fp, mutated: true, overwroteExisting: !!existed, content: (existed ? `已修改 ${call.path}（+${added}/-${removed} 行${resolvedNote}）。` : `已新建 ${call.path}（${added} 行${resolvedNote}）。`) + (_editNote || "") + (_redactNote || "") };
 
     } else if (call.type === "multiedit") {
       const fp = _boundRunFilePath(run, root, call.path) || await _resolveExisting(call.path, root);
