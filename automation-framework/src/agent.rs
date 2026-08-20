@@ -101,6 +101,16 @@ impl Agent {
         // 所有注入型操作（鼠标/键盘）都以这里为唯一入口；剪贴板走 arboard、
         // screen.info 走 platform，都不经过这里，所以只在这里预检不会误伤只读能力。
         ensure_input_permission()?;
+        self.system_init_readonly()
+    }
+
+    /// 只读能力用的初始化：**不查辅助功能权限**。
+    ///
+    /// 上面那句注释写着「只在这里预检不会误伤只读能力」，可截屏偏偏走的就是 system_init——
+    /// 于是只授予了「屏幕录制」而没给「辅助功能」的机器上，智能体**根本看不到屏幕**，
+    /// 而且报错还指向错误的那一格设置。截屏需要的是屏幕录制，和鼠标键盘注入是两回事。
+    #[cfg(feature = "system")]
+    pub fn system_init_readonly(&mut self) -> Result<()> {
         if self.system.is_none() {
             let sys = SystemAutomation::new()?;
             self.system = Some(Arc::new(Mutex::new(sys)));
@@ -124,15 +134,26 @@ impl Agent {
         sys.move_mouse(x, y)?;
         // 轮询到位。上限 200ms：到不了就说明目标被系统夹住了（越界、被其他进程抢走），
         // 与其假装成功，不如让调用方拿到真实落点自己判断。
+        let mut last = (x, y);
         for _ in 0..40 {
             match sys.mouse_location() {
-                Ok((cx, cy)) if (cx - x).abs() <= 1 && (cy - y).abs() <= 1 => return Ok(()),
-                Ok(_) => {}
+                Ok((cx, cy)) if (cx - x).abs() <= 2 && (cy - y).abs() <= 2 => return Ok(()),
+                Ok(p) => last = p,
+                // 读不到当前位置就不能判定，按到位处理（老行为），别凭空拒绝执行。
                 Err(_) => return Ok(()),
             }
             std::thread::sleep(Duration::from_millis(5));
         }
-        Ok(())
+        // 200ms 还没落位 = 没到位。原来这里直接 Ok(())，于是"指针根本没过去"被报成成功，
+        // 紧接着的点击就点在旧位置上——而调用方拿到的是一路 ok，屏幕上什么都没发生。
+        // 最常见的原因是坐标越界（多显示器、或者拿像素当点用，Retina 上正好差一倍）。
+        // 宁可拒绝执行也不要假装成功：把真实落点和目标一起说出来，模型自己能判断。
+        Err(Error::System(format!(
+            "指针没能移动到 ({x}, {y})：200ms 后它停在 ({}, {})。本次不执行后续点击。\
+最常见的原因是坐标超出了可用范围——先调 screen.info 看屏幕的**点**尺寸；\
+如果坐标是从截图上量的，注意 Retina 截图是像素、这里收的是点，两者差一倍。",
+            last.0, last.1
+        )))
     }
     
     #[cfg(feature = "system")]
@@ -147,8 +168,9 @@ impl Agent {
 
     /// 拍屏幕。`region` 为 None 就是整屏。返回 PNG 的 data URL。
     #[cfg(feature = "system")]
-    pub fn screen_capture(&mut self, region: Option<(i32, i32, i32, i32)>) -> Result<String> {
-        self.system_init()?;
+    pub fn screen_capture(&mut self, region: Option<(i32, i32, i32, i32)>) -> Result<(String, Option<String>)> {
+        // 截屏是只读能力，不需要辅助功能权限（那是给鼠标键盘注入用的）。
+        self.system_init_readonly()?;
         let sys = self.system.as_ref()
             .ok_or_else(|| Error::System("系统自动化未初始化".to_string()))?
             .lock()

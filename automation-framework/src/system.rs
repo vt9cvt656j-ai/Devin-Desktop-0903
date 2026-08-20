@@ -15,7 +15,28 @@ pub struct SystemAutomation {
     enigo: Enigo,
 }
 
+/// PNG 头 IHDR 里的真实像素尺寸。只读前 33 字节，不解码整张图。
+fn png_pixel_size(buf: &[u8]) -> Option<(u32, u32)> {
+    // 8 字节签名 + 4 长度 + 4 "IHDR" + 4 width + 4 height
+    if buf.len() < 24 || &buf[0..8] != b"\x89PNG\r\n\x1a\n" || &buf[12..16] != b"IHDR" {
+        return None;
+    }
+    let w = u32::from_be_bytes([buf[16], buf[17], buf[18], buf[19]]);
+    let h = u32::from_be_bytes([buf[20], buf[21], buf[22], buf[23]]);
+    if w == 0 || h == 0 { None } else { Some((w, h)) }
+}
+
 impl SystemAutomation {
+    /// 屏幕的**点**尺寸（不是像素）。鼠标坐标用的就是这套单位。
+    fn screen_size_points(&self) -> Option<(u32, u32)> {
+        // enigo 的 main_display 返回的是**点**——和 mouse.move 收的坐标同一套单位。
+        use enigo::Mouse;
+        self.enigo
+            .main_display()
+            .ok()
+            .and_then(|(w, h)| if w > 0 && h > 0 { Some((w as u32, h as u32)) } else { None })
+    }
+
     /// 创建新的系统自动化实例
     pub fn new() -> Result<Self> {
         info!("初始化系统自动化");
@@ -51,7 +72,9 @@ impl SystemAutomation {
     ///   相对当前工作目录，落在哪儿完全不确定。
     /// · **回 data URL 而不是路径**。路径对模型没用——它要的是图本身。
     #[cfg(target_os = "macos")]
-    pub fn screen_capture(&self, region: Option<(i32, i32, i32, i32)>) -> Result<String> {
+    /// 返回 (PNG data URL, 像素↔点的换算说明)。第二项在 Retina 上非空——
+    /// 图是像素尺寸而鼠标收的是点，不说清楚模型就会拿图上量的坐标直接去点，点到屏幕外。
+    pub fn screen_capture(&self, region: Option<(i32, i32, i32, i32)>) -> Result<(String, Option<String>)> {
         use std::io::Read;
         let dir = std::env::temp_dir().join("mrdayone-screen");
         std::fs::create_dir_all(&dir)
@@ -94,15 +117,35 @@ impl SystemAutomation {
         std::fs::File::open(&path)
             .and_then(|mut f| f.read_to_end(&mut buf))
             .map_err(|e| Error::System(format!("读截图失败：{e}")))?;
+        // Retina 上 screencapture 出的是**像素**尺寸（2x），而鼠标要的是**点**坐标。
+        // 此前这个差别一个字都没告诉模型：它在图上量出按钮在 (1200, 800)，直接传给
+        // mouse.move —— 实际点在 (2400, 1600)，屏幕外。「看一眼再动手」这条链从来没成立过。
+        // 这里不改图（缩放会糊，且 OCR 更难认），改成把换算关系如实报出来：
+        // 图的像素尺寸、屏幕的点尺寸、两者的比值。模型除一下就能用。
+        let scale_note = {
+            let px = png_pixel_size(&buf);
+            match (px, self.screen_size_points()) {
+                (Some((pw, ph)), Some((sw, sh))) if sw > 0 && sh > 0 => {
+                    let fx = pw as f64 / sw as f64;
+                    Some(format!(
+                        "image_px={pw}x{ph}; screen_points={sw}x{sh}; pixels_per_point={:.2}。\
+图上量到的坐标要除以 {:.2} 再传给 mouse.move —— 那个接口收的是点，不是像素。",
+                        fx, fx
+                    ))
+                    .filter(|_| (fx - 1.0).abs() > 0.01 || (ph as f64 / sh as f64 - 1.0).abs() > 0.01)
+                }
+                _ => None,
+            }
+        };
         let _ = std::fs::remove_file(&path); // 图已经在内存里，别把它留在盘上
         if buf.is_empty() {
             return Err(Error::System("截屏得到 0 字节——多半是屏幕录制权限没给".into()));
         }
-        Ok(format!("data:image/png;base64,{}", base64_encode(&buf)))
+        Ok((format!("data:image/png;base64,{}", base64_encode(&buf)), scale_note))
     }
 
     #[cfg(not(target_os = "macos"))]
-    pub fn screen_capture(&self, _region: Option<(i32, i32, i32, i32)>) -> Result<String> {
+    pub fn screen_capture(&self, _region: Option<(i32, i32, i32, i32)>) -> Result<(String, Option<String>)> {
         Err(Error::System("这个平台还没有实现屏幕截图".into()))
     }
 
@@ -178,17 +221,34 @@ impl SystemAutomation {
     pub fn drag(&mut self, from_x: i32, from_y: i32, to_x: i32, to_y: i32) -> Result<()> {
         debug!("拖拽: ({}, {}) -> ({}, {})", from_x, from_y, to_x, to_y);
         
+        // 拖拽必须是**连续**的，不能瞬移。
+        //
+        // 原来是：移到起点 → 按下 → **一步瞬移**到终点 → 松开。绝大多数应用识别不了——
+        // HTML5 的 dragover、原生列表的重排、滑块的 value 更新，全都靠中间那一连串
+        // mouse-moved 事件驱动；只有首尾两个点时它们收到的是"按下然后在别处松开"，
+        // 于是滑块不动、拖文件失败、列表顺序没变，而这里一路返回 ok。
+        // 插值 16 步、每步约 12ms（总计约 200ms，接近真人拖动速度）。
         self.move_mouse(from_x, from_y)?;
-        std::thread::sleep(std::time::Duration::from_millis(50));
-        
+        std::thread::sleep(std::time::Duration::from_millis(60));
+
         self.mouse_down(MouseButton::Left)?;
-        std::thread::sleep(std::time::Duration::from_millis(100));
-        
-        self.move_mouse(to_x, to_y)?;
-        std::thread::sleep(std::time::Duration::from_millis(50));
-        
+        std::thread::sleep(std::time::Duration::from_millis(90));
+
+        const STEPS: i32 = 16;
+        for i in 1..=STEPS {
+            let t = i as f64 / STEPS as f64;
+            // 缓入缓出：匀速直线在某些手势识别里也会被当成程序化输入。
+            let e = if t < 0.5 { 2.0 * t * t } else { 1.0 - 2.0 * (1.0 - t) * (1.0 - t) };
+            let x = from_x + ((to_x - from_x) as f64 * e).round() as i32;
+            let y = from_y + ((to_y - from_y) as f64 * e).round() as i32;
+            self.move_mouse(x, y)?;
+            std::thread::sleep(std::time::Duration::from_millis(12));
+        }
+        // 终点再停一拍：拖放的目标高亮/吸附往往有动画，立刻松手会落在上一个位置。
+        std::thread::sleep(std::time::Duration::from_millis(80));
+
         self.mouse_up(MouseButton::Left)?;
-        
+
         Ok(())
     }
 
