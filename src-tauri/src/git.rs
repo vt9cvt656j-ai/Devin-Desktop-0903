@@ -963,22 +963,31 @@ pub struct GitLogEntry {
     refs: Vec<String>,
 }
 
-/// Return the last N commits (default 50) from all branches.
+/// Return the last N commits (default 50).
+///
+/// `all` 默认 **false**，只看当前分支。原来这里写死 `--all`，于是提交历史是
+/// 「所有分支按时间穿插」的一张表——分支装饰只出现在各分支的顶端，中间的行
+/// 长得一模一样。画分支图的面板要的正是这个，但智能体问「刚才这条线上改了什么」
+/// 「这个回归是哪一笔引进来的」时，它拿到的是一份混着别人分支的清单，挑出来的
+/// 提交可能根本不是 HEAD 的祖先——接着 git_show 它、照着不在工作区里的代码推理。
+/// 默认取安全的那个：图形面板显式传 all=true，其余调用方忘了传也不会被带偏。
 #[tauri::command(async)]
-pub fn git_log(root: String, count: Option<usize>) -> Result<Vec<GitLogEntry>, String> {
+pub fn git_log(
+    root: String,
+    count: Option<usize>,
+    all: Option<bool>,
+) -> Result<Vec<GitLogEntry>, String> {
     require_git_root(&root, false)?;
     let n = count.unwrap_or(50).min(200);
     // %P = parent hashes (space-separated), %D = ref names
     let format = "%H%n%h%n%an%n%ar%n%s%n%P%n%D";
-    let out = run_git_checked(
-        &root,
-        &[
-            "log",
-            "--all",
-            &format!("-{n}"),
-            &format!("--format={format}"),
-        ],
-    )?;
+    let mut args: Vec<String> = vec!["log".into()];
+    if all.unwrap_or(false) {
+        args.push("--all".into());
+    }
+    args.push(format!("-{n}"));
+    args.push(format!("--format={format}"));
+    let out = run_git_checked(&root, &args.iter().map(|s| s.as_str()).collect::<Vec<_>>())?;
     Ok(parse_log_entries(&out))
 }
 
@@ -1773,5 +1782,32 @@ mod git_failure_text_tests {
     fn both_streams_are_kept_and_a_silent_failure_still_says_something() {
         assert_eq!(git_failure_text("out", "err", "fallback"), "out\nerr");
         assert_eq!(git_failure_text("", "", "fallback"), "fallback");
+    }
+}
+
+#[cfg(test)]
+mod git_log_scope_tests {
+    /// `--all` 必须是**显式传进来**才加。默认取安全的那个：画分支图的面板要跨分支，
+    /// 智能体问「这条线上刚改了什么」时要的是当前分支，忘了传的调用方不该被带偏。
+    #[test]
+    fn all_is_opt_in_not_hardcoded() {
+        let src = include_str!("git.rs");
+        let body = src
+            .split("pub fn git_log(")
+            .nth(1)
+            .and_then(|s| s.split("\nfn parse_log_entries").next())
+            .expect("git_log 的函数体不见了");
+        assert!(
+            body.contains("if all.unwrap_or(false)"),
+            "git_log 又把 --all 写死了"
+        );
+        let arg_line = body
+            .lines()
+            .find(|l| l.contains("\"--all\""))
+            .expect("--all 整个没了 —— 分支图会退化成一条直线");
+        assert!(
+            arg_line.trim().starts_with("args.push"),
+            "--all 回到了固定参数表里：{arg_line}"
+        );
     }
 }

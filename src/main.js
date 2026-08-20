@@ -497,7 +497,7 @@ async function tauriBackend() {
     gitBranches: (root) => core.invoke("git_branches", { root }),
     gitCheckout: (root, branch, create) => core.invoke("git_checkout", { root, branch, create }),
     gitPull: (root) => core.invoke("git_pull", { root }),
-    gitLog: (root, count) => core.invoke("git_log", { root, count }),
+    gitLog: (root, count, all) => core.invoke("git_log", { root, count, all: all ?? null }),
     gitFileLog: (root, rel, count) => core.invoke("git_file_log", { root, rel, count }),
     gitFileAt: (root, rel, rev) => core.invoke("git_file_at", { root, rel, rev }),
     uiDiff: (target, candidate) => core.invoke("ui_diff", { target, candidate }),
@@ -11756,7 +11756,8 @@ async function refreshGitLog() {
   logTitle.style.display = "";
   let entries;
   try {
-    entries = await backend.gitLog(rootPath, 60);
+    // 分支图要的就是「所有分支穿插」的那份，显式要；智能体那条路默认只看当前分支。
+    entries = await backend.gitLog(rootPath, 60, true);
   } catch {
     return;
   }
@@ -57085,11 +57086,19 @@ async function _executeToolStepInner(step, call, root, run) {
             : `（git show ${call.rev}${showRel ? ":" + showRel : ""} 没有输出）\n${showRel ? "那个提交里可能没有这个路径——文件后来改过名的话，用 git_log 看重命名历史。" : "这可能是个空提交。"}` };
         } else if (call.op === "log") {
           const n = (Number.isFinite(call.count) && call.count > 0) ? Math.floor(call.count) : 20;
+          // 只看当前分支（后端的 all 默认 false）。原来写死 --all，回执是所有分支按时间
+          // 穿插的一张表，而分支装饰只出现在各分支顶端——中间的行长得一模一样。
+          // 抬头点名分支：并行开着别人分支的仓库里，「最近的提交」不写清是谁的就没有意义。
           const entries = await backend.invoke("git_log", { root: gitExecRoot, count: n }) || [];
           const lines = entries.map(e => `${e.short_hash} ${e.message} — ${e.author}, ${e.date}${(e.refs && e.refs.length) ? " (" + e.refs.join(", ") + ")" : ""}`);
+          let _logBranch = "";
+          try { _logBranch = String(gitBranchNameEl?.textContent || "").trim(); } catch {}
+          if (_logBranch === "—") _logBranch = "";
+          const _logHead = `${_logBranch ? `分支 ${_logBranch}` : "当前分支"}的最近 ${entries.length} 条提交`
+            + `（只这一条线，不含其它分支——别的分支上的提交不会出现在这里）：\n`;
           res.className = "atc-result atc-result--ok"; res.textContent = `${entries.length} 条提交`;
           if (vp) vp.innerHTML = `<pre>${_escHtml(lines.join("\n") || "(无提交)")}</pre>`;
-          return { type: "git", path: "log", content: (lines.join("\n") || "(无提交历史)") + gitRerootNote };
+          return { type: "git", path: "log", content: (lines.length ? _logHead + lines.join("\n") : "(无提交历史)") + gitRerootNote };
         } else if (call.op === "commit") {
           const msg = (call.message || "").trim();
           if (!msg) { res.className = "atc-result atc-result--err"; res.textContent = "缺提交信息"; return { type: "git", path: "commit", content: "[ERROR] git_commit 需要 message。" }; }

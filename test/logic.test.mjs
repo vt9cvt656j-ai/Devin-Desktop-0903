@@ -31228,3 +31228,26 @@ test("git_stash：什么都没存进去时不许说「已 stash」", () => {
   assert.match(noop.content, /不带走未跟踪的新文件/,
     "模型会据此去 checkout / clean，动的正是它以为已经收好的东西");
 });
+
+// git_log 原来在后端写死 --all：回执是所有分支按时间穿插的一张表，而分支装饰只出现在
+// 各分支顶端，中间的行长得一模一样。模型问「这个回归是哪一笔引进来的」，挑出来的提交
+// 可能根本不是 HEAD 的祖先——接着 git_show 它、照着不在工作区里的代码推理。
+test("git_log 只看当前分支，并且说清是哪条分支", () => {
+  const seg = SRC.slice(SRC.indexOf('} else if (call.op === "log") {'),
+                        SRC.indexOf('} else if (call.op === "commit") {'));
+  assert.doesNotMatch(seg, /all:\s*true/, "智能体这条路把 --all 又打开了");
+  const body = seg.slice(seg.indexOf("const lines = entries.map"));
+  const run = (entries, branch) => new Function(
+    "entries", "n", "res", "vp", "_escHtml", "gitBranchNameEl", "gitRerootNote", body,
+  )(entries, 20, {}, null, (x) => x, { textContent: branch }, "");
+
+  const e = [{ short_hash: "abc1234", message: "fix", author: "t", date: "1h ago", refs: [] }];
+  const out = run(e, "tool-config-cleanup");
+  assert.match(out.content, /分支 tool-config-cleanup/, "没点名分支——并行开着别人分支时这份清单没有意义");
+  assert.match(out.content, /不含其它分支/, "没说清范围，模型会以为这是全仓最近的提交");
+  assert.match(out.content, /abc1234 fix/);
+
+  // 分支名读的是 git 面板那个 DOM 节点，"—" 是它的空态占位，不能当成分支名印出去。
+  assert.match(run(e, "—").content, /当前分支的最近/);
+  assert.equal(run([], "main").content, "(无提交历史)", "没有提交时别硬扣一个抬头");
+});
