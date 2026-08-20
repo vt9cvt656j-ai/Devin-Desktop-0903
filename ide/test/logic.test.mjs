@@ -18869,7 +18869,7 @@ test("P1：run_subagent 多任务并发——tasks 数组解析 + Promise.allSet
   const mapSrc = extractFn("_mapToolCall");
   assert.match(mapSrc, /case "run_subagent": \{/);
   assert.match(mapSrc, /Array\.isArray\(args\.tasks\)/);
-  assert.match(mapSrc, /tasks: _tasks && _tasks\.length \? _tasks : undefined/);
+  assert.match(mapSrc, /tasks: _kept \? _tasks : undefined/);
   // 并发实现：Promise.allSettled + 合并报告；只对 run_subagent 多任务生效（worker/wiki 不受影响）
   const loopSrc = SRC.slice(SRC.indexOf("const runSubagentItem = async (it)"), SRC.indexOf("const executeScheduledItem"));
   assert.match(loopSrc, /!isWorker && it\.tc\.name === "run_subagent" && Array\.isArray\(it\.call\.tasks\)/);
@@ -18958,7 +18958,8 @@ test("P2.1-异步派发：只读调研默认后台作业立即返回+台账记�
   assert.match(loopSrc, /_jobSess\.streaming && \(_jobSess\._runGen \|\| 0\) === _jobGenSnap/);
   // #43 多任务并发提为 _spawnMulti 后同步/异步两路复用（既有钉死正则仍在本 slice 内）
   assert.match(loopSrc, /const _spawnMulti = async \(\)/);
-  assert.match(loopSrc, /const merged = await _spawnMulti\(\)/);
+  assert.match(loopSrc, /const merged = \(await _spawnMulti\(\)\) \+ _subDropNote/,
+    "合并报告也要带上被丢弃任务的提示");
 });
 
 test("P2.1-结果自动交付：落定作业合并注入一条 nudge，consumed 去重不重复送达", () => {
@@ -31151,4 +31152,102 @@ test("background_monitor：检查不了的条件必须当场说，别用 300 秒
   assert.equal(check(call({ message: "等用户登录" })), null, "manual 被拦了");
   assert.equal(check(call({ message: "等端口", check_type: "port", pattern: "3000" })), null,
     "写全了还被拦");
+});
+
+// run_subagent 的 tasks 数组有三条静默丢弃路，隔壁 spawn_multiple_agents 早就把
+// 「丢掉的角色必须报回去」写进注释了，这边一直没跟上。后果一样：模型以为六条线索
+// 都查了，照着「都覆盖了」下结论，实际只跑了四条。
+test("run_subagent：丢掉的 task 要报回去，单任务的 role 不许吞掉", () => {
+  const map = load("_mapToolCall", {
+    _mcpToolMap: new Map(), _normalizeArgKeys: load("_normalizeArgKeys"),
+    _STR_ARG_KEYS: new Set(), _KNOWN_TOOLS: new Set(["run_subagent"]), _canonicalToolName: () => "",
+  });
+  const call = (args) => map("run_subagent", args);
+
+  // ① 单任务带 role。多任务那条路取 task.role，单任务这条原来写死 args.role，
+  //    于是模型指定的视角凭空消失，派出去的是个通用子体。
+  const one = call({ description: "查权限", tasks: [{ role: "security", task: "审一遍鉴权" }] });
+  assert.equal(one.role, "security", "单任务的 role 被吞了 —— 模型指定了视角，子体压根不知道");
+  assert.equal(one.prompt, "审一遍鉴权");
+  assert.deepEqual(one.dropped, []);
+
+  // ② 超出 4 个并发上限的部分被 slice 掉，而回执里一个字都没提。
+  const six = call({ tasks: Array.from({ length: 6 }, (_, i) => `任务${i}`) });
+  assert.ok(six.dropped.some((d) => /2 个超出/.test(d)), "截断了 2 个却没报");
+
+  // ③ task 为空的项被 filter 静默过滤。
+  const holes = call({ tasks: [{ task: "有内容" }, { task: "" }, { role: "perf" }] });
+  assert.ok(holes.dropped.some((d) => /2 个.*task 为空/.test(d)), "空 task 被静默过滤了");
+
+  // ④ prompt 和 tasks 同时给。原来在 tasks 恰好只有 1 条时 prompt 赢、2 条时 tasks 赢——
+  //    同一份入参因为条数不同走两条路，那一条的正文凭空消失且无人知晓。
+  // 注意 args.prompt 不一定是模型写的：归一里 alias("prompt","description",...) 会把
+  // description 复制过去。**这就是「单任务 brief 消失」的真凶**——原来的
+  // `args.prompt || tasks[0].task` 里 args.prompt 早被 description 顶上了。
+  const aliased = call({ description: "查权限", tasks: [{ task: "审一遍鉴权，重点看 JWT 过期处理" }] });
+  assert.equal(aliased.prompt, "审一遍鉴权，重点看 JWT 过期处理",
+    "整段任务书被 description 顶掉了 —— 子体收到的是三个字的标签");
+  assert.deepEqual(aliased.dropped, [], "description 走 alias 填进来的 prompt 不算「模型给了 prompt」");
+
+  const both = call({ prompt: "按 prompt 走", tasks: [{ task: "按 task 走" }] });
+  assert.equal(both.prompt, "按 task 走", "单任务时 prompt 反过来赢了，tasks[0] 的正文被吞");
+  assert.equal(call({ prompt: "按 prompt 走", tasks: [{ task: "a" }, { task: "b" }] }).tasks.length, 2);
+  assert.ok(both.dropped.some((d) => /prompt 没有被用/.test(d)), "两个都给了却不说用了哪个");
+
+  // 没 tasks 的老路径原样不动。
+  const plain = call({ description: "调研", prompt: "去查", role: "research" });
+  assert.equal(plain.prompt, "去查");
+  assert.equal(plain.role, "research");
+  assert.equal(plain.tasks, undefined);
+
+  // 回执三条路（异步派发 / 多任务合并 / 单任务同步）都要带上这个提示。
+  const dispatch = SRC.slice(SRC.indexOf("const _subDropNote"), SRC.indexOf("const executeScheduledItem"));
+  assert.equal((dispatch.match(/_subDropNote/g) || []).length, 4,
+    "三条回执路径里有的没拼上丢弃提示 —— 走哪条路取决于 wait/条数，模型控制不了");
+});
+
+// git stash 什么都没存进去时照样退出 0，stdout 只印一句 "No local changes to save"，
+// 而前端无条件打「已 stash」、回执抬头也是 `git stash:` —— 读起来就是「存好了」。
+test("git_stash：什么都没存进去时不许说「已 stash」", () => {
+  const seg = SRC.slice(SRC.indexOf('} else if (call.op === "stash") {'),
+                        SRC.indexOf('} else if (call.op === "stash_pop") {'));
+  const run = (out) => {
+    const res = {};
+    const body = seg.slice(seg.indexOf("const _nothingStashed"));
+    return new Function("out", "res", "vp", "_escHtml", "gitRerootNote", body)(out, res, null, (x) => x, "");
+  };
+
+  const ok = run("Saved working directory and index state On main: Mr. Day One stash");
+  assert.match(ok.content, /Saved working directory/);
+  assert.doesNotMatch(ok.content, /什么都没存进去/);
+
+  const noop = run("No local changes to save");
+  assert.match(noop.content, /什么都没存进去/, "一句没存进去被报成了 stash 成功");
+  assert.match(noop.content, /拿不回任何东西/, "没说清后果：stash 栈上根本没有新条目");
+  // git stash 默认不带走未跟踪文件，所以「没有本地改动」≠ 工作区干净。
+  assert.match(noop.content, /不带走未跟踪的新文件/,
+    "模型会据此去 checkout / clean，动的正是它以为已经收好的东西");
+});
+
+// git_log 原来在后端写死 --all：回执是所有分支按时间穿插的一张表，而分支装饰只出现在
+// 各分支顶端，中间的行长得一模一样。模型问「这个回归是哪一笔引进来的」，挑出来的提交
+// 可能根本不是 HEAD 的祖先——接着 git_show 它、照着不在工作区里的代码推理。
+test("git_log 只看当前分支，并且说清是哪条分支", () => {
+  const seg = SRC.slice(SRC.indexOf('} else if (call.op === "log") {'),
+                        SRC.indexOf('} else if (call.op === "commit") {'));
+  assert.doesNotMatch(seg, /all:\s*true/, "智能体这条路把 --all 又打开了");
+  const body = seg.slice(seg.indexOf("const lines = entries.map"));
+  const run = (entries, branch) => new Function(
+    "entries", "n", "res", "vp", "_escHtml", "gitBranchNameEl", "gitRerootNote", body,
+  )(entries, 20, {}, null, (x) => x, { textContent: branch }, "");
+
+  const e = [{ short_hash: "abc1234", message: "fix", author: "t", date: "1h ago", refs: [] }];
+  const out = run(e, "tool-config-cleanup");
+  assert.match(out.content, /分支 tool-config-cleanup/, "没点名分支——并行开着别人分支时这份清单没有意义");
+  assert.match(out.content, /不含其它分支/, "没说清范围，模型会以为这是全仓最近的提交");
+  assert.match(out.content, /abc1234 fix/);
+
+  // 分支名读的是 git 面板那个 DOM 节点，"—" 是它的空态占位，不能当成分支名印出去。
+  assert.match(run(e, "—").content, /当前分支的最近/);
+  assert.equal(run([], "main").content, "(无提交历史)", "没有提交时别硬扣一个抬头");
 });

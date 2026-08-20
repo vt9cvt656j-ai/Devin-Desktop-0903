@@ -222,6 +222,25 @@ pub async fn read_screen(ocr: Option<bool>) -> Result<ReadScreenResponse, String
                     .into(),
             );
         }
+    } else if !use_ocr {
+        // 实测过的事实，不是猜的：浏览器把可访问性几何裁到可见区，折叠以下的内容
+        // 要么不出现，要么被压扁成零高度容器（然后被尺寸过滤掉）——所以这份清单等于
+        // 「这一屏上有什么」，不等于「这个页面有什么」。
+        //
+        // 不说清楚，模型读完没找到目标按钮，就会断言这页没有这个功能，然后基于这句
+        // 假话往下做决定。它其实只需要滚一下再读一次。
+        limitations.push(
+            "This is the frontmost window's CURRENTLY VISIBLE area — an accessibility tree reports what is on screen, not the whole document. In a browser or any scrollable view, anything below the fold is simply absent from this list. So \"the element I need is not here\" usually means \"it has not been scrolled into view\", NOT \"it does not exist\": scroll and read again before concluding a control is missing."
+                .into(),
+        );
+        // 截断必须说出来。500 上限静默生效时，一份被砍掉一半的清单看起来和一份完整的
+        // 清单一模一样，模型没有任何办法察觉自己看到的是残缺的。
+        if elements.len() >= 500 {
+            limitations.push(format!(
+                "The element list hit its {} cap and WAS TRUNCATED — what you see is not everything this window exposes. Interactive controls are kept first and plain text is dropped first, so a missing label may still be on screen. Narrow the view (scroll to the region you care about) and read again rather than assuming the rest is empty.",
+                elements.len()
+            ));
+        }
     }
     Ok(ReadScreenResponse {
         source: if use_ocr {
@@ -1083,6 +1102,38 @@ return JSON.stringify({operated:operated,changed:changed});
     }
 
     #[cfg(target_os = "macos")]
+    #[test]
+    fn a_successful_read_still_says_what_it_could_not_see() {
+        // AX 树只覆盖可见的那一屏（实测：浏览器把几何裁到可见区，折叠以下的内容
+        // 不出现或被压扁成零高度然后被过滤）。而 500 上限是静默生效的——被砍过的
+        // 清单和完整的清单长得一模一样。这两件事不说，模型会把「没滚到」和「被截断」
+        // 都读成「这东西不存在」，然后基于假话往下决策。
+        // needle 拼出来，否则这个测试自己会被数进去。
+        let src: String = include_str!("accessibility.rs")
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let viewport = format!("{} VISIBLE", "CURRENTLY");
+        let truncated = format!("{} TRUNCATED", "WAS");
+        let cap_check = format!("elements.len() {} 500", ">=");
+        assert_eq!(
+            src.matches(&viewport).count(),
+            1,
+            "成功读取时必须说明这只是可见的那一屏"
+        );
+        assert_eq!(
+            src.matches(&truncated).count(),
+            1,
+            "触到上限时必须说明清单被截断了"
+        );
+        assert_eq!(
+            src.matches(&cap_check).count(),
+            1,
+            "截断说明要真的按元素数判断，不能写死"
+        );
+    }
+
     #[test]
     fn both_ax_scans_skip_windows_the_user_cannot_click() {
         // 最小化的窗口交出来的是失效坐标，照着点会落在空处；浏览器还会挂 1x1 的隐藏工具窗。
