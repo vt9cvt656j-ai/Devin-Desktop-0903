@@ -34877,11 +34877,44 @@ function _planStepActionKind(step) {
   if (_PLAN_STEP_KINDS.has(declared)) return declared;
   const text = String(step?.content || step?.title || step?.description || step || "").toLowerCase();
   if (!text) return "";
-  if (/(?:test|check|verify|validat|assert|build|compile|type.?check|lint|smoke|regression|screenshot|browser|viewport|health|exit\s*code|console|network|测试|检查|验证|校验|确认|复测|回归|构建|编译|截图|浏览器|视口|退出码|控制台|网络|验收)/i.test(text)) return "verify";
-  if (/(?:implement|edit|change|fix|add|create|refactor|write|update|integrat|migrat|wire|remove|replace|patch|scaffold|setup|install|config|初始化|搭建|脚手架|实现|修改|修复|新增|创建|生成|编辑|重构|编写|接入|迁移|改造|替换|删除|落地|补齐|安装|写入|更新|配置|设置|定义|设计|完善|调整|优化|加上|做一个|做个)/i.test(text)) return "implement";
-  if (/(?:execute|run|start|serve|preview|launch|wait|monitor|terminal|watch|daemon|background|deploy|执行|运行|启动|跑起来|跑通|跑一下|预览|等待|监听|监控|终端|持续任务|后台|守护进程|部署|上线)/i.test(text)) return "execute";
-  if (/(?:investigat|inspect|analy[sz]|reproduc|locat|trace|read|review|understand|diagnos|audit|map|inventory|log|error|stack|调用链|数据流|调查|检查|分析|复现|定位|追踪|读取|阅读|审查|梳理|摸清|确认|盘点|取证|诊断|日志|报错|根因)/i.test(text)) return "investigate";
-  return "";
+  // 谁**先出现**谁说了算，而不是谁先被测试。
+  //
+  // 原来是四条正则按 verify → implement → execute → investigate 顺序试，命中即返回。
+  // 用户实拍的九步计划里，这套判法错了两步：
+  //   ·「搭建 Electron + React + Vite 项目脚手架与构建配置」判成 verify——"搭建"是实现，
+  //     可后半句的"构建"属于 verify 表，而 verify 排在前面，于是后半句抢走了整步的定性。
+  //   ·「调研 Monaco Editor + …」判成 implement——英文动词表**没有词边界**，
+  //     `edit` 直接匹进了 "Editor"。产品名里带 editor / run / map / add 的步骤全会中招。
+  // 判错是双向的伤：该勾的勾不上（进度条永远难看），不该勾的可能被勾掉（假完成）。
+  // 两边都会让计划失去可信度，然后模型和用户一起不再当真。
+  //
+  // 改成按**最早出现的位置**定性：一句话的主动词在最前面，这比"表的排列顺序"可靠得多。
+  // 英文一律加词边界；中文保持原样（中文没有词边界问题，加了反而失配）。
+  const _KIND_PATTERNS = [
+    ["verify", /\b(?:test|check|verify|validat\w*|assert|build|compile|type-?check|lint|smoke|regression|screenshot|viewport|health|console)\b|测试|检查|验证|校验|复测|回归|构建|编译|截图|浏览器|视口|退出码|控制台|验收/i],
+    ["implement", /\b(?:implement\w*|edit|edits|editing|change|fix|add|adds|create|creates|refactor\w*|write|writes|update|updates|integrat\w*|migrat\w*|wire|remove|replace|patch|scaffold\w*|setup|install|config\w*)\b|初始化|搭建|脚手架|实现|修改|修复|新增|创建|生成|编辑|重构|编写|接入|集成|迁移|改造|替换|删除|落地|补齐|安装|写入|更新|配置|设置|定义|设计|完善|调整|优化|加上|做一个|做个/i],
+    ["execute", /\b(?:execute|run|runs|start|starts|serve|preview|launch|wait|monitor|terminal|watch|daemon|background|deploy)\b|执行|运行|启动|跑起来|跑通|跑一下|预览|等待|监听|监控|终端|持续任务|后台|守护进程|部署|上线/i],
+    // 中文里"调研/研究/探索/对比/选型/评估/摸底"是计划第一步最常用的词，原表一个都没有，
+    // 只有"调查"——于是"调研 X"这种最典型的开头步骤永远分不出类。
+    ["investigate", /\b(?:investigat\w*|inspect|analy[sz]\w*|reproduc\w*|locat\w*|trace|read|reads|review|understand|diagnos\w*|audit|inventory)\b|调用链|数据流|调研|调查|研究|探索|对比|选型|评估|摸底|分析|复现|定位|追踪|读取|阅读|审查|梳理|摸清|盘点|取证|诊断|根因/i],
+  ];
+  let best = "", bestAt = Infinity;
+  const matched = new Set();
+  for (const [kind, re] of _KIND_PATTERNS) {
+    const m = text.match(re);
+    if (!m) continue;
+    matched.add(kind);
+    if (m.index < bestAt) { best = kind; bestAt = m.index; }
+  }
+  // 重叠时倒向**更严**的那一类。
+  //
+  // 「运行测试并检查退出码」按位置定性会得到 execute（"运行"在最前），可 execute 是四类里
+  // 最宽松的——_planStepMatchesEvidence 让它同时接受 execute 和 verify 证据，于是一条
+  // `npm install` 就能把这一步勾掉。那是假完成。而 verify 只认 verify 证据。
+  // 位置解决的是"谁是主动词"，这一条解决的是"错了往哪边错"：宁可严到勾不上，
+  // 也不能松到假勾上——一步停在进行中只是看着慢，一个假勾会让用户以为事情做了。
+  if (best === "execute" && matched.has("verify")) return "verify";
+  return best;
 }
 
 function _planEvidenceKindsForTool(call, result) {
@@ -34946,6 +34979,15 @@ function _advancePlanFromTool(run, call, result) {
   let changed = steps !== run._planSteps;
   if (idx < 0) return false;
   if (!_planStepMatchesEvidence(steps[idx], evidenceKinds)) {
+    // 「刚做的事和当前这一步对不上」是这里**当场算出来的**事实，此前算完就扔。
+    // 用户实拍：9 步计划的第 1 步是"调研"，模型直接去写 package.json（第 3 步的活），
+    // 进度条停在 0/9——他看到的是"计划列得挺准，就是不照着走"。
+    // 记在 run 上，供每轮那条计划位置行带一句，不新开提醒通道、不占提醒预算。
+    run._planStepMismatch = {
+      step: String(steps[idx]?.content || "").slice(0, 80),
+      want: _planStepActionKind(steps[idx]),
+      got: [...new Set(evidenceKinds)].join("/"),
+    };
     if (changed) {
       run._planSteps = steps;
       if (run._planEl?.parentNode) _renderPlan(run._planEl.parentNode, steps, run._planEl, run);
@@ -34954,6 +34996,7 @@ function _advancePlanFromTool(run, call, result) {
     return changed;
   }
   // 事实记账：这个勾是哪个工具在本 run 第几次工具调用时推进的（供追责/调试，不进 UI）。
+  run._planStepMismatch = null;   // 对上了就把上一次的错配清掉
   const advancedBy = { tool: String(call?.type || ""), iter: Number(run?._toolStep) || 0 };
   steps = steps.map((step, i) => i === idx ? { ...step, status: "completed", advancedBy } : step);
   steps = _planPrimeCurrentStep(steps);
@@ -41881,6 +41924,8 @@ function _strayScratchFiles(run, testDir) {
 
 // 交付事实注入消息的标签：每轮替换上一条，避免在长 run 里越堆越多。
 const _DELIVERY_FACTS_TAG = "[本轮交付事实]";
+/// 计划位置的每轮标签。和交付事实同形：每轮替换上一条，不在长 run 里越堆越多。
+const _PLAN_STATE_TAG = "[任务计划·当前位置]";
 function _deliveryFactsLine(run) {
   const { code, tests, ran, verifiers } = _deliveryFacts(run);
   // 落空的写入尝试：**比"改了几个文件"更要紧的一条**。
@@ -49911,6 +49956,33 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
           messages.push({ role: "user", content: `${_ORCH_NOTE}${_DELIVERY_FACTS_TAG}（本轮真实执行记录，不是推断）: ${_facts}\n`
             + "照着事实说话：没跑过验证就别说「已验证」「能用了」「跑通了」；该验证就现在去验证，别把没做的事写成做完了。" });
         }
+        // 计划位置也每轮重注，和交付事实同一条通道。
+        //
+        // 此前计划**只**以「当初那次 update_plan 的工具结果」的形式存在于历史里，随着
+        // 对话变长就沉底了——于是模型列了一份很准的 9 步计划，然后跳过第 1 步（调研）
+        // 直接去做第 3 步（写 package.json）。用户看到的是"计划列得挺好，就是不照着走"。
+        //
+        // 这里只报事实（几步、完成几步、当前是哪一步），不带说教：催同步进度的话
+        // 已经有 planStale 那条按证据触发的提醒了，重复说只会更沉重。
+        // 模型每轮看见"当前第 1 步：调研…"而自己正在写 package.json，这个反差本身就够。
+        for (let i = messages.length - 1; i >= 0; i--) {
+          if (messages[i].role === "user" && typeof messages[i].content === "string" && messages[i].content.includes(_PLAN_STATE_TAG)) { messages.splice(i, 1); break; }
+        }
+        const _planNow = Array.isArray(run._planSteps) ? run._planSteps : [];
+        if (run.mode === "agent" && _planNow.length) {
+          const _doneN = _planNow.filter((s) => s?.status === "completed").length;
+          const _curIdx = _planNow.findIndex((s) => s?.status === "in_progress");
+          const _atIdx = _curIdx >= 0 ? _curIdx : _planNow.findIndex((s) => s?.status === "pending");
+          if (_atIdx >= 0) {
+            const _next = _planNow.slice(_atIdx + 1).find((s) => s?.status === "pending");
+            messages.push({ role: "user", content: `${_ORCH_NOTE}${_PLAN_STATE_TAG} 共 ${_planNow.length} 步，已完成 ${_doneN}。`
+              + `当前第 ${_atIdx + 1} 步：${String(_planNow[_atIdx]?.content || "").slice(0, 160)}`
+              + (_next ? `（其后：${String(_next.content || "").slice(0, 80)}）` : "（这是最后一步）")
+              + (run._planStepMismatch
+                ? `\n上一次动作是「${run._planStepMismatch.got}」类，而这一步要的是「${run._planStepMismatch.want}」类，所以它没有被勾上。两条路都行：先把这一步做掉，或者 update_plan 把它标 cancelled 并写明为什么不做——别让它一直停在这儿。`
+                : "") });
+          }
+        }
       }
 
       // Tool-RAG (B) — anti-forgetting refresh: on a long run, re-surface the full
@@ -50402,7 +50474,11 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
       if (planSteps && iter > 0 && iter % 8 === 0 && iter <= 40 && _live()) {
         const pending = Array.isArray(planSteps) ? planSteps.filter(s => s.status === "pending" || s.status === "in_progress") : [];
         if (pending.length) {
-          _pushNudge("planRefresh", `你已经执行了 ${iter} 步。快速回顾一下已完成和还缺什么，根据真实证据调整下一步；不用为了形式更新计划，直接继续完成剩余改动和验证。`);
+          // 原文的后半句是"不用为了形式更新计划，直接继续完成剩余改动和验证"——它在**劝退**：
+          // 一边每 8 轮提醒回顾计划，一边告诉模型别管计划。用户看到的就是"计划列得挺准，
+          // 但它不照着走，进度条一直是 0/N"。删掉那半句；剩下的话只报事实：还剩哪几步。
+          // 催同步进度已经有 planStale 那条按证据触发的提醒，这里不重复说。
+          _pushNudge("planRefresh", `你已经执行了 ${iter} 步，计划里还剩 ${pending.length} 步没做完：${pending.slice(0, 5).map((s) => s.content).join("、")}。对着真实证据看一眼：哪几步其实已经做到了（去 update_plan 标 completed）、哪几步查清之后不该做了（标 cancelled 并写明原因）、下一步该做哪个。`);
         }
       }
 

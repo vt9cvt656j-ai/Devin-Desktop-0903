@@ -55,6 +55,43 @@ test("没声明的老计划照旧靠动词表兜底，行为不变", () => {
   assert.equal(kindOf({ content: "面包店门店信息与地图" }), "");
 });
 
+test("用户实拍那份 9 步计划，每一步都要判对类型", () => {
+  // 判错是双向的伤：该勾的勾不上（进度条永远难看），不该勾的可能被勾掉（假完成）。
+  // 两边都会让计划失去可信度，然后模型和用户一起不再当真——用户原话：
+  // 「任务规划内容是非常准确的，但是我的不根据任务规划去走」。
+  const cases = [
+    // 英文动词表原来没有词边界，`edit` 直接匹进 "Editor"，这一步被判成 implement。
+    ["调研 Monaco Editor + Electron + React 集成方案与最佳实践", "investigate"],
+    ["设计架构：确定 Electron 主进程/渲染进程通信、文件系统抽象层、状态管理方案", "implement"],
+    // "搭建"是实现，可后半句的"构建"属于 verify 表，而 verify 原来排在前面先被测试，
+    // 于是后半句抢走了整步的定性。
+    ["搭建 Electron + React + Vite 项目脚手架与构建配置", "implement"],
+    ["实现 Electron 主进程：窗口创建、菜单、文件操作 IPC 通信", "implement"],
+    ["集成 Monaco Editor：编辑器实例、语法高亮、主题配置", "implement"],
+    ["实现文件管理：文件树组件、打开/保存/新建文件、多 tab 管理", "implement"],
+  ];
+  for (const [content, want] of cases) {
+    assert.equal(kindOf({ content }), want, `「${content.slice(0, 24)}」判成了 ${kindOf({ content }) || "空"}`);
+  }
+});
+
+test("中文里最常见的调研类动词不能一个都不在表里", () => {
+  // 原表只有"调查"，而计划第一步最常用的是"调研"，其次是研究/探索/对比/选型/评估。
+  // 分不出类的步骤永远勾不上，进度条永远难看，模型很可能因此索性放弃维护计划。
+  for (const verb of ["调研", "研究", "探索", "对比", "选型", "评估", "摸底"]) {
+    assert.equal(kindOf({ content: `${verb}一下现有方案` }), "investigate", `${verb} 分不出类`);
+  }
+});
+
+test("重叠时倒向更严的那一类，不许倒向更松的", () => {
+  // execute 是四类里最宽松的（同时接受 execute 和 verify 证据），verify 只认 verify。
+  // 「运行测试」按位置定性会得到 execute，那样一条 npm install 就能把它勾掉——假完成。
+  assert.equal(kindOf({ content: "运行测试并检查退出码" }), "verify");
+  assert.equal(kindOf({ content: "跑一遍测试" }), "verify");
+  // 但主动词是实现时不受影响：implement 不比 verify 松，不该被覆盖。
+  assert.equal(kindOf({ content: "搭建脚手架与构建配置" }), "implement");
+});
+
 test("乱写的 kind 当作没声明，退回猜测而不是让整步失效", () => {
   assert.equal(kindOf({ content: "运行测试", kind: "不存在的类别" }), "verify");
   assert.equal(kindOf({ content: "运行测试", kind: "" }), "verify");
