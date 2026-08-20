@@ -612,6 +612,15 @@ fn launch() -> Result<Session, String> {
             let _ = std::fs::create_dir_all(&fresh);
             let opts2 = LaunchOptionsBuilder::default()
                 .path(Some(std::path::PathBuf::from(&path)))
+                // 这一行以前**只有上面那条主路径有**，回退路径漏了，于是它吃的是
+                // headless_chrome 的默认 30 秒空闲超时。症状和上面注释描述的一模一样：
+                // 起了窗口 → 模型转头去读代码/跑测试（超过 30 秒是常态）→ 回来连接已断
+                // → 杀掉进程 → 重开一个新窗口，什么都没操作。
+                //
+                // 而且它会**自我循环**：被杀掉的进程留下 profile 锁 → 下一次启动又落到这条
+                // 回退路径 → 又没有超时 → 又被杀。用户看到的就是「打开窗口卡在那里，
+                // 过一会开新的，就是不操作」，一直转圈出不来。
+                .idle_browser_timeout(std::time::Duration::from_secs(30 * 60))
                 .headless(headless)
                 .sandbox(false)
                 .ignore_certificate_errors(true)
@@ -2423,13 +2432,28 @@ mod tests {
                 SRC.contains(&needle),
                 "LaunchOptions 没有配 idle_browser_timeout —— 会退回默认 30 秒，浏览器会被反复杀掉重开",
             );
-            // 而且必须明显长于一次动作间隔。30 秒那一档等于没配。
-            let at = SRC.find(&needle).unwrap();
-            let call = &SRC[at..(at + 120).min(SRC.len())];
+            // **每一处** LaunchOptions 都要配，不是有一处就算数。
+            //
+            // 这条断言原来只查「文件里出现过一次」，于是回退路径（profile 被残留进程锁住时
+            // 走的那条）漏配了它整整一直没被发现：那条路吃默认 30 秒，起了窗口就断，
+            // 断了杀进程、杀完留下锁、下次又落回退路径——自我循环，用户看到的是
+            // 「打开窗口卡在那里，过一会开新的，就是不操作」。
+            // 同上：拼出来找，别写成字面量——否则会匹配到本测试自己，把 2 处数成 3 处。
+            let builder_needle = format!("{}::default()", "LaunchOptionsBuilder");
+            let builders = SRC.matches(&builder_needle).count();
+            let configured = SRC.matches(&needle).count();
             assert!(
-                call.contains("60") || call.contains("min"),
-                "空闲超时看起来还是秒级；这道门要的是分钟级：{call}",
+                configured >= builders,
+                "有 {builders} 处 LaunchOptions，只有 {configured} 处配了空闲超时——漏配的那条会退回默认 30 秒",
             );
+            // 而且每一处都必须明显长于一次动作间隔。30 秒那一档等于没配。
+            for (at, _m) in SRC.match_indices(&needle) {
+                let call = &SRC[at..(at + 120).min(SRC.len())];
+                assert!(
+                    call.contains("60") || call.contains("min"),
+                    "位置 {at} 处的空闲超时看起来还是秒级；这道门要的是分钟级：{call}",
+                );
+            }
         }
 
         // 孤儿清理的判据要覆盖**每一种**我们会造出来的 profile 目录，
