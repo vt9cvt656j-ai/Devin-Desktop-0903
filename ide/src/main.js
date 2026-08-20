@@ -24850,6 +24850,26 @@ function _runStateNextActionSuggestions(sess, { maxAgeMs = 5 * 60_000 } = {}) {
       send: `上一轮的收尾评审读了改动本身,判定还没实现要求。它给的具体指令是:\n${run.wrapUp.instruction}\n\n先核对这条说得对不对(以我的原话为准),对就照着补完。`,
     });
   }
+  // direction：评审拿【用户历次要求】去对这一轮的走向，只在**不一致**时才出声。
+  // 它就是这套东西里唯一一处「你真正想做的是不是另一件事」的检测器，而且当初是用户
+  // 点名要的（"即使用户走歪了，给用户弄完 也可以给用户说 他想要做的是什么事情"）。
+  // 按设计它是事后提醒、不改变本轮交付，所以出口只能是一张卡：说与不说由它，听不听由用户。
+  if (run.wrapUp && run.wrapUp.direction) {
+    picks.push({
+      label: "评审说我真正想做的是另一件事",
+      send: `上一轮的收尾评审对着我历次的要求看,认为我真正想做的是:\n${run.wrapUp.direction}\n\n这个判断对就按它继续;不对就当没说,按我的原话来。`,
+    });
+  }
+  // findings：改动过程中顺手发现的、**本次任务之外**的真实缺陷。同样是用户点名要的
+  // （"修 bug 过程中发现更多问题"）。不许自动去修——超出本轮范围，修不修是用户的事。
+  if (run.wrapUp && Array.isArray(run.wrapUp.findings) && run.wrapUp.findings.length) {
+    picks.push({
+      label: `顺带修掉发现的 ${run.wrapUp.findings.length} 处问题`,
+      send: `上一轮改动时顺带发现这些**本次任务之外**的真实问题:\n`
+        + run.wrapUp.findings.map((f, i) => `${i + 1}. ${f}`).join("\n")
+        + `\n\n逐条先确认现在还在不在,再决定修哪些——别直接动手。`,
+    });
+  }
 
   // 场景 3:成功且有运行效果→提示验证
   if (run.outcome === "success" && run.runtimeEffects && run.runtimeEffects.length) {
@@ -50518,9 +50538,18 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
       // 没人收得到的结论。落到这里,它才能变成一个用户点得动的建议。
       wrapUp: (() => {
         const v = run?._wrapUpVerdict;
-        if (!v || v.done !== false) return null;
-        const instruction = String(v.instruction || "").replace(/\s+/g, " ").trim().slice(0, 300);
-        return instruction ? { instruction } : null;
+        if (!v) return null;
+        const clean = (x, n) => String(x || "").replace(/\s+/g, " ").trim().slice(0, n);
+        // instruction 只在评审判「没实现」时才算数；done 缺席（评审压根没跑成）不许
+        // 被当成「没实现」——那是凭空冤枉自己。
+        const instruction = v.done === false ? clean(v.instruction, 300) : "";
+        // findings / direction 按设计**不参与 done**（"先交付，再提醒"），所以它们和
+        // done 通过与否无关，通过的那轮同样要说。
+        const direction = clean(v.direction, 300);
+        const findings = (Array.isArray(v.findings) ? v.findings : [])
+          .map((f) => clean(`${f?.where ? f.where + " " : ""}${f?.what || ""}`, 160))
+          .filter(Boolean).slice(0, 3);
+        return (instruction || direction || findings.length) ? { instruction, direction, findings } : null;
       })(),
       mutated: !!didMutate, // 「接下来」建议据此区分干活轮和纯问答轮
       toolStats: _toolLedgerStats(run._toolLedger?.entries || []),
