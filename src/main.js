@@ -32765,7 +32765,7 @@ function _buildAgentToolSchemas(includeWrite, mcpTools = []) {
     { type: "function", function: { name: "lsp_symbols", description: "List a file's code structure outline — the language service (LSP / Monaco TS) parses out functions, classes, methods, variables and other symbols with their line numbers. Faster than read_file for seeing a file's skeleton. Requires a language service for that language (JS/TS work out of the box; Python, Go, Rust and so on need their LSP installed). 【When to use】To get a quick sense of what a file exports and which functions and classes it holds, and to locate roughly where a symbol is. 【vs alternatives】To find a symbol's definition across the project use find_symbol; for its callers use lsp_references.", parameters: { type: "object", properties: { path: { type: "string", description: "File path" } }, required: ["path"] } } },
     { type: "function", function: { name: "find_symbol", description: "**Find a symbol across the whole project** — locate every definition of a function / class / interface / type / constant by name (file:line). It queries the workspace symbol index maintained in the background and **returns in milliseconds**, far faster than grepping the whole project. First choice in a large project for finding a definition, a name collision, or a duplicate implementation. Supports a kind filter (function/class/interface/type/enum/const/struct/trait/impl). The index is built in the background about 3 seconds after the IDE starts and covers JS/TS, Python, Rust, Go, Java/Kotlin, C/C++, Ruby, PHP and more. 【When to use】When you need a symbol's definition — faster and more precise than a full-text grep; to find its callers use lsp_references. 【vs alternatives】For callers use lsp_references; to search by meaning use semantic_search; for plain text matching use search.", parameters: { type: "object", properties: { name: { type: "string", description: "The symbol name (exact match; case-insensitive)" }, kind: { type: "string", description: "Optional; filter by symbol type: function / class / interface / type / enum / const / struct / trait / impl / method" }, limit: { type: "integer", description: "Maximum number of results to return (default 20)" } }, required: ["name"] } } },
     { type: "function", function: { name: "semantic_search", description: "**Find code by meaning** — not exact grep matching, but \"find the code that does this\" from a sentence of natural language. 【When to use】First choice when first exploring an unfamiliar codebase, or when you can describe the behaviour but cannot name a keyword — far faster than reading and grepping your way through guesses. 【vs alternatives】When you know the exact symbol name use find_symbol; when you know a keyword or string use search; to find files by name use find_files.", parameters: { type: "object", properties: { query: { type: "string", description: "A natural-language description of the code you want (the more specific the better)" }, top_k: { type: "integer", description: "How many of the most relevant code blocks to return (default 10, maximum 30)" } }, required: ["query"] } } },
-    { type: "function", function: { name: "knowledge_search", description: "**Query the platform's built-in professional knowledge base** — battle-tested best practices and common traps across specialist areas (front-end React/Next, back-end API design, database schema/indexing, application security, UI/UX design, DevOps deployment), distilled from senior experience. **When a domain task is unfamiliar or has to be right, look here first**: how to design a database schema, where a JWT should be stored, how to make UI look professional, how to use API status codes, how to prevent SQL injection or IDOR, how to write a Dockerfile, **which tool plus exact command to use to reverse-engineer or decompile a given format**, and so on. Follow the best practices you find rather than going from impressions. It returns the few most relevant passages. This is faster and more focused than a web search (it is already curated), and a second spent here before you start avoids many traps and noticeably raises the quality of the result.", parameters: { type: "object", properties: { query: { type: "string", description: "What you are doing / the best practice you want to confirm, e.g. \"how to build a database index\", \"jwt vs session\", \"how to unpack an NSIS installer\", \"pyinstaller decompile\", \"js deobfuscation\", \"radare2 disassembly\"" }, domain: { type: "string", description: "Optional; restrict to a domain. **michael-design** is the design blueprint corpus \u2014 441 production-grade, Tailwind-native page and section blueprints with real palettes, layout composition patterns, motion recipes and component coverage. Pass it for ANY visible UI work (website, web app, desktop GUI, dashboard, landing page, a single component) and build from what it returns instead of inventing colours and spacing from memory. Other domains: web-frontend / backend-api / database / security / ui-ux / devops / reverse-engineering / penetration-testing" }, top_k: { type: "integer", description: "How many passages to return (default 6, maximum 20)" } }, required: ["query"] } } },
+    { type: "function", function: { name: "knowledge_search", description: "**Query the platform's built-in professional knowledge base** — battle-tested best practices and common traps across specialist areas (front-end React/Next, back-end API design, database schema/indexing, application security, UI/UX design, DevOps deployment), distilled from senior experience. **When a domain task is unfamiliar or has to be right, look here first**: how to design a database schema, where a JWT should be stored, how to make UI look professional, how to use API status codes, how to prevent SQL injection or IDOR, how to write a Dockerfile, **which tool plus exact command to use to reverse-engineer or decompile a given format**, and so on. Follow the best practices you find rather than going from impressions. It now ALSO answers from this platform's own code corpus: the real exported signatures of published libraries (npm / PyPI / crates.io, extracted from the published package itself) and official documentation (MDN for the whole web platform, plus React / Vue / Svelte / TypeScript / Node / Rust / Astro / FastAPI). So it is the right first stop for \"what is this library's real API\" and \"what does the spec actually say\", not only for curated advice. Every passage is labelled by source: curated = distilled experience, real_api = the library's own declaration, official_docs = the official documentation. Prefer a labelled passage over recalling an API from memory: a signature you remember may belong to a different major version. It returns the few most relevant passages. This is faster and more focused than a web search (it is already curated), and a second spent here before you start avoids many traps and noticeably raises the quality of the result.", parameters: { type: "object", properties: { query: { type: "string", description: "What you are doing / the best practice you want to confirm, e.g. \"how to build a database index\", \"jwt vs session\", \"how to unpack an NSIS installer\", \"pyinstaller decompile\", \"js deobfuscation\", \"radare2 disassembly\"" }, domain: { type: "string", description: "Optional; restrict to a domain. **michael-design** is the design blueprint corpus \u2014 441 production-grade, Tailwind-native page and section blueprints with real palettes, layout composition patterns, motion recipes and component coverage. Pass it for ANY visible UI work (website, web app, desktop GUI, dashboard, landing page, a single component) and build from what it returns instead of inventing colours and spacing from memory. Other domains: web-frontend / backend-api / database / security / ui-ux / devops / reverse-engineering / penetration-testing" }, top_k: { type: "integer", description: "How many passages to return (default 6, maximum 20)" } }, required: ["query"] } } },
     { type: "function", function: { name: "lsp_definition", description: "Jump to a symbol's definition. Give the file the symbol appears in, its line number and the symbol name, and it returns file:line for the definition. It resolves semantically, so it is more accurate than guessing with search. Requires a language service for that language. 【When to use】When reading code and you want to jump precisely into an implementation (you already know an occurrence at path:line); if you do not know where it is, use find_symbol first, and for usages use lsp_references. 【vs alternatives】For callers use lsp_references; when the location is unknown start with find_symbol.", parameters: { type: "object", properties: { path: { type: "string", description: "The file where the symbol appears" }, line: { type: "integer", description: "The line the symbol is on (1-based)" }, symbol: { type: "string", description: "The symbol name (used to locate the column on that line)" } }, required: ["path", "line"] } } },
       { type: "function", function: { name: "lsp_hover", description: "**Ask the language server what a symbol's type/signature actually is**, at a given position — the same information the editor shows on hover: resolved signature plus doc comment, for the version actually installed here. 【When to use】When you are about to call something and are not sure of its exact signature, and you already have an occurrence at path:line (yours or existing code). This is the cheapest possible signature check — one round trip, no file reading. 【Limits】Needs a running language server for that language; if it returns nothing, fall back to package_source (for third-party APIs) or read the definition. Does NOT work for a symbol you have not written down anywhere yet — use find_symbol or package_source for that.", parameters: { type: "object", properties: { path: { type: "string", description: "File containing the occurrence" }, line: { type: "integer", description: "1-based line number of the occurrence" }, symbol: { type: "string", description: "The symbol name on that line (used to find the exact column)" } }, required: ["path", "line", "symbol"] } } },
     { type: "function", function: { name: "lsp_references", description: "Find every reference to / use of a symbol in the project. Give the file the symbol appears in, its line number and the symbol name, and it returns the reference list (file:line). It resolves semantically, so it is more accurate than a plain-text search (it distinguishes same-named but different things). Requires a language service for that language. 【When to use】To see who calls a function or variable and to gauge the blast radius of a change — more precise than a full-text grep, with semantic boundaries that do not report same-named false positives. 【vs alternatives】To jump to the definition use lsp_definition; to outline a whole file's symbols use lsp_symbols.", parameters: { type: "object", properties: { path: { type: "string", description: "The file where the symbol appears" }, line: { type: "integer", description: "The line the symbol is on (1-based)" }, symbol: { type: "string", description: "The symbol name (used to locate the column on that line)" } }, required: ["path", "line"] } } },
@@ -33291,11 +33291,13 @@ function _searchToolsFuzzyMatch(query, registry, loadedNames) {
       if (useCases.some((u) => String(u).toLowerCase().includes(w))) { score += 2; matchedOn.push("use_case"); }
       if (desc.includes(w)) { score += 1; matchedOn.push("desc"); }
     }
+    // 二元组也要**归因到具体维度**。统一记成 "cjk" 的话，下游判"有没有命中结构化维度"
+    // 对中文查询结构上永远为假——而中文恰恰只能靠二元组命中，于是快通道对中文全盲。
     for (const w of extraTokens) {
-      if (lname.includes(w) || triggers.some((t) => String(t).toLowerCase().includes(w))
-        || useCases.some((u) => String(u).toLowerCase().includes(w)) || desc.includes(w)) {
-        score += 1; matchedOn.push("cjk");
-      }
+      if (lname.includes(w)) { score += 1; matchedOn.push("name"); }
+      else if (triggers.some((t) => String(t).toLowerCase().includes(w))) { score += 1; matchedOn.push("trigger"); }
+      else if (useCases.some((u) => String(u).toLowerCase().includes(w))) { score += 1; matchedOn.push("use_case"); }
+      else if (desc.includes(w)) { score += 1; matchedOn.push("desc"); }
     }
     if (score <= 0) continue;
     hits.push({
@@ -33310,6 +33312,30 @@ function _searchToolsFuzzyMatch(query, registry, loadedNames) {
     });
   }
   return hits.sort((a, b) => b.score - a.score).slice(0, 20);
+}
+
+/// 本地模糊命中够不够硬，够就别再发那一次网络编排调用了。
+///
+/// 一次非精确的 search_tools 现在最坏要串行等：8 秒 MCP 发现 + 20 秒编排器 LLM 调用，
+/// 然后模型还得再花一轮回合才真正调到工具。而绝大多数查询（「在浏览器里点一下」
+/// 「看一眼数据库」「跑一下测试」）本地零毫秒就能给出同一个答案。
+///
+/// 判据刻意保守——宁可多走一次编排器，也不要给错工具：
+///   · 至少命中一个**结构化维度**（工具名 / 触发条件 / 使用场景），
+///     只在描述正文里出现过（desc / cjk）不算数，那是弱信号；
+///   · 与第二名拉开至少 2 分，或者干脆只有一个命中——排名咬得很紧时说明查询本身有歧义，
+///     那正是语义编排器存在的意义。
+/// 拿不准一律返回 null 走原路。
+function _confidentFuzzyResolution(hits) {
+  const fresh = (Array.isArray(hits) ? hits : []).filter((h) => h && !h.alreadyLoaded);
+  if (!fresh.length) return null;
+  const top = fresh[0];
+  const strong = (top.matchedOn || []).some((m) => m === "name" || m === "trigger" || m === "use_case");
+  if (!strong || !(top.score >= 3)) return null;
+  const second = fresh[1];
+  if (second && top.score - second.score < 2) return null;
+  // 同分并列的一起带上（例如 browser 与 browser_batch），最多 3 个。
+  return fresh.filter((h) => h.score === top.score).slice(0, 3);
 }
 
 // 模糊命中的展示后缀：在 compactToolGuide 基础行之外追加推荐场景/触发条件，
@@ -45527,7 +45553,7 @@ function _buildToolHint(text, profile = _engineeringProfileWithAiIntent(text)) {
   // P0.2(#51): 场景→工具静态决策地图。必须保持**字节稳定**（纯字面量、零动态插值）——
   // 该文本随 system 前缀进 prompt cache，任何动态内容都会击穿缓存。精炼映射，不是禁令。
   return "\n\n🔧 **动态工具编排**：所有已注册工具都能由语义编排器随用户目标、新证据和当前阶段装入。别因为开局窗口里不显示某个工具就假设它不可用；根据真实结果继续执行，已知精确工具名时也可用 search_tools 请求装入（支持自然语言能力描述的模糊搜索，如「数据库查询」）。" +
-    "\n\n🗺️ **场景→工具直觉**：做/改任何看得见的界面（网站、Web 应用、桌面 GUI、控制面板、单个组件）→ 先 knowledge_search(domain 传 michael-design) 取本品类蓝图，照命中的配色与构图做，别凭印象编色和间距；查符号定义→find_symbol；查谁调用→lsp_references；第三方库的真实签名→package_source（读本项目实际装的那个版本；search/find_files/semantic_search 都跳过 node_modules，查不到）；签名对了但不确定怎么用→developer_community_search(sources=['sourcegraph']) 看真实仓库里怎么调；库的版本/废弃→package_search；代码历史/为什么这样写→git_blame/git_log；数据库结构→db_query 直连；技术选型/踩坑→developer_community_search；页面卡顿→performance_profile；已知工具名未装载→search_tools。用对专用工具比 read/grep 蛮力快数倍。" +
+    "\n\n🗺️ **场景→工具直觉**：做/改任何看得见的界面（网站、Web 应用、桌面 GUI、控制面板、单个组件）→ 先 knowledge_search(domain 传 michael-design) 取本品类蓝图，照命中的配色与构图做，别凭印象编色和间距；查符号定义→find_symbol；查谁调用→lsp_references；第三方库的真实签名→package_source（读本项目实际装的那个版本；search/find_files/semantic_search 都跳过 node_modules，查不到）；**本机没装、或者要问「官方到底怎么说」→ knowledge_search**（平台自有语料库：npm/PyPI/crates 已发布版本的真实导出签名，加 MDN 整个 Web 平台与 React/Vue/Svelte/TypeScript/Node/Rust 官方文档。写任何一个你没十成把握的第三方调用之前先查一次——凭记忆写出来的签名很可能属于另一个大版本，而这一步只要一次工具调用）；签名对了但不确定怎么用→developer_community_search(sources=['sourcegraph']) 看真实仓库里怎么调；库的版本/废弃→package_search；代码历史/为什么这样写→git_blame/git_log；数据库结构→db_query 直连；技术选型/踩坑→developer_community_search；页面卡顿→performance_profile；已知工具名未装载→search_tools。用对专用工具比 read/grep 蛮力快数倍。" +
     // 全量名录。没有它，开局窗口外的工具模型既叫不出名字、search_tools 又是精确名查找，
     // 于是够得着的只有开局那十来个。字节稳定，可以待在 cache 前缀里。
     "\n\n📚 **完整能力名录（全部可用，按名字直接调用即可自动装载；不在开局窗口里不代表不能用）**\n" +
@@ -48823,6 +48849,33 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
             return _m;
           }
         }
+        // 名字对得上就直接执行，别罚它。
+        //
+        // 模型调一个**没装载但真实存在**的工具，此前的处置是：浪费这一轮 + 发一次语义编排器
+        // 网络调用（最长 20 秒）+ 回一句「未知工具，请重新调用」+ 模型再花一轮重调。
+        // 也就是说，模型**喊对了名字**反而是最慢的一条路——而带注解的能力名录恰恰就是要
+        // 让它喊得出名字。这一段把奖惩掰回来：注册表里精确对得上（含别名自愈）就当场装进
+        // 窗口、用它自己给的参数直接跑。省掉两个模型回合和一次网络编排。
+        //
+        // 安全性没有任何折扣：名字来自真实注册表（不是词形猜测），参数是模型自己写的，
+        // 执行走的是同一个 _executeToolStep——同一个权限门、同一份台账、同一套取证。
+        if (it._unknown || it.call?.type === "unknown") {
+          const _attempted = String(it.tc.name || "").trim();
+          const _healed = _canonicalToolName(_attempted) || _attempted;
+          const _registry = run._toolRegistry || (run._toolRegistry = _buildToolRegistry(isAgent, run.mcpToolCache));
+          const _schema = _healed && _registry.get(_healed);
+          if (_schema) {
+            const _remapped = _mapToolCall(_healed, it.tc.parsedArgs, run?.mcpToolMap);
+            if (_remapped && _remapped.type !== "unknown") {
+              _applyToolPayloadWindow(toolSchemas, [_schema], run._toolCoreNames);
+              _remapped._toolName = _remapped._toolName || _healed;
+              it.call = _remapped;
+              it.tc.name = _healed;
+              it._unknown = false;
+              it._healedFrom = _attempted !== _healed ? _attempted : "";
+            }
+          }
+        }
         const { call, step } = it;
         if (it._unknown || call?.type === "unknown") {
           // A hallucinated name is evidence about the intended capability, not a string-
@@ -48844,18 +48897,47 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
         // A registered tool chosen by the model still reaches its real executor.
         // search_tools — 元工具：把命中的延迟工具 schema 换入有界窗口。不走 _executeToolStep。
         if (call && call.type === "search_tools") {
+          // ── 快通道：本地就能确定的查询，既不等 MCP 发现，也不发那次编排器网络调用 ──
+          //
+          // 慢的从来不是"找"，是两段串行的等待：MCP 后台发现最多 8 秒，语义编排器是一次
+          // 完整的 LLM 网络调用、上限 20 秒。而且它发生在**模型回合内部**，用户全程干等；
+          // 结束之后模型还要再花一轮才真正调到那个工具。最坏 28 秒换一句"已加载 browser"。
+          //
+          // 可是绝大多数查询（「在浏览器里点一下」「看一眼数据库」「跑一下测试」）本地零毫秒
+          // 就能给出同一个答案。判据见 _confidentFuzzyResolution：必须命中结构化维度、
+          // 且与第二名拉开 2 分，咬得紧就说明查询本身有歧义——那才是编排器该上场的时候。
+          //
+          // 快通道刻意**不缓存** run._toolRegistry：这时 MCP 可能还没发现完，把一份不全的
+          // 注册表钉在 run 上，后面整轮都会少工具。慢路径照旧在等完之后才缓存。
+          let registry = run._toolRegistry || _buildToolRegistry(isAgent, run.mcpToolCache);
+          let loaded = new Set(toolSchemas.map((t) => t.function && t.function.name));
+          let exact = _searchToolsExactQuery(call.query, registry);
+          let fastAdds = null;
+          let fastHits = [];
+          if (!exact?.schema) {
+            fastHits = _searchToolsFuzzyMatch(call.query, registry, loaded);
+            const _confident = _confidentFuzzyResolution(fastHits);
+            if (_confident) fastAdds = _confident.map((h) => h.schema);
+          }
           // MCP connects/discovers in the background. Only an explicit tool search is allowed to
           // wait for that catalog, so ordinary turns never pay MCP startup latency.
-          await _waitForRunMcpDiscovery(run);
-          const loaded = new Set(toolSchemas.map((t) => t.function && t.function.name));
-          const registry = run._toolRegistry || (run._toolRegistry = _buildToolRegistry(isAgent, run.mcpToolCache));
-          const exact = _searchToolsExactQuery(call.query, registry);
+          if (!exact?.schema && !fastAdds) {
+            await _waitForRunMcpDiscovery(run);
+            registry = run._toolRegistry || (run._toolRegistry = _buildToolRegistry(isAgent, run.mcpToolCache));
+            loaded = new Set(toolSchemas.map((t) => t.function && t.function.name));
+            exact = _searchToolsExactQuery(call.query, registry);
+          }
           let semanticDecision = null;
           let adds = [];
           let fuzzyHits = [];
           let usedFuzzyFallback = false;
+          let usedFastPath = false;
           if (exact?.schema) {
             adds = _searchToolsLookup(call.query, registry, loaded);
+          } else if (fastAdds) {
+            adds = fastAdds;
+            fuzzyHits = fastHits;
+            usedFastPath = true;
           } else {
             // P1 #5: 非精确名查询先跑本地多维度模糊匹配（名称/描述/场景/触发器/自动标签）。
             // 命中只作编排器的候选提示 + 编排器不可用时的降级回退；语义主判权仍在编排器。
@@ -48902,7 +48984,15 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
           //   · 压根**没找到**——能力真的缺。
           // 排查时这两者的下一步完全相反，界面却分不出来，只能靠猜。所以标签跟着分支走。
           let label;
-          if (lines.length) { content = "已加载 " + lines.length + " 个工具，现在可直接调用：\n" + lines.join("\n") + (usedFuzzyFallback ? "\n（语义调度本次不可用，以上为多维度模糊匹配结果，按推荐场景自行判断适用性）" : thoughtNote) + rejectedNote; label = `已加载 ${lines.length}`; }
+          if (lines.length) {
+            const _how = usedFuzzyFallback
+              ? "\n（语义调度本次不可用，以上为多维度模糊匹配结果，按推荐场景自行判断适用性）"
+              : usedFastPath ? "" : thoughtNote;
+            content = "已加载 " + lines.length + " 个工具，现在可直接调用：\n" + lines.join("\n") + _how + rejectedNote;
+            // 标签分快慢：快通道零毫秒本地判定，慢通道等过 MCP 发现并发了一次编排器调用。
+            // 排查"为什么这次搜索花了半分钟"时，这一个字就够定位。
+            label = usedFastPath ? `已加载 ${lines.length}·本地` : `已加载 ${lines.length}`;
+          }
           else if (exact?.schema && loaded.has(exact.name)) { content = `工具已加载：\n· ${compactToolGuide(exact.schema)}`; label = "已在手上"; }
           // 「没有这个工具」是能力缺口，不是查询写错了。以前这句到此为止，模型就把它当
           // 「IDE 不支持」回给用户——用户说的"很呆"正是这个。指路要跟着结论一起给。
