@@ -140,6 +140,10 @@ fn ps_array(items: &[String]) -> String {
 
 // Foreground-window → process P/Invoke, reused by several Windows scripts. (Add-Type of
 // the same class is harmless across the fresh per-call powershell processes.)
+/// EnumWindows 版的 P/Invoke 前导。PS_FG 只声明了 GetForegroundWindow /
+/// GetWindowThreadProcessId，列窗口还要 EnumWindows + GetWindowText + IsWindowVisible。
+const PS_ENUM: &str = "Add-Type @\"\nusing System;using System.Text;using System.Runtime.InteropServices;\npublic class _FG{\n[DllImport(\"user32.dll\")]public static extern IntPtr GetForegroundWindow();\n[DllImport(\"user32.dll\")]public static extern uint GetWindowThreadProcessId(IntPtr h,out uint pid);\n[DllImport(\"user32.dll\")]public static extern bool IsWindowVisible(IntPtr h);\n[DllImport(\"user32.dll\",CharSet=CharSet.Unicode)]public static extern int GetWindowText(IntPtr h,StringBuilder s,int n);\npublic delegate bool EnumProc(IntPtr h,IntPtr l);\n[DllImport(\"user32.dll\")]public static extern bool EnumWindows(EnumProc cb,IntPtr l);\n}\n\"@";
+
 const PS_FG: &str = "Add-Type @\"\nusing System;using System.Runtime.InteropServices;\npublic class _FG{[DllImport(\"user32.dll\")]public static extern IntPtr GetForegroundWindow();[DllImport(\"user32.dll\")]public static extern int GetWindowThreadProcessId(IntPtr h,out int p);}\n\"@ -ErrorAction SilentlyContinue;";
 
 // ── open / activate an app ────────────────────────────────────────────────────
@@ -426,11 +430,35 @@ fn system_app_windows_inner(name: String) -> Result<String, String> {
   }} catch (e) {{ return JSON.stringify({{ error: String(e), hint: '该 App 没在运行或没暴露窗口；先 system open 打开它' }}); }}
 }})()"##
     );
+    // 真正枚举顶层窗口，而不是读 MainWindowTitle。
+    //
+    // 三处都不对：
+    //  · `MainWindowTitle` 每个进程**只有一个**——浏览器开着五个窗口，这里只列出一个，
+    //    而这个工具存在的意义就是"列出某个应用的所有窗口"。
+    //  · `$_.Name -eq $n` 只比进程名且要求全等。模型拿到的是界面上的名字
+    //    （"Visual Studio Code"、"Google Chrome"），进程名是 Code / chrome，对不上。
+    //  · 空结果什么都不说，模型只能换关键词反复试。
+    //
+    // EnumWindows 拿到的是真窗口；进程名和标题都用**子串**匹配，两边都试。
     let windows = format!(
-        "$ErrorActionPreference='SilentlyContinue';$n={n};\
-         $ws=@(Get-Process|Where-Object{{$_.Name -eq $n -and $_.MainWindowTitle}}|ForEach-Object{{$_.MainWindowTitle}});\
-         $o=@();for($i=0;$i -lt $ws.Count;$i++){{$o+=@{{i=$i;title=$ws[$i]}}}};\
-         @{{app=$n;count=$o.Count;windows=$o}}|ConvertTo-Json -Compress",
+        "{fg}\n$ErrorActionPreference='SilentlyContinue';$n={n};\
+         $all=@();$cb={{param($h,$l) \
+           if([_FG]::IsWindowVisible($h)){{ \
+             $sb=New-Object System.Text.StringBuilder 512; \
+             [void][_FG]::GetWindowText($h,$sb,512); \
+             $t=$sb.ToString(); \
+             if($t){{ $pp=0;[void][_FG]::GetWindowThreadProcessId($h,[ref]$pp); \
+               $pn='';try{{$pn=(Get-Process -Id $pp).ProcessName}}catch{{}}; \
+               $script:all+=@{{title=$t;process=$pn}} }} }}; \
+           return $true }};\
+         [void][_FG]::EnumWindows($cb,[IntPtr]::Zero);\
+         $hit=@($all|Where-Object{{$_.process -like ('*'+$n+'*') -or $_.title -like ('*'+$n+'*')}});\
+         $o=@();for($i=0;$i -lt $hit.Count;$i++){{$o+=@{{i=$i;title=$hit[$i].title;process=$hit[$i].process}}}};\
+         if($o.Count -eq 0){{ \
+           $names=@($all|Select-Object -ExpandProperty process -Unique|Where-Object{{$_}}); \
+           @{{app=$n;count=0;windows=@();hint=('没有窗口的进程名或标题含有「'+$n+'」。当前有窗口的应用：'+($names -join '、')+'。用其中一个重试，或先 system open 打开它。')}}|ConvertTo-Json -Compress \
+         }} else {{ @{{app=$n;count=$o.Count;windows=$o}}|ConvertTo-Json -Compress -Depth 4 }}",
+        fg = PS_ENUM,
         n = ps_quote(&name)
     );
     run_native(&macos, &windows, 4000)
@@ -650,5 +678,50 @@ mod tests {
             "blocking system work stalled the current-thread async runtime"
         );
         assert_eq!(blocking.await.unwrap().unwrap(), "done");
+    }
+}
+
+#[cfg(test)]
+mod windows_listing_tests {
+    /// 反漂移：`system windows` 在 Windows 上必须真的枚举顶层窗口。
+    ///
+    /// 原来读的是 `MainWindowTitle`——每个进程只有一个，所以浏览器开五个窗口
+    /// 也只列出一个，而这个工具存在的意义就是"列出某个应用的所有窗口"。
+    /// 进程名还要求全等，模型拿到的却是界面上的名字（Google Chrome vs chrome）。
+    /// 空结果什么都不说，只能换关键词反复试。
+    ///
+    /// 断言源码：Windows 分支在 mac 上不参与编译。先剥注释——上面这段解释里
+    /// 就引用了旧写法（MainWindowTitle），不剥的话断言会被自己喂饱。
+    #[test]
+    fn listing_an_apps_windows_enumerates_real_windows() {
+        let src: String = include_str!("sysctl.rs")
+            .lines()
+            .filter(|l| {
+                let t = l.trim_start();
+                !t.starts_with("//") && !t.starts_with("///")
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let at = src
+            .find("fn system_app_windows_inner")
+            .expect("找不到 system_app_windows_inner");
+        let body = &src[at..];
+        let body = &body[..body.find("\nfn ").unwrap_or(body.len().min(4000))];
+        assert!(
+            body.contains("EnumWindows"),
+            "列窗口没有枚举顶层窗口——MainWindowTitle 每个进程只有一个"
+        );
+        assert!(
+            !body.contains("MainWindowTitle"),
+            "还在读 MainWindowTitle"
+        );
+        assert!(
+            body.contains("-like ('*'+$n+'*')"),
+            "进程名/标题应该按子串匹配：模型拿到的是界面上的名字，不是进程名"
+        );
+        assert!(
+            body.contains("hint="),
+            "空结果必须给出可行的下一步，否则模型只会换关键词反复试"
+        );
     }
 }
