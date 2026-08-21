@@ -595,7 +595,22 @@ impl RpcServer {
                     .ok_or_else(|| Error::Other(anyhow::anyhow!("Missing 'title' parameter")))?;
                 drop(agent);
                 crate::platform::get_window_controller().minimize_window(title)?;
-                Ok(serde_json::json!({ "status": "ok" }))
+                // 到这里代表**回读确认过**它真的最小化了（平台层轮询到位才返回 Ok）。
+                Ok(serde_json::json!({ "status": "ok", "minimized": title }))
+            }
+            // 只有最小化没有还原等于半条路：模型把一个窗口收起来之后就再也拿不回来，
+            // 只能去点 Dock——而那要坐标、要截图、要猜。
+            #[cfg(all(feature = "system", target_os = "macos"))]
+            "window.restore" => {
+                let title = params.get("title").and_then(|v| v.as_str())
+                    .ok_or_else(|| Error::Other(anyhow::anyhow!("Missing 'title' parameter")))?;
+                drop(agent);
+                let pid = crate::platform::macos_tree::pid_of(title).ok_or_else(|| {
+                    Error::Other(anyhow::anyhow!("没找到叫「{title}」的应用"))
+                })?;
+                let t = crate::platform::macos_tree::set_minimized(pid, false)
+                    .map_err(|e| Error::Other(anyhow::anyhow!(e)))?;
+                Ok(serde_json::json!({ "status": "ok", "restored": t }))
             }
             #[cfg(feature = "system")]
             // screen.info 报的 width/height 来自 CGDisplay::pixels_wide()——名字叫 pixels，

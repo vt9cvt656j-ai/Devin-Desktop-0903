@@ -485,6 +485,106 @@ unsafe fn walk_one(el: AXUIElementRef, out: &mut Vec<AxNode>) {
     });
 }
 
+/// 按应用名找进程号。window.restore 要用，和 macos.rs 里那个是同一件事。
+pub fn pid_of(title: &str) -> Option<i32> {
+    use cocoa::base::{id, nil};
+    use objc::{class, msg_send, sel, sel_impl};
+    unsafe {
+        let workspace: id = msg_send![class!(NSWorkspace), sharedWorkspace];
+        let apps: id = msg_send![workspace, runningApplications];
+        let count: usize = msg_send![apps, count];
+        for i in 0..count {
+            let app: id = msg_send![apps, objectAtIndex: i];
+            let name_obj: id = msg_send![app, localizedName];
+            if name_obj == nil {
+                continue;
+            }
+            let ptr: *const i8 = msg_send![name_obj, UTF8String];
+            let name = std::ffi::CStr::from_ptr(ptr).to_string_lossy();
+            if name.contains(title) {
+                let pid: i32 = msg_send![app, processIdentifier];
+                return Some(pid);
+            }
+        }
+    }
+    None
+}
+
+/// 最小化 / 还原某个应用的窗口。
+///
+/// 平台层那两个（minimize_window / maximize_window）在 macOS 上一直是只会返回
+/// UnsupportedPlatform 的空实现，而 window.minimize 就写在工具目录的 enum 里——
+/// 模型照着调必然报错。而 AX 侧本来就有 AXMinimized 这个可写属性，几行就能实现。
+///
+/// 按应用名匹配（和 window.activate 一致），只动第一个尺寸够大的窗口。
+pub fn set_minimized(pid: i32, minimized: bool) -> Result<String, String> {
+    unsafe {
+        let app = AXUIElementCreateApplication(pid);
+        if app.is_null() {
+            return Err("拿不到这个应用的可访问性入口".into());
+        }
+        AXUIElementSetMessagingTimeout(app, 2.0);
+        let key = CFString::new("AXWindows");
+        let mut raw: CFTypeRef = ptr::null();
+        let rc = AXUIElementCopyAttributeValue(app, key.as_concrete_TypeRef(), &mut raw);
+        if rc != 0 || raw.is_null() {
+            CFRelease(app as CFTypeRef);
+            return Err(format!("这个应用没有交出窗口（AXError {rc}）"));
+        }
+        let arr = raw as CFArrayRef;
+        let n = CFArrayGetCount(arr);
+        let mut done: Option<String> = None;
+        for i in 0..n {
+            let w = CFArrayGetValueAtIndex(arr, i) as AXUIElementRef;
+            if w.is_null() {
+                continue;
+            }
+            // 尺寸过滤只在**最小化**时用（挑一个真窗口下手，别去动 1x1 的隐藏工具窗）。
+            // 还原时不能用：已经最小化的窗口尺寸就是不正常的，按尺寸筛会把唯一那个
+            // 要还原的窗口挡在外面——实测就是这么失败的（最小化成功、还原报「没找到」）。
+            if minimized {
+                let (ww, wh) = attr_size(w, "AXSize").unwrap_or((0, 0));
+                if ww < 40 || wh < 40 {
+                    continue;
+                }
+            } else if !attr_bool(w, "AXMinimized").unwrap_or(false) {
+                // 还原时只找当前确实是最小化的那些。
+                continue;
+            }
+            let attr = CFString::new("AXMinimized");
+            let v = if minimized { CFBoolean::true_value() } else { CFBoolean::false_value() };
+            let src = AXUIElementSetAttributeValue(w, attr.as_concrete_TypeRef(), v.as_CFTypeRef());
+            if src != 0 {
+                continue;
+            }
+            // 赋值不抛错 != 真的生效了。回读——这个项目里所有「发出请求」都要回读，
+            // 否则就是又一个「一路 ok、屏幕上什么都没发生」。
+            //
+            // 要**轮询**不能只读一次：最小化那一下回读立刻就对，还原却有动画，
+            // 立刻读到的还是 true。实测就是这么失败的（最小化成功、还原报没找到）。
+            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(1500);
+            let mut got = attr_bool(w, "AXMinimized").unwrap_or(!minimized);
+            while got != minimized && std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                got = attr_bool(w, "AXMinimized").unwrap_or(!minimized);
+            }
+            if got == minimized {
+                done = Some(attr_string(w, "AXTitle").unwrap_or_default());
+                break;
+            }
+        }
+        CFRelease(raw);
+        CFRelease(app as CFTypeRef);
+        match done {
+            Some(t) => Ok(t),
+            None => Err(format!(
+                "没能{}任何窗口——可能这个应用不允许（AXMinimized 只读），或者它没有普通窗口",
+                if minimized { "最小化" } else { "还原" }
+            )),
+        }
+    }
+}
+
 #[cfg(test)]
 mod act_tests {
     /// 句柄表和 ref 解析的端到端验证——不真的按下去，但把 act 在动作**之前**做的
@@ -523,5 +623,24 @@ mod act_tests {
             }
         }
         println!("句柄表 {} 个元素，ref 解析与签名比对正常", nodes.len());
+    }
+}
+
+#[cfg(test)]
+mod minimize_tests {
+    /// 真的最小化再还原一次。这个项目里「发出请求」和「真发生了」是两回事，
+    /// 而 minimize_window 以前就是个只会报 UnsupportedPlatform 的空实现，
+    /// 却写在工具目录的 enum 里——清单在说谎。
+    ///   AX_PID=<pid> cargo test --all-features minimize_roundtrip -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn minimize_roundtrip() {
+        let pid: i32 = std::env::var("AX_PID").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+        assert!(pid > 0, "用 AX_PID=<进程号> 指定目标");
+        let title = super::set_minimized(pid, true).expect("最小化应当成功");
+        println!("已最小化：{title}");
+        std::thread::sleep(std::time::Duration::from_millis(600));
+        let back = super::set_minimized(pid, false).expect("还原应当成功");
+        println!("已还原：{back}");
     }
 }

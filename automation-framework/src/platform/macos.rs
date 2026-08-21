@@ -15,6 +15,27 @@ impl MacOSControl {
     }
 }
 
+    /// 按应用名找进程号。activate_window 里那段遍历做的是同一件事。
+unsafe fn pid_of_app(title: &str) -> Option<i32> {
+    let workspace: id = msg_send![class!(NSWorkspace), sharedWorkspace];
+    let apps: id = msg_send![workspace, runningApplications];
+    let count: usize = msg_send![apps, count];
+    for i in 0..count {
+        let app: id = msg_send![apps, objectAtIndex: i];
+        let app_name: id = msg_send![app, localizedName];
+        if app_name == nil {
+            continue;
+        }
+        let ptr: *const i8 = msg_send![app_name, UTF8String];
+        let name = std::ffi::CStr::from_ptr(ptr).to_string_lossy();
+        if name.contains(title) {
+            let pid: i32 = msg_send![app, processIdentifier];
+            return Some(pid);
+        }
+    }
+    None
+}
+
 /// 当前前台应用名。切前台失败时光说「没成功」没法排查，得说出是谁占着前台。
 fn frontmost_app_name() -> Option<String> {
     unsafe {
@@ -191,10 +212,15 @@ impl WindowControl for MacOSControl {
         Err(Error::ElementNotFound(format!("未找到窗口: {}", title)))
     }
     
-    fn minimize_window(&self, _title: &str) -> Result<()> {
-        Err(Error::UnsupportedPlatform(
-            "macOS 平台暂不支持最小化指定窗口".to_string()
-        ))
+    fn minimize_window(&self, title: &str) -> Result<()> {
+        // 以前这里是个只会返回 UnsupportedPlatform 的空实现，而 window.minimize
+        // 就写在工具目录的 enum 里——模型照着调必然报错，等于清单在说谎。
+        // AX 侧本来就有 AXMinimized 这个可写属性，实现在 macos_tree.rs。
+        let pid = unsafe { pid_of_app(title) }
+            .ok_or_else(|| Error::ElementNotFound(format!("没找到叫「{title}」的应用")))?;
+        crate::platform::macos_tree::set_minimized(pid, true)
+            .map(|_| ())
+            .map_err(Error::System)
     }
     
     fn maximize_window(&self, _title: &str) -> Result<()> {
