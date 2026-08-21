@@ -45340,8 +45340,37 @@ async function _runSubAgent({ config, description, prompt, root, container, run,
         // _runSubAgent 顶部的硬边界③强制收敛（孙子体一律只读），超时由硬边界④取 min 继承。
         if (call.type === "subagent" || call.type === "worker") {
           toolCount++;
-          const _nestReport = await _runSubAgent({ config, description: call.description || "嵌套子任务", prompt: call.prompt || "", root, container: vp, run: execRun, write: call.type === "worker", scope: call.scope || [], role: call.role || "" });
-          messages.push({ role: "tool", tool_call_id: tc.id, content: _clip(String(_nestReport || ""), 8000, "子智能体的简报") });
+          // 这是 run_subagent 的**第四条**派发路径（前三条在主循环里：异步派发、
+          // 多任务合并、单任务同步）。它只取 prompt —— 于是深度 1 的子体调
+          // run_subagent({tasks:[4 条]}) 时，只有 tasks[0] 真的跑（映射会把它填进
+          // prompt），另外 3 条静默消失，回执里一个字都没有。子体照样拿着一份只覆盖
+          // 第一条线索的报告回来说「四个方向都查过」——正是这批修复要治的那个病，
+          // 只是换了一层。嵌套这一层不建作业台账、不并发（硬边界⑤），所以按顺序跑完，
+          // 并把丢弃提示一起带回去。
+          const _nestTasks = Array.isArray(call.tasks) && call.tasks.length
+            ? call.tasks.filter((t) => t && String(t.task || t || "").trim()).slice(0, 4)
+            : null;
+          let _nestReport;
+          if (_nestTasks && _nestTasks.length > 1) {
+            const _parts = [];
+            for (const [_i, _t] of _nestTasks.entries()) {
+              const _r = await _runSubAgent({
+                config,
+                description: `${call.description || "嵌套子任务"}[${_i + 1}/${_nestTasks.length}]`,
+                prompt: typeof _t === "string" ? _t : String(_t.task || ""),
+                root, container: vp, run: execRun, write: false, scope: [],
+                role: (_t && _t.role) || call.role || "",
+              }).catch((e) => `[ERROR] ${String(e?.message || e).slice(0, 200)}`);
+              _parts.push(`【任务 ${_i + 1}/${_nestTasks.length}】\n${_r}`);
+            }
+            _nestReport = _parts.join("\n\n---\n\n");
+          } else {
+            _nestReport = await _runSubAgent({ config, description: call.description || "嵌套子任务", prompt: call.prompt || "", root, container: vp, run: execRun, write: call.type === "worker", scope: call.scope || [], role: call.role || "" });
+          }
+          const _nestDrop = Array.isArray(call.dropped) && call.dropped.length
+            ? `\n⚠ 你给的 tasks 里有 ${call.dropped.join("；")}——这些**没有**被派出去。别当成已经查过了。`
+            : "";
+          messages.push({ role: "tool", tool_call_id: tc.id, content: _clip(String(_nestReport || ""), 8000, "子智能体的简报") + _nestDrop });
           continue;
         }
         const step = _createToolStep(call);
@@ -55570,7 +55599,9 @@ async function _executeToolStepInner(step, call, root, run) {
       res.textContent = fileMatches.length ? `${hits} 处匹配${searchErrors.length ? " · 部分范围失败" : ""}` : (searchErrors.length ? "无匹配 · 部分范围失败" : "无匹配");
       const _body = blocks.join("\n\n");
       vp.innerHTML = `<pre>${_escHtml((_body || "(无匹配)") + partialNote)}</pre>`;
-      return { type: "search", path: call.path, content: (blocks.length ? `搜索 "${q}" — ${summary}:\n${_redactSecrets(_body)}` : `搜索 "${q}"：${_backendTruncated ? "**这次没搜完**（触到后端的命中数/扫描文件数上限就停了），所以「没找到」不等于「不存在」——缩小到具体目录再搜一次。" : ""}在已扫描的范围里无匹配。跳过的只有几个具名的构建/缓存目录（.git、.next、.venv、.gradle、.idea、.vscode、node_modules、target 这类）——**点开头的文件照常搜**（.env、.eslintrc、.gitignore、.prettierrc 都在扫描范围里），**.github 也照常搜**。所以「没找到」多半是关键词不对，不是范围不够：换关键词、用 semantic_search 按语义找、或 find_files 按文件名找。`) + partialNote };
+      return { type: "search", path: call.path, content: (blocks.length ? `搜索 "${q}" — ${summary}:\n${_redactSecrets(_body)}` : `搜索 "${q}"：${_backendTruncated ? "**这次没搜完**（触到后端的命中数/扫描文件数上限就停了），所以「没找到」不等于「不存在」——缩小到具体目录再搜一次。" : ""}在已扫描的范围里无匹配。${_remote.active
+        ? "当前工作区在**远程主机**上，这次搜索由远端代理执行，它的扫描范围以那台机器上的实现为准，这里说不准跳过了什么。"
+        : "跳过的只有几个具名的构建/缓存目录（.git、.next、.venv、.gradle、.idea、.vscode、node_modules、target 这类）——**点开头的文件照常搜**（.env、.eslintrc、.gitignore、.prettierrc 都在扫描范围里），**.github 也照常搜**。所以「没找到」多半是关键词不对，不是范围不够"}：换关键词、用 semantic_search 按语义找、或 find_files 按文件名找。`) + partialNote };
 
     } else if (call.type === "find") {
       const requestedPattern = call.pattern || call.path || "";

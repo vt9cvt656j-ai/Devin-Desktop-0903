@@ -19460,9 +19460,18 @@ test("#53-1 深度控制：_subDepth 递进落盘 execRun + 深度 ≥2 白名�
 
 test("#53-2 并发预算共享：嵌套走同一个 _sess._subAgentsActive 上限，不因层级翻倍", () => {
   const sub = extractFn("_runSubAgent");
-  // 嵌套派发复用 _runSubAgent 入口且 run: execRun（session 浅拷贝共享）→ 同一会话计数器
-  assert.match(sub, /const _nestReport = await _runSubAgent\(\{ config, [^\n]*run: execRun/,
-    "嵌套必须递归复用 _runSubAgent（才能吃到同一套计数/排队/超时机制）");
+  // 嵌套派发复用 _runSubAgent 入口且 run: execRun（session 浅拷贝共享）→ 同一会话计数器。
+  // 钉的是**性质**不是某一行的形状：嵌套那段里每一次 _runSubAgent 调用都必须带 run: execRun。
+  // （原来钉的是单行正则，嵌套多任务拆成循环之后就假红了。）
+  const nestAt = sub.indexOf('if (call.type === "subagent" || call.type === "worker") {');
+  assert.ok(nestAt >= 0, "嵌套派发那段不见了");
+  const nestSeg = sub.slice(nestAt, sub.indexOf("const step = _createToolStep(call);", nestAt));
+  const nestCalls = nestSeg.split("_runSubAgent({").slice(1);
+  assert.ok(nestCalls.length >= 1, "嵌套必须递归复用 _runSubAgent（才能吃到同一套计数/排队/超时机制）");
+  for (const [i, c] of nestCalls.entries()) {
+    assert.match(c.slice(0, 400), /run: execRun/,
+      `嵌套里第 ${i + 1} 次 _runSubAgent 没带 run: execRun —— 它会另起一套计数器，预算按层级翻倍`);
+  }
   // 真信号量：超额必须真的等待槽位释放，而不是"等一个 tick 然后照常启动"。
   // 旧写法 `if (willStart > MAX) await setImmediate` 从不真正限流——九个 worker 会同时起，
   // 而描述里的 2 又在劝退模型分工，两头都不讨好。
@@ -31278,6 +31287,23 @@ test("run_subagent：丢掉的 task 要报回去，单任务的 role 不许吞�
   const dispatch = SRC.slice(SRC.indexOf("const _subDropNote"), SRC.indexOf("const executeScheduledItem"));
   assert.equal((dispatch.match(/_subDropNote/g) || []).length, 4,
     "三条回执路径里有的没拼上丢弃提示 —— 走哪条路取决于 wait/条数，模型控制不了");
+
+  // **第四条**派发路径：子体内部再调 run_subagent（嵌套）。
+  // 它原来只取 prompt，于是 tasks 里除第一条外全部静默消失——子体拿着一份只覆盖
+  // 第一条线索的报告回来说「四个方向都查过」，正是这批修复要治的病，换了一层而已。
+  // 结束锚点必须从起点**往后**找：`const step = _createToolStep(call);` 在文件更早处
+  // 也出现过，直接 indexOf 会切出一段倒过来的空串（第一版就这么假红了）。
+  const nestAt = SRC.indexOf('if (call.type === "subagent" || call.type === "worker") {');
+  const nest = SRC.slice(nestAt, SRC.indexOf("const step = _createToolStep(call);", nestAt));
+  assert.ok(nest.length > 400, "嵌套派发那段切空了");
+  assert.match(nest, /const _nestTasks = Array\.isArray\(call\.tasks\)/,
+    "嵌套派发还是只看 prompt —— tasks 里除第一条外全部静默消失");
+  assert.match(nest, /\(_t && _t\.role\) \|\| call\.role/, "嵌套派发丢了每条任务自己的 role");
+  assert.match(nest, /Array\.isArray\(call\.dropped\) && call\.dropped\.length\s*\n?\s*\?/,
+    "嵌套派发不报被丢弃的任务");
+  assert.match(nest, /这些\*\*没有\*\*被派出去/, "嵌套的丢弃提示没有真的拼进回执");
+  assert.match(nest, /任务 \$\{_i \+ 1\}\/\$\{_nestTasks\.length\}/,
+    "嵌套的合并报告没标明第几条 / 共几条");
 });
 
 // git stash 什么都没存进去时照样退出 0，stdout 只印一句 "No local changes to save"，
