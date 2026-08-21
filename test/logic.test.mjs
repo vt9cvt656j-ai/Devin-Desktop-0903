@@ -31478,6 +31478,13 @@ test("gh_pr_review_comments：抬头的条数必须是正文里真有的条数",
     "又把 --paginate 和 --jq 写在一起了 —— jq 会按页作用，切出来不是这一批");
   assert.match(big.content, /per_page=100/, "没有单页取，切片就没有意义");
   assert.match(big.content, /别加 --paginate/, "没警告这个坑，模型很容易自己加回去");
+  // 翻页那句上一版是错的：`.[N:]` 是从第一页数起的**全局偏移**，套到第二页就变成
+  // 「跳过第 2 页的前 N 条」，评论 101..100+N 静默消失。实测（cli/cli labels，两页）：
+  // `?per_page=50&page=2 --jq 'length'` 得 32，同 URL 加 `.[12:]` 只剩 20。
+  assert.match(big.content, /翻页时不要再带 \.\[N:\]/,
+    "教了翻页却没说偏移要归零 —— 模型第二页会再漏掉一批，还以为看完了");
+  assert.doesNotMatch(big.content, /加 &page=2。）/,
+    "又把「超过 100 条加 &page=2」单独甩出来了 —— 不配上「偏移归零」它就是错的");
   assert.match(big.content, /别按「都看完了」下结论/);
 
   // 30 条上限也要走同一条抬头。
@@ -31553,6 +31560,22 @@ test("送给模型的图必须先消毒：SVG 要栅格化，送不进去的要�
   assert.deepEqual(remote.content[1], { type: "image_url", image_url: { url: "https://example.test/a.png" } },
     "http 图片地址被消毒吞了 —— 它本来能用");
   assert.doesNotMatch(remote.content[0].text, /没能转成模型可读的格式/);
+
+  // 纯文本模型那条路原来另起一个 lead，把调用方的 leadText 连同丢弃提示一起丢掉：
+  // 5 张掉 2 张时模型收到「我已把 3 张图转写成文字」，一个字不提缺失。
+  const textOnly = load("_buildImageFeedback", {
+    _modelSeesImages: () => false,
+    _downscaleImageForVision: async (u) => (u.startsWith("data:image/svg+xml") ? "" : u),
+    _describeImageForTextModel: async () => "（转写内容）",
+  });
+  const mixedText = await textOnly(
+    ["data:image/png;base64,AAA", "data:image/svg+xml;base64,BBB"], { model: "m" }, "这是刚才截的图", "hint");
+  assert.equal(typeof mixedText.content, "string");
+  assert.match(mixedText.content, /有 1 张图没能转成模型可读的格式/,
+    "纯文本模型这条路把丢弃提示丢了 —— 模型不知道自己少看了图");
+  assert.match(mixedText.content, /这是刚才截的图/,
+    "调用方说明图片是什么的那段也一起没了");
+  assert.match(mixedText.content, /转写成文字/);
 
   const none = await build(["data:image/svg+xml;base64,BBB"], { model: "m" }, "看图", "hint");
   assert.equal(typeof none.content, "string");

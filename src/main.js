@@ -46130,7 +46130,10 @@ async function _buildImageFeedback(imgs, config, leadText, perImageHint) {
       d ? `【图 ${k + 1} 的视觉转写】\n${d}`
         : `【图 ${k + 1}】（转写失败：当前没有可配置的多模态模型来读图。要让我真正"看"图，请在模型菜单切到 Claude / GPT-4o / Gemini 等视觉模型。）`)));
   const lead = `你当前用的模型看不到图片，我已用视觉模型把 ${imgs.length} 张图转写成文字（OCR + 布局 + 视觉缺陷）。请把它当成你"亲眼看到"的内容来判断与改进，标准不降低：\n\n`;
-  return { role: "user", content: lead + descs.join("\n\n———\n\n") };
+  // 纯文本模型这条路原来另起了一个 lead，把调用方的 leadText 连同 _dropNote 一起丢掉了：
+  // 5 张图掉了 2 张时，模型收到的是「我已把 3 张图转写成文字」，全程没有一个字说过缺了两张——
+  // 正是上面那句注释要防的事，只是漏了这一条分支。leadText 里也包含「这几张图是什么」。
+  return { role: "user", content: leadText + "\n\n" + lead + descs.join("\n\n———\n\n") };
 }
 
 // --- Live workspace staging ("show your work") — as the agent runs each tool, bring
@@ -57835,8 +57838,14 @@ async function _executeToolStepInner(step, call, root, run) {
               // 不是对合并后的数组。`--jq '.[30:]'` 于是变成「每页各跳过 30 条」，切出来的根本不是
               // 你要的那批（40 条评论分两页时，第二页只有 10 条，`.[30:]` 直接给空数组）。
               // 单页 per_page=100 就没有这个问题；超过 100 条再加 &page=2。
-              + `（**别加 --paginate**——加了之后 jq 是按每一页分别作用的，切出来的不是这一批；`
-              + `评论超过 100 条时在 URL 里加 &page=2。）\n${formatted}`
+              + `（**别加 --paginate**——加了之后 jq 是按每一页分别作用的，切出来的不是这一批。`
+              // 「加 &page=2」这句话上一版是**错的**：`.[N:]` 是全局偏移，作用到第 2 页的数组上
+              // 就变成「跳过第 2 页的前 N 条」，评论 101..100+N 静默消失，模型第二次又拿到一份
+              // 不全的清单还以为看完了——正是这条修复要治的病。实测（cli/cli labels，两页）：
+              // `?per_page=50&page=2 --jq 'length'` 得 32，同 URL 加 `.[12:]` 只剩 20。
+              // 翻页时偏移必须归零：换成 `--jq '.[]'`，或干脆不带 jq。
+              + `评论超过 100 条时翻第二页：\`gh api "repos/{owner}/{repo}/pulls/${call.number}/comments?per_page=100&page=2"\`，`
+              + `**翻页时不要再带 .[N:]**——那个 N 是从第一页数起的偏移，套到第二页就会把开头 N 条也跳掉。）\n${formatted}`
             : `PR #${call.number} review 评论 (${arr.length}):\n${formatted}` };
         }
         if (call.op === "pr_reply") {
