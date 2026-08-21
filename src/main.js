@@ -27569,8 +27569,22 @@ async function _agentRunInTerminal(root, command, stepEl, explicitTimeoutSecs) {
         sandbox: r?.sandbox || "none",
         sandboxDenied: r?.sandboxDenied === true,
       };
-      if (bgDevServerNoLog) {
-        result.stdout = (result.stdout || "") + "\n\n[note] You started this dev server in the background with run_cmd, so it is running in a throwaway isolated subprocess — **not an IDE terminal tab, so read_terminal cannot see it and its logs cannot be followed** (that is why no terminal was found). To keep watching the log and hot reload, and to be able to read and stop it later, **start the dev server with run_in_terminal instead** (it goes into the IDE's real terminal, where read_terminal reads its output, list_terminals lists it and stop_terminal stops it). If you already have the log file's path, read_logs(path) will show you its tail.";
+      // 后台起的东西**已经被杀掉了**，必须当场说清楚。
+      //
+      // run_cmd 拿到退出码之后会无条件 terminate_task_tree（tasks.rs 那段清理是对的：
+      // 一次性命令跑完还活着按定义就是泄漏）。但回执里退出码 0、启动日志
+      // 「Local: http://localhost:5173」一应俱全，模型据此判定服务已就绪，接着去
+      // screenshot / http_request / 把地址告诉用户——**全部打在一个已经死掉的端口上**。
+      // 它拿到的每一个信号都说成功，没有任何一处会让它起疑。
+      //
+      // backgrounded 这个事实上面早就算出来了（27502），只是从没告诉过模型。
+      if (backgrounded) {
+        result.stdout = (result.stdout || "")
+          + "\n\n[note] 这条命令是后台启动的，而 run_cmd 在拿到退出码之后会把它启动的整棵进程树**杀掉**"
+          + "——所以它**现在没有在运行**，端口也没有在监听。上面那些启动日志是它活着的那几秒打的，"
+          + "不代表现在还活着。别据此去截图、发请求或把地址告诉用户。"
+          + "要真的让服务常驻，用 run_in_terminal：它进 IDE 的真实终端页签，有自己的生命周期，"
+          + "read_terminal 能读它的日志，也能停掉它。";
       }
     }
 
@@ -53984,6 +53998,24 @@ function _occurrenceLines(text, needle, cap = 8) {
 
 function _recoverEditMatch(text, needle) {
   if (!needle) return null;
+  // Windows 换行。这是 Windows 上最常见的一种"改不动文件"：仓库里的文件是 CRLF，
+  // 而模型复述 old_string 时几乎一定会把 \r 丢掉——它看到的是渲染后的文本，
+  // 回车符在那里是不可见的。于是逐字符复制这个要求它**做不到**，
+  // 而回执给的是「多半是空白/缩进对不上，请照原文重新复制」，把它推去重试同一件
+  // 做不到的事。实测表现就是在一个 CRLF 文件上反复 read→edit→失败。
+  //
+  // 放在最前面：这是精确匹配，不是近似，不该排在缩进容错后面。
+  if (text.includes("\r\n") && needle.includes("\n") && !needle.includes("\r")) {
+    const crlf = needle.replace(/\n/g, "\r\n");
+    const at = text.indexOf(crlf);
+    if (at >= 0) {
+      return {
+        text: crlf,
+        crlf: true,
+        how: "把换行按这个文件的 CRLF 补齐了（它是 Windows 换行的文件，你给的 old_string 里没有 \\r）",
+      };
+    }
+  }
   const fileLines = text.split("\n");
   const uniqueExact = (n) => {
     if (!n) return null;
@@ -55400,6 +55432,9 @@ async function _executeToolStepInner(step, call, root, run) {
           if (rec) {
             oldStr = rec.text;
             occ = old.split(oldStr).length - 1;
+            // 命中的是 CRLF 版本，替换文本也得是 CRLF——否则这一段会变成 LF，
+            // 文件成了混合换行，git 上看是整块改动，而模型完全不知道自己干了这个。
+            if (rec.crlf) _editReplacement = String(_editReplacement).replace(/\r\n/g, "\n").replace(/\n/g, "\r\n");
             if (rec.indent) _editReplacement = _reindentReplacement(_editReplacement, rec.indent);
             _editNote = "（注：你的 old_string 不完全一致，我" + rec.how + "并已应用；下次请逐字符复制、别带行号）";
           }
@@ -55645,6 +55680,7 @@ async function _executeToolStepInner(step, call, root, run) {
           if (rec) {
             oldStr = rec.text;
             occ = content.split(oldStr).length - 1;
+            if (rec.crlf) newStr = String(newStr).replace(/\r\n/g, "\n").replace(/\n/g, "\r\n");
             if (rec.indent) newStr = _reindentReplacement(newStr, rec.indent);
             if (!_mEditNote) _mEditNote = "（注：部分 old_string 不完全一致，已自动容错定位并应用；下次请逐字符复制、别带行号）";
           }
