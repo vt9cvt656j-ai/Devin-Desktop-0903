@@ -11,6 +11,10 @@ pub mod windows_ui_automation;
 pub mod macos;
 #[cfg(target_os = "macos")]
 pub mod macos_accessibility;
+/// 前台应用可访问性树的**原生**快照。JXA 那条路每读一个属性就是一次 Apple Event
+/// 往返，实测真实窗口下 500 个元素要 95 秒，而读屏上限是 6 秒——必然超时。
+#[cfg(target_os = "macos")]
+pub mod macos_tree;
 
 use crate::error::Result;
 use crate::types::{ScreenInfo, WindowInfo};

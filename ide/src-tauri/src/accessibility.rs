@@ -173,26 +173,96 @@ pub struct ReadScreenResponse {
 /// Read the frontmost application's accessibility tree. OCR is an explicit
 /// fallback for self-drawn interfaces; OCR refs are informational because they
 /// do not correspond to an accessibility node that can receive AX actions.
+/// 走 sidecar 的原生 AX 快照。失败就返回 None，让调用方退回 JXA 那条。
+///
+/// 为什么值得多这一跳：JXA 每读一个属性就是一次 Apple Event 往返，实测本机一个真实
+/// 窗口下 500 个元素要 **95 秒**，而这里的上限是 6 秒——在任何真实应用上都必然超时，
+/// 用户看到的就是「读屏一直超时、智能体在发呆」。原生那条同一批 500 个元素 **184 毫秒**，
+/// 而且网页内容照样在（WebArea、按钮、正文都读得到）。
+#[cfg(target_os = "macos")]
+async fn native_snapshot_via_sidecar() -> Option<UiSnapshot> {
+    let out = crate::automation::automation_call(
+        "screen.elements".into(),
+        serde_json::json!({ "cap": 500 }),
+    )
+    .await
+    .ok()?;
+    let arr = out.get("elements")?.as_array()?;
+    let pid = out.get("pid").and_then(|v| v.as_i64()).unwrap_or(0);
+    if pid <= 0 {
+        return None;
+    }
+    let name = out
+        .get("app")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+    let mut elements = Vec::with_capacity(arr.len());
+    for (i, e) in arr.iter().enumerate() {
+        elements.push(UiElement {
+            // 序号要和 sidecar 那边发出来的 ref 对上（它从 1 开始）：动作是按这个号
+            // 回到句柄表里找元素的，错一位就点到别的东西上。
+            ref_: i as u32 + 1,
+            role: e.get("role").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+            text: e.get("text").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+            x: e.get("x").and_then(|v| v.as_f64()).unwrap_or(0.0),
+            y: e.get("y").and_then(|v| v.as_f64()).unwrap_or(0.0),
+            w: e.get("w").and_then(|v| v.as_f64()).unwrap_or(0.0),
+            h: e.get("h").and_then(|v| v.as_f64()).unwrap_or(0.0),
+            value: e.get("value").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+            enabled: e.get("enabled").and_then(|v| v.as_bool()).unwrap_or(true),
+        });
+    }
+    Some(UiSnapshot {
+        target: Some(AccessibilityTarget { pid, name }),
+        elements,
+        page: None,
+        read_error: None,
+    })
+}
+
+#[cfg(not(target_os = "macos"))]
+async fn native_snapshot_via_sidecar() -> Option<UiSnapshot> {
+    None
+}
+
 #[tauri::command]
 pub async fn read_screen(ocr: Option<bool>) -> Result<ReadScreenResponse, String> {
     let use_ocr = ocr.unwrap_or(false);
     // Invalidate old refs before starting a new read. A failed or concurrent read
     // must never leave a ref from an older foreground process actionable.
     clear_latest_ax_refs()?;
-    let mut snapshot = tauri::async_runtime::spawn_blocking(move || {
-        if use_ocr {
-            UiSnapshot {
-                target: None,
-                elements: read_ocr_elements(),
-                page: None, // OCR 看的是像素，读不到网页的加载状态
-                read_error: None, // OCR 路径不经过 AX 读取，没有「读取没完成」这回事
+    // 先走**原生 AX**（sidecar 里的 screen.elements）。
+    //
+    // JXA 每读一个属性就是一次 Apple Event 往返：实测本机一个真实 Chrome 窗口，
+    // 只读 500 个元素的 5 个属性就要 **95 秒**，而这里的上限是 6 秒——也就是说在任何
+    // 真实应用上它必然超时。原生那条同一棵树 **106 毫秒**，还照样看得到网页内容
+    // （WebArea、链接、按钮、正文都在）。
+    //
+    // JXA 那条留着兜底：sidecar 没起来、权限没给、或者哪天原生这条读回空的时候，
+    // 至少还有一条路，而不是直接把「读不到」交给模型。
+    //
+    // 快路产出的是**同一个 UiSnapshot 结构**，然后走完全相同的下游：装 ref 表、
+    // 拼限制说明。绝不能在这里提前 return——ui_click 靠 install_ax_snapshot 记下的
+    // pid 和元素签名来定位，跳过它等于把「按 ref 操作」整条功能弄坏。
+    let fast = if use_ocr { None } else { native_snapshot_via_sidecar().await };
+    let mut snapshot = match fast {
+        Some(s) if !s.elements.is_empty() => s,
+        _ => tauri::async_runtime::spawn_blocking(move || {
+            if use_ocr {
+                UiSnapshot {
+                    target: None,
+                    elements: read_ocr_elements(),
+                    page: None, // OCR 看的是像素，读不到网页的加载状态
+                    read_error: None, // OCR 路径不经过 AX 读取，没有「读取没完成」这回事
+                }
+            } else {
+                read_ui_snapshot()
             }
-        } else {
-            read_ui_snapshot()
-        }
-    })
-    .await
-    .map_err(|error| format!("screen reader task failed: {error}"))?;
+        })
+        .await
+        .map_err(|error| format!("screen reader task failed: {error}"))?,
+    };
     install_ax_snapshot(&mut snapshot)?;
     let elements = snapshot.elements;
 

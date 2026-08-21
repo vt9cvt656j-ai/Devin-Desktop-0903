@@ -137,6 +137,10 @@ fn test_window_info() {
         width: 800,
         height: 600,
         is_visible: true,
+        // 「是不是前台」和「可见」是两回事：可见的窗口可以有很多个，前台只有一个，
+        // 而合成按键只进前台那个。原来两边共用 is_visible，Windows 上它恒为 true，
+        // 于是「谁在前台」永远是枚举到的第一个窗口。
+        is_frontmost: false,
         is_minimized: false,
     };
     
@@ -161,4 +165,33 @@ fn test_screen_info() {
     assert_eq!(deserialized.width, 1920);
     assert_eq!(deserialized.height, 1080);
     assert_eq!(deserialized.scale_factor, 2.0);
+}
+
+/// cmd 必须解释成「**这个平台的**主修饰键」，不是死板地映射到 Meta。
+///
+/// 错了的后果在 Windows 上是静默的：enigo 把 Meta 编成 VK_LWIN，模型照工具描述里的
+/// 示例发 ["cmd","s"] 想保存，实际按下 Win+S 打开系统搜索框，紧接着 keyboard.type
+/// 把内容打进了搜索框。而 RPC 回 ok、还带 delivered_to，三层都在说成功。
+/// 想按真正的 Windows 键仍然有说法：win / super / meta。
+#[test]
+fn cmd_means_this_platforms_primary_modifier() {
+    use crate::agent::parse_key_for_test as parse_key;
+    let primary = parse_key("cmd").expect("cmd 必须能解析");
+    let win_key = parse_key("win").expect("win 必须能解析");
+
+    #[cfg(target_os = "macos")]
+    {
+        assert_eq!(format!("{primary:?}"), format!("{:?}", enigo::Key::Meta), "mac 上 cmd = Meta");
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        assert_eq!(format!("{primary:?}"), format!("{:?}", enigo::Key::Control),
+            "非 mac 平台上 cmd 必须是 Ctrl —— 映射成 Meta 会按出 Win 键");
+        assert_ne!(format!("{primary:?}"), format!("{win_key:?}"),
+            "cmd 和 win 在 Windows 上必须是两个不同的键");
+    }
+    // 两个平台上 win 都指真正的 Windows/Command 键位（Meta）。
+    assert_eq!(format!("{win_key:?}"), format!("{:?}", enigo::Key::Meta));
+    // 平台中立的别名也要认，文案里推荐的就是它。
+    assert_eq!(format!("{:?}", parse_key("mod").unwrap()), format!("{primary:?}"));
 }

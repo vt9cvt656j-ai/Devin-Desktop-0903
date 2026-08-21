@@ -594,6 +594,13 @@ impl Agent {
     }
 }
 
+/// 只给测试用的出口。修饰键映射错了在 Windows 上是**静默**按下 Win 键，
+/// 三层回执还都说成功——这种东西必须有测试钉着。
+#[cfg(test)]
+pub fn parse_key_for_test(key: &str) -> Result<Key> {
+    parse_key(key)
+}
+
 fn parse_key(key: &str) -> Result<Key> {
     match key.to_lowercase().as_str() {
         "return" | "enter" => Ok(Key::Return),
@@ -608,7 +615,21 @@ fn parse_key(key: &str) -> Result<Key> {
         "down" | "downarrow" | "arrowdown" => Ok(Key::DownArrow),
         "left" | "leftarrow" | "arrowleft" => Ok(Key::LeftArrow),
         "right" | "rightarrow" | "arrowright" => Ok(Key::RightArrow),
-        "cmd" | "command" | "meta" | "super" | "win" => Ok(Key::Meta),
+        // **cmd 在 Windows 上必须是 Ctrl，不是 Win 键。**
+        //
+        // 原来一律映射成 Key::Meta，而 enigo 在 Windows 上把 Meta 编成 VK_LWIN。
+        // 于是模型照工具描述里的示例发 ["cmd","s"] 想保存文件，Windows 上实际按下的是
+        // Win+S——打开系统搜索框，紧接着 keyboard.type 把内容打进了搜索框而不是目标应用。
+        // 而 RPC 回 {"status":"ok"} 还带 delivered_to，三层都在说成功，模型收不到任何
+        // 失败信号，会把「已保存」当既成事实继续往下做。Win+R / Win+D / Win+E 同理。
+        //
+        // 所以 cmd/command/mod/primary 一律解释成「这个平台的主修饰键」，
+        // 而 win/super 保留给真正的 Windows 键——想按它的人还有话可说。
+        #[cfg(target_os = "macos")]
+        "cmd" | "command" | "mod" | "primary" => Ok(Key::Meta),
+        #[cfg(not(target_os = "macos"))]
+        "cmd" | "command" | "mod" | "primary" => Ok(Key::Control),
+        "meta" | "super" | "win" => Ok(Key::Meta),
         "ctrl" | "control" => Ok(Key::Control),
         "alt" | "option" => Ok(Key::Alt),
         "shift" => Ok(Key::Shift),
