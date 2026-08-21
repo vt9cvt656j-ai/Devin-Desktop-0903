@@ -54287,7 +54287,7 @@ async function _fetchWithTimeout(url, options = {}, timeoutMs = 9000) {
  * 语料库按需生长：网关没收录就现拉注册表 tarball、抽 .d.ts、入库，此后永久留下。
  * 所以第一次问某个包会慢几秒，之后是本地查询。
  */
-async function _searchCodeCorpus({ query, pkg, topK = 6 } = {}) {
+async function _searchCodeCorpus({ query, pkg, eco, topK = 6 } = {}) {
   const cfg = loadConfig();
   const baseUrl = cfg.baseUrl || MICHAEL_API;
   let apiKey = cfg.apiKey;
@@ -54304,7 +54304,9 @@ async function _searchCodeCorpus({ query, pkg, topK = 6 } = {}) {
   const response = await _fetchWithTimeout(`${baseUrl}/api/code-corpus/search`, {
     method: "POST",
     headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey || ""}` },
-    body: JSON.stringify({ query: query || pkg || "", package: pkg || undefined, top_k: topK }),
+    // 生态能确定就带上：网关据此决定「库里没有时去哪个注册表拉」。
+    // 带不上也没关系——网关会 npm→PyPI→crates 依次试，而检索本身跨生态按名字查。
+    body: JSON.stringify({ query: query || pkg || "", package: pkg || undefined, ecosystem: eco || undefined, top_k: topK }),
   }, 60_000);
   if (!response.ok) throw new Error(`HTTP ${response.status}`);
   return await response.json();
@@ -54347,7 +54349,15 @@ async function _searchKnowledgeBase(call) {
         content: `知识库${call.domain ? `的「${call.domain}」这一个域` : "（未指定域，已全库检索）"}里没有「${call.query}」相关的内容。${call.domain ? "**这只是这一个域的结论**——换个域、或不传 domain 再查一次，再下判断。" : ""}不要编造知识库结论；确认该主题确实不可用后，基于用户明确要求与项目证据继续。`,
       };
     }
-    const body = hits.map((hit, index) => `【${index + 1}｜${hit.domain}/${hit.topic} · ${hit.section}】\n${hit.text}`).join("\n\n———\n\n");
+    // 来源标签必须渲染出来。网关给每条打了 curated / real_api / official_docs，
+    // 而工具说明明确让模型「优先采信带标签的段落，别凭记忆回想 API」——
+    // 标签不渲染的话，那句说明承诺的东西模型一个字都看不到，三种来源在它眼里一模一样：
+    // 前人总结的经验、那个库自己的声明、官方文档，分量完全不同。
+    const _srcLabel = { curated: "经验", real_api: "真实声明", official_docs: "官方文档" };
+    const body = hits.map((hit, index) => {
+      const tag = _srcLabel[hit.source] ? `·${_srcLabel[hit.source]}` : "";
+      return `【${index + 1}${tag}｜${hit.domain}/${hit.topic} · ${hit.section}】\n${hit.text}`;
+    }).join("\n\n———\n\n");
     const domains = [...new Set(hits.map((hit) => String(hit?.domain || "").trim()).filter(Boolean))];
     return {
       type: "knowledge",
