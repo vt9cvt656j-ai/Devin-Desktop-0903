@@ -4761,14 +4761,14 @@ pub async fn smashingmag_search(query: String, max_results: Option<u32>) -> Resu
         // 于是查「rust ownership」拿回一份言之凿凿、实则零相关的清单——
         // 而这个源是 RSS 全文，命中率本来就低，一条假命中就足以让整页看起来「有结果」。
         // 纯 ASCII 词才按边界比；中日韩没有词边界，仍按子串。
-        let hit = |k: &&str| -> bool {
+        let hit = |k: &str| -> bool {
             let ascii = k.chars().all(|c| c.is_ascii_alphanumeric());
             if !ascii {
-                return haystack.contains(k.as_str());
+                return haystack.contains(k);
             }
             let bytes = haystack.as_bytes();
             let mut from = 0usize;
-            while let Some(rel) = haystack[from..].find(k.as_str()) {
+            while let Some(rel) = haystack[from..].find(k) {
                 let at = from + rel;
                 let end = at + k.len();
                 let before_ok = at == 0 || !bytes[at - 1].is_ascii_alphanumeric();
@@ -5343,11 +5343,13 @@ fn hit_matches_query(tokens: &[String], title: &str, path: &str) -> bool {
     tokens.iter().any(|tok| {
         let latin = tok.chars().all(|c| c.is_ascii_alphanumeric());
         if !latin {
-            return hay.contains(tok.as_str());
+            // 不能写 tok.as_str()：tok 是 &String，那条路径在这个工具链上被判成
+            // 不稳定特性 str_as_str，直接编不过（挡住了整个打包）。&**tok 等价。
+            return hay.contains(&**tok);
         }
         // 词边界：命中处的前后不能还是字母数字。
         let mut from = 0usize;
-        while let Some(rel) = hay[from..].find(tok.as_str()) {
+        while let Some(rel) = hay[from..].find(&**tok) {
             let at = from + rel;
             let end = at + tok.len();
             let before_ok = at == 0
@@ -6772,6 +6774,77 @@ mod endpoint_reality_tests {
         assert!(
             body.contains("换查询词重试没有用"),
             "没告诉模型别重试，它会换词再等 13 秒"
+        );
+    }
+}
+
+#[cfg(test)]
+mod result_quality_tests {
+    fn body_of(func: &str) -> String {
+        let src = include_str!("knowledge.rs");
+        let at = src.find(func).unwrap_or_else(|| panic!("{func} 不见了"));
+        let end = src[at..]
+            .find("\n#[cfg(test)]")
+            .map(|e| at + e)
+            .unwrap_or(src.len());
+        src[at..end.min(at + 5000)]
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// 不带 countTotal=true，ClinicalTrials 的响应里**根本没有** totalCount 字段——
+    /// 于是表头恒印「0 studies」，下面却跟着 10 条真试验。
+    /// 实测：加上之后 diabetes 返回 totalCount=35008。
+    #[test]
+    fn clinical_trials_asks_for_the_total() {
+        let b = body_of("pub async fn clinical_trials_search");
+        assert!(b.contains(r#"("countTotal", "true".into())"#), "表头又会恒印 0 studies");
+        // 非 2xx 时要把响应体带上：那句 `Invalid value in parameter …` 直接就是修法。
+        assert!(b.contains("body.chars().take(300)"), "错误只回裸状态码，模型只能瞎猜参数");
+    }
+
+    /// CocoaPods 的 530/1016 是 Cloudflare 源站解析失败，不是参数问题。
+    /// 只回裸状态码的话，模型会改包名重试若干轮，每次都 530。
+    #[test]
+    fn cocoapods_says_the_upstream_is_down() {
+        let b = body_of("fn search_cocoapods");
+        // 钉**判据本身**，不是消息文本——消息里也写着 530，只删掉 if 条件照样能过。
+        assert!(
+            b.contains("if st == 530 || st == 1016 {"),
+            "530/1016 的分支判据没了 —— 又只回裸状态码，模型会改包名重试若干轮"
+        );
+        assert!(b.contains("换包名重试没有用"), "没告诉模型别重试");
+        assert!(b.contains("swiftpm"), "没给出还能走的替代路");
+    }
+
+    /// NVD **按 CVE 编号升序**返回。实测 keywordSearch=kubernetes 前 5 条是
+    /// CVE-2015-5305 / 2016-1905 / 2015-7528 / 2016-5392 / 2017-1000056——
+    /// 全是十年前的，而 totalResults 写着 623。模型问「现在有什么漏洞」会据此答错。
+    #[test]
+    fn cve_results_are_sorted_newest_first_and_say_so() {
+        let b = body_of("pub async fn cve_search");
+        assert!(b.contains("vulns.sort_by"), "没有按时间重排，返回的是最老的那一批");
+        assert!(b.contains("已按发布时间从新到旧重排"), "没告诉模型这一页被重排过");
+        assert!(
+            b.contains("并不是全局最新的 N 条"),
+            "没说清这只是一页 —— 模型会把它当成「最新的全部」"
+        );
+    }
+
+    /// Smashing 的过滤原来是子串：查 "rust" 会命中 trust / frustration / crusty，
+    /// 于是拿回一份言之凿凿、实则零相关的清单。
+    #[test]
+    fn smashingmag_matches_on_word_boundaries() {
+        let b = body_of("pub async fn smashingmag_search");
+        assert!(
+            b.contains("before_ok && after_ok"),
+            "又退回子串匹配 —— rust 会命中 trust"
+        );
+        assert!(
+            !b.contains("keywords.iter().any(|k| haystack.contains(k))"),
+            "旧的子串判据还在"
         );
     }
 }
