@@ -9060,9 +9060,19 @@ test("automation-era laws: install cleanup desktop gates fire only on AI intent"
   assert.match(auto, /keyboard\.paste/);
   const plain = frame("把按钮改成蓝色", { applies: true, ui: true, implementation: true });
   assert.doesNotMatch(plain, /环境安装律|清理律|桌面自动化律/);
-  // 框架新 RPC 能力必须在 automation 工具描述里可发现，否则模型永远不会调
-  assert.match(SRC, /window\.list \/ window\.activate\{title\} \/ window\.minimize\{title\} \/ screen\.info \/ clipboard\.get \/ clipboard\.set\{text\} \/ keyboard\.paste\{text\}/,
-    "窗口/屏幕/剪贴板 RPC 必须对模型可见");
+  // 框架新 RPC 能力必须在 automation 工具描述里可发现，否则模型永远不会调。
+  //
+  // 这条守卫自己就漏过一个：screen.capture 在 sidecar 里实现着（rpc.rs 的 match 分支），
+  // 却从没写进这份清单，而清单里偏偏有个 browser.screenshot。实拍到模型翻完这份清单后
+  // 得出「屏幕截图这儿没有，只有浏览器截图」，绕了六分钟没找到——真方法藏在另一个工具
+  // （computer）的 enum 里。所以改成**逐个点名**，别再用一整串连写的正则：
+  // 连写的串一旦中间加了新方法就整条失配，而失配时人只会去改正则，不会去问「是不是漏了谁」。
+  for (const m of [
+    "window.list", "window.activate{title}", "window.minimize{title}",
+    "screen.info", "screen.capture", "clipboard.get", "clipboard.set{text}", "keyboard.paste{text}",
+  ]) {
+    assert.ok(SRC.includes(m), `automation 的方法清单里少了 ${m}——模型看不到就永远不会调它`);
+  }
   // Tool availability is no longer routed through a separate profile table. The
   // semantic orchestrator receives the live registry, which contains any installed
   // desktop, setup, cleanup, and remote capabilities.
