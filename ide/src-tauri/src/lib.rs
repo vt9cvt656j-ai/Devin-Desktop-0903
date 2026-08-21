@@ -525,6 +525,49 @@ pub fn run() {
 
 #[cfg(all(test, desktop))]
 mod tests {
+
+    /// 反漂移：Windows 的应用清单**只能有一份**。
+    ///
+    /// 踩过的坑：build.rs 为了补 DPI 感知，自己写了一份只含 dpiAwareness 的清单，
+    /// 用 `/MANIFESTINPUT` + `/MANIFEST:EMBED` 交给链接器；而 tauri-build 本来就会
+    /// 嵌一份自己的。两份 MANIFEST 都是 id 1，链接期直接失败：
+    ///   CVTRES : fatal error CVT1100: duplicate resource. type:MANIFEST, name:1
+    /// 结果是那次修复让 **Windows 整个编不出来**，而 `cargo xwin check` 是绿的——
+    /// check 不做链接，冲突只在链接期出现，一直到 CI 才炸。
+    ///
+    /// 正确做法：把要加的东西并进 tauri-build 要嵌的那一份里（app_manifest）。
+    #[test]
+    fn windows_app_manifest_is_embedded_exactly_once() {
+        let src = include_str!("../build.rs");
+        let code: String = src
+            .lines()
+            .filter(|l| {
+                let t = l.trim_start();
+                !t.starts_with("//") && !t.starts_with("///")
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !code.contains("MANIFESTINPUT"),
+            "build.rs 又自己往链接器塞了一份清单 —— 和 tauri-build 嵌的那份撞车，Windows 链接会失败"
+        );
+        assert!(
+            code.contains("app_manifest(WINDOWS_APP_MANIFEST)"),
+            "清单没有交给 tauri-build 嵌 —— 要加的东西必须并进它那一份里"
+        );
+        // 替换掉默认清单之后，默认里那些该有的都得带上，缺一样都是回归。
+        for needle in [
+            "Microsoft.Windows.Common-Controls",
+            "compatibility.v1",
+            "asInvoker",
+            "PerMonitorV2",
+        ] {
+            assert!(
+                code.contains(needle),
+                "清单里少了 {needle} —— 它替换了 tauri-build 的默认清单，默认里有的不能丢"
+            );
+        }
+    }
     use super::should_open_devtools_on_startup;
 
     #[test]

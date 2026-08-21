@@ -62,6 +62,13 @@ echo "── Windows 那条分支能不能编过 ──"
 if command -v cargo-xwin >/dev/null 2>&1; then
   (cd ide/src-tauri && cargo xwin check --target x86_64-pc-windows-msvc >/dev/null 2>&1) \
     || fail "Windows 目标编不过：cd ide/src-tauri && cargo xwin check --target x86_64-pc-windows-msvc"
+  # check **不做链接**，而有一整类失败只在链接期出现。实际发生过：build.rs 用
+  # /MANIFESTINPUT 自己塞了一份 Windows 清单，而 tauri-build 本来就嵌一份——
+  # 两份 MANIFEST 都是 id 1，链接直接失败（CVT1100 duplicate resource / LNK1123）。
+  # 那次「补 DPI 感知」的修复因此让 Windows 整个编不出来，而这道闸门当时是绿的，
+  # CI 上跑到链接那一步才炸。所以必须真链一次主程序。
+  (cd ide/src-tauri && cargo xwin build --release --target x86_64-pc-windows-msvc --bin michael-ide >/dev/null 2>&1) \
+    || fail "Windows 主程序链接不过（check 查不出来，只有真链接才会暴露）：cd ide/src-tauri && cargo xwin build --release --target x86_64-pc-windows-msvc --bin michael-ide"
   (cd ide/automation-framework && cargo xwin check --target x86_64-pc-windows-msvc --all-features >/dev/null 2>&1) \
     || fail "sidecar 的 Windows 目标编不过"
 else
