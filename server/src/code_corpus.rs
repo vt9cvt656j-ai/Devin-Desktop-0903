@@ -563,6 +563,16 @@ pub async fn search(
         .map(|w| w.to_ascii_lowercase())
         .take(12)
         .collect();
+    // 加权强度随查询里的词数递减。
+    //
+    // 一个词的查询里，命中包名几乎是决定性的；五个词的问句里，某个词碰巧和某个包同名
+    // 只是弱证据——而 probe / difference / parse / error 这种名字在包生态里遍地都是。
+    // 实测：问「liveness probe readiness probe difference」时，固定 +3.0 的加权把名叫
+    // `probe` 和 `difference` 的两个 crate 顶到了最前面，而答案（kubernetes 官方文档
+    // 讲这两种探针区别的那一节）被压了下去。普通英文词被当成了包名。
+    //
+    // 除以词数就够了：单词查询仍拿满额，长问句里它退化成一个轻微的偏好。
+    let name_boost = 3.0f32 / (name_tokens.len().max(1) as f32);
     // {D, C, B, A}
     let weights: Vec<f32> = if ident {
         vec![0.1, 0.2, 0.4, 1.0]
@@ -574,7 +584,7 @@ pub async fn search(
                 (ts_rank($6::float4[], tsv, websearch_to_tsquery('english', $1)) * 2.0 \
                   + ts_rank($6::float4[], tsv, websearch_to_tsquery('english', $5)) \
                   + CASE WHEN $7 AND symbol <> '' THEN similarity(symbol, $2) * 2.0 ELSE 0 END \
-                  + CASE WHEN lower(name) = ANY($8) THEN 3.0 ELSE 0 END)::real AS score \
+                  + CASE WHEN lower(name) = ANY($8) THEN $9::real ELSE 0 END)::real AS score \
            FROM code_corpus \
           WHERE ($3 = '' OR name = $3) \
             AND ($5 <> '' AND tsv @@ websearch_to_tsquery('english', $5) \
@@ -590,6 +600,7 @@ pub async fn search(
     .bind(&weights)
     .bind(ident)
     .bind(&name_tokens)
+    .bind(name_boost)
     .fetch_all(db)
     .await
     .context("code corpus search")?;
@@ -1835,8 +1846,10 @@ declare function notExported(): void;
         assert!(prod.contains("CASE WHEN $7 AND symbol <> '' THEN similarity"),
             "符号相似度只该在标识符查询时加权");
         // 用户把库名说出来了，那是查询里最强的信号——不加权就会被冗长的无关正文压过去。
-        assert!(prod.contains("CASE WHEN lower(name) = ANY($8) THEN 3.0"),
-            "查询里点名的库必须加权，否则问 zustand 排不出 zustand");
+        assert!(prod.contains("CASE WHEN lower(name) = ANY($8) THEN $9::real"),
+            "查询里点名的库要加权，但强度必须可调——固定值会让普通英文词冒充包名");
+        assert!(prod.contains("let name_boost = 3.0f32 / (name_tokens.len().max(1) as f32);"),
+            "加权强度要随词数递减：问句里某个词碰巧和某个包同名只是弱证据");
     }
 
     #[test]
