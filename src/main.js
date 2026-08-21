@@ -70315,6 +70315,12 @@ function _downscaleImageForVision(dataUrl, maxDim = 1568, stripMetadata = false)
   return new Promise((resolve) => {
     // SVG 必须栅格化：三家视觉接口（OpenAI / Anthropic / Gemini）都不收
     // image/svg+xml，原样送过去要么整条请求报错、要么被悄悄丢掉。
+    //
+    // 说清楚这段的分量，免得被当成 SVG 问题的解药：**当前每一个调用点都传
+    // stripMetadata=true**，所以下面几处 `|| needsRaster` 今天一次都走不到，
+    // 它们是给「将来有人传 false」留的防线。真正让 SVG 不再被送出去的是
+    // _buildImageFeedback 那一步——把工具返回的图也接进这个消毒函数。
+    // （这条是复核自己上一笔时发现说法夸大了，据实改回来。）
     // 这个标志原来在 onload 里才算，而**结尾那行又把栅格结果扔了**：
     // `out.length < dataUrl.length ? out : dataUrl` —— SVG 是文本，几乎永远比它
     // 自己的 PNG 小，于是每次都退回原来那份 SVG。强制栅格化写了，等于没写。
