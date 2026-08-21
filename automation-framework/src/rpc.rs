@@ -237,8 +237,15 @@ impl RpcServer {
             #[cfg(feature = "browser")]
             "browser.screenshot" => {
                 let path = params.get("path").and_then(|v| v.as_str());
-                agent.browser_screenshot(path)?;
-                Ok(serde_json::json!({"status": "ok"}))
+                let png = agent.browser_screenshot(path)?;
+                // 回 data_url，和 screen.capture 同形——上层（main.js 的 automation 分支）
+                // 只在 r.data_url 存在时才把图走 image 通道喂给模型。原来这里只回
+                // `{"status":"ok"}`，于是「截了一张图」变成了「什么都没看到但显示成功」。
+                Ok(serde_json::json!({
+                    "data_url": format!("data:image/png;base64,{}", crate::system::base64_encode(&png)),
+                    "bytes": png.len(),
+                    "path": path,
+                }))
             }
             
             #[cfg(feature = "browser")]

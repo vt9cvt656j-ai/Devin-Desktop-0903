@@ -482,7 +482,7 @@ impl SystemAutomation {
 /// 不引 base64 crate：sidecar 是独立编译、独立分发的二进制，为一个 20 行的编码器多一条
 /// 依赖不划算，而且这条链路上任何一次 `cargo update` 都可能让二进制和源码悄悄对不上
 /// （本仓库记录过：Tauri 不会自动重编这个 crate）。
-fn base64_encode(bytes: &[u8]) -> String {
+pub(crate) fn base64_encode(bytes: &[u8]) -> String {
     const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity((bytes.len() + 2) / 3 * 4);
     for chunk in bytes.chunks(3) {
