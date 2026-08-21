@@ -144,7 +144,158 @@ impl SystemAutomation {
         Ok((format!("data:image/png;base64,{}", base64_encode(&buf)), scale_note))
     }
 
-    #[cfg(not(target_os = "macos"))]
+    /// Windows：GDI 抓屏（BitBlt + GetDIBits），编成 PNG data URL。
+    ///
+    /// 这条以前是一句硬 Err——"这个平台还没有实现屏幕截图"。后果不只是少一个功能：
+    /// read_screen 读空时，非 macOS 分支明确把模型指向 `screen.capture`，
+    /// 工具目录也把它写成"唯一能看见原生应用的办法"。也就是说 Windows 上
+    /// 唯一的兜底路是死的，而所有指路牌都指着它。
+    ///
+    /// 用 GDI 而不是起 PowerShell：截图在"看一眼再动手"的循环里会被反复调用，
+    /// 每次多花半秒起一个 PowerShell 是实打实的代价。
+    #[cfg(target_os = "windows")]
+    pub fn screen_capture(&self, region: Option<(i32, i32, i32, i32)>) -> Result<(String, Option<String>)> {
+        use windows::Win32::Foundation::HWND;
+        use windows::Win32::Graphics::Gdi::*;
+        use windows::Win32::UI::WindowsAndMessaging::{
+            GetSystemMetrics, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN,
+            SM_YVIRTUALSCREEN,
+        };
+
+        // 不给 region 就抓**整个虚拟桌面**，不是主屏：多显示器下窗口经常在副屏，
+        // 只抓主屏会得到一张"什么都没有"的图，而模型无从分辨那是空桌面还是抓错了屏。
+        let (x, y, w, h) = match region {
+            Some((rx, ry, rw, rh)) => {
+                if rw <= 0 || rh <= 0 {
+                    return Err(Error::System("截图区域的宽高必须为正".into()));
+                }
+                (rx, ry, rw, rh)
+            }
+            None => unsafe {
+                (
+                    GetSystemMetrics(SM_XVIRTUALSCREEN),
+                    GetSystemMetrics(SM_YVIRTUALSCREEN),
+                    GetSystemMetrics(SM_CXVIRTUALSCREEN),
+                    GetSystemMetrics(SM_CYVIRTUALSCREEN),
+                )
+            },
+        };
+        if w <= 0 || h <= 0 {
+            return Err(Error::System("拿不到屏幕尺寸（虚拟桌面宽高为 0）".into()));
+        }
+
+        let pixels = unsafe {
+            let screen_dc = GetDC(HWND(std::ptr::null_mut()));
+            if screen_dc.is_invalid() {
+                return Err(Error::System("拿不到屏幕设备上下文（GetDC 失败）".into()));
+            }
+            // 下面每一步失败都要把已经拿到的资源还回去，否则每次失败泄漏一个 DC/位图，
+            // 而截图是会被反复调用的。
+            let mem_dc = CreateCompatibleDC(screen_dc);
+            if mem_dc.is_invalid() {
+                ReleaseDC(HWND(std::ptr::null_mut()), screen_dc);
+                return Err(Error::System("建内存设备上下文失败".into()));
+            }
+            let bitmap = CreateCompatibleBitmap(screen_dc, w, h);
+            if bitmap.is_invalid() {
+                let _ = DeleteDC(mem_dc);
+                ReleaseDC(HWND(std::ptr::null_mut()), screen_dc);
+                return Err(Error::System("建位图失败（截图区域可能过大）".into()));
+            }
+            let old = SelectObject(mem_dc, bitmap);
+
+            // CAPTUREBLT 是必须的：不加的话分层窗口（很多输入法候选框、部分
+            // Electron 应用的阴影和圆角、以及半透明浮层）会整块缺失。
+            let blt_ok = BitBlt(mem_dc, 0, 0, w, h, screen_dc, x, y, SRCCOPY | CAPTUREBLT).is_ok();
+
+            let mut buf = vec![0u8; (w as usize) * (h as usize) * 4];
+            let mut info = BITMAPINFO {
+                bmiHeader: BITMAPINFOHEADER {
+                    biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                    biWidth: w,
+                    // 负高度 = 自上而下。正数的话拿到的是上下颠倒的图，
+                    // 而颠倒的截图看着"像是"能用，模型据此算出来的 y 全是反的。
+                    biHeight: -h,
+                    biPlanes: 1,
+                    biBitCount: 32,
+                    biCompression: BI_RGB.0,
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            let got = if blt_ok {
+                GetDIBits(
+                    screen_dc,
+                    bitmap,
+                    0,
+                    h as u32,
+                    Some(buf.as_mut_ptr() as *mut std::ffi::c_void),
+                    &mut info,
+                    DIB_RGB_COLORS,
+                )
+            } else {
+                0
+            };
+
+            SelectObject(mem_dc, old);
+            let _ = DeleteObject(bitmap);
+            let _ = DeleteDC(mem_dc);
+            ReleaseDC(HWND(std::ptr::null_mut()), screen_dc);
+
+            if !blt_ok {
+                return Err(Error::System(
+                    "BitBlt 抓屏失败。受保护内容（DRM 播放器、部分远程桌面会话）会拒绝被截。".into(),
+                ));
+            }
+            if got == 0 {
+                return Err(Error::System("GetDIBits 读不出像素".into()));
+            }
+            buf
+        };
+
+        // GDI 给的是 BGRA，而且 BitBlt 出来的 alpha 通道是 0（它不管透明度）。
+        // 照原样编码会得到一张全透明的 PNG——打开是空白，但字节数看着完全正常。
+        let mut rgba = pixels;
+        for px in rgba.chunks_exact_mut(4) {
+            px.swap(0, 2);
+            px[3] = 255;
+        }
+
+        let img = image::RgbaImage::from_raw(w as u32, h as u32, rgba)
+            .ok_or_else(|| Error::System("像素数据长度和图像尺寸对不上".into()))?;
+        let mut png = std::io::Cursor::new(Vec::new());
+        img.write_to(&mut png, image::ImageFormat::Png)
+            .map_err(|e| Error::System(format!("PNG 编码失败：{e}")))?;
+        let png = png.into_inner();
+        if png.is_empty() {
+            return Err(Error::System("截屏得到 0 字节".into()));
+        }
+
+        // 和 macOS 那支同一个约定：图是像素，鼠标收的是点，不一致就说出来。
+        // Windows 上进程如果不是 per-monitor DPI aware，这两者也会差一个缩放比。
+        let scale_note = match self.screen_size_points() {
+            Some((sw, sh)) if sw > 0 && sh > 0 && region.is_none() => {
+                let fx = w as f64 / sw as f64;
+                if (fx - 1.0).abs() > 0.01 || (h as f64 / sh as f64 - 1.0).abs() > 0.01 {
+                    Some(format!(
+                        "image_px={w}x{h}; screen_points={sw}x{sh}; pixels_per_point={:.2}。\
+图上量到的坐标要除以 {:.2} 再传给 mouse.move —— 那个接口收的是点，不是像素。",
+                        fx, fx
+                    ))
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        };
+
+        Ok((
+            format!("data:image/png;base64,{}", base64_encode(&png)),
+            scale_note,
+        ))
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     pub fn screen_capture(&self, _region: Option<(i32, i32, i32, i32)>) -> Result<(String, Option<String>)> {
         Err(Error::System("这个平台还没有实现屏幕截图".into()))
     }

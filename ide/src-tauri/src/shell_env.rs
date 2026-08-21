@@ -344,6 +344,37 @@ pub fn shell_plan() -> ShellPlan {
 }
 
 #[cfg(test)]
+mod one_shell_decision {
+    /// 「用哪个解释器」这个决定**只许有一处**。
+    ///
+    /// 这条守的是一个实际发生过的 bug：终端另起炉灶读 COMSPEC，而 run_cmd 走 plan()。
+    /// 装了 Git for Windows 的机器上 run_cmd 跑 bash、终端跑 cmd.exe，而每轮注入给
+    /// 模型的平台说明只说一句「两者都由 bash 执行」——对前者是真的，对后者是假的。
+    /// 模型据此往终端里写 POSIX 语法，而本该保护它的那段警告正好被关掉。
+    #[test]
+    fn only_shell_env_decides_the_interpreter() {
+        for (name, src) in [
+            ("terminal.rs", include_str!("terminal.rs")),
+            ("tasks.rs", include_str!("tasks.rs")),
+        ] {
+            let code: String = src
+                .lines()
+                .filter(|l| !l.trim_start().starts_with("//"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(
+                !code.contains("COMSPEC"),
+                "{name} 又自己去读 COMSPEC 挑解释器了——这个决定只该由 shell_env::plan() 做"
+            );
+            assert!(
+                code.contains("shell_env::plan"),
+                "{name} 应该走 shell_env::plan()"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 

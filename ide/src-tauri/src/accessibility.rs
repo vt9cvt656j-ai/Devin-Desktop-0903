@@ -123,7 +123,9 @@ fn install_ax_snapshot(snapshot: &mut UiSnapshot) -> Result<(), String> {
     Ok(())
 }
 
-#[cfg(target_os = "macos")]
+// 两个平台共用：macOS 走 AX，Windows 走 UI Automation，但"ref 是谁"这件事
+// 由同一张表回答。Windows 侧以前根本不查表（直接把 ref 当索引传下去），
+// 于是元素在两次调用之间变了也无从发现。
 fn resolve_ax_ref(reference: u32) -> Result<(AxRefBinding, AccessibilityTarget), String> {
     let latest = LATEST_AX_REFS
         .lock()
@@ -311,7 +313,13 @@ pub async fn read_screen(ocr: Option<bool>) -> Result<ReadScreenResponse, String
                     // 两处平台差异，都会让这句建议变成假话：
                     //  · 已经在 ocr 里读空的时候，再建议「用 ocr=true」等于建议它用正在用的那个；
                     //  · OCR 只有 macOS 有实现，非 macOS 上它恒返回空——把模型指过去等于送进死路。
-                    if use_ocr {
+                    if use_ocr && !cfg!(target_os = "macos") {
+                        // 这里以前和 macOS 共用一句「OCR 也读空了，所以屏幕上没有文字」。
+                        // 在非 macOS 上 read_ocr_elements() 是个恒返回空 Vec 的实现——
+                        // 空结果跟屏幕上有没有字毫无关系。模型据此断定「这个界面没有可读的
+                        // 内容」，然后放弃整条任务，而真实原因只是这个平台没写 OCR。
+                        "there is NO OCR implementation on this platform — ocr=true returned empty because nothing ran, not because the screen is blank. Use computer's screen.capture to look at the real pixels instead"
+                    } else if use_ocr {
                         "OCR also came back empty, so there is no text on screen to read either — this is not something a different flag fixes"
                     } else if cfg!(target_os = "macos") {
                         "read it with ocr=true instead"
@@ -398,27 +406,10 @@ pub async fn ui_click(
     if action == "set_value" && value.is_none() {
         return Err("set_value requires value".into());
     }
-    #[cfg(target_os = "macos")]
+    // 非 macOS 上原来这里现造一个空签名的 binding：raw_ref 直接等于模型传来的 ref，
+    // 签名八个字段全是零值。也就是说 Windows 上"这个 ref 还指着刚才那个元素吗"
+    // 从来没有被检查过——而它恰恰是按 ref 操作能不能信的全部依据。
     let (binding, expected_target) = resolve_ax_ref(reference)?;
-    #[cfg(not(target_os = "macos"))]
-    let binding = AxRefBinding {
-        raw_ref: reference,
-        signature: AxElementSignature {
-            role: String::new(),
-            text: String::new(),
-            x: 0.0,
-            y: 0.0,
-            w: 0.0,
-            h: 0.0,
-            value: String::new(),
-            enabled: false,
-        },
-    };
-    #[cfg(not(target_os = "macos"))]
-    let expected_target = AccessibilityTarget {
-        pid: 0,
-        name: String::new(),
-    };
     let result = tauri::async_runtime::spawn_blocking(move || {
         perform_ax_action(&binding, &action, value.as_deref(), &expected_target)
     })
@@ -594,7 +585,7 @@ pub fn read_ui_elements() -> Vec<UiElement> {
 // bounded → falls back to the coordinate grid on permission/slow/no-tree (no hang). Same
 // JSON shape as macOS so the caller is platform-agnostic.
 #[cfg(target_os = "windows")]
-pub fn read_ui_elements() -> (Vec<UiElement>, Option<String>) {
+pub fn read_ui_elements() -> (Vec<UiElement>, Option<AccessibilityTarget>, Option<String>) {
     use std::io::Read;
     use std::process::{Command, Stdio};
     use std::time::{Duration, Instant};
@@ -603,13 +594,16 @@ pub fn read_ui_elements() -> (Vec<UiElement>, Option<String>) {
 Add-Type -AssemblyName UIAutomationClient,UIAutomationTypes
 Add-Type @"
 using System;using System.Runtime.InteropServices;
-public class _AW{[DllImport("user32.dll")]public static extern IntPtr GetForegroundWindow();}
+public class _AW{[DllImport("user32.dll")]public static extern IntPtr GetForegroundWindow();
+[DllImport("user32.dll")]public static extern uint GetWindowThreadProcessId(IntPtr h,out uint pid);}
 "@
 $h=[_AW]::GetForegroundWindow()
-if($h -eq [IntPtr]::Zero){'[]';exit}
+if($h -eq [IntPtr]::Zero){'{"elements":[]}';exit}
+$tp=0;[void][_AW]::GetWindowThreadProcessId($h,[ref]$tp)
+$tn='';try{$tn=(Get-Process -Id $tp).ProcessName}catch{}
 $AE=[System.Windows.Automation.AutomationElement]
 $root=$AE::FromHandle($h)
-if($root -eq $null){'[]';exit}
+if($root -eq $null){'{"elements":[],"pid":'+$tp+',"app":"'+$tn+'"}';exit}
 $t1=@{'Button'=1;'Edit'=1;'CheckBox'=1;'RadioButton'=1;'ComboBox'=1;'Hyperlink'=1;'Slider'=1;'SplitButton'=1;'Spinner'=1;'MenuItem'=1;'TabItem'=1}
 $t2=@{'Text'=1}
 $t3=@{'Group'=1;'Pane'=1;'ToolBar'=1;'StatusBar'=1;'ScrollBar'=1;'Table'=1;'DataGrid'=1;'Document'=1;'Window'=1;'Header'=1}
@@ -632,7 +626,7 @@ foreach($e in $els){
 }
 $all=@($a1)+@($a2)+@($a3)+@($a4)
 $out=@();for($i=0;$i -lt [Math]::Min($all.Count,500);$i++){$m=$all[$i];$m.ref=$i;$out+=$m}
-if($out.Count -eq 0){'[]'}else{ConvertTo-Json -Compress -InputObject @($out)}"#;
+ConvertTo-Json -Compress -Depth 4 -InputObject @{pid=$tp;app=$tn;elements=@($out)}"#;
 
     let mut child = match crate::process_util::command("powershell")
         .args([
@@ -648,7 +642,7 @@ if($out.Count -eq 0){'[]'}else{ConvertTo-Json -Compress -InputObject @($out)}"#;
         .spawn()
     {
         Ok(c) => c,
-        Err(_) => return (Vec::new(), Some("powershell 起不来".into())),
+        Err(_) => return (Vec::new(), None, Some("powershell 起不来".into())),
     };
     let deadline = Instant::now() + Duration::from_millis(6000);
     loop {
@@ -663,11 +657,11 @@ if($out.Count -eq 0){'[]'}else{ConvertTo-Json -Compress -InputObject @($out)}"#;
                     // 下游会照 macOS 那套说「权限没问题、重试没意义、改用 ocr」——而 ocr
                     // 在 Windows 上恒返回空，模型绕一圈后断定「这个应用没法自动化」，
                     // 把一句假话报给用户。
-                    return (Vec::new(), Some("UI Automation 读取超时（6 秒）".into()));
+                    return (Vec::new(), None, Some("UI Automation 读取超时（6 秒）".into()));
                 }
                 std::thread::sleep(Duration::from_millis(40));
             }
-            Err(_) => return (Vec::new(), Some("等待 powershell 时出错".into())),
+            Err(_) => return (Vec::new(), None, Some("等待 powershell 时出错".into())),
         }
     }
     let mut s = String::new();
@@ -675,23 +669,39 @@ if($out.Count -eq 0){'[]'}else{ConvertTo-Json -Compress -InputObject @($out)}"#;
         let _ = so.read_to_string(&mut s);
     }
     let t = s.trim();
-    if t.starts_with('{') {
-        return match serde_json::from_str::<UiElement>(t) {
-            Ok(e) => (vec![e], None),
-            Err(_) => (Vec::new(), Some("powershell 输出不是合法 JSON".into())),
-        };
+    // 脚本现在固定回一个 {pid, app, elements} 的对象。以前回的是裸数组，还得靠
+    // 「开头是不是 {」来猜 PowerShell 有没有把单元素数组塌成对象——那个启发式
+    // 一旦猜错就把整棵树当成一个元素。现在形状是固定的，不用猜。
+    //
+    // pid/app 不是装饰：install_ax_snapshot 靠它判断「这次读的还是不是同一个应用」，
+    // 没有身份它会直接早退，ref 表一条都不存——于是 ui_click 拿到的 ref 无从校验。
+    #[derive(serde::Deserialize)]
+    struct WinRead {
+        #[serde(default)]
+        pid: i64,
+        #[serde(default)]
+        app: String,
+        #[serde(default)]
+        elements: Vec<UiElement>,
     }
-    match serde_json::from_str::<Vec<UiElement>>(t) {
-        Ok(v) => (v, None),
+    match serde_json::from_str::<WinRead>(t) {
+        Ok(r) => {
+            let target = if r.pid > 0 {
+                Some(AccessibilityTarget { pid: r.pid, name: r.app })
+            } else {
+                None
+            };
+            (r.elements, target, None)
+        }
         // 解析失败以前是 unwrap_or_default() 静默变空——和「这个应用真没有元素」
         // 长得一模一样，而这两件事该走完全不同的处置。
-        Err(_) => (Vec::new(), Some("powershell 输出不是合法 JSON".into())),
+        Err(_) => (Vec::new(), None, Some("powershell 输出不是合法 JSON".into())),
     }
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-pub fn read_ui_elements() -> (Vec<UiElement>, Option<String>) {
-    (Vec::new(), Some("这个平台没有可访问性树读取实现".into()))
+pub fn read_ui_elements() -> (Vec<UiElement>, Option<AccessibilityTarget>, Option<String>) {
+    (Vec::new(), None, Some("这个平台没有可访问性树读取实现".into()))
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -700,9 +710,13 @@ fn read_ui_snapshot() -> UiSnapshot {
     // 输出不是合法 JSON，三种失败都存在，只是原来全都静默返回了空。空结果因此和
     // 「这个应用真的没有可访问性树」长得一模一样，而下游对这两件事的处置完全相反
     // （一个该重试或切前台，一个该换别的手段）。现在各自报出来。
-    let (elements, read_error) = read_ui_elements();
+    let (elements, target, read_error) = read_ui_elements();
     UiSnapshot {
-        target: None,
+        // 以前这里硬写 None。后果不是"少一个字段"：install_ax_snapshot 见到
+        // target 为 None 就整段早退，一条 ref 都不入表——而它同时也是把
+        // element.ref_ 换成不透明序号的地方。于是 Windows 上读屏发出去的 ref
+        // 既没被登记、也没被改写，ui_click 拿着它无从校验元素还是不是原来那个。
+        target,
         elements,
         page: None,
         read_error,
@@ -930,14 +944,175 @@ fn perform_ax_action(
     run_osa(&script, 6000).ok_or_else(|| "辅助功能操作超时或无权限".to_string())
 }
 
-#[cfg(not(target_os = "macos"))]
+/// Windows：按 ref 在 UI Automation 上真的执行动作。
+///
+/// 这条以前是一句硬 Err「当前平台暂不支持节点直接操作，请改用坐标点击」。
+/// 读屏那条路在 Windows 上是真的（PowerShell + UIA，分层取控件），但读完之后
+/// 唯一能"动"的方式是坐标点击——而坐标点击对滚动、缩放、DPI 变化毫无抵抗力，
+/// 也没法读回"点完变成什么样了"。读和动之间是断的。
+///
+/// 做法和 macOS 那侧对齐：重跑**同一套确定性枚举**，按序号取回元素，
+/// 先用 read_screen 时记下的签名核对它还是不是原来那个，再执行动作。
+#[cfg(target_os = "windows")]
+fn perform_ax_action(
+    binding: &AxRefBinding,
+    action: &str,
+    value: Option<&str>,
+    expected_target: &AccessibilityTarget,
+) -> Result<String, String> {
+    fn ps_lit(v: &str) -> String {
+        // PowerShell 单引号字符串里只有单引号需要转义（写成两个）。
+        format!("'{}'", v.replace('\'', "''"))
+    }
+    let sig = &binding.signature;
+    let script = format!(
+        r#"$ErrorActionPreference='SilentlyContinue'
+Add-Type -AssemblyName UIAutomationClient,UIAutomationTypes
+Add-Type @"
+using System;using System.Runtime.InteropServices;
+public class _AX{{[DllImport("user32.dll")]public static extern IntPtr GetForegroundWindow();
+[DllImport("user32.dll")]public static extern uint GetWindowThreadProcessId(IntPtr h,out uint pid);}}
+"@
+function Fail($m){{ConvertTo-Json -Compress -InputObject @{{ok=$false;err=$m}};exit}}
+$h=[_AX]::GetForegroundWindow()
+if($h -eq [IntPtr]::Zero){{Fail 'no foreground window'}}
+$tp=0;[void][_AX]::GetWindowThreadProcessId($h,[ref]$tp)
+# 前台换了应用就直接停手。不核对的话，模型在 A 应用上读的 ref 会被拿到
+# 刚弹出来的 B 应用上执行——点中的是完全不相干的东西，而回执照样是 ok。
+if({pid} -gt 0 -and $tp -ne {pid}){{Fail ('foreground app changed (was pid {pid}, now '+$tp+'); run read_screen again')}}
+$AE=[System.Windows.Automation.AutomationElement]
+$root=$AE::FromHandle($h)
+if($root -eq $null){{Fail 'no automation root'}}
+$t1=@{{'Button'=1;'Edit'=1;'CheckBox'=1;'RadioButton'=1;'ComboBox'=1;'Hyperlink'=1;'Slider'=1;'SplitButton'=1;'Spinner'=1;'MenuItem'=1;'ListItem'=1;'TreeItem'=1;'TabItem'=1;'Custom'=1}}
+$t2=@{{'Text'=1}}
+$t3=@{{'Group'=1;'Pane'=1;'ToolBar'=1;'StatusBar'=1;'ScrollBar'=1;'Table'=1;'DataGrid'=1;'Document'=1;'Window'=1;'Header'=1}}
+$a1=@();$a2=@();$a3=@();$a4=@()
+$els=$root.FindAll([System.Windows.Automation.TreeScope]::Descendants,[System.Windows.Automation.Condition]::TrueCondition)
+foreach($e in $els){{
+  if(($a1.Count+$a2.Count+$a3.Count+$a4.Count) -ge 1500){{break}}
+  $ct='';try{{$ct=$e.Current.ControlType.ProgrammaticName -replace 'ControlType\.',''}}catch{{continue}}
+  $r=$null;try{{$r=$e.Current.BoundingRectangle}}catch{{continue}}
+  if($r -eq $null -or [double]::IsInfinity([double]$r.X) -or $r.Width -lt 2 -or $r.Height -lt 2){{continue}}
+  $nm='';try{{$nm=''+$e.Current.Name}}catch{{}}
+  if($nm.Length -gt 80){{$nm=$nm.Substring(0,80)}}
+  $rec=@{{role=$ct;text=$nm;x=[double]$r.X;y=[double]$r.Y;w=[double]$r.Width;h=[double]$r.Height;el=$e}}
+  if($t1.ContainsKey($ct)){{$a1+=$rec}}
+  elseif($t2.ContainsKey($ct)){{$a2+=$rec}}
+  elseif($t3.ContainsKey($ct)){{$a3+=$rec}}
+  else{{$a4+=$rec}}
+}}
+$all=@($a1)+@($a2)+@($a3)+@($a4)
+$idx={idx}
+if($idx -lt 0 -or $idx -ge [Math]::Min($all.Count,500)){{Fail ('ref out of range (tree now has '+$all.Count+' elements); run read_screen again')}}
+$m=$all[$idx];$e=$m.el
+# 签名核对：读屏那一刻记下的 role/text/矩形，现在还对不对得上。
+# 界面动过（滚动、切页、弹窗）之后同一个序号会落到别的元素上，而那种误点
+# 是完全静默的——回执一样是 ok，只是点错了东西。
+$changed=@()
+if({rolechk} -and $m.role -ne {role}){{$changed+='role'}}
+if({textchk} -and $m.text -ne {text}){{$changed+='text'}}
+if([Math]::Abs($m.x-{x}) -gt 6 -or [Math]::Abs($m.y-{y}) -gt 6){{$changed+='position'}}
+if([Math]::Abs($m.w-{w}) -gt 8 -or [Math]::Abs($m.h-{h}) -gt 8){{$changed+='size'}}
+if($changed.Count -gt 0){{Fail ('element changed since read_screen ('+($changed -join ', ')+'); run read_screen again')}}
+$P=[System.Windows.Automation]
+$act={action}
+$val={value}
+$done=$false
+try{{
+  switch($act){{
+    'focus'      {{ $e.SetFocus(); $done=$true }}
+    'scroll_to'  {{ $e.GetCurrentPattern($P.ScrollItemPattern::Pattern).ScrollIntoView(); $done=$true }}
+    'set_value'  {{ $e.GetCurrentPattern($P.ValuePattern::Pattern).SetValue($val); $done=$true }}
+    'show_menu'  {{ $e.GetCurrentPattern($P.ExpandCollapsePattern::Pattern).Expand(); $done=$true }}
+    'pick'       {{ $e.GetCurrentPattern($P.SelectionItemPattern::Pattern).Select(); $done=$true }}
+    {{'increment','decrement' -contains $_}} {{
+      $rv=$e.GetCurrentPattern($P.RangeValuePattern::Pattern)
+      $step=$rv.Current.SmallChange; if($step -eq 0){{$step=1}}
+      $nv=if($act -eq 'increment'){{$rv.Current.Value+$step}}else{{$rv.Current.Value-$step}}
+      $rv.SetValue([Math]::Min($rv.Current.Maximum,[Math]::Max($rv.Current.Minimum,$nv))); $done=$true
+    }}
+    default {{
+      # press / confirm / cancel：UIA 里没有独立的"确认/取消"，它们就是按下那个按钮。
+      # Invoke 是主路；开关类控件只实现 Toggle，列表项只实现 SelectionItem，
+      # 展开箭头只实现 ExpandCollapse —— 挨个退，全不认才算失败。
+      try{{ $e.GetCurrentPattern($P.InvokePattern::Pattern).Invoke(); $done=$true }}catch{{}}
+      if(-not $done){{ try{{ $e.GetCurrentPattern($P.TogglePattern::Pattern).Toggle(); $done=$true }}catch{{}} }}
+      if(-not $done){{ try{{ $e.GetCurrentPattern($P.SelectionItemPattern::Pattern).Select(); $done=$true }}catch{{}} }}
+      if(-not $done){{ try{{ $e.GetCurrentPattern($P.ExpandCollapsePattern::Pattern).Expand(); $done=$true }}catch{{}} }}
+    }}
+  }}
+}}catch{{ Fail ($act+' failed: '+$_.Exception.Message) }}
+if(-not $done){{Fail ($m.role+' does not support '+$act+' (no matching UI Automation pattern)')}}
+# 动作之后回读一次：value 变没变、还 enabled 吗。光说 ok 等于让模型自己再去看一眼。
+$nv='';try{{$nv=''+$e.GetCurrentPattern($P.ValuePattern::Pattern).Current.Value}}catch{{}}
+$en=$true;try{{$en=$e.Current.IsEnabled}}catch{{}}
+ConvertTo-Json -Compress -InputObject @{{ok=$true;role=$m.role;name=$m.text;value=$nv;enabled=$en}}"#,
+        pid = expected_target.pid,
+        idx = binding.raw_ref,
+        role = ps_lit(&sig.role),
+        text = ps_lit(&sig.text),
+        rolechk = if sig.role.is_empty() { "$false" } else { "$true" },
+        textchk = if sig.text.is_empty() { "$false" } else { "$true" },
+        x = sig.x,
+        y = sig.y,
+        w = sig.w,
+        h = sig.h,
+        action = ps_lit(action),
+        value = ps_lit(value.unwrap_or("")),
+    );
+    run_powershell(&script, 8000)
+        .ok_or_else(|| "UI Automation 动作超时（8 秒）或 powershell 起不来".to_string())
+}
+
+/// 跑一段 PowerShell 并收走 stdout，超时就杀掉。和 macOS 那侧的 run_osa 一个形状。
+#[cfg(target_os = "windows")]
+fn run_powershell(script: &str, ms: u64) -> Option<String> {
+    use std::io::Read;
+    use std::process::Stdio;
+    use std::time::{Duration, Instant};
+    let mut child = crate::process_util::command("powershell")
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            script,
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let deadline = Instant::now() + Duration::from_millis(ms);
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) => {
+                if Instant::now() > deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return None;
+                }
+                std::thread::sleep(Duration::from_millis(40));
+            }
+            Err(_) => return None,
+        }
+    }
+    let mut s = String::new();
+    if let Some(mut so) = child.stdout.take() {
+        let _ = so.read_to_string(&mut s);
+    }
+    let t = s.trim().to_string();
+    if t.is_empty() { None } else { Some(t) }
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
 fn perform_ax_action(
     _binding: &AxRefBinding,
     _action: &str,
     _value: Option<&str>,
     _expected_target: &AccessibilityTarget,
 ) -> Result<String, String> {
-    // Non-macOS: no AX-action path yet → caller falls back to a pixel click.
     Err("当前平台暂不支持节点直接操作，请改用坐标点击".to_string())
 }
 
@@ -1284,7 +1459,13 @@ return JSON.stringify({operated:operated,changed:changed});
             .filter(|l| !l.trim_start().starts_with("//"))
             .collect::<Vec<_>>()
             .join("\n");
-        let win_sig = format!("{} -> (Vec<UiElement>, Option<String>)", "pub fn read_ui_elements()");
+        // 第三项是失败原因，第二项是目标应用身份（后加的，见
+        // windows_read_reports_the_target_app）。needle 拼出来，别写成完整字面量——
+        // 否则这个断言会被它自己喂饱。
+        let win_sig = format!(
+            "{} -> (Vec<UiElement>, Option<AccessibilityTarget>, Option<String>)",
+            "pub fn read_ui_elements()"
+        );
         assert!(
             src.contains(&win_sig),
             "Windows 的 read_ui_elements 必须把失败原因带出来，不能只返回元素"
@@ -1350,6 +1531,69 @@ return JSON.stringify({operated:operated,changed:changed});
         assert_eq!(src.matches(&raw).count(), 0, "还有地方在直接遍历未筛选的窗口");
     }
 
+    // 这条用的 element / signature_gate_result 两个辅助函数都带 macOS 门，
+    // 而它自己没有——于是 `cargo test` 在 Windows 上根本编不过（E0425）。
+    // 补上门，让 Windows 也能跑测试。
+    /// 反漂移：Windows 的按 ref 操作不许退回成一句 Err。
+    ///
+    /// 它以前就是「当前平台暂不支持节点直接操作，请改用坐标点击」——读屏在
+    /// Windows 上是真的，但读完之后动不了，读和动之间是断的。
+    /// 断言实现特征（UIA 模式名、签名核对、前台身份核对），不断言说明词，
+    /// 并且先剥掉注释——注释里会引用被修掉的旧写法，能把断言喂饱。
+    #[test]
+    fn windows_ref_actions_are_implemented_not_stubbed() {
+        let src: String = include_str!("accessibility.rs")
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        // 老的桩：整个函数体就是这一句 Err。Windows 分支里不该再有它。
+        // 锚到动作函数本身，而不是"第一个 Windows 块"——第一个是读屏。
+        let at = src
+            .find("fn perform_ax_action(\n    binding: &AxRefBinding,")
+            .expect("应该有 Windows 版的 perform_ax_action（带实名参数，不是 _binding 的桩）");
+        let win = &src[at..];
+        assert!(
+            win.contains("InvokePattern"),
+            "Windows 的按 ref 操作没走 UI Automation 的 Invoke"
+        );
+        for pat in ["TogglePattern", "SelectionItemPattern", "ValuePattern", "ExpandCollapsePattern"] {
+            assert!(src.contains(pat), "少了 {pat} 这条退路——只认 Invoke 的话开关和列表项都点不动");
+        }
+        assert!(
+            src.contains("element changed since read_screen"),
+            "Windows 动作前必须核对签名，否则界面动过之后同一个序号会落到别的元素上"
+        );
+        assert!(
+            src.contains("foreground app changed"),
+            "Windows 动作前必须核对前台还是不是读屏时那个应用"
+        );
+    }
+
+    /// 反漂移：Windows 的读屏必须把前台应用身份一起带回来。
+    ///
+    /// 少了它，install_ax_snapshot 见 target 为 None 直接早退，ref 表一条不存，
+    /// 于是 ui_click 拿到的 ref 没有任何可校验的东西——而这个失效是完全静默的。
+    #[test]
+    fn windows_read_reports_the_target_app() {
+        let src: String = include_str!("accessibility.rs")
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            src.contains("GetWindowThreadProcessId"),
+            "Windows 读屏脚本没有取前台窗口的 pid"
+        );
+        // needle 拼出来：写成完整字面量的话，这个断言自己就会成为它要找的东西。
+        let three = format!("let (elements, {}, read_error) = {}", "target", "read_ui_elements();");
+        assert!(
+            src.contains(&three),
+            "read_ui_snapshot 应该接收并透传 target；不透传的话 install_ax_snapshot 会早退，ref 表一条不存"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
     #[test]
     fn same_pid_reordering_fails_signature_gate_before_operation() {
         let expected = AxElementSignature::from(&element(0));

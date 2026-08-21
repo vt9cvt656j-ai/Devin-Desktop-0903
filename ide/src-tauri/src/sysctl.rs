@@ -199,7 +199,12 @@ fn do_open(name: &str, _bg: bool) -> Result<String, String> {
     let script = format!(
         "{fg}\n$ErrorActionPreference='SilentlyContinue';$n={n};\
          $p=Get-Process|Where-Object{{$_.MainWindowHandle -ne 0 -and ($_.Name -eq $n -or $_.MainWindowTitle -like ('*'+$n+'*'))}}|Select-Object -First 1;\
-         if($p){{$sh=New-Object -ComObject WScript.Shell;[void]$sh.AppActivate($p.Id);('✓ 已切换到 '+$n)}}\
+         if($p){{$sh=New-Object -ComObject WScript.Shell;[void]$sh.AppActivate($p.Id);\
+           $ok=$false;$d=(Get-Date).AddSeconds(2.5);\
+           while(-not $ok -and (Get-Date) -lt $d){{Start-Sleep -Milliseconds 80;$h=[_FG]::GetForegroundWindow();$fp=0;[void][_FG]::GetWindowThreadProcessId($h,[ref]$fp);if($fp -eq $p.Id){{$ok=$true}}}}\
+           if($ok){{('✓ 已切换到 '+$n+'，已核实它现在确实在前台')}}\
+           else{{$h=[_FG]::GetForegroundWindow();$fp=0;[void][_FG]::GetWindowThreadProcessId($h,[ref]$fp);$fn=(Get-Process -Id $fp -ErrorAction SilentlyContinue).Name;\
+             Write-Error ('已向 '+$n+' 发出激活请求，但 2.5 秒后它仍不在前台，当前前台是 '+$fn+'。合成按键和点击只进前台应用，此刻继续操作会打进 '+$fn+'。Windows 的前台锁常见于：目标正在冷启动、有模态对话框、或者调用方本身不在前台。')}}}}\
          else{{try{{Start-Process $n -ErrorAction Stop;('✓ 已启动 '+$n)}}catch{{Write-Error ('打不开 '+$n+'：'+$_.Exception.Message)}}}}",
         fg = PS_FG,
         n = ps_quote(name)
@@ -254,7 +259,25 @@ mod lx {
     }
     pub fn open(name: &str) -> Result<String, String> {
         if run_cmd_bounded("wmctrl", &["-a", name], 3000).is_ok() {
-            return Ok(format!("✓ 已切换到「{name}」"));
+            // wmctrl 退出码为 0 只代表"请求发出去了"，不代表窗口真到了前台
+            // （合成器可以拒绝、目标可能正在冷启动）。macOS 和 Windows 两支
+            // 都在这里回读确认，Linux 这支原来直接就报成功了——而合成按键只进
+            // 前台应用，说错的代价是后面每一次输入都打进别的窗口。
+            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(2500);
+            loop {
+                let now = active_name();
+                if now.to_lowercase().contains(&name.to_lowercase()) {
+                    return Ok(format!("✓ 已切换到「{name}」，已核实它现在确实在前台"));
+                }
+                if std::time::Instant::now() >= deadline {
+                    return Err(format!(
+                        "已向「{name}」发出激活请求，但 2.5 秒后前台仍是「{now}」。\
+合成按键和点击只进前台应用，此刻继续操作会打进「{now}」。\
+常见原因：目标正在冷启动、窗口在别的工作区、或合成器拒绝了激活请求。"
+                    ));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(80));
+            }
         }
         if run_cmd_bounded("gtk-launch", &[name], 3000).is_ok() {
             return Ok(format!("✓ 已启动「{name}」"));
@@ -458,7 +481,7 @@ fn system_focus_window_inner(name: String, title: Option<String>) -> Result<Stri
 // Windows menu/menu_items share a UIAutomation preamble + window-resolver. Placeholder
 // templates (no format! braces) keep the dense automation code readable.
 #[cfg(target_os = "windows")]
-const PS_UIA_HEAD: &str = "$ErrorActionPreference='SilentlyContinue';Add-Type -AssemblyName UIAutomationClient,UIAutomationTypes;Add-Type @\"\nusing System;using System.Runtime.InteropServices;\npublic class _W{[DllImport(\"user32.dll\")]public static extern IntPtr GetForegroundWindow();}\n\"@ -ErrorAction SilentlyContinue;$AE=[System.Windows.Automation.AutomationElement];$TS=[System.Windows.Automation.TreeScope]::Descendants;\nfunction _root($app){ if($app){ $p=Get-Process|Where-Object{$_.Name -eq $app -and $_.MainWindowHandle -ne 0}|Select-Object -First 1; if($p){ return $AE::FromHandle($p.MainWindowHandle) } }; return $AE::FromHandle([_W]::GetForegroundWindow()) }\nfunction _byName($el,$nm){ $c=New-Object System.Windows.Automation.PropertyCondition($AE::NameProperty,$nm); return $el.FindFirst($TS,$c) }\nfunction _invoke($el){ $p=$null; if($el.TryGetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern,[ref]$p)){ $p.Invoke(); return $true }; if($el.TryGetCurrentPattern([System.Windows.Automation.ExpandCollapsePattern]::Pattern,[ref]$p)){ $p.Expand(); return $true }; return $false }\nfunction _expand($el){ $p=$null; if($el.TryGetCurrentPattern([System.Windows.Automation.ExpandCollapsePattern]::Pattern,[ref]$p)){ $p.Expand(); Start-Sleep -Milliseconds 140; return $true }; return $false }";
+const PS_UIA_HEAD: &str = "$ErrorActionPreference='SilentlyContinue';Add-Type -AssemblyName UIAutomationClient,UIAutomationTypes;Add-Type @\"\nusing System;using System.Runtime.InteropServices;\npublic class _W{[DllImport(\"user32.dll\")]public static extern IntPtr GetForegroundWindow();}\n\"@ -ErrorAction SilentlyContinue;$AE=[System.Windows.Automation.AutomationElement];$TS=[System.Windows.Automation.TreeScope]::Descendants;\nfunction _root($app){ if($app){ $p=Get-Process|Where-Object{$_.MainWindowHandle -ne 0 -and ($_.Name -eq $app -or $_.MainWindowTitle -like ('*'+$app+'*'))}|Select-Object -First 1; if($p){ return $AE::FromHandle($p.MainWindowHandle) }; throw ('没找到名字含 '+$app+' 的应用窗口。system apps 可以看当前有哪些；名字可以是进程名（chrome）也可以是窗口标题的一部分。') } return $AE::FromHandle([_W]::GetForegroundWindow()) }\nfunction _byName($el,$nm){ $c=New-Object System.Windows.Automation.PropertyCondition($AE::NameProperty,$nm); return $el.FindFirst($TS,$c) }\nfunction _invoke($el){ $p=$null; if($el.TryGetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern,[ref]$p)){ $p.Invoke(); return $true }; if($el.TryGetCurrentPattern([System.Windows.Automation.ExpandCollapsePattern]::Pattern,[ref]$p)){ $p.Expand(); return $true }; return $false }\nfunction _expand($el){ $p=$null; if($el.TryGetCurrentPattern([System.Windows.Automation.ExpandCollapsePattern]::Pattern,[ref]$p)){ $p.Expand(); Start-Sleep -Milliseconds 140; return $true }; return $false }";
 
 /// Trigger a menu item by PATH, e.g. ["File","New Tab"] or ["Format","Font","Bold"].
 /// app=None → the current frontmost app. A 1-element path opens that top menu.

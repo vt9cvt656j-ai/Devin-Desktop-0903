@@ -6249,6 +6249,10 @@ test("visual_compare fails before screenshotting when its design image cannot be
     _refreshEmptyRootBeforeSkip: async () => false,
     rootPath: "/workspace", workspaceRoots: ["/workspace"], inTauri: true, backend,
     _escHtml: String, _composeCompare: composeCompare, _chatFollow: () => {},
+    // 设计图路径的绝对/相对判定现在走这个共享助手（认盘符，`C:\x.png` 也是绝对路径）。
+    // 沙箱里不给的话，执行器一进这条分支就 ReferenceError，测试看到的是空 textContent
+    // 而不是预期的错误提示——注入表缺一项，表现出来却像是被测逻辑没跑。
+    _isAbsoluteFsPath: (v) => /^(\/|\/\/|[A-Za-z]:[\\/])/.test(String(v || "")),
   });
 
   let captures = 0;
@@ -31999,4 +32003,102 @@ test("lsp_hover 要有 TS worker 兜底，拿不到时把话说死", () => {
   assert.match(fn, /getQuickInfoAtPosition/, "没调 TS 的 quick info");
   assert.match(fn, /displayParts/, "没取签名部分");
   assert.match(fn, /if \(created\) \{ try \{ model\.dispose\(\); \}/, "临时 model 没释放 —— 和兄弟函数不一致");
+});
+
+test("CRLF 文件上 edit_file 要能命中，而不是让模型去重试一件它做不到的事", () => {
+  // Windows 仓库里的文件是 CRLF。模型看到的是渲染后的文本——回车符在那里不可见，
+  // 所以它复述 old_string 时几乎一定只给 \n。精确匹配落空，回执说的是
+  // 「多半是空白/缩进对不上，请照原文逐字符复制」，于是它重试同一件做不到的事。
+  //
+  // 这条按**行为**测：真的把函数体取出来跑，而不是断言源码里有某个字符串。
+  const src = SRC.slice(SRC.indexOf("function _recoverEditMatch(text, needle)"));
+  const body = src.slice(0, src.indexOf("\n/// 给 new_string"));
+  const fn = new Function("text", "needle",
+    body.slice(body.indexOf("{") + 1, body.lastIndexOf("}")).replace(/_stripLineNoPrefix\(needle\)/, "null"));
+
+  const file = ["function a() {", "  return 1;", "}", ""].join("\r\n");
+  const needle = ["function a() {", "  return 1;", "}"].join("\n");
+
+  // 前提：这确实是精确匹配找不到的情况，否则这条测试什么都没测。
+  assert.equal(file.indexOf(needle), -1, "前提不成立：LF 版本竟然直接命中了");
+
+  const r = fn(file, needle);
+  assert.ok(r, "CRLF 文件 + LF 的 old_string 没能恢复——Windows 上这类文件改不动");
+  assert.equal(r.crlf, true, "没有标记这次是靠补 CRLF 命中的；调用方靠它决定替换文本要不要也转成 CRLF");
+  assert.ok(file.includes(r.text), "恢复出来的 old_string 在文件里找不到");
+  assert.equal(file.split(r.text).length - 1, 1, "恢复出来的 old_string 不唯一");
+
+  // 反向一：纯 LF 的文件不该被这条动到（它本来就能精确命中，走不到恢复函数；
+  // 但即便走到，也不该无中生有地报 crlf）。
+  const lfFile = ["function b() {", "  return 2;", "}", ""].join("\n");
+  const lfHit = fn(lfFile, ["function b() {", "  return 2;", "}"].join("\n"));
+  assert.ok(!lfHit || lfHit.crlf !== true, "纯 LF 文件被误判成 CRLF 恢复");
+
+  // 反向二：old_string 自己已经带 \r 的话，不该再补一遍（会变成 \r\r\n）。
+  const already = fn(file, ["function a() {", "  return 1;", "}"].join("\r\n"));
+  assert.ok(!already || already.crlf !== true, "old_string 已经是 CRLF 了还被再补一次");
+});
+
+test("CRLF 命中后，替换文本也要转成 CRLF，否则文件变成混合换行", () => {
+  // 只把 old_string 补成 CRLF、replacement 仍是 LF 的话，改动那一段会静默变成 LF。
+  // git 上看是整块重写，而模型完全不知道自己干了这个。
+  // 两个调用点（edit_file 和 multi_edit）都必须转。
+  for (const [name, needle] of [
+    ["edit_file", "if (rec.crlf) _editReplacement = "],
+    ["multi_edit", "if (rec.crlf) newStr = "],
+  ]) {
+    const at = SRC.indexOf(needle);
+    assert.ok(at > 0, `${name} 的调用点没有在 CRLF 命中时转换替换文本`);
+    const line = SRC.slice(at, SRC.indexOf("\n", at));
+    // 先规约到 LF 再展开，否则 old_string 里本来就带 \r 的替换文本会被补成 \r\r\n。
+    assert.match(line, /replace\(\/\\r\\n\/g, "\\n"\)\.replace\(\/\\n\/g, "\\r\\n"\)/,
+      `${name} 的转换没有先规约再展开，带 \\r 的替换文本会变成 \\r\\r\\n`);
+  }
+});
+
+test("Windows 绝对路径不许被当成相对路径二次拼接", () => {
+  // `C:\designs\a.png` 不以 "/" 开头，手写 startsWith("/") 会判它是相对路径，
+  // 拼成 `C:\ws/C:\designs\a.png`。真正的问题是拼错了路径，可报出来的原因却是
+  // 「设计图不可读 / 文件不存在」——模型会去换一张设计图，怎么换都不对。
+  //
+  // 仓库里本来就有认盘符的 _isAbsoluteFsPath，这几处只是没用它。
+  // 用仓库自己的加载器做依赖注入：_isAbsoluteFsPath → _normalizeFsPath → _toPosix
+  // 是一条链，手工拼 new Function 只会把链上下一环漏掉。
+  const norm = load("_normalizeFsPath", { _toPosix: load("_toPosix", {}) });
+  const fn = load("_isAbsoluteFsPath", { _normalizeFsPath: norm });
+  for (const p of ["C:\\designs\\a.png", "C:/designs/a.png", "/tmp/a.png", "//server/share/a.png"]) {
+    assert.equal(fn(p), true, `${p} 应该被认成绝对路径`);
+  }
+  for (const p of ["designs/a.png", "./a.png", "a.png", ""]) {
+    assert.equal(fn(p), false, `${p} 不该被认成绝对路径`);
+  }
+
+  // 这几处调用点必须走那个助手，而不是自己写 startsWith("/")。
+  // needle 拼出来，免得这段断言把自己也数进去。
+  const sw = `.dest.startsWith(${JSON.stringify("/")})`;
+  assert.equal(SRC.split(sw).length - 1, 0,
+    "还有地方用 dest.startsWith(\"/\") 判绝对路径——Windows 绝对 dest 会被二次拼接");
+  const vc = `_vcDesignRel.startsWith(${JSON.stringify("/")})`;
+  assert.equal(SRC.split(vc).length - 1, 0,
+    "visual_compare 还在用 startsWith(\"/\") 判设计图路径");
+  assert.ok(SRC.includes("_isAbsoluteFsPath(_vcDesignRel)"), "visual_compare 没改用认盘符的判定");
+  assert.ok(SRC.includes("_isAbsoluteFsPath(call.dest)"), "download_file/generate_image 没改用认盘符的判定");
+});
+
+test("Windows 上不许往终端写 python3（那不是一个命令）", () => {
+  // python.org 的安装包只产出 python.exe；同名的 python3.exe 是微软商店的
+  // 应用执行别名，跑它会弹商店。Run 按钮是用户点的，不是模型写的命令——
+  // 报 command not found 的时候用户没有任何线索。
+  //
+  // 判据是：所有往终端写 python 的地方都得按平台分支。
+  for (const marker of ["const _py = _isWin ? ", "_isWin ? \"py -3\" : \"python3\""]) {
+    assert.ok(SRC.includes(marker), `缺少按平台选解释器的分支：${marker}`);
+  }
+  // 起服务那两条必须用分支出来的变量，不能再写死。
+  const hard = `\`\\n\${_clearCmd}\\npython3 `;
+  assert.equal(SRC.split(hard).length - 1, 0, "还有 writeToActiveTerminal 直接写死 python3");
+  // _py 必须声明在 try 之外——catch 分支也要用它。
+  const at = SRC.indexOf("const _py = _isWin ? ");
+  const tryAt = SRC.indexOf("try {", at);
+  assert.ok(tryAt > at, "_py 应该声明在它所在的 try 之前，否则 catch 分支会 ReferenceError");
 });

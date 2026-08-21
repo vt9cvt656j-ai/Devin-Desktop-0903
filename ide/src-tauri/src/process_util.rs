@@ -293,7 +293,20 @@ pub fn resolve_command(cmd: &str, workspace: Option<&str>) -> String {
 /// Windows: prepend the workspace's `node_modules\.bin` + Python venv Scripts to the existing PATH.
 #[cfg(windows)]
 pub fn augmented_path(workspace: Option<&str>) -> String {
-    let cur = std::env::var("PATH").unwrap_or_default();
+    augmented_path_over(None, workspace)
+}
+
+/// 同上，但允许指定 PATH 的**基底**。
+///
+/// 为什么需要：Windows 不会改写运行中进程的环境块，用户 `setx` 出来的东西只在注册表里。
+/// tasks.rs 为此专门读了注册表（`shell_env::registry_env()`），但紧接着又用
+/// `.env("PATH", augmented_path(..))` 把 PATH 覆盖回**进程启动时的那份快照**——
+/// 刚读出来的注册表 PATH 在下一行就被丢掉了，用户装完工具、setx 完，IDE 里照样找不到。
+#[cfg(windows)]
+pub fn augmented_path_over(base: Option<String>, workspace: Option<&str>) -> String {
+    let cur = base
+        .filter(|p| !p.is_empty())
+        .unwrap_or_else(|| std::env::var("PATH").unwrap_or_default());
     let home = std::env::var("USERPROFILE").unwrap_or_default();
     let mut base = Vec::new();
     if !home.is_empty() {

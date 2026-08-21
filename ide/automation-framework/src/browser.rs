@@ -47,18 +47,50 @@ fn find_browser() -> Result<String> {
         ("brave", &["/Applications/Brave Browser.app/Contents/MacOS/Brave Browser"]),
         ("chromium", &["/Applications/Chromium.app/Contents/MacOS/Chromium"]),
     ];
+    // 用户级安装（%LOCALAPPDATA%）必须在列。Chrome/Edge 的安装器在非管理员账户下
+    // 默认就装那儿，而这张表以前只有 Program Files——于是装着 Chrome 的机器被告知
+    // "没装浏览器"。chromium 那一项以前整个不在表里，找不到时的提示却叫人去装它。
     #[cfg(target_os = "windows")]
-    let table: &[(&str, &[&str])] = &[
-        ("chrome", &[
-            r"C:\Program Files\Google\Chrome\Application\chrome.exe",
-            r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
-        ]),
-        ("edge", &[
-            r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
-            r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
-        ]),
-        ("brave", &[r"C:\Program Files\BraveSoftware\Brave-Browser\Application\brave.exe"]),
-    ];
+    let owned_table: Vec<(&str, Vec<String>)> = {
+        let local = std::env::var("LOCALAPPDATA").ok();
+        let l = |rel: &str| -> Option<String> { local.as_ref().map(|b| format!(r"{b}\{rel}")) };
+        let with = |fixed: &[&str], user: Option<String>| -> Vec<String> {
+            let mut v: Vec<String> = fixed.iter().map(|s| s.to_string()).collect();
+            if let Some(u) = user {
+                v.push(u);
+            }
+            v
+        };
+        vec![
+            ("chrome", with(&[
+                r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+                r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+            ], l(r"Google\Chrome\Application\chrome.exe"))),
+            ("edge", with(&[
+                r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
+                r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
+            ], l(r"Microsoft\Edge\Application\msedge.exe"))),
+            ("brave", with(&[
+                r"C:\Program Files\BraveSoftware\Brave-Browser\Application\brave.exe",
+                r"C:\Program Files (x86)\BraveSoftware\Brave-Browser\Application\brave.exe",
+            ], l(r"BraveSoftware\Brave-Browser\Application\brave.exe"))),
+            ("chromium", with(&[
+                r"C:\Program Files\Chromium\Application\chrome.exe",
+            ], l(r"Chromium\Application\chrome.exe"))),
+        ]
+    };
+    #[cfg(target_os = "windows")]
+    let table_owned: Vec<(&str, Vec<&str>)> = owned_table
+        .iter()
+        .map(|(id, paths)| (*id, paths.iter().map(|s| s.as_str()).collect()))
+        .collect();
+    #[cfg(target_os = "windows")]
+    let table: Vec<(&str, &[&str])> = table_owned
+        .iter()
+        .map(|(id, paths)| (*id, paths.as_slice()))
+        .collect();
+    #[cfg(target_os = "windows")]
+    let table: &[(&str, &[&str])] = &table;
     #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
     let table: &[(&str, &[&str])] = &[
         ("chrome", &["/usr/bin/google-chrome", "/usr/bin/google-chrome-stable"]),
@@ -134,8 +166,17 @@ fn profile_dir(profile: BrowserProfile) -> Result<std::path::PathBuf> {
             .join(format!("rust_automation_browser_{}", std::process::id())),
         // 固定路径：跨进程、跨重启都是同一个，登录一次长期有效。
         BrowserProfile::Session => {
-            let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
-            std::path::PathBuf::from(home).join(".mrday-browser-session")
+            // Windows 上没有 HOME，只有 USERPROFILE。原来硬回落到 "/tmp"，
+            // 在 Windows 上就成了当前盘根下的 C:\tmp——一个多半不存在、
+            // 也不属于这个用户的目录。于是"登录一次长期有效"这个承诺在 Windows 上
+            // 要么创建失败、要么每次落在别处，而回执照旧那么说。
+            let home = std::env::var("HOME")
+                .or_else(|_| std::env::var("USERPROFILE"))
+                .map(std::path::PathBuf::from)
+                // 两个都没有才退到系统临时目录——那是**平台正确**的临时目录，
+                // 不是写死的 /tmp。这时候会话不再跨重启，但至少能建出来。
+                .unwrap_or_else(|_| std::env::temp_dir());
+            home.join(".mrday-browser-session")
         }
     };
     std::fs::create_dir_all(&dir)?;

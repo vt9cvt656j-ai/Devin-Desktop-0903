@@ -74,12 +74,17 @@ struct Inner {
     terms: HashMap<u32, Term>,
 }
 
-fn default_shell() -> String {
-    if cfg!(windows) {
-        std::env::var("COMSPEC").unwrap_or_else(|_| "powershell.exe".into())
-    } else {
-        std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".into())
-    }
+/// 终端用哪个解释器——**和 run_cmd 走同一份决定**。
+///
+/// 以前这里另起炉灶读 COMSPEC，于是同一个决定被抄成两份：装了 Git for Windows 的
+/// 机器上 run_cmd 跑 bash，而终端跑 cmd.exe。每轮注入给模型的平台说明只说一句
+/// 「run_cmd 与终端都由 bash 执行（POSIX 语法）」——对前者是真的，对后者是假的。
+/// 模型于是往终端里写 `PORT=3000 npm run dev`、`cd api; python app.py`，
+/// 而本该保护它的那段「; 不是分隔符 / $VAR 不展开」的警告正好在这种机器上被关掉。
+///
+/// ShellPlan 的 interactive 字段就是为这里准备的（它的注释写着），但一直零消费者。
+fn shell_plan_for_pty() -> crate::shell_env::ShellPlan {
+    crate::shell_env::plan()
 }
 
 /// Spawn a new shell in a PTY and start streaming its output to `on_event`.
@@ -102,14 +107,30 @@ pub fn term_open(
         })
         .map_err(|e| e.to_string())?;
 
-    let mut cmd = CommandBuilder::new(default_shell());
+    let _plan = shell_plan_for_pty();
+    let mut cmd = CommandBuilder::new(_plan.program.clone());
+    // 交互式参数（cmd.exe 的 /K、bash 的 -i 之类）——这个字段一直没人用。
+    for a in &_plan.interactive {
+        cmd.arg(a);
+    }
+    // Git Bash 少了这三个变量会静默出错：它会把原生工具的开关（/FO、/TN）当路径改写。
+    // tasks.rs 那条链路早就在做了，终端这条一直漏着。
+    for (k, v) in crate::shell_env::posix_shim_env(&_plan.kind, &_plan.program) {
+        cmd.env(k, v);
+    }
     // Windows: force the console to UTF-8 so Chinese / non-ASCII output isn't GBK(936)
     // mojibake (this terminal decodes bytes as UTF-8). cmd.exe → `/K chcp 65001`;
     // PowerShell → chcp + set [Console]::OutputEncoding (chcp alone doesn't fix PS output).
     #[cfg(windows)]
     {
-        let sh = default_shell().to_lowercase();
-        if sh.contains("powershell") || sh.contains("pwsh") {
+        // 这段只对 cmd/PowerShell 成立：给 Git Bash 塞 /K chcp 会被当成参数。
+        // 判据用 plan.kind，别再各自猜解释器——那正是这条 bug 的来源。
+        let sh = _plan.program.to_lowercase();
+        let _is_cmdish = _plan.kind == "cmd";
+        if !_is_cmdish {
+            // Git Bash：UTF-8 靠 locale 环境（上面 utf8_locale_env 已经设过），
+            // 不需要也不能用 chcp / -NoExit 这套。
+        } else if sh.contains("powershell") || sh.contains("pwsh") {
             cmd.arg("-NoExit");
             cmd.arg("-Command");
             cmd.arg("chcp 65001 > $null; [Console]::OutputEncoding = [System.Text.Encoding]::UTF8; $OutputEncoding = [System.Text.Encoding]::UTF8");
@@ -141,14 +162,14 @@ pub fn term_open(
             }
         }
     }
-    cmd.env(
-        "TERM",
-        if cfg!(windows) {
-            "dumb"
-        } else {
-            "xterm-256color"
-        },
-    );
+    // TERM 按**解释器**分，不按平台分。
+    //
+    // 以前 Windows 一律 dumb。但 Windows 用的是 ConPTY——真 PTY，支持 VT 序列——
+    // 而 dumb 正是 bubbletea / ncurses / vim / top 用来判定「不要进全屏模式」的信号。
+    // 工具描述把 run_in_terminal 定位成「真 TTY，这些程序都归这里」，结果它们一进去
+    // 就主动降级。cmd.exe 下保守留 dumb（它的 VT 支持要按版本开），bash 下给全套。
+    let _term = if crate::shell_env::plan().kind == "cmd" { "dumb" } else { "xterm-256color" };
+    cmd.env("TERM", _term);
     // 以前这里无条件写死 en_US.UTF-8，把用户自己配的 zh_CN.UTF-8 / ja_JP.UTF-8 也一起
     // 顶掉了（排序、月份名、报错语言都会跟着变）。现在只在**一个 locale 都没有**时才补。
     //
@@ -158,8 +179,8 @@ pub fn term_open(
     for (k, v) in crate::process_util::utf8_locale_env() {
         cmd.env(k, v);
     }
-    #[cfg(not(windows))]
-    {
+    // 颜色那组原来整个按平台 cfg 掉了。判据同样该是解释器：Git Bash 下这些照样有用。
+    if _term != "dumb" {
         cmd.env("CLICOLOR", "1");
         cmd.env("CLICOLOR_FORCE", "1");
         cmd.env("LSCOLORS", "ExGxFxdaCxDaDahbadacec");

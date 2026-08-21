@@ -438,14 +438,27 @@ fn task_run_capture_inner(
             // bash 用普通 argv 传参才是对的，不需要 raw_arg。
             c.args(&plan.oneshot).arg(&command);
         }
+        // 注册表环境要先拿出来，因为它里面的 PATH 是下面那句增强的**基底**。
+        // 原来的顺序是 .envs(registry_env()) 之后紧接着 .env("PATH", augmented_path(..))，
+        // 而 augmented_path 读的是 std::env::var("PATH")——进程启动时的快照。
+        // 于是专门去注册表捞回来的那份新 PATH，在下一行就被旧快照盖掉了：
+        // 用户 setx 完、装完工具，命令照样"找不到"，而整段读注册表的代码看着是在工作。
+        let reg = crate::shell_env::registry_env();
+        let reg_path = reg
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("PATH"))
+            .map(|(_, v)| v.clone());
         c.current_dir(&dir)
             // 外部改的环境变量在这里当场生效。Windows 永远不会改写运行中进程的环境块，
             // 只往注册表写再广播一条消息；不主动读注册表，用户 setx 出来的东西这个进程
             // 到死都看不见。
-            .envs(crate::shell_env::registry_env())
+            .envs(reg.iter().map(|(k, v)| (k.as_str(), v.as_str())))
             // 这个分支以前**从来没有设过 PATH**（设 PATH 那一行在 cfg(not(windows)) 里面），
             // 于是工作区的 node_modules\.bin、venv\Scripts 一个都进不来。
-            .env("PATH", crate::process_util::augmented_path(Some(&cwd)))
+            .env(
+                "PATH",
+                crate::process_util::augmented_path_over(reg_path, Some(&cwd)),
+            )
             .env("PYTHONUTF8", "1")
             .env("PYTHONIOENCODING", "utf-8");
         for (k, v) in crate::shell_env::posix_shim_env(&plan.kind, &plan.program) {
