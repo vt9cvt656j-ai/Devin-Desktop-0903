@@ -64,6 +64,7 @@ impl WindowControl for MacOSControl {
                     width: 0,
                     height: 0,
                     is_visible: is_active,
+                    is_frontmost: is_active,
                     is_minimized: false,
                 });
             }

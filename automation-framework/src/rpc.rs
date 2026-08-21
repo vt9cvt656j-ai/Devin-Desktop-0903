@@ -81,7 +81,7 @@ fn frontmost_now() -> Option<String> {
         .enumerate_windows()
         .ok()?
         .into_iter()
-        .find(|w| w.is_visible)
+        .find(|w| w.is_frontmost)
         .map(|w| w.title)
 }
 
@@ -412,7 +412,7 @@ impl RpcServer {
                         .map(|s| s.trim()).filter(|s| !s.is_empty())
                         .map(|s| s.to_string()).collect(),
                     _ => return Err(Error::Other(anyhow::anyhow!(
-                        "keyboard.combo 需要 keys：可以是数组 [\"cmd\",\"s\"]，也可以直接写 \"cmd+s\"。每个元素必须是**单个**键名（cmd/ctrl/alt/shift/enter/tab/esc/f1-f12/单个字符），不是整条快捷键。"))),
+                        "keyboard.combo 需要 keys：可以是数组 [\"mod\",\"s\"]，也可以直接写 \"mod+s\"。mod = 本平台主修饰键（mac=Cmd，Windows=Ctrl），\"cmd\" 等价；真要按 Windows 键写 \"win\"。每个元素必须是**单个**键名（cmd/ctrl/alt/shift/enter/tab/esc/f1-f12/单个字符），不是整条快捷键。"))),
                 };
                 let key_strs: Vec<&str> = owned.iter().map(|s| s.as_str()).collect();
                 agent.keyboard_combo(key_strs)?;
@@ -484,6 +484,54 @@ impl RpcServer {
 
             // ── 窗口/屏幕：平台层早就有（enumerate/activate/screen_info），此前一直没暴露给 RPC，
             //    AI 桌面自动化最需要的"激活目标应用再操作"因此做不了。补齐。 ──
+            // 原生 AX 快照。JXA 那条路每读一个属性就是一次 Apple Event 往返，
+            // 实测真实窗口下 500 个元素要 95 秒，而读屏的上限是 6 秒——必然超时。
+            // 这里是进程内 C 调用。
+            #[cfg(all(feature = "system", target_os = "macos"))]
+            "screen.elements" => {
+                drop(agent);
+                let cap = params.get("cap").and_then(|v| v.as_u64()).unwrap_or(500) as usize;
+                // 不给 pid 就读**当前前台**——这是九成的用法，省一次 window.list 往返。
+                let pid = match params.get("pid").and_then(|v| v.as_i64()) {
+                    Some(p) if p > 0 => p as i32,
+                    _ => crate::platform::macos_tree::frontmost_pid().ok_or_else(|| {
+                        Error::Other(anyhow::anyhow!("读不到当前前台应用；给 pid 参数指定目标"))
+                    })?,
+                };
+                let t0 = std::time::Instant::now();
+                let nodes = crate::platform::macos_tree::snapshot(pid, cap);
+                // pid 和应用名要一起回：调用方（read_screen）拿它装 ref 表，
+                // 没有身份就没法在动作时校验「读的还是不是同一个 app」。
+                let app_name = crate::platform::get_window_controller()
+                    .enumerate_windows()
+                    .ok()
+                    .and_then(|ws| ws.into_iter().find(|w| w.is_frontmost).map(|w| w.title))
+                    .unwrap_or_default();
+                Ok(serde_json::json!({
+                    "elements": nodes,
+                    "count": nodes.len(),
+                    "truncated": nodes.len() >= cap,
+                    "took_ms": t0.elapsed().as_millis() as u64,
+                    "pid": pid,
+                    "app": app_name,
+                }))
+            }
+            // 对上一次 screen.elements 里的某个 ref 执行 AX 动作。用的是**留下来的句柄**，
+            // 不重跑枚举——老路那种「点的时候再枚举一遍按下标取第 N 个」既慢又会下标错位。
+            #[cfg(all(feature = "system", target_os = "macos"))]
+            "screen.act" => {
+                drop(agent);
+                let r = params.get("ref").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+                let action = params.get("action").and_then(|v| v.as_str()).unwrap_or("press");
+                let value = params.get("value").and_then(|v| v.as_str());
+                if r == 0 {
+                    return Err(Error::Other(anyhow::anyhow!(
+                        "screen.act 需要 ref（screen.elements 结果里的序号）"
+                    )));
+                }
+                crate::platform::macos_tree::act(r, action, value)
+                    .map_err(|e| Error::Other(anyhow::anyhow!(e)))
+            }
             #[cfg(feature = "system")]
             "window.list" => {
                 drop(agent);
@@ -503,7 +551,7 @@ impl RpcServer {
                     o.insert("title".into(), serde_json::json!(w.title));
                     o.insert("process".into(), serde_json::json!(w.process_name));
                     // isActive 唯一诚实的读法就是「是不是前台」，只报这一个。
-                    o.insert("frontmost".into(), serde_json::json!(w.is_visible));
+                    o.insert("frontmost".into(), serde_json::json!(w.is_frontmost));
                     if geometry_real {
                         o.insert("x".into(), serde_json::json!(w.x));
                         o.insert("y".into(), serde_json::json!(w.y));

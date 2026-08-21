@@ -109,6 +109,14 @@ pub struct WindowInfo {
     pub height: u32,
     pub is_visible: bool,
     pub is_minimized: bool,
+    /// 它**是不是当前前台**。
+    ///
+    /// 原来没有这个字段，两个平台都拿 is_visible 凑：macOS 塞的是 isActive（碰巧对），
+    /// Windows 硬编码 true（永远错）。于是「谁在前台」在 Windows 上恒等于「枚举到的
+    /// 第一个窗口」，而合成按键只会进入真正的前台应用——每条按键回执的 delivered_to、
+    /// window.activate 的确认、window.list 的每一行，全都在说假话。
+    #[serde(default)]
+    pub is_frontmost: bool,
 }
 
 /// 屏幕信息

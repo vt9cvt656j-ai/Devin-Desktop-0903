@@ -147,6 +147,8 @@ unsafe extern "system" fn enum_windows_callback(hwnd: HWND, lparam: LPARAM) -> B
         width: (rect.right - rect.left) as u32,
         height: (rect.bottom - rect.top) as u32,
         is_visible: true,
+        // 真正的前台判据。GetForegroundWindow 已经在作用域里（文件头的 glob 导入）。
+        is_frontmost: hwnd == GetForegroundWindow(),
         is_minimized,
     });
     
