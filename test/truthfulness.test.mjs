@@ -496,5 +496,13 @@ test("工具描述里的三句假话：stash 清空工作区 / auto_rig 一定�
     // ④ stash pop 撞冲突时 stash 条目会保留，回执里带完整冲突报告。
     assert.match(text, /git keeps the stash entry in place and the receipt carries the full conflict report/,
       `${where}: git_stash_pop 没说冲突时条目还留着，模型会重复 pop 或直接 drop`);
+
+    // ⑤ background_monitor 的 url 判据：代码收的是 2xx **和 3xx**
+    //    （`+status >= 200 && +status < 400`），说成「until HTTP 200」会让模型
+    //    以为 302 不算就绪，白等到超时。
+    assert.doesNotMatch(text, /url = re-request a URL until HTTP 200/,
+      `${where}: url 的就绪判据说成了只认 200 —— 代码接受 2xx 和 3xx`);
+    assert.match(text, /url = re-request a URL until it answers 2xx or 3xx/,
+      `${where}: url 的就绪判据没说清 3xx 也算可达`);
   }
 });
