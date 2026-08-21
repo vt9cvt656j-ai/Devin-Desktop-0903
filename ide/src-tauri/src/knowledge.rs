@@ -506,6 +506,12 @@ fn community_result_status(outcome: &CommunitySearchOutcome) -> CommunitySourceS
                 let normalized = content.trim().to_ascii_lowercase();
                 if normalized.is_empty()
                     || normalized.contains("search_status: empty")
+                    // infoq 会回第六种状态 unusable（抓回来的和查询词一条都对不上）。
+                    // 它落进 else 就成了 Success，于是聚合抬头写 `success=1`、分节写
+                    // `status=success`，而正文三行后就是 `search_status: unusable`——
+                    // 模型只读抬头计数会得出「这一路查成功了」。
+                    // 语义上它就是「跑完了但没有可用命中」，和 empty 归一类。
+                    || normalized.contains("search_status: unusable")
                     || normalized.starts_with("no ")
                     || normalized.contains("\nno matching page was returned")
                     || normalized.contains("\n  no results found")
@@ -5369,8 +5375,11 @@ pub async fn infoq_search(query: String, max_results: Option<u32>) -> Result<Str
             let dropped = hits.len() - kept.len();
             let mut out = format!(
                 "InfoQ articles for '{query}':\nretrieved_at: {retrieved}\n\n\
-                 （抓回来 {} 条，其中 {dropped} 条的标题和链接跟 '{query}' 对不上，已经滤掉——\
-                 InfoQ 的搜索页是客户端渲染的，抓到的常常混着首页最新文章。）\n\n",
+                 （抓回来 {} 条，其中 {dropped} 条的标题和链接跟 '{query}' 对不上，已经滤掉。\
+                 **剩下的这些也未必是检索结果**：InfoQ 的搜索页是客户端渲染的，/search.action 对任何\
+                 查询词都返回同一张首页，下面这些只是那张页面上恰好含查询词的条目。\
+                 当线索用可以，别当成「InfoQ 上关于 '{query}' 的搜索结果」引用；要真检索请用\
+                 web_search 加 site:infoq.com。）\n\n",
                 hits.len()
             );
             for (i, (title, path)) in kept.iter().enumerate() {
@@ -6488,6 +6497,58 @@ mod infoq_shell_page_tests {
         // 命中在 slug 里也算。
         let slug_only = [("What's New This Month".to_string(), "/articles/rust-async/".to_string())];
         assert!(any_hit_matches_query("rust async", &slug_only));
+    }
+
+    /// unusable 是第六种状态，聚合器必须把它归到「跑完了但没有可用命中」，不能算成 success。
+    /// 否则抬头写 `Status counts: success=1`、分节写 `status=success`，而正文三行后就是
+    /// `search_status: unusable`——只读抬头计数的模型会得出「这一路查成功了」。
+    #[test]
+    fn unusable_is_not_counted_as_success() {
+        let src = include_str!("knowledge.rs");
+        // **先剥注释**：上面那段解释里就原样写着 `search_status: unusable`，
+        // 不剥的话这条断言会被自己要守的那段代码的注释喂饱（今天踩到第四次）。
+        let raw = src
+            .split("fn community_result_status")
+            .nth(1)
+            .and_then(|s| s.split("\n}\n").next())
+            .expect("community_result_status 不见了");
+        let body: String = raw
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let body = body.as_str();
+        assert!(
+            body.contains("search_status: unusable"),
+            "unusable 落进 else 被算成 Success —— 聚合抬头会写 success=1"
+        );
+        // 而且要和 empty 归在同一条判据里（同一个 if 的 || 链），不是另开一档。
+        let empty_at = body.find("search_status: empty").expect("empty 判据不见了");
+        let unusable_at = body.find("search_status: unusable").unwrap();
+        assert!(
+            unusable_at > empty_at && unusable_at - empty_at < 600,
+            "unusable 没有和 empty 归在同一条判据里"
+        );
+    }
+
+    /// 「滤掉了 N 条」那条分支留下来的，未必是检索结果——/search.action 对任何查询词都返回
+    /// 同一张首页，留下的只是那张页面上恰好含查询词的条目。措辞不能暗示它们通过了核对。
+    #[test]
+    fn the_partial_branch_does_not_pass_shell_items_off_as_results() {
+        let src = include_str!("knowledge.rs");
+        let body = src
+            .split("pub async fn infoq_search(")
+            .nth(1)
+            .and_then(|s| s.split("\n#[cfg(test)]").next())
+            .expect("infoq_search 不见了");
+        assert!(
+            body.contains("**剩下的这些也未必是检索结果**"),
+            "「滤掉 N 条」的措辞暗示剩下的通过了相关性核对 —— 模型会当检索结果引用"
+        );
+        assert!(
+            body.contains("别当成「InfoQ 上关于 '{query}' 的搜索结果」引用"),
+            "没说清这些只能当线索用"
+        );
     }
 
     /// 核对不了就放行，但「放行」不能顺手把结果也漏出去：这条钉住 infoq_search

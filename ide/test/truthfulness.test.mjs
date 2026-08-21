@@ -344,6 +344,16 @@ test("检索类：说清楚「没找到」还是「没去找」", () => {
   assert.match(CODE, /\$\{_remote\.active[\s\S]{0,120}远程主机/,
     "search 的零命中文案没有区分远程工作区 —— 本地扫描规则在那边不成立");
   assert.match(CODE, /这里说不准跳过了什么/, "远程时没有承认自己不知道扫描范围");
+  // 远程那条路原来 return 一个纯数组，truncated / scannedFiles 全丢——于是
+  // _backendTruncated 恒 false，「**这次没搜完**」在远程工作区上一次都不会出现，
+  // 有命中时的抬头也毫无提示。模型把一个任意子集当成全部（「所有调用点都改掉」
+  // 只改了前面几十处），正是本地那条注释写明要防的假阴性。
+  assert.match(CODE, /_hits\.truncated = !!j\?\.truncated/,
+    "远程搜索没把截断标志带出来 —— 远程工作区上「没搜完」永远不会触发");
+  assert.match(CODE, /_hits\.scanScopeUnknown = _hits\.scannedFiles === undefined/,
+    "远端没报扫描规模时没有留出「不知道」这一档");
+  assert.match(CODE, /判断不了这次搜完没有/,
+    "有命中时的抬头没提示「判断不了搜完没有」—— 沉默会被读成「搜完了」");
   assert.match(SRC, /符号索引只覆盖/, "find_symbol 不说索引作用域");
   assert.match(SRC, /在\*\*已建索引的部分\*\*里/, "semantic_search 不说索引作用域");
   // 这条原来钉的是一句**假话**：它和后端 skip_walk_entry 同 commit 写下，四小时后后端就
@@ -353,7 +363,16 @@ test("检索类：说清楚「没找到」还是「没去找」", () => {
   assert.doesNotMatch(SRC, /扫描范围不含点开头的目录和文件/,
     "又把「点开头的目录和文件全不扫」这句假话写回去了 —— 后端只跳几个具名目录，文件一律保留");
   assert.match(SRC, /点开头的文件照常搜/, "search 没说清点开头的文件其实在扫描范围里");
-  assert.match(SRC, /跳过的只有几个具名的构建\/缓存目录/, "search 没说清到底跳了什么");
+  // 「跳过的**只有**几个具名目录」是过头话：search_project_scope 还静默跳掉符号链接
+  // （文件和目录都跳）、>2MB 的文件、含 NUL 的二进制、以及非 UTF-8 编码的文件。
+  // 原文案后面那句「所以没找到多半是关键词不对，不是范围不够」正好把模型从真因推开。
+  assert.doesNotMatch(SRC, /跳过的只有几个具名的构建\/缓存目录/,
+    "又把「只有几个具名目录」这句过头话写回去了 —— 符号链接 / >2MB / 非 UTF-8 都在静默跳过之列");
+  for (const [needle, why] of [
+    [/符号链接/, "没说符号链接整棵树都不在扫描范围里"],
+    [/大于 2MB 的文件/, "没说文件大小上限"],
+    [/非 UTF-8 编码/, "没说非 UTF-8 的文件整份搜不到"],
+  ]) assert.match(SRC, needle, `search 零命中文案：${why}`);
   // 也不许换成另一句假话：search 根本不调 path_is_git_ignored。
   assert.doesNotMatch(SRC, /被 \.gitignore 忽略的.{0,12}不搜/,
     "用新假话替旧假话了 —— search 不查 .gitignore");
@@ -505,4 +524,96 @@ test("工具描述里的三句假话：stash 清空工作区 / auto_rig 一定�
     assert.match(text, /url = re-request a URL until it answers 2xx or 3xx/,
       `${where}: url 的就绪判据没说清 3xx 也算可达`);
   }
+});
+
+// 工具描述里承诺了代码做不到的事。这类比回执里的假话传得更远：模型在**调用之前**
+// 就照着它规划，而 _applyCloudToolDescs 会用网关那份顶掉本地兜底，所以两份都要钉。
+test("工具描述不许承诺代码做不到的事", () => {
+  const CATALOG = readFileSync(join(HERE, "..", "..", "server", "prompts", "tools.json"), "utf8");
+  for (const [where, text] of [["main.js", SRC], ["tools.json", CATALOG]]) {
+    // ① generate_image：省略 width/height 传的是 auto；而自动挑中的 gpt-image / dall-e
+    //    只支持 1024x1024 / 1536x1024 / 1024x1536，2048 和 3072 根本拿不到。
+    assert.doesNotMatch(text, /\*\*2048×2048 ultra-sharp square\*\* \(default\)/,
+      `${where}: generate_image 又说 2048×2048 是默认 —— 代码传的是 auto，gpt-image 一族也给不了这个尺寸`);
+    assert.doesNotMatch(text, /\*\*2048×2048 ultra-sharp is already the default\*\*/,
+      `${where}: 同上，而且还说「不用传 width/height」`);
+    assert.match(text, /2048×2048 and 3072×3072 are NOT reachable there/,
+      `${where}: 没说清 gpt-image 一族拿不到大尺寸`);
+
+    // ② search 的 query：默认 literal 会把整条 regex::escape 掉，
+    //    那个 `function\s+login` 的例子在默认模式下必然零命中。
+    assert.doesNotMatch(text, /Text to search for \(regex supported/,
+      `${where}: search 的 query 又在默认 literal 模式下教正则 —— 那个例子必然搜不到`);
+    assert.match(text, /\*\*Literal by default\*\*/, `${where}: search 的 query 没说清默认是字面匹配`);
+
+    // ③ run_subagent 的 tasks：嵌套那层是顺序跑的，且 4 个槽位整会话共享。
+    assert.doesNotMatch(text, /up to 4; all 4 run concurrently/,
+      `${where}: run_subagent 又无条件说 4 条并发 —— 嵌套那层是顺序跑的，子体会照着并发估超时`);
+    assert.match(text, /runs them one after another, so budget its timeout accordingly/,
+      `${where}: 没说清嵌套派发是顺序的`);
+
+    // ④ generate_texture 只落**一个**文件（后端每次调用只有一次 stream_asset_to_path）。
+    assert.doesNotMatch(text, /the full albedo \/ normal \/ roughness \/ metallic set/,
+      `${where}: generate_texture 又承诺整套 PBR 贴图 —— 后端只存一个文件，模型会去引用三个不存在的路径`);
+    assert.match(text, /It does not produce a separate albedo\/normal\/roughness\/metallic set/,
+      `${where}: 没说清只有一张图`);
+
+    // ⑤ 走同一条落盘路径的四个工具，扩展名告诫只写在 auto_rig 上是不够的。
+    for (const tool of ["Generate a 3D model with AI", "Generate character animation / motion with AI",
+      "Download a game asset into the workspace"]) {
+      const at = text.indexOf(tool);
+      assert.ok(at >= 0, `${where}: 找不到 ${tool}`);
+      assert.match(text.slice(at, at + 900), /go by the path in the receipt/,
+        `${where}: 「${tool}」没说清格式以回执为准 —— 内容类型闸门明摆着放行 zip`);
+    }
+  }
+});
+
+// 第三份工具目录：src/tool-guides.js 的 example_call / TOOL_EXAMPLES。
+// 它经 compactToolGuide 进 search_tools 的回执，是模型真会照抄的一份，
+// 而 sync-tools-json.mjs --check 只比 main.js ↔ tools.json，**根本不看它**。
+// 实测漂出来的：git_log 教 max_count（真名 count）、debate 教 topic（真名 question）、
+// git_branch 教 action='create'（真名 create 布尔）、bundlephobia_search 教 query
+// （真名 package）、read_terminal/stop_terminal 教 id（真名 name）。
+// 归一层没有对应别名的那几个，映射层直接把参数丢掉——模型拿到「默认 20 条」「空问题」，
+// 一声不响。
+test("第三份工具目录里的例子，参数名必须真的存在", async () => {
+  const { TOOL_METADATA } = await import("../src/tool-guides.js");
+  const catalog = JSON.parse(readFileSync(join(HERE, "..", "..", "server", "prompts", "tools.json"), "utf8"));
+  const byName = new Map();
+  for (const entry of (Array.isArray(catalog) ? catalog : catalog.tools)) {
+    const f = entry.function || entry;
+    byName.set(f.name, new Set(Object.keys((f.parameters || {}).properties || {})));
+  }
+
+  // 只取**顶层**参数名：嵌套对象里的键（steps=[{content,status}]、params={x,y}）是合法的。
+  const topLevelKeys = (argsText) => {
+    const keys = [];
+    let depth = 0, inStr = null, expectKey = true, buf = "";
+    for (let i = 0; i < argsText.length; i++) {
+      const c = argsText[i];
+      if (inStr) { if (c === inStr && argsText[i - 1] !== "\\") inStr = null; continue; }
+      if (c === "'" || c === '"' || c === "`") { inStr = c; continue; }
+      if ("[{(".includes(c)) { depth++; continue; }
+      if ("]})".includes(c)) { depth--; continue; }
+      if (depth === 0) {
+        if (c === ",") { expectKey = true; buf = ""; continue; }
+        if (c === "=" || c === ":") { if (expectKey && buf.trim()) keys.push(buf.trim()); expectKey = false; buf = ""; continue; }
+        buf += c;
+      }
+    }
+    return keys.filter((k) => /^[A-Za-z_][\w]*$/.test(k));
+  };
+
+  const bad = [];
+  for (const [name, meta] of Object.entries(TOOL_METADATA)) {
+    const props = byName.get(name);
+    if (!props) continue;                       // 运行时工具（search_tools 等）不在网关目录里
+    const m = /^[a-z_0-9]+\((.*)\)\s*$/s.exec(String(meta.example_call || "").trim());
+    if (!m) continue;
+    const unknown = topLevelKeys(m[1]).filter((k) => !props.has(k));
+    if (unknown.length) bad.push(`${name}: 例子里的 ${unknown.join("/")} 不是它的参数（真实参数：${[...props].join("/")}）`);
+  }
+  assert.deepEqual(bad, [],
+    "第三份目录教了不存在的参数——映射层会静默丢掉，模型拿到默认值还以为传进去了：\n  " + bad.join("\n  "));
 });

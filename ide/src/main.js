@@ -325,7 +325,20 @@ function _groupRemoteSearchHits(root, query, caseSensitive, hits) {
   backend.renamePath = (from, to) => _remote.active ? _remoteCall("/fs/rename", { from, to }) : _local.renamePath(from, to);
   backend.deletePath = (p) => _remote.active ? _remoteCall("/fs/delete", { path: p }) : _local.deletePath(p);
   backend.searchInProject = (root, query, cs, mode = "literal") => _remote.active
-    ? _remoteCall("/fs/search", { root, query, case_sensitive: cs, mode }).then((j) => _groupRemoteSearchHits(root, query, cs, j.hits))
+    ? _remoteCall("/fs/search", { root, query, case_sensitive: cs, mode }).then((j) => {
+      // 截断信息也要带出来。本地那条把 truncated / scannedFiles 挂在数组对象上
+      // （见 _local.searchInProject 的注释），远程这条原来只 return 一个纯数组——
+      // 于是 _backendTruncated 恒 false、_scannedFiles 恒 0，「**这次没搜完**」那句话
+      // 在远程工作区上一次都不会出现。后果就是那边注释写的假阴性：模型把一个任意
+      // 子集当成全部，「所有调用点都改掉」只改了前面几十处。
+      // 远端没报这两个字段时挂 undefined，让回执能区分「没截断」和「不知道」。
+      const _hits = _groupRemoteSearchHits(root, query, cs, j.hits);
+      _hits.truncated = !!j?.truncated;
+      _hits.scannedFiles = Number.isFinite(Number(j?.scanned_files)) ? Number(j.scanned_files)
+        : Number.isFinite(Number(j?.scannedFiles)) ? Number(j.scannedFiles) : undefined;
+      _hits.scanScopeUnknown = _hits.scannedFiles === undefined;
+      return _hits;
+    })
     : _local.searchInProject(root, query, cs, mode);
 }
 
@@ -19913,6 +19926,9 @@ let _currentAiMode = "agent";
 //             bites where the agent can actually write. Persisted across sessions.
 function _loadAiPerm(storage) {
   const saved = storage?.getItem("michael-ide.ai-perm");
+  // 两档。auto（默认）**一个都不问**——高危也不问；approve 才逐个问。
+  // 曾经有过第三档 full，但 auto 改成不问之后它和 auto 完全一样，两个同义的模式
+  // 只会让人困惑，所以删掉。老配置里存着 "full" 的按 auto 读，行为不变。
   return saved === "approve" ? "approve" : "auto";
 }
 let _currentAiPerm = (() => { try { return _loadAiPerm(localStorage); } catch { return "auto"; } })();
@@ -20278,7 +20294,10 @@ function _toolApprovalDialog({ title, detail, onceLabel = "允许", alwaysLabel 
   // 没人在电脑前就等于永久挂起。出口选「拒绝」而不是「放行」：没人看着的时候
   // 权限反而更大，那是最坏的方向。五个调用点（工具审批、沙箱逃逸、工作区配置
   // 执行、工作区信任、撤销条）共用这一道闸，堵一处漏四处的事不会发生。
-  if (_unattendedRun) return Promise.resolve("deny");
+  // full 档下这个函数根本不会被调到（mustAsk 恒 false）。留这行是给另外四个
+  // 调用点（沙箱逃逸、工作区配置执行、工作区信任、撤销条）兜底——它们不走 mustAsk。
+  // full 时它们也该放行，否则定时任务会在这些地方被拦住，而用户要的是全放开。
+  if (_unattendedRun) return Promise.resolve(_currentAiPerm === "approve" ? "deny" : "once");
   const show = () => new Promise((resolve) => {
     if (!_approveDlg) {
       _approveDlg = document.createElement("dialog");
@@ -20877,7 +20896,17 @@ async function _approveToolCall(call, run) {
   if (ruleVerdict !== "ask" && call.type === "mcp" && call.mcpAutoApprove) return true;
 
   const mode = (run && run.perm) || _currentAiPerm;
-  const mustAsk = ruleVerdict === "ask" || dangerous || (mode === "approve" && _requiresApproval(call));
+  // **只有用户主动打开授权模式时才问，其余一概不问。**
+  //
+  // 原来 auto（默认）下高危仍然会问，理由是"删除不可逆"。但那让默认状态变成了
+  // 一个走两步就停下来等人点的智能体，而用户要的是它能自己把活干完。
+  // 现在判据只有一条：他有没有打开这个开关。没打开 = 全放行，高危也放行，
+  // 工作区规则里写着 ask 的也放行（那类规则可能来自 clone 来的仓库，
+  // 而开关是用户本人的决定，比仓库带来的策略更权威）。
+  //
+  // ruleVerdict === "deny" 不走这里：它在更早一步就静默否决了，那是硬停不是询问。
+  const mustAsk = mode === "approve"
+    && (_requiresApproval(call) || dangerous || ruleVerdict === "ask");
   if (!mustAsk) return true;
   const key = _approvalKey(call, run);
   // 高危调用**不吃会话记忆**，也不给「本会话总是允许」。
@@ -20894,7 +20923,7 @@ async function _approveToolCall(call, run) {
   // 改文件类的调用，把真实 diff 放进框里——否则用户只能凭文件名猜。
   let _diffPreview = "";
   try { _diffPreview = await _approvalDiffPreview(call); } catch { _diffPreview = ""; }
-  if (_unattendedRun) {
+  if (_unattendedRun && _currentAiPerm === "approve") {
     // 对话框那一层已经会返回 deny，这里补的是**给模型的说法**：否则它拿到的
     // 是一句「用户拒绝了」，而实际上没有任何人做过这个决定。说清楚是「没人能点」
     // 而不是「有人不同意」，模型才会把它留给用户，而不是去找一条绕过确认的路。
@@ -32948,7 +32977,7 @@ function _buildAgentToolSchemas(includeWrite, mcpTools = []) {
   const tools = [
     { type: "function", function: { name: "read_file", description: "Read a file's contents. By default it reads the whole file from the start (up to 2000 lines) — **prefer omitting offset/limit and just reading the whole file**; use offset/limit only when the file is too large for one read (the result says it was truncated) to continue through the part you have not covered. You can issue several tool calls in parallel in one reply: **speculatively reading every possibly-useful file in one parallel batch is always better** than reading one at a time. When investigating, evaluating, or reviewing and you find further relevant files you have not read (modules the entry point imports, build scripts, config): **read them and then conclude — never stop to ask the user \"shall I keep reading?\". The unread list you just produced is your reading queue, not a question to hand back.** Do not re-read a whole file you already read and that has not changed; re-read a range only when you need character-exact text for an edit and the exact original has fallen out of context. Before modifying an existing file you must have its current real version. It can also read the text layer of .pdf/.docx/.pptx/.xlsx (image-only scans need OCR).", parameters: { type: "object", properties: { path: { type: "string", description: "Path relative to the workspace root, or an absolute path" }, offset: { type: "integer", description: "Starting line number (1-based). Provide only when the file is too large to read in one go" }, limit: { type: "integer", description: "How many lines to read. Provide only when the file is too large to read in one go; omit = read the whole file at once" } }, required: ["path"] } } },
     { type: "function", function: { name: "list_dir", description: "List the direct children of a directory on demand; use \".\" for the workspace root. When the IDE has already provided a project tree or symbol map, use that instead of re-scanning level by level; list a directory once only when the target location is unknown or the directory genuinely may have changed. Results include the resolved absolute path.", parameters: { type: "object", properties: { path: { type: "string", description: "Directory path (relative to the workspace root, or absolute)" }, depth: { type: "integer", description: "Recursion depth, default 1 (current level only); 0 = recurse all the way down" } }, required: ["path"] } } },
-    { type: "function", function: { name: "search", description: "Locate text inside a single file or directory when the position is unknown, returning matching lines with context. When the target file is known, read_file directly; after a hit, read the target source to confirm the full context — never edit from a fragment alone. Defaults to literal; use regex only when you genuinely need pattern matching.", parameters: { type: "object", properties: { query: { type: "string", description: "Text to search for (regex supported, e.g. \"function\\s+login\")" }, path: { type: "string", description: "Optional, restrict to a single file or subdirectory (e.g. \"src/auth.ts\" or \"src/\")" }, mode: { type: "string", enum: ["literal", "regex"], description: "Match mode, default literal" }, case_sensitive: { type: "boolean", description: "Whether to match case, default false" } }, required: ["query"] } } },
+    { type: "function", function: { name: "search", description: "Locate text inside a single file or directory when the position is unknown, returning matching lines with context. When the target file is known, read_file directly; after a hit, read the target source to confirm the full context — never edit from a fragment alone. Defaults to literal; use regex only when you genuinely need pattern matching.", parameters: { type: "object", properties: { query: { type: "string", description: "Text to search for. **Literal by default** — every character is matched as-is, so \"function\\s+login\" would look for that exact text and find nothing. For a real pattern you must also pass mode=\"regex\"." }, path: { type: "string", description: "Optional, restrict to a single file or subdirectory (e.g. \"src/auth.ts\" or \"src/\")" }, mode: { type: "string", enum: ["literal", "regex"], description: "Match mode, default literal" }, case_sensitive: { type: "boolean", description: "Whether to match case, default false" } }, required: ["query"] } } },
     { type: "function", function: { name: "find_files", description: "Find files by name or glob pattern — *.rs, main.js, src/**/*.ts — or just a substring of the filename. 【vs alternatives】Search by content with search; find a symbol's definition with find_symbol; when you know the exact path, read_file directly.", parameters: { type: "object", properties: { pattern: { type: "string", description: "Filename or glob pattern" }, limit: { type: "integer", description: "Optional; max results (default 200, max 2000). Results are capped DURING traversal and sorted afterwards, so a truncated result is an arbitrary subset in directory order — not the alphabetically first N. When the answer says it was truncated, narrow the pattern to a subdirectory rather than assuming you saw everything." } }, required: ["pattern"] } } },
     { type: "function", function: { name: "web_search", description: "General web-search fallback (the current desktop backend tries Google, Bing and DuckDuckGo in parallel and merges whatever actually comes back), returning a list of titles, URLs and snippets. Prefer tools closer to the question — the existing knowledge base, structured live sources, specialist databases, official documentation, package registries, GitHub and developer communities; use web_search only when no dedicated source applies or you need supplementary general-web evidence. Search snippets are only leads: read the original with web_fetch for any key conclusion and weigh it by source credibility — never treat a snippet, or this round's retrieved_at, as a current fact.", parameters: { type: "object", properties: { query: { type: "string", description: "Search keywords (English is often more precise)" } }, required: ["query"] } } },
     { type: "function", function: { name: "web_fetch", description: "Fetch a public web page and return its body text — for reading pages found by web_search, online documentation, API references, error messages and so on. http/https only. Intranet and localhost addresses ARE reachable — an internal wiki, a private docs site or a dev server on this machine can all be fetched; only link-local / cloud-metadata addresses (169.254.x.x) are refused. 【vs alternatives】To find a page use web_search; to call an API, send headers, or POST, use http_request.", parameters: { type: "object", properties: { url: { type: "string", description: "The full http/https URL" } }, required: ["url"] } } },
@@ -32989,7 +33018,7 @@ function _buildAgentToolSchemas(includeWrite, mcpTools = []) {
     { type: "function", function: { name: "think", description: "Record a short internal reasoning conclusion within this round, to clarify the goal, the assumptions and the next step before acting. Write only conclusions directly relevant to the current user request, and do not treat it as a reply addressed to the user.", parameters: { type: "object", properties: { thought: { type: "string", minLength: 1, description: "A short reasoning conclusion for the current decision" } }, required: ["thought"] } } },
     { type: "function", function: { name: "schedule", description: "Create, list or remove a **scheduled task** — something you run again later, on your own, with nobody at the keyboard. Use it whenever the user says 「every morning at 9」, 「check again in 20 minutes」, 「every day」, 「remind me to」. Give either at (daily HH:MM, their local time) or every_minutes, not both. The prompt you store is what a future run receives, so write it as a **standing instruction that stands alone**: that run has none of this conversation, so name the project path, the exact check, and what counts as done. **Two boundaries you must tell the user:** it fires only while this app is running (nothing is installed into their system, so a task waits until they reopen it), and a step that needs their confirmation is refused rather than silently allowed — so schedule work that can finish unattended.", parameters: { type: "object", properties: { action: { type: "string", enum: ["add", "list", "remove"], description: "add = create one; list = show all; remove = delete by id" }, prompt: { type: "string", description: "For add: the standing instruction a future run will receive. Must stand alone — no reference to this conversation." }, at: { type: "string", description: "For add: a daily time as HH:MM in the user's local timezone, e.g. 09:00" }, every_minutes: { type: "integer", description: "For add: repeat every N minutes instead of a daily time" }, id: { type: "integer", description: "For remove: which task" } }, required: ["action"] } } },
     { type: "function", function: { name: "ask_user", description: "**When you genuinely cannot tell what the user wants, ask them with this — do not guess and barrel ahead.** It shows a card in the conversation: the few **predicted options (buttons)** you supply, plus a **free-text box** (the user types their own requirement) and \"let the AI decide\". The user clicks one, types their own, or hands it back to you; you continue once you have their answer.\n**Use it only when the intent is genuinely ambiguous and the different readings would produce very different things** — e.g. the user asks to migrate the database and both an in-place migration and a rebuild are defensible; the user has two accounts/environments and you cannot tell which to target; two instructions in the same message contradict each other. A build request whose stack is unspecified is NOT ambiguous: \"build me a Telegram bot\" / \"build a login page\" → pick the mainstream library and a sensible default, build it, and state the choices in your summary. This tool is for decisions you genuinely cannot make on the user's behalf, not for \"which framework\".\n**Never ask about anything you can reasonably infer, or about mere implementation detail (which variable name, which file) — just do it.** Users hate being stopped for nothing. This tool is for \"what should I build\", not \"may I continue\".\n**Ordering rule: when the ambiguity is about direction, ask_user always comes before update_plan** — settle the direction, then plan. The system will never block your ask_user for \"there is no plan yet\".", parameters: { type: "object", properties: { question: { type: "string", description: "The specific clarifying question to put to the user (one sentence)" }, options: { type: "array", description: "2-4 answers you predict (each a few words), rendered as buttons for the user to pick; they can also skip them and type their own", items: { type: "string" } }, recommended: { type: "integer", description: "Index of the recommended option (0-based); that option is highlighted as recommended" }, multi_select: { type: "boolean", description: "true = multi-select mode (checkboxes; the user can pick several options and submit them together)" }, confirm_text: { type: "string", description: "Confirmation for a dangerous operation: once set, the user must type this text exactly into the box to continue (e.g. DELETE)" } }, required: ["question"] } } },
-    { type: "function", function: { name: "run_subagent", description: "Use only in structured-collaboration mode, for heavyweight research that needs broad coverage or an independent perspective. staged_roles first dispatches read-only roles such as architect/product/research/security to converge the architecture, product, evidence, and security contracts; an ordinary focused investigation is faster and cheaper if the main agent just reads it. A sub-report must give its evidence, the boundaries of its conclusion, the delivery contract, and the next step. 【vs alternatives】For parallel implementation that changes files use run_worker; to dispatch several read-only roles at once use spawn_multiple_agents; for a single focused investigation the main agent reading/searching directly is faster — do not dispatch.", parameters: { type: "object", properties: { description: { type: "string", description: "Short description of the subtask (3-6 words)" }, role: { type: "string", enum: ["architect", "product", "research", "frontend", "backend", "database", "security", "test", "devops", "design", "docs"], description: "A read-only specialist perspective. When the architecture, product, or security boundary is undecided, use architect/product/security first to converge the contract; other roles investigate their domain." }, prompt: { type: "string", description: "The complete, self-contained read-only task statement: the evidence to check, the contract to deliver, the paths/symbols involved, and the next step." }, tasks: { type: "array", minItems: 1, maxItems: 4, description: "Optional · dispatch several at once: send multiple read-only subtasks in one call (up to 4; all 4 run concurrently, each with its own card, merged into one report on completion). Each entry is {role, task}; when dispatching only one subtask, omit this and use prompt.", items: { anyOf: [{ type: "string" }, { type: "object", properties: { task: { type: "string" }, role: { type: "string", enum: ["architect", "product", "research", "frontend", "backend", "database", "security", "test", "devops", "design", "docs"] } }, required: ["task"] }] } }, wait: { type: "boolean", description: "Optional, default false = background job: returns job#N immediately, the main agent keeps working, and the result is delivered when ready (or await it with await_subagent). true = wait synchronously for the result before continuing." } }, required: ["description"], anyOf: [{ required: ["prompt"] }, { required: ["tasks"] }] } } },
+    { type: "function", function: { name: "run_subagent", description: "Use only in structured-collaboration mode, for heavyweight research that needs broad coverage or an independent perspective. staged_roles first dispatches read-only roles such as architect/product/research/security to converge the architecture, product, evidence, and security contracts; an ordinary focused investigation is faster and cheaper if the main agent just reads it. A sub-report must give its evidence, the boundaries of its conclusion, the delivery contract, and the next step. 【vs alternatives】For parallel implementation that changes files use run_worker; to dispatch several read-only roles at once use spawn_multiple_agents; for a single focused investigation the main agent reading/searching directly is faster — do not dispatch.", parameters: { type: "object", properties: { description: { type: "string", description: "Short description of the subtask (3-6 words)" }, role: { type: "string", enum: ["architect", "product", "research", "frontend", "backend", "database", "security", "test", "devops", "design", "docs"], description: "A read-only specialist perspective. When the architecture, product, or security boundary is undecided, use architect/product/security first to converge the contract; other roles investigate their domain." }, prompt: { type: "string", description: "The complete, self-contained read-only task statement: the evidence to check, the contract to deliver, the paths/symbols involved, and the next step." }, tasks: { type: "array", minItems: 1, maxItems: 4, description: "Optional · dispatch several at once: send multiple read-only subtasks in one call (up to 4, each with its own card, merged into one report on completion. They run concurrently only at the top level, and only while the session-wide sub-agent slots are free (4 shared across the whole session); a sub-agent that dispatches its own tasks runs them one after another, so budget its timeout accordingly). Each entry is {role, task}; when dispatching only one subtask, omit this and use prompt.", items: { anyOf: [{ type: "string" }, { type: "object", properties: { task: { type: "string" }, role: { type: "string", enum: ["architect", "product", "research", "frontend", "backend", "database", "security", "test", "devops", "design", "docs"] } }, required: ["task"] }] } }, wait: { type: "boolean", description: "Optional, default false = background job: returns job#N immediately, the main agent keeps working, and the result is delivered when ready (or await it with await_subagent). true = wait synchronously for the result before continuing." } }, required: ["description"], anyOf: [{ required: ["prompt"] }, { required: ["tasks"] }] } } },
     { type: "function", function: { name: "await_subagent", description: "Wait for a background subagent job to finish and collect its result. Use it when you cannot continue without the sub-report; with no jobs running it returns a summary of the current job ledger. 【vs alternatives】To dispatch an investigation use run_subagent / spawn_multiple_agents.", parameters: { type: "object", properties: { job: { type: "string", description: "The job number (e.g. 3) or all, default all" } }, required: [] } } },
     { type: "function", function: { name: "spawn_multiple_agents", description: "**Dispatch several role-based subagents concurrently in one call** (asynchronous and in the background, while the main flow continues). Suited to a large task needing several perspectives at once: research-type roles (research/security/architect and so on) gather evidence independently and their results are delivered when ready, or you can join them with await_subagent. With shared_store collaboration enabled, each subagent's findings are broadcast to the others automatically, avoiding duplicated research. ⚠️ Do not use it for a single focused investigation — the main agent reading directly is faster; for parallel implementation that writes files use run_worker.", parameters: { type: "object", properties: { task: { type: "string", description: "The overall task description (shared background for every agent)" }, agents: { type: "array", minItems: 1, maxItems: 5, items: { type: "object", properties: { role: { type: "string", enum: ["architect", "product", "research", "frontend", "backend", "database", "security", "test", "devops", "design", "docs"], description: "A read-only specialist perspective" }, focus: { type: "string", description: "This agent's focused subtask (self-contained — it cannot see the conversation history)" } }, required: ["role", "focus"] }, description: "2-5 parallel subagent definitions" }, collaboration: { type: "string", enum: ["shared_store", "independent"], description: "Default shared_store = findings are broadcast between agents; independent = fully isolated" } }, required: ["task", "agents"] } } },
     { type: "function", function: { name: "research_project", description: "Dispatch a read-only subagent to map the stack, core responsibilities, data flow and change entry points — only when the user explicitly asks for a full codebase onboarding map, or the task genuinely spans several unknown modules and the existing project tree and symbol map cannot pin down the entry point. Do not call it when the target file or module is already clear — read_file the relevant source and its callers directly — and do not treat it as a fixed preamble to every task. Optionally use focus to concentrate on one area (such as the authentication flow, the data layer, or build and release).", parameters: { type: "object", properties: { focus: { type: "string", description: "Optional; the direction to dig into (e.g. \"the authentication flow\", \"the data layer\", \"build and deployment\"); omit = a whole-project overview" }, wait: { type: "boolean", description: "Optional, default false = a background job returning job#N immediately; true = wait synchronously for the result." } }, required: [] } } },
@@ -33118,17 +33147,17 @@ function _buildAgentToolSchemas(includeWrite, mcpTools = []) {
       { type: "function", function: { name: "capture_replay", description: "**Replay one captured request exactly** (invaluable for reverse-engineering and debugging). It takes the original request by its `id` from capture_flows and **sends it with every captured request header intact (the cookie, token and signature are all in there — which is exactly why the replay succeeds)**, optionally overriding url/method/headers/body to probe with different parameters. It returns the real response. More reliable than hand-assembling an http_request, because you do not have to rebuild that pile of headers.", parameters: { type: "object", properties: { id: { type: "string", description: "The id=… value from a capture_flows result" }, url: { type: "string", description: "Optional; override the URL (to probe a different query or path)" }, method: { type: "string", description: "Optional; override the method" }, headers: { type: "object", description: "Optional; override or add request headers (merged into the captured originals)", additionalProperties: { type: "string" } }, body: { type: "string", description: "Optional; override the request body" } }, required: ["id"] } } },
       { type: "function", function: { name: "decode_qr", description: "Read the QR codes in an image and return the text they encode (there may be several). Supply either path (the path to an image file — a screenshot you just captured, or an image in the project; relative to the workspace root or absolute) or data_url (a base64 image). Typical uses: read the link behind a sign-in or pairing QR code, or see what a given QR code actually encodes. When the image is too blurry or small to decode, crop and enlarge the QR area first and try again. Requires the desktop app.", parameters: { type: "object", properties: { path: { type: "string", description: "Path to the QR code image, e.g. debug.png or the path of a screenshot" }, data_url: { type: "string", description: "Optional; a base64 image (data:image/...;base64,...), for when there is no file" } }, required: [] } } },
       { type: "function", function: { name: "remote", description: "**Connect to another machine (a server or computer) and write code and run commands directly on it — no SSH or scp needed.** Once you connect to a michael-remote-agent.py daemon, all of your subsequent read_file / write_file / edit_file / list_dir / search / run_cmd calls **operate on that remote machine automatically** (exactly as if it were local), with no uploading or downloading. Use it when the user asks you to work on their server or remote machine: connect first (you need the address and token they supply; root is the remote project directory), and disconnect when done to switch back to local. status reports which machine you are currently on. ⚠️ The user must start the daemon on the remote machine first (python3 michael-remote-agent.py --token … --root …). Requires the desktop app.", parameters: { type: "object", properties: { action: { type: "string", enum: ["connect", "disconnect", "status"], description: "connect / disconnect (switch back to local) / status (see the current connection)" }, url: { type: "string", description: "For connect: the remote daemon's address, e.g. 1.2.3.4:8765 or http://host:8765" }, token: { type: "string", description: "For connect: the daemon's token" }, root: { type: "string", description: "For connect (optional): the remote project root, e.g. /home/user/app" } }, required: ["action"] } } },
-      { type: "function", function: { name: "generate_image", description: "**Generate an image from a text description** (AI image generation), saved straight into the workspace, with **the generated image sent back to you**. Two uses: (1) real assets for UI and web pages — hero images, illustrations, logos, textures, avatars, placeholders, OG images; (2) UI design comps / interface mockups to show the user what it will look like (then write the code from them). A prompt works best written in five parts: Scene → Subject → Important details (material/lighting/lens) → Use case → Constraints. English is more precise. **When producing a UI mockup, always write it as \"a high-fidelity screenshot of a shipped product\"** (high-fidelity UI screenshot of a working …; **do not use concept art / illustration / sketch**). Any combination of multiples of 16 is supported; common ones: **2048×2048 ultra-sharp square** (default), 1536×1024 landscape, 1024×1536 portrait, 3072×3072 ultra-high. **2048×2048 ultra-sharp is already the default** — there is no need to pass width/height deliberately. After generating, judge it from the image sent back, and if it is not right, revise the prompt and regenerate.", parameters: { type: "object", properties: { prompt: { type: "string", description: "The image description (English is more precise). Write it in five parts: Scene → Subject → Details (material/lighting/lens, e.g. 85mm f/1.4, soft bounce light) → Use case → Constraints. Use concrete visual description instead of empty words like '8K masterpiece'." }, dest: { type: "string", description: "Save path, relative to the workspace root, e.g. assets/hero.png" }, width: { type: "integer", description: "Width; omit = auto (the model decides). gpt-image/dall-e support only fixed sizes and will snap to the nearest 1024/1536" }, height: { type: "integer", description: "Height; omit = auto (the model decides). gpt-image/dall-e support only fixed sizes and will snap to the nearest 1024/1536" } }, required: ["prompt", "dest"] } } },
+      { type: "function", function: { name: "generate_image", description: "**Generate an image from a text description** (AI image generation), saved straight into the workspace, with **the generated image sent back to you**. Two uses: (1) real assets for UI and web pages — hero images, illustrations, logos, textures, avatars, placeholders, OG images; (2) UI design comps / interface mockups to show the user what it will look like (then write the code from them). A prompt works best written in five parts: Scene → Subject → Important details (material/lighting/lens) → Use case → Constraints. English is more precise. **When producing a UI mockup, always write it as \"a high-fidelity screenshot of a shipped product\"** (high-fidelity UI screenshot of a working …; **do not use concept art / illustration / sketch**). Size depends on the model actually in use. Omitting width/height sends `auto` and lets the model decide — that is the recommended default. The auto-picked gpt-image / dall-e family only supports 1024x1024, 1536x1024 and 1024x1536, and snaps any other request to the nearest of those; 2048×2048 and 3072×3072 are NOT reachable there. Free width/height (multiples of 16) are passed through only to non-gpt-image models. Just omit width/height unless you need a specific aspect ratio — `auto` is what gets sent, and on gpt-image/dall-e only the three fixed sizes above exist anyway. After generating, judge it from the image sent back, and if it is not right, revise the prompt and regenerate.", parameters: { type: "object", properties: { prompt: { type: "string", description: "The image description (English is more precise). Write it in five parts: Scene → Subject → Details (material/lighting/lens, e.g. 85mm f/1.4, soft bounce light) → Use case → Constraints. Use concrete visual description instead of empty words like '8K masterpiece'." }, dest: { type: "string", description: "Save path, relative to the workspace root, e.g. assets/hero.png" }, width: { type: "integer", description: "Width; omit = auto (the model decides). gpt-image/dall-e support only fixed sizes and will snap to the nearest 1024/1536" }, height: { type: "integer", description: "Height; omit = auto (the model decides). gpt-image/dall-e support only fixed sizes and will snap to the nearest 1024/1536" } }, required: ["prompt", "dest"] } } },
       { type: "function", function: { name: "game_scaffold", description: "Generate a game project scaffold in one command. Defaults to Godot 4 (a AAA-grade 3D engine, Vulkan rendering, GDScript, exports to every platform). Choose phaser/threejs/babylon only for browser games. After generating, add features by editing the scripts with edit_file.", parameters: { type: "object", properties: { engine: { description: "Game engine: godot (default, AAA-grade 3D/2D, Vulkan, GDScript, exports everywhere) | phaser (browser 2D) | threejs (browser 3D scenes) | babylon (browser 3D games)", type: "string", enum: ["godot", "phaser", "threejs", "babylon"], default: "godot" }, name: { type: "string", description: "Project folder name (letters and hyphens, e.g. fps-shooter, rpg-world)" } }, required: [] } } },
       { type: "function", function: { name: "web_scaffold", description: "**Lay down a curated front-end base in one command (the deterministic opening move, comparable to v0.dev)** — generates a Vite project in the workspace that runs as-is: by default React + TypeScript + Tailwind v4 + a shadcn base + OKLCH semantic tokens + a font pairing. Pass style=material/google → the official MUI + Material 3 theme (React); style=tdesign/tencent → the official tdesign-vue-next with its official tokens (Vue) — the big-vendor styles come straight from the tool rather than being imitated by hand. If the workspace already has reference/*-tokens.css learned by learn_design, it is wired into the project automatically. **Start a site, marketing page or landing page from scratch with this**, then cd in and run npm install && npm run dev.", parameters: { type: "object", properties: { name: { type: "string", description: "Project name (a short slug used as the directory name, e.g. my-portfolio)" }, framework: { description: "react (default, the Michael Design standard stack) or vue", type: "string", enum: ["react", "vue"], default: "react" }, style: { type: "string", description: "Design-system preset: material/m3/google = official MUI + Material 3 (forces React); tdesign/tencent = official tdesign-vue-next (forces Vue); omit = the default token base" }, tokens_css: { type: "string", description: "Optional; the contents of a tokens.css produced by learn_design, wired straight into the project (omit and it looks for reference/*-tokens.css in the workspace)" } }, required: [] } } },
-      { type: "function", function: { name: "generate_3d", description: "Generate a 3D model with AI (.glb). Describe the model you want in text → the mesh and texture are generated and saved to assets/models/. Built on open models such as Hunyuan3D / TripoSR / TRELLIS.", parameters: { type: "object", properties: { prompt: { description: "Model description (e.g. \"medieval castle gate\", \"cyberpunk pistol\", \"cartoon tree\")", type: "string" }, name: { type: "string", description: "Filename (letters, e.g. castle-gate, cyber-gun)" }, style: { description: "Style: realistic | cartoon | lowpoly", type: "string", enum: ["realistic", "cartoon", "lowpoly"], default: "realistic" } }, required: ["prompt"] } } },
+      { type: "function", function: { name: "generate_3d", description: "Generate a 3D model with AI. Describe the model you want in text → the mesh and texture are generated and saved to assets/models/, usually as .glb. When the upstream returns another format the file is saved under its real extension and the receipt names it — go by the path in the receipt. Built on open models such as Hunyuan3D / TripoSR / TRELLIS.", parameters: { type: "object", properties: { prompt: { description: "Model description (e.g. \"medieval castle gate\", \"cyberpunk pistol\", \"cartoon tree\")", type: "string" }, name: { type: "string", description: "Filename (letters, e.g. castle-gate, cyber-gun)" }, style: { description: "Style: realistic | cartoon | lowpoly", type: "string", enum: ["realistic", "cartoon", "lowpoly"], default: "realistic" } }, required: ["prompt"] } } },
       { type: "function", function: { name: "generate_sound", description: "Generate a game sound effect with AI (.mp3). Text description → a sound file saved to assets/audio/. For explosions, footsteps, gunfire, impacts, ambience and so on. Built on ElevenLabs / AudioLDM2.", parameters: { type: "object", properties: { prompt: { description: "Sound description (e.g. \"metal impact\", \"rainy ambience\", \"laser gun shot\")", type: "string" }, name: { type: "string", description: "Filename (letters, e.g. metal-impact, rain-ambient)" }, duration: { description: "Length in seconds (default 5)", type: "number", minimum: 0.5, maximum: 300 } }, required: ["prompt"] } } },
       { type: "function", function: { name: "generate_music", description: "Generate game background music with AI (.mp3). Describe the style or mood in text → a BGM file saved to assets/music/. Built on ACE-Step / MusicGen.", parameters: { type: "object", properties: { prompt: { description: "Music description (e.g. \"epic orchestral battle BGM 120BPM\", \"gentle piano exploration score\", \"8-bit retro game music\")", type: "string" }, name: { type: "string", description: "Filename (letters, e.g. battle-epic, explore-calm)" }, duration: { description: "Length in seconds (default 30)", type: "number", minimum: 1, maximum: 600 } }, required: ["prompt"] } } },
       { type: "function", function: { name: "generate_voice", description: "AI speech synthesis (.mp3). Text → NPC dialogue, narration, voice-over. Built on Kokoro / XTTS-v2, with sub-200ms latency.", parameters: { type: "object", properties: { text: { description: "The text to be spoken", type: "string" }, name: { type: "string", description: "Filename (letters, e.g. npc-greeting, narrator-intro)" }, voice: { description: "Voice style (default/male/female/child/elder)", type: "string" } }, required: ["text"] } } },
       { type: "function", function: { name: "auto_rig", description: "Automatic rigging. Rigs the skeleton for a task_id returned by generate_3d and outputs an animatable model. Usually .glb; when the upstream returns another format (a zipped FBX, for instance) the file is saved under its real extension and the receipt names it — go by the path in the receipt, not by the extension you expected.", parameters: { type: "object", properties: { task_id: { type: "string", description: "The real Tripo task_id returned by generate_3d" }, name: { type: "string", description: "Output filename (letters, e.g. character-rigged)" } }, required: [] } } },
-      { type: "function", function: { name: "generate_motion", description: "Generate character animation / motion with AI. Produces an animation file for an existing character or model task_id, saved to assets/animations/.", parameters: { type: "object", properties: { prompt: { description: "Motion description (e.g. \"walk\", \"run\", \"sword attack\", \"dance\", \"crouch\")", type: "string" }, task_id: { type: "string", description: "The real Tripo task_id returned by auto_rig" }, name: { type: "string", description: "Filename (letters, e.g. walk, run, sword-attack)" }, duration: { description: "Animation length in seconds (default 3)", type: "number", minimum: 0.5, maximum: 120 } }, required: ["prompt"] } } },
-      { type: "function", function: { name: "generate_texture", description: "Generate PBR texture maps with AI. Text description → the full albedo / normal / roughness / metallic set saved to assets/textures/. Built on MatFuse / Paint3D.", parameters: { type: "object", properties: { prompt: { description: "Texture description (e.g. \"rusty metal plate\", \"stone brick wall\", \"wooden floor\", \"lava ground\")", type: "string" }, name: { type: "string", description: "Filename (letters, e.g. rusty-metal, stone-brick)" }, resolution: { description: "Resolution (512/1024/2048/4096, default 1024)", type: "integer", enum: [512, 1024, 2048, 4096] } }, required: ["prompt"] } } },
-      { type: "function", function: { name: "download_asset", description: "Download a game asset into the workspace. Used together with search_game_assets — pick one of the search results and download it.", parameters: { type: "object", properties: { url: { description: "Asset download URL (from a search_game_assets result)", type: "string" }, name: { type: "string", description: "Filename to save as (letters)" }, asset_type: { description: "Asset type (determines which subdirectory it goes to)", type: "string", enum: ["model", "sound", "music", "texture", "hdri", "animation"], default: "model" } }, required: ["url"] } } },
+      { type: "function", function: { name: "generate_motion", description: "Generate character animation / motion with AI. Produces an animation file for an existing character or model task_id, saved to assets/animations/, usually as .glb. When the upstream returns another format the file is saved under its real extension and the receipt names it — go by the path in the receipt.", parameters: { type: "object", properties: { prompt: { description: "Motion description (e.g. \"walk\", \"run\", \"sword attack\", \"dance\", \"crouch\")", type: "string" }, task_id: { type: "string", description: "The real Tripo task_id returned by auto_rig" }, name: { type: "string", description: "Filename (letters, e.g. walk, run, sword-attack)" }, duration: { description: "Animation length in seconds (default 3)", type: "number", minimum: 0.5, maximum: 120 } }, required: ["prompt"] } } },
+      { type: "function", function: { name: "generate_texture", description: "Generate a PBR texture with AI. Text description → **one** image file saved to assets/textures/ (the path comes back in the receipt). It does not produce a separate albedo/normal/roughness/metallic set — if you need the other maps, ask for them one at a time. Built on MatFuse / Paint3D.", parameters: { type: "object", properties: { prompt: { description: "Texture description (e.g. \"rusty metal plate\", \"stone brick wall\", \"wooden floor\", \"lava ground\")", type: "string" }, name: { type: "string", description: "Filename (letters, e.g. rusty-metal, stone-brick)" }, resolution: { description: "Resolution (512/1024/2048/4096, default 1024)", type: "integer", enum: [512, 1024, 2048, 4096] } }, required: ["prompt"] } } },
+      { type: "function", function: { name: "download_asset", description: "Download a game asset into the workspace. Used together with search_game_assets — pick one of the search results and download it. The saved file is checked against its real format: if the bytes disagree with the extension you asked for, it is saved under the real one and the receipt says so — go by the path in the receipt.", parameters: { type: "object", properties: { url: { description: "Asset download URL (from a search_game_assets result)", type: "string" }, name: { type: "string", description: "Filename to save as (letters)" }, asset_type: { description: "Asset type (determines which subdirectory it goes to)", type: "string", enum: ["model", "sound", "music", "texture", "hdri", "animation"], default: "model" } }, required: ["url"] } } },
       { type: "function", function: { name: "docker_compose_up", description: "Parse and start a Docker Compose service stack — it checks that docker is available, reads the compose file, runs docker compose up (or legacy docker-compose), collects container status, and offers self-healing hints for common failures (port conflicts, image pull failures, permission problems). Returns the container list, their status, port mappings and suggested access URLs.", parameters: { type: "object", properties: { path: { type: "string", description: "Compose file path, relative, default docker-compose.yml", default: "docker-compose.yml" }, services: { type: "array", description: "Optional; a subset of services to start; omit to start all of them", items: { type: "string" } }, detach: { type: "boolean", description: "Whether to start in the background, default true", default: true } }, required: [] } } },
       { type: "function", function: { name: "design_board", description: "**Lay several design comps or images out for the user in a professional grid, and return their choice to you once they click \"take this direction\"** (interactive, like the multi-direction pickers in Midjourney/Lovable). When designing UI, first generate 2-6 comps in different directions with generate_image, then call design_board to arrange them into a clean comparison grid — **the tool pauses and waits for the user to choose**. The user can click to view an image full size, and once they pick a direction with the button, the return value tells you which one they chose (label + path + description), so **you do not need to ask them what they picked** — just continue from the result. It lays out 2-9 images intelligently: 2 = side by side, 3 = hero layout, 4 = 2×2, 5 = 3+2 staggered, 6 = 3×2, 9 = 3×3. **In a UI design workflow you must use this to present the comps once you have generated several — do not post them one at a time.**", parameters: { type: "object", properties: { title: { type: "string", description: "Board title, e.g. \"Landing page design directions\" or \"Dashboard layout options\"" }, variants: { type: "array", minItems: 2, maxItems: 9, items: { type: "object", properties: { label: { type: "string", description: "Option name, e.g. \"Minimal white\", \"Dark tech\", \"Warm and rounded\"" }, path: { type: "string", description: "Image path (where generate_image saved it earlier, relative to the workspace root)" }, description: { type: "string", description: "One sentence describing what characterizes this direction" } }, required: ["label", "path"] } } }, required: ["variants"] } } },
       { type: "function", function: { name: "db_query", description: "**Query and operate a database directly** — MySQL / PostgreSQL / SQLite (SQL) and Redis (commands) are supported. Work from real data instead of guessing: inspect a table's structure, read rows, check a single record, run a migration, look at cache keys. Results are echoed back to you as a **table**. SELECT/SHOW/DESCRIBE and friends return columns and rows; INSERT/UPDATE/DELETE return the affected row count; the timeout is 20s and at most 500 rows come back by default. ⚠️ The connection string, and whether writes are allowed, come from the user — never connect to an external database on your own initiative. Be careful with writes (changing or deleting data, migrations); when unsure, SELECT first and look. If a date, decimal, json or similar special type shows up as <typename>, CAST it to text in the SQL. 【When to use】To confirm a table's structure or the real data, query it directly (SHOW TABLES and so on) — more accurate than guessing the schema from migration files.", parameters: { type: "object", properties: { driver: { type: "string", enum: ["mysql", "mariadb", "postgres", "sqlite", "mssql", "mongodb", "redis", "clickhouse", "elastic"], description: "Database type" }, url: { type: "string", description: "Connection string: for MySQL/PostgreSQL pass DATABASE_URL; for SQLite use sqlite:///abs/path.db or sqlite://relative.db; for Redis use redis://host:6379/0" }, query: { type: "string", description: "The SQL statement, or a Redis command line (e.g. GET key, KEYS user:*, HGETALL h)" }, limit: { type: "integer", description: "Maximum rows to return (default 500, maximum 2000)" } }, required: ["driver", "url", "query"] } } },
@@ -33832,6 +33861,12 @@ function _normalizeArgKeys(args) {
   alias("file_pattern", "filePattern", "file_match", "fileMatch", "content_pattern", "contentPattern", "contains", "match_text", "matchText");
   alias("check_type", "checkType", "check", "check_kind", "checkKind", "condition", "condition_type", "conditionType");
   alias("timeout", "timeout_secs", "timeoutSecs", "timeout_seconds", "timeoutSeconds", "wait_seconds", "waitSeconds");
+  // 这两个是**归一兜底**，不是纵容：第三份目录（tool-guides.js）曾经把 git_log 的参数
+  // 教成 max_count、debate 的教成 topic，而归一层没有对应别名，映射层直接把它们丢掉——
+  // 模型拿到的是「默认 20 条」和「空问题」，没有任何报错。例子已经改对了，别名留作兜底：
+  // 这两个词都无歧义，别的工具不会用到。
+  alias("count", "max_count", "maxCount", "limit_count");
+  alias("question", "topic");
   alias("message", "msg", "label", "reason", "status_text", "statusText");
   alias("prompt", "description", "instruction", "instructions");
   alias("method", "action", "op", "operation");
@@ -36627,6 +36662,8 @@ async function _readLogTailForAgent(rawPath, root = "", lines = 200) {
 
 async function _workspaceLogCandidates(root = "", limit = 8) {
   const base = root || rootPath || workspaceRoots[0] || "";
+  // 没有工作区 = **一次目录都没读**。调用方据此区分「扫过，没有」和「根本没扫」——
+  // 回执原来无论哪种都写「工作区常见日志位置也没有 .log/.out/.err 可读」。
   if (!base) return [];
   const out = [];
   const seen = new Set();
@@ -36639,10 +36676,22 @@ async function _workspaceLogCandidates(root = "", limit = 8) {
   let topEntries = [];
   try { topEntries = await backend.readDir(base); } catch {}
   const topNames = new Set(topEntries.filter((e) => !e?.is_dir).map((e) => e.name));
+  // 先按这几个常见名排序：它们最可能是这次要看的那份。
   for (const name of [
     "npm-debug.log", "yarn-error.log", "pnpm-debug.log", "bun-debug.log",
     "vite.log", "server.log", "app.log", "error.log", "debug.log", "crash.log",
   ]) if (topNames.has(name)) add(`${base}/${name}`);
+  // 然后把根目录里**其余**的 .log/.out/.err 也收进来。
+  //
+  // 原来根目录只比对上面那 10 个写死的名字，不走 _looksLikeLogFileName（它当时只在
+  // logs/log/.logs/tmp/var/log 五个子目录里生效）。于是根目录躺着 backend.log、
+  // worker.out、test.err 时一个都看不见，而回执写的是「工作区常见日志位置也没有
+  // .log/.out/.err 可读」——模型据此判定服务没输出。目录本来就已经读过一遍，这里
+  // 套一下判据不多花任何代价。
+  for (const entry of topEntries) {
+    if (out.length >= limit) break;
+    if (!entry?.is_dir && _looksLikeLogFileName(entry.name)) add(entry.path || `${base}/${entry.name}`);
+  }
   for (const dir of ["logs", "log", ".logs", "tmp", "var/log"]) {
     if (out.length >= limit) break;
     const abs = `${base}/${dir}`;
@@ -36800,7 +36849,12 @@ async function _agentReadLogs(call, root = "", run = null, out = null) {
     // 正则失配，于是**一次什么都没读到的日志调用被记成了有效的运行时证据**。
     // 改文案会再犯一次；这里给事实，判据那边读事实。
     _emptyRead = true;
-    if (_nameMiss) return _finish(`[终端没匹配上] ${_nameMiss}\n工作区常见日志位置也没有 .log/.out/.err 可读。`);
+    const _noWorkspace = !(root || rootPath || workspaceRoots[0] || "");
+    const _scanNote = _noWorkspace
+      ? "当前没有打开工作区，所以**一次目录都没扫**——这不等于没有日志。"
+      : "工作区常见日志位置也没有 .log/.out/.err 可读。";
+    if (_nameMiss) return _finish(`[终端没匹配上] ${_nameMiss}\n${_scanNote}`);
+    if (_noWorkspace) return _finish("当前没有可读的 Agent 终端日志；而且**没有打开工作区**，所以一次目录都没扫——这不等于工作区里没有日志。先打开项目，或直接 read_logs(path=绝对路径)。");
     return _finish("当前没有可读的 Agent 终端日志，也没有在工作区常见日志位置发现 .log/.out/.err。若报错输出里给了日志路径，调用 read_logs(path=那个路径) 读取尾部。");
   }
   // 裸切会让下游报出一个**精确的假数字**。
@@ -45013,6 +45067,13 @@ async function _runSubAgent({ config, description, prompt, root, container, run,
   const _scopeGuidance = _scopeIsWholeWs
     ? `\n\n# 你的可改范围(scope)\n本次没有细分 scope：你可以改整个工作区，但你是**独占串行**运行（同一时刻只有你在写文件）。请只改这块子任务真正需要的文件，别越界重写别人的部分。`
     : `\n\n# 你的可改范围(scope)\n你**只能修改**下面这些路径内的文件（相对工作区根），其余文件只读：\n${scopeRel.map((s) => "- " + s).join("\n")}`;
+  // **必须声明在第一次使用之前**。它原来声明在 170 行之后，而下面这条 sysPrompt 就要读它——
+  // 同一个函数体、中间没有函数边界，于是 `_runSubAgent` **每次调用都抛**
+  // `ReferenceError: Cannot access '_parentReadOnlyMode' before initialization`。
+  // run_subagent / run_worker / debate / 嵌套派发整条功能因此是死的，而且没有任何测试发现：
+  // 全仓 37 处 _runSubAgent 引用里 25 处是 extractFn/SRC.slice + assert.match 的**源码文本**断言，
+  // 没有一条真的调用过它。node --check 也查不出函数作用域内的 TDZ。
+  const _parentReadOnlyMode = !write && ["explorer", "plan", "reviewer"].includes(String(run?.mode || ""));
   const sysPrompt = (write
     ? _WORKER_SYSTEM + _scopeGuidance
     : _SUBAGENT_SYSTEM)
@@ -45185,7 +45246,6 @@ async function _runSubAgent({ config, description, prompt, root, container, run,
   // 修的方向是**收回许诺**而不是放开门：只读是用户在模式选择器上亲手选的，父体自己都不许跑
   // 命令（tool-policy 里 cmd/termtask 的 readOnlyModeBlocked 有测试正面钉着），让子体绕过去
   // 等于那个选择白选。收回之后模型看不见这个工具，也就不会撞上那堵墙。
-  const _parentReadOnlyMode = !write && ["explorer", "plan", "reviewer"].includes(String(run?.mode || ""));
   if (_parentReadOnlyMode) {
     const _i = _allow.indexOf("run_cmd");
     if (_i >= 0) _allow.splice(_i, 1);
@@ -46108,7 +46168,10 @@ async function _buildImageFeedback(imgs, config, leadText, perImageHint) {
       d ? `【图 ${k + 1} 的视觉转写】\n${d}`
         : `【图 ${k + 1}】（转写失败：当前没有可配置的多模态模型来读图。要让我真正"看"图，请在模型菜单切到 Claude / GPT-4o / Gemini 等视觉模型。）`)));
   const lead = `你当前用的模型看不到图片，我已用视觉模型把 ${imgs.length} 张图转写成文字（OCR + 布局 + 视觉缺陷）。请把它当成你"亲眼看到"的内容来判断与改进，标准不降低：\n\n`;
-  return { role: "user", content: lead + descs.join("\n\n———\n\n") };
+  // 纯文本模型这条路原来另起了一个 lead，把调用方的 leadText 连同 _dropNote 一起丢掉了：
+  // 5 张图掉了 2 张时，模型收到的是「我已把 3 张图转写成文字」，全程没有一个字说过缺了两张——
+  // 正是上面那句注释要防的事，只是漏了这一条分支。leadText 里也包含「这几张图是什么」。
+  return { role: "user", content: leadText + "\n\n" + lead + descs.join("\n\n———\n\n") };
 }
 
 // --- Live workspace staging ("show your work") — as the agent runs each tool, bring
@@ -49586,7 +49649,14 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
               run._quietResumePool--;
               // 上一轮已经推过一次、而这一轮模型没有产生任何新的成功编辑 → 说明提醒没起作用，
               // _diagnosticBlock 又只在有成功编辑时才重算，再推就是拿一个陈旧值反复烧钱。
-              if (run._diagnosticNudges >= 2 && !(Array.isArray(_successfulEdits) && _successfulEdits.length)) {
+              // 读的是**上一轮**的成功编辑，不是 _successfulEdits。
+              //
+              // _successfulEdits 在同一个函数体里、但**在这一行之后**才计算（本轮工具阶段跑完才汇总），
+              // 所以这里读它是纯 TDZ：`Cannot access '_successfulEdits' before initialization`。
+              // 因为 && 短路，第一次推送（nudges===1）躲得过，**第二次必然抛**——而这一行的唯一
+              // 用途就是给第二次用的，等于这条「推过一次还没起作用就别再推」的判断从来没生效过。
+              // 语义上要的本来就是「刚跑完那一轮有没有新的成功编辑」，跨轮存活的值挂在 run 上。
+              if (run._diagnosticNudges >= 2 && !(Array.isArray(run._lastSuccessfulEdits) && run._lastSuccessfulEdits.length)) {
                 run._quietResumePool++;   // 没真的开火，把刚扣的还回去
                 run._incompleteReason = run._incompleteReason || "new_diagnostics_unresolved";
               } else
@@ -50801,6 +50871,9 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
         const actualPath = c._resolvedPath || _resolveRel(c.path, root);
         if (!_successfulEdits.includes(actualPath)) _successfulEdits.push(actualPath);
       }
+      // 跨轮存活：下一轮的诊断推送判据要读「刚跑完这一轮有没有新的成功编辑」。
+      // 在同一轮里读 _successfulEdits 是读不到的（它就在这几行才算出来）。
+      run._lastSuccessfulEdits = _successfulEdits;
       for (const it of items) {
         for (const path of (it._workerMutationPaths || [])) {
           const actualPath = _resolveRel(path, root);
@@ -55536,6 +55609,7 @@ async function _executeToolStepInner(step, call, root, run) {
       // 后果是**假阴性**：用户说「把这个变量所有调用点都改掉」，某个文件里有 80 处引用，
       // 模型只看到前 50 处，然后按"一共就这么多"改完收工，剩下 30 处静静留在代码里。
       let _backendTruncated = false;
+      let _scanScopeUnknown = false;
       let _scannedFiles = 0;
       for (const searchRoot of searchScopes) {
         let scopedMatches = [];
@@ -55544,6 +55618,9 @@ async function _executeToolStepInner(step, call, root, run) {
           successfulScopes++;
           if (scopedMatches && scopedMatches.truncated) _backendTruncated = true;
           _scannedFiles += Number(scopedMatches?.scannedFiles) || 0;
+          // 远端没报扫描规模时，"没搜完" 这一条这里判断不了——要说出来，别让沉默
+          // 被读成「搜完了」。
+          if (scopedMatches && scopedMatches.scanScopeUnknown) _scanScopeUnknown = true;
         } catch (error) {
           searchErrors.push(`${searchRoot}: ${String(error?.message || error).slice(0, 180)}`);
           continue;
@@ -55653,9 +55730,9 @@ async function _executeToolStepInner(step, call, root, run) {
       res.textContent = fileMatches.length ? `${hits} 处匹配${searchErrors.length ? " · 部分范围失败" : ""}` : (searchErrors.length ? "无匹配 · 部分范围失败" : "无匹配");
       const _body = blocks.join("\n\n");
       vp.innerHTML = `<pre>${_escHtml((_body || "(无匹配)") + partialNote)}</pre>`;
-      return { type: "search", path: call.path, content: (blocks.length ? `搜索 "${q}" — ${summary}:\n${_redactSecrets(_body)}` : `搜索 "${q}"：${_backendTruncated ? "**这次没搜完**（触到后端的命中数/扫描文件数上限就停了），所以「没找到」不等于「不存在」——缩小到具体目录再搜一次。" : ""}在已扫描的范围里无匹配。${_remote.active
-        ? "当前工作区在**远程主机**上，这次搜索由远端代理执行，它的扫描范围以那台机器上的实现为准，这里说不准跳过了什么。"
-        : "跳过的只有几个具名的构建/缓存目录（.git、.next、.venv、.gradle、.idea、.vscode、node_modules、target 这类）——**点开头的文件照常搜**（.env、.eslintrc、.gitignore、.prettierrc 都在扫描范围里），**.github 也照常搜**。所以「没找到」多半是关键词不对，不是范围不够"}：换关键词、用 semantic_search 按语义找、或 find_files 按文件名找。`) + partialNote };
+      return { type: "search", path: call.path, content: (blocks.length ? `搜索 "${q}" — ${summary}${_scanScopeUnknown ? "（远端没报扫描规模，**判断不了这次搜完没有**——别按「这就是全部」下结论）" : ""}:\n${_redactSecrets(_body)}` : `搜索 "${q}"：${_backendTruncated ? "**这次没搜完**（触到后端的命中数/扫描文件数上限就停了），所以「没找到」不等于「不存在」——缩小到具体目录再搜一次。" : ""}在已扫描的范围里无匹配。${_remote.active
+        ? `当前工作区在**远程主机**上，这次搜索由远端代理执行，它的扫描范围以那台机器上的实现为准，这里说不准跳过了什么。${_scanScopeUnknown ? "远端也没报扫描规模，所以「搜完了」还是「没搜完」这里同样判断不了。" : ""}`
+        : "好消息是**点开头的文件照常搜**（.env、.eslintrc、.gitignore、.prettierrc 都在扫描范围里），**.github 也照常搜**。但扫描确实会静默跳过这些：构建/缓存目录（.git、.next、.venv、.gradle、.idea、.vscode、node_modules、target、dist、build、out、vendor、coverage、Pods、venv、__pycache__）、**符号链接**（文件和目录都跳，monorepo/pnpm 的 workspace 链接整棵树都不在内）、**大于 2MB 的文件**、含 NUL 字节的二进制、以及**非 UTF-8 编码**的文件（GBK/Latin-1 的老代码整份搜不到）。所以先换关键词再试；如果目标可能落在上面任何一类里，直接 read_file 指名读"}：换关键词、用 semantic_search 按语义找、或 find_files 按文件名找。`) + partialNote };
 
     } else if (call.type === "find") {
       const requestedPattern = call.pattern || call.path || "";
@@ -57452,7 +57529,7 @@ async function _executeToolStepInner(step, call, root, run) {
             // 真正不出现的是**没合并进来**的分支。原来那句「别的分支上的提交不会出现在
             // 这里」在有过合并的分支上是假话，而这个仓库天天在合并。
             + `（这是 HEAD 的祖先链：已经合并进来的分支，它们的提交也在其中；\n`
-            + `　没有合并进来的分支上的提交才不会出现。要跨分支找请指名那条分支。）：\n`;
+            + `　没有合并进来的分支上的提交才不会出现。要看别的分支，git_log 没有分支参数，用 run_cmd 跑 \`git log <分支名> --oneline -20\`。）：\n`;
           res.className = "atc-result atc-result--ok"; res.textContent = `${entries.length} 条提交`;
           if (vp) vp.innerHTML = `<pre>${_escHtml(lines.join("\n") || "(无提交)")}</pre>`;
           return { type: "git", path: "log", content: (lines.length ? _logHead + lines.join("\n") : "(无提交历史)") + gitRerootNote };
@@ -57803,8 +57880,14 @@ async function _executeToolStepInner(step, call, root, run) {
               // 不是对合并后的数组。`--jq '.[30:]'` 于是变成「每页各跳过 30 条」，切出来的根本不是
               // 你要的那批（40 条评论分两页时，第二页只有 10 条，`.[30:]` 直接给空数组）。
               // 单页 per_page=100 就没有这个问题；超过 100 条再加 &page=2。
-              + `（**别加 --paginate**——加了之后 jq 是按每一页分别作用的，切出来的不是这一批；`
-              + `评论超过 100 条时在 URL 里加 &page=2。）\n${formatted}`
+              + `（**别加 --paginate**——加了之后 jq 是按每一页分别作用的，切出来的不是这一批。`
+              // 「加 &page=2」这句话上一版是**错的**：`.[N:]` 是全局偏移，作用到第 2 页的数组上
+              // 就变成「跳过第 2 页的前 N 条」，评论 101..100+N 静默消失，模型第二次又拿到一份
+              // 不全的清单还以为看完了——正是这条修复要治的病。实测（cli/cli labels，两页）：
+              // `?per_page=50&page=2 --jq 'length'` 得 32，同 URL 加 `.[12:]` 只剩 20。
+              // 翻页时偏移必须归零：换成 `--jq '.[]'`，或干脆不带 jq。
+              + `评论超过 100 条时翻第二页：\`gh api "repos/{owner}/{repo}/pulls/${call.number}/comments?per_page=100&page=2"\`，`
+              + `**翻页时不要再带 .[N:]**——那个 N 是从第一页数起的偏移，套到第二页就会把开头 N 条也跳掉。）\n${formatted}`
             : `PR #${call.number} review 评论 (${arr.length}):\n${formatted}` };
         }
         if (call.op === "pr_reply") {
@@ -58605,10 +58688,21 @@ return { type: call.type, path: call.query || "", content: `[失败] ${call.type
       // 是抓包恢复路径明说的用法（logic.test.mjs 那条 CONFIGURE_BACKGROUND_PROXY 钉着）。
       const _BM_CHECKS = new Set(["manual", "capture", "file", "command", "url", "port"]);
       const _BM_NEEDS_PATTERN = new Set(["file", "command", "url", "port"]);
-      if (!_BM_CHECKS.has(bmType) || (_BM_NEEDS_PATTERN.has(bmType) && !bmPat)) {
+      // 光判「空不空」不够。轮询里还有第二道**隐形**闸门：
+      //   port  → `const port = bmPat.replace(/[^0-9]/g,""); if (port) { …lsof… }`
+      //   url   → http_request(bmPat)，不是 http(s) 开头每次都抛、被 catch 吃掉
+      // 于是 pattern 写成一句话（这道修复自己点名的高发场景）时，闸门放行、卡片显示
+      // 「已检查 N 次」、300 秒后回一句超时——一次 lsof / 一次请求都没真正成立过。
+      // 判据前移到这里：形状不对就当场说，别用 300 秒换一个假答案。
+      const _bmPatternIssue = !bmPat ? ""
+        : bmType === "port" && !/\d/.test(bmPat) ? `port 的 pattern 要的是端口号，而「${bmPat.slice(0, 60)}」里一个数字都没有`
+        : bmType === "url" && !/^https?:\/\//i.test(bmPat.trim()) ? `url 的 pattern 要的是完整地址（http:// 或 https:// 开头），而这次给的是「${bmPat.slice(0, 60)}」`
+        : "";
+      if (!_BM_CHECKS.has(bmType) || (_BM_NEEDS_PATTERN.has(bmType) && !bmPat) || _bmPatternIssue) {
         // 这里还没走到 _registerRunInteraction，没有东西要释放；_bmRelease 也还在 TDZ 里。
         res.className = "atc-result atc-result--err"; res.textContent = "条件没法检查";
-        const _why = !_BM_CHECKS.has(bmType)
+        const _why = _bmPatternIssue ? `${_bmPatternIssue}。把条件本身写进 pattern，别写成一句话。`
+          : !_BM_CHECKS.has(bmType)
           ? `check_type 收到的是「${String(bmType).slice(0, 120)}」，不是可检查的类型。`
             + `注意入参归一会把 condition / check / condition_type 都并进 check_type——`
             + `如果你写的是一整句自然语言，它就原样变成了这里的 check_type。`
@@ -58753,7 +58847,7 @@ return { type: call.type, path: call.query || "", content: `[失败] ${call.type
                   ? `netstat -ano | findstr /R /C:":${port} .*LISTENING"`
                   : `lsof -nP -iTCP:${port} -sTCP:LISTEN -t 2>/dev/null`;
                 const r = await backend.taskRunCapture(bmCwd, cmd, { timeoutSecs: 5 });
-                if (r && r.code === 0 && (r.stdout || "").trim()) _bmFinish("done", `端口 ${bmPat} 已监听`, `[background_monitor 结果] 端口 ${bmPat} 已被监听（PID: ${(r.stdout || "").trim().split("\\n")[0]}），继续执行。`);
+                if (r && r.code === 0 && (r.stdout || "").trim()) _bmFinish("done", `端口 ${bmPat} 已监听`, `[background_monitor 结果] 端口 ${bmPat} 已被监听（PID: ${(r.stdout || "").trim().split("\n")[0]}），继续执行。`);
               }
             } catch {}
           }

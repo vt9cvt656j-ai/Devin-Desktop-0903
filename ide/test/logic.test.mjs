@@ -2492,7 +2492,7 @@ test("the approval gate is real, reachable, and exposed in settings", () => {
 // Behavioural cover for the gate itself. The dangerous-command path must ask in EVERY
 // permission mode — that is the boundary that turns "a repo file told the model to run
 // this" into a question rather than an execution.
-test("dangerous commands are gated in auto mode; ordinary tools are not", async () => {
+test("auto 档一个都不问（高危也不问）；approve 才是那道门", async () => {
   const asked = [];
   const mk = (decision, perm) => load("_approveToolCall", {
     _dbCallIsDestructive: () => false,
@@ -2518,18 +2518,24 @@ test("dangerous commands are gated in auto mode; ordinary tools are not", async 
   const ls = { type: "cmd", command: "ls -la" };
   const write = { type: "write", path: "a.js" };
 
-  // auto mode: ordinary tools run untouched, the dangerous one still asks
-  assert.equal(await mk("once", "auto")(ls), true);
-  assert.equal(await mk("once", "auto")(write), true);
-  assert.equal(asked.length, 0, "auto mode must not interrupt ordinary work");
-  assert.equal(await mk("once", "auto")(rm), true, "allowing runs it");
-  assert.equal(asked.length, 1, "…but it had to ask first");
-  assert.equal(await mk("deny", "auto")(rm), false, "declining blocks it");
+  // auto 是默认档，现在**一个都不问**——高危也不问。
+  //
+  // 这条契约以前不是这样：auto 下高危仍然会弹框。用户明确要求改掉，理由是
+  // 那让默认状态变成一个走两步就停下等人点的智能体。判据现在只有一条：
+  // 他有没有主动打开「改动前审批」。所以这里断言的是「一次都不弹」，
+  // 只要有一处漏判，默认体验就又变回走走停停。
+  for (const call of [ls, write, rm]) {
+    assert.equal(await mk("deny", "auto")(call), true,
+      `auto 档下 ${call.type} 应当直接放行（连对话框都不该造出来，所以 deny 也不影响）`);
+  }
+  assert.equal(asked.length, 0, `auto 档下一个框都不该弹，实际弹了 ${asked.length} 次`);
 
-  // approve mode additionally gates every state-changing tool
+  // approve 才是那道门：状态变更类工具和高危命令都要问。
   asked.length = 0;
   assert.equal(await mk("deny", "approve")(write), false);
   assert.equal(asked.length, 1, "approve mode asks before a write");
+  assert.equal(await mk("once", "approve")(rm), true, "approve 档下高危问过之后照样能放行");
+  assert.equal(asked.length, 2, "高危在 approve 档下必须问");
 });
 
 // Every green run ended with two adjacent lines that contradicted each other:
@@ -3057,10 +3063,12 @@ test("configured rules run ahead of every other check in the gate", async () => 
   assert.equal(await gate({ ...none, allow: ["Bash(rm -rf /)"] })({ type: "cmd", command: "rm -rf /" }), true);
   assert.equal(asked, 0);
 
-  // ask forces a prompt even in auto mode for something otherwise unremarkable
+  // ask 规则现在**只在授权模式下**才弹框。auto 是默认档，用户要的是它一个都不问，
+  // 而 ask 规则可能来自 clone 来的仓库——开关是用户本人的决定，比仓库带来的策略更权威。
+  // deny 不受影响（上面那条），它是静默硬停，不是询问。
   asked = 0;
   assert.equal(await gate({ ...none, ask: ["Write(src/**)"] })({ type: "write", path: "src/a.ts" }), true);
-  assert.equal(asked, 1, "an ask rule prompts even when the mode would not");
+  assert.equal(asked, 0, "auto 档下 ask 规则也不弹——判据只有「有没有开授权模式」");
 
   // a broken rules load must fail OPEN to the normal policy, not lock the IDE up
   asked = 0;
@@ -3202,15 +3210,17 @@ test("session approval is remembered per exact call, not per tool", async () => 
   assert.equal(asks, 2, "a DIFFERENT npm command must ask on its own");
 });
 
-// No DOM means nobody can answer. A dangerous command must not slip through by default.
-test("with no dialog available the gate denies dangerous commands and allows the rest", async () => {
-  const gate = (dangerous) => load("_approveToolCall", {
+// 没有 DOM 就没人能回答。但 auto 档现在压根不问，所以这条只在**授权模式**下才成立：
+// 用户主动打开了那道门，却没有能回答的界面，那就只能拒——不能因为界面缺席就
+// 把他打开的门当没打开。auto 档下无论危不危险都直接放行，一次都不问。
+test("授权模式下没有界面可问就拒；auto 档下压根不问", async () => {
+  const gate = (dangerous, perm = "approve") => load("_approveToolCall", {
     _dbCallIsDestructive: () => false,
     _callIsDestructive: () => dangerous,
     _callIsReadOnlyCommand: () => false,
     _loadPermissionRules: async () => ({ allow: [], ask: [], deny: [] }),
     _permissionRuleVerdict: () => "",
-    _currentAiPerm: "auto",
+    _currentAiPerm: perm,
     _requiresApproval: () => false,
     _approvalKey: () => "k",
     _approvalLabel: () => ({ title: "t", detail: "d" }),
@@ -3218,8 +3228,12 @@ test("with no dialog available the gate denies dangerous commands and allows the
     _toolApprovalDialog: async () => { throw new Error("must not be reachable without a DOM"); },
     document: undefined,
   });
-  assert.equal(await gate(true)({ type: "cmd", command: "rm -rf /" }), false);
+  assert.equal(await gate(true)({ type: "cmd", command: "rm -rf /" }), false,
+    "开了授权模式却没有界面可问 —— 只能拒，不能当成没开");
   assert.equal(await gate(false)({ type: "read", path: "a.js" }), true);
+  // auto 档：一个都不问，所以没有 DOM 也无所谓，高危照样放行。
+  assert.equal(await gate(true, "auto")({ type: "cmd", command: "rm -rf /" }), true,
+    "auto 档下不该走到对话框那一步");
 });
 
 // A declined call must read as "never attempted", not as a tool that failed: that is what
@@ -15026,7 +15040,15 @@ test("remote search uses the active backend and preserves native file-match shap
       { line: 9, column: 8, text: "return NEEDLE", start: 7, end: 13 },
     ],
   });
-  assert.match(SRC, /backend\.searchInProject = \(root, query, cs, mode = "literal"\)[\s\S]{0,320}_groupRemoteSearchHits/);
+  // 钉的是**性质**：远程分支要路由到 _groupRemoteSearchHits，并且把截断信息带出来。
+  // （原来限了 320 字符的窗口，加两行注释就假红了。）
+  const _remoteBranch = SRC.slice(
+    SRC.indexOf('backend.searchInProject = (root, query, cs, mode = "literal")'),
+    SRC.indexOf("_local.searchInProject(root, query, cs, mode)"));
+  assert.ok(_remoteBranch.length > 100, "远程搜索那条分支不见了");
+  assert.match(_remoteBranch, /_groupRemoteSearchHits/);
+  assert.match(_remoteBranch, /_hits\.truncated = !!j\?\.truncated/,
+    "远程搜索没把截断标志带出来 —— 那边「没搜完」永远不会触发");
   const inner = extractFn("_executeToolStepInner");
   assert.match(inner, /const searchScopes = _independentFsPaths\(_relCandidates\(requestedScope, root\)\)/,
     "Agent search must resolve the same multi-root candidates as read_file and list_dir");
@@ -31248,6 +31270,34 @@ test("read_logs 点名的终端没匹配上，不许把别人的日志当成它�
   assert.equal(!!_toolFailureMatch(miss), false,
     "抬头被判成工具失败了——其它日志真读到了，报失败等于把有产出的调用抹成零产出");
 
+  // 根目录里的 .log/.out/.err 也要能找到。原来根目录只比对 10 个写死的名字，
+  // 于是躺着 backend.log / worker.out / test.err 时一个都看不见，回执却写
+  // 「工作区常见日志位置也没有 .log/.out/.err 可读」。
+  const cands = load("_workspaceLogCandidates", {
+    rootPath: "", workspaceRoots: [],
+    backend: { readDir: async (p) => (p === "/w"
+      ? [{ name: "backend.log", is_dir: false, path: "/w/backend.log" },
+         { name: "worker.out", is_dir: false, path: "/w/worker.out" },
+         { name: "README.md", is_dir: false, path: "/w/README.md" }]
+      : Promise.reject(new Error("no"))) },
+    _coherentFilePath: (x) => x,
+    _pathIdentity: (x) => x,
+    _looksLikeLogFileName: (n) => /\.(log|out|err)$/i.test(n),
+  });
+  const found = await cands("/w", 8);
+  assert.deepEqual(found, ["/w/backend.log", "/w/worker.out"],
+    "根目录里的 .log/.out/.err 找不到 —— 而回执会说「也没有 .log/.out/.err 可读」");
+
+  // 没有工作区 = 一次目录都没扫，不能说成「扫过、没有」。
+  const noWs = load("_agentReadLogs", {
+    _terminalLogChunks: () => [], _formatAgentTerminalLines: () => [],
+    _looksLikeLogFileName: () => true, _workspaceLogCandidates: async () => [],
+    _readLogTailForAgent: async () => ({ error: "x" }),
+    rootPath: "", workspaceRoots: [],
+  });
+  const blind = await noWs({ name: "worker" }, "", null);
+  assert.match(blind, /一次目录都没扫/, "没打开工作区时把「没扫」说成了「没有」");
+
   // 什么都没读到时，也要说是「名字没匹配上」，不是笼统的「没有日志」。
   const empty = load("_agentReadLogs", {
     _terminalLogChunks: () => [],
@@ -31291,6 +31341,25 @@ test("background_monitor：检查不了的条件必须当场说，别用 300 秒
   assert.match(blocked.content, /condition/, "没点破是 condition 被并进 check_type 的");
   assert.match(blocked.content, /port|url|command/, "没给出可用的 check_type，模型无从改口");
   assert.equal(blocked.failure.attempted, false, "一次都没检查，不能报成尝试过");
+
+  // pattern 非空但**形状不对**，同样是「说开始等了，一次都没检查」：
+  // 轮询里还有第二道隐形闸门——port 会 `bmPat.replace(/[^0-9]/g,"")` 后 `if (port)`，
+  // url 会拿 pattern 去 http_request，不是 http(s) 开头每次都抛并被 catch 吃掉。
+  for (const [t, pat, want] of [
+    ["port", "the dev server port", /一个数字都没有/],
+    ["port", "3000", null],
+    ["url", "localhost 那个页面", /http:\/\/ 或 https:\/\/ 开头/],
+    ["url", "http://127.0.0.1:3000/health", null],
+  ]) {
+    const r = check(call({ message: "等", check_type: t, pattern: pat }));
+    if (want) {
+      assert.ok(r, `check_type=${t} 的 pattern 形状不对（${pat}），却被放行去空等`);
+      assert.match(r.content, want);
+      assert.match(r.content, /别写成一句话/);
+    } else {
+      assert.equal(r, null, `check_type=${t} 写对了却被拦（${pat}）`);
+    }
+  }
 
   // 类型对但 pattern 空：file/command/url/port 四条分支都带 `&& bmPat`，同样一条都不进。
   for (const t of ["file", "command", "url", "port"]) {
@@ -31424,6 +31493,13 @@ test("git_log 只看当前分支，并且说清是哪条分支", () => {
   assert.match(out.content, /HEAD 的祖先链/, "没说清范围，模型会以为这是全仓最近的提交");
   assert.match(out.content, /已经合并进来的分支，它们的提交也在其中/,
     "把「不含其它分支」说死了 —— 合并进来的分支提交明明在里面");
+  // 上一版写的是「要跨分支找请指名那条分支」，可 git_log 的 schema 只有 count 一个参数，
+  // 映射层也只读 args.count——模型照着发 git_log({branch:"x"}) 会拿到一模一样的结果，
+  // 而且不知道自己的参数被丢了。给一条真能跑的路。
+  assert.doesNotMatch(out.content, /指名那条分支/,
+    "又教模型给 git_log 传分支参数了 —— 它没有这个参数，会被静默丢掉");
+  assert.match(out.content, /git_log 没有分支参数/, "没说清这个工具看不了别的分支");
+  assert.match(out.content, /git log <分支名> --oneline/, "没给出真能跑的替代路");
   assert.doesNotMatch(out.content, /别的分支上的提交不会出现在这里/,
     "又把那句在有合并时不成立的话写回去了");
   assert.match(out.content, /abc1234 fix/);
@@ -31478,6 +31554,13 @@ test("gh_pr_review_comments：抬头的条数必须是正文里真有的条数",
     "又把 --paginate 和 --jq 写在一起了 —— jq 会按页作用，切出来不是这一批");
   assert.match(big.content, /per_page=100/, "没有单页取，切片就没有意义");
   assert.match(big.content, /别加 --paginate/, "没警告这个坑，模型很容易自己加回去");
+  // 翻页那句上一版是错的：`.[N:]` 是从第一页数起的**全局偏移**，套到第二页就变成
+  // 「跳过第 2 页的前 N 条」，评论 101..100+N 静默消失。实测（cli/cli labels，两页）：
+  // `?per_page=50&page=2 --jq 'length'` 得 32，同 URL 加 `.[12:]` 只剩 20。
+  assert.match(big.content, /翻页时不要再带 \.\[N:\]/,
+    "教了翻页却没说偏移要归零 —— 模型第二页会再漏掉一批，还以为看完了");
+  assert.doesNotMatch(big.content, /加 &page=2。）/,
+    "又把「超过 100 条加 &page=2」单独甩出来了 —— 不配上「偏移归零」它就是错的");
   assert.match(big.content, /别按「都看完了」下结论/);
 
   // 30 条上限也要走同一条抬头。
@@ -31553,6 +31636,22 @@ test("送给模型的图必须先消毒：SVG 要栅格化，送不进去的要�
   assert.deepEqual(remote.content[1], { type: "image_url", image_url: { url: "https://example.test/a.png" } },
     "http 图片地址被消毒吞了 —— 它本来能用");
   assert.doesNotMatch(remote.content[0].text, /没能转成模型可读的格式/);
+
+  // 纯文本模型那条路原来另起一个 lead，把调用方的 leadText 连同丢弃提示一起丢掉：
+  // 5 张掉 2 张时模型收到「我已把 3 张图转写成文字」，一个字不提缺失。
+  const textOnly = load("_buildImageFeedback", {
+    _modelSeesImages: () => false,
+    _downscaleImageForVision: async (u) => (u.startsWith("data:image/svg+xml") ? "" : u),
+    _describeImageForTextModel: async () => "（转写内容）",
+  });
+  const mixedText = await textOnly(
+    ["data:image/png;base64,AAA", "data:image/svg+xml;base64,BBB"], { model: "m" }, "这是刚才截的图", "hint");
+  assert.equal(typeof mixedText.content, "string");
+  assert.match(mixedText.content, /有 1 张图没能转成模型可读的格式/,
+    "纯文本模型这条路把丢弃提示丢了 —— 模型不知道自己少看了图");
+  assert.match(mixedText.content, /这是刚才截的图/,
+    "调用方说明图片是什么的那段也一起没了");
+  assert.match(mixedText.content, /转写成文字/);
 
   const none = await build(["data:image/svg+xml;base64,BBB"], { model: "m" }, "看图", "hint");
   assert.equal(typeof none.content, "string");
