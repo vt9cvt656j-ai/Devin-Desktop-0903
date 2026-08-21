@@ -5519,6 +5519,7 @@ pub async fn codeberg_search(query: String, max_results: Option<u32>) -> Result<
         // 换浏览器 UA 即 200」）**正好反过来**——Codeberg 现在改成拦「伪装成浏览器的
         // API 客户端」了。当初为了修 codeberg 加的那条全局 UA，如今是它唯一挂掉的原因。
         // 不动全局 UA（十几个工具共用），只在这里覆盖，做法和 infoq_search 一致。
+        .header(reqwest::header::USER_AGENT, "Michael-IDE/1.0")
         .query(&[("q", query), ("sort", "stars"), ("limit", &n.to_string())])
         .send()
         .await
