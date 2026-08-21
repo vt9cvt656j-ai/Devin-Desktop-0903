@@ -340,6 +340,10 @@ const _autoAiFailureKind = load("_aiFailureKind", { _aiStatusFromMessage: _autoA
 AUTO_LOAD_DEPS = {
   _aiStatusFromMessage: _autoAiStatusFromMessage,
   _aiFailureKind: _autoAiFailureKind,
+  // 无人值守标志。审批门现在会先看它：定时任务撞上需要确认的操作时不弹框傻等
+  // （那个 promise 没有计时器，没人在电脑前就是永久挂起），而是如实拒绝并说明。
+  // 这里给 false＝有人在场，所以下面所有审批门的断言量的仍然是有人时的行为。
+  _unattendedRun: false,
   // 审批门现在按**这一次调用**判定（browser 的 needsApproval 是个函数：看页面不弹框，
   // 替用户按按钮才弹）。用真实现，不用桩——桩会让"哪些动作要审批"这件事在测试里失真。
   needsApprovalFor: toolPolicy.needsApprovalFor,
@@ -31337,19 +31341,30 @@ test("git_log 只看当前分支，并且说清是哪条分支", () => {
                         SRC.indexOf('} else if (call.op === "commit") {'));
   assert.doesNotMatch(seg, /all:\s*true/, "智能体这条路把 --all 又打开了");
   const body = seg.slice(seg.indexOf("const lines = entries.map"));
-  const run = (entries, branch) => new Function(
-    "entries", "n", "res", "vp", "_escHtml", "gitBranchNameEl", "gitRerootNote", body,
-  )(entries, 20, {}, null, (x) => x, { textContent: branch }, "");
+  const run = (entries) => new Function(
+    "entries", "n", "res", "vp", "_escHtml", "gitRerootNote", body,
+  )(entries, 20, {}, null, (x) => x, "");
+  const mk = (refs) => [{ short_hash: "abc1234", message: "fix", author: "t", date: "1h ago", refs }];
 
-  const e = [{ short_hash: "abc1234", message: "fix", author: "t", date: "1h ago", refs: [] }];
-  const out = run(e, "tool-config-cleanup");
+  // 分支名从**这次结果自己**认（%D 里的 `HEAD -> <分支>`），不读那个全局 DOM 节点：
+  // 那个节点跟着 rootPath 走，而这里记录的是 gitExecRoot——重定位过、多工作区、
+  // 子智能体、或 refreshGitStatus 被丢弃时，它显示的是另一个仓库或切换前的分支。
+  const out = run(mk(["HEAD -> tool-config-cleanup", "origin/main"]));
   assert.match(out.content, /分支 tool-config-cleanup/, "没点名分支——并行开着别人分支时这份清单没有意义");
   assert.match(out.content, /不含其它分支/, "没说清范围，模型会以为这是全仓最近的提交");
   assert.match(out.content, /abc1234 fix/);
 
-  // 分支名读的是 git 面板那个 DOM 节点，"—" 是它的空态占位，不能当成分支名印出去。
-  assert.match(run(e, "—").content, /当前分支的最近/);
-  assert.equal(run([], "main").content, "(无提交历史)", "没有提交时别硬扣一个抬头");
+  // 游离 HEAD 要照实说，不能硬安一个分支名。
+  assert.match(run(mk(["HEAD", "main"])).content, /游离 HEAD的最近/);
+  // 顶端没有任何装饰时，只说「当前分支」，不猜。
+  assert.match(run(mk([])).content, /当前分支的最近/);
+  assert.equal(run([]).content, "(无提交历史)", "没有提交时别硬扣一个抬头");
+
+  // 不许再回去读全局 DOM 节点。**先剥注释**——上面那段注释里就点名提到它，
+  // 不剥的话这条负向断言会被注释喂饱（今天已经踩过三次同一个坑）。
+  const codeOnly = body.split("\n").filter((l) => !l.trim().startsWith("//")).join("\n");
+  assert.doesNotMatch(codeOnly, /gitBranchNameEl/,
+    "分支名又去读那个全局 DOM 节点了 —— 它可能是另一个仓库的");
 });
 
 // gh_pr_review_comments 的抬头报 arr.length（--paginate 会取全），正文却先 slice(0,30)

@@ -300,14 +300,12 @@ pub fn git_status(root: String) -> Result<GitStatus, String> {
         &["-c", "core.quotepath=false", "status", "--porcelain=v1"],
     )?;
     if !status_out.status.success() {
+        // 和 stash 那四处同一个形状：只看 stderr，stdout 里的东西被整个扔掉。
         let err = String::from_utf8_lossy(&status_out.stderr)
             .trim()
             .to_string();
-        return Err(if err.is_empty() {
-            "git status failed".into()
-        } else {
-            err
-        });
+        let text = String::from_utf8_lossy(&status_out.stdout).trim().to_string();
+        return Err(git_failure_text(&text, &err, "git status failed"));
     }
 
     let root_path = PathBuf::from(&root);
@@ -413,11 +411,8 @@ pub fn git_diff(root: String, rel: Option<String>, staged: Option<bool>) -> Resu
                     .into(),
             );
         }
-        Err(if err.is_empty() {
-            "git diff failed".into()
-        } else {
-            err
-        })
+        let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        Err(git_failure_text(&text, &err, "git diff failed"))
     }
 }
 
@@ -917,11 +912,8 @@ pub fn git_branches(root: String) -> Result<GitBranches, String> {
     let out = run_git(&root, &["branch", "--format=%(refname:short)"])?;
     if !out.status.success() {
         let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
-        return Err(if err.is_empty() {
-            "git branch failed".into()
-        } else {
-            err
-        });
+        let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        return Err(git_failure_text(&text, &err, "git branch failed"));
     }
     let branches = String::from_utf8_lossy(&out.stdout)
         .lines()
@@ -1754,6 +1746,48 @@ mod git_show_tests {
 mod git_failure_text_tests {
     use super::git_failure_text;
 
+    /// 函数写对了但没接上，等于没写。实测：把 git_stash_pop 那处接线退回
+    /// `if err.is_empty() { … } else { err }`，455 个测试全绿——守卫测的是 helper 的
+    /// 纯逻辑，覆盖不到「四个失败分支有没有用它」。
+    #[test]
+    fn all_four_stash_failure_branches_are_wired() {
+        let src = include_str!("git.rs");
+        let code: String = src
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap_or(src)
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//") && !l.trim_start().starts_with("///"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        for fallback in [
+            "git stash push failed",
+            "git stash pop failed",
+            "git stash apply failed",
+            "git stash drop failed",
+        ] {
+            assert!(
+                code.contains(&format!("git_failure_text(&text, &err, \"{fallback}\")")),
+                "「{fallback}」那条失败分支没走 git_failure_text —— stdout 里的冲突报告会被整个扔掉"
+            );
+        }
+        // 而且不许再出现「只看 err、扔掉 stdout」的老形状。
+        // 收窄到「扔掉 stdout」那个确切形状：`Err(if err.is_empty() { … })`。
+        // run_git_checked 里的 `let msg = if err.is_empty() { …stdout… }` 是对的
+        // ——它 stderr 空时会退回 stdout，不在此列。
+        assert!(
+            !code.contains("Err(if err.is_empty() {"),
+            "又有分支退回了「err 为空就用兜底文案」—— 那正是把 stdout 整个扔掉的写法"
+        );
+        // 这条 bug 不止 stash 有：git_status / git_diff / git_branches 当初是同一个形状。
+        for fallback in ["git status failed", "git diff failed", "git branch failed"] {
+            assert!(
+                code.contains(&format!("git_failure_text(&text, &err, \"{fallback}\")")),
+                "「{fallback}」这条也会把 stdout 扔掉 —— 同一个形状，一起修的"
+            );
+        }
+    }
+
     /// `git stash pop` 撞冲突：退出码 1，冲突报告全在 stdout，stderr 空。
     /// 原来的 `if err.is_empty() { fallback } else { err }` 把它整个扔掉。
     #[test]
@@ -1782,6 +1816,67 @@ mod git_failure_text_tests {
     fn both_streams_are_kept_and_a_silent_failure_still_says_something() {
         assert_eq!(git_failure_text("out", "err", "fallback"), "out\nerr");
         assert_eq!(git_failure_text("", "", "fallback"), "fallback");
+    }
+}
+
+#[cfg(test)]
+mod git_log_behaviour_tests {
+    /// 源码 grep 挡不住「空 if + 无条件 push」这种**等价于旧 bug** 的变体——
+    /// 实测：那么改一遍，455 个测试全绿。所以这条跑真 git。
+    fn sh(dir: &std::path::Path, args: &[&str]) {
+        let out = std::process::Command::new("git")
+            .current_dir(dir)
+            .args(args)
+            .output()
+            .expect("git 跑不起来");
+        assert!(
+            out.status.success(),
+            "git {args:?} 失败: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    #[test]
+    fn defaults_to_the_current_branch_and_all_is_opt_in() {
+        let dir = std::env::temp_dir().join(format!("mrday-gitlog-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        sh(&dir, &["init", "-q", "-b", "main"]);
+        sh(&dir, &["config", "user.email", "t@t"]);
+        sh(&dir, &["config", "user.name", "t"]);
+        std::fs::write(dir.join("a.txt"), "a").unwrap();
+        sh(&dir, &["add", "."]);
+        sh(&dir, &["commit", "-qm", "main-1"]);
+        sh(&dir, &["checkout", "-q", "-b", "side"]);
+        std::fs::write(dir.join("b.txt"), "b").unwrap();
+        sh(&dir, &["add", "."]);
+        sh(&dir, &["commit", "-qm", "side-only"]);
+        sh(&dir, &["checkout", "-q", "main"]);
+
+        let root = dir.to_string_lossy().to_string();
+        let mine = super::git_log(root.clone(), Some(20), None).expect("git_log 失败");
+        let subjects: Vec<&str> = mine.iter().map(|e| e.message.as_str()).collect();
+        assert!(
+            !subjects.contains(&"side-only"),
+            "默认就带上了别的分支的提交：{subjects:?} —— 模型会挑一个根本不是 HEAD 祖先的提交去推理"
+        );
+        assert!(subjects.contains(&"main-1"), "当前分支自己的提交反而没了：{subjects:?}");
+
+        let all = super::git_log(root.clone(), Some(20), Some(true)).expect("git_log(all) 失败");
+        let all_subjects: Vec<&str> = all.iter().map(|e| e.message.as_str()).collect();
+        assert!(
+            all_subjects.contains(&"side-only"),
+            "显式要 all 也拿不到别的分支——分支图会退化成一条直线：{all_subjects:?}"
+        );
+
+        // 第一条的 refs 必须带 `HEAD -> <分支>`：前端靠它报分支名（比读全局 DOM 节点准）。
+        assert!(
+            mine[0].refs.iter().any(|r| r.contains("HEAD -> main")),
+            "HEAD 装饰没了，前端就没法从这份结果里认出分支：{:?}",
+            mine[0].refs
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
 
