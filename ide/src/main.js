@@ -42398,8 +42398,20 @@ function _commandStartsLongRunningServer(command) {
       if (tokens.includes("http.server") || tokens.includes("SimpleHTTPServer")) return true;
       if (rest.includes("manage.py") && tokens.includes("runserver")) return true;
     }
-    // 显式打开 watch 才算；--watch=false / --no-watch 不算
-    if (tokens.some((t) => /^--watch$/i.test(t) || /^-w$/.test(t))) return true;
+    // 显式打开 watch 才算；--watch=false / --no-watch 不算。
+    if (tokens.some((t) => /^--watch$/i.test(t))) return true;
+    // 裸 `-w` 只对**真的把它当 watch 用**的那几个命令成立。
+    //
+    // 原来是无条件 `/^-w$/`，于是这些秒回的命令全被判成「长跑服务」并拒绝执行：
+    //   grep -w alpha f.txt                          （--word-regexp）
+    //   curl -sS -o /dev/null -w '%{http_code}' URL  （--write-out，模型最常用的验证手段）
+    //   sort -w / comm -w / uniq -w …
+    // 而给出的替代路是「改用 run_in_terminal」——那是真 PTY，**拿不到退出码**，
+    // 恰好毁掉这类命令唯一的用处。deploy_site 那条自产管线里也带着 curl -w，
+    // 于是它在 `npm run build` 之前就被拦下，从来没有真正尝试过一次部署。
+    const WATCH_W_HEADS = new Set(["tsc", "jest", "vitest", "nodemon", "webpack", "rollup", "esbuild", "parcel", "sass", "tailwindcss", "cargo-watch", "watchexec"]);
+    if (tokens.some((t) => /^-w$/.test(t))
+      && (WATCH_W_HEADS.has(head) || (head === "npx" && WATCH_W_HEADS.has(String(tokens[1] || ""))))) return true;
   }
   return false;
 }

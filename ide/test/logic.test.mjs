@@ -31881,3 +31881,34 @@ test("符号/语义索引必须真的走进子目录——判目录看 is_dir，
       `${fn} 没走 _walkSourceFiles —— 修一处两个都好这条前提就不成立了`);
   }
 });
+
+// 裸 `-w` 被无条件当成 watch，于是这些秒回的命令全被判成「长跑服务」拒绝执行：
+//   grep -w（--word-regexp）、curl -w '%{http_code}'（--write-out，模型最常用的验证手段）、
+//   sort -w / comm -w。而给出的替代路是 run_in_terminal —— 真 PTY，**拿不到退出码**，
+//   恰好毁掉这类命令唯一的用处。deploy_site 的自产管线里也带着 curl -w，
+//   于是它在 npm run build 之前就被拦下，从来没有真正尝试过一次部署。
+test("秒回的 -w 命令不许被当成长跑服务拒掉", () => {
+  const isLong = load("_commandStartsLongRunningServer", {
+    _LONG_RUNNING_HEADS: loadConst("_LONG_RUNNING_HEADS"),
+    _LONG_RUNNING_PAIRS: loadConst("_LONG_RUNNING_PAIRS"),
+  });
+
+  for (const c of [
+    "grep -w alpha src/main.js",
+    "curl -sS -o /dev/null -w '%{http_code}' https://example.com",
+    "sort -u -w a.txt",
+    "comm -12 -w a b",
+    "uniq -w 8 log.txt",
+  ]) assert.equal(isLong(c), false, `秒回的命令被判成长跑服务了：${c}`);
+
+  // 真的 watch 照拦不误。
+  for (const c of [
+    "tsc -w", "jest -w", "vitest -w", "nodemon -w src", "npx tsc -w",
+    "vite --watch", "npm run dev", "webpack -w",
+  ]) assert.equal(isLong(c), true, `真的 watch/长跑没拦住：${c}`);
+
+  // --watch=false / --no-watch 不算（原有语义不能丢）。
+  // 注意别拿 vite 举例：它本身就在长跑名单里，加不加 --no-watch 都算长跑。
+  assert.equal(isLong("tsc --no-watch"), false);
+  assert.equal(isLong("jest --watch=false"), false);
+});

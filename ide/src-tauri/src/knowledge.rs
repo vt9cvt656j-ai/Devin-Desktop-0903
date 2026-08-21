@@ -300,9 +300,15 @@ fn url_query_component(value: &str) -> String {
 fn kclient() -> Result<Client, String> {
     Client::builder()
         .timeout(Duration::from_secs(30))
-        // 浏览器 UA。实测（2026-08-05）：codeberg.org 对 "Michael-IDE/1.0" 直接拒连（000），
-        // 换成下面这个 UA 即 200。多个公开 API 会按 UA 拦非浏览器客户端，自报家门在这里
-        // 没有收益，只有被拒的风险。
+        // 浏览器 UA。多个公开 API 会按 UA 拦非浏览器客户端，自报家门在这里没有收益。
+        //
+        // **注意：当初加它的那个理由已经反过来了。** 2026-08-05 的记录是
+        // 「codeberg.org 对 Michael-IDE/1.0 直接拒连（000），换浏览器 UA 即 200」；
+        // 而 2026-08-20 同机复测：curl/8.7.1 → 200、Michael-IDE/1.0 → 200、
+        // 浏览器 UA → **403**。Codeberg 改成拦「伪装成浏览器的 API 客户端」了。
+        // codeberg_search 因此在那一次请求上单独覆盖回 Michael-IDE/1.0。
+        // 这条注释留着是为了让下一个人别照旧记录把它改回去——按站点当时的行为定，
+        // 别按注释定。
         .user_agent("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
         .build()
         .map_err(|e| format!("HTTP client: {e}"))
@@ -3858,6 +3864,7 @@ pub async fn gitee_search(query: String, max_results: Option<u32>) -> Result<Str
     }
     let client = kclient()?;
     let n = max_results.unwrap_or(10).min(20);
+    let _started = std::time::Instant::now();
     let resp = client
         .get("https://gitee.com/api/v5/search/repositories")
         .query(&[
@@ -3882,7 +3889,22 @@ pub async fn gitee_search(query: String, max_results: Option<u32>) -> Result<Str
         .map_err(|e| format!("Gitee parse: {e}"))?;
     let arr = data.as_array().ok_or("Gitee: unexpected response")?;
     let retrieved = retrieved_at();
+    let elapsed_secs = _started.elapsed().as_secs_f64();
     if arr.is_empty() {
+        // 「200 + 空数组 + 耗时超过 8 秒」这个组合不是「没搜到」，是**接口挂了**。
+        //
+        // 实测（2026-08-20）：kubernetes / vue / spring / linux / 微服务 五个词全部
+        // HTTP 200、`[]`、12~13 秒；而同一时刻精确直查 /repos/mirrors/Kubernetes 正常，
+        // /search/users、/search/issues 未鉴权也能用，限流头也正常递减——就是仓库搜索
+        // 这个后端超时后返回空集。
+        // 报成 empty 的代价：模型读作「Gitee 上确实没有」，换个词再等 13 秒，再拿同一句。
+        if elapsed_secs >= 8.0 {
+            return Err(format!(
+                "Gitee 仓库搜索接口当前对**任何**查询词都返回空集（HTTP 200 + [] + 本次耗时 {elapsed_secs:.0} 秒，\
+                 实测多个常见词均如此）。这**不代表** Gitee 上没有该仓库——换查询词重试没有用。\
+                 改用 github_search，或已知 owner/repo 时直接用 gitee_repo 精确取。"
+            ));
+        }
         return Ok(format!(
             "Gitee repos for '{query}':\nretrieved_at: {retrieved}\nsearch_status: empty\nNo matching repositories were returned."
         ));
@@ -4748,7 +4770,14 @@ pub async fn awwwards_search(query: String, max_results: Option<u32>) -> Result<
     let n = max_results.unwrap_or(10).min(20) as usize;
     let resp = c
         .get("https://www.awwwards.com/websites/")
-        .query(&[("q", query)])
+        // 站点认的是 `text=`，不是 `q=`。
+        //
+        // 实测（2026-08-20）：`?q=restaurant`、`?q=agency` 和**不带参数**抓到的
+        // slug 列表逐条相同（oimachi / cipher / likova / michael-gatt…）——`q` 被
+        // 整个忽略，返回的永远是首页那批精选。而 `?text=restaurant` 立刻变成
+        // pier88-coast-by-monarq / studenterkilden / supreme-luxury。
+        // 换句话说这个工具此前对任何查询词都返回同一份榜单，抬头还写着「for '<查询词>'」。
+        .query(&[("text", query)])
         .header("Accept", "text/html")
         .send()
         .await
@@ -5480,6 +5509,16 @@ pub async fn codeberg_search(query: String, max_results: Option<u32>) -> Result<
     let n = max_results.unwrap_or(10).min(25) as usize;
     let resp = c
         .get("https://codeberg.org/api/v1/repos/search")
+        // 这一次请求上**覆盖** kclient() 的全局浏览器 UA。
+        //
+        // 实测（2026-08-20，同机同时刻）：
+        //   curl/8.7.1        → 200
+        //   Michael-IDE/1.0   → 200
+        //   Chrome 浏览器 UA   → 403
+        // 和 kclient() 里那条注释（2026-08-05：「codeberg 对 Michael-IDE/1.0 直接拒连，
+        // 换浏览器 UA 即 200」）**正好反过来**——Codeberg 现在改成拦「伪装成浏览器的
+        // API 客户端」了。当初为了修 codeberg 加的那条全局 UA，如今是它唯一挂掉的原因。
+        // 不动全局 UA（十几个工具共用），只在这里覆盖，做法和 infoq_search 一致。
         .query(&[("q", query), ("sort", "stars"), ("limit", &n.to_string())])
         .send()
         .await
@@ -5489,6 +5528,12 @@ pub async fn codeberg_search(query: String, max_results: Option<u32>) -> Result<
         return Err("Codeberg rate limited (HTTP 429)".into());
     }
     if !status.is_success() {
+        // 403 在这里几乎总是 UA 被拦，不是限流也不是缺 token。说死，别让模型换词重试。
+        if status.as_u16() == 403 {
+            return Err("Codeberg 返回 403：它拦的是「伪装成浏览器 UA 的 API 客户端」，\
+                 不是限流、也不需要 token。这条请求应当带 Michael-IDE/1.0 这类真实客户端 UA；\
+                 换查询词重试没有用。".into());
+        }
         return Err(format!("Codeberg returned HTTP {status}"));
     }
     let data: Value = resp.json_capped().await.map_err(|e| e.to_string())?;
@@ -6597,5 +6642,69 @@ mod infoq_shell_page_tests {
         assert!(!any_hit_matches_query("go", &hits), "两字查询要按整串比");
         let go = [("Go 1.26 lands".to_string(), "/news/go126/".to_string())];
         assert!(any_hit_matches_query("go", &go));
+    }
+}
+
+#[cfg(test)]
+mod endpoint_reality_tests {
+    /// 三条都是 2026-08-20 实测出来的「工具在，但每次调用都白费」。
+    /// 用源码断言钉住——这些是外部站点的行为，单测发不出真请求，但**改回去**要能被拦下。
+    fn code_of(func: &str) -> String {
+        let src = include_str!("knowledge.rs");
+        let at = src.find(func).unwrap_or_else(|| panic!("{func} 不见了"));
+        let end = src[at..]
+            .find("\n#[cfg(test)]")
+            .map(|e| at + e)
+            .unwrap_or(src.len());
+        src[at..end.min(at + 4000)]
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// awwwards 认的是 `text=`。实测 `?q=restaurant`、`?q=agency` 和**不带参数**
+    /// 抓到的 slug 逐条相同（oimachi / cipher / likova…）——q 被整个忽略，
+    /// 于是这个工具对任何查询词都返回同一份首页榜单，抬头还写着「for '<查询词>'」。
+    #[test]
+    fn awwwards_uses_the_parameter_the_site_actually_reads() {
+        let body = code_of("pub async fn awwwards_search");
+        assert!(
+            body.contains(r#"("text", query)"#),
+            "awwwards 又用回 q= 了 —— 站点会忽略它，对任何词都返回同一份榜单"
+        );
+        assert!(!body.contains(r#"("q", query)"#), "q= 还在");
+    }
+
+    /// codeberg 现在拦「伪装成浏览器 UA 的 API 客户端」：
+    /// curl/8.7.1 → 200、Michael-IDE/1.0 → 200、Chrome UA → **403**。
+    /// 和 kclient() 当初那条注释正好反过来。
+    #[test]
+    fn codeberg_overrides_the_browser_user_agent() {
+        let body = code_of("pub async fn codeberg_search");
+        assert!(
+            body.contains(r#"USER_AGENT, "Michael-IDE/1.0""#),
+            "codeberg 又用回全局浏览器 UA 了 —— 站点会回 403"
+        );
+        assert!(
+            body.contains("403"),
+            "403 没有单独给可行动的解释，模型只会换词重试"
+        );
+    }
+
+    /// gitee 仓库搜索对任何词都 200 + [] + 12~13 秒。报成 empty 会被读作
+    /// 「Gitee 上确实没有」，于是换词、再等 13 秒、再拿同一句。
+    #[test]
+    fn gitee_reports_a_dead_endpoint_instead_of_emptiness() {
+        let body = code_of("pub async fn gitee_search");
+        assert!(body.contains("elapsed_secs"), "没有计时，就分不出「没搜到」和「接口挂了」");
+        assert!(
+            body.contains("if elapsed_secs >= 8.0"),
+            "耗时判据没了 —— 空集又会被报成「Gitee 上没有」"
+        );
+        assert!(
+            body.contains("换查询词重试没有用"),
+            "没告诉模型别重试，它会换词再等 13 秒"
+        );
     }
 }

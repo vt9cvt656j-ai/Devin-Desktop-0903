@@ -262,6 +262,26 @@ pub fn snapshot(pid: i32, cap: usize) -> Vec<AxNode> {
                     order.push(i);
                 }
             }
+            // 一个都没留下时不要直接交空。
+            //
+            // 有的应用（托盘类的、比如 Clash Verge）会把自己**看得见的**窗口报成
+            // AXMinimized=true——JXA 那边读到的也是 true，所以这不是读错，是这个
+            // 应用就这么报的。但据此返回空，下游只有一条解释路径，会说成
+            // 「这个应用不暴露可访问性树」，模型于是断定它没法自动化。
+            // 宁可退回去读所有尺寸够大的窗口：坐标可能不准，但至少是真的有东西，
+            // 而「点了没反应」比「这应用没法自动化」好排查得多。
+            if order.is_empty() {
+                for i in 0..n {
+                    let w = CFArrayGetValueAtIndex(arr, i) as AXUIElementRef;
+                    if w.is_null() {
+                        continue;
+                    }
+                    let (ww, wh) = attr_size(w, "AXSize").unwrap_or((0, 0));
+                    if ww >= 40 && wh >= 40 {
+                        order.push(i);
+                    }
+                }
+            }
             for i in order.into_iter().take(5) {
                 let w = CFArrayGetValueAtIndex(arr, i) as AXUIElementRef;
                 if !w.is_null() {
