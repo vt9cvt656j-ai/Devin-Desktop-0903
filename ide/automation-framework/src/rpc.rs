@@ -324,14 +324,25 @@ impl RpcServer {
             
             #[cfg(feature = "system")]
             "mouse.drag" => {
-                let from_x = Self::coord(&params, "from_x")
-                    .ok_or_else(|| Error::Other(anyhow::anyhow!("Missing 'from_x' parameter")))? as i32;
-                let from_y = Self::coord(&params, "from_y")
-                    .ok_or_else(|| Error::Other(anyhow::anyhow!("Missing 'from_y' parameter")))? as i32;
-                let to_x = Self::coord(&params, "to_x")
-                    .ok_or_else(|| Error::Other(anyhow::anyhow!("Missing 'to_x' parameter")))? as i32;
-                let to_y = Self::coord(&params, "to_y")
-                    .ok_or_else(|| Error::Other(anyhow::anyhow!("Missing 'to_y' parameter")))? as i32;
+                // 四个键各吃一组别名。这条方法在清单里一直是**裸的**（同一行的
+                // mouse.scroll{delta_y}、keyboard.down{key} 都带了参数标注），所以模型
+                // 只能照它见过的唯一坐标约定写 {x,y,to_x,to_y}，或者照 browser 那套写
+                // {x,y,toX,toY}。原来只认 from_x/from_y/to_x/to_y，于是每错一个键就多一个
+                // 来回：Missing 'from_x' → 改 → Missing 'from_y' → 再改。
+                // 清单已经补上参数名，这里再兜一层，三种常见写法都一次成。
+                let pick = |names: &[&str]| names.iter().find_map(|k| Self::coord(&params, k));
+                let from_x = pick(&["from_x", "x", "start_x", "startX", "fromX"])
+                    .ok_or_else(|| Error::Other(anyhow::anyhow!(
+                        "mouse.drag 需要起点和终点四个坐标：{{from_x,from_y,to_x,to_y}}（也接受 x/y + toX/toY）")))? as i32;
+                let from_y = pick(&["from_y", "y", "start_y", "startY", "fromY"])
+                    .ok_or_else(|| Error::Other(anyhow::anyhow!(
+                        "mouse.drag 需要起点和终点四个坐标：{{from_x,from_y,to_x,to_y}}（也接受 x/y + toX/toY）")))? as i32;
+                let to_x = pick(&["to_x", "toX", "end_x", "endX"])
+                    .ok_or_else(|| Error::Other(anyhow::anyhow!(
+                        "mouse.drag 需要起点和终点四个坐标：{{from_x,from_y,to_x,to_y}}（也接受 x/y + toX/toY）")))? as i32;
+                let to_y = pick(&["to_y", "toY", "end_y", "endY"])
+                    .ok_or_else(|| Error::Other(anyhow::anyhow!(
+                        "mouse.drag 需要起点和终点四个坐标：{{from_x,from_y,to_x,to_y}}（也接受 x/y + toX/toY）")))? as i32;
                 agent.mouse_drag(from_x, from_y, to_x, to_y)?;
                 Ok(serde_json::json!({"status": "ok"}))
             }
@@ -386,12 +397,24 @@ impl RpcServer {
             }
             #[cfg(feature = "system")]
             "keyboard.combo" => {
-                let keys = params.get("keys")
-                    .and_then(|v| v.as_array())
-                    .ok_or_else(|| Error::Other(anyhow::anyhow!("Missing 'keys' parameter (array)")))?;
-                let key_strs: Vec<&str> = keys.iter()
-                    .filter_map(|v| v.as_str())
-                    .collect();
+                // 模型从同一份工具目录的 browser 那里学到的写法是 "Meta+K" 这种整串，
+                // 而这里要的是数组、且每个元素是**单个**键名。原来只认数组，字符串
+                // 一律回同一句 "Missing 'keys' parameter (array)"——模型明明传了 keys，
+                // 于是判定这是工具的 bug；就算它套上方括号，["Meta+S"] 又会在 parse_key
+                // 炸成 "Unknown key: Meta+S"，那句话读起来是「没有这个键」而不是
+                // 「要拆成两个」，于是它转去试 Command+S、⌘S、cmd s，全军覆没。
+                // 这里直接吃下整串写法：按 + 或空格拆开，"Meta+S" 等价于 ["meta","s"]。
+                let owned: Vec<String> = match params.get("keys").or_else(|| params.get("key")) {
+                    Some(v) if v.is_array() => v.as_array().unwrap().iter()
+                        .filter_map(|x| x.as_str()).map(|s| s.to_string()).collect(),
+                    Some(v) if v.is_string() => v.as_str().unwrap()
+                        .split(|c| c == '+' || c == ' ')
+                        .map(|s| s.trim()).filter(|s| !s.is_empty())
+                        .map(|s| s.to_string()).collect(),
+                    _ => return Err(Error::Other(anyhow::anyhow!(
+                        "keyboard.combo 需要 keys：可以是数组 [\"cmd\",\"s\"]，也可以直接写 \"cmd+s\"。每个元素必须是**单个**键名（cmd/ctrl/alt/shift/enter/tab/esc/f1-f12/单个字符），不是整条快捷键。"))),
+                };
+                let key_strs: Vec<&str> = owned.iter().map(|s| s.as_str()).collect();
                 agent.keyboard_combo(key_strs)?;
                 drop(agent);
                 Ok(serde_json::json!({"status": "ok", "delivered_to": frontmost_now()}))
@@ -466,16 +489,40 @@ impl RpcServer {
                 drop(agent);
                 let ctrl = crate::platform::get_window_controller();
                 let wins = ctrl.enumerate_windows()?;
-                let list: Vec<serde_json::Value> = wins.iter().map(|w| serde_json::json!({
-                    "title": w.title, "process": w.process_name,
-                    "x": w.x, "y": w.y, "width": w.width, "height": w.height,
-                    // is_visible 里装的其实是 NSRunningApplication.isActive，也就是
-                    // 「它是不是前台」。名字对不上语义，模型没法知道能拿它回答
-                    // 「现在谁在前台」——而这正是合成按键会打进谁的唯一判据。
-                    "frontmost": w.is_visible,
-                    "visible": w.is_visible, "minimized": w.is_minimized,
-                })).collect();
-                Ok(serde_json::json!({ "windows": list }))
+                // macOS 这一侧枚举的是**正在运行的应用**，不是窗口：几何四个字段在
+                // 平台层就是硬编码的 0，is_visible 装的其实是 NSRunningApplication.isActive
+                // （是否前台），is_minimized 恒 false。
+                //
+                // 照原样把 x/y/width/height 报成 0 是最坏的一种错：模型会拿它算窗口中心、
+                // 发 mouse.click{x:0,y:0}，点在屏幕左上角的苹果菜单上，而回执是个漂亮的
+                // {"status":"ok","x":0,"y":0}——静默的错答案，没有任何一步会触发重试。
+                // 缺字段会让模型换个地方找，值为 0 的字段会让它拿去算。所以宁可不给。
+                let geometry_real = cfg!(not(target_os = "macos"));
+                let list: Vec<serde_json::Value> = wins.iter().map(|w| {
+                    let mut o = serde_json::Map::new();
+                    o.insert("title".into(), serde_json::json!(w.title));
+                    o.insert("process".into(), serde_json::json!(w.process_name));
+                    // isActive 唯一诚实的读法就是「是不是前台」，只报这一个。
+                    o.insert("frontmost".into(), serde_json::json!(w.is_visible));
+                    if geometry_real {
+                        o.insert("x".into(), serde_json::json!(w.x));
+                        o.insert("y".into(), serde_json::json!(w.y));
+                        o.insert("width".into(), serde_json::json!(w.width));
+                        o.insert("height".into(), serde_json::json!(w.height));
+                        o.insert("visible".into(), serde_json::json!(w.is_visible));
+                        o.insert("minimized".into(), serde_json::json!(w.is_minimized));
+                    }
+                    serde_json::Value::Object(o)
+                }).collect();
+                if geometry_real {
+                    Ok(serde_json::json!({ "windows": list }))
+                } else {
+                    // 不给坐标就必须说去哪儿拿，否则模型只会以为这次查询失败了。
+                    Ok(serde_json::json!({
+                        "windows": list,
+                        "note": "这一列是**正在运行的应用**，不是窗口矩形：macOS 这条路拿不到窗口几何，所以没有 x/y/width/height（给 0 会让你照着点到屏幕左上角）。要元素坐标就把目标切到前台再用 read_screen，它给的每个元素都带真实屏幕坐标；frontmost 是这里唯一可信的状态位，合成按键只会进入 frontmost 为 true 的那个应用。",
+                    }))
+                }
             }
             #[cfg(feature = "system")]
             "window.activate" => {

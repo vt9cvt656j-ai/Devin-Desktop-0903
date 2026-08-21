@@ -9060,9 +9060,19 @@ test("automation-era laws: install cleanup desktop gates fire only on AI intent"
   assert.match(auto, /keyboard\.paste/);
   const plain = frame("把按钮改成蓝色", { applies: true, ui: true, implementation: true });
   assert.doesNotMatch(plain, /环境安装律|清理律|桌面自动化律/);
-  // 框架新 RPC 能力必须在 automation 工具描述里可发现，否则模型永远不会调
-  assert.match(SRC, /window\.list \/ window\.activate\{title\} \/ window\.minimize\{title\} \/ screen\.info \/ clipboard\.get \/ clipboard\.set\{text\} \/ keyboard\.paste\{text\}/,
-    "窗口/屏幕/剪贴板 RPC 必须对模型可见");
+  // 框架新 RPC 能力必须在 automation 工具描述里可发现，否则模型永远不会调。
+  //
+  // 这条守卫自己就漏过一个：screen.capture 在 sidecar 里实现着（rpc.rs 的 match 分支），
+  // 却从没写进这份清单，而清单里偏偏有个 browser.screenshot。实拍到模型翻完这份清单后
+  // 得出「屏幕截图这儿没有，只有浏览器截图」，绕了六分钟没找到——真方法藏在另一个工具
+  // （computer）的 enum 里。所以改成**逐个点名**，别再用一整串连写的正则：
+  // 连写的串一旦中间加了新方法就整条失配，而失配时人只会去改正则，不会去问「是不是漏了谁」。
+  for (const m of [
+    "window.list", "window.activate{title}", "window.minimize{title}",
+    "screen.info", "screen.capture", "clipboard.get", "clipboard.set{text}", "keyboard.paste{text}",
+  ]) {
+    assert.ok(SRC.includes(m), `automation 的方法清单里少了 ${m}——模型看不到就永远不会调它`);
+  }
   // Tool availability is no longer routed through a separate profile table. The
   // semantic orchestrator receives the live registry, which contains any installed
   // desktop, setup, cleanup, and remote capabilities.
@@ -28157,6 +28167,28 @@ test("运行中按回车必须走实时引导，不是排队——注释说了�
   const streamAt = SRC.indexOf("_setStreaming(sess, true);", flagAt);
   assert.ok(streamAt > flagAt && streamAt - flagAt < 400,
     "标志要紧挨在 _setStreaming(sess, true) 之前——晚一步，启动那几秒里的消息就还是排队");
+});
+
+test("面向模型的文案里不许出现不存在的方法名", () => {
+  // 实拍：模型想给屏幕截图，转了六分钟没找到。三处文案都教它用 "computer screenshot"，
+  // 而 computer 的 enum 里根本没有 screenshot 这个 method（真名是 screen.capture）。
+  // 更糟的是 screenshot/take_screenshot/capture_screen 这些名字全被映射到那个**渲染网址**
+  // 的 screenshot 工具，于是它撞过去只拿到「需要 url」——所有错路的终点是同一个死胡同。
+  //
+  // 这条钉的是「文案里点名的方法必须真的存在」。幽灵名字比缺文档更贵：缺文档模型会去找，
+  // 幽灵名字会让它确信自己找对了，然后一路撞到底。
+  assert.doesNotMatch(SRC, /computer screenshot/,
+    "computer 没有 screenshot 这个 method，真名是 screen.capture");
+
+  // 终点要是路标不是死胡同：screenshot 工具在缺 url 时必须把两个真名字说出来。
+  const shotErr = SRC.slice(SRC.indexOf("[ERROR] screenshot 只把一个"), SRC.indexOf("[ERROR] screenshot 只把一个") + 300);
+  assert.ok(shotErr.includes("screen.capture"), "缺 url 的报错要指向拍真实屏幕的那个方法");
+  assert.ok(shotErr.includes("read_screen"), "也要指向读界面节点的那个");
+
+  // 不可猜的参数名必须写进清单。裸方法名 = 让模型照它见过的唯一约定去猜。
+  for (const sig of ["mouse.drag{from_x,from_y,to_x,to_y}", "keyboard.press{key}"]) {
+    assert.ok(SRC.includes(sig), `automation 清单里 ${sig} 的参数名没写，模型只能猜`);
+  }
 });
 
 test("docker 只有真会挂住的那几条算长时运行，秒回的不算", () => {
