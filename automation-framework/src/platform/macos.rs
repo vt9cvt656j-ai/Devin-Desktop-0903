@@ -223,6 +223,14 @@ impl WindowControl for MacOSControl {
             .map_err(Error::System)
     }
     
+    fn restore_window(&self, title: &str) -> Result<()> {
+        let pid = unsafe { pid_of_app(title) }
+            .ok_or_else(|| Error::ElementNotFound(format!("没找到叫「{title}」的应用")))?;
+        crate::platform::macos_tree::set_minimized(pid, false)
+            .map(|_| ())
+            .map_err(Error::System)
+    }
+    
     fn maximize_window(&self, _title: &str) -> Result<()> {
         Err(Error::UnsupportedPlatform(
             "macOS 平台暂不支持最大化指定窗口".to_string()

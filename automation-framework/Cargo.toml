@@ -27,6 +27,9 @@ tower = { version = "0.4", optional = true }
 tower-http = { version = "0.5", features = ["cors"], optional = true }
 
 [target.'cfg(target_os = "windows")'.dependencies]
+# 只为了把 GDI 抓到的原始 BGRA 编成 PNG。default-features 关掉，只留 png——
+# 不需要 jpeg/gif/webp 那一堆解码器。
+image = { version = "0.25", default-features = false, features = ["png"] }
 windows = { version = "0.58", features = [
     "Win32_Foundation",
     "Win32_UI_WindowsAndMessaging",
@@ -35,6 +38,9 @@ windows = { version = "0.58", features = [
     "Win32_System_Com",
     "Win32_System_Ole",
     "Win32_Graphics_Gdi",
+    # DwmGetWindowAttribute：判窗口是不是 cloaked（切走的虚拟桌面、挂起的 UWP）。
+    # 这类窗口 IsWindowVisible 为真、矩形也正常，只有 DWM 知道它其实不在屏幕上。
+    "Win32_Graphics_Dwm",
 ] }
 
 [target.'cfg(target_os = "macos")'.dependencies]

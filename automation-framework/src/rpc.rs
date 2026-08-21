@@ -567,12 +567,24 @@ impl RpcServer {
                     o.insert("process".into(), serde_json::json!(w.process_name));
                     // isActive 唯一诚实的读法就是「是不是前台」，只报这一个。
                     o.insert("frontmost".into(), serde_json::json!(w.is_frontmost));
-                    if geometry_real {
+                    // geometry_real 是**批级**判据：这一批里只要有一个窗口有真矩形，
+                    // 它就是 true。但单条仍可能是 0——Windows 上最小化的窗口
+                    // （GetWindowRect 给的是 -32000 哨兵）和取矩形失败的窗口，
+                    // 平台层都归零了。批级判据挡不住这些，照发就等于告诉模型
+                    // "这个窗口在屏幕左上角、160x160"，它会拿去算点击位置。
+                    // 所以最终还得逐条看：这一条自己有没有非零矩形。
+                    if geometry_real && w.width > 0 && w.height > 0 {
                         o.insert("x".into(), serde_json::json!(w.x));
                         o.insert("y".into(), serde_json::json!(w.y));
                         o.insert("width".into(), serde_json::json!(w.width));
                         o.insert("height".into(), serde_json::json!(w.height));
                         o.insert("visible".into(), serde_json::json!(w.is_visible));
+                    }
+                    // minimized 要**无条件**报（只要这批的几何是真的）。最小化恰恰是
+                    // 单条没有几何的主要原因，而它同时也是解法：先 window.restore
+                    // 再操作。跟着几何一起被藏掉的话，模型只看到"这条没坐标"，
+                    // 不知道下一步该干什么。
+                    if geometry_real {
                         o.insert("minimized".into(), serde_json::json!(w.is_minimized));
                     }
                     serde_json::Value::Object(o)
@@ -608,17 +620,17 @@ impl RpcServer {
             }
             // 只有最小化没有还原等于半条路：模型把一个窗口收起来之后就再也拿不回来，
             // 只能去点 Dock——而那要坐标、要截图、要猜。
-            #[cfg(all(feature = "system", target_os = "macos"))]
+            // 原来这条只编进 macOS，而工具清单在 Windows 上照样列着它——模型收起
+            // 一个窗口之后想还原，收到的是「Unknown method」。那句话读起来像是它
+            // 方法名拼错了，于是换着参数重试，而不是去找别的路。还原在 Windows 上
+            // 本来就是现成的（ShowWindow + SW_RESTORE），缺的只是没接上来。
+            #[cfg(feature = "system")]
             "window.restore" => {
                 let title = params.get("title").and_then(|v| v.as_str())
                     .ok_or_else(|| Error::Other(anyhow::anyhow!("Missing 'title' parameter")))?;
                 drop(agent);
-                let pid = crate::platform::macos_tree::pid_of(title).ok_or_else(|| {
-                    Error::Other(anyhow::anyhow!("没找到叫「{title}」的应用"))
-                })?;
-                let t = crate::platform::macos_tree::set_minimized(pid, false)
-                    .map_err(|e| Error::Other(anyhow::anyhow!(e)))?;
-                Ok(serde_json::json!({ "status": "ok", "restored": t }))
+                crate::platform::get_window_controller().restore_window(title)?;
+                Ok(serde_json::json!({ "status": "ok", "restored": title }))
             }
             #[cfg(feature = "system")]
             // screen.info 报的 width/height 来自 CGDisplay::pixels_wide()——名字叫 pixels，
