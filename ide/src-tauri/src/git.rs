@@ -1348,7 +1348,16 @@ pub fn git_blame(root: String, rel: String) -> Result<Vec<BlameLine>, String> {
         if let Some(a) = line.strip_prefix("author ") {
             cur_author = a.to_string();
         } else if let Some(d) = line.strip_prefix("author-time ") {
-            cur_date = d.to_string();
+            // `author-time` 是**裸 Unix 时间戳**（1787290406）。原样交出去，模型要么
+            // 照抄给用户，要么自己去换算——而 git_log 那条早就用 %ar 给的是「3 小时前」。
+            // 同一个仓库里两种口径，这里对齐成人能读的日期。
+            cur_date = d
+                .trim()
+                .parse::<i64>()
+                .ok()
+                .and_then(|ts| chrono::DateTime::from_timestamp(ts, 0))
+                .map(|dt| dt.format("%Y-%m-%d").to_string())
+                .unwrap_or_else(|| d.to_string());
         } else if !line.starts_with('\t') && !line.is_empty() {
             let parts: Vec<&str> = line.split_whitespace().collect();
             if parts.len() >= 3 && parts[0].len() == 40 {
