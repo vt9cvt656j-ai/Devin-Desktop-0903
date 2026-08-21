@@ -44,6 +44,19 @@ cargo test --manifest-path ide/src-tauri/Cargo.toml --lib >/dev/null 2>&1 || fai
 cargo test --manifest-path server/Cargo.toml >/dev/null 2>&1 || fail "网关测试没过"
 (cd ide/automation-framework && cargo test --all-features >/dev/null 2>&1) || fail "自动化框架测试没过"
 
+echo "── Windows 那条分支能不能编过 ──"
+# 在 mac 上 cargo check 只编 mac 那些 cfg 分支，Windows 独家的代码根本不参与编译——
+# 也就是说「本机全绿」对 Windows 版一点保证都没有。实际发生过：改了一个函数签名，
+# mac 全过，Windows 侧四个 cfg 分支全部类型不匹配。
+if command -v cargo-xwin >/dev/null 2>&1; then
+  (cd ide/src-tauri && cargo xwin check --target x86_64-pc-windows-msvc >/dev/null 2>&1) \
+    || fail "Windows 目标编不过：cd ide/src-tauri && cargo xwin check --target x86_64-pc-windows-msvc"
+  (cd ide/automation-framework && cargo xwin check --target x86_64-pc-windows-msvc --all-features >/dev/null 2>&1) \
+    || fail "sidecar 的 Windows 目标编不过"
+else
+  echo "   （跳过：没装 cargo-xwin。要装：cargo install cargo-xwin）"
+fi
+
 echo "── 工具目录两份是否同步 ──"
 (cd ide && node build/sync-tools-json.mjs --check >/dev/null 2>&1) \
   || fail "main.js 和 server/prompts/tools.json 的工具描述漂了。同步脚本只对齐 schema、

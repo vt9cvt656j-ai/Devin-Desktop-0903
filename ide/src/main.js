@@ -40178,7 +40178,20 @@ async function _walkSourceFiles(root, onFile, limit) {
     for (const e of entries) {
       const p = e.path || (dir + "/" + e.name);
       if (_SYMBOL_SKIP_DIRS.test(p + "/")) continue;
-      if (e.children !== undefined) { // directory
+      // 判目录必须看 `is_dir`。
+      //
+      // 原来写的是 `e.children !== undefined`——而后端 files.rs 的 DirEntry 只有
+      // `{name, path, is_dir, ignored}`，**根本没有 children**。于是这个条件恒为假，
+      // 目录全部掉进 else 分支，被扩展名过滤 continue 掉，子目录一次都没入过队：
+      // 整个仓库只索引到根目录那几个文件（实测本仓 `indexed 6 symbols across 6 files`）。
+      //
+      // 两个高频工具因此常年失效，而且是最坏的那种失效——不报错，只给假料：
+      //   · find_symbol 对真实存在的符号回「0 处」，回执还把原因解释成
+      //     「白名单扩展名 / 512KB / 前 6000 个文件」，模型以为是规模限制；
+      //   · semantic_search 对任意两个不相干的查询词返回**逐字相同**的一句
+      //     「在已建索引的部分里没有语义相近的内容」。
+      // 两者共用这个 walker，所以是同一行代码。
+      if (e.is_dir || e.children !== undefined) { // directory
         q.push(p);
       } else {
         const ext = (e.name.split(".").pop() || "").toLowerCase();

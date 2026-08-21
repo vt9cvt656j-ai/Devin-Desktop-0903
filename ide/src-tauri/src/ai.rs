@@ -3759,18 +3759,22 @@ pub async fn web_search(query: String) -> Result<String, String> {
     // agent turn. The fast scrape race (~8s cap) → headless-browser fallback all live inside 30s;
     // if even that blows through, return "no results" so the agent gets a graceful message, not a
     // frozen tool call.
-    let results = tokio::time::timeout(Duration::from_secs(30), async {
-        let mut r = ddg_search_multi(q).await;
+    let (results, ok_sources, empty_sources) = tokio::time::timeout(Duration::from_secs(30), async {
+        let (mut r, mut ok, mut empty) = ddg_search_multi(q).await;
         if r.is_empty() {
             // The bare HTTP scrape got blocked (anti-bot walls fingerprint reqwest's TLS / reject
             // its UA). Fall back to a REAL headless-browser render — the agent's own Chrome does the
             // search (real TLS fingerprint + JS + UA), getting through where the scrape can't.
             r = browser_render_search(q).await;
+            if !r.is_empty() {
+                ok.push("headless-browser");
+                empty.retain(|s| *s != "headless-browser");
+            }
         }
-        r
+        (r, ok, empty)
     })
     .await
-    .unwrap_or_default();
+    .unwrap_or_else(|_| (Vec::new(), Vec::new(), Vec::new()));
     if results.is_empty() {
         return Ok(format!(
             "「{q}」这次没搜到结果（搜索引擎可能限流、反爬，或当前关键词没有索引结果）。不要原样重发或只换近义词反复搜索：已有明确官方 URL 就直接 web_fetch；只有出现新的具体假设时才换一次真正不同的来源或检索方式。仍无新增证据就停止，并如实说明这次没有检索到可验证结果。"
@@ -3778,10 +3782,23 @@ pub async fn web_search(query: String) -> Result<String, String> {
     }
     // 表头不能写死「三引擎合并」——每个抓取器失败都是 `Err(_) => Vec::new()`，
     // 三个全挂也照样这么写，于是「三大引擎都没搜到」和「三个抓取器全被拦了」同形。
+    // 抬头要报**这次到底有几路回了东西**。
+    //
+    // 原来只写一句「多来源合并去重；某个来源被拦截时结果会少于预期」——听起来像
+    // 偶发。而实测（2026-08-20）五路里三路是**结构性**失效：google 只回 JS 壳页、
+    // duckduckgo 两路回 202 反爬挑战页。于是「结果少」到底是这个词冷门，还是三路
+    // 常年挂着，模型分不出来，只能猜——正是「感觉在瞎猜」的一种。
+    let src_note = format!(
+        "本次 {}/{} 个来源返回了结果（有结果：{}；空手：{}）",
+        ok_sources.len(),
+        ok_sources.len() + empty_sources.len(),
+        if ok_sources.is_empty() { "无".to_string() } else { ok_sources.join("、") },
+        if empty_sources.is_empty() { "无".to_string() } else { empty_sources.join("、") },
+    );
     let mut out = if results.is_empty() {
-        format!("搜索「{q}」：**没有任何来源返回结果**——可能是三个抓取器都被拦截/限流了，而不是这个词没有结果。换个词再试，或改用 web_fetch 直接抓已知地址。\n")
+        format!("搜索「{q}」：**没有任何来源返回结果**——{src_note}。这更可能是抓取器被拦截/限流，而不是这个词没有结果。换个词再试，或改用 web_fetch 直接抓已知地址。\n")
     } else {
-        format!("搜索「{q}」的结果（多来源合并去重；某个来源被拦截时结果会少于预期，本次合并后 {} 条）：\n", results.len())
+        format!("搜索「{q}」的结果（多来源合并去重，共 {} 条）。{src_note}——**空手的那几个是常年被反爬拦着，不是这个词冷门**，别据此判断「这个话题没资料」。\n", results.len())
     };
     for (i, (title, url, snippet)) in results.iter().take(12).enumerate() {
         out.push_str(&format!(
@@ -3800,21 +3817,44 @@ pub async fn web_search(query: String) -> Result<String, String> {
 /// Google goes first in merge order, followed by Bing, DuckDuckGo HTML, then DDG Lite.
 /// Each engine has its own 8s timeout so the
 /// total wall-clock is max ~8s (all run in parallel).
-async fn ddg_search_multi(q: &str) -> Vec<(String, String, String)> {
-    let (google, bing, ddg, lite) = tokio::join!(
+/// 返回 (合并结果, 有结果的来源名, 空手而归的来源名)。
+///
+/// 后两个不是装饰：实测五路里三路已经结构性失效（google 只回 JS 壳页、
+/// ddg 两路回 202 挑战页），而回执原来只说一句「多来源合并去重」——
+/// 于是「结果少」到底是这个词冷门、还是三个来源全挂了，模型分不出来，
+/// 只能猜。把事实报出去。
+async fn ddg_search_multi(q: &str) -> (Vec<(String, String, String)>, Vec<&'static str>, Vec<&'static str>) {
+    let (google, bing, ddg, lite, brave) = tokio::join!(
         scrape_google(q.to_string()),
         scrape_bing(q.to_string()),
         scrape_ddg_html(q.to_string()),
         scrape_ddg_lite(q.to_string()),
+        scrape_brave(q.to_string()),
     );
+    let sources: [(&'static str, Vec<(String, String, String)>); 5] = [
+        ("bing", bing),
+        ("brave", brave),
+        ("google", google),
+        ("duckduckgo", ddg),
+        ("duckduckgo-lite", lite),
+    ];
     let mut seen = std::collections::HashSet::new();
     let mut merged = Vec::new();
-    for r in google.into_iter().chain(bing).chain(ddg).chain(lite) {
-        if seen.insert(r.1.clone()) {
-            merged.push(r);
+    let mut ok = Vec::new();
+    let mut empty = Vec::new();
+    for (name, rows) in sources {
+        if rows.is_empty() {
+            empty.push(name);
+            continue;
+        }
+        ok.push(name);
+        for r in rows {
+            if seen.insert(r.1.clone()) {
+                merged.push(r);
+            }
         }
     }
-    merged
+    (merged, ok, empty)
 }
 
 const SEARCH_UA: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
@@ -4043,6 +4083,74 @@ async fn scrape_ddg_lite(q: String) -> Vec<(String, String, String)> {
             .unwrap_or_default(),
         Err(_) => Vec::new(),
     }
+}
+
+/// Brave Search —— 第五路，也是实测下来**唯一还能和 Bing 并肩**的裸抓来源。
+///
+/// 为什么要加它（2026-08-20 实测，同一台机、同一个 UA）：
+///   google      200 / 92KB  但整页**零个 `<h3>`** —— 现在只回一个 JS 壳页
+///                （有 noscript / enablejs），parse_google 永远拿不到东西
+///   ddg html    202 / 14KB  反爬挑战页（read_search_response_text 已按 202 丢弃）
+///   ddg lite    202 / 14KB  同上
+///   bing        200 / 125KB 30 条 —— 唯一活着的
+///   brave       200 / 293KB 20 条 —— 结构稳定，标题和链接都能干净抽出
+/// 四路里死了三路，`web_search` 实际是单点。再挂一路，Bing 哪天也被拦时不至于归零。
+async fn scrape_brave(q: String) -> Vec<(String, String, String)> {
+    let client = match search_client() {
+        Some(c) => c,
+        None => return Vec::new(),
+    };
+    let url = format!("https://search.brave.com/search?q={}", urlencoding(&q));
+    let resp = client
+        .get(&url)
+        .header(reqwest::header::USER_AGENT, SEARCH_UA)
+        .send()
+        .await;
+    match resp {
+        Ok(r) => read_search_response_text(r)
+            .await
+            .map(|h| parse_brave(&h))
+            .unwrap_or_default(),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// 从 Brave 的结果卡里抽 (标题, 链接, 摘要)。
+///
+/// 卡片形状：`<a href="URL" …> … <div class="…title…">标题</div> … </a>`，
+/// 摘要在同一张卡后面的 `<div class="snippet-description">`（拿不到就留空——
+/// 标题和链接才是必需的，摘要缺失不该让整条结果消失）。
+fn parse_brave(html: &str) -> Vec<(String, String, String)> {
+    let mut out = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    let mut rest = html;
+    while let Some(a) = rest.find("<a href=\"http") {
+        let tail = &rest[a + 9..];
+        let Some(qend) = tail.find('"') else { break };
+        let url = &tail[..qend];
+        let card_end = tail.find("</a>").unwrap_or(tail.len());
+        let card = &tail[..card_end];
+        // 标题：卡片里第一个 class 含 "title" 的块
+        let title = card
+            .find("title")
+            .and_then(|t| card[t..].find('>').map(|g| t + g + 1))
+            .and_then(|st| card[st..].find("</").map(|e| &card[st..st + e]))
+            .map(strip_tags)
+            .unwrap_or_default();
+        let title = title.trim().to_string();
+        if !title.is_empty()
+            && title.chars().count() >= 3
+            && !url.contains("brave.com")
+            && seen.insert(url.to_string())
+        {
+            out.push((title, url.to_string(), String::new()));
+        }
+        rest = &tail[card_end.min(tail.len())..];
+        if out.len() >= 12 {
+            break;
+        }
+    }
+    out
 }
 
 /// Last-resort search via a REAL headless-browser render (`chrome --dump-dom`).
@@ -4537,6 +4645,84 @@ mod html_entity_tests {
         assert!(
             decode.contains("crate::ai::decode_html_entities") && !decode.contains(".replace("),
             "knowledge 的 html_decode 又自己手写了一份实体名单"
+        );
+    }
+}
+
+#[cfg(test)]
+mod web_search_sources_tests {
+    use super::parse_brave;
+
+    /// 实测（2026-08-20，同机同 UA）：web_search 的四路抓取里三路已经结构性失效——
+    /// google 只回 JS 壳页（整页零个 `<h3>`）、duckduckgo html/lite 回 202 反爬挑战页。
+    /// 只剩 bing 一路撑着。加 brave 是为了不让它变成单点。
+    #[test]
+    fn brave_cards_parse_into_title_and_url() {
+        let html = r#"
+          <div data-type="web">
+            <a href="https://doc.rust-lang.org/book/ch04-00.html" class="card">
+              <div class="title">Understanding Ownership - The Rust Programming Language</div>
+            </a>
+          </div>
+          <div data-type="web">
+            <a href="https://example.com/x" class="card"><div class="title">Second Result</div></a>
+          </div>
+          <a href="https://search.brave.com/settings" class="card"><div class="title">Settings</div></a>
+        "#;
+        let rows = parse_brave(html);
+        assert_eq!(rows.len(), 2, "解析出来的条数不对: {rows:?}");
+        assert_eq!(rows[0].1, "https://doc.rust-lang.org/book/ch04-00.html");
+        assert!(rows[0].0.contains("Understanding Ownership"));
+        assert!(
+            rows.iter().all(|r| !r.1.contains("brave.com")),
+            "把 Brave 自己的站内链接当成结果了"
+        );
+    }
+
+    /// 同一个 URL 出现两次只算一条。
+    #[test]
+    fn duplicate_urls_collapse() {
+        let html = r#"<a href="https://a.test/1" class="c"><div class="title">A</div></a>
+                      <a href="https://a.test/1" class="c"><div class="title">A again</div></a>"#;
+        assert_eq!(parse_brave(html).len(), 1);
+    }
+
+    /// 标题空的卡片不要——留一条只有链接的结果，模型没法判断值不值得点。
+    #[test]
+    fn cards_without_a_title_are_dropped() {
+        let html = r#"<a href="https://a.test/2" class="c"><div class="title">  </div></a>"#;
+        assert!(parse_brave(html).is_empty());
+    }
+
+    /// 接线：五路都要并进去，且回执要报「几路返回了结果」。
+    #[test]
+    fn all_five_sources_are_raced_and_reported() {
+        let src = include_str!("ai.rs");
+        // ai.rs 里有**多个** #[cfg(test)] 模块，而且有的排在 ddg_search_multi 之前——
+        // 按第一个截断会把要查的函数一起切掉（第一版就是这么假红的）。
+        // 改成：从函数所在位置起，切到它**之后**的第一个测试模块。
+        let at = src.find("async fn ddg_search_multi").expect("ddg_search_multi 不见了");
+        let end = src[at..].find("\n#[cfg(test)]").map(|e| at + e).unwrap_or(src.len());
+        let code: String = src[..end]
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let multi = code
+            .split("async fn ddg_search_multi")
+            .nth(1)
+            .and_then(|s| s.split("\n}\n").next())
+            .expect("ddg_search_multi 不见了");
+        for name in ["scrape_google", "scrape_bing", "scrape_ddg_html", "scrape_ddg_lite", "scrape_brave"] {
+            assert!(multi.contains(name), "{name} 没进这一轮并发");
+        }
+        assert!(
+            code.contains("本次 {}/{} 个来源返回了结果"),
+            "回执没报「几路返回了结果」—— 结果少到底是词冷门还是三路挂了，模型分不出来"
+        );
+        assert!(
+            code.contains("空手的那几个是常年被反爬拦着，不是这个词冷门"),
+            "没告诉模型空手是常态，它会据此判断「这个话题没资料」"
         );
     }
 }
