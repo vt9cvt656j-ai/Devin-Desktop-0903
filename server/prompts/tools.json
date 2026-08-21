@@ -1290,7 +1290,7 @@
               "url",
               "app"
             ],
-            "description": "url = a web page (navigate first with browser, or pass url here); app = the frontmost native application on this Mac"
+            "description": "url = a web page (navigate first with browser, or pass url here); app = the frontmost native application on this computer (macOS reads the AX tree, Windows reads UI Automation — both work)"
           },
           "url": {
             "type": "string",

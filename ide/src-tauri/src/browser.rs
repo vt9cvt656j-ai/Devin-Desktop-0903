@@ -271,7 +271,51 @@ fn is_browser_running(process_name: &str) -> bool {
     })
 }
 
-#[cfg(not(target_os = "macos"))]
+/// Windows：同一个问题的 CIM 版本。
+///
+/// 这里原来是个恒 false 的桩（连同 Linux 一起）。调用方拿它当**已核实的事实**用：
+/// 「你现在没开着 Chrome」——而实际上一次都没查过。用户明明开着浏览器，
+/// 却被告知没开，然后被引去做一堆不该做的事。
+///
+/// 判据和 discover_debuggable_browsers 保持一致：读完整命令行，
+/// 剔掉带我们 profile 标记的（那是自动化自己起的实例）和 `--type=` 的子进程。
+#[cfg(windows)]
+fn is_browser_running(process_name: &str) -> bool {
+    let Ok(out) = crate::process_util::command("powershell")
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "Get-CimInstance Win32_Process -Filter \"Name='chrome.exe' or Name='msedge.exe' or Name='brave.exe' or Name='chromium.exe'\" | ForEach-Object { $_.CommandLine }",
+        ])
+        .output()
+    else {
+        // 查不到就返回 false，和 macOS 那支同一条原则：宁可少说一句，也不说错。
+        return false;
+    };
+    let Ok(re) = regex::Regex::new(ORPHAN_PROFILE_PATTERN) else {
+        return false;
+    };
+    // process_name 在 macOS 上是 "Google Chrome" 这种展示名，Windows 上命令行里
+    // 出现的是 chrome.exe。两边都比一遍，取不区分大小写——Windows 路径大小写不敏感。
+    let needle = process_name.to_lowercase();
+    let exe = match needle.as_str() {
+        n if n.contains("chrome") && !n.contains("chromium") => "chrome.exe",
+        n if n.contains("chromium") => "chromium.exe",
+        n if n.contains("edge") => "msedge.exe",
+        n if n.contains("brave") => "brave.exe",
+        _ => "",
+    };
+    String::from_utf8_lossy(&out.stdout).lines().any(|line| {
+        let low = line.to_lowercase();
+        (!exe.is_empty() && low.contains(exe))
+            // 渲染进程 / GPU 进程不算"用户开着浏览器"，它们跟着主进程走。
+            && !low.contains("--type=")
+            && !re.is_match(line)
+    })
+}
+
+#[cfg(not(any(target_os = "macos", windows)))]
 fn is_browser_running(_process_name: &str) -> bool {
     false
 }
@@ -2329,19 +2373,52 @@ pub fn kill_orphaned_browsers() {
         }
         #[cfg(windows)]
         {
-            // 按镜像名清理，所以每个可能被选中的浏览器都要单独来一遍——以前只写了
-            // chrome.exe，于是自动化跑 Edge 或 Brave 时残留进程一个都清不掉，它们
-            // 继续占着 profile 目录，下一次启动就全线失败。
-            for image in ["chrome.exe", "msedge.exe", "brave.exe", "chromium.exe"] {
-                let _ = std::process::Command::new("taskkill")
-                    .args([
-                        "/F",
-                        "/FI",
-                        &format!("IMAGENAME eq {image}"),
-                        "/FI",
-                        "WINDOWTITLE eq rust-headless*",
-                    ])
+            // 判据必须是 **profile 目录**，不是窗口标题。
+            //
+            // 原来是 `taskkill /FI "WINDOWTITLE eq rust-headless*"`，两处都不成立：
+            //  · 我们起的实例窗口标题是页面标题，不叫 rust-headless；
+            //  · headless 实例根本没有窗口，而 taskkill 的 WINDOWTITLE 过滤器
+            //    对无窗口进程永远不匹配。
+            // 于是这段清理是**恒空转**的：孤儿一个都没杀过，它们继续占着 profile
+            // 目录，下一次启动全线失败——而日志里看不出任何异常。
+            //
+            // 换成和非 Windows 那支同一条判据（ORPHAN_PROFILE_PATTERN 匹配完整命令行），
+            // 先用 CIM 找出 pid，再按 pid 杀。同时改走 process_util::command：
+            // 直接 std::process::Command 起 taskkill 会在 Windows 上闪一个黑窗，
+            // 仓库里专门写了静默 spawn 助手就是为了这个。
+            let my_pid = std::process::id();
+            let out = match crate::process_util::command("powershell")
+                .args([
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-Command",
+                    "Get-CimInstance Win32_Process -Filter \"Name='chrome.exe' or Name='msedge.exe' or Name='brave.exe' or Name='chromium.exe'\" | ForEach-Object { \"$($_.ProcessId) $($_.CommandLine)\" }",
+                ])
+                .output()
+            {
+                Ok(o) => o,
+                Err(_) => return,
+            };
+            let Ok(re) = regex::Regex::new(ORPHAN_PROFILE_PATTERN) else {
+                return;
+            };
+            let mut killed = 0usize;
+            for line in String::from_utf8_lossy(&out.stdout).lines() {
+                let line = line.trim();
+                let Some((pid_str, args)) = line.split_once(' ') else { continue };
+                let Ok(pid) = pid_str.parse::<u32>() else { continue };
+                if pid == my_pid || !re.is_match(args) {
+                    continue;
+                }
+                // /T 连子进程一起收：Chromium 的渲染/GPU 进程是主进程的子进程，
+                // 只杀主进程会留下一地孤儿孙子。
+                let _ = crate::process_util::command("taskkill")
+                    .args(["/F", "/T", "/PID", &pid.to_string()])
                     .output();
+                killed += 1;
+            }
+            if killed > 0 {
+                crate::elog!("[browser] killed {} orphaned browser process(es)", killed);
             }
         }
     });
@@ -2350,6 +2427,52 @@ pub fn kill_orphaned_browsers() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 反漂移：Windows 侧的两处「浏览器还在不在」都必须真的去查，不能是桩，
+    /// 也不能用窗口标题当判据。
+    ///
+    /// 断言源码而不是行为——Windows 分支在 mac 上不参与编译，跑不起来。
+    /// 先剥注释：上面那几段解释里就引用了被修掉的旧写法，不剥的话断言会被自己喂饱。
+    #[test]
+    fn windows_browser_liveness_is_queried_not_assumed() {
+        let src: String = include_str!("browser.rs")
+            .lines()
+            .filter(|l| {
+                let t = l.trim_start();
+                !t.starts_with("//") && !t.starts_with("///")
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        // ① 孤儿清理的判据是 profile 目录（和非 Windows 那支同一条），不是窗口标题。
+        let title_filter = format!("WINDOWTITLE {} rust-headless", "eq");
+        assert!(
+            !src.contains(&title_filter),
+            "Windows 孤儿清理还在按窗口标题过滤——headless 实例没有窗口，这条永远不匹配"
+        );
+        assert!(
+            src.contains("taskkill") && src.contains("/PID"),
+            "孤儿清理应该按 CIM 查出来的 pid 杀，而不是按镜像名整片杀"
+        );
+
+        // ② is_browser_running 在 Windows 上不再是恒 false 的桩。
+        let stub = format!("fn is_browser_running(_process_name: &str) -> bool {{\n    {}\n}}", "false");
+        assert_eq!(
+            src.matches(&stub).count(),
+            1,
+            "恒 false 的桩应该只剩「既不是 macOS 也不是 Windows」那一份"
+        );
+        assert!(
+            src.contains("#[cfg(windows)]\nfn is_browser_running(process_name: &str)"),
+            "Windows 上 is_browser_running 应该是真实现（实名参数），不是下划线桩"
+        );
+
+        // ③ 两处都要走静默 spawn 助手，否则 Windows 上每次清理闪一个黑窗。
+        assert!(
+            !src.contains("std::process::Command::new(\"taskkill\")"),
+            "taskkill 绕过了仓库的静默 spawn 助手，会在 Windows 上闪黑窗"
+        );
+    }
 
     // 一篇长文，用来喂「正文足够长 → 弱信号不算数」那条规则。
     const ARTICLE: &str = "x的正文很长，足够长到不像一张过渡页。这一段会被重复很多遍以越过阈值。";
