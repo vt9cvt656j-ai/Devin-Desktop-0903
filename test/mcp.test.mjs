@@ -331,7 +331,7 @@ test("仓库自带的 MCP 工具照旧要问——这道门不能顺手拆掉", 
   assert.equal(asked.length, 1, "仓库自带的服务必须弹一次");
 });
 
-test("工作区权限规则写了 ask，就算是自己配的服务也得问——事先写下的策略优先", async () => {
+test("permissions.ask 压过自动放行——但只在授权模式下；auto 档一个都不问", async () => {
   const asked = [];
   const approve = load("_approveToolCall", {
     // 「是谁拒的」走旁路（那道门的返回值必须保持布尔）。测试里不关心理由，给个空实现。
@@ -342,7 +342,7 @@ test("工作区权限规则写了 ask，就算是自己配的服务也得问—�
     _callIsDestructive: () => false,
     _dbCallIsDestructive: () => false,
     _callIsReadOnlyCommand: () => false,
-    _currentAiPerm: "auto",
+    _currentAiPerm: "approve",
     _requiresApproval: () => true,
     _approvalKey: () => "k",
     _approvalLabel: () => ({ title: "执行 MCP 工具？", detail: "" }),
@@ -355,8 +355,31 @@ test("工作区权限规则写了 ask，就算是自己配的服务也得问—�
     _noteRefusal: () => {},
     _toolApprovalDialog: async ({ title }) => { asked.push(title); return "once"; },
   });
-  await approve({ type: "mcp", server: "memory", tool: "search", mcpAutoApprove: true }, { root: "/w" });
-  assert.equal(asked.length, 1, "permissions.ask 必须压过自动放行");
+  const call = { type: "mcp", server: "memory", tool: "search", mcpAutoApprove: true };
+  await approve(call, { root: "/w" });
+  assert.equal(asked.length, 1, "开了授权模式时，permissions.ask 必须压过自动放行");
+
+  // 但 auto 是默认档，用户要的是它一个都不问。ask 规则可能来自 clone 来的仓库，
+  // 而开关是用户本人的决定——所以 auto 档下它也不弹。deny 不受影响（另有一条钉着）。
+  asked.length = 0;
+  const autoGate = load("_approveToolCall", {
+    _noteRefusal: () => {}, _permRuleSource: () => "",
+    _permissionRuleVerdict: () => "ask",
+    _loadPermissionRules: async () => ({}),
+    _callIsDestructive: () => false, _dbCallIsDestructive: () => false,
+    _callIsReadOnlyCommand: () => false,
+    _currentAiPerm: "auto",
+    _requiresApproval: () => true,
+    _approvalKey: () => "k",
+    _approvalLabel: () => ({ title: "执行 MCP 工具？", detail: "" }),
+    _approvalAlwaysLabel: load("_approvalAlwaysLabel"),
+    _sessionApproved: new Set(),
+    document: { body: {} },
+    _unattendedRun: false,
+    _toolApprovalDialog: async ({ title }) => { asked.push(title); return "once"; },
+  });
+  assert.equal(await autoGate(call, { root: "/w" }), true);
+  assert.equal(asked.length, 0, "auto 档下 ask 规则也不该弹");
 });
 
 test("规则写了 deny 就直接否决，自动放行不能把它顶掉", async () => {

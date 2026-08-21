@@ -3214,13 +3214,13 @@ test("session approval is remembered per exact call, not per tool", async () => 
 // 用户主动打开了那道门，却没有能回答的界面，那就只能拒——不能因为界面缺席就
 // 把他打开的门当没打开。auto 档下无论危不危险都直接放行，一次都不问。
 test("授权模式下没有界面可问就拒；auto 档下压根不问", async () => {
-  const gate = (dangerous) => load("_approveToolCall", {
+  const gate = (dangerous, perm = "approve") => load("_approveToolCall", {
     _dbCallIsDestructive: () => false,
     _callIsDestructive: () => dangerous,
     _callIsReadOnlyCommand: () => false,
     _loadPermissionRules: async () => ({ allow: [], ask: [], deny: [] }),
     _permissionRuleVerdict: () => "",
-    _currentAiPerm: "auto",
+    _currentAiPerm: perm,
     _requiresApproval: () => false,
     _approvalKey: () => "k",
     _approvalLabel: () => ({ title: "t", detail: "d" }),
@@ -3228,8 +3228,12 @@ test("授权模式下没有界面可问就拒；auto 档下压根不问", async 
     _toolApprovalDialog: async () => { throw new Error("must not be reachable without a DOM"); },
     document: undefined,
   });
-  assert.equal(await gate(true)({ type: "cmd", command: "rm -rf /" }), false);
+  assert.equal(await gate(true)({ type: "cmd", command: "rm -rf /" }), false,
+    "开了授权模式却没有界面可问 —— 只能拒，不能当成没开");
   assert.equal(await gate(false)({ type: "read", path: "a.js" }), true);
+  // auto 档：一个都不问，所以没有 DOM 也无所谓，高危照样放行。
+  assert.equal(await gate(true, "auto")({ type: "cmd", command: "rm -rf /" }), true,
+    "auto 档下不该走到对话框那一步");
 });
 
 // A declined call must read as "never attempted", not as a tool that failed: that is what

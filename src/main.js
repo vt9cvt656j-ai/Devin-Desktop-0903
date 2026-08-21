@@ -19926,17 +19926,13 @@ let _currentAiMode = "agent";
 //             bites where the agent can actually write. Persisted across sessions.
 function _loadAiPerm(storage) {
   const saved = storage?.getItem("michael-ide.ai-perm");
-  // 三档。full = 完全放开：连高危操作也不问。
-  //
-  // auto（默认）下高危仍然会问，那道门不受「改动前审批」开关影响；full 是用户
-  // 明确要的第三档——他要的是一个真能自己干完的智能体，不是每走一步都停下来的。
-  // 这一档的代价必须说清楚而不是藏着：删除在系统侧就是 remove_dir_all，没有回收站，
-  // 界面上也没有撤销入口，所以 full 下的一次误判就是永久丢失。用户已经知道并选择了它。
-  if (saved === "full") return "full";
+  // 两档。auto（默认）**一个都不问**——高危也不问；approve 才逐个问。
+  // 曾经有过第三档 full，但 auto 改成不问之后它和 auto 完全一样，两个同义的模式
+  // 只会让人困惑，所以删掉。老配置里存着 "full" 的按 auto 读，行为不变。
   return saved === "approve" ? "approve" : "auto";
 }
 let _currentAiPerm = (() => { try { return _loadAiPerm(localStorage); } catch { return "auto"; } })();
-function _setAiPerm(p) { _currentAiPerm = (p === "full" ? "full" : p === "approve" ? "approve" : "auto"); try { localStorage.setItem("michael-ide.ai-perm", _currentAiPerm); } catch {} }
+function _setAiPerm(p) { _currentAiPerm = (p === "approve" ? "approve" : "auto"); try { localStorage.setItem("michael-ide.ai-perm", _currentAiPerm); } catch {} }
 // Tools that touch disk / the machine / the outside world. Pure reads, git
 // status/diff/log, lsp, think, screenshot, web search never ask.
 const _APPROVE_TYPES = approvalTypes(); // 见 agent/tool-policy.js —— 单一声明处，不再逐点重抄
@@ -20301,7 +20297,7 @@ function _toolApprovalDialog({ title, detail, onceLabel = "允许", alwaysLabel 
   // full 档下这个函数根本不会被调到（mustAsk 恒 false）。留这行是给另外四个
   // 调用点（沙箱逃逸、工作区配置执行、工作区信任、撤销条）兜底——它们不走 mustAsk。
   // full 时它们也该放行，否则定时任务会在这些地方被拦住，而用户要的是全放开。
-  if (_unattendedRun) return Promise.resolve(_currentAiPerm === "full" ? "once" : "deny");
+  if (_unattendedRun) return Promise.resolve(_currentAiPerm === "approve" ? "deny" : "once");
   const show = () => new Promise((resolve) => {
     if (!_approveDlg) {
       _approveDlg = document.createElement("dialog");
@@ -20900,13 +20896,17 @@ async function _approveToolCall(call, run) {
   if (ruleVerdict !== "ask" && call.type === "mcp" && call.mcpAutoApprove) return true;
 
   const mode = (run && run.perm) || _currentAiPerm;
-  // full = 用户明确选择的完全放开：一个都不问，高危也不问。
-  // 连工作区规则里写着 ask 的也放行——那类规则可能来自 clone 来的仓库，
-  // 而 full 是用户本人当下的决定，比仓库里带来的策略更靠后也更权威。
-  // （ruleVerdict === "deny" 例外：它在上面已经静默否决过了，那是硬停，不走这里。）
-  const mustAsk = mode === "full"
-    ? false
-    : ruleVerdict === "ask" || dangerous || (mode === "approve" && _requiresApproval(call));
+  // **只有用户主动打开授权模式时才问，其余一概不问。**
+  //
+  // 原来 auto（默认）下高危仍然会问，理由是"删除不可逆"。但那让默认状态变成了
+  // 一个走两步就停下来等人点的智能体，而用户要的是它能自己把活干完。
+  // 现在判据只有一条：他有没有打开这个开关。没打开 = 全放行，高危也放行，
+  // 工作区规则里写着 ask 的也放行（那类规则可能来自 clone 来的仓库，
+  // 而开关是用户本人的决定，比仓库带来的策略更权威）。
+  //
+  // ruleVerdict === "deny" 不走这里：它在更早一步就静默否决了，那是硬停不是询问。
+  const mustAsk = mode === "approve"
+    && (_requiresApproval(call) || dangerous || ruleVerdict === "ask");
   if (!mustAsk) return true;
   const key = _approvalKey(call, run);
   // 高危调用**不吃会话记忆**，也不给「本会话总是允许」。
@@ -20923,7 +20923,7 @@ async function _approveToolCall(call, run) {
   // 改文件类的调用，把真实 diff 放进框里——否则用户只能凭文件名猜。
   let _diffPreview = "";
   try { _diffPreview = await _approvalDiffPreview(call); } catch { _diffPreview = ""; }
-  if (_unattendedRun && _currentAiPerm !== "full") {
+  if (_unattendedRun && _currentAiPerm === "approve") {
     // 对话框那一层已经会返回 deny，这里补的是**给模型的说法**：否则它拿到的
     // 是一句「用户拒绝了」，而实际上没有任何人做过这个决定。说清楚是「没人能点」
     // 而不是「有人不同意」，模型才会把它留给用户，而不是去找一条绕过确认的路。
@@ -64419,20 +64419,6 @@ async function renderSettingsTool(body) {
     createSwitch(_currentAiPerm === "approve", (on) => {
       _setAiPerm(on ? "approve" : "auto");
       showToast(on ? t("feature.settings.approvalOn") : t("feature.settings.approvalOff"));
-    }),
-  ));
-  // 「完全放开」：第三档，连高危也不问。和上面那个开关互斥——两个都开是自相矛盾的
-  // 状态，所以打开这个就把审批关掉，打开审批就退回 auto。
-  //
-  // 这一档的代价写在 hint 里，不藏着：删目录在系统侧是 remove_dir_all，没有回收站、
-  // 没有备份，这个软件里也没有撤销入口；而且它对定时任务同样生效，也就是没人看着的
-  // 时候它也能删。用户明确要这个，那就给他，但要让他每次进设置都看得见这句话。
-  aiSec.appendChild(createSettingsRow(
-    t("feature.settings.fullAuto.label"),
-    t("feature.settings.fullAuto.hint"),
-    createSwitch(_currentAiPerm === "full", (on) => {
-      _setAiPerm(on ? "full" : "auto");
-      showToast(on ? t("feature.settings.fullAutoOn") : t("feature.settings.fullAutoOff"));
     }),
   ));
   aiSec.appendChild(createSettingsRow(
