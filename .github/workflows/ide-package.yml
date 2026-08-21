@@ -63,6 +63,16 @@ jobs:
           - label: Windows x64 EXE + MSI
             os: windows-latest
             rust_target: x86_64-pc-windows-msvc
+            # Windows 独有的窗口配置（decorations:false）。
+            #
+            # 这份配置文件一直存在、内容也一直是对的，但**从没生效过**：Tauri 2 只在
+            # 没有显式 --config 时才自动合并 tauri.<platform>.conf.json，而下面的构建
+            # 步骤为了 createUpdaterArtifacts 传了 --config，于是平台配置被整个跳过。
+            #
+            # 后果是用户报的三件事，其实是同一件：原生标题栏没被关掉，压在应用自绘的
+            # 那条 44px 标题栏上面——两条叠着、标题显示两遍、自绘的最小化/最大化/关闭
+            # 三个键被压在下面点不到（「右上角缺少关闭按钮」），全屏也被原生那条挡住。
+            extra_config: --config src-tauri/tauri.windows.conf.json
             sidecar_path: ide/src-tauri/binaries/automation-server-x86_64-pc-windows-msvc.exe
             artifact_name: michael-ide-windows-x64-exe-msi
             artifact_paths: |
@@ -260,7 +270,7 @@ jobs:
           # 两个 macOS 任务都是编译签名全过、最后死在这一步。
         with:
           projectPath: ide
-          args: --target ${{ matrix.rust_target }} --config src-tauri/tauri.package.conf.json --ci
+          args: --target ${{ matrix.rust_target }} --config src-tauri/tauri.package.conf.json ${{ matrix.extra_config }} --ci
           tagName: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || '' }}
           releaseName: Mr. Day One ${{ github.ref_name }}
           releaseDraft: true
