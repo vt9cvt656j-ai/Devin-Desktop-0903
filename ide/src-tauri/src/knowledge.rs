@@ -1045,6 +1045,17 @@ async fn search_cocoapods(c: &Client, q: &str, limit: u32) -> Result<String, Str
         .await
         .map_err(|e| format!("CocoaPods: {e}"))?;
     if !resp.status().is_success() {
+        // 530 / 1016 是 Cloudflare 的「源站解析失败」，不是参数问题，也不是限流。
+        // 只回一个裸状态码的话，模型会改包名重试若干轮，每次都 530。
+        let st = resp.status().as_u16();
+        if st == 530 || st == 1016 {
+            return Err(
+                "CocoaPods 搜索服务当前上游不可用（Cloudflare 530/1016，源站解析失败）——\
+                 这不是参数问题，换包名重试没有用。iOS/Swift 依赖改用 package_search\
+                 (ecosystem=\"swiftpm\") 或直接在 GitHub 上查该 pod 的仓库。"
+                    .into(),
+            );
+        }
         return Err(format!("CocoaPods returned {}", resp.status()));
     }
     let json: Value = resp
@@ -2419,9 +2430,25 @@ pub async fn cve_search(query: String, max_results: Option<u32>) -> Result<Strin
                 .to_string(),
         );
     };
-    let mut out = format!("NVD CVE: {total} results\n\n");
+    // NVD **按 CVE 编号升序**返回，不是按时间倒序。实测 keywordSearch=kubernetes
+    // 的前 5 条是 CVE-2015-5305 / 2016-1905 / 2015-7528 / 2016-5392 / 2017-1000056
+    // ——全是十年前的老漏洞，而 totalResults 写着 623。
+    // 模型问「这个组件现在有什么漏洞」，拿回十年前的历史条目 + 一个看起来很权威的
+    // 总数，很容易据此答错，而且完全没有线索知道自己看的是最老的那一批。
+    // 这里把本页按发布时间倒排，并在抬头把顺序和「这只是一页」说清楚。
+    let mut out = format!(
+        "NVD CVE「{query}」：共 {total} 条，下面是本次取回的这一页（**已按发布时间从新到旧重排**）。\n\
+         注意 NVD 接口本身按 CVE 编号升序返回，所以这一页并不是全局最新的 N 条——\
+         要看某个时间段用 pubStartDate/pubEndDate（窗口不得超过 120 天）。\n\n"
+    );
 
     if let Some(vulns) = json["vulnerabilities"].as_array() {
+        let mut vulns: Vec<&Value> = vulns.iter().collect();
+        vulns.sort_by(|a, b| {
+            let ka = a["cve"]["published"].as_str().unwrap_or("");
+            let kb = b["cve"]["published"].as_str().unwrap_or("");
+            kb.cmp(ka)
+        });
         for (i, v) in vulns.iter().enumerate() {
             let cve = &v["cve"];
             let id = cve["id"].as_str().unwrap_or("?");
@@ -3632,6 +3659,10 @@ pub async fn clinical_trials_search(
         ("pageSize", limit.to_string()),
         ("format", "json".into()),
         ("sort", "LastUpdatePostDate:desc".into()),
+        // 不带这个参数，响应里**根本没有 totalCount** 字段——于是表头恒印
+        // 「ClinicalTrials.gov: 0 studies」，下面却跟着 10 条真试验。
+        // 实测：加上之后 diabetes 返回 totalCount=35008。
+        ("countTotal", "true".into()),
     ];
     if let Some(s) = &status {
         params.push(("filter.overallStatus", s.clone()));
@@ -3645,7 +3676,14 @@ pub async fn clinical_trials_search(
         .map_err(|e| format!("ClinicalTrials: {e}"))?;
 
     if !resp.status().is_success() {
-        return Err(format!("ClinicalTrials returned {}", resp.status()));
+        // 响应体里那句（例如 `Invalid value in parameter 'overallStatus'`）直接就告诉
+        // 模型该怎么改；只回一个裸状态码它只能瞎猜参数重试。
+        let st = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        return Err(format!(
+            "ClinicalTrials returned {st}: {}",
+            body.chars().take(300).collect::<String>()
+        ));
     }
 
     let json: Value = resp
@@ -4717,7 +4755,35 @@ pub async fn smashingmag_search(query: String, max_results: Option<u32>) -> Resu
         let desc = extract_xml_tag(item, "description");
         let date = extract_xml_tag(item, "pubDate");
         let haystack = format!("{} {} {}", title, desc, link).to_lowercase();
-        if !keywords.is_empty() && !keywords.iter().any(|k| haystack.contains(k)) {
+        // 按**词边界**匹配，不是子串。
+        //
+        // 原来是 `haystack.contains(k)`：查 "rust" 会命中 trust / frustration / crusty，
+        // 于是查「rust ownership」拿回一份言之凿凿、实则零相关的清单——
+        // 而这个源是 RSS 全文，命中率本来就低，一条假命中就足以让整页看起来「有结果」。
+        // 纯 ASCII 词才按边界比；中日韩没有词边界，仍按子串。
+        let hit = |k: &&str| -> bool {
+            let ascii = k.chars().all(|c| c.is_ascii_alphanumeric());
+            if !ascii {
+                return haystack.contains(k.as_str());
+            }
+            let bytes = haystack.as_bytes();
+            let mut from = 0usize;
+            while let Some(rel) = haystack[from..].find(k.as_str()) {
+                let at = from + rel;
+                let end = at + k.len();
+                let before_ok = at == 0 || !bytes[at - 1].is_ascii_alphanumeric();
+                let after_ok = end >= bytes.len() || !bytes[end].is_ascii_alphanumeric();
+                if before_ok && after_ok {
+                    return true;
+                }
+                from = at + k.len().max(1);
+                if from >= haystack.len() {
+                    break;
+                }
+            }
+            false
+        };
+        if !keywords.is_empty() && !keywords.iter().any(|k| hit(k)) {
             continue;
         }
         count += 1;
@@ -5519,6 +5585,7 @@ pub async fn codeberg_search(query: String, max_results: Option<u32>) -> Result<
         // 换浏览器 UA 即 200」）**正好反过来**——Codeberg 现在改成拦「伪装成浏览器的
         // API 客户端」了。当初为了修 codeberg 加的那条全局 UA，如今是它唯一挂掉的原因。
         // 不动全局 UA（十几个工具共用），只在这里覆盖，做法和 infoq_search 一致。
+        .header(reqwest::header::USER_AGENT, "Michael-IDE/1.0")
         .query(&[("q", query), ("sort", "stars"), ("limit", &n.to_string())])
         .send()
         .await

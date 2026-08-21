@@ -31912,3 +31912,47 @@ test("秒回的 -w 命令不许被当成长跑服务拒掉", () => {
   assert.equal(isLong("tsc --no-watch"), false);
   assert.equal(isLong("jest --watch=false"), false);
 });
+
+// search 带 path= 时，后端返回的 rel 是相对**那个子目录**算的：
+// search(path="src/") 命中打印成 `deep/auth.ts` 而不是 `src/deep/auth.ts`。
+// 模型照抄去 read_file 必然扑空，而且会以为是文件不存在，转头去猜别的路径——
+// 一次白跑加一次误判。absolute 一直是对的，用它按工作区根反推即可。
+test("search 带 path 时，命中路径必须相对工作区根，不是相对被搜的子目录", () => {
+  const at = SRC.indexOf('} else if (call.type === "search") {');
+  const seg = SRC.slice(at, SRC.indexOf("if (!successfulScopes)", at));
+  assert.ok(seg.length > 400, "search 那段切空了");
+  assert.match(seg, /rel: _normRel\(absolute, root\)/,
+    "rel 还在用后端按 scope 算的那个 —— 带 path 搜索时模型拿到的路径读不开");
+  // 兜底顺序不能反：工作区根算不出来时才退回后端的 rel。
+  assert.match(seg, /rel: _normRel\(absolute, root\) \|\| rel \|\| _normRel\(absolute, searchRoot\)/,
+    "兜底顺序变了");
+});
+
+// lsp_hover 对 JS/TS/JSX/TSX 是**结构性**失效：lspManager 的 MANAGED_LANGS 里没有它们，
+// 而三个兄弟工具（format / symbols / definition-references）都有 TS worker 兜底，
+// 只有 hover 没有。更糟的是回执写「这个语言**可能**没有语言服务，或者该符号**此刻**
+// 无法解析」——「可能 / 此刻」暗示重试或换位置会好，模型于是白试几轮。
+test("lsp_hover 要有 TS worker 兜底，拿不到时把话说死", () => {
+  // ① 四个工具都要有 TS worker 兜底，一个都不能少。
+  for (const [op, fn] of [["format", "_tsWorkerFormat"], ["symbols", "_tsWorkerSymbols"],
+    ["definition/references", "_tsWorkerLocate"], ["hover", "_tsWorkerHover"]]) {
+    assert.ok(SRC.includes(`async function ${fn}(`), `${op} 的 TS worker 兜底 ${fn} 不见了`);
+    assert.match(SRC, new RegExp(`await ${fn}\\(`), `${fn} 写了却没人调 —— ${op} 还是会必然失败`);
+  }
+  // hover 的兜底要接在语言服务之后。
+  const at = SRC.indexOf("if (call.op === \"hover\") {");
+  const seg = SRC.slice(at, at + 1400);
+  assert.match(seg, /agentHover[\s\S]{0,400}_tsWorkerHover/,
+    "TS worker 兜底没接在 hover 分支里，或顺序反了");
+
+  // ② 拿不到时不许用「可能 / 此刻」这种诱导重试的说法。
+  assert.doesNotMatch(seg, /这个语言可能没有可用的语言服务/,
+    "又说回「可能没有」了 —— 对 JS/TS 是必然，模型会白试几轮");
+  assert.match(seg, /换个位置或重试不会有不同结果/, "没把话说死");
+
+  // ③ _tsWorkerHover 要真的取 quick info，不是空壳。
+  const fn = extractFn("_tsWorkerHover");
+  assert.match(fn, /getQuickInfoAtPosition/, "没调 TS 的 quick info");
+  assert.match(fn, /displayParts/, "没取签名部分");
+  assert.match(fn, /if \(created\) \{ try \{ model\.dispose\(\); \}/, "临时 model 没释放 —— 和兄弟函数不一致");
+});

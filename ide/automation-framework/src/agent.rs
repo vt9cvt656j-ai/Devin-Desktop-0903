@@ -441,10 +441,16 @@ impl Agent {
     }
     
     #[cfg(feature = "browser")]
-    pub fn browser_screenshot(&self, path: Option<&str>) -> Result<()> {
+    /// 返回 PNG 字节——**不要再丢掉它**。
+    ///
+    /// 原来这里是 `browser.screenshot(path)?; Ok(())`：底层 browser.rs 明明
+    /// `Ok(screenshot)` 返回了 PNG，这一层直接扔了，RPC 再回一句 `{"status":"ok"}`。
+    /// 模型调 browser.screenshot 的唯一目的就是看一眼页面，结果什么都没看到，
+    /// 却被告知成功了——它会照着「我看过了」继续往下推。
+    /// 对照 screen.capture：那条一直是回 data_url 的。
+    pub fn browser_screenshot(&self, path: Option<&str>) -> Result<Vec<u8>> {
         let mut browser = self.browser_lock()?;
-        self.rt()?.block_on(browser.screenshot(path))?;
-        Ok(())
+        self.rt()?.block_on(browser.screenshot(path))
     }
     
     #[cfg(feature = "browser")]
