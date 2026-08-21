@@ -558,3 +558,52 @@ test("工具描述不许承诺代码做不到的事", () => {
     }
   }
 });
+
+// 第三份工具目录：src/tool-guides.js 的 example_call / TOOL_EXAMPLES。
+// 它经 compactToolGuide 进 search_tools 的回执，是模型真会照抄的一份，
+// 而 sync-tools-json.mjs --check 只比 main.js ↔ tools.json，**根本不看它**。
+// 实测漂出来的：git_log 教 max_count（真名 count）、debate 教 topic（真名 question）、
+// git_branch 教 action='create'（真名 create 布尔）、bundlephobia_search 教 query
+// （真名 package）、read_terminal/stop_terminal 教 id（真名 name）。
+// 归一层没有对应别名的那几个，映射层直接把参数丢掉——模型拿到「默认 20 条」「空问题」，
+// 一声不响。
+test("第三份工具目录里的例子，参数名必须真的存在", async () => {
+  const { TOOL_METADATA } = await import("../src/tool-guides.js");
+  const catalog = JSON.parse(readFileSync(join(HERE, "..", "..", "server", "prompts", "tools.json"), "utf8"));
+  const byName = new Map();
+  for (const entry of (Array.isArray(catalog) ? catalog : catalog.tools)) {
+    const f = entry.function || entry;
+    byName.set(f.name, new Set(Object.keys((f.parameters || {}).properties || {})));
+  }
+
+  // 只取**顶层**参数名：嵌套对象里的键（steps=[{content,status}]、params={x,y}）是合法的。
+  const topLevelKeys = (argsText) => {
+    const keys = [];
+    let depth = 0, inStr = null, expectKey = true, buf = "";
+    for (let i = 0; i < argsText.length; i++) {
+      const c = argsText[i];
+      if (inStr) { if (c === inStr && argsText[i - 1] !== "\\") inStr = null; continue; }
+      if (c === "'" || c === '"' || c === "`") { inStr = c; continue; }
+      if ("[{(".includes(c)) { depth++; continue; }
+      if ("]})".includes(c)) { depth--; continue; }
+      if (depth === 0) {
+        if (c === ",") { expectKey = true; buf = ""; continue; }
+        if (c === "=" || c === ":") { if (expectKey && buf.trim()) keys.push(buf.trim()); expectKey = false; buf = ""; continue; }
+        buf += c;
+      }
+    }
+    return keys.filter((k) => /^[A-Za-z_][\w]*$/.test(k));
+  };
+
+  const bad = [];
+  for (const [name, meta] of Object.entries(TOOL_METADATA)) {
+    const props = byName.get(name);
+    if (!props) continue;                       // 运行时工具（search_tools 等）不在网关目录里
+    const m = /^[a-z_0-9]+\((.*)\)\s*$/s.exec(String(meta.example_call || "").trim());
+    if (!m) continue;
+    const unknown = topLevelKeys(m[1]).filter((k) => !props.has(k));
+    if (unknown.length) bad.push(`${name}: 例子里的 ${unknown.join("/")} 不是它的参数（真实参数：${[...props].join("/")}）`);
+  }
+  assert.deepEqual(bad, [],
+    "第三份目录教了不存在的参数——映射层会静默丢掉，模型拿到默认值还以为传进去了：\n  " + bad.join("\n  "));
+});

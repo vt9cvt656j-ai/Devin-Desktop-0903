@@ -33848,6 +33848,12 @@ function _normalizeArgKeys(args) {
   alias("file_pattern", "filePattern", "file_match", "fileMatch", "content_pattern", "contentPattern", "contains", "match_text", "matchText");
   alias("check_type", "checkType", "check", "check_kind", "checkKind", "condition", "condition_type", "conditionType");
   alias("timeout", "timeout_secs", "timeoutSecs", "timeout_seconds", "timeoutSeconds", "wait_seconds", "waitSeconds");
+  // 这两个是**归一兜底**，不是纵容：第三份目录（tool-guides.js）曾经把 git_log 的参数
+  // 教成 max_count、debate 的教成 topic，而归一层没有对应别名，映射层直接把它们丢掉——
+  // 模型拿到的是「默认 20 条」和「空问题」，没有任何报错。例子已经改对了，别名留作兜底：
+  // 这两个词都无歧义，别的工具不会用到。
+  alias("count", "max_count", "maxCount", "limit_count");
+  alias("question", "topic");
   alias("message", "msg", "label", "reason", "status_text", "statusText");
   alias("prompt", "description", "instruction", "instructions");
   alias("method", "action", "op", "operation");
