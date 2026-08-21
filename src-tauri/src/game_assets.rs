@@ -266,14 +266,16 @@ fn correct_extension_after_write(target: &Path, declared: &str) -> (PathBuf, Opt
         Ok(()) => (
             renamed,
             Some(format!(
-                "上游返回的其实是 {actual}，不是 {declared}；文件已按真实格式改名保存。                 按 {actual} 处理它，别当成 {declared}。"
+                "落盘的文件其实是 {actual}，不是 {declared}；已按真实格式改名保存。\
+                 按 {actual} 处理它，别当成 {declared}。"
             )),
         ),
         // 改名失败也要说：内容和扩展名对不上这件事比改名本身重要。
         Err(e) => (
             target.to_path_buf(),
             Some(format!(
-                "警告：文件内容其实是 {actual}，扩展名却是 {declared}，自动改名失败（{e}）。                 按 {actual} 处理它。"
+                "警告：文件内容其实是 {actual}，扩展名却是 {declared}，自动改名失败（{e}）。\
+                 按 {actual} 处理它。"
             )),
         ),
     }
@@ -949,10 +951,15 @@ mod asset_extension_tests {
 
         let (path, note) = correct_extension_after_write(&target, "glb");
         assert_eq!(path.extension().and_then(|e| e.to_str()), Some("zip"));
+        // 文案里不许再夹进去缩进漏掉的长空格串——它会**原样进模型上下文**。
+        // 也不能说「上游返回的」：第三个落盘点 download_asset 是从素材库下现成文件，
+        // 那不是上游生成的返回。
         assert!(path.exists(), "改名后的文件不在盘上");
         assert!(!target.exists(), "旧的 .glb 还留着，会有两份");
         let note = note.expect("扩展名对不上却一个字都不说");
         assert!(note.contains("zip") && note.contains("glb"), "{note}");
+        assert!(!note.contains("   "), "文案里夹了长空格串（去缩进漏了续行符）：{note:?}");
+        assert!(!note.contains("上游返回的"), "download_asset 那条路不是上游生成的返回：{note}");
 
         // 对得上时不动、也不多话。
         let ok = dir.join("model.glb");
