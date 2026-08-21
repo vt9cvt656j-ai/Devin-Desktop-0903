@@ -31248,6 +31248,34 @@ test("read_logs 点名的终端没匹配上，不许把别人的日志当成它�
   assert.equal(!!_toolFailureMatch(miss), false,
     "抬头被判成工具失败了——其它日志真读到了，报失败等于把有产出的调用抹成零产出");
 
+  // 根目录里的 .log/.out/.err 也要能找到。原来根目录只比对 10 个写死的名字，
+  // 于是躺着 backend.log / worker.out / test.err 时一个都看不见，回执却写
+  // 「工作区常见日志位置也没有 .log/.out/.err 可读」。
+  const cands = load("_workspaceLogCandidates", {
+    rootPath: "", workspaceRoots: [],
+    backend: { readDir: async (p) => (p === "/w"
+      ? [{ name: "backend.log", is_dir: false, path: "/w/backend.log" },
+         { name: "worker.out", is_dir: false, path: "/w/worker.out" },
+         { name: "README.md", is_dir: false, path: "/w/README.md" }]
+      : Promise.reject(new Error("no"))) },
+    _coherentFilePath: (x) => x,
+    _pathIdentity: (x) => x,
+    _looksLikeLogFileName: (n) => /\.(log|out|err)$/i.test(n),
+  });
+  const found = await cands("/w", 8);
+  assert.deepEqual(found, ["/w/backend.log", "/w/worker.out"],
+    "根目录里的 .log/.out/.err 找不到 —— 而回执会说「也没有 .log/.out/.err 可读」");
+
+  // 没有工作区 = 一次目录都没扫，不能说成「扫过、没有」。
+  const noWs = load("_agentReadLogs", {
+    _terminalLogChunks: () => [], _formatAgentTerminalLines: () => [],
+    _looksLikeLogFileName: () => true, _workspaceLogCandidates: async () => [],
+    _readLogTailForAgent: async () => ({ error: "x" }),
+    rootPath: "", workspaceRoots: [],
+  });
+  const blind = await noWs({ name: "worker" }, "", null);
+  assert.match(blind, /一次目录都没扫/, "没打开工作区时把「没扫」说成了「没有」");
+
   // 什么都没读到时，也要说是「名字没匹配上」，不是笼统的「没有日志」。
   const empty = load("_agentReadLogs", {
     _terminalLogChunks: () => [],
@@ -31291,6 +31319,25 @@ test("background_monitor：检查不了的条件必须当场说，别用 300 秒
   assert.match(blocked.content, /condition/, "没点破是 condition 被并进 check_type 的");
   assert.match(blocked.content, /port|url|command/, "没给出可用的 check_type，模型无从改口");
   assert.equal(blocked.failure.attempted, false, "一次都没检查，不能报成尝试过");
+
+  // pattern 非空但**形状不对**，同样是「说开始等了，一次都没检查」：
+  // 轮询里还有第二道隐形闸门——port 会 `bmPat.replace(/[^0-9]/g,"")` 后 `if (port)`，
+  // url 会拿 pattern 去 http_request，不是 http(s) 开头每次都抛并被 catch 吃掉。
+  for (const [t, pat, want] of [
+    ["port", "the dev server port", /一个数字都没有/],
+    ["port", "3000", null],
+    ["url", "localhost 那个页面", /http:\/\/ 或 https:\/\/ 开头/],
+    ["url", "http://127.0.0.1:3000/health", null],
+  ]) {
+    const r = check(call({ message: "等", check_type: t, pattern: pat }));
+    if (want) {
+      assert.ok(r, `check_type=${t} 的 pattern 形状不对（${pat}），却被放行去空等`);
+      assert.match(r.content, want);
+      assert.match(r.content, /别写成一句话/);
+    } else {
+      assert.equal(r, null, `check_type=${t} 写对了却被拦（${pat}）`);
+    }
+  }
 
   // 类型对但 pattern 空：file/command/url/port 四条分支都带 `&& bmPat`，同样一条都不进。
   for (const t of ["file", "command", "url", "port"]) {

@@ -36643,6 +36643,8 @@ async function _readLogTailForAgent(rawPath, root = "", lines = 200) {
 
 async function _workspaceLogCandidates(root = "", limit = 8) {
   const base = root || rootPath || workspaceRoots[0] || "";
+  // 没有工作区 = **一次目录都没读**。调用方据此区分「扫过，没有」和「根本没扫」——
+  // 回执原来无论哪种都写「工作区常见日志位置也没有 .log/.out/.err 可读」。
   if (!base) return [];
   const out = [];
   const seen = new Set();
@@ -36655,10 +36657,22 @@ async function _workspaceLogCandidates(root = "", limit = 8) {
   let topEntries = [];
   try { topEntries = await backend.readDir(base); } catch {}
   const topNames = new Set(topEntries.filter((e) => !e?.is_dir).map((e) => e.name));
+  // 先按这几个常见名排序：它们最可能是这次要看的那份。
   for (const name of [
     "npm-debug.log", "yarn-error.log", "pnpm-debug.log", "bun-debug.log",
     "vite.log", "server.log", "app.log", "error.log", "debug.log", "crash.log",
   ]) if (topNames.has(name)) add(`${base}/${name}`);
+  // 然后把根目录里**其余**的 .log/.out/.err 也收进来。
+  //
+  // 原来根目录只比对上面那 10 个写死的名字，不走 _looksLikeLogFileName（它当时只在
+  // logs/log/.logs/tmp/var/log 五个子目录里生效）。于是根目录躺着 backend.log、
+  // worker.out、test.err 时一个都看不见，而回执写的是「工作区常见日志位置也没有
+  // .log/.out/.err 可读」——模型据此判定服务没输出。目录本来就已经读过一遍，这里
+  // 套一下判据不多花任何代价。
+  for (const entry of topEntries) {
+    if (out.length >= limit) break;
+    if (!entry?.is_dir && _looksLikeLogFileName(entry.name)) add(entry.path || `${base}/${entry.name}`);
+  }
   for (const dir of ["logs", "log", ".logs", "tmp", "var/log"]) {
     if (out.length >= limit) break;
     const abs = `${base}/${dir}`;
@@ -36816,7 +36830,12 @@ async function _agentReadLogs(call, root = "", run = null, out = null) {
     // 正则失配，于是**一次什么都没读到的日志调用被记成了有效的运行时证据**。
     // 改文案会再犯一次；这里给事实，判据那边读事实。
     _emptyRead = true;
-    if (_nameMiss) return _finish(`[终端没匹配上] ${_nameMiss}\n工作区常见日志位置也没有 .log/.out/.err 可读。`);
+    const _noWorkspace = !(root || rootPath || workspaceRoots[0] || "");
+    const _scanNote = _noWorkspace
+      ? "当前没有打开工作区，所以**一次目录都没扫**——这不等于没有日志。"
+      : "工作区常见日志位置也没有 .log/.out/.err 可读。";
+    if (_nameMiss) return _finish(`[终端没匹配上] ${_nameMiss}\n${_scanNote}`);
+    if (_noWorkspace) return _finish("当前没有可读的 Agent 终端日志；而且**没有打开工作区**，所以一次目录都没扫——这不等于工作区里没有日志。先打开项目，或直接 read_logs(path=绝对路径)。");
     return _finish("当前没有可读的 Agent 终端日志，也没有在工作区常见日志位置发现 .log/.out/.err。若报错输出里给了日志路径，调用 read_logs(path=那个路径) 读取尾部。");
   }
   // 裸切会让下游报出一个**精确的假数字**。
@@ -55690,7 +55709,7 @@ async function _executeToolStepInner(step, call, root, run) {
       vp.innerHTML = `<pre>${_escHtml((_body || "(无匹配)") + partialNote)}</pre>`;
       return { type: "search", path: call.path, content: (blocks.length ? `搜索 "${q}" — ${summary}:\n${_redactSecrets(_body)}` : `搜索 "${q}"：${_backendTruncated ? "**这次没搜完**（触到后端的命中数/扫描文件数上限就停了），所以「没找到」不等于「不存在」——缩小到具体目录再搜一次。" : ""}在已扫描的范围里无匹配。${_remote.active
         ? "当前工作区在**远程主机**上，这次搜索由远端代理执行，它的扫描范围以那台机器上的实现为准，这里说不准跳过了什么。"
-        : "跳过的只有几个具名的构建/缓存目录（.git、.next、.venv、.gradle、.idea、.vscode、node_modules、target 这类）——**点开头的文件照常搜**（.env、.eslintrc、.gitignore、.prettierrc 都在扫描范围里），**.github 也照常搜**。所以「没找到」多半是关键词不对，不是范围不够"}：换关键词、用 semantic_search 按语义找、或 find_files 按文件名找。`) + partialNote };
+        : "好消息是**点开头的文件照常搜**（.env、.eslintrc、.gitignore、.prettierrc 都在扫描范围里），**.github 也照常搜**。但扫描确实会静默跳过这些：构建/缓存目录（.git、.next、.venv、.gradle、.idea、.vscode、node_modules、target、dist、build、out、vendor、coverage、Pods、venv、__pycache__）、**符号链接**（文件和目录都跳，monorepo/pnpm 的 workspace 链接整棵树都不在内）、**大于 2MB 的文件**、含 NUL 字节的二进制、以及**非 UTF-8 编码**的文件（GBK/Latin-1 的老代码整份搜不到）。所以先换关键词再试；如果目标可能落在上面任何一类里，直接 read_file 指名读"}：换关键词、用 semantic_search 按语义找、或 find_files 按文件名找。`) + partialNote };
 
     } else if (call.type === "find") {
       const requestedPattern = call.pattern || call.path || "";
@@ -58646,10 +58665,21 @@ return { type: call.type, path: call.query || "", content: `[失败] ${call.type
       // 是抓包恢复路径明说的用法（logic.test.mjs 那条 CONFIGURE_BACKGROUND_PROXY 钉着）。
       const _BM_CHECKS = new Set(["manual", "capture", "file", "command", "url", "port"]);
       const _BM_NEEDS_PATTERN = new Set(["file", "command", "url", "port"]);
-      if (!_BM_CHECKS.has(bmType) || (_BM_NEEDS_PATTERN.has(bmType) && !bmPat)) {
+      // 光判「空不空」不够。轮询里还有第二道**隐形**闸门：
+      //   port  → `const port = bmPat.replace(/[^0-9]/g,""); if (port) { …lsof… }`
+      //   url   → http_request(bmPat)，不是 http(s) 开头每次都抛、被 catch 吃掉
+      // 于是 pattern 写成一句话（这道修复自己点名的高发场景）时，闸门放行、卡片显示
+      // 「已检查 N 次」、300 秒后回一句超时——一次 lsof / 一次请求都没真正成立过。
+      // 判据前移到这里：形状不对就当场说，别用 300 秒换一个假答案。
+      const _bmPatternIssue = !bmPat ? ""
+        : bmType === "port" && !/\d/.test(bmPat) ? `port 的 pattern 要的是端口号，而「${bmPat.slice(0, 60)}」里一个数字都没有`
+        : bmType === "url" && !/^https?:\/\//i.test(bmPat.trim()) ? `url 的 pattern 要的是完整地址（http:// 或 https:// 开头），而这次给的是「${bmPat.slice(0, 60)}」`
+        : "";
+      if (!_BM_CHECKS.has(bmType) || (_BM_NEEDS_PATTERN.has(bmType) && !bmPat) || _bmPatternIssue) {
         // 这里还没走到 _registerRunInteraction，没有东西要释放；_bmRelease 也还在 TDZ 里。
         res.className = "atc-result atc-result--err"; res.textContent = "条件没法检查";
-        const _why = !_BM_CHECKS.has(bmType)
+        const _why = _bmPatternIssue ? `${_bmPatternIssue}。把条件本身写进 pattern，别写成一句话。`
+          : !_BM_CHECKS.has(bmType)
           ? `check_type 收到的是「${String(bmType).slice(0, 120)}」，不是可检查的类型。`
             + `注意入参归一会把 condition / check / condition_type 都并进 check_type——`
             + `如果你写的是一整句自然语言，它就原样变成了这里的 check_type。`
@@ -58794,7 +58824,7 @@ return { type: call.type, path: call.query || "", content: `[失败] ${call.type
                   ? `netstat -ano | findstr /R /C:":${port} .*LISTENING"`
                   : `lsof -nP -iTCP:${port} -sTCP:LISTEN -t 2>/dev/null`;
                 const r = await backend.taskRunCapture(bmCwd, cmd, { timeoutSecs: 5 });
-                if (r && r.code === 0 && (r.stdout || "").trim()) _bmFinish("done", `端口 ${bmPat} 已监听`, `[background_monitor 结果] 端口 ${bmPat} 已被监听（PID: ${(r.stdout || "").trim().split("\\n")[0]}），继续执行。`);
+                if (r && r.code === 0 && (r.stdout || "").trim()) _bmFinish("done", `端口 ${bmPat} 已监听`, `[background_monitor 结果] 端口 ${bmPat} 已被监听（PID: ${(r.stdout || "").trim().split("\n")[0]}），继续执行。`);
               }
             } catch {}
           }

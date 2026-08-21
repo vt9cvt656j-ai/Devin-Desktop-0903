@@ -353,7 +353,16 @@ test("检索类：说清楚「没找到」还是「没去找」", () => {
   assert.doesNotMatch(SRC, /扫描范围不含点开头的目录和文件/,
     "又把「点开头的目录和文件全不扫」这句假话写回去了 —— 后端只跳几个具名目录，文件一律保留");
   assert.match(SRC, /点开头的文件照常搜/, "search 没说清点开头的文件其实在扫描范围里");
-  assert.match(SRC, /跳过的只有几个具名的构建\/缓存目录/, "search 没说清到底跳了什么");
+  // 「跳过的**只有**几个具名目录」是过头话：search_project_scope 还静默跳掉符号链接
+  // （文件和目录都跳）、>2MB 的文件、含 NUL 的二进制、以及非 UTF-8 编码的文件。
+  // 原文案后面那句「所以没找到多半是关键词不对，不是范围不够」正好把模型从真因推开。
+  assert.doesNotMatch(SRC, /跳过的只有几个具名的构建\/缓存目录/,
+    "又把「只有几个具名目录」这句过头话写回去了 —— 符号链接 / >2MB / 非 UTF-8 都在静默跳过之列");
+  for (const [needle, why] of [
+    [/符号链接/, "没说符号链接整棵树都不在扫描范围里"],
+    [/大于 2MB 的文件/, "没说文件大小上限"],
+    [/非 UTF-8 编码/, "没说非 UTF-8 的文件整份搜不到"],
+  ]) assert.match(SRC, needle, `search 零命中文案：${why}`);
   // 也不许换成另一句假话：search 根本不调 path_is_git_ignored。
   assert.doesNotMatch(SRC, /被 \.gitignore 忽略的.{0,12}不搜/,
     "用新假话替旧假话了 —— search 不查 .gitignore");
