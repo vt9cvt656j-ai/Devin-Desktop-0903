@@ -474,16 +474,19 @@ pub async fn ingest_npm(
 }
 
 /// 抓取失败也要留痕，否则同一个抓不到的包会被反复重抓，而原因只在日志里一闪而过。
-pub async fn record_failure(db: &sqlx::PgPool, name: &str, version: &str, err: &str) {
+/// 记一次失败。**生态必须带上**：写死 'npm' 会把 PyPI/crates 的失败记到 npm 名下，
+/// 于是 npm 那条腿以为自己试过了要退避，而真正失败的那个生态永远不退避、每轮重试。
+pub async fn record_failure(db: &sqlx::PgPool, eco: Eco, name: &str, version: &str, err: &str) {
     let _ = sqlx::query(
         "INSERT INTO code_corpus_fetches (ecosystem, name, version, ok, error) \
-         VALUES ('npm',$1,$2,false,$3) \
+         VALUES ($4,$1,$2,false,$3) \
          ON CONFLICT (ecosystem, name, version) DO UPDATE \
            SET ok = false, error = EXCLUDED.error, fetched_at = now()",
     )
     .bind(name)
     .bind(version)
     .bind(err.chars().take(500).collect::<String>())
+    .bind(eco.as_str())
     .execute(db)
     .await;
 }

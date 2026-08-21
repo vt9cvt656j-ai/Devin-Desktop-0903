@@ -4604,12 +4604,36 @@ pub async fn code_corpus_search(
     if let Some(pkg) = package {
         // 生态由调用方指明（客户端知道自己是在 node_modules 还是 site-packages 里找不到的）；
         // 没指明就按 npm 办——这个 IDE 的主战场。
-        let eco = body
+        // 没指定生态时**依次试**，而不是默认 npm。
+        //
+        // package_source 的回退就没法指定：本机没装那个包，它无从知道这是 npm 包还是
+        // PyPI 包。而默认 npm 的后果是实拍过的——问 PyPI 的 pandas 会去 npm 拉回那个
+        // 占坑的 pandas@0.0.3，真正的 pypi/pandas 反而没被抓。
+        // 检索本身跨生态按名字查，不受影响；这里只影响「库里没有时去哪个注册表拉」。
+        let declared = body
             .get("ecosystem")
             .and_then(|v| v.as_str())
-            .and_then(crate::code_corpus::Eco::parse)
-            .unwrap_or(crate::code_corpus::Eco::Npm);
-        if !crate::code_corpus::have_package(&state.db, eco, pkg).await {
+            .and_then(crate::code_corpus::Eco::parse);
+        let candidates: Vec<crate::code_corpus::Eco> = match declared {
+            Some(e) => vec![e],
+            None => vec![
+                crate::code_corpus::Eco::Npm,
+                crate::code_corpus::Eco::PyPI,
+                crate::code_corpus::Eco::Crates,
+            ],
+        };
+        // 任何一个生态已经收录过就不必再拉——检索会跨生态找到它。
+        let mut known = false;
+        for e in &candidates {
+            if crate::code_corpus::have_package(&state.db, *e, pkg).await {
+                known = true;
+                break;
+            }
+        }
+        for eco in candidates {
+            if known {
+                break;
+            }
             match crate::code_corpus::ingest(&state.db, eco, pkg, None).await {
                 Ok(report) => {
                     tracing::info!(
@@ -4620,10 +4644,16 @@ pub async fn code_corpus_search(
                     ingested = json!({
                         "name": report.name, "version": report.version, "entries": report.entries
                     });
+                    // 抽到东西就收手——同名包在多个生态里都存在是常态
+                    // （npm 上有个占坑的 pandas，PyPI 上是真的那个），
+                    // 继续往下试只会把无关的同名包也拉进来。
+                    if report.entries > 0 {
+                        break;
+                    }
                 }
                 Err(err) => {
                     let msg = err.to_string();
-                    crate::code_corpus::record_failure(&state.db, pkg, "", &msg).await;
+                    crate::code_corpus::record_failure(&state.db, eco, pkg, "", &msg).await;
                     tracing::warn!(package = %pkg, error = %msg, "code corpus: on-demand ingest failed");
                 }
             }
