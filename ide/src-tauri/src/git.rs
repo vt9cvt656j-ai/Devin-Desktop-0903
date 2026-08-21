@@ -1833,7 +1833,7 @@ mod git_log_behaviour_tests {
     /// 源码 grep 挡不住「空 if + 无条件 push」这种**等价于旧 bug** 的变体——
     /// 实测：那么改一遍，455 个测试全绿。所以这条跑真 git。
     fn sh(dir: &std::path::Path, args: &[&str]) {
-        let out = std::process::Command::new("git")
+        let out = crate::process_util::command("git")
             .current_dir(dir)
             .args(args)
             .output()

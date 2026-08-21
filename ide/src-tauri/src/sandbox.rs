@@ -266,7 +266,7 @@ fn seatbelt_available() -> bool {
 fn bubblewrap_available() -> bool {
     static PROBE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *PROBE.get_or_init(|| {
-        let out = std::process::Command::new("bwrap")
+        let out = crate::process_util::command("bwrap")
             .args([
                 "--ro-bind", "/", "/",
                 "--dev", "/dev",
@@ -551,7 +551,7 @@ mod tests {
 
         let run = |script: &str| {
             let plan = wrap("/bin/sh", &["-c"], script, &ws, &[]).expect("a plan on macOS");
-            std::process::Command::new(&plan.program)
+            crate::process_util::command(&plan.program)
                 .args(&plan.args)
                 // The profile grants the workspace by absolute path; the callers all set cwd
                 // there too, and a relative write in the script needs it to resolve inside.

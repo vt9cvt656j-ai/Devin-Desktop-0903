@@ -2507,7 +2507,7 @@ pub fn restrict_to_current_user(path: &std::path::Path, dir: bool) -> Result<(),
         // 上一版按 `Option<String>` 用它、还只传了一个参数——两个编译错误，于是整个
         // Windows 构建都出不来，这道闸门一次都没运行过。
         let icacls = crate::process_util::resolve_command("icacls", None);
-        let out = std::process::Command::new(icacls)
+        let out = crate::process_util::command(icacls)
             .arg(path)
             .arg("/inheritance:r")
             .arg("/grant:r")
@@ -2961,7 +2961,7 @@ mod tests {
     #[test]
     fn windows_only_code_actually_compiles_for_windows() {
         const TARGET: &str = "x86_64-pc-windows-msvc";
-        let installed = std::process::Command::new("rustc")
+        let installed = crate::process_util::command("rustc")
             .args(["--print", "target-libdir", "--target", TARGET])
             .output()
             .ok()
@@ -3011,6 +3011,9 @@ mod tests {
                  pub fn windows_command_is_explicit(c: &str) -> bool {{ c.contains('/') }}\n\
                  pub fn windows_command_candidates(c: &str, _p: &str) -> Vec<String> {{ vec![c.to_string()] }}\n\
                  pub fn augmented_path(_w: Option<&str>) -> String {{ String::new() }}\n\
+                 // 真实的 command() 会给 Windows 子进程设 CREATE_NO_WINDOW（不弹黑窗）。
+                 // 这里只需要一个签名相同的桩，让这段代码编得过。
+                 pub fn command(p: impl AsRef<std::ffi::OsStr>) -> std::process::Command {{ std::process::Command::new(p) }}\n\
              }}\n{}\n",
             resolve.replace("crate::process_util::", "process_util::"),
             restrict.replace("crate::process_util::", "process_util::"),
@@ -3020,7 +3023,7 @@ mod tests {
         std::fs::create_dir_all(&dir).expect("建临时目录");
         let src = dir.join("lib.rs");
         std::fs::write(&src, harness).expect("写临时源码");
-        let out = std::process::Command::new("rustc")
+        let out = crate::process_util::command("rustc")
             .args(["--target", TARGET, "--crate-type", "lib", "--emit=metadata", "-o"])
             .arg(dir.join("out.rmeta"))
             .arg(&src)
