@@ -36716,7 +36716,11 @@ function _terminalLogChunks(name = "", maxTasks = 3) {
   });
 }
 
-async function _agentReadLogs(call, root = "", run = null) {
+async function _agentReadLogs(call, root = "", run = null, out = null) {
+  // out.emptyRead：**结构化**地告诉调用方「这次一个字节都没读到」。
+  // 不靠回执文案去猜——文案是会被改的，判据不该跟着文案漂。
+  let _emptyRead = false;
+  const _finish = (text) => { if (out) out.emptyRead = _emptyRead; return text; };
   const lines = Math.max(20, Math.min(1000, Number(call?.lines) || 200));
   const explicit = [];
   if (Array.isArray(call?.paths)) explicit.push(...call.paths);
@@ -36752,8 +36756,14 @@ async function _agentReadLogs(call, root = "", run = null) {
     }
   }
   if (!chunks.length) {
-    if (_nameMiss) return `[终端没匹配上] ${_nameMiss}\n工作区常见日志位置也没有 .log/.out/.err 可读。`;
-    return "当前没有可读的 Agent 终端日志，也没有在工作区常见日志位置发现 .log/.out/.err。若报错输出里给了日志路径，调用 read_logs(path=那个路径) 读取尾部。";
+    // **一个字节都没读到**。这件事必须以结构化事实交出去，不能让下游拿文案去猜——
+    // _debugEvidenceKind 原来就是用 /没有可读/ 这样的正则判「取证是不是空的」，
+    // 而我把文案改成「也没有 .log/.out/.err 可读」之后，"没有"和"可读"被隔开，
+    // 正则失配，于是**一次什么都没读到的日志调用被记成了有效的运行时证据**。
+    // 改文案会再犯一次；这里给事实，判据那边读事实。
+    _emptyRead = true;
+    if (_nameMiss) return _finish(`[终端没匹配上] ${_nameMiss}\n工作区常见日志位置也没有 .log/.out/.err 可读。`);
+    return _finish("当前没有可读的 Agent 终端日志，也没有在工作区常见日志位置发现 .log/.out/.err。若报错输出里给了日志路径，调用 read_logs(path=那个路径) 读取尾部。");
   }
   // 裸切会让下游报出一个**精确的假数字**。
   //
@@ -36774,11 +36784,11 @@ async function _agentReadLogs(call, root = "", run = null) {
     : `[日志已截断] 实际共 ${_joined.length} 字、${chunks.length} 份，下面只有前 ${_LOG_BUDGET} 字。`
       + `缺的那几份用 read_logs(path=...) 单独取。\n\n` + _joined.slice(0, _LOG_BUDGET);
   if (_nameMiss) {
-    return `[终端没匹配上] ${_nameMiss}\n`
+    return _finish(`[终端没匹配上] ${_nameMiss}\n`
       + `下面这些是工作区里的日志文件，**不是**「${String(call.name).slice(0, 80)}」的输出，别当成它的。\n\n`
-      + _body;
+      + _body);
   }
-  return _body;
+  return _finish(_body);
 }
 
 function _markCommandFailureRecovery(run, root, diagnostics) {
@@ -36849,7 +36859,14 @@ function _debugEvidenceKind(call, result) {
     return /无匹配|未找到|找不到|no (?:matches|results)|\b0\s*(?:处|个|matches|results)\b/i.test(content) ? "" : "code_trace";
   }
   if (["diag", "logs", "termread"].includes(type)) {
-    return /暂无输出|没有可读|no diagnostics|\b0\s+errors?\b/i.test(content) ? "" : "runtime_evidence";
+    // 工具自己说「这次一个字节都没读到」时，以它为准。
+    // 下面那条散文正则是兜底：它判的是「回执长得像空的」，而回执文案会被改——
+    // read_logs 的文案从「没有可读」改成「也没有 .log/.out/.err 可读」之后，
+    // "没有"和"可读"被隔开，正则失配，一次零内容的读取就被记成了运行时证据。
+    if (result.evidence && typeof result.evidence.empty === "boolean") {
+      return result.evidence.empty ? "" : "runtime_evidence";
+    }
+    return /暂无输出|暂无新输出|没有[^\n]{0,30}?可读|no diagnostics|\b0\s+errors?\b/i.test(content) ? "" : "runtime_evidence";
   }
   // A green arbitrary command is not causal evidence for a bug. In particular,
   // `echo ok` or an unrelated build must not unlock source mutation merely because
@@ -57726,11 +57743,16 @@ async function _executeToolStepInner(step, call, root, run) {
       };
 
     } else if (call.type === "logs") {
-      const text = await _agentReadLogs(call, root, run);
-      res.className = "atc-result atc-result--ok";
-      res.textContent = "已读取日志";
+      const _logsOut = {};
+      const text = await _agentReadLogs(call, root, run, _logsOut);
+      res.className = _logsOut.emptyRead ? "atc-result atc-result--info" : "atc-result atc-result--ok";
+      res.textContent = _logsOut.emptyRead ? "没读到日志" : "已读取日志";
       if (vp) vp.innerHTML = `<pre>${_escHtml(text.slice(0, 12000))}</pre>`;
-      return { type: "logs", path: call.path || call.name || "", content: text };
+      // evidence.empty 是**事实**，不是文案。取证门原来拿正则去匹配回执里的
+      // 「没有可读」，改一次文案就失配一次——而失配的方向是把一次零内容的读取
+      // 记成有效的运行时证据，于是「先看日志再改代码」那道门被凭空打开。
+      return { type: "logs", path: call.path || call.name || "", content: text,
+        evidence: { empty: !!_logsOut.emptyRead } };
 
     } else if (call.type === "termlist") {
       const entries = _agentTerminalEntries().sort((a, b) => b.lastActivityAt - a.lastActivityAt);

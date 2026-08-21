@@ -30748,11 +30748,12 @@ test("读不了的文件不许说成「找不到」，而且错误码要被失�
 test("日志截断要说真实总量，不能让下游报出一个精确的假数字", () => {
   // 切到 `return _body` 为止：中间那两个自由变量（call / _nameMiss）当参数注进去，
   // 「点名的终端没匹配上」那条抬头有自己的测试，这里只看截断。
-  const seg = /const _joined = chunks\.join[\s\S]*?\n  return _body;/.exec(SRC);
+  const seg = /const _joined = chunks\.join[\s\S]*?\n  return _finish\(_body\);/.exec(SRC);
   assert.ok(seg, "日志截断那段不见了");
-  const f = new Function("chunks", "call", "_nameMiss", seg[0].replace("const _joined", "let _joined"));
+  const f = new Function("chunks", "call", "_nameMiss", "_finish",
+    seg[0].replace("const _joined", "let _joined"));
   const chunks = Array.from({ length: 8 }, (_, i) => "--- 日志文件: a" + i + ".log ---\n" + "x".repeat(12000));
-  const out = f(chunks, {}, "");
+  const out = f(chunks, {}, "", (x) => x);
   const real = chunks.join("\n\n").length;
   assert.match(out, new RegExp(`实际共 ${real} 字`),
     "没给真实总量 —— 下游那句「中间约 N 字不在上下文里」用的是砍完之后的长度，会低报几千倍");
@@ -30762,7 +30763,7 @@ test("日志截断要说真实总量，不能让下游报出一个精确的假�
     "返回正好顶到下游预算，恰恰是让那个假标记必然触发的值；要留出抬头和外部数据标记的位置");
   assert.match(out, /read_logs\(path=/, "没告诉模型缺的那几份怎么单独取");
   // 没超预算时原样返回，别平白加一句。
-  assert.equal(f(["short"], {}, ""), "short");
+  assert.equal(f(["short"], {}, "", (x) => x), "short");
 });
 
 test("CI 日志：第一行就是错因时不许说「没匹配到失败关键词」，抬头的行数要从实际交付反推", () => {
@@ -31398,4 +31399,60 @@ test("送给模型的图必须先消毒：SVG 要栅格化，送不进去的要�
   const none = await build(["data:image/svg+xml;base64,BBB"], { model: "m" }, "看图", "hint");
   assert.equal(typeof none.content, "string");
   assert.match(none.content, /一张图都没能送进来，别假装看过/);
+});
+
+// 取证门原来拿**散文正则**判「这次取证是不是空的」：/暂无输出|没有可读|.../。
+// 而回执文案是会改的——read_logs 的空态文案改成「也没有 .log/.out/.err 可读」之后，
+// "没有" 和 "可读" 被隔开，正则失配，于是**一次一个字节都没读到的日志调用，
+// 被记成了有效的运行时证据**，「先看日志再改代码」那道门就被凭空打开了。
+// 判据要读事实，不能读文案。
+test("取证门：日志一个字节都没读到时，不许算成运行时证据", async () => {
+  // ① _agentReadLogs 通过 out.emptyRead 把事实交出来（三条空态出口都要标）。
+  const mkRead = (deps) => load("_agentReadLogs", {
+    _formatAgentTerminalLines: () => [],
+    _looksLikeLogFileName: () => true,
+    _readLogTailForAgent: async () => ({ error: "not found" }),
+    _workspaceLogCandidates: async () => [],
+    _terminalLogChunks: () => [],
+    ...deps,
+  });
+
+  for (const [name, call, deps] of [
+    ["什么都没有", {}, {}],
+    ["点名的终端没匹配上", { name: "worker" }, {}],
+  ]) {
+    const out = {};
+    await mkRead(deps)(call, "/w", null, out);
+    assert.equal(out.emptyRead, true, `${name}：没标成「什么都没读到」`);
+  }
+
+  // 真读到东西时不能误标。
+  const got = {};
+  const text = await mkRead({ _terminalLogChunks: () => ["--- 终端日志: a ---\nhello"] })(
+    { name: "a" }, "/w", null, got);
+  assert.equal(got.emptyRead, false, "读到了却标成空");
+  assert.match(text, /hello/);
+
+  // ② 判据读事实，不读文案。
+  const kind = load("_debugEvidenceKind", { _toolExecutionSucceeded: () => true });
+  assert.equal(kind({ type: "logs" }, { content: "随便什么文案", evidence: { empty: true } }), "",
+    "工具明说这次什么都没读到，判据还是把它算成了运行时证据");
+  assert.equal(kind({ type: "logs" }, { content: "随便什么文案", evidence: { empty: false } }), "runtime_evidence");
+
+  // ③ 散文兜底仍要盖住我改过的那句实际文案（没有结构化事实的老结果走这条）。
+  const realEmpty = "[终端没匹配上] 没找到匹配「worker」的 IDE 终端；当前 IDE 一个终端都没打开。\n"
+    + "工作区常见日志位置也没有 .log/.out/.err 可读。";
+  assert.equal(kind({ type: "logs" }, { content: realEmpty }), "",
+    "散文兜底盖不住真实的空态文案 —— 这正是当初失配的那一句");
+  assert.equal(kind({ type: "termread" }, { content: "IDE普通终端「a」状态：运行中。最新输出：(暂无新输出)" }), "");
+  assert.equal(kind({ type: "logs" }, { content: "--- 终端日志: a ---\nlistening on 8080" }), "runtime_evidence");
+
+  // ④ 接线：执行端必须真的把 emptyRead 变成 evidence.empty 带回去。
+  //    判据写对了、事实没送到，等于没修——上一轮的变异测试就漏在这一条。
+  const exec = SRC.slice(SRC.indexOf('} else if (call.type === "logs") {'),
+                         SRC.indexOf('} else if (call.type === "termlist") {'));
+  assert.match(exec, /_agentReadLogs\(call, root, run, _logsOut\)/,
+    "执行端没把出参传进去，emptyRead 根本收不到");
+  assert.match(exec, /evidence: \{ empty: !!_logsOut\.emptyRead \}/,
+    "执行端没把「什么都没读到」作为结构化事实带回结果");
 });
