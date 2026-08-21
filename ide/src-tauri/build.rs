@@ -104,5 +104,39 @@ fn newest_mtime(dir: &std::path::Path) -> Option<std::time::SystemTime> {
 
 fn main() {
     assert_sidecar_is_authenticated();
+    windows_dpi_aware_manifest();
     tauri_build::build()
+}
+
+/// 声明 per-monitor DPI 感知（只影响 Windows 目标）。
+///
+/// 不声明的进程会被 Windows **虚拟化**：UI Automation 的 BoundingRectangle 给的是
+/// 真实物理像素，而 GetSystemMetrics / GetCursorPos 给的是被缩放过的逻辑像素——
+/// 两者差一个缩放系数。而 read_screen 出坐标、mouse.move 吃坐标，工具描述还明写着
+/// 「screen.info、read_screen、window.list、mouse.move 说的是同一套坐标，
+/// 绝不要乘 scale_factor」。在 125%/150% 缩放（Windows 笔记本出厂默认）下，
+/// 模型照着读到的坐标去点，必然点在别处——而每一步回执都说成功。
+///
+/// 走 manifest 而不是运行时调 SetProcessDpiAwarenessContext：manifest 在进程启动前
+/// 就生效，不依赖代码执行时机，也不会被先跑到的某个库抢先设成别的等级。
+fn windows_dpi_aware_manifest() {
+    if std::env::var("CARGO_CFG_WINDOWS").is_err() {
+        return;
+    }
+    let out = PathBuf::from(std::env::var("OUT_DIR").unwrap_or_default());
+    let path = out.join("dpi-aware.manifest");
+    let manifest = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
+  <application xmlns="urn:schemas-microsoft-com:asm.v3">
+    <windowsSettings>
+      <dpiAwareness xmlns="http://schemas.microsoft.com/SMI/2016/WindowsSettings">PerMonitorV2</dpiAwareness>
+      <dpiAware xmlns="http://schemas.microsoft.com/SMI/2005/WindowsSettings">true/pm</dpiAware>
+    </windowsSettings>
+  </application>
+</assembly>
+"#;
+    if std::fs::write(&path, manifest).is_ok() {
+        println!("cargo:rustc-link-arg-bins=/MANIFESTINPUT:{}", path.display());
+        println!("cargo:rustc-link-arg-bins=/MANIFEST:EMBED");
+    }
 }

@@ -1162,7 +1162,12 @@ test("打包进 app 的 automation sidecar 必须带鉴权，且这道闸在构�
   // Apple Silicon 装到安全的那份、Intel Mac 和 Windows 装到零鉴权那份，全程无报错。
   // 换掉二进制不够：手工产物迟早再次和源码脱节，所以闸必须在构建期。
   assert.match(build, /fn assert_sidecar_is_authenticated/, "构建期要有 sidecar 鉴权闸");
-  assert.match(build, /assert_sidecar_is_authenticated\(\);\s*\n\s*tauri_build::build\(\)/,
+  // 断言的是**顺序**（闸在 build 之前跑），不是「紧挨着」——中间还会有别的构建期
+  // 步骤（比如 Windows 的 DPI manifest）。原来那条正则要求两行相邻，加一行就失配，
+  // 而失配时人只会去改正则，不会去问「闸是不是真的被绕过了」。
+  const _gateAt = build.indexOf("assert_sidecar_is_authenticated();");
+  const _buildAt = build.indexOf("tauri_build::build()");
+  assert.ok(_gateAt >= 0 && _buildAt > _gateAt,
     "闸必须在 tauri_build::build() 之前跑");
   assert.match(build, /MICHAEL_AUTOMATION_TOKEN/);
   assert.match(build, /unauthorized/);
