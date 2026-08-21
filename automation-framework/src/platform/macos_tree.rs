@@ -484,3 +484,44 @@ unsafe fn walk_one(el: AXUIElementRef, out: &mut Vec<AxNode>) {
         enabled: attr_bool(el, "AXEnabled").unwrap_or(true),
     });
 }
+
+#[cfg(test)]
+mod act_tests {
+    /// 句柄表和 ref 解析的端到端验证——不真的按下去，但把 act 在动作**之前**做的
+    /// 每一步都跑一遍：查表、拿句柄、回读元素、比签名。
+    ///
+    /// 为什么值得单独测：这条路是「读一次留下句柄，点的时候直接用」，而老路是
+    /// 「点的时候重跑一遍枚举按下标取」。下标那套一旦界面动过就错位，句柄这套不会——
+    /// 但句柄如果没 retain 住，用的时候就是野指针（已经踩过一次 SIGTRAP）。
+    ///   cargo test --all-features act_ref -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn act_ref_resolves_and_detects_staleness() {
+        let pid: i32 = std::env::var("AX_PID").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+        assert!(pid > 0, "用 AX_PID=<进程号> 指定目标");
+        let nodes = super::snapshot(pid, 200);
+        assert!(!nodes.is_empty(), "先得读到东西");
+
+        // 不存在的 ref 要说清楚，而不是崩或者点到别的东西上。
+        let bad = super::act(999_999, "press", None).unwrap_err();
+        assert!(bad.contains("不在最近一次读屏结果里"), "越界 ref 的说法不对：{bad}");
+
+        // 不支持的动作同样要点名可用的是哪几个。
+        let wrong = super::act(1, "click", None).unwrap_err();
+        assert!(wrong.contains("press") && wrong.contains("focus"), "不支持的动作没列出可用的：{wrong}");
+
+        // 真正要验的：ref 1 的句柄还活着，回读得到、签名对得上。
+        // 走 set_value 到一个多半不可写的元素上——它会在**签名比对之后**才失败，
+        // 所以只要报的不是「过期」就说明句柄和签名这一段是通的。
+        let r = super::act(1, "set_value", Some("__probe__"));
+        match r {
+            Ok(_) => println!("ref 1 可写，句柄链路通"),
+            Err(e) => {
+                assert!(!e.contains("已经过期"), "句柄没留住或签名对不上：{e}");
+                assert!(!e.contains("不存在"), "句柄失效了：{e}");
+                println!("ref 1 不可写（预期内），但签名比对通过：{e}");
+            }
+        }
+        println!("句柄表 {} 个元素，ref 解析与签名比对正常", nodes.len());
+    }
+}
