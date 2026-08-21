@@ -532,7 +532,7 @@ pub async fn ensure_tor() -> Result<(), String> {
         }
     };
     // Launch detached; tor keeps running in the background after we drop the handle.
-    std::process::Command::new(&bin)
+    crate::process_util::command(&bin)
         .args(["--SocksPort", "9050", "--quiet"])
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
