@@ -59,7 +59,7 @@
         "properties": {
           "query": {
             "type": "string",
-            "description": "Text to search for (regex supported, e.g. \"function\\s+login\")"
+            "description": "Text to search for. **Literal by default** — every character is matched as-is, so \"function\\s+login\" would look for that exact text and find nothing. For a real pattern you must also pass mode=\"regex\"."
           },
           "path": {
             "type": "string",
@@ -430,7 +430,7 @@
             "type": "array",
             "minItems": 1,
             "maxItems": 4,
-            "description": "Optional · dispatch several at once: send multiple read-only subtasks in one call (up to 4; all 4 run concurrently, each with its own card, merged into one report on completion). Each entry is {role, task}; when dispatching only one subtask, omit this and use prompt.",
+            "description": "Optional · dispatch several at once: send multiple read-only subtasks in one call (up to 4, each with its own card, merged into one report on completion. They run concurrently only at the top level, and only while the session-wide sub-agent slots are free (4 shared across the whole session); a sub-agent that dispatches its own tasks runs them one after another, so budget its timeout accordingly). Each entry is {role, task}; when dispatching only one subtask, omit this and use prompt.",
             "items": {
               "anyOf": [
                 {
@@ -2222,7 +2222,7 @@
     "type": "function",
     "function": {
       "name": "generate_image",
-      "description": "**Generate an image from a text description** (AI image generation), saved straight into the workspace, with **the generated image sent back to you**. Two uses: (1) real assets for UI and web pages — hero images, illustrations, logos, textures, avatars, placeholders, OG images; (2) UI design comps / interface mockups to show the user what it will look like (then write the code from them). A prompt works best written in five parts: Scene → Subject → Important details (material/lighting/lens) → Use case → Constraints. English is more precise. **When producing a UI mockup, always write it as \"a high-fidelity screenshot of a shipped product\"** (high-fidelity UI screenshot of a working …; **do not use concept art / illustration / sketch**). Any combination of multiples of 16 is supported; common ones: **2048×2048 ultra-sharp square** (default), 1536×1024 landscape, 1024×1536 portrait, 3072×3072 ultra-high. **2048×2048 ultra-sharp is already the default** — there is no need to pass width/height deliberately. After generating, judge it from the image sent back, and if it is not right, revise the prompt and regenerate.",
+      "description": "**Generate an image from a text description** (AI image generation), saved straight into the workspace, with **the generated image sent back to you**. Two uses: (1) real assets for UI and web pages — hero images, illustrations, logos, textures, avatars, placeholders, OG images; (2) UI design comps / interface mockups to show the user what it will look like (then write the code from them). A prompt works best written in five parts: Scene → Subject → Important details (material/lighting/lens) → Use case → Constraints. English is more precise. **When producing a UI mockup, always write it as \"a high-fidelity screenshot of a shipped product\"** (high-fidelity UI screenshot of a working …; **do not use concept art / illustration / sketch**). Size depends on the model actually in use. Omitting width/height sends `auto` and lets the model decide — that is the recommended default. The auto-picked gpt-image / dall-e family only supports 1024x1024, 1536x1024 and 1024x1536, and snaps any other request to the nearest of those; 2048×2048 and 3072×3072 are NOT reachable there. Free width/height (multiples of 16) are passed through only to non-gpt-image models. Just omit width/height unless you need a specific aspect ratio — `auto` is what gets sent, and on gpt-image/dall-e only the three fixed sizes above exist anyway. After generating, judge it from the image sent back, and if it is not right, revise the prompt and regenerate.",
       "parameters": {
         "type": "object",
         "properties": {
@@ -2966,7 +2966,7 @@
     "type": "function",
     "function": {
       "name": "generate_3d",
-      "description": "Generate a 3D model with AI (.glb). Describe the model you want in text → the mesh and texture are generated and saved to assets/models/. Built on open models such as Hunyuan3D / TripoSR / TRELLIS.",
+      "description": "Generate a 3D model with AI. Describe the model you want in text → the mesh and texture are generated and saved to assets/models/, usually as .glb. When the upstream returns another format the file is saved under its real extension and the receipt names it — go by the path in the receipt. Built on open models such as Hunyuan3D / TripoSR / TRELLIS.",
       "parameters": {
         "type": "object",
         "properties": {
@@ -3105,7 +3105,7 @@
     "type": "function",
     "function": {
       "name": "generate_motion",
-      "description": "Generate character animation / motion with AI. Produces an animation file for an existing character or model task_id, saved to assets/animations/.",
+      "description": "Generate character animation / motion with AI. Produces an animation file for an existing character or model task_id, saved to assets/animations/, usually as .glb. When the upstream returns another format the file is saved under its real extension and the receipt names it — go by the path in the receipt.",
       "parameters": {
         "type": "object",
         "properties": {
@@ -3138,7 +3138,7 @@
     "type": "function",
     "function": {
       "name": "generate_texture",
-      "description": "Generate PBR texture maps with AI. Text description → the full albedo / normal / roughness / metallic set saved to assets/textures/. Built on MatFuse / Paint3D.",
+      "description": "Generate a PBR texture with AI. Text description → **one** image file saved to assets/textures/ (the path comes back in the receipt). It does not produce a separate albedo/normal/roughness/metallic set — if you need the other maps, ask for them one at a time. Built on MatFuse / Paint3D.",
       "parameters": {
         "type": "object",
         "properties": {
@@ -3207,7 +3207,7 @@
     "type": "function",
     "function": {
       "name": "download_asset",
-      "description": "Download a game asset into the workspace. Used together with search_game_assets — pick one of the search results and download it.",
+      "description": "Download a game asset into the workspace. Used together with search_game_assets — pick one of the search results and download it. The saved file is checked against its real format: if the bytes disagree with the extension you asked for, it is saved under the real one and the receipt says so — go by the path in the receipt.",
       "parameters": {
         "type": "object",
         "properties": {
