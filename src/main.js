@@ -57529,7 +57529,7 @@ async function _executeToolStepInner(step, call, root, run) {
             // 真正不出现的是**没合并进来**的分支。原来那句「别的分支上的提交不会出现在
             // 这里」在有过合并的分支上是假话，而这个仓库天天在合并。
             + `（这是 HEAD 的祖先链：已经合并进来的分支，它们的提交也在其中；\n`
-            + `　没有合并进来的分支上的提交才不会出现。要跨分支找请指名那条分支。）：\n`;
+            + `　没有合并进来的分支上的提交才不会出现。要看别的分支，git_log 没有分支参数，用 run_cmd 跑 \`git log <分支名> --oneline -20\`。）：\n`;
           res.className = "atc-result atc-result--ok"; res.textContent = `${entries.length} 条提交`;
           if (vp) vp.innerHTML = `<pre>${_escHtml(lines.join("\n") || "(无提交)")}</pre>`;
           return { type: "git", path: "log", content: (lines.length ? _logHead + lines.join("\n") : "(无提交历史)") + gitRerootNote };

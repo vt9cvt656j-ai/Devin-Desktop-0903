@@ -2492,7 +2492,7 @@ test("the approval gate is real, reachable, and exposed in settings", () => {
 // Behavioural cover for the gate itself. The dangerous-command path must ask in EVERY
 // permission mode — that is the boundary that turns "a repo file told the model to run
 // this" into a question rather than an execution.
-test("dangerous commands are gated in auto mode; ordinary tools are not", async () => {
+test("auto 档一个都不问（高危也不问）；approve 才是那道门", async () => {
   const asked = [];
   const mk = (decision, perm) => load("_approveToolCall", {
     _dbCallIsDestructive: () => false,
@@ -2518,18 +2518,24 @@ test("dangerous commands are gated in auto mode; ordinary tools are not", async 
   const ls = { type: "cmd", command: "ls -la" };
   const write = { type: "write", path: "a.js" };
 
-  // auto mode: ordinary tools run untouched, the dangerous one still asks
-  assert.equal(await mk("once", "auto")(ls), true);
-  assert.equal(await mk("once", "auto")(write), true);
-  assert.equal(asked.length, 0, "auto mode must not interrupt ordinary work");
-  assert.equal(await mk("once", "auto")(rm), true, "allowing runs it");
-  assert.equal(asked.length, 1, "…but it had to ask first");
-  assert.equal(await mk("deny", "auto")(rm), false, "declining blocks it");
+  // auto 是默认档，现在**一个都不问**——高危也不问。
+  //
+  // 这条契约以前不是这样：auto 下高危仍然会弹框。用户明确要求改掉，理由是
+  // 那让默认状态变成一个走两步就停下等人点的智能体。判据现在只有一条：
+  // 他有没有主动打开「改动前审批」。所以这里断言的是「一次都不弹」，
+  // 只要有一处漏判，默认体验就又变回走走停停。
+  for (const call of [ls, write, rm]) {
+    assert.equal(await mk("deny", "auto")(call), true,
+      `auto 档下 ${call.type} 应当直接放行（连对话框都不该造出来，所以 deny 也不影响）`);
+  }
+  assert.equal(asked.length, 0, `auto 档下一个框都不该弹，实际弹了 ${asked.length} 次`);
 
-  // approve mode additionally gates every state-changing tool
+  // approve 才是那道门：状态变更类工具和高危命令都要问。
   asked.length = 0;
   assert.equal(await mk("deny", "approve")(write), false);
   assert.equal(asked.length, 1, "approve mode asks before a write");
+  assert.equal(await mk("once", "approve")(rm), true, "approve 档下高危问过之后照样能放行");
+  assert.equal(asked.length, 2, "高危在 approve 档下必须问");
 });
 
 // Every green run ended with two adjacent lines that contradicted each other:
@@ -3057,10 +3063,12 @@ test("configured rules run ahead of every other check in the gate", async () => 
   assert.equal(await gate({ ...none, allow: ["Bash(rm -rf /)"] })({ type: "cmd", command: "rm -rf /" }), true);
   assert.equal(asked, 0);
 
-  // ask forces a prompt even in auto mode for something otherwise unremarkable
+  // ask 规则现在**只在授权模式下**才弹框。auto 是默认档，用户要的是它一个都不问，
+  // 而 ask 规则可能来自 clone 来的仓库——开关是用户本人的决定，比仓库带来的策略更权威。
+  // deny 不受影响（上面那条），它是静默硬停，不是询问。
   asked = 0;
   assert.equal(await gate({ ...none, ask: ["Write(src/**)"] })({ type: "write", path: "src/a.ts" }), true);
-  assert.equal(asked, 1, "an ask rule prompts even when the mode would not");
+  assert.equal(asked, 0, "auto 档下 ask 规则也不弹——判据只有「有没有开授权模式」");
 
   // a broken rules load must fail OPEN to the normal policy, not lock the IDE up
   asked = 0;
@@ -3202,8 +3210,10 @@ test("session approval is remembered per exact call, not per tool", async () => 
   assert.equal(asks, 2, "a DIFFERENT npm command must ask on its own");
 });
 
-// No DOM means nobody can answer. A dangerous command must not slip through by default.
-test("with no dialog available the gate denies dangerous commands and allows the rest", async () => {
+// 没有 DOM 就没人能回答。但 auto 档现在压根不问，所以这条只在**授权模式**下才成立：
+// 用户主动打开了那道门，却没有能回答的界面，那就只能拒——不能因为界面缺席就
+// 把他打开的门当没打开。auto 档下无论危不危险都直接放行，一次都不问。
+test("授权模式下没有界面可问就拒；auto 档下压根不问", async () => {
   const gate = (dangerous) => load("_approveToolCall", {
     _dbCallIsDestructive: () => false,
     _callIsDestructive: () => dangerous,
@@ -31479,6 +31489,13 @@ test("git_log 只看当前分支，并且说清是哪条分支", () => {
   assert.match(out.content, /HEAD 的祖先链/, "没说清范围，模型会以为这是全仓最近的提交");
   assert.match(out.content, /已经合并进来的分支，它们的提交也在其中/,
     "把「不含其它分支」说死了 —— 合并进来的分支提交明明在里面");
+  // 上一版写的是「要跨分支找请指名那条分支」，可 git_log 的 schema 只有 count 一个参数，
+  // 映射层也只读 args.count——模型照着发 git_log({branch:"x"}) 会拿到一模一样的结果，
+  // 而且不知道自己的参数被丢了。给一条真能跑的路。
+  assert.doesNotMatch(out.content, /指名那条分支/,
+    "又教模型给 git_log 传分支参数了 —— 它没有这个参数，会被静默丢掉");
+  assert.match(out.content, /git_log 没有分支参数/, "没说清这个工具看不了别的分支");
+  assert.match(out.content, /git log <分支名> --oneline/, "没给出真能跑的替代路");
   assert.doesNotMatch(out.content, /别的分支上的提交不会出现在这里/,
     "又把那句在有合并时不成立的话写回去了");
   assert.match(out.content, /abc1234 fix/);
