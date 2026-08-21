@@ -37281,22 +37281,68 @@ function _questionSimilarity(a, b) {
   // 任意两句长英文的字符集几乎全覆盖。配上 0.65 的阈值，英文用户问第二个**完全不同**的
   // 问题时会被判成「你已经问过了」，直接吃到 [ALREADY_ANSWERED] —— 一次会话只能被问一次。
   //
-  // 两边都不含中日韩时改用**词集合**；含 CJK 时一字不动（现有标定测试钉着那组 margin）。
-  // 不整体换成 bigram：实测中文 SAME 最低 0.429、DIFF 最高 0.429，margin 归零，当场打挂标定。
-  // 代价是英文的**真**改写会掉到 0.3–0.4、模型多问一次 —— 这正是这个函数注释自己定的取舍
+  // 判据不是「这句话里有没有中文」，而是「**这一段**是中文还是拉丁」。
+  //
+  // 上一版按「任一边含 CJK 就整句走字符集合」分派，于是只要出现一个汉字就退回饱和的
+  // 字符 Jaccard。而这个产品里最常见的问法恰恰是**中英混写**（界面中文、技术词英文）：
+  // 实测「Should I use PostgreSQL 还是 MySQL？」vs「Should I enable dark mode 还是
+  // light mode？」= 0.667，照样被判重复 —— 修复覆盖不到主用例。
+  //
+  // 改成逐段分派：中日韩按**字**切（这些语言没有空格，按词切不可靠），拉丁字母和数字
+  // 按**词**切（26 个字母的语言按字切恒高），两边取并集。
+  // 纯中文的集合与旧实现逐字相同（标点空白本来就不是 CJK 字符，自然被排除），
+  // 所以钉着中文 margin 的标定测试不受影响；纯英文保持已修好的词集合。
+  // 代价仍是英文的**真**改写会掉到 0.3 以下、模型多问一次 —— 这正是本函数既定的取舍
   //（漏判只多问一次，误判会拿旧答案顶掉新问题）。
-  // 注意：_normalizeQuestion **把空格也删了**（中文按字比对时那样更稳），所以按词切必须
-  // 回到**原始串**上做，不能用 x / y。
-  const _hasCjk = (t) => /[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uac00-\ud7af]/.test(t);
-  const _cjk = _hasCjk(String(a)) || _hasCjk(String(b));
-  const _words = (raw) => new Set(
-    String(raw || "").toLowerCase().split(/[^a-z0-9]+/i).filter((w) => w.length > 1));
-  const sx = _cjk ? new Set(x) : _words(a);
-  const sy = _cjk ? new Set(y) : _words(b);
+  // 注意：_normalizeQuestion **把空格也删了**，所以按词切必须回到**原始串**上做，不能用 x / y。
+  const _CJK_CHAR = /[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uac00-\ud7af]/;
+  const _tokens = (raw) => {
+    const t = new Set();
+    const low = String(raw || "").toLowerCase();
+    for (const w of low.split(/[^a-z0-9]+/i)) if (w.length > 1) t.add(w);
+    for (const ch of low) if (_CJK_CHAR.test(ch)) t.add(ch);
+    return t;
+  };
+  const sx = _tokens(a);
+  const sy = _tokens(b);
   if (!sx.size || !sy.size) return 0;
+  // 按**字符长度**加权，不是按 token 计数。
+  //
+  // 不加权的话，一个共享的长技术词只算 1 分：「要不要用 TypeScript 重写」和
+  // 「是否用 TypeScript 重写」——同一个问题——会掉到 0.5，被判成新问题。
+  // 旧的按字比对里 typescript 天然占 10 个字符的分量，加权把这份分量还回来，
+  // 同时保住「整词才算命中」（不加权重也不行：不相干的两句英文按字比对恒高）。
+  // 纯中文每个 token 都只有 1 个字符，加权与不加权完全等价 —— 中文标定原样成立。
+  const _w = (set) => { let n = 0; for (const t of set) n += t.length; return n; };
   let inter = 0;
-  for (const c of sx) if (sy.has(c)) inter++;
-  return inter / (sx.size + sy.size - inter);
+  for (const t of sx) if (sy.has(t)) inter += t.length;
+  const union = _w(sx) + _w(sy) - inter;
+  const score = union > 0 ? inter / union : 0;
+
+  // 安全下限：差在一对**反义动作**上的两个问题，不可能是同一个问题的改写。
+  //
+  // 词袋相似度对「只差一个内容词」的最小对天生给高分——实测
+  // 「Should I add the cache layer?」vs「…remove…」= 0.679，越过 0.65 被判成重复，
+  // 于是「要不要删」直接拿到了「要不要加」的旧答案。这正是本函数自己写明的最坏情况
+  //（漏判只多问一次，误判会拿旧答案顶掉新问题），而且**没有任何阈值**能把这类最小对
+  // 和真改写分开（真改写同样落在 0.61–0.68）。
+  //
+  // 所以这里加的是**门槛**，不是判断——架构里正则只用于权限和下限，这是下限。
+  // 名单只收确凿的动作反义；「是/否」「要/不要」这类是问法差异，绝不能进来。
+  const _ANTONYMS = [
+    ["add", "remove"], ["add", "delete"], ["add", "drop"], ["enable", "disable"],
+    ["start", "stop"], ["open", "close"], ["show", "hide"], ["install", "uninstall"],
+    ["create", "delete"], ["include", "exclude"], ["allow", "deny"], ["allow", "block"],
+    ["increase", "decrease"], ["expand", "collapse"], ["keep", "discard"],
+    ["加", "删"], ["开", "关"], ["增", "减"], ["启", "禁"], ["显", "隐"],
+  ];
+  const _onlyIn = (p, q) => { const d = new Set(); for (const t of p) if (!q.has(t)) d.add(t); return d; };
+  const dx = _onlyIn(sx, sy);
+  const dy = _onlyIn(sy, sx);
+  for (const [p, q] of _ANTONYMS) {
+    if ((dx.has(p) && dy.has(q)) || (dx.has(q) && dy.has(p))) return Math.min(score, 0.4);
+  }
+  return score;
 }
 
 /**

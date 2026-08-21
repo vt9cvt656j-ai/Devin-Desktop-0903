@@ -22880,6 +22880,10 @@ test("相似度阈值是标定出来的：同一问题的改写要命中，不�
     ["Which database should I use for this project?", "Should the login page support social sign-in?"],
     ["Do you want dark mode enabled by default?", "Which package manager should the project use?"],
     ["Should I add end-to-end tests now?", "What is the deploy target for this build?"],
+    // 中英混写：这个产品最常见的问法，上一版整句分派时这一类会退回老路被判重复。
+    ["Should I use PostgreSQL 还是 MySQL？", "Should I enable dark mode 还是 light mode？"],
+    // 最难的一对：只差一个技术词，仍然是两个问题。
+    ["前端用 React 还是 Vue？", "前端用 React 还是 Svelte？"],
   ];
   for (const [a, b] of SAME) assert.ok(sim(a, b) >= 0.65, `「${a}」和「${b}」是同一个问题，却没命中：${sim(a, b)}`);
   for (const [a, b] of DIFF) assert.ok(sim(a, b) < 0.65, `「${a}」和「${b}」是两件事，却被判成同一个：${sim(a, b)}`);
@@ -31079,17 +31083,56 @@ test("英文问两个完全不同的问题，不许被判成重复", () => {
   assert.equal(sim("Use postgres?", "Use postgres?"), 1);
   assert.ok(sim("Use postgres for this?", "Use postgres") >= 0.9, "包含关系的快路没了");
 
-  // **取舍写明**：英文的真改写会掉到阈值之下，模型因此多问一次 —— 这是这个函数注释
-  // 自己定的方向（漏判只多问一次，误判会拿旧答案顶掉新问题）。钉住它，免得后人
-  // 「顺手调高召回」把误判那一侧放回来。
+  // 中英**混写**——界面中文、技术词英文，这个产品里最常见的问法。
+  // 上一版按「任一边含 CJK 就整句走字符集合」分派，于是只要出现一个汉字就退回饱和的
+  // 老路：实测 0.667，照样判重复。修复必须覆盖到这里，否则等于没修主用例。
+  for (const [a, b] of [
+    ["Should I use PostgreSQL 还是 MySQL？", "Should I enable dark mode 还是 light mode？"],
+    ["这个接口用 REST 还是 GraphQL？", "这个页面用 SSR 还是 CSR？"],
+  ]) {
+    assert.ok(sim(a, b) < DUP, `中英混写的两个不同问题被判成重复：${sim(a, b).toFixed(3)}\n  ${a}\n  ${b}`);
+  }
+
+  // **取舍写明**。英文这一侧，真改写和「最小反义对」的分数是**重叠**的：
+  //   Should I start the server? / …stop…                         → 0.625
+  //   Should I add tests for this feature? / Do I need to add tests… → 0.611
+  // 没有任何阈值能把这两类分开。所以阈值放在保证**不误判**的那一侧——0.65 之下一律
+  // 当新问题，代价是部分英文改写被多问一次（漏判只多问一次，误判会拿旧答案顶掉新问题）。
+  // 钉住的是**方向**，不是某个具体分数：反义对绝不能越过阈值。
+  for (const [a, b] of [
+    ["Should I start the server?", "Should I stop the server?"],
+    ["Should I add the cache layer?", "Should I remove the cache layer?"],
+    ["Deploy to staging?", "Deploy to production?"],
+  ]) {
+    assert.ok(sim(a, b) < DUP,
+      `语义相反的最小对被判成同一个问题：${sim(a, b).toFixed(3)}\n  ${a}\n  ${b}`);
+  }
+  // 反义对靠的是**下限**，不是阈值：词袋相似度对「只差一个内容词」的最小对天生给高分
+  // （加权后 add/remove the cache layer 一度到 0.679，越过 0.65 被判成重复——
+  // 「要不要删」直接拿到了「要不要加」的旧答案）。而真改写同样落在 0.61–0.68，
+  // **没有任何阈值**能把这两类分开，所以只能在判据之外压一道下限。
+  const src0 = extractFn("_questionSimilarity");
+  assert.match(src0, /_ANTONYMS/, "反义下限没了 —— 相反的两个问题会被合并");
+  assert.ok(sim("Should I add the cache layer?", "Should I remove the cache layer?") <= 0.4,
+    "反义下限没压住");
+  assert.ok(sim("要不要加缓存层", "要不要删缓存层") <= 0.4, "中文的反义下限没压住");
+  // 名单只收确凿的动作反义；「是/否」「要/不要」是问法差异，进来会把真改写全打掉。
+  assert.doesNotMatch(src0, /\["是", *"否"\]|\["要", *"不"\]/,
+    "把问法差异当成了反义 —— 真改写会被整片误伤");
+
+  // 相似度本身还得有意义：真改写不能掉到和陌生问题一个档位。
   const rewrite = sim("Which database should I use?", "What database should I use?");
-  assert.ok(rewrite < DUP,
-    "英文真改写又被判成重复了 —— 方向错了：误判的代价是拿旧答案顶掉新问题");
-  assert.ok(rewrite > 0.4, `英文真改写掉得太狠（${rewrite.toFixed(3)}），相似度已经失去意义`);
+  assert.ok(rewrite > 0.5, `英文真改写掉得太狠（${rewrite.toFixed(3)}），相似度已经失去意义`);
 
   // 分派必须在**原始串**上做：_normalizeQuestion 把空格也删了，在它之后按词切永远是空集。
   const src = extractFn("_questionSimilarity");
-  assert.match(src, /_words\(a\)/, "按词切用的不是原始串 —— 空格已经被规范化删掉了");
+  assert.match(src, /_tokens\(a\)/, "按词切用的不是原始串 —— 空格已经被规范化删掉了");
+  // 而且必须**逐段**分派，不能整句二选一：整句分派就是「有一个汉字就退回老路」那个 bug。
+  assert.doesNotMatch(src, /_hasCjk\(String\(a\)\) \|\| _hasCjk\(String\(b\)\)/,
+    "又退回整句分派了 —— 中英混写会整句走字符集合，主用例覆盖不到");
+  // 长技术词要按字符长度加权：不加权的话共享的 typescript 只算 1 分，
+  //「要不要用 TypeScript 重写」和「是否用 TypeScript 重写」会掉到 0.5 被判成新问题。
+  assert.match(src, /inter \+= t\.length/, "Jaccard 没有按字符长度加权");
 });
 
 // read_logs(name=...) 点名一个终端，没匹配上时代码**照样**往下走去读工作区里的日志文件。
