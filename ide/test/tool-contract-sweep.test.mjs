@@ -68,6 +68,11 @@ function buildMapToolCall(catalog) {
     extractFn("_applyToolArgDefaults"),
     extractFn("_canonicalToolName"),
     extractFn("_finiteNumberArg"),
+    // _normPlanSteps 取步骤文字走 _planStepText（带两张常量表）——少一个就当场
+    // ReferenceError，而这条测试的全部意义就是"照 schema 填的参数不许让映射崩掉"。
+    extractConst("_PLAN_STEP_TEXT_KEYS"),
+    extractConst("_PLAN_STEP_META_KEYS"),
+    extractFn("_planStepText"),
     extractFn("_normPlanSteps"),
     extractFn("_shellKind"),
   ].filter(Boolean).join("\n");

@@ -20785,7 +20785,7 @@ let _lastRefusal = null;
 // 所以「自主执行」的前提不是放宽权限，而是让每一个等人的地方都有出口。
 let _unattendedRun = false;
 function _setUnattendedRun(on) { _unattendedRun = !!on; }
-function _noteRefusal(by, detail) { _lastRefusal = { by, detail: String(detail || "") }; }
+function _noteRefusal(by, detail, allow = null) { _lastRefusal = { by, detail: String(detail || ""), allow: Array.isArray(allow) ? allow : null }; }
 function _takeRefusal() { const r = _lastRefusal; _lastRefusal = null; return r; }
 
 /// 审批框里那份改动预览。
@@ -20876,7 +20876,13 @@ async function _approveToolCall(call, run) {
     try {
       showToast(`「${skillGate.names[0]}」声明了 allowed-tools，${call._toolName || call.type || "这个工具"} 不在其中`);
     } catch {}
-    _noteRefusal("skill", skillGate.names[0] || "");
+    // 把**这个技能到底允许什么**一起带出去。
+    //
+    // 原来只交技能名，于是回执成了「换该技能允许的工具」——一句模型执行不了的指令：
+    // allow 集合在这里就被丢了；SKILL.md 的 allowed-tools frontmatter 在解析期
+    // 被剥掉、不进提示词；判定还隔着一层别名映射（技能写 Read/Grep/Bash →
+    // read_file/search/run_cmd）。三条路都够不着，它只能换个名字再试一次，一次一轮。
+    _noteRefusal("skill", skillGate.names[0] || "", [...(skillGate.allow || [])]);
     return false;
   }
 
@@ -20961,13 +20967,20 @@ async function _approveToolCall(call, run) {
 function _userDeniedToolResult(call, verdict = null) {
   const by = verdict && typeof verdict === "object" ? verdict.by : "user";
   const where = verdict && typeof verdict === "object" ? String(verdict.detail || "") : "";
+  // 技能允许的工具清单。没有它，下面那句「换该技能允许的工具」就是一句空话。
+  const allowList = (verdict && typeof verdict === "object" && Array.isArray(verdict.allow) ? verdict.allow : [])
+    .map((x) => String(x || "").trim()).filter(Boolean);
   const content = by === "rule"
     ? `[BLOCKED] 这次调用被**权限规则**挡下了${where ? `（${where}）` : ""}——不是用户刚刚拒绝的。`
       + "别重试，也别换个工具做同一件事：规则是按工具类型匹配的，绕不过去。"
       + "如果这一步确实必要，停下来告诉用户是哪条规则挡的、要放开需要改哪个文件。"
     : by === "skill"
       ? `[BLOCKED] 当前技能${where ? `「${where}」` : ""}声明的 allowed-tools 不包含这个工具。`
-        + "这不是「用户不同意」，是这件事不在该技能的范围内——换该技能允许的工具，或者说明需要退出技能范围。"
+        + "这不是「用户不同意」，是这件事不在该技能的范围内。"
+        + (allowList.length
+          ? `这个技能只允许这些工具：${allowList.slice(0, 20).join("、")}${allowList.length > 20 ? " …" : ""}——从里面挑一个继续，`
+          : "换该技能允许的工具，")
+        + "或者说明这件事需要退出技能范围。"
       : "[BLOCKED] 用户拒绝了这次调用。不要重试同一个调用，也不要换一种工具做同一件事"
         + "（例如改用 run_cmd 去完成刚被拒的写入）。改用别的方案推进；如果这一步确实必要，"
         + "停下来向用户说明原因并请他确认。";
@@ -33545,12 +33558,77 @@ function _selectInitialTools(includeWrite, taskText, mcpTools = [], mode = inclu
 // Identifier-shaped input can be an explicit tool-name request. Exact registered
 // names always win, and unknown compound identifiers never degrade into loose terms:
 // `local_discovery` must not match `http_request` merely because it says localhost.
+/// 子任务当前手上真正能用的工具名（按它被允许的 type 过滤注册表）。
+///
+/// 拒绝的时候要能把这份清单说出来。说不出来，「换一个工具」就是一句空话——
+/// 子体侧没有主循环那套「回执里点名的工具当轮装进窗口」的自愈。
+/// 叫错工具名时那一句提示。
+///
+/// 单独一个函数而不是就地 IIFE：仓库里有一条「并发槽位在每一条退出路径上都要还回去」
+/// 的检查，它按 return 的位置扫，就地 IIFE 的 return 会被误判成提前退出。
+function _unknownToolHint(wanted, execTypes, write) {
+  const near = _nearestToolNames(wanted, _subAgentUsableToolNames(execTypes, write));
+  return near.length
+    ? `最接近的是：${near.join("、")}——是不是想调其中一个？`
+    : "用 search_tools 传精确名字取回它的 schema，或者换一个你手上已有的工具。";
+}
+
+function _subAgentUsableToolNames(execTypes, write) {
+  try {
+    const reg = _buildToolRegistry(!!write, []);
+    const ok = [];
+    for (const name of reg.keys()) {
+      let type = "";
+      try { type = (_mapToolCall(name, {}) || {}).type || ""; } catch { continue; }
+      if (type && Array.isArray(execTypes) && execTypes.includes(type)) ok.push(name);
+    }
+    return ok.sort();
+  } catch { return []; }
+}
+
+/// 名字打错时最接近的几个候选。纯本地：前缀/包含 + 一个便宜的编辑距离上界。
+function _nearestToolNames(wanted, pool, limit = 3) {
+  const w = String(wanted || "").toLowerCase().replace(/[\s_-]+/g, "");
+  if (!w || !Array.isArray(pool) || !pool.length) return [];
+  const score = (name) => {
+    const n = String(name).toLowerCase().replace(/[\s_-]+/g, "");
+    if (n === w) return 0;
+    if (n.startsWith(w) || w.startsWith(n)) return 1;
+    if (n.includes(w) || w.includes(n)) return 2;
+    // 共同字符占比——不做完整编辑距离，够用且零依赖。
+    // 阈值卡得高、并且要求长度接近：给错方向比不给更糟。放松到 0.7 时
+    // "readfile" 会把 "find_files" 也算成候选（重合 5/7），那是在帮倒忙。
+    if (Math.abs(n.length - w.length) > 2) return 99;
+    const set = new Set(n);
+    let hit = 0;
+    for (const c of new Set(w)) if (set.has(c)) hit++;
+    const ratio = hit / Math.max(new Set(w).size, 1);
+    return ratio >= 0.85 ? 3 : 99;
+  };
+  return pool.map((n) => [score(n), n]).filter(([sc]) => sc < 99)
+    .sort((a, b) => a[0] - b[0] || (a[1] < b[1] ? -1 : 1))
+    .slice(0, limit).map(([, n]) => n);
+}
+
 function _searchToolsExactQuery(query, registry) {
   const requested = String(query || "").trim();
   if (!/^[a-zA-Z0-9_-]{1,64}$/.test(requested)) return null;
-  const exactName = registry.has(requested)
+  // 第三步必须做**同一套归一**。
+  //
+  // 直接按名字调用时会先过 _canonicalToolName（别名、复数、连字符/下划线互换都收），
+  // 而这里只试了原样和全小写。于是同一个名字：直接调能通、拿去 search_tools 查却被判
+  // 「注册表里没有这个工具」。模型正是在够不着某个工具时才来搜的——这一步失手，
+  // 它就以为这个能力不存在，转去绕远路或者干脆放弃。
+  // 纯本地、零成本；mcp__ 前缀原样跳过（那套名字有自己的命名空间，不参与归一）。
+  let exactName = registry.has(requested)
     ? requested
     : [...registry.keys()].find((name) => name.toLowerCase() === requested.toLowerCase()) || "";
+  if (!exactName && !requested.startsWith("mcp__")) {
+    try {
+      const canon = _canonicalToolName(requested);
+      if (canon && registry.has(canon)) exactName = canon;
+    } catch {}
+  }
   const schema = exactName ? registry.get(exactName) || null : null;
   if (!schema && !/[_-]/.test(requested)) return null;
   return { name: exactName || requested, schema };
@@ -34223,8 +34301,25 @@ function _coerceSchemaTypes(value, schema) {
     }
     return value;
   }
+  const required = new Set(Array.isArray(schema.required) ? schema.required : []);
   for (const [key, child] of Object.entries(schema.properties || {})) {
     if (!Object.prototype.hasOwnProperty.call(value, key) || value[key] == null || !child) continue;
+    // enum 自愈：先按大小写/连字符归一再比一次；仍然对不上而这个字段**不是必填**的，
+    // 就把它删掉，等同于模型压根没填。
+    //
+    // 为什么值得：这类字段大多是纯咨询性质的（mode / kind / scope 之类），
+    // 模型把 "read_only" 写成 "readonly"、把 "Text" 写成 "text"，整条调用就被拒——
+    // 而它的意图从别的参数上看得一清二楚。一个可选的枚举猜错一个词，不该让整件事作废。
+    // 必填的 enum 保持硬拒：那种情况下丢掉键会让下游拿到一个语义不明的调用。
+    if (Array.isArray(child.enum) && child.enum.length && typeof value[key] === "string") {
+      const raw = value[key];
+      if (!child.enum.includes(raw)) {
+        const norm = (x) => String(x).toLowerCase().replace(/[\s_-]+/g, "");
+        const hit = child.enum.find((e) => norm(e) === norm(raw));
+        if (hit !== undefined) value[key] = hit;
+        else if (!required.has(key)) { delete value[key]; continue; }
+      }
+    }
     const fixed = _coerceScalarBySchema(value[key], child);
     if (fixed !== undefined) { value[key] = fixed; continue; }
     // 容器先扶正，再递归进去修里面的标量：headers 从 JSON 字符串还原成对象之后，
@@ -34614,7 +34709,13 @@ function _mapToolCall(name, args, mcpToolMap = _mcpToolMap) {
       return { type: "cmd", command: _cmd };
     }
     case "create_project": return { type: "createproject", path: String(args.name || ""), name: String(args.name || "") };
-    case "update_plan": return { type: "plan", steps: _normPlanSteps(args.steps || args.plan || args.todos) };
+    case "update_plan": {
+      // 容器字段名同理：steps/plan/todos 之外，tasks/items/checklist 也都收。
+      const _raw = args.steps || args.plan || args.todos || args.tasks || args.items || args.checklist;
+      // 原始条数要留着：归一化之后为空时，回执得能分清「你交了 5 步但没解析出来」
+      // 和「你确实交了 0 步」——这两件事对模型的下一步完全不同。
+      return { type: "plan", steps: _normPlanSteps(_raw), rawSteps: Array.isArray(_raw) ? _raw.length : 0 };
+    }
     case "think": return { type: "think", content: args.thought || args.thoughts || "" };
     case "schedule": return { type: "schedule", action: String(args.action || "list").toLowerCase(), prompt: String(args.prompt || args.task || ""), at: String(args.at || args.time || ""), everyMinutes: Number.isFinite(+args.every_minutes) ? +args.every_minutes : 0, id: Number.isFinite(+args.id) ? +args.id : 0 };
     case "ask_user": return { type: "askuser", question: args.question || args.q || args.prompt || args.text || "", options: Array.isArray(args.options) ? args.options : (Array.isArray(args.choices) ? args.choices : (Array.isArray(args.buttons) ? args.buttons : [])), recommended: Number.isFinite(+args.recommended) ? +args.recommended : -1, multiSelect: !!args.multi_select, confirmText: String(args.confirm_text || "") };
@@ -35096,6 +35197,29 @@ function _invalidToolRepairInstruction(attempts, recoveryCalls = [], registry = 
 /** 计划步骤的四种性质。模型在 update_plan 里逐步声明，猜测只是老计划的兜底。 */
 const _PLAN_STEP_KINDS = new Set(["investigate", "implement", "execute", "verify"]);
 
+/// 从一个步骤对象里取出它的文字。
+///
+/// 先按常见字段名找，找不到就退到「对象里第一个非空字符串值」——模型用什么词
+/// 命名这个字段都不该让整份计划作废。status/kind 这些结构字段要排除掉，
+/// 否则会把 "pending" 当成步骤内容。
+const _PLAN_STEP_TEXT_KEYS = [
+  "content", "step", "text", "title", "name", "task", "description",
+  "label", "todo", "item", "summary", "goal", "action",
+];
+const _PLAN_STEP_META_KEYS = new Set(["status", "kind", "id", "index", "state", "type", "done"]);
+function _planStepText(s) {
+  if (!s || typeof s !== "object") return "";
+  for (const k of _PLAN_STEP_TEXT_KEYS) {
+    const v = s[k];
+    if (typeof v === "string" && v.trim()) return v.trim();
+  }
+  for (const [k, v] of Object.entries(s)) {
+    if (_PLAN_STEP_META_KEYS.has(k)) continue;
+    if (typeof v === "string" && v.trim()) return v.trim();
+  }
+  return "";
+}
+
 function _normPlanSteps(steps) {
   if (!Array.isArray(steps)) return [];
   const normStatus = (st) => {
@@ -35109,7 +35233,17 @@ function _normPlanSteps(steps) {
     .map((s) => typeof s === "string"
       ? { content: s, status: "pending" }
       : {
-        content: s.content || s.step || s.text || s.title || "",
+        // 步骤文字的字段名：模型给什么名字都收。
+        //
+        // 原来只认 content/step/text/title 四个。差一个名字（name / task /
+        // description / label / todo / item / summary…）→ content 为空 → 被下面的
+        // filter 丢掉 → **整份计划变成 0 步**。而回执照样说「计划已更新：共 0 步」，
+        // 看着像成功；0 步又让计划门认为"还没有计划"，继续催它去 update_plan，
+        // 于是它把同样形状再发一遍——开局连发 4~5 次的环就是这么成的。
+        //
+        // 意图在这里是**毫无歧义**的：模型交上来一串步骤。为一个字段名把整件事丢掉，
+        // 是这套工具最贵的一种苛刻。列表之外再兜一层：对象里第一个像样的字符串值就用它。
+        content: _planStepText(s),
         status: normStatus(s.status),
         // 模型自己声明这一步是什么性质。以前只能靠动词表去猜措辞，而猜错是有代价的：
         // 猜不出来就不打勾（对的），但猜错了类别就会被错误的证据勾掉。声明是模型
@@ -35120,7 +35254,17 @@ function _normPlanSteps(steps) {
 }
 
 /** Short textual confirmation of a plan update, fed back to the model. */
-function _planSummary(steps) {
+function _planSummary(steps, rawCount = null) {
+  // 交上来有内容、归一化之后一步不剩 —— 这不是「更新成 0 步」，是**没解析出来**。
+  //
+  // 原来这里照说「计划已更新：共 0 步」，读起来像成功；而 0 步又让计划门认为
+  // 「还没有计划」，继续催模型去 update_plan。两条出路都指回同一个工具，成环。
+  // 现在如实说，并且把它能用的字段名直接列出来——模型下一次就对了，不用猜。
+  if (!steps.length && rawCount) {
+    return "⚠️ 计划没有更新：你交了 " + rawCount + " 步，但一步都没解析出来（每一步都取不到文字）。"
+      + "每一步要么是一个字符串，要么是带文字字段的对象（content / step / text / title / name / task / description 都收）。"
+      + "**别原样重发**——换成上面这个形状再发一次。";
+  }
   const total = steps.length;
   const done = steps.filter((s) => s.status === "completed").length;
   const canc = steps.filter((s) => s.status === "cancelled");
@@ -41486,6 +41630,17 @@ function _blockedToolRecoveryInstruction(content, call = null, result = null) {
   // A deferred call is not an execution failure. The model already receives the
   // structured pending result and may issue a fresh call on its next turn.
   if (result?.failure?.attempted === false) return null;
+  // 结构化结局优先于文案。
+  //
+  // 下面那条 looksLikeFailureText 是**全文**正则：只要正文里出现方括号里带 ERROR/失败
+  // 的字样就算失败。而构建工具、测试框架、linter 在**成功**的输出里印 `[ERROR]` 行
+  // 是家常便饭（退出码仍是 0）。于是一次成功的 run_cmd 会拿到一段「这条路走不通、
+  // 别再调」的恢复指示——模型据此放弃一条本来是通的路，这正是「不会随机应变」里
+  // 最冤的一种。read_logs 读到含 ERROR 的日志同理。
+  //
+  // 判据和 _toolExecutionSucceeded 同源：显式 ok / 命令退出码。
+  if (result && result.ok === true) return null;
+  if (call && call.type === "cmd" && Number.isFinite(Number(result?.code)) && Number(result.code) === 0) return null;
   const text = String(content || "");
   const browserFailureLike = (call?.type === "browser")
     && (/\[浏览器失败\]|\[失败\]|\*\*批量自动化结果\*\*[\s\S]{0,1200}[✗×].{0,80}(后续步骤已停|重试后仍失败|没找到)|找不到匹配|找不到输入框|React|Vue|受控组件|validationMessage|invalid|missing/i.test(text));
@@ -42911,6 +43066,9 @@ function _isMergedToolItem(item) {
 // gh 的只读 op。**模块级**：并行判据（_isReadOnlyParallel）和子体的执行白名单都要用它，
 // 原来它只定义在 _runSubAgent 函数体内，别处引用就是运行时 ReferenceError——而 node --check
 // 查不出这种错。抄第二份更糟：pr_create / pr_reply 是不可逆的对外动作，两份名单漂了就会漏。
+// 只读的 git op。原来只在子体那个函数里有一份局部常量，于是别处想说
+// 「你还能用哪些 git 操作」时只能手抄一份——手抄就会漂。提到模块级共用。
+const _GIT_READ_OPS_ALL = ["status", "diff", "log", "blame", "show", "conflicts", "stash_list"];
 const _GH_READ_OPS = ["pr_view", "pr_review_comments", "pr_checks", "actions_log"];
 
 function _isReadOnlyParallel(call) {
@@ -45332,7 +45490,7 @@ async function _runSubAgent({ config, description, prompt, root, container, run,
   // 只读的 git op。type 级放行之后按 op 二次把关（见下面 _gitOpBlocked）。
   // show/conflicts/stash_list 都只读：git show 看历史提交，conflicts 列冲突文件，
   // stash_list 列储藏——三个都不动工作树，也不写远端。
-  const _GIT_READ_OPS = ["status", "diff", "log", "blame", "show", "conflicts", "stash_list"];
+  const _GIT_READ_OPS = _GIT_READ_OPS_ALL;
   // gh 和 git 是同一个形状：单 type 多 op，其中 pr_create / pr_reply 会**不可逆地推到
   // GitHub**。原来 gh 类型根本不在子体的可执行集合里，所以不需要 op 闸门；现在把
   // gh_pr_view / gh_pr_review_comments / gh_actions_log 这三个只读的放给子体（读 PR 讨论
@@ -45539,8 +45697,16 @@ async function _runSubAgent({ config, description, prompt, root, container, run,
               ? `[BLOCKED] 子任务只能读 GitHub（${_GH_READ_OPS.join("/")}），不能用 ${tc.name} —— 建 PR / 回复评论是不可逆的对外动作，交回主任务做。`
               : _mcpWriteBlocked
               ? `[BLOCKED] 子任务只能用声明为只读的 MCP 工具，${tc.name} 没有这个声明。把这一步交回主任务处理。`
-              : `[BLOCKED] ${write ? "worker 只能读 + 在 scope 内改文件" : "子智能体只读"}，不能用 ${tc.name}。`)
-            : `[ERROR] 未知工具: ${tc.name}`;
+              // 这条兜底原来只说「不能用 X」，是四个分支里唯一不给去向的。
+              // 前三条都写明了「还能用什么 / 交回主任务」，这条不写，子体就只能
+              // 换个名字再试一次——而子体侧没有主循环那两套自愈接着它。
+              : `[BLOCKED] ${write ? "worker 只能读 + 在 scope 内改文件" : "子智能体只读"}，不能用 ${tc.name}。`
+                + `子任务手上能用的是：${_subAgentUsableToolNames(_execTypes, write).slice(0, 18).join("、") || "只读工具"}。`
+                + "这一步如果确实必要，把它连同你已经查到的事实一起写进结论交回主任务，由它来做。")
+            // 名字对不上时给出最接近的几个。原来只回一句「未知工具: X」——
+            // 而叫错名字最常见的原因就是记混了近名（read/read_file、grep/search），
+            // 一个候选都不给，子体只能瞎猜，猜一次一轮。
+            : `[ERROR] 未知工具: ${tc.name}。` + _unknownToolHint(tc.name, _execTypes, write);
           let rejectedStep = null;
           try {
             rejectedStep = _createToolStep(rejectedCall);
@@ -47205,7 +47371,17 @@ function _projectJournalBlock(root) {
  */
 function _recFailBrief(name, result) {
   const text = String(result?.content || "").replace(/^〔外部数据〕[^\n]*\n?/, "").trim();
-  const first = text.split("\n")[0].slice(0, 100);
+  // 取**看着像失败原因**的那一行，不是盲取第一行。
+  //
+  // 实测踩到的：一条判定为失败的 read_file，摘要被记成 `#!/usr/bin/env node`——
+  // 那是文件的首行内容，不是失败原因。这条数据是用来回答「哪个工具老是失败、
+  // 失败成什么样」的，记成文件内容等于这一条白记了。
+  //
+  // 有些工具会先回一段正常内容、把失败说明放在后面（截断说明、部分失败清单），
+  // 所以要在前几行里找，而不是只看头一行。
+  const lines = text.split("\n").slice(0, 12);
+  const FAILISH = /\[(?:ERROR|BLOCKED|失败|已拦截|not executed|UNREADABLE)[^\]]*\]|^(?:错误|失败|无法|拒绝|超时)|(?:failed|error|denied|timeout|unsupported|not found|没有找到|不存在|没权限|未授权)/i;
+  const first = (lines.find((l) => FAILISH.test(l)) || lines[0] || "").trim().slice(0, 100);
   // 结构化失败码优先——它不随文案漂。只有它才另加前缀：
   // 首句本身通常已经带着 `[失败]` / `[BLOCKED…]` 那个方括号标记，再拼一次就成了
   // 「web_fetch [失败] [失败] HTTP 403」。
@@ -50493,8 +50669,28 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
         //
         // A reviewer whose only possible verdict is "add more" is not quality control, it is a
         // ratchet. The plan belongs to the agent doing the task.
-        toolMsgs[i] = { role: "tool", tool_call_id: it.tc.id, content: _planSummary(planSteps)
-          + (completionIssue ? `\n[PLAN_NEEDS_EVIDENCE] ${completionIssue}；completed 已退回 pending，取得真实证据后再更新。` : "") };
+        // 计划收下之后必须明说「去做第一步」。不说的话模型手上只有一句「计划已更新」，
+        // 而它刚被要求先规划——最省事的下一步就是再规划一次。真实执行记录里
+        // 开局连发 4~5 次 update_plan 的轮次，65% 没跑成。
+        const _firstOpen = planSteps.find((x) => x && x.status !== "completed" && x.status !== "cancelled");
+        const _goDo = planSteps.length && !completionIssue
+          ? `\n计划已收下，**现在去做第一步**${_firstOpen ? `：${_firstOpen.content}` : ""}。别再调 update_plan——只有在某一步真的做完、或路线要改时才更新它。`
+          : "";
+        const _planMsg = _planSummary(planSteps, it.call.rawSteps)
+          + _goDo
+          + (completionIssue ? `\n[PLAN_NEEDS_EVIDENCE] ${completionIssue}；completed 已退回 pending，取得真实证据后再更新。` : "");
+        toolMsgs[i] = { role: "tool", tool_call_id: it.tc.id, content: _planMsg };
+        // rawResult 必须写。
+        //
+        // 这个分支原来只写 toolMsgs，从不给 it.rawResult 赋值，而
+        // `_toolExecutionSucceeded(call, undefined)` 第一行就是 `if (!call || !result) return false`
+        // ——于是**每一次正常的计划更新都被记成失败调用**。三条链路一起中毒：
+        //   · 工具成败账本聚成 `update_plan[interaction]: 0✓/N✗`，而这份账本每轮都注给编排模型；
+        //   · 跨会话经验判「最近 3 条全失败」，产出「该工具在此类场景近期屡次失败，
+        //     除非有新证据否则考虑替代方案」——等于系统在劝模型别用自己的规划工具；
+        //   · 死循环检测把这些凑进 fails，纯粹的正常规划也能把 runHadTrouble 顶起来。
+        // 「模型不会随机应变」有一部分就是这么被喂出来的：它手上那份账本在说规划工具是坏的。
+        it.rawResult = { type: "plan", path: "", content: _planMsg, ok: planSteps.length > 0 };
       }
 
       const subagentNames = new Set(["run_subagent", "run_worker", "research_project", "design_research", "generate_wiki", "spawn_multiple_agents", "debate"]);
@@ -57685,7 +57881,13 @@ async function _executeToolStepInner(step, call, root, run) {
         const modeName = _mode === "explorer" ? "Explorer" : _mode === "plan" ? "Plan" : "Reviewer";
         res.className = "atc-result atc-result--blocked";
         res.textContent = `⛔ ${modeName} 模式禁止改动仓库`;
-        return { type: "git", path: call.op, content: `[BLOCKED] ${modeName} 是只读模式，不能执行会改动仓库的 git ${call.op}。` };
+        // git/gh 是「单 type 多 op」，走不到 blockedInReadOnlyMode，于是也绕开了
+        // 54819 那条写得很全的回执（列出仍然可用的工具 + 出路），只剩一句光秃秃的
+        // 「不能执行」。模型手上没有下一步，只能换个 op 再试，或者干脆放弃取证。
+        // 这里复用同一口径：还能用哪些 op、以及这一步该怎么交出去。
+        return { type: "git", path: call.op, content: `[BLOCKED] ${modeName} 是只读模式，不能执行会改动仓库的 git ${call.op}。`
+          + `\ngit 的只读操作**全部可用**：${_GIT_READ_OPS_ALL.join(" / ")} —— 看历史、看差异、看分支都不受影响。`
+          + "\n出路：把该改的地方写成带 path:line 的最小修复建议交回去，由用户切到 Agent 模式执行。" };
       }
       let gitCtx = null;
       let gitExecRoot = gitRoot;
@@ -57972,7 +58174,10 @@ async function _executeToolStepInner(step, call, root, run) {
       const mutating = call.op === "pr_create" || call.op === "pr_reply";
       if (readOnlyMode && mutating) {
         const modeName = _mode === "explorer" ? "Explorer" : _mode === "plan" ? "Plan" : "Reviewer";
-        return { type: "gh", path: call.op, content: `[BLOCKED] ${modeName} 是只读模式，不能 ${call.op}。` };
+        // 同上：gh 也是单 type 多 op，同样绕开了那条完整回执。
+        return { type: "gh", path: call.op, content: `[BLOCKED] ${modeName} 是只读模式，不能 ${call.op}。`
+          + `\nGitHub 的只读操作**全部可用**：${_GH_READ_OPS.join(" / ")} —— 读 issue、读 PR、读评论都不受影响。`
+          + "\n出路：要建 PR 或回复评论，把内容写好交回去，由用户切到 Agent 模式执行。" };
       }
       // Quick preflight: gh available + authed? Cached for the session.
       if (!_ghAvailable) {   // 只缓存成功：上次失败就重探一次，别让用户装完还得重启
