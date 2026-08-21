@@ -552,7 +552,15 @@ impl RpcServer {
                 // 发 mouse.click{x:0,y:0}，点在屏幕左上角的苹果菜单上，而回执是个漂亮的
                 // {"status":"ok","x":0,"y":0}——静默的错答案，没有任何一步会触发重试。
                 // 缺字段会让模型换个地方找，值为 0 的字段会让它拿去算。所以宁可不给。
-                let geometry_real = cfg!(not(target_os = "macos"));
+                // 按**实际数据**判，不按平台猜。
+                //
+                // 这里原来写死 `cfg!(not(target_os = "macos"))`——在 macOS 那条枚举还走
+                // NSWorkspace.runningApplications（应用列表、几何硬写 0）的时候是对的。
+                // 现在那条已经换成 CGWindowListCopyWindowInfo，几何是真的了，
+                // 再硬说「这条路拿不到窗口几何」就成了反方向的假话：模型会以为拿不到坐标，
+                // 转而去做多余的前置+read_screen。
+                // 判据改成「这批里有没有非零矩形」——哪天枚举又退化回全 0，它自己会说回去。
+                let geometry_real = wins.iter().any(|w| w.width > 0 && w.height > 0);
                 let list: Vec<serde_json::Value> = wins.iter().map(|w| {
                     let mut o = serde_json::Map::new();
                     o.insert("title".into(), serde_json::json!(w.title));
@@ -575,7 +583,7 @@ impl RpcServer {
                     // 不给坐标就必须说去哪儿拿，否则模型只会以为这次查询失败了。
                     Ok(serde_json::json!({
                         "windows": list,
-                        "note": "这一列是**正在运行的应用**，不是窗口矩形：macOS 这条路拿不到窗口几何，所以没有 x/y/width/height（给 0 会让你照着点到屏幕左上角）。要元素坐标就把目标切到前台再用 read_screen，它给的每个元素都带真实屏幕坐标；frontmost 是这里唯一可信的状态位，合成按键只会进入 frontmost 为 true 的那个应用。",
+                        "note": "这一批没有拿到窗口矩形，所以没有 x/y/width/height（给 0 会让你照着点到屏幕左上角）。要元素坐标就把目标切到前台再用 read_screen，它给的每个元素都带真实屏幕坐标；frontmost 是这里唯一可信的状态位，合成按键只会进入 frontmost 为 true 的那个应用。",
                     }))
                 }
             }
@@ -911,5 +919,49 @@ mod health_challenge_tests {
         assert!(a.chars().all(|c| c.is_ascii_hexdigit()));
         // 固定串（冒充者最容易回的那个）绝不可能命中
         assert_ne!(a, "ok");
+    }
+}
+
+#[cfg(test)]
+mod window_list_geometry_tests {
+    /// `geometry_real` 必须按**实际数据**判，不能按平台猜。
+    ///
+    /// 它原来写死 `cfg!(not(target_os = "macos"))`——在 macOS 那条枚举还走
+    /// NSWorkspace.runningApplications（应用列表、几何硬写 0）的时候是对的。
+    /// 换成 CGWindowListCopyWindowInfo 之后几何是真的了，再硬说「这条路拿不到窗口几何」
+    /// 就成了反方向的假话：模型会以为拿不到坐标，转而去做多余的前置 + read_screen。
+    /// 实测（重编 sidecar 后真调 window.list）：2 个真窗口、几何真实、note 自动消失。
+    #[test]
+    fn geometry_availability_is_decided_by_the_data() {
+        let src = include_str!("rpc.rs");
+        let at = src.find("let geometry_real").expect("geometry_real 不见了");
+        let end = src[at..].find("\n            }").map(|e| at + e).unwrap_or(src.len());
+        let body: String = src[at..end]
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            body.contains("wins.iter().any(|w| w.width > 0 && w.height > 0)"),
+            "又按平台硬判了 —— 枚举修好之后它会反过来说假话"
+        );
+        assert!(
+            !body.contains(r#"cfg!(not(target_os = "macos"))"#),
+            "旧的平台判据还在"
+        );
+        // 那句说明也不能再点名 macOS——它现在描述的是「这一批数据没有矩形」。
+        // 只扫**生产代码**：这条断言自己的字符串字面量就是那句话，扫整份文件会自己喂饱自己。
+        let whole: String = src
+            .split("\n#[cfg(test)]")
+            .next()
+            .unwrap_or(src)
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !whole.contains("macOS 这条路拿不到窗口几何"),
+            "又把「拿不到几何」写死成平台事实了"
+        );
     }
 }
