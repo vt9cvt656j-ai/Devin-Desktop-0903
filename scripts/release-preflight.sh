@@ -10,6 +10,17 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 fail() { echo "❌ $*" >&2; exit 1; }
 
+echo "── 有没有残留的 dmg 卷 ──"
+# tauri 打 dmg 时会挂载一个卷做窗口布局；这一步失败的话卷不会被卸掉，
+# 而**下一次打包会被它挡住**——报的却是一句没有信息的
+# 「error running bundle_dmg.sh」，让人以为是签名或权限问题。
+# 今天连撞两次才找到，清掉卷就成。
+stale=$(ls -d /Volumes/dmg.* 2>/dev/null || true)
+if [ -n "$stale" ]; then
+  echo "   清理残留卷：$stale"
+  for v in $stale; do hdiutil detach "$v" -force >/dev/null 2>&1 || true; done
+fi
+
 echo "── 双仓一致性 ──"
 cargo test --manifest-path server/Cargo.toml repo_sync -- --nocapture >/dev/null 2>&1 \
   || fail "外层仓的 ide/ 副本和内层仓 HEAD 不一致。流水线编的是外层那份，直接打包会发出旧代码。
