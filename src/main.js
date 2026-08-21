@@ -55730,8 +55730,8 @@ async function _executeToolStepInner(step, call, root, run) {
       res.textContent = fileMatches.length ? `${hits} 处匹配${searchErrors.length ? " · 部分范围失败" : ""}` : (searchErrors.length ? "无匹配 · 部分范围失败" : "无匹配");
       const _body = blocks.join("\n\n");
       vp.innerHTML = `<pre>${_escHtml((_body || "(无匹配)") + partialNote)}</pre>`;
-      return { type: "search", path: call.path, content: (blocks.length ? `搜索 "${q}" — ${summary}:\n${_redactSecrets(_body)}` : `搜索 "${q}"：${_backendTruncated ? "**这次没搜完**（触到后端的命中数/扫描文件数上限就停了），所以「没找到」不等于「不存在」——缩小到具体目录再搜一次。" : ""}在已扫描的范围里无匹配。${_remote.active
-        ? "当前工作区在**远程主机**上，这次搜索由远端代理执行，它的扫描范围以那台机器上的实现为准，这里说不准跳过了什么。"
+      return { type: "search", path: call.path, content: (blocks.length ? `搜索 "${q}" — ${summary}${_scanScopeUnknown ? "（远端没报扫描规模，**判断不了这次搜完没有**——别按「这就是全部」下结论）" : ""}:\n${_redactSecrets(_body)}` : `搜索 "${q}"：${_backendTruncated ? "**这次没搜完**（触到后端的命中数/扫描文件数上限就停了），所以「没找到」不等于「不存在」——缩小到具体目录再搜一次。" : ""}在已扫描的范围里无匹配。${_remote.active
+        ? `当前工作区在**远程主机**上，这次搜索由远端代理执行，它的扫描范围以那台机器上的实现为准，这里说不准跳过了什么。${_scanScopeUnknown ? "远端也没报扫描规模，所以「搜完了」还是「没搜完」这里同样判断不了。" : ""}`
         : "好消息是**点开头的文件照常搜**（.env、.eslintrc、.gitignore、.prettierrc 都在扫描范围里），**.github 也照常搜**。但扫描确实会静默跳过这些：构建/缓存目录（.git、.next、.venv、.gradle、.idea、.vscode、node_modules、target、dist、build、out、vendor、coverage、Pods、venv、__pycache__）、**符号链接**（文件和目录都跳，monorepo/pnpm 的 workspace 链接整棵树都不在内）、**大于 2MB 的文件**、含 NUL 字节的二进制、以及**非 UTF-8 编码**的文件（GBK/Latin-1 的老代码整份搜不到）。所以先换关键词再试；如果目标可能落在上面任何一类里，直接 read_file 指名读"}：换关键词、用 semantic_search 按语义找、或 find_files 按文件名找。`) + partialNote };
 
     } else if (call.type === "find") {

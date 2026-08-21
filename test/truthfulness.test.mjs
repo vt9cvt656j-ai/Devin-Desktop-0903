@@ -344,6 +344,16 @@ test("检索类：说清楚「没找到」还是「没去找」", () => {
   assert.match(CODE, /\$\{_remote\.active[\s\S]{0,120}远程主机/,
     "search 的零命中文案没有区分远程工作区 —— 本地扫描规则在那边不成立");
   assert.match(CODE, /这里说不准跳过了什么/, "远程时没有承认自己不知道扫描范围");
+  // 远程那条路原来 return 一个纯数组，truncated / scannedFiles 全丢——于是
+  // _backendTruncated 恒 false，「**这次没搜完**」在远程工作区上一次都不会出现，
+  // 有命中时的抬头也毫无提示。模型把一个任意子集当成全部（「所有调用点都改掉」
+  // 只改了前面几十处），正是本地那条注释写明要防的假阴性。
+  assert.match(CODE, /_hits\.truncated = !!j\?\.truncated/,
+    "远程搜索没把截断标志带出来 —— 远程工作区上「没搜完」永远不会触发");
+  assert.match(CODE, /_hits\.scanScopeUnknown = _hits\.scannedFiles === undefined/,
+    "远端没报扫描规模时没有留出「不知道」这一档");
+  assert.match(CODE, /判断不了这次搜完没有/,
+    "有命中时的抬头没提示「判断不了搜完没有」—— 沉默会被读成「搜完了」");
   assert.match(SRC, /符号索引只覆盖/, "find_symbol 不说索引作用域");
   assert.match(SRC, /在\*\*已建索引的部分\*\*里/, "semantic_search 不说索引作用域");
   // 这条原来钉的是一句**假话**：它和后端 skip_walk_entry 同 commit 写下，四小时后后端就

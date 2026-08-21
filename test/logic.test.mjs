@@ -15026,7 +15026,15 @@ test("remote search uses the active backend and preserves native file-match shap
       { line: 9, column: 8, text: "return NEEDLE", start: 7, end: 13 },
     ],
   });
-  assert.match(SRC, /backend\.searchInProject = \(root, query, cs, mode = "literal"\)[\s\S]{0,320}_groupRemoteSearchHits/);
+  // 钉的是**性质**：远程分支要路由到 _groupRemoteSearchHits，并且把截断信息带出来。
+  // （原来限了 320 字符的窗口，加两行注释就假红了。）
+  const _remoteBranch = SRC.slice(
+    SRC.indexOf('backend.searchInProject = (root, query, cs, mode = "literal")'),
+    SRC.indexOf("_local.searchInProject(root, query, cs, mode)"));
+  assert.ok(_remoteBranch.length > 100, "远程搜索那条分支不见了");
+  assert.match(_remoteBranch, /_groupRemoteSearchHits/);
+  assert.match(_remoteBranch, /_hits\.truncated = !!j\?\.truncated/,
+    "远程搜索没把截断标志带出来 —— 那边「没搜完」永远不会触发");
   const inner = extractFn("_executeToolStepInner");
   assert.match(inner, /const searchScopes = _independentFsPaths\(_relCandidates\(requestedScope, root\)\)/,
     "Agent search must resolve the same multi-root candidates as read_file and list_dir");
