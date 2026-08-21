@@ -31827,3 +31827,57 @@ test("撞过的墙要落盘：情景档案必须记下哪个工具失败了、�
     "情景档案没有 walls 字段 —— 「哪个工具老撞墙」依旧查不出来");
   assert.match(ep, /\.slice\(0, 6\)/, "walls 没有上限，一轮里连撞几十次会把存档撑爆");
 });
+
+// 一行代码同时废掉两个高频工具，而且是最坏的那种失效——不报错，只给假料。
+//
+// _walkSourceFiles 原来用 `e.children !== undefined` 判目录，而后端 files.rs 的
+// DirEntry 只有 {name, path, is_dir, ignored}，**没有 children**：条件恒为假，
+// 目录全掉进 else 被扩展名过滤掉，子目录一次都没入过队。整个仓库只索引到根目录。
+// 后果：find_symbol 对真实存在的符号回「0 处」并把原因说成规模限制；
+// semantic_search 对任意两个不相干的查询词返回逐字相同的「索引里没有相近内容」。
+test("符号/语义索引必须真的走进子目录——判目录看 is_dir，不是 children", async () => {
+  const walk = load("_walkSourceFiles", {
+    // 真实后端形状：**没有 children 字段**
+    backend: { readDir: async (d) => ({
+      "/p": [{ name: "a.js", path: "/p/a.js", is_dir: false },
+             { name: "src", path: "/p/src", is_dir: true },
+             { name: "node_modules", path: "/p/node_modules", is_dir: true }],
+      "/p/src": [{ name: "b.js", path: "/p/src/b.js", is_dir: false },
+                 { name: "lib", path: "/p/src/lib", is_dir: true }],
+      "/p/src/lib": [{ name: "c.js", path: "/p/src/lib/c.js", is_dir: false },
+                     { name: "d.png", path: "/p/src/lib/d.png", is_dir: false }],
+      "/p/node_modules": [{ name: "junk.js", path: "/p/node_modules/junk.js", is_dir: false }],
+    })[d] || [] },
+    _SYMBOL_SKIP_DIRS: /node_modules|\.git/,
+    _SYMBOL_EXTS: new Set(["js"]),
+  });
+  const seen = [];
+  const n = await walk("/p", async (p) => seen.push(p), 100);
+  assert.deepEqual(seen, ["/p/a.js", "/p/src/b.js", "/p/src/lib/c.js"],
+    "子目录没被走到 —— 整个仓库只会索引到根目录那几个文件");
+  assert.equal(n, 3);
+
+  // 忽略名单仍然生效，扩展名过滤仍然生效。
+  assert.ok(!seen.some((p) => p.includes("node_modules")), "忽略目录被走进去了");
+  assert.ok(!seen.some((p) => p.endsWith(".png")), "非源码扩展名被收进索引了");
+
+  // 兼容旧形状（真有 children 的后端）也不能退化。
+  const walk2 = load("_walkSourceFiles", {
+    backend: { readDir: async (d) => ({
+      "/q": [{ name: "s", path: "/q/s", children: [] }],
+      "/q/s": [{ name: "e.js", path: "/q/s/e.js" }],
+    })[d] || [] },
+    _SYMBOL_SKIP_DIRS: /node_modules/, _SYMBOL_EXTS: new Set(["js"]),
+  });
+  const seen2 = [];
+  await walk2("/q", async (p) => seen2.push(p), 100);
+  assert.deepEqual(seen2, ["/q/s/e.js"], "带 children 的旧形状不该被这次修改弄坏");
+
+  // 接线：两个索引器共用这个 walker，所以修一处两个都好——钉住它们确实共用。
+  for (const fn of ["buildSymbolIndex", "buildBM25Index"]) {
+    const at = SRC.indexOf(`async function ${fn}(`);
+    assert.ok(at > 0, `${fn} 不见了`);
+    assert.match(SRC.slice(at, at + 2000), /_walkSourceFiles\(/,
+      `${fn} 没走 _walkSourceFiles —— 修一处两个都好这条前提就不成立了`);
+  }
+});
