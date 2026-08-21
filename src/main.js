@@ -47205,7 +47205,17 @@ function _projectJournalBlock(root) {
  */
 function _recFailBrief(name, result) {
   const text = String(result?.content || "").replace(/^〔外部数据〕[^\n]*\n?/, "").trim();
-  const first = text.split("\n")[0].slice(0, 100);
+  // 取**看着像失败原因**的那一行，不是盲取第一行。
+  //
+  // 实测踩到的：一条判定为失败的 read_file，摘要被记成 `#!/usr/bin/env node`——
+  // 那是文件的首行内容，不是失败原因。这条数据是用来回答「哪个工具老是失败、
+  // 失败成什么样」的，记成文件内容等于这一条白记了。
+  //
+  // 有些工具会先回一段正常内容、把失败说明放在后面（截断说明、部分失败清单），
+  // 所以要在前几行里找，而不是只看头一行。
+  const lines = text.split("\n").slice(0, 12);
+  const FAILISH = /\[(?:ERROR|BLOCKED|失败|已拦截|not executed|UNREADABLE)[^\]]*\]|^(?:错误|失败|无法|拒绝|超时)|(?:failed|error|denied|timeout|unsupported|not found|没有找到|不存在|没权限|未授权)/i;
+  const first = (lines.find((l) => FAILISH.test(l)) || lines[0] || "").trim().slice(0, 100);
   // 结构化失败码优先——它不随文案漂。只有它才另加前缀：
   // 首句本身通常已经带着 `[失败]` / `[BLOCKED…]` 那个方括号标记，再拼一次就成了
   // 「web_fetch [失败] [失败] HTTP 403」。

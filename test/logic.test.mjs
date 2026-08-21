@@ -32248,3 +32248,31 @@ test("收尾不许摆成「已验证 / 没验证」的固定模板", () => {
   assert.ok(SRC.includes("写在做出断言的那句话里"),
     "把收尾模板去掉时连「说清验证到什么程度」也一起丢了");
 });
+
+test("失败摘要要记失败原因，不能记成文件内容", () => {
+  // 实测踩到的：一条判定为失败的 read_file，walls 里记的是 `#!/usr/bin/env node`
+  // ——那是文件首行，不是失败原因。这份数据的用途就是回答「哪个工具老在失败、
+  // 失败成什么样」，记成文件内容等于白记。
+  const brief = load("_recFailBrief", {});
+
+  // ① 回执前面是正常内容、失败说明在后面 —— 要挑出后面那句。
+  const r1 = { content: "#!/usr/bin/env node\nconst x = 1;\n[ERROR] 文件超过 5MB，只读了前 2000 行" };
+  const out1 = brief("read_file", r1);
+  assert.ok(!out1.includes("#!/usr/bin/env node"), `摘要里混进了文件内容：${out1}`);
+  assert.ok(out1.includes("[ERROR]"), `没挑出失败那一行：${out1}`);
+
+  // ② 结构化失败码优先，且不重复拼方括号标记。
+  const r2 = { content: "[失败] HTTP 403", failure: { code: "http_403" } };
+  const out2 = brief("web_fetch", r2);
+  assert.ok(out2.includes("http_403"), "结构化失败码没带上");
+  assert.equal((out2.match(/\[失败\]/g) || []).length, 1, "方括号标记被拼了两次");
+
+  // ③ 整段都不像失败时，退回第一行（总比空着强），但不许崩。
+  const out3 = brief("run_cmd", { content: "just some output\nmore" });
+  assert.ok(out3.startsWith("run_cmd"), "工具名没带上");
+  assert.ok(out3.length <= 160, "摘要没截断");
+
+  // ④ 空回执不许炸。
+  assert.ok(brief("x", {}).startsWith("x"));
+  assert.ok(brief("", null).length >= 0);
+});
