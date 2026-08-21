@@ -19425,7 +19425,12 @@ test("#51-4 子智能体白名单：web_search 在场 + git 只读四件套 + op
   assert.ok(typesM && typesM[1].includes('"websearch"') && typesM[1].includes('"git"'),
     "_READ_TYPES 必须含 websearch 与 git");
   // git 单 type 多 op：type 级放行必须配 op 级二次把关，否则 commit/push 会漏进只读子智能体
-  assert.match(sub, /const _GIT_READ_OPS = \["status", "diff", "log", "blame", "show", "conflicts", "stash_list"\]/,
+  // 这张表已经提到模块级（_GIT_READ_OPS_ALL），子体这里引用它。
+  // 别处也要说「你还能用哪些 git 操作」，两份手抄必然漂——所以钉的是
+  // **模块级那份的内容** + **子体确实引用了它**，而不是子体里的字面量。
+  assert.match(sub, /const _GIT_READ_OPS = _GIT_READ_OPS_ALL;/,
+    "子体没有引用模块级那份只读 op 表 —— 又手抄了一份，早晚漂");
+  assert.match(SRC, /const _GIT_READ_OPS_ALL = \["status", "diff", "log", "blame", "show", "conflicts", "stash_list"\]/,
     "show/conflicts/stash_list 都只读——不动工作树也不写远端，该放给子体");
   assert.match(sub, /call\.type === "git" && !_GIT_READ_OPS\.includes\(call\.op\)/,
     "必须有 op 级把关表达式");
@@ -32320,4 +32325,56 @@ test("计划收下之后要明说「去做第一步」", () => {
   assert.match(seg, /别再调 update_plan/, "没拦住再规划一次");
   // 计划有问题时不该催它去做（那时该先补证据）。
   assert.match(seg, /!completionIssue/, "证据不足时也在催它往下做");
+});
+
+test("撞墙之后必须有出路：八处硬拒绝都要说清「还能用什么」", () => {
+  // 用户原话：「调用工具那些不够灵活，有些时候不太行，不会随机应变」。
+  // 从 1083 条真实执行记录出发，逐子系统排查 + 逐条对抗验证（35 报 8 立），
+  // 共同形状是：拒绝了，但模型手上当轮没有一个能调的替代——只能原样重试或放弃。
+
+  // ① 计划更新必须写 rawResult。不写的话 _toolExecutionSucceeded(call, undefined)
+  //    恒 false —— 每一次正常的计划更新都被记成失败，进而写进跨会话经验，
+  //    产出「该工具近期屡次失败，考虑替代方案」，等于系统在劝模型别用自己的规划工具。
+  assert.ok(SRC.includes('it.rawResult = { type: "plan"'),
+    "update_plan 分支仍然不写 rawResult —— 成功的计划更新会被记成失败调用");
+
+  // ② 技能拒绝要把该技能允许的工具列出来。
+  assert.match(extractFn("_noteRefusal"), /allow/, "_noteRefusal 没把 allow 集合带出来");
+  assert.ok(SRC.includes("这个技能只允许这些工具"),
+    "技能拒绝仍然只说「换该技能允许的工具」，而那份名单模型从来看不到");
+
+  // ③ 可选 enum 猜错一个词不该让整条调用作废。
+  const coerce = extractFn("_coerceSchemaTypes");
+  assert.match(coerce, /child\.enum/, "没有 enum 自愈");
+  assert.match(coerce, /required\.has\(key\)/, "必填的 enum 也被丢掉了 —— 那会让下游拿到语义不明的调用");
+
+  // ④ 恢复层要先看结构化结局，再看文案。构建工具在**成功**输出里印 [ERROR] 很常见。
+  const rec = extractFn("_blockedToolRecoveryInstruction");
+  assert.match(rec, /result\.ok === true/, "恢复层没有先认 ok:true");
+  assert.match(rec, /Number\(result\.code\) === 0/, "退出码 0 的命令仍会被文案判成失败");
+
+  // ⑤ search_tools 的精确查找要和直接调用走同一套归一，否则同一个名字「调得通、搜不到」。
+  assert.match(extractFn("_searchToolsExactQuery"), /_canonicalToolName/,
+    "search_tools 不做归一 —— 模型正是够不着工具时才来搜的，这一步失手它就以为没这个能力");
+
+  // ⑥⑦ 子体的两条：兜底拒绝要说还能用什么；叫错名字要给最接近的候选。
+  assert.ok(SRC.includes("子任务手上能用的是"), "子体兜底拒绝仍然只说「不能用 X」");
+  assert.ok(SRC.includes("最接近的是"), "子体叫错工具名仍然只回一句「未知工具」");
+
+  // ⑧ 只读模式挡 git/gh 时要列出仍可用的 op（直接引常量，不手抄）。
+  assert.match(SRC, /git 的只读操作\*\*全部可用\*\*：\$\{_GIT_READ_OPS_ALL\.join/,
+    "git 只读拒绝没列出可用 op");
+  assert.match(SRC, /GitHub 的只读操作\*\*全部可用\*\*：\$\{_GH_READ_OPS\.join/,
+    "gh 只读拒绝没列出可用 op");
+});
+
+test("叫错工具名时给出的候选要真的沾边", () => {
+  const near = load("_nearestToolNames", {});
+  const pool = ["read_file", "list_dir", "search", "find_files", "run_cmd", "write_file"];
+  assert.deepEqual(near("readfile", pool), ["read_file"], "近名没命中");
+  assert.ok(near("grep", pool).length <= 3, "候选给太多");
+  // 完全不沾边的不许硬凑 —— 给错方向比不给更糟。
+  assert.deepEqual(near("zzzzqqqq", pool), [], "给了一个毫不相干的候选");
+  assert.deepEqual(near("", pool), [], "空名字不该有候选");
+  assert.deepEqual(near("read_file", []), [], "池子为空时不许崩");
 });
