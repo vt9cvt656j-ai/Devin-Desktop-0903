@@ -28059,6 +28059,35 @@ test("自动改重复标点不许碰别的语言的合法语法", () => {
   }
 });
 
+test("docker 只有真会挂住的那几条算长时运行，秒回的不算", () => {
+  // 判据不能用那张二元组表：它只看 head 和第一个非选项 token，于是
+  // `docker compose up`（一直刷日志）和 `docker compose ps`（秒回）会同判。
+  // 判漏了，compose up 走 run_cmd 会在 240 秒被杀，用户看到「起容器总是失败」；
+  // 判过了，一条 `docker ps` 会被推去开一个终端标签页。
+  const isLong = load("_commandStartsLongRunningServer", {
+    _LONG_RUNNING_HEADS: new Set(["vite"]),
+    _LONG_RUNNING_PAIRS: new Set(["npm dev"]),
+  });
+  for (const cmd of [
+    "docker compose up",
+    "docker-compose up",
+    "docker compose -f prod.yml up",
+    "docker run nginx",
+    "docker logs -f api",
+    "docker attach api",
+  ]) assert.ok(isLong(cmd), `${cmd} 会一直挂着，必须判成长时运行`);
+
+  for (const cmd of [
+    "docker compose up -d",
+    "docker compose ps",
+    "docker compose down",
+    "docker compose logs",
+    "docker ps",
+    "docker images",
+    "docker build .",
+  ]) assert.ok(!isLong(cmd), `${cmd} 会自己结束，不该被判成长时运行`);
+});
+
 test("自动改重复标点只许碰用户刚动过的那几行", () => {
   // 同批四个改写器里只有它原来扫整个文件。后果不是性能是改坏别人的代码：
   // `,,` 在 JS 里是合法的稀疏数组（长度里有个洞），被合并掉长度就变了。

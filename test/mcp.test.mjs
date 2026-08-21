@@ -272,6 +272,10 @@ function makeGate({ asked = [] } = {}) {
     _approvalAlwaysLabel: load("_approvalAlwaysLabel"),
     _sessionApproved: new Set(),
     document: { body: {} },
+    // 有人在场。审批门现在先看这个标志：无人值守（定时任务）时不弹框傻等，
+    // 而是如实拒绝——那个 promise 没有计时器，没人点就是永久挂起。
+    _unattendedRun: false,
+    _noteRefusal: () => {},
     _toolApprovalDialog: async ({ title }) => { asked.push(title); return "once"; },
   };
   return load("_approveToolCall", deps);
@@ -311,6 +315,10 @@ test("工作区权限规则写了 ask，就算是自己配的服务也得问—�
     _approvalAlwaysLabel: load("_approvalAlwaysLabel"),
     _sessionApproved: new Set(),
     document: { body: {} },
+    // 有人在场。审批门现在先看这个标志：无人值守（定时任务）时不弹框傻等，
+    // 而是如实拒绝——那个 promise 没有计时器，没人点就是永久挂起。
+    _unattendedRun: false,
+    _noteRefusal: () => {},
     _toolApprovalDialog: async ({ title }) => { asked.push(title); return "once"; },
   });
   await approve({ type: "mcp", server: "memory", tool: "search", mcpAutoApprove: true }, { root: "/w" });

@@ -78,6 +78,10 @@ test("approval set matches the pre-refactor literal exactly", () => {
     "userfolder",
     // 新增：会在用户主目录下真的建出 ~/MrDayOne/<name>，并把左侧文件树整个切过去——
     // 用户原来打开的项目就这么被顶掉。此前一条声明都没有。
+    // 新增：定时任务。它排下的是一条**将来在没人看着时执行**的常驻指令，和 mcpconfig
+    // 同级——网页正文、仓库文件、命令输出都可能诱导模型偷偷排一条。list 只读不弹框，
+    // add/remove 一律要用户点头，只读模式下同样挡住。
+    "schedule",
     "createproject",
     // 新增：mode='system' / system_proxy=true 会改掉**操作系统级**代理，整台机器的
     // 流量都走本地 mitmproxy，接着还要用户 sudo 装根证书。
@@ -124,6 +128,10 @@ test("read-only-mode block matches the pre-refactor chain, plus the closed termt
     "write", "edit", "multiedit", "cmd", "delete", "move", "mkdir", "copy", "format",
     "uiclick", "mcp", "termtask",
     // 新增：只读模式里也能建目录并把用户当前工作区顶掉——模式标签写着「只读」。
+    // 新增：定时任务。它排下的是一条**将来在没人看着时执行**的常驻指令，和 mcpconfig
+    // 同级——网页正文、仓库文件、命令输出都可能诱导模型偷偷排一条。list 只读不弹框，
+    // add/remove 一律要用户点头，只读模式下同样挡住。
+    "schedule",
     "createproject",
     // 新增：用户 HTTP 能力。和 mcp 一样是**逐次**判定（下面那条测试钉住细则），
     // 所以它出现在这个集合里只表示「默认挡住」，不表示一刀切。
