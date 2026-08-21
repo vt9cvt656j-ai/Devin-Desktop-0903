@@ -5028,6 +5028,40 @@ mod tests {
         }
     }
 
+    /// 用户实拍的两条毛病，各钉一条判据。
+    ///
+    /// 一、「不会自己调研了」。老规则写死 `look up current sources only for facts that
+    ///    change`——版本/价格/日期/排名。于是"这个库怎么用""这个 API 是什么形状"
+    ///    "别人踩过什么坑"全被归成稳定知识，模型凭记忆写代码，而那正是它最容易
+    ///    自信地写错的地方。
+    ///
+    /// 二、每条回复末尾摆一段「已验证 / 没验证」。诚实该长在做出断言的那句话里，
+    ///    不是收尾贴一张体检表——固定模板会训练读者跳过恰恰最要紧的那句保留。
+    #[test]
+    fn research_is_expected_and_status_templates_are_banned() {
+        let t = read_prompt("truthfulness").expect("truthfulness prompt should load");
+        assert!(
+            !t.contains("look up current sources only for facts that change"),
+            "研究规则又退回成「只查会变的事实」——模型会凭记忆写 API"
+        );
+        assert!(
+            t.contains("what memory cannot settle"),
+            "缺少「记忆定不了的就去查」这条正面判据"
+        );
+        assert!(
+            t.contains("verified / not verified"),
+            "没有禁止收尾贴「已验证 / 没验证」体检表"
+        );
+
+        // 收尾禁令只放 truthfulness 一份：两份都写会重复计入每一轮的提示词预算，
+        // 而 truthfulness 本来就随 agent 一起注入。
+        let a = read_prompt("agent").expect("agent prompt should load");
+        assert!(
+            a.contains("SAY THEM FIRST"),
+            "带着假设往下做时没有要求先把假设说出来——用户只能在几步之后才发现方向错了"
+        );
+    }
+
     #[test]
     fn truthfulness_policy_rejects_partial_success_claims() {
         let policy = read_prompt("truthfulness").expect("truthfulness prompt should load");

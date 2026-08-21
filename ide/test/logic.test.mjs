@@ -32159,3 +32159,92 @@ test("ui_extract 不许把 read_screen 的限制说明丢掉", () => {
   // 参数说明不该写死 Mac：Windows 上这条走 UI Automation，一样能用。
   assert.ok(!SRC.includes("on this Mac"), "ui_extract 的参数说明仍写死「on this Mac」");
 });
+
+// ---- 同一会话里出现两张计划卡（用户实拍：两张 0/6 连着摆） ----
+//
+// 三级指针查找修的是「指针丢了」，但指针能丢的方式不止一种：消息体被重绘、
+// 快照恢复、流式重放。每补一种就是一次事后追认。这件事本身有个不变量——
+// 一个会话在同一时刻只该有一张计划卡。这条测试钉住的是不变量本身。
+test("一个会话只许有一张计划卡：多出来的要被清掉，别的会话的不许动", () => {
+  const mkEl = (cls = "") => ({
+    className: cls, innerHTML: "", children: [], parentNode: null, isConnected: false,
+    get lastChild() { return this.children[this.children.length - 1] || null; },
+    appendChild(c) {
+      if (c.parentNode) c.parentNode.children = c.parentNode.children.filter((x) => x !== c);
+      c.parentNode = this; c.isConnected = true; this.children.push(c); return c;
+    },
+    remove() {
+      if (this.parentNode) this.parentNode.children = this.parentNode.children.filter((x) => x !== this);
+      this.parentNode = null; this.isConnected = false;
+    },
+    querySelector(sel) {
+      const want = sel.replace(".", "");
+      const walk = (n) => { for (const c of n.children) { if (c.className === want) return c; const r = walk(c); if (r) return r; } return null; };
+      return walk(this);
+    },
+    querySelectorAll(sel) {
+      const want = sel.replace(".", "");
+      const out = [];
+      const walk = (n) => { for (const c of n.children) { if (c.className === want) out.push(c); walk(c); } };
+      walk(this);
+      return out;
+    },
+  });
+  const render = new Function("document", "t", "_escHtml", "_PLAN_ICON", "_planVisibleWindow",
+    "_planRowHtml", "_planWindowControlsHtml", "_bindPlanWindow", "_syncPlanChip",
+    "_schedulePlanReveal", "_PLAN_MAX_RENDERED_STEPS",
+    `${extractFn("_renderPlan")}\nreturn _renderPlan;`)(
+    { createElement: () => mkEl() }, () => "", (x) => String(x), "",
+    (run, steps) => ({ rows: steps, start: 0 }), () => "", () => "", () => {}, () => {}, () => {}, 8);
+
+  const countCards = (n) => (n.className === "agent-plan" ? 1 : 0)
+    + n.children.reduce((a, c) => a + countCards(c), 0);
+  const steps = [{ content: "a", status: "pending" }, { content: "b", status: "pending" }];
+
+  const chat = mkEl(); chat.isConnected = true;
+  const session = { container: chat };
+
+  // 第一轮：正常渲染一张。
+  const body1 = mkEl(); chat.appendChild(body1);
+  render(body1, steps, undefined, { session });
+  assert.equal(countCards(chat), 1, "第一轮就不止一张");
+
+  // 模拟指针失效后遗留的孤儿卡 —— 不管它是怎么来的（重绘/快照恢复/重放）。
+  const orphan = mkEl("agent-plan");
+  const body2 = mkEl(); chat.appendChild(body2); body2.appendChild(orphan);
+  assert.equal(countCards(chat), 2, "前提不成立：孤儿卡没被植入");
+
+  // 再渲染一次：不变量要把多出来的那张清掉。
+  const body3 = mkEl(); chat.appendChild(body3);
+  render(body3, steps, undefined, { session });
+  assert.equal(countCards(chat), 1,
+    "同一会话里留下了不止一张计划卡 —— 用户看到的就是两张 0/6 连着摆");
+
+  // 另一个会话的卡绝不能被这次清扫波及。
+  const chatB = mkEl(); chatB.isConnected = true;
+  const sessionB = { container: chatB };
+  const bodyB = mkEl(); chatB.appendChild(bodyB);
+  render(bodyB, steps, undefined, { session: sessionB });
+  assert.equal(countCards(chatB), 1, "另一个会话没有自己的卡");
+  assert.equal(countCards(chat), 1, "清扫跨会话了 —— 把别人的卡删掉了");
+
+  // 清扫必须限定在会话容器内，不许查全局 document。
+  const src = extractFn("_renderPlan");
+  assert.doesNotMatch(src, /document\.querySelectorAll\(["'`]\.agent-plan/,
+    "清扫查了全局 document —— 会跨标签页删掉别的会话那张卡");
+});
+
+test("收尾不许摆成「已验证 / 没验证」的固定模板", () => {
+  // 用户三次点名同一件事。前两次堵的是**词**（「验证情况」「验证状态」），
+  // 换个标题照写不误。真正的驱动是提示词自己给了三段式模板：
+  // 「收尾只说做成了什么、怎么验证、还剩什么限制」——模型照着渲染成小节。
+  // 所以这次堵的是**形状**，并且把生成模板的那句话本身改掉。
+  const tmpl = "收尾只说做成了什么、" + "怎么验证" + "、还剩什么限制";
+  assert.ok(!SRC.includes(tmpl),
+    "收尾指令还是三段式模板 —— 模型会把「怎么验证」渲染成一个独立小节");
+  assert.ok(SRC.includes("不要在末尾另起"),
+    "没有按形状禁掉收尾小节，只堵词的话换个标题就绕过去了");
+  // 诚实本身不能一起丢掉：验证程度要求写进断言那句话里。
+  assert.ok(SRC.includes("写在做出断言的那句话里"),
+    "把收尾模板去掉时连「说清验证到什么程度」也一起丢了");
+});
