@@ -515,3 +515,46 @@ test("工具描述里的三句假话：stash 清空工作区 / auto_rig 一定�
       `${where}: url 的就绪判据没说清 3xx 也算可达`);
   }
 });
+
+// 工具描述里承诺了代码做不到的事。这类比回执里的假话传得更远：模型在**调用之前**
+// 就照着它规划，而 _applyCloudToolDescs 会用网关那份顶掉本地兜底，所以两份都要钉。
+test("工具描述不许承诺代码做不到的事", () => {
+  const CATALOG = readFileSync(join(HERE, "..", "..", "server", "prompts", "tools.json"), "utf8");
+  for (const [where, text] of [["main.js", SRC], ["tools.json", CATALOG]]) {
+    // ① generate_image：省略 width/height 传的是 auto；而自动挑中的 gpt-image / dall-e
+    //    只支持 1024x1024 / 1536x1024 / 1024x1536，2048 和 3072 根本拿不到。
+    assert.doesNotMatch(text, /\*\*2048×2048 ultra-sharp square\*\* \(default\)/,
+      `${where}: generate_image 又说 2048×2048 是默认 —— 代码传的是 auto，gpt-image 一族也给不了这个尺寸`);
+    assert.doesNotMatch(text, /\*\*2048×2048 ultra-sharp is already the default\*\*/,
+      `${where}: 同上，而且还说「不用传 width/height」`);
+    assert.match(text, /2048×2048 and 3072×3072 are NOT reachable there/,
+      `${where}: 没说清 gpt-image 一族拿不到大尺寸`);
+
+    // ② search 的 query：默认 literal 会把整条 regex::escape 掉，
+    //    那个 `function\s+login` 的例子在默认模式下必然零命中。
+    assert.doesNotMatch(text, /Text to search for \(regex supported/,
+      `${where}: search 的 query 又在默认 literal 模式下教正则 —— 那个例子必然搜不到`);
+    assert.match(text, /\*\*Literal by default\*\*/, `${where}: search 的 query 没说清默认是字面匹配`);
+
+    // ③ run_subagent 的 tasks：嵌套那层是顺序跑的，且 4 个槽位整会话共享。
+    assert.doesNotMatch(text, /up to 4; all 4 run concurrently/,
+      `${where}: run_subagent 又无条件说 4 条并发 —— 嵌套那层是顺序跑的，子体会照着并发估超时`);
+    assert.match(text, /runs them one after another, so budget its timeout accordingly/,
+      `${where}: 没说清嵌套派发是顺序的`);
+
+    // ④ generate_texture 只落**一个**文件（后端每次调用只有一次 stream_asset_to_path）。
+    assert.doesNotMatch(text, /the full albedo \/ normal \/ roughness \/ metallic set/,
+      `${where}: generate_texture 又承诺整套 PBR 贴图 —— 后端只存一个文件，模型会去引用三个不存在的路径`);
+    assert.match(text, /It does not produce a separate albedo\/normal\/roughness\/metallic set/,
+      `${where}: 没说清只有一张图`);
+
+    // ⑤ 走同一条落盘路径的四个工具，扩展名告诫只写在 auto_rig 上是不够的。
+    for (const tool of ["Generate a 3D model with AI", "Generate character animation / motion with AI",
+      "Download a game asset into the workspace"]) {
+      const at = text.indexOf(tool);
+      assert.ok(at >= 0, `${where}: 找不到 ${tool}`);
+      assert.match(text.slice(at, at + 900), /go by the path in the receipt/,
+        `${where}: 「${tool}」没说清格式以回执为准 —— 内容类型闸门明摆着放行 zip`);
+    }
+  }
+});
