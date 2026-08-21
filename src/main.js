@@ -40495,6 +40495,33 @@ async function _tsWorkerLocate(fp, line, character, op) {
   } finally { if (created) { try { model.dispose(); } catch {} } }
 }
 
+/** TS worker 的悬停信息（getQuickInfoAtPosition）。
+ *
+ * 三个兄弟工具都有 TS worker 兜底——format 在 57369、symbols 在 57455、
+ * definition/references 在 57514——**只有 hover 没有**。而 lspManager 的
+ * MANAGED_LANGS 里没有 typescript / javascript / json / css / html，
+ * 于是 lsp_hover 对这几个语言是**结构性**拿不到东西，永远不会好。
+ * 更糟的是回执写「这个语言**可能**没有可用的语言服务，或者该符号**此刻**无法解析」
+ * ——「可能 / 此刻」暗示重试或换个位置会好，模型于是白试几轮。
+ * 补齐这一条，和兄弟工具对齐。
+ */
+async function _tsWorkerHover(fp, line, character) {
+  const _m = await _modelForPath(fp); if (!_m) return null;
+  const { model, created } = _m;
+  try {
+    const client = await _tsWorkerClient(model); if (!client) return null;
+    let offset; try { offset = model.getOffsetAt({ lineNumber: line, column: (character | 0) + 1 }); } catch { return null; }
+    let info;
+    try { info = await client.getQuickInfoAtPosition(model.uri.toString(), offset); } catch { return null; }
+    if (!info) return null;
+    const flat = (parts) => (Array.isArray(parts) ? parts.map((p) => String(p?.text || "")).join("") : "");
+    const sig = flat(info.displayParts).trim();
+    const doc = flat(info.documentation).trim();
+    const text = [sig, doc].filter(Boolean).join("\n\n");
+    return text || null;
+  } finally { if (created) { try { model.dispose(); } catch {} } }
+}
+
 async function _tsWorkerFormat(fp) {
   const _m = await _modelForPath(fp); if (!_m) return null;
   const { model, created } = _m;
@@ -55767,7 +55794,14 @@ async function _executeToolStepInner(step, call, root, run) {
           const key = _pathIdentity(absolute);
           let group = matchesByPath.get(key);
           if (!group) {
-            group = { ...match, path: absolute, rel: rel || _normRel(absolute, searchRoot), matches: [], _scopeRoot: searchRoot };
+            // rel 一律按**工作区根**重算，不能用后端那个。
+            //
+            // 后端的 rel 是相对「这次被搜的那个 scope」算的：search(path="src/") 时
+            // searchRoot 是 <root>/src，于是命中打印成 `deep/auth.ts` 而不是
+            // `src/deep/auth.ts`。模型照抄去 read_file，必然扑空——一次白跑，
+            // 而且它会以为是文件不存在，转头去猜别的路径。
+            // absolute 是对的，这里就用它反推。
+            group = { ...match, path: absolute, rel: _normRel(absolute, root) || rel || _normRel(absolute, searchRoot), matches: [], _scopeRoot: searchRoot };
             matchesByPath.set(key, group);
           }
           const seenMatches = new Set(group.matches.map((item) => `${item?.line || 0}\x1f${item?.column || 0}\x1f${item?.text || ""}`));
@@ -57490,11 +57524,15 @@ async function _executeToolStepInner(step, call, root, run) {
             // 悬停：一次往返拿到"这个符号在当前装的版本下到底是什么类型"。
             let hover = null;
             try { hover = await (lspManager && lspManager.agentHover ? lspManager.agentHover(fp, line, character) : null); } catch {}
+            // TS worker 兜底——三个兄弟工具都有，只有 hover 漏了。
+            // JS/TS/JSX/TSX 不在 lspManager 的 MANAGED_LANGS 里，没有这一条就是必然失败。
+            if (!hover) { try { hover = await _tsWorkerHover(fp, line, character); } catch {} }
             if (!hover) {
               res.className = "atc-result atc-result--err"; res.textContent = "无悬停信息";
               return { type: "lsp", path: rel, content:
-                `[无结果] ${rel}:${line} 的「${sym}」拿不到悬停信息——这个语言可能没有可用的语言服务，`
-                + `或者该符号此刻无法解析。**这不代表这个符号不存在**。`
+                `[无结果] ${rel}:${line} 的「${sym}」拿不到悬停信息。已经试过语言服务和 TS worker 两条路，`
+                + `都没有——**换个位置或重试不会有不同结果**，别再试第二次。`
+                + `**这不代表这个符号不存在**，只代表当前这个文件类型没有可用的类型信息来源。`
                 + `\n第三方库的签名改用 package_source(package="包名", symbol="${sym}")；项目内的用 lsp_definition。` };
             }
             res.className = "atc-result atc-result--ok"; res.textContent = "已解析";
