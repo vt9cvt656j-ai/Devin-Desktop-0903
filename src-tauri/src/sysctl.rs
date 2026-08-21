@@ -166,12 +166,12 @@ fn do_open(name: &str, bg: bool) -> Result<String, String> {
                 if let Ok(front) = system_frontmost_inner() {
                     seen = front.clone();
                     if front.to_lowercase().contains(&want) {
-                        return Ok(format!("✓ 已切换到「{name}」，已核实它现在确实在前台（{front}）。可以用 system menu 走它的菜单，或 computer screenshot 看界面节点。"));
+                        return Ok(format!("✓ 已切换到「{name}」，已核实它现在确实在前台（{front}）。可以用 system menu 走它的菜单，或 read_screen 读它的可访问性节点（要看真实像素用 computer 的 screen.capture）。"));
                     }
                 }
                 if std::time::Instant::now() >= deadline {
                     return Ok(format!(
-                        "⚠️ 已向系统发出打开「{name}」的请求，但 3 秒内它没有到前台——当前前台是「{}」。可能还在冷启动、被权限或更新对话框截了焦点、或者起在别的桌面空间。**先 computer screenshot 或 system frontmost 确认现在屏幕上是什么，再决定下一步**，别直接对着它操作。",
+                        "⚠️ 已向系统发出打开「{name}」的请求，但 3 秒内它没有到前台——当前前台是「{}」。可能还在冷启动、被权限或更新对话框截了焦点、或者起在别的桌面空间。**先 system frontmost 或 computer 的 screen.capture 确认现在屏幕上是什么，再决定下一步**，别直接对着它操作。",
                         if seen.is_empty() { "（读不到）" } else { seen.as_str() }
                     ));
                 }
@@ -322,7 +322,7 @@ mod lx {
             .map_err(|e| format!("聚焦失败（装 wmctrl）：{e}"))
     }
     pub fn menu_unsupported() -> Result<String, String> {
-        Ok("{\"error\":\"Linux 没有统一菜单接口，system menu 暂不支持——改用 computer screenshot + 坐标点菜单\"}".into())
+        Ok("{\"error\":\"Linux 没有统一菜单接口，system menu 暂不支持——改用 computer 的 screen.capture 看像素 + 坐标点菜单\"}".into())
     }
 }
 

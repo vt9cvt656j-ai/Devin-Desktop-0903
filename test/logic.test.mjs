@@ -28169,6 +28169,28 @@ test("运行中按回车必须走实时引导，不是排队——注释说了�
     "标志要紧挨在 _setStreaming(sess, true) 之前——晚一步，启动那几秒里的消息就还是排队");
 });
 
+test("面向模型的文案里不许出现不存在的方法名", () => {
+  // 实拍：模型想给屏幕截图，转了六分钟没找到。三处文案都教它用 "computer screenshot"，
+  // 而 computer 的 enum 里根本没有 screenshot 这个 method（真名是 screen.capture）。
+  // 更糟的是 screenshot/take_screenshot/capture_screen 这些名字全被映射到那个**渲染网址**
+  // 的 screenshot 工具，于是它撞过去只拿到「需要 url」——所有错路的终点是同一个死胡同。
+  //
+  // 这条钉的是「文案里点名的方法必须真的存在」。幽灵名字比缺文档更贵：缺文档模型会去找，
+  // 幽灵名字会让它确信自己找对了，然后一路撞到底。
+  assert.doesNotMatch(SRC, /computer screenshot/,
+    "computer 没有 screenshot 这个 method，真名是 screen.capture");
+
+  // 终点要是路标不是死胡同：screenshot 工具在缺 url 时必须把两个真名字说出来。
+  const shotErr = SRC.slice(SRC.indexOf("[ERROR] screenshot 只把一个"), SRC.indexOf("[ERROR] screenshot 只把一个") + 300);
+  assert.ok(shotErr.includes("screen.capture"), "缺 url 的报错要指向拍真实屏幕的那个方法");
+  assert.ok(shotErr.includes("read_screen"), "也要指向读界面节点的那个");
+
+  // 不可猜的参数名必须写进清单。裸方法名 = 让模型照它见过的唯一约定去猜。
+  for (const sig of ["mouse.drag{from_x,from_y,to_x,to_y}", "keyboard.press{key}"]) {
+    assert.ok(SRC.includes(sig), `automation 清单里 ${sig} 的参数名没写，模型只能猜`);
+  }
+});
+
 test("docker 只有真会挂住的那几条算长时运行，秒回的不算", () => {
   // 判据不能用那张二元组表：它只看 head 和第一个非选项 token，于是
   // `docker compose up`（一直刷日志）和 `docker compose ps`（秒回）会同判。
