@@ -4590,15 +4590,11 @@ fn strip_html(s: &str) -> String {
             _ => {}
         }
     }
-    out.replace("&amp;", "&")
-        .replace("&lt;", "<")
-        .replace("&gt;", ">")
-        .replace("&quot;", "\"")
-        .replace("&#039;", "'")
-        .replace("&#8217;", "\u{2019}")
-        .replace("&#8211;", "\u{2013}")
-        .replace("&#8230;", "\u{2026}")
-        .replace("&nbsp;", " ")
+    // 第 N 份手写实体解码。它和隔壁 html_decode 犯的是同两个错：
+    // 数字实体只认三个（&#039;/&#8217;/&#8211;/&#8230;），别的照样漏给模型；
+    // 而且是**顺序 replace**，页面上真实存在的 `&amp;lt;` 会被二次解码成 `<`。
+    // 11 个调用点（各社区/资讯源的正文摘要）一直吃着这两个毛病。统一走一份。
+    crate::ai::decode_html_entities(&out)
         .trim()
         .to_string()
 }

@@ -3957,8 +3957,10 @@ fn parse_google(html: &str) -> Vec<(String, String, String)> {
         let url = extract_between(chunk, "<a href=\"/url?q=", "&")
             .map(|s| s.to_string())
             .or_else(|| extract_between(chunk, "<a href=\"http", "\"").map(|u| format!("http{u}")))
-            .unwrap_or_default()
-            .replace("&amp;", "&");
+            .unwrap_or_default();
+        // 抓下来的 href 同样要走统一解码：只换 &amp; 的话，`&#38;` / `&#x26;`
+        // 这类数字实体会原样留在 URL 里，打开就是 404。
+        let url = decode_html_entities(&url);
         let snippet = extract_between(chunk, "<span class=\"", "</span>")
             .map(|s| {
                 let inner = s.find('>').map(|i| &s[i + 1..]).unwrap_or(s);
@@ -4467,6 +4469,50 @@ mod html_entity_tests {
     fn zero_width_entities_are_removed() {
         assert_eq!(decode_html_entities("Java&shy;Script"), "JavaScript");
         assert_eq!(decode_html_entities("a&zwnj;b"), "ab");
+    }
+
+    /// 全仓的手写实体解码必须**一份都不剩**。
+    ///
+    /// 上一版只钉了两个函数名，于是 knowledge.rs 的 strip_html（11 个调用点，
+    /// 各社区/资讯源的正文摘要）和 files.rs 的 strip_xml（docx/xlsx 正文）
+    /// 都还带着这次要修的两个毛病：数字实体漏给模型、顺序 replace 把
+    /// `&amp;lt;` 二次解码成 `<`。这条改成**扫全仓**，谁再手写第五份都会红。
+    #[test]
+    fn no_hand_rolled_entity_table_survives_anywhere() {
+        for (name, src) in [
+            ("ai.rs", include_str!("ai.rs")),
+            ("knowledge.rs", include_str!("knowledge.rs")),
+            ("files.rs", include_str!("files.rs")),
+        ] {
+            // 只看代码，不看注释——注释里会原样引着这些片段（刚踩过）。
+            let code: String = src
+                .lines()
+                .filter(|l| !l.trim_start().starts_with("//"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            for needle in ["\"&amp;\"", "\"&lt;\"", "\"&nbsp;\"", "\"&#39;\"", "\"&#8217;\""] {
+                assert!(
+                    !code.contains(&format!(".replace({needle}")),
+                    "{name} 里又出现了手写的实体 replace（{needle}）—— 统一走 decode_html_entities"
+                );
+            }
+        }
+
+        // 两个曾经漏网的函数，单独钉一遍它们真的改走统一解码了。
+        for (name, src, func) in [
+            ("knowledge.rs", include_str!("knowledge.rs"), "fn strip_html("),
+            ("files.rs", include_str!("files.rs"), "fn strip_xml("),
+        ] {
+            let body = src
+                .split(func)
+                .nth(1)
+                .and_then(|s| s.split("\n}\n").next())
+                .unwrap_or_else(|| panic!("{name} 里 {func} 不见了"));
+            assert!(
+                body.contains("crate::ai::decode_html_entities"),
+                "{name} 的 {func} 没走统一解码 —— 数字实体照样漏、&amp;lt; 照样二次解码"
+            );
+        }
     }
 
     /// 三份手写解码器已经并成一份 —— 名单漂了就是三种不同的漏法。
