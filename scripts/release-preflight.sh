@@ -15,6 +15,17 @@ cargo test --manifest-path server/Cargo.toml repo_sync -- --nocapture >/dev/null
   || fail "外层仓的 ide/ 副本和内层仓 HEAD 不一致。流水线编的是外层那份，直接打包会发出旧代码。
    先对齐：cargo test --manifest-path server/Cargo.toml repo_sync  看它列出哪些文件差了。"
 
+echo "── 内层新增的文件有没有漏进外层 ──"
+# repo_sync 比的是两边**已提交**的内容，所以它抓不到「内层新建、外层压根没这个文件」
+# 这种情况——而流水线编的正是外层那份，漏一个模块就是整个功能不存在。
+# 实际漏过一次：macos_tree.rs（原生 AX 快照）。
+missing=$(git -C ide ls-files | while IFS= read -r f; do
+  git ls-files --error-unmatch "ide/$f" >/dev/null 2>&1 || echo "$f"
+done)
+[ -z "$missing" ] || fail "这些文件内层有、外层没有（流水线编的是外层，等于它们不存在）：
+$missing
+   补上：git add ide/<文件> && git commit"
+
 echo "── sidecar 是否比源码新（四个平台）──"
 newest_src=$(find ide/automation-framework/src -name '*.rs' -newer ide/src-tauri/binaries/automation-server-aarch64-apple-darwin -print -quit 2>/dev/null || true)
 [ -z "$newest_src" ] || fail "automation-server (aarch64) 比它的源码旧：$newest_src
