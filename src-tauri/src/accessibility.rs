@@ -306,8 +306,19 @@ pub async fn read_screen(ocr: Option<bool>) -> Result<ReadScreenResponse, String
             // 而 agent 干活时前台往往就是 Mr. Day One 自己（WebView 内容对 AX 不可见）。
             // 不写清楚，模型会把它当权限问题反复上报。
             limitations.push(
-                "No elements were returned, and permissions ARE granted — so this is not a permission problem. Two ordinary causes: (1) read_screen reads the FRONTMOST app, which is often Mr. Day One itself — bring the target to the front first with system open / window.activate, then read again; (2) the app draws its own UI and exposes no accessibility tree (games, Electron canvases, remote desktops) — read it with ocr=true instead. Retrying the same call unchanged will not help."
-                    .into(),
+                format!(
+                    "No elements were returned, and permissions ARE granted — so this is not a permission problem. Two ordinary causes: (1) read_screen reads the FRONTMOST app, which is often Mr. Day One itself — bring the target to the front first with system open / window.activate, then read again; (2) the app draws its own UI and exposes no accessibility tree (games, Electron canvases, remote desktops) — {}. Retrying the same call unchanged will not help.",
+                    // 两处平台差异，都会让这句建议变成假话：
+                    //  · 已经在 ocr 里读空的时候，再建议「用 ocr=true」等于建议它用正在用的那个；
+                    //  · OCR 只有 macOS 有实现，非 macOS 上它恒返回空——把模型指过去等于送进死路。
+                    if use_ocr {
+                        "OCR also came back empty, so there is no text on screen to read either — this is not something a different flag fixes"
+                    } else if cfg!(target_os = "macos") {
+                        "read it with ocr=true instead"
+                    } else {
+                        "there is no OCR fallback on this platform — use computer's screen.capture to look at the real pixels instead"
+                    }
+                ),
             );
         }
     } else if !use_ocr {
@@ -570,6 +581,8 @@ fn read_ui_snapshot() -> UiSnapshot {
     })
 }
 
+/// macOS 侧的便捷包装：给不关心失败原因的调用方用，保持只返回元素。
+/// Windows 侧那个返回 (元素, 失败原因)，因为它三种失败原来全都静默变空。
 #[cfg(target_os = "macos")]
 pub fn read_ui_elements() -> Vec<UiElement> {
     read_ui_snapshot().elements
@@ -581,7 +594,7 @@ pub fn read_ui_elements() -> Vec<UiElement> {
 // bounded → falls back to the coordinate grid on permission/slow/no-tree (no hang). Same
 // JSON shape as macOS so the caller is platform-agnostic.
 #[cfg(target_os = "windows")]
-pub fn read_ui_elements() -> Vec<UiElement> {
+pub fn read_ui_elements() -> (Vec<UiElement>, Option<String>) {
     use std::io::Read;
     use std::process::{Command, Stdio};
     use std::time::{Duration, Instant};
@@ -635,7 +648,7 @@ if($out.Count -eq 0){'[]'}else{ConvertTo-Json -Compress -InputObject @($out)}"#;
         .spawn()
     {
         Ok(c) => c,
-        Err(_) => return Vec::new(),
+        Err(_) => return (Vec::new(), Some("powershell 起不来".into())),
     };
     let deadline = Instant::now() + Duration::from_millis(6000);
     loop {
@@ -645,11 +658,16 @@ if($out.Count -eq 0){'[]'}else{ConvertTo-Json -Compress -InputObject @($out)}"#;
                 if Instant::now() > deadline {
                     let _ = child.kill();
                     let _ = child.wait();
-                    return Vec::new();
+                    // 这是 Windows 上最常见的一种空结果（Explorer / Office / Electron
+                    // 很容易撞到），而它**不是**「这个应用没有可访问性树」。不区分的话，
+                    // 下游会照 macOS 那套说「权限没问题、重试没意义、改用 ocr」——而 ocr
+                    // 在 Windows 上恒返回空，模型绕一圈后断定「这个应用没法自动化」，
+                    // 把一句假话报给用户。
+                    return (Vec::new(), Some("UI Automation 读取超时（6 秒）".into()));
                 }
                 std::thread::sleep(Duration::from_millis(40));
             }
-            Err(_) => return Vec::new(),
+            Err(_) => return (Vec::new(), Some("等待 powershell 时出错".into())),
         }
     }
     let mut s = String::new();
@@ -658,27 +676,36 @@ if($out.Count -eq 0){'[]'}else{ConvertTo-Json -Compress -InputObject @($out)}"#;
     }
     let t = s.trim();
     if t.starts_with('{') {
-        return serde_json::from_str::<UiElement>(t)
-            .map(|e| vec![e])
-            .unwrap_or_default();
+        return match serde_json::from_str::<UiElement>(t) {
+            Ok(e) => (vec![e], None),
+            Err(_) => (Vec::new(), Some("powershell 输出不是合法 JSON".into())),
+        };
     }
-    serde_json::from_str::<Vec<UiElement>>(t).unwrap_or_default()
+    match serde_json::from_str::<Vec<UiElement>>(t) {
+        Ok(v) => (v, None),
+        // 解析失败以前是 unwrap_or_default() 静默变空——和「这个应用真没有元素」
+        // 长得一模一样，而这两件事该走完全不同的处置。
+        Err(_) => (Vec::new(), Some("powershell 输出不是合法 JSON".into())),
+    }
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-pub fn read_ui_elements() -> Vec<UiElement> {
-    Vec::new()
+pub fn read_ui_elements() -> (Vec<UiElement>, Option<String>) {
+    (Vec::new(), Some("这个平台没有可访问性树读取实现".into()))
 }
 
 #[cfg(not(target_os = "macos"))]
 fn read_ui_snapshot() -> UiSnapshot {
+    // 上面那句注释以前说「这条路径没有独立的失败信号」——不对：起不来、超时、
+    // 输出不是合法 JSON，三种失败都存在，只是原来全都静默返回了空。空结果因此和
+    // 「这个应用真的没有可访问性树」长得一模一样，而下游对这两件事的处置完全相反
+    // （一个该重试或切前台，一个该换别的手段）。现在各自报出来。
+    let (elements, read_error) = read_ui_elements();
     UiSnapshot {
         target: None,
-        elements: read_ui_elements(),
-        // 这条路径是同步读、没有 osascript 那种超时/起不来/输出不合法的独立失败信号，
-        // 所以「读取本身没完成」这回事不存在 —— 和 OCR 路径一样填 None。
-        // （macOS 版 read_ui_snapshot 在 329 行，各失败分支各自填 read_error。）
-        read_error: None,
+        elements,
+        page: None,
+        read_error,
     }
 }
 
@@ -1242,6 +1269,36 @@ return JSON.stringify({operated:operated,changed:changed});
     }
 
     #[cfg(target_os = "macos")]
+    #[test]
+    fn windows_read_reports_why_it_came_back_empty() {
+        // Windows 上读屏有三种失败：powershell 起不来、UIA 超时、输出不是合法 JSON。
+        // 原来三种全都静默 return 空——于是「读失败了」和「这个应用真的没有可访问性树」
+        // 长得一模一样，而下游对这两件事的处置完全相反（一个该重试或切前台，
+        // 一个该换手段）。空结果因此被包装成一句假话交给模型。
+        //
+        // 只在 mac 上跑 cargo check 是发现不了这类问题的——Windows 那条分支根本不参与
+        // 编译。这条改动就是靠 `cargo xwin check --target x86_64-pc-windows-msvc`
+        // 才发现签名没改全、编不过的。断言源码，因为这里编不出 Windows 的运行时。
+        let src: String = include_str!("accessibility.rs")
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let win_sig = format!("{} -> (Vec<UiElement>, Option<String>)", "pub fn read_ui_elements()");
+        assert!(
+            src.contains(&win_sig),
+            "Windows 的 read_ui_elements 必须把失败原因带出来，不能只返回元素"
+        );
+        for reason in ["powershell 起不来", "UI Automation 读取超时", "不是合法 JSON"] {
+            assert!(src.contains(reason), "少了一种失败原因：{reason}");
+        }
+        // OCR 兜底只有 macOS 有实现；在别的平台上把模型指过去是送进死路。
+        assert!(
+            src.contains("no OCR fallback on this platform"),
+            "非 macOS 平台不能建议用 ocr=true —— 那条路在那儿恒返回空"
+        );
+    }
+
     #[test]
     fn a_successful_read_still_says_what_it_could_not_see() {
         // AX 树只覆盖可见的那一屏（实测：浏览器把几何裁到可见区，折叠以下的内容
