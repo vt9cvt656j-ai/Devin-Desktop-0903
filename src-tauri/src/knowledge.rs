@@ -5343,11 +5343,13 @@ fn hit_matches_query(tokens: &[String], title: &str, path: &str) -> bool {
     tokens.iter().any(|tok| {
         let latin = tok.chars().all(|c| c.is_ascii_alphanumeric());
         if !latin {
-            return hay.contains(tok.as_str());
+            // 不能写 tok.as_str()：tok 是 &String，那条路径在这个工具链上被判成
+            // 不稳定特性 str_as_str，直接编不过（挡住了整个打包）。&**tok 等价。
+            return hay.contains(&**tok);
         }
         // 词边界：命中处的前后不能还是字母数字。
         let mut from = 0usize;
-        while let Some(rel) = hay[from..].find(tok.as_str()) {
+        while let Some(rel) = hay[from..].find(&**tok) {
             let at = from + rel;
             let end = at + tok.len();
             let before_ok = at == 0
