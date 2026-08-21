@@ -30,6 +30,7 @@ import assert from "node:assert/strict";
 import { readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
+import * as acorn from "acorn";
 import { dirname, join } from "node:path";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -1989,4 +1990,127 @@ test("harness 的编排信封两侧必须是同一个字面量，否则「谁在
     "harness 话语量没有进 assembled IDE prompt request 那条日志——量了看不到等于没量");
   // 只统计结构，不记内容。
   assert.doesNotMatch(rust, /orch_(bytes|msg_count)\s*=\s*%/, "这两个字段只能记数字，不能记正文");
+});
+
+// 函数作用域内的 TDZ：`node --check` 查不出来，源码文本断言更查不出来。
+//
+// 实例：_parentReadOnlyMode 是个 const，声明在第 45188 行，而第 45022 行的 sysPrompt 就要读它
+// ——同一函数体、中间没有函数边界。于是 _runSubAgent **每次调用都抛**
+// `Cannot access '_parentReadOnlyMode' before initialization`，
+// run_subagent / run_worker / debate / 嵌套派发整条功能死了两天，全仓 1845 条测试全绿：
+// 37 处 _runSubAgent 引用里 25 处是 extractFn/SRC.slice + assert.match 的源码文本断言，
+// 没有一条真的调用过它。
+//
+// 这条用 acorn 建作用域图，对整份 main.js 做静态 TDZ 判定——不依赖能不能把某个函数跑起来。
+test("函数作用域里不许先用后声明——node --check 查不出的 TDZ", () => {
+  const ast = acorn.parse(SRC, { ecmaVersion: "latest", sourceType: "module" });
+  const problems = [];
+
+  // 判据只在**同一个函数体内**成立：那里文本顺序就是执行顺序。
+  // 跨函数边界不算——`const f = () => later; const later = 1;` 是合法的，f 晚于声明才被调用。
+  // 每个作用域记 { map: 名字 -> 声明结束位置, fnDepth }；引用点的 fnDepth 与绑定不同就跳过。
+  const walk = (node, scopes, fnDepth, skipIds) => {
+    if (!node || typeof node.type !== "string") return;
+    const isFn = /Function/.test(node.type);
+    const opensScope = isFn || node.type === "Program";
+    const opensBlock = node.type === "BlockStatement" || node.type === "ForStatement"
+      || node.type === "ForOfStatement" || node.type === "ForInStatement"
+      || node.type === "SwitchStatement" || node.type === "CatchClause";
+    const depth = isFn ? fnDepth + 1 : fnDepth;
+    let next = scopes;
+
+    if (opensScope || opensBlock) {
+      const map = new Map();
+      const pick = (p, out) => {
+        if (!p) return;
+        if (p.type === "Identifier") out.push(p);
+        else if (p.type === "ObjectPattern") p.properties.forEach((q) => pick(q.value || q.argument, out));
+        else if (p.type === "ArrayPattern") p.elements.forEach((e) => pick(e, out));
+        else if (p.type === "AssignmentPattern") pick(p.left, out);
+        else if (p.type === "RestElement") pick(p.argument, out);
+      };
+      const collect = (n) => {
+        if (!n || typeof n.type !== "string") return;
+        if (/Function/.test(n.type) && n !== node) return;      // 内层函数自己管自己
+        // 自带作用域的语句也自己管自己：块、for/for-of/for-in（循环变量属于循环）、switch。
+        // 不这么切的话，三个连着的 `for (const s of …)` 会把最后一个的位置登记到外层函数上，
+        // 于是第一个循环体里用 s 就被误报成「先用后声明」。
+        if (n !== node && (n.type === "BlockStatement" || n.type === "ForStatement"
+          || n.type === "ForOfStatement" || n.type === "ForInStatement"
+          || n.type === "SwitchStatement" || n.type === "CatchClause")) return;
+        if (n.type === "VariableDeclaration" && n.kind !== "var") {
+          for (const d of n.declarations) {
+            const out = []; pick(d.id, out);
+            for (const id of out) map.set(id.name, d.end);
+          }
+        }
+        for (const k in n) {
+          const v = n[k];
+          if (Array.isArray(v)) v.forEach(collect);
+          else if (v && typeof v.type === "string") collect(v);
+        }
+      };
+      // 形参 / 循环变量 / catch 参数也要登记，否则内层用了同名变量会错误地解析到外层的 const。
+      // 它们不受 TDZ 约束，登记成位置 0（永远早于任何引用）。
+      const bind0 = (p) => { const out = []; pick(p, out); out.forEach((id) => map.set(id.name, 0)); };
+      if (isFn) (node.params || []).forEach(bind0);
+      if (node.type === "ForStatement" && node.init && node.init.type === "VariableDeclaration") {
+        node.init.declarations.forEach((d) => bind0(d.id));
+      }
+      if ((node.type === "ForOfStatement" || node.type === "ForInStatement")
+        && node.left && node.left.type === "VariableDeclaration") {
+        node.left.declarations.forEach((d) => bind0(d.id));
+      }
+      const kids = node.body ? (Array.isArray(node.body) ? node.body : [node.body]) : [];
+      kids.forEach(collect);
+      next = [...scopes, { map, fnDepth: depth }];
+    }
+
+    if (node.type === "Identifier") {
+      if (skipIds && skipIds.has(node)) return;
+      for (let i = next.length - 1; i >= 0; i--) {
+        const at = next[i].map.get(node.name);
+        if (at === undefined) continue;
+        // 只在同一函数体内比文本顺序。
+        if (next[i].fnDepth === depth && node.start < at) {
+          problems.push({ name: node.name, use: node.start, decl: at });
+        }
+        break;
+      }
+      return;
+    }
+    if (node.type === "MemberExpression" && !node.computed) { walk(node.object, next, depth, skipIds); return; }
+    if (node.type === "Property" && !node.computed) { walk(node.value, next, depth, skipIds); return; }
+    if (node.type === "VariableDeclarator") {
+      // 声明式本身的名字不是「引用」。
+      const own = new Set();
+      const mark = (p) => {
+        if (!p) return;
+        if (p.type === "Identifier") own.add(p);
+        else if (p.type === "ObjectPattern") p.properties.forEach((q) => mark(q.value || q.argument));
+        else if (p.type === "ArrayPattern") p.elements.forEach(mark);
+        else if (p.type === "AssignmentPattern") mark(p.left);
+        else if (p.type === "RestElement") mark(p.argument);
+      };
+      mark(node.id);
+      const merged = new Set([...(skipIds || []), ...own]);
+      walk(node.id, next, depth, merged);
+      walk(node.init, next, depth, merged);
+      return;
+    }
+
+    for (const k in node) {
+      if (k === "type" || k === "start" || k === "end") continue;
+      const v = node[k];
+      if (Array.isArray(v)) v.forEach((c) => walk(c, next, depth, skipIds));
+      else if (v && typeof v.type === "string") walk(v, next, depth, skipIds);
+    }
+  };
+  walk(ast, [], 0, null);
+
+  const lineOf = (off) => SRC.slice(0, off).split("\n").length;
+  const shown = problems.slice(0, 12).map((p) => `${p.name}：第 ${lineOf(p.use)} 行用，第 ${lineOf(p.decl)} 行才声明`);
+  assert.deepEqual(problems.length, 0,
+    `这些标识符在**声明之前**就被读了——运行时抛 "Cannot access X before initialization"，\n`
+    + `而 node --check 和源码文本断言都查不出来：\n  ${shown.join("\n  ")}`);
 });

@@ -19913,10 +19913,17 @@ let _currentAiMode = "agent";
 //             bites where the agent can actually write. Persisted across sessions.
 function _loadAiPerm(storage) {
   const saved = storage?.getItem("michael-ide.ai-perm");
+  // 三档。full = 完全放开：连高危操作也不问。
+  //
+  // auto（默认）下高危仍然会问，那道门不受「改动前审批」开关影响；full 是用户
+  // 明确要的第三档——他要的是一个真能自己干完的智能体，不是每走一步都停下来的。
+  // 这一档的代价必须说清楚而不是藏着：删除在系统侧就是 remove_dir_all，没有回收站，
+  // 界面上也没有撤销入口，所以 full 下的一次误判就是永久丢失。用户已经知道并选择了它。
+  if (saved === "full") return "full";
   return saved === "approve" ? "approve" : "auto";
 }
 let _currentAiPerm = (() => { try { return _loadAiPerm(localStorage); } catch { return "auto"; } })();
-function _setAiPerm(p) { _currentAiPerm = (p === "approve" ? "approve" : "auto"); try { localStorage.setItem("michael-ide.ai-perm", _currentAiPerm); } catch {} }
+function _setAiPerm(p) { _currentAiPerm = (p === "full" ? "full" : p === "approve" ? "approve" : "auto"); try { localStorage.setItem("michael-ide.ai-perm", _currentAiPerm); } catch {} }
 // Tools that touch disk / the machine / the outside world. Pure reads, git
 // status/diff/log, lsp, think, screenshot, web search never ask.
 const _APPROVE_TYPES = approvalTypes(); // 见 agent/tool-policy.js —— 单一声明处，不再逐点重抄
@@ -20278,7 +20285,10 @@ function _toolApprovalDialog({ title, detail, onceLabel = "允许", alwaysLabel 
   // 没人在电脑前就等于永久挂起。出口选「拒绝」而不是「放行」：没人看着的时候
   // 权限反而更大，那是最坏的方向。五个调用点（工具审批、沙箱逃逸、工作区配置
   // 执行、工作区信任、撤销条）共用这一道闸，堵一处漏四处的事不会发生。
-  if (_unattendedRun) return Promise.resolve("deny");
+  // full 档下这个函数根本不会被调到（mustAsk 恒 false）。留这行是给另外四个
+  // 调用点（沙箱逃逸、工作区配置执行、工作区信任、撤销条）兜底——它们不走 mustAsk。
+  // full 时它们也该放行，否则定时任务会在这些地方被拦住，而用户要的是全放开。
+  if (_unattendedRun) return Promise.resolve(_currentAiPerm === "full" ? "once" : "deny");
   const show = () => new Promise((resolve) => {
     if (!_approveDlg) {
       _approveDlg = document.createElement("dialog");
@@ -20877,7 +20887,13 @@ async function _approveToolCall(call, run) {
   if (ruleVerdict !== "ask" && call.type === "mcp" && call.mcpAutoApprove) return true;
 
   const mode = (run && run.perm) || _currentAiPerm;
-  const mustAsk = ruleVerdict === "ask" || dangerous || (mode === "approve" && _requiresApproval(call));
+  // full = 用户明确选择的完全放开：一个都不问，高危也不问。
+  // 连工作区规则里写着 ask 的也放行——那类规则可能来自 clone 来的仓库，
+  // 而 full 是用户本人当下的决定，比仓库里带来的策略更靠后也更权威。
+  // （ruleVerdict === "deny" 例外：它在上面已经静默否决过了，那是硬停，不走这里。）
+  const mustAsk = mode === "full"
+    ? false
+    : ruleVerdict === "ask" || dangerous || (mode === "approve" && _requiresApproval(call));
   if (!mustAsk) return true;
   const key = _approvalKey(call, run);
   // 高危调用**不吃会话记忆**，也不给「本会话总是允许」。
@@ -20894,7 +20910,7 @@ async function _approveToolCall(call, run) {
   // 改文件类的调用，把真实 diff 放进框里——否则用户只能凭文件名猜。
   let _diffPreview = "";
   try { _diffPreview = await _approvalDiffPreview(call); } catch { _diffPreview = ""; }
-  if (_unattendedRun) {
+  if (_unattendedRun && _currentAiPerm !== "full") {
     // 对话框那一层已经会返回 deny，这里补的是**给模型的说法**：否则它拿到的
     // 是一句「用户拒绝了」，而实际上没有任何人做过这个决定。说清楚是「没人能点」
     // 而不是「有人不同意」，模型才会把它留给用户，而不是去找一条绕过确认的路。
@@ -45013,6 +45029,13 @@ async function _runSubAgent({ config, description, prompt, root, container, run,
   const _scopeGuidance = _scopeIsWholeWs
     ? `\n\n# 你的可改范围(scope)\n本次没有细分 scope：你可以改整个工作区，但你是**独占串行**运行（同一时刻只有你在写文件）。请只改这块子任务真正需要的文件，别越界重写别人的部分。`
     : `\n\n# 你的可改范围(scope)\n你**只能修改**下面这些路径内的文件（相对工作区根），其余文件只读：\n${scopeRel.map((s) => "- " + s).join("\n")}`;
+  // **必须声明在第一次使用之前**。它原来声明在 170 行之后，而下面这条 sysPrompt 就要读它——
+  // 同一个函数体、中间没有函数边界，于是 `_runSubAgent` **每次调用都抛**
+  // `ReferenceError: Cannot access '_parentReadOnlyMode' before initialization`。
+  // run_subagent / run_worker / debate / 嵌套派发整条功能因此是死的，而且没有任何测试发现：
+  // 全仓 37 处 _runSubAgent 引用里 25 处是 extractFn/SRC.slice + assert.match 的**源码文本**断言，
+  // 没有一条真的调用过它。node --check 也查不出函数作用域内的 TDZ。
+  const _parentReadOnlyMode = !write && ["explorer", "plan", "reviewer"].includes(String(run?.mode || ""));
   const sysPrompt = (write
     ? _WORKER_SYSTEM + _scopeGuidance
     : _SUBAGENT_SYSTEM)
@@ -45185,7 +45208,6 @@ async function _runSubAgent({ config, description, prompt, root, container, run,
   // 修的方向是**收回许诺**而不是放开门：只读是用户在模式选择器上亲手选的，父体自己都不许跑
   // 命令（tool-policy 里 cmd/termtask 的 readOnlyModeBlocked 有测试正面钉着），让子体绕过去
   // 等于那个选择白选。收回之后模型看不见这个工具，也就不会撞上那堵墙。
-  const _parentReadOnlyMode = !write && ["explorer", "plan", "reviewer"].includes(String(run?.mode || ""));
   if (_parentReadOnlyMode) {
     const _i = _allow.indexOf("run_cmd");
     if (_i >= 0) _allow.splice(_i, 1);
@@ -49586,7 +49608,14 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
               run._quietResumePool--;
               // 上一轮已经推过一次、而这一轮模型没有产生任何新的成功编辑 → 说明提醒没起作用，
               // _diagnosticBlock 又只在有成功编辑时才重算，再推就是拿一个陈旧值反复烧钱。
-              if (run._diagnosticNudges >= 2 && !(Array.isArray(_successfulEdits) && _successfulEdits.length)) {
+              // 读的是**上一轮**的成功编辑，不是 _successfulEdits。
+              //
+              // _successfulEdits 在同一个函数体里、但**在这一行之后**才计算（本轮工具阶段跑完才汇总），
+              // 所以这里读它是纯 TDZ：`Cannot access '_successfulEdits' before initialization`。
+              // 因为 && 短路，第一次推送（nudges===1）躲得过，**第二次必然抛**——而这一行的唯一
+              // 用途就是给第二次用的，等于这条「推过一次还没起作用就别再推」的判断从来没生效过。
+              // 语义上要的本来就是「刚跑完那一轮有没有新的成功编辑」，跨轮存活的值挂在 run 上。
+              if (run._diagnosticNudges >= 2 && !(Array.isArray(run._lastSuccessfulEdits) && run._lastSuccessfulEdits.length)) {
                 run._quietResumePool++;   // 没真的开火，把刚扣的还回去
                 run._incompleteReason = run._incompleteReason || "new_diagnostics_unresolved";
               } else
@@ -50801,6 +50830,9 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
         const actualPath = c._resolvedPath || _resolveRel(c.path, root);
         if (!_successfulEdits.includes(actualPath)) _successfulEdits.push(actualPath);
       }
+      // 跨轮存活：下一轮的诊断推送判据要读「刚跑完这一轮有没有新的成功编辑」。
+      // 在同一轮里读 _successfulEdits 是读不到的（它就在这几行才算出来）。
+      run._lastSuccessfulEdits = _successfulEdits;
       for (const it of items) {
         for (const path of (it._workerMutationPaths || [])) {
           const actualPath = _resolveRel(path, root);
