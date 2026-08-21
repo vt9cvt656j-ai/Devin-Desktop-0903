@@ -3980,7 +3980,7 @@
               "url",
               "port"
             ],
-            "description": "manual = wait for the user to click continue; file = wait for a file to appear (with file_pattern, wait for its contents to match); capture = watch captured traffic for pattern; command = re-run a command until it exits 0; url = re-request a URL until HTTP 200; port = wait for a port to be listening"
+            "description": "manual = wait for the user to click continue; file = wait for a file to appear (with file_pattern, wait for its contents to match); capture = watch captured traffic for pattern; command = re-run a command until it exits 0; url = re-request a URL until it answers 2xx or 3xx (a redirect counts as reachable); port = wait for a port to be listening"
           },
           "pattern": {
             "type": "string",
