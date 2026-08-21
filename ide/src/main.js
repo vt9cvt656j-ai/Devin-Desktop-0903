@@ -20039,6 +20039,15 @@ function _approvalLabel(call) {
     case "copy": return { title: "复制？", detail: (call.path || "") + "  →  " + (call.to || "") };
     case "mkdir": return { title: "新建目录？", detail: call.path || "" };
     case "saveskill": return { title: "保存为技能？", detail: `${call.name || ""}\n${String(call.description || "").slice(0, 160)}\n→ ${call.path || ""}` };
+    // 定时任务是一条**将来会在没人看着时被执行的常驻指令**。框上必须把两件事摆出来：
+    // 什么时候跑、跑的时候会拿到哪句话。只写「新建定时任务？」等于让用户闭着眼点同意
+    // 一件他事后才会看见后果的事。
+    case "schedule": return {
+      title: call.action === "add" ? "排一条定时任务？（到点会在没人看着时自己跑）" : "删掉这条定时任务？",
+      detail: call.action === "add"
+        ? `${call.everyMinutes > 0 ? `每 ${call.everyMinutes} 分钟` : `每天 ${call.at}`}\n\n到点时它会收到这句话：\n${String(call.prompt || "").slice(0, 400)}`
+        : `#${call.id}`,
+    };
     // MCP 服务就是一条任意命令行。框上必须把命令原文摆出来，否则用户等于闭着眼点同意。
     case "mcpconfig": return {
       title: call.action === "add" ? "把这个 MCP 服务写进你的配置？"
@@ -20265,6 +20274,11 @@ async function _mcpPollElicitation() {
 let _approveDlg = null;
 let _approveChain = Promise.resolve();
 function _toolApprovalDialog({ title, detail, onceLabel = "允许", alwaysLabel = "本会话总是允许" }) {
+  // 无人值守时**绝不弹框**。这个 promise 只有「点按钮」和「关对话框」两个出口，
+  // 没人在电脑前就等于永久挂起。出口选「拒绝」而不是「放行」：没人看着的时候
+  // 权限反而更大，那是最坏的方向。五个调用点（工具审批、沙箱逃逸、工作区配置
+  // 执行、工作区信任、撤销条）共用这一道闸，堵一处漏四处的事不会发生。
+  if (_unattendedRun) return Promise.resolve("deny");
   const show = () => new Promise((resolve) => {
     if (!_approveDlg) {
       _approveDlg = document.createElement("dialog");
@@ -20745,6 +20759,13 @@ function _skillToolAllowed(allow, toolName) {
 // 改成返回对象的话 `{ ok: false }` 是**真值**，那道门会当场变成"一律放行"。
 // 这是整条执行链上唯一的授权检查点，不值得为一句文案去动它的契约。
 let _lastRefusal = null;
+// 本次运行是不是无人值守启动的（定时任务）。
+//
+// 审批框没有任何计时器，而 _approveChain 是全局串行的：半夜跑起来的任务撞上一个
+// 需要确认的操作，就在弹框上永久停住，占着审批链，后面所有任务跟着一起死。
+// 所以「自主执行」的前提不是放宽权限，而是让每一个等人的地方都有出口。
+let _unattendedRun = false;
+function _setUnattendedRun(on) { _unattendedRun = !!on; }
 function _noteRefusal(by, detail) { _lastRefusal = { by, detail: String(detail || "") }; }
 function _takeRefusal() { const r = _lastRefusal; _lastRefusal = null; return r; }
 
@@ -20873,6 +20894,18 @@ async function _approveToolCall(call, run) {
   // 改文件类的调用，把真实 diff 放进框里——否则用户只能凭文件名猜。
   let _diffPreview = "";
   try { _diffPreview = await _approvalDiffPreview(call); } catch { _diffPreview = ""; }
+  if (_unattendedRun) {
+    // 对话框那一层已经会返回 deny，这里补的是**给模型的说法**：否则它拿到的
+    // 是一句「用户拒绝了」，而实际上没有任何人做过这个决定。说清楚是「没人能点」
+    // 而不是「有人不同意」，模型才会把它留给用户，而不是去找一条绕过确认的路。
+    _noteRefusal(
+      "unattended",
+      "这一步需要用户当面确认，而本次运行是无人值守启动的（定时任务），此刻没有人能点。"
+        + "这一步**没有执行**。把它留给用户：在总结里明确写出「这一步需要你确认」以及具体是什么操作，"
+        + "然后继续完成其余不需要确认的部分——不要绕开这道确认去换一条路达到同样的效果。",
+    );
+    return false;
+  }
   const decision = await _toolApprovalDialog({
     // 「总是允许」这个按钮必须说清它到底放行了多大一片，否则用户看着一行
     // 「删除（不可恢复）？ build/a.o」点下去，实际授权的是别的东西。空串＝不给这个按钮。
@@ -23615,7 +23648,9 @@ async function _agentProjectServiceHints(root) {
       .slice(0, 12);
     if (pyDeps.length) lines.push(`Python 后端依赖 (requirements.txt): ${pyDeps.join(", ")}`);
   } catch {}
-  for (const [marker, label] of [["pyproject.toml", "Python (pyproject)"], ["manage.py", "Django"], ["main.py", "Python 入口 main.py"], ["app.py", "Python 入口 app.py"], ["go.mod", "Go"], ["Cargo.toml", "Rust"], ["pom.xml", "Java (Maven)"], ["build.gradle", "Java (Gradle)"]]) {
+  // Docker 原来一个标记都没有：项目里明明躺着 docker-compose.yml，每轮的环境块里
+  // 却只字不提，模型于是从不把「这个项目是用容器跑的」当成事实，一路按裸机猜命令。
+  for (const [marker, label] of [["pyproject.toml", "Python (pyproject)"], ["manage.py", "Django"], ["main.py", "Python 入口 main.py"], ["app.py", "Python 入口 app.py"], ["go.mod", "Go"], ["Cargo.toml", "Rust"], ["pom.xml", "Java (Maven)"], ["build.gradle", "Java (Gradle)"], ["Dockerfile", "Docker 镜像"], ["docker-compose.yml", "Docker Compose 编排"], ["docker-compose.yaml", "Docker Compose 编排"], ["compose.yml", "Docker Compose 编排"], ["Makefile", "Make"]]) {
     if (await _pathExistsAsFile(root + "/" + marker)) lines.push(`后端标记文件: ${marker}（${label}）`);
   }
   const known = [];
@@ -32952,6 +32987,7 @@ function _buildAgentToolSchemas(includeWrite, mcpTools = []) {
     { type: "function", function: { name: "create_project", description: "**Create a new project folder and start working in it.** Use this the moment the user asks you to build something (a bot, a script, a service, a site) and no workspace folder is open — do not ask them to open one first, and do not stop to ask where it should go. The folder is always created under the user\u0027s home in MrDayOne/<name>, becomes the active workspace immediately, and every file tool works inside it right after. Reusing an existing name is safe: it binds to that folder instead of overwriting it. Say the full path in your summary so the user knows where their project lives.", parameters: { type: "object", properties: { name: { type: "string", description: "Folder name: letters, digits, \u0027.\u0027, \u0027_\u0027, \u0027-\u0027 only, not starting with a dot. Pick something descriptive, e.g. telegram-image-bot." } }, required: ["name"] } } },
     { type: "function", function: { name: "current_time", description: "Get the current real date and time (year, month, day, weekday, hour, minute, second, timezone, Unix timestamp). Call it when you need to know today's date, the weekday, or the current time — do not guess from memory. The current time only tells you when this request was made; it does not prove that a web page, paper, price, version, market quote, or rule is current. A dynamic fact still requires reading the publication date, update time, version number, observation time, or quote time from the corresponding source.", parameters: { type: "object", properties: {} } } },
     { type: "function", function: { name: "think", description: "Record a short internal reasoning conclusion within this round, to clarify the goal, the assumptions and the next step before acting. Write only conclusions directly relevant to the current user request, and do not treat it as a reply addressed to the user.", parameters: { type: "object", properties: { thought: { type: "string", minLength: 1, description: "A short reasoning conclusion for the current decision" } }, required: ["thought"] } } },
+    { type: "function", function: { name: "schedule", description: "Create, list or remove a **scheduled task**: something you run again later, on your own, with nobody at the keyboard. Use it whenever the user says 「every morning at 9」, 「check again in 20 minutes」, 「every day」, 「remind me to」 — anything whose whole point is that it happens without them asking again. Give either at (a daily HH:MM in the user's local time) or every_minutes (a repeating interval), not both. The prompt you store is what a future you will receive as the task, so write it as a **complete standing instruction**: a fresh run has none of this conversation's context, so name the project path, the exact check to make, and what counts as done. **Know the boundary and say it to the user:** these fire only while the app is running — this does not install anything into their system, so a task does not fire while the app is closed; it fires on the next tick after they reopen it. When a scheduled run hits something that needs the user to confirm (a dangerous command, a workspace-trust prompt), that step is refused rather than silently allowed, and left for them — so schedule work that can genuinely finish unattended.", parameters: { type: "object", properties: { action: { type: "string", enum: ["add", "list", "remove"], description: "add = create one; list = show all; remove = delete by id" }, prompt: { type: "string", description: "For add: the standing instruction a future run will receive. Must stand alone — no reference to this conversation." }, at: { type: "string", description: "For add: a daily time as HH:MM in the user's local timezone, e.g. 09:00" }, every_minutes: { type: "integer", description: "For add: repeat every N minutes instead of a daily time" }, id: { type: "integer", description: "For remove: which task" } }, required: ["action"] } } },
     { type: "function", function: { name: "ask_user", description: "**When you genuinely cannot tell what the user wants, ask them with this — do not guess and barrel ahead.** It shows a card in the conversation: the few **predicted options (buttons)** you supply, plus a **free-text box** (the user types their own requirement) and \"let the AI decide\". The user clicks one, types their own, or hands it back to you; you continue once you have their answer.\n**Use it only when the intent is genuinely ambiguous and the different readings would produce very different things** — e.g. the user asks to migrate the database and both an in-place migration and a rebuild are defensible; the user has two accounts/environments and you cannot tell which to target; two instructions in the same message contradict each other. A build request whose stack is unspecified is NOT ambiguous: \"build me a Telegram bot\" / \"build a login page\" → pick the mainstream library and a sensible default, build it, and state the choices in your summary. This tool is for decisions you genuinely cannot make on the user's behalf, not for \"which framework\".\n**Never ask about anything you can reasonably infer, or about mere implementation detail (which variable name, which file) — just do it.** Users hate being stopped for nothing. This tool is for \"what should I build\", not \"may I continue\".\n**Ordering rule: when the ambiguity is about direction, ask_user always comes before update_plan** — settle the direction, then plan. The system will never block your ask_user for \"there is no plan yet\".", parameters: { type: "object", properties: { question: { type: "string", description: "The specific clarifying question to put to the user (one sentence)" }, options: { type: "array", description: "2-4 answers you predict (each a few words), rendered as buttons for the user to pick; they can also skip them and type their own", items: { type: "string" } }, recommended: { type: "integer", description: "Index of the recommended option (0-based); that option is highlighted as recommended" }, multi_select: { type: "boolean", description: "true = multi-select mode (checkboxes; the user can pick several options and submit them together)" }, confirm_text: { type: "string", description: "Confirmation for a dangerous operation: once set, the user must type this text exactly into the box to continue (e.g. DELETE)" } }, required: ["question"] } } },
     { type: "function", function: { name: "run_subagent", description: "Use only in structured-collaboration mode, for heavyweight research that needs broad coverage or an independent perspective. staged_roles first dispatches read-only roles such as architect/product/research/security to converge the architecture, product, evidence, and security contracts; an ordinary focused investigation is faster and cheaper if the main agent just reads it. A sub-report must give its evidence, the boundaries of its conclusion, the delivery contract, and the next step. 【vs alternatives】For parallel implementation that changes files use run_worker; to dispatch several read-only roles at once use spawn_multiple_agents; for a single focused investigation the main agent reading/searching directly is faster — do not dispatch.", parameters: { type: "object", properties: { description: { type: "string", description: "Short description of the subtask (3-6 words)" }, role: { type: "string", enum: ["architect", "product", "research", "frontend", "backend", "database", "security", "test", "devops", "design", "docs"], description: "A read-only specialist perspective. When the architecture, product, or security boundary is undecided, use architect/product/security first to converge the contract; other roles investigate their domain." }, prompt: { type: "string", description: "The complete, self-contained read-only task statement: the evidence to check, the contract to deliver, the paths/symbols involved, and the next step." }, tasks: { type: "array", minItems: 1, maxItems: 4, description: "Optional · dispatch several at once: send multiple read-only subtasks in one call (up to 4; all 4 run concurrently, each with its own card, merged into one report on completion). Each entry is {role, task}; when dispatching only one subtask, omit this and use prompt.", items: { anyOf: [{ type: "string" }, { type: "object", properties: { task: { type: "string" }, role: { type: "string", enum: ["architect", "product", "research", "frontend", "backend", "database", "security", "test", "devops", "design", "docs"] } }, required: ["task"] }] } }, wait: { type: "boolean", description: "Optional, default false = background job: returns job#N immediately, the main agent keeps working, and the result is delivered when ready (or await it with await_subagent). true = wait synchronously for the result before continuing." } }, required: ["description"], anyOf: [{ required: ["prompt"] }, { required: ["tasks"] }] } } },
     { type: "function", function: { name: "await_subagent", description: "Wait for a background subagent job to finish and collect its result. Use it when you cannot continue without the sub-report; with no jobs running it returns a summary of the current job ledger. 【vs alternatives】To dispatch an investigation use run_subagent / spawn_multiple_agents.", parameters: { type: "object", properties: { job: { type: "string", description: "The job number (e.g. 3) or all, default all" } }, required: [] } } },
@@ -33710,6 +33746,7 @@ const _TOOL_ALIASES = {
   decodeqr: "decode_qr", scan_qr: "decode_qr", scanqr: "decode_qr", read_qr: "decode_qr", qr_decode: "decode_qr", qrcode: "decode_qr", qr: "decode_qr",
   remote_connect: "remote", connect_remote: "remote", remote_dev: "remote", remotedev: "remote",
   app: "system", launch_app: "system", open_app: "system", activate_app: "system", switch_app: "system", app_control: "system", system_control: "system", click_menu: "system", app_menu: "system",
+  schedule: "schedule", schedule_task: "schedule", cron: "schedule", set_timer: "schedule", remind: "schedule",
   ask_user: "ask_user", task_user: "ask_user", askuser: "ask_user", clarify: "ask_user", ask_question: "ask_user", confirm_intent: "ask_user", ask_choice: "ask_user", request_input: "ask_user",
   research_project: "research_project", explore_codebase: "research_project", explore_project: "research_project", map_project: "research_project", understand_codebase: "research_project", study_project: "research_project", deep_research_codebase: "research_project",
   learn_design: "learn_design", design_learn: "learn_design", learn_style: "learn_design", study_design: "learn_design", refero: "learn_design",
@@ -34507,6 +34544,7 @@ function _mapToolCall(name, args, mcpToolMap = _mcpToolMap) {
     case "create_project": return { type: "createproject", path: String(args.name || ""), name: String(args.name || "") };
     case "update_plan": return { type: "plan", steps: _normPlanSteps(args.steps || args.plan || args.todos) };
     case "think": return { type: "think", content: args.thought || args.thoughts || "" };
+    case "schedule": return { type: "schedule", action: String(args.action || "list").toLowerCase(), prompt: String(args.prompt || args.task || ""), at: String(args.at || args.time || ""), everyMinutes: Number.isFinite(+args.every_minutes) ? +args.every_minutes : 0, id: Number.isFinite(+args.id) ? +args.id : 0 };
     case "ask_user": return { type: "askuser", question: args.question || args.q || args.prompt || args.text || "", options: Array.isArray(args.options) ? args.options : (Array.isArray(args.choices) ? args.choices : (Array.isArray(args.buttons) ? args.buttons : [])), recommended: Number.isFinite(+args.recommended) ? +args.recommended : -1, multiSelect: !!args.multi_select, confirmText: String(args.confirm_text || "") };
     case "run_subagent": {
       // P1 多任务并发：容错解析 tasks 数组（每项 {role, task} 或纯字符串）。
@@ -36716,7 +36754,11 @@ function _terminalLogChunks(name = "", maxTasks = 3) {
   });
 }
 
-async function _agentReadLogs(call, root = "", run = null) {
+async function _agentReadLogs(call, root = "", run = null, out = null) {
+  // out.emptyRead：**结构化**地告诉调用方「这次一个字节都没读到」。
+  // 不靠回执文案去猜——文案是会被改的，判据不该跟着文案漂。
+  let _emptyRead = false;
+  const _finish = (text) => { if (out) out.emptyRead = _emptyRead; return text; };
   const lines = Math.max(20, Math.min(1000, Number(call?.lines) || 200));
   const explicit = [];
   if (Array.isArray(call?.paths)) explicit.push(...call.paths);
@@ -36752,8 +36794,14 @@ async function _agentReadLogs(call, root = "", run = null) {
     }
   }
   if (!chunks.length) {
-    if (_nameMiss) return `[终端没匹配上] ${_nameMiss}\n工作区常见日志位置也没有 .log/.out/.err 可读。`;
-    return "当前没有可读的 Agent 终端日志，也没有在工作区常见日志位置发现 .log/.out/.err。若报错输出里给了日志路径，调用 read_logs(path=那个路径) 读取尾部。";
+    // **一个字节都没读到**。这件事必须以结构化事实交出去，不能让下游拿文案去猜——
+    // _debugEvidenceKind 原来就是用 /没有可读/ 这样的正则判「取证是不是空的」，
+    // 而我把文案改成「也没有 .log/.out/.err 可读」之后，"没有"和"可读"被隔开，
+    // 正则失配，于是**一次什么都没读到的日志调用被记成了有效的运行时证据**。
+    // 改文案会再犯一次；这里给事实，判据那边读事实。
+    _emptyRead = true;
+    if (_nameMiss) return _finish(`[终端没匹配上] ${_nameMiss}\n工作区常见日志位置也没有 .log/.out/.err 可读。`);
+    return _finish("当前没有可读的 Agent 终端日志，也没有在工作区常见日志位置发现 .log/.out/.err。若报错输出里给了日志路径，调用 read_logs(path=那个路径) 读取尾部。");
   }
   // 裸切会让下游报出一个**精确的假数字**。
   //
@@ -36774,11 +36822,11 @@ async function _agentReadLogs(call, root = "", run = null) {
     : `[日志已截断] 实际共 ${_joined.length} 字、${chunks.length} 份，下面只有前 ${_LOG_BUDGET} 字。`
       + `缺的那几份用 read_logs(path=...) 单独取。\n\n` + _joined.slice(0, _LOG_BUDGET);
   if (_nameMiss) {
-    return `[终端没匹配上] ${_nameMiss}\n`
+    return _finish(`[终端没匹配上] ${_nameMiss}\n`
       + `下面这些是工作区里的日志文件，**不是**「${String(call.name).slice(0, 80)}」的输出，别当成它的。\n\n`
-      + _body;
+      + _body);
   }
-  return _body;
+  return _finish(_body);
 }
 
 function _markCommandFailureRecovery(run, root, diagnostics) {
@@ -36849,7 +36897,14 @@ function _debugEvidenceKind(call, result) {
     return /无匹配|未找到|找不到|no (?:matches|results)|\b0\s*(?:处|个|matches|results)\b/i.test(content) ? "" : "code_trace";
   }
   if (["diag", "logs", "termread"].includes(type)) {
-    return /暂无输出|没有可读|no diagnostics|\b0\s+errors?\b/i.test(content) ? "" : "runtime_evidence";
+    // 工具自己说「这次一个字节都没读到」时，以它为准。
+    // 下面那条散文正则是兜底：它判的是「回执长得像空的」，而回执文案会被改——
+    // read_logs 的文案从「没有可读」改成「也没有 .log/.out/.err 可读」之后，
+    // "没有"和"可读"被隔开，正则失配，一次零内容的读取就被记成了运行时证据。
+    if (result.evidence && typeof result.evidence.empty === "boolean") {
+      return result.evidence.empty ? "" : "runtime_evidence";
+    }
+    return /暂无输出|暂无新输出|没有[^\n]{0,30}?可读|no diagnostics|\b0\s+errors?\b/i.test(content) ? "" : "runtime_evidence";
   }
   // A green arbitrary command is not causal evidence for a bug. In particular,
   // `echo ok` or an unrelated build must not unlock source mutation merely because
@@ -37264,22 +37319,68 @@ function _questionSimilarity(a, b) {
   // 任意两句长英文的字符集几乎全覆盖。配上 0.65 的阈值，英文用户问第二个**完全不同**的
   // 问题时会被判成「你已经问过了」，直接吃到 [ALREADY_ANSWERED] —— 一次会话只能被问一次。
   //
-  // 两边都不含中日韩时改用**词集合**；含 CJK 时一字不动（现有标定测试钉着那组 margin）。
-  // 不整体换成 bigram：实测中文 SAME 最低 0.429、DIFF 最高 0.429，margin 归零，当场打挂标定。
-  // 代价是英文的**真**改写会掉到 0.3–0.4、模型多问一次 —— 这正是这个函数注释自己定的取舍
+  // 判据不是「这句话里有没有中文」，而是「**这一段**是中文还是拉丁」。
+  //
+  // 上一版按「任一边含 CJK 就整句走字符集合」分派，于是只要出现一个汉字就退回饱和的
+  // 字符 Jaccard。而这个产品里最常见的问法恰恰是**中英混写**（界面中文、技术词英文）：
+  // 实测「Should I use PostgreSQL 还是 MySQL？」vs「Should I enable dark mode 还是
+  // light mode？」= 0.667，照样被判重复 —— 修复覆盖不到主用例。
+  //
+  // 改成逐段分派：中日韩按**字**切（这些语言没有空格，按词切不可靠），拉丁字母和数字
+  // 按**词**切（26 个字母的语言按字切恒高），两边取并集。
+  // 纯中文的集合与旧实现逐字相同（标点空白本来就不是 CJK 字符，自然被排除），
+  // 所以钉着中文 margin 的标定测试不受影响；纯英文保持已修好的词集合。
+  // 代价仍是英文的**真**改写会掉到 0.3 以下、模型多问一次 —— 这正是本函数既定的取舍
   //（漏判只多问一次，误判会拿旧答案顶掉新问题）。
-  // 注意：_normalizeQuestion **把空格也删了**（中文按字比对时那样更稳），所以按词切必须
-  // 回到**原始串**上做，不能用 x / y。
-  const _hasCjk = (t) => /[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uac00-\ud7af]/.test(t);
-  const _cjk = _hasCjk(String(a)) || _hasCjk(String(b));
-  const _words = (raw) => new Set(
-    String(raw || "").toLowerCase().split(/[^a-z0-9]+/i).filter((w) => w.length > 1));
-  const sx = _cjk ? new Set(x) : _words(a);
-  const sy = _cjk ? new Set(y) : _words(b);
+  // 注意：_normalizeQuestion **把空格也删了**，所以按词切必须回到**原始串**上做，不能用 x / y。
+  const _CJK_CHAR = /[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uac00-\ud7af]/;
+  const _tokens = (raw) => {
+    const t = new Set();
+    const low = String(raw || "").toLowerCase();
+    for (const w of low.split(/[^a-z0-9]+/i)) if (w.length > 1) t.add(w);
+    for (const ch of low) if (_CJK_CHAR.test(ch)) t.add(ch);
+    return t;
+  };
+  const sx = _tokens(a);
+  const sy = _tokens(b);
   if (!sx.size || !sy.size) return 0;
+  // 按**字符长度**加权，不是按 token 计数。
+  //
+  // 不加权的话，一个共享的长技术词只算 1 分：「要不要用 TypeScript 重写」和
+  // 「是否用 TypeScript 重写」——同一个问题——会掉到 0.5，被判成新问题。
+  // 旧的按字比对里 typescript 天然占 10 个字符的分量，加权把这份分量还回来，
+  // 同时保住「整词才算命中」（不加权重也不行：不相干的两句英文按字比对恒高）。
+  // 纯中文每个 token 都只有 1 个字符，加权与不加权完全等价 —— 中文标定原样成立。
+  const _w = (set) => { let n = 0; for (const t of set) n += t.length; return n; };
   let inter = 0;
-  for (const c of sx) if (sy.has(c)) inter++;
-  return inter / (sx.size + sy.size - inter);
+  for (const t of sx) if (sy.has(t)) inter += t.length;
+  const union = _w(sx) + _w(sy) - inter;
+  const score = union > 0 ? inter / union : 0;
+
+  // 安全下限：差在一对**反义动作**上的两个问题，不可能是同一个问题的改写。
+  //
+  // 词袋相似度对「只差一个内容词」的最小对天生给高分——实测
+  // 「Should I add the cache layer?」vs「…remove…」= 0.679，越过 0.65 被判成重复，
+  // 于是「要不要删」直接拿到了「要不要加」的旧答案。这正是本函数自己写明的最坏情况
+  //（漏判只多问一次，误判会拿旧答案顶掉新问题），而且**没有任何阈值**能把这类最小对
+  // 和真改写分开（真改写同样落在 0.61–0.68）。
+  //
+  // 所以这里加的是**门槛**，不是判断——架构里正则只用于权限和下限，这是下限。
+  // 名单只收确凿的动作反义；「是/否」「要/不要」这类是问法差异，绝不能进来。
+  const _ANTONYMS = [
+    ["add", "remove"], ["add", "delete"], ["add", "drop"], ["enable", "disable"],
+    ["start", "stop"], ["open", "close"], ["show", "hide"], ["install", "uninstall"],
+    ["create", "delete"], ["include", "exclude"], ["allow", "deny"], ["allow", "block"],
+    ["increase", "decrease"], ["expand", "collapse"], ["keep", "discard"],
+    ["加", "删"], ["开", "关"], ["增", "减"], ["启", "禁"], ["显", "隐"],
+  ];
+  const _onlyIn = (p, q) => { const d = new Set(); for (const t of p) if (!q.has(t)) d.add(t); return d; };
+  const dx = _onlyIn(sx, sy);
+  const dy = _onlyIn(sy, sx);
+  for (const [p, q] of _ANTONYMS) {
+    if ((dx.has(p) && dy.has(q)) || (dx.has(q) && dy.has(p))) return Math.min(score, 0.4);
+  }
+  return score;
 }
 
 /**
@@ -41177,7 +41278,7 @@ const _toolCategoryMap = {
   httprequest: "network", http: "network", download: "network", downloadfile: "network",
   computer: "desktop", system: "desktop",
   runsubagent: "orchestration", runworker: "orchestration", awaitsubagent: "orchestration",
-  askuser: "interaction", updateplan: "interaction",
+  askuser: "interaction", updateplan: "interaction", schedule: "interaction",
   genimage: "generation", generateimage: "generation",
   generate3d: "generation", generatesound: "generation", generatemusic: "generation",
   generatevoice: "generation", generatemotion: "generation", generatetexture: "generation",
@@ -42202,6 +42303,22 @@ function _commandStartsLongRunningServer(command) {
       ? (rest[0] === "run" ? rest[1] : rest[0])
       : rest[0];
     if (first && _LONG_RUNNING_PAIRS.has(`${head} ${first}`)) return true;
+    // docker 不能靠上面那张二元组表判定：那张表只看 head 和第一个非选项 token，
+    // 于是 `docker compose up`（会一直挂着刷日志）和 `docker compose ps`（秒回）
+    // 会被判成同一件事。必须看真正的子命令，还要看带没带 -d。
+    //
+    // 不判的后果是实打实的：compose up 走 run_cmd 会在 240 秒被杀，用户看到的是
+    // 「起容器总是失败」；判对了模型才会被引导去 run_in_terminal（真 PTY，不会被超时杀）。
+    if (head === "docker" || head === "docker-compose") {
+      // 按**词**判，不按位置判：`docker compose -f prod.yml up` 里 -f 的值
+      // 不是选项，按位置取会取到 prod.yml。
+      const words = tokens.map((t) => t.toLowerCase());
+      const has = (w) => words.includes(w);
+      const detached = has("-d") || has("--detach");
+      if (!detached && (has("up") || has("start") || has("run"))) return true;
+      if (has("attach")) return true;
+      if ((has("logs") || has("events") || has("stats")) && (has("-f") || has("--follow"))) return true;
+    }
     if (head === "python" || head === "python3") {
       if (tokens.includes("http.server") || tokens.includes("SimpleHTTPServer")) return true;
       if (rest.includes("manage.py") && tokens.includes("runserver")) return true;
@@ -45277,8 +45394,37 @@ async function _runSubAgent({ config, description, prompt, root, container, run,
         // _runSubAgent 顶部的硬边界③强制收敛（孙子体一律只读），超时由硬边界④取 min 继承。
         if (call.type === "subagent" || call.type === "worker") {
           toolCount++;
-          const _nestReport = await _runSubAgent({ config, description: call.description || "嵌套子任务", prompt: call.prompt || "", root, container: vp, run: execRun, write: call.type === "worker", scope: call.scope || [], role: call.role || "" });
-          messages.push({ role: "tool", tool_call_id: tc.id, content: _clip(String(_nestReport || ""), 8000, "子智能体的简报") });
+          // 这是 run_subagent 的**第四条**派发路径（前三条在主循环里：异步派发、
+          // 多任务合并、单任务同步）。它只取 prompt —— 于是深度 1 的子体调
+          // run_subagent({tasks:[4 条]}) 时，只有 tasks[0] 真的跑（映射会把它填进
+          // prompt），另外 3 条静默消失，回执里一个字都没有。子体照样拿着一份只覆盖
+          // 第一条线索的报告回来说「四个方向都查过」——正是这批修复要治的那个病，
+          // 只是换了一层。嵌套这一层不建作业台账、不并发（硬边界⑤），所以按顺序跑完，
+          // 并把丢弃提示一起带回去。
+          const _nestTasks = Array.isArray(call.tasks) && call.tasks.length
+            ? call.tasks.filter((t) => t && String(t.task || t || "").trim()).slice(0, 4)
+            : null;
+          let _nestReport;
+          if (_nestTasks && _nestTasks.length > 1) {
+            const _parts = [];
+            for (const [_i, _t] of _nestTasks.entries()) {
+              const _r = await _runSubAgent({
+                config,
+                description: `${call.description || "嵌套子任务"}[${_i + 1}/${_nestTasks.length}]`,
+                prompt: typeof _t === "string" ? _t : String(_t.task || ""),
+                root, container: vp, run: execRun, write: false, scope: [],
+                role: (_t && _t.role) || call.role || "",
+              }).catch((e) => `[ERROR] ${String(e?.message || e).slice(0, 200)}`);
+              _parts.push(`【任务 ${_i + 1}/${_nestTasks.length}】\n${_r}`);
+            }
+            _nestReport = _parts.join("\n\n---\n\n");
+          } else {
+            _nestReport = await _runSubAgent({ config, description: call.description || "嵌套子任务", prompt: call.prompt || "", root, container: vp, run: execRun, write: call.type === "worker", scope: call.scope || [], role: call.role || "" });
+          }
+          const _nestDrop = Array.isArray(call.dropped) && call.dropped.length
+            ? `\n⚠ 你给的 tasks 里有 ${call.dropped.join("；")}——这些**没有**被派出去。别当成已经查过了。`
+            : "";
+          messages.push({ role: "tool", tool_call_id: tc.id, content: _clip(String(_nestReport || ""), 8000, "子智能体的简报") + _nestDrop });
           continue;
         }
         const step = _createToolStep(call);
@@ -52680,7 +52826,7 @@ function _toolStepActionLabel(call) {
     copy: "复制", format: "格式化", termtask: "终端任务", termread: "读终端", termlist: "终端列表",
     termstop: "停止终端", http: "HTTP", tor: "Tor", download: "下载", mcp: "MCP", demostart: "录制中",
     demostop: "录制完成", screenshot: "截图", browser: "浏览器", computer: "电脑", system: "系统",
-    automation: "自动化", readscreen: "读取屏幕", uiclick: "操作元素", remote: "远程", askuser: "需要你确认", current_time: "当前时间", localdiscovery: "附近发现", liveenvironment: "环境数据", db: "数据库",
+    automation: "自动化", readscreen: "读取屏幕", uiclick: "操作元素", remote: "远程", askuser: "需要你确认", schedule: "定时任务", current_time: "当前时间", localdiscovery: "附近发现", liveenvironment: "环境数据", db: "数据库",
     qr: "识别二维码", genimage: "生成图片", vizcompare: "视觉对比", designboard: "设计看板", preview: "方案预览",
     explain: "视觉解释", capture_start: "开始抓包", capture_flows: "读取抓包",
     capture_stop: "停止抓包", capture_replay: "重放请求", background_monitor: "后台监控", worktree: "工作树",
@@ -55507,7 +55653,9 @@ async function _executeToolStepInner(step, call, root, run) {
       res.textContent = fileMatches.length ? `${hits} 处匹配${searchErrors.length ? " · 部分范围失败" : ""}` : (searchErrors.length ? "无匹配 · 部分范围失败" : "无匹配");
       const _body = blocks.join("\n\n");
       vp.innerHTML = `<pre>${_escHtml((_body || "(无匹配)") + partialNote)}</pre>`;
-      return { type: "search", path: call.path, content: (blocks.length ? `搜索 "${q}" — ${summary}:\n${_redactSecrets(_body)}` : `搜索 "${q}"：${_backendTruncated ? "**这次没搜完**（触到后端的命中数/扫描文件数上限就停了），所以「没找到」不等于「不存在」——缩小到具体目录再搜一次。" : ""}在已扫描的范围里无匹配。跳过的只有几个具名的构建/缓存目录（.git、.next、.venv、.gradle、.idea、.vscode、node_modules、target 这类）——**点开头的文件照常搜**（.env、.eslintrc、.gitignore、.prettierrc 都在扫描范围里），**.github 也照常搜**。所以「没找到」多半是关键词不对，不是范围不够：换关键词、用 semantic_search 按语义找、或 find_files 按文件名找。`) + partialNote };
+      return { type: "search", path: call.path, content: (blocks.length ? `搜索 "${q}" — ${summary}:\n${_redactSecrets(_body)}` : `搜索 "${q}"：${_backendTruncated ? "**这次没搜完**（触到后端的命中数/扫描文件数上限就停了），所以「没找到」不等于「不存在」——缩小到具体目录再搜一次。" : ""}在已扫描的范围里无匹配。${_remote.active
+        ? "当前工作区在**远程主机**上，这次搜索由远端代理执行，它的扫描范围以那台机器上的实现为准，这里说不准跳过了什么。"
+        : "跳过的只有几个具名的构建/缓存目录（.git、.next、.venv、.gradle、.idea、.vscode、node_modules、target 这类）——**点开头的文件照常搜**（.env、.eslintrc、.gitignore、.prettierrc 都在扫描范围里），**.github 也照常搜**。所以「没找到」多半是关键词不对，不是范围不够"}：换关键词、用 semantic_search 按语义找、或 find_files 按文件名找。`) + partialNote };
 
     } else if (call.type === "find") {
       const requestedPattern = call.pattern || call.path || "";
@@ -56058,6 +56206,57 @@ async function _executeToolStepInner(step, call, root, run) {
       if (typeof vp !== "undefined" && vp) vp.innerHTML = `<pre>${_escHtml(thought.slice(0, 1200))}</pre>`;
       return { type: "think", path: "", content: thought ? "（已记下推理，按它继续）" : "（空思考）" };
 
+    } else if (call.type === "schedule") {
+      const _list = await _schedLoad();
+      if (call.action === "add") {
+        if (!call.prompt.trim()) {
+          res.className = "atc-result atc-result--err"; res.textContent = "缺 prompt";
+          return { type: "schedule", path: "", ok: false, content: "[ERROR] add 需要 prompt：一条**独立成立**的指令。将来那一轮拿不到这次对话的上下文，所以要写清项目路径、具体要检查什么、做到什么算完成。" };
+        }
+        if (!call.at && !(call.everyMinutes > 0)) {
+          res.className = "atc-result atc-result--err"; res.textContent = "缺时间";
+          return { type: "schedule", path: "", ok: false, content: "[ERROR] add 需要 at（每天 HH:MM，用户本地时区）或 every_minutes（间隔分钟）二选一。" };
+        }
+        const _t = {
+          id: (_list.reduce((m, x) => Math.max(m, x?.id || 0), 0) || 0) + 1,
+          prompt: call.prompt.trim(),
+          at: call.at || "",
+          every_minutes: call.everyMinutes > 0 ? call.everyMinutes : 0,
+          enabled: true,
+          createdAt: Date.now(),
+          lastFiredAt: 0,
+          lastOutcome: "",
+          nextAt: 0,
+        };
+        _t.nextAt = _schedNextAt(_t);
+        if (!(_t.nextAt > 0)) {
+          res.className = "atc-result atc-result--err"; res.textContent = "时间格式不对";
+          return { type: "schedule", path: "", ok: false, content: "[ERROR] at 的格式必须是 HH:MM（例如 09:00）。" };
+        }
+        _list.push(_t);
+        await _schedSave();
+        await _schedStart();
+        res.className = "atc-result atc-result--ok"; res.textContent = `已排 #${_t.id}`;
+        return { type: "schedule", path: "", ok: true, content:
+          `已建立定时任务：\n${_schedSummary(_t)}\n\n`
+          + `**这条边界要在总结里告诉用户**：定时任务只在应用开着时触发——它没有往系统里装任何常驻项，`
+          + `所以应用关着的时候不会跑，重新打开后的下一次检查会补上。另外，跑到需要他当面确认的操作时`
+          + `（危险命令、工作区信任）会被拒绝并留给他，不会在没人的时候放行。` };
+      }
+      if (call.action === "remove") {
+        const _i = _list.findIndex((x) => x && x.id === call.id);
+        if (_i < 0) {
+          res.className = "atc-result atc-result--err"; res.textContent = "没这条";
+          return { type: "schedule", path: "", ok: false, content: `[ERROR] 没有 #${call.id} 这条定时任务。现有：\n${_list.map(_schedSummary).join("\n") || "（空）"}` };
+        }
+        const _gone = _list.splice(_i, 1)[0];
+        await _schedSave();
+        res.className = "atc-result atc-result--ok"; res.textContent = "已删除";
+        return { type: "schedule", path: "", ok: true, content: `已删除定时任务 #${_gone.id}。` };
+      }
+      res.className = "atc-result atc-result--ok"; res.textContent = `${_list.length} 条`;
+      return { type: "schedule", path: "", ok: true, content:
+        _list.length ? `现有定时任务：\n${_list.map(_schedSummary).join("\n")}` : "现在没有任何定时任务。" };
     } else if (call.type === "askuser") {
       const q = String(call.question || "").trim() || "需要你确认一下方向";
       // ── 反复提问的下限 ──────────────────────────────────────────────────
@@ -57232,10 +57431,22 @@ async function _executeToolStepInner(step, call, root, run) {
           // 抬头点名分支：并行开着别人分支的仓库里，「最近的提交」不写清是谁的就没有意义。
           const entries = await backend.invoke("git_log", { root: gitExecRoot, count: n }) || [];
           const lines = entries.map(e => `${e.short_hash} ${e.message} — ${e.author}, ${e.date}${(e.refs && e.refs.length) ? " (" + e.refs.join(", ") + ")" : ""}`);
+          // 分支名从**这次结果自己**认，不读那个全局 DOM 节点。
+          //
+          // gitBranchNameEl 是全窗口唯一的一个元素，跟着 rootPath 走；而这里记录的是
+          // gitExecRoot——重定位过、多工作区、子智能体、或 refreshGitStatus 正被
+          // _gitRefreshing 丢弃时，它显示的是**另一个仓库**或切换前的分支名。
+          // 报错分支名比不报更糟：模型会拿它去核对「我是不是在对的线上」。
+          // git log 不带 --all 时第一条的 %D 一定带 `HEAD -> <分支>`（游离时是 `HEAD, …`），
+          // 那是被记录的这个仓库的真分支。
           let _logBranch = "";
-          try { _logBranch = String(gitBranchNameEl?.textContent || "").trim(); } catch {}
-          if (_logBranch === "—") _logBranch = "";
-          const _logHead = `${_logBranch ? `分支 ${_logBranch}` : "当前分支"}的最近 ${entries.length} 条提交`
+          let _logDetached = false;
+          for (const _r of (entries[0]?.refs || [])) {
+            const _m = /HEAD\s*->\s*(.+)$/.exec(String(_r).trim());
+            if (_m) { _logBranch = _m[1].trim(); break; }
+            if (String(_r).trim() === "HEAD") _logDetached = true;
+          }
+          const _logHead = `${_logBranch ? `分支 ${_logBranch}` : (_logDetached ? "游离 HEAD" : "当前分支")}的最近 ${entries.length} 条提交`
             + `（只这一条线，不含其它分支——别的分支上的提交不会出现在这里）：\n`;
           res.className = "atc-result atc-result--ok"; res.textContent = `${entries.length} 条提交`;
           if (vp) vp.innerHTML = `<pre>${_escHtml(lines.join("\n") || "(无提交)")}</pre>`;
@@ -57726,11 +57937,16 @@ async function _executeToolStepInner(step, call, root, run) {
       };
 
     } else if (call.type === "logs") {
-      const text = await _agentReadLogs(call, root, run);
-      res.className = "atc-result atc-result--ok";
-      res.textContent = "已读取日志";
+      const _logsOut = {};
+      const text = await _agentReadLogs(call, root, run, _logsOut);
+      res.className = _logsOut.emptyRead ? "atc-result atc-result--info" : "atc-result atc-result--ok";
+      res.textContent = _logsOut.emptyRead ? "没读到日志" : "已读取日志";
       if (vp) vp.innerHTML = `<pre>${_escHtml(text.slice(0, 12000))}</pre>`;
-      return { type: "logs", path: call.path || call.name || "", content: text };
+      // evidence.empty 是**事实**，不是文案。取证门原来拿正则去匹配回执里的
+      // 「没有可读」，改一次文案就失配一次——而失配的方向是把一次零内容的读取
+      // 记成有效的运行时证据，于是「先看日志再改代码」那道门被凭空打开。
+      return { type: "logs", path: call.path || call.name || "", content: text,
+        evidence: { empty: !!_logsOut.emptyRead } };
 
     } else if (call.type === "termlist") {
       const entries = _agentTerminalEntries().sort((a, b) => b.lastActivityAt - a.lastActivityAt);
@@ -72616,6 +72832,10 @@ restoreChatHistory()
   })
   .catch(console.warn);
 startIdeUpdateChecks();
+// 定时任务的唤醒器。放在这里而不是模块顶层：它要先能读到 store，而 store 在
+// Tauri 下是异步加载的。启动时会顺手补一次排期——关机期间到点的任务，开机后
+// 的第一次检查就会认出来（判据是墙钟比较，不是靠 interval 的精度）。
+void _schedStart();
 
 // ---- recent projects ----
 async function addRecentProject(path) {
@@ -73543,6 +73763,112 @@ monacoEditor.addAction({
   run: () => prevBookmark(),
 });
 
+// ---- 定时任务 ----
+//
+// 「设置个时间，让它自己去干」这件事以前完全没有：全仓没有任何 cron / schedule。
+//
+// 唤醒器就放在 JS 里，不放 Rust。Rust 的 tokio loop 和 webview 是同一个进程——
+// 应用活着两边都活着，应用没了两边一起没。而没有 webview 就没有智能体，所以
+// Rust 那一侧买不到任何多出来的时间窗口，只多一层跨进程通信。
+// 「关掉应用也要跑」需要 launchd / 计划任务，那是往用户系统里装常驻项，
+// 这个项目一贯不做，也不该背着用户做。所以边界说清楚：**应用开着才跑**。
+//
+// 判据用墙钟比较（nextAt <= now）而不是靠 interval 的精度，所以窗口被系统节流、
+// 或者电脑睡了一觉，醒来那一次就是一个 overdue，照样会被认出来执行。
+const _SCHED_KEY = "schedules";
+const _SCHED_TICK_MS = 30_000;
+let _schedules = null;
+let _schedTimer = null;
+let _schedFiring = false;
+
+async function _schedLoad() {
+  if (_schedules) return _schedules;
+  try {
+    const st = await getStore();
+    const raw = await st.get(_SCHED_KEY);
+    _schedules = Array.isArray(raw) ? raw : [];
+  } catch { _schedules = []; }
+  return _schedules;
+}
+
+async function _schedSave() {
+  try {
+    const st = await getStore();
+    await st.set(_SCHED_KEY, _schedules || []);
+    await st.save();
+  } catch {}
+}
+
+/// 下一次该在什么时候跑。every_minutes = 周期；at = 每天的 HH:MM。
+function _schedNextAt(task, from = Date.now()) {
+  if (task.every_minutes > 0) return from + task.every_minutes * 60_000;
+  const m = /^(\d{1,2}):(\d{2})$/.exec(String(task.at || ""));
+  if (!m) return 0;
+  const d = new Date(from);
+  d.setHours(Number(m[1]), Number(m[2]), 0, 0);
+  // 今天这个点已经过了就排到明天。用本地时区——用户说「早上 9 点」指的是他的 9 点。
+  if (d.getTime() <= from) d.setDate(d.getDate() + 1);
+  return d.getTime();
+}
+
+function _schedSummary(t) {
+  const when = t.every_minutes > 0 ? `每 ${t.every_minutes} 分钟` : `每天 ${t.at}`;
+  const next = t.nextAt ? new Date(t.nextAt).toLocaleString() : "未排期";
+  const last = t.lastOutcome ? `；上次 ${t.lastOutcome}` : "";
+  return `#${t.id} ${when} · 下次 ${next}${last}\n    ${String(t.prompt || "").slice(0, 120)}`;
+}
+
+/// 到点了就跑一次。串行：同一时刻只允许一个定时任务在跑，否则几个任务一起
+/// 抢同一个会话和同一条审批链，结果互相踩。
+async function _schedFireDue() {
+  if (_schedFiring) return;
+  const list = await _schedLoad();
+  const now = Date.now();
+  const due = list.find((t) => t && t.enabled !== false && t.nextAt > 0 && t.nextAt <= now);
+  if (!due) return;
+  _schedFiring = true;
+  // 先把下一次排掉再跑。跑的过程中出任何岔子（异常、应用被关）都不会让这条任务
+  // 卡在「已到期」上被反复触发。
+  due.lastFiredAt = now;
+  due.nextAt = _schedNextAt(due, now);
+  await _schedSave();
+  try {
+    _setUnattendedRun(true);
+    await sendPrompt(
+      `[定时任务 #${due.id}]\n${due.prompt}\n\n`
+        + `（这一轮是定时触发的，此刻没有人在电脑前。需要用户当面确认的操作会被自动拒绝并留给他，`
+        + `你把不需要确认的部分做完，然后在总结里写清哪些等他回来处理。）`,
+    );
+    due.lastOutcome = "已执行";
+  } catch (e) {
+    due.lastOutcome = `失败：${String(e?.message || e).slice(0, 80)}`;
+  } finally {
+    _setUnattendedRun(false);
+    _schedFiring = false;
+    await _schedSave();
+    // 铃铛是「人回来怎么知道」的唯一落点，所以这里必须发一条。
+    try {
+      showNotification({
+        title: `定时任务 #${due.id} ${due.lastOutcome}`,
+        message: String(due.prompt || "").slice(0, 120),
+      });
+    } catch {}
+  }
+}
+
+async function _schedStart() {
+  if (_schedTimer) return;
+  const list = await _schedLoad();
+  // 重启后补排期：存的 nextAt 可能已经是过去时（关机期间到点了）。
+  let dirty = false;
+  for (const t of list) {
+    if (t && t.enabled !== false && !(t.nextAt > 0)) { t.nextAt = _schedNextAt(t); dirty = true; }
+  }
+  if (dirty) await _schedSave();
+  _schedTimer = setInterval(() => { void _schedFireDue(); }, _SCHED_TICK_MS);
+  void _schedFireDue();
+}
+
 // ---- Notification Center ----
 const _notifHistory = [];
 const MAX_NOTIF_HISTORY = 50;
@@ -73554,6 +73880,12 @@ const _wrappedShowNotification = function(opts) {
   _updateNotifBadge();
   return _origShowNotification(opts);
 };
+// 这一行以前不存在，于是上面这个包装**从来没有被安装过**：定义了、也确实会往
+// _notifHistory 里写，但没有任何调用点走它——所有通知走的都是原来那个函数。
+// 结果就是通知历史恒为空、角标恒为 0、通知中心永远显示「没有通知」。
+// showNotification 是函数声明，绑定可写；这行在两个声明之后执行，没有 TDZ 问题。
+// 这也是「定时任务跑完了，人回来怎么知道」的落点：铃铛得先是活的。
+showNotification = _wrappedShowNotification;
 
 function _updateNotifBadge() {
   const badge = $("notifBadge");

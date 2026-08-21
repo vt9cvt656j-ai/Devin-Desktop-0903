@@ -140,6 +140,18 @@ function seed() {
     readOnlyModeBlocked: (call) => String(call?.action || "list").trim().toLowerCase() !== "list",
     recoverableBlock: true,
   });
+  // 定时任务和 mcpconfig 是同一类东西：**它改变的是将来的自主行为**，而不是当下这一步。
+  // 一条排好的任务会在没人看着的时候把智能体重新拉起来，所以建/删必须由用户点头——
+  // 网页正文、仓库文件、命令输出里的内容都可能诱导模型偷偷排一条常驻指令，那是这个
+  // 项目一直在防的注入面。list 只是读，不弹框。
+  //
+  // 顺带说明这道门在无人值守下的效果：定时任务跑起来的那一轮里 add/remove 会被自动
+  // 拒绝（审批门的无人值守分支），也就是说定时任务不能自己给自己续命或者繁殖。
+  defineTool("schedule", {
+    needsApproval: (call) => String(call?.action || "list").trim().toLowerCase() !== "list",
+    readOnlyModeBlocked: (call) => String(call?.action || "list").trim().toLowerCase() !== "list",
+    recoverableBlock: true,
+  });
   defineTool("copy", { ...FILE_OP, scopeField: "path" });
   // delete/move are refused outright for workers rather than scope-checked (a parallel child
   // deleting or relocating files is a conflict source no scope can make safe), so they carry

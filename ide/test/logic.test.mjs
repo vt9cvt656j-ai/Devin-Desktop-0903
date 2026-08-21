@@ -340,6 +340,10 @@ const _autoAiFailureKind = load("_aiFailureKind", { _aiStatusFromMessage: _autoA
 AUTO_LOAD_DEPS = {
   _aiStatusFromMessage: _autoAiStatusFromMessage,
   _aiFailureKind: _autoAiFailureKind,
+  // 无人值守标志。审批门现在会先看它：定时任务撞上需要确认的操作时不弹框傻等
+  // （那个 promise 没有计时器，没人在电脑前就是永久挂起），而是如实拒绝并说明。
+  // 这里给 false＝有人在场，所以下面所有审批门的断言量的仍然是有人时的行为。
+  _unattendedRun: false,
   // 审批门现在按**这一次调用**判定（browser 的 needsApproval 是个函数：看页面不弹框，
   // 替用户按按钮才弹）。用真实现，不用桩——桩会让"哪些动作要审批"这件事在测试里失真。
   needsApprovalFor: toolPolicy.needsApprovalFor,
@@ -19460,9 +19464,18 @@ test("#53-1 深度控制：_subDepth 递进落盘 execRun + 深度 ≥2 白名�
 
 test("#53-2 并发预算共享：嵌套走同一个 _sess._subAgentsActive 上限，不因层级翻倍", () => {
   const sub = extractFn("_runSubAgent");
-  // 嵌套派发复用 _runSubAgent 入口且 run: execRun（session 浅拷贝共享）→ 同一会话计数器
-  assert.match(sub, /const _nestReport = await _runSubAgent\(\{ config, [^\n]*run: execRun/,
-    "嵌套必须递归复用 _runSubAgent（才能吃到同一套计数/排队/超时机制）");
+  // 嵌套派发复用 _runSubAgent 入口且 run: execRun（session 浅拷贝共享）→ 同一会话计数器。
+  // 钉的是**性质**不是某一行的形状：嵌套那段里每一次 _runSubAgent 调用都必须带 run: execRun。
+  // （原来钉的是单行正则，嵌套多任务拆成循环之后就假红了。）
+  const nestAt = sub.indexOf('if (call.type === "subagent" || call.type === "worker") {');
+  assert.ok(nestAt >= 0, "嵌套派发那段不见了");
+  const nestSeg = sub.slice(nestAt, sub.indexOf("const step = _createToolStep(call);", nestAt));
+  const nestCalls = nestSeg.split("_runSubAgent({").slice(1);
+  assert.ok(nestCalls.length >= 1, "嵌套必须递归复用 _runSubAgent（才能吃到同一套计数/排队/超时机制）");
+  for (const [i, c] of nestCalls.entries()) {
+    assert.match(c.slice(0, 400), /run: execRun/,
+      `嵌套里第 ${i + 1} 次 _runSubAgent 没带 run: execRun —— 它会另起一套计数器，预算按层级翻倍`);
+  }
   // 真信号量：超额必须真的等待槽位释放，而不是"等一个 tick 然后照常启动"。
   // 旧写法 `if (willStart > MAX) await setImmediate` 从不真正限流——九个 worker 会同时起，
   // 而描述里的 2 又在劝退模型分工，两头都不讨好。
@@ -22880,6 +22893,10 @@ test("相似度阈值是标定出来的：同一问题的改写要命中，不�
     ["Which database should I use for this project?", "Should the login page support social sign-in?"],
     ["Do you want dark mode enabled by default?", "Which package manager should the project use?"],
     ["Should I add end-to-end tests now?", "What is the deploy target for this build?"],
+    // 中英混写：这个产品最常见的问法，上一版整句分派时这一类会退回老路被判重复。
+    ["Should I use PostgreSQL 还是 MySQL？", "Should I enable dark mode 还是 light mode？"],
+    // 最难的一对：只差一个技术词，仍然是两个问题。
+    ["前端用 React 还是 Vue？", "前端用 React 还是 Svelte？"],
   ];
   for (const [a, b] of SAME) assert.ok(sim(a, b) >= 0.65, `「${a}」和「${b}」是同一个问题，却没命中：${sim(a, b)}`);
   for (const [a, b] of DIFF) assert.ok(sim(a, b) < 0.65, `「${a}」和「${b}」是两件事，却被判成同一个：${sim(a, b)}`);
@@ -28042,6 +28059,35 @@ test("自动改重复标点不许碰别的语言的合法语法", () => {
   }
 });
 
+test("docker 只有真会挂住的那几条算长时运行，秒回的不算", () => {
+  // 判据不能用那张二元组表：它只看 head 和第一个非选项 token，于是
+  // `docker compose up`（一直刷日志）和 `docker compose ps`（秒回）会同判。
+  // 判漏了，compose up 走 run_cmd 会在 240 秒被杀，用户看到「起容器总是失败」；
+  // 判过了，一条 `docker ps` 会被推去开一个终端标签页。
+  const isLong = load("_commandStartsLongRunningServer", {
+    _LONG_RUNNING_HEADS: new Set(["vite"]),
+    _LONG_RUNNING_PAIRS: new Set(["npm dev"]),
+  });
+  for (const cmd of [
+    "docker compose up",
+    "docker-compose up",
+    "docker compose -f prod.yml up",
+    "docker run nginx",
+    "docker logs -f api",
+    "docker attach api",
+  ]) assert.ok(isLong(cmd), `${cmd} 会一直挂着，必须判成长时运行`);
+
+  for (const cmd of [
+    "docker compose up -d",
+    "docker compose ps",
+    "docker compose down",
+    "docker compose logs",
+    "docker ps",
+    "docker images",
+    "docker build .",
+  ]) assert.ok(!isLong(cmd), `${cmd} 会自己结束，不该被判成长时运行`);
+});
+
 test("自动改重复标点只许碰用户刚动过的那几行", () => {
   // 同批四个改写器里只有它原来扫整个文件。后果不是性能是改坏别人的代码：
   // `,,` 在 JS 里是合法的稀疏数组（长度里有个洞），被合并掉长度就变了。
@@ -30748,11 +30794,12 @@ test("读不了的文件不许说成「找不到」，而且错误码要被失�
 test("日志截断要说真实总量，不能让下游报出一个精确的假数字", () => {
   // 切到 `return _body` 为止：中间那两个自由变量（call / _nameMiss）当参数注进去，
   // 「点名的终端没匹配上」那条抬头有自己的测试，这里只看截断。
-  const seg = /const _joined = chunks\.join[\s\S]*?\n  return _body;/.exec(SRC);
+  const seg = /const _joined = chunks\.join[\s\S]*?\n  return _finish\(_body\);/.exec(SRC);
   assert.ok(seg, "日志截断那段不见了");
-  const f = new Function("chunks", "call", "_nameMiss", seg[0].replace("const _joined", "let _joined"));
+  const f = new Function("chunks", "call", "_nameMiss", "_finish",
+    seg[0].replace("const _joined", "let _joined"));
   const chunks = Array.from({ length: 8 }, (_, i) => "--- 日志文件: a" + i + ".log ---\n" + "x".repeat(12000));
-  const out = f(chunks, {}, "");
+  const out = f(chunks, {}, "", (x) => x);
   const real = chunks.join("\n\n").length;
   assert.match(out, new RegExp(`实际共 ${real} 字`),
     "没给真实总量 —— 下游那句「中间约 N 字不在上下文里」用的是砍完之后的长度，会低报几千倍");
@@ -30762,7 +30809,7 @@ test("日志截断要说真实总量，不能让下游报出一个精确的假�
     "返回正好顶到下游预算，恰恰是让那个假标记必然触发的值；要留出抬头和外部数据标记的位置");
   assert.match(out, /read_logs\(path=/, "没告诉模型缺的那几份怎么单独取");
   // 没超预算时原样返回，别平白加一句。
-  assert.equal(f(["short"], {}, ""), "short");
+  assert.equal(f(["short"], {}, "", (x) => x), "short");
 });
 
 test("CI 日志：第一行就是错因时不许说「没匹配到失败关键词」，抬头的行数要从实际交付反推", () => {
@@ -31078,17 +31125,56 @@ test("英文问两个完全不同的问题，不许被判成重复", () => {
   assert.equal(sim("Use postgres?", "Use postgres?"), 1);
   assert.ok(sim("Use postgres for this?", "Use postgres") >= 0.9, "包含关系的快路没了");
 
-  // **取舍写明**：英文的真改写会掉到阈值之下，模型因此多问一次 —— 这是这个函数注释
-  // 自己定的方向（漏判只多问一次，误判会拿旧答案顶掉新问题）。钉住它，免得后人
-  // 「顺手调高召回」把误判那一侧放回来。
+  // 中英**混写**——界面中文、技术词英文，这个产品里最常见的问法。
+  // 上一版按「任一边含 CJK 就整句走字符集合」分派，于是只要出现一个汉字就退回饱和的
+  // 老路：实测 0.667，照样判重复。修复必须覆盖到这里，否则等于没修主用例。
+  for (const [a, b] of [
+    ["Should I use PostgreSQL 还是 MySQL？", "Should I enable dark mode 还是 light mode？"],
+    ["这个接口用 REST 还是 GraphQL？", "这个页面用 SSR 还是 CSR？"],
+  ]) {
+    assert.ok(sim(a, b) < DUP, `中英混写的两个不同问题被判成重复：${sim(a, b).toFixed(3)}\n  ${a}\n  ${b}`);
+  }
+
+  // **取舍写明**。英文这一侧，真改写和「最小反义对」的分数是**重叠**的：
+  //   Should I start the server? / …stop…                         → 0.625
+  //   Should I add tests for this feature? / Do I need to add tests… → 0.611
+  // 没有任何阈值能把这两类分开。所以阈值放在保证**不误判**的那一侧——0.65 之下一律
+  // 当新问题，代价是部分英文改写被多问一次（漏判只多问一次，误判会拿旧答案顶掉新问题）。
+  // 钉住的是**方向**，不是某个具体分数：反义对绝不能越过阈值。
+  for (const [a, b] of [
+    ["Should I start the server?", "Should I stop the server?"],
+    ["Should I add the cache layer?", "Should I remove the cache layer?"],
+    ["Deploy to staging?", "Deploy to production?"],
+  ]) {
+    assert.ok(sim(a, b) < DUP,
+      `语义相反的最小对被判成同一个问题：${sim(a, b).toFixed(3)}\n  ${a}\n  ${b}`);
+  }
+  // 反义对靠的是**下限**，不是阈值：词袋相似度对「只差一个内容词」的最小对天生给高分
+  // （加权后 add/remove the cache layer 一度到 0.679，越过 0.65 被判成重复——
+  // 「要不要删」直接拿到了「要不要加」的旧答案）。而真改写同样落在 0.61–0.68，
+  // **没有任何阈值**能把这两类分开，所以只能在判据之外压一道下限。
+  const src0 = extractFn("_questionSimilarity");
+  assert.match(src0, /_ANTONYMS/, "反义下限没了 —— 相反的两个问题会被合并");
+  assert.ok(sim("Should I add the cache layer?", "Should I remove the cache layer?") <= 0.4,
+    "反义下限没压住");
+  assert.ok(sim("要不要加缓存层", "要不要删缓存层") <= 0.4, "中文的反义下限没压住");
+  // 名单只收确凿的动作反义；「是/否」「要/不要」是问法差异，进来会把真改写全打掉。
+  assert.doesNotMatch(src0, /\["是", *"否"\]|\["要", *"不"\]/,
+    "把问法差异当成了反义 —— 真改写会被整片误伤");
+
+  // 相似度本身还得有意义：真改写不能掉到和陌生问题一个档位。
   const rewrite = sim("Which database should I use?", "What database should I use?");
-  assert.ok(rewrite < DUP,
-    "英文真改写又被判成重复了 —— 方向错了：误判的代价是拿旧答案顶掉新问题");
-  assert.ok(rewrite > 0.4, `英文真改写掉得太狠（${rewrite.toFixed(3)}），相似度已经失去意义`);
+  assert.ok(rewrite > 0.5, `英文真改写掉得太狠（${rewrite.toFixed(3)}），相似度已经失去意义`);
 
   // 分派必须在**原始串**上做：_normalizeQuestion 把空格也删了，在它之后按词切永远是空集。
   const src = extractFn("_questionSimilarity");
-  assert.match(src, /_words\(a\)/, "按词切用的不是原始串 —— 空格已经被规范化删掉了");
+  assert.match(src, /_tokens\(a\)/, "按词切用的不是原始串 —— 空格已经被规范化删掉了");
+  // 而且必须**逐段**分派，不能整句二选一：整句分派就是「有一个汉字就退回老路」那个 bug。
+  assert.doesNotMatch(src, /_hasCjk\(String\(a\)\) \|\| _hasCjk\(String\(b\)\)/,
+    "又退回整句分派了 —— 中英混写会整句走字符集合，主用例覆盖不到");
+  // 长技术词要按字符长度加权：不加权的话共享的 typescript 只算 1 分，
+  //「要不要用 TypeScript 重写」和「是否用 TypeScript 重写」会掉到 0.5 被判成新问题。
+  assert.match(src, /inter \+= t\.length/, "Jaccard 没有按字符长度加权");
 });
 
 // read_logs(name=...) 点名一个终端，没匹配上时代码**照样**往下走去读工作区里的日志文件。
@@ -31234,6 +31320,23 @@ test("run_subagent：丢掉的 task 要报回去，单任务的 role 不许吞�
   const dispatch = SRC.slice(SRC.indexOf("const _subDropNote"), SRC.indexOf("const executeScheduledItem"));
   assert.equal((dispatch.match(/_subDropNote/g) || []).length, 4,
     "三条回执路径里有的没拼上丢弃提示 —— 走哪条路取决于 wait/条数，模型控制不了");
+
+  // **第四条**派发路径：子体内部再调 run_subagent（嵌套）。
+  // 它原来只取 prompt，于是 tasks 里除第一条外全部静默消失——子体拿着一份只覆盖
+  // 第一条线索的报告回来说「四个方向都查过」，正是这批修复要治的病，换了一层而已。
+  // 结束锚点必须从起点**往后**找：`const step = _createToolStep(call);` 在文件更早处
+  // 也出现过，直接 indexOf 会切出一段倒过来的空串（第一版就这么假红了）。
+  const nestAt = SRC.indexOf('if (call.type === "subagent" || call.type === "worker") {');
+  const nest = SRC.slice(nestAt, SRC.indexOf("const step = _createToolStep(call);", nestAt));
+  assert.ok(nest.length > 400, "嵌套派发那段切空了");
+  assert.match(nest, /const _nestTasks = Array\.isArray\(call\.tasks\)/,
+    "嵌套派发还是只看 prompt —— tasks 里除第一条外全部静默消失");
+  assert.match(nest, /\(_t && _t\.role\) \|\| call\.role/, "嵌套派发丢了每条任务自己的 role");
+  assert.match(nest, /Array\.isArray\(call\.dropped\) && call\.dropped\.length\s*\n?\s*\?/,
+    "嵌套派发不报被丢弃的任务");
+  assert.match(nest, /这些\*\*没有\*\*被派出去/, "嵌套的丢弃提示没有真的拼进回执");
+  assert.match(nest, /任务 \$\{_i \+ 1\}\/\$\{_nestTasks\.length\}/,
+    "嵌套的合并报告没标明第几条 / 共几条");
 });
 
 // git stash 什么都没存进去时照样退出 0，stdout 只印一句 "No local changes to save"，
@@ -31267,19 +31370,30 @@ test("git_log 只看当前分支，并且说清是哪条分支", () => {
                         SRC.indexOf('} else if (call.op === "commit") {'));
   assert.doesNotMatch(seg, /all:\s*true/, "智能体这条路把 --all 又打开了");
   const body = seg.slice(seg.indexOf("const lines = entries.map"));
-  const run = (entries, branch) => new Function(
-    "entries", "n", "res", "vp", "_escHtml", "gitBranchNameEl", "gitRerootNote", body,
-  )(entries, 20, {}, null, (x) => x, { textContent: branch }, "");
+  const run = (entries) => new Function(
+    "entries", "n", "res", "vp", "_escHtml", "gitRerootNote", body,
+  )(entries, 20, {}, null, (x) => x, "");
+  const mk = (refs) => [{ short_hash: "abc1234", message: "fix", author: "t", date: "1h ago", refs }];
 
-  const e = [{ short_hash: "abc1234", message: "fix", author: "t", date: "1h ago", refs: [] }];
-  const out = run(e, "tool-config-cleanup");
+  // 分支名从**这次结果自己**认（%D 里的 `HEAD -> <分支>`），不读那个全局 DOM 节点：
+  // 那个节点跟着 rootPath 走，而这里记录的是 gitExecRoot——重定位过、多工作区、
+  // 子智能体、或 refreshGitStatus 被丢弃时，它显示的是另一个仓库或切换前的分支。
+  const out = run(mk(["HEAD -> tool-config-cleanup", "origin/main"]));
   assert.match(out.content, /分支 tool-config-cleanup/, "没点名分支——并行开着别人分支时这份清单没有意义");
   assert.match(out.content, /不含其它分支/, "没说清范围，模型会以为这是全仓最近的提交");
   assert.match(out.content, /abc1234 fix/);
 
-  // 分支名读的是 git 面板那个 DOM 节点，"—" 是它的空态占位，不能当成分支名印出去。
-  assert.match(run(e, "—").content, /当前分支的最近/);
-  assert.equal(run([], "main").content, "(无提交历史)", "没有提交时别硬扣一个抬头");
+  // 游离 HEAD 要照实说，不能硬安一个分支名。
+  assert.match(run(mk(["HEAD", "main"])).content, /游离 HEAD的最近/);
+  // 顶端没有任何装饰时，只说「当前分支」，不猜。
+  assert.match(run(mk([])).content, /当前分支的最近/);
+  assert.equal(run([]).content, "(无提交历史)", "没有提交时别硬扣一个抬头");
+
+  // 不许再回去读全局 DOM 节点。**先剥注释**——上面那段注释里就点名提到它，
+  // 不剥的话这条负向断言会被注释喂饱（今天已经踩过三次同一个坑）。
+  const codeOnly = body.split("\n").filter((l) => !l.trim().startsWith("//")).join("\n");
+  assert.doesNotMatch(codeOnly, /gitBranchNameEl/,
+    "分支名又去读那个全局 DOM 节点了 —— 它可能是另一个仓库的");
 });
 
 // gh_pr_review_comments 的抬头报 arr.length（--paginate 会取全），正文却先 slice(0,30)
@@ -31398,4 +31512,60 @@ test("送给模型的图必须先消毒：SVG 要栅格化，送不进去的要�
   const none = await build(["data:image/svg+xml;base64,BBB"], { model: "m" }, "看图", "hint");
   assert.equal(typeof none.content, "string");
   assert.match(none.content, /一张图都没能送进来，别假装看过/);
+});
+
+// 取证门原来拿**散文正则**判「这次取证是不是空的」：/暂无输出|没有可读|.../。
+// 而回执文案是会改的——read_logs 的空态文案改成「也没有 .log/.out/.err 可读」之后，
+// "没有" 和 "可读" 被隔开，正则失配，于是**一次一个字节都没读到的日志调用，
+// 被记成了有效的运行时证据**，「先看日志再改代码」那道门就被凭空打开了。
+// 判据要读事实，不能读文案。
+test("取证门：日志一个字节都没读到时，不许算成运行时证据", async () => {
+  // ① _agentReadLogs 通过 out.emptyRead 把事实交出来（三条空态出口都要标）。
+  const mkRead = (deps) => load("_agentReadLogs", {
+    _formatAgentTerminalLines: () => [],
+    _looksLikeLogFileName: () => true,
+    _readLogTailForAgent: async () => ({ error: "not found" }),
+    _workspaceLogCandidates: async () => [],
+    _terminalLogChunks: () => [],
+    ...deps,
+  });
+
+  for (const [name, call, deps] of [
+    ["什么都没有", {}, {}],
+    ["点名的终端没匹配上", { name: "worker" }, {}],
+  ]) {
+    const out = {};
+    await mkRead(deps)(call, "/w", null, out);
+    assert.equal(out.emptyRead, true, `${name}：没标成「什么都没读到」`);
+  }
+
+  // 真读到东西时不能误标。
+  const got = {};
+  const text = await mkRead({ _terminalLogChunks: () => ["--- 终端日志: a ---\nhello"] })(
+    { name: "a" }, "/w", null, got);
+  assert.equal(got.emptyRead, false, "读到了却标成空");
+  assert.match(text, /hello/);
+
+  // ② 判据读事实，不读文案。
+  const kind = load("_debugEvidenceKind", { _toolExecutionSucceeded: () => true });
+  assert.equal(kind({ type: "logs" }, { content: "随便什么文案", evidence: { empty: true } }), "",
+    "工具明说这次什么都没读到，判据还是把它算成了运行时证据");
+  assert.equal(kind({ type: "logs" }, { content: "随便什么文案", evidence: { empty: false } }), "runtime_evidence");
+
+  // ③ 散文兜底仍要盖住我改过的那句实际文案（没有结构化事实的老结果走这条）。
+  const realEmpty = "[终端没匹配上] 没找到匹配「worker」的 IDE 终端；当前 IDE 一个终端都没打开。\n"
+    + "工作区常见日志位置也没有 .log/.out/.err 可读。";
+  assert.equal(kind({ type: "logs" }, { content: realEmpty }), "",
+    "散文兜底盖不住真实的空态文案 —— 这正是当初失配的那一句");
+  assert.equal(kind({ type: "termread" }, { content: "IDE普通终端「a」状态：运行中。最新输出：(暂无新输出)" }), "");
+  assert.equal(kind({ type: "logs" }, { content: "--- 终端日志: a ---\nlistening on 8080" }), "runtime_evidence");
+
+  // ④ 接线：执行端必须真的把 emptyRead 变成 evidence.empty 带回去。
+  //    判据写对了、事实没送到，等于没修——上一轮的变异测试就漏在这一条。
+  const exec = SRC.slice(SRC.indexOf('} else if (call.type === "logs") {'),
+                         SRC.indexOf('} else if (call.type === "termlist") {'));
+  assert.match(exec, /_agentReadLogs\(call, root, run, _logsOut\)/,
+    "执行端没把出参传进去，emptyRead 根本收不到");
+  assert.match(exec, /evidence: \{ empty: !!_logsOut\.emptyRead \}/,
+    "执行端没把「什么都没读到」作为结构化事实带回结果");
 });

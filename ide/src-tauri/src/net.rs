@@ -799,6 +799,47 @@ fn with_ide_request_id(
 /// OpenAI Codex / 中转站 (LaoZhang etc.) route — relay stations wrap gpt-image-2
 /// behind ChatGPT Plus accounts via this endpoint. The mainline `model` field is
 /// what the relay routes on; the image model itself is fixed by the tool.
+/// 200 响应里的 `error` 字段到底算不算一次失败。
+///
+/// **不能只看字段在不在**。很多中转站成功时也带一个 `"error": null`，而
+/// `Value::get("error")` 对 null 返回 `Some(&Value::Null)`——原来的
+/// `if let Some(err) = v.get("error")` 于是把一次**成功的生图**判成「上游报错:
+/// unknown」，把图扔掉、再去下一个端点画一张。既丢结果又多花一份钱。
+/// `"error": {}` 同理。
+///
+/// 判据改成「能不能取出一条**非空的错误消息**」：取不出来就当它没报错，
+/// 继续往下找图。
+fn upstream_error_message(v: &serde_json::Value) -> Option<String> {
+    let e = v.get("error")?;
+    if e.is_null() {
+        return None;
+    }
+    let msg = e["message"]
+        .as_str()
+        .or_else(|| e["msg"].as_str())
+        .or_else(|| e["detail"].as_str())
+        .or_else(|| e.as_str())
+        .map(str::trim)
+        .filter(|m| !m.is_empty());
+    if let Some(m) = msg {
+        return Some(m.to_string());
+    }
+    // 没有可读的 message 时，只有对象里**确实还带着别的东西**才算报错。
+    // `{"message":"   "}` 不算（只有一个空白消息，等于什么都没说），
+    // `{"code":42}` 算（上游确实标了点什么）。空对象、空串一律不算。
+    let obj = e.as_object()?;
+    let informative = obj.values().any(|v| match v {
+        serde_json::Value::Null => false,
+        serde_json::Value::String(s) => !s.trim().is_empty(),
+        _ => true,
+    });
+    if informative {
+        Some(e.to_string())
+    } else {
+        None
+    }
+}
+
 /// 一次生图尝试的失败，带一条**关键的**信息：上游有没有可能已经画了。
 ///
 /// generate_image_chat 依次试三个端点（images / responses / chat），本意是照顾
@@ -927,14 +968,11 @@ async fn try_responses_api(
     }
     let v: serde_json::Value =
         serde_json::from_str(&text).map_err(|e| ImageAttemptError::billed(format!("responses 解析失败（200 已回，上游可能已出图）: {e}")))?;
-    if let Some(err) = v.get("error") {
-        let msg = err["message"]
-            .as_str()
-            .or(err.as_str())
-            .unwrap_or("unknown");
-        // 200 里带 error 字段 = 上游明确拒了这次请求，通常在出图之前（模型名不认、
-        // 内容策略、参数不合法）。这种可以换端点：同一个模型在中转站上往往只有
-        // 某一条路支持。
+    // 有一条**非空**的错误消息才算上游拒了——`"error": null` / `"error": {}` 是
+    // 成功响应里的常见噪声，当成报错会把已经出好的图扔掉并去下一个端点重画。
+    if let Some(msg) = upstream_error_message(&v) {
+        // 上游明确拒了这次请求，通常在出图之前（模型名不认、内容策略、参数不合法）。
+        // 这种可以换端点：同一个模型在中转站上往往只有某一条路支持。
         return Err(ImageAttemptError::route(format!(
             "responses 上游报错: {}",
             msg.chars().take(200).collect::<String>()
@@ -1088,14 +1126,11 @@ async fn try_images_api(
     }
     let v: serde_json::Value =
         serde_json::from_str(&text).map_err(|e| ImageAttemptError::billed(format!("images-api 响应解析失败（200 已回，上游可能已出图）: {e}")))?;
-    if let Some(err) = v.get("error") {
-        let msg = err["message"]
-            .as_str()
-            .or(err.as_str())
-            .unwrap_or("unknown");
-        // 200 里带 error 字段 = 上游明确拒了这次请求，通常在出图之前（模型名不认、
-        // 内容策略、参数不合法）。这种可以换端点：同一个模型在中转站上往往只有
-        // 某一条路支持。
+    // 有一条**非空**的错误消息才算上游拒了——`"error": null` / `"error": {}` 是
+    // 成功响应里的常见噪声，当成报错会把已经出好的图扔掉并去下一个端点重画。
+    if let Some(msg) = upstream_error_message(&v) {
+        // 上游明确拒了这次请求，通常在出图之前（模型名不认、内容策略、参数不合法）。
+        // 这种可以换端点：同一个模型在中转站上往往只有某一条路支持。
         return Err(ImageAttemptError::route(format!(
             "images-api 上游报错: {}",
             msg.chars().take(200).collect::<String>()
@@ -1894,6 +1929,61 @@ mod image_billing_tests {
         assert!(
             !rest.contains("上游可能已经出图并计费"),
             "又把猜测写成了结论"
+        );
+    }
+
+    /// `"error": null` 是成功响应里的常见噪声。原来 `if let Some(err) = v.get("error")`
+    /// 对它返回 Some，于是一次**成功的生图**被判成「上游报错: unknown」，图被扔掉，
+    /// 再去下一个端点画一张——既丢结果又多花一份钱。
+    #[test]
+    fn a_null_error_field_is_not_an_error() {
+        let ok = serde_json::json!({"error": null, "data": [{"b64_json": "AAA"}]});
+        assert_eq!(super::upstream_error_message(&ok), None, "error:null 被当成了报错");
+        let empty = serde_json::json!({"error": {}, "data": [{"b64_json": "AAA"}]});
+        assert_eq!(super::upstream_error_message(&empty), None, "空 error 对象被当成了报错");
+        let blank = serde_json::json!({"error": {"message": "   "}});
+        assert_eq!(super::upstream_error_message(&blank), None, "空白 message 被当成了报错");
+        let none = serde_json::json!({"data": []});
+        assert_eq!(super::upstream_error_message(&none), None);
+
+        // 真的报错要认出来，消息要取到。
+        assert_eq!(
+            super::upstream_error_message(&serde_json::json!({"error": {"message": "bad model"}})),
+            Some("bad model".to_string())
+        );
+        assert_eq!(
+            super::upstream_error_message(&serde_json::json!({"error": "quota exceeded"})),
+            Some("quota exceeded".to_string())
+        );
+        assert!(super::upstream_error_message(
+            &serde_json::json!({"error": {"code": 42}})
+        )
+        .is_some(), "对象里有东西却没被当成报错");
+
+        // 接线：两条 200 路径都必须走这个判据，不能再裸用 v.get("error")。
+        // **先剥注释**——上面那段文档注释里就原样引着 `v.get("error")`，
+        // 不剥的话这条负向断言会被自己要守的那段代码的注释喂饱（刚踩过一次）。
+        let src = include_str!("net.rs");
+        let code_only: String = src
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap_or(src)
+            .lines()
+            .filter(|l| {
+                let t = l.trim_start();
+                !t.starts_with("//")
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let prod = code_only.as_str();
+        assert_eq!(
+            prod.matches("if let Some(msg) = upstream_error_message(&v)").count(),
+            2,
+            "有 200 路径没接上这个判据"
+        );
+        assert!(
+            !prod.contains("if let Some(err) = v.get(\"error\")"),
+            "又裸用 v.get(\"error\") 了 —— error:null 会把成功的图扔掉"
         );
     }
 

@@ -1881,13 +1881,10 @@ fn strip_xml(xml: &str) -> String {
             _ => {}
         }
     }
-    let out = out
-        .replace("&amp;", "&")
-        .replace("&lt;", "<")
-        .replace("&gt;", ">")
-        .replace("&quot;", "\"")
-        .replace("&apos;", "'")
-        .replace("&#10;", "\n");
+    // docx / xlsx 的正文。同样两个老毛病：数字实体只认 &#10;，别的（&#8217; 这类
+    // 智能引号在 Word 文档里满地都是）原样漏给模型；顺序 replace 还会把真实存在的
+    // `&amp;lt;` 二次解码成 `<`。统一走 ai.rs 那份一趟扫完的解码器。
+    let out = crate::ai::decode_html_entities(&out);
     let mut res = String::new();
     let mut blank = 0;
     for l in out.lines().map(|l| l.trim_end()) {

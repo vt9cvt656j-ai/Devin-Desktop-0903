@@ -4309,5 +4309,45 @@
         ]
       }
     }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "schedule",
+      "description": "Create, list or remove a **scheduled task**: something you run again later, on your own, with nobody at the keyboard. Use it whenever the user says 「every morning at 9」, 「check again in 20 minutes」, 「every day」, 「remind me to」 — anything whose whole point is that it happens without them asking again. Give either at (a daily HH:MM in the user's local time) or every_minutes (a repeating interval), not both. The prompt you store is what a future you will receive as the task, so write it as a **complete standing instruction**: a fresh run has none of this conversation's context, so name the project path, the exact check to make, and what counts as done. **Know the boundary and say it to the user:** these fire only while the app is running — this does not install anything into their system, so a task does not fire while the app is closed; it fires on the next tick after they reopen it. When a scheduled run hits something that needs the user to confirm (a dangerous command, a workspace-trust prompt), that step is refused rather than silently allowed, and left for them — so schedule work that can genuinely finish unattended.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "action": {
+            "type": "string",
+            "enum": [
+              "add",
+              "list",
+              "remove"
+            ],
+            "description": "add = create one; list = show all; remove = delete by id"
+          },
+          "prompt": {
+            "type": "string",
+            "description": "For add: the standing instruction a future run will receive. Must stand alone — no reference to this conversation."
+          },
+          "at": {
+            "type": "string",
+            "description": "For add: a daily time as HH:MM in the user's local timezone, e.g. 09:00"
+          },
+          "every_minutes": {
+            "type": "integer",
+            "description": "For add: repeat every N minutes instead of a daily time"
+          },
+          "id": {
+            "type": "integer",
+            "description": "For remove: which task"
+          }
+        },
+        "required": [
+          "action"
+        ]
+      }
+    }
   }
 ]

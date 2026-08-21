@@ -182,6 +182,14 @@ const TOOL_METADATA = Object.freeze({
   },
 
   // 开发辅助工具
+  schedule: {
+    category: 'interaction',
+    use_cases: ['每天定点跑一次', '过一会儿再检查', '周期性巡检', '把重复的事交出去'],
+    triggers: ['每天几点', '过 N 分钟后', '定时', '提醒我', '自动跑'],
+    example_call: "schedule(action='add', at='09:00', prompt='检查 /Users/me/proj 的 CI 是否通过，失败就把报错贴出来')",
+    priority: 'normal',
+    usage_note: '用户说「每天/过一会儿/定时」时用它。存的 prompt 必须独立成立——将来那一轮没有本次对话的上下文。只在应用开着时触发，这条边界要告诉用户'
+  },
   ask_user: {
     category: 'interaction',
     use_cases: ['需求不明确', '技术方案多选一', '参数未确定', '优先级排序'],

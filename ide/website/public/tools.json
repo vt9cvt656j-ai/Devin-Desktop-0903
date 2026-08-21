@@ -1,7 +1,7 @@
 {
   "generatedFrom": "ide/src/main.js · _buildAgentToolSchemas",
   "generatedAt": null,
-  "count": 140,
+  "count": 141,
   "groups": [
     "Agents",
     "Code intelligence",
@@ -94,6 +94,11 @@
     },
     {
       "name": "think",
+      "group": "Knowledge",
+      "desktopOnly": false
+    },
+    {
+      "name": "schedule",
       "group": "Knowledge",
       "desktopOnly": false
     },

@@ -205,16 +205,39 @@ fn sniff_asset_ext(head: &[u8]) -> Option<&'static str> {
     None
 }
 
+/// 嗅探要读的字节数。必须 >= 最长的魔数前缀（"Kaydara FBX Binary" = 18）。
+const ASSET_SNIFF_BYTES: usize = 32;
+
 /// 落盘之后按魔数复核扩展名；对不上就改名，并把这件事**说出去**。
 ///
 /// 认不出来（None）时保持原样——不知道是什么就不要乱改，那会把一个能用的文件
 /// 改成一个没人认识的名字。
 fn correct_extension_after_write(target: &Path, declared: &str) -> (PathBuf, Option<String>) {
-    let mut head = [0u8; 16];
+    // 缓冲必须装得下**最长的那个魔数前缀**。原来写的是 16 字节，而
+    // "Kaydara FBX Binary" 有 18 个字节——于是 starts_with 恒 false，裸二进制
+    // FBX 存成 .glb 时复核一声不响，正是这套复核要挡的主场景。
+    // 单元测试当时直接喂 21 字节给 sniff_asset_ext，绕过了这个缓冲，所以一直是绿的。
+    // 32 字节留了余量；下面有断言钉住「生产喂进去的字节数 >= 最长前缀」。
+    let mut head = [0u8; ASSET_SNIFF_BYTES];
+    // read 一次不保证读满（尤其是刚写完的文件）。read_exact 遇到短文件会报错，
+    // 所以循环读到填满或 EOF——少读几个字节就等于认不出来。
     let read = match std::fs::File::open(target) {
         Ok(mut f) => {
             use std::io::Read;
-            f.read(&mut head).unwrap_or(0)
+            let mut filled = 0usize;
+            loop {
+                match f.read(&mut head[filled..]) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        filled += n;
+                        if filled == head.len() {
+                            break;
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+            filled
         }
         Err(_) => 0,
     };
@@ -225,6 +248,20 @@ fn correct_extension_after_write(target: &Path, declared: &str) -> (PathBuf, Opt
         return (target.to_path_buf(), None);
     }
     let renamed = target.with_extension(actual);
+    // rename 会**静默覆盖**同名文件。assets/models/hero.glb 认出来是 zip 时，
+    // 旁边可能已经躺着一个用户自己放的 hero.zip——直接 rename 就把它冲掉了，
+    // 而且没有任何人知道。宁可不改名，只报警。
+    if renamed != target && renamed.exists() {
+        return (
+            target.to_path_buf(),
+            Some(format!(
+                "警告：文件内容其实是 {actual}，扩展名却是 {declared}。没有自动改名——\
+                 同目录下已经有一个 {} 了，改名会把它覆盖掉。按 {actual} 处理这个文件，\
+                 或者自己挪个名字。",
+                renamed.file_name().and_then(|n| n.to_str()).unwrap_or("同名文件")
+            )),
+        );
+    }
     match std::fs::rename(target, &renamed) {
         Ok(()) => (
             renamed,
@@ -671,11 +708,18 @@ pub async fn download_asset(
     }
     let target = safe_dest(&workspace, sub, &name, ext)?;
     let written = stream_asset_to_path(response, &target).await?;
+    // 第三个落盘点。前两个（gateway_download 里那两条）早就接了复核，这条漏了——
+    // 而 download_asset 恰恰是从素材库拿现成文件的那条路，格式对不上更常见。
+    let (target, ext_note) = correct_extension_after_write(&target, ext);
     let rel = target.strip_prefix(&workspace).unwrap_or(&target);
-    Ok(serde_json::json!({
+    let mut out = serde_json::json!({
         "path": rel.to_string_lossy(),
         "bytes": written,
-    }))
+    });
+    if let Some(note) = ext_note {
+        out["ext_note"] = serde_json::Value::String(note);
+    }
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -756,6 +800,29 @@ mod asset_extension_tests {
             2,
             "有落盘点没把 ext_note 塞回 JSON —— 后端认出来了，模型收不到"
         );
+
+        // 全文件一共**三个**落盘点：gateway_download 里两个，download_asset 一个。
+        // 上一版只接了前两个，而 download_asset 正是从素材库拿现成文件那条路。
+        let whole = include_str!("game_assets.rs");
+        let prod = whole.split("#[cfg(test)]").next().unwrap_or(whole);
+        assert_eq!(
+            prod.matches("stream_asset_to_path(").count(),
+            4,
+            "落盘点总数变了（3 处调用 + 1 处定义），这条断言的前提得重算"
+        );
+        assert_eq!(
+            prod.matches("correct_extension_after_write(&target, ext)").count(),
+            3,
+            "有落盘点没接扩展名复核 —— download_asset 就漏过一次"
+        );
+        let dl = prod
+            .split("let target = safe_dest(&workspace, sub, &name, ext)?;")
+            .nth(1)
+            .expect("download_asset 的落盘段不见了");
+        assert!(
+            dl.contains("correct_extension_after_write") && dl.contains("ext_note"),
+            "download_asset 落盘后没复核扩展名，或者认出来了不回传"
+        );
     }
 
     /// 短文件不能让嗅探 panic：ftyp 那条要读 head[4..8] 和 head[8..11]，
@@ -786,6 +853,67 @@ mod asset_extension_tests {
             assert_eq!(p, f, "{name} 被无端改名了");
             assert!(note.is_none(), "{name} 无端报了警告");
         }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 这条是上一版**漏掉**的那件事：单元测试直接喂 21 字节给 sniff_asset_ext，
+    /// 而生产只读文件前 16 字节，"Kaydara FBX Binary"（18 字节）永远装不下，
+    /// 于是裸二进制 FBX 存成 .glb 时复核一声不响——正是这套复核要挡的主场景。
+    /// 所以要钉两件事：缓冲容得下最长前缀，且**走真实落盘路径**验一遍。
+    #[test]
+    fn the_sniff_buffer_fits_the_longest_magic() {
+        assert!(
+            super::ASSET_SNIFF_BYTES >= b"Kaydara FBX Binary".len(),
+            "嗅探缓冲装不下最长的魔数前缀，长前缀会恒不匹配"
+        );
+        let src = include_str!("game_assets.rs");
+        let body = src
+            .split("fn correct_extension_after_write(")
+            .nth(1)
+            .and_then(|s| s.split("\n}\n").next())
+            .expect("correct_extension_after_write 不见了");
+        assert!(
+            body.contains("[0u8; ASSET_SNIFF_BYTES]"),
+            "生产路径又写死了一个字面量缓冲长度，和常量脱钩"
+        );
+
+        // 真实落盘路径：写一个裸二进制 FBX，声明成 glb。
+        let dir = std::env::temp_dir().join(format!("mrday-fbx-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("rigged.glb");
+        let mut fbx = b"Kaydara FBX Binary  \x00".to_vec();
+        fbx.extend_from_slice(&[0x1a, 0x00, 0x00, 0x00]);
+        std::fs::write(&f, &fbx).unwrap();
+        let (p, note) = correct_extension_after_write(&f, "glb");
+        assert_eq!(
+            p.extension().and_then(|e| e.to_str()),
+            Some("fbx"),
+            "裸 FBX 存成 .glb 没被认出来 —— 缓冲又不够长了"
+        );
+        assert!(note.expect("认出来了却不说").contains("fbx"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// rename 会静默覆盖同名文件。hero.glb 认出来是 zip 时，旁边可能已经躺着
+    /// 用户自己的 hero.zip —— 直接改名就把它冲掉了，而且没有任何人知道。
+    #[test]
+    fn renaming_never_clobbers_an_existing_file() {
+        let dir = std::env::temp_dir().join(format!("mrday-clobber-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let victim = dir.join("hero.zip");
+        std::fs::write(&victim, b"USER DATA MUST SURVIVE").unwrap();
+        let asset = dir.join("hero.glb");
+        std::fs::write(&asset, b"PK\x03\x04zipped").unwrap();
+
+        let (p, note) = correct_extension_after_write(&asset, "glb");
+        assert_eq!(p, asset, "改名了 —— 会覆盖旁边那个同名文件");
+        assert_eq!(
+            std::fs::read(&victim).unwrap(),
+            b"USER DATA MUST SURVIVE".to_vec(),
+            "用户的 hero.zip 被覆盖了"
+        );
+        let note = note.expect("没改名也没报警 —— 内容和扩展名对不上这件事必须说");
+        assert!(note.contains("zip") && note.contains("覆盖"), "{note}");
         std::fs::remove_dir_all(&dir).ok();
     }
 
