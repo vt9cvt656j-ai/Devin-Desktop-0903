@@ -896,7 +896,11 @@ async fn search_crates(c: &Client, q: &str, limit: u32) -> Result<String, String
         .query(&[
             ("q", q),
             ("per_page", &limit.to_string()),
-            ("sort", "downloads"),
+            // **不要**按下载量排。crates.io 默认就是相关性排序，实测
+            // `?q=serde` 第一条就是 serde；加上 sort=downloads 之后第一条变成
+            // hashbrown——模型问「serde 这个包」，拿回的是下载量最高的一批不相干 crate。
+            // （search_hf / search_hex 那两处的 downloads 排序是刻意的：那两个源
+            // 的相关性排序本身不好用，保留。）
         ])
         .send()
         .await
@@ -1285,6 +1289,57 @@ fn decode_github_base64(value: &str) -> Result<Vec<u8>, String> {
             out.push(((buf >> bits) & 0xff) as u8);
         }
         buf &= if bits == 0 { 0 } else { (1u32 << bits) - 1 };
+    }
+    Ok(out)
+}
+
+/// 真正的 discussions 检索：GraphQL 的 `search(type: DISCUSSION)`。
+///
+/// REST 的 search/issues 索引里**没有 discussions**（实测 `is:discussion` 只是被当成
+/// 普通词，返回的是正文提到 "discussion" 的 issue）。GraphQL 这条是唯一的真路，
+/// 但它强制鉴权——所以只在有 GITHUB_TOKEN 时走。
+async fn github_discussions_graphql(
+    c: &Client,
+    query: &str,
+    limit: usize,
+) -> Result<String, String> {
+    let gql = serde_json::json!({
+        "query": "query($q:String!,$n:Int!){search(query:$q,type:DISCUSSION,first:$n){discussionCount nodes{... on Discussion{title url createdAt repository{nameWithOwner} category{name}}}}}",
+        "variables": { "q": query, "n": limit.min(25) as i64 }
+    });
+    let resp = github_auth_header(c.post("https://api.github.com/graphql"))
+        .header(reqwest::header::USER_AGENT, "Michael-IDE/1.0")
+        .json(&gql)
+        .send()
+        .await
+        .map_err(|e| format!("GitHub GraphQL: {e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!("GitHub GraphQL returned {}", resp.status()));
+    }
+    let j: Value = resp.json_capped().await.map_err(|e| format!("GraphQL JSON: {e}"))?;
+    let search = &j["data"]["search"];
+    let nodes = search["nodes"].as_array().cloned().unwrap_or_default();
+    if nodes.is_empty() {
+        return Err("GraphQL 返回 0 条".into());
+    }
+    let total = search["discussionCount"].as_u64().unwrap_or(nodes.len() as u64);
+    let retrieved = retrieved_at();
+    let mut out = format!(
+        "GitHub Discussions for '{query}'（GraphQL search(type: DISCUSSION)，共 {total} 条）\nretrieved_at: {retrieved}\n\n"
+    );
+    for (i, n) in nodes.iter().enumerate() {
+        let title = n["title"].as_str().unwrap_or("");
+        if title.is_empty() {
+            continue;
+        }
+        out.push_str(&format!(
+            "{}. {}\n   {}\n   {} · {}\n\n",
+            i + 1,
+            title,
+            n["url"].as_str().unwrap_or(""),
+            n["repository"]["nameWithOwner"].as_str().unwrap_or("?"),
+            n["category"]["name"].as_str().unwrap_or("?"),
+        ));
     }
     Ok(out)
 }
@@ -4586,7 +4641,14 @@ pub async fn juejin_search(query: String, max_results: Option<u32>) -> Result<St
     let limit = max_results.unwrap_or(10).min(20);
     let body = serde_json::json!({
         "search_type": 2,
-        "keyword": query,
+        // 接口认的是 `key_word`，不是 `keyword`。
+        //
+        // 实测（2026-08-20，同一条 body 只改这一个字段名）：
+        //   "keyword"  → err_no=0、err_msg=success、data **0 条**
+        //   "key_word" → err_no=0、data **20 条**真文章
+        // 也就是说这个源此前一直「成功地返回空」——HTTP 200、业务码 0、
+        // 回执写「没有找到相关文章」，而掘金上明明有。一个词的事。
+        "key_word": query,
         "cursor": "0",
         "limit": limit,
         "search_id": ""
@@ -5102,6 +5164,27 @@ pub async fn github_discussions_search(
     let query = required_search_term(&query)?;
     let c = kclient()?;
     let n = max_results.unwrap_or(10).min(30);
+    // `is:discussion` **不是** REST issues 搜索的有效限定词。
+    //
+    // 实测（2026-08-20）：`q=rust ownership` → 125935 条（全是 issue/PR）；
+    // 加上 `is:discussion` → 73 条——那不是 73 个 discussion，是 73 条正文里恰好
+    // 提到 "discussion" 的 issue。REST 的 issues 索引里**根本没有 discussions**。
+    // 而回执抬头写着「GitHub Discussions for '<查询词>'」，模型据此以为自己看的是
+    // 社区讨论，实际是一堆问题单。
+    //
+    // 真能检索 discussions 的只有 GraphQL 的 search(type: DISCUSSION)，
+    // 它**强制鉴权**（实测带 GITHUB_TOKEN 时 rust ownership 有 1485 条）。
+    // 有 token 就走真路；没有就照实说这次搜的是 issue。
+    let has_token = std::env::var("GITHUB_TOKEN")
+        .ok()
+        .map(|v| !v.trim().is_empty())
+        .unwrap_or(false);
+    if has_token {
+        if let Ok(text) = github_discussions_graphql(&c, &query, n as usize).await {
+            return Ok(text);
+        }
+        // GraphQL 失败就落回下面这条 REST 路，但抬头照样会说清「搜的是 issue」。
+    }
     let q_full = format!("{query} is:discussion");
     let resp = github_auth_header(
         c.get("https://api.github.com/search/issues")
@@ -5123,7 +5206,12 @@ pub async fn github_discussions_search(
         .and_then(Value::as_array)
         .ok_or_else(|| "GitHub Discussions response did not contain an items array".to_string())?;
     let retrieved = retrieved_at();
-    let mut out = format!("GitHub Discussions for '{query}' (GitHub official search API)\nretrieved_at: {retrieved}\n\n");
+    // 抬头必须说清这次搜的**其实是 issue**——REST 索引里没有 discussions。
+    let mut out = format!(
+        "GitHub **issues**（不是 discussions）for '{query}'（REST search/issues）\nretrieved_at: {retrieved}\n\n         注意：GitHub 的 REST 搜索索引里**没有 discussions**，`is:discussion` 在这里不是有效限定词，\
+         下面这些是正文里提到相关内容的 issue / PR。要真的检索社区讨论，需要设置 GITHUB_TOKEN\
+         （有 token 时本工具会自动改走 GraphQL 的 search(type: DISCUSSION)）。\n\n"
+    );
     let mut count = 0usize;
     for it in items {
         let title = it.get("title").and_then(|v| v.as_str()).unwrap_or("");
@@ -6846,5 +6934,69 @@ mod result_quality_tests {
             !b.contains("keywords.iter().any(|k| haystack.contains(k))"),
             "旧的子串判据还在"
         );
+    }
+}
+
+#[cfg(test)]
+mod wrong_field_tests {
+    /// 切到**下一个函数**为止，不能按固定字符数截——按 4000 字符取会越界读到隔壁
+    /// search_hf，而那处的 downloads 排序是刻意保留的，于是 crates 那条断言假红。
+    fn body_of(func: &str) -> String {
+        let src = include_str!("knowledge.rs");
+        let at = src.find(func).unwrap_or_else(|| panic!("{func} 不见了"));
+        let rest = &src[at + func.len()..];
+        let end = ["\nasync fn ", "\npub async fn ", "\nfn ", "\npub fn ", "\n#[cfg(test)]"]
+            .iter()
+            .filter_map(|m| rest.find(m))
+            .min()
+            .map(|e| at + func.len() + e)
+            .unwrap_or(src.len());
+        src[at..end]
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// 掘金的接口认的是 `key_word`，不是 `keyword`。同一条 body 只改这一个字段名：
+    /// "keyword" → data 0 条（err_no 仍是 0、err_msg 仍是 success）；
+    /// "key_word" → data 20 条真文章。
+    /// 也就是说这个源此前一直「成功地返回空」，回执写「没有找到相关文章」。
+    #[test]
+    fn juejin_uses_the_field_the_api_actually_reads() {
+        let b = body_of("pub async fn juejin_search");
+        assert!(b.contains(r#""key_word": query"#), "又写回 keyword 了 —— 接口会返回 0 条");
+        assert!(!b.contains(r#""keyword": query"#), "旧字段名还在");
+    }
+
+    /// crates.io 默认就是相关性排序（?q=serde 第一条就是 serde）；
+    /// 加上 sort=downloads 之后第一条变成 hashbrown——模型问「serde 这个包」，
+    /// 拿回的是下载量最高的一批不相干 crate。
+    #[test]
+    fn crates_keeps_relevance_ordering() {
+        let b = body_of("async fn search_crates");
+        assert!(
+            !b.contains(r#"("sort", "downloads")"#),
+            "crates 又按下载量排了 —— 精确包名会被挤到后面"
+        );
+    }
+
+    /// REST 的 search/issues 索引里**没有** discussions：`is:discussion` 只是被当成
+    /// 普通词（实测 rust ownership 12.5 万条 → 加上限定词剩 73 条正文提到 discussion
+    /// 的 issue）。真路是 GraphQL 的 search(type: DISCUSSION)，实测 1485 条，强制鉴权。
+    #[test]
+    fn discussions_search_tells_the_truth_about_what_it_searched() {
+        let b = body_of("pub async fn github_discussions_search");
+        assert!(
+            b.contains("GitHub **issues**（不是 discussions）"),
+            "抬头又把 issue 说成 discussions 了"
+        );
+        assert!(b.contains("没有 discussions"), "没说清 REST 索引里根本没有 discussions");
+        assert!(
+            b.contains("github_discussions_graphql"),
+            "有 GITHUB_TOKEN 时没走真正能检索 discussions 的 GraphQL"
+        );
+        let g = body_of("async fn github_discussions_graphql");
+        assert!(g.contains("type:DISCUSSION"), "GraphQL 查询写错了类型");
     }
 }
