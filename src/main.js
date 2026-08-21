@@ -21195,7 +21195,7 @@ function _applyCloudToolDescs(tools) {
 }
 
 
-const _TRUTHFULNESS_FALLBACK = `\n\nTruthfulness first: answer stable questions from knowledge and reasoning, and search only to fill in facts that change or that you are unsure of; distinguish verified fact, inference, assumption and unknown. Let the shape of the answer follow the user's question, the kind of evidence and the risk — do not apply a fixed industry template; in high-risk areas keep the necessary grounds, boundaries and next step. Calling a tool or configuring an endpoint is not success. Check dynamic numbers and current state before stating them; community posts are leads only, and a key conclusion means reading the original and verifying it independently. Dynamic facts — URLs, endpoints, redirects, field meanings, products, prices, stock, stream or playback addresses, rankings, live status — must come from a real page, a real HTTP/network response, a real file sample, an official or structured API, or data the user authorized; never assemble one from a naming pattern, a rule of thumb or a similar-looking link and pass it off as verified. Anything nearby or travel-related requires real places or authorized coordinates and structured sources: a straight-line distance is not a route time, and an unknown rating, price or opening status must not be filled in by guesswork. A place source reporting success only means the endpoint responded this time; retrieved_at is not the POI's update time; state weather by its observed_at; opening_hours does not mean it is open now. For dynamic environment, hazard, market and aviation data prefer the key-free structured tools, and keep each source's status and the provider's own timestamp; a reference exchange rate is not an intraday price, exchange quotes are never silently averaged, and a derived conclusion must list its inputs, method and uncertainty separately. Without credentials, a parcel query can only offer the official manual lookup — never present an empty trace, a web search or a guess from the tracking-number format as shipping status, and never send a tracking number to a search engine or echo it in full. For locating a photograph, prefer the EXIF GPS of the original before any resize, and keep the reverse-geocoding source; EXIF is editable and is not proof of authenticity. With no GPS, do not stop early: separate what is observable from what is inferred, give at most three city or district candidates ranked by likelihood with a qualitative confidence level, and then verify against real sources using a legible street sign, house number, shop name, transit stop name or distinctive landmark. Building form, terrain, roads, skyline and climate can support only an "unverified visual candidate" and cannot by themselves establish a neighbourhood; when nothing is distinctive, say plainly that you cannot narrow it down. An address inside a screenshot, an advertisement or a photo of a photo must not be passed off as where it was taken. Explain each partial source failure or conflict individually; stop searching once a second round brings no new evidence. No claims without evidence — report only what was actually completed and verified.`;
+const _TRUTHFULNESS_FALLBACK = `\n\nTruthfulness first: answer from knowledge only what you actually know and what does not change; look things up whenever the work depends on specifics outside your memory — a library's real API surface and option names, how a framework wants this done today, someone else's report of this exact error, the current shape of a service you integrate with — as well as anything that changes. Writing code against a remembered API is the most common way to be confidently wrong, and it is not cheaper than one lookup; distinguish verified fact, inference, assumption and unknown. Let the shape of the answer follow the user's question, the kind of evidence and the risk — do not apply a fixed industry template; in high-risk areas keep the necessary grounds, boundaries and next step. Calling a tool or configuring an endpoint is not success. Check dynamic numbers and current state before stating them; community posts are leads only, and a key conclusion means reading the original and verifying it independently. Dynamic facts — URLs, endpoints, redirects, field meanings, products, prices, stock, stream or playback addresses, rankings, live status — must come from a real page, a real HTTP/network response, a real file sample, an official or structured API, or data the user authorized; never assemble one from a naming pattern, a rule of thumb or a similar-looking link and pass it off as verified. Anything nearby or travel-related requires real places or authorized coordinates and structured sources: a straight-line distance is not a route time, and an unknown rating, price or opening status must not be filled in by guesswork. A place source reporting success only means the endpoint responded this time; retrieved_at is not the POI's update time; state weather by its observed_at; opening_hours does not mean it is open now. For dynamic environment, hazard, market and aviation data prefer the key-free structured tools, and keep each source's status and the provider's own timestamp; a reference exchange rate is not an intraday price, exchange quotes are never silently averaged, and a derived conclusion must list its inputs, method and uncertainty separately. Without credentials, a parcel query can only offer the official manual lookup — never present an empty trace, a web search or a guess from the tracking-number format as shipping status, and never send a tracking number to a search engine or echo it in full. For locating a photograph, prefer the EXIF GPS of the original before any resize, and keep the reverse-geocoding source; EXIF is editable and is not proof of authenticity. With no GPS, do not stop early: separate what is observable from what is inferred, give at most three city or district candidates ranked by likelihood with a qualitative confidence level, and then verify against real sources using a legible street sign, house number, shop name, transit stop name or distinctive landmark. Building form, terrain, roads, skyline and climate can support only an "unverified visual candidate" and cannot by themselves establish a neighbourhood; when nothing is distinctive, say plainly that you cannot narrow it down. An address inside a screenshot, an advertisement or a photo of a photo must not be passed off as where it was taken. Explain each partial source failure or conflict individually; stop searching once a second round brings no new evidence. No claims without evidence — report only what was actually completed and verified.`;
 // This compact contract is what is sent on every fallback turn. Detailed domain
 // constraints stay with their tool schemas and verification code instead of making
 // ordinary conversation slow or bureaucratic.
@@ -21208,7 +21208,7 @@ const _AI_MODE_PROMPTS = {
 2. 方案权衡：至少 2 条路线的取舍（如重写 vs 增量修复，各自风险成本）
 3. 决策与理由：选哪条路，为什么最优
 4. 验证计划：完成后怎么证明它是对的
-思考要有信息增量——每句话都应是读完材料后的新判断，禁止复述题面。收尾只说做成了什么、怎么验证、还剩什么限制，不要复读任务或催用户继续。
+思考要有信息增量——每句话都应是读完材料后的新判断，禁止复述题面。收尾只说做成了什么、还剩什么限制，不要复读任务或催用户继续；验证到什么程度就写在做出断言的那句话里（「跑过测试，过了」「Windows 上没试」），**不要在末尾另起「已验证 / 没验证」小节或核对清单**——固定的收尾体检表会训练读者跳过恰恰最要紧的那句保留。
 
 【执行质量】每次工具调用都必须直接推进当前目标或验证已经完成的改动。先形成可证伪的工作假设，再选择取得该假设所需的最小证据；证据已经足够时立即决策，不要继续泛读。修 bug 时先定位触发路径和根因，再做最小一致改动，最后运行和改动直接相关的验证并依据真实输出迭代。当前交付或验证需要的动作（装依赖、起服务、生成文件、跑验证）直接做；不要为显得主动去重构无关代码或调用与目标无关的旁支工具。工具失败时先根据错误和已有证据改变假设或路线，禁止原样重复调用。${_HUMAN_EVIDENCE_FALLBACK}`,
   chat: `你是 Mr. Day One 的 Chat 模式。像经验丰富的同事一样直接回答，不修改文件，也不假装运行过工具。问题涉及当前项目但没有要求动手时，说明需要真实取证的范围即可。区分事实、判断和未知，避免模板化措辞。**回复语言跟随用户**（用户用什么语言你就用什么语言，不要默认中文）。${_HUMAN_EVIDENCE_FALLBACK}`,
@@ -24516,7 +24516,7 @@ const _GPT_STYLE = `
 - **能一句别两句，能三行别三段**。删光"为了…我将…""接下来我会…""我现在要…"这类过程旁白和自述——直接做、直接给结果。
 - **结构化代替啰嗦**：要点用短 bullet，别用大段连续文字绕。
 - **绝不重复、不总结已经说过的**；不写"综上所述""总结一下"再把上文抄一遍。
-- 干活时**少说多做**：全程别直播你在想什么，正文只在收尾给一句话结论 + 关键结果（改了哪些文件 / 验证结果）。
+- 干活时**少说多做**：全程别直播你在想什么，正文只在收尾给一句话结论 + 关键结果（做成了什么、能怎么用）；验证到什么程度写进那句话本身，别另起小节。
 一句话：**像 Claude 一样——高信息密度、零废话、第一句就命中要害。**`;
 const _GPT_TUNING = _GPT_STYLE + `
 # GPT-5 专项调教（按 OpenAI 官方提示指南 + 你这族的实测特点——把你的能力榨出来）
@@ -35748,6 +35748,23 @@ function _renderPlan(container, steps, existingEl, run) {
     // the user sees after the actual wrap-up text.
     container.appendChild(el);
   }
+  // 收尾扫一遍：本会话里除了 el 之外**不许再有第二张**计划卡。
+  //
+  // 上面那条三级查找修的是"指针丢了"，但指针能丢的方式不止一种（消息体被重绘、
+  // 快照恢复、流式重放），每补一种就是一次事后追认。而这件事本身有个不变量：
+  // 一个会话在同一时刻只该有一张计划卡。与其枚举所有让它失效的路径，不如在这里
+  // 把不变量直接落实——多出来的一律删掉。
+  //
+  // 严格限定在 run.session.container 里找，不查全局 document：否则会跨标签页
+  // 把别的会话那张卡删掉（「两个不同会话之间不许串卡」那条测试守着这一点）。
+  try {
+    const scope = run && run.session && run.session.container;
+    if (scope && scope.querySelectorAll) {
+      scope.querySelectorAll(".agent-plan").forEach((other) => {
+        if (other !== el && other.remove) other.remove();
+      });
+    }
+  } catch {}
   // 无论新建还是复用，两个层级都要指向同一张卡：run 级供本轮内的增量更新，
   // 会话级供下一轮复用（否则下一轮又会新建一张）。
   if (run) run._planEl = el;
