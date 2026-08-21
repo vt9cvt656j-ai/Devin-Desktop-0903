@@ -5217,27 +5217,57 @@ pub async fn github_trending(query: String, max_results: Option<u32>) -> Result<
 ///
 /// 不写死「infoq 坏了」：核对一下命中项跟查询词有没有关系。哪天它恢复了，
 /// 这段自己就通了。
-fn any_hit_matches_query(query: &str, hits: &[(String, String)]) -> bool {
+fn query_tokens(query: &str) -> Vec<String> {
     let q = query.to_lowercase();
-    let mut tokens: Vec<&str> = q
+    let mut tokens: Vec<String> = q
         .split(|c: char| !c.is_alphanumeric())
         .filter(|t| t.chars().count() >= 3)
+        .map(str::to_string)
         .collect();
     // 查询词本身很短（"go"、"k8s"）时没有 >=3 的分词，就拿整串比。
     // 但整串得**有字母数字**才有比的意义：全是符号的话核对不了，那就不核对。
     let trimmed = q.trim();
-    if tokens.is_empty()
-        && trimmed.chars().filter(|c| c.is_alphanumeric()).count() >= 2
-    {
-        tokens.push(trimmed);
+    if tokens.is_empty() && trimmed.chars().filter(|c| c.is_alphanumeric()).count() >= 2 {
+        tokens.push(trimmed.to_string());
     }
-    if tokens.is_empty() {
-        return true; // 没法核对就不冤枉它。
-    }
-    hits.iter().any(|(title, path)| {
-        let t = title.to_lowercase();
-        let p = path.to_lowercase();
-        tokens.iter().any(|tok| t.contains(tok) || p.contains(tok))
+    tokens
+}
+
+/// 一条结果跟查询词沾不沾边。
+///
+/// 拉丁词按**词边界**比，不按子串：子串会让 "go" 命中 "Django" / "Algorithms"，
+/// 一条这样的误命中就足以把整页无关文章放行。中日韩没有词边界，仍按子串。
+fn hit_matches_query(tokens: &[String], title: &str, path: &str) -> bool {
+    let hay = format!("{} {}", title.to_lowercase(), path.to_lowercase());
+    tokens.iter().any(|tok| {
+        let latin = tok.chars().all(|c| c.is_ascii_alphanumeric());
+        if !latin {
+            return hay.contains(tok.as_str());
+        }
+        // 词边界：命中处的前后不能还是字母数字。
+        let mut from = 0usize;
+        while let Some(rel) = hay[from..].find(tok.as_str()) {
+            let at = from + rel;
+            let end = at + tok.len();
+            let before_ok = at == 0
+                || !hay[..at]
+                    .chars()
+                    .next_back()
+                    .is_some_and(|c| c.is_ascii_alphanumeric());
+            let after_ok = end >= hay.len()
+                || !hay[end..]
+                    .chars()
+                    .next()
+                    .is_some_and(|c| c.is_ascii_alphanumeric());
+            if before_ok && after_ok {
+                return true;
+            }
+            from = at + tok.len().max(1);
+            if from >= hay.len() {
+                break;
+            }
+        }
+        false
     })
 }
 
@@ -5322,7 +5352,40 @@ pub async fn infoq_search(query: String, max_results: Option<u32>) -> Result<Str
              search_status: empty\nNo results found in the successful InfoQ response.\n{search_url}"
         ));
     }
-    if !any_hit_matches_query(&query, &hits) {
+    // 逐条筛，不再「有一条沾边就整批放行」。
+    //
+    // 原来是 any()：InfoQ 首页哪天恰好有一条标题含查询词的新闻，另外九条无关文章
+    // 就跟着一起顶着「for '<查询词>'」交出去——这次修复要挡的 bug 原样复发。
+    // 反过来「一条都不沾就整批扔」也太狠：单复数、连字符、换词表达都会误杀十条里的九条。
+    // 改成留下真正沾边的那些，一条都不剩才报 unusable。
+    let tokens = query_tokens(&query);
+    if !tokens.is_empty() {
+        let kept: Vec<(String, String)> = hits
+            .iter()
+            .filter(|(t, p)| hit_matches_query(&tokens, t, p))
+            .cloned()
+            .collect();
+        if !kept.is_empty() && kept.len() < hits.len() {
+            let dropped = hits.len() - kept.len();
+            let mut out = format!(
+                "InfoQ articles for '{query}':\nretrieved_at: {retrieved}\n\n\
+                 （抓回来 {} 条，其中 {dropped} 条的标题和链接跟 '{query}' 对不上，已经滤掉——\
+                 InfoQ 的搜索页是客户端渲染的，抓到的常常混着首页最新文章。）\n\n",
+                hits.len()
+            );
+            for (i, (title, path)) in kept.iter().enumerate() {
+                out.push_str(&format!(
+                    "{}. {}\n{}   https://www.infoq.com{}\n\n",
+                    i + 1,
+                    title,
+                    provider_date_lines(None, None, None, None, &retrieved),
+                    path
+                ));
+            }
+            out.push_str(&search_url);
+            return Ok(out);
+        }
+        if kept.is_empty() {
         // 一条都跟查询词沾不上边 = 拿到的是那张跟查询无关的壳页。照实说，别把首页
         // 最新文章顶着「for '<查询词>'」交出去。
         return Ok(format!(
@@ -5334,8 +5397,9 @@ pub async fn infoq_search(query: String, max_results: Option<u32>) -> Result<Str
              同一张页面（实测 2026-08-20），抓到的其实是首页最新文章。也可能只是这个词在\
              infoq.com 上确实没有命中——这两种在这里分不出来。\n\
              改用 web_search 加 site:infoq.com，或用 browser 打开下面这个地址等页面渲染完再读。\n{search_url}",
-            hits.len()
-        ));
+                hits.len()
+            ));
+        }
     }
     let mut out = format!("InfoQ articles for '{query}':\nretrieved_at: {retrieved}\n\n");
     for (i, (title, path)) in hits.iter().enumerate() {
@@ -6352,7 +6416,44 @@ mod tests {
 
 #[cfg(test)]
 mod infoq_shell_page_tests {
-    use super::any_hit_matches_query;
+    use super::{hit_matches_query, query_tokens};
+
+    fn any_hit_matches_query(query: &str, hits: &[(String, String)]) -> bool {
+        let t = query_tokens(query);
+        if t.is_empty() {
+            return true; // 核对不了就不冤枉它
+        }
+        hits.iter().any(|(a, b)| hit_matches_query(&t, a, b))
+    }
+
+    /// 子串匹配会让 "go" 命中 "Django"/"Algorithms"——**一条**这样的误命中就足以把
+    /// 整页无关文章放行（原来是 any()：有一条沾边就整批交出去）。拉丁词按词边界比。
+    #[test]
+    fn latin_tokens_match_on_word_boundaries() {
+        let t = query_tokens("go");
+        assert!(!hit_matches_query(&t, "Django 5.0 released", "/news/django5/"), "go 命中了 Django");
+        assert!(!hit_matches_query(&t, "Algorithms at scale", "/articles/algo/"), "go 命中了 Algorithms");
+        assert!(hit_matches_query(&t, "Go 1.26 lands", "/news/go126/"), "真正的 Go 反而没命中");
+        assert!(hit_matches_query(&t, "Why we chose go", "/x/"), "词尾的命中丢了");
+
+        // 中日韩没有词边界，仍按子串。
+        let cn = query_tokens("微服务");
+        assert!(hit_matches_query(&cn, "谈谈微服务架构", "/x/"));
+    }
+
+    /// 逐条筛，不再「有一条沾边就整批放行 / 一条不沾就整批扔」。
+    #[test]
+    fn unrelated_hits_are_filtered_out_one_by_one() {
+        let t = query_tokens("kubernetes");
+        let hits = [
+            ("Kubernetes 1.33 Released".to_string(), "/news/k8s/".to_string()),
+            ("PostgreSQL Simulates a City".to_string(), "/news/pgsimcity/".to_string()),
+            ("GraphQL LLM Mocking Spec".to_string(), "/news/graphql/".to_string()),
+        ];
+        let kept: Vec<_> = hits.iter().filter(|(a, b)| hit_matches_query(&t, a, b)).collect();
+        assert_eq!(kept.len(), 1, "混进来的首页文章没被滤掉——它们会顶着「for 'kubernetes'」交出去");
+        assert!(kept[0].0.contains("Kubernetes"));
+    }
 
     /// 实测（2026-08-20）：InfoQ 的 /search.action 对 kubernetes、rust ownership、
     /// 以及一串乱码查询词，都返回 HTTP 200、~115KB、**文章链接一模一样**的同一张页面。
@@ -6400,8 +6501,12 @@ mod infoq_shell_page_tests {
             .and_then(|s| s.split("\n#[cfg(test)]").next())
             .expect("infoq_search 的函数体不见了");
         assert!(
-            body.contains("if !any_hit_matches_query(&query, &hits)"),
+            body.contains("hit_matches_query(&tokens, t, p)"),
             "核对函数写了却没接上 —— 首页文章照样顶着「for '<查询词>'」交出去"
+        );
+        assert!(
+            body.contains("if !kept.is_empty() && kept.len() < hits.len()"),
+            "又退回「整批放行或整批扔掉」了 —— 混进来的无关文章会跟着一起交出去"
         );
         assert!(
             body.contains("search_status: unusable"),
