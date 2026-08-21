@@ -28059,6 +28059,44 @@ test("自动改重复标点不许碰别的语言的合法语法", () => {
   }
 });
 
+test("定时任务的排期：今天过了就排明天，间隔按间隔，格式不对不排", () => {
+  // 这是调度器里唯一一段真逻辑，别的都是存取和触发。排错了的后果很具体：
+  // 「每天 9 点」排成了今天已经过去的 9 点 → 一启动就立刻跑一次，然后每次
+  // 检查都认为它到期了，变成死循环刷任务。
+  const nextAt = load("_schedNextAt", {});
+
+  // 用户说「早上 9 点」指的是他的 9 点，所以按本地时区算。
+  const at9 = (h, m) => { const d = new Date(); d.setHours(h, m, 0, 0); return d.getTime(); };
+  const noon = at9(12, 0);
+
+  // 今天 9:00 已经过了（现在是中午）→ 排到明天 9:00
+  const tomorrow9 = nextAt({ at: "09:00" }, noon);
+  assert.ok(tomorrow9 > noon, "已经过去的时间点必须排到明天，不能排在过去");
+  const d1 = new Date(tomorrow9);
+  assert.equal(d1.getHours(), 9);
+  assert.equal(d1.getMinutes(), 0);
+  assert.ok(tomorrow9 - noon > 20 * 3600_000, "应该是明天的 9 点，不是今天的");
+
+  // 今天 18:00 还没到（现在是中午）→ 就排今天
+  const today18 = nextAt({ at: "18:00" }, noon);
+  assert.ok(today18 - noon < 12 * 3600_000, "还没到的时间点应该排在今天");
+  assert.equal(new Date(today18).getHours(), 18);
+
+  // 恰好等于当前时刻也要排到明天，否则会被判成「已到期」立刻再跑一次
+  const exactly = nextAt({ at: "12:00" }, noon);
+  assert.ok(exactly > noon, "等于当前时刻要排到下一天，不然会立刻重复触发");
+
+  // 间隔模式
+  assert.equal(nextAt({ every_minutes: 20 }, 1000), 1000 + 20 * 60_000);
+  // 间隔优先于 at（两个都给时不该出现歧义）
+  assert.equal(nextAt({ every_minutes: 5, at: "09:00" }, 1000), 1000 + 5 * 60_000);
+
+  // 格式不对就不排期（返回 0），而不是排到一个乱七八糟的时刻
+  for (const bad of ["", "9点", "25:00abc", "上午九点", undefined]) {
+    assert.equal(nextAt({ at: bad }, noon), 0, `${bad} 不是合法时间，不该排期`);
+  }
+});
+
 test("docker 只有真会挂住的那几条算长时运行，秒回的不算", () => {
   // 判据不能用那张二元组表：它只看 head 和第一个非选项 token，于是
   // `docker compose up`（一直刷日志）和 `docker compose ps`（秒回）会同判。
@@ -31380,7 +31418,14 @@ test("git_log 只看当前分支，并且说清是哪条分支", () => {
   // 子智能体、或 refreshGitStatus 被丢弃时，它显示的是另一个仓库或切换前的分支。
   const out = run(mk(["HEAD -> tool-config-cleanup", "origin/main"]));
   assert.match(out.content, /分支 tool-config-cleanup/, "没点名分支——并行开着别人分支时这份清单没有意义");
-  assert.match(out.content, /不含其它分支/, "没说清范围，模型会以为这是全仓最近的提交");
+  // 范围要说**准**。git log 走的是 HEAD 的祖先链：已经合并进来的分支，它们的提交
+  // 照样在这里（实测：merge 之后 feature 上那笔就出现了）。原来写的
+  //「别的分支上的提交不会出现在这里」在有过合并的分支上是假话——而这个仓库天天在合并。
+  assert.match(out.content, /HEAD 的祖先链/, "没说清范围，模型会以为这是全仓最近的提交");
+  assert.match(out.content, /已经合并进来的分支，它们的提交也在其中/,
+    "把「不含其它分支」说死了 —— 合并进来的分支提交明明在里面");
+  assert.doesNotMatch(out.content, /别的分支上的提交不会出现在这里/,
+    "又把那句在有合并时不成立的话写回去了");
   assert.match(out.content, /abc1234 fix/);
 
   // 游离 HEAD 要照实说，不能硬安一个分支名。
