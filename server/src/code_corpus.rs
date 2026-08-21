@@ -26,7 +26,7 @@ const MAX_TARBALL_BYTES: u64 = 24 * 1024 * 1024;
 /// 解包后单个文件的上限。一个 .d.ts 超过这个尺寸多半是打包产物而不是声明。
 const MAX_ENTRY_BYTES: usize = 2 * 1024 * 1024;
 /// 一个包最多抽多少条。防一个巨型 SDK 把整张表灌满。
-const MAX_ENTRIES_PER_PACKAGE: usize = 400;
+const MAX_ENTRIES_PER_PACKAGE: usize = 900;
 /// 正文截断长度。签名 + 文档注释，超过这个长度的多半是把实现也带进来了。
 const MAX_BODY_CHARS: usize = 4000;
 const HTTP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
@@ -396,6 +396,10 @@ pub async fn ingest_npm(
 
     let mut entries: Vec<Entry> = Vec::new();
     let mut exports_line = String::new();
+    // 先按重要性排序再抽：条目上限会被排在前面的文件吃光，不排序就等于让 tar 的
+    // 内部顺序决定「这个包的哪部分进语料」。
+    let mut files = files;
+    files.sort_by_key(|(rel, _)| file_priority(rel));
     for (rel, body) in &files {
         if rel == "package.json" {
             if let Ok(pkg) = serde_json::from_str::<serde_json::Value>(body) {
@@ -605,10 +609,14 @@ pub async fn search(
 }
 
 /// 这个包收录过没有。按需入库那条路先问它，再决定要不要现拉。
-pub async fn have_package(db: &sqlx::PgPool, name: &str) -> bool {
+pub async fn have_package(db: &sqlx::PgPool, eco: Eco, name: &str) -> bool {
+    // 生态必须带上。写死 'npm' 的后果实测过：问 PyPI 的 pandas 时它答「没有」，
+    // 于是按默认生态去 npm 现拉，拉回来的是 npm 上那个占坑的 pandas@0.0.3，
+    // 而真正的 pypi/pandas@3.0.5 就在库里躺着。
     sqlx::query_scalar::<_, i64>(
-        "SELECT count(*) FROM code_corpus WHERE ecosystem = 'npm' AND name = $1",
+        "SELECT count(*) FROM code_corpus WHERE ecosystem = $1 AND name = $2",
     )
+    .bind(eco.as_str())
     .bind(name)
     .fetch_one(db)
     .await
@@ -647,6 +655,8 @@ pub async fn ingest(db: &sqlx::PgPool, eco: Eco, name: &str, version: Option<&st
     };
 
     let mut entries: Vec<Entry> = Vec::new();
+    let mut files = files;
+    files.sort_by_key(|(rel, _)| file_priority(rel));
     for (rel, body) in &files {
         let lower = rel.to_ascii_lowercase();
         if lower.split('/').next_back().is_some_and(|f| f.starts_with("readme")) {
@@ -814,6 +824,49 @@ async fn download_capped(client: &reqwest::Client, url: &str) -> Result<bytes::B
         return Err(anyhow!("artifact is {} bytes, over the cap", bytes.len()));
     }
     Ok(bytes)
+}
+
+/// 抽取顺序的优先级（越小越先抽）。
+///
+/// # 为什么必须排序
+///
+/// 每包有条目上限（防一个巨型 SDK 灌满整张表），而抽取是按 tar 里的文件顺序走的——
+/// 于是**上限被排在前面的文件吃光，真正的主 API 根本轮不到**。
+///
+/// 实测 pandas：382 条全是 `_libs/tslibs/*.pyi` 里的底层helper
+/// （abbrev_to_npy_unit、periods_per_second…），而 `DataFrame` 一条都没有。
+/// 「包在库里、但它最核心的 API 查不到」比没收录更糟——查的人会以为这个库收全了。
+///
+/// 判据只用路径形状，不猜语义：
+///   · 入口文件最优先（index.d.ts / lib.rs / __init__.py / main）；
+///   · 层级越浅越靠前（公开 API 通常在浅层，内部实现在深层）；
+///   · 下划线开头的目录段、internal/、vendor/ 往后压——各语言都用这个约定表示「内部」。
+fn file_priority(rel: &str) -> i32 {
+    let lower = rel.to_ascii_lowercase();
+    let file = lower.rsplit('/').next().unwrap_or(&lower);
+    let mut score = 0i32;
+
+    // README 先抽：包级说明是最便宜的上下文。
+    if file.starts_with("readme") {
+        return -100;
+    }
+    // 入口文件：一个包的公开面基本都从这儿开始。
+    if matches!(file, "index.d.ts" | "lib.rs" | "__init__.py" | "__init__.pyi" | "main.rs" | "mod.rs")
+    {
+        score -= 40;
+    }
+    // 层级：每深一层退一点。公开 API 在浅层是三个生态共同的惯例。
+    score += 6 * lower.matches('/').count() as i32;
+    // 内部/私有约定：下划线开头的目录段、internal、vendor、dist 里的打包产物。
+    for seg in lower.split('/') {
+        if seg.starts_with('_') && seg != "__init__.py" && seg != "__init__.pyi" {
+            score += 60;
+        }
+        if seg == "internal" || seg == "vendor" || seg == "_vendor" || seg == "priv" {
+            score += 60;
+        }
+    }
+    score
 }
 
 /// 这个文件对该生态有没有抽取价值。
@@ -1013,52 +1066,6 @@ async fn discover_popular(client: &reqwest::Client, per_term: usize) -> Vec<Stri
             "code corpus: npm discovery was rate-limited on some seed terms; coverage is short by that much");
     }
     names.into_iter().collect()
-}
-
-/// 这个包最近抓过吗（不管成功失败）。抓过就跳过——预热要能中断、能重跑，
-/// 而不是每次从头再来一遍。
-async fn recently_attempted(db: &sqlx::PgPool, name: &str) -> bool {
-    sqlx::query_scalar::<_, i64>(
-        "SELECT count(*) FROM code_corpus_fetches \
-          WHERE ecosystem = 'npm' AND name = $1 AND fetched_at > now() - interval '30 days'",
-    )
-    .bind(name)
-    .fetch_one(db)
-    .await
-    .map(|n| n > 0)
-    .unwrap_or(false)
-}
-
-/// 批量预热：发现常用包 → 逐个抽取入库。
-///
-/// **串行 + 间隔**是刻意的：并发拉 npm 只会更快撞上限流，而这活本来就该慢慢跑在后台。
-/// 已经抓过的直接跳过，所以中断之后重跑会接着上次的进度走。
-pub async fn seed(db: sqlx::PgPool, per_term: usize, max_packages: usize) -> Result<()> {
-    let client = http()?;
-    let names = discover_popular(&client, per_term).await;
-    tracing::info!(discovered = names.len(), "code corpus: seeding started");
-    let mut done = 0usize;
-    let mut failed = 0usize;
-    for name in names.into_iter().take(max_packages) {
-        if recently_attempted(&db, &name).await {
-            continue;
-        }
-        match ingest_npm(&db, &name, None).await {
-            Ok(r) => {
-                done += 1;
-                if done % 50 == 0 {
-                    tracing::info!(done, failed, last = %r.name, "code corpus: seeding progress");
-                }
-            }
-            Err(e) => {
-                failed += 1;
-                record_failure(&db, &name, "", &e.to_string()).await;
-            }
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-    }
-    tracing::info!(done, failed, "code corpus: seeding finished");
-    Ok(())
 }
 
 /// 文档仓库的下载超时。
@@ -1715,6 +1722,45 @@ declare function notExported(): void;
         // 而它们随即进台账吃 30 天冷却——一次限流换来一个月的覆盖缺口。
         assert_eq!(prod.matches("get_json_retry(client, &url)").count(), 5,
             "三个生态的元数据抓取 + npm/crates 两处发现，五处都要带退避重试");
+    }
+
+    #[test]
+    fn the_public_api_is_extracted_before_internal_helpers() {
+        // 实测事故：pandas 收了 382 条，全是 _libs/tslibs/*.pyi 里的底层 helper，
+        // 而 DataFrame 一条都没有——每包条目上限被 tar 里排在前面的内部存根吃光了。
+        // 「包在库里、但最核心的 API 查不到」比没收录更糟：查的人会以为它收全了。
+        let mut files = vec![
+            "pandas/_libs/tslibs/timedeltas.pyi",
+            "pandas/core/frame.py",
+            "pandas/__init__.py",
+            "README.md",
+            "pandas/core/internals/blocks.py",
+        ];
+        files.sort_by_key(|f| file_priority(f));
+        assert_eq!(files[0], "README.md", "包级说明最先");
+        assert_eq!(files[1], "pandas/__init__.py", "入口文件排在实现之前");
+        assert!(
+            files.iter().position(|f| *f == "pandas/core/frame.py").unwrap()
+                < files.iter().position(|f| f.contains("_libs")).unwrap(),
+            "公开 API 必须排在下划线内部目录之前：{files:?}"
+        );
+        assert!(
+            files.iter().position(|f| *f == "pandas/core/frame.py").unwrap()
+                < files.iter().position(|f| f.contains("internals")).unwrap(),
+            "internal/ 段要往后压：{files:?}"
+        );
+
+        // 三个生态的入口文件都要享受同一条优先级。
+        for entry in ["index.d.ts", "lib.rs", "__init__.py"] {
+            assert!(file_priority(entry) < file_priority("a/b/c/deep.rs"),
+                "{entry} 应当优先于深层文件");
+        }
+
+        // 三条抽取路径都要先排序再抽，漏一条就会以完全一样的方式静默抽错东西。
+        let src = include_str!("code_corpus.rs");
+        let prod = &src[..src.find("mod tests").expect("tests module")];
+        assert_eq!(prod.matches("files.sort_by_key(|(rel, _)| file_priority(rel));").count(), 2,
+            "包的两条抽取路径（npm / pypi+crates）都要先排序");
     }
 
     #[test]

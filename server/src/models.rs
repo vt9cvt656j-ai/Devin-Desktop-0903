@@ -4609,7 +4609,7 @@ pub async fn code_corpus_search(
             .and_then(|v| v.as_str())
             .and_then(crate::code_corpus::Eco::parse)
             .unwrap_or(crate::code_corpus::Eco::Npm);
-        if !crate::code_corpus::have_package(&state.db, pkg).await {
+        if !crate::code_corpus::have_package(&state.db, eco, pkg).await {
             match crate::code_corpus::ingest(&state.db, eco, pkg, None).await {
                 Ok(report) => {
                     tracing::info!(
@@ -4642,7 +4642,8 @@ pub async fn code_corpus_search(
 /// 让常用库开箱即有。跑在后台任务里立刻返回：一次预热是几十分钟量级的活，
 /// 不该占着一个 HTTP 连接，更不该被网关的响应超时掐断。
 ///
-/// 可重入：已经抓过的包会跳过（见 recently_attempted），中断之后重跑接着上次走。
+/// 可重入：已经抓过的包会跳过（见 recently_attempted_eco），中断之后重跑接着上次走。
+/// 走的是和开机自启同一个 seed_all——三个生态一起，别再留一个只跑 npm 的旁支。
 pub async fn code_corpus_seed(
     State(state): State<AppState>,
     claims: crate::auth::Claims,
@@ -4657,7 +4658,7 @@ pub async fn code_corpus_seed(
     let max_packages = body.get("max").and_then(|v| v.as_u64()).unwrap_or(2000) as usize;
     let db = state.db.clone();
     tokio::spawn(async move {
-        if let Err(err) = crate::code_corpus::seed(db, per_term.min(2000), max_packages.min(20000)).await {
+        if let Err(err) = crate::code_corpus::seed_all(db, per_term.min(2000), max_packages.min(20000)).await {
             tracing::warn!(%err, "code corpus: seeding failed");
         }
     });
