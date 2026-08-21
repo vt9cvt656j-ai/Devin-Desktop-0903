@@ -32102,3 +32102,60 @@ test("Windows 上不许往终端写 python3（那不是一个命令）", () => {
   const tryAt = SRC.indexOf("try {", at);
   assert.ok(tryAt > at, "_py 应该声明在它所在的 try 之前，否则 catch 分支会 ReferenceError");
 });
+
+test("「已后台化」要按真实 shell 判，不按操作系统", () => {
+  // 装了 Git for Windows 的机器上 run_cmd 跑的是 bash——那里 `&` 确实后台化。
+  // 而在 cmd.exe 下 `&` 是**命令分隔符**：`npm run dev &` 会在前台起 npm，
+  // 永远不返回。按操作系统判的话，长命令拦截门被一个假的"已后台化"整个绕开，
+  // 命令挂死，回执还说"已在后台启动"。
+  //
+  // 反过来也一样：cmd 才用 `start "" /b`，bash 上那条既不后台化也写不出文件。
+  const at = SRC.indexOf("const backgrounded =");
+  assert.ok(at > 0, "找不到后台化判定");
+  const block = SRC.slice(at, at + 400);
+  assert.match(block, /_posixShell\s*&&/, "nohup / 尾随 & 没有被限定在 POSIX shell 下");
+  assert.ok(
+    SRC.includes('const _posixShell = _shKind !== "cmd"'),
+    "后台化判定应该问 _shellKind()，而不是 _detectOS()",
+  );
+
+  // 补救语必须跟同一个判据走，否则两处会互相打架。
+  assert.ok(
+    SRC.includes('stderr: !_posixShell'),
+    "长命令被拒后的补救语还在按操作系统分支——bash 机器会被教去写 start \"\" /b",
+  );
+
+  // 反向：cmd 专属的 `start … /b` 不该被限定在 POSIX 下（它本来就是 cmd 的写法）。
+  const startForm = block.slice(block.indexOf("||"));
+  assert.ok(
+    /start/.test(startForm) && !/_posixShell/.test(startForm),
+    "`start … /b` 这条被错误地也限定进 POSIX 分支了",
+  );
+});
+
+test("ui_extract 不许把 read_screen 的限制说明丢掉", () => {
+  // read_screen 的回执里不只有 elements：limitations 装着"这次读取为什么没完成"
+  // （超时 / 起不来 / 输出不是 JSON）、缺哪个权限、这个平台有没有 OCR。
+  // ui_extract 原来只取 .elements，于是一次 UIA 超时会被它改写成
+  // 「这个应用就是不暴露辅助功能树」——一句结论性的假话，模型据此放弃整条路线。
+  const at = SRC.indexOf('backend.invoke("read_screen", { ocr: false })');
+  assert.ok(at > 0, "找不到 ui_extract 的 read_screen 调用");
+  const block = SRC.slice(at - 400, at + 2600);
+  assert.match(block, /_uxLimits\s*=\s*Array\.isArray/, "没有接住 limitations");
+
+  // 空结果那条必须把成因转给模型，而不是无条件断言"这个应用不暴露"。
+  assert.ok(
+    !SRC.includes("[ERROR] 前台应用没有暴露任何辅助功能元素。有些应用"),
+    "空结果仍在无条件断言成「这个应用不暴露」",
+  );
+  assert.ok(
+    SRC.includes("如果上面说的是「读取没完成」"),
+    "空结果没有区分「读取没完成」和「应用真的不暴露」",
+  );
+
+  // 有元素时也要带上——最常见的一条是"这只是当前可见区域"。
+  assert.ok(SRC.includes("${_uxNote}"), "成功回执没有把 limitations 拼进去");
+
+  // 参数说明不该写死 Mac：Windows 上这条走 UI Automation，一样能用。
+  assert.ok(!SRC.includes("on this Mac"), "ui_extract 的参数说明仍写死「on this Mac」");
+});
