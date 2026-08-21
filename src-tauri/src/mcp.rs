@@ -1193,16 +1193,17 @@ fn spawn_session(
     // or `uvx` would fail to spawn ("启动 MCP 服务失败（npx）"). Resolve the launcher against the
     // augmented PATH and hand the subprocess that PATH too, so a resolved `npx` can still find `node`
     // and the server package it launches. Same fix as LSP/debug/tasks/terminal.
-    #[cfg(not(windows))]
+    // 两个 cfg 排除以前把 Windows 挡在外面，而 resolve_command 本来就有 Windows 分支
+    // （走 PATHEXT 候选名解析）。不用它的后果是整条 MCP 在 Windows 上起不来：
+    // CreateProcessW 只补 .exe、不查 PATHEXT，而 npm 装出来的是 npx.cmd —— 裸名字
+    // 恰恰是 npm 系工具唯一找不到的那个形态（process_util 里那段注释自己写着）。
+    // augmented_path 同理：解析出来的 npx 还得能找到 node 和它要起的那个包。
     let resolved = crate::process_util::resolve_command(command, ws);
-    #[cfg(windows)]
-    let resolved = command.to_string();
     let mut cmd = crate::process_util::command(&resolved);
     cmd.args(args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    #[cfg(not(windows))]
     cmd.env("PATH", crate::process_util::augmented_path(ws));
     for (k, v) in env {
         cmd.env(k, v); // user-provided env (API keys, or an explicit PATH override) wins

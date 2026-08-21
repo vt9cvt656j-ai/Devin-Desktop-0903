@@ -502,6 +502,20 @@ async fn tor_port_up() -> bool {
 /// binary in the background and wait for it to bootstrap — so the deep-web tools "just
 /// work" and self-heal instead of silently returning nothing whenever Tor is stopped.
 /// (This is the fix for "不知道深网工具有没有用" — it can no longer be silently dead.)
+/// 「怎么把 tor 跑起来」——按平台给。
+///
+/// 同一个函数的「未安装」分支早就按平台分了（Windows 给 winget），另外三条失败文案
+/// 却写死 brew。Windows 上模型拿到的补救办法是一条不存在的命令，照着做只会再失败一次。
+fn tor_start_hint() -> &'static str {
+    if cfg!(target_os = "windows") {
+        "在服务里启动 Tor（services.msc 找 Tor），或直接运行 tor.exe"
+    } else if cfg!(target_os = "macos") {
+        "brew services start tor"
+    } else {
+        "sudo systemctl start tor（或直接运行 tor）"
+    }
+}
+
 pub async fn ensure_tor() -> Result<(), String> {
     if tor_port_up().await {
         return Ok(());
@@ -547,8 +561,7 @@ pub async fn ensure_tor() -> Result<(), String> {
         }
     }
     Err(
-        "tor 已拉起但 30s 内未就绪（网络慢/被墙？）——稍等片刻再试，或手动 brew services start tor"
-            .into(),
+        format!("tor 已拉起但 30s 内未就绪（网络慢/被墙？）——稍等片刻再试，或手动启动：{}", tor_start_hint()),
     )
 }
 
@@ -585,7 +598,7 @@ pub async fn tor_request(
         .timeout(Duration::from_secs(to))
         .build()
         .map_err(|e| {
-            format!("构建 Tor 客户端失败（tor 是否在运行？brew services start tor）: {e}")
+            format!("构建 Tor 客户端失败（tor 是否在运行？{}）: {e}", tor_start_hint())
         })?;
 
     let mut req = client.request(method, parsed).header(
@@ -603,7 +616,7 @@ pub async fn tor_request(
 
     let resp = req.send().await.map_err(|e| {
         if e.is_connect() {
-            format!("Tor 连接失败——确认 tor 在运行：brew services start tor（原始错误: {e}）")
+            format!("Tor 连接失败——确认 tor 在运行：{}（原始错误: {e}）", tor_start_hint())
         } else {
             e.to_string()
         }

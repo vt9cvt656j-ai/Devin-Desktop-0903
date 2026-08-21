@@ -26,6 +26,9 @@ const IGNORED_WATCH_DIRS: &[&str] = &[
     "vendor",
     ".gradle",
     ".idea",
+    // Visual Studio 的工程缓存，几百 MB 二进制中间产物。和 .idea/.vscode 同类，
+    // 但只有 Windows 上会出现，所以四份名单里都漏了它。
+    ".vs",
     "Pods",
     "DerivedData",
 ];

@@ -270,9 +270,16 @@ pub struct ProxyStatus {
 }
 
 fn ca_cert_path() -> Option<String> {
-    let home = std::env::var("HOME").ok()?;
-    let p = format!("{home}/.mitmproxy/mitmproxy-ca-cert.pem");
-    Some(p)
+    // 只读 HOME 的话，Windows 上这里恒为 None——而 mitmproxy 在 Windows 上确实
+    // 把证书放在 %USERPROFILE%\.mitmproxy\ 下。拿不到具体路径，抓 HTTPS 时
+    // 就没法告诉用户"去装哪个文件"，只能给一句泛泛的"要装证书"。
+    let home = std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .ok()?;
+    let mut p = std::path::PathBuf::from(home);
+    p.push(".mitmproxy");
+    p.push("mitmproxy-ca-cert.pem");
+    Some(p.to_string_lossy().into_owned())
 }
 
 /// Is mitmdump installed / resolvable?

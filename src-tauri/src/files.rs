@@ -49,6 +49,10 @@ const IGNORED_DOT_DIRS: &[&str] = &[
     ".gradle",
     ".idea",
     ".vscode",
+    // Visual Studio 的工程缓存目录，几百 MB 全是二进制中间产物。
+    // 名单里有 .idea/.vscode 却独独漏了它 —— 于是 Windows 上用 VS 的仓库，
+    // 索引和搜索会被这一堆东西灌满，真代码被挤出结果。
+    ".vs",
     ".cache",
     ".turbo",
     ".vite",
@@ -561,9 +565,23 @@ const SAFE_PREFIXES: &[&str] = &[
 ];
 
 fn has_safe_prefix(path: &Path) -> bool {
-    SAFE_PREFIXES
+    if SAFE_PREFIXES
         .iter()
         .any(|prefix| starts_with_prefix(path, prefix))
+    {
+        return true;
+    }
+    // SAFE_PREFIXES 是四条 POSIX 字面量，Windows 上一条都不可能命中——那儿的临时目录是
+    // `%LOCALAPPDATA%\Temp`。平时看不出来（Windows 的黑名单里恰好没有它的父目录），
+    // 但只要用户把 TEMP 指到一个被挡的树下（受管电脑上常见），写入就会被拒，
+    // 而拒绝信息还在说「临时目录仍然可用」——一句当场就不成立的话。
+    //
+    // 判据换成**系统真实的临时目录**，不再靠猜它在哪儿：三个平台都自动对。
+    let tmp = std::env::temp_dir();
+    if tmp.as_os_str().is_empty() {
+        return false;
+    }
+    starts_with_prefix(path, &tmp.to_string_lossy())
 }
 
 fn is_within_allowed_root(path: &Path, roots: &[PathBuf]) -> bool {
@@ -899,7 +917,25 @@ fn friendly_write_error(op: &str, path: &str, e: &std::io::Error) -> String {
             format!("{}失败：路径中间有一段不是目录：{}", op, path)
         }
         std::io::ErrorKind::DirectoryNotEmpty => format!("{}失败：目录不为空：{}", op, path),
-        kind => format!("{}失败：{}（{}）", op, path, kind),
+        // 兜底分支打的是 e.kind()（分类名）而不是 e 本身。Windows 上**最常见**的写失败
+        // ——文件被别的程序占着（ERROR_SHARING_VIOLATION 32 / ERROR_LOCK_VIOLATION 33）
+        // ——在 std 里映射成 Uncategorized，于是模型看到的是一句
+        // 「写入失败：a.txt（uncategorized）」：没有原因，也没有下一步。
+        // 打 e 本身才会带上系统那句「另一个程序正在使用此文件」和错误号。
+        kind => {
+            let raw = e.to_string();
+            let locked = cfg!(windows)
+                && matches!(e.raw_os_error(), Some(32) | Some(33));
+            if locked {
+                format!(
+                    "{}失败：{} 正被另一个程序占用（{}）。Windows 的文件锁是强制的——\
+先关掉占着它的程序（编辑器、预览、杀毒扫描、还在跑的进程），或者换个文件名写。",
+                    op, path, raw
+                )
+            } else {
+                format!("{}失败：{}（{}）", op, path, raw)
+            }
+        }
     }
 }
 
@@ -2886,6 +2922,43 @@ mod tests {
     /// 里的 `Prefix::Disk` 不相等 —— 一条都匹配不上，`C:\Windows` 能被登记成工作区根，
     /// 界面上和日志里都没有任何异样。这段逻辑只在 Windows 生效但**不带 cfg**，
     /// 所以 macOS 上照样编译、照样跑得到。
+    /// 临时目录豁免必须按**系统真实的**临时目录判，不是四条 POSIX 字面量。
+    ///
+    /// 原来只有 /tmp、/private/tmp、/var/folders、/private/var/folders 四条，
+    /// Windows 上一条都不可能命中（那儿是 %LOCALAPPDATA%\Temp）。平时看不出来，
+    /// 但用户把 TEMP 指到受管目录下时写入会被拒，而拒绝信息还说"临时目录仍然可用"。
+    #[test]
+    fn the_systems_own_temp_dir_is_always_writable() {
+        let tmp = std::env::temp_dir();
+        assert!(
+            has_safe_prefix(&tmp),
+            "系统临时目录 {} 没有被豁免",
+            tmp.display()
+        );
+        assert!(
+            has_safe_prefix(&tmp.join("mrdayone-probe").join("a.txt")),
+            "临时目录下的子路径没有被豁免"
+        );
+        // 反向：普通目录不该因为这条变成"安全"。
+        assert!(
+            !has_safe_prefix(std::path::Path::new("/definitely/not/temp/x")),
+            "豁免放得太宽了"
+        );
+    }
+
+    /// .vs 是 Visual Studio 的工程缓存，只在 Windows 上出现——四份忽略名单
+    /// 都收了 .idea/.vscode，独独漏了它，于是 Windows 上用 VS 的仓库，
+    /// 索引会被几百 MB 二进制中间产物灌满。
+    #[test]
+    fn visual_studio_cache_is_ignored_like_its_siblings() {
+        for name in [".idea", ".vscode", ".vs"] {
+            assert!(
+                IGNORED_DOT_DIRS.contains(&name),
+                "忽略名单里少了 {name}"
+            );
+        }
+    }
+
     #[test]
     fn windows_prefix_match_handles_verbatim_and_case() {
         // verbatim 前缀要被剥掉

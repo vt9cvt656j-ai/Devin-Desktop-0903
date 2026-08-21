@@ -140,21 +140,48 @@ fn candidate_paths(id: &str) -> Vec<String> {
     }
     #[cfg(target_os = "windows")]
     {
-        match id {
-            "chrome" => vec![
-                r"C:\Program Files\Google\Chrome\Application\chrome.exe".into(),
-                r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe".into(),
-            ],
-            "edge" => vec![
-                r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe".into(),
-                r"C:\Program Files\Microsoft\Edge\Application\msedge.exe".into(),
-            ],
-            "brave" => vec![
-                r"C:\Program Files\BraveSoftware\Brave-Browser\Application\brave.exe".into(),
-            ],
-            "chromium" => Vec::new(),
-            _ => Vec::new(),
-        }
+        // 只列 Program Files 是不够的。Chrome 和 Edge 的安装器在**非管理员**账户下
+        // 默认装到 %LOCALAPPDATA%，而那恰恰是公司电脑上最常见的一种装法——于是
+        // "你指定的浏览器没装"这句话对一个装着 Chrome 的机器说了出来，
+        // 用户去装第二遍还是装到同一个地方，怎么试都不对。
+        //
+        // chromium 那项更直接：候选表是空的，永远解析不到，而找不到时的提示
+        // 又叫用户"去装 Chromium"——装完照样找不到。
+        let local = std::env::var("LOCALAPPDATA").ok();
+        let under_local = |rel: &str| -> Option<String> {
+            local.as_ref().map(|l| format!(r"{l}\{rel}"))
+        };
+        let (fixed, user): (&[&str], &[&str]) = match id {
+            "chrome" => (
+                &[
+                    r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+                    r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+                ],
+                &[r"Google\Chrome\Application\chrome.exe"],
+            ),
+            "edge" => (
+                &[
+                    r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
+                    r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
+                ],
+                &[r"Microsoft\Edge\Application\msedge.exe"],
+            ),
+            "brave" => (
+                &[
+                    r"C:\Program Files\BraveSoftware\Brave-Browser\Application\brave.exe",
+                    r"C:\Program Files (x86)\BraveSoftware\Brave-Browser\Application\brave.exe",
+                ],
+                &[r"BraveSoftware\Brave-Browser\Application\brave.exe"],
+            ),
+            "chromium" => (
+                &[r"C:\Program Files\Chromium\Application\chrome.exe"],
+                &[r"Chromium\Application\chrome.exe", r"Chromium\chrome.exe"],
+            ),
+            _ => (&[], &[]),
+        };
+        let mut out: Vec<String> = fixed.iter().map(|s| (*s).to_string()).collect();
+        out.extend(user.iter().filter_map(|rel| under_local(rel)));
+        out
     }
     #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
     {
