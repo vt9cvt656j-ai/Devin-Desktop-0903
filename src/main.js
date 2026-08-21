@@ -34614,7 +34614,13 @@ function _mapToolCall(name, args, mcpToolMap = _mcpToolMap) {
       return { type: "cmd", command: _cmd };
     }
     case "create_project": return { type: "createproject", path: String(args.name || ""), name: String(args.name || "") };
-    case "update_plan": return { type: "plan", steps: _normPlanSteps(args.steps || args.plan || args.todos) };
+    case "update_plan": {
+      // 容器字段名同理：steps/plan/todos 之外，tasks/items/checklist 也都收。
+      const _raw = args.steps || args.plan || args.todos || args.tasks || args.items || args.checklist;
+      // 原始条数要留着：归一化之后为空时，回执得能分清「你交了 5 步但没解析出来」
+      // 和「你确实交了 0 步」——这两件事对模型的下一步完全不同。
+      return { type: "plan", steps: _normPlanSteps(_raw), rawSteps: Array.isArray(_raw) ? _raw.length : 0 };
+    }
     case "think": return { type: "think", content: args.thought || args.thoughts || "" };
     case "schedule": return { type: "schedule", action: String(args.action || "list").toLowerCase(), prompt: String(args.prompt || args.task || ""), at: String(args.at || args.time || ""), everyMinutes: Number.isFinite(+args.every_minutes) ? +args.every_minutes : 0, id: Number.isFinite(+args.id) ? +args.id : 0 };
     case "ask_user": return { type: "askuser", question: args.question || args.q || args.prompt || args.text || "", options: Array.isArray(args.options) ? args.options : (Array.isArray(args.choices) ? args.choices : (Array.isArray(args.buttons) ? args.buttons : [])), recommended: Number.isFinite(+args.recommended) ? +args.recommended : -1, multiSelect: !!args.multi_select, confirmText: String(args.confirm_text || "") };
@@ -35096,6 +35102,29 @@ function _invalidToolRepairInstruction(attempts, recoveryCalls = [], registry = 
 /** 计划步骤的四种性质。模型在 update_plan 里逐步声明，猜测只是老计划的兜底。 */
 const _PLAN_STEP_KINDS = new Set(["investigate", "implement", "execute", "verify"]);
 
+/// 从一个步骤对象里取出它的文字。
+///
+/// 先按常见字段名找，找不到就退到「对象里第一个非空字符串值」——模型用什么词
+/// 命名这个字段都不该让整份计划作废。status/kind 这些结构字段要排除掉，
+/// 否则会把 "pending" 当成步骤内容。
+const _PLAN_STEP_TEXT_KEYS = [
+  "content", "step", "text", "title", "name", "task", "description",
+  "label", "todo", "item", "summary", "goal", "action",
+];
+const _PLAN_STEP_META_KEYS = new Set(["status", "kind", "id", "index", "state", "type", "done"]);
+function _planStepText(s) {
+  if (!s || typeof s !== "object") return "";
+  for (const k of _PLAN_STEP_TEXT_KEYS) {
+    const v = s[k];
+    if (typeof v === "string" && v.trim()) return v.trim();
+  }
+  for (const [k, v] of Object.entries(s)) {
+    if (_PLAN_STEP_META_KEYS.has(k)) continue;
+    if (typeof v === "string" && v.trim()) return v.trim();
+  }
+  return "";
+}
+
 function _normPlanSteps(steps) {
   if (!Array.isArray(steps)) return [];
   const normStatus = (st) => {
@@ -35109,7 +35138,17 @@ function _normPlanSteps(steps) {
     .map((s) => typeof s === "string"
       ? { content: s, status: "pending" }
       : {
-        content: s.content || s.step || s.text || s.title || "",
+        // 步骤文字的字段名：模型给什么名字都收。
+        //
+        // 原来只认 content/step/text/title 四个。差一个名字（name / task /
+        // description / label / todo / item / summary…）→ content 为空 → 被下面的
+        // filter 丢掉 → **整份计划变成 0 步**。而回执照样说「计划已更新：共 0 步」，
+        // 看着像成功；0 步又让计划门认为"还没有计划"，继续催它去 update_plan，
+        // 于是它把同样形状再发一遍——开局连发 4~5 次的环就是这么成的。
+        //
+        // 意图在这里是**毫无歧义**的：模型交上来一串步骤。为一个字段名把整件事丢掉，
+        // 是这套工具最贵的一种苛刻。列表之外再兜一层：对象里第一个像样的字符串值就用它。
+        content: _planStepText(s),
         status: normStatus(s.status),
         // 模型自己声明这一步是什么性质。以前只能靠动词表去猜措辞，而猜错是有代价的：
         // 猜不出来就不打勾（对的），但猜错了类别就会被错误的证据勾掉。声明是模型
@@ -35120,7 +35159,17 @@ function _normPlanSteps(steps) {
 }
 
 /** Short textual confirmation of a plan update, fed back to the model. */
-function _planSummary(steps) {
+function _planSummary(steps, rawCount = null) {
+  // 交上来有内容、归一化之后一步不剩 —— 这不是「更新成 0 步」，是**没解析出来**。
+  //
+  // 原来这里照说「计划已更新：共 0 步」，读起来像成功；而 0 步又让计划门认为
+  // 「还没有计划」，继续催模型去 update_plan。两条出路都指回同一个工具，成环。
+  // 现在如实说，并且把它能用的字段名直接列出来——模型下一次就对了，不用猜。
+  if (!steps.length && rawCount) {
+    return "⚠️ 计划没有更新：你交了 " + rawCount + " 步，但一步都没解析出来（每一步都取不到文字）。"
+      + "每一步要么是一个字符串，要么是带文字字段的对象（content / step / text / title / name / task / description 都收）。"
+      + "**别原样重发**——换成上面这个形状再发一次。";
+  }
   const total = steps.length;
   const done = steps.filter((s) => s.status === "completed").length;
   const canc = steps.filter((s) => s.status === "cancelled");
@@ -50503,7 +50552,15 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
         //
         // A reviewer whose only possible verdict is "add more" is not quality control, it is a
         // ratchet. The plan belongs to the agent doing the task.
-        toolMsgs[i] = { role: "tool", tool_call_id: it.tc.id, content: _planSummary(planSteps)
+        // 计划收下之后必须明说「去做第一步」。不说的话模型手上只有一句「计划已更新」，
+        // 而它刚被要求先规划——最省事的下一步就是再规划一次。真实执行记录里
+        // 开局连发 4~5 次 update_plan 的轮次，65% 没跑成。
+        const _firstOpen = planSteps.find((x) => x && x.status !== "completed" && x.status !== "cancelled");
+        const _goDo = planSteps.length && !completionIssue
+          ? `\n计划已收下，**现在去做第一步**${_firstOpen ? `：${_firstOpen.content}` : ""}。别再调 update_plan——只有在某一步真的做完、或路线要改时才更新它。`
+          : "";
+        toolMsgs[i] = { role: "tool", tool_call_id: it.tc.id, content: _planSummary(planSteps, it.call.rawSteps)
+          + _goDo
           + (completionIssue ? `\n[PLAN_NEEDS_EVIDENCE] ${completionIssue}；completed 已退回 pending，取得真实证据后再更新。` : "") };
       }
 

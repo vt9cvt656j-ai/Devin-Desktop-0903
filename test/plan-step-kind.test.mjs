@@ -29,14 +29,36 @@ function extractFn(name) {
   return SRC.slice(i, j + 1);
 }
 
+/// 取一条 const 声明的原文（到匹配的收尾括号为止）。
+/// 和 extractFn 同一条原则：跑真源码，不在测试里另写一份会漂的字面量。
+function extractConstDecl(name) {
+  const i = SRC.indexOf(`const ${name} = `);
+  assert.ok(i >= 0, `main.js 里找不到 const ${name}`);
+  let j = SRC.indexOf("=", i) + 1, depth = 0;
+  for (; j < SRC.length; j++) {
+    const c = SRC[j];
+    if (c === "(" || c === "[" || c === "{") depth++;
+    else if (c === ")" || c === "]" || c === "}") depth--;
+    else if (c === ";" && depth <= 0) break;
+  }
+  return SRC.slice(i, j + 1);
+}
+
 const KINDS = new Set(["investigate", "implement", "execute", "verify"]);
 const kindOf = new Function(
   "_PLAN_STEP_KINDS",
   `${extractFn("_planStepActionKind")}\n;return _planStepActionKind;`,
 )(KINDS);
+// _normPlanSteps 取步骤文字时走 _planStepText（它带两张常量表）。少注入一个，
+// 归一化会当场抛 ReferenceError —— 而那正是「模型照 schema 填的参数让这一步崩掉」。
 const norm = new Function(
   "_PLAN_STEP_KINDS",
-  `${extractFn("_normPlanSteps")}\n;return _normPlanSteps;`,
+  [
+    extractConstDecl("_PLAN_STEP_TEXT_KEYS"),
+    extractConstDecl("_PLAN_STEP_META_KEYS"),
+    extractFn("_planStepText"),
+    extractFn("_normPlanSteps"),
+  ].join("\n") + "\n;return _normPlanSteps;",
 )(KINDS);
 
 test("模型声明了 kind 就用声明的，不再去猜措辞", () => {

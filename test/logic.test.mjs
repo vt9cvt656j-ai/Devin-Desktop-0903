@@ -32276,3 +32276,48 @@ test("失败摘要要记失败原因，不能记成文件内容", () => {
   assert.ok(brief("x", {}).startsWith("x"));
   assert.ok(brief("", null).length >= 0);
 });
+
+test("update_plan：字段名换一个不许把整份计划丢掉", () => {
+  // 真实执行记录里开局连发 4~5 次 update_plan 的轮次，65% 没跑成。机制是：
+  // 步骤文字只认 content/step/text/title 四个名字，差一个 → 内容为空 → 被 filter
+  // 丢掉 → 整份计划变 0 步 → 回执还说「计划已更新：共 0 步」→ 0 步让计划门认为
+  // 「还没有计划」，继续催它去 update_plan → 它把同样形状再发一遍。成环。
+  const text = new Function(
+    `${extractConstDecl("_PLAN_STEP_TEXT_KEYS")}\n${extractConstDecl("_PLAN_STEP_META_KEYS")}\n${extractFn("_planStepText")}\nreturn _planStepText;`)();
+
+  // 常见的六种命名，全都要能取出文字。
+  for (const key of ["content", "step", "text", "title", "name", "task", "description"]) {
+    assert.equal(text({ [key]: "做第一步", status: "pending" }), "做第一步", `字段名 ${key} 取不到文字`);
+  }
+  // 没列进名单的名字，也要靠「第一个非空字符串」兜住。
+  assert.equal(text({ 步骤: "写首页", status: "pending" }), "写首页", "兜底没生效：没列名的字段整步被丢");
+  // 但结构字段不许被当成步骤内容。
+  assert.equal(text({ status: "pending", kind: "write" }), "", "把 status/kind 当成步骤内容了");
+});
+
+test("update_plan：解析不出来时不许回「计划已更新」", () => {
+  const summary = new Function("steps", "rawCount",
+    `${extractFn("_planSummary")}\nreturn _planSummary(steps, rawCount);`);
+  // 交了 5 步、一步没解析出来 —— 必须说清楚，并且明说别原样重发。
+  const bad = summary([], 5);
+  assert.ok(!bad.includes("计划已更新"), `解析失败却回了「计划已更新」：${bad}`);
+  assert.ok(bad.includes("没有更新"), "没说清计划其实没更新");
+  assert.ok(bad.includes("别原样重发"), "没拦住原样重发 —— 这正是死循环那一环");
+  assert.ok(/content|step|text/.test(bad), "没告诉模型该用什么字段名");
+  // 真的交 0 步是另一回事，不该走这条。
+  assert.ok(summary([], 0).includes("计划已更新"), "真的 0 步被误判成解析失败");
+  // 正常情况照旧。
+  assert.ok(summary([{ content: "a", status: "pending" }], 1).includes("共 1 步"));
+});
+
+test("计划收下之后要明说「去做第一步」", () => {
+  // 不说的话模型手上只有一句「计划已更新」，而它刚被要求先规划 ——
+  // 最省事的下一步就是再规划一次。
+  const at = SRC.indexOf("const _goDo = planSteps.length");
+  assert.ok(at > 0, "没有「去做第一步」这段");
+  const seg = SRC.slice(at, at + 400);
+  assert.match(seg, /现在去做第一步/, "没催它去执行");
+  assert.match(seg, /别再调 update_plan/, "没拦住再规划一次");
+  // 计划有问题时不该催它去做（那时该先补证据）。
+  assert.match(seg, /!completionIssue/, "证据不足时也在催它往下做");
+});
