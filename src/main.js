@@ -57326,10 +57326,22 @@ async function _executeToolStepInner(step, call, root, run) {
           // 抬头点名分支：并行开着别人分支的仓库里，「最近的提交」不写清是谁的就没有意义。
           const entries = await backend.invoke("git_log", { root: gitExecRoot, count: n }) || [];
           const lines = entries.map(e => `${e.short_hash} ${e.message} — ${e.author}, ${e.date}${(e.refs && e.refs.length) ? " (" + e.refs.join(", ") + ")" : ""}`);
+          // 分支名从**这次结果自己**认，不读那个全局 DOM 节点。
+          //
+          // gitBranchNameEl 是全窗口唯一的一个元素，跟着 rootPath 走；而这里记录的是
+          // gitExecRoot——重定位过、多工作区、子智能体、或 refreshGitStatus 正被
+          // _gitRefreshing 丢弃时，它显示的是**另一个仓库**或切换前的分支名。
+          // 报错分支名比不报更糟：模型会拿它去核对「我是不是在对的线上」。
+          // git log 不带 --all 时第一条的 %D 一定带 `HEAD -> <分支>`（游离时是 `HEAD, …`），
+          // 那是被记录的这个仓库的真分支。
           let _logBranch = "";
-          try { _logBranch = String(gitBranchNameEl?.textContent || "").trim(); } catch {}
-          if (_logBranch === "—") _logBranch = "";
-          const _logHead = `${_logBranch ? `分支 ${_logBranch}` : "当前分支"}的最近 ${entries.length} 条提交`
+          let _logDetached = false;
+          for (const _r of (entries[0]?.refs || [])) {
+            const _m = /HEAD\s*->\s*(.+)$/.exec(String(_r).trim());
+            if (_m) { _logBranch = _m[1].trim(); break; }
+            if (String(_r).trim() === "HEAD") _logDetached = true;
+          }
+          const _logHead = `${_logBranch ? `分支 ${_logBranch}` : (_logDetached ? "游离 HEAD" : "当前分支")}的最近 ${entries.length} 条提交`
             + `（只这一条线，不含其它分支——别的分支上的提交不会出现在这里）：\n`;
           res.className = "atc-result atc-result--ok"; res.textContent = `${entries.length} 条提交`;
           if (vp) vp.innerHTML = `<pre>${_escHtml(lines.join("\n") || "(无提交)")}</pre>`;
