@@ -7118,8 +7118,13 @@ mod tests {
         // 这条对自动化任务同样适用，不是 UI 专属，所以该由核心层承担。
         // 7_000：2026-08-17 晚实测 ~6_826 token。同上，跟着 answer_quality 的新增走。
         // 这条真正的保证是下面那几条"不含 michael-design 各层"，它们仍然成立。
+        //
+        // 7_100：2026-08-20 实测 ~7_023。涨的主要不是措辞，是**多了一个工具**——
+        // schedule（定时任务），它的描述和别的工具一个量级。另有约 46 字节来自
+        // 收尾禁令的改写：用户第二次点名禁掉「验证情况/验证状态」那种结尾，而原来
+        // 那条禁令只堵了词、没堵形状，换个名字照写不误，所以改成按形状禁。
         assert!(
-            automation_tokens < 7_000,
+            automation_tokens < 7_100,
             "automation prompt should not pay the UI tax: ~{automation_tokens} tokens ({} bytes)",
             automation_system.len()
         );
