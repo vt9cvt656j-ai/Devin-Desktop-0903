@@ -31785,3 +31785,45 @@ test("取证门：日志一个字节都没读到时，不许算成运行时证�
   assert.match(exec, /evidence: \{ empty: !!_logsOut\.emptyRead \}/,
     "执行端没把「什么都没读到」作为结构化事实带回结果");
 });
+
+// 工具失败在整个产品里从来没有落过盘：抄本只存对话文本，情景档案只存动词序列
+// （「读取 → 运行 → 写入」）。于是「哪个工具老是撞墙」这个问题**在数据上无法回答**——
+// 用户凭印象、开发者靠猜、模型自己也没法复盘。这一条把失败记进档案。
+test("撞过的墙要落盘：情景档案必须记下哪个工具失败了、失败成什么样", () => {
+  const brief = load("_recFailBrief");
+
+  // 结构化失败码优先——它不随文案漂。
+  assert.match(brief("background_monitor", {
+    failure: { code: "monitor_uncheckable" },
+    content: "[BLOCKED_MONITOR_UNCHECKABLE] check_type 收到的是「等服务起来」",
+  }), /^background_monitor \[monitor_uncheckable\]/);
+
+  // 没有码就取回执开头那个方括号标记 + 首句。
+  const b2 = brief("read_logs", { content: "[终端没匹配上] 没找到 label 匹配「worker」的 IDE 终端。\n下面这些是…" });
+  assert.match(b2, /^read_logs \[终端没匹配上\]/);
+  assert.doesNotMatch(b2, /下面这些是/, "把回执正文也拖进存档了");
+
+  // 外部数据抬头要剥掉，否则每条墙都以同一句开头、没法归类。
+  assert.match(brief("web_fetch", { content: "〔外部数据〕来自 example.com\n[失败] HTTP 403" }),
+    /^web_fetch \[失败\] HTTP 403/);
+
+  // 长度要压住：这是存档，不是日志。
+  assert.ok(brief("x", { content: "[E] " + "很长".repeat(300) }).length <= 160);
+
+  // 接线：记录点要在失败时写 fail，情景组装要把它汇成 walls。
+  // 结束锚点要从起点**往后**找：`const _ok = _toolExecutionSucceeded` 在文件更早处
+  // 也出现过，直接 indexOf 会切出一段倒过来的空串。
+  const recAt = SRC.indexOf("run.recording.push({");
+  const rec = SRC.slice(recAt, SRC.indexOf("const _ok = _toolExecutionSucceeded", recAt));
+  assert.ok(rec.length > 200, "recording 那段切空了");
+  assert.match(rec, /fail: _recFailBrief\(it\.tc\?\.name \|\| t, it\.rawResult\)/,
+    "失败没被记进 recording —— 后面就无从汇总");
+  assert.match(rec, /\.\.\.\(_recOk \? \{\} : \{ fail:/, "成功的步骤不该背一个空 fail 字段");
+
+  const epAt = SRC.indexOf("async function _recordEpisode(");
+  const ep = SRC.slice(epAt, SRC.indexOf("const eps = _epLoad(root);", epAt));
+  assert.ok(ep.length > 200, "_recordEpisode 那段切空了");
+  assert.match(ep, /walls: \[\.\.\.new Set\(steps\.filter\(\(s\) => s && s\.ok === false && s\.fail\)/,
+    "情景档案没有 walls 字段 —— 「哪个工具老撞墙」依旧查不出来");
+  assert.match(ep, /\.slice\(0, 6\)/, "walls 没有上限，一轮里连撞几十次会把存档撑爆");
+});

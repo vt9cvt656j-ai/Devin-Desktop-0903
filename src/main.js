@@ -47097,6 +47097,24 @@ function _projectJournalBlock(root) {
 // 而且 _epLoad 失败只返回空数组，全程一声不响。
 //
 // 整条经验管道（干过的活 → 下次参考）就断在这一个参数上。
+/** 把一次失败的工具回执压成一条可归类的短标记（工具名 + 标记 + 首句）。
+ *
+ * 之所以要有它：工具失败在整个产品里从来没有落过盘。抄本只存对话文本，情景档案
+ * 只存动词序列（「读取 → 运行 → 写入」），`[ERROR]` / `[BLOCKED] `/ `[不可用]`
+ * 这些回执一条都没留下。结果就是「哪个工具老撞墙」这个问题**在数据上无法回答**——
+ * 用户凭印象、开发者靠猜、模型自己也没法复盘。
+ * 只取前 120 字：足够分辨类别，又不会把日志正文拖进存档。
+ */
+function _recFailBrief(name, result) {
+  const text = String(result?.content || "").replace(/^〔外部数据〕[^\n]*\n?/, "").trim();
+  const first = text.split("\n")[0].slice(0, 100);
+  // 结构化失败码优先——它不随文案漂。只有它才另加前缀：
+  // 首句本身通常已经带着 `[失败]` / `[BLOCKED…]` 那个方括号标记，再拼一次就成了
+  // 「web_fetch [失败] [失败] HTTP 403」。
+  const code = String(result?.failure?.code || "").trim();
+  return `${String(name || "?").slice(0, 32)}${code ? ` [${code}]` : ""}${first ? " " + first : ""}`.slice(0, 160);
+}
+
 async function _recordEpisode(run, task, root, outcome, config, session = null) {
   try {
     if (!task || !run || !Array.isArray(run.recording) || run.recording.length < 2) return; // skip trivial
@@ -47107,6 +47125,10 @@ async function _recordEpisode(run, task, root, outcome, config, session = null) 
       id: "ep_" + Math.random().toString(36).slice(2, 9), ts: (new Date()).toISOString().slice(0, 19),
       task: String(task).slice(0, 160), outcome, steps: steps.length, files,
       approach: steps.slice(0, 12).map((s) => s.label).filter(Boolean).join(" → ").slice(0, 280), insight: "",
+      // 这一轮里**撞了哪些墙**。approach 只记动词，成败在那里就丢了——
+      // 于是「哪个工具老是失败」在数据上无从回答。这一条把它补上：
+      // 同一条墙只记一次（同一个工具连撞五次不该占五个位置），最多 6 条。
+      walls: [...new Set(steps.filter((s) => s && s.ok === false && s.fail).map((s) => s.fail))].slice(0, 6),
     };
     const eps = _epLoad(root);
     _markReworkIfAny(eps, ep); // 上一条 ✓ 如果被这一轮返工了，就地挂一条并列事实
@@ -51061,11 +51083,21 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
         // Session recording: append every action to a replayable timeline (type +
         // human label + timing + ok). Bounded so a long run can't grow unbounded.
         if (_toolExecutionAttempted(it.rawResult) && run.recording.length < 800) {
+          const _recOk = _toolExecutionSucceeded(it.call, it.rawResult);
           run.recording.push({
             t: (Date.now ? Date.now() : 0) - run._recStart,
             type: t,
             label: _recLabel(it.call),
-            ok: _toolExecutionSucceeded(it.call, it.rawResult),
+            ok: _recOk,
+            // 失败时把**回执开头那句**一并记下。
+            //
+            // 在此之前，工具失败在整个产品里一个字节都不落盘：抄本只存对话文本，
+            // 情景档案只存动词。于是「哪个工具老是撞墙」这个问题，用户答不上来、
+            // 开发者查不出来、模型自己也无从复盘——只能靠猜。
+            // 记的是回执前 120 字（标记 + 首句），不是全文：足够分辨
+            // 「[不可用] 桌面专用」「[BLOCKED] 没有工作区」「HTTP 403」这些类别，
+            // 又不会把日志正文拖进存档。
+            ...(_recOk ? {} : { fail: _recFailBrief(it.tc?.name || t, it.rawResult) }),
           });
         }
         const _ok = _toolExecutionSucceeded(it.call, it.rawResult);
