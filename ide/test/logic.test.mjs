@@ -28102,6 +28102,50 @@ test("自动改重复标点不许碰别的语言的合法语法", () => {
   }
 });
 
+test("定时任务到点会真的发出去、重排下一次、并把结果报出来", async () => {
+  // 排期算得对不等于它会跑。这条把整条触发链走一遍：存一条已到期的任务 →
+  // 走一次 tick → 确认 (1) prompt 真的发给了智能体 (2) 无人值守标志开过又关上
+  // (3) 下一次排期被推到未来 (4) 结果落回任务本身 (5) 通知发了。
+  //
+  // 少任何一环的后果都很具体：不发＝定时任务是摆设；不重排＝每次 tick 都判定
+  // 到期，变成死循环刷任务；不关无人值守标志＝之后用户亲自发的消息也不会弹确认框。
+  const sent = [];
+  const notified = [];
+  let unattended = [];
+  const store = { schedules: null };
+  const fire = load("_schedFireDue", {
+    _schedFiring: false,
+    _schedLoad: async () => store.schedules,
+    _schedSave: async () => {},
+    _schedNextAt: load("_schedNextAt", {}),
+    _schedSummary: () => "",
+    _setUnattendedRun: (on) => unattended.push(on),
+    sendPrompt: async (text) => { sent.push(text); },
+    showNotification: (o) => notified.push(o),
+  });
+
+  const past = Date.now() - 60_000;
+  store.schedules = [{
+    id: 7, prompt: "检查 CI 是否通过", at: "", every_minutes: 30,
+    enabled: true, nextAt: past, lastOutcome: "",
+  }];
+
+  await fire();
+
+  assert.equal(sent.length, 1, "到期的任务必须真的发出去");
+  assert.match(sent[0], /检查 CI 是否通过/, "发的得是任务里存的那句话");
+  assert.match(sent[0], /定时任务/, "要让模型知道这一轮是定时触发的");
+  assert.match(sent[0], /没有人在电脑前/, "要说清此刻没人，需要确认的操作会被留下");
+
+  assert.deepEqual(unattended, [true, false],
+    "无人值守标志必须开过又关上——不关的话之后用户亲自发的消息也不会弹确认框");
+
+  const t = store.schedules[0];
+  assert.ok(t.nextAt > Date.now(), "下一次必须排到未来，否则每次 tick 都判定到期，变成死循环");
+  assert.equal(t.lastOutcome, "已执行", "结果要落回任务本身，用户回来才看得到");
+  assert.equal(notified.length, 1, "跑完要发通知——这是人不在时唯一的落点");
+});
+
 test("定时任务的排期：今天过了就排明天，间隔按间隔，格式不对不排", () => {
   // 这是调度器里唯一一段真逻辑，别的都是存取和触发。排错了的后果很具体：
   // 「每天 9 点」排成了今天已经过去的 9 点 → 一启动就立刻跑一次，然后每次
