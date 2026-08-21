@@ -325,7 +325,23 @@ pub struct EnvRefresh {
 pub fn env_refresh() -> EnvRefresh {
     #[cfg(not(windows))]
     crate::process_util::refresh_login_shell_path(false);
+    #[cfg(not(windows))]
     let path = crate::process_util::augmented_path(None);
+    // Windows 上 augmented_path 的基底是 std::env::var("PATH")——进程启动时的快照，
+    // 而 Windows **永远不会**改写运行中进程的环境块。也就是说这里每次算出来的都是
+    // 同一个字符串，changed 恒为 false，invalidate_plan() 一次也不会触发：
+    // 用户装完 Git、setx 完 PATH，解释器缓存到进程退出都不会失效——而这个函数
+    // 存在的全部意义就是发现这件事。
+    //
+    // 注册表才是 Windows 上环境变化的真实来源，tasks.rs 已经在读它了。
+    #[cfg(windows)]
+    let path = {
+        let reg_path = registry_env()
+            .into_iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("PATH"))
+            .map(|(_, v)| v);
+        crate::process_util::augmented_path_over(reg_path, None)
+    };
     static LAST: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
     let mut g = LAST.lock().unwrap_or_else(|e| e.into_inner());
     let changed = !g.is_empty() && *g != path;
@@ -376,6 +392,48 @@ mod one_shell_decision {
 
 #[cfg(test)]
 mod tests {
+
+    /// 反漂移：Windows 上 env_refresh 必须拿**注册表**的 PATH 作基底。
+    ///
+    /// 用进程环境（std::env::var("PATH")）的话它是个常量——Windows 永远不改写
+    /// 运行中进程的环境块。于是 changed 恒 false、invalidate_plan() 一次不触发，
+    /// 用户装完 Git、setx 完 PATH，解释器缓存到进程退出都不失效。而这个函数
+    /// 存在的全部意义就是发现这件事。
+    ///
+    /// 断言源码（Windows 分支在 mac 上不参与编译），先剥注释——上面这段解释里
+    /// 就引用了旧写法，不剥的话断言会被自己喂饱。
+    #[test]
+    fn windows_env_refresh_reads_the_registry_not_the_process_snapshot() {
+        let src: String = include_str!("shell_env.rs")
+            .lines()
+            .filter(|l| {
+                let t = l.trim_start();
+                !t.starts_with("//") && !t.starts_with("///")
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let at = src
+            .find("pub fn env_refresh()")
+            .expect("找不到 env_refresh");
+        let body = &src[at..at + 1400];
+        assert!(
+            body.contains("registry_env()"),
+            "env_refresh 的 Windows 分支没有读注册表"
+        );
+        assert!(
+            body.contains("augmented_path_over"),
+            "env_refresh 没有把注册表 PATH 当作基底传下去"
+        );
+        // 无平台门的那个调用不该还在：它会让 Windows 也走进程快照。
+        let bare = format!("let path = crate::process_util::{}(None);", "augmented_path");
+        let guarded = format!("#[cfg(not(windows))]\n    {bare}");
+        assert_eq!(
+            body.matches(&bare).count(),
+            1,
+            "augmented_path(None) 应该只剩被 cfg(not(windows)) 门住的那一处"
+        );
+        assert!(body.contains(&guarded), "那一处没有被 cfg(not(windows)) 门住");
+    }
     use super::*;
 
     fn table(pairs: &[(&str, &str)]) -> HashMap<String, String> {
