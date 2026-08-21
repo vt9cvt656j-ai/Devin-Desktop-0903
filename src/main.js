@@ -325,7 +325,20 @@ function _groupRemoteSearchHits(root, query, caseSensitive, hits) {
   backend.renamePath = (from, to) => _remote.active ? _remoteCall("/fs/rename", { from, to }) : _local.renamePath(from, to);
   backend.deletePath = (p) => _remote.active ? _remoteCall("/fs/delete", { path: p }) : _local.deletePath(p);
   backend.searchInProject = (root, query, cs, mode = "literal") => _remote.active
-    ? _remoteCall("/fs/search", { root, query, case_sensitive: cs, mode }).then((j) => _groupRemoteSearchHits(root, query, cs, j.hits))
+    ? _remoteCall("/fs/search", { root, query, case_sensitive: cs, mode }).then((j) => {
+      // 截断信息也要带出来。本地那条把 truncated / scannedFiles 挂在数组对象上
+      // （见 _local.searchInProject 的注释），远程这条原来只 return 一个纯数组——
+      // 于是 _backendTruncated 恒 false、_scannedFiles 恒 0，「**这次没搜完**」那句话
+      // 在远程工作区上一次都不会出现。后果就是那边注释写的假阴性：模型把一个任意
+      // 子集当成全部，「所有调用点都改掉」只改了前面几十处。
+      // 远端没报这两个字段时挂 undefined，让回执能区分「没截断」和「不知道」。
+      const _hits = _groupRemoteSearchHits(root, query, cs, j.hits);
+      _hits.truncated = !!j?.truncated;
+      _hits.scannedFiles = Number.isFinite(Number(j?.scanned_files)) ? Number(j.scanned_files)
+        : Number.isFinite(Number(j?.scannedFiles)) ? Number(j.scannedFiles) : undefined;
+      _hits.scanScopeUnknown = _hits.scannedFiles === undefined;
+      return _hits;
+    })
     : _local.searchInProject(root, query, cs, mode);
 }
 
@@ -55596,6 +55609,7 @@ async function _executeToolStepInner(step, call, root, run) {
       // 后果是**假阴性**：用户说「把这个变量所有调用点都改掉」，某个文件里有 80 处引用，
       // 模型只看到前 50 处，然后按"一共就这么多"改完收工，剩下 30 处静静留在代码里。
       let _backendTruncated = false;
+      let _scanScopeUnknown = false;
       let _scannedFiles = 0;
       for (const searchRoot of searchScopes) {
         let scopedMatches = [];
@@ -55604,6 +55618,9 @@ async function _executeToolStepInner(step, call, root, run) {
           successfulScopes++;
           if (scopedMatches && scopedMatches.truncated) _backendTruncated = true;
           _scannedFiles += Number(scopedMatches?.scannedFiles) || 0;
+          // 远端没报扫描规模时，"没搜完" 这一条这里判断不了——要说出来，别让沉默
+          // 被读成「搜完了」。
+          if (scopedMatches && scopedMatches.scanScopeUnknown) _scanScopeUnknown = true;
         } catch (error) {
           searchErrors.push(`${searchRoot}: ${String(error?.message || error).slice(0, 180)}`);
           continue;
@@ -64402,6 +64419,20 @@ async function renderSettingsTool(body) {
     createSwitch(_currentAiPerm === "approve", (on) => {
       _setAiPerm(on ? "approve" : "auto");
       showToast(on ? t("feature.settings.approvalOn") : t("feature.settings.approvalOff"));
+    }),
+  ));
+  // 「完全放开」：第三档，连高危也不问。和上面那个开关互斥——两个都开是自相矛盾的
+  // 状态，所以打开这个就把审批关掉，打开审批就退回 auto。
+  //
+  // 这一档的代价写在 hint 里，不藏着：删目录在系统侧是 remove_dir_all，没有回收站、
+  // 没有备份，这个软件里也没有撤销入口；而且它对定时任务同样生效，也就是没人看着的
+  // 时候它也能删。用户明确要这个，那就给他，但要让他每次进设置都看得见这句话。
+  aiSec.appendChild(createSettingsRow(
+    t("feature.settings.fullAuto.label"),
+    t("feature.settings.fullAuto.hint"),
+    createSwitch(_currentAiPerm === "full", (on) => {
+      _setAiPerm(on ? "full" : "auto");
+      showToast(on ? t("feature.settings.fullAutoOn") : t("feature.settings.fullAutoOff"));
     }),
   ));
   aiSec.appendChild(createSettingsRow(

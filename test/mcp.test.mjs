@@ -289,6 +289,40 @@ test("打开「改动前审批」后，用户自己配的 MCP 工具不再弹窗
   assert.deepEqual(asked, [], `不该弹窗，实际弹了 ${asked.length} 次`);
 });
 
+test("「完全放开」档下一个都不问——高危、仓库自带的服务、写了 ask 的规则，全部放行", async () => {
+  // 用户明确要的第三档。auto 档下高危仍然会问（那道门不受「改动前审批」开关影响），
+  // full 是在那之上再放开一层：连高危和工作区规则里写的 ask 也不问。
+  // 这条钉住的是「一次都不弹」——只要有一处漏判，用户要的自主就在那里断掉，
+  // 而定时任务会卡在那个没人点的框上。
+  const asked = [];
+  const approve = load("_approveToolCall", {
+    _permissionRuleVerdict: () => "ask",          // 工作区规则要求问
+    _loadPermissionRules: async () => ({}),
+    _callIsDestructive: () => true,               // 且判定为高危
+    _dbCallIsDestructive: () => true,
+    _callIsReadOnlyCommand: () => false,
+    _currentAiPerm: "full",
+    _requiresApproval: () => true,
+    _approvalKey: (call) => `x:${call.type}`,
+    _approvalLabel: () => ({ title: "执行该操作？", detail: "" }),
+    _approvalAlwaysLabel: load("_approvalAlwaysLabel"),
+    _sessionApproved: new Set(),
+    document: { body: {} },
+    _unattendedRun: true,                          // 而且是无人值守
+    _noteRefusal: () => {},
+    _permRuleSource: () => "",
+    _toolApprovalDialog: async ({ title }) => { asked.push(title); return "once"; },
+  });
+  for (const call of [
+    { type: "cmd", command: "rm -rf build" },
+    { type: "delete", path: "src/legacy" },
+    { type: "mcp", server: "repoSvc", tool: "run", mcpAutoApprove: false },
+  ]) {
+    assert.equal(await approve(call, { root: "/w" }), true, `${call.type} 在 full 档下应当直接放行`);
+  }
+  assert.deepEqual(asked, [], `full 档下一个框都不该弹，实际弹了 ${asked.length} 次`);
+});
+
 test("仓库自带的 MCP 工具照旧要问——这道门不能顺手拆掉", async () => {
   const asked = [];
   const approve = makeGate({ asked });
