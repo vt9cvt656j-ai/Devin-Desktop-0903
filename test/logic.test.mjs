@@ -31380,7 +31380,14 @@ test("git_log 只看当前分支，并且说清是哪条分支", () => {
   // 子智能体、或 refreshGitStatus 被丢弃时，它显示的是另一个仓库或切换前的分支。
   const out = run(mk(["HEAD -> tool-config-cleanup", "origin/main"]));
   assert.match(out.content, /分支 tool-config-cleanup/, "没点名分支——并行开着别人分支时这份清单没有意义");
-  assert.match(out.content, /不含其它分支/, "没说清范围，模型会以为这是全仓最近的提交");
+  // 范围要说**准**。git log 走的是 HEAD 的祖先链：已经合并进来的分支，它们的提交
+  // 照样在这里（实测：merge 之后 feature 上那笔就出现了）。原来写的
+  //「别的分支上的提交不会出现在这里」在有过合并的分支上是假话——而这个仓库天天在合并。
+  assert.match(out.content, /HEAD 的祖先链/, "没说清范围，模型会以为这是全仓最近的提交");
+  assert.match(out.content, /已经合并进来的分支，它们的提交也在其中/,
+    "把「不含其它分支」说死了 —— 合并进来的分支提交明明在里面");
+  assert.doesNotMatch(out.content, /别的分支上的提交不会出现在这里/,
+    "又把那句在有合并时不成立的话写回去了");
   assert.match(out.content, /abc1234 fix/);
 
   // 游离 HEAD 要照实说，不能硬安一个分支名。

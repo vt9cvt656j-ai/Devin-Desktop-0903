@@ -57447,7 +57447,12 @@ async function _executeToolStepInner(step, call, root, run) {
             if (String(_r).trim() === "HEAD") _logDetached = true;
           }
           const _logHead = `${_logBranch ? `分支 ${_logBranch}` : (_logDetached ? "游离 HEAD" : "当前分支")}的最近 ${entries.length} 条提交`
-            + `（只这一条线，不含其它分支——别的分支上的提交不会出现在这里）：\n`;
+            // 「不含其它分支」要说准。git log 走的是 **HEAD 的祖先链**：已经合并进来的
+            // 分支，它们的提交照样在这里（实测：merge 之后 feature 上那笔就出现了）；
+            // 真正不出现的是**没合并进来**的分支。原来那句「别的分支上的提交不会出现在
+            // 这里」在有过合并的分支上是假话，而这个仓库天天在合并。
+            + `（这是 HEAD 的祖先链：已经合并进来的分支，它们的提交也在其中；\n`
+            + `　没有合并进来的分支上的提交才不会出现。要跨分支找请指名那条分支。）：\n`;
           res.className = "atc-result atc-result--ok"; res.textContent = `${entries.length} 条提交`;
           if (vp) vp.innerHTML = `<pre>${_escHtml(lines.join("\n") || "(无提交)")}</pre>`;
           return { type: "git", path: "log", content: (lines.length ? _logHead + lines.join("\n") : "(无提交历史)") + gitRerootNote };
