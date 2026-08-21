@@ -1070,10 +1070,18 @@ test("an interrupted turn keeps what the model already wrote", () => {
   // 3. The run loop broke on the error BEFORE the line that accumulates the prose into the run
   //    summary — which is the only thing persisted to history. This is the one that made it
   //    survive a restart as well as a repaint.
-  // 距离放宽到 1400：这个 break 之前现在还要补一段记账（didMutate / _implOps），
-  // 因为落了盘的文件不光要进清单，还得让「改了代码就要验证」那条记账触发得起来。
-  // 断言要守的仍然是同一件事——正文必须在 break **之前**被收进 run 摘要。
-  assert.match(SRC, /if \(turn\.error\) \{[\s\S]{0,900}summaryText \+= \(summaryText \? "\\n\\n" : ""\) \+ turn\.text\.trim\(\);[\s\S]{0,1400}finalErr = turn\.error; break;/);
+  // 不用字符距离钉了。这个块只会越长越大（记账、抖动重试都加在里面），每加一次就要
+  // 调一次数字，而数字本身不表达任何契约。真正要守的是**顺序**：正文先被收进 run 摘要，
+  // 然后才 break。所以直接比两者的位置。
+  {
+    const _errAt = SRC.indexOf("if (turn.error) {");
+    assert.ok(_errAt > 0, "turn.error 那个块挪走了，这条断言失去落点");
+    const _bankAt = SRC.indexOf('summaryText += (summaryText ? "\\n\\n" : "") + turn.text.trim();', _errAt);
+    const _breakAt = SRC.indexOf("finalErr = turn.error; break;", _errAt);
+    assert.ok(_bankAt > 0 && _breakAt > 0, "收正文或 break 不见了");
+    assert.ok(_bankAt < _breakAt,
+      "正文必须在 break **之前**收进 run 摘要，否则中断的那一轮在历史里什么都不剩");
+  }
   // 正文之外，**已经落盘的文件**也要收账再走。流完即写是在流式阶段就真写磁盘的，
   // 而这条 break 走在批处理之前：不收的话，落了盘的文件在消息历史、run 摘要、账本里
   // 一个记录都没有——磁盘变了，所有记录都说没变。

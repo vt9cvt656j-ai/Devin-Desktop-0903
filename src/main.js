@@ -25871,7 +25871,8 @@ async function sendPrompt(text, attachments = [], readyConfig = null, opts = {})
   // If THIS tab is already running, a sent message becomes a real-time STEER ("引导"):
   // inject it into the live run so the agent adapts mid-task instead of dropping it.
   // (Other tabs still run concurrently — each has its own loop.)
-  { const _rs = _currentSession(); if (_rs?.streaming) { _queueFollowup(_rs, text, attachments); return; } }
+  // 和输入框那条同一个判据：有循环在跑就实时引导，纯对话才排队。见 composer submit 处的说明。
+  { const _rs = _currentSession(); if (_rs?.streaming) { if (_rs._runIsLoop) _steerRunningAgent(_rs, text, attachments); else _queueFollowup(_rs, text, attachments); return; } }
   // If all chats were closed, sending starts a fresh one so history has a home.
   if (!_currentSession()) _newChatSession();
   // Bind this whole turn to ONE session, captured now — so even if the user
@@ -25952,6 +25953,12 @@ async function sendPrompt(text, attachments = [], readyConfig = null, opts = {})
   // Stop button is live through the whole turn and a hang in compaction / context
   // gathering can be interrupted (was: streaming only set later, so an early hang
   // left a dead Stop button + no response).
+  //
+  // 同一个理由，这个标志也要在这里就置上：它决定「运行中发的消息」走实时引导还是排队。
+  // 原来它要等循环真正开跑才置真，而在那之前还有好几秒（恢复转录、上下文压缩、意图
+  // 分析）——那段时间里发的消息会掉进排队，用户看到的仍然是「说了没反应」。
+  // 判据用的就是下面决定「跑不跑循环」的那一个，所以流式一开它就是真话。
+  sess._runIsLoop = _MODES_WITH_TOOLS.has(effectiveMode);
   _setStreaming(sess, true);
   // 运行代际（治"停止后发新消息，旧循环复活并行"）：旧 run 的存活判据只有
   // sess.streaming，新一轮把它置回 true 后，还卡在工具/重试等待里的旧循环下个
@@ -26584,6 +26591,7 @@ async function sendPrompt(text, attachments = [], readyConfig = null, opts = {})
   const _canSelfServeWorkspace = effectiveMode === "agent";
   if (_needsRealWorkspace && !_canSelfServeWorkspace) {
     _setStreaming(sess, false);
+    sess._runIsLoop = null; // 这一轮没起循环就退了，标志不能留着说假话
     if (sess === _currentSession()) _setSendBtnStop(false);
     const blockedBody = addMessage("assistant", "⚠️ 这次要改/创建/运行项目文件，但当前没有绑定到真实工作区文件夹。我没有继续瞎写相对路径，避免文件写到错误位置或一直失败。\n\n请先点击左侧「最近项目」里的项目，或点聊天标签上的文件夹图标设置工作目录；绑定后我会按真实路径继续写文件。", sess);
     await Promise.allSettled(_turnBillingTasks);
@@ -48475,7 +48483,10 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
   //
   // 数字越大越先被淘汰。没登记的一律按建议类处理——新加的提醒默认可丢，要保命就显式登记。
   const _NUDGE_FACTS = new Set([
-    "toolRepair", "cmdFail", "buildFix", "diag", "diagFinish", "bugEvidence",
+    // turnRetry：「上一轮线路断了，这几个文件已经落盘」是执行记录不是建议。
+    // 不登记的话它会被判成建议类——而建议类同时只留一条，它会挤掉别的建议，
+    // 自己也是下一条建议到来时第一个被踢出去的。
+    "toolRepair", "turnRetry", "cmdFail", "buildFix", "diag", "diagFinish", "bugEvidence",
     "blindEdit", "subagentResult", "recovery", "emptyHistoryFact",
     // 「刚改完、这个版本还没验过」是执行记账里的硬事实，丢了模型就会照着"应该没问题"收尾。
     "verifyNow", "uiLook",
@@ -49251,6 +49262,11 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
       // 让流式草稿携带本 run 已完成轮次的叙述（summaryText）：中途硬重启时能恢复整段 run、
       // 而不是只恢复当前这一轮（长 agent run 的先前几轮本来只在 run 结束才合并 push）。
       session._streamRunPrefix = summaryText;
+      // 本轮写入账本的水位线。run._writeLedger 是**整个 run 累积、从不清空**的，
+      // 所以下面那几条提前退出的路如果整本遍历，只要之前任何一轮写成功过，每退出一次
+      // 就白加一次 _implOps——把已经做过的验证判成过期，收尾时又要求重验。
+      // 取在模型轮之前：流式中途落盘的和收尾竞速里才落定的，两类都在这条线之后。
+      const _ledgerAtTurnStart = (run._writeLedger || []).length;
       let turn = await _agentModelTurn({ config, messages, toolSchemas, toolRegistry: run._toolRegistry, body, session, root, ideMode: run.mode, skillsBlock: run.skillsBlock, narrativeSeen: run._narrativeSeen, renderRejectedToolAttempts: false, onStreamToolReady: isAgent ? run._eagerStreamHook : null, settlementTasks: run._billingTasks, timeline: run.timeline, runId: run._runId, stepKind: "main" });
       if (_selfMemMsg) { const _i = messages.indexOf(_selfMemMsg); if (_i !== -1) messages.splice(_i, 1); }
       // User hit Stop DURING this model turn → halt NOW, before executing the turn's tool
@@ -49337,9 +49353,46 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
           }
           if (_landed) { didMutate = true; run._didMutate = true; _implOps++; }
         }
+        // 线路断在模型轮里 ≠ 任务失败。
+        //
+        // 下面那层确实有重试，但有个硬前提：只在「模型一个字都还没吐出来」时可用。
+        // 推理模型先吐思考再吐正文，所以它实际拿不到那 4 次重试，只剩停滞续传的 1 次。
+        // 于是长任务跑到第 25 轮撞一次网关抖动，整轮当场结束——用户看到的就是
+        // 「干了二十几轮、活干了一多半，突然报个线路错误就不动了」。
+        //
+        // 账在上面几行已经收过；出错时工具批次必然是空的，所以重开一轮既不会重复执行
+        // 工具，也不会丢已落盘的改动。
+        const _turnErrTag = String(turn.error || "");
+        const _turnErrRaw = _stripAiRetryPrefix(_turnErrTag);
+        // 参数流到一半断掉：流完即写可能已经落了盘，而这次调用没执行完。下层是**刻意**
+        // 不重放它的，用户会看到「被打断的那次工具调用参数不完整，没有执行，也不会重放」——
+        // 那句话必须继续为真，所以这一种不救。
+        const _replayUnsafe = /^\[tool-stream-retry-exhausted\]/i.test(_turnErrTag);
+        // 只吐了思考、没正文也没工具。不是线路错误，重试判据认不出它，
+        // 但它同样只该换一轮再问一次，不该整轮判死。
+        const _emptyOut = /^\[model-empty-output\]/i.test(_turnErrTag);
+        if (_live() && (run._turnErrRetries || 0) < 2 && !_replayUnsafe
+            && (_emptyOut || _isRetryableAiError(_turnErrRaw))) {
+          run._turnErrRetries = (run._turnErrRetries || 0) + 1;
+          runHadTrouble = true;
+          // 成功落盘的路径只有这本账知道：交付事实那行只报数量和失败项，不点名成功项。
+          // 不把名字给模型，它下一轮就会把同一个文件再写一遍。
+          const _landedPaths = [...new Set((Array.isArray(run._writeLedger) ? run._writeLedger : [])
+            .filter((x) => x && x.ok && x.path).map((x) => String(x.path)))];
+          _pushNudge("turnRetry",
+            `[执行记录] 上一轮模型线路中断（${_turnErrRaw.slice(0, 160)}），已自动重新发起第 ${run._turnErrRetries} 次。`
+            + (_landedPaths.length
+              ? `这些文件本次运行**已经真实写入磁盘**，不要重写、不要重做：${_landedPaths.slice(0, 12).join("、")}${_landedPaths.length > 12 ? " 等" : ""}。`
+              : "本次运行还没有任何文件落盘。")
+            + "接着没做完的那部分往下做，不要从头重来，不要收尾，也不要声称已完成。");
+          continue;
+        }
         finalErr = turn.error; break;
       }
       clearAgentRetryToast();
+      // 这一轮好好回来了：抖动预算复位。判据要的是「连续两次都断」，
+      // 不是「整个 run 里断过两次」——60 轮的任务撞三次互不相关的抖动不该被判死。
+      run._turnErrRetries = 0;
       // A steer that arrived while the model was deciding invalidates this turn's
       // still-unexecuted tools. Do not run stale writes/commands; the next iteration
       // drains the steer queue first and lets the model produce a fresh tool batch.
@@ -49352,17 +49405,29 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
         const _eagerNote = await _settleEagerWritesForBreak(run);
         if (_eagerNote) summaryText += (summaryText ? "\n\n" : "") + _eagerNote;
         let _landed = 0;
-        for (const item of (Array.isArray(run._writeLedger) ? run._writeLedger : [])) {
+        for (const item of (run._writeLedger || []).slice(_ledgerAtTurnStart)) {
           if (item?.ok && item.path) { _mutatedFiles.add(_normRel(item.path, root)); _landed++; }
         }
         // 补清单还不够：didMutate / run._didMutate / _implOps 是在**批处理**里置位的，
         // 而这条 continue 整个跳过了那段。于是磁盘上多了一份没验证过的代码，收尾时
         // didMutate 仍是 false —— 「改了代码要验证」那条记账根本不会触发，run 被判成
         // 干干净净的 success。_implOps 也要加：新代码落盘之后，之前那次验证就过期了。
+        // 只数**本轮**落盘的（上面那条水位线），否则每插一次话就白判一次验证过期。
         if (_landed) {
           didMutate = true;
           run._didMutate = true;
           _implOps++;
+        }
+        // 模型这一轮出了一整批工具调用，不是空转——是插话让它作废的。不归零的话，
+        // 静默计数会一路涨到 2，而那会**同时**关掉诊断门、构建门、计划门直接收尾：
+        // 插一次话，反而让它提前一轮进入「不再补回合」的状态。
+        quietTurns = 0;
+        // 那一轮模型说了什么、决定了什么，原来随着这条 continue 从 messages 里整个消失，
+        // 下一轮它拿着被清空的上下文重新组织，很容易又变成一个纯说话轮。正文留下来。
+        // 不带 tool_calls：那批调用已经作废，留下孤儿 id 而没有对应的 tool 结果，上游会拒。
+        if (turn.text && turn.text.trim()) {
+          summaryText += (summaryText ? "\n\n" : "") + turn.text.trim();
+          messages.push({ role: "assistant", content: turn.text.trim() });
         }
         continue;
       }
@@ -49491,6 +49556,9 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
           buildFixAttempts = 0;
           run._planFinishNudges = 0;
           run._quietResumePool = 3;
+          // 静默计数是同一本欠账里的第五个计数器（它到 2 就把 _canResume 整体置假，
+          // 三道续跑门一起关掉）。上面四个都作废了，它不作废等于账没销干净。
+          quietTurns = 0;
           continue;
         }
         // 模型自己派发的子智能体（run_subagent）：模型知道它们在跑，也有 await_subagent 可以
@@ -68283,9 +68351,16 @@ $("composer").addEventListener("submit", (e) => {
     promptEl.value = "";
     _clearDroppedRefs();
     const _rs = _currentSession();
-    // 运行中的新消息一律先排队（输入框上方显示小卡片）；用户点「插入」才立即并入当前任务，
-    // 否则当前回答完成后自动依次发送。
-    _queueFollowup(_rs, text, attachments);
+    // 上面那段英文注释一直写着「这是实时引导」，而代码走的是纯排队——**注释和实现相反**，
+    // 而且 _steerRunningAgent 全文件唯一的调用点是队列小卡片上那个「插入」按钮。
+    // 也就是说：用户直接回车时，整条实时引导链路（drain、意图重判、按引导重排工具）
+    // 一次都不会被触发；这句话要等整个 run 跑完才作为全新一轮发出去。
+    // 用户看到的就是「说完话什么都没发生，它照旧做原来的事，等它彻底停下来才回过神」。
+    //
+    // 有智能体循环在跑（agent/explorer/reviewer/plan）时就走引导；纯对话没有循环可引导，
+    // 照旧排队，当前回答结束后自动依次发出。
+    if (_rs?._runIsLoop) _steerRunningAgent(_rs, text, attachments);
+    else _queueFollowup(_rs, text, attachments);
     return;
   }
   _clearDroppedRefs();

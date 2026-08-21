@@ -23479,8 +23479,19 @@ test("a quiet turn is the model's completion decision except for real bounded wo
   // 抽干必须在**所有门之前**。原来它夹在构建门和计划门中间——只要上面任何一道门先
   // break（而不是 continue），用户中途发的那条消息就被永久搁死。提到分支顶端之后，
   // 这个顺序依赖永久消失。
-  assert.match(quiet, /if \(Array\.isArray\(session\._steerQueue\)[\s\S]{0,200}continue;/,
-    "user steering is drained before the run ends");
+  // 不用字符距离钉。这个分支只会越加越长（现在还要归零静默计数），每加一次就得调一次
+  // 数字，而数字本身不表达契约。真正要守的是**位置**：抽干排在所有门之前，且它是 continue
+  // 不是 break——否则上面任何一道门先 break，用户中途发的那条消息就被永久搁死。
+  {
+    const _drainAt = quiet.indexOf("if (Array.isArray(session._steerQueue)");
+    assert.ok(_drainAt >= 0, "抽干那一支不见了");
+    const _tail = quiet.slice(_drainAt);
+    const _continueAt = _tail.indexOf("continue;");
+    const _breakAt = _tail.indexOf("break;");
+    assert.ok(_continueAt > 0, "抽干之后必须 continue（回到循环重开一轮），不能落到别处");
+    assert.ok(_breakAt < 0 || _continueAt < _breakAt,
+      "抽干必须先 continue；先撞上 break 的话用户那条消息就被搁死了");
+  }
   const _steerAt = quiet.indexOf("Array.isArray(session._steerQueue)");
   for (const gate of ["_diagnosticNudges", "buildFixAttempts", "_planFinishNudges"]) {
     assert.ok(_steerAt < quiet.indexOf(gate + " ="), `steer 抽干必须排在 ${gate} 那道门之前`);
@@ -28117,6 +28128,35 @@ test("定时任务的排期：今天过了就排明天，间隔按间隔，格�
   for (const bad of ["", "9点", "25:00abc", "上午九点", undefined]) {
     assert.equal(nextAt({ at: bad }, noon), 0, `${bad} 不是合法时间，不该排期`);
   }
+});
+
+test("运行中按回车必须走实时引导，不是排队——注释说了两年的事得真的成立", () => {
+  // 这条坏过很久而且没人发现：composer 上方的英文注释一直写着「这是实时引导」，
+  // 代码却无条件走 _queueFollowup（纯排队），而 _steerRunningAgent 全文件唯一的调用点
+  // 是队列小卡片上那个「插入」按钮。于是用户直接回车时，整条引导链路一次都不会触发，
+  // 那句话要等整个 run 跑完才作为全新一轮发出——用户看到的就是「说完话它照旧做原来的，
+  // 等它彻底停下来才回过神」。
+  //
+  // 判据钉两件事：两个入口都按 _runIsLoop 分岔；标志在**流式开启的那一刻**就置上
+  // （不是等循环真开跑）——否则 run 启动前那几秒（恢复转录、压缩、意图分析）发的消息
+  // 仍然掉进排队，同一个卡顿原样复发。
+  const steerCalls = (SRC.match(/_steerRunningAgent\(/g) || []).length;
+  assert.ok(steerCalls >= 4,
+    `_steerRunningAgent 的调用点只剩 ${steerCalls} 个（定义 + 至少两个发送入口 + 「插入」按钮）——回车那条路多半又被改回排队了`);
+
+  for (const entry of [
+    "if (_rs?._runIsLoop) _steerRunningAgent(_rs, text, attachments);",
+    "if (_rs._runIsLoop) _steerRunningAgent(_rs, text, attachments);",
+  ]) {
+    assert.ok(SRC.includes(entry), `发送入口少了按 _runIsLoop 分岔的那一支：${entry}`);
+  }
+
+  // 标志必须在 _setStreaming(sess, true) 之前置上，不能晚于它。
+  const flagAt = SRC.indexOf("sess._runIsLoop = _MODES_WITH_TOOLS.has(effectiveMode);");
+  assert.ok(flagAt > 0, "循环标志没有在发送路径上按当前模式置位");
+  const streamAt = SRC.indexOf("_setStreaming(sess, true);", flagAt);
+  assert.ok(streamAt > flagAt && streamAt - flagAt < 400,
+    "标志要紧挨在 _setStreaming(sess, true) 之前——晚一步，启动那几秒里的消息就还是排队");
 });
 
 test("docker 只有真会挂住的那几条算长时运行，秒回的不算", () => {
