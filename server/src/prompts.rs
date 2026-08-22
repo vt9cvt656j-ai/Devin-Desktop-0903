@@ -3562,6 +3562,20 @@ fn inject_static_tools(mode: &str, names: &str, body: &mut serde_json::Value) {
 
 
 ///   x-ide-tools: comma-separated tool names → inject those tools' schemas from tools.json
+/// 组装日志要能按 run 分组：`semantic_profile_seen` 修好之后，「首发空、第二发起亮」
+/// 是唯一能证明画像链路按设计工作的口径——没有 run_id/step_index，这个口径量不出来，
+/// 只能看总数猜。三个头 IDE 一直在发（ai.rs::with_ide_headers），这里只是终于读它。
+/// 缺头给 "-"：单独跑的测试请求、老客户端都没有，别让它们在日志里变成空串歧义。
+fn ide_run_telemetry(headers: &HeaderMap) -> (String, String, String) {
+    let h = |k: &str| headers
+        .get(k)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.chars().take(64).collect::<String>())
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| "-".into());
+    (h("x-ide-run-id"), h("x-ide-step-index"), h("x-ide-step-kind"))
+}
+
 pub fn assemble_into(headers: &HeaderMap, body: &mut serde_json::Value) -> Result<(), String> {
     let hdr = |k: &str| headers.get(k).and_then(|v| v.to_str().ok());
     let mode = match hdr("x-ide-mode") {
@@ -3900,6 +3914,7 @@ pub fn assemble_into(headers: &HeaderMap, body: &mut serde_json::Value) -> Resul
                 .map(str::len)
                 .unwrap_or_else(|| serde_json::to_vec(content).map_or(0, |bytes| bytes.len()))
         });
+    let ide_run = ide_run_telemetry(headers);
     tracing::info!(
         mode,
         prompt_blocks = ?prompt_blocks,
@@ -3913,6 +3928,9 @@ pub fn assemble_into(headers: &HeaderMap, body: &mut serde_json::Value) -> Resul
         marked_request_bytes,
         last_user_bytes,
         semantic_profile_seen = ?semantic_profile_seen,
+        run_id = %ide_run.0,
+        step_index = %ide_run.1,
+        step_kind = %ide_run.2,
         orch_msg_count,
         orch_bytes,
         "assembled IDE prompt request"
@@ -7766,6 +7784,21 @@ mod shadcn_delivery_tests {
 
 #[cfg(test)]
 mod readonly_tool_injection_tests {
+    #[test]
+    fn ide_run_telemetry_reads_the_three_headers_and_dashes_the_missing() {
+        use axum::http::HeaderMap;
+        let mut h = HeaderMap::new();
+        h.insert("x-ide-run-id", "run_abc".parse().unwrap());
+        h.insert("x-ide-step-index", "7".parse().unwrap());
+        let (r, i, k) = super::ide_run_telemetry(&h);
+        assert_eq!((r.as_str(), i.as_str(), k.as_str()), ("run_abc", "7", "-"));
+        let (r2, _, _) = super::ide_run_telemetry(&HeaderMap::new());
+        assert_eq!(r2, "-", "缺头要给 '-'，不能是空串歧义");
+        let mut long = HeaderMap::new();
+        long.insert("x-ide-run-id", "x".repeat(200).parse().unwrap());
+        assert_eq!(super::ide_run_telemetry(&long).0.len(), 64, "超长要截断");
+    }
+
     use super::{allowed_static_tool, requested_static_tools};
     use std::collections::HashSet;
 
