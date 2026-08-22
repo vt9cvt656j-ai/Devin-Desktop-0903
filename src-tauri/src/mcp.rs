@@ -2408,9 +2408,9 @@ async fn pending_auth_at(key: SessionKey) -> Result<bool, String> {
 
 // ── 用户级（跨项目）MCP 配置 ─────────────────────────────────────────────────
 //
-// 在这之前，MCP 配置**只**来自工作区里的 `.mcp.local.json` / `.mcp.json` /
-// `.cursor/mcp.json`。也就是说换一个项目，你配好的服务、连同填进去的 API Key 全都
-// 不在了，得从头再配一遍；没打开文件夹的时候更是一个 MCP 都用不了。那不叫"能用"。
+// 在这之前，MCP 配置**只**来自工作区里的 `.mcp.local.json` / `.mcp.json`。也就是说换一个
+// 项目，你配好的服务、连同填进去的 API Key 全都不在了，得从头再配一遍；没打开文件夹的
+// 时候更是一个 MCP 都用不了。那不叫"能用"。
 //
 // 用户级配置放在 `~/.mrdayone/mcp.json`，配一次到处都在。这里必须走**独立的
 // Tauri 命令**而不是复用 `write_text_file_if_unchanged`：那条路的
@@ -2418,10 +2418,19 @@ async fn pending_auth_at(key: SessionKey) -> Result<bool, String> {
 // 里"的写入（正是它挡住了 ~/.ssh、~/.bashrc），不该为了这一个文件把那道墙挖开。
 // 这两个命令的作用域被钉死在这一个文件上，路径不接受调用方输入。
 //
-// 顺带把别的客户端的配置读进来（只读）：用户在 Claude Code / Cursor 里配好的服务
-// 直接就能用，不用再抄一遍。`~/.claude.json` 里除了 mcpServers 还有账号、项目历史
-// 等等，所以**在 Rust 侧就只摘 mcpServers 子树**交给前端，其余内容一个字节都不进
-// 渲染进程。这也顺便绕开了 read_text_file 的 5 MB 上限（那个文件会长得很大）。
+// 这里曾经顺带把别的客户端的全局配置（`~/.claude.json`、`~/.cursor/mcp.json`、
+// `~/.codex/mcp.json`、Claude Desktop 那份）一并读进来，理由是"用户在那边配过就不用再抄
+// 一遍"。按用户要求去掉了，判据换成一句话：**别人的目录不是这个 IDE 的输入**。技能那条链
+// （_skillDiscoveryBases）先按这条判据收敛过，MCP 跟上，两边一致——想用那边配过的服务，
+// 在 MCP 面板里加一遍，那一次是明确的采纳，而不是默默继承。一条 MCP 配置就是一条任意
+// 命令行，"用户在别的软件里配过"不足以成为在这里静默执行它的依据。
+//
+// 工作区里仓库自带的 `.mcp.json` / `.mcp.local.json` 是另一回事，照旧读：它们属于用户
+// 打开的这个项目，而且要过工作区信任门 + 逐条确认（scope=repo）。
+//
+// `servers_subtree` 因此仍然保留：这份文件是用户手写的，可能长得很大，也可能在
+// `mcpServers` 之外挂着别的东西——**在 Rust 侧就只摘 mcpServers 子树**交给前端，其余内容
+// 一个字节都不进渲染进程，也顺便绕开了 read_text_file 的 5 MB 上限。
 /// 应用自己的家目录：`~/.mrdayone`。
 ///
 /// 以前叫 `.michael-ide`。改名带**一次性搬迁**：这个目录里不只有 mcp.json，还有浏览器
@@ -2520,7 +2529,8 @@ pub fn app_dir_name() -> &'static str {
 }
 const LEGACY_APP_DIR_NAME: &str = ".michael-ide";
 const USER_CONFIG_FILE: &str = "mcp.json";
-/// 这几个文件都可能长期堆积（Claude Code 会把项目历史写进 ~/.claude.json）。
+/// 这份文件是用户手写的，堆积到几十兆也不该让读取本身变成拒绝服务。上限保留得很宽：
+/// 收窄它等于在用户的配置长大之后突然"所有 MCP 都不见了"。
 const MAX_USER_CONFIG_BYTES: u64 = 32 * 1024 * 1024;
 
 fn home_dir() -> Result<std::path::PathBuf, String> {

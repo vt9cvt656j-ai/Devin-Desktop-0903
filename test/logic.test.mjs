@@ -15293,7 +15293,11 @@ test("Advanced MCP and Skills add buttons create inline records without old mana
   const skillsTool = extractFn("renderSkillsTool");
   assert.match(mcpTool, /data-mcpfp-add-form/);
   assert.match(mcpTool, /const saveCustomMcpService = async/);
-  assert.match(mcpTool, /sv\[name\] = \{\s*command/s);
+  // 这条以前钉的是 `sv[name] = { command …`（裸写配置对象）。改成钉统一写入口
+  // _mcpUpsertServer：裸写的那版**不碰 disabled**，于是保存一个名字恰好在停用清单里的
+  // 服务会被合并层静默吞掉——写进磁盘了，模型看不到，卡片也不翻成「已安装」。
+  // 详见 test/mcp-own-dir.test.mjs。三个写入点（自定义保存 / 精选 / 市场）统一走这一口。
+  assert.match(mcpTool, /_mcpUpsertServer\(c, name, \{\s*command/s);
   assert.match(mcpTool, /await writeCfg\(c\)/);
   assert.match(mcpTool, /_ensureMcpTools\(root\)/);
   assert.doesNotMatch(mcpTool, /openMcpPanel\(\{ add: true \}\)/);

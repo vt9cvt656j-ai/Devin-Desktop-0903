@@ -3,7 +3,8 @@
 // 用户报的是两件事：「把我的 MCP 做成真实可以用的」和「不需要『始终允许』那些按钮
 // 点击条件」。查下来它们其实是同一个设计缺口的两面：
 //
-//   1. 配置**只**来自工作区里的 .mcp.local.json / .mcp.json / .cursor/mcp.json。
+//   1. 配置**只**来自工作区里的 .mcp.local.json / .mcp.json（当时还并列读 .cursor/mcp.json，
+//      以及 Claude Code / Cursor / Codex 的全局配置；那一层已按用户要求整个去掉）。
 //      换一个项目，配好的服务连同填进去的 API Key 全都不在了；没打开文件夹时
 //      `_ensureMcpTools` 直接 early-return，一个 MCP 都没有。
 //   2. mcp 类型一刀切 needsApproval: true，而"本会话总是允许"只活在内存的
@@ -15,7 +16,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 // 按名字取真源码只有一份实现：test/helpers/source.mjs 的 fnSource（acorn 按 AST 边界切）。
-import { fnSource as extractFn } from "./helpers/source.mjs";
+import { fnSource as extractFn, CODE } from "./helpers/source.mjs";
 
 const SRC = fs.readFileSync("src/main.js", "utf8");
 const APP_CSS = fs.readFileSync("src/styles/app.css", "utf8");
@@ -135,8 +136,10 @@ function makeDoc({ files = {}, ownConfig = null, tracked = [], noGit = [] } = {}
 }
 
 const USER_FILE = "/home/me/.michael-ide/mcp.json";
-const CURSOR_FILE = "/home/me/.cursor/mcp.json";
-const CLAUDE_FILE = "/home/me/.claude.json";
+// 这里曾经还有 CURSOR_FILE / CLAUDE_FILE 两个常量，用来给"别的客户端的全局配置也读进来"
+// 那批用例造文件。那条链按用户要求整个去掉了（见本文件里几条改成钉新行为的用例，以及
+// src-tauri/src/mcp.rs 里 mcp_user_config 的说明），常量随之无人使用——留着会让下一个人
+// 以为那些路径还在被读。
 
 // ── ① 全局作用域：换项目还在，没打开文件夹也在 ──────────────────────────────
 
@@ -987,17 +990,54 @@ test("停用过的服务在面板里找得回来，而且排在「还没配置�
   assert.match(before, /disabledRows/, "恢复入口排在了空状态之后，最需要它的时候看不到");
 });
 
-test("装服务和重连都不再要求先打开文件夹", () => {
-  // 写的是全局配置，本来就不属于任何项目；拦在这儿等于「想装 MCP 先随便开个项目」。
-  // saveCustomMcpService 是箭头函数常量，extractFn 只认 function 声明——按区间取。
-  const saveAt = SRC.indexOf("const saveCustomMcpService = async");
+test("MCP 面板四个写入口 + 重连都不要求先打开文件夹", () => {
+  // 写的是全局配置（~/.mrdayone/mcp.json），本来就不属于任何项目；拦在这儿等于
+  // 「想装 MCP 先随便开个项目」。
+  //
+  // 这条用例原来只取样 saveCustomMcpService 和 reconnect 两处，而同一页上的「市场安装」
+  // 和「精选安装」两个一键入口仍然被 `!root` 闸死——契约写在测试名里，破的那一半没人看。
+  // 现在四个入口全在断言范围内。断言跑 CODE（注释置空）：解释这次改动的注释里会原样
+  // 引用被删掉的 `|| !root`。
+  const saveAt = CODE.indexOf("const saveCustomMcpService = async");
   assert.ok(saveAt > 0, "找不到 saveCustomMcpService");
-  const save = SRC.slice(saveAt, saveAt + 900);
+  const save = CODE.slice(saveAt, saveAt + 900);
   assert.ok(!/请先打开一个工作区文件夹/.test(save), "装服务还在要求先打开文件夹");
-  const at = SRC.indexOf('if (act === "reconnect")');
+
+  const at = CODE.indexOf('if (act === "reconnect")');
   assert.ok(at > 0);
-  assert.ok(!/if \(!root\) return;/.test(SRC.slice(at, at + 260)),
+  assert.ok(!/if \(!root\) return;/.test(CODE.slice(at, at + 260)),
     "重连还在要求先打开文件夹——全局服务连失败了就没有重试入口了");
+
+  // 精选预设：按钮不许带 !root 的 disabled，处理器不许拿 root 当前置条件。
+  const presetBtn = CODE.indexOf("data-mcpfp-preset=");
+  assert.ok(presetBtn > 0, "找不到精选安装按钮");
+  assert.ok(!/!root \? "disabled"/.test(CODE.slice(presetBtn - 200, presetBtn + 200)),
+    "精选「安装」按钮还在没开文件夹时被灰掉");
+  const presetAt = CODE.indexOf("const presetName = e.target.closest");
+  assert.ok(presetAt > 0, "找不到精选安装处理器");
+  assert.ok(!/if \(!p \|\| !root\) return;/.test(CODE.slice(presetAt, presetAt + 300)),
+    "精选安装处理器还在要求 root");
+
+  // 市场卡片：同上。
+  const marketBtn = CODE.indexOf('data-mcpfp-install="${i}"');
+  assert.ok(marketBtn > 0, "找不到市场安装按钮");
+  assert.ok(!/installing \|\| !root/.test(CODE.slice(marketBtn - 200, marketBtn + 200)),
+    "市场「安装」按钮还在没开文件夹时被灰掉");
+  const marketAt = CODE.indexOf('const idx = e.target.closest("[data-mcpfp-install]")');
+  assert.ok(marketAt > 0, "找不到市场安装处理器");
+  // 窗口开大一点：CODE 把注释置成等长空白，而这里恰好有一段解释这次改动的注释。
+  assert.ok(!/if \(!s \|\| !conf \|\| !root\) return;/.test(CODE.slice(marketAt, marketAt + 1000)),
+    "市场安装处理器还在要求 root");
+});
+
+test("打开 MCP 面板一定会触发一次连接，没开文件夹时也要", () => {
+  // 带 `root &&` 的话，没打开文件夹时一次连接都不会发起，卡片状态永远是打开面板前那一刻
+  // 的陈值（0 工具 / 未连接）——而全局服务恰恰是没开项目时唯一还能用的那些。
+  const at = CODE.indexOf("if (!_mcpLoaded || _mcpLoadedRoot !== root) {");
+  assert.ok(at > 0, "面板打开时的预热被改回成有条件的了");
+  const before = CODE.slice(Math.max(0, at - 400), at);
+  assert.ok(!/if \(root && \(!_mcpLoaded/.test(before + CODE.slice(at, at + 200)),
+    "又回到了 `root &&` 那个版本");
 });
 
 // ── 前端和 Rust 的调用契约：所有 mcp_* 都必须带 root ─────────────────────────
