@@ -366,6 +366,11 @@ pub fn run() {
             mcp::mcp_save_user_config,
             mcp::user_rules_read,
             mcp::user_rules_save,
+            // 跨项目技能库（~/.mrdayone/skills）。走独立命令而不是 write_text_file：
+            // 那条路的 require_inside_workspace 明确拒绝 HOME 底下的写入。
+            mcp::skills_dir,
+            mcp::skills_write_file,
+            mcp::skills_delete,
             capture::capture_url,
             capture::capture_url_frames,
             browser::browser_navigate,

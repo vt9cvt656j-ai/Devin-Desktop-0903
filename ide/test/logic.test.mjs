@@ -7659,22 +7659,28 @@ test("standard SKILL.md frontmatter is parsed with a stable source identity", ()
   assert.equal(skill.baseDir, "/repo/.agents/skills/release");
   assert.equal(skill._readonly, true);
   assert.match(skill.prompt, /Run the full test suite/);
-  // 技能只从自有位置发现：工作区（含上级仓库）和家目录，两处都是自有产品目录
-  // `.mrdayone/skills`。.cursor / .codex / .agents / .claude 以及插件市场缓存都不扫。
-  assert.match(SRC, /\$\{root\}\/\$\{_STATE_DIR\}\/skills/);
+  // 技能只从**一个**位置发现：家目录技能库 `~/.mrdayone/skills`。这条以前钉的是
+  // `${root}/${_STATE_DIR}/skills`（工作区那份）——2026-08-22 那条路整条删了：技能是
+  // 跨项目复用的能力，装进"当时打开的那个项目"意味着换个项目整批消失。
   assert.match(SRC, /const _STATE_DIR = "\.mrdayone";/);
+  assert.doesNotMatch(extractFn("_skillDiscoveryBases", { code: true }), /\$\{root\}/,
+    "发现路径又回到工作区了——那正是「装完无法使用」的来源");
 });
 
-test("workspace SKILL.md discovery reads a real skill directory", async () => {
+// 这条以前叫「workspace SKILL.md discovery…」，扫的是 /repo/.mrdayone/skills。
+// 2026-08-22 落点和发现路径一起收敛到家目录技能库，工作区那条整条删了（见
+// test/skills-global.test.mjs 里的完整覆盖）。这里保留的是"真的读一遍磁盘"这一半。
+test("家目录技能库的 SKILL.md 能被真的读出来", async () => {
   const parse = load("_parseSkillDocument");
   const backend = {
+    invoke: async (cmd) => (cmd === "skills_dir" ? "/home/tester/.mrdayone/skills" : ""),
     homeDir: async () => "/home/tester",
     readTextFile: async (path) => {
-      if (path === "/repo/.mrdayone/skills/release/SKILL.md") return "---\nname: Release\ndescription: Verify releases\n---\nRun tests.";
+      if (path === "/home/tester/.mrdayone/skills/release/SKILL.md") return "---\nname: Release\ndescription: Verify releases\n---\nRun tests.";
       throw new Error("missing");
     },
     readDir: async (path) => {
-      if (path === "/repo/.mrdayone/skills") return [{ name: "release", path: "/repo/.mrdayone/skills/release", is_dir: true }];
+      if (path === "/home/tester/.mrdayone/skills") return [{ name: "release", path: "/home/tester/.mrdayone/skills/release", is_dir: true }];
       return [];
     },
   };
@@ -7685,38 +7691,42 @@ test("workspace SKILL.md discovery reads a real skill directory", async () => {
     _fileSkillsCacheKey: "",
     _fileSkillsLoadedAt: 0,
     _parseSkillDocument: parse,
-    _skillDiscoveryBases: load("_skillDiscoveryBases", {
-      _workspaceAncestorRoots: load("_workspaceAncestorRoots"),
-      _STATE_DIR: loadConst("_STATE_DIR"),
-    }),
+    _skillsHomeRoot: async () => "/home/tester/.mrdayone/skills",
+    _migrateActiveSkillIdsToHome: () => {},
+    _skillDiscoveryBases: load("_skillDiscoveryBases", { _STATE_DIR: loadConst("_STATE_DIR") }),
     _activeSkillIds: new Set(),
     _saveActiveSkills: () => {},
     _updateSkillBadge: () => {},
   });
-  const found = await refresh("/repo");
+  const found = await refresh();
   assert.equal(found.length, 1);
   assert.equal(found[0].name, "Release");
-  assert.equal(found[0].sourcePath, "/repo/.mrdayone/skills/release/SKILL.md");
+  assert.equal(found[0].sourcePath, "/home/tester/.mrdayone/skills/release/SKILL.md");
 });
 
-test("技能只从自有目录发现：上级仓库算，别的工具的目录一个都不算", () => {
-  const ancestorRoots = load("_workspaceAncestorRoots");
+test("技能只从家目录技能库发现：工作区和别的工具的目录一个都不算", () => {
   const bases = load("_skillDiscoveryBases", {
-    _workspaceAncestorRoots: ancestorRoots,
     _STATE_DIR: loadConst("_STATE_DIR"),  // 取源码里那一份，测试里不另写一个字面量
-  })("/repo/apps/ide", "/home/tester");
-  // 工作区自己和上级仓库的自有技能目录 —— 那是技能市场「安装」按钮的落点。
-  assert.ok(bases.includes("/repo/apps/ide/.mrdayone/skills"), bases.join(" "));
-  assert.ok(bases.includes("/repo/.mrdayone/skills"), "上级仓库的也要算，monorepo 里技能常放顶层");
-  // 家目录那份技能库，和 ~/.michael-ide/mcp.json 同一个命名空间。
-  assert.ok(bases.includes("/home/tester/.mrdayone/skills"), bases.join(" "));
+  });
+  /*
+   * 这条以前要求 bases 里**必须**含 `/repo/apps/ide/.mrdayone/skills` 和
+   * `/repo/.mrdayone/skills`（工作区自己和上级仓库）。那个断言随落点一起翻面：
+   * 技能是跨项目复用的能力，只存在 `~/.mrdayone/skills`；项目里的 .mrdayone 装的是
+   * 这个项目的记忆（memory.md）。工作区那条留着，项目里那个历史遗留的空 skills/
+   * 目录还会被扫，同名技能又会出现"哪一份生效看运气"。
+   */
+  const home = bases("/home/tester");
+  assert.deepEqual(home, ["/home/tester/.mrdayone/skills"]);
+  // 传了工作区路径也不该冒出工作区的目录——发现路径的入参里根本没有 projectRoot 了。
+  assert.ok(!bases("/home/tester", "").some((b) => b.includes("/repo")), bases("/home/tester", "").join(" "));
+  // Rust 侧给的绝对路径优先（app_dir 会回退到老的 .michael-ide，JS 常量不知道这回事）。
+  assert.deepEqual(bases("/home/tester", "/home/tester/.michael-ide/skills"),
+    ["/home/tester/.michael-ide/skills"]);
   // 别的工具的目录一个都不扫——用户明确要求只加载自己的。
   // .claude 也进黑名单：2026-08-18 用户点名「全部用我自己目录」。
   for (const foreign of [".cursor", ".codex", ".agents", "plugins", ".claude"]) {
-    assert.ok(!bases.some((b) => b.includes(foreign)), `还在扫 ${foreign}：${bases.join(" ")}`);
+    assert.ok(!home.some((b) => b.includes(foreign)), `还在扫 ${foreign}：${home.join(" ")}`);
   }
-  // 家目录不该再冒出一个 .claude/skills（那是 Claude Code 的共享库，不是这个 IDE 的）。
-  assert.ok(!bases.includes("/home/tester/.claude/skills"), bases.join(" "));
 });
 
 test("项目配置只读 .mcp.local.json 和 .mcp.json，合并后各自带着来源", async () => {
@@ -15235,19 +15245,27 @@ test("MCP and Skills settings cards expose live state and real deletion cleanup"
   assert.match(SRC, /_forgetMcpServer\(root, del\)/);
   assert.match(SRC, /mcpfp-badge--count/);
 
-  assert.match(SRC, /function _skillIsWorkspaceInstalled\(skill, root\)/);
-  // 原来钉的是 `.claude/skills`。那条发现路径 2026-08-18 已按用户要求整条删掉（「全部用我
-  // 自己目录」），源码里只剩注释复述了一句旧路径——于是这条断言守着一个生产里明令不许再
-  // 存在的东西，还照样绿。改钉真正的落点：工作区技能只装在本产品自己的状态目录下。
+  /*
+   * 这条以前钉的是 `_skillIsWorkspaceInstalled(skill, root)` 和
+   * `return base ? \`${base}/${_STATE_DIR}/skills\` : ""`（"工作区技能的安装根必须是
+   * <root>/.mrdayone/skills"）。2026-08-22 落点整条搬到家目录技能库：技能是跨项目复用的
+   * 能力，"装进这个工作区"这个概念本身没了，那两个函数也随之改名/删除。判据换成
+   * "是不是技能库里的"，跟打开哪个项目无关。
+   */
+  assert.match(SRC, /function _skillIsLibraryInstalled\(skill, skillsRoot\)/);
   assert.match(SRC, /const _STATE_DIR = "\.mrdayone";/);
-  assert.match(SRC, /return base \? `\$\{base\}\/\$\{_STATE_DIR\}\/skills` : "";/,
-    "工作区技能的安装根必须是 <root>/.mrdayone/skills");
+  assert.doesNotMatch(SRC, /function _skillWorkspaceInstallRoot/,
+    "工作区安装根又回来了——那正是「换个项目技能整批消失」的来源");
   assert.doesNotMatch(SRC, /\.claude\/skills/,
     "别的工具的技能目录不该在这个 IDE 里生效");
-  assert.match(SRC, /function _deleteSkillRecord\(skill, root, customList = null\)/);
-  // 删的仍然是这个技能自己的目录，只是先把路径读进局部变量再删（要在确认框里显示它）。
+  assert.match(SRC, /function _deleteSkillRecord\(skill, customList = null\)/);
+  // 删的仍然是这个技能自己的目录，只是先把路径读进局部变量（要在确认框里显示它）。
+  // 落盘那一下换成了技能库自己的命令：`backend.deletePath` 那条路会被
+  // require_inside_workspace 拒掉——技能库在 HOME 底下、不在任何已打开的工作区里。
   assert.match(extractFn("_deleteSkillRecord"), /const dir = String\(skill\.baseDir \|\| ""\)\.trim\(\);/);
-  assert.match(extractFn("_deleteSkillRecord"), /backend\.deletePath\(dir\)/);
+  assert.match(extractFn("_deleteSkillRecord", { code: true }), /backend\.invoke\("skills_delete", \{ name: dirName \}\)/);
+  assert.doesNotMatch(extractFn("_deleteSkillRecord", { code: true }), /backend\.deletePath/,
+    "又走通用删除了——那条路对 HOME 底下的技能库是 write denied");
   assert.match(extractFn("_deleteSkillRecord"), /await _saveSkills/);
   assert.match(extractFn("_deleteSkillRecord"), /_activeSkillIds\.delete\(skill\.id\)/);
   assert.match(SRC, /data-skfp-del/);
@@ -15296,20 +15314,25 @@ test("installed Skills render with the same marketplace card chrome and source m
   assert.match(SRC, /\.michael-skill\.json/);
   assert.match(extractFn("_refreshFileSkills"), /skill\._installMeta = meta/);
   assert.match(extractFn("_skillInstallDir"), /repoFull[\s\S]*installedAt/);
-  // 工作区那批和外部（家目录 / 插件缓存）那批要分开算——但两批都得**显示出来**。
-  //
-  // 这条以前钉的是"只显示工作区那批"。那样界面是干净了，代价是：家目录里的技能照样
-  // 被 _skillCatalogBlock 列给模型、被 _activeSkillsBlock 注入每一次请求，而用户在
-  // 面板里根本看不到它们——看不见的东西关不掉。所以改成分两段渲染：主列表保持干净，
-  // 外部那批单独一段、标明只读。
-  assert.match(extractFn("renderSkillsTool"), /const visibleFileSkills = fileSkills\.filter\(\(skill\) => _skillIsWorkspaceInstalled\(skill, root\)\)/,
-    "工作区那批要单独算出来——installedDirs 只能来自它");
-  assert.match(extractFn("renderSkillsTool"), /const externalFileSkills = fileSkills\.filter\(\(skill\) => !_skillIsWorkspaceInstalled\(skill, root\)\)/,
-    "家目录/插件目录的技能没被算出来，面板会显示成「还没有技能」");
-  assert.match(extractFn("renderSkillsTool"), /installedDirs = new Set\(visibleFileSkills\.map/,
-    "installedDirs 必须只来自工作区那批，否则市场里的「安装」按钮会错误地变灰");
-  assert.match(extractFn("renderSkillsTool"), /skfp-section/,
-    "外部技能要有自己的分段标题，不能和工作区那批混在一起");
+  /*
+   * 面板显示的必须是**模型手上的全部技能**。
+   *
+   * 这条改过两轮。最早钉的是"只显示工作区那批"：界面干净了，代价是家目录里的技能照样
+   * 被 _skillCatalogBlock 列给模型、被 _activeSkillsBlock 注入每一次请求，而用户在面板
+   * 里根本看不到——看不见的东西关不掉。于是改成分两段渲染（工作区 + 外部）。
+   *
+   * 2026-08-22 落点统一到家目录技能库，那个分段在描述一个不存在的区别，一并去掉。
+   * installedDirs 也跟着改：它驱动市场卡片的「已安装」徽标，只算"装进当前工作区"的
+   * 那批会恒为空——每张卡片永远显示「安装」，用户重复点、反复覆盖已有目录。
+   */
+  assert.match(extractFn("renderSkillsTool"), /const fileSkills = await _refreshFileSkills\(\);/,
+    "面板没去扫技能库");
+  assert.match(extractFn("renderSkillsTool"), /allSkills = \[\.\.\.custom, \.\.\.fileSkills\];/,
+    "面板显示的不是模型手上的全部技能");
+  assert.match(extractFn("renderSkillsTool"), /installedDirs = new Set\(fileSkills\.map/,
+    "installedDirs 又只取子集了，市场里的「安装」按钮会永远不变灰");
+  assert.doesNotMatch(extractFn("renderSkillsTool"), /_skillIsWorkspaceInstalled/,
+    "又按工作区分了两批，而技能只有技能库一个落点");
   assert.match(extractFn("renderSkillsTool"), /mcpfp-card mcpfp-card--installed/);
   assert.match(extractFn("renderSkillsTool"), /_skillCardIconHtml\(s, iconOwner\)/);
   assert.match(extractFn("renderSkillsTool"), /mcpfp-card__btns/);
@@ -28831,18 +28854,29 @@ test("模型加的 MCP 服务必须钉 approve:ask，且只碰用户自己的配
   assert.doesNotMatch(listBranch, /_writeOwnMcpConfig|_setMcpServerDisabled/, "list 里出现了写入");
 });
 
-// ---- 存技能没有工作区时，自己建，别把活推回给用户 ----
-test("save_skill 没有工作区时指向 create_project，而不是让用户去开文件夹", () => {
+// ---- 存技能跟工作区无关：它落在家目录技能库 ----
+//
+// 这条以前叫「save_skill 没有工作区时指向 create_project」：没打开文件夹就拒绝，并让模型
+// 先去 create_project 建一个目录。那个前提 2026-08-22 消失了——技能是**跨项目复用的能力**，
+// 落点是 `~/.mrdayone/skills/<名字>/SKILL.md`，跟有没有打开项目无关。原来那条路把全局能力
+// 绑在了"当时打开的那个项目"上，换个项目技能就没了。
+test("save_skill 不再依赖工作区，落点是家目录技能库", () => {
   const at = RAW_SRC.indexOf('} else if (call.type === "saveskill") {');
   assert.ok(at > 0, "save_skill 的执行分支找不到了");
   const exec = SRC.slice(at, RAW_SRC.indexOf('} else if (call.type ===', at + 40));
-  assert.match(exec, /create_project/, "没告诉它自己建目录，这一步就会被推回给用户");
+  assert.doesNotMatch(exec, /create_project/,
+    "又让模型先去建项目了 —— 全局技能不需要工作区");
+  assert.doesNotMatch(exec, /if \(!root\)/,
+    "又拿工作区当前提了");
   assert.doesNotMatch(stripJsComments(exec), /请用户|让用户打开|提示用户先打开/, "又把活推回给用户了");
-  // 落点必须用产品目录常量拼，不许再手写别人的目录名。
-  assert.match(exec, /\$\{_STATE_DIR\}\/skills\//, "技能落点没走产品目录常量");
-  // 写完要让下一轮真的重扫，否则「下一轮生效」这句话又是空的。
-  assert.match(exec, /_fileSkillsCacheKey = "";/,
-    "没清技能目录缓存 —— 这一轮写的技能要等换工作区才会被发现，而提示词承诺了下一轮生效");
+  // 落点来自 Rust 侧的技能库路径，不在 JS 里拼（app_dir 会回退到老的 .michael-ide）。
+  assert.match(exec, /await _skillsHomeRoot\(\)/, "技能落点没走技能库");
+  assert.match(exec, /backend\.invoke\("skills_write_file"/,
+    "又走通用写文件了 —— 那条路对 HOME 底下的技能库是 write denied");
+  // 写完要清缓存**并且**重扫：不重扫的话同一个 run 里 read_skill 读不回刚存的技能。
+  assert.match(exec, /_fileSkillsCacheKey = "";/, "没清技能目录缓存");
+  assert.match(exec, /await _refreshFileSkills\(\)/,
+    "只清了缓存没重扫 —— read_skill 查的是模块级 _fileSkills，run 内没有别的地方会触发重扫");
 });
 
 // ---- 纯读检索工具不许待在 includeWrite 块里 ----
