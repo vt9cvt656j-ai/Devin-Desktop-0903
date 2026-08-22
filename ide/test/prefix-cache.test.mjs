@@ -115,7 +115,11 @@ test("a brand-new session waits, briefly and once, before sending an empty profi
     `${windowMs}ms window: this arm only fires when the verdict is slower than it — sizing it for`
     + " the slow case means every message pays that wall-clock time on top of an already slow upstream");
 
-  const guard = /if \(_turnIntentState && !\(sess\._semanticProfileFlags \|\| \[\]\)\.length && !sess\._intentWaitPaid\) \{/;
+  // 「画像还空吗」现在抽成了 _profileStillEmpty —— 因为快通道的**发送**要用同一个判据，
+  // 而发送不该看 _intentWaitPaid（看了就会连发送一起被记账关掉）。两条性质分别钉住：
+  assert.match(SRC, /const _profileStillEmpty = !\(sess\._semanticProfileFlags \|\| \[\]\)\.length;/,
+    "「画像还空吗」必须仍然由 _semanticProfileFlags 决定，不能换成别的近似判据");
+  const guard = /if \(_turnIntentState && _profileStillEmpty && !sess\._intentWaitPaid\) \{/;
   assert.match(SRC, guard,
     "the wait must be gated on the session having no flags yet AND not having paid already —"
     + " a plain-Q&A verdict legitimately returns zero flags, so the flags test alone makes every"
@@ -128,6 +132,8 @@ test("a brand-new session waits, briefly and once, before sending an empty profi
   // 快通道落定时那次并集写入——那一次刻意排在等待之前（它是个 .then 回调，落定时才跑），
   // 于是这条断言会把一个正确的实现判成红。
   const waitAt = SRC.search(guard);
+  // 要比的是**本轮请求头那一次**赋值。快通道落定后也会赋一次（在 guard 之前的 .then 里），
+  // 拿它来比会把顺序判反——所以这里按后者独有的 _semanticProfileHeaderFor 精确定位。
   const assignAt = SRC.indexOf("config.ideSemanticProfile = _sessionStableSemanticProfile(sess, _semanticProfileHeaderFor(");
   assert.ok(waitAt > 0 && assignAt > waitAt,
     "the wait must precede the profile assignment it exists to inform");
