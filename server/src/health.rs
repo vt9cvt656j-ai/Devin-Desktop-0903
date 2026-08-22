@@ -130,6 +130,20 @@ async fn probe(state: &AppState, base_url: &str) -> (bool, Option<i32>, Option<i
     }
 }
 
+/// `GET /health` — 容器活性探针 + 一小撮进程内计数器。
+///
+/// 部署脚本和 Docker healthcheck 只看 HTTP 200（`curl -fsS` / `urllib.urlopen`），
+/// 不解析 body，所以从纯文本 "ok" 换成 JSON 不改任何探活语义；`"status":"ok"`
+/// 让人肉 curl 的读感也不变。响应缓存三计数器挂在这里：它是唯一免鉴权、每台实例
+/// 各自应答的端点，正适合回答「没人命中还是根本没在记」。进程内计数，重启归零。
+pub async fn liveness() -> Json<serde_json::Value> {
+    let (hit, miss, store) = crate::models::response_cache_counters();
+    Json(json!({
+        "status": "ok",
+        "response_cache": { "hit": hit, "miss": miss, "store": store },
+    }))
+}
+
 #[derive(serde::Deserialize)]
 pub struct StatusQuery {
     /// Availability window in days. Clamped to the three the page offers.
@@ -293,6 +307,19 @@ mod tests {
             assert!(
                 !body.contains(leaked),
                 "the status payload must not expose `{leaked}`"
+            );
+        }
+    }
+
+    /// /health 必须暴露响应缓存三计数器，且保持 "ok" 语义（部署脚本按 200 探活）。
+    #[tokio::test]
+    async fn liveness_reports_response_cache_counters() {
+        let v = super::liveness().await.0;
+        assert_eq!(v["status"], "ok");
+        for key in ["hit", "miss", "store"] {
+            assert!(
+                v["response_cache"][key].is_u64(),
+                "缺了 response_cache.{key} 计数器"
             );
         }
     }

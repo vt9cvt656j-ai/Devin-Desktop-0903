@@ -830,6 +830,88 @@ fn chat_upstream_retry_delay(attempt: u32) -> Duration {
     Duration::from_millis(chat_upstream_retry_base_delay_ms(attempt) + jitter_ms)
 }
 
+/// ── 429 单线路排队（B5）────────────────────────────────────────────────────
+///
+/// 牛来（stealth/ox-alpha）这类模型只有一条线路：换线逻辑无路可换，429 重试耗尽后
+/// 直接怼回用户。实测 24h 内 57 次请求 26 次 429。上游自己会用 Retry-After 说
+/// 「等多久再来」，所以单线路时按它有界地排一小段队，比立刻把 429 透传更接近
+/// 用户想要的结果。
+///
+/// **总预算**：所有排队等待加起来不超过这个数。它必须显著小于 ROUTE_BUDGET（58s），
+/// 否则排队本身会吃光找线路的时间；且排队每一步还要单独让位给客户端死线
+/// （见 rate_limit_queue_delay 的死线判定）。
+const RATE_LIMIT_QUEUE_TOTAL_WAIT: Duration = Duration::from_secs(20);
+/// 一次用户发送里，429 排队重试的次数上限（不含最初那一发）。
+const RATE_LIMIT_QUEUE_MAX_RETRIES: u32 = 2;
+/// 上游没给 Retry-After（或给了 0）时的固定小退避。给 0 也不许立刻重发：
+/// 对着一个刚说完「太频繁」的上游热循环，只会把 2 次重试机会在毫秒内烧光。
+const RATE_LIMIT_QUEUE_FALLBACK_DELAY: Duration = Duration::from_secs(2);
+
+/// 解析 Retry-After 头。RFC 9110 允许两种形态，都得认：
+///   * 非负整数秒数：`Retry-After: 7`
+///   * HTTP 日期（IMF-fixdate）：`Retry-After: Sat, 22 Aug 2026 12:00:09 GMT`
+/// 认不出（负数、乱写、空串）返回 None，调用方落回固定小退避。
+/// `now` 由调用方注入，测试才能给一个确定的时钟。
+fn parse_retry_after(value: &str, now: chrono::DateTime<chrono::Utc>) -> Option<Duration> {
+    let v = value.trim();
+    if v.is_empty() {
+        return None;
+    }
+    if let Ok(secs) = v.parse::<u64>() {
+        return Some(Duration::from_secs(secs));
+    }
+    // chrono 的 RFC 2822 解析器认 IMF-fixdate（含 GMT 这类过时区名）。
+    let at = chrono::DateTime::parse_from_rfc2822(v).ok()?;
+    let delta_ms = at.timestamp_millis().saturating_sub(now.timestamp_millis());
+    if delta_ms <= 0 {
+        // 过去的日期 = 上游说「现在就可以重试」。
+        return Some(Duration::ZERO);
+    }
+    Some(Duration::from_millis(delta_ms as u64))
+}
+
+/// 这一次 429 排队该等多久；None = 不该再等，把真实的 429 透传给客户端。
+///
+/// 两道上限，`None` 的理由各不相同：
+///   * **预算封顶**：`already_waited + 等待 ≤ RATE_LIMIT_QUEUE_TOTAL_WAIT`。上游要求的
+///     等待比剩余预算还长时，等一个不足额的时长再重试几乎必然再吃一次 429 ——
+///     不如立刻把真话给用户。
+///   * **死线优先**：等完之后还得剩下一个可用的发送窗口（MIN_VIABLE_HEADER_WAIT），
+///     否则这次排队注定发不出去。`until_route_deadline` 来自 route_deadline，而它由
+///     route_budget_with_client_patience 从客户端的 response-deadline/budget 头算出，
+///     所以**绝不会等到客户端死线之后**——客户端已经断了还在替它排队，是双输。
+fn rate_limit_queue_delay(
+    retry_after: Option<Duration>,
+    already_waited: Duration,
+    until_route_deadline: Duration,
+) -> Option<Duration> {
+    let want = match retry_after {
+        Some(d) if !d.is_zero() => d,
+        _ => RATE_LIMIT_QUEUE_FALLBACK_DELAY,
+    };
+    let budget_left = RATE_LIMIT_QUEUE_TOTAL_WAIT.checked_sub(already_waited)?;
+    if want > budget_left {
+        return None;
+    }
+    if want + MIN_VIABLE_HEADER_WAIT > until_route_deadline {
+        return None;
+    }
+    Some(want)
+}
+
+/// 排队预算用完仍被限流时，追加在最终错误文案后面的说明。
+/// 只在「真排过队」且「最终就是 429」时开口：排队后败给了别的错误（比如重试那一发
+/// 卡死成 504），再说「仍被限流」就是在骗用户。
+fn rate_limit_exhausted_note(final_status: u16, waited: Duration) -> String {
+    if final_status != 429 || waited.is_zero() {
+        return String::new();
+    }
+    format!(
+        "（上游限流：网关已排队等待 {:.1} 秒仍被限流，建议稍后再试）",
+        waited.as_secs_f64()
+    )
+}
+
 fn route_cooldown_remaining(id: uuid::Uuid, now: Instant) -> Option<Duration> {
     let mut guard = CHAT_UPSTREAM_ROUTE_COOLDOWNS.lock().ok()?;
     match guard.get(&id).copied() {
@@ -4491,6 +4573,55 @@ fn usable_completion(data: &serde_json::Value) -> bool {
     has_text || has_tools
 }
 
+/// ── 响应缓存遥测（B6）────────────────────────────────────────────────────
+///
+/// 近 6h 日志里 grep "response cache" 为 0——分不清「没人命中」和「根本没在记」。
+/// 三个事件（命中 / 未命中 / 写入）各打一条 info!，字段名固定 response_cache=
+/// hit|miss|store（面板和 grep 都按这个名字找），并配三个进程内计数器，由
+/// GET /health 暴露（health::liveness）。计数器是进程内的，重启归零。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum ResponseCacheEvent {
+    Hit,
+    Miss,
+    Store,
+}
+
+impl ResponseCacheEvent {
+    fn as_str(self) -> &'static str {
+        match self {
+            ResponseCacheEvent::Hit => "hit",
+            ResponseCacheEvent::Miss => "miss",
+            ResponseCacheEvent::Store => "store",
+        }
+    }
+}
+
+static RESPONSE_CACHE_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static RESPONSE_CACHE_MISSES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static RESPONSE_CACHE_STORES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// 记一次响应缓存事件：计数 + 结构化日志一次完成，调用点不可能只做一半。
+pub(crate) fn note_response_cache(event: ResponseCacheEvent, model: &str) {
+    use std::sync::atomic::Ordering;
+    let counter = match event {
+        ResponseCacheEvent::Hit => &RESPONSE_CACHE_HITS,
+        ResponseCacheEvent::Miss => &RESPONSE_CACHE_MISSES,
+        ResponseCacheEvent::Store => &RESPONSE_CACHE_STORES,
+    };
+    counter.fetch_add(1, Ordering::Relaxed);
+    tracing::info!(response_cache = event.as_str(), model = %model, "response cache event");
+}
+
+/// (hit, miss, store) 快照，给 /health 用。
+pub(crate) fn response_cache_counters() -> (u64, u64, u64) {
+    use std::sync::atomic::Ordering;
+    (
+        RESPONSE_CACHE_HITS.load(Ordering::Relaxed),
+        RESPONSE_CACHE_MISSES.load(Ordering::Relaxed),
+        RESPONSE_CACHE_STORES.load(Ordering::Relaxed),
+    )
+}
+
 fn response_cache_safe(bytes: &[u8]) -> bool {
     // Tool-call arguments contain the user's full tracking number. The native tool
     // masks its result, but caching the model response would retain the original
@@ -7777,6 +7908,7 @@ pub async fn chat_completions(
             .ok()
             .flatten();
         if let Some(bytes) = hit.filter(|bytes| response_cache_safe(bytes)) {
+            note_response_cache(ResponseCacheEvent::Hit, &model_id);
             bill(
                 &state,
                 uid,
@@ -7818,6 +7950,9 @@ pub async fn chat_completions(
                 .body(Body::from(bytes))
                 .map_err(|e| AppError::internal(e.to_string()));
         }
+        // 命中路径在上面 return 了；走到这里就是未命中。Redis 出错、取到但判不安全
+        // 也算未命中——对用户的效果一样是「这次得打上游」。
+        note_response_cache(ResponseCacheEvent::Miss, &model_id);
     }
     // ── max_tokens guardrail for thinking (all protocols) ───────────────────
     // Chinese aggregators (zyz etc.) convert reasoning_effort / thinking to Anthropic thinking
@@ -7880,6 +8015,10 @@ pub async fn chat_completions(
         let mut err_low = String::new();
         let mut selected_conn = None;
         let mut attempted_sends = 0u32;
+        // 429 单线路排队的累计等待与次数（见 RATE_LIMIT_QUEUE_* 常量）。跨整轮存活：
+        // 最终还是失败时，错误文案要能说出「网关已经替你等了多久」。
+        let mut rate_limit_waited = Duration::ZERO;
+        let mut rate_limit_retries = 0u32;
         let now = Instant::now();
         // Total budget for finding a working upstream route, and a per-attempt ceiling
         // on the header wait.
@@ -8056,7 +8195,12 @@ pub async fn chat_completions(
             // happen after the supplier accepted the body, so a fresh send is not reliably
             // idempotent and may duplicate both model work and billing.
             let candidate_max_attempts = CHAT_UPSTREAM_MAX_ATTEMPTS_PER_ROUTE;
-            for attempt in 0u32..candidate_max_attempts {
+            // 429 排队重试解锁的额外同路发送次数。只有下面「完整 429 响应 + 单线路」的
+            // 排队分支会给它 +1；其余一切路径下恒为 0，此时这个 while 与原来的
+            // `for attempt in 0..candidate_max_attempts` 完全等价。
+            let mut rate_limit_extra_attempts = 0u32;
+            let mut attempt = 0u32;
+            while attempt < candidate_max_attempts + rate_limit_extra_attempts {
                 // Out of budget: stop probing and let the caller report the last error,
                 // so the client gets a real response instead of timing out and retrying.
                 let remaining = route_deadline.saturating_duration_since(Instant::now());
@@ -8209,6 +8353,15 @@ pub async fn chat_completions(
                         // 上游把话说完了：它没跑模型，也不会为这一次计费 —— 换线是安全的。
                         upstream_answered_with_error = true;
                         err_status = r.status().as_u16();
+                        // Retry-After 必须在 .text() 消费掉响应之前取出来；只有 429 用得上。
+                        let retry_after_header = (err_status == 429)
+                            .then(|| {
+                                r.headers()
+                                    .get(reqwest::header::RETRY_AFTER)
+                                    .and_then(|v| v.to_str().ok())
+                                    .map(str::to_owned)
+                            })
+                            .flatten();
                         route_health::spawn_fail(&state, candidate.id, err_status);
                         let error_body_wait = route_deadline
                             .saturating_duration_since(Instant::now())
@@ -8269,6 +8422,51 @@ pub async fn chat_completions(
                             }
                             break;
                         }
+                        // ── 429 且该模型只有这一条线路：按 Retry-After 有界排队后原路重试 ──
+                        //
+                        // 多线路时不进这条分支：既有的「上游明确答错 → 换同模型线路」逻辑
+                        // 照旧优先，行为与改动前一致。
+                        //
+                        // 计费不变量（见 one_send_per_route_*）：一次用户发送最多对应一次
+                        // **计费**的上游调用。一个完整的 429 响应意味着上游没跑模型、也不会
+                        // 为它计费——和「上游明确答错时允许换线」同一条理由——所以这里的
+                        // 同路重试只是把一次被拒之门外的请求再递一次，不违反不变量。
+                        // 卡死 / 发送出错（上游可能已收下 body、可能在跑）仍然一次都不重发，
+                        // 那两道闸在超时分支和 Err 分支里，原样没动。
+                        if err_status == 429
+                            && route_count <= 1
+                            && rate_limit_retries < RATE_LIMIT_QUEUE_MAX_RETRIES
+                        {
+                            let parsed = retry_after_header
+                                .as_deref()
+                                .and_then(|v| parse_retry_after(v, chrono::Utc::now()));
+                            let until_deadline =
+                                route_deadline.saturating_duration_since(Instant::now());
+                            if let Some(delay) =
+                                rate_limit_queue_delay(parsed, rate_limit_waited, until_deadline)
+                            {
+                                rate_limit_retries += 1;
+                                tracing::info!(
+                                    request_id = request_id.as_deref().unwrap_or(""),
+                                    model = %model_id,
+                                    route_id = %candidate.id,
+                                    retry_after_secs = delay.as_secs_f64(),
+                                    attempt = rate_limit_retries,
+                                    retry_after_header_present = parsed.is_some(),
+                                    queued_ms_so_far = rate_limit_waited.as_millis() as u64,
+                                    "上游限流且该模型只有一条线路：按 Retry-After 排队后原路重试"
+                                );
+                                tokio::time::sleep(delay).await;
+                                rate_limit_waited += delay;
+                                rate_limit_extra_attempts += 1;
+                                attempt += 1;
+                                continue;
+                            }
+                            // 预算 / 客户端死线容不下这次等待 → 不再等，把真实的 429
+                            // 透传出去；最终文案会带上已排队的时长（rate_limit_exhausted_note）。
+                            route_failed_transient = true;
+                            break;
+                        }
                         if attempt + 1 >= candidate_max_attempts {
                             route_failed_transient = true;
                             break;
@@ -8302,6 +8500,7 @@ pub async fn chat_completions(
                         }
                     }
                 }
+                attempt += 1;
             }
             if route_failed_persistent {
                 // 坏 key 不会在 20 秒内变好，冷却时间要长得多，避免它反复回到轮换里
@@ -8352,17 +8551,19 @@ pub async fn chat_completions(
                     error_excerpt = %safe_upstream_error_excerpt(&err_low),
                     attempted_sends,
                     route_count,
+                    rate_limit_queued_ms = rate_limit_waited.as_millis() as u64,
                     "returning classified upstream failure"
                 );
                 let msg = format!(
-                    "【{model_name}】{}{}",
+                    "【{model_name}】{}{}{}",
                     friendly_upstream(err_status, &err_low),
                     chat_upstream_attempt_suffix(
                         route_count,
                         attempted_sends,
                         err_status,
                         want_power
-                    )
+                    ),
+                    rate_limit_exhausted_note(err_status, rate_limit_waited)
                 );
                 if headers.contains_key("x-ide-mode") {
                     return Response::builder()
@@ -8775,13 +8976,18 @@ pub async fn chat_completions(
             // 命中缓存就会拿回同一份坏流，钳位后的重试永远打不到上游。
             if complete && !relay_dropped_blocks && !thinking_went_missing && !acc.is_empty() && acc.len() < 1_000_000 && response_cache_safe(&acc) {
                 let mut rconn = st.redis.clone();
-                let _: Result<(), redis::RedisError> = redis::cmd("SET")
+                let stored: Result<(), redis::RedisError> = redis::cmd("SET")
                     .arg(&ckey_task)
                     .arg(acc)
                     .arg("EX")
                     .arg(3600i64)
                     .query_async(&mut rconn)
                     .await;
+                // 只在真的写进去时才记 store：Redis 抖动写失败还记一笔，命中率
+                // 就会被高估（store 多、hit 永远追不上）。
+                if stored.is_ok() {
+                    note_response_cache(ResponseCacheEvent::Store, &req_model);
+                }
             }
             bill(&st, uid, cid, cost, use_quota, &tokens, free_pool, free_micro).await;
         });
@@ -8854,13 +9060,16 @@ pub async fn chat_completions(
         if let Ok(bytes) = serde_json::to_vec(&data) {
             if !bytes.is_empty() && bytes.len() < 1_000_000 && response_cache_safe(&bytes) && usable_completion(&data) {
                 let mut rconn = state.redis.clone();
-                let _: Result<(), redis::RedisError> = redis::cmd("SET")
+                let stored: Result<(), redis::RedisError> = redis::cmd("SET")
                     .arg(&ckey)
                     .arg(bytes)
                     .arg("EX")
                     .arg(3600i64)
                     .query_async(&mut rconn)
                     .await;
+                if stored.is_ok() {
+                    note_response_cache(ResponseCacheEvent::Store, &model_id);
+                }
             }
         }
         let mut free_pool = false;
@@ -9701,6 +9910,205 @@ mod billing_tests {
             loop_src.matches(set_site).count(),
             1,
             "只允许在「收到完整错误响应」那一支置位；多一处就等于把卡死也放进了换线路径",
+        );
+    }
+
+    // ── B5：429 单线路按 Retry-After 有界排队 ──────────────────────────────
+
+    /// Retry-After 的两种线上形态（RFC 9110）都得认：整数秒数、HTTP 日期。
+    #[test]
+    fn retry_after_parses_both_wire_formats() {
+        use chrono::TimeZone;
+        use std::time::Duration;
+        let now = chrono::Utc.with_ymd_and_hms(2026, 8, 22, 12, 0, 0).unwrap();
+        // 形态一：非负整数秒
+        assert_eq!(
+            super::parse_retry_after("7", now),
+            Some(Duration::from_secs(7))
+        );
+        assert_eq!(super::parse_retry_after(" 0 ", now), Some(Duration::ZERO));
+        // 形态二：HTTP 日期（IMF-fixdate，带 GMT）。用 format 生成，星期几永远自洽。
+        let at = now + chrono::Duration::seconds(9);
+        let http_date = at.format("%a, %d %b %Y %H:%M:%S GMT").to_string();
+        assert_eq!(
+            super::parse_retry_after(&http_date, now),
+            Some(Duration::from_secs(9)),
+            "HTTP 日期形态没认出来：{http_date}"
+        );
+        // 过去的日期 = 上游说「现在就可以」。
+        let past = (now - chrono::Duration::seconds(60))
+            .format("%a, %d %b %Y %H:%M:%S GMT")
+            .to_string();
+        assert_eq!(super::parse_retry_after(&past, now), Some(Duration::ZERO));
+        // 认不出的一律 None，调用方落回固定小退避。
+        assert_eq!(super::parse_retry_after("soon", now), None);
+        assert_eq!(super::parse_retry_after("-3", now), None);
+        assert_eq!(super::parse_retry_after("", now), None);
+    }
+
+    /// 排队预算封顶：具名常量 ≤20s、最多重试 2 次；上游要求超预算就不等。
+    #[test]
+    fn rate_limit_queue_is_capped_by_the_named_budget() {
+        use std::time::Duration;
+        assert_eq!(super::RATE_LIMIT_QUEUE_TOTAL_WAIT, Duration::from_secs(20));
+        assert_eq!(super::RATE_LIMIT_QUEUE_MAX_RETRIES, 2);
+        assert!(super::RATE_LIMIT_QUEUE_FALLBACK_DELAY <= Duration::from_secs(5));
+
+        let far = Duration::from_secs(600);
+        // 没有 Retry-After → 固定小退避。
+        assert_eq!(
+            super::rate_limit_queue_delay(None, Duration::ZERO, far),
+            Some(super::RATE_LIMIT_QUEUE_FALLBACK_DELAY)
+        );
+        // Retry-After: 0 同样落到固定退避——不许对刚限流的上游热循环重发。
+        assert_eq!(
+            super::rate_limit_queue_delay(Some(Duration::ZERO), Duration::ZERO, far),
+            Some(super::RATE_LIMIT_QUEUE_FALLBACK_DELAY)
+        );
+        // 上游要求 30s > 总预算 20s：等一个不足额的时长几乎必然再 429，直接放弃。
+        assert_eq!(
+            super::rate_limit_queue_delay(Some(Duration::from_secs(30)), Duration::ZERO, far),
+            None
+        );
+        // 已等 19s，再要 2s 会破 20s 预算 → 放弃。
+        assert_eq!(
+            super::rate_limit_queue_delay(
+                Some(Duration::from_secs(2)),
+                Duration::from_secs(19),
+                far
+            ),
+            None
+        );
+        // 已等 18s，再要 2s 恰好贴满预算 → 允许。
+        assert_eq!(
+            super::rate_limit_queue_delay(
+                Some(Duration::from_secs(2)),
+                Duration::from_secs(18),
+                far
+            ),
+            Some(Duration::from_secs(2))
+        );
+        // 预算彻底烧完之后，连固定退避也不给。
+        assert_eq!(
+            super::rate_limit_queue_delay(None, Duration::from_secs(20), far),
+            None
+        );
+    }
+
+    /// 客户端死线永远压过排队预算：等完之后塞不进一个可用发送窗口就不等。
+    #[test]
+    fn client_deadline_outranks_the_rate_limit_queue_budget() {
+        use std::time::Duration;
+        let want = Some(Duration::from_secs(5));
+        // 预算装得下（5 ≤ 20），但 5s 等待 + 发送地板（MIN_VIABLE_HEADER_WAIT=3s）
+        // 超过死线剩余的 6s → 不等，立刻把 429 透传。
+        assert_eq!(
+            super::rate_limit_queue_delay(want, Duration::ZERO, Duration::from_secs(6)),
+            None
+        );
+        // 死线够宽（5 + 3 ≤ 9）才允许排队。
+        assert_eq!(
+            super::rate_limit_queue_delay(want, Duration::ZERO, Duration::from_secs(9)),
+            Some(Duration::from_secs(5))
+        );
+    }
+
+    /// 透传 429 的最终文案要说「上游限流 / 建议稍后再试 / 等了多久」，且只在
+    /// 真排过队、最终仍是 429 时开口。
+    #[test]
+    fn the_exhausted_note_names_the_wait_and_only_fires_on_429() {
+        use std::time::Duration;
+        let note = super::rate_limit_exhausted_note(429, Duration::from_millis(12_500));
+        assert!(note.contains("上游限流"), "{note}");
+        assert!(note.contains("建议稍后再试"), "{note}");
+        assert!(note.contains("12.5"), "要把等了多久说出来：{note}");
+        assert_eq!(super::rate_limit_exhausted_note(429, Duration::ZERO), "");
+        assert_eq!(
+            super::rate_limit_exhausted_note(502, Duration::from_secs(3)),
+            "",
+            "排队后败给别的错误时不许再说「仍被限流」"
+        );
+    }
+
+    /// 429 排队分支的三道闸不许被单独拆掉：完整 429 判据、单线路判据、次数上限。
+    /// （单测起不了真 HTTP 上游，至少把结构钉住——拆掉任何一道闸都转红。）
+    #[test]
+    fn the_429_queue_branch_keeps_its_guards() {
+        const SRC: &str = include_str!("models.rs");
+        let prod_raw = &SRC[..SRC.find("mod billing_tests").expect("tests module")];
+        // 先剥行注释再断言，别让说明文字替实现背书（本仓踩过）。
+        let prod: String = prod_raw
+            .lines()
+            .map(|l| match l.find("//") {
+                Some(i) => &l[..i],
+                None => l,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let at = prod
+            .find("rate_limit_queue_delay(parsed")
+            .expect("429 排队分支没了");
+        // 按字符往回取窗口（不许按字节切中文源码），窗口给足以覆盖整段分支头。
+        let head: String = prod[..at].chars().rev().take(1500).collect::<Vec<_>>().iter().rev().collect();
+        assert!(
+            head.contains("err_status == 429"),
+            "排队只许发生在完整的 429 响应上"
+        );
+        assert!(
+            head.contains("route_count <= 1"),
+            "多线路必须走既有换线逻辑，不许排队"
+        );
+        assert!(
+            head.contains("rate_limit_retries < RATE_LIMIT_QUEUE_MAX_RETRIES"),
+            "重试次数上限被拆掉了"
+        );
+    }
+
+    // ── B6：响应缓存遥测 ────────────────────────────────────────────────────
+
+    /// 三个计数器各记各的账。用差值断言：计数器是进程级的。
+    #[test]
+    fn response_cache_telemetry_counts_all_three_events() {
+        use super::{note_response_cache, response_cache_counters, ResponseCacheEvent};
+        let (h0, m0, s0) = response_cache_counters();
+        note_response_cache(ResponseCacheEvent::Hit, "m-test");
+        note_response_cache(ResponseCacheEvent::Miss, "m-test");
+        note_response_cache(ResponseCacheEvent::Miss, "m-test");
+        note_response_cache(ResponseCacheEvent::Store, "m-test");
+        let (h1, m1, s1) = response_cache_counters();
+        assert_eq!(h1 - h0, 1);
+        assert_eq!(m1 - m0, 2);
+        assert_eq!(s1 - s0, 1);
+    }
+
+    /// 记录点一个都不能少：GET 命中、GET 未命中、流式与非流式两个写入点。
+    /// 少一个，那一类事件就静默消失——正是这次要修的「grep 为 0」。
+    #[test]
+    fn response_cache_telemetry_is_wired_at_every_cache_touchpoint() {
+        const SRC: &str = include_str!("models.rs");
+        let prod_raw = &SRC[..SRC.find("mod billing_tests").expect("tests module")];
+        let prod: String = prod_raw
+            .lines()
+            .map(|l| match l.find("//") {
+                Some(i) => &l[..i],
+                None => l,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(
+            prod.matches("ResponseCacheEvent::Hit,").count(),
+            1,
+            "缓存命中的记录点没了"
+        );
+        assert_eq!(
+            prod.matches("ResponseCacheEvent::Miss,").count(),
+            1,
+            "缓存未命中的记录点没了"
+        );
+        assert_eq!(
+            prod.matches("ResponseCacheEvent::Store,").count(),
+            2,
+            "写入记录点应该恰好两个：流式 tee 与非流式 JSON"
         );
     }
 

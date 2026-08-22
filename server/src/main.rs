@@ -172,7 +172,7 @@ async fn main() -> anyhow::Result<()> {
     let app = Router::new()
         .route("/", get(root_redirect))
         .route("/api/logo.png", get(logo_png))
-        .route("/health", get(|| async { "ok" }))
+        .route("/health", get(health::liveness))
         // 加密层的引导。这两条永远明文、永远不要求加密 —— 给它们加密是循环依赖。
         // 拿公钥不需要登录：公钥是公开的，而任何客户端在有会话之前就得先能加密。
         .route("/api/crypto/pubkey", get(mse::pubkey))
