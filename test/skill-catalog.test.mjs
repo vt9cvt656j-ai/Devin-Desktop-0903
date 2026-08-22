@@ -158,12 +158,14 @@ test("技能：正文不被腰斩、描述不被提前砍死、allowed-tools 真
   assert.match(allow.slice(0, 900), /if \(!declaring\.length\) return null;/,
     "没有声明的技能也参与收窄了");
 
-  // ④ 只扫自有目录。这一条以前是反的（断言"要扫到 Claude Code 的插件市场"）——
-  //    按用户要求，别的工具的目录一个都不扫了。2026-08-18 用户再次点名「全部用我自己
-  //    目录」：工作区那条从 .claude/skills 也一并改到自有产品目录，两处同名。
-  const bases = SRC.slice(RAW_SRC.indexOf("function _skillDiscoveryBases"), RAW_SRC.indexOf("function _skillDiscoveryBases") + 700);
-  assert.match(bases, /\$\{root\}\/\$\{_STATE_DIR\}\/skills/, "工作区技能没扫，或又手写成了别人的目录名");
-  assert.match(bases, /\$\{_STATE_DIR\}\/skills/, "家目录那份自有技能库没扫");
+  // ④ 只扫**家目录技能库**这一处。这一条改过两次：最早断言"要扫到 Claude Code 的插件
+  //    市场"，2026-08-18 按用户要求改成"只扫自己的目录（工作区 + 家目录）"，
+  //    2026-08-22 再把工作区那条也删掉——技能是跨项目复用的能力，装进"当时打开的那个
+  //    项目"意味着换个项目整批消失，那正是用户报的"装完无法使用"。
+  const bases = topLevelFn("_skillDiscoveryBases", { code: true });
+  assert.match(bases, /\$\{_STATE_DIR\}\/skills/, "家目录那份技能库没扫");
+  assert.doesNotMatch(bases, /\$\{root\}/, "工作区那条发现路径又回来了");
+  assert.doesNotMatch(bases, /_workspaceAncestorRoots/, "还在按工作区祖先展开");
   // .claude 现在也在这张黑名单里：技能只落自己的目录。
   for (const foreign of ["plugins", ".cursor", ".codex", ".agents", ".claude"]) {
     assert.ok(!bases.includes(foreign), `还在扫别的工具的目录：${foreign}`);

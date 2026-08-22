@@ -2792,6 +2792,147 @@ fn write_user_doc(kind: &str, text: &str) -> Result<String, String> {
     Ok(path.to_string_lossy().into_owned())
 }
 
+// ── 用户级（跨项目）技能库 ────────────────────────────────────────────────────
+//
+// 技能是**跨项目复用的能力**，唯一的存放处是 `~/.mrdayone/skills/<名字>/`。项目里的
+// `.mrdayone/` 装的是这个项目的记忆（memory.md），不装技能——同一个技能装进"当时打开的
+// 那个项目"，换个项目就整批消失，那正是用户报的"装完无法使用"。
+//
+// 走**独立命令**的理由和 mcp.json / rules.md 完全一样，而且这里是硬性的：
+// `write_text_file` / `create_dir` / `delete_path` 那条路都先过
+// `require_inside_workspace(path, true)`，那个函数明确拒绝"在 HOME 底下但不在已打开工作区
+// 里"的写入（正是它挡住 ~/.ssh、~/.bashrc）。技能库就在 HOME 底下，前端只改路径不加命令的
+// 话，点安装当场拿到 `write denied: … is under HOME but not inside any opened workspace`。
+// 那道墙一寸都不许挖开，所以在它旁边开一条**作用域钉死**的窄路。
+//
+// **路径不接受调用方输入。** 命令只收技能名 + 技能目录内的相对路径，逐段白名单校验，
+// 绝对路径由这里自己拼；拼完再验一次结果确实落在技能根下面。
+const SKILLS_DIR: &str = "skills";
+/// 单个技能文件的上限。SKILL.md 前端按 256 KB 读，装的时候还会带脚本和参考资料；
+/// 1 MB 够用，同时挡住"把一整个仓库塞进技能目录"。
+const MAX_SKILL_FILE_BYTES: usize = 1024 * 1024;
+/// 技能目录内相对路径的最大深度（市场装的是 `<技能>/scripts/x.py` 这种形状）。
+const MAX_SKILL_REL_DEPTH: usize = 8;
+
+fn skills_root() -> Result<std::path::PathBuf, String> {
+    Ok(app_dir()?.join(SKILLS_DIR))
+}
+
+/// 一段路径的白名单校验。**这是这组命令唯一的安全边界**，所以判据写死在这里，不靠调用方
+/// 自觉：`..`、`.`、空串、分隔符、盘符冒号、通配符、控制字符一律拒。
+///
+/// 允许开头的点：技能目录里有 `.mrdayone-skill.json`（安装来源元数据）。但 `.` 和 `..`
+/// 本身是逐字拒的——它们是唯一能把路径带出技能根的两段。
+fn skill_segment(seg: &str) -> Result<(), String> {
+    if seg.is_empty() || seg == "." || seg == ".." {
+        return Err(format!("技能路径里有非法的一段：{seg:?}"));
+    }
+    if seg.len() > 64 {
+        return Err(format!("技能路径里有一段太长（上限 64 字节）：{seg:?}"));
+    }
+    if seg
+        .chars()
+        .any(|c| c.is_control() || matches!(c, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|'))
+    {
+        return Err(format!("技能路径里有非法字符：{seg:?}"));
+    }
+    Ok(())
+}
+
+/// `<技能库>/<name>/<rel>` 的绝对路径。逐段校验之后**再验一次** starts_with——分段合法
+/// 不等于拼出来的结果一定在根下面，这一步是兜底。
+///
+/// 根作参数是为了能在测试里用临时目录跑完整往返（和 `save_user_config_at` 同一个理由）；
+/// **命令本身不接受调用方给根**，那会把 HOME 底下任意目录变成可写目标。
+fn skill_file_path(root: &std::path::Path, name: &str, rel: &str) -> Result<std::path::PathBuf, String> {
+    skill_segment(name)?;
+    // 绝对路径**报错**而不是悄悄当成相对的。剥掉开头的斜杠之后 `/etc/passwd` 会落成
+    // `<技能>/etc/passwd`——是安全的，但那不是调用方想要的东西，静默改写比拒绝更糟。
+    if rel.starts_with('/') || rel.starts_with('\\') {
+        return Err(format!("技能文件的相对路径不能以分隔符开头：{rel:?}"));
+    }
+    let segs: Vec<&str> = rel.split('/').filter(|s| !s.is_empty()).collect();
+    if segs.is_empty() {
+        return Err("技能文件的相对路径不能为空".to_string());
+    }
+    if segs.len() > MAX_SKILL_REL_DEPTH {
+        return Err(format!(
+            "技能文件的相对路径太深（{} 层，上限 {MAX_SKILL_REL_DEPTH}）",
+            segs.len()
+        ));
+    }
+    for seg in &segs {
+        skill_segment(seg)?;
+    }
+    let mut path = root.join(name);
+    for seg in &segs {
+        path.push(seg);
+    }
+    if !path.starts_with(root) {
+        return Err("技能路径越界".to_string());
+    }
+    Ok(path)
+}
+
+/// 技能库的绝对路径，顺手把目录建出来。前端拿它做**发现路径**和落点显示。
+///
+/// 走这条而不是在 JS 里拼 `~/.mrdayone/skills`：`app_dir()` 会经 `migrate_app_dir` 回退到
+/// 老的 `.michael-ide`，JS 侧的常量不知道这回事，两边会指到不同目录。
+#[tauri::command]
+pub fn skills_dir() -> Result<String, String> {
+    let root = skills_root()?;
+    std::fs::create_dir_all(&root).map_err(|e| format!("无法创建 {}：{e}", root.display()))?;
+    Ok(root.to_string_lossy().into_owned())
+}
+
+/// 往技能库里写一个文件。`name` 是技能目录名，`rel` 是技能目录**内**的相对路径。
+#[tauri::command]
+pub fn skills_write_file(name: String, rel: String, text: String) -> Result<String, String> {
+    skills_write_at(&skills_root()?, &name, &rel, &text)
+}
+
+fn skills_write_at(
+    root: &std::path::Path,
+    name: &str,
+    rel: &str,
+    text: &str,
+) -> Result<String, String> {
+    if text.len() > MAX_SKILL_FILE_BYTES {
+        return Err(format!(
+            "技能文件太大（{} 字节，上限 {MAX_SKILL_FILE_BYTES}）",
+            text.len()
+        ));
+    }
+    let path = skill_file_path(root, name, rel)?;
+    let dir = path
+        .parent()
+        .ok_or_else(|| "无法确定技能目录".to_string())?
+        .to_path_buf();
+    std::fs::create_dir_all(&dir).map_err(|e| format!("无法创建 {}：{e}", dir.display()))?;
+    std::fs::write(&path, text.as_bytes())
+        .map_err(|e| format!("无法写入 {}：{e}", path.display()))?;
+    Ok(path.to_string_lossy().into_owned())
+}
+
+/// 删掉一个技能目录。名字同样只收一段，路径由这里拼——技能库外面的东西这条命令碰不到。
+#[tauri::command]
+pub fn skills_delete(name: String) -> Result<String, String> {
+    skills_delete_at(&skills_root()?, &name)
+}
+
+fn skills_delete_at(root: &std::path::Path, name: &str) -> Result<String, String> {
+    skill_segment(name)?;
+    let dir = root.join(name);
+    if !dir.starts_with(root) {
+        return Err("技能路径越界".to_string());
+    }
+    if !dir.is_dir() {
+        return Err(format!("技能「{name}」不在技能库里"));
+    }
+    std::fs::remove_dir_all(&dir).map_err(|e| format!("无法删除 {}：{e}", dir.display()))?;
+    Ok(dir.to_string_lossy().into_owned())
+}
+
 /// Disconnect and kill an MCP server session.
 #[tauri::command]
 pub async fn mcp_disconnect(
@@ -3413,6 +3554,54 @@ mod tests {
         save_user_config_at(&path, r#"{"mcpServers":{}}"#, false).unwrap();
         assert_eq!(servers_subtree(&read_capped(&path).unwrap()), json!({}));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 技能库命令的**唯一**安全边界是这一段白名单校验：路径不接受调用方输入，
+    /// 只有技能名和目录内相对路径，而这两样都得逐段过 `skill_segment`。
+    ///
+    /// 挑的是能真的把路径带出技能根的那几种：`..`、绝对路径、盘符、反斜杠。
+    /// 没有这道校验，`skills_write_file("..", "..\/.ssh\/authorized_keys", …)` 就是
+    /// 一条绕过 require_inside_workspace 写任意家目录文件的路。
+    #[test]
+    fn skill_paths_cannot_escape_the_skills_library() {
+        for bad in ["..", ".", "", "a/b", "a\\b", "C:", "x*", "nul\u{0}l"] {
+            assert!(skill_segment(bad).is_err(), "{bad:?} 应该被拒");
+        }
+        for good in ["docx", "deploy-gateway", ".mrdayone-skill.json", "a_b.md", "工具"] {
+            assert!(skill_segment(good).is_ok(), "{good:?} 不该被拒");
+        }
+        // 相对路径逐段校验：任何一段是 `..` 都整条拒，不是"规范化之后再看"。
+        let root = std::path::Path::new("/tmp/skills-root");
+        assert!(skill_file_path(root, "docx", "../../.ssh/authorized_keys").is_err());
+        assert!(skill_file_path(root, "..", "SKILL.md").is_err());
+        assert!(skill_file_path(root, "docx", "/etc/passwd").is_err());
+        assert!(skill_file_path(root, "docx", "").is_err());
+        assert!(skill_file_path(root, "docx", &"a/".repeat(MAX_SKILL_REL_DEPTH + 1)).is_err());
+
+        // 正路：结果必须落在 <技能库>/<名字>/ 下面。
+        let ok = skill_file_path(root, "docx", "scripts/build.py").unwrap();
+        assert!(ok.starts_with(root.join("docx")), "{}", ok.display());
+        assert!(ok.ends_with("scripts/build.py"), "{}", ok.display());
+    }
+
+    /// 技能库整条往返：目录不存在时自己建、写进去、删掉。用户环境里 `~/.mrdayone/skills`
+    /// 至今是空的（其实压根不存在），因为以前**没有任何入口往那儿写**——这条钉住入口在。
+    #[test]
+    fn the_skills_library_creates_its_own_directory_and_round_trips() {
+        let root = std::env::temp_dir().join("michael-skills-roundtrip").join(SKILLS_DIR);
+        let _ = std::fs::remove_dir_all(root.parent().unwrap());
+        assert!(!root.exists(), "前置：技能库目录一开始不存在");
+
+        let md = skills_write_at(&root, "docx", "SKILL.md", "---\nname: docx\n---\nbody").unwrap();
+        assert_eq!(std::fs::read_to_string(&md).unwrap(), "---\nname: docx\n---\nbody");
+        // 子目录也要自己建出来——市场装的技能带 scripts/ 和 reference/。
+        let py = skills_write_at(&root, "docx", "scripts/build.py", "print(1)").unwrap();
+        assert!(std::path::Path::new(&py).is_file(), "{py}");
+
+        assert!(skills_delete_at(&root, "missing").is_err(), "删不存在的技能要报错，不能装作删了");
+        skills_delete_at(&root, "docx").unwrap();
+        assert!(!root.join("docx").exists());
+        let _ = std::fs::remove_dir_all(root.parent().unwrap());
     }
 
     /// 一份读不懂的配置**不能**长得和「还没配过」一样。

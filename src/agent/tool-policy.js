@@ -128,10 +128,21 @@ function seed() {
   // a lint hook on every auto-format was noise.
   defineTool("format", { ...FILE_CONTENT_OP, hooked: false });
   defineTool("mkdir", { ...FILE_OP, scopeField: "path" });
-  // 存技能会在工作区落一个 SKILL.md：算工作区改动、要审批、只读模式挡住、worker 按 path
-  // 收作用域。但它**不是结构化文件操作**（和 genimage 同类）——不进 fileMutation/fileEdit，
-  // 那两族的语义是"八件结构化文件工具"，掺进来会让 diff 复核和诊断链路跟着错位。
-  defineTool("saveskill", { ...GENERATOR, hooked: true, readOnlyModeBlocked: true, recoverableBlock: true, scopeField: "path" });
+  /*
+   * 存技能落的是 `~/.mrdayone/skills/<名字>/SKILL.md`——**家目录技能库，不在工作区里**。
+   *
+   * 于是三条登记跟着变（2026-08-22 落点从工作区改到家目录）：
+   *   · 去掉 mutatesWorkspace：它一个工作区文件都不碰。留着会把一次不碰工作区的写入
+   *     报成"改了工作区"，`mutated` 这个字段就不再是证据。
+   *   · 去掉 scopeField：worker 的 scope 是工作区内的相对路径清单，而技能库是绝对路径，
+   *     必然落在任何 scope 之外——子智能体收尾时存技能会被"超出 scope"整条拒掉。
+   *   · 去掉 hooked：工作区的 pre_tool_use hook 是这个仓库配的，对一个不落在这个项目里
+   *     的写入没有管辖权。
+   * 保留的是 needsApproval（它在用户家目录里建文件）和 readOnlyModeBlocked（只读模式
+   * 不许留下任何持久化写入）。语义上它现在和 mcpconfig 同类：改的是**跨项目的持久化
+   * 配置**，不是工作区内容。
+   */
+  defineTool("saveskill", { needsApproval: true, readOnlyModeBlocked: true, recoverableBlock: true });
   // 改 MCP 配置：不是工作区文件改动，但是**持久化配置** + 注册一条可执行命令行。
   // list 是只读的，不该弹框；其余四个动作一律要用户点头。只读模式下一概不许改配置。
   defineTool("mcpconfig", {

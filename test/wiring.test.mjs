@@ -1678,12 +1678,17 @@ test("Skills：外部技能可删，但删之前必须把磁盘路径摆出来",
 
   const del = SRC.slice(RAW_SRC.indexOf("async function _deleteSkillRecord"));
   const delBody = del.slice(0, del.indexOf("\n}\n") + 3);
-  assert.match(delBody, /confirm\(/, "删工作区外的目录居然不确认");
+  assert.match(delBody, /confirm\(/, "删磁盘上的技能目录居然不确认");
   assert.match(delBody, /\$\{dir\}/, "确认框里没写清楚要删哪个目录");
   assert.match(delBody, /if \(!ok\) return;/, "用户点了取消还照删");
-  // 确认只针对**工作区外**的；工作区里自己装的不必每次拦一道。
-  assert.match(delBody, /if \(!_skillIsWorkspaceInstalled\(skill, skillRoot\)\) \{/,
-    "把工作区内的删除也拦上了确认框，那是多余的摩擦");
+  /*
+   * 确认以前只针对**工作区外**的（`if (!_skillIsWorkspaceInstalled(skill, skillRoot))`）：
+   * 装进当前项目的那批不拦，理由是"只影响这个项目"。2026-08-22 落点统一到家目录技能库，
+   * 那个区分不存在了——**每一次**删除都会波及所有项目，所以每一次都要确认。
+   */
+  assert.doesNotMatch(delBody, /_skillIsWorkspaceInstalled/,
+    "又按工作区分了两种删除，而技能只有技能库一个落点");
+  assert.match(delBody, /其它项目里也会跟着消失/, "确认框没说清这是跨项目的删除");
   // 分区标题不能再说"不能在这里删除"——现在能删了，留着就是假话。
   assert.doesNotMatch(SRC, /只读，可开关但不能在这里删除/,
     "分区标题还写着不能删除，和实际行为对不上");

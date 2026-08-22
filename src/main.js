@@ -26284,15 +26284,15 @@ async function sendPrompt(text, attachments = [], readyConfig = null, opts = {})
   // 没打开文件夹也要扫：家目录那份技能库（~/.mrdayone/skills）跟有没有打开项目无关。
   // 这里以前带着 `_curRoot &&`，于是"启动 IDE、不开文件夹、直接提问"这条最常见的路径上，
   // 磁盘技能一个都不会被发现——用户装了一堆，模型全不知道。
-  // 自限：扫完 _fileSkillsCacheKey 变成 "\0<home>"（非空），所以每次启动最多等这一回；
-  // 之后真打开了文件夹，cacheKey 不同会自动重扫。
+  // 自限：扫完 _fileSkillsCacheKey 变成技能库的绝对路径（非空），所以每次启动最多等这
+  // 一回。技能库是家目录那一份，和打开哪个项目无关，换文件夹不需要重扫。
   if (inTauri && !_fileSkillsCacheKey) {
     try {
       await Promise.race([
         // MCP 和技能一起等这一下。名录（_mcpAvailabilitySystemContext）是在这之后、
         // run 开始**之前**算的：预热没落地它就是空串，于是首轮模型连"有哪些服务"都
         // 不知道。等不到也不阻塞——1.5 秒上限，后台那次照常写回缓存，下一轮就齐了。
-        Promise.allSettled([_refreshFileSkills(_curRoot || ""), _warmMcpTools(_curRoot || "")]),
+        Promise.allSettled([_refreshFileSkills(), _warmMcpTools(_curRoot || "")]),
         new Promise((resolve) => setTimeout(resolve, 1500)),
       ]);
     } catch {}
@@ -29969,7 +29969,7 @@ function _scheduleWorkspaceAgentWarmup(root) {
     _idleRun(async () => {
       try {
         await Promise.allSettled([
-          _refreshFileSkills(normalized),
+          _refreshFileSkills(),
           _warmMcpTools(normalized),
           // 只有这一件真的跟项目走；没打开文件夹时它没有对象可扫。
           ...(normalized ? [_gatherAgentContext("", normalized)] : []),
@@ -30471,23 +30471,49 @@ function _activeSkillsBlock() {
 }
 
 /*
- * 技能只从**这个 IDE 自己的目录**发现，两处：
+ * 技能只从**一个**地方发现：`~/.mrdayone/skills/<名字>/SKILL.md`。
  *
- *   <工作区及其父目录>/.mrdayone/skills/<名字>/SKILL.md ← 技能市场的安装落点（见
- *                                                        destBase，「安装」按钮就写这里）
- *   ~/.mrdayone/skills/<名字>/SKILL.md               ← 自己的家目录技能库，和
- *                                                        ~/.mrdayone/mcp.json 同一个命名空间
+ * 技能是**跨项目复用的能力**，所以它跟着人走，不跟着项目走。项目里的 `.mrdayone/` 是
+ * 这个项目的记忆（memory.md：在这个项目里犯过的错、要注意的事、项目事实），不放技能。
  *
- * 这里曾经还会扫 .cursor/skills、.codex/skills、.agents/skills、~/.codex/plugins/cache、
- * ~/.claude/plugins，工作区那条也一度是 .claude/skills。按用户要求全部去掉了：那些是别的
- * 工具的目录，不该在这个 IDE 里生效——技能只落在**自己的**产品目录 `_STATE_DIR` 下，
- * 工作区和家目录同名（2026-08-18 用户点名：「全部用我自己目录」）。
- * 想用那边的某个技能，把它复制到上面两个位置之一——那一次是明确的采纳，而不是默默继承。
+ * 这里以前先扫 `<工作区及其父目录>/.mrdayone/skills`、再扫家目录。那条工作区路径是
+ * 2026-08-22 整条删掉的，原因不是洁癖：写入侧的三个入口（save_skill、市场安装、
+ * _skillWorkspaceInstallRoot）全部钉死在工作区，家目录那份**没有任何写入方**，于是
+ * `~/.mrdayone/skills` 一直是空的，而装出来的技能落进"当时打开的那个项目"，换个项目
+ * 整批消失——用户报的"装完无法使用"就是这个。落点统一到家目录之后，发现路径必须跟着
+ * 收敛到同一处，否则项目里那个历史遗留的空 skills/ 目录还会被扫。
+ *
+ * 更早还扫过 .cursor/skills、.codex/skills、.agents/skills、~/.claude/plugins。按用户
+ * 要求全部去掉了（2026-08-18「全部用我自己目录」）：那些是别的工具的目录。想用那边的
+ * 某个技能，把它复制进来——那一次是明确的采纳，而不是默默继承。
+ *
+ * `skillsRoot` 是 Rust 侧 `skills_dir` 给的绝对路径（它经 `migrate_app_dir`，认得老的
+ * `.michael-ide`）。拿不到时才按 `_STATE_DIR` 常量拼——那是旧壳里没有这条命令的兜底。
  */
-function _skillDiscoveryBases(projectRoot, home) {
-  const bases = _workspaceAncestorRoots(projectRoot).map((root) => `${root}/${_STATE_DIR}/skills`);
-  if (home) bases.push(`${String(home).replace(/\/+$/, "")}/${_STATE_DIR}/skills`);
-  return [...new Set(bases)];
+function _skillDiscoveryBases(home, skillsRoot = "") {
+  const root = String(skillsRoot || "").replace(/\\/g, "/").replace(/\/+$/, "")
+    || (home ? `${String(home).replace(/\/+$/, "")}/${_STATE_DIR}/skills` : "");
+  return root ? [root] : [];
+}
+
+/*
+ * 技能库的绝对路径。**所有**读写技能的地方都从这里取落点，不再各自拼字符串。
+ *
+ * 走 Rust 的 `skills_dir` 而不是在 JS 里拼 `${home}/${_STATE_DIR}/skills`：`app_dir()`
+ * 会经 `migrate_app_dir` 回退到老的 `.michael-ide`，JS 常量不知道这回事，两边会指到
+ * 不同目录——发现扫新目录、写入写老目录，又是一次"存了却用不上"。
+ */
+let _skillsHomeRootCache = "";
+async function _skillsHomeRoot() {
+  if (_skillsHomeRootCache) return _skillsHomeRootCache;
+  if (!inTauri) return "";
+  try {
+    const p = String(await backend.invoke("skills_dir") || "").replace(/\\/g, "/").replace(/\/+$/, "");
+    if (p) { _skillsHomeRootCache = p; return p; }
+  } catch {}
+  let home = "";
+  try { home = await backend.homeDir(); } catch {}
+  return _skillDiscoveryBases(home)[0] || "";
 }
 
 // L0 removes the bundled local system prompt and asks the gateway to restore it. User-authored
@@ -30670,14 +30696,23 @@ function _parseSkillDocument(text, sourcePath) {
   };
 }
 
-async function _refreshFileSkills(root) {
+/*
+ * 参数没了：技能库是家目录那一份，和当前打开哪个项目无关。
+ *
+ * 顺带消掉一类竞态：cacheKey 以前是 `projectRoot + "\0" + home`，而 sendPrompt 的冷启动
+ * 等待判据是 `!_fileSkillsCacheKey`（"从没扫过"）。换一个 root 之后 cacheKey 只是不相等、
+ * 并不为空，那次等待被跳过，这一轮的技能清单用的还是上一个项目扫出来的。现在 key 里没有
+ * projectRoot，这一类结构性不存在。
+ */
+async function _refreshFileSkills() {
   if (!inTauri) { _fileSkills = []; _fileSkillsCacheKey = ""; return _fileSkills; }
+  const skillsRoot = await _skillsHomeRoot();
   let home = "";
   try { home = await backend.homeDir(); } catch {}
-  const projectRoot = String(root || "").replace(/\/$/, "");
-  const cacheKey = projectRoot + "\0" + home;
+  const cacheKey = skillsRoot || ("\0" + home);
   if (_fileSkillsCacheKey === cacheKey && Date.now() - _fileSkillsLoadedAt < 5000) return _fileSkills;
-  const bases = _skillDiscoveryBases(projectRoot, home);
+  _migrateActiveSkillIdsToHome(skillsRoot);
+  const bases = _skillDiscoveryBases(home, skillsRoot);
   /*
    * 每个来源单独收，最后**按来源顺序**拼起来。
    *
@@ -30687,8 +30722,8 @@ async function _refreshFileSkills(root) {
    * 一份。而按名字点技能只解析到第一个（_findSkillByName），清单去重也只留第一个。
    * 一个「有时候对、有时候不对」的技能，比没有还难查。
    *
-   * _skillDiscoveryBases 给的顺序本来就是对的优先级：项目 → 上级仓库 → 家目录 →
-   * 插件缓存。拼接时照这个顺序，后面的 sort 是稳定排序，同名的自然是项目那份赢。
+   * 落点收敛到家目录之后 bases 只剩一条，这段分桶暂时只有一个桶。留着不是死代码：
+   * 它是"同名技能的优先级必须确定"这条不变量的实现，加回任何一个来源都靠它兜住。
    */
   const perBase = bases.map(() => []);
   const seen = new Set();
@@ -30726,8 +30761,8 @@ async function _refreshFileSkills(root) {
       }
     }
   };
-  // 两个自有目录的形状是一样的：<base>/<名字>/SKILL.md，2 层够。以前这里有个 5 层的
-  // 分档，是给插件市场那种 <市场>/<插件>/skills/<名字>/ 的深目录用的——不扫了，一并去掉。
+  // 技能库的形状是 <base>/<名字>/SKILL.md，2 层够。以前这里有个 5 层的分档，是给插件
+  // 市场那种 <市场>/<插件>/skills/<名字>/ 的深目录用的——不扫了，一并去掉。
   await Promise.all(bases.map((base, i) => visit(perBase[i], base, 2)));
   // 先按来源顺序拼接，再按名字稳定排序——同名时留下的是优先级更高的那个来源。
   const found = perBase.flat();
@@ -30735,11 +30770,44 @@ async function _refreshFileSkills(root) {
   _fileSkills = found.sort((a, b) => a.name.localeCompare(b.name));
   _fileSkillsCacheKey = cacheKey;
   _fileSkillsLoadedAt = Date.now();
-  // Keep activation ids for skills belonging to another project. They are not
-  // injected unless present in this root's catalog, and become active again when
-  // the user returns to that project instead of being silently pruned forever.
+  // 常驻集合里匹配不上的 id 不清理：技能库是全局的，一个技能被临时删掉又装回来时，
+  // 用户原来钉的常驻状态还在，而不是被静默剪掉再也回不来。
   _updateSkillBadge();
   return _fileSkills;
+}
+
+/*
+ * 常驻状态的一次性迁移。
+ *
+ * 技能 id 是 `file:<SKILL.md 的绝对路径>`（见 _parseSkillDocument），常驻集合按 id 存在
+ * localStorage 里。落点从 `<项目>/.mrdayone/skills/x/SKILL.md` 换到
+ * `~/.mrdayone/skills/x/SKILL.md`，id 就变了——不迁的话用户原来钉住的常驻技能升级后
+ * 全部变回"按需"，localStorage 里还留下一堆永远匹配不上的死 id。
+ *
+ * 按**目录名**映射：那是技能在两种布局里唯一稳定的身份。只跑一次（带标记），
+ * 而且只改那些形如 `.../skills/<目录名>/SKILL.md` 的旧 id。
+ */
+const _SKILLS_HOME_MIGRATED_KEY = "michael-ide.skills.active.home-migrated.v1";
+function _migrateActiveSkillIdsToHome(skillsRoot) {
+  if (!skillsRoot) return;
+  try {
+    if (localStorage.getItem(_SKILLS_HOME_MIGRATED_KEY)) return;
+    const next = new Set();
+    let changed = false;
+    for (const id of _activeSkillIds) {
+      const m = /^file:(.*)\/skills\/([^/]+)\/SKILL\.md$/.exec(String(id || ""));
+      if (!m) { next.add(id); continue; }
+      const moved = `file:${skillsRoot}/${m[2]}/SKILL.md`;
+      if (moved !== id) changed = true;
+      next.add(moved);
+    }
+    if (changed) {
+      _activeSkillIds.clear();
+      for (const id of next) _activeSkillIds.add(id);
+      _saveActiveSkills();
+    }
+    localStorage.setItem(_SKILLS_HOME_MIGRATED_KEY, "1");
+  } catch {}
 }
 // Sync skills to the account server when logged in; localStorage stays the offline cache / fallback.
 /*
@@ -30811,29 +30879,31 @@ async function _loadSkills() {
   return remote;
 }
 async function _saveSkills(list) { _saveSkillsLocal(list); await _skillsApi("PUT", list); }
-function _skillWorkspaceInstallRoot(root) {
-  const base = String(root || "").replace(/\\/g, "/").replace(/\/+$/, "");
-  return base ? `${base}/${_STATE_DIR}/skills` : "";
-}
-function _skillIsWorkspaceInstalled(skill, root) {
+/*
+ * 一个技能是不是**技能库里**的（`~/.mrdayone/skills/<名字>/`）。
+ *
+ * 这里以前叫 `_skillIsWorkspaceInstalled`，判据是"装在 `<当前工作区>/.mrdayone/skills`
+ * 下面"。落点统一到家目录之后那个判据恒为假：市场卡片的「已安装」徽标会永远显示"安装"，
+ * 用户重复点、反复覆盖已有目录。判据换成"在技能库根下面"，跟打开哪个项目无关。
+ */
+function _skillIsLibraryInstalled(skill, skillsRoot) {
   const baseDir = String(skill?.baseDir || "").replace(/\\/g, "/").replace(/\/+$/, "");
-  const installRoot = _skillWorkspaceInstallRoot(root);
+  const installRoot = String(skillsRoot || "").replace(/\\/g, "/").replace(/\/+$/, "");
   return !!(baseDir && installRoot && baseDir !== installRoot && _pathIsAtOrUnder(baseDir, installRoot));
 }
 /*
  * 哪些技能能删。
  *
  * 原来只有"自定义"和"装进本工作区"的能删；来自用户目录 / 插件目录的一律只能停用，
- * 卡片上连删除按钮都不画——用户看到的是"这一堆技能没有删除功能"，而不是"它们不属于
- * 这个工作区"。按所有者要求放开：只要它在磁盘上有一个实实在在的目录，就能删。
+ * 卡片上连删除按钮都不画——用户看到的是"这一堆技能没有删除功能"。按所有者要求放开：
+ * 只要它在磁盘上有一个实实在在的目录，就能删。
  *
- * 代价是这一下会删到工作区**外面**的文件，所以删之前必须把目录路径摆给用户看
+ * 技能库是**跨项目**的，删一个就是所有项目里都没了，所以删之前必须把目录路径摆给用户看
  * （见 _deleteSkillRecord 里的确认框）——放开权限可以，闷声删不行。
  */
-function _skillCanDelete(skill, root) {
+function _skillCanDelete(skill) {
   if (!skill) return false;
   if (!skill._readonly) return true;
-  if (_skillIsWorkspaceInstalled(skill, root)) return true;
   return !!String(skill.baseDir || "").trim();
 }
 function _skillInstalledDirName(skill) {
@@ -30872,28 +30942,33 @@ function _skillMatchesOfficialCatalog(skill, official = []) {
     return (!!dir && itemDir === dir) || (!!name && itemName === name);
   });
 }
-async function _deleteSkillRecord(skill, root, customList = null) {
+async function _deleteSkillRecord(skill, customList = null) {
   if (!skill?.id) throw new Error("技能记录无效");
-  const skillRoot = String(root || rootPath || workspaceRoots[0] || "").replace(/\/+$/, "");
   if (skill._readonly) {
     const dir = String(skill.baseDir || "").trim();
     if (!dir) throw new Error("这个技能没有对应的磁盘目录，删不掉（它不是从文件发现的）");
-    // 工作区外面的技能：删的是用户目录 / 插件目录里的真实文件夹。把完整路径摆出来再删
-    // ——它不在当前项目里，用户很可能以为只是从这个列表里移除。
-    if (!_skillIsWorkspaceInstalled(skill, skillRoot)) {
-      const ok = confirm(
-        `这个技能不在当前工作区，它的文件在：\n\n${dir}\n\n`
-        + "删除会把这个目录整个删掉，其它项目里也会跟着消失。\n"
-        // 这里原来劝用户"别删了，把开关关掉就不生效了"——那是假的。那个开关管的只是常驻
-        // 注入；关掉之后，模型照样在技能清单里看得见它、照样能 read_skill 读它、照样会用。
-        // 用户照着那句话点一下，以为技能被关了，实际什么都没变。
-        + "想让它彻底不出现，只能删；「取消常驻」只是不再把全文塞进每次请求。\n\n确定删除？",
-      );
-      if (!ok) return;
-    }
-    await backend.deletePath(dir);
+    // 技能库是跨项目的：删一个就是**所有**项目里都没了。把完整路径摆出来再删——
+    // 用户很可能以为只是从这个列表里移除。
+    const ok = confirm(
+      `技能是跨项目共用的，它的文件在：\n\n${dir}\n\n`
+      + "删除会把这个目录整个删掉，其它项目里也会跟着消失。\n"
+      // 这里原来劝用户"别删了，把开关关掉就不生效了"——那是假的。那个开关管的只是常驻
+      // 注入；关掉之后，模型照样在技能清单里看得见它、照样能 read_skill 读它、照样会用。
+      // 用户照着那句话点一下，以为技能被关了，实际什么都没变。
+      + "想让它彻底不出现，只能删；「取消常驻」只是不再把全文塞进每次请求。\n\n确定删除？",
+    );
+    if (!ok) return;
+    /*
+     * 删走的是 `~/.mrdayone/skills/<名字>/`，在 HOME 底下。`backend.deletePath` 那条路
+     * 先过 require_inside_workspace(path, true)，会明确拒绝"在 HOME 底下但不在已打开
+     * 工作区里"的删除（正是它挡住 ~/.ssh）。所以走技能库自己那条作用域钉死的命令：
+     * 它只收一个技能名，路径由 Rust 侧拼。
+     */
+    const dirName = _skillInstalledDirName(skill);
+    if (!dirName) throw new Error("认不出这个技能的目录名，删不掉");
+    await backend.invoke("skills_delete", { name: dirName });
     _fileSkillsCacheKey = "";
-    await _refreshFileSkills(skillRoot);
+    await _refreshFileSkills();
   } else {
     const local = Array.isArray(customList) ? customList : await _loadSkills();
     await _saveSkills(local.filter((item) => item?.id !== skill.id));
@@ -33239,7 +33314,7 @@ function _buildAgentToolSchemas(includeWrite, mcpTools = []) {
     // 渐进式披露的另一半：技能目录常驻上下文（_skillCatalogBlock），正文靠这个按需取。
     // 全部正文一起塞是 33k token，目录只要 970——差 34 倍，所以正文必须按需。
     { type: "function", function: { name: "read_skill", description: "Read the FULL text of one skill from the user's installed skill library. The system prompt lists every available skill as `name: description`; when one of them matches the task at hand, call this to get its complete instructions and then follow them. Read-only, needs no authorization. Read only the skill you actually need — reading irrelevant ones wastes the context window. If a skill is already marked 常驻 its full text is already in the system prompt; do not re-read it.", parameters: { type: "object", properties: { name: { type: "string", description: "The skill's name, exactly as listed in the available-skills catalogue" }, why: { type: "string", description: "One short sentence, in the user's language, shown to the user verbatim on the tool card. Name the concrete thing in THIS request that made you reach for this skill — the file type, the format they asked for, the words they used. Write it for them, not for yourself: 「用户要把这份周报导出成 .docx，这个技能里带了模板和写入脚本」, not 「docx 技能用于处理 Word 文档」. Never restate the skill's own description, and never write filler like 「为了更好地完成任务」 — the user already knows you are trying to help; what they cannot see is what you noticed. If you cannot point at something in the request, do not read this skill." } }, required: ["name", "why"] } } },
-    { type: "function", function: { name: "save_skill", description: "Save a procedure you just worked out as a SKILL, so it survives past this run. Writes `<workspace>/.mrdayone/skills/<name>/SKILL.md` — that exact path is what this IDE scans, so from the next turn on it appears in your available-skills catalogue and read_skill can fetch its full text. Reach for it when you had to figure something out that will be needed again: a build/deploy sequence, an API you reverse-engineered from docs, a file format you wrote a parser for, a workaround with a non-obvious gotcha. Write the steps, the real commands and the traps — not a summary of what you did. Do NOT use it to store findings about this one task, to leave notes for the user, or in place of your reply. Needs an open workspace: with none, call create_project first. 【vs alternatives】read_skill reads an existing skill; remember stores a user preference; a one-off script belongs in the repo via write_file.", parameters: { type: "object", properties: { name: { type: "string", description: "Skill name, short and task-shaped (e.g. \"deploy-gateway\"). Becomes the directory name; it is how you and the user refer to it later." }, description: { type: "string", description: "One line, in the user's language. This is the ONLY thing you see in the catalogue later, so it must say when to reach for this skill — the trigger, not the topic." }, body: { type: "string", description: "The skill's full instructions in Markdown: the ordered steps, the exact commands, the paths, what to verify, and the gotchas you hit. Written for a future run that has none of your current context." }, allowed_tools: { type: "array", items: { type: "string" }, description: "Optional. Tool names this skill needs (e.g. [\"run_cmd\",\"read_file\"]). Leave it out unless you mean to NARROW capability: while a skill declaring this is resident, tools outside the list are refused." }, why: { type: "string", description: "One short sentence, in the user's language, shown verbatim on the tool card: what in THIS task makes it worth keeping." } }, required: ["name", "description", "body", "why"] } } },
+    { type: "function", function: { name: "save_skill", description: "Save a procedure you just worked out as a SKILL, so it survives past this run. Writes `~/.mrdayone/skills/<name>/SKILL.md` — the user's own skill library, which is exactly what this IDE scans, so read_skill can fetch its full text immediately and it appears in your available-skills catalogue from the next turn on. Skills are GLOBAL: they are available in every project, and no workspace needs to be open. Reach for it when you had to figure something out that will be needed again: a build/deploy sequence, an API you reverse-engineered from docs, a file format you wrote a parser for, a workaround with a non-obvious gotcha. Write the steps, the real commands and the traps — not a summary of what you did. Do NOT use it to store findings about this one task, to leave notes for the user, or in place of your reply. 【vs alternatives】read_skill reads an existing skill; something true only of THIS project (its stack, its conventions, a trap you hit here) belongs in remember, not in a skill; a one-off script belongs in the repo via write_file.", parameters: { type: "object", properties: { name: { type: "string", description: "Skill name, short and task-shaped (e.g. \"deploy-gateway\"). Becomes the directory name; it is how you and the user refer to it later." }, description: { type: "string", description: "One line, in the user's language. This is the ONLY thing you see in the catalogue later, so it must say when to reach for this skill — the trigger, not the topic." }, body: { type: "string", description: "The skill's full instructions in Markdown: the ordered steps, the exact commands, the paths, what to verify, and the gotchas you hit. Written for a future run that has none of your current context." }, allowed_tools: { type: "array", items: { type: "string" }, description: "Optional. Tool names this skill needs (e.g. [\"run_cmd\",\"read_file\"]). Leave it out unless you mean to NARROW capability: while a skill declaring this is resident, tools outside the list are refused." }, why: { type: "string", description: "One short sentence, in the user's language, shown verbatim on the tool card: what in THIS task makes it worth keeping." } }, required: ["name", "description", "body", "why"] } } },
     { type: "function", function: { name: "mcp_server", description: "Inspect and manage the user's own MCP servers (`~/.mrdayone/mcp.json`). `list` reports what is configured, what is disabled and how each was added — read-only, no authorization. `add` registers a new server (command + args, or url for a remote one); its tools join your registry on the next run. `remove` / `disable` / `enable` change ONLY the user's own config — a server that arrived with the repository is never touched. Reach for this when the capability you need exists as a published MCP server and nothing in your registry covers it: add it, then tell the user what you added, that it lands next run, and that its tool calls will ask for confirmation. Servers you add are written with approve:\"ask\" — an MCP server is an arbitrary command line, so the user is asked before each of its tool calls. 【vs alternatives】For a one-off HTTP API just use http_request; to look for a capability that may already be registered use search_tools.", parameters: { type: "object", properties: { action: { type: "string", enum: ["list", "add", "remove", "enable", "disable"], description: "What to do. Start with list when you are not sure what is already there." }, name: { type: "string", description: "Server name (the key in mcpServers). Required for everything except list." }, command: { type: "string", description: "For add, a local server: the executable, e.g. \"npx\" or \"uvx\"." }, args: { type: "array", items: { type: "string" }, description: "For add: the command's arguments, e.g. [\"-y\",\"@modelcontextprotocol/server-filesystem\",\"/path\"]." }, env: { type: "object", description: "For add: environment variables the server needs. Never put a real secret here — name the variable and tell the user what to paste." }, url: { type: "string", description: "For add, a remote server: its SSE/HTTP endpoint. Give either command or url, not both." }, why: { type: "string", description: "One short sentence, in the user's language, shown verbatim on the tool card: which capability this is for and why the registry does not already cover it." } }, required: ["action", "why"] } } },
     { type: "function", function: { name: "get_diagnostics", description: "Read the editor/LSP live diagnostics for a file (errors and warnings), returning file:line:column, source/code, nearby code, likely cause and direction of the fix. It is a read-only evidence tool, not a command, and needs no extra authorization this round. When the user asks \"which files have bugs / why is this erroring / how do I fix this error\", reach for it first to read the errors that already exist; after changing code, use it as a quick self-check. Omit path to get diagnostics for every open file.", parameters: { type: "object", properties: { path: { type: "string", description: "Optional; the file path to check. Omit to check every open file" } } } } },
     { type: "function", function: { name: "read_logs", description: "Read the tail of the latest terminal output or of a log file. Use it to look straight at the cause when a backend/API/build fails; it is a read-only evidence tool, starts no new command, and needs no extra authorization this round. When the error output names an npm debug log or a .log/.out/.err path, pass that as path; with no path it aggregates the recent task terminals and the workspace's usual logs. 【vs alternatives】For the live state of a long-running task terminal use read_terminal; for live editor/LSP diagnostics use get_diagnostics.", parameters: { type: "object", properties: { path: { type: "string", description: "Optional; the log file whose tail to read" }, paths: { type: "array", description: "Optional; several log file paths", items: { type: "string" } }, name: { type: "string", description: "Optional; the task name given to run_in_terminal" }, lines: { type: "integer", description: "How many trailing lines to read, default 200" }, include_terminal: { type: "boolean", description: "Whether to include task terminal output as well, default true" } } } } },
@@ -33835,7 +33910,7 @@ const _CAPABILITY_ROUTES = "外部服务或 API → web_search/web_fetch 读官�
   + "要跑起来看的服务/TUI → run_in_terminal 起，read_logs 看日志；"
   + "工作区里的 .db/.sqlite 文件 → db_query 传 driver=sqlite、url=sqlite:///绝对路径（路径本身就是连接串，不用问用户要）；"
   + "外部服务有官方 MCP → mcp_server(action=\"add\") 把它接进来（下一轮生效，它的工具调用会先问用户）；"
-  + "值得复用的流程 → save_skill 存成技能（落在 <工作区>/.mrdayone/skills/<名字>/SKILL.md），下一轮它就在你的技能清单里。";
+  + "值得复用的流程 → save_skill 存成技能（落在 ~/.mrdayone/skills/<名字>/SKILL.md，所有项目通用），下一轮它就在你的技能清单里。";
 
 function _searchToolsFuzzyMatch(query, registry, loadedNames) {
   const q = String(query || "").toLowerCase().trim();
@@ -34982,8 +35057,10 @@ function _mapToolCall(name, args, mcpToolMap = _mcpToolMap) {
         : String(args.allowed_tools || "").split(/[,\s]+/).map((t) => t.trim()).filter(Boolean);
       return { type: "saveskill", slug: _slug, name: String(args.name || "").trim(), description: String(args.description || "").trim(),
         body: String(args.body || ""), allowedTools: _tools,
-        // path 一并带上：作用域检查、卡片显示、写入记账都读它。
-        path: _slug ? `${_STATE_DIR}/skills/${_slug}/SKILL.md` : "",
+        // path 一并带上给卡片显示用。真正的落点是执行时向 Rust 要来的技能库绝对路径
+        // （call._resolvedPath），这里只是个还没解析的显示值——技能库在家目录，不在
+        // 工作区里，所以写成 `~/` 开头而不是一个会被当成工作区相对路径的字符串。
+        path: _slug ? `~/${_STATE_DIR}/skills/${_slug}/SKILL.md` : "",
         why: String(args.why || "").replace(/\s+/g, " ").trim().slice(0, 200) };
     }
     case "mcp_server": return { type: "mcpconfig", action: String(args.action || "list").trim().toLowerCase(),
@@ -56821,12 +56898,18 @@ async function _executeToolStepInner(step, call, root, run) {
         res.className = "atc-result atc-result--err"; res.textContent = "参数不全";
         return { type: "saveskill", path: "", content: "[ERROR] save_skill 需要 name（字母/数字/连字符）、description（一句话说清什么时候该用它）和 body（完整步骤）。" };
       }
-      if (!root) {
-        res.className = "atc-result atc-result--blocked"; res.textContent = "⛔ 未打开工作区";
-        return { type: "saveskill", path: "", content: "[BLOCKED] 技能要落在工作区里（<工作区>/" + _STATE_DIR + "/skills/），当前没有工作区根目录。先用 create_project 建一个目录，它会立刻成为当前工作区，然后重试——别把这一步推回给用户。" };
+      /*
+       * 落点是**家目录技能库**，和有没有打开文件夹无关——技能是跨项目复用的能力。
+       *
+       * 这里原来先判 `if (!root)` 再拒，文案让模型去 create_project 建个目录；那条路
+       * 把一个全局能力绑在了"当时打开的那个项目"上，换个项目技能就消失了。
+       */
+      const _skillsRoot = await _skillsHomeRoot();
+      if (!_skillsRoot) {
+        res.className = "atc-result atc-result--err"; res.textContent = "技能库不可用";
+        return { type: "saveskill", path: "", content: "[ERROR] 找不到技能库目录（~/" + _STATE_DIR + "/skills）。这是桌面 App 才有的能力。" };
       }
-      const _rel = `${_STATE_DIR}/skills/${_slug}/SKILL.md`;
-      const fp = _resolveRel(_rel, root);
+      const fp = `${_skillsRoot}/${_slug}/SKILL.md`;
       call._resolvedPath = fp;
       _setToolStepResolvedPath(step, fp);
       // frontmatter 的三个字段是解析器认的全部（见 _parseSkillDocument）。allowed-tools 只在
@@ -56835,12 +56918,16 @@ async function _executeToolStepInner(step, call, root, run) {
       const _doc = ["---", `name: ${_name}`, `description: ${_desc}`,
         ...(_fmTools.length ? [`allowed-tools: ${_fmTools.join(", ")}`] : []), "---", "", _body, ""].join("\n");
       try {
-        await backend.writeTextFile(fp, _doc);
-        // 技能目录是按 cacheKey 缓存的快照。不清掉的话，这一轮刚写的技能要等到 cacheKey
-        // 变化（换工作区）才会被发现——那正是「存了却用不上」，而提示词刚承诺了下一轮生效。
+        // 走技能库自己那条命令：技能库在 HOME 底下，backend.writeTextFile 会被
+        // require_inside_workspace 当场拒成 "write denied: … is under HOME"。
+        await backend.invoke("skills_write_file", { name: _slug, rel: "SKILL.md", text: _doc });
+        // 清缓存**并且**主动重扫。只清 key 的话这一轮 read_skill 还是读不到刚存的技能
+        // （它查的是模块级 _fileSkills，而 run 内没有任何地方会触发重扫）——模型照着
+        // 回执那句"可以用 read_skill 读全文"去验，拿到的是"没有名为 X 的技能"。
         _fileSkillsCacheKey = "";
+        await _refreshFileSkills();
         res.className = "atc-result atc-result--ok"; res.textContent = _name;
-        return { type: "saveskill", path: fp, content: `技能「${_name}」已存到 ${fp}。下一轮它就在你的技能清单里，可以用 read_skill 按名字读全文。收尾时告诉用户存在哪、以及下次什么情形会用到它。` };
+        return { type: "saveskill", path: fp, content: `技能「${_name}」已存到 ${fp}（家目录技能库，所有项目通用）。现在就能用 read_skill 按名字读全文；系统提示词里的技能清单下一轮才重算。收尾时告诉用户存在哪、以及下次什么情形会用到它。` };
       } catch (e) {
         res.className = "atc-result atc-result--err"; res.textContent = "写入失败";
         return { type: "saveskill", path: fp, content: `[ERROR] 写入技能失败: ${String(e?.message || e)}` };
@@ -63499,7 +63586,7 @@ function renderMcpTool(body) {
           </div>
           <div class="mcpfp-card__btns">
             ${s.repo ? `<button type="button" class="ctp-iconbtn" data-mcpfp-repo="${_escAttr(s.repo)}" title="查看仓库">${_dbUiIconSvg("open")}</button>` : ""}
-            <button type="button" class="ctp-btn ctp-btn--sm${installed ? "" : " ctp-btn--primary"}" data-mcpfp-install="${i}" ${installed || installing || !root ? "disabled" : ""}>${installed ? "已安装" : installing ? "安装中…" : "安装"}</button>
+            <button type="button" class="ctp-btn ctp-btn--sm${installed ? "" : " ctp-btn--primary"}" data-mcpfp-install="${i}" ${installed || installing ? "disabled" : ""}>${installed ? "已安装" : installing ? "安装中…" : "安装"}</button>
           </div>
         </div>`;
     }).join("") + `
@@ -63866,10 +63953,14 @@ async function _skillRegPrefetch(query = "", fromPage = 1) {
   }
 }
 
-// 把仓库里含 SKILL.md 的目录整个装进工作区 .mrdayone/skills/<name>/（跳过二进制和超大文件）。
+// 把仓库里含 SKILL.md 的目录整个装进家目录技能库 ~/.mrdayone/skills/<name>/（跳过二进制和超大文件）。
+//
+// 这里原来第一件事是 `if (!root) throw new Error("先打开一个工作区文件夹")`，落点是
+// `${root}/.mrdayone/skills/`。技能是跨项目的能力：装进"当时打开的那个项目"意味着换个项目
+// 整批消失，而没打开文件夹时整个市场都用不了。落点改成技能库之后，这两条限制都不成立了。
 async function _skillInstallDir(repoFull, branch, dirPath, destName, onProgress, preTree = null, meta = null) {
-  const root = (rootPath || workspaceRoots[0] || "").replace(/\/$/, "");
-  if (!root) throw new Error("先打开一个工作区文件夹");
+  const skillsRoot = await _skillsHomeRoot();
+  if (!skillsRoot) throw new Error("找不到技能库目录（桌面 App 才有）");
   const tree = preTree || await _mcpRegFetchJson(`https://api.github.com/repos/${repoFull}/git/trees/${encodeURIComponent(branch)}?recursive=1`);
   const prefix = dirPath ? dirPath + "/" : "";
   const SKIP = /\.(png|jpe?g|gif|webp|svgz|ico|zip|gz|tgz|7z|rar|pdf|woff2?|ttf|otf|eot|mp4|mp3|wav|bin|exe|dll|dylib|so|jar|pyc|wasm|node)$/i;
@@ -63879,28 +63970,25 @@ async function _skillInstallDir(repoFull, branch, dirPath, destName, onProgress,
   // SKILL.md 优先，其余按路径序，上限 40 个文件。
   files.sort((a, b) => (a.path === prefix + "SKILL.md" ? -1 : b.path === prefix + "SKILL.md" ? 1 : a.path.localeCompare(b.path)));
   files = files.slice(0, 40);
-  const destBase = `${root}/${_STATE_DIR}/skills/${destName}`;
+  const destBase = `${skillsRoot}/${destName}`;
   let n = 0;
   for (const f of files) {
     const rel = f.path.slice(prefix.length);
-    const dest = `${destBase}/${rel}`;
-    const dir = dest.slice(0, dest.lastIndexOf("/"));
-    try { await backend.createDir(dir); } catch {}
+    // 落点在 HOME 底下，backend.createDir / writeTextFile 那条路会被
+    // require_inside_workspace 拒掉。走技能库自己那条命令：它只收技能名 + 目录内相对
+    // 路径，自己 create_dir_all，路径不接受调用方输入。
     const text = await _skillFetchText(`https://raw.githubusercontent.com/${repoFull}/${branch}/${f.path}`);
-    await backend.writeTextFile(dest, text);
+    await backend.invoke("skills_write_file", { name: destName, rel, text });
     n++;
     onProgress?.(`${n}/${files.length}`);
   }
   if (meta && typeof meta === "object") {
     try {
-      await backend.writeTextFile(`${destBase}/${_SKILL_META_NAME}`, JSON.stringify({
-        ...meta,
-        repoFull,
-        branch,
-        dirPath,
-        destName,
-        installedAt: Date.now(),
-      }, null, 2));
+      await backend.invoke("skills_write_file", {
+        name: destName,
+        rel: _SKILL_META_NAME,
+        text: JSON.stringify({ ...meta, repoFull, branch, dirPath, destName, installedAt: Date.now() }, null, 2),
+      });
     } catch {}
   }
   return { destBase, fileCount: n, skillMdPath: `${destBase}/SKILL.md` };
@@ -63932,13 +64020,21 @@ async function _skillInstallFromRepo(item, onProgress) {
   return { ...r, destName, pickedDir: dir, totalDirs: dirs.length };
 }
 
-// 安装后：刷新文件技能目录并自动启用。
-async function _skillPostInstall(skillMdPath) {
-  const root = (rootPath || workspaceRoots[0] || "").replace(/\/$/, "");
+/*
+ * 安装后：清缓存并主动重扫，这一下装完立刻能被发现，不用等重启。
+ *
+ * 这里原来还无条件 `if (!_isSkillActive(id)) _toggleSkillActive(id)`——**自动置常驻**。
+ * 那是一条静默收窄整个 IDE 的路：`_skillAllowedTools` 对每个"常驻且声明了 allowed-tools"
+ * 的技能取白名单并集，而这道闸排在权限规则**之前**（见 _approveToolCall ⓪），不在名单里
+ * 的工具直接 return false。装一个声明了 allowed-tools 的技能，写文件/搜索/跑命令就可能
+ * 被静默拒掉，用户既没选过常驻、也无处查看被收窄成了什么——看起来像"IDE 突然变残废"。
+ *
+ * 装完不置常驻不等于装了没用：技能本来就一直在清单里，模型随时能 read_skill 读全文。
+ * 常驻只是"把全文钉进每次请求"（面板文案就是这么写的），那是用户自己该点的一个决定。
+ */
+async function _skillPostInstall(_skillMdPath) {
   _fileSkillsCacheKey = "";
-  await _refreshFileSkills(root);
-  const id = `file:${String(skillMdPath).replace(/\\/g, "/")}`;
-  if (!_isSkillActive(id)) _toggleSkillActive(id);
+  await _refreshFileSkills();
   _updateSkillBadge();
 }
 
@@ -63947,7 +64043,9 @@ const _skFp = { query: "", page: 1, hasMore: false, total: 0, loading: false, se
 
 function renderSkillsTool(body) {
   body.classList.add("mcpfp-body");
-  const root = (rootPath || workspaceRoots[0] || "").replace(/\/$/, "");
+  // 技能库的路径，renderInstalled 每次刷新时填。整页不再读 rootPath——技能跟项目无关，
+  // 有没有打开文件夹都一样能装、能删、能设常驻。
+  let skillsRoot = "";
   const wrap = document.createElement("div");
   wrap.className = "mcpfp";
   wrap.innerHTML = `
@@ -63955,7 +64053,7 @@ function renderSkillsTool(body) {
       <div class="mcpfp-head">
         <div>
           <h3>Skills 技能</h3>
-          <p class="mcpfp-sub">技能一直对模型可见，它按需自己读正文；「常驻」是把全文钉进每次请求。装在工作区 <code>.mrdayone/skills/</code> 或 <code>~/.mrdayone/skills/</code>。</p>
+          <p class="mcpfp-sub">技能一直对模型可见，它按需自己读正文；「常驻」是把全文钉进每次请求。技能是跨项目复用的能力，统一放在 <code>~/.mrdayone/skills/</code>，每个项目里都在；项目自己的 <code>.mrdayone/</code> 放的是这个项目的记忆（<code>memory.md</code>）。</p>
         </div>
         <button type="button" class="ctp-btn ctp-btn--primary" data-skfp="add-skill">＋ 添加技能</button>
       </div>
@@ -64049,21 +64147,16 @@ function renderSkillsTool(body) {
   const renderInstalled = async () => {
     const custom = await _loadSkills();
     /*
-     * 面板要显示**模型手上的全部技能**，而不只是装进当前工作区的那些。
+     * 面板显示的就是**模型手上的全部技能**：技能库那份（磁盘）+ 自定义那份（账号/本地）。
      *
-     * 这里以前只留 _skillIsWorkspaceInstalled 的那批。可技能目录（_skillCatalogBlock）
-     * 读的是 _fileSkills 全量——家目录 ~/.mrdayone/skills 和上级仓库的都算。
-     * 于是一个把技能装在家目录的人，模型明明按那些技能在干活，面板却写着「还没有技能」；
-     * 想关掉其中某一个，界面上根本找不到它。面板和模型看到的必须是同一份。
-     *
-     * 但 installedDirs 仍然只能来自工作区那批：它驱动的是市场卡片的「已安装」状态，
-     * 语义是"已装进这个工作区"。把家目录的技能算进去，会让「安装」按钮错误地变灰。
+     * installedDirs 驱动的是市场卡片的「已安装」徽标。它以前只算"装进当前工作区"的那批，
+     * 落点收敛到技能库之后那个子集恒为空——每张卡片都永远显示「安装」，用户重复点、
+     * 反复覆盖已有目录。现在按技能库全量算。
      */
-    const fileSkills = root ? await _refreshFileSkills(root) : await _refreshFileSkills("");
-    const visibleFileSkills = fileSkills.filter((skill) => _skillIsWorkspaceInstalled(skill, root));
-    const externalFileSkills = fileSkills.filter((skill) => !_skillIsWorkspaceInstalled(skill, root));
-    allSkills = [...custom, ...visibleFileSkills, ...externalFileSkills];
-    installedDirs = new Set(visibleFileSkills.map((s) => (s.baseDir || "").split("/").pop()).filter(Boolean));
+    skillsRoot = await _skillsHomeRoot();
+    const fileSkills = await _refreshFileSkills();
+    allSkills = [...custom, ...fileSkills];
+    installedDirs = new Set(fileSkills.map((s) => _skillInstalledDirName(s)).filter(Boolean));
     installedEl.classList.add("mcpfp-installed--cards");
     if (!allSkills.length) {
       installedEl.innerHTML = `<div class="ctp-empty">还没有技能——从下面的热门清单一键安装，或点「＋ 添加技能」写一个自定义技能。</div>`;
@@ -64073,8 +64166,8 @@ function renderSkillsTool(body) {
     const cardFor = (s) => {
       const on = _isSkillActive(s.id);
       const isFile = !!s._readonly;
-      const canDelete = _skillCanDelete(s, root);
-      const workspaceSkill = _skillIsWorkspaceInstalled(s, root);
+      const canDelete = _skillCanDelete(s);
+      const librarySkill = _skillIsLibraryInstalled(s, skillsRoot);
       const meta = s._installMeta || {};
       const installedDir = _skillInstalledDirName(s);
       const officialCatalogHit = !meta.source && _skillMatchesOfficialCatalog(s, _skFp.official);
@@ -64083,8 +64176,8 @@ function renderSkillsTool(body) {
       const repoUrl = _skillSourceUrl(s) || (officialLike && installedDir ? `https://github.com/anthropics/skills/tree/main/skills/${installedDir}` : "");
       const desc = String(meta.desc || (officialPath ? `Anthropic 官方技能 · ${officialPath}` : "") || s.desc || (isFile ? s.baseDir || "" : "自定义技能")).slice(0, 160);
       // 最后那档以前写「只读」，是假的：_skillCanDelete 对文件技能一律放行，卡片上删除键
-      // 就在那儿。真正的区别是它不装在本工作区——删它会波及其它项目。
-      const sourceBadge = !isFile ? "自定义" : officialLike ? "官方" : meta.source === "github" ? "GitHub" : workspaceSkill ? "工作区" : "家目录";
+      // 就在那儿。「工作区 / 家目录」那组区分也没了——技能只有技能库这一个落点。
+      const sourceBadge = !isFile ? "自定义" : officialLike ? "官方" : meta.source === "github" ? "GitHub" : librarySkill ? "技能库" : "外部目录";
       // 不写「未启用」：那是这一页最误导的一个字。它是常驻显示的**状态标签**，用户
       // 读到的是"这个技能是关着的"——而技能从来没关过，模型随时能在清单里看见它、
       // 用 read_skill 读它。这个开关管的只是"要不要把全文钉进每次请求"。
@@ -64100,24 +64193,18 @@ function renderSkillsTool(body) {
               <span class="mcpfp-row__status ${on ? "is-on" : "is-off"}">${status}</span>
               ${Number(meta.stars) ? `<span class="mcpfp-stars">★ ${_mcpStarsText(Number(meta.stars))}</span>` : ""}
             </div>
-            <p title="${_escAttr(desc)}">${_escHtml(desc || (isFile ? "工作区 SKILL.md" : "自定义技能"))}</p>
+            <p title="${_escAttr(desc)}">${_escHtml(desc || (isFile ? "技能库 SKILL.md" : "自定义技能"))}</p>
           </div>
           <div class="mcpfp-card__btns">
             ${repoUrl ? `<button type="button" class="ctp-iconbtn" data-skfp-repo="${_escAttr(repoUrl)}" title="查看来源">${_dbUiIconSvg("open")}</button>` : ""}
             <button type="button" class="ctp-btn ctp-btn--sm${on ? " ctp-btn--primary" : ""}" data-skfp-toggle="${_escAttr(s.id)}">${on ? "已常驻" : "设为常驻"}</button>
-            ${canDelete ? `<button type="button" class="ctp-iconbtn ctp-iconbtn--danger" data-skfp-del="${_escAttr(s.id)}" title="${workspaceSkill ? "删除工作区 Skills 目录" : "删除自定义技能"}">${_ICON_TRASH}</button>` : ""}
+            ${canDelete ? `<button type="button" class="ctp-iconbtn ctp-iconbtn--danger" data-skfp-del="${_escAttr(s.id)}" title="${librarySkill ? "从技能库删除（所有项目都会没有）" : "删除自定义技能"}">${_ICON_TRASH}</button>` : ""}
           </div>
         </div>`;
     };
-    // 工作区那批照旧排在前面；家目录 / 插件目录那批单独一段，标题写清楚它们从哪来、
-    // 为什么删不掉。分成两段而不是混在一起，是因为这两类的可操作性完全不同：
-    // 上面那批能删，下面那批只能设常驻 / 取消常驻。
-    installedEl.innerHTML =
-      [...custom, ...visibleFileSkills].map(cardFor).join("")
-      + (externalFileSkills.length
-        ? `<div class="skfp-section">家目录 / 上级仓库（不属于当前项目，删除会连磁盘上的文件夹一起删，其它项目里也会跟着消失）</div>`
-          + externalFileSkills.map(cardFor).join("")
-        : "");
+    // 不再分「工作区 / 家目录」两段：技能只有技能库这一个落点，分段是在描述一个不存在的
+    // 区别。自定义技能（账号里那份，没有磁盘目录）排在技能库那批前面。
+    installedEl.innerHTML = allSkills.map(cardFor).join("");
     renderMarket();
   };
 
@@ -64142,7 +64229,7 @@ function renderSkillsTool(body) {
           </div>
           <div class="mcpfp-card__btns">
             <button type="button" class="ctp-iconbtn" data-skfp-repo="https://github.com/anthropics/skills/tree/main/${_escAttr(s.path)}" title="查看源码">${_dbUiIconSvg("open")}</button>
-            <button type="button" class="ctp-btn ctp-btn--sm${installed ? "" : " ctp-btn--primary"}" data-skfp-official="${_escAttr(s.path)}" ${installed || installing || !root ? "disabled" : ""}>${installed ? "已安装" : installing ? "安装中…" : "安装"}</button>
+            <button type="button" class="ctp-btn ctp-btn--sm${installed ? "" : " ctp-btn--primary"}" data-skfp-official="${_escAttr(s.path)}" ${installed || installing ? "disabled" : ""}>${installed ? "已安装" : installing ? "安装中…" : "安装"}</button>
           </div>
         </div>`;
     }).join("");
@@ -64161,7 +64248,7 @@ function renderSkillsTool(body) {
           </div>
           <div class="mcpfp-card__btns">
             <button type="button" class="ctp-iconbtn" data-skfp-repo="${_escAttr(s.url)}" title="查看仓库">${_dbUiIconSvg("open")}</button>
-            <button type="button" class="ctp-btn ctp-btn--sm${installed ? "" : " ctp-btn--primary"}" data-skfp-install="${i}" ${installed || installing || !root ? "disabled" : ""}>${installed ? "已安装" : installing ? "安装中…" : "安装"}</button>
+            <button type="button" class="ctp-btn ctp-btn--sm${installed ? "" : " ctp-btn--primary"}" data-skfp-install="${i}" ${installed || installing ? "disabled" : ""}>${installed ? "已安装" : installing ? "安装中…" : "安装"}</button>
           </div>
         </div>`;
     }).join("");
@@ -64203,7 +64290,9 @@ function renderSkillsTool(body) {
     try {
       const r = await run();
       await _skillPostInstall(r.skillMdPath);
-      showToast(`已安装并启用（${r.fileCount} 个文件 → ${_STATE_DIR}/skills/）`);
+      // 打绝对落点，不打相对路径：以前写 `.mrdayone/skills/`，用户看不出到底进了哪个
+      // .mrdayone（项目里也有一个同名目录）。也不再说"并启用"——装完不置常驻了。
+      showToast(`已安装（${r.fileCount} 个文件 → ${r.destBase}）`);
     } catch (err) {
       showToast("安装失败：" + String(err?.message || err).slice(0, 140));
     }
@@ -64233,7 +64322,7 @@ function renderSkillsTool(body) {
       if (!skill) return;
       try {
         if (btn) { btn.disabled = true; btn.classList.add("is-loading"); }
-        await _deleteSkillRecord(skill, root, allSkills.filter((item) => !item?._readonly));
+        await _deleteSkillRecord(skill, allSkills.filter((item) => !item?._readonly));
         await renderInstalled();
         showToast(`已删除技能：${skill.name || "技能"}`);
       } catch (err) {
@@ -64247,7 +64336,7 @@ function renderSkillsTool(body) {
     const officialPath = e.target.closest("[data-skfp-official]")?.getAttribute("data-skfp-official");
     if (officialPath) {
       const s = _skFp.official.find((x) => x.path === officialPath);
-      if (s && root) doInstall(`o:${s.path}`, () => _skillInstallDir(s.repo, s.branch, s.path, _mcpSanitizeName(s.name), null, null, {
+      if (s) doInstall(`o:${s.path}`, () => _skillInstallDir(s.repo, s.branch, s.path, _mcpSanitizeName(s.name), null, null, {
         name: s.name,
         full: s.repo,
         repo: s.repo,
@@ -64263,7 +64352,7 @@ function renderSkillsTool(body) {
     const idx = e.target.closest("[data-skfp-install]")?.getAttribute("data-skfp-install");
     if (idx !== null && idx !== undefined && idx !== "") {
       const s = _skFp.servers[Number(idx)];
-      if (s && root) doInstall(String(idx), () => _skillInstallFromRepo(s));
+      if (s) doInstall(String(idx), () => _skillInstallFromRepo(s));
       return;
     }
   });

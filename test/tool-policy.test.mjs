@@ -62,13 +62,18 @@ test("workspace-mutating set matches the pre-refactor literal exactly", () => {
     // 新增：git worktree。它在 <root>/.mrdayone/worktrees/ 下面建目录、建分支，remove
     // 还会连未提交的改动一起删。原来完全没登记，拿的是默认策略。
     "worktree",
-    // 新增：save_skill 在 <root>/.mrdayone/skills/<名字>/ 下落一个 SKILL.md。
-    "saveskill",
   ])));
   // The subtle one: a shell command may change the workspace but never REPORTS it, so it is
   // not in this set. Adding it would make `mutated === false` look like proof of a no-op.
   assert.equal(mutatesWorkspace("cmd"), false);
   assert.equal(mutatesWorkspace("termtask"), false);
+  /*
+   * saveskill 曾在这张表里（"在 <root>/.mrdayone/skills/<名字>/ 下落一个 SKILL.md"）。
+   * 2026-08-22 落点改成家目录技能库 `~/.mrdayone/skills/` —— 技能是跨项目复用的能力，
+   * 跟着人走不跟着项目走。它现在一个工作区文件都不碰，留在这张表里会把一次不碰工作区的
+   * 写入报成"改了工作区"，`mutated` 这个字段就不再是证据。
+   */
+  assert.equal(mutatesWorkspace("saveskill"), false);
 });
 
 test("approval set matches the pre-refactor literal exactly", () => {
@@ -103,8 +108,8 @@ test("approval set matches the pre-refactor literal exactly", () => {
     // capture_replay 能指定任意 method/url/body 直发，是 http 那道门的完整旁路；
     // system 能开 App、切前台窗口、触发任意 App 的菜单项。
     "browser", "docker_compose_up", "capture_replay", "system",
-      // 新增：save_skill 往工作区写文件；mcp_server 改**持久化配置**并注册一条可执行命令行
-    // （list 是只读的，按调用逐次判，见下面的细则断言）。
+      // save_skill 在用户家目录的技能库里建文件；mcp_server 改**持久化配置**并注册一条
+    // 可执行命令行（list 是只读的，按调用逐次判，见下面的细则断言）。
     "saveskill", "mcpconfig",
   ])));
   // worktree 是**有意**不问的：它只在 <root>/.mrdayone/worktrees/ 下动，是 IDE 自己的
@@ -118,13 +123,22 @@ test("hooked set matches the pre-refactor literal exactly, including format's ab
     // docker_compose_up 借用 EXEC（needsApproval + hooked）：它和 cmd 一样是把一串命令
     // 交给 shell，钩子该看得到它。另三个不是 shell 执行，不进这个集合。
     "docker_compose_up",
-      // 新增：这两个都会改磁盘上的东西（技能文件 / 用户 MCP 配置），钩子该看得到。
-    "saveskill", "mcpconfig",
+      // 改的是磁盘上的用户 MCP 配置，钩子该看得到。
+    "mcpconfig",
   ])));
   // `format` writes content but is intentionally NOT hooked. It is the single element that
   // makes this set differ from the file-mutation family, and it was easy to lose.
   assert.equal(isFileEdit("format"), true);
   assert.equal(toolPolicy("format").hooked, false);
+  /*
+   * saveskill 曾和 mcpconfig 并列在这里。落点改成 `~/.mrdayone/skills/` 之后摘掉：
+   * pre_tool_use 钩子是**当前工作区**配的（<root>/.mrdayone/hooks），对一个不落在这个
+   * 项目里的写入没有管辖权——换个项目开着，同一次存技能会被另一套钩子拦，那不是判据。
+   * 它仍然要审批、只读模式仍然挡住（见上下两条名单），那两道才是它该过的门。
+   */
+  assert.equal(toolPolicy("saveskill").hooked, false);
+  assert.equal(approvalTypes().has("saveskill"), true, "存技能在用户家目录建文件，审批不许丢");
+  assert.equal(readOnlyBlockedTypes().has("saveskill"), true, "只读模式不许留下持久化写入");
 });
 
 test("read-only-mode block matches the pre-refactor chain, plus the closed termtask gap", () => {
@@ -185,12 +199,17 @@ test("worker scope targets match the pre-refactor list", () => {
   const scoped = sorted(new Set(Object.keys(allPolicies()).filter((t) => workerScopeField(t))));
   assert.deepEqual(scoped, sorted(new Set([
     "write", "edit", "multiedit", "mkdir", "copy", "format",
-    // 新增：save_skill 落的是文件，worker 的 scope 要照着 path 收。
-    "saveskill",
   ])));
   // delete/move are refused for workers outright rather than scope-checked.
   assert.equal(workerScopeField("delete"), "");
   assert.equal(workerScopeField("move"), "");
+  /*
+   * saveskill 曾在这张表里（"落的是文件，worker 的 scope 要照着 path 收"）。落点改成
+   * 家目录技能库之后必须摘掉：worker 的 scope 是**工作区内的相对路径清单**，而技能库是
+   * HOME 底下的绝对路径，必然落在任何 scope 之外——子智能体收尾时存技能会被
+   * `[BLOCKED] 路径「…」不在你这个 worker 的负责范围(scope)内` 整条拒掉。
+   */
+  assert.equal(workerScopeField("saveskill"), "");
   // The helper returns the concrete path, so the executor never re-derives "which field".
   assert.equal(workerScopeTarget({ type: "write", path: "src/a.ts" }), "src/a.ts");
   assert.equal(workerScopeTarget({ type: "copy", path: "", to: "src/b.ts" }), "src/b.ts");
