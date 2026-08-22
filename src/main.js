@@ -21804,7 +21804,10 @@ function _aiIntentEnum(value, allowed, fallback) {
 
 function _aiIntentWorkspaceEvidence(root) {
   const workspace = _normalizeFsPath(String(root || "")).replace(/\/+$/, "");
-  if (!workspace) return { hasWorkspace: false, snapshotReady: false, topLevel: [], stack: {} };
+  // 工作区取证依赖桌面端的项目扫描（_agentContextCache / _projectStacks 由 Tauri 侧预热
+  // 填充）。web 构建拿不到就如实降级成「没有工作区证据」，而不是拦掉整条画像腿——
+  // _normalizeAiIntentVerdict 里 inferredProjectState 对 hasWorkspace:false 已有分支。
+  if (!inTauri || !workspace) return { hasWorkspace: false, snapshotReady: false, topLevel: [], stack: {} };
   const ready = _agentContextCache?.root === workspace && _agentContextCache?.ts
     && Date.now() - _agentContextCache.ts < 300000;
   const stack = _projectStacks.get(workspace) || {};
@@ -21922,6 +21925,17 @@ function _normalizeAiIntentVerdict(value, context = {}) {
   // and silently routes a turn with a classifier result the model never actually supplied.
   if (!hasDimensionInput && !hasSemanticInput && !hasEngineeringInput) return null;
   const verdict = {};
+  // 半份裁决不许冒充完整裁决。上面那句是 OR：语义半到了、工程半（16 个枚举/数组 + 73 键
+  // 维度表，输出里最大的那部分）没出来，也算「有效裁决」——下面所有工程枚举全退默认值、
+  // 维度一个不亮，产出的画像却带着完整裁决的身份。弱模型恰恰最容易出小的语义块、出不来
+  // 大的工程块，于是「模型没答出来」被误读成「模型答了：不适用」。这里把两半的到场情况
+  // 原样记在 verdict 上，_mergeAiIntentProfile 据此写 intentSource（都到="ai"，半份="partial"，
+  // 缺席="pending"），缓存与会话状态的准入同判。dimensions 属于工程半：它和工程枚举同一张
+  // 大表、由同一段输出产生。
+  verdict._halves = {
+    semantic: hasSemanticInput,
+    engineering: hasEngineeringInput || hasDimensionInput,
+  };
   for (const dim of _AI_INTENT_DIMENSIONS) {
     if (typeof dimensionSource[dim] === "boolean") verdict[dim] = dimensionSource[dim];
   }
@@ -21996,8 +22010,18 @@ function _normalizeAiIntentVerdict(value, context = {}) {
   return verdict;
 }
 
+/** 两半都到场的裁决才算完整。没带 _halves 的（测试桩/旧状态重建）按完整算。 */
+function _aiIntentVerdictComplete(verdict) {
+  if (!verdict || typeof verdict !== "object") return false;
+  const halves = verdict._halves;
+  return !halves || (halves.semantic === true && halves.engineering === true);
+}
+
 function _commitAiIntentState(session, verdict, text, context = {}) {
   if (!session || !verdict || typeof verdict !== "object") return null;
+  // 半份裁决不落会话状态：状态重建出的 verdict 不带 _halves、天然被当成完整，
+  // 让 partial 进来就等于洗掉它的半份身份。语义帧宁缺勿假。
+  if (!_aiIntentVerdictComplete(verdict)) return null;
   const dimensions = {};
   for (const dim of _AI_INTENT_DIMENSIONS) dimensions[dim] = verdict[dim] === true;
   const state = {
@@ -22015,7 +22039,12 @@ function _commitAiIntentState(session, verdict, text, context = {}) {
 
 async function _aiIntentProfile(text, config, session = null, context = null) {
   const t = String(text || "").trim().replace(/\s+/g, " ");
-  if (!inTauri || !config || !t) return null;
+  // 门槛是「有没有可用的补全通道」，不是「是不是桌面构建」。以前这里写 inTauri，
+  // 于是 web 构建上整套画像机器永不启动：run.engineering 恒为 pending 默认值、六道
+  // 闸门全灭、语义画像头恒空——同一个模型在网页版像「什么纪律都没有」。判据与
+  // _wrapUpCritic / _semanticToolOrchestrator 同源（它们在 web 上正常工作）；
+  // 依赖 Tauri 的工作区取证在 _aiIntentWorkspaceEvidence 里单独降级。
+  if (!config?.baseUrl || !config?.apiKey || !t) return null;
   const boundedContext = context && typeof context === "object"
     ? context : _aiIntentContextForTurn(session, t);
   const contextFingerprint = _aiIntentContextFingerprint(boundedContext);
@@ -22105,8 +22134,14 @@ async function _aiIntentProfile(text, config, session = null, context = null) {
       const out = await _billableAiComplete(intentConfig, [{ role: "user", content: prompt }], 900);
       const intents = _normalizeAiIntentVerdict(_safeJsonLoose(out), boundedContext);
       if (!intents) return null;
-      _aiIntentCache.set(key, { ts: Date.now(), intents });
-      if (_aiIntentCache.size > 24) _aiIntentCache.delete(_aiIntentCache.keys().next().value);
+      // 缓存准入同判：半份裁决不缓存。缓存 15 分钟，缓存一份「语义到了、工程没到」的
+      // 残废裁决，就是让同一句话在 15 分钟内一直「看着懂了、纪律全没有」。
+      // 半份照样返回给本轮（partial 身份随 _halves 带出去），只是不落长期状态。
+      // （判据就地写，不引 _aiIntentVerdictComplete：本函数被测试独立装载。）
+      if (!intents._halves || (intents._halves.semantic === true && intents._halves.engineering === true)) {
+        _aiIntentCache.set(key, { ts: Date.now(), intents });
+        if (_aiIntentCache.size > 24) _aiIntentCache.delete(_aiIntentCache.keys().next().value);
+      }
       return intents;
     } catch {
       return null;
@@ -22268,7 +22303,13 @@ function _mergeAiIntentProfile(base, intents, text, priorState = null) {
   m.requiresPlan = m.substantial;
   m.intentSemantic = verdict?.semantic || null;
   m.intentEngineering = engineering;
-  m.intentSource = verdict ? "ai" : "pending";
+  // 三值化：两半都到才是 "ai"（行为闸门只认它）；半份记 "partial"——对所有
+  // `=== "ai"` 的读者它天然等同「裁决未到」，于是不夺能力、不早关补救路径
+  // （_applyLateIntentIfLanded 对 partial 照样重试）。没带 _halves 的 verdict
+  // （会话状态/缓存重建的——那两处准入只收完整裁决）按完整算。
+  m.intentSource = verdict
+    ? (verdict._halves && !(verdict._halves.semantic && verdict._halves.engineering) ? "partial" : "ai")
+    : "pending";
   return m;
 }
 
@@ -22328,8 +22369,9 @@ function _ideSemanticProfile(profile) {
 // 快通道少判了某一项，完整裁决落定后会把它并进来——模块只会晚到一轮，不会消失。所以这条通道
 // 宁缺毋滥，判不准的一律不标。
 //
-// 它**只喂给请求头**，不写 run.engineering：那份画像还管着计划门槛、写入义务、角色编排这些行为
-// 闸门，拿一份精简判断去驱动它们会把影响面放得太大。行为仍然只认完整裁决。
+// 请求头无条件收它；run.engineering 只收一份**受限副本**（_applyFastRouteBehaviorIfLanded）：
+// 只够得到「多一道取证/仪式」方向的门，夺能力的门（`=== "ai"` 精确比较）和硬拦回合的
+// 计划门（显式排除 "fast"）仍然只认完整裁决。
 const _FAST_ROUTING_WAIT_MS = 6000;
 const _FAST_ROUTING_KEYS = [
   "implementation", "projectEngineering", "needsReferences", "needsOfficialResearch",
@@ -22340,7 +22382,7 @@ const _FAST_ROUTING_KEYS = [
 ];
 async function _fastRoutingFlags(text, config, session = null, context = null) {
   const t = String(text || "").trim().replace(/\s+/g, " ");
-  if (!inTauri || !config || !t) return null;
+  if (!config?.baseUrl || !config?.apiKey || !t) return null;
   const bounded = context && typeof context === "object" ? context : _aiIntentContextForTurn(session, t);
   const prompt = `只判断这一轮该给编码智能体挂哪些能力模块。严格只输出一个 JSON 对象，除 JSON 外不要任何文字，也不要解释。
 布尔键只在**确实为真**时输出，其余一律省略（省略即 false）。判不准就省略——漏判会由随后的完整裁决补上，误判则会让整轮带上不相干的纪律。
@@ -26605,7 +26647,8 @@ async function sendPrompt(text, attachments = [], readyConfig = null, opts = {})
   // 工具直觉表/能力名录不在这儿：它是静态的，随 system 前缀走（见上面 _toolHint）。
   const _uiTurnEngineering = _turnEngineeringResolved;
   // 第三个参数只在完整裁决缺席时起作用（见 _agentDecisionFrameBlock 上面那段）：
-  // 信息走快通道、闸门等全量。_fastRouteProfile 不写进 _uiTurnEngineering，就是为了这条边界。
+  // 发车时快通道多半还没落定，这里仍用同步画像；落定后的受限行为副本由循环边界的
+  // _applyFastRouteBehaviorIfLanded 收，方向边界见那边。
   const _decisionFrame = (effectiveMode === "agent")
     ? _agentDecisionFrameBlock(text, _uiTurnEngineering, _fastRouteProfile)
     : "";
@@ -38212,8 +38255,18 @@ function _rememberAskedQuestion(session, question, answer) {
 function _implementationMutationGroundingIssue(run, call, root = "") {
   if (!run || run.mode !== "agent" || !_implementationGroundingCandidate(call)) return "";
   const profile = run.engineering || {};
-  if (!(profile.implementation || profile.explicitWorkspaceMutation || profile.projectEngineering
-      || profile.uiProject || profile.bug || profile.debugProject)) return "";
+  // 画像从「开启条件」改成「豁免条件」。原来这里要求 implementation/bug/uiProject 等
+  // 画像位先亮，门才存在——而那张表是模型自己填的：模型越弱表越空，门就越全开，
+  // 恰好把安全带从最需要它的那批 run 上解掉（完整裁决实测 8–20 秒，画像为空还是常态）。
+  // 门内的判据（_runHasImplementationGrounding / _runRootConfirmedEmptyForImplementation）
+  // 本来就全是当场可算的执行事实，不需要画像才能算。所以默认开门；范围由执行事实收窄：
+  // 文件写入只在目标是源码/清单/配置（_implementationGroundingFilePath）时要求取证，
+  // 写 README/素材不拦；scaffold/mutate 命令照旧。豁免只认**落了地的**裁决明确说这轮
+  // 只读（intentSource === "ai" 且 explicitReadOnly）——pending/partial/fast 都不豁免。
+  const _callType = String(call?.type || "");
+  if (typeof fileEditTypes === "function" && fileEditTypes().has(_callType)
+      && !_implementationGroundingFilePath(call?.path)) return "";
+  if (profile.intentSource === "ai" && profile.explicitReadOnly) return "";
   const currentRoot = root || call?._runRoot || run.root || "";
   if (_runRootConfirmedEmptyForImplementation(run, currentRoot)) return "";
   if (_runHasImplementationGrounding(run, currentRoot)) return "";
@@ -43295,6 +43348,11 @@ function _planBeforeBuildIssue(run, call) {
   // substantial 反而不在白名单里：模型就算填了也会被 21982 那行无条件覆盖掉，
   // 拿一个纯派生量当硬拦判据，正是这次重构要根除的「预测驱动控制流」。
   if (p.bug || p.debugProject || p.explicitReadOnly) return "";
+  // 快通道画像（intentSource="fast"）可以驱动「多一道取证」方向的门，但不许驱动这道
+  // 全系统唯一硬拦回合的计划门——精简判断误报一次，代价是整轮被打回。完整裁决（"ai"）
+  // 照旧。注意判据写在 run.engineering 上而不是 p 上：p.* 被下面那条「硬拦判据只认
+  // 模型直接声明的维度」的元测试按白名单扫，而 intentSource 是裁决的到场状态，不是维度。
+  if (run.engineering?.intentSource === "fast") return "";
   if (!(p.projectScope || p.fromZeroUiProject || p.fullWebsite)) return "";
   const steps = Array.isArray(run._planSteps) ? run._planSteps : [];
   if (steps.length) return "";
@@ -49083,6 +49141,9 @@ function _planGateGrandProject(run) {
 
 function _runNeedsPlanGateNow(run, call = null) {
   if (Array.isArray(run?._planSteps) && run._planSteps.some((s) => s?.status !== "cancelled")) return false;
+  // 同 _planBeforeBuildIssue：快通道画像（intentSource="fast"）不许驱动硬拦回合的
+  // 计划门——它的 requiresPlan 是从精简旗标派生的（催单 nudge 不受此限，那是仪式方向）。
+  if (run?.engineering?.intentSource === "fast") return false;
   // run_worker 不再无条件要计划：派 worker 只是并行手段，不等于大工程——小型并行任务
   // （如"并行重构 2 个模块"）走下面的意图判定即可；真正的大工程编排会被
   // _planGateGrandProject 按意图拦住（worker 不在 _callCanBypassPlanGate 豁免名单里）。
@@ -49159,14 +49220,61 @@ function _applyLateIntentIfLanded(run, config, task, session, body, isLive, mess
 // 结构上赢不了。赢不了 = 结果没有读者 = 整条通道白跑。生产 46 次 agent 请求
 // semantic_profile_seen 全空、agent_engineering 装载 0 次，就是这个洞。
 //
-// 它只写请求头，绝不写 run.engineering：那份画像还管着计划门槛、写入义务、角色编排，
-// 拿一份精简判断驱动它们会把影响面放得太大。行为仍然只认完整裁决。
+// 本函数只写请求头；run.engineering 由下面的 _applyFastRouteBehaviorIfLanded 收一份
+// 受限副本（方向边界见那边的说明）。
 function _applyFastRouteProfileIfLanded(run, config, session) {
   if (!run || !config || run._fastRouteProfileApplied) return false;
   const fast = run._intentState?.fastProfile;
   if (!fast || typeof fast !== "object") return false;
   run._fastRouteProfileApplied = true;
   config.ideSemanticProfile = _sessionStableSemanticProfile(session, _ideSemanticProfile(fast));
+  return true;
+}
+
+// 快通道的**受限行为写入权** —— 上面那个头部落地点的同胞。
+//
+// 上面那条「只写请求头，绝不写 run.engineering」的禁令，假设的对照组是完整裁决；而弱模型
+// 上的真实对照组是**零**：实测（26473 附近的注释）快通道那份小 JSON 弱模型吐得又快又全，
+// 完整裁决那份 43 字段大 JSON 它给到 4996 token 依然一个字出不来。于是恰恰在唯一一条已知
+// 跑得通的腿上，我们拿到了 debugProject / implementation / workspaceAction 这些行为闸门
+// 要的字段，然后把它们丢掉——行为闸门拿到的不是「精简但真实」，是全空。
+//
+// 所以给它一个**按方向收窄**的写入权（方向表 = gate-tristate 的 ceremony/capability 清单）：
+//   · 允许驱动「多做一道仪式/取证」方向的门：_implementationMutationGroundingIssue、
+//     _debugCaseForRun（及其 BLOCKED_DEBUG_EVIDENCE 链）、收尾验收契约、取证 nudge。
+//     这些门开着只会让模型多读一次代码/多留一条证据。
+//   · 结构上够不到「夺能力」的门：那些一律 `intentSource === "ai"` 精确比较
+//     （gate-tristate 钉着），"fast" 对它们等同「裁决未到」。
+//   · 显式禁掉硬拦回合的计划门：_planBeforeBuildIssue / _runNeedsPlanGateNow 各有一条
+//     `intentSource === "fast"` 的排除。
+//   · explicitReadOnly 被剥掉：拿快通道判断去把一轮标成只读是夺能力方向（50546 附近
+//     已有先例注释），也会误触发取证门的只读豁免。
+// 完整裁决落定后 _applyLateIntentIfLanded 照常整体覆盖（"fast" ≠ "ai"，早返回拦不住它）。
+function _applyFastRouteBehaviorIfLanded(run) {
+  if (!run || run._fastRouteBehaviorApplied) return false;
+  if ((run.engineering?.intentSource || "pending") !== "pending") return false;
+  const fast = run._intentState?.fastProfile;
+  if (!fast || typeof fast !== "object") return false;
+  const pseudo = {};
+  for (const key of _FAST_ROUTING_KEYS) {
+    if (fast[key] === true && key !== "explicitReadOnly" && _AI_INTENT_DIMENSIONS.includes(key)) pseudo[key] = true;
+  }
+  pseudo.engineering = {
+    projectState: fast.existingProject === true || fast.existingWebsite === true ? "existing" : "unknown",
+    workspaceAction: _AI_WORKSPACE_ACTIONS.has(fast.workspaceAction) ? fast.workspaceAction : "none",
+    designMode: _AI_DESIGN_MODES.has(fast.designMode) ? fast.designMode : "none",
+    orchestrationMode: _AI_ORCHESTRATION_MODES.has(fast.orchestrationMode) ? fast.orchestrationMode : "solo",
+    changeScope: _AI_CHANGE_SCOPES.has(fast.changeScope) ? fast.changeScope : "none",
+    roleNeeds: Array.isArray(fast.roleNeeds) ? [...fast.roleNeeds] : [],
+  };
+  const base = _semanticEngineeringEvidence(run._originalText || "");
+  base._isAgentMode = run.mode === "agent";
+  const merged = _mergeAiIntentProfile(base, pseudo, run._originalText || "", null);
+  if (!merged) return false;
+  merged.intentSource = "fast";
+  merged.explicitReadOnly = false;
+  run._fastRouteBehaviorApplied = true;
+  run.engineering = merged;
   return true;
 }
 
@@ -49938,9 +50046,10 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
   if (run.engineering?.intentSource !== "ai") {
     _applyLateIntentIfLanded(run, config, task, session, body, _live, messages);
   }
-  // 完整裁决之外的两个来源，同一个边界一起收：快通道的旗标（模型判断，只喂请求头）和
-  // 这一轮已经发生的执行事实。两者都只并进单调并集，不动任何行为闸门。
+  // 完整裁决之外的两个来源，同一个边界一起收：快通道（旗标进请求头 + 一份受限行为
+  // 画像，方向边界见 _applyFastRouteBehaviorIfLanded）和这一轮已经发生的执行事实。
   _applyFastRouteProfileIfLanded(run, config, session);
+  _applyFastRouteBehaviorIfLanded(run);
   _applyExecutionFactProfile(run, config, session);
   _startMichaelDesignPreflight({ run, body, isLive: _live });
   // The Agent nucleus + search_tools are sufficient for the first evidence step. Delay
@@ -50104,6 +50213,7 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
         _applyLateIntentIfLanded(run, config, task, session, body, _live, messages);
       }
       _applyFastRouteProfileIfLanded(run, config, session);
+      _applyFastRouteBehaviorIfLanded(run);
       _applyExecutionFactProfile(run, config, session);
       _startInitialToolRoutingAfterFirstTurn();
       _startMichaelDesignPreflight({ run, body, isLive: _live });
@@ -50507,6 +50617,7 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
         _applyLateIntentIfLanded(run, config, task, session, body, _live, messages);
       }
       _applyFastRouteProfileIfLanded(run, config, session);
+      _applyFastRouteBehaviorIfLanded(run);
       _applyExecutionFactProfile(run, config, session);
       _firstModelTurnCompleted = true;
       _startInitialToolRoutingAfterFirstTurn();

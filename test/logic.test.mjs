@@ -8901,15 +8901,15 @@ test("a novice's vague sentence flows through the real chain into professional d
   });
   const context = (message, id = "chat-ledger") => ({ sessionId: id, currentMessage: message, priorTask: null, recentTurns: [] });
   const intentSession = { _cancelIds: new Set() };
-  const verdict = await aiIntent("我想搞个能记账的小东西", { model: "claude-opus-4", requestId: "req_settlement_123" }, intentSession, context("我想搞个能记账的小东西"));
+  const verdict = await aiIntent("我想搞个能记账的小东西", { model: "claude-opus-4", baseUrl: "https://gw.test", apiKey: "k", requestId: "req_settlement_123" }, intentSession, context("我想搞个能记账的小东西"));
   assert.equal(asked[0].model, "claude-opus-4", "判意图用的就是用户选的模型");
   assert.equal(asked[0].requestId, "req_settlement_123", "intent keeps the enclosing settlement ID");
   assert.notEqual(asked[0].cancelId, asked[0].requestId, "intent cancellation must address its physical request, not the settlement scope");
   assert.equal(intentSession._cancelIds.size, 0, "the physical cancel ID is removed once the intent request settles");
   // single-flight：同文本并发只许发一次网络请求、计费一次
   const [a, b] = await Promise.all([
-    aiIntent("帮我把那个订单系统搞完整点", { model: "claude-opus-4" }, null, context("帮我把那个订单系统搞完整点")),
-    aiIntent("帮我把那个订单系统搞完整点", { model: "claude-opus-4" }, null, context("帮我把那个订单系统搞完整点")),
+    aiIntent("帮我把那个订单系统搞完整点", { model: "claude-opus-4", baseUrl: "https://gw.test", apiKey: "k" }, null, context("帮我把那个订单系统搞完整点")),
+    aiIntent("帮我把那个订单系统搞完整点", { model: "claude-opus-4", baseUrl: "https://gw.test", apiKey: "k" }, null, context("帮我把那个订单系统搞完整点")),
   ]);
   assert.deepEqual(a, b);
   assert.equal(asked.length, 2, "两条不同文本共 2 次请求；同文本并发必须被 single-flight 合并");
@@ -9004,7 +9004,7 @@ test("intent foreground timeout leaves the physical request alive and safely ado
   const session = { id: "session-timeout", _cancelIds: new Set() };
   const result = await profile(
     "继续修复",
-    { model: "test-model", requestId: "req_settlement_scope_123" },
+    { model: "test-model", baseUrl: "https://gw.test", apiKey: "k", requestId: "req_settlement_scope_123" },
     session,
     { sessionId: "session-timeout", currentMessage: "继续修复" },
   );
@@ -13381,6 +13381,8 @@ test("implementation grounding is advisory and only a real prior failure stops a
     _implementationGroundingCandidate: groundingCandidate,
     _runRootConfirmedEmptyForImplementation: rootIsEmpty,
     _runHasImplementationGrounding: hasGrounding,
+    _implementationGroundingFilePath: groundingPath,
+    fileEditTypes: () => new Set(["write", "edit", "multiedit", "format"]),
   });
   const succeeds = load("_toolExecutionSucceeded", {
     _toolFailureMatch: load("_toolFailureMatch"),
