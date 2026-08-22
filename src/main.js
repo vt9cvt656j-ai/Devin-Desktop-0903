@@ -20201,7 +20201,7 @@ function _approvalLabel(call) {
       let d = "";
       try {
         const snap = _mcpStates.get(String(call.mcpRoot || "").replace(/\/+$/, ""))?.snapshot;
-        d = (snap?.toolCache || []).find((e) => e?.function?.name === call.mcpName)?.descBody || "";
+        d = snap?.toolMap?.get?.(call.mcpName)?.descBody || "";
       } catch {}
       return { title: "执行 MCP 工具？", detail: `${call.server || "?"}/${call.tool || call.mcpName || "?"}`
         + (call.mcpReadOnly ? "\n服务声明：readOnlyHint=true（仅作提示，仍需授权）" : "")
@@ -28454,6 +28454,9 @@ function _mcpFailureSystemContext(failed, maxItems = 8, maxBytes = 2048) {
 function _mcpAvailabilitySystemContext(snapshot, maxServers = 12, maxBytes = 1536) {
   const cache = Array.isArray(snapshot?.toolCache) ? snapshot.toolCache : [];
   if (!cache.length) return "";
+  // descBody 是本地元数据，住在按公开名索引的 toolMap 里（缓存条目本身要保持纯 schema，
+  // 它会原样发给上游并被三层字节预算计费）。
+  const toolMap = snapshot?.toolMap;
   const clean = (value, limit) => _truncateUtf8(
     String(value ?? "").replace(/[\u0000-\u001f\u007f\u2028\u2029]+/g, " ").replace(/\s+/g, " ").trim(),
     limit,
@@ -28473,7 +28476,7 @@ function _mcpAvailabilitySystemContext(snapshot, maxServers = 12, maxBytes = 153
     // 带上一句说明，它一眼就能判断这件事该不该交给这个工具。
     // descBody 是没套免责前缀的那份（见 _mcpDescriptionBody）。取不到才退回
     // function.description——那上面带着 72 字符的前缀，几个工具就能把说明预算吃光。
-    byServer.get(service).push({ name: full, desc: clean(schema?.descBody ?? schema?.function?.description, 400) });
+    byServer.get(service).push({ name: full, desc: clean(toolMap?.get?.(full)?.descBody ?? schema?.function?.description, 400) });
   }
   if (!byServer.size) return "";
   // 体量小的服务已经被整体放进开局工具窗口了（_mcpServersForInitialWindow，与
@@ -29144,33 +29147,106 @@ function _mcpPublicToolName(server, tool, usedNames) {
   return candidate;
 }
 
+/*
+ * 适配器说明的字节预算，和 _mcpDescriptionBody 的 320 是两件事。
+ *
+ * 320 那个上限是给「第三方工具自述」定的：那是一段可裁的散文，砍短了模型顶多少知道点
+ * 用法。适配器说明不是散文，它是**资源/prompt 清单唯一的模型可见通道**——run.mcpResourceCache
+ * 从不进上下文，适配器本身也没有 list 动作。拿 320 去砍它，10 个资源只剩 4 个、第 4 个
+ * 的 URI 切在路径中间、连「另有 N 项」都被切掉，而同一段话还写着「必须传真实 uri」。
+ * 模型于是要么照着半截 URI 调用失败，要么断定资源就这么几条。
+ *
+ * 所以这里给它自己的预算，并且换一套裁法：外层模板是我们自己写的，不再整段截断；
+ * 每个第三方字段各自消毒、各自限长；「另有 N 项」先占位，保证留在尾部。
+ */
+const _MCP_ADAPTER_DESC_MAX_BYTES = 1500;
+const _MCP_ADAPTER_ITEM_NAME_MAX = 64;
+const _MCP_ADAPTER_ITEM_DESC_MAX = 80;
+const _MCP_ADAPTER_ITEM_ARG_MAX = 32;
+const _MCP_ADAPTER_URI_MAX = 200;
+const _MCP_ADAPTER_ENUM_MAX = 32;
+
+/// URI 不能走 _mcpDescriptionBody。
+///
+/// 那个函数剥的是伪造的对话角色头（`user:`、`system:` 一类），对散文是对的；而 URI 是
+/// 要被模型**原样回传**的标识符，剥掉里面合法的 `user:` 就是给它一个调不通的地址——
+/// 正是这条修复要消灭的那种失败。控制字符和空白照样清掉，伪造分段结构靠的是它们。
+function _mcpUriText(raw) {
+  return String(raw || "")
+    .replace(/[\u0000-\u001f\u007f\u2028\u2029\s]+/g, "")
+    .slice(0, _MCP_ADAPTER_URI_MAX);
+}
+
 function _mcpCapabilitySchema(server, kind, metadata, usedNames) {
   const items = Array.isArray(metadata) ? metadata : [];
   if (!items.length) return null;
   const label = kind === "resource" ? "read_resource" : "get_prompt";
   const publicName = _mcpPublicToolName(server, label, usedNames);
-  const lines = items.slice(0, 32).map((item) => {
+  // 每个字段单独消毒、单独限长。整段过一次 _mcpDescriptionBody 的话，一条超长描述就能
+  // 把它后面所有条目的 URI 挤没。
+  const clip = (raw, limit) => _mcpDescriptionBody(raw).slice(0, limit);
+  const uris = [];
+  let urisIntact = true;
+  const allLines = items.map((item) => {
     if (kind === "resource") {
-      const uri = String(item?.uri || item?.uriTemplate || "");
-      const name = String(item?.name || uri);
-      const desc = String(item?.description || "").replace(/\s+/g, " ").trim();
+      const uri = _mcpUriText(item?.uri || item?.uriTemplate);
+      const name = clip(item?.name || uri, _MCP_ADAPTER_ITEM_NAME_MAX);
+      const desc = clip(item?.description, _MCP_ADAPTER_ITEM_DESC_MAX);
+      if (item?.uri) {
+        uris.push(uri);
+        // 被 _MCP_ADAPTER_URI_MAX 削过的 URI 不能进 enum：那等于把「只许传这些值」
+        // 钉在一串调不通的地址上，比不钉更糟。
+        if (!uri || uri.length >= _MCP_ADAPTER_URI_MAX) urisIntact = false;
+      }
       return `${name}: ${uri}${desc ? ` (${desc})` : ""}`;
     }
-    const name = String(item?.name || "");
-    const desc = String(item?.description || "").replace(/\s+/g, " ").trim();
-    const args = Array.isArray(item?.arguments) ? item.arguments.map((arg) => arg?.name).filter(Boolean).join(", ") : "";
+    const name = clip(item?.name, _MCP_ADAPTER_ITEM_NAME_MAX);
+    const desc = clip(item?.description, _MCP_ADAPTER_ITEM_DESC_MAX);
+    const args = Array.isArray(item?.arguments)
+      ? item.arguments.map((arg) => clip(arg?.name, _MCP_ADAPTER_ITEM_ARG_MAX)).filter(Boolean).join(", ")
+      : "";
     return `${name}${args ? `(${args})` : ""}${desc ? `: ${desc}` : ""}`;
   });
-  const omitted = items.length > lines.length ? `；另有 ${items.length - lines.length} 项` : "";
-  const description = kind === "resource"
-    ? _mcpDescriptionAsData(server, `读取该 MCP 服务的资源。必须传真实 uri；已发现资源：${lines.join("；")}${omitted}`)
-    : _mcpDescriptionAsData(server, `获取该 MCP 服务的 prompt。prompt 必须传已发现名称；arguments 传参数对象。已发现 prompts：${lines.join("；")}${omitted}`);
+  // 「另有 N 项」先按最坏情况占位再填正文。先填满再回头补这句话，它恰好是被挤掉的那一句，
+  // 而模型看不到它就会断定清单到此为止——比少列几条更糟。
+  const noteFor = (n) => `；另有 ${n} 项未列出`;
+  const noteReserve = _utf8ByteLength(noteFor(items.length));
+  const lines = [];
+  let usedBytes = 0;
+  for (const line of allLines) {
+    const cost = _utf8ByteLength(line) + (lines.length ? 1 : 0);
+    if (lines.length && usedBytes + cost > _MCP_ADAPTER_DESC_MAX_BYTES - noteReserve) break;
+    lines.push(line);
+    usedBytes += cost;
+  }
+  const omitted = items.length > lines.length ? noteFor(items.length - lines.length) : "";
+  const body = kind === "resource"
+    ? `读取该 MCP 服务的资源。必须传真实 uri；已发现资源：${lines.join("；")}${omitted}`
+    : `获取该 MCP 服务的 prompt。prompt 必须传已发现名称；arguments 传参数对象。已发现 prompts：${lines.join("；")}${omitted}`;
+  // 免责前缀照旧要有（正文里嵌着第三方字段），但正文不再过整段 _mcpDescriptionBody——
+  // 每个字段已经各自消毒过，再套一次只是把 320 字上限原样加回来。传空正文取到的就是
+  // 那段前缀本身，所以它仍然只有一份，不会和 _mcpDescriptionAsData 长歪。
+  const description = _mcpDescriptionAsData(server, "") + body;
+  const uriProperty = { type: "string", description: "已发现的资源 URI；资源模板按其 URI 模式填写" };
+  // 清单能钉进 schema 就别只靠描述正文承载：enum 让模型不用从一段散文里抠 URI。
+  // 但只有「全是静态资源、都没被削过、数量装得下」时才钉——资源模板的 URI 要模型自己
+  // 按模式填，enum 会把它们一律判成非法值。
+  if (kind === "resource" && uris.length === items.length && urisIntact
+    && uris.length > 0 && uris.length <= _MCP_ADAPTER_ENUM_MAX) {
+    uriProperty.enum = [...new Set(uris)];
+  }
   const schema = kind === "resource"
-    ? { type: "function", function: { name: publicName, description, parameters: { type: "object", properties: { uri: { type: "string", description: "已发现的资源 URI；资源模板按其 URI 模式填写" } }, required: ["uri"] } } }
+    ? { type: "function", function: { name: publicName, description, parameters: { type: "object", properties: { uri: uriProperty }, required: ["uri"] } } }
     : { type: "function", function: { name: publicName, description, parameters: { type: "object", properties: { prompt: { type: "string", description: "已发现的 prompt 名称" }, arguments: { type: "object", description: "prompt 参数对象" } }, required: ["prompt"] } } };
   return {
     name: publicName,
     schema,
+    // 名录块要的那份说明：不带免责前缀，而且**不是**上面那份完整清单。名录整体只有
+    // 1536 字节预算，塞一份 1500 字节的 URI 清单进去会把别的服务整条挤没——清单的
+    // 去处是 function.description 和 uri.enum，名录只需要一句「这是什么、有多少条」。
+    descBody: kind === "resource"
+      ? `读取该服务发布的资源（传 uri）。已发现 ${items.length} 项，完整 URI 清单在本工具的参数说明里。`
+      : `取用该服务发布的 prompt（传 prompt 名称与 arguments）。已发现 ${items.length} 项，完整清单在本工具的参数说明里。`,
     // resources/read 和 prompts/get 按 MCP 协议就是读取操作，不可能改动任何东西。
     // 不标 readOnly 的话，只读模式那道按 mcpReadOnly 判定的门会把它们一律拦掉——
     // 而"查文档、取模板"恰恰是 Plan/Explorer 最需要的两件事。
@@ -29438,11 +29514,21 @@ function _mcpIngestServer(serverName, server, discovery, { root, scope, source }
       readOnly: tool.annotations?.readOnlyHint === true,
       autoApprove,
       root,
+      // 名录块/审批框/卡片要的是**不带免责前缀**的那份说明。它是本地元数据，所以住在
+      // 这张按公开名索引的表里，不挂在缓存条目上——那个对象会原样发给上游（见下）。
+      // 不能让读的人去 function.description 上按前缀文本切：那段文字服务自述里可以原样
+      // 伪造，切出来的东西不可信。
+      descBody: _mcpDescriptionBody(tool.description || tool.name),
     });
     const inputSchema = tool.inputSchema || tool.input_schema;
     const schema = (inputSchema && typeof inputSchema === "object" && inputSchema.type)
       ? inputSchema
       : { type: "object", properties: (inputSchema && inputSchema.properties) || {} };
+    // 这里入库的对象**原样进 body.tools 发给上游**（_toolPayloadWindow → _l0Tools →
+    // aiChatWithTools → payload["tools"]），而客户端窗口、开局 MCP 预算、网关的最终工具
+    // 预算三层都按整条对象的字节算。任何本地元数据挂在这一层，就是把同一段说明再发一遍、
+    // 还被重复计费三次，OpenAI 兼容的上游收到的还是带未知顶层键的 tool 对象。
+    // 所以条目必须是纯 {type, function}；descBody 在上面进了 _mcpToolMap。
     _mcpToolCache.push({
       type: "function",
       function: {
@@ -29450,9 +29536,6 @@ function _mcpIngestServer(serverName, server, discovery, { root, scope, source }
         description: _mcpDescriptionAsData(serverName, tool.description || tool.name),
         parameters: schema,
       },
-      // 名录块用的是不带免责前缀的这份。不能让它去 function.description 上按前缀
-      // 文本切——那段文字是可以被服务自述里原样伪造的，切出来的东西不可信。
-      descBody: _mcpDescriptionBody(tool.description || tool.name),
     });
   }
   // MCP resources and prompts are first-class capabilities, not just metadata.
@@ -29460,12 +29543,14 @@ function _mcpIngestServer(serverName, server, discovery, { root, scope, source }
   // through the same tool-call loop without pretending they are ordinary tools.
   const resourceAdapter = _mcpCapabilitySchema(serverName, "resource", [...resources, ...resourceTemplates], _mcpToolMap);
   if (resourceAdapter) {
-    _mcpToolMap.set(resourceAdapter.name, { ...resourceAdapter.route, autoApprove, root });
+    // 适配器也要有 descBody。没有的话名录块只能退回 function.description，而那上面带着
+    // 72 字符的免责前缀——正是「说明预算被一句重复话术吃光」那个已经修过的病。
+    _mcpToolMap.set(resourceAdapter.name, { ...resourceAdapter.route, autoApprove, root, descBody: resourceAdapter.descBody });
     _mcpToolCache.push(resourceAdapter.schema);
   }
   const promptAdapter = _mcpCapabilitySchema(serverName, "prompt", prompts, _mcpToolMap);
   if (promptAdapter) {
-    _mcpToolMap.set(promptAdapter.name, { ...promptAdapter.route, autoApprove, root });
+    _mcpToolMap.set(promptAdapter.name, { ...promptAdapter.route, autoApprove, root, descBody: promptAdapter.descBody });
     _mcpToolCache.push(promptAdapter.schema);
   }
 }
@@ -33767,7 +33852,18 @@ function _searchToolsFuzzyMatch(query, registry, loadedNames) {
     if (w.length < 3 || !/[\u4e00-\u9fff]/.test(w)) continue;
     for (let i = 0; i + 2 <= w.length; i++) bigrams.push(w.slice(i, i + 2));
   }
-  const extraTokens = [...new Set(bigrams)].filter((b) => !tokens.includes(b));
+  // 同一个盲区的第二种形状：`browser_click`、`git_status` 这类标识符按上面的分词规则是
+  // **一个** token，要求某个工具名/触发条件逐字包含 "browser_click" 才算命中——恒不命中。
+  // 而这恰恰是模型最自然的查询形态（它就是照着工具命名法在猜名字）。零命中 → 快通道必空
+  // → 等 MCP → 编排器，最坏 28 秒换回一句话。拆出子词，和 CJK 二元组同样按 1 分计：
+  // 片段是弱信号，不能让 "database_inspector" 里的 "database" 以整词的分量把某个数据库
+  // 工具直接顶成"判据明确"。排序逻辑一个字不动。
+  const subwords = [];
+  for (const w of tokens) {
+    if (!/^[a-z0-9]+(?:[_-][a-z0-9]+)+$/.test(w)) continue;
+    for (const part of w.split(/[_-]+/)) if (part.length >= 3) subwords.push(part);
+  }
+  const extraTokens = [...new Set([...bigrams, ...subwords])].filter((b) => !tokens.includes(b));
   const hits = [];
   for (const [name, schema] of registry.entries()) {
     const fn = schema?.function;
@@ -46726,7 +46822,7 @@ function _mcpToolCardHtml(call, result) {
   let snap = null;
   try { snap = _mcpStates.get(String(call?.mcpRoot || "").replace(/\/+$/, ""))?.snapshot || null; } catch {}
   const meta = snap?.serverMeta?.get?.(call?.server) || null;
-  const desc = (snap?.toolCache || []).find((e) => e?.function?.name === call?.mcpName)?.descBody || "";
+  const desc = snap?.toolMap?.get?.(call?.mcpName)?.descBody || "";
   const scope = { local: "项目本地配置", repo: "仓库自带配置", user: "本机全局配置" }[String(meta?.scope || "")] || "配置来源未知";
   const kind = call?.kind === "resource" ? "读取资源" : call?.kind === "prompt" ? "取 prompt" : `调用工具 ${call?.tool || "?"}`;
   const info = meta?.serverInfo || {};
@@ -50585,6 +50681,15 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
             registry = run._toolRegistry || (run._toolRegistry = _buildToolRegistry(isAgent, run.mcpToolCache));
             loaded = new Set(toolSchemas.map((t) => t.function && t.function.name));
             exact = _searchToolsExactQuery(call.query, registry);
+            // 等完之后注册表**变了**——MCP 的工具刚进来。原来这里只重算 exact，模糊层
+            // 用的还是等待之前那份不全的目录：第一轮问一个 MCP 服务名（"context7"）本可
+            // 在这里本地定下来，却仍要再付一次上限 20 秒的编排器调用。判据和快通道那次
+            // 逐字一样（_confidentFuzzyResolution），只是这回喂给它的目录是全的。
+            if (!exact?.schema) {
+              fastHits = _searchToolsFuzzyMatch(call.query, registry, loaded);
+              const _confidentAfterMcp = _confidentFuzzyResolution(fastHits);
+              if (_confidentAfterMcp) fastAdds = _confidentAfterMcp.map((h) => h.schema);
+            }
           }
           let semanticDecision = null;
           let adds = [];
@@ -50631,7 +50736,7 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
           // P1 #5: 命中行追加推荐场景/触发条件元数据，帮主模型建立工具↔场景关联。
           const lines = loadedAdds.map((schema) => "· " + compactToolGuide(schema) + _toolMetaGuideSuffix(schema?.function?.name));
           const rejectedNote = update.rejected.length
-            ? `\n另找到 ${update.rejected.length} 个匹配工具，但当前 128 tools / 512 KiB 窗口无法装入，未加载。请缩小查询后重试。`
+            ? `\n另找到 ${update.rejected.length} 个匹配工具，但当前 ${_TOOL_PAYLOAD_MAX_TOOLS} tools / 512 KiB 窗口无法装入，未加载。请缩小查询后重试。`
             : "";
           const mcpFailureNote = _mcpFailureSystemContext(run?._mcpFailures || []);
           // 工具规划思考链：编排器给出选择理由时随结果回传（只进工具结果/UI，不进 system 缓存）。
@@ -50665,12 +50770,26 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
             label = usedFastPath ? `已加载 ${lines.length}·本地` : `已加载 ${lines.length}`;
           }
           else if (exact?.schema && loaded.has(exact.name)) { content = `工具已加载：\n· ${compactToolGuide(exact.schema)}`; label = "已在手上"; }
-          // 「没有这个工具」是能力缺口，不是查询写错了。以前这句到此为止，模型就把它当
-          // 「IDE 不支持」回给用户——用户说的"很呆"正是这个。指路要跟着结论一起给。
-          else if (exact && !exact.schema) { content = `当前注册表没有名为 ${exact.name} 的工具——注册表是起手包，不是能力边界。别再换词搜，直接按目标组合出来：${_CAPABILITY_ROUTES}`; label = "注册表里没有"; }
-          else if (adds.length) { content = `语义调度选出 ${adds.length} 个工具，但当前 128 tools / 512 KiB 窗口无法装入，未加载。请缩小当前阶段后重试。`; label = "窗口装不下"; }
+          else if (adds.length) { content = `语义调度选出 ${adds.length} 个工具，但当前 ${_TOOL_PAYLOAD_MAX_TOOLS} tools / 512 KiB 窗口无法装入，未加载。请缩小当前阶段后重试。`; label = "窗口装不下"; }
           else if (semanticDecision?.instruction) { content = `语义调度未要求增加新 schema；当前工具已足够。${thoughtNote}\n下一步：${semanticDecision.instruction}`; label = "无需新增"; }
           else if (fuzzyHits.length && fuzzyHits.every((h) => h.alreadyLoaded)) { content = `相关工具均已加载，可直接调用：\n${fuzzyHits.slice(0, 8).map((h) => `· ${h.name}${_toolMetaGuideSuffix(h.name)}`).join("\n")}`; label = "已在手上"; }
+          // 「没有这个工具」是能力缺口，不是查询写错了：这句到此为止的话，模型会把它当
+          // 「IDE 不支持」回给用户——用户说的"很呆"正是这个。指路要跟着结论一起给。
+          //
+          // 但这条排在上面两条**前面**时，它连正确的结论都不是：模型查 browser_click
+          // （含下划线 → exact.schema 恒为 null），编排器指向的 browser 已经在窗口里、
+          // 被 loaded 过滤成空 adds，于是它读到的是「注册表没有 browser_click，去 web_fetch
+          // 拼」——手里握着浏览器，却被告知没有这个能力。所以先让「编排器说够用」和
+          // 「相关工具都已加载」说话，轮到这里才是真的没有。
+          // 真的没有时也分两种：注册表里有名字相近的就报候选（已装的标出来，让它直接调），
+          // 只有连候选都没有才是能力缺口，那时才给换路清单。
+          else if (exact && !exact.schema) {
+            const _near = _nearestToolNames(exact.name, [...registry.keys()], 5);
+            content = _near.length
+              ? `当前注册表没有名为 ${exact.name} 的工具，但有名字相近的：${_near.map((n) => (loaded.has(n) ? `${n}（已在手上，直接调）` : n)).join("、")}。按这些名字调用，或用 search_tools 传其中一个精确名取回 schema。`
+              : `当前注册表没有名为 ${exact.name} 的工具——注册表是起手包，不是能力边界。别再换词搜，直接按目标组合出来：${_CAPABILITY_ROUTES}`;
+            label = _near.length ? "名字相近" : "注册表里没有";
+          }
           else if (mcpFailureNote) { content = `没有找到匹配的新工具；部分 MCP 服务在后台发现时失败。\n\n${mcpFailureNote}`; label = "MCP 连接失败"; }
           else { content = "语义工具调度本次不可用，且模糊匹配无命中。这**不是检索失败，是内置工具里没有专用的**（⚠️ 如果本轮 MCP 服务发现还没完成，已连接服务提供的工具不在这次检索范围内——过几步再调一次 search_tools 确认）——注册表是起手包，不是能力边界。别再换词空搜，按目标改走组合路径：" + _CAPABILITY_ROUTES; label = "无匹配"; }
           const r = { type: "search_tools", path: "", content };

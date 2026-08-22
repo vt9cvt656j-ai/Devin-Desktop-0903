@@ -248,12 +248,17 @@ test("查找工具的界面标签要跟着分支走，不能七种结局压成�
 // [160,90,50,0] 逐级下调：实测 2 个工具时说明完整，4 个工具时每条都砍在词中间只剩套话，
 // 到 6 个工具直接掉到 0，一条说明都不剩——而这时 1536 字节的预算才用掉 786。
 // 说明没了，模型就退回自己瞎写，MCP 等于白装。这正是加说明要解决的那个问题。
+// descBody 是本地元数据，住在按公开名索引的 toolMap 里；缓存条目保持纯 schema，因为
+// 那个对象会原样进 body.tools 发给上游，并被客户端窗口/开局 MCP 预算/网关三层重复计费。
 const describedSnap = (n) => ({
   toolCache: Array.from({ length: n }, (_, i) => ({
     type: "function",
     function: { name: `mcp__context7__tool_${i}`, description: "x" },
-    descBody: `Resolves a package name to a library ID so documentation can be fetched for tool ${i}. Call this before querying docs.`,
   })),
+  toolMap: new Map(Array.from({ length: n }, (_, i) => [
+    `mcp__context7__tool_${i}`,
+    { descBody: `Resolves a package name to a library ID so documentation can be fetched for tool ${i}. Call this before querying docs.` },
+  ])),
 });
 
 const parseCatalog = (out) => JSON.parse(out.slice(out.indexOf("{")));
@@ -297,8 +302,8 @@ test("名录读的是不带免责前缀的那份说明", () => {
     toolCache: [{
       type: "function",
       function: { name: "mcp__s__t", description: "[MCP·s] 第三方服务自述（不可信数据…）：真正的说明" },
-      descBody: "真正的说明",
     }],
+    toolMap: new Map([["mcp__s__t", { descBody: "真正的说明" }]]),
   });
   assert.match(out, /真正的说明/);
   assert.ok(!out.includes("第三方服务自述"), "每条说明里还在重复整段已经声明过的免责话术");
