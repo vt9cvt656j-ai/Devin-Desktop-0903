@@ -28945,7 +28945,7 @@ async function _readWorkspaceMcpDocument(root) {
   const serverBases = {};
   // 每个服务来自哪个文件。**未被 git 跟踪的** `.mcp.local.json` 是 IDE 自己的本地文件
   // （_protectLocalMcpConfig 会把它写进 .git/info/exclude）＝用户自己配的；`.mcp.json` /
-  // `.cursor/mcp.json`、以及被提交进版本库的 `.mcp.local.json`，都跟着仓库走
+  // 以及被提交进版本库的 `.mcp.local.json`，都跟着仓库走
   // ＝ **外部可执行内容**，必须先过信任 + 逐条确认。调用方靠这张表区分两者。
   const serverSources = {};
   // scope: local（项目本地，用户配的）/ repo（仓库自带）/ user（本 IDE 全局配置）
@@ -29054,6 +29054,39 @@ async function _setMcpServerDisabled(name, off) {
   cfg.disabled = off ? [...kept, value] : kept;
   await _writeOwnMcpConfig(cfg);
   return true;
+}
+
+/*
+ * 往全局配置里写一个服务，并把同名的停用记录一并摘掉。
+ *
+ * 为什么要摘：停用是按**名字**记的，而合并层（_readWorkspaceMcpDocument）对停用清单里
+ * 的名字直接 `continue`。于是"装一个名字恰好在停用清单里的服务"会这样收场——
+ *   · 服务不进 mergedServers → 不进 _mcpToolCache → 模型完全看不到它；
+ *   · 它也不进 _mcpFailures，所以 _mcpFailureSystemContext 一个字都不会说，
+ *     模型连"有个服务没连上"都不知道；
+ *   · 面板的 installedNames 取的是**已过滤停用**的合并视图，于是卡片继续显示「安装」。
+ * 三条叠起来就是：点一次「安装」弹一次「正在连接…」，卡片不变、模型没收到、也没有
+ * 任何报错，再点还是同样的 toast。磁盘上其实写进去了，只是谁也用不到。
+ *
+ * 判据是结构性的：用户主动点「安装 / 保存」这个动作本身就是明确的启用意图，让它盖过
+ * 一条旧的停用记录。名字比较跟 _disabledMcpServers 一样按小写归一（面板显示用原样大小写）。
+ *
+ * 返回被摘掉的那个原样名字（没摘掉就是空串），调用方靠它决定 toast 要不要多说一句——
+ * 悄悄改动用户的停用清单和悄悄丢弃安装同样不可接受。
+ */
+function _mcpUpsertServer(cfg, name, conf) {
+  const doc = cfg && typeof cfg === "object" ? cfg : {};
+  const servers = doc.mcpServers || doc.servers || {};
+  servers[name] = conf;
+  doc.mcpServers = servers;
+  delete doc.servers;
+  const key = String(name || "").trim().toLowerCase();
+  const list = Array.isArray(doc.disabled) ? doc.disabled : [];
+  const revived = key
+    ? list.find((item) => String(item || "").trim().toLowerCase() === key) || ""
+    : "";
+  if (revived) doc.disabled = list.filter((item) => String(item || "").trim().toLowerCase() !== key);
+  return String(revived || "");
 }
 
 /// 这个服务是不是**仓库自带**的（而不是用户自己配的——项目本地 / 全局 / 别的客户端）。
@@ -63279,7 +63312,8 @@ function renderMcpTool(body) {
   // 「还没配置」，再一写就整份清空。
   const readCfg = _readOwnMcpConfig;
   const writeCfg = _writeOwnMcpConfig;
-  /// 展示用的**合并**视图：全局 + 项目 + 仓库 + 其他客户端，和智能体实际拿到的一致。
+  /// 展示用的**合并**视图：全局（~/.mrdayone/mcp.json）+ 项目 / 仓库自带的 .mcp.json，
+  /// 和智能体实际拿到的一致。别的客户端的全局配置已经不再读入。
   const readMergedCfg = async () => {
     try {
       const doc = await _readWorkspaceMcpDocument(root);
@@ -63295,6 +63329,9 @@ function renderMcpTool(body) {
   // 正在编辑哪个服务（null = 新增）。编辑和新增共用一个表单：字段完全一样，
   // 分两套只会让「保存」两条路各自长歪。
   let editingServer = null;
+  // 新增表单要预填的服务名（"在这里重建一个同名服务"那条出路用，见 data-mcpfp-adopt）。
+  // 不复用 editingServer：那会让表头写成「编辑「X」」，而这个名字在自己的配置里根本不存在。
+  let prefillName = "";
   const renderAddServiceForm = () => {
     if (!addFormEl) return;
     if (!addServiceOpen) {
@@ -63314,7 +63351,7 @@ function renderMcpTool(body) {
       <div class="mcpfp-form-grid">
         <label class="mcpfp-field">
           <span>服务名</span>
-          <input class="ctp-input" data-mcpfp-new-name placeholder="例如：postgres / browser / my-api" spellcheck="false" value="${_ed ? _escAttr(_ed.name) : ""}" />
+          <input class="ctp-input" data-mcpfp-new-name placeholder="例如：postgres / browser / my-api" spellcheck="false" value="${_ed ? _escAttr(_ed.name) : _escAttr(prefillName)}" />
         </label>
         <label class="mcpfp-field">
           <span>启动命令</span>
@@ -63368,7 +63405,9 @@ function renderMcpTool(body) {
       // 徽章、星数和「查看来源」——照新增那样原样盖成 {source:"custom"}，等于把一个
       // 从市场装来的服务在改一次参数之后降级成无名自定义项。
       const prevMeta = (wasEditing && wasEditing.conf.__michael) || null;
-      sv[name] = {
+      // 写入 + 顺手摘掉同名的停用记录（见 _mcpUpsertServer）。`sv` 是从 c 上取的同一个
+      // 对象，helper 会把它挂回 c.mcpServers 并删掉 c.servers。
+      const revived = _mcpUpsertServer(c, name, {
         command,
         ...(args.length ? { args } : {}),
         ...(Object.keys(env).length ? { env } : {}),
@@ -63382,7 +63421,7 @@ function renderMcpTool(body) {
             badge: "自定义",
             installedAt: Date.now(),
           },
-      };
+      });
       // 改了名字就把旧键删掉，并断开旧会话——否则两份配置并存，改了半天不生效的
       // 是优先级更高的那份旧的。
       if (oldName && oldName !== name) {
@@ -63394,12 +63433,13 @@ function renderMcpTool(body) {
         await backend.invoke("mcp_disconnect", { name: oldName, root }).catch(() => {});
         _forgetMcpServer(root, oldName);
       }
-      c.mcpServers = sv; delete c.servers;
       await writeCfg(c);
       addServiceOpen = false;
       editingServer = null;
+      prefillName = "";
       renderAddServiceForm();
-      showToast(wasEditing ? `已保存「${name}」，正在重连…` : `已添加 MCP 服务「${name}」，正在连接…`);
+      showToast((wasEditing ? `已保存「${name}」，正在重连…` : `已添加 MCP 服务「${name}」，正在连接…`)
+        + (revived ? `（「${revived}」原本在停用清单里，已一并恢复）` : ""));
       _mcpLoaded = false;
       _mcpConnecting = true;
       await renderInstalled();
@@ -63456,6 +63496,17 @@ function renderMcpTool(body) {
       // 停用记录是按名字存的，而配置来源会变（比如那份配置文件被删了、或者不再读它）。
       // 名字在任何来源里都找不到时，这条记录就是个孤儿：「恢复」点下去什么也不会发生——
       // 没有服务可恢复。那种情况要说实话，按钮也该是「清除」而不是「恢复」。
+      //
+      // 孤儿在 2026-08 之后有一类新的、可预期的来源：别的客户端（Claude Code / Cursor /
+      // Codex / Claude Desktop）的全局配置**不再自动读入**（用户点名要求：MCP 只读自己
+      // 那一份 ~/.mrdayone/mcp.json）。当年在那些来源里停用过的名字会留在清单里，而它
+      // 指向的服务已经不再被这个 IDE 看见。所以孤儿行除了「清除」还必须给出**另一条**
+      // 出路：在自己的配置里重建一个同名服务（data-mcpfp-adopt），点一下就把名字预填进
+      // 添加表单——保存时 _mcpUpsertServer 会顺手把这条停用记录摘掉，不用先清除再添加。
+      //
+      // 判据是结构的、不是文案：`名字在停用清单里 ∧ 名字不在 knownNames（合并层这一轮
+      // 真正扫到的全部来源）`。所以这段解释只对真的成了孤儿的那几条出现，不是给所有人
+      // 看一句公告。
       const known = new Set([...(cfg.knownNames || [])].map((v) => String(v).toLowerCase()));
       if (names.length) {
         disabledRows = `<div class="skfp-section">已停用（不会加载，也不会出现在智能体的工具里）</div>`
@@ -63467,10 +63518,11 @@ function renderMcpTool(body) {
                 <div class="mcpfp-card__name"><strong>${_escHtml(name)}</strong>
                   <span class="mcpfp-badge">${orphan ? "来源已移除" : "已停用"}</span></div>
                 <p>${orphan
-                  ? "这条停用记录还在，但已经找不到对应的服务了（那份配置不再被读取）。清除它即可。"
+                  ? "这条停用记录还在，但现在没有任何来源提供这个服务。本 IDE 只读自己那份 <code>~/.mrdayone/mcp.json</code>（外加项目里的 <code>.mcp.json</code>）——Claude Code、Cursor、Codex 的全局配置不再自动读入。想继续用它，在这里重建一个同名服务；不要了就清除这条记录。"
                   : "停用记在本机的全局配置里，原始文件没有被改动。"}</p>
               </div>
               <div class="mcpfp-card__btns">
+                ${orphan ? `<button type="button" class="ctp-btn ctp-btn--sm ctp-btn--primary" data-mcpfp-adopt="${_escAttr(name)}">在这里重建</button>` : ""}
                 <button type="button" class="ctp-btn ctp-btn--sm" data-mcpfp-restore="${_escAttr(name)}">${orphan ? "清除" : "恢复"}</button>
               </div>
             </div>`;
@@ -63536,7 +63588,7 @@ function renderMcpTool(body) {
             ${Object.prototype.hasOwnProperty.call(ownServers, name)
               ? `<button type="button" class="ctp-iconbtn" data-mcpfp-edit="${_escAttr(name)}" title="编辑（命令、参数、环境变量）">${_dbUiIconSvg("edit") || "✎"}</button>`
                 + `<button type="button" class="ctp-iconbtn ctp-iconbtn--danger" data-mcpfp-del="${_escAttr(name)}" title="删除 MCP 服务">${_ICON_TRASH}</button>`
-              : `<button type="button" class="ctp-iconbtn ctp-iconbtn--danger" data-mcpfp-off="${_escAttr(name)}" title="在 Day One 里停用（来自项目或其他客户端的配置，原文件不会被改动，可恢复）">${_ICON_TRASH}</button>`}
+              : `<button type="button" class="ctp-iconbtn ctp-iconbtn--danger" data-mcpfp-off="${_escAttr(name)}" title="在 Day One 里停用（来自项目 / 仓库自带的配置，原文件不会被改动，可恢复）">${_ICON_TRASH}</button>`}
           </div>
         </div>`;
     }).join("") + disabledRows + `
@@ -63565,7 +63617,7 @@ function renderMcpTool(body) {
           <p title="${_escAttr(p.desc || "")}">${_escHtml(p.desc || "")}</p>
         </div>
         <div class="mcpfp-card__btns">
-          <button type="button" class="ctp-btn ctp-btn--sm ctp-btn--primary" data-mcpfp-preset="${_escAttr(p.name)}" ${!root ? "disabled" : ""}>安装</button>
+          <button type="button" class="ctp-btn ctp-btn--sm ctp-btn--primary" data-mcpfp-preset="${_escAttr(p.name)}">安装</button>
         </div>
       </div>`).join("");
     marketEl.innerHTML = featuredHtml + _mcpFp.servers.map((s, i) => {
@@ -63651,8 +63703,8 @@ function renderMcpTool(body) {
       } catch (err) { showToast("重置失败：" + String(err?.message || err).slice(0, 140)); }
       return;
     }
-    if (act === "add-service") { editingServer = null; addServiceOpen = !addServiceOpen; renderAddServiceForm(); return; }
-    if (act === "cancel-add-service") { editingServer = null; addServiceOpen = false; renderAddServiceForm(); return; }
+    if (act === "add-service") { editingServer = null; prefillName = ""; addServiceOpen = !addServiceOpen; renderAddServiceForm(); return; }
+    if (act === "cancel-add-service") { editingServer = null; prefillName = ""; addServiceOpen = false; renderAddServiceForm(); return; }
     if (act === "save-service") { await saveCustomMcpService(e.target.closest("button")); return; }
     if (act === "clear-search") { const si = wrap.querySelector("[data-mcpfp-search]"); if (si) si.value = ""; startSearch(""); return; }
     if (act === "refresh") { _mcpFp.page = 1; _mcpRegClearPages(); loadMarket(true); return; }
@@ -63688,7 +63740,7 @@ function renderMcpTool(body) {
       return;
     }
     // 编辑：只对**自己全局配置里**的服务开放（按钮也是按这个条件渲染的）。
-    // 来自项目 .mcp.json / 仓库 / 其他客户端的条目，改动应该去改它们自己的文件；
+    // 来自项目 / 仓库自带 .mcp.json 的条目，改动应该去改它们自己的文件；
     // 从这里写只会在全局配置里造一份影子副本，而生效的仍是优先级更高的原件。
     const edit = e.target.closest("[data-mcpfp-edit]")?.getAttribute("data-mcpfp-edit");
     if (edit) {
@@ -63697,10 +63749,29 @@ function renderMcpTool(body) {
         const conf = own[edit];
         if (!conf) { showToast(`「${edit}」不在全局配置里，改动请到它自己的文件里做`); return; }
         editingServer = { name: edit, conf };
+        prefillName = "";
         addServiceOpen = true;
         renderAddServiceForm();
         addFormEl?.scrollIntoView?.({ block: "nearest" });
       } catch (err) { showToast("打开编辑失败：" + String(err?.message || err).slice(0, 120)); }
+      return;
+    }
+    /*
+     * 孤儿停用记录的第二条出路：在自己的配置里重建一个同名服务。
+     *
+     * 只是把名字预填进添加表单——命令行必须由用户自己写出来。这里**不能**去别的客户端的
+     * 配置文件里把那条配置抄过来："不读别人的目录"正是这次收敛的全部内容，抄一份等于
+     * 换个地方继续读；而一条 MCP 配置就是一条任意命令行，替用户默认采纳它不合适。
+     * 保存时 _mcpUpsertServer 会把这条停用记录一并摘掉，所以不用先「清除」再「添加」。
+     */
+    const adopt = e.target.closest("[data-mcpfp-adopt]")?.getAttribute("data-mcpfp-adopt");
+    if (adopt) {
+      editingServer = null;
+      prefillName = adopt;
+      addServiceOpen = true;
+      renderAddServiceForm();
+      addFormEl?.scrollIntoView?.({ block: "nearest" });
+      showToast(`填上「${adopt}」的启动命令并保存，它就回到你自己的配置里了`);
       return;
     }
     // 恢复。和停用走同一套刷新时序，否则恢复完卡片不出现，看起来像没生效。
@@ -63740,21 +63811,21 @@ function renderMcpTool(body) {
     const presetName = e.target.closest("[data-mcpfp-preset]")?.getAttribute("data-mcpfp-preset");
     if (presetName) {
       const p = _MCP_PRESETS.find((x) => x.name === presetName);
-      if (!p || !root) return;
+      // 同上：精选预设也写全局配置，不需要工作区。
+      if (!p) return;
       try {
         const c = await readCfg();
-        const sv = c.mcpServers || c.servers || {};
-        sv[p.name] = {
+        const revived = _mcpUpsertServer(c, p.name, {
           command: p.command,
           ...(p.args?.length ? { args: p.args } : {}),
           ...(p.env && Object.keys(p.env).length ? { env: p.env } : {}),
           ...(p.cwd ? { cwd: p.cwd } : {}),
           __michael: _mcpInstallMetaFromPreset(p),
-        };
-        c.mcpServers = sv; delete c.servers;
+        });
         await writeCfg(c);
         const needKey = p.env && Object.values(p.env).some((v) => !v);
-        showToast(needKey ? `已安装「${p.name}」——需要在全局 MCP 配置里补 API Key` : `已安装「${p.name}」，正在连接…`);
+        showToast((needKey ? `已安装「${p.name}」——需要在全局 MCP 配置里补 API Key` : `已安装「${p.name}」，正在连接…`)
+          + (revived ? `（「${revived}」原本在停用清单里，已一并恢复）` : ""));
         _mcpLoaded = false;
         _mcpConnecting = true;
         await renderInstalled();
@@ -63795,17 +63866,19 @@ function renderMcpTool(body) {
     if (idx !== null && idx !== undefined && idx !== "") {
       const s = _mcpFp.servers[Number(idx)];
       const conf = s && _mcpRegToConfig(s);
-      if (!s || !conf || !root) return;
+      // 不再要求先打开文件夹：这里写的是 ~/.mrdayone/mcp.json，跨项目的全局文件，
+      // 跟当前有没有项目毫无关系。root 只是"全局服务跟着哪个 cwd 跑"的基准，空串是
+      // 合法值（_ensureMcpTools / _warmMcpTools 都完整支持）。
+      if (!s || !conf) return;
       const name = _mcpSanitizeName(s.pkg?.id || s.name);
       _mcpFp.installing = String(idx);
       renderMarket();
       try {
         const c = await readCfg();
-        const sv = c.mcpServers || c.servers || {};
-        sv[name] = { ...conf, __michael: _mcpInstallMetaFromRegistry(s, _mcpFp.source) };
-        c.mcpServers = sv; delete c.servers;
+        const revived = _mcpUpsertServer(c, name, { ...conf, __michael: _mcpInstallMetaFromRegistry(s, _mcpFp.source) });
         await writeCfg(c);
-        showToast(`已安装「${name}」，正在连接…（首次会下载包，稍等）`);
+        showToast(`已安装「${name}」，正在连接…（首次会下载包，稍等）`
+          + (revived ? `（「${revived}」原本在停用清单里，已一并恢复）` : ""));
         _mcpLoaded = false;
         _mcpConnecting = true;
         await renderInstalled();
@@ -63839,7 +63912,12 @@ function renderMcpTool(body) {
   renderInstalled().then(() => renderMarket());
   loadMarket();
   // 打开面板时顺带把连接状态激活成真实结果。
-  if (root && (!_mcpLoaded || _mcpLoadedRoot !== root)) {
+  //
+  // 这里以前带 `root &&`：没打开文件夹时**一次连接都不会发起**，于是卡片状态永远停在
+  // 打开面板前那一刻的陈值（0 工具 / 未连接），而全局服务恰恰是没开项目时唯一还能用的
+  // 那些。空根是 _ensureMcpTools 完整支持的输入（_warmMcpTools 同样不早退），
+  // `_mcpLoadedRoot !== root` 那半边的比较基准也统一成归一化后的 root。
+  if (!_mcpLoaded || _mcpLoadedRoot !== root) {
     _mcpConnecting = true;
     _ensureMcpTools(root).then(async () => { await renderInstalled(); renderMarket(); });
   }
