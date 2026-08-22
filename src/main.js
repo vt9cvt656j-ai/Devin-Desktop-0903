@@ -18905,6 +18905,15 @@ function _addRunSettlement(runUsage, settlement) {
   }
 }
 
+// 本次运行到此刻**已结算落地**的 token 总量。单次运行预算（michael-ide.token-budget）
+// 判的就是这个数：它按 run 起点清零（session._runUsage 在 run 开头重建），所以不会被上
+// 一个 run 的尾数污染；每一笔都来自网关结算，不是估算。
+function _runUsageTokens(runUsage) {
+  if (!runUsage) return 0;
+  return (Number(runUsage.in) || 0) + (Number(runUsage.out) || 0)
+    + (Number(runUsage.cacheRead) || 0) + (Number(runUsage.cacheCreation) || 0);
+}
+
 function _liveRunSettlement(runUsage) {
   if (!runUsage || !runUsage.settledTurns) return null;
   const settledTurns = Math.max(0, Math.round(Number(runUsage.settledTurns) || 0));
@@ -33463,6 +33472,21 @@ function _subAgentAdmitTools(query, { registry, loaded, execTypes, mapCall, max 
   out.outside = out.outside.slice(0, 8);
   return out;
 }
+// 子体 search_tools 的卡片标签。三种结局在拼正文时已经判明（装上了 / 全在沙箱外 /
+// 一个都没有），标签直接跟着同一个分支走，不需要新判据。
+//
+// 不给标签的代价是实打实的：_settleToolStep 在 label 为空时只能拿正文扫词判红绿，而
+// 「已加载工具：…」「以下工具超出子任务沙箱」「没有匹配的工具」三条一个失败词都不含
+// —— 三种相反的结局在卡片上全是绿色「完成」，排查"子体为什么没用 X 工具"时这张卡
+// 一点区分度都没有。主循环的同一个工具早就按分支贴了标签，这条并行路径漏了。
+function _subAgentSearchToolsLabel(admitted, outside) {
+  const _a = Array.isArray(admitted) ? admitted.length : 0;
+  const _o = Array.isArray(outside) ? outside.length : 0;
+  if (_a && _o) return `已加载 ${_a} · 沙箱外 ${_o}`;
+  if (_a) return `已加载 ${_a}·子任务`;
+  if (_o) return `沙箱外 ${_o} · 交回主任务`;
+  return "无匹配";
+}
 // 全量注册表 { name → schema }。
 function _buildToolRegistry(includeWrite, mcpTools = []) {
   const reg = new Map();
@@ -45692,6 +45716,7 @@ async function _runSubAgent({ config, description, prompt, root, container, run,
         if (call && call.type === "search_tools") {
           toolCount++;
           let _stContent = "";
+          let _stLabel = "";
           let _stStep = null;
           try { _stStep = _createToolStep(call); vp.appendChild(_stStep); } catch {}
           try {
@@ -45710,10 +45735,12 @@ async function _runSubAgent({ config, description, prompt, root, container, run,
             if (_stAdmitted.length) _stContent += `已加载工具：${_stAdmitted.join("、")}。下一步直接调用。`;
             if (_found.outside.length) _stContent += `${_stContent ? "\n" : ""}以下工具超出子任务沙箱，不能在这里执行；如确实需要，在最终报告里请父智能体处理：${_found.outside.join("、")}`;
             if (!_stContent) _stContent = "没有匹配的工具。用现有工具完成，或在最终报告里说明缺少的能力。";
+            _stLabel = _subAgentSearchToolsLabel(_stAdmitted, _found.outside);
           } catch (e) {
             _stContent = `[ERROR] 工具搜索失败: ${String(e?.message || e)}`;
+            _stLabel = "搜索出错";
           }
-          try { if (_stStep) _settleToolStep(_stStep, { type: "search_tools", path: "", content: _stContent }); } catch {}
+          try { if (_stStep) _settleToolStep(_stStep, { type: "search_tools", path: "", content: _stContent }, _stLabel); } catch {}
           messages.push({ role: "tool", tool_call_id: tc.id, content: _stContent });
           continue;
         }
@@ -48544,6 +48571,9 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
   session._runIsLoop = true; // this run has a draining loop → a 2nd message steers it mid-run
   const _runGenSnap = session._runGen || 0; // 代际快照：旧 run 不能被新回合的 streaming=true 救活
   session._runUsage = { in: 0, out: 0, cacheRead: 0, cacheCreation: 0, costCents: 0, turns: 0, settledTurns: 0, reportedTurns: 0, allSettled: true, allReported: true };
+  // 这个字段是"上一轮"的用量，挂在 session 上、跨 run 存活。不清零的话它会把上一个 run
+  // 最后一轮的读数带进新 run 的第一次读取。
+  session._lastTurnTokens = 0;
   _setStreaming(session, true);
   if (session === _currentSession()) _setSendBtnStop(true);
   const _live = () => !!session.streaming && (session._runGen || 0) === (_runGenSnap || 0);
@@ -48876,9 +48906,20 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
     "websiteContent",
   ]);
   const _nudgeRank = (cat) => (cat === "steer" ? 0 : _NUDGE_FACTS.has(cat) ? 1 : 2);
+  // 本轮尾部区间的起点：每轮迭代开头置成当时的 messages.length。
+  //
+  // 提醒的增删本身也要守 RATCHET compression 那段棘轮（只在尾部动，历史只进不摆）。同类提醒重发时
+  // 无条件 splice 旧条，等于每 12 轮（toolReminder）从**消息中段**抠掉一条——上游前缀
+  // 缓存从那一点起全部失效，重新计费的是它后面的整段历史；走网关压缩线路时更狠，边界
+  // 指纹一变就是整份重传。所以只有「旧条就在本轮刚推的这一截里」才 splice（那是尾部，
+  // 缓存本来就没覆盖到），更早的留在原地当历史。
+  let _nudgeTurnFloor = 0;
   const _pushNudge = (cat, content) => {
     const prev = _nudgeReg.get(cat);
-    if (prev) { const i = messages.indexOf(prev); if (i !== -1) messages.splice(i, 1); }
+    if (prev) {
+      const i = messages.indexOf(prev);
+      if (i >= _nudgeTurnFloor) messages.splice(i, 1);
+    }
     // 同轮活跃上限：不同类别的提醒同时挂在尾部（planStale+verify+honesty+…），模型会逐条
     // 表态——输出又长又自我横跳（用户实测骂"痴呆"）。steer 是用户实时插话的护送指令，永不清。
     //
@@ -48906,11 +48947,52 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
     _nudgeReg.set(cat, m);
     messages.push(m);
   };
+  // 陈旧提醒**注销**，但不从消息里抠。距尾 >14 条的提醒早就不是"当前指令"了，它要退出的
+  // 是三件事：占着 ≤4 的活跃名额、挡着同类刷新、以及被 _clearNudges 连坐——注销一次全退掉。
+  // 而把它从中段 splice 掉换不来任何东西：那一条的 token 早就付过了，删除只会让上游前缀
+  // 缓存从那一点起失效，代价是**它后面**十几条历史被重新计费。同样是"历史只进不摆"。
   const _sweepNudges = () => {
     for (const [cat, m] of _nudgeReg) {
       const i = messages.indexOf(m);
       if (i === -1) { _nudgeReg.delete(cat); continue; }
-      if (messages.length - i > 14) { messages.splice(i, 1); _nudgeReg.delete(cat); } // 距尾>14条 = 早已过时
+      if (messages.length - i > 14) _nudgeReg.delete(cat); // 距尾>14条 = 早已过时，退出管理不退出历史
+    }
+  };
+  // 提醒之外的另一条投递路：**事实**的载体不能是"随时会被撤走的提醒"。
+  // 子智能体报告是主 run 花了几十个模型轮次换回来的证据，不是一句提点——它必须像工具
+  // 结果一样留在历史里。这条推的消息不进 _nudgeReg，同类替换、14 条清扫、_clearNudges
+  // 三条删除路径都够不着它。
+  const _pushRunFact = (content) => {
+    const m = { role: "user", content: _ORCH_NOTE + content };
+    messages.push(m);
+    return m;
+  };
+  run._pushRunFact = _pushRunFact;
+  // ── 单次运行 token 预算：判定挂在**结算落地**那一刻，不在读数那一刻 ──
+  //
+  // 结算是后台任务（settlementTasks 里不 await，为的是别让工具执行等计费传播），所以
+  // 模型轮刚结束时账上还是空的。原来的写法在那一刻同步读一个"上一轮"的字段来累加，
+  // 整条预算判定因此错位一轮、还会被上个 run 的尾数污染，最后一轮永远不计入。
+  // 现在改成：结算 promise 落地 → 用本 run 自己的结算账（session._runUsage）重算并判超限，
+  // 只置一个标记；下一轮迭代开头消费这个标记推收尾提醒。既不阻塞工具执行，也不错位。
+  const _readTokenCap = () => {
+    let cap = 0;
+    try { cap = parseInt(localStorage.getItem("michael-ide.token-budget") || "0", 10) || 0; } catch { cap = 0; }
+    return cap > 0 ? cap : 0;
+  };
+  const _noteTokenCapOnSettlement = () => {
+    if (run._tokenCapNudged || run._tokenCapPending) return;
+    const cap = _readTokenCap();
+    if (!cap) return;
+    const used = _runUsageTokens(session._runUsage);
+    if (used > cap) run._tokenCapPending = { used, cap };
+  };
+  const _billingHooked = new WeakSet();
+  const _hookSettlementTasks = () => {
+    for (const task of run._billingTasks || []) {
+      if (!task || typeof task.then !== "function" || _billingHooked.has(task)) continue;
+      _billingHooked.add(task);
+      task.then(_noteTokenCapOnSettlement, () => {});
     }
   };
   const _clearNudges = () => {
@@ -49307,21 +49389,36 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
         // it tells the truth.
         _activeThinkEffort = config.thinkingEffort || config.reasoningEffort || (config.thinkingBudget ? "high" : "off");
       }
-      _sweepNudges(); // 清掉离上下文尾部太远的陈旧 harness 提醒（真实用户消息不受影响）
+      _nudgeTurnFloor = messages.length; // 本轮尾部区间起点：只有这之后推的提醒才允许被 splice
+      _sweepNudges(); // 注销离上下文尾部太远的陈旧 harness 提醒（真实用户消息不受影响）
       // === P2.1 结果自动交付：后台子智能体作业落定后，下一轮迭代开头把报告注入模型 ===
-      // 多个完成的合并成一条 nudge；单条注入总量 ~3K 字，每作业复用 #43 的
-      // _clipPreservingErrors 1200 字+错误行豁免出口。cancelled 作业在取消传播处已标 consumed。
+      // 通知和证据分开承载：
+      //   · 完整报告（保留换行 → _clipPreservingErrors 的错误行豁免才成立）走 _pushRunFact，
+      //     不进 _nudgeReg，后续同类投递 / 14 条清扫 / _clearNudges 都碰不到它；
+      //   · nudge 只负责"有结果了"这个通知：首段结论 + 取回指针，总量仍 ~3K 字。
+      // 原来两件事挤在一条 nudge 里：先 replace(/\s+/g," ") 压成一行（证据清单的行结构没了，
+      // _clipPreservingErrors 按行做的错误行豁免同时作废）、再裁到 ≤1200 字（并发 4 个作业时
+      // 每个 750 字），而这条 nudge 几轮之后又会被删掉——主 run 为子体付了几十轮模型调用，
+      // 留下的是一段 10% 的单行摘要，且它还会消失。cancelled 作业在取消传播处已标 consumed。
       if (run._subAgentJobs instanceof Map) {
         const _settledJobs = [...run._subAgentJobs.values()].filter((j) => !j.consumed && (j.status === "done" || j.status === "failed" || j.status === "timeout" || j.status === "truncated"));
         if (_settledJobs.length) {
           const _jobBudget = Math.max(300, Math.floor(3000 / _settledJobs.length));
+          // 完整报告的预算：单份对齐同步路的 8000，并发多份时摊薄，一次交付总量有界。
+          const _factBudget = Math.min(8000, Math.max(2000, Math.floor(16000 / _settledJobs.length)));
           const _jobParts = [];
           for (const j of _settledJobs) {
             j.consumed = true;
             const _jobTag = j.status === "done" ? "完成"
               : (j.status === "timeout" ? "超时(部分结果)"
               : (j.status === "truncated" ? "未完成·轮次用尽(中间状态，不是结论)" : "失败"));
-            _jobParts.push(`[子智能体 job#${j.id} ${_jobTag}·${j.desc}] ${_clipPreservingErrors(String(j.result || "（无产出）").replace(/\s+/g, " "), Math.min(1200, _jobBudget))}`);
+            const _jobText = String(j.result || "（无产出）");
+            if (typeof run._pushRunFact === "function") {
+              run._pushRunFact(`[子智能体 job#${j.id} ${_jobTag}·${j.desc}·完整报告]\n${_clipPreservingErrors(_jobText, _factBudget)}`);
+            }
+            // 首段 = 子体简报里的"结论"段（_SUBAGENT_SYSTEM 要求结论写在最前）。
+            _jobParts.push(`[子智能体 job#${j.id} ${_jobTag}·${j.desc}] ${_clipPreservingErrors(_jobText.split(/\n\s*\n/)[0], Math.min(1200, _jobBudget))}`
+              + `\n（完整报告已在上文；也可用 await_subagent job=${j.id} 再取一次。）`);
           }
           _pushNudge("subagentResult", _jobParts.join("\n").slice(0, 3200));
         }
@@ -49813,15 +49910,21 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
       // Per-run token 预算控制：用户可在设置里给单次运行设 token 上限
       // （localStorage "michael-ide.token-budget"，0/未设 = 不限）。超限后不再硬扩步数，
       // 只给模型留收尾轮，把已做的如实交代——预算烧穿前有序着陆而不是无感烧钱。
-      run._tokens = (run._tokens || 0) + (session._lastTurnTokens || 0);
-      {
-        let _cap = 0; try { _cap = parseInt(localStorage.getItem("michael-ide.token-budget") || "0", 10) || 0; } catch {}
-        if (_cap > 0 && run._tokens > _cap && !run._tokenCapNudged) {
-          run._tokenCapNudged = true;
-          budget = Math.min(budget, iter + 3); // 留 2-3 轮收尾，不再延展
-          messages.push({ role: "user", content: _ORCH_NOTE + `[系统：本次运行 token 预算已用完（约 ${Math.round(run._tokens / 1000)}k / 上限 ${Math.round(_cap / 1000)}k）。立即收尾：不再开新任务，把已完成的和未完成的如实总结。]` });
-          showToast(`Token 预算已用完（${Math.round(run._tokens / 1000)}k），智能体收尾中`);
-        }
+      // 用量不在这里现读（结算还在飞），只累计**已落地**的账并消费结算回调置下的标记。
+      _hookSettlementTasks();
+      run._tokens = _runUsageTokens(session._runUsage);
+      if (run._tokenCapPending && !run._tokenCapNudged) {
+        const _cap = run._tokenCapPending.cap;
+        run._tokenCapPending = null;
+        run._tokenCapNudged = true;
+        // 收尾余量按**最近一轮的真实开销**给。原来固定 3 轮：一轮就吃掉半个预算的长上下文
+        // 任务，收尾本身还要再烧一个半预算，"有序着陆"变成又一次超支。
+        // session._lastTurnTokens 是最新一轮主模型的结算读数（写点在结算任务里，
+        // _lastMainUsageRequestId 把它钉在最新那一轮上），没上报过时是 0 → 退回 3 轮。
+        const _lastTurn = session._lastTurnTokens || 0;
+        budget = Math.min(budget, iter + (_lastTurn * 2 > _cap ? 1 : 3));
+        messages.push({ role: "user", content: _ORCH_NOTE + `[系统：本次运行 token 预算已用完（约 ${Math.round(run._tokens / 1000)}k / 上限 ${Math.round(_cap / 1000)}k）。立即收尾：不再开新任务，把已完成的和未完成的如实总结。]` });
+        showToast(`Token 预算已用完（${Math.round(run._tokens / 1000)}k），智能体收尾中`);
       }
       // 持久化工作流检查点（Temporal 思路的桌面版）：每轮把运行状态落盘；
       // 正常结束时清掉，崩溃/强关时它就留着 → 重启后恢复继续（见 restoreChatHistory）。
@@ -59918,13 +60021,17 @@ return { type: call.type, path: call.query || "", content: `[失败] ${call.type
         new Promise((resolve) => _guardTimers.push(setTimeout(resolve, _waitMs))),
       ])));
       for (const t of _guardTimers) clearTimeout(t);
-      const _budget = Math.max(300, Math.floor(3000 / _targets.length));
+      // 这是模型**显式**要报告的那条路，取回的必须是报告本身：预算对齐同步路（wait=true）
+      // 的 8000 字总额，且不做 replace(/\s+/g," ")——证据清单 (path:line) 的行结构一压就没，
+      // _clipPreservingErrors 按行做的错误行豁免也跟着作废。工具结果不在 _nudgeReg 里，
+      // 进了 messages 就不会被任何一条提醒清扫路径删掉。
+      const _budget = Math.max(2000, Math.floor(8000 / _targets.length));
       const _parts = [];
       for (const j of _targets) {
         if (j.status === "running") { _parts.push(`[job#${j.id}·${j.desc}] ⏱ 等待超时仍未落定（内部 5min 超时会自行终止，稍后结果自动送达）`); continue; }
         j.consumed = true;
         const _tag = j.status === "done" ? "完成" : (j.status === "timeout" ? "超时 (部分结果)" : (j.status === "truncated" ? "未完成 (轮次用尽)" : (j.status === "cancelled" ? "已取消" : "失败")));
-        _parts.push(`[job#${j.id} ${_tag}·${j.desc}] ${_clipPreservingErrors(String(j.result || "（无产出）").replace(/\s+/g, " "), Math.min(1200, _budget))}`);
+        _parts.push(`[job#${j.id} ${_tag}·${j.desc}] ${_clipPreservingErrors(String(j.result || "（无产出）"), _budget)}`);
       }
       res.className = "atc-result atc-result--ok"; res.textContent = t("subagent.jobsSettled", { count: _targets.length });
       const _factHead = _idleWait ? "[事实] 派发后未做任何其他工作就开始等待 = 同步阻塞，异步失去意义。下次：单个聚焦调研直接自己读；派了后台作业就先推进其他步骤，结果会自动送达。\n" : "";
@@ -59971,7 +60078,8 @@ return { type: call.type, path: call.query || "", content: `[失败] ${call.type
           _endRunCollaborationSession(run, "completed");
         }
       }
-      return { type: "awaitsubagent", path: _want, content: (_factHead + _parts.join("\n")).slice(0, 3200) + _panel };
+      // 总额跟着 _budget 走：再按 3200 砍一刀的话，上面把每份报告放大到 8000 字等于白做。
+      return { type: "awaitsubagent", path: _want, content: (_factHead + _parts.join("\n")).slice(0, 12000) + _panel };
 
     } else if (call.type === "openapi_parser") {
       // OpenAPI/Swagger 规范解析器：支持本地文件和公网 URL
