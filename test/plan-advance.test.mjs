@@ -14,18 +14,22 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
-const SRC = readFileSync(join(HERE, "..", "src", "main.js"), "utf8");
+// 正向源码断言必须跑在**剥掉注释**的源码上。注释不是代码：把一条契约从代码里删掉、
+// 只在注释里留一句，assert.match 照样绿——本仓库已经这样漏过一整组模型可见的工具契约。
+// 所以 `SRC` 绑定的是 CODE（注释整段置空，行号与偏移和原文一字不差）；
+// 真要匹配注释本身的断言显式用 RAW_SRC，并在那一行写清为什么。
+import { CODE as SRC, SRC as RAW_SRC } from "./helpers/source.mjs";
 
 function extractFn(name) {
-  const i = SRC.indexOf(`function ${name}(`);
+  const i = RAW_SRC.indexOf(`function ${name}(`);
   assert.ok(i >= 0, `找不到 ${name}`);
-  let depth = 0, j = SRC.indexOf("{", SRC.indexOf(")", i));
-  for (; j < SRC.length; j++) {
-    const c = SRC[j];
+  let depth = 0, j = RAW_SRC.indexOf("{", RAW_SRC.indexOf(")", i));
+  for (; j < RAW_SRC.length; j++) {
+    const c = RAW_SRC[j];
     if (c === "{") depth++;
     else if (c === "}") { depth--; if (!depth) break; }
   }
-  return SRC.slice(i, j + 1);
+  return RAW_SRC.slice(i, j + 1);
 }
 
 // 模型现在可以在 update_plan 里逐步声明 kind，动词表退化成兜底，所以这两个函数多了
@@ -121,9 +125,9 @@ test("兜底方向写进了注释，避免以后又被改回去", () => {
 //   3. 历史是 text-only（工具调用和结果不入库，为了压缩和重放安全），所以"读过什么"
 //      只能靠证据账本转达；不明说，模型就会重读。
 function resumeBlock() {
-  const i = SRC.indexOf("function _resumeHandoffBlock");
+  const i = RAW_SRC.indexOf("function _resumeHandoffBlock");
   const tail = '\n  } catch { return ""; }\n}';
-  const end = SRC.indexOf(tail, i);
+  const end = RAW_SRC.indexOf(tail, i);
   assert.ok(i > 0 && end > i, "找不到 _resumeHandoffBlock");
   return new Function(SRC.slice(i, end + tail.length) + "\nreturn _resumeHandoffBlock;")();
 }
@@ -172,7 +176,7 @@ test("计划全做完 / 压根没有计划时，不输出这段", () => {
 
 test("这段要真的进提示词，而且排在项目上下文之前", () => {
   // 它讲的是"这一轮该怎么接"，比项目背景更该被先读到。
-  const at = SRC.indexOf("const _dynPreamble =");
+  const at = RAW_SRC.indexOf("const _dynPreamble =");
   assert.ok(at > 0);
   const seg = SRC.slice(at, at + 500);
   assert.match(seg, /_resumeBlock \? _resumeBlock \+ "\\n\\n" : ""/, "交接块没有拼进提示词");
@@ -199,7 +203,7 @@ test("计划继承：限 agent 模式、排在 planSteps 声明之后、并同�
 });
 
 test("user_stopped 要有对应人话，不能把内部枚举名甩给用户", () => {
-  const at = SRC.indexOf("const _INCOMPLETE_LABELS");
+  const at = RAW_SRC.indexOf("const _INCOMPLETE_LABELS");
   assert.ok(at > 0);
   assert.match(SRC.slice(at, at + 600), /user_stopped: "/,
     "新枚举值没有人话，建议行会退回泛泛的「继续完成剩余部分」，send 串还会写「因 user_stopped 未完成」");

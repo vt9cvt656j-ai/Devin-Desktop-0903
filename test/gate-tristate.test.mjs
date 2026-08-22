@@ -18,7 +18,11 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
-const SRC = readFileSync(join(HERE, "..", "src", "main.js"), "utf8");
+// 正向源码断言必须跑在**剥掉注释**的源码上。注释不是代码：把一条契约从代码里删掉、
+// 只在注释里留一句，assert.match 照样绿——本仓库已经这样漏过一整组模型可见的工具契约。
+// 所以 `SRC` 绑定的是 CODE（注释整段置空，行号与偏移和原文一字不差）；
+// 真要匹配注释本身的断言显式用 RAW_SRC，并在那一行写清为什么。
+import { CODE as SRC, SRC as RAW_SRC } from "./helpers/source.mjs";
 
 // 按**代码文本**登记，不按行号：这个文件几万行，行号每天都在漂，按行号钉的清单第二天就是
 // 一堆假红。改了那一行的文本 = 改了那处判断，本来就该重新过一遍。
@@ -96,7 +100,7 @@ test("每一处「按画像否决」都要写明：裁决缺席时它倒向哪�
 test("工具编排的闸门必须区分「裁决未到」和「裁决说不适用」", () => {
   // 这是那天那个 bug 的原位，单独钉一条：它是**唯一**一处倒向 capability 的否决，
   // 也是「我让他干什么他什么都不知道」的直接成因。回退它不该只让上面那条泛化断言变红。
-  const loop = SRC.slice(SRC.indexOf("const _startInitialToolRoutingAfterFirstTurn"));
+  const loop = SRC.slice(RAW_SRC.indexOf("const _startInitialToolRoutingAfterFirstTurn"));
   const gate = loop.slice(0, 1400);
   assert.match(gate, /const _verdictLanded = run\.engineering\?\.intentSource === "ai";/,
     "工具编排闸门不再区分「裁决未到」——画像为空时整轮 128 个工具都进不来");
@@ -169,7 +173,7 @@ test("默认完整交付、先读懂再动手、每一步先想", () => {
   // ……才能去修改代码」「每写一个文件每做一步就需要去思考」。
   // 补之前全仓搜 MVP / 最小可用 / 糊弄，服务端提示词和客户端**零命中**——从来没有任何一条
   // 规则要求它别缩水。没有规则，模型缩到能跑就交，而且缩水本身不会被说出来。
-  const frame = SRC.slice(SRC.indexOf("function _agentDecisionFrameBlock"));
+  const frame = SRC.slice(RAW_SRC.indexOf("function _agentDecisionFrameBlock"));
   const laws = frame.slice(0, 8000);
 
   // ① 不降级。需求大就拆切片，不是砍功能。
@@ -325,7 +329,7 @@ test("schema 不许比实现更严——模型不填就整轮失败", () => {
 // 已经登记成「仪式」。所以对**具体那件能力**再钉一条：证据必须在带裁决守卫的分支里取。
 test("代码检索是能力不是仪式：裁决没回来时照给", () => {
   // 认 `await …` 那处**调用**，别撞上同名的函数定义（定义在前，indexOf 会先命中它）。
-  const at = SRC.indexOf("await _buildRetrievedCodeContext(query, root");
+  const at = RAW_SRC.indexOf("await _buildRetrievedCodeContext(query, root");
   assert.ok(at > 0, "首答路径上的代码检索调用不见了");
   // 往上找最近的那个 if，必须带裁决守卫。
   const before = SRC.slice(Math.max(0, at - 600), at);

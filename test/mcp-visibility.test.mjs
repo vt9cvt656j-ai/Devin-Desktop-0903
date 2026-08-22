@@ -17,14 +17,18 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
-const SRC = readFileSync(join(HERE, "..", "src", "main.js"), "utf8");
+// 正向源码断言必须跑在**剥掉注释**的源码上。注释不是代码：把一条契约从代码里删掉、
+// 只在注释里留一句，assert.match 照样绿——本仓库已经这样漏过一整组模型可见的工具契约。
+// 所以 `SRC` 绑定的是 CODE（注释整段置空，行号与偏移和原文一字不差）；
+// 真要匹配注释本身的断言显式用 RAW_SRC，并在那一行写清为什么。
+import { CODE as SRC, SRC as RAW_SRC } from "./helpers/source.mjs";
 
 function topLevelFn(name) {
-  const at = SRC.indexOf(`function ${name}(`);
+  const at = RAW_SRC.indexOf(`function ${name}(`);
   assert.ok(at > 0, `找不到 ${name}`);
-  const end = SRC.indexOf("\n}\n", at);
+  const end = RAW_SRC.indexOf("\n}\n", at);
   assert.ok(end > at, `${name} 没有行首收尾大括号`);
-  return SRC.slice(at, end + 2);
+  return RAW_SRC.slice(at, end + 2);
 }
 
 function topLevelConst(name) {
@@ -199,7 +203,7 @@ test("输出稳定：同一份快照两次调用逐字节相同", () => {
 // —— 光有函数不算数：必须真的被接进那一轮的上下文 ——
 
 test("这个块真的被拼进 contextBlock", () => {
-  const at = SRC.indexOf("const mcpBlock = _mcpAvailabilitySystemContext(");
+  const at = RAW_SRC.indexOf("const mcpBlock = _mcpAvailabilitySystemContext(");
   assert.ok(at > 0, "函数定义了却没人调用——那等于没写");
   const around = SRC.slice(Math.max(0, at - 400), at + 300);
   assert.match(around, /contextBlock \+=/, "结果没有并进 contextBlock");
@@ -209,8 +213,8 @@ test("这个块真的被拼进 contextBlock", () => {
 test("不为这个块引入新的等待", () => {
   // MCP 连接会拉起子进程、可能现装 npm 包，最长能到几十秒。为了报个名录去 await 它，
   // 等于给每一轮对话加一段无上限的首字延迟——预热拿不到就算了，下一轮自然就有。
-  const at = SRC.indexOf("const mcpBlock = _mcpAvailabilitySystemContext(");
-  const line = SRC.slice(at, SRC.indexOf("\n", at));
+  const at = RAW_SRC.indexOf("const mcpBlock = _mcpAvailabilitySystemContext(");
+  const line = SRC.slice(at, RAW_SRC.indexOf("\n", at));
   assert.doesNotMatch(line, /await/, "这里不该 await");
 });
 
@@ -222,11 +226,11 @@ test("查找工具的界面标签要跟着分支走，不能七种结局压成�
   //   · 压根**没找到** —— 能力真的缺。
   // 下一步动作完全相反，界面却分不出来，只能靠猜——这一轮排查就卡在这。
   // 锚在 search_tools 自己那段上——同名调用在别的分支也有。
-  const anchor = SRC.indexOf("const rejectedNote = update.rejected.length");
+  const anchor = RAW_SRC.indexOf("const rejectedNote = update.rejected.length");
   assert.ok(anchor > 0, "找不到 search_tools 的结果组装段");
-  const at = SRC.indexOf("_settleToolStep(step, r, ", anchor);
+  const at = RAW_SRC.indexOf("_settleToolStep(step, r, ", anchor);
   assert.ok(at > anchor, "找不到 search_tools 的界面落地点");
-  const line = SRC.slice(at, SRC.indexOf("\n", at));
+  const line = SRC.slice(at, RAW_SRC.indexOf("\n", at));
   assert.doesNotMatch(line, /无新工具/,
     "还是一刀切的「无新工具」——已在手上和没找到看起来一模一样");
   assert.match(line, /label/, "标签要由分支决定");
@@ -314,12 +318,12 @@ test("没打开文件夹也要预热——全局服务不属于任何项目", ()
    * 路径上，MCP **从来没被预热过**。第一轮既没有工具 schema，也没有那份「有哪些服务」的
    * 名录——而模型不会去搜一件自己不知道存在的东西。第二轮才正常。
    */
-  const warm = SRC.slice(SRC.indexOf("async function _warmMcpTools("), SRC.indexOf("async function _warmMcpTools(") + 900);
+  const warm = SRC.slice(RAW_SRC.indexOf("async function _warmMcpTools("), RAW_SRC.indexOf("async function _warmMcpTools(") + 900);
   assert.doesNotMatch(warm, /if \(!inTauri \|\| !root\) return;/,
     "空根又被早退挡掉了——不开文件夹就永远不预热 MCP");
   assert.match(warm, /if \(!inTauri\) return;/, "预热的守卫应当只看在不在桌面端");
 
-  const sched = SRC.slice(SRC.indexOf("function _scheduleWorkspaceAgentWarmup("), SRC.indexOf("function _scheduleWorkspaceAgentWarmup(") + 1200);
+  const sched = SRC.slice(RAW_SRC.indexOf("function _scheduleWorkspaceAgentWarmup("), RAW_SRC.indexOf("function _scheduleWorkspaceAgentWarmup(") + 1200);
   assert.doesNotMatch(sched, /if \(!inTauri \|\| !normalized\) return null;/,
     "整批预热又被空根挡掉了");
   // 真正跟项目走的只有工作区上下文，空根时跳过它就够了。

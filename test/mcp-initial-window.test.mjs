@@ -18,14 +18,18 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
-const SRC = readFileSync(join(HERE, "..", "src", "main.js"), "utf8");
+// 正向源码断言必须跑在**剥掉注释**的源码上。注释不是代码：把一条契约从代码里删掉、
+// 只在注释里留一句，assert.match 照样绿——本仓库已经这样漏过一整组模型可见的工具契约。
+// 所以 `SRC` 绑定的是 CODE（注释整段置空，行号与偏移和原文一字不差）；
+// 真要匹配注释本身的断言显式用 RAW_SRC，并在那一行写清为什么。
+import { CODE as SRC, SRC as RAW_SRC } from "./helpers/source.mjs";
 
 function topLevelFn(name) {
-  const at = SRC.indexOf(`function ${name}(`);
+  const at = RAW_SRC.indexOf(`function ${name}(`);
   assert.ok(at > 0, `找不到 ${name}`);
-  const end = SRC.indexOf("\n}\n", at);
+  const end = RAW_SRC.indexOf("\n}\n", at);
   assert.ok(end > at, `${name} 没有行首收尾大括号`);
-  return SRC.slice(at, end + 2);
+  return RAW_SRC.slice(at, end + 2);
 }
 
 // 和 main.js 的 agent 核心表保持一致。2026-08-18 扩窗：取外部资源那五个进了核心

@@ -14,7 +14,11 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
-const SRC = readFileSync(join(HERE, "..", "src", "main.js"), "utf8");
+// 正向源码断言必须跑在**剥掉注释**的源码上。注释不是代码：把一条契约从代码里删掉、
+// 只在注释里留一句，assert.match 照样绿——本仓库已经这样漏过一整组模型可见的工具契约。
+// 所以 `SRC` 绑定的是 CODE（注释整段置空，行号与偏移和原文一字不差）；
+// 真要匹配注释本身的断言显式用 RAW_SRC，并在那一行写清为什么。
+import { CODE as SRC, SRC as RAW_SRC } from "./helpers/source.mjs";
 const FILES_RS = readFileSync(join(HERE, "..", "src-tauri", "src", "files.rs"), "utf8");
 
 // 组合路径的四条出路，缺一条模型就少一种解法
@@ -31,9 +35,9 @@ const ROUTES = [
 // 四条出路现在是一份共用常量。原来它被手抄了两份，而另外两个出口（编了个不存在的工具名、
 // 抓页面失败）压根没有——所以钉两样：常量本身一条不缺，且每个出口都真的接上了它。
 test("能力缺口的换路清单只有一份，四条出路一条不缺", () => {
-  const at = SRC.indexOf("const _CAPABILITY_ROUTES =");
+  const at = RAW_SRC.indexOf("const _CAPABILITY_ROUTES =");
   assert.ok(at > 0, "换路清单被改名或删了");
-  const decl = SRC.slice(at, SRC.indexOf(";\n", at));
+  const decl = SRC.slice(at, RAW_SRC.indexOf(";\n", at));
   for (const [needle, why] of ROUTES) {
     assert.ok(decl.includes(needle), `缺 ${needle}：${why}`);
   }
@@ -41,15 +45,15 @@ test("能力缺口的换路清单只有一份，四条出路一条不缺", () =>
 });
 
 test("search_tools 精确名没命中时给的是出路，不是「换个词再搜」", () => {
-  const at = SRC.indexOf("当前注册表没有名为");
+  const at = RAW_SRC.indexOf("当前注册表没有名为");
   assert.ok(at > 0, "找不到精确名 miss 的文案");
-  const line = SRC.slice(at, SRC.indexOf("`;", at));
+  const line = SRC.slice(at, RAW_SRC.indexOf("`;", at));
   assert.match(line, /\$\{_CAPABILITY_ROUTES\}/, "没接上换路清单，模型只会被推回去再搜一次");
   assert.match(line, /不是能力边界|起手包/, "要点明注册表不等于能力上限");
 });
 
 test("语义调度也没命中时同样给出路", () => {
-  const at = SRC.indexOf("语义工具调度本次不可用");
+  const at = RAW_SRC.indexOf("语义工具调度本次不可用");
   assert.ok(at > 0, "找不到语义兜底文案");
   const line = SRC.slice(at, at + 700);
   assert.match(line, /_CAPABILITY_ROUTES/, "没接上换路清单");
@@ -62,7 +66,7 @@ test("模型编了个不存在的工具名时，也要给出路", () => {
   // 这一步恰恰是「它认为该有这个能力、而注册表里没有」的时刻，最需要换路指引。
   // 原来这里只说「请用 search_tools 描述当前所需能力，或按已注册工具名重试」——把它推回
   // 它刚刚证明了没有它要的东西的那张表。
-  const at = SRC.indexOf("没有通过词形、关键词或相似度猜测替代工具");
+  const at = RAW_SRC.indexOf("没有通过词形、关键词或相似度猜测替代工具");
   assert.ok(at > 0, "未知工具的兜底文案找不到了");
   const line = SRC.slice(at, at + 400);
   assert.match(line, /_CAPABILITY_ROUTES/, "只把模型推回注册表，等于告诉它这事做不了");
@@ -72,13 +76,13 @@ test("模型编了个不存在的工具名时，也要给出路", () => {
 test("抓页面/联网搜索失败要给换路，不能只说检查网络", () => {
   // agent_core 第 5 条把「web_search + web_fetch 读官方文档」定为造能力的第一步。
   // 这一步倒下时，原来唯一的指示是「检查 URL、检查网络、换个关键词试试」。
-  const fetchAt = SRC.indexOf("[ERROR] 网页抓取失败");
+  const fetchAt = RAW_SRC.indexOf("[ERROR] 网页抓取失败");
   assert.ok(fetchAt > 0);
   const fetchLine = SRC.slice(fetchAt, fetchAt + 500);
   assert.match(fetchLine, /http_request/, "反爬/要登录/要渲染时的换路没给");
   assert.match(fetchLine, /browser|curl/, "换真实浏览器或 curl 这条路没给");
 
-  const searchAt = SRC.indexOf("[ERROR] 联网搜索失败");
+  const searchAt = RAW_SRC.indexOf("[ERROR] 联网搜索失败");
   assert.ok(searchAt > 0);
   const searchLine = SRC.slice(searchAt, searchAt + 500);
   assert.match(searchLine, /web_fetch|http_request/, "已知站点直接打官网这条路没给");
@@ -88,9 +92,9 @@ test("抓页面/联网搜索失败要给换路，不能只说检查网络", () =
 test("文档解析失败不再被当成文件内容返回", () => {
   // 以前是 `catch (e) { return "[文档无法解析] …" }`：错误变成了正文，readFailed 是 false，
   // 这次读取被记为成功并进读缓存，模型拿着一句错误文案当文档往下推。
-  const at = SRC.indexOf("async function _readFileOrDoc(");
+  const at = RAW_SRC.indexOf("async function _readFileOrDoc(");
   assert.ok(at > 0);
-  const fn = SRC.slice(at, SRC.indexOf("\n}\n", at));
+  const fn = SRC.slice(at, RAW_SRC.indexOf("\n}\n", at));
   assert.doesNotMatch(fn, /catch \(e\) \{ return `\[文档无法解析\]/,
     "解析失败不能当作内容返回——那会把失败记成成功");
   assert.match(fn, /throw new Error\(/, "解析失败要真的抛出去");

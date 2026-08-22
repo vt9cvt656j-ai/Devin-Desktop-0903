@@ -15,20 +15,24 @@ import { dirname, join } from "node:path";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const ROOT = join(HERE, "..");
-const SRC = readFileSync(join(ROOT, "src", "main.js"), "utf8");
+// 正向源码断言必须跑在**剥掉注释**的源码上。注释不是代码：把一条契约从代码里删掉、
+// 只在注释里留一句，assert.match 照样绿——本仓库已经这样漏过一整组模型可见的工具契约。
+// 所以 `SRC` 绑定的是 CODE（注释整段置空，行号与偏移和原文一字不差）；
+// 真要匹配注释本身的断言显式用 RAW_SRC，并在那一行写清为什么。
+import { CODE as SRC, SRC as RAW_SRC } from "./helpers/source.mjs";
 
 function topLevelFn(name) {
-  const at = SRC.indexOf(`function ${name}(`);
+  const at = RAW_SRC.indexOf(`function ${name}(`);
   assert.ok(at > 0, `找不到 ${name}`);
-  const start = SRC.lastIndexOf("async ", at) === at - 6 ? at - 6 : at;
-  const end = SRC.indexOf("\n}\n", at);
+  const start = RAW_SRC.lastIndexOf("async ", at) === at - 6 ? at - 6 : at;
+  const end = RAW_SRC.indexOf("\n}\n", at);
   assert.ok(end > at, `${name} 没有行首收尾大括号`);
-  return SRC.slice(start, end + 2);
+  return RAW_SRC.slice(start, end + 2);
 }
 const constLine = (name) => {
-  const i = SRC.indexOf(`const ${name} =`);
+  const i = RAW_SRC.indexOf(`const ${name} =`);
   assert.ok(i > 0, `找不到常量 ${name}`);
-  return SRC.slice(i, SRC.indexOf("\n", i) + 1);
+  return SRC.slice(i, RAW_SRC.indexOf("\n", i) + 1);
 };
 
 // 真实文件系统当后端——被测的就是"能不能在真实包布局里找到东西"。
@@ -102,9 +106,9 @@ test("符号模式在三种真实写法上都拿得到定义", { skip: !hasDeps 
   //   export function   —— exifr（直接导出）
   //   declare function  —— @tauri-apps/api（声明和导出分开写，.d.ts 里最常见）
   //   裸 interface      —— monaco（命名空间里的类型）
-  const i = SRC.indexOf("const esc = wantSymbol.replace");
+  const i = RAW_SRC.indexOf("const esc = wantSymbol.replace");
   assert.ok(i > 0, "找不到符号匹配那段");
-  const buildRe = new Function("wantSymbol", SRC.slice(i, SRC.indexOf("\n      );", i) + 9) + ";return defRe;");
+  const buildRe = new Function("wantSymbol", SRC.slice(i, RAW_SRC.indexOf("\n      );", i) + 9) + ";return defRe;");
 
   const find = async (pkg, symbol) => {
     const hit = await api._resolvePackageDir(ROOT, pkg);
@@ -179,7 +183,7 @@ test("read_file 读不到 node_modules 时不再塞假事实", () => {
 // 才知道那儿写了什么——而在"别磨蹭"的压力下它多半不再读，直接按记忆往下写。
 
 test("lsp_definition 连正文一起回，引用则不带", () => {
-  const at = SRC.indexOf("const rels = uniq.map(");
+  const at = RAW_SRC.indexOf("const rels = uniq.map(");
   assert.ok(at > 0, "找不到定义结果的拼装处");
   const block = SRC.slice(at, at + 1600);
   assert.match(block, /if \(call\.op !== "references"\)/,
@@ -224,7 +228,7 @@ test("已有的公共代码搜索要说清它是干什么的", () => {
    * 它治的是 package_source 治不了的那一层：**签名对了，但用法不对**——参数顺序、
    * 必需的初始化步骤、真实的调用惯例。文档常常不写，一千个仓库的实际用法里全都有。
    */
-  const at = SRC.indexOf('name: "developer_community_search"');
+  const at = RAW_SRC.indexOf('name: "developer_community_search"');
   assert.ok(at > 0, "找不到这个工具");
   const block = SRC.slice(at, at + 5000);
   assert.match(block, /`sourcegraph` is public CODE search across many repositories/,
@@ -233,8 +237,8 @@ test("已有的公共代码搜索要说清它是干什么的", () => {
     "工具直觉里没有引导到它");
   // 这句活在一条**双引号**字符串里，内部再出现裸的 " 会把它提前截断（踩过一次，
   // 整个 main.js 语法都断了）。
-  const hintAt = SRC.indexOf("签名对了但不确定怎么用");
-  const hintLine = SRC.slice(SRC.lastIndexOf("\n", hintAt) + 1, SRC.indexOf("\n", hintAt));
+  const hintAt = RAW_SRC.indexOf("签名对了但不确定怎么用");
+  const hintLine = SRC.slice(RAW_SRC.lastIndexOf("\n", hintAt) + 1, RAW_SRC.indexOf("\n", hintAt));
   assert.doesNotMatch(hintLine, /sources=\["/, "又在双引号字符串里用了双引号");
 });
 
@@ -273,13 +277,13 @@ test("垫片只补真类型没覆盖到的名字", () => {
   assert.match(makeShim("x", { named: new Set(), hasDefault: true }, new Set()), /export default _default;/);
 
   function extractShim() {
-    const at = SRC.indexOf("function _makeInstalledPackageShim(");
-    return SRC.slice(at, SRC.indexOf("\n}\n", at) + 2);
+    const at = RAW_SRC.indexOf("function _makeInstalledPackageShim(");
+    return SRC.slice(at, RAW_SRC.indexOf("\n}\n", at) + 2);
   }
 });
 
 test("注入点：全覆盖时不加那份 ambient 声明", () => {
-  const at = SRC.indexOf("const shim = _makeInstalledPackageShim(specifier, details");
+  const at = RAW_SRC.indexOf("const shim = _makeInstalledPackageShim(specifier, details");
   assert.ok(at > 0, "找不到垫片注入处");
   const block = SRC.slice(at, at + 500);
   assert.match(block, /realType\?\.exports \|\| null/, "没有把真类型的导出集传进去");
@@ -311,8 +315,8 @@ test("类型入口要跟随 re-export，否则导出集永远是空的", async (
   assert.ok(entry.exports.includes("createServer"), `具名再导出没跟上：${entry.exports}`);
 
   function fnSrc(name) {
-    const at = SRC.indexOf(`function ${name}(`);
-    const start = SRC.lastIndexOf("async ", at) === at - 6 ? at - 6 : at;
-    return SRC.slice(start, SRC.indexOf("\n}\n", at) + 2);
+    const at = RAW_SRC.indexOf(`function ${name}(`);
+    const start = RAW_SRC.lastIndexOf("async ", at) === at - 6 ? at - 6 : at;
+    return RAW_SRC.slice(start, RAW_SRC.indexOf("\n}\n", at) + 2);
   }
 });
