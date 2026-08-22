@@ -41678,6 +41678,259 @@ function _duplicateSymbolNote(run, fp, oldText, newText) {
   } catch { return ""; }
 }
 
+// ── 依赖坑前置：manifest 落盘那一刻点名「这个依赖这个版本还没核对过资料」 ────────
+//
+// 触发是执行事实，不是猜测：写工具这次真的往 manifest（package.json / Cargo.toml /
+// requirements*.txt / pyproject.toml / go.mod）落了盘，且 checkpoint 基线相减的**新增行**
+// 里解析得出依赖条目（与 _stubDeliveryFindings/_duplicateSymbolNote 同一套新增行手法）。
+// 训练语料常落后于装进项目的版本，模型凭记忆写 API 是「写完才发现坑」的机器成因；
+// 而写 manifest 的那一刻，正是「写用法代码之前」唯一确定存在的时机。
+//
+// 给的是机制不是劝诫：
+//   · 连着 context7（run.mcpToolCache 里有 mcp__context7__query-docs）→ 把一条**参数已
+//     预填**的查询挂成候选（run._depDocsCandidate，_verifyCandidate 的同款先例），模型
+//     空参数调用那个工具即点头执行；
+//   · 没有 context7 → 退为指路事实：registry 页面 URL 按 manifest 类型确定性拼出
+//     （npm/crates.io/pypi/pkg.go.dev），模型可用 web_fetch 自行核对。
+// 两条路的发起方都永远是模型——IDE 不代跑、不后台抓取（与 verifyNow 同一条红线）。
+// 有界：每轮最多 2 条（run._depHintBudget，主循环每轮重置）；同一 (生态,名字,主版本)
+// 跨 run 只提示一次（localStorage LRU，上限 64 条）。
+function _manifestDepKind(path) {
+  const base = String(path || "").split(/[\\/]/).pop() || "";
+  if (/^package\.json$/i.test(base)) return "npm";
+  if (/^cargo\.toml$/i.test(base)) return "crates";
+  if (/^requirements[\w.-]*\.txt$/i.test(base)) return "pypi";
+  if (/^pyproject\.toml$/i.test(base)) return "pypi";
+  if (/^go\.mod$/i.test(base)) return "go";
+  return "";
+}
+
+// 确定性映射，不是猜测：manifest 类型 → 该生态的官方 registry 页面。
+function _depRegistryUrl(kind, name) {
+  if (kind === "npm") return `https://www.npmjs.com/package/${name}`;
+  if (kind === "crates") return `https://crates.io/crates/${name}`;
+  if (kind === "pypi") return `https://pypi.org/project/${name}/`;
+  if (kind === "go") return `https://pkg.go.dev/${name}`;
+  return "";
+}
+
+// checkpoint 基线相减、只看新增行，从中解析 (名字, 版本)。行文本级判据：版本换行
+// （^17→^18）也算「这个版本的条目是新的」——大版本跳变恰恰是坑最密的时刻，缓存按
+// (名字,主版本) 去重，同主版本不会重复提示。本地 path/git 依赖不在 registry 上，跳过。
+function _manifestDepAdditions(path, oldText, newText, maxItems = 6) {
+  const kind = _manifestDepKind(path);
+  if (!kind) return [];
+  // 行归一化剥掉尾逗号：往 JSON/TOML 数组已有条目后面追加时，前一行只多出一个 `,`——
+  // 那不是新依赖，是标点。不剥的话每次追加都会把邻居误报成新增，白烧每轮预算。
+  const _normLine = (l) => String(l).trim().replace(/,\s*$/, "");
+  const before = new Set(String(oldText || "").split("\n").map(_normLine));
+  const lines = String(newText || "").split("\n");
+  const out = [];
+  const seenNames = new Set();
+  const push = (name, version) => {
+    name = String(name || "").trim();
+    const ver = String(version || "").trim();
+    const lower = name.toLowerCase();
+    if (!name || seenNames.has(lower) || out.length >= maxItems) return;
+    seenNames.add(lower);
+    const digits = /(\d+)/.exec(ver);
+    out.push({ kind, name, version: ver, major: digits ? digits[1] : "?", registry: _depRegistryUrl(kind, name) });
+  };
+  if (kind === "npm") {
+    let inDeps = false;
+    for (const raw of lines) {
+      const t = raw.trim();
+      if (!inDeps) {
+        if (/^"(?:dependencies|devDependencies|peerDependencies|optionalDependencies)"\s*:\s*\{/.test(t)) inDeps = true;
+        continue;
+      }
+      if (t.startsWith("}")) { inDeps = false; continue; }
+      const m = /^"((?:@[\w.-]+\/)?[\w.-]+)"\s*:\s*"([^"]*)"/.exec(t);
+      if (m && !before.has(_normLine(t))) push(m[1], m[2]);
+    }
+  } else if (kind === "crates") {
+    let inDepTable = false; // [dependencies] 一族：一行一个依赖
+    let entryName = "";     // [dependencies.foo] 一族：整节描述一个依赖
+    let entryNew = false;
+    let entryVersion = "";
+    const flushEntry = () => {
+      if (entryName && entryNew) push(entryName, entryVersion);
+      entryName = ""; entryNew = false; entryVersion = "";
+    };
+    for (const raw of lines) {
+      const t = raw.trim();
+      const isNew = !!t && !before.has(_normLine(t));
+      const header = /^\[([^\]]+)\]/.exec(t);
+      if (header) {
+        flushEntry();
+        const sec = header[1].trim();
+        const dm = /^(?:workspace\.|target\.[^\]]*?\.)?(?:dev-|build-)?dependencies(?:\.(.+))?$/.exec(sec);
+        inDepTable = !!dm && !dm[1];
+        if (dm && dm[1]) { entryName = dm[1].replace(/^["']|["']$/g, ""); entryNew = isNew; }
+        continue;
+      }
+      if (entryName) {
+        const vm = /^version\s*=\s*["']([^"']+)["']/.exec(t);
+        if (vm) { entryVersion = vm[1]; if (isNew) entryNew = true; }
+        if (/^(?:path|git)\s*=/.test(t)) entryName = ""; // 本地/git 依赖不在 crates.io 上
+        continue;
+      }
+      if (!inDepTable || !isNew || t.startsWith("#")) continue;
+      const m = /^([A-Za-z0-9_-]+)\s*=\s*(.+)$/.exec(t);
+      if (!m) continue;
+      const rhs = m[2];
+      if (/(?:^|[{,\s])(?:path|git)\s*=/.test(rhs)) continue;
+      const vm = /^["']([^"']*)["']/.exec(rhs) || /version\s*=\s*["']([^"']*)["']/.exec(rhs);
+      push(m[1], vm ? vm[1] : "");
+    }
+    flushEntry();
+  } else if (kind === "pypi") {
+    const isPyproject = /^pyproject\.toml$/i.test(String(path || "").split(/[\\/]/).pop() || "");
+    // PEP 508 形状的一条 spec（extras 允许，环境标记/注释允许跟在后面）。
+    const spec = (text) => {
+      const m = /^([A-Za-z0-9][\w.-]*)(?:\[[^\]]*\])?\s*(?:(?:===|==|>=|<=|~=|!=|>|<)\s*([^\s;,#'"]+))?/.exec(String(text || "").trim());
+      if (!m) return null;
+      const rest = String(text || "").trim().slice(m[0].length);
+      if (rest && !/^[\s;,#]/.test(rest)) return null;
+      return { name: m[1], version: m[2] || "" };
+    };
+    if (!isPyproject) {
+      for (const raw of lines) {
+        const t = raw.trim();
+        if (!t || /^[#-]/.test(t) || /:\/\//.test(t) || before.has(_normLine(t))) continue;
+        const s = spec(t);
+        if (s) push(s.name, s.version);
+      }
+    } else {
+      let section = "";
+      let inArray = false;
+      for (const raw of lines) {
+        const t = raw.trim();
+        const isNew = !!t && !before.has(_normLine(t));
+        const header = /^\[([^\]]+)\]/.exec(t);
+        if (header) { section = header[1].trim(); inArray = false; continue; }
+        if (/^tool\.poetry\.(?:dev-)?dependencies$|^tool\.poetry\.group\.[\w.-]+\.dependencies$/.test(section)) {
+          if (!isNew) continue;
+          const m = /^([A-Za-z0-9][\w.-]*)\s*=\s*(.+)$/.exec(t);
+          if (!m || m[1].toLowerCase() === "python") continue;
+          const rhs = m[2];
+          if (/(?:^|[{,\s])(?:path|git|url)\s*=/.test(rhs)) continue;
+          const vm = /^["']([^"']*)["']/.exec(rhs) || /version\s*=\s*["']([^"']*)["']/.exec(rhs);
+          push(m[1], vm ? vm[1] : "");
+          continue;
+        }
+        if (inArray) {
+          if (isNew) {
+            const q = /^["']([^"']+)["']/.exec(t);
+            const s = q && spec(q[1]);
+            if (s) push(s.name, s.version);
+          }
+          if (t.includes("]")) inArray = false;
+          continue;
+        }
+        // 依赖数组只认这两处：[project] 的 dependencies=[…] 和 [project.optional-dependencies]
+        // 的任意 key=[…]。别处的字符串数组（keywords/classifiers）不是依赖清单。
+        const opensDeps = (section === "project" && /^dependencies\s*=\s*\[/.test(t))
+          || (section === "project.optional-dependencies" && /^[\w.-]+\s*=\s*\[/.test(t));
+        if (opensDeps) {
+          if (t.includes("]")) { // 单行数组：整行为新才解析
+            if (isNew) for (const q of t.matchAll(/["']([^"']+)["']/g)) { const s = spec(q[1]); if (s) push(s.name, s.version); }
+          } else inArray = true;
+        }
+      }
+    }
+  } else if (kind === "go") {
+    let inReq = false;
+    for (const raw of lines) {
+      const t = raw.trim();
+      const isNew = !!t && !before.has(_normLine(t));
+      if (/^require\s*\($/.test(t)) { inReq = true; continue; }
+      if (inReq && t.startsWith(")")) { inReq = false; continue; }
+      if (/\/\/\s*indirect\b/.test(t)) continue; // go mod tidy 带进来的间接依赖不是模型的选择
+      let m = /^require\s+(\S+)\s+(v\S+)/.exec(t);
+      if (!m && inReq) m = /^([^\s()]+)\s+(v\S+)/.exec(t);
+      if (m && isNew) push(m[1], m[2]);
+    }
+  }
+  return out;
+}
+
+// 跨 run 去重：同一 (生态,名字,主版本) 只提示一次。LRU 有界（64 条），键持久在
+// localStorage——「见过」是执行事实，随版本主号翻新自动失效（键里含主版本）。
+// 返回「之前是否已见过」，同时把这条刷成最新（touch）。
+const _DEP_SEEN_LS_KEY = "michael-ide.dep-pitfalls-seen";
+const _DEP_SEEN_MAX = 64;
+function _depSeenTouch(key) {
+  let list = [];
+  try {
+    const parsed = JSON.parse(localStorage.getItem(_DEP_SEEN_LS_KEY) || "[]");
+    if (Array.isArray(parsed)) list = parsed.filter((s) => typeof s === "string");
+  } catch {}
+  const had = list.includes(key);
+  const next = list.filter((k) => k !== key);
+  next.push(key);
+  while (next.length > _DEP_SEEN_MAX) next.shift();
+  try { localStorage.setItem(_DEP_SEEN_LS_KEY, JSON.stringify(next)); } catch {}
+  return had;
+}
+
+// 写工具返回值通道（_lostNote/_duplicateSymbolNote 的同款）：manifest 这次落盘新增了
+// 依赖条目时，把「该依赖该版本未经资料核对」+ 核对入口作为事实拼进写结果。
+// 基线优先取 checkpoint（run 起点快照），没有 checkpoint 才退回本次写前内容。
+function _depPitfallNote(run, fp, oldText, newText) {
+  try {
+    if (!run || typeof run !== "object") return "";
+    const snap = run.checkpoint && typeof run.checkpoint.get === "function" ? run.checkpoint.get(fp) : null;
+    const baseline = snap ? (snap.existed ? String(snap.content || "") : "") : String(oldText || "");
+    const adds = _manifestDepAdditions(fp, baseline, newText);
+    if (!adds.length) return "";
+    if (!Number.isFinite(run._depHintBudget)) run._depHintBudget = 2;
+    const fresh = [];
+    for (const d of adds) {
+      if (run._depHintBudget <= 0) break;
+      if (_depSeenTouch(`${d.kind}:${d.name.toLowerCase()}@${d.major}`)) continue;
+      run._depHintBudget--;
+      fresh.push(d);
+    }
+    if (!fresh.length) return "";
+    const label = fresh.map((d) => `${d.name}@${d.version || "?"}（${d.kind}）`).join("、");
+    // 预填目标是 resolve-library-id 而不是 query-docs：后者的必填参数 libraryId 必须先由
+    // 前者换取（读过 @upstash/context7-mcp 包内的 zod schema 实证），预填 query-docs 一点头
+    // 就是一次缺参失败。点头 = 第一步换 ID，note 里写清第二步自己用 query-docs 查细节。
+    const c7 = (Array.isArray(run.mcpToolCache) ? run.mcpToolCache : [])
+      .map((t2) => String(t2?.function?.name || ""))
+      .find((n) => /^mcp__context7__resolve[-_]library[-_]id$/.test(n));
+    if (c7) {
+      // 预填候选（机制，不是劝诫）：查询参数由代码算好，挂在 run 上等模型点头——
+      // 空参数调用该工具即执行这一条（_depDocsCandidateFill 代填，_verifyCandidateFill
+      // 的同款先例）。IDE 绝不自己发起这次查询。
+      run._depDocsCandidate = {
+        mcpName: c7,
+        args: { libraryName: fresh[0].name },
+      };
+      return `\n📦 新依赖 ${label}：训练语料可能落后于这个版本，尚未核对资料。已把 ${c7} 预填为候选（libraryName=${fresh[0].name}）——空参数调用它即先换取 libraryId，拿到后用 mcp__context7__query-docs 查「${fresh.map((d) => d.name + (d.version ? "@" + d.version : "")).join(" ")} 快速上手与已知坑/破坏性变更」。`;
+    }
+    return `\n📦 新依赖 ${label}：训练语料可能落后于这个版本，尚未核对资料。写用法前可用 web_fetch 核对官方文档/README：`
+      + fresh.map((d) => `\n  - ${d.name}: ${d.registry}`).join("");
+  } catch { return ""; }
+}
+
+// 依赖资料查询候选的代填器：模型对 _depPitfallNote 预填的 context7 查询点头（对那个
+// 工具发一个空参数调用）时，把算好的查询参数填进去；候选一次性消费。模型自带参数则
+// 一个字不动、候选保留——它在查自己的问题，不是在点头。发起方永远是模型，IDE 不代跑。
+function _depDocsCandidateFill(run, call) {
+  if (!run || !call || call.type !== "mcp") return null;
+  const cand = run._depDocsCandidate;
+  if (!cand || String(call.mcpName || "") !== String(cand.mcpName || "")) return null;
+  const args = call.args && typeof call.args === "object" ? call.args : {};
+  for (const v of Object.values(args)) {
+    if (v != null && String(v).trim() !== "") return null;
+  }
+  run._depDocsCandidate = null;
+  call.args = { ...cand.args };
+  return call.args;
+}
+
 // ---- Workspace BM25 semantic search ------------------------------------
 // Lightweight in-memory inverted-index over the workspace. For each indexed
 // file chunk (~80 lines), we track which lowercase terms appear in it.
@@ -51023,6 +51276,7 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
       }
       _nudgeTurnFloor = messages.length; // 本轮尾部区间起点：只有这之后推的提醒才允许被 splice
       _sweepNudges(); // 注销离上下文尾部太远的陈旧 harness 提醒（真实用户消息不受影响）
+      run._depHintBudget = 2; // 依赖坑前置的每轮上限（_depPitfallNote 消费；有界，verifyNudges 同族）
       // === P2.1 结果自动交付：后台子智能体作业落定后，下一轮迭代开头把报告注入模型 ===
       // 通知和证据分开承载：
       //   · 完整报告（保留换行 → _clipPreservingErrors 的错误行豁免才成立）走 _pushRunFact，
@@ -58028,7 +58282,9 @@ async function _executeToolStepInner(step, call, root, run) {
       // 从中文文案里猜，于是干脆只管 edit/multi_edit，把破坏性最大的那种放过去了。
       // 重复实现查重：新增顶层符号命中项目里别的文件的同名定义时，事实随写入结果一起回。
       const _dupNote = _duplicateSymbolNote(run, fp, existed ? old : "", newContent);
-      return { type: call.type, path: fp, mutated: true, overwroteExisting: !!existed, linesLost: _lostLines, content: (existed ? `已修改 ${call.path}（+${added}/-${removed} 行${resolvedNote}）。` : `已新建 ${call.path}（${added} 行${resolvedNote}）。`) + _lostNote + (_editNote || "") + (_redactNote || "") + _dupNote };
+      // 依赖坑前置：manifest 新增依赖条目时，「该依赖该版本未经资料核对」随写结果一起回。
+      const _depNote = _depPitfallNote(run, fp, existed ? old : "", newContent);
+      return { type: call.type, path: fp, mutated: true, overwroteExisting: !!existed, linesLost: _lostLines, content: (existed ? `已修改 ${call.path}（+${added}/-${removed} 行${resolvedNote}）。` : `已新建 ${call.path}（${added} 行${resolvedNote}）。`) + _lostNote + (_editNote || "") + (_redactNote || "") + _dupNote + _depNote };
 
     } else if (call.type === "multiedit") {
       const fp = _boundRunFilePath(run, root, call.path) || await _resolveExisting(call.path, root);
@@ -58209,7 +58465,7 @@ async function _executeToolStepInner(step, call, root, run) {
           } catch (err) { showToast("Undo failed: " + (err?.message || err)); }
         });
       }
-      return { type: "multiedit", path: fp, mutated: true, content: `已对 ${call.path} 应用 ${edits.length} 处替换（+${added}/-${removed} 行）。` + (_mEditNote || "") + _duplicateSymbolNote(run, fp, old, newContent) };
+      return { type: "multiedit", path: fp, mutated: true, content: `已对 ${call.path} 应用 ${edits.length} 处替换（+${added}/-${removed} 行）。` + (_mEditNote || "") + _duplicateSymbolNote(run, fp, old, newContent) + _depPitfallNote(run, fp, old, newContent) };
 
     } else if (call.type === "search") {
       const q = (call.query || "").trim();
@@ -63195,6 +63451,10 @@ async function _executeToolStep(step, call, root, run) {
   // 浏览器验证候选的「点头」入口：同款先例、同款位置——必须在唯一授权检查点之前，
   // 确认框里给用户看的得是真实 URL 的导航，不是一次空截图请求。
   if (typeof _browserVerifyCandidateFill === "function") _browserVerifyCandidateFill(run, call);
+  // 依赖资料查询候选的「点头」入口（同上同款）：manifest 落盘新增依赖时 _depPitfallNote
+  // 已把 context7 查询参数预填在 run 上；模型对那个工具发空参数调用即点头，这里代填。
+  // 同样必须在授权检查之前——确认框里给用户看的得是真实查询参数。IDE 从不自己发起。
+  if (typeof _depDocsCandidateFill === "function") _depDocsCandidateFill(run, call);
   // ── 唯一权限检查点 ──────────────────────────────────────────────────────
   // 每个工具调用都必经此处（主循环批量调度、内联渲染、子智能体都走这个函数），
   // 所以授权判定只需要插在这一个地方。放在失败记忆之前：被拒绝是用户的决定，
