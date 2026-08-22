@@ -8738,6 +8738,10 @@ test("_disposeChatSession cancels streams and releases closed tab resources", ()
   assert.equal(session._htmlSnapshot, "");
 });
 
+// 领域白名单归一：真实现 + 真白名单，都从 main.js 取。测试里复述那 22 个目录名
+// 只会制造第二张会漂的表。
+const KNOWLEDGE_DOMAIN = load("_aiIntentKnowledgeDomain", { _AI_KNOWLEDGE_DOMAINS: loadConst("_AI_KNOWLEDGE_DOMAINS") });
+
 function aiIntentNormalizeDeps(dims, intentText, intentList) {
   return {
     _AI_INTENT_DIMENSIONS: dims,
@@ -8757,6 +8761,9 @@ function aiIntentNormalizeDeps(dims, intentText, intentList) {
     _RUNTIME_OBLIGATION_ORDER: ["build", "run", "test", "install", "package"],
     _EXTERNAL_OBLIGATION_ORDER: ["commit", "push", "sync", "pr", "deploy", "upload", "download", "database", "automation", "external"],
     _aiIntentEnum: load("_aiIntentEnum"),
+    // 领域字段的白名单归一器。目录名里有连字符，_aiIntentEnum 不认下划线写法，
+    // 所以它是独立的一支；从源码抓真实现，不在测试里另抄一份白名单。
+    _aiIntentKnowledgeDomain: KNOWLEDGE_DOMAIN,
     _aiIntentText: intentText,
     _aiIntentList: intentList,
   };
@@ -8800,7 +8807,7 @@ test("AI intent judgment is session-aware, semantic, and never falls back to key
   const dims = ["database", "databaseOps", "dataModel", "persistence", "needsReferences",
     "businessLogic", "businessRisk", "securityRisk", "architectureQuality",
     "containerOps", "featureCompleteness", "websiteDelivery", "ui", "bug", "implementation"];
-  const merge = load("_mergeAiIntentProfile", { _AI_INTENT_DIMENSIONS: dims });
+  const merge = load("_mergeAiIntentProfile", { _AI_INTENT_DIMENSIONS: dims, _aiIntentKnowledgeDomain: KNOWLEDGE_DOMAIN });
   const base = {
     applies: true, database: true, databaseOps: true, dataModel: false, persistence: false,
     databaseArchitecture: true, databaseQuery: false, architecture: false, architectureQuality: false,
@@ -9144,7 +9151,7 @@ test("semantic orchestration chooses the minimum role topology and lazy collabor
   assert.deepEqual(verdict.engineering.roleNeeds, ["architect", "security", "backend"]);
   assert.deepEqual(verdict.engineering.coordinationRisks, ["鉴权契约尚未稳定", "共享类型由单一角色所有"]);
 
-  const merge = load("_mergeAiIntentProfile", { _AI_INTENT_DIMENSIONS: dims });
+  const merge = load("_mergeAiIntentProfile", { _AI_INTENT_DIMENSIONS: dims, _aiIntentKnowledgeDomain: KNOWLEDGE_DOMAIN });
   const profile = merge({ referenceWebsiteUrls: [] }, verdict, "升级认证与权限系统");
   assert.equal(profile.orchestrationMode, "staged_roles");
   assert.deepEqual(profile.roleNeeds, ["architect", "security", "backend"]);
@@ -9323,7 +9330,7 @@ test("a novice's vague sentence flows through the real chain into professional d
   assert.equal(verdict.databaseOps, true);
   assert.equal(verdict.semantic.goal, "交付可用的记账产品");
 
-  const merge = load("_mergeAiIntentProfile", { _AI_INTENT_DIMENSIONS: dims });
+  const merge = load("_mergeAiIntentProfile", { _AI_INTENT_DIMENSIONS: dims, _aiIntentKnowledgeDomain: KNOWLEDGE_DOMAIN });
   const merged = merge({}, verdict, "我想搞个能记账的小东西");
   assert.equal(merged.intentSource, "ai");
   assert.equal(merged.database, true);
@@ -9482,7 +9489,7 @@ test("automation-era laws: install cleanup desktop gates fire only on AI intent"
 
 test("semantic profile merging derives engineering gates from structured fields", () => {
   const dims = ["database", "databaseOps", "persistence", "ui", "implementation", "projectScope"];
-  const merge = load("_mergeAiIntentProfile", { _AI_INTENT_DIMENSIONS: dims });
+  const merge = load("_mergeAiIntentProfile", { _AI_INTENT_DIMENSIONS: dims, _aiIntentKnowledgeDomain: KNOWLEDGE_DOMAIN });
   const profile = merge({}, {
     semantic: {
       goal: "交付订单后台",
@@ -10547,7 +10554,7 @@ test("michael-design runs in the background and is injected only at loop boundar
 });
 
 test("every structured UI branch performs real michael-design preflight calls", async () => {
-  const mergeProfile = load("_mergeAiIntentProfile", { _AI_INTENT_DIMENSIONS: [] });
+  const mergeProfile = load("_mergeAiIntentProfile", { _AI_INTENT_DIMENSIONS: [], _aiIntentKnowledgeDomain: KNOWLEDGE_DOMAIN });
   const searches = [];
   const preflight = load("_runMichaelDesignPreflight", {
     _michaelDesignResearchPlan: () => [
@@ -10601,7 +10608,7 @@ test("every structured UI branch performs real michael-design preflight calls", 
 });
 
 test("explicit UI review activates Michael Design without granting implementation tools", () => {
-  const merge = load("_mergeAiIntentProfile", { _AI_INTENT_DIMENSIONS: [] });
+  const merge = load("_mergeAiIntentProfile", { _AI_INTENT_DIMENSIONS: [], _aiIntentKnowledgeDomain: KNOWLEDGE_DOMAIN });
   const profile = merge({ _isAgentMode: true }, {
     ui: true,
     semantic: { action: "review" },
@@ -10795,8 +10802,13 @@ test("reference-site UI tasks keep learning and fetch schemas lazy", () => {
   // "**不按任务文本**猜着塞工具"，那个保证没变：learn_design / browser / screenshot
   // 这类要等真实证据指出需要才装。
   // 顺序跟着目录走（select 是按 all 过滤的），不是按核心表的书写顺序。
-  assert.deepEqual(names, ["web_fetch", "read_file", "search_tools"]);
-  for (const deferred of ["learn_design", "knowledge_search", "browser", "screenshot"]) {
+  // 2026-08-22：knowledge_search 也进了固定核心。理由和取外部资源那五个**逐字相同**，
+  // 只是方向相反：查外部的六个全在窗口里、查自家 22 域 4.3MB 语料的那一个不在，于是
+  // 两条路结果差不多时模型永远走零成本的外部那条——弱模型尤其不肯付「先花一轮
+  // search_tools 取 schema」的绕路成本。这不是放宽「窗口保持最小」的纪律：那条纪律的
+  // 原话就是「模型走便宜的那条」，所以自家语料的检索成本必须和外部对等。
+  assert.deepEqual(names, ["web_fetch", "knowledge_search", "read_file", "search_tools"]);
+  for (const deferred of ["learn_design", "browser", "screenshot"]) {
     assert.ok(!names.includes(deferred), `${deferred} must not expand the first-turn schema payload`);
   }
 });
@@ -10962,7 +10974,10 @@ test("task profiles do not expand the minimal first-turn tool schema payload", (
       got,
       // github_repo 跟着 github_search 成对进核心（搜索只给标题，标题不算取证证据）。
       // 这个桩的可用清单里没有 github_search，所以这里只多出 github_repo 一个。
-      ["read_file", "package_search", "github_repo", "developer_community_search", "web_search", "web_fetch", "search_tools"],
+      // knowledge_search 同理进核心（2026-08-22）：查外部的都在窗口里、查自家语料的不在，
+      // 就等于结构性地只把模型往外部推。这条测的仍然是「画像/文本不许把窗口撑大」——
+      // 同一批工具，不随 request 文本变化，那个不变量一个字没动。
+      ["read_file", "package_search", "github_repo", "developer_community_search", "web_search", "web_fetch", "knowledge_search", "search_tools"],
       `profile must not eagerly expand schemas for: ${request}`,
     );
   }
@@ -11839,11 +11854,14 @@ test("external source tools stay real but load on demand", () => {
   // 理由是结构性的：窗口里的工具零成本可调，不在窗口里的要先花一轮 search_tools 取
   // schema——两条路结果差不多时模型当然走便宜的那条，于是"能查 GitHub / 社区"这件事
   // 在真正需要它的难任务上永远轮不到。
+  // 2026-08-22 再扩一个：knowledge_search。它和上面五个是**同一条论证的两端**——
+  // 查外部的全在窗口里，查自家 22 域 4.3MB 语料的那一个不在，于是"两条路结果差不多时
+  // 走便宜的那条"这句话本身变成了一道单向阀门：只把模型往外部推。而这两条路的成本与
+  // 质量恰好相反（自家语料一次调用就到、已蒸馏过；公网要先搜再抓再自己判真假）。
   assert.deepEqual(names, [
-    "read_file", "web_search", "web_fetch", "developer_community_search", "github_search", "search_tools",
+    "read_file", "knowledge_search", "web_search", "web_fetch", "developer_community_search", "github_search", "search_tools",
   ]);
-  // 但**没被点名**的外部源工具照旧懒加载——扩的是有明确用途的那五个，不是把目录敞开。
-  assert.ok(!names.includes("knowledge_search"), "knowledge schemas also load through the meta-tool");
+  // 但**没被点名**的外部源工具照旧懒加载——扩的是有明确用途的那几个，不是把目录敞开。
   assert.ok(!names.includes("local_discovery"), "没点名的外部源工具仍然按需加载");
   // 这三条是旧设计的原话（"公开搜索要先有具体证据缺口""社区搜索不是第一轮反射"）。
   // 用户 2026-08-18 明确改了这个取舍：宁可开局就够得着，也不要它在难任务上因为"要多花
@@ -11852,7 +11870,7 @@ test("external source tools stay real but load on demand", () => {
     "lazy loading must derive from the live registry instead of a second static tool table");
 });
 
-test("Agent 开局窗口 21 个：取外部资源那一族、硬拒点名的、自己造能力的那两个、以及 think，都要在里面", () => {
+test("Agent 开局窗口 22 个：取外部资源那一族、自家语料、硬拒点名的、自己造能力的那两个、以及 think，都要在里面", () => {
   // 用户 2026-08-18 点名："把初始化编排工具从 11 提升到 16，把那些加进来"（那五个取外部
   // 资源的）。后来又按同一条理由加了 run_in_terminal + read_logs：harness 自己有三处**硬拒**
   // 并点名要 run_in_terminal（timeout 包住的 dev server、前台长命令、需要真 TTY 的交互程序），
@@ -11864,7 +11882,17 @@ test("Agent 开局窗口 21 个：取外部资源那一族、硬拒点名的、�
   const core = /agent: \["read_file"[\s\S]*?\],/.exec(SRC);
   assert.ok(core, "agent 核心表被改名或挪走了，这条断言失去落点");
   const names = [...core[0].matchAll(/"([a-z_]+)"/g)].map((m) => m[1]);
-  assert.equal(names.length + 1, 22, `开局窗口是 ${names.length + 1} 个（含 search_tools），不是 22`);
+  assert.equal(names.length + 1, 23, `开局窗口是 ${names.length + 1} 个（含 search_tools），不是 23`);
+  // 2026-08-22 +1：knowledge_search。判据是**对等**，不是"多多益善"——查外部的六个
+  // （web_search / web_fetch / github_search / github_repo / developer_community_search /
+  // package_search）全在窗口里，查自家语料的那一个不在，于是上面那条"模型走便宜的那条"
+  // 的机制论证就只朝一个方向生效：把模型推向公网。而自家语料是 22 个域、4.3MB 已蒸馏的
+  // 专业事实（外加已发布包的真实导出签名和 MDN/React/Vue/Svelte/TS/Node/Rust 官方文档），
+  // 一次调用就到；公网要先搜、再抓、再自己判真假。成本更低质量更高的那条被放在更贵的
+  // 位置上，是这局不公平，不是模型选错了。
+  // 怎么证伪：如果扩窗后自家语料的调用率没上去，说明瓶颈不在窗口，把它撤回去。
+  assert.ok(names.includes("knowledge_search"),
+    "knowledge_search 不在开局窗口——查外部零成本、查自家要多花一轮，模型就永远只查外部");
   for (const t of ["run_in_terminal", "read_logs"]) {
     assert.ok(names.includes(t), `${t} 不在开局窗口——harness 硬拒时点名要它，模型却够不着`);
   }
@@ -11952,8 +11980,10 @@ test("Agent initial tools keep the role nucleus independent of intent profile", 
     intentSource: "ai", intentSemantic: { action: "answer" }, deliverySurface: "answer",
     workspaceAction: "none", needsReferences: false, runtimeObligations: [], externalObligations: [],
   });
+  // knowledge_search 在这份目录桩里，所以它跟着核心表一起出现（2026-08-22 扩窗）。
+  // 这条测的是「画像不许**增删**核心能力」，那个不变量没变：下面三份画像的输出必须逐字相同。
   assert.deepEqual(greeting, [
-    "read_file", "list_dir", "search", "find_files", "update_plan", "ask_user",
+    "read_file", "list_dir", "search", "find_files", "update_plan", "ask_user", "knowledge_search",
     "edit_file", "multi_edit", "write_file", "run_cmd", "read_logs", "run_in_terminal", "search_tools",
   ], "profile must not remove registered Agent capabilities from the initial schema");
 
@@ -11997,9 +12027,12 @@ test("answer-only project assessments stay local and do not start design researc
   };
 
   assert.equal(AGENT_ANSWER_ONLY_INSPECTION(assessment), true);
+  // knowledge_search 进核心后（2026-08-22）它随目录桩一起出现。这条守的是"评价型只读任务
+  // 不去做设计检索"，而那件事由下面的 designRunnerCalls 断言看着——工具窗口里有一个
+  // 只读的检索工具，不等于这一轮会去调它。
   assert.deepEqual(select(true, "current project assessment", [], "agent", assessment)
     .map((tool) => tool.function.name), [
-      "read_file", "list_dir", "search", "find_files",
+      "read_file", "list_dir", "search", "find_files", "knowledge_search",
       "run_cmd", "write_file", "edit_file", "multi_edit", "search_tools",
     ]);
   for (const name of ["browser", "search_tools", "knowledge_search", "run_cmd", "write_file", "edit_file", "multi_edit", "semantic_search", "get_diagnostics", "git_status"]) {
@@ -12060,8 +12093,10 @@ test("explicit bug fixes retain read, write, and verification capabilities", () 
     workspaceAction: "modify", explicitWorkspaceMutation: true, bug: true,
     runtimeObligations: ["test"], externalObligations: [],
   }).map((tool) => tool.function.name);
+  // knowledge_search 在这份目录桩里，随核心表一起出现（2026-08-22 扩窗）。这条守的是
+  // "按需装载的那些（LSP/诊断/Git）不会因为一句 bug 描述就被塞进来"，那个保证没动。
   assert.deepEqual(names, [
-    "read_file", "list_dir", "search", "find_files", "update_plan", "ask_user",
+    "read_file", "list_dir", "search", "find_files", "update_plan", "ask_user", "knowledge_search",
     "edit_file", "multi_edit", "write_file", "run_cmd", "search_tools",
   ]);
   for (const deferred of [
@@ -12118,7 +12153,9 @@ test("large MCP catalogs stay out of the first turn but remain exactly loadable"
   });
   const initial = select(true, "inspect this project", mcp, "agent");
   const initialNames = initial.map((tool) => tool.function.name);
-  assert.deepEqual(initialNames, ["read_file", "search", "search_tools"]);
+  // knowledge_search 在这份静态桩里，随核心表一起出现（2026-08-22 扩窗）。这条守的是
+  // "36 个工具的 MCP 服务不许挤进首轮"，那个保证与扩窗无关，仍然逐字成立。
+  assert.deepEqual(initialNames, ["read_file", "search", "knowledge_search", "search_tools"]);
   assert.equal(initialNames.some((name) => name.startsWith("mcp__")), false);
 
   const exactQuery = load("_searchToolsExactQuery");
@@ -24238,6 +24275,8 @@ test("late and steering intent adoption immediately reconcile the live tool wind
     // injecting a stub here would hide it if that ever stopped being true.
     _sessionStableSemanticProfile: load("_sessionStableSemanticProfile"),
     _startMichaelDesignPreflight: () => { throw new Error("design preflight must not run"); },
+    // 专业域小抄的起跑点，和设计预检并列挂在同一条迟到裁决路径上；这里只关心契约注入。
+    _startDomainKnowledgePreflight: () => null,
     // 真实现，不打桩：裁决落定后要把契约送进对话，桩会把「到底送没送」这件事测糊。
     _agentIntentExecutionBlock: load("_agentIntentExecutionBlock"),
     _ORCH_NOTE: loadConst("_ORCH_NOTE"),
@@ -30725,6 +30764,8 @@ test("裁决迟到落定时，契约要真的送进对话，而不是只更新�
     _ideSemanticProfile: () => "semantic:modify",
     _sessionStableSemanticProfile: load("_sessionStableSemanticProfile"),
     _startMichaelDesignPreflight: () => {},
+    // 专业域小抄的起跑点，和设计预检并列挂在同一条迟到裁决路径上；这里只关心契约注入。
+    _startDomainKnowledgePreflight: () => null,
     _agentIntentExecutionBlock: load("_agentIntentExecutionBlock"),
     _ORCH_NOTE: loadConst("_ORCH_NOTE"),
   });
@@ -30771,6 +30812,8 @@ test("裁决迟到落定时，契约要真的送进对话，而不是只更新�
     _ideSemanticProfile: () => "s",
     _sessionStableSemanticProfile: load("_sessionStableSemanticProfile"),
     _startMichaelDesignPreflight: () => {},
+    // 专业域小抄的起跑点，和设计预检并列挂在同一条迟到裁决路径上；这里只关心契约注入。
+    _startDomainKnowledgePreflight: () => null,
     _agentIntentExecutionBlock: load("_agentIntentExecutionBlock"),
     _ORCH_NOTE: loadConst("_ORCH_NOTE"),
   });

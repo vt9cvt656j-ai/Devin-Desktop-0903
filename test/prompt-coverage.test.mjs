@@ -73,6 +73,36 @@ const RESERVED_FLAGS = {
   existing_website: "已有网站信号，同上；design 各层由 designMode 区分而不是这个旗标",
 };
 
+// 动态旗标族：名字不是字面量，是从数据拼出来的（`add(`domain_${...}`)`）。
+// 上面那条 `add("…")` 正则**看不见它们**——而看不见不等于不存在：它们照样每轮被算出来、
+// 照样进请求头、照样参与网关的缓存前缀。这正是这个文件存在的理由（"改了不生效，而且看
+// 起来跟生效一模一样"）的动态版本，所以单列一张表，按前缀写明理由。
+const RESERVED_FLAG_FAMILIES = {
+  domain_: "专业域路由旗标（domain_healthcare / domain_reverse_engineering / domain_penetration_testing …），"
+    + "取值逐字等于 server/knowledge/ 的 22 个目录名（`-` 换成 `_`）。客户端侧已经有真实消费者："
+    + "_startDomainKnowledgePreflight 在首个模型回合前把该域语料嚼成结构化小抄注进本轮上下文。"
+    + "网关侧的 semantic(\"domain_*\") 消费者尚未实现——这是与网关的待接契约，接上之前这条留在这里。",
+};
+
+test("动态拼出来的旗标族同样要有交代——字面量正则看不见它们，缓存前缀看得见", () => {
+  const fn = /function _ideSemanticProfile\(profile\)\s*\{([\s\S]*?)\n\}/.exec(CLIENT);
+  assert.ok(fn, "找不到 _ideSemanticProfile——旗标清单的来源变了");
+  // `add(`前缀${表达式}`)` 里那截固定前缀。
+  const families = [...new Set([...fn[1].matchAll(/add\(`([a-z0-9_]+)\$\{/g)].map((m) => m[1]))];
+  const undeclared = families.filter((f) => !(f in RESERVED_FLAG_FAMILIES));
+  assert.deepEqual(undeclared, [],
+    `这些旗标族是拼出来的，字面量正则扫不到，服务端也没人认领：${undeclared.join(", ")}。`
+    + `要么在 prompts.rs 里消费，要么在 RESERVED_FLAG_FAMILIES 里写明是预留。`);
+
+  for (const [prefix, why] of Object.entries(RESERVED_FLAG_FAMILIES)) {
+    assert.ok(families.includes(prefix),
+      `RESERVED_FLAG_FAMILIES 里的 ${prefix} 客户端已经不算了，删掉这条`);
+    assert.ok(why && why.length >= 10, `RESERVED_FLAG_FAMILIES.${prefix} 得写清为什么预留`);
+    assert.ok(!new RegExp(`semantic\\("${prefix}`).test(RUST),
+      `${prefix} 服务端已经在消费了，但仍留在 RESERVED_FLAG_FAMILIES 里——清单和现实对不上`);
+  }
+});
+
 test("每个提示词文件都必须运行时到得了模型，否则要写明为什么躺着", () => {
   const files = readdirSync(PROMPT_DIR).filter((f) => f.endsWith(".txt")).map((f) => f.slice(0, -4));
   assert.ok(files.length > 20, `只扫到 ${files.length} 个提示词文件——路径或后缀变了，这条断言等于没跑`);
