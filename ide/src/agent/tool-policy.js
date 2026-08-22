@@ -163,7 +163,20 @@ function seed() {
     readOnlyModeBlocked: (call) => String(call?.action || "list").trim().toLowerCase() !== "list",
     recoverableBlock: true,
   });
-  defineTool("copy", { ...FILE_OP, scopeField: "path" });
+  // copy 的 scope 字段是 `to`，不是 `path`。
+  //
+  // 它原来抄了 FILE_OP 里 write/edit 那一套的 `scopeField:"path"`——对那几个工具是对的，
+  // 因为它们的 path 就是被改的那个文件。copy 不是：`copy_path(from,to)` 映射成
+  // `{path: from, to}`（main.js 的 _mapToolCall），**落笔的地方是 to**，path 只是被读的源。
+  // 于是 worker A（scope=src/a/）调 copy_path(from:"src/a/t.js", to:"src/b/x.js") 时，
+  // 作用域门拿源去比，比中了自己的 scope，放行——文件却建在了 worker B 的地盘上。
+  // 并行 worker 之所以安全，全靠 _scopesOverlap 保证的「各改各的、互不相交」；
+  // 隔壁 delete/move 干脆整个禁掉正是为了这个不变量，而 copy 用错字段等于从旁边开了个口子。
+  //
+  // 只卡目的地、不卡来源：worker 读任何地方都是允许的（执行器注释里写明了「may read
+  // anywhere」），copy 的读那一半不该比 read_file 更严。变化在于：worker 现在不能把
+  // scope 内的文件复制到 scope 外——这正是要挡的那件事。
+  defineTool("copy", { ...FILE_OP, scopeField: "to" });
   // delete/move are refused outright for workers rather than scope-checked (a parallel child
   // deleting or relocating files is a conflict source no scope can make safe), so they carry
   // no scopeField — the executor's own worker guard rejects them earlier.

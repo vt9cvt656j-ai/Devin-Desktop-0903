@@ -65,6 +65,19 @@ if [ "$PUBLISH" -ne 1 ]; then
   exit 0
 fi
 
+# 预压缩。nginx 那边开了 gzip_static（server/nginx/michael-limits.conf），命中 .gz 就
+# 直接发文件、零 CPU；没有 .gz 或客户端不接受 gzip 时自动回退到原文件，所以这一步只赚不亏。
+#
+# 为什么放在这里而不是 `npm run build`：tauri.conf.json 的 beforeBuildCommand 就是
+# `npm run build`，而 Tauri 打包会把整个 dist/ 原样塞进桌面端安装包 —— 在构建里生成 .gz
+# 等于给每个安装包白白加 6MB 永远用不到的文件。
+#
+# -k 保留原文件（gzip_static 回退要用），-f 覆盖上一次的 .gz。上面第 2 条产物校验只找
+# .bak/.map，不会被 .gz 误伤；--delete 会同步清掉线上上一版的 .gz。
+echo "==> 预压缩静态产物"
+find dist -type f \( -name '*.js' -o -name '*.css' -o -name '*.html' -o -name '*.svg' -o -name '*.json' -o -name '*.wasm' \) -exec gzip -9kf {} +
+echo "✓ 预压缩完成：$(find dist -name '*.gz' | wc -l | tr -d ' ') 个 .gz，dist 现在 $(du -sh dist | cut -f1)"
+
 echo "==> 发布到 $REMOTE:$REMOTE_DIR"
 # --delete：线上要和本次构建完全一致，不留上一版的残余 chunk。
 rsync -az --delete -e "ssh -i $SSH_KEY" dist/ "$REMOTE:$REMOTE_DIR"

@@ -2484,7 +2484,22 @@ pub fn replace_in_file(
     if bytes.iter().take(8000).any(|&b| b == 0) {
         return Err("cannot replace in binary files".into());
     }
-    let content = String::from_utf8_lossy(&bytes).to_string();
+    // 只在能**无损**表示这份内容时才动它。
+    //
+    // 这里原来是 `String::from_utf8_lossy(&bytes).to_string()`。上面那道二进制闸门只在
+    // 前 8000 字节里找 NUL，而 GBK / Big5 / Latin-1 的正文一个 NUL 都没有，照样过闸；
+    // 接着 from_utf8_lossy 把每一段非法多字节序列换成 U+FFFD，而下面 `count > 0` 时写回去
+    // 的是**整个缓冲区**。于是替掉一个 ASCII 词的代价是整份中文/带重音的正文变成一串 �，
+    // 工具还回报「替换成功 N 处」。replace_in_project 会拿整棵树逐个文件调这里，
+    // 所以工作区里只要有一个 GBK 源文件就够。
+    //
+    // read_text_file（本文件里 `file is not valid UTF-8 text` 那处）早就立了同一条契约：
+    // 读不懂的编码宁可拒绝，也不静默转码。这里跟上——**能读的才准写**。
+    // 对 replace_in_project 的影响是「跳过这个文件」而不是中断整轮扫描：那边对 Err
+    // 的分支是 `_ => {}`。少替一处远好过毁掉一整个文件。
+    let content = String::from_utf8(bytes).map_err(|_| {
+        format!("cannot replace in '{file_path}': file is not valid UTF-8 text")
+    })?;
     let (new_content, count) = if case_sensitive {
         let c = content.matches(&query).count();
         (content.replace(&query, &replacement), c)
@@ -2520,7 +2535,32 @@ pub fn replace_in_file(
         (result, found)
     };
     if count > 0 {
-        std::fs::write(&file_path, &new_content).map_err(|e| e.to_string())?;
+        // 走原子写，不用 std::fs::write。后者是 O_TRUNC：先把原文件清零，再流式写入新内容；
+        // 中间被杀 / 断电 / 磁盘写满，用户的源文件就停在截断或全空的状态，原内容没处找。
+        // atomic_write_text（本文件里那个"staged temp + fsync + rename"）的文档注释写得
+        // 很清楚，它存在就是为了让"写到一半"永远不可见——工作区里别的写路径
+        // （write_text_file / write_text_file_if_unchanged / create_file）全走它，
+        // 只有这里绕开了，而 replace_in_project 一轮能重写上百个文件，正是窗口最大的那条。
+        //
+        // `resolved` 是 require_inside_workspace 规范化后的路径（软链已经解开），
+        // 所以 rename 替换的就是 std::fs::write 会写到的那个真实 inode，落点没变。
+        //
+        // 但**权限语义确实变了**，写在这儿免得下一个人把它当成新 bug：
+        // `std::fs::write` 要的是**文件**的写权限，rename 要的是**目录**的写权限。
+        // 实测（macOS，普通用户）：对一个 0o444 的文件直接写 → EACCES；把临时文件
+        // rename 到同一个 0o444 目标上 → 成功，且目标仍是 0o444（atomic_write_text 先把
+        // 原文件的权限抄到临时文件上再换）。所以只读文件从"替换失败"变成了"替换成功、
+        // 权限不变"，replace_in_project 那边也从静默跳过（对 Err 的分支是 `_ => {}`，
+        // 既不计数也不报错）变成计进 files_changed / replacements。
+        //
+        // 这是**对齐**，不是放宽：write_text_file / write_text_file_if_unchanged /
+        // create_file 一直就是这个语义——在编辑器里打开同一个 0o444 文件按保存本来就成功，
+        // 只有查找替换会失败。「能编辑却替换不了」才是说不通的那一半。
+        // 真正锁死的树照样失败：临时文件是在**同一个目录**里 create_new 出来的，
+        // 目录不可写就在暂存那一步报错，一个字节都不会动。
+        // 另一处代价：rename 换的是 inode，指向老 inode 的硬链接不会跟着变（这一条
+        // 同样是本模块所有写路径的既有行为）。
+        atomic_write_text(&resolved, &new_content)?;
     }
     Ok(count)
 }
@@ -2588,6 +2628,216 @@ pub fn replace_in_project(
         files_changed,
         replacements,
     })
+}
+
+#[cfg(test)]
+mod replace_in_file_tests {
+    use super::*;
+
+    fn scratch(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "mrday-replace-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// GBK 正文 `中文` = D6 D0 CE C4：**没有 NUL**，所以 8000 字节查 NUL 的二进制闸门放它过。
+    /// 从这里往下就是那个 bug 的全部条件。
+    fn gbk_line() -> Vec<u8> {
+        let mut v = b"// TODO_TOKEN ".to_vec();
+        v.extend_from_slice(&[0xD6, 0xD0, 0xCE, 0xC4]); // “中文”，GBK
+        v.push(b'\n');
+        v
+    }
+
+    /// 一次替换不该把整个文件重新编码。
+    ///
+    /// 事故形状：工作区里有一份 GBK 的 .po / .csv / 老源码（中文用户很常见）。模型替一个
+    /// 纯 ASCII 的词，from_utf8_lossy 把每个 GBK 汉字变成 U+FFFD，而 count>0 时**整份**
+    /// 缓冲区被写回去——那个词是替掉了，全文的中文一起变成 ���，工具还报"成功替换 1 处"。
+    /// 现在按 read_text_file 的同一条契约办：读不懂就拒绝，一个字节都不许动。
+    #[test]
+    fn a_non_utf8_file_is_refused_instead_of_being_rewritten_as_replacement_chars() {
+        let dir = scratch("gbk");
+        let f = dir.join("legacy.po");
+        let original = gbk_line();
+        std::fs::write(&f, &original).unwrap();
+
+        let err = replace_in_file(
+            f.to_string_lossy().to_string(),
+            "TODO_TOKEN".into(),
+            "DONE".into(),
+            true,
+        )
+        .expect_err("非 UTF-8 的文件必须被拒绝，而不是顺手转码写回去");
+        assert!(
+            err.contains("not valid UTF-8"),
+            "拒绝的理由要说清是编码问题（和 read_text_file 同一口径）：{err}"
+        );
+
+        // 关键的一条：磁盘上的字节要**一个都没变**。
+        assert_eq!(
+            std::fs::read(&f).unwrap(),
+            original,
+            "文件被改写了 —— 那 4 个 GBK 字节就是被 U+FFFD 吃掉的中文"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 整棵树扫描时，读不懂的那一个文件只是**被跳过**，不能拖垮其余文件的替换。
+    /// （replace_in_project 对 Err 的分支是 `_ => {}`，这条把那个前提钉住。）
+    #[test]
+    fn a_project_sweep_skips_the_undecodable_file_and_still_fixes_the_utf8_ones() {
+        let dir = scratch("sweep");
+        let legacy = dir.join("legacy.po");
+        let modern = dir.join("modern.rs");
+        let original = gbk_line();
+        std::fs::write(&legacy, &original).unwrap();
+        std::fs::write(&modern, "let x = TODO_TOKEN;\n").unwrap();
+
+        let out = replace_in_project(
+            dir.to_string_lossy().to_string(),
+            "TODO_TOKEN".into(),
+            "DONE".into(),
+            true,
+        )
+        .expect("扫描本身不该失败");
+
+        assert_eq!(
+            (out.files_changed, out.replacements),
+            (1, 1),
+            "只有那个 UTF-8 文件该被改，GBK 的那个只是跳过"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&modern).unwrap(),
+            "let x = DONE;\n",
+            "合法 UTF-8 的文件没被替换 —— 修法不能把正常路径一起关掉"
+        );
+        assert_eq!(
+            std::fs::read(&legacy).unwrap(),
+            original,
+            "扫描顺手毁掉了那个 GBK 文件"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 新内容必须靠**原子替换**落盘，不是 O_TRUNC 就地重写。
+    ///
+    /// std::fs::write 先把原文件清零再流式写入；中途被杀 / 断电 / 写满，用户的源文件就停在
+    /// 截断状态，原内容没处找 —— 而 replace_in_project 一轮能重写上百个文件。
+    /// atomic_write_text 的做法是「同目录暂存 + fsync + rename」，所以**inode 会换**：
+    /// 那就是"没有就地截断这个窗口"唯一能在进程内观察到的证据（真去 kill 进程没法写成测试）。
+    /// 退回 std::fs::write，inode 不变，这条立刻变红。
+    #[cfg(unix)]
+    #[test]
+    fn the_new_content_arrives_by_atomic_rename_not_by_truncating_in_place() {
+        use std::os::unix::fs::MetadataExt;
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = scratch("atomic");
+        let f = dir.join("app.rs");
+        std::fs::write(&f, "let x = TODO_TOKEN;\n").unwrap();
+        // 权限也要跟着走：原子替换换的是 inode，忘了搬权限的话可执行脚本会在替换后失去 +x。
+        std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o640)).unwrap();
+        let before = std::fs::metadata(&f).unwrap();
+
+        let n = replace_in_file(
+            f.to_string_lossy().to_string(),
+            "TODO_TOKEN".into(),
+            "DONE".into(),
+            true,
+        )
+        .expect("替换应当成功");
+        assert_eq!(n, 1);
+
+        let after = std::fs::metadata(&f).unwrap();
+        assert_eq!(std::fs::read_to_string(&f).unwrap(), "let x = DONE;\n");
+        assert_ne!(
+            before.ino(),
+            after.ino(),
+            "inode 没变 —— 说明还是就地 truncate 重写，崩在中间就把用户的文件清空了"
+        );
+        assert_eq!(
+            after.permissions().mode() & 0o777,
+            0o640,
+            "原子替换把文件权限丢了"
+        );
+        // 暂存文件必须已经被 rename 走，不能在工作区里留下 .app.rs.michael-write-*.tmp
+        let leftovers: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|n| n.contains("michael-write"))
+            .collect();
+        assert!(leftovers.is_empty(), "暂存文件被落在了工作区里：{leftovers:?}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 走原子替换之后，**只读文件（0o444）也会被改写，且权限保持不变**。
+    ///
+    /// 这不是顺带的副作用，是换写法必然带来的一条行为变化，所以钉在这里：
+    /// `std::fs::write` 要文件的写权限，rename 要**目录**的写权限。以前 replace_in_file
+    /// 对 0o444 返回 EACCES，replace_in_project 那边被 `_ => {}` 静默吃掉——不报错、
+    /// 也不计进 files_changed，用户只看到「替换了 N 处」里少了这一个文件，无从追查。
+    /// 现在两边都算数。判它是对的：同一个文件在编辑器里保存一直是成功的
+    /// （write_text_file 系列本来就走原子替换），"能编辑却替换不了"才是那半边说不通。
+    /// 目录不可写的树不受影响——暂存文件就建在同目录，那一步会先失败。
+    ///
+    /// 退回 `std::fs::write(&resolved, &new_content)`，这条立刻变红（EACCES）。
+    #[cfg(unix)]
+    #[test]
+    fn a_read_only_file_is_rewritten_and_keeps_its_read_only_mode() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = scratch("readonly");
+        let locked = dir.join("locked.txt");
+        let plain = dir.join("plain.txt");
+        std::fs::write(&locked, "let x = TODO_TOKEN;\n").unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o444)).unwrap();
+
+        let n = replace_in_file(
+            locked.to_string_lossy().to_string(),
+            "TODO_TOKEN".into(),
+            "DONE".into(),
+            true,
+        )
+        .expect("0o444 的文件现在应当能替换 —— rename 要的是目录写权限，不是文件写权限");
+        assert_eq!(n, 1);
+        assert_eq!(std::fs::read_to_string(&locked).unwrap(), "let x = DONE;\n");
+        assert_eq!(
+            std::fs::metadata(&locked).unwrap().permissions().mode() & 0o777,
+            0o444,
+            "只读位被替换掉了 —— 改内容可以，悄悄把文件变成可写不行"
+        );
+
+        // 整棵树扫描时它必须**计进结果**，不能像以前那样在 `_ => {}` 里静默消失。
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o644)).unwrap();
+        std::fs::write(&locked, "SWEEP_TOKEN\n").unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o444)).unwrap();
+        std::fs::write(&plain, "SWEEP_TOKEN\n").unwrap();
+
+        let out = replace_in_project(
+            dir.to_string_lossy().to_string(),
+            "SWEEP_TOKEN".into(),
+            "OK".into(),
+            true,
+        )
+        .expect("扫描本身不该失败");
+        assert_eq!(
+            (out.files_changed, out.replacements),
+            (2, 2),
+            "只读的那个文件没被计进来 —— 用户看到的「替换 N 处」少了它，而且一句错都没有"
+        );
+        assert_eq!(std::fs::read_to_string(&locked).unwrap(), "OK\n");
+        assert_eq!(std::fs::read_to_string(&plain).unwrap(), "OK\n");
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }
 
 #[cfg(test)]

@@ -1093,6 +1093,37 @@ pub fn git_file_log(
     Ok(parse_log_entries(&out))
 }
 
+/// 冲突这条路上，所有 `rel` 的锚点是**仓库顶层**，不是用户打开的那个文件夹。
+///
+/// `root` 只被 `require_git_root` 要求"在工作区里"，从来不要求它是仓库顶层——打开
+/// `<repo>/sub` 是很常见的用法（monorepo 里只开一个包）。而这条路上两头用的坐标系不一样：
+///
+/// - `git diff --name-only --diff-filter=U`（git_conflicts 的数据源）无论从哪个子目录跑，
+///   印的都是**相对顶层**的路径，而且列的是**整个仓库**的冲突，不只是当前目录底下的
+///   （实测：`git -C <repo>/sub` 照样印出 `top.txt` 和 `sub/bar.txt`）。
+/// - 而 pathspec 是**相对 CWD** 解析的。`git -C <repo>/sub ls-files -u -- ':(literal)sub/bar.txt'`
+///   实测一行都不匹配。
+///
+/// 这个错位以前是"静默走偏"：老代码把 `<repo>/top.txt` 写成了 `<repo>/sub/top.txt`
+/// ——一个凭空多出来的野文件——然后 `git add` 它、返回 Ok(())。上一轮修复补了
+/// "索引里没有未合并项就报错"，于是它变成了"每一次解冲突都失败"，而且失败信息说的是
+/// 「当前不是冲突状态」，与面板上一行还把它列成冲突文件的事实正面矛盾。
+///
+/// 所以两头一起校到顶层：pathspec 加 `top` magic（`:(top,literal)`，相对顶层解析），
+/// 落盘/读盘的绝对路径也从这里拼。`git show :N:<rel>` 不用管——它本来就是相对顶层解析的
+/// （实测 `git -C <repo>/sub show :2:sub/bar.txt` 出内容，`:2:bar.txt` 报 fatal）。
+fn repo_top_level(root: &str) -> Result<PathBuf, String> {
+    let top = run_git_checked(root, &["rev-parse", "--show-toplevel"])?;
+    if top.is_empty() {
+        // 裸仓库 / `--show-toplevel` 印不出东西：这两种情况下根本不会有工作区冲突，
+        // 但绝不能退回用 `root` 当顶层——那正是上面那个错位，静默走偏比报错糟得多。
+        return Err(format!(
+            "cannot locate the repository top level for '{root}' (git rev-parse --show-toplevel printed nothing)"
+        ));
+    }
+    Ok(PathBuf::from(top))
+}
+
 /// List files with merge conflicts (unmerged entries in `git status`).
 #[derive(Serialize)]
 pub struct ConflictFile {
@@ -1119,13 +1150,16 @@ pub fn git_conflicts(root: String) -> Result<Vec<ConflictFile>, String> {
     if !out.status.success() {
         return Ok(Vec::new());
     }
-    let root_path = PathBuf::from(&root);
+    // 绝对路径从顶层拼，不是从 `root` 拼（见 repo_top_level）。面板拿 `path` 去
+    // read_text_file / 手动解决时写回，按打开的文件夹拼就会指向一个不存在的
+    // `<repo>/sub/sub/bar.txt`。放在 diff 成功之后：不是仓库时上面已经返回空列表了。
+    let top = repo_top_level(&root)?;
     let text = String::from_utf8_lossy(&out.stdout);
     let files: Vec<ConflictFile> = text
         .lines()
         .filter(|l| !l.trim().is_empty())
         .map(|rel| {
-            let abs = root_path.join(rel);
+            let abs = top.join(rel);
             ConflictFile {
                 path: abs.to_string_lossy().to_string(),
                 name: Path::new(rel)
@@ -1151,8 +1185,30 @@ pub struct MergeVersions {
 #[tauri::command(async)]
 pub fn git_merge_versions(root: String, rel: String) -> Result<MergeVersions, String> {
     require_git_root(&root, false)?;
-    let root_path = PathBuf::from(&root);
-    let safe_path = require_rel_inside_root(&root_path, &rel)?;
+    // 三个 `git show :N:{rel}` 本来就按顶层解析，只有这条读磁盘的路以前按打开的文件夹
+    // 拼——子目录工作区里「合并结果」那一栏于是永远是空的（read_to_string 落在一个
+    // 不存在的 `<repo>/sub/sub/bar.txt` 上，被 unwrap_or_default 吞成空串）。
+    let top = repo_top_level(&root)?;
+    let safe_path = require_rel_inside_root(&top, &rel)?;
+    // 锚点从「打开的文件夹」挪到「仓库顶层」之后，这条读盘的路也**当场再查一次**边界，
+    // 理由和 `git_resolve_conflict` 那边一模一样，只是方向是读：`require_git_root` 查的是
+    // `root`，而 `top` 可以是 `root` 的任意祖先，于是 rel 能把 read_to_string 引到打开的
+    // 工作区之外去 —— 内容会原样出现在合并面板里（以及模型的上下文里）。
+    //
+    // 这不是「本来就有的老洞」，是**这次改锚点新开的**：从前拼的是 `<root>/{rel}`，
+    // 越界路径落在一个不存在的位置上、被 unwrap_or_default 吞成空串。
+    //
+    // 用读的那一档（`false`）而不是写的那一档：HOME 是读根，所以 HOME 底下的仓库
+    // 一切照旧、这条检查一个用例都不影响；被挡住的只有「仓库顶层在 HOME 之外、
+    // 而你打开的是它的子目录」那一种 —— 那正是不该把顶层旁边的文件读出来的场合。
+    // 报错而不是继续给空串：空串就是这次修的那个 bug 本身（面板上一栏莫名其妙是空的）。
+    require_inside_workspace(&safe_path.to_string_lossy(), false).map_err(|e| {
+        format!(
+            "「{rel}」在这个仓库里，但不在你打开的工作区内，读不到它的工作副本（{e}）。\
+             把仓库顶层 {} 作为文件夹打开再试。",
+            top.display()
+        )
+    })?;
     let base = run_git(&root, &["show", &format!(":1:{rel}")])
         .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
         .unwrap_or_default();
@@ -1171,31 +1227,138 @@ pub fn git_merge_versions(root: String, rel: String) -> Result<MergeVersions, St
     })
 }
 
+/// 索引里 `pathspec` 真正存着哪几个合并 stage，以及每个 stage 的 blob oid
+/// （1=base，2=ours，3=theirs）。
+///
+/// 冲突不一定三个 stage 都齐：modify/delete 冲突里被删掉的那一侧**根本没有 stage**。
+/// `git ls-files -u` 每行形如 `100644 <sha> 2\t<path>`：模式、oid、stage 号、TAB、路径
+/// （路径可能被 git 加引号转义，但我们只取 TAB 前那段，所以不受影响）。
+///
+/// **判据必须来自索引，不能来自 `git show` 的退出码。** 实测：`git show ':3:a*.txt'` 在
+/// stage 3 不存在时**退出 0 且 stdout 为空**（路径里的 `*` 让它走了通配匹配那条路），
+/// 而同样情况下 `git show ':3:foo.txt'` 是退出 128。也就是说"查退出码"这一条对带通配
+/// 字符的文件名当场失效，零字节文件照样被写下去。拿到 oid 之后改用
+/// `git cat-file blob <oid>`：不再有任何路径/revision 解析，退出码也就可信了。
+fn conflict_stages(root: &str, pathspec: &str) -> Result<Vec<(u8, String)>, String> {
+    let out = run_git_checked(root, &["ls-files", "-u", "--", pathspec])?;
+    let mut stages: Vec<(u8, String)> = Vec::new();
+    for line in out.lines() {
+        let meta = match line.split_once('\t') {
+            Some((meta, _)) => meta,
+            None => continue,
+        };
+        let mut fields = meta.split_whitespace();
+        let _mode = fields.next();
+        let oid = match fields.next() {
+            // oid 会被原样当作 `git cat-file` 的实参，所以只接受纯十六进制——git 自己的
+            // 输出本来就是，但一个非 hex 的串（比如以 `-` 开头）会变成选项注入。
+            Some(o) if !o.is_empty() && o.chars().all(|c| c.is_ascii_hexdigit()) => o,
+            _ => continue,
+        };
+        let stage = match fields.next().and_then(|s| s.parse::<u8>().ok()) {
+            Some(s) => s,
+            None => continue,
+        };
+        if !stages.iter().any(|(s, _)| *s == stage) {
+            stages.push((stage, oid.to_string()));
+        }
+    }
+    Ok(stages)
+}
+
 /// Accept one side of a merge conflict for a file.
+///
+/// 这个函数踩过三个坑，三个都以「它照样返回 Ok」收场：
+///
+/// ① **不看退出码。** `run_git` 对任何非零退出都返回 `Ok(Output)`（只有 spawn 失败才 Err），
+///    所以原来那句 `.map_err(...)?` 从来不会触发。modify/delete 冲突（porcelain 的 UD / DU）
+///    里被删的那一侧没有对应 stage，`git show :3:rel` 以 128 退出、stdout 是空的，
+///    于是**一个 0 字节的文件**被写下去、`git add` 进索引，函数报成功。用户点的是
+///    「接受对方的删除」，拿到的却是一个空文件——而且它已经暂存好了，下一步就提交进去。
+/// ② **没有 blob 时该删文件，不是写空文件。** 「接受删了它的那一侧」在语义上就是接受删除。
+/// ③ **走了 from_utf8_lossy。** 冲突的是一张 PNG / 一个 .so 的时候，每个非 UTF-8 字节被换成
+///    U+FFFD，暂存进去的是一份烂掉的二进制，同样报成功。现在按**原始字节**读写。
+///
+/// 修法上有一处值得记下来：**光加一句"查退出码"是不够的**。实测 `git show ':3:a*.txt'`
+/// 在 stage 3 不存在时退出 0、stdout 为空（文件名里的 `*` 让它走了通配那条路），
+/// 零字节文件照样会被写下去。所以判据整个搬到索引上：先 `git ls-files -u` 问出这个路径
+/// 到底有哪几个 stage 和对应的 oid，再用 `git cat-file blob <oid>` 取内容——那条路上
+/// 没有任何路径/revision 解析，退出码才真的可信。
+///
+/// 本文件里其它每一个会改东西的 git 包装（stage / commit / stash / branch）都查退出码，
+/// 只有这里没查；`git_merge_versions` 用 `unwrap_or_default()` 是对的——它只用于**显示**。
 #[tauri::command(async)]
 pub fn git_resolve_conflict(root: String, rel: String, resolution: String) -> Result<(), String> {
     require_git_root(&root, true)?;
-    let root_path = PathBuf::from(&root);
-    let file_path = require_rel_inside_root(&root_path, &rel)?;
-    match resolution.as_str() {
-        "ours" => {
-            let ours = run_git(&root, &["show", &format!(":2:{rel}")])
-                .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
-                .map_err(|e| format!("cannot get ours: {e}"))?;
-            std::fs::write(&file_path, &ours).map_err(|e| e.to_string())?;
-        }
-        "theirs" => {
-            let theirs = run_git(&root, &["show", &format!(":3:{rel}")])
-                .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
-                .map_err(|e| format!("cannot get theirs: {e}"))?;
-            std::fs::write(&file_path, &theirs).map_err(|e| e.to_string())?;
-        }
+    let top = repo_top_level(&root)?;
+    let file_path = require_rel_inside_root(&top, &rel)?;
+    // 锚点从「打开的文件夹」挪到「仓库顶层」之后，写入边界要在这里**当场再查一次**：
+    // `require_git_root` 查的是 `root`，而现在动的文件可能在 `root` 之外。
+    // HOME 本身就是一个仓库（dotfiles 仓库，`git init ~`）的人是真实存在的，那种机器上
+    // 顶层等于 HOME，一个叫 `.ssh/authorized_keys` 的未合并条目就能顺着这条路被写出去。
+    // require_inside_workspace(写) 要求路径落在**显式打开过**的工作区里（HOME 不算），
+    // 正好挡住这一类。副作用是：打开 `<repo>/sub` 时，仓库里 `sub/` 之外的那些冲突
+    // 在面板上看得见但解不了——报的是「不在打开的工作区内、去打开仓库顶层」，
+    // 这句话是真的，比原来那句「不是冲突状态」强。
+    require_inside_workspace(&file_path.to_string_lossy(), true).map_err(|e| {
+        format!(
+            "「{rel}」在这个仓库里，但不在你打开的工作区内，无法在这里解决（{e}）。\
+             把仓库顶层 {} 作为文件夹打开再试。",
+            top.display()
+        )
+    })?;
+    // `--` 只挡住「路径被当成选项」，挡不住**通配**：`git rm -- 'a*.txt'` 会把 ab.txt 一起
+    // 删掉（实测过）。rel 来自 git status，是一条真实路径，但文件名里带 `*` / `?` / `[]`
+    // 在 Unix 上完全合法。`:(literal)` 是 git 的 pathspec magic，关掉这一条的通配解释。
+    // 解冲突这条路上现在有 `git rm`，误伤的代价是别人的文件被删，所以三处 pathspec 一起收。
+    // 前面那个 `top` 是第二条 magic：pathspec 默认相对 CWD 解析，而 rel 是相对顶层的，
+    // 打开子目录时两者对不上（见 repo_top_level）。两条 magic 必须同时在。
+    let pathspec = format!(":(top,literal){rel}");
+    let stage: u8 = match resolution.as_str() {
+        "ours" => 2,
+        "theirs" => 3,
         "manual" => {
             // File was manually edited; just mark as resolved
+            return run_git_checked(&root, &["add", "--", &pathspec]).map(|_| ());
         }
         _ => return Err(format!("unknown resolution: {resolution}")),
+    };
+
+    // 先问索引，再取内容。顺序不能反：`git show` 的失败**不可靠**（见 conflict_stages），
+    // 而索引里有没有这个 stage 是个确定的事实。
+    let stages = conflict_stages(&root, &pathspec)?;
+    if stages.is_empty() {
+        return Err(format!(
+            "「{rel}」当前不是冲突状态（索引里没有未合并的暂存项），无法按 {resolution} 解决"
+        ));
     }
-    run_git_checked(&root, &["add", "--", &rel]).map(|_| ())
+
+    let oid = match stages.iter().find(|(s, _)| *s == stage) {
+        Some((_, oid)) => oid.clone(),
+        None => {
+            // 选中的那一侧**没有这个文件**（modify/delete 冲突里被删掉的那一边）。
+            // 「接受这一侧」在语义上就是接受删除，所以真的删掉并把删除暂存起来——
+            // 旧代码在这里写了个 0 字节文件然后 git add，把"删除"解决成了"空文件"。
+            // `-f` 是必须的：路径处于未合并状态时 git rm 会拒绝，而工作区里那份正是
+            // 用户此刻明确要丢弃的另一侧内容。
+            return run_git_checked(&root, &["rm", "-q", "-f", "--", &pathspec]).map(|_| ());
+        }
+    };
+
+    let out = run_git(&root, &["cat-file", "blob", &oid])?;
+    if !out.status.success() {
+        // 索引说这个 stage 在，却读不出对象 —— 仓库真的坏了。必须报出去，而不是把空的
+        // stdout 当成内容写进用户的文件。
+        let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        return Err(format!(
+            "cannot get {resolution} for '{rel}'{}",
+            if err.is_empty() { String::new() } else { format!(": {err}") }
+        ));
+    }
+    // 原始字节原样落盘：这一侧的内容可能是二进制，也可能是这个仓库里合法但非 UTF-8
+    // 的文本，任何转码都是在替用户改内容。
+    std::fs::write(&file_path, &out.stdout).map_err(|e| e.to_string())?;
+    run_git_checked(&root, &["add", "--", &pathspec]).map(|_| ())
 }
 
 /// git 失败时的回执：**stdout 也要带上**。
@@ -1912,6 +2075,390 @@ mod git_log_scope_tests {
         assert!(
             arg_line.trim().starts_with("args.push"),
             "--all 回到了固定参数表里：{arg_line}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod git_conflict_resolution_tests {
+    use super::*;
+
+    /// 跑真 git。源码 grep 挡不住「换个写法、同样不看退出码」的变体，而这两个 bug 的
+    /// 全部形状都在 git 的索引状态里（缺 stage、二进制 blob），造不出来就测不到。
+    struct Repo {
+        dir: std::path::PathBuf,
+    }
+
+    impl Repo {
+        fn new(tag: &str) -> Repo {
+            let dir = std::env::temp_dir().join(format!(
+                "mrday-conflict-{tag}-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            std::fs::remove_dir_all(&dir).ok();
+            std::fs::create_dir_all(&dir).unwrap();
+            let repo = Repo { dir };
+            repo.git(&["init", "-q", "."]);
+            repo.git(&["config", "user.name", "t"]);
+            repo.git(&["config", "user.email", "t@t"]);
+            crate::files::register_workspace_root(repo.root()).ok();
+            repo
+        }
+
+        fn root(&self) -> String {
+            self.dir.to_string_lossy().to_string()
+        }
+
+        fn git(&self, args: &[&str]) -> std::process::Output {
+            let git = crate::process_util::resolve_system_command("git");
+            crate::process_util::command(&git)
+                .arg("-C")
+                .arg(&self.dir)
+                .args(args)
+                .env("PATH", crate::process_util::augmented_path(None))
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@t")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@t")
+                .env("LC_ALL", "C")
+                .output()
+                .expect("git 跑不起来")
+        }
+
+        fn out(&self, args: &[&str]) -> String {
+            String::from_utf8_lossy(&self.git(args).stdout)
+                .trim()
+                .to_string()
+        }
+
+        fn branch(&self) -> String {
+            self.out(&["rev-parse", "--abbrev-ref", "HEAD"])
+        }
+    }
+
+    impl Drop for Repo {
+        fn drop(&mut self) {
+            std::fs::remove_dir_all(&self.dir).ok();
+        }
+    }
+
+    /// modify/delete 冲突：HEAD 改了它，对面删了它 → porcelain 的 `UD`，索引里**没有 stage 3**。
+    ///
+    /// 老代码在这里 `git show :3:foo.txt` 拿到 128 + 空 stdout，却因为 run_git 对非零退出
+    /// 返回 Ok 而毫无察觉，于是写下一个 **0 字节的 foo.txt** 并 `git add`，最后返回 Ok(())。
+    /// 用户点的是「接受对方的删除」，得到的是一个已经暂存好的空文件——下一次提交就把它
+    /// 固化进历史，而且看不出哪里错了。
+    #[test]
+    fn accepting_the_deleting_side_removes_the_file_instead_of_staging_an_empty_one() {
+        let repo = Repo::new("moddel");
+        std::fs::write(repo.dir.join("foo.txt"), "base\n").unwrap();
+        repo.git(&["add", "-A"]);
+        repo.git(&["commit", "-q", "-m", "base"]);
+        let main = repo.branch();
+
+        repo.git(&["checkout", "-q", "-b", "deleter"]);
+        repo.git(&["rm", "-q", "foo.txt"]);
+        repo.git(&["commit", "-q", "-m", "删掉 foo"]);
+
+        repo.git(&["checkout", "-q", &main]);
+        std::fs::write(repo.dir.join("foo.txt"), "ours change\n").unwrap();
+        repo.git(&["commit", "-q", "-am", "改了 foo"]);
+        let merge = repo.git(&["merge", "deleter"]);
+        assert!(!merge.status.success(), "这一步本该冲突，测试前提没造出来");
+        assert!(
+            repo.out(&["ls-files", "-u", "--", "foo.txt"])
+                .lines()
+                .all(|l| !l.contains("\tfoo.txt") || !l.split('\t').next().unwrap().ends_with(" 3")),
+            "前提不成立：索引里居然有 stage 3"
+        );
+
+        git_resolve_conflict(repo.root(), "foo.txt".into(), "theirs".into())
+            .expect("接受对方的删除应当成功");
+
+        assert!(
+            !repo.dir.join("foo.txt").exists(),
+            "文件还在——说明写下去的是个空文件，而不是把删除这件事解决掉"
+        );
+        // 索引里必须是**已暂存的删除**（porcelain `D `），不是一个 0 字节的暂存内容。
+        let status = repo.out(&["status", "--porcelain", "--", "foo.txt"]);
+        assert_eq!(status, "D  foo.txt", "索引状态不对：{status:?}");
+        assert!(
+            repo.out(&["ls-files", "-u"]).is_empty(),
+            "冲突没被真正解决，索引里还留着未合并的项"
+        );
+    }
+
+    /// 二进制冲突：`from_utf8_lossy` 会把每个非 UTF-8 字节换成 U+FFFD（EF BF BD），
+    /// 于是「接受我方」暂存进去的是一张**烂掉的图**，而函数照样报成功。
+    /// 现在按原始字节读写，选中那一侧的 blob 必须**一个字节不差**地落到磁盘和索引里。
+    #[test]
+    fn a_conflicted_binary_file_is_restored_byte_for_byte() {
+        let repo = Repo::new("binary");
+        let mut base = b"\x89PNG\r\n\x1a\n".to_vec();
+        base.extend_from_slice(&[0x00, 0x01, 0xFF, 0xFE, b'b', b'a', b's', b'e']);
+        std::fs::write(repo.dir.join("logo.png"), &base).unwrap();
+        repo.git(&["add", "-A"]);
+        repo.git(&["commit", "-q", "-m", "base"]);
+        let main = repo.branch();
+
+        repo.git(&["checkout", "-q", "-b", "other"]);
+        let mut theirs = b"\x89PNG\r\n\x1a\n".to_vec();
+        theirs.extend_from_slice(&[0x00, 0x02, 0xC3, 0x28, b't', b'h', b'e', b'i', b'r', b's']);
+        std::fs::write(repo.dir.join("logo.png"), &theirs).unwrap();
+        repo.git(&["commit", "-q", "-am", "对面改图"]);
+
+        repo.git(&["checkout", "-q", &main]);
+        // 0x80 / 0x81 是**孤立的 UTF-8 续字节**，from_utf8_lossy 一定会把它们吃掉。
+        let mut ours = b"\x89PNG\r\n\x1a\n".to_vec();
+        ours.extend_from_slice(&[0x00, 0x03, 0x80, 0x81, 0xFF, b'o', b'u', b'r', b's']);
+        std::fs::write(repo.dir.join("logo.png"), &ours).unwrap();
+        repo.git(&["commit", "-q", "-am", "我方改图"]);
+        let merge = repo.git(&["merge", "other"]);
+        assert!(!merge.status.success(), "这一步本该冲突，测试前提没造出来");
+
+        git_resolve_conflict(repo.root(), "logo.png".into(), "ours".into())
+            .expect("接受我方应当成功");
+
+        let on_disk = std::fs::read(repo.dir.join("logo.png")).unwrap();
+        assert_eq!(
+            on_disk, ours,
+            "落盘的不是原始字节 —— 非 UTF-8 的部分被 U+FFFD 替掉了，图就此损坏"
+        );
+        assert!(
+            !on_disk.windows(3).any(|w| w == [0xEF, 0xBF, 0xBD]),
+            "文件里出现了 U+FFFD 的字节序列，说明还是走了 from_utf8_lossy"
+        );
+        // 暂存的 blob 也要是同一份字节，不能磁盘对了索引却是坏的。
+        let staged = repo.git(&["show", ":0:logo.png"]).stdout;
+        assert_eq!(staged, ours, "索引里暂存的 blob 和磁盘不一致");
+    }
+
+    /// 带通配字符的文件名，是这条修复路上最阴的一格，它同时踩两个雷：
+    ///
+    /// 雷一：`git show ':3:a*.txt'` 在 stage 3 不存在时**退出 0、stdout 为空**（`*` 让它
+    /// 走了通配匹配那条路），所以"补一句查退出码"根本挡不住零字节文件——这也是为什么
+    /// 判据搬去了 `ls-files -u` + `cat-file blob <oid>`。
+    ///
+    /// 雷二：`--` 只保证路径不被当成选项，**不关通配**：`git rm -- 'a*.txt'` 会连 ab.txt
+    /// 一起删（真 git 上实测过）。Unix 下这种文件名完全合法，而 rel 一路是从 git status
+    /// 抄下来的真实路径。修法是 `:(literal)` pathspec magic。这一格比原 bug 更凶：
+    /// 丢的是一个跟这次冲突毫无关系的文件。
+    #[test]
+    fn resolving_a_path_with_glob_characters_does_not_take_its_neighbours_with_it() {
+        let repo = Repo::new("glob");
+        std::fs::write(repo.dir.join("a*.txt"), "base\n").unwrap();
+        std::fs::write(repo.dir.join("ab.txt"), "innocent\n").unwrap();
+        repo.git(&["add", "-A"]);
+        repo.git(&["commit", "-q", "-m", "base"]);
+        let main = repo.branch();
+
+        repo.git(&["checkout", "-q", "-b", "deleter"]);
+        repo.git(&["rm", "-q", "--", ":(literal)a*.txt"]);
+        repo.git(&["commit", "-q", "-m", "删掉带星号的那个"]);
+
+        repo.git(&["checkout", "-q", &main]);
+        std::fs::write(repo.dir.join("a*.txt"), "ours change\n").unwrap();
+        repo.git(&["commit", "-q", "-am", "改了带星号的那个"]);
+        assert!(
+            !repo.git(&["merge", "deleter"]).status.success(),
+            "这一步本该冲突，测试前提没造出来"
+        );
+
+        git_resolve_conflict(repo.root(), "a*.txt".into(), "theirs".into())
+            .expect("接受对方的删除应当成功");
+
+        assert!(
+            !repo.dir.join("a*.txt").exists(),
+            "该删的没删掉 —— 大概率是 git show 退出 0 + 空 stdout，又写了个零字节文件"
+        );
+        assert_eq!(
+            repo.out(&["status", "--porcelain", "--", ":(literal)a*.txt"]),
+            "D  a*.txt",
+            "没有解决成「已暂存的删除」"
+        );
+        assert!(
+            repo.dir.join("ab.txt").exists(),
+            "ab.txt 被 `git rm -- 'a*.txt'` 的通配一起删了 —— 用户丢的是一个完全无关的文件"
+        );
+        assert_eq!(
+            std::fs::read_to_string(repo.dir.join("ab.txt")).unwrap(),
+            "innocent\n"
+        );
+    }
+
+    /// 没有冲突的时候必须**报错**，不能悄悄写点什么再 add。
+    /// 这是①那条的另一半：不看退出码时，这种调用同样会写一个空文件然后返回 Ok。
+    #[test]
+    fn resolving_a_file_that_is_not_conflicted_fails_loudly() {
+        let repo = Repo::new("noconflict");
+        std::fs::write(repo.dir.join("a.txt"), "hello\n").unwrap();
+        repo.git(&["add", "-A"]);
+        repo.git(&["commit", "-q", "-m", "base"]);
+
+        let err = git_resolve_conflict(repo.root(), "a.txt".into(), "theirs".into())
+            .expect_err("没有冲突却报成功 —— 那意味着刚往文件里写了空内容");
+        assert!(err.contains("不是冲突状态"), "错误信息没说清原因：{err}");
+        assert_eq!(
+            std::fs::read_to_string(repo.dir.join("a.txt")).unwrap(),
+            "hello\n",
+            "文件被动过了"
+        );
+    }
+
+    /// 打开的文件夹是仓库的**子目录**时，整条冲突链路要落在正确的文件上。
+    ///
+    /// 这一条钉的是两个坐标系的错位（见 repo_top_level）：`git diff --diff-filter=U`
+    /// 给的 rel 相对**仓库顶层**，而 pathspec 相对 **CWD**。打开 `<repo>/sub` 时：
+    /// 老代码把 `<repo>/sub/bar.txt` 的内容写到了 `<repo>/sub/sub/bar.txt`（凭空多一层），
+    /// 再 `git add` 那个野文件、返回 Ok(())；加了索引判据之后它改成每次都失败，
+    /// 报的却是「当前不是冲突状态」——而同一个面板上一行正把它显示为冲突文件。
+    #[test]
+    fn a_conflict_resolves_when_the_opened_folder_is_a_subdirectory_of_the_repo() {
+        let repo = Repo::new("subdir");
+        std::fs::create_dir_all(repo.dir.join("sub")).unwrap();
+        std::fs::write(repo.dir.join("sub/bar.txt"), "base\n").unwrap();
+        repo.git(&["add", "-A"]);
+        repo.git(&["commit", "-q", "-m", "base"]);
+        let main = repo.branch();
+
+        repo.git(&["checkout", "-q", "-b", "other"]);
+        std::fs::write(repo.dir.join("sub/bar.txt"), "theirs\n").unwrap();
+        repo.git(&["commit", "-q", "-am", "对方改了"]);
+
+        repo.git(&["checkout", "-q", &main]);
+        std::fs::write(repo.dir.join("sub/bar.txt"), "ours\n").unwrap();
+        repo.git(&["commit", "-q", "-am", "我方改了"]);
+        assert!(
+            !repo.git(&["merge", "other"]).status.success(),
+            "这一步本该冲突，测试前提没造出来"
+        );
+
+        // 用户打开的是子目录，后端拿到的 root 就是它。
+        let sub = repo.dir.join("sub").to_string_lossy().to_string();
+        crate::files::register_workspace_root(sub.clone()).ok();
+
+        let listed = git_conflicts(sub.clone()).expect("列冲突不该失败");
+        assert_eq!(
+            listed.iter().map(|c| c.rel.as_str()).collect::<Vec<_>>(),
+            vec!["sub/bar.txt"],
+            "git diff 印的一直是相对仓库顶层的路径，即使从子目录里跑"
+        );
+        assert!(
+            Path::new(&listed[0].path).exists(),
+            "面板给出的绝对路径不存在：{} —— 从打开的文件夹拼就会多出一层 sub/",
+            listed[0].path
+        );
+
+        git_resolve_conflict(sub, "sub/bar.txt".into(), "theirs".into())
+            .expect("子目录工作区里解冲突失败了 —— pathspec 还在按 CWD 解析");
+
+        assert_eq!(
+            std::fs::read_to_string(repo.dir.join("sub/bar.txt")).unwrap(),
+            "theirs\n",
+            "内容没落到真正那个冲突文件上"
+        );
+        assert_eq!(
+            repo.out(&["status", "--porcelain", "--", ":(top,literal)sub/bar.txt"]),
+            "M  sub/bar.txt",
+            "没有解决成「已暂存的修改」"
+        );
+        assert!(
+            !repo.dir.join("sub/sub").exists(),
+            "在打开的文件夹底下又拼了一层 sub/ —— 那是老代码写出来的野文件"
+        );
+    }
+
+    /// 同一个锚点错误的**另一半**：`git_merge_versions` 也从「打开的文件夹」拼路径。
+    ///
+    /// 上面那条测的是解冲突（写），这条测的是三栏对比里的「合并结果」（读）。两处各自
+    /// 有一行 `require_rel_inside_root(...)`，改对一处、漏掉另一处，测试全绿 —— 这条
+    /// 就是补那个缺口：把 1192 行的 `&top` 换回 `&PathBuf::from(&root)`，这里必须红。
+    ///
+    /// 症状不是报错，是**静悄悄的空白**：路径拼成不存在的 `<repo>/sub/sub/bar.txt`，
+    /// `read_to_string(...).unwrap_or_default()` 把 io 错误吞成空串，面板上那一栏就
+    /// 永远是空的 —— 用户会以为「合并结果真的没内容」。所以断言必须落在**内容**上，
+    /// 只断言 Ok 是抓不到的。
+    #[test]
+    fn merge_versions_reads_the_working_copy_when_the_opened_folder_is_a_subdirectory() {
+        let repo = Repo::new("subdir-merge-versions");
+        std::fs::create_dir_all(repo.dir.join("sub")).unwrap();
+        std::fs::write(repo.dir.join("sub/bar.txt"), "base\n").unwrap();
+        repo.git(&["add", "-A"]);
+        repo.git(&["commit", "-q", "-m", "base"]);
+        let main = repo.branch();
+
+        repo.git(&["checkout", "-q", "-b", "other"]);
+        std::fs::write(repo.dir.join("sub/bar.txt"), "theirs\n").unwrap();
+        repo.git(&["commit", "-q", "-am", "对方改了"]);
+
+        repo.git(&["checkout", "-q", &main]);
+        std::fs::write(repo.dir.join("sub/bar.txt"), "ours\n").unwrap();
+        repo.git(&["commit", "-q", "-am", "我方改了"]);
+        assert!(
+            !repo.git(&["merge", "other"]).status.success(),
+            "这一步本该冲突，测试前提没造出来"
+        );
+
+        let sub = repo.dir.join("sub").to_string_lossy().to_string();
+        crate::files::register_workspace_root(sub.clone()).ok();
+
+        let v = git_merge_versions(sub, "sub/bar.txt".into()).expect("取三方版本不该失败");
+
+        // 索引那三栏一直是按顶层解析的，本来就对——先钉住，免得下面那条红了以后
+        // 有人误以为是 git show 坏了。
+        assert_eq!(v.base, "base\n", "stage 1 不是基线");
+        assert_eq!(v.ours, "ours\n", "stage 2 不是我方");
+        assert_eq!(v.theirs, "theirs\n", "stage 3 不是对方");
+
+        // 而这一栏读的是磁盘：锚点错了它就是空串。
+        assert!(
+            !v.merged.is_empty(),
+            "「合并结果」是空的 —— 路径又从打开的文件夹拼了，多出一层 sub/"
+        );
+        assert!(
+            v.merged.contains("<<<<<<<") && v.merged.contains("ours") && v.merged.contains("theirs"),
+            "读到的不是那个带冲突标记的工作副本：{:?}",
+            v.merged
+        );
+        assert!(
+            !repo.dir.join("sub/sub").exists(),
+            "又在打开的文件夹底下拼了一层 sub/"
+        );
+    }
+
+    /// 读盘这一步要不要再查一次工作区边界 —— 这条是源码断言，不是行为断言，因为
+    /// `Repo` 造在 `std::env::temp_dir()` 里，而临时目录是 `has_safe_prefix` 明写的
+    /// 例外，在那里边界检查恒为 Ok，行为上造不出被挡的那一侧。
+    ///
+    /// 挡的是这个形状：仓库顶层在 HOME 之外（外接盘 / /opt 下的仓库），用户打开的是它的
+    /// 子目录，于是 `top` 落在工作区外，一条 `../` 之外的 rel 就能把任意文件的内容读进
+    /// 合并面板。写那一侧（`git_resolve_conflict`）早就查了，读这一侧不查就是不对称。
+    #[test]
+    fn merge_versions_still_checks_the_workspace_boundary_after_moving_the_anchor() {
+        let src = include_str!("git.rs");
+        let body = src
+            .split("pub fn git_merge_versions(")
+            .nth(1)
+            .and_then(|s| s.split("\n#[tauri::command").next())
+            .expect("git_merge_versions 的函数体不见了");
+        // 先剥注释：上面那几段注释里逐字写着被修掉的旧代码和这里要断言的调用名，
+        // 不剥的话断言会被自己的注释喂饱，函数体删空了都还是绿的。
+        let code: String = body
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            code.contains("require_rel_inside_root(&top, &rel)"),
+            "锚点又回到了打开的文件夹上：{code}"
+        );
+        assert!(
+            code.contains("require_inside_workspace(&safe_path.to_string_lossy(), false)"),
+            "读盘前不再查工作区边界了 —— 顶层在工作区之外时，任意文件会被读进合并面板：{code}"
         );
     }
 }

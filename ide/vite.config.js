@@ -92,6 +92,21 @@ const obfuscatorOptions = {
 
 const COMPUTED_IMPORT_RE = /import\(\s*[^"'`)\s]/;
 
+// Packages reachable ONLY from globe.gl / three (see manualChunks below for why this is an
+// explicit list and how to regenerate it). `tslib` is intentionally excluded: it is shared
+// with other runtime dependencies and belongs in `vendor`.
+const THREE_GLOBE_TREE = new Set([
+  "@babel/runtime", "@turf/boolean-point-in-polygon", "@turf/helpers", "@turf/invariant",
+  "@tweenjs/tween.js", "@types/geojson", "accessor-fn", "d3-array", "d3-color",
+  "d3-delaunay", "d3-format", "d3-geo", "d3-geo-voronoi", "d3-interpolate", "d3-octree",
+  "d3-scale", "d3-scale-chromatic", "d3-selection", "d3-time", "d3-time-format",
+  "d3-tricontour", "data-bind-mapper", "delaunator", "earcut", "float-tooltip",
+  "frame-ticker", "globe.gl", "h3-js", "index-array-by", "internmap", "kapsule",
+  "lodash-es", "point-in-polygon-hao", "polished", "preact", "robust-predicates",
+  "simplesignal", "three", "three-conic-polygon-geometry", "three-geojson-geometry",
+  "three-globe", "three-render-objects", "three-slippy-map-globe", "tinycolor2",
+]);
+
 // Obfuscate OUR app entry chunks AFTER the whole build is written to disk. This has
 // to happen in `writeBundle`, not `transform`/`renderChunk`: under vite 8 / rolldown
 // both earlier hooks get their output re-minified by rolldown's built-in pass, which
@@ -161,6 +176,57 @@ function dynamicImportGuard() {
   };
 }
 
+// Build-time invariant: the three.js/globe tree must stay OFF the startup path.
+//
+// Splitting it into its own chunk is only half the job — the half that silently regresses
+// is the other direction. If any package that imports `three` is missing from
+// THREE_GLOBE_TREE it lands in `vendor`, `vendor` then *statically* imports three3d, and
+// because index.html modulepreloads vendor the whole 2 MB is back on cold start while the
+// build still looks correct (a three3d chunk exists, the app runs). Same outcome if the
+// entry HTML ever preloads three3d directly.
+//
+// So assert both directions: nothing eagerly loaded may reference three3d, and three3d
+// must actually exist as long as globe.gl is a dependency.
+function threeChunkGuard() {
+  return {
+    name: "three-chunk-guard",
+    generateBundle(_options, bundle) {
+      const names = Object.keys(bundle);
+      const three3d = names.filter((n) => /^assets\/three3d-/.test(n));
+      if (three3d.length === 0) {
+        throw new Error(
+          "[three-chunk-guard] no three3d chunk was emitted — manualChunks no longer matches " +
+          "the globe/three tree (a dependency rename?). Without it the 2 MB tree is folded " +
+          "back into `vendor`, which index.html modulepreloads, and every cold start pays for " +
+          "a panel most users never open.",
+        );
+      }
+      for (const [fileName, chunk] of Object.entries(bundle)) {
+        // Only chunks that are themselves eagerly loaded can drag three3d into startup.
+        // `vendor` and the entry chunks are modulepreloaded; three3d's own facade is not.
+        if (chunk.type !== "chunk") continue;
+        if (!/^assets\/(vendor|rolldown-runtime|main|overlay|tailwind)-/.test(fileName)) continue;
+        const eager = (chunk.imports || []).filter((i) => /three3d-/.test(i));
+        if (eager.length) {
+          throw new Error(
+            `[three-chunk-guard] ${fileName} statically imports ${eager.join(", ")} — the ` +
+            "globe/three tree is back on the startup path. A package that imports `three` is " +
+            "missing from THREE_GLOBE_TREE in this file (check for new transitive deps of " +
+            "three-globe, which declare `three` as a peerDependency). Add it and rebuild.",
+          );
+        }
+      }
+      const html = bundle["index.html"];
+      if (html && html.type === "asset" && /three3d-/.test(String(html.source))) {
+        throw new Error(
+          "[three-chunk-guard] index.html references the three3d chunk (modulepreload or " +
+          "script tag) — it must only be reachable through the lazy import in main.js.",
+        );
+      }
+    },
+  };
+}
+
 export default defineConfig({
   clearScreen: false,
   // The app's own version, so the desktop heartbeat can tell the gateway which build is
@@ -186,6 +252,8 @@ export default defineConfig({
     obfuscateAppChunks(),
     // generateBundle → assert dynamic imports survived (runs after obfuscation).
     dynamicImportGuard(),
+    // generateBundle → assert the globe/three tree stayed off the startup path.
+    threeChunkGuard(),
   ],
   server: {
     port: 5174,
@@ -215,7 +283,35 @@ export default defineConfig({
           // returning undefined here preserves that lazy behaviour.
           if (id.includes("monaco-editor")) return;
           if (id.includes("@xterm")) return "xterm";
-          if (id.includes("node_modules")) return "vendor";
+          // three.js + globe.gl and their entire private dependency tree.
+          //
+          // MUST come before the node_modules catch-all. src/main.js:39073 already loads
+          // the memory-centre globe lazily (`await Promise.all([import("globe.gl"),
+          // import("three")])`), but with everything under node_modules folded into
+          // `vendor` that laziness was decorative: the emitted globe.gl chunk was a
+          // 73-byte re-export stub and the real 2.02 MB lived in `vendor`, which
+          // index.html modulepreloads. Measured 2026-08-22: vendor 2,442,537 B, of which
+          // ~2.02 MB is this tree — about 27% of the JS parsed on every cold start, for a
+          // panel most users never open.
+          //
+          // An explicit package list, not a regex: the tree includes names a
+          // "three-*" pattern misses (three-geojson-geometry, three-slippy-map-globe are
+          // dependencies of three-globe that declare three as a *peer*), and missing one
+          // leaves it in vendor, which then statically imports three3d and drags the whole
+          // chunk back into startup — the exact failure the split is meant to avoid.
+          //
+          // Regenerate after any dependency change: walk `dependencies` transitively from
+          // ["globe.gl","three"], then subtract the closure of every other direct
+          // dependency. tslib is deliberately absent — it is shared with other packages
+          // and must stay in vendor.
+          if (id.includes("node_modules")) {
+            const norm = id.replace(/\\/g, "/");
+            const rest = norm.slice(norm.lastIndexOf("node_modules/") + 13);
+            const seg = rest.split("/");
+            const name = seg[0].startsWith("@") ? `${seg[0]}/${seg[1]}` : seg[0];
+            if (THREE_GLOBE_TREE.has(name)) return "three3d";
+            return "vendor";
+          }
         },
       },
     },

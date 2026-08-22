@@ -217,6 +217,27 @@ test("worker scope targets match the pre-refactor list", () => {
   assert.equal(workerScopeTarget(null), "");
 });
 
+// 这条守的是一次真实的作用域逃逸，不是命名口味。
+//
+// copy 原本继承了 FILE_OP 里 write/edit 的 scopeField:"path"。对那几个工具 path 就是被
+// 改的文件，对 copy 不是：`copy_path(from,to)` 映射成 `{path: from, to}`，写落在 `to`。
+// 于是 worker A（scope=["src/a/"]）调 copy_path(from:"src/a/template.js",
+// to:"src/b/injected.js")：main.js 的 worker 门取 workerScopeTarget(call) 得到**源**，
+// 源在 A 的 scope 里 → 放行；文件却建到了并行的 worker B 的地盘上。并行 worker 的安全
+// 前提就是 _scopesOverlap 保证的互不相交，delete/move 被整个禁掉正是为了它。
+//
+// 注意上面那条老断言（path 为空、只有 to）**挡不住这个回归**：scopeField 退回 "path"
+// 时它照样绿，因为 workerScopeTarget 会 `call[field] || call.dest || call.to` 兜到 to。
+// 所以这里必须给出**两个字段都非空且不同**的调用——那才是逃逸的真实形状。
+test("a worker's copy is scope-checked at the destination, not the source", () => {
+  assert.equal(workerScopeField("copy"), "to");
+  assert.equal(
+    workerScopeTarget({ type: "copy", path: "src/a/template.js", to: "src/b/injected.js" }),
+    "src/b/injected.js",
+    "copy 按源判作用域 —— worker 可以把文件写进别的 worker 的 scope",
+  );
+});
+
 // ── Behaviour of the registry itself ────────────────────────────────────────
 
 test("an unregistered tool gets the safe default, so read-only tools need no declaration", () => {
