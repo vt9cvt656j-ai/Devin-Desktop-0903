@@ -24,6 +24,39 @@ use crate::AppState;
 /// 抽成常量而不是散在 7 条 SQL 里：这个值散落多处然后各自漂移，是本仓库最常见的一类 bug。
 pub const QUOTA_WINDOW_REFRESH: &str = "30 minutes";
 
+/// 「窗口回满 + 周计数器重置」这条 UPDATE 的唯一出处。
+///
+/// 上面那个常量抽出来是因为「值」漂移过；这个函数抽出来是因为「语句」也漂移了——同一条
+/// UPDATE 曾经在 auth.rs 的 /api/me 和 models.rs 的 chat / image / audio 三处各抄了一份，
+/// 四份逐字相同。2026-08-22 给它加 WHERE 闸时，四处都得改；改三处漏一处，就会出现
+/// 「网页上看余额刷了、发消息时没刷」这种查不明白的分歧。现在只有这一处。
+///
+/// **末尾的 WHERE 是正确性的一部分，不是优化。** 每个 CASE 分支在条件为假时都返回原值，
+/// 所以没有 WHERE 时它在绝大多数调用上是个空写——而 Postgres 不知道那是空写：照样写新
+/// 元组、写 WAL、留死行。2026-08-22 线上实测：users 表 171 行，累计 n_tup_upd 647,154；
+/// 自动 ANALYZE 跑了 9,244 次（171 行的表约每 67 次修改就重算统计，把池子里所有连接的
+/// 执行计划作废）；全库 22GB WAL 里 2,596,965 个整页镜像（约 20GB）主要来自这种同页重写。
+/// 抽样时 171 行里只有 139 行窗口到期、156 行日期到期。
+///
+/// WHERE 的条件和 CASE 里的条件**逐字同构**（窗口到期 或 周到期），所以结果集完全一致，
+/// 只是不再为不该动的行写元组。并发也安全：READ COMMITTED 拿到行锁后会重新求值 WHERE，
+/// 同一用户的并发请求塌缩成一次真写。
+///
+/// 绑定参数：`$1` = 用户 id。
+pub fn quota_refresh_sql() -> String {
+    format!(
+        "UPDATE users SET \
+         quota_window_cents = CASE WHEN (quota_window_reset_at IS NULL OR quota_window_reset_at <= now()) AND quota_total_cents > 0 THEN LEAST(quota_window_cap_cents, quota_total_cents) ELSE quota_window_cents END, \
+         quota_window_reset_at = CASE WHEN (quota_window_reset_at IS NULL OR quota_window_reset_at <= now()) AND quota_total_cents > 0 THEN now() + interval '{QUOTA_WINDOW_REFRESH}' ELSE quota_window_reset_at END, \
+         quota_week_used_cents = CASE WHEN quota_week_reset_at IS NULL OR quota_week_reset_at <= now() THEN 0 ELSE quota_week_used_cents END, \
+         quota_week_reset_at = CASE WHEN quota_week_reset_at IS NULL OR quota_week_reset_at <= now() THEN now() + interval '7 days' ELSE quota_week_reset_at END \
+         WHERE id = $1 AND ( \
+           ((quota_window_reset_at IS NULL OR quota_window_reset_at <= now()) AND quota_total_cents > 0) \
+           OR quota_week_reset_at IS NULL OR quota_week_reset_at <= now() \
+         )"
+    )
+}
+
 // ---- models ----------------------------------------------------------------
 
 #[derive(Debug, Serialize, sqlx::FromRow)]
@@ -976,22 +1009,34 @@ pub async fn logout(State(state): State<AppState>, claims: Claims) -> ApiResult<
 pub async fn me(State(state): State<AppState>, claims: Claims) -> ApiResult<Json<serde_json::Value>> {
     let id = uuid::Uuid::parse_str(&claims.sub).map_err(|_| AppError::unauthorized("令牌损坏"))?;
     // Apply the 30-minute window refill + weekly reset so the profile shows current quota.
+    // 语句本体和它为什么带 WHERE，见 quota_refresh_sql()。
+    let _ = sqlx::query(&quota_refresh_sql())
+        .bind(id)
+        .execute(&state.db)
+        .await;
+
+    // 每日免费点的惰性发放。同样加了 WHERE：原来 `free_points_date = CURRENT_DATE` 是**无
+    // 条件**赋值，所以哪怕日期没变也照写一遍——这是 /api/me 每次调用的第二条空写。
+    //
+    // 顺序也换了：以前是 UPDATE ... RETURNING 排在 SELECT 之后，用返回值当余额。加了
+    // WHERE 之后不该发放时不会有行返回（RETURNING 给不出值），所以改成先执行、再由下面
+    // 那条 SELECT 读出结果——`User` 结构体本来就有 free_points 字段，读到的是同一个值。
     let _ = sqlx::query(
-        &format!("UPDATE users SET \
-         quota_window_cents = CASE WHEN (quota_window_reset_at IS NULL OR quota_window_reset_at <= now()) AND quota_total_cents > 0 THEN LEAST(quota_window_cap_cents, quota_total_cents) ELSE quota_window_cents END, \
-         quota_window_reset_at = CASE WHEN (quota_window_reset_at IS NULL OR quota_window_reset_at <= now()) AND quota_total_cents > 0 THEN now() + interval '{QUOTA_WINDOW_REFRESH}' ELSE quota_window_reset_at END, \
-         quota_week_used_cents = CASE WHEN quota_week_reset_at IS NULL OR quota_week_reset_at <= now() THEN 0 ELSE quota_week_used_cents END, \
-         quota_week_reset_at = CASE WHEN quota_week_reset_at IS NULL OR quota_week_reset_at <= now() THEN now() + interval '7 days' ELSE quota_week_reset_at END \
-         WHERE id = $1"),
+        "UPDATE users SET free_points = $2, free_points_date = CURRENT_DATE \
+         WHERE id = $1 AND free_points_date IS DISTINCT FROM CURRENT_DATE",
     )
     .bind(id)
+    .bind(crate::models::free_milli_points_daily())
     .execute(&state.db)
     .await;
+
     let user = sqlx::query_as::<_, User>("SELECT * FROM users WHERE id = $1")
         .bind(id)
         .fetch_optional(&state.db)
         .await?
         .ok_or_else(|| AppError::unauthorized("用户不存在"))?;
+    // 上面那条 UPDATE 已经落盘，所以这里读到的就是今天该有的余额。
+    let free_points: i64 = user.free_points;
 
     // 附带 michael-compression 的可用档位，客户端据此决定「本地要不要自己压」。
     // 这是**加字段**，老客户端会忽略它，不会破坏现有消费方（nginx 的 auth_request
@@ -1006,23 +1051,8 @@ pub async fn me(State(state): State<AppState>, claims: Claims) -> ApiResult<Json
     } else {
         None
     };
-    // Daily free-points grant, applied lazily on read: if the stored date is not today the
-    // pool is overwritten with today's allowance, so yesterday's remainder is never carried.
-    // Doing it here means the profile popup is always the freshest view of the pool.
-    let free_points: i64 = sqlx::query_scalar(
-        "UPDATE users SET \
-           free_points = CASE WHEN free_points_date IS DISTINCT FROM CURRENT_DATE \
-                              THEN $2 ELSE free_points END, \
-           free_points_date = CURRENT_DATE \
-         WHERE id = $1 RETURNING free_points",
-    )
-    .bind(id)
-    .bind(crate::models::free_milli_points_daily())
-    .fetch_optional(&state.db)
-    .await
-    .ok()
-    .flatten()
-    .unwrap_or(0);
+    // （每日免费点的发放已经上移到 SELECT 之前，见那里的注释。语义不变：存的日期不是
+    // 今天就把池子覆盖成今天的额度，昨天的余量永远不结转。）
 
     let mut body = serde_json::to_value(&user).unwrap_or_else(|_| json!({}));
     if let Some(obj) = body.as_object_mut() {
@@ -1275,6 +1305,52 @@ mod quota_window_tests {
                 || QUOTA_WINDOW_REFRESH.contains("hour")
                 || QUOTA_WINDOW_REFRESH.contains("day"),
             "不是合法的 interval 单位：{QUOTA_WINDOW_REFRESH}"
+        );
+    }
+
+    /// 回满语句只能有一份，而且必须带 WHERE 闸。
+    ///
+    /// 抓的是一个真实存在过的形状：同一条 UPDATE 在 /api/me、chat、image、audio 四处各抄
+    /// 了一份逐字相同的副本。2026-08-22 给它加 WHERE 闸时四处都要改——只改一处就会出现
+    /// 「网页上余额刷新了、发消息时没刷」这种分歧，而类型检查和现有测试都抓不到。
+    ///
+    /// 断言的是「连接」不是「实现」：语句怎么写随便改，但 (a) 原始 SQL 片段在整个
+    /// server/src 里只能出现一次（就在 quota_refresh_sql 里），(b) 那一份必须带 WHERE。
+    #[test]
+    fn quota_refresh_statement_has_exactly_one_home_and_keeps_its_guard() {
+        // 用 concat! 拆开：否则这段断言自己的字面量会被 include_str! 数进去。
+        let fragment = concat!("quota_window_cents", " = CASE WHEN");
+
+        let auth_src = include_str!("auth.rs");
+        assert_eq!(
+            auth_src.matches(fragment).count(),
+            1,
+            "auth.rs 里出现了不止一份回满语句——它只应该活在 quota_refresh_sql() 里",
+        );
+        for (name, src) in [
+            ("models.rs", include_str!("models.rs") as &str),
+            ("codes.rs", include_str!("codes.rs")),
+            ("settings.rs", include_str!("settings.rs")),
+        ] {
+            assert_eq!(
+                src.matches(fragment).count(),
+                0,
+                "{name} 里又抄了一份回满语句。改调 crate::auth::quota_refresh_sql()——\
+                 四份副本各自漂移正是这条测试要挡的那个 bug",
+            );
+        }
+
+        // WHERE 闸本身。没有它，这条语句在绝大多数调用上都是空写，而 Postgres 照样写
+        // 新元组 + WAL：线上 171 行的 users 表因此累计了 64.7 万次更新、9,244 次自动
+        // ANALYZE，以及 22GB WAL 里约 20GB 的整页镜像。
+        let sql = super::quota_refresh_sql();
+        let where_pos = sql.find("WHERE id = $1").expect("必须按 id 定位");
+        let guard = &sql[where_pos..];
+        assert!(
+            guard.contains("quota_window_reset_at <= now()")
+                && guard.contains("quota_week_reset_at <= now()"),
+            "WHERE 闸被拿掉或只剩一半了：两个到期条件都要在，否则要么退化成每次空写、\
+             要么该刷的那一半刷不到。当前语句尾部：{guard}",
         );
     }
 }

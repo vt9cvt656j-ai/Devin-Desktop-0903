@@ -1,5 +1,4 @@
 use axum::body::Body;
-use crate::auth::QUOTA_WINDOW_REFRESH;
 use axum::extract::{Multipart, Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -136,6 +135,52 @@ const MIN_TRUSTED_ABSOLUTE_REMAINING: Duration = Duration::from_secs(30);
 /// 就是钉这件事的。
 fn route_budget_for(_deep_thinking: bool) -> Duration {
     ROUTE_BUDGET
+}
+
+/// 一条**还没试过**的线路至少要拿到这么多表头等待时间，否则不如不发。
+///
+/// ROUTE_BUDGET 是整轮共用的一份，不是每条线路各一份。允许换线的唯一情形是前一条线路
+/// 完整地回了一个错误响应 —— 而它可以拖到第 56.5 秒才回完。下一条线路于是拿到几百毫秒的
+/// `remaining`：`remaining.is_zero()` 那道闸只拦"刚好走完"，几百毫秒是拦不住的，
+/// `header_wait = remaining.min(...)` 就把一条健康线路塞进一个必然超时的窗口。
+///
+/// 超时之后它被当成上游卡死处理：mark_route_stall 把它降级并压到 25 秒短探测 120 秒、
+/// spawn_fail 给它记一次故障（喂给 route_health 的 classify 和告警）、spawn_stall_recovery
+/// 还要花运营方的钱去探一条根本没坏的线路。route_health 的全部前提是"记录真实流量的结果"，
+/// 而这条记录是网关自己造出来的假红。
+///
+/// **这道闸确实会关掉一部分本来能成功的请求。** 审计把这一条记成「请求反正都已经没救了」，
+/// 那句话是错的：`tokio::time::timeout` 只裹住 `send()`，它约束的仅仅是表头阶段（见发送处
+/// 那段注释），route_deadline 之后就不再管流式响应体 —— 一条在这几百毫秒里把表头交回来的
+/// 线路，原本会完整地流完一个成功回答。所以这里是拿一份小概率的成功去换三件确定的事：
+/// ① 不给一条没试过的健康线路记假故障；② 不花运营方的钱去探一条没坏的线路；
+/// ③ 客户端拿到的是前一条线路那个**真实的**上游错误，而不是被超时分支覆盖掉 ——
+/// `err_low` 会被写成 `upstream sent no response headers within {N}s`，而 `header_wait` 只剩
+/// 几百毫秒时那个 `as_secs()` 就是 **0**：一句「0 秒内没回表头」既没意义，又把真正的失败
+/// 原因盖住了。
+///
+/// 3 这个数字本身没有严格依据。实测表头延迟是 p50 9.4s、p90 21.7s（2026-08-19，786 个成功
+/// 样本），3 秒远在 p50 左侧；但那是**全部**表头延迟的分布，它算不出「3 秒以内能交回表头」
+/// 的概率有多大 —— 先前这段注释拿它当"概率极小"的证据，那一步不成立。仍然取 3 秒（而不是
+/// 审计建议的 2 秒），理由只是失败方向：猜大了，用户失掉一次小概率的成功、换到一句真话；
+/// 猜小了，是一条假红加一句假话，而且那一次照样失败。哪天有了按「剩余窗口 < 3s」切出来的
+/// 条件分布，这个数应该重算。
+///
+/// 注意这个地板只对「已经发过一次」的轮次生效，见调用处的注释。
+const MIN_VIABLE_HEADER_WAIT: Duration = Duration::from_secs(3);
+
+/// 这个剩余预算还值不值得再发一次。
+///
+/// `already_sent` = 这一轮已经向某条线路发过请求（`attempted_sends > 0`）。第一次发送
+/// **无条件**尝试，只受 `is_zero` 约束：客户端可以用 `x-ide-response-budget-ms` 给一个很小
+/// 的预算，那时整份 route_budget 本来就小于地板，拿地板拦住第一发等于让那台机器什么都发不
+/// 出去 —— 那正是 `route_budget_with_client_patience` 上面记着的「预算恒为零」事故的形状，
+/// 不能用一道保护把它换个方式再犯一次。
+fn route_send_window_is_viable(remaining: Duration, already_sent: bool) -> bool {
+    if remaining.is_zero() {
+        return false;
+    }
+    !already_sent || remaining >= MIN_VIABLE_HEADER_WAIT
 }
 
 fn unix_time_ms() -> u64 {
@@ -362,40 +407,133 @@ fn telemetry_output_config_effort(body: &serde_json::Value) -> &'static str {
     }
 }
 
-const ANTHROPIC_CONTEXT_1M_BETA: &str = "context-1m-2025-08-07";
-const ANTHROPIC_INTERLEAVED_THINKING_BETA: &str = "interleaved-thinking-2025-05-14";
-const ANTHROPIC_EFFORT_BETA: &str = "effort-2025-11-24";
+/// 和 Claude Code v2.1.153 (SDK 0.94.0) 完全一致的 `anthropic-beta` 头。
+///
+/// Claude Code 对第三方中转商 (`bz8()=false`) 只发 `Tv9` 里的 8 个 beta（`zv9` 过滤），
+/// 对 Anthropic 直连 (`firstParty`/`anthropicAws`/`foundry`) 才发全部。多余的 beta 会让
+/// 某些中转商直接 503。
+///
+/// 全量头——直连 Anthropic 时用。
+const ANTHROPIC_BETA_HEADER_FIRST_PARTY: &str = "\
+claude-code-20250219,\
+interleaved-thinking-2025-05-14,\
+context-management-2025-06-27,\
+structured-outputs-2025-12-15,\
+web-search-2025-03-05,\
+advanced-tool-use-2025-11-20,\
+tool-search-tool-2025-10-19,\
+effort-2025-11-24,\
+task-budgets-2026-03-13,\
+prompt-caching-scope-2026-01-05,\
+extended-cache-ttl-2025-04-11,\
+fast-mode-2026-02-01,\
+thinking-token-count-2026-05-13,\
+afk-mode-2026-01-31,\
+advisor-tool-2026-03-01,\
+cache-diagnosis-2026-04-07,\
+context-hint-2026-04-09,\
+files-api-2025-04-14,\
+mcp-servers-2025-12-04,\
+environments-2025-11-01,\
+oauth-2025-04-20,\
+ccr-byoc-2025-07-29,\
+mid-conversation-system-2026-04-07";
 
-/// Build the single Anthropic capability header sent to native `/v1/messages` routes.
+/// 精简头——走中转商时用（Claude Code 的 `Tv9` 集合）。
+const ANTHROPIC_BETA_HEADER_THIRD_PARTY: &str = "\
+claude-code-20250219,\
+interleaved-thinking-2025-05-14,\
+context-management-2025-06-27,\
+structured-outputs-2025-12-15,\
+web-search-2025-03-05,\
+effort-2025-11-24,\
+tool-search-tool-2025-10-19";
+
+/// `context-1m` 单独拎出来，不写进上面两个集合。
 ///
-/// Sub2API treats this as a comma-separated capability set. Sending `context-1m` in a
-/// standalone header used to omit the two capabilities its API-key path needs in order
-/// to preserve adaptive/interleaved thinking and `output_config.effort`. Never include
-/// `redact-thinking`: that capability intentionally removes visible thinking text.
-/// 不带 `context-1m` 时上游实际允许的输入上限。
+/// **为什么这一项和别的 beta 不一样**：其它 beta 是「这条线路认不认这个能力」，是一次性的
+/// 静态事实；而 1M 是「**这一次请求**要不要一条更大的窗口」，是逐请求的。把它焊进常量，
+/// 等于把一个逐请求的判断做成了全局常量 —— 两件事本来正交，只是之前拼头和判体积挤在同一
+/// 个函数里，看着像互斥。
 ///
-/// **不从目录取。** 目录（`official_contexts`）描述的是 Anthropic 自己的行为——它对
-/// Opus 4.6+/Sonnet 4.6+/Fable 原生就给 1M，所以那边的条目是「1M，不需要 beta」。而中转商
-/// 把 1M 挡在和 Sonnet 4/4.5 同一个 beta 后面（实测原文：`400 {"error":"1m context is
-/// fully available; please enable 1m context and retry"}`）。也就是说：不发这个 flag 时，
-/// 我们实际能用的是 Anthropic 的经典窗口，不是目录上那个数。
-const ANTHROPIC_CONTEXT_WITHOUT_1M_BETA_TOKENS: usize = 200_000;
+/// 判据只看**正文字节数**，刻意不再问模型目录（这是上一版真实存在的静默失效路径：
+/// `official_contexts` 在目录 miss 时返回空 → 判定「这个模型不支持 1M」→ 再大的请求也不发
+/// → 中转商回一个硬 400，而 400 不做故障转移，整轮对话直接失败）。字节数是自证的，
+/// 不依赖任何外部数据。
+const ANTHROPIC_CONTEXT_1M_BETA: &str = "context-1m-2025-08-07";
 
 /// 触发 `context-1m` 的正文字节阈值。
 ///
 /// 任何 BPE 分词器在 UTF-8 上都满足 **token 数 ≤ 字符数 ≤ 字节数**，所以「正文字节数 < N」
-/// 可以*证明* token 数 < N —— 是硬上界，不是经验估计。取 150k 而不是 200k，是给工具
-/// schema、系统提示词模板这类不在正文字符串里、但会进 token 账的部分留 25% 余量。
+/// 可以*证明* token 数 < N —— 是硬上界，不是经验估计。取 150k 而不是 200k（不带 beta 时
+/// 上游实际给的窗口），是给工具 schema、系统提示词模板这类不在正文字符串里、但会进 token
+/// 账的部分留 25% 余量。
 ///
-/// 方向是刻意选的：多发一次这个 flag 只是回到改动前的行为，而少发一次会换来一个硬 400
-/// （而且 400 不会 failover），所以一切模糊地带都往「发」的方向倒。图片正是这样一个
-/// 模糊地带——base64 字节巨大、token 很少，于是它天然把我们推向多发，正合适。
+/// 方向是刻意选的，两个失败方向不对等：多发一次这个 flag，对 4.6+ 的模型按官方文档是
+/// **标准价、无额外费用**；而少发一次会换来一个硬 400，且 400 不 failover。所以一切模糊
+/// 地带都往「发」的方向倒。图片正是这样一个模糊地带 —— base64 字节巨大、token 很少，
+/// 于是它天然把我们推向多发，正合适。
 const ANTHROPIC_1M_BETA_TEXT_BYTES: usize = 150_000;
 
-/// 请求体里所有字符串内容的字节数之和。
+/// 不带 `context-1m` 时上游实际允许的输入上限。阈值必须严格小于它，否则存在漏发区间。
+const ANTHROPIC_CONTEXT_WITHOUT_1M_BETA_TOKENS: usize = 200_000;
+
+/// 这一次请求要不要追加 `context-1m`。
+fn wants_1m_context(upstream_body: &serde_json::Value) -> bool {
+    debug_assert!(ANTHROPIC_1M_BETA_TEXT_BYTES < ANTHROPIC_CONTEXT_WITHOUT_1M_BETA_TOKENS);
+    body_text_bytes(upstream_body) >= ANTHROPIC_1M_BETA_TEXT_BYTES
+}
+
+/// 这条线路该拿哪一份基础 beta 集合。
 ///
-/// 只数字符串值：JSON 的键名和结构字符不进模型，不该算进 token 账。深度由 serde_json
-/// 解析时的递归上限兜住（默认 128 层），所以这里的递归是有界的。
+/// 判据从 `base_url.contains("api.anthropic.com")` 换成**解析 URL 取 host 后小写全等**。
+/// 裸子串匹配两个方向都能错，而且错了在日志里看不见：
+///   · `https://gw.example.com/proxy/api.anthropic.com/v1` —— 中转商被误判成直连，
+///     按这份代码自己的注释，多余的 beta 会让某些中转商直接 503；
+///   · `https://API.anthropic.com/v1` —— 主机名在 URL/DNS 里本就大小写无关，
+///     大写写法会被漏判成中转商，静默少发一批能力。
+/// base_url 落库只做了 trim + 去尾斜杠（见 admin 那两处），没有任何归一，所以它是一段
+/// 管理员任填的字符串，不能当结构化数据用。
+fn anthropic_is_first_party(base_url: &str) -> bool {
+    let raw = base_url.trim();
+    let with_scheme = if raw.contains("://") {
+        raw.to_string()
+    } else {
+        format!("https://{raw}")
+    };
+    reqwest::Url::parse(&with_scheme)
+        .ok()
+        .and_then(|u| u.host_str().map(|h| h.to_ascii_lowercase()))
+        .is_some_and(|h| h == "api.anthropic.com")
+}
+
+/// 出站 `anthropic-beta` 的最终取值：基础集合 + 这一次要不要 1M。
+///
+/// 返回 `String` 而不是 `Option`：基础集合永远非空，所以这个头恒发。
+fn anthropic_beta_header(first_party: bool, wants_1m: bool) -> String {
+    let base = if first_party {
+        ANTHROPIC_BETA_HEADER_FIRST_PARTY
+    } else {
+        ANTHROPIC_BETA_HEADER_THIRD_PARTY
+    };
+    if wants_1m {
+        format!("{base},{ANTHROPIC_CONTEXT_1M_BETA}")
+    } else {
+        base.to_string()
+    }
+}
+
+const ANTHROPIC_SDK_VERSION: &str = "0.94.0";
+const ANTHROPIC_SDK_USER_AGENT: &str = "anthropic-sdk-typescript/0.94.0";
+
+/// Codex 官方客户端头——走 OpenAI 协议时模拟 Codex desktop (0.148.0)。
+/// Codex 是 Rust 二进制，不走 Stainless SDK，发的是自己的 x-codex-* 系列头。
+const CODEX_VERSION: &str = "0.148.0";
+const CODEX_USER_AGENT: &str = "codex/0.148.0";
+const CODEX_OPENAI_BETA: &str = "responses_websockets=2026-02-06";
+/// 固定安装 ID——Codex 按安装生成一次，不变。
+const CODEX_INSTALLATION_ID: &str = "a1b2c3d4-e5f6-7890-abcd-ef1234567890";
+
 fn body_text_bytes(value: &serde_json::Value) -> usize {
     match value {
         serde_json::Value::String(text) => text.len(),
@@ -403,36 +541,6 @@ fn body_text_bytes(value: &serde_json::Value) -> usize {
         serde_json::Value::Object(fields) => fields.values().map(body_text_bytes).sum(),
         _ => 0,
     }
-}
-
-/// 这一次请求要不要发 `context-1m`。
-///
-/// 以前的判据只有「这个模型支不支持 1M」，于是**每一个** Claude 请求都带着它——包括一个
-/// 354 token 的请求。实测（近 7 天 11,990 次 Claude 调用）真正超过 20 万 token 的只有 93 次，
-/// 占 0.78%：另外 99.2% 都在把一个溢价通道标记发给一个用不上它的请求。
-///
-/// 现在加一道体积判据：模型支持 1M **且** 这一次的正文大到可能超出标准窗口，才发。
-fn wants_1m_context(model_id: &str, upstream_body: &serde_json::Value) -> bool {
-    let model_supports_1m = official_contexts(model_id)
-        .iter()
-        .any(|(tokens, _)| *tokens >= 1_000_000);
-    if !model_supports_1m {
-        return false;
-    }
-    debug_assert!(ANTHROPIC_1M_BETA_TEXT_BYTES < ANTHROPIC_CONTEXT_WITHOUT_1M_BETA_TOKENS);
-    body_text_bytes(upstream_body) >= ANTHROPIC_1M_BETA_TEXT_BYTES
-}
-
-fn anthropic_beta_header(body: &serde_json::Value, wants_1m: bool) -> Option<String> {
-    let mut betas = Vec::with_capacity(3);
-    if wants_1m {
-        betas.push(ANTHROPIC_CONTEXT_1M_BETA);
-    }
-    if body.pointer("/thinking/type").and_then(|value| value.as_str()) == Some("adaptive") {
-        betas.push(ANTHROPIC_INTERLEAVED_THINKING_BETA);
-        betas.push(ANTHROPIC_EFFORT_BETA);
-    }
-    (!betas.is_empty()).then(|| betas.join(","))
 }
 
 /// Collapse an untrusted native event type into a fixed telemetry enum.
@@ -1337,6 +1445,29 @@ fn effective_billing_micro(model: &Model, model_id: &str) -> (String, i64, bool,
     (m, c, f, micro)
 }
 
+/// 这次调用要不要先看余额（非免费模型的准入前置）。
+///
+/// **前两个参数必须是 `effective_billing_micro` 解析出来的结果，不是连接列。** 这条判据
+/// 原来直接读 `model.billing_mode` / `model.per_call_cents`，而单模型覆盖能把一条
+/// billing_mode="rate"、三个价格列全 0 的连接上的某个模型定成 per_call 收费：连接列看过去
+/// 全是 0 → 判成免费 → 余额门整个跳过，然后结算按覆盖真扣钱。判「要不要钱」和「扣多少钱」
+/// 必须走同一条解析，否则这两个答案迟早会分家。
+///
+/// 倍率/输入价/输出价仍然读连接列：按量计费下它们本来就是连接级的量，单模型价格覆盖
+/// （model_prices）只在这三者之上再改单价，不会把一个收费模型变成免费模型。
+fn paid_model_requires_balance(
+    eff_mode: &str,
+    eff_per_call_cents: i64,
+    rate: f64,
+    input_price: f64,
+    output_price: f64,
+) -> bool {
+    (eff_mode == "per_call" && eff_per_call_cents > 0)
+        || rate > 0.0
+        || input_price > 0.0
+        || output_price > 0.0
+}
+
 fn effective_billing_inner(model: &Model, model_id: &str) -> (String, i64, bool) {
     let ov = model.model_billing.get(model_id);
     let mode = ov
@@ -2233,9 +2364,18 @@ pub async fn admin_model_estimate(
         "cache_read_input_tokens": req.cache_read_tokens,
         "cache_creation_input_tokens": req.cache_creation_tokens,
     });
+    // 计费**模式**和单次固定费也必须按单模型解析，不能读连接列。
+    //
+    // 上面那条阶梯只把 token 单价统一了（effective_token_prices / effective_cache_prices）；
+    // 模式和 per_call 这里原来直接取 model.billing_mode / model.per_call_cents，而真实扣费
+    // （chat、chat_completions、responses）走的是 effective_billing_micro，认单模型覆盖。
+    // 于是一个「连接默认 rate、这个模型覆盖成 per_call 200 分」的模型，推算器按 token 算出
+    // 50 分，线上真收 200 分 —— 运营方看到的毛利、盈亏平衡点、定价决策全建在错的那个数上。
+    // 只影响后台这一张预估表，不产生任何用户侧扣费。
+    let (eff_mode, eff_percall, _eff_free, _eff_micro) = effective_billing_micro(&model, model_id);
     let billed_cents_per_call = resolve_cost(
-        &model.billing_mode,
-        model.per_call_cents,
+        &eff_mode,
+        eff_percall,
         Some(&usage),
         model_id,
         route_rate,
@@ -2922,6 +3062,22 @@ pub async fn list_for_client(State(state): State<AppState>) -> ApiResult<Json<se
                 } else {
                     "unknown"
                 },
+                // 这个模型看不看得懂图片。三态，缺一不可：
+                //   true  = 目录说它吃图 → 客户端照常发 image_url 块
+                //   false = 目录说它只吃文本 → 客户端不要把截图塞进历史
+                //   null  = 目录里没这一款（中转商私有命名）→ 客户端保持自己的内置判断
+                //
+                // 加这个字段是因为客户端在猜，而且猜的方向是危险的那一边：_modelSeesImages
+                // 的正则默认返回 true，只排掉 deepseek-chat/coder/r1/v2/v3 这些老名字，
+                // 认不出 deepseek-v4-pro 和 glm-5.x —— 而目录里这两个的 input_modalities
+                // 都只有 ["text"]。2026-08-22 实测后果：glm 直接 400（"messages.content.type
+                // 参数非法，取值范围 ['text']"，六小时 9 次，按设计不做故障转移，这一轮就废了），
+                // deepseek 不报错但默默丢掉，代价是每步重传几兆 base64 —— 实测每 token 摊到
+                // 25 字节，而 Claude 那边是 3.1 字节。
+                //
+                // admin_available 早就在下发同一个字段（管理台看得到），只有面向客户端的
+                // 这一条漏了，所以客户端只能靠正则猜。
+                "accepts_image": crate::model_catalog::accepts_image(&mid),
             }));
         }
     }
@@ -2966,66 +3122,6 @@ pub async fn chat(
     // Which pool pays decides which balance to gate on. A free-flagged model must NOT be
     // blocked by an empty wallet — that is the whole point — but it must still be blocked by
     // an empty points pool, or "free" would silently become unlimited.
-    let _pre_mid = body
-        .get("model")
-        .and_then(|v| v.as_str())
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(String::from)
-        .unwrap_or_else(|| model.model_id.clone().unwrap_or_default());
-    let (_pre_mode, _pre_percall, pre_free, _pre_micro) = effective_billing_micro(&model, &_pre_mid);
-    // 这条路由此前**用订阅额度放行、却用钱包结算**：admit_billing 收到 quota_ok=true 就放行，
-    // 而下面 bill(..., use_quota=false, ...) 只扣钱包。只有会员额度、钱包是 0 的用户，
-    // 每一次调用都在把钱包记成负数——声明里的"扣订阅额度"在这条路由上从没发生过。
-    let mut use_quota = false;
-    if pre_free {
-        // 免费池空了不再直接拒绝：改用会员额度/钱包继续。这道门要和另外两个准入口
-        // 同一条规则，否则又会出现"同一个免费模型，从这个接口能用、从那个接口说没额度"。
-        //
-        // 判据必须是"这一次付得起吗"，不是"还剩不剩一点"：结算全额扣或一点不扣，
-        // 余数永远清不空，`<= 0` 当天就再也为真不了（和另外两个入口同一个坑）。
-        if !free_pool_covers_call(free_points_balance(&state, uid).await, _pre_micro) {
-            let (plan, plan_exp, q_total, q_window, q_weekly_cap, q_week_used, credits): (
-                String, Option<chrono::DateTime<chrono::Utc>>, i64, i64, i64, i64, i64,
-            ) = sqlx::query_as(
-                "SELECT plan, plan_expires_at, quota_total_cents, quota_window_cents, \
-                        quota_weekly_cap_cents, quota_week_used_cents, credits_cents \
-                 FROM users WHERE id = $1",
-            )
-            .bind(uid)
-            .fetch_one(&state.db)
-            .await?;
-            let plan_active = plan != "none" && plan_exp.is_none_or(|e| e > chrono::Utc::now());
-            let quota_ok = plan_active
-                && q_total > 0
-                && q_window > 0
-                && (q_weekly_cap == 0 || q_week_used < q_weekly_cap);
-            admit_billing(
-                free_fallback_to_paid(), true, false, quota_ok, credits,
-                plan_active, q_total, q_window, q_weekly_cap, q_week_used,
-            )?;
-            // 放行靠的是哪个池子，结算就得扣哪个。
-            use_quota = quota_ok;
-        }
-    } else {
-        let not_free = model.rate > 0.0
-            || model.input_price > 0.0
-            || model.output_price > 0.0
-            || (model.billing_mode == "per_call" && model.per_call_cents > 0);
-        if not_free {
-            let bal: i64 = sqlx::query_scalar("SELECT credits_cents FROM users WHERE id = $1")
-                .bind(uid)
-                .fetch_one(&state.db)
-                .await?;
-            if bal <= 0 {
-                return Err(AppError {
-                    status: axum::http::StatusCode::PAYMENT_REQUIRED,
-                    msg: "额度不足，请充值".into(),
-                });
-            }
-        }
-    }
-
     // forward to the provider (OpenAI-compatible /chat/completions)
     if !body.is_object() {
         return Err(AppError::bad("请求体需为 JSON 对象"));
@@ -3041,6 +3137,84 @@ pub async fn chat(
         return Err(AppError::bad("该连接未开放任何模型，请在后台编辑勾选"));
     }
     body["model"] = json!(chosen);
+
+    // 门和结算必须问**同一个** model id。
+    //
+    // 上面这段解析原本在余额门**后面**，门那边自己另算了一份（body["model"]，取不到就回落
+    // model.model_id）。两份规则不一样：结算这份只认 allowed_ids 里的名字，否则回落
+    // allowed.first()，而 allowed_ids 在 enabled_models 非空时压根不看 model_id。于是
+    // 只要请求体不带 model（或带一个没勾选的名字），门看的是 A、结算扣的是 B ——
+    // 「按模型覆盖」的定价挂在 B 上时，门按 A 判成免费放行，结算按 B 收 50 分，
+    // 零余额账号照样被扣成负数。也就是刚修掉的那个洞换了一种触发方式回来了。
+    let (_pre_mode, _pre_percall, pre_free, _pre_micro) = effective_billing_micro(&model, &chosen);
+    // 30 分钟窗口的补充 / 周计数器的清零，和另外三个入口同一句（见 auth::quota_refresh_sql）。
+    // 这条路由此前压根不刷新就去读配额：一个窗口早该刷新、但当天还没走过 /api/me 或
+    // chat_completions 的会员，在这里读到的 quota_window_cents 还是上一个窗口用完时的 0，
+    // 于是 quota_ok 假、下面按"没有会员额度"处理——他不是没额度，是这条路由没让他刷新。
+    sqlx::query(&crate::auth::quota_refresh_sql())
+        .bind(uid)
+        .execute(&state.db)
+        .await?;
+    // 这条路由此前**用订阅额度放行、却用钱包结算**：admit_billing 收到 quota_ok=true 就放行，
+    // 而下面 bill(..., use_quota=false, ...) 只扣钱包。只有会员额度、钱包是 0 的用户，
+    // 每一次调用都在把钱包记成负数——声明里的"扣订阅额度"在这条路由上从没发生过。
+    let mut use_quota = false;
+    if pre_free {
+        // 免费池空了不再直接拒绝：改用会员额度/钱包继续。这道门要和另外两个准入口
+        // 同一条规则，否则又会出现"同一个免费模型，从这个接口能用、从那个接口说没额度"。
+        //
+        // 判据必须是"这一次付得起吗"，不是"还剩不剩一点"：结算全额扣或一点不扣，
+        // 余数永远清不空，`<= 0` 当天就再也为真不了（和另外两个入口同一个坑）。
+        if !free_pool_covers_call(free_points_balance(&state, uid).await, _pre_micro) {
+            let BillingState {
+                plan_active, q_total, q_window, q_weekly_cap, q_week_used, credits, quota_ok, ..
+            } = read_billing_state(&state, uid).await?;
+            admit_billing(
+                free_fallback_to_paid(), true, false, quota_ok, credits,
+                plan_active, q_total, q_window, q_weekly_cap, q_week_used,
+            )?;
+            // 放行靠的是哪个池子，结算就得扣哪个。
+            use_quota = quota_ok;
+        }
+    } else {
+        // 「这个模型收不收钱」必须用**结算用的那份解析**来判，不能读连接级的原始列。
+        //
+        // 单模型覆盖 model_billing[mid] = {"mode":"per_call","per_call_cents":50} 可以在一条
+        // billing_mode="rate"、rate/输入价/输出价三列全 0 的连接上把某个模型定成收费的。
+        // 老写法只看那四个连接列，于是 not_free 全假、整道余额门被跳过；而下面结算走的是
+        // effective_billing_micro（认这份覆盖），实收 50 分。结果是一个零余额零套餐的账号
+        // 被放行一次、credits_cents 直接扣成负数。门和结算问的必须是同一个函数。
+        let not_free = paid_model_requires_balance(
+            &_pre_mode,
+            _pre_percall,
+            model.rate,
+            model.input_price,
+            model.output_price,
+        );
+        if not_free {
+            // 这条路由此前只读 credits_cents，后果有两个方向，都是真的：
+            //   · 套餐有效、钱包 0 的会员在这里吃 402「额度不足，请充值」，而同一个人、
+            //     同一个模型走 /v1/chat/completions 是放行的 —— 同一份配置两个答案。
+            //   · 钱包里有钱的会员被放行，但 use_quota 始终是 false，bill() 全额扣钱包，
+            //     他买的那份订阅额度一分没动 —— 等于为套餐内的用量再付一次现金。
+            // 现在和另外三个入口同一条规则：quota_ok || credits > 0 才放行，且**靠哪个池子
+            // 放行，结算就扣哪个**。admit_billing 的返回值这里用不上：free_here 传 false，
+            // 它只可能返回 false（走付费池）。
+            //
+            // 外部行为变化：钱不够时的文案从固定的「额度不足，请充值」换成 admit_billing 那
+            // 四句（总额度已用完 / 本时段额度已用完 / 本周额度已用完 / 请先开通会员或充值
+            // 额度）。这正是要的：原来那句会把「本时段用完，等 30 分钟就好」的会员骗去充值。
+            let BillingState {
+                plan_active, q_total, q_window, q_weekly_cap, q_week_used, credits, quota_ok, ..
+            } = read_billing_state(&state, uid).await?;
+            admit_billing(
+                free_fallback_to_paid(), false, false, quota_ok, credits,
+                plan_active, q_total, q_window, q_weekly_cap, q_week_used,
+            )?;
+            // 放行靠的是哪个池子，结算就得扣哪个。
+            use_quota = quota_ok;
+        }
+    }
 
     // Weak-vision models (deepseek/minimax/glm/…) can't read images well. If the
     // request has images and the chosen model isn't vision-native, let gpt-5.5
@@ -4989,21 +5163,66 @@ fn split_fused_charge(
     let overflow = requested.saturating_sub(quota_cents);
     // 超出配额的部分怎么落，取决于这是**谁**的超支：
     //
-    // · 按量付费（use_quota=false，或套餐配额本来就是 0）：全额记为债务，允许 credits
-    //   为负。此前这里被 `.min(credits.max(0))` 钳住，等于用户超支的那部分直接免单
-    //   —— 门禁只看余额是否为正、结算又发生在上游调用之后，所以每一次超支都被静默
-    //   写掉，而运营方照付上游。记成债务不会多收他没花的钱，还能让 `credits <= 0`
-    //   的门禁挡住下一次请求，充值时自动净额抵扣。
+    // · 按量付费（use_quota=false）：全额记为债务，允许 credits 为负。此前这里被
+    //   `.min(credits.max(0))` 钳住，等于用户超支的那部分直接免单 —— 门禁只看余额是否
+    //   为正、结算又发生在上游调用之后，所以每一次超支都被静默写掉，而运营方照付上游。
+    //   记成债务不会多收他没花的钱，还能让 `credits <= 0` 的门禁挡住下一次请求，充值
+    //   时自动净额抵扣。
     //
-    // · 纯订阅（本轮确实动用了套餐配额）：**不制造钱包债务**。固定价套餐的用户每个
-    //   配额窗口末尾都会有一次请求超出剩余配额，全额落到钱包的话，他每个窗口都在
-    //   为套餐内的正常使用累积负债 —— 那是他买套餐时就付过的钱。这一小段由运营方
-    //   吸收，且天然被"单次请求"的规模限制住。
-    let wallet_cents = if use_quota && quota_cents > 0 {
+    // · 订阅（use_quota=true，即这一次是**靠套餐额度放行**的）：**不制造钱包债务**。
+    //   固定价套餐的用户每个配额窗口末尾都会有一次请求超出剩余配额，全额落到钱包的话，
+    //   他每个窗口都在为套餐内的正常使用累积负债 —— 那是他买套餐时就付过的钱。这一小段
+    //   由运营方吸收。
+    //
+    //   **这笔钱有多大，别用"在途上限"糊过去。** 在途上限（MAX_INFLIGHT_PER_USER = 8）
+    //   限的是"同一时刻"，不是"一天累计"：配额窗口每 30 分钟回满一次 → 每天 48 个窗口，
+    //   每个窗口的尾巴上同一个用户都可以再压 8 笔并发上来，每一笔的成本只受
+    //   `compute_cost` 的 COST_CEILING_CENTS（5000 分 = $50/次）封顶。也就是说单个订阅用户
+    //   一天的理论吸收上限是 8 × 48 × $50 ≈ $19,200，而不是"一次请求那么多"。这是**上限**
+    //   不是预期值（要触发得让配额恰好归零、钱包也恰好 ≤ 0），但它没有自限：被吸收的这
+    //   一笔 quota_cents 是 0，连总额度都不消耗，所以吸收本身不会让下一次更难触发。修复前
+    //   这些钱至少还会变成钱包负债——一道很弱的刹车，可它是一条**记录**；现在它一分不留。
+    //
+    //   ⚠️ **待运营方拍板**：这块支出到底吃掉多少、要不要给它加一道每用户每日吸收上限，
+    //   是运营决策，不是这一层能定的。先按"失败向用户这一侧倒"落地（不给用户记债），
+    //   并在下面把每一次吸收打进日志，让运营方先能测出真实规模再决定要不要加帽子。
+    //
+    // 判据是「**靠哪个池子放行的**」，不是「这一轮实际扣到了多少配额」。原来写的是
+    // `use_quota && quota_cents > 0`，而 quota_cents 完全可以合法地算成 0：准入门读配额
+    // **不加锁**，结算才 FOR UPDATE 重读。同一个用户两笔并发，第一笔把周上限（或时段、
+    // 总额）恰好压到 0，第二笔结算时 quota_available=0 → quota_cents=0 → 掉进按量付费那
+    // 一支，把全额记成钱包债务。那个用户钱包本来就是 0，于是他为套餐内的用量背上了负债
+    // —— 正是这段注释和 `subscription_quota_overshoot_does_not_create_wallet_debt` 存在的
+    // 理由被绕过去了。只看 use_quota 之后，按量付费的债务一分不少（下面另有测试钉着），
+    // 而订阅放行的调用在任何配额边界上都不会把 credits 扣成负数。
+    let wallet_cents = if use_quota {
         overflow.min(credits.max(0))
     } else {
         overflow
     };
+    // 被运营方吸收掉的那一部分要留一行 —— 上面那条「待运营方拍板」要能拍，得先量得出来。
+    //
+    // 上面那条「订阅放行就不制造钱包债务」是有意的，但它有个静默的副作用：配额和钱包同时
+    // 为 0 时这一次调用结算成 **0 分**，`model_usage.cost_cents` 记 0、余额语句被跳过，
+    // 而上游那笔钱运营方是真付了的。不记一笔的话，这块支出在任何报表里都不存在——既不在
+    // 计费流水里，也不在告警里，只能从上游账单和本地流水的差额倒推。
+    // 这里只记录、不改变金额：要不要把它转成债务是产品决策，不是这一层能定的。
+    //
+    // 口径要说清楚，免得拿这条日志当全量账：它只打**这次修复新吸收进来的那一类**
+    // ——配额和钱包同时为 0、整笔归零。配额还剩一点点（quota_cents > 0）、钱包为 0 的
+    // 那种"窗口尾巴上超出的零头"，修复前就已经是运营方吸收，这里不打，所以这条日志
+    // 是吸收总额的**下界**。要算全量得拿 model_usage.cost_cents 和上游账单对差。
+    if use_quota && requested_cost > 0 && quota_cents == 0 && wallet_cents == 0 {
+        tracing::warn!(
+            requested_cost,
+            quota_total,
+            quota_window,
+            quota_weekly_cap,
+            quota_week_used,
+            credits,
+            "订阅放行但配额与钱包同时为 0：这一次的成本由运营方吸收，未向用户计费"
+        );
+    }
     FusedCharge {
         quota_cents,
         wallet_cents,
@@ -5250,6 +5469,77 @@ pub fn carry_to_cents(carry: i64, add_micro_usd: i64) -> (i64, i64) {
     (total / MICRO_USD_PER_CENT, total % MICRO_USD_PER_CENT)
 }
 
+/// 一次准入判定要用的全部账户状态，外加由它算出的「会员额度这条路走不走得通」。
+///
+/// 这段 SELECT + 派生此前在五处逐字重复：chat 的免费分支和付费分支各一份，
+/// chat_completions、responses_proxy、image_generations 各一份。billing-core-1 那一轮只把
+/// **准入动作**收拢进 `admit_billing`，判据本身仍是五份 —— 而五份手抄的同一条规则正是
+/// auth.rs 的 `quota_refresh_statement_has_exactly_one_home_and_keeps_its_guard` 在防的形状：
+/// 回满语句抄了四份，改的时候中三漏一，漏掉的那个入口就变成「同一份后台配置、两个答案」。
+/// 周上限（`quota_weekly_cap_cents`）那一条本身就是这么落地的：它当初只补进了一部分副本。
+///
+/// 这里**不**做 30 分钟窗口的回满，理由是「谁需要读账户状态」和「谁需要回满」不是同一批人。
+///
+/// chat 在分支之前就无条件跑了一次 `crate::auth::quota_refresh_sql()`，两个分支共用；而
+/// 「免费池够付」那一支**根本不调这个 helper**。所以把回满搬进来的后果不是多刷一次，
+/// 而是那一支的 30 分钟窗口回满就此消失（要么就两处都留着，让回退分支刷两遍）。
+/// 读和刷分开，行为与拆分前逐字一致。
+///
+/// 同理也别把这个 helper 上提到 chat 开头「顺手统一」：免费池够付那条路本来一次账户状态都
+/// 不用读，提上去等于给它凭空加一次数据库往返。
+///
+/// `require_paid_access`（第三方素材生成那道门）另有一份更窄的判据：只看总额度和时段额度，
+/// 没有周上限。那是**不同的边界**，并进来等于顺手改产品行为，故意留在外面。
+struct BillingState {
+    /// 原始 plan 字符串。压缩档位（`max_tier_for_plan`）和日志按它取，判定本身只用
+    /// `plan_active` —— 过期套餐的 plan 仍然是 "power"，直接拿字符串判会把过期会员放进来。
+    plan: String,
+    plan_active: bool,
+    q_total: i64,
+    q_window: i64,
+    q_weekly_cap: i64,
+    q_week_used: i64,
+    credits: i64,
+    /// 会员额度这次能不能付：套餐有效，且总额度、时段额度、周上限三道都还有余量。
+    quota_ok: bool,
+}
+
+/// 读一次账户计费状态。调用前请确保 `crate::auth::quota_refresh_sql()` 已经跑过，
+/// 否则读到的 `quota_window_cents` 可能还是上个窗口用完时的 0（chat 曾经就漏了这一步，
+/// 窗口早该续上的会员在那条路由上被判成没有额度）。
+async fn read_billing_state(state: &AppState, uid: uuid::Uuid) -> Result<BillingState, AppError> {
+    let (plan, plan_exp, q_total, q_window, q_weekly_cap, q_week_used, credits): (
+        String,
+        Option<chrono::DateTime<chrono::Utc>>,
+        i64,
+        i64,
+        i64,
+        i64,
+        i64,
+    ) = sqlx::query_as(
+        "SELECT plan, plan_expires_at, quota_total_cents, quota_window_cents, \
+         quota_weekly_cap_cents, quota_week_used_cents, credits_cents FROM users WHERE id = $1",
+    )
+    .bind(uid)
+    .fetch_one(&state.db)
+    .await?;
+    let plan_active = plan != "none" && plan_exp.is_none_or(|e| e > chrono::Utc::now());
+    let quota_ok = plan_active
+        && q_total > 0
+        && q_window > 0
+        && (q_weekly_cap == 0 || q_week_used < q_weekly_cap);
+    Ok(BillingState {
+        plan,
+        plan_active,
+        q_total,
+        q_window,
+        q_weekly_cap,
+        q_week_used,
+        credits,
+        quota_ok,
+    })
+}
+
 /// 三个准入口（chat / chat_completions / responses）共用的判定。
 ///
 /// 分开写过一次，代价是同一个免费模型从 IDE 能用、从走 /v1/responses 的客户端被判成
@@ -5278,10 +5568,24 @@ pub fn admit_billing(
         // 也可以消耗付费余额和订阅额度"。
         return Ok(false);
     }
+    // 下面两句里的重置时刻按**服务端的 UTC 日历日**说，不是"明天 0 点"。
+    //
+    // 免费池的发放和重置全部比对 `free_points_date <> CURRENT_DATE`（auth.rs 的 me()，
+    // 本文件的余额/扣点三处），而生产库的会话时区就是 UTC（实测 `SHOW timezone` = UTC）。
+    // 原文写的是"明天 0 点重置"，读的人只会理解成**自己所在时区**的午夜；主力用户在
+    // UTC+8，真实续杯时刻是早上 8 点，差整整 8 小时 —— 晚上 8 点用完的人等到半夜发现
+    // 还是 0，只会认为是坏了。美国用户差得更离谱，重置落在本地下午。
+    //
+    // 这里改的是**话**，不是**边界**：把重置挪到某个本地日界（例如
+    // `(now() AT TIME ZONE 'Asia/Shanghai')::date`）会改变每一个存量用户的续杯时刻，还要
+    // 同时改 auth.rs 的发放判据和这里的三处扣点判据。那是运营方该拍板的产品决策（"免费
+    // 额度按谁的一天算"），不是一条 bug 修复能顺手带的。先让文案说实话，失败向"少承诺"
+    // 这一侧倒。
     if free_here && !fallback_enabled {
         return Err(AppError {
             status: StatusCode::PAYMENT_REQUIRED,
-            msg: "今日免费额度已用完，明天 0 点重置（或改用付费模型）".into(),
+            msg: "今日免费额度已用完，每天 UTC 0 点（北京时间 8:00）重置（或改用付费模型）"
+                .into(),
         });
     }
     let tail = if plan_active && q_total <= 0 {
@@ -5294,7 +5598,10 @@ pub fn admit_billing(
         "请先开通会员或充值额度"
     };
     let msg = if free_here {
-        format!("今日免费额度已用完，付费余额和会员额度也不可用（{tail}）。明天 0 点重置免费额度。")
+        format!(
+            "今日免费额度已用完，付费余额和会员额度也不可用（{tail}）。\
+             免费额度每天 UTC 0 点（北京时间 8:00）重置。"
+        )
     } else {
         tail.to_string()
     };
@@ -6013,6 +6320,33 @@ fn thinking_effort_for(body: &serde_json::Value) -> Option<&str> {
                 }
             })
         })
+        .or(Some("high"))
+}
+
+/// OpenAI 的 `stop` → Anthropic 的 `stop_sequences`。
+///
+/// 形状差异是硬的：OpenAI 收字符串**或**字符串数组，Anthropic 只收字符串数组。
+///
+/// 空串会被丢掉，全丢完就一个键都不发。理由是「没设过」和「设了但是空的」在上游那里
+/// 不是同一件事：空串作为截断点没有任何意义，而 `stop_sequences: []` 是一个显式的空参数，
+/// 有的中转会因此报错。判不准时选「什么都不发」——那等价于用户没写这个参数。
+/// 非字符串元素（数字、对象）同样丢掉：转过去只会换来一个 400。
+fn anthropic_stop_sequences(stop: Option<&serde_json::Value>) -> Option<Vec<String>> {
+    let seqs: Vec<String> = match stop? {
+        serde_json::Value::String(s) => vec![s.clone()],
+        serde_json::Value::Array(items) => items
+            .iter()
+            .filter_map(|item| item.as_str())
+            .map(str::to_string)
+            .collect(),
+        _ => return None,
+    };
+    let seqs: Vec<String> = seqs.into_iter().filter(|s| !s.is_empty()).collect();
+    if seqs.is_empty() {
+        None
+    } else {
+        Some(seqs)
+    }
 }
 
 fn oai_to_anthropic_with_cache(
@@ -6210,10 +6544,20 @@ fn oai_to_anthropic_with_cache(
     // Native Anthropic requests do not forward OpenAI sampling knobs. New Claude
     // models reject temperature/top_p even when thinking is off, while omitting
     // them preserves the provider default for every model generation.
-    for k in ["stream", "stop"] {
-        if let Some(v) = body.get(k) {
-            out.insert(k.to_string(), v.clone());
-        }
+    if let Some(v) = body.get("stream") {
+        out.insert("stream".into(), v.clone());
+    }
+    // OpenAI 叫 `stop`，Anthropic 叫 `stop_sequences` —— 这两个键原来是一个循环**原样**
+    // 搬过去的，而 `out` 是从零建起的白名单，所以搬进去的就是一个字面上的 `stop`。
+    //
+    // 后果分两种上游，都不好：
+    //   · 官方 api.anthropic.com 严格拒绝未知顶层键，回 400 "extra inputs are not
+    //     permitted"。而下面的失败切换把这种 400 判成「请求体本身有问题，换线路也一样」
+    //     直接 `break 'routes` —— 整轮对话硬失败，一条线路都不再试。
+    //   · 宽松中转默默忽略这个键：不报错，但用户要的截断点从来没生效过，模型一路写过头。
+    // 全仓库找不到 `stop_sequences` 这个名字，说明它从来没被翻译过，不是哪里改漏了。
+    if let Some(stops) = anthropic_stop_sequences(body.get("stop")) {
+        out.insert("stop_sequences".into(), json!(stops));
     }
     if let Some(tools) = body.get("tools").and_then(|t| t.as_array()) {
         let atools: Vec<serde_json::Value> = tools
@@ -7219,36 +7563,23 @@ pub async fn chat_completions(
             candidates = plain;
         }
     }
-    let route_count = candidates.len();
     let primary_conn = candidates
         .first()
         .cloned()
         .ok_or_else(|| AppError::bad(format!("模型 {model_id} 不可用")))?;
 
     // Refill the 30-minute window + reset the weekly counter when due.
-    sqlx::query(
-        &format!("UPDATE users SET \
-         quota_window_cents = CASE WHEN (quota_window_reset_at IS NULL OR quota_window_reset_at <= now()) AND quota_total_cents > 0 THEN LEAST(quota_window_cap_cents, quota_total_cents) ELSE quota_window_cents END, \
-         quota_window_reset_at = CASE WHEN (quota_window_reset_at IS NULL OR quota_window_reset_at <= now()) AND quota_total_cents > 0 THEN now() + interval '{QUOTA_WINDOW_REFRESH}' ELSE quota_window_reset_at END, \
-         quota_week_used_cents = CASE WHEN quota_week_reset_at IS NULL OR quota_week_reset_at <= now() THEN 0 ELSE quota_week_used_cents END, \
-         quota_week_reset_at = CASE WHEN quota_week_reset_at IS NULL OR quota_week_reset_at <= now() THEN now() + interval '7 days' ELSE quota_week_reset_at END \
-         WHERE id = $1"),
-    )
+    // 语句本体和它为什么带 WHERE 闸，见 crate::auth::quota_refresh_sql()。
+    // 这里曾经是四份逐字相同的副本之一（/api/me + chat + image + audio）。
+    sqlx::query(&crate::auth::quota_refresh_sql())
     .bind(uid)
     .execute(&state.db)
     .await?;
 
     // Access gate: active-membership quota (window/total/weekly) OR pay-as-you-go credits.
-    let (plan, plan_exp, q_total, q_window, q_weekly_cap, q_week_used, credits): (String, Option<chrono::DateTime<chrono::Utc>>, i64, i64, i64, i64, i64) =
-        sqlx::query_as("SELECT plan, plan_expires_at, quota_total_cents, quota_window_cents, quota_weekly_cap_cents, quota_week_used_cents, credits_cents FROM users WHERE id = $1")
-            .bind(uid)
-            .fetch_one(&state.db)
-            .await?;
-    let plan_active = plan != "none" && plan_exp.is_none_or(|e| e > chrono::Utc::now());
-    let quota_ok = plan_active
-        && q_total > 0
-        && q_window > 0
-        && (q_weekly_cap == 0 || q_week_used < q_weekly_cap);
+    let BillingState {
+        plan, plan_active, q_total, q_window, q_weekly_cap, q_week_used, credits, quota_ok,
+    } = read_billing_state(&state, uid).await?;
     let use_quota = quota_ok;
     // Free-flagged models are paid from the daily 点 pool, so the quota/credits gate below
     // does not apply to them — and crucially, passing that gate must NOT let a user keep
@@ -7297,6 +7628,15 @@ pub async fn chat_completions(
         }
     }
 
+    // 线路条数要在**收窄之后**才数得准。它原来取在上面那次筛选之前。
+    //
+    // 只有免费池能付的用户，候选集在这里被砍成只剩免费线路。沿用收窄前的条数，失败提示
+    // 就会走 `attempts < route_count` 那一支，告诉他"同模型另有 N 条没试过，直接重发一次
+    // 就会自动改走其它线路" —— 那些线路他一条都够不着：重发会原样再收窄一次，结果一模一样。
+    // 给一个结构上不可能成立的建议，比不给建议更糟，用户会一直重发。
+    // route_goes_to_the_back 里 `route_count > 1`（只剩一条时谁都不往后排）同理。
+    let route_count = candidates.len();
+
     // The gate above only proves the balance is positive, not that it covers this
     // call, and settlement happens after the upstream responds. Serially that lets a
     // user overspend by exactly one request per top-up (the next request is refused);
@@ -7309,6 +7649,38 @@ pub async fn chat_completions(
     // drop — including the early-return and panic paths — and the key carries a TTL so
     // a hard crash can't strand a user at their limit.
     let inflight_guard = InFlightGuard::acquire(&state, uid).await?;
+
+    // 看不懂图的模型，不要把图发给它。
+    //
+    // `chat()` 早就有这道闸（那边叫 needs_vision_help + vision_preprocess），但 IDE 走的是
+    // 这条 /v1/chat/completions，而它一直没有。后果 2026-08-22 实测到两种：
+    //
+    //   · glm-5.x 直接 400：{"message":"messages.content.type 参数非法，取值范围 ['text']"}。
+    //     这类是「上游拒收请求体」，按设计不做故障转移（见下面 upstream_rejected 那段），
+    //     所以这一轮整个报废。六小时内 9 次。
+    //   · deepseek-v4-pro 不报错，默默丢掉图片块——代价是每一步都把几兆 base64 重传一遍。
+    //     实测每个 prompt token 摊到 25 字节，而同一个客户端发给 Claude 的是 3.1 字节；
+    //     会话因此一直贴着客户端 3.5MB 的请求上限跑，历史里的图只有超限时才会被裁。
+    //
+    // 客户端那边 _modelSeesImages 的正则默认返回 true，只认得出 deepseek-chat/coder/r1/
+    // v2/v3 这些旧名字，deepseek-v4-pro 和 glm-5.x 都判成"能看图"。客户端已经改成读
+    // /api/models 新下发的 accepts_image，但**已经装在用户机器上的旧版本改不了**，所以
+    // 这道闸必须在网关这边。
+    //
+    // 复用 chat() 那条路径，不另写一套：vision_preprocess 会把图交给配置好的视觉模型转写成
+    // 文字，转写失败或超配额时**照样把图片块剥掉**（best-effort，见它自己的注释），所以
+    // 两种情况下上游都只会收到 text —— 400 消失，字节也降下来。它内部有每小时 60 次配额和
+    // 单次 8 张上限，并且走 bill_vision_call 计费，成本可控可归属。
+    //
+    // 位置：必须在 InFlightGuard 之后。vision_preprocess 会替用户发起一次上游调用，排在闸
+    // 前面等于一个账号可以挂起任意多个 —— 这正是 chat_route_acquires_the_inflight_guard
+    // 那条测试当初钉住的东西，这里同样适用。
+    //
+    // needs_vision_help 内部三态：目录说不吃图 → true；说吃图 → false；目录里没这一款
+    // （中转商私有命名）→ 回退到名字表。所以未收录的模型行为和改动前一致。
+    if needs_vision_help(&model_id) {
+        vision_preprocess(&state, uid, &mut body).await;
+    }
 
     // michael-compression：严格 opt-in。没有请求档位时这里直接返回，body 一个字节都不动，
     // 现有流量的行为与这个特性上线前完全一致。
@@ -7630,30 +8002,23 @@ pub async fn chat_completions(
                     "route recently dropped post-thinking blocks; thinking depth clipped for this request"
                 );
             }
-            let wants_1m =
-                candidate_anthropic && wants_1m_context(&model_id, &candidate_upstream_body);
-            let candidate_anthropic_beta = candidate_anthropic
-                .then(|| anthropic_beta_header(&candidate_upstream_body, wants_1m))
-                .flatten();
             if candidate_anthropic {
-                // The body has already been normalized to the native Anthropic contract.
-                // Keep this to protocol and enum categories only; do not log the body.
                 tracing::info!(
                     request_id = request_id.as_deref().unwrap_or(""),
                     model = %model_id,
                     protocol = "anthropic",
                     thinking_type = telemetry_thinking_type(&candidate_upstream_body),
                     output_config_effort = telemetry_output_config_effort(&candidate_upstream_body),
-                    beta_context_1m = wants_1m,
-                    // 体积判据的输入。留着是为了能在线上直接验证这道门有没有按预期开合，
-                    // 而不用从"beta 发没发"反推。
-                    body_text_bytes = body_text_bytes(&candidate_upstream_body),
-                    beta_interleaved_thinking = candidate_anthropic_beta
-                        .as_deref()
-                        .is_some_and(|value| value.contains(ANTHROPIC_INTERLEAVED_THINKING_BETA)),
-                    beta_effort = candidate_anthropic_beta
-                        .as_deref()
-                        .is_some_and(|value| value.contains(ANTHROPIC_EFFORT_BETA)),
+                    // 这三格是这次补回来的。前两格 HEAD 上有过、被整块重写时删掉了；
+                    // 第三格 HEAD 也没有 —— 它回答「这一路走了哪份基础集合」，
+                    // 而那正是 base_url 判据一旦误判、日志里唯一看得出来的地方。
+                    beta_context_1m = wants_1m_context(&candidate_upstream_body),
+                    beta_text_bytes = body_text_bytes(&candidate_upstream_body),
+                    beta_profile = if anthropic_is_first_party(&candidate.base_url) {
+                        "first_party"
+                    } else {
+                        "third_party"
+                    },
                     // 请求**形状**（不是内容）。合成请求在这条线路上 89/89 都回了思考，
                     // 而线上同模型同线路只有 ~15% —— 差别只可能在形状里。这几个字段是
                     // 用来把那两群请求区分开的，全部是计数/枚举，不含任何提示词文本。
@@ -7695,11 +8060,17 @@ pub async fn chat_completions(
                 // Out of budget: stop probing and let the caller report the last error,
                 // so the client gets a real response instead of timing out and retrying.
                 let remaining = route_deadline.saturating_duration_since(Instant::now());
-                if remaining.is_zero() {
+                // 判据是「这段剩余预算够不够发一次」，不再是「预算是不是刚好走完」。
+                // 前一条线路可以把整轮共用的预算烧到只剩几百毫秒，而那几百毫秒足够让下一条
+                // 健康线路被记成卡死（降级 120 秒 + 记一次故障 + 花钱探测）。
+                // 地板只对已经发过的轮次生效，理由见 route_send_window_is_viable。
+                if !route_send_window_is_viable(remaining, attempted_sends > 0) {
                     tracing::warn!(
                         model = %model_id,
                         attempted_sends,
                         budget_secs = route_budget.as_secs(),
+                        remaining_ms = remaining.as_millis(),
+                        min_viable_ms = MIN_VIABLE_HEADER_WAIT.as_millis(),
                         "upstream route budget exhausted; answering the client instead of retrying further"
                     );
                     break 'routes;
@@ -7717,23 +8088,38 @@ pub async fn chat_completions(
                 // 否则等于把一段密文当令牌发给上游 → 每条线路一律 401。遗留明文原样透传，
                 // 所以对加密/未加密两种行都正确。这一处漏解密，正是「所有模型都用不了」。
                 let candidate_key = model_key(&candidate.api_key);
+                // 这一路到底发了什么 beta，必须**当场算出来并记下来**。
+                //
+                // 上一版是在 `.header(...)` 的实参里内联三元，于是「这次发了 8 个还是 24 个」
+                // 「发没发 1M」在线上一个字都查不到 —— 只能拿 route_id 反查 models 表的
+                // base_url 离线猜。而这两位恰恰是「零思考」那个调查唯一还没做过对照的变量。
+                let candidate_first_party = anthropic_is_first_party(&candidate.base_url);
+                let candidate_wants_1m = candidate_anthropic && wants_1m_context(&candidate_upstream_body);
+                let candidate_beta_header = if candidate_anthropic {
+                    anthropic_beta_header(candidate_first_party, candidate_wants_1m)
+                } else {
+                    String::new()
+                };
                 let mut req = if candidate_anthropic {
-                    // 1M context must be explicitly enabled upstream. Anthropic's own API ships
-                    // 1M by default on Opus 4.6+/Sonnet 4.6+/Fable, but resellers front it behind
-                    // the same beta flag Anthropic uses for Sonnet 4/4.5 — observed verbatim:
-                    //   400 {"error":"1m context is fully available; please enable 1m context and retry"}
-                    // So: whenever this model's native window is >= 1M, or it has a beta-gated
-                    // 1M entry, send the flag. It is a no-op where 1M is already default, and it
-                    // is the difference between working and a hard 400 where it is not.
-                    let mut r = req0
+                    req0
                         .header("x-api-key", &candidate_key)
-                        .header("anthropic-version", "2023-06-01");
-                    if let Some(beta) = candidate_anthropic_beta.as_deref() {
-                        r = r.header("anthropic-beta", beta);
-                    }
-                    r.json(&candidate_upstream_body)
+                        .header("anthropic-version", "2023-06-01")
+                        .header("anthropic-beta", &candidate_beta_header)
+                        .header("User-Agent", ANTHROPIC_SDK_USER_AGENT)
+                        .header("X-Stainless-Lang", "js")
+                        .header("X-Stainless-Package-Version", ANTHROPIC_SDK_VERSION)
+                        .header("X-Stainless-OS", "Linux")
+                        .header("X-Stainless-Arch", "x64")
+                        .header("X-Stainless-Runtime", "node")
+                        .header("X-Stainless-Runtime-Version", "v22.11.0")
+                        .json(&candidate_upstream_body)
                 } else {
                     req0.header("Authorization", format!("Bearer {}", candidate_key))
+                        .header("User-Agent", CODEX_USER_AGENT)
+                        .header("OpenAI-Beta", CODEX_OPENAI_BETA)
+                        .header("x-codex-installation-id", CODEX_INSTALLATION_ID)
+                        .header("x-codex-routing-hint", "codex-cli")
+                        .header("x-codex-turn-state", "coding")
                         .json(&body)
                 };
                 if !streaming {
@@ -8597,38 +8983,16 @@ pub async fn responses_proxy(
         .ok_or_else(|| AppError::bad(format!("模型 {model_id} 不可用")))?;
 
     // Same quota refill + check as image_generations.
-    sqlx::query(
-        &format!("UPDATE users SET \
-         quota_window_cents = CASE WHEN (quota_window_reset_at IS NULL OR quota_window_reset_at <= now()) AND quota_total_cents > 0 THEN LEAST(quota_window_cap_cents, quota_total_cents) ELSE quota_window_cents END, \
-         quota_window_reset_at = CASE WHEN (quota_window_reset_at IS NULL OR quota_window_reset_at <= now()) AND quota_total_cents > 0 THEN now() + interval '{QUOTA_WINDOW_REFRESH}' ELSE quota_window_reset_at END, \
-         quota_week_used_cents = CASE WHEN quota_week_reset_at IS NULL OR quota_week_reset_at <= now() THEN 0 ELSE quota_week_used_cents END, \
-         quota_week_reset_at = CASE WHEN quota_week_reset_at IS NULL OR quota_week_reset_at <= now() THEN now() + interval '7 days' ELSE quota_week_reset_at END \
-         WHERE id = $1"),
-    )
+    // 语句本体和它为什么带 WHERE 闸，见 crate::auth::quota_refresh_sql()。
+    // 这里曾经是四份逐字相同的副本之一（/api/me + chat + image + audio）。
+    sqlx::query(&crate::auth::quota_refresh_sql())
     .bind(uid)
     .execute(&state.db)
     .await?;
 
-    let (plan, plan_exp, q_total, q_window, q_weekly_cap, q_week_used, credits): (
-        String,
-        Option<chrono::DateTime<chrono::Utc>>,
-        i64,
-        i64,
-        i64,
-        i64,
-        i64,
-    ) = sqlx::query_as(
-        "SELECT plan, plan_expires_at, quota_total_cents, quota_window_cents, \
-         quota_weekly_cap_cents, quota_week_used_cents, credits_cents FROM users WHERE id = $1",
-    )
-    .bind(uid)
-    .fetch_one(&state.db)
-    .await?;
-    let plan_active = plan != "none" && plan_exp.is_none_or(|e| e > chrono::Utc::now());
-    let quota_ok = plan_active
-        && q_total > 0
-        && q_window > 0
-        && (q_weekly_cap == 0 || q_week_used < q_weekly_cap);
+    let BillingState {
+        plan_active, q_total, q_window, q_weekly_cap, q_week_used, credits, quota_ok, ..
+    } = read_billing_state(&state, uid).await?;
     let use_quota = quota_ok;
     // 免费模型走每日点数池，和会员、钱包并列——这道门必须和 chat_completions 那道一致。
     // 之前只有 chat_completions 做了豁免，于是同一个免费模型：从 IDE（走 /v1/chat/completions）
@@ -8876,38 +9240,16 @@ pub async fn image_generations(
         .ok_or_else(|| AppError::bad(format!("模型 {model_id} 不可用")))?;
 
     // Quota refill + check (same as chat_completions).
-    sqlx::query(
-        &format!("UPDATE users SET \
-         quota_window_cents = CASE WHEN (quota_window_reset_at IS NULL OR quota_window_reset_at <= now()) AND quota_total_cents > 0 THEN LEAST(quota_window_cap_cents, quota_total_cents) ELSE quota_window_cents END, \
-         quota_window_reset_at = CASE WHEN (quota_window_reset_at IS NULL OR quota_window_reset_at <= now()) AND quota_total_cents > 0 THEN now() + interval '{QUOTA_WINDOW_REFRESH}' ELSE quota_window_reset_at END, \
-         quota_week_used_cents = CASE WHEN quota_week_reset_at IS NULL OR quota_week_reset_at <= now() THEN 0 ELSE quota_week_used_cents END, \
-         quota_week_reset_at = CASE WHEN quota_week_reset_at IS NULL OR quota_week_reset_at <= now() THEN now() + interval '7 days' ELSE quota_week_reset_at END \
-         WHERE id = $1"),
-    )
+    // 语句本体和它为什么带 WHERE 闸，见 crate::auth::quota_refresh_sql()。
+    // 这里曾经是四份逐字相同的副本之一（/api/me + chat + image + audio）。
+    sqlx::query(&crate::auth::quota_refresh_sql())
     .bind(uid)
     .execute(&state.db)
     .await?;
 
-    let (plan, plan_exp, q_total, q_window, q_weekly_cap, q_week_used, credits): (
-        String,
-        Option<chrono::DateTime<chrono::Utc>>,
-        i64,
-        i64,
-        i64,
-        i64,
-        i64,
-    ) = sqlx::query_as(
-        "SELECT plan, plan_expires_at, quota_total_cents, quota_window_cents, \
-         quota_weekly_cap_cents, quota_week_used_cents, credits_cents FROM users WHERE id = $1",
-    )
-    .bind(uid)
-    .fetch_one(&state.db)
-    .await?;
-    let plan_active = plan != "none" && plan_exp.is_none_or(|e| e > chrono::Utc::now());
-    let quota_ok = plan_active
-        && q_total > 0
-        && q_window > 0
-        && (q_weekly_cap == 0 || q_week_used < q_weekly_cap);
+    let BillingState {
+        plan_active, q_total, q_window, q_weekly_cap, q_week_used, credits, quota_ok, ..
+    } = read_billing_state(&state, uid).await?;
     let use_quota = quota_ok;
     if !quota_ok && credits <= 0 {
         let msg = if plan_active && q_total <= 0 {
@@ -9151,10 +9493,9 @@ mod billing_tests {
         assert_eq!(usage.unwrap()["prompt_tokens"], 3);
     }
     use super::{
-        anthropic_beta_header, anthropic_effort_word, anthropic_thinking,
+        anthropic_effort_word, anthropic_thinking,
         anthropic_thinking_with_display, anthropic_to_oai,
-        body_text_bytes, upstream_capacity_wording, wants_1m_context, ANTHROPIC_1M_BETA_TEXT_BYTES,
-        ANTHROPIC_CONTEXT_WITHOUT_1M_BETA_TOKENS,
+        body_text_bytes, upstream_capacity_wording,
         oai_to_anthropic_with_cache, chat_upstream_attempt_suffix,
         chat_upstream_retry_base_delay_ms, claude_generation, clip_thinking_budget, compute_cost,
         is_image_gen_model, official_max_output, official_contexts, model_caps_override,
@@ -10040,6 +10381,7 @@ mod billing_tests {
         assert_eq!(checked, 2, "生产里应有两条 model_usage 插入路径（免费点 + 付费结算）");
     }
 
+    #[test]
     /// 结算失败 = 用户被服务了却没扣到钱。日志必须能对账到「谁、哪笔请求、多少钱」，否则一次
     /// DB 抖动就是一笔查无对象的漏收。bill() 是 fire-and-forget，日志是唯一的追账凭证，所以每条
     /// 致命失败分支都要带 uid/conn_id/request_id + 统一事件标记，供告警与重对账脚本 grep。
@@ -10225,10 +10567,19 @@ mod billing_tests {
         let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/models.rs"))
             .expect("read models.rs");
         let at = src.find("let (_pre_mode, _pre_percall, pre_free, _pre_micro)").expect("准入块改写了");
-        let body: String = src[at..].chars().take(6_000).collect();
-        assert!(
-            body.contains("use_quota = quota_ok;"),
-            "放行用的是会员额度，结算却没带上——钱包会被记成负数",
+        // 切到**下一个 handler** 为止，不用固定字数。原来写死 6000 字符，而这个 handler 后来
+        // 长过了那个数（付费分支补上准入判定 + 说明），于是 bill() 落到窗口外面，测试红在
+        // "结算调用改名了"——一个和它要防的 bug 毫无关系的假失败。窗口要跟着函数走。
+        let end = src[at..]
+            .find("\npub async fn ")
+            .map(|e| at + e)
+            .unwrap_or(src.len());
+        let body: String = src[at..end].to_string();
+        assert_eq!(
+            body.matches("use_quota = quota_ok;").count(),
+            2,
+            "免费分支和付费分支都得「放行靠哪个池子、结算就扣哪个」——少一处，那一支的会员\
+             额度就永远扣不到，钱包被全额扣走",
         );
         let bill_at = body.find("bill(&state, uid, model.id, cost,").expect("结算调用改名了");
         assert!(
@@ -10242,6 +10593,7 @@ mod billing_tests {
         );
     }
 
+    #[test]
     fn admission_asks_the_same_question_settlement_answers() {
         // 每次 60 毫点的免费模型：$0.003 = 3000 micro-USD，按 50 micro-USD/毫点换算正好 60。
         let per_call_micro = 3_000;
@@ -10270,6 +10622,7 @@ mod billing_tests {
         assert_eq!(admit(true, false, 0).ok(), Some(true), "盖得住仍由免费池付");
     }
 
+    #[test]
     fn free_pool_exhaustion_falls_back_to_paid_balances() {
         // 池子还有 → 由池子付
         let ok = |r: Result<bool, super::AppError>| match r {
@@ -10301,8 +10654,11 @@ mod billing_tests {
         );
         // 开关关掉 → 回到老行为：免费池空了就拒绝，哪怕钱包有钱
         let (_, off) = err_msg(super::admit_billing(false, true, false, false, 500, false, 0, 0, 0, 0));
-        assert!(off.contains("明天 0 点重置"), "实际：{off}");
-        // 「两边都没了」那句里也有"明天 0 点重置"，光判这四个字会被它喂饱。开关关掉时
+        // 重置时刻按 UTC 说（见 admit_billing 上面那段：池子比对的是 CURRENT_DATE，而库是
+        // UTC）。这里钉的仍然是"关掉开关时也要告诉用户什么时候能再用"，只是措辞从那句
+        // 不成立的"明天 0 点"换成了真实边界。
+        assert!(off.contains("UTC 0 点"), "实际：{off}");
+        // 「两边都没了」那句里也有重置时刻，光判这几个字会被它喂饱。开关关掉时
         // 用户钱包里明明还有钱，措辞里就不该出现"付费余额也不可用"。
         assert!(!off.contains("付费余额"), "开关关掉时不该走到「两边都没了」那句：{off}");
         // 非免费模型的措辞不受影响
@@ -11277,16 +11633,15 @@ mod billing_tests {
             json!({"type":"adaptive","display":"summarized"})
         );
 
-        // No reasoning_effort (user chose "off" → IDE drops the field) → NO thinking.
-        // Sampling knobs are still omitted because current Claude models reject them.
-        let off = oai_to_anthropic(&json!({
+        // No reasoning_effort → gateway defaults to "high" so thinking is always on.
+        // Explicit "off" goes through thinking:{type:"disabled"} path, not absent effort.
+        let implicit = oai_to_anthropic(&json!({
             "model":"claude-opus-4-8","max_tokens":4096,"temperature":0.5,"top_p":0.9,"messages":[]
         }))
         .unwrap();
-        assert!(off.get("thinking").is_none());
-        assert_eq!(off["max_tokens"], json!(4096));
-        assert!(off.get("temperature").is_none());
-        assert!(off.get("top_p").is_none());
+        assert_eq!(implicit["thinking"], json!({"type":"adaptive","display":"summarized"}));
+        assert!(implicit.get("temperature").is_none());
+        assert!(implicit.get("top_p").is_none());
     }
 
     #[test]
@@ -11366,6 +11721,7 @@ mod billing_tests {
         // Absent is not off. A caller that names no effort wants the model's own default, and
         // disabling thinking for them would be the same bug pointed the other way.
         assert_eq!(anthropic_thinking("claude-opus-5", None), None);
+
 
         // A disabled turn must not collect the headroom meant for thinking, and the client's
         // explicit disable must read as "off" rather than as the bare-toggle "high".
@@ -11806,77 +12162,155 @@ mod billing_tests {
         assert_eq!(telemetry.thinking_utf8_chars, 2);
     }
 
+    /// 基础集合是「这条线路认哪些能力」，`context-1m` 是「这一次要不要更大的窗口」——
+    /// 两件事正交，测试也分开钉。
     #[test]
-    fn anthropic_beta_header_keeps_context_and_adaptive_thinking_capabilities() {
-        let adaptive = json!({"thinking": {"type": "adaptive"}});
-        let beta = anthropic_beta_header(&adaptive, true)
-            .expect("adaptive request needs beta capabilities");
-        assert_eq!(
-            beta,
-            "context-1m-2025-08-07,interleaved-thinking-2025-05-14,effort-2025-11-24"
-        );
-        assert!(!beta.contains("redact-thinking"));
+    fn anthropic_beta_headers_match_claude_code_sdk() {
+        use super::{ANTHROPIC_BETA_HEADER_FIRST_PARTY, ANTHROPIC_BETA_HEADER_THIRD_PARTY};
 
-        let no_context = anthropic_beta_header(&adaptive, false)
-            .expect("adaptive request needs thinking capabilities");
-        assert_eq!(
-            no_context,
-            "interleaved-thinking-2025-05-14,effort-2025-11-24"
+        let tp = ANTHROPIC_BETA_HEADER_THIRD_PARTY;
+        for beta in [
+            "claude-code-20250219",
+            "interleaved-thinking-2025-05-14",
+            "context-management-2025-06-27",
+            "structured-outputs-2025-12-15",
+            "web-search-2025-03-05",
+            "effort-2025-11-24",
+            "tool-search-tool-2025-10-19",
+        ] {
+            assert!(tp.contains(beta), "third-party 基础集合少了 {beta}");
+        }
+        assert_eq!(tp.split(',').count(), 7, "third-party 基础集合的项数变了");
+        assert!(!tp.contains("extended-cache-ttl"));
+        assert!(!tp.contains("task-budgets"));
+        assert!(!tp.contains("redact-thinking"));
+
+        let fp = ANTHROPIC_BETA_HEADER_FIRST_PARTY;
+        assert_eq!(fp.split(',').count(), 23, "first-party 基础集合的项数变了");
+        assert!(!fp.contains("redact-thinking"));
+
+        // 两张清单会静默分叉 —— 上一版只断言了 first-party 24 项里的 4 项，把
+        // context-1m 从它里面删掉测试照样绿。改成钉住「包含关系」：third-party 是
+        // first-party 的真子集，少一项都算漂。
+        for beta in tp.split(',') {
+            assert!(
+                fp.split(',').any(|f| f == beta),
+                "third-party 有而 first-party 没有的 beta：{beta} —— 两张清单分叉了",
+            );
+        }
+
+        // context-1m **不许**焊进任何一份基础集合：它是逐请求判的。
+        assert!(
+            !tp.contains("context-1m") && !fp.contains("context-1m"),
+            "context-1m 又被焊回基础集合了 —— 体积闸就此失效，98.75% 的请求会无条件带上它",
         );
-        assert_eq!(anthropic_beta_header(&json!({}), false), None);
-        assert_eq!(
-            telemetry_anthropic_event_kind(Some("message_start")),
-            "message_start"
-        );
-        assert_eq!(telemetry_anthropic_event_kind(Some("provider_private")), "other");
     }
 
-    /// `context-1m` 按这一次请求的实际体积发，而不是按"这个模型支不支持 1M"发。
-    ///
-    /// 改之前每一个 Claude 请求都带着它，包括一个 354 token 的请求——近 7 天 11,990 次
-    /// Claude 调用里真正超过 20 万 token 的只有 93 次（0.78%）。
+    /// 体积闸：判据只看正文字节，不问模型目录。
     #[test]
     fn the_1m_beta_follows_the_actual_request_size() {
-        seed_catalog();
+        assert!(
+            super::ANTHROPIC_1M_BETA_TEXT_BYTES < super::ANTHROPIC_CONTEXT_WITHOUT_1M_BETA_TOKENS,
+            "阈值必须严格低于不带 beta 的窗口，否则存在漏发区间",
+        );
 
         let small = json!({"messages": [{"role": "user", "content": "写个 hello world"}]});
-        assert!(
-            !wants_1m_context("claude-fable-5", &small),
-            "小请求不该被派到 1M 那条溢价通道上"
-        );
+        assert!(!super::wants_1m_context(&small), "小请求不该追加 1M");
 
         let big = json!({
-            "messages": [{
-                "role": "user",
-                "content": "x".repeat(ANTHROPIC_1M_BETA_TEXT_BYTES),
-            }]
+            "messages": [{"role": "user", "content": "x".repeat(super::ANTHROPIC_1M_BETA_TEXT_BYTES)}]
         });
         assert!(
-            wants_1m_context("claude-fable-5", &big),
-            "真的可能超出标准窗口时必须发，否则换来一个硬 400（而且 400 不会 failover）"
+            super::wants_1m_context(&big),
+            "真的可能超出标准窗口时必须发，否则换来一个硬 400（而且 400 不 failover）",
         );
 
-        // 模型本身不支持 1M 的，多大都不发。
-        let huge = json!({
-            "messages": [{"role": "user", "content": "x".repeat(ANTHROPIC_1M_BETA_TEXT_BYTES * 2)}]
-        });
+        // **刻意不依赖模型目录。** 上一版的判据是「模型支持 1M 且体积够大」，而
+        // `official_contexts` 在目录 miss 时返回空 → 判成不支持 → 多大都不发 → 硬 400。
+        // 这条断言钉住那个依赖没有回来：函数只收请求体一个参数。
+        let src = include_str!("models.rs");
+        let head = &src[..src.find("\nmod billing_tests").unwrap_or(src.len())];
+        let body = head
+            .split("fn wants_1m_context(")
+            .nth(1)
+            .and_then(|s| s.split("\n}").next())
+            .expect("wants_1m_context 不见了");
         assert!(
-            !wants_1m_context("claude-haiku-4-5", &huge),
-            "目录说这个模型只有 200k，发 1M flag 没有意义"
+            !body.contains("official_contexts"),
+            "体积闸又去问模型目录了：目录 miss 时会判成「不支持 1M」，大请求硬 400",
         );
     }
 
-    /// 阈值的安全性是可以**证明**的，不是估的：任何 BPE 分词器在 UTF-8 上都满足
-    /// token ≤ 字符 ≤ 字节，所以正文字节数低于阈值就意味着 token 数低于阈值。
-    /// 阈值本身再低于「不带 beta 时的窗口」，这道门就不可能漏发。
+    /// 拼头：基础集合 + 这一次要不要 1M。
     #[test]
-    fn the_size_gate_cannot_underestimate_the_token_count() {
-        assert!(
-            ANTHROPIC_1M_BETA_TEXT_BYTES < ANTHROPIC_CONTEXT_WITHOUT_1M_BETA_TOKENS,
-            "阈值必须低于不带 beta 的窗口，否则存在漏发区间",
-        );
+    fn the_beta_header_is_base_set_plus_this_requests_1m() {
+        let small = super::anthropic_beta_header(false, false);
+        assert_eq!(small, super::ANTHROPIC_BETA_HEADER_THIRD_PARTY);
+        assert!(!small.contains("context-1m"));
 
-        // 只数字符串值：键名和 JSON 结构字符不进模型，不该算进 token 账。
+        let big = super::anthropic_beta_header(false, true);
+        assert!(big.starts_with(super::ANTHROPIC_BETA_HEADER_THIRD_PARTY));
+        assert!(big.ends_with(",context-1m-2025-08-07"));
+
+        assert!(super::anthropic_beta_header(true, false)
+            .starts_with(super::ANTHROPIC_BETA_HEADER_FIRST_PARTY));
+    }
+
+    /// 走哪份基础集合，判据必须是**解析出来的 host**，不是裸子串。
+    ///
+    /// 两个方向都真的会错，而且错了在日志里看不见（所以同一次改动还补了 `beta_profile`）：
+    /// 路径挂载式的中转商含这个子串 → 被当成直连、多发一批 beta（按这份代码自己的注释，
+    /// 某些中转商会因此 503）；大写主机名 → 被当成中转商、静默少发。
+    #[test]
+    fn the_base_set_is_chosen_by_parsed_host_not_substring() {
+        for direct in [
+            "https://api.anthropic.com",
+            "https://api.anthropic.com/",
+            "https://api.anthropic.com/v1",
+            "https://API.Anthropic.COM/v1",
+            "api.anthropic.com/v1",
+        ] {
+            assert!(super::anthropic_is_first_party(direct), "{direct} 应判为直连");
+        }
+        for relay in [
+            "https://api.hanhegufei.online/v1",
+            "https://gw.example.com/proxy/api.anthropic.com/v1",
+            "https://api.anthropic.com.cdn.example.cn/v1",
+            "https://xxx.workers.dev/https://api.anthropic.com",
+            "",
+        ] {
+            assert!(!super::anthropic_is_first_party(relay), "{relay} 不该被判为直连");
+        }
+
+        // 判据必须真的接在发送路径上，而且**算出来的那一份**要被记进日志 ——
+        // 上一版是在 .header() 实参里内联三元，线上完全查不到这一路发了哪份。
+        let src = include_str!("models.rs");
+        let head = &src[..src.find("\nmod billing_tests").unwrap_or(src.len())];
+        let code: String = head
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            code.contains("let candidate_first_party = anthropic_is_first_party(&candidate.base_url);"),
+            "发送路径没有用解析 host 的判据",
+        );
+        assert!(
+            code.contains(".header(\"anthropic-beta\", &candidate_beta_header)"),
+            "发送处没有用算好的那一份头",
+        );
+        assert!(
+            code.contains("beta_profile = if anthropic_is_first_party(&candidate.base_url)"),
+            "遥测里没有 beta_profile —— base_url 判据一旦误判，线上看不出来",
+        );
+        assert!(
+            code.contains("beta_context_1m = wants_1m_context(&candidate_upstream_body)"),
+            "遥测里没有 beta_context_1m —— 「这次发没发 1M」又答不了了",
+        );
+    }
+
+    #[test]
+    fn body_text_bytes_counts_only_string_values() {
         let body = json!({
             "model": "claude-fable-5",
             "max_tokens": 1024,
@@ -11885,9 +12319,6 @@ mod billing_tests {
                 {"role": "assistant", "content": [{"type": "text", "text": "efg"}]}
             ]
         });
-        // 值：claude-fable-5(14) + user(4) + abcd(4) + assistant(9) + text(4) + efg(3) = 38。
-        // max_tokens 是数字不算；`"text": "efg"` 里的**键**也不算——只有那个 `"type"` 的
-        // 值 "text" 进账。
         assert_eq!(body_text_bytes(&body), 38);
         assert_eq!(body_text_bytes(&json!({"n": 1, "b": true, "z": null})), 0);
     }
@@ -15075,6 +15506,47 @@ mod vision_billing_tests {
         assert!(guard_at < first_upstream, "并发闸必须早于任何上游调用");
     }
 
+    /// IDE 真正走的那条路由也要有图片能力闸，而且顺序和 chat() 一样。
+    ///
+    /// 抓的是一个实测到的缺口：这道闸只有 chat() 有，而 IDE 用的是
+    /// /v1/chat/completions。2026-08-22 线上后果——glm-5.x 收到 image_url 直接 400
+    /// （"messages.content.type 参数非法"，六小时 9 次，且这类不做故障转移，整轮报废），
+    /// deepseek-v4-pro 默默丢图但每步重传几兆 base64（每 token 25 字节 vs Claude 3.1）。
+    ///
+    /// 断言的是连接不是实现：闸在不在、在不在并发闸后面。怎么判「这个模型看不看得懂图」
+    /// 是 needs_vision_help 自己的事（它另有测试）。
+    #[test]
+    fn chat_completions_gates_images_for_text_only_models() {
+        let src = include_str!("models.rs");
+        let body = src
+            .split("pub async fn chat_completions(")
+            .nth(1)
+            .expect("chat_completions");
+        let body = &body[..body.find("\npub async fn ").unwrap_or(body.len())];
+        // 先剥注释：本仓库的注释里会逐字引用被修掉的旧代码，不剥的话这类断言永远是绿的。
+        let code: String = body
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let gate = code.find("needs_vision_help(&model_id)").expect(
+            "IDE 那条路由缺图片能力闸：看不懂图的模型会收到 image_url —— glm 直接 400、\
+             deepseek 默默丢图并重传几兆 base64",
+        );
+        let vp = code
+            .find("vision_preprocess(&state, uid, &mut body)")
+            .expect("闸判定之后必须真的把图剥掉/转写，否则判了也没用");
+        assert!(gate < vp, "先判定再处理");
+        let guard_at = code
+            .find("InFlightGuard::acquire")
+            .expect("chat_completions 必须持并发闸");
+        assert!(
+            guard_at < gate,
+            "并发闸必须排在图片闸前面：vision_preprocess 会替用户发起一次上游调用，\
+             排在闸前面等于一个账号能挂起任意多个",
+        );
+    }
+
     /// 视觉代看图有每小时配额和张数上限，二者都不能被悄悄拿掉。
     #[test]
     fn vision_has_a_budget_and_an_image_cap() {
@@ -15851,5 +16323,500 @@ mod power_route_tests {
             mig.contains("power_route"),
             "迁移没建这一列，线上启动就会因为查不到列而炸"
         );
+    }
+}
+
+/// 2026-08-22 一轮定向审计修掉的八条缺陷，每条一道守卫。
+///
+/// 这一批里有五条的载体是几千行的 async handler（拿不到 DB 就跑不起来），所以判据分两类：
+/// 能提纯的先提成纯函数直接测（`paid_model_requires_balance`、`anthropic_stop_sequences`、
+/// `route_send_window_is_viable`、`split_fused_charge`），提不动的用源码断言钉接线。
+/// 源码断言一律**先剥注释再断言**——本仓库的注释就是在逐字讲旧代码长什么样，不剥的话
+/// 这类断言永远是绿的（这个坑在本文件里已经踩过两次，各自留了注释）。
+#[cfg(test)]
+mod audit_20260822_tests {
+    use serde_json::json;
+    use std::time::Duration;
+
+    /// 非测试那一半的源码，注释已剥。
+    ///
+    /// 运行时读而不是 `include_str!`：把正在编译的这个文件嵌进来，cargo 的变更检测会滞后
+    /// 一个 build，断言可能对着上一版字节通过——本文件里真发生过一次，藏掉了一道被删掉的闸。
+    /// 只留 `mod billing_tests` 之前：测试里也会逐字引用旧代码，不切就会自己喂饱自己。
+    fn gateway_code() -> String {
+        let full = models_rs_source();
+        let head = &full[..full.find("\nmod billing_tests").unwrap_or(full.len())];
+        strip_line_comments(head)
+    }
+
+    fn models_rs_source() -> String {
+        std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/models.rs"))
+            .expect("read models.rs")
+    }
+
+    fn strip_line_comments(src: &str) -> String {
+        src.lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// 整份 models.rs（注释已剥）。
+    ///
+    /// `gateway_code()` 只取 `mod billing_tests` 之前那一段，而本文件把测试模块夹在生产代码
+    /// 中间——「只许有一份」这类计数断言必须扫全文，否则第六份副本长在测试模块之后就数不到。
+    fn whole_gateway_code() -> String {
+        strip_line_comments(&models_rs_source())
+    }
+
+    /// 从某个函数签名截到下一个 `pub async fn` 为止。
+    fn fn_body(code: &str, sig: &str) -> String {
+        let start = code.find(sig).unwrap_or_else(|| panic!("{sig} 不见了"));
+        let rest = &code[start + sig.len()..];
+        let end = rest.find("\npub async fn ").unwrap_or(rest.len());
+        rest[..end].to_string()
+    }
+
+    /// 第 `nth` 个 `callee` 调用点的实参文本（到 `)?;` 为止），空白折成单空格。
+    ///
+    /// 逐字比实参，是因为「调用了几次」这种计数断言挡不住改实参：位置参数一多，
+    /// 抄错一个 bool 既不报编译错、也不动调用次数。
+    fn nth_call_args(body: &str, callee: &str, nth: usize) -> String {
+        let mut from = 0usize;
+        for _ in 0..=nth {
+            let at = body[from..]
+                .find(callee)
+                .unwrap_or_else(|| panic!("{callee} 的第 {nth} 个调用点不见了"));
+            from += at + callee.len();
+        }
+        let end = body[from..]
+            .find(")?;")
+            .unwrap_or_else(|| panic!("{callee} 的第 {nth} 个调用点没有 `)?;` 收尾"));
+        body[from..from + end]
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    /// 某个调用点的头 200 个字符（按字符切，源码里有中文）。
+    fn call_args(body: &str, callee: &str) -> String {
+        let at = body
+            .find(callee)
+            .unwrap_or_else(|| panic!("{callee} 这个调用点不见了"));
+        body[at..].chars().take(200).collect()
+    }
+
+    /// [billing-core-1] 旧接口 `/api/models/:id/chat` 的付费分支必须和另外三个入口同一条规则。
+    ///
+    /// 它此前只读 `credits_cents`，两个方向都出事：套餐有效、钱包为 0 的会员在这条路由上
+    /// 吃 402「额度不足，请充值」，而同一个人、同一个模型走 /v1/chat/completions 是放行的；
+    /// 钱包里有钱的会员则被放行后**全额扣钱包**——`use_quota` 一直是 false，他买的那份
+    /// 订阅额度一分没动，等于为套餐内的用量再付一次现金。
+    ///
+    /// 断的是连接：付费分支里有没有统一准入，以及 use_quota 有没有跟着 quota_ok 走。
+    #[test]
+    fn 旧chat接口的付费分支必须走统一准入并按放行池结算() {
+        let body = fn_body(&gateway_code(), "pub async fn chat(");
+        assert!(
+            !body.contains("query_scalar(\"SELECT credits_cents FROM users"),
+            "付费分支又只看钱包余额了：套餐有效、钱包为 0 的会员会在这条路由上吃 402，\
+             而同一个人走 /v1/chat/completions 是放行的",
+        );
+        assert_eq!(
+            body.matches("admit_billing(").count(),
+            2,
+            "免费分支和付费分支必须各有一次统一准入判定",
+        );
+        assert_eq!(
+            body.matches("use_quota = quota_ok;").count(),
+            2,
+            "放行靠哪个池子就得扣哪个。付费分支漏掉这一句，会员的订阅额度永远扣不到，\
+             钱包被全额扣走",
+        );
+        // 只数"调用了几次"钉不住**怎么调的**。admit_billing 有十个位置参数（4 个 bool +
+        // 5 个 i64），错一个就是另一条放行规则，而编译器一句话都不会说。
+        // 复核时把付费分支的第二个实参 free_here 从 false 改成 true——这块正是三行之上
+        // 从免费分支复制过来的，漏改一个 bool 是最现实的抄写事故——208 个 models:: 测试
+        // 全绿。它是用户可见的：free_fallback_to_paid() 关着时，付费模型上的付费用户会
+        // 收到 402「今日免费额度已用完…」。q_window / q_weekly_cap 对调同样没人拦。
+        // 所以两处实参逐字钉死。
+        assert_eq!(
+            nth_call_args(&body, "admit_billing(", 0),
+            "free_fallback_to_paid(), true, false, quota_ok, credits, \
+             plan_active, q_total, q_window, q_weekly_cap, q_week_used,"
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" "),
+            "免费分支的准入实参变了：这一支的 free_here 必须是 true（模型确实是免费的），\
+             free_pool_has_room 必须是 false（走到这里就是免费池已经付不起了）",
+        );
+        assert_eq!(
+            nth_call_args(&body, "admit_billing(", 1),
+            "free_fallback_to_paid(), false, false, quota_ok, credits, \
+             plan_active, q_total, q_window, q_weekly_cap, q_week_used,"
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" "),
+            "付费分支的准入实参变了：free_here 必须是 false，否则付费用户在付费模型上会被\
+             判成「免费额度用完」；后面五个配额位的顺序也不许调换",
+        );
+        assert!(
+            body.contains("crate::auth::quota_refresh_sql()"),
+            "读配额之前没刷新 30 分钟窗口：窗口早该续上的会员在这里会被判成没有额度",
+        );
+    }
+
+    /// [billing-core-2] 「这个模型要不要余额」必须按**单模型**解析算，不能读连接列。
+    ///
+    /// 单模型覆盖 `model_billing[mid] = {"mode":"per_call","per_call_cents":50}` 能在一条
+    /// billing_mode="rate"、rate/输入价/输出价全 0 的连接上把某个模型定成收费的。老写法只看
+    /// 那四个连接列 → 判成免费 → 整道余额门被跳过；而结算走 effective_billing_micro，认这份
+    /// 覆盖、真扣 50 分。零余额零套餐的账号被放行一次，credits_cents 直接变负。
+    #[test]
+    fn 单模型计费覆盖的模型也必须先看余额() {
+        // 连接列全是 0，解析结果是 ("per_call", 50) —— 门必须认解析结果。
+        assert!(
+            super::paid_model_requires_balance("per_call", 50, 0.0, 0.0, 0.0),
+            "覆盖定价的模型被判成免费：零余额账号会被放行一次，然后被扣成负数",
+        );
+        // 反向：连接是 per_call 500，但这个模型被覆盖回 rate 且没有任何单价 → 真的不收钱。
+        assert!(!super::paid_model_requires_balance("rate", 500, 0.0, 0.0, 0.0));
+        // 按量计费的三列任意一个为正都算收费。
+        assert!(super::paid_model_requires_balance("rate", 0, 1.5, 0.0, 0.0));
+        assert!(super::paid_model_requires_balance("rate", 0, 0.0, 3.0, 0.0));
+        assert!(super::paid_model_requires_balance("rate", 0, 0.0, 0.0, 15.0));
+        // 全空 = 真免费；per_call 但费用 0 = 配置成不收钱（和 effective_billing_inner 一致）。
+        assert!(!super::paid_model_requires_balance("rate", 0, 0.0, 0.0, 0.0));
+        assert!(!super::paid_model_requires_balance("per_call", 0, 0.0, 0.0, 0.0));
+
+        // 接线：门必须拿结算那份解析出来的模式/单次费，而不是 model.billing_mode。
+        let body = fn_body(&gateway_code(), "pub async fn chat(");
+        assert!(
+            !body.contains("model.billing_mode == \"per_call\""),
+            "余额门又读回连接列了：单模型覆盖定价的模型会被判成免费，整道门被跳过",
+        );
+        let args = call_args(&body, "paid_model_requires_balance(");
+        assert!(
+            args.contains("_pre_mode") && args.contains("_pre_percall"),
+            "余额门没有用 effective_billing_micro 的结果：{args}",
+        );
+
+        // 用对了函数还不够 —— 得喂给它**同一个 model id**。
+        //
+        // 上一版把门换成了 effective_billing_micro，但门那边自己另算了一份 id：body["model"]
+        // 取不到就回落 model.model_id；而结算用的 `chosen` 只认 allowed_ids 里的名字、否则
+        // 回落 allowed.first()，且 allowed_ids 在 enabled_models 非空时根本不看 model_id。
+        // 两份规则一分叉，覆盖定价挂在结算那个 id 上时，门按另一个 id 判成免费 —— 刚堵上的
+        // 洞换个触发条件原样回来。所以这里钉三件事：只有一份解析、两处都用它、解析在门之前。
+        assert!(
+            !body.contains("_pre_mid"),
+            "余额门又自己算了一份 model id：它和结算用的 chosen 规则不同，会分叉",
+        );
+        let resolves = body.matches("effective_billing_micro(&model, &chosen)").count();
+        let all_calls = body.matches("effective_billing_micro(&model,").count();
+        assert_eq!(
+            (resolves, all_calls),
+            (2, 2),
+            "这条路由里 effective_billing_micro 的两个调用点（门、结算）必须都传 &chosen，\
+             实际 {resolves}/{all_calls} 处传的是它",
+        );
+        let pick = body
+            .find("let chosen = match requested")
+            .expect("model id 的那段解析不见了");
+        let gate = body
+            .find("paid_model_requires_balance(")
+            .expect("余额门不见了");
+        assert!(
+            pick < gate,
+            "model id 的解析又跑到余额门后面去了：门判的和结算扣的不是同一个模型",
+        );
+    }
+
+    /// [billing-core-3] 后台 Token 推算器的计费模式也要按单模型解析。
+    ///
+    /// 上面那条阶梯只统一了 token 单价；模式和单次固定费原来直接取连接列，于是一个
+    /// 「连接默认 rate、这个模型覆盖成 per_call 200 分」的模型，面板按 token 算出 50 分、
+    /// 线上真收 200 分。只影响后台这张预估表，但运营方的定价决策就建在这个数上。
+    #[test]
+    fn 后台推算器要按单模型解析计费模式() {
+        let body = fn_body(&gateway_code(), "pub async fn admin_model_estimate(");
+        assert!(
+            body.contains("effective_billing_micro(&model, model_id)"),
+            "推算器没解析单模型计费覆盖，算出来的毛利和盈亏平衡点都是错的",
+        );
+        let args = call_args(&body, "resolve_cost(");
+        assert!(
+            args.contains("&eff_mode") && args.contains("eff_percall"),
+            "resolve_cost 又拿连接级 billing_mode / per_call_cents 了：{args}",
+        );
+        assert!(
+            !args.contains("model.billing_mode"),
+            "resolve_cost 又拿连接级 billing_mode 了：{args}",
+        );
+    }
+
+    /// [stream-route-1] 转 Anthropic 时发的必须是 `stop_sequences`，不是裸的 `stop`。
+    ///
+    /// 官方 api.anthropic.com 对未知顶层键回 400 "extra inputs are not permitted"，而失败切换
+    /// 把这种 400 判成「请求体本身有问题，换线路也一样」直接 break 'routes —— 整轮对话硬失败。
+    /// 宽松中转不报错，但用户要的截断点从来没生效过。
+    #[test]
+    fn 转anthropic时stop要翻译成stop_sequences() {
+        assert_eq!(
+            super::anthropic_stop_sequences(Some(&json!("\n\n"))),
+            Some(vec!["\n\n".to_string()]),
+            "OpenAI 允许字符串形态，Anthropic 只收数组",
+        );
+        assert_eq!(
+            super::anthropic_stop_sequences(Some(&json!(["END", "STOP"]))),
+            Some(vec!["END".to_string(), "STOP".to_string()]),
+        );
+        // 判不准就什么都不发：空数组是「有这个参数但没内容」，和「没这个参数」不是一回事。
+        assert_eq!(super::anthropic_stop_sequences(None), None);
+        assert_eq!(super::anthropic_stop_sequences(Some(&json!(""))), None);
+        assert_eq!(super::anthropic_stop_sequences(Some(&json!([]))), None);
+        assert_eq!(super::anthropic_stop_sequences(Some(&json!(["", ""]))), None);
+        assert_eq!(super::anthropic_stop_sequences(Some(&json!([1, 2]))), None);
+        assert_eq!(super::anthropic_stop_sequences(Some(&json!(null))), None);
+
+        // 整条转换：进去是 OpenAI 的 stop，出来只能是 Anthropic 的 stop_sequences。
+        let out = super::oai_to_anthropic_with_cache(
+            &json!({
+                "model": "claude-sonnet-4-5",
+                "messages": [{ "role": "user", "content": "hi" }],
+                "stop": ["\n\nHuman:"],
+                "stream": true,
+            }),
+            false,
+            false,
+        )
+        .expect("OpenAI → Anthropic 转换失败");
+        assert!(
+            out.get("stop").is_none(),
+            "裸 stop 又被原样搬过去了：官方 API 回 400 extra inputs are not permitted，\
+             而这类 400 不做故障转移，整轮对话直接硬失败。实际：{out}",
+        );
+        assert_eq!(out["stop_sequences"], json!(["\n\nHuman:"]));
+        assert_eq!(out["stream"], json!(true), "stream 仍然要照常转发");
+
+        // 没写 stop 的请求，两个键都不许凭空冒出来。
+        let plain = super::oai_to_anthropic_with_cache(
+            &json!({
+                "model": "claude-sonnet-4-5",
+                "messages": [{ "role": "user", "content": "hi" }],
+            }),
+            false,
+            false,
+        )
+        .expect("OpenAI → Anthropic 转换失败");
+        assert!(plain.get("stop").is_none() && plain.get("stop_sequences").is_none());
+    }
+
+    /// [stream-route-2] 预算见底时不许再拿一条没试过的线路去撞超时。
+    ///
+    /// ROUTE_BUDGET 是整轮共用的一份。前一条线路可以拖到第 56.5 秒才回完一个完整错误，
+    /// 下一条线路于是拿到几百毫秒的窗口——`is_zero()` 拦不住它，它必然超时，然后被当成
+    /// 上游卡死：降级并压到 25 秒短探测 120 秒、记一次故障喂给告警、再花运营方的钱探一次。
+    /// route_health 的前提是「记录真实流量的结果」，而这条记录是网关自己造出来的假红。
+    #[test]
+    fn 剩余预算不够就别再发一条没试过的线路() {
+        // 第一发无条件放行：客户端能用 x-ide-response-budget-ms 给一个很小的预算，
+        // 拿地板拦住第一发等于让那台机器什么都发不出去（"预算恒为零"那个事故的形状）。
+        assert!(super::route_send_window_is_viable(
+            Duration::from_millis(300),
+            false
+        ));
+        assert!(
+            !super::route_send_window_is_viable(Duration::from_millis(300), true),
+            "只剩几百毫秒还要再发一条：这条线路必然超时，然后被降级 120 秒、记一次故障、\
+             再花钱探一次——全是网关自己造出来的假红",
+        );
+        assert!(!super::route_send_window_is_viable(
+            super::MIN_VIABLE_HEADER_WAIT - Duration::from_millis(1),
+            true
+        ));
+        assert!(super::route_send_window_is_viable(
+            super::MIN_VIABLE_HEADER_WAIT,
+            true
+        ));
+        // 预算真的走完，谁都不发。
+        assert!(!super::route_send_window_is_viable(Duration::ZERO, false));
+        assert!(!super::route_send_window_is_viable(Duration::ZERO, true));
+
+        // 接线：钉的是**形状**，不是「这个函数名出现过」。
+        //
+        // 原来只断言 body 里含 `route_send_window_is_viable(remaining, attempted_sends > 0)`。
+        // 复核时把调用点改成
+        // `if route_send_window_is_viable(remaining, attempted_sends > 0) && false {`
+        // ——新地板和它取代的那道 is_zero 保护一起失效——208 个 models:: 测试全绿。
+        // 一个只挡得住「删掉」、挡不住「就地阉掉」的守卫等于没有，所以这里连取反、
+        // 连 `break 'routes;` 一起钉住，再反过来禁掉裸的 is_zero 判据。
+        let body = fn_body(&gateway_code(), "pub async fn chat_completions(");
+        let gate = "if !route_send_window_is_viable(remaining, attempted_sends > 0) {";
+        let at = body.find(gate).unwrap_or_else(|| {
+            panic!(
+                "主链路那道闸不再是原样的 `{gate}`：取反被拿掉、或者被 `&& …` 接了别的条件，\
+                 都会让这道地板整个哑掉，而且是连原来的 is_zero 保护一起哑掉"
+            )
+        });
+        // 800 是实测 551 字符（if 行 + 那条 tracing::warn! + break）留的余量，够容下
+        // 再加一两个日志字段，又不至于把整段循环都吞进来。
+        let block: String = body[at..].chars().take(800).collect();
+        assert!(
+            block.contains("break 'routes;"),
+            "闸成立之后没有 `break 'routes;`：换成 continue 或者内层 break 就会继续往下发，\
+             地板等于不存在。当前这一段：{block}",
+        );
+        assert!(
+            !body.contains("remaining.is_zero()"),
+            "主链路又自己判 `remaining.is_zero()` 了——那道闸只拦「刚好走完」，\
+             几百毫秒的剩余窗口照样能把一条健康线路记成卡死",
+        );
+    }
+
+    /// [billing-core-1 复核] 「会员额度这次付不付得起」的判据只许有一个家。
+    ///
+    /// billing-core-1 收拢的是**准入动作**（四个入口都改走 admit_billing），判据本身当时
+    /// 还是五份逐字副本：chat 的免费/付费两个分支、chat_completions、responses_proxy、
+    /// image_generations。这正是 auth.rs 那条
+    /// `quota_refresh_statement_has_exactly_one_home_and_keeps_its_guard` 在防的形状——
+    /// 回满语句抄成四份，改的时候中三漏一，漏掉的那个入口就变成「同一份后台配置、两个
+    /// 答案」；周上限当初就是这么落地的。五处现在都读 `read_billing_state()`，这条断言
+    /// 钉住它别再长出第二份，也钉住那唯一一份不许被削。
+    #[test]
+    fn 配额放行判据只许有一个家() {
+        // concat! 拆开：不拆的话这条断言自己的字面量会被数进去（本文件踩过这个坑）。
+        let fragment = concat!("q_weekly_cap == 0 || ", "q_week_used < q_weekly_cap");
+        let code = whole_gateway_code();
+        assert_eq!(
+            code.matches(fragment).count(),
+            1,
+            "models.rs 里又出现了第二份配额放行判据。改调 read_billing_state()——\
+             五份手抄副本各自漂移，正是这条测试要挡的那个 bug",
+        );
+        // 唯一那份还得是完整的四条。缺一条，对应的那道额度门在**全部**入口上一起失守。
+        let at = code
+            .find("async fn read_billing_state")
+            .expect("read_billing_state 没了：五个入口又各读各的了");
+        let home: String = code[at..].chars().take(1400).collect();
+        for (needle, why) in [
+            ("plan_active", "套餐是否有效"),
+            ("q_total > 0", "总额度"),
+            ("q_window > 0", "时段额度"),
+            (fragment, "周上限"),
+        ] {
+            assert!(
+                home.contains(needle),
+                "唯一那份判据里少了「{why}」这一条：它一没，这道门在五个入口上同时失守。\
+                 当前 read_billing_state：{home}",
+            );
+        }
+    }
+
+    /// [stream-route-3] 线路条数要在免费池收窄**之后**才数。
+    ///
+    /// 只有免费池能付的用户，候选集会被砍成只剩免费线路。沿用收窄前的条数，失败提示就会
+    /// 告诉他「同模型另有 N 条没试过，直接重发就会自动改走其它线路」——而那些线路他一条都
+    /// 够不着：重发会原样再收窄一次，结果一模一样。给一个结构上不可能成立的建议，
+    /// 比不给建议更糟，用户会一直重发。
+    #[test]
+    fn 线路条数要在免费池收窄之后才数() {
+        let body = fn_body(&gateway_code(), "pub async fn chat_completions(");
+        let narrow = body
+            .find("candidates = free_only;")
+            .expect("免费池收窄那一步不见了");
+        let count = body
+            .find("let route_count = candidates.len();")
+            .expect("route_count 不见了");
+        assert!(
+            count > narrow,
+            "route_count 又取在收窄之前了：只有免费池能付的用户会被告知「另有线路没试过，\
+             重发就会换线」，而那条线路他结构上够不着",
+        );
+    }
+
+    /// [quota-codes-2] 靠套餐额度放行的调用，在配额恰好归零时也不许制造钱包债务。
+    ///
+    /// 准入门读配额**不加锁**，结算才 FOR UPDATE 重读。同一个用户两笔并发，第一笔把周上限
+    /// （或时段、总额）恰好压满，第二笔结算时 quota_cents 算出 0 —— 旧判据
+    /// `use_quota && quota_cents > 0` 于是让它掉进按量付费那一支，把全额记成钱包债务。
+    /// 那个用户钱包本来就是 0，他为套餐内的用量背上了负债。判据得是「靠哪个池子放行」。
+    #[test]
+    fn 订阅放行的调用在配额恰好归零时也不背钱包债() {
+        // 周上限刚好被并发压满：quota_cents=0，但这仍然是一笔订阅调用。
+        assert_eq!(
+            super::split_fused_charge(23, true, 100, 100, 50, 50, 0),
+            super::FusedCharge {
+                quota_cents: 0,
+                wallet_cents: 0,
+            },
+            "周上限在门禁和结算之间被并发压满，这笔订阅调用被记成了钱包债务",
+        );
+        // 总额度、时段额度归零同理。
+        assert_eq!(
+            super::split_fused_charge(23, true, 0, 100, 0, 0, 0),
+            super::FusedCharge {
+                quota_cents: 0,
+                wallet_cents: 0,
+            },
+        );
+        assert_eq!(
+            super::split_fused_charge(23, true, 100, 0, 0, 0, 0),
+            super::FusedCharge {
+                quota_cents: 0,
+                wallet_cents: 0,
+            },
+        );
+        // 有余额时照常从钱包扣，只是扣不出负数。
+        assert_eq!(
+            super::split_fused_charge(23, true, 0, 0, 0, 0, 5),
+            super::FusedCharge {
+                quota_cents: 0,
+                wallet_cents: 5,
+            },
+        );
+        // 按量付费（不是靠套餐放行的）超支仍然一分不少记债，这一支不能被顺手改掉。
+        assert_eq!(
+            super::split_fused_charge(23, false, 0, 0, 0, 0, 0),
+            super::FusedCharge {
+                quota_cents: 0,
+                wallet_cents: 23,
+            },
+        );
+    }
+
+    /// [quota-codes-3] 免费额度的重置时刻不许承诺用户本地时区的午夜。
+    ///
+    /// 池子按 `free_points_date <> CURRENT_DATE` 重置，而生产库会话时区是 UTC（实测
+    /// `SHOW timezone` = UTC）。原文的"明天 0 点重置"对 UTC+8 的主力用户差整整 8 小时：
+    /// 晚上 8 点用完的人熬到半夜发现还是 0，只会认为是坏了。
+    ///
+    /// 这道守卫钉的是**话**，不是边界：把重置挪到本地日界是产品决策（"免费额度按谁的一天
+    /// 算"），要连 auth.rs 的发放判据一起改，且会挪动每个存量用户的续杯时刻。
+    #[test]
+    fn 免费额度重置时刻不许承诺本地午夜() {
+        let msg = |r: Result<bool, crate::error::AppError>| match r {
+            Ok(v) => panic!("不该放行（by_pool={v}）"),
+            Err(e) => e.msg,
+        };
+        // 免费回退关掉 + 池子空 → 那句「只差免费额度」的拒绝语
+        let only_free = msg(super::admit_billing(
+            false, true, false, false, 500, false, 0, 0, 0, 0,
+        ));
+        // 免费回退开着 + 三样都空 → 那句「两边都没了」的拒绝语
+        let all_out = msg(super::admit_billing(
+            true, true, false, false, 0, false, 0, 0, 0, 0,
+        ));
+        for m in [&only_free, &all_out] {
+            assert!(
+                !m.contains("明天 0 点"),
+                "又在承诺用户本地时区的午夜：池子按 CURRENT_DATE 重置、库是 UTC，\
+                 UTC+8 的用户真实续杯是早上 8 点，差 8 小时。实际：{m}",
+            );
+            assert!(
+                m.contains("UTC 0 点"),
+                "得说清楚是哪个 0 点，否则用户等到半夜发现还是 0。实际：{m}",
+            );
+        }
     }
 }
