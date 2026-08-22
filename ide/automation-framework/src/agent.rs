@@ -53,6 +53,62 @@ fn ensure_input_permission() -> Result<()> {
     ))
 }
 
+/// browser.start 实际做了什么。
+///
+/// 回执必须由它生成，不能由请求参数生成：已经有实例在跑时 headless / profile 一个都不
+/// 会生效，而模型正是照着工具描述「再 start 一次、这次带 profile=session / headless=false」
+/// 走到这里的。给它一句 ok，它就会以为自己换到了持久身份、以为窗口已经弹出来让用户登录。
+#[cfg(feature = "browser")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BrowserStartOutcome {
+    /// 本次真的起了一只新的，身份就是请求的身份。
+    Started(crate::browser::BrowserIdentity),
+    /// 已经有一只活着的，本次调用**什么都没改**。带的是那只的真实身份。
+    AlreadyRunning(crate::browser::BrowserIdentity),
+    /// 命中的那只已经不应答了（用户手关窗口 / Chrome 崩了）：残壳收掉，按请求重起。
+    Restarted(crate::browser::BrowserIdentity),
+}
+
+/// browser.close 实际做了什么。flushed 是这里唯一重要的事实——见 close_gracefully。
+#[cfg(feature = "browser")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BrowserCloseOutcome {
+    /// 本来就没有实例。这不是失败，但也不是「关掉了」。
+    NotRunning,
+    /// 关了。identity 为 None 只发生在连锁都拿不到的时候（那时也一定 flushed=false）。
+    Closed {
+        identity: Option<crate::browser::BrowserIdentity>,
+        flushed: bool,
+    },
+}
+
+/// 命中已有实例时该怎么办。
+#[cfg(feature = "browser")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StartDecision {
+    /// 手上没有实例，正常起。
+    Launch,
+    /// 有，而且还活着：**不重启**。换身份必须先 close——一只跑着的浏览器改不了自己的
+    /// profile 和有头无头，悄悄替用户杀掉它更不是这条命令该做的事。
+    Reuse(crate::browser::BrowserIdentity),
+    /// 有，但已经不应答了：收掉重起。原来这一支和 Reuse 走同一句无动作的 Ok，于是
+    /// 「浏览器死了 → 每条 browser.* 报连接错误 → 模型调 browser.start 想重启 → 拿到 ok
+    /// → 再调 browser.* 还是连接错误」成了一个没有出口的环。
+    RestartDead(crate::browser::BrowserIdentity),
+}
+
+/// running: None = 手上没实例；Some((身份, 是否还应答))。
+#[cfg(feature = "browser")]
+pub fn decide_start(
+    running: Option<(crate::browser::BrowserIdentity, bool)>,
+) -> StartDecision {
+    match running {
+        None => StartDecision::Launch,
+        Some((identity, true)) => StartDecision::Reuse(identity),
+        Some((identity, false)) => StartDecision::RestartDead(identity),
+    }
+}
+
 pub struct Agent {
     #[cfg(feature = "browser")]
     browser: Option<Arc<Mutex<BrowserAutomation>>>,
@@ -374,7 +430,7 @@ impl Agent {
     }
 
     #[cfg(feature = "browser")]
-    pub fn browser_start(&mut self, headless: bool) -> Result<()> {
+    pub fn browser_start(&mut self, headless: bool) -> Result<BrowserStartOutcome> {
         self.browser_start_with_profile(headless, crate::browser::BrowserProfile::Isolated)
     }
 
@@ -383,16 +439,49 @@ impl Agent {
     /// Isolated：每次全新，抓公开页面/测自己的站点用。
     /// Session：专用持久 profile，保留登录态——任务需要用户已登录的身份时用这个，
     /// 否则一定撞登录墙。它和用户自己的 Chrome 互不干扰，可以同时开着。
+    ///
+    /// 返回的是**发生了什么**，不是「请求了什么」：已经有实例在跑时这两个参数一个都不
+    /// 生效，调用方必须能看出这一点（见 BrowserStartOutcome）。命中的实例已经死了则
+    /// 收掉残壳重起——原来无论如何都是一句无动作的 Ok，那是死循环的入口。
     #[cfg(feature = "browser")]
     pub fn browser_start_with_profile(
         &mut self,
         headless: bool,
         profile: crate::browser::BrowserProfile,
-    ) -> Result<()> {
-        if self.browser.is_some() {
-            return Ok(());
-        }
-        
+    ) -> Result<BrowserStartOutcome> {
+        let requested = crate::browser::BrowserIdentity::new(headless, profile);
+
+        // 命中缓存实例时先连接级探活。用 is_alive 不用 is_connected：后者在没开过页面时
+        // 恒 true，正好覆盖「起完就被用户关掉」这个最常见的死法。
+        let running = match self.browser.as_ref() {
+            None => None,
+            Some(arc) => {
+                let guard = arc
+                    .lock()
+                    .map_err(|e| Error::Browser(format!("Mutex 中毒: {}", e)))?;
+                let identity = guard.identity();
+                let alive = self
+                    .runtime
+                    .as_ref()
+                    .ok_or_else(|| Error::Other(anyhow::anyhow!("Runtime not initialized")))?
+                    .block_on(guard.is_alive());
+                drop(guard);
+                Some((identity, alive))
+            }
+        };
+
+        let restarted = match decide_start(running) {
+            StartDecision::Reuse(identity) => return Ok(BrowserStartOutcome::AlreadyRunning(identity)),
+            StartDecision::RestartDead(_) => {
+                // 残壳该收就收：不收的话新实例起来后旧进程还挂着，而且 self.browser
+                // 会被直接覆盖，旧的 Arc 连 Drop 的时机都不确定。这里不看它的 flushed——
+                // 一只已经不应答的浏览器谈不上落盘，能报的事实在下面那条 Restarted 里。
+                let _ = self.close_current();
+                true
+            }
+            StartDecision::Launch => false,
+        };
+
         let runtime = self.runtime.as_ref()
             .ok_or_else(|| Error::Other(anyhow::anyhow!("Runtime not initialized")))?;
         
@@ -404,7 +493,11 @@ impl Agent {
         
         std::thread::sleep(Duration::from_millis(1500));
         self.browser = Some(Arc::new(Mutex::new(browser)));
-        Ok(())
+        Ok(if restarted {
+            BrowserStartOutcome::Restarted(requested)
+        } else {
+            BrowserStartOutcome::Started(requested)
+        })
     }
     
     #[cfg(feature = "browser")]
@@ -457,19 +550,35 @@ impl Agent {
     }
     
     #[cfg(feature = "browser")]
-    pub fn browser_close(&mut self) -> Result<()> {
-        let Some(browser_arc) = self.browser.take() else { return Ok(()) };
-        // 直接 drop 会杀掉 Chrome，cookie 来不及落盘——持久 profile 下等于登录白登。
-        // 先走 CDP 的优雅关闭再放手。
-        if let Some(runtime) = self.runtime.as_ref() {
-            runtime.block_on(async {
-                if let Ok(mut guard) = browser_arc.lock() {
-                    let _ = guard.close_gracefully().await;
+    pub fn browser_close(&mut self) -> Result<BrowserCloseOutcome> {
+        Ok(self.close_current())
+    }
+
+    /// 收掉当前实例，并如实回答**它有没有来得及落盘**。
+    ///
+    /// 直接 drop 会杀掉 Chrome，cookie 来不及写进 profile——持久 profile 下等于登录白登。
+    /// 所以先走 CDP 的优雅关闭再放手；而「等到了它自己退出」这件事本身必须回给调用方，
+    /// 否则强杀和正常关闭在回执里长得一模一样。
+    #[cfg(feature = "browser")]
+    fn close_current(&mut self) -> BrowserCloseOutcome {
+        let Some(browser_arc) = self.browser.take() else { return BrowserCloseOutcome::NotRunning };
+        let Some(runtime) = self.runtime.as_ref() else {
+            // 没有 runtime 就发不出 Browser.close，只能让 Drop 强杀：落盘没保证。
+            return BrowserCloseOutcome::Closed { identity: None, flushed: false };
+        };
+        let (identity, flushed) = runtime.block_on(async {
+            match browser_arc.lock() {
+                Ok(mut guard) => {
+                    let identity = guard.identity();
+                    let flushed = guard.close_gracefully().await.unwrap_or(false);
+                    (Some(identity), flushed)
                 }
-            });
-        }
+                // 拿不到锁就发不出 Browser.close，Drop 直接强杀——如实报 false，别说成成功。
+                Err(_) => (None, false),
+            }
+        });
         drop(browser_arc);
-        Ok(())
+        BrowserCloseOutcome::Closed { identity, flushed }
     }
     
     // ==================== 桌面元素操作 ====================
@@ -693,5 +802,99 @@ mod input_permission_tests {
                 "又把授权结果缓存起来了（{bad}）——用户中途撤销后会永远放行: {body}"
             );
         }
+    }
+}
+
+#[cfg(all(test, feature = "browser"))]
+mod browser_start_decision_tests {
+    use super::{decide_start, StartDecision};
+    use crate::browser::{BrowserIdentity, BrowserProfile};
+
+    const ID: BrowserIdentity = BrowserIdentity {
+        headless: true,
+        profile: BrowserProfile::Isolated,
+    };
+
+    #[test]
+    fn nothing_running_means_launch() {
+        assert_eq!(decide_start(None), StartDecision::Launch);
+    }
+
+    /// 活着的实例不重启：换身份得先 close。悄悄替用户杀掉一只正开着的浏览器
+    /// 不是 browser.start 该做的事，但回执必须说清参数没生效（见 rpc 那组用例）。
+    #[test]
+    fn a_live_browser_is_reused_and_carries_its_own_identity_out() {
+        assert_eq!(decide_start(Some((ID, true))), StartDecision::Reuse(ID));
+    }
+
+    /// 死实例必须被换掉。
+    ///
+    /// 修复前这一支和「还活着」走同一句无动作的 Ok，于是用户手关了有头窗口之后：
+    /// 每条 browser.* 抛底层连接错误 → 模型调 browser.start 想重启 → 拿到 ok →
+    /// 再调 browser.* 还是连接错误。这个环没有出口。
+    #[test]
+    fn a_dead_browser_is_restarted_not_silently_accepted() {
+        assert_eq!(decide_start(Some((ID, false))), StartDecision::RestartDead(ID));
+        assert_ne!(
+            decide_start(Some((ID, false))),
+            decide_start(Some((ID, true))),
+            "死的和活的走了同一条路——那就是那个没有出口的环"
+        );
+    }
+
+    /// 只保留生产代码：test 模块里会引用被改掉的旧写法，扫整份文件会把断言喂饱自己。
+    fn production_source() -> &'static str {
+        let src = include_str!("agent.rs");
+        let cut = ["\n#[cfg(test)]", "\n#[cfg(all(test"]
+            .iter()
+            .filter_map(|m| src.find(m))
+            .min()
+            .unwrap_or(src.len());
+        &src[..cut]
+    }
+
+    /// 探活必须是**连接级**的，而且真的接在启动路径上。
+    ///
+    /// is_connected 回答不了「浏览器还在不在」：current_page 为 None 时它恒 true，
+    /// 而那正好是「起完就被关掉、一个页面都没开过」这个最常见的死法。
+    #[test]
+    fn the_start_path_probes_the_connection_before_reusing() {
+        let prod = production_source();
+        let pat = "pub fn browser_start_with_profile(";
+        let at = prod.find(pat).expect("browser_start_with_profile 不见了");
+        let end = prod[at..]
+            .find("\n    #[cfg(feature = \"browser\")]\n    pub fn browser_goto")
+            .map(|e| at + e)
+            .expect("browser_goto 不在它后面了，切不出函数体");
+        let body: String = prod[at..end]
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !body.contains("if self.browser.is_some()"),
+            "又回到「已经有实例就无条件回 Ok」了: {body}"
+        );
+        assert!(body.contains("is_alive()"), "启动路径没做连接级探活: {body}");
+        assert!(!body.contains("is_connected()"), "拿页面级探活当浏览器存活判据了: {body}");
+        assert!(body.contains("decide_start("), "复用/重启的判定没走同一个判据: {body}");
+    }
+
+    /// 关闭路径不许再把「有没有等到进程自己退出」吞掉。
+    #[test]
+    fn the_close_path_keeps_the_flush_result() {
+        let prod = production_source();
+        let at = prod.find("fn close_current(").expect("close_current 不见了");
+        let end = prod[at..].find("\n    // ====").map(|e| at + e).unwrap_or(prod.len());
+        let body: String = prod[at..end]
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !body.contains("let _ = guard.close_gracefully()"),
+            "又把落盘结果吞掉了: {body}"
+        );
+        assert!(body.contains("close_gracefully().await"), "{body}");
     }
 }

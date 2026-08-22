@@ -17,6 +17,8 @@ use tracing::{debug, info, warn};
 pub struct BrowserAutomation {
     browser: Browser,
     pub current_page: Option<Arc<Page>>,
+    /// 这个实例**实际**是怎么起来的。回执必须按它说话——见 BrowserIdentity。
+    identity: BrowserIdentity,
 }
 
 /// 找一个能用的 Chromium 内核浏览器。
@@ -145,6 +147,24 @@ pub enum BrowserProfile {
     Session,
 }
 
+/// 一个跑着的实例的真实身份：**它是怎么起来的**，不是这次请求要它怎么起。
+///
+/// 这两样以前根本没存下来，于是 browser.start 命中已有实例时只能拿本次请求的参数
+/// 去编回执：模型先用默认 isolated 起过浏览器，之后按工具描述带 profile="session"
+/// 再 start，收到的是「持久 profile、登录态可用」——而真正在跑的还是那只无 cookie 的
+/// 隔离实例。headless 同理：它拿着一句 ok，以为窗口已经弹出来给用户登录了。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BrowserIdentity {
+    pub headless: bool,
+    pub profile: BrowserProfile,
+}
+
+impl BrowserIdentity {
+    pub fn new(headless: bool, profile: BrowserProfile) -> Self {
+        Self { headless, profile }
+    }
+}
+
 /// 一次性实例关掉扩展（干净、可复现）；持久实例**不关**。
 ///
 /// 以前两种都无条件加 `--disable-extensions`，于是「在有头窗口里登录一次、此后一直
@@ -216,7 +236,7 @@ impl BrowserAutomation {
             .arg("--disable-features=site-per-process")
             .user_data_dir(&temp_dir)
             .build()?;
-        Self::with_config(config).await
+        Self::with_config(config, BrowserIdentity::new(true, profile)).await
     }
 
     /// 创建有头（可见）浏览器实例
@@ -242,11 +262,14 @@ impl BrowserAutomation {
             .arg("--disable-features=site-per-process")
             .user_data_dir(&temp_dir)
             .build()?;
-        Self::with_config(config).await
+        Self::with_config(config, BrowserIdentity::new(false, profile)).await
     }
 
-    /// 使用自定义配置创建
-    pub async fn with_config(config: BrowserConfig) -> Result<Self> {
+    /// 使用自定义配置创建。
+    ///
+    /// identity 必须如实描述这份 config 起出来的是什么实例：它是之后所有回执的唯一
+    /// 事实来源，编错了就等于回执说谎。
+    pub async fn with_config(config: BrowserConfig, identity: BrowserIdentity) -> Result<Self> {
         info!("启动浏览器实例...");
         let (browser, mut handler) = Browser::launch(config).await?;
 
@@ -271,16 +294,41 @@ impl BrowserAutomation {
         Ok(Self {
             browser,
             current_page: None,
+            identity,
         })
     }
 
-    /// 检查浏览器连接是否活跃
+    /// 这个实例实际的（有头/无头 × 身份）。回执按它编，不按请求参数编。
+    pub fn identity(&self) -> BrowserIdentity {
+        self.identity
+    }
+
+    /// 检查**当前页面**是否还应答。重试循环用它区分「这一次点击失败」和「整条链路没了」。
+    ///
+    /// 注意它不是浏览器存活判据：current_page 为 None 时它恒返回 true（那时确实没有
+    /// 页面可问），而 page.evaluate 失败也可能只是这一个标签页崩了。要问「浏览器进程
+    /// 还在不在」用 is_alive。
     pub async fn is_connected(&self) -> bool {
         if let Some(page) = &self.current_page {
             page.evaluate("1+1".to_string()).await.is_ok()
         } else {
             true // 没有页面时认为浏览器本身是连接的
         }
+    }
+
+    /// 连接级探活：直接问浏览器自己（CDP Browser.getVersion），不经过任何页面。
+    ///
+    /// 这是「这只浏览器还活着吗」唯一靠得住的问法。is_connected 回答不了：没开过页面时
+    /// 它恒 true，于是用户手关了有头窗口、或 Chrome 崩了之后，browser.start 命中缓存实例
+    /// 照样回一句 ok，接着每条 browser.* 抛一串底层连接错误，而模型手里没有任何「重启」
+    /// 的出路——它再调 browser.start 拿到的还是那句无动作的 ok，出不去。
+    ///
+    /// 超时是必须的：进程还在但 websocket 卡住时，execute 会一直等下去。
+    pub async fn is_alive(&self) -> bool {
+        matches!(
+            tokio::time::timeout(Duration::from_secs(5), self.browser.version()).await,
+            Ok(Ok(_))
+        )
     }
 
     /// 导航到指定 URL（带重试机制）
@@ -589,12 +637,31 @@ impl BrowserAutomation {
     /// Chrome 来不及把 cookie 刷盘。隔离 profile 下无所谓（本来就要丢），持久 profile 下
     /// 就是致命的：用户登录一次，关掉，登录态没了。所以必须发 CDP 的 Browser.close
     /// 再等进程自己退出。
-    pub async fn close_gracefully(&mut self) -> Result<()> {
+    /// 返回**是否真的落了盘**：Browser.close 被接受，且进程在超时前自己退了。
+    ///
+    /// 两个结果原来都被 `let _ =` 吞掉，于是「超时没等到退出 → Drop 走 kill_on_drop
+    /// 强杀 → cookie 没写进 profile」这条路在回执里完全不可见：browser.close 照样回
+    /// {"status":"ok"}，模型据此认为登录态保住了。持久 profile 下这就是「登录一次长期
+    /// 有效」这个承诺静默失守的那一刻，而它下一次运行才会以「怎么又要登录」的形式冒出来。
+    pub async fn close_gracefully(&mut self) -> Result<bool> {
         info!("优雅关闭浏览器（等待落盘）");
-        let _ = self.browser.close().await;
-        // 等它自己退出，给 cookie/localStorage 刷盘的时间；超时就算了，Drop 会兜底。
-        let _ = tokio::time::timeout(Duration::from_secs(8), self.browser.wait()).await;
-        Ok(())
+        // close() 自己没有超时：进程还在、handler 还活着但 websocket 卡住时，它会一直等
+        // 下去。browser.start 的重启分支也会走到这里，所以这一步必须有上限，否则「浏览器
+        // 卡死」会从「一条 RPC 报错」升级成「整个 sidecar 挂住」。
+        let close_sent = matches!(
+            tokio::time::timeout(Duration::from_secs(8), self.browser.close()).await,
+            Ok(Ok(_))
+        );
+        // 等它自己退出，给 cookie/localStorage 刷盘的时间；超时就算了，Drop 会兜底——
+        // 但那是强杀，所以「没等到」必须如实回给调用方。
+        let exited = matches!(
+            tokio::time::timeout(Duration::from_secs(8), self.browser.wait()).await,
+            Ok(Ok(_))
+        );
+        if !(close_sent && exited) {
+            warn!("浏览器没能自己退出（close_sent={close_sent}, exited={exited}），将被强杀，落盘无保证");
+        }
+        Ok(close_sent && exited)
     }
 }
 
@@ -626,5 +693,67 @@ mod profile_tests {
         );
         // 同一种身份重复取必须是同一个目录
         assert_eq!(session, profile_dir(BrowserProfile::Session).expect("session again"));
+    }
+}
+
+#[cfg(test)]
+mod liveness_tests {
+    /// is_alive 必须直接问浏览器（CDP Browser.getVersion），不许经过任何页面。
+    ///
+    /// 页面级探活答不了「浏览器进程还在不在」：没开过页面时恒 true，开了页面时
+    /// 一个崩掉的标签页也会被当成整只浏览器死了。启动路径拿它当判据，就等于
+    /// 对「用户手关了那个有头窗口」全盲。
+    #[test]
+    fn liveness_is_probed_at_the_connection_not_through_a_page() {
+        let src = include_str!("browser.rs");
+        let at = src.find("pub async fn is_alive(").expect("is_alive 不见了");
+        let end = src[at..].find("\n    }").map(|e| at + e).unwrap_or(src.len());
+        let body: String = src[at..end]
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(body.contains("self.browser.version()"), "没走连接级探活: {body}");
+        assert!(!body.contains("current_page"), "又从页面探活了: {body}");
+        assert!(!body.contains("evaluate"), "又从页面探活了: {body}");
+        // 进程还在但 websocket 卡住时 execute 会一直等，探活不能变成挂起。
+        assert!(body.contains("timeout("), "探活没有超时兜底: {body}");
+    }
+
+    /// close_gracefully 必须回答「有没有真的落盘」，而且两个结果都要算进去。
+    ///
+    /// 只发出 Browser.close 不等于关成功；等超时了 Drop 会 kill_on_drop 强杀，
+    /// 那时 cookie 根本没写进 profile。任何一步没成，flushed 就必须是 false。
+    #[test]
+    fn a_graceful_close_reports_whether_the_process_really_exited() {
+        let src = include_str!("browser.rs");
+        let at = src.find("pub async fn close_gracefully(").expect("close_gracefully 不见了");
+        let signature = src[at..].lines().next().unwrap_or("");
+        assert!(
+            signature.contains("Result<bool>"),
+            "close_gracefully 又不回落盘结果了: {signature}"
+        );
+        let end = src[at..].find("\n    }").map(|e| at + e).unwrap_or(src.len());
+        let body: String = src[at..end]
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!body.contains("let _ = self.browser.close()"), "又吞掉 close 的结果了: {body}");
+        // 钉的是**返回值**：只写在 warn! 的判据里不算，那句话不改变任何回执。
+        assert!(
+            body.contains("Ok(close_sent && exited)"),
+            "落盘结论不是「两步都成了」——只看其中一个不够，超时被强杀也是没落盘: {body}"
+        );
+    }
+
+    /// 实例的身份跟着实例走，不跟着请求走——回执唯一的事实来源。
+    #[test]
+    fn an_instance_carries_the_identity_it_was_launched_with() {
+        let src = include_str!("browser.rs");
+        assert!(src.contains("pub fn identity(&self) -> BrowserIdentity"), "identity() 不见了");
+        // 两条启动路径都必须如实标注自己是有头还是无头。
+        assert!(src.contains("BrowserIdentity::new(true, profile)"), "无头路径没标注身份");
+        assert!(src.contains("BrowserIdentity::new(false, profile)"), "有头路径没标注身份");
     }
 }
