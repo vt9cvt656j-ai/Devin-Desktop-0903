@@ -4861,7 +4861,21 @@ fn step_emitted_tool(text: &str) -> Option<String> {
     let mut from = 0usize;
     while let Some(f) = text[from..].find(key) {
         let start = from + f + key.len();
-        let window = &text[start..text.len().min(start + 160)];
+        // 按字节 +160 取窗口会切进多字节字符里 —— 生产实测 panic：
+        //   end byte index 669399 is not a char boundary; it is inside '行'
+        // 这条路跑在流式收尾（算计费遥测、写响应缓存）上，panic 掉的是那整个 task：
+        // 用户那边流已经收完了看不出异常，而计费与缓存静默丢失。上游正文只要有中文
+        // 就随时可能踩到，而下面那条自称「绝不 panic」的测试喂的全是 ASCII。
+        // 按字节 +160 取窗口会切进多字节字符里 —— 生产实测 panic：
+        //   end byte index 669399 is not a char boundary; it is inside '行'
+        // 这条路跑在流式收尾（算计费遥测、写响应缓存）上，panic 掉的是那整个 task：
+        // 用户那边流已经收完了看不出异常，而计费与缓存静默丢失。上游正文只要有中文
+        // 就随时可能踩到，而下面那条自称「绝不 panic」的测试喂的全是 ASCII。
+        let mut window_end = text.len().min(start + 160);
+        while window_end > start && !text.is_char_boundary(window_end) {
+            window_end -= 1;
+        }
+        let window = &text[start..window_end];
         if let Some(n) = window.find("\"name\"") {
             let rest = &window[n + 6..];
             if let Some(q1) = rest.find('"') {
@@ -15175,6 +15189,18 @@ mod step_kind_tests {
         // runs over untrusted upstream text; must be total, not merely usually-correct
         for s in ["\"function\"", "\"function\"{\"name\":", "\"function\"{\"name\":\"", "{}", "\"function\"{\"name\":\"\"}"] {
             let _ = step_emitted_tool(s);
+        }
+        // 这条测试原来喂的全是 ASCII，于是「绝不 panic」只是句声明：真正炸的是按字节
+        // 取 160 字窗口时切进多字节字符里（生产里由一个「行」字触发）。窗口边界必须被
+        // 一个中文字**跨过**才测得到，所以让 "function" 之后的填充刚好把 160 卡在字中间。
+        for pad in 155..=165 {
+            let s = format!("\"function\"{}行的内容", "x".repeat(pad));
+            let _ = step_emitted_tool(&s);
+        }
+        // 名字本身是多字节、窗口正好切在名字中间
+        for pad in 0..8 {
+            let s = format!("\"function\"{}{{\"name\":\"{}\"}}", "x".repeat(150 + pad), "工具名".repeat(30));
+            let _ = step_emitted_tool(&s);
         }
         let long = format!("\"function\"{{\"name\":\"{}\"}}", "x".repeat(500));
         assert_eq!(step_emitted_tool(&long), None, "over-long names are rejected");
