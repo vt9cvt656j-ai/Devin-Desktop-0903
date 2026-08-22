@@ -57,6 +57,51 @@ if [[ -n "$SERVER_KEY" ]]; then
   SSH_ARGS+=(-i "$SERVER_KEY")
 fi
 
+# ── 连接复用（这台机器最要命的一条）───────────────────────────────────────
+#
+# 这台服务器的 SSH **握手**经常直接失败，报 `banner exchange: … invalid format`。
+# 手动 ssh 得重试 1–5 次是常态。每一次新连接都在重新赌这一下，而一次部署要建十几条
+# 连接（ensure / backup / rsync / install-nginx / rollout / health…），于是「部署整体
+# 成功」的概率被这些独立的赌局连乘掉。
+#
+# 实测过一次：rsync 直接被握手打死（`rsync: unexpected end of file`），而外层是
+# `| tail` 的话这条错误还会被吞掉（tail 在进程被杀时不刷缓冲），现象就变成「部署停在
+# syncing source、什么都没说」—— 极难判断，差点被误判成别的原因。
+#
+# 修法是别再赌：ControlMaster 只在开头**握手一次**，后面所有 ssh 和 rsync 都复用这条
+# 已经建好的 TCP 连接，一次握手都不用再做。实测复用之后同一个 rsync 从「必失败」变成
+# 2.4 秒跑完。
+#
+# ControlPath 放 /tmp 而不是 ~/.ssh：路径有长度上限（sockaddr_un 大约 104 字节），
+# 家目录深一点就会静默超限。%C 是「主机+端口+用户」的哈希，短且唯一。
+SSH_CTL="${SSH_CTL:-/tmp/mrday-deploy-cm-%C}"
+SSH_ARGS+=(-o ControlMaster=auto -o "ControlPath=$SSH_CTL" -o ControlPersist=600)
+
+# 主连接自己也要重试——它是唯一还需要真握手的那一次。
+open_master() {
+  local attempt
+  for attempt in 1 2 3 4 5 6 7 8; do
+    if ssh "${SSH_ARGS[@]}" -O check "$REMOTE" >/dev/null 2>&1; then
+      return 0   # 已经有一条活着的主连接（上一次部署留下的，ControlPersist 还没到期）
+    fi
+    if ssh "${SSH_ARGS[@]}" -M -N -f "$REMOTE" 2>/dev/null; then
+      echo "SSH 主连接已建立（第 ${attempt} 次握手）"
+      return 0
+    fi
+    echo "  SSH 握手被丢（第 ${attempt} 次），重试…" >&2
+    sleep $((attempt))
+  done
+  echo "SSH 主连接建不起来（8 次握手全失败）——链路有问题，不继续部署" >&2
+  return 1
+}
+close_master() {
+  ssh "${SSH_ARGS[@]}" -O exit "$REMOTE" >/dev/null 2>&1 || true
+}
+# 无论成功、失败还是被 Ctrl-C，都把主连接收掉：留着的话下一次部署会复用一条**旧**连接，
+# 而它可能连的是你上一次改 SERVER_HOST 之前的那台机器。
+trap close_master EXIT
+open_master || exit 1
+
 # `status=$?` 放在 `if ssh …; then return 0; fi` 之后取到的是 **if 语句** 的退出码——
 # 条件失败且没有 else 分支时它是 0。于是三次全失败之后这个函数返回 0，deploy.sh 一路走完
 # 并打印 "deployment healthy"，实际什么都没部署。
@@ -115,7 +160,9 @@ ssh_true() {
   exit 2
 }
 
-RSYNC_RSH="ssh -p $(printf '%q' "$SERVER_PORT") -o BatchMode=yes -o ConnectTimeout=10 -o ConnectionAttempts=3 -o ServerAliveInterval=15 -o ServerAliveCountMax=4"
+# rsync 也走同一条主连接（ControlPath 必须和上面 SSH_ARGS 里的逐字一致，否则它会
+# 自己再建一条、又去赌那次握手）。
+RSYNC_RSH="ssh -p $(printf '%q' "$SERVER_PORT") -o BatchMode=yes -o ConnectTimeout=10 -o ConnectionAttempts=3 -o ServerAliveInterval=15 -o ServerAliveCountMax=4 -o ControlMaster=auto -o ControlPath=$(printf '%q' "$SSH_CTL") -o ControlPersist=600"
 if [[ -n "$SERVER_KEY" ]]; then
   RSYNC_RSH+=" -i $(printf '%q' "$SERVER_KEY")"
 fi
