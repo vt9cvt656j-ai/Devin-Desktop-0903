@@ -50487,7 +50487,7 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
     "toolRepair", "turnRetry", "cmdFail", "buildFix", "diag", "diagFinish", "bugEvidence",
     "blindEdit", "subagentResult", "recovery", "emptyHistoryFact",
     // 「刚改完、这个版本还没验过」是执行记账里的硬事实，丢了模型就会照着"应该没问题"收尾。
-    "verifyNow", "uiLook",
+    "verifyNow", "uiLook", "browserVerify",
     // 写入质量事实（占位/删了没查引用的导出/盲覆写/硬编码/真实引用/没碰过的同名测试）：
     // 全部来自 checkpoint 基线相减和只读查询，丢了模型就按「刚写的都没问题」的图景继续。
     "writeFacts",
@@ -53699,6 +53699,70 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
         }
       }
 
+      // ── 改了前端就该在浏览器里看：verifyNow 同形状的浏览器侧候选 ──────────────
+      //
+      // 触发全是执行事实：这一批真的落盘了前端源码（_UI_SOURCE_EXT——uiLook 同一判据，
+      // 刻意不含纯 .js/.ts：那会把每个后端 Node 改动都拖进浏览器候选），且运行状态里有
+      // **活着的** dev server URL——读的是运行状态块同一来源（_agentTerminalEntries 的
+      // urls 字段：真实终端输出里解析出的 localhost 地址，"运行中" 才算活着），不是从
+      // 模型的叙述或分类器的预测里来的。两个事实都在，才谈得上「打开那个 URL 看一眼」。
+      //
+      // 预填的是第一步（navigate 打开 URL）：browser 没有任何一个 action 能同时「开页 +
+      // 读控制台」——check（页面体检，consoleErrors 在它的结果里）只对当前已打开的页面
+      // 跑，所以第二步写进事实文案，由模型自己发。代填由 _browserVerifyCandidateFill 在
+      // 唯一授权检查点之前完成（_verifyCandidateFill 同款位置，不开新口子）；发起方永远
+      // 是模型，IDE 不代跑。
+      //
+      // 有界：每 run 每 URL 只提示一次（_browserVerifyPromptedUrls），候选一次性消费、
+      // 每次触发重新武装。与 run_cmd 候选（verifyNow）并存不打架，先后判据用改动文件
+      // 类型这个执行事实：本批代码改动**全是**前端文件 → 浏览器候选先说、verifyNow 本批
+      // 让位（它的计数不消耗，后续批次照常）；批里还有后端/通用代码而 verifyNow 又够格
+      // 发言 → 命令候选先说、浏览器候选等下一批前端改动（URL 名额不消耗）。两个候选挂在
+      // 不同工具上（cmd / browser），消费互不越界。
+      let _bvSpokeThisBatch = false;
+      if (_live() && run.mode === "agent") {
+        const _bvWrites = items
+          .filter((it) => it.call && _WORKSPACE_MUTATING_TYPES.has(it.call.type) && it.call.path
+            && !/\[(ERROR|BLOCKED|DENIED)\]/.test((it.rawResult && it.rawResult.content) || ""))
+          .map((it) => String(it.call.path));
+        const _bvUi = _bvWrites.filter((p) => _UI_SOURCE_EXT.test(p));
+        const _bvCode = _bvWrites.filter((p) => _CODE_FILE_RE.test(p));
+        // verifyNow 这一批会不会发言（它自己的门槛 + 本批有代码改动）；会、且批里有
+        // 非前端代码 → 命令候选优先，浏览器候选本批不说、名额不消耗。
+        const _vnWould = verifyNudges < 2 && _implOps > 0 && _verifiedAtImplOps < _implOps
+          && _lastVerifyNudgeAtImplOps < _implOps && _bvCode.length > 0;
+        const _cmdFirst = _vnWould && _bvCode.some((p) => !_UI_SOURCE_EXT.test(p));
+        if (_bvUi.length && !_cmdFirst) {
+          // 活着的 dev server URL：运行中终端里最近打印的 localhost 地址，且终端 cwd 在
+          // 本工作区内——别把验证指到另一个项目的端口上（routes-change 那类坑）。
+          let _bvUrl = "", _bvTermLabel = "";
+          try {
+            const _rootNorm = String(root || "").replace(/\\/g, "/").replace(/\/+$/, "");
+            const _alive = _agentTerminalEntries()
+              .filter((t) => t.status === "运行中" && t.urls.length)
+              .filter((t) => {
+                const c = String(t.cwd || "").replace(/\\/g, "/").replace(/\/+$/, "");
+                return !c || !_rootNorm || c === _rootNorm || c.startsWith(_rootNorm + "/");
+              })
+              .sort((a, b) => b.lastActivityAt - a.lastActivityAt);
+            if (_alive.length) { _bvUrl = _alive[0].urls[_alive[0].urls.length - 1]; _bvTermLabel = _alive[0].label; }
+          } catch {}
+          run._browserVerifyPromptedUrls = run._browserVerifyPromptedUrls || new Set();
+          if (_bvUrl && !run._browserVerifyPromptedUrls.has(_bvUrl)) {
+            run._browserVerifyPromptedUrls.add(_bvUrl);
+            run._browserVerifyCandidate = { action: "navigate", url: _bvUrl };
+            _bvSpokeThisBatch = true;
+            _pushNudge("browserVerify",
+              `[前端改了没看] 刚改了 ${[...new Set(_bvUi)].slice(0, 4).join("、")}`
+              + `${_bvUi.length > 4 ? ` 等 ${_bvUi.length} 个前端文件` : ""}，`
+              + `而 dev server 正在运行：${_bvUrl}（终端「${_bvTermLabel}」的真实输出）。`
+              + `**当前这个版本还没有任何浏览器侧验证证据**。`
+              + `已预填浏览器验证候选——现在调 browser（参数留空即可，留空时执行预填的这一条：navigate 打开 ${_bvUrl}）。`
+              + `这一步只完成「打开页面」；打开后第二步自己再调 browser action:"check" 读控制台错误/接口失败——JS 报错和挂掉的接口在截图上看不出来。`);
+          }
+        }
+      }
+
       // ── 改完就该验：在**刚改完那一下**说，不是等到收尾 ────────────────────────
       //
       // 收尾那道「改了代码、零验证证据」是**只记账、不补回合**的，而且被两条测试正面钉着
@@ -53722,7 +53786,10 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
             && !/\[(ERROR|BLOCKED|DENIED)\]/.test((it.rawResult && it.rawResult.content) || ""))
           .map((it) => String(it.call.path))
           .filter((path) => _CODE_FILE_RE.test(path));
-        if (_justChanged.length) {
+        // 与浏览器候选的先后判据（执行事实=本批改动文件类型）：浏览器候选刚发言且本批
+        // 代码改动**全是**前端文件 → 前端改动浏览器候选优先，这条命令候选本批让位
+        // （verifyNudges 与武装位都不消耗，后续批次照常）；否则照旧先说。
+        if (_justChanged.length && !(_bvSpokeThisBatch && _justChanged.every((p) => _UI_SOURCE_EXT.test(p)))) {
           const _stack = _projectStacks.get(root) || {};
           const _cmd = _stack.checkCmd || _stack.testCmd || "";
           verifyNudges++;
@@ -63092,12 +63159,42 @@ function _verifyCandidateFill(run, call) {
   return call.command;
 }
 
+// ── 浏览器验证候选的代填器 ──────────────────────────────────────────────────
+// browserVerify 把「打开正在跑的 dev server」（真实终端输出里的 URL）预填在
+// run._browserVerifyCandidate 上。模型只需点头：对 browser 发空参数/缺参数调用
+// （没有 url、没有任何定位/文本/脚本/步骤/表单/上传载荷），这里代填 action:"navigate"
+// + url。构造器把缺省 action 落成 "screenshot"、把缺 url 的 navigate 原样放行——这两种
+// 空载荷形态本来要么对着空会话报「没拿到页面截图」、要么开错页面，代填是严格的净改善。
+// 候选一次性消费；模型自己带着 URL 开页则视为它已接管验证路线，候选就地作废——不许
+// 陈旧候选把之后一次普通的空 screenshot 劫持成再导航。发起方永远是模型——IDE 不代跑。
+function _browserVerifyCandidateFill(run, call) {
+  if (!run || !call || call.type !== "browser") return null;
+  const cand = run._browserVerifyCandidate;
+  if (!cand || !String(cand.url || "").trim()) return null;
+  if (String(call.url || "").trim()) { run._browserVerifyCandidate = null; return null; }
+  if (String(call.selector || "").trim() || String(call.target || "").trim() || String(call.role || "").trim()
+    || String(call.text || "").trim() || String(call.script || "").trim() || String(call.key || "").trim()) return null;
+  if (Array.isArray(call.steps) && call.steps.length) return null;
+  if (call.fields && typeof call.fields === "object" && Object.keys(call.fields).length) return null;
+  if (Array.isArray(call.uploadPaths) && call.uploadPaths.length) return null;
+  if (call.width !== undefined || call.height !== undefined || call.mobile) return null;
+  const act = String(call.action || "");
+  if (act && act !== "screenshot" && act !== "navigate") return null;
+  run._browserVerifyCandidate = null;
+  call.action = "navigate";
+  call.url = String(cand.url);
+  return call.url;
+}
+
 async function _executeToolStep(step, call, root, run) {
   // 预填验证候选的「点头」入口：verifyNow 已把项目真实验证命令备好在 run 上；模型空参数
   // 调 run_cmd 即视为点头，代码替它补上命令（「模型答不好，代码替它答」——
   // _recoverableInvalidToolCalls 的同款先例）。必须在授权检查之前：确认框里给用户看的
   // 得是真实命令，不是空串。发起方仍是模型，IDE 从不自己代跑。
   if (typeof _verifyCandidateFill === "function") _verifyCandidateFill(run, call);
+  // 浏览器验证候选的「点头」入口：同款先例、同款位置——必须在唯一授权检查点之前，
+  // 确认框里给用户看的得是真实 URL 的导航，不是一次空截图请求。
+  if (typeof _browserVerifyCandidateFill === "function") _browserVerifyCandidateFill(run, call);
   // ── 唯一权限检查点 ──────────────────────────────────────────────────────
   // 每个工具调用都必经此处（主循环批量调度、内联渲染、子智能体都走这个函数），
   // 所以授权判定只需要插在这一个地方。放在失败记忆之前：被拒绝是用户的决定，
