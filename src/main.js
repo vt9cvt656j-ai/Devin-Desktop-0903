@@ -18639,9 +18639,43 @@ function _turnStatsText({ elapsedMs = 0, settlement = null, timeline = null, liv
   // 不同的两件事，而此前它们显示成一模一样的跑秒表——用户以为首字节到了、界面卡着不画，
   // 实际是上游还没开口。（有些中转不做流式转发：要等整段生成完才发第一个字节，
   // 那段时间本来就没有任何内容可显示。）
+  //
+  // 判据必须是**当前这一轮**，不是任务级首次事件。任务级的 firstModelProgressAt /
+  // firstVisibleAt 只在第一次写入，第一轮首显之后就永远非空，这两个分支从第二轮起
+  // 再也进不去——而 agent 模式下绝大多数等待恰恰发生在第二轮以后（中转不做流式转发、
+  // 网关重试第 2/3 次），界面于是退回成一只光跑的秒表。同一份数据在 tooltip 里是
+  // 逐轮全的（「#5 发起 1:02 · 响应头 - · 模型进度 -」），两个出口说法不一致。
+  // 这里只读 timeline.turns 上已有的字段，不新增任何记录点。
   if (live) {
-    if (firstProgressMs == null) bits.push("等待上游首字节");
-    else if (firstVisibleMs == null) bits.push("接收中");
+    const turns = Array.isArray(timeline?.turns) ? timeline.turns : [];
+    // 倒序找「还没结束的那一轮」，遇到已结束的轮次就停：再往前的未结束轮只可能是
+    // 异常留下的陈迹，拿它当现状会让标签在跑工具时一直亮着。
+    let openTurn = null;
+    for (let i = turns.length - 1; i >= 0; i--) {
+      const turn = turns[i];
+      if (!turn) continue;
+      if (turn.endedAt != null) break;
+      if (turn.requestStartedAt == null) continue;
+      // 并行子体会把自己的轮次推进同一条 timeline，可能同时有多个未结束轮。
+      // 主轮优先——它才是用户正在等的那一次。
+      if (openTurn == null) openTurn = turn;
+      if (String(turn.kind || "main") === "main") { openTurn = turn; break; }
+    }
+    if (openTurn) {
+      const kind = String(openTurn.kind || "main");
+      const tag = kind === "subagent" ? "子体 · "
+        : kind === "aux" ? "辅助 · "
+        : turns.length > 1 ? `第 ${Number(openTurn.stepIndex) || turns.length} 轮 · ` : "";
+      const attempts = Array.isArray(openTurn.attempts) ? openTurn.attempts.length : 0;
+      const retry = attempts > 1 ? `重试 #${attempts} · ` : "";
+      if (openTurn.firstProgressAt == null) bits.push(`${tag}${retry}等待上游首字节`);
+      else if (openTurn.firstVisibleAt == null) bits.push(`${tag}接收中`);
+    } else if (!turns.length) {
+      // 一轮都还没开过（timeline 刚建）：这时任务级判据就是当前判据。
+      if (firstProgressMs == null) bits.push("等待上游首字节");
+      else if (firstVisibleMs == null) bits.push("接收中");
+    }
+    // 有轮次但都已结束 = 正在跑工具，不加标签：工具卡自己在转。
   }
   if (firstProgressMs != null) bits.push(`模型 ${_fmtElapsed(firstProgressMs)}`);
   if (firstVisibleMs != null) bits.push(`首显 ${_fmtElapsed(firstVisibleMs)}`);
@@ -37045,6 +37079,34 @@ function _formatAgentTerminalLines(max = 12) {
   });
 }
 
+// 运行状态块的缓存键里，终端那一半必须是「这一块真会渲染出来的终端事实」，
+// 而不是「终端有没有动静」。原来叠的是 lastActivityAt，可每一个 PTY 输出块都会把它刷成
+// Date.now()——工作区里只要有一个活着的 dev server 在打日志（Vite/express/watcher，
+// 模型用 browser 验页面时服务终端还会刷请求日志），两轮之间键必然不同，缓存永远不命中，
+// 这一块每轮照旧全量重扫。而「起 dev server → 改 → 验」正是最常见的工作形态，
+// 等于这份缓存在最需要它的场景里整体失效。
+//
+// 签名只取块里真会出现的字段：编号 / 状态 / 普通还是任务终端 / 标签 / 命令行 / cwd /
+// URL，外加**已退出终端**那 600 字输出尾巴的指纹（块里只贴这一段）。于是服务崩了
+// （status 变、尾巴出现）、新服务起来（新命令、新 URL）都会换签名；运行中的服务
+// 刷日志不会。原来那项 `status === "已退出" ? 1 : 0` 被时间戳 max 吞掉，从来没生效过，
+// 它想表达的「服务退出要刷新」由 status 字段直接承担。
+function _agentTerminalStateSignature() {
+  const parts = [];
+  try {
+    for (const it of _agentTerminalEntries()) {
+      const tail = it.status === "已退出"
+        ? _resultFingerprint(String(it.recent || "").trim().slice(-600))
+        : "";
+      parts.push([
+        it.index, it.status, it.task ? "task" : "plain",
+        it.label, it.command, it.cwd, it.urls.join(","), tail,
+      ].join("|"));
+    }
+  } catch { /* 终端面板还没就绪：按目前收集到的部分算签名 */ }
+  return parts.join(";");
+}
+
 function _terminalLogChunks(name = "", maxTasks = 3) {
   const tasks = name
     ? [_findAgentTerminal(name)].filter(Boolean)
@@ -49577,17 +49639,19 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
       // 缓存键不能只看文件变化。这一块现在还带着**终端状态**（已退出的终端 + 它的最后输出）
       // 和 git 现场，而 `npm run dev` 崩掉时一个文件都不会动——只用 _fsMutTick 当键的话，
       // 进程死了、输出也有了，模型整轮拿到的仍是那份写着「运行中」的旧快照。
-      // 把终端的最近活动时间叠进键里：终端一有动静（启动/输出/退出）就重建。
-      let _termTick = 0;
-      try {
-        for (const it of _agentTerminalEntries()) {
-          _termTick = Math.max(_termTick, Number(it.lastActivityAt) || 0, it.status === "已退出" ? 1 : 0);
-        }
-      } catch {}
+      // 把终端状态签名叠进键里：块里真会渲染的终端事实一变（服务崩了、新服务起来、
+      // 换了命令或 URL）就重建，运行中的服务刷日志不重建。见 _agentTerminalStateSignature。
+      const _termTick = _agentTerminalStateSignature();
       const _fsTickNow = `${run._fsMutTick || 0}:${_termTick}`;
       if (run._rtStateTick !== _fsTickNow) {
-        run._rtState = await _promiseOrFallbackWithin(_agentRuntimeStateBlock(root), 1600, "");
-        run._rtStateTick = _fsTickNow;
+        // 超时兜底不能写进缓存。原来超时回 "" 并连同新键一起存下，于是这一整轮模型手上
+        // 没有执行状态块，下一轮键再变又重扫——模型看到的环境事实在「完整」和「空」
+        // 之间来回翻。超时就保留上一份快照、且不推进键，下一轮自然重试。
+        const _rtFresh = await _promiseOrFallbackWithin(_agentRuntimeStateBlock(root), 1600, null);
+        if (_rtFresh != null) {
+          run._rtState = _rtFresh;
+          run._rtStateTick = _fsTickNow;
+        }
       }
       const _runtimeStateBlock = run._rtState || "";
       // 「本次运行真的做过事」和「这个项目长什么样」是两件事，此前混成了一个条件。
@@ -53768,7 +53832,23 @@ function _settleToolStep(step, result, label = "") {
     return false;
   }
   const content = String(result?.content || "");
-  const failed = /\[(?:ERROR|BLOCKED|DENIED|失败|不可用|interrupted|未执行)\]|失败|缺参数|未知工具|已停止/i.test(content);
+  // 红绿判据必须和台账同源。这里原来是对**整段正文**扫裸词（失败 / 缺参数 / 未知工具 /
+  // 已停止），于是 search_tools 走到「无匹配」分支时，正文里那句「这不是检索失败」把一张
+  // 成功卡涂成红色 + rejected 样式，而同一次调用在 _toolExecutionSucceeded 那边记的是
+  // ok=true、计划照常推进——界面和记账对同一次调用给出相反结论，用户据此以为工具被拒了。
+  // 反向也漏：裸词表里没有 CONFLICT / NEEDS_REPO / 权限问题，那几种真失败反被画成绿色。
+  // 判定顺序照抄 _toolExecutionSucceeded：结构化结局 → cmd 退出码 → 正文首行方括号标记。
+  // 需要说清语义的调用点本来就传了 label（「未知工具」「缺少 question」「已停止」…），
+  // 从此 label 只管文字、结构化事实只管红绿。
+  //
+  // 首行标记这一条是 _toolFailureMarkerAtHead 的内联副本：本函数会被 test/logic.test.mjs
+  // 用 load() 单独取出来跑（只注入 _collapseSettledToolSteps），引用外部函数会当场
+  // ReferenceError。两份词表由 test/tool-card-verdict.test.mjs 里的漂移断言钉住。
+  const head = content.replace(/^\s*〔外部数据〕\s*/, "").split("\n", 1)[0] || "";
+  const failed = result?.failure && result.failure.code ? true
+    : result?.ok === false ? true
+    : result?.type === "cmd" && Number.isFinite(Number(result?.code)) ? Number(result.code) !== 0
+    : /^\s*\[[^\]\n]{0,80}(失败|ERROR|BLOCKED|CONFLICT|DENIED|NEEDS_REPO|不可用|未执行|权限问题|interrupted)[^\]\n]{0,80}\]/i.test(head);
   res.className = `atc-result ${failed ? "atc-result--err" : "atc-result--ok"}`;
   res.textContent = label || (failed ? "失败" : "完成");
   if (failed) step?.classList?.add?.("agent-tool-step--rejected");

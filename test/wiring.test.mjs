@@ -38,7 +38,7 @@ const HERE = dirname(fileURLToPath(import.meta.url));
 // 只在注释里留一句，assert.match 照样绿——本仓库已经这样漏过一整组模型可见的工具契约。
 // 所以 `SRC` 绑定的是 CODE（注释整段置空，行号与偏移和原文一字不差）；
 // 真要匹配注释本身的断言显式用 RAW_SRC，并在那一行写清为什么。
-import { CODE as SRC, SRC as RAW_SRC } from "./helpers/source.mjs";
+import { CODE as SRC, SRC as RAW_SRC, load } from "./helpers/source.mjs";
 
 // Deliberately NOT comment-stripped. A naive stripper is unsafe here: this file contains
 // regex literals holding `/*` and `//`, and a stripper that mis-parses one silently deletes a
@@ -491,9 +491,27 @@ test("没跑成的工具调用必须如实回一条结果，不能在转录里�
     "补齐的同时要标 _notAttempted");
   assert.equal(count(SRC, /_notAttempted = true/g), 1, "_notAttempted 只该在补齐处写入");
   assert.ok(count(SRC, /\?\._notAttempted/g) >= 3, "失败归因/恢复分析仍要按 _notAttempted 排除未执行项");
-  // UI 上不能把"未执行"显示成绿色的成功
-  assert.match(SRC, /const failed = \/\\\[\(\?:ERROR\|BLOCKED\|DENIED\|失败\|不可用\|interrupted\|未执行\)/,
+  // UI 上不能把"未执行"显示成绿色的成功。
+  // 这条原来钉的是 _settleToolStep 里那串判据正则的**字面量**。判据后来换成了结构化的
+  // （failure.code / ok:false / cmd 退出码 / 正文首行的方括号标记，见 test/tool-card-verdict），
+  // 字面量一改这条就假红，而它真正要守的从来是「[未执行] 不许显示成绿勾」。改钉行为。
+  const settleStep = load("_settleToolStep", { _collapseSettledToolSteps: () => {} });
+  let cardText = "";
+  const cardClasses = new Set();
+  const resultEl = {
+    className: "atc-result",
+    querySelector: (sel) => (sel === ".atc-spin" && !cardText ? {} : null),
+    get textContent() { return cardText; },
+    set textContent(v) { cardText = v; },
+  };
+  settleStep(
+    { dataset: {}, classList: { add: (n) => cardClasses.add(n) }, querySelector: (sel) => (sel === ".atc-result" ? resultEl : null) },
+    { content: "[未执行] 这次调用没有跑，不要把它当成已完成。" },
+    "未执行",
+  );
+  assert.match(resultEl.className, /atc-result--err/,
     "[未执行] 必须被判成非成功态，否则卡片显示绿勾");
+  assert.ok(cardClasses.has("agent-tool-step--rejected"), "未执行的卡片还要带 rejected 样式");
 });
 
 // ── 2026-08-19：「说执行完毕，其实没执行」专项。以下五条都是执行事实层面的谎报。 ──
