@@ -16369,21 +16369,70 @@ async function _ensureSessionTranscript(session) {
     session._transcriptLoadPromise = (async () => {
       try {
         const expected = Math.max(0, Number(session.memory?.totalTurns) || 0);
-        const start = Math.max(0, expected - _RENDER_LIMIT);
-        const loaded = await backend.conversationTranscriptWindow(session.id, start, _RENDER_LIMIT);
+        // 第一窗按 checkpoint 猜，**唯一目的是问出日志的真实总数**（返回值带 total）。
+        // 猜错不要紧，下面会按真实结尾重取；猜对时省掉一次 IPC。
+        let loaded = await backend.conversationTranscriptWindow(
+          session.id,
+          Math.max(0, expected - _RENDER_LIMIT),
+          _RENDER_LIMIT,
+        );
         if (!loaded || loaded.sessionId !== session.id || !Array.isArray(loaded.messages)) {
           throw new Error("conversation transcript response was invalid");
         }
-        for (let index = 0; index < loaded.messages.length; index++) {
-          _cacheTranscriptMessage(session, loaded.start + index, loaded.messages[index]);
-        }
-        session._historyTotal = Math.max(0, Number(loaded.total) || 0);
-        // journal 比 checkpoint 新时，先把多出来的那截真正补进 recent，再对齐计数。
-        // 只对齐计数的话，界面（从 journal 重画）是全的、模型上下文却停在旧 checkpoint——
-        // 这正是"崩溃重开后消息一条不少，它却像没看过"的来源。顺序不能反：补进去之后
-        // totalTurns 已经推到 loaded.total，setExternalTranscriptLength 只是兜底。
-        if (session._historyTotal > expected) {
-          session.memory?.adoptJournalTail?.(loaded.messages, session._historyTotal);
+        const total = Math.max(0, Number(loaded.total) || 0);
+        session._historyTotal = total;
+
+        if (total > expected) {
+          // ── 崩溃重开这条路 ────────────────────────────────────────────────
+          //
+          // 流式期间 saveChatHistory 会降级、**不写 checkpoint**，但每条消息都逐条进了
+          // SQLite。所以异常退出后 `expected`（来自 checkpoint）可以远远落后于日志。
+          //
+          // 上一版在这里有两个叠加的错，后果都落在"崩溃后它像没看过"上：
+          //
+          //  1. **取错了那一窗。** 取的是 `[expected-56, expected)` —— 那是**旧结尾**
+          //     附近的一窗，不是日志的结尾。checkpoint 停在 100、日志已经 500 时，
+          //     取回来的是第 44–100 条。
+          //  2. **把它当成结尾喂了进去。** `adoptJournalTail(tail, total)` 的契约是
+          //     「tail 必须是结尾那一段」：它按 `target - known` 算差额、再从 tail
+          //     **末尾**切。于是第 44–100 条被当作第 444–500 条接进 recent，而
+          //     totalTurns 一步跳到 500 —— 中间 344 轮既没进 recent 也没进 archive，
+          //     `recall_conversation` 从此也找不回来。界面上消息一条不少（那是从日志
+          //     重画的），模型的记忆里却是一段错位 + 一个黑洞。
+          //
+          // 现在按真实总数重取，并且把 checkpoint 没见过的**整段**补进来。整段补进去
+          // 之后，超出 RECENT_WINDOW 的部分由 `_compressOldestBatch` 正常归档 ——
+          // 那正是它平时的走法，recall 仍然找得到。
+          const from = Math.max(0, Math.max(expected, total - _RESTORE_GAP_MAX_MESSAGES));
+          if (total - expected > _RESTORE_GAP_MAX_MESSAGES) {
+            console.warn(
+              `[chat] 日志比 checkpoint 多出 ${total - expected} 条，只补最近 ${_RESTORE_GAP_MAX_MESSAGES} 条`,
+            );
+          }
+          const gap = [];
+          for (let cursor = from; cursor < total;) {
+            const page = await backend.conversationTranscriptWindow(
+              session.id,
+              cursor,
+              Math.min(_RESTORE_GAP_PAGE, total - cursor),
+            );
+            if (!page || page.sessionId !== session.id || !Array.isArray(page.messages) || page.end <= cursor) {
+              throw new Error("conversation transcript gap page was invalid");
+            }
+            for (let index = 0; index < page.messages.length; index++) {
+              _cacheTranscriptMessage(session, page.start + index, page.messages[index]);
+            }
+            gap.push(...page.messages);
+            cursor = page.end;
+          }
+          // 顺序不能反：补进去之后 totalTurns 已经推到 total，下面那句只是兜底。
+          session.memory?.adoptJournalTail?.(gap, total);
+          // 后面那段「窗口里有分块消息就丢弃 HTML 快照」要看的是**实际渲染的那一窗**。
+          loaded = { sessionId: session.id, start: from, end: total, total, messages: gap };
+        } else {
+          for (let index = 0; index < loaded.messages.length; index++) {
+            _cacheTranscriptMessage(session, loaded.start + index, loaded.messages[index]);
+          }
         }
         session.memory?.setExternalTranscriptLength?.(session._historyTotal);
         // A bounded HTML snapshot cannot carry the metadata needed to page a
@@ -16403,6 +16452,41 @@ async function _ensureSessionTranscript(session) {
   }
   return session._transcriptLoadPromise;
 }
+
+// 把**后台标签**的历史也读进来，别等用户点到那一个才开始加载。
+//
+// 在此之前 `_ensureSessionTranscript` 只在切标签时调，于是异常退出重开之后，除了当前
+// 这一个，其它标签的 `session.memory` 全是 checkpoint 里那份旧的（崩溃时可能远远落后
+// 于日志）。表现有两种，用户都会碰到：点过去要等一下才出内容；更糟的是**在它补完之前
+// 就发消息**，模型拿到的是缺了一大截的上下文。
+//
+// 只补**数据**，不碰 DOM：渲染仍然等到那个标签第一次被显示时再做（整窗渲染卡死主线程
+// 是有实锤的，见 _RENDER_SYNC_LIMIT 那条注释）。所以这一步对首屏零影响。
+//
+// 串行 + requestIdleCallback：并发拉几个长会话会和首屏抢主线程，而这件事一点都不急。
+function _schedulePassiveTranscriptWarmup() {
+  if (!inTauri || _passiveWarmupStarted) return;
+  _passiveWarmupStarted = true;
+  const idle = typeof requestIdleCallback === "function"
+    ? requestIdleCallback
+    : (fn) => setTimeout(() => fn({ timeRemaining: () => 0 }), 200);
+  const pending = _chatSessions.filter((session) => session && session._transcriptLoaded === false);
+  if (!pending.length) return;
+  const step = () => {
+    const session = pending.shift();
+    if (!session) return;
+    // 期间用户可能已经点过去了（那时 _switchChatSession 自己会加载），或者关掉了这个标签。
+    if (session._transcriptLoaded === false && _chatSessions.includes(session)) {
+      _ensureSessionTranscript(session)
+        .catch((error) => console.warn("[chat] 后台标签历史预载失败:", error))
+        .finally(() => { if (pending.length) idle(step); });
+      return;
+    }
+    if (pending.length) idle(step);
+  };
+  idle(step);
+}
+let _passiveWarmupStarted = false;
 
 function _bindSessionMemoryCleanup(session) {
   session?.memory?.setRemovalHandler?.((messages) => {
@@ -16642,6 +16726,13 @@ const _ICON_CAPS = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" s
 // a long thread can't freeze the UI — the FULL history always stays in
 // session.history for the agent's context, only the DOM is trimmed.
 const _RENDER_LIMIT = 56;
+// 崩溃重开时要补的「checkpoint 没见过的那一段」的上限与分页大小。
+//
+// 上限存在的理由只有一个：别让一份异常巨大的日志把启动卡住。它**不是**"只恢复这么多"
+// —— 超出的部分仍然在 SQLite 里，界面往回滚照样读得到；被限制的只是一次性补进模型
+// 记忆结构的量，而且补的永远是**最近**那一段（adoptJournalTail 从尾部切）。
+const _RESTORE_GAP_MAX_MESSAGES = 2000;
+const _RESTORE_GAP_PAGE = 128;
 const _RENDER_PAGE = 32;
 const _RENDER_SYNC_LIMIT = 30; // 恢复时只同步渲染最近这么多条，其余窗口 idle 补渲
 const _RENDER_SLICE_BUDGET_MS = 50; // 历史渲染每片最多占用主线程 50ms
@@ -18105,6 +18196,7 @@ async function restoreChatHistory() {
         const activeIdx = saved.activeIdx ?? 0;
         await _switchChatSession(Math.min(activeIdx, _chatSessions.length - 1));
         _scrollChatBottom(); // on open, land on the latest message without manual scrolling
+        _schedulePassiveTranscriptWarmup();
       }
     } else if (Array.isArray(saved) && saved.length > 0) {
       const session = _newChatSession("Chat 1");
