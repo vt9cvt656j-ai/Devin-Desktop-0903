@@ -482,8 +482,16 @@ const LEGACY_USER_REQUEST_BOUNDARY_PREFIX: &str = "━━━━━━━━━�
 #[cfg(test)]
 const AUTO_KNOWLEDGE_MIN_QUERY_CHARS: usize = 12;
 const AUTO_KNOWLEDGE_MAX_QUERY_CHARS: usize = 1200;
+/// 未限定领域时的召回上限：查询要和全部 828 段抢名额，其中 452 段（86%）是
+/// michael-design 设计蓝本，多给名额只会多灌设计稿。
 const AUTO_KNOWLEDGE_MAX_HITS: usize = 2;
+/// 画像点名了领域时的召回上限。检索池从 828 段收窄到一个领域的几十段，压过召回的噪声
+/// 源没了，名额就该给到位——专业请求（HIPAA／逆向／渗透）值一段以上的成体系参考。
+const AUTO_KNOWLEDGE_DOMAIN_MAX_HITS: usize = 4;
 const AUTO_KNOWLEDGE_MIN_SCORE: f64 = 3.0;
+/// 画像里领域旗标的前缀：`domain_<name>`，name = knowledge/ 下的目录名把 `-` 换成 `_`
+/// （画像头的字符集不收 `-`）。例：`domain_healthcare`、`domain_reverse_engineering`。
+const SEMANTIC_DOMAIN_FLAG_PREFIX: &str = "domain_";
 const DESIGN_KNOWLEDGE_DOMAIN: &str = "michael-design";
 const DESIGN_KNOWLEDGE_SEARCH_POOL: usize = 12;
 const DESIGN_KNOWLEDGE_MAX_HITS: usize = 8;
@@ -2009,15 +2017,38 @@ fn auto_knowledge_block(mode: &str, user_request: Option<&str>) -> Option<String
     {
         return None;
     }
-    auto_knowledge_block_for_semantic_task(mode, Some(request))
+    auto_knowledge_block_for_semantic_task(mode, Some(request), None).map(|injected| injected.block)
+}
+
+/// 一次通用语料注入的结果。块本身给提示词，`hits` 只给遥测：部署后要能直接量「21 个
+/// 专业领域到底醒了没有」，而 prompt_blocks 里那个 `auto_knowledge` 标记只说「有块」，
+/// 说不出真正注进去几段。
+///
+/// 这里不重复存限定到的域：调用方本来就持有它，而且调用方那份还要覆盖「门开了、零命中」
+/// 这种本结构体根本不会返回的情形——存两份就是给它们留了个不一致的口子。
+struct AutoKnowledgeInjection {
+    block: String,
+    hits: usize,
+}
+
+/// 遥测字段值：没限定域时打 `-`（不是空串——空串在日志里和「字段丢了」长得一样）。
+fn auto_knowledge_domain_field(domain: Option<&str>) -> &str {
+    match domain {
+        Some(domain) if !domain.is_empty() => domain,
+        _ => "-",
+    }
 }
 
 /// Same bounded retrieval, but intent has already been decided by the IDE semantic profile.
 /// The request text is only the retrieval query; it must not be classified again here.
+///
+/// `domain` 必须是 `semantic_knowledge_domain` 核对过、来自 knowledge 索引的真实目录名，
+/// 或者 None（全库检索）。这里不做任何领域判断，也不看用户正文猜领域。
 fn auto_knowledge_block_for_semantic_task(
     mode: &str,
     user_request: Option<&str>,
-) -> Option<String> {
+    domain: Option<&str>,
+) -> Option<AutoKnowledgeInjection> {
     if mode != "agent" {
         return None;
     }
@@ -2025,11 +2056,16 @@ fn auto_knowledge_block_for_semantic_task(
     if request.is_empty() {
         return None;
     }
+    let max_hits = if domain.is_some() {
+        AUTO_KNOWLEDGE_DOMAIN_MAX_HITS
+    } else {
+        AUTO_KNOWLEDGE_MAX_HITS
+    };
     let query = bounded_chars(request, AUTO_KNOWLEDGE_MAX_QUERY_CHARS);
-    let hits = crate::knowledge::search(&query, None, AUTO_KNOWLEDGE_MAX_HITS)
+    let hits = crate::knowledge::search(&query, domain, max_hits)
         .into_iter()
         .filter(|hit| hit.score >= AUTO_KNOWLEDGE_MIN_SCORE)
-        .take(AUTO_KNOWLEDGE_MAX_HITS)
+        .take(max_hits)
         .collect::<Vec<_>>();
     if hits.is_empty() {
         return None;
@@ -2047,11 +2083,14 @@ fn auto_knowledge_block_for_semantic_task(
             hit.text
         ));
     }
-    Some(format!(
-        "--- 平台知识库·与真实用户请求相关的工程参考（自动检索，最多 {AUTO_KNOWLEDGE_MAX_HITS} 段）---\n\
-         这些内容用于提醒常见工程约束，不替代当前项目源码、项目约定和真实构建/测试结果；发生冲突时以后者为准。未标适用版本或更新时间的片段不能证明当前 API 或社区现状。\n\n{}",
-        sections.join("\n\n———\n\n")
-    ))
+    Some(AutoKnowledgeInjection {
+        block: format!(
+            "--- 平台知识库·与真实用户请求相关的工程参考（自动检索，最多 {max_hits} 段）---\n\
+             这些内容用于提醒常见工程约束，不替代当前项目源码、项目约定和真实构建/测试结果；发生冲突时以后者为准。未标适用版本或更新时间的片段不能证明当前 API 或社区现状。\n\n{}",
+            sections.join("\n\n———\n\n")
+        ),
+        hits: hits.len(),
+    })
 }
 
 /// Build a compact design-blueprint block from the michael-design corpus for a UI task.
@@ -3438,6 +3477,9 @@ fn looks_like_ui_data_task(q: &str) -> bool {
         .any(|term| lower.contains(term))
 }
 
+/// 画像协议里**固定的**那批旗标。这张表不是全集：还有一族 `domain_<name>`（见
+/// `SEMANTIC_DOMAIN_FLAG_PREFIX` / `is_semantic_domain_flag`），它的合法取值来自
+/// knowledge 语料目录、随运营增删，列在这里只会漂移。
 const IDE_SEMANTIC_PROFILE_FLAGS: &[&str] = &[
     "engineering",
     "defects",
@@ -3505,10 +3547,51 @@ fn ide_semantic_profile(headers: &HeaderMap) -> Option<HashSet<String>> {
     Some(
         raw[4..]
             .split(',')
-            .filter(|flag| allowed.contains(*flag))
+            .filter(|flag| allowed.contains(*flag) || is_semantic_domain_flag(flag))
             .map(str::to_string)
             .collect(),
     )
+}
+
+/// `domain_<name>` 是数据驱动的旗标，静态名单装不下它：语料目录随运营增删，写死一份
+/// 名单就等着漂移——加一个领域要改两处代码、少改一处就是这面旗永远被静默丢弃。
+/// 这里只做形状与长度检查（字符集已由头部整体校验保证是 `[a-z0-9._:,]`）；真正的白名单
+/// 在 `semantic_knowledge_domain`，对着 knowledge 索引里实际加载到的目录名核。
+fn is_semantic_domain_flag(flag: &str) -> bool {
+    flag.strip_prefix(SEMANTIC_DOMAIN_FLAG_PREFIX)
+        .is_some_and(|name| !name.is_empty() && name.len() <= 64)
+}
+
+/// 把画像里的 `domain_<name>` 旗标还原成 knowledge 索引里**真实存在**的目录名。
+///
+/// 白名单的唯一来源是 `knowledge::get().domains`——`knowledge::load()` 扫
+/// `KNOWLEDGE_DIR/<domain>/` 得到的目录名，不是任何硬编码列表；语料新增一个领域，这里
+/// 自动认，删掉一个领域，对应旗标当场失效。核不上就返回 None（退回全库检索），客户端
+/// 发来的原文一个字都不进检索：`knowledge::search` 的域解析会做子串近似匹配，把未知
+/// 字符串透传进去等于让客户端拿一个乱猜的名字去命中某个真实领域。
+///
+/// 比对时两边都把 `_` 归一成 `-`：旗标名带不了 `-`（画像头字符集不收），而目录名用的
+/// 是 `-`；两边同时归一，目录名里真出现 `_` 也不会漏认。
+///
+/// 网关不分类，只被告知：域只能来自画像旗标，这里不看用户正文一个字。
+fn semantic_knowledge_domain(profile: &HashSet<String>) -> Option<String> {
+    let mut candidates: Vec<&str> = profile
+        .iter()
+        .filter_map(|flag| flag.strip_prefix(SEMANTIC_DOMAIN_FLAG_PREFIX))
+        .filter(|name| !name.is_empty())
+        .collect();
+    // 画像同时带多面域旗时按字典序取第一个核得上的。HashSet 的迭代顺序不稳定，直接取
+    // 首个会让同一份画像两次组装出不同的系统前缀，整条上游 prompt 缓存逐轮作废。
+    candidates.sort_unstable();
+    let known = &crate::knowledge::get().domains;
+    candidates.into_iter().find_map(|name| {
+        let want = name.to_lowercase().replace('_', "-");
+        known
+            .iter()
+            .map(|(domain, _)| domain)
+            .find(|domain| domain.to_lowercase().replace('_', "-") == want)
+            .cloned()
+    })
 }
 
 /// Server-side assembly (L0 — "airtight"): if the IDE asks for it via headers, inject the
@@ -3805,6 +3888,11 @@ pub fn assemble_into(headers: &HeaderMap, body: &mut serde_json::Value) -> Resul
     // Model-independent engineering retrieval. Every agent model gets the same bounded
     // reference block for a concrete coding task; prompt tier only changes presentation density.
     // Env MICHAEL_AUTO_KNOWLEDGE=0 remains an operational kill switch.
+    //
+    // 这两个只为遥测存在：本轮限定到了哪个语料领域、真正注进去几段。没进这道门时保持
+    // 默认值（`-` / 0），日志里「门没开」和「开了但零命中」因此可分。
+    let mut knowledge_domain: Option<String> = None;
+    let mut knowledge_hits: usize = 0;
     if std::env::var("MICHAEL_AUTO_KNOWLEDGE").ok().as_deref() != Some("0") {
         // 粘性检索查询：续跑轮（"继续/再改改"）不含工程描述，工程参考块会整轮消失——
         // 恰恰是迭代实现最需要社区参考的轮次。当前请求不合格时，回退到最近一条合格的
@@ -3812,14 +3900,38 @@ pub fn assemble_into(headers: &HeaderMap, body: &mut serde_json::Value) -> Resul
         // 前缀缓存纪律：这个块在系统提示里，query 取【最早】命中工程信号的真实用户请求
         // （正向扫描 + 剥 📌 包装），会话内逐字节稳定；取最新一条会让每句追问打碎整条缓存。
         let knowledge_query = anchor_request.clone().filter(|query| !query.trim().is_empty());
-        if engineering_intent && research_intent {
-            if let Some(block) =
-                auto_knowledge_block_for_semantic_task(mode, knowledge_query.as_deref())
-            {
+        // 判据从 `engineering_intent && research_intent` 放宽成只看 engineering。
+        //
+        // 旧判据把语料的自动注入挂在 research 旗标上，而 research 说的是「这轮要去外面查
+        // 资料」，不是「这轮该拿领域参考」。后果是纯实现请求（"写个 X 功能"）不点亮
+        // research，整个知识库对它不存在——生产实测近 24h 只有个位数请求挂上
+        // auto_knowledge，21 个专业领域（HIPAA、逆向、渗透、嵌入式……）等于没部署。
+        //
+        // 代价明确且有界：每个编码请求多约 1-2KB 系统提示（限定域时最多 4 段，见
+        // AUTO_KNOWLEDGE_DOMAIN_MAX_HITS）。语料就是为了被用而维护的，门窄到只有
+        // 「工程 + 研究」双旗才开，等于花钱养一份没人读的资料。零命中时块整个不出现，
+        // 不相关的请求不会白背这 1-2KB。
+        //
+        // 研究类请求的行为不变：research 旗标照旧路由 graph.agent.research 模块，那是
+        // 另一条路，这里放宽不动它。
+        if engineering_intent {
+            // 域只能来自画像旗标。这里不看 knowledge_query 一个字——网关不分类，只被告知。
+            knowledge_domain = semantic_knowledge_domain(&semantic_profile);
+            if let Some(injected) = auto_knowledge_block_for_semantic_task(
+                mode,
+                knowledge_query.as_deref(),
+                knowledge_domain.as_deref(),
+            ) {
                 sys.push_str("\n\n");
-                sys.push_str(&block);
+                sys.push_str(&injected.block);
                 prompt_blocks.push("auto_knowledge".to_string());
-                tracing::info!(mode, "auto-injecting bounded engineering knowledge");
+                knowledge_hits = injected.hits;
+                tracing::info!(
+                    mode,
+                    knowledge_domain = %auto_knowledge_domain_field(knowledge_domain.as_deref()),
+                    knowledge_hits,
+                    "auto-injecting bounded engineering knowledge"
+                );
             }
         }
     }
@@ -3928,6 +4040,13 @@ pub fn assemble_into(headers: &HeaderMap, body: &mut serde_json::Value) -> Resul
         marked_request_bytes,
         last_user_bytes,
         semantic_profile_seen = ?semantic_profile_seen,
+        // 「语料到底注进去没有」的直接判据。prompt_blocks 里的 auto_knowledge 只说「有块」：
+        //   knowledge_domain=- 且 hits=0 → 门没开或零命中，语料对这轮不存在；
+        //   knowledge_domain=healthcare 且 hits>0 → 领域限定生效，专业域醒了。
+        // 没有这两个字段，就只能从 prompt_blocks 反推，而反推分不清「没限定域」和「限定
+        // 到了但一段都没召回」——恰恰是 21 个薄领域最可能出的那种失败。
+        knowledge_domain = %auto_knowledge_domain_field(knowledge_domain.as_deref()),
+        knowledge_hits,
         run_id = %ide_run.0,
         step_index = %ide_run.1,
         step_kind = %ide_run.2,
@@ -6389,6 +6508,270 @@ mod tests {
         );
     }
 
+    /// 组装一次 agent 请求，取回系统前缀里的语料块（没有就 None）。
+    fn assembled_knowledge_block(profile: &str, request: &str) -> Option<String> {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-ide-mode", "agent".parse().unwrap());
+        headers.insert("x-ide-semantic-profile", profile.parse().unwrap());
+        let mut body = serde_json::json!({
+            "model": "gpt-5.5",
+            "messages": [{"role": "user", "content": request}]
+        });
+        assemble_into(&headers, &mut body);
+        let system = body["messages"][0]["content"].as_str().unwrap_or_default();
+        let marker = "--- 平台知识库·与真实用户请求相关";
+        system.find(marker).map(|at| system[at..].to_string())
+    }
+
+    /// 语料块里每条命中的 `域/主题` 前缀（块头形如 `【1｜healthcare/hipaa-and-fhir · …】`）。
+    fn knowledge_hit_domains(block: &str) -> Vec<String> {
+        block
+            .match_indices("【")
+            .filter_map(|(at, _)| {
+                let head = &block[at..];
+                let bar = head.find('｜')?;
+                let rest = &head[bar + '｜'.len_utf8()..];
+                let slash = rest.find('/')?;
+                Some(rest[..slash].to_string())
+            })
+            .collect()
+    }
+
+    fn profile_flags(flags: &[&str]) -> HashSet<String> {
+        flags.iter().map(|flag| (*flag).to_string()).collect()
+    }
+
+    /// 通用语料的自动注入曾经挂在 `engineering && research` 双旗上。research 说的是「这轮
+    /// 要去外面查资料」，不是「这轮该拿领域参考」——于是纯实现请求（"写个 X 功能"）永远
+    /// 不点亮它，22 个领域 828 段语料对绝大多数编码轮次等于不存在（生产实测近 24h 只有
+    /// 个位数请求挂上 auto_knowledge）。判据现在只看 engineering。
+    ///
+    /// 反向的边同样重要：engineering 是唯一的钥匙，research 自己开不了这道门——否则这就
+    /// 不是「换了判据」而是「取消了判据」。
+    #[test]
+    fn engineering_alone_opens_the_general_knowledge_gate() {
+        let request = "实现 Rust Tokio 并发任务，修复 MutexGuard 跨 await，并补充错误处理测试";
+
+        let engineering_only = assembled_knowledge_block("2.5:engineering", request)
+            .expect("engineering 单旗必须能拿到通用语料——放宽这道门就是本次改动的全部意义");
+        assert!(
+            !knowledge_hit_domains(&engineering_only).is_empty(),
+            "块在但一条命中都没有，说明块头写死了而检索没接上"
+        );
+
+        let with_research = assembled_knowledge_block("2.5:engineering,research", request)
+            .expect("原有的双旗组合必须继续注入");
+        assert_eq!(
+            engineering_only, with_research,
+            "research 只该决定 agent_research 模块挂不挂，不该再改变语料块的内容"
+        );
+
+        for closed in ["2.5:research", "2.5:research,community,official", "2.5:"] {
+            assert!(
+                assembled_knowledge_block(closed, request).is_none(),
+                "没有 engineering 旗标就不该注入通用语料：{closed}"
+            );
+        }
+    }
+
+    /// 领域限定：画像点名 `domain_<name>` 时，检索只在那个语料目录里跑，名额也从 2 提到 4。
+    ///
+    /// 用渗透测试这条请求当判据，是因为它把「召回被淹没」量在了明处：不限定域时全库前两
+    /// 名里挤着 security/ 的段，第三名往后直接是 web-frontend/testing 的 Playwright——因为
+    /// "testing" 这个词在前端语料里密度更高。限定到 penetration-testing 之后，四个名额全部
+    /// 落在真正对口的目录里。
+    #[test]
+    fn a_declared_domain_flag_scopes_retrieval_and_widens_top_k() {
+        let request = "对这个内网做渗透测试，枚举服务并做权限提升";
+
+        let unscoped =
+            assembled_knowledge_block("2.5:engineering", request).expect("不限定域也该有块");
+        let unscoped_domains = knowledge_hit_domains(&unscoped);
+        assert_eq!(
+            unscoped_domains.len(),
+            AUTO_KNOWLEDGE_MAX_HITS,
+            "不限定域时名额是 AUTO_KNOWLEDGE_MAX_HITS"
+        );
+        assert!(
+            unscoped_domains
+                .iter()
+                .any(|domain| domain != "penetration-testing"),
+            "全库检索本来就会混进别的领域，这正是要限定域的理由；混不进来说明这条请求\
+             选得不对，换一条能量出淹没现象的"
+        );
+
+        let scoped =
+            assembled_knowledge_block("2.5:engineering,domain_penetration_testing", request)
+                .expect("限定到真实存在的域必须有块");
+        let scoped_domains = knowledge_hit_domains(&scoped);
+        assert_eq!(
+            scoped_domains.len(),
+            AUTO_KNOWLEDGE_DOMAIN_MAX_HITS,
+            "限定域后名额是 AUTO_KNOWLEDGE_DOMAIN_MAX_HITS"
+        );
+        assert!(
+            AUTO_KNOWLEDGE_DOMAIN_MAX_HITS > AUTO_KNOWLEDGE_MAX_HITS,
+            "限定域的名额必须比全库多，否则收窄检索池毫无收益"
+        );
+        assert!(
+            scoped_domains
+                .iter()
+                .all(|domain| domain == "penetration-testing"),
+            "限定域后仍混进了别的目录：{scoped_domains:?}"
+        );
+        assert!(
+            scoped.contains(&format!("最多 {AUTO_KNOWLEDGE_DOMAIN_MAX_HITS} 段")),
+            "块头报的名额必须是本次真正用的那个，别写死成全库那个数"
+        );
+    }
+
+    /// 域名白名单：只认 knowledge 索引里实际加载到的目录名，来源是 `knowledge::load()` 扫
+    /// 出来的 `domains`，不是任何硬编码列表。
+    ///
+    /// `domain_pen` 是这条测试的重点。`knowledge::search` 的域解析故意做了子串近似匹配
+    /// （模型会把 backend-api 猜成 "backend"），所以一旦把客户端发来的原文透传进去，
+    /// "pen" 就会静默命中 penetration-testing——一个乱猜的旗标于是拿到了限定检索的权力。
+    /// 白名单必须在进检索之前就把它挡掉，退回全库。
+    #[test]
+    fn only_domains_that_exist_in_the_index_can_scope_retrieval() {
+        let indexed: Vec<String> = crate::knowledge::get()
+            .domains
+            .iter()
+            .map(|(domain, _)| domain.clone())
+            .collect();
+        assert!(
+            indexed.len() >= 20,
+            "语料索引没加载起来，下面的断言会全是空转：{indexed:?}"
+        );
+
+        // 每一个真实目录名都能被它对应的旗标还原（`-` ↔ `_`），且还原出的是索引里的原串。
+        for domain in &indexed {
+            let flag = format!("{SEMANTIC_DOMAIN_FLAG_PREFIX}{}", domain.replace('-', "_"));
+            assert!(
+                is_semantic_domain_flag(&flag),
+                "{flag} 形状检查就没过，画像解析会先把它丢掉"
+            );
+            assert_eq!(
+                semantic_knowledge_domain(&profile_flags(&["engineering", &flag])).as_ref(),
+                Some(domain),
+                "{flag} 应还原成索引里的 {domain}"
+            );
+        }
+        // 契约里逐字点名的四个。
+        for (flag, domain) in [
+            ("domain_healthcare", "healthcare"),
+            ("domain_reverse_engineering", "reverse-engineering"),
+            ("domain_penetration_testing", "penetration-testing"),
+            ("domain_michael_design", "michael-design"),
+        ] {
+            assert_eq!(
+                semantic_knowledge_domain(&profile_flags(&[flag])).as_deref(),
+                Some(domain),
+                "{flag} 是与 IDE 侧逐字约定的旗标名"
+            );
+        }
+
+        for unknown in [
+            "domain_pen",         // 真实域的前缀：近似匹配会中，白名单必须不中
+            "domain_engineering", // 真实域的后缀，同上
+            "domain_healthcare_v2",
+            "domain_not_a_real_domain",
+            "domain_",
+        ] {
+            assert_eq!(
+                semantic_knowledge_domain(&profile_flags(&["engineering", unknown])).as_deref(),
+                None,
+                "{unknown} 不在索引里，必须当没有这面旗"
+            );
+        }
+
+        // 多面域旗时按字典序取第一个核得上的，结果不随 HashSet 的迭代顺序漂移——
+        // 系统前缀漂一个字节，整条上游 prompt 缓存就作废。
+        let both = profile_flags(&["engineering", "domain_healthcare", "domain_devops"]);
+        assert_eq!(semantic_knowledge_domain(&both).as_deref(), Some("devops"));
+        for _ in 0..32 {
+            assert_eq!(semantic_knowledge_domain(&both).as_deref(), Some("devops"));
+        }
+
+        // 端到端：未知域退回全库，块与完全不带域旗时逐字节一致。
+        let request = "对这个内网做渗透测试，枚举服务并做权限提升";
+        let baseline = assembled_knowledge_block("2.5:engineering", request).unwrap();
+        for unknown in [
+            "2.5:engineering,domain_pen",
+            "2.5:engineering,domain_not_a_real_domain",
+        ] {
+            assert_eq!(
+                assembled_knowledge_block(unknown, request).as_deref(),
+                Some(baseline.as_str()),
+                "{unknown} 必须退回全库检索，而不是被近似匹配成某个真实领域"
+            );
+        }
+    }
+
+    /// 遥测：`assembled IDE prompt request` 那条日志要能直接回答「语料到底注进去没有」。
+    /// prompt_blocks 里的 `auto_knowledge` 标记只说「有块」，说不出限定到了哪个域、真正注
+    /// 进去几段——而 21 个薄领域最可能出的失败恰恰是「限定到了但一段都没召回」。
+    ///
+    /// 字段值走源码断言，因为这两个字段的价值在于「它们确实在那条日志里」，而 tracing 的
+    /// 输出在单测里没有订阅者可截。断言前先剥掉注释：上面这段说明文字里就写着字段名，
+    /// 不剥的话注释自己就能把断言喂饱。
+    #[test]
+    fn the_assembly_log_reports_which_domain_and_how_many_sections() {
+        assert_eq!(auto_knowledge_domain_field(None), "-");
+        assert_eq!(auto_knowledge_domain_field(Some("")), "-");
+        assert_eq!(
+            auto_knowledge_domain_field(Some("healthcare")),
+            "healthcare"
+        );
+
+        let src = include_str!("prompts.rs");
+        let start = src
+            .find("    let ide_run = ide_run_telemetry(headers);")
+            .expect("组装日志前的 ide_run 取值不见了");
+        let end = src[start..]
+            .find("\"assembled IDE prompt request\"")
+            .expect("组装日志的消息文本改了")
+            + start;
+        let stripped: String = src[start..end]
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            stripped.contains("knowledge_domain = %auto_knowledge_domain_field("),
+            "组装日志必须带 knowledge_domain 字段，且空域打 `-` 而不是空串"
+        );
+        assert!(
+            stripped.contains("\n        knowledge_hits,"),
+            "组装日志必须带 knowledge_hits 字段"
+        );
+
+        // hits 必须来自真正注入的片段数，不能是「有块就记 1」之类的近似。
+        let injected = auto_knowledge_block_for_semantic_task(
+            "agent",
+            Some("对这个内网做渗透测试，枚举服务并做权限提升"),
+            Some("penetration-testing"),
+        )
+        .expect("这条请求在 penetration-testing 里必须有命中");
+        assert_eq!(
+            knowledge_hit_domains(&injected.block),
+            vec!["penetration-testing"; AUTO_KNOWLEDGE_DOMAIN_MAX_HITS],
+        );
+        assert_eq!(injected.hits, knowledge_hit_domains(&injected.block).len());
+        assert_eq!(injected.hits, AUTO_KNOWLEDGE_DOMAIN_MAX_HITS);
+
+        // 零命中时不该有块，遥测因此停在 0——「门开了但没召回」在日志里可分。
+        assert!(
+            auto_knowledge_block_for_semantic_task(
+                "agent",
+                Some("做一个登录页面，用 Tailwind 做卡片网格"),
+                Some("healthcare"),
+            )
+            .is_none(),
+            "限定到毫不相干的领域时应当零命中、整块不出现"
+        );
+    }
+
     #[test]
     fn orchestration_blocks_never_split_tool_call_adjacency() {
         let real_request = "实现 Rust Tokio 并发任务，修复 MutexGuard 跨 await，并补充错误处理测试";
@@ -6624,8 +7007,16 @@ mod tests {
         }
     }
 
+    /// 只读的工程建议／评审请求不会被当成实现命令，也不会走关键词那条语料注入路径。
+    ///
+    /// 这里原本还断言过「组装出来的系统前缀里没有语料块」，那三条断言已经删掉：它们看着
+    /// 像在钉「只读 ⇒ 不注语料」，实际成立的机制是这份夹具的画像只写了 engineering、没写
+    /// research，而当时的门要双旗才开。生产那条路（auto_knowledge_block_for_semantic_task）
+    /// 从来不看这几个关键词判定——它的文档注释写得很清楚：正文只当检索 query，不再分类。
+    /// 门放宽成单旗之后那三条断言直接变成假的，而它们本来也没在测自己名字里的那件事。
+    /// 只读请求现在照样能拿到语料，这是有意的：读代码给建议同样需要领域参考。
     #[test]
-    fn read_only_engineering_advice_and_review_reason_without_auto_knowledge() {
+    fn read_only_engineering_advice_is_not_reclassified_as_implementation() {
         let mut headers = HeaderMap::new();
         headers.insert("x-ide-mode", "agent".parse().unwrap());
         headers.insert(
@@ -6660,10 +7051,6 @@ mod tests {
             assemble_into(&headers, &mut body);
             let system = body["messages"][0]["content"].as_str().unwrap();
             assert!(system.contains("# Reasoning discipline"), "{request}");
-            assert!(
-                !system.contains("平台知识库·与真实用户请求相关"),
-                "{request}"
-            );
         }
 
         for request in [
@@ -6682,7 +7069,6 @@ mod tests {
             assemble_into(&headers, &mut body);
             let system = body["messages"][0]["content"].as_str().unwrap();
             assert!(system.contains("# Reasoning discipline"), "{request}");
-            assert!(!system.contains("平台知识库·与真实用户请求相关"));
         }
 
         assert!(has_explicit_mutation_directive("请优化这个 Rust 架构"));
