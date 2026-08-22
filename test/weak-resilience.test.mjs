@@ -93,6 +93,8 @@ test("账本的三个事实源都真的在记：意图裁决、快通道、收�
 // ===========================================================================
 
 const _mkCritic = (responder, calls = []) => load("_wrapUpCritic", {
+  // 预算同源改造后新增的真实依赖：普通模型 2000（核心半外推为 400）。
+  _criticMaxTokens: () => 2000,
   _cognitiveLegDeadlineMs: () => 60_000,
   _cognitiveLegEffort: () => ({}),
   _executionEvidenceReviewBlock: () => "",

@@ -69,7 +69,9 @@ function numericConst(code, name) {
 }
 
 // 「第一轮等意图裁决」那一整段的源文本。按那道 if 的判据取——它在 main.js 里唯一。
-const WAIT_ANCHOR = "_semanticProfileFlags || []).length";
+// 锚在等待门自己的收尾上：并行的两套实现一个用 _sessionFlags、一个把空判抽成
+// _profileStillEmpty 常量——按表达式原文锚会命中 const 定义行，waitBlock 整个切错位置。
+const WAIT_ANCHOR = "&& !sess._intentWaitPaid) {";
 function waitBlock() {
   const i = CODE.indexOf(WAIT_ANCHOR);
   assert.ok(i > 0, `找不到第一轮等待那道 if（锚点 ${WAIT_ANCHOR}）——它是本文件全部断言的落点`);
