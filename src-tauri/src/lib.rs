@@ -42,6 +42,10 @@ mod shell_env;
 mod sysctl;
 mod tasks;
 mod terminal;
+/// 进程级环境变量在测试里只有一把锁：`auth` 和 `mcp` 曾各写各的 `ENV_LOCK`，
+/// 于是一边改 HOME、另一边正在读 HOME，红的每次都不是同一条。见 test_env.rs。
+#[cfg(test)]
+mod test_env;
 mod watcher;
 mod web_scaffold;
 

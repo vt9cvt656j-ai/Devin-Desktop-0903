@@ -16,26 +16,6 @@ use std::time::{Duration, Instant};
 use serde::Serialize;
 use serde_json::{json, Value};
 
-/// 改环境变量的用例和读它的用例必须排队：`std::env` 是**进程级**的，而 Rust 默认多线程
-/// 跑测试——一个用例把 MCP_TIMEOUT 设上，另一个正好在断言默认预算，就是一次偶发红，
-/// 而且每次红的不是同一条，最难查的那一类。
-#[cfg(test)]
-static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-/// 离开作用域就把这两个变量清掉——**包括断言失败 panic 出去的那条路**。少了它，
-/// 一条失败的用例会把脏环境留给后面所有用例，红的看起来像是别人。
-#[cfg(test)]
-struct ClearTimeoutEnv;
-#[cfg(test)]
-impl Drop for ClearTimeoutEnv {
-    fn drop(&mut self) {
-        unsafe {
-            std::env::remove_var("MCP_TIMEOUT");
-            std::env::remove_var("MCP_TOOL_TIMEOUT");
-        }
-    }
-}
-
 const PROTOCOL_VERSION: &str = "2025-06-18";
 /// 这个客户端认得的协议版本，新到旧。
 ///
@@ -2838,6 +2818,16 @@ async fn disconnect_at(key: SessionKey) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 改环境变量的用例和读它的用例必须排队：`std::env` 是**进程级**的，而 Rust 默认多线程
+    /// 跑测试——一个用例把 MCP_TIMEOUT 设上，另一个正好在断言默认预算，就是一次偶发红，
+    /// 而且每次红的不是同一条，最难查的那一类。
+    ///
+    /// 队只能有一条。这里以前是 mcp 私有的一把 `ENV_LOCK`，auth.rs 里另有一把，两边各排
+    /// 各的——mcp 的用例把 HOME 指到临时目录时，auth 正在断言「没有 HOME 就走 USERPROFILE」，
+    /// 这次跨模块的撞车谁的局部锁都看不见。锁和还原现在都在 `crate::test_env::EnvGuard`：
+    /// 构造时加锁并记下旧值，Drop 时先还原再放锁，**包括断言失败 panic 出去的那条路**。
+    use crate::test_env::EnvGuard;
     use std::sync::atomic::{AtomicBool, Ordering};
 
     /// `#[cfg(windows)]` 里的代码在 macOS 上**一行都不会被编译**——这是 Windows 构建
@@ -3279,7 +3269,7 @@ mod tests {
     /// 清空、配好的 MCP 服务不见了"。
     #[test]
     fn renaming_the_app_directory_carries_everything_over() {
-        let _serial = ENV_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _serial = EnvGuard::serial();
         let home = std::env::temp_dir().join(format!("michael-appdir-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&home);
         let legacy = home.join(LEGACY_APP_DIR_NAME);
@@ -3323,7 +3313,7 @@ mod tests {
     /// 没有混进返回值：任何一条回来，这条就红。
     #[test]
     fn only_this_ides_own_config_is_read_never_another_clients() {
-        let _serial = ENV_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut env = EnvGuard::serial();
         let home = std::env::temp_dir().join(format!("michael-own-only-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&home);
 
@@ -3346,20 +3336,9 @@ mod tests {
             r#"{"mcpServers":{"桌面版的":{"command":"x"}}}"#,
         );
 
-        // HOME 是进程级的，改完必须还原——包括断言失败 panic 出去的那条路。
-        struct RestoreHome(Option<String>);
-        impl Drop for RestoreHome {
-            fn drop(&mut self) {
-                unsafe {
-                    match self.0.take() {
-                        Some(old) => std::env::set_var("HOME", old),
-                        None => std::env::remove_var("HOME"),
-                    }
-                }
-            }
-        }
-        let _restore = RestoreHome(std::env::var("HOME").ok());
-        unsafe { std::env::set_var("HOME", &home) };
+        // HOME 是进程级的，改完必须还原——包括断言失败 panic 出去的那条路。守卫从这条
+        // 用例开头就握着锁，所以 auth 的用例不会在这中间把 HOME 抽走。
+        env.put("HOME", Some(home.to_str().expect("临时目录路径不是 UTF-8")));
 
         let config = mcp_user_config().expect("读自有配置");
         let names: Vec<&String> = config
@@ -3541,24 +3520,25 @@ mod tests {
     /// 用户照着文档填的 30000 在这边会变成八小时。
     #[test]
     fn timeout_env_vars_follow_claude_codes_names_and_milliseconds() {
-        let _serial = ENV_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        let _clean = ClearTimeoutEnv;   // 失败也要还原，见它的注释
+        // 起点必须是"两个都没设"，否则跑测试的人自己环境里设了 MCP_TIMEOUT 就能让下面
+        // 三条默认值断言红；失败 panic 出去也照样还原，那是守卫的 Drop 干的。
+        let mut env = EnvGuard::set(&[("MCP_TIMEOUT", None), ("MCP_TOOL_TIMEOUT", None)]);
         assert_eq!(handshake_budget(true), REMOTE_HANDSHAKE_SECS);
         assert_eq!(handshake_budget(false), LOCAL_HANDSHAKE_SECS);
         assert_eq!(tool_call_budget(), (TOOL_CALL_IDLE_SECS, TOOL_CALL_MAX_SECS));
 
-        unsafe { std::env::set_var("MCP_TIMEOUT", "300000") };
+        env.put("MCP_TIMEOUT", Some("300000"));
         assert_eq!(handshake_budget(false), 300, "30 万毫秒 = 300 秒，不是 30 万秒");
         assert_eq!(handshake_budget(true), 300, "显式设过就该盖住远端那个默认值");
 
-        unsafe { std::env::set_var("MCP_TOOL_TIMEOUT", "30000") };
+        env.put("MCP_TOOL_TIMEOUT", Some("30000"));
         let (idle, max) = tool_call_budget();
         assert_eq!(max, 30);
         // 空闲判定不能比硬顶还长，否则硬顶先到、"没动静"这条一次都不触发。
         assert!(idle <= max, "空闲 {idle}s 超过了硬顶 {max}s");
 
         for junk in ["", "  ", "abc", "0", "-5", "12.5"] {
-            unsafe { std::env::set_var("MCP_TIMEOUT", junk) };
+            env.put("MCP_TIMEOUT", Some(junk));
             assert_eq!(
                 handshake_budget(false),
                 LOCAL_HANDSHAKE_SECS,
@@ -4498,8 +4478,8 @@ mod tests {
     /// 这条路的测试等于没有测试。
     #[tokio::test]
     async fn a_remote_server_waiting_for_browser_auth_is_parked_not_killed() {
-        // 这两条断言读的是进程级环境变量，和改它的那条用例要排队，见 ENV_LOCK。
-        let _serial = ENV_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        // 这两条断言读的是进程级环境变量，和改它的那条用例要排队，见 crate::test_env。
+        let _serial = EnvGuard::serial();
         assert_eq!(handshake_budget(true), REMOTE_HANDSHAKE_SECS);
         assert_eq!(handshake_budget(false), LOCAL_HANDSHAKE_SECS);
 
