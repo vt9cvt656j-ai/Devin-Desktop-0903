@@ -23,18 +23,15 @@ use crate::platform::macos_accessibility::MacOSAccessibility;
 /// 继续推进，越走越偏，还查不出原因。宁可在入口就报错，并且把补救路径写清楚。
 #[cfg(all(feature = "system", target_os = "macos"))]
 pub fn input_permission_granted() -> bool {
-    use std::sync::atomic::{AtomicBool, Ordering};
-    static GRANTED: AtomicBool = AtomicBool::new(false);
-    // 授权一旦拿到，本进程生命周期内不会再撤销，缓存住即可；反过来没拿到时必须
-    // 每次真查——用户可能刚在系统设置里勾上（虽然通常还需要重启应用才生效）。
-    if GRANTED.load(Ordering::Relaxed) {
-        return true;
-    }
-    let trusted = unsafe { accessibility_sys::AXIsProcessTrusted() };
-    if trusted {
-        GRANTED.store(true, Ordering::Relaxed);
-    }
-    trusted
+    // 每次真查，**不缓存**。
+    //
+    // 这里原来把「拿到过授权」用 static AtomicBool 缓存到进程死亡，依据是「授权一旦拿到
+    // 就不会再撤销」——可 sidecar 随 IDE 常驻几个小时，用户中途在系统设置里取消勾选
+    // （或 tccutil reset）之后，这个缓存让 ensure_input_permission 永远放行，macOS 则
+    // 静默丢掉每一个合成事件：回执全是 ok、screen.info 还报 granted，模型照着「已点击 /
+    // 已输入」继续推进——正是上面那段头注说要杜绝的最坏失败。IDE 侧同一个 API
+    // （src-tauri permissions.rs）就是每次查的，这个调用本身很便宜。
+    unsafe { accessibility_sys::AXIsProcessTrusted() }
 }
 
 #[cfg(all(feature = "system", not(target_os = "macos")))]
@@ -664,5 +661,37 @@ fn parse_key(key: &str) -> Result<Key> {
             Ok(Key::Character(ch))
         }
         _ => Err(Error::System(format!("Unknown key: {}", key))),
+    }
+}
+
+#[cfg(test)]
+mod input_permission_tests {
+    /// 辅助功能授权**不能正向缓存到进程死亡**。
+    ///
+    /// sidecar 随 IDE 常驻几个小时；用户中途在系统设置里取消勾选（或 tccutil reset）后，
+    /// 缓存让 ensure_input_permission 永远放行，macOS 静默丢弃全部合成键鼠事件——每层
+    /// 回执都是 ok、screen.info 也报 granted，模型照着「已点击 / 已输入」继续推进。
+    /// IDE 侧同一个 API（src-tauri permissions.rs）就是每次查的。
+    /// 只扫生产代码里 macOS 那个变体的函数体，并先剥掉注释行——注释里会引用旧代码。
+    #[test]
+    fn accessibility_check_is_not_cached() {
+        let src = include_str!("agent.rs");
+        let prod = src.split("\n#[cfg(test)]").next().unwrap_or(src);
+        let at = prod
+            .find("pub fn input_permission_granted() -> bool {")
+            .expect("input_permission_granted 不见了");
+        let end = prod[at..].find("\n}").map(|e| at + e).unwrap_or(prod.len());
+        let body: String = prod[at..end]
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(body.contains("AXIsProcessTrusted()"), "macOS 分支必须每次真查 AXIsProcessTrusted: {body}");
+        for bad in ["static ", "AtomicBool", "OnceLock", "OnceCell", "thread_local", "Mutex"] {
+            assert!(
+                !body.contains(bad),
+                "又把授权结果缓存起来了（{bad}）——用户中途撤销后会永远放行: {body}"
+            );
+        }
     }
 }
