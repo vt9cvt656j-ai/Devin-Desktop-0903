@@ -122,8 +122,13 @@ test("a brand-new session waits, briefly and once, before sending an empty profi
     + " turn in a chat session pay the full window again");
 
   // 等待必须发生在画像组装之前，否则等了也白等。
+  //
+  // 锚点必须钉在**发车前那一行**（_semanticProfileHeaderFor(_routeSource, text)）。
+  // 泛泛地找第一处 `config.ideSemanticProfile = _sessionStableSemanticProfile(sess,` 会撞上
+  // 快通道落定时那次并集写入——那一次刻意排在等待之前（它是个 .then 回调，落定时才跑），
+  // 于是这条断言会把一个正确的实现判成红。
   const waitAt = SRC.search(guard);
-  const assignAt = SRC.indexOf("config.ideSemanticProfile = _sessionStableSemanticProfile(sess,");
+  const assignAt = SRC.indexOf("config.ideSemanticProfile = _sessionStableSemanticProfile(sess, _semanticProfileHeaderFor(");
   assert.ok(waitAt > 0 && assignAt > waitAt,
     "the wait must precede the profile assignment it exists to inform");
 
