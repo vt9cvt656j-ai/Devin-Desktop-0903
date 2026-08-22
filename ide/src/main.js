@@ -26301,10 +26301,18 @@ async function sendPrompt(text, attachments = [], readyConfig = null, opts = {})
 
   _compactHistoryIfNeeded(sess);
 
-  const messages = [{ role: "system", content: fullPrompt }];
+  // 场景→工具直觉表 + 完整能力名录是字节稳定的纯字面量，只有待在 system 末尾才真的随前缀进
+  // prompt cache。以前它拼在每轮 user 消息尾部：那是每轮的新后缀，永远不命中；历史又只存
+  // lean text，于是每个用户轮都按未缓存单价重付 ≈5.8KB；run 过了 45% 窗口开场消息被折叠时
+  // 它还整段消失——恰恰在最长的 run 里失效。fullPrompt 那一行的组成被多条测试钉着，所以
+  // 在装配 system 消息这一步追加。
+  const _toolHint = (effectiveMode === "agent") ? _buildToolHint() : "";
+  const messages = [{ role: "system", content: fullPrompt + _toolHint }];
   // Read THIS turn's session history explicitly (not the active-tab proxy) — the
   // user may have switched tabs during the awaits above.
-  for (const m of await _memoryMessagesForModel(sess.memory, config, text, attachments.length > 0)) messages.push(m);
+  // 历史投影单调、不随本轮改写；本轮要回看的旧图在 _history.priorMedia 里，附到本轮消息末尾。
+  const _history = await _memoryMessagesForModel(sess.memory, config, text, attachments.length > 0);
+  for (const m of _history.messages) messages.push(m);
   // Workspace-switch re-anchor: if the user opened a DIFFERENT folder mid-conversation, the history
   // above is full of the OLD project's paths/files — the model keeps working on the old dir unless
   // told. Drop a loud, RECENT notice (right before the new request) so it re-anchors on the current
@@ -26519,9 +26527,7 @@ async function sendPrompt(text, attachments = [], readyConfig = null, opts = {})
     (_adaptiveMemory ? _adaptiveMemory + "\n\n" : "") +
     (_imgHint ? _imgHint + "\n\n" : "") +
     (contextBlock ? `--- 项目上下文 ---\n${contextBlock}\n\n` : "");
-  // Tool-RAG (A): spotlight the tools most relevant to this task, at the END of the
-  // message (high-attention recency) so weak models actually reach for the right one.
-  // Semantic rerank (cheap model, intent-aware, covers MCP tools) when it adds value.
+  // 工具直觉表/能力名录不在这儿：它是静态的，随 system 前缀走（见上面 _toolHint）。
   const _uiTurnEngineering = _turnEngineeringResolved;
   // 第三个参数只在完整裁决缺席时起作用（见 _agentDecisionFrameBlock 上面那段）：
   // 信息走快通道、闸门等全量。_fastRouteProfile 不写进 _uiTurnEngineering，就是为了这条边界。
@@ -26531,7 +26537,6 @@ async function sendPrompt(text, attachments = [], readyConfig = null, opts = {})
   const _uiDesignCraft = (effectiveMode === "agent")
     ? _uiDesignCraftBlock(text, _uiTurnEngineering, { serverDesignLayersActive: _serverDesignLayersRouted(config) })
     : "";
-  const _toolHint = (effectiveMode === "agent") ? _buildToolHint(text, _uiTurnEngineering) : "";
   // Experiential memory: a matching reusable WORKFLOW (AWM procedural memory, if this
   // task type recurred) + the most similar past episodes' insights (ExpeL) — both at
   // the recency slot so the agent reuses proven recipes for this project.
@@ -26545,7 +26550,7 @@ async function sendPrompt(text, attachments = [], readyConfig = null, opts = {})
   // "串联" feeling (the SHARED editor's current file bleeds into every chat). Order:
   // background context + guidance first → then the real ask, marked as the thing to
   // actually respond to.
-  const _contextPreamble = _dynPreamble + _atContext + _modeFrame + _decisionFrame + _uiDesignCraft + _toolHint + _expHint;
+  const _contextPreamble = _dynPreamble + _atContext + _modeFrame + _decisionFrame + _uiDesignCraft + _expHint;
   const _hasVisualAttachment = attachments.some((attachment) => attachment?.kind === "image" || attachment?.kind === "video");
   const _uiVisualEvidenceHint = (effectiveMode === "agent" && (_uiTurnEngineering.ui || _uiTurnEngineering.uiProject) && _hasVisualAttachment)
     ? "\n\n📎 **前端/UI 附件证据**：本轮图片/视频/截图是目标视觉或缺陷证据，不是装饰。先按图中真实布局、文字、裁切、溢出、间距、素材内容和移动/桌面差异修；不要套行业模板。若重写 UI，优先使用用户附图、项目 `assets/`、`public/`、`screenshots/` 里的真实图片/截图/设计稿；缺真实素材时才用 generate_image 或 picsum 等占位，并明确说明占位。"
@@ -26558,7 +26563,8 @@ async function sendPrompt(text, attachments = [], readyConfig = null, opts = {})
     + _requestFrame
     + text
     + _uiVisualEvidenceHint;
-  const userContent = await _attachmentAwareContent(_userText, attachments, config, 7_000_000, false, text);
+  // 旧图附在本轮消息末尾（不回头改写历史条目，见 _memoryMessagesForModel）。
+  const userContent = _appendContentParts(await _attachmentAwareContent(_userText, attachments, config, 7_000_000, false, text), _history.priorMedia);
   messages.push({ role: "user", content: userContent });
   if (!opts.alreadyInTranscript) sess.memory.push({ role: "user", content: text, attachments });
   // 会话需求账本：用户每条实质要求入账（接续词/纯寒暄不записыв入），每轮开工整本
@@ -39652,8 +39658,14 @@ function _trimMessagesIfHuge(messages, run = null, root = "", contextLimitTok = 
   // re-fetch any project detail it still needs — Select-on-demand beats re-injecting.
   if (doCompact && overSoft && toolIdx.length >= 4) {
     for (let i = messages.length - 1; i >= 1; i--) {
-      const m = messages[i];
-      if (m.role !== "user" || typeof m.content !== "string") continue;
+      const _raw = messages[i];
+      // 开场消息带图（本轮附件、或附在末尾回看的旧图）时是多模态数组，请求正文在第一个
+      // text 部分里。折叠逻辑统一读字符串 `m`，写回时按 _raw 的形态：只动那段文本，图片部分原样保留。
+      const _openerText = typeof _raw.content === "string"
+        ? _raw.content
+        : (Array.isArray(_raw.content) && _raw.content[0]?.type === "text" ? String(_raw.content[0].text || "") : null);
+      if (_raw.role !== "user" || _openerText === null) continue;
+      const m = typeof _raw.content === "string" ? _raw : { ..._raw, content: _openerText };
       // 折叠必须保住完整的 ━━━ 请求边界行：网关按「━━━…\n📌」定位真实用户请求来做
       // 意图门控，只留 📌 会让边界匹配失败 → user_request 漂移成编排 nudge → 系统
       // 提示块逐轮增删（缓存与行为双重抖动）。
@@ -39686,8 +39698,11 @@ function _trimMessagesIfHuge(messages, run = null, root = "", contextLimitTok = 
           }
         }
         const _kept = _keepBlocks.length ? _keepBlocks.join("\n") + "\n\n" : "";
-        const before = _msgSize(m);
-        messages[i] = { ...m, content: _kept + "[较早的项目上下文 / 当前文件已折叠省上下文——需要项目结构或某文件内容就用 list_dir / read_file 取回]\n\n" + request };
+        const before = _msgSize(_raw);
+        const _folded = { ...m, content: _kept + "[较早的项目上下文 / 当前文件已折叠省上下文——需要项目结构或某文件内容就用 list_dir / read_file 取回]\n\n" + request };
+        messages[i] = typeof _raw.content === "string"
+          ? _folded
+          : { ..._raw, content: [{ ..._raw.content[0], text: _folded.content }, ..._raw.content.slice(1)] };
         if (run?._contextPreambleAvailable) {
           run._contextPreambleAvailable = false;
           readContextChanged = true;
@@ -43485,7 +43500,9 @@ async function _agentModelTurn({ config, messages, toolSchemas, toolRegistry = n
           + _modelFamilyTuning(_turnConfig.model)
           + _authContextBlock()
           + _languagePreferenceBlock()
-          + _adaptivePromptBlock();
+          + _adaptivePromptBlock()
+          // 工具直觉表 + 完整能力名录：静态、字节稳定，和 sendPrompt 非 L0 路径的 fullPrompt 末尾同一份。
+          + (ideMode === "agent" ? _buildToolHint() : "");
         // 子智能体不重写消息：它的系统提示词是本地的、已经对了，网关那边对 "subagent"
         // 也不会 prepend 任何东西。只借这条路把工具描述取回来。
         if (!_isSub) _l0Msgs = _l0MessagesWithSkills(providerMessages, skillsBlock, clientBlocks);
@@ -46367,9 +46384,47 @@ async function _attachmentAwareContent(text, attachments, config, maxMediaChars 
   return text + "\n\n———\n当前模型不接收图片，我已把附件转写为文字：\n\n" + descriptions.join("\n\n———\n\n");
 }
 
-// Strip IDE-only attachment fields and rebuild valid multimodal history messages.
+// Strip IDE-only attachment fields and rebuild valid history messages for the model.
+//
+// 历史投影是**单调**的：带附件的历史轮永远渲染成「文本 + 一句说明」，只看这条消息自己，
+// 与本轮说了什么、有没有带图无关。以前这里按本轮意图把同一条历史消息在「图片数组」和
+// 「文本」之间来回改写（带图一轮 → 之前 4 张全变文本；下一轮纯文字 → 又全变回数组），
+// 上游 prompt cache 按前缀逐字节匹配，于是从最早一张图起整段历史每轮作废；网关压缩线路
+// 只核对 messages[pinned] 的指纹，第一条历史是带图轮时每次翻转都让本地前缀作废、整份
+// 历史重传重压。_trimMessagesIfHuge 的棘轮（只进不摆）管不到这里——它改的是 run 内
+// messages，这里是 memory.assemble() 的投影。
+//
+// 本轮该回看哪些旧图仍按原判据选（见 _priorMediaForTurn），但它们作为 `priorMedia`
+// 交给调用方附到**本轮** user 消息的末尾：新内容本来就是新后缀，放那儿不打碎任何前缀。
 async function _memoryMessagesForModel(memory, config, currentUserText = "", hasCurrentMedia = false) {
   const assembled = memory?.assemble?.() || [];
+  const messages = [];
+  for (let index = 0; index < assembled.length; index++) {
+    const message = assembled[index];
+    if (!message || typeof message !== "object") continue;
+    const clean = { ...message };
+    delete clean.attachments;
+    // 旧会话行为消毒：历史里 assistant 的表忠心开场句是模型最强的模仿样板（老会话
+    // "旧行为一直回来"的根因），回放给模型前物理剥掉——新规则才不被历史先例压制。
+    if (message.role === "assistant" && typeof clean.content === "string" && clean.content) {
+      clean.content = _stripTeachingSections(_stripAckOpeners(clean.content));
+    }
+    if (Array.isArray(message.attachments) && message.attachments.length) {
+      clean.content = String(message.content || "") + `\n（该轮曾附带 ${message.attachments.length} 个媒体文件；历史里不重复原始画面——本轮需要回看的旧图会附在本轮消息的末尾。）`;
+    }
+    messages.push(clean);
+  }
+  const priorMedia = await _priorMediaForTurn(assembled, config, currentUserText, hasCurrentMedia);
+  return { messages, priorMedia };
+}
+
+// Which historical media THIS turn gets to see again, rendered as content parts for the tail of
+// this turn's user message. Selection rules are unchanged from when they rewrote history in place:
+//   · a text-only turn sees the last 4 media turns;
+//   · a turn with its own attachment sees none, unless the user explicitly points back at
+//     「上一张」(the latest image turn only) or 「之前所有图片」(the whole window);
+//   · a location follow-up forces the geolocation evidence path only for the latest image turn.
+async function _priorMediaForTurn(assembled, config, currentUserText = "", hasCurrentMedia = false) {
   const latestUserText = currentUserText || [...assembled].reverse().find((message) => message?.role === "user")?.content || "";
   const mediaTurns = assembled
     .map((message, index) => Array.isArray(message?.attachments) && message.attachments.length ? index : -1)
@@ -46388,26 +46443,29 @@ async function _memoryMessagesForModel(memory, config, currentUserText = "", has
     : hasCurrentMedia && referencesPreviousMedia && !referencesAllPriorMedia
       ? (latestImageTurn === undefined ? [] : [latestImageTurn])
       : mediaTurns;
-  const activeMediaTurns = new Set(selectedMediaTurns);
-  const out = [];
-  for (let index = 0; index < assembled.length; index++) {
+  const parts = [];
+  for (const index of selectedMediaTurns) {
     const message = assembled[index];
-    if (!message || typeof message !== "object") continue;
-    const clean = { ...message };
-    delete clean.attachments;
-    // 旧会话行为消毒：历史里 assistant 的表忠心开场句是模型最强的模仿样板（老会话
-    // "旧行为一直回来"的根因），回放给模型前物理剥掉——新规则才不被历史先例压制。
-    if (message.role === "assistant" && typeof clean.content === "string" && clean.content) {
-      clean.content = _stripTeachingSections(_stripAckOpeners(clean.content));
-    }
-    if (activeMediaTurns.has(index) && message.role === "user") {
-      clean.content = await _attachmentAwareContent(String(message.content || ""), message.attachments, config, 3_000_000, wantsPriorImageLocation && index === latestImageTurn, "");
-    } else if (Array.isArray(message.attachments) && message.attachments.length) {
-      clean.content = String(message.content || "") + `\n（该轮曾附带 ${message.attachments.length} 个媒体文件；为控制请求大小，原始画面未在本轮重复发送。）`;
-    }
-    out.push(clean);
+    if (message?.role !== "user") continue;
+    const snippet = String(message.content || "").replace(/\s+/g, " ").trim().slice(0, 80);
+    const lead = `📎 回看较早消息的媒体（不是本轮新附件）：用户之前那条「${snippet}」附带的画面如下，你当时已经看过。`;
+    const content = await _attachmentAwareContent(lead, message.attachments, config, 3_000_000, wantsPriorImageLocation && index === latestImageTurn, "");
+    if (Array.isArray(content)) parts.push(...content);
+    else if (content) parts.push({ type: "text", text: String(content) });
   }
-  return out;
+  return parts;
+}
+
+// Append content parts to a message's content without changing its shape more than needed:
+// text-only parts onto a string stay a string (the opener fold and text-only models both read
+// string content); anything with an image turns the whole thing into a multimodal array.
+function _appendContentParts(content, parts) {
+  if (!Array.isArray(parts) || !parts.length) return content;
+  if (typeof content === "string" && parts.every((part) => part?.type === "text")) {
+    return content + "\n\n" + parts.map((part) => String(part.text || "")).join("\n");
+  }
+  const base = Array.isArray(content) ? content : [{ type: "text", text: String(content ?? "") }];
+  return base.concat(parts);
 }
 
 function _latestHistoricalImageAttachments(memory) {
@@ -46693,11 +46751,10 @@ function _mcpResponseText(value) {
 // (A) The task-start payload is selected by _semanticToolOrchestrator from the complete
 // registry. This prompt stays capability-neutral instead of becoming a second static router.
 // 工具规划 Few-Shot 已禁用：移除强制思考引导语，避免简单任务也产生冗余编排步骤
-function _buildToolHint(text, profile = _engineeringProfileWithAiIntent(text)) {
-  void text;
-  void profile;
+function _buildToolHint() {
   // P0.2(#51): 场景→工具静态决策地图。必须保持**字节稳定**（纯字面量、零动态插值）——
-  // 该文本随 system 前缀进 prompt cache，任何动态内容都会击穿缓存。精炼映射，不是禁令。
+  // 该文本拼在 system 末尾（非 L0 进 fullPrompt；L0 进 clientBlocks 重建的 system 消息），
+  // 随前缀进 prompt cache，任何动态内容都会击穿缓存。精炼映射，不是禁令。
   return "\n\n🔧 **动态工具编排**：所有已注册工具都能由语义编排器随用户目标、新证据和当前阶段装入。别因为开局窗口里不显示某个工具就假设它不可用；根据真实结果继续执行，已知精确工具名时也可用 search_tools 请求装入（支持自然语言能力描述的模糊搜索，如「数据库查询」）。" +
     "\n\n🗺️ **场景→工具直觉**：做/改任何看得见的界面（网站、Web 应用、桌面 GUI、控制面板、单个组件）→ 先 knowledge_search(domain 传 michael-design) 取本品类蓝图，照命中的配色与构图做，别凭印象编色和间距；查符号定义→find_symbol；查谁调用→lsp_references；第三方库的真实签名→package_source（读本项目实际装的那个版本；search/find_files/semantic_search 都跳过 node_modules，查不到）；**本机没装、或者要问「官方到底怎么说」→ knowledge_search**（平台自有语料库：npm/PyPI/crates 已发布版本的真实导出签名，加 MDN 整个 Web 平台与 React/Vue/Svelte/TypeScript/Node/Rust 官方文档。写任何一个你没十成把握的第三方调用之前先查一次——凭记忆写出来的签名很可能属于另一个大版本，而这一步只要一次工具调用）；签名对了但不确定怎么用→developer_community_search(sources=['sourcegraph']) 看真实仓库里怎么调；库的版本/废弃→package_search；代码历史/为什么这样写→git_blame/git_log；数据库结构→db_query 直连；技术选型/踩坑→developer_community_search；页面卡顿→performance_profile；已知工具名未装载→search_tools。用对专用工具比 read/grep 蛮力快数倍。" +
     // 全量名录。没有它，开局窗口外的工具模型既叫不出名字、search_tools 又是精确名查找，
