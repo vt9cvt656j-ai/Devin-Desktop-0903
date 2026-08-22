@@ -449,6 +449,10 @@ pub async fn catalog(
 
     // A day pass is sold once per account; say so up front rather than letting the buyer
     // reach Stripe and get refused at fulfilment.
+    //
+    // 「refused at fulfilment」这半句在 2026-08 之前是空话：fulfil_session 把
+    // once_per_account 读进来过，但一次都没看过它，重复付款照发。现在发放点真的会拒发
+    // （并把订单打上待退款标记），这句话才成立 —— 见 fulfil_session 里的同名闸门。
     let spent_once: Vec<String> = sqlx::query_scalar(
         "SELECT DISTINCT p.lookup_key FROM orders o JOIN prices p ON p.id = o.price_id \
          WHERE o.user_id = $1 AND o.status = 'paid' AND p.once_per_account = true \
@@ -573,6 +577,12 @@ pub async fn checkout(
         1
     };
 
+    // 友好前置检查，**不是**那道闸。
+    //
+    // 这里数的是「已付款」的订单，而 N 个还没付款的 checkout 全都能通过它：连开 N 个
+    // 日卡结账、一个都不付，N 次查询看到的都是 0。真正拦住重复发放的是 fulfil_session
+    // 里的同名检查（在发放点，且带 users 行锁）。这一条留着只为一件事：让重复购买在
+    // **付款之前**就被挡回去，而不是收了钱再由人去退。
     if row.once_per_account {
         let already: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM orders WHERE user_id = $1 AND price_id = $2 AND status = 'paid'",
@@ -854,6 +864,9 @@ pub async fn webhook(
     // Anything user-visible is recorded AFTER the commit — an event announced from
     // inside a transaction that later rolls back is a lie told to the admin console.
     let mut post_commit: Vec<(uuid::Uuid, &'static str, serde_json::Value)> = Vec::new();
+    // 履约单独收着：回执和 order_paid 不再挂在 webhook 自己身上，而是交给
+    // announce_fulfilment —— 三条能赢下竞态的路径共用同一个出口。见那个函数的注释。
+    let mut fulfilled: Vec<(Fulfilled, &'static str)> = Vec::new();
 
     match event_type {
         // Covers both one-off payments and the first period of a subscription.
@@ -867,16 +880,8 @@ pub async fn webhook(
                 .map(|s| s == "paid" || s == "no_payment_required")
                 .unwrap_or(false);
             if paid {
-                if let Some((uid, label, quantity)) = fulfil_session(&mut tx, &obj).await? {
-                    post_commit.push((
-                        uid,
-                        "order_paid",
-                        // session 一并带上：提交之后要靠它精确找到这一笔订单去发回执。
-                        json!({
-                            "via": "stripe", "product": label, "quantity": quantity,
-                            "session": obj.get("id").and_then(|v| v.as_str()).unwrap_or_default(),
-                        }),
-                    ));
+                if let Some(f) = fulfil_session(&mut tx, &obj).await? {
+                    fulfilled.push((f, "stripe"));
                 }
             }
         }
@@ -894,16 +899,9 @@ pub async fn webhook(
             let pi = obj.get("id").and_then(|v| v.as_str()).unwrap_or_default().to_owned();
             if !pi.is_empty() {
                 if let Some(session) = session_for_payment_intent(&state, &pi).await {
-                    if let Some((uid, label, quantity)) = fulfil_session(&mut tx, &session).await? {
+                    if let Some(f) = fulfil_session(&mut tx, &session).await? {
                         tracing::info!("fulfilled {pi} via payment_intent fallback");
-                        post_commit.push((
-                            uid,
-                            "order_paid",
-                            json!({
-                                "via": "stripe", "product": label, "quantity": quantity,
-                                "session": session.get("id").and_then(|v| v.as_str()).unwrap_or_default(),
-                            }),
-                        ));
+                        fulfilled.push((f, "stripe"));
                     }
                 }
             }
@@ -1141,33 +1139,99 @@ pub async fn webhook(
 
     tx.commit().await?;
 
+    // 付款成功要发回执。**必须在提交之后**——事务里发信的话，事务一回滚就成了
+    // 「钱没扣、回执已经发出去」。
+    //
+    // 在这之前 receipt::purchase_html 在整个 server/src 的生产代码里**零调用点**：
+    // 全仓构造 Receipt 的三处都在测试模块里。也就是说付了钱的用户手里没有任何
+    // 金额/额度/有效期/订单号的凭据，而退订页明确写着「回执照发」。
+    //
+    //（这段注释刻意不写出那个 cfg 属性的字面量：本文件里有一条测试用它来切分生产代码，
+    // 注释里出现一次就会把它的切点提前，让断言在错误的范围上求值。）
+    for (f, via) in fulfilled {
+        announce_fulfilment(&state, &f, via).await;
+    }
+
     for (uid, kind, payload) in post_commit {
-        // 付款成功要发回执。**必须在提交之后**——事务里发信的话，事务一回滚就成了
-        // 「钱没扣、回执已经发出去」。
-        //
-        // 在这之前 receipt::purchase_html 在整个 server/src 的生产代码里**零调用点**：
-        // 全仓构造 Receipt 的三处都在测试模块里。也就是说付了钱的用户手里没有任何
-        // 金额/额度/有效期/订单号的凭据，而退订页明确写着「回执照发」。
-        //
-        //（这段注释刻意不写出那个 cfg 属性的字面量：本文件里有一条测试用它来切分生产代码，
-        // 注释里出现一次就会把它的切点提前，让断言在错误的范围上求值。）
-        if kind == "order_paid" {
-            let session = payload
-                .get("session")
-                .and_then(|v| v.as_str())
-                .unwrap_or_default()
-                .to_owned();
-            if !session.is_empty() {
-                let st = state.clone();
-                // 分离出去：发信失败绝不能让 webhook 回非 2xx —— 那会让 Stripe 一直重投一个
-                // **已经完成**的事件，而重投什么都改变不了（幂等认领会直接跳过）。
-                tokio::spawn(async move { send_purchase_receipt(&st, uid, &session).await });
-            }
-        }
         crate::realtime::record_event(&state, Some(uid), kind, payload).await;
     }
 
     Ok(Json(json!({ "ok": true })))
+}
+
+/// 一次履约的收尾：回执 + `order_paid`，由**真正完成这次发放的那条路径**发，正好一次。
+///
+/// 能赢下履约竞态的有三条：webhook、对账扫描（`reconcile_once`）、支付成功页
+/// （`session_result`）。回执和 order_paid 原来只挂在 webhook 的提交后循环上，而成功页
+/// 抢先是**常态**——Stripe 先把浏览器重定向回来，webhook 是另一条链路，晚几百毫秒到几秒
+/// 都正常。成功页赢下的那一笔，webhook 随后拿到的是「已经付过了」（`Ok(None)`），于是
+/// 买家一封回执都收不到，而退订页明确写着「回执照发」。对账扫描那条也一样，它记了事件
+/// 但从不发回执。
+///
+/// 不会重复发：`fulfil_session` 只对**认领成功**的那一次返回 `Some`，另外两条拿到
+/// `None`，压根不会走到这里。
+async fn announce_fulfilment(state: &AppState, f: &Fulfilled, via: &str) {
+    if !f.granted {
+        /*
+         * 钱收了，货没发（once_per_account 已经用过）。
+         *
+         * 这里刻意**不**发回执：回执上写着买到了什么额度、有效期多久，而这一笔什么都
+         * 没买到，发出去就是一句谎。也刻意**不**自动退款：webhook 里自动动钱是更坏的
+         * 失败模式（一次误判就是一笔真金退出去，且没有人在环里）。
+         *
+         * 所以只做一件事——记一条运营看得见的事件，点名这笔订单，由人去决定退不退。
+         * 「多收的这笔怎么办」是产品决策，代码只保证两条底线：不多发额度、不静默吞钱。
+         *
+         * 但**别把下面这条事件当成账**，它三头都靠不住：record_event 跑在事务提交之后，
+         * 失败只 warn（realtime.rs），提交完到发事件之间崩一下，通知就没了而钱照收；
+         * 控制台的动态只读 events 最后 50 条（realtime.rs 的 recent_events），忙的一天
+         * 几分钟就翻过去；而 order_needs_refund 在控制台 EVENT_LABEL 里没有条目，
+         * 翻到了也只显示原始 kind。
+         *
+         * 耐久的那份留痕是 orders.note：它在 fulfil_session 的**同一个事务**里写，和
+         * 「这笔钱记成 paid」同生共死。所以运营事后要捞这些单，跑的是这句，不是翻动态：
+         *
+         *   SELECT id, user_id, created_at, amount_cents FROM orders
+         *    WHERE note LIKE 'once_per_account:%' AND refunded_at IS NULL
+         *    ORDER BY created_at DESC;
+         *
+         *（前缀由 ONCE_PER_ACCOUNT_REFUND_NOTE 定，fulfilment_gate_tests 有一条断言钉着
+         * 它——改了前缀这句 SQL 不报错，只是静默捞不到单。控制台缺的那条 EVENT_LABEL 和
+         * 订单备注列要单独开一张单子，不在本文件里。）
+         */
+        crate::realtime::record_event(
+            state,
+            Some(f.user),
+            "order_needs_refund",
+            json!({
+                "via": via,
+                "product": f.label,
+                "quantity": f.quantity,
+                "session": f.session,
+                "order": f.order.map(|id| id.to_string()),
+                "reason": "once_per_account",
+            }),
+        )
+        .await;
+        return;
+    }
+
+    if !f.session.is_empty() {
+        let st = state.clone();
+        let (uid, session) = (f.user, f.session.clone());
+        // 分离出去：发信失败绝不能让调用方失败 —— webhook 回非 2xx 会让 Stripe 一直重投一个
+        // **已经完成**的事件，而重投什么都改变不了（幂等认领会直接跳过）。
+        tokio::spawn(async move { send_purchase_receipt(&st, uid, &session).await });
+    }
+    crate::realtime::record_event(
+        state,
+        Some(f.user),
+        "order_paid",
+        json!({
+            "via": via, "product": f.label, "quantity": f.quantity, "session": f.session,
+        }),
+    )
+    .await;
 }
 
 /// 给刚付款成功的那一笔发一封回执。
@@ -1288,14 +1352,39 @@ async fn end_subscription(
         return Ok(None);
     };
 
-    // 幂等：Stripe 会重投事件，重复标记不改变结果（只写第一次的时间）。
-    sqlx::query(
-        "UPDATE orders SET subscription_ended_at = COALESCE(subscription_ended_at, now()) \
-         WHERE stripe_subscription_id = $1",
+    // 结束这条订阅——**并且把「是我结束的」这件事抢下来**。
+    //
+    // 原来这里是 `SET subscription_ended_at = COALESCE(subscription_ended_at, now())`，对
+    // 「只标记」来说确实幂等（重投不改结果）。但下面新增了一段**读—算—写**的额度扣减，
+    // 它不继承那个性质，而 end_subscription 对同一次取消是会被走**两遍**的：
+    // customer.subscription.deleted 和 customer.subscription.updated（终态 canceled /
+    // unpaid / incomplete_expired）各是一个独立 event id，stripe_events 那层去重按 event id
+    // 走，两条都会放行；普通退订 Stripe 就会同时发这两条，欠费流程还会先 unpaid 再 deleted。
+    //
+    // 走两遍的后果正好把这次修复抵消掉：basic（面额 33000）+ 兑换码 5000 = 38000。
+    // 第一条事件算出 38000−33000=5000 写回（正确）；第二条事件再来一次，current 变成 5000，
+    // 5000−33000 夹到 0 → clear_plan → 兑换码那份仍然被清空，只是从一步变成了两步。
+    //
+    // 所以把标记改成**认领**：只有把 NULL 改成 now() 的那一次才算数（rows_affected == 1），
+    // 后来的重投看到 0 行，直接跳过扣减返回。并发的两条事件在 orders 的行锁上串行，
+    // 第二条一定看到 0。
+    let claimed_ending = sqlx::query(
+        "UPDATE orders SET subscription_ended_at = now() \
+         WHERE stripe_subscription_id = $1 AND subscription_ended_at IS NULL",
     )
     .bind(sub)
     .execute(&mut **tx)
-    .await?;
+    .await?
+    .rows_affected();
+
+    if claimed_ending == 0 {
+        // 这条订阅早就被上一个事件结束过了，账已经算完。再算一遍就是重复扣减。
+        tracing::info!(
+            %uid, subscription = sub,
+            "订阅结束事件重投：这条订阅已结束过，跳过额度扣减（幂等）"
+        );
+        return Ok(Some(uid));
+    }
 
     let (others,): (i64,) = sqlx::query_as(
         "SELECT count(DISTINCT stripe_subscription_id) FROM orders \
@@ -1315,8 +1404,96 @@ async fn end_subscription(
         return Ok(Some(uid));
     }
 
-    crate::codes::clear_plan(tx, uid).await?;
+    /*
+     * 到这里这个账号已经没有别的**订阅**了。但额度池不是只有订阅在往里加。
+     *
+     * quota_total_cents 是一个加法池，四个来源都往里写（都走 codes::apply_plan）：
+     * 兑换码、管理员发放、手工订单确认、Stripe 购买（含日卡和一次性套餐）。
+     * **只有 Stripe 订阅**会在 orders 上写 stripe_subscription_id，所以上面那句
+     * others 查询看不见前三者。原来这里无条件 clear_plan（quota_total_cents = 0），
+     * 于是「兑换了一张 30 天码，又顺手在 Stripe 客户门户退掉一条订阅」＝把还没到期的
+     * 兑换额度一起抹掉。用户那边是静默数据丢失，日志里一个字都没有。
+     *
+     * 精确记账做不到：库里没有「这笔额度是谁给的」这一列。所以走保守路线——**只减这条
+     * 订阅自己那一份**（按 plan_quotas 里该套餐的 total_cents），下限 0；减完还有剩，
+     * 说明剩下的来自别处，plan 标签和上限就都留着，只有减到 0 才清。
+     *
+     * 残留的不精确，写清楚，免得下一个人以为这里已经准确了：
+     *   1. quota_total_cents 是**余额**（models.rs 按用量逐次扣减），而这里减的是套餐
+     *      面额。用户把订阅那份花掉大半再退订，减法会咬进别处来的那部分——多减。
+     *   2. 同一账号叠了两条**同款**订阅，退掉其中一条会走上面 others 那道闸提前返回，
+     *      一分不减——少减。
+     *   3. 续费每期再 apply_plan 一次，上期没花完的留在池子里；退订只减一份面额。
+     *   4. plan_spec 读的是 plan_quotas 里该套餐**此刻**的面额，不是当初卖出去时那个。
+     *      目录在库内已经重定价过一轮（migration 20260834_reprice_2026q3）：basic
+     *      33000→39780、power 180000→139230、ultra 500000→497250 —— 两个方向都出现过。
+     *      在重定价之前买的人，涨过价的套餐退订时多减（咬进兑换码/管理员发放的那份），
+     *      降过价的少减（留下一截白拿的额度）。orders 上没有存下当时的面额，所以此刻
+     *      没有更准的数可取。
+     * 前三条要「这笔额度是谁给的」才算得准：users 上按来源分列的额度，或者一张额度
+     * 流水表。第 4 条要的是另一样东西——下单时把套餐面额快照进 orders，退订优先用订单上
+     * 那一份。两样都是独立的 schema 改动，不在这次修复里做。
+     */
+    let plan = sqlx::query_scalar::<_, Option<String>>(
+        "SELECT plan FROM orders \
+         WHERE stripe_subscription_id = $1 AND kind = 'plan' AND plan IS NOT NULL \
+         ORDER BY created_at DESC LIMIT 1",
+    )
+    .bind(sub)
+    .fetch_optional(&mut **tx)
+    .await?
+    .flatten();
+
+    let Some(plan_total) = plan.as_deref().and_then(crate::settings::plan_spec).map(|s| s.0) else {
+        // 认不出这条订阅当初发的是哪个套餐，就没有「该减多少」的答案。退回旧行为（清空）
+        // 并且吼一嗓子：让一条已取消的订阅无限期保留全额额度，比多清一点更贵。
+        tracing::error!(
+            %uid, subscription = sub, ?plan,
+            "取消订阅：认不出套餐，退回清空额度的旧行为——这行日志出现就说明订单数据有问题"
+        );
+        crate::codes::clear_plan(tx, uid).await?;
+        return Ok(Some(uid));
+    };
+
+    // 行锁先拿：下面是「读—算—写」，两条取消事件并发进来会各自按同一个旧值算，
+    // 两次减法都落在同一个基数上，等于只减了一份。apply_plan 拿的也是这把锁。
+    let current: i64 =
+        sqlx::query_scalar("SELECT quota_total_cents FROM users WHERE id = $1 FOR UPDATE")
+            .bind(uid)
+            .fetch_one(&mut **tx)
+            .await?;
+    let remaining = quota_after_subscription_ends(current, plan_total);
+
+    if remaining == 0 {
+        // 池子空了，plan 标签和上限跟着走 —— 一份定义，和管理员手工取消同一条路径。
+        crate::codes::clear_plan(tx, uid).await?;
+    } else {
+        // 只动总额和窗口余额。窗口余额要跟着夹住（它是从总额里取的一段），上限
+        // quota_window_cap_cents 不动：还剩额度就还是这一档的待遇。
+        sqlx::query(
+            "UPDATE users SET quota_total_cents = $2, \
+             quota_window_cents = LEAST(quota_window_cents, $2), updated_at = now() \
+             WHERE id = $1",
+        )
+        .bind(uid)
+        .bind(remaining)
+        .execute(&mut **tx)
+        .await?;
+        tracing::info!(
+            %uid, subscription = sub, ?plan, deducted = plan_total, remaining,
+            "订阅结束：只扣掉这条订阅自己那一份，余下的额度来自别处，保留"
+        );
+    }
     Ok(Some(uid))
+}
+
+/// 取消一条订阅之后，额度池该剩多少：减掉这条订阅那个套餐的面额，下限 0。
+///
+/// 单独拎成函数是为了能被断言钉住。这里唯一容易写错的是那个下限：不夹 0 就会把额度做成
+/// 负数，而访问闸判的是 `quota_total_cents > 0` —— 负数在闸门那里和 0 等价，看不出异常，
+/// 却会让用户之后**每一次**充值先去填这个坑，直到把坑填平才重新能用。
+fn quota_after_subscription_ends(current_total: i64, plan_total: i64) -> i64 {
+    current_total.saturating_sub(plan_total).max(0)
 }
 
 /// Grant what the purchased row says, in the caller's transaction — the same one that
@@ -1414,10 +1591,33 @@ async fn session_for_payment_intent(
     paid.then_some(session)
 }
 
+/// 打在订单上的标记：钱收了、按 once_per_account 拒发，等人工退款。
+///
+/// 写进 `orders.note` 而不是新开一列：这一列本来就是「这笔订单出了什么事」的位置。
+/// 而 status 必须留在 'paid' —— `fulfil_session` 的认领条件是 `status <> 'paid'`，
+/// 把状态改成别的等于把这一笔重新变成可履约的，另一条路径会把它再发一遍。
+const ONCE_PER_ACCOUNT_REFUND_NOTE: &str = "once_per_account: 重复购买，已收款未发放，待人工退款";
+
+/// 一次**由本次调用真正完成**的履约。
+///
+/// `fulfil_session` 只对认领成功的那一次返回它；抢输的路径拿到 `None`。回执和
+/// order_paid 因此可以挂在「谁拿到 Some」上，正好发一次——见 `announce_fulfilment`。
+struct Fulfilled {
+    user: uuid::Uuid,
+    label: String,
+    quantity: i64,
+    /// Checkout Session id：回执按它回查订单行。
+    session: String,
+    /// 这一笔到底发没发货。`false` = 钱收了、按 once_per_account 拒发，等运营退款。
+    granted: bool,
+    /// 出事时用来点名这一笔的订单行。
+    order: Option<uuid::Uuid>,
+}
+
 async fn fulfil_session(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     session: &serde_json::Value,
-) -> ApiResult<Option<(uuid::Uuid, String, i64)>> {
+) -> ApiResult<Option<Fulfilled>> {
     let session_id = session.get("id").and_then(|v| v.as_str()).unwrap_or_default();
     let uid_str = session
         .get("client_reference_id")
@@ -1519,6 +1719,67 @@ async fn fulfil_session(
         }
     }
 
+    /*
+     * once_per_account —— 这道闸只有在**发放点**才站得住。
+     *
+     * 结账时也查一次（见 `checkout`），但那次只数**已付款**的订单：连开 N 个日卡结账、
+     * 一个都不付，N 次查询看到的都是 0，然后把 N 笔一起付掉。每一笔都认领到自己那个
+     * stripe_session_id，各自走到这里，而 apply_plan 是加法（codes.rs：
+     * new_total = cur_total + total）——$1 的日卡付 N 次就叠出 N 份额度。日卡收 $1 发
+     * 约 $5 的量，这道补贴上限就是这么被绕过去的，连并发都不需要。
+     *
+     * 先锁住 users 这一行再数。两笔并发履约认领的是**不同的** orders 行，彼此不冲突，
+     * 光数一次谁都看不见对方。users 行是 apply_plan 接下来无论如何都要拿的锁
+     * （codes.rs 里的 SELECT … FOR UPDATE），提前到这里拿不引入新的加锁顺序；
+     * READ COMMITTED 下后一笔在这里排队，拿到锁之后 COUNT 是一个新快照，
+     * 于是能看见前一笔已提交的那张 'paid' 订单。
+     *
+     * 外面这层 `if` 只决定「要不要花一次锁和一次 COUNT」，判据在 once_per_account_blocks。
+     */
+    if row.once_per_account {
+        sqlx::query("SELECT 1 FROM users WHERE id = $1 FOR UPDATE")
+            .bind(uid)
+            .execute(&mut **tx)
+            .await?;
+        let others: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM orders \
+             WHERE user_id = $1 AND price_id = $2 AND status = 'paid' \
+               AND stripe_session_id IS DISTINCT FROM $3",
+        )
+        .bind(uid)
+        .bind(row.id)
+        .bind(session_id)
+        .fetch_one(&mut **tx)
+        .await?;
+
+        if once_per_account_blocks(row.once_per_account, others) {
+            // 钱已经收了，所以不能就这么算了。订单留在 'paid'（Stripe 那边确实收到了），
+            // 打上标记说明没发货，再让调用方记一条运营看得见的事件点名这一笔。
+            //
+            // 这里也**不**计佣：一笔准备退掉的销售不该产生推荐佣金。真退款之后
+            // charge.refunded 会走 referral::reverse，两条路都不留脏账。
+            let order = sqlx::query_scalar::<_, uuid::Uuid>(
+                "UPDATE orders SET note = $2 WHERE stripe_session_id = $1 RETURNING id",
+            )
+            .bind(session_id)
+            .bind(ONCE_PER_ACCOUNT_REFUND_NOTE)
+            .fetch_optional(&mut **tx)
+            .await?;
+            tracing::warn!(
+                %uid, session = session_id, product = %row.label, ?order,
+                "once_per_account 已经用过：钱收了但没有发放，等运营退款"
+            );
+            return Ok(Some(Fulfilled {
+                user: uid,
+                label: row.label.clone(),
+                quantity,
+                session: session_id.to_string(),
+                granted: false,
+                order,
+            }));
+        }
+    }
+
     grant(tx, uid, &row, quantity).await?;
 
     // Whoever referred this buyer, if their window is still open.
@@ -1553,7 +1814,23 @@ async fn fulfil_session(
             .await;
     }
 
-    Ok(Some((uid, row.label.clone(), quantity)))
+    Ok(Some(Fulfilled {
+        user: uid,
+        label: row.label.clone(),
+        quantity,
+        session: session_id.to_string(),
+        granted: true,
+        order: paid_order,
+    }))
+}
+
+/// 这一笔限购商品该不该被拒发。
+///
+/// 拎成函数是为了把边界钉死：判据是「除自己以外**还有没有另一笔**已付款的同款订单」，
+/// 也就是 `> 0`。写成 `> 1` 会正好放过第二笔（第一笔＋自己＝2 才拦），而第二笔就是这个
+/// 漏洞全部的收益所在。
+fn once_per_account_blocks(once_per_account: bool, other_paid_orders: i64) -> bool {
+    once_per_account && other_paid_orders > 0
 }
 
 /// The subscription an invoice belongs to, across Stripe API versions.
@@ -1837,11 +2114,20 @@ mod tests {
     #[test]
     fn cancelling_one_subscription_must_not_wipe_the_others() {
         let src = include_str!("stripe.rs");
-        let body = src
+        let raw = src
             .split("async fn end_subscription")
             .nth(1)
             .and_then(|s| s.split("\n/// ").next())
             .expect("end_subscription 不见了");
+        // 剥注释再断言：函数里的中文注释逐字提到了 `clear_plan`（在解释重投会怎么把额度
+        // 清掉），而下面用 `body.find("clear_plan")` 判先后顺序——不剥的话会命中注释里
+        // 那一处，把「闸门在 clear_plan 之前」判成假。AGENTS.md 第四条说的就是这个。
+        let body: String = raw
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let body = body.as_str();
 
         // 必须先把这条订阅记成已结束——否则「还有没有别的活订阅」这句问不出正确答案。
         assert!(
@@ -2666,20 +2952,19 @@ async fn reconcile_once(state: &AppState) -> anyhow::Result<()> {
         if paid {
             let mut tx = state.db.begin().await?;
             match fulfil_session(&mut tx, &session).await {
-                Ok(Some((uid, label, quantity))) => {
+                Ok(Some(f)) => {
                     tx.commit().await?;
-                    rescued += 1;
+                    if f.granted {
+                        rescued += 1;
+                    }
                     tracing::warn!(
-                        order = %order_id, session = %session_id, %label,
+                        order = %order_id, session = %session_id, label = %f.label,
+                        granted = f.granted,
                         "reconciler fulfilled a paid order the webhook never delivered"
                     );
-                    crate::realtime::record_event(
-                        state,
-                        Some(uid),
-                        "order_paid",
-                        json!({ "via": "stripe-reconcile", "product": label, "quantity": quantity }),
-                    )
-                    .await;
+                    // 回执也归到这里。这条路径原来只记 order_paid、从不发回执，于是
+                    // 「买家收不收得到回执」取决于是哪条路径先抢到履约——从买家看是随机的。
+                    announce_fulfilment(state, &f, "stripe-reconcile").await;
                 }
                 // Already fulfilled between the query and now — the webhook won the race,
                 // which is the normal case and not worth a line in the log.
@@ -2972,10 +3257,14 @@ pub async fn session_result(
                         if paid {
                             let mut tx = state.db.begin().await?;
                             match fulfil_session(&mut tx, &session).await {
-                                Ok(Some(_)) => {
+                                Ok(Some(f)) => {
                                     tx.commit().await?;
                                     status = "paid".into();
-                                    tracing::info!(session = %sid, "success page fulfilled ahead of the webhook");
+                                    tracing::info!(session = %sid, granted = f.granted, "success page fulfilled ahead of the webhook");
+                                    // 成功页抢先是**常态**（Stripe 先重定向、webhook 后到），
+                                    // 所以回执必须挂在这里：webhook 随后看到「已经付过了」，
+                                    // 什么都不会再发，买家一封回执都收不到。
+                                    announce_fulfilment(&state, &f, "stripe-return").await;
                                 }
                                 // webhook 抢先了，也算成功。
                                 Ok(None) => {
@@ -3095,5 +3384,279 @@ mod bind_arity_tests {
             );
         }
         assert!(checked > 15, "扫到的语句太少（{checked}），这个断言可能没在检查什么");
+    }
+}
+
+#[cfg(test)]
+mod fulfilment_gate_tests {
+    use super::*;
+
+    /// 从源码里切出一个顶层函数：签名到第一处顶格 `}`。
+    ///
+    /// 函数体里的括号都有缩进，所以「顶格的 }」就是这个函数的结尾。比按行数切稳。
+    fn top_level_fn<'a>(src: &'a str, needle: &str) -> &'a str {
+        let start = src.find(needle).unwrap_or_else(|| panic!("找不到 {needle}"));
+        let tail = &src[start..];
+        let end = tail.find("\n}\n").map(|i| i + 3).unwrap_or(tail.len());
+        &tail[..end]
+    }
+
+    /// 剥掉注释再做源码断言 —— 两种注释都要剥。
+    ///
+    /// 这个坑本文件已经踩过：end_subscription 的注释里**逐字**引用了被换掉的旧写法
+    /// （`COALESCE(subscription_ended_at, now())`），只按行剥 `//` 又漏了 `/* */`
+    /// 那一大段——注释一路把断言喂饱，把 bug 放回去照样绿。断言也因此只挑实现特征
+    /// （SQL 片段、调用名），不挑说明词。
+    fn code_only(src: &str) -> String {
+        let mut out = String::with_capacity(src.len());
+        let mut rest = src;
+        // 本文件的 /* */ 只用来写大段事故说明：不嵌套，也从不出现在字符串字面量里。
+        while let Some(i) = rest.find("/*") {
+            out.push_str(&rest[..i]);
+            match rest[i..].find("*/") {
+                Some(j) => rest = &rest[i + j + 2..],
+                None => {
+                    rest = "";
+                    break;
+                }
+            }
+        }
+        out.push_str(rest);
+        out.lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// 从 `needle` 起按花括号配平切出一个语句块（含首尾大括号）。
+    ///
+    /// 不按「下一处同缩进的 `}`」切：要切的那个拒发分支里 `return Ok(Some(Fulfilled { … }))`
+    /// 自带一层括号，按缩进切会在它身上断掉，切出来短一截。而这上面挂的断言是「块里
+    /// **没有**某个调用」——片段短了断言自动为真，又变成一条空守卫。
+    /// 调用方必须先 `code_only`：注释里一个 `{` 就能把配平算歪。
+    fn brace_block<'a>(src: &'a str, needle: &str) -> &'a str {
+        let start = src.find(needle).unwrap_or_else(|| panic!("找不到 {needle}"));
+        let open =
+            start + src[start..].find('{').unwrap_or_else(|| panic!("{needle} 后面没有 {{"));
+        let mut depth = 0i32;
+        for (i, c) in src[open..].char_indices() {
+            match c {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return &src[start..open + i + 1];
+                    }
+                }
+                _ => {}
+            }
+        }
+        panic!("{needle} 的块没有闭合")
+    }
+
+    /// 限购的判据是「除自己以外还有没有**另一笔**已付款的同款订单」。
+    ///
+    /// 边界就在第二笔上：第一笔必须放行（它就是那次合法购买），第二笔必须拦。
+    /// 写成 `> 1` 会正好把第二笔放过去，而第二笔起就是白拿。
+    #[test]
+    fn the_second_paid_order_is_the_one_that_must_be_refused() {
+        assert!(!once_per_account_blocks(true, 0), "第一笔必须放行");
+        assert!(once_per_account_blocks(true, 1), "第二笔就该拒——刷额度全靠这一笔");
+        assert!(once_per_account_blocks(true, 99), "第 100 笔更该拒");
+        assert!(!once_per_account_blocks(false, 99), "不限购的商品不受这道闸影响");
+    }
+
+    /// 限购必须在**发放点**兜住，不能只在结账时查。
+    ///
+    /// 结账那次查的是「已付款」的订单数，N 个还没付的 checkout 全都能通过它：连开 N 个
+    /// 日卡结账、一起付掉，apply_plan 是加法，$1 的日卡就叠出 N 份额度。
+    /// 而 catalog 里写着「reach Stripe and get refused at fulfilment」—— 在这段代码
+    /// 存在之前，那句话是假的：fulfil_session 把标志读进来过，一次都没看过它。
+    #[test]
+    fn once_per_account_is_enforced_at_the_grant_not_only_at_checkout() {
+        let src = include_str!("stripe.rs");
+        let owned = code_only(top_level_fn(src, "async fn fulfil_session("));
+        let body = owned.as_str();
+        // 找的是**带条件的那一行**，不是「提到过 once_per_account」。差别是实的：
+        // 把条件改成常量假、闸门原地变成死代码，这条守卫第一版就没拦住。
+        let check = body.find("if row.once_per_account {").expect(
+            "fulfil_session 不再按 once_per_account 分支：连开 N 个结账再一起付就是 N 份额度",
+        );
+        let grant = body.find("grant(tx, uid, &row, quantity)").expect("grant 调用不见了");
+        assert!(check < grant, "限购检查排在发放之后，等于没有");
+
+        let gate = &body[check..grant];
+        assert!(gate.contains("return Ok(Some("), "查了却没拦：检查必须能提前返回");
+        // 数「别人」要排除正在履约的这一笔。忘了排除，方向就反过来：上面刚把这笔
+        // 认领成 'paid'，它会数到自己，于是**第一次**合法购买也被拒发。
+        assert!(
+            gate.contains("stripe_session_id IS DISTINCT FROM"),
+            "COUNT 没排除正在履约的这一笔，第一次合法购买就会被当成重复购买拒发",
+        );
+
+        // 那句 COUNT 只挡得住**串行**付款。并发的两笔认领的是不同的 orders 行，彼此不
+        // 冲突，READ COMMITTED 下两次 COUNT 各拿各的旧快照，谁都数不到对方——两笔都会发。
+        // 补住这一半的只有 users 那把行锁，而且它必须排在 COUNT **前面**：排在后面，
+        // 第二笔在排队拿锁之前就已经把 0 读走了，锁等于白拿。
+        //
+        // 这两条是后补的：在此之前把那四行锁整段删掉，本模块 4 个测试全绿。
+        let lock = gate.find("FROM users WHERE id = $1 FOR UPDATE").expect(
+            "没先锁 users 行：两笔并发履约认领的是不同的 orders 行，\
+             各自 COUNT 都看不见对方，两笔都会发",
+        );
+        let count = gate.find("SELECT count(*) FROM orders").expect("限购的 COUNT 不见了");
+        assert!(
+            lock < count,
+            "users 行锁排在 COUNT 之后：并发的第二笔在拿到锁之前就数完了，这道闸只挡得住串行付款",
+        );
+
+        assert!(gate.contains("granted: false"), "拒发之后要让调用方知道这一笔没发货");
+        // 钱已经收了。不许静默——订单上要留痕，运营才有得查。
+        assert!(
+            gate.contains("UPDATE orders SET note"),
+            "收了钱不发货却不在订单行上留痕，这笔钱就没人知道该退",
+        );
+        // announce_fulfilment 的注释里给运营留了一句按 `once_per_account:` 前缀捞单的 SQL。
+        // 前缀改了，那句 SQL 不报错，只是静默返回 0 行——看起来像「没有待退款的单」。
+        assert!(
+            ONCE_PER_ACCOUNT_REFUND_NOTE.starts_with("once_per_account:"),
+            "退款留痕的前缀变了：注释里给运营的 `note LIKE 'once_per_account:%'` 会静默捞不到单",
+        );
+
+        // 一笔准备退掉的销售不该产生推荐佣金。
+        //
+        // 这里原来写的是 `!gate.contains("referral::award")`，那是句空话：gate 只切到
+        // grant 为止，而 award 本来就在 grant **之后**，改这个 bug 之前的代码也一样能过；
+        // 它只有在有人把 award 挪到 grant 上面时才会响。真正要钉的是拒发那个分支自己——
+        // 在分支里加一行 `use crate::referral::award; award(...).await;`，旧断言纹丝不动。
+        let refuse = brace_block(body, "if once_per_account_blocks(");
+        assert!(
+            !refuse.contains("award("),
+            "拒发分支里出现了计佣：这一笔是准备退掉的，不该产生推荐佣金——\
+             真退款时 charge.refunded 会走 referral::reverse，两条路都不留脏账",
+        );
+        assert!(
+            refuse.contains("return Ok(Some("),
+            "拒发分支自己没有提前返回，会一路走到 grant——上面那条只看得出「gate 里某处有 return」",
+        );
+    }
+
+    /// 三条能赢下履约竞态的路径，都要发回执 / 记事件。
+    ///
+    /// webhook、对账扫描、支付成功页都能是真正发放的那一条，而回执原来只挂在 webhook 上。
+    /// 成功页抢先是常态（Stripe 先重定向），于是那些订单一封回执都没有——退订页却写着
+    /// 「回执照发」。
+    #[test]
+    fn whichever_path_wins_the_race_sends_the_receipt() {
+        // 先剥注释再断言。webhook 体内有一行 `// announce_fulfilment —— 三条能赢下竞态的
+        // 路径共用同一个出口`，**逐字**含被断言的那个名字：不剥的话，把真实调用整句删掉
+        // 这条断言照样绿 —— 三条腿里恰恰只有 webhook 这一条是被自己的注释喂饱的。
+        let src = code_only(include_str!("stripe.rs"));
+        for (needle, who) in [
+            ("pub async fn webhook(", "webhook"),
+            ("async fn reconcile_once(", "对账扫描"),
+            ("pub async fn session_result(", "支付成功页"),
+        ] {
+            let body = top_level_fn(&src, needle);
+            assert!(
+                body.contains("announce_fulfilment("),
+                "{who} 能抢到履约却不发回执、不记 order_paid —— \
+                 同一笔付款收不收得到回执，变成看哪条路径先跑到",
+            );
+        }
+        // 只有一处真正发信，所以「谁发的」等价于「谁发放的」，不会重复发。
+        // 针不能写成字面量：这行断言自己也在源码里，会被自己数进去。
+        let needle = format!("{}(&st", "send_purchase_receipt");
+        let sends = src.as_str().matches(needle.as_str()).count();
+        assert_eq!(sends, 1, "回执有 {sends} 个发出点，重复发只是时间问题");
+    }
+
+    /// 退订一条订阅，只许拿回这条订阅自己那一份额度。
+    ///
+    /// 兑换码 / 管理员发放 / 日卡 / 一次性套餐都往同一个 quota_total_cents 里加，且都不写
+    /// stripe_subscription_id —— end_subscription 里那句「还有没有别的活订阅」看不见它们。
+    /// 原来这里无条件 clear_plan（归零），于是退一条订阅会把兑换码买的额度一起抹掉。
+    #[test]
+    fn cancelling_a_subscription_only_takes_back_its_own_quota() {
+        // 兑换码给了 5000，basic 订阅给了 33000；退订只该拿走 33000。
+        assert_eq!(quota_after_subscription_ends(38_000, 33_000), 5_000);
+        assert_eq!(quota_after_subscription_ends(33_000, 33_000), 0);
+        // 池子里剩的比套餐面额还少（订阅那份已经花掉大半）——夹到 0，绝不做成负数：
+        // 负数在 `quota_total_cents > 0` 的访问闸那里和 0 长得一样，看不出异常，
+        // 却会让之后每一次充值先去填坑。
+        assert_eq!(quota_after_subscription_ends(1_000, 33_000), 0);
+        assert_eq!(quota_after_subscription_ends(0, 33_000), 0);
+
+        let src = include_str!("stripe.rs");
+        // 先剥注释再断言（code_only 的文档里写了这个坑长什么样）：这个函数的 `//` 注释里
+        // **逐字**引用了被换掉的旧写法（`COALESCE(subscription_ended_at, now())`）和
+        // `clear_plan`，而 /* */ 那一大段又逐字写着扣减取的是 plan_quotas 里的面额。
+        // 连注释一起扫，下面这些断言全会被注释喂到——把 bug 放回去也照样绿。
+        let owned = code_only(top_level_fn(src, "async fn end_subscription("));
+        let body = owned.as_str();
+        assert!(
+            body.contains("quota_after_subscription_ends"),
+            "退订又回到了无条件清零：非订阅来源的额度会被一起抹掉，而且不留任何痕迹",
+        );
+        let deduct = body
+            .find("quota_after_subscription_ends")
+            .expect("减法不见了");
+        assert!(
+            body[deduct..].contains("if remaining == 0"),
+            "缺了「减完为 0 才清 plan」这道判断，clear_plan 会照样把剩下的额度抹掉",
+        );
+
+        // 减法本身对，取数取错照样扣错——而下面这几句上面一条都管不着。
+        //
+        // 三种改法都能让上面的断言全绿而结果是错的：ORDER BY 掉个头（中途升过级的账号
+        // 按升级**前**那档扣）、去掉 kind = 'plan'（同一条订阅上的加购/手工行会被当成
+        // 套餐行）、绑成别的订阅 id（扣的是人家那条订阅的面额）。
+        let lookup = body
+            .find("SELECT plan FROM orders")
+            .expect("按订阅反查套餐的语句不见了：没有它就不知道该减多少");
+        let stmt: String = body[lookup..].chars().take(300).collect();
+        assert!(
+            stmt.contains("WHERE stripe_subscription_id = $1 AND kind = 'plan'"),
+            "套餐反查没有同时按「这条订阅」和「套餐行」收窄：丢掉 kind = 'plan' 就会\
+             把同一条订阅上的加购行当成套餐行，扣错面额",
+        );
+        assert!(
+            stmt.contains("ORDER BY created_at DESC LIMIT 1"),
+            "套餐反查取的不是**最新**那条 plan 订单：中途升过级的账号，退订时会按升级前那档扣",
+        );
+        assert!(stmt.contains(".bind(sub)"), "套餐反查绑的不是当前这条订阅");
+        assert!(lookup < deduct, "先减后查，减的是上一次的答案");
+
+        // 读—算—写 之前先拿 users 行锁。两条取消事件并发进来，各自读到同一个旧总额，
+        // 两次减法落在同一个基数上，等于只减了一份。apply_plan 拿的也是这把锁。
+        let lock = body
+            .find("SELECT quota_total_cents FROM users WHERE id = $1 FOR UPDATE")
+            .expect("读总额没带 FOR UPDATE：并发的两条取消事件各按旧值算，只会减掉一份");
+        assert!(lock < deduct, "行锁排在减法之后，减法用的还是拿锁之前读到的旧值");
+
+        // 扣减必须只发生一次。
+        //
+        // 抓的是这个修复自己差点带进来的 bug：扣减是「读—算—写」，不像原来那句纯标记那样
+        // 天然幂等，而 end_subscription 对同一次取消会被走两遍——customer.subscription.deleted
+        // 和 customer.subscription.updated（终态）是两个独立 event id，stripe_events 的去重
+        // 按 event id 走，两条都放行。走两遍的话：38000 −33000→ 5000，第二条再 5000 −33000
+        // 夹到 0 → clear_plan，兑换码那 5000 还是没了，只是分两步。
+        //
+        // 所以标记语句必须是**认领**（NULL → now()），并且扣减挂在 rows_affected 后面。
+        let claim = body
+            .find("subscription_ended_at IS NULL")
+            .expect("结束标记必须是认领：WHERE ... AND subscription_ended_at IS NULL");
+        assert!(
+            !body[..claim].contains("COALESCE(subscription_ended_at, now())"),
+            "标记退回了 COALESCE 写法：那样每一次重投都会认领成功，扣减跟着跑第二遍",
+        );
+        assert!(
+            body.contains("rows_affected()") && body.contains("if claimed_ending == 0"),
+            "缺少「没抢到就直接返回」这道闸——重投事件会把额度再扣一遍",
+        );
+        assert!(
+            claim < deduct,
+            "认领必须排在扣减之前，否则闸门形同虚设",
+        );
     }
 }

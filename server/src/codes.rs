@@ -203,6 +203,66 @@ pub(crate) fn plan_rank(plan: &str) -> i32 {
     crate::settings::plan_rank(plan)
 }
 
+/// 合并周额度上限。这个函数存在的唯一理由是：`0` 在这一列里有两种截然相反的含义，
+/// 而原来的写法把它们当成了一种。
+///
+/// `users.quota_weekly_cap_cents` 的建表默认值是 0（0009_quota.sql，注释写着「0 = 不限」），
+/// 所以一个从没被发放过套餐的账号，这一列必然是 0 —— 那是「还没配过」，不是任何人做出的
+/// 「不限」选择。原来这里是 `if cur_weekly == 0 || weekly == 0 { 0 }`：第一次发放时基线的
+/// 0 直接压过套餐给出的有限值，写回去仍然是 0，于是下一次发放再读到 0、再写回 0 ——
+/// 这道闸**在 redeem / Stripe / 支付宝三条路上永远立不起来**。admin_set_plan 不受影响，
+/// 它是把套餐的值直接写进去的，所以后台改过的账号看起来是对的，更掩盖了这个问题。
+///
+/// 判据换成「**手上这个套餐的规格**本身是不是不限」：
+///   * cur_weekly > 0            → 已经有有限上限，取两者较高的（权益不缩水，原行为）。
+///   * cur_weekly == 0 且当前套餐规格 weekly == 0 → 这个 0 是真实选择，保留不限。
+///   * cur_weekly == 0 且当前套餐规格 weekly > 0，或压根没有套餐（'none'、后台已删）
+///                               → 这个 0 是默认值/历史遗留，让新套餐的有限值立起来。
+///
+/// 用「当前套餐的规格」而不是「cur_plan != 'none'」，是因为后者只修得了首次发放：一个
+/// 存量 basic 用户续费时 cur_plan 仍是 basic，运营新填的有限周上限还是落不下去，控制项
+/// 照样是死的。
+///
+/// **今天线上是空操作**：plan_quotas 六个套餐的 weekly_cents 全是 0（运营的配置选择），
+/// 所以首次发放取到的仍是 0、持有套餐的仍判为不限，写入值逐字不变。这条改的是「控制项
+/// 失灵」本身 —— 运营哪天在后台填上一个有限周上限，存量订阅者和新订阅者才会真的受它约束。
+///
+/// 生效时机要说清楚，别当成「改完就全员生效」：这个函数只在**发放**时被调到（redeem /
+/// Stripe / 支付宝三条路），所以后台填上上限之后，一个存量订阅者要等到**下一次续费或
+/// 再发放**才会被写上。最长可以差一整个计费周期。想立刻全员生效只有两条路，都得人来
+/// 决定，所以这里刻意不做：
+///   · 写一条回填 migration —— 但今天没有值可回填（六个套餐都是 0），提前写等于替运营
+///     做了一个他还没做的定价决定；
+///   · 后台「保存周上限」时顺手对存量订阅者跑一次批量写入 —— 那是产品行为，不是这条
+///     缺陷的范围。
+/// 另有 5 个老账号（pro 10000、ultra 80000×3、trial 500）身上还挂着更早版本的默认上限，
+/// 正被限着，而同档甚至更高档的新用户不被限。这批不对称同样只能靠上面两条之一抹平。
+fn merge_weekly_cap(cur_plan: &str, cur_weekly: i64, plan_weekly: i64) -> i64 {
+    // 新套餐自己声明不限：不限赢过任何有限值，和原来一样（买了更高的套餐不该被旧上限捆住）。
+    if plan_weekly <= 0 {
+        return 0;
+    }
+    if cur_weekly > 0 {
+        return cur_weekly.max(plan_weekly);
+    }
+    // cur_weekly == 0 有两种完全相反的含义，必须去问用户**当前持有的套餐**才能分开：
+    //   · 他现在持有的套餐自己就声明不限 → 这个 0 是一次真实的选择，保留不限。
+    //   · 他现在没套餐、或持有的套餐是有限档但这一列还是建表默认值 → 这个 0 只是「还没配」，
+    //     不能拿它去压掉新套餐的有限上限，否则第一次开通就把周上限永久做成不限
+    //     （写回 0 之后，下一次授予再读到 0，再写回 0，永远建立不起来）。
+    let cur_is_unlimited = plan_spec(cur_plan).is_some_and(|(_, _, weekly, _)| weekly <= 0);
+    if cur_is_unlimited {
+        return 0;
+    }
+    // 「还没配」这条路上仍然要和当前套餐自己的档位取大，不能直接写新套餐的值。
+    // 上面 cur_weekly > 0 那条分支用的就是 max —— 上限是权益，叠加时保留更好的那个
+    // （见 apply_plan 里 window_cap 的同款注释）。这里直接返回 plan_weekly 的话，
+    // 一个 ultra 用户（周上限 80000，但这一列因为历史原因是 0）去兑换一张 basic 码
+    // （5000），周上限会被按 basic 定死，等于降级。
+    let cur_plan_weekly = plan_spec(cur_plan).map_or(0, |(_, _, weekly, _)| weekly);
+    plan_weekly.max(cur_plan_weekly)
+}
+
 pub(crate) async fn apply_plan(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     uid: uuid::Uuid,
@@ -236,12 +296,8 @@ pub(crate) async fn apply_plan(
         let new_window_cap = cur_window_cap.max(window);
         // Don't shrink what's left in the live window; top it up toward the new cap.
         let new_window = cur_window.max(window.min(new_total)).min(new_window_cap);
-        // 0 means "no weekly cap", so it wins over any finite cap.
-        let new_weekly = if cur_weekly == 0 || weekly == 0 {
-            0
-        } else {
-            cur_weekly.max(weekly)
-        };
+        // 0 在这一列里既可能是「不限」也可能是「还没配过」，判据见 merge_weekly_cap。
+        let new_weekly = merge_weekly_cap(&cur_plan, cur_weekly, weekly);
         let new_plan = if plan_rank(plan) >= plan_rank(&cur_plan) {
             plan.to_string()
         } else {
@@ -621,6 +677,73 @@ pub async fn admin_cancel_plan(
 }
 
 #[cfg(test)]
+mod weekly_cap_tests {
+    use super::merge_weekly_cap;
+    use crate::settings::{swap_plans_for_test, PlanQuota};
+
+    fn plan(name: &str, weekly: i64, rank: i32) -> PlanQuota {
+        PlanQuota {
+            plan: name.to_string(),
+            total_cents: 33_000,
+            window_cents: 3_000,
+            weekly_cents: weekly,
+            days: 30,
+            rank,
+        }
+    }
+
+    /// 周上限这道闸必须能从零立起来。
+    ///
+    /// 老写法 `if cur_weekly == 0 || weekly == 0 { 0 }` 把建表默认值 0（「还没配过」）
+    /// 当成了套餐做出的「不限」选择：第一次发放写回 0，之后每一次发放都再读到 0 再写回 0，
+    /// 于是 redeem / Stripe / 支付宝三条路上这个控制项永远是死的，只有 admin_set_plan
+    /// 直写才看得到有限值。前两条断言就是那个 bug 的形状。
+    #[test]
+    fn a_zero_weekly_cap_only_means_unlimited_when_the_held_plan_says_so() {
+        // 后台把 basic 配成有限周上限，另有一个规格本身就是不限的套餐。
+        let _swap = swap_plans_for_test(vec![
+            plan("basic", 5_000, 2),
+            plan("unlimited", 0, 5),
+            // 一个上限更高的有限档，用来钉「0 不代表可以按新套餐重定上限」（见末尾）。
+            plan("big", 30_000, 4),
+        ]);
+
+        // ① 全新账号：plan='none'，周上限是建表默认的 0 —— 没人选过「不限」。
+        assert_eq!(merge_weekly_cap("none", 0, 5_000), 5_000);
+        // ② 存量订阅者：手上是 basic，列里还是历史遗留的 0，而 basic 现在配了有限值。
+        //    续费/再发放必须让新配置落地，否则「后台能填」只是个摆设。
+        assert_eq!(merge_weekly_cap("basic", 0, 5_000), 5_000);
+        // ③ 手上套餐的规格本身就是不限：这个 0 是一次真实选择，不许收紧成有限值。
+        assert_eq!(merge_weekly_cap("unlimited", 0, 5_000), 0);
+        // ④ 新套餐声明不限：不限照旧赢过任何有限基线（买了更高的套餐不该被旧上限捆住）。
+        assert_eq!(merge_weekly_cap("basic", 5_000, 0), 0);
+        // ⑤ 两边都有限：取高的，权益不缩水。
+        assert_eq!(merge_weekly_cap("basic", 5_000, 10_000), 10_000);
+        assert_eq!(merge_weekly_cap("basic", 30_000, 10_000), 30_000);
+
+        // 「这一列还是 0」不等于「可以按新套餐重定上限」。上限是权益，叠加时保留更好的
+        // 那个（和上面 cur_weekly > 0 那条分支、以及 apply_plan 里的 window_cap 同一条规矩）。
+        // 持有 big（30000）的人因为历史原因这一列还是 0，去兑一张 basic 码（5000）时，
+        // 周上限不该被按 basic 定死 —— 那是降级。
+        assert_eq!(
+            merge_weekly_cap("big", 0, 5_000),
+            30_000,
+            "持有高档套餐的人兑一张低档码，周上限被降到了低档那一档",
+        );
+    }
+
+    /// 今天线上六个套餐的 weekly_cents 全是 0（运营的配置选择），这个改动在那份配置下
+    /// 必须逐字不改变写入值 —— 修的是控制项失灵，不是现在的额度。
+    #[test]
+    fn todays_all_zero_configuration_writes_the_same_value_as_before() {
+        let _swap = swap_plans_for_test(vec![plan("basic", 0, 2), plan("power", 0, 4)]);
+        for cur_plan in ["none", "basic", "power"] {
+            assert_eq!(merge_weekly_cap(cur_plan, 0, 0), 0, "{cur_plan}");
+        }
+    }
+}
+
+#[cfg(test)]
 mod plan_spec_tests {
     use super::{plan_spec, PLANS};
 
@@ -724,7 +847,14 @@ mod plan_spec_tests {
         );
     }
 
+    #[test]
     fn plan_spec_window_cap_is_never_zero() {
+        // 这条测试在 HEAD 上**漏了 `#[test]`**，所以从来没跑过。补上之后它立刻红了，
+        // 但红的不是 window_cap —— 是 `plan_spec(plan)` 返回 None。原因是隔壁一批用例
+        // 会用 `PlansSwap` 临时换掉 PLANS 表，而这条没有像它的同族
+        // `plan_spec_window_cap_never_exceeds_total` 那样先拿串行锁，于是并行跑时读到
+        // 的是别人换上去的假表。补锁，不是改断言 —— 断言本身是对的。
+        let _g = crate::settings::plans_test_guard();
         for plan in PLANS {
             let (total, window_cap, _weekly, days) =
                 plan_spec(plan).unwrap_or_else(|| panic!("{plan} must have a spec"));

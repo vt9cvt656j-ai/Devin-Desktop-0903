@@ -675,9 +675,99 @@ pub async fn reverse(
         // 还没进批次的都能按比例扣：pending（待审）和 settled（已审但没被锁走）。
         // 自动审核打开时根本不会有 pending 行，只匹配 pending 等于这条路永远走不到，
         // 于是部分退款掉进下面的整笔标记 —— $500 的订单退 $10，$150 佣金全没了。
+        /*
+         * 按**原始基数**重算，不是在当前值上再扣一刀。
+         *
+         * ratio_bps 来自 stripe.rs 的 charge.refunded：分母是这笔销售的原始金额，分子是
+         * Stripe 的 amount_refunded，而那个字段是**累计**退款额，不是本次退了多少。所以
+         * 每次事件送来的都是「到目前为止一共退了百分之几」。原来的写法
+         * `c = c - c * ratio / 10000` 把这个累计比例套在已经扣过一轮的值上：$100 的单先退
+         * $10（ratio 1000）把 3000 扣成 2700，再退 $20（ratio 累计 3000）把 2700 扣成 1890，
+         * 而 30% 的正确剩余是 2100 —— 复利式多扣，退得越多次差得越远。
+         *
+         * 改成从行上钉着的 amount_cents × rate_bps 重算：不管这个事件是第一次还是第五次，
+         * 结果都收敛到 basis × (1 - 累计比例)，重复投递同一个事件也是幂等的。
+         *
+         * 为什么不是 `LEAST(commission_cents, 基数重算)`：那个写法在一类行上会把扣款
+         * **整个取消掉**。admin_create_commission 允许人工把 commission_cents 写成和
+         * amount_cents × rate_bps 对不上的值，只要写得比基数低（基数 3000、人工写 100），
+         * LEAST(100, 2700) 就是 100 —— 客户退了款，推荐人一分没被扣。
+         *
+         * 所以按「当前值和基数对不对得上」分两条路：
+         *   · 当前值 ≥ 基数×(1−累计比例)：正常路径（首次退款，或同一笔的第二次退款）。
+         *     直接写基数重算的结果。它只跟**累计**比例有关，所以同一个事件重投、或者
+         *     10% 之后再退到 30%，都收敛到同一个数，不会像老写法那样在已经扣过的值上
+         *     再扣一次（3000 → 2700 → 1890，而正确答案是 2100）。
+         *   · 当前值 < 基数×(1−累计比例)：基数和这一行对不上（人工改过），基数不可信。
+         *     退回按当前值的比例扣，至少保证「退了款就一定扣到」。
+         *
+         * 两条路都不会把 commission_cents 抬高：前者赋的值 ≤ 当前值（进这条路的条件就是
+         * 当前值不小于它），后者是减法。这条在真 Postgres 16 上按 amount/rate/stored/ratio
+         * 的网格连投两个事件跑过 1683 种组合，没有一例被抬高、也没有一例变成负数。
+         *
+         * **幂等只在第一条路上成立。** 第二条路（人工改低的行）没有：基数 3000、存 1000
+         * 的行退 50% 得到 500，同一个事件重投一次得到 250。原因是「已经扣过多少」这张表上
+         * 没有记录，而唯一能算出它的那个基数，恰恰是这类行不可信的那个数。两个方向里这是
+         * **多扣**：钱留在平台这一侧、留在账上看得见，比少扣（钱已经付给推荐人、追不回来）
+         * 好收拾，所以按这一侧倒。真要做到幂等得在行上记下「已按多少比例扣过」，那是一次
+         * 迁移，不在这次修的范围里，也是个该由运营方拍板的口径问题。
+         *
+         * 同理，人工改**高**的行（基数 3000、存 5000）退 50% 被直接拉到基数重算的 1500，
+         * 而不是按存值算的 2500 —— 走的是第一条路，赋的就是基数值。同样是多扣。
+         *
+         * 这两类行下面会逐行 warn 出来：自动算不对的部分必须有人看得见。
+         *
+         * rate_bps / amount_cents 为 0 的历史行没有可用基数，同样退回老算法。
+         */
+
+        /*
+         * 先把「存的佣金和它自己的基数对不上」的行喊出来。
+         *
+         * 这类行只可能是人工建的：commission.rs 的 admin_create_commission 允许把
+         * commission_cents 写成任意 ≤ amount_cents 的值、同时照写 amount_cents 和 rate_bps，
+         * source 还能填 'referral' —— 而 source 是上面那条 UPDATE 唯一的筛选条件。上面两条
+         * 路对这种行给出的结果不一样，且都偏向多扣。多扣是刻意选的方向，但**不能是无声的**：
+         * 账上只会留下一个变小的数字，事后谁也说不出它是按什么算出来的。
+         *
+         * 范围故意比下面那条 UPDATE 宽（不看 status / payout_id）：这是给人看的报告，宁可
+         * 多报一行（连已经进批次、这次只会被打标记的行也报），也不要因为两处 WHERE 各自
+         * 演化而漏报。
+         *
+         * `if let Ok` 不是「读失败也没关系」的意思 —— Postgres 里一条语句报错，整个事务就
+         * 作废了，下面几段 UPDATE 一条也落不下。这么写只是不在这里多一个 `?`：它读的列
+         * 下面那条 UPDATE 同样在用，能让它挂的场景两条一起挂，那时该失败的是整个 webhook
+         * （Stripe 会重投），而不是由这里决定。
+         */
+        if let Ok(odd) = sqlx::query_as::<_, (uuid::Uuid, i64, i64)>(
+            "SELECT id, commission_cents, amount_cents * rate_bps / 10000 FROM commissions \
+             WHERE order_id = $1 AND source = 'referral' \
+               AND amount_cents > 0 AND rate_bps > 0 \
+               AND commission_cents <> amount_cents * rate_bps / 10000",
+        )
+        .bind(order_id)
+        .fetch_all(&mut **tx)
+        .await
+        {
+            for (row, stored, basis) in odd {
+                tracing::warn!(
+                    order = %order_id, commission = %row, stored, basis, ratio_bps,
+                    "partial refund on a commission whose stored amount disagrees with its own \
+                     basis (amount_cents × rate_bps): the clawback errs high and repeat delivery \
+                     of the same event keeps shrinking it — reconcile this row by hand"
+                );
+            }
+        }
+
         sqlx::query(
             "UPDATE commissions SET \
-                 commission_cents = commission_cents - (commission_cents * $3 / 10000), \
+                 commission_cents = CASE \
+                     WHEN amount_cents > 0 AND rate_bps > 0 THEN \
+                         CASE WHEN commission_cents < (amount_cents * rate_bps / 10000) * (10000 - $3) / 10000 \
+                              THEN commission_cents - (commission_cents * $3 / 10000) \
+                              ELSE (amount_cents * rate_bps / 10000) * (10000 - $3) / 10000 \
+                         END \
+                     ELSE commission_cents - (commission_cents * $3 / 10000) \
+                 END, \
                  note = concat_ws(' ', NULLIF(note, ''), $2 || ' 部分退款，已按比例扣减'), \
                  updated_at = now() \
              WHERE order_id = $1 AND source = 'referral' \
@@ -714,14 +804,28 @@ pub async fn reverse(
      * `settled_by <> 'auto'` excludes automatic settlement, where the credit was applied
      * at the moment the row was written and no withdrawal exists to measure.
      */
-    // 部分退款就到此为止：已结算的钱要么已经进了余额、要么已经转出去，按比例往回抠需要
-    // 决定「从哪一笔里扣」，那是人的判断，不是这里该替他做的。标注出来。
+    /*
+     * 部分退款就到此为止：钱**已经出去**的那些行，按比例往回抠需要决定「从哪一笔里扣」，
+     * 那是人的判断，不是这里该替他做的。标注出来。
+     *
+     * `payout_id IS NOT NULL OR status = 'paid'` 这个条件是这条 UPDATE 的全部要害。
+     * 少了它，它盖的是**上面第一段刚刚按比例扣过的那些行**：自动审核开着时，每一条新佣金
+     * 都是 settled + payout_id IS NULL + reversed_at IS NULL，两段 UPDATE 的 WHERE 同时命中。
+     * 第一段把 $30 的佣金按 10% 退款扣成 $27，第二段紧接着给同一行盖上 reversed_at ——
+     * 而 withdrawable() 和批量调度器都要求 reversed_at IS NULL，于是这一行被整个排除：
+     * 退了 10%，推荐人拿到 $0 而不是 $27。默认流程下**每一笔部分退款都会这样**。
+     *
+     * 这条注释上面那句「已结算的钱要么已经进了余额、要么已经转出去」对 settled +
+     * payout_id IS NULL 的行是不成立的：那笔钱还在自己账上，没进任何批次。真正「已经出去」
+     * 的判据只有一个 —— 它被某次打款锁走了（payout_id 非空 / status='paid'）。
+     */
     if partial {
         let flagged = sqlx::query(
             "UPDATE commissions SET reversed_at = now(), \
                  reversal_reason = $2 || ' (partial)', updated_at = now() \
              WHERE order_id = $1 AND source = 'referral' \
-               AND status IN ('settled', 'paid') AND reversed_at IS NULL",
+               AND status IN ('settled', 'paid') AND reversed_at IS NULL \
+               AND (payout_id IS NOT NULL OR status = 'paid')",
         )
         .bind(order_id)
         .bind(reason)
@@ -1262,10 +1366,19 @@ pub async fn withdraw(
         .execute(&mut *tx)
         .await?;
 
+    // 下面这条的三个条件必须和 withdrawable() 那条逐字一致，包括 mature_at 这道冻结期闸。
+    //
+    // 冻结期原来只加在 withdrawable()（那条只是给用户一个体面的报错），没加在这条锁内重算
+    // 上 —— 而这条才是算数的那个。差别只在并发时暴露：40 美元已过冻结期、60 美元还在冻结期
+    // 里，两个 40 美元的请求前后脚进来，A 看到基数 100 美元（把冻结中的也算进去了）、
+    // taken=0，放行；B 看到基数还是 100 美元、taken=40，还剩 60，照样放行 —— 一共发出
+    // 80 美元，其中 40 来自还在退款窗口里的佣金，之后订单一退，钱已经出去了，reverse()
+    // 只能打个标记。两条查询同源，这个洞才关得上。
     let settled: i64 = sqlx::query_scalar(
         "SELECT COALESCE(SUM(commission_cents), 0)::bigint FROM commissions \
          WHERE referrer_user_id = $1 AND status = 'settled' \
-           AND reversed_at IS NULL",
+           AND reversed_at IS NULL \
+           AND (mature_at IS NULL OR mature_at <= now())",
     )
     .bind(uid)
     .fetch_one(&mut *tx)
@@ -1330,8 +1443,13 @@ pub async fn withdraw(
      * （connect.rs 会返回 Skipped("Stripe 不可达")）。如果这一行还停在 pending，它和一笔
      * 「没人处理过的申请」在运营队列里长得一模一样，运营会再手工转一次 —— 同一笔钱付两遍。
      *
-     * admin_withdraw_status 只接受 pending，所以 sending 的行人工也点不动：进程中途死掉，
-     * 这行会停在 sending 等人来看，而不是被悄悄再付一次。
+     * 进程中途死掉，这行会停在 sending 等人来看，而不是被悄悄再付一次 —— 队列里它和
+     * pending 长得不一样（provider / failure_reason 都写着），运营也不会照着它再转一遍。
+     *
+     * （这里原来写的是「admin_withdraw_status 只接受 pending，所以 sending 的行人工也点不动」。
+     * 那句话已经不成立：那个接口现在接受 pending 和 sending 两种，正是为了让核对完 Stripe
+     * 的人能把结果写回来。sending 行能被点的两件事都要求人先去核对过 —— 详见那个函数上的
+     * 注释，尤其是「驳回一条其实已经转成功的 sending 行会让批次再转一次」。）
      */
     sqlx::query(
         "UPDATE withdrawals SET status = 'sending', provider = 'stripe_connect', \
@@ -1565,6 +1683,28 @@ pub struct WithdrawStatusReq {
 /// Rejecting returns the amount to the person's withdrawable balance, because `withdrawable`
 /// counts everything that is not rejected. That is the intended behaviour and the reason
 /// rejecting is safe: it un-reserves the money rather than destroying it.
+///
+/// 驳回现在**不止**退回可提现余额，这是批量打款上线之后新长出来的一条耦合，必须说清楚：
+/// payout.rs 的 `claimed_by_hand_sql` 同样排除 'rejected'，所以驳回一笔手动提现，等于把这
+/// 笔钱放回**批次的预算**，下一轮批次可以拿它去付佣金。
+///
+///   * pending 行：对的。钱从来没出去过，占着的额度就该还回去 —— 切到自动打款之后，
+///     「用驳回清掉遗留 pending 队列」正是靠这个才不会把额度永久扣在那儿。
+///   * 'sending' 行：驳回是一句**断言** —— 「这笔 Connect 转账不存在」。程序判不了真假，
+///     sending 的意思就是结果不明（connect.rs 的 Payout::Unknown）。运营必须先按
+///     metadata[withdrawal_id] 去 Stripe 核对：查到转账在，就标已支付并填上 tr_ 号；
+///     查不到，才驳回。凭感觉驳回一条转账其实已经成立的行 = 同一笔钱转两次。
+///
+/// 这个接口自己不动钱，它改的是预算，而预算是批次唯一的刹车。
+///
+/// 两条还没补上的（都不在这个文件里，留给控制台那边）：
+///   1. 截至 2026-08-22 出货的控制台只在 `status === 'pending'` 的行上渲染「已支付 / 驳回」
+///      两个按钮，'sending' 行一个都没有，而默认队列筛的又是 pending。所以上面这套核对流程
+///      目前只能按接口走 —— 按钮和「全部」筛选补上之前，它不是一条运营真能点的路。
+///   2. 人工填的 tr_ 号进的是 `reference`，不是 `transfer_id`（那一列有唯一索引，不能拿
+///      人手输入去填）。而 stripe.rs 的 transfer.reversed / transfer.failed 是按
+///      `transfer_id` 找行的，所以事后被冲回时匹配不到这一行，佣金不会自动放回 settled。
+///      对所有人工标记的行都成立，不是 'sending' 独有的。
 pub async fn admin_withdraw_status(
     State(state): State<AppState>,
     claims: Claims,
@@ -1577,15 +1717,39 @@ pub async fn admin_withdraw_status(
     }
 
     /*
-     * 开着自动打款时不许人工标「已支付」。
+     * 开着自动打款时不许人工标「已支付」—— 但这道闸只拦 pending。
      *
      * withdraw() 只拦了新申请，这个接口原来完全不看这个开关 —— 于是切换之前留下的那些
      * pending 行仍然能被手工付掉，而它们背后的佣金正等着被批次锁走。同一笔钱两条路各发一次。
      *
-     * 「驳回」照旧允许：那正是把遗留队列清干净的办法。
+     * 为什么必须放过 'sending'。那些行的结果不明，钱**可能已经出去了**。运营按
+     * metadata[withdrawal_id] 在 Stripe 查到转账确实在，唯一正确的收尾就是把它标成已支付
+     * —— 这不是「再付一次」，这个接口从不动钱，它只是把已经发生的事记下来，而且记下来之后
+     * 佣金稳稳停在 paid，批次不会再扫到。原来这道闸把 sending 一起拦了，还在报错里让人去点
+     * 「驳回」，而驳回会 release() 把佣金放回 settled、并把金额放回批次预算
+     * （claimed_by_hand_sql 排除 rejected）—— 下一轮批次把同一笔钱又转一次。一道防重复支付
+     * 的闸，在结果不明的行上恰好把人推向重复支付，这是最贵的那种「安全检查」。
+     *
+     * 放开之后的坏结果方向是反的：把一条其实没转成的 sending 行标成已支付，钱卡在账上、
+     * 有人看得见、可以再发一次；而不是悄悄转出去第二笔。
+     *
+     * 「驳回」照旧允许：那正是把遗留 pending 队列清干净的办法。
      */
     let t = terms(&state.db).await;
-    if t.batch_enabled && req.status == "paid" {
+    // 这一行现在是什么状态，决定上面那道闸拦不拦得到它。
+    //
+    // **只有「这个 id 不存在」才允许放过去**（Ok(None)），让下面那条 UPDATE 去给出
+    // 「该申请已经处理过了」这个统一的答复。查询本身失败必须往上抛，不能吞成 None：
+    // 吞掉的话「读不到」和「行是 pending」在这里长得一模一样，而后者正是这道闸要拦的。
+    // 连接被回收、语句超时这类瞬时错误下，行其实还是 pending，下面那条 UPDATE 换一条
+    // 健康连接照样会成功 —— 于是批量打款开着的时候，运营还是把这笔手工标成了已支付，
+    // 而系统稍后会把同一批佣金再转一次。这道闸存在的唯一理由就是挡住那次重复支付，
+    // 失败时向安全侧倒（fix-context 第 6 条）：宁可回 500 让人重试，也不能悄悄放行。
+    let current: Option<String> = sqlx::query_scalar("SELECT status FROM withdrawals WHERE id = $1")
+        .bind(id)
+        .fetch_optional(&state.db)
+        .await?;
+    if t.batch_enabled && req.status == "paid" && current.as_deref() == Some("pending") {
         return Err(AppError::bad(
             "已开启自动打款：佣金会由系统转出，不要再人工标记已支付。要清掉这条遗留申请请用「驳回」",
         ));
@@ -1630,6 +1794,11 @@ pub async fn admin_withdraw_status(
 
     // 驳回一笔批量打款，等于宣布这次转账没成立 —— 被它锁走的佣金必须回到可结算，
     // 否则它们会永远停在 paid：不会被支付，也不会再被下一轮扫到。
+    //
+    // 「等于宣布」这四个字是字面意思，不是修辞：这里放回去的钱下一轮就能被批次转出去。
+    // 手动那条路上还有一层同样方向的放回 —— 驳回把这行从 claimed_by_hand_sql 的合计里
+    // 摘掉，批次的预算随之涨回来（见本函数的文档注释）。两层都建立在「这笔转账没发生」
+    // 这个前提上，而对 'sending' 行这个前提只有人去 Stripe 核对过才成立。
     if req.status == "rejected" {
         crate::payout::release(&state, id).await;
     }
@@ -2482,6 +2651,199 @@ mod refund_tests {
              等人去 Stripe 核对的行 —— 不让处理它们，佣金就永远卡在 paid。\
              已经 paid/rejected 的仍然改不动，双击不会把付款时间挪走。",
         );
+
+        // 「批量打款开着就不许人工标已支付」这道闸的输入不许吞错误。
+        //
+        // 读当前状态那句一旦写成 `.unwrap_or(None)`，「库出错」和「这个 id 不存在」就变成
+        // 同一个结果，而闸门只在读到 'pending' 时才拦 —— 于是一次连接回收或语句超时就能
+        // 让运营把一笔真 pending 的申请标成已支付，而系统稍后把同一批佣金再转一次。
+        // 这道闸存在的唯一理由就是挡住那次重复支付，所以它的输入必须失败向安全侧倒。
+        let read_at = body
+            .find("SELECT status FROM withdrawals WHERE id = $1")
+            .expect("闸门要先读当前状态");
+        let after = &body[read_at..];
+        let stmt_end = after.find(';').unwrap_or(after.len());
+        assert!(
+            !after[..stmt_end].contains("unwrap_or(None)"),
+            "读当前状态的那句把错误吞成了 None：库一抖，这道防重复支付的闸就自动放行了",
+        );
+        assert!(
+            after[..stmt_end].contains(".await?"),
+            "读失败必须往上抛成 500 让人重试，不能当成「这行不存在」放过去",
+        );
+    }
+}
+
+#[cfg(test)]
+mod partial_refund_tests {
+    fn reverse_body() -> &'static str {
+        let src = include_str!("referral.rs");
+        let f = src.split("pub async fn reverse(").nth(1).expect("reverse");
+        let end = f.find("\n/// ").unwrap_or(f.len());
+        &f[..end]
+    }
+
+    /// 部分退款只该扣掉退掉的那一部分，不能把整条佣金抹掉。
+    ///
+    /// 两段 UPDATE 原来会同时命中同一行：第一段把 $30 的佣金按 10% 退款扣成 $27（不动
+    /// 状态、不动 reversed_at），第二段紧接着给同一行盖上 reversed_at —— 而 withdrawable()
+    /// 和批量调度器都要求 reversed_at IS NULL，于是这一行被整个排除，推荐人拿 $0 而不是 $27。
+    /// 自动审核开着时每一条新佣金都是 settled + payout_id IS NULL，所以这不是边角情况，
+    /// 是**每一笔部分退款**。第一段那句「按比例扣减」的注释和第二段的行为互相矛盾，
+    /// 出货的结果两边都不是。
+    #[test]
+    fn a_partial_refund_does_not_erase_a_settled_commission_it_just_reduced() {
+        let body = reverse_body();
+
+        // 第一段：还没进批次的按比例扣（pending 和 settled 都要够得着）。
+        assert!(
+            body.contains("status IN ('pending', 'settled') AND payout_id IS NULL"),
+            "自动审核开着时根本没有 pending 行，只扣 pending 等于这条路永远走不到",
+        );
+
+        // 第二段：只许盖在钱**真的已经出去**的行上。
+        let flag = body
+            .split("' (partial)'")
+            .nth(1)
+            .expect("部分退款的标记 UPDATE 必须还在：进了批次的佣金退款时要看得见");
+        let flag = &flag[..flag.find(".bind(").unwrap_or(flag.len())];
+        assert!(
+            flag.contains("payout_id IS NOT NULL OR status = 'paid'"),
+            "没有这个条件，它盖的就是上一段刚按比例扣过的那些行 —— 退 10% 变成扣 100%。\
+             『钱已经出去了』的唯一判据是它被某次打款锁走了，不是 status='settled'",
+        );
+    }
+
+    /// 只取真正发给数据库的那条语句，并把续行折成单空格。
+    ///
+    /// 这个 helper 是被一次**假绿**逼出来的：上一版直接在整段源码（含注释）上断言
+    /// `contains("LEAST(")`。语句里的 LEAST 后来被换成了嵌套 CASE，只剩注释里「为什么不是
+    /// LEAST」那两行还写着这个词 —— 断言被注释喂饱，护栏名存实亡，语句怎么改都是绿的。
+    /// 断言的输入必须是会被执行的那些字符。
+    fn partial_update_sql() -> String {
+        let body = reverse_body();
+        let reduce = body
+            .split("let cleared = if partial {")
+            .nth(1)
+            .expect("部分退款的按比例扣减必须还在");
+        let reduce = &reduce[..reduce.find("} else {").unwrap_or(reduce.len())];
+        // 前面还有一条只用来打日志的 query_as（"sqlx::query_as::<" 不含 "sqlx::query("），
+        // 这里切到的是真正改钱的那一条。
+        let stmt = reduce
+            .split("sqlx::query(")
+            .nth(1)
+            .expect("按比例扣减的那条 UPDATE 必须还在");
+        let stmt = &stmt[..stmt.find(".bind(").expect("UPDATE 后面必须有绑定参数")];
+        // 折成单空格：这样断言钉的是语句的形状，换行怎么排都不影响。
+        stmt.split_whitespace()
+            .filter(|t| *t != "\\")
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    /// 存的佣金和它自己的基数对不上的行，必须被喊出来。
+    ///
+    /// 这类行只可能是人工建的（admin_create_commission 什么都能写，source 也能填
+    /// 'referral'），而上面那条 CASE 对它们给出的结果既不等于按基数算、也不等于按存值算，
+    /// 并且重复投递同一个退款事件还会一路多扣。方向是刻意选的（多扣，钱留在平台一侧），
+    /// 但账上只会留下一个变小的数字 —— 没有这行 warn，事后没人说得出它是怎么来的。
+    #[test]
+    fn a_commission_that_disagrees_with_its_own_basis_gets_reported() {
+        let body = reverse_body();
+        let reduce = body
+            .split("let cleared = if partial {")
+            .nth(1)
+            .expect("部分退款的按比例扣减必须还在");
+        let reduce = &reduce[..reduce.find("} else {").unwrap_or(reduce.len())];
+        assert!(
+            reduce.contains("commission_cents <> amount_cents * rate_bps / 10000"),
+            "少了这条查询，人工改过的行会被悄悄多扣：它们走的是和其它行不同的那条分支",
+        );
+        assert!(
+            reduce.contains("tracing::warn!"),
+            "查出来不喊等于没查 —— 这条必须进日志，运营才有得对账",
+        );
+    }
+
+    /// 累计退款比例必须打在**原始基数**上，且既不能把佣金抬高、也不能把扣款取消掉。
+    ///
+    /// stripe.rs 的 ratio_bps 用的是 charge.amount_refunded，那是 Stripe 的**累计**退款额，
+    /// 每个事件送来的都是「到目前为止一共退了百分之几」。老写法 c = c − c×ratio 把累计比例
+    /// 套在已经扣过一轮的值上：$100 的单先退 $10（3000→2700）、再退 $20（累计 30%，
+    /// 2700→1890），而正确剩余是 2100 —— 复利式多扣，退得越多次差得越远。
+    ///
+    /// 换成基数重算之后，两个相反方向的坏结果都在真 Postgres 16 上量过（basis 3000、
+    /// 人工把 commission_cents 写成 1000 的行，退 50%）：
+    ///   · 裸的基数重算 —— 1000 被**抬到** 1500，退款反而让推荐人多赚；
+    ///   · `LEAST(commission_cents, 基数重算)` —— 1000 原地不动，扣款被**整个取消**，
+    ///     要退到 90% 才开始咬。
+    /// 现在这条嵌套 CASE 得到 500（= 按当前值扣 50%）。三个分支缺一个就掉进上面某一边，
+    /// 所以三段分别钉住。
+    #[test]
+    fn a_cumulative_refund_ratio_is_recomputed_from_the_original_basis() {
+        let sql = partial_update_sql();
+        let basis = "(amount_cents * rate_bps / 10000) * (10000 - $3) / 10000";
+        let by_ratio = "commission_cents - (commission_cents * $3 / 10000)";
+
+        assert!(
+            sql.contains(basis),
+            "必须从行上钉着的成交额×费率重算，这样第 N 次累计事件也收敛到 basis×(1−累计比例)",
+        );
+        assert!(
+            !sql.contains(&format!("commission_cents = {by_ratio}")),
+            "在当前值上再乘一次累计比例就是复利式多扣 —— 这正是被修掉的那个写法",
+        );
+        assert!(
+            !sql.contains("LEAST("),
+            "不能用 LEAST 挡上抬：它在人工把 commission_cents 写得低于基数的行上会把扣款\
+             整个取消 —— 基数 3000、存 1000，退 50% 之后还是 1000（真库上量过），\
+             要退到 90% 才开始扣。挡上抬的是下面那层 CASE，不是 LEAST",
+        );
+        assert!(
+            sql.contains(&format!("CASE WHEN commission_cents < {basis}")),
+            "少了这层判断，基数重算会把人工调低过的行**抬回去**：基数 3000、存 1000 的行\
+             退 50% 变成 1500，客户退了款推荐人反而多赚 500",
+        );
+        assert!(
+            sql.contains(&format!("THEN {by_ratio}")),
+            "对不上基数的行必须退回「按当前值扣」这条路，否则那一支就没有扣款",
+        );
+        assert!(
+            sql.contains(&format!("ELSE {basis}")),
+            "对得上基数的行（award 路径写出来的全都是）必须走基数重算，否则重复投递同一个\
+             事件会一路复利式多扣",
+        );
+    }
+
+    /// 提现的两条余额查询必须逐字同源。
+    ///
+    /// withdrawable() 是给用户看的、也是发出去的报错文案的来源；锁内那条才是算数的。
+    /// 冻结期（mature_at）当初只加在前者身上，于是并发时后者的基数被冻结中的佣金撑大：
+    /// $40 已到期 + $60 还在冻结期，两个 $40 的请求前后脚进来，A 看到基数 $100、taken=0
+    /// 放行，B 看到基数还是 $100、taken=$40 仍有 $60 可用，照样放行 —— 一共发出 $80，
+    /// 其中 $40 来自还在退款窗口里的佣金。钱出去之后再退款，reverse() 只能打个标记。
+    #[test]
+    fn the_authoritative_recheck_gates_on_the_hold_period_too() {
+        let src = include_str!("referral.rs");
+        let shown = src.split("async fn withdrawable").nth(1).expect("withdrawable");
+        let shown = &shown[..shown.find("\n#[derive").unwrap_or(shown.len())];
+        let enforced = src.split("pub async fn withdraw(").nth(1).expect("withdraw");
+        let enforced = &enforced[..enforced.find("\n// ---").unwrap_or(enforced.len())];
+
+        for clause in [
+            "status = 'settled'",
+            "reversed_at IS NULL",
+            "(mature_at IS NULL OR mature_at <= now())",
+            "status NOT IN ('rejected', 'failed', 'returned')",
+            "method <> 'auto'",
+        ] {
+            assert!(shown.contains(clause), "withdrawable 少了 `{clause}`");
+            assert!(
+                enforced.contains(clause),
+                "锁内重算少了 `{clause}` —— 那条才是算数的，两条一旦漂开，并发请求就从\
+                 缺失的那个条件底下穿过去",
+            );
+        }
     }
 }
 
