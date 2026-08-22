@@ -313,7 +313,9 @@ test("完整裁决要 19.8 秒，路由必须有第二条腿——而且那条�
   assert.match(CODE, /async function _fastRoutingFlags\(/,
     "路由快通道没了——那这道等待又回到了「干等」和「没有模块」的二选一");
 
-  const fn = CODE.slice(CODE.indexOf("async function _fastRoutingFlags("), CODE.indexOf("async function _fastRoutingFlags(") + 3300);
+  // 窗口 3300 → 3600：快通道函数体又多了一行每模型能力账本的回执记账
+  // （_recordModelJsonOutcome，弱模型判定的事实源），函数收尾再次被推出旧窗口。
+  const fn = CODE.slice(CODE.indexOf("async function _fastRoutingFlags("), CODE.indexOf("async function _fastRoutingFlags(") + 3600);
 
   // 快的全部原因就是输出短。max_tokens 一放开，它就跟完整裁决一样慢，这条腿白加。
   assert.match(fn, /_billableAiComplete\(cfg, \[\{ role: "user", content: prompt \}\], 200\)/,

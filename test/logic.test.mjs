@@ -13298,11 +13298,16 @@ test("打码密钥块内部的部分编辑被明确拒绝，编号打码只在�
   assert.match(SRC, /②整块删除/);
   assert.match(SRC, /③替换为新密钥/);
 
-  // 编号开关的启用范围：只有「读文件返回给模型」这一个 _redactSecrets 调用点传 map，
-  // 日志/搜索片段/展示脱敏等其余调用点保持旧格式不变。
+  // 编号开关的启用范围：只有「文件内容返回给模型」的 _redactSecrets 调用点传 map，
+  // 日志/搜索片段/展示脱敏等其余调用点保持旧格式不变。这样的出口恰好两个：
+  // read_file 的模型副本，和盲写事前拦截随失败结果回带的当前文件内容
+  // （_blindOverwritePrecheck——同一性质：模型拿到内容、之后可能带占位符写回，
+  // 必须能按编号整块还原）。
   assert.match(fn, /_redactSecrets\(body, \{ map: _runRedactionMap\(run\) \}\)/,
     "the read_file model copy is the numbered-redaction outlet");
-  assert.equal((SRC.match(/_redactSecrets\([^)]*\{ map:/g) || []).length, 1,
+  assert.match(SRC, /_redactSecrets\(oldText, \{ map: _runRedactionMap\(run\) \}\)/,
+    "the blind-overwrite precheck's carried-back file content is the second model outlet");
+  assert.equal((SRC.match(/_redactSecrets\([^)]*\{ map:/g) || []).length, 2,
     "numbered mode must not spread to display/log call sites");
 });
 
