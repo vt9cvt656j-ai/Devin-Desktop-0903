@@ -242,7 +242,11 @@ SRC_DIR="$(pwd -P)"
 SRC_COMMIT="$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
 SRC_BRANCH="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo unknown)"
 # 只数会被 rsync 送上去的那些：排除项和上面 rsync 的 --exclude 对齐。
-SRC_DIRTY="$(git status --porcelain -- . 2>/dev/null | grep -vE '^\?\? (target|node_modules)/' | wc -l | tr -d ' ')"
+# `{ grep … || true; }` 不是装饰：树**干净**时 `git status --porcelain` 一行都不输出，
+# `grep -v` 没有任何行可输出就返回 1，`pipefail` 把整条管道判成失败，`set -e` 当场杀掉
+# 整个脚本 —— 而且只在干净树上触发，也就是恰好在推荐的部署方式下炸。实测踩过：部署停在
+# 「syncing source」、退出码 1、一个字的解释都没有（那两行 echo 还没来得及跑）。
+SRC_DIRTY="$(git status --porcelain -- . 2>/dev/null | { grep -vE '^\?\? (target|node_modules)/' || true; } | wc -l | tr -d ' ')"
 SRC_STAMP="path=${SRC_DIR} commit=${SRC_COMMIT} branch=${SRC_BRANCH} dirty=${SRC_DIRTY}"
 echo "部署来源：${SRC_STAMP}"
 if [ "${SRC_DIRTY}" != "0" ]; then
