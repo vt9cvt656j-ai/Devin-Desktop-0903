@@ -27977,6 +27977,78 @@ test("journal 跑在 checkpoint 前面时，要把那截真正补回模型上下
   assert.match(src, /adoptJournalTail/, "恢复时只对齐计数、不补内容，等于让模型停在旧 checkpoint");
 });
 
+// ── 崩溃重开：喂给 adoptJournalTail 的必须是**日志的结尾**，不是旧结尾附近那一窗 ──
+//
+// 上面两条测试都直接喂了一段已经对齐好的 tail，所以它们覆盖不到真正出问题的那一层：
+// 恢复时那一窗**是怎么取的**。
+//
+// 旧代码取的是 `[expected-_RENDER_LIMIT, expected)`，expected 来自 checkpoint。流式期间
+// saveChatHistory 会降级、不写 checkpoint，但每条消息都逐条进了 SQLite，所以异常退出后
+// expected 可以远远落后于日志。checkpoint 停在 100、日志已经 500 时取回来的是第 44–100 条，
+// 却被当作「到 500 为止的结尾」喂进去——adoptJournalTail 按 target-known 算差额、从 tail
+// **末尾**切，于是第 97/98/99 条被当成第 497/498/499 条接进 recent，totalTurns 一步跳到 500。
+// 中间 344 轮既没进 recent 也没进 archive，recall_conversation 也找不回来。
+// 界面上消息一条不少（那是从日志重画的），模型的记忆里是一段错位 + 一个黑洞。
+test("崩溃重开：补进上下文的必须是日志结尾那一段，不是 checkpoint 旧结尾附近那一窗", () => {
+  const turn = (i) => ({ role: i % 2 ? "assistant" : "user", content: `turn${i}` });
+
+  // 先复现旧行为，证明这条测试不是在守一个不存在的问题。
+  const broken = new ConversationMemory();
+  for (let i = 0; i < 100; i++) broken.push(turn(i));
+  const wrongWindow = Array.from({ length: 56 }, (_, i) => turn(44 + i)); // [expected-56, expected)
+  broken.adoptJournalTail(wrongWindow, 500);
+  assert.equal(
+    broken.recent.at(-1).content, "turn99",
+    "前提校验：喂旧结尾那一窗，模型的最近一条会停在 turn99（而日志的最后一条是 turn499）",
+  );
+
+  // 正确做法：按真实总数取结尾那一段。
+  const fixed = new ConversationMemory();
+  for (let i = 0; i < 100; i++) fixed.push(turn(i));
+  const realGap = Array.from({ length: 400 }, (_, i) => turn(100 + i)); // [expected, total)
+  fixed.adoptJournalTail(realGap, 500);
+  assert.equal(fixed.recent.at(-1).content, "turn499", "最近一条必须是日志真正的最后一条");
+  assert.equal(fixed.totalTurns, 500);
+  // 整段补进去之后，超出 RECENT_WINDOW 的部分要归档，不能凭空消失。
+  assert.ok(fixed.archive.length > 0, "溢出的那截要进归档，否则 recall_conversation 找不回来");
+  const everywhere = JSON.stringify([fixed.recent, fixed.archive, fixed.summaries]);
+  assert.ok(everywhere.includes("turn150"), "gap 中段的消息必须在 recent/archive/summaries 里留有痕迹");
+
+  // 接线：恢复函数必须按**返回的 total** 重新取窗，而不是继续用 checkpoint 的 expected。
+  const src = stripJsComments(extractFn("_ensureSessionTranscript"));
+  assert.match(src, /const total = Math\.max\(0, Number\(loaded\.total\) \|\| 0\)/,
+    "没有从返回值里取日志真实总数");
+  assert.match(src, /if \(total > expected\)/,
+    "没有判断「日志跑在 checkpoint 前面」这条路");
+  assert.match(src, /Math\.max\(expected, total - _RESTORE_GAP_MAX_MESSAGES\)/,
+    "补的起点不是 checkpoint 见过的位置——那样要么漏补要么重复补");
+  assert.match(src, /adoptJournalTail\?\.\(gap, total\)/,
+    "喂进去的必须是按 total 取的那一段，不能是第一窗");
+  assert.doesNotMatch(src, /adoptJournalTail\?\.\(loaded\.messages/,
+    "又把第一窗（按 checkpoint 猜的那一窗）当结尾喂进去了");
+});
+
+// ── 其它已打开的标签，历史也要读进来 ─────────────────────────────────────────
+//
+// `_ensureSessionTranscript` 原来只在切标签时调，于是异常退出重开之后，除了当前这一个，
+// 其它标签的 memory 全是 checkpoint 里那份旧的。表现有两种：点过去要等一下才出内容；
+// 更糟的是**在它补完之前就发消息**，模型拿到的是缺了一大截的上下文。
+test("恢复后其它标签的历史也要在空闲时补上，而且只补数据不渲染", () => {
+  const src = stripJsComments(extractFn("_schedulePassiveTranscriptWarmup"));
+  assert.match(src, /_transcriptLoaded === false/, "预载对象必须是「还没加载过」的那些标签");
+  assert.match(src, /_ensureSessionTranscript\(session\)/, "没有真的去加载");
+  assert.match(src, /requestIdleCallback/, "必须让到空闲再做，否则和首屏抢主线程");
+  // 只补数据：这条最重要——整窗渲染卡死主线程是有实锤的（见 _RENDER_SYNC_LIMIT）。
+  assert.doesNotMatch(src, /_renderSessionHistory|_renderMsgRange|addMessage\(/,
+    "预载里不许碰渲染：后台标签一次性渲染会把首屏卡死");
+  // 期间标签可能已经被点开或关掉。
+  assert.match(src, /_chatSessions\.includes\(session\)/, "标签被关掉之后不该继续补它");
+  // 真的接在启动恢复的末尾。
+  const restore = stripJsComments(SRC);
+  assert.match(restore, /_scrollChatBottom\(\);[\s\S]{0,120}_schedulePassiveTranscriptWarmup\(\)/,
+    "预载没有挂在启动恢复完成之后");
+});
+
 test("崩溃恢复补上的那批消息，溢出的头部要归档而不是凭空消失", () => {
   // 这条路正好是崩溃重开那条：日志比 checkpoint 跑得远，恢复时把差额补进来。原来补完
   // 直接 `slice(-RECENT_WINDOW)`，超出窗口的头部一刀切掉——而这批消息**同时**从模型上下文
