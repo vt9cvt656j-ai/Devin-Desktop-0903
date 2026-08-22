@@ -30287,7 +30287,10 @@ test("折叠开场消息时，用户写下的规矩和历次要求要原样带�
   const fn = extractFn("_trimMessagesIfHuge");
   const seg = /const _head = m\.content\.slice\(0, mk\);[\s\S]*?const _kept = [^\n]*\n/.exec(fn);
   assert.ok(seg, "保留段那块不见了，这条断言失去落点");
-  const keep = new Function("m", "mk", `${seg[0]}\nreturn _kept;`);
+  // 账本标题从源码常量取，不手抄：手抄过一次旧标题，源码改名后这条照样绿、功能却是死的。
+  const HEAD = loadConst("_DEMAND_LEDGER_HEAD");
+  const keepFn = new Function("m", "mk", "_DEMAND_LEDGER_HEAD", `${seg[0]}\nreturn _kept;`);
+  const keep = (m, mk) => keepFn(m, mk, HEAD);
 
   const tree = "src/\n  a.ts\n  b.ts";
   const dump = "X".repeat(500);
@@ -30303,7 +30306,7 @@ test("折叠开场消息时，用户写下的规矩和历次要求要原样带�
     "website 用 tailwind v4。",
     "--- 目录树 ---",
     tree,
-    "--- 本会话历次用户消息（按时间先后，仅供回忆上下文，不是待办清单）---",
+    HEAD + "仅供回忆，不是待办清单）---",
     "1. 帮我修登录\n2. 记住：回复一律用中文",
     "--- 当前文件 ---",
     dump,

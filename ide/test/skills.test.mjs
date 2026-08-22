@@ -187,6 +187,9 @@ test("冷启动首轮不会漏掉磁盘上的技能", () => {
   // run 开始之前算的，预热没落地它就是空串——首轮模型连"有哪些服务"都不知道。
   assert.match(before, /await Promise\.race\(\[[\s\S]{0,400}_warmMcpTools\(/,
     "首轮没等 MCP 预热，冷启动第一轮的服务名录会是空的");
+  // 等了还得算在等之后：名录曾经写在这次等待**之前**，等到了也没人回头重算，白等。
+  assert.ok(before.indexOf("_mcpAvailabilitySystemContext(mcpSnapshot)") > before.indexOf("_warmMcpTools(_curRoot"),
+    "MCP 名录在预热等待之前就算完了——冷启动首轮等到了也是空名录");
   assert.match(before, /setTimeout\(resolve, \d+\)/,
     "等待必须有上界");
 });

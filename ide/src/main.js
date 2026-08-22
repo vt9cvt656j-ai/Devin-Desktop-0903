@@ -21423,6 +21423,23 @@ function _headAndTail(list, head, tail) {
 /** 带工具的那几个模式。判「要不要给工具」和判「要不要给会话账本」读的是同一份。 */
 const _MODES_WITH_TOOLS = new Set(["agent", "explorer", "reviewer", "plan"]);
 
+/**
+ * 需求账本在开场消息里的分段标题前缀（和约定分段的 marker 同款：只取到开括号）。装配（sendPrompt 的
+ * _demandLedgerBlock）和折叠（_trimMessagesIfHuge 的保留段）都从这一个常量取——两头各写
+ * 一份字面量时，改名只改一头，折叠那刀就会把账本整段切掉，而账本压根不在磁盘上，折掉就
+ * 再也回不来。
+ */
+const _DEMAND_LEDGER_HEAD = "--- 已从对话中折叠掉的历次要求（";
+
+/**
+ * 账本用的唯一一种空白归一化：入账、和「还在不在对话历史里」的比对两侧都走它。
+ * 此前入账压成单空格、比对却拿历史原文，于是前 40 字里只要有一个换行（分行写需求、
+ * 贴报错都是），明明还在对话里的那条也被当成「已折叠」每轮重列一遍。
+ */
+function _ledgerNorm(s) {
+  return String(s || "").replace(/\s+/g, " ").trim();
+}
+
 function _fallbackConversationSummary(messages) {
   const userRequests = [], outcomes = [];
   for (const message of messages || []) {
@@ -26215,10 +26232,36 @@ async function sendPrompt(text, attachments = [], readyConfig = null, opts = {})
   const diagBlock = agentDiagnosticsBlock(_contextRoot, _activeForSession);
   if (diagBlock) contextBlock += `\n\n${diagBlock}`;
 
+  // ── 提示词缓存: system = 纯静态前缀(跨轮复用), 动态内容下沉到 user 消息末尾 ──
+  _scheduleWorkspaceAgentWarmup(_curRoot);
+  // 磁盘上的技能是异步发现的（_warmupWorkspaceAgent 里的 _idleRun）。冷启动后立刻提问
+  // 时它还没跑完，技能目录里就只剩 localStorage 那批——模型看不见的技能等于不存在，
+  // 而且不会有任何报错。首轮值得等这一次目录扫描：只扫几个目录，只在从没扫过时等，
+  // 超时也不阻塞（后台那次照常写回缓存，下一轮就齐了）。
+  // 没打开文件夹也要扫：家目录那份技能库（~/.mrdayone/skills）跟有没有打开项目无关。
+  // 这里以前带着 `_curRoot &&`，于是"启动 IDE、不开文件夹、直接提问"这条最常见的路径上，
+  // 磁盘技能一个都不会被发现——用户装了一堆，模型全不知道。
+  // 自限：扫完 _fileSkillsCacheKey 变成 "\0<home>"（非空），所以每次启动最多等这一回；
+  // 之后真打开了文件夹，cacheKey 不同会自动重扫。
+  if (inTauri && !_fileSkillsCacheKey) {
+    try {
+      await Promise.race([
+        // MCP 和技能一起等这一下。名录（_mcpAvailabilitySystemContext）是在这之后、
+        // run 开始**之前**算的：预热没落地它就是空串，于是首轮模型连"有哪些服务"都
+        // 不知道。等不到也不阻塞——1.5 秒上限，后台那次照常写回缓存，下一轮就齐了。
+        Promise.allSettled([_refreshFileSkills(_curRoot || ""), _warmMcpTools(_curRoot || "")]),
+        new Promise((resolve) => setTimeout(resolve, 1500)),
+      ]);
+    } catch {}
+  }
   // 已连上的 MCP 服务必须报给模型。它们的工具被 _selectInitialTools 挡在开局窗口外，
   // 名字又不在静态的 toolCapabilityIndex() 里——不在这儿说一句，模型就完全不知道
   // 这些服务存在，也就永远不会去 search_tools 取。快照来自 app 启动 / 打开文件夹时
   // 的后台预热，取不到就返回空串，不为它增加任何等待。
+  //
+  // 位置有讲究：必须在上面那次冷启动等待**之后**。冷启动首轮 _mcpLoaded 还是 false，
+  // _readyMcpSnapshot 返回空快照；这段以前写在等待之前，等到了也没人回头重算，于是
+  // 那 1.5 秒对 MCP 是白等——装了 MCP 的用户第一句话就像没装。
   //
   // 但**聊天模式不发这一段**。那条路径压根没有工具循环——模型吐出来的工具调用会被
   // 收进 _pendingToolCalls，然后当成 `[TOOL:…]` 文本渲染出来，一个都不会执行。
@@ -26243,28 +26286,6 @@ async function sendPrompt(text, attachments = [], readyConfig = null, opts = {})
     if (mcpFailures) contextBlock += `\n\n${mcpFailures}`;
   }
 
-  // ── 提示词缓存: system = 纯静态前缀(跨轮复用), 动态内容下沉到 user 消息末尾 ──
-  _scheduleWorkspaceAgentWarmup(_curRoot);
-  // 磁盘上的技能是异步发现的（_warmupWorkspaceAgent 里的 _idleRun）。冷启动后立刻提问
-  // 时它还没跑完，技能目录里就只剩 localStorage 那批——模型看不见的技能等于不存在，
-  // 而且不会有任何报错。首轮值得等这一次目录扫描：只扫几个目录，只在从没扫过时等，
-  // 超时也不阻塞（后台那次照常写回缓存，下一轮就齐了）。
-  // 没打开文件夹也要扫：家目录那份技能库（~/.mrdayone/skills）跟有没有打开项目无关。
-  // 这里以前带着 `_curRoot &&`，于是"启动 IDE、不开文件夹、直接提问"这条最常见的路径上，
-  // 磁盘技能一个都不会被发现——用户装了一堆，模型全不知道。
-  // 自限：扫完 _fileSkillsCacheKey 变成 "\0<home>"（非空），所以每次启动最多等这一回；
-  // 之后真打开了文件夹，cacheKey 不同会自动重扫。
-  if (inTauri && !_fileSkillsCacheKey) {
-    try {
-      await Promise.race([
-        // MCP 和技能一起等这一下。名录（_mcpAvailabilitySystemContext）是在这之后、
-        // run 开始**之前**算的：预热没落地它就是空串，于是首轮模型连"有哪些服务"都
-        // 不知道。等不到也不阻塞——1.5 秒上限，后台那次照常写回缓存，下一轮就齐了。
-        Promise.allSettled([_refreshFileSkills(_curRoot || ""), _warmMcpTools(_curRoot || "")]),
-        new Promise((resolve) => setTimeout(resolve, 1500)),
-      ]);
-    } catch {}
-  }
   // Append the model-family style corrective (GPT → strong anti-verbosity; weaker
   // models → terse). Static per model, so the prompt prefix still caches.
   // 聊天模式只给**常驻技能的全文**，不给技能目录：目录的落点是「用 read_skill 读它」，
@@ -26466,20 +26487,22 @@ async function sendPrompt(text, attachments = [], readyConfig = null, opts = {})
   // 而其中绝大多数就在下面的对话里原样摆着——机器把用户刚说过的话再背一遍给模型听，
   // 模型于是也跟着复述。它真正的用途只有一个：会话被压缩之后，最早那些要求不在历史里了，
   // 这块把它们捞回来。还在历史里的一条都不该重复。差集为空时连表头一起不发。
+  // 差集两侧必须走同一个归一化（_ledgerNorm）：账本入账时压过空白，历史原文没有，
+  // 直接拿原文 includes 会让任何一条多行消息永远「不在历史里」。
   const _recentText = (() => {
     try {
       return (sess?.memory?.recent || []).filter((m) => m?.role === "user")
-        .map((m) => String(m.content || "")).join("\n");
+        .map((m) => _ledgerNorm(m.content)).join("\n");
     } catch { return ""; }
   })();
   const _fadedDemands = (_MODES_WITH_TOOLS.has(effectiveMode) && Array.isArray(sess._demandLedger))
     ? sess._demandLedger.filter((d) => {
-        const key = String(d || "").trim().slice(0, 40);
+        const key = _ledgerNorm(d).slice(0, 40);
         return key && !_recentText.includes(key);
       })
     : [];
   const _demandLedgerBlock = _fadedDemands.length
-    ? `--- 已从对话中折叠掉的历次要求（仅供回忆，不是待办清单）---\n${_fadedDemands.map((d, i) => `${i + 1}. ${d}`).join("\n")}\n（本轮真正要做的事只看下方 📌。上表里：越靠后的越新，后条对同一件事的说法直接作废前条；已完成、已撤销、以及只是提问或抱怨的，都不要再执行。）\n\n`
+    ? `${_DEMAND_LEDGER_HEAD}仅供回忆，不是待办清单）---\n${_fadedDemands.map((d, i) => `${i + 1}. ${d}`).join("\n")}\n（本轮真正要做的事只看下方 📌。上表里：越靠后的越新，后条对同一件事的说法直接作废前条；已完成、已撤销、以及只是提问或抱怨的，都不要再执行。）\n\n`
     : "";
   // 方案A：上轮思考结论块——只注结论摘要（总量 ≤400 字，最新一条永远在场），治"每轮
   // 从零重想"。只进当轮动态前导，不碰历史前缀缓存。
@@ -26547,7 +26570,7 @@ async function sendPrompt(text, attachments = [], readyConfig = null, opts = {})
       || /^(?:请|麻烦|那|就|快|你)?(?:继续|接着|接下来|然后呢|别停|恢复|快点|开始吧?|动手吧?|开干|做吧|干吧|好的|好嘞|嗯+|哦|噢|行|可以|明白|懂了|收到|谢谢|多谢|辛苦了|ok|okay|goon|continue|resume)[啊呀呢嘛吧~！!。.\s]*$/i.test(_lt.replace(/[，,、\s]+/g, ""));
     if (!_isFiller) {
       sess._demandLedger = Array.isArray(sess._demandLedger) ? sess._demandLedger : [];
-      sess._demandLedger.push(_lt.replace(/\s+/g, " ").slice(0, 240));
+      sess._demandLedger.push(_ledgerNorm(_lt).slice(0, 240));
       if (sess._demandLedger.length > 40) sess._demandLedger.splice(0, sess._demandLedger.length - 40);
       // A high-confidence "not X, use Y" correction supersedes matching durable
       // memory immediately. Other preference signals keep the normal capture path.
@@ -39653,7 +39676,7 @@ function _trimMessagesIfHuge(messages, run = null, root = "", contextLimitTok = 
         // 亲手写进去的分段标记。在就保、不在就什么都不做——不猜模型接下来用不用得上。
         const _head = m.content.slice(0, mk);
         const _keepBlocks = [];
-        for (const marker of ["--- 项目约定 (", "--- 子目录约定 (", "--- 本会话历次用户消息（"]) {
+        for (const marker of ["--- 项目约定 (", "--- 子目录约定 (", _DEMAND_LEDGER_HEAD]) {
           let from = _head.indexOf(marker);
           while (from >= 0) {
             // 切到下一个分段标记为止（分段一律以行首 "--- " 起头）。
@@ -49305,7 +49328,7 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
             run._steeringText = `${run._steeringText || ""}\n${steerText}`.trim().slice(-12000);
             // 插话与正常消息同权：入需求账本 + 长期记忆自动沉淀（此前只有 sendPrompt 入口有）
             try {
-              const _sl = steerText.trim().replace(/\s+/g, " ");
+              const _sl = _ledgerNorm(steerText);
               if (_sl.length >= 6 && session) {
                 session._demandLedger = Array.isArray(session._demandLedger) ? session._demandLedger : [];
                 session._demandLedger.push(_sl.slice(0, 240));
