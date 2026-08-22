@@ -5465,40 +5465,53 @@ test("historical image bytes are sanitized before model use and never fall back 
 });
 
 test("a location follow-up applies only to the most recent historical media turn", async () => {
+  // 旧图不再回头改写历史条目（那会逐轮打碎前缀缓存），而是作为 priorMedia 附到本轮消息
+  // 末尾——这里断言的仍是「哪些图可见、forced 只落在最近一张」，位置换了，语义没换。
   const calls = [];
   const rebuild = load("_memoryMessagesForModel", {
     _stripAckOpeners: load("_stripAckOpeners"),
     _stripTeachingSections: load("_stripTeachingSections"),
-    _isImageLocationRequest: (text, hasImageContext) => hasImageContext && /定位/.test(String(text)),
-    _attachmentAwareContent: async (text, attachments, _config, _budget, forced, intentText) => {
-      calls.push({ text, name: attachments[0].name, forced, intentText });
-      return text;
-    },
+    _priorMediaForTurn: load("_priorMediaForTurn", {
+      _isImageLocationRequest: (text, hasImageContext) => hasImageContext && /定位/.test(String(text)),
+      _attachmentAwareContent: async (text, attachments, _config, _budget, forced, intentText) => {
+        calls.push({ text, name: attachments[0].name, forced, intentText });
+        return text;
+      },
+    }),
   });
-  const messages = await rebuild({ assemble: () => [
+  const { messages, priorMedia } = await rebuild({ assemble: () => [
     { role: "user", content: "第一张", attachments: [{ kind: "image", name: "old.jpg" }] },
     { role: "assistant", content: "看过了" },
     { role: "user", content: "第二张", attachments: [{ kind: "image", name: "recent.jpg" }] },
     { role: "user", content: "再看视频", attachments: [{ kind: "video", name: "clip.mp4" }] },
   ] }, { model: "vision" }, "定位刚才那张图片");
   assert.equal(messages.length, 4);
-  assert.deepEqual(calls, [
-    { text: "第一张", name: "old.jpg", forced: false, intentText: "" },
-    { text: "第二张", name: "recent.jpg", forced: true, intentText: "" },
-    { text: "再看视频", name: "clip.mp4", forced: false, intentText: "" },
+  assert.ok(messages.every((m) => typeof m.content === "string"), "history entries stay text; media rides on the current turn");
+  assert.deepEqual(calls.map(({ name, forced, intentText }) => ({ name, forced, intentText })), [
+    { name: "old.jpg", forced: false, intentText: "" },
+    { name: "recent.jpg", forced: true, intentText: "" },
+    { name: "clip.mp4", forced: false, intentText: "" },
   ]);
+  // 尾部的每段回看都要指回原消息，模型才知道这是哪一轮的图。
+  assert.match(calls[0].text, /第一张/);
+  assert.match(calls[1].text, /第二张/);
+  assert.match(calls[2].text, /再看视频/);
+  assert.deepEqual(priorMedia.map((part) => part.type), ["text", "text", "text"]);
 });
 
 test("a current attachment suppresses historical media unless the user explicitly references it", async () => {
+  // 同上：可见性判据不变，可见的旧图出现在本轮 priorMedia（消息末尾），历史条目本身不动。
   const calls = [];
   const rebuild = load("_memoryMessagesForModel", {
     _stripAckOpeners: load("_stripAckOpeners"),
     _stripTeachingSections: load("_stripTeachingSections"),
-    _isImageLocationRequest: (text, hasImageContext) => hasImageContext && /哪里|定位/.test(String(text)),
-    _attachmentAwareContent: async (text, attachments, _config, _budget, forced) => {
-      calls.push({ name: attachments[0].name, forced });
-      return text;
-    },
+    _priorMediaForTurn: load("_priorMediaForTurn", {
+      _isImageLocationRequest: (text, hasImageContext) => hasImageContext && /哪里|定位/.test(String(text)),
+      _attachmentAwareContent: async (text, attachments, _config, _budget, forced) => {
+        calls.push({ name: attachments[0].name, forced });
+        return [{ type: "text", text }, { type: "image_url", image_url: { url: `data:${attachments[0].name}` } }];
+      },
+    }),
   });
   const memory = { assemble: () => [
     { role: "user", content: "更早的图", attachments: [{ kind: "image", name: "older.jpg" }] },
@@ -5507,22 +5520,27 @@ test("a current attachment suppresses historical media unless the user explicitl
     { role: "assistant", content: "看过了" },
   ] };
 
-  await rebuild(memory, { model: "vision" }, "这张图在哪里", true);
+  const none = await rebuild(memory, { model: "vision" }, "这张图在哪里", true);
   assert.deepEqual(calls, [], "a new attachment must not disclose or mix in an older image");
+  assert.deepEqual(none.priorMedia, []);
 
-  await rebuild(memory, { model: "vision" }, "把这张和上一张图片比较", true);
+  const one = await rebuild(memory, { model: "vision" }, "把这张和上一张图片比较", true);
   assert.deepEqual(calls, [{ name: "old.jpg", forced: false }]);
+  assert.deepEqual(one.priorMedia.map((part) => part.type), ["text", "image_url"]);
+  assert.ok(one.messages.every((m) => typeof m.content === "string"), "the historical entry itself is not rewritten");
 
   calls.length = 0;
   await rebuild(memory, { model: "vision" }, "这张和上一张分别在哪里拍的", true);
   assert.deepEqual(calls, [{ name: "old.jpg", forced: true }]);
 
   calls.length = 0;
-  await rebuild(memory, { model: "vision" }, "把这张和之前所有图片一起比较", true);
+  const all = await rebuild(memory, { model: "vision" }, "把这张和之前所有图片一起比较", true);
   assert.deepEqual(calls, [
     { name: "older.jpg", forced: false },
     { name: "old.jpg", forced: false },
   ]);
+  assert.deepEqual(all.priorMedia.map((part) => part.image_url?.url).filter(Boolean), ["data:older.jpg", "data:old.jpg"],
+    "prior images are appended in conversation order");
 });
 
 test("historical image lookup selects the latest image turn and ignores a later video", () => {
@@ -9898,8 +9916,9 @@ test("Agent decision frame gives task-specific old-hand operating rules", () => 
     "Agent send path must add the decision frame to the per-turn preamble");
   assert.doesNotMatch(SRC, /_uiTurnEngineering = _fastRouteProfile|run\.engineering = _fastRouteProfile/,
     "快通道的判断不许写进驱动闸门的那份画像——它只负责给模型指路");
-  assert.match(SRC, /_dynPreamble \+ _atContext \+ _modeFrame \+ _decisionFrame \+ _uiDesignCraft \+ _toolHint \+ _expHint/,
-    "decision frame must sit before tool and experience hints in recency context");
+  // 工具直觉表/能力名录已搬进 system 前缀（字节稳定才有缓存收益），当轮前导里只剩动态块。
+  assert.match(SRC, /_dynPreamble \+ _atContext \+ _modeFrame \+ _decisionFrame \+ _uiDesignCraft \+ _expHint/,
+    "decision frame must sit before the experience hint in recency context");
   assert.match(SRC, /每次工具前先在内部过三问/);
   assert.match(SRC, /报错\/bug\/哪些文件有问题这类请求，优先读取 IDE 已有证据/);
 });
@@ -9984,8 +10003,8 @@ test("UI design craft guidance is injected only for front-end work", () => {
   assert.match(greenfield, /Tailwind 采用 v4 时使用 CSS-first 配置/);
   assert.match(SRC, /const _uiDesignCraft = \(effectiveMode === "agent"\)\s*\? _uiDesignCraftBlock\(text, _uiTurnEngineering, \{ serverDesignLayersActive: _serverDesignLayersRouted\(config\) \}\)/,
     "Agent send path must add the UI craft block to front-end turns");
-  assert.match(SRC, /_dynPreamble \+ _atContext \+ _modeFrame \+ _decisionFrame \+ _uiDesignCraft \+ _toolHint \+ _expHint/,
-    "UI craft guidance must appear before the tool and experience hints");
+  assert.match(SRC, /_dynPreamble \+ _atContext \+ _modeFrame \+ _decisionFrame \+ _uiDesignCraft \+ _expHint/,
+    "UI craft guidance must appear before the experience hint");
 });
 
 
