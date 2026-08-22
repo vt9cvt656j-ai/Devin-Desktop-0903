@@ -169,7 +169,67 @@ rsync_run() {
   echo "source sync failed after 5 attempts (last exit ${status}) — NOT deploying stale files" >&2
   return "$status"
 }
+# ── 部署来源追溯 ────────────────────────────────────────────────────────────
+#
+# 上面那条 rsync 同步的是 **`./`，也就是你 cd 进来的那个目录**。这个仓库同时存在四个
+# 能部署的工作树（主工作树 + ~/.mrday-scratch 下三个钉在不同提交的 detached worktree），
+# 而且主工作树长期带着好几个并行会话的未提交改动。于是「线上跑的是什么」取决于
+# **最后一次是谁在哪个目录跑的这个脚本**，而这件事此前一个字都没被记下来。
+#
+# 这不是假想。2026-08-21 一批改动（Anthropic/Codex 协议头）从主工作树连部署了 5 次、
+# 在线上跑了约一小时四十分；2026-08-22 有人从 ~/.mrday-scratch/wt-server（一个干净的
+# detached worktree）部署了两次，那批未提交的改动就此被 rsync --delete-delay 静默覆盖掉。
+# **没有人做过回滚决定**，也没有任何地方留下痕迹 —— 事后是靠比对服务器上源文件的 md5
+# 才发现的。
+#
+# 所以这里做三件事，都很便宜：把来源算出来、打在屏幕上、随部署写到服务器上；
+# 并且在「来源和上一次不一样」时**拦一下**，因为那正是上面那次事故的形状。
+SRC_DIR="$(pwd -P)"
+SRC_COMMIT="$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
+SRC_BRANCH="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo unknown)"
+# 只数会被 rsync 送上去的那些：排除项和上面 rsync 的 --exclude 对齐。
+SRC_DIRTY="$(git status --porcelain -- . 2>/dev/null | grep -vE '^\?\? (target|node_modules)/' | wc -l | tr -d ' ')"
+SRC_STAMP="path=${SRC_DIR} commit=${SRC_COMMIT} branch=${SRC_BRANCH} dirty=${SRC_DIRTY}"
+echo "部署来源：${SRC_STAMP}"
+if [ "${SRC_DIRTY}" != "0" ]; then
+  echo "  ⚠ 这次带上去的包含 ${SRC_DIRTY} 处**未提交**改动 —— 下一次从别的目录部署会把它们盖掉。"
+fi
+
+read_remote_stamp() {
+  local attempt out
+  for attempt in 1 2 3; do
+    if out="$(ssh "${SSH_ARGS[@]}" "$REMOTE" "cat $REMOTE_Q/DEPLOYED_FROM 2>/dev/null" 2>/dev/null)"; then
+      printf '%s' "$out"
+      return 0
+    fi
+    sleep 2
+  done
+  return 0   # 读不到就当第一次部署，不拦
+}
+PREV_STAMP="$(read_remote_stamp | head -1)"
+PREV_PATH="$(printf '%s' "$PREV_STAMP" | sed -n 's/.*path=\([^ ]*\).*/\1/p')"
+PREV_DIRTY="$(printf '%s' "$PREV_STAMP" | sed -n 's/.*dirty=\([0-9]*\).*/\1/p')"
+if [ -n "$PREV_PATH" ] && [ "$PREV_PATH" != "$SRC_DIR" ]; then
+  echo "" >&2
+  echo "⚠ 部署来源变了：" >&2
+  echo "    上一次：${PREV_STAMP}" >&2
+  echo "    这一次：${SRC_STAMP}" >&2
+  if [ "${PREV_DIRTY:-0}" != "0" ] && [ "${SRC_DIRTY}" = "0" ]; then
+    echo "" >&2
+    echo "  上一次部署带着 ${PREV_DIRTY} 处未提交改动，这一次的树是干净的 ——" >&2
+    echo "  继续下去会把那批改动从线上**静默移除**，这正是 2026-08-22 那次事故的形状。" >&2
+  fi
+  if [ "${CONFIRM_SOURCE_CHANGE:-}" != "1" ]; then
+    echo "" >&2
+    echo "  确认要这么做就带上 CONFIRM_SOURCE_CHANGE=1 重跑。" >&2
+    exit 1
+  fi
+  echo "  已通过 CONFIRM_SOURCE_CHANGE=1 确认，继续。" >&2
+fi
+
 rsync_run
+# 落一份来源到服务器上，供下一次比对，也让「线上这份是从哪来的」随时能答。
+ssh_run "{ printf '%s\n' $(printf '%q' "$SRC_STAMP"); printf 'deployed_at=%s\n' \"\$(date -u +%Y-%m-%dT%H:%M:%SZ)\"; } > $REMOTE_Q/DEPLOYED_FROM"
 
 echo "checking for ${REMOTE_DIR}/${ENV_FILE} on the server"
 if ! ssh_true "test -f $REMOTE_Q/$(printf '%q' "$ENV_FILE")"; then
