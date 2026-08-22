@@ -26134,14 +26134,36 @@ async function sendPrompt(text, attachments = [], readyConfig = null, opts = {})
   // 这道等待就变成了每一轮都付一次完整窗口——纯聊天的会话会被这个数字拖成逐轮卡顿。
   // 真正的判据是"这个会话已经拿到过一次裁决了"，跟裁决点亮了几个 flag 无关。
   let _fastRouteProfile = null;
+  // 快通道的**启动判据**从「这一轮等没等过」换成「会话画像还空不空」，结果也终于有了落地点。
+  //
+  // 原来它和下面那道等待窗口共用同一个 `!sess._intentWaitPaid`，于是一条会话总共只有一次
+  // 机会，而那次机会被关在 _FIRST_TURN_INTENT_WAIT_MS（6 秒）的 race 里。快通道自己就是一次
+  // 完整的模型调用——生产线路实测首响应头 8~18 秒——它结构上赢不了这个 race。输了之后
+  // `_fastRouteProfile` 再也没有第二个读者：算出来、付过钱、然后丢掉。
+  // 生产 46/46 语义画像全空、agent_engineering 装载 0 次，正是这个形状。
+  const _sessionFlags = Array.isArray(sess._semanticProfileFlags) ? sess._semanticProfileFlags : [];
+  const _fastRoute = (_turnIntentState && !_sessionFlags.length)
+    ? _fastRoutingFlags(text, config, sess, _turnIntentState.context || null)
+        .then((p) => {
+          _fastRouteProfile = p;
+          // **落地点**。窗口早就过去了也照样并进会话画像：画像是单调并集，晚到只补旗标，
+          // 不会改掉已经在的。run 自己持有的那份 config 由循环边界的
+          // _applyFastRouteProfileIfLanded 补写，所以本轮第二个模型回合起就带着旗标出门。
+          if (p) {
+            if (_turnIntentState) _turnIntentState.fastProfile = p;
+            config.ideSemanticProfile = _sessionStableSemanticProfile(sess, _ideSemanticProfile(p));
+          }
+          return p;
+        })
+        .catch(() => null)
+    : null;
   if (_turnIntentState && !(sess._semanticProfileFlags || []).length && !sess._intentWaitPaid) {
     // 两条腿一起跑，谁先到算谁：
     //   · 完整裁决——实测 19.8 秒，字段全，落定后驱动 run.engineering（行为闸门只认它）；
     //   · 快通道——只回路由旗标，输出卡在 200 token，几秒就回，只喂请求头。
     // 单靠完整裁决那条腿，这道等待就是"要么干等二十几秒，要么这一轮什么模块都没有"的二选一。
-    const _fastRoute = _fastRoutingFlags(text, config, sess, _turnIntentState.context || null)
-      .then((p) => { _fastRouteProfile = p; return p; })
-      .catch(() => null);
+    // 这道等待只决定「本轮第一发能不能带上旗标」；赢不了它不再等于丢掉——上面那个 .then 才是
+    // 结果的归宿，循环边界会把迟到的旗标补进请求头。
     let _waitTimer = null;
     try {
       await Promise.race([
@@ -48919,6 +48941,59 @@ function _applyLateIntentIfLanded(run, config, task, session, body, isLive, mess
   return true;
 }
 
+// 快通道旗标的落地点 —— _applyLateIntentIfLanded 的同胞。
+//
+// 为什么必须存在：快通道（_fastRoutingFlags）在 sendPrompt 里启动，而它的结果原来只有一个
+// 读者，就是发车前那一行同步的 `_fastRouteProfile || _turnEngineeringResolved`。那一行跑在
+// 一个 6 秒的 race 之后，而快通道自己是一次完整的模型调用（生产实测首响应头 8~18 秒）——
+// 结构上赢不了。赢不了 = 结果没有读者 = 整条通道白跑。生产 46 次 agent 请求
+// semantic_profile_seen 全空、agent_engineering 装载 0 次，就是这个洞。
+//
+// 它只写请求头，绝不写 run.engineering：那份画像还管着计划门槛、写入义务、角色编排，
+// 拿一份精简判断驱动它们会把影响面放得太大。行为仍然只认完整裁决。
+function _applyFastRouteProfileIfLanded(run, config, session) {
+  if (!run || !config || run._fastRouteProfileApplied) return false;
+  const fast = run._intentState?.fastProfile;
+  if (!fast || typeof fast !== "object") return false;
+  run._fastRouteProfileApplied = true;
+  config.ideSemanticProfile = _sessionStableSemanticProfile(session, _ideSemanticProfile(fast));
+  return true;
+}
+
+// 执行事实 → 语义旗标。**一个字的用户措辞都不看**。
+//
+// 分类器不可用时不许退回词表猜意图（这条有测试正面钉着），但"什么都不发"并不是唯一的
+// 另一条路：这一轮**真的发生过什么**是可观测事实，和猜测是两回事。
+//   · run._writeLedger 非空 = 这一轮真的往工作区落过盘。落过盘的一轮就是工程活，
+//     不是闲聊——这不是预测，是已经发生的执行事实。对应 implementation → 旗标 engineering。
+//   · 会话绑着的工作区根有 ready 的顶层快照 = 磁盘上确实有一个已有项目。
+//     对应 existingProject → 旗标 existing_project。
+// 画像是单调并集，所以这里给出的是**下限**：完整裁决/快通道随后照样把自己的旗标并进来。
+function _executionFactSemanticFlags(run) {
+  const facts = {};
+  if (!run || typeof run !== "object") return facts;
+  if (Array.isArray(run._writeLedger) && run._writeLedger.length > 0) facts.implementation = true;
+  const evidence = run._intentState?.context?.workspaceEvidence;
+  if (evidence?.hasWorkspace && evidence?.snapshotReady && (evidence.topLevel || []).length) {
+    facts.existingProject = true;
+  }
+  return facts;
+}
+
+// 把执行事实并进请求头。没有任何事实时一个字都不发（不许凭空造旗标）。
+function _applyExecutionFactProfile(run, config, session) {
+  if (!run || !config) return false;
+  const facts = _executionFactSemanticFlags(run);
+  if (!Object.keys(facts).length) return false;
+  const header = _ideSemanticProfile(facts);
+  const flags = header.slice(header.indexOf(":") + 1).split(",").filter(Boolean);
+  if (!flags.length) return false;
+  const already = Array.isArray(session?._semanticProfileFlags) ? session._semanticProfileFlags : [];
+  if (flags.every((flag) => already.includes(flag))) return false;
+  config.ideSemanticProfile = _sessionStableSemanticProfile(session, header);
+  return true;
+}
+
 async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot = "", session, mode, task, engineering = null, intentState = null, skillsBlock = "", billingTasks = [], taskStartedAt = Date.now(), timeline = null }) {
   _clearPlanChip(); // drop any stale plan chip from a previous task before this run starts
   // session/root 先解析：意图画像要读本会话刚确认的语义帧，必须拿到真 session。
@@ -49650,6 +49725,10 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
   if (run.engineering?.intentSource !== "ai") {
     _applyLateIntentIfLanded(run, config, task, session, body, _live, messages);
   }
+  // 完整裁决之外的两个来源，同一个边界一起收：快通道的旗标（模型判断，只喂请求头）和
+  // 这一轮已经发生的执行事实。两者都只并进单调并集，不动任何行为闸门。
+  _applyFastRouteProfileIfLanded(run, config, session);
+  _applyExecutionFactProfile(run, config, session);
   _startMichaelDesignPreflight({ run, body, isLive: _live });
   // The Agent nucleus + search_tools are sufficient for the first evidence step. Delay
   // semantic routing until that first model turn returns: otherwise both requests compete
@@ -49811,6 +49890,8 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
       if (run.engineering?.intentSource !== "ai") {
         _applyLateIntentIfLanded(run, config, task, session, body, _live, messages);
       }
+      _applyFastRouteProfileIfLanded(run, config, session);
+      _applyExecutionFactProfile(run, config, session);
       _startInitialToolRoutingAfterFirstTurn();
       _startMichaelDesignPreflight({ run, body, isLive: _live });
       _consumeMichaelDesignPreflight();
@@ -50212,6 +50293,8 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
       if (run.engineering?.intentSource !== "ai") {
         _applyLateIntentIfLanded(run, config, task, session, body, _live, messages);
       }
+      _applyFastRouteProfileIfLanded(run, config, session);
+      _applyExecutionFactProfile(run, config, session);
       _firstModelTurnCompleted = true;
       _startInitialToolRoutingAfterFirstTurn();
       _startMichaelDesignPreflight({ run, body, isLive: _live });

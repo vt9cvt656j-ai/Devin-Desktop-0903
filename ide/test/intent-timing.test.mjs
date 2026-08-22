@@ -333,9 +333,22 @@ test("完整裁决要 19.8 秒，路由必须有第二条腿——而且那条�
 
   // 两条腿必须真的并行 race，否则快通道等于没接。
   const wait = waitBlock();
-  assert.match(wait, /_fastRoutingFlags\(text, config, sess/, "快通道没有在等待块里启动");
-  assert.match(wait, /Promise\.race\(\[\s*_turnIntentExactPromise,\s*_fastRoute,/,
+  assert.match(wait, /Promise\.race\(\[\s*_turnIntentExactPromise,\s*_fastRoutingFlags\(|Promise\.race\(\[\s*_turnIntentExactPromise,\s*_fastRoute,/,
     "两条腿必须在同一个 race 里——串行等待就没有意义了");
+
+  // 快通道的**启动点**已经搬到这道等待之外，而且必须在它之外。
+  //
+  // 原来它是等待块里的一个 const：既然生在块里，就只有块里那次 race 能用它，块外那行同步的
+  // `_fastRouteProfile || _turnEngineeringResolved` 是它唯一的读者。而这条腿自己是一次完整的
+  // 模型调用（生产首响应头 8~18 秒），它结构上赢不了 6 秒的窗口——赢不了就等于结果没有读者。
+  // 生产 46/46 语义画像全空正是这个形状。启动点提到块外，结果才有机会在循环边界落地。
+  const startAt = CODE.indexOf("const _fastRoute = ");
+  const waitAt = CODE.indexOf(WAIT_ANCHOR);
+  assert.ok(startAt > 0 && startAt < waitAt,
+    "快通道的启动点必须在等待块之外——生在块里，它的结果就只有那一次赢不了的 race 能读到");
+  assert.doesNotMatch(CODE.slice(startAt, startAt + 200), /_intentWaitPaid/,
+    "快通道的启动判据不许挂在 _intentWaitPaid 上：那个标志记的是「这一轮等过」，"
+    + "一置真整条会话就再也不发快通道了");
 });
 
 test("角色计划第一轮就要到，但只当指路用——闸门仍然只认完整裁决", () => {
