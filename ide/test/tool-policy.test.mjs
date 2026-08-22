@@ -32,7 +32,11 @@ import {
 } from "../src/agent/tool-policy.js";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
-const MAIN = readFileSync(join(HERE, "../src/main.js"), "utf8");
+// 正向源码断言必须跑在**剥掉注释**的源码上。注释不是代码：把一条契约从代码里删掉、
+// 只在注释里留一句，assert.match 照样绿——本仓库已经这样漏过一整组模型可见的工具契约。
+// 所以 `MAIN` 绑定的是 CODE（注释整段置空，行号与偏移和原文一字不差）；
+// 真要匹配注释本身的断言显式用 RAW_SRC，并在那一行写清为什么。
+import { CODE as MAIN, SRC as RAW_SRC } from "./helpers/source.mjs";
 
 const sorted = (set) => [...set].sort();
 
@@ -350,10 +354,10 @@ const NO_APPROVAL_TODAY = new Set([
 
 /** _mapToolCall 会产出的全部 call.type。剥注释再取，免得被注释里引用的旧类型名喂到。 */
 function mappedCallTypes() {
-  const at = MAIN.indexOf("function _mapToolCall(");
+  const at = RAW_SRC.indexOf("function _mapToolCall(");
   assert.ok(at > 0, "_mapToolCall 改名了，这条守卫要跟着改");
   let depth = 0, end = MAIN.length;
-  for (let i = MAIN.indexOf("{", MAIN.indexOf(")", at)); i < MAIN.length; i++) {
+  for (let i = RAW_SRC.indexOf("{", RAW_SRC.indexOf(")", at)); i < MAIN.length; i++) {
     if (MAIN[i] === "{") depth++;
     else if (MAIN[i] === "}" && --depth === 0) { end = i + 1; break; }
   }

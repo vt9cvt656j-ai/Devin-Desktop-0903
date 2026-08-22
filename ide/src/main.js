@@ -33393,8 +33393,11 @@ function _withoutDisabledTools(tools) {
 // Keep the always-loaded Tool Search schema short. The semantic router has the
 // complete registry; this resident tool only explains how to request a missing
 // capability. The old domain manual was repeated on every model turn.
-// 兼容旧提示契约：帮用户装软件/装环境/配工具链：run_cmd 配 package_search/homebrew_search。
-// 具体仓库读取契约：要读具体代码仓库的 README/目录/源码/release/issue/PR/MR；GitHub 用 github_repo，GitLab 用 gitlab_repo，Gitee 用 gitee_repo，Codeberg 用 codeberg_repo。
+// 这里曾经留着两行自称「兼容旧提示契约」的注释，逐字抄着装环境和读代码托管平台这两条路由
+// 指引。它们不在下面这段描述正文里，也不在网关 tools.json 里——模型一个字都收不到，却把
+// logic.test.mjs 里五条「模型必须看得见这条路由」的断言喂成了绿的。整段删掉，别让注释再替
+// 代码作证。两条路由钉回它们真正的落点：tool-guides 的 TOOL_METADATA，经 enrichedCatalogLine
+// 拼进语义编排器的目录行，那才是模型真读得到的地方。
 const _SEARCH_TOOLS_DESCRIPTION = `按需查找和加载当前支持的工具（工程、终端、浏览器、数据库、Git、LSP、桌面、MCP 与外部来源都在注册表中）。自然语言请求由语义编排器依据完整目录、任务阶段和真实证据选择，不做关键词或正则路由；已知精确工具名也可直接查询。先用项目证据、记忆和 knowledge_search，只有存在明确的当前事实缺口才加载公网来源。当前时间只表示本轮请求时间，不能替代来源的 published_date、updated_at、version、observed_at、rate_date 或 retrieved_at。最新论文/SOTA/前沿研究加载 arxiv_search、openalex_search、crossref_search；医学/药物/临床优先加载 pubmed_search、clinical_trials_search、pubchem_search；新技术/新版本/API 兼容性先查官方文档、包注册表、GitHub/GitLab/Gitee/Codeberg release/issues 和开发者社区；developer_community_search 用于真实开发者社区证据；游戏价格/平台加载 steam_search。拿到社区、仓库、论坛或专业数据库结果后必须提炼共识、分歧、适用版本/时间、对当前问题的影响和验证动作，不能只罗列链接。`;
 const _SEARCH_TOOLS_SCHEMA = { type: "function", function: { name: "search_tools", description: _SEARCH_TOOLS_DESCRIPTION, parameters: { type: "object", properties: { query: { type: "string", description: "要查找的能力或要完成的工作" } }, required: ["query"] } } };
 

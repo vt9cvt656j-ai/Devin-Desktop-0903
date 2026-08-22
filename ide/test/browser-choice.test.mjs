@@ -14,7 +14,11 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
-const SRC = readFileSync(join(HERE, "..", "src", "main.js"), "utf8");
+// 正向源码断言必须跑在**剥掉注释**的源码上。注释不是代码：把一条契约从代码里删掉、
+// 只在注释里留一句，assert.match 照样绿——本仓库已经这样漏过一整组模型可见的工具契约。
+// 所以 `SRC` 绑定的是 CODE（注释整段置空，行号与偏移和原文一字不差）；
+// 真要匹配注释本身的断言显式用 RAW_SRC，并在那一行写清为什么。
+import { CODE as SRC, SRC as RAW_SRC } from "./helpers/source.mjs";
 const RUST = readFileSync(join(HERE, "..", "src-tauri", "src", "browser.rs"), "utf8");
 const CAPTURE = readFileSync(join(HERE, "..", "src-tauri", "src", "capture.rs"), "utf8");
 const LIB = readFileSync(join(HERE, "..", "src-tauri", "src", "lib.rs"), "utf8");
@@ -26,8 +30,8 @@ const AUTOMATION = readFileSync(
 test("图标常量必须声明在那段立刻执行的块之前，否则应用一启动就白屏", () => {
   // 能力菜单那段是块语句，模块求值时就跑。它读的常量如果声明在文件后面，
   // 就是 TDZ 报错——而且所有静态测试照样全绿，因为没人真的求值过 main.js。
-  const decl = SRC.indexOf("const _ICON_BROWSER =");
-  const use = SRC.indexOf("icon.innerHTML = _ICON_BROWSER");
+  const decl = RAW_SRC.indexOf("const _ICON_BROWSER =");
+  const use = RAW_SRC.indexOf("icon.innerHTML = _ICON_BROWSER");
   assert.ok(decl >= 0, "_ICON_BROWSER 没了");
   assert.ok(use >= 0, "菜单项不再设置图标");
   assert.ok(decl < use, "_ICON_BROWSER 声明排在使用之后 —— 这是 TDZ，应用起不来");

@@ -16,19 +16,23 @@ import assert from "node:assert/strict";
 import { normalizeCapabilities } from "../src/agent/capabilities.js";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
-const SRC = readFileSync(join(HERE, "..", "src", "main.js"), "utf8");
+// 正向源码断言必须跑在**剥掉注释**的源码上。注释不是代码：把一条契约从代码里删掉、
+// 只在注释里留一句，assert.match 照样绿——本仓库已经这样漏过一整组模型可见的工具契约。
+// 所以 `SRC` 绑定的是 CODE（注释整段置空，行号与偏移和原文一字不差）；
+// 真要匹配注释本身的断言显式用 RAW_SRC，并在那一行写清为什么。
+import { CODE as SRC, SRC as RAW_SRC } from "./helpers/source.mjs";
 
 function extractFn(name) {
-  const i = SRC.indexOf(`function ${name}(`);
+  const i = RAW_SRC.indexOf(`function ${name}(`);
   assert.ok(i >= 0, `main.js 里找不到 ${name}`);
   let depth = 0;
-  let j = SRC.indexOf("{", SRC.indexOf(")", i));
-  for (; j < SRC.length; j++) {
-    const c = SRC[j];
+  let j = RAW_SRC.indexOf("{", RAW_SRC.indexOf(")", i));
+  for (; j < RAW_SRC.length; j++) {
+    const c = RAW_SRC[j];
     if (c === "{") depth++;
     else if (c === "}") { depth--; if (!depth) break; }
   }
-  return SRC.slice(i, j + 1);
+  return RAW_SRC.slice(i, j + 1);
 }
 
 const DECL = normalizeCapabilities({

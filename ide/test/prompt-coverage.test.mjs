@@ -17,7 +17,11 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
-const CLIENT = readFileSync(join(HERE, "..", "src", "main.js"), "utf8");
+// 正向源码断言必须跑在**剥掉注释**的源码上。注释不是代码：把一条契约从代码里删掉、
+// 只在注释里留一句，assert.match 照样绿——本仓库已经这样漏过一整组模型可见的工具契约。
+// 所以 `CLIENT` 绑定的是 CODE（注释整段置空，行号与偏移和原文一字不差）；
+// 真要匹配注释本身的断言显式用 RAW_SRC，并在那一行写清为什么。
+import { CODE as CLIENT, SRC as RAW_SRC } from "./helpers/source.mjs";
 const RUST = readFileSync(join(HERE, "..", "..", "server", "src", "prompts.rs"), "utf8");
 const GRAPH = JSON.parse(readFileSync(join(HERE, "..", "..", "server", "prompts", "prompt_graph.json"), "utf8"));
 const PROMPT_DIR = join(HERE, "..", "..", "server", "prompts");

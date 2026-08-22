@@ -15,33 +15,37 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
-const SRC = readFileSync(join(HERE, "..", "src", "main.js"), "utf8");
+// 正向源码断言必须跑在**剥掉注释**的源码上。注释不是代码：把一条契约从代码里删掉、
+// 只在注释里留一句，assert.match 照样绿——本仓库已经这样漏过一整组模型可见的工具契约。
+// 所以 `SRC` 绑定的是 CODE（注释整段置空，行号与偏移和原文一字不差）；
+// 真要匹配注释本身的断言显式用 RAW_SRC，并在那一行写清为什么。
+import { CODE as SRC, SRC as RAW_SRC } from "./helpers/source.mjs";
 
 function extractFn(name) {
-  const i = SRC.indexOf(`function ${name}(`);
+  const i = RAW_SRC.indexOf(`function ${name}(`);
   assert.ok(i >= 0, `main.js 里找不到 ${name}`);
-  let depth = 0, j = SRC.indexOf("{", SRC.indexOf(")", i));
-  for (; j < SRC.length; j++) {
-    const c = SRC[j], d = SRC[j + 1];
-    if (c === "/" && d === "/") { j = SRC.indexOf("\n", j); if (j < 0) j = SRC.length; continue; }
-    if (c === "/" && d === "*") { j = SRC.indexOf("*/", j + 2) + 1; continue; }
+  let depth = 0, j = RAW_SRC.indexOf("{", RAW_SRC.indexOf(")", i));
+  for (; j < RAW_SRC.length; j++) {
+    const c = RAW_SRC[j], d = RAW_SRC[j + 1];
+    if (c === "/" && d === "/") { j = RAW_SRC.indexOf("\n", j); if (j < 0) j = RAW_SRC.length; continue; }
+    if (c === "/" && d === "*") { j = RAW_SRC.indexOf("*/", j + 2) + 1; continue; }
     if (c === '"' || c === "'" || c === "`") {
       const q = c;
-      for (j++; j < SRC.length; j++) { if (SRC[j] === "\\") { j++; continue; } if (SRC[j] === q) break; }
+      for (j++; j < RAW_SRC.length; j++) { if (RAW_SRC[j] === "\\") { j++; continue; } if (RAW_SRC[j] === q) break; }
       continue;
     }
     if (c === "{") depth++;
     else if (c === "}") { depth--; if (!depth) break; }
   }
-  return SRC.slice(i, j + 1);
+  return RAW_SRC.slice(i, j + 1);
 }
 
 function decl(name) {
-  const i = SRC.indexOf(`const ${name} = `);
+  const i = RAW_SRC.indexOf(`const ${name} = `);
   assert.ok(i >= 0, `找不到 ${name}`);
-  return SRC.slice(i, SRC.indexOf("\n]);", i) >= 0 && SRC.indexOf("\n]);", i) < SRC.indexOf(";\n", i) + 2
-    ? SRC.indexOf("\n]);", i) + 4
-    : SRC.indexOf(";", SRC.indexOf(")", i)) + 1);
+  return SRC.slice(i, RAW_SRC.indexOf("\n]);", i) >= 0 && RAW_SRC.indexOf("\n]);", i) < RAW_SRC.indexOf(";\n", i) + 2
+    ? RAW_SRC.indexOf("\n]);", i) + 4
+    : RAW_SRC.indexOf(";", RAW_SRC.indexOf(")", i)) + 1);
 }
 
 const drives = new Function(
@@ -115,22 +119,24 @@ test("大小写不影响判定", () => {
 test("三个真驱动的执行分支都接上了红光", () => {
   // 光有判据没用，得真的在执行点调。以前只有 automation 那一条接了，而且判据是写死的
   // 正则 ^(mouse|keyboard)\.，recorder.replay / window.activate / system / ui_click 全漏。
-  const automation = SRC.slice(SRC.indexOf('} else if (call.type === "automation") {'));
+  const automation = SRC.slice(RAW_SRC.indexOf('} else if (call.type === "automation") {'));
   assert.match(automation.slice(0, 900), /_callDrivesDesktop\(call\) && \(await _showControlGlow\(\)|_callDrivesDesktop\(call\)\) _showControlGlow\(\)/,
     "automation 分支必须用统一判据，不能再用写死的正则");
 
-  const system = SRC.slice(SRC.indexOf('} else if (call.type === "system") {'));
+  const system = SRC.slice(RAW_SRC.indexOf('} else if (call.type === "system") {'));
   assert.match(system.slice(0, 900), /_callDrivesDesktop\(call\)\) _showControlGlow\(\)/,
     "system 分支（open/focus/menu 会真的搬窗口点菜单）必须亮红光");
 
-  const uiclick = SRC.slice(SRC.indexOf('} else if (call.type === "uiclick") {'));
+  const uiclick = SRC.slice(RAW_SRC.indexOf('} else if (call.type === "uiclick") {'));
   assert.match(uiclick.slice(0, 1600), /_showControlGlow\(\)/,
     "ui_click 通过辅助功能真的操作前台 App，必须亮红光");
 });
 
 test("红光在运行收尾时一定会灭", () => {
-  assert.match(SRC, /_hideControlGlow\(\); \/\/ 灭掉红光/,
-    "运行结束的 finally 里必须熄灯——灭不掉的红光比不亮更糟");
+  // 原来钉的是 `_hideControlGlow(); // 灭掉红光` —— 后半截是注释，删掉调用只留注释这条
+  // 断言照样绿。改钉真代码里的相邻关系：收尾把流关掉的同一处，紧接着必须熄灯。
+  assert.match(SRC, /_setStreaming\(session, false\);\s*_hideControlGlow\(\);/,
+    "运行结束的收尾里必须紧跟着熄灯——灭不掉的红光比不亮更糟");
 });
 
 test("覆盖层本身是透明穿透的，且带着说明文字", () => {
@@ -163,7 +169,7 @@ test("桌面控制失败时会把真实的权限诊断带给模型", () => {
     ["system", "[系统控制失败]"],
     ["uiclick", '[失败] ui_click: ${message}'],
   ]) {
-    const at = SRC.indexOf(marker);
+    const at = RAW_SRC.indexOf(marker);
     assert.ok(at > 0, `找不到 ${what} 的失败返回`);
     assert.match(SRC.slice(at - 400, at + 300), /_desktopPermissionNote\(\)/,
       `${what} 失败时必须附上权限诊断`);
@@ -226,7 +232,7 @@ function stripJsComments(source) {
 test("system 失败不再无条件叫用户去勾一个已经勾着的开关", () => {
   // 先切出 system 失败那一小段再剥注释。整份 main.js 不能直接剥——里面的正则字面量
   // 含 /* 序列，块注释规则会从那里一路吃掉几千行，断言就成了空对空。
-  const at = SRC.indexOf("[系统控制失败]");
+  const at = RAW_SRC.indexOf("[系统控制失败]");
   assert.ok(at > 0, "找不到 system 失败返回");
   const region = stripJsComments(SRC.slice(at - 900, at + 400));
   assert.doesNotMatch(region, /勾选 Mr\. Day One 后重启/,
@@ -260,9 +266,9 @@ test("启动后有一个能点的授权入口", () => {
 // 顶层函数按"行首单独一个 }"收尾来切。上面那个括号匹配器不认正则字面量，
 // 而 _dialogBodyHtml 里有 /[&<>"]/g —— 里面那个引号会被当成字符串开头，一路跑飞。
 function extractTopLevelFn(name) {
-  const i = SRC.indexOf(`function ${name}(`);
+  const i = RAW_SRC.indexOf(`function ${name}(`);
   assert.ok(i >= 0, `找不到 ${name}`);
-  const end = SRC.indexOf("\n}\n", i);
+  const end = RAW_SRC.indexOf("\n}\n", i);
   assert.ok(end > i, `${name} 没有行首收尾的大括号`);
   return SRC.slice(i, end + 2);
 }

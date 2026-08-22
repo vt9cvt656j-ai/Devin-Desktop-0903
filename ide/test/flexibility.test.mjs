@@ -15,14 +15,18 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
-const SRC = readFileSync(join(HERE, "..", "src", "main.js"), "utf8");
+// 正向源码断言必须跑在**剥掉注释**的源码上。注释不是代码：把一条契约从代码里删掉、
+// 只在注释里留一句，assert.match 照样绿——本仓库已经这样漏过一整组模型可见的工具契约。
+// 所以 `SRC` 绑定的是 CODE（注释整段置空，行号与偏移和原文一字不差）；
+// 真要匹配注释本身的断言显式用 RAW_SRC，并在那一行写清为什么。
+import { CODE as SRC, SRC as RAW_SRC } from "./helpers/source.mjs";
 
 function loadPredicate() {
-  const at = SRC.indexOf("function _commandStartsLongRunningServer(");
+  const at = RAW_SRC.indexOf("function _commandStartsLongRunningServer(");
   assert.ok(at > 0, "找不到 _commandStartsLongRunningServer");
-  const end = SRC.indexOf("\n}\n", at);
+  const end = RAW_SRC.indexOf("\n}\n", at);
   assert.ok(end > at, "函数没有行首收尾大括号");
-  const declsAt = SRC.indexOf("const _LONG_RUNNING_HEADS");
+  const declsAt = RAW_SRC.indexOf("const _LONG_RUNNING_HEADS");
   assert.ok(declsAt > 0 && declsAt < at, "找不到常量表");
   return new Function(
     SRC.slice(declsAt, at) + SRC.slice(at, end + 2) + "\n;return _commandStartsLongRunningServer;",
@@ -84,8 +88,8 @@ test("空输入不炸", () => {
 });
 
 test("判据不再是扫整条命令字符串", () => {
-  const at = SRC.indexOf("function _commandStartsLongRunningServer(");
-  const body = SRC.slice(at, SRC.indexOf("\n}\n", at));
+  const at = RAW_SRC.indexOf("function _commandStartsLongRunningServer(");
+  const body = SRC.slice(at, RAW_SRC.indexOf("\n}\n", at));
   assert.match(body, /split\(/, "必须按段切开再看段首");
   // 老写法的特征：一条含 serve|watch 的大正则直接 .test(整条命令)
   assert.doesNotMatch(body, /\(serve\|watch\|/,
@@ -99,11 +103,11 @@ test("请求已发出但上游还没开口时，界面要说明在等首字节",
   // 用户于是以为首字节已经到了、界面卡着不画，实际是上游还没开口——有些中转不做流式
   // 转发，要等整段生成完才发第一个字节，那段时间本来就没有任何内容可显示。
   // 两种状态长得一样，就没法判断该等还是该重试。
-  const at = SRC.indexOf("function _turnStatsText(");
+  const at = RAW_SRC.indexOf("function _turnStatsText(");
   assert.ok(at > 0, "找不到 _turnStatsText");
-  const fn = SRC.slice(at, SRC.indexOf("\n}\n", at));
+  const fn = SRC.slice(at, RAW_SRC.indexOf("\n}\n", at));
   assert.match(fn, /live/, "实时统计要能区分 live 与收尾");
   assert.match(fn, /等待上游首字节/, "没有任何进展时要说明在等首字节");
   assert.match(fn, /接收中/, "已经开始收但还没画出来时要说明在接收");
-  assert.ok(SRC.indexOf("live: true,") > 0, "实时统计必须以 live 模式渲染");
+  assert.ok(RAW_SRC.indexOf("live: true,") > 0, "实时统计必须以 live 模式渲染");
 });

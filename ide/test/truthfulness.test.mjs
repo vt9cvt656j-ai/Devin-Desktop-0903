@@ -14,22 +14,26 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
-const SRC = readFileSync(join(HERE, "..", "src", "main.js"), "utf8");
+// 正向源码断言必须跑在**剥掉注释**的源码上。注释不是代码：把一条契约从代码里删掉、
+// 只在注释里留一句，assert.match 照样绿——本仓库已经这样漏过一整组模型可见的工具契约。
+// 所以 `SRC` 绑定的是 CODE（注释整段置空，行号与偏移和原文一字不差）；
+// 真要匹配注释本身的断言显式用 RAW_SRC，并在那一行写清为什么。
+import { CODE as SRC, SRC as RAW_SRC } from "./helpers/source.mjs";
 const TRUTH = readFileSync(join(HERE, "..", "..", "server", "prompts", "truthfulness.txt"), "utf8");
 const PLAN = readFileSync(join(HERE, "..", "..", "server", "prompts", "plan.txt"), "utf8");
 
 /** 取一个具名函数的开头一段源码，用来对结构下断言。 */
 function fnBody(name, len = 1400) {
-  const i = SRC.indexOf(`function ${name}(`);
+  const i = RAW_SRC.indexOf(`function ${name}(`);
   assert.ok(i >= 0, `${name} 不见了`);
-  return SRC.slice(i, i + len);
+  return RAW_SRC.slice(i, i + len);
 }
 
 /** 本地兜底那条共用尾巴——五个模式都拼它。 */
 function fallbackTail() {
-  const i = SRC.indexOf("_HUMAN_EVIDENCE_FALLBACK = `");
+  const i = RAW_SRC.indexOf("_HUMAN_EVIDENCE_FALLBACK = `");
   assert.ok(i >= 0, "共用尾巴不见了：五个模式会一起失去这条约束");
-  const j = SRC.indexOf("`;", i);
+  const j = RAW_SRC.indexOf("`;", i);
   return SRC.slice(i, j);
 }
 
@@ -97,8 +101,8 @@ test("反谄媚纪律要发到 worker 和子智能体——它们才是真正交
   // 简报天然偏向报喜，主智能体复核的又是跨模块契约而不是「有没有把失败埋在中间」。
   // 表现就是：单干时诚实，一并行就出现「五件事报三件」。
   assert.match(SRC, /const _SUBAGENT_TRUTH = `/, "子智能体的真话下限不见了");
-  const i = SRC.indexOf("const _SUBAGENT_TRUTH = `");
-  const seg = SRC.slice(i, SRC.indexOf("`;", i));
+  const i = RAW_SRC.indexOf("const _SUBAGENT_TRUTH = `");
+  const seg = SRC.slice(i, RAW_SRC.indexOf("`;", i));
   for (const clause of ["FIRST", "name those two", "could not verify"]) {
     assert.ok(seg.includes(clause), `子智能体的下限里少了：${clause}`);
   }
@@ -110,7 +114,7 @@ test("硬防线要拦提示词点名禁止的那几句恭维开场", () => {
   // 提示词是软约束（模型可以不听），剥离器是硬约束。以前硬约束打的是「我明白了」
   // 这类状态应答，而提示词点名的「好问题/你说得对/Great question」一句都不拦——
   // 靶子对不上，等于两层都漏。
-  const i = SRC.indexOf("function _stripAckOpeners");
+  const i = RAW_SRC.indexOf("function _stripAckOpeners");
   assert.ok(i >= 0);
   const seg = SRC.slice(i, i + 4000);
   for (const opener of ["好问题", "你说得", "Great (?:question|point)", "Good (?:catch|question|point)", "right", "Thanks for"]) {
@@ -147,9 +151,9 @@ test("部署失败不能报成功——这是唯一会跨出 IDE 变成对外承
   // 原来是 `curl -sS`（没有 --fail），网关返回 401/413/500 一律退出 0，set -e 不触发，
   // 紧跟着那句「可直接访问分享」是**无条件**打印的。模型读到它就告诉用户「部署好了，
   // 链接给你」——而那是个 404，用户把它发给别人之后才发现。
-  const i = SRC.indexOf("mi-deploy.tar.gz");
+  const i = RAW_SRC.indexOf("mi-deploy.tar.gz");
   assert.ok(i >= 0, "deploy_site 的命令不见了");
-  const cmd = SRC.slice(SRC.lastIndexOf("`", i - 200), SRC.indexOf("`;", i) + 1);
+  const cmd = SRC.slice(RAW_SRC.lastIndexOf("`", i - 200), RAW_SRC.indexOf("`;", i) + 1);
   assert.match(cmd, /-w '%\{http_code\}'/, "没有取回 HTTP 状态码，就无从判断成没成");
   assert.match(cmd, /if \[ "\$code" != "200" \]/, "没有按状态码判定成败");
   assert.match(cmd, /exit 1/, "失败时必须非零退出，否则上游仍会当成功");
@@ -163,8 +167,8 @@ test("红灯和绿灯必须用同一套判据，否则「不声明 + 跑个失�
   // 发绿灯的 _evidenceCertifies 只看执行期盖上的 verifierRecognized，不看 purpose；
   // 而判红灯的 _freshBuildFailure 原来额外要求 purpose === "verify"。于是模型跑
   // `npm test` 不声明 purpose：过了拿满学分，挂了被直接跳过、照常宣布完成。
-  const red = SRC.slice(SRC.indexOf("function _freshBuildFailure"), SRC.indexOf("function _freshBuildFailure") + 1800);
-  const green = SRC.slice(SRC.indexOf("function _evidenceCertifies"), SRC.indexOf("function _evidenceCertifies") + 1800);
+  const red = SRC.slice(RAW_SRC.indexOf("function _freshBuildFailure"), RAW_SRC.indexOf("function _freshBuildFailure") + 1800);
+  const green = SRC.slice(RAW_SRC.indexOf("function _evidenceCertifies"), RAW_SRC.indexOf("function _evidenceCertifies") + 1800);
   assert.doesNotMatch(red, /e\.purpose !== "verify"/,
     "判红灯又要求声明 purpose 了——绿灯不要求，这个不对称就是一条过关捷径");
   for (const seg of [red, green]) {
@@ -187,7 +191,7 @@ test("「改了代码没验证」只记账不补回合——这是刻意的，�
   // 我一度把它改成推提醒并续跑，被两条测试拦下，而它们是对的：红构建是**观测到失败**，
   // 是「已完成」为假的直接证据；「没验证」观测到的是**缺席**，缺席不等于工作是坏的。
   // 拿缺席去覆盖模型的收尾判断，就是用 harness 的偏好压过它的判断。
-  const loop = SRC.slice(SRC.indexOf("function _runAgenticLoop"));
+  const loop = SRC.slice(RAW_SRC.indexOf("function _runAgenticLoop"));
   assert.match(loop, /run\._incompleteReason = "code_delivered_unverified"/,
     "缺席必须记账，否则这一轮看起来就像验证过了");
   assert.ok(!/_pushNudge\("codeVerify"/.test(loop),
@@ -201,10 +205,10 @@ test("中文查询必须搜得到——原来整段汉字是一个 token，几�
   // 这个 IDE 的用户大多用中文提问。原来 `[一-鿿]+` 把「用户登录校验在哪」当成一个
   // token，它和注释里的「登录校验」永远不相等，BM25 里 df===0 直接跳过——
   // 也就是说「搜不到」和「不存在」在中文上长得完全一样，而这正是最容易骗到人的一种。
-  const i = SRC.indexOf("function _tokenize");
+  const i = RAW_SRC.indexOf("function _tokenize");
   assert.ok(i >= 0);
   const tokenize = new Function("_BM25_STOP",
-    `${SRC.slice(i, (() => { let d = 0, j = SRC.indexOf("{", SRC.indexOf(")", i)); for (; j < SRC.length; j++) { const c = SRC[j]; if (c === "{") d++; else if (c === "}") { d--; if (!d) break; } } return j + 1; })())}\nreturn _tokenize;`,
+    `${SRC.slice(i, (() => { let d = 0, j = RAW_SRC.indexOf("{", RAW_SRC.indexOf(")", i)); for (; j < SRC.length; j++) { const c = SRC[j]; if (c === "{") d++; else if (c === "}") { d--; if (!d) break; } } return j + 1; })())}\nreturn _tokenize;`,
   )(new Set());
 
   const q = tokenize("用户登录校验在哪");
@@ -222,7 +226,7 @@ test("检索截断必须说出来——「搜到上限」和「一共就这么�
   // 原来摘要写「${hits} 处匹配」，而 hits 被 HIT_CAP 封在 150：真有 500 处时它照样说
   // 「150 处匹配」。调用方读到的是一个完整答案，于是停止追查——这是最容易让人停下来的
   // 一种假话。
-  const i = SRC.indexOf("const HIT_CAP = 150");
+  const i = RAW_SRC.indexOf("const HIT_CAP = 150");
   assert.ok(i >= 0, "搜索的上限常量不见了");
   const seg = SRC.slice(i, i + 4200);
   assert.match(seg, /已截断/, "达到上限时没有任何提示");
@@ -233,7 +237,7 @@ test("检索截断必须说出来——「搜到上限」和「一共就这么�
 test("检索结果按命中数排序——字母序会把最相关的文件埋掉，而截断从末尾砍", () => {
   // 后端刚按命中数排好（files.rs 里注释写明「以前是纯字母序，会把 30 处命中的文件埋在
   // 一个偶然命中 1 处的文件下面」），前端原来一行 localeCompare 把那次修复整个撤销了。
-  const i = SRC.indexOf("const fileMatches = [...matchesByPath.values()]");
+  const i = RAW_SRC.indexOf("const fileMatches = [...matchesByPath.values()]");
   assert.ok(i >= 0);
   const seg = SRC.slice(i, i + 400);
   assert.match(seg, /_hitsOf\(b\) - _hitsOf\(a\)/, "又变回按路径字母序了");
@@ -265,7 +269,7 @@ test("git_stash_list 命令失败不能吞成「堆栈为空」——那会让�
 test("docker_compose_up 的结论必须来自容器状态，不是 up -d 的退出码", () => {
   // `up -d` 退出 0 只代表容器被创建并启动过——里面的进程起来就崩时它照样是 0。
   // ps 的输出本来就已经取到了，原来只当装饰贴在成功文案后面。
-  const i = SRC.indexOf("Docker Compose 启动成功");
+  const i = RAW_SRC.indexOf("Docker Compose 启动成功");
   assert.ok(i >= 0);
   const seg = SRC.slice(Math.max(0, i - 3000), i);
   assert.match(seg, /_badStates/, "没有解析容器状态，结论仍然只看退出码");
@@ -440,7 +444,7 @@ test("Rust 侧：三处会被当成结论的空值", () => {
 // gitignore 里，都能被提交、跟着 clone 到受害者机器上。
 
 test("仓库里的 permissions.allow 必须被丢弃——它会短路唯一那道高危弹窗", () => {
-  const i = SRC.indexOf("const merged = { allow: [], ask: [], deny: [] }");
+  const i = RAW_SRC.indexOf("const merged = { allow: [], ask: [], deny: [] }");
   assert.ok(i >= 0, "权限规则加载器不见了");
   const seg = SRC.slice(i, i + 2200);
   assert.match(seg, /bucket === "allow" && !trusted/, "allow 仍然接受工作区文件");
@@ -474,8 +478,8 @@ test("打开外部链接不许经过 shell", () => {
   // 仅剩的一处走 shell 打开的是本地证书路径，三个平台三条命令，但**都必须转义**。
   // 窗口要卡在这条语句本身，不能按字节数开——多开一点就会溢进下面那条通知文案，
   // 那里合法地用着 `${p}`，断言会被它喂到。（窗口越界这坑这轮也踩过。）
-  const openStart = SRC.indexOf("const openCmd = _isWin");
-  const openBlock = SRC.slice(openStart, SRC.indexOf("taskRunCapture(", openStart));
+  const openStart = RAW_SRC.indexOf("const openCmd = _isWin");
+  const openBlock = SRC.slice(openStart, RAW_SRC.indexOf("taskRunCapture(", openStart));
   assert.ok(openBlock.length > 50, "找不到打开证书那段");
   assert.match(openBlock, /shellQuote\(p\)/, "证书路径没转义就拼进了 shell");
   assert.match(openBlock, /cmd \/c start ""/, "Windows 上没有 open，要走 start");

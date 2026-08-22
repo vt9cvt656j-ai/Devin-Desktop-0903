@@ -17,14 +17,18 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
-const SRC = readFileSync(join(HERE, "..", "src", "main.js"), "utf8");
+// 正向源码断言必须跑在**剥掉注释**的源码上。注释不是代码：把一条契约从代码里删掉、
+// 只在注释里留一句，assert.match 照样绿——本仓库已经这样漏过一整组模型可见的工具契约。
+// 所以 `SRC` 绑定的是 CODE（注释整段置空，行号与偏移和原文一字不差）；
+// 真要匹配注释本身的断言显式用 RAW_SRC，并在那一行写清为什么。
+import { CODE as SRC, SRC as RAW_SRC } from "./helpers/source.mjs";
 
 function topLevelFn(name) {
-  const at = SRC.indexOf(`function ${name}(`);
+  const at = RAW_SRC.indexOf(`function ${name}(`);
   assert.ok(at > 0, `找不到 ${name}`);
-  const end = SRC.indexOf("\n}\n", at);
+  const end = RAW_SRC.indexOf("\n}\n", at);
   assert.ok(end > at, `${name} 没有行首收尾大括号`);
-  return SRC.slice(at, end + 2);
+  return RAW_SRC.slice(at, end + 2);
 }
 
 // _skillCatalogBlock 读的是模块级的 _fileSkills / _loadSkillsLocal / _isSkillActive，
@@ -131,20 +135,20 @@ test("技能：正文不被腰斩、描述不被提前砍死、allowed-tools 真
   // ① 致命项：read_skill 的返回落在 8000 那一档时会被 _headTailModelText 从**中间**挖空，
   //    而官方技能的 SKILL.md 普遍 10–20KB —— 模型拿到头尾、丢掉中段的分步说明，
   //    同时工具卡片还显示「已全部读入」。两个互相矛盾的事实同时摆在用户和模型面前。
-  const cap = SRC.slice(SRC.indexOf("function _toolMsgForModel"), SRC.indexOf("const rawMessage"));
+  const cap = SRC.slice(RAW_SRC.indexOf("function _toolMsgForModel"), RAW_SRC.indexOf("const rawMessage"));
   assert.match(cap, /_rt === "skill" \? 30000/,
     "技能正文又落回 8000 档，会被从中间挖空");
 
   // ② description 就是触发判据。官方技能的「什么时候该用我 / 什么时候别用我」写在
   //    400–900 字符处，解析期砍到 240 等于把触发条件本身切掉。
-  const parse = SRC.slice(SRC.indexOf("id: `file:${normalizedPath}`"));
+  const parse = SRC.slice(RAW_SRC.indexOf("id: `file:${normalizedPath}`"));
   assert.match(parse.slice(0, 1400), /desc: desc\.replace\(\/\\s\+\/g, " "\)\.trim\(\)\.slice\(0, 1200\)/,
     "描述又在解析期被砍短了——目录那边自有 6000 字预算和逐级压缩，这里不该提前钉死上限");
 
   // ③ allowed-tools 必须是真约束。原来它唯一的消费点是工具卡片上一枚灰色标签：
   //    一个写着 Read, Grep 的只读技能，启用后模型照样能 write_file、删文件。
   assert.match(SRC, /function _skillAllowedTools\(\)/, "allowed-tools 的收窄逻辑没了");
-  const gate = SRC.slice(SRC.indexOf("async function _approveToolCall"));
+  const gate = SRC.slice(RAW_SRC.indexOf("async function _approveToolCall"));
   // 钉住**白名单的来源**，不只是那行条件文本：把 skillGate 直接改成 null，条件那行还在，
   // 只钉文本的话照样绿。
   assert.match(gate.slice(0, 1400), /const skillGate = typeof _skillAllowedTools === "function" \? _skillAllowedTools\(\) : null;/,
@@ -153,7 +157,7 @@ test("技能：正文不被腰斩、描述不被提前砍死、allowed-tools 真
   // 闸必须真的去查白名单。切片放宽是因为那处补了一大段说明为什么不能按单一字段比对。
   assert.match(gate.slice(0, 3200), /_skillToolAllowed\(skillGate\.allow, n\)/, "闸没真的去查白名单");
   // 取并集不取交集：启用两个技能时两边的工具都该可用，交集会让"启用越多能干越少"。
-  const allow = SRC.slice(SRC.indexOf("function _skillAllowedTools"));
+  const allow = SRC.slice(RAW_SRC.indexOf("function _skillAllowedTools"));
   assert.match(allow.slice(0, 900), /for \(const s of declaring\) for \(const t of s\.tools\)/,
     "白名单不是并集");
   assert.match(allow.slice(0, 900), /allow\.add\("read_skill"\)/,
@@ -165,7 +169,7 @@ test("技能：正文不被腰斩、描述不被提前砍死、allowed-tools 真
   // ④ 只扫自有目录。这一条以前是反的（断言"要扫到 Claude Code 的插件市场"）——
   //    按用户要求，别的工具的目录一个都不扫了。2026-08-18 用户再次点名「全部用我自己
   //    目录」：工作区那条从 .claude/skills 也一并改到自有产品目录，两处同名。
-  const bases = SRC.slice(SRC.indexOf("function _skillDiscoveryBases"), SRC.indexOf("function _skillDiscoveryBases") + 700);
+  const bases = SRC.slice(RAW_SRC.indexOf("function _skillDiscoveryBases"), RAW_SRC.indexOf("function _skillDiscoveryBases") + 700);
   assert.match(bases, /\$\{root\}\/\$\{_STATE_DIR\}\/skills/, "工作区技能没扫，或又手写成了别人的目录名");
   assert.match(bases, /\$\{_STATE_DIR\}\/skills/, "家目录那份自有技能库没扫");
   // .claude 现在也在这张黑名单里：技能只落自己的目录。
@@ -231,7 +235,7 @@ test("「常驻」这个词在四个地方必须是同一个词——它们互�
   assert.match(SRC, catalogMark, "技能清单里的常驻标记被改了");
   assert.match(SRC, /标着「常驻」的/, "清单抬头对这个标记的解释和标记本身对不上");
 
-  const readSkillDesc = SRC.slice(SRC.indexOf('name: "read_skill"'), SRC.indexOf('name: "read_skill"') + 1200);
+  const readSkillDesc = SRC.slice(RAW_SRC.indexOf('name: "read_skill"'), RAW_SRC.indexOf('name: "read_skill"') + 1200);
   assert.match(readSkillDesc, /already marked 常驻/,
     "read_skill 的描述引用的标记和清单里打的不是同一个词——那条「别重读」的规则会整条落空");
 
@@ -246,7 +250,7 @@ test("界面上不再有任何「启用 / 未启用」的说法", () => {
   // 技能从来没被"关"过：清单里的名称和描述始终在上下文里，模型随时能 read_skill 读它。
   // 「未启用」尤其糟——它是常驻显示在卡片上的**状态标签**，用户读到的是"这个技能是
   // 关着的"，于是他以为点一下就能停掉某个技能，实际什么都没停。
-  const skillsPage = SRC.slice(SRC.indexOf('<h3>Skills 技能</h3>'), SRC.indexOf('<h3>Skills 技能</h3>') + 40000);
+  const skillsPage = SRC.slice(RAW_SRC.indexOf('<h3>Skills 技能</h3>'), RAW_SRC.indexOf('<h3>Skills 技能</h3>') + 40000);
   for (const stale of ['"未启用"', '"已启用"', '保存并启用', '默认启用到模型请求里']) {
     assert.ok(!skillsPage.includes(stale), `设置面板的 Skills 页还留着「${stale}」`);
   }
@@ -282,7 +286,7 @@ test("allowed-tools 比对的必须是工具注册名，不是映射后的内部
   assert.equal(allowed(A("read"), "run_cmd"), false, "allowed-tools 不再是真约束了");
 
   // 钉实现特征：闸必须拿注册名去比，且不许再用 call.name（那对 read_skill 是技能名）。
-  const gate = SRC.slice(SRC.indexOf("async function _approveToolCall"), SRC.indexOf("async function _approveToolCall") + 2600);
+  const gate = SRC.slice(RAW_SRC.indexOf("async function _approveToolCall"), RAW_SRC.indexOf("async function _approveToolCall") + 2600);
   assert.match(gate, /\[call\._toolName, call\.tool, call\.type\]\.filter\(Boolean\)/,
     "闸又改回按单一字段比对了——run_cmd/write_file 会被自己声明它们的技能拒掉");
   assert.doesNotMatch(gate, /_skillToolAllowed\(skillGate\.allow, call\.name/,
@@ -294,7 +298,7 @@ test("allowed-tools 比对的必须是工具注册名，不是映射后的内部
 // 文件照样写成功、模型照样跟用户说「已经存好了」，而下一轮它在清单里是一条没有描述、
 // 甚至根本解析不出来的废条目。所以这条把两头接起来跑一遍。
 test("save_skill 写出的 SKILL.md 能被真正的技能解析器读回来", () => {
-  const exec = SRC.slice(SRC.indexOf('} else if (call.type === "saveskill") {'));
+  const exec = SRC.slice(RAW_SRC.indexOf('} else if (call.type === "saveskill") {'));
   const docSrc = /const _doc = \[[\s\S]*?\.join\("\\n"\);/.exec(exec);
   assert.ok(docSrc, "SKILL.md 的拼装代码改形状了，这条断言失去落点");
   const build = new Function("_name", "_desc", "_fmTools", "_body", `${docSrc[0]}\nreturn _doc;`);

@@ -34,7 +34,11 @@ import * as acorn from "acorn";
 import { dirname, join } from "node:path";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
-const SRC = readFileSync(join(HERE, "../src/main.js"), "utf8");
+// 正向源码断言必须跑在**剥掉注释**的源码上。注释不是代码：把一条契约从代码里删掉、
+// 只在注释里留一句，assert.match 照样绿——本仓库已经这样漏过一整组模型可见的工具契约。
+// 所以 `SRC` 绑定的是 CODE（注释整段置空，行号与偏移和原文一字不差）；
+// 真要匹配注释本身的断言显式用 RAW_SRC，并在那一行写清为什么。
+import { CODE as SRC, SRC as RAW_SRC } from "./helpers/source.mjs";
 
 // Deliberately NOT comment-stripped. A naive stripper is unsafe here: this file contains
 // regex literals holding `/*` and `//`, and a stripper that mis-parses one silently deletes a
@@ -44,17 +48,17 @@ const SRC = readFileSync(join(HERE, "../src/main.js"), "utf8");
 
 /** Body of a top-level function, brace-matched. */
 function fnBody(name) {
-  const m = new RegExp(`(?:async\\s+)?function\\s+${name}\\s*\\(`).exec(SRC);
+  const m = new RegExp(`(?:async\\s+)?function\\s+${name}\\s*\\(`).exec(RAW_SRC);
   if (!m) throw new Error(`function ${name} not found`);
-  let p = SRC.indexOf("(", m.index), pd = 0;
-  for (; p < SRC.length; p++) {
-    const c = SRC[p];
+  let p = RAW_SRC.indexOf("(", m.index), pd = 0;
+  for (; p < RAW_SRC.length; p++) {
+    const c = RAW_SRC[p];
     if (c === "(") pd++; else if (c === ")") { pd--; if (!pd) break; }
   }
-  let i = SRC.indexOf("{", p), d = 0;
-  for (; i < SRC.length; i++) {
-    const c = SRC[i];
-    if (c === "{") d++; else if (c === "}") { d--; if (!d) return SRC.slice(m.index, i + 1); }
+  let i = RAW_SRC.indexOf("{", p), d = 0;
+  for (; i < RAW_SRC.length; i++) {
+    const c = RAW_SRC[i];
+    if (c === "{") d++; else if (c === "}") { d--; if (!d) return RAW_SRC.slice(m.index, i + 1); }
   }
   throw new Error(`unbalanced braces in ${name}`);
 }
@@ -69,11 +73,11 @@ function fnBody(name) {
 function loadConst(name) {
   const m = new RegExp(`\\bconst\\s+${name}\\s*=`).exec(SRC);
   if (!m) throw new Error(`const ${name} not found in main.js`);
-  let i = SRC.indexOf("=", m.index) + 1, depth = 0;
+  let i = RAW_SRC.indexOf("=", m.index) + 1, depth = 0;
   for (; i < SRC.length; i++) {
     const c = SRC[i], d = SRC[i + 1];
-    if (c === "/" && d === "/") { i = SRC.indexOf("\n", i); if (i < 0) i = SRC.length; continue; }
-    if (c === "/" && d === "*") { i = SRC.indexOf("*/", i + 2) + 1; continue; }
+    if (c === "/" && d === "/") { i = RAW_SRC.indexOf("\n", i); if (i < 0) i = SRC.length; continue; }
+    if (c === "/" && d === "*") { i = RAW_SRC.indexOf("*/", i + 2) + 1; continue; }
     if (c === '"' || c === "'" || c === "`") {
       const q = c; i++;
       while (i < SRC.length && SRC[i] !== q) i += SRC[i] === "\\" ? 2 : 1;
@@ -443,8 +447,8 @@ test("every quiet-turn re-entry is latched or counted", () => {
 test("装配把工具调用全吃掉时，绝不能表现成模型自己收尾", () => {
   // 直接锚在源码上：fnBody 的括号配平对这个上千行、满是模板串的函数不可靠，
   // 会截出一段不含装配点的残体，让这条断言变成"永远绿"。
-  const at = SRC.indexOf("let toolCalls = (fatalToolArgIssue || err)");
-  const end = SRC.indexOf("const _hasNonControlToolCall", at);
+  const at = RAW_SRC.indexOf("let toolCalls = (fatalToolArgIssue || err)");
+  const end = RAW_SRC.indexOf("const _hasNonControlToolCall", at);
   assert.ok(at > 0 && end > at, "工具调用装配点必须还在");
   assert.equal(count(SRC, /let toolCalls = \(fatalToolArgIssue \|\| err\)/g), 1, "装配点必须唯一，否则这条断言可能钉错地方");
   const tail = SRC.slice(at, end);
@@ -470,10 +474,10 @@ test("装配把工具调用全吃掉时，绝不能表现成模型自己收尾",
 // 把空洞当 undefined 推进消息流。于是模型的转录里，它调过的工具没有任何结果反驳它，
 // 它就默认成功并写下「已改好」——那次调用其实没跑。
 test("没跑成的工具调用必须如实回一条结果，不能在转录里留白", () => {
-  const at = SRC.indexOf("const toolMsgs = new Array(items.length);");
+  const at = RAW_SRC.indexOf("const toolMsgs = new Array(items.length);");
   assert.ok(at > 0, "toolMsgs 还是稀疏数组的话，补齐就仍是必需的");
   // 活路径的推送点（不是 !_live() 那条——它自带 [interrupted] 补齐后 break）
-  const pushAt = SRC.indexOf("for (const m of toolMsgs) messages.push(m);\n      if (turn._invalidToolRepairInstruction", at);
+  const pushAt = RAW_SRC.indexOf("for (const m of toolMsgs) messages.push(m);\n      if (turn._invalidToolRepairInstruction", at);
   assert.ok(pushAt > at, "活路径的推送点没找到——这条断言可能钉错了地方");
   const before = SRC.slice(at, pushAt);
   // 补齐必须紧挨着推送点之前，且覆盖每一个 item
@@ -500,7 +504,7 @@ test("没跑成的工具调用必须如实回一条结果，不能在转录里�
 // 跑三五轮就收尾的 run 根本到不了。于是那次删除同时关掉了两个出口，模型下一轮照旧
 // "改完就说能用"。这条守住：交付事实必须有一条不受 iter 门槛约束的注入。
 test("交付事实必须每轮喂给模型，不能只挂在 iter>=6 的草稿纸上", () => {
-  const gate = SRC.indexOf("if ((iter >= 6 && (iter % 3 === 0 || iter >= 20)) || run._compactedThisTurn) {");
+  const gate = RAW_SRC.indexOf("if ((iter >= 6 && (iter % 3 === 0 || iter >= 20)) || run._compactedThisTurn) {");
   assert.ok(gate > 0, "草稿纸门槛还在——那么交付事实就必须有自己的出口");
   const after = SRC.slice(gate, gate + 3000);
   // 注入点必须存在，且**不在**那个 iter 条件的花括号里：判据是它读的是自己的标签常量
@@ -514,7 +518,7 @@ test("交付事实必须每轮喂给模型，不能只挂在 iter>=6 的草稿�
   assert.match(after, /messages\[i\]\.content\.includes\(_DELIVERY_FACTS_TAG\)[\s\S]{0,80}?messages\.splice\(i, 1\)/,
     "注入前要先摘掉上一条，别在上下文里堆积");
   // 自带闸门：没动代码就返回空串 → 纯问答/只读 run 不受打扰。这是"执行事实"而非"意图分类"。
-  const dfl = SRC.slice(SRC.indexOf("function _deliveryFactsLine(run) {"), SRC.indexOf("function _deliveryFactsLine(run) {") + 2000);
+  const dfl = SRC.slice(RAW_SRC.indexOf("function _deliveryFactsLine(run) {"), RAW_SRC.indexOf("function _deliveryFactsLine(run) {") + 2000);
   // 闸门还在，但多了一个**必须**的例外：写入尝试落空了要说。用户实撞过「它说已保存到
   // .doc/xxx.md，而文件不在」——那次模型手上没有任何与之矛盾的事实，因为这一行整个是空的。
   // 落空的写入是纯执行记录（run._writeLedger 逐条记着），不是对措辞的猜测。
@@ -539,7 +543,7 @@ test("任务完成通知必须说真实结局，不能写死成功", () => {
   assert.match(SRC, /_notifyTaskDone\(sess, text, sess\?\._lastRunState\?\.outcome \|\| "success"\)/,
     "通知要读真实 outcome；写死 true 等于 harness 自己谎报完成");
   assert.equal(count(SRC, /_notifyTaskDone\(sess, text, true\)/g), 0, "字面量 true 不许回来");
-  const fn = SRC.slice(SRC.indexOf("async function _notifyTaskDone("), SRC.indexOf("async function _notifyTaskDone(") + 1200);
+  const fn = SRC.slice(RAW_SRC.indexOf("async function _notifyTaskDone("), RAW_SRC.indexOf("async function _notifyTaskDone(") + 1200);
   for (const [oc, why] of [["partial", "没做完"], ["failed", "失败"], ["awaiting_user", "在等用户回话"]]) {
     assert.match(fn, new RegExp(`${oc}:\\s*\\[`), `${why} 要有自己的标题，不能并进"任务完成"`);
   }
@@ -559,7 +563,7 @@ test("子智能体轮次用尽不能标成完成", () => {
 
 // 一个字节都没写进 PTY 的调用，此前回「已在运行中」并判成功、还给计划打勾。
 test("复用终端的调用要说清这次什么都没执行", () => {
-  const branch = SRC.slice(SRC.indexOf("if (r.alreadyRunning) {"), SRC.indexOf("if (r.alreadyRunning) {") + 2200);
+  const branch = SRC.slice(RAW_SRC.indexOf("if (r.alreadyRunning) {"), RAW_SRC.indexOf("if (r.alreadyRunning) {") + 2200);
   assert.ok(branch.length > 100, "复用分支还在");
   assert.doesNotMatch(branch, /termWrite/, "这条分支确实没有向 PTY 写任何东西——前提没变");
   assert.match(branch, /本次调用\*\*没有执行任何命令\*\*/,
@@ -584,12 +588,12 @@ test("检测到启动错误就不能再算启动成功", () => {
 // 通道本来就是通的（tauri opener），只是 agent 侧一直没有入口。
 test("browser 要有一条「交给用户自己的浏览器」的路，而且是真的生效那一份", () => {
   // ① 执行器认得这个动作，并且**不启动任何会话**（走 openUrl，不碰 CDP）
-  const at = SRC.indexOf('if (act === "open") {');
+  const at = RAW_SRC.indexOf('if (act === "open") {');
   assert.ok(at > 0, "browser 执行器里没有 open 动作");
   // 切片只到 open 块本身为止：再往后的分支各自有自己的 invoke（close 有 browser_close、
   // mytabs 有 browser_user_tabs），切进去会让下面那条"不许碰会话"的断言永远红——
   // 断言切错范围和断言写错一样坏。所以取**下一个** act 分支的起点，而不是写死某一个。
-  const implEnd = SRC.indexOf('if (act === "', at + 20);
+  const implEnd = RAW_SRC.indexOf('if (act === "', at + 20);
   assert.ok(implEnd > at, "找不到 open 块的结尾");
   const impl = SRC.slice(at, implEnd);
   assert.match(impl, /backend\.openUrl\(/, "open 必须交给系统默认浏览器，而不是自己起浏览器");
@@ -602,15 +606,15 @@ test("browser 要有一条「交给用户自己的浏览器」的路，而且是
   // ② **生效的那份**枚举里要有 open。
   //    schema 字面量里那份会被下面这行覆盖：browserProps.action.enum = wantedActions;
   //    只改字面量等于没改——这次就先踩了一次，所以这条断言钉的是覆盖用的那份。
-  const wa = SRC.indexOf("const wantedActions = [");
+  const wa = RAW_SRC.indexOf("const wantedActions = [");
   assert.ok(wa > 0, "wantedActions 不见了");
-  const list = SRC.slice(wa, SRC.indexOf("]", wa));
+  const list = SRC.slice(wa, RAW_SRC.indexOf("]", wa));
   assert.match(list, /"open"/, "真正生效的动作枚举里没有 open，模型根本调不到它");
   // 覆盖那行必须还在它后面（否则这条断言钉错了地方）
-  assert.ok(SRC.indexOf("browserProps.action.enum = wantedActions;", wa) > wa,
+  assert.ok(RAW_SRC.indexOf("browserProps.action.enum = wantedActions;", wa) > wa,
     "覆盖点没了，这条断言失去意义——请重新确认哪份枚举才是生效的");
   // ③ 覆盖用的说明也要讲清楚什么时候用 open，否则模型没有判据
-  const descAt = SRC.indexOf('browserProps.action.description = "');
+  const descAt = RAW_SRC.indexOf('browserProps.action.description = "');
   assert.ok(descAt > 0);
   const desc = SRC.slice(descAt, descAt + 1600);
   assert.match(desc, /open = hand the URL/, "生效的 action 说明里没有 open 的用法指引");
@@ -622,9 +626,9 @@ test("browser 要有一条「交给用户自己的浏览器」的路，而且是
 // 是两件事，而看一眼在 macOS 上不需要 CDP——Chrome 的 AppleScript 字典直接给标签页、
 // 标题和 URL，实测开箱可读。有了这一步，模型才有判据去决定"要不要新开窗口"。
 test("模型要能先看一眼用户自己开着什么，再决定要不要新开窗口", () => {
-  const at = SRC.indexOf('if (act === "mytabs") {');
+  const at = RAW_SRC.indexOf('if (act === "mytabs") {');
   assert.ok(at > 0, "browser 没有「看用户自己的标签页」这个动作");
-  const impl = SRC.slice(at, SRC.indexOf('if (act === "', at + 20));
+  const impl = SRC.slice(at, RAW_SRC.indexOf('if (act === "', at + 20));
   assert.match(impl, /invoke\("browser_user_tabs"\)/, "要调到那个真的读得到标签页的命令");
   // 这条路绝不能起浏览器：它的全部意义就是"先别开窗口"
   assert.doesNotMatch(impl, /browser_navigate|current_or_launch|aiChatWithTools/,
@@ -644,10 +648,10 @@ test("模型要能先看一眼用户自己开着什么，再决定要不要新�
 
   // **生效的那份**枚举里要有它。schema 字面量那份会被 wantedActions 整个覆盖，
   // 只改字面量等于没改（这个坑本会话已经踩过一次）。
-  const wa = SRC.indexOf("const wantedActions = [");
-  const list = SRC.slice(wa, SRC.indexOf("]", wa));
+  const wa = RAW_SRC.indexOf("const wantedActions = [");
+  const list = SRC.slice(wa, RAW_SRC.indexOf("]", wa));
   assert.match(list, /"mytabs"/, "真正生效的动作枚举里没有 mytabs，模型调不到");
-  const descAt = SRC.indexOf('browserProps.action.description = "');
+  const descAt = RAW_SRC.indexOf('browserProps.action.description = "');
   assert.match(SRC.slice(descAt, descAt + 2200), /mytabs = look at/,
     "生效的 action 说明里没有 mytabs 的用法指引，模型不知道该先看一眼");
 });
@@ -680,7 +684,7 @@ test("两套浏览器自动化要有一条能照做的选择判据，而且两�
 // 「我先这样改了，需要我跑一下测试验证吗？」——用一个问号收尾，就把"改了代码没验证"
 // 这个事实一笔勾销。而这恰恰是最像"已经做完了"的收尾形态。
 test("末尾问一句话不能抹掉「改了代码没验证」这个事实", () => {
-  const at = SRC.indexOf('run._incompleteReason ||= "code_delivered_unverified";');
+  const at = RAW_SRC.indexOf('run._incompleteReason ||= "code_delivered_unverified";');
   assert.ok(at > 0, "记账点还在");
   const block = SRC.slice(at - 400, at + 300);
   assert.match(block, /if \(_codeNeedsVerification && !_currentCodeVerified\) \{/,
@@ -696,7 +700,7 @@ test("末尾问一句话不能抹掉「改了代码没验证」这个事实", ()
 
 // exit 0 不等于验证过：go/jest/pytest/cargo 空跑全是 exit 0。
 test("空跑的绿色不能盖验证章", () => {
-  const stamp = SRC.indexOf("const _verificationExitRaw = result?.exitCode ?? result?.code;");
+  const stamp = RAW_SRC.indexOf("const _verificationExitRaw = result?.exitCode ?? result?.code;");
   assert.ok(stamp > 0, "盖章点还在");
   const block = SRC.slice(stamp, stamp + 2000);
   assert.match(block, /if \(_verifierRanNoTests\(_vOut\)\) \{/,
@@ -1218,19 +1222,19 @@ test("强力版开关必须真的改变请求去向，而不只是一个会亮�
   // 1) 按钮渲染进卡片头部（不是定义了一个没人调的函数）
   // 断言的是**调用点在卡片模板里**，不是"源码里出现过这个名字"——函数定义本身
   // 就含有这个名字，照着名字找等于自己喂饱自己。
-  const tpl = SRC.slice(SRC.indexOf("card.innerHTML ="));
+  const tpl = SRC.slice(RAW_SRC.indexOf("card.innerHTML ="));
   assert.match(tpl.slice(0, 700), /_modelPowerToggleHtml\(/,
     "卡片模板没调强力版按钮，那个函数成了死代码");
 
   // 2) 点击真的落盘，而不是只切了个 class
-  const clickBlock = SRC.slice(SRC.indexOf('.closest?.(".mic-power")'));
+  const clickBlock = SRC.slice(RAW_SRC.indexOf('.closest?.(".mic-power")'));
   assert.match(clickBlock.slice(0, 600), /_setPowerRoute\(/,
     "点了按钮没写进持久化状态，刷新/重开卡片就丢");
 
   // 3) 意图盖到了**所有**去后端的入口。轮次组装点有好几处，漏一处就会出现
   //    "开关亮着但请求走普通线路"。
   for (const cmd of ["ai_chat", "ai_chat_with_tools", "ai_complete"]) {
-    const at = SRC.indexOf(`core.invoke("${cmd}",`);
+    const at = RAW_SRC.indexOf(`core.invoke("${cmd}",`);
     assert.notEqual(at, -1, `${cmd} 入口不见了`);
     assert.match(SRC.slice(at, at + 200), /_stampPowerRoute\(config\)/,
       `${cmd} 没盖强力版标记，从这个入口发的轮次会静默走普通线路`);
@@ -1248,7 +1252,7 @@ test("强力版开关必须真的改变请求去向，而不只是一个会亮�
   // 5) 只有 Claude 一族有。用户明确要求过。
   // 这里**跑**这个判定而不是读它的源码：上一版按 /claude/i 去匹配源文本，结果被
   // 函数上面那段写着 Claude 的注释喂饱了——把限定改成 `return true` 都照样绿。
-  const gate = SRC.slice(SRC.indexOf("function _modelSupportsPowerRoute"));
+  const gate = SRC.slice(RAW_SRC.indexOf("function _modelSupportsPowerRoute"));
   const supports = new Function(`${gate.slice(0, gate.indexOf("\n}") + 2)}
     return _modelSupportsPowerRoute;`)();
   for (const yes of ["claude-opus-4-6", "claude-sonnet-4-5", "anthropic/claude-haiku-4-5"]) {
@@ -1258,7 +1262,7 @@ test("强力版开关必须真的改变请求去向，而不只是一个会亮�
     assert.equal(supports(no), false,
       `${no} 不是 Claude，却冒出了强力版按钮——用户明确要求过只有 Claude 有`);
   }
-  const render = SRC.slice(SRC.indexOf("function _modelPowerToggleHtml"));
+  const render = SRC.slice(RAW_SRC.indexOf("function _modelPowerToggleHtml"));
   assert.match(render.slice(0, 900), /if \(!_modelSupportsPowerRoute\(id\)\) return ""/,
     "渲染时没挡住非 Claude 模型");
 });
@@ -1269,7 +1273,7 @@ test("强力版：网关说了没有强力线路，就不该把那个按钮画�
   //
   // 三态是关键：网关明确说 false 才藏；拿不到（离线、目录没拉到、网关旧版）是"不知道"，
   // 这时候必须退回旧行为。压成布尔的话按钮会在离线时集体消失，而那不是"没有强力线路"。
-  const mapAt = SRC.indexOf("(byGroup[label] ||= []).push({");
+  const mapAt = RAW_SRC.indexOf("(byGroup[label] ||= []).push({");
   assert.notEqual(mapAt, -1, "目录映射那个对象字面量没了");
   assert.match(SRC.slice(mapAt, mapAt + 2600), /powerRouteAvailable:/,
     "映射层没接这个字段——那个 push 是逐字段列举的白名单，不在里面就到不了按钮那儿");
@@ -1282,17 +1286,17 @@ test("强力版：网关说了没有强力线路，就不该把那个按钮画�
     "客户端读的键名和网关下发的对不上");
 
   // 三态判定：只认布尔，其它一律 null（不知道）。
-  const availSrc = SRC.slice(SRC.indexOf("function _powerRouteAvailable"));
+  const availSrc = SRC.slice(RAW_SRC.indexOf("function _powerRouteAvailable"));
   const avail = availSrc.slice(0, availSrc.indexOf("\n}") + 2);
   assert.match(avail, /typeof v === "boolean" \? v : null/,
     "没做成三态——离线/网关旧版会被当成'没有强力线路'，按钮集体消失");
 
   // 同一条闸必须同时管住**渲染**和**发送**。只藏按钮不拦请求头，用户会陷在一个
   // 每轮都报错、又找不到地方关掉的状态里。
-  const send = SRC.slice(SRC.indexOf("function _powerRouteOn"));
+  const send = SRC.slice(RAW_SRC.indexOf("function _powerRouteOn"));
   assert.match(send.slice(0, 900), /_powerRouteAvailable\(id\) === false/,
     "发送侧没拦——按钮藏了但请求头照发，用户没有关掉它的入口");
-  const render = SRC.slice(SRC.indexOf("function _modelPowerToggleHtml"));
+  const render = SRC.slice(RAW_SRC.indexOf("function _modelPowerToggleHtml"));
   assert.match(render.slice(0, 1200), /_powerRouteAvailable\(id\) === false/,
     "渲染侧没拦——按钮画在了没有强力线路的模型上，点了只会报错");
 });
@@ -1302,9 +1306,9 @@ test("档位滑块：拖动要真的落到档位上，且拖出卡片边界不�
   // "拖到一半断掉"——三种都不报错，只是控件坏了。
 
   // 1) 两个控件都换成了滑块（不再是分段按钮那一套）
-  const ctxFn = SRC.slice(SRC.indexOf("function _modelContextRows"));
+  const ctxFn = SRC.slice(RAW_SRC.indexOf("function _modelContextRows"));
   assert.match(ctxFn.slice(0, 2000), /_micSliderHtml\(/, "上下文没渲染成滑块");
-  const thinkAt = SRC.indexOf("thinkEl.innerHTML =");
+  const thinkAt = RAW_SRC.indexOf("thinkEl.innerHTML =");
   assert.notEqual(thinkAt, -1, "思考深度那段渲染没了");
   assert.match(SRC.slice(thinkAt, thinkAt + 600), /_micSliderHtml\(/, "思考深度没渲染成滑块");
 
@@ -1312,9 +1316,9 @@ test("档位滑块：拖动要真的落到档位上，且拖出卡片边界不�
   // 窗口必须**切在两个滑块之间**：从上下文那段一路读到思考深度那段的话，
   // 上下文的绑定被剪掉了也照样能在隔壁读到 _bindMicSlider——自己喂饱自己。
   // 先后不重要（上下文那条已挪到 `if (supports)` 之外），各自成段才重要。
-  const ctxAt = SRC.indexOf("const ctxSl =");
-  const thinkAt2 = SRC.indexOf("const thinkSl =");
-  const posAt = SRC.indexOf("// Position:", Math.max(ctxAt, thinkAt2));
+  const ctxAt = RAW_SRC.indexOf("const ctxSl =");
+  const thinkAt2 = RAW_SRC.indexOf("const thinkSl =");
+  const posAt = RAW_SRC.indexOf("// Position:", Math.max(ctxAt, thinkAt2));
   assert.ok(ctxAt !== -1 && thinkAt2 !== -1 && posAt > Math.max(ctxAt, thinkAt2),
     "两个滑块的绑定段没了");
   const seg = (from) => SRC.slice(from, Math.min(...[ctxAt, thinkAt2, posAt].filter((n) => n > from)));
@@ -1327,18 +1331,18 @@ test("档位滑块：拖动要真的落到档位上，且拖出卡片边界不�
 
   // 3) 拖动中不得重画整张卡片。重画会把正在被拖的那个 input 换成新节点，
   //    指针立刻丢掉目标，拖到一半就断——这正是分段按钮时代 showModelInfoCard() 的做法。
-  const binder = SRC.slice(SRC.indexOf("function _bindMicSlider"));
+  const binder = SRC.slice(RAW_SRC.indexOf("function _bindMicSlider"));
   const binderBody = binder.slice(0, binder.indexOf("\n}\n") + 3);
   assert.doesNotMatch(binderBody, /showModelInfoCard\(/,
     "拖动处理里重画了整张卡片，拖动会断在半路");
 
   // 4) 指针拖出卡片边界时不能收卡片，否则 input 随卡片一起消失。
-  const leaveAt = SRC.indexOf('el.addEventListener("mouseleave"');
+  const leaveAt = RAW_SRC.indexOf('el.addEventListener("mouseleave"');
   assert.notEqual(leaveAt, -1, "卡片的 mouseleave 处理没了");
   // 抑制必须是**无状态**的：读事件自带的 buttons，而不是一个要靠 pointerup 清掉的标志位。
   // 标志位那一版只要 pointerup 没送达（拖动中窗口失焦、指针捕获被中断、拖到屏幕外松手），
   // 就永远挂着，卡片从此再也不会自动收起——表现就是"调完滑块后卡片赖着好几秒"。
-  const leaveBody = SRC.slice(leaveAt, SRC.indexOf("});", leaveAt));
+  const leaveBody = SRC.slice(leaveAt, RAW_SRC.indexOf("});", leaveAt));
   assert.match(leaveBody, /if \(ev\.buttons\) return;/,
     "拖滑块时卡片仍会因为 mouseleave 被收走，拖到最右端必断");
   assert.doesNotMatch(SRC, /_sliderDrag/,
@@ -1380,7 +1384,7 @@ test("AI 助手开关：按钮、面板、分隔条、落盘、开机还原，�
   // 2) 点击走的是**既有的** togglePane("assistant")，不是另起一套。视图菜单里本来就有
   //    这个开关，CSS 的 .layout.hide-assistant 也早就同时收掉面板和分隔条；各做一套的
   //    结果是两个入口互相不认账——从菜单关掉，标题栏按钮还亮着"已展开"。
-  const clickAt = SRC.indexOf('$("toggleAssistantBtn")?.addEventListener');
+  const clickAt = RAW_SRC.indexOf('$("toggleAssistantBtn")?.addEventListener');
   assert.notEqual(clickAt, -1, "按钮没绑点击，点了什么都不会发生");
   const click = SRC.slice(clickAt, clickAt + 420);
   assert.match(click, /togglePane\("assistant"\)/, "按钮没复用既有的面板开关");
@@ -1389,14 +1393,14 @@ test("AI 助手开关：按钮、面板、分隔条、落盘、开机还原，�
 
   // 3) 按钮要跟着**实际状态**走，包括从视图菜单改的那次。
   assert.match(click, /_syncAssistantToggleBtn\(\)/, "点完没同步按钮状态");
-  const sync = SRC.slice(SRC.indexOf("function _syncAssistantToggleBtn"));
+  const sync = SRC.slice(RAW_SRC.indexOf("function _syncAssistantToggleBtn"));
   assert.match(sync.slice(0, 500), /paneIsOpen\("assistant"\)/,
     "按钮状态不是从布局真值读的，会和实际显示对不上");
 
   // 4) 状态落盘 + 开机还原。少了任何一半，用户收起来的面板重启后又弹回来。
   // 只切 togglePane 的**函数体**。往后多读几行就会读到紧邻的 function _savePaneState()
   // 定义，那样即便 togglePane 里根本没调它，按名字找的断言照样能通过。
-  const tpAll = SRC.slice(SRC.indexOf("function togglePane"));
+  const tpAll = SRC.slice(RAW_SRC.indexOf("function togglePane"));
   const tp = tpAll.slice(0, tpAll.indexOf("\n}\n") + 3);
   assert.match(tp, /_savePaneState\(\)/, "开关状态没存，重开 IDE 就丢");
   assert.match(SRC, /_restorePaneState\(\);/, "启动时没还原，存了也等于没存");
@@ -1412,24 +1416,24 @@ test("设置面板的下拉必须是自绘组件：菜单在控件正下方、�
   // 1) 面板内不许再有原生 <select>。原生控件的弹出菜单是系统画的：盖在控件上、
   //    宽度按最长选项算，位置和宽度 CSS 一行都管不着——"菜单在下方、同宽"这个要求
   //    在原生控件上根本无法满足，打扮得再像也没用。
-  const selAt = SRC.indexOf('createElement("select")');
+  const selAt = RAW_SRC.indexOf('createElement("select")');
   assert.equal(selAt, -1, "又建原生 select 了，它的弹出菜单没法按要求定位");
 
   // 2) 两处入口都走同一个组件——否则同一个面板里两种下拉各弹各的。
   assert.match(SRC, /function buildSelectControl\(/, "自绘下拉组件没了");
-  const bc = SRC.slice(SRC.indexOf("function buildSettingControl"));
+  const bc = SRC.slice(RAW_SRC.indexOf("function buildSettingControl"));
   assert.match(bc.slice(0, 700), /buildSelectControl\(/, "通用设置行没用自绘下拉");
-  const mk = SRC.slice(SRC.indexOf("const makeSelect = "));
+  const mk = SRC.slice(RAW_SRC.indexOf("const makeSelect = "));
   assert.match(mk.slice(0, 400), /buildSelectControl\(/, "自适应页没用自绘下拉");
 
   // 3) 菜单必须与控件同宽、贴在正下方。这三行是"对齐"这件事的全部实现。
-  const open = SRC.slice(SRC.indexOf("const r = btn.getBoundingClientRect();"));
+  const open = SRC.slice(RAW_SRC.indexOf("const r = btn.getBoundingClientRect();"));
   assert.match(open.slice(0, 600), /menu\.style\.width = `\$\{r\.width\}px`/, "菜单没跟控件同宽");
   assert.match(open.slice(0, 600), /menu\.style\.left = `\$\{r\.left\}px`/, "菜单左缘没和控件对齐");
   assert.match(open.slice(0, 600), /r\.bottom \+ 4/, "菜单没贴在控件下方");
 
   // 4) 键盘要能用。原生 select 白送的东西，自绘就得自己补——少一样键盘用户就用不了。
-  const kd = SRC.slice(SRC.indexOf('btn.addEventListener("keydown"'));
+  const kd = SRC.slice(RAW_SRC.indexOf('btn.addEventListener("keydown"'));
   for (const key of ["Escape", "ArrowDown", "ArrowUp", "Enter"]) {
     assert.match(kd.slice(0, 1200), new RegExp(key), `键盘少了 ${key}`);
   }
@@ -1455,13 +1459,13 @@ test("设置面板的下拉必须是自绘组件：菜单在控件正下方、�
     "深色主题下菜单没有自己的底色");
   // 键盘走到视口外的项要带进来，否则高亮跑到看不见的地方。
   // 只在 setActive 的函数体里找——main.js 别处也有 scrollIntoView，扫全文会被喂饱。
-  const sa = SRC.slice(SRC.indexOf("const setActive = (i) =>"));
+  const sa = SRC.slice(RAW_SRC.indexOf("const setActive = (i) =>"));
   assert.match(sa.slice(0, sa.indexOf("\n  };") + 5), /scrollIntoView/,
     "键盘移动时没把当前项滚进视野，高亮会跑到看不见的地方");
 
   // 4b) 只有菜单**外面**的滚动才关菜单。直接把 close 挂在 window 捕获阶段的话，
   //     在菜单里滚滚轮同样会被捕获到，表现就是"菜单根本滚不动"。
-  const sc = SRC.slice(SRC.indexOf("const onScroll ="));
+  const sc = SRC.slice(RAW_SRC.indexOf("const onScroll ="));
   assert.match(sc.slice(0, 200), /menu\.contains\(ev\.target\)/,
     "菜单内部的滚动也会关掉菜单——菜单会滚不动");
   assert.doesNotMatch(SRC, /window\.addEventListener\("scroll", close/,
@@ -1485,11 +1489,11 @@ test("数字设置项要有自绘步进器，而不是一个裸文本框", () =>
   // 连带把"这个值可以加减"的提示也一起拿掉了，剩一个看不出能干嘛的文本框。
   const css = readFileSync(join(HERE, "../src/styles/app.css"), "utf8");
   assert.match(SRC, /function buildNumberControl\(/, "步进器组件没了");
-  const bc = SRC.slice(SRC.indexOf("function buildSettingControl"));
+  const bc = SRC.slice(RAW_SRC.indexOf("function buildSettingControl"));
   assert.match(bc.slice(0, 900), /buildNumberControl\(/, "数字设置项没用步进器");
 
   // 中间必须还是真的 number 输入框：键入、↑/↓、读屏器的数值语义都靠它。
-  const nc = SRC.slice(SRC.indexOf("function buildNumberControl"));
+  const nc = SRC.slice(RAW_SRC.indexOf("function buildNumberControl"));
   const body = nc.slice(0, nc.indexOf("\n}\n") + 3);
   assert.match(body, /inp\.type = "number"/, "中间不是真的数字输入框，键盘和读屏器会失去数值语义");
   // 到头置灰，否则用户会对着一个点了没反应的按钮反复点。
@@ -1520,7 +1524,7 @@ test("面板里的按钮不能出现蓝字压蓝底，页尾动作要居中", ()
   // 自适应页那颗「保存」按钮已删：上面每一项都是 onchange 就落盘的，它唯一真正保存的
   // 是同时被删掉的那个偏好编辑框。留着就是一颗按下去什么都不改变、却让人以为"不按就
   // 没生效"的按钮。
-  const adaptive = SRC.slice(SRC.indexOf("function renderAdaptiveTool"), SRC.indexOf("const SETTINGS_SCHEMA"));
+  const adaptive = SRC.slice(RAW_SRC.indexOf("function renderAdaptiveTool"), RAW_SRC.indexOf("const SETTINGS_SCHEMA"));
   assert.doesNotMatch(adaptive, /adaptive-notes/, "那个偏好编辑框不该回来——记忆中心才是这份数据的正主");
   assert.doesNotMatch(adaptive, /_saveKgText\(/, "保存按钮回来了，但它已经没有要保存的东西");
   assert.match(adaptive, /actions\.append\(reset, memory\)/, "页尾按钮不是预期的两颗");
@@ -1531,10 +1535,10 @@ test("快捷键显示必须分平台：Mac 用符号，Windows 用词并带加�
   // 上一版只有 mod/ctrl/alt/meta 做了分支，shift/enter/backspace 无论什么平台都吐
   // Mac 符号；shortcutLabel 又是无分隔连写的，Windows 上会出现 "CtrlShiftP"。
   const cut = (n) => {
-    const i = SRC.indexOf("function " + n + "(");
+    const i = RAW_SRC.indexOf("function " + n + "(");
     assert.notEqual(i, -1, `${n} 没了`);
     let d = 0;
-    for (let k = SRC.indexOf("{", i); k < SRC.length; k++) {
+    for (let k = RAW_SRC.indexOf("{", i); k < SRC.length; k++) {
       if (SRC[k] === "{") d++;
       else if (SRC[k] === "}") { d--; if (!d) return SRC.slice(i, k + 1); }
     }
@@ -1558,11 +1562,11 @@ test("快捷键显示必须分平台：Mac 用符号，Windows 用词并带加�
 test("快捷键表要覆盖真正生效的键，且每个动作都得有实现", () => {
   // 之前设置页只登记了 15 条，而缩放、Markdown 预览、删除文件这些是各自挂 keydown 的
   // ——在设置页里既查不到也改不了。现在它们都进了同一张表。
-  const labels = SRC.slice(SRC.indexOf("const ACTION_LABELS = {"));
+  const labels = SRC.slice(RAW_SRC.indexOf("const ACTION_LABELS = {"));
   const labelBlock = labels.slice(0, labels.indexOf("\n};") + 3);
-  const acts = SRC.slice(SRC.indexOf("const KB_ACTIONS = {"));
+  const acts = SRC.slice(RAW_SRC.indexOf("const KB_ACTIONS = {"));
   const actBlock = acts.slice(0, acts.indexOf("\n};") + 3);
-  const defs = SRC.slice(SRC.indexOf("function _defaultKeybindings()"));
+  const defs = SRC.slice(RAW_SRC.indexOf("function _defaultKeybindings()"));
   const defBlock = defs.slice(0, defs.indexOf("\n}\n") + 3);
 
   for (const id of ["view.markdownPreview", "view.zoomIn", "view.zoomOut", "view.zoomReset",
@@ -1585,7 +1589,7 @@ test("快捷键表要覆盖真正生效的键，且每个动作都得有实现",
   // 否则在聊天框里按退格会删掉磁盘上的文件。守卫必须在动作函数**自己**身上。
   // 这里**跑**这个函数，不是看它源码里有没有那几个字符串——把条件 `&& false` 掉，
   // 按名字找的断言照样通过，而守卫已经形同虚设。
-  const del = SRC.slice(SRC.indexOf("function _deleteSelectedTreeItem"));
+  const del = SRC.slice(RAW_SRC.indexOf("function _deleteSelectedTreeItem"));
   const delBody = del.slice(0, del.indexOf("\n}\n") + 3);
   const runDelete = (activeElement) => {
     let deleted = false;
@@ -1618,7 +1622,7 @@ test("快捷键表要覆盖真正生效的键，且每个动作都得有实现",
 test("MCP 页：已停用排在已装服务之后，卡片不靠整块染色表达状态", () => {
   const css = readFileSync(join(HERE, "../src/styles/app.css"), "utf8");
   // 一进 MCP 页第一眼该看到正在跑的服务。已停用是补救入口，不是主角。
-  const at = SRC.indexOf("installedEl.innerHTML = brokenBanner + installedNames.map");
+  const at = RAW_SRC.indexOf("installedEl.innerHTML = brokenBanner + installedNames.map");
   assert.notEqual(at, -1, "已装服务列表的拼装变了");
   const stmt = SRC.slice(at, at + 6000);
   const joinAt = stmt.indexOf('}).join("")');
@@ -1649,12 +1653,12 @@ test("Skills：外部技能可删，但删之前必须把磁盘路径摆出来",
   // 原来外部目录（用户 / 插件目录）的技能一律只能停用，卡片上连删除按钮都不画——
   // 用户看到的是"这一堆技能没有删除功能"。按所有者要求放开了，但这一下会删到工作区
   // **外面**的文件夹，所以必须先把完整路径摆给用户看。
-  const can = SRC.slice(SRC.indexOf("function _skillCanDelete"));
+  const can = SRC.slice(RAW_SRC.indexOf("function _skillCanDelete"));
   const canBody = can.slice(0, can.indexOf("\n}\n") + 3);
   assert.match(canBody, /return !!String\(skill\.baseDir \|\| ""\)\.trim\(\)/,
     "外部技能又不能删了");
 
-  const del = SRC.slice(SRC.indexOf("async function _deleteSkillRecord"));
+  const del = SRC.slice(RAW_SRC.indexOf("async function _deleteSkillRecord"));
   const delBody = del.slice(0, del.indexOf("\n}\n") + 3);
   assert.match(delBody, /confirm\(/, "删工作区外的目录居然不确认");
   assert.match(delBody, /\$\{dir\}/, "确认框里没写清楚要删哪个目录");
@@ -1757,7 +1761,7 @@ test("拖滑块时不许每一帧都落盘", () => {
   // 这个仓库的性能记录里，localStorage.setItem 是最常见的多秒卡顿源（见 logic.test.mjs
   // 那条「空闲期卡死」：实测 120 次 2–60s 的卡顿里它出现得最多）。而 input 事件在拖动时
   // 每移动一点就触发一次，一次拖动几十上百次——每次都写一遍盘，松手后界面顿好几秒。
-  const bind = SRC.slice(SRC.indexOf("function _bindMicSlider"));
+  const bind = SRC.slice(RAW_SRC.indexOf("function _bindMicSlider"));
   const body = bind.slice(0, bind.indexOf("\n}\n") + 3);
   assert.match(body, /addEventListener\("input",[\s\S]{0,80}resolve\(false\)/,
     "input 还在提交——拖动时每一帧都会落盘");
@@ -1770,9 +1774,9 @@ test("拖滑块时不许每一帧都落盘", () => {
   // 两段的**先后不重要**，重要的是各自成段：上下文那条已经被挪到 `if (supports)` 之外
   // （不支持思考深度的模型此前滑块画得出来却拖不动），所以顺序反过来了。按各自的起点
   // 到"下一个起点或收尾"来切，谁在前都能测。
-  const ctxAt = SRC.indexOf("const ctxSl =");
-  const thinkAt = SRC.indexOf("const thinkSl =");
-  const endAt = SRC.indexOf("// Position:", Math.max(ctxAt, thinkAt));
+  const ctxAt = RAW_SRC.indexOf("const ctxSl =");
+  const thinkAt = RAW_SRC.indexOf("const thinkSl =");
+  const endAt = RAW_SRC.indexOf("// Position:", Math.max(ctxAt, thinkAt));
   assert.ok(ctxAt !== -1 && thinkAt !== -1 && endAt > Math.max(ctxAt, thinkAt),
     "两条滑块的绑定段没了");
   const cut = (from) => SRC.slice(from, Math.min(...[ctxAt, thinkAt, endAt].filter((n) => n > from)));
