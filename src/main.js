@@ -29342,6 +29342,163 @@ function _expandMcpPlaceholders(value, envMap) {
   return { value: out, error };
 }
 
+/*
+ * 一条**已装**配置指向的远程地址。
+ *
+ * 两种写法都要认：原生远程配置（`{url, type, headers}`），以及市场写出来的 mcp-remote
+ * 垫片（`npx -y -- mcp-remote <url>`）。自愈判据要落在真实地址上，所以取值必须和
+ * _mcpServerLaunchConfig 拼参数时用的是同一批字段。
+ */
+function _mcpConfigRemoteUrl(config) {
+  const c = config && typeof config === "object" ? config : {};
+  for (const v of [c.url, c.endpoint, c.remote]) {
+    const direct = String(typeof v === "string" ? v : "").trim();
+    if (/^https?:\/\/\S+$/i.test(direct)) return direct;
+  }
+  const args = Array.isArray(c.args) ? c.args.map((v) => String(v ?? "")) : [];
+  const at = args.findIndex((a) => /(?:^|[\\/])mcp-remote(?:@[^\s]*)?$/i.test(a));
+  if (at < 0) return "";
+  for (let i = at + 1; i < args.length; i++) {
+    if (/^https?:\/\/\S+$/i.test(args[i])) return args[i];
+  }
+  return "";
+}
+
+/*
+ * spawn 失败里唯一可靠的那一位：errno。
+ *
+ * Rust 的 io::Error 显示形式一律以 `(os error N)` 收尾，三个平台都有；它前面那句描述
+ * 会随系统语言和版本变，所以只取数字。2 = ENOENT（命令根本不存在 / 不在 PATH 里），
+ * 13 = EACCES（存在但没有执行权限）。
+ */
+function _mcpSpawnErrno(text) {
+  const m = String(text || "").match(/\(os error (\d+)\)/i);
+  return m ? Number(m[1]) : 0;
+}
+
+/*
+ * 远程端点探测：拿执行事实，不猜文案。
+ *
+ * 发一条真的 MCP `initialize`（streamable-HTTP 的握手就是这一条 POST），要回来的是
+ * HTTP 状态码和 Content-Type —— 这些是机器事实，而 mcp-remote 吐出来的错误串是
+ * 第三方进程的散文，会随它的版本变。分类器只吃这里返回的字段。
+ */
+async function _mcpProbeRemoteEndpoint(url) {
+  const payload = JSON.stringify({
+    jsonrpc: "2.0", id: 1, method: "initialize",
+    params: { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "michael-ide", version: "1" } },
+  });
+  try {
+    const r = await backend.invoke("http_request", {
+      method: "POST",
+      url,
+      headers: { "Content-Type": "application/json", Accept: "application/json, text/event-stream" },
+      body: payload,
+      timeoutSecs: 8,
+    });
+    const headers = (r && typeof r.headers === "object" && r.headers) || {};
+    const authHeader = Object.keys(headers).some((k) => String(k).toLowerCase() === "www-authenticate");
+    return {
+      reached: true,
+      status: Number(r?.status) || 0,
+      contentType: String(r?.content_type || "").toLowerCase(),
+      authHeader,
+      error: "",
+    };
+  } catch (error) {
+    // 请求根本没发出去（DNS / TCP / TLS / 超时）—— 这本身就是「网络不通」这条事实。
+    return { reached: false, status: 0, contentType: "", authHeader: false, error: String(error?.message || error) };
+  }
+}
+
+/*
+ * 包在不在：直接问包注册表，拿 HTTP 状态码。
+ *
+ * 「npx 起不来」有两种完全不同的原因：包名根本不存在（配置写错，删了重来），和网络/
+ * 权限问题（重试有用）。从 npx 的 stderr 里 grep 是猜；GET registry.npmjs.org/<name>
+ * 回 404 是证据。
+ */
+async function _mcpProbePackage(kind, id) {
+  const name = String(id || "").trim();
+  if (!name) return { reached: false, status: 0 };
+  const bare = name.replace(/(?!^)@[^@/]*$/, ""); // 去掉 `pkg@1.2.3` 的版本尾巴，保住 @scope/
+  const url = kind === "npm"
+    ? `https://registry.npmjs.org/${bare.split("/").map(encodeURIComponent).join("/")}`
+    : kind === "pypi" ? `https://pypi.org/pypi/${encodeURIComponent(bare.replace(/==.*$/, ""))}/json` : "";
+  if (!url) return { reached: false, status: 0 };
+  try {
+    const r = await backend.invoke("http_request", { method: "GET", url, headers: { Accept: "application/json" }, body: null, timeoutSecs: 8 });
+    return { reached: true, status: Number(r?.status) || 0 };
+  } catch {
+    return { reached: false, status: 0 };
+  }
+}
+
+/*
+ * 连接失败 → 一句用户能据以行动的话。
+ *
+ * 判据全部是**执行事实**：配置里写着的地址、探测拿到的 HTTP 状态码与 Content-Type、
+ * spawn 的 errno。一个关键词都不 grep —— 底层错误串来自 mcp-remote / npx / uvx 这些
+ * 第三方进程，换个版本措辞就变，靠它分类等于靠运气。
+ *
+ * `action` 是给面板用的结论：
+ *   "delete"    这条配置本身就是错的，留着不会自己好
+ *   "configure" 服务是对的，缺凭据
+ *   "retry"     环境问题，网络恢复后重试有用
+ *   ""          没能判定，原样把底层错误交出去（不编）
+ *
+ * 措辞把结论放在最前面：这些串会被 _mcpFailureSystemContext 截到 180 字节喂给模型。
+ */
+function _mcpDiagnoseFailure({ error = "", config = null, probe = null, pkgProbe = null } = {}) {
+  const raw = String(error || "").replace(/\s+/g, " ").trim();
+  const fallback = { kind: "unknown", action: "", message: raw.slice(0, 160) };
+  const url = _mcpConfigRemoteUrl(config);
+
+  // 1. 目录页。这是用户 ~/.mrdayone/mcp.json 里现在就躺着的那条（ethereum-rpc）：
+  //    判据是地址本身，不需要联网，也不用等一次必然失败的握手。
+  if (url && _mcpIsDirectoryPageUrl(url)) {
+    return {
+      kind: "directory-page",
+      action: "delete",
+      message: `这个地址是 MCP 目录站的条目页（一张网页），不是 MCP 端点——这条服务是装错了，建议删除；要用它就去它的仓库按说明装。地址：${url}`,
+    };
+  }
+
+  if (probe && probe.reached) {
+    const st = Number(probe.status) || 0;
+    const ct = String(probe.contentType || "");
+    if (st === 401 || st === 407 || probe.authHeader) {
+      return { kind: "auth", action: "configure", message: `这个服务需要鉴权（HTTP ${st || 401}）：在它的配置里填上凭据（headers 里的 Authorization），或按它的说明先在浏览器完成授权。地址：${url}` };
+    }
+    if (st === 403) {
+      return { kind: "auth", action: "configure", message: `凭据被拒（HTTP 403）：地址是对的，但当前这份凭据没有权限。换一份 token 或重新授权。地址：${url}` };
+    }
+    if (/text\/html/.test(ct)) {
+      return { kind: "not-endpoint", action: "delete", message: `这个地址返回的是一张 HTML 网页（Content-Type: ${ct}），不是 MCP 端点——地址填错了。地址：${url}` };
+    }
+    if (st === 404 || st === 405 || st === 410) {
+      return { kind: "not-endpoint", action: "delete", message: `这个地址上没有 MCP 端点（HTTP ${st}）——地址填错了，或者服务方已经换了路径。地址：${url}` };
+    }
+  }
+  if (probe && probe.reached === false) {
+    return { kind: "network", action: "retry", message: `连不上：请求没能发出去（${String(probe.error || "").replace(/\s+/g, " ").slice(0, 70)}）。检查网络 / 代理后重试。地址：${url}` };
+  }
+
+  if (pkgProbe && pkgProbe.reached && Number(pkgProbe.status) === 404) {
+    const pkg = _mcpConfigPackage(config || {});
+    return { kind: "missing-package", action: "delete", message: `包不存在：${pkg?.kind || ""} 注册表里查不到「${pkg?.id || ""}」（HTTP 404）。这条配置的包名是错的，装不起来。` };
+  }
+
+  const errno = _mcpSpawnErrno(raw);
+  if (errno === 2) {
+    return { kind: "missing-command", action: "configure", message: `找不到启动命令「${String(config?.command || "").trim() || "?"}」（os error 2）：这个程序没装，或者不在 PATH 里。装上它（npx 要 Node、uvx 要 uv）再重连。` };
+  }
+  if (errno === 13) {
+    return { kind: "missing-command", action: "configure", message: `启动命令「${String(config?.command || "").trim() || "?"}」没有执行权限（os error 13）。` };
+  }
+  return fallback;
+}
+
 // Normalize the two MCP launch formats used by Claude Code/Cursor projects into the
 // stdio transport owned by src-tauri. Local configs already provide command/args. Remote
 // configs provide url/type/headers and are bridged through mcp-remote so they participate
@@ -29870,7 +30027,27 @@ async function _ensureMcpTools(rootOverride = "") {
         });
         _mcpConnected.push(serverName);
       } catch (error) {
-        _mcpFailures.set(serverName, String(error?.message || error).slice(0, 160));
+        /*
+         * 失败要说人话，判据走执行事实。
+         *
+         * 直接把底层错误串塞进面板是这条路原来的做法：用户看到的是 mcp-remote 或 npx
+         * 吐的一行英文，既不知道是地址错了还是缺凭据，也不知道下一步该干什么。
+         *
+         * 顺序是「先不花钱的，再花钱的」：地址是不是目录页、spawn 的 errno，都在本地
+         * 就能判；判不出来才对**这条已经确定失败的**服务做一次探测（远程量 HTTP 状态
+         * 与 Content-Type，本地量包在不在）。探测只在失败分支上跑、8 秒上限、和别的
+         * 服务并行，所以正常路径一次都不会多花时间。
+         */
+        const raw = String(error?.message || error);
+        let diag = _mcpDiagnoseFailure({ error: raw, config: server });
+        if (diag.kind === "unknown") {
+          const remoteUrl = _mcpConfigRemoteUrl(server);
+          const pkg = remoteUrl ? null : _mcpConfigPackage(launch);
+          const probe = remoteUrl ? await _mcpProbeRemoteEndpoint(remoteUrl) : null;
+          const pkgProbe = pkg ? await _mcpProbePackage(pkg.kind, pkg.id) : null;
+          diag = _mcpDiagnoseFailure({ error: raw, config: server, probe, pkgProbe });
+        }
+        _mcpFailures.set(serverName, (diag.message || raw).slice(0, 300));
       }
     }));
 
@@ -62959,12 +63136,68 @@ async function _mcpRegFetchJson(url) {
   return res.json();
 }
 
-// 把不同注册表的条目统一成一个形状：{name, title, desc, stars, repo, owner, pkg: {kind, id}, remote}
+/*
+ * 已证实的「目录站条目页」——给人看的网页，不是 MCP 端点。
+ *
+ * 只列**能证明**的那一个：api.pulsemcp.com 每条结果的顶层 `url` 就是这个形状
+ * （https://www.pulsemcp.com/servers/<slug>），每条都有，和这个服务有没有远程端点
+ * 毫无关系。我们自己曾经把它当端点写进过用户的 ~/.mrdayone/mcp.json。
+ * 不去猜别的站点：把一个真端点误判成网页，比现在这个 bug 更糟。
+ */
+const _MCP_DIRECTORY_PAGE_PATTERNS = [
+  /^https?:\/\/(?:[a-z0-9-]+\.)*pulsemcp\.com\/servers(?:[/?#]|$)/i,
+];
+
+function _mcpIsDirectoryPageUrl(url) {
+  const u = String(url || "").trim();
+  return _MCP_DIRECTORY_PAGE_PATTERNS.some((re) => re.test(u));
+}
+
+/*
+ * remotes[] → 一个真的 MCP 端点。
+ *
+ * 这是「这条能不能远程装」的**唯一**来源。曾经这里的判据是「有 url 且没有
+ * package_name 就当远程」，而 PulseMCP 的 url 是它自己的目录页：热度前 100 条里
+ * 23 条有包、13 条有真端点、66 条两者皆无，那 66 条于是全被写成
+ * `mcp-remote https://www.pulsemcp.com/servers/…` —— mcp-remote 连过去拿回一张
+ * HTML 网页，握手必然失败，用户看到的就是「装上了，然后连接失败」。
+ *
+ * 元素形状按两个注册表的实测字段取并集：PulseMCP 用 {url, transport_type}，
+ * 官方注册表用 {url, transport|type}。只认绝对 https 地址，且不能是目录页。
+ */
+function _mcpPickRemoteEndpoint(remotes) {
+  for (const r of Array.isArray(remotes) ? remotes : []) {
+    const url = String(r?.url || "").trim();
+    if (!/^https:\/\/\S+$/i.test(url)) continue;
+    if (_mcpIsDirectoryPageUrl(url)) continue;
+    const transport = String(r?.transport_type || r?.transport || r?.type || "").trim().toLowerCase();
+    return { url, transport };
+  }
+  return { url: "", transport: "" };
+}
+
+/*
+ * 一条市场条目能不能一键装。
+ *
+ * 可安装性只有两种来源：package_name + package_registry（npm/pypi/docker），或者
+ * remotes[] 里的真端点。两者皆无 = 这条**只有源码**，不是「暂时失败」，是这份数据里
+ * 根本没有可启动的东西。这类条目照样列出来（用户要能搜到、能点进仓库），但不给
+ * 「安装」按钮——给一个必然失败的按钮才是现在这个 bug 的本体。
+ */
+function _mcpRegInstallable(s) {
+  return !!(s?.pkg?.id || s?.remote);
+}
+
+const _MCP_SOURCE_ONLY_NOTE = "这条在注册表里只有源码：没有 npm / PyPI / Docker 包，也没有远程端点，所以没法一键装。按仓库 README 在本机把它跑起来，再用「＋ 添加服务」把启动命令填进来。";
+
+// 把不同注册表的条目统一成一个形状：
+// {name, title, desc, stars, repo, owner, pkg: {kind, id}, remote, remoteTransport, listing}
 function _mcpRegNormalizePulse(s) {
   const repo = String(s?.source_code_url || s?.external_url || "");
   const gh = repo.match(/github\.com\/([^/]+)\/([^/#?]+)/i);
   const rawName = String(s?.name || gh?.[2] || "").trim();
   const kind = String(s?.package_registry || "").toLowerCase();
+  const endpoint = _mcpPickRemoteEndpoint(s?.remotes);
   return {
     name: rawName,
     title: rawName,
@@ -62973,7 +63206,10 @@ function _mcpRegNormalizePulse(s) {
     repo,
     owner: gh?.[1] || "",
     pkg: s?.package_name ? { kind: kind || "npm", id: String(s.package_name) } : null,
-    remote: String(s?.url || "").startsWith("http") && !s?.package_name ? String(s.url) : "",
+    remote: endpoint.url,
+    remoteTransport: endpoint.transport,
+    // s.url 是 PulseMCP 的目录页。它只配当「查看条目」的链接，永远不进启动配置。
+    listing: String(s?.url || ""),
   };
 }
 
@@ -62987,6 +63223,7 @@ function _mcpRegNormalizeOfficial(entry) {
   const docker = pkgs.find((p) => /docker|oci/i.test(p?.registryType || p?.registry_type || p?.registry_name || ""));
   const pick = npm || pypi || docker || null;
   const remotes = Array.isArray(s?.remotes) ? s.remotes : [];
+  const endpoint = _mcpPickRemoteEndpoint(remotes);
   // "ac.inference.sh/mcp" 这类反向域名：从后往前找第一个有信息量的 token 当显示名。
   const GENERIC = new Set(["mcp", "mcp-server", "server", "main", "app", "api", "cloud", "sh", "io", "com", "ai", "dev", "org", "net", "co", "github", "www"]);
   const tokens = full.split(/[./]/).filter(Boolean);
@@ -63002,7 +63239,9 @@ function _mcpRegNormalizeOfficial(entry) {
     repo: gh ? `https://github.com/${gh[1]}/${gh[2]}` : String(s?.repository?.url || ""),
     owner: gh?.[1] || (String(s?.repository?.url || "").match(/github\.com\/([^/]+)/i)?.[1] || ""),
     pkg: pick ? { kind: npm ? "npm" : pypi ? "pypi" : "docker", id: String(pick.identifier || pick.name || "") } : null,
-    remote: String(remotes[0]?.url || ""),
+    remote: endpoint.url,
+    remoteTransport: endpoint.transport,
+    listing: "",
   };
 }
 
@@ -63054,7 +63293,10 @@ async function _mcpRegistryPage(query = "", page = 1, force = false) {
         const u = `https://api.pulsemcp.com/v0beta/servers?count_per_page=${_MCP_REG_PAGE_SIZE}&offset=${offset}` + (q ? "&query=" + encodeURIComponent(q) : "");
         const data = await _mcpRegFetchJson(u);
         const raw = data?.servers || [];
-        const servers = raw.map(_mcpRegNormalizePulse).filter((s) => s.name && (s.pkg || s.remote));
+        // 「装不了」的条目不再被丢掉，而是留在列表里标成「只有源码」——丢掉它们，
+        // 用户搜一个名字搜不到，只会以为市场坏了；留着并如实标注才是能行动的信息。
+        // 唯一的过滤条件是「这条至少能指向点什么」。
+        const servers = raw.map(_mcpRegNormalizePulse).filter((s) => s.name && (_mcpRegInstallable(s) || s.repo || s.listing));
         servers.sort((a, b) => b.stars - a.stars);
         const total = Number(data?.total_count) || 0;
         out = { servers, source: "PulseMCP", total, hasMore: total ? offset + raw.length < total : raw.length >= _MCP_REG_PAGE_SIZE };
@@ -63065,7 +63307,7 @@ async function _mcpRegistryPage(query = "", page = 1, force = false) {
       const cursor = _mcpRegCursors.byPage[page] || "";
       const u = `https://registry.modelcontextprotocol.io/v0/servers?limit=${_MCP_REG_PAGE_SIZE}` + (cursor ? "&cursor=" + encodeURIComponent(cursor) : "") + (q ? "&search=" + encodeURIComponent(q) : "");
       const data = await _mcpRegFetchJson(u);
-      let servers = (data?.servers || []).map(_mcpRegNormalizeOfficial).filter((s) => s.name && (s.pkg || s.remote));
+      let servers = (data?.servers || []).map(_mcpRegNormalizeOfficial).filter((s) => s.name && (_mcpRegInstallable(s) || s.repo));
       const seen = new Set();
       servers = servers.filter((s) => { const k = s.title || s.name; if (seen.has(k)) return false; seen.add(k); return true; });
       const next = data?.metadata?.next_cursor || data?.metadata?.nextCursor || "";
@@ -63125,9 +63367,52 @@ function _mcpRegToConfig(s) {
     // 远程地址同样来自注册表：只接受 https，且不能被当成旗标。
     const url = String(s.remote || "");
     if (!/^https:\/\/[^\s]+$/i.test(url)) return null;
+    // 最后一道闸：目录站的条目页永远不是 MCP 端点。上游哪天把目录页塞进 remotes[]，
+    // 这里也不会再写出一条「装得上、必然连不上」的配置。
+    if (_mcpIsDirectoryPageUrl(url)) return null;
+    // 传输方式**不**从注册表声明里钉死。mcp-remote 默认 http-first：先试 streamable
+    // HTTP，不行再退 SSE。钉住只在声明准确时省掉一次探测，声明一旦过时就把一个本来
+    // 能用的服务变成用不了——拿一份第三方数据换掉一条自愈路径，不划算。
+    // remoteTransport 只作为「注册表声明了什么」记在元信息里。
     return { command: "npx", args: ["-y", "--", "mcp-remote", url] };
   }
   return null;
+}
+
+/*
+ * 一张市场卡片。
+ *
+ * 抽成顶层函数是为了能被直接测：这里唯一重要的分支是「装得了 / 只有源码」，
+ * 而它决定的是用户会不会拿到一个必然失败的「安装」按钮。
+ *
+ * 「只有源码」的条目不给安装按钮：热度前 100 条里有 66 条既没有包也没有远程端点，
+ * 之前每条都给一个「安装」，点下去写进一条必然连不上的配置——用户看到的是
+ * 「装上了 → 连接失败 → 不知道为什么」。装不了就说装不了，并把唯一真实可走的
+ * 那条路（去仓库）摆出来。
+ */
+function _mcpMarketCardHtml(s, { index = 0, installed = false, installing = false } = {}) {
+  const installable = _mcpRegInstallable(s);
+  const badge = s.pkg ? s.pkg.kind : installable ? "remote" : "仅源码";
+  const sourceUrl = s.repo || s.listing || "";
+  return `
+        <div class="mcpfp-card${installable ? "" : " mcpfp-card--srconly"}">
+          ${_mcpRegIconHtml(s)}
+          <div class="mcpfp-card__main">
+            <div class="mcpfp-card__name">
+              <strong title="${_escAttr(s.title)}">${_escHtml(s.name)}</strong>
+              <span class="mcpfp-badge${installable ? "" : " mcpfp-badge--muted"}">${_escHtml(badge)}</span>
+              ${s.stars ? `<span class="mcpfp-stars">★ ${_mcpStarsText(s.stars)}</span>` : ""}
+            </div>
+            <p title="${_escAttr(s.desc)}">${_escHtml(s.desc || "（没有简介）")}</p>
+            ${installable ? "" : `<p class="mcpfp-card__note">${_escHtml(_MCP_SOURCE_ONLY_NOTE)}</p>`}
+          </div>
+          <div class="mcpfp-card__btns">
+            ${s.repo ? `<button type="button" class="ctp-iconbtn" data-mcpfp-repo="${_escAttr(s.repo)}" title="查看仓库">${_dbUiIconSvg("open")}</button>` : ""}
+            ${installable
+              ? `<button type="button" class="ctp-btn ctp-btn--sm${installed ? "" : " ctp-btn--primary"}" data-mcpfp-install="${index}" ${installed || installing ? "disabled" : ""}>${installed ? "已安装" : installing ? "安装中…" : "安装"}</button>`
+              : `<button type="button" class="ctp-btn ctp-btn--sm" data-mcpfp-repo="${_escAttr(sourceUrl)}" ${sourceUrl ? "" : "disabled"} title="${_escAttr(_MCP_SOURCE_ONLY_NOTE)}">查看仓库</button>`}
+          </div>
+        </div>`;
 }
 
 function _mcpSanitizeName(name) {
@@ -63189,6 +63474,7 @@ function _mcpInstallMetaFromRegistry(s, source = "") {
     avatar: s.avatar || "",
     repo: s.repo || "",
     remote: s.remote || "",
+    remoteTransport: s.remoteTransport || "",
     stars: Number(s.stars) || 0,
     pkg: s.pkg || null,
     badge: s.pkg ? s.pkg.kind : (s.remote ? "remote" : ""),
@@ -63581,6 +63867,7 @@ function renderMcpTool(body) {
               ${Number(meta.stars) ? `<span class="mcpfp-stars">★ ${_mcpStarsText(Number(meta.stars))}</span>` : ""}
             </div>
             <p title="${_escAttr(desc)}">${_escHtml(desc)}</p>
+            ${failure ? `<p class="mcpfp-card__err" title="${_escAttr(failure)}">${_escHtml(failure)}</p>` : ""}
           </div>
           <div class="mcpfp-card__btns">
             <button type="button" class="ctp-iconbtn" data-mcpfp-log="${_escAttr(name)}" title="看这个服务自己说了什么（stderr 与它的日志通知）">${_dbUiIconSvg("list")}</button>
@@ -63620,28 +63907,11 @@ function renderMcpTool(body) {
           <button type="button" class="ctp-btn ctp-btn--sm ctp-btn--primary" data-mcpfp-preset="${_escAttr(p.name)}">安装</button>
         </div>
       </div>`).join("");
-    marketEl.innerHTML = featuredHtml + _mcpFp.servers.map((s, i) => {
-      const key = _mcpSanitizeName(s.pkg?.id || s.name);
-      const installed = installedNames.includes(key) || installedNames.includes(_mcpSanitizeName(s.name));
-      const installing = _mcpFp.installing === String(i);
-      const badge = s.pkg ? s.pkg.kind : "remote";
-      return `
-        <div class="mcpfp-card">
-          ${_mcpRegIconHtml(s)}
-          <div class="mcpfp-card__main">
-            <div class="mcpfp-card__name">
-              <strong title="${_escAttr(s.title)}">${_escHtml(s.name)}</strong>
-              <span class="mcpfp-badge">${_escHtml(badge)}</span>
-              ${s.stars ? `<span class="mcpfp-stars">★ ${_mcpStarsText(s.stars)}</span>` : ""}
-            </div>
-            <p title="${_escAttr(s.desc)}">${_escHtml(s.desc || "（没有简介）")}</p>
-          </div>
-          <div class="mcpfp-card__btns">
-            ${s.repo ? `<button type="button" class="ctp-iconbtn" data-mcpfp-repo="${_escAttr(s.repo)}" title="查看仓库">${_dbUiIconSvg("open")}</button>` : ""}
-            <button type="button" class="ctp-btn ctp-btn--sm${installed ? "" : " ctp-btn--primary"}" data-mcpfp-install="${i}" ${installed || installing ? "disabled" : ""}>${installed ? "已安装" : installing ? "安装中…" : "安装"}</button>
-          </div>
-        </div>`;
-    }).join("") + `
+    marketEl.innerHTML = featuredHtml + _mcpFp.servers.map((s, i) => _mcpMarketCardHtml(s, {
+      index: i,
+      installed: installedNames.includes(_mcpSanitizeName(s.pkg?.id || s.name)) || installedNames.includes(_mcpSanitizeName(s.name)),
+      installing: _mcpFp.installing === String(i),
+    })).join("") + `
       <div class="mcpfp-pager">
         <button type="button" class="ctp-btn ctp-btn--sm" data-mcpfp-page="prev" ${_mcpFp.page > 1 ? "" : "disabled"}>← 上一页</button>
         <span class="mcpfp-pager__info">第 ${_mcpFp.page} 页${_mcpFp.total ? ` / 共 ${Math.max(1, Math.ceil(_mcpFp.total / _MCP_REG_PAGE_SIZE))} 页` : ""}</span>
@@ -63865,11 +64135,18 @@ function renderMcpTool(body) {
     const idx = e.target.closest("[data-mcpfp-install]")?.getAttribute("data-mcpfp-install");
     if (idx !== null && idx !== undefined && idx !== "") {
       const s = _mcpFp.servers[Number(idx)];
-      const conf = s && _mcpRegToConfig(s);
       // 不再要求先打开文件夹：这里写的是 ~/.mrdayone/mcp.json，跨项目的全局文件，
       // 跟当前有没有项目毫无关系。root 只是"全局服务跟着哪个 cwd 跑"的基准，空串是
       // 合法值（_ensureMcpTools / _warmMcpTools 都完整支持）。
-      if (!s || !conf) return;
+      if (!s) return;
+      const conf = _mcpRegToConfig(s);
+      // 拒绝要说出理由。原来是静默 return：按钮按下去什么都不发生，比装错还费解。
+      if (!conf) {
+        showToast(_mcpRegInstallable(s)
+          ? `「${s.name}」的注册表数据转不成安全的启动配置（包名或远程地址不合法），没有安装`
+          : _MCP_SOURCE_ONLY_NOTE);
+        return;
+      }
       const name = _mcpSanitizeName(s.pkg?.id || s.name);
       _mcpFp.installing = String(idx);
       renderMarket();

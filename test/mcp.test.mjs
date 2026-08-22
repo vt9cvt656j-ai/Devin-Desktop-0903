@@ -1018,15 +1018,17 @@ test("MCP 面板四个写入口 + 重连都不要求先打开文件夹", () => {
   assert.ok(!/if \(!p \|\| !root\) return;/.test(CODE.slice(presetAt, presetAt + 300)),
     "精选安装处理器还在要求 root");
 
-  // 市场卡片：同上。
-  const marketBtn = CODE.indexOf('data-mcpfp-install="${i}"');
+  // 市场卡片：同上。（卡片模板搬进了顶层的 _mcpMarketCardHtml，索引形参叫 index。）
+  const marketBtn = CODE.indexOf('data-mcpfp-install="${index}"');
   assert.ok(marketBtn > 0, "找不到市场安装按钮");
   assert.ok(!/installing \|\| !root/.test(CODE.slice(marketBtn - 200, marketBtn + 200)),
     "市场「安装」按钮还在没开文件夹时被灰掉");
   const marketAt = CODE.indexOf('const idx = e.target.closest("[data-mcpfp-install]")');
   assert.ok(marketAt > 0, "找不到市场安装处理器");
   // 窗口开大一点：CODE 把注释置成等长空白，而这里恰好有一段解释这次改动的注释。
-  assert.ok(!/if \(!s \|\| !conf \|\| !root\) return;/.test(CODE.slice(marketAt, marketAt + 1000)),
+  // 判据是「这段里不许出现 !root」，不是某一行的原文——那一行的形状已经因为
+  // 「装不了的条目要说明理由而不是静默 return」变过一次。
+  assert.ok(!/!root/.test(CODE.slice(marketAt, marketAt + 1200)),
     "市场安装处理器还在要求 root");
 });
 
