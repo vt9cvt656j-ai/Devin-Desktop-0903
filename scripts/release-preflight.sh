@@ -80,6 +80,30 @@ echo "── 工具目录两份是否同步 ──"
   || fail "main.js 和 server/prompts/tools.json 的工具描述漂了。同步脚本只对齐 schema、
    不覆盖描述，所以描述改动必须两边都写。跑 node build/sync-tools-json.mjs 看差在哪。"
 
+echo "── 本地 tag 和远端有没有分叉 ──"
+# `git push --tags` 推的是**本地**那个指针。本地和远端指向不同 commit 时，它会安静地
+# 把本地那个（可能是旧的、或者别人已经移过的）发出去，而流水线编的就是 tag 指到的那次
+# 提交 —— 于是「我明明发的是最新代码」和「用户拿到的是旧包」同时成立。
+#
+# 实际撞到过两次，而且**本地指针在两次之间自己变了**（v0.4.10 先是 3f27224、后是
+# e124833，远端一直是 83cc905），说明有别的会话在动 tag。所以这一条每次发版都要查。
+if git remote get-url origin >/dev/null 2>&1; then
+  diverged=""
+  while IFS= read -r t; do
+    [ -n "$t" ] || continue
+    remote_sha="$(git ls-remote --tags origin "$t" 2>/dev/null | awk '$2 !~ /\^\{\}$/ {print $1}' | head -1)"
+    [ -n "$remote_sha" ] || continue   # 远端没有这个 tag = 还没推，不算分叉
+    local_sha="$(git rev-parse "$t" 2>/dev/null || true)"
+    if [ -n "$local_sha" ] && [ "$local_sha" != "$remote_sha" ]; then
+      diverged="$diverged
+     $t  本地 ${local_sha:0:7}  远端 ${remote_sha:0:7}"
+    fi
+  done <<< "$(git tag --sort=-v:refname | head -10)"
+  [ -z "$diverged" ] || fail "这些 tag 本地和远端指向不同的提交：$diverged
+   git push --tags 会把本地那个发出去，流水线就编了错的提交。
+   先拉齐：git fetch --tags --force origin"
+fi
+
 echo "── Actions 还跑不跑得起来（计费）──"
 # 前面所有检查查的都是「代码能不能打出包」。这一条查的是「流水线**允不允许**开始跑」，
 # 它和代码质量完全无关，却能让一次打 tag 彻底白费。
