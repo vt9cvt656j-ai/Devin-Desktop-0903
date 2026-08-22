@@ -126,7 +126,7 @@ test("快通道的结果必须有落地点，不能只被那一行同步表达�
   assert.doesNotMatch(start, /_intentWaitPaid/,
     "快通道又被挂回 _intentWaitPaid 上了：那记的是「等过一次」，一条会话只剩一次机会，"
     + "而那次机会关在一个它结构上赢不了的 6 秒窗口里");
-  assert.match(start, /!_sessionFlags\.length/,
+  assert.match(start, /!_sessionFlags\.length|_profileStillEmpty/,
     "启动判据应当是「会话画像还空」——空才值得再花一次 200 token 的快通道");
 
   // 两条腿仍然并行 race（第一轮能赶上就直接带上旗标出门，这条没变）。
