@@ -147,6 +147,127 @@ fn focus_bracketed(
 
 /// 逐条回放一串 {method, params}。分发器注入进来，回放本身不关心方法是怎么执行的。
 ///
+/// 一句描述**某个 profile 本身**的话。回执里凡是谈 cookie / 登录态的部分都从这里来，
+/// 而参数只有 profile —— 也就是说它永远只可能描述真正在跑的那套身份。
+#[cfg(feature = "browser")]
+fn profile_note(profile: crate::browser::BrowserProfile) -> &'static str {
+    match profile {
+        crate::browser::BrowserProfile::Session =>
+            "Persistent profile: cookies and logins from earlier runs are available, and anything you sign into here stays signed in. \
+If a site still shows a login wall, call browser.close first and then browser.start with headless=false, so the user can sign in once.",
+        crate::browser::BrowserProfile::Isolated =>
+            "Clean isolated profile: no cookies, no logins. If the task needs the user's own account, call browser.close first and then browser.start with profile=session.",
+    }
+}
+
+#[cfg(feature = "browser")]
+fn profile_name(profile: crate::browser::BrowserProfile) -> &'static str {
+    match profile {
+        crate::browser::BrowserProfile::Session => "session",
+        crate::browser::BrowserProfile::Isolated => "isolated",
+    }
+}
+
+/// browser.start 的回执。**只看 outcome，不看请求参数**——除了在参数没生效时把它们
+/// 原样回显，好让调用方看出自己要的和实际跑的不是一回事。
+///
+/// 之前 profile 字段和整段 note 都是由本次请求的 params 生成的：浏览器已经在跑时，
+/// 一句 `if self.browser.is_some() { return Ok(()) }` 把参数全丢了，回执却照样按参数
+/// 宣布「持久 profile、登录态可用」。模型据此往下走，必撞登录墙，而 note 给的补救
+/// （headless=false 让用户登录）方向也是错的：登录进的是那只隔离实例的临时目录。
+#[cfg(feature = "browser")]
+fn browser_start_receipt(
+    outcome: crate::agent::BrowserStartOutcome,
+    requested: crate::browser::BrowserIdentity,
+) -> serde_json::Value {
+    use crate::agent::BrowserStartOutcome as O;
+    let actual = match outcome {
+        O::Started(id) | O::AlreadyRunning(id) | O::Restarted(id) => id,
+    };
+    let mut v = serde_json::json!({
+        "status": "ok",
+        "profile": profile_name(actual.profile),
+        "headless": actual.headless,
+    });
+    let obj = v.as_object_mut().expect("json! 建的就是对象");
+    let mut note = String::new();
+    match outcome {
+        O::Started(_) => {}
+        O::Restarted(_) => {
+            obj.insert("restarted".into(), serde_json::json!(true));
+            note.push_str(
+                "The browser that was running had stopped responding (it crashed, or its window was closed), \
+so it was discarded and a fresh one was started with the settings you asked for. ",
+            );
+        }
+        O::AlreadyRunning(_) => {
+            obj.insert("already_running".into(), serde_json::json!(true));
+            if actual == requested {
+                note.push_str("A browser was already running with exactly these settings; this call changed nothing. ");
+            } else {
+                // 参数没生效——这是**唯一**该回显请求参数的地方，而且必须说清出路。
+                obj.insert("requested_profile".into(), serde_json::json!(profile_name(requested.profile)));
+                obj.insert("requested_headless".into(), serde_json::json!(requested.headless));
+                note.push_str(&format!(
+                    "A browser was already running and this call changed NOTHING: it is still profile={}, headless={}. \
+browser.start cannot switch a running browser's identity. To get profile={}, headless={}, call browser.close first and then browser.start again. ",
+                    profile_name(actual.profile), actual.headless,
+                    profile_name(requested.profile), requested.headless,
+                ));
+            }
+        }
+    }
+    note.push_str(profile_note(actual.profile));
+    obj.insert("note".into(), serde_json::json!(note));
+    v
+}
+
+/// browser.close 的回执。flushed 是这里唯一重要的事实。
+///
+/// 之前无论发生了什么都是 {"status":"ok"}：Browser.close 没被接受、或者进程 8 秒内没
+/// 自己退出而被 Drop 强杀（cookie 没写进 profile），在调用方眼里和一次干净的关闭完全
+/// 一样。持久 profile 下这正是「登录一次长期有效」失守的那一刻，而它要到下一次运行
+/// 才会以「怎么又要登录」的形式冒出来。
+#[cfg(feature = "browser")]
+fn browser_close_receipt(outcome: crate::agent::BrowserCloseOutcome) -> serde_json::Value {
+    use crate::agent::BrowserCloseOutcome as O;
+    match outcome {
+        O::NotRunning => serde_json::json!({ "status": "ok", "was_running": false }),
+        O::Closed { identity, flushed } => {
+            let mut v = serde_json::json!({
+                "status": "ok",
+                "was_running": true,
+                "flushed": flushed,
+            });
+            let obj = v.as_object_mut().expect("json! 建的就是对象");
+            if let Some(id) = identity {
+                obj.insert("profile".into(), serde_json::json!(profile_name(id.profile)));
+            }
+            let persistent = matches!(
+                identity.map(|id| id.profile),
+                // 身份读不出来时按最坏情况说话：宁可让调用方多验一次，也不要漏报丢失。
+                None | Some(crate::browser::BrowserProfile::Session)
+            );
+            let note = if flushed {
+                if persistent {
+                    "The browser exited on its own, so cookies and logins were written to disk. \
+Whatever you signed into will still be signed in the next time you start with profile=session."
+                } else {
+                    "The browser exited cleanly. This was a throwaway isolated profile, so nothing was meant to persist."
+                }
+            } else if persistent {
+                "The browser did NOT exit on its own and had to be killed, so cookies and logins from this run \
+may never have reached disk. Do not assume a sign-in made during this run survived — check it on the next start."
+            } else {
+                "The browser did NOT exit on its own and had to be killed. This was a throwaway isolated profile, \
+so nothing was lost."
+            };
+            obj.insert("note".into(), serde_json::json!(note));
+            v
+        }
+    }
+}
+
 /// 第 N 步失败时前面的点击 / 输入已经落到桌面上了。原来这里一个 `?` 把底层错误
 /// （比如 "Missing 'x' parameter"）原样上抛，位置和已执行步数随之丢掉——调用方既不
 /// 知道停在哪，也不知道整条重放会不会把已发生的副作用再来一遍。位置信息放最前面：
@@ -259,16 +380,11 @@ impl RpcServer {
                     "session" | "user" | "persistent" | "logged_in" => crate::browser::BrowserProfile::Session,
                     _ => crate::browser::BrowserProfile::Isolated,
                 };
-                agent.browser_start_with_profile(headless, profile)?;
-                Ok(serde_json::json!({
-                    "status": "ok",
-                    "profile": if profile == crate::browser::BrowserProfile::Session { "session" } else { "isolated" },
-                    "note": if profile == crate::browser::BrowserProfile::Session {
-                        "Persistent profile: cookies and logins from earlier runs are available, and anything you sign into here stays signed in. If a site still shows a login wall, start again with headless=false so the user can sign in once."
-                    } else {
-                        "Clean isolated profile: no cookies, no logins. If the task needs the user's own account, restart with profile=session."
-                    }
-                }))
+                let outcome = agent.browser_start_with_profile(headless, profile)?;
+                Ok(browser_start_receipt(
+                    outcome,
+                    crate::browser::BrowserIdentity::new(headless, profile),
+                ))
             }
             
             #[cfg(feature = "browser")]
@@ -344,8 +460,7 @@ impl RpcServer {
             
             #[cfg(feature = "browser")]
             "browser.close" => {
-                agent.browser_close()?;
-                Ok(serde_json::json!({"status": "ok"}))
+                Ok(browser_close_receipt(agent.browser_close()?))
             }
             
             // 系统方法
@@ -1176,5 +1291,217 @@ mod replay_context_tests {
         let v = replay_steps(&steps, 0, |_m, _p| Ok(json!({}))).unwrap();
         assert_eq!(v["status"], "ok");
         assert_eq!(v["replayed"], 2);
+    }
+}
+
+#[cfg(all(test, feature = "browser"))]
+mod browser_receipt_tests {
+    use super::{browser_close_receipt, browser_start_receipt, profile_note};
+    use crate::agent::{BrowserCloseOutcome, BrowserStartOutcome};
+    use crate::browser::{BrowserIdentity, BrowserProfile};
+
+    const ISO_HEADLESS: BrowserIdentity = BrowserIdentity {
+        headless: true,
+        profile: BrowserProfile::Isolated,
+    };
+    const SESSION_HEADED: BrowserIdentity = BrowserIdentity {
+        headless: false,
+        profile: BrowserProfile::Session,
+    };
+
+    /// 回执必须描述**跑着的那只**，不能描述这次请求的参数。
+    ///
+    /// 触发路径是工具描述亲自教的：先用默认 isolated 起过浏览器，撞了登录墙，于是带
+    /// profile="session" 再 start 一次。修复前收到的是「持久 profile、登录态可用」，
+    /// 而真正在跑的还是那只无 cookie 的隔离实例——接下来每一步都建立在这句假话上。
+    #[test]
+    fn already_running_describes_the_running_browser_not_the_requested_one() {
+        let v = browser_start_receipt(
+            BrowserStartOutcome::AlreadyRunning(ISO_HEADLESS),
+            SESSION_HEADED,
+        );
+        assert_eq!(v["profile"], "isolated", "报的是请求的身份，不是跑着的：{v}");
+        assert_eq!(v["headless"], true, "headless 同样被吞掉了：{v}");
+        assert_eq!(v["already_running"], true, "「这次调用什么都没做」必须是结构化字段");
+        // 参数没生效时才回显请求值，好让调用方看出差在哪。
+        assert_eq!(v["requested_profile"], "session");
+        assert_eq!(v["requested_headless"], false);
+
+        let note = v["note"].as_str().expect("note");
+        assert!(
+            note.contains(profile_note(BrowserProfile::Isolated)),
+            "没有描述真正在跑的那套身份: {note}"
+        );
+        assert!(
+            !note.contains(profile_note(BrowserProfile::Session)),
+            "又在描述一套根本没在跑的身份: {note}"
+        );
+        assert!(
+            note.contains("browser.close"),
+            "没给出路——模型只会一遍遍再 start，那正是它出不来的那个环: {note}"
+        );
+    }
+
+    /// 请求和实际一致时不回显请求值（没有差异可说），但仍要说清这次没做任何事。
+    #[test]
+    fn a_matching_already_running_call_still_says_it_changed_nothing() {
+        let v = browser_start_receipt(
+            BrowserStartOutcome::AlreadyRunning(SESSION_HEADED),
+            SESSION_HEADED,
+        );
+        assert_eq!(v["already_running"], true);
+        assert_eq!(v["profile"], "session");
+        assert_eq!(v["headless"], false);
+        assert!(v.get("requested_profile").is_none(), "没有差异就别多两个字段: {v}");
+        assert!(v.get("requested_headless").is_none(), "{v}");
+    }
+
+    #[test]
+    fn a_fresh_start_reports_what_it_started_and_claims_nothing_else() {
+        let v = browser_start_receipt(BrowserStartOutcome::Started(SESSION_HEADED), SESSION_HEADED);
+        assert_eq!(v["status"], "ok");
+        assert_eq!(v["profile"], "session");
+        assert_eq!(v["headless"], false);
+        assert!(v.get("already_running").is_none(), "{v}");
+        assert!(v.get("restarted").is_none(), "{v}");
+        assert_eq!(
+            v["note"].as_str().unwrap(),
+            profile_note(BrowserProfile::Session),
+            "全新启动时 note 就该只有那套身份的说明"
+        );
+    }
+
+    /// 死浏览器被换掉这件事必须看得见：否则「重启」和「什么都没做」在回执里一模一样。
+    #[test]
+    fn a_restart_after_a_dead_browser_is_visible() {
+        let v = browser_start_receipt(BrowserStartOutcome::Restarted(ISO_HEADLESS), ISO_HEADLESS);
+        assert_eq!(v["restarted"], true, "{v}");
+        assert!(v.get("already_running").is_none(), "重启不是「已在运行」: {v}");
+        assert_eq!(v["profile"], "isolated");
+        assert_eq!(v["headless"], true);
+    }
+
+    /// 全组合扫一遍：任何一条回执都不许描述一套没在跑的身份。
+    #[test]
+    fn no_receipt_ever_describes_a_profile_that_is_not_running() {
+        let ids = [
+            ISO_HEADLESS,
+            SESSION_HEADED,
+            BrowserIdentity::new(false, BrowserProfile::Isolated),
+            BrowserIdentity::new(true, BrowserProfile::Session),
+        ];
+        for actual in ids {
+            for requested in ids {
+                for outcome in [
+                    BrowserStartOutcome::Started(actual),
+                    BrowserStartOutcome::AlreadyRunning(actual),
+                    BrowserStartOutcome::Restarted(actual),
+                ] {
+                    let v = browser_start_receipt(outcome, requested);
+                    assert_eq!(v["profile"], super::profile_name(actual.profile), "{v:?}");
+                    assert_eq!(v["headless"], actual.headless, "{v:?}");
+                    let note = v["note"].as_str().expect("note");
+                    let other = match actual.profile {
+                        BrowserProfile::Session => BrowserProfile::Isolated,
+                        BrowserProfile::Isolated => BrowserProfile::Session,
+                    };
+                    assert!(note.contains(profile_note(actual.profile)), "{note}");
+                    assert!(!note.contains(profile_note(other)), "{note}");
+                }
+            }
+        }
+    }
+
+    /// 本来就没浏览器 ≠ 关掉了一个。
+    #[test]
+    fn closing_nothing_is_not_reported_as_a_close() {
+        let v = browser_close_receipt(BrowserCloseOutcome::NotRunning);
+        assert_eq!(v["was_running"], false);
+        assert!(v.get("flushed").is_none(), "什么都没关，flushed 无从谈起: {v}");
+    }
+
+    /// 强杀（没等到进程自己退出）和干净关闭必须能分开。
+    ///
+    /// 修复前两者都是 {"status":"ok"}：持久 profile 的 cookie 没落盘这件事完全不可见，
+    /// 要到下一次运行才以「怎么又要登录」的形式冒出来。
+    #[test]
+    fn a_killed_browser_is_not_reported_like_a_clean_close() {
+        let clean = browser_close_receipt(BrowserCloseOutcome::Closed {
+            identity: Some(SESSION_HEADED),
+            flushed: true,
+        });
+        let killed = browser_close_receipt(BrowserCloseOutcome::Closed {
+            identity: Some(SESSION_HEADED),
+            flushed: false,
+        });
+        assert_eq!(clean["flushed"], true);
+        assert_eq!(killed["flushed"], false);
+        assert_eq!(clean["was_running"], true);
+        assert_eq!(killed["was_running"], true);
+        assert_eq!(clean["profile"], "session");
+        assert_ne!(clean["note"], killed["note"], "两种结局说了同一句话");
+    }
+
+    /// 隔离 profile 被强杀无所谓（本来就要丢），持久 profile 被强杀是丢登录态。
+    /// 两者说的不能是同一句。
+    #[test]
+    fn a_throwaway_profile_and_a_persistent_one_do_not_share_the_kill_note() {
+        let iso = browser_close_receipt(BrowserCloseOutcome::Closed {
+            identity: Some(ISO_HEADLESS),
+            flushed: false,
+        });
+        let sess = browser_close_receipt(BrowserCloseOutcome::Closed {
+            identity: Some(SESSION_HEADED),
+            flushed: false,
+        });
+        assert_eq!(iso["profile"], "isolated");
+        assert_ne!(iso["note"], sess["note"]);
+    }
+
+    /// 连身份都读不出来时按最坏情况说话——漏报「登录可能没了」比多验一次贵得多。
+    #[test]
+    fn an_unknown_identity_is_treated_as_the_worst_case() {
+        let unknown = browser_close_receipt(BrowserCloseOutcome::Closed {
+            identity: None,
+            flushed: false,
+        });
+        let persistent = browser_close_receipt(BrowserCloseOutcome::Closed {
+            identity: Some(SESSION_HEADED),
+            flushed: false,
+        });
+        assert!(unknown.get("profile").is_none(), "不知道就别编一个: {unknown}");
+        assert_eq!(unknown["flushed"], false);
+        assert_eq!(unknown["note"], persistent["note"], "身份不明时必须按持久 profile 报警");
+    }
+
+    /// browser.start 那条分发不许再自己拿 params 编 profile / note。
+    ///
+    /// 这是「假回执」的原始形状：`if profile == Session { "Persistent profile…" }`。
+    /// 只要它还在，前面所有单元测试都可以照样绿，而线上回执照旧说反。
+    #[test]
+    fn the_start_arm_builds_its_receipt_from_the_outcome_not_from_the_params() {
+        let src = include_str!("rpc.rs");
+        let prod = src.split("\n#[cfg(test)]").next().unwrap_or(src);
+        let pat = "\"browser.start\" => {";
+        let at = prod.find(pat).expect("browser.start 这条分发不见了");
+        let rest = &prod[at + pat.len()..];
+        let end = ["\n            \"", "\n            _ =>", "\n            #[cfg"]
+            .iter()
+            .filter_map(|p| rest.find(p))
+            .min()
+            .unwrap_or(rest.len());
+        let body: String = rest[..end]
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            body.contains("browser_start_receipt("),
+            "回执又不是从 outcome 生成的了: {body}"
+        );
+        assert!(
+            !body.contains("Persistent profile"),
+            "又在这条分发里按请求参数编 note 了: {body}"
+        );
     }
 }
