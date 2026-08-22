@@ -63120,19 +63120,151 @@ function renderCaptureTool(body) {
 
 // ---- 高级设置 · MCP 标签页：在线热门 MCP 市场（自动拉取注册表）+ 已配置服务管理 ----
 
+/*
+ * GitHub 的未鉴权额度：核心 60 次/小时、搜索 10 次/分钟
+ * （`curl https://api.github.com/rate_limit` 可复现）。技能市场首页一次就要拉一批仓库树，
+ * 翻两页、多点几次就撞 403 —— 而这条共用的拉取函数以前只 `throw new Error("HTTP 403")`，
+ * 用户看到的是「获取失败：HTTP 403」或一片空白：不知道为什么，也不知道等多久。
+ *
+ * 结论不靠猜。每个响应都带 `x-ratelimit-remaining` / `x-ratelimit-reset`，429 还带
+ * `retry-after`；`http_request` 那条 IPC 路径本来就把整张 headers 表回传（net.rs 的
+ * HttpResponse.headers），只是这里以前把它丢了。下面这几个函数把响应头里的**执行事实**
+ * 变成一句能行动的话，以及一个能据以退避的余额。
+ */
+
+/** 响应头取值：Tauri 那条路回的是普通对象，webview fetch 回的是 Headers。两种都认，大小写不敏感。 */
+function _ghHeaderGet(headers, name) {
+  if (!headers) return "";
+  const want = String(name).toLowerCase();
+  if (typeof headers.get === "function") return String(headers.get(want) ?? "");
+  for (const k of Object.keys(headers)) if (k.toLowerCase() === want) return String(headers[k] ?? "");
+  return "";
+}
+
+/**
+ * 响应头 → {remaining, limit, resetAt(毫秒时间戳), retryAfterMs}。
+ * 缺字段就是 null / 0 —— 没量到就说没量到，不拿默认值冒充事实。
+ */
+function _ghRateFromHeaders(headers, now = Date.now()) {
+  const num = (v) => (/^\d+$/.test(String(v ?? "").trim()) ? Number(String(v).trim()) : null);
+  const remaining = num(_ghHeaderGet(headers, "x-ratelimit-remaining"));
+  const limit = num(_ghHeaderGet(headers, "x-ratelimit-limit"));
+  const resetSec = num(_ghHeaderGet(headers, "x-ratelimit-reset"));
+  const retrySec = num(_ghHeaderGet(headers, "retry-after"));
+  const retryAfterMs = retrySec === null ? 0 : retrySec * 1000;
+  // x-ratelimit-reset 是 epoch 秒；只有 retry-after 时按「从现在起」折算。
+  let resetAt = resetSec === null ? 0 : resetSec * 1000;
+  if (!resetAt && retryAfterMs) resetAt = now + retryAfterMs;
+  return { remaining, limit, resetAt, retryAfterMs };
+}
+
+function _ghWaitText(waitMs) {
+  const sec = Math.ceil(Math.max(0, Number(waitMs) || 0) / 1000);
+  if (sec <= 0) return "稍后自动";
+  if (sec < 60) return `约 ${sec} 秒后`;
+  return `约 ${Math.ceil(sec / 60)} 分钟后`;
+}
+
+function _ghRateLimitMessage(waitMs, limit) {
+  return `GitHub 接口限流${limit ? `（这一小时的 ${limit} 次额度用完了）` : ""}，${_ghWaitText(waitMs)}恢复。`;
+}
+
+/*
+ * 403/429 → 是不是限流，还要等多久。
+ *
+ * 只有响应头**说**额度耗尽（x-ratelimit-remaining: 0）或者明确给了 retry-after，才叫限流。
+ * 一个没带这些头的 403 是「被拒」，不是「等等就好」——把它说成限流，用户会白等一小时；
+ * 所以这里不看状态码猜，看头。
+ */
+function _ghRateLimitVerdict(status, headers, now = Date.now()) {
+  const r = _ghRateFromHeaders(headers, now);
+  const st = Number(status) || 0;
+  const limited = st === 429 || (st === 403 && (r.remaining === 0 || r.retryAfterMs > 0));
+  const waitMs = limited ? Math.max(0, (r.resetAt || 0) - now) : 0;
+  return {
+    rateLimited: limited,
+    waitMs,
+    resetAt: limited ? (r.resetAt || 0) : 0,
+    remaining: r.remaining,
+    limit: r.limit,
+    message: limited ? _ghRateLimitMessage(waitMs, r.limit) : "",
+  };
+}
+
+// 两个额度桶：/search/ 走搜索额度（10 次/分钟），其余走核心（60 次/小时）。余额只从响应头来。
+const _ghRate = { core: null, search: null };
+
+function _ghRateBucket(url) {
+  return /^https?:\/\/api\.github\.com\/search\//i.test(String(url || "")) ? "search" : "core";
+}
+
+function _ghRateNote(bucket, headers, now = Date.now()) {
+  const r = _ghRateFromHeaders(headers, now);
+  if (r.remaining === null && !r.resetAt) return; // 这个响应没带额度信息，别拿它覆盖已量到的
+  _ghRate[bucket] = { remaining: r.remaining, limit: r.limit, resetAt: r.resetAt, at: now };
+}
+
+/*
+ * 还能花几次。
+ *
+ * 没量过就回 null（= 不知道，别据此拦人）；量过、额度归零、且重置点还没到就是 0。
+ * `reserve` 是留给用户主动动作（点安装、拉官方清单）的头寸：后台的批量校验不许把它花光。
+ */
+function _ghRateBudget(bucket, { reserve = 0, now = Date.now() } = {}) {
+  const s = _ghRate[bucket];
+  if (!s || s.remaining === null) return null;
+  if (s.resetAt && now >= s.resetAt) return null; // 窗口翻篇了，下一次请求会重新量
+  return Math.max(0, s.remaining - reserve);
+}
+
+/**
+ * 一个带结论的 HTTP 错误。限流时 message 就是给用户看的那句话，并带上 retryAt 供界面倒数；
+ * 其余情况保持原来的 `HTTP <code>`，不编。
+ */
+function _ghHttpError(status, headers, now = Date.now()) {
+  const v = _ghRateLimitVerdict(status, headers, now);
+  const err = new Error(v.rateLimited ? v.message : `HTTP ${Number(status) || 0}`);
+  err.status = Number(status) || 0;
+  err.rateLimited = v.rateLimited;
+  err.retryAt = v.rateLimited ? (v.resetAt || now + v.waitMs) : 0;
+  return err;
+}
+
+/*
+ * 有现成的 GitHub 令牌就带上（额度 60/小时 → 5000/小时）；没有就照常匿名跑。
+ *
+ * 令牌**只**从用户已经配好的那一份来（设置里的「GitHub 访问令牌」，和 @ 选仓库共用同一个
+ * localStorage 键）。不新增任何要用户填令牌的强制步骤：没填就是没填，市场照常能用，
+ * 只是额度小。令牌不进日志、不进任何错误文案——上面那些文案里只有状态码和响应头里的时间。
+ */
+function _ghAuthHeaders(base, url) {
+  const h = { ...base };
+  if (!/^https?:\/\/(api\.github\.com|raw\.githubusercontent\.com)\//i.test(String(url || ""))) return h;
+  let tok = "";
+  try { tok = _atIntegrationToken("github"); } catch { tok = ""; }
+  if (tok) h.Authorization = `Bearer ${tok}`;
+  return h;
+}
+
 // 注册表双通道拉取：优先 Tauri http_request（无 CORS 问题），webview fetch 兜底。
+// 两条路都把响应头交给 _ghRateNote —— 额度是量出来的，不是猜的。
 async function _mcpRegFetchJson(url) {
+  const bucket = _ghRateBucket(url);
+  const isGh = /^https?:\/\/api\.github\.com\//i.test(String(url || ""));
   if (inTauri) {
+    let r = null;
     try {
-      const r = await backend.invoke("http_request", { method: "GET", url, headers: { Accept: "application/json" }, body: null, timeoutSecs: 20 });
-      if (r && r.ok && r.body) return JSON.parse(r.body);
-      if (r && r.status) throw new Error(`HTTP ${r.status}`);
-    } catch (e) {
-      if (!String(e).includes("HTTP")) { /* IPC 不可用 → 落到 fetch */ } else { throw e; }
+      r = await backend.invoke("http_request", { method: "GET", url, headers: _ghAuthHeaders({ Accept: "application/json" }, url), body: null, timeoutSecs: 20 });
+    } catch { r = null; /* IPC 不可用 → 落到 fetch */ }
+    if (r) {
+      if (isGh) _ghRateNote(bucket, r.headers);
+      if (r.ok) return r.body ? JSON.parse(r.body) : null;
+      throw _ghHttpError(r.status, r.headers);
     }
   }
-  const res = await fetch(url, { headers: { Accept: "application/json" } });
-  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  const res = await fetch(url, { headers: _ghAuthHeaders({ Accept: "application/json" }, url) });
+  if (isGh) _ghRateNote(bucket, res.headers);
+  if (!res.ok) throw _ghHttpError(res.status, res.headers);
   return res.json();
 }
 
@@ -64204,16 +64336,19 @@ function renderMcpTool(body) {
 // 思路与 MCP 标签页一致：精选置顶 + 全网搜索 + 分页预取去重 + 一键安装即用。
 
 async function _skillFetchText(url) {
+  // raw.githubusercontent.com 不是 api.github.com，不吃那份 60 次/小时的核心额度；
+  // 有现成令牌就带上（私有仓库/更高额度），没有就匿名跑。
+  const hdr = _ghAuthHeaders({ Accept: "*/*" }, url);
   if (inTauri) {
     try {
-      const r = await backend.invoke("http_request", { method: "GET", url, headers: { Accept: "*/*" }, body: null, timeoutSecs: 30 });
+      const r = await backend.invoke("http_request", { method: "GET", url, headers: hdr, body: null, timeoutSecs: 30 });
       if (r && r.ok) return r.body || "";
       if (r && r.status) throw new Error(`HTTP ${r.status}`);
     } catch (e) {
       if (String(e).includes("HTTP")) throw e;
     }
   }
-  const res = await fetch(url);
+  const res = await fetch(url, { headers: hdr });
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
   return res.text();
 }
@@ -64238,6 +64373,233 @@ async function _skillOfficialList(force = false) {
   skills.sort((a, b) => a.name.localeCompare(b.name));
   if (skills.length) { try { localStorage.setItem(_SKILL_OFFICIAL_KEY, JSON.stringify({ ts: Date.now(), skills })); } catch {} }
   return skills;
+}
+
+/*
+ * 一条技能市场条目能不能装。
+ *
+ * 数据源是 GitHub 仓库搜索：`claude skill in:name,description,topics`。这个搜索式命中的是
+ * **名字/描述/话题里提到** "claude skill" 的仓库——很多只是在**讨论** Claude 技能，并不
+ * **是**一个技能包。而「这个仓库到底有没有 SKILL.md」以前只在用户点安装那一刻才验
+ * （_skillInstallFromRepo 拉树，找不到就 throw）。于是列表是一排热门，点安装报错，反复如此。
+ *
+ * 判据前移到列表阶段，而且判据只有一个：**仓库里到底有没有 SKILL.md** 这个执行事实。
+ * 不按名字、描述、话题猜——那正是产生这个 bug 的那种判据。
+ *
+ * 三态，因为「还没验」和「验过、没有」是两件不同的事，混成两态就又开始编：
+ *   "yes"     见到了 SKILL.md（根目录 raw 命中，或整棵树里找到）→ 给「安装」
+ *   "no"      整棵树拉过了，里面没有 SKILL.md → 标出来 +「查看仓库」，不给安装按钮
+ *   "unknown" 还没验（额度不够 / 还没轮到）→ 如实说没验，按钮是「检查并安装」
+ * 三态都留在列表里。悄悄把装不了的丢掉，用户搜一个名字搜不到，只会以为市场坏了。
+ */
+const _SKILL_VERDICT_KEY = "michael-ide.skill-verdicts.v1";
+// "yes" 稳定（技能包不会突然不是技能包），"no" 存得短一点：仓库随时可能补上 SKILL.md。
+const _SKILL_VERDICT_TTL = { yes: 7 * 24 * 3600_000, no: 24 * 3600_000 };
+const _skillVerdicts = new Map(); // "owner/repo@branch" -> {v, dir, ts}
+let _skillVerdictsLoaded = false;
+
+function _skillVerdictKey(full, branch) {
+  return `${String(full || "").toLowerCase()}@${String(branch || "main")}`;
+}
+
+function _skillVerdictsLoad() {
+  if (_skillVerdictsLoaded) return _skillVerdicts;
+  _skillVerdictsLoaded = true;
+  try {
+    const raw = JSON.parse(localStorage.getItem(_SKILL_VERDICT_KEY) || "null");
+    const now = Date.now();
+    for (const [k, v] of Object.entries(raw || {})) {
+      if (!v || (v.v !== "yes" && v.v !== "no")) continue;
+      if (now - (Number(v.ts) || 0) > _SKILL_VERDICT_TTL[v.v]) continue;
+      _skillVerdicts.set(k, { v: v.v, dir: String(v.dir || ""), ts: Number(v.ts) || 0 });
+    }
+  } catch {}
+  return _skillVerdicts;
+}
+
+function _skillVerdictsSave() {
+  try {
+    const out = {};
+    for (const [k, v] of _skillVerdictsLoad()) out[k] = v;
+    localStorage.setItem(_SKILL_VERDICT_KEY, JSON.stringify(out));
+  } catch {}
+}
+
+function _skillVerdictGet(full, branch) {
+  const key = _skillVerdictKey(full, branch);
+  const hit = _skillVerdictsLoad().get(key);
+  if (!hit) return null;
+  if (Date.now() - hit.ts > _SKILL_VERDICT_TTL[hit.v]) { _skillVerdicts.delete(key); return null; }
+  return hit;
+}
+
+function _skillVerdictSet(full, branch, verdict, dir = "") {
+  if (verdict !== "yes" && verdict !== "no") return;
+  _skillVerdictsLoad().set(_skillVerdictKey(full, branch), { v: verdict, dir: String(dir || ""), ts: Date.now() });
+  _skillVerdictsSave();
+}
+
+/** 把已有判据盖到一页结果上；没判过的显式标成 unknown（而不是让它看起来像能装）。 */
+function _skillApplyVerdicts(servers) {
+  for (const s of Array.isArray(servers) ? servers : []) {
+    if (!s) continue;
+    const hit = _skillVerdictGet(s.full, s.branch);
+    if (hit) { s.verdict = hit.v; s.skillDir = hit.dir; }
+    else if (s.verdict !== "yes" && s.verdict !== "no") s.verdict = "unknown";
+  }
+  return servers;
+}
+
+/*
+ * 一棵仓库树里的 SKILL.md 目录：根目录优先，其次同名目录，否则第一个。
+ *
+ * 列表校验和真正安装用的是**同一个**函数——「判据前移」的意思就是这个：列表上说能装、
+ * 点下去真能装，必须是同一段代码得出的结论，否则两边随时会分叉回今天这个 bug。
+ */
+function _skillPickDirFromTree(tree, name = "") {
+  const dirs = [];
+  for (const t of tree?.tree || []) {
+    const p = String(t?.path || "");
+    if (t?.type === "blob" && /(^|\/)SKILL\.md$/.test(p)) {
+      dirs.push(p === "SKILL.md" ? "" : p.slice(0, p.length - "/SKILL.md".length));
+    }
+  }
+  if (!dirs.length) return null;
+  const dir = dirs.includes("") ? "" : (dirs.find((d) => d.split("/").pop() === name) || dirs[0]);
+  return { dir, dirs };
+}
+
+/*
+ * 判据的**便宜那一半**：根目录有没有 SKILL.md。
+ *
+ * 走 raw.githubusercontent.com —— 那是 CDN，不是 api.github.com，不吃 60 次/小时那份额度
+ * （安装时每个文件本来也都走它）。一页 30 条全探一遍也撞不到限流，而绝大多数真技能包的
+ * SKILL.md 就在仓库根上。
+ *
+ * 命中 = 证明有。**没命中不等于没有**（可能在子目录里），所以这里只回「有没有命中」，
+ * 由调用方决定要不要再花一次树请求去证伪。把 404 当成「不是技能包」就是又一次按猜下结论。
+ */
+async function _skillProbeRootSkillMd(full, branch) {
+  try {
+    const text = await _skillFetchText(`https://raw.githubusercontent.com/${full}/${encodeURIComponent(branch || "main")}/SKILL.md`);
+    return String(text || "").trim().length > 0;
+  } catch { return false; }
+}
+
+/** 判据的**贵那一半**：拉整棵树，能给出 yes/no 两侧的确定结论。一次核心额度。 */
+async function _skillProbeTree(full, branch) {
+  const tree = await _mcpRegFetchJson(`https://api.github.com/repos/${full}/git/trees/${encodeURIComponent(branch || "main")}?recursive=1`);
+  return _skillPickDirFromTree(tree, String(full || "").split("/").pop());
+}
+
+/** 并发池：一次最多 n 个在飞，不把一整页同时丢出去。 */
+async function _skillPool(items, n, run) {
+  const queue = [...items];
+  const width = Math.max(1, Math.min(n, queue.length));
+  await Promise.all(Array.from({ length: width }, async () => {
+    while (queue.length) {
+      const it = queue.shift();
+      try { await run(it); } catch {}
+    }
+  }));
+}
+
+const _SKILL_VERIFY_CONCURRENCY = 6;
+const _SKILL_VERIFY_RESERVE = 12; // 留给「安装」「官方清单」这些用户主动动作的头寸
+const _SKILL_VERIFY_TREE_MAX = 8; // 单页最多再花这么多次树请求
+
+/*
+ * 给一页结果盖判据章。
+ *
+ * 成本是这道题的真问题：一页 30 条，每条拉一次仓库树 = 30 次核心请求，而未鉴权的核心额度
+ * 一共 60 次/小时——翻两页就没了，正好撞上限流那个 bug。所以摊成三层：
+ *   ① 缓存：判过的仓库不再判（yes 存 7 天、no 存 1 天，落 localStorage，翻页/重开都算数）
+ *   ② 便宜那层：根目录 SKILL.md 走 raw CDN，不吃 API 额度，一页全探
+ *   ③ 贵那层：只对 ①② 都没结论的条目拉树，且**花多少由响应头里的剩余额度说了算**
+ *      （_ghRateBudget），并给用户的主动点击留头寸；花不起就停在 "unknown"，如实标注，
+ *      由用户点「检查并安装」时按需花一次——那一次是用户的意图，不是后台的猜测。
+ * 中途撞到限流就立刻停（e.rateLimited），不把剩下的额度也撞光。
+ */
+async function _skillVerifyPage(servers, { onUpdate = null } = {}) {
+  const list = _skillApplyVerdicts(Array.isArray(servers) ? servers : []);
+  await _skillPool(list.filter((s) => s.verdict === "unknown"), _SKILL_VERIFY_CONCURRENCY, async (s) => {
+    if (await _skillProbeRootSkillMd(s.full, s.branch)) {
+      s.verdict = "yes";
+      s.skillDir = "";
+      _skillVerdictSet(s.full, s.branch, "yes", "");
+      onUpdate?.();
+    }
+  });
+  const budget = _ghRateBudget("core", { reserve: _SKILL_VERIFY_RESERVE });
+  let left = budget === null ? _SKILL_VERIFY_TREE_MAX : Math.min(_SKILL_VERIFY_TREE_MAX, budget);
+  for (const s of list) {
+    if (left <= 0) break;
+    if (s.verdict !== "unknown") continue;
+    left--;
+    try {
+      const picked = await _skillProbeTree(s.full, s.branch);
+      s.verdict = picked ? "yes" : "no";
+      s.skillDir = picked?.dir || "";
+      _skillVerdictSet(s.full, s.branch, s.verdict, s.skillDir);
+      onUpdate?.();
+    } catch (e) {
+      if (e?.rateLimited) break;
+    }
+  }
+  return list;
+}
+
+const _SKILL_NOT_A_SKILL_NOTE = "这个仓库里没有 SKILL.md：它只是名字/描述/话题里提到了 Claude 技能，本身不是一个技能包，装不了。点「查看仓库」看它到底是什么。";
+const _SKILL_UNVERIFIED_NOTE = "还没验证这个仓库里有没有 SKILL.md（GitHub 未登录接口额度有限，没把它花在每一条上）。点「检查并安装」会当场查一次：有就装，没有就把这条标成「不是技能包」。";
+
+/*
+ * 一张技能市场卡片。
+ *
+ * 抽成顶层函数是为了能被直接测：这里唯一重要的分支就是那个三态判据，而它决定的是用户会不会
+ * 拿到一个必然失败的「安装」按钮。形状和 MCP 市场的 _mcpMarketCardHtml 保持一致：标出来、
+ * 给「查看仓库」、说清为什么，不从列表里悄悄丢掉。
+ */
+function _skillMarketCardHtml(s, { index = 0, installed = false, installing = false } = {}) {
+  const verdict = s?.verdict === "yes" || s?.verdict === "no" ? s.verdict : "unknown";
+  const badge = verdict === "yes" ? "技能" : verdict === "no" ? "非技能包" : "未验证";
+  const note = verdict === "no" ? _SKILL_NOT_A_SKILL_NOTE : verdict === "unknown" ? _SKILL_UNVERIFIED_NOTE : "";
+  const label = installed ? "已安装" : installing ? "安装中…" : verdict === "yes" ? "安装" : "检查并安装";
+  const name = String(s?.name || "");
+  return `
+        <div class="mcpfp-card${verdict === "no" ? " mcpfp-card--srconly" : ""}">
+          <span class="mcpfp-icon">${s.avatar ? `<img src="${_escAttr(s.avatar)}&s=96" alt="" loading="lazy" onerror="this.remove()" />` : ""}<span class="mcpfp-icon__letter">${_escHtml(name.slice(0, 1).toUpperCase())}</span></span>
+          <div class="mcpfp-card__main">
+            <div class="mcpfp-card__name">
+              <strong title="${_escAttr(s.full)}">${_escHtml(name)}</strong>
+              <span class="mcpfp-badge${verdict === "yes" ? "" : " mcpfp-badge--muted"}">${_escHtml(badge)}</span>
+              ${s.skillDir ? `<span class="mcpfp-badge mcpfp-badge--muted" title="${_escAttr(s.skillDir + "/SKILL.md")}">${_escHtml(s.skillDir)}</span>` : ""}
+              ${s.stars ? `<span class="mcpfp-stars">★ ${_mcpStarsText(s.stars)}</span>` : ""}
+            </div>
+            <p title="${_escAttr(s.desc)}">${_escHtml(s.desc || "（没有简介）")}</p>
+            ${note ? `<p class="mcpfp-card__note">${_escHtml(note)}</p>` : ""}
+          </div>
+          <div class="mcpfp-card__btns">
+            <button type="button" class="ctp-iconbtn" data-skfp-repo="${_escAttr(s.url)}" title="查看仓库">${_dbUiIconSvg("open")}</button>
+            ${verdict === "no"
+              ? `<button type="button" class="ctp-btn ctp-btn--sm" data-skfp-repo="${_escAttr(s.url)}" ${s.url ? "" : "disabled"} title="${_escAttr(_SKILL_NOT_A_SKILL_NOTE)}">查看仓库</button>`
+              : `<button type="button" class="ctp-btn ctp-btn--sm${installed || verdict !== "yes" ? "" : " ctp-btn--primary"}" data-skfp-install="${index}" ${installed || installing ? "disabled" : ""} title="${_escAttr(verdict === "yes" ? "" : _SKILL_UNVERIFIED_NOTE)}">${label}</button>`}
+          </div>
+        </div>`;
+}
+
+/*
+ * 市场加载失败那一格。撞限流时给的是**从响应头算出来的**时间，不是一句「稍后再试」；
+ * 顺带把「填个令牌额度会大很多」摆出来——是一个可选项，不是必须走的步骤。
+ */
+function _skillMarketErrorHtml(error, { retryAt = 0, now = Date.now() } = {}) {
+  const msg = String(error || "网络错误");
+  const waitMs = Math.max(0, (Number(retryAt) || 0) - now);
+  const hint = waitMs > 0
+    ? `${_ghWaitText(waitMs)}可以重试；也可以在「设置 → GitHub 访问令牌」填一个，额度会大很多。`
+    : "";
+  return `<div class="ctp-empty">获取失败：${_escHtml(msg)}`
+    + (hint ? `<p class="mcpfp-card__note">${_escHtml(hint)}</p>` : "<br>")
+    + `<button type="button" class="ctp-btn" data-skfp="refresh" style="margin-top:8px">重试</button></div>`;
 }
 
 // 社区技能：GitHub 仓库搜索（按 star 热度 + page 分页），页缓存 + 在途去重 + 预取，绝不重复请求。
@@ -64266,7 +64628,7 @@ async function _skillRegistryPage(query = "", page = 1, force = false) {
       try {
         const c = JSON.parse(localStorage.getItem(_SKILL_REG_CACHE_KEY) || "null");
         if (c && Array.isArray(c.servers) && c.servers.length && Date.now() - c.ts < 6 * 3600_000) {
-          const hit = { servers: c.servers, hasMore: !!c.hasMore, total: c.total || 0 };
+          const hit = { servers: _skillApplyVerdicts(c.servers), hasMore: !!c.hasMore, total: c.total || 0 };
           _skillRegPageCache.set(key, hit);
           return hit;
         }
@@ -64285,7 +64647,12 @@ async function _skillRegistryPage(query = "", page = 1, force = false) {
       owner: String(it?.owner?.login || ""),
       branch: String(it?.default_branch || "main"),
       url: String(it?.html_url || ""),
+      // 判据留空到验证那一步再填：这里没有任何能证明「有没有 SKILL.md」的字段，
+      // 按名字/描述猜就是这个 bug 本身。
+      verdict: "unknown",
+      skillDir: "",
     })).filter((s) => s.name && s.full);
+    _skillApplyVerdicts(servers);
     const total = Math.min(Number(data?.total_count) || 0, 1000); // GitHub 搜索最多翻到 1000 条
     const out = { servers, total, hasMore: page * _SKILL_REG_PAGE_SIZE < total && servers.length >= _SKILL_REG_PAGE_SIZE };
     if (!q && page === 1 && servers.length) {
@@ -64300,6 +64667,10 @@ async function _skillRegistryPage(query = "", page = 1, force = false) {
 
 async function _skillRegPrefetch(query = "", fromPage = 1) {
   const q = String(query || "").trim();
+  // 搜索额度只有 10 次/分钟。响应头说没剩下了就别预取——预取是"顺手"，不值得把用户
+  // 下一次真正的搜索也撞进 403 里。
+  const budget = _ghRateBudget("search", { reserve: 2 });
+  if (budget !== null && budget <= 0) return;
   for (let p = fromPage + 1; p <= fromPage + _SKILL_REG_PREFETCH; p++) {
     const prev = _skillRegPageCache.get(_skillRegPageKey(q, p - 1));
     if (prev && !prev.hasMore) break;
@@ -64349,19 +64720,25 @@ async function _skillInstallDir(repoFull, branch, dirPath, destName, onProgress,
   return { destBase, fileCount: n, skillMdPath: `${destBase}/SKILL.md` };
 }
 
-// 社区仓库安装：树里找 SKILL.md 目录——根目录优先，其次同名目录，否则第一个。
+/*
+ * 社区仓库安装。目录挑选走 _skillPickDirFromTree —— 和列表阶段那道判据**同一段代码**。
+ *
+ * 结论顺手落盘：这一次拉到的树是最新的执行事实，把它写进判据缓存，下次打开市场这条就不再
+ * 冒充一个能装的技能（"检查并安装"点一次就自愈成"非技能包"），也不会再白花一次树请求。
+ */
 async function _skillInstallFromRepo(item, onProgress) {
-  const tree = await _mcpRegFetchJson(`https://api.github.com/repos/${item.full}/git/trees/${encodeURIComponent(item.branch || "main")}?recursive=1`);
-  const dirs = [];
-  for (const t of tree?.tree || []) {
-    if (t.type === "blob" && /(^|\/)SKILL\.md$/.test(t.path)) {
-      dirs.push(t.path === "SKILL.md" ? "" : t.path.slice(0, t.path.length - "/SKILL.md".length));
-    }
+  const branch = item.branch || "main";
+  const tree = await _mcpRegFetchJson(`https://api.github.com/repos/${item.full}/git/trees/${encodeURIComponent(branch)}?recursive=1`);
+  const picked = _skillPickDirFromTree(tree, item.name);
+  if (!picked) {
+    _skillVerdictSet(item.full, branch, "no", "");
+    throw new Error("这个仓库里没有 SKILL.md：它不是一个技能包，装不了。");
   }
-  if (!dirs.length) throw new Error("仓库里没有 SKILL.md");
-  const dir = dirs.includes("") ? "" : (dirs.find((d) => d.split("/").pop() === item.name) || dirs[0]);
+  const dirs = picked.dirs;
+  const dir = picked.dir;
+  _skillVerdictSet(item.full, branch, "yes", dir);
   const destName = _mcpSanitizeName(dir ? dir.split("/").pop() : item.name);
-  const r = await _skillInstallDir(item.full, item.branch || "main", dir, destName, onProgress, tree, {
+  const r = await _skillInstallDir(item.full, branch, dir, destName, onProgress, tree, {
     name: item.name,
     full: item.full,
     desc: item.desc,
@@ -64394,7 +64771,7 @@ async function _skillPostInstall(_skillMdPath) {
 }
 
 // ---- 标签页渲染（结构/样式与 MCP 标签页共用 mcpfp-*） ----
-const _skFp = { query: "", page: 1, hasMore: false, total: 0, loading: false, servers: [], official: [], error: "", installing: "" };
+const _skFp = { query: "", page: 1, hasMore: false, total: 0, loading: false, servers: [], official: [], error: "", retryAt: 0, installing: "" };
 
 function renderSkillsTool(body) {
   body.classList.add("mcpfp-body");
@@ -64565,8 +64942,8 @@ function renderSkillsTool(body) {
 
   const renderMarket = () => {
     if (_skFp.loading) { marketEl.innerHTML = `<div class="ctp-loading">正在获取热门 Skills…</div>`; return; }
-    if (_skFp.error) { marketEl.innerHTML = `<div class="ctp-empty">获取失败：${_escHtml(_skFp.error)}<br><button type="button" class="ctp-btn" data-skfp="refresh" style="margin-top:8px">重试</button></div>`; return; }
-    if (sourceEl) sourceEl.textContent = `数据源：Anthropic 官方 + GitHub 搜索 · 按 star 热度排序${_skFp.total ? ` · 共 ${_skFp.total.toLocaleString()} 个仓库` : ""} · 6 小时自动更新`;
+    if (_skFp.error) { marketEl.innerHTML = _skillMarketErrorHtml(_skFp.error, { retryAt: _skFp.retryAt }); return; }
+    if (sourceEl) sourceEl.textContent = `数据源：Anthropic 官方 + GitHub 搜索 · 按 star 热度排序${_skFp.total ? ` · 共 ${_skFp.total.toLocaleString()} 个仓库` : ""} · 只有确认含 SKILL.md 的才给「安装」 · 6 小时自动更新`;
     const q = _skFp.query.toLowerCase();
     const official = _skFp.page === 1 ? _skFp.official.filter((s) => !q || s.name.toLowerCase().includes(q) || s.path.toLowerCase().includes(q)) : [];
     const officialHtml = official.map((s) => {
@@ -64588,31 +64965,25 @@ function renderSkillsTool(body) {
           </div>
         </div>`;
     }).join("");
-    const cardsHtml = _skFp.servers.map((s, i) => {
-      const installed = installedDirs.has(_mcpSanitizeName(s.name));
-      const installing = _skFp.installing === String(i);
-      return `
-        <div class="mcpfp-card">
-          <span class="mcpfp-icon">${s.avatar ? `<img src="${_escAttr(s.avatar)}&s=96" alt="" loading="lazy" onerror="this.remove()" />` : ""}<span class="mcpfp-icon__letter">${_escHtml(s.name.slice(0, 1).toUpperCase())}</span></span>
-          <div class="mcpfp-card__main">
-            <div class="mcpfp-card__name">
-              <strong title="${_escAttr(s.full)}">${_escHtml(s.name)}</strong>
-              ${s.stars ? `<span class="mcpfp-stars">★ ${_mcpStarsText(s.stars)}</span>` : ""}
-            </div>
-            <p title="${_escAttr(s.desc)}">${_escHtml(s.desc || "（没有简介）")}</p>
-          </div>
-          <div class="mcpfp-card__btns">
-            <button type="button" class="ctp-iconbtn" data-skfp-repo="${_escAttr(s.url)}" title="查看仓库">${_dbUiIconSvg("open")}</button>
-            <button type="button" class="ctp-btn ctp-btn--sm${installed ? "" : " ctp-btn--primary"}" data-skfp-install="${i}" ${installed || installing ? "disabled" : ""}>${installed ? "已安装" : installing ? "安装中…" : "安装"}</button>
-          </div>
-        </div>`;
-    }).join("");
+    const cardsHtml = _skFp.servers.map((s, i) => _skillMarketCardHtml(s, {
+      index: i,
+      // 落点名按真正会用的那个算：装进技能库的目录名是 SKILL.md 所在目录的名字，
+      // 不是仓库名——判据验出 skillDir 之后这两者常常不同。
+      installed: installedDirs.has(_mcpSanitizeName(s.skillDir ? s.skillDir.split("/").pop() : s.name)),
+      installing: _skFp.installing === String(i),
+    })).join("");
     marketEl.innerHTML = officialHtml + cardsHtml + `
       <div class="mcpfp-pager">
         <button type="button" class="ctp-btn ctp-btn--sm" data-skfp-page="prev" ${_skFp.page > 1 ? "" : "disabled"}>← 上一页</button>
         <span class="mcpfp-pager__info">第 ${_skFp.page} 页${_skFp.total ? ` / 共 ${Math.max(1, Math.ceil(Math.min(_skFp.total, 1000) / _SKILL_REG_PAGE_SIZE))} 页` : ""}</span>
         <button type="button" class="ctp-btn ctp-btn--sm" data-skfp-page="next" ${_skFp.hasMore ? "" : "disabled"}>下一页 →</button>
       </div>`;
+  };
+
+  let _verifyRenderTimer = null;
+  const scheduleVerifyRender = () => {
+    clearTimeout(_verifyRenderTimer);
+    _verifyRenderTimer = setTimeout(() => renderMarket(), 150);
   };
 
   const loadMarket = async (force = false) => {
@@ -64631,12 +65002,23 @@ function renderSkillsTool(body) {
       _skFp.hasMore = !!hasMore;
       _skFp.total = total || 0;
       _skFp.error = "";
+      _skFp.retryAt = 0;
     } catch (e) {
+      // 限流那条路上 message 已经是"约 X 分钟后恢复"，retryAt 供界面倒数——两者都来自响应头。
       _skFp.error = String(e?.message || e || "网络错误");
+      _skFp.retryAt = Number(e?.retryAt) || 0;
     }
     _skFp.loading = false;
     await renderInstalled();
-    if (!_skFp.error) _skillRegPrefetch(_skFp.query, _skFp.page);
+    if (!_skFp.error) {
+      // 可安装性在列表阶段就验：先便宜那层（raw CDN，不吃 API 额度），额度有富余再拉树。
+      // 每有结论就重画（合并到一帧，别一条一画）。
+      const page = _skFp.servers;
+      _skillVerifyPage(page, { onUpdate: () => { if (_skFp.servers === page) scheduleVerifyRender(); } })
+        .then(() => { if (_skFp.servers === page) renderMarket(); })
+        .catch(() => {});
+      _skillRegPrefetch(_skFp.query, _skFp.page);
+    }
   };
 
   const doInstall = async (tag, run) => {
@@ -64652,6 +65034,9 @@ function renderSkillsTool(body) {
       showToast("安装失败：" + String(err?.message || err).slice(0, 140));
     }
     _skFp.installing = "";
+    // 装的那一步刚拿到一棵新树，判据已经落盘了；盖回列表，这条卡片当场变成它真正的样子
+    // （"非技能包" + 「查看仓库」），不用等下次刷新，也不用用户再点一次才知道。
+    _skillApplyVerdicts(_skFp.servers);
     await renderInstalled();
   };
 
