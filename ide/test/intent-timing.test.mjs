@@ -23,6 +23,9 @@ import { dirname, join } from "node:path";
 import { spawnSync } from "node:child_process";
 import { test } from "node:test";
 import assert from "node:assert/strict";
+// 按名字取真源码只有一份实现：test/helpers/source.mjs 的 fnSource（acorn 按 AST 边界切）。
+// 本文件的 SRC/CODE 还要同样处理 prompts.rs，所以那两个绑定保持本地不动。
+import { fnSource } from "./helpers/source.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const SRC = readFileSync(join(HERE, "..", "src", "main.js"), "utf8");
@@ -56,20 +59,6 @@ function stripComments(src) {
 const CODE = stripComments(SRC);
 const RUST_CODE = stripComments(RUST);
 
-// 取一个不含花括号字面量的短函数的源文本。本文件只用它取 _serverDesignLayersRouted，
-// 那个函数里没有 `{`/`}` 出现在字符串或正则里，简单配对就够；复杂函数请用 logic.test.mjs
-// 里那套带字符串/模板/正则跳过的 extractFn。
-function extractSimpleFn(name) {
-  const m = new RegExp(`function\\s+${name}\\s*\\(`).exec(SRC);
-  assert.ok(m, `main.js 里找不到 ${name}`);
-  let i = SRC.indexOf("{", SRC.indexOf(")", m.index));
-  let depth = 0;
-  for (; i < SRC.length; i++) {
-    if (SRC[i] === "{") depth++;
-    else if (SRC[i] === "}") { depth--; if (depth === 0) return SRC.slice(m.index, i + 1); }
-  }
-  throw new Error(`${name} 的函数体没有闭合`);
-}
 
 function numericConst(code, name) {
   const m = new RegExp(`const\\s+${name}\\s*(?::\\s*usize\\s*)?=\\s*([0-9_]+)\\s*(\\*\\s*[0-9_]+\\s*)?;`).exec(code);
@@ -161,7 +150,7 @@ test("零旗标的裁决是合法的，不能让此后每一轮都重付一次�
 });
 
 test("「服务端挂了设计层吗」必须按 design 旗标判，空画像的 2.5: 是 truthy 的", () => {
-  const fn = extractSimpleFn("_serverDesignLayersRouted");
+  const fn = fnSource("_serverDesignLayersRouted");
   const make = new Function("_l0On", `${fn}; return _serverDesignLayersRouted;`);
   const routed = make(() => true);
 

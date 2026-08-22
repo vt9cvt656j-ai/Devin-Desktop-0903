@@ -14,33 +14,12 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
+// 按名字取真源码只有一份实现：test/helpers/source.mjs 的 fnSource（acorn 按 AST 边界切）。
+import { fnSource as extractFn } from "./helpers/source.mjs";
 
 const SRC = fs.readFileSync("src/main.js", "utf8");
 const APP_CSS = fs.readFileSync("src/styles/app.css", "utf8");
 
-/** 抠出一个函数体（和 logic.test.mjs 同一套做法的精简版：跳过注释/字符串/模板/正则）。 */
-function extractFn(name) {
-  const m = new RegExp(`(?:async\\s+)?function\\s+${name}\\s*\\(`).exec(SRC);
-  if (!m) throw new Error(`function ${name} not found in main.js`);
-  let i = SRC.indexOf("{", SRC.indexOf(")", m.index));
-  let depth = 0;
-  for (; i < SRC.length; i++) {
-    const c = SRC[i], d = SRC[i + 1];
-    if (c === "/" && d === "/") { i = SRC.indexOf("\n", i); if (i < 0) i = SRC.length; continue; }
-    if (c === "/" && d === "*") { i = SRC.indexOf("*/", i + 2) + 1; continue; }
-    if (c === "'" || c === '"' || c === "`") {
-      const quote = c;
-      for (i++; i < SRC.length; i++) {
-        if (SRC[i] === "\\") { i++; continue; }
-        if (SRC[i] === quote) break;
-      }
-      continue;
-    }
-    if (c === "{") depth++;
-    else if (c === "}") { depth--; if (depth === 0) return SRC.slice(m.index, i + 1); }
-  }
-  throw new Error(`unbalanced braces extracting ${name}`);
-}
 
 /**
  * 剥掉注释再断言。

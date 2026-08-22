@@ -19,16 +19,7 @@ const ROOT = join(HERE, "..");
 // 只在注释里留一句，assert.match 照样绿——本仓库已经这样漏过一整组模型可见的工具契约。
 // 所以 `SRC` 绑定的是 CODE（注释整段置空，行号与偏移和原文一字不差）；
 // 真要匹配注释本身的断言显式用 RAW_SRC，并在那一行写清为什么。
-import { CODE as SRC, SRC as RAW_SRC } from "./helpers/source.mjs";
-
-function topLevelFn(name) {
-  const at = RAW_SRC.indexOf(`function ${name}(`);
-  assert.ok(at > 0, `找不到 ${name}`);
-  const start = RAW_SRC.lastIndexOf("async ", at) === at - 6 ? at - 6 : at;
-  const end = RAW_SRC.indexOf("\n}\n", at);
-  assert.ok(end > at, `${name} 没有行首收尾大括号`);
-  return RAW_SRC.slice(start, end + 2);
-}
+import { CODE as SRC, SRC as RAW_SRC, fnSource as topLevelFn } from "./helpers/source.mjs";
 const constLine = (name) => {
   const i = RAW_SRC.indexOf(`const ${name} =`);
   assert.ok(i > 0, `找不到常量 ${name}`);
@@ -305,18 +296,12 @@ test("类型入口要跟随 re-export，否则导出集永远是空的", async (
   // _readPackageTypeEntry 的外层 try/catch 会把它吞成"没读到类型入口"——症状和真失败
   // 一模一样，最容易查错方向。
   const api = new Function("backend", "TS_PACKAGE_TYPE_MAX_BYTES", "TS_TYPE_REEXPORT_MAX_FILES",
-    fnSrc("_typeEntryCandidatesFromPackageJson") + fnSrc("_followTypeReexports")
-    + fnSrc("_readPackageTypeEntry") + fnSrc("_extractExportNames")
+    topLevelFn("_typeEntryCandidatesFromPackageJson") + topLevelFn("_followTypeReexports")
+    + topLevelFn("_readPackageTypeEntry") + topLevelFn("_extractExportNames")
     + ";return _readPackageTypeEntry;")(backend, 256 * 1024, 8);
 
   const entry = await api("/p", "vite");
   assert.ok(entry, "没读到类型入口");
   assert.ok(entry.exports.includes("defineConfig"), `export * 没跟上：${entry.exports}`);
   assert.ok(entry.exports.includes("createServer"), `具名再导出没跟上：${entry.exports}`);
-
-  function fnSrc(name) {
-    const at = RAW_SRC.indexOf(`function ${name}(`);
-    const start = RAW_SRC.lastIndexOf("async ", at) === at - 6 ? at - 6 : at;
-    return RAW_SRC.slice(start, RAW_SRC.indexOf("\n}\n", at) + 2);
-  }
 });

@@ -4,26 +4,22 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import fs from "node:fs";
-import * as acorn from "acorn";
-
-const SRC = fs.readFileSync("src/main.js", "utf8");
-const ast = acorn.parse(SRC, { ecmaVersion: "latest", sourceType: "module" });
-function grab(name) {
-  for (const n of ast.body) {
-    if (n.type === "FunctionDeclaration" && n.id?.name === name) return SRC.slice(n.start, n.end);
-    if (n.type === "VariableDeclaration")
-      for (const d of n.declarations)
-        if (d.id?.name === name && d.init) return "const " + name + " = " + SRC.slice(d.init.start, d.init.end) + ";";
-  }
-  throw new Error("missing " + name);
-}
+// 按名字取真源码只有一份实现：test/helpers/source.mjs 的 fnSource（acorn 按 AST 边界切）。
+// 这个文件后面还对源码原文下断言，所以 SRC 仍绑定 main.js 原文。
+import { SRC, load } from "./helpers/source.mjs";
 // 依赖既可能在构造时缺，也可能在**调用时**才缺（默认参数、函数体里的调用）。
 // 所以既在构造时补，也在一次真实调用里补，直到不再抛 ReferenceError。
-const load = async () => {
+//
+// 依赖是 helper 的 load() 按名字从 main.js 抓的真源码，只有一处例外：命中 OVERRIDES 的
+// 名字换成字面量。这里唯一命中的是 _AI_MODEL_RETRY_DELAY_MS（生产值 2_000）——下面
+// 「出字之前就失败的，仍然走重试」那条守的是走哪条分支，和退避时长毫无关系，却因为
+// 依赖照抄生产常量而真睡一次 equal-jitter 的随机 1–2 秒，是整个套件最慢的一条，且每次
+// 时长都不一样。退避曲线本身在 logic.test.mjs 里另有专测。
+const resolveRealFn = async () => {
   // _modelEventHasProgress 在回调里被调用，它的 ReferenceError 会被吞成 attemptError
   // 字符串，探针看不见，所以直接点名。
   const need = ["_modelEventHasProgress", "_runModelRequestWithRetry"];
-  const build = () => new Function(need.map(grab).join("\n") + "\nreturn _runModelRequestWithRetry;")();
+  const build = () => load("_runModelRequestWithRetry", need);
   for (let i = 0; i < 60; i++) {
     let fn;
     try { fn = build(); } catch (e) {
@@ -59,7 +55,7 @@ const load = async () => {
   }
   throw new Error("unresolved deps: " + need.join(","));
 };
-const run = await load();
+const run = await resolveRealFn();
 
 // 一个会在出了 N 个 token 之后断线的假模型
 const flaky = (failAfter, failures) => {

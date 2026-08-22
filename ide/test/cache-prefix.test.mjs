@@ -6,49 +6,15 @@
 //   2. 场景→工具直觉表 + 完整能力名录：字节稳定的纯字面量只有待在 system 末尾才有缓存收益；
 //      拼在每轮 user 消息尾部是每轮重付，折叠开场消息时还会整段消失。
 //
-// 真函数从 src/main.js 里用 acorn 抠出来跑（同 prefix-cache.test.mjs），不复刻逻辑。
+// 真函数从 src/main.js 里用 acorn 抠出来跑（test/helpers/source.mjs 的 fnSource），不复刻逻辑。
 // 源码断言先剥注释再匹配：注释里引用旧代码就能把断言喂绿。
 import assert from "node:assert/strict";
 import test from "node:test";
-import fs from "node:fs";
-import * as acorn from "acorn";
+import { fnSource, load, loadConst } from "./helpers/source.mjs";
 import { toolCapabilityIndex } from "../src/tool-guides.js";
 
-const SRC = fs.readFileSync("src/main.js", "utf8");
-const comments = [];
-const ast = acorn.parse(SRC, { ecmaVersion: "latest", sourceType: "module", onComment: comments });
-function grab(name) {
-  for (const n of ast.body) {
-    if (n.type === "FunctionDeclaration" && n.id?.name === name) return SRC.slice(n.start, n.end);
-  }
-  throw new Error("missing " + name);
-}
-// 把注释替换成等长空白，函数边界不动，抠出来的片段照样按名字定位。
-const CODE = (() => {
-  let out = SRC;
-  for (const c of comments) out = out.slice(0, c.start) + " ".repeat(c.end - c.start) + out.slice(c.end);
-  return out;
-})();
-function grabCode(name) {
-  for (const n of ast.body) {
-    if (n.type === "FunctionDeclaration" && n.id?.name === name) return CODE.slice(n.start, n.end);
-  }
-  throw new Error("missing " + name);
-}
-// 顶层 const 的值（用于把 main.js 里的模块级常量注入被抽出来的函数）。
-function loadConst(name) {
-  for (const n of ast.body) {
-    if (n.type !== "VariableDeclaration") continue;
-    for (const d of n.declarations) {
-      if (d.id?.type === "Identifier" && d.id.name === name) return new Function(`return ${SRC.slice(d.init.start, d.init.end)};`)();
-    }
-  }
-  throw new Error("missing const " + name);
-}
-function load(name, deps = {}) {
-  const keys = Object.keys(deps);
-  return new Function(...keys, `${grab(name)}\nreturn ${name};`)(...keys.map((k) => deps[k]));
-}
+/** 剥了注释的函数源码：正向源码断言跑在这上面。 */
+const grabCode = (name) => fnSource(name, { code: true });
 
 // ---------------------------------------------------------------------------
 // 1. 历史里的图片消息

@@ -19,26 +19,7 @@ const HERE = dirname(fileURLToPath(import.meta.url));
 // 只在注释里留一句，assert.match 照样绿——本仓库已经这样漏过一整组模型可见的工具契约。
 // 所以 `SRC` 绑定的是 CODE（注释整段置空，行号与偏移和原文一字不差）；
 // 真要匹配注释本身的断言显式用 RAW_SRC，并在那一行写清为什么。
-import { CODE as SRC, SRC as RAW_SRC } from "./helpers/source.mjs";
-
-function extractFn(name) {
-  const i = RAW_SRC.indexOf(`function ${name}(`);
-  assert.ok(i >= 0, `main.js 里找不到 ${name}`);
-  let depth = 0, j = RAW_SRC.indexOf("{", RAW_SRC.indexOf(")", i));
-  for (; j < RAW_SRC.length; j++) {
-    const c = RAW_SRC[j], d = RAW_SRC[j + 1];
-    if (c === "/" && d === "/") { j = RAW_SRC.indexOf("\n", j); if (j < 0) j = RAW_SRC.length; continue; }
-    if (c === "/" && d === "*") { j = RAW_SRC.indexOf("*/", j + 2) + 1; continue; }
-    if (c === '"' || c === "'" || c === "`") {
-      const q = c;
-      for (j++; j < RAW_SRC.length; j++) { if (RAW_SRC[j] === "\\") { j++; continue; } if (RAW_SRC[j] === q) break; }
-      continue;
-    }
-    if (c === "{") depth++;
-    else if (c === "}") { depth--; if (!depth) break; }
-  }
-  return RAW_SRC.slice(i, j + 1);
-}
+import { CODE as SRC, SRC as RAW_SRC, fnSource, fnSource as extractFn } from "./helpers/source.mjs";
 
 function decl(name) {
   const i = RAW_SRC.indexOf(`const ${name} = `);
@@ -263,16 +244,10 @@ test("启动后有一个能点的授权入口", () => {
 });
 
 // —— 对话框正文的排版 ——
-// 顶层函数按"行首单独一个 }"收尾来切。上面那个括号匹配器不认正则字面量，
-// 而 _dialogBodyHtml 里有 /[&<>"]/g —— 里面那个引号会被当成字符串开头，一路跑飞。
-function extractTopLevelFn(name) {
-  const i = RAW_SRC.indexOf(`function ${name}(`);
-  assert.ok(i >= 0, `找不到 ${name}`);
-  const end = RAW_SRC.indexOf("\n}\n", i);
-  assert.ok(end > i, `${name} 没有行首收尾的大括号`);
-  return SRC.slice(i, end + 2);
-}
-const dialogHtml = new Function(`${extractTopLevelFn("_dialogBodyHtml")}\n;return _dialogBodyHtml;`)();
+// 这里要的是**剥掉注释**的那一份源码：_dialogBodyHtml 的注释里写着渲染前的原始写法，
+// 不剥的话「渲染后不该还剩星号」之类的断言会看见注释里的星号。
+const codeOf = (name) => fnSource(name, { code: true });
+const dialogHtml = new Function(`${codeOf("_dialogBodyHtml")}\n;return _dialogBodyHtml;`)();
 
 test("强调不会以星号残渣的形式漏到界面上", () => {
   const out = dialogHtml("开关**看起来是开的**，但已失效");
@@ -305,7 +280,7 @@ test("空正文不产出空段落", () => {
 });
 
 test("对话框真的用了这个渲染，而不是直接 esc 塞进去", () => {
-  const dlg = extractTopLevelFn("_confirmDialog");
+  const dlg = codeOf("_confirmDialog");
   assert.match(dlg, /_dialogBodyHtml\(body\)/, "正文必须走排版函数");
   assert.doesNotMatch(dlg, /line-height:1\.6">\$\{esc\(body\)\}/, "不能再整段 esc 直塞");
 });
@@ -345,7 +320,7 @@ test("设计证据在首个模型回合之前有界等待，不是发完就走",
 test("界面活会自动去取设计蓝图，不用用户提醒", () => {
   // 这条进的是随 system 前缀发送、字节稳定的场景直觉表——每一轮都在，
   // 所以模型碰到界面活时的第一反应就是先取蓝图，而不是凭印象编色。
-  const hint = extractTopLevelFn("_buildToolHint");
+  const hint = codeOf("_buildToolHint");
   assert.match(hint, /michael-design/, "场景直觉表必须把界面活指向 michael-design");
   assert.match(hint, /界面|UI/, "要说清什么算界面活");
 });

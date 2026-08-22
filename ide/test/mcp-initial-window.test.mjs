@@ -22,15 +22,7 @@ const HERE = dirname(fileURLToPath(import.meta.url));
 // 只在注释里留一句，assert.match 照样绿——本仓库已经这样漏过一整组模型可见的工具契约。
 // 所以 `SRC` 绑定的是 CODE（注释整段置空，行号与偏移和原文一字不差）；
 // 真要匹配注释本身的断言显式用 RAW_SRC，并在那一行写清为什么。
-import { CODE as SRC, SRC as RAW_SRC } from "./helpers/source.mjs";
-
-function topLevelFn(name) {
-  const at = RAW_SRC.indexOf(`function ${name}(`);
-  assert.ok(at > 0, `找不到 ${name}`);
-  const end = RAW_SRC.indexOf("\n}\n", at);
-  assert.ok(end > at, `${name} 没有行首收尾大括号`);
-  return RAW_SRC.slice(at, end + 2);
-}
+import { CODE as SRC, SRC as RAW_SRC, fnSource as topLevelFn } from "./helpers/source.mjs";
 
 // 和 main.js 的 agent 核心表保持一致。2026-08-18 扩窗：取外部资源那五个进了核心
 // （用户点名——不进窗口就意味着"要多花一轮取 schema"，模型在难任务上永远不会选它们）。

@@ -10,31 +10,11 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
+// 按名字取真源码 + 注入依赖跑起来，只有一份实现：test/helpers/source.mjs。
+import { fnSource as extractFn, load } from "./helpers/source.mjs";
 
 const SRC = fs.readFileSync("src/main.js", "utf8");
 
-function extractFn(name) {
-  const m = new RegExp(`(?:async\\s+)?function\\s+${name}\\s*\\(`).exec(SRC);
-  if (!m) throw new Error(`function ${name} not found`);
-  let i = SRC.indexOf("{", SRC.indexOf(")", m.index)), depth = 0;
-  for (; i < SRC.length; i++) {
-    const c = SRC[i], d = SRC[i + 1];
-    if (c === "/" && d === "/") { i = SRC.indexOf("\n", i); if (i < 0) i = SRC.length; continue; }
-    if (c === "/" && d === "*") { i = SRC.indexOf("*/", i + 2) + 1; continue; }
-    if (c === "'" || c === '"' || c === "`") {
-      const q = c;
-      for (i++; i < SRC.length; i++) { if (SRC[i] === "\\") { i++; continue; } if (SRC[i] === q) break; }
-      continue;
-    }
-    if (c === "{") depth++;
-    else if (c === "}") { depth--; if (depth === 0) return SRC.slice(m.index, i + 1); }
-  }
-  throw new Error(`unbalanced braces in ${name}`);
-}
-function load(name, deps = {}) {
-  const keys = Object.keys(deps);
-  return new Function(...keys, `${extractFn(name)}\n;return ${name};`)(...keys.map((k) => deps[k]));
-}
 
 const SKILLS = [
   { id: "file:/s/a/SKILL.md", name: "ui-ux-pro-max", desc: "UI/UX design intelligence: styles, palettes, font pairings.", prompt: "A".repeat(44_000) },

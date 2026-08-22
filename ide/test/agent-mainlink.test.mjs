@@ -2,20 +2,9 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import fs from "node:fs";
-import * as acorn from "acorn";
 import { SharedStore } from "../src/agent/shared-store.js";
-
-const SRC = fs.readFileSync(new URL("../src/main.js", import.meta.url), "utf8");
-const ast = acorn.parse(SRC, { ecmaVersion: "latest", sourceType: "module" });
-function grab(name) {
-  for (const n of ast.body) {
-    if (n.type === "FunctionDeclaration" && n.id?.name === name) return SRC.slice(n.start, n.end);
-    if (n.type === "VariableDeclaration")
-      for (const d of n.declarations)
-        if (d.id?.name === name && d.init) return "const " + name + " = " + SRC.slice(d.init.start, d.init.end) + ";";
-  }
-  throw new Error("missing " + name);
-}
+// 按名字取真源码只有一份实现：test/helpers/source.mjs 的 fnSource（acorn 按 AST 边界切）。
+import { fnSource as grab } from "./helpers/source.mjs";
 // 黑板键带 run 前缀（_smRunToken）：jobId 是 run 内的编号，而 SharedStore 是全局的，
 // 不带前缀两个标签页的 job#1 会写进同一条记录。这里注入真实实现，不用桩——
 // 键怎么拼正是这组测试要守的东西。

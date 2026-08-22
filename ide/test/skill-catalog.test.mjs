@@ -21,15 +21,7 @@ const HERE = dirname(fileURLToPath(import.meta.url));
 // 只在注释里留一句，assert.match 照样绿——本仓库已经这样漏过一整组模型可见的工具契约。
 // 所以 `SRC` 绑定的是 CODE（注释整段置空，行号与偏移和原文一字不差）；
 // 真要匹配注释本身的断言显式用 RAW_SRC，并在那一行写清为什么。
-import { CODE as SRC, SRC as RAW_SRC } from "./helpers/source.mjs";
-
-function topLevelFn(name) {
-  const at = RAW_SRC.indexOf(`function ${name}(`);
-  assert.ok(at > 0, `找不到 ${name}`);
-  const end = RAW_SRC.indexOf("\n}\n", at);
-  assert.ok(end > at, `${name} 没有行首收尾大括号`);
-  return RAW_SRC.slice(at, end + 2);
-}
+import { CODE as SRC, SRC as RAW_SRC, fnSource as topLevelFn } from "./helpers/source.mjs";
 
 // _skillCatalogBlock 读的是模块级的 _fileSkills / _loadSkillsLocal / _isSkillActive，
 // 全部注入成桩，这样测的就是真实那段代码本身。

@@ -8,17 +8,9 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import fs from "node:fs";
-import * as acorn from "acorn";
-
-const SRC = fs.readFileSync("src/main.js", "utf8");
-const ast = acorn.parse(SRC, { ecmaVersion: "latest", sourceType: "module" });
-function grab(name) {
-  for (const n of ast.body) {
-    if (n.type === "FunctionDeclaration" && n.id?.name === name) return SRC.slice(n.start, n.end);
-  }
-  throw new Error("missing " + name);
-}
-const load = (name, need) => new Function(need.map(grab).join("\n") + `\nreturn ${name};`)();
+// 按名字取真源码 + 拼依赖闭包跑起来，只有一份实现：test/helpers/source.mjs。
+// 这个文件的源码断言历来跑在**原文**上，所以 SRC 仍绑定 main.js 原文，不动。
+import { SRC, fnSource as grab, load } from "./helpers/source.mjs";
 
 const stable = load("_sessionStableSemanticProfile", ["_sessionStableSemanticProfile"]);
 const profileOf = load("_ideSemanticProfile", ["_ideSemanticProfile"]);
