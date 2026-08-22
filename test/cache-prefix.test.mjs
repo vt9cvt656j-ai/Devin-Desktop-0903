@@ -35,6 +35,16 @@ function grabCode(name) {
   }
   throw new Error("missing " + name);
 }
+// 顶层 const 的值（用于把 main.js 里的模块级常量注入被抽出来的函数）。
+function loadConst(name) {
+  for (const n of ast.body) {
+    if (n.type !== "VariableDeclaration") continue;
+    for (const d of n.declarations) {
+      if (d.id?.type === "Identifier" && d.id.name === name) return new Function(`return ${SRC.slice(d.init.start, d.init.end)};`)();
+    }
+  }
+  throw new Error("missing const " + name);
+}
 function load(name, deps = {}) {
   const keys = Object.keys(deps);
   return new Function(...keys, `${grab(name)}\nreturn ${name};`)(...keys.map((k) => deps[k]));
@@ -131,6 +141,9 @@ test("the opener fold still reaches an opener that carries images", () => {
   // 旧图附在本轮消息末尾之后，纯文字轮的开场消息也可能是多模态数组；折叠只认字符串的话，
   // 这几轮的项目上下文（目录树 + 当前文件转储）在长 run 里就永远折不掉。
   const trim = load("_trimMessagesIfHuge", {
+    _DEMAND_LEDGER_HEAD: loadConst("_DEMAND_LEDGER_HEAD"),
+    // 折叠的保留段引用了账本标题常量（见 _DEMAND_LEDGER_HEAD）——从源码取真值注入，
+    // 别手抄字符串：手抄过一次，标题改名后测试照绿而功能已经死了。
     _perfPhase: () => {},
     _gatewayHandlesCompression: () => false,
     _mcPrefixInvalidate: () => {},
