@@ -112,10 +112,13 @@ pub async fn ws_handler(ws: WebSocketUpgrade, State(state): State<AppState>) -> 
 /// unauthenticated socket must never reach `stream_feed`.
 const WS_AUTH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
-/// How often a still-open feed socket re-checks that its owner is still an admin.
+/// How often a still-open feed socket re-checks that it is still allowed to be open.
 /// Without this, a socket opened while the user WAS an admin keeps streaming for as
 /// long as it stays connected, which for this feed can be days.
-const WS_ROLE_RECHECK: std::time::Duration = std::time::Duration::from_secs(300);
+///
+/// 「还允许开着」是两件事，不是一件：这个账号现在还是不是管理员，以及**这次登录**本身
+/// 还在不在。原来只查前者，于是「注销该设备」对已经连上的这条 socket 完全不生效。
+const WS_AUTH_RECHECK: std::time::Duration = std::time::Duration::from_secs(300);
 
 /// Is this user an admin *right now*, according to the users table?
 ///
@@ -138,8 +141,12 @@ async fn is_admin_now(state: &AppState, uid: uuid::Uuid) -> bool {
 ///
 /// The browser cannot set an Authorization header on a WebSocket, and putting the
 /// token in the query string would write it into nginx's access log, so the token
-/// travels in the first message instead. Returns the admin's user id on success.
-async fn ws_authenticate(socket: &mut WebSocket, state: &AppState) -> Option<uuid::Uuid> {
+/// travels in the first message instead. Returns the admin's user id and the id of the
+/// session that token names, on success.
+async fn ws_authenticate(
+    socket: &mut WebSocket,
+    state: &AppState,
+) -> Option<(uuid::Uuid, Option<uuid::Uuid>)> {
     let first = match tokio::time::timeout(WS_AUTH_TIMEOUT, socket.recv()).await {
         Ok(Some(Ok(Message::Text(text)))) => text,
         _ => return None,
@@ -151,11 +158,26 @@ async fn ws_authenticate(socket: &mut WebSocket, state: &AppState) -> Option<uui
     let token = frame.get("token").and_then(|v| v.as_str())?;
     let claims = crate::auth::claims_from_jwt(&state.db, &state.cfg, token).await?;
     let uid = uuid::Uuid::parse_str(&claims.sub).ok()?;
-    is_admin_now(state, uid).await.then_some(uid)
+    // sid 要一路带到 stream_feed：连上之后每次复查都得拿它去问「这次登录还在吗」。
+    // `claims_from_jwt` 在这里已经查过一次了，但那只覆盖握手的那一瞬间。
+    // 没有 sid 的是 sessions 表出现之前签发的老令牌，`session_is_live` 照原样放行
+    // （`SESSION_LIVE_SQL` 的 `$2::uuid IS NULL OR …`）—— 也就是说这道复查对它们是
+    // **fail-open**：吊销设备之后，这类连接不会掉线。
+    //
+    // 这个口子有尽头，不是长期属性，2026-08-22 核过：全仓只有 `auth::issue_token`
+    // 一处签发令牌（`grep -n "encode(&Header"` 只此一家），而它无条件写
+    // `sid: Some(sid.to_string())`。所以今天发出去的每一把令牌都带 sid，剩下的只有
+    // 存量老令牌，JWT 30 天，随时间自然清零。
+    //
+    // 别照着 `device_id` 那条推断这里也一样 —— 那一条**不是**有尽头的：handoff 的
+    // redeem 今天仍在以 `device_id: None` 建会话（见 sessions.rs 里 revoke 的注释）。
+    // 两处形状像，结论相反，判据是「今天还在不在产生新的空值」。
+    let sid = claims.sid.as_deref().and_then(|s| uuid::Uuid::parse_str(s).ok());
+    is_admin_now(state, uid).await.then_some((uid, sid))
 }
 
 async fn handle_socket(mut socket: WebSocket, state: AppState) {
-    let Some(uid) = ws_authenticate(&mut socket, &state).await else {
+    let Some((uid, sid)) = ws_authenticate(&mut socket, &state).await else {
         let _ = socket
             .send(Message::Text(
                 json!({ "type": "auth_error", "error": "需要管理员权限" }).to_string(),
@@ -169,7 +191,7 @@ async fn handle_socket(mut socket: WebSocket, state: AppState) {
         .await;
     let presence = format!("{}{}", PRESENCE_PREFIX, uuid::Uuid::new_v4());
     touch_presence(&state, &presence).await;
-    let result = stream_feed(&mut socket, &state, uid, &presence).await;
+    let result = stream_feed(&mut socket, &state, uid, sid, &presence).await;
     if let Err(e) = result {
         tracing::debug!("ws closed: {}", e.msg);
     }
@@ -180,12 +202,13 @@ async fn stream_feed(
     socket: &mut WebSocket,
     state: &AppState,
     uid: uuid::Uuid,
+    sid: Option<uuid::Uuid>,
     presence: &str,
 ) -> ApiResult<()> {
     let mut pubsub = state.redis_client.get_async_pubsub().await?;
     pubsub.subscribe(FEED_CHANNEL).await?;
     let mut messages = pubsub.on_message();
-    let mut recheck = tokio::time::interval(WS_ROLE_RECHECK);
+    let mut recheck = tokio::time::interval(WS_AUTH_RECHECK);
     recheck.tick().await; // the first tick fires immediately; auth just succeeded
     let mut heartbeat = tokio::time::interval(PRESENCE_REFRESH);
     heartbeat.tick().await; // ditto — touch_presence already ran
@@ -193,9 +216,33 @@ async fn stream_feed(
         tokio::select! {
             _ = heartbeat.tick() => { touch_presence(state, presence).await; }
             _ = recheck.tick() => {
+                // 两件事都要现查，缺一条就漏一种踢人方式。
+                //
+                // 只查 role 的那一版留下的洞：管理员的笔记本丢了，他在另一台机器上从设备
+                // 列表把那次登录注销掉 —— 他自己还是管理员，所以这里判定通过，那台机器上
+                // 已经连着的 socket 照推不误，把全站用户的邮箱、订单和佣金金额一直推到
+                // 30 天令牌自然过期为止。整条认证链上只有这里不查 `revoked_at`：提取器、
+                // user_from_jwt、claims_from_jwt、门禁 cookie 每次调用都查。
+                //
+                // 顺序无所谓，两条都失败时先报哪条都行；分成两条只是为了让前端显示的原因
+                // 是对的（降权 vs 这次登录被移除）。
+                //
+                // 「这次登录还在不在」不在这里自己写一遍 SQL：修上面那个洞时这里一度是
+                // 那条判定的第**三**份手抄件（另两份在 auth.rs 的 user_from_jwt 和
+                // claims_from_jwt 里），而多份手抄正是这个洞本身的成因。判定只有一份文本，
+                // 在 `crate::sessions::SESSION_LIVE_SQL`；查不出来算「不在」的 fail-closed
+                // 语义也在那里，对这条流尤其要紧 —— 它推的是全站用户的邮箱和订单/佣金金额，
+                // 掉线重连的代价远小于多推五分钟。
                 if !is_admin_now(state, uid).await {
                     let _ = socket.send(Message::Text(
                         json!({ "type": "auth_error", "error": "权限已变更" }).to_string(),
+                    )).await;
+                    break;
+                }
+                if !crate::sessions::session_is_live(&state.db, uid, sid).await {
+                    let _ = socket.send(Message::Text(
+                        json!({ "type": "auth_error", "error": "该设备的登录已被移除，请重新登录" })
+                            .to_string(),
                     )).await;
                     break;
                 }
@@ -271,4 +318,89 @@ pub async fn stats(
         "today_users": today,
         "online": online_count(&state).await,
     })))
+}
+
+#[cfg(test)]
+mod tests {
+    /// 剥掉注释再断言。注释里写着「原来只查 role」这类字样，连注释一起扫的话，
+    /// 断言会被注释喂到，把 bug 放回去也照样是绿的。
+    fn code_of(src: &str) -> String {
+        src.lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn body(src: &str) -> &str {
+        &src[..src.find("#[cfg(test)]").unwrap_or(src.len())]
+    }
+
+    /// 已经连上的推送流，每次复查都要同时查「还是不是管理员」和「这次登录还在不在」。
+    ///
+    /// 只查 role 的那一版留下的洞：管理员笔记本丢了，他在另一台机器上把那次登录注销掉，
+    /// 自己仍然是管理员 —— 于是那台机器上已经连着的 socket 判定通过，继续把全站用户的
+    /// 邮箱和订单/佣金金额推满 30 天令牌寿命。整条认证链上只有这里不查 revoked_at。
+    /// 这里没有能连真实数据库的用例，所以钉源码：谁把这段「优化」掉，这条会红并解释原因。
+    #[test]
+    fn an_open_feed_socket_rechecks_the_session_not_just_the_role() {
+        let src = code_of(include_str!("realtime.rs"));
+        let src = body(&src);
+
+        let handshake = src
+            .split("async fn ws_authenticate(")
+            .nth(1)
+            .expect("ws_authenticate");
+        let handshake = &handshake[..handshake.find("async fn handle_socket").unwrap_or(handshake.len())];
+        assert!(
+            handshake.contains("claims.sid"),
+            "sid 必须从令牌里取出来带走 —— 丢掉它，连上之后就没有东西可以复查",
+        );
+
+        let feed = src.split("async fn stream_feed(").nth(1).expect("stream_feed");
+        assert!(
+            feed.contains("sid: Option<uuid::Uuid>"),
+            "这条连接的 sid 要一路带进推送循环",
+        );
+
+        let arm = feed.split("_ = recheck.tick() =>").nth(1).expect("recheck 分支");
+        let arm = &arm[..arm.find("maybe = messages.next()").unwrap_or(arm.len())];
+        // 钉的是**整个条件**，不是被调用的那个函数名。
+        //
+        // 只断言「调用存在」挡不住一次符号翻转：把 `if !session_is_live(…)` 改成
+        // `if session_is_live(…)`，效果是把所有**还活着**的管理员连接踢掉、而所有**已被
+        // 吊销**的继续推流 —— 原漏洞原样回来，还附赠一次线上故障。实测那样改之后
+        // realtime:: 两条测试照样全绿。所以 `!` 和整条 if 都要在断言里。
+        assert!(
+            arm.contains("if !is_admin_now(state, uid).await {"),
+            "降权和删号仍然要现查，而且判据必须是「不再是管理员就断开」——\
+             少一个 ! 就变成「还是管理员才断开」，方向正好反过来",
+        );
+        assert!(
+            arm.contains("if !crate::sessions::session_is_live(&state.db, uid, sid).await {"),
+            "「注销该设备」必须能切断已经连上的这条流，否则设备列表宣传的是个不生效的开关。\
+             同样要钉住 !：符号一翻，被吊销的连接反而是唯一留下来的",
+        );
+        assert_eq!(
+            arm.matches("break;").count(),
+            2,
+            "两条判定各自都要断开连接，任一条不过就不能再推",
+        );
+    }
+
+    /// 这里不许再有第三份手抄的存活判定。
+    ///
+    /// 修「/ws 不查 revoked_at」那个洞时，这个文件里一度原样抄了一份 SQL —— 而洞本身的
+    /// 成因就是同一条规则有多份实现（当时 auth.rs 里已经有两份）。判定的唯一文本在
+    /// `crate::sessions::SESSION_LIVE_SQL`，两份手抄件之间是否还一致由 sessions.rs 的
+    /// `liveness_tests` 逐字比对；这条只盯一件事：realtime 不要把它抄回来。
+    #[test]
+    fn the_recheck_does_not_keep_its_own_copy_of_the_liveness_sql() {
+        let src = code_of(include_str!("realtime.rs"));
+        let src = body(&src);
+        assert!(
+            !src.contains("FROM sessions"),
+            "realtime 又自己写了一条查 sessions 的语句 —— 改调 \
+             crate::sessions::session_is_live()，那条判定只应该有一份文本",
+        );
+    }
 }
