@@ -85,6 +85,94 @@ fn frontmost_now() -> Option<String> {
         .map(|w| w.title)
 }
 
+/// 注入型按键动作的回执：**动作前后各采一次前台**，两个都回出去。
+///
+/// 原来只在动作完成后采一次 delivered_to。可合成按键投给的是**投递那一刻**的前台：
+/// 打一段长文本期间弹窗 / 通知把焦点抢走再还回来，前半截字进了别的窗口，事后采到的
+/// 却还是目标窗口——回执和一次正常输入长得一模一样。CGEventPost 还是异步投递，
+/// 单点事后采样连「事件已消化」都证明不了。前后两次给的是一个**可判定**的信号：
+/// 两次不一致就一定有按键进了别处；一致至少说明起点和终点都是它。
+#[cfg(feature = "system")]
+fn focus_receipt(before: Option<String>, after: Option<String>) -> serde_json::Value {
+    let mut v = serde_json::json!({
+        "status": "ok",
+        "focus_before": before,
+        "delivered_to": after,
+    });
+    match (&before, &after) {
+        (Some(b), Some(a)) if b == a => {
+            v["focus_changed"] = serde_json::Value::Bool(false);
+        }
+        (Some(b), Some(a)) => {
+            v["focus_changed"] = serde_json::Value::Bool(true);
+            v["focus_changed_hint"] = serde_json::Value::String(format!(
+                "输入开始时前台是「{b}」，结束时是「{a}」：至少有一部分按键进了另一个窗口。\
+                 先 read_screen / screen.capture 看目标里实际收到了什么，再决定补发哪一段。"
+            ));
+        }
+        // 读不到前台就是**不知道**，不能报成「没变」——那和报成功是同一种假话。
+        _ => {
+            v["focus_changed"] = serde_json::Value::Null;
+            v["focus_changed_hint"] = serde_json::Value::String(
+                "没读到前台窗口，无法判定按键是否进了目标；用 read_screen / screen.capture 验证后再继续。".into(),
+            );
+        }
+    }
+    v
+}
+
+/// 把一个注入动作夹在两次前台采样之间。采样器注入进来是为了能在没有窗口系统的
+/// 环境里测「先采再动」这个顺序本身。
+#[cfg(feature = "system")]
+fn focus_bracketed_with(
+    sample: impl Fn() -> Option<String>,
+    act: impl FnOnce() -> Result<()>,
+) -> Result<serde_json::Value> {
+    let before = sample();
+    act()?;
+    Ok(focus_receipt(before, sample()))
+}
+
+/// 生产用法：动作持着 agent 锁跑，锁随闭包结束释放，后一次采样不持锁。
+#[cfg(feature = "system")]
+fn focus_bracketed(
+    agent: std::sync::MutexGuard<'_, Agent>,
+    act: impl FnOnce(&mut Agent) -> Result<()>,
+) -> Result<serde_json::Value> {
+    focus_bracketed_with(frontmost_now, move || {
+        let mut agent = agent;
+        act(&mut agent)
+    })
+}
+
+/// 逐条回放一串 {method, params}。分发器注入进来，回放本身不关心方法是怎么执行的。
+///
+/// 第 N 步失败时前面的点击 / 输入已经落到桌面上了。原来这里一个 `?` 把底层错误
+/// （比如 "Missing 'x' parameter"）原样上抛，位置和已执行步数随之丢掉——调用方既不
+/// 知道停在哪，也不知道整条重放会不会把已发生的副作用再来一遍。位置信息放最前面：
+/// IDE 侧只保留错误文案的前 300 字，底层错误可以被截，位置不能。
+fn replay_steps(
+    steps: &[serde_json::Value],
+    delay_ms: u64,
+    mut dispatch: impl FnMut(&str, serde_json::Value) -> Result<serde_json::Value>,
+) -> Result<serde_json::Value> {
+    let total = steps.len();
+    let mut done = 0u64;
+    for (i, step) in steps.iter().enumerate() {
+        let m = step.get("method").and_then(|v| v.as_str()).unwrap_or("");
+        if m.is_empty() { continue; }
+        let p = step.get("params").cloned().unwrap_or_else(|| serde_json::json!({}));
+        dispatch(m, p).map_err(|e| Error::Other(anyhow::anyhow!(
+            "recorder.replay 在第 {}/{} 步（{}）失败；之前已执行 {} 步，它们的副作用已经发生。\
+             续作从第 {} 步开始（steps[{}..]），逐条重发。底层错误：{}",
+            i + 1, total, m, done, i + 1, i, e
+        )))?;
+        done += 1;
+        if delay_ms > 0 { std::thread::sleep(Duration::from_millis(delay_ms)); }
+    }
+    Ok(serde_json::json!({ "status": "ok", "replayed": done }))
+}
+
 impl RpcServer {
     /// 创建新的 RPC 服务器
     pub fn new(port: u16) -> Result<Self> {
@@ -370,9 +458,7 @@ impl RpcServer {
                 let text = params.get("text")
                     .and_then(|v| v.as_str())
                     .ok_or_else(|| Error::Other(anyhow::anyhow!("Missing 'text' parameter")))?;
-                agent.keyboard_type(text)?;
-                drop(agent);
-                Ok(serde_json::json!({"status": "ok", "delivered_to": frontmost_now()}))
+                focus_bracketed(agent, |a| a.keyboard_type(text))
             }
             
             #[cfg(feature = "system")]
@@ -380,27 +466,24 @@ impl RpcServer {
                 let key = params.get("key")
                     .and_then(|v| v.as_str())
                     .ok_or_else(|| Error::Other(anyhow::anyhow!("Missing 'key' parameter")))?;
-                agent.keyboard_press(key)?;
-                drop(agent);
-                Ok(serde_json::json!({"status": "ok", "delivered_to": frontmost_now()}))
+                focus_bracketed(agent, |a| a.keyboard_press(key))
             }
             
             #[cfg(feature = "system")]
             "keyboard.down" => {
                 let key = params.get("key").and_then(|v| v.as_str())
                     .ok_or_else(|| Error::Other(anyhow::anyhow!("Missing 'key' parameter")))?;
-                agent.keyboard_down(key)?;
-                drop(agent);
-                Ok(serde_json::json!({"status": "ok", "delivered_to": frontmost_now(),
-                    "note": "这个键现在是按住状态，用完必须 keyboard.up 松开，否则它会一直卡住影响之后所有输入。"}))
+                let mut receipt = focus_bracketed(agent, |a| a.keyboard_down(key))?;
+                receipt["note"] = serde_json::Value::String(
+                    "这个键现在是按住状态，用完必须 keyboard.up 松开，否则它会一直卡住影响之后所有输入。".into(),
+                );
+                Ok(receipt)
             }
             #[cfg(feature = "system")]
             "keyboard.up" => {
                 let key = params.get("key").and_then(|v| v.as_str())
                     .ok_or_else(|| Error::Other(anyhow::anyhow!("Missing 'key' parameter")))?;
-                agent.keyboard_up(key)?;
-                drop(agent);
-                Ok(serde_json::json!({"status": "ok", "delivered_to": frontmost_now()}))
+                focus_bracketed(agent, |a| a.keyboard_up(key))
             }
             #[cfg(feature = "system")]
             "keyboard.combo" => {
@@ -422,9 +505,7 @@ impl RpcServer {
                         "keyboard.combo 需要 keys：可以是数组 [\"mod\",\"s\"]，也可以直接写 \"mod+s\"。mod = 本平台主修饰键（mac=Cmd，Windows=Ctrl），\"cmd\" 等价；真要按 Windows 键写 \"win\"。每个元素必须是**单个**键名（cmd/ctrl/alt/shift/enter/tab/esc/f1-f12/单个字符），不是整条快捷键。"))),
                 };
                 let key_strs: Vec<&str> = owned.iter().map(|s| s.as_str()).collect();
-                agent.keyboard_combo(key_strs)?;
-                drop(agent);
-                Ok(serde_json::json!({"status": "ok", "delivered_to": frontmost_now()}))
+                focus_bracketed(agent, |a| a.keyboard_combo(key_strs))
             }
             
             #[cfg(feature = "system")]
@@ -477,16 +558,8 @@ impl RpcServer {
                     return Err(Error::Other(anyhow::anyhow!("recorder.replay needs 'steps' or 'name'")));
                 };
                 let delay = params.get("delay_ms").and_then(|v| v.as_u64()).unwrap_or(250);
-                let mut done = 0u64;
-                for step in &steps {
-                    let m = step.get("method").and_then(|v| v.as_str()).unwrap_or("");
-                    if m.is_empty() { continue; }
-                    let p = step.get("params").cloned().unwrap_or_else(|| serde_json::json!({}));
-                    self.execute_method(m, p)?; // 复用同一套分发
-                    done += 1;
-                    if delay > 0 { std::thread::sleep(Duration::from_millis(delay)); }
-                }
-                Ok(serde_json::json!({ "status": "ok", "replayed": done }))
+                // 复用同一套分发；失败时带上停在第几步、已执行几步
+                replay_steps(&steps, delay, |m, p| self.execute_method(m, p))
             }
 
             // ── 窗口/屏幕：平台层早就有（enumerate/activate/screen_info），此前一直没暴露给 RPC，
@@ -676,9 +749,7 @@ impl RpcServer {
             "keyboard.paste" => {
                 let text = params.get("text").and_then(|v| v.as_str())
                     .ok_or_else(|| Error::Other(anyhow::anyhow!("Missing 'text' parameter")))?;
-                agent.quick_paste(text)?;
-                drop(agent);
-                Ok(serde_json::json!({ "status": "ok", "delivered_to": frontmost_now() }))
+                focus_bracketed(agent, |a| a.quick_paste(text))
             }
             _ => Err(Error::Other(anyhow::anyhow!("Unknown method: {}", method))),
         }
@@ -975,5 +1046,135 @@ mod window_list_geometry_tests {
             !whole.contains("macOS 这条路拿不到窗口几何"),
             "又把「拿不到几何」写死成平台事实了"
         );
+    }
+}
+
+#[cfg(all(test, feature = "system"))]
+mod focus_receipt_tests {
+    use super::{focus_bracketed_with, focus_receipt};
+    use std::cell::Cell;
+
+    /// 前台必须在**动作之前**就采过一次，而不是只在事后采。
+    ///
+    /// 修复前 keyboard.type/press/down/up/combo/paste 六条都是动作完成后采一次
+    /// frontmost 当 delivered_to：打长文本期间焦点被弹窗抢走又还回来，前半截进了
+    /// 别的窗口，事后采到的仍是目标——回执和一次正常输入完全一样。
+    #[test]
+    fn samples_focus_before_the_action_not_only_after() {
+        let calls = Cell::new(0u32);
+        let sample = || {
+            calls.set(calls.get() + 1);
+            Some(if calls.get() == 1 { "目标编辑器" } else { "更新弹窗" }.to_string())
+        };
+        let v = focus_bracketed_with(&sample, || {
+            assert_eq!(calls.get(), 1, "动作开始前必须已经采过一次前台");
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(calls.get(), 2, "动作前后各一次，总共两次");
+        assert_eq!(v["status"], "ok");
+        assert_eq!(v["focus_before"], "目标编辑器");
+        assert_eq!(v["delivered_to"], "更新弹窗");
+        assert_eq!(v["focus_changed"], true);
+        let hint = v["focus_changed_hint"].as_str().expect("前后不一致必须带可读的说明");
+        assert!(hint.contains("目标编辑器") && hint.contains("更新弹窗"), "说明里要点名两个窗口: {hint}");
+    }
+
+    #[test]
+    fn unchanged_focus_is_reported_as_unchanged_without_a_hint() {
+        let v = focus_receipt(Some("A".into()), Some("A".into()));
+        assert_eq!(v["status"], "ok");
+        assert_eq!(v["focus_before"], "A");
+        assert_eq!(v["delivered_to"], "A");
+        assert_eq!(v["focus_changed"], false);
+        assert!(v.get("focus_changed_hint").is_none(), "没变就别多一句话");
+    }
+
+    /// 读不到前台 = 不知道，不能报成 false。
+    #[test]
+    fn unknown_focus_is_null_not_false() {
+        for (b, a) in [(None, Some("A".to_string())), (Some("A".to_string()), None), (None, None)] {
+            let v = focus_receipt(b, a);
+            assert!(v["focus_changed"].is_null(), "{v}");
+            assert!(!v["focus_changed_hint"].as_str().unwrap_or("").is_empty(), "{v}");
+        }
+    }
+
+    #[test]
+    fn a_failed_action_yields_no_receipt() {
+        let r = focus_bracketed_with(|| Some("A".into()), || Err(crate::error::Error::System("x".into())));
+        assert!(r.is_err());
+    }
+
+    /// 六条注入型按键方法都必须走 focus_bracketed，不能有任何一条退回「事后采一次」。
+    #[test]
+    fn every_keyboard_method_is_focus_bracketed() {
+        let src = include_str!("rpc.rs");
+        let prod = src.split("\n#[cfg(test)]").next().unwrap_or(src);
+        for m in ["keyboard.type", "keyboard.press", "keyboard.down", "keyboard.up", "keyboard.combo", "keyboard.paste"] {
+            let pat = format!("\"{m}\" => {{");
+            let at = prod.find(&pat).unwrap_or_else(|| panic!("{m} 这条分发不见了"));
+            let rest = &prod[at + pat.len()..];
+            // 下一条 match 分支从 12 空格缩进的 `"` 或 `_ =>` 或 `#[cfg` 开始
+            let end = ["\n            \"", "\n            _ =>", "\n            #[cfg"]
+                .iter()
+                .filter_map(|p| rest.find(p))
+                .min()
+                .unwrap_or(rest.len());
+            let body: String = rest[..end]
+                .lines()
+                .filter(|l| !l.trim_start().starts_with("//"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(body.contains("focus_bracketed("), "{m} 没走前后双采样: {body}");
+            assert!(!body.contains("\"delivered_to\": frontmost_now()"), "{m} 又退回只在事后采一次了");
+        }
+    }
+}
+
+#[cfg(test)]
+mod replay_context_tests {
+    use super::replay_steps;
+    use crate::error::Error;
+    use serde_json::json;
+
+    /// 第 N 步失败时前 N-1 步的副作用已经落到桌面上；错误必须说清停在哪、已执行几步。
+    #[test]
+    fn a_mid_replay_failure_names_the_step_and_the_count_already_executed() {
+        let steps = vec![
+            json!({"method": "a.one", "params": {}}),
+            json!({"method": ""}), // 空 method 跳过，不计入已执行
+            json!({"method": "b.two", "params": {"x": 1}}),
+            json!({"method": "c.three"}),
+        ];
+        let mut seen = vec![];
+        let err = replay_steps(&steps, 0, |m, _p| {
+            seen.push(m.to_string());
+            if m == "b.two" {
+                Err(Error::Other(anyhow::anyhow!("Missing 'y' parameter")))
+            } else {
+                Ok(json!({"status": "ok"}))
+            }
+        })
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("第 3/4 步"), "{msg}");
+        assert!(msg.contains("b.two"), "{msg}");
+        assert!(msg.contains("已执行 1 步"), "{msg}");
+        assert!(msg.contains("steps[2..]"), "{msg}");
+        assert!(msg.contains("Missing 'y' parameter"), "底层错误不能丢: {msg}");
+        assert!(
+            msg.find("第 3/4 步").unwrap() < msg.find("Missing 'y'").unwrap(),
+            "位置信息要排在底层错误前面——IDE 侧只保留前 300 字: {msg}"
+        );
+        assert_eq!(seen, vec!["a.one", "b.two"], "失败之后不能继续执行后面的步骤");
+    }
+
+    #[test]
+    fn a_clean_replay_keeps_the_old_receipt_shape() {
+        let steps = vec![json!({"method": "a"}), json!({"method": ""}), json!({"method": "b"})];
+        let v = replay_steps(&steps, 0, |_m, _p| Ok(json!({}))).unwrap();
+        assert_eq!(v["status"], "ok");
+        assert_eq!(v["replayed"], 2);
     }
 }
