@@ -80,5 +80,42 @@ echo "── 工具目录两份是否同步 ──"
   || fail "main.js 和 server/prompts/tools.json 的工具描述漂了。同步脚本只对齐 schema、
    不覆盖描述，所以描述改动必须两边都写。跑 node build/sync-tools-json.mjs 看差在哪。"
 
+echo "── Actions 还跑不跑得起来（计费）──"
+# 前面所有检查查的都是「代码能不能打出包」。这一条查的是「流水线**允不允许**开始跑」，
+# 它和代码质量完全无关，却能让一次打 tag 彻底白费。
+#
+# 私有仓的 macOS runner 按 10 倍计费，一次三平台打包约 700 计费分钟。额度烧穿之后，
+# 三个 job **一个都不会启动**，整个 run 5–9 秒就 failure。最坑的是失败原因
+# **只在 annotation 里**，`gh run view --log-failed` 什么都看不到（日志本来就不存在），
+# 于是现象是「刚才还好好的，现在 7 秒就挂，没有任何日志」——极容易被当成代码问题去查。
+# 2026-08-21 的 v0.4.10 就是这么废掉的：tag 推了、包没出、release 也没建。
+#
+# 计费额度的 REST 接口要 `user` scope，而发版用的 token 通常没有（gh 会报 404 +
+# "needs the user scope"）。所以这里不查额度，直接查**最近有没有出现过这个形状的失败**：
+# 极短耗时 + failure + annotation 里带计费字样。这一条不需要任何额外权限。
+if command -v gh >/dev/null 2>&1; then
+  billing_hit=""
+  # 只看最近 5 次；再往前的失败可能早就被处理掉了。
+  for rid in $(gh run list --limit 5 --json databaseId,conclusion \
+                 --jq '.[] | select(.conclusion=="failure") | .databaseId' 2>/dev/null); do
+    if gh run view "$rid" 2>/dev/null | grep -qiE "spending limit|payments have failed"; then
+      billing_hit="$rid"
+      break
+    fi
+  done
+  if [ -n "$billing_hit" ]; then
+    fail "GitHub Actions 现在跑不起来：最近一次失败（run $billing_hit）的原因是账户计费
+   —— 'recent account payments have failed or your spending limit needs to be increased'。
+   三个打包 job 一个都不会启动，现在打 tag 只会白费一个版本号。
+   先去 GitHub → Settings → Billing & plans 处理付款/提高额度，再回来发版。
+   注意：**别用「把仓库改成公开」来绕过**。这个仓库是刻意保持私有的——里面有未混淆的
+   main.js，而整条打包流水线的意义就是剥掉它的工具描述和编排逻辑。
+   验证是否解封（7 秒出结果、不产生费用）：
+     gh workflow run main.yml --ref \$(git rev-parse --abbrev-ref HEAD) && sleep 12 && gh run list --limit 1"
+  fi
+else
+  echo "   （跳过：没装 gh CLI）"
+fi
+
 echo
 echo "✅ 全部通过，可以打 tag 了。"
