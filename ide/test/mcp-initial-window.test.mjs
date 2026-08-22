@@ -27,11 +27,23 @@ import { CODE as SRC, SRC as RAW_SRC, fnSource as topLevelFn } from "./helpers/s
 // 和 main.js 的 agent 核心表保持一致。2026-08-18 扩窗：取外部资源那五个进了核心
 // （用户点名——不进窗口就意味着"要多花一轮取 schema"，模型在难任务上永远不会选它们）。
 // 这个文件守的是"MCP 不许挤爆窗口"，那个保证与扩窗无关，仍然成立。
-const CORE = ["read_file", "list_dir", "search", "find_files", "update_plan", "ask_user",
+// 2026-08-22 再扩一个：knowledge_search——查外部的六个全在窗口里、查自家 22 域语料的那一个
+// 不在，于是"两条路结果差不多时模型走便宜的那条"就只朝一个方向生效。
+const CORE = ["read_file", "list_dir", "search", "find_files", "update_plan", "ask_user", "think",
               "write_file", "edit_file", "multi_edit", "run_cmd", "run_in_terminal", "read_logs",
               "save_skill", "mcp_server",
               "web_search", "web_fetch", "github_search", "github_repo",
-              "developer_community_search", "package_search"];
+              "developer_community_search", "package_search", "knowledge_search"];
+
+// 上面这份 CORE 是**手抄的副本**，抄错或漏跟一次，下面每条 deepEqual 都会守着一条早已
+// 不存在的边界，而且全是绿的。所以先和 main.js 的真表对一遍：漂了当场红。
+test("这个文件里的 CORE 副本必须和 main.js 的 agent 核心表逐字一致", () => {
+  const table = /agent: \["read_file"[\s\S]*?\],\n  \};/.exec(SRC);
+  assert.ok(table, "agent 核心表被改名或挪走了，这条对账失去落点");
+  const real = [...table[0].matchAll(/"([a-z_]+)"/g)].map((m) => m[1]);
+  assert.deepEqual([...CORE].sort(), [...real].sort(),
+    "本文件的 CORE 和 main.js 的核心表分叉了——下面那些 deepEqual 守的就不再是真实窗口");
+});
 
 function selector() {
   return new Function(

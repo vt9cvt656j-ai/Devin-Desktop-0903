@@ -22,6 +22,8 @@ const intentText = load("_aiIntentText");
 const intentList = load("_aiIntentList", { _aiIntentText: intentText });
 const DIMS = loadConst("_AI_INTENT_DIMENSIONS");
 
+const KNOWLEDGE_DOMAIN = load("_aiIntentKnowledgeDomain", { _AI_KNOWLEDGE_DOMAINS: loadConst("_AI_KNOWLEDGE_DOMAINS") });
+
 function normalizeDeps() {
   return {
     _AI_INTENT_DIMENSIONS: DIMS,
@@ -41,6 +43,8 @@ function normalizeDeps() {
     _RUNTIME_OBLIGATION_ORDER: ["build", "run", "test", "install", "package"],
     _EXTERNAL_OBLIGATION_ORDER: ["commit", "push", "sync", "pr", "deploy", "upload", "download", "database", "automation", "external"],
     _aiIntentEnum: load("_aiIntentEnum"),
+    // 领域字段走独立的白名单归一（目录名带连字符，_aiIntentEnum 不认下划线写法）。
+    _aiIntentKnowledgeDomain: KNOWLEDGE_DOMAIN,
     _aiIntentText: intentText,
     _aiIntentList: intentList,
     _userRoleMap: () => new Map(),
@@ -48,7 +52,7 @@ function normalizeDeps() {
 }
 
 const normalize = load("_normalizeAiIntentVerdict", normalizeDeps());
-const merge = load("_mergeAiIntentProfile", { _AI_INTENT_DIMENSIONS: DIMS });
+const merge = load("_mergeAiIntentProfile", { _AI_INTENT_DIMENSIONS: DIMS, _aiIntentKnowledgeDomain: KNOWLEDGE_DOMAIN });
 
 const FULL_RAW = {
   semantic: { goal: "修复登录", action: "debug", target: "登录请求", continuation: "new", confidence: 0.9, ambiguities: [] },
@@ -145,6 +149,8 @@ test("partial 不关闭迟到补救：完整裁决落定后照样整体覆盖", 
     _sessionStableSemanticProfile: (s, h) => h,
     _ideSemanticProfile: () => "2.5:",
     _startMichaelDesignPreflight: () => null,
+    // 专业域小抄的起跑点，和设计预检并列挂在同一条迟到裁决路径上；这里只关心契约注入。
+    _startDomainKnowledgePreflight: () => null,
     _agentIntentExecutionBlock: () => "",
     _ORCH_NOTE: "",
   });
