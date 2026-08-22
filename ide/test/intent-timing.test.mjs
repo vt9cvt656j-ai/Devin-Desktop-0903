@@ -69,7 +69,9 @@ function numericConst(code, name) {
 }
 
 // 「第一轮等意图裁决」那一整段的源文本。按那道 if 的判据取——它在 main.js 里唯一。
-const WAIT_ANCHOR = "_semanticProfileFlags || []).length";
+// 锚在等待门自己的收尾上：并行的两套实现一个用 _sessionFlags、一个把空判抽成
+// _profileStillEmpty 常量——按表达式原文锚会命中 const 定义行，waitBlock 整个切错位置。
+const WAIT_ANCHOR = "&& !sess._intentWaitPaid) {";
 function waitBlock() {
   const i = CODE.indexOf(WAIT_ANCHOR);
   assert.ok(i > 0, `找不到第一轮等待那道 if（锚点 ${WAIT_ANCHOR}）——它是本文件全部断言的落点`);
@@ -313,7 +315,9 @@ test("完整裁决要 19.8 秒，路由必须有第二条腿——而且那条�
   assert.match(CODE, /async function _fastRoutingFlags\(/,
     "路由快通道没了——那这道等待又回到了「干等」和「没有模块」的二选一");
 
-  const fn = CODE.slice(CODE.indexOf("async function _fastRoutingFlags("), CODE.indexOf("async function _fastRoutingFlags(") + 3200);
+  // 窗口 3300 → 3600：快通道函数体又多了一行每模型能力账本的回执记账
+  // （_recordModelJsonOutcome，弱模型判定的事实源），函数收尾再次被推出旧窗口。
+  const fn = CODE.slice(CODE.indexOf("async function _fastRoutingFlags("), CODE.indexOf("async function _fastRoutingFlags(") + 3600);
 
   // 快的全部原因就是输出短。max_tokens 一放开，它就跟完整裁决一样慢，这条腿白加。
   assert.match(fn, /_billableAiComplete\(cfg, \[\{ role: "user", content: prompt \}\], 200\)/,

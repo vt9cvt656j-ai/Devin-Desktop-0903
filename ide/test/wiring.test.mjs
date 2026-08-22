@@ -1846,10 +1846,12 @@ const KNOWN_UNCALLED = new Set([
   "_agentQuestionNeedsWorkspaceEvidence",
   "_agentSideEffectIntentIssue",
   "_agentToolNameAllowedByProfile", "_agentUserIntentText", "_appendToolPlanCard",
+  // _writeGateBypass / _readCoverageImpossible / _readBeforeEditCoverageHint 已从这张表
+  // 移除（2026-08-22）：三个都被盲写事前拦截 _blindOverwritePrecheck 接活了。
   "_hasContextOnlyLocationIntent", "_isCompressionPrefixInvalidError",
-  "_looksLikeProjectExecutionCommand", "_readBeforeEditCoverageHint", "_readCoverageImpossible",
+  "_looksLikeProjectExecutionCommand",
   "_stickToBottom", "_structureReadinessHint", "_thinkTip",
-  "_toolRequiresPlanGate", "_writeGateBypass", "renderCaptureTool", "renderConflictsTool", "renderDebuggerTool",
+  "_toolRequiresPlanGate", "renderCaptureTool", "renderConflictsTool", "renderDebuggerTool",
   "renderMarketplaceTool", "renderRemoteTool", "renderTasksTool", "renderWorkspaceTool",
 ]);
 
