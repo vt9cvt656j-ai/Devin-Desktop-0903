@@ -102,7 +102,7 @@ static CACHE: LazyLock<RwLock<Settings>> = LazyLock::new(|| RwLock::new(Settings
 static DEFAULT_MODEL: LazyLock<RwLock<String>> = LazyLock::new(|| RwLock::new(String::new()));
 static PLANS: LazyLock<RwLock<Vec<PlanQuota>>> = LazyLock::new(|| RwLock::new(default_plans()));
 
-/// 测试专用：把套餐缓存换成给定的一组，返回原来的那组以便还原。
+/// 测试专用：换掉套餐缓存的那把串行锁。
 ///
 /// 存在的理由很具体：`plan_quotas` 是运营在后台加套餐的地方，而校验一度查的是代码里
 /// 写死的五元组。两者在**默认配置下恰好相等**，所以任何不改这份缓存的测试都无法区分
@@ -113,6 +113,9 @@ static PLANS: LazyLock<RwLock<Vec<PlanQuota>>> = LazyLock::new(|| RwLock::new(de
 /// "yunying-xinzeng" 的假配置期间，另外几个正在读真配置的测试就会 unwrap 到 None。
 /// 症状是这几条时红时绿、每次红的还不一定是同一条——最难查的那种。
 /// 中毒了也照用（`into_inner`）：一次 panic 不该让后面每条都变成"锁中毒"。
+///
+/// 只读用例拿 [`plans_test_guard`]；要换表的用例拿 [`swap_plans_for_test`]，它自己
+/// 持有这把锁，别再在外面套一层（std 的 Mutex 不可重入，套了就是死锁）。
 #[cfg(test)]
 pub static PLANS_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
@@ -121,10 +124,82 @@ pub fn plans_test_guard() -> std::sync::MutexGuard<'static, ()> {
     PLANS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// 换表期间的持有凭证：旧表和串行锁绑在同一个值的生命周期上，`Drop` 时写回。
+///
+/// 之前是「换表返回旧表，用例末尾手工写回」——中间任何一条断言一红，写回那行就永远
+/// 到不了，假表留给后面所有读 PLANS 的用例，报出来的是三条红、真正的根因淹在后两条
+/// 的 unwrap panic 里。绑到 `Drop` 上之后，正常返回和 panic 展开走的是同一条还原路。
+///
+/// 字段顺序即析构顺序：先在 `drop` 里写回旧表，再释放 `_serial`，还原始终在锁内完成。
 #[cfg(test)]
-pub fn replace_plans_for_test(plans: Vec<PlanQuota>) -> Vec<PlanQuota> {
-    let mut guard = PLANS.write().expect("plans lock");
-    std::mem::replace(&mut *guard, plans)
+pub struct PlansSwap {
+    previous: Option<Vec<PlanQuota>>,
+    _serial: std::sync::MutexGuard<'static, ()>,
+}
+
+#[cfg(test)]
+impl Drop for PlansSwap {
+    fn drop(&mut self) {
+        if let Some(previous) = self.previous.take() {
+            // 展开路径上 PLANS 可能已经中毒；还原比保持中毒更重要。
+            let mut guard = PLANS.write().unwrap_or_else(|e| e.into_inner());
+            *guard = previous;
+        }
+    }
+}
+
+/// 把套餐缓存换成给定的一组，直到返回值离开作用域——失败、panic 也一样还原。
+#[cfg(test)]
+pub fn swap_plans_for_test(plans: Vec<PlanQuota>) -> PlansSwap {
+    let serial = plans_test_guard();
+    let previous = {
+        let mut guard = PLANS.write().unwrap_or_else(|e| e.into_inner());
+        std::mem::replace(&mut *guard, plans)
+    };
+    PlansSwap {
+        previous: Some(previous),
+        _serial: serial,
+    }
+}
+
+/// 运营参数缓存的对应物：同一把锁的思路，只是换的是 `CACHE`。
+#[cfg(test)]
+static SETTINGS_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// 只读地看 `CACHE` 时拿这把锁，别拿 swap——swap 会先写一次再让你读。
+#[cfg(test)]
+pub fn settings_test_guard() -> std::sync::MutexGuard<'static, ()> {
+    SETTINGS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+#[cfg(test)]
+pub struct SettingsSwap {
+    previous: Option<Settings>,
+    _serial: std::sync::MutexGuard<'static, ()>,
+}
+
+#[cfg(test)]
+impl Drop for SettingsSwap {
+    fn drop(&mut self) {
+        if let Some(previous) = self.previous.take() {
+            let mut guard = CACHE.write().unwrap_or_else(|e| e.into_inner());
+            *guard = previous;
+        }
+    }
+}
+
+/// 把运营参数缓存换成给定值，直到返回值离开作用域——失败、panic 也一样还原。
+#[cfg(test)]
+pub fn swap_settings_for_test(settings: Settings) -> SettingsSwap {
+    let serial = settings_test_guard();
+    let previous = {
+        let mut guard = CACHE.write().unwrap_or_else(|e| e.into_inner());
+        std::mem::replace(&mut *guard, settings)
+    };
+    SettingsSwap {
+        previous: Some(previous),
+        _serial: serial,
+    }
 }
 
 /// 读缓存。锁中毒时退回默认值而不是 panic——这些是展示与发放参数，让整个网关因为一把
@@ -493,14 +568,101 @@ mod tests {
     /// 面值分母永远不会返回 0，即使缓存被写进了非法值——它在展示路径上是除数。
     #[test]
     fn denominator_is_never_zero() {
-        if let Ok(mut g) = CACHE.write() {
-            g.raw_cents_per_credit_usd = 0;
-        }
+        let _swap = swap_settings_for_test(Settings {
+            raw_cents_per_credit_usd: 0,
+            ..Settings::default()
+        });
         assert!(raw_cents_per_credit_usd() >= MIN_RAW_CENTS_PER_CREDIT_USD);
         assert!(raw_usd_per_visible_usd() > 0.0);
-        if let Ok(mut g) = CACHE.write() {
-            *g = Settings::default();
-        }
+    }
+
+    fn plan_rows(plans: &[PlanQuota]) -> Vec<(String, i64, i64, i64, i32, i32)> {
+        plans
+            .iter()
+            .map(|p| {
+                (
+                    p.plan.clone(),
+                    p.total_cents,
+                    p.window_cents,
+                    p.weekly_cents,
+                    p.days,
+                    p.rank,
+                )
+            })
+            .collect()
+    }
+
+    /// 换表用例中途 panic，PLANS 也必须回到换表前的样子。
+    ///
+    /// 这正是 RAII 要守的那条路：手工「末尾写回」在断言一红时永远到不了，假表会留给
+    /// 后面所有读 PLANS 的用例。这里故意在换表后 panic，展开完再看缓存。
+    #[test]
+    fn swap_plans_restores_even_when_the_body_panics() {
+        let before = {
+            let _g = plans_test_guard();
+            plan_rows(&plans())
+        };
+        assert!(
+            plan_spec("trial").is_some(),
+            "前置：换表前 trial 必须在表里，否则这条验不出东西"
+        );
+
+        let fake = PlanQuota {
+            plan: "panic-only".to_string(),
+            total_cents: 1,
+            window_cents: 1,
+            weekly_cents: 0,
+            days: 1,
+            rank: 1,
+        };
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let _swap = swap_plans_for_test(vec![fake]);
+            // 换表确实生效——不然「还原」无从谈起。
+            assert!(plan_spec("trial").is_none(), "换表没生效");
+            assert!(plan_spec("panic-only").is_some(), "换表没生效");
+            panic!("故意：模拟用例中途断言失败");
+        }));
+        assert!(outcome.is_err(), "闭包本该 panic");
+
+        let _g = plans_test_guard();
+        assert_eq!(
+            plan_rows(&plans()),
+            before,
+            "panic 展开后 PLANS 没有还原：假表会漏给后面所有读 PLANS 的用例"
+        );
+        assert!(plan_spec("panic-only").is_none());
+        assert!(plan_spec("trial").is_some());
+    }
+
+    /// 运营参数缓存同理：中途 panic 也要把 CACHE 还原。
+    #[test]
+    fn swap_settings_restores_even_when_the_body_panics() {
+        let before = {
+            let _g = settings_test_guard();
+            current()
+        };
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _swap = swap_settings_for_test(Settings {
+                raw_cents_per_credit_usd: MAX_RAW_CENTS_PER_CREDIT_USD,
+                free_points_daily: MAX_FREE_POINTS_DAILY,
+                usd_per_cny_bps: MAX_USD_PER_CNY_BPS,
+            });
+            assert_eq!(
+                current().raw_cents_per_credit_usd,
+                MAX_RAW_CENTS_PER_CREDIT_USD
+            );
+            panic!("故意：模拟用例中途断言失败");
+        }));
+        assert!(outcome.is_err(), "闭包本该 panic");
+
+        let _g = settings_test_guard();
+        let after = current();
+        assert_eq!(
+            after.raw_cents_per_credit_usd,
+            before.raw_cents_per_credit_usd
+        );
+        assert_eq!(after.free_points_daily, before.free_points_daily);
+        assert_eq!(after.usd_per_cny_bps, before.usd_per_cny_bps);
     }
 
     /// 面值分母只能有一个真相。

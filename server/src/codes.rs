@@ -645,8 +645,8 @@ mod plan_spec_tests {
     /// 等价，测试会两边都过、等于没守。
     #[test]
     fn grantable_follows_the_configured_plans_not_the_builtin_list() {
-        // 这条会把进程级 PLANS 换掉，必须和读 PLANS 的那几条串行。
-        let _g = crate::settings::plans_test_guard();
+        // 这条会把进程级 PLANS 换掉，必须和读 PLANS 的那几条串行——串行锁由 swap 自己
+        // 持有，并在离开作用域时把表写回，断言中途红了也一样。
         use crate::settings::PlanQuota;
         let custom = PlanQuota {
             plan: "yunying-xinzeng".to_string(),
@@ -656,7 +656,7 @@ mod plan_spec_tests {
             days: 30,
             rank: 9,
         };
-        let restore = crate::settings::replace_plans_for_test(vec![custom]);
+        let _swap = crate::settings::swap_plans_for_test(vec![custom]);
 
         // 后台新加的套餐：不在 PLANS 里，但必须可发放——Stripe 就是这么发的。
         assert!(!PLANS.contains(&"yunying-xinzeng"));
@@ -677,8 +677,6 @@ mod plan_spec_tests {
         let hint = super::grantable_plans_hint();
         assert!(hint.contains("yunying-xinzeng"), "提示应报当前配置，实际: {hint}");
         assert!(!hint.contains("pro"), "提示不该再报已经不存在的套餐");
-
-        crate::settings::replace_plans_for_test(restore);
     }
 
     /// 有套餐就必须有额度——「保存套餐」不许发出空壳会员。
