@@ -49,3 +49,150 @@ export function stripComments(source) {
 
 /** main.js with all comments blanked out. Use this for positive source assertions. */
 export const CODE = stripComments(SRC);
+
+// ---------------------------------------------------------------------------
+// 按名字取真源码：整个 test/ 目录唯一的一份提取器
+// ---------------------------------------------------------------------------
+//
+// 在这之前 test/ 下有 16 份手抄副本、4 种互不相同的语义（朴素计括号、找 "\n}\n" 收尾、
+// 逐字符跳注释和字符串、acorn）。它们不只是重复代码，是四种不同的「函数体是什么」：
+//   · 朴素计括号那几份不认字符串字面量。实测 capabilities-wiring 用它抽 _executeToolStepInner，
+//     抽到 1,040,765 字节，真函数只有 406,715——main.js 里一句 `t.startsWith("{")` 让计数差 1，
+//     于是多跑了一万四千行。那个用例当时仍然绿，纯属它断言的分支恰好落在真函数体内。
+//     截断的那一侧会把 new Function 炸成看不懂的 SyntaxError；跑过头的那一侧会让
+//     「函数体里不得出现 X」这类反向断言看见别人的代码，可能假红也可能假绿。
+//   · 找 "\n}\n" 的那几份挑的是排版，不是语法。
+//   · 于是修一个提取 bug 要同时改九个文件，历史上就出现过「只修了 mcp/skills 那两份」的分叉。
+//
+// 这里只有一条实现：acorn 解析整份 main.js，按 AST 节点边界切。注释、字符串、模板、正则
+// 一概不可能干扰，async 天然带上，FunctionDeclaration 和 `const 名 = 箭头` 两种都认。
+//
+// 切的是 SRC（原文）而不是 CODE：抽出来的东西要能 new Function 跑起来，也要能被
+// 「源码里必须写着这一行」的断言匹配。要在剥了注释的文本上断言，传 { code: true }。
+const _ast = acorn.parse(SRC, {
+  ecmaVersion: "latest",
+  sourceType: "module",
+  allowAwaitOutsideFunction: true,
+  allowHashBang: true,
+});
+
+/**
+ * 测试里要把生产常量换掉的地方。
+ *
+ * 名字进了这张表，`load()` 解析依赖时就不再回 main.js 抓真值，而是拼一条字面量声明。
+ * 覆盖发生在**依赖解析这一层**，用例代码一个字都不用改。
+ *
+ * _AI_MODEL_RETRY_DELAY_MS 在 main.js 里是 2_000，退避是 equal jitter：等 [base/2, base]。
+ * model-resume 那条「没出过字 → 走重试」的用例守的是走哪条分支，和退避时长毫无关系，
+ * 却因为依赖是从 main.js 原样抓的而真睡一次随机 1–2 秒——整个套件最慢的一条，而且每次
+ * 时长都不一样，看 duration 根本发现不了真正变慢的测试。退避曲线本身在 logic.test.mjs
+ * 里另有专测（那里手工注入 120ms，正是这个机制的特例）。
+ */
+export const OVERRIDES = { _AI_MODEL_RETRY_DELAY_MS: 1 };
+
+/** 从一批语句里按名字找声明（认 export 包一层的写法）。 */
+function _scanStatements(body, name) {
+  const hits = [];
+  for (const stmt of body) {
+    const node =
+      stmt.type === "ExportNamedDeclaration" || stmt.type === "ExportDefaultDeclaration"
+        ? stmt.declaration
+        : stmt;
+    if (!node) continue;
+    if (node.type === "FunctionDeclaration" && node.id?.name === name) hits.push({ fn: node });
+    else if (node.type === "VariableDeclaration") {
+      for (const d of node.declarations) {
+        if (d.id?.type === "Identifier" && d.id.name === name && d.init) hits.push({ varDecl: d });
+      }
+    }
+  }
+  return hits;
+}
+
+/** 整棵树走一遍找同名声明：main.js 里有真正嵌套在别的函数里的声明。 */
+function _scanEverywhere(name) {
+  const hits = [];
+  const seen = new Set();
+  const walk = (node) => {
+    if (!node || typeof node !== "object" || seen.has(node)) return;
+    if (Array.isArray(node)) { for (const c of node) walk(c); return; }
+    if (typeof node.type !== "string") return;
+    seen.add(node);
+    if (node.type === "FunctionDeclaration" && node.id?.name === name) hits.push({ fn: node });
+    else if (node.type === "VariableDeclaration") {
+      for (const d of node.declarations) {
+        if (d.id?.type === "Identifier" && d.id.name === name && d.init) hits.push({ varDecl: d });
+      }
+    }
+    for (const key of Object.keys(node)) {
+      if (key === "type" || key === "start" || key === "end") continue;
+      walk(node[key]);
+    }
+  };
+  walk(_ast);
+  return hits;
+}
+
+function _declFor(name) {
+  // 顶层优先。顶层没有就整棵树扫——老的 indexOf 版本抓的是文件里第一处 `function 名(`，
+  // 全文唯一时这里给出同一个答案；不唯一就当场报歧义，而不是随手挑一个。
+  const top = _scanStatements(_ast.body, name);
+  if (top.length) return top[0];
+  const nested = _scanEverywhere(name);
+  if (nested.length === 1) return nested[0];
+  if (nested.length > 1) {
+    const at = nested.map((d) => (d.fn ?? d.varDecl).start).join(", ");
+    throw new Error(`main.js 里 ${name} 有 ${nested.length} 处同名声明（offset ${at}），按名字取源码是歧义的`);
+  }
+  return null;
+}
+
+/**
+ * 按名字取一段声明的源码。
+ *
+ * - `function 名(…) {…}` / `async function 名(…) {…}` → 整段原文（async 前缀在内）
+ * - `const 名 = …`（箭头函数或任何值）→ 重新拼成 `const 名 = <初始化表达式>;`
+ *
+ * @param {string} name
+ * @param {{ code?: boolean }} [opts] code:true 时从 CODE（注释置空的那份）里切，
+ *   用于对函数体做正向源码断言——注释里引用一段已经删掉的旧代码就能把断言喂绿。
+ */
+export function fnSource(name, { code = false } = {}) {
+  const found = _declFor(name);
+  if (!found) throw new Error(`main.js 里找不到声明 ${name}`);
+  const text = code ? CODE : SRC;
+  if (found.fn) return text.slice(found.fn.start, found.fn.end);
+  const d = found.varDecl;
+  return `const ${name} = ${text.slice(d.init.start, d.init.end)};`;
+}
+
+/** 一条依赖的源码：名字在 OVERRIDES 里就拼字面量，否则回 main.js 抓真源。 */
+function _depSource(name) {
+  if (Object.hasOwn(OVERRIDES, name)) return `const ${name} = ${JSON.stringify(OVERRIDES[name])};`;
+  return fnSource(name);
+}
+
+/**
+ * 把 main.js 里的真函数取出来跑。
+ *
+ * @param {string} name 要拿到手的那个声明名
+ * @param {Record<string, unknown> | string[]} [deps]
+ *   - 对象：键名作为形参注入（桩、常量、别的模块的真实现）
+ *   - 数组：按名字把这些声明一起从 main.js 抓进来（顺序即拼接顺序），
+ *     其中命中 OVERRIDES 的换成字面量
+ *
+ * 数组形式配合「构造时接住 ReferenceError、把缺的名字 unshift 进去再来一次」的循环，
+ * 就能自动补齐依赖闭包（见 test/model-resume.test.mjs）。
+ */
+export function load(name, deps = {}) {
+  if (Array.isArray(deps)) {
+    return new Function(`${deps.map(_depSource).join("\n")}\n;return ${name};`)();
+  }
+  const keys = Object.keys(deps);
+  return new Function(...keys, `${_depSource(name)}\n;return ${name};`)(...keys.map((k) => deps[k]));
+}
+
+/** 取一条顶层 const 的**值**（在空作用域里求值，所以它不能引用别的模块级变量）。 */
+export function loadConst(name) {
+  return new Function(`${fnSource(name)}\n;return ${name};`)();
+}

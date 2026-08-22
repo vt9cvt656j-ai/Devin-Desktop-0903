@@ -47,7 +47,7 @@ const HERE = dirname(fileURLToPath(import.meta.url));
 // 只在注释里留一句，assert.match 照样绿——本仓库已经这样漏过一整组模型可见的工具契约。
 // 所以 `SRC` 绑定的是 CODE（注释整段置空，行号与偏移和原文一字不差）；
 // 真要匹配注释本身的断言显式用 RAW_SRC，并在那一行写清为什么。
-import { CODE as SRC, SRC as RAW_SRC } from "./helpers/source.mjs";
+import { CODE as SRC, SRC as RAW_SRC, fnSource as extractFn, fnSource as extractConstDecl, loadConst } from "./helpers/source.mjs";
 const DAP_CLIENT = readFileSync(join(HERE, "../src/dap-client.js"), "utf8");
 const LSP_CLIENT = readFileSync(join(HERE, "../src/lsp-client.js"), "utf8");
 const TAURI_DEBUG = readFileSync(join(HERE, "../src-tauri/src/debug.rs"), "utf8");
@@ -97,88 +97,6 @@ const TAURI_PACKAGE_CONFIG = JSON.parse(readFileSync(join(HERE, "../src-tauri/ta
 const RELEASE_WORKFLOW = readFileSync(join(HERE, "../../.github/workflows/ide-package.yml"), "utf8");
 const SERVER_UPDATE = readFileSync(join(HERE, "../../server/src/update.rs"), "utf8");
 
-// ---- source scanner (skip strings / templates / regex / comments) --------------------
-function skipString(s, i, q) { i++; for (; i < s.length; i++) { if (s[i] === "\\") { i++; continue; } if (s[i] === q) return i; } return i; }
-function skipRegex(s, i) { i++; let cls = false; for (; i < s.length; i++) { const c = s[i]; if (c === "\\") { i++; continue; } if (c === "[") cls = true; else if (c === "]") cls = false; else if (c === "/" && !cls) return i; } return i; }
-function skipTemplate(s, i) {
-  i++;
-  for (; i < s.length; i++) {
-    if (s[i] === "\\") { i++; continue; }
-    if (s[i] === "`") return i;
-    if (s[i] === "$" && s[i + 1] === "{") {
-      i += 2; let depth = 1;
-      for (; i < s.length && depth > 0; i++) {
-        const c = s[i];
-        if (c === "\\") { i++; continue; }
-        if (c === "'" || c === '"') { i = skipString(s, i, c); continue; }
-        if (c === "`") { i = skipTemplate(s, i); continue; }
-        if (c === "{") depth++; else if (c === "}") depth--;
-      }
-      i--; // for-loop will ++
-    }
-  }
-  return i;
-}
-function isRegexPos(s, i) {
-  let j = i - 1; while (j >= 0 && /\s/.test(s[j])) j--;
-  if (j < 0) return true;
-  if ("=([,{;:!&|?+-*%<>~^".includes(s[j])) return true;
-  return /(?:^|[^\w$])(return|typeof|case|in|of|do|else|void|delete|instanceof|yield|await)$/.test(s.slice(Math.max(0, j - 12), j + 1));
-}
-// Extract a module-level `const NAME = <expr>;` declaration. extractFn only reaches `function`
-// declarations, so a table a function depends on used to have no way into the harness except a
-// hand-written stub — and a stub is free to drift from the literal it stands in for. This slices
-// the real declaration, matching the same rule the tool-policy deps follow: tests run against the
-// real thing or they are not testing it.
-function extractConstDecl(name) {
-  const m = new RegExp(`\\bconst\\s+${name}\\s*=`).exec(RAW_SRC);
-  if (!m) throw new Error(`const ${name} not found in main.js`);
-  let i = RAW_SRC.indexOf("=", m.index) + 1, depth = 0;
-  for (; i < RAW_SRC.length; i++) {
-    const c = RAW_SRC[i], d = RAW_SRC[i + 1];
-    if (c === "/" && d === "/") { i = RAW_SRC.indexOf("\n", i); if (i < 0) i = RAW_SRC.length; continue; }
-    if (c === "/" && d === "*") { i = RAW_SRC.indexOf("*/", i + 2) + 1; continue; }
-    if (c === "'" || c === '"') { i = skipString(RAW_SRC, i, c); continue; }
-    if (c === "`") { i = skipTemplate(RAW_SRC, i); continue; }
-    if (c === "/" && isRegexPos(RAW_SRC, i)) { i = skipRegex(RAW_SRC, i); continue; }
-    if (c === "(" || c === "[" || c === "{") depth++;
-    else if (c === ")" || c === "]" || c === "}") depth--;
-    else if (c === ";" && depth === 0) return RAW_SRC.slice(m.index, i + 1);
-  }
-  throw new Error(`unterminated declaration extracting ${name}`);
-}
-function loadConst(name) {
-  return new Function(`${extractConstDecl(name)}\n;return ${name};`)();
-}
-function extractFn(name) {
-  const m = new RegExp(`(?:async\\s+)?function\\s+${name}\\s*\\(`).exec(RAW_SRC);
-  if (!m) throw new Error(`function ${name} not found in main.js`);
-  // 先跳过参数表再匹配函数体：默认参数可能含 {}（如 `onRetry = () => {}`），
-  // 从参数表里的第一个 { 开始配对会把函数截断在签名中间。
-  let p = RAW_SRC.indexOf("(", m.index), pd = 0;
-  for (; p < RAW_SRC.length; p++) {
-    const c = RAW_SRC[p], d = RAW_SRC[p + 1];
-    if (c === "/" && d === "/") { p = RAW_SRC.indexOf("\n", p); if (p < 0) p = RAW_SRC.length; continue; }
-    if (c === "/" && d === "*") { p = RAW_SRC.indexOf("*/", p + 2) + 1; continue; }
-    if (c === "'" || c === '"') { p = skipString(RAW_SRC, p, c); continue; }
-    if (c === "`") { p = skipTemplate(RAW_SRC, p); continue; }
-    if (c === "/" && isRegexPos(RAW_SRC, p)) { p = skipRegex(RAW_SRC, p); continue; }
-    if (c === "(") pd++;
-    else if (c === ")") { pd--; if (pd === 0) break; }
-  }
-  let i = RAW_SRC.indexOf("{", p), depth = 0;
-  for (; i < RAW_SRC.length; i++) {
-    const c = RAW_SRC[i], d = RAW_SRC[i + 1];
-    if (c === "/" && d === "/") { i = RAW_SRC.indexOf("\n", i); if (i < 0) i = RAW_SRC.length; continue; }
-    if (c === "/" && d === "*") { i = RAW_SRC.indexOf("*/", i + 2) + 1; continue; }
-    if (c === "'" || c === '"') { i = skipString(RAW_SRC, i, c); continue; }
-    if (c === "`") { i = skipTemplate(RAW_SRC, i); continue; }
-    if (c === "/" && isRegexPos(RAW_SRC, i)) { i = skipRegex(RAW_SRC, i); continue; }
-    if (c === "{") depth++;
-    else if (c === "}") { depth--; if (depth === 0) return RAW_SRC.slice(m.index, i + 1); }
-  }
-  throw new Error(`unbalanced braces extracting ${name}`);
-}
 // Strip comments so a "this code must not appear" assertion cannot be satisfied — or defeated —
 // by prose. extractFn returns comments verbatim, and the comments explaining a perf fix routinely
 // quote the very code the fix removed.

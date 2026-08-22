@@ -10,85 +10,10 @@
 // 不手抄任何标题。
 import test from "node:test";
 import assert from "node:assert/strict";
-import fs from "node:fs";
+// 按名字取真源码 / 取顶层常量的值，只有一份实现：test/helpers/source.mjs。
+// 这个文件的源码断言历来跑在**原文**上（下面自己剥注释），所以 SRC 绑定 main.js 原文。
+import { SRC, fnSource as extractFn, loadConst } from "./helpers/source.mjs";
 
-const SRC = fs.readFileSync("src/main.js", "utf8");
-
-// ---- source scanner (skip strings / templates / regex / comments) --------------------
-function skipString(s, i, q) { i++; for (; i < s.length; i++) { if (s[i] === "\\") { i++; continue; } if (s[i] === q) return i; } return i; }
-function skipRegex(s, i) { i++; let cls = false; for (; i < s.length; i++) { const c = s[i]; if (c === "\\") { i++; continue; } if (c === "[") cls = true; else if (c === "]") cls = false; else if (c === "/" && !cls) return i; } return i; }
-function skipTemplate(s, i) {
-  i++;
-  for (; i < s.length; i++) {
-    if (s[i] === "\\") { i++; continue; }
-    if (s[i] === "`") return i;
-    if (s[i] === "$" && s[i + 1] === "{") {
-      i += 2; let depth = 1;
-      for (; i < s.length && depth > 0; i++) {
-        const c = s[i];
-        if (c === "\\") { i++; continue; }
-        if (c === "'" || c === '"') { i = skipString(s, i, c); continue; }
-        if (c === "`") { i = skipTemplate(s, i); continue; }
-        if (c === "{") depth++; else if (c === "}") depth--;
-      }
-      i--;
-    }
-  }
-  return i;
-}
-function isRegexPos(s, i) {
-  let j = i - 1; while (j >= 0 && /\s/.test(s[j])) j--;
-  if (j < 0) return true;
-  if ("=([,{;:!&|?+-*%<>~^".includes(s[j])) return true;
-  return /(?:^|[^\w$])(return|typeof|case|in|of|do|else|void|delete|instanceof|yield|await)$/.test(s.slice(Math.max(0, j - 12), j + 1));
-}
-function extractConstDecl(name) {
-  const m = new RegExp(`\\bconst\\s+${name}\\s*=`).exec(SRC);
-  if (!m) throw new Error(`const ${name} not found in main.js`);
-  let i = SRC.indexOf("=", m.index) + 1, depth = 0;
-  for (; i < SRC.length; i++) {
-    const c = SRC[i], d = SRC[i + 1];
-    if (c === "/" && d === "/") { i = SRC.indexOf("\n", i); if (i < 0) i = SRC.length; continue; }
-    if (c === "/" && d === "*") { i = SRC.indexOf("*/", i + 2) + 1; continue; }
-    if (c === "'" || c === '"') { i = skipString(SRC, i, c); continue; }
-    if (c === "`") { i = skipTemplate(SRC, i); continue; }
-    if (c === "/" && isRegexPos(SRC, i)) { i = skipRegex(SRC, i); continue; }
-    if (c === "(" || c === "[" || c === "{") depth++;
-    else if (c === ")" || c === "]" || c === "}") depth--;
-    else if (c === ";" && depth === 0) return SRC.slice(m.index, i + 1);
-  }
-  throw new Error(`unterminated declaration extracting ${name}`);
-}
-function loadConst(name) {
-  return new Function(`${extractConstDecl(name)}\n;return ${name};`)();
-}
-function extractFn(name) {
-  const m = new RegExp(`(?:async\\s+)?function\\s+${name}\\s*\\(`).exec(SRC);
-  if (!m) throw new Error(`function ${name} not found in main.js`);
-  let p = SRC.indexOf("(", m.index), pd = 0;
-  for (; p < SRC.length; p++) {
-    const c = SRC[p], d = SRC[p + 1];
-    if (c === "/" && d === "/") { p = SRC.indexOf("\n", p); if (p < 0) p = SRC.length; continue; }
-    if (c === "/" && d === "*") { p = SRC.indexOf("*/", p + 2) + 1; continue; }
-    if (c === "'" || c === '"') { p = skipString(SRC, p, c); continue; }
-    if (c === "`") { p = skipTemplate(SRC, p); continue; }
-    if (c === "/" && isRegexPos(SRC, p)) { p = skipRegex(SRC, p); continue; }
-    if (c === "(") pd++;
-    else if (c === ")") { pd--; if (pd === 0) break; }
-  }
-  let i = SRC.indexOf("{", p), depth = 0;
-  for (; i < SRC.length; i++) {
-    const c = SRC[i], d = SRC[i + 1];
-    if (c === "/" && d === "/") { i = SRC.indexOf("\n", i); if (i < 0) i = SRC.length; continue; }
-    if (c === "/" && d === "*") { i = SRC.indexOf("*/", i + 2) + 1; continue; }
-    if (c === "'" || c === '"') { i = skipString(SRC, i, c); continue; }
-    if (c === "`") { i = skipTemplate(SRC, i); continue; }
-    if (c === "/" && isRegexPos(SRC, i)) { i = skipRegex(SRC, i); continue; }
-    if (c === "{") depth++;
-    else if (c === "}") { depth--; if (depth === 0) return SRC.slice(m.index, i + 1); }
-  }
-  throw new Error(`unbalanced braces extracting ${name}`);
-}
 // 注释里会引用被修掉的旧代码，所以凡是对源码文本的断言都先剥注释。按上下文逐字符扫，
 // 认得字符串 / 模板串 / 正则字面量（两条正则式的剥法会把 `/\//` 当成行注释吃掉真代码）。
 function stripJsComments(source) {

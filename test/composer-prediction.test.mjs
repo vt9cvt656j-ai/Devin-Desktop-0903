@@ -14,20 +14,11 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
+// 从 main.js（无导出的浏览器单文件）里按名字抠真源码：全仓唯一那份提取器。
+import { fnSource as grab } from "./helpers/source.mjs";
 
 const SRC = fs.readFileSync("src/main.js", "utf8");
 
-/** 从 main.js（无导出的浏览器单文件）里抠出一个函数体，和其它测试同一套做法。 */
-function grab(name) {
-  const i = SRC.indexOf(`function ${name}(`);
-  if (i < 0) throw new Error(`function ${name} not found`);
-  let depth = 0, started = false;
-  for (let k = i; k < SRC.length; k++) {
-    if (SRC[k] === "{") { depth++; started = true; }
-    else if (SRC[k] === "}") { depth--; if (started && depth === 0) return SRC.slice(i, k + 1); }
-  }
-  throw new Error(`unbalanced braces in ${name}`);
-}
 
 // 只桩掉两个外部依赖，_predictionAlreadyUsed 用真身——它参与判定。
 const deps = {

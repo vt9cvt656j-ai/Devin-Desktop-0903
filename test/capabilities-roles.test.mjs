@@ -20,20 +20,7 @@ const HERE = dirname(fileURLToPath(import.meta.url));
 // 只在注释里留一句，assert.match 照样绿——本仓库已经这样漏过一整组模型可见的工具契约。
 // 所以 `SRC` 绑定的是 CODE（注释整段置空，行号与偏移和原文一字不差）；
 // 真要匹配注释本身的断言显式用 RAW_SRC，并在那一行写清为什么。
-import { CODE as SRC, SRC as RAW_SRC } from "./helpers/source.mjs";
-
-function extractFn(name) {
-  const i = RAW_SRC.indexOf(`function ${name}(`);
-  assert.ok(i >= 0, `main.js 里找不到 ${name}`);
-  let depth = 0;
-  let j = RAW_SRC.indexOf("{", RAW_SRC.indexOf(")", i));
-  for (; j < RAW_SRC.length; j++) {
-    const c = RAW_SRC[j];
-    if (c === "{") depth++;
-    else if (c === "}") { depth--; if (!depth) break; }
-  }
-  return RAW_SRC.slice(i, j + 1);
-}
+import { CODE as SRC, SRC as RAW_SRC, fnSource as extractFn } from "./helpers/source.mjs";
 
 const DECL = normalizeCapabilities({
   roles: [{

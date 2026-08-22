@@ -18,19 +18,7 @@ const HERE = dirname(fileURLToPath(import.meta.url));
 // 只在注释里留一句，assert.match 照样绿——本仓库已经这样漏过一整组模型可见的工具契约。
 // 所以 `SRC` 绑定的是 CODE（注释整段置空，行号与偏移和原文一字不差）；
 // 真要匹配注释本身的断言显式用 RAW_SRC，并在那一行写清为什么。
-import { CODE as SRC, SRC as RAW_SRC } from "./helpers/source.mjs";
-
-function extractFn(name) {
-  const i = RAW_SRC.indexOf(`function ${name}(`);
-  assert.ok(i >= 0, `找不到 ${name}`);
-  let depth = 0, j = RAW_SRC.indexOf("{", RAW_SRC.indexOf(")", i));
-  for (; j < RAW_SRC.length; j++) {
-    const c = RAW_SRC[j];
-    if (c === "{") depth++;
-    else if (c === "}") { depth--; if (!depth) break; }
-  }
-  return RAW_SRC.slice(i, j + 1);
-}
+import { CODE as SRC, SRC as RAW_SRC, fnSource as extractFn } from "./helpers/source.mjs";
 
 // 模型现在可以在 update_plan 里逐步声明 kind，动词表退化成兜底，所以这两个函数多了
 // 一个依赖。本文件测的是**兜底那条路**（没有声明时的行为），声明那条路见

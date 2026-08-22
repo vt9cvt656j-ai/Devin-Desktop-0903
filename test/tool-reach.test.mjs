@@ -21,30 +21,8 @@ const HERE = dirname(fileURLToPath(import.meta.url));
 // 只在注释里留一句，assert.match 照样绿——本仓库已经这样漏过一整组模型可见的工具契约。
 // 所以 `SRC` 绑定的是 CODE（注释整段置空，行号与偏移和原文一字不差）；
 // 真要匹配注释本身的断言显式用 RAW_SRC，并在那一行写清为什么。
-import { CODE as SRC, SRC as RAW_SRC } from "./helpers/source.mjs";
-
-// main.js 没有导出，按名抠函数源码再注入依赖执行——测的是真正发出去的那份代码。
-function extractFn(name) {
-  const i = RAW_SRC.indexOf(`function ${name}(`);
-  assert.ok(i >= 0, `main.js 里找不到 ${name}`);
-  let depth = 0, j = RAW_SRC.indexOf("{", RAW_SRC.indexOf(")", i));
-  for (; j < RAW_SRC.length; j++) {
-    const c = RAW_SRC[j], d = RAW_SRC[j + 1];
-    if (c === "/" && d === "/") { j = RAW_SRC.indexOf("\n", j); if (j < 0) j = RAW_SRC.length; continue; }
-    if (c === "/" && d === "*") { j = RAW_SRC.indexOf("*/", j + 2) + 1; continue; }
-    if (c === '"' || c === "'" || c === "`") {
-      const quote = c;
-      for (j++; j < RAW_SRC.length; j++) {
-        if (RAW_SRC[j] === "\\") { j++; continue; }
-        if (RAW_SRC[j] === quote) break;
-      }
-      continue;
-    }
-    if (c === "{") depth++;
-    else if (c === "}") { depth--; if (!depth) break; }
-  }
-  return RAW_SRC.slice(i, j + 1);
-}
+import { CODE as SRC, SRC as RAW_SRC, fnSource as extractFn } from "./helpers/source.mjs";
+// main.js 没有导出：按名抠函数源码再注入依赖执行——测的是真正发出去的那份代码。
 
 function registeredToolNames() {
   // 用户声明给空：本文件测的是**内置**注册表的覆盖度，用户自己接进来的能力

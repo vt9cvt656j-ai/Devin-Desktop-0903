@@ -8,27 +8,9 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
-
-const SRC = fs.readFileSync("src/main.js", "utf8");
-
-function extractFn(name) {
-  const m = new RegExp(`(?:async\\s+)?function\\s+${name}\\s*\\(`).exec(SRC);
-  if (!m) throw new Error(`function ${name} not found`);
-  let i = SRC.indexOf("{", SRC.indexOf(")", m.index)), depth = 0;
-  for (; i < SRC.length; i++) {
-    const c = SRC[i], d = SRC[i + 1];
-    if (c === "/" && d === "/") { i = SRC.indexOf("\n", i); if (i < 0) i = SRC.length; continue; }
-    if (c === "/" && d === "*") { i = SRC.indexOf("*/", i + 2) + 1; continue; }
-    if (c === "'" || c === '"' || c === "`") {
-      const q = c;
-      for (i++; i < SRC.length; i++) { if (SRC[i] === "\\") { i++; continue; } if (SRC[i] === q) break; }
-      continue;
-    }
-    if (c === "{") depth++;
-    else if (c === "}") { depth--; if (depth === 0) return SRC.slice(m.index, i + 1); }
-  }
-  throw new Error(`unbalanced braces in ${name}`);
-}
+// 按名字取真源码只有一份实现：test/helpers/source.mjs 的 fnSource（acorn 按 AST 边界切）。
+// 这个文件的源码断言历来跑在**原文**上，所以 SRC 仍绑定 main.js 原文，不动。
+import { SRC, fnSource as extractFn } from "./helpers/source.mjs";
 // 规则那一段的便捷桩（习惯留空）。_userRulesBlock 现在同时渲染两份文档，且用到 _clipUserDoc。
 const block = (text, max = 4000) =>
   new Function("_userRulesText", "_userHabitsText", "_USER_RULES_MAX",
