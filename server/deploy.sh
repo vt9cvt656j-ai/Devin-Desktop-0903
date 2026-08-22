@@ -48,7 +48,11 @@ REMOTE_LOCK="${REMOTE_LOCK:-/var/lock/michael-ide-deploy-${TARGET}.lock}"
 REMOTE_LOCK_Q="$(printf '%q' "$REMOTE_LOCK")"
 DEPLOY_LOCK_TIMEOUT_SECS="${DEPLOY_LOCK_TIMEOUT_SECS:-900}"
 
-SSH_ARGS=(-p "$SERVER_PORT" -o BatchMode=yes -o ConnectTimeout=10 -o ConnectionAttempts=3)
+# ServerAlive*：连接**建立之后**才卡住的那种（这台机器的 SSH 时好时坏，握手能过、
+# 传输中途静默 stall），ConnectTimeout 管不到——它只管建连那一下。没有保活探测的话，
+# 一个半死的连接会一直挂到调用方的超时才被杀，rsync 的整个重试循环都轮不到跑。
+# 15s×4 = 一条卡死的连接最多 60s 就被判死、抛错，交给下面的重试。
+SSH_ARGS=(-p "$SERVER_PORT" -o BatchMode=yes -o ConnectTimeout=10 -o ConnectionAttempts=3 -o ServerAliveInterval=15 -o ServerAliveCountMax=4)
 if [[ -n "$SERVER_KEY" ]]; then
   SSH_ARGS+=(-i "$SERVER_KEY")
 fi
@@ -111,7 +115,7 @@ ssh_true() {
   exit 2
 }
 
-RSYNC_RSH="ssh -p $(printf '%q' "$SERVER_PORT") -o BatchMode=yes -o ConnectTimeout=10 -o ConnectionAttempts=3"
+RSYNC_RSH="ssh -p $(printf '%q' "$SERVER_PORT") -o BatchMode=yes -o ConnectTimeout=10 -o ConnectionAttempts=3 -o ServerAliveInterval=15 -o ServerAliveCountMax=4"
 if [[ -n "$SERVER_KEY" ]]; then
   RSYNC_RSH+=" -i $(printf '%q' "$SERVER_KEY")"
 fi
@@ -153,7 +157,10 @@ rsync_run() {
     # 只排除 `.env` 的话，服务器上的 `.env.test`（本地没有这个文件）会被当成"多余文件"
     # **删掉** —— 表现是第一次测试部署报「No .env.test exists」，而它其实是刚被这次
     # rsync 删的。（注释必须写在命令**外面**：写在续行反斜杠后面会把命令截断。）
-    rsync -az --delete-delay -e "$RSYNC_RSH" \
+    # --timeout=90：rsync 自己的 I/O 超时，兜住「保活探测也没能及时判死」的残余情况。
+    # 传输本身很小（只有源码，排掉了 target），正常几秒就完；90s 没有任何 I/O = 链路死了，
+    # 抛错重试，而不是永远挂着等外层超时把整个部署连根拔掉（那正是刚才那次的现象）。
+    rsync -az --timeout=90 --delete-delay -e "$RSYNC_RSH" \
       --exclude target --exclude '.env*' --exclude .git \
       --exclude .DS_Store --exclude node_modules \
       --exclude '*.tsbuildinfo' \
