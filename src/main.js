@@ -23773,10 +23773,17 @@ async function _agentProjectServiceHints(root) {
   for (const envName of [".env", ".env.local", ".env.development", ".env.dev"]) {
     try {
       const text = await backend.readTextFile(root + "/" + envName);
-      const keys = [...new Set(String(text).split(/\r?\n/)
+      const allKeys = [...new Set(String(text).split(/\r?\n/)
         .map((line) => line.trim().match(/^([A-Za-z_][A-Za-z0-9_]*)\s*=/)?.[1])
-        .filter(Boolean)
-        .filter((key) => /(DATABASE|DB_|POSTGRES|MYSQL|SQLITE|MONGO|REDIS|PORT|HOST|API|SERVER|BACKEND|URL)/i.test(key)))]
+        .filter(Boolean))];
+      // key 名（**只有名字，值从不缓存**）同时喂给硬编码扫描器当判据：新增行里写死了
+      // :3000 / http://… 而 .env 里明明有 PORT / API_URL 时，事实才说得出「项目里已经
+      // 有配置项 X」这半句。这份读取本来就在跑，这里只是把已经算出的名字存住。
+      // typeof 守卫：这个函数会被测试按名字抽出来在独立作用域跑，缓存 Map 不在场时
+      // 采集这一步跳过即可，绝不能让 ReferenceError 把整段 env 线索吞掉。
+      if (allKeys.length && typeof _envKeysByRoot !== "undefined") _envKeysByRoot.set(root, [...new Set([...(_envKeysByRoot.get(root) || []), ...allKeys])].slice(0, 64));
+      const keys = allKeys
+        .filter((key) => /(DATABASE|DB_|POSTGRES|MYSQL|SQLITE|MONGO|REDIS|PORT|HOST|API|SERVER|BACKEND|URL)/i.test(key))
         .slice(0, 12);
       if (keys.length) envLines.push(`${envName}: ${keys.join(", ")}（值已隐藏）`);
     } catch {}
@@ -24272,13 +24279,16 @@ async function _gatherAgentContext(query, sessionRoot, boundaryRoot = "") {
 
   // Stack hints FIRST (high-priority, model sees it before raw file dumps).
   const stack = _extractStackHints(fileMap);
-  if (stack.lang) _projectStacks.set(root, { ...stack, root }); else _projectStacks.delete(root);
   // 套件位置紧跟在栈提示后面：它回答的是"新测试写到哪去"，而 testCmd 只回答"怎么跑"。
+  // testDir 必须在 _projectStacks.set **之前**落到 stack 上：set 存的是浅拷贝，先 set
+  // 再赋 testDir 的话，Map 里那份永远没有 testDir——_strayScratchFiles 和「改的文件有
+  // 同名测试没读没跑」两条判据读的都是 Map 里那份，等于探测白跑。
   const _testDir = await _testDirPromise;
   if (_testDir) {
     stack.testDir = _testDir.dir;
     stack.testSubs = _testDir.subs;
   }
+  if (stack.lang) _projectStacks.set(root, { ...stack, root }); else _projectStacks.delete(root);
   const stackHint = _formatStackHint(stack);
   if (stackHint) {
     // Insert near the top, right after osBlock and workspace path.
@@ -38624,6 +38634,155 @@ function _stubDeliveryFindings(run, maxItems = 8) {
   return out;
 }
 
+// ── 硬编码字面量：_stubDeliveryFindings 的姊妹扫描器 ─────────────────────────
+//
+// 同一套纪律：checkpoint 基线相减、只看**新增**行、只报有原文佐证的字面命中、
+// 只陈述不拦截。规则族是硬编码一类：写死的端口/本机地址、写死的 URL、写死的绝对
+// 路径、密钥形字面量。「不要散落硬编码」在提示词里写了三遍而用户照样抱怨——所以
+// 这里给的是判据不是劝告：file:line + 那一行原文，命中 .env 里已有的 key 名时把
+// 配置项名字一并点出（envKey 由 _envKeysByRoot 提供，只有名字、值从不缓存）。
+const _envKeysByRoot = new Map(); // root -> [".env 里的 key 名"]（值绝不入内存缓存）
+function _hardcodedDeliveryFindings(run, envKeys, maxItems = 6) {
+  const cp = run?.checkpoint;
+  if (!cp || typeof cp.forEach !== "function") return [];
+  const keys = Array.isArray(envKeys) ? envKeys : [];
+  const _envFor = (cat) => {
+    const want = cat === "port" ? /PORT/i
+      : cat === "url" ? /(URL|HOST|ENDPOINT|API)/i
+      : cat === "secret" ? /(KEY|SECRET|TOKEN|PASS)/i : null;
+    return (want && keys.find((k) => want.test(k))) || "";
+  };
+  // 「是字面量还是表达式」——和 _redactSecrets 里那套被实测校准过的判据同一逻辑
+  // （那份刻意定义在函数内部，不能引用；这里保持同样的四条规则）。
+  const _looksLikeCodeValue = (v) => {
+    if (!v) return false;
+    if (/[(){}[\]<>\\]/.test(v)) return true;
+    if (/^[+\-*/!~&|=]/.test(v)) return true;
+    if (/^[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)+$/.test(v)) return true;
+    if (/^[A-Za-z_$]+$/.test(v)) return true;
+    return false;
+  };
+  const out = [];
+  cp.forEach((snap, absPath) => {
+    if (out.length >= maxItems) return;
+    const cur = String(snap?.current || "");
+    if (!cur || !_CODE_FILE_RE.test(String(absPath))) return;
+    const before = new Set(String(snap?.content || "").split("\n").map((l) => l.trim()));
+    const lines = cur.split("\n");
+    for (let i = 0; i < lines.length && out.length < maxItems; i++) {
+      const trimmed = lines[i].trim();
+      if (!trimmed || before.has(trimmed)) continue;
+      if (/^(?:\/\/|#|\*|\/\*|<!--)/.test(trimmed)) continue; // 注释行不算这次交付的行为
+      const short = trimmed.slice(0, 90);
+      const path = String(absPath).split("/").slice(-2).join("/");
+      const sm = /(?:api[_-]?key|apikey|secret|token|passw(?:or)?d|credential)\s*[:=]\s*["'`]([^"'`]{8,})["'`]/i.exec(trimmed);
+      if (sm && !_looksLikeCodeValue(sm[1])) {
+        out.push({ path, line: i + 1, kind: "密钥形字面量写进了源码", text: short, envKey: _envFor("secret") });
+        continue;
+      }
+      if (/(?:localhost|127\.0\.0\.1|0\.0\.0\.0):\d{2,5}\b/.test(trimmed) || /\bport\b["']?\s*[:=]\s*["']?\d{2,5}\b/i.test(trimmed)) {
+        out.push({ path, line: i + 1, kind: "写死的端口/本机地址", text: short, envKey: _envFor("port") });
+        continue;
+      }
+      if (/https?:\/\//.test(trimmed) && !/xmlns|w3\.org|schema\.org|localhost|127\.0\.0\.1/.test(trimmed)) {
+        out.push({ path, line: i + 1, kind: "写死的 URL", text: short, envKey: _envFor("url") });
+        continue;
+      }
+      if (/["'`(=\s](?:\/Users\/|\/home\/|[A-Za-z]:\\\\)/.test(trimmed)) {
+        out.push({ path, line: i + 1, kind: "写死的绝对路径", text: short, envKey: "" });
+      }
+    }
+  });
+  return out;
+}
+
+// ── 这一轮**触及**（新增声明行、或声明行文本变了）的对外导出符号 ────────────────
+//
+// 给有界引用查询供靶子：每轮最多 maxItems 个、每 run 每个符号只查一次（seen 记在
+// run._refQueriedSymbols 上）。只挑**还在文件里**的声明——被删掉的那类走
+// _removedDeclarationsUnchecked（位置都没了，引用查询无处下手）；全新文件里的全新
+// 符号天然没有调用方，也不在这份名单里（重名那一侧由符号索引查重覆盖）。
+function _touchedExportedDecls(run, absPaths, maxItems = 3) {
+  const cp = run?.checkpoint;
+  if (!cp || typeof cp.get !== "function") return [];
+  const DECL = /^export\s+(?:async\s+)?(?:function|class)\s+([A-Za-z_$][\w$]*)|^export\s+(?:const|let|var)\s+([A-Za-z_$][\w$]*)|^pub\s+(?:async\s+)?fn\s+([A-Za-z_][\w]*)|^def\s+([A-Za-z_][\w]*)/;
+  const seen = run._refQueriedSymbols || (run._refQueriedSymbols = new Set());
+  const out = [];
+  for (const abs of Array.isArray(absPaths) ? absPaths : []) {
+    if (out.length >= maxItems) break;
+    const snap = cp.get(abs);
+    const cur = snap?.current;
+    if (typeof cur !== "string" || !snap?.existed || !_CODE_FILE_RE.test(String(abs))) continue;
+    const beforeDecl = new Map();
+    for (const line of String(snap.content || "").split("\n")) {
+      const m = DECL.exec(line);
+      if (m) beforeDecl.set(m[1] || m[2] || m[3] || m[4], line.trim());
+    }
+    const lines = cur.split("\n");
+    for (let i = 0; i < lines.length && out.length < maxItems; i++) {
+      const m = DECL.exec(lines[i]);
+      if (!m) continue;
+      const name = m[1] || m[2] || m[3] || m[4];
+      const prev = beforeDecl.get(name);
+      // 全新符号不查引用（还没有调用方可言）；声明行原样没动的也不查。
+      if (prev === undefined || prev === lines[i].trim()) continue;
+      const key = `${name}@${abs}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      out.push({ name, abs, line: i + 1, character: Math.max(0, lines[i].indexOf(name)) });
+    }
+  }
+  return out;
+}
+
+// ── 改的文件有同名测试文件，而本 run 没读过它、也没有任何验证跑过 ────────────────
+//
+// 判据全是执行事实：testDir 是启动上下文里真实探测到的目录，清单是它下面的真实文件
+// （每 run 只 readDir 一次，缓存在 run 上），「读过没有」问 _runHasRead 的读取台账，
+// 「跑过没有」看工具账本里的 cmd 参数和已识别的验证证据。输出是一条**具体路径**。
+async function _untouchedTestFilesFor(run, root, absPaths, maxItems = 3) {
+  const testDir = _projectStacks.get(root)?.testDir;
+  if (!testDir || !root || !run) return [];
+  if (!run._testDirFiles) {
+    run._testDirFiles = (async () => {
+      const files = [];
+      const q = [[String(root) + "/" + testDir, testDir, 0]];
+      while (q.length && files.length < 400) {
+        const [dirAbs, dirRel, depth] = q.shift();
+        let entries; try { entries = await backend.readDir(dirAbs); } catch { continue; }
+        for (const e of Array.isArray(entries) ? entries : []) {
+          if (!e?.name) continue;
+          if (e.is_dir) { if (depth < 2) q.push([dirAbs + "/" + e.name, dirRel + "/" + e.name, depth + 1]); }
+          else files.push(dirRel + "/" + e.name);
+          if (files.length >= 400) break;
+        }
+      }
+      return files;
+    })().catch(() => []);
+  }
+  const files = await run._testDirFiles;
+  if (!files.length) return [];
+  const _reEsc = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const out = [];
+  for (const abs of Array.isArray(absPaths) ? absPaths : []) {
+    if (out.length >= maxItems) break;
+    if (!_CODE_FILE_RE.test(String(abs)) || _looksLikeTestFile(String(abs))) continue;
+    const base = String(abs).split("/").pop().replace(/\.[^.]+$/, "");
+    if (!base || base.length < 2) continue;
+    const re = new RegExp(`^(?:${_reEsc(base)}[._-](?:test|spec)|test_${_reEsc(base)}|${_reEsc(base)}_test)\\.[a-z]+$`, "i");
+    const hit = files.find((f) => re.test(f.split("/").pop() || ""));
+    if (!hit) continue;
+    if (_runHasRead(run, root, hit)) continue;
+    // 「跑过」两种算：整套验证真被识别跑过（verifiers 有货），或某条命令的参数点名了它。
+    if ((_deliveryFacts(run).verifiers || []).length) continue;
+    const _cmdMentioned = (run._toolLedger?.entries || []).some((e) =>
+      /cmd|task/.test(String(e?.tool || "") + String(e?.category || "")) && String(e?.args || "").includes(base));
+    if (_cmdMentioned) continue;
+    out.push({ src: _normRel(String(abs), root), rel: hit });
+  }
+  return out;
+}
+
 function _checkpointRecord(cp, absPath, existed, content) {
   cp = cp || _runCheckpoint;
   if (!absPath || cp.has(absPath)) return;
@@ -40996,6 +41155,57 @@ async function refreshSymbolIndexFor(path) {
       }
     }
   }
+}
+
+// ── 落盘查重：这次新写的顶层符号，项目里是不是已经有同名实现 ────────────────────
+//
+// 「重复实现」此前全仓零判据：唯一提到它的是 find_symbol 的工具描述，纯靠模型自觉去查。
+// 而 write/edit/multiedit 每次落盘都在无条件刷新 _symbolIndex——落盘那一刻索引里同时
+// 有「刚写的新符号」和「项目里原有的同名符号」，判据就是一次 Map.get。这里对**本次
+// 新增**的行（checkpoint 基线相减，与 _stubDeliveryFindings 同一手法）抽顶层符号名，
+// 命中**别的文件**里的同名定义就把 name @ path:line + 签名行拼进写工具返回值（与
+// _lostNote 同一条已被证明有效的写时事实通道）。索引没建好就一个字不说（降级先例
+// 同 find_symbol）。每 run 每个 path:line 只说一次（run._writeFactsSaid）。
+function _duplicateSymbolNote(run, fp, oldText, newText) {
+  try {
+    if (!_symbolIndexBuilt || !_symbolIndexRoot) return "";
+    const ext = (String(fp).split(".").pop() || "").toLowerCase();
+    const patterns = _symbolPatternsFor(ext);
+    if (!patterns) return "";
+    const rel = String(fp).startsWith(_symbolIndexRoot) ? String(fp).slice(_symbolIndexRoot.length + 1) : String(fp);
+    const before = new Set(String(oldText || "").split("\n").map((l) => l.trim()));
+    const names = new Set();
+    for (const raw of String(newText || "").split("\n")) {
+      const t = raw.trim();
+      if (!t || before.has(t)) continue;
+      for (const [re] of patterns) {
+        const m = re.exec(raw);
+        if (m && m[1]) { names.add(m[1]); break; }
+      }
+      if (names.size >= 12) break;
+    }
+    if (!names.size) return "";
+    // 太通用的名字撞车是常态不是事故，报出来全是噪音。
+    const COMMON = new Set(["main", "init", "test", "setup", "run", "index", "app", "config", "default"]);
+    const said = run && (run._writeFactsSaid || (run._writeFactsSaid = new Set()));
+    const dupes = [];
+    for (const name of names) {
+      if (name.length < 3 || COMMON.has(name.toLowerCase())) continue;
+      const hits = (_symbolIndex.get(name.toLowerCase()) || []).filter((e) => e.path !== rel && e.name === name);
+      for (const h of hits.slice(0, 2)) {
+        const key = `dupe:${name}@${h.path}:${h.line}`;
+        if (said) {
+          if (said.has(key)) continue;
+          said.add(key);
+        }
+        dupes.push(`${name} @ ${h.path}:${h.line}（${h.sig}）`);
+        if (dupes.length >= 4) break;
+      }
+      if (dupes.length >= 4) break;
+    }
+    if (!dupes.length) return "";
+    return `\n⚠️ 本次新增的符号在项目里已有同名实现（符号索引里的真实条目）：${dupes.join("；")}。看一眼那份再决定是复用它还是确有必要另写一份。`;
+  } catch { return ""; }
 }
 
 // ---- Workspace BM25 semantic search ------------------------------------
@@ -49419,6 +49629,9 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
     "blindEdit", "subagentResult", "recovery", "emptyHistoryFact",
     // 「刚改完、这个版本还没验过」是执行记账里的硬事实，丢了模型就会照着"应该没问题"收尾。
     "verifyNow", "uiLook",
+    // 写入质量事实（占位/删了没查引用的导出/盲覆写/硬编码/真实引用/没碰过的同名测试）：
+    // 全部来自 checkpoint 基线相减和只读查询，丢了模型就按「刚写的都没问题」的图景继续。
+    "writeFacts",
     // 「页面写了，可这个 run 一条真实产品事实都没取到过」同理：丢了它，模型就按
     // "内容没问题" 的图景继续把编出来的文案铺满整站。判据是取证台账空不空，是硬事实。
     // （referenceSite 故意**不**登记：参考站律每轮都在提示词里，模型收得到信号，
@@ -52017,6 +52230,22 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
           root,
           run._diagnosticBaselineCounts,
         );
+        // 「没有检查器看过」是事实，不是「干净」。这里只登记（run 级去重），
+        // 说出去统一走下面写入质量事实那条通道；verifyNow 也读 run._uncheckedLangs，
+        // 在没有语言检查器的语言上把「这条命令是唯一的正确性检查」这半句事实补上。
+        if (Array.isArray(_d.unchecked) && _d.unchecked.length) {
+          run._uncheckedLangs = run._uncheckedLangs || new Set();
+          const _wfSaid0 = run._writeFactsSaid || (run._writeFactsSaid = new Set());
+          const _freshUnchecked = _d.unchecked.filter((u) => u?.rel && !_wfSaid0.has("unchecked:" + u.rel));
+          for (const u of _freshUnchecked) {
+            _wfSaid0.add("unchecked:" + u.rel);
+            run._uncheckedLangs.add(String(u.lang || ""));
+          }
+          if (_freshUnchecked.length) {
+            (run._writeFactsPending = run._writeFactsPending || []).push(
+              `这一轮改的 ${_freshUnchecked.map((u) => u.rel).slice(0, 4).join("、")}${_freshUnchecked.length > 4 ? ` 等 ${_freshUnchecked.length} 个文件` : ""} 没有任何检查器看过（${[...new Set(_freshUnchecked.map((u) => u.lang))].join("/")} 的语言服务器没在运行）——诊断门对它们是空白，不等于「没有错误」`);
+          }
+        }
         // ── 收敛计数 + 真正的阻断内容 ────────────────────────────────────────
         // `run._diagnosticBlock` 曾经是**只写不读**的：三处赋值全是 `""`，唯一的读取点
         // （下面 quiet-turn 里的 `_codeDeliveredUnverified`）因此恒真地跳过它，而
@@ -52449,6 +52678,105 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
         }
       }
 
+      // ── 写入质量事实：算完当场说，不等收尾 ──────────────────────────────────
+      //
+      // 三个写入质量扫描器（新写进去的占位、删了没查引用的导出、没读过还覆写掉一半）
+      // 此前只在静默收尾轮被调用：结果写进 run._stubFindings / _removedDecls /
+      // _blindOverwrites 之后紧跟 break，模型侧永远读不到；用户侧的建议卡又被排在
+      // 前面的 code_delivered_unverified 先占先得地吞掉。收尾门那套「只记账、不补
+      // 回合」的设计不动——这里是在**刚落盘的这一轮**把同样的执行事实（checkpoint
+      // 基线相减 + 各类台账，不跑任何命令）经 _pushNudge 事实类通道交回模型，此刻
+      // 它还在干活、还来得及改。有界：run 级 Set 去重（同一处每 run 只说一次）、
+      // 每轮最多 8 条、引用查询每轮最多 3 个符号且只做进程内只读查询。
+      if (_live() && run.mode === "agent" && (run._lastSuccessfulEdits || []).length) {
+        const _wfSaid = run._writeFactsSaid || (run._writeFactsSaid = new Set());
+        const _wfLines = [];
+        // ⓪ 诊断门发现的「没有检查器看过」——它解释了后面为什么只剩命令能兜底。
+        for (const pendingLine of (run._writeFactsPending || [])) _wfLines.push(pendingLine);
+        run._writeFactsPending = [];
+        // ① 这次交付新写进去的占位/假数据（基线相减，只报有原文佐证的字面命中）。
+        try {
+          const _wfStubs = _stubDeliveryFindings(run);
+          if (_wfStubs.length) run._stubFindings = _wfStubs;
+          for (const s of _wfStubs) {
+            const k = `stub:${s.path}:${s.line}`;
+            if (_wfSaid.has(k)) continue;
+            _wfSaid.add(k);
+            _wfLines.push(`新写进去的占位：${s.path}:${s.line}（${s.kind}）「${s.text}」——这一处现在是空的`);
+          }
+        } catch {}
+        // ② 删掉的、本 run 从没检索过的对外声明（检索词从工具账本现取，与收尾门同判据）。
+        try {
+          const _wfTerms = new Set();
+          for (const e of (run._toolLedger?.entries || [])) {
+            if (!/^(?:search|find_symbol|lsp_references|lsp_definition|semantic_search|grep)/.test(String(e?.tool || ""))) continue;
+            try {
+              const a = JSON.parse(e.args || "{}");
+              for (const v of [a.query, a.name, a.pattern, a.symbol]) if (v) _wfTerms.add(String(v));
+            } catch {}
+          }
+          const _wfGone = _removedDeclarationsUnchecked(run, _wfTerms);
+          if (_wfGone.length) run._removedDecls = _wfGone;
+          for (const g of _wfGone) {
+            const k = `removed:${g.name}@${g.path}`;
+            if (_wfSaid.has(k)) continue;
+            _wfSaid.add(k);
+            _wfLines.push(`删掉了对外声明 ${g.name}（原在 ${g.path}），本 run 还没查过谁在引用它`);
+          }
+        } catch {}
+        // ③ 没读过还整文件覆写掉一大半（记账在上面 blindEdit 块里，这里就地转述）。
+        for (const b of (run._blindOverwrites || [])) {
+          const k = `overwrote:${b}`;
+          if (_wfSaid.has(k)) continue;
+          _wfSaid.add(k);
+          _wfLines.push(`整文件覆写 ${b} 且本 run 从没读过它——消失的行没有人看过一眼`);
+        }
+        // ④ 新增行里的硬编码字面量；命中 .env 里已有的配置项时点名那一项。
+        try {
+          for (const h of _hardcodedDeliveryFindings(run, _envKeysByRoot.get(root) || [])) {
+            const k = `hard:${h.path}:${h.line}`;
+            if (_wfSaid.has(k)) continue;
+            _wfSaid.add(k);
+            _wfLines.push(h.envKey
+              ? `硬编码：${h.path}:${h.line}（${h.kind}）「${h.text}」——项目 .env 里已经有配置项 ${h.envKey}`
+              : `硬编码：${h.path}:${h.line}（${h.kind}）「${h.text}」`);
+          }
+        } catch {}
+        // ⑤ 触及的导出符号做一次真实引用查询（进程内只读：JS/TS 走 TS worker，
+        //    其它语言只在语言服务器在跑时查；查不成就一个字不下结论）。
+        try {
+          for (const t of _touchedExportedDecls(run, run._lastSuccessfulEdits || [], 3)) {
+            const _tExt = (t.abs.split(".").pop() || "").toLowerCase();
+            let _refs = null;
+            if (/^(?:js|jsx|mjs|cjs|ts|tsx|mts|cts)$/.test(_tExt)) {
+              try { _refs = await _tsWorkerLocate(t.abs, t.line, t.character, "references"); } catch {}
+            } else {
+              const _tLang = _lintableLangId(t.abs.split("/").pop() || "");
+              if (_tLang && lspManager?.isRunning?.(_tLang)) {
+                try { _refs = await lspManager.agentLocate(t.abs, t.line, t.character, "references"); } catch {}
+              }
+            }
+            if (!Array.isArray(_refs)) continue; // 没查成 ≠ 没有引用，不说
+            const _others = _refs.filter((r2) => r2?.path && r2.path !== t.abs);
+            _wfLines.push(_others.length
+              ? `${t.name} 的声明这一轮改过，它的真实引用在：${_others.slice(0, 4).map((r2) => `${_normRel(r2.path, root)}${r2.line ? ":" + r2.line : ""}`).join("、")}${_others.length > 4 ? ` 等 ${_others.length} 处` : ""}——这些调用点得对上新的声明`
+              : `${t.name} 的声明这一轮改过；本文件之外查不到它的任何引用`);
+          }
+        } catch {}
+        // ⑥ 改的文件有同名测试文件，而本 run 没读过它、也没有任何验证跑过——点名那条路径。
+        try {
+          for (const hit of await _untouchedTestFilesFor(run, root, run._lastSuccessfulEdits || [])) {
+            const k = `testfile:${hit.rel}`;
+            if (_wfSaid.has(k)) continue;
+            _wfSaid.add(k);
+            _wfLines.push(`${hit.src} 有专门的测试文件 ${hit.rel}，写着它的预期契约——本 run 没读过它，也没有任何验证跑过`);
+          }
+        } catch {}
+        if (_wfLines.length) {
+          _pushNudge("writeFacts", `[写入质量事实]（对本轮真实落盘内容的扫描与只读查询，不是推断）\n- ${_wfLines.slice(0, 8).join("\n- ")}`);
+        }
+      }
+
       // ── 改完就该验：在**刚改完那一下**说，不是等到收尾 ────────────────────────
       //
       // 收尾那道「改了代码、零验证证据」是**只记账、不补回合**的，而且被两条测试正面钉着
@@ -52484,6 +52812,9 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
             + (_cmd
               ? `这个项目的验证命令是 \`${_cmd}\`——现在跑它（run_cmd，purpose="verify"），拿到退出码再往下走。`
               : `跑一遍这个项目自己的编译/类型检查/测试；没有现成命令就用最直接的那条（能跑起来入口、或 tsc --noEmit 之类）。`)
+            + (run._uncheckedLangs && run._uncheckedLangs.size
+              ? `本 run 改过的 ${[...run._uncheckedLangs].join("/")} 文件没有任何语言检查器在看（对应语言服务器没在运行），这条命令是那些改动**唯一**的正确性检查。`
+              : "")
             + `没有任何东西会替你跑：不跑就交付，等于把没编译过的代码交给用户。`);
         }
       }
@@ -56587,7 +56918,9 @@ async function _executeToolStepInner(step, call, root, run) {
       // overwroteExisting：把「这次写的是一个**本来就存在**的文件」这个事实结构化带出去。
       // 新建文件不需要先读，覆写已有文件需要——而下游那两道「没读就写」的闸门此前只能
       // 从中文文案里猜，于是干脆只管 edit/multi_edit，把破坏性最大的那种放过去了。
-      return { type: call.type, path: fp, mutated: true, overwroteExisting: !!existed, linesLost: _lostLines, content: (existed ? `已修改 ${call.path}（+${added}/-${removed} 行${resolvedNote}）。` : `已新建 ${call.path}（${added} 行${resolvedNote}）。`) + _lostNote + (_editNote || "") + (_redactNote || "") };
+      // 重复实现查重：新增顶层符号命中项目里别的文件的同名定义时，事实随写入结果一起回。
+      const _dupNote = _duplicateSymbolNote(run, fp, existed ? old : "", newContent);
+      return { type: call.type, path: fp, mutated: true, overwroteExisting: !!existed, linesLost: _lostLines, content: (existed ? `已修改 ${call.path}（+${added}/-${removed} 行${resolvedNote}）。` : `已新建 ${call.path}（${added} 行${resolvedNote}）。`) + _lostNote + (_editNote || "") + (_redactNote || "") + _dupNote };
 
     } else if (call.type === "multiedit") {
       const fp = _boundRunFilePath(run, root, call.path) || await _resolveExisting(call.path, root);
@@ -56768,7 +57101,7 @@ async function _executeToolStepInner(step, call, root, run) {
           } catch (err) { showToast("Undo failed: " + (err?.message || err)); }
         });
       }
-      return { type: "multiedit", path: fp, mutated: true, content: `已对 ${call.path} 应用 ${edits.length} 处替换（+${added}/-${removed} 行）。` + (_mEditNote || "") };
+      return { type: "multiedit", path: fp, mutated: true, content: `已对 ${call.path} 应用 ${edits.length} 处替换（+${added}/-${removed} 行）。` + (_mEditNote || "") + _duplicateSymbolNote(run, fp, old, newContent) };
 
     } else if (call.type === "search") {
       const q = (call.query || "").trim();
@@ -66999,23 +67332,32 @@ const _INTERLEAVED_DIAG_MAX_WAIT_MS = 4000;
 // read. `baselineCounts` is captured before the first mutation of each file, so
 // pre-existing project errors do not get blamed on the current Agent run.
 async function _interleavedDiagnostics(editedRelPaths, root = "", baselineCounts = null) {
-  if (!editedRelPaths.length || typeof monaco === "undefined") return { ran: false, report: "", counts: new Map(), newErrorCount: 0 };
+  if (!editedRelPaths.length || typeof monaco === "undefined") return { ran: false, report: "", counts: new Map(), newErrorCount: 0, unchecked: [] };
   const targets = []; // { rel, model, created, isTs }
-  // 上限原来是 6：一轮改超过 6 个文件，第 7 个起**完全不检查**，而且不声张。
-  // 一次重构动十几个文件是常态。
+  // 「查过了，是干净的」和「这门语言根本没有检查器」是两个状态，此前在返回值里同形：
+  // 没装语言服务器时 didOpen 是 no-op，等满超时读到 0 个 marker，newErrorCount = 0，
+  // 与真干净字节级不可区分——非 JS/TS 项目里这道唯一的写时正确性门结构性哑掉，还每轮
+  // 白等 _INTERLEAVED_DIAG_MAX_WAIT_MS。判据是现成的一个布尔查询：lspManager.isRunning。
+  // 服务器没在跑的文件不建 model、不进等待循环，改记进 unchecked 让调用方当事实说出去。
+  const unchecked = []; // [{ rel, lang }] —— 没有任何检查器看过的目标文件
   for (const rel of editedRelPaths.slice(0, _INTERLEAVED_DIAG_MAX_FILES)) {
     const ext = (rel.split(".").pop() || "").toLowerCase();
     if (!_LINTABLE_EXT.has(ext)) continue;
     let abs = rel;
     try { abs = await _resolveExisting(rel, root); } catch {}
-    let uri; try { uri = monaco.Uri.file(abs); } catch { continue; }
     const isTs = _TS_EXT.has(ext);
+    const _jsFamily = isTs || ext === "js" || ext === "jsx" || ext === "mjs" || ext === "cjs";
+    const langId = _lintableLangId(rel) || (isTs ? "typescript" : "javascript");
+    if (!_jsFamily && !(lspManager?.isRunning?.(langId))) {
+      unchecked.push({ rel: _normRel(abs, root), lang: langId });
+      continue;
+    }
+    let uri; try { uri = monaco.Uri.file(abs); } catch { continue; }
     let model = monaco.editor.getModel(uri);
     let created = false;
     if (!model) {
       let content = "";
       try { content = await backend.readTextFile(abs); } catch { continue; }
-      const langId = _lintableLangId(rel) || (isTs ? "typescript" : "javascript");
       try { model = monaco.editor.createModel(content, langId, uri); created = true; } catch { continue; }
       // 光建 Monaco model 不够：TS/JS 由 Monaco 自带 worker 分析，**其余语言的诊断来自
       // 语言服务器**，而服务器只会分析它被 didOpen 告知过的文档。模型刚写完、从没被打开
@@ -67025,7 +67367,7 @@ async function _interleavedDiagnostics(editedRelPaths, root = "", baselineCounts
     }
     targets.push({ rel: _normRel(abs, root), model, created, isTs });
   }
-  if (!targets.length) return { ran: false, report: "", counts: new Map(), newErrorCount: 0 };
+  if (!targets.length) return { ran: false, report: "", counts: new Map(), newErrorCount: 0, unchecked };
   // 诊断是异步来的，而且两条来源的延迟差一个数量级：Monaco 自带的 TS worker 通常几百
   // 毫秒，真 LSP（rust-analyzer / pyright / gopls）冷启动要好几秒。原来固定等 900ms，
   // 对 LSP 语言等于"还没出结果就读，读到空的，判成无新增错误"——门看着在跑，实际恒放行。
@@ -67070,7 +67412,7 @@ async function _interleavedDiagnostics(editedRelPaths, root = "", baselineCounts
     try { lspManager?.didClose(t.model?.uri?.fsPath || t.model?.uri?.path || ""); } catch {}
     try { t.model.dispose(); } catch {}
   }
-  return { ran: true, report: reports.join("\n\n"), counts, newErrorCount };
+  return { ran: true, report: reports.join("\n\n"), counts, newErrorCount, unchecked };
 }
 
 // Run the project's test command (auto-detected) and return a compact failure
