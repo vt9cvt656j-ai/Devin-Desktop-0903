@@ -491,7 +491,7 @@ static CHAT_UPSTREAM_ROUTE_STALLS: LazyLock<Mutex<HashMap<uuid::Uuid, Instant>>>
 
 /// 记号的有效期。比冷却长得多：冷却是"这一轮换条线走"，而这个是"这条线的脾气"，
 /// 需要跨越好几轮请求才看得出来。
-const CHAT_UPSTREAM_STALL_MEMORY: Duration = Duration::from_secs(120);
+pub(crate) const CHAT_UPSTREAM_STALL_MEMORY: Duration = Duration::from_secs(120);
 
 /// 对一条最近卡满过的线路，单次表头等待的上限。
 ///
@@ -764,7 +764,7 @@ fn mark_route_cooldown_auth(id: uuid::Uuid) {
 }
 
 /// 这条线路在记忆窗口内卡满过表头预算吗。
-fn route_recently_stalled(id: uuid::Uuid, now: Instant) -> bool {
+pub(crate) fn route_recently_stalled(id: uuid::Uuid, now: Instant) -> bool {
     let Ok(mut guard) = CHAT_UPSTREAM_ROUTE_STALLS.lock() else {
         return false;
     };
@@ -778,9 +778,20 @@ fn route_recently_stalled(id: uuid::Uuid, now: Instant) -> bool {
     }
 }
 
-fn mark_route_stall(id: uuid::Uuid) {
+pub(crate) fn mark_route_stall(id: uuid::Uuid) {
     if let Ok(mut guard) = CHAT_UPSTREAM_ROUTE_STALLS.lock() {
         guard.insert(id, Instant::now() + CHAT_UPSTREAM_STALL_MEMORY);
+    }
+}
+
+/// 后台探针确认这条线路又能回话了 —— 把冷却也一并撤掉。
+///
+/// 冷却表平时靠到期自清；这里显式清是因为探针拿到的是**新于冷却**的证据：一条刚被
+/// 探通的线路没有理由继续排在后面。清掉的包括鉴权冷却，因为探针带着同一把 key 拿到了
+/// 2xx，坏 key 的前提已经不成立。
+pub(crate) fn clear_route_cooldown(id: uuid::Uuid) {
+    if let Ok(mut guard) = CHAT_UPSTREAM_ROUTE_COOLDOWNS.lock() {
+        guard.remove(&id);
     }
 }
 
@@ -789,10 +800,23 @@ fn mark_route_stall(id: uuid::Uuid) {
 /// 这一条是"自愈"的全部机制：上游一旦恢复，第一个成功的请求就把短探测预算撤掉，
 /// 后面的请求拿回完整的 57 秒。没有它，短探测会自我延续 —— 被 25 秒截断的失败又写一
 /// 次记号，一条只是慢的线路会被永远按在 25 秒上。
-fn clear_route_stall(id: uuid::Uuid) {
+pub(crate) fn clear_route_stall(id: uuid::Uuid) {
     if let Ok(mut guard) = CHAT_UPSTREAM_ROUTE_STALLS.lock() {
         guard.remove(&id);
     }
+}
+
+/// 这一轮该不该把这条线路排到同模型候选的末尾。
+///
+/// 三个记号的语义完全一致：只是**重排**，不是排除 —— 有别的同模型线路时先试别人，
+/// 记号到期或被撤销后自动回到排头。只有一条线路时谁都不动（`route_count > 1`），
+/// 那种情形由 `header_wait_for_route` 的短探测预算兜着。
+///
+/// 卡死记号以前不在这里：它只压缩表头耐心，排序只看 20 秒的瞬时冷却。于是主线路
+/// 挂掉时，冷却一过（对话节奏下几乎每条消息都过了），请求又落回死线路、垫满 25 秒
+/// 才 504 —— 旁边那条健康线路从头到尾没被优先过。
+fn route_goes_to_the_back(route_count: usize, cooled: bool, mutes: bool, stalled: bool) -> bool {
+    route_count > 1 && (cooled || mutes || stalled)
 }
 
 /// 这一次给这条线路多少表头耐心。
@@ -7509,7 +7533,19 @@ pub async fn chat_completions(
             // 要了思考却一个字都不回的线路：有别的同模型线路可走时排到后面。
             // 和冷却一样只是**重排**，不是排除——到期自动再探，上游恢复了就自己回来。
             let mutes = wants_thinking && route_mutes_thinking(candidate.id, now);
-            if route_count > 1 && (cooled || mutes) {
+            // 最近卡满过表头预算的线路同理：停机期间别让每条消息都先在它上面垫 25 秒。
+            let stalled = route_recently_stalled(candidate.id, now);
+            if route_goes_to_the_back(route_count, cooled, mutes, stalled) {
+                if stalled {
+                    tracing::info!(
+                        request_id = request_id.as_deref().unwrap_or(""),
+                        model = %model_id,
+                        route_id = %candidate.id,
+                        route_count,
+                        stalled_and_deprioritised = true,
+                        "route recently stalled; trying healthier same-model routes first"
+                    );
+                }
                 cooled_candidates.push(candidate);
             } else {
                 ordered_candidates.push(candidate);
@@ -7753,6 +7789,8 @@ pub async fn chat_completions(
                         // 卡满整段预算才失败，是最该被面板看见的一种坏 —— 这次事故那条线
                         // 44 小时全是这个形状。
                         route_health::spawn_fail(&state, candidate.id, 504);
+                        // 恢复判定交给后台 1-token 探针，不再由下一个用户的真实请求付费。
+                        route_health::spawn_stall_recovery(&state, candidate.clone());
                         route_failed_transient = true;
                         break;
                     }
@@ -14898,6 +14936,64 @@ mod route_cooldown_tests {
         mark_route_stall(id);
         let after_memory = Instant::now() + CHAT_UPSTREAM_STALL_MEMORY + Duration::from_secs(1);
         assert!(!route_recently_stalled(id, after_memory));
+    }
+}
+
+#[cfg(test)]
+mod stall_routing_tests {
+    use super::*;
+
+    /// 卡死记号必须参与选路排序，而且语义和冷却/吞思考一致：只是重排，不是排除。
+    ///
+    /// 以前记号只压缩表头耐心、不参与排序，于是主线路挂掉时冷却（20s）一过，请求又落回
+    /// 死线路垫满 25 秒才 504，旁边的健康线路一次都没被优先过。
+    #[test]
+    fn a_stalled_route_goes_to_the_back_when_there_is_another_route() {
+        // 只因卡死就该排后面
+        assert!(route_goes_to_the_back(2, false, false, true));
+        // 原有两个判据不变
+        assert!(route_goes_to_the_back(2, true, false, false));
+        assert!(route_goes_to_the_back(2, false, true, false));
+        assert!(!route_goes_to_the_back(2, false, false, false));
+        // 只有一条线路时不动：那种情形靠短探测预算兜着，不是靠排序
+        assert!(!route_goes_to_the_back(1, false, false, true));
+        assert!(!route_goes_to_the_back(1, true, true, true));
+    }
+
+    /// 记号的生命周期要和排序接得上：记下就排后面，撤掉/过期就回排头。
+    #[test]
+    fn the_stall_mark_feeds_ordering_and_releases_on_recovery() {
+        let id = uuid::Uuid::new_v4();
+        let now = Instant::now();
+        assert!(!route_goes_to_the_back(2, false, false, route_recently_stalled(id, now)));
+        mark_route_stall(id);
+        assert!(route_goes_to_the_back(2, false, false, route_recently_stalled(id, Instant::now())));
+        clear_route_stall(id);
+        assert!(!route_goes_to_the_back(2, false, false, route_recently_stalled(id, Instant::now())));
+        mark_route_stall(id);
+        let expired = Instant::now() + CHAT_UPSTREAM_STALL_MEMORY + Duration::from_secs(1);
+        assert!(!route_goes_to_the_back(2, false, false, route_recently_stalled(id, expired)));
+    }
+
+    /// 后台探针探通后撤冷却：鉴权冷却也一并撤，因为同一把 key 刚刚拿到了 2xx。
+    #[test]
+    fn a_probe_success_clears_the_cooldown() {
+        let id = uuid::Uuid::new_v4();
+        mark_route_cooldown_auth(id);
+        assert!(route_cooldown_remaining(id, Instant::now()).is_some());
+        clear_route_cooldown(id);
+        assert!(route_cooldown_remaining(id, Instant::now()).is_none());
+    }
+
+    /// 纯函数对了还不算数：派单路径上排序那一处必须真的读记号、真的把结果喂给判据。
+    /// 拼串查找，避免本测试自己喂绿自己；只认调用形态，不认注释里的说明。
+    #[test]
+    fn dispatch_ordering_reads_the_stall_mark() {
+        let src = include_str!("models.rs");
+        let read = format!("let stalled = {}(candidate.id, now);", "route_recently_stalled");
+        assert!(src.contains(&read), "排序没有读卡死记号 —— 记了也白记，用户照样先撞死线路");
+        let judge = format!("if {}(route_count, cooled, mutes, stalled) {{", "route_goes_to_the_back");
+        assert!(src.contains(&judge), "排序没有把卡死记号喂进判据");
     }
 }
 

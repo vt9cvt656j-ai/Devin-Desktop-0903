@@ -35,7 +35,9 @@
 //! 重新造出这里要杀掉的假绿灯。这里只在**结局确实已知**的四个点显式记一次，客户端取消
 //! 时什么都不执行 —— 不写，就不会写错。
 
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::collections::HashSet;
+use std::sync::{LazyLock, Mutex};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use uuid::Uuid;
 
@@ -260,6 +262,112 @@ async fn canary_once(m: &crate::models::Model) -> Option<(bool, u16)> {
         // 超时/连不上：和派单路径上的卡死是同一种坏，用同一个码，面板上读起来一致。
         Err(_) => Some((false, 504)),
     }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 卡死恢复探针：停机期间不让用户当探针
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// 派单路径上一条线路卡满表头预算后会记一个 120 秒的卡死记号（`models::mark_route_stall`）。
+// 在这之前，记号只有两种退出方式：用户的真实请求真的拿到表头，或者 120 秒自然过期。
+// 两种都由用户付费：记号在世时每个落上去的请求挂 25 秒；过期后下一个用户再挂满 57 秒；
+// 停机持续多久就循环多久 —— 44 小时事故就是这个形状。而上面的巡检金丝雀反而不探它：
+// 每次失败都刷新 last_attempt_at，被当成「有新鲜证据」跳过。
+//
+// 对用户请求做并发赛马是不行的：首字节=全文的中转在回表头前已经在跑模型，双发就是
+// 双计费（models.rs 里「一次用户发送只对应一次上游调用」那条不变量）。所以赛的是探针：
+// 卡死后按线路起一个后台任务，每 30 秒发一次 1-token 的最小真实请求（复用 `canary_once`
+// 的协议分支）。失败就把记号续上 —— 停机期间线路持续降权、持续短预算，而不是 120 秒后
+// 让用户去撞；成功就撤记号、撤冷却、记一次真实成功，任务退出。
+//
+// 纪律：
+//   · 只对有记号的线路跑，记号一消失（真实流量拿到表头、或兜底过期）任务立刻停；
+//   · 同一条线路只有一个任务；并发任务总数有上限 —— 超出的线路退回 120 秒过期的老路；
+//   · 受同一个 ROUTE_CANARY 开关约束，因为它花的也是真钱；
+//   · 「无从探起」（None）什么都不记、任务退出，和巡检金丝雀一样不伪造证据。
+
+/// 两次恢复探测之间的间隔。必须明显短于卡死记号的有效期，否则记号会在两次探测之间
+/// 过期、线路回到排头、用户又成了探针。
+const STALL_RECOVERY_EVERY: Duration = Duration::from_secs(30);
+/// 同时在跑的恢复任务上限。一次把整批线路都卡死（上游整体故障）时，不让探针本身
+/// 变成一次小型压测；超出上限的线路退回 120 秒自然过期那条老路。
+const STALL_RECOVERY_MAX_CONCURRENT: usize = 4;
+
+/// 正在跑恢复任务的线路。进程内存即可：记号本身也在进程内存里，发版两边一起清零。
+static STALL_RECOVERY_ACTIVE: LazyLock<Mutex<HashSet<Uuid>>> =
+    LazyLock::new(|| Mutex::new(HashSet::new()));
+
+/// 这条线路现在能不能起一个恢复任务。返回 true 表示**已经占了名额**，调用方必须保证
+/// 任务结束时 `stall_recovery_release`。
+fn stall_recovery_admit(route_id: Uuid) -> bool {
+    let Ok(mut active) = STALL_RECOVERY_ACTIVE.lock() else {
+        return false;
+    };
+    if active.contains(&route_id) || active.len() >= STALL_RECOVERY_MAX_CONCURRENT {
+        return false;
+    }
+    active.insert(route_id);
+    true
+}
+
+fn stall_recovery_release(route_id: Uuid) {
+    if let Ok(mut active) = STALL_RECOVERY_ACTIVE.lock() {
+        active.remove(&route_id);
+    }
+}
+
+/// 任务无论怎么结束（正常退出、panic、运行时关闭时被丢弃）都把名额还回去。
+struct StallRecoverySlot(Uuid);
+impl Drop for StallRecoverySlot {
+    fn drop(&mut self) {
+        stall_recovery_release(self.0);
+    }
+}
+
+/// 一条线路刚刚卡满表头预算 —— 起一个后台任务替用户去探它什么时候恢复。
+///
+/// 调用时机是派单路径上 `mark_route_stall` 之后。派单路径上一个 await 都不加：这里只
+/// 占名额、spawn，立刻返回。
+pub fn spawn_stall_recovery(state: &AppState, m: crate::models::Model) {
+    if !canary_enabled() {
+        return;
+    }
+    if !stall_recovery_admit(m.id) {
+        return;
+    }
+    let st = state.clone();
+    tokio::spawn(async move {
+        let _slot = StallRecoverySlot(m.id);
+        loop {
+            tokio::time::sleep(STALL_RECOVERY_EVERY).await;
+            // 记号没了 —— 要么真实流量已经拿到表头（clear_route_stall），要么兜底过期。
+            // 两种都不该再花钱探。
+            if !crate::models::route_recently_stalled(m.id, Instant::now()) {
+                tracing::info!(route = %m.label, "卡死记号已撤，恢复探针退出");
+                return;
+            }
+            match canary_once(&m).await {
+                Some((true, status)) => {
+                    crate::models::clear_route_stall(m.id);
+                    crate::models::clear_route_cooldown(m.id);
+                    record_ok(&st, m.id).await;
+                    tracing::info!(route = %m.label, status, "卡死线路已由后台探针确认恢复，回到轮换");
+                    return;
+                }
+                Some((false, status)) => {
+                    // 还没好：把记号续上，让它在停机期间持续降权、持续短预算。
+                    crate::models::mark_route_stall(m.id);
+                    record_fail(&st, m.id, status).await;
+                    tracing::warn!(route = %m.label, status, "卡死线路仍未恢复（后台探针）");
+                }
+                // 无从探起（没有任何可用模型 id）：什么都不记，退出。记号按 120 秒自然过期。
+                None => {
+                    tracing::warn!(route = %m.label, "恢复探针无从探起：这条线路没有任何可用模型 id");
+                    return;
+                }
+            }
+        }
+    });
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -743,6 +851,102 @@ mod tests {
         assert!(
             loop_src.contains("None =>") && !loop_src.contains("None => record_ok"),
             "调用方没有为「没有证据」留一条什么都不做的分支",
+        );
+    }
+
+    /// 卡死线路的恢复判定由后台探针接管，用户的真实请求不再当探针。
+    ///
+    /// 节奏必须钉住：探测间隔短于记号有效期，否则记号在两次探测之间过期、线路回到排头、
+    /// 下一个用户又去撞满 57 秒 —— 正是这条要消灭的形态。
+    #[test]
+    fn stall_recovery_probes_faster_than_the_mark_expires() {
+        assert!(
+            STALL_RECOVERY_EVERY * 2 <= crate::models::CHAT_UPSTREAM_STALL_MEMORY,
+            "探测间隔 {STALL_RECOVERY_EVERY:?} 太稀疏，记号会在两次探测之间过期",
+        );
+        assert!(STALL_RECOVERY_EVERY >= Duration::from_secs(10), "探得太密，停机期间白烧钱");
+        assert!(
+            CANARY_TIMEOUT <= STALL_RECOVERY_EVERY,
+            "单次探测耐心超过间隔，探针会自己叠自己",
+        );
+        assert!(STALL_RECOVERY_MAX_CONCURRENT >= 1 && STALL_RECOVERY_MAX_CONCURRENT <= 8);
+    }
+
+    /// 同一条线路只许一个任务，总数有上限，名额用完能还。
+    #[test]
+    fn stall_recovery_admission_is_bounded() {
+        // 别的测试也可能占着名额：先把这组用到的 id 清干净，结束时再还回去。
+        let ids: Vec<Uuid> = (0..STALL_RECOVERY_MAX_CONCURRENT + 1).map(|_| Uuid::new_v4()).collect();
+        let baseline = STALL_RECOVERY_ACTIVE.lock().map(|a| a.len()).unwrap_or(0);
+        let room = STALL_RECOVERY_MAX_CONCURRENT.saturating_sub(baseline);
+        if room == 0 {
+            // 并发跑的别的用例把名额占满了，本用例的判定没意义；只验证拒绝。
+            assert!(!stall_recovery_admit(ids[0]));
+            return;
+        }
+        assert!(stall_recovery_admit(ids[0]), "空闲时必须放行");
+        assert!(!stall_recovery_admit(ids[0]), "同一条线路第二次必须拒绝 —— 一条线一个任务");
+        for id in ids.iter().skip(1).take(room - 1) {
+            assert!(stall_recovery_admit(*id));
+        }
+        assert!(
+            !stall_recovery_admit(ids[room]),
+            "超过 {STALL_RECOVERY_MAX_CONCURRENT} 个并发任务必须拒绝",
+        );
+        stall_recovery_release(ids[0]);
+        assert!(stall_recovery_admit(ids[room]), "释放后名额要能再用");
+        for id in ids.iter().take(room + 1) {
+            stall_recovery_release(*id);
+        }
+        assert!(!STALL_RECOVERY_ACTIVE.lock().unwrap().contains(&ids[0]));
+    }
+
+    /// 任务的结构必须是：只对有记号的线路跑、恢复即停、失败续记号、受开关约束、None 不记账。
+    ///
+    /// 钉的是实现特征（调用点），不是文案。需要的串拼出来找，避免本测试自己喂绿自己。
+    #[test]
+    fn stall_recovery_task_stops_when_the_mark_is_gone_and_refreshes_it_on_failure() {
+        let src = include_str!("route_health.rs");
+        let body = src
+            .split("pub fn spawn_stall_recovery(")
+            .nth(1)
+            .and_then(|s| s.split("\n}\n").next())
+            .expect("spawn_stall_recovery 不见了");
+        let stalled_read = format!("{}(m.id, Instant::now())", "route_recently_stalled");
+        assert!(
+            body.contains(&format!("if !crate::models::{stalled_read}")),
+            "任务没有在每轮前检查记号是否还在 —— 线路恢复后探针不会停",
+        );
+        assert!(
+            body.contains(&format!("{}(m.id)", "clear_route_stall"))
+                && body.contains(&format!("{}(m.id)", "clear_route_cooldown")),
+            "探通之后没有撤记号/撤冷却，线路回不到排头",
+        );
+        assert!(
+            body.contains(&format!("{}(m.id)", "mark_route_stall")),
+            "失败没有续记号 —— 120 秒后记号过期，用户又成了探针",
+        );
+        assert!(body.contains("canary_enabled()"), "恢复探针花的是真钱，必须受 ROUTE_CANARY 约束");
+        assert!(body.contains("stall_recovery_admit(m.id)"), "没有并发上限");
+        assert!(
+            body.contains("None =>") && !body.contains("None => record_ok"),
+            "「无从探起」必须什么都不记",
+        );
+        // record_ok 只能出现在探针成功那一支里。
+        let ok_arm = body.split("Some((true,").nth(1).and_then(|s| s.split("Some((false,").next()).unwrap_or("");
+        assert!(ok_arm.contains("record_ok("), "探通了却不记成功，面板看不到恢复");
+        let fail_arm = body.split("Some((false,").nth(1).unwrap_or("");
+        assert!(!fail_arm.contains("record_ok("), "失败支里记了成功");
+        // 派单路径必须真的起它 —— 写好了零调用点是这个仓库反复出现的失败模式。
+        let models_src = include_str!("models.rs");
+        let stall_site = models_src
+            .split(&format!("{}(candidate.id);", "mark_route_stall"))
+            .nth(1)
+            .expect("派单路径上的 mark_route_stall 不见了");
+        let after = &stall_site[..stall_site.len().min(600)];
+        assert!(
+            after.contains("spawn_stall_recovery(&state, candidate.clone())"),
+            "卡死之后没有起恢复探针，恢复判定仍由用户的真实请求付费",
         );
     }
 
