@@ -492,3 +492,22 @@ test("旗标 → 域名的反向映射不会拼出目录外的东西", () => {
     assert.deepEqual(flagDomains(header), [name], `${name} 的旗标来回丢了字`);
   }
 });
+
+test("设计已经在场时不再发 michael-design 域旗标——同一份语料不注两遍", () => {
+  // michael-design 有自己的专属通道（design 旗标 → design_knowledge_block + 客户端设计预检）。
+  // 域旗标再报一次，网关会按域限定检索**同一份**语料并二次注入：网关侧实测系统提示
+  // 42KB → 69KB，纯重复。抑制必须在 IDE 侧做——网关无从知道 design 通道已经注了什么。
+  const profile = load("_ideSemanticProfile");
+  const withDesign = profile({ ui: true, domain: "michael-design", applies: true });
+  assert.ok(withDesign.includes("design"), "设计通道本身要在");
+  assert.ok(!withDesign.includes("domain_michael_design"),
+    "设计在场时还发域旗标 → 同一份语料被注两遍");
+  // 设计不在场时（例如只读地问设计规范），域旗标仍要发——那时它是唯一的通道。
+  const noDesign = profile({ domain: "michael-design", applies: true });
+  assert.ok(noDesign.includes("domain_michael_design"),
+    "设计通道不在场时，域旗标是这份语料唯一的入口，不能一并抑制");
+  // 其余 21 个专业域不受影响。
+  const health = profile({ ui: true, domain: "healthcare", applies: true });
+  assert.ok(health.includes("domain_healthcare"),
+    "抑制只针对 michael-design，专业域和设计可以同时在场");
+});

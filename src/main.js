@@ -22735,7 +22735,14 @@ function _ideSemanticProfile(profile) {
   // 值已经在 _aiIntentKnowledgeDomain 里按白名单归过一次，这里不可能拼出目录外的名字。
   //
   // 只在 domain 非空时加：空串代表"模型判不出领域"，那就不该点亮任何东西。
-  if (p.domain) add(`domain_${String(p.domain).replace(/-/g, "_")}`, true);
+  // michael-design 那一份语料已经有自己的专属通道（design 旗标 → design_knowledge_block，
+  // 外加客户端的设计预检），域旗标再报一次会让网关按域限定检索**同一份**语料并二次注入：
+  // 实测系统提示 42KB → 69KB，纯重复。设计已经在场时就不发这个域旗标——领域旗标是给
+  // 那 21 个没有专属通道的专业域用的。（跨端契约：网关侧不做这个抑制，它无从知道
+  // design 通道注了什么。）
+  if (p.domain && !(p.domain === "michael-design" && flags.includes("design"))) {
+    add(`domain_${String(p.domain).replace(/-/g, "_")}`, true);
+  }
   return `2.5:${flags.join(",")}`;
 }
 
