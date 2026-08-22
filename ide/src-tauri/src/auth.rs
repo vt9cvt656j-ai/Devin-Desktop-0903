@@ -495,34 +495,15 @@ pub async fn auth_verify_code(email: String, code: String) -> Result<AuthResult,
 
 #[cfg(test)]
 mod auth_dir_tests {
-    /// HOME 和 USERPROFILE 都是进程级的，改它们的用例必须排队。
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    struct Restore(Vec<(&'static str, Option<String>)>);
-    impl Drop for Restore {
-        fn drop(&mut self) {
-            for (key, old) in self.0.drain(..) {
-                unsafe {
-                    match old {
-                        Some(v) => std::env::set_var(key, v),
-                        None => std::env::remove_var(key),
-                    }
-                }
-            }
-        }
-    }
+    /// HOME 和 USERPROFILE 都是进程级的，改它们的用例必须排队——而且要和**全 crate**
+    /// 排，不是只和 auth 自己排。这里以前有一把 auth 私有的 `ENV_LOCK`，mcp.rs 顶上另有
+    /// 一把：两把锁互不相识，mcp 的用例把 HOME 指到临时目录的那一刻，下面这条正好在断言
+    /// 「没有 HOME 就该走 USERPROFILE」，于是偶发红。锁现在只有 crate 根那一把。
+    use crate::test_env::EnvGuard;
 
     #[test]
     fn windows_has_no_home_so_userprofile_must_be_honoured() {
-        let _serial = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        let _restore = Restore(vec![
-            ("HOME", std::env::var("HOME").ok()),
-            ("USERPROFILE", std::env::var("USERPROFILE").ok()),
-        ]);
-        unsafe {
-            std::env::remove_var("HOME");
-            std::env::set_var("USERPROFILE", "C:\\Users\\me");
-        }
+        let mut env = EnvGuard::set(&[("HOME", None), ("USERPROFILE", Some("C:\\Users\\me"))]);
         assert_eq!(super::auth_db_dir(), "C:\\Users\\me/.michael_ide");
         assert!(
             !super::auth_db_dir().starts_with('.'),
@@ -530,7 +511,7 @@ mod auth_dir_tests {
         );
 
         // HOME 在的时候仍然优先用它——别把 macOS/Linux 的行为改掉。
-        unsafe { std::env::set_var("HOME", "/Users/me") };
+        env.put("HOME", Some("/Users/me"));
         assert_eq!(super::auth_db_dir(), "/Users/me/.michael_ide");
     }
 }
