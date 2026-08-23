@@ -22822,7 +22822,7 @@ function _semanticEngineeringEvidence(text) {
 // 必须判定的面——而那正是「产不出大 JSON」的直接成因（同模型实测：40 条判定项→
 // 正文 0 字；20 条→完整产出。卡的是输入规模，不是预算）。
 const _AI_INTENT_DIMENSIONS = [
-  "database", "databaseOps", "dataModel", "persistence", "databaseQuery", "databaseDecisionRequired",
+  "database", "databaseOps", "dataModel", "persistence", "databaseQuery",
   "needsReferences", "needsOfficialResearch", "needsCommunityResearch", "authoritativeReferencesRequired",
   "businessLogic", "businessRisk", "securityRisk", "architectureQuality",
   "containerOps", "featureCompleteness", "websiteDelivery", "ui", "bug", "implementation",
@@ -22830,10 +22830,10 @@ const _AI_INTENT_DIMENSIONS = [
   "multiService", "promptRescue", "vagueProjectRequest", "maintainabilityUpgrade",
   "envSetup", "cleanupTask", "desktopAutomation", "backendApi", "packageVersion",
   "fullWebsite", "transactionalProduct", "designKnowledgeRequired", "fromZeroUiProject",
-  "existingUiStackSignal", "richMediaRequired", "motionDesignRequired", "advancedMotionRequired", 
+  "richMediaRequired", "motionDesignRequired", "advancedMotionRequired", 
   "motionChoreographyRequired", "browserAutomation", "capture", "interactiveWait", "longRunningRuntime",
   "explicitWorkspaceMutation", "explicitRuntimeAction", "explicitExternalAction", "explicitReadOnly",
-  "git", "gitReadOnly", "gitBranching", "gitCommit", "gitSync",
+  "git", "gitBranching", "gitCommit", "gitSync",
   "gitPublish", "gitReview", "referenceWebsiteRequested", 
   "qualityFloor", "allProjectsEngineering",
 ];
@@ -23454,7 +23454,6 @@ function _mergeAiIntentProfile(base, intents, text, priorState = null) {
   m.referenceWebsiteRequested = !!(m.referenceWebsiteRequested || m.referenceWebsiteRequired);
   m.fromZeroUiProject = !!(m.uiProject && (projectState === "greenfield" || designMode === "michael_design_2_5_greenfield"));
   m.existingWebsite = !!(m.existingProject && m.uiProject && !m.fromZeroUiProject);
-  m.existingUiStackSignal = m.existingWebsite;
   // A repository containing UI is a fact, not a request for a design review. Michael Design
   // participates only in actual UI implementation or an explicit visual/UI review.
   const designTask = !!(m.ui && (workspaceAction === "modify" || semanticAction === "review"));
@@ -23462,8 +23461,7 @@ function _mergeAiIntentProfile(base, intents, text, priorState = null) {
     designMode = "none";
     m.fromZeroUiProject = false;
     m.existingWebsite = !!(m.existingProject && m.uiProject);
-    m.existingUiStackSignal = m.existingWebsite;
-  } else if (designMode === "none") {
+    } else if (designMode === "none") {
     designMode = m.fromZeroUiProject ? "michael_design_2_5_greenfield" : "michael_design_2_5_existing";
   }
   m.designMode = designMode;
@@ -23473,7 +23471,6 @@ function _mergeAiIntentProfile(base, intents, text, priorState = null) {
   const unresolvedData = dataStrategy === "undecided";
   m.persistence = !!(m.persistence || ["local", "server", "inspect_existing", "undecided"].includes(dataStrategy));
   m.database = !!(m.database || m.databaseOps || m.dataModel || m.databaseQuery || serverData || unresolvedData);
-  m.databaseDecisionRequired = !!(m.databaseDecisionRequired || unresolvedData || dataStrategy === "inspect_existing");
   m.databaseArchitecture = !!(m.dataModel || m.databaseOps || dataStrategy === "server" || unresolvedData);
 
   // 或合并，不是直接赋值 —— 上下相邻的每一行都是 `x = !!(x || …)`，只有这两行曾是覆盖。
@@ -26683,6 +26680,35 @@ function _authContextBlock({ forSubAgent = false } = {}) {
 // "onboarding" (after opening a project).
 const _NS_SPARK = '<svg class="next-steps__ic" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M12 2.5l1.55 4.95a3 3 0 0 0 1.99 1.99L20.5 11l-4.96 1.56a3 3 0 0 0-1.99 1.99L12 19.5l-1.55-4.95a3 3 0 0 0-1.99-1.99L3.5 11l4.96-1.56a3 3 0 0 0 1.99-1.99z"/></svg>';
 const _NS_ARROW = '<svg class="next-steps__arrow" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 12h13"/><path d="m12 6 6 6-6 6"/></svg>';
+/**
+ * 把一段带行内 `代码` 的文字铺进元素里：反引号内的部分渲染成 <code>，其余是纯文本。
+ *
+ * 建的是 DOM 节点，**不走 innerHTML** —— 这段文字来自模型，拼 HTML 就是把模型输出
+ * 当代码执行。分段之后每一段都是 textContent，反引号里的内容再怎么写都只是文字。
+ *
+ * 只认成对的反引号；落单的那个原样留着（模型偶尔会写半个，吞掉它反而让人看不懂）。
+ */
+function _appendTextWithInlineCode(el, text) {
+  const raw = String(text == null ? "" : text);
+  const parts = raw.split("`");
+  // 偶数段是普通文字，奇数段是代码；反引号个数为奇数时最后一段不成对，退回纯文字。
+  const paired = parts.length % 2 === 1;
+  parts.forEach((part, i) => {
+    const isCode = paired && i % 2 === 1;
+    if (isCode && part) {
+      const code = document.createElement("code");
+      code.className = "next-steps__code";
+      code.textContent = part;
+      el.appendChild(code);
+    } else if (part) {
+      el.appendChild(document.createTextNode(i === 0 || paired ? part : "`" + part));
+    } else if (!paired && i > 0) {
+      el.appendChild(document.createTextNode("`"));
+    }
+  });
+  if (!el.childNodes.length) el.textContent = raw;
+}
+
 // Total chips in one 「接下来」 block, across offered choices AND run-state suggestions.
 const _NEXT_STEPS_MAX = 4;
 function _renderSuggestionChips(sess, items, label) {
@@ -26720,8 +26746,17 @@ function _renderSuggestionChips(sess, items, label) {
       const b = document.createElement("button");
       b.type = "button";
       b.className = "next-steps__chip";
-      b.innerHTML = '<span class="next-steps__chip-t"></span>' + _NS_ARROW;
-      b.querySelector(".next-steps__chip-t").textContent = text;
+      // 序号/字母做成**前面一个小徽标**，不再拼进正文（原来是 "1、跑 npm install 装依赖"）。
+      // 数字序号本来就由卡片的上下顺序说明了，占着行首只是把正文往右挤；字母选项（A/B）
+      // 是这个选项的真身份，做成徽标反而更醒目。
+      b.innerHTML = (typeof it === "object" && it.badge
+        ? '<span class="next-steps__badge"></span>' : "")
+        + '<span class="next-steps__chip-t"></span>' + _NS_ARROW;
+      if (typeof it === "object" && it.badge) b.querySelector(".next-steps__badge").textContent = it.badge;
+      // 正文里的 `代码` 渲染成真正的行内代码：原来是 textContent，反引号原样显示成字符，
+      // 一行里三对反引号既难读又白占位置。
+      _appendTextWithInlineCode(b.querySelector(".next-steps__chip-t"), text);
+      b.title = text.replace(/`/g, "");
       b.addEventListener("click", () => { wrap.remove(); sendPrompt(send); });
       wrap.appendChild(b);
     });
@@ -27369,7 +27404,7 @@ function _maybeRenderChoices(sess, src) {
     // its run-state suggestions into the same block.
     _renderSuggestionChips(
       sess,
-      opts.map((o) => ({ label: o.label + (o.text ? "、" + o.text : ""), send: o.send })),
+      opts.map((o) => ({ badge: o.label, label: o.text || o.label, send: o.send })),
       t("chat.nextSteps"),
     );
     const block = sess.container.lastElementChild;

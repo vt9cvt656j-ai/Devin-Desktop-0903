@@ -5413,9 +5413,19 @@ img.settings-dropdown__avatar--filled { object-fit: cover; }
 .next-steps { display: flex; flex-direction: column; align-items: stretch; gap: 6px; margin: 12px 14px 10px 36px; }
 .next-steps__label { display: flex; align-items: center; gap: 5px; margin: 0 0 6px; font-size: 11px; font-weight: 500; letter-spacing: .02em; color: var(--text-dim, #80868b); }
 .next-steps__label .next-steps__ic { width: 13px; height: 13px; color: var(--accent, #1a73e8); opacity: .9; }
-.next-steps__chip { display: flex; align-items: center; justify-content: space-between; gap: 10px; width: 100%; text-align: left; border: 1px solid var(--line-strong, #d7d7dc); background: var(--panel-2, #fbfbfd); color: var(--text, #1c1c1e); border-radius: 12px; padding: 9px 14px; font-size: 13px; line-height: 1.3; cursor: pointer; transition: background .14s ease, border-color .14s ease, box-shadow .14s ease, transform .08s ease; }
-.next-steps__chip-t { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.next-steps__chip .next-steps__arrow { width: 15px; height: 15px; flex: none; color: var(--accent, #0a84ff); opacity: .55; transition: opacity .14s ease, transform .14s ease; }
+/* 卡片是 align-items:flex-start —— 正文可以是两行，箭头和徽标要停在第一行的高度上，
+   不能被拉到两行的正中间。 */
+.next-steps__chip { display: flex; align-items: flex-start; justify-content: space-between; gap: 10px; width: 100%; text-align: left; border: 1px solid var(--line-strong, #d7d7dc); background: var(--panel-2, #fbfbfd); color: var(--text, #1c1c1e); border-radius: 12px; padding: 9px 14px; font-size: 13px; line-height: 1.45; cursor: pointer; transition: background .14s ease, border-color .14s ease, box-shadow .14s ease, transform .08s ease; }
+/* 原来是 `white-space: nowrap` + 省略号：一行装不下就砍掉，而这些建议本来就是一句话，
+   砍掉后半句等于让人猜（用户原话「看不全」）。改成最多两行、按词/字换行；真有超长的
+   （模型偶尔把整条命令塞进来）才在第二行末尾收省略号，全文留在 title 里。 */
+.next-steps__chip-t { flex: 1 1 auto; min-width: 0; display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; line-clamp: 2; overflow: hidden; overflow-wrap: anywhere; word-break: break-word; }
+/* 序号/字母徽标。数字序号靠卡片顺序就能读，做成徽标是为了把行首让给正文；
+   字母选项（A/B）是选项真身份，徽标反而更醒目。 */
+.next-steps__badge { flex: none; display: inline-flex; align-items: center; justify-content: center; min-width: 18px; height: 18px; margin-top: 1px; padding: 0 5px; border-radius: 6px; background: color-mix(in srgb, var(--accent, #0a84ff) 12%, transparent); color: var(--accent, #0a84ff); font-size: 11px; font-weight: 650; font-variant-numeric: tabular-nums; line-height: 1; }
+/* 建议里的 `命令` 渲染成真正的行内代码 —— 原来反引号是当字符显示的。 */
+.next-steps__code { padding: 1px 5px; border-radius: 5px; background: var(--line, rgba(0,0,0,.07)); font-family: var(--mono); font-size: 11.5px; overflow-wrap: anywhere; }
+.next-steps__chip .next-steps__arrow { width: 15px; height: 15px; flex: none; margin-top: 2px; color: var(--accent, #0a84ff); opacity: .55; transition: opacity .14s ease, transform .14s ease; }
 .next-steps__chip:hover { background: color-mix(in srgb, var(--accent, #0a84ff) 5%, var(--panel-2, #fbfbfd)); border-color: color-mix(in srgb, var(--accent, #0a84ff) 40%, var(--line-strong, #d7d7dc)); box-shadow: 0 3px 12px color-mix(in srgb, var(--accent, #0a84ff) 14%, transparent); transform: translateY(-1px); }
 .next-steps__chip:hover .next-steps__arrow { opacity: 1; transform: translateX(3px); }
 .next-steps__chip:active { transform: translateY(0); box-shadow: none; }
