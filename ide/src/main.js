@@ -22486,6 +22486,15 @@ function _semanticEngineeringEvidence(text) {
 // 用户要求账本、未完成计划、上轮结果和当前文件会组成一个严格有界的会话快照。
 // 这让“继续 / 不对 / 还是不行 / 就这个”等短句拥有真实指代，又不会把整段历史
 // 重发给判定器。判定仍使用用户当前选择的模型，不降级廉价模型。
+
+// 2026-08-23 删掉 12 个**零读者**维度：paletteHarmonyRequired / cardLayoutRequired /
+// cardStylingRequired / semanticIconRequired / gitHistory / gitLocalMutation /
+// gitReviewMutation / nativeHtmlRequested / darkThemeRequested / gradientThemeRequested /
+// monochromeThemeRequested / categoryProductSurface。
+// 逐个 grep 过：main.js 里各 1 次（只有定义）、网关 0 次、测试里只有 fixture 赋值，
+// 没有任何断言要求它们出现。它们占着提示词里那份键名清单的字符，也占着模型每一轮
+// 必须判定的面——而那正是「产不出大 JSON」的直接成因（同模型实测：40 条判定项→
+// 正文 0 字；20 条→完整产出。卡的是输入规模，不是预算）。
 const _AI_INTENT_DIMENSIONS = [
   "database", "databaseOps", "dataModel", "persistence", "databaseQuery", "databaseDecisionRequired",
   "needsReferences", "needsOfficialResearch", "needsCommunityResearch", "authoritativeReferencesRequired",
@@ -22495,13 +22504,11 @@ const _AI_INTENT_DIMENSIONS = [
   "multiService", "promptRescue", "vagueProjectRequest", "maintainabilityUpgrade",
   "envSetup", "cleanupTask", "desktopAutomation", "backendApi", "packageVersion",
   "fullWebsite", "transactionalProduct", "designKnowledgeRequired", "fromZeroUiProject",
-  "existingUiStackSignal", "richMediaRequired", "motionDesignRequired", "advancedMotionRequired",
-  "paletteHarmonyRequired", "cardLayoutRequired", "cardStylingRequired", "semanticIconRequired",
+  "existingUiStackSignal", "richMediaRequired", "motionDesignRequired", "advancedMotionRequired", 
   "motionChoreographyRequired", "browserAutomation", "capture", "interactiveWait", "longRunningRuntime",
   "explicitWorkspaceMutation", "explicitRuntimeAction", "explicitExternalAction", "explicitReadOnly",
-  "git", "gitReadOnly", "gitHistory", "gitBranching", "gitLocalMutation", "gitCommit", "gitSync",
-  "gitPublish", "gitReview", "gitReviewMutation", "referenceWebsiteRequested", "nativeHtmlRequested",
-  "darkThemeRequested", "gradientThemeRequested", "monochromeThemeRequested", "categoryProductSurface",
+  "git", "gitReadOnly", "gitBranching", "gitCommit", "gitSync",
+  "gitPublish", "gitReview", "referenceWebsiteRequested", 
   "qualityFloor", "allProjectsEngineering",
 ];
 const _AI_INTENT_RELATIONS = new Set(["new", "continue", "correct", "replace", "clarify"]);
@@ -27640,6 +27647,26 @@ async function sendPrompt(text, attachments = [], readyConfig = null, opts = {})
     ? _turnEngineeringResolved
     : (_fastRouteProfile || _turnEngineeringResolved);
   config.ideSemanticProfile = _sessionStableSemanticProfile(sess, _semanticProfileHeaderFor(_routeSource, text));
+  // 执行事实这条腿也要在**第一发之前**并进来，而不是等到循环边界。
+  //
+  // 它算的是这一刻磁盘上确实有什么（工作区里是不是一个已有项目），纯本地同步计算、
+  // 零模型调用、零延迟——`_aiIntentWorkspaceEvidence` 读的是 `_agentContextCache` /
+  // `_projectStacks`，而 `_curRoot` 上面早就算好了。
+  //
+  // 为什么非要提到第一发：那道等待窗口是 6 秒，而完整裁决实测健康时 6.9~7.6 秒、
+  // 上游拥堵时 19.8 秒，快通道首响应头也要 8~18 秒——**两条腿都赢不了它**。所以每个会话的
+  // 第一发必然带着一份不完整的画像出门，而画像是会话粘性的单调并集：第一发从「空」变成
+  // 「有 existing_project」，就少一次整条对话的前缀缓存作废（本文件另有实测记录：这类抖动
+  // 把 120k token 请求的缓存命中率打到 2%）。
+  //
+  // 判据一个字不放宽：仍要 hasWorkspace + snapshotReady + 顶层非空，空目录（从零建）
+  // 照旧不点 existing_project——那正是它和已有项目的分界。
+  try {
+    const _factFlags = _executionFactSemanticFlags({ root: _curRoot, _writeLedger: null });
+    if (Object.keys(_factFlags).length) {
+      config.ideSemanticProfile = _sessionStableSemanticProfile(sess, _ideSemanticProfile(_factFlags));
+    }
+  } catch {}
 
   // Selected model is an IMAGE model → generate the image directly from this message,
   // instead of feeding it to the agent loop (an image model can't handle the tools +
