@@ -55972,7 +55972,8 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
         return true;
       });
       if (_newBaselinePaths.length && _live()) {
-        const baseline = await _interleavedDiagnostics(_newBaselinePaths, root);
+        if (!run._diagLangTried) run._diagLangTried = new Set();
+        const baseline = await _interleavedDiagnostics(_newBaselinePaths, root, null, run._diagLangTried);
         for (const [key, count] of baseline.counts) run._diagnosticBaselineCounts.set(key, count);
       }
 
@@ -56216,10 +56217,12 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
           const ext = (String(path).split(".").pop() || "").toLowerCase();
           if (_LINTABLE_EXT.has(ext)) run._diagnosticCheckPaths.add(path);
         }
+        if (!run._diagLangTried) run._diagLangTried = new Set();
         const _d = await _interleavedDiagnostics(
           [...run._diagnosticCheckPaths],
           root,
           run._diagnosticBaselineCounts,
+          run._diagLangTried,
         );
         // 「没有检查器看过」是事实，不是「干净」。这里只登记（run 级去重），
         // 说出去统一走下面写入质量事实那条通道；verifyNow 也读 run._uncheckedLangs，
@@ -71756,7 +71759,11 @@ const _INTERLEAVED_DIAG_MAX_WAIT_MS = 4000;
 // unopened files use a transient model (no listeners) that is disposed after the
 // read. `baselineCounts` is captured before the first mutation of each file, so
 // pre-existing project errors do not get blamed on the current Agent run.
-async function _interleavedDiagnostics(editedRelPaths, root = "", baselineCounts = null) {
+/**
+ * @param triedLangs run 级的「这门语言这一轮已经试过拉起服务器了」集合。
+ *   不传就退化成原来的行为（只用已经在跑的服务器）。
+ */
+async function _interleavedDiagnostics(editedRelPaths, root = "", baselineCounts = null, triedLangs = null) {
   if (!editedRelPaths.length || typeof monaco === "undefined") return { ran: false, report: "", counts: new Map(), newErrorCount: 0, unchecked: [] };
   const targets = []; // { rel, model, created, isTs }
   // 「查过了，是干净的」和「这门语言根本没有检查器」是两个状态，此前在返回值里同形：
@@ -71774,8 +71781,28 @@ async function _interleavedDiagnostics(editedRelPaths, root = "", baselineCounts
     const _jsFamily = isTs || ext === "js" || ext === "jsx" || ext === "mjs" || ext === "cjs";
     const langId = _lintableLangId(rel) || (isTs ? "typescript" : "javascript");
     if (!_jsFamily && !(lspManager?.isRunning?.(langId))) {
-      unchecked.push({ rel: _normRel(abs, root), lang: langId });
-      continue;
+      /*
+       * **先自己把语言服务器拉起来再说「没检查器」。**
+       *
+       * 这里原来直接 `continue` —— 而语言服务器只有用户**手动在编辑器里打开**同语言文件
+       * 才会起。于是一个 Python / Rust / Go 项目里，只要这次会话用户没手动开过 .py，
+       * 智能体改多少个 .py 都只会被记成 unchecked，`[BLOCKING_NEW_DIAGNOSTICS]` 那道门
+       * 结构上永不触发 —— 全系统唯一一道「改完自动检查」的门，在非 JS/TS 项目上是关着的。
+       * 而且它关着的时候还很诚实地告诉模型「这些文件没有任何检查器看过」。
+       *
+       * `ensureServer` 的契约正好够用：可 await，缺二进制/启动失败时干净返回 null 并把
+       * 自己从 clients 里删掉。所以退化路径就是现在的 unchecked，零风险。
+       * 有界：每 run 每语言只试一次（冷启动要花时间，不能每批改动都试一遍）。
+       */
+      const _canTry = triedLangs && !triedLangs.has(langId) && lspManager?.ensureServer;
+      if (_canTry) {
+        triedLangs.add(langId);
+        try { await lspManager.ensureServer(langId); } catch {}
+      }
+      if (!(lspManager?.isRunning?.(langId))) {
+        unchecked.push({ rel: _normRel(abs, root), lang: langId });
+        continue;
+      }
     }
     let uri; try { uri = monaco.Uri.file(abs); } catch { continue; }
     let model = monaco.editor.getModel(uri);
