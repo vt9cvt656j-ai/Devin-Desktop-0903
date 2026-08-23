@@ -11,6 +11,7 @@
 // 看起来跟生效一模一样。这个文件把它们变成**显式清单**：想让一个文件/旗标躺着不用，就得在
 // 下面写下理由；新加的没接上，当场红。
 import { readFileSync, readdirSync } from "node:fs";
+import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import { test } from "node:test";
@@ -126,6 +127,45 @@ test("每个提示词文件都必须运行时到得了模型，否则要写明�
   }
 });
 
+// 改了死副本 ≠ 上线。这道闸把「静默无效」变成「当场变红」。
+//
+// RETIRED 那张表已经写明这几份到不了模型，可它拦不住**有人去改它们**——实测：
+//   worker_system.txt  2026-08-20 「先写骨架再补满没限定…」  ← 一条防数据丢失的规则，没上线
+//   subagent_system.txt 2026-08-19 「人格提示词把子体真有的两…」          ← 没上线
+//   agent.txt          2026-08-21 「带着假设往下做要先说出来」            ← 没上线
+// 一周之内三次。登记表是**说明**，不是**机制**——所以再加一道内容闸。
+//
+// 哈希变了要么是你改错了地方（改活版本），要么是你刻意改这份死副本并已经把内容同步到活版本
+// （那就连同这里的哈希一起更新，并在提交信息里写明同步到了哪儿）。
+const RETIRED_SHA = {
+  agent: ["564a0a807060908b", "ide/src/main.js 的 _AI_MODE_PROMPTS.agent（已被 agent_core + reasoning + 条件模块取代）"],
+  agent_lite: ["2da999202b2c34c3", "无活版本，已被 agent_core 取代"],
+  design_system: ["d50756e1f4ca2d37", "冻结的回滚样本，永不注入"],
+  ui_design_flow: ["06a746e754d4eb58", "已被 design_core / design_tokens / design_components 取代"],
+  ui_design_guide: ["14b6840fd876bd58", "同上"],
+  next_action: ["6825461eb0e92fdd", "ide/src/main.js 的 _ASK_PREDICT_SYSTEM"],
+  compact: ["8f932b79ccd35757", 'ide/src/main.js 里 _P(\"compact\", …) 的第二参数'],
+  research_prompt: ["dc96974e4c285f6a", 'ide/src/main.js 里 _P(\"research_prompt\", …) 的第二参数'],
+  design_research_prompt: ["5c13d54eba296a6a", 'ide/src/main.js 里 _P(\"design_research_prompt\", …) 的第二参数'],
+  edit_rewrite: ["0bbe60046596aebc", 'ide/src/main.js 里 _P(\"edit_rewrite\", …) 的第二参数'],
+  edit_transform: ["94169a59438d84a2", 'ide/src/main.js 里 _P(\"edit_transform\", …) 的第二参数'],
+  subagent_system: ["9d4fa64f6385e833", "ide/src/main.js 的 _SUBAGENT_SYSTEM"],
+  worker_system: ["ac8a85c2d1d0b4d3", "ide/src/main.js 的 _WORKER_SYSTEM"],
+};
+
+test("死副本被改动时要当场变红——改了它不等于上线", () => {
+  for (const [name, [want, live]] of Object.entries(RETIRED_SHA)) {
+    assert.ok(name in RETIRED, `${name} 已经不在 RETIRED 里了，两张表对不上`);
+    const got = createHash("sha256")
+      .update(readFileSync(join(PROMPT_DIR, `${name}.txt`)))
+      .digest("hex").slice(0, 16);
+    assert.equal(got, want,
+      `server/prompts/${name}.txt 被改动了，而它**运行时到不了模型**——改它零效果。\n`
+      + `活版本在：${live}。\n`
+      + "要么去改活版本；要么这次是刻意同步（内容已经进了活版本），那就把这里的哈希一起更新，"
+      + "并在提交信息里写清同步到了哪儿。实测一周内有三次修复写进死副本从未上线。");
+  }
+});
 test("客户端算出来的每个语义旗标，服务端都得有消费者，否则要写明是预留", () => {
   const fn = /function _ideSemanticProfile\(profile\)\s*\{([\s\S]*?)\n\}/.exec(CLIENT);
   assert.ok(fn, "找不到 _ideSemanticProfile——旗标清单的来源变了");
