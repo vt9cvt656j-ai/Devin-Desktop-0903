@@ -5587,6 +5587,15 @@ img.settings-dropdown__avatar--filled { object-fit: cover; }
   justify-content: space-between;
   gap: 8px;
   margin-top: 6px;
+  animation: msg-acts-in .18s ease both;
+}
+/* 这一轮还没结算完 —— 先不占位，等统计行落定再出场（见 _revealMsgActions）。
+   用 display:none 而**不是** opacity：opacity 为 0 的元素照样接点击，那正是这排按钮
+   已经踩过的坑（藏起来却点得到）。 */
+.msg__acts.is-pending { display: none; }
+@keyframes msg-acts-in { from { opacity: 0; transform: translateY(-2px); } to { opacity: 1; transform: none; } }
+@media (prefers-reduced-motion: reduce) {
+  .msg__acts { animation: none; }
 }
 .msg__acts-side { display: flex; align-items: center; gap: 2px; }
 .msg__act {
