@@ -887,3 +887,47 @@ mod knowledge_design_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod design_share_guard {
+    /// 无域自动检索只有 2 个名额，而全库 3218 段里 michael-design 占 **2535 段（78.8%）**。
+    /// 设计活另有专属注入通道（prompts.rs 的 design_knowledge_block），所以设计段在这里
+    /// 抢走名额是纯损失——一个工程回合本该拿到的服务拆分规则/选型决策树被顶掉。
+    ///
+    /// 但「占比高」不等于「实际抢得到」：BM25 只看词项匹配。实测（2026-08-23，真检索、
+    /// 8 条典型工程查询、16 个名额）**设计蓝本只抢到 1 个，6.2%**。
+    ///
+    /// 所以**没有**给 search 加排除参数：为 6.2% 改一处检索核心，是拿新缺口换旧缺口。
+    /// 这条测试把那个数字变成常驻守卫——语料配比一旦变到设计段真的开始抢名额，它会红，
+    /// 那时再改才有依据。
+    #[test]
+    fn design_blueprints_barely_take_the_no_domain_slots() {
+        let queries = [
+            "how to split services and keep bounded contexts",
+            "which database should I choose for a multi-tenant scheduling app",
+            "rate limiting per tenant in an API gateway",
+            "python ORM default choice and alternatives",
+            "how to structure a realtime collaborative todo app",
+            "HIPAA requirements for storing patient schedules",
+            "refactor a large module without breaking callers",
+            "websocket broadcast fanout and conflict resolution",
+        ];
+        let mut design = 0usize;
+        let mut total = 0usize;
+        for q in queries {
+            for h in super::search(q, None, 2) {
+                total += 1;
+                if h.domain == "michael-design" {
+                    design += 1;
+                }
+            }
+        }
+        assert!(total >= 12, "只命中 {total} 个名额，这条守卫失去落点（语料没加载？）");
+        let share = design as f64 / total as f64;
+        assert!(
+            share <= 0.25,
+            "设计蓝本抢走了 {:.1}% 的无域名额（{design}/{total}）——实测基线是 6.2%。\n             涨到这个程度就该给 search 加一个排除 michael-design 的信号了：\n             设计活另有专属注入通道，它在这里占名额是纯损失。",
+            share * 100.0
+        );
+    }
+}
