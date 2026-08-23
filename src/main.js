@@ -40422,6 +40422,7 @@ function _newTechResearchIssue(run, call) {
   }
   return "[BLOCKED_TECH_RESEARCH] 这一步在**选技术**（新建项目 / 往依赖清单里加东西），"
     + "而本轮还没有做过任何外部调研。\n"
+    + "**这次调用没有执行，磁盘一个字节都没改**——不要在总结里说这个文件已保存/已更新。\n"
     + "先花一次调用确认三件事，再回来写：\n"
     + "· 这个包/框架**真的存在**、名字拼对了 —— package_search 或 package_source\n"
     + "· 它现在**还有人维护**，最新版本是多少（别照着记忆里的旧版本写）—— github_repo / package_search\n"
@@ -40701,7 +40702,8 @@ function _implementationMutationBatchBlockResult(run, items, index) {
   }[String(priorFailed.rawResult?.failure?.code || "")] || "";
   return {
     type: current.call.type,
-    path: current.call.path || current.call.description || "",
+    // cmd/termtask 没有 path，此前这里落的是空串——卡片上就成了一条没有主语的记录。
+    path: current.call.path || current.call.command || current.call.description || "",
     ok: false,
     failure: { code: "mutation_batch" },
     content: _isPreExecutionBlock(priorFailed.rawResult)
@@ -45473,6 +45475,16 @@ function _blockedToolRecoveryInstruction(content, call = null, result = null) {
       `下一步不要写文件：先读取刚才 read_file 的工具结果，确认真实路径和当前内容；再对真实路径用 edit_file / multi_edit。禁止继续用原始猜测路径或整文件覆盖。`),
     implementation_grounding: () => mk("implementation_grounding", "GROUND_IMPLEMENTATION",
       `这是已有项目的实现任务，但当前还没有真实工程取证。下一步只做 list_dir/find_files 定位，再 read_file 读取相关入口、调用方和配置（或 get_diagnostics/find_symbol 取得真实证据）；拿到结果后再写代码。不要按旧对话或文件名猜技术栈，也不要用 shell 绕过。`),
+    // 三道门此前落不到这张表里，一律走最后的 generic 兜底——模型于是拿到一条泛泛的
+    // 「先判断真实原因再选最小安全动作」，而这三种情况的下一步其实都是**确定**的一件事。
+    // 每条都以「这次调用没有执行、磁盘一个字节都没改」开头：那正是「README.md 已更新」
+    // 这句假话的模型侧堵口（用户现场实拍，文件 17 分钟后才第一次被真正写入）。
+    plan_first: () => mk("plan_first", "WRITE_PLAN_FIRST",
+      `这次调用没有执行，磁盘一个字节都没改——不要在总结里说这个文件已保存/已更新。下一步只做一件事：用 update_plan 写出步骤（做哪几步、每步产出什么、怎么验证），然后把这次被拦的调用**原样重发**（同一个 path、同一份内容/old_string）。不要改用 run_cmd / sed / 重定向绕过，也不要为此去问用户。`),
+    tech_research: () => mk("tech_research", "RESEARCH_NEW_TECH",
+      `这次调用没有执行，磁盘一个字节都没改——不要在总结里说这个文件已保存/已更新。下一步查你正在加的那几个包本身：package_search / package_source 确认它真的存在、名字拼对；github_repo 看它还有没有人维护、最新版本是多少；developer_community_search / web_search 看这件事主流是怎么做的。查完把这次被拦的调用**原样重发**，不要绕过去，也不要为此去问用户。`),
+    command_batch: () => mk("command_batch", "ONE_COMMAND_AT_A_TIME",
+      `这条命令没有执行。同一轮里更早的一条已经出局——先看清它到底是**跑过并失败**（读它的 exit code 和 stderr 第一条根因，修掉再跑）还是**被门在运行前拦下**（那就没有任何失败输出可读，先按那道门的要求做完那一步）。无论哪种，接下来**一次只发一条**命令，拿到结果再决定下一条。`),
     mutation_batch: () => mk("mutation_batch", "STOP_AFTER_MUTATION_FAILURE",
       `同一补丁的前项失败、尚未落定，或包含命令/worker/脚手架这类落盘范围不明确的动作，因此后续修改已停止。先处理前一项真实结果；下一次可把基于已读证据的多个文件级 edit/write/multi_edit/format 作为一个顺序一致批次提交。`),
     shell_file_rewrite: () => mk("shell_file_rewrite", "USE_FILE_TOOL",
@@ -46453,6 +46465,21 @@ function _addedPackageNames(text) {
 function _planBeforeBuildIssue(run, call) {
   if (!run || run.mode !== "agent" || run._planStopUsed) return "";
   if (!_implementationGroundingCandidate(call) && !_introducesNewTech(call)) return "";
+  // 写 README / 素材 / 纯文本不武装这道硬拦——**同胞取证门早就有这一条**（见
+  // `_implementationMutationGroundingIssue` 里同款两行，注释原话就是「写 README/素材不拦」），
+  // 计划门漏了它，于是 `edit_file(README.md)` 成了它最容易触发的形态，而那正是它自己
+  // docstring 里写着「改已有代码一概不拦」的那一类。
+  //
+  // 代价是实打实的：这是全系统**唯一一道硬拦回合**的门，而且「一个 run 只拦一次」
+  // （run._planStopUsed）。被一次 README 编辑用掉那一次，真正需要拦的那次从零动工就再也
+  // 拦不住了——误拦本身还只是白烧一轮，这个才是真损失。
+  // 用户现场（2026-08-23）：一次 README.md 编辑被它拦下，卡片红着，而模型在总结里报「已更新」。
+  //
+  // 判据与取证门**同源同一个函数**，不另立一份名单：.sh / package.json / 各类源码扩展名
+  // 照旧武装它，只有文档和素材不再。
+  const _planCallType = String(call?.type || "");
+  if (typeof fileEditTypes === "function" && fileEditTypes().has(_planCallType)
+      && !_implementationGroundingFilePath(call?.path)) return "";
   const p = run.engineering || {};
   // 只对"从零建一个东西"生效：改 bug、改已有代码不在此列。
   //
@@ -46476,9 +46503,10 @@ function _planBeforeBuildIssue(run, call) {
   const steps = Array.isArray(run._planSteps) ? run._planSteps : [];
   if (steps.length) return "";
   return "[BLOCKED_PLAN_FIRST] 这是从零建一个东西的第一次落盘，而本轮还没有计划。\n"
+    + "**这次调用没有执行，磁盘一个字节都没改**——不要在总结里说这个文件已保存/已更新。\n"
     + "先用 update_plan 把步骤写出来（要做哪几步、每步的产出是什么、怎么验证），再动手。\n"
     + "理由不是流程：没有计划的从零构建会边写边改方向，最后交出一堆互相不搭的文件。\n"
-    + "写完直接继续，不用问我。";
+    + "写完之后把这次被拦的调用**原样重发**（同一个 path、同一份内容），不用问我。";
 }
 
 function _toolRequiresPlanGate(call) {

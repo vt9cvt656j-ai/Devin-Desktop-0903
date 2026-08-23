@@ -289,6 +289,10 @@ test("快通道禁入硬拦回合的计划门", () => {
 
   // 唯一硬拦回合的门：fast 不许驱动。
   const planGate = load("_planBeforeBuildIssue", {
+    // 计划门现在复用同胞取证门那条路径过滤（写 README/素材不武装硬拦）。
+    // 注入清单是手工的：漏一处就是运行时 ReferenceError，不是断言失败。
+    fileEditTypes: () => new Set(["write", "edit", "multiedit", "format"]),
+    _implementationGroundingFilePath: load("_implementationGroundingFilePath"),
     _implementationGroundingCandidate: () => true,
     _introducesNewTech: () => false,
   });
