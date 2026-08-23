@@ -14011,9 +14011,9 @@ test("implementation grounding is advisory and only a real prior failure stops a
   const loop = extractFn("_runAgenticLoop");
   assert.doesNotMatch(loop, /await run\._emptyRootProbe/,
     "a background empty-root probe must never delay an ordered mutation");
-  assert.match(loop, /entry\._mutationAdvice = _debugMutationBlockResult\(run, call, root\)[\s\S]{0,120}entry\._eagerDone = true/,
+  assert.match(loop, /entry\._mutationAdvice = String\(_debugMutationBlockResult\(run, call, root\) \|\| ""\) \+ _sinkRiskAdvice\(call\)[\s\S]{0,120}entry\._eagerDone = true/,
     "the eager write path records advice and still commits");
-  assert.match(loop, /it\._mutationAdvice = _debugMutationBlockResult\(run, it\.call, root\)[\s\S]{0,220}message \+= it\._mutationAdvice/,
+  assert.match(loop, /it\._mutationAdvice = String\(_debugMutationBlockResult\(run, it\.call, root\) \|\| ""\) \+ _sinkRiskAdvice\(it\.call\)[\s\S]{0,220}message \+= it\._mutationAdvice/,
     "the ordered path appends advice to the real tool result instead of replacing it");
 });
 
@@ -14333,9 +14333,9 @@ test("debug evidence stays target-aware while mutation execution only receives a
   assert.equal(candidateChecks({ type: "cmd", command: "rewrite", purpose: "explore" }), true);
   assert.equal(candidateChecks({ type: "read", path: "src/app.js" }), false);
   const loop = extractFn("_runAgenticLoop");
-  assert.match(loop, /entry\._mutationAdvice = _debugMutationBlockResult\(run, call, root\)/,
+  assert.match(loop, /entry\._mutationAdvice = String\(_debugMutationBlockResult\(run, call, root\) \|\| ""\) \+ _sinkRiskAdvice\(call\)/,
     "the eager write hook must carry evidence advice alongside the real result");
-  assert.match(loop, /it\._mutationAdvice = _debugMutationBlockResult\(run, it\.call, root\)/,
+  assert.match(loop, /it\._mutationAdvice = String\(_debugMutationBlockResult\(run, it\.call, root\) \|\| ""\) \+ _sinkRiskAdvice\(it\.call\)/,
     "the ordered mutation path must use the same advisory ledger");
   const ordered = loop.indexOf("await _runOrderedToolSegments");
   const settled = loop.indexOf("_settleDebugToolBatch(run, items, root)");
@@ -28569,6 +28569,10 @@ test("抓取卡片展开后要能读：分段、正文字体、英文不从词�
   const out = view("第一段。\n\n第二段。\n\n第三段。");
   assert.equal((out.match(/atc-web__p/g) || []).length, 3, "没有按段落切开");
   assert.ok(!/<pre/.test(out), "又回到 <pre> 了——等宽字体读散文别扭，段落也挤在一起");
+  // 函数写得再好，两个调用点不用也是白搭（变异实测漏过：把 web 那处改回裸 pre，测试照样绿）。
+  const src = stripJsComments(SRC);
+  assert.equal((src.match(/vp\.innerHTML = _webTextView\(text\);/g) || []).length, 2,
+    "web / websearch 两个调用点没有都走 _webTextView");
   // 超长时要说清楚只是预览，别让人以为模型也只看到这些。
   assert.match(view("x".repeat(5000)), /只预览前 4000 字/, "截断没有留痕");
 

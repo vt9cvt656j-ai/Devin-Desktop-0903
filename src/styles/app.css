@@ -6538,6 +6538,37 @@ img.settings-dropdown__avatar--filled { object-fit: cover; }
   display: none;
   background: var(--atc-bg);
 }
+/* 抓回来的网页/搜索正文。
+   原来是裸 <pre>：等宽字体读散文本来就别扭，段落之间没有间距，而且继承来的换行规则
+   会在**英文单词中间**断开（用户截图里的 `Claud/e`、`you/r`、`ou/tputs`）。
+   现在按段落成块，用正文字体和正常行距；`overflow-wrap: break-word` 只在整词放不下时
+   才断，不像 `anywhere` 那样见缝就切。 */
+.atc-web {
+  padding: 10px 13px;
+  max-height: 320px;
+  overflow: auto;
+  color: var(--atc-text, #1d1d1f);
+  font-family: var(--font);
+  font-size: 12.5px;
+  line-height: 1.62;
+}
+/* 必须写成 `.atc-web .atc-web__p`（0,2,0）—— 裸 `.atc-web__p` 是 (0,1,0)，打不过
+   `.chat-session-container p` 的 (0,1,1)，那条给的是 `word-break: break-word`，
+   在 WebKit 里等同于「见缝就切」，英文单词会从中间断开（实测 `c/apabilities`）。 */
+.atc-web .atc-web__p {
+  margin: 0;
+  overflow-wrap: break-word;
+  word-break: normal;
+}
+.atc-web .atc-web__p + .atc-web__p { margin-top: 9px; }
+.atc-web__more {
+  margin-top: 10px;
+  padding-top: 8px;
+  border-top: 1px solid rgba(128, 128, 128, .18);
+  color: var(--atc-dim, #636c76);
+  font-size: 11px;
+}
+
 .agent-tool-step.is-open .atc-viewport {
   display: block;
   animation: atcViewportOpen .2s ease both;

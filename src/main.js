@@ -41051,6 +41051,87 @@ function _removedDeclarationsUnchecked(run, searchedTerms, maxItems = 6) {
   return out;
 }
 
+/**
+ * 这次**正在写**的代码碰到了哪些「不可信输入 → 危险汇聚点」。
+ *
+ * 用户原话：「实时的知道到底有没有漏洞那些，有的话写的不要写出漏洞」。
+ *
+ * 为什么不是把漏洞分类表挂上来：那张表（server/prompts/defect_hunting.txt，9.4KB）
+ * **刻意**只在只读审计时挂载，写代码时不挂，理由写在 `add("defects", …)` 上面，而且
+ * server/src/prompts.rs 里有一条测试正面钉着 `assemble("2.5:engineering")` 不许含它。
+ * 那条契约是对的：写个登录功能不该平白背上整张表。
+ *
+ * 所以这里走另一条路——不按「这轮是什么任务」挂整表，按**这一次写进去的代码碰到了什么**
+ * 递对应的那几条。判据是落盘内容本身（和 _stubDeliveryFindings 同源），不读用户措辞、
+ * 不做意图推断；产物挂在 `_mutationAdvice` 上，跟着**这一次写入的工具结果**一起回给模型，
+ * 所以是「写的当下」知道，不是收尾时才知道。
+ *
+ * 每一条都在本仓库自己的 207,820 行真实代码（JS + Rust）上量过误报：
+ *   动态求值 / 命令注入 / 不安全反序列化 / 批量赋值 / HTML 汇聚  —— 全部 0
+ *   SQL 拼接 —— 0.10/万行，而那 2 处是 `format!("UPDATE {table} SET {col} = $1 …")`，
+ *   属于**真发现**（标识符插进 SQL），不是误报。
+ * 量出来被砍掉的：裸 `.innerHTML =`（21.22/万行——界面密集的应用里遍地都是）。
+ * 假警报比漏报贵：每次写文件都跳一条，模型和用户都会学会略过它。
+ */
+function _sinkRisksInWrite(text, before = null) {
+  const src = String(text || "");
+  if (!src) return [];
+  const RULES = [
+    [/\b(?:SELECT|INSERT\s+INTO|UPDATE|DELETE\s+FROM)\b[\s\S]{0,160}?\b(?:WHERE|VALUES|SET|LIKE|HAVING)\b[^`"'\n]{0,40}(?:\$\{\s*[\w.\[\]]+\s*\}|\{\s*[\w.\[\]]+\s*\}|["']\s*\+\s*[\w.]+|%s["']\s*%\s*[\w(])/i,
+      "SQL 拼接", "改成参数绑定（? / $1 / :name）。顺带确认这条查询按调用者的身份过滤了行——只按请求里的 id 取记录就是 IDOR。"],
+    [/dangerouslySetInnerHTML|\bv-html\b|\.outerHTML\s*=\s*[`"'][^`"']*\$\{|insertAdjacentHTML\s*\(\s*[^,]+,\s*[`"'][^`"']*\$\{/,
+      "HTML 汇聚", "这条路径上的内容只要有一段来自用户，就是存储型 XSS。要么改成 textContent，要么先过白名单净化（DOMPurify 一类），别自己写转义。"],
+    [/\beval\s*\(|new\s+Function\s*\(/,
+      "动态求值", "传进去的串只要有一段来自外部就是任意代码执行。换成显式的分支/查表；确实要沙箱执行的，用真沙箱而不是 eval。"],
+    [/\b(?:execSync|exec|spawnSync|spawn|system|popen|Command::new)\s*\(\s*[`"'][^`"']*\$\{|shell\s*[:=]\s*true/,
+      "命令注入", "别把变量拼进命令串。改成参数数组形式（execFile / spawn(cmd, [args])），并关掉 shell:true。"],
+    [/\bpickle\.loads?\s*\(|yaml\.load\s*\((?![^)]*Safe)|Marshal\.load|ObjectInputStream/,
+      "不安全反序列化", "这几个能在反序列化过程中直接执行代码。换 safe_load / JSON / 带类型白名单的解析器。"],
+    [/Object\.assign\s*\(\s*\w+\s*,\s*(?:req|request|ctx)\.body|\{\s*\.\.\.\s*(?:req|request|ctx)\.body\s*\}/,
+      "批量赋值", "整包绑上去，调用方就能自己设 role / isAdmin / ownerId。只挑这次允许改的字段。"],
+  ];
+  const seen = before instanceof Set ? before : null;
+  const lines = src.split("\n");
+  // 按**类别**去重、首次命中为准。两个理由：
+  //   ① 3 行窗口会让同一处连报三次（窗口从第 1、2、3 行各命中一次），刷屏且全是同一条。
+  //   ② 每类的处置办法是同一句，重复说没有任何新信息——真正的信息在「哪一行、原文是什么」。
+  // 每个窗口要测**全部**规则、不 break：同一段代码常常同时踩两类（实测一段 7 行的
+  // handler 里 SQL 拼接 + 批量赋值 + HTML 汇聚三类同时成立），先命中的那条不该把别的挡掉。
+  const byKind = new Map();
+  for (let i = 0; i < lines.length; i++) {
+    const trimmed = lines[i].trim();
+    if (!trimmed || (seen && seen.has(trimmed))) continue;
+    const win = lines.slice(i, i + 3).map((l) => l.trim()).join(" ");
+    for (const [re, kind, ask] of RULES) {
+      if (byKind.has(kind) || !re.test(win)) continue;
+      // 行号要指准。窗口是从第 i 行起的三行拼平，命中的往往是里面第 2、第 3 行——
+      // 报窗口起点就差一两行，而「指到了行号」正是这条机制区别于泛泛提醒的全部所在。
+      // 先看窗口里哪一行**自己**就成立，成立就报那一行；三行都不单独成立（真正跨行的
+      // 那种，比如模板字符串里的多行 SQL）才退回窗口起点。
+      let at = -1;
+      for (let k = 0; k < 3 && i + k < lines.length; k++) {
+        if (re.test(lines[i + k].trim())) { at = i + k; break; }
+      }
+      // 单行就成立 → 报那一行的原文；真正跨行的（模板字符串里的多行 SQL）→ 报窗口起点和
+      // 拼平后的三行。只报起点那一行会给出 `const q = \`` 这种什么都没说的"原文"。
+      byKind.set(kind, at >= 0
+        ? { line: at + 1, kind, ask, text: lines[at].trim().slice(0, 100) }
+        : { line: i + 1, kind, ask, text: win.slice(0, 100) });
+    }
+    if (byKind.size >= RULES.length) break;
+  }
+  return [...byKind.values()].sort((a, b) => a.line - b.line);
+}
+
+// 把上面那些做成挂在**这一次写入**上的一段话。没有命中就一个字都不发。
+function _sinkRiskAdvice(call) {
+  const risks = _sinkRisksInWrite(String(call?.content ?? call?.new_string ?? ""));
+  if (!risks.length) return "";
+  const path = String(call?.path || "").split("/").slice(-2).join("/");
+  return "\n\n⚠ 这次写入碰到了危险汇聚点，趁还在这一步先堵上（下面每条都指到了行号和原文，不是泛泛提醒）：\n"
+    + risks.map((r) => `· ${path}:${r.line} ${r.kind} — \`${r.text}\`\n  ${r.ask}`).join("\n");
+}
+
 function _stubDeliveryFindings(run, maxItems = 8) {
   const cp = run?.checkpoint;
   if (!cp || typeof cp.forEach !== "function") return [];
@@ -54188,7 +54269,7 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
         // Evidence quality is advisory, not an execution permission. Streaming writes
         // still land immediately; any missing grounding is attached to the real result.
         run._eagerTurnBias = 1;
-        entry._mutationAdvice = _debugMutationBlockResult(run, call, root);
+        entry._mutationAdvice = String(_debugMutationBlockResult(run, call, root) || "") + _sinkRiskAdvice(call);
         entry._eagerDone = true;
         // An eager write belongs to the IN-FLIGHT model turn, but run._toolBatch is not
         // incremented until the turn returns — so the read-gate's "read must be from a
@@ -55735,7 +55816,7 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
               _preExecutionBlockedEarlier(items, index) ? "前项被门拦下 · 后续已停止" : "前项真实失败 · 后续已停止");
             return _toolMsgForModel(it.call, batchBlock);
           }
-          it._mutationAdvice = _debugMutationBlockResult(run, it.call, root);
+          it._mutationAdvice = String(_debugMutationBlockResult(run, it.call, root) || "") + _sinkRiskAdvice(it.call);
         }
         let message = subagentNames.has(it.tc.name) ? await runSubagentItem(it) : await runOne(it);
         if (it._mutationAdvice) {

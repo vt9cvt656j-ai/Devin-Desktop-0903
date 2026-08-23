@@ -3333,6 +3333,108 @@ fn html_to_text(html: &str) -> String {
     out.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+/// 整页正文提取：**保留段落结构**，并丢掉导航/页脚这类样板。
+///
+/// 和 `html_to_text` 分开写，不是重复：那个是给**行内片段**用的（链接文字、搜索结果摘要，
+/// 见 `s.find("</a>").map(|e| html_to_text(&s[..e]))` 那几处），调用点期望**单行**，
+/// 它最后那句 `split_whitespace().join(" ")` 正是为此。
+///
+/// 但整页正文走同一条就毁了：一篇文章的所有换行、段落、列表项被压成一行，
+/// 抓回来是一堵没有任何结构的墙 —— 界面上没法读，**喂给模型的也是同一堵墙**。
+///
+/// 这里做三件事：
+///   1. 整块跳过 script/style/nav/footer/aside/noscript/svg/form/template/iframe。
+///      截图里那串「Claude Platform Docs Messages Managed Agents Admin Resources…」
+///      就是 `<nav>` 的内容，它对读者和模型都是纯噪声，还占着上下文预算。
+///      **`<header>` 不跳** —— 很多文章把标题放在 `<article><header>` 里，跳了会丢标题。
+///   2. 块级标签边界产出换行（p / div / h1-6 / li / br / tr / section / article /
+///      blockquote / pre / ul / ol / table / hr），行内标签产出空格。
+///   3. 逐行收拢空白，连续空行压成一个。
+fn html_to_article_text(html: &str) -> String {
+    const SKIP: [&str; 10] = [
+        "script", "style", "nav", "footer", "aside", "noscript", "svg", "form", "template",
+        "iframe",
+    ];
+    const BLOCK: [&str; 16] = [
+        "p", "div", "br", "li", "tr", "section", "article", "blockquote", "pre", "ul", "ol",
+        "table", "hr", "h1", "h2", "h3",
+    ];
+    const BLOCK2: [&str; 3] = ["h4", "h5", "h6"];
+
+    let lower = html.to_ascii_lowercase(); // ASCII 折叠，字节长度与边界不变
+    let bytes = html.as_bytes();
+    let n = bytes.len();
+    let mut out = String::with_capacity(n / 2);
+    let mut i = 0usize;
+    'outer: while i < n {
+        if bytes[i] == b'<' {
+            let rest = &lower[i..];
+            for tag in SKIP {
+                // `<tag>` / `<tag ...>`，别把 <script> 和 <section> 弄混。
+                let open = format!("<{tag}");
+                if rest.starts_with(&open)
+                    && rest[open.len()..]
+                        .chars()
+                        .next()
+                        .is_some_and(|c| c == '>' || c == ' ' || c == '/' || c == '\n' || c == '\t')
+                {
+                    let close = format!("</{tag}>");
+                    match rest.find(&close) {
+                        Some(rel) => i += rel + close.len(),
+                        None => break 'outer,
+                    }
+                    out.push('\n');
+                    continue 'outer;
+                }
+            }
+            let is_block = BLOCK.iter().chain(BLOCK2.iter()).any(|tag| {
+                let a = format!("<{tag}");
+                let b = format!("</{tag}");
+                for pre in [a, b] {
+                    if rest.starts_with(&pre)
+                        && rest[pre.len()..]
+                            .chars()
+                            .next()
+                            .is_some_and(|c| c == '>' || c == ' ' || c == '/' || c == '\n' || c == '\t')
+                    {
+                        return true;
+                    }
+                }
+                false
+            });
+            match html[i..].find('>') {
+                Some(rel) => i += rel + 1,
+                None => break,
+            }
+            out.push(if is_block { '\n' } else { ' ' });
+            continue;
+        }
+        let l = utf8_len(bytes[i]).min(n - i);
+        out.push_str(&html[i..i + l]);
+        i += l;
+    }
+    let decoded = decode_html_entities(&out);
+    // 逐行收拢：行内空白压成单空格，连续空行压成一个。
+    let mut lines: Vec<String> = Vec::new();
+    let mut blank = 0usize;
+    for raw_line in decoded.lines() {
+        let line = raw_line.split_whitespace().collect::<Vec<_>>().join(" ");
+        if line.is_empty() {
+            blank += 1;
+            if blank == 1 && !lines.is_empty() {
+                lines.push(String::new());
+            }
+        } else {
+            blank = 0;
+            lines.push(line);
+        }
+    }
+    while lines.last().is_some_and(|l| l.is_empty()) {
+        lines.pop();
+    }
+    lines.join("\n")
+}
+
 /// Fetch a public web page for the agent. Guards against SSRF (public IPs only,
 /// redirects are followed but **re-validated on every hop**), bounds time/size, and returns readable text.
 #[tauri::command]
@@ -3455,7 +3557,7 @@ pub async fn web_fetch(url: String) -> Result<String, String> {
             )
             .await;
             if let Ok(Ok(Some(html))) = rendered {
-                let text = html_to_text(&html);
+                let text = html_to_article_text(&html);
                 if text.len() > 100 {
                     return {
         // 截断必须留痕。原来直接 take(24_000) 就返回，正文在半句话处结束、没有省略号、
@@ -3515,7 +3617,7 @@ pub async fn web_fetch(url: String) -> Result<String, String> {
     let raw = String::from_utf8_lossy(&bytes).to_string();
 
     let text = if ct.contains("html") || raw.trim_start().starts_with('<') {
-        html_to_text(&raw)
+        html_to_article_text(&raw)
     } else {
         raw
     };
@@ -4410,6 +4512,87 @@ fn parse_ddg_lite(html: &str) -> Vec<(String, String, String)> {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod article_text_tests {
+    use super::*;
+
+    /// 抓回来的内容此前是**一堵墙**：`html_to_text` 最后一句
+    /// `split_whitespace().join(" ")` 把整页的换行和段落全压成一行空格。
+    /// 界面上没法读，而**喂给模型的是同一堵墙**。
+    #[test]
+    fn 整页正文要保留段落结构() {
+        let html = "<h1>标题</h1><p>第一段。</p><p>第二段。</p><ul><li>要点一</li><li>要点二</li></ul>";
+        let out = html_to_article_text(html);
+        assert!(out.contains('\n'), "整页正文被压成一行了：{out:?}");
+        let lines: Vec<&str> = out.lines().filter(|l| !l.trim().is_empty()).collect();
+        assert!(lines.len() >= 5, "段落没有分开，只有 {} 行：{out:?}", lines.len());
+        assert!(lines.contains(&"标题"), "标题丢了");
+        assert!(lines.contains(&"第一段。"), "段落丢了");
+        assert!(lines.contains(&"要点一"), "列表项丢了");
+    }
+
+    /// 导航/页脚是纯噪声：读者不看，而它还占着模型的上下文预算。
+    /// 用户截图里那串「Claude Platform Docs Messages Managed Agents Admin Resources…」
+    /// 就是 <nav> 的内容。
+    #[test]
+    fn 导航页脚这类样板要整块丢掉() {
+        let html = "<nav>Docs Messages Managed Agents Admin Resources</nav>\
+                    <article><p>真正的正文。</p></article>\
+                    <footer>版权所有</footer><aside>相关阅读</aside>";
+        let out = html_to_article_text(html);
+        assert!(out.contains("真正的正文。"), "正文丢了：{out:?}");
+        for noise in ["Managed Agents", "版权所有", "相关阅读"] {
+            assert!(!out.contains(noise), "{noise} 没被丢掉：{out:?}");
+        }
+    }
+
+    /// `<header>` **不能**跳：很多文章把标题放在 `<article><header>` 里，跳了会丢标题。
+    #[test]
+    fn header_不跳过_否则文章标题会丢() {
+        let out = html_to_article_text("<article><header><h1>文章标题</h1></header><p>正文</p></article>");
+        assert!(out.contains("文章标题"), "文章标题被当成样板丢掉了：{out:?}");
+    }
+
+    /// 跳过判定必须认**标签边界**，不能只比前缀。
+    ///
+    /// 用 `<section>` / `<article>` 试是试不出来的 —— 它们和 `<script>` / `<aside>`
+    /// 第三个字母就分岔，裸前缀也不会混（第一版就这么写的，变异实测漏网）。
+    /// 真正只有边界判定挡得住的是**自定义元素**：`<nav-bar>` / `<form-field>` 这类
+    /// 在组件化站点里很常见，裸前缀会把它们整块吞掉，正文跟着一起没。
+    #[test]
+    fn 跳过判定要认标签边界_不是前缀() {
+        let out = html_to_article_text("<nav-bar><p>组件里的正文要留下</p></nav-bar>");
+        assert!(out.contains("组件里的正文要留下"), "<nav-bar> 被当成 <nav> 整块吞了：{out:?}");
+        let out2 = html_to_article_text("<form-field><p>也要留下</p></form-field>");
+        assert!(out2.contains("也要留下"), "<form-field> 被当成 <form> 整块吞了：{out2:?}");
+        // 顺带确认真正的 <nav> 仍然被丢掉 —— 放宽不是拆掉。
+        let out3 = html_to_article_text("<nav>导航噪声</nav><p>正文</p>");
+        assert!(!out3.contains("导航噪声") && out3.contains("正文"), "真 <nav> 没被丢：{out3:?}");
+    }
+
+    /// script/style 仍要整块丢（这条是从 html_to_text 继承来的行为，不能丢）。
+    #[test]
+    fn 脚本和样式仍然整块丢掉() {
+        let out = html_to_article_text("<style>.a{color:red}</style><script>var x=1;</script><p>正文</p>");
+        assert!(out.contains("正文"));
+        assert!(!out.contains("color:red") && !out.contains("var x"), "脚本/样式漏出来了：{out:?}");
+    }
+
+    /// 连续空行压成一个，别把墙换成一片空白。
+    #[test]
+    fn 连续空行要压成一个() {
+        let out = html_to_article_text("<p>一</p><div></div><div></div><div></div><p>二</p>");
+        assert!(!out.contains("\n\n\n"), "出现了三连空行：{out:?}");
+    }
+
+    /// **行内片段那条路不能被带偏。** html_to_text 的调用点（链接文字、摘要）期望单行。
+    #[test]
+    fn 行内提取仍然是单行() {
+        let out = html_to_text("<a href=\"#\">点<b>这</b>里</a>");
+        assert!(!out.contains('\n'), "行内提取混进了换行：{out:?}");
+    }
 }
 
 #[cfg(test)]
