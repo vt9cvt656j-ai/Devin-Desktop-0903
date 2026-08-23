@@ -24144,6 +24144,134 @@ let _ghErr = "";
 // stack summary the model sees prominently at the top of the context block. Much
 // more reliable than hoping the model derives "this is Next.js, run `npm test`"
 // from raw JSON. The same info is cached for the agent loop's auto-test.
+// 项目栈识别表。**唯一**一份「哪些文件是依赖清单」的名单——三处判据全部从它派生。
+//
+// 为什么要有这张表：漏掉一类构建描述文件，代价不是"少认一个栈"，是整块栈提示一个字都
+// 不出（lang 为空 → _formatStackHint 以前直接返回 ""），模型连一行「怎么跑测试」都收不到，
+// 只能靠猜，或者干脆一条验证命令都不跑就交付。而这份名单此前在三个地方各写了一遍、
+// 互相漂开：读取清单 12 条、"改它就是在选技术栈" 15 条、"清单只算文档不算源码" 13 条。
+// 同一个 pubspec.yaml，在一处算依赖清单、在另一处不算——这种分叉最难查。
+//
+// bespoke: true 的那几行由下面的专用分支解析（要读 JSON、按依赖嗅框架、算复杂度）；
+// 表里仍然列出，因为三份名单要从这里派生。其余的整条由表驱动：**加一门语言 = 加一行**，
+// 不用改代码、不用等发版（见 [[config-over-hardcoding]]）。用户自己那一层再往上叠：
+// _userCapabilities().stack 能覆盖任何一个字段——公司内部的构建包装器（`./bin/ci check`）、
+// monorepo 里某个子包的专属命令，永远不可能进产品自带的表。
+//
+// guessed：这条命令是**猜的默认值**，没有任何项目文件声明过它，也没验证装没装。要如实
+// 标给模型（退出 127 时它才知道该换命令，而不是当成代码错误），并被验证管线过滤掉。
+const _STACK_TABLE = [
+  { manifest: "package.json", lang: "JS/TS", bespoke: true },
+  { manifest: "Cargo.toml", lang: "Rust", bespoke: true },
+  { manifest: "pyproject.toml", lang: "Python", bespoke: true },
+  { manifest: "requirements.txt", lang: "Python", bespoke: true },
+  { manifest: "go.mod", lang: "Go", bespoke: true },
+  // 读它是为了拿 `test:` 目标，但它是构建逻辑、不是依赖清单：改 Makefile 不等于在选技术栈，
+  // 读 Makefile 也不等于"只读了一份依赖描述"。notManifest 就是这个区别。
+  { manifest: "Makefile", bespoke: true, notManifest: true },
+  { manifest: "pom.xml", lang: "Java", bespoke: true },
+  { manifest: "build.gradle", lang: "JVM", bespoke: true },
+  { manifest: "build.gradle.kts", lang: "JVM", bespoke: true },
+  { manifest: "composer.json", lang: "PHP", bespoke: true },
+  { manifest: "Gemfile", lang: "Ruby", bespoke: true },
+  { manifest: "README.md", doc: true, notManifest: true },
+
+  // ↓ 以下没有专用分支，整条由这张表驱动。
+  { manifest: "deno.json", lang: "Deno", pkgMgr: "deno",
+    cmds: { testCmd: "deno test -A", checkCmd: "deno check .", formatCmd: "deno fmt", lintCmd: "deno lint" } },
+  { manifest: "deno.jsonc", lang: "Deno", pkgMgr: "deno",
+    cmds: { testCmd: "deno test -A", checkCmd: "deno check .", formatCmd: "deno fmt", lintCmd: "deno lint" } },
+  { manifest: "mix.exs", lang: "Elixir", pkgMgr: "mix",
+    cmds: { testCmd: "mix test", checkCmd: "mix compile --warnings-as-errors", buildCmd: "mix compile", formatCmd: "mix format" },
+    frameworks: [[/phoenix/i, "Phoenix"]] },
+  { manifest: "pubspec.yaml", lang: "Dart", pkgMgr: "pub",
+    cmds: { testCmd: "dart test", checkCmd: "dart analyze", buildCmd: "dart compile exe .", formatCmd: "dart format ." },
+    frameworks: [[/^\s*flutter\s*:/m, "Flutter"]],
+    // Flutter 项目的命令是另一套，嗅到就整组换掉。
+    whenFramework: { Flutter: { testCmd: "flutter test", checkCmd: "flutter analyze", buildCmd: "flutter build", pkgMgr: "flutter pub" } } },
+  { manifest: "Package.swift", lang: "Swift", pkgMgr: "SwiftPM",
+    cmds: { testCmd: "swift test", checkCmd: "swift build", buildCmd: "swift build -c release" } },
+  { manifest: "build.zig", lang: "Zig", pkgMgr: "zig",
+    cmds: { testCmd: "zig build test", checkCmd: "zig build", buildCmd: "zig build -Doptimize=ReleaseSafe", formatCmd: "zig fmt ." } },
+  { manifest: "build.sbt", lang: "Scala", pkgMgr: "sbt",
+    cmds: { testCmd: "sbt test", checkCmd: "sbt compile", buildCmd: "sbt package" } },
+  { manifest: "deps.edn", lang: "Clojure", pkgMgr: "deps.edn",
+    cmds: { testCmd: "clojure -M:test", checkCmd: "clojure -M -e nil" }, guessed: ["clojure -M:test"] },
+  { manifest: "stack.yaml", lang: "Haskell", pkgMgr: "stack",
+    cmds: { testCmd: "stack test", checkCmd: "stack build --fast", buildCmd: "stack build" } },
+  { manifest: "cabal.project", lang: "Haskell", pkgMgr: "cabal",
+    cmds: { testCmd: "cabal test", checkCmd: "cabal build", buildCmd: "cabal build" } },
+  { manifest: "CMakeLists.txt", lang: "C/C++", pkgMgr: "CMake",
+    cmds: { checkCmd: "cmake --build build", buildCmd: "cmake --build build", testCmd: "ctest --test-dir build" },
+    guessed: ["cmake --build build", "ctest --test-dir build"] },
+  { manifest: "meson.build", lang: "C/C++", pkgMgr: "Meson",
+    cmds: { checkCmd: "meson compile -C build", buildCmd: "meson compile -C build", testCmd: "meson test -C build" },
+    guessed: ["meson compile -C build", "meson test -C build"] },
+  { manifest: "Gopkg.toml", lang: "Go", pkgMgr: "dep" },
+  { manifest: "Pipfile", lang: "Python", pkgMgr: "pipenv",
+    cmds: { testCmd: "pipenv run pytest", checkCmd: "pipenv run python -m compileall -q ." }, guessed: ["pipenv run pytest"] },
+  { manifest: "Podfile", lang: "Swift/ObjC", pkgMgr: "CocoaPods" },
+
+  // 按扩展名认的（工程文件名跟着项目名走，没有固定文件名）。这一族要多一次根目录列举，
+  // 命中的内容以扩展名为键放进 fileMap。
+  { ext: ".csproj", lang: "C#", pkgMgr: "NuGet",
+    cmds: { testCmd: "dotnet test", checkCmd: "dotnet build", buildCmd: "dotnet build -c Release", formatCmd: "dotnet format" } },
+  { ext: ".fsproj", lang: "F#", pkgMgr: "NuGet",
+    cmds: { testCmd: "dotnet test", checkCmd: "dotnet build", buildCmd: "dotnet build -c Release" } },
+  { ext: ".sln", lang: "C#", pkgMgr: "NuGet",
+    cmds: { testCmd: "dotnet test", checkCmd: "dotnet build" } },
+  { ext: ".cabal", lang: "Haskell", pkgMgr: "cabal",
+    cmds: { testCmd: "cabal test", checkCmd: "cabal build" } },
+  { ext: ".gemspec", lang: "Ruby", pkgMgr: "Bundler" },
+];
+
+/** 表里所有固定文件名（读取用，保持原大小写）。 */
+const _stackManifestNames = () => _STACK_TABLE.filter((r) => r.manifest).map((r) => r.manifest);
+/** 表里所有按扩展名认的后缀。 */
+const _stackManifestExts = () => _STACK_TABLE.filter((r) => r.ext).map((r) => r.ext);
+/**
+ * 「这个文件名是依赖清单吗」——小写基名判据，两处旧的硬编码 Set 都改用它。
+ * `extra` 收锁文件之类：它们不该出现在读取清单里（读了也没信息量），但确实算清单。
+ */
+const _MANIFEST_EXTRA = ["go.sum", "gemfile.lock", "package-lock.json", "yarn.lock", "pnpm-lock.yaml",
+  "cargo.lock", "poetry.lock", "composer.lock", "pubspec.lock", "package-swift"];
+function _isManifestBaseName(base, { includeLocks = true, includeDocs = false } = {}) {
+  // includeDocs 只在极少数「连说明文件也算」的场景放行；默认 notManifest 的行一律不算。
+  const b = String(base || "").toLowerCase();
+  if (!b) return false;
+  for (const row of _STACK_TABLE) {
+    if (row.notManifest && !includeDocs) continue;
+    if (row.manifest && row.manifest.toLowerCase() === b) return true;
+    if (row.ext && b.endsWith(row.ext)) return true;
+  }
+  return includeLocks && _MANIFEST_EXTRA.includes(b);
+}
+
+/**
+ * 用户声明的项目栈覆盖探测结果。
+ *
+ * 探测再全也有边界：公司内部的构建包装器、monorepo 里某个子包的专属命令，永远不可能
+ * 进产品自带的表。用户填一段 `stack: { checkCmd: "./bin/ci check" }` 就生效。
+ *
+ * 覆盖掉一条**猜测**命令时要把它从 guessedCmds 里摘掉——用户声明的是事实，不是猜测；
+ * 留着的话它会一直被标注成"未验证已安装"，也会被验证管线当猜测过滤掉，等于白填。
+ */
+function _applyUserStackOverride(stack) {
+  let over = null;
+  try { over = _userCapabilities().stack; } catch { return stack; }
+  if (!over || typeof over !== "object") return stack;
+  const guessed = new Set(stack.guessedCmds || []);
+  for (const [key, value] of Object.entries(over)) {
+    if (!value) continue;
+    if (stack[key] && guessed.has(stack[key])) guessed.delete(stack[key]);
+    stack[key] = value;
+    stack.declaredKeys = stack.declaredKeys || [];
+    if (!stack.declaredKeys.includes(key)) stack.declaredKeys.push(key);
+  }
+  stack.guessedCmds = [...guessed];
+  return stack;
+}
+
 function _extractStackHints(fileMap) {
   // checkCmd = a FAST compile/type-check (no test execution) — the cheapest strongest
   // per-change correctness signal. Used for non-JS/TS stacks (JS/TS gets live Monaco
@@ -24269,14 +24397,45 @@ function _extractStackHints(fileMap) {
       (out.guessedCmds = out.guessedCmds || []).push(out.testCmd);
     }
   }
+  // 表驱动的其余语言。专用分支先跑，这里只**填空**（`||`），所以一个 JS/TS + Elixir 的
+  // 混合仓不会被后来者把已经识别出来的命令顶掉；lang 走和上面完全相同的 " + X" 追加口径。
+  for (const row of _STACK_TABLE) {
+    if (row.bespoke || row.doc) continue;
+    const key = row.manifest || row.ext;
+    const content = fileMap[key];
+    if (content === undefined || content === null || content === "") continue;
+    if (row.lang) out.lang = out.lang ? (out.lang.includes(row.lang) ? out.lang : out.lang + " + " + row.lang) : row.lang;
+    if (row.pkgMgr) out.pkgMgr = out.pkgMgr || row.pkgMgr;
+    // 框架嗅探先做：命中的框架可能整组换掉命令（Flutter 之于 Dart）。
+    let framework = "";
+    for (const [re, name] of row.frameworks || []) {
+      if (re.test(String(content))) { framework = name; break; }
+    }
+    if (framework) out.framework = out.framework || framework;
+    const cmds = { ...(row.cmds || {}), ...((framework && row.whenFramework?.[framework]) || {}) };
+    if (cmds.pkgMgr) { out.pkgMgr = cmds.pkgMgr; delete cmds.pkgMgr; }
+    const guessed = new Set(row.guessed || []);
+    for (const [k, v] of Object.entries(cmds)) {
+      if (out[k] || !v) continue;
+      out[k] = v;
+      // 框架专属那组是从项目文件里嗅出来的事实，不是猜测；只有 row.guessed 里列名的才是。
+      if (guessed.has(v)) (out.guessedCmds = out.guessedCmds || []).push(v);
+    }
+  }
   return out;
 }
 
 // Format the extracted stack into a tight, model-friendly hint block. Goes at the
 // TOP of the context (before raw file dumps) so the model sees it first.
 function _formatStackHint(s) {
-  if (!s || !s.lang) return "";
-  const lines = [`📦 项目栈: ${s.lang}${s.framework ? " · " + s.framework : ""}${s.pkgMgr ? " · 包管理 " + s.pkgMgr : ""}${s.complexity === "large" ? " · ⚠️ 大项目" : s.complexity === "medium" ? " · 中型项目" : ""}`];
+  // 认不出语言 ≠ 什么都不知道：套件位置、用户自己声明的构建命令、已声明依赖都可能在。
+  // 以前这里一个 `!s.lang` 就把整块提示吞掉，模型连一行「怎么跑测试」都收不到，
+  // 于是只能猜，或者干脆一条验证命令都不跑就交付。
+  if (!s) return "";
+  const _known = s.lang || s.testDir || s.checkCmd || s.testCmd || s.buildCmd || s.devCmd
+    || s.lintCmd || s.formatCmd || s.declaredKeys?.length;
+  if (!_known) return "";
+  const lines = [`📦 项目栈: ${s.lang || "未识别（下面这些是从项目文件或你的声明里读到的事实）"}${s.framework ? " · " + s.framework : ""}${s.pkgMgr ? " · 包管理 " + s.pkgMgr : ""}${s.complexity === "large" ? " · ⚠️ 大项目" : s.complexity === "medium" ? " · 中型项目" : ""}`];
   // 猜测命令要如实标注——模型自己跑到 127 时才知道该换命令而不是当成代码错误。
   const _guessed = new Set(s.guessedCmds || []);
   const _unverified = (cmd) => _guessed.has(cmd) ? "（猜测默认、未验证已安装；退出 127 就换 venv 内工具或 python -m compileall，别当代码错误）" : "";
@@ -24961,11 +25120,28 @@ async function _gatherAgentContext(query, sessionRoot, boundaryRoot = "") {
   // lang 为空 → _formatStackHint 直接返回 ""，模型连一行「怎么跑测试」都收不到，
   // 只能靠猜或者干脆一条验证命令都不跑就交付。讽刺的是验证器白名单本来就认得
   // mvn/gradle/dotnet 这些命令——能认，但从来发现不了。
-  const keyFiles = ["package.json", "README.md", "Cargo.toml", "pyproject.toml", "go.mod", "Makefile", "requirements.txt",
-    "pom.xml", "build.gradle", "build.gradle.kts", "composer.json", "Gemfile"];
+  const keyFiles = _stackManifestNames();
   const _keyReadsPromise = Promise.all(keyFiles.map(name =>
     backend.readTextFile(root + "/" + name).catch(() => null).then(c => c?.trim() ? [name, c] : null)
   ));
+  // 工程文件名跟着项目名走（`MyApp.csproj`），没有固定文件名可读——.NET / F# / Haskell
+  // 整个语族此前因此一次都识别不出来。列一次根目录换整族可见，命中的内容以**扩展名**
+  // 为键放进 fileMap，_extractStackHints 因此仍然是纯函数（只吃 fileMap）。
+  const _extReadsPromise = (async () => {
+    const exts = _stackManifestExts();
+    if (!exts.length) return [];
+    let entries = [];
+    try { entries = await backend.readDir(root); } catch { return []; }
+    if (!Array.isArray(entries)) return [];
+    const hits = [];
+    for (const ext of exts) {
+      const hit = entries.find((e) => e && !e.is_dir && String(e.name || "").toLowerCase().endsWith(ext));
+      if (!hit) continue;
+      const text = await backend.readTextFile(root + "/" + hit.name).catch(() => null);
+      if (text?.trim()) hits.push([ext, text]);
+    }
+    return hits;
+  })();
   // 测试套件在**哪个目录**，和"用什么命令跑"是两件事，而以前只告诉了后者。
   //
   // 实证（用户的 ThesisX）：项目有标准 pytest 套件 tests/ + conftest.py + unit/ +
@@ -25086,9 +25262,10 @@ async function _gatherAgentContext(query, sessionRoot, boundaryRoot = "") {
   const fileMap = {};
   for (const r of results) { if (r) fileMap[r[0]] = r[1]; }
   for (const name of await _lockReadsPromise) { if (name) fileMap[name] = "[present]"; }
+  for (const hit of await _extReadsPromise) { if (hit) fileMap[hit[0]] = hit[1]; }
 
   // Stack hints FIRST (high-priority, model sees it before raw file dumps).
-  const stack = _extractStackHints(fileMap);
+  const stack = _applyUserStackOverride(_extractStackHints(fileMap));
   // 套件位置紧跟在栈提示后面：它回答的是"新测试写到哪去"，而 testCmd 只回答"怎么跑"。
   // testDir 必须在 _projectStacks.set **之前**落到 stack 上：set 存的是浅拷贝，先 set
   // 再赋 testDir 的话，Map 里那份永远没有 testDir——_strayScratchFiles 和「改的文件有
@@ -25103,7 +25280,12 @@ async function _gatherAgentContext(query, sessionRoot, boundaryRoot = "") {
   // 答不上来就一个字都不说。放在这里而不是塞进 _extractStackHints：那个函数是"栈提示"的
   // 纯格式化器，依赖名单和它要回答的问题（怎么跑测试）没关系。
   stack.declaredDeps = _declaredDepsFromFileMap(fileMap);
-  if (stack.lang) _projectStacks.set(root, { ...stack, root }); else _projectStacks.delete(root);
+  // 闸门从"认出语言"放宽到"有任何一条可用事实"。原来只要 lang 为空，testDir、
+  // declaredDeps、用户自己声明的 checkCmd 会**一起**被丢掉——一个 .NET 仓库或一个用户
+  // 手填了构建命令的仓库，栈提示整块一个字不出。
+  const _hasStackFact = !!(stack.lang || stack.testDir || stack.declaredKeys?.length
+    || stack.checkCmd || stack.testCmd || stack.buildCmd || stack.devCmd);
+  if (_hasStackFact) _projectStacks.set(root, { ...stack, root }); else _projectStacks.delete(root);
   const stackHint = _formatStackHint(stack);
   if (stackHint) {
     // Insert near the top, right after osBlock and workspace path.
@@ -39038,12 +39220,10 @@ function _introducesNewTech(call) {
   // 依赖清单：改它就等于在选技术栈。
   const p = String(call.path || "").replace(/\\/g, "/").toLowerCase();
   const name = p.slice(p.lastIndexOf("/") + 1);
-  const MANIFESTS = new Set([
-    "package.json", "requirements.txt", "pyproject.toml", "cargo.toml", "go.mod",
-    "gemfile", "composer.json", "pubspec.yaml", "build.gradle", "build.gradle.kts",
-    "pom.xml", "package-swift", "package.swift", "podfile", "mix.exs",
-  ]);
-  if (!MANIFESTS.has(name)) return false;
+  // 名单从 _STACK_TABLE 派生：这里和读取清单、"清单只算文档"那两处以前各写了一遍并且
+  // 互相漂开（同一个 pubspec.yaml 在一处算清单、另一处不算）。锁文件不算"选技术栈"——
+  // 它是解析结果，不是人做的选择。
+  if (!_isManifestBaseName(name, { includeLocks: false })) return false;
   // 只有**新增**才算选型；删依赖、改版本号不需要重新调研。
   const added = String(call.content ?? call.new_string ?? "");
   return added.length > 0;
@@ -46809,11 +46989,12 @@ function _evidenceGradingHint(readPaths, draftText) {
   // exactly trusting a description instead of the real files. So a manifest counts as a
   // description (like a doc), NOT as authoritative source/config — reading only manifests
   // must still push the agent to open actual source before a project/implementation claim.
-  const MANIFEST = new Set(["package.json", "cargo.toml", "go.mod", "go.sum", "pyproject.toml", "requirements.txt", "gemfile", "gemfile.lock", "pom.xml", "build.gradle", "composer.json", "pubspec.yaml", "pipfile"]);
+  // 同一份名单（见 _isManifestBaseName）。这里连锁文件一起算：读 package-lock.json
+  // 同样只是读了一份依赖描述，不构成"看过真源码"。
   let sawDoc = false, sawSource = false, sawConfig = false;
   for (const p of paths) {
     const ext = _ext(p), base = _base(p);
-    if (MANIFEST.has(base)) { sawDoc = true; continue; } // a manifest is a description of deps
+    if (_isManifestBaseName(base)) { sawDoc = true; continue; } // a manifest is a description of deps
     if (SOURCE_EXT.has(ext)) { sawSource = true; continue; }
     if (CONFIG_EXT.has(ext) || base === "dockerfile" || base === "makefile") { sawConfig = true; continue; }
     if (DOC_EXT.has(ext) || base === "readme" || base === "license" || base === "changelog" || base === "authors") { sawDoc = true; continue; }
