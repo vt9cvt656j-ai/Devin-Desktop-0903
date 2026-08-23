@@ -56188,9 +56188,36 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
           if (messages[i].role === "user" && typeof messages[i].content === "string" && messages[i].content.includes(_DELIVERY_FACTS_TAG)) { messages.splice(i, 1); break; }
         }
         const _facts = run.mode === "agent" && !_padInjectedThisTurn ? _deliveryFactsLine(run) : "";
-        if (_facts) {
+        // 这块**没说自己是给谁用的**，那是那段固定收尾模板的真正来源。
+        //
+        // 用户实拍、且反复投诉多次：每次交付后面都跟着一段一模一样的
+        // 「验证结果（真实命令输出）／未验证的一项／你要做的唯一一步／两点说明」。
+        // 那不是模型爱写八股——是 harness 以 **user 角色**递了一份带小标题的结构化执行记录
+        // 过去，一条 user 消息里塞一份清单，最自然的反应就是把它转述回给用户。
+        // answer_quality 里那条「仪式性结尾按形状禁止」拦不住它：那是一条规矩，而这是一份
+        // 摆在眼前的模板。修机制不是加劝诫——把这块的**用途**说清就够了。
+        //
+        // 同时把「还欠几步」并进来。计划位置在另一个块里（_PLAN_STATE_TAG），那块只说
+        // 「你在第几步」，没有一句「那就别说完成」。于是 harness 明明记着 plan_steps_pending，
+        // 模型正文照样写「已完成」——和「README.md 已更新」而文件没动是同一族：harness 知道，
+        // 模型照说不误。要让「完成」这两个字当场撞上一条摆在面前的事实。
+        const _openSteps = (Array.isArray(run._planSteps) ? run._planSteps : [])
+          .filter((st) => st?.status === "pending" || st?.status === "in_progress");
+        const _openLine = _openSteps.length
+          ? `\n还没做完的步骤有 ${_openSteps.length} 个：`
+            + _openSteps.slice(0, 4).map((st) => String(st?.content || "").slice(0, 40)).join("、")
+            + (_openSteps.length > 4 ? " 等" : "")
+            + "。**这一轮不是完成**——要么继续做，要么说清哪几步没做、为什么；不许写成交付完成。"
+          : "";
+        if (_facts || _openLine) {
           messages.push({ role: "user", content: `${_ORCH_NOTE}${_DELIVERY_FACTS_TAG}（本轮真实执行记录，不是推断）: ${_facts}\n`
-            + "照着事实说话：没跑过验证就别说「已验证」「能用了」「跑通了」；该验证就现在去验证，别把没做的事写成做完了。" });
+            + "**这块是给你自己核对用的，不是让你转述给用户。** 拿它和你打算说的话对一遍：说了「已保存」"
+            + "而这里写着没落盘、说了「验证过」而这里写着没跑过验证，就改口。绝不要把它抄成"
+            + "「验证结果」「未验证的一项」「你要做的下一步」「已知边界」这类每次都长一样的固定章节——"
+            + "用户要的是结论和真实状态，不是一份体检报告。真有一项没验证、且它会改变用户接下来怎么做，"
+            + "就在正文里用一句话说清，说完就停。\n"
+            + "照着事实说话：没跑过验证就别说「已验证」「能用了」「跑通了」；该验证就现在去验证，别把没做的事写成做完了。"
+            + _openLine });
         }
       }
 
