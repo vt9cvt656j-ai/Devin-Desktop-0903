@@ -19551,6 +19551,22 @@ function _wireInlineEditMenuTrigger(button, openMenu) {
 
 // 双击自己的消息 → 就地编辑 → 重新发送。该消息及其后的对话（气泡+记忆里的 recent）
 // 作废重跑；这之前的全部上下文（包括更早的摘要/里程碑）原样保留。
+// 这条气泡对应的那条消息带了哪些附件。
+//
+// 从 memory 里按 transcriptSequence 取，**不去 DOM 里捞 <img>**：DOM 里的可能是
+// blob: URL（进程一重启就失效），而 memory / SQLite 里那份是持久化过的原始附件。
+// 取不到就返回空数组——编辑一条没有图的消息本来就该是空的。
+function _messageAttachmentsFor(session, wrap) {
+  const seq = Number(wrap?.dataset?.transcriptSequence);
+  if (!session?.memory || !Number.isFinite(seq) || seq < 0) return [];
+  try {
+    const offset = Math.max(0, Number(session.memory.transcriptOffset) || 0);
+    const entries = session.memory.transcriptEntries?.() || session.memory.recent || [];
+    const message = entries[seq - offset];
+    return Array.isArray(message?.attachments) ? message.attachments.slice() : [];
+  } catch { return []; }
+}
+
 function _beginEditResend(wrap, forSession) {
   const sess = forSession || _currentSession();
   if (!sess || wrap._editing) return;
@@ -19562,16 +19578,15 @@ function _beginEditResend(wrap, forSession) {
   const orig = String(wrap._rawText || body.textContent || "");
   // 保留原 DOM 节点（而非序列化 HTML），取消时原样放回——@引用卡片/图片的点击事件不丢
   const origNodes = [...body.childNodes];
-  // 相册**留在原地**，只摘走文字节点。
+  origNodes.forEach((n) => n.remove());
+  // 这条消息带的图，在编辑态里用**底部输入框那一套**缩略图重新画一遍。
   //
-  // 原来这里是 `origNodes.forEach(n => n.remove())` —— 把整个 body 清空，图片跟着一起
-  // 消失。于是双击一条带图的消息，屏幕上只剩一个写着文字的输入框，用户根本看不出这条
-  // 消息本来是带图的（也就无从判断编辑后图还在不在）。
-  // 图不参与编辑（textarea 装不下），但**必须看得见**：它们是这条消息的一部分。
-  const keptNodes = origNodes.filter((n) =>
-    n.nodeType === 1 && (n.classList?.contains("msg__album") || n.classList?.contains("msg__attached-image")
-      || n.classList?.contains("msg__attached-video")));
-  origNodes.filter((n) => !keptNodes.includes(n)).forEach((n) => n.remove());
+  // 上一版是把消息里的相册（Telegram 版式的大格子）留在原地，用户指出来不对：
+  // 「编辑的输入框就是要和下面的总输入框一模一样」。相册是**阅读态**的样子，编辑态该
+  // 长得像输入框——同一套 .prompt-images / .prompt-image-preview，连删除按钮都在。
+  //
+  // 取消编辑时整份 origNodes 原样放回，所以这里画的是副本，不动原节点。
+  const editMedia = _messageAttachmentsFor(sess, wrap);
   const ta = document.createElement("textarea");
   ta.className = "msg__edit-ta";
   ta.value = orig;
@@ -19611,12 +19626,22 @@ function _beginEditResend(wrap, forSession) {
   // 复用底部 composer 的盒子样式（同一个 class）：与底部输入框完全一致的白底圆角卡片
   const box = document.createElement("div");
   box.className = "composer__box msg__edit-box";
-  box.append(ta, bar);
-  // 阅读态是「文字在上、图在下」（_renderMessageAttachments 在文字之后才调）。
-  // 直接 append 会让编辑框排到相册**后面**，双击一下图片就跳到文字上方去了。
-  // 插在第一个保留节点之前，编辑态和阅读态的上下关系保持一致。
-  if (keptNodes.length) body.insertBefore(box, keptNodes[0]);
-  else body.append(box);
+  // 缩略图条在**输入框上方**，和底部输入框一致（那边是 insertBefore(container, promptEl)）。
+  const mediaStrip = document.createElement("div");
+  mediaStrip.className = "prompt-images";
+  const paintMedia = () => {
+    mediaStrip.innerHTML = "";
+    editMedia.forEach((attachment, i) => mediaStrip.appendChild(
+      _createImagePreview(attachment, i, () => {
+        // 编辑框里删图改的是这份副本，不碰底部的 _pastedImages，也不碰原消息。
+        editMedia.splice(i, 1);
+        paintMedia();
+      })));
+    mediaStrip.hidden = editMedia.length === 0;
+  };
+  paintMedia();
+  box.append(mediaStrip, ta, bar);
+  body.append(box);
   try { ta.focus(); ta.setSelectionRange(ta.value.length, ta.value.length); } catch {}
   const cancel = () => {
     // 若模型/模式菜单还寄宿在这张编辑卡里，先收回并送回底部原位，避免随卡片一起被销毁。
@@ -19625,10 +19650,8 @@ function _beginEditResend(wrap, forSession) {
     document.removeEventListener("pointerdown", onOutside, true);
     wrap._editing = false;
     body.classList.remove("msg__body--editing");
-    body.textContent = "";           // 连相册一起清掉，下面按原顺序整份放回
-    // 按 origNodes 的**原始顺序**放回，不是「先文字后图片」：顺序错了的话，
-    // 取消一次编辑图片就跑到文字后面去，而且再取消一次还会再跑一次。
-    body.append(...origNodes);
+    body.textContent = "";
+    body.append(...origNodes);       // 原节点一直没被改过，原样放回即可
   };
   // 点击编辑卡片外面且内容没改动 → 视为放弃编辑，恢复原消息。
   // 有改动时不自动取消（防误触丢稿）；透传到底部真实按钮的弹层也不算"外面"。
@@ -19658,9 +19681,10 @@ function _beginEditResend(wrap, forSession) {
       // 模型这一轮也再看不到它。用户报的就是这个。
       // 用原消息上的 attachments 而不是去 DOM 里捞 <img>：DOM 里的可能是 blob: URL
       // （进程一重启就失效），而 memory 里那份是持久化过的原始附件。
-      const _original = await _truncateFromUserMessage(sess, wrap);
-      const _keptMedia = Array.isArray(_original?.attachments) ? _original.attachments : [];
-      sendPrompt(next, _keptMedia);
+      await _truncateFromUserMessage(sess, wrap);
+      // 发的是**编辑框里现在还剩下的**那些图，不是原消息那份：用户在缩略图上点了 ×
+      // 删掉几张，就该真的不再发出去——否则那个删除按钮是假的。
+      sendPrompt(next, editMedia.slice());
     } catch (error) {
       sendBtn.disabled = false;
       console.warn("[chat] historical edit preparation failed:", error);
@@ -34846,7 +34870,7 @@ function _buildAgentToolSchemas(includeWrite, mcpTools = []) {
     { type: "function", function: { name: "lsp_symbols", description: "List a file's code structure outline — the language service (LSP / Monaco TS) parses out functions, classes, methods, variables and other symbols with their line numbers. Faster than read_file for seeing a file's skeleton. Requires a language service for that language (JS/TS work out of the box; Python, Go, Rust and so on need their LSP installed). 【When to use】To get a quick sense of what a file exports and which functions and classes it holds, and to locate roughly where a symbol is. 【vs alternatives】To find a symbol's definition across the project use find_symbol; for its callers use lsp_references.", parameters: { type: "object", properties: { path: { type: "string", description: "File path" } }, required: ["path"] } } },
     { type: "function", function: { name: "find_symbol", description: "**Find a symbol across the whole project** — locate every definition of a function / class / interface / type / constant by name (file:line). It queries the workspace symbol index maintained in the background and **returns in milliseconds**, far faster than grepping the whole project. First choice in a large project for finding a definition, a name collision, or a duplicate implementation. Supports a kind filter (function/class/interface/type/enum/const/struct/trait/impl). The index is built in the background about 3 seconds after the IDE starts and covers JS/TS, Python, Rust, Go, Java/Kotlin, C/C++, Ruby, PHP and more. 【When to use】When you need a symbol's definition — faster and more precise than a full-text grep; to find its callers use lsp_references. 【vs alternatives】For callers use lsp_references; to search by meaning use semantic_search; for plain text matching use search.", parameters: { type: "object", properties: { name: { type: "string", description: "The symbol name (exact match; case-insensitive)" }, kind: { type: "string", description: "Optional; filter by symbol type: function / class / interface / type / enum / const / struct / trait / impl / method" }, limit: { type: "integer", description: "Maximum number of results to return (default 20)" } }, required: ["name"] } } },
     { type: "function", function: { name: "semantic_search", description: "**Find code by meaning** — not exact grep matching, but \"find the code that does this\" from a sentence of natural language. 【When to use】First choice when first exploring an unfamiliar codebase, or when you can describe the behaviour but cannot name a keyword — far faster than reading and grepping your way through guesses. 【vs alternatives】When you know the exact symbol name use find_symbol; when you know a keyword or string use search; to find files by name use find_files.", parameters: { type: "object", properties: { query: { type: "string", description: "A natural-language description of the code you want (the more specific the better)" }, top_k: { type: "integer", description: "How many of the most relevant code blocks to return (default 10, maximum 30)" } }, required: ["query"] } } },
-    { type: "function", function: { name: "knowledge_search", description: "**Query the platform's built-in professional knowledge base** — battle-tested best practices and common traps across specialist areas (front-end React/Next, back-end API design, database schema/indexing, application security, UI/UX design, DevOps deployment), distilled from senior experience. **When a domain task is unfamiliar or has to be right, look here first**: how to design a database schema, where a JWT should be stored, how to make UI look professional, how to use API status codes, how to prevent SQL injection or IDOR, how to write a Dockerfile, **which tool plus exact command to use to reverse-engineer or decompile a given format**, and so on. Follow the best practices you find rather than going from impressions. It now ALSO answers from this platform's own code corpus: the real exported signatures of published libraries (npm / PyPI / crates.io, extracted from the published package itself) and official documentation (MDN for the whole web platform, plus React / Vue / Svelte / TypeScript / Node / Rust / Astro / FastAPI). So it is the right first stop for \"what is this library's real API\" and \"what does the spec actually say\", not only for curated advice. Every passage is labelled by source: curated = distilled experience, real_api = the library's own declaration, official_docs = the official documentation. Prefer a labelled passage over recalling an API from memory: a signature you remember may belong to a different major version. It returns the few most relevant passages. This is faster and more focused than a web search (it is already curated), and a second spent here before you start avoids many traps and noticeably raises the quality of the result. 【**用什么语言写 query**——这条直接决定搜不搜得到】这个库是**按词匹配**的（BM25），不是语义匹配：query 和文档必须**用同一种语言的同一批词**。技术语料（MDN、React/Vue/Svelte/TypeScript/Node/Rust 官方文档、各语言包的导出签名）**是英文的**，所以查它时 query 要写**英文技术词**——哪怕你正在用中文跟用户对话。michael-design 是中文的，查它就写中文。实测：`why does my effect fire twice on mount` 命中正确小节；同一个问题写成「组件卸载时怎么取消订阅」不但没命中，还以更高的分数命中了完全无关的 `Billing & Subscription`——**它不会告诉你搜错了，只会给你一个高分的错答案**。拿不准就把中英文都写进去（\"useEffect cleanup 副作用清理\"）。", parameters: { type: "object", properties: { query: { type: "string", description: "What you are doing / the best practice you want to confirm, e.g. \"how to build a database index\", \"jwt vs session\", \"how to unpack an NSIS installer\", \"pyinstaller decompile\", \"js deobfuscation\", \"radare2 disassembly\"" }, domain: { type: "string", description: "Optional; restrict to a domain. **michael-design** is the design blueprint corpus \u2014 441 production-grade, Tailwind-native page and section blueprints with real palettes, layout composition patterns, motion recipes and component coverage. Pass it for ANY visible UI work (website, web app, desktop GUI, dashboard, landing page, a single component) and build from what it returns instead of inventing colours and spacing from memory. Other domains: web-frontend / backend-api / database / security / ui-ux / devops / reverse-engineering / penetration-testing" }, top_k: { type: "integer", description: "How many passages to return (default 6, maximum 20)" } }, required: ["query"] } } },
+    { type: "function", function: { name: "knowledge_search", description: "**Query the platform's built-in professional knowledge base** — battle-tested best practices and common traps across specialist areas (front-end React/Next, back-end API design, database schema/indexing, application security, UI/UX design, DevOps deployment), distilled from senior experience. **When a domain task is unfamiliar or has to be right, look here first**: how to design a database schema, where a JWT should be stored, how to make UI look professional, how to use API status codes, how to prevent SQL injection or IDOR, how to write a Dockerfile, **which tool plus exact command to use to reverse-engineer or decompile a given format**, and so on. Follow the best practices you find rather than going from impressions. It now ALSO answers from this platform's own code corpus: the real exported signatures of published libraries (npm / PyPI / crates.io, extracted from the published package itself) and official documentation (MDN for the whole web platform, plus React / Vue / Svelte / TypeScript / Node / Rust / Astro / FastAPI). So it is the right first stop for \"what is this library's real API\" and \"what does the spec actually say\", not only for curated advice. Every passage is labelled by source: curated = distilled experience, real_api = the library's own declaration, official_docs = the official documentation. Prefer a labelled passage over recalling an API from memory: a signature you remember may belong to a different major version. It returns the few most relevant passages. This is faster and more focused than a web search (it is already curated), and a second spent here before you start avoids many traps and noticeably raises the quality of the result. 【**用什么语言写 query**——这条直接决定搜不搜得到】这个库是**按词匹配**的（BM25），不是语义匹配：query 和文档必须**用同一种语言的同一批词**。技术语料（MDN、React/Vue/Svelte/TypeScript/Node/Rust 官方文档、各语言包的导出签名）**是英文的**，所以查它时 query 要写**英文技术词**——哪怕你正在用中文跟用户对话。michael-design 是中文的，查它就写中文。实测：`why does my effect fire twice on mount` 命中正确小节；同一个问题写成「组件卸载时怎么取消订阅」不但没命中，还以更高的分数命中了完全无关的 `Billing & Subscription`——**它不会告诉你搜错了，只会给你一个高分的错答案**。拿不准就把中英文都写进去（\"useEffect cleanup 副作用清理\"）。", parameters: { type: "object", properties: { query: { type: "string", description: "What you are doing / the best practice you want to confirm, e.g. \"how to build a database index\", \"jwt vs session\", \"how to unpack an NSIS installer\", \"pyinstaller decompile\", \"js deobfuscation\", \"radare2 disassembly\"" }, domain: { type: "string", description: "Optional; restrict to a domain. **michael-design** is the design blueprint corpus \u2014 441 production-grade, Tailwind-native page and section blueprints with real palettes, layout composition patterns, motion recipes and component coverage. Pass it for ANY visible UI work (website, web app, desktop GUI, dashboard, landing page, a single component) and build from what it returns instead of inventing colours and spacing from memory. Other domains, pass the one that matches the BUSINESS area (not the tech you happen to use — a hospital scheduling system is healthcare, not web-frontend): healthcare / finance / legal / security / penetration-testing / reverse-engineering / database / devops / gaming / data-ml / blockchain / iot-embedded / mobile / saas / ecommerce / education / marketing / backend-api / web-frontend / ui-ux / systems-programming. A wrong guess is safe: an unmatched domain falls back to searching everything rather than returning nothing." }, top_k: { type: "integer", description: "How many passages to return (default 6, maximum 20)" } }, required: ["query"] } } },
     { type: "function", function: { name: "lsp_definition", description: "Jump to a symbol's definition. Give the file the symbol appears in, its line number and the symbol name, and it returns file:line for the definition. It resolves semantically, so it is more accurate than guessing with search. Requires a language service for that language. 【When to use】When reading code and you want to jump precisely into an implementation (you already know an occurrence at path:line); if you do not know where it is, use find_symbol first, and for usages use lsp_references. 【vs alternatives】For callers use lsp_references; when the location is unknown start with find_symbol.", parameters: { type: "object", properties: { path: { type: "string", description: "The file where the symbol appears" }, line: { type: "integer", description: "The line the symbol is on (1-based)" }, symbol: { type: "string", description: "The symbol name (used to locate the column on that line)" } }, required: ["path", "line"] } } },
       { type: "function", function: { name: "lsp_hover", description: "**Ask the language server what a symbol's type/signature actually is**, at a given position — the same information the editor shows on hover: resolved signature plus doc comment, for the version actually installed here. 【When to use】When you are about to call something and are not sure of its exact signature, and you already have an occurrence at path:line (yours or existing code). This is the cheapest possible signature check — one round trip, no file reading. 【Limits】Needs a running language server for that language; if it returns nothing, fall back to package_source (for third-party APIs) or read the definition. Does NOT work for a symbol you have not written down anywhere yet — use find_symbol or package_source for that.", parameters: { type: "object", properties: { path: { type: "string", description: "File containing the occurrence" }, line: { type: "integer", description: "1-based line number of the occurrence" }, symbol: { type: "string", description: "The symbol name on that line (used to find the exact column)" } }, required: ["path", "line", "symbol"] } } },
     { type: "function", function: { name: "lsp_references", description: "Find every reference to / use of a symbol in the project. Give the file the symbol appears in, its line number and the symbol name, and it returns the reference list (file:line). It resolves semantically, so it is more accurate than a plain-text search (it distinguishes same-named but different things). Requires a language service for that language. 【When to use】To see who calls a function or variable and to gauge the blast radius of a change — more precise than a full-text grep, with semantic boundaries that do not report same-named false positives. 【vs alternatives】To jump to the definition use lsp_definition; to outline a whole file's symbols use lsp_symbols.", parameters: { type: "object", properties: { path: { type: "string", description: "The file where the symbol appears" }, line: { type: "integer", description: "The line the symbol is on (1-based)" }, symbol: { type: "string", description: "The symbol name (used to locate the column on that line)" } }, required: ["path", "line"] } } },
@@ -75215,7 +75239,20 @@ promptEl.addEventListener("keydown", (e) => {
 
 let _pastedImages = [];
 
-function _createImagePreview(attachment, idx) {
+/**
+ * 底部输入框那套待发图缩略图，**编辑框也用这一份**。
+ *
+ * 用户原话：「编辑的输入框就是要和下面的总输入框一模一样」。做法上唯一能保证「一模一样」
+ * 的是**共用同一套 DOM 和样式**（.prompt-images / .prompt-image-preview），而不是照着
+ * 写第二份——写第二份的话，底部那边以后改一次样式，编辑框就悄悄跟不上了（这个仓库里
+ * 「同一件事两份实现」的坑已经吃过好几次）。
+ *
+ * 删除按钮是唯一的差异点：底部那份直接改模块级的 `_pastedImages`，编辑框改的是自己那份
+ * 副本。所以把它抽成 `onRemove` 参数，其余一个字不改。
+ *
+ * @param {(attachment:object, idx:number)=>void} [onRemove] 不给就沿用底部输入框的行为
+ */
+function _createImagePreview(attachment, idx, onRemove = null) {
   const wrap = document.createElement("div");
   wrap.className = "prompt-image-preview";
   const src = attachment.dataUrl || attachment.objectUrl || (attachment.path ? (inTauri ? backend.assetUrl(attachment.path) : attachment.path) : attachment.frames?.[0] || "");
@@ -75244,6 +75281,7 @@ function _createImagePreview(attachment, idx) {
   remove.innerHTML = "&times;";
   wrap.appendChild(remove);
   wrap.querySelector("button").addEventListener("click", () => {
+    if (onRemove) { onRemove(attachment, idx); return; }
     _releaseAttachmentObjectUrl(_pastedImages[idx]);
     _pastedImages = _pastedImages.filter((_, i) => i !== idx);
     _refreshImagePreviews();

@@ -28189,38 +28189,67 @@ test("相册样式：格子定尺寸、行等高、角标盖实", () => {
     "角标挡住了点击——点 +N 进不了画廊");
 });
 
-// ── 编辑态：图要看得见，输入框要跟着内容长高 ────────────────────────────────
+// ── 编辑态：长得就得和底部输入框一模一样 ──────────────────────────────────
 //
-// 两个都是用户实测报的：
-//   1. 双击一条带图的消息进编辑，图**消失了** —— 原来是把整个 body 清空再塞输入框。
-//      于是屏幕上只剩一个写着文字的框，用户看不出这条消息本来带图，也就无从判断
-//      编辑之后图还在不在。
-//   2. 内容打多了不换行 —— rows 只在建 textarea 时算一次，之后再也不变；而 CSS 里
-//      `height:auto; max-height:168px` 又没配 overflow-y，于是超过一行之后既不长高、
-//      也没滚动条，后面打的字直接看不见。
-test("编辑态要保留图片，且输入框跟着内容长高", () => {
+// 三轮下来的经过：
+//   1. 最早是把整个 body 清空再塞输入框 → 双击带图的消息，图**消失**。
+//   2. 改成把消息里的相册留在原地 → 图是在了，但那是**阅读态**的 Telegram 大格子。
+//      用户指出来不对：「编辑的输入框就是要和下面的总输入框一模一样」。
+//   3. 现在用底部输入框那一套（.prompt-images / .prompt-image-preview），连删除按钮都在。
+//
+// 「一模一样」唯一靠得住的做法是**共用同一份渲染**，不是照着写第二份——写第二份的话
+// 底部那边以后改一次样式，编辑框就悄悄跟不上了（这仓库里「同一件事两份实现」的坑
+// 已经吃过好几次，见 two-tool-catalogs 那类）。
+test("编辑态的图用底部输入框那一套渲染，不是消息里的相册", () => {
   const src = stripJsComments(extractFn("_beginEditResend"));
 
-  // 图不参与编辑（textarea 装不下），但必须留在 DOM 里看得见。
-  assert.match(src, /const keptNodes = origNodes\.filter/, "没有挑出要保留的媒体节点");
-  assert.match(src, /msg__album/, "相册没有被列进保留名单");
-  assert.doesNotMatch(src, /^\s*origNodes\.forEach\(\(n\) => n\.remove\(\)\);/m,
-    "又把整个 body 清空了——带图消息一进编辑态图就没了");
-  assert.match(src, /origNodes\.filter\(\(n\) => !keptNodes\.includes\(n\)\)\.forEach\(\(n\) => n\.remove\(\)\)/,
-    "摘走的应该只有非媒体节点");
+  assert.match(src, /mediaStrip\.className = "prompt-images"/,
+    "没有用底部输入框那个容器类——样式就不可能一模一样");
+  assert.match(src, /_createImagePreview\(attachment, i, \(\) =>/,
+    "没有复用底部那套缩略图渲染（照着写第二份迟早和底部漂开）");
+  assert.doesNotMatch(src, /msg__album/,
+    "又把消息里的相册搬进编辑态了——那是阅读态的版式，不是输入框的样子");
+  // 缩略图条在输入框**上方**，和底部一致（那边是 insertBefore(container, promptEl)）。
+  assert.match(src, /box\.append\(mediaStrip, ta, bar\)/,
+    "缩略图条不在输入框上方，和底部输入框的排布对不上");
 
-  // 编辑框要插在相册**前面**：阅读态是「文字在上、图在下」，append 会上下颠倒。
-  assert.match(src, /body\.insertBefore\(box, keptNodes\[0\]\)/,
-    "编辑框排到相册后面了——双击一下图片会跳到文字上方");
+  // 删除按钮必须是真的：删掉的图不能再发出去。
+  assert.match(src, /editMedia\.splice\(i, 1\)/, "点 × 没有真的把那张图去掉");
+  assert.match(src, /sendPrompt\(next, editMedia\.slice\(\)\)/,
+    "发的还是原消息那份附件——那个删除按钮就是假的");
 
-  // 自动长高：每次输入都重算，而且先塌回 auto 再取 scrollHeight（否则只增不减）。
+  // 取消：原节点一直没被改过，整份放回。
+  assert.match(src, /body\.append\(\.\.\.origNodes\)/, "取消时没把原消息放回去");
+
+  // 自动长高：每次输入都重算，且先塌回 auto（否则删字时只增不减）。
   assert.match(src, /ta\.addEventListener\("input", autoGrow\)/, "打字时不会重算高度");
   assert.match(src, /ta\.style\.height = "auto";[\s\S]{0,120}ta\.scrollHeight/,
     "没有先塌回 auto 再量 scrollHeight——删字时高度只增不减");
+});
 
-  // 取消：整份按**原始顺序**放回。textContent="" 会连相册一起清掉，所以不能只放回被摘走的。
-  assert.match(src, /body\.textContent = "";[\s\S]{0,300}body\.append\(\.\.\.origNodes\)/,
-    "取消时没有把节点按原顺序整份放回——图片会跑到文字后面，而且每取消一次就再跑一次");
+test("附件从 memory 取，不从 DOM 捞", () => {
+  const pick = load("_messageAttachmentsFor");
+  const sess = { memory: { transcriptOffset: 0, transcriptEntries: () => [
+    { role: "user", content: "没图" },
+    { role: "user", content: "带图", attachments: [{ kind: "image", name: "p.png" }] },
+  ] } };
+  assert.deepEqual(pick(sess, { dataset: { transcriptSequence: "1" } }), [{ kind: "image", name: "p.png" }]);
+  assert.deepEqual(pick(sess, { dataset: { transcriptSequence: "0" } }), [], "没图的消息要给空数组");
+  assert.deepEqual(pick(sess, { dataset: {} }), [], "没有 sequence 时不许抛");
+  assert.deepEqual(pick(sess, { dataset: { transcriptSequence: "99" } }), [], "越界不许抛");
+  // 返回的必须是**副本**：编辑框里点 × 会 splice 它，直接返回原数组就把消息本身改了。
+  //
+  // 观测点要落在**同一个 message 对象**上。第一版写的是「清空返回值、再取一次看长度」，
+  // 而上面那个 sess 每次调用都重建 entries 字面量，所以那个探针什么都探不到
+  // （变异实测漏网：返回原数组照样绿）。
+  const held = { role: "user", content: "带图", attachments: [{ kind: "image", name: "p.png" }] };
+  const stable = { memory: { transcriptOffset: 0, transcriptEntries: () => [held] } };
+  pick(stable, { dataset: { transcriptSequence: "0" } }).length = 0;
+  assert.equal(held.attachments.length, 1,
+    "返回的是原数组——编辑框里删一张图会把消息本身也改掉");
+  // DOM 里的可能是 blob:（进程一重启就失效），所以只能从 memory 取。
+  assert.doesNotMatch(stripJsComments(extractFn("_messageAttachmentsFor")), /querySelector/,
+    "去 DOM 里捞 <img> 了——那些 src 可能是重启后就失效的 blob:");
 });
 
 test("编辑框样式：超出上限要能滚，长串要折行", () => {
@@ -28257,11 +28286,15 @@ test("编辑带图的历史消息重发，图片必须跟着走", () => {
     "截断没有接住 removed，被编辑那条的附件就此丢失");
   assert.match(src, /return Array\.isArray\(removedByEdit\) \? removedByEdit\[0\] \|\| null : null;/,
     "截断函数没有把被编辑的原消息返回给调用方");
-  // 发送处必须真的把附件传进去。只钉「取了值」不够——要钉 sendPrompt 的第二个实参。
-  assert.match(src, /const _keptMedia = Array\.isArray\(_original\?\.attachments\) \? _original\.attachments : \[\];/,
-    "没有从原消息上取回附件");
-  assert.match(src, /sendPrompt\(next, _keptMedia\)/,
-    "附件取回来了却没传给 sendPrompt——编辑仍然等于把图删掉");
+  // 附件来源在「编辑框改用底部输入框那套缩略图」时换过一次：不再从 truncate 的返回值上
+  // 捞，而是进编辑态就取出来画成缩略图条，发送时发编辑框里**剩下的**那份。
+  // 守的性质没变——编辑不许把图弄丢——所以钉的是新实现。
+  assert.match(src, /const editMedia = _messageAttachmentsFor\(sess, wrap\)/,
+    "进编辑态时没有把这条消息的附件取出来");
+  assert.match(src, /sendPrompt\(next, editMedia\.slice\(\)\)/,
+    "重发时没带附件——编辑仍然等于把图删掉");
+  assert.doesNotMatch(src, /sendPrompt\(next\)\s*;/,
+    "又变回只发文字了");
 });
 
 test("编辑历史消息后，按轮次累积的台账要跟着作废，不能继续喂给模型", () => {
