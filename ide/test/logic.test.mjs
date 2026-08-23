@@ -28082,6 +28082,60 @@ test("崩溃重开：补进上下文的必须是日志结尾那一段，不是 c
     "又把第一窗（按 checkpoint 猜的那一窗）当结尾喂进去了");
 });
 
+// ── 多图按 Telegram 那套排版，不再竖着堆一长条 ─────────────────────────────
+//
+// 改之前每张图 display:block + max-width:240px 直接 appendChild 到消息体，于是三张图
+// 竖着堆成一长条、每张都占满一屏高。现在按**张数**选版式，装进一个 grid 容器。
+test("多图消息按张数选相册版式", () => {
+  const pick = load("_albumLayoutFor");
+  assert.equal(pick(0), "single");
+  assert.equal(pick(1), "single", "单张不进相册——它没有对齐对象，保持原比例不裁");
+  assert.equal(pick(2), "two");
+  assert.equal(pick(3), "three", "三张是 Telegram 的招牌版式：左一大 + 右两小");
+  assert.equal(pick(4), "four");
+  assert.equal(pick(5), "many");
+  assert.equal(pick(12), "many");
+
+  const src = stripJsComments(extractFn("_renderMessageAttachments"));
+  // 只有多图才建容器：单图仍走原来那条路，样式完全不变。
+  assert.match(src, /imageCount > 1 \? document\.createElement\("div"\) : null/,
+    "单张图也被塞进相册容器了——它会被 1:1 裁掉");
+  // 视频不进相册：object-fit: cover 会把播放控件条裁掉。
+  assert.match(src, /a\.kind !== "video"/, "视频被算进了相册张数，版式会错位");
+  assert.match(src, /\(album \|\| body\)\.appendChild\(imgEl\)/,
+    "图片没有挂进相册容器");
+  // 版式和张数都要写到 DOM 上，CSS 才选得中。
+  assert.match(src, /album\.dataset\.layout = _albumLayoutFor\(imageCount\)/);
+  assert.match(src, /album\.dataset\.count = String\(imageCount\)/,
+    "没写 count，最后一行铺满的那几条规则就选不中");
+});
+
+test("相册样式：每种版式都在，最后一行不许留白", () => {
+  // 版式选择器齐全。
+  for (const layout of ["two", "three", "four", "many"]) {
+    assert.match(APP_CSS, new RegExp(`\\.msg__album\\[data-layout="${layout}"\\]`),
+      `${layout} 版式的样式不见了`);
+  }
+  // 相册里的图必须由格子定尺寸：不覆盖单图那套 max-width 的话，格子撑不开。
+  assert.match(APP_CSS, /\.msg__album \.msg__attached-image[\s\S]{0,400}object-fit:\s*cover/,
+    "相册里的图没有 object-fit: cover——每张各自的比例会让行高参差，就是改之前那个样子");
+  assert.match(APP_CSS, /\.msg__album \.msg__attached-image[\s\S]{0,400}max-width:\s*none/,
+    "没有覆盖单图的 max-width，格子撑不开");
+  // 圆角裁在容器上：每张自己圆角会露出白角。
+  assert.match(APP_CSS, /\.msg__album\s*\{[\s\S]{0,400}overflow:\s*hidden/,
+    "圆角没裁在容器上");
+
+  // 「many」必须用 6 列。这是最后一行铺满的机制：满行每张跨 2，余 2 张各跨 3、余 1 张跨 6。
+  // 用 3 列 + aspect-ratio 是修不了留白的（那只改高度、不改占几列），实测过：5 张时
+  // 第二行右边空三分之一。
+  assert.match(APP_CSS, /\.msg__album\[data-layout="many"\]\s*\{\s*grid-template-columns:\s*repeat\(6,\s*1fr\)/,
+    "many 版式不是 6 列——最后一行会留白");
+  assert.match(APP_CSS, /data-count="5"\][\s\S]{0,200}grid-column:\s*span 3/,
+    "5 张时第二行没铺满");
+  assert.match(APP_CSS, /data-count="7"\][\s\S]{0,160}grid-column:\s*span 6/,
+    "7 张时最后一张没通栏");
+});
+
 // ── 编辑历史消息：图片不许丢，作废轮次的台账也要跟着删 ─────────────────────
 //
 // 两个都是用户实测报的：

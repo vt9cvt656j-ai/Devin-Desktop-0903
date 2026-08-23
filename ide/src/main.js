@@ -19836,8 +19836,42 @@ function _discardPreTurnAssistant(session) {
 
 // Render user media without changing the existing message layout. Videos use
 // native controls; persisted videos without raw bytes fall back to a key frame.
+// 一条消息里有几张图，就用哪种相册排法（Telegram 那套）。
+//
+// 判据只看**图片张数**，不看宽高比：拿不到自然尺寸的时候（历史消息里的图还没解码、
+// 或者只剩关键帧）任何按比例分组的算法都会先摆错一次、图片加载完再跳一下。宁可用一套
+// 稳定的固定版式，也不要一个会当着用户面重排的“聪明”版式。
+//
+// 1 张   → 单张，保持原比例，不裁
+// 2 张   → 并排各半
+// 3 张   → 左一大 + 右两小（Telegram 的招牌版式）
+// 4 张   → 上一大 + 下三小
+// 5 张+  → 每行三张的方格；最后一行不足三张时铺满该行剩余宽度
+//
+// ≥2 张时统一用 1:1 方格 + object-fit: cover：不裁的话每张各自的比例会让行高参差，
+// 那正是现在这个“竖着堆一长条”的样子。单张不裁，因为它没有对齐对象。
+function _albumLayoutFor(count) {
+  if (count <= 1) return "single";
+  if (count === 2) return "two";
+  if (count === 3) return "three";
+  if (count === 4) return "four";
+  return "many";
+}
+
 function _renderMessageAttachments(body, attachments = []) {
   if (!body || !Array.isArray(attachments)) return;
+  // 相册只收**图片**：视频有自己的播放器尺寸和控件，塞进方格里会被 object-fit 裁掉控件条。
+  // 视频仍旧按原来的方式逐个平铺，和这次改动无关。
+  const imageCount = attachments.filter((a) =>
+    a && typeof a === "object" && a.kind !== "video"
+    && (a.dataUrl || a.objectUrl || a.path || (Array.isArray(a.frames) && a.frames.length))).length;
+  const album = imageCount > 1 ? document.createElement("div") : null;
+  if (album) {
+    album.className = "msg__album";
+    album.dataset.layout = _albumLayoutFor(imageCount);
+    album.dataset.count = String(imageCount);
+    body.appendChild(album);
+  }
   for (const attachment of attachments) {
     if (!attachment || typeof attachment !== "object") continue;
     const kind = attachment.kind === "video" ? "video" : "image";
@@ -19878,7 +19912,7 @@ function _renderMessageAttachments(body, attachments = []) {
     if (attachment.path && inTauri) imgEl.addEventListener("error", async () => {
       try { const dataUrl = await backend.readFileDataUrl(attachment.path); if (dataUrl) imgEl.src = dataUrl; } catch {}
     }, { once: true });
-    body.appendChild(imgEl);
+    (album || body).appendChild(imgEl);
   }
 }
 

@@ -7531,6 +7531,73 @@ button.agent-plan__fold--toggle:focus-visible { outline: 2px solid #1a73e8; outl
   background: #000;
 }
 
+/* ---- 消息里的多图相册（Telegram 式，按张数换版式）--------------------------
+   张数由 JS 写进 data-layout（见 _albumLayoutFor）。这里只有版式，没有条件判断：
+   grid 的行列在每种版式里都是写死的，所以图片加载完不会重排——用户不会看到跳一下。
+
+   ≥2 张统一 1:1 方格 + object-fit: cover。不裁的话每张各自的比例会让行高参差，
+   那正是改之前「竖着堆一长条」的样子。单张（.msg__attached-image 不在相册里）保持
+   原比例、原上限，因为它没有对齐对象。 */
+.msg__album {
+  display: grid;
+  gap: 3px;                      /* Telegram 的缝隙就是这么窄，宽了像九宫格贴纸 */
+  margin-top: 8px;
+  width: min(320px, 100%);       /* 和单图 240px 上限同一量级，多图给多一点 */
+  border-radius: 12px;
+  overflow: hidden;              /* 圆角裁在容器上：每张自己圆角会露出四个白角 */
+}
+.msg__album .msg__attached-image {
+  /* 覆盖单图那套：在相册里由格子定尺寸 */
+  width: 100%; height: 100%;
+  max-width: none; max-height: none;
+  margin-top: 0;
+  border: 0; border-radius: 0; box-shadow: none;
+  object-fit: cover;
+  aspect-ratio: 1 / 1;
+}
+.msg__album .msg__attached-image:hover {
+  transform: none;               /* 格子里放大会把邻居盖住 */
+  filter: brightness(.92);
+}
+
+/* 2 张：并排各半 */
+.msg__album[data-layout="two"] { grid-template-columns: 1fr 1fr; }
+
+/* 3 张：左一大 + 右两小。左边那张跨两行，所以它是 1:2 的竖图 */
+.msg__album[data-layout="three"] {
+  grid-template-columns: 2fr 1fr;
+  grid-template-rows: 1fr 1fr;
+}
+.msg__album[data-layout="three"] .msg__attached-image:first-child {
+  grid-row: 1 / span 2;
+  aspect-ratio: auto;            /* 跨行的那张由行高决定，不能再钉 1:1*/
+}
+
+/* 4 张：上一大 + 下三小 */
+.msg__album[data-layout="four"] {
+  grid-template-columns: repeat(3, 1fr);
+  grid-template-rows: auto auto;
+}
+.msg__album[data-layout="four"] .msg__attached-image:first-child {
+  grid-column: 1 / span 3;
+  aspect-ratio: 3 / 2;           /* 通栏那张用 3:2，1:1 会高得占掉半屏 */
+}
+
+/* 5 张及以上：每行三张的方格。最后一行不足三张时由 grid 自动左对齐，
+   再用 :last-child 的跨列把那一行铺满，避免右侧留一块突兀的空白。 */
+.msg__album[data-layout="many"] { grid-template-columns: repeat(6, 1fr); }
+.msg__album[data-layout="many"] .msg__attached-image { grid-column: span 2; }
+/* 最后一行不足三张时右边会留白 —— aspect-ratio 修不了这件事（它只改高度、不改占几列）。
+   底层用 6 列，满行每张跨 2；余 2 张各跨 3、余 1 张跨 6，正好把那一行吃满。
+   余数按张数取模：5=3+2、7=3+3+1、8=3+3+2。 */
+.msg__album[data-layout="many"][data-count="5"] .msg__attached-image:nth-child(n+4),
+.msg__album[data-layout="many"][data-count="8"] .msg__attached-image:nth-child(n+7) {
+  grid-column: span 3; aspect-ratio: 3 / 2;
+}
+.msg__album[data-layout="many"][data-count="7"] .msg__attached-image:nth-child(7) {
+  grid-column: span 6; aspect-ratio: 3 / 1;
+}
+
 /* ---- Design Board grid (design_board / batch generate_image results) ---- */
 .design-board {
   display: grid; gap: 10px; margin: 8px 0; width: 100%;
