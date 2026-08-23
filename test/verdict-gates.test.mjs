@@ -326,6 +326,13 @@ test("画像机器的门槛不许写 inTauri：web 构建照样有画像", () =>
 
 test("补全通道缺席才返回 null；工作区取证拿不到就降级成 hasWorkspace:false", async () => {
   const fast = load("_fastRoutingFlags", {
+    // 快通道现在也判 domain（路由旗标的最后一块）：提示词要展开语料域名单，解析侧要
+    // 对着真实目录名归一。注入清单是**手工**维护的，漏一个就是整段 ReferenceError——
+    // 表现成"这个测试挂了"，而不是"少测一项"。
+    _AI_KNOWLEDGE_DOMAINS: loadConst("_AI_KNOWLEDGE_DOMAINS"),
+    _aiIntentKnowledgeDomain: load("_aiIntentKnowledgeDomain", {
+      _AI_KNOWLEDGE_DOMAINS: loadConst("_AI_KNOWLEDGE_DOMAINS"),
+    }),
     _FAST_ROUTING_KEYS: loadConst("_FAST_ROUTING_KEYS"),
     _AI_AGENT_ROLES: loadConst("_AI_AGENT_ROLES"),
     _aiIntentContextForTurn: () => ({}),
