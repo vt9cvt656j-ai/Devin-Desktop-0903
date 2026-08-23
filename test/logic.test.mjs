@@ -26800,6 +26800,22 @@ test("lsp-client 暴露真实就绪状态，而不是让调用方假设", () => 
 // 可达；run._checkPendingPaths / _testPendingPaths 两个账本只写不读。
 // 模型于是理性地把跑构建/测试外包给 IDE，改完就收尾。什么都没跑。用户拿到没编译过的代码。
 
+test("后台监视器盯到了必须真的通知得出去", () => {
+  // 缺陷形状：用 webview 的 `Notification` 且只在 permission === "granted" 时发，
+  // 而全代码里**从没有任何地方申请过**这个权限 —— permission 恒为 "default"，
+  // 这个分支一次都没成立过。监视器是「让用户去做 X 之后自己盯着」这条能力的全部
+  // 载体，通知发不出去 = 用户切到别的窗口就再也不知道它盯到了。
+  const inner = SRC.slice(SRC.indexOf("const _bmNotify"), SRC.indexOf("const _bmFinish"));
+  assert.ok(inner, "_bmNotify 不见了");
+  assert.doesNotMatch(inner, /new Notification\(/,
+    "又退回 webview 的 Notification 了——那条路的权限从来没人申请，恒为静默");
+  // 走的必须是这份代码里已经验证可用的那条（_notifyTaskDone 同款：问权限 + 插件发）。
+  assert.match(inner, /_notifyRequestPermission\(\)/, "没有申请通知权限，等于必然静默");
+  assert.match(inner, /_notifySystem\(/, "没有走 Tauri 通知插件");
+  // 用户拒绝系统通知 / 插件不可用时仍要有可见信号，否则又回到"完全无声"。
+  assert.match(inner, /_flashTitle\(/, "拒绝通知后没有任何兜底信号");
+});
+
 test("栈提示要如实说：改完你自己跑，兜底只有一次", () => {
   const fn = extractFn("_formatStackHint");
   const code = fn.split("\n").filter((l) => !/^\s*(\/\/|\*|\/\*)/.test(l)).join("\n");
