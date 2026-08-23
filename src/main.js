@@ -68096,6 +68096,52 @@ async function _skillRegPrefetch(query = "", fromPage = 1) {
 // 这里原来第一件事是 `if (!root) throw new Error("先打开一个工作区文件夹")`，落点是
 // `${root}/.mrdayone/skills/`。技能是跨项目的能力：装进"当时打开的那个项目"意味着换个项目
 // 整批消失，而没打开文件夹时整个市场都用不了。落点改成技能库之后，这两条限制都不成立了。
+/**
+ * 技能安装台账。**失败也要留痕。**
+ *
+ * 原来一次失败的全部痕迹就是一条一闪而过的 toast：磁盘上没东西、面板上没标记、
+ * 没有任何地方能回答「刚才那次到底为什么没成」。用户看到的就是「点了安装就这样了」，
+ * 排查的人只能靠猜。实测（2026-08-23，用户机器）：~/.mrdayone/skills 目录建于当天 12:04
+ * （说明市场面板确实跑过），里面一个技能都没有；而整条安装链路——网络可达、仓库树 509
+ * 个节点拉得到、raw 抓取 200、20 个官方技能 356 个文件全部通过路径白名单、目录创建、
+ * 按钮接线——逐项实测全是通的。缺的不是能力，是**这一次到底发生了什么**没被记下来。
+ *
+ * 只记结果与原因，不记文件正文。上限 30 条，够回答「最近几次装了什么、为什么没成」。
+ */
+const _SKILL_INSTALL_LOG_KEY = "michael-ide.skill-install-log";
+const _SKILL_INSTALL_LOG_MAX = 30;
+
+function _skillInstallLogAppend(entry) {
+  try {
+    let arr = [];
+    try { arr = JSON.parse(localStorage.getItem(_SKILL_INSTALL_LOG_KEY) || "[]") || []; } catch { arr = []; }
+    if (!Array.isArray(arr)) arr = [];
+    arr.push({ at: Date.now(), ...entry });
+    if (arr.length > _SKILL_INSTALL_LOG_MAX) arr.splice(0, arr.length - _SKILL_INSTALL_LOG_MAX);
+    localStorage.setItem(_SKILL_INSTALL_LOG_KEY, JSON.stringify(arr));
+  } catch {}
+}
+
+/**
+ * 面板上该显示的那条失败。判据是「**最近一次**尝试失败了」，不是「历史上失败过」。
+ *
+ * 所以往回扫时**先撞到成功就停**：装成功之后还顶着上一次的错误，用户会以为一直没成，
+ * 而磁盘上其实已经有东西了——那是另一种形式的谎报。历史仍在台账里，只是不再顶在面板上。
+ */
+function _skillLastInstallFailure() {
+  try {
+    const arr = JSON.parse(localStorage.getItem(_SKILL_INSTALL_LOG_KEY) || "[]") || [];
+    if (!Array.isArray(arr)) return null;
+    for (let i = arr.length - 1; i >= 0; i--) {
+      const row = arr[i];
+      if (!row || typeof row !== "object") continue;
+      if (row.ok === true) return null;   // 最近一次是成功的 → 面板上不该有错误
+      if (row.ok === false) return row;
+    }
+    return null;
+  } catch { return null; }
+}
+
 async function _skillInstallDir(repoFull, branch, dirPath, destName, onProgress, preTree = null, meta = null) {
   const skillsRoot = await _skillsHomeRoot();
   if (!skillsRoot) throw new Error("找不到技能库目录（桌面 App 才有）");
@@ -68110,14 +68156,29 @@ async function _skillInstallDir(repoFull, branch, dirPath, destName, onProgress,
   files = files.slice(0, 40);
   const destBase = `${skillsRoot}/${destName}`;
   let n = 0;
+  // 单个附属文件抓不到，不该把整次安装作废。
+  //
+  // 原来循环里任何一次失败都直接抛出去：一个临时 404、一个文件名撞上路径白名单——
+  // 整包就没了，而且磁盘上什么都不留。用户看到的只是一闪而过的 toast。
+  //
+  // 判据：SKILL.md 是这个技能**是什么**的唯一载体，它没落盘就等于没装，必须硬失败
+  // 并说清原因；其余是配套资料，缺几个仍然可用，收集起来如实报数即可。
+  // files 上面那次 sort 已经把 SKILL.md 排在第一个，所以第一轮就能判出来。
+  const skipped = [];
   for (const f of files) {
     const rel = f.path.slice(prefix.length);
     // 落点在 HOME 底下，backend.createDir / writeTextFile 那条路会被
-    // require_inside_workspace 拒掉。走技能库自己那条命令：它只收技能名 + 目录内相对
-    // 路径，自己 create_dir_all，路径不接受调用方输入。
-    const text = await _skillFetchText(`https://raw.githubusercontent.com/${repoFull}/${branch}/${f.path}`);
-    await backend.invoke("skills_write_file", { name: destName, rel, text });
-    n++;
+    // require_inside_workspace 拒掉。走技能库自己那条命令：它只收技能名 + 目录内
+    // 相对路径，自己 create_dir_all，路径不接受调用方输入。
+    try {
+      const text = await _skillFetchText(`https://raw.githubusercontent.com/${repoFull}/${branch}/${f.path}`);
+      await backend.invoke("skills_write_file", { name: destName, rel, text });
+      n++;
+    } catch (err) {
+      const why = String(err?.message || err).slice(0, 160);
+      if (rel === "SKILL.md") throw new Error(`SKILL.md 没能落盘：${why}`);
+      skipped.push({ rel, why });
+    }
     onProgress?.(`${n}/${files.length}`);
   }
   if (meta && typeof meta === "object") {
@@ -68129,7 +68190,7 @@ async function _skillInstallDir(repoFull, branch, dirPath, destName, onProgress,
       });
     } catch {}
   }
-  return { destBase, fileCount: n, skillMdPath: `${destBase}/SKILL.md` };
+  return { destBase, fileCount: n, skipped, skillMdPath: `${destBase}/SKILL.md` };
 }
 
 /*
@@ -68209,6 +68270,7 @@ function renderSkillsTool(body) {
         <div>
           <h3>发现热门 Skills</h3>
           <p class="mcpfp-sub" data-skfp-source>官方技能置顶 + GitHub 全网按 star 热度排序，一键安装到工作区。</p>
+          <p class="mcpfp-sub" data-skfp-lastfail hidden style="color:#cf6a1c"></p>
         </div>
         <div class="mcpfp-tools">
           <label class="mcpfp-searchbox">
@@ -68227,6 +68289,7 @@ function renderSkillsTool(body) {
   const addFormEl = wrap.querySelector("[data-skfp-add-form]");
   const marketEl = wrap.querySelector("[data-skfp-market]");
   const sourceEl = wrap.querySelector("[data-skfp-source]");
+  const failEl = wrap.querySelector("[data-skfp-lastfail]");
 
   let allSkills = [];
   let installedDirs = new Set();
@@ -68355,6 +68418,17 @@ function renderSkillsTool(body) {
   const renderMarket = () => {
     if (_skFp.loading) { marketEl.innerHTML = `<div class="ctp-loading">正在获取热门 Skills…</div>`; return; }
     if (_skFp.error) { marketEl.innerHTML = _skillMarketErrorHtml(_skFp.error, { retryAt: _skFp.retryAt }); return; }
+    // 上一次安装失败的痕迹要**留在面板上**，不能只有一条一闪而过的 toast。
+    // 用户的原话是「点击安装后就这样了」——那正是一次失败没有留下任何可看的东西时
+    // 的样子：磁盘上没东西、面板上没标记、没有任何地方能回答为什么。
+    const _lastFail = _skillLastInstallFailure();
+    if (_lastFail && failEl) {
+      const _when = new Date(_lastFail.at || Date.now()).toLocaleString();
+      failEl.textContent = `上次安装失败（${_when}）：${String(_lastFail.error || "").slice(0, 200)}`;
+      failEl.hidden = false;
+    } else if (failEl) {
+      failEl.hidden = true;
+    }
     if (sourceEl) sourceEl.textContent = `数据源：Anthropic 官方 + GitHub 搜索 · 按 star 热度排序${_skFp.total ? ` · 共 ${_skFp.total.toLocaleString()} 个仓库` : ""} · 只有确认含 SKILL.md 的才给「安装」 · 6 小时自动更新`;
     const q = _skFp.query.toLowerCase();
     const official = _skFp.page === 1 ? _skFp.official.filter((s) => !q || s.name.toLowerCase().includes(q) || s.path.toLowerCase().includes(q)) : [];
@@ -68439,11 +68513,17 @@ function renderSkillsTool(body) {
     try {
       const r = await run();
       await _skillPostInstall(r.skillMdPath);
+      _skillInstallLogAppend({ ok: true, tag, files: r.fileCount, skipped: (r.skipped || []).length, dest: r.destBase });
       // 打绝对落点，不打相对路径：以前写 `.mrdayone/skills/`，用户看不出到底进了哪个
       // .mrdayone（项目里也有一个同名目录）。也不再说"并启用"——装完不置常驻了。
-      showToast(`已安装（${r.fileCount} 个文件 → ${r.destBase}）`);
+      // 缺了几个配套文件要如实说：技能能用，但别让用户以为整包都在。
+      showToast(`已安装（${r.fileCount} 个文件 → ${r.destBase}）`
+        + ((r.skipped || []).length ? ` · ${r.skipped.length} 个配套文件没抓到（${r.skipped[0].rel}：${r.skipped[0].why}）` : ""));
     } catch (err) {
-      showToast("安装失败：" + String(err?.message || err).slice(0, 140));
+      const _why = String(err?.message || err).slice(0, 200);
+      // 先记账再弹 toast：toast 会消失，台账不会。这是「点了安装就这样了」唯一可查的落点。
+      _skillInstallLogAppend({ ok: false, tag, error: _why });
+      showToast("安装失败：" + _why.slice(0, 140));
     }
     _skFp.installing = "";
     // 装的那一步刚拿到一棵新树，判据已经落盘了；盖回列表，这条卡片当场变成它真正的样子
