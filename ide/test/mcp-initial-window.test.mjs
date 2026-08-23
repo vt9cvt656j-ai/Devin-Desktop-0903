@@ -29,11 +29,14 @@ import { CODE as SRC, SRC as RAW_SRC, fnSource as topLevelFn } from "./helpers/s
 // 这个文件守的是"MCP 不许挤爆窗口"，那个保证与扩窗无关，仍然成立。
 // 2026-08-22 再扩一个：knowledge_search——查外部的六个全在窗口里、查自家 22 域语料的那一个
 // 不在，于是"两条路结果差不多时模型走便宜的那条"就只朝一个方向生效。
+// 2026-08-22 又扩一个：package_source——零网络零成本（读本机 node_modules/site-packages 里
+// 装着的那一份真源码），却是这一族里唯一够不着的；package_search 在窗口里而它不在，正是
+// github_search 曾经缺 github_repo 后手的同一种缺口：注册表搜索一个签名都不给。
 const CORE = ["read_file", "list_dir", "search", "find_files", "update_plan", "ask_user", "think",
               "write_file", "edit_file", "multi_edit", "run_cmd", "run_in_terminal", "read_logs",
               "save_skill", "mcp_server",
               "web_search", "web_fetch", "github_search", "github_repo",
-              "developer_community_search", "package_search", "knowledge_search"];
+              "developer_community_search", "package_search", "package_source", "knowledge_search"];
 
 // 上面这份 CORE 是**手抄的副本**，抄错或漏跟一次，下面每条 deepEqual 都会守着一条早已
 // 不存在的边界，而且全是绿的。所以先和 main.js 的真表对一遍：漂了当场红。

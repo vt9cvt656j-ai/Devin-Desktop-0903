@@ -53,8 +53,56 @@ const ALLOWED_PARAM_TYPES = new Set(["string", "number", "integer", "boolean"]);
 export const MAX_TOOLS = 64;
 export const MAX_COMMANDS = 64;
 export const MAX_ROLES = 32;
+/** 官方文档域名白名单的条数上限。同上，纯粹防一个坏文件把判定表撑爆。 */
+export const MAX_DOC_HOSTS = 64;
 
 const str = (v) => (typeof v === "string" ? v.trim() : "");
+
+/** 主机名：字母数字段用点连接，最后一段是字母（TLD）。故意不认端口和路径。 */
+const HOST_RE = new RegExp("^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)*\\.[a-z]{2,}$");
+
+/**
+ * 一条用户写的「这个站是官方文档」→ 归一化的主机名。
+ *
+ * 用户会两种写法都用：`docs.acme.com` 和 `https://docs.acme.com/api/v2`。两种都收，
+ * 统一成裸主机名并去掉 `www.`——判定那侧比对的就是这个形状。认不出来返回空串。
+ */
+export function normalizeDocsHost(value) {
+  let s = str(value).toLowerCase();
+  if (!s) return "";
+  if (s.includes("://")) {
+    try { s = new URL(s).hostname; } catch { return ""; }
+  } else {
+    s = s.split("/")[0].split("?")[0].split("#")[0];
+    if (s.includes("@")) return "";        // 邮箱之类的，不是主机名
+    if (s.includes(":")) s = s.split(":")[0]; // 顺手容忍 host:port
+  }
+  s = s.replace(/^www\./, "").replace(/\.$/, "");
+  return HOST_RE.test(s) ? s : "";
+}
+
+/**
+ * 项目栈覆盖：用户直接告诉我们这个项目怎么编、怎么测、测试放哪。
+ *
+ * 存在的理由是 `_STACK_TABLE` 再全也有边界——公司内部的构建包装器（`./bin/ci check`）、
+ * 一个 monorepo 里某个子包的专属命令，永远不可能进产品自带的表。填一段就生效，不用等发版。
+ *
+ * 只收白名单里这几个键，且一律当**字符串**：这里出来的 checkCmd/testCmd 会进模型上下文，
+ * 也会被 `_isRecognizedVerifierCommand` 认成项目自己声明的验证命令，所以形状必须是死的。
+ * 「谁有资格写这几个键」不在本模块判——见 main.js 里 `_refreshUserCapabilities` 的 absorb()：
+ * 跟着 git clone 下来的文件写的命令一律不生效。
+ */
+const STACK_KEYS = ["lang", "framework", "pkgMgr", "checkCmd", "testCmd", "buildCmd", "lintCmd", "formatCmd", "devCmd", "testDir"];
+function normalizeStack(raw) {
+  const bag = raw && typeof raw === "object" && !Array.isArray(raw) ? raw : null;
+  const out = {};
+  if (!bag) return out;
+  for (const key of STACK_KEYS) {
+    const v = str(bag[key]).slice(0, 400);
+    if (v) out[key] = v;
+  }
+  return out;
+}
 
 /**
  * 把一份（可能是任何东西的）声明规整成 `{ tools, commands, disabled, errors }`。
@@ -66,7 +114,7 @@ const str = (v) => (typeof v === "string" ? v.trim() : "");
  * @param {string} source 这份声明来自哪个文件，用于报错和审批框
  */
 export function normalizeCapabilities(raw, source = "") {
-  const out = { tools: [], commands: [], roles: [], disabled: [], errors: [] };
+  const out = { tools: [], commands: [], roles: [], disabled: [], stack: {}, officialDocsHosts: [], errors: [] };
   const bag = raw && typeof raw === "object" && !Array.isArray(raw) ? raw : null;
   if (!bag) return out;
   // 顶层允许直接写，也允许包在 `capabilities` 下——两种写法用户都会自然写出来。
@@ -110,6 +158,20 @@ export function normalizeCapabilities(raw, source = "") {
   for (const name of Array.isArray(caps.disabled) ? caps.disabled : []) {
     const n = str(name);
     if (n) out.disabled.push(n);
+  }
+
+  out.stack = normalizeStack(caps.stack);
+
+  // 「这些域名是官方文档」。产品自带的那张表只可能收录公开的大站，收不了公司内网的
+  // Confluence、也收不了一个小众框架刚换的新域名——而判不出 official 的代价不是少一条
+  // 提示，是取证提醒照发、收尾契约继续列为未完成，白烧一轮再给用户一行不实的「未验证」。
+  const seenHost = new Set();
+  for (const item of Array.isArray(caps.officialDocsHosts) ? caps.officialDocsHosts.slice(0, MAX_DOC_HOSTS) : []) {
+    const host = normalizeDocsHost(item);
+    if (!host) { out.errors.push(`officialDocsHosts 里这一条不是主机名：${str(item) || "(空)"}`); continue; }
+    if (seenHost.has(host)) continue;
+    seenHost.add(host);
+    out.officialDocsHosts.push(host);
   }
   return out;
 }
@@ -323,7 +385,7 @@ export function userToolShortName(fullName) {
  * 「收紧永远赢」的方向一致：一个作用域说"别用这个"，另一个作用域不该把它打开。
  */
 export function mergeCapabilities(list) {
-  const out = { tools: [], commands: [], roles: [], disabled: [], errors: [] };
+  const out = { tools: [], commands: [], roles: [], disabled: [], stack: {}, officialDocsHosts: [], errors: [] };
   const seenTool = new Set();
   const seenRole = new Set();
   const seenCmd = new Set();
@@ -344,6 +406,11 @@ export function mergeCapabilities(list) {
       seenRole.add(r.name);
       out.roles.push(r);
     }
+    // 栈覆盖按**字段**取先给的那一份：先给的作用域填了 testCmd、后一个只填了 testDir，
+    // 两条都该生效。整块覆盖的话，越靠近项目的那份会把个人配置里的其余字段一起抹掉。
+    for (const [k, v] of Object.entries(one.stack || {})) if (!out.stack[k]) out.stack[k] = v;
+    // 域名是并集：多一个作用域说"这个站是官方的"，不该被另一个作用域抹掉（和 disabled 同向）。
+    for (const h of one.officialDocsHosts || []) if (!out.officialDocsHosts.includes(h)) out.officialDocsHosts.push(h);
     for (const d of one.disabled || []) if (!out.disabled.includes(d)) out.disabled.push(d);
     for (const e of one.errors || []) out.errors.push(e);
   }

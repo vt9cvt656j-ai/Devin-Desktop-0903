@@ -123,10 +123,14 @@ test("提醒按重要性淘汰，不是按先来后到", () => {
   const rank = new Function(`${factsSrc[0]}\n${rankSrc[0]}\nreturn _nudgeRank;`)();
 
   assert.equal(rank("steer"), 0, "用户实时插话必须永远最高优先级");
-  for (const fact of ["buildFix", "diag", "blindEdit", "subagentResult", "toolRepair", "recovery"]) {
+  // researchFirst 2026-08-22 从建议类改判事实类：它陈述的是执行事实（"这次工程语义要求
+  // 外部参考，而取证账本是空的"，由 _missingResearchEvidence 按台账算出来），和 websiteContent
+  // 是同一个判据的两半。而它偏偏只在**第一次写入**推一次（researchGateNudges < 1，整个 run
+  // 就这一次机会），留在建议类里就意味着任何一条更晚的建议都能把它永久挤掉。
+  for (const fact of ["buildFix", "diag", "blindEdit", "subagentResult", "toolRepair", "recovery", "researchFirst"]) {
     assert.equal(rank(fact), 1, `${fact} 是事实类，丢了模型会按错误图景干活`);
   }
-  for (const advice of ["researchFirst", "planNudge", "midSummary", "stuck", "askBudget"]) {
+  for (const advice of ["planNudge", "midSummary", "stuck", "askBudget"]) {
     assert.equal(rank(advice), 2, `${advice} 是建议类，可以被事实挤掉`);
   }
   assert.equal(rank("someBrandNewNudge"), 2,
@@ -146,7 +150,7 @@ test("提醒按重要性淘汰，不是按先来后到", () => {
   };
 
   // ① 事实不再被事实挤掉：三条事实 + 一条建议，第四条事实进来时该走的是建议。
-  const a = mk(["buildFix", "diag", "blindEdit", "researchFirst"]);
+  const a = mk(["buildFix", "diag", "blindEdit", "askBudget"]);
   assert.deepEqual(evict(a.reg, a.msgs, "subagentResult", rank),
     ["buildFix", "diag", "blindEdit"],
     "第四条事实到达时挤掉的必须是建议——构建失败、盲改警告、子智能体结论互不替代");
@@ -158,7 +162,7 @@ test("提醒按重要性淘汰，不是按先来后到", () => {
     ["diag", "blindEdit", "cmdFail"], "满额时让位的是最旧的事实，且总数收敛");
 
   // ③ 建议同时只留 1 条（正在推入的那条就是这 1 条），事实不受牵连。
-  const c = mk(["buildFix", "researchFirst"]);
+  const c = mk(["buildFix", "askBudget"]);
   assert.deepEqual(evict(c.reg, c.msgs, "planNudge", rank), ["buildFix"],
     "两条建议不能同时挂着，而事实要留下");
 
