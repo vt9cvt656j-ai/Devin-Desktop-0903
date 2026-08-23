@@ -12,7 +12,7 @@
 // 拦不住它：那是一条规矩，而这是一份摆在眼前的模板。修机制不是加劝诫——说清用途就够了。
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { CODE as SRC } from "./helpers/source.mjs";
+import { CODE as SRC, SRC as RAW_SRC, fnSource } from "./helpers/source.mjs";
 
 const at = SRC.indexOf('const _facts = run.mode === "agent"');
 const block = SRC.slice(at, at + 3400);
@@ -66,4 +66,53 @@ test("纯问答、只读排查的回合一个字都不加", () => {
     "无条件注入了——纯问答的回合会被平白塞一段");
   assert.match(block, /const _openLine = _openSteps\.length\s*\n?\s*\?/,
     "没有计划时也发欠账那段");
+});
+
+// ── 模式契约不许被一句注入推翻 ──────────────────────────────────────
+//
+// plan.txt 三处写着 never modify files / never run commands，客户端 _AI_MODE_PROMPTS.plan
+// 也写着「不修改文件或运行副作用命令」。而 harness 往同一份上下文里注入的两句话，
+// 原来都不看模式：
+//   · update_plan 的工具回执：「计划已收下，**现在去做第一步**」
+//   · 每轮交付事实块：「还没做完的步骤有 N 个……要么继续做」
+// 两句都在逼 plan 模式违约。多智能体审查把这两条都判成「高」，其中第二条是这次会话
+// 自己引入的回归。
+test("交付事实块里的「继续做」只对 agent 模式说", () => {
+  assert.match(block, /const _openSteps = run\.mode === "agent"/,
+    "又不分模式了——plan 模式的契约是只出方案不动手，对它说「要么继续做」正是逼它违约");
+  // 注释断言要对**原文**：本文件的 SRC 是剥掉注释的 CODE（本仓库的老坑，
+  // 另有记录说注释会把源码断言喂绿，所以两份要分清用途）。
+  assert.match(RAW_SRC, /plan 模式的契约是「只出方案、不动手」/,
+    "理由没写下来，下一个人会把它合并回去");
+});
+
+test("update_plan 的回执也按模式分开，且 plan 模式拿到的是正确的下一步", () => {
+  assert.match(SRC, /const _goDo = run\.mode !== "agent"/,
+    "「现在去做第一步」又不分模式了");
+  assert.match(SRC, /本模式不执行其中任何一步/,
+    "plan 模式没拿到替代的那一句——只删不给替代，模型手上就只剩「计划已更新」，"
+    + "而它刚被要求先规划，最省事的下一步就是再规划一次（那条实测：开局连发 4~5 次，65% 跑不成）");
+});
+
+// ── 验证器起不来 ≠ 代码坏了 ─────────────────────────────────────────
+test("退出 126/127 不再被当成「构建没过、代码跑不起来」", () => {
+  // agent_engineering.txt:32 逐字写着 A verifier that cannot run is NOT evidence the code is
+  // broken；而红构建门照单把 127 推成「代码现在跑不起来，先修根因」。用户现场就撞过：
+  // `vhs demo.tape` 连着两次退出 127（工具没装），门却指示去修代码。
+  const fn = fnSource("_freshBuildFailure", { code: true });
+  assert.match(fn, /e\.exitCode === 127 \|\| e\.exitCode === 126/,
+    "又把「命令没找到」当成代码坏了");
+  assert.match(fn, /if \(_cannotRun\) continue;/, "认出来了却没跳过");
+  // 判据必须是执行事实，不是正文里出现 not found（那可能是被测代码自己打印的）
+  assert.match(fn, /e\.output \|\| e\.tail/, "没看运行器级输出");
+});
+
+// ── 诊断按新增算，不是按全工程 ───────────────────────────────────────
+test("「先修掉 error 再收尾」对实时诊断要按新增算", () => {
+  // 诊断块自己写着「这是**整个工程当前的全部诊断**，包含你动手之前就有的」，
+  // 而那句无判据的「若实时诊断返回 error 就先修掉再收尾」等于要模型去清一堆本来就有的红线。
+  // 收尾门走的是基线逐条抵扣（只报新增），这句原来是这条链上唯一没做基线的。
+  assert.match(RAW_SRC, /实时诊断按\*\*新增\*\*算/, "又变回按全工程算了");
+  assert.doesNotMatch(SRC, /若实时诊断、终端、日志、HTTP 或数据库返回 error，先解释根因并修掉再收尾/,
+    "无判据的那句又回来了");
 });

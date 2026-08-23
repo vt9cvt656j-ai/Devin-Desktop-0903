@@ -7669,7 +7669,17 @@ test("Plan Explorer Reviewer and Chat receive upgraded mode-specific operating r
   const greenfieldUiPlan = block("plan", "创建第一个网站", { ui: true, uiProject: true, fromZeroUiProject: true });
   assert.match(greenfieldUiPlan, /默认 React \+ Tailwind CSS \+ shadcn\/ui/);
   assert.match(block("explorer", "梳理项目", {}), /Explorer 模式纪律[\s\S]*find_symbol\/lsp_definition\/lsp_references/);
-  assert.match(block("reviewer", "审查代码", {}), /Reviewer 模式纪律[\s\S]*P0\/P1\/P2/);
+  // 输出形状**刻意不再规定**：这两个分支原来各摆了一张槽位清单
+  //（explorer「一句结论、证据清单、架构/数据流、关键约定、风险边界、下一步建议」；
+  // reviewer「path:line、问题、触发条件、影响、最小修复建议、建议验证；不确定的放"需进一步确认"」），
+  // 而 answer_quality.txt:3 明写着答案不是几个槽的表格、只说这次真实成立的那几项，
+  // reviewer.txt:4 更写着「构造不出真实触发路径就不是 bug，不要报」——和「不确定的放需进一步
+  // 确认」正相反。规矩在服务端模块里已经说全了，客户端这层只留取证路由和只读约束。
+  assert.doesNotMatch(block("explorer", "梳理项目", {}), /输出像老手地图|下一步建议/,
+    "Explorer 分支又摆回一张输出槽位清单了");
+  assert.match(block("reviewer", "审查代码", {}), /Reviewer 模式纪律[\s\S]*只报有证据的问题/);
+  assert.doesNotMatch(block("reviewer", "审查代码", {}), /需进一步确认/,
+    "和 reviewer.txt:4「构造不出真实触发路径就不是 bug」正相反");
 
   assert.match(SRC, /const _modeFrame = \(effectiveMode !== "agent"\) \? _modeRuntimeGuidanceBlock\(effectiveMode, text, _uiTurnEngineering\) : ""/,
     "non-Agent modes should get a runtime discipline block");
@@ -26757,7 +26767,10 @@ test("栈提示不得承诺自动验证——那套机器是死的", () => {
   assert.doesNotMatch(code, /agent 会自动注入失败报告/);
   // 换成祈使句，并且明说没人替它跑
   assert.match(code, /\*\*改完必须你自己跑这条\*\*，没有任何东西会替你自动跑/);
-  assert.match(code, /退出码就是结论/);
+  // 「退出码就是结论」是半句真理，而 answer_quality.txt:7 写着 exit code 0 is not proof of
+  // business success。改成有判据的说法：非 0 是结论，0 只说明这条检查过了。
+  assert.match(code, /退出码非 0 就是结论/);
+  assert.doesNotMatch(code, /退出码就是结论。/, "又变回「0 也算结论」了");
   assert.match(code, /同样没人会替你跑/);
 });
 
@@ -34234,13 +34247,18 @@ test("update_plan：解析不出来时不许回「计划已更新」", () => {
 test("计划收下之后要明说「去做第一步」", () => {
   // 不说的话模型手上只有一句「计划已更新」，而它刚被要求先规划 ——
   // 最省事的下一步就是再规划一次。
-  const at = RAW_SRC.indexOf("const _goDo = planSteps.length");
+  // 这句只对 agent 模式成立：plan.txt 三处写着 never modify files / never run commands，
+  // 对 plan 模式说「现在去做第一步」等于让一句工具回执推翻模式契约。
+  const at = RAW_SRC.indexOf('const _goDo = run.mode !== "agent"');
   assert.ok(at > 0, "没有「去做第一步」这段");
-  const seg = SRC.slice(at, at + 400);
+  const seg = SRC.slice(at, at + 700);
   assert.match(seg, /现在去做第一步/, "没催它去执行");
   assert.match(seg, /别再调 update_plan/, "没拦住再规划一次");
   // 计划有问题时不该催它去做（那时该先补证据）。
   assert.match(seg, /!completionIssue/, "证据不足时也在催它往下做");
+  // plan 模式要拿到的是**另一句**：交方案，不执行。
+  assert.match(seg, /本模式不执行其中任何一步/,
+    "plan 模式还在被催着去执行——那是模式契约本身被工具回执推翻");
 });
 
 test("撞墙之后必须有出路：八处硬拒绝都要说清「还能用什么」", () => {
