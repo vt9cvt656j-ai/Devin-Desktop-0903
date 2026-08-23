@@ -128,3 +128,35 @@ test("提示词里排除 michael-design：它有自己的路由，不该混进�
     "michael-design 混进业务域选项了——同一份语料会被注两遍");
   assert.ok(DOMAINS.has("michael-design"), "真表里应该有它，只是不进这份选项");
 });
+
+// ── 五、架构模式：这一轮要不要做架构决定 ──────────────────────────────
+test("快通道也判 architectureMode，且判据说清了分界", () => {
+  // 它不点亮任何请求头旗标，但决策框直接读它：填错会让模型在已有项目里另起一套架构、
+  // 或在空目录里去「沿用」一个不存在的架构。而这两件事都发生在第一发。
+  assert.match(fastSrc, /architectureMode=none\|follow_existing\|extend_existing\|design_new\|refactor_existing/,
+    "快通道不判架构模式——那条腿在弱模型上是唯一跑得通的");
+  assert.match(fastSrc, /判据是\*\*这一轮要不要做架构决定\*\*/,
+    "只有枚举值没有判据——这种字段恒等于默认值 none");
+  assert.match(fastSrc, /空目录或第一次建这类东西/, "没说清 design_new 的分界");
+  assert.match(fastSrc, /证据要求整体重构才 refactor_existing/, "没给重构那一档设门槛");
+});
+
+test("解析侧收下它，且只判出它也算「判过了」", () => {
+  assert.match(fastSrc, /"dataStrategy", "architectureMode"\]/, "没进枚举白名单");
+  assert.match(fastSrc, /profile\.architectureMode && profile\.architectureMode !== "none"/,
+    "只给出 architectureMode 时快通道返回 null——判出来了又被当成空画像丢掉");
+  assert.match(fastSrc, /"architectureMode":"none"/, "输出样例没带它，模型不知道该产");
+});
+
+test("六个枚举的形状逐字一致", () => {
+  // 形状漂了会让某一个枚举被静默丢掉——这份键数组是手工维护的。
+  const m = /for \(const k of \[([^\]]+)\]\)/.exec(fastSrc);
+  assert.ok(m, "枚举白名单取不到");
+  const keys = [...m[1].matchAll(/"([a-zA-Z]+)"/g)].map((x) => x[1]);
+  assert.deepEqual(keys.sort(), [
+    "architectureMode", "changeScope", "dataStrategy", "designMode", "orchestrationMode", "workspaceAction",
+  ], "枚举白名单和提示词里声明的那几个漂了");
+  for (const k of keys) {
+    assert.ok(new RegExp(`${k}=`).test(fastSrc), `${k} 在白名单里却没在提示词里声明`);
+  }
+});
