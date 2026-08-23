@@ -507,14 +507,33 @@ pub fn lsp_stop(state: State<LspManager>, lang: String) -> Result<(), String> {
 }
 
 #[tauri::command(async)]
-pub fn lsp_check_available(lang: String) -> bool {
+/// 「这台机器上有没有这门语言的服务器」。
+///
+/// 必须和 `lsp_start` **用同一个作用域**去找。原来这里恒定传 None，而 lsp_start 在
+/// 工作区受信任时会把工作区目录算进 PATH——于是装在项目 `node_modules/.bin` 或
+/// `.venv/bin` 里的语言服务器，启动得起来，这里却一律判「没装」。
+///
+/// 后果是那张安装进度卡**必定超时**：它每 2.5 秒问一次这个函数「装好了没」，
+/// 用户 `npm i -D typescript-language-server` 明明装成功了，卡片还是转满 90 秒然后
+/// 告诉他「安装超时」。缺省仍然 fail closed（不传 = 不信任 = 只看系统装的那份）。
+pub fn lsp_check_available(
+    lang: String,
+    workspace: Option<String>,
+    trust_workspace_binaries: Option<bool>,
+) -> bool {
     let (cmd, _) = match find_server(&lang) {
         Some(pair) => pair,
         None => return false,
     };
+    let ws = workspace.filter(|w| !w.is_empty());
+    let scope = if workspace_trusted(trust_workspace_binaries) {
+        ws.as_deref()
+    } else {
+        None
+    };
     #[cfg(not(windows))]
     {
-        let resolved = process_util::resolve_command(cmd, None);
+        let resolved = process_util::resolve_command(cmd, scope);
         resolved != cmd || std::path::Path::new(cmd).exists()
     }
     #[cfg(windows)]
@@ -522,7 +541,7 @@ pub fn lsp_check_available(lang: String) -> bool {
         if std::path::Path::new(cmd).exists() {
             return true;
         }
-        let path = process_util::augmented_path(None);
+        let path = process_util::augmented_path(scope);
         for dir in path.split(';').filter(|d| !d.is_empty()) {
             for ext in ["", ".exe", ".cmd", ".bat"] {
                 if std::path::Path::new(&format!("{dir}\\{cmd}{ext}")).exists() {
@@ -677,10 +696,17 @@ fn py_cache() -> &'static Mutex<Option<PythonModuleCache>> {
     PY_CACHE.get_or_init(|| Mutex::new(None))
 }
 
-fn run_python_script(script: &str, extra_args: &[&str]) -> Option<String> {
+/// `scope` 是**已经过信任门**的工作区目录（不信任就传 None）。
+///
+/// 原来这里恒定 `pick_python(None)`，跑的是系统 python3；而 pyright 拿到的是
+/// `lsp_detect_python` 用工作区 venv 挑出来的那个解释器。于是同一个编辑器里出现两套
+/// 互相矛盾的「这个包存不存在」：项目 venv 里 pip 装的 requests / pandas，pyright 的
+/// 诊断认得，而模块名补全和 `import requests` 之后的属性补全一片空白——因为
+/// `pkgutil.iter_modules()` 是在系统解释器下跑的。
+fn run_python_script(script: &str, extra_args: &[&str], scope: Option<&str>) -> Option<String> {
     // 走和 pick_python 同一套按平台的名字，别在这里再写死一个 python3。
-    let python = pick_python(None);
-    let aug_path = process_util::augmented_path(None);
+    let python = pick_python(scope);
+    let aug_path = process_util::augmented_path(scope);
     let mut cmd = crate::process_util::command(&python);
     cmd.args(["-c", script])
         .env("PATH", &aug_path)
@@ -697,7 +723,17 @@ fn run_python_script(script: &str, extra_args: &[&str]) -> Option<String> {
 }
 
 #[tauri::command(async)]
-pub fn lsp_python_env_symbols(modules: Vec<String>) -> Result<PythonModuleSymbols, String> {
+pub fn lsp_python_env_symbols(
+    modules: Vec<String>,
+    workspace: Option<String>,
+    trust_workspace_binaries: Option<bool>,
+) -> Result<PythonModuleSymbols, String> {
+    let ws = workspace.filter(|w| !w.is_empty());
+    let scope = if workspace_trusted(trust_workspace_binaries) {
+        ws.as_deref()
+    } else {
+        None
+    };
     let mut guard = py_cache().lock().map_err(|e| e.to_string())?;
     let now = Instant::now();
 
@@ -709,7 +745,7 @@ pub fn lsp_python_env_symbols(modules: Vec<String>) -> Result<PythonModuleSymbol
         guard.as_ref().unwrap().modules.clone()
     } else {
         let script = "import json,pkgutil;print(json.dumps(sorted(set(m.name for m in pkgutil.iter_modules() if not m.name.startswith('_')))))";
-        let mods: Vec<String> = run_python_script(script, &[])
+        let mods: Vec<String> = run_python_script(script, &[], scope)
             .and_then(|s| serde_json::from_str(&s).ok())
             .unwrap_or_default();
         let c = guard.get_or_insert_with(|| PythonModuleCache {
@@ -717,8 +753,13 @@ pub fn lsp_python_env_symbols(modules: Vec<String>) -> Result<PythonModuleSymbol
             fetched_at: now,
             symbol_cache: HashMap::new(),
         });
-        c.modules = mods.clone();
-        c.fetched_at = now;
+        // **失败不落缓存**。脚本跑挂（解释器不在、venv 刚建还没装好）时 mods 是空的，
+        // 原来照样写 fetched_at —— 于是一张空模块表被当成有效缓存钉住 300 秒，
+        // 这五分钟里补全一个模块名都给不出，而且没有任何迹象说明为什么。
+        if !mods.is_empty() {
+            c.modules = mods.clone();
+            c.fetched_at = now;
+        }
         mods
     };
 
@@ -745,7 +786,7 @@ for n in sys.argv[1:]:
  except: pass
 print(json.dumps(r))"#;
         let args: Vec<&str> = need_fetch.iter().map(|s| s.as_str()).collect();
-        if let Some(out) = run_python_script(script, &args) {
+        if let Some(out) = run_python_script(script, &args, scope) {
             if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&out) {
                 if let Some(obj) = parsed.as_object() {
                     let c = guard.get_or_insert_with(|| PythonModuleCache {
