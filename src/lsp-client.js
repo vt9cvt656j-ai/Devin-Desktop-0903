@@ -651,7 +651,13 @@ export function createLspManager(options) {
       lazyModels.delete(uri);
       try {
         const m = monaco.editor.getModel(monaco.Uri.parse(uri));
-        if (m && !m.isAttachedToEditor?.()) m.dispose();
+        if (m && !m.isAttachedToEditor?.()) {
+          // 先告诉服务器这个文档关了。不关的话它侧的句柄永远不释放（跨文件诊断会给
+          // 一堆没打开的文件建惰性 model，几十个之后是实打实的内存），而且下次同名
+          // didOpen 会因为 openDocs 里已经有它而被当成 no-op。
+          try { clients.get(m.getLanguageId())?.didClose(uri); } catch { /* 服务器没了就算了 */ }
+          m.dispose();
+        }
       } catch { /* 已经没了就算了 */ }
     }
   }
@@ -1071,6 +1077,13 @@ export function createLspManager(options) {
         model = monaco.editor.createModel(content ?? "", undefined, parsed);
         lazyModels.add(uri);
         evictLazyModels();
+      } else if (lazyModels.has(uri) && !model.isAttachedToEditor?.() && model.getValue() !== content) {
+        // 刚从磁盘读到的内容不能丢。
+        //
+        // 这份 model 是之前某次跨文件诊断建的惰性副本，之后智能体把文件改了——改动
+        // 没经过编辑器，所以没人更新过它。原来这里直接 `return model`，于是
+        // lsp_definition / lsp_hover / lsp_references 全部按**改前**的内容算行号。
+        try { model.setValue(String(content ?? "")); } catch { /* 建不动就用旧的 */ }
       }
       return model;
     } catch {
@@ -1905,6 +1918,35 @@ export function createLspManager(options) {
       const client = clients.get(String(langId || ""));
       return !!(client && client.initialized === true);
     },
+    /**
+     * 工作区根**被替换**了（打开另一个项目）——把所有在跑的语言服务器停掉。
+     *
+     * rootUri / workspaceFolders 是 initialize 时一次性钉进去的，之后没有任何一处会改它
+     * （全仓没有一处发 workspace/didChangeWorkspaceFolders）。于是：打开 Rust 项目 A，
+     * rust-analyzer 按 A 的 Cargo workspace 起来；不重启应用直接切到项目 B，那个进程
+     * 还在按 A 工作。打开 B/src/main.rs → 它不属于 A 认识的任何 crate → 补全、跳转、
+     * 诊断全部失效，而状态栏仍然显示 `LSP: rust` 一切正常。唯一的恢复手段是重启应用。
+     *
+     * 停掉就行，不用在这里重启：下一次 didOpen 会按新根重新 initialize。
+     * pyright 的 venv 探测结果也一起清掉——它同样只在第一次 ensureServer 时算一次。
+     */
+    async resetForNewWorkspace() {
+      manager._pythonSettings = null;
+      const langs = [...clients.keys()];
+      for (const langId of langs) {
+        try { await this.stop(langId); } catch { /* 停不掉也要继续停别的 */ }
+      }
+      // 惰性 model 属于上一个项目，留着只会让新项目里的同名路径拿到旧内容。
+      for (const uri of [...lazyModels]) {
+        lazyModels.delete(uri);
+        try {
+          const m = monaco.editor.getModel(monaco.Uri.parse(uri));
+          if (m && !m.isAttachedToEditor?.()) m.dispose();
+        } catch { /* 已经没了就算了 */ }
+      }
+      onStatus?.();
+      return langs;
+    },
     async startManual(langId, custom) {
       return ensureServer(langId, custom);
     },
@@ -1932,6 +1974,40 @@ export function createLspManager(options) {
     },
     lastStopReason(langId) {
       return lastStopReason.get(langId) || "";
+    },
+    /**
+     * 这个文件刚在磁盘上被改过（智能体的写工具落盘），把新内容同步给语言服务器。
+     *
+     * 缺这一条的后果是「怎么改都不消失的报错」：pyright 为一个**没开标签页**的
+     * models.py 推过诊断（跨文件诊断会给它建一份惰性 model 并 didOpen），智能体随后
+     * 把那个类型错误修好了——磁盘写成功，但 _applyDiskContentToOpenFile 因为这个文件
+     * 既不在 openFiles 也不在 projectModels（.py 不在预载扩展名里）而直接返回
+     * "closed"，didChange 一次都没发。pyright 手里仍是旧文本，继续推同一条旧错误，
+     * 那条错误进 markers、进每轮注入给模型的「实时诊断」块——模型看到「没修上」，
+     * 再改一遍同一行，循环。同一时刻 lsp_* 查询返回的也全是改前版本的行号。
+     *
+     * 返回是否真的同步了，调用方据此区分「没这个文档」和「同步过了」。
+     */
+    syncFromDisk(path, content) {
+      if (!enabled || !path) return false;
+      let model = null;
+      try { model = monaco.editor.getModel(monaco.Uri.file(path)); } catch { return false; }
+      if (!model) return false;
+      // 用户正开着在编辑的缓冲区不碰——那里可能有还没落盘的输入，覆盖它就是丢用户的字。
+      if (model.isAttachedToEditor?.()) return false;
+      const next = String(content ?? "");
+      if (model.getValue() === next) return false;
+      try { model.setValue(next); } catch { return false; }
+      const langId = model.getLanguageId();
+      const client = clients.get(langId);
+      if (client && client.initialized) {
+        const uri = model.uri.toString();
+        try {
+          if (client.openDocs.has(uri)) client.didChange(uri, model.getVersionId(), next);
+          else client.didOpen(uri, DOC_LANGUAGE_ID[langId] || langId, model.getVersionId(), next);
+        } catch { /* 服务器这会儿没了，下次 didOpen 会补上 */ }
+      }
+      return true;
     },
     logFor(langId) {
       return clients.get(langId)?.logLines.join("\n") || "";

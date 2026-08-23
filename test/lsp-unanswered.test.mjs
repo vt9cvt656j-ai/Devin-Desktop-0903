@@ -298,3 +298,44 @@ test("Windows 也要走 resolve_command——npm 装的语言服务器全是 .cm
     assert.match(src, /let resolved = process_util::resolve_command\(/, `${file}：resolve_command 没了`);
   }
 });
+
+// ── ⑦ 写工具落盘之后，语言服务器必须跟上 ──────────────────────────────────
+test("落盘同步点在放弃之前先问一次语言服务器认不认识这个文件", () => {
+  const i = MAIN.indexOf("function _applyDiskContentToOpenFile(");
+  assert.ok(i > 0, "落盘同步点不见了");
+  const seg = MAIN.slice(i, MAIN.indexOf("if (f.dirty && _openFileWriteConflict(path))", i));
+  const iSync = seg.indexOf("lspManager?.syncFromDisk?.(path, content)");
+  const iGiveUp = seg.indexOf('return { state: "closed" }');
+  assert.ok(iSync > 0,
+    "不在 projectModels 里就直接放弃了 —— 而 projectModels 只预载 TS/JS/JSON，"
+    + ".py/.rs/.go 一个都不在里面。跨文件诊断给它们建过惰性 model 并 didOpen 过，"
+    + "服务器手里会永远停在改前的版本，那条已经修好的错误一直被推回来喂给模型");
+  assert.ok(iSync < iGiveUp, "同步放在放弃之后就永远走不到");
+});
+
+test("惰性 model 被回收前要 didClose，否则服务器侧句柄永不释放", () => {
+  const seg = LSP.slice(LSP.indexOf("function evictLazyModels"), LSP.indexOf("let executeCommandRegistered"));
+  assert.match(seg, /didClose\(uri\)/,
+    "dispose 之前没 didClose —— 服务器侧的文档句柄永远不释放，而且下次同名 didOpen "
+    + "会因为 openDocs 里还有它而被当成 no-op");
+  assert.ok(seg.indexOf("didClose(uri)") < seg.indexOf("m.dispose()"), "didClose 排在 dispose 后面了");
+});
+
+test("惰性 model 已经存在时，刚从磁盘读到的内容不许丢", () => {
+  const seg = LSP.slice(LSP.indexOf("async function lazilyCreateModel"), LSP.indexOf("async function _agentEnsureDoc"));
+  assert.match(seg, /model\.getValue\(\) !== content/,
+    "model 已存在就直接 return 了 —— lsp_definition / lsp_hover / lsp_references 全部按改前的内容算行号");
+  assert.match(seg, /model\.setValue\(String\(content \?\? ""\)\)/, "读到了新内容却没用上");
+});
+
+test("openFolder 换根之前先停掉语言服务器", () => {
+  const i = MAIN.indexOf("async function openFolder(path, owner = null)");
+  assert.ok(i > 0, "openFolder 不见了");
+  const seg = MAIN.slice(i, MAIN.indexOf("await renderWorkspaceRoots();", i));
+  const iReset = seg.indexOf("lspManager?.resetForNewWorkspace?.()");
+  const iSwap = seg.indexOf("workspaceRoots = [path];");
+  assert.ok(iReset > 0,
+    "换项目不换语言服务器 —— 新项目里补全/跳转/诊断全失效，而状态栏仍显示一切正常，"
+    + "唯一的恢复手段是重启应用");
+  assert.ok(iReset < iSwap, "在 workspaceRoots 换掉之后才停 —— 清 markers 之类会按新根算，停不干净");
+});
