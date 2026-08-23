@@ -28590,7 +28590,14 @@ test("「接下来」建议：不砍半句、反引号渲染成代码、序号�
   assert.ok(chip, ".next-steps__chip-t 规则不见了");
   assert.ok(!/white-space:\s*nowrap/.test(chip[1]),
     "又变回单行了——一句话装不下就被砍掉后半句");
-  assert.match(chip[1], /-webkit-line-clamp:\s*2/, "没有给到两行");
+  // **不许封行数。** 两行封顶试过：这些建议是模型摆出来让用户挑的选项，截掉后半句
+  // 等于选项名都看不全（用户原话「内容都到外面了」）。实测用户面板宽度下的真实文案，
+  // 两行 3/4 被截断，不封顶 0/4，而整块只高了 78px。
+  // 上界靠源头 `_detectChoiceOptions` 的 140 字，不靠这里。
+  assert.ok(!/line-clamp/.test(chip[1]),
+    "又给建议封行数了——长选项会被截掉后半句，用户看不全要选什么");
+  assert.ok(!/overflow:\s*hidden/.test(chip[1]), "还在裁剪溢出，长内容仍然会丢");
+  assert.match(chip[1], /overflow-wrap:\s*anywhere/, "长标识符不换行会把卡片撑破");
 
   // 行内代码：建 DOM 节点，**不能**拿模型文本拼 innerHTML。
   const inl = stripJsComments(extractFn("_appendTextWithInlineCode"));
