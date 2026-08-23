@@ -11881,7 +11881,7 @@ test("external source tools stay real but load on demand", () => {
     "lazy loading must derive from the live registry instead of a second static tool table");
 });
 
-test("Agent 开局窗口 23 个：取外部资源那一族、读本机依赖真源码的、自家语料、硬拒点名的、自己造能力的那两个、以及 think，都要在里面", () => {
+test("Agent 开局窗口 24 个：取外部资源那一族、读本机依赖真源码的、自家语料、硬拒点名的、自己造能力的那两个、think，以及唯一的编排入口，都要在里面", () => {
   // 用户 2026-08-18 点名："把初始化编排工具从 11 提升到 16，把那些加进来"（那五个取外部
   // 资源的）。后来又按同一条理由加了 run_in_terminal + read_logs：harness 自己有三处**硬拒**
   // 并点名要 run_in_terminal（timeout 包住的 dev server、前台长命令、需要真 TTY 的交互程序），
@@ -11893,7 +11893,25 @@ test("Agent 开局窗口 23 个：取外部资源那一族、读本机依赖真�
   const core = /agent: \["read_file"[\s\S]*?\],/.exec(SRC);
   assert.ok(core, "agent 核心表被改名或挪走了，这条断言失去落点");
   const names = [...core[0].matchAll(/"([a-z_]+)"/g)].map((m) => m[1]);
-  assert.equal(names.length + 1, 24, `开局窗口是 ${names.length + 1} 个（含 search_tools），不是 24`);
+  assert.equal(names.length + 1, 25, `开局窗口是 ${names.length + 1} 个（含 search_tools），不是 25`);
+  // 2026-08-22 +1：run_subagent——整个编排族里够不着得最彻底的一个。
+  //
+  // 实测（用户机器 939 个真实回合的情景档案）：run_subagent / run_worker /
+  // spawn_multiple_agents 合计被调用 **0 次**。三道门叠在一起，任何一道单独就够：
+  //   一、orchestrationMode 这个枚举在两条裁决链路里都**只有枚举值、没有判据**，
+  //      而同一段提示词里 researchMode 有 250 字判据、domain 有判据。没判据的枚举
+  //      恒等于默认值 solo，整道门结构性哑掉。
+  //   二、四个编排工具全在窗口外，要先花一轮 search_tools——而"自己往下读"永远更便宜。
+  //   三、它的描述以 "Use only in structured-collaboration mode" 开头，而那是个内部
+  //      画像旗标，模型**观察不到**自己在不在这个模式里。无法自查的前置条件＝"别用"。
+  //
+  // 只放这一个：它的 schema 自带 tasks 数组（一次派多个）和 wait，是整族的单一入口；
+  // spawn_multiple_agents / run_worker / await_subagent 由它的描述指路，模型走到那一步
+  // 时已经在编排了，愿意付那一轮 search_tools。
+  // 怎么证伪：情景档案现在记 orch 字段（裁决判的编排模式）。扩窗后如果"判了非 solo"
+  // 的回合里编排调用率仍然是 0，说明瓶颈不在窗口，把它撤回去。
+  assert.ok(names.includes("run_subagent"),
+    "run_subagent 不在开局窗口——编排整族要先花一轮 search_tools 才够得着，939 个真实回合里 0 次调用");
   // 2026-08-22 再 +1：package_source。判据和下面 knowledge_search 那段**逐字同源**，证据更硬：
   // 它零网络零成本（读的是本机 node_modules / site-packages 里装着的那一份源码，拿到的是
   // 本项目真正锁住的那个版本的真实签名），却要先花一轮 search_tools 才够得着。
@@ -28062,6 +28080,65 @@ test("崩溃重开：补进上下文的必须是日志结尾那一段，不是 c
     "喂进去的必须是按 total 取的那一段，不能是第一窗");
   assert.doesNotMatch(src, /adoptJournalTail\?\.\(loaded\.messages/,
     "又把第一窗（按 checkpoint 猜的那一窗）当结尾喂进去了");
+});
+
+// ── 编辑历史消息：图片不许丢，作废轮次的台账也要跟着删 ─────────────────────
+//
+// 两个都是用户实测报的：
+//   1. 编辑一条**带图**的消息重发 → 图没了。编辑框是 textarea、装不下图，原来这里是
+//      `sendPrompt(next)`，附件参数缺省成 []，于是「编辑」顺手把图删了。
+//   2. 编辑发送后，上下文缓存**没有把编辑前那条彻底删掉，而是增量了**。截断只清了三个
+//      瞬时状态，而按轮次累积、每轮整本喂给模型的那几本台账一本都没动。
+test("编辑带图的历史消息重发，图片必须跟着走", () => {
+  const mem = new ConversationMemory();
+  mem.push({ role: "user", content: "看看这张图", attachments: [{ kind: "image", name: "pic.png" }] });
+  mem.push({ role: "assistant", content: "看到了" });
+  mem.push({ role: "user", content: "再看这张", attachments: [{ kind: "image", name: "two.png" }] });
+
+  // 截断返回的第一条就是被编辑的那条，附件挂在它身上——这是修复的前提。
+  const removed = mem.truncateTranscript(2);
+  assert.equal(removed[0]?.content, "再看这张", "removed[0] 必须是被编辑的那一条");
+  assert.deepEqual(removed[0]?.attachments, [{ kind: "image", name: "two.png" }],
+    "被编辑那条的附件必须原样带在 removed[0] 上，否则捞不回来");
+
+  const src = stripJsComments(SRC);
+  // 截断函数必须把它交出去，调用方才拿得到。
+  assert.match(src, /removedByEdit = sess\.memory\.truncateTranscript\(cut\) \|\| \[\]/,
+    "截断没有接住 removed，被编辑那条的附件就此丢失");
+  assert.match(src, /return Array\.isArray\(removedByEdit\) \? removedByEdit\[0\] \|\| null : null;/,
+    "截断函数没有把被编辑的原消息返回给调用方");
+  // 发送处必须真的把附件传进去。只钉「取了值」不够——要钉 sendPrompt 的第二个实参。
+  assert.match(src, /const _keptMedia = Array\.isArray\(_original\?\.attachments\) \? _original\.attachments : \[\];/,
+    "没有从原消息上取回附件");
+  assert.match(src, /sendPrompt\(next, _keptMedia\)/,
+    "附件取回来了却没传给 sendPrompt——编辑仍然等于把图删掉");
+});
+
+test("编辑历史消息后，按轮次累积的台账要跟着作废，不能继续喂给模型", () => {
+  const src = stripJsComments(extractFn("_truncateFromUserMessage"));
+
+  // 需求账本：按内容剔除被删掉的那些用户消息。
+  assert.match(src, /_demandLedger = sess\._demandLedger\.filter/,
+    "需求账本没跟着截断——被作废轮次的要求会继续逐轮喂给模型（用户说的「增量了」）");
+  assert.match(src, /_ledgerNorm\(m\.content\)/,
+    "剔除时必须用入账时同一套归一化，否则一条都对不上");
+  // **不许**整本清空：账本本来就是给「已折叠出对话历史的老要求」用的，
+  // 整清会把编辑点之前仍然有效的要求也抹掉，那是另一个方向的失忆。
+  assert.doesNotMatch(src, /_demandLedger = \[\]/,
+    "把需求账本整本清空了——编辑点之前那些仍然有效的要求会一起消失");
+
+  // 思考结论账本：条目自带 turn，按 cut 精确切（和 milestones / corrections 同一套）。
+  assert.match(src, /_thinkLedger = sess\._thinkLedger\.filter\(\(item\) => Number\(item\?\.turn\) <= cut\)/,
+    "思考结论账本没按轮次切");
+
+  // 内存缓存的失效不许再被 inTauri 门禁罩住：网页版和副窗口同样能编辑历史消息。
+  const mut = stripJsComments(extractFn("_queueTranscriptMutation"));
+  assert.doesNotMatch(mut, /^\s*if \(!inTauri \|\| _isSecondaryWindow \|\| !session\?\.id/m,
+    "整个函数又被 inTauri 罩住了：网页版编辑后 _historyCache 里作废的条目会残留，往回翻页又冒出来");
+  const cacheAt = mut.indexOf("_historyCache.delete");
+  const gateAt = mut.indexOf("if (!inTauri || _isSecondaryWindow) return;");
+  assert.ok(cacheAt !== -1 && gateAt !== -1 && cacheAt < gateAt,
+    "缓存失效必须排在落盘门禁**之前**——它是纯内存的事，不该被没有 SQLite 挡住");
 });
 
 // ── 被打断的那一轮，要看得见「它做了什么」，不只是「它说到哪」 ─────────────

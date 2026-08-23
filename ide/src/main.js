@@ -16129,7 +16129,13 @@ function _conversationSessionMetadata(session) {
 }
 
 function _queueTranscriptMutation(session, mutation) {
-  if (!inTauri || _isSecondaryWindow || !session?.id || !mutation) return;
+  if (!session?.id || !mutation) return;
+  // 内存侧的失效**先做，且不受 inTauri / 副窗口门禁约束**。
+  //
+  // 这道门禁原来罩着整个函数，而它的本意只是「没有 SQLite 就别写日志」。可截断时要做的
+  // 第一件事是把 `_historyCache` 里作废的条目删掉 —— 那是纯内存的事。网页版（inTauri 为
+  // 假，见 web-ide 那条：整体切到模拟后端）和副窗口里，编辑历史消息照样能用，于是编辑点
+  // **之后**的条目留在缓存里，往回翻页时又被读出来：删掉的对话又出现了。
   if (mutation.kind === "truncate") {
     session._historyTotal = Math.max(0, Number(mutation.length) || 0);
     if (session._historyCache instanceof Map) {
@@ -16141,6 +16147,8 @@ function _queueTranscriptMutation(session, mutation) {
     _cacheTranscriptMessage(session, mutation.sequence, mutation.message);
     session._historyTotal = Math.max(Number(session._historyTotal) || 0, mutation.sequence + 1);
   }
+  // 落盘那一半才是真需要门禁的：没有 SQLite（网页版）或在副窗口里，不能调后端。
+  if (!inTauri || _isSecondaryWindow) return;
   const previous = Promise.resolve(session._transcriptJournalPromise).catch(() => {});
   const task = async () => {
     if (mutation.kind === "truncate") {
@@ -19568,8 +19576,16 @@ function _beginEditResend(wrap, forSession) {
     try { if (box.contains($("modeMenu"))) _closeModeMenu(); } catch {}
     document.removeEventListener("pointerdown", onOutside, true);
     try {
-      await _truncateFromUserMessage(sess, wrap);
-      sendPrompt(next);
+      // 附件从被截断的那条原消息上捞回来再发。
+      //
+      // 编辑框里只有文本（textarea 装不下图），所以此前这里是 `sendPrompt(next)` ——
+      // 附件参数缺省成 []，于是**编辑一条带图的消息等于顺手把图删了**：气泡里的图没了，
+      // 模型这一轮也再看不到它。用户报的就是这个。
+      // 用原消息上的 attachments 而不是去 DOM 里捞 <img>：DOM 里的可能是 blob: URL
+      // （进程一重启就失效），而 memory 里那份是持久化过的原始附件。
+      const _original = await _truncateFromUserMessage(sess, wrap);
+      const _keptMedia = Array.isArray(_original?.attachments) ? _original.attachments : [];
+      sendPrompt(next, _keptMedia);
     } catch (error) {
       sendBtn.disabled = false;
       console.warn("[chat] historical edit preparation failed:", error);
@@ -19620,8 +19636,15 @@ async function _truncateFromUserMessage(sess, wrap) {
   if (!Number.isFinite(cut) || cut < 0) {
     throw new Error("conversation sequence is unavailable");
   }
-  if (typeof sess.memory?.truncateTranscript === "function") sess.memory.truncateTranscript(cut);
-  else sess.memory?.recent?.splice(Math.max(0, Math.trunc(cut)));
+  // 接住被删掉的那批：`removed[0]` 就是用户正在编辑的那一条（cut 是它的 sequence），
+  // 它身上挂着这轮原本带的附件。编辑重发只从 textarea 取文本，附件必须从这里捞回来，
+  // 否则「编辑一条带图的消息」＝把图删了——用户报的正是这个。
+  let removedByEdit = [];
+  if (typeof sess.memory?.truncateTranscript === "function") {
+    removedByEdit = sess.memory.truncateTranscript(cut) || [];
+  } else {
+    removedByEdit = sess.memory?.recent?.splice(Math.max(0, Math.trunc(cut))) || [];
+  }
   sess._historyTotal = Math.max(0, Math.trunc(cut));
   await _restorePromptTailAfterTruncate(sess, sess._historyTotal);
   // 这条之后的对话已经作废，对应的已解析目标和上轮结果也必须作废；下一次发送会从
@@ -19629,6 +19652,34 @@ async function _truncateFromUserMessage(sess, wrap) {
   // 语义标志是"这个会话到目前为止需要过什么能力"的累积，被删掉的那部分对话不再算数；
   // 而且截断本来就已经让缓存失效，这里重建前缀是免费的。
   try { sess._intentState = null; sess._lastRunState = null; sess._semanticProfileFlags = null; } catch {}
+  // ── 按轮次累积、且每轮都喂给模型的那几本台账，也要跟着截断 ──────────────────
+  //
+  // 上面清掉的三个是「上一轮的瞬时状态」。真正让用户看见问题的是下面这几本：它们**按轮次
+  // 累积**、每轮开工整本注入，而截断此前一个都没动。于是编辑一条历史消息之后，被作废那些
+  // 轮次的内容仍然逐轮喂给模型 —— 用户原话「不是把编辑前那条消息彻底删除，而是增量了」。
+  //
+  // 三本的可切性不同，分别处理，不能一刀切成「全清」：
+  try {
+    // 1) 需求账本：入的是归一化后的用户原文，一条用户消息一条。被删掉的那些用户消息
+    //    逐条从账本里剔除。**按内容剔除而不是整本清空** —— 账本本来就是给「被折叠出
+    //    对话历史的老要求」用的，整本清掉会把编辑点**之前**那些仍然有效的要求也抹掉，
+    //    那是另一个方向的失忆。
+    const _dropped = (Array.isArray(removedByEdit) ? removedByEdit : [])
+      .filter((m) => m?.role === "user" && typeof m.content === "string")
+      .map((m) => _ledgerNorm(m.content).slice(0, 240));
+    if (_dropped.length && Array.isArray(sess._demandLedger)) {
+      const _drop = new Set(_dropped);
+      sess._demandLedger = sess._demandLedger.filter((entry) => !_drop.has(String(entry)));
+    }
+    // 2) 思考结论账本：条目自带 turn，和 milestones / corrections 用同一套判据切。
+    if (Array.isArray(sess._thinkLedger)) {
+      sess._thinkLedger = sess._thinkLedger.filter((item) => Number(item?.turn) <= cut);
+    }
+    // 3) 问答账本：条目只有 {q, answer, at}，**没有轮次号**，切不准。而它记的是
+    //    「已经问过用户什么、用户答了什么」——编辑重发之后那些问答多半仍然成立，
+    //    错删的代价是重复追问同一件事。所以这一本刻意保留，并在这里写明理由，
+    //    免得下一个人看到「就它没处理」以为是漏了。
+  } catch {}
   // 界面：这条气泡和它之后的全部移除
   try {
     const doomed = [];
@@ -19639,6 +19690,8 @@ async function _truncateFromUserMessage(sess, wrap) {
   sess._historyAtLatest = true;
   _updateHistoryControls(sess);
   try { saveChatHistory({ immediate: true }); } catch {}
+  // 交给调用方：被编辑那条的原始消息（含 attachments）。
+  return Array.isArray(removedByEdit) ? removedByEdit[0] || null : null;
 }
 // 事件委托：整个文档监听一次 dblclick，命中任何用户气泡都能进入编辑——不依赖
 // 每个气泡单独绑定（任何渲染路径/任何时期创建的气泡都生效）。
@@ -22579,7 +22632,7 @@ async function _aiIntentProfile(text, config, session = null, context = null) {
 ;constraints=不能违反的要求；successCriteria=用户会据此判断完成的可观察结果；continuation=new/continue/correct/replace/clarify；confidence=0 到 1；ambiguities=仍会实质改变结果且无法从上下文消除的歧义；restatedTask=把用户这句话（哪怕很短/有错别字/口语/指代）用第一人称、完整、可直接执行地重述一遍——补全从上下文能确定的对象和范围、纠正明显笔误、展开"做个网站"这类省略，但绝不臆造用户没有的意图或约束；能从上下文确定就写清，不能确定的写进 ambiguities 而不是在这里编。这是给执行阶段的"读懂了你要什么"的确认，不替代用户原话。
 规则：短句不能孤立理解。“继续/这个/还是不行/不对/按刚才的”必须结合 priorTask、recentTurns、lastRun、unfinishedPlan 和附件解析指代；correct 表示纠正旧理解，replace 表示换目标，continue 表示沿用已确认目标。最新用户消息优先，旧要求冲突时只保留最新约束。不要把助手上一轮的建议误当成用户授权。
 当前消息的动作边界必须独立成立：普通问候、身份问答和一般知识问答用 action=answer、workspaceAction=none、deliverySurface=answer，打开了工作区也不等于要求检查项目；**用户要方案/思路/设计/架构建议/"怎么做"/"评估一下"时是 action=plan、workspaceAction=inspect、runtimeActions=[]、externalActions=[]**——交付物是方案本身，只读取形成方案所需的最小事实，不得派生写文件、装依赖、起服务、打包或部署；同一句话里既要方案又明确说了"然后做/做完给我"才算 workspaceAction=modify；“你觉得这个项目怎么样/评价一下当前项目”是 action=inspect、locationIntent=query、workspaceAction=inspect、deliverySurface=answer，只读取形成评价所需的最小项目事实，runtimeActions/externalActions=[]，不得派生写文件、安装依赖、启动服务、打包、部署或设计知识检索；明确要求视觉/UI 设计评审时才用 action=review + workspaceAction=inspect + 对应 designMode；实际新建或修改 UI 时用 create/modify + workspaceAction=modify。只有 continuation 明确为 continue/correct/clarify 时才能沿用 priorTask；新问题和判定未决都不能继承上一轮的修改、运行或外部动作。
-工程字段（全部必填）：projectState=none/existing/greenfield/unknown；deliverySurface=answer/code/ui_component/website/web_app/backend/data/cli/desktop/automation/mixed；changeScope=none/local/module/project/system；architectureMode=none/follow_existing/extend_existing/design_new/refactor_existing；dataStrategy=not_applicable/none/local/server/inspect_existing/undecided；researchMode=none/official/community/official_and_community —— 这个字段决定动手前要不要先取证，别因为省事就填 none：要**引入或升级**第三方库/框架/SDK/云服务、要为新项目选技术栈、要写你没在本仓库里读到过的第三方 API 或协议、或结论依赖版本/兼容/弃用事实时，至少 official（注册表与官方文档、仓库 releases/issues 才是事实来源；凭记忆写版本号和 API 一定出错）；还需要判「别人踩过哪些坑、这个库还有没有人维护、当前主流做法是什么、有没有现成实现可以直接用」时，填 official_and_community。只有当这件事完全落在本仓库既有代码和**已装依赖**里闭合、不新增也不升级任何外部依赖时才填 none；designMode=none/michael_design_2_5_existing/michael_design_2_5_greenfield；domain=这件事属于哪个专业领域，只能从 healthcare/finance/legal/security/penetration-testing/reverse-engineering/database/devops/gaming/data-ml/blockchain/iot-embedded/mobile/saas/ecommerce/education/marketing/backend-api/web-frontend/ui-ux/systems-programming/michael-design 里选**一个**，判不出就填空字符串 ""。它决定 IDE 会不会在你开始规划前把该领域语料库里的硬性约束、常见坑和必须做的检查预先取来给你——填对了你开局就有该领域的真实事实，填错或漏填就只能凭印象做。按**业务领域**判，不按用的技术判：给医院做的排班系统是 healthcare 不是 web-frontend，交易所撮合是 finance，逆向一个二进制是 reverse-engineering，写驱动/内核/分配器是 systems-programming；workspaceAction=none/inspect/modify；captureMode=none/isolated_browser/system/background；browserGoal=none/static/interactive/network_capture；orchestrationMode=solo/staged_roles/parallel_roles；roleNeeds 只能从 architect/product/research/frontend/backend/database/security/test/devops/design/docs${_userRoleEnumSuffix()} 选择且只列真正需要的角色；coordinationRisks 记录跨角色契约、共享文件、顺序依赖或集成风险；runtimeActions 和 externalActions 只列实际需要的动作；researchTopics 列需要核验的具体技术主题；rationale 用短句记录决定依据。
+工程字段（全部必填）：projectState=none/existing/greenfield/unknown；deliverySurface=answer/code/ui_component/website/web_app/backend/data/cli/desktop/automation/mixed；changeScope=none/local/module/project/system；architectureMode=none/follow_existing/extend_existing/design_new/refactor_existing；dataStrategy=not_applicable/none/local/server/inspect_existing/undecided；researchMode=none/official/community/official_and_community —— 这个字段决定动手前要不要先取证，别因为省事就填 none：要**引入或升级**第三方库/框架/SDK/云服务、要为新项目选技术栈、要写你没在本仓库里读到过的第三方 API 或协议、或结论依赖版本/兼容/弃用事实时，至少 official（注册表与官方文档、仓库 releases/issues 才是事实来源；凭记忆写版本号和 API 一定出错）；还需要判「别人踩过哪些坑、这个库还有没有人维护、当前主流做法是什么、有没有现成实现可以直接用」时，填 official_and_community。只有当这件事完全落在本仓库既有代码和**已装依赖**里闭合、不新增也不升级任何外部依赖时才填 none；designMode=none/michael_design_2_5_existing/michael_design_2_5_greenfield；domain=这件事属于哪个专业领域，只能从 healthcare/finance/legal/security/penetration-testing/reverse-engineering/database/devops/gaming/data-ml/blockchain/iot-embedded/mobile/saas/ecommerce/education/marketing/backend-api/web-frontend/ui-ux/systems-programming/michael-design 里选**一个**，判不出就填空字符串 ""。它决定 IDE 会不会在你开始规划前把该领域语料库里的硬性约束、常见坑和必须做的检查预先取来给你——填对了你开局就有该领域的真实事实，填错或漏填就只能凭印象做。按**业务领域**判，不按用的技术判：给医院做的排班系统是 healthcare 不是 web-frontend，交易所撮合是 finance，逆向一个二进制是 reverse-engineering，写驱动/内核/分配器是 systems-programming；workspaceAction=none/inspect/modify；captureMode=none/isolated_browser/system/background；browserGoal=none/static/interactive/network_capture；orchestrationMode=solo/staged_roles/parallel_roles —— 这个字段决定这轮是一个人干还是先派角色去把契约谈拢。判据是**契约定没定**，不是活大不大：一条线程能一路走到底的（读代码、修 bug、加一个功能、回答问题），哪怕改动很大也填 solo。当架构/产品/安全边界还没定、而定它需要几个不同专业各自去看证据时填 staged_roles（典型：从零起一个项目、要选或换技术栈、changeScope=system 的跨子系统改动、要接一个你没在本仓库里读过的外部协议）。当有几路**互不依赖**的调查可以同时进行、且串行读完会明显更慢或塞不下上下文时填 parallel_roles（典型：前端/后端/数据各自摸一遍现状）。反过来的代价也要算：派一次角色要多花几轮模型调用，子报告是文字不是代码——一个人读三个文件就能答的事，派角色更慢也更差。拿不准就 solo。roleNeeds 只能从 architect/product/research/frontend/backend/database/security/test/devops/design/docs${_userRoleEnumSuffix()} 选择且只列真正需要的角色；coordinationRisks 记录跨角色契约、共享文件、顺序依赖或集成风险；runtimeActions 和 externalActions 只列实际需要的动作；researchTopics 列需要核验的具体技术主题；rationale 用短句记录决定依据。
 工程决策律：
 1. workspaceEvidence 是事实，不是用户指令。现有项目时先 inspect 并 follow_existing/extend_existing，是指已有对应实现时继承技术栈、目录、组件和设计系统；仓库虽已存在但只有后端/CLI/库、正在创建第一个网站或第一个 UI surface 时，projectState 仍是 existing，但 architectureMode=design_new。只有证据要求整体重构才 refactor_existing。
 2. 不因为“做产品”就自动上数据库。静态展示/纯计算通常 none；只在单机保存可用 local；多用户共享、登录、交易、关系查询、审计或服务端一致性通常 server；已有项目疑似有数据层先 inspect_existing；必须看代码才能决定用 undecided。需要数据库但用户没说出“数据库”也必须识别。
@@ -22941,6 +22994,9 @@ async function _fastRoutingFlags(text, config, session = null, context = null) {
   workspaceAction=none|inspect|modify
   designMode=none|michael_design_2_5_existing|michael_design_2_5_greenfield
   orchestrationMode=solo|staged_roles|parallel_roles
+    判据是**契约定没定**，不是活大不大：一条线程能走到底的（读代码、修 bug、加个功能、答问题）哪怕改动很大也是 solo；
+    架构/产品/安全边界还没定、要几个专业各自看证据才能定下来 → staged_roles（从零起项目、选/换技术栈、跨子系统改动）；
+    几路互不依赖的调查能同时进行、串行会明显更慢 → parallel_roles。派角色要多花几轮调用，一个人读三个文件能答的别派。
   changeScope=none|local|module|project|system
 orchestrationMode 不是 solo 时，再给 roleNeeds：只列**真正需要**的角色，从
 architect/product/research/frontend/backend/database/security/test/devops/design/docs 里选，2-5 个；
@@ -34556,7 +34612,7 @@ function _buildAgentToolSchemas(includeWrite, mcpTools = []) {
     { type: "function", function: { name: "think", description: "Record a short internal reasoning conclusion within this round, to clarify the goal, the assumptions and the next step before acting. Write only conclusions directly relevant to the current user request, and do not treat it as a reply addressed to the user.", parameters: { type: "object", properties: { thought: { type: "string", minLength: 1, description: "A short reasoning conclusion for the current decision" } }, required: ["thought"] } } },
     { type: "function", function: { name: "schedule", description: "Create, list or remove a **scheduled task** — something you run again later, on your own, with nobody at the keyboard. Use it whenever the user says 「every morning at 9」, 「check again in 20 minutes」, 「every day」, 「remind me to」. Give either at (daily HH:MM, their local time) or every_minutes, not both. The prompt you store is what a future run receives, so write it as a **standing instruction that stands alone**: that run has none of this conversation, so name the project path, the exact check, and what counts as done. **Two boundaries you must tell the user:** it fires only while this app is running (nothing is installed into their system, so a task waits until they reopen it), and a step that needs their confirmation is refused rather than silently allowed — so schedule work that can finish unattended.", parameters: { type: "object", properties: { action: { type: "string", enum: ["add", "list", "remove"], description: "add = create one; list = show all; remove = delete by id" }, prompt: { type: "string", description: "For add: the standing instruction a future run will receive. Must stand alone — no reference to this conversation." }, at: { type: "string", description: "For add: a daily time as HH:MM in the user's local timezone, e.g. 09:00" }, every_minutes: { type: "integer", description: "For add: repeat every N minutes instead of a daily time" }, id: { type: "integer", description: "For remove: which task" } }, required: ["action"] } } },
     { type: "function", function: { name: "ask_user", description: "**When you genuinely cannot tell what the user wants, ask them with this — do not guess and barrel ahead.** It shows a card in the conversation: the few **predicted options (buttons)** you supply, plus a **free-text box** (the user types their own requirement) and \"let the AI decide\". The user clicks one, types their own, or hands it back to you; you continue once you have their answer.\n**Use it only when the intent is genuinely ambiguous and the different readings would produce very different things** — e.g. the user asks to migrate the database and both an in-place migration and a rebuild are defensible; the user has two accounts/environments and you cannot tell which to target; two instructions in the same message contradict each other. A build request whose stack is unspecified is NOT ambiguous: \"build me a Telegram bot\" / \"build a login page\" → pick the mainstream library and a sensible default, build it, and state the choices in your summary. This tool is for decisions you genuinely cannot make on the user's behalf, not for \"which framework\".\n**Never ask about anything you can reasonably infer, or about mere implementation detail (which variable name, which file) — just do it.** Users hate being stopped for nothing. This tool is for \"what should I build\", not \"may I continue\".\n**Ordering rule: when the ambiguity is about direction, ask_user always comes before update_plan** — settle the direction, then plan. The system will never block your ask_user for \"there is no plan yet\".", parameters: { type: "object", properties: { question: { type: "string", description: "The specific clarifying question to put to the user (one sentence)" }, options: { type: "array", description: "2-4 answers you predict (each a few words), rendered as buttons for the user to pick; they can also skip them and type their own", items: { type: "string" } }, recommended: { type: "integer", description: "Index of the recommended option (0-based); that option is highlighted as recommended" }, multi_select: { type: "boolean", description: "true = multi-select mode (checkboxes; the user can pick several options and submit them together)" }, confirm_text: { type: "string", description: "Confirmation for a dangerous operation: once set, the user must type this text exactly into the box to continue (e.g. DELETE)" } }, required: ["question"] } } },
-    { type: "function", function: { name: "run_subagent", description: "Use only in structured-collaboration mode, for heavyweight research that needs broad coverage or an independent perspective. staged_roles first dispatches read-only roles such as architect/product/research/security to converge the architecture, product, evidence, and security contracts; an ordinary focused investigation is faster and cheaper if the main agent just reads it. A sub-report must give its evidence, the boundaries of its conclusion, the delivery contract, and the next step. 【vs alternatives】For parallel implementation that changes files use run_worker; to dispatch several read-only roles at once use spawn_multiple_agents; for a single focused investigation the main agent reading/searching directly is faster — do not dispatch.", parameters: { type: "object", properties: { description: { type: "string", description: "Short description of the subtask (3-6 words)" }, role: { type: "string", enum: ["architect", "product", "research", "frontend", "backend", "database", "security", "test", "devops", "design", "docs"], description: "A read-only specialist perspective. When the architecture, product, or security boundary is undecided, use architect/product/security first to converge the contract; other roles investigate their domain." }, prompt: { type: "string", description: "The complete, self-contained read-only task statement: the evidence to check, the contract to deliver, the paths/symbols involved, and the next step." }, tasks: { type: "array", minItems: 1, maxItems: 4, description: "Optional · dispatch several at once: send multiple read-only subtasks in one call (up to 4, each with its own card, merged into one report on completion. They run concurrently only at the top level, and only while the session-wide sub-agent slots are free (4 shared across the whole session); a sub-agent that dispatches its own tasks runs them one after another, so budget its timeout accordingly). Each entry is {role, task}; when dispatching only one subtask, omit this and use prompt.", items: { anyOf: [{ type: "string" }, { type: "object", properties: { task: { type: "string" }, role: { type: "string", enum: ["architect", "product", "research", "frontend", "backend", "database", "security", "test", "devops", "design", "docs"] } }, required: ["task"] }] } }, wait: { type: "boolean", description: "Optional, default false = background job: returns job#N immediately, the main agent keeps working, and the result is delivered when ready (or await it with await_subagent). true = wait synchronously for the result before continuing." } }, required: ["description"], anyOf: [{ required: ["prompt"] }, { required: ["tasks"] }] } } },
+    { type: "function", function: { name: "run_subagent", description: "**Dispatch a read-only specialist to investigate in its own context and report back** — broad coverage or an independent perspective, without spending your own context on it. 【When to use】When the architecture, product, or security contract is still undecided: in staged_roles you first dispatch read-only roles such as architect/product/research/security to converge the architecture, product, evidence, and security contracts before anything is written (greenfield project, choosing or switching a stack, a change spanning subsystems). Also when several independent investigations can run at once and reading them serially would be much slower. 【When NOT to use】One focused question, or anything you could answer by reading a few files yourself: dispatching costs extra model round-trips and a sub-report is prose, not code — reading it yourself is both faster and better. A sub-report must give its evidence, the boundaries of its conclusion, the delivery contract, and the next step. 【vs alternatives】For parallel implementation that changes files use run_worker; to dispatch several read-only roles at once use spawn_multiple_agents; for a single focused investigation the main agent reading/searching directly is faster — do not dispatch.", parameters: { type: "object", properties: { description: { type: "string", description: "Short description of the subtask (3-6 words)" }, role: { type: "string", enum: ["architect", "product", "research", "frontend", "backend", "database", "security", "test", "devops", "design", "docs"], description: "A read-only specialist perspective. When the architecture, product, or security boundary is undecided, use architect/product/security first to converge the contract; other roles investigate their domain." }, prompt: { type: "string", description: "The complete, self-contained read-only task statement: the evidence to check, the contract to deliver, the paths/symbols involved, and the next step." }, tasks: { type: "array", minItems: 1, maxItems: 4, description: "Optional · dispatch several at once: send multiple read-only subtasks in one call (up to 4, each with its own card, merged into one report on completion. They run concurrently only at the top level, and only while the session-wide sub-agent slots are free (4 shared across the whole session); a sub-agent that dispatches its own tasks runs them one after another, so budget its timeout accordingly). Each entry is {role, task}; when dispatching only one subtask, omit this and use prompt.", items: { anyOf: [{ type: "string" }, { type: "object", properties: { task: { type: "string" }, role: { type: "string", enum: ["architect", "product", "research", "frontend", "backend", "database", "security", "test", "devops", "design", "docs"] } }, required: ["task"] }] } }, wait: { type: "boolean", description: "Optional, default false = background job: returns job#N immediately, the main agent keeps working, and the result is delivered when ready (or await it with await_subagent). true = wait synchronously for the result before continuing." } }, required: ["description"], anyOf: [{ required: ["prompt"] }, { required: ["tasks"] }] } } },
     { type: "function", function: { name: "await_subagent", description: "Wait for a background subagent job to finish and collect its result. Use it when you cannot continue without the sub-report; with no jobs running it returns a summary of the current job ledger. 【vs alternatives】To dispatch an investigation use run_subagent / spawn_multiple_agents.", parameters: { type: "object", properties: { job: { type: "string", description: "The job number (e.g. 3) or all, default all" } }, required: [] } } },
     { type: "function", function: { name: "spawn_multiple_agents", description: "**Dispatch several role-based subagents concurrently in one call** (asynchronous and in the background, while the main flow continues). Suited to a large task needing several perspectives at once: research-type roles (research/security/architect and so on) gather evidence independently and their results are delivered when ready, or you can join them with await_subagent. With shared_store collaboration enabled, each subagent's findings are broadcast to the others automatically, avoiding duplicated research. ⚠️ Do not use it for a single focused investigation — the main agent reading directly is faster; for parallel implementation that writes files use run_worker.", parameters: { type: "object", properties: { task: { type: "string", description: "The overall task description (shared background for every agent)" }, agents: { type: "array", minItems: 1, maxItems: 5, items: { type: "object", properties: { role: { type: "string", enum: ["architect", "product", "research", "frontend", "backend", "database", "security", "test", "devops", "design", "docs"], description: "A read-only specialist perspective" }, focus: { type: "string", description: "This agent's focused subtask (self-contained — it cannot see the conversation history)" } }, required: ["role", "focus"] }, description: "2-5 parallel subagent definitions" }, collaboration: { type: "string", enum: ["shared_store", "independent"], description: "Default shared_store = findings are broadcast between agents; independent = fully isolated" } }, required: ["task", "agents"] } } },
     { type: "function", function: { name: "research_project", description: "Dispatch a read-only subagent to map the stack, core responsibilities, data flow and change entry points — only when the user explicitly asks for a full codebase onboarding map, or the task genuinely spans several unknown modules and the existing project tree and symbol map cannot pin down the entry point. Do not call it when the target file or module is already clear — read_file the relevant source and its callers directly — and do not treat it as a fixed preamble to every task. Optionally use focus to concentrate on one area (such as the authentication flow, the data layer, or build and release).", parameters: { type: "object", properties: { focus: { type: "string", description: "Optional; the direction to dig into (e.g. \"the authentication flow\", \"the data layer\", \"build and deployment\"); omit = a whole-project overview" }, wait: { type: "boolean", description: "Optional, default false = a background job returning job#N immediately; true = wait synchronously for the result." } }, required: [] } } },
@@ -35082,6 +35138,26 @@ agent: ["read_file", "list_dir", "search", "find_files", "update_plan", "ask_use
             // 对照 web_search→web_fetch：那一对本来就是配齐的，这一对漏了后手。
             "web_search", "web_fetch", "github_search", "github_repo",
             "developer_community_search", "package_search",
+            // run_subagent 是这一族里够不着得最彻底的一个：四个编排工具全在窗口外。
+            //
+            // 实测（用户机器 939 个真实回合的情景档案，2026-08-22）：run_subagent /
+            // run_worker / spawn_multiple_agents 合计被调用 **0 次**。不是模型不想派角色，
+            // 是这一族叠了三道结构性的门，任何一道单独就足以让它永远轮不到：
+            //   一、orchestrationMode 这个枚举**没有判据**——完整裁决里 researchMode 有
+            //      250 字的判据、domain 有判据，它只有一行枚举值加一句"不确定就填 solo"。
+            //      没判据的枚举恒等于默认值，整道门结构性哑掉。（已补，见裁决提示词。）
+            //   二、工具不在开局窗口，要先花一轮 search_tools 取 schema——就是本文件里
+            //      重复过五次的同一条机制：两条路结果差不多时模型走便宜的那条。而"自己
+            //      往下读"永远是更便宜的那条。
+            //   三、它的描述以 "Use only in structured-collaboration mode" 开头，而
+            //      "structured-collaboration mode" 是内部画像旗标，模型**观察不到**自己
+            //      在不在这个模式里。一句无法自查的前置条件，读起来就是"别用"。（已改。）
+            //
+            // 只放 run_subagent 一个：它的 schema 自带 tasks 数组（一次派多个）和 wait，
+            // 是整族的单一入口；spawn_multiple_agents / run_worker / await_subagent 由它
+            // 的描述指路，模型真走到那一步时已经在编排了，愿意付那一轮 search_tools。
+            // 装进窗口 ≠ 每轮都要用——判断权仍在模型和裁决手里，这里只保证够得着。
+            "run_subagent",
             // package_source 与上面这一族同源，判据逐字相同，而证据更硬：它**零网络零成本**——
             // 读的是本机 node_modules / site-packages 里真正装着的那一份源码，拿到的是这个项目
             // 实际锁住的那个版本的真实导出与签名。可它此前不在窗口里，于是「写第三方调用之前
@@ -50184,6 +50260,11 @@ async function _recordEpisode(run, task, root, outcome, config, session = null) 
       // 于是「哪个工具老是失败」在数据上无从回答。这一条把它补上：
       // 同一条墙只记一次（同一个工具连撞五次不该占五个位置），最多 6 条。
       walls: [...new Set(steps.filter((s) => s && s.ok === false && s.fail).map((s) => s.fail))].slice(0, 6),
+      // 裁决这轮判的编排模式。没有它，"编排到底通没通"只能从 approach 的动词里反推——
+      // 而那恰好分不清两种截然不同的情况：裁决压根没判成要编排，和判了却没派出去。
+      // 前者要改判据，后者要改可达性；2026-08-22 实测两者同时存在（939 回合 0 次调用）。
+      ...(run.engineering?.orchestrationMode && run.engineering.orchestrationMode !== "solo"
+        ? { orch: String(run.engineering.orchestrationMode) } : {}),
     };
     const eps = _epLoad(root);
     _markReworkIfAny(eps, ep); // 上一条 ✓ 如果被这一轮返工了，就地挂一条并列事实
