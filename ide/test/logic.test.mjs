@@ -33208,9 +33208,12 @@ test("LSP 没答上来 ≠ 这个文件里没有符号", () => {
   const LSP = readFileSync(join(HERE, "..", "src", "lsp-client.js"), "utf8");
   const seg = /async agentDocumentSymbols\(path\) \{[\s\S]*?\n    \},/.exec(LSP);
   assert.ok(seg, "agentDocumentSymbols 不见了");
+  // 夹具跟着实现走：agentDocumentSymbols 现在问的是 requestDetailed（它把"没答上来"
+  // 的**理由**一起带回来），reply 抛异常就等于传输层断了。
   const mk = (reply) => new Function("_agentEnsureDoc", "LSP_SYMBOL_KIND_NAMES",
     `return ({ ${seg[0].replace(/,$/, "")} });`)(
-    async () => ({ uri: "file:///x", client: { supports: () => true, request: reply } }), {});
+    async () => ({ uri: "file:///x", client: { supports: () => true,
+      requestDetailed: async (...a) => ({ ok: true, result: await reply(...a), reason: "", detail: "" }) } }), {});
   const kindOf = async (reply) => {
     const r = await mk(reply).agentDocumentSymbols("/x.rs");
     return Array.isArray(r) ? (r.length ? "symbols" : "empty") : (r && r.unanswered ? "unanswered" : "none");
@@ -34171,10 +34174,17 @@ test("lsp_hover 要有 TS worker 兜底，拿不到时把话说死", () => {
     assert.match(SRC, new RegExp(`await ${fn}\\(`), `${fn} 写了却没人调 —— ${op} 还是会必然失败`);
   }
   // hover 的兜底要接在语言服务之后。
-  const at = RAW_SRC.indexOf("if (call.op === \"hover\") {");
-  const seg = SRC.slice(at, at + 1400);
-  assert.match(seg, /agentHover[\s\S]{0,400}_tsWorkerHover/,
-    "TS worker 兜底没接在 hover 分支里，或顺序反了");
+  // 按锚点取整个 hover 分支，不要固定长度：分支一变长，1400 这个窗口就悄悄不再守尾部，
+  // 而测试照旧是绿的（仓库里已经栽过一次）。hover 分支后面紧跟的就是 locate 那段。
+  const at = SRC.indexOf("if (call.op === \"hover\") {");
+  const end = SRC.indexOf("let locs = null;", at);
+  assert.ok(at > 0 && end > at, "hover 分支的锚点不见了");
+  const seg = SRC.slice(at, end);
+  // 同理，别钉「相隔不超过 400 字」——中间合法地多几行就假红。要守的是**顺序**。
+  const _iHover = seg.indexOf("agentHover");
+  const _iWorker = seg.indexOf("_tsWorkerHover");
+  assert.ok(_iHover >= 0, "hover 分支里没调 agentHover");
+  assert.ok(_iWorker > _iHover, "TS worker 兜底没接在 hover 分支里，或顺序反了");
 
   // ② 拿不到时不许用「可能 / 此刻」这种诱导重试的说法。
   assert.doesNotMatch(seg, /这个语言可能没有可用的语言服务/,

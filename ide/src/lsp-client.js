@@ -220,7 +220,10 @@ class LspClient {
       if (pending) {
         this.pending.delete(msg.id);
         clearTimeout(pending.timer);
-        if (msg.error) pending.resolve(null);
+        // 服务器回 error 走 reject 那条：不这么分，"服务器明确拒绝"就和"服务器说没有"
+        // 挤成同一个 null，调用方再也分不开（reject 只到 requestDetailed 为止，
+        // request() 照旧 resolve(null)，对外契约没变）。
+        if (msg.error) { if (pending.reject) pending.reject(msg.error); else pending.resolve(null); }
         else pending.resolve(msg.result);
       }
       return;
@@ -292,25 +295,48 @@ class LspClient {
     return this.manager.backend.lspSend(this.serverLang, payload).catch(() => {});
   }
 
-  request(method, params, opts) {
+  /*
+   * 一次请求的**完整**结果：{ ok, result, reason, detail }。
+   *
+   * request() 只回 result，于是 null 有四种来源——超时、发送失败、服务器回 error、
+   * 以及服务器真的答了 null（"这里没有定义"是一个合法结论）。调用方分不出"没有"和
+   * "没查成"，就会把后者说成前者。已经出过事的那条：agent 问"谁调用了这个函数"，
+   * 语言服务超时 → 回 [] → 模型读成"没人调用"→ 删掉。
+   *
+   * 所以判别放在这一层，只有一份实现；request() 就是它丢掉 reason 的那个薄封装
+   * （**不改 request 的行为**：全仓 36 处 await 依赖它 resolve(null)，改成 reject
+   * 会复现"initialize 超时 → capabilities={} 却 initialized=true"那个老 bug）。
+   */
+  requestDetailed(method, params, opts) {
     const id = this.nextId++;
     const timeoutMs = (opts && opts.timeoutMs) || REQUEST_TIMEOUT_MS;
     const payload = JSON.stringify({ jsonrpc: "2.0", id, method, params });
     return new Promise((resolve) => {
+      const settle = (v) => { this.pending.delete(id); resolve(v); };
       const timer = setTimeout(() => {
-        this.pending.delete(id);
-        resolve(null);
+        settle({ ok: false, result: null, reason: "timeout", detail: `${method} 等了 ${Math.round(timeoutMs / 1000)}s 没有回应` });
       }, timeoutMs);
-      this.pending.set(id, { resolve, timer });
-      this.manager.backend.lspSend(this.serverLang, payload).catch(() => {
-        const p = this.pending.get(id);
-        if (p) {
-          this.pending.delete(id);
-          clearTimeout(p.timer);
-          resolve(null);
-        }
+      this.pending.set(id, {
+        resolve: (result) => { clearTimeout(timer); settle({ ok: true, result, reason: "", detail: "" }); },
+        reject: (err) => {
+          clearTimeout(timer);
+          const text = err && (err.message || err.code !== undefined)
+            ? `${err.message || "server error"}${err.code !== undefined ? ` (code ${err.code})` : ""}`
+            : "server error";
+          settle({ ok: false, result: null, reason: "error", detail: `${method} 被服务器拒绝：${text}` });
+        },
+        timer,
+      });
+      this.manager.backend.lspSend(this.serverLang, payload).catch((e) => {
+        if (!this.pending.has(id)) return;
+        clearTimeout(timer);
+        settle({ ok: false, result: null, reason: "transport", detail: `${method} 没能送到语言服务器：${String(e && e.message ? e.message : e).slice(0, 120)}` });
       });
     });
+  }
+
+  request(method, params, opts) {
+    return this.requestDetailed(method, params, opts).then((r) => (r.ok ? r.result : null));
   }
 
   async _initialize() {
@@ -453,9 +479,12 @@ class LspClient {
 
   shutdown() {
     this.disposed = true;
-    for (const { timer, resolve } of this.pending.values()) {
+    // 服务器没了，这些请求就是**没答上来**，不是"答了没有"。走 reject 那条路，
+    // 调用方才不会把一次进程退出说成"这个符号没有引用"。
+    for (const { timer, resolve, reject } of this.pending.values()) {
       clearTimeout(timer);
-      resolve(null);
+      if (reject) reject({ message: "语言服务器已停止", code: -32003 });
+      else resolve(null);
     }
     this.pending.clear();
   }
@@ -1896,10 +1925,14 @@ export function createLspManager(options) {
     async agentDocumentSymbols(path) {
       const ctx = await _agentEnsureDoc(path);
       if (!ctx || !ctx.client.supports("documentSymbol")) return null;
-      let result;
-      try { result = await ctx.client.request("textDocument/documentSymbol", { textDocument: { uri: ctx.uri } }); }
-      catch { return { unanswered: true }; }
-      if (result == null) return { unanswered: true };
+      let r;
+      try { r = await ctx.client.requestDetailed("textDocument/documentSymbol", { textDocument: { uri: ctx.uri } }); }
+      catch (e) { return { unanswered: true, reason: "transport", detail: String(e && e.message ? e.message : e).slice(0, 160) }; }
+      // 服务器**答了 null** 也算没答上来：这是仓库原有的保守选择，现在有了 reason 也照旧保留。
+      // 判据是代价不对称——把"答了 null"说成"这文件没有符号"，模型会当成空文件；说成
+      // "没答上来"，它最多多读一次文件。
+      if (!r.ok || r.result == null) return { unanswered: true, reason: r.ok ? "null" : r.reason, detail: r.detail };
+      const result = r.result;
       if (!Array.isArray(result)) return [];
       const out = [];
       const walk = (items, depth) => {
@@ -1925,9 +1958,19 @@ export function createLspManager(options) {
       const position = { line: Math.max(0, (line | 0) - 1), character: Math.max(0, character | 0) };
       const params = { textDocument: { uri: ctx.uri }, position };
       if (kind === "references") params.context = { includeDeclaration: true };
-      let result;
-      try { result = await ctx.client.request("textDocument/" + cap, params); }
-      catch { return null; }
+      /*
+       * 「没查成」和「没有引用」必须分开——这一条是四个里最危险的。
+       *
+       * 超时/服务器报错原来都变成 []，调用方读到的是**「这个符号没人用」**，于是放心
+       * 地删掉它、或者改了签名不管调用点。同一个文件里 63337 那段注释已经把这个后果
+       * 写出来了（那次修的是"行号偏了"那条路），超时这条路一直没修。
+       */
+      let r;
+      try { r = await ctx.client.requestDetailed("textDocument/" + cap, params); }
+      catch (e) { return { unanswered: true, reason: "transport", detail: String(e && e.message ? e.message : e).slice(0, 160) }; }
+      // 同上，且这一条代价最大：`[]` 只有在服务器**真的回了一个空数组**时才成立。
+      if (!r.ok || r.result == null) return { unanswered: true, reason: r.ok ? "null" : r.reason, detail: r.detail };
+      const result = r.result;
       const arr = Array.isArray(result) ? result : (result ? [result] : []);
       const locs = arr.map((loc) => {
         const uri = loc.uri || loc.targetUri;
@@ -1955,10 +1998,12 @@ export function createLspManager(options) {
       if (!ctx) return null;
       if (!ctx.client.supports("hover")) return null;
       const position = { line: Math.max(0, (line | 0) - 1), character: Math.max(0, character | 0) };
-      let result;
-      try { result = await ctx.client.request("textDocument/hover", { textDocument: { uri: ctx.uri }, position }); }
-      catch { return null; }
-      const contents = result?.contents;
+      let r;
+      try { r = await ctx.client.requestDetailed("textDocument/hover", { textDocument: { uri: ctx.uri }, position }); }
+      catch (e) { return { unanswered: true, reason: "transport", detail: String(e && e.message ? e.message : e).slice(0, 160) }; }
+      // 没答上来 ≠ 这个符号没有类型信息。前者重试有意义，后者重试是浪费。
+      if (!r.ok) return { unanswered: true, reason: r.reason, detail: r.detail };
+      const contents = r.result?.contents;
       if (!contents) return null;
       const flatten = (node) => {
         if (!node) return "";
@@ -1979,13 +2024,17 @@ export function createLspManager(options) {
     async agentFormat(path, options) {
       const ctx = await _agentEnsureDoc(path);
       if (!ctx || !ctx.client.supports("formatting")) return null;
-      let edits;
+      let r;
       try {
-        edits = await ctx.client.request("textDocument/formatting", {
+        r = await ctx.client.requestDetailed("textDocument/formatting", {
           textDocument: { uri: ctx.uri },
           options: { tabSize: options?.tabSize || 2, insertSpaces: options?.insertSpaces !== false },
         });
-      } catch { return null; }
+      } catch (e) { return { unanswered: true, reason: "transport", detail: String(e && e.message ? e.message : e).slice(0, 160) }; }
+      // 格式化这条的后果不同：没答上来还照旧返回 null 会让调用方以为"这语言没有格式化器"，
+      // 于是**再也不试**。分开之后它知道这次只是没答上来。
+      if (!r.ok) return { unanswered: true, reason: r.reason, detail: r.detail };
+      const edits = r.result;
       if (!Array.isArray(edits)) return null;
       const original = ctx.model.getValue();
       if (!edits.length) return original;
