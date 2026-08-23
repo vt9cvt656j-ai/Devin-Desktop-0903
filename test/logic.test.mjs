@@ -28653,6 +28653,39 @@ test("后台监视器要熬过一轮的自然收尾——那正是它存在的�
   assert.match(src, /\}, \{ durable: true \}\);/, "background_monitor 没有注册成常驻");
 });
 
+test("非 JS/TS 项目：改完之后先把语言服务器拉起来，再说「没有检查器看过」", () => {
+  /*
+   * `_interleavedDiagnostics` 是全系统**唯一**一道「改完自动检查」的门（不需要模型调工具）。
+   * 但它原来遇到没在跑的语言服务器就直接 `continue` —— 而服务器只有用户**手动在编辑器里
+   * 打开**同语言文件才会起。于是一个 Python / Rust / Go 项目里，只要这次会话用户没手动
+   * 开过 .py，智能体改多少个 .py 都只被记成 unchecked，`[BLOCKING_NEW_DIAGNOSTICS]`
+   * 结构上永不触发。用户原话「验证那些各种内容明明就应该能帮我做」。
+   */
+  const fn = stripJsComments(extractFn("_interleavedDiagnostics"));
+  assert.match(fn, /lspManager\.ensureServer\(langId\)/,
+    "遇到没起的语言服务器还是直接放弃——非 JS/TS 项目那道自动检查门永远是关着的");
+  // 有界：每 run 每语言只试一次。冷启动要花时间，不能每批改动都试一遍。
+  assert.match(fn, /triedLangs && !triedLangs\.has\(langId\)/,
+    "没有 run 级去重，每批改动都会重试一次冷启动");
+  assert.match(fn, /triedLangs\.add\(langId\)/, "试过了没记账，去重是假的");
+  // 拉起之后要**重新判**，不能拉完就当它起来了：缺二进制/启动失败时 ensureServer
+  // 干净返回 null，那时仍然该记 unchecked。
+  assert.match(fn, /if \(!\(lspManager\?\.isRunning\?\.\(langId\)\)\) \{[\s\S]{0,120}unchecked\.push/,
+    "拉起之后没有重新判——启动失败的语言会被当成检查过了，那比不检查更糟");
+  // 两个调用点都要把 run 级集合**传下去**，否则参数恒为 null，整条路退化回原样。
+  // 钉「作为实参出现」的次数，不数总出现次数 —— 惰性初始化那句
+  // `if (!run._diagLangTried) run._diagLangTried = new Set();` 自己就占两次（数错过）。
+  const src = stripJsComments(SRC);
+  const passed = (src.match(/run\._diagLangTried(?!\s*[)=])/g) || []).length
+    + (src.match(/,\s*run\._diagLangTried,/g) || []).length;
+  assert.ok(passed >= 2,
+    `run 级去重集合只在 ${passed} 个调用点被传下去，应有 2 个（基线那次 + 每批那次）`);
+  assert.match(src, /_interleavedDiagnostics\(_newBaselinePaths, root, null, run\._diagLangTried\)/,
+    "基线那次调用没传去重集合");
+  assert.match(src, /run\._diagnosticBaselineCounts,\s*run\._diagLangTried,/,
+    "每批改动那次调用没传去重集合");
+});
+
 test("harness 点名的工具必须在手里：盯着用户做完没的那个", () => {
   /*
    * 仓库自己已经三次为同一条理由破例（run_subagent 那族实测 939 回合 0 次调用、
