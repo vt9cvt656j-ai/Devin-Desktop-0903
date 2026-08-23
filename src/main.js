@@ -113,6 +113,7 @@ import appPackage from "../package.json";
 import {
   approvalTypes, blockedInReadOnlyMode, defineTool, fileEditTypes, hookedTypes, needsApprovalFor,
   isFileMutation, fileMutationTypes, workerScopeField, workerScopeTarget, workspaceMutatingTypes,
+  toolPolicy,
 } from "./agent/tool-policy.js";
 import {
   USER_TOOL_PREFIX, buildHttpCall, compileToolSchema, mergeCapabilities,
@@ -28140,7 +28141,16 @@ async function sendPrompt(text, attachments = [], readyConfig = null, opts = {})
     // 现在它有 create_project 了（位置固定在 ~/MrDayOne/<name>，名字过白名单，仍走
     // register_workspace_root 的全部守卫），所以告诉它自己开工，而不是让它去求用户。
     // 用户说「写个 telegram 机器人」时应该看到机器人，而不是一句"请先点这里"。
+    // 只读模式下**不能**说这句：create_project 的策略是 readOnlyModeBlocked，
+    // 执行时 100% 回 [BLOCKED]。指使模型去调一个必被拒的工具，比不说更糟——
+    // 它会照做、被拒、然后不知道该干什么。（同一批修改里，这三个必被拒的工具也已经
+    // 不再出现在只读模式的注册表里；这里是同一件事的另一半：harness 自己别去点名它。）
+    if (_readOnlyBlockedTool("create_project")
+        && ["explorer", "reviewer", "plan"].includes(String(effectiveMode || ""))) {
+      contextBlock += "\n(未打开工作区文件夹。当前是只读模式，开不了新项目——先回答用户能回答的部分，并说清「要真的建这个项目，请切到 Agent 模式或先打开一个文件夹」。)";
+    } else {
     contextBlock += "\n(未打开工作区文件夹。要创建/修改/运行项目文件时，先调 create_project 建一个目录（给个描述性名字，如 telegram-image-bot），它会立刻成为当前工作区；别停下来问用户，也别写相对路径——那会被沙箱拒绝。收尾时把返回的完整路径告诉用户。)";
+    }
     }
   }
   if (_activeForSession) {
@@ -35384,6 +35394,13 @@ async function _figRun(call) {
   return out.join("\n");
 }
 
+/** 只读模式下这个工具是不是「注册了也一定被拒」。严格布尔——策略表里有一族字段是函数。 */
+function _readOnlyBlockedTool(name) {
+  const n = String(name || "").replace(/_/g, "").toLowerCase();
+  if (!n) return false;
+  try { return toolPolicy(n)?.readOnlyModeBlocked === true; } catch { return false; }
+}
+
 function _buildAgentToolSchemas(includeWrite, mcpTools = []) {
   const tools = [
     { type: "function", function: { name: "read_file", description: "Read a file's contents. By default it reads the whole file from the start (up to 2000 lines) — **prefer omitting offset/limit and just reading the whole file**; use offset/limit only when the file is too large for one read (the result says it was truncated) to continue through the part you have not covered. You can issue several tool calls in parallel in one reply: **speculatively reading every possibly-useful file in one parallel batch is always better** than reading one at a time. When investigating, evaluating, or reviewing and you find further relevant files you have not read (modules the entry point imports, build scripts, config): **read them and then conclude — never stop to ask the user \"shall I keep reading?\". The unread list you just produced is your reading queue, not a question to hand back.** Do not re-read a whole file you already read and that has not changed; re-read a range only when you need character-exact text for an edit and the exact original has fallen out of context. Before modifying an existing file you must have its current real version. It can also read the text layer of .pdf/.docx/.pptx/.xlsx (image-only scans need OCR).", parameters: { type: "object", properties: { path: { type: "string", description: "Path relative to the workspace root, or an absolute path" }, offset: { type: "integer", description: "Starting line number (1-based). Provide only when the file is too large to read in one go" }, limit: { type: "integer", description: "How many lines to read. Provide only when the file is too large to read in one go; omit = read the whole file at once" } }, required: ["path"] } } },
@@ -35697,7 +35714,17 @@ function _buildAgentToolSchemas(includeWrite, mcpTools = []) {
   }
   // 角色枚举**必须**包在 _applyCloudToolDescs 外面：那一步整块替换 function.parameters，
   // 包在里面的话云端 tools.json 会把枚举原样盖回内置 11 个（见 _applyUserRoleEnums 注释）。
-  return _applyUserRoleEnums(_applyCloudToolDescs(_withoutDisabledTools(tools)));
+  // 只读模式下必被拒的工具，一开始就不发给模型。
+  //
+  // 和本函数上面那段「网页版别发桌面专属工具」是**同一个形状**，只是那一份修了、
+  // 这一份漏了：ui_click / create_project / save_skill 的策略是 readOnlyModeBlocked，
+  // 执行时 100% 回 [BLOCKED]，可它们照样待在只读模式的 87 条注册表里——search_tools
+  // 取得回、编排器选得中，选中一次就是一轮白烧，还占掉工具窗口的配额。
+  //
+  // 判据用**严格布尔** `=== true`：策略表里有一族 readOnly 相关字段是**函数**
+  // （按这一次调用判），真值判断会把那一族一并误杀。
+  const _visible = includeWrite ? tools : tools.filter((t) => !_readOnlyBlockedTool(t?.function?.name));
+  return _applyUserRoleEnums(_applyCloudToolDescs(_withoutDisabledTools(_visible)));
 }
 
 /**
