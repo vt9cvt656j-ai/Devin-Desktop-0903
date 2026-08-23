@@ -24256,6 +24256,17 @@ function _michaelDesignBrief(researchPlan, evidence, results = [], profile = nul
     const content = focusedExcerpt(item);
     return `【${purpose}】\n${content}`;
   }).join("\n\n---\n\n").slice(0, 9200);
+  // 「一条都没查到」和「查询根本没成功」对模型是两条相反的指令，此前都落到同一句
+  // 「没有返回命中」。前者是**结论**：这个库里确实没有，按用户约束继续就是对的；后者是
+  // **没有结论**：库可能是全的，只是这次没拿到——那就绝不能把「知识库没有相关规则」写进
+  // 任何交付说明里。判据用预检打在每条轨道上的 failed（结构字段派生，见那边的注释）。
+  const _failedTracks = (Array.isArray(results) ? results : []).filter((item) => item?.failed);
+  const _noHitNote = _failedTracks.length
+    ? `本轮 michael-design 有 ${_failedTracks.length} 条检索**没有成功**（`
+      + _failedTracks.map((item) => String(item?.result?.content || "").split("\n", 1)[0].slice(0, 70)).join("；")
+      + "）。**这不等于知识库里没有内容**——不要据此对用户说「知识库没有相关规则」，也不要编造规则；"
+      + "按用户明确要求与项目证据继续，并在交付说明里如实写明这一轮设计知识没取到、以及为什么。"
+    : "本轮 michael-design 没有返回命中；不要编造知识库规则，改为明确记录不可用原因并基于用户约束继续。";
   const planned = (Array.isArray(researchPlan) ? researchPlan : [])
     .map((item) => `${item.id}: ${item.purpose}`).join("；");
   const compositionRecipe = _michaelDesignCompositionRecipe(researchPlan, results, profile);
@@ -24290,7 +24301,23 @@ ${compositionRecipe}
 执行要求：三轨是同时成立的采用契约，不允许只选第一轨的浅色、圆角和卡片后忽略动效/媒体轨。结构配色轨必须逐项写成“来源 section → 当前项目组件 primitive/variant/API → 当前项目语义 token/theme/style → 页面落点”；动效轨必须落实知识库命中的高级技术、至少两处区块触发、桌面/移动参数以及 reduced-motion；媒体图标轨必须落实真实图片/视频/GIF/头像 URL、加载失败态和“业务对象/动作/状态 → 具体图标”。已有网站保留框架、组件库、主题、样式入口和构建系统，不新增平行组件体系；${defaultStack ? "本轮是无栈场景，默认用 React + Tailwind CSS + shadcn/ui，并按 Tailwind v4 CSS-first 实现。" : "先读取工程文件确认真实栈，Michael Design 只迁移设计事实，不负责改写技术栈。"}按命中的布局规则决定卡片数量、跨列和移动端断点。先在计划中逐轨写明采用与弃用项，再实现；收尾只核对执行事实（浏览器验收记账、落盘台账），设计采用项写在计划里是给你自己对照用的。
 
 原始命中摘录（仅以下内容可当作知识库事实）：
-${excerpts || "本轮 michael-design 没有返回命中；不要编造知识库规则，改为明确记录不可用原因并基于用户约束继续。"}`;
+${excerpts || _noHitNote}`;
+}
+
+// 「检索失败」和「检索到 0 条」是两件完全不同的事，而知识检索这两处此前都写成同一句
+// 「无可用命中」。
+//
+// 差别不在措辞。零命中是**一个结论**——这个域里确实没有这个主题，模型据此可以放心地按
+// 用户约束继续；HTTP 4xx/5xx、鉴权失败、网络异常是**没有结论**——语料可能好端端摆在那儿，
+// 只是这次没拿到。把后者显示成「无可用命中」，用户看到的是一张红卡片配一句「没查到内容」，
+// 于是以为知识库是空的；而这两条路都落到同一句文案，红绿又是另算的，所以卡片上出现过
+// 「红色 + 无可用命中」这种自相矛盾的组合（2026-08-23 用户现场截图，六次检索里三次如此）。
+function _knowledgeSettleLabel(call, result, okLabel) {
+  if (okLabel) return okLabel;
+  if (_toolExecutionSucceeded(call, result)) return "无可用命中";
+  const head = String(result?.content || "").split("\n", 1)[0] || "";
+  const brief = head.replace(/^\s*\[[^\]]{0,40}\]\s*/, "").replace(/^知识库查询\s*/, "").trim().slice(0, 28);
+  return brief ? `检索失败 · ${brief}` : "检索失败";
 }
 
 async function _runMichaelDesignPreflight({ run, body = null, isLive = () => true } = {}) {
@@ -24316,9 +24343,13 @@ async function _runMichaelDesignPreflight({ run, body = null, isLive = () => tru
       if (step) {
         const viewport = step.querySelector?.(".atc-viewport");
         if (viewport) viewport.textContent = String(result?.content || "").slice(0, 6000);
-        _settleToolStep(step, result, evidence ? `${evidence.hitCount} 段 · 已注入` : "无可用命中");
+        _settleToolStep(step, result, _knowledgeSettleLabel(call, result, evidence ? `${evidence.hitCount} 段 · 已注入` : ""));
       }
-      return { plan, result, evidence };
+      // 零命中和检索失败要能分开，而且判据必须是**结构**不是文案：_searchKnowledgeBase 的
+      // 零命中分支带 `knowledge: { hitCount: 0, domains: [] }`，两条失败分支（HTTP 非 2xx、
+      // 预取异常）根本不带 knowledge 字段。简报那边据此决定对模型说哪句话——说错了方向相反：
+      // 「库里没有」是可以照着继续的结论，「没拿到」不是。
+      return { plan, result, evidence, failed: !result?.knowledge };
     } catch (error) {
       const result = { type: "knowledge", path: plan.query, content: `[失败] michael-design 预取异常: ${String(error?.message || error).slice(0, 180)}` };
       if (step) _settleToolStep(step, result, "预取失败");
@@ -24570,7 +24601,7 @@ async function _runDomainKnowledgePreflight({ run, profile = "", body = null, is
         if (step) {
           const viewport = step.querySelector?.(".atc-viewport");
           if (viewport) viewport.textContent = String(result?.content || "").slice(0, 6000);
-          _settleToolStep(step, result, bullets.length ? `${bullets.length} 条 · ${plan.heading}` : "无可用命中");
+          _settleToolStep(step, result, _knowledgeSettleLabel(call, result, bullets.length ? `${bullets.length} 条 · ${plan.heading}` : ""));
         }
         return { heading: plan.heading, bullets, raw: _raw };
       } catch (error) {
