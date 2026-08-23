@@ -3527,6 +3527,26 @@ fn ide_region(headers: &HeaderMap) -> Option<String> {
 /// lockfile semantics.
 const REGION_MIRROR_BLOCK_CN: &str = "【Install sources · by the user's network region】The user's network egress is currently in mainland China: when installing or downloading dependencies and tools, prefer a domestic mirror for speed — npm/pnpm/yarn via npmmirror (--registry=https://registry.npmmirror.com, or a temporary environment variable; do not permanently change the user's global config); pip via Tsinghua TUNA (-i https://pypi.tuna.tsinghua.edu.cn/simple); cargo can use RsProxy; Go via GOPROXY=https://goproxy.cn,direct; large files, models and install scripts likewise prefer a source reachable from within the country. When a package manager has no reliable mirror, the mirror fails, or it lacks the target version, fall straight back to the official default source rather than retrying the mirror repeatedly. Change only the download source — never dependency versions, lockfiles or project config files; when the user has specified a source explicitly, the user wins.";
 
+/// 语义画像这个头的**四态**：absent / rejected / empty / flags。
+///
+/// 抽成函数只为一件事：让它可测，且只有一处实现。`unwrap_or_default()` 会把「头缺失」
+/// 「头被解析器拒掉」「头合法但没有旗标」折成同一个空集合，而这三种的修法在完全不同的
+/// 地方——排查恰恰要从这里分叉：
+///   absent   → 客户端压根没挂这个头（config 没传到、或那条发送路径不带头）
+///   rejected → 挂了但形状不合法（版本前缀 / 字符集 / 长度），在这里被静默丢掉
+///   empty    → 挂了、合法，但客户端确实一个旗标都没算出来（裁决没落地）
+///   flags    → 正常
+pub(crate) fn semantic_profile_source(headers: &HeaderMap) -> &'static str {
+    match headers.get("x-ide-semantic-profile") {
+        None => "absent",
+        Some(_) => match ide_semantic_profile(headers) {
+            None => "rejected",
+            Some(set) if set.is_empty() => "empty",
+            Some(_) => "flags",
+        },
+    }
+}
+
 fn ide_semantic_profile(headers: &HeaderMap) -> Option<HashSet<String>> {
     let raw = headers
         .get("x-ide-semantic-profile")?
@@ -3686,6 +3706,15 @@ pub fn assemble_into(headers: &HeaderMap, body: &mut serde_json::Value) -> Resul
         return Ok(());
     }
     let semantic_profile = ide_semantic_profile(headers).unwrap_or_default();
+    // 这道量尺本身曾经量不准：`unwrap_or_default()` 把**头缺失**、**头被解析器拒掉**、
+    // **头存在但一个旗标都没有**三种情况折成同一个空集合，而下面那条日志的注释却写着
+    // 「空 → 客户端没算出旗标，问题在客户端」——那个推断在头缺失或被拒时是错的，
+    // 而排查恰恰要从这里分叉。三种情况的修法在完全不同的地方：
+    //   absent   → 客户端压根没挂这个头（config 没传到、或那条发送路径不带头）
+    //   rejected → 挂了但形状不合法（版本前缀、字符集、长度），被这里静默丢掉
+    //   empty    → 挂了、合法，但客户端确实一个旗标都没算出来（裁决没落地）
+    //   flags    → 正常
+    let semantic_profile_source = semantic_profile_source(headers);
     let semantic = |flag: &str| semantic_profile.contains(flag);
     let requested_tool_count = hdr("x-ide-tools")
         .map(|names| {
@@ -4040,6 +4069,9 @@ pub fn assemble_into(headers: &HeaderMap, body: &mut serde_json::Value) -> Resul
         marked_request_bytes,
         last_user_bytes,
         semantic_profile_seen = ?semantic_profile_seen,
+        // 空集合的**成因**。没有它，「客户端没算出来」和「客户端根本没发」在日志里
+        // 长得一模一样，而这两件事要改的地方完全不同。
+        semantic_profile_source,
         // 「语料到底注进去没有」的直接判据。prompt_blocks 里的 auto_knowledge 只说「有块」：
         //   knowledge_domain=- 且 hits=0 → 门没开或零命中，语料对这轮不存在；
         //   knowledge_domain=healthcare 且 hits>0 → 领域限定生效，专业域醒了。
@@ -8321,5 +8353,58 @@ mod readonly_tool_injection_tests {
         // 走一遍真实入口，确认过滤发生在 requested_static_tools 这一层。
         let picked = requested_static_tools("reviewer", "read_file,write_file,view_image,await_subagent");
         assert_eq!(picked, vec!["read_file", "view_image", "await_subagent"]);
+    }
+}
+
+#[cfg(test)]
+mod semantic_profile_source_tests {
+    use super::semantic_profile_source;
+    use axum::http::HeaderMap;
+
+    fn source(raw: Option<&str>) -> &'static str {
+        let mut headers = HeaderMap::new();
+        if let Some(v) = raw {
+            headers.insert("x-ide-semantic-profile", v.parse().unwrap());
+        }
+        semantic_profile_source(&headers)
+    }
+
+    #[test]
+    fn a_missing_header_is_not_the_same_as_an_empty_one() {
+        assert_eq!(source(None), "absent");
+        assert_eq!(source(Some("2.5:")), "empty");
+    }
+
+    #[test]
+    fn a_malformed_header_says_rejected_instead_of_looking_empty() {
+        // 版本前缀不对、字符集不合法——都会被解析器静默丢掉，而它们在日志里
+        // 必须和「客户端算出来是空的」区分开：前者改客户端的发送路径，后者改裁决。
+        assert_eq!(source(Some("2.4:engineering")), "rejected", "版本前缀不对");
+        assert_eq!(source(Some("engineering")), "rejected", "没有版本前缀");
+        assert_eq!(source(Some("2.5:Engineering")), "rejected", "大写不在允许字符集里");
+        assert_eq!(source(Some("2.5:a-b")), "rejected", "连字符不在允许字符集里");
+    }
+
+    #[test]
+    fn real_flags_say_flags() {
+        assert_eq!(source(Some("2.5:engineering")), "flags");
+        assert_eq!(source(Some("2.5:engineering,research,domain_web_frontend")), "flags");
+    }
+
+    #[test]
+    fn unknown_flag_names_read_as_empty_not_flags() {
+        // 全是不认识的旗标 → 解析成功但集合为空。这是「两侧旗标名单漂了」，
+        // 和「客户端没算出来」不是一回事，但都落到 empty——所以 empty 时还要看 seen 名单。
+        assert_eq!(source(Some("2.5:not_a_real_flag")), "empty");
+    }
+
+    // 纯函数测不到「装配处还用不用它」：把那一行改回内联的 match，上面四条照样全绿。
+    #[test]
+    fn the_assembler_actually_calls_it() {
+        let src = include_str!("prompts.rs");
+        let call = concat!("let semantic_profile_source = semantic_profile", "_source(headers);");
+        assert!(src.contains(call), "装配处绕开了这个函数，自己又写了一份判据——两边会漂");
+        let def = concat!("pub(crate) fn semantic_profile", "_source(headers: &HeaderMap)");
+        assert_eq!(src.matches(def).count(), 1, "出现了第二份实现");
     }
 }
