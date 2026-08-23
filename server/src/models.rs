@@ -4475,6 +4475,18 @@ impl OpenAiSseValidator {
     }
 }
 
+/// 「这次 knowledge_search 要不要并上自有语料库（真实 API 签名 + 官方文档）」。
+///
+/// 抽成独立函数只为一件事：让这条判据可测、且在源码层面看得见它到底是什么。
+/// 它曾经写成 `domain.is_none()`——按「有没有传 domain」开关；而真正的理由只对
+/// michael-design 一个域成立（那条设计流程要精选蓝本，掺进几十万条 API 条目会冲淡它）。
+/// 判据和理由分叉的后果：模型每照着提示词传一次 domain，就把 295 万行真实 API 声明
+/// 和 7.6 万条官方文档整条腿关掉一次——而那正是「写第三方调用前先核对真实 API」
+/// 唯一够得着的事实源。
+pub(crate) fn code_corpus_leg_enabled(domain: Option<&str>) -> bool {
+    domain != Some(crate::prompts::DESIGN_KNOWLEDGE_DOMAIN)
+}
+
 #[cfg(test)]
 fn validate_openai_sse_eof(bytes: &[u8]) -> Result<(), String> {
     let mut validator = OpenAiSseValidator::default();
@@ -4863,8 +4875,19 @@ pub async fn knowledge_search(
     //
     // 字段映射成 domain/topic/section/text —— 和手写语料同一套形状，客户端不用改一行。
     //
-    // 指定了 domain 就**只给手写语料**：michael-design 那条设计流程要的是精选蓝本，
+    // 只有 **michael-design** 走「只给手写语料」：那条设计流程要的是精选蓝本，
     // 掺进几十万条 API 条目只会把它冲淡。
+    //
+    // 判据原来写的是 `domain.is_none()`——按「有没有传 domain」开关，而上面那行理由
+    // 只对 michael-design 一个域成立。后果是：模型每照着提示词传一次 domain，就把
+    // 真实 API 声明和官方文档整条腿关掉一次。而线上这张表有 295 万行
+    // （pypi 140 万 / npm 76 万 / crates 72 万 / 官方文档 7.6 万），正是「写第三方
+    // 调用之前先核对真实 API」唯一够得着的那份事实。
+    //
+    // 运行时权威的那份工具说明（server/prompts/tools.json 的 knowledge_search）**无条件**
+    // 向模型承诺了 curated / real_api / official_docs 三种标签，还写着「宁可用带标签的
+    // 段落，也别凭记忆写 API——你记得的签名可能属于另一个大版本」。判据写反的时候，
+    // 那句承诺在任何带 domain 的调用里都是假的。
     let mut merged: Vec<serde_json::Value> = hits
         .iter()
         .map(|h| json!({
@@ -4872,7 +4895,7 @@ pub async fn knowledge_search(
             "text": h.text, "score": h.score, "source": "curated",
         }))
         .collect();
-    if domain.is_none() {
+    if code_corpus_leg_enabled(domain) {
         // 手写语料是精选的，排在前面；语料库补足剩下的名额。
         let want = top_k.saturating_sub(merged.len()).max(top_k / 2).min(12) as i64;
         if want > 0 {
@@ -17226,5 +17249,60 @@ mod audit_20260822_tests {
                 "得说清楚是哪个 0 点，否则用户等到半夜发现还是 0。实际：{m}",
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod code_corpus_leg_tests {
+    use super::code_corpus_leg_enabled;
+
+    // 这条腿是「写第三方调用之前先核对真实 API」唯一够得着的事实源：线上 295 万行
+    // （pypi 140 万 / npm 76 万 / crates 72 万 / 官方文档 7.6 万）。判据一旦退回
+    // `domain.is_none()`，模型每照着提示词传一次 domain 就把它整条关掉一次。
+    #[test]
+    fn only_the_design_domain_turns_the_code_corpus_leg_off() {
+        assert!(!code_corpus_leg_enabled(Some(crate::prompts::DESIGN_KNOWLEDGE_DOMAIN)),
+            "michael-design 要的是精选蓝本，掺进几十万条 API 条目会把它冲淡");
+    }
+
+    #[test]
+    fn every_other_domain_still_gets_real_api_and_official_docs() {
+        for d in [
+            "web-frontend", "backend-api", "database", "security", "devops",
+            "healthcare", "finance", "systems-programming", "mobile", "saas",
+        ] {
+            assert!(code_corpus_leg_enabled(Some(d)),
+                "传了 {d} 就把真实 API 声明和官方文档整条腿关掉了——\
+                 而运行时那份工具说明无条件向模型承诺了 real_api / official_docs 两种标签");
+        }
+    }
+
+    #[test]
+    fn no_domain_at_all_still_works() {
+        // 不带 domain 是原来唯一能走到这条腿的路径，不能被这次修改弄丢。
+        assert!(code_corpus_leg_enabled(None));
+    }
+
+    // 纯函数测不到「调用点还接不接着它」：把 `if code_corpus_leg_enabled(domain)` 改回
+    // `if domain.is_none()`，上面四条照样全绿（2026-08-23 变异实测）。所以补这一条。
+    #[test]
+    fn the_handler_actually_calls_the_predicate() {
+        let src = include_str!("models.rs");
+        // 字面量要拼起来写：直接写全名的话，**这条断言自己**也会被数进去。
+        let call = concat!("if code_corpus_leg", "_enabled(domain) {");
+        let def = concat!("fn code_corpus_leg", "_enabled(domain: Option<&str>)");
+        assert!(src.contains(call),
+            "knowledge_search 的调用点绕开了这条判据，自己又写了一份——两边会漂");
+        assert_eq!(src.matches(def).count(), 1, "判据出现了第二份实现");
+    }
+
+    #[test]
+    fn the_criterion_is_the_domain_identity_not_whether_one_was_given() {
+        // 反向断言：只要「传了任意 domain」和「没传」的结果一致（除 michael-design 外），
+        // 就说明判据看的是**域的身份**，而不是「有没有传」。
+        let some = code_corpus_leg_enabled(Some("web-frontend"));
+        let none = code_corpus_leg_enabled(None);
+        assert_eq!(some, none,
+            "判据又变回按「有没有传 domain」开关了——那和它自己的理由分叉");
     }
 }
