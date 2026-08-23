@@ -22131,7 +22131,7 @@ test("client modules have no undeclared identifiers", async () => {
     "AbortController","AbortSignal","Blob","BroadcastChannel","CSS","CustomEvent","Event","FileReader",
     "FormData","Image","MutationObserver","Node","Notification","PerformanceObserver","ResizeObserver",
     "TextDecoder","TextEncoder","URL","URLSearchParams","alert","cancelAnimationFrame","clearInterval",
-    "clearTimeout","confirm","console","crypto","document","fetch","localStorage","sessionStorage","location","navigator",
+    "clearTimeout","confirm","console","crypto","document","fetch","getComputedStyle","localStorage","sessionStorage","location","navigator",
     "performance","queueMicrotask","requestAnimationFrame","requestIdleCallback","self","setInterval",
     "setTimeout","window","setImmediate",
     // Feature-detected on purpose, always behind `typeof x !== "undefined"`
@@ -28247,6 +28247,78 @@ test("模型菜单：free 徽标由网关下发的字段决定，不是客户端
   // 两组菜单（网关模型 / 自定义模型）都要有对勾列，否则两组之间对不齐。
   assert.equal((menu.match(/check-slot/g) || []).length, 2,
     "自定义模型那组没用同一套结构，两组的对勾对不齐");
+});
+
+test("模型菜单：比原来宽，且中线正对下面那个模型按钮", () => {
+  // 两条要求互相拉扯：菜单一旦宽到占满输入框，就不可能再以按钮为中心 —— 按钮不在输入框
+  // 正中，它左边还坐着模式选择器。所以宽度取「以按钮中线为心、两边都还装得下的最大值」。
+  //
+  // 造一份假 DOM 喂给真函数：只用到 getBoundingClientRect / getComputedStyle / style。
+  const run = ({ boxLeft, boxRight, pad = 8, pickLeft, pickWidth = 102 }) => {
+    const vars = {};
+    const box = { getBoundingClientRect: () => ({ left: boxLeft, right: boxRight, width: boxRight - boxLeft }) };
+    const picker = {
+      closest: (sel) => (sel === ".composer" ? box : null),
+      getBoundingClientRect: () => ({ left: pickLeft, right: pickLeft + pickWidth, width: pickWidth }),
+    };
+    const menu = { style: { setProperty: (k, v) => { vars[k] = v; } } };
+    load("_applyModelMenuGeometry", {
+      modelPicker: picker,
+      modelMenu: menu,
+      getComputedStyle: () => ({ paddingLeft: pad + "px", paddingRight: pad + "px" }),
+    })();
+    const width = parseFloat(vars["--model-menu-width"]);
+    const left = parseFloat(vars["--model-menu-left"]);
+    return {
+      width,
+      menuLeft: pickLeft + left,
+      menuRight: pickLeft + left + width,
+      innerLeft: boxLeft + pad,
+      innerRight: boxRight - pad,
+      centreOff: Math.abs((pickLeft + left + width / 2) - (pickLeft + pickWidth / 2)),
+    };
+  };
+
+  // 实测过的那一组：输入框 573–988（内 415），按钮 679 起、宽 102，中线 730。
+  const real = run({ boxLeft: 565, boxRight: 996, pickLeft: 679 });
+  assert.equal(real.width, 314, "宽度不是「以按钮为心装得下的最大值」");
+  assert.ok(real.width > 232, "没有比原来的 232px 更宽");
+  assert.equal(real.centreOff, 0, "菜单中线没有对齐按钮中线");
+  assert.ok(real.menuLeft >= real.innerLeft && real.menuRight <= real.innerRight, "溢出输入框了");
+
+  // 面板拖得很宽：420 封顶，且仍然居中。
+  const wide = run({ boxLeft: 200, boxRight: 1200, pickLeft: 640 });
+  assert.equal(wide.width, 420, "很宽的面板下没有封顶到 420");
+  assert.equal(wide.centreOff, 0, "封顶之后就不居中了");
+
+  // 面板拖得极窄：宁可放弃严格居中，也不能比原来还窄，而且要被按回输入框里。
+  const narrow = run({ boxLeft: 700, boxRight: 900, pickLeft: 760 });
+  assert.equal(narrow.width, 232, "极窄面板下菜单缩得比原来还窄");
+  assert.ok(narrow.menuLeft >= narrow.innerLeft - 0.5,
+    "夹取失效，菜单从输入框左边溢出去了");
+
+  // 按钮偏左但还装得下：半宽由左侧决定（右边留白更多），仍然严格居中。
+  const leftish = run({ boxLeft: 565, boxRight: 1100, pickLeft: 700 });
+  assert.equal(leftish.centreOff, 0, "按钮偏左时不居中了");
+  assert.ok(leftish.innerRight - leftish.menuRight > leftish.menuLeft - leftish.innerLeft,
+    "半宽没有由较近的那一侧决定");
+
+  // 按钮**紧**贴边：这时 232px 下限和严格居中不可能同时成立。取舍是「宁可不居中，
+  // 也不缩得比原来还窄、也不溢出」—— 缩窄会让模型名读不了，溢出会盖到面板外面去。
+  const pinned = run({ boxLeft: 565, boxRight: 1100, pickLeft: 580 });
+  assert.equal(pinned.width, 232, "贴边时缩得比原来还窄了");
+  assert.ok(pinned.menuLeft >= pinned.innerLeft - 0.5, "贴边时从左边溢出去了");
+  assert.ok(pinned.centreOff > 0,
+    "这一档本来就居中不了；如果它居中了，说明夹取没生效、菜单正溢出输入框");
+
+  // JS 算得再对，CSS 不读也是白算 —— 这一环变异实测漏过一次。
+  const rule = APP_CSS_CODE.match(/#modelMenu\s*\{([^}]*)\}/);
+  assert.ok(rule, "#modelMenu 那条规则不见了");
+  assert.match(rule[1], /left:\s*var\(--model-menu-left/, "CSS 没有用 JS 算出来的左缘");
+  assert.match(rule[1], /width:\s*var\(--model-menu-width/, "CSS 没有用 JS 算出来的宽度");
+  // 缺省值要退回原样：变量没写上时不能塌成 0 宽或贴到别处去。
+  assert.match(rule[1], /--model-menu-left,\s*0px/, "左缘缺省不是 0（等于原来的 left:0）");
+  assert.match(rule[1], /--model-menu-width,\s*auto/, "宽度缺省不是 auto（等于原来的 min-width）");
 });
 
 test("free 徽标是「模型 × 当前额度」，额度用完就消失、回满又出现", () => {

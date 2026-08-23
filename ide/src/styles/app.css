@@ -8306,6 +8306,18 @@ button.agent-plan__fold--toggle:focus-visible { outline: 2px solid #1a73e8; outl
   }
 }
 /* titlebar menus open downward */
+/* 模型菜单：更宽，且**横向居中对齐**到下面那个模型按钮。
+   原来是 left:0 + min-width:232px —— 从模型按钮的左缘向右摊开 232px，于是菜单整个
+   偏在按钮右侧，看着像挂歪了；模型名又偏长（claude-opus-4-6 / GPT-5.4 Mini，后面还要
+   跟 free 徽标和对勾），232px 里很挤。
+   现在宽度取「以按钮中线为心、输入框两边都还装得下的最大值」（夹在 232–420px），左缘
+   随之算出来 —— 菜单左右到输入框边缘的余量一样，正正地挂在按钮上方。
+   两个数都由 JS 每次打开量一次：模式选择器的宽度随语言变（Agent / 智能体），面板本身
+   也能拖宽拖窄，写死一个数换个语言或拖一下就歪。量不到 → 变量缺省 → 完全是原来的样子。 */
+#modelMenu {
+  left: var(--model-menu-left, 0px);
+  width: var(--model-menu-width, auto);
+}
 .menu--tb {
   top: calc(100% + 6px);
   bottom: auto;
