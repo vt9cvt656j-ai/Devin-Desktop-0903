@@ -25343,8 +25343,8 @@ function _formatStackHint(s) {
   // 这正是"写出来的代码很容易用不了"最直接的一条机器原因。
   //
   // 改成祈使句：验证是**模型自己的活**，而且说清"没人替你跑"。
-  if (s.checkCmd) lines.push(`✅ 快速校验: \`${s.checkCmd}\`（编译/类型检查）——**改完必须你自己跑这条**，没有任何东西会替你自动跑。退出码非 0 就是结论——这条没过；退出码 0 只说明这条检查通过了，不等于用户要的事做成了，还要看真实输出和目标后置状态。${_unverified(s.checkCmd)}`);
-  if (s.testCmd) lines.push(`🧪 测试: \`${s.testCmd}\`——**改完必须你自己跑**，同样没人会替你跑，也不会有失败报告自动送到你面前。${_unverified(s.testCmd)}`);
+  if (s.checkCmd) lines.push(`✅ 快速校验: \`${s.checkCmd}\`（编译/类型检查）——**改完必须你自己跑这条**——IDE 只会在你被提醒之后仍然不跑时兜底跑一次，兜出来的红字同样算你的账，别把它当默认路径。退出码非 0 就是结论——这条没过；退出码 0 只说明这条检查通过了，不等于用户要的事做成了，还要看真实输出和目标后置状态。${_unverified(s.checkCmd)}`);
+  if (s.testCmd) lines.push(`🧪 测试: \`${s.testCmd}\`——**改完必须你自己跑**——同样只有那一次兜底，别指望失败报告自动送到你面前。${_unverified(s.testCmd)}`);
   // 有套件就说清位置。只给命令不给位置，模型就会在根目录另起一个脚本——实测如此。
   if (s.testDir) {
     lines.push(`📁 测试套件在 \`${s.testDir}/\`${s.testSubs?.length ? `（${s.testSubs.join(" / ")}）` : ""}`
@@ -41322,7 +41322,22 @@ function _stubDeliveryFindings(run, maxItems = 8) {
       const win = lines.slice(i, i + 3).map((l) => l.trim()).join(" ");
       for (const [re, kind] of STRUCT) {
         if (!re.test(win)) continue;
-        mine.push({ path: String(absPath).split("/").slice(-2).join("/"), line: i + 1, kind, text: win.slice(0, 90) });
+        // 3 行窗口会让**同一处**连报两三次（窗口从它前面一两行就开始命中了）。
+        // 实测：一行 fetch("https://api.example.com/…") 报了第 14 行和第 16 行两条，
+        // 内容是同一句。同类且行距 <3 的当成同一处，只留先命中的那一条。
+        // （_sinkRisksInWrite 那边是按类别整份去重；这边不能那么做——同一份文件里
+        //   真的可能有多处独立的同类占位，那些每一处都该点名。）
+        // 行号要指准：窗口起点常常不是真正命中的那一行（实测一行 fetch(...) 报成了它
+        // 前面两行的行号）。先看窗口里哪一行**自己**就成立；三行都不单独成立（真跨行的
+        // 那种，比如模板串里的多行函数签名）才退回窗口起点并给拼平后的三行。
+        let at = -1;
+        for (let k = 0; k < 3 && i + k < lines.length; k++) {
+          if (re.test(lines[i + k].trim())) { at = i + k; break; }
+        }
+        const hitLine = at >= 0 ? at + 1 : i + 1;
+        const hitText = at >= 0 ? lines[at].trim().slice(0, 90) : win.slice(0, 90);
+        const dup = mine.some((f) => f.kind === kind && hitLine - f.line < 3);
+        if (!dup) mine.push({ path: String(absPath).split("/").slice(-2).join("/"), line: hitLine, kind, text: hitText });
         break;
       }
     }
@@ -51319,7 +51334,7 @@ function _agentDecisionFrameBlock(text, profile = _engineeringProfileWithAiInten
     //
     // 这是"写出来的代码用不了"最直接的一条机器原因。修法只有两条：把机器真接上，
     // 或者别再承诺它。先选后者——承诺一个不存在的能力，比没有这个能力糟得多。
-    lines.push(`🏁 收尾验收契约（harness 收尾**只机械核对两件事**：改过代码有没有真跑过验证、改过界面有没有浏览器验过；取证与运行/外部义务这几项没有任何门会核对、缺了也不会拦你，代价直接落在交付上。所以把它们当作任务的一部分提前做掉，别指望收尾有人提醒）：${_finishChecks.length ? _finishChecks.map((check, index) => `${index + 1}. ${check}`).join("；") + "；" : ""}改过代码就**自己跑一遍**本项目的构建/测试命令（没有任何东西会替你自动跑，也不会有失败报告自动送到你面前）——退出码非 0 就是结论——这条没过；退出码 0 只说明这条检查通过了，不等于用户要的事做成了，还要看真实输出和目标后置状态。确实做不到的项，收尾如实写明未完成及原因。`);
+    lines.push(`🏁 收尾验收契约（harness 收尾**只机械核对两件事**：改过代码有没有真跑过验证、改过界面有没有浏览器验过；取证与运行/外部义务这几项没有任何门会核对、缺了也不会拦你，代价直接落在交付上。所以把它们当作任务的一部分提前做掉，别指望收尾有人提醒）：${_finishChecks.length ? _finishChecks.map((check, index) => `${index + 1}. ${check}`).join("；") + "；" : ""}改过代码就**自己跑一遍**本项目的构建/测试命令（IDE 只会在你被提醒之后仍然不跑时兜底跑一次，兜出来的红字同样算你的账，收尾门本身不代跑、只记账）——退出码非 0 就是结论——这条没过；退出码 0 只说明这条检查通过了，不等于用户要的事做成了，还要看真实输出和目标后置状态。确实做不到的项，收尾如实写明未完成及原因。`);
   }
   return lines.join("\n");
 }
@@ -53290,7 +53305,7 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
     // 声明装载：画像说这轮要操作桌面/浏览器/抓包，就把那一族**加进**窗口。
     // 进签名，这样画像迟到落地（_applyLateIntentIfLanded）时会真的重算一次。
     const _granted = _profileGrantedTools(run.engineering);
-    const signature = `${run.mode || "agent"}:${run.mcpToolCache?.length || 0}`;
+    const signature = `${run.mode || "agent"}:${run.mcpToolCache?.length || 0}:${_granted.join(",")}`;
     if (signature === _toolProfileSignature) return false;
     _toolProfileSignature = signature;
     // **仍然不把画像传进 _selectInitialTools**：那条路会**裁剪**（分类器判错就把已经
@@ -57025,8 +57040,80 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
             + (run._uncheckedLangs && run._uncheckedLangs.size
               ? `本 run 改过的 ${[...run._uncheckedLangs].join("/")} 文件没有任何语言检查器在看（对应语言服务器没在运行），这条命令是那些改动**唯一**的正确性检查。`
               : "")
-            + `没有任何东西会替你跑：不跑就交付，等于把没编译过的代码交给用户。`);
+            + `不跑就交付，等于把没编译过的代码交给用户。`
+            + `IDE 只会在这之后你仍然不跑时兜底一次——那是兜底，不是你的默认路径。`);
         }
+      }
+
+      /*
+       * ── 兜底自动验证：模型被提醒过、仍然不验，harness 自己跑一次 ────────────────
+       *
+       * **这条改动了一条一直守着的不变量**（「发起方永远是模型，IDE 从不自己代跑」）。
+       * 是产品负责人两次点名要的：「验证那些各种内容明明就应该能帮我做」。所以它是
+       * owner 的决定，不是我判断那条不变量错了——原来的理由现在仍然成立，只是被更强的
+       * 一条盖过：智能体的宗旨是替用户把事做完。
+       *
+       * 当初拆掉自动验证是有真实事故的：`vhs demo.tape` 连着两次退 127，门却指示
+       * 「先读真实错误、定位并修掉根因」——而根因是没装 vhs。那次事故的三个成因今天
+       * 各有独立防线，逐条核实过：
+       *   · 126/127（验证器不存在）→ `_detectVerifyCmd` 先过 `_filterVerifyCmdSteps`
+       *     做存在性探测，跑不动的步骤根本不会进命令；全不可用则返回 null，这里不跑。
+       *   · 猜出来的命令 → 同一层过滤；`_verificationCommandsForStack` 只认项目自己声明的。
+       *   · 慢套件超时被当失败 → 结算走 `_toolExecutionSucceeded`，超时不盖绿章。
+       *
+       * 形态取最窄的一种，把原禁令真正在防的几件事都保住：
+       *   · **不是偷偷跑**：走 `_executeToolStep` —— 渲染真实终端卡片、过那道唯一的
+       *     授权检查点、输出进模型上下文。用户看得见，模型也知道跑过了。
+       *   · **不在收尾腿**：这里是刚落盘的这一批，不是 `_runAgenticLoop` 的收尾门。
+       *     「缺席只记账、永不制造回合去覆盖模型的收尾判断」那条仍然成立。
+       *   · **模型先说了算**：只有它已经被提醒过（verifyNudges ≥ 1）、又推进了实现却
+       *     依然没验时才兜底。不抢在模型判断之前。
+       *   · **不另开判据**：结算完全复用模型自跑那一套（_executionEvidenceFromTool +
+       *     verifierRecognized + _evidenceCertifies）。空跑的绿色照样不算验证。
+       *   · 每个 run 最多一次。
+       */
+      if (!run._autoVerifyRan && verifyNudges >= 1 && _live() && run.mode === "agent"
+          && _implOps > 0 && _verifiedAtImplOps < _implOps && body) {
+        run._autoVerifyRan = true;   // 先置位：无论成败都只兜底一次
+        try {
+          const _avCmd = await _detectVerifyCmd(root, _projectStacks.get(root) || null);
+          if (_avCmd && _live()) {
+            const _avCall = { type: "cmd", command: _avCmd, purpose: "verify", timeoutSecs: 600, _autoVerify: true };
+            const _avStep = _createToolStep(_avCall);
+            body.appendChild(_avStep);
+            _scroll();
+            const _avRes = await _executeToolStep(_avStep, _avCall, root, run);
+            _settleToolStep(_avStep, _avRes);
+            const _avOut = `${_avRes?.stdout || ""}\n${_avRes?.stderr || ""}\n${_avRes?.content || ""}`;
+            const _avEvi = _executionEvidenceFromTool(_avCall, _avRes, root);
+            if (run && _avEvi) {
+              const _rec = {
+                ..._avEvi,
+                purpose: "verify",
+                implementationVersion: _implOps,
+                verifierRecognized: _isRecognizedVerifierCommand(_avCmd, run?.stack) && !_verifierRanNoTests(_avOut),
+                ok: _toolExecutionSucceeded(_avCall, _avRes),
+              };
+              run._executionEvidence.push(_rec);
+              if (run._executionEvidence.length > 12) _evictExpendableEvidence(run._executionEvidence, _implOps);
+              // 授信判据和模型自跑那条**一模一样**：认结算好的证据，不认命令形态。
+              if (_evidenceCertifies(_rec, _implOps)) {
+                didVerify = true; verificationPassed = true; _verifiedAtImplOps = _implOps;
+                run._diagnosticBlock = "";
+                _editCounts.clear(); _churnNudged.clear();
+              }
+            }
+            // 结果按事实交回模型：绿了它不用再跑，红了 `_freshBuildFailure` 那套自修
+            // 循环照常接管。这里不新增任何一行判定逻辑。
+            const _avOk = _toolExecutionSucceeded(_avCall, _avRes);
+            messages.push({ role: "user", content: _ORCH_NOTE
+              + `[AUTO_VERIFY] 你改完之后没有跑验证，IDE 替你跑了一次 \`${_avCmd}\`（这是 harness 代跑的，不是你调的工具）：\n`
+              + (_stripAnsi(String(_avRes?.content || _avOut)) || "(无输出)").slice(0, 4000)
+              + (_avOk
+                ? `\n绿了——这一版的验证证据已经记上，别再重复跑同一条，继续往下做。`
+                : `\n**红了**：先修这个再谈交付。上面就是真实输出，按它定位，别猜。`) });
+          }
+        } catch { /* 兜底失败就是没兜底，绝不因此让这一轮跑不起来 */ }
       }
 
       // ── 改了界面就该看一眼：同样放在刚落盘那一下 ──────────────────────────────
