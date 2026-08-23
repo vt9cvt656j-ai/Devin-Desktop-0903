@@ -655,7 +655,7 @@ export function createLspManager(options) {
           // 先告诉服务器这个文档关了。不关的话它侧的句柄永远不释放（跨文件诊断会给
           // 一堆没打开的文件建惰性 model，几十个之后是实打实的内存），而且下次同名
           // didOpen 会因为 openDocs 里已经有它而被当成 no-op。
-          try { clients.get(m.getLanguageId())?.didClose(uri); } catch { /* 服务器没了就算了 */ }
+          try { clients.get(lspLangOf(m))?.didClose(uri); } catch { /* 服务器没了就算了 */ }
           m.dispose();
         }
       } catch { /* 已经没了就算了 */ }
@@ -694,9 +694,34 @@ export function createLspManager(options) {
     return MANAGED_LANGS.includes(langId);
   }
 
+  /*
+   * 这个 model 该交给哪个语言服务器。
+   *
+   * 多数时候就是 Monaco 的 languageId，但 `.vue` 是个例外：客户端把它映射成 html
+   * （extLang 里写死的），于是 Monaco 里**根本不存在 "vue" 这个 languageId**——后端
+   * KNOWN_SERVERS 里那条 vue-language-server 登记项从来没有机会被启动过，整条链不可达。
+   *
+   * 不改那个映射是有意的：改了，.vue 就失去 HTML 的高亮和 html worker，而没装
+   * vue-language-server 的用户会**倒退**。所以只在 LSP 这一层按扩展名认它——高亮照旧，
+   * 装了 vue 服务器的人多拿到补全/跳转/诊断，没装的人和以前一模一样。
+   */
+  // 一份真相：扩展名 → { 交给哪个语言服务器, 它在 Monaco 里的 languageId }。
+  // 下面两处都从这里推（路由、provider 选择器），不要再各维护一张表——这个仓库已经
+  // 因为「手工维护的两份清单」栽过好几次。
+  const _EXT_LSP_LANG = {
+    vue: { lsp: "vue", monaco: "html" },
+  };
+  function lspLangOf(model, path = "") {
+    const p = String(path || (model && model.uri ? model.uri.toString() : ""));
+    const ext = (p.split(/[?#]/)[0].split(".").pop() || "").toLowerCase();
+    const mapped = _EXT_LSP_LANG[ext];
+    if (mapped) return mapped.lsp;
+    return model && model.getLanguageId ? model.getLanguageId() : "";
+  }
+
   function clientForModel(model) {
     if (!model) return null;
-    return clients.get(model.getLanguageId()) || null;
+    return clients.get(lspLangOf(model)) || null;
   }
 
   /**
@@ -924,7 +949,7 @@ export function createLspManager(options) {
   // ---- document lifecycle ----
   function didOpen(path, model) {
     if (!enabled || !model || typeof model.getLanguageId !== "function" || typeof model.getValue !== "function" || !model.uri) return;
-    const langId = model.getLanguageId();
+    const langId = lspLangOf(model, path);
     if (!isManaged(langId)) return;
     const uri = model.uri.toString();
     const docLang = DOC_LANGUAGE_ID[langId] || langId;
@@ -937,7 +962,7 @@ export function createLspManager(options) {
 
   function didChange(path, model) {
     if (!enabled || !model || typeof model.getLanguageId !== "function" || typeof model.getValue !== "function" || !model.uri) return;
-    const langId = model.getLanguageId();
+    const langId = lspLangOf(model, path);
     if (!isManaged(langId)) return;
     const client = clients.get(langId);
     if (!client || !client.initialized) return;
@@ -955,7 +980,7 @@ export function createLspManager(options) {
 
   function didSave(path, model) {
     if (!enabled || !model || typeof model.getLanguageId !== "function" || typeof model.getValue !== "function" || !model.uri) return;
-    const langId = model.getLanguageId();
+    const langId = lspLangOf(model, path);
     if (!isManaged(langId)) return;
     const client = clients.get(langId);
     if (!client) return;
@@ -1099,7 +1124,7 @@ export function createLspManager(options) {
     if (!enabled || !path) return null;
     const model = await lazilyCreateModel(pathToUri(path));
     if (!model) return null;
-    const langId = model.getLanguageId();
+    const langId = lspLangOf(model, path);
     if (!isManaged(langId)) return null;
     const client = await ensureServer(langId);
     if (!client || !client.initialized) return null;
@@ -1181,11 +1206,23 @@ export function createLspManager(options) {
   }
 
   // ---- Monaco provider registration ----
+  /*
+   * 编辑器里的补全/悬停/跳转注册在**Monaco 的 languageId** 上，而 .vue 的 languageId
+   * 是 "html"（见 lspLangOf 那段注释：故意不改，改了会让没装 vue 服务器的人倒退）。
+   * 所以选择器要额外带上 "html"——真正决定用不用得上语言服务器的是 clientForModel，
+   * 它走 lspLangOf：.vue 拿到 vue 客户端，真正的 .html 拿到 undefined 直接返回空，
+   * Monaco 自带的 html worker 照常出它自己的补全（多个 provider 是并存的）。
+   */
+  const PROVIDER_LANGS = [...new Set([
+    ...MANAGED_LANGS,
+    ...Object.values(_EXT_LSP_LANG).map((m) => m.monaco),
+  ])];
+
   function registerProviders() {
     if (!enabled) return;
     registerExecuteCommand();
 
-    monaco.languages.registerCompletionItemProvider(MANAGED_LANGS, {
+    monaco.languages.registerCompletionItemProvider(PROVIDER_LANGS, {
       triggerCharacters: [".", ":", ">", "<", "\"", "'", "/", "@", "(", "#", "$", "*", "&"],
       async provideCompletionItems(model, position, context) {
         let client = clientForModel(model);
@@ -1243,7 +1280,7 @@ export function createLspManager(options) {
       },
     });
 
-    monaco.languages.registerHoverProvider(MANAGED_LANGS, {
+    monaco.languages.registerHoverProvider(PROVIDER_LANGS, {
       async provideHover(model, position) {
         const client = clientForModel(model);
         if (!client || !client.supports("hover")) return null;
@@ -1259,7 +1296,7 @@ export function createLspManager(options) {
       },
     });
 
-    monaco.languages.registerDefinitionProvider(MANAGED_LANGS, {
+    monaco.languages.registerDefinitionProvider(PROVIDER_LANGS, {
       async provideDefinition(model, position) {
         const client = clientForModel(model);
         if (!client || !client.supports("definition")) return null;
@@ -1271,7 +1308,7 @@ export function createLspManager(options) {
       },
     });
 
-    monaco.languages.registerImplementationProvider(MANAGED_LANGS, {
+    monaco.languages.registerImplementationProvider(PROVIDER_LANGS, {
       async provideImplementation(model, position) {
         const client = clientForModel(model);
         if (!client || !client.supports("implementation")) return null;
@@ -1283,7 +1320,7 @@ export function createLspManager(options) {
       },
     });
 
-    monaco.languages.registerTypeDefinitionProvider(MANAGED_LANGS, {
+    monaco.languages.registerTypeDefinitionProvider(PROVIDER_LANGS, {
       async provideTypeDefinition(model, position) {
         const client = clientForModel(model);
         if (!client || !client.supports("typeDefinition")) return null;
@@ -1295,7 +1332,7 @@ export function createLspManager(options) {
       },
     });
 
-    monaco.languages.registerDeclarationProvider(MANAGED_LANGS, {
+    monaco.languages.registerDeclarationProvider(PROVIDER_LANGS, {
       async provideDeclaration(model, position) {
         const client = clientForModel(model);
         if (!client || !client.supports("declaration")) return null;
@@ -1307,7 +1344,7 @@ export function createLspManager(options) {
       },
     });
 
-    monaco.languages.registerReferenceProvider(MANAGED_LANGS, {
+    monaco.languages.registerReferenceProvider(PROVIDER_LANGS, {
       async provideReferences(model, position, context) {
         const client = clientForModel(model);
         if (!client || !client.supports("references")) return null;
@@ -1320,7 +1357,7 @@ export function createLspManager(options) {
       },
     });
 
-    monaco.languages.registerRenameProvider(MANAGED_LANGS, {
+    monaco.languages.registerRenameProvider(PROVIDER_LANGS, {
       async provideRenameEdits(model, position, newName) {
         const client = clientForModel(model);
         if (!client || !client.supports("rename")) {
@@ -1336,7 +1373,7 @@ export function createLspManager(options) {
       },
     });
 
-    monaco.languages.registerDocumentSymbolProvider(MANAGED_LANGS, {
+    monaco.languages.registerDocumentSymbolProvider(PROVIDER_LANGS, {
       async provideDocumentSymbols(model) {
         const client = clientForModel(model);
         if (!client || !client.supports("documentSymbol")) return [];
@@ -1347,7 +1384,7 @@ export function createLspManager(options) {
       },
     });
 
-    monaco.languages.registerSignatureHelpProvider(MANAGED_LANGS, {
+    monaco.languages.registerSignatureHelpProvider(PROVIDER_LANGS, {
       signatureHelpTriggerCharacters: ["(", ","],
       signatureHelpRetriggerCharacters: [")"],
       async provideSignatureHelp(model, position) {
@@ -1363,7 +1400,7 @@ export function createLspManager(options) {
       },
     });
 
-    monaco.languages.registerDocumentFormattingEditProvider(MANAGED_LANGS, {
+    monaco.languages.registerDocumentFormattingEditProvider(PROVIDER_LANGS, {
       async provideDocumentFormattingEdits(model, formatOptions) {
         const client = clientForModel(model);
         if (!client || !client.supports("formatting")) return [];
@@ -1381,7 +1418,7 @@ export function createLspManager(options) {
       },
     });
 
-    monaco.languages.registerCodeActionProvider(MANAGED_LANGS, {
+    monaco.languages.registerCodeActionProvider(PROVIDER_LANGS, {
       async provideCodeActions(model, range, context) {
         const client = clientForModel(model);
         if (!client || !client.supports("codeAction")) return { actions: [], dispose() {} };
@@ -1401,7 +1438,7 @@ export function createLspManager(options) {
       },
     });
 
-    monaco.languages.registerInlayHintsProvider(MANAGED_LANGS, {
+    monaco.languages.registerInlayHintsProvider(PROVIDER_LANGS, {
       async provideInlayHints(model, range) {
         const client = clientForModel(model);
         if (!client || !client.supports("inlayHint")) return { hints: [], dispose() {} };
@@ -1425,7 +1462,7 @@ export function createLspManager(options) {
     });
 
     // ---- CodeLens ----
-    monaco.languages.registerCodeLensProvider(MANAGED_LANGS, {
+    monaco.languages.registerCodeLensProvider(PROVIDER_LANGS, {
       async provideCodeLenses(model) {
         const client = clientForModel(model);
         if (!client || !client.supports("codeLens")) return { lenses: [], dispose() {} };
@@ -1467,7 +1504,7 @@ export function createLspManager(options) {
     });
 
     // ---- Document Highlight (highlight all occurrences of selected symbol) ----
-    monaco.languages.registerDocumentHighlightProvider(MANAGED_LANGS, {
+    monaco.languages.registerDocumentHighlightProvider(PROVIDER_LANGS, {
       async provideDocumentHighlights(model, position) {
         const client = clientForModel(model);
         if (!client || !client.supports("documentHighlight")) return [];
@@ -1486,7 +1523,7 @@ export function createLspManager(options) {
     });
 
     // ---- Color Provider (inline color swatches in CSS/code) ----
-    monaco.languages.registerColorProvider(MANAGED_LANGS, {
+    monaco.languages.registerColorProvider(PROVIDER_LANGS, {
       async provideDocumentColors(model) {
         const client = clientForModel(model);
         if (!client || !client.supports("colorProvider")) return [];
@@ -1527,7 +1564,7 @@ export function createLspManager(options) {
     });
 
     // ---- Linked Editing Ranges (rename HTML open/close tags together) ----
-    monaco.languages.registerLinkedEditingRangeProvider(MANAGED_LANGS, {
+    monaco.languages.registerLinkedEditingRangeProvider(PROVIDER_LANGS, {
       async provideLinkedEditingRanges(model, position) {
         const client = clientForModel(model);
         if (!client || !client.supports("linkedEditingRange")) return null;
@@ -1547,7 +1584,7 @@ export function createLspManager(options) {
     // 无答案时必须返回 null 而不是 []：注册了 provider 后，[] 是「确定没有可折叠
     // 区域」的正式答复，会顶掉 Monaco 的缩进折叠兜底——LSP 没起来/不支持
     // foldingRange 的语言从此一个折叠箭头都没有；null 才会回退到缩进折叠。
-    monaco.languages.registerFoldingRangeProvider(MANAGED_LANGS, {
+    monaco.languages.registerFoldingRangeProvider(PROVIDER_LANGS, {
       async provideFoldingRanges(model) {
         const client = clientForModel(model);
         if (!client || !client.supports("foldingRange")) return null;
@@ -1571,7 +1608,7 @@ export function createLspManager(options) {
 
     // ---- On-Type Formatting ----
     const onTypeCandidates = [";", "}", "\n", ":", ")"];
-    monaco.languages.registerOnTypeFormattingEditProvider(MANAGED_LANGS, {
+    monaco.languages.registerOnTypeFormattingEditProvider(PROVIDER_LANGS, {
       autoFormatTriggerCharacters: onTypeCandidates,
       async provideOnTypeFormattingEdits(model, position, ch, formatOptions) {
         const client = clientForModel(model);
@@ -1593,7 +1630,7 @@ export function createLspManager(options) {
     });
 
     // ---- Range Formatting ----
-    monaco.languages.registerDocumentRangeFormattingEditProvider(MANAGED_LANGS, {
+    monaco.languages.registerDocumentRangeFormattingEditProvider(PROVIDER_LANGS, {
       async provideDocumentRangeFormattingEdits(model, range, formatOptions) {
         const client = clientForModel(model);
         if (!client || !client.supports("rangeFormatting")) return [];
@@ -1617,7 +1654,7 @@ export function createLspManager(options) {
 
     // ---- Call Hierarchy (only if Monaco exposes the API) ----
     if (typeof monaco.languages.registerCallHierarchyProvider === "function") {
-      monaco.languages.registerCallHierarchyProvider(MANAGED_LANGS, {
+      monaco.languages.registerCallHierarchyProvider(PROVIDER_LANGS, {
         async prepareCallHierarchy(model, position) {
           const client = clientForModel(model);
           if (!client || !client.supports("callHierarchy")) return [];
@@ -1652,7 +1689,7 @@ export function createLspManager(options) {
     }
 
     // ---- Selection Range ----
-    monaco.languages.registerSelectionRangeProvider(MANAGED_LANGS, {
+    monaco.languages.registerSelectionRangeProvider(PROVIDER_LANGS, {
       async provideSelectionRanges(model, positions) {
         const client = clientForModel(model);
         if (!client || !client.supports("selectionRange")) return [];
@@ -1674,7 +1711,7 @@ export function createLspManager(options) {
     });
 
     // ---- Document Link ----
-    monaco.languages.registerLinkProvider(MANAGED_LANGS, {
+    monaco.languages.registerLinkProvider(PROVIDER_LANGS, {
       async provideLinks(model) {
         const client = clientForModel(model);
         if (!client || !client.supports("documentLink")) return { links: [] };
@@ -1998,7 +2035,7 @@ export function createLspManager(options) {
       const next = String(content ?? "");
       if (model.getValue() === next) return false;
       try { model.setValue(next); } catch { return false; }
-      const langId = model.getLanguageId();
+      const langId = lspLangOf(model, path);
       const client = clients.get(langId);
       if (client && client.initialized) {
         const uri = model.uri.toString();
