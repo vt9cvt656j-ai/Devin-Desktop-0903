@@ -13690,6 +13690,12 @@ async function loadBackendModels() {
         // 压成布尔的话，离线或网关旧版时按钮会集体消失，而那是"不知道"，不是"没有"。
         powerRouteAvailable:
           typeof it.power_route_available === "boolean" ? it.power_route_available : null,
+        // 运营方把这个模型标成免费（每日免费点数能买，不动钱包和会员额度）。
+        // 网关按**和计费同一条解析**下发（effective_billing_micro + paid_model_requires_balance），
+        // 客户端不自己按价格列猜 —— 单模型覆盖能把「三列价格全 0」的模型定成收费，
+        // 猜的话会标出一个点进去才发现扣钱的 free。
+        // 老网关不下发这个字段 → undefined → `=== true` 为假 → 不标，退回旧样子。
+        free: it.free === true,
         // 运维在网关里指定的开箱默认模型。老网关不下发这个字段 → 全 false → 沿用旧行为。
         isDefault: it.default === true,
         desc: it.description || "", group: label,
@@ -15791,11 +15797,18 @@ function buildModelMenu() {
       item.setAttribute("role", "option");
       item.dataset.modelId = m.id;
       const meta = m.meta ? `<span class="meta">${m.meta}</span>` : "";
-      const mark = active
-          ? `<svg class="check"><use href="#i-check" /></svg>`
-          : meta;
+      // free 徽标：运营方把这个模型标成免费（服务端按**和计费同一条解析**下发 `free`，
+      // 不是客户端猜的）。它和对勾是**两列**，不是二选一：
+      //   [图标] [名称] ……… [free] [对勾位]
+      // 对勾那一列固定占位（.menu__item .check-slot），所以没选中的行里 free 徽标也停在
+      // 同一个横坐标上，一列对齐 —— 用户要的就是这个。
+      const freeTag = m.free ? `<span class="free-tag">free</span>` : "";
       const b = brandFor(m);
-      item.innerHTML = `<svg class="ic ${b.cls}"><use href="#${b.sym}" /></svg><span class="name"></span>${mark}`;
+      item.innerHTML = `<svg class="ic ${b.cls}"><use href="#${b.sym}" /></svg>`
+        + `<span class="name"></span>`
+        + (active ? "" : meta)
+        + freeTag
+        + `<span class="check-slot">${active ? `<svg class="check"><use href="#i-check" /></svg>` : ""}</span>`;
       item.querySelector(".name").textContent = m.name || m.id;
       item.addEventListener("mouseenter", () => showModelInfoCard(m, item));
       const grpLabel = group.label;
@@ -15822,9 +15835,12 @@ function buildModelMenu() {
         item.className = "menu__item" + (active ? " is-active" : "");
         item.setAttribute("role", "option");
         item.dataset.modelId = cm.id;
-        const mark = active ? `<svg class="check"><use href="#i-check" /></svg>` : "";
         const b = brandOf(cm.name); // 按真实模型名认品牌图标（claude-x → Anthropic …）
-        item.innerHTML = `<svg class="ic ${b.cls}"><use href="#${b.sym}" /></svg><span class="name"></span>${mark}`;
+        // 和上面网关模型同一套结构，对勾列一样固定占位，两组才对得齐。
+        // 自定义模型不标 free：那是用户自己的 key，收不收费我们不知道。
+        item.innerHTML = `<svg class="ic ${b.cls}"><use href="#${b.sym}" /></svg>`
+          + `<span class="name"></span>`
+          + `<span class="check-slot">${active ? `<svg class="check"><use href="#i-check" /></svg>` : ""}</span>`;
         item.querySelector(".name").textContent = cm.name;
         item.addEventListener("mouseenter", hideModelInfoCard);
         item.addEventListener("click", () => {

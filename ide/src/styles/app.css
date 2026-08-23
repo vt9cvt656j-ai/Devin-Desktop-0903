@@ -8370,6 +8370,36 @@ button.agent-plan__fold--toggle:focus-visible { outline: 2px solid #1a73e8; outl
   font-size: 11px;
   color: var(--text-dim);
 }
+/* free 徽标 + 固定宽的对勾列。
+   排布是 [图标] [名称] ……… [free] [对勾位]，两者是**两列**不是二选一。
+   对勾列固定占位，所以没选中的行里 free 徽标也停在同一个横坐标 —— 一列对齐。 */
+.menu__item .free-tag {
+  margin-left: auto;            /* 把它连同后面的对勾列一起顶到右侧 */
+  flex: none;
+  font-size: 10px;
+  font-weight: 600;
+  line-height: 1;
+  letter-spacing: .03em;
+  text-transform: uppercase;
+  padding: 3px 6px;
+  border-radius: 5px;
+  color: var(--ok, #2c6b4f);
+  background: color-mix(in srgb, var(--ok, #2c6b4f) 14%, transparent);
+}
+/* meta 已经带 margin-left:auto；两个都带的话 free 会被推到 meta 右边、离对勾更近，
+   顺序反而对。但 meta 和 free 同时出现时只需要一个自动外边距，否则中间会被均分开。 */
+.menu__item .meta + .free-tag { margin-left: 8px; }
+.menu__item .check-slot {
+  flex: none;
+  width: 15px;                  /* 和 .menu__item .ic 同宽，两端视觉对称 */
+  height: 15px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+/* 没有 free 徽标的行：对勾列自己顶到右边，否则它会紧贴名称。 */
+.menu__item .name + .check-slot,
+.menu__item .meta + .check-slot { margin-left: auto; }
 .menu__item.is-active {
   color: var(--accent);
 }

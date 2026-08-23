@@ -3056,6 +3056,19 @@ pub async fn list_for_client(State(state): State<AppState>) -> ApiResult<Json<se
                     .map(|(tokens, beta)| json!({ "tokens": tokens, "beta": beta }))
                     .collect()
             };
+            // 这个模型是不是免费的（每日免费点数能买、不动钱包和会员额度）。
+            //
+            // 走 `effective_billing_micro` + `paid_model_requires_balance`，和**准入门、
+            // 结算**同一条解析。另写一份「看价格列是不是都为 0」是不行的：单模型覆盖
+            // （model_billing）能把一条 billing_mode="rate"、三列价格全 0 的线路上的某个
+            // 模型定成 per_call 收费，只看连接列会把它标成免费，用户点进去才发现扣钱
+            // —— 那正是 M-8 那个洞的形状，不能在展示侧再犯一遍。
+            //
+            // 在 json! 外面算：宏里放不下块表达式（context_windows 那段同理）。
+            let is_free = {
+                let (eff_mode, eff_percall, _eff_free, _micro) = effective_billing_micro(m, &mid);
+                !paid_model_requires_balance(&eff_mode, eff_percall, m.rate, input_price, output_price)
+            };
             list.push(json!({
                 // Which route this model came from. Requests are resolved by model id
                 // (chat_completions), not by this — it is here so a caller can tell two
@@ -3070,6 +3083,14 @@ pub async fn list_for_client(State(state): State<AppState>) -> ApiResult<Json<se
                 // 按 model id 索引的目录，同一个 id 可能挂在好几条线路下，逐条判断会得出
                 // 一个取决于排序的随机答案。这个式子和派单那边的筛选条件必须是同一个。
                 "power_route_available": power_ids.contains(&mid),
+                // 这个模型是不是免费的（每日免费点数能买、不动钱包和会员额度）。
+                //
+                // 走 `effective_billing_micro` + `paid_model_requires_balance`，和**准入门、
+                // 结算**同一条解析。这里另写一份"看看价格列是不是都为 0"是不行的：单模型
+                // 覆盖（model_billing）能把一条 billing_mode="rate"、三个价格列全 0 的线路上
+                // 的某个模型定成 per_call 收费，只看连接列会把它标成免费，用户点进去才发现扣钱
+                // ——那正是 M-8 那个洞的形状，不能在展示侧再犯一遍。
+                "free": is_free,
                 // 新装客户端开箱选谁。运维在设置里指定（app_settings.default_model），
                 // 没指定就一个都不标、客户端沿用「取列表第一个」的旧行为。
                 //
@@ -16960,6 +16981,35 @@ mod audit_20260822_tests {
         assert!(
             pick < gate,
             "model id 的解析又跑到余额门后面去了：门判的和结算扣的不是同一个模型",
+        );
+    }
+
+    /// [billing-core-4] 目录里那个 `free` 标记必须和**计费**同源。
+    ///
+    /// 客户端拿它在模型菜单上画 free 徽标。如果这里另写一份「三列价格是不是都为 0」，
+    /// 就会和准入门/结算分家：单模型覆盖（model_billing）能把一条 billing_mode="rate"、
+    /// 三列价格全 0 的线路上的某个模型定成 per_call 收费 —— 只看连接列会把它标成免费，
+    /// 用户点进去才发现扣钱。那正是 M-8 那个洞的形状，展示侧不能再犯一遍。
+    #[test]
+    fn 目录里的免费标记要和计费同一条解析() {
+        let body = fn_body(&gateway_code(), "pub async fn list_for_client(");
+        assert!(
+            body.contains("effective_billing_micro(m, &mid)"),
+            "free 没有走单模型解析——覆盖定价的模型会被标成免费",
+        );
+        assert!(
+            body.contains("!paid_model_requires_balance(&eff_mode, eff_percall, m.rate, input_price, output_price)"),
+            "free 的判据和准入门不是同一个",
+        );
+        assert!(body.contains("\"free\": is_free,"), "free 字段没有下发");
+        // 纯函数层再钉一次两个方向，免得判据被人反过来写。
+        assert!(
+            !super::paid_model_requires_balance("rate", 0, 0.0, 0.0, 0.0),
+            "三列全 0 且非 per_call 才是真免费",
+        );
+        assert!(
+            super::paid_model_requires_balance("per_call", 50, 0.0, 0.0, 0.0),
+            "单模型覆盖成 per_call 50 分的，绝不能标成 free",
         );
     }
 
