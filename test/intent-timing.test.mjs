@@ -365,8 +365,11 @@ test("角色计划第一轮就要到，但只当指路用——闸门仍然只�
                         CODE.indexOf("async function _fastRoutingFlags(") + 4200);
   assert.match(fn, /orchestrationMode 不是 solo 时，再给 roleNeeds/,
     "快通道没问角色——第一轮就不知道该派谁");
-  assert.match(fn, /\.filter\(\(role\) => _AI_AGENT_ROLES\.has\(role\)\)/,
-    "角色名必须逐个对着目录校验：弱模型会编出目录里没有的角色");
+  // 逐个对目录校验这条不放，但"目录"是两处：内置角色表 + 用户自己声明的角色
+  // （_userRoleMap）。孪生的完整裁决分支一直是两处都认，快通道只认内置那一处，
+  // 于是同一个自定义角色"有时候认有时候不认"——最难查的那类不一致。
+  assert.match(fn, /\.filter\(\(role\) => _AI_AGENT_ROLES\.has\(role\) \|\| _userRoleMap\(\)\.has\(role\)\)/,
+    "角色名必须逐个对着目录校验（内置表 + 用户自定义两处都要认）");
   assert.match(fn, /profile\.orchestrationMode !== "solo" && Array\.isArray\(raw\.roleNeeds\)/,
     "solo 时不该带角色清单");
   assert.match(fn, /\[\.\.\.new Set\(roles\)\]\.slice\(0, 5\)/, "角色要去重并封顶，别让它列一长串");

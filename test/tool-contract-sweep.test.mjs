@@ -39,7 +39,7 @@ const EMPTY_CAPS = { tools: [], commands: [], disabled: [], errors: [] };
 function buildCatalog() {
   const build = new Function(
     "inTauri", "_applyCloudToolDescs", "_userCapabilities", "compileToolSchema", "_withoutDisabledTools",
-    `${extractFn("_withoutDisabledTools")}\n${extractFn("_buildAgentToolSchemas")}\n;return _buildAgentToolSchemas;`,
+    `${extractFn("_applyUserRoleEnums")}\n${extractFn("_withoutDisabledTools")}\n${extractFn("_buildAgentToolSchemas")}\n;return _buildAgentToolSchemas;`,
   )(true, (t) => t, () => EMPTY_CAPS, compileToolSchema, undefined);
   return build(true, []);
 }

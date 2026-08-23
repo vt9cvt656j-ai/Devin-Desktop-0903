@@ -168,7 +168,7 @@ function buildRegisteredToolSchemas() {
     "_userCapabilities",
     "compileToolSchema",
     "_withoutDisabledTools",
-    `${extractFn("_buildAgentToolSchemas")}\n;return _buildAgentToolSchemas;`,
+    `${extractFn("_applyUserRoleEnums")}\n${extractFn("_buildAgentToolSchemas")}\n;return _buildAgentToolSchemas;`,
   )(
     true,
     (tools) => tools,
@@ -18598,7 +18598,10 @@ test("推断出的外部研究偏好永远不会让静默收尾多补一个回�
     "静默收尾不能再基于分类器预测的研究要求记账");
   assert.doesNotMatch(loop, /_pushNudge\("researchEvidence"/,
     "inferred research preferences must not force another model request");
-  assert.match(loop, /_researchEvidenceCategory\(it\.tc\.name, it\.call, it\.rawResult\)/,
+  // 前三个参数钉死不放：证据只能取自**实际完成**的工具结果（名字/调用/原始返回）。
+  // 尾参放开是因为官方站点判据已从 33 域硬编码常量改成逐包事实（registry 声明的
+  // homepage/repository + 工作区白名单），会以第四个参数传进来；那不改变本条不变量。
+  assert.match(loop, /_researchEvidenceCategory\(it\.tc\.name, it\.call, it\.rawResult[,)]/,
     "证据必须来自实际完成的工具结果");
 });
 
