@@ -13878,6 +13878,13 @@ test("implementation grounding is advisory and only a real prior failure stops a
   const batchBlock = load("_implementationMutationBatchBlockResult", {
     _implementationMutationCandidate: candidate,
     _toolExecutionSucceeded: succeeds,
+      // 门拦和真失败要分开说给模型听（前者不存在「失败输出」可读），所以这两个函数现在
+      // 引用了 _isPreExecutionBlock。注入清单是手工的：漏一处就是运行时 ReferenceError。
+      _isPreExecutionBlock: load("_isPreExecutionBlock", {
+        _PRE_EXECUTION_BLOCK_CODES: new Set([
+          "plan_first", "tech_research", "read_before_edit", "mutation_batch", "command_batch",
+        ]),
+      }),
   });
   const mutationAdvice = load("_debugMutationBlockResult", {
     // 用真正的 _debugMutationCandidate，不再拿实现侧那份冒充——
@@ -22202,9 +22209,6 @@ test("offered choices and run-state suggestions merge into one 接下来 block",
     document: { createElement: mkEl, createTextNode: (v) => ({ nodeType: 3, textContent: String(v) }) },
     _NS_SPARK: "<svg/>", _NS_ARROW: "<svg/>", _NEXT_STEPS_MAX: 4,
     _appendTextWithInlineCode: (el, text) => { el.textContent = String(text); },
-    // 建议文案现在会先拆成「动作 + 补充」两层。替身少一个依赖的话，渲染会在 try/catch 里
-    // 静默抛掉，现象是「一张卡片都没有」—— 和真的没渲染分不出来。
-    _splitSuggestionText: (t) => ({ main: String(t || ""), sub: "" }),
     sendPrompt() {}, _currentSession: () => null, _chatFollow() {},
   };
   const render = load("_renderSuggestionChips", deps);
@@ -23762,6 +23766,13 @@ test("同一轮里前面的命令失败，后面的命令不许再跑", () => {
     // 桩要是把 null 判成成功，`rawResult != null` 那道检查就测不到了（第一版就是这么假绿的）。
     _toolExecutionSucceeded: (call, res) => !!res && res.ok !== false,
     _callIsReadOnlyCommand: (c) => /^(?:which|ls|cat|echo|pwd)\b/.test(String(c.command || "")),
+      // 门拦和真失败要分开说给模型听（前者不存在「失败输出」可读），所以这两个函数现在
+      // 引用了 _isPreExecutionBlock。注入清单是手工的：漏一处就是运行时 ReferenceError。
+      _isPreExecutionBlock: load("_isPreExecutionBlock", {
+        _PRE_EXECUTION_BLOCK_CODES: new Set([
+          "plan_first", "tech_research", "read_before_edit", "mutation_batch", "command_batch",
+        ]),
+      }),
   });
   const run = { mode: "agent" };
   const item = (command, ok) => ({ call: { type: "cmd", command }, rawResult: ok === undefined ? null : { ok } });
@@ -28531,66 +28542,39 @@ test("每条回复底下的操作条：五个按钮，全部走委托", () => {
     "挂到 wrap 上了——那是 flex row，会跑到头像右边去，而不是正文底下");
 });
 
-test("「接下来」卡片内部：三列栅格，长内容分两层，左边缘对齐", () => {
+test("「接下来」卡片内部：一行一句话，不堆盒子", () => {
   /*
-   * 内容居中试过，不好看 —— 长短不一的一列动作项居中之后每行起点都在跳，
-   * 读起来像散落的标签而不是一份清单。列表就该左对齐。
-   *
-   * 现在卡片内部是三列栅格 [序号][内容][箭头]：
-   *   · 栅格而不是 flex，换行后的第二行才会和第一行对齐，不滑到序号底下；
-   *   · 副行（补充说明）必须在**内容那一列里面**，否则它会占掉第三列、
-   *     把箭头挤到下一行 —— 实测出现过「箭头掉到左下角、正文和副行左右分家」；
-   *   · 序号安静下来：原来是填色蓝药丸，眼睛先被序号吸走，而它是这里最不重要的信息。
+   * 这一块改了三版，把取舍记下来免得再绕回去：
+   *   v1 内容水平居中 —— 长短不一的动作项居中之后每行起点都在跳，像散落的标签；
+   *   v2 三列栅格 [序号][正文][箭头] + 长句拆「动作/补充」两层 —— 更糟：每行一个灰盒子
+   *      序号 + 若干灰盒子代码 + 灰卡片，盒中盒糊成一团；有的卡有副行有的没有，高度参差；
+   *   v3（现在）做减法：两列 [正文][箭头]，序号不画，代码不填底。
+   * 外壳本来就好看，里面需要的是**少**，不是多。
    */
   const chip = APP_CSS_CODE.match(/\.next-steps__chip \{([^}]*)\}/);
   assert.ok(chip, ".next-steps__chip 规则不见了");
-  assert.match(chip[1], /display:\s*grid/, "又不是栅格了——换行的第二行会滑到序号底下");
-  assert.match(chip[1], /grid-template-columns:\s*auto minmax\(0, 1fr\) auto/,
-    "三列结构变了（序号 / 内容 / 箭头）");
+  assert.match(chip[1], /grid-template-columns:\s*minmax\(0, 1fr\) auto/, "不是 [正文][箭头] 两列了");
   assert.ok(!/justify-content:\s*center/.test(chip[1]), "又居中了——列表该左对齐");
-  assert.match(chip[1], /text-align:\s*left/, "文字不是左对齐");
 
-  // 内容列容器：正文和副行装在同一列，左边缘才对得齐。
-  assert.match(APP_CSS_CODE, /\.next-steps__body \{[^}]*min-width:\s*0/,
-    "内容列没有 min-width:0，长内容会把卡片撑破而不是换行");
-  const body = stripJsComments(extractFn("_renderSuggestionChips"));
-  assert.match(body, /querySelector\("\.next-steps__body"\)\.appendChild\(s2\)/,
-    "副行没放进内容列——它会占掉第三列，把箭头挤到下一行");
-  assert.ok(!/chip-t"\)\.after\(s2\)/.test(body), "副行又被插成栅格的兄弟了");
+  // 行内代码不许填底：一行里两三个灰药丸，整条建议被切成一段段。
+  const code = APP_CSS_CODE.match(/\.next-steps__code \{([^}]*)\}/);
+  assert.ok(code, ".next-steps__code 规则不见了");
+  assert.ok(!/background/.test(code[1]),
+    "行内代码又填底了——灰药丸落在灰卡片上是盒中盒，比不标记还难读");
+  assert.match(code[1], /font-family:\s*var\(--mono\)/, "代码没换等宽字体，和正文分不开");
 
-  // 箭头回到第三列，不再绝对定位。
-  const ar = APP_CSS_CODE.match(/\.next-steps__chip \.next-steps__arrow \{([^}]*)\}/);
-  assert.ok(!/position:\s*absolute/.test(ar[1]), "箭头还在绝对定位，栅格里不需要");
-
-  // 序号：不许再用强调色填底把眼睛抢走。
-  const badge = APP_CSS_CODE.match(/\.next-steps__badge \{([^}]*)\}/);
-  assert.ok(!/background:[^;]*--accent/.test(badge[1]),
-    "序号又用强调色填底了——它是这里最不重要的信息，不该压过动作本身");
+  // v2 那套盒子一个都不许回来。
+  for (const gone of ["next-steps__badge", "next-steps__sub", "next-steps__body"]) {
+    assert.ok(!APP_CSS_CODE.includes(gone), `${gone} 又回来了——那是 v2 的盒子堆`);
+  }
+  assert.ok(!/_splitSuggestionText/.test(stripJsComments(SRC)),
+    "长句拆两层又回来了——有的卡有副行有的没有，高度会参差");
+  assert.match(stripJsComments(extractFn("_renderSuggestionChips")),
+    /b\.innerHTML = '<span class="next-steps__chip-t"><\/span>' \+ _NS_ARROW/,
+    "卡片结构不是「一行正文 + 箭头」");
 });
 
-test("长建议拆成「动作 + 补充」两层，短的原样一行", () => {
-  // 一整行同一个字重时，长句是一堵墙，读者得自己找重点。只在两边都够实在时才拆，
-  // 短句拆开只会显得零碎。判据是纯长度，不看词义 —— 拆错最多是分行不好看，不改语义。
-  const split = load("_splitSuggestionText");
-  // 短句原样一行。**这条要能抓住「把长度下限整个删掉」** —— 删了之后短句会被拆成
-  // 两层，一张卡片上下两截各三四个字，比不拆还零碎（变异实测漏过一次：原来的用例
-  // 里短句都不含逗号，删掉下限也照样返回 sub:""，等于没验）。
-  assert.deepEqual(split("修复构建失败"), { main: "修复构建失败", sub: "" }, "短句不该拆");
-  // 这一条必须挑「**只有长度下限拦得住**」的形状：逗号前 6 字、逗号后 4 字，
-  // 正则本身是匹配的，全长 11 字 < 16 才被下限拦下。用「先做 1，再看」不行 ——
-  // 它逗号前只有 4 字，正则本来就不匹配，删掉下限照样返回 sub:""，等于没验（实测漏过）。
-  assert.deepEqual(split("先跑一遍测试，然后再说"), { main: "先跑一遍测试，然后再说", sub: "" },
-    "短句带逗号也不该拆——长度下限没了");
-  assert.deepEqual(split("跑一遍验证刚才的改动"), { main: "跑一遍验证刚才的改动", sub: "" });
-  assert.deepEqual(split("先把这两个改动小的做了，其他的等我看完再说"),
-    { main: "先把这两个改动小的做了", sub: "其他的等我看完再说" });
-  // 逗号后面太短就不拆——「…，好吗」分成两层比一行还难看。
-  assert.equal(split("帮我把依赖装好并验证一遍构建，谢谢").sub, "", "逗号后太短不该拆");
-  // 没有逗号的长句原样一行，靠两行封顶兜底。
-  assert.equal(split("跑 `npm run typecheck` 验证类型是不是全都绿了").sub, "");
-});
-
-test("「接下来」建议：不砍半句、反引号渲染成代码、序号让出行首", () => {
+test("「接下来」建议：不砍半句、反引号渲染成代码、序号不占正文", () => {
   /*
    * 三个毛病叠在一起，用户原话「看不全，而且要简单易懂」：
    *   1. `white-space: nowrap` + 省略号 —— 一行装不下就砍掉后半句，等于让人猜；
@@ -28621,12 +28605,10 @@ test("「接下来」建议：不砍半句、反引号渲染成代码、序号�
     "正文没走行内代码渲染");
   assert.ok(!/chip-t"\)\.textContent = (text|main)/.test(render), "正文还在用 textContent 直铺");
 
-  // 序号进徽标，不再拼进正文。
+  // 序号不再进正文，也不再画成徽标 —— 卡片的上下顺序本来就说明了「第几条」。
   const choices = stripJsComments(extractFn("_maybeRenderChoices"));
-  assert.match(choices, /badge: o\.label, label: o\.text \|\| o\.label/,
-    "序号还拼在正文前面");
+  assert.match(choices, /label: o\.text \|\| o\.label/, "序号又拼回正文了");
   assert.ok(!/o\.label \+ \(o\.text \? "、"/.test(choices), "又拼回 \"1、\" 了");
-  assert.match(APP_CSS_CODE, /\.next-steps__badge\s*\{/, "徽标没有样式");
 
   // 两行仍然放不下的极端长句，全文要留在 title 里。
   assert.match(stripJsComments(extractFn("_renderSuggestionChips")),
