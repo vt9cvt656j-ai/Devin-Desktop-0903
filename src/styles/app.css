@@ -5425,7 +5425,12 @@ img.settings-dropdown__avatar--filled { object-fit: cover; }
    砍掉后半句等于让人猜（用户原话「看不全」）。改成最多两行、按词/字换行；真有超长的
    （模型偶尔把整条命令塞进来）才在第二行末尾收省略号，全文留在 title 里。 */
 /* 正文一列。两行封顶，按字换行；换行后仍在这一列里，天然和第一行对齐。 */
-.next-steps__chip-t { min-width: 0; display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; line-clamp: 2; overflow: hidden; overflow-wrap: anywhere; word-break: break-word; }
+/* **不限行数。** 这里原来卡两行 —— 而这些建议是模型摆出来让用户挑的选项，截掉后半句
+   等于选项名都看不全（用户原话「内容都到外面了」：`…edit_file 唯…`、`…config 缓存语义 …`）。
+   实测用户面板宽度（367px）下的真实文案：两行 3/4 被截断，不限行数 0/4，而且「不限」
+   和「四行」的结果一模一样 —— 最长那条正好四行，整块只高了 78px。
+   上界不是靠这里的 clamp，是靠源头：`_detectChoiceOptions` 只收 140 字以内的选项。 */
+.next-steps__chip-t { min-width: 0; overflow-wrap: anywhere; word-break: break-word; }
 /* 行内代码：换字体 + 换颜色，**不填底**。
    填底的灰药丸在一张本来就是灰底的卡片上是盒中盒 —— 一行里出现两三个，整条建议就被
    切成一段段，比不标记还难读。等宽字体本身已经足够把它和中文正文区分开。 */
