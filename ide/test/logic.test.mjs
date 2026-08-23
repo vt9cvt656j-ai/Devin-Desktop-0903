@@ -28686,6 +28686,55 @@ test("非 JS/TS 项目：改完之后先把语言服务器拉起来，再说「�
     "每批改动那次调用没传去重集合");
 });
 
+test("画像声明要操作桌面/浏览器，就把那一族装进窗口——只加不减", () => {
+  /*
+   * 用户第一句：「我的桌面自动化工具不够强大」。查下来能力都在，是够不着：
+   * read_screen / ui_click / computer / screenshot / browser 全在开局窗口外，
+   * 而「桌面自动化律」逐个点名它们怎么用。裁决把 desktopAutomation 标成 true、
+   * 提示词长篇讲用法，模型手上一个都没有 —— 要先花一轮 search_tools 取 schema。
+   *
+   * `_selectInitialTools` 本来就收 profile 参数，但两个调用点传的都是 null，
+   * 因为带画像会让它**裁剪**（分类器判错就把已装载的挤掉，那是真事故）。
+   * 所以这里走一条**纯加法**的独立通路：判错的代价从「工具没了」降成「多带几 KB」。
+   */
+  // 常量表要一起注入：load() 只搬函数声明，它引用的模块级常量不会跟着来
+  //（这个仓库里「手工维护的注入清单」踩过好几次）。
+  const _GRANTS = new Function(
+    `${/const _PROFILE_TOOL_GRANTS = \[[\s\S]*?\n\];/.exec(SRC)[0]}\n;return _PROFILE_TOOL_GRANTS;`)();
+  const grant = load("_profileGrantedTools", { _PROFILE_TOOL_GRANTS: _GRANTS });
+  assert.deepEqual(grant({}), [], "什么都没声明时不该平白多装工具");
+  assert.deepEqual(grant(null), [], "画像还没落地（null）时不该炸，也不该装");
+
+  const desktop = grant({ desktopAutomation: true });
+  for (const t of ["read_screen", "ui_click", "computer", "screenshot"]) {
+    assert.ok(desktop.includes(t), `声明了桌面自动化却没装 ${t}——律里点名了它`);
+  }
+  assert.ok(!desktop.includes("browser"), "桌面自动化不该顺手装 browser（它 12.5KB，最贵的一个）");
+
+  assert.deepEqual(grant({ browserGoal: "none" }), [], "browserGoal=none 不是声明");
+  assert.ok(grant({ browserGoal: "research" }).includes("browser"), "声明了浏览器目标却没装 browser");
+  assert.ok(grant({ capture: true }).includes("capture_start"), "声明了抓包却没装 capture_start");
+  // deliverySurface=automation 是另一条同义声明（_ideSemanticProfile 里就是这么并的）。
+  assert.ok(grant({ deliverySurface: "automation" }).includes("read_screen"));
+
+  // 装的名字必须真的在注册表里，否则是往窗口里塞空气。
+  const src = SRC;
+  for (const t of ["read_screen", "ui_click", "computer", "screenshot", "browser", "capture_start"]) {
+    assert.ok(src.includes(`name: "${t}"`), `${t} 不在工具注册表里——授予表写了一个不存在的名字`);
+  }
+
+  // 同步钩子：声明要进签名（否则画像迟到落地时不会重算），而且**只能加不能减**。
+  const sync = stripJsComments(SRC.slice(SRC.indexOf("const _syncAgentToolWindowToProfile = ()")));
+  assert.match(sync.slice(0, 2200), /_profileGrantedTools\(run\.engineering\)/,
+    "同步钩子没有读画像声明");
+  assert.match(sync.slice(0, 2200), /:\$\{_granted\.join\(","\)\}/,
+    "声明没进签名——画像迟到落地时窗口不会重算，等于没装");
+  assert.match(sync.slice(0, 2200), /desired\.push\(schema\)/, "不是加法（没有 push）");
+  // 绝不能改成把画像传进 _selectInitialTools —— 那条路会裁剪。
+  assert.ok(!/_selectInitialTools\(true, run\._originalText, run\.mcpToolCache, run\.mode, run\.engineering/.test(sync),
+    "把画像传进 _selectInitialTools 了——那会让分类器判错时把已装载的工具挤掉");
+});
+
 test("harness 点名的工具必须在手里：盯着用户做完没的那个", () => {
   /*
    * 仓库自己已经三次为同一条理由破例（run_subagent 那族实测 939 回合 0 次调用、
@@ -30757,7 +30806,14 @@ test("只读子体的人格提示词与它真实的工具集对得上", () => {
   const prompt = /const _SUBAGENT_SYSTEM = _P\("subagent_system", `[\s\S]*?`\);/.exec(SRC);
   assert.ok(prompt, "_SUBAGENT_SYSTEM 改名或挪走了");
   const text = prompt[0];
-  assert.ok(!/browser/.test(text), "提示词还在让它用 browser —— 它没有这个工具，一调就是 [BLOCKED]");
+  // 原来禁的是**词**：`!/browser/.test(text)`。它要守的性质是「别让它去用一个自己没有的工具」，
+  // 可同一个词也可以用来**正面告诉它这条边界**——而那正是缺的：这个边界一直是真的
+  // （只读集合里没有 browser），却从没有一句话说给模型听，于是它只能靠撞 [BLOCKED] 才知道。
+  // 断言改成按方向判：不许出现「去用 browser」，必须出现「你没有 browser」。
+  assert.doesNotMatch(text, /\buse (?:the )?browser\b|browser\s*\(/i,
+    "提示词还在让它用 browser —— 它没有这个工具，一调就是 [BLOCKED]");
+  assert.match(text, /you do not have the browser tool/,
+    "这条边界从没正面说给模型听，它只能靠撞 [BLOCKED] 才知道");
   assert.doesNotMatch(text, /run a command, or spawn a further subagent/,
     "又把它真有的两样能力说成禁止的了");
   assert.match(text, /run_cmd is available/, "没告诉它 run_cmd 可用，它就会绕远路或直接说做不到");

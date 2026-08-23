@@ -128,3 +128,57 @@ test("不许默默把用户要的东西换成自己认定的真问题", () => {
   assert.match(c, /quietly substituting your own reading for theirs is not/,
     "没点名这就是 silently substituting");
 });
+
+// ── 死副本里那些「活版本确实缺」的规则，接回来了没有 ────────────────
+//
+// 8 个 .txt 在服务端躺着，客户端 _P() 查找键 100% 落空（接口只对 admin 且 ?full=1 返回正文，
+// IDE 从不这么请求；生产 3495 次请求每次 body 恰好 54 字节，prompts 恒为空对象）。
+// 于是永远回落到 main.js 的内联版——而那份**不是死副本的超集**，两边各有独家内容。
+// 这里钉住的是「.txt 独有、活版本确实缺、且现在仍然正确」的那些，已经接进活版本。
+const inlineOf = (name) => {
+  const m = new RegExp("_P\\(\"" + name + "\",\\s*`([\\s\\S]*?)`\\)").exec(RAW_SRC);
+  assert.ok(m, `${name} 的内联版定位不到了`);
+  return m[1];
+};
+
+test("压缩摘要不再写死中文——它会替换掉真实历史成为之后每轮的上下文", () => {
+  const t = inlineOf("compact");
+  assert.doesNotMatch(t, /中文、分条/,
+    "写死中文：一场英文对话被压缩后，历史里躺着一段中文，直接顶撞 agent_core 和五个模式提示词里"
+    + "各写了一遍的「用与用户相同的语言，不要默认中文」");
+  assert.match(t, /用这段对话本身的语言/, "改了却没给替代说法");
+});
+
+test("worker 人格补上它此前一条都没有的操作规则", () => {
+  const t = inlineOf("worker_system");
+  // worker 拿到的只有 _WORKER_SYSTEM + scope，拿不到主智能体的决策框，所以这些必须写在人格里
+  assert.match(t, /Do not emit a huge file in one shot/, "死锁保护没了");
+  assert.match(t, /never to one that already exists/,
+    "少了那个关键区分——对已存在的文件「先写骨架」会把用户正在工作的代码截断成几十行");
+  assert.match(t, /carry on from it rather than/, "没说要承接主智能体已有的上下文");
+  assert.match(t, /watch for when integrating/, "交付里没有集成交接");
+  assert.match(t, /comes back as \[BLOCKED\]/, "没说清越界写会怎样");
+  assert.match(t, /run_cmd is not scope-limited/,
+    "没堵住用命令绕过 scope——这是唯一一条能绕开作用域的路");
+  assert.match(t, /belong to the main agent after every worker is done/,
+    "没说跨模块接线和最终集成归谁");
+});
+
+test("subagent 人格补上能力边界与检索纪律", () => {
+  const t = inlineOf("subagent_system");
+  assert.match(t, /two independent pieces of evidence/, "关键结论只要一条证据就下了");
+  assert.match(t, /Do not restate the task/, "没禁复述任务和开场白");
+  assert.match(t, /you do not have the browser tool/,
+    "这条边界一直是真的（只读集合里没有 browser），却从没说给模型听，它只能靠撞 [BLOCKED] 才知道");
+  assert.match(t, /Think, then look/, "缺了「先想清楚缺哪一块再检索」");
+  assert.match(t, /Follow the thread/, "缺了「顺着 import/调用/定义逐层追」");
+});
+
+test("项目摸底子体拿到可执行的判据和输出模板", () => {
+  const t = inlineOf("research_prompt");
+  assert.match(t, /技术栈只认清单文件和真实代码/, "技术栈还可以靠猜");
+  assert.match(t, /读全/, "关键文件可以只读开头几行");
+  assert.match(t, /## 目录地图/, "没有固定输出模板，交付形状随机");
+  assert.match(t, /## 常见改动入口/, "同上，六段模板不全");
+  assert.match(t, /不要只列文件名/, "会交回一份文件名清单");
+});

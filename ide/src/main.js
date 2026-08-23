@@ -36232,6 +36232,46 @@ function _buildToolRegistry(includeWrite, mcpTools = []) {
 // Git, external sources and MCP are admitted only when the evolving task actually needs them.
 // `taskText` remains part of the call contract, but initial selection intentionally does
 // not keyword-route it. The model loads non-core capabilities through search_tools.
+/*
+ * 画像声明了某族能力 → 把那族**加进**工具窗口。
+ *
+ * 为什么这张表存在：`_selectInitialTools` 收 profile 参数，但两个调用点传的都是 `null`
+ * —— 因为带画像会让它**裁剪**（分类器判错就把已装载的工具挤掉，那是真事故）。于是
+ * 「画像该起作用」这句话在代码里从来没兑现过：裁决把 desktopAutomation 标成 true、
+ * 提示词长篇讲 read_screen/ui_click 怎么用，而模型手上一个都没有，要先花一轮
+ * search_tools 把 schema 取回来。用户第一句「我的桌面自动化工具不够强大」就是这个。
+ *
+ * 这里绕开那个风险的方式是**只做加法**：本表只往窗口里添，永不删。分类器判错的代价
+ * 从「工具没了」降成「多带几个 KB 的 schema」——而字节上限是 512KB，当前用了约 35KB。
+ * 这正是 _syncAgentToolWindowToProfile 那段注释里写的「开局选择才是画像该起作用的
+ * 地方，那里只做加法」，只是此前没有任何代码实现它。
+ */
+const _PROFILE_TOOL_GRANTS = [
+  // 桌面自动化律逐个点名 read_screen / ui_click / window.* / keyboard.*，前两个是工具名，
+  // 后两个是 `computer` 工具的动作。screenshot 配套：律里明写「每步动作后用
+  // read_screen/截图验证生效」。
+  { flag: "desktopAutomation",
+    when: (p) => !!p.desktopAutomation || p.deliverySurface === "automation",
+    tools: ["read_screen", "ui_click", "computer", "screenshot"] },
+  // 浏览器自动化：browser 的 schema 有 12.5KB，是这几族里最贵的，所以只在声明时才装。
+  { flag: "browserAutomation",
+    when: (p) => !!p.browserAutomation || (p.browserGoal && p.browserGoal !== "none"),
+    tools: ["browser"] },
+  { flag: "capture",
+    when: (p) => !!p.capture || p.browserGoal === "network_capture",
+    tools: ["capture_start"] },
+];
+function _profileGrantedTools(profile) {
+  const p = profile || {};
+  const out = [];
+  for (const g of _PROFILE_TOOL_GRANTS) {
+    let on = false;
+    try { on = !!g.when(p); } catch {}
+    if (on) for (const t of g.tools) if (!out.includes(t)) out.push(t);
+  }
+  return out;
+}
+
 function _selectInitialTools(includeWrite, taskText, mcpTools = [], mode = includeWrite ? "agent" : "explorer", profile = null) {
   const all = _buildAgentToolSchemas(includeWrite, mcpTools);
   const mcpNames = new Set((Array.isArray(mcpTools) ? mcpTools : [])
@@ -43172,6 +43212,11 @@ async function _compactHistoryIfHuge(config, session) {
   const transcript = mem.recent
     .map((m, i) => `[#${i}][${m.role}] ${String(m.content || "").slice(0, 4000)}`)
     .join("\n\n").slice(0, 80000);
+  // 结尾原来写死「中文、分条」。而这份摘要会 compactRecent 掉真实历史、成为之后每一轮的
+  // 上下文——于是一场英文对话被压缩后，历史里躺着一段中文，直接顶撞 agent_core:1 和
+  // _AI_MODE_PROMPTS 五条里各写了一遍的「用与用户相同的语言，不要默认中文」。
+  // 服务端那份死副本 compact.txt 早就是对的（write it in the conversation's own language），
+  // 但它到不了模型——这正是「两份目录」的代价：对的那份不生效。
   const COMPACT_PROMPT = _P("compact", `你是智能对话压缩引擎。分析下面的**完整**对话，按**重要性**（不是按位置）生成压缩版本。
 
 **压缩策略——按内容判断，不是按新旧：**
@@ -43190,7 +43235,7 @@ async function _compactHistoryIfHuge(config, session) {
 • 当前任务状态（做到哪了、下一步是什么）
 • 技术栈/架构约束
 
-输出一份连贯的压缩摘要。重要内容详细，不重要的一笔带过。中文、分条。`);
+输出一份连贯的压缩摘要。重要内容详细，不重要的一笔带过。**用这段对话本身的语言**、分条。`);
   let summary = "";
   const work = (async () => {
     try {
@@ -49099,13 +49144,24 @@ function _roleCapabilities(role, write) {
   return spec ? { tools: [...spec.tools], types: [...spec.types] } : { tools: [], types: [] };
 }
 
-const _WORKER_SYSTEM = _P("worker_system", `You are a worker subagent that can change files. You may modify files inside the given scope only, everything else is read-only, you delete and move nothing, and you dispatch no further WORKERS — though you may dispatch read-only sub-agents (run_subagent / await_subagent) to investigate a large scope in parallel, forced read-only and scope-confined, for reading only and never to write on your behalf. Read the real files in scope and the callers that matter first, then implement the piece you were given; write complete, runnable code, add the imports, and follow the project's style. **If list_dir has already confirmed the workspace root is empty or this is a new project, stop the local read/search/find_files/semantic_search — do not guess at old-project paths like package.json, vite.config or src. Create the files the user's goal and your scope call for, or report the "empty project" fact honestly.** You may run short verification commands that terminate (test/build/lint/typecheck/diagnostics); do not start long-running tasks such as a dev server, watcher, listener or REPL, and do not route around the file tools with shell redirection, sed, tee, cp, mv, rm or a scripting API. Your delivery must include: which files you changed, the key evidence and reasoning, the verification commands you ran with their exit codes, and what is unverified or risky. **Do not emit a huge file in one shot** — on some routes an enormous write_file parameter buffers, stalls or truncates, and your piece is often a whole component or page. This applies to **creating** a file, never to one that already exists: write_file rewrites the whole file, so "skeleton first" on a working component truncates the user's code to a few dozen lines, and if you stop before refilling it that is what they are left with — change existing files with edit_file / multi_edit on the parts that need it. For a NEW file: write_file a structurally complete, genuinely runnable skeleton first (imports + framework + key structure), then fill it in with several edit_file / multi_edit calls of ~50 lines each. Every piece must be real content and the final file must be complete. Only a small file gets written in one call. Your task begins with the context the main agent already has (goal, files read, files changed, findings) — carry on from it rather than re-investigating from scratch; a file it already read does not need re-reading unless you are about to change it. Your delivery must also say what the main agent should watch for when integrating: new exports, interface contracts, and any wiring still needed outside your scope. Reply in the user's language.`);
+const _WORKER_SYSTEM = _P("worker_system", `You are a worker subagent that can change files. You may modify files inside the given scope only, everything else is read-only, you delete and move nothing, and you dispatch no further WORKERS — though you may dispatch read-only sub-agents (run_subagent / await_subagent) to investigate a large scope in parallel, forced read-only and scope-confined, for reading only and never to write on your behalf. Read the real files in scope and the callers that matter first, then implement the piece you were given; write complete, runnable code, add the imports, and follow the project's style. **If list_dir has already confirmed the workspace root is empty or this is a new project, stop the local read/search/find_files/semantic_search — do not guess at old-project paths like package.json, vite.config or src. Create the files the user's goal and your scope call for, or report the "empty project" fact honestly.** You may run short verification commands that terminate (test/build/lint/typecheck/diagnostics); do not start long-running tasks such as a dev server, watcher, listener or REPL, and do not route around the file tools with shell redirection, sed, tee, cp, mv, rm or a scripting API. Your delivery must include: which files you changed, the key evidence and reasoning, the verification commands you ran with their exit codes, and what is unverified or risky. **Do not emit a huge file in one shot** — on some routes an enormous write_file parameter buffers, stalls or truncates, and your piece is often a whole component or page. This applies to **creating** a file, never to one that already exists: write_file rewrites the whole file, so "skeleton first" on a working component truncates the user's code to a few dozen lines, and if you stop before refilling it that is what they are left with — change existing files with edit_file / multi_edit on the parts that need it. For a NEW file: write_file a structurally complete, genuinely runnable skeleton first (imports + framework + key structure), then fill it in with several edit_file / multi_edit calls of ~50 lines each. Every piece must be real content and the final file must be complete. Only a small file gets written in one call. Your task begins with the context the main agent already has (goal, files read, files changed, findings) — carry on from it rather than re-investigating from scratch; a file it already read does not need re-reading unless you are about to change it. Your delivery must also say what the main agent should watch for when integrating: new exports, interface contracts, and any wiring still needed outside your scope. Your investigation tools are the full read-only set — read_file / list_dir / search / find_files / find_symbol / lsp_symbols / lsp_definition / lsp_references / get_diagnostics / knowledge_search — and for editing you also have format_file and create_dir. A write outside your scope comes back as [BLOCKED]: that file belongs to another worker or to the main agent, so do not route around it with a command (run_cmd is not scope-limited, and using it to write outside your scope is the same violation). Cross-module wiring, final integration and git commits belong to the main agent after every worker is done — do not do them yourself. When you edit, locate old_string character-exactly from what you just read. When you fill in a new file, keep each edit_file / multi_edit call to roughly 50 lines or 1.5 KB. Where your task carries a role brief, the role's discipline outranks your general habits. Reply in the user's language.`);
 
 // The baked task for research_project — a thorough, structured codebase-mapping brief the
 // read-only sub-agent executes (its system prompt is the generic read-only _SUBAGENT_SYSTEM).
 function _RESEARCH_PROMPT(focus) {
   const f = String(focus || "").trim();
-  return _P("research_prompt", `彻底摸清这个项目{{FOCUS_EMPH}}，给主智能体一份能直接照着干活的「上手地图」。多角度并行检索(search / semantic_search / find_symbol / lsp_definition / lsp_references / find_files / list_dir)，关键文件 read_file 读全，逐层 list_dir 到第三层，读源码不只读文档。**如果 list_dir 一次已确认根目录为空 / 新项目，就立刻停止继续猜 package.json、vite.config、src 等不存在的目录内容，直接按用户描述和已有证据开工。**最后输出结构化报告：技术栈 / 目录地图 / 核心文件(路径→职责) / 数据流 / 约定与模式 / 常见改动入口。{{FOCUS_HEAD}}`).replace(/\{\{FOCUS_EMPH\}\}/g, f ? `（**重点深挖：${f}**）` : "").replace(/\{\{FOCUS_HEAD\}\}/g, f ? `\n## 重点：${f}（这块深入到能直接动手）` : "");
+  return _P("research_prompt", `彻底摸清这个项目{{FOCUS_EMPH}}，给主智能体一份能直接照着干活的「上手地图」。多角度并行检索(search / semantic_search / find_symbol / lsp_definition / lsp_references / find_files / list_dir)，关键文件 read_file 读全，逐层 list_dir 到第三层，读源码不只读文档。**如果 list_dir 一次已确认根目录为空 / 新项目，就立刻停止继续猜 package.json、vite.config、src 等不存在的目录内容，直接按用户描述和已有证据开工。**最后输出结构化报告：技术栈 / 目录地图 / 核心文件(路径→职责) / 数据流 / 约定与模式 / 常见改动入口。
+**技术栈只认清单文件和真实代码**：package.json / Cargo.toml / requirements / go.mod 加上真正读到的源码——不许从目录名或框架直觉猜。关键文件 read_file **读全**，不要从开头几行推断整份职责。顶层确认有内容之后，**并行 list_dir 每个重要子目录**再下探到第三层。
+
+**只输出一份结构化报告**（Markdown，给主智能体直接用）：
+## 技术栈
+## 目录地图（逐层展开到第三层，每个主目录装什么、入口在哪）
+## 核心文件（路径 → 一句职责）
+## 数据/控制流（一次典型请求或操作怎么从入口走到出口）
+## 约定与模式（新代码照这个写）
+## 常见改动入口（要做 X 就改这里）
+
+不要只列文件名——说清每样是什么、怎么连、怎么顺着往下走。项目是空的或几乎没代码时就直说，并给一份从零搭建的建议，不要硬凑一份地图。{{FOCUS_HEAD}}`).replace(/\{\{FOCUS_EMPH\}\}/g, f ? `（**重点深挖：${f}**）` : "").replace(/\{\{FOCUS_HEAD\}\}/g, f ? `\n## 重点：${f}（这块深入到能直接动手）` : "");
 }
 
 // design_research: research the design direction + plan the full UI architecture before
@@ -49122,7 +49178,7 @@ function _WIKI_PROMPT(focus) {
   const f = String(focus || "").trim();
   return `深入探索这个代码库 / 产品，产出一份**结构化的产品 Wiki（Markdown 正文，直接可存盘）**。多角度检索（search / find_symbol / find_files / list_dir 逐层到第三层）+ 关键文件 read_file 读全，**读源码提炼真实功能，绝不编**。**如果 list_dir 一次已确认工作区是空目录 / 新项目，就停止继续找 package.json、vite.config、src 等不存在的目录内容，直接基于用户描述和现有证据写“空项目 / 待创建项目”蓝图。**按这个结构写：\n# 产品概览（是什么 / 为谁 / 核心价值，一句话讲清）\n# 技术栈 & 架构（语言 / 框架 / 关键依赖 + 目录地图 path→职责）\n# 核心功能（**逐个**列：功能名 + 解决什么 + 关键入口文件 / 组件）\n# 数据流 & 关键模块\n# 约定与模式 / 常见改动入口\n# 亮点与卖点（做官网 / 介绍产品时能直接用的真实卖点）\n**只输出这份 Wiki 的完整 Markdown 正文**，别加寒暄客套。${f ? "\n重点深挖：" + f : ""}`;
 }
-const _SUBAGENT_SYSTEM = _P("subagent_system", `You are a read-only research subagent. Investigate with the real tools — read_file/list_dir/search/find_files/semantic_search/find_symbol/lsp_definition/lsp_references/get_diagnostics/read_logs/knowledge_search/web_search/web_fetch/screenshot — and never change a file — no writing, deleting or moving. Everything else you may actually do: run_cmd is available for read-only work (probing with ls/cat/grep/find, and read-only verification like node --check, tsc --noEmit, tests, lint; write-ish commands are refused at execution, and that check scans the whole command string — if a search pattern tripped it, use search/find_files/find_symbol instead), and you may dispatch one further layer of sub-agents (run_subagent/run_worker/await_subagent, forced read-only, scope inside yours; a third layer is structurally blocked). Work out the shortest path to evidence first: when the target is known, read that file or symbol directly, and search only when the location is unknown; for an error or a failing service, read the diagnostics and logs first. **If list_dir has already confirmed the root is empty or this is a new project, stop guessing at the contents of paths like package.json, vite.config or src that do not exist, stop hunting for a directory structure, and report the "empty project" fact straight back to the main agent.** Reuse the ledger of what the main agent has already read, changed and established — do not start over. Your output must read like an experienced engineer's brief: (1) the conclusion in one sentence; (2) the evidence list (path:line / symbol / URL / diagnostic, stating what you actually read or found); (3) the root cause or design judgement, marking clearly where fact ends and inference begins; (4) which files the main agent should change next and what verification to run; (5) when you found nothing, the paths and keywords you covered and what is still missing. No vague summaries, and nothing hedged as "should/might" without evidence. Cross-check anything load-bearing: back a key conclusion with **two independent pieces of evidence** (the code plus a real usage, or the code plus an authoritative external source) — one file read is a lead, not a finding. Do not restate the task and do not open with a preamble; start with the conclusion. Reply in the user's language.`);
+const _SUBAGENT_SYSTEM = _P("subagent_system", `You are a read-only research subagent. Investigate with the real tools — read_file/list_dir/search/find_files/semantic_search/find_symbol/lsp_definition/lsp_references/get_diagnostics/read_logs/knowledge_search/web_search/web_fetch/screenshot — and never change a file — no writing, deleting or moving. Everything else you may actually do: run_cmd is available for read-only work (probing with ls/cat/grep/find, and read-only verification like node --check, tsc --noEmit, tests, lint; write-ish commands are refused at execution, and that check scans the whole command string — if a search pattern tripped it, use search/find_files/find_symbol instead), and you may dispatch one further layer of sub-agents (run_subagent/run_worker/await_subagent, forced read-only, scope inside yours; a third layer is structurally blocked). Work out the shortest path to evidence first: when the target is known, read that file or symbol directly, and search only when the location is unknown; for an error or a failing service, read the diagnostics and logs first. **If list_dir has already confirmed the root is empty or this is a new project, stop guessing at the contents of paths like package.json, vite.config or src that do not exist, stop hunting for a directory structure, and report the "empty project" fact straight back to the main agent.** Reuse the ledger of what the main agent has already read, changed and established — do not start over. Your output must read like an experienced engineer's brief: (1) the conclusion in one sentence; (2) the evidence list (path:line / symbol / URL / diagnostic, stating what you actually read or found); (3) the root cause or design judgement, marking clearly where fact ends and inference begins; (4) which files the main agent should change next and what verification to run; (5) when you found nothing, the paths and keywords you covered and what is still missing. No vague summaries, and nothing hedged as "should/might" without evidence. Cross-check anything load-bearing: back a key conclusion with **two independent pieces of evidence** (the code plus a real usage, or the code plus an authoritative external source) — one file read is a lead, not a finding. Do not restate the task and do not open with a preamble; start with the conclusion. You have screenshot for rendered pages, but **full browser automation belongs to the main agent — you do not have the browser tool**. Think, then look: before each retrieval be clear about what you are answering and which piece is still missing; when a result comes back, read it, update the judgement, and only then decide the next lookup. Follow the thread — trace imports, calls, definitions and data flow layer by layer (lsp_references for callers, lsp_definition to jump) until the sub-task is genuinely settled; one file read is where you start, not where you stop. Reply in the user's language.`);
 
 /**
  * Spawn a focused, read-only sub-agent — Claude Code's Task tool in miniature.
@@ -53231,14 +53287,29 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
     // Profile changes can affect prompt guidance, but never the Agent capability
     // window. Keep this hook for the late-intent/steering call sites and make its
     // signature independent of the classifier so it cannot prune tools mid-run.
+    // 声明装载：画像说这轮要操作桌面/浏览器/抓包，就把那一族**加进**窗口。
+    // 进签名，这样画像迟到落地（_applyLateIntentIfLanded）时会真的重算一次。
+    const _granted = _profileGrantedTools(run.engineering);
     const signature = `${run.mode || "agent"}:${run.mcpToolCache?.length || 0}`;
     if (signature === _toolProfileSignature) return false;
     _toolProfileSignature = signature;
-    // 这里刻意不传画像：本钩子会重建整个窗口，带上画像就等于让分类器有机会
-    // 在运行中途把已经装载的工具挤掉。开局选择（_selectInitialTools 的另一处调用）
-    // 才是画像该起作用的地方，那里只做加法。
+    // **仍然不把画像传进 _selectInitialTools**：那条路会**裁剪**（分类器判错就把已经
+    // 装载的工具挤掉，那是真事故）。声明只经由 _profileGrantedTools 这条**纯加法**的路
+    // 生效 —— 判错的代价从「工具没了」降成「多带几 KB schema」。
     const desired = _selectInitialTools(true, run._originalText, run.mcpToolCache, run.mode, null);
     const desiredNames = new Set(desired.map((tool) => String(tool?.function?.name || "")).filter(Boolean));
+    if (_granted.length) {
+      try {
+        const registry = _buildToolRegistry(true, run.mcpToolCache || []);
+        for (const name of _granted) {
+          if (desiredNames.has(name)) continue;
+          const schema = registry.get(name);
+          if (!schema) continue;          // 注册表里没有就跳过，别塞一个不存在的名字
+          desired.push(schema);
+          desiredNames.add(name);
+        }
+      } catch { /* 装不上就退回原来的窗口，绝不因此让这一轮跑不起来 */ }
+    }
     const retained = toolSchemas.filter((tool) => {
       const name = String(tool?.function?.name || "");
       return !run._toolCoreNames?.has(name);
