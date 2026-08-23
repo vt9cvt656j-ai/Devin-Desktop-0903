@@ -117,8 +117,32 @@ test("a brand-new session waits, briefly and once, before sending an empty profi
 
   // 「画像还空吗」现在抽成了 _profileStillEmpty —— 因为快通道的**发送**要用同一个判据，
   // 而发送不该看 _intentWaitPaid（看了就会连发送一起被记账关掉）。两条性质分别钉住：
-  assert.match(SRC, /const _profileStillEmpty = !\(sess\._semanticProfileFlags \|\| \[\]\)\.length;/,
-    "「画像还空吗」必须仍然由 _semanticProfileFlags 决定，不能换成别的近似判据");
+  //
+  // 判据的**真源**从 _semanticProfileFlags 换成了 _semanticProfileFromModel。原因是执行事实
+  // 腿被提到第一发之前（按磁盘现状点亮 existing_project，零模型调用），那之后每个打开了
+  // 已有项目的会话，第 1 发结束时 flags 至少是 ["existing_project"] —— 于是第 2 发起
+  // 这道判据恒为假，**快通道整条会话再也不发车**。那正是本仓库记着「已经修好」的那个
+  // 117 轮全空的失效模式，从另一个变量上回来了。
+  //
+  // 要守的契约没变：判据只认**模型来源**的画像，纯磁盘事实不许冒充「模型判过了」。
+  assert.match(SRC, /const _profileStillEmpty = !sess\._semanticProfileFromModel;/,
+    "「画像还空吗」的真源被换掉了——换成 flags 会被执行事实腿污染，换成别的近似判据同理");
+  // 那一位只能由**模型来源**置：快通道落定、或完整裁决落定。
+  assert.match(SRC, /sess\._semanticProfileFromModel = true;/, "没有任何地方置这一位，快通道会每轮重发");
+  const fromModelSets = (SRC.match(/sess\._semanticProfileFromModel = true;/g) || []).length;
+  // 置位必须**有条件**：两条腿都没回时置了，就等于宣布「模型判过了」，
+  // 下一轮快通道不再发车——那和这次要修的回归是同一个形状，只是原因不同。
+  const setAt = SRC.indexOf("if (_routeSource) { try { sess._semanticProfileFromModel");
+  assert.ok(setAt > 0,
+    "完整裁决那侧的置位没有条件——_routeSource 为空（两条腿都没回）时也会置");
+  assert.equal(fromModelSets, 2,
+    `置位点有 ${fromModelSets} 处，应为 2（快通道落定 + 完整裁决落定）。`
+    + "多一处很可能就是又让某个非模型来源冒充了「模型判过了」");
+  // 执行事实腿绝不能置它——它一个模型调用都不需要。
+  const factAt = SRC.indexOf("_executionFactSemanticFlags({ root: _curRoot");
+  assert.ok(factAt > 0, "第一发的执行事实腿不见了");
+  assert.doesNotMatch(SRC.slice(factAt, factAt + 400), /_semanticProfileFromModel/,
+    "执行事实腿把自己标成了「模型判过了」——那就是这次要修的那个回归本身");
   const guard = /if \(_turnIntentState && _profileStillEmpty && !sess\._intentWaitPaid\) \{/;
   assert.match(SRC, guard,
     "the wait must be gated on the session having no flags yet AND not having paid already —"
