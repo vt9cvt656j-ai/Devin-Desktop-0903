@@ -28596,14 +28596,11 @@ test("「接下来」建议：不砍半句、反引号渲染成代码、序号�
     "拿模型输出拼 innerHTML 了——那是把模型的话当代码执行");
   assert.match(APP_CSS_CODE, /\.next-steps__code\s*\{/, "行内代码没有样式，会和正文糊在一起");
   // 函数写得再好，卡片不调用也是白搭 —— 这一环变异实测漏过。
-  // 钉的是「正文和副行都走行内代码渲染」这个**行为**，不是某一行的字面写法 ——
-  // 拆成主/副两层之后调用点变了，钉字面的话每次重排版都要跟着改，且容易钉成假的。
+  // 卡片正文必须走行内代码渲染，不能用 textContent 直铺（反引号会原样显示成字符）。
   const render = stripJsComments(extractFn("_renderSuggestionChips"));
-  assert.equal((render.match(/_appendTextWithInlineCode\(/g) || []).length, 2,
-    "正文和副行没有都走行内代码渲染——反引号会原样显示成字符");
-  assert.match(render, /_appendTextWithInlineCode\(b\.querySelector\("\.next-steps__chip-t"\), main\)/,
-    "正文没走行内代码渲染");
-  assert.ok(!/chip-t"\)\.textContent = (text|main)/.test(render), "正文还在用 textContent 直铺");
+  assert.match(render, /_appendTextWithInlineCode\(b\.querySelector\("\.next-steps__chip-t"\), text\)/,
+    "卡片正文没走行内代码渲染");
+  assert.ok(!/chip-t"\)\.textContent = text/.test(render), "正文还在用 textContent 直铺");
 
   // 序号不再进正文，也不再画成徽标 —— 卡片的上下顺序本来就说明了「第几条」。
   const choices = stripJsComments(extractFn("_maybeRenderChoices"));
