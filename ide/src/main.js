@@ -63221,6 +63221,12 @@ async function _executeToolStepInner(step, call, root, run) {
       _applyDiskContentToOpenFile(fp, old);
       let formatted = null;
       let _fmtUnanswered = "";
+      let _fmtDeadWhy = "";
+      try {
+        const _lid = _lintableLangId(fp.split("/").pop() || "");
+        const _why = _lid && lspManager?.lastStopReason ? lspManager.lastStopReason(_lid) : "";
+        if (_why) _fmtDeadWhy = `\n**这个语言的服务器是崩掉的，不是没装**：${_why}`;
+      } catch {}
       try { formatted = await (lspManager && lspManager.agentFormat ? lspManager.agentFormat(fp) : null); } catch {}
       // agentFormat 现在会用 { unanswered: true } 表示"没查成"（区别于"这语言没有格式化器"）。
       // 这个分支不是可选的：不摘出来，这个对象会一路走到 writeTextFileIfUnchanged，
@@ -63239,7 +63245,7 @@ async function _executeToolStepInner(step, call, root, run) {
       }
       if (formatted == null) {
         res.className = "atc-result atc-result--err"; res.textContent = "无格式化器";
-        return { type: "format", path: rel, content: `[无格式化服务] ${rel} 没有可用的语言格式化器。改用 run_cmd 跑 prettier / rustfmt / gofmt 等。` };
+        return { type: "format", path: rel, content: `[无格式化服务] ${rel} 没有可用的语言格式化器。改用 run_cmd 跑 prettier / rustfmt / gofmt 等。${_fmtDeadWhy}` };
       }
       if (formatted === old) {
         res.className = "atc-result atc-result--ok"; res.textContent = "已是规范格式";
@@ -63312,6 +63318,20 @@ async function _executeToolStepInner(step, call, root, run) {
       if (!rel) { res.className = "atc-result atc-result--err"; res.textContent = "空路径"; return { type: "lsp", path: call.op, content: "[ERROR] 空路径。" }; }
       const fp = _isAbsoluteFsPath(rel) ? _normalizeFsPath(rel) : _resolveRel(rel, lroot);
       call._evidenceRoot = _runEvidenceRoot(lroot, fp);
+      /*
+       * 这个语言的服务器如果是**崩掉**的，把死因带进回执。
+       *
+       * 没有它，四条「无 LSP」的回执都只会说「这个语言没有可用的 X 服务（可能未装）」——
+       * 而真相往往是装了、起来了、然后因为找不到 JDK / node 版本太老退了。模型照着
+       * 「可能未装」去装一遍，装完还是不行，来回几轮。死因在语言服务器的 stderr 里，
+       * 后端现在会把它随 stopped 事件带上来（lsp.rs 的 STDERR_TAIL_LINES）。
+       */
+      let _lspDeadWhy = "";
+      try {
+        const _lid = _lintableLangId(fp.split("/").pop() || "");
+        const _why = _lid && lspManager?.lastStopReason ? lspManager.lastStopReason(_lid) : "";
+        if (_why) _lspDeadWhy = `\n**这个语言的服务器是崩掉的，不是没装**：${_why}`;
+      } catch {}
       try {
         if (call.op === "symbols") {
           let syms = null;
@@ -63331,7 +63351,7 @@ async function _executeToolStepInner(step, call, root, run) {
                 `[ERROR] ${rel}：这次**没有查成**——语言服务超时或还在建索引（刚打开项目的头一分钟很常见）。`
                 + `\n**这不代表这个文件里没有符号。** 过一会儿再试一次，或者先用 read_file / search 看结构。` };
             }
-            return { type: "lsp", path: rel, content: syms ? `${rel} 未解析到符号。` : `[无 LSP] ${rel} 的语言没有可用的符号服务（可能未装语言服务器）。改用 read_file / search。` };
+            return { type: "lsp", path: rel, content: syms ? `${rel} 未解析到符号。` : `[无 LSP] ${rel} 的语言没有可用的符号服务（可能未装语言服务器）。改用 read_file / search。${_lspDeadWhy}` };
           }
           const lines = syms.map(s => `${"  ".repeat(Math.min(s.depth || 0, 6))}${s.kind ? "[" + s.kind + "] " : ""}${s.name}${s.line ? "  :" + s.line : ""}`);
           res.className = "atc-result atc-result--ok"; res.textContent = `${syms.length} 个符号`;
@@ -63390,7 +63410,7 @@ async function _executeToolStepInner(step, call, root, run) {
                 `[无结果] ${rel}:${line} 的「${sym}」拿不到悬停信息。已经试过语言服务和 TS worker 两条路，`
                 + `都没有——**换个位置或重试不会有不同结果**，别再试第二次。`
                 + `**这不代表这个符号不存在**，只代表当前这个文件类型没有可用的类型信息来源。`
-                + `\n第三方库的签名改用 package_source(package="包名", symbol="${sym}")；项目内的用 lsp_definition。` };
+                + `\n第三方库的签名改用 package_source(package="包名", symbol="${sym}")；项目内的用 lsp_definition。${_lspDeadWhy}` };
             }
             res.className = "atc-result atc-result--ok"; res.textContent = "已解析";
             if (vp) vp.innerHTML = `<pre>${_escHtml(String(hover).slice(0, 4000))}</pre>`;
@@ -63418,7 +63438,7 @@ async function _executeToolStepInner(step, call, root, run) {
           }
           if (!locs) {
             res.className = "atc-result atc-result--err"; res.textContent = "无 LSP";
-            return { type: "lsp", path: rel, content: `[无 LSP] ${rel} 的语言没有可用的${label}服务。改用 search。` };
+            return { type: "lsp", path: rel, content: `[无 LSP] ${rel} 的语言没有可用的${label}服务。改用 search。${_lspDeadWhy}` };
           }
           const seen = new Set(); const uniq = [];
           for (const l of locs) { const k = (l.path || "") + ":" + (l.line || ""); if (!seen.has(k)) { seen.add(k); uniq.push(l); } }
