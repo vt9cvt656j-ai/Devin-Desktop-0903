@@ -50947,68 +50947,87 @@ function _buildScenarioSignature(profile) {
   return sigs.join("_").slice(0, 180);
 }
 
-// 跨会话经验存储（localStorage）：写入一条记录。失败时附带自动分类的 failCategory
-// 和原始细节 failDetail（放宽到 200 字：截太短经常砍掉真正的错误原因）。
+// 跨会话工具经验：按 (场景签名, 工具) **聚合**存储，不是全局原始事件的环形缓冲。
+//
+// 旧结构的失败方式是结构性的：一份 **200 条的全局**数组要被所有场景签名和 141 个工具
+// 分摊，取用侧还要求"同一签名同一工具 ≥3 条"才产生任何信号。一个忙碌的下午就能把之前
+// 的记录全部挤光——于是喂给工具编排腿的"过往同类场景经验"这一块在真实使用里几乎恒为空。
+// 它偏偏是最该随时间变聪明的那条腿：它决定下一阶段装入哪些能力。
+//
+// 聚合之后每对 (sig, tool) 只占一条小记录：一个工具的历史不会因为别的工具忙而被挤掉，
+// 而计数是累加的（"这个工具在这类场景 45✓/3✗"），比 200 条原始事件能承载的多得多。
+// 判据本身一个字没改：仍然是"最近 3 次是不是全失败"，所以每条记录留最近 5 次成败。
+const _TOOL_EXP_KEY = "michael-ide.tool-experience";
+const _TOOL_EXP_MAX_ENTRIES = 600;   // (sig, tool) 对；每条约 80 字节
+const _TOOL_EXP_RECENT = 5;          // 判"最近 3 次全失败"只需要 3，留 5 是余量
+
+/** 读出聚合表；遇到 v1 的原始事件数组就地折叠迁移（不丢已有数据）。 */
+function _toolExpLoad() {
+  let raw;
+  try { raw = JSON.parse(localStorage.getItem(_TOOL_EXP_KEY) || "null"); } catch { return {}; }
+  if (!raw) return {};
+  // v1：[{sig, tool, ok, ts, failCategory, failDetail}, ...]
+  if (Array.isArray(raw)) {
+    const out = {};
+    for (const e of raw) {
+      if (!e || !e.tool) continue;
+      _toolExpFold(out, String(e.sig || "unknown"), String(e.tool), !!e.ok,
+        e.failCategory || (e.ok ? "" : _classifyToolFailure(e.failDetail || "")), Number(e.ts) || 0);
+    }
+    return out;
+  }
+  return raw && typeof raw.e === "object" && raw.e ? raw.e : {};
+}
+
+/** 把一次成败折进聚合表。cat 只在失败时有意义。 */
+function _toolExpFold(table, sig, tool, ok, cat, ts) {
+  const key = `${sig}\u0000${tool}`;
+  const cur = table[key] || { n: 0, ok: 0, ts: 0, cats: {}, r: [] };
+  cur.n++;
+  if (ok) cur.ok++;
+  else if (cat) cur.cats[cat] = (cur.cats[cat] || 0) + 1;
+  cur.ts = Math.max(cur.ts || 0, ts || 0);
+  cur.r.push(ok ? 1 : 0);
+  if (cur.r.length > _TOOL_EXP_RECENT) cur.r.splice(0, cur.r.length - _TOOL_EXP_RECENT);
+  table[key] = cur;
+  return table;
+}
+
 function _toolExpRecord(profileKeys, toolName, ok, failDetail = "") {
   try { _perfPhase("_toolExpRecord:localStorage"); } catch {}
   try {
+    if (!toolName) return;
     const sig = _buildScenarioSignature(profileKeys);
-    const rec = { sig, tool: toolName, ok, ts: Date.now() };
-    if (!ok) {
-      rec.failCategory = _classifyToolFailure(failDetail);
-      rec.failDetail = String(failDetail || "").slice(0, 200);
+    const table = _toolExpLoad();
+    _toolExpFold(table, sig, String(toolName), !!ok,
+      ok ? "" : _classifyToolFailure(failDetail), Date.now());
+    // 满了按最近使用时间淘汰整对，而不是像旧结构那样按写入顺序砍掉最老的**一条事件**：
+    // 后者会把一个工具的历史砍成半截，聚合计数于是无声地失真。
+    const keys = Object.keys(table);
+    if (keys.length > _TOOL_EXP_MAX_ENTRIES) {
+      keys.sort((a, b) => (table[a].ts || 0) - (table[b].ts || 0));
+      for (const k of keys.slice(0, keys.length - _TOOL_EXP_MAX_ENTRIES)) delete table[k];
     }
-    const key = "michael-ide.tool-experience";
-    let arr;
-    try { arr = JSON.parse(localStorage.getItem(key) || "[]") || []; } catch { return; }
-    arr.push(rec);
-    if (arr.length > 200) arr.shift();
-    localStorage.setItem(key, JSON.stringify(arr));
+    localStorage.setItem(_TOOL_EXP_KEY, JSON.stringify({ v: 2, e: table }));
   } catch {}
 }
 
-// 跨会话经验检索：用 sig 检索同类历史记录，聚合成经验文本（最多 8 条）
+// 跨会话经验检索：取同一场景签名下的聚合记录，拼成经验文本（最多 limit 条）
 function _toolExpRetrieve(profileKeys, limit = 8) {
   try { _perfPhase("_toolExpRetrieve:localStorage"); } catch {}
   try {
     const sig = _buildScenarioSignature(profileKeys);
-    const key = "michael-ide.tool-experience";
-    let arr;
-    try { arr = JSON.parse(localStorage.getItem(key) || "[]") || []; } catch { return ""; }
-    const matchings = arr.filter((e) => e.sig === sig).slice(-50); // recent same-sig history
-    if (matchings.length === 0) return "";
-    // 按 tool 分组——**不能把成败拆进 key**。
-    //
-    // 原来的分组键是 `${e.tool}|${e.ok ? "ok" : "fail"}`，于是 fail 桶里装的全是失败，
-    // 下面那句「最近 3 条全是失败」**恒真**：任何一个历史上失败过 3 次的工具都会被打上
-    // 「近期屡次失败」——哪怕它 45 次成功、3 次失败、最近 5 次全成。模型据此绕开一个
-    // 本来好用的工具，学到的是**反的**。注释写的是「连续失败」，代码算的不是。
-    //
-    // 正确判据：同一个工具的记录按时间排好，看**最近 3 条**是不是都失败。
-    const grouped = new Map();
-    for (const e of matchings) {
-      if (!grouped.has(e.tool)) grouped.set(e.tool, []);
-      grouped.get(e.tool).push(e);
+    const table = _toolExpLoad();
+    const prefix = `${sig}\u0000`;
+    const rows = [];
+    for (const [key, e] of Object.entries(table)) {
+      if (!key.startsWith(prefix) || !e) continue;
+      rows.push([key.slice(prefix.length), e]);
     }
-    const warnings = new Set();
-    for (const [toolName, items] of grouped) {
-      if (items.length < 3) continue;
-      const ordered = [...items].sort((a, b) => (Number(a.ts) || 0) - (Number(b.ts) || 0));
-      const tail = ordered.slice(-3);
-      if (tail.every((x) => !x.ok)) warnings.add(toolName);
-    }
-    // 按工具名聚合：总调用、成功、失败、失败类别分布、警告标记
-    const summary = new Map();
-    for (const e of matchings) {
-      if (!summary.has(e.tool)) summary.set(e.tool, { ok: 0, fail: 0, warned: warnings.has(e.tool), cats: new Map() });
-      const s = summary.get(e.tool);
-      if (e.ok) s.ok++;
-      else {
-        s.fail++;
-        const cat = e.failCategory || _classifyToolFailure(e.failDetail || "");
-        s.cats.set(cat, (s.cats.get(cat) || 0) + 1);
-      }
-    }
+    if (!rows.length) return "";
+    // 按最近用到的排前面：limit 砍掉的应该是最不相关的那些，而不是碰巧先写进表的。
+    rows.sort((a, b) => (b[1].ts || 0) - (a[1].ts || 0));
+
     // 失败类别 → 行动建议映射（事实+建议，不禁止；判断权在编排模型）
     const catAdvice = {
       not_found: "建议先确认文件/资源存在",
@@ -51018,14 +51037,23 @@ function _toolExpRetrieve(profileKeys, limit = 8) {
       network: "建议先确认网络/服务可达",
     };
     const lines = [];
-    for (const [tool, data] of summary) {
-      const warn = data.warned ? " ⚠️ 该工具在此类场景近期屡次失败，除非有新证据否则考虑替代方案" : "";
+    for (const [tool, e] of rows) {
+      const fail = Math.max(0, (e.n || 0) - (e.ok || 0));
+      // 警告判据一个字没改：**最近 3 次**是不是全失败。
+      //
+      // 这里要守住的老坑：曾经的分组键把成败拆进 key（`tool|ok` / `tool|fail`），于是
+      // fail 桶里装的全是失败，"最近 3 条全是失败"**恒真**——一个 45✓/3✗、最近 5 次全成
+      // 的工具照样被打上"近期屡次失败"，模型据此绕开一个本来好用的工具，学到的是反的。
+      const recent = Array.isArray(e.r) ? e.r : [];
+      const warned = recent.length >= 3 && recent.slice(-3).every((x) => !x);
+      const warn = warned ? " ⚠️ 该工具在此类场景近期屡次失败，除非有新证据否则考虑替代方案" : "";
       let catText = "";
-      if (data.fail > 0 && data.cats.size) {
-        const top = [...data.cats.entries()].sort((a, b) => b[1] - a[1])[0];
+      const cats = e.cats && typeof e.cats === "object" ? Object.entries(e.cats) : [];
+      if (fail > 0 && cats.length) {
+        const top = cats.sort((a, b) => b[1] - a[1])[0];
         catText = `（在此类场景 ${top[0]} 失败 ${top[1]} 次${catAdvice[top[0]] ? ` → ${catAdvice[top[0]]}` : ""}）`;
       }
-      lines.push(`${tool}: ${data.ok}✓/${data.fail}✗${catText}${warn}`);
+      lines.push(`${tool}: ${e.ok || 0}✓/${fail}✗${catText}${warn}`);
       if (lines.length >= limit) break;
     }
     return lines.join("\n");
