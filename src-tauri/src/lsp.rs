@@ -9,14 +9,21 @@ use tauri::State;
 
 use crate::process_util;
 
+/// 送到前端的事件。
+///
+/// `Error` 这一支以前是**声明了从来没构造过**的死变体（`#[allow(dead_code)]` 就是证据）：
+/// 语言服务器的 stderr 只进了 `tracing::debug!`，默认日志级别下谁都看不见。于是
+/// jdtls 因为找不到 JDK 起来就退、pyright 因为 node 版本太老崩掉，用户看到的都是
+/// 一句光秃秃的「已停止」，真正的原因被丢掉了。现在 stderr 走这一支上来，
+/// `Stopped` 也带上进程死前的最后几行。allow(dead_code) 一并撤掉——让编译器替我们
+/// 盯着这个变体别再变回死代码。
 #[derive(Serialize, Clone)]
 #[serde(tag = "kind", rename_all = "camelCase")]
-#[allow(dead_code)]
 pub enum LspEvent {
     Message { data: String },
     Started { lang: String },
     Error { message: String },
-    Stopped { lang: String },
+    Stopped { lang: String, tail: Vec<String> },
 }
 
 struct LspProcess {
@@ -322,6 +329,11 @@ pub fn lsp_start(
     let stdout = child.stdout.take().ok_or("no stdout")?;
     let stderr = child.stderr.take().ok_or("no stderr")?;
 
+    // 进程死前的最后几行 stderr —— 「java 停了」和「java 停了：找不到 JDK」的差别。
+    const STDERR_TAIL_LINES: usize = 12;
+    let stderr_tail = std::sync::Arc::new(Mutex::new(std::collections::VecDeque::<String>::new()));
+    let tail_for_stop = std::sync::Arc::clone(&stderr_tail);
+
     let (stdin_tx, stdin_rx) = std::sync::mpsc::channel::<String>();
 
     let mut stdin_handle = child.stdin.take().ok_or("no stdin")?;
@@ -362,16 +374,58 @@ pub fn lsp_start(
                 break;
             }
         }
-        let _ = evt.send(LspEvent::Stopped { lang });
+        // stdout EOF 是进程死掉的可靠信号，但 stderr 那边可能还没读完最后几行。
+        // 等一小下再取尾巴——不等的话，最能说明死因的那几行恰好赶不上这班车。
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        let tail = tail_for_stop
+            .lock()
+            .map(|t| t.iter().cloned().collect::<Vec<_>>())
+            .unwrap_or_default();
+        let _ = evt.send(LspEvent::Stopped { lang, tail });
     });
 
     let lang2 = config.lang.clone();
+    let evt_err = on_event.clone();
+    let tail2 = std::sync::Arc::clone(&stderr_tail);
     std::thread::spawn(move || {
         let reader = BufReader::new(stderr);
+        // 转发有上限：rust-analyzer / metals 这类会往 stderr 刷进度，全转会把前端的
+        // 日志缓冲冲垮。前 STDERR_FORWARD_MAX 行全转（启动失败必在这一段），之后只转
+        // 看着像错误的那些。环形缓冲不受上限影响——它要保证"死前最后几行"永远是最新的。
+        const STDERR_FORWARD_MAX: usize = 200;
+        let mut forwarded = 0usize;
         for line in reader.lines() {
-            match line {
-                Ok(l) => tracing::debug!("[lsp-{}] {}", lang2, l),
+            let l = match line {
+                Ok(l) => l,
                 Err(_) => break,
+            };
+            tracing::debug!("[lsp-{}] {}", lang2, l);
+            if let Ok(mut t) = tail2.lock() {
+                t.push_back(l.clone());
+                while t.len() > STDERR_TAIL_LINES {
+                    t.pop_front();
+                }
+            }
+            let looks_bad = {
+                let low = l.to_ascii_lowercase();
+                low.contains("error")
+                    || low.contains("exception")
+                    || low.contains("fatal")
+                    || low.contains("panic")
+                    || low.contains("not found")
+                    || low.contains("cannot find")
+                    || low.contains("traceback")
+            };
+            if forwarded < STDERR_FORWARD_MAX || looks_bad {
+                forwarded += 1;
+                if evt_err
+                    .send(LspEvent::Error {
+                        message: format!("[stderr] {}", l.chars().take(600).collect::<String>()),
+                    })
+                    .is_err()
+                {
+                    break;
+                }
             }
         }
     });

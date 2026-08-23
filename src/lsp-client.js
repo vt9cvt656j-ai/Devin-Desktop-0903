@@ -198,10 +198,15 @@ class LspClient {
       case "error":
         this.log(`[error] ${ev.message}`);
         break;
-      case "stopped":
+      case "stopped": {
+        // 后端会把进程死前的最后几行 stderr 一起带上来。没有它，用户看到的就是一句
+        // 光秃秃的「已停止」，而真正的原因（找不到 JDK、node 版本太老、缺依赖）被丢掉。
+        const tail = Array.isArray(ev.tail) ? ev.tail.filter(Boolean) : [];
         this.log(`[stopped] ${ev.lang}`);
-        this.manager._handleStopped(this.lang, this);
+        for (const line of tail) this.log(`[stopped:stderr] ${line}`);
+        this.manager._handleStopped(this.lang, this, tail);
         break;
+      }
       default:
         break;
     }
@@ -676,6 +681,9 @@ export function createLspManager(options) {
     return r ? pathToUri(r) : "";
   }
 
+  // langId -> 上一次非预期停止的原因（stderr 最后一行看着像错误的那句）。
+  const lastStopReason = new Map();
+
   function isManaged(langId) {
     return MANAGED_LANGS.includes(langId);
   }
@@ -685,11 +693,28 @@ export function createLspManager(options) {
     return clients.get(model.getLanguageId()) || null;
   }
 
-  function _handleStopped(langId, stoppedClient) {
+  /**
+   * 语言服务器停了。`tail` 是它死前最后几行 stderr —— 停止**原因**。
+   *
+   * 只在**非预期**停止时告诉用户：手动 stop / 重启换服务器不该弹提示。判据是这个
+   * 客户端还挂在 clients 上（stop() 会先摘掉它再关）。
+   */
+  function _handleStopped(langId, stoppedClient, tail = []) {
     const client = clients.get(langId);
     // The event belongs to the channel that emitted it. A final stopped event
     // from a manually replaced server must not remove the new client.
     if (!client || (stoppedClient && client !== stoppedClient)) return;
+    if (tail.length) {
+      // 挑最能说明问题的一行：优先看着像错误的那句，没有就用最后一行。
+      const bad = tail.filter((l) => /error|exception|fatal|panic|not found|cannot find|traceback/i.test(l));
+      const why = String(bad.length ? bad[bad.length - 1] : tail[tail.length - 1]).trim().slice(0, 180);
+      if (why) {
+        // 留给智能体：语言服务器死了之后，lsp_* 工具只会说「这个语言没有可用的服务」，
+        // 不说为什么。存下来，工具回执里带上——模型才知道该去装什么、修什么。
+        lastStopReason.set(langId, why);
+        showToast(`${langId} 语言服务已停止：${why}`);
+      }
+    }
     client.shutdown();
     clients.delete(langId);
     // Drop any debounced didChange still queued for this language: firing it after
@@ -742,6 +767,7 @@ export function createLspManager(options) {
     clients.set(langId, client);
     try {
       await client.start(custom);
+      lastStopReason.delete(langId); // 起来了，别再拿上一次的死因解释这一次
       // No success toast. A language server starting is routine background plumbing the user
       // did not ask for and cannot act on, and it fires again for every language a project
       // touches. The status bar already shows which servers are live ("LSP: python, shell"),
@@ -1873,6 +1899,9 @@ export function createLspManager(options) {
     },
     isRunning(langId) {
       return clients.has(langId);
+    },
+    lastStopReason(langId) {
+      return lastStopReason.get(langId) || "";
     },
     logFor(langId) {
       return clients.get(langId)?.logLines.join("\n") || "";

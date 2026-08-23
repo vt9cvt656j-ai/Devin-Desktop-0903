@@ -152,3 +152,57 @@ test("交付事实里那条引用查询，不许把「没查成」写成「查�
   assert.match(seg, /if \(!Array\.isArray\(_refs\)\) continue;/,
     "守卫没了 —— 「没查成」会被当成事实写进模型看的那个块");
 });
+
+// ── ④ 语言服务器死了，得说出为什么 ─────────────────────────────────────────
+//
+// `LspEvent::Error` 以前是**声明了从来没构造过**的死变体（枚举上挂着 #[allow(dead_code)]
+// 就是证据），语言服务器的 stderr 只进了 tracing::debug!，默认级别下谁都看不见。
+// 于是 jdtls 找不到 JDK 起来就退、pyright 因为 node 太老崩掉，用户看到的都是一句
+// 光秃秃的「已停止」，模型看到的是「这个语言没有可用的服务（可能未装）」——照着
+// 「可能未装」去装一遍，装完还是不行。
+const RS = readFileSync(new URL("../src-tauri/src/lsp.rs", import.meta.url), "utf8");
+
+test("stderr 要真的送上来，Error 这一支不许再是死变体", () => {
+  const en = RS.slice(RS.indexOf("pub enum LspEvent"), RS.indexOf("struct LspProcess"));
+  assert.ok(en.length > 50, "LspEvent 不见了");
+  assert.doesNotMatch(RS.slice(RS.indexOf("pub enum LspEvent") - 300, RS.indexOf("pub enum LspEvent")),
+    /#\[allow\(dead_code\)\]/,
+    "allow(dead_code) 又回来了 —— 那是这个变体从没被构造过的证据，撤掉它才能让编译器盯着");
+  assert.match(RS, /LspEvent::Error \{/, "Error 变体还是没有任何构造点");
+  // stderr 线程里构造，不是别处。
+  const th = RS.slice(RS.indexOf("let reader = BufReader::new(stderr);"), RS.indexOf("let _ = on_event.send(LspEvent::Started"));
+  // 钉真正的判据（那个 if 的条件），不钉出现过的词：改成 `if false {` 时
+  // STDERR_FORWARD_MAX / looks_bad / LspEvent::Error 三个词照样都在。
+  assert.match(th, /if forwarded < STDERR_FORWARD_MAX \|\| looks_bad \{/,
+    "转发的判据被改掉了 —— 有上限（别把前端日志缓冲刷爆）但错误行不受上限限制（崩溃常常发生在很久以后）");
+  assert.match(th, /LspEvent::Error \{/, "stderr 没有构造 Error 事件");
+});
+
+test("stopped 事件要带上死前的最后几行", () => {
+  assert.match(RS, /Stopped \{ lang: String, tail: Vec<String> \}/, "Stopped 没带 tail");
+  const stop = RS.slice(RS.indexOf("let tail = tail_for_stop"), RS.indexOf("LspEvent::Stopped { lang, tail }") + 40);
+  assert.ok(stop.length > 40, "取 tail 那段不见了");
+  const loop = RS.slice(RS.indexOf("let mut reader = BufReader::new(stdout);"), RS.indexOf("LspEvent::Stopped { lang, tail }"));
+  assert.match(loop, /sleep\(std::time::Duration::from_millis/,
+    "stdout EOF 之后没等 stderr 收尾 —— 最能说明死因的那几行恰好赶不上这班车");
+});
+
+test("前端把死因说给用户，也留给模型", () => {
+  const ev = LSP.slice(LSP.indexOf('case "stopped"'), LSP.indexOf('default:'));
+  assert.match(ev, /Array\.isArray\(ev\.tail\)/, "没接 tail");
+  assert.match(ev, /_handleStopped\(this\.lang, this, tail\)/, "tail 没往下传");
+
+  const h = LSP.slice(LSP.indexOf("function _handleStopped"), LSP.indexOf("async function ensureServer"));
+  assert.match(h, /showToast\(/, "用户那边一句话都没有");
+  assert.match(h, /lastStopReason\.set\(langId, why\)/, "没留给模型 —— 工具回执还是只会说「可能未装」");
+  // 起来了要清掉，否则拿上一次的失败解释这一次。
+  assert.match(LSP, /lastStopReason\.delete\(langId\)/, "启动成功后没清掉旧死因");
+
+  // 工具回执四条都要带上。
+  for (const anchor of ["没有可用的符号服务", "没有可用的${label}服务", "没有可用的语言格式化器", "项目内的用 lsp_definition"]) {
+    const i = MAIN.indexOf(anchor);
+    assert.ok(i > 0, `回执「${anchor}」不见了`);
+    const seg = MAIN.slice(i, i + 260);
+    assert.match(seg, /\$\{_(?:lsp|fmt)DeadWhy\}/, `「${anchor}」这条回执没带死因，模型还是只知道「可能未装」`);
+  }
+});
