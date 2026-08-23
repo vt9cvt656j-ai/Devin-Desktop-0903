@@ -28490,10 +28490,86 @@ test("切换模型不许改写历史消息的头像", () => {
     "又在切模型时批量重刷历史头像了——名字不会跟着变，会错配成「旧名字 + 新图标」");
   assert.doesNotMatch(src, /_setModelAvatar/,
     "selectModel 不该碰任何已渲染消息的头像");
-  // 渲染时按**当时**的 id 定头像和名字，这一条不能丢，否则新回复也没有正确图标。
+  // 渲染时按**这条消息自己**的 id 定头像和名字，这一条不能丢，否则新回复也没有正确图标。
   const add = stripJsComments(extractFn("addMessage"));
-  assert.match(add, /_setModelAvatar\(avatar, id\)/, "新回复渲染时没有按当时的模型设头像");
-  assert.match(add, /textContent = id \? modelLabel\(id\)/, "新回复渲染时没有按当时的模型写名字");
+  assert.match(add, /_setModelAvatar\(avatar, id\)/, "渲染时没有按这条消息的模型设头像");
+  assert.match(add, /textContent = id \? modelLabel\(id\)/, "渲染时没有按这条消息的模型写名字");
+});
+
+test("「这条是谁答的」要活着走完存盘→读回，且绝不上线", () => {
+  // 记下来没用，得能**活着回来**。这条链上任何一环做字段白名单，模型就悄悄丢了，
+  // 而现象和没修一模一样（重画后又变成当前模型）—— 所以走一遍真的往返，不靠推理。
+  const msg = { role: "assistant", content: "答案", reasoning: "想了想", model: "deepseek-v4-flash" };
+
+  // 1) 存进 memory：push 不做归一化，原样留住。
+  const memory = new ConversationMemory();
+  memory.push({ ...msg });
+  assert.equal(memory.transcriptEntries()[0].model, "deepseek-v4-flash", "push 之后就没了");
+
+  // 2) 序列化到 session.json / localStorage 这条路。
+  const persisted = serializeMessagesForPersistence(
+    memory.transcriptEntries(), { remaining: 1e9 }, { textBudget: { remaining: 1e9 } });
+  assert.equal(persisted[0].model, "deepseek-v4-flash", "存盘序列化把它摘掉了");
+
+  // 3) SQLite 日志走的是整条 JSON（Rust 侧 serde_json::to_string(message) 原样写），
+  //    这里把那一跳也走一遍，确认没有不可序列化的东西。
+  const roundTripped = JSON.parse(JSON.stringify(persisted[0]));
+  assert.equal(roundTripped.model, "deepseek-v4-flash", "JSON 往返丢了");
+
+  // 4) 反过来：它**绝不能**跟着请求上线。出线口是排除法不是白名单。
+  const sanitize = load("_sanitizeProviderMessages", {
+    _withoutLegacyReasoningSummary: (content) => content,
+    _wellFormedContent: (content) => content,
+    _stripLoneSurrogates: (text) => text,
+  });
+  const wire = sanitize([roundTripped])[0];
+  assert.ok(!("model" in wire), "展示用的 model 字段被当成协议字段发给上游了");
+  assert.ok(!("reasoning" in wire), "reasoning 也该在这儿摘掉（一起守住，免得改坏）");
+  assert.equal(wire.role, "assistant", "把该留的也摘了");
+  assert.equal(wire.content, "答案", "内容被弄丢了");
+});
+
+test("每条回复记住自己是哪个模型答的，重画历史不按当前选择重刷", () => {
+  /*
+   * 用户原话：「本来上面用各种不同模型聊天，他居然都是同一个模型，然后又变成了我现在
+   * 这个模型图标和模型名字」。
+   *
+   * 病根不在 selectModel（那处的批量重刷早就摘了），在 addMessage：助手行的头像和名字
+   * 一律取 `currentModel()`。于是**每一次重画历史**——切标签、往回翻页、HTML 快照失效后
+   * 从文本重建——都把所有历史助手行按当时选中的模型重刷一遍。
+   *
+   * 修法是把「这条是谁答的」当成消息的一部分存下来，渲染时读它。
+   */
+  const add = stripJsComments(extractFn("addMessage"));
+  // 判据必须是「调用方给没给这个键」，不能是真值：从历史重画时空串表示「这条记录里
+  // 没存过模型」，那是**已知的未知**，得画成中性身份；用 `||` 会把它塌回当前选择，
+  // 也就是原来那个错。
+  assert.match(add, /hasOwnProperty\.call\(options, "modelId"\)/,
+    "没有区分「历史重画」和「实时那一轮」——空模型会塌回 currentModel()，历史又被重刷");
+  assert.match(add, /: currentModel\(\);/,
+    "实时那一轮不该丢掉 currentModel() 兜底");
+
+  // 重画那条路必须**一直**传这个键（哪怕值是空串），否则上面的判据永远走不到。
+  const slice = stripJsComments(extractFn("_renderMsgRange"));
+  assert.match(slice, /modelId: m\.role === "assistant" \? String\(m\.model \|\| ""\) : ""/,
+    "从历史重画时没有把记录里的模型传给 addMessage");
+
+  // 落库：**每一处**会落进 memory 的助手消息都要记下本轮模型。
+  //
+  // 判据是完整性，不是数个数：`>= N` 挡不住「其中一处漏了」——变异实测真漏过。
+  // 漏掉的那条路径存出来的记录没有模型，重画时会退回中性身份，看起来像是修了一半。
+  const pushLines = stripJsComments(SRC).split("\n").filter((line) =>
+    /(?:sess|session)\.memory\.push\(/.test(line) && /role: "assistant"/.test(line));
+  assert.ok(pushLines.length >= 6,
+    `只找到 ${pushLines.length} 处助手落库（应有 6），锚点过时了或有路径被删——请核对后更新这里`);
+  for (const line of pushLines) {
+    assert.match(line, /model: config\.model \|\| ""/,
+      `这处助手落库没记模型：${line.trim().slice(0, 90)}…`);
+  }
+
+  // 展示用的记账不许上线。这里是**排除法**不是白名单，不显式摘就会原样发给上游。
+  const sanitize = stripJsComments(extractFn("_sanitizeProviderMessages"));
+  assert.match(sanitize, /model: _uiModelTag/, "展示用的 model 字段会被当成协议字段发给上游");
 });
 
 // ── 本轮统计行必须钉在最底部，不许一上一下 ─────────────────────────────────
