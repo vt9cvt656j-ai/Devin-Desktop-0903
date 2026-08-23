@@ -27413,6 +27413,7 @@ async function sendPrompt(text, attachments = [], readyConfig = null, opts = {})
     // 这道等待只决定「本轮第一发能不能带上旗标」；赢不了它不再等于丢掉——上面那个 .then 才是
     // 结果的归宿，循环边界会把迟到的旗标补进请求头。
     let _waitTimer = null;
+    const _waitStartedAt = Date.now();
     try {
       // 只把**真实的** promise 放进 race：Promise.race 会把 null 当成已兑现的值，
       // 立刻以 null 结束整场等待——那等于这道窗口从来没生效过。
@@ -27423,6 +27424,31 @@ async function sendPrompt(text, attachments = [], readyConfig = null, opts = {})
       ].filter((x) => x && typeof x.then === "function"));
     } catch {}
     if (_waitTimer) clearTimeout(_waitTimer);
+    // 快通道赢了这场 race，**不等于这场等待该结束**。
+    //
+    // 它只回四个枚举加一批布尔旗标，几秒就到；而 domain / architectureMode / researchMode
+    // 这三样只有完整裁决产得出——domain 决定要不要注入该领域语料，researchMode 决定动手前
+    // 要不要取证，architectureMode 决定按既有架构走还是设计新的。快通道一落定就把整场等待
+    // 退掉，于是**决定架构的那一发**永远只带着快通道那点旗标出门，完整裁决要等到本轮的
+    // 第二个模型回合才补进请求头——那时候栈和目录结构已经写完了。
+    //
+    // 这里不多花一分钱、也不多等一毫秒**预算**：`_FIRST_TURN_INTENT_WAIT_MS` 本来就是
+    // 已经决定要付的额度，今天只是被快通道提前退还了。把剩下那截继续等完即可。
+    // 上限仍是同一个常量，等不到照样往下走（迟到的旗标由循环边界的
+    // _applyLateIntentIfLanded / _applyFastRouteProfileIfLanded 补进去，行为闸门只认完整裁决）。
+    if (_turnIntentExactPromise && !_turnIntentState.settled) {
+      const _left = _FIRST_TURN_INTENT_WAIT_MS - (Date.now() - _waitStartedAt);
+      if (_left > 50) {
+        let _restTimer = null;
+        try {
+          await Promise.race([
+            _turnIntentExactPromise,
+            new Promise((resolve) => { _restTimer = setTimeout(resolve, _left); }),
+          ]);
+        } catch {}
+        if (_restTimer) clearTimeout(_restTimer);
+      }
+    }
     // 裁决落定即记账：零 flag 也算付过了。超时没落定的不记，下一轮还值得再等一次。
     // 付款按「等过一次」算，不按「等到了」算。
     //
@@ -73144,8 +73170,31 @@ let _intentPrefetchedText = "";
 // 成本不翻倍：_aiIntentProfile 自带缓存 + _aiIntentInflight 单飞去重，发送路径本来就优先
 // 复用同键的在途请求。净效果是把同一次调用**提前**，不是多发一次。
 // 用户改了字 → 键不同 → 预取作废，退回今天的行为，无害（epoch/key 守卫保证陈旧结果不会提交）。
+// 打字空闲时预热意图裁决。它的价值全在**会话第一条消息**上——那是唯一一条要付
+// `_FIRST_TURN_INTENT_WAIT_MS` 等待窗口的消息，而完整裁决实测健康时也要 6.9~7.6 秒
+// （见 _FIRST_TURN_INTENT_WAIT_MS 旁的实测记录），窗口是 6 秒，结构上接不住。
+// 预热之后，按下回车那一刻裁决通常已经在 `_aiIntentCache` 里，那道窗口只花几毫秒。
 function _prefetchIntentFromComposer() {
-  if (!inTauri || !_lastGoodAiConfig) return;              // 没跑过一轮就没有可复用的凭证
+  if (!inTauri) return;
+  // 凭证来源：跑过一轮就复用那一轮的，没跑过就读**持久化配置**。
+  //
+  // 原来这里只认 `_lastGoodAiConfig`，而它全仓只有一处写入——在 sendPrompt 内部。
+  // 也就是说：应用启动后的第一条消息，预热**一次都不会跑**——恰恰是唯一需要它的那条。
+  // 后果不是"慢一点"：那一发是决定技术栈和目录结构的一发，画像空掉的话，IDE 侧 2000 多
+  // 字符的工程律和网关侧 agent_engineering 整块（模块边界、反硬编码、优先用成熟主流方案）
+  // 全部不在场；等第二轮补上时，栈和目录已经写死了。
+  //
+  // 必须用 `loadConfig()`（纯读 `_cfgCache`）而**不是** `_readyAiConfig()`：后者会调
+  // `michaelAccessGate()`，在用户打字这条空闲路径上等于随时可能弹一个登录框出来。
+  let _prefetchCfg = _lastGoodAiConfig;
+  if (!_prefetchCfg) {
+    try {
+      const c = loadConfig();
+      // 三样齐了才发。缺任一样这次请求必然失败，白发一次。
+      if (c && c.baseUrl && c.apiKey && c.model) _prefetchCfg = c;
+    } catch { _prefetchCfg = null; }
+  }
+  if (!_prefetchCfg) return;
   if (_normalizeAiMode(_currentAiMode) !== "agent") return; // 纯聊天本来就不发这个请求
   const sess = _currentSession();
   if (!sess || sess.streaming) return;                      // 正在流式输出时别插队
@@ -73167,7 +73216,9 @@ function _prefetchIntentFromComposer() {
   const key = _aiIntentCacheKey(t, ctx.sessionId || sess.id, _aiIntentContextFingerprint(ctx));
   if (_aiIntentCache.get(key) || _aiIntentInflight.get(key)) return; // 已有结果或已在途
   _intentPrefetchedText = t;
-  _aiIntentProfile(t, _lastGoodAiConfig, sess, ctx).catch(() => {});
+  // 不多发一次请求：`_aiIntentInflight` 单飞去重 + `_aiIntentCache` 同键复用，而缓存键
+  // （文本 + 会话 + 上下文指纹）不含时间戳也不含轮次——发送路径算出来的是同一个键。
+  _aiIntentProfile(t, _prefetchCfg, sess, ctx).catch(() => {});
 }
 // At module load there is no session yet, so this reads 0. Sessions restore asynchronously after
 // it and nothing recomputed — which is why reopening the app showed an empty context for a
