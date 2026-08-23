@@ -19133,6 +19133,19 @@ function _liveTurnStats(body, { startedAt = Date.now(), getSettlement, getTimeli
   let el = null;
   let timer = 0;
   let active = true;
+  let watcher = null;
+  // 统计行必须**始终**是这条回复的最后一行。
+  //
+  // 原来只在每秒 tick 里判 `el !== body.lastElementChild` 再 append。于是新内容（文字段、
+  // 工具卡）追加之后，统计行会在它**上面**待着，直到下一次 tick（最多 1 秒）才跳到下面 ——
+  // 用户看到的就是「一上一下、一直篡位」。轮询修不了这个：只要间隔非零，那个空窗就在。
+  //
+  // 改成用 MutationObserver：内容一进来同一帧就下移，肉眼看不到中间态。
+  // 移动 el 自己也会触发 observer，所以先判「已经在末尾就什么都不做」，否则死循环。
+  const pinToBottom = () => {
+    if (!active || !el || !body || el === body.lastElementChild) return;
+    body.appendChild(el);
+  };
   const tick = () => {
     try {
       if (!active || !body) return;
@@ -19140,6 +19153,10 @@ function _liveTurnStats(body, { startedAt = Date.now(), getSettlement, getTimeli
         el = document.createElement("div");
         el.className = "turn-stats turn-stats--live";
         body.appendChild(el);
+        if (typeof MutationObserver === "function") {
+          watcher = new MutationObserver(pinToBottom);
+          watcher.observe(body, { childList: true });
+        }
       }
       const settlement = typeof getSettlement === "function" ? getSettlement() : null;
       const timeline = typeof getTimeline === "function" ? getTimeline() : null;
@@ -19151,7 +19168,7 @@ function _liveTurnStats(body, { startedAt = Date.now(), getSettlement, getTimeli
         live: true,
       }).html;
       el.title = _turnStatsTitle({ elapsedMs, settlement, live: true, timeline });
-      if (el !== body.lastElementChild) body.appendChild(el); // 新内容追加后保持在最底部
+      pinToBottom(); // 兜底：observer 没跑起来（老 WebView / 被异常打断）时仍然归位
     } catch { /* live stats must never break a reply */ }
   };
   tick();
@@ -19161,6 +19178,8 @@ function _liveTurnStats(body, { startedAt = Date.now(), getSettlement, getTimeli
     stop() {
       active = false;
       if (timer) { clearInterval(timer); timer = 0; }
+      try { watcher?.disconnect(); } catch {}
+      watcher = null;
       try { if (el) el.remove(); } catch {}
       el = null;
     },
