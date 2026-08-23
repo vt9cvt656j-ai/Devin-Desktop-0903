@@ -35,6 +35,10 @@ import { CODE as SRC, SRC as RAW_SRC, fnSource as topLevelFn } from "./helpers/s
 const CORE = ["read_file", "list_dir", "search", "find_files", "update_plan", "ask_user", "think",
               "write_file", "edit_file", "multi_edit", "run_cmd", "run_in_terminal", "read_logs",
               "save_skill", "mcp_server",
+              // 2026-08-23 再扩一个：background_monitor。理由和 github_repo 那条逐字
+              // 相同 —— **文案点名的工具必须在手里**。这个文件守的是「MCP 不许挤爆窗口」，
+              // 与扩窗无关，那个保证仍然成立。
+              "background_monitor",
               "web_search", "web_fetch", "github_search", "github_repo",
               "developer_community_search", "package_search", "package_source", "knowledge_search",
               // 2026-08-22 又扩一个：run_subagent。这个文件守的是"MCP 不许挤爆窗口"，
