@@ -90,6 +90,24 @@ import { createDapManager } from "./dap-client.js";
 import * as growth from "./growth.js";
 import { ConversationMemory, extractExplicitCorrection, serializeMessagesForPersistence } from "./conversation-memory.js";
 import { compactToolGuide, enrichedCatalogLine, autoEnrichToolMetadata, toolCapabilityIndex, TOOL_METADATA } from "./tool-guides.js";
+
+/**
+ * 工具描述的兜底文案——**数据，不是常量**。
+ *
+ * 发布构建会把 `_buildAgentToolSchemas` 里 141 条工具描述全部剥空（IP 保护，
+ * build/strip-tool-ip.mjs）。实测：dev 空描述 0 条，release **141 条**，参数描述 411/412 也空。
+ * 网关按名注回只补 `body.tools`，补不到**消息正文里的工具目录**——而那份目录正是
+ * 编排模型决定「这轮装哪些工具」、收尾评审判断「选对工具了吗」的唯一依据。
+ * 于是线上那个构建里，这两条认知路径看到的是 141 个光名字加一句「（无描述）」。
+ *
+ * TOOL_METADATA 在 src/tool-guides.js 里，**不在剥除范围内**（vite 只匹配 /src/main.js$，
+ * 实测剥它 0 处改动），142 键、全部有 use_cases。用它兜底不新增一个字的人工文案。
+ */
+function _toolScenarioFallback(name) {
+  const meta = TOOL_METADATA[String(name || "")];
+  const first = Array.isArray(meta?.use_cases) ? String(meta.use_cases[0] || "").trim() : "";
+  return first || "（无描述）";
+}
 import exifr from "exifr";
 import appPackage from "../package.json";
 import {
@@ -51524,7 +51542,10 @@ async function _wrapUpCritic({ config, task, padText, draft, readList, execution
   const catalogText = toolCatalog.map((entry) => {
     const inputs = Array.isArray(entry.inputs) ? entry.inputs.join(",") : "";
     const required = Array.isArray(entry.required) && entry.required.length ? ` required:${entry.required.join(",")}` : "";
-    return `${entry.name}\t${entry.description || "（无描述）"}\t${inputs}${required}`;
+    // 发布构建把 141 条工具描述全部剥空（实测 release 空描述 141/141），而这份目录正是
+    // 收尾评审用来判断「模型选对工具了吗」的依据。兜底走 TOOL_METADATA（不在剥除范围内），
+    // 不是常量占位符——否则整列都是「（无描述）」。
+    return `${entry.name}\t${entry.description || _toolScenarioFallback(entry.name)}\t${inputs}${required}`;
   }).join("\n");
   // Keep the complete capability index in the stable system prefix. The gateway's
   // native Anthropic bridge can cache this prefix once; task/evidence text remains
