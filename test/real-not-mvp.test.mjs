@@ -169,7 +169,13 @@ test("放宽命名之后不许开始误报（负向，本仓库实测 0.10/万�
 // 挂整表，按**这一次写进去的代码碰到了什么**递对应的那几条，挂在 _mutationAdvice 上，
 // 跟着这一次写入的工具结果一起回给模型 —— 写的当下就知道，不是收尾时才知道。
 const risks = load("_sinkRisksInWrite");
-const sinkAdvice = load("_sinkRiskAdvice", { _sinkRisksInWrite: risks });
+// 注入清单是手工的：_sinkRiskAdvice 里新引用一个函数，这里不同步就是 ReferenceError
+// （不是断言失败——排查方向完全不同）。仓库里已经因为这个栽过。
+const ambiguous = load("_ambiguousFailureInWrite");
+const sinkAdvice = load("_sinkRiskAdvice", {
+  _sinkRisksInWrite: risks,
+  _ambiguousFailureInWrite: ambiguous,
+});
 
 test("六类危险汇聚点各自认得出，且指到行号和原文", () => {
   const CASES = [
