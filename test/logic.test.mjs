@@ -22196,8 +22196,12 @@ test("offered choices and run-state suggestions merge into one 接下来 block",
   const container = mkEl("div");
   const sess = { container };
   const deps = {
-    document: { createElement: mkEl },
+    // createTextNode 是 _appendTextWithInlineCode 要用的（正文里的 `代码` 段之外
+    // 那些纯文字）。这个替身少一个方法的话，渲染会在 try/catch 里静默抛掉，
+    // 现象是「一张卡片都没有」—— 和真的没渲染分不出来。
+    document: { createElement: mkEl, createTextNode: (v) => ({ nodeType: 3, textContent: String(v) }) },
     _NS_SPARK: "<svg/>", _NS_ARROW: "<svg/>", _NEXT_STEPS_MAX: 4,
+    _appendTextWithInlineCode: (el, text) => { el.textContent = String(text); },
     sendPrompt() {}, _currentSession: () => null, _chatFollow() {},
   };
   const render = load("_renderSuggestionChips", deps);
@@ -28522,6 +28526,72 @@ test("每条回复底下的操作条：五个按钮，全部走委托", () => {
   assert.match(add, /main\.appendChild\(_buildMsgActions\(/, "助手消息没挂上操作条");
   assert.ok(!/wrap\.appendChild\(_buildMsgActions\(/.test(add),
     "挂到 wrap 上了——那是 flex row，会跑到头像右边去，而不是正文底下");
+});
+
+test("「接下来」建议：不砍半句、反引号渲染成代码、序号让出行首", () => {
+  /*
+   * 三个毛病叠在一起，用户原话「看不全，而且要简单易懂」：
+   *   1. `white-space: nowrap` + 省略号 —— 一行装不下就砍掉后半句，等于让人猜；
+   *   2. 正文用 textContent 铺进去 —— 模型写的 `npm install` 里那对反引号**当字符显示**，
+   *      一行三对反引号既难读又白占位置；
+   *   3. 正文前面拼了 "1、" —— 数字序号靠卡片上下顺序就能读，占着行首只是把正文往右挤。
+   */
+  const chip = APP_CSS_CODE.match(/\.next-steps__chip-t\s*\{([^}]*)\}/);
+  assert.ok(chip, ".next-steps__chip-t 规则不见了");
+  assert.ok(!/white-space:\s*nowrap/.test(chip[1]),
+    "又变回单行了——一句话装不下就被砍掉后半句");
+  assert.match(chip[1], /-webkit-line-clamp:\s*2/, "没有给到两行");
+
+  // 行内代码：建 DOM 节点，**不能**拿模型文本拼 innerHTML。
+  const inl = stripJsComments(extractFn("_appendTextWithInlineCode"));
+  assert.match(inl, /document\.createElement\("code"\)/, "反引号没有渲染成行内代码");
+  assert.match(inl, /code\.textContent = part/, "代码段不是 textContent");
+  assert.ok(!/innerHTML/.test(inl),
+    "拿模型输出拼 innerHTML 了——那是把模型的话当代码执行");
+  assert.match(APP_CSS_CODE, /\.next-steps__code\s*\{/, "行内代码没有样式，会和正文糊在一起");
+  // 函数写得再好，卡片不调用也是白搭 —— 这一环变异实测漏过。
+  const render = stripJsComments(extractFn("_renderSuggestionChips"));
+  assert.match(render, /_appendTextWithInlineCode\(b\.querySelector\("\.next-steps__chip-t"\), text\)/,
+    "卡片正文又退回 textContent 了，反引号会原样显示成字符");
+  assert.ok(!/chip-t"\)\.textContent = text/.test(render), "正文还在用 textContent 直铺");
+
+  // 序号进徽标，不再拼进正文。
+  const choices = stripJsComments(extractFn("_maybeRenderChoices"));
+  assert.match(choices, /badge: o\.label, label: o\.text \|\| o\.label/,
+    "序号还拼在正文前面");
+  assert.ok(!/o\.label \+ \(o\.text \? "、"/.test(choices), "又拼回 \"1、\" 了");
+  assert.match(APP_CSS_CODE, /\.next-steps__badge\s*\{/, "徽标没有样式");
+
+  // 两行仍然放不下的极端长句，全文要留在 title 里。
+  assert.match(stripJsComments(extractFn("_renderSuggestionChips")),
+    /b\.title = text\.replace/, "超长建议没有把全文留在 title 里");
+});
+
+test("行内代码切分：成对才当代码，落单的反引号原样留着", () => {
+  // 落单的反引号不能吞掉：模型偶尔写半个，吞了反而让人看不懂那句话在说什么。
+  const run = (raw) => {
+    const nodes = [];
+    const el = {
+      childNodes: nodes,
+      appendChild: (n) => { nodes.push(n); return n; },
+      set textContent(v) { nodes.push({ t: "text", v }); },
+    };
+    load("_appendTextWithInlineCode", {
+      document: {
+        createElement: () => ({ className: "", set textContent(v) { this.t = "code"; this.v = v; } }),
+        createTextNode: (v) => ({ t: "text", v }),
+      },
+    })(el, raw);
+    return nodes.map((n) => (n.t === "code" ? "[code]" + n.v : n.v));
+  };
+  assert.deepEqual(run("跑 `npm install` 装依赖"), ["跑 ", "[code]npm install", " 装依赖"]);
+  assert.deepEqual(run("生成 `dist/`"), ["生成 ", "[code]dist/"]);
+  assert.deepEqual(run("没有代码"), ["没有代码"]);
+  // 落单：反引号个数为奇数 → 整句退回纯文字，那些反引号一个都不能少。
+  assert.ok(run("a `b` c ` d").join("").includes("`"), "落单的反引号被吞掉了");
+  // 结尾就是那个孤儿的情形（split 出一个空尾段）—— 单独钉一次，上一条打不到这个分支。
+  assert.deepEqual(run("a `"), ["a ", "`"], "结尾的落单反引号被吞掉了");
+  assert.deepEqual(run(""), [""]);
 });
 
 test("操作条等统计行落定再出场，而且不会有消息永远等不到", () => {
