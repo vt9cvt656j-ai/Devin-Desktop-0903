@@ -41038,6 +41038,35 @@ function _stubDeliveryFindings(run, maxItems = 8) {
     [/\b(?:mock|fake|dummy|sample)(?:Data|List|Items|Users|Products|Response)\b|假数据|模拟数据|示例数据/, "写死的假数据"],
     [/\bplaceholder\b.*=.*['"`]|占位实现/i, "占位实现"],
   ];
+  // 上面那五条只抓**模型自己老实标注**的占位（TODO、not implemented、命名里带 mock）。
+  // 实测召回 3/12：真正的「写着写着变成 MVP」是**看着像写完了的空壳**，一条都不落进上面那张表。
+  //
+  // 下面这批按**结构**判，且要跨行——真实代码是
+  //     function verifyToken(t) {
+  //       return true;
+  //     }
+  // 三行，单行正则一条都抓不到。所以对每个起始行取一个 3 行窗口拼平再判，正则一律锚在
+  // 窗口首行行首（不锚的话窗口会把不相干的下一行拼进来，实测空函数体那条误报从 0 涨到 1.59/万行）。
+  //
+  // 每一条都在本仓库自己的 207,656 行真实代码（JS + Rust）上量过误报，**全部为 0**；
+  // 正向自检 6/6。量出来被砍掉的候选：空 catch（83.4/万行——`try{...}catch{}` 在本仓库是
+  // 通用惯用法）、硬编码 `return {ok:true}`（1.24/万行）、写死 localhost（0.8/万行，抽样全是
+  // 正则误匹配到散文里）。宁可漏，不可让每一轮都跳一堆假警报——那会让这本账整个失去可信度。
+  const STRUCT = [
+    // 鉴权/权限函数整个身子就是 return true —— 它同时是 MVP 空壳和一个真漏洞
+    [/^(?:pub\s+)?(?:async\s+)?(?:fn|function)\s+(?:auth\w*|authorize\w*|authenticate\w*|verif\w*|permit\w*|permission\w*|canAccess|hasAccess|hasRole|hasPermission|isAdmin|isOwner|isAllowed|checkToken|checkAuth|validateToken|validateUser)\s*\([^)]*\)[^{]{0,40}\{\s*(?:return\s+)?true\s*;?\s*\}/i, "鉴权恒真（空壳且是漏洞）"],
+    [/^(?:const|let|var)?\s*(?:auth\w*|authorize\w*|authenticate\w*|verif\w*|permit\w*|permission\w*|canAccess|hasAccess|hasRole|hasPermission|isAdmin|isOwner|isAllowed|checkToken|checkAuth|validateToken|validateUser)\s*[:=]\s*(?:async\s*)?\([^)]*\)\s*=>\s*\{?\s*(?:return\s+)?true\s*;?\s*\}?\s*;?$/i, "鉴权恒真（空壳且是漏洞）"],
+    // 真逻辑被关掉
+    [/^\s*if\s*\(\s*(?:false|0)\s*\)/, "真逻辑被关掉"],
+    // 有名字、有参数，身子是空的
+    [/^(?:pub\s+)?(?:async\s+)?(?:fn|function)\s+\w{3,}\s*\([^)]*\)[^{]{0,40}\{\s*\}\s*$/, "空函数体"],
+    // 取数函数直接回空
+    [/^(?:pub\s+)?(?:async\s+)?(?:fn|function)\s+(?:get|list|fetch|load|query|find|search)\w*\s*\([^)]*\)[^{]{0,40}\{\s*return\s*(?:\[\s*\]|null|None|\{\s*\})\s*;?\s*\}\s*$/i, "取数函数回空"],
+    // 编出来的地址。**只在真会被调用/被配成端点的上下文里**才算——纯字符串数据和测试断言里
+    // 出现 example.com 是正当的（收紧前它在本仓库误报 5.4/万行，全是网关的 HTML 解析夹具）。
+    [/\b(?:fetch|axios(?:\.\w+)?|request|got|superagent|urlopen|requests\.\w+|http\.(?:Get|Post)|reqwest::\w+)\s*\(\s*["'`]https?:\/\/(?:[\w.-]*\.)?(?:example\.(?:com|org|net)|your-\w+|api\.example)\b/i, "编造的地址"],
+    [/\b(?:baseUrl|baseURL|BASE_URL|apiUrl|API_URL|endpoint|ENDPOINT|apiHost|webhook\w*)\s*[:=]\s*["'`]https?:\/\/(?:[\w.-]*\.)?(?:example\.(?:com|org|net)|your-\w+|api\.example)\b/i, "编造的地址"],
+  ];
   cp.forEach((snap, absPath) => {
     if (out.length >= maxItems) return;
     const cur = String(snap?.current || "");
@@ -41049,9 +41078,19 @@ function _stubDeliveryFindings(run, maxItems = 8) {
       const raw = lines[i];
       const trimmed = raw.trim();
       if (!trimmed || before.has(trimmed)) continue;
+      let matched = false;
       for (const [re, kind] of MARKS) {
         if (!re.test(trimmed)) continue;
         out.push({ path: String(absPath).split("/").slice(-2).join("/"), line: i + 1, kind, text: trimmed.slice(0, 90) });
+        matched = true;
+        break;
+      }
+      if (matched) continue;
+      // 3 行窗口：起始行必须是新增的（上面已判），后两行只用来补全结构。
+      const win = lines.slice(i, i + 3).map((l) => l.trim()).join(" ");
+      for (const [re, kind] of STRUCT) {
+        if (!re.test(win)) continue;
+        out.push({ path: String(absPath).split("/").slice(-2).join("/"), line: i + 1, kind, text: win.slice(0, 90) });
         break;
       }
     }
