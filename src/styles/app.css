@@ -5587,11 +5587,7 @@ img.settings-dropdown__avatar--filled { object-fit: cover; }
   justify-content: space-between;
   gap: 8px;
   margin-top: 6px;
-  opacity: .45;
-  transition: opacity .14s ease;
 }
-.msg.assistant:hover .msg__acts,
-.msg__acts:focus-within { opacity: 1; }
 .msg__acts-side { display: flex; align-items: center; gap: 2px; }
 .msg__act {
   display: inline-flex;
@@ -5603,11 +5599,16 @@ img.settings-dropdown__avatar--filled { object-fit: cover; }
   border: none;
   border-radius: 7px;
   background: transparent;
+  /* 强弱靠**颜色**，不靠透明度。
+     第一版是给整条 .msg__acts 加 opacity:.45，实测把 #6e6e73 冲淡成接近 #b4b4b7
+     —— 对白底只有约 2:1，浅色模式下基本看不清（用户原话「有点看不清」）。
+     图标类控件的对比度下限是 3:1；--text-dim 原色对白底约 4.8:1，够用而且不抢正文。 */
   color: var(--text-dim);
   cursor: pointer;
   transition: background .12s ease, color .12s ease;
 }
-.msg__act svg { width: 15px; height: 15px; }
+.msg__act svg { width: 16px; height: 16px; }
+.msg.assistant:hover .msg__act { color: var(--text); }
 .msg__act:hover { background: var(--line); color: var(--text); }
 .msg__act:active { background: var(--line-strong); }
 .msg__act.is-on { color: var(--accent); }
