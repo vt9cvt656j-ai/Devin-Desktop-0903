@@ -27,4 +27,4 @@ The catalogue of defect classes to sweep — memory and low-level, concurrency a
 - ❌ Why it is wrong, and the impact
 - ✅ Suggested fix
 
-Finish with a one-line overview: what scope you covered, how many real problems you found (ordered by severity), and any open questions you could not verify. Review only — do not modify files.
+Open with one line: which files/paths you actually read, and how many proven problems you found. Then the findings, most severe first. Anything you could not verify goes in the finding it belongs to, not in a closing summary — a rundown of what you checked at the end is exactly the ritual ending the answer-quality module bans by shape. Review only — do not modify files.
