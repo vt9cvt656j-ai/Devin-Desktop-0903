@@ -12972,20 +12972,32 @@ function _billableAiComplete(config, messages, maxTokens) {
   // 重试和首发共用这一个发送点。守卫那条断言是**数源文本里出现几次**来钉住
   // 「非流式模型调用只有一个出口」的，所以这里既不能写第二个调用点，注释里也不能
   // 复述那个调用的字面形状——写了同样会被数进去（这个坑本仓库踩过好几次）。
+  // ai_complete 现在回 { text, finishReason }。旧构建回的是裸字符串，两种都要认——
+  // 前端和 Rust 一起发版，但测试夹具和网页构建仍会喂裸串。
+  const _text = (o) => (o && typeof o === "object" && !Array.isArray(o) ? String(o.text || "") : String(o || ""));
+  const _finish = (o) => (o && typeof o === "object" && !Array.isArray(o) ? String(o.finishReason || "") : "");
   const send = (cap2) => backend.aiComplete(requestConfig, messages, cap2);
   const task = Promise.resolve()
     .then(() => send(firstCap))
     .then((out) => {
+      // 「非空但被截断」这种形状**现在抓得住了**：finish_reason === "length"。
+      //
+      // 以前这里的注释写着「抓不住——那需要 finish_reason，而 ai_complete 只回正文
+      // 字符串」。那正是这条链上最贵的一处盲区：产不出和截断在能力账本上都记 fail，
+      // 而修法完全相反（前者要切小输入面，后者补预算就够）。现在两种按事实分开。
+      if (_finish(out) === "length" && firstCap === maxTokens && cap) {
+        _markModelNeedsAuxHeadroom(model);
+        return send(headroomCap);
+      }
       // 兜底只认「成功但正文为空」这一种事实：抛错的不重试（那是网络或取消，不是预算），
       // 已经带了余量的不重试（避免无上限地往上加）。有界辅助调用返回空串永远没有用处，
       // 所以这次重试不会把任何本来有效的结果换掉。
-      //
-      // 抓不住「非空但截断」那种形状——那需要 finish_reason，而 ai_complete 只回正文字符串。
-      // 那一种由上面的能力声明负责；这里只补声明漏掉的模型。
-      if (String(out || "").trim() || firstCap !== maxTokens || !cap) return out;
+      if (_text(out).trim() || firstCap !== maxTokens || !cap) return out;
       _markModelNeedsAuxHeadroom(model);
       return send(headroomCap);
-    });
+    })
+    // 调用方拿到的仍然是正文字符串——签名不变，finish_reason 只在上面这段里当判据用。
+    .then(_text);
   let active = _billableAiTasks.get(id);
   if (!active) { active = new Set(); _billableAiTasks.set(id, active); }
   active.add(task);
@@ -23069,8 +23081,19 @@ async function _aiIntentProfile(text, config, session = null, context = null) {
       const _merged = (_semObj || _engObj) ? { ...(_semObj || {}), ...(_engObj || {}) } : null;
       const intents = _normalizeAiIntentVerdict(_merged, boundedContext);      // 每模型能力账本：拆问后每一半都是一次独立的大表回执（弱模型判定的事实源）。
       if (typeof _recordModelJsonOutcome === "function") {
-        _recordModelJsonOutcome(intentConfig.model, "big", !String(_outSem || "").trim() ? "empty" : _sem ? "ok" : "fail");
-        _recordModelJsonOutcome(intentConfig.model, "big", !String(_outEng || "").trim() ? "empty" : _eng ? "ok" : "fail");
+        // 判据是「这一半**被 normalize 接住了**」，不是「解析器抠到了东西」。
+        //
+        // 原来判的是 _safeJsonLoose 的真值，而它比 normalize 早一行。两种垃圾形状都会被记成
+        // ok：解析器回了数组（spread 之后必然归零）、抠到的字段落在顶层而工程半读不到（拍平
+        // 那条路）。结果这本账**系统性高估**模型能力——而它恰好是 _isWeakModel 的唯一事实源，
+        // 方向正好是「让产不出大表的模型显得能产」。
+        //
+        // 分桶从两个 "big" 拆成 big_sem / big_eng：同一个桶里记两半，结构上分不出是哪一半失败，
+        // 而这两半的失败原因和修法完全不同（弱模型最常见的形状恰恰是语义半到、工程半空）。
+        const _semOk = intents?._halves?.semantic === true;
+        const _engOk = intents?._halves?.engineering === true;
+        _recordModelJsonOutcome(intentConfig.model, "big_sem", !String(_outSem || "").trim() ? "empty" : _semOk ? "ok" : "fail");
+        _recordModelJsonOutcome(intentConfig.model, "big_eng", !String(_outEng || "").trim() ? "empty" : _engOk ? "ok" : "fail");
       }
       if (!intents) return null;
       // 缓存准入同判：半份裁决不缓存。缓存 15 分钟，缓存一份「语义到了、工程没到」的
@@ -51659,7 +51682,9 @@ function _modelCapSave(caps) { try { localStorage.setItem(_MODEL_CAP_KEY, JSON.s
 function _recordModelJsonOutcome(modelId, table, outcome) {
   const id = String(modelId || "").trim().toLowerCase();
   if (!id) return;
-  const bucket = table === "big" ? "big" : "small";
+  // 桶名白名单。big_sem / big_eng 是拆问之后的两半——同一个桶里记两半，结构上就分不出
+  // 是哪一半失败。旧的 "big" 保留：升级前写进去的记录仍要能读，读侧按新旧一起算。
+  const bucket = ["big", "big_sem", "big_eng", "small"].includes(table) ? table : "small";
   const o = outcome === "ok" ? "ok" : outcome === "empty" ? "empty" : "fail";
   const caps = _modelCapLoad();
   const m = caps[id] && typeof caps[id] === "object" ? caps[id] : {};
@@ -51678,7 +51703,14 @@ function _isWeakModel(modelId) {
   // 执行事实优先：最近 N 次大表 JSON 调用的失败率（fail+empty）≥ 50% ⇒ 弱；< 50% ⇒ 强。
   if (typeof _modelCapLoad === "function") {
     try {
-      const ring = _modelCapLoad()[id]?.big;
+      // 「这个模型产不产得出大表」的判据是**工程半**：它是 16 个枚举 + 4 个数组的那半，
+      // 也是弱模型实测最常出不来的那半；语义半是小的，产得出并不说明它扛得住大表。
+      // 旧记录写在 "big" 桶里，一起算进来——否则升级当天这本账会被清空，而空账会退回
+      // 名称初值，那个初值把 stealth/ox-alpha 判成**强**。
+      const caps = _modelCapLoad()[id] || {};
+      const ring = [...(Array.isArray(caps.big_eng) ? caps.big_eng : []),
+                    ...(Array.isArray(caps.big) ? caps.big : [])]
+        .sort((a, b) => (Number(a?.t) || 0) - (Number(b?.t) || 0));
       if (Array.isArray(ring) && ring.length >= _MODEL_CAP_MIN_SAMPLES) {
         const recent = ring.slice(-_MODEL_CAP_RING);
         const bad = recent.filter((e) => e && e.o !== "ok").length;
