@@ -19986,6 +19986,25 @@ const _MSG_ACT_ICONS = {
   stats: '<path stroke-width="2" d="M6 19v-4M12 19v-8M18 19v-12"/>',
   more: '<circle cx="5.5" cy="12" r="1.35" fill="currentColor" stroke="none"/><circle cx="12" cy="12" r="1.35" fill="currentColor" stroke="none"/><circle cx="18.5" cy="12" r="1.35" fill="currentColor" stroke="none"/>',
 };
+/**
+ * 把一条建议拆成「动作」和「补充说明」两层。
+ *
+ * 这些文案有两种形态：运行状态档是 5–15 字的短祈使句（「修复构建失败」「跑一遍验证刚才的
+ * 改动」），模型给的选项常常是「动作，再顺带一件事」的长句（「创建 .env 填 KEY，试一次
+ * npx tsx …」）。一整行同一个字重时，长的那类是一堵墙，读者得自己找重点。
+ *
+ * 只在**两边都够实在**时才拆，短句原样留一行 —— 把「先做 1」拆成两层只会显得零碎。
+ * 判据是纯长度，不看词义：这里没有任何「这句在说什么」的推断，拆错了最多是分行不好看，
+ * 不会改变语义。
+ */
+function _splitSuggestionText(text) {
+  const raw = String(text || "").trim();
+  if ([...raw].length < 16) return { main: raw, sub: "" };
+  const m = raw.match(/^(.{6,}?)[，,]\s*(.{4,})$/);
+  if (!m) return { main: raw, sub: "" };
+  return { main: m[1].trim(), sub: m[2].trim() };
+}
+
 function _msgActButton(act, label, on = false) {
   return `<button type="button" class="msg__act${on ? " is-on" : ""}" data-act="${act}"`
     + ` title="${_escAttr(label)}" aria-label="${_escAttr(label)}"${on ? ' aria-pressed="true"' : ""}>`
@@ -26781,11 +26800,21 @@ function _renderSuggestionChips(sess, items, label) {
       // 是这个选项的真身份，做成徽标反而更醒目。
       b.innerHTML = (typeof it === "object" && it.badge
         ? '<span class="next-steps__badge"></span>' : "")
-        + '<span class="next-steps__chip-t"></span>' + _NS_ARROW;
+        + '<span class="next-steps__body"><span class="next-steps__chip-t"></span></span>' + _NS_ARROW;
       if (typeof it === "object" && it.badge) b.querySelector(".next-steps__badge").textContent = it.badge;
       // 正文里的 `代码` 渲染成真正的行内代码：原来是 textContent，反引号原样显示成字符，
       // 一行里三对反引号既难读又白占位置。
-      _appendTextWithInlineCode(b.querySelector(".next-steps__chip-t"), text);
+      const { main, sub } = _splitSuggestionText(text);
+      _appendTextWithInlineCode(b.querySelector(".next-steps__chip-t"), main);
+      if (sub) {
+        const s2 = document.createElement("span");
+        s2.className = "next-steps__sub";
+        _appendTextWithInlineCode(s2, sub);
+        // 追加到**正文那一列**里，不是卡片下面。卡片是三列栅格 [序号][内容][箭头]，
+        // 副行如果成了栅格的直接子元素，它会占掉第三列、把箭头挤到下一行 —— 实测就是
+        // 那个「箭头掉到左下角、正文和副行左右分家」的坏版。
+        b.querySelector(".next-steps__body").appendChild(s2);
+      }
       b.title = text.replace(/`/g, "");
       b.addEventListener("click", () => { wrap.remove(); sendPrompt(send); });
       wrap.appendChild(b);
@@ -40564,6 +40593,38 @@ function _implementationMutationGroundingIssue(run, call, root = "") {
  * **只读探测失败不算前提塌了**：`which python` 没有、`cat 某个可能不存在的文件` 失败，
  * 都是信息本身，同批的其它探测照跑。这条豁免是为了不把"一次性探环境"这种正当批次拦死。
  */
+// 「门在运行前拦下」和「跑了并失败」是两件事，而这条链上此前只有一个判据。
+//
+// _toolExecutionSucceeded 对任何 failure.code 一律判失败——对它自己的用途（这次调用有没有
+// 产出可采信的结果）这是对的。但另外两个消费者问的是别的问题：
+//   · 批量停止门问的是「工作区是不是处在半落地状态」——门拦下的那一项一个字节都没写；
+//   · 失败记账问的是「这个调用是不是真的做不成」——门拦下的下一轮补上前置就能成。
+// 两者都把门拦当成了真失败：用户在卡片上读到「前项**真实失败**」却找不到任何失败输出，
+// 而被拦的命令还在给这轮累计失败次数（_toolFailureKey 是 `cmd:<完整命令>`，撞够三次那条
+// 命令就再也发不出去，且 56815 行那条 maxFailRepeat>=3 会据此提前判定这轮跑砸了）。
+//
+// 只收**预执行拦截**这一族，真失败一个都不放：
+//   · plan_first / tech_research —— 门自己的正文就写着「写完/查完直接继续」
+//   · read_before_edit          —— 读一遍当前版本就能继续
+//   · mutation_batch / command_batch —— 拦截自身，是连锁的传导者
+// http_redirect / monitor_uncheckable 刻意不在内：那两个是**跑过了**才有的结局。
+//
+// 注意：这个谓词只用来纠正「理由」和「记账」，**不放行任何一次拦截**。门是「一个 run 只拦
+// 一次」，让后续照跑等于让那道要求彻底落空（test/logic.test.mjs 正面钉着前项 [BLOCKED] 时
+// 后续必须停）。
+const _PRE_EXECUTION_BLOCK_CODES = new Set([
+  "plan_first", "tech_research", "read_before_edit", "mutation_batch", "command_batch",
+]);
+function _isPreExecutionBlock(result) {
+  const code = String(result?.failure?.code || "");
+  return code ? _PRE_EXECUTION_BLOCK_CODES.has(code) : false;
+}
+// 同一批里、当前项之前，有没有哪一项是被门拦下的（而不是跑过并失败的）。
+function _preExecutionBlockedEarlier(items, index) {
+  if (!Array.isArray(items) || !(index > 0)) return false;
+  return items.slice(0, index).some((item) => _isPreExecutionBlock(item?.rawResult));
+}
+
 function _commandBatchBlockResult(run, items, index) {
   if (!run || run.mode !== "agent" || !Array.isArray(items) || index <= 0) return null;
   const current = items[index];
@@ -55495,18 +55556,24 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
           // 而编一个不存在的依赖会一路写下去，直到装不上才暴露。
           const techIssue = _planBeforeBuildIssue(run, it.call) || _newTechResearchIssue(run, it.call);
           if (techIssue) {
-            if (techIssue.startsWith("[BLOCKED_PLAN_FIRST]")) run._planStopUsed = true;
+            // 这里合流的是**两道门**，要求完全不同：一道说「先写计划」，一道说「先查这个包」。
+            // 此前它们共用一句「先查一下再选」和同一个 failure code，于是计划门拦下时，
+            // 用户在卡片上读到的是一件他根本没被要求做的事（实测：一次 README.md 编辑被
+            // 计划门拦下，徽章却写着去查资料）。恢复指令也跟着走错分支——tech_research
+            // 不在 _blockedToolRecoveryInstruction 的码表里，计划门于是退回散文兜底。
+            const _planFirst = techIssue.startsWith("[BLOCKED_PLAN_FIRST]");
+            if (_planFirst) run._planStopUsed = true;
             else run._techResearchStopUsed = true;
             const blocked = {
               type: it.call.type, path: it.call.path || "", ok: false,
-              failure: { code: "tech_research" }, content: techIssue,
+              failure: { code: _planFirst ? "plan_first" : "tech_research" }, content: techIssue,
             };
             it.rawResult = blocked;
             if (!it.step) {
               it.step = _createToolStep({ ...it.call, _toolName: it.tc.name });
               body.appendChild(it.step);
             }
-            _settleToolStep(it.step, blocked, "先查一下再选");
+            _settleToolStep(it.step, blocked, _planFirst ? "先写计划再动手" : "先查一下再选");
             return _toolMsgForModel(it.call, blocked);
           }
           const batchBlock = _implementationMutationBatchBlockResult(run, items, index)
@@ -55517,7 +55584,13 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
               it.step = _createToolStep({ ...it.call, _toolName: it.tc.name });
               body.appendChild(it.step);
             }
-            _settleToolStep(it.step, batchBlock, "前项真实失败 · 后续已停止");
+            // 「真实失败」这三个字要对得上事实。前项有两种：**跑过并失败**（工作区可能
+            // 半落地，这时"停下别再叠加"是对的），和**被门在运行前拦下**（一个字节都没写，
+            // 停下是为了让模型先去补掉门要求的那一步）。停止本身两种都该发生——门是
+            // 「一个 run 只拦一次」，放行后续等于让那道要求彻底落空——但**说给用户的理由
+            // 不能说反**：他会去找一个并不存在的失败输出。
+            _settleToolStep(it.step, batchBlock,
+              _preExecutionBlockedEarlier(items, index) ? "前项被门拦下 · 后续已停止" : "前项真实失败 · 后续已停止");
             return _toolMsgForModel(it.call, batchBlock);
           }
           it._mutationAdvice = _debugMutationBlockResult(run, it.call, root);
