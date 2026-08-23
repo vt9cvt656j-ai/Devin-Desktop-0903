@@ -23726,6 +23726,10 @@ test("从零建东西之前先写计划——但只拦一次，且不碰改已�
   // _toolRequiresPlanGate 以前是 `return false`，注释写着"计划是思考辅助，不是运行时权限闸门"
   // ——那是一条有意的设计决定，被用户明确推翻了。但推翻的是"要不要拦"，不是"能不能循环"。
   const gate = load("_planBeforeBuildIssue", {
+    // 计划门现在复用同胞取证门那条路径过滤（写 README/素材不武装硬拦）。
+    // 注入清单是手工的：漏一处就是运行时 ReferenceError，不是断言失败。
+    fileEditTypes: () => new Set(["write", "edit", "multiedit", "format"]),
+    _implementationGroundingFilePath: load("_implementationGroundingFilePath"),
     _implementationGroundingCandidate: (c) => c?.type === "write" || c?.type === "edit",
     _introducesNewTech: load("_introducesNewTech"),
   });
@@ -32210,6 +32214,10 @@ test("流式代码卡和写入预览：贴底判定必须先于内容写入", ()
 // 硬拦的集合必须 ⊆ 软催单的集合。
 test("硬拦的计划门只认模型直接声明的维度，不认 harness 派生的 substantial", () => {
   const gate = load("_planBeforeBuildIssue", {
+    // 计划门现在复用同胞取证门那条路径过滤（写 README/素材不武装硬拦）。
+    // 注入清单是手工的：漏一处就是运行时 ReferenceError，不是断言失败。
+    fileEditTypes: () => new Set(["write", "edit", "multiedit", "format"]),
+    _implementationGroundingFilePath: load("_implementationGroundingFilePath"),
     _implementationGroundingCandidate: () => true,
     _introducesNewTech: () => false,
   });

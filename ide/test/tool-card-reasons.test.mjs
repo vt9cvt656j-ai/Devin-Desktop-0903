@@ -285,3 +285,83 @@ test("留住肇事前项用的是 find 不是 some（否则说不出是哪道门
   assert.match(src, /item\.rawResult\.mutated !== false/,
     "幂等空操作的豁免没了——[create_dir 已存在, write_file] 会被当成前项失败硬拦");
 });
+
+// ── ⑦ 计划门不该武装在写文档上 ────────────────────────────────────────
+//
+// _planBeforeBuildIssue 是全系统**唯一一道硬拦回合**的门，而且「一个 run 只拦一次」
+// （run._planStopUsed）。它的 docstring 写着「改已有代码一概不拦」，可判据里对
+// fileEditTypes() 一律放行进门、没有任何路径过滤——于是 edit_file(README.md) 反倒成了
+// 它最容易触发的形态。
+//
+// 真损失不是误拦本身（那只白烧一轮），是**那一次配额被用掉了**：真正需要拦的那次从零
+// 动工就再也拦不住。同胞取证门 _implementationMutationGroundingIssue 在同一件事上早就
+// 写了排除（注释原话「写 README/素材不拦」），计划门漏了这一条。
+const planGate = load("_planBeforeBuildIssue", {
+  _implementationGroundingCandidate: () => true,
+  _introducesNewTech: () => false,
+  fileEditTypes: () => new Set(["write", "edit", "multiedit", "format"]),
+  _implementationGroundingFilePath: load("_implementationGroundingFilePath"),
+});
+const zeroRun = { mode: "agent", engineering: { projectScope: true, intentSource: "ai" }, _planSteps: [] };
+
+test("写文档/素材不再武装那道唯一的硬拦门", () => {
+  for (const path of ["README.md", "DEMO.md", "docs/guide.md", "demo.txt", "demo-output.txt", "notes.rst"]) {
+    assert.equal(planGate(zeroRun, { type: "edit", path }), "",
+      `${path} 仍然武装了硬拦门——那一个 run 只有一次的配额会被一次写文档用掉`);
+  }
+});
+
+test("真该拦的一个都没漏（反向断言，否则上面那条是绿的摆设）", () => {
+  // 只钉「文档不拦」是摆设：把整道门 return "" 它也绿。
+  for (const path of ["src/app.ts", "src/main.py", "examples/auto-edit.sh", "package.json",
+    "Cargo.toml", "index.html", "styles/app.css", "vite.config.ts"]) {
+    assert.ok(planGate(zeroRun, { type: "write", path }),
+      `${path} 不拦了——这道门被拆松了，不是收窄`);
+  }
+  // 判据必须和取证门同源，不许另立一份名单（两份必然漂开）
+  const src = fnSource("_planBeforeBuildIssue", { code: true });
+  assert.match(src, /_implementationGroundingFilePath\(call\?\.path\)/,
+    "另写了一份路径名单——它和取证门那份必然漂开，且漂开时没有任何报错");
+});
+
+test("门拦的正文要当场堵住「已保存」那句话", () => {
+  const blocked = planGate(zeroRun, { type: "write", path: "src/app.ts" });
+  assert.match(blocked, /\[BLOCKED_PLAN_FIRST\]/, "标记不能变");
+  assert.match(blocked, /这次调用没有执行，磁盘一个字节都没改/,
+    "没当场说清这次没写成——模型会照着说「已更新」（用户现场实拍：文件 17 分钟后才第一次被写入）");
+  assert.match(blocked, /原样重发/, "没说清补完之后该怎么办，模型只能猜");
+  const techGate = load("_newTechResearchIssue", {
+    _introducesNewTech: () => true,
+    _addedPackageNames: () => [],
+  });
+  const tech = techGate({ mode: "agent", _toolTypesUsed: [], _researchQueries: [] }, { type: "write", path: "package.json", content: "{}" });
+  assert.match(tech, /这次调用没有执行，磁盘一个字节都没改/, "调研门漏了同一句");
+});
+
+// ── ⑧ 三道门的恢复指令不再落 generic 兜底 ─────────────────────────────
+test("plan_first / tech_research / command_batch 各有确定的下一步", () => {
+  // generic 兜底那支引用 _CAPABILITY_ROUTES；下面的反向用例会走到它，不注入就是 ReferenceError。
+  const recover = load("_blockedToolRecoveryInstruction", { _CAPABILITY_ROUTES: "（能力路由清单）" });
+  for (const [code, want] of [
+    ["plan_first", /update_plan/],
+    ["tech_research", /package_search/],
+    ["command_batch", /一次只发一条/],
+  ]) {
+    const r = recover("[BLOCKED] x", { type: "write", path: "a.ts" }, { failure: { code } });
+    assert.ok(r, `${code} 没有恢复指令`);
+    assert.equal(r.kind, code, `${code} 的 kind 变了，别处按它识别`);
+    assert.match(r.text, want, `${code} 落到了 generic 兜底——模型拿到的是泛泛的「先判断真实原因」`);
+  }
+  // 反向：真正未知的码仍要走兜底，不许被这三条顺手吞掉
+  const unknown = recover("[BLOCKED] x", { type: "write", path: "a.ts" }, { failure: { code: "no_such_code_xyz" } });
+  assert.notEqual(unknown?.kind, "plan_first", "未知失败码被错认成了计划门");
+});
+
+test("cmd 在写入批次里要有主语", () => {
+  const out = mutBatch(RUN, [
+    { call: { type: "edit", path: "README.md" }, rawResult: { ok: false, failure: { code: "plan_first" } } },
+    { call: { type: "cmd", command: "chmod +x examples/*.sh" } },
+  ], 1);
+  assert.equal(out.path, "chmod +x examples/*.sh",
+    "cmd 没有 path，此前这里落空串——卡片上就是一条没有主语的记录");
+});
