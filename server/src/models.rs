@@ -3056,18 +3056,40 @@ pub async fn list_for_client(State(state): State<AppState>) -> ApiResult<Json<se
                     .map(|(tokens, beta)| json!({ "tokens": tokens, "beta": beta }))
                     .collect()
             };
-            // 这个模型是不是免费的（每日免费点数能买、不动钱包和会员额度）。
+            // 这个模型**现在**要不要钱——三态，不能塌成一个 bool。
             //
-            // 走 `effective_billing_micro` + `paid_model_requires_balance`，和**准入门、
-            // 结算**同一条解析。另写一份「看价格列是不是都为 0」是不行的：单模型覆盖
-            // （model_billing）能把一条 billing_mode="rate"、三列价格全 0 的线路上的某个
-            // 模型定成 per_call 收费，只看连接列会把它标成免费，用户点进去才发现扣钱
-            // —— 那正是 M-8 那个洞的形状，不能在展示侧再犯一遍。
+            // 上一版把 free 判成「三列价格都是 0」。那判的是**价格**，而这套系统里的 free
+            // 是**扣哪个池子**：`mode == "free"` 的模型照常算钱，只是从每日免费点池里扣，
+            // 池子空了才落到会员额度/钱包（见 `effective_billing` 的文档和 chat 的免费分支）。
+            // 两者是不同的事实 —— 实测生产上「免费deepseek」「免费智普」两条线路正是靠
+            // model_billing 里的 `{"mode":"free"}` 声明的，而它们的价格列全是 0 的同时
+            // billing_mode 是 "rate"，于是上一版一个都没标上，只标中了一个真·零价的。
+            //
+            //   always —— 三列价格全 0 且没有按次费：永远不花钱
+            //   pool   —— 声明 mode="free"：从每日免费点池扣，池子空了就开始扣钱
+            //   none   —— 收费
+            //
+            // pool 和 always 必须分开，因为 pool 的免费**是有额度的**：额度用完徽标就该消失，
+            // 而这只有结合用户当前的免费点余额才判得出来。余额是 /api/me 的事，不属于这个
+            // 匿名目录（也不该放进来）。所以这里只下发**判据**，由客户端拿自己的余额去比。
             //
             // 在 json! 外面算：宏里放不下块表达式（context_windows 那段同理）。
-            let is_free = {
-                let (eff_mode, eff_percall, _eff_free, _micro) = effective_billing_micro(m, &mid);
-                !paid_model_requires_balance(&eff_mode, eff_percall, m.rate, input_price, output_price)
+            let (eff_mode, eff_percall, eff_free, eff_micro) = effective_billing_micro(m, &mid);
+            let free_kind = if eff_free {
+                "pool"
+            } else if !paid_model_requires_balance(
+                &eff_mode, eff_percall, m.rate, input_price, output_price,
+            ) {
+                "always"
+            } else {
+                "none"
+            };
+            // 一次调用要从池子里扣多少点。用的是准入门那个函数（`free_points_needed` 带
+            // 1 毫点地板），所以客户端问的「够不够」和网关问的「放不放行」是同一句话。
+            let free_call_points = if eff_free {
+                free_points_needed(eff_micro) as f64 / MILLI as f64
+            } else {
+                0.0
             };
             list.push(json!({
                 // Which route this model came from. Requests are resolved by model id
@@ -3090,7 +3112,12 @@ pub async fn list_for_client(State(state): State<AppState>) -> ApiResult<Json<se
                 // 覆盖（model_billing）能把一条 billing_mode="rate"、三个价格列全 0 的线路上
                 // 的某个模型定成 per_call 收费，只看连接列会把它标成免费，用户点进去才发现扣钱
                 // ——那正是 M-8 那个洞的形状，不能在展示侧再犯一遍。
-                "free": is_free,
+                // 兼容位：只认这个 bool 的老客户端退化成「属于免费那一类」，
+                // 不含「额度还够不够」—— 够不够要 free_kind + free_call_points
+                // 配上 /api/me 的余额才知道。
+                "free": free_kind != "none",
+                "free_kind": free_kind,
+                "free_call_points": free_call_points,
                 // 新装客户端开箱选谁。运维在设置里指定（app_settings.default_model），
                 // 没指定就一个都不标、客户端沿用「取列表第一个」的旧行为。
                 //
@@ -16986,31 +17013,54 @@ mod audit_20260822_tests {
 
     /// [billing-core-4] 目录里那个 `free` 标记必须和**计费**同源。
     ///
-    /// 客户端拿它在模型菜单上画 free 徽标。如果这里另写一份「三列价格是不是都为 0」，
-    /// 就会和准入门/结算分家：单模型覆盖（model_billing）能把一条 billing_mode="rate"、
-    /// 三列价格全 0 的线路上的某个模型定成 per_call 收费 —— 只看连接列会把它标成免费，
-    /// 用户点进去才发现扣钱。那正是 M-8 那个洞的形状，展示侧不能再犯一遍。
+    /// 客户端拿它在模型菜单上画 free 徽标。两个坑：
+    ///
+    /// 1. 别在展示侧另写一份「三列价格是不是都为 0」。单模型覆盖（model_billing）能把一条
+    ///    billing_mode="rate"、三列价格全 0 的线路上的某个模型定成 per_call 收费 ——
+    ///    只看连接列会把它标成免费，用户点进去才发现扣钱。那正是 M-8 那个洞的形状。
+    ///
+    /// 2. **free 是「扣哪个池子」，不是「价格是多少」**（见 `effective_billing` 的文档）。
+    ///    `mode == "free"` 的模型照常算钱，只是从每日免费点池里扣，池子空了才落到会员额度/
+    ///    钱包。上一版把 free 判成「价格列全 0」，于是生产上四个真·免费模型（免费deepseek /
+    ///    免费智普，靠 model_billing 声明 mode:"free"，而价格列全 0、billing_mode="rate"）
+    ///    一个都没标上，反倒标中了一个不走免费池的零价模型。两个方向都错。
     #[test]
-    fn 目录里的免费标记要和计费同一条解析() {
+    fn 目录里的免费标记要分清永远免费和有额度的免费() {
         let body = fn_body(&gateway_code(), "pub async fn list_for_client(");
         assert!(
             body.contains("effective_billing_micro(m, &mid)"),
-            "free 没有走单模型解析——覆盖定价的模型会被标成免费",
+            "free 没有走单模型解析——覆盖定价的模型会被标错",
+        );
+        // 三态必须都在：塌成一个 bool 就分不清「永远免费」和「有额度的免费」，
+        // 而后者的徽标要随余额消失/回来。
+        for needle in ["\"pool\"", "\"always\"", "\"none\"", "\"free_kind\": free_kind"] {
+            assert!(body.contains(needle), "free_kind 少了 {needle}");
+        }
+        assert!(
+            body.contains("if eff_free {\n                \"pool\""),
+            "pool 不是由 effective_billing 的 free 位判定的",
         );
         assert!(
-            body.contains("!paid_model_requires_balance(&eff_mode, eff_percall, m.rate, input_price, output_price)"),
-            "free 的判据和准入门不是同一个",
+            body.contains("!paid_model_requires_balance("),
+            "always 的判据和准入门不是同一个",
         );
-        assert!(body.contains("\"free\": is_free,"), "free 字段没有下发");
+        // 「够不够付这一次」的判据必须由网关下发，否则客户端只能自己换算，迟早和门分家。
+        assert!(
+            body.contains("free_points_needed(eff_micro)"),
+            "没有下发一次调用要扣多少免费点——客户端判不出额度够不够",
+        );
         // 纯函数层再钉一次两个方向，免得判据被人反过来写。
         assert!(
             !super::paid_model_requires_balance("rate", 0, 0.0, 0.0, 0.0),
-            "三列全 0 且非 per_call 才是真免费",
+            "三列全 0 且非 per_call 才是 always",
         );
         assert!(
             super::paid_model_requires_balance("per_call", 50, 0.0, 0.0, 0.0),
-            "单模型覆盖成 per_call 50 分的，绝不能标成 free",
+            "单模型覆盖成 per_call 50 分的，绝不能标成免费",
         );
+        // 地板：按量计费的免费模型在准入时算不出成本，needed 退到 1 毫点 —— 等价于
+        // 「池里还有点数就放行」。客户端拿同一个数去比，两边才不会一个标一个不标。
+        assert_eq!(super::free_points_needed(0), 1, "1 毫点地板没了");
     }
 
     /// [billing-core-3] 后台 Token 推算器的计费模式也要按单模型解析。
