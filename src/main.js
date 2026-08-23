@@ -12972,20 +12972,32 @@ function _billableAiComplete(config, messages, maxTokens) {
   // 重试和首发共用这一个发送点。守卫那条断言是**数源文本里出现几次**来钉住
   // 「非流式模型调用只有一个出口」的，所以这里既不能写第二个调用点，注释里也不能
   // 复述那个调用的字面形状——写了同样会被数进去（这个坑本仓库踩过好几次）。
+  // ai_complete 现在回 { text, finishReason }。旧构建回的是裸字符串，两种都要认——
+  // 前端和 Rust 一起发版，但测试夹具和网页构建仍会喂裸串。
+  const _text = (o) => (o && typeof o === "object" && !Array.isArray(o) ? String(o.text || "") : String(o || ""));
+  const _finish = (o) => (o && typeof o === "object" && !Array.isArray(o) ? String(o.finishReason || "") : "");
   const send = (cap2) => backend.aiComplete(requestConfig, messages, cap2);
   const task = Promise.resolve()
     .then(() => send(firstCap))
     .then((out) => {
+      // 「非空但被截断」这种形状**现在抓得住了**：finish_reason === "length"。
+      //
+      // 以前这里的注释写着「抓不住——那需要 finish_reason，而 ai_complete 只回正文
+      // 字符串」。那正是这条链上最贵的一处盲区：产不出和截断在能力账本上都记 fail，
+      // 而修法完全相反（前者要切小输入面，后者补预算就够）。现在两种按事实分开。
+      if (_finish(out) === "length" && firstCap === maxTokens && cap) {
+        _markModelNeedsAuxHeadroom(model);
+        return send(headroomCap);
+      }
       // 兜底只认「成功但正文为空」这一种事实：抛错的不重试（那是网络或取消，不是预算），
       // 已经带了余量的不重试（避免无上限地往上加）。有界辅助调用返回空串永远没有用处，
       // 所以这次重试不会把任何本来有效的结果换掉。
-      //
-      // 抓不住「非空但截断」那种形状——那需要 finish_reason，而 ai_complete 只回正文字符串。
-      // 那一种由上面的能力声明负责；这里只补声明漏掉的模型。
-      if (String(out || "").trim() || firstCap !== maxTokens || !cap) return out;
+      if (_text(out).trim() || firstCap !== maxTokens || !cap) return out;
       _markModelNeedsAuxHeadroom(model);
       return send(headroomCap);
-    });
+    })
+    // 调用方拿到的仍然是正文字符串——签名不变，finish_reason 只在上面这段里当判据用。
+    .then(_text);
   let active = _billableAiTasks.get(id);
   if (!active) { active = new Set(); _billableAiTasks.set(id, active); }
   active.add(task);
@@ -70010,16 +70022,10 @@ function applyPlatformShortcutLabels() {
   // 两个来源，两份都写死 ⌃`。
   setShortcutTitle("terminalBtn", "terminal.toggle", "ctrl+`", "切换终端");
 
-  // 输入框右下角原来还挂着一个写着 ⌘↩ 的小标签（.composer__hint），占地方，删了。
-  //
-  // 删之前得先把这条快捷键**搬个地方**，否则它就彻底没处可看了：发送按钮的 title 当时是
-  // 在这儿单独拼的一行，而按钮上挂着 data-i18n-title —— i18n 的属性观察器（attributeFilter
-  // 里有 title）下一帧就按词条把它刷回一个不带组合键的「发送」。也就是说那行 title 一直
-  // 是白写的，可见提示才是唯一的出处；只删提示等于把这条快捷键从界面上抹掉。
-  //
-  // 所以按这个文件里已有的那条规矩来：摘掉标记 + 走 setShortcutTitle，一个写者。
-  // 顺带修掉原来写死的中文「发送」——现在名字从词条取，语言切换跟着走。
-  setShortcutTitle("sendBtn", "assistant.send", "mod+enter", "发送");
+  const composerHint = document.querySelector(".composer__hint");
+  if (composerHint) composerHint.textContent = shortcutLabel("mod+enter");
+  const sendBtn = $("sendBtn");
+  if (sendBtn) sendBtn.title = `发送 (${shortcutLabel("mod+enter")})`;
 
   const tips = document.querySelectorAll("#welcome .kbd-tip");
   renderKbdCombo(tips[0], "mod+o");

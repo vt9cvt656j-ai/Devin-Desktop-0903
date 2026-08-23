@@ -367,7 +367,7 @@ pub async fn ai_complete(
     config: AiConfig,
     messages: Vec<serde_json::Value>,
     max_tokens: u32,
-) -> Result<String, String> {
+) -> Result<serde_json::Value, String> {
     let url = chat_completions_url(&config.base_url)?;
     let cancel_id = cancellation_id(&config);
     let cancel_flag = cancel_id.as_deref().map(register_cancel);
@@ -401,14 +401,19 @@ pub async fn ai_complete(
         return Err(format_ai_http_error(status, &text));
     }
 
-    // 流式回来的是一串增量，拼回完整文本再返回——调用方的签名和返回值一个字都没变。
-    let content = read_sse_text(
+    // 流式回来的是一串增量，拼回完整文本再返回。
+    //
+    // 返回值从裸字符串改成 { text, finishReason }：finish_reason 是**唯一**能分清
+    // 「模型什么都没产出」和「产到一半被预算截断」的信号，而这两种在能力账本上都记成
+    // fail、修法却完全不同（前者切小输入面，后者补齐收尾）。带工具的那条流早就在解析
+    // 它了，只有这条一直把它扔掉。客户端两种形状都认（旧构建回字符串），所以这是加法。
+    let (content, finish) = read_sse_text(
         resp,
         StreamTimeouts::for_config(&config).stall.max(Duration::from_secs(120)),
         cancel_flag.as_deref(),
     )
     .await?;
-    Ok(content)
+    Ok(serde_json::json!({ "text": content, "finishReason": finish }))
 }
 
 /// Tool-enabled chat. `messages` is forwarded verbatim to the provider, so the
@@ -510,7 +515,7 @@ async fn read_sse_text(
     response: reqwest::Response,
     timeout: Duration,
     cancel: Option<&AtomicBool>,
-) -> Result<String, String> {
+) -> Result<(String, String), String> {
     use futures_util::StreamExt;
     let deadline = Instant::now() + timeout;
     let mut stream = response.bytes_stream();
@@ -519,6 +524,11 @@ async fn read_sse_text(
     let mut buf: Vec<u8> = Vec::new();
     let mut out = String::new();
     let mut saw_done = false;
+    // 顺带把 finish_reason 带回去。它是**唯一**能分清「模型什么都没产出」和「产到一半被
+    // 预算截断」的信号——这两种在账本上都表现为 fail，可修法完全不同：前者要切小输入面，
+    // 后者要补齐收尾。这条流本来就在逐行解析 SSE，取它零成本；带工具的那条流早就在解析
+    // 它了，只有 ai_complete 这条一直把它扔掉。
+    let mut finish: String = String::new();
     // 兜底用的原文副本：有的中转**无视 stream:true**，直接回一个普通 JSON body。没有这条
     // 兜底，那些线路会整条失效（报"流提前结束"），而用户看到的是这个模型彻底不能用。
     let mut raw: Vec<u8> = Vec::new();
@@ -561,6 +571,11 @@ async fn read_sse_text(
             let Ok(v) = serde_json::from_str::<serde_json::Value>(data) else {
                 continue; // 心跳/注释/半截帧：跳过，别把整轮判失败
             };
+            if let Some(fr) = v["choices"][0]["finish_reason"].as_str() {
+                if !fr.is_empty() {
+                    finish = normalize_finish_reason(fr).to_string();
+                }
+            }
             if let Some(t) = v["choices"][0]["delta"]["content"].as_str() {
                 out.push_str(t);
             } else if v["type"] == "content_block_delta" {
@@ -580,15 +595,15 @@ async fn read_sse_text(
         // 一帧 SSE 都没有 → 大概率是中转把 stream 忽略了，按普通补全响应再解一次。
         if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&raw) {
             if let Some(t) = v["choices"][0]["message"]["content"].as_str() {
-                return Ok(t.to_string());
+                return Ok((t.to_string(), String::new()));
             }
             if let Some(t) = v["content"][0]["text"].as_str() {
-                return Ok(t.to_string());
+                return Ok((t.to_string(), String::new()));
             }
         }
         return Err(INCOMPLETE_SSE_STREAM_ERROR.to_string());
     }
-    Ok(out)
+    Ok((out, finish))
 }
 
 async fn read_ai_completion_body(
