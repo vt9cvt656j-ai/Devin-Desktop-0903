@@ -4523,6 +4523,14 @@ impl OpenAiSseValidator {
     }
 }
 
+/// 调用方是否要这一次带上代码语料腿。缺省要（向后兼容：旧客户端不传就是原行为）。
+///
+/// 只认显式的布尔 false。传别的类型、传字符串 "false"、根本不传，都按「要」处理——
+/// 一个打错的字段名不该把整条腿悄悄关掉。
+pub(crate) fn corpus_leg_requested(body: &serde_json::Value) -> bool {
+    body.get("corpus").and_then(|v| v.as_bool()).unwrap_or(true)
+}
+
 /// 「这次 knowledge_search 要不要并上自有语料库（真实 API 签名 + 官方文档）」。
 ///
 /// 抽成独立函数只为一件事：让这条判据可测、且在源码层面看得见它到底是什么。
@@ -4908,6 +4916,22 @@ pub async fn knowledge_search(
     if query.is_empty() {
         return Err(AppError::bad("缺少 query"));
     }
+    // 调用方可以说明「这一次不要代码语料腿」。缺省仍是要（向后兼容，旧客户端行为不变）。
+    //
+    // 为什么需要这个开关：语料腿查的是 295 万行 API 签名与官方文档，它的价值是「写第三方
+    // 调用之前核对真实 API」。而 IDE 的域小抄预检发的是四条 rubric 散文查询（适用条件 /
+    // 硬性约束 / 常见坑 / 必须做的检查），答案在 893 段手写语料里，不在签名表里。
+    //
+    // 实测（2026-08-23 生产库）：那种散文查询的 12 个 OR 词在 295 万行上匹配 124,042 行，
+    // 对每行算两次 ts_rank 再全排序 —— 单条 2.8~8.5 秒，而捞回来的前六条是
+    // metagit-cli「Pattern categories」、两条重复的 next-pwa「Tips」、selenium-devtools
+    // 「Reference」：对「ui-ux 常见坑」一条都不沾边。对照：标识符查询 useEffect 匹配 353 行、
+    // 28 毫秒。域小抄一轮发 4 条 × 最多 2 个域 = 8 条这样的重查询。
+    //
+    // 不用「超时」来切：实测「zustand create store selector」这种**有用**的多词技术查询
+    // 要 3.5 秒，比散文查询还慢，按时长切会误伤真内容。判别只能来自调用方——它知道
+    // 自己问的是散文小抄还是 API 核对。
+    let corpus_wanted = corpus_leg_requested(&body);
     let domain = body
         .get("domain")
         .and_then(|v| v.as_str())
@@ -4943,7 +4967,7 @@ pub async fn knowledge_search(
             "text": h.text, "score": h.score, "source": "curated",
         }))
         .collect();
-    if code_corpus_leg_enabled(domain) {
+    if corpus_wanted && code_corpus_leg_enabled(domain) {
         // 手写语料是精选的，排在前面；语料库补足剩下的名额。
         let want = top_k.saturating_sub(merged.len()).max(top_k / 2).min(12) as i64;
         if want > 0 {
@@ -17354,7 +17378,7 @@ mod audit_20260822_tests {
 
 #[cfg(test)]
 mod code_corpus_leg_tests {
-    use super::code_corpus_leg_enabled;
+    use super::{code_corpus_leg_enabled, corpus_leg_requested};
 
     // 这条腿是「写第三方调用之前先核对真实 API」唯一够得着的事实源：线上 295 万行
     // （pypi 140 万 / npm 76 万 / crates 72 万 / 官方文档 7.6 万）。判据一旦退回
@@ -17363,6 +17387,31 @@ mod code_corpus_leg_tests {
     fn only_the_design_domain_turns_the_code_corpus_leg_off() {
         assert!(!code_corpus_leg_enabled(Some(crate::prompts::DESIGN_KNOWLEDGE_DOMAIN)),
             "michael-design 要的是精选蓝本，掺进几十万条 API 条目会把它冲淡");
+    }
+
+    #[test]
+    fn the_corpus_leg_can_be_declined_per_call_but_defaults_on() {
+        use serde_json::json;
+        // 缺省要：旧客户端不传这个字段，行为一个字不变。
+        assert!(corpus_leg_requested(&json!({ "query": "useEffect" })));
+        // 显式关掉：IDE 的域小抄预检发的是四条 rubric 散文查询，答案在手写语料里，
+        // 而语料腿在 295 万行签名表上要 2.8~8.5 秒且捞回来的是噪声（实测 2026-08-23）。
+        assert!(!corpus_leg_requested(&json!({ "query": "x", "corpus": false })));
+        assert!(corpus_leg_requested(&json!({ "query": "x", "corpus": true })));
+        // 只认真正的布尔 false。字段名打错、类型给错，都不该把整条腿悄悄关掉——
+        // 那条腿是「写第三方调用之前核对真实 API」唯一够得着的事实。
+        for wrong in [
+            json!({ "corpus": "false" }),
+            json!({ "corpus": 0 }),
+            json!({ "corpus": null }),
+            json!({ "corpse": false }),
+            json!({}),
+        ] {
+            assert!(
+                corpus_leg_requested(&wrong),
+                "{wrong} 把语料腿关掉了——只有显式的布尔 false 才算数"
+            );
+        }
     }
 
     #[test]
@@ -17389,11 +17438,20 @@ mod code_corpus_leg_tests {
     fn the_handler_actually_calls_the_predicate() {
         let src = include_str!("models.rs");
         // 字面量要拼起来写：直接写全名的话，**这条断言自己**也会被数进去。
-        let call = concat!("if code_corpus_leg", "_enabled(domain) {");
+        // 判据现在是两条与：调用方要不要（corpus_leg_requested）× 这个域该不该
+        // （code_corpus_leg_enabled）。两条都必须在同一个调用点上，缺一条就是一条腿
+        // 在某种情况下被静默旁路。
+        let call = concat!("if corpus_leg_requested_call && code_corpus_leg", "_enabled(domain) {")
+            .replace("corpus_leg_requested_call", "corpus_wanted");
         let def = concat!("fn code_corpus_leg", "_enabled(domain: Option<&str>)");
-        assert!(src.contains(call),
-            "knowledge_search 的调用点绕开了这条判据，自己又写了一份——两边会漂");
-        assert_eq!(src.matches(def).count(), 1, "判据出现了第二份实现");
+        let want_def = concat!("fn corpus_leg", "_requested(body: &serde_json::Value)");
+        assert!(src.contains(&call),
+            "knowledge_search 的调用点绕开了这两条判据之一，自己又写了一份——两边会漂");
+        assert_eq!(src.matches(def).count(), 1, "域判据出现了第二份实现");
+        assert_eq!(src.matches(want_def).count(), 1, "调用方开关出现了第二份实现");
+        // corpus_wanted 只能来自那个函数，不许在调用点上就地再解析一次 body
+        assert!(src.contains(concat!("let corpus_wanted = corpus_leg", "_requested(&body);")),
+            "corpus_wanted 不是从 corpus_leg_requested 来的——多一处解析就多一处会漂的判据");
     }
 
     #[test]
