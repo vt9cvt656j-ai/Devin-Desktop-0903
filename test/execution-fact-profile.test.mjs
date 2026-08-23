@@ -13,11 +13,11 @@ import { load, fnSource as topLevelFn } from "./helpers/source.mjs";
 
 const EV = (over = {}) => ({ hasWorkspace: true, snapshotReady: true, topLevel: ["src", "package.json"], ...over });
 
-function facts(run, { evidenceForRoot = null } = {}) {
+function facts(run, { evidenceForRoot = null, ...opts } = {}) {
   const fn = load("_executionFactSemanticFlags", {
     _aiIntentWorkspaceEvidence: evidenceForRoot || (() => null),
   });
-  return fn(run);
+  return fn(run, Object.keys(opts).length ? opts : null);
 }
 
 test("分类器没跑时，工作区证据自己现算——这条腿的全部意义就在这", () => {
@@ -39,17 +39,86 @@ test("分类器跑了就用它那份，不重复计算", () => {
   assert.equal(out.existingProject, true);
 });
 
-test("判据一个字没放宽：三个条件缺一不可", () => {
-  // 放宽它等于凭空造旗标——本文件守的是「兜底腿够得着自己的输入」，不是「更容易点亮」。
+test("没有工作区、或既无目录快照又无技术栈，都不点亮", () => {
+  // 本文件守的是「兜底腿够得着自己的输入」，不是「更容易点亮」。
   for (const over of [
-    { hasWorkspace: false },
-    { snapshotReady: false },
-    { topLevel: [] },
+    { hasWorkspace: false },                       // 连工作区都没有
+    { snapshotReady: false },                      // 快照冷、且这份证据里没有栈
+    { topLevel: [] },                              // 快照热但目录空
+    { snapshotReady: false, stack: {} },           // 栈字段在但全空
+    { snapshotReady: false, stack: { lang: "" } }, // 空串不是「识别出了栈」
   ]) {
     const out = facts({ root: "/p/app" }, { evidenceForRoot: () => EV(over) });
     assert.notEqual(out.existingProject, true,
       `判据被放宽了：${JSON.stringify(over)} 也点亮了 existing_project`);
   }
+});
+
+test("目录快照过期、但技术栈识别得出来 → 照样算已有项目", () => {
+  // 这是修的那一刀。_agentContextCache 带 5 分钟 TTL，会话第一发时它必然是冷的——
+  // 而这条腿存在的全部理由就是第一发。_projectStacks 没有 TTL，且扫不出栈事实时会被
+  // 显式 delete，所以「栈识别得出来」是比目录清单更强的证据，不是更弱的近似。
+  for (const stack of [{ lang: "TypeScript" }, { framework: "React" }, { packageManager: "pnpm" }]) {
+    const out = facts({ root: "/p/app" }, {
+      evidenceForRoot: () => EV({ snapshotReady: false, topLevel: [], stack }),
+    });
+    assert.equal(out.existingProject, true,
+      `${JSON.stringify(stack)}：栈已识别却还是没点亮——第一发仍然带空画像出门`);
+  }
+});
+
+test("模型画像缺席时，engineering 由执行事实补上", () => {
+  // engineering 在网关侧一面旗门着两样东西：agent_engineering（13KB 架构纪律 +
+  // 「优先用成熟主流方案」）和整个 4.3MB 专业语料的自动注入。它此前唯一的来源是模型裁决，
+  // 于是线上 317/383（83%）的装配两样一起够不着。
+  const out = facts({ root: "/p/app" }, {
+    evidenceForRoot: () => EV(),
+    modelProfileMissing: true,
+  });
+  assert.equal(out.projectEngineering, true,
+    "模型画像没到，事实腿也没补 engineering——那一轮就是零架构纪律、零语料");
+});
+
+test("模型画像到了就以模型为准，事实腿不许盖上去", () => {
+  // 模型判「这不是工程活」是**一个判断**，不是缺席。事实腿只在缺席时兜底。
+  const out = facts({ root: "/p/app" }, { evidenceForRoot: () => EV() });
+  assert.notEqual(out.projectEngineering, true,
+    "模型画像在场时事实腿仍然强点 engineering——这会覆盖模型自己的判断");
+});
+
+test("没有工作区就不补 engineering（不许凭空造）", () => {
+  const out = facts({ root: "/p/app" }, {
+    evidenceForRoot: () => EV({ hasWorkspace: false }),
+    modelProfileMissing: true,
+  });
+  assert.notEqual(out.projectEngineering, true,
+    "连工作区都没有也补 engineering——那是凭空造旗标");
+});
+
+test("循环边界那条腿也带着「模型画像到没到」", () => {
+  // 第一发补上了不等于全程补上。一轮里模型始终没回（线上那 159 次上游限流就是这个形状），
+  // 循环边界每一步装配都要重新给出这个条件，否则中途每一次又退回零纪律、零语料。
+  // 变异实测：把这个参数从循环边界拿掉，本文件其余 12 条测试全绿——所以这条必须单独钉。
+  const body = topLevelFn("_applyExecutionFactProfile", { code: true });
+  assert.match(body, /_executionFactSemanticFlags\(\s*run\s*,/,
+    "循环边界调用事实腿时没传第二个参数——那个条件整轮都丢了");
+  assert.match(body, /modelProfileMissing/, "没把「模型画像到没到」传下去");
+  assert.match(body, /_semanticProfileFromModel/,
+    "条件不是从「模型来源的画像」来的——换成别的近似判据，事实腿就会冒充模型判过了");
+});
+
+test("补出来的事实确实变成网关认得的 engineering 旗标", () => {
+  // 光在事实对象上点一个字段没用：网关门的是**旗标名**。这条把「事实 → 旗标」这一跳钉住，
+  // 免得字段改名后整条链静默断掉（本仓库踩过同款：调用点在、路径不会被走到）。
+  const profile = load("_ideSemanticProfile", {});
+  const out = facts({ root: "/p/app" }, {
+    evidenceForRoot: () => EV(),
+    modelProfileMissing: true,
+  });
+  const flags = profile(out).split(":")[1].split(",").filter(Boolean);
+  assert.ok(flags.includes("engineering"),
+    `事实腿产出的字段没映射成 engineering 旗标，网关那边等于没收到：${flags.join(",")}`);
+  assert.ok(flags.includes("existing_project"), `existing_project 也丢了：${flags.join(",")}`);
 });
 
 test("空目录（从零建）不点 existing_project——那正是它和已有项目的分界", () => {
