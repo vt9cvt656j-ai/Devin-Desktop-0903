@@ -315,9 +315,10 @@ test("完整裁决要 19.8 秒，路由必须有第二条腿——而且那条�
   assert.match(CODE, /async function _fastRoutingFlags\(/,
     "路由快通道没了——那这道等待又回到了「干等」和「没有模块」的二选一");
 
-  // 窗口 3300 → 3600：快通道函数体又多了一行每模型能力账本的回执记账
-  // （_recordModelJsonOutcome，弱模型判定的事实源），函数收尾再次被推出旧窗口。
-  const fn = CODE.slice(CODE.indexOf("async function _fastRoutingFlags("), CODE.indexOf("async function _fastRoutingFlags(") + 3600);
+  // 用真正的函数提取器，不是固定字符窗口。窗口切法每次往这个函数里加一句注释或一行代码
+  // 就会把函数收尾挤出去，于是断言不是变红、而是**静静地不再守着尾部那几条**——本文件
+  // 已经因此把窗口从 3300 调到 3600 一次。fnSource 按 AST 边界取整个函数，加多少都不漂。
+  const fn = fnSource("_fastRoutingFlags", { code: true });
 
   // 快的全部原因就是输出短。max_tokens 一放开，它就跟完整裁决一样慢，这条腿白加。
   assert.match(fn, /_billableAiComplete\(cfg, \[\{ role: "user", content: prompt \}\], 200\)/,
@@ -361,8 +362,8 @@ test("角色计划第一轮就要到，但只当指路用——闸门仍然只�
   //
   // 边界是死的：给模型的**信息**可以走快通道，harness 自己的**闸门**（计划门槛、写入义务、
   // 角色派发准入）仍然只认完整裁决。精简判断可以指路，不该管闸门。
-  const fn = CODE.slice(CODE.indexOf("async function _fastRoutingFlags("),
-                        CODE.indexOf("async function _fastRoutingFlags(") + 4200);
+  // 同上：AST 边界取整个函数，不用固定字符窗口（那种切法加几行注释就静静地不再守尾部）。
+  const fn = fnSource("_fastRoutingFlags", { code: true });
   assert.match(fn, /orchestrationMode 不是 solo 时，再给 roleNeeds/,
     "快通道没问角色——第一轮就不知道该派谁");
   // 逐个对目录校验这条不放，但"目录"是两处：内置角色表 + 用户自己声明的角色

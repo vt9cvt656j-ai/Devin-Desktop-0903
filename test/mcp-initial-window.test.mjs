@@ -36,7 +36,11 @@ const CORE = ["read_file", "list_dir", "search", "find_files", "update_plan", "a
               "write_file", "edit_file", "multi_edit", "run_cmd", "run_in_terminal", "read_logs",
               "save_skill", "mcp_server",
               "web_search", "web_fetch", "github_search", "github_repo",
-              "developer_community_search", "package_search", "package_source", "knowledge_search"];
+              "developer_community_search", "package_search", "package_source", "knowledge_search",
+              // 2026-08-22 又扩一个：run_subagent。这个文件守的是"MCP 不许挤爆窗口"，
+              // 那个保证与扩窗无关，仍然成立。扩它的理由见 logic.test.mjs 里那条窗口断言：
+              // 939 个真实回合里整个编排族 0 次调用，而三道门里有一道正是"不在窗口"。
+              "run_subagent"];
 
 // 上面这份 CORE 是**手抄的副本**，抄错或漏跟一次，下面每条 deepEqual 都会守着一条早已
 // 不存在的边界，而且全是绿的。所以先和 main.js 的真表对一遍：漂了当场红。
