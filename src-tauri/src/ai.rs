@@ -1493,7 +1493,11 @@ mod ide_header_tests {
         .unwrap();
         server.join().unwrap();
 
-        assert_eq!(result, "ok");
+        // ai_complete 现在回 { text, finishReason }：finish_reason 是唯一能分清
+        // 「模型什么都没产出」和「产到一半被截断」的信号，而这两种的修法完全相反。
+        // 这条用例守的是**请求头透传**，那条契约没变；顺带把新形状一起钉住。
+        assert_eq!(result["text"], "ok");
+        assert!(result.get("finishReason").is_some(), "新形状少了 finishReason 字段");
         let request = rx.recv().unwrap().to_ascii_lowercase();
         assert!(request.contains("x-ide-request-id: req_nonstream_123\r\n"));
     }
@@ -1675,7 +1679,8 @@ mod stream_timeout_tests {
             .send()
             .await
             .unwrap();
-        read_sse_text(resp, Duration::from_secs(5), None).await
+        // read_sse_text 现在同时带回 finish_reason；这个夹具只关心正文，取第一项即可。
+        read_sse_text(resp, Duration::from_secs(5), None).await.map(|(text, _finish)| text)
     }
 
     /// 走 OpenAI 形状的中转：增量在 choices[0].delta.content。
