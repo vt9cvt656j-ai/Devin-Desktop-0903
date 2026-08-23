@@ -222,22 +222,36 @@ fn resolve_target_pid(target: &AxTarget) -> Result<Option<i64>, String> {
     let Some(name) = target.app.as_deref().map(str::trim).filter(|a| !a.is_empty()) else {
         return Ok(None); // 前台
     };
+    // 三种名字都要认，因为它们**互不相同**而且模型只知道其中一种：
+    //   · System Events 的 name() 给的是可执行名（Finder / WeChat）
+    //   · 用户屏幕上看到的是 localizedName（访达 / 微信）——中文系统上和上面完全不同
+    //   · bundle id（com.apple.finder）是最稳的一种，模型有时会给它
+    // 只认第一种的话，在中文系统上用户说「访达」永远找不到；只认第二种的话，
+    // 模型说「Finder」永远找不到。实测本机两边都会发生。
     let script = format!(
         r##"(function(){{
   try {{
     var want = {};
+    var lw = want.toLowerCase();
     var se = Application('System Events');
     var ps = se.applicationProcesses();
-    var exact = null, sub = null;
+    var exact = null, sub = null, names = [];
     for (var i=0;i<ps.length;i++) {{
       var n=''; try{{n=String(ps[i].name()||'');}}catch(e){{continue;}}
       var pid=0; try{{pid=Number(ps[i].unixId());}}catch(e){{}}
       if(!isFinite(pid)||pid<=0) continue;
-      if(n===want) {{ exact={{pid:pid,name:n}}; break; }}
-      if(!sub && n.toLowerCase().indexOf(want.toLowerCase())>=0) sub={{pid:pid,name:n}};
+      var d=''; try{{d=String(ps[i].displayedName()||'');}}catch(e){{}}
+      var b=''; try{{b=String(ps[i].bundleIdentifier()||'');}}catch(e){{}}
+      // 只把「有窗口的」列进候选名单：几十个后台守护进程对模型毫无用处，
+      // 而它拿这份名单是为了重发一次调用。
+      var hasWin=false; try{{hasWin=ps[i].windows.length>0;}}catch(e){{}}
+      if(hasWin && names.length<14) names.push(d && d!==n ? (n+'（'+d+'）') : n);
+      if(n===want || d===want) {{ exact={{pid:pid,name:n}}; break; }}
+      if(!sub && (n.toLowerCase().indexOf(lw)>=0 || d.toLowerCase().indexOf(lw)>=0
+                  || (b && b.toLowerCase().indexOf(lw)>=0))) sub={{pid:pid,name:n}};
     }}
     var hit = exact || sub;
-    return JSON.stringify(hit ? {{ok:true,pid:hit.pid,name:hit.name}} : {{ok:false}});
+    return JSON.stringify(hit ? {{ok:true,pid:hit.pid,name:hit.name}} : {{ok:false,names:names}});
   }} catch(e) {{ return JSON.stringify({{ok:false,err:String(e)}}); }}
 }})()"##,
         serde_json::to_string(name).unwrap_or_else(|_| "\"\"".into())
@@ -251,9 +265,28 @@ fn resolve_target_pid(target: &AxTarget) -> Result<Option<i64>, String> {
     }
     // 找不到就**报错**，绝不悄悄退回读前台：那会让模型以为读的是 A，
     // 实际读的是别的应用，然后基于这份内容去点。
-    Err(format!(
-        "没有找到名字里含「{name}」的运行中应用。用 system 的 window.list 看准确名字，或直接给 pid。"
-    ))
+    //
+    // 报错时把**当前有窗口的应用名**一并给出来。只说一句「没找到，去 window.list 看」
+    // 是在把一次可以当场纠正的失败变成两个来回，而且 window.list 只列**屏幕上**的窗口，
+    // 后台应用（实测 Finder 就不在里面）根本不会出现——照它给的名单找会二次落空。
+    let candidates = v
+        .get("names")
+        .and_then(serde_json::Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter_map(serde_json::Value::as_str)
+                .collect::<Vec<_>>()
+                .join("、")
+        })
+        .unwrap_or_default();
+    Err(if candidates.is_empty() {
+        format!("没有找到名字里含「{name}」的运行中应用。给 pid 更准。")
+    } else {
+        format!(
+            "没有找到名字里含「{name}」的运行中应用。当前有窗口的是：{candidates}。\
+             名字三种写法都认（可执行名 Finder / 屏幕上的名字 访达 / bundle id com.apple.finder），挑一个重发，或者直接给 pid。"
+        )
+    })
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -1004,8 +1037,15 @@ const AX_ACTION_JS: &str = r##"(function(){
     var actualPid=0; try{actualPid=Number(proc.unixId());}catch(e){}
     if(!isFinite(actualPid)||actualPid<=0) return JSON.stringify({ok:false, err:'could not identify target process'});
     if(actualPid!==CTX.pid) return JSON.stringify({ok:false, err:'target app changed; run read_screen again', expectedPid:CTX.pid, actualPid:actualPid});
+    // 名字要**两个空间都认**，因为读屏那两条路记下的身份不在同一个空间里：
+    //   · 快路（sidecar）记的是 NSRunningApplication.localizedName —— 屏幕上的名字
+    //   · 慢路（JXA）记的是 System Events 的 name() —— 可执行名
+    // 英文系统上两者恰好相同，所以这个错藏得住；中文系统上 Finder 的显示名是「访达」，
+    // 只比 name() 的话每一次按 ref 点击都会被这道校验硬拒，而回执说的是
+    // 「应用身份变了」——一句和真实原因毫无关系的话。
     var actualAppName=''; try{actualAppName=String(proc.name()||'').slice(0,120);}catch(e){}
-    if(actualAppName!==CTX.appName) return JSON.stringify({ok:false, err:'target app identity changed (pid reused); run read_screen again'});
+    var actualShown=''; try{actualShown=String(proc.displayedName()||'').slice(0,120);}catch(e){}
+    if(actualAppName!==CTX.appName && actualShown!==CTX.appName) return JSON.stringify({ok:false, err:'target app identity changed (pid reused); run read_screen again', expected:CTX.appName, actual:actualAppName});
     var CAP = 500;
     var T1 = { AXButton:1,AXTextField:1,AXTextArea:1,AXCheckBox:1,AXRadioButton:1,AXPopUpButton:1,AXMenuButton:1,AXComboBox:1,AXLink:1,AXSlider:1,AXDisclosureTriangle:1,AXSegmentedControl:1,AXTabGroup:1,AXSearchField:1,AXStepper:1,AXIncrementor:1,AXColorWell:1,AXMenuItem:1,AXTab:1,AXDateField:1,AXSecureTextField:1 };
     var T2 = { AXStaticText:1,AXHeading:1 };
@@ -1793,6 +1833,16 @@ return JSON.stringify({operated:operated,changed:changed});
         assert!(
             js.contains("actualAppName!==CTX.appName"),
             "少了应用名校验——pid 复用时会点到新进程上"
+        );
+        // 两个名字空间都要认：快路记显示名（访达），慢路记可执行名（Finder）。
+        // 只认一个的话，中文系统上按 ref 点击会被这道校验全部硬拒。
+        assert!(
+            js.contains("actualShown!==CTX.appName"),
+            "只认一个名字空间——中文系统上按 ref 点击会被身份校验全部拒掉"
+        );
+        assert!(
+            js.contains("proc.displayedName()"),
+            "没读显示名，没法和快路记下的身份对上"
         );
     }
 
