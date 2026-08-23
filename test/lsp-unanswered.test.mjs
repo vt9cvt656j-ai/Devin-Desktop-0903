@@ -339,3 +339,37 @@ test("openFolder 换根之前先停掉语言服务器", () => {
     + "唯一的恢复手段是重启应用");
   assert.ok(iReset < iSwap, "在 workspaceRoots 换掉之后才停 —— 清 markers 之类会按新根算，停不干净");
 });
+
+// ── ⑧ 「装了没」和「跑起来用哪个解释器」要和启动那条路一致 ──────────────────
+test("lsp_check_available 和 lsp_start 用同一个作用域，否则安装进度卡必定超时", () => {
+  const i = RS.indexOf("pub fn lsp_check_available(");
+  assert.ok(i > 0, "lsp_check_available 不见了");
+  const fn = RS.slice(i, RS.indexOf("\n}\n", i));
+  assert.match(fn, /workspace: Option<String>/, "还是恒定不看工作区");
+  assert.match(fn, /trust_workspace_binaries: Option<bool>/, "没有信任参数");
+  assert.match(fn, /let scope = if workspace_trusted\(trust_workspace_binaries\)/, "作用域没过信任门");
+  assert.match(fn, /resolve_command\(cmd, scope\)/, "查找时没用上那个作用域");
+  assert.doesNotMatch(fn, /resolve_command\(cmd, None\)/,
+    "还在恒定传 None —— 装在项目 node_modules/.bin 里的语言服务器启动得起来，"
+    + "这里却判「没装」，那张卡每 2.5 秒问一次、转满 90 秒然后说「安装超时」");
+  // 前端也要真的传。
+  const j = MAIN.indexOf('core.invoke("lsp_check_available"');
+  assert.ok(j > 0);
+  assert.match(MAIN.slice(j, j + 300), /trustWorkspaceBinaries: isWorkspaceTrusted\(\)/, "前端没带信任状态");
+  assert.match(MAIN.slice(j, j + 300), /workspace:/, "前端没带工作区");
+});
+
+test("补全用的 Python 解释器要和 pyright 用的是同一个", () => {
+  const i = RS.indexOf("fn run_python_script(");
+  const fn = RS.slice(i, RS.indexOf("\n}\n", i));
+  assert.match(fn, /scope: Option<&str>/, "还是恒定跑系统解释器");
+  assert.match(fn, /pick_python\(scope\)/, "解释器没跟着作用域走");
+  assert.doesNotMatch(fn, /pick_python\(None\)/,
+    "同一个编辑器里会出现两套互相矛盾的「这个包存不存在」：pyright 认得项目 venv 里 "
+    + "pip 装的 requests，而模块名补全一片空白");
+  // 失败不许落缓存。
+  const g = RS.slice(RS.indexOf("pub fn lsp_python_env_symbols("), RS.indexOf("pub struct NodeEnvSymbols"));
+  assert.match(g, /if !mods\.is_empty\(\) \{\s*c\.modules = mods\.clone\(\);\s*c\.fetched_at = now;/,
+    "脚本跑挂时那张空模块表被当成有效缓存钉住 300 秒 —— 这五分钟里补全一个模块名都给不出，"
+    + "而且没有任何迹象说明为什么");
+});

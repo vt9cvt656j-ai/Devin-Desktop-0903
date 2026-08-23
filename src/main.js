@@ -612,7 +612,14 @@ async function tauriBackend() {
     },
     lspSend: (lang, message) => core.invoke("lsp_send", { lang, message }),
     lspStop: (lang) => core.invoke("lsp_stop", { lang }),
-    lspCheckAvailable: (lang) => core.invoke("lsp_check_available", { lang }),
+    // 作用域要和 lsp_start 一致：否则装在项目 node_modules/.bin 里的语言服务器
+    // 启动得起来、这里却判「没装」，那张安装进度卡会每 2.5 秒问一次、转满 90 秒
+    // 然后告诉用户「安装超时」——而他明明装成功了。
+    lspCheckAvailable: (lang) => core.invoke("lsp_check_available", {
+      lang,
+      workspace: (workspaceRoots && workspaceRoots[0]) || rootPath || null,
+      trustWorkspaceBinaries: isWorkspaceTrusted(),
+    }),
     // 「这台机器上有没有这个命令」——两个平台同一套判据。前端不要再拼 `command -v`：
     // cmd 没有那个内建，返回 9009，于是 Windows 上答案永远是没有。
     whichCommand: (name, workspace) => core.invoke("which_command", { name, workspace: workspace || null }),
@@ -627,7 +634,14 @@ async function tauriBackend() {
      * 虚的。后端缺省 fail closed，所以这里传错方向只会让功能降级，不会让门失效。
      */
     lspDetectPython: (workspace) => core.invoke("lsp_detect_python", { workspace: workspace || null, trustWorkspaceBinaries: isWorkspaceTrusted() }),
-    lspPythonEnvSymbols: (modules) => core.invoke("lsp_python_env_symbols", { modules }),
+    // 必须和 lsp_detect_python 用**同一个解释器**：那边把工作区 venv 的解释器交给了
+    // pyright，这边如果还跑系统 python3，同一个编辑器里就会出现两套互相矛盾的
+    // 「这个包存不存在」——pyright 认得项目里 pip 装的 requests，而补全一片空白。
+    lspPythonEnvSymbols: (modules) => core.invoke("lsp_python_env_symbols", {
+      modules,
+      workspace: (workspaceRoots && workspaceRoots[0]) || rootPath || null,
+      trustWorkspaceBinaries: isWorkspaceTrusted(),
+    }),
     lspNodeEnvSymbols: (projectDir, modules) => core.invoke("lsp_node_env_symbols", { projectDir, modules, trustWorkspaceBinaries: isWorkspaceTrusted() }),
     // 抓包 (MITM capture proxy, mitmproxy-backed)
     proxyAvailable: () => core.invoke("proxy_available"),
@@ -72179,6 +72193,9 @@ function _lintableLangId(rel) {
 const _TS_EXT = new Set(["ts", "tsx", "mts", "cts"]);
 const _INTERLEAVED_DIAG_MAX_FILES = 16;
 const _INTERLEAVED_DIAG_MAX_WAIT_MS = 4000;
+// TS/JS 由 Monaco 自带 worker 出诊断，几百毫秒的事——给它一个短得多的期限，
+// 免得整批等待被「反正总闸是 4 秒」拖满。
+const _INTERLEAVED_DIAG_TS_WAIT_MS = 1200;
 // After the agent changes JS/TS files, ask Monaco's built-in worker whether the
 // edits introduced ERRORS — surfaced immediately for self-correction. Side-effect
 // free: open models are read-only (never setValue → never falsely marked dirty);
@@ -72251,14 +72268,35 @@ async function _interleavedDiagnostics(editedRelPaths, root = "", baselineCounts
   // 对 LSP 语言等于"还没出结果就读，读到空的，判成无新增错误"——门看着在跑，实际恒放行。
   // 改成轮询：任一目标出现 marker 就收，最多等 _INTERLEAVED_DIAG_MAX_WAIT_MS。
   {
-    const deadline = Date.now() + _INTERLEAVED_DIAG_MAX_WAIT_MS;
+    /*
+     * 退出条件必须是「**每个**目标各自有结果或各自超时」，不是「任一出结果」。
+     *
+     * 原来写的是 any：一批里同时改了 src/app.ts 和 src/engine.rs，Monaco 自带的 TS
+     * worker 约 300ms 就为 app.ts 推出一条 marker → 循环立刻退出 → 此时 rust-analyzer
+     * 一条都还没到（它刚被 didOpen 告知这个文件，冷启动几秒起步）→ engine.rs 的
+     * markers 为空 → 新增错误数不含它 → 这道门放行，**engine.rs 里新引入的编译错误
+     * 一句提示都没有**，智能体照常收尾报「已完成」。而且它也进不了 unchecked 名单
+     * （它满足 isRunning，走的是「查过了、是干净的」那条腿），连「没检查」的诚实
+     * 兜底都拿不到。
+     *
+     * 每个目标有自己的期限：TS/JS 走 Monaco 自带 worker，几百毫秒的事，等久了是白等；
+     * 其余语言按 LSP 冷启动给足。整体仍有一个总闸，避免被最慢的那个拖满。
+     */
+    const started = Date.now();
+    const hardDeadline = started + _INTERLEAVED_DIAG_MAX_WAIT_MS;
+    const own = (t) => started + (t.isTs ? _INTERLEAVED_DIAG_TS_WAIT_MS : _INTERLEAVED_DIAG_MAX_WAIT_MS);
     for (;;) {
       await new Promise((r) => setTimeout(r, 150));
-      let any = false;
+      const now = Date.now();
+      let settled = true;
       for (const t of targets) {
-        try { if (monaco.editor.getModelMarkers({ resource: t.model.uri }).length) { any = true; break; } } catch {}
+        if (t._diagSettled) continue;
+        let has = false;
+        try { has = monaco.editor.getModelMarkers({ resource: t.model.uri }).length > 0; } catch {}
+        if (has || now >= own(t)) t._diagSettled = true;
+        else settled = false;
       }
-      if (any || Date.now() >= deadline) break;
+      if (settled || now >= hardDeadline) break;
     }
   }
   const reports = [];
