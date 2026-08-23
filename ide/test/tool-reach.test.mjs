@@ -29,7 +29,7 @@ function registeredToolNames() {
   // 有自己的测试（test/capabilities.test.mjs）。
   const build = new Function(
     "inTauri", "_applyCloudToolDescs", "_userCapabilities", "compileToolSchema", "_withoutDisabledTools",
-    `${extractFn("_buildAgentToolSchemas")}\n;return _buildAgentToolSchemas;`,
+    `${extractFn("_applyUserRoleEnums")}\n${extractFn("_buildAgentToolSchemas")}\n;return _buildAgentToolSchemas;`,
   )(
     true, (tools) => tools,
     () => ({ tools: [], commands: [], disabled: [], errors: [] }),

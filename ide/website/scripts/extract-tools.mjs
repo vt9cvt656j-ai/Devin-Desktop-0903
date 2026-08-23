@@ -108,6 +108,7 @@ const buildCatalog = new Function(
   "_applyCloudToolDescs",
   "_userCapabilities",
   `${extractFunction("_withoutDisabledTools")}
+   ${extractFunction("_applyUserRoleEnums")}
    ${extractFunction("_buildAgentToolSchemas")}
    ;return _buildAgentToolSchemas;`,
 )(true, (tools) => tools, () => ({

@@ -168,7 +168,7 @@ function buildRegisteredToolSchemas() {
     "_userCapabilities",
     "compileToolSchema",
     "_withoutDisabledTools",
-    `${extractFn("_buildAgentToolSchemas")}\n;return _buildAgentToolSchemas;`,
+    `${extractFn("_applyUserRoleEnums")}\n${extractFn("_buildAgentToolSchemas")}\n;return _buildAgentToolSchemas;`,
   )(
     true,
     (tools) => tools,
@@ -400,6 +400,17 @@ const AGENT_TOOL_NAME_ALLOWED = load("_agentToolNameAllowedByProfile", {
     "get_diagnostics", "git_status", "git_diff", "git_log", "git_blame",
     "read_logs", "read_terminal", "list_terminals",
   ]),
+});
+// 「这个文件名是依赖清单吗」现在是一条从 _STACK_TABLE 派生的判据，不再是三处各抄一遍的
+// 硬编码 Set。凡是判「读到的是清单还是实现」「改的是不是依赖清单」的函数都会引用它——
+// 注真实现而不是桩：桩会让"同一个 pubspec.yaml 两处判定是否一致"这件事测不出来。
+Object.assign(AUTO_LOAD_DEPS, {
+  _STACK_TABLE: loadConst("_STACK_TABLE"),
+  _MANIFEST_EXTRA: loadConst("_MANIFEST_EXTRA"),
+  _isManifestBaseName: load("_isManifestBaseName", {
+    _STACK_TABLE: loadConst("_STACK_TABLE"),
+    _MANIFEST_EXTRA: loadConst("_MANIFEST_EXTRA"),
+  }),
 });
 Object.assign(AUTO_LOAD_DEPS, {
   _agentAnswerOnlyInspection: AGENT_ANSWER_ONLY_INSPECTION,
@@ -11388,7 +11399,7 @@ test("automatic engineering references add only stack-relevant official forums",
 });
 
 test("stack extraction honors the declared package manager and project scripts", () => {
-  const extract = load("_extractStackHints");
+  const extract = load("_extractStackHints", { _STACK_TABLE: loadConst("_STACK_TABLE") });
   const stack = extract({
     "package.json": JSON.stringify({
       packageManager: "pnpm@10.0.0",
@@ -18598,7 +18609,10 @@ test("推断出的外部研究偏好永远不会让静默收尾多补一个回�
     "静默收尾不能再基于分类器预测的研究要求记账");
   assert.doesNotMatch(loop, /_pushNudge\("researchEvidence"/,
     "inferred research preferences must not force another model request");
-  assert.match(loop, /_researchEvidenceCategory\(it\.tc\.name, it\.call, it\.rawResult\)/,
+  // 前三个参数钉死不放：证据只能取自**实际完成**的工具结果（名字/调用/原始返回）。
+  // 尾参放开是因为官方站点判据已从 33 域硬编码常量改成逐包事实（registry 声明的
+  // homepage/repository + 工作区白名单），会以第四个参数传进来；那不改变本条不变量。
+  assert.match(loop, /_researchEvidenceCategory\(it\.tc\.name, it\.call, it\.rawResult[,)]/,
     "证据必须来自实际完成的工具结果");
 });
 
@@ -28313,7 +28327,7 @@ test("红测试要把 stdout 和 stderr 都喂回去，失败明细不能被对�
 });
 
 test("Maven / Gradle / .NET 这些项目也要认得出怎么跑测试", () => {
-  const extract = load("_extractStackHints", {});
+  const extract = load("_extractStackHints", { _STACK_TABLE: loadConst("_STACK_TABLE") });
   const maven = extract({ "pom.xml": "<project><artifactId>x</artifactId></project>" });
   assert.equal(maven.lang, "Java");
   assert.equal(maven.testCmd, "mvn -q test");
@@ -28328,11 +28342,18 @@ test("Maven / Gradle / .NET 这些项目也要认得出怎么跑测试", () => {
   });
   assert.ok(recognized("mvn -q test"));
   assert.ok(recognized("./gradlew test"));
-  const keyAt = RAW_SRC.indexOf("const keyFiles = [");
-  assert.ok(keyAt > 0);
-  const keyLine = SRC.slice(keyAt, RAW_SRC.indexOf("];", keyAt));
-  assert.match(keyLine, /"pom\.xml"/, "关键文件清单里还是没有这些构建描述文件");
-  assert.match(keyLine, /"build\.gradle\.kts"/);
+  // 读取清单不再是一句字面量，而是从 _STACK_TABLE 派生。对**派生结果**断言比对源码
+  // 文本更强：它同时证明了这张表真的是那三份判据的唯一来源。
+  const names = load("_stackManifestNames", { _STACK_TABLE: loadConst("_STACK_TABLE") })();
+  assert.ok(names.includes("pom.xml"), "关键文件清单里还是没有这些构建描述文件");
+  assert.ok(names.includes("build.gradle.kts"));
+  // 按扩展名认的那一族（.NET 的工程文件名跟着项目名走，没有固定文件名可读）
+  const exts = load("_stackManifestExts", { _STACK_TABLE: loadConst("_STACK_TABLE") })();
+  assert.ok(exts.includes(".csproj"), ".NET 整族仍然一个都识别不出来");
+  const dotnet = extract({ ".csproj": "<Project Sdk=\"Microsoft.NET.Sdk\" />" });
+  assert.equal(dotnet.lang, "C#");
+  assert.equal(dotnet.testCmd, "dotnet test");
+  assert.ok(recognized("dotnet test"), "认出来了却不被验证器白名单认，等于白认");
 });
 
 test("打包命令也算验证——打包失败必须被红构建门看见", () => {

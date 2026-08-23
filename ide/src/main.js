@@ -20996,7 +20996,7 @@ async function _loadPermissionRules(root) {
 // `_userCaps` 是**同步可读**的快照，因为 `_buildAgentToolSchemas` 是同步的，而且在模块
 // 求值时就会被调用一次（`_KNOWN_TOOLS`）。那一次读到的是空快照，正好——`_KNOWN_TOOLS`
 // 要的就是静态全集，不该被用户的停用清单削掉。
-let _userCaps = { tools: [], commands: [], disabled: [], errors: [] };
+let _userCaps = { tools: [], commands: [], roles: [], disabled: [], stack: {}, officialDocsHosts: [], errors: [] };
 let _userCapsCache = { root: null, ts: 0 };
 
 /** 当前生效的用户声明（同步）。 */
@@ -21019,17 +21019,29 @@ async function _refreshUserCapabilities(root) {
   // 所以：加能力（tools / knowledge / roles / commands）只认用户自己的作用域；仓库里的
   // 声明只保留 disabled（关掉某个内置工具）——那是收紧，任何来源都该允许。
   // 仓库想共享一套工具，把它抄进 ~/.mrdayone/settings.json 即可，那是一次明确的采纳动作。
+  //
+  // `stack`（checkCmd/testCmd/testDir）和 `officialDocsHosts` 走**同一条线**，理由和上面
+  // 一模一样，不是保守：
+  //   · stack.testCmd 会原样进模型上下文（栈提示里那句「改完必须你自己跑这条」），并被
+  //     _isRecognizedVerifierCommand 认成项目自己声明的验证命令。仓库能写这一格，就等于
+  //     clone 一个仓库＝把一行任意 shell 递到模型面前，还带着「这是本项目的验证命令」的背书。
+  //     注意今天从 package.json 推出来的是 `npm test` 这种**固定字面量**，仓库内容从来没有
+  //     逐字变成过命令行——所以这不是"边界本来就开着"，是一道还没被开的门。
+  //   · officialDocsHosts 决定「这份网页算不算官方证据」。仓库自证官方，等于让被 clone 的
+  //     那个人替模型降低对某个站的怀疑度。
+  // 两者都只认用户自己的作用域；报错文案照旧告诉用户抄到哪里去。
   const absorb = (raw, source, { trusted }) => {
     let parsed = null;
     try { parsed = JSON.parse(raw || "{}"); } catch { return; }
     const one = normalizeCapabilities(parsed, source);
     if (trusted) { scopes.push(one); return; }
-    const dropped = one.tools.length + one.roles.length + one.commands.length;
+    const dropped = one.tools.length + one.roles.length + one.commands.length
+      + Object.keys(one.stack || {}).length + (one.officialDocsHosts || []).length;
     scopes.push({
-      tools: [], roles: [], commands: [],
+      tools: [], roles: [], commands: [], stack: {}, officialDocsHosts: [],
       disabled: one.disabled,
       errors: dropped
-        ? [...one.errors, `${source}：来自仓库的声明里有 ${dropped} 项能力（工具/知识库/角色/命令）**没有启用**——`
+        ? [...one.errors, `${source}：来自仓库的声明里有 ${dropped} 项能力（工具/知识库/角色/命令/项目栈覆盖/官方文档域名）**没有启用**——`
           + `跟着 git clone 下来的文件不能给自己加能力，否则打开一个别人的仓库就等于让它往外发数据。`
           + `确实要用的话，把那几段抄进你自己的 ~/.mrdayone/settings.json。（这里的 disabled 照常生效，关能力任何来源都允许。）`]
         : one.errors,
@@ -22956,7 +22968,11 @@ solo 时给空数组。这一项决定第一轮就能不能派对角色，别为
     if (profile.orchestrationMode && profile.orchestrationMode !== "solo" && Array.isArray(raw.roleNeeds)) {
       const roles = raw.roleNeeds
         .map((role) => String(role || "").trim().toLowerCase())
-        .filter((role) => _AI_AGENT_ROLES.has(role));
+        // 判据必须和完整裁决那侧**逐字一致**（见 `_AI_AGENT_ROLES.has(item) || _userRoleMap().has(item)`）：
+        // 这一层挡的是模型凭空编出来的角色名，不是"非内置的都挡掉"。快通道原来漏了用户
+        // 声明的那一半，于是同一个 `data` 角色在快通道被丢、在完整裁决里保留——第一轮
+        // （快通道唯一起作用的那一轮）恰恰是决定派谁的那一轮，用户的角色永远赶不上。
+        .filter((role) => _AI_AGENT_ROLES.has(role) || _userRoleMap().has(role));
       if (roles.length) profile.roleNeeds = [...new Set(roles)].slice(0, 5);
     }
     // 一个旗标都没点亮、枚举也全是默认值时返回 null：让调用方走原路，别把空画像当成"判过了"。
@@ -24128,6 +24144,134 @@ let _ghErr = "";
 // stack summary the model sees prominently at the top of the context block. Much
 // more reliable than hoping the model derives "this is Next.js, run `npm test`"
 // from raw JSON. The same info is cached for the agent loop's auto-test.
+// 项目栈识别表。**唯一**一份「哪些文件是依赖清单」的名单——三处判据全部从它派生。
+//
+// 为什么要有这张表：漏掉一类构建描述文件，代价不是"少认一个栈"，是整块栈提示一个字都
+// 不出（lang 为空 → _formatStackHint 以前直接返回 ""），模型连一行「怎么跑测试」都收不到，
+// 只能靠猜，或者干脆一条验证命令都不跑就交付。而这份名单此前在三个地方各写了一遍、
+// 互相漂开：读取清单 12 条、"改它就是在选技术栈" 15 条、"清单只算文档不算源码" 13 条。
+// 同一个 pubspec.yaml，在一处算依赖清单、在另一处不算——这种分叉最难查。
+//
+// bespoke: true 的那几行由下面的专用分支解析（要读 JSON、按依赖嗅框架、算复杂度）；
+// 表里仍然列出，因为三份名单要从这里派生。其余的整条由表驱动：**加一门语言 = 加一行**，
+// 不用改代码、不用等发版（见 [[config-over-hardcoding]]）。用户自己那一层再往上叠：
+// _userCapabilities().stack 能覆盖任何一个字段——公司内部的构建包装器（`./bin/ci check`）、
+// monorepo 里某个子包的专属命令，永远不可能进产品自带的表。
+//
+// guessed：这条命令是**猜的默认值**，没有任何项目文件声明过它，也没验证装没装。要如实
+// 标给模型（退出 127 时它才知道该换命令，而不是当成代码错误），并被验证管线过滤掉。
+const _STACK_TABLE = [
+  { manifest: "package.json", lang: "JS/TS", bespoke: true },
+  { manifest: "Cargo.toml", lang: "Rust", bespoke: true },
+  { manifest: "pyproject.toml", lang: "Python", bespoke: true },
+  { manifest: "requirements.txt", lang: "Python", bespoke: true },
+  { manifest: "go.mod", lang: "Go", bespoke: true },
+  // 读它是为了拿 `test:` 目标，但它是构建逻辑、不是依赖清单：改 Makefile 不等于在选技术栈，
+  // 读 Makefile 也不等于"只读了一份依赖描述"。notManifest 就是这个区别。
+  { manifest: "Makefile", bespoke: true, notManifest: true },
+  { manifest: "pom.xml", lang: "Java", bespoke: true },
+  { manifest: "build.gradle", lang: "JVM", bespoke: true },
+  { manifest: "build.gradle.kts", lang: "JVM", bespoke: true },
+  { manifest: "composer.json", lang: "PHP", bespoke: true },
+  { manifest: "Gemfile", lang: "Ruby", bespoke: true },
+  { manifest: "README.md", doc: true, notManifest: true },
+
+  // ↓ 以下没有专用分支，整条由这张表驱动。
+  { manifest: "deno.json", lang: "Deno", pkgMgr: "deno",
+    cmds: { testCmd: "deno test -A", checkCmd: "deno check .", formatCmd: "deno fmt", lintCmd: "deno lint" } },
+  { manifest: "deno.jsonc", lang: "Deno", pkgMgr: "deno",
+    cmds: { testCmd: "deno test -A", checkCmd: "deno check .", formatCmd: "deno fmt", lintCmd: "deno lint" } },
+  { manifest: "mix.exs", lang: "Elixir", pkgMgr: "mix",
+    cmds: { testCmd: "mix test", checkCmd: "mix compile --warnings-as-errors", buildCmd: "mix compile", formatCmd: "mix format" },
+    frameworks: [[/phoenix/i, "Phoenix"]] },
+  { manifest: "pubspec.yaml", lang: "Dart", pkgMgr: "pub",
+    cmds: { testCmd: "dart test", checkCmd: "dart analyze", buildCmd: "dart compile exe .", formatCmd: "dart format ." },
+    frameworks: [[/^\s*flutter\s*:/m, "Flutter"]],
+    // Flutter 项目的命令是另一套，嗅到就整组换掉。
+    whenFramework: { Flutter: { testCmd: "flutter test", checkCmd: "flutter analyze", buildCmd: "flutter build", pkgMgr: "flutter pub" } } },
+  { manifest: "Package.swift", lang: "Swift", pkgMgr: "SwiftPM",
+    cmds: { testCmd: "swift test", checkCmd: "swift build", buildCmd: "swift build -c release" } },
+  { manifest: "build.zig", lang: "Zig", pkgMgr: "zig",
+    cmds: { testCmd: "zig build test", checkCmd: "zig build", buildCmd: "zig build -Doptimize=ReleaseSafe", formatCmd: "zig fmt ." } },
+  { manifest: "build.sbt", lang: "Scala", pkgMgr: "sbt",
+    cmds: { testCmd: "sbt test", checkCmd: "sbt compile", buildCmd: "sbt package" } },
+  { manifest: "deps.edn", lang: "Clojure", pkgMgr: "deps.edn",
+    cmds: { testCmd: "clojure -M:test", checkCmd: "clojure -M -e nil" }, guessed: ["clojure -M:test"] },
+  { manifest: "stack.yaml", lang: "Haskell", pkgMgr: "stack",
+    cmds: { testCmd: "stack test", checkCmd: "stack build --fast", buildCmd: "stack build" } },
+  { manifest: "cabal.project", lang: "Haskell", pkgMgr: "cabal",
+    cmds: { testCmd: "cabal test", checkCmd: "cabal build", buildCmd: "cabal build" } },
+  { manifest: "CMakeLists.txt", lang: "C/C++", pkgMgr: "CMake",
+    cmds: { checkCmd: "cmake --build build", buildCmd: "cmake --build build", testCmd: "ctest --test-dir build" },
+    guessed: ["cmake --build build", "ctest --test-dir build"] },
+  { manifest: "meson.build", lang: "C/C++", pkgMgr: "Meson",
+    cmds: { checkCmd: "meson compile -C build", buildCmd: "meson compile -C build", testCmd: "meson test -C build" },
+    guessed: ["meson compile -C build", "meson test -C build"] },
+  { manifest: "Gopkg.toml", lang: "Go", pkgMgr: "dep" },
+  { manifest: "Pipfile", lang: "Python", pkgMgr: "pipenv",
+    cmds: { testCmd: "pipenv run pytest", checkCmd: "pipenv run python -m compileall -q ." }, guessed: ["pipenv run pytest"] },
+  { manifest: "Podfile", lang: "Swift/ObjC", pkgMgr: "CocoaPods" },
+
+  // 按扩展名认的（工程文件名跟着项目名走，没有固定文件名）。这一族要多一次根目录列举，
+  // 命中的内容以扩展名为键放进 fileMap。
+  { ext: ".csproj", lang: "C#", pkgMgr: "NuGet",
+    cmds: { testCmd: "dotnet test", checkCmd: "dotnet build", buildCmd: "dotnet build -c Release", formatCmd: "dotnet format" } },
+  { ext: ".fsproj", lang: "F#", pkgMgr: "NuGet",
+    cmds: { testCmd: "dotnet test", checkCmd: "dotnet build", buildCmd: "dotnet build -c Release" } },
+  { ext: ".sln", lang: "C#", pkgMgr: "NuGet",
+    cmds: { testCmd: "dotnet test", checkCmd: "dotnet build" } },
+  { ext: ".cabal", lang: "Haskell", pkgMgr: "cabal",
+    cmds: { testCmd: "cabal test", checkCmd: "cabal build" } },
+  { ext: ".gemspec", lang: "Ruby", pkgMgr: "Bundler" },
+];
+
+/** 表里所有固定文件名（读取用，保持原大小写）。 */
+const _stackManifestNames = () => _STACK_TABLE.filter((r) => r.manifest).map((r) => r.manifest);
+/** 表里所有按扩展名认的后缀。 */
+const _stackManifestExts = () => _STACK_TABLE.filter((r) => r.ext).map((r) => r.ext);
+/**
+ * 「这个文件名是依赖清单吗」——小写基名判据，两处旧的硬编码 Set 都改用它。
+ * `extra` 收锁文件之类：它们不该出现在读取清单里（读了也没信息量），但确实算清单。
+ */
+const _MANIFEST_EXTRA = ["go.sum", "gemfile.lock", "package-lock.json", "yarn.lock", "pnpm-lock.yaml",
+  "cargo.lock", "poetry.lock", "composer.lock", "pubspec.lock", "package-swift"];
+function _isManifestBaseName(base, { includeLocks = true, includeDocs = false } = {}) {
+  // includeDocs 只在极少数「连说明文件也算」的场景放行；默认 notManifest 的行一律不算。
+  const b = String(base || "").toLowerCase();
+  if (!b) return false;
+  for (const row of _STACK_TABLE) {
+    if (row.notManifest && !includeDocs) continue;
+    if (row.manifest && row.manifest.toLowerCase() === b) return true;
+    if (row.ext && b.endsWith(row.ext)) return true;
+  }
+  return includeLocks && _MANIFEST_EXTRA.includes(b);
+}
+
+/**
+ * 用户声明的项目栈覆盖探测结果。
+ *
+ * 探测再全也有边界：公司内部的构建包装器、monorepo 里某个子包的专属命令，永远不可能
+ * 进产品自带的表。用户填一段 `stack: { checkCmd: "./bin/ci check" }` 就生效。
+ *
+ * 覆盖掉一条**猜测**命令时要把它从 guessedCmds 里摘掉——用户声明的是事实，不是猜测；
+ * 留着的话它会一直被标注成"未验证已安装"，也会被验证管线当猜测过滤掉，等于白填。
+ */
+function _applyUserStackOverride(stack) {
+  let over = null;
+  try { over = _userCapabilities().stack; } catch { return stack; }
+  if (!over || typeof over !== "object") return stack;
+  const guessed = new Set(stack.guessedCmds || []);
+  for (const [key, value] of Object.entries(over)) {
+    if (!value) continue;
+    if (stack[key] && guessed.has(stack[key])) guessed.delete(stack[key]);
+    stack[key] = value;
+    stack.declaredKeys = stack.declaredKeys || [];
+    if (!stack.declaredKeys.includes(key)) stack.declaredKeys.push(key);
+  }
+  stack.guessedCmds = [...guessed];
+  return stack;
+}
+
 function _extractStackHints(fileMap) {
   // checkCmd = a FAST compile/type-check (no test execution) — the cheapest strongest
   // per-change correctness signal. Used for non-JS/TS stacks (JS/TS gets live Monaco
@@ -24253,14 +24397,45 @@ function _extractStackHints(fileMap) {
       (out.guessedCmds = out.guessedCmds || []).push(out.testCmd);
     }
   }
+  // 表驱动的其余语言。专用分支先跑，这里只**填空**（`||`），所以一个 JS/TS + Elixir 的
+  // 混合仓不会被后来者把已经识别出来的命令顶掉；lang 走和上面完全相同的 " + X" 追加口径。
+  for (const row of _STACK_TABLE) {
+    if (row.bespoke || row.doc) continue;
+    const key = row.manifest || row.ext;
+    const content = fileMap[key];
+    if (content === undefined || content === null || content === "") continue;
+    if (row.lang) out.lang = out.lang ? (out.lang.includes(row.lang) ? out.lang : out.lang + " + " + row.lang) : row.lang;
+    if (row.pkgMgr) out.pkgMgr = out.pkgMgr || row.pkgMgr;
+    // 框架嗅探先做：命中的框架可能整组换掉命令（Flutter 之于 Dart）。
+    let framework = "";
+    for (const [re, name] of row.frameworks || []) {
+      if (re.test(String(content))) { framework = name; break; }
+    }
+    if (framework) out.framework = out.framework || framework;
+    const cmds = { ...(row.cmds || {}), ...((framework && row.whenFramework?.[framework]) || {}) };
+    if (cmds.pkgMgr) { out.pkgMgr = cmds.pkgMgr; delete cmds.pkgMgr; }
+    const guessed = new Set(row.guessed || []);
+    for (const [k, v] of Object.entries(cmds)) {
+      if (out[k] || !v) continue;
+      out[k] = v;
+      // 框架专属那组是从项目文件里嗅出来的事实，不是猜测；只有 row.guessed 里列名的才是。
+      if (guessed.has(v)) (out.guessedCmds = out.guessedCmds || []).push(v);
+    }
+  }
   return out;
 }
 
 // Format the extracted stack into a tight, model-friendly hint block. Goes at the
 // TOP of the context (before raw file dumps) so the model sees it first.
 function _formatStackHint(s) {
-  if (!s || !s.lang) return "";
-  const lines = [`📦 项目栈: ${s.lang}${s.framework ? " · " + s.framework : ""}${s.pkgMgr ? " · 包管理 " + s.pkgMgr : ""}${s.complexity === "large" ? " · ⚠️ 大项目" : s.complexity === "medium" ? " · 中型项目" : ""}`];
+  // 认不出语言 ≠ 什么都不知道：套件位置、用户自己声明的构建命令、已声明依赖都可能在。
+  // 以前这里一个 `!s.lang` 就把整块提示吞掉，模型连一行「怎么跑测试」都收不到，
+  // 于是只能猜，或者干脆一条验证命令都不跑就交付。
+  if (!s) return "";
+  const _known = s.lang || s.testDir || s.checkCmd || s.testCmd || s.buildCmd || s.devCmd
+    || s.lintCmd || s.formatCmd || s.declaredKeys?.length;
+  if (!_known) return "";
+  const lines = [`📦 项目栈: ${s.lang || "未识别（下面这些是从项目文件或你的声明里读到的事实）"}${s.framework ? " · " + s.framework : ""}${s.pkgMgr ? " · 包管理 " + s.pkgMgr : ""}${s.complexity === "large" ? " · ⚠️ 大项目" : s.complexity === "medium" ? " · 中型项目" : ""}`];
   // 猜测命令要如实标注——模型自己跑到 127 时才知道该换命令而不是当成代码错误。
   const _guessed = new Set(s.guessedCmds || []);
   const _unverified = (cmd) => _guessed.has(cmd) ? "（猜测默认、未验证已安装；退出 127 就换 venv 内工具或 python -m compileall，别当代码错误）" : "";
@@ -24945,11 +25120,28 @@ async function _gatherAgentContext(query, sessionRoot, boundaryRoot = "") {
   // lang 为空 → _formatStackHint 直接返回 ""，模型连一行「怎么跑测试」都收不到，
   // 只能靠猜或者干脆一条验证命令都不跑就交付。讽刺的是验证器白名单本来就认得
   // mvn/gradle/dotnet 这些命令——能认，但从来发现不了。
-  const keyFiles = ["package.json", "README.md", "Cargo.toml", "pyproject.toml", "go.mod", "Makefile", "requirements.txt",
-    "pom.xml", "build.gradle", "build.gradle.kts", "composer.json", "Gemfile"];
+  const keyFiles = _stackManifestNames();
   const _keyReadsPromise = Promise.all(keyFiles.map(name =>
     backend.readTextFile(root + "/" + name).catch(() => null).then(c => c?.trim() ? [name, c] : null)
   ));
+  // 工程文件名跟着项目名走（`MyApp.csproj`），没有固定文件名可读——.NET / F# / Haskell
+  // 整个语族此前因此一次都识别不出来。列一次根目录换整族可见，命中的内容以**扩展名**
+  // 为键放进 fileMap，_extractStackHints 因此仍然是纯函数（只吃 fileMap）。
+  const _extReadsPromise = (async () => {
+    const exts = _stackManifestExts();
+    if (!exts.length) return [];
+    let entries = [];
+    try { entries = await backend.readDir(root); } catch { return []; }
+    if (!Array.isArray(entries)) return [];
+    const hits = [];
+    for (const ext of exts) {
+      const hit = entries.find((e) => e && !e.is_dir && String(e.name || "").toLowerCase().endsWith(ext));
+      if (!hit) continue;
+      const text = await backend.readTextFile(root + "/" + hit.name).catch(() => null);
+      if (text?.trim()) hits.push([ext, text]);
+    }
+    return hits;
+  })();
   // 测试套件在**哪个目录**，和"用什么命令跑"是两件事，而以前只告诉了后者。
   //
   // 实证（用户的 ThesisX）：项目有标准 pytest 套件 tests/ + conftest.py + unit/ +
@@ -25070,9 +25262,10 @@ async function _gatherAgentContext(query, sessionRoot, boundaryRoot = "") {
   const fileMap = {};
   for (const r of results) { if (r) fileMap[r[0]] = r[1]; }
   for (const name of await _lockReadsPromise) { if (name) fileMap[name] = "[present]"; }
+  for (const hit of await _extReadsPromise) { if (hit) fileMap[hit[0]] = hit[1]; }
 
   // Stack hints FIRST (high-priority, model sees it before raw file dumps).
-  const stack = _extractStackHints(fileMap);
+  const stack = _applyUserStackOverride(_extractStackHints(fileMap));
   // 套件位置紧跟在栈提示后面：它回答的是"新测试写到哪去"，而 testCmd 只回答"怎么跑"。
   // testDir 必须在 _projectStacks.set **之前**落到 stack 上：set 存的是浅拷贝，先 set
   // 再赋 testDir 的话，Map 里那份永远没有 testDir——_strayScratchFiles 和「改的文件有
@@ -25087,7 +25280,12 @@ async function _gatherAgentContext(query, sessionRoot, boundaryRoot = "") {
   // 答不上来就一个字都不说。放在这里而不是塞进 _extractStackHints：那个函数是"栈提示"的
   // 纯格式化器，依赖名单和它要回答的问题（怎么跑测试）没关系。
   stack.declaredDeps = _declaredDepsFromFileMap(fileMap);
-  if (stack.lang) _projectStacks.set(root, { ...stack, root }); else _projectStacks.delete(root);
+  // 闸门从"认出语言"放宽到"有任何一条可用事实"。原来只要 lang 为空，testDir、
+  // declaredDeps、用户自己声明的 checkCmd 会**一起**被丢掉——一个 .NET 仓库或一个用户
+  // 手填了构建命令的仓库，栈提示整块一个字不出。
+  const _hasStackFact = !!(stack.lang || stack.testDir || stack.declaredKeys?.length
+    || stack.checkCmd || stack.testCmd || stack.buildCmd || stack.devCmd);
+  if (_hasStackFact) _projectStacks.set(root, { ...stack, root }); else _projectStacks.delete(root);
   const stackHint = _formatStackHint(stack);
   if (stackHint) {
     // Insert near the top, right after osBlock and workspace path.
@@ -34622,9 +34820,11 @@ function _buildAgentToolSchemas(includeWrite, mcpTools = []) {
   "codrops_search",
   "smashingmag_search",
   "awwwards_search"]);
-    return _applyCloudToolDescs(_withoutDisabledTools(tools.filter((t) => !desktopOnly.has(t.function.name))));
+    return _applyUserRoleEnums(_applyCloudToolDescs(_withoutDisabledTools(tools.filter((t) => !desktopOnly.has(t.function.name)))));
   }
-  return _applyCloudToolDescs(_withoutDisabledTools(tools));
+  // 角色枚举**必须**包在 _applyCloudToolDescs 外面：那一步整块替换 function.parameters，
+  // 包在里面的话云端 tools.json 会把枚举原样盖回内置 11 个（见 _applyUserRoleEnums 注释）。
+  return _applyUserRoleEnums(_applyCloudToolDescs(_withoutDisabledTools(tools)));
 }
 
 /**
@@ -34642,6 +34842,72 @@ function _withoutDisabledTools(tools) {
   if (!off.length) return tools;
   const drop = new Set(off);
   return tools.filter((t) => !drop.has(t?.function?.name));
+}
+
+/**
+ * 把用户自己声明的角色**补进派活工具的 `role` 枚举**。
+ *
+ * 配置那一侧早就通了：`_userRoleMap()` 有这个角色，`_roleCapabilities` 优先取它的工具矩阵，
+ * `_agentRoleBlock` 发它的提示词，分类器的枚举后缀也带上了它。唯独 run_subagent /
+ * spawn_multiple_agents / run_worker 三个 schema 里的 `role` 枚举写死着内置那 11 个——
+ * 而 schema 的枚举是**硬约束**：模型要么根本选不出这个角色，要么选了被结构化输出挡掉。
+ * 声明了等于没声明，而且失败得毫无声响。
+ *
+ * ## 为什么必须在 `_applyCloudToolDescs` **之后**
+ *
+ * 网关那份 `server/prompts/tools.json` 里这四处枚举和本文件里逐字相同，而
+ * `_applyCloudToolDescs` 是**整块换掉 `function.parameters`**（不是只换 description）。
+ * 所以在它之前改枚举，登录状态下会被云端那份原样盖回去——白改，而且只在联网时才错。
+ * 两个 return 分支都必须包在最外层。
+ *
+ * ## 为什么是「按结构找」而不是写死四条路径
+ *
+ * 路径写死就是第五份手抄：以后谁再加一个带 role 的工具，这里不会跟着长。这里走整棵
+ * schema，凡是属性名为 `role`、且带字符串 enum 的节点都补——枚举在哪一层都逃不掉。
+ *
+ * 只在真的声明了角色时才动 schema：没声明的用户（绝大多数）拿到的字节和以前完全一样，
+ * prompt cache 一点不受影响。
+ */
+function _applyUserRoleEnums(tools) {
+  // 名字取自 `_userCapabilities().roles`，**不能**走 `_userRoleMap()`：那个函数为了校验
+  // 工具名会回头调 `_buildAgentToolSchemas(true, [])`，而这里正在它的返回路径上——调过去
+  // 就是无限递归。两边的名字集合逐字相同（_userRoleMap 的 key 就是这些 name，
+  // normalizeRole 已统一小写），所以「两侧判据一致」这条没有被这次取值方式破坏。
+  let names = [];
+  try { names = (_userCapabilities().roles || []).map((r) => String(r?.name || "")).filter(Boolean); } catch { return tools; }
+  if (!names.length || !Array.isArray(tools)) return tools;
+  // 找到就地改**不行**：`_applyCloudToolDescs` 把 `function.parameters` 直接指向了
+  // `_remoteTools` 里那个对象，它跨调用长期存活。就地改会把角色名永久焊进云端缓存
+  // ——用户删掉一个角色之后它还在，换个工作区也还在。所以先扫、命中了再整块深拷贝。
+  const walk = (node, depth, mutate) => {
+    if (!node || typeof node !== "object" || depth > 12) return false;
+    if (Array.isArray(node)) {
+      let hit = false;
+      for (const child of node) if (walk(child, depth + 1, mutate)) hit = true;
+      return hit;
+    }
+    let hit = false;
+    const role = node.properties && typeof node.properties === "object" ? node.properties.role : null;
+    if (role && typeof role === "object" && Array.isArray(role.enum)) {
+      if (names.some((n) => !role.enum.includes(n))) hit = true;
+      if (mutate) role.enum = [...new Set([...role.enum, ...names])];
+    }
+    for (const key of Object.keys(node)) {
+      if (key === "enum") continue;
+      if (walk(node[key], depth + 1, mutate)) hit = true;
+    }
+    return hit;
+  };
+  for (const t of tools) {
+    const params = t?.function?.parameters;
+    if (!walk(params, 0, false)) continue;
+    let copy = null;
+    try { copy = JSON.parse(JSON.stringify(params)); } catch { copy = null; }
+    if (!copy) continue; // 拷不动就原样留着：宁可少一个角色，也不能把云端缓存改脏
+    walk(copy, 0, true);
+    t.function.parameters = copy;
+  }
+  return tools;
 }
 
 // ============================================================================
@@ -36907,6 +37173,18 @@ const _OFFICIAL_RESEARCH_EVIDENCE_TOOLS = new Set([
   "mdn_search", ]);
 const _COMMUNITY_RESEARCH_EVIDENCE_TOOLS = new Set([
   "developer_community_search", "stackoverflow_search", "hackernews_search", ]);
+// 通用兜底名单——**不再是唯一判据**。
+//
+// 它判错的不是边缘情况：tauri.app（本产品自己的框架）、tailwindcss.com、postgresql.org、
+// redis.io、vercel.com、supabase.com、stripe.com、djangoproject.com 一个都不在里面。
+// 后果是模型读到了**真正的官方文档**，`_researchEvidenceCategory` 判成不是 official →
+// 取证提醒照发让它回头再查、收尾契约继续列为未完成：白烧一轮，再给用户一行不实的「未验证」。
+//
+// 往这张表里再塞几个域名只是把表加长——生态每年都在长新域名，手写名单永远追不上。真正的
+// 判据换成了**执行事实**：本次会话里 package_search / package_source 取回的注册表记录里，
+// 那个包**自己声明**的 homepage / repository / documentation 主机（见
+// `_declaredDocsHostsFromResult`），加上用户在自己的配置里填的内部/企业文档站
+// （`officialDocsHosts`）。这张表留着，因为这 33 个确实是官方站，而且离线时它是唯一还在的那份。
 const _OFFICIAL_RESEARCH_HOSTS = new Set([
   "github.com", "raw.githubusercontent.com", "docs.github.com",
   "gitlab.com", "docs.gitlab.com", "gitee.com", "codeberg.org",
@@ -36918,14 +37196,70 @@ const _OFFICIAL_RESEARCH_HOSTS = new Set([
   "cloud.google.com", "docs.aws.amazon.com", "kubernetes.io", "docs.docker.com",
 ]);
 
-function _isOfficialResearchUrl(value) {
+function _isOfficialResearchUrl(value, extraHosts = null) {
   try {
     const host = new URL(String(value || "")).hostname.toLowerCase().replace(/^www\./, "");
     for (const official of _OFFICIAL_RESEARCH_HOSTS) {
       if (host === official || host.endsWith(`.${official}`)) return true;
     }
+    // 本次会话解析出来的「这个包自己声明的主页/仓库」+ 用户配置里的内部文档站。
+    // 同样按后缀匹配：包声明的是 `tauri.app`，模型读的常常是 `v2.tauri.app/start/`。
+    for (const official of (extraHosts || [])) {
+      if (!official) continue;
+      if (host === official || host.endsWith(`.${official}`)) return true;
+    }
   } catch {}
   return false;
+}
+
+/**
+ * 从一次包注册表查询的**返回正文**里，抠出这个包自己声明的主页 / 仓库 / 文档主机。
+ *
+ * 这是判定「官方」的执行事实来源：不是我们认为哪些站官方，而是**包自己在注册表记录里
+ * 写的那几个 URL**。npm 的 homepage/repository、PyPI 的 project_urls、crates.io 的
+ * homepage/documentation/repository、Homebrew 的 Homepage 都是这一类。
+ *
+ * 只认 `package_search` / `package_source` 两个工具的结果。放宽到 web_fetch 就等于让任何
+ * 一个被抓下来的页面自证官方——那是把判据交给被判定的对象。
+ *
+ * 抠法是「键名紧跟 URL」，不是"正文里所有 URL"：README 正文里随手一个链接不该获得官方身份。
+ */
+const _DECLARED_DOCS_KEY_RE = new RegExp(
+  "(?:^|[\\s,{\"'])(homepage|home_page|repository|repo|documentation|docs|project_url|project_urls)"
+  + "\"?\\s*[:=]\\s*[\"'{\\s]*(?:git\\+)?(https?://[^\\s\"'<>,)\\]}]+)", "gi");
+function _declaredDocsHostsFromResult(toolName, result) {
+  const name = String(toolName || "").trim().toLowerCase();
+  if (name !== "package_search" && name !== "package_source") return [];
+  const content = String(result?.content || "");
+  if (!content) return [];
+  const out = [];
+  const re = new RegExp(_DECLARED_DOCS_KEY_RE.source, "gi");
+  let m;
+  while ((m = re.exec(content)) && out.length < 12) {
+    let host = "";
+    try { host = new URL(m[2]).hostname.toLowerCase().replace(/^www\./, ""); } catch { continue; }
+    // 注册表站本身已经在兜底表里，重复登记只是噪音。
+    if (host && !out.includes(host)) out.push(host);
+  }
+  return out;
+}
+
+/** 本 run 当前生效的「额外官方主机」：用户声明 ∪ 本会话从注册表记录里解析出来的。 */
+function _officialDocsHosts(run) {
+  const set = new Set();
+  try { for (const h of _userCapabilities().officialDocsHosts || []) if (h) set.add(h); } catch {}
+  const harvested = run && run._declaredDocsHosts;
+  if (harvested instanceof Set) for (const h of harvested) set.add(h);
+  return set;
+}
+
+/** 把一次工具结果里解析出的包声明主机记进 run（上限 64，防一次巨大结果把表撑爆）。 */
+function _recordDeclaredDocsHosts(run, toolName, result) {
+  if (!run) return;
+  const hosts = _declaredDocsHostsFromResult(toolName, result);
+  if (!hosts.length) return;
+  const set = run._declaredDocsHosts instanceof Set ? run._declaredDocsHosts : (run._declaredDocsHosts = new Set());
+  for (const h of hosts) { if (set.size >= 64) break; set.add(h); }
 }
 
 function _researchResultHasEvidence(toolName, result) {
@@ -36947,14 +37281,16 @@ function _researchResultHasEvidence(toolName, result) {
   return content.length >= 40;
 }
 
-function _researchEvidenceCategory(toolName, call, result) {
+function _researchEvidenceCategory(toolName, call, result, extraHosts = null) {
   const name = String(toolName || "").trim().toLowerCase();
   if (!_researchResultHasEvidence(name, result)) return "";
   if (_OFFICIAL_RESEARCH_EVIDENCE_TOOLS.has(name)) return "official";
   if (_COMMUNITY_RESEARCH_EVIDENCE_TOOLS.has(name)) return "community";
   // Search result titles are discovery only. A direct fetch of a known official or
   // maintainer-owned host is the only generic web operation that counts as evidence.
-  if (name === "web_fetch" && _isOfficialResearchUrl(call?.url || call?.path)) return "official";
+  // `extraHosts` 是本会话的执行事实（包自己声明的主页/仓库）+ 用户配置的内部文档站；
+  // 「必须真的读到正文」这条不变式没有变——它由上面的 _researchResultHasEvidence 把着。
+  if (name === "web_fetch" && _isOfficialResearchUrl(call?.url || call?.path, extraHosts)) return "official";
   return "";
 }
 
@@ -38884,12 +39220,10 @@ function _introducesNewTech(call) {
   // 依赖清单：改它就等于在选技术栈。
   const p = String(call.path || "").replace(/\\/g, "/").toLowerCase();
   const name = p.slice(p.lastIndexOf("/") + 1);
-  const MANIFESTS = new Set([
-    "package.json", "requirements.txt", "pyproject.toml", "cargo.toml", "go.mod",
-    "gemfile", "composer.json", "pubspec.yaml", "build.gradle", "build.gradle.kts",
-    "pom.xml", "package-swift", "package.swift", "podfile", "mix.exs",
-  ]);
-  if (!MANIFESTS.has(name)) return false;
+  // 名单从 _STACK_TABLE 派生：这里和读取清单、"清单只算文档"那两处以前各写了一遍并且
+  // 互相漂开（同一个 pubspec.yaml 在一处算清单、另一处不算）。锁文件不算"选技术栈"——
+  // 它是解析结果，不是人做的选择。
+  if (!_isManifestBaseName(name, { includeLocks: false })) return false;
   // 只有**新增**才算选型；删依赖、改版本号不需要重新调研。
   const added = String(call.content ?? call.new_string ?? "");
   return added.length > 0;
@@ -46655,11 +46989,12 @@ function _evidenceGradingHint(readPaths, draftText) {
   // exactly trusting a description instead of the real files. So a manifest counts as a
   // description (like a doc), NOT as authoritative source/config — reading only manifests
   // must still push the agent to open actual source before a project/implementation claim.
-  const MANIFEST = new Set(["package.json", "cargo.toml", "go.mod", "go.sum", "pyproject.toml", "requirements.txt", "gemfile", "gemfile.lock", "pom.xml", "build.gradle", "composer.json", "pubspec.yaml", "pipfile"]);
+  // 同一份名单（见 _isManifestBaseName）。这里连锁文件一起算：读 package-lock.json
+  // 同样只是读了一份依赖描述，不构成"看过真源码"。
   let sawDoc = false, sawSource = false, sawConfig = false;
   for (const p of paths) {
     const ext = _ext(p), base = _base(p);
-    if (MANIFEST.has(base)) { sawDoc = true; continue; } // a manifest is a description of deps
+    if (_isManifestBaseName(base)) { sawDoc = true; continue; } // a manifest is a description of deps
     if (SOURCE_EXT.has(ext)) { sawSource = true; continue; }
     if (CONFIG_EXT.has(ext) || base === "dockerfile" || base === "makefile") { sawConfig = true; continue; }
     if (DOC_EXT.has(ext) || base === "readme" || base === "license" || base === "changelog" || base === "authors") { sawDoc = true; continue; }
@@ -54314,7 +54649,10 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
         const _workspaceMutated = _ok && (it._wikiMutated || _toolMutatesWorkspace(it.call, it.rawResult));
         if (_ok) {
           if (!it._skipped) {
-            const category = _researchEvidenceCategory(it.tc.name, it.call, it.rawResult);
+            // 先登记「这个包自己声明的主页/仓库」，再分类：同一轮里模型常常是先
+            // package_search 拿到事实、下一轮才 web_fetch 去读那个站。
+            _recordDeclaredDocsHosts(run, it.tc.name, it.rawResult);
+            const category = _researchEvidenceCategory(it.tc.name, it.call, it.rawResult, _officialDocsHosts(run));
             if (category) _researchEvidence[category].add(it.tc.name);
           }
           if (it.tc.name !== "update_plan" && (it._planAdvanced || _advancePlanFromTool(run, it.call, it.rawResult))) planSteps = run._planSteps;
