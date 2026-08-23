@@ -17556,7 +17556,8 @@ function _disposeChatSession(session) {
   if (!session || session._disposed) return;
   session._disposed = true;
   _teardownChatGrowthObserver(session);
-  try { _setStreaming(session, false); } catch {}
+  // 关掉会话 = 这事不做了，常驻监视器也要收（否则它还攥着一个已经不存在的会话）。
+  try { if (session) session._stopRequested = true; _setStreaming(session, false); } catch {}
   try {
     _releaseMessagesAttachmentUrls(session?.memory?.assemble?.() || session?.memory?.recent || [], session?.container, false);
     _releaseMessagesAttachmentUrls(session?._pendingSends || [], session?.container, false);
@@ -20651,11 +20652,17 @@ function _setStreaming(sess, on) {
   if (!sess) return;
   const wasStreaming = !!sess.streaming;
   sess.streaming = !!on;
-  // Interactive tools (ask_user / pickers / background monitors) can otherwise keep
-  // their promises, listeners, and timers alive after Stop.  Settle them before the
-  // transport cancellation so an old run cannot resume itself later.
+  // Interactive tools (ask_user / pickers) can otherwise keep their promises, listeners
+  // and timers alive after a run ends.  Settle them before the transport cancellation so
+  // an old run cannot resume itself later.
+  //
+  // **但常驻监视器不在此列。** 这里原来是无条件全清，而 background_monitor 的全部意义
+  // 就是熬过这一轮的结束（模型让用户去建 key / 去点授权，它盯着 .env / 端口 / URL）。
+  // 一起清掉的后果是那句「条件满足后自动恢复对话继续执行」从来没兑现过。
+  // 用户按停走的是 `_stopSessionRun`（那儿传 hard=true），不是这里。
   if (!on) {
-    try { _cancelSessionInteractions(sess); } catch {}
+    try { _cancelSessionInteractions(sess, false, !!sess._stopRequested); } catch {}
+    sess._stopRequested = false;
   }
   // Stop → cancel ALL in-flight requests. Each _agentModelTurn registers a unique
   // per-turn requestId in sess._cancelIds (so parallel sub-agents have separate
@@ -20706,10 +20713,32 @@ function _setStreaming(sess, on) {
 // A picker is allowed to wait for a person, but it must never keep an obsolete run
 // alive after Stop, a new turn, or a closed chat session.  Keeping the registry on
 // the session also lets lifecycle code cancel waits before it has a direct run ref.
-function _registerRunInteraction(run, cleanup) {
+/**
+ * @param durable 常驻监视器：**自然收尾时不要杀它**。
+ *
+ * 这里原来只有一类生命周期，于是「阻塞式 picker」和「后台监视器」被当成同一种东西 ——
+ * 而它们要活多久正好相反：
+ *   · picker（ask_user / designboard / preview）在轮次**内**阻塞等人，这一轮结束它就该走；
+ *   · background_monitor 的**全部意义**就是熬过这一轮：模型让用户去建个 API key、
+ *     去点个授权，然后挂一个监视器盯着 `.env` / 端口 / URL，条件满足自动把对话续上。
+ *
+ * 后果是 background_monitor 那句回执从来没兑现过：它 return「✅ 后台监控已启动，
+ * 条件满足后自动恢复对话继续执行」，紧接着模型收尾 → `_setStreaming(sess, false)` →
+ * `_cancelSessionInteractions(sess)`（不传第二参 → retiredOnly=false → `!retiredOnly`
+ * 恒真 → 无条件全杀）→ 监视器当场死，而且 suppressFollowup=true，**连模型都不告诉**。
+ * 用户去把事做完回来，界面上什么都没发生 —— 用户原话「明明用户完成了他也不知道，
+ * 他也不自己继续，就很蠢」，机制原因就在这一行。
+ *
+ * 常驻不等于不死。它仍然在三种情况下被清掉，都是用户可感知的「这事不做了」：
+ * 按停、开新一轮、关掉会话（见 _cancelSessionInteractions 的 hard 参数）。
+ * 而监视器分支自己那套 `_bmRetired()`（换代际/dispose 才退场）写得是对的，
+ * 只是此前被这道 run 级注册抢先判死，永远轮不到它说话。
+ */
+function _registerRunInteraction(run, cleanup, { durable = false } = {}) {
   if (!run || typeof cleanup !== "function") return () => {};
   const sess = run.session;
-  if (!run._interactiveCleanups) run._interactiveCleanups = new Set();
+  const bucket = durable ? "_durableCleanups" : "_interactiveCleanups";
+  if (!run[bucket]) run[bucket] = new Set();
   if (sess) {
     if (!sess._interactiveRuns) sess._interactiveRuns = new Set();
     sess._interactiveRuns.add(run);
@@ -20718,28 +20747,39 @@ function _registerRunInteraction(run, cleanup) {
   const release = () => {
     if (!active) return;
     active = false;
-    run._interactiveCleanups?.delete(cleanup);
-    if (sess && !run._interactiveCleanups?.size) sess._interactiveRuns?.delete(run);
+    run[bucket]?.delete(cleanup);
+    if (sess && !run._interactiveCleanups?.size && !run._durableCleanups?.size) {
+      sess._interactiveRuns?.delete(run);
+    }
   };
-  run._interactiveCleanups.add(cleanup);
+  run[bucket].add(cleanup);
   return release;
 }
 
-function _cancelRunInteractions(run) {
-  if (!run?._interactiveCleanups?.size) return;
-  for (const cleanup of [...run._interactiveCleanups]) {
-    try { cleanup(); } catch {}
+/** @param hard 连常驻监视器一起清（按停 / 开新一轮 / 关会话），默认只清阻塞式的。 */
+function _cancelRunInteractions(run, hard = false) {
+  const sets = hard ? ["_interactiveCleanups", "_durableCleanups"] : ["_interactiveCleanups"];
+  for (const key of sets) {
+    if (!run?.[key]?.size) continue;
+    for (const cleanup of [...run[key]]) { try { cleanup(); } catch {} }
+    run[key].clear();
   }
-  run._interactiveCleanups.clear();
-  run.session?._interactiveRuns?.delete(run);
+  if (!run?._interactiveCleanups?.size && !run?._durableCleanups?.size) {
+    run?.session?._interactiveRuns?.delete(run);
+  }
 }
 
-function _cancelSessionInteractions(sess, retiredOnly = false) {
+/**
+ * @param retiredOnly 只清已经不属于当前一轮的
+ * @param hard 连常驻监视器一起清。**只有「这事不做了」才传 true**：用户按停、开新一轮、
+ *   关掉会话。自然收尾不传 —— 那正是监视器要熬过去的那一刻。
+ */
+function _cancelSessionInteractions(sess, retiredOnly = false, hard = false) {
   if (!sess?._interactiveRuns?.size) return;
   for (const run of [...sess._interactiveRuns]) {
     const retired = !sess.streaming || !!sess._disposed
       || Number(run?._sessionGen || 0) !== Number(sess._runGen || 0);
-    if (!retiredOnly || retired) _cancelRunInteractions(run);
+    if (!retiredOnly || retired) _cancelRunInteractions(run, hard);
   }
 }
 
@@ -28119,7 +28159,11 @@ async function sendPrompt(text, attachments = [], readyConfig = null, opts = {})
   // A replacement turn must also release UI waits owned by the previous
   // generation.  Merely advancing _runGen is not enough: an unresolved picker
   // promise would otherwise keep its old loop suspended indefinitely.
-  _cancelSessionInteractions(sess, true);
+  //
+  // hard=true：上一代的常驻监视器也一起收。用户已经开了新一轮，说明他不再等那件事了；
+  // 留着的话它条件一满足就会往当前这轮里插一段无关的续跑。
+  // 注意这里传的是 retiredOnly=true —— 只收**上一代**的，这一轮自己刚挂的不受影响。
+  _cancelSessionInteractions(sess, true, true);
   const _turnRunGen = sess._runGen;
   const _turnLive = () => sess.streaming && sess._runGen === _turnRunGen;
   chatEl.querySelector(".chat-empty")?.remove();
@@ -36247,6 +36291,29 @@ agent: ["read_file", "list_dir", "search", "find_files", "update_plan", "ask_use
             //     工具」（下面那条注释就是这条规矩的原文）。
             // 两个都不给子体（不在 _READ_TOOLS 里）：只读子体本来就不写文件、不注册服务。
             "save_skill", "mcp_server",
+            // background_monitor 和 get_diagnostics 进窗口，理由和上面 github_repo 那条
+            // 逐字相同：**文案点名的工具必须在手里**。
+            //
+            //   · background_monitor 的自我描述第一句就是 "you **must** call this tool
+            //     whenever a step needs the user to do something by hand"，提示词里另有
+            //     两处（持续任务律、AGENT_INTERACTIVE_WAIT）再点名一次 —— 三处都在指着它，
+            //     而它不在窗口里。模型手边唯一够得着的是 ask_user：弹卡片、阻塞 120 秒、
+            //     超时后自己编一句「用户没回，按最合理的方案继续」。用户去建个 API key
+            //     要三五分钟，回来看到的是一堆基于「假设 key 已经有了」的产物。
+            //     实测 14 天真实流量：ask_user 58 次，background_monitor 30 次 —— 而正文
+            //     交办（没有工具调用）那些根本不进统计。
+            //
+            // **只加这一个。** get_diagnostics 一度也想加（收尾账本里有
+            // `new_diagnostics_unresolved`），但那条理由站不住：诊断已经有**自动**路径
+            // （`_interleavedDiagnostics` 每批改动后自己读，不需要模型调工具），而且
+            // logic.test.mjs 明确钉着「engineering turn should load get_diagnostics only
+            // when requested」——那是刻意的延后加载。诊断真正的缺口在别处：非 JS/TS 项目
+            // 里 `_interleavedDiagnostics` 不肯自己拉起语言服务器，于是那条自动路径整个哑掉。
+            // 那个要在它自己那儿修，不是靠往窗口里塞工具。
+            //
+            // 字节不是约束：上限 512KB / 256 个（_TOOL_PAYLOAD_MAX_*），当前 25 个约 33KB，
+            // 这一个 2KB。窗口小是编辑取舍（怕分散注意力），不是预算逼的。
+            "background_monitor",
             // github_repo 和 github_search 必须成对进窗口：搜索只给标题和链接，而
             // _researchEvidenceCategory 明说「搜索结果标题只算发现，不算证据」——真正记进
             // 取证账本的是 github_repo（读仓库真实内容）。只放搜索那一半，模型会去 GitHub
@@ -64545,9 +64612,11 @@ return { type: call.type, path: call.query || "", content: `[失败] ${call.type
           _drainFollowups(_bmSess);
         }
       };
+      // durable：这一轮自然结束时**不要**杀它 —— 熬过这一轮正是它存在的理由。
+      // 按停 / 开新一轮 / 关会话仍然会收（见 _registerRunInteraction 的注释）。
       _bmRelease = _registerRunInteraction(run, () => {
         _bmFinish("cancelled", "已因任务停止而取消", "", true);
-      });
+      }, { durable: true });
       if (!_runInteractionLive(run)) {
         _bmFinish("cancelled", "已因任务停止而取消", "", true);
         return { type: "background_monitor", path: bmType, content: "[已取消] 当前等待所属任务已停止或被替换。" };
@@ -74664,7 +74733,8 @@ _sendBtnEl?.addEventListener("click", (e) => {
     e.preventDefault();
     e.stopPropagation();
     const s = _currentSession();
-    if (s) _setStreaming(s, false);
+    // 按停 = 这事不做了，连常驻监视器一起收。标志由 _setStreaming 消费后清掉。
+    if (s) { s._stopRequested = true; _setStreaming(s, false); }
     _setSendBtnStop(false);
     showToast("Generation stopped");
   }

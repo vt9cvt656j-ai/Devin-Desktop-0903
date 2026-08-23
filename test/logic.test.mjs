@@ -11896,7 +11896,7 @@ test("external source tools stay real but load on demand", () => {
     "lazy loading must derive from the live registry instead of a second static tool table");
 });
 
-test("Agent 开局窗口 24 个：取外部资源那一族、读本机依赖真源码的、自家语料、硬拒点名的、自己造能力的那两个、think，以及唯一的编排入口，都要在里面", () => {
+test("Agent 开局窗口 25 个：取外部资源那一族、读本机依赖真源码的、自家语料、硬拒点名的、自己造能力的那两个、think、唯一的编排入口，以及盯着用户做完没的那个，都要在里面", () => {
   // 用户 2026-08-18 点名："把初始化编排工具从 11 提升到 16，把那些加进来"（那五个取外部
   // 资源的）。后来又按同一条理由加了 run_in_terminal + read_logs：harness 自己有三处**硬拒**
   // 并点名要 run_in_terminal（timeout 包住的 dev server、前台长命令、需要真 TTY 的交互程序），
@@ -11908,7 +11908,31 @@ test("Agent 开局窗口 24 个：取外部资源那一族、读本机依赖真�
   const core = /agent: \["read_file"[\s\S]*?\],/.exec(SRC);
   assert.ok(core, "agent 核心表被改名或挪走了，这条断言失去落点");
   const names = [...core[0].matchAll(/"([a-z_]+)"/g)].map((m) => m[1]);
-  assert.equal(names.length + 1, 25, `开局窗口是 ${names.length + 1} 个（含 search_tools），不是 25`);
+  assert.equal(names.length + 1, 26, `开局窗口是 ${names.length + 1} 个（含 search_tools），不是 26`);
+  /*
+   * 2026-08-23 +1：background_monitor。用户原话：
+   * 「让用户去做 xxx，他不会自己盯着，明明用户完成了他也不知道，他也不自己继续，就很蠢」
+   * 「验证那些各种内容明明就应该能帮我做」。
+   *
+   * 判据和上面 github_repo 那条**逐字同源**：文案点名的工具必须在手里。
+   *   · background_monitor 被点名三次 —— 它自己的描述第一句 "you **must** call this
+   *     tool whenever a step needs the user to do something by hand"，加上提示词里的
+   *     持续任务律和 AGENT_INTERACTIVE_WAIT。三处都在指着它，而它不在窗口里。
+   *     模型手边唯一够得着的是 ask_user：弹卡片、**同轮阻塞** 120 秒、超时后自己编一句
+   *     「用户没回，按最合理的方案继续」。而「去后台建个 API key」这类事人要三五分钟，
+   *     于是模型在没有 key 的前提下往下写，用户回来看到一堆基于假设的产物。
+   *     实测 14 天真实流量：ask_user 58 次 vs background_monitor 30 次，而**正文交办**
+   *     （没有工具调用那种）根本不进统计。
+   *
+   * 字节不是约束：上限 512KB / 256 个，当前 25 个约 35KB，这一个 2KB。
+   * 真实成本是注意力，所以下面那条 <= 32 的上限继续守着。
+   * 怎么证伪：扩窗后如果 background_monitor 的调用率相对 ask_user 没上去，
+   * 说明瓶颈不在窗口，把它撤回去。
+   */
+  assert.ok(names.includes("background_monitor"),
+    "background_monitor 不在开局窗口——harness 三处点名要它，模型却只够得着会阻塞 120 秒的 ask_user");
+  // get_diagnostics 一度也加过，撤了：诊断有自动路径（_interleavedDiagnostics），
+  // 而且下面 "explicit bug fixes" 那条明确钉着它要延后加载。理由不成立就不要硬塞。
   // 2026-08-22 +1：run_subagent——整个编排族里够不着得最彻底的一个。
   //
   // 实测（用户机器 939 个真实回合的情景档案）：run_subagent / run_worker /
@@ -28568,6 +28592,95 @@ test("每条回复底下的操作条：五个按钮，全部走委托", () => {
   assert.match(add, /main\.appendChild\(_buildMsgActions\(/, "助手消息没挂上操作条");
   assert.ok(!/wrap\.appendChild\(_buildMsgActions\(/.test(add),
     "挂到 wrap 上了——那是 flex row，会跑到头像右边去，而不是正文底下");
+});
+
+test("后台监视器要熬过一轮的自然收尾——那正是它存在的理由", () => {
+  /*
+   * 用户原话：「让用户去做 xxx，他不会自己盯着，明明用户完成了他也不知道，
+   * 他也不自己继续，就很蠢」。
+   *
+   * 机制原因：`background_monitor` 注册进的是 run 级交互表，而 `_setStreaming(sess,false)`
+   * 在**任何**一轮结束时都会 `_cancelSessionInteractions(sess)` —— 不传第二参、
+   * `retiredOnly=false`、`!retiredOnly` 恒真 → 无条件全杀。于是它 return
+   * 「✅ 后台监控已启动，条件满足后自动恢复对话继续执行」之后，模型一收尾监视器就死了，
+   * 而且 suppressFollowup=true，连模型都不告诉。那句承诺从来没兑现过。
+   *
+   * 这里钉的是**行为**：常驻的熬得过自然收尾，阻塞式的照旧当场清，按停两种都收。
+   */
+  const mk = () => {
+    const calls = [];
+    const run = { session: null };
+    const reg = load("_registerRunInteraction");
+    const cancelRun = load("_cancelRunInteractions");
+    return { run, calls, reg, cancelRun };
+  };
+
+  // 阻塞式（picker）：自然收尾就该清。
+  {
+    const { run, calls, reg, cancelRun } = mk();
+    reg(run, () => calls.push("picker"));
+    cancelRun(run);                      // hard 缺省 = 自然收尾
+    assert.deepEqual(calls, ["picker"], "阻塞式 picker 在自然收尾时没被清");
+  }
+  // 常驻（监视器）：自然收尾**不许**清。
+  {
+    const { run, calls, reg, cancelRun } = mk();
+    reg(run, () => calls.push("monitor"), { durable: true });
+    cancelRun(run);
+    assert.deepEqual(calls, [], "常驻监视器在自然收尾时被杀了——那句「条件满足自动恢复」又白说了");
+    cancelRun(run, true);                // 按停
+    assert.deepEqual(calls, ["monitor"], "按停之后常驻监视器还活着");
+  }
+  // 两类共存：自然收尾只清一半。
+  {
+    const { run, calls, reg, cancelRun } = mk();
+    reg(run, () => calls.push("picker"));
+    reg(run, () => calls.push("monitor"), { durable: true });
+    cancelRun(run);
+    assert.deepEqual(calls, ["picker"], "自然收尾把两类一起清了");
+  }
+
+  // 源码侧：三个「这事不做了」的入口必须传 hard，自然收尾那处必须不传。
+  const setStreaming = stripJsComments(extractFn("_setStreaming"));
+  assert.match(setStreaming, /_cancelSessionInteractions\(sess, false, !!sess\._stopRequested\)/,
+    "自然收尾又变成无条件全清了");
+  const src = stripJsComments(SRC);
+  assert.match(src, /s\._stopRequested = true; _setStreaming\(s, false\)/,
+    "按停没有标记 hard——常驻监视器会在用户明确喊停之后继续跑");
+  assert.match(src, /_cancelSessionInteractions\(sess, true, true\)/,
+    "开新一轮没有收掉上一代的常驻监视器");
+  // 监视器自己要注册成常驻，否则上面全白搭。
+  assert.match(src, /\}, \{ durable: true \}\);/, "background_monitor 没有注册成常驻");
+});
+
+test("harness 点名的工具必须在手里：盯着用户做完没的那个", () => {
+  /*
+   * 仓库自己已经三次为同一条理由破例（run_subagent 那族实测 939 回合 0 次调用、
+   * save_skill「模型绝不会为一件可选的事先花一轮 search_tools」、github_repo
+   * 「文案点名的工具必须在手里」）。background_monitor 是同一个形状：它的自我描述
+   * 第一句就是 "you must call this tool"，提示词里另有两处点名，而它不在开局窗口 ——
+   * 模型手边只有 ask_user（同轮阻塞 120 秒，超时后自己编一句「用户没回」）。
+   *
+   * get_diagnostics 一度也加过，**撤了**：诊断已经有自动路径（_interleavedDiagnostics
+   * 每批改动后自己读，不需要模型调工具），而且下面 "explicit bug fixes" 那条测试明确
+   * 钉着它要延后加载。理由不成立就不要硬塞 —— 这条留在这儿，免得下次又想加一遍。
+   */
+  const src = SRC;
+  const i = src.indexOf('agent: ["read_file", "list_dir"');
+  assert.ok(i > 0, "agent 工具窗口的定义不见了");
+  let depth = 0, j = i;
+  for (; j < src.length; j++) {
+    if (src[j] === "[") depth++;
+    else if (src[j] === "]" && --depth === 0) break;
+  }
+  const names = [...src.slice(i, j + 1).matchAll(/"([a-z_0-9]+)"/g)].map((m) => m[1]);
+  for (const t of ["background_monitor", "ask_user"]) {
+    assert.ok(names.includes(t), `${t} 不在开局工具窗口里——模型够不着，只能先花一轮 search_tools`);
+  }
+  assert.ok(!names.includes("get_diagnostics"),
+    "get_diagnostics 又被塞进窗口了——诊断有自动路径，而且它被钉为延后加载");
+  // 别把窗口撑成一整份注册表：注意力是真实成本，字节不是（上限 512KB，当前约 33KB）。
+  assert.ok(names.length <= 32, `开局窗口涨到 ${names.length} 个了，注意力会被稀释`);
 });
 
 test("抓取卡片展开后要能读：分段、正文字体、英文不从词中间断", () => {
