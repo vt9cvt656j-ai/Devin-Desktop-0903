@@ -65,7 +65,13 @@ test("判据一个字没放宽", () => {
 const DEAD = ["paletteHarmonyRequired", "cardLayoutRequired", "cardStylingRequired",
   "semanticIconRequired", "gitHistory", "gitLocalMutation", "gitReviewMutation",
   "nativeHtmlRequested", "darkThemeRequested", "gradientThemeRequested",
-  "monochromeThemeRequested", "categoryProductSurface"];
+  "monochromeThemeRequested", "categoryProductSurface",
+  // 第二批：只写不读的那三个。判据要看**读**，不是看出现次数——
+  // databaseDecisionRequired 唯一的「读」在同一句赋值的右边（自引用），上一轮漏了。
+  "gitReadOnly", "existingUiStackSignal", "databaseDecisionRequired",
+  // 新加的那条「只写不读」守卫当场又抓出一个：它写进的 referenceWebsiteRequired
+  // 才是真有读者的那个，它自己没有。
+  "referenceWebsiteRequested"];
 
 test("12 个零读者维度已从模型必判清单里删掉", () => {
   const back = DEAD.filter((k) => DIMS.includes(k));
@@ -90,7 +96,11 @@ test("有读者的维度一个都没被误删", () => {
   }
   // 精确对数，不用下限。下限是绿的摆设：把维度表删掉 5 个它照样过（2026-08-23 变异实测）。
   // 这个数变了要**刻意**改这里并说明为什么——和本仓库钉开局工具窗口大小同款。
-  assert.equal(DIMS.length, 61,
+  // 2026-08-23 再删 3 个：gitReadOnly（连定义之外一次都没出现）、existingUiStackSignal
+  // 与 databaseDecisionRequired（**只写不读**——后者那个「读」是同一句赋值右边的自引用，
+  // 上一轮的判据把它当成了真读者，所以漏掉了）。加了「只写不读」守卫之后当场又抓出
+  // referenceWebsiteRequested，一并删。61 → 57。
+  assert.equal(DIMS.length, 57,
     `维度数变成 ${DIMS.length} 了。加维度＝模型每轮多一项必判，删维度＝可能删掉有读者的；`
     + "两种都该在这里留下痕迹");
 });
@@ -99,4 +109,19 @@ test("键名清单确实变短了（这是收益本身）", () => {
   // 模型每一轮都要读这份清单并逐项判定。它的长度就是「输入规模」的一部分。
   assert.ok(DIMS.join(",").length <= 1000,
     `键名清单 ${DIMS.join(",").length} 字符——删了 12 个还没降下来，说明删的不是它`);
+});
+
+test("维度表里不许再有「只写不读」的", () => {
+  // 上一轮按「出现次数」判，漏掉了 databaseDecisionRequired——它唯一的那次「读」
+  // 在同一句赋值的右边（`m.X = !!(m.X || …)`），是自引用不是消费者。
+  // 这条按**读写位置**判，把那一类一并守住。
+  const dead = [];
+  for (const d of DIMS) {
+    const reads = (SRC.match(new RegExp(`\\b\\w+\\.${d}\\b(?!\\s*=(?!=))`, "g")) || []).length;
+    // 自引用：`x.D = ...x.D...` 同一行里既写又读，那次读不算消费者
+    const selfRef = (SRC.match(new RegExp(`\\b\\w+\\.${d}\\s*=[^\\n]*\\b\\w+\\.${d}\\b`, "g")) || []).length;
+    if (reads - selfRef <= 0) dead.push(d);
+  }
+  assert.deepEqual(dead, [],
+    `这些维度只写不读，占着模型每一轮的判定面却没有任何消费者：${dead.join(",")}`);
 });

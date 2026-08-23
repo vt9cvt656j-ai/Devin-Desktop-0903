@@ -22834,7 +22834,7 @@ const _AI_INTENT_DIMENSIONS = [
   "motionChoreographyRequired", "browserAutomation", "capture", "interactiveWait", "longRunningRuntime",
   "explicitWorkspaceMutation", "explicitRuntimeAction", "explicitExternalAction", "explicitReadOnly",
   "git", "gitBranching", "gitCommit", "gitSync",
-  "gitPublish", "gitReview", "referenceWebsiteRequested", 
+  "gitPublish", "gitReview", 
   "qualityFloor", "allProjectsEngineering",
 ];
 const _AI_INTENT_RELATIONS = new Set(["new", "continue", "correct", "replace", "clarify"]);
@@ -23451,7 +23451,6 @@ function _mergeAiIntentProfile(base, intents, text, priorState = null) {
   m.fullWebsite = !!(m.fullWebsite || deliverySurface === "website" || deliverySurface === "web_app");
   m.referenceWebsiteUrls = Array.isArray(base?.referenceWebsiteUrls) ? [...base.referenceWebsiteUrls] : [];
   m.referenceWebsiteRequired = !!(m.ui && m.referenceWebsiteUrls.length);
-  m.referenceWebsiteRequested = !!(m.referenceWebsiteRequested || m.referenceWebsiteRequired);
   m.fromZeroUiProject = !!(m.uiProject && (projectState === "greenfield" || designMode === "michael_design_2_5_greenfield"));
   m.existingWebsite = !!(m.existingProject && m.uiProject && !m.fromZeroUiProject);
   // A repository containing UI is a fact, not a request for a design review. Michael Design
