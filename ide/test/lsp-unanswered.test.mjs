@@ -180,8 +180,9 @@ test("stderr 要真的送上来，Error 这一支不许再是死变体", () => {
 
 test("stopped 事件要带上死前的最后几行", () => {
   assert.match(RS, /Stopped \{ lang: String, tail: Vec<String> \}/, "Stopped 没带 tail");
-  const stop = RS.slice(RS.indexOf("let tail = tail_for_stop"), RS.indexOf("LspEvent::Stopped { lang, tail }") + 40);
+  const stop = RS.slice(RS.indexOf("let mut tail = tail_for_stop"), RS.indexOf("LspEvent::Stopped { lang, tail }") + 40);
   assert.ok(stop.length > 40, "取 tail 那段不见了");
+  assert.match(stop, /\.iter\(\)\.cloned\(\)\.collect/, "没真的把环形缓冲取出来");
   const loop = RS.slice(RS.indexOf("let mut reader = BufReader::new(stdout);"), RS.indexOf("LspEvent::Stopped { lang, tail }"));
   assert.match(loop, /sleep\(std::time::Duration::from_millis/,
     "stdout EOF 之后没等 stderr 收尾 —— 最能说明死因的那几行恰好赶不上这班车");
@@ -268,4 +269,32 @@ test("未信任导致的降级要说出来，不能让用户对着「无法解�
   const seg = LSP.slice(i, i + 700);
   assert.match(seg, /info\.untrustedFallback/, "前端没接这个标记");
   assert.match(seg, /信任这个工作区/, "没告诉用户怎么解决 —— 这恰恰是他一键能解决的问题");
+});
+
+// ── ⑥ 读线程退出时必须摘掉自己，否则这门语言整个会话静默死亡 ──────────────
+test("读循环退出前先把这门语言从 map 里摘掉，再发 stopped", () => {
+  const loop = RS.slice(RS.indexOf("let mut reader = BufReader::new(stdout);"), RS.indexOf("LspEvent::Stopped { lang, tail }"));
+  assert.ok(loop.length > 100, "读循环不见了");
+  assert.match(loop, /reap\(&reap_map, &lang\);/,
+    "读线程退出时没摘掉自己 —— 进程还活着 → prune_stopped 保留 → 下次 lsp_start 撞上 "
+    + "already running → 前端静默 return。这门语言整个会话再也没有补全/诊断/跳转，"
+    + "界面上一个字都没有，而那个几百 MB 的进程一直挂着");
+  // 顺序：先摘再发事件。反了的话前端可能在记录还在时就去重启。
+  assert.ok(loop.indexOf("reap(&reap_map") < loop.length, "reap 跑到发事件后面去了");
+  // 非法帧的原因要带出去，不能只留一句「已停止」。
+  assert.match(RS, /frame_error = format!\("协议帧读不懂/, "非法帧的原因被丢了");
+  assert.match(RS, /if !frame_error\.is_empty\(\)\s*\{\s*tail\.push\(frame_error\);/, "原因没接进 stopped 的 tail");
+});
+
+test("Windows 也要走 resolve_command——npm 装的语言服务器全是 .cmd", () => {
+  // Rust 的 Command 在 Windows 上走 CreateProcessW，只补 .exe、不查 PATHEXT。
+  // 而 typescript-language-server / bash-language-server / yaml-language-server /
+  // docker-langserver / vue-language-server / intelephense / graphql-lsp 全是 npm 装的 *.cmd。
+  // 更难查的是表现：lsp_check_available 的 Windows 分支**会**扫 .cmd，于是返回「装了」，
+  // 前端走的是「启动失败」而不是「去装一个」——用户看到「明明装好了却没有补全」。
+  for (const [file, src] of [["lsp.rs", RS], ["debug.rs", readFileSync(new URL("../src-tauri/src/debug.rs", import.meta.url), "utf8")]]) {
+    assert.doesNotMatch(src, /#\[cfg\(windows\)\]\s*\n\s*let resolved = command\.clone\(\);/,
+      `${file}：Windows 分支又回到裸名字 spawn —— npm 装的适配器/语言服务器一个都起不来`);
+    assert.match(src, /let resolved = process_util::resolve_command\(/, `${file}：resolve_command 没了`);
+  }
 });
