@@ -13691,11 +13691,18 @@ async function loadBackendModels() {
         powerRouteAvailable:
           typeof it.power_route_available === "boolean" ? it.power_route_available : null,
         // 运营方把这个模型标成免费（每日免费点数能买，不动钱包和会员额度）。
-        // 网关按**和计费同一条解析**下发（effective_billing_micro + paid_model_requires_balance），
-        // 客户端不自己按价格列猜 —— 单模型覆盖能把「三列价格全 0」的模型定成收费，
-        // 猜的话会标出一个点进去才发现扣钱的 free。
-        // 老网关不下发这个字段 → undefined → `=== true` 为假 → 不标，退回旧样子。
-        free: it.free === true,
+        // 这个模型属于哪一类免费。网关按**和计费同一条解析**下发，客户端不自己按价格列猜
+        // —— 单模型覆盖能把「三列价格全 0」的模型定成收费，猜的话会标出一个点进去才发现
+        // 扣钱的 free。
+        //
+        //   always —— 永远不花钱
+        //   pool   —— 从每日免费点池扣，池子空了就开始扣会员额度/钱包
+        //   none   —— 收费
+        //
+        // 老网关只有 free 这个 bool，退化成 always/none（它没有池子这个概念）。
+        freeKind: typeof it.free_kind === "string" ? it.free_kind : (it.free === true ? "always" : "none"),
+        // pool 类的一次调用要扣多少免费点。和网关准入门同一个判据（带 1 毫点地板）。
+        freeCallPoints: Number(it.free_call_points) || 0,
         // 运维在网关里指定的开箱默认模型。老网关不下发这个字段 → 全 false → 沿用旧行为。
         isDefault: it.default === true,
         desc: it.description || "", group: label,
@@ -13815,6 +13822,32 @@ const _bootCompressionCapability = _loadMichaelCompressionCapability();
 let _michaelUser = _bootCompressionCapability
   ? { michael_compression: _bootCompressionCapability }
   : null;
+
+/**
+ * 这个模型**此刻**免不免费 —— 决定模型菜单上那个 free 徽标画不画。
+ *
+ * 不是模型的静态属性，而是「模型 × 当前免费点余额」：
+ *
+ *   · always —— 三列价格全 0、没有按次费。永远不花钱，永远标。
+ *   · pool   —— 网关声明的 `mode:"free"`。**是有额度的**：从每日免费点池里扣，池子空了
+ *               就落到会员额度/钱包开始真扣钱。所以额度用完徽标必须消失，第二天点数
+ *               回满（UTC 0 点）又该出现。
+ *
+ * 判据和网关准入门的 `free_pool_covers_call` 是同一句：够不够付**这一次**，不是「还剩不剩
+ * 一点」。网关那边记着为什么——结算是全额扣或一点不扣，`> 0` 会让余数永远挂着。
+ * 每次调用一次的成本由网关随目录下发（freeCallPoints，带 1 毫点地板），客户端不自己换算。
+ *
+ * 余额未知（没登录、或 /api/me 还没回来）时按**显示**处理：那确实是一个免费模型，
+ * 「不知道」不等于「用完了」。菜单每次打开重建，所以余额一变，下次打开就是新的。
+ */
+function _modelIsFreeNow(m) {
+  if (!m) return false;
+  if (m.freeKind === "always") return true;
+  if (m.freeKind !== "pool") return false;
+  const balance = Number(_michaelUser?.free_points);
+  if (!Number.isFinite(balance)) return true;
+  return balance >= (Number(m.freeCallPoints) || 0);
+}
 
 function _setMichaelUserProfile(user, compressionVerified = true) {
   _michaelUser = user && typeof user === "object" ? user : null;
@@ -15802,7 +15835,7 @@ function buildModelMenu() {
       //   [图标] [名称] ……… [free] [对勾位]
       // 对勾那一列固定占位（.menu__item .check-slot），所以没选中的行里 free 徽标也停在
       // 同一个横坐标上，一列对齐 —— 用户要的就是这个。
-      const freeTag = m.free ? `<span class="free-tag">free</span>` : "";
+      const freeTag = _modelIsFreeNow(m) ? `<span class="free-tag">free</span>` : "";
       const b = brandFor(m);
       item.innerHTML = `<svg class="ic ${b.cls}"><use href="#${b.sym}" /></svg>`
         + `<span class="name"></span>`
@@ -22500,6 +22533,23 @@ const _AI_KNOWLEDGE_DOMAINS = new Set([
   "systems-programming", "michael-design",
 ]);
 /**
+ * 工程半的字段名单。**只此一份。**
+ *
+ * 它有两个用途：判定「工程半到没到场」，以及在模型把 JSON 拍平时认出「顶层就是工程半」。
+ * 今天这份名单是内联字面量，而赋值处那一批是另一份手抄副本——目前逐项一致，但那正是
+ * 本仓库反复踩过的静默漂移形状（漏跟一次就出现「读得到却判成没到」）。
+ *
+ * 和语义半的判定名单（goal/action/target/locationIntent/continuation/constraints/
+ * successCriteria/ambiguities）**零重叠**，逐个比过——所以拿它认顶层不会把语义半误判成工程半。
+ */
+const _AI_ENGINEERING_FIELDS = [
+  "projectState", "deliverySurface", "changeScope", "architectureMode", "dataStrategy",
+  "researchMode", "designMode", "domain", "workspaceAction", "captureMode", "browserGoal",
+  "runtimeActions", "externalActions", "researchTopics", "rationale", "orchestrationMode",
+  "roleNeeds", "coordinationRisks",
+];
+
+/**
  * 用户自己声明的角色名，拼进判定提示词的角色枚举里。
  *
  * 模型不知道存在的角色，它永远不会选。以前角色枚举是写死的一串，用户加了角色也白加。
@@ -22693,7 +22743,20 @@ function _normalizeAiIntentVerdict(value, context = {}) {
   if (!value || typeof value !== "object") return null;
   const dimensionSource = value.dimensions && typeof value.dimensions === "object" ? value.dimensions : value;
   const rawSemantic = value.semantic && typeof value.semantic === "object" ? value.semantic : value;
-  const rawEngineering = value.engineering && typeof value.engineering === "object" ? value.engineering : null;
+  // 工程半的取值方式要和上面两行**对齐**。原来只有它没有扁平回退：
+  //   dimensions → 有回退（value.dimensions 不是对象就用顶层）
+  //   semantic   → 有回退
+  //   engineering→ 没有，直接 null
+  // 而发给模型的那句是「**只输出这一个对象**，不要输出其它顶层字段」，示例里却有
+  // engineering 和 dimensions **两个**顶层键——指令和示例互相打架，模型最自然的解法就是
+  // 拍平。拍平之后实测：解析成功、账本记 ok、**18 个枚举全部退默认值**
+  //   带壳：domain=healthcare / researchMode=official / architectureMode=design_new
+  //   扁平：domain="" / researchMode=none / architectureMode=none（而 _halves 仍报 true）
+  // 这是消歧不是放松：工程字段名单和语义半的判定名单零重叠，顶层出现工程字段只可能是
+  // 「模型把工程半拍平了」这一种情况。
+  const rawEngineering = value.engineering && typeof value.engineering === "object"
+    ? value.engineering
+    : (_AI_ENGINEERING_FIELDS.some((field) => Object.prototype.hasOwnProperty.call(value, field)) ? value : null);
   const hasDimensionInput = _AI_INTENT_DIMENSIONS.some((dim) => typeof dimensionSource[dim] === "boolean");
   // confidence **不算**内容：一个只回了 {"semantic":{"confidence":0.3}} 的空答会被判成
   // 「有效裁决」，产出一份全默认画像（goal 空、workspaceAction "none"），并把 intentSource
@@ -22702,11 +22765,8 @@ function _normalizeAiIntentVerdict(value, context = {}) {
   // plausible-looking answer"），一个自评标量恰恰是最像 {} 的东西。
   const hasSemanticInput = ["goal", "action", "target", "locationIntent", "continuation", "constraints", "successCriteria", "ambiguities"]
     .some((field) => Object.prototype.hasOwnProperty.call(rawSemantic, field));
-  const hasEngineeringInput = !!rawEngineering && [
-    "projectState", "deliverySurface", "changeScope", "architectureMode", "dataStrategy",
-    "researchMode", "designMode", "domain", "workspaceAction", "captureMode", "browserGoal", "runtimeActions", "externalActions",
-    "researchTopics", "rationale", "orchestrationMode", "roleNeeds", "coordinationRisks",
-  ].some((field) => Object.prototype.hasOwnProperty.call(rawEngineering, field));
+  const hasEngineeringInput = !!rawEngineering
+    && _AI_ENGINEERING_FIELDS.some((field) => Object.prototype.hasOwnProperty.call(rawEngineering, field));
   // Do this before filling defaults. Otherwise `{}` becomes a plausible-looking answer/profile
   // and silently routes a turn with a classifier result the model never actually supplied.
   if (!hasDimensionInput && !hasSemanticInput && !hasEngineeringInput) return null;
@@ -22941,7 +23001,12 @@ async function _aiIntentProfile(text, config, session = null, context = null) {
       // 一半到了就算数：语义和工程互不依赖，缺哪半就少哪半的字段，
       // 而 _normalizeAiIntentVerdict 本来就按缺省补齐——这比整份作废强得多。
       const _sem = _safeJsonLoose(_outSem), _eng = _safeJsonLoose(_outEng);
-      const _merged = (_sem || _eng) ? { ...(_sem || {}), ...(_eng || {}) } : null;
+      // 数组要挡住。_safeJsonLoose 的最后一档在某些截断形状上会回一个**数组**，
+      // 而数组是 truthy：spread 之后 [] 变成 {}、["a"] 变成 {"0":"a"}，混进 merged 之后
+      // 这一半必然归零，账本却照样记 ok。这条路径的产出没有任何一种是有用的，直接判死。
+      const _semObj = (_sem && typeof _sem === "object" && !Array.isArray(_sem)) ? _sem : null;
+      const _engObj = (_eng && typeof _eng === "object" && !Array.isArray(_eng)) ? _eng : null;
+      const _merged = (_semObj || _engObj) ? { ...(_semObj || {}), ...(_engObj || {}) } : null;
       const intents = _normalizeAiIntentVerdict(_merged, boundedContext);      // 每模型能力账本：拆问后每一半都是一次独立的大表回执（弱模型判定的事实源）。
       if (typeof _recordModelJsonOutcome === "function") {
         _recordModelJsonOutcome(intentConfig.model, "big", !String(_outSem || "").trim() ? "empty" : _sem ? "ok" : "fail");

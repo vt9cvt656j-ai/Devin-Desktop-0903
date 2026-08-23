@@ -27,6 +27,7 @@ const KNOWLEDGE_DOMAIN = load("_aiIntentKnowledgeDomain", { _AI_KNOWLEDGE_DOMAIN
 function normalizeDeps() {
   return {
     _AI_INTENT_DIMENSIONS: DIMS,
+    _AI_ENGINEERING_FIELDS: loadConst("_AI_ENGINEERING_FIELDS"),
     _AI_INTENT_RELATIONS: loadConst("_AI_INTENT_RELATIONS"),
     _AI_PROJECT_STATES: loadConst("_AI_PROJECT_STATES"),
     _AI_DELIVERY_SURFACES: loadConst("_AI_DELIVERY_SURFACES"),

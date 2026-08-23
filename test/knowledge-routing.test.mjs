@@ -147,6 +147,7 @@ function normalizeVerdict() {
   const intentList = load("_aiIntentList", { _aiIntentText: intentText });
   return load("_normalizeAiIntentVerdict", {
     _AI_INTENT_DIMENSIONS: loadConst("_AI_INTENT_DIMENSIONS"),
+    _AI_ENGINEERING_FIELDS: loadConst("_AI_ENGINEERING_FIELDS"),
     _AI_INTENT_RELATIONS: loadConst("_AI_INTENT_RELATIONS"),
     _AI_PROJECT_STATES: loadConst("_AI_PROJECT_STATES"),
     _AI_DELIVERY_SURFACES: loadConst("_AI_DELIVERY_SURFACES"),
