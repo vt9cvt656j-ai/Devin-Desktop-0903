@@ -113,3 +113,48 @@ test("判据全部定义在函数体内，不引入新的外部标识符", () =>
   assert.match(body, /lines\.slice\(i, i \+ 3\)/,
     "3 行窗口没了——真实代码里的空壳是跨行的，单行判据一条都抓不到");
 });
+
+// ── 四、这本账必须**双向**跟着落盘内容走 ──────────────────────────────
+//
+// 原来两处写入都是 `if (_stubs.length) run._stubFindings = _stubs;`，而全仓没有任何一处
+// 清零。于是：模型第 3 轮写了 3 处占位 → 被告知 → 第 4 轮全改成真实现 → 第 5 轮、第 6 轮……
+// _deliveryFactsLine 仍然每轮注入「这一轮新写进去 3 处占位（a.ts:12 …）——这些地方现在是
+// 空的」。一条已经不成立的执行事实被反复推给模型：它要么去修不存在的东西，要么学会不信
+// 这整块事实。后者更糟——那块事实里还有「有 N 次写入没有落盘，不要说它们已保存」。
+test("占位修好之后，事实要从下一轮消失", () => {
+  assert.doesNotMatch(SRC, /if \(_stubs\.length\) \{\s*\n\s*run\._stubFindings = _stubs;/,
+    "收尾那处又变回「有命中才写」了——修好之后旧结论会一直挂着");
+  assert.doesNotMatch(SRC, /if \(_wfStubs\.length\) run\._stubFindings = _wfStubs;/,
+    "写时那处又变回「有命中才写」了");
+  assert.match(SRC, /run\._stubFindings = _stubs;\s*\n\s*if \(_stubs\.length\) \{/,
+    "收尾那处要先无条件写回，再按有无命中决定记不记 incompleteReason");
+  assert.match(SRC, /run\._stubFindings = _wfStubs;/, "写时那处要无条件写回");
+});
+
+// ── 五、名额不许被一个文件占光 ────────────────────────────────────────
+test("每个动过的文件都要能出场，不能被前一个文件的命中饿死", () => {
+  // 实测（改之前）：old.ts 新增 12 条 TODO + new.ts 新增一条假数据 → 返回 8 条、
+  // 来自 new.ts 的 0 条。而 new.ts 那条恰恰是这次交付最该被点名的。
+  const many = Array.from({ length: 12 }, (_, i) => `// TODO: 旧的第 ${i}`).join("\n");
+  const got = scan({ checkpoint: new Map([
+    ["/p/src/old.ts", { content: "", current: many }],
+    ["/p/src/new.ts", { content: "", current: "const mock_users = [];" }],
+  ]) });
+  assert.ok(got.some((f) => f.path.includes("new.ts")),
+    `第二个文件一条都没排上：${JSON.stringify(got.map((f) => f.path))}`);
+  assert.ok(got.length <= 8, "上限失效了——一次塞几十条会把交付事实块淹掉");
+});
+
+// ── 六、命名判据不许把三门语言排除在外 ────────────────────────────────
+test("蛇形/全大写/单数命名都要认（Python、Go、Rust 的主流写法）", () => {
+  for (const nm of ["mockData", "MockData", "MOCK_DATA", "mock_data", "fake_users",
+    "sample_response", "mockUser", "dummy_payload", "stubOrders", "fakeList"]) {
+    assert.ok(one(`x = ${nm}`).length, `${nm} 漏掉了——原判据没有 i 标志且写死小驼峰`);
+  }
+});
+
+test("放宽命名之后不许开始误报（负向，本仓库实测 0.10/万行没变）", () => {
+  for (const nm of ["sampleRate", "mockingbird", "dataList", "resultSet", "userList", "sampled"]) {
+    assert.deepEqual(one(`const ${nm} = 1;`), [], `${nm} 被误报成假数据了`);
+  }
+});

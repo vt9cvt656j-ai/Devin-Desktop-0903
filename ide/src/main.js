@@ -30216,6 +30216,30 @@ function _extractSegFileName(seg, allSegs, idx) {
   return null;
 }
 
+/**
+ * 抓回来的网页/搜索正文，渲染成**能读**的样子。
+ *
+ * 原来是 `<pre>${escaped}</pre>`：
+ *   · 等宽字体读散文本来就别扭，中英混排更挤；
+ *   · 上游 `html_to_article_text` 现在保留了段落，`<pre>` 却把它们等同处理，
+ *     段落之间没有间距，仍然像一堵墙；
+ *   · 继承来的换行规则会在英文单词中间断（截图里的 `Claud/e`、`you/r`、`ou/tputs`）。
+ *
+ * 现在按段落切开逐段成块：正常字体、正常行距、段间留白，长单词整词换行。
+ * 仍然只画前 4000 字（这只是预览，完整文本已经进了模型的上下文）。
+ */
+function _webTextView(text) {
+  const clipped = String(text || "").slice(0, 4000);
+  const paras = clipped.split(/\n{2,}/).map((p) => p.trim()).filter(Boolean);
+  const body = (paras.length ? paras : [clipped])
+    .map((p) => `<p class="atc-web__p">${_escHtml(p)}</p>`)
+    .join("");
+  const more = String(text || "").length > 4000
+    ? `<div class="atc-web__more">…此处只预览前 4000 字，完整正文已交给模型</div>`
+    : "";
+  return `<div class="atc-web">${body}${more}</div>`;
+}
+
 function _renderAgentSegStatic(container, seg, allSegs, idx) {
   if (seg.type === "text") {
     let clean = _cleanAgentText(seg.content);
@@ -41035,7 +41059,12 @@ function _stubDeliveryFindings(run, maxItems = 8) {
     [/\b(?:TODO|FIXME|XXX)\b/i, "TODO 占位"],
     [/not\s*implemented|NotImplementedError|未实现|尚未实现|待实现/i, "声明未实现"],
     [/lorem\s+ipsum/i, "lorem 假文案"],
-    [/\b(?:mock|fake|dummy|sample)(?:Data|List|Items|Users|Products|Response)\b|假数据|模拟数据|示例数据/, "写死的假数据"],
+    // 这条原来**没有 i 标志、且写死小驼峰**：mockData 命中，而 MOCK_DATA / mock_data /
+    // fake_users / sample_response / mockUser（单数）全漏——Python、Go、Rust 的蛇形命名是
+    // 主流写法，等于这条判据在那三门语言上结构性失效。放宽后误报率没变（本仓库 207,792 行
+    // 实测：旧 0.10/万行、新 0.10/万行，那两处命中还是正则字面量自己和提示词里的一句话）；
+    // 负向自检 6/6：sampleRate / mockingbird / dataList / resultSet / userList / sampled 静默。
+    [/\b(?:mock|fake|dummy|stub|sample)[_-]?(?:data|list|items?|users?|products?|response|result|payload|records?|orders?)\b|假数据|模拟数据|示例数据/i, "写死的假数据"],
     [/\bplaceholder\b.*=.*['"`]|占位实现/i, "占位实现"],
   ];
   // 上面那五条只抓**模型自己老实标注**的占位（TODO、not implemented、命名里带 mock）。
@@ -41067,21 +41096,26 @@ function _stubDeliveryFindings(run, maxItems = 8) {
     [/\b(?:fetch|axios(?:\.\w+)?|request|got|superagent|urlopen|requests\.\w+|http\.(?:Get|Post)|reqwest::\w+)\s*\(\s*["'`]https?:\/\/(?:[\w.-]*\.)?(?:example\.(?:com|org|net)|your-\w+|api\.example)\b/i, "编造的地址"],
     [/\b(?:baseUrl|baseURL|BASE_URL|apiUrl|API_URL|endpoint|ENDPOINT|apiHost|webhook\w*)\s*[:=]\s*["'`]https?:\/\/(?:[\w.-]*\.)?(?:example\.(?:com|org|net)|your-\w+|api\.example)\b/i, "编造的地址"],
   ];
+  // 上限是**跨文件共享**的，而 cp.forEach 的顺序就是写入顺序。实测：一个文件里新增 12 条
+  // TODO 就把 8 个名额全占光，这一轮真正新写的那个文件**一条都排不上**（返回 8 条、来自新
+  // 文件的 0 条）——而后者恰恰是「这次交付」最该被点名的那一个。
+  // 改成两轮分配：先每个动过的文件各出 1 条保证露面，再按顺序把剩下的名额填满。
+  const perFile = [];
   cp.forEach((snap, absPath) => {
-    if (out.length >= maxItems) return;
     const cur = String(snap?.current || "");
     if (!cur || !_CODE_FILE_RE.test(String(absPath))) return;
     // 改前原文按行建集合：只有新增的行才算这次交付引入的。
     const before = new Set(String(snap?.content || "").split("\n").map((l) => l.trim()));
     const lines = cur.split("\n");
-    for (let i = 0; i < lines.length && out.length < maxItems; i++) {
+    const mine = [];
+    for (let i = 0; i < lines.length && mine.length < maxItems; i++) {
       const raw = lines[i];
       const trimmed = raw.trim();
       if (!trimmed || before.has(trimmed)) continue;
       let matched = false;
       for (const [re, kind] of MARKS) {
         if (!re.test(trimmed)) continue;
-        out.push({ path: String(absPath).split("/").slice(-2).join("/"), line: i + 1, kind, text: trimmed.slice(0, 90) });
+        mine.push({ path: String(absPath).split("/").slice(-2).join("/"), line: i + 1, kind, text: trimmed.slice(0, 90) });
         matched = true;
         break;
       }
@@ -41090,11 +41124,17 @@ function _stubDeliveryFindings(run, maxItems = 8) {
       const win = lines.slice(i, i + 3).map((l) => l.trim()).join(" ");
       for (const [re, kind] of STRUCT) {
         if (!re.test(win)) continue;
-        out.push({ path: String(absPath).split("/").slice(-2).join("/"), line: i + 1, kind, text: win.slice(0, 90) });
+        mine.push({ path: String(absPath).split("/").slice(-2).join("/"), line: i + 1, kind, text: win.slice(0, 90) });
         break;
       }
     }
+    if (mine.length) perFile.push(mine);
   });
+  // 第一轮：每个动过的文件各出一条。第二轮：剩下的名额按文件顺序填满。
+  for (const m of perFile) { if (out.length < maxItems) out.push(m[0]); }
+  for (const m of perFile) {
+    for (let k = 1; k < m.length && out.length < maxItems; k++) out.push(m[k]);
+  }
   return out;
 }
 
@@ -54775,8 +54815,14 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
         // 排在最后：更具体的原因（红构建、写入落空）靠 ||= 先占位。只记账不补回合。
         if (run.mode === "agent") {
           const _stubs = _stubDeliveryFindings(run);
+          // **空数组也要写回去。** 这两处原来都是 `if (…length) run._stubFindings = …`，
+          // 而全仓没有任何一处清零：模型第 3 轮写了 3 处占位 → 被告知 → 第 4 轮全改成真
+          // 实现 → 第 5 轮、第 6 轮…… _deliveryFactsLine **仍然**每轮注入「这一轮新写进去
+          // 3 处占位（a.ts:12 …）——这些地方现在是空的」。一条已经不成立的执行事实被反复
+          // 推给模型：它要么去修不存在的东西，要么学会不信这整块事实。
+          // 这本账的全部价值就是「跟着落盘内容走」，那它就必须**双向**跟。
+          run._stubFindings = _stubs;
           if (_stubs.length) {
-            run._stubFindings = _stubs;
             run._incompleteReason = run._incompleteReason || `stub_delivery:${_stubs.length}`;
           }
         }
@@ -56471,7 +56517,8 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
         // ① 这次交付新写进去的占位/假数据（基线相减，只报有原文佐证的字面命中）。
         try {
           const _wfStubs = _stubDeliveryFindings(run);
-          if (_wfStubs.length) run._stubFindings = _wfStubs;
+          // 同上：空数组也写回去——修好了就得从事实里消失。
+          run._stubFindings = _wfStubs;
           for (const s of _wfStubs) {
             const k = `stub:${s.path}:${s.line}`;
             if (_wfSaid.has(k)) continue;
@@ -62381,7 +62428,7 @@ async function _executeToolStepInner(step, call, root, run) {
       const chars = text.length;
       res.className = "atc-result atc-result--ok";
       res.textContent = chars > 1024 ? `${(chars / 1024).toFixed(1)} KB` : `${chars} chars`;
-      vp.innerHTML = `<pre>${_escHtml(text.slice(0, 4000))}</pre>`;
+      vp.innerHTML = _webTextView(text);
       return { type: "web", path: call.path, content: `网页 ${url}:\n${text}` };
 
     } else if (call.type === "websearch") {
@@ -62406,7 +62453,7 @@ async function _executeToolStepInner(step, call, root, run) {
       if (_deep.text) text += _deep.text;
       res.className = "atc-result atc-result--ok";
       res.textContent = hits ? `${hits} 条结果` + (_deep.count ? ` +${_deep.count}页深读` : "") : "完成";
-      vp.innerHTML = `<pre>${_escHtml(text.slice(0, 4000))}</pre>`;
+      vp.innerHTML = _webTextView(text);
       return { type: "websearch", path: call.path, content: text };
 
     } else if (call.type === "probeenv") {
