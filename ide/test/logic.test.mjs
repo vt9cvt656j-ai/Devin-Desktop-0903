@@ -71,6 +71,10 @@ const INDEX_HTML = (() => {
     .replace(/\bhtmlFor=/g, "for=");
 })();
 const APP_CSS = readFileSync(join(HERE, "../src/styles/app.css"), "utf8");
+// 剥掉注释的 app.css。**正向的 CSS 源码断言必须跑在这上面**：注释里写「这里必须配
+// overflow-y: auto」这类说明是常态，而 assert.match 分不出那是说明还是规则——实测把
+// 真规则删掉、断言被自己的注释喂绿（和 stripJsComments 治的是同一个病）。
+const APP_CSS_CODE = APP_CSS.replace(/\/\*[\s\S]*?\*\//g, "");
 const GROWTH_SRC = readFileSync(join(HERE, "../src/growth.js"), "utf8");
 const PICKER_SRC = readFileSync(join(HERE, "../src/ui/session-picker.jsx"), "utf8");
 const MEMORY_SRC = readFileSync(join(HERE, "../src/ui/memory-center.jsx"), "utf8");
@@ -28183,6 +28187,49 @@ test("相册样式：格子定尺寸、行等高、角标盖实", () => {
     "+N 角标太透，底下的图会透出来");
   assert.match(APP_CSS, /\.msg__album-more[\s\S]{0,500}pointer-events:\s*none/,
     "角标挡住了点击——点 +N 进不了画廊");
+});
+
+// ── 编辑态：图要看得见，输入框要跟着内容长高 ────────────────────────────────
+//
+// 两个都是用户实测报的：
+//   1. 双击一条带图的消息进编辑，图**消失了** —— 原来是把整个 body 清空再塞输入框。
+//      于是屏幕上只剩一个写着文字的框，用户看不出这条消息本来带图，也就无从判断
+//      编辑之后图还在不在。
+//   2. 内容打多了不换行 —— rows 只在建 textarea 时算一次，之后再也不变；而 CSS 里
+//      `height:auto; max-height:168px` 又没配 overflow-y，于是超过一行之后既不长高、
+//      也没滚动条，后面打的字直接看不见。
+test("编辑态要保留图片，且输入框跟着内容长高", () => {
+  const src = stripJsComments(extractFn("_beginEditResend"));
+
+  // 图不参与编辑（textarea 装不下），但必须留在 DOM 里看得见。
+  assert.match(src, /const keptNodes = origNodes\.filter/, "没有挑出要保留的媒体节点");
+  assert.match(src, /msg__album/, "相册没有被列进保留名单");
+  assert.doesNotMatch(src, /^\s*origNodes\.forEach\(\(n\) => n\.remove\(\)\);/m,
+    "又把整个 body 清空了——带图消息一进编辑态图就没了");
+  assert.match(src, /origNodes\.filter\(\(n\) => !keptNodes\.includes\(n\)\)\.forEach\(\(n\) => n\.remove\(\)\)/,
+    "摘走的应该只有非媒体节点");
+
+  // 编辑框要插在相册**前面**：阅读态是「文字在上、图在下」，append 会上下颠倒。
+  assert.match(src, /body\.insertBefore\(box, keptNodes\[0\]\)/,
+    "编辑框排到相册后面了——双击一下图片会跳到文字上方");
+
+  // 自动长高：每次输入都重算，而且先塌回 auto 再取 scrollHeight（否则只增不减）。
+  assert.match(src, /ta\.addEventListener\("input", autoGrow\)/, "打字时不会重算高度");
+  assert.match(src, /ta\.style\.height = "auto";[\s\S]{0,120}ta\.scrollHeight/,
+    "没有先塌回 auto 再量 scrollHeight——删字时高度只增不减");
+
+  // 取消：整份按**原始顺序**放回。textContent="" 会连相册一起清掉，所以不能只放回被摘走的。
+  assert.match(src, /body\.textContent = "";[\s\S]{0,300}body\.append\(\.\.\.origNodes\)/,
+    "取消时没有把节点按原顺序整份放回——图片会跑到文字后面，而且每取消一次就再跑一次");
+});
+
+test("编辑框样式：超出上限要能滚，长串要折行", () => {
+  // 跑在剥掉注释的副本上：这条规则的注释里逐字写着「必须配 overflow-y: auto」，
+  // 不剥的话把真规则删掉断言照样绿（变异实测漏网）。
+  assert.match(APP_CSS_CODE, /\.msg__edit-ta\s*\{[^}]{0,400}overflow-y:\s*auto/,
+    "只有 max-height 没有 overflow-y：撑到上限后再打的字既不长高也滚不出来");
+  assert.match(APP_CSS_CODE, /\.msg__edit-ta\s*\{[^}]{0,400}word-break:\s*break-word/,
+    "长 URL / 无空格长串不折行，会把编辑框撑出气泡");
 });
 
 // ── 编辑历史消息：图片不许丢，作废轮次的台账也要跟着删 ─────────────────────

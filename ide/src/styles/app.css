@@ -5803,7 +5803,11 @@ img.settings-dropdown__avatar--filled { object-fit: cover; }
 .composer__box.msg__edit-box:focus-within { border-color: var(--line-strong); box-shadow: var(--shadow-sm); }
 .msg__edit-ta {
   width: 100%; box-sizing: border-box; resize: none;
-  min-height: 24px; height: auto; max-height: 168px;
+  /* 高度由 JS 每次输入重算（见 _beginEditResend 的 autoGrow）。这里必须配
+     overflow-y: auto —— 原来只有 max-height 没有它，撑到 168px 之后再打的字既不长高
+     也滚不出来，直接看不见。 */
+  min-height: 24px; height: auto; max-height: 168px; overflow-y: auto;
+  white-space: pre-wrap; word-break: break-word;   /* 长 URL / 无空格长串也要折行 */
   font-family: var(--font); font-size: 13.5px; line-height: 1.5;
   color: var(--text); background: transparent;
   border: none; padding: 10px 12px 4px; outline: none;
