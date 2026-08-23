@@ -28082,58 +28082,107 @@ test("崩溃重开：补进上下文的必须是日志结尾那一段，不是 c
     "又把第一窗（按 checkpoint 猜的那一窗）当结尾喂进去了");
 });
 
-// ── 多图按 Telegram 那套排版，不再竖着堆一长条 ─────────────────────────────
+// ── 多图按 Telegram 那套排版：行式马赛克 + `+N` 收口 + 画廊翻页 ──────────────
 //
-// 改之前每张图 display:block + max-width:240px 直接 appendChild 到消息体，于是三张图
-// 竖着堆成一长条、每张都占满一屏高。现在按**张数**选版式，装进一个 grid 容器。
-test("多图消息按张数选相册版式", () => {
-  const pick = load("_albumLayoutFor");
-  assert.equal(pick(0), "single");
-  assert.equal(pick(1), "single", "单张不进相册——它没有对齐对象，保持原比例不裁");
-  assert.equal(pick(2), "two");
-  assert.equal(pick(3), "three", "三张是 Telegram 的招牌版式：左一大 + 右两小");
-  assert.equal(pick(4), "four");
-  assert.equal(pick(5), "many");
-  assert.equal(pick(12), "many");
-
-  const src = stripJsComments(extractFn("_renderMessageAttachments"));
-  // 只有多图才建容器：单图仍走原来那条路，样式完全不变。
-  assert.match(src, /imageCount > 1 \? document\.createElement\("div"\) : null/,
-    "单张图也被塞进相册容器了——它会被 1:1 裁掉");
-  // 视频不进相册：object-fit: cover 会把播放控件条裁掉。
-  assert.match(src, /a\.kind !== "video"/, "视频被算进了相册张数，版式会错位");
-  assert.match(src, /\(album \|\| body\)\.appendChild\(imgEl\)/,
-    "图片没有挂进相册容器");
-  // 版式和张数都要写到 DOM 上，CSS 才选得中。
-  assert.match(src, /album\.dataset\.layout = _albumLayoutFor\(imageCount\)/);
-  assert.match(src, /album\.dataset\.count = String\(imageCount\)/,
-    "没写 count，最后一行铺满的那几条规则就选不中");
+// 改之前每张图 display:block + max-width:240px 直接 appendChild 到消息体，三张图竖着堆
+// 成一长条、每张独占一行。
+test("相册行计划：每行 2-4 张，张数必须对得上", () => {
+  const plan = load("_albumRowPlan");
+  assert.deepEqual(plan(2), [2]);
+  assert.deepEqual(plan(3), [3]);
+  assert.deepEqual(plan(4), [4]);
+  assert.deepEqual(plan(5), [2, 3], "5 张是 Telegram 最认得出来的那个「上两大下三小」");
+  assert.deepEqual(plan(6), [3, 3]);
+  assert.deepEqual(plan(7), [3, 4], "余 1 张要并进上一行凑 4，不能单独留一格");
+  assert.deepEqual(plan(9), [3, 3, 3]);
+  assert.deepEqual(plan(10), [3, 3, 4]);
+  // 不变量：任意张数都要摆得下、且没有 1 张或 5 张的行（那两种都不好看）。
+  for (let n = 2; n <= 10; n++) {
+    const rows = plan(n);
+    assert.equal(rows.reduce((a, b) => a + b, 0), n, `${n} 张摆不平`);
+    assert.ok(rows.every((r) => r >= 2 && r <= 4), `${n} 张出现了 ${rows} 这种行`);
+  }
 });
 
-test("相册样式：每种版式都在，最后一行不许留白", () => {
-  // 版式选择器齐全。
-  for (const layout of ["two", "three", "four", "many"]) {
-    assert.match(APP_CSS, new RegExp(`\\.msg__album\\[data-layout="${layout}"\\]`),
-      `${layout} 版式的样式不见了`);
+test("相册跨列：12 栅格，行宽决定占几列", () => {
+  const spanFor = load("_albumSpanFor");
+  assert.equal(spanFor(2), 6, "行 2 张各占一半");
+  assert.equal(spanFor(3), 4);
+  assert.equal(spanFor(4), 3);
+  const spans = load("_albumSpans", { _albumRowPlan: load("_albumRowPlan"), _albumSpanFor: spanFor });
+  assert.deepEqual(spans(5), [6, 6, 4, 4, 4]);
+  // 每一行的跨列加起来必须正好 12，否则那行右边留白——3 列 + aspect-ratio 修不了这件事
+  // （它只改高度、不改占几列），实测 5 张时第二行会空掉三分之一。
+  for (let n = 2; n <= 10; n++) {
+    let acc = 0;
+    for (const sp of spans(n)) {
+      acc += sp;
+      if (acc === 12) acc = 0;
+      assert.ok(acc < 12, `${n} 张有一行跨列超过 12`);
+    }
+    assert.equal(acc, 0, `${n} 张最后一行没铺满，右边会留白`);
   }
-  // 相册里的图必须由格子定尺寸：不覆盖单图那套 max-width 的话，格子撑不开。
-  assert.match(APP_CSS, /\.msg__album \.msg__attached-image[\s\S]{0,400}object-fit:\s*cover/,
-    "相册里的图没有 object-fit: cover——每张各自的比例会让行高参差，就是改之前那个样子");
-  assert.match(APP_CSS, /\.msg__album \.msg__attached-image[\s\S]{0,400}max-width:\s*none/,
-    "没有覆盖单图的 max-width，格子撑不开");
-  // 圆角裁在容器上：每张自己圆角会露出白角。
-  assert.match(APP_CSS, /\.msg__album\s*\{[\s\S]{0,400}overflow:\s*hidden/,
-    "圆角没裁在容器上");
+});
 
-  // 「many」必须用 6 列。这是最后一行铺满的机制：满行每张跨 2，余 2 张各跨 3、余 1 张跨 6。
-  // 用 3 列 + aspect-ratio 是修不了留白的（那只改高度、不改占几列），实测过：5 张时
-  // 第二行右边空三分之一。
-  assert.match(APP_CSS, /\.msg__album\[data-layout="many"\]\s*\{\s*grid-template-columns:\s*repeat\(6,\s*1fr\)/,
-    "many 版式不是 6 列——最后一行会留白");
-  assert.match(APP_CSS, /data-count="5"\][\s\S]{0,200}grid-column:\s*span 3/,
-    "5 张时第二行没铺满");
-  assert.match(APP_CSS, /data-count="7"\][\s\S]{0,160}grid-column:\s*span 6/,
-    "7 张时最后一张没通栏");
+test("超过上限收成 +N，且画廊仍能翻到被收起来的那些", () => {
+  const src = stripJsComments(extractFn("_renderMessageAttachments"));
+  assert.match(src, /const tiles = Math\.min\(imageCount, _ALBUM_MAX_TILES\)/,
+    "没有按上限截断，几十张图会铺出一整屏格子");
+  assert.equal(loadConst("_ALBUM_MAX_TILES"), 10, "上限取 10——Telegram 一个相册就是最多 10 个媒体");
+  // 版式和跨列必须按**实际铺出来的格数**算，不是按总张数：按总数算最后一行会空出
+  // 被截掉那几格的位置。
+  assert.match(src, /_albumLayoutFor\(tiles\)/, "版式按总张数算了，最后一行会空");
+  assert.match(src, /_albumSpans\(tiles\)/, "跨列按总张数算了");
+  assert.match(src, /`\+\$\{overflow\}`/, "没有 +N 角标");
+  assert.match(src, /placed === tiles - 1/, "角标没盖在最后一格上");
+  // 画廊收的是**全集**：被 +N 收起来的那些也要能翻到，否则点开只能看见铺出来的 10 张。
+  const galleryPush = src.indexOf("gallery.push(imageSrc)");
+  assert.ok(galleryPush > 0, "画廊没有收集图片");
+  // 只比 push 和那条 continue 的先后是弱断言：在 push **前面**另插一条早退照样满足
+  // （变异实测漏网）。钉的必须是「push 之前不存在任何按 tiles 的早退」。
+  const beforePush = src.slice(0, galleryPush);
+  assert.doesNotMatch(beforePush, /placed >= tiles[\s\S]{0,40}continue/,
+    "超出上限的图在进 gallery 之前就被 continue 掉了——点 +N 翻不到它们");
+  assert.match(src.slice(galleryPush), /if \(placed >= tiles\) continue/,
+    "超出上限的图仍然会被铺成格子");
+  assert.match(src, /showImageLightbox\(imgEl\.src, gallery, galleryIndex\)/,
+    "点图没有带上画廊上下文");
+});
+
+test("画廊翻页：循环、计数、单图时整组隐藏", () => {
+  const step = extractFn("_lightboxStep");
+  assert.match(step, /\(_lightboxIndex \+ direction \+ total\) % total/,
+    "翻页不循环——到头按不动，用户得自己数还剩几张");
+  assert.match(step, /if \(total < 2\) return/, "单图时也在翻");
+  const show = extractFn("_lightboxShow");
+  assert.match(show, /nav\.style\.display = many \? "" : "none"/,
+    "单图时没把翻页藏掉——两个点不动的箭头比没有更糟");
+  assert.match(show, /\$\{_lightboxIndex \+ 1\} \/ \$\{_lightboxGallery\.length\}/, "没有计数");
+  // 状态必须在模块级：lightbox 的 DOM 只建一次，闭包会钉死在第一次那组图上。
+  assert.match(stripJsComments(SRC), /let _lightboxGallery = \[\];/,
+    "画廊状态放进闭包了，第二条消息的图会翻出第一条的");
+});
+
+test("相册样式：格子定尺寸、行等高、角标盖实", () => {
+  for (const layout of ["three", "four"]) {
+    assert.match(APP_CSS, new RegExp(`\\.msg__album\\[data-layout="${layout}"\\]`), `${layout} 版式不见了`);
+  }
+  assert.match(APP_CSS, /\.msg__album\s*\{[\s\S]{0,400}grid-template-columns:\s*repeat\(12,\s*1fr\)/,
+    "不是 12 栅格——2/3/4 三种行宽没法整除，会留半像素缝");
+  // 行等高：三种跨列的宽高比必须让高度都等于容器宽的三分之一。
+  assert.match(APP_CSS, /\[data-span="6"\][\s\S]{0,80}aspect-ratio:\s*3 \/ 2/);
+  assert.match(APP_CSS, /\[data-span="4"\][\s\S]{0,80}aspect-ratio:\s*1 \/ 1/);
+  assert.match(APP_CSS, /\[data-span="3"\][\s\S]{0,80}aspect-ratio:\s*3 \/ 4/);
+  assert.match(APP_CSS, /\.msg__album \.msg__attached-image[\s\S]{0,400}object-fit:\s*cover/,
+    "没有 object-fit: cover，每张各自的比例会让行高参差");
+  assert.match(APP_CSS, /\.msg__album \.msg__attached-image[\s\S]{0,400}max-width:\s*none/,
+    "没覆盖单图的 max-width，格子撑不开");
+  // 角标要盖实：半透明时底下那张图的内容会透出来和 +N 叠成一团（实测 14 张那组，
+  // 底下的「10」和上面的「+4」糊在一起）。
+  assert.match(APP_CSS, /\.msg__album-more[\s\S]{0,500}background:\s*rgba\(0,0,0,\.6[0-9]?\)/,
+    "+N 角标太透，底下的图会透出来");
+  assert.match(APP_CSS, /\.msg__album-more[\s\S]{0,500}pointer-events:\s*none/,
+    "角标挡住了点击——点 +N 进不了画廊");
 });
 
 // ── 编辑历史消息：图片不许丢，作废轮次的台账也要跟着删 ─────────────────────

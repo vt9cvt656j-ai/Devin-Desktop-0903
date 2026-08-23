@@ -7531,21 +7531,33 @@ button.agent-plan__fold--toggle:focus-visible { outline: 2px solid #1a73e8; outl
   background: #000;
 }
 
-/* ---- 消息里的多图相册（Telegram 式，按张数换版式）--------------------------
-   张数由 JS 写进 data-layout（见 _albumLayoutFor）。这里只有版式，没有条件判断：
-   grid 的行列在每种版式里都是写死的，所以图片加载完不会重排——用户不会看到跳一下。
+/* ---- 消息里的多图相册（Telegram 式）--------------------------------------
+   行计划在 JS 里算（_albumRowPlan / _albumSpans），每格把自己占几列写进 data-span。
+   这里只有版式，没有条件判断：行列在渲染时就定死，图片加载完不会重排——用户不会看到
+   跳一下。这也是刻意不按宽高比分组的原因：拿不到自然尺寸时那种算法一定会先摆错一次。
 
-   ≥2 张统一 1:1 方格 + object-fit: cover。不裁的话每张各自的比例会让行高参差，
-   那正是改之前「竖着堆一长条」的样子。单张（.msg__attached-image 不在相册里）保持
-   原比例、原上限，因为它没有对齐对象。 */
+   12 栅格：能被 2/3/4 整除，三种行宽都不留半像素缝。
+   宽高比按行宽缩放，让**所有行等高**（都等于容器宽的三分之一）：行 3 张正方、
+   行 2 张 3/2、行 4 张 3/4。等高是这套版式好看的关键，参差不齐正是改之前那个
+   「竖着堆一长条」的观感来源。 */
 .msg__album {
   display: grid;
+  grid-template-columns: repeat(12, 1fr);
   gap: 3px;                      /* Telegram 的缝隙就是这么窄，宽了像九宫格贴纸 */
   margin-top: 8px;
-  width: min(320px, 100%);       /* 和单图 240px 上限同一量级，多图给多一点 */
+  width: min(320px, 100%);
   border-radius: 12px;
-  overflow: hidden;              /* 圆角裁在容器上：每张自己圆角会露出四个白角 */
+  overflow: hidden;              /* 圆角裁在容器上：每格自己圆角会露出白角 */
 }
+.msg__album-cell {
+  position: relative;            /* +N 角标的定位基准 */
+  overflow: hidden;
+  min-width: 0;
+}
+.msg__album-cell[data-span="6"] { grid-column: span 6; aspect-ratio: 3 / 2; }
+.msg__album-cell[data-span="4"] { grid-column: span 4; aspect-ratio: 1 / 1; }
+.msg__album-cell[data-span="3"] { grid-column: span 3; aspect-ratio: 3 / 4; }
+
 .msg__album .msg__attached-image {
   /* 覆盖单图那套：在相册里由格子定尺寸 */
   width: 100%; height: 100%;
@@ -7553,49 +7565,71 @@ button.agent-plan__fold--toggle:focus-visible { outline: 2px solid #1a73e8; outl
   margin-top: 0;
   border: 0; border-radius: 0; box-shadow: none;
   object-fit: cover;
-  aspect-ratio: 1 / 1;
+  display: block;
 }
 .msg__album .msg__attached-image:hover {
   transform: none;               /* 格子里放大会把邻居盖住 */
   filter: brightness(.92);
 }
 
-/* 2 张：并排各半 */
-.msg__album[data-layout="two"] { grid-template-columns: 1fr 1fr; }
-
-/* 3 张：左一大 + 右两小。左边那张跨两行，所以它是 1:2 的竖图 */
-.msg__album[data-layout="three"] {
-  grid-template-columns: 2fr 1fr;
-  grid-template-rows: 1fr 1fr;
-}
-.msg__album[data-layout="three"] .msg__attached-image:first-child {
-  grid-row: 1 / span 2;
-  aspect-ratio: auto;            /* 跨行的那张由行高决定，不能再钉 1:1*/
+/* 3 张：左一大 + 右两小（Telegram 的招牌）。JS 给的是 [4,4,4]，这里整体改写成
+   左半 + 右两格，所以要覆盖 data-span 的那三条。 */
+.msg__album[data-layout="three"] { grid-template-columns: 2fr 1fr; }
+.msg__album[data-layout="three"] .msg__album-cell { grid-column: auto; aspect-ratio: 1 / 1; }
+.msg__album[data-layout="three"] .msg__album-cell:first-child {
+  grid-row: 1 / span 2; aspect-ratio: auto;
 }
 
-/* 4 张：上一大 + 下三小 */
-.msg__album[data-layout="four"] {
-  grid-template-columns: repeat(3, 1fr);
-  grid-template-rows: auto auto;
-}
-.msg__album[data-layout="four"] .msg__attached-image:first-child {
-  grid-column: 1 / span 3;
-  aspect-ratio: 3 / 2;           /* 通栏那张用 3:2，1:1 会高得占掉半屏 */
+/* 4 张：上一大通栏 + 下三小 */
+.msg__album[data-layout="four"] { grid-template-columns: repeat(3, 1fr); }
+.msg__album[data-layout="four"] .msg__album-cell { grid-column: auto; aspect-ratio: 1 / 1; }
+.msg__album[data-layout="four"] .msg__album-cell:first-child {
+  /* 通栏那格用 16/9 而不是 3/2：气泡本来就窄（320px 上限），3/2 那一格实测几乎占掉
+     一屏高，下面三小格被挤到看不见。16/9 之后整组高度和 5 张那版差不多。 */
+  grid-column: 1 / span 3; aspect-ratio: 16 / 9;
 }
 
-/* 5 张及以上：每行三张的方格。最后一行不足三张时由 grid 自动左对齐，
-   再用 :last-child 的跨列把那一行铺满，避免右侧留一块突兀的空白。 */
-.msg__album[data-layout="many"] { grid-template-columns: repeat(6, 1fr); }
-.msg__album[data-layout="many"] .msg__attached-image { grid-column: span 2; }
-/* 最后一行不足三张时右边会留白 —— aspect-ratio 修不了这件事（它只改高度、不改占几列）。
-   底层用 6 列，满行每张跨 2；余 2 张各跨 3、余 1 张跨 6，正好把那一行吃满。
-   余数按张数取模：5=3+2、7=3+3+1、8=3+3+2。 */
-.msg__album[data-layout="many"][data-count="5"] .msg__attached-image:nth-child(n+4),
-.msg__album[data-layout="many"][data-count="8"] .msg__attached-image:nth-child(n+7) {
-  grid-column: span 3; aspect-ratio: 3 / 2;
+/* 超出上限那几张收进最后一格的 `+X`（Telegram 就是这么收的）。
+   盖满整格而不是做成小角标：整格变暗才读得出「这里还有更多」，
+   角落里一个小数字在缩略图上根本看不见。 */
+.msg__album-more {
+  position: absolute; inset: 0;
+  display: flex; align-items: center; justify-content: center;
+  /* 盖得够实：.46 时底下那张图的数字/内容会透出来和 `+N` 叠成一团（实测 14 张那组，
+     底下的「10」和上面的「+4」糊在一起）。再加一层模糊，读的是「这里还有更多」，
+     不是「这张图被蒙了一层」。 */
+  background: rgba(0,0,0,.62);
+  backdrop-filter: blur(3px);
+  color: #fff;
+  font-size: clamp(15px, 5cqw, 26px);
+  font-weight: 600;
+  letter-spacing: .5px;
+  pointer-events: none;          /* 点击要落到底下那张图上，才进得了画廊 */
+  text-shadow: 0 1px 3px rgba(0,0,0,.5);
 }
-.msg__album[data-layout="many"][data-count="7"] .msg__attached-image:nth-child(7) {
-  grid-column: span 6; aspect-ratio: 3 / 1;
+
+/* 画廊翻页（lightbox 里）。单图时整组 display:none，见 _lightboxShow。 */
+.img-lightbox__nav {
+  position: absolute; bottom: 52px; left: 50%; transform: translateX(-50%);
+  display: flex; align-items: center; gap: 14px;
+  padding: 6px 10px;
+  border-radius: 999px;
+  background: rgba(255,255,255,.12);
+  backdrop-filter: blur(8px);
+}
+.img-lightbox__nav button {
+  width: 34px; height: 34px;
+  border: 0; border-radius: 50%;
+  background: rgba(255,255,255,.14);
+  color: #fff; font-size: 20px; line-height: 1;
+  cursor: pointer;
+}
+.img-lightbox__nav button:hover { background: rgba(255,255,255,.26); }
+.img-lightbox__count {
+  color: rgba(255,255,255,.85);
+  font-size: 13px;
+  font-variant-numeric: tabular-nums;   /* 翻页时数字不跳宽 */
+  min-width: 52px; text-align: center;
 }
 
 /* ---- Design Board grid (design_board / batch generate_image results) ---- */

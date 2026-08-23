@@ -8084,8 +8084,20 @@ async function _composeCompare(designUrl, liveUrl) {
   ctx.fillStyle = "#fca5a5"; ctx.fillText("你的实现 LIVE ▶", aw + gap + 10, labelH / 2);
   return cv.toDataURL("image/jpeg", 0.85);
 }
-function showImageLightbox(src) {
+// 相册画廊的当前状态。放模块级而不是闭包里：翻页按钮和键盘事件都要读它，
+// 而 lightbox 的 DOM 只建一次（下面 `if (!_imgLightboxEl)`），闭包会钉死在第一次那组图上。
+let _lightboxGallery = [];
+let _lightboxIndex = 0;
+
+/**
+ * @param {string} src 要显示的图
+ * @param {string[]} [gallery] 同一条消息里的全部图；给了就能左右翻
+ * @param {number} [index] src 在 gallery 里的位置
+ */
+function showImageLightbox(src, gallery = null, index = 0) {
   if (!src) return;
+  _lightboxGallery = Array.isArray(gallery) && gallery.length > 1 ? gallery.slice() : [];
+  _lightboxIndex = Math.max(0, Math.min(_lightboxGallery.length - 1, Math.trunc(Number(index) || 0)));
   if (!_imgLightboxEl) {
     _imgLightboxEl = document.createElement("div");
     _imgLightboxEl.style.cssText = "position:fixed;inset:0;background:rgba(0,0,0,.88);z-index:99999;display:flex;align-items:center;justify-content:center;cursor:zoom-out;opacity:0;transition:opacity .12s ease;backdrop-filter:blur(4px)";
@@ -8096,11 +8108,51 @@ function showImageLightbox(src) {
     const close = () => { _imgLightboxEl.style.opacity = "0"; _imgLightboxEl.style.pointerEvents = "none"; setTimeout(() => { _imgLightboxEl.style.display = "none"; }, 130); };
     _imgLightboxEl.addEventListener("click", close);
     document.addEventListener("keydown", (e) => { if (e.key === "Escape" && _imgLightboxEl && _imgLightboxEl.style.display !== "none") close(); });
+    // 画廊翻页：两个箭头 + 一个计数。整个覆盖层的点击是「关闭」，所以这三个都要
+    // stopPropagation，否则点「下一张」会先把 lightbox 关掉。
+    const nav = document.createElement("div");
+    nav.className = "img-lightbox__nav";
+    nav.innerHTML = `<button type="button" data-dir="-1" aria-label="上一张">‹</button>`
+      + `<span class="img-lightbox__count"></span>`
+      + `<button type="button" data-dir="1" aria-label="下一张">›</button>`;
+    nav.addEventListener("click", (e) => {
+      e.stopPropagation();
+      const dir = Number(e.target?.dataset?.dir);
+      if (dir) _lightboxStep(dir);
+    });
+    _imgLightboxEl.appendChild(nav);
+    document.addEventListener("keydown", (e) => {
+      if (!_imgLightboxEl || _imgLightboxEl.style.display === "none") return;
+      if (e.key === "ArrowLeft") { e.preventDefault(); _lightboxStep(-1); }
+      else if (e.key === "ArrowRight") { e.preventDefault(); _lightboxStep(1); }
+    });
   }
-  _imgLightboxEl.querySelector("img").src = src;
+  _lightboxShow(src);
   _imgLightboxEl.style.display = "flex";
   _imgLightboxEl.style.pointerEvents = "";
   requestAnimationFrame(() => { _imgLightboxEl.style.opacity = "1"; });
+}
+
+// 单图时把翻页整组藏掉——留着两个点不动的箭头比没有更糟。
+function _lightboxShow(src) {
+  if (!_imgLightboxEl) return;
+  _imgLightboxEl.querySelector("img").src = src;
+  const nav = _imgLightboxEl.querySelector(".img-lightbox__nav");
+  if (!nav) return;
+  const many = _lightboxGallery.length > 1;
+  nav.style.display = many ? "" : "none";
+  if (many) {
+    const count = nav.querySelector(".img-lightbox__count");
+    if (count) count.textContent = `${_lightboxIndex + 1} / ${_lightboxGallery.length}`;
+  }
+}
+
+// 循环翻页：到头再按一下回到另一端，比按不动好——用户不用去数还剩几张。
+function _lightboxStep(direction) {
+  const total = _lightboxGallery.length;
+  if (total < 2) return;
+  _lightboxIndex = (_lightboxIndex + direction + total) % total;
+  _lightboxShow(_lightboxGallery[_lightboxIndex]);
 }
 
 // ---- markdown preview ----
@@ -19838,18 +19890,55 @@ function _discardPreTurnAssistant(session) {
 // native controls; persisted videos without raw bytes fall back to a key frame.
 // 一条消息里有几张图，就用哪种相册排法（Telegram 那套）。
 //
-// 判据只看**图片张数**，不看宽高比：拿不到自然尺寸的时候（历史消息里的图还没解码、
-// 或者只剩关键帧）任何按比例分组的算法都会先摆错一次、图片加载完再跳一下。宁可用一套
-// 稳定的固定版式，也不要一个会当着用户面重排的“聪明”版式。
+// 判据只看**张数**，不看宽高比。Telegram 真实算法是按每张的宽高比分组的，但那要求先拿到
+// 自然尺寸——而历史消息里的图还没解码、只剩关键帧的更没有。任何按比例分组的做法都会先摆
+// 错一次、图片加载完再跳一下。宁可要一套稳定的固定版式，也不要一个会当着用户面重排的。
 //
-// 1 张   → 单张，保持原比例，不裁
-// 2 张   → 并排各半
-// 3 张   → 左一大 + 右两小（Telegram 的招牌版式）
-// 4 张   → 上一大 + 下三小
-// 5 张+  → 每行三张的方格；最后一行不足三张时铺满该行剩余宽度
+// 版式：
+//   2 张   并排各半
+//   3 张   左一大 + 右两小（Telegram 的招牌）
+//   4 张   上一大通栏 + 下三小
+//   5 张+  行式马赛克，每行 2/3/4 张
 //
-// ≥2 张时统一用 1:1 方格 + object-fit: cover：不裁的话每张各自的比例会让行高参差，
-// 那正是现在这个“竖着堆一长条”的样子。单张不裁，因为它没有对齐对象。
+// 超过 _ALBUM_MAX_TILES 张时只铺前 N-1 张，最后一格盖 `+X` 角标（Telegram 就是这么收的），
+// 点它进画廊看全部。上限取 10 —— Telegram 一个相册最多就是 10 个媒体。
+const _ALBUM_MAX_TILES = 10;
+
+// 每行放几张。规则：以 3 张一行为主，余 1 张时把最后一行凑成 4，余 2 张时最后一行放 2。
+// 5 张特判成 [2,3]（上两大下三小）——那是 Telegram 最认得出来的五图版式。
+function _albumRowPlan(count) {
+  const n = Math.max(0, Math.trunc(Number(count) || 0));
+  if (n <= 1) return [n].filter(Boolean);
+  if (n === 2) return [2];
+  if (n === 5) return [2, 3];
+  // `left > 4` 这个循环条件已经保证退出时 left ∈ [2,4]：left 每次减 3，能进循环说明
+  // left ≥ 5，减完至少是 2。所以**不存在**「余 1 张」的情况，不需要为它写分支。
+  // （这里原来有一条 `if (left === 1) rows[last] = 4`，变异测试把它整条删掉、
+  // 行计划一个字都没变 —— 死代码，留着会让人以为余 1 有专门处理。）
+  const rows = [];
+  let left = n;
+  while (left > 4) { rows.push(3); left -= 3; }
+  if (left > 0) rows.push(left);
+  return rows;
+}
+
+// 每格占 12 栅格里的几列。12 能被 2/3/4 整除，所以三种行宽都不会有半像素缝。
+// 同时把宽高比按行宽缩放，让**所有行等高**：行 3 张是正方（1/1），行 2 张就得 3/2、
+// 行 4 张就得 3/4，三者算出来的高度都等于容器宽的三分之一。等高是这套版式好看的关键，
+// 参差不齐正是改之前那个「竖着堆一长条」的观感来源。
+function _albumSpanFor(perRow) {
+  return perRow === 2 ? 6 : perRow === 4 ? 3 : 4;
+}
+
+// 每一格该占几列：把行计划摊平成一张「第 i 格 → span」的表。
+function _albumSpans(count) {
+  const spans = [];
+  for (const perRow of _albumRowPlan(count)) {
+    for (let i = 0; i < perRow; i++) spans.push(_albumSpanFor(perRow));
+  }
+  return spans;
+}
+
 function _albumLayoutFor(count) {
   if (count <= 1) return "single";
   if (count === 2) return "two";
@@ -19865,13 +19954,21 @@ function _renderMessageAttachments(body, attachments = []) {
   const imageCount = attachments.filter((a) =>
     a && typeof a === "object" && a.kind !== "video"
     && (a.dataUrl || a.objectUrl || a.path || (Array.isArray(a.frames) && a.frames.length))).length;
-  const album = imageCount > 1 ? document.createElement("div") : null;
+  // 超过上限只铺前 N 格，最后一格盖 `+X`。tiles 是**实际铺出来的格数**，
+  // 版式和跨列都按它算——按总数算的话最后一行会空出被截掉那几格的位置。
+  const tiles = Math.min(imageCount, _ALBUM_MAX_TILES);
+  const overflow = Math.max(0, imageCount - tiles);
+  const spans = tiles > 1 ? _albumSpans(tiles) : [];
+  const album = tiles > 1 ? document.createElement("div") : null;
   if (album) {
     album.className = "msg__album";
-    album.dataset.layout = _albumLayoutFor(imageCount);
-    album.dataset.count = String(imageCount);
+    album.dataset.layout = _albumLayoutFor(tiles);
+    album.dataset.count = String(tiles);
     body.appendChild(album);
   }
+  // 画廊要能翻到**全部**图片，包括被 `+X` 收起来的那些，所以这里收集的是全集。
+  const gallery = [];
+  let placed = 0;
   for (const attachment of attachments) {
     if (!attachment || typeof attachment !== "object") continue;
     const kind = attachment.kind === "video" ? "video" : "image";
@@ -19908,11 +20005,28 @@ function _renderMessageAttachments(body, attachments = []) {
     imgEl.className = "msg__attached-image";
     imgEl.alt = attachment.name || (kind === "video" ? "Video key frame" : "Attached image");
     imgEl.title = kind === "video" ? "视频关键帧" : "点击查看原图";
-    imgEl.addEventListener("click", () => showImageLightbox(imgEl.src));
+    const galleryIndex = gallery.length;
+    gallery.push(imageSrc);
+    imgEl.addEventListener("click", () => showImageLightbox(imgEl.src, gallery, galleryIndex));
     if (attachment.path && inTauri) imgEl.addEventListener("error", async () => {
       try { const dataUrl = await backend.readFileDataUrl(attachment.path); if (dataUrl) imgEl.src = dataUrl; } catch {}
     }, { once: true });
-    (album || body).appendChild(imgEl);
+    if (!album) { body.appendChild(imgEl); continue; }
+    if (placed >= tiles) continue;   // 超出上限的不铺格子，但上面已经进了 gallery
+    // 每格一个包装 div：`+X` 角标要盖在图上，而 <img> 装不下子节点。
+    const cell = document.createElement("div");
+    cell.className = "msg__album-cell";
+    cell.dataset.span = String(spans[placed] || 4);
+    cell.appendChild(imgEl);
+    if (overflow > 0 && placed === tiles - 1) {
+      const more = document.createElement("span");
+      more.className = "msg__album-more";
+      more.textContent = `+${overflow}`;
+      more.setAttribute("aria-label", `还有 ${overflow} 张图片`);
+      cell.appendChild(more);
+    }
+    album.appendChild(cell);
+    placed++;
   }
 }
 
