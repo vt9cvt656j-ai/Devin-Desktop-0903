@@ -87,8 +87,12 @@ test("交付事实块里的「继续做」只对 agent 模式说", () => {
 });
 
 test("update_plan 的回执也按模式分开，且 plan 模式拿到的是正确的下一步", () => {
-  assert.match(SRC, /const _goDo = run\.mode !== "agent"/,
+  assert.match(SRC, /const _planOnly = run\.mode !== "agent" \|\| run\.engineering\?\.explicitReadOnly === true;/,
     "「现在去做第一步」又不分模式了");
+  assert.match(SRC, /const _goDo = _planOnly/, "判据算出来了却没接上");
+  // agent 模式里用户明说「这轮只出计划、别动代码」时也不催——agent_core.txt:6
+  // 写着 A plan request ends at the plan，那是模式之外的第二种「只规划」。
+  assert.match(RAW_SRC, /A plan request ends at the plan/, "第二种只规划的理由没写下来");
   assert.match(SRC, /本模式不执行其中任何一步/,
     "plan 模式没拿到替代的那一句——只删不给替代，模型手上就只剩「计划已更新」，"
     + "而它刚被要求先规划，最省事的下一步就是再规划一次（那条实测：开局连发 4~5 次，65% 跑不成）");

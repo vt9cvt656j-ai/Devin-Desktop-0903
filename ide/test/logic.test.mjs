@@ -34249,7 +34249,7 @@ test("计划收下之后要明说「去做第一步」", () => {
   // 最省事的下一步就是再规划一次。
   // 这句只对 agent 模式成立：plan.txt 三处写着 never modify files / never run commands，
   // 对 plan 模式说「现在去做第一步」等于让一句工具回执推翻模式契约。
-  const at = RAW_SRC.indexOf('const _goDo = run.mode !== "agent"');
+  const at = RAW_SRC.indexOf('const _planOnly = run.mode !== "agent"');
   assert.ok(at > 0, "没有「去做第一步」这段");
   const seg = SRC.slice(at, at + 700);
   assert.match(seg, /现在去做第一步/, "没催它去执行");
