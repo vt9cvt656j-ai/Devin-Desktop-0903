@@ -91,10 +91,13 @@ test("从零建系统类项目要先读真实实现，建应用则直接开工",
   // 而外部知识律要求从零写版本控制/编译器/数据库时第一份代码前先查。合成一条带判据的。
   const r = P("reasoning");
   assert.match(r, /application-shaped/, "没有区分应用型和系统型");
-  assert.match(r, /systems artifact whose design trade-offs are the work itself/,
-    "系统型那一档没写出来");
-  assert.match(r, /version control system, a compiler, a database/,
-    "没给具体例子，判据落不了地");
+  // 钉判据本身，不钉措辞：这段为了塞进注意力预算被压过一次，
+  // 「systems artifact whose…」缩成了「When the design trade-offs are…」，
+  // 判据一个字没少而测试却红了。所以只钉那句判词和两个落地例子。
+  assert.match(r, /design trade-offs are the work itself/,
+    "系统型那一档的判据没了——没有判据的枚举恒等于默认值");
+  assert.match(r, /compiler/, "没给具体例子，判据落不了地");
+  assert.match(r, /database/, "没给具体例子，判据落不了地");
   // 反向：应用型仍然直接开工，不许退回「先比较一圈技术选型」
   assert.match(r, /pick the mainstream stack from what you already know and start building/,
     "把「直接开建」也删了——那会让每个待办应用都先做一轮选型调研");
@@ -125,8 +128,9 @@ test("不许默默把用户要的东西换成自己认定的真问题", () => {
   assert.doesNotMatch(c, /solve the real problem and say why/,
     "又允许默默换掉用户要的东西了");
   assert.match(c, /then build what they asked for/, "没说清正确做法是「说明 + 照做」");
-  assert.match(c, /quietly substituting your own reading for theirs is not/,
-    "没点名这就是 silently substituting");
+  // 同上：这句被压缩过，钉动作+判据，不钉整句。
+  assert.match(c, /substituting[^.]{0,60}without saying so/,
+    "没点名「不说一声就替换」这个动作本身");
 });
 
 // ── 死副本里那些「活版本确实缺」的规则，接回来了没有 ────────────────
