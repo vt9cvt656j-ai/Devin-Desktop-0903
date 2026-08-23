@@ -21196,6 +21196,13 @@ function _approvalLabel(call) {
     case "move": return { title: "移动 / 重命名？", detail: (call.path || "") + "  →  " + (call.to || "") };
     case "copy": return { title: "复制？", detail: (call.path || "") + "  →  " + (call.to || "") };
     case "mkdir": return { title: "新建目录？", detail: call.path || "" };
+    // 只有带 _wiki 的那次落盘会走到这里（纯调研的 subagent 不弹框）。框上必须写清楚
+    // **要覆盖哪个文件**——路径是模型给的，默认 PRODUCT_WIKI.md，但传 README.md 就
+    // 把 README 覆盖掉；只写「执行该操作？」等于让用户闭着眼睛点。
+    case "subagent": return {
+      title: "把生成的 Wiki 写进工作区？（整份覆盖）",
+      detail: (call.path || call.wikiDest || "PRODUCT_WIKI.md") + "\n\n这个路径由模型指定；写入是整份替换，不是追加。",
+    };
     case "saveskill": return { title: "保存为技能？", detail: `${call.name || ""}\n${String(call.description || "").slice(0, 160)}\n→ ${call.path || ""}` };
     // 定时任务是一条**将来会在没人看着时被执行的常驻指令**。框上必须把两件事摆出来：
     // 什么时候跑、跑的时候会拿到哪句话。只写「新建定时任务？」等于让用户闭着眼点同意
@@ -56106,6 +56113,31 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
         if (isWorker && workerMutated) it._workerMutated = true;
         let message = report;
         if (it.call._wiki && report && !/^\[ERROR\]/.test(report) && root) {
+          /*
+           * 这一步是**真的写工作区文件**，路径由模型的 dest 参数给（默认
+           * PRODUCT_WIKI.md，但传 "README.md" 就覆盖 README）。而它发生在主循环的结果
+           * 处理里、不在工具执行器里——所以只读门和审批门从头到尾没被问过：Explorer /
+           * Plan / Reviewer 下它照样写盘，开着「改动前审批」时也一框不弹，而隔壁
+           * write_file 写一个字节就要弹。两道门在这里补上。
+           *
+           * 拦下不等于白干：报告本身已经在 message 里，照样交回给模型和用户。
+           */
+          // 模式在这个作用域里没有现成变量（那两个是工具执行器里的局部量），按同一条
+          // 判据现算：run 上的优先，没有就用当前全局模式。
+          const _wikiMode = (run && run.mode) || _currentAiMode;
+          const _wikiReadOnly = _wikiMode === "explorer" || _wikiMode === "reviewer" || _wikiMode === "plan";
+          if (_wikiReadOnly && blockedInReadOnlyMode("subagent", it.call)) {
+            const _m = _wikiMode === "explorer" ? "Explorer" : _wikiMode === "plan" ? "Plan" : "Reviewer";
+            it.rawResult = { type: "subagent", path: it.call.description || "", content: report };
+            return `[BLOCKED] ${_m} 是只读模式，不能把 Wiki 写进工作区（generate_wiki 的 dest 是一次真实落盘，`
+              + `传 README.md 就会覆盖 README）。**报告本身在下面，一个字都没少**——`
+              + `把它交给用户，或者切到 Agent 模式再存盘。\n\n` + report;
+          }
+          if (!(await _approveToolCall({ ...it.call, type: "subagent", path: it.call.wikiDest || "PRODUCT_WIKI.md" }, run))) {
+            it.rawResult = { type: "subagent", path: it.call.description || "", content: report };
+            return `[BLOCKED] 用户没有批准把 Wiki 写进 ${it.call.wikiDest || "PRODUCT_WIKI.md"}。`
+              + `**报告本身在下面，一个字都没少**——直接交给用户即可。\n\n` + report;
+          }
           try {
             const wikiPath = it.call.wikiDest || "PRODUCT_WIKI.md";
             const absolute = _resolveRel(wikiPath, root);

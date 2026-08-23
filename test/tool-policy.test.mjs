@@ -111,6 +111,13 @@ test("approval set matches the pre-refactor literal exactly", () => {
       // save_skill 在用户家目录的技能库里建文件；mcp_server 改**持久化配置**并注册一条
     // 可执行命令行（list 是只读的，按调用逐次判，见下面的细则断言）。
     "saveskill", "mcpconfig",
+    // 新增（2026-08-23 审计）：subagent。它这一族里有一个会**真的写工作区文件**的——
+    // generate_wiki 把报告落成 dest 指定的那个文件，路径由模型给（默认 PRODUCT_WIKI.md，
+    // 传 "README.md" 就覆盖 README）。那次落盘发生在主循环的结果处理里、不在工具执行器
+    // 里，于是两道门从头到尾没被问过。它是**逐次**判定：纯调研的 run_subagent /
+    // research_project / design_research 照常放行（只读模式本来就靠它们干活），只有带
+    // _wiki 的那次落盘被挡；出现在这个集合里只表示「至少有一种调用会被挡」。
+    "subagent",
   ])));
   // worktree 是**有意**不问的：它只在 <root>/.mrdayone/worktrees/ 下动，是 IDE 自己的
   // 目录，best-of-N 每建一个候选弹一次窗就没法用了。这条豁免要留着，也要看得见。
@@ -163,6 +170,13 @@ test("read-only-mode block matches the pre-refactor chain, plus the closed termt
     "browser", "docker_compose_up", "capture_replay", "system",
       // 新增：只读模式里不许存技能、不许改 MCP 配置（mcp_server 的 list 仍放行，逐次判）。
     "saveskill", "mcpconfig",
+    // 新增（2026-08-23 审计）：subagent。它这一族里有一个会**真的写工作区文件**的——
+    // generate_wiki 把报告落成 dest 指定的那个文件，路径由模型给（默认 PRODUCT_WIKI.md，
+    // 传 "README.md" 就覆盖 README）。那次落盘发生在主循环的结果处理里、不在工具执行器
+    // 里，于是两道门从头到尾没被问过。它是**逐次**判定：纯调研的 run_subagent /
+    // research_project / design_research 照常放行（只读模式本来就靠它们干活），只有带
+    // _wiki 的那次落盘被挡；出现在这个集合里只表示「至少有一种调用会被挡」。
+    "subagent",
   ])));
   // 上一版这里断言的是 `false`，并写着「补掉的时候这一行要在同一个提交里翻成 true」——
   // 这就是那个提交。termtask 就是 run_in_terminal，命令串由模型给出、原样执行，和 cmd

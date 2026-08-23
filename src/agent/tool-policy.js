@@ -123,6 +123,21 @@ const SYSTEM_READ_OPS = new Set(["apps", "windows", "frontmost", "menu_items"]);
 function seed() {
   // ── structured file operations ────────────────────────────────────────────
   for (const t of ["write", "edit", "multiedit"]) defineTool(t, FILE_CONTENT_OP);
+  /*
+   * `subagent` 这一类里有一个会**写工作区文件**的：generate_wiki（带 _wiki）把报告落成
+   * dest 指定的那个文件，路径由模型给，默认 PRODUCT_WIKI.md，但传 "README.md" 就覆盖
+   * README。落盘发生在主循环的结果处理里、不在工具执行器里，于是这道门从头到尾没被
+   * 问过：Explorer / Plan / Reviewer 三个只读模式下它照样写盘，开着「改动前审批」时
+   * 也一框不弹——而隔壁 write_file 写一个字节就要弹。
+   *
+   * 其余的 run_subagent / research_project / design_research 是纯调研，只读模式必须
+   * 照常放行（只读模式本来就靠它们干活），所以按 call 判、不按类型判。
+   *
+   * 光声明还不够：真正的检查点要写在那次落盘前面（见 main.js 里 it.call._wiki 那段），
+   * 因为那条路径压根不经过工具执行器。这里的声明是让「这个工具的策略」有一个唯一出处。
+   */
+  const isWikiWrite = (call) => !!call?._wiki;
+  defineTool("subagent", { needsApproval: isWikiWrite, readOnlyModeBlocked: isWikiWrite });
   // `format` writes content like the other three, but repository hooks deliberately do NOT
   // fire for it: formatting is a mechanical rewrite of code the hooks already saw, and firing
   // a lint hook on every auto-format was noise.
