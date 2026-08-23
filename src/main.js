@@ -59650,11 +59650,25 @@ async function _searchKnowledgeBase(call) {
   }
 
   try {
+    // 超时必须对齐**这个端点自己的**延迟，不能吃 _fetchWithTimeout 的 9 秒默认值。
+    //
+    // 非设计域的 knowledge_search 在网关侧会并上 code_corpus 那条腿（295 万行表上的多词
+    // OR-tsquery + 两次 ts_rank），而喂给它的查询正是「域名 + 6~11 个 rubric 词 + 160 字
+    // 用户原文」拼出来的长句。实测（2026-08-23，生产网关）：domain=michael-design 1.79s；
+    // domain=ui-ux 9.00s；不传 domain 8.88s；按本 app 真实的 7 路并发跑域小抄那 4 条 rubric，
+    // 4.67 / 8.01 / 9.07 / **14.34** 秒。网关自己的日志里有对应的 `slow statement … code_corpus`。
+    //
+    // 于是超过 9 秒的那几条被 AbortController 掐掉 → catch 分支回 `[失败] …请求超时` →
+    // 卡片涂红、文案落到「无可用命中」。而网关那边每一条都有 6 段命中在等着：
+    // **零命中一次都没发生过**（用户现场那三张红卡就是这么来的）。
+    //
+    // 同文件里查同一张表的兄弟端点 _searchCodeCorpus 早就给了 60_000 并写明理由；这里取
+    // 30_000：高于实测最慢那条（14.3s）一倍有余，又不至于真挂掉时干等一分钟。
     const response = await _fetchWithTimeout(`${baseUrl}/api/knowledge/search`, {
       method: "POST",
       headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey || ""}` },
       body: JSON.stringify({ query: call.query, domain: call.domain || undefined, top_k: call.topK || 6 }),
-    });
+    }, 30_000);
     if (!response.ok) {
       const text = await response.text().catch(() => "");
       return { type: "knowledge", path: call.query, content: `[失败] 知识库查询 HTTP ${response.status}: ${text.slice(0, 200)}` };

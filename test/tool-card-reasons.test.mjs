@@ -365,3 +365,37 @@ test("cmd 在写入批次里要有主语", () => {
   assert.equal(out.path, "chmod +x examples/*.sh",
     "cmd 没有 path，此前这里落空串——卡片上就是一条没有主语的记录");
 });
+
+// ── ⑨ 知识检索的超时必须对齐它自己那个端点 ─────────────────────────────
+//
+// 用户现场那三张红色「无可用命中」既不是零命中、也不是网关报错，是**客户端 9 秒超时把请求
+// 掐了**：_searchKnowledgeBase 调 _fetchWithTimeout 时没传第三个参数，吃了默认 9000ms。
+// 而非设计域的 knowledge_search 在网关侧要并上 code_corpus 那条腿（295 万行表上的多词
+// OR-tsquery + 两次 ts_rank）。实测：michael-design 1.79s，ui-ux 9.00s，7 路并发下
+// 4.67 / 8.01 / 9.07 / 14.34 秒。网关那边每条都有 6 段命中在等着——零命中一次都没发生过。
+test("knowledge_search 不许吃 9 秒默认超时", () => {
+  const fn = fnSource("_searchKnowledgeBase", { code: true });
+  const m = fn.match(/api\/knowledge\/search`[\s\S]{0,400}?\}, (\d[\d_]*)\)/);
+  assert.ok(m, "knowledge/search 的 fetch 又没传超时了——它会吃 9 秒默认值，"
+    + "而这个端点在非设计域上实测中位数就 7~9 秒，慢的那几条 14.3 秒");
+  const ms = Number(String(m[1]).replace(/_/g, ""));
+  assert.ok(ms >= 20_000, `超时给了 ${ms}ms，低于实测最慢那条（14.3s）的安全余量`);
+  assert.ok(ms <= 60_000, `超时给了 ${ms}ms，真挂掉时用户要干等这么久`);
+});
+
+test("默认值本身没被顺手调大（那会影响所有别的调用）", () => {
+  // 反向断言。把 _fetchWithTimeout 的默认值从 9000 改成 30000 也能让上面那条过，
+  // 但那是把整个 app 的每一次带超时的请求都放宽——治标且波及面极大。
+  assert.match(SRC, /async function _fetchWithTimeout\(url, options = \{\}, timeoutMs = 9000\)/,
+    "改的是默认值而不是这一个调用点——所有别的请求跟着一起被放宽了");
+});
+
+test("晚到的域小抄仍有消费点（所以不必为它加长用户等待）", () => {
+  // 修完超时后这几条要 4.4~14.3 秒才回，而预检的等待预算是 6 秒。
+  // 之所以不必把预算调大：循环边界上有消费点，晚到的那份会在下一步被注入，
+  // 用户不用干等。这条钉住那个前提——它一旦没了，超时改大就变成纯粹的延迟。
+  const loop = fnSource("_runAgenticLoop", { code: true });
+  const hits = (loop.match(/_consumeDomainKnowledgePreflight\(\)/g) || []).length;
+  assert.ok(hits >= 2,
+    `循环里只有 ${hits} 个消费点：晚到的域小抄将被丢弃，那超时改大就只剩延迟没有收益`);
+});
