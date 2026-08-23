@@ -19986,25 +19986,6 @@ const _MSG_ACT_ICONS = {
   stats: '<path stroke-width="2" d="M6 19v-4M12 19v-8M18 19v-12"/>',
   more: '<circle cx="5.5" cy="12" r="1.35" fill="currentColor" stroke="none"/><circle cx="12" cy="12" r="1.35" fill="currentColor" stroke="none"/><circle cx="18.5" cy="12" r="1.35" fill="currentColor" stroke="none"/>',
 };
-/**
- * 把一条建议拆成「动作」和「补充说明」两层。
- *
- * 这些文案有两种形态：运行状态档是 5–15 字的短祈使句（「修复构建失败」「跑一遍验证刚才的
- * 改动」），模型给的选项常常是「动作，再顺带一件事」的长句（「创建 .env 填 KEY，试一次
- * npx tsx …」）。一整行同一个字重时，长的那类是一堵墙，读者得自己找重点。
- *
- * 只在**两边都够实在**时才拆，短句原样留一行 —— 把「先做 1」拆成两层只会显得零碎。
- * 判据是纯长度，不看词义：这里没有任何「这句在说什么」的推断，拆错了最多是分行不好看，
- * 不会改变语义。
- */
-function _splitSuggestionText(text) {
-  const raw = String(text || "").trim();
-  if ([...raw].length < 16) return { main: raw, sub: "" };
-  const m = raw.match(/^(.{6,}?)[，,]\s*(.{4,})$/);
-  if (!m) return { main: raw, sub: "" };
-  return { main: m[1].trim(), sub: m[2].trim() };
-}
-
 function _msgActButton(act, label, on = false) {
   return `<button type="button" class="msg__act${on ? " is-on" : ""}" data-act="${act}"`
     + ` title="${_escAttr(label)}" aria-label="${_escAttr(label)}"${on ? ' aria-pressed="true"' : ""}>`
@@ -26826,26 +26807,12 @@ function _renderSuggestionChips(sess, items, label) {
       const b = document.createElement("button");
       b.type = "button";
       b.className = "next-steps__chip";
-      // 序号/字母做成**前面一个小徽标**，不再拼进正文（原来是 "1、跑 npm install 装依赖"）。
-      // 数字序号本来就由卡片的上下顺序说明了，占着行首只是把正文往右挤；字母选项（A/B）
-      // 是这个选项的真身份，做成徽标反而更醒目。
-      b.innerHTML = (typeof it === "object" && it.badge
-        ? '<span class="next-steps__badge"></span>' : "")
-        + '<span class="next-steps__body"><span class="next-steps__chip-t"></span></span>' + _NS_ARROW;
-      if (typeof it === "object" && it.badge) b.querySelector(".next-steps__badge").textContent = it.badge;
+      // 一行就是一句话。序号不画了 —— 卡片的上下顺序本来就说明了「第几条」，
+      // 而每行多一个灰盒子，一列看下来全是盒子，正文反而不显眼。
+      b.innerHTML = '<span class="next-steps__chip-t"></span>' + _NS_ARROW;
       // 正文里的 `代码` 渲染成真正的行内代码：原来是 textContent，反引号原样显示成字符，
       // 一行里三对反引号既难读又白占位置。
-      const { main, sub } = _splitSuggestionText(text);
-      _appendTextWithInlineCode(b.querySelector(".next-steps__chip-t"), main);
-      if (sub) {
-        const s2 = document.createElement("span");
-        s2.className = "next-steps__sub";
-        _appendTextWithInlineCode(s2, sub);
-        // 追加到**正文那一列**里，不是卡片下面。卡片是三列栅格 [序号][内容][箭头]，
-        // 副行如果成了栅格的直接子元素，它会占掉第三列、把箭头挤到下一行 —— 实测就是
-        // 那个「箭头掉到左下角、正文和副行左右分家」的坏版。
-        b.querySelector(".next-steps__body").appendChild(s2);
-      }
+      _appendTextWithInlineCode(b.querySelector(".next-steps__chip-t"), text);
       b.title = text.replace(/`/g, "");
       b.addEventListener("click", () => { wrap.remove(); sendPrompt(send); });
       wrap.appendChild(b);
@@ -27668,7 +27635,7 @@ function _maybeRenderChoices(sess, src) {
     // its run-state suggestions into the same block.
     _renderSuggestionChips(
       sess,
-      opts.map((o) => ({ badge: o.label, label: o.text || o.label, send: o.send })),
+      opts.map((o) => ({ label: o.text || o.label, send: o.send })),
       t("chat.nextSteps"),
     );
     const block = sess.container.lastElementChild;
@@ -40677,17 +40644,28 @@ function _commandBatchBlockResult(run, items, index) {
     && !_callIsReadOnlyCommand(item.call));
   if (!failed) return null;
   const cmd = String(failed.call.command || "").slice(0, 120);
+  // 前项有两种，给模型的指示必须分开——这不是措辞问题。
+  //
+  // 「先读上面那条失败的真实输出」对**跑过并失败**的前项是对的；可前项若是被门在运行前
+  // 拦下的（它自己也带 failure.code，于是同样落进上面那个判据），那条真实输出**根本不存在**。
+  // 模型被指去找一个不存在的东西，找不到就只能猜，一轮白烧。
+  const _gate = _isPreExecutionBlock(failed.rawResult);
   return {
     type: current.call.type,
     path: current.call.command || "",
     ok: false,
     failure: { code: "command_batch" },
-    content: "[BLOCKED_COMMAND_BATCH] **这条没有执行。**\n"
-      + `同一轮里更早的一条命令失败了：\`${cmd}\`\n`
-      + "本轮这些命令是在看到任何结果之前一次性决定的，所以后面每一条都建立在一个刚刚被证伪的"
-      + "前提上——继续跑只会把一个错误变成一排错误。\n"
-      + "先读上面那条失败的真实输出，判断：是要修掉它再跑，还是这条本来就和它无关、可以单独重发。"
-      + "无论哪种，都请**一次只发一条**，拿到结果再决定下一条。",
+    content: _gate
+      ? "[BLOCKED_COMMAND_BATCH] **这条没有执行。**\n"
+        + `同一轮里更早的一条命令被门在运行前拦下了：\`${cmd}\`——它没有跑过，磁盘也没有被它改过。\n`
+        + "**不要去找它的失败输出：这一批没有产生任何失败输出。** 先按那道门自己正文里写的把那一步做掉，"
+        + "然后把这一批原样重发。"
+      : "[BLOCKED_COMMAND_BATCH] **这条没有执行。**\n"
+        + `同一轮里更早的一条命令失败了：\`${cmd}\`\n`
+        + "本轮这些命令是在看到任何结果之前一次性决定的，所以后面每一条都建立在一个刚刚被证伪的"
+        + "前提上——继续跑只会把一个错误变成一排错误。\n"
+        + "先读上面那条失败的真实输出，判断：是要修掉它再跑，还是这条本来就和它无关、可以单独重发。"
+        + "无论哪种，都请**一次只发一条**，拿到结果再决定下一条。",
   };
 }
 
@@ -40702,19 +40680,37 @@ function _implementationMutationBatchBlockResult(run, items, index) {
   // 一律判失败，而"目录已存在""内容和目标一致，无改动"这些**磁盘已经是目标状态**的情形
   // UI 当面给用户显示的就是成功。放宽候选集合之后，`[create_dir 已存在, write_file]`
   // 会被这道门硬拦——把一次正常的批次判成"前项失败"。
-  const priorFailed = previous.some((item) => item.rawResult != null
+  // 用 find 不用 some：要留住**肇事的那一项**，才能说清它是跑失败了还是被门拦下的。
+  const priorFailed = previous.find((item) => item.rawResult != null
     && item.rawResult.mutated !== false
     && !_toolExecutionSucceeded(item.call, item.rawResult));
   // A pending predecessor or an action with an unknown write scope is not a failure.
   // Preserve model order and let it execute; only a real settled failure stops later
   // dependent mutations from piling onto a partially-applied batch.
   if (!priorFailed) return null;
+  // 和命令批次同一条道理：门拦下的前项不存在「前一项真实错误」，而这段正文原来无条件
+  // 叫模型「先根据前一项真实错误修正方案」。用户现场就是这个形状——一次 README 编辑被
+  // 计划门拦下，后面整批写入连坐停止，模型拿到的指示是去读一份从未产生过的错误。
+  // 停止本身不变（门是一个 run 只拦一次，放行后续等于让那道要求彻底落空）。
+  const _gateName = {
+    plan_first: "计划门（先写计划再动手）",
+    tech_research: "依赖调研门（先查你正在加的那几个包）",
+    read_before_edit: "读前门（先读这个文件的当前版本）",
+    mutation_batch: "上游的批次停止",
+    command_batch: "上游的批次停止",
+  }[String(priorFailed.rawResult?.failure?.code || "")] || "";
   return {
     type: current.call.type,
     path: current.call.path || current.call.description || "",
     ok: false,
     failure: { code: "mutation_batch" },
-    content: "[BLOCKED_MUTATION_BATCH] 同一补丁中前一个修改没有成功，已停止后续写入，避免在部分失败的工作区上继续叠加改动。先根据前一项真实错误修正方案，再重新提交完整的一致补丁。",
+    content: _isPreExecutionBlock(priorFailed.rawResult)
+      ? `[BLOCKED_MUTATION_BATCH] **这条没有写入。** 同一批更早的一项被${_gateName || "某道门"}在运行前拦下了，`
+        + "磁盘一个字节都没改，所以本批后续写入一并停止——不是因为工作区半落地，"
+        + "而是要让那道门的要求先被满足。\n"
+        + "**不要去找前一项的失败输出：这一批没有产生任何失败输出。** 先按那道门自己正文里写的把那一步做完，"
+        + "再把这一批原样重发。"
+      : "[BLOCKED_MUTATION_BATCH] 同一补丁中前一个修改没有成功，已停止后续写入，避免在部分失败的工作区上继续叠加改动。先根据前一项真实错误修正方案，再重新提交完整的一致补丁。",
   };
 }
 

@@ -200,3 +200,88 @@ test("门拦的写入不许把自己标成「没尝试过」（标了就从台�
   assert.match(SRC, /\(run\._writeLedger = run\._writeLedger \|\| \[\]\)\.push\(\{ path: it\.call\.path, ok: _ok \}\)/,
     "那一遍的台账写入点没了——门拦的写入不会留下任何痕迹");
 });
+
+// ── ⑥ 给模型看的正文也要分开（这一半才影响它的下一步动作）─────────────
+//
+// 徽章是给用户看的；tool result 正文是给模型看的。原来两条批次停止门都无条件写着
+// 「先读上面那条失败的真实输出 / 先根据前一项真实错误修正方案」——前项是门拦时，
+// 那份输出**根本不存在**。模型被指去找一个不存在的东西，找不到就只能猜，一轮白烧。
+const PRE_BLOCK = load("_isPreExecutionBlock", {
+  _PRE_EXECUTION_BLOCK_CODES: new Set([
+    "plan_first", "tech_research", "read_before_edit", "mutation_batch", "command_batch",
+  ]),
+});
+const cmdBatch = load("_commandBatchBlockResult", {
+  _toolExecutionSucceeded: (call, res) => !!res && res.ok !== false && res.code !== 1,
+  _callIsReadOnlyCommand: (c) => /^(?:which|ls|cat|echo|pwd)\b/.test(String(c.command || "")),
+  _isPreExecutionBlock: PRE_BLOCK,
+});
+const mutBatch = load("_implementationMutationBatchBlockResult", {
+  _implementationMutationCandidate: (c) => ["write", "edit", "multiedit"].includes(c?.type)
+    || (c?.type === "cmd" && /^chmod\b/.test(String(c.command || ""))),
+  _toolExecutionSucceeded: (call, res) => !!res && res.ok !== false && res.code !== 1,
+  _isPreExecutionBlock: PRE_BLOCK,
+});
+const RUN = { mode: "agent" };
+
+test("前项是门拦时，不许叫模型去读一份不存在的失败输出（命令批次）", () => {
+  const items = [
+    { call: { type: "cmd", command: "npm run build" }, rawResult: { ok: false, failure: { code: "command_batch" } } },
+    { call: { type: "cmd", command: "npm test" } },
+  ];
+  const out = cmdBatch(RUN, items, 1);
+  assert.ok(out, "门拦的前项之后不再停止后续命令了——那道门就白设了");
+  assert.equal(out.failure.code, "command_batch", "失败码变了，恢复指令会走错分支");
+  assert.match(out.content, /\[BLOCKED_COMMAND_BATCH\]/, "标记不能变，别处按它识别");
+  assert.match(out.content, /没有产生任何失败输出/,
+    "还在叫模型去找失败输出——门拦下的那条根本没跑过");
+  assert.doesNotMatch(out.content, /先读上面那条失败的真实输出/,
+    "真失败那套指示漏到门拦分支上了");
+});
+
+test("前项真跑过并失败时，原来那套指示一个字不变（命令批次）", () => {
+  // 反向断言。只钉「门拦分支说了新话」是绿的摆设：把两个分支合并成新话它也绿，
+  // 而那会让真失败的回合失去「去读 exit code 和 stderr」这条唯一正确的指示。
+  const items = [
+    { call: { type: "cmd", command: "npm run build" }, rawResult: { ok: false, code: 1, content: "npm ERR! build failed" } },
+    { call: { type: "cmd", command: "npm test" } },
+  ];
+  const out = cmdBatch(RUN, items, 1);
+  assert.ok(out);
+  assert.match(out.content, /先读上面那条失败的真实输出/, "真失败的指示被冲掉了");
+  assert.match(out.content, /npm run build/, "要指名道姓是哪条挂了");
+  assert.doesNotMatch(out.content, /没有产生任何失败输出/, "真失败被说成了门拦");
+});
+
+test("写入批次同理，而且要说清是哪道门", () => {
+  const blocked = (code) => [
+    { call: { type: "edit", path: "README.md" }, rawResult: { ok: false, failure: { code } } },
+    { call: { type: "cmd", command: "chmod +x examples/*.sh" } },
+  ];
+  const planFirst = mutBatch(RUN, blocked("plan_first"), 1);
+  assert.ok(planFirst, "门拦的前项之后不再停止后续写入了");
+  assert.equal(planFirst.failure.code, "mutation_batch");
+  assert.match(planFirst.content, /\[BLOCKED_MUTATION_BATCH\]/);
+  assert.match(planFirst.content, /计划门/, "没说清是哪道门，模型不知道该去补哪一步");
+  assert.match(planFirst.content, /没有产生任何失败输出/);
+  assert.doesNotMatch(planFirst.content, /前一项真实错误/, "真失败那套话漏过来了");
+
+  const techFirst = mutBatch(RUN, blocked("tech_research"), 1);
+  assert.match(techFirst.content, /依赖调研门/, "两道门给了同一句话——又合流了");
+
+  // 真失败：原文一个字不变
+  const real = mutBatch(RUN, [
+    { call: { type: "write", path: "a.ts" }, rawResult: { ok: false, code: 1, content: "EACCES" } },
+    { call: { type: "write", path: "b.ts" } },
+  ], 1);
+  assert.match(real.content, /先根据前一项真实错误修正方案/, "真失败的指示被冲掉了");
+  assert.doesNotMatch(real.content, /没有产生任何失败输出/);
+});
+
+test("留住肇事前项用的是 find 不是 some（否则说不出是哪道门）", () => {
+  const src = fnSource("_implementationMutationBatchBlockResult", { code: true });
+  assert.match(src, /const priorFailed = previous\.find\(/,
+    "换回 some 了——拿不到肇事项，就只能说一句笼统的话");
+  assert.match(src, /item\.rawResult\.mutated !== false/,
+    "幂等空操作的豁免没了——[create_dir 已存在, write_file] 会被当成前项失败硬拦");
+});
