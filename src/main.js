@@ -19562,11 +19562,28 @@ function _beginEditResend(wrap, forSession) {
   const orig = String(wrap._rawText || body.textContent || "");
   // 保留原 DOM 节点（而非序列化 HTML），取消时原样放回——@引用卡片/图片的点击事件不丢
   const origNodes = [...body.childNodes];
-  origNodes.forEach((n) => n.remove());
+  // 相册**留在原地**，只摘走文字节点。
+  //
+  // 原来这里是 `origNodes.forEach(n => n.remove())` —— 把整个 body 清空，图片跟着一起
+  // 消失。于是双击一条带图的消息，屏幕上只剩一个写着文字的输入框，用户根本看不出这条
+  // 消息本来是带图的（也就无从判断编辑后图还在不在）。
+  // 图不参与编辑（textarea 装不下），但**必须看得见**：它们是这条消息的一部分。
+  const keptNodes = origNodes.filter((n) =>
+    n.nodeType === 1 && (n.classList?.contains("msg__album") || n.classList?.contains("msg__attached-image")
+      || n.classList?.contains("msg__attached-video")));
+  origNodes.filter((n) => !keptNodes.includes(n)).forEach((n) => n.remove());
   const ta = document.createElement("textarea");
   ta.className = "msg__edit-ta";
   ta.value = orig;
-  ta.rows = Math.min(12, Math.max(1, orig.split("\n").length));
+  // 高度跟着内容走。`rows` 只在这里算一次，打字时不会再变，而 CSS 里
+  // `height:auto; max-height:168px` 又没配 overflow-y —— 于是输入超过一行之后既不长高、
+  // 也没有滚动条，后面打的字直接看不见了。改成每次输入都重算一遍。
+  const autoGrow = () => {
+    ta.style.height = "auto";                       // 先塌回去，否则 scrollHeight 只增不减
+    ta.style.height = `${Math.min(ta.scrollHeight, 168)}px`;
+  };
+  ta.addEventListener("input", autoGrow);
+  requestAnimationFrame(autoGrow);                  // 进编辑态时按原文长度先撑开一次
   // 克隆底部 composer 的整条工具栏（Agent/模型/麦克风/⌘↩/发送箭头），视觉完全一致。
   // 克隆体去掉 id 防止重复；麦克风等普通控件透传给底部真实按钮，两个下拉菜单单独按编辑按钮定位。
   const realBar = document.querySelector("#composer .composer__bar");
@@ -19595,7 +19612,11 @@ function _beginEditResend(wrap, forSession) {
   const box = document.createElement("div");
   box.className = "composer__box msg__edit-box";
   box.append(ta, bar);
-  body.append(box);
+  // 阅读态是「文字在上、图在下」（_renderMessageAttachments 在文字之后才调）。
+  // 直接 append 会让编辑框排到相册**后面**，双击一下图片就跳到文字上方去了。
+  // 插在第一个保留节点之前，编辑态和阅读态的上下关系保持一致。
+  if (keptNodes.length) body.insertBefore(box, keptNodes[0]);
+  else body.append(box);
   try { ta.focus(); ta.setSelectionRange(ta.value.length, ta.value.length); } catch {}
   const cancel = () => {
     // 若模型/模式菜单还寄宿在这张编辑卡里，先收回并送回底部原位，避免随卡片一起被销毁。
@@ -19604,7 +19625,9 @@ function _beginEditResend(wrap, forSession) {
     document.removeEventListener("pointerdown", onOutside, true);
     wrap._editing = false;
     body.classList.remove("msg__body--editing");
-    body.textContent = "";
+    body.textContent = "";           // 连相册一起清掉，下面按原顺序整份放回
+    // 按 origNodes 的**原始顺序**放回，不是「先文字后图片」：顺序错了的话，
+    // 取消一次编辑图片就跑到文字后面去，而且再取消一次还会再跑一次。
     body.append(...origNodes);
   };
   // 点击编辑卡片外面且内容没改动 → 视为放弃编辑，恢复原消息。
