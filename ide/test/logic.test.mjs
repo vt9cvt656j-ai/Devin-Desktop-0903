@@ -28189,6 +28189,61 @@ test("相册样式：格子定尺寸、行等高、角标盖实", () => {
     "角标挡住了点击——点 +N 进不了画廊");
 });
 
+// ── 本轮统计行必须钉在最底部，不许一上一下 ─────────────────────────────────
+//
+// 原来只在每秒 tick 里判「不在末尾就 append」。于是新内容（文字段 / 工具卡）追加之后，
+// 统计行会在它**上面**待着，直到下一次 tick（最多 1 秒）才跳下去 —— 用户看到的是
+// 「本来在上面，有消息又到下面，一直重复」。轮询修不了：只要间隔非零，那个空窗就在。
+test("本轮统计行：内容一追加就立刻归位，不靠每秒轮询", () => {
+  const src = extractFn("_liveTurnStats", { code: true });
+
+  assert.match(src, /new MutationObserver\(pinToBottom\)/,
+    "还在靠轮询把统计行搬到底部——新内容进来后它会在上面停最多 1 秒");
+  assert.doesNotMatch(src, /if \(el !== body\.lastElementChild\) body\.appendChild\(el\);/,
+    "每秒重排那行还在");
+  // 移动 el 自己也会触发 observer：必须先判「已经在末尾就什么都不做」，否则死循环。
+  assert.match(src, /el === body\.lastElementChild\) return/,
+    "没有防死循环的早退——移动自己会再次触发 observer");
+  assert.match(src, /watcher\?\.disconnect\(\)/, "stop 时没断开观察，回复结束后还在盯");
+  // tick 里保留一次兜底：老 WebView 没有 MutationObserver，或者 observer 被异常打断。
+  assert.match(src, /pinToBottom\(\); \/\/ 兜底|pinToBottom\(\);/,
+    "tick 里没有兜底归位");
+
+  // 行为：用最小 DOM 桩真跑一遍「追加内容 → 统计行是否还在末尾」。
+  const made = [];
+  const mkNode = (tag) => {
+    const node = { tag, children: [], className: "", innerHTML: "", title: "",
+      get lastElementChild() { return this.children[this.children.length - 1] || null; },
+      appendChild(c) { const i = this.children.indexOf(c); if (i !== -1) this.children.splice(i, 1);
+        this.children.push(c); (this._cbs || []).forEach((cb) => cb()); return c; },
+      remove() {} };
+    made.push(node);
+    return node;
+  };
+  const body = mkNode("div");
+  const stats = load("_liveTurnStats", {
+    document: { createElement: mkNode },
+    MutationObserver: function (cb) {
+      return { observe(target) { (target._cbs = target._cbs || []).push(cb); }, disconnect() {} };
+    },
+    Date,
+    setInterval: () => 0,
+    clearInterval: () => {},
+    _turnStatsText: () => ({ html: "x" }),
+    _turnStatsTitle: () => "t",
+  });
+  const handle = stats(body, { startedAt: Date.now() });
+  const statsEl = body.lastElementChild;
+  assert.ok(statsEl, "统计行没建出来");
+  // 追加三段内容，每次之后统计行都必须仍在末尾（这就是「不许篡位」）。
+  for (const tag of ["seg", "tool", "seg"]) {
+    body.appendChild(mkNode(tag));
+    assert.equal(body.lastElementChild, statsEl,
+      `追加 ${tag} 之后统计行不在末尾了——这正是用户看到的一上一下`);
+  }
+  handle.stop();
+});
+
 // ── 编辑态：长得就得和底部输入框一模一样 ──────────────────────────────────
 //
 // 三轮下来的经过：
