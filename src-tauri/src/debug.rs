@@ -136,10 +136,10 @@ pub fn dap_start(
         config.args.clone()
     };
 
-    #[cfg(not(windows))]
+    // 和 lsp.rs 同一处坑：Windows 分支原来是裸名字直接 spawn，而 Rust 的 Command 在
+    // Windows 上只补 .exe、不查 PATHEXT。调试适配器同样多是 npm 装的 *.cmd
+    // （js-debug-adapter-stdio），于是「装了却起不来，也没人说为什么」。
     let resolved = process_util::resolve_command(&command, config.cwd.as_deref());
-    #[cfg(windows)]
-    let resolved = command.clone();
 
     let mut builder = crate::process_util::command(&resolved);
     builder

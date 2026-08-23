@@ -785,7 +785,31 @@ export function createLspManager(options) {
       if (clients.get(langId) === client) clients.delete(langId);
       const msg = String(e && e.message ? e.message : e);
       const alreadyRunning = /already running/i.test(msg);
-      if (alreadyRunning) { onLog?.(`[lsp] ${langId}: ${msg}`); return null; }
+      if (alreadyRunning) {
+        /*
+         * 「已经在跑了」几乎总是**后端那条记录成了孤儿**：读线程遇到一个非法帧退出、
+         * 却没把自己从 map 里摘掉（lsp.rs 那边现在会摘了，这里是对老进程/竞态的兜底）。
+         * 原来这条分支只写一行日志就静默 return —— 于是这门语言整个会话再也起不来，
+         * 界面上一个字都没有。
+         *
+         * 先真的把它停掉，再重试一次。还是不行才认输，而且**说出来**。
+         */
+        onLog?.(`[lsp] ${langId}: ${msg}`);
+        try { await backend.lspStop(SERVER_LANG[langId] || langId); } catch { /* 已经没了也算成功 */ }
+        try {
+          const retry = new LspClient(langId, manager);
+          clients.set(langId, retry);
+          await retry.start(custom);
+          onStatus?.();
+          return retry;
+        } catch (e2) {
+          // 这里不能用下面那张 names 表：它是同一个函数作用域里 const 声明的，声明点在
+          // 这一行**之后**，读它是 TDZ 抛错（而且只在这条 catch 路径上炸，语法检查看不见）。
+          clients.delete(langId);
+          showToast(`${langId} 语言服务卡住了，已尝试重启但没起来：${String(e2 && e2.message ? e2.message : e2).slice(0, 120)}`);
+          return null;
+        }
+      }
       /*
        * 安装命令按平台分。以前整张表是照 macOS 写的，Windows 上是三重失败：
        *

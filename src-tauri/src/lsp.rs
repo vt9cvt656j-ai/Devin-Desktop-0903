@@ -41,9 +41,31 @@ impl Drop for LspProcess {
     }
 }
 
+/// map 是 `Arc` 的，因为**读线程要能把自己摘掉**。
+///
+/// 原来读循环遇到一个非法帧就 break，然后发一个 Stopped 事件走人——子进程既不 kill、
+/// 也不从这个 map 里移除。于是用户再打开一个同语言文件：ensureServer → lsp_start →
+/// prune_stopped 看见进程还活着就保留 → `contains_key` 命中 → 返回
+/// 「LSP for 'x' is already running」→ 前端那条 alreadyRunning 分支**静默 return**。
+/// 结果整个会话里这门语言再也没有补全/诊断/跳转，界面上一个字都没有；而那个
+/// 几百 MB 的语言服务器进程一直挂着，还没人读它的 stdout，管道写满后它自己也卡死。
 #[derive(Default)]
 pub struct LspManager {
-    inner: Mutex<HashMap<String, LspProcess>>,
+    inner: Arc<Mutex<HashMap<String, LspProcess>>>,
+}
+
+use std::sync::Arc;
+
+/// 把一门语言从 map 里摘掉并结束它的进程。
+///
+/// **先移除、再在锁外 drop**：LspProcess::drop 会 kill + 阻塞 wait，抱着锁做这件事会
+/// 让编辑器的所有诊断/跳转请求排在它后面（lsp_stop 那边早就是这么写的，这里跟上）。
+fn reap(map: &Arc<Mutex<HashMap<String, LspProcess>>>, lang: &str) {
+    let removed = match map.lock() {
+        Ok(mut inner) => inner.remove(lang),
+        Err(_) => None,
+    };
+    drop(removed);
 }
 
 impl LspManager {
@@ -267,10 +289,19 @@ pub fn lsp_start(
     } else {
         None
     };
-    #[cfg(not(windows))]
+    // 两个平台统一走 resolve_command。
+    //
+    // Windows 分支原来是 `command.clone()`——裸名字直接交给 spawn。可 Rust 的 Command 在
+    // Windows 上走 CreateProcessW，**只补 .exe，不查 PATHEXT**（process_util 里那段注释
+    // 自己写着）。而 npm 装出来的语言服务器全是 *.cmd：typescript-language-server、
+    // bash-language-server、yaml-language-server、docker-langserver、vue-language-server、
+    // intelephense、graphql-lsp —— 一个都起不来。
+    //
+    // 更难查的是它的表现：lsp_check_available 的 Windows 分支**会**扫 .exe/.cmd/.bat，
+    // 于是返回「装了」，前端走的是「启动失败」而不是「去装一个」。用户看到的是
+    // 「明明装好了，却没有补全、没有跳转，也没人告诉我为什么」。
+    // mcp.rs 早就为同一个坑打过补丁并写明后果，lsp.rs 没跟上。
     let resolved = process_util::resolve_command(&command, bin_scope);
-    #[cfg(windows)]
-    let resolved = command.clone();
 
     // Detect Node.js shebang scripts and run them through node directly,
     // because the kernel's shebang handler uses the parent process PATH
@@ -355,6 +386,8 @@ pub fn lsp_start(
 
     let lang = config.lang.clone();
     let evt = on_event.clone();
+    let reap_map = Arc::clone(&state.inner);
+    let mut frame_error = String::new();
     std::thread::spawn(move || {
         let mut reader = BufReader::new(stdout);
         loop {
@@ -363,6 +396,9 @@ pub fn lsp_start(
                 Ok(None) => break,
                 Err(error) => {
                     tracing::warn!("[lsp-{lang}] invalid protocol frame: {error}");
+                    // 非法帧不是「这门语言坏了」，是「这一条读不懂」——但从这里往后
+                    // 流已经错位，只能收摊。把原因带出去，别让用户面对一句「已停止」。
+                    frame_error = format!("协议帧读不懂：{error}（服务器往 stdout 写了非 LSP 内容，常见于包装脚本打印下载进度）");
                     break;
                 }
             };
@@ -377,10 +413,16 @@ pub fn lsp_start(
         // stdout EOF 是进程死掉的可靠信号，但 stderr 那边可能还没读完最后几行。
         // 等一小下再取尾巴——不等的话，最能说明死因的那几行恰好赶不上这班车。
         std::thread::sleep(std::time::Duration::from_millis(150));
-        let tail = tail_for_stop
+        let mut tail = tail_for_stop
             .lock()
             .map(|t| t.iter().cloned().collect::<Vec<_>>())
             .unwrap_or_default();
+        if !frame_error.is_empty() {
+            tail.push(frame_error);
+        }
+        // **必须摘掉自己**：不摘的话 map 里那条记录会永远挡住这门语言的下一次启动
+        // （contains_key → "already running"），而进程本身还活着、还占着几百 MB。
+        reap(&reap_map, &lang);
         let _ = evt.send(LspEvent::Stopped { lang, tail });
     });
 
@@ -1248,6 +1290,15 @@ mod windows_path_tests {
 mod trust_gate_tests {
     use super::*;
 
+    /// 这几条测试会**真的起进程**（假解释器、node、被 kill 的 sleep）。测试运行器默认
+    /// 并行，几条同时 spawn 在负载高时会波及别的用例——加进去当天就见过一次 archive
+    /// 那三条莫名其妙一起红（单独跑、单线程跑都是绿的）。起进程的用例没必要并行，
+    /// 用一把锁串起来；比留一个偶发的红更值。
+    pub(super) static SPAWN_LOCK: Mutex<()> = Mutex::new(());
+    pub(super) fn spawn_guard() -> std::sync::MutexGuard<'static, ()> {
+        SPAWN_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     fn fake_repo_with_venv(tag: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!("mrday-trustgate-{tag}"));
         let _ = std::fs::remove_dir_all(&dir);
@@ -1273,6 +1324,7 @@ mod trust_gate_tests {
     #[test]
     #[cfg(unix)]
     fn untrusted_workspace_never_runs_its_own_interpreter() {
+        let _g = spawn_guard();
         let dir = fake_repo_with_venv("untrusted");
         let ws = dir.to_string_lossy().to_string();
 
@@ -1305,6 +1357,7 @@ mod trust_gate_tests {
 
     #[test]
     fn untrusted_workspace_never_requires_its_node_modules() {
+        let _g = spawn_guard();
         let dir = std::env::temp_dir().join("mrday-trustgate-node");
         let _ = std::fs::remove_dir_all(&dir);
         let m = dir.join("node_modules").join("evil");
@@ -1333,5 +1386,62 @@ mod trust_gate_tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// 读线程退出时必须把自己从 map 里摘掉。
+///
+/// 不摘的后果是一条**静默**的死亡：进程还活着 → prune_stopped 保留它 → 下次
+/// `contains_key` 命中 → lsp_start 返回「already running」→ 前端那条分支静默 return。
+/// 整个会话里这门语言再也没有补全/诊断/跳转，界面上一个字都没有，而那个几百 MB 的
+/// 进程一直挂着、没人读它的 stdout，管道写满后它自己也卡死。
+#[cfg(test)]
+mod reap_tests {
+    use super::*;
+
+    #[test]
+    #[cfg(unix)]
+    fn reap_removes_the_entry_and_kills_the_child() {
+        let _g = super::trust_gate_tests::spawn_guard();
+        let map: Arc<Mutex<HashMap<String, LspProcess>>> = Arc::new(Mutex::new(HashMap::new()));
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .stdin(Stdio::piped())
+            .spawn()
+            .expect("spawn sleep");
+        let pid = child.id();
+        // stdin_tx 只是个占位：reap 走的是 remove + drop，不碰它。
+        let (tx, _rx) = std::sync::mpsc::channel::<String>();
+        let _ = child.stdin.take();
+        map.lock().unwrap().insert(
+            "rust".to_string(),
+            LspProcess {
+                child,
+                stdin_tx: tx,
+            },
+        );
+        assert!(map.lock().unwrap().contains_key("rust"));
+
+        reap(&map, "rust");
+
+        assert!(
+            !map.lock().unwrap().contains_key("rust"),
+            "读线程退出后那条记录还在 —— 下次 lsp_start 会撞上 already running，这门语言整个会话再也起不来"
+        );
+        // 进程真的被结束了：kill -0 探测不到就是没了。
+        std::thread::sleep(std::time::Duration::from_millis(120));
+        let alive = std::process::Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        assert!(!alive, "进程没被结束 —— 几百 MB 的语言服务器会一直挂到应用退出");
+    }
+
+    #[test]
+    fn reap_on_a_missing_lang_is_a_no_op() {
+        let map: Arc<Mutex<HashMap<String, LspProcess>>> = Arc::new(Mutex::new(HashMap::new()));
+        reap(&map, "nope"); // 不许 panic
+        assert!(map.lock().unwrap().is_empty());
     }
 }

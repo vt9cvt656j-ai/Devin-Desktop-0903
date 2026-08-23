@@ -116,3 +116,51 @@ test("langId 要一路传到进度卡片——它是跨平台探测的入口", (
     "通知里没带 langId，进度卡片就没法问后端「装好了没」");
 });
 
+
+// ── 「已经在跑了」不许静默认输 ──────────────────────────────────────────────
+//
+// 后端那条记录成孤儿时（读线程遇到一个非法帧就退出、却没把自己从 map 里摘掉），
+// lsp_start 会返回「LSP for 'x' is already running」。这条分支原来只写一行日志就
+// 静默 return —— 于是这门语言整个会话再也起不来，界面上一个字都没有。
+test("后端说「已经在跑了」时，先真的停掉再重试一次，而不是静默放弃", async () => {
+  let starts = 0, stops = 0;
+  const callbacks = [];
+  const backend = {
+    async lspStart(_config, cb) {
+      callbacks.push(cb);
+      starts++;
+      // 第一次：假装后端 map 里有一条孤儿记录。停过之后才让它起来。
+      if (starts === 1 && stops === 0) throw new Error("LSP for 'rust' is already running");
+    },
+    async lspSend(_lang, raw) {
+      const m = JSON.parse(raw);
+      if (m.id === undefined) return;
+      const cb = callbacks.at(-1);
+      queueMicrotask(() => cb({ kind: "message", data: JSON.stringify({ jsonrpc: "2.0", id: m.id, result: { capabilities: {} } }) }));
+    },
+    async lspStop() { stops++; },
+    async lspCheckAvailable() { return true; },
+  };
+  const toasts = [];
+  const manager = createLspManager({ backend, isWorkspaceTrusted: () => true, showToast: (m) => toasts.push(m) });
+
+  const client = await manager.startManual("rust");
+  assert.ok(client, "「已经在跑了」之后就放弃了 —— 这门语言整个会话再也起不来，而且一声不吭");
+  assert.equal(stops, 1, "没有先把那条孤儿记录停掉，重试必然还是同一个错");
+  assert.equal(manager.isRunning("rust"), true, "重试起来了却没登记");
+  await manager.stop("rust");
+});
+
+test("停掉之后仍然起不来，要说出来，不能静默", async () => {
+  const backend = {
+    async lspStart() { throw new Error("LSP for 'rust' is already running"); },
+    async lspSend() {}, async lspStop() {}, async lspCheckAvailable() { return true; },
+  };
+  const toasts = [];
+  const manager = createLspManager({ backend, isWorkspaceTrusted: () => true, showToast: (m) => toasts.push(m) });
+  const client = await manager.startManual("rust");
+  assert.equal(client, null);
+  assert.ok(toasts.some((t) => /语言服务卡住了/.test(t)),
+    "两次都失败却一个字都不说 —— 用户只会看到「代码智能没了」，无从下手");
+  assert.equal(manager.isRunning("rust"), false, "失败了还留着 client，状态栏会显示它在跑");
+});
