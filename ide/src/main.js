@@ -64750,10 +64750,24 @@ return { type: call.type, path: call.query || "", content: `[失败] ${call.type
       // No session at all also counts as retired: without one we cannot tell which run a
       // follow-up would belong to, and queueing one anyway starts a billed agent turn blind.
       const _bmRetired = () => !_bmSess || (_bmSess._runGen || 0) !== _bmGen || !!_bmSess._disposed;
+      // 监视器盯到了，用户得知道——而这正是它存在的全部理由（「让用户去做 X」之后
+      // 自己盯着，用户做完就继续）。原来这里用的是 webview 那个 `Notification`：
+      // 权限**从来没有申请过**，于是 permission 恒等于 "default"，这个 if 一次都没
+      // 成立过。监视器盯到了，用户不在这个窗口，就什么都不会发生——功能等于没有。
+      //
+      // 改走这份代码里已经在用的那条 Tauri 通道（_notifyTaskDone 同款：问一次权限、
+      // 用插件发系统通知），再补一条窗口标题闪烁作为兜底：用户拒绝了系统通知、或者
+      // 插件不可用时，标题栏仍然会动，不至于完全无声。
       const _bmNotify = (title) => {
-        try {
-          if (typeof Notification !== "undefined" && Notification.permission === "granted") new Notification("Mr. Day One", { body: title });
-        } catch {}
+        try { _flashTitle("✅ 等到了"); } catch {}
+        void (async () => {
+          try {
+            if (!inTauri) return;
+            let granted = await _notifyPermitted();
+            if (!granted) granted = (await _notifyRequestPermission()) === "granted";
+            if (granted) await _notifySystem({ title: "Mr. Day One", body: String(title || "").slice(0, 120) });
+          } catch {}
+        })();
       };
       const _bmFinish = (dotClass, statusText, followupText, suppressFollowup = false) => {
         if (_bmDone) return; _bmDone = true;
