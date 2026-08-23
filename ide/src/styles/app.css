@@ -5415,30 +5415,21 @@ img.settings-dropdown__avatar--filled { object-fit: cover; }
 .next-steps__label .next-steps__ic { width: 13px; height: 13px; color: var(--accent, #1a73e8); opacity: .9; }
 /* 卡片是 align-items:flex-start —— 正文可以是两行，箭头和徽标要停在第一行的高度上，
    不能被拉到两行的正中间。 */
-/* 卡片内部是一张三列的栅格：[序号] [内容] [箭头]。
-   居中试过，不好看 —— 长短不一的一列动作项居中之后每行起点都在跳，读起来像散落的标签。
-   列表就该左对齐：起点对齐，眼睛沿一条竖线往下扫。
-   `align-items: start` + 栅格（而不是 flex）是为了让**换行后的第二行和第一行对齐**，
-   不会滑到序号底下 —— 这是长内容那一类唯一要紧的排版细节。 */
-.next-steps__chip { position: relative; display: grid; grid-template-columns: auto minmax(0, 1fr) auto; align-items: start; column-gap: 10px; width: 100%; text-align: left; border: 1px solid var(--line-strong, #d7d7dc); background: var(--panel-2, #fbfbfd); color: var(--text, #1c1c1e); border-radius: 12px; padding: 10px 13px; font-size: 13px; line-height: 1.45; cursor: pointer; transition: background .14s ease, border-color .14s ease, box-shadow .14s ease, transform .08s ease; }
+/* 卡片内部：两列 —— [正文] [箭头]。就这么多。
+   上一版是三列（序号 / 正文 / 箭头）外加长句拆两层，方向错了：外壳本来就好看，里面
+   需要的是**做减法**。每行一个灰盒子序号 + 若干灰盒子代码 + 灰卡片，盒中盒糊成一团；
+   而且有的卡有副行、有的没有，高度参差，一列看下来是乱的。
+   现在一行就是一句话，序号去掉（顺序本来就看得见），代码不再填底。 */
+.next-steps__chip { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: start; column-gap: 12px; width: 100%; text-align: left; border: 1px solid var(--line-strong, #d7d7dc); background: var(--panel-2, #fbfbfd); color: var(--text, #1c1c1e); border-radius: 12px; padding: 10px 13px; font-size: 13px; line-height: 1.5; cursor: pointer; transition: background .14s ease, border-color .14s ease, box-shadow .14s ease, transform .08s ease; }
 /* 原来是 `white-space: nowrap` + 省略号：一行装不下就砍掉，而这些建议本来就是一句话，
    砍掉后半句等于让人猜（用户原话「看不全」）。改成最多两行、按词/字换行；真有超长的
    （模型偶尔把整条命令塞进来）才在第二行末尾收省略号，全文留在 title 里。 */
-/* 内容那一列的容器：正文 + 可选的补充说明都装在这里，所以它们左边缘天然对齐，
-   而箭头始终是栅格的第三列。min-width:0 是栅格子项能收缩的前提，少了它长内容会把
-   卡片撑破而不是换行。 */
-.next-steps__body { min-width: 0; display: flex; flex-direction: column; }
 /* 正文一列。两行封顶，按字换行；换行后仍在这一列里，天然和第一行对齐。 */
 .next-steps__chip-t { min-width: 0; display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; line-clamp: 2; overflow: hidden; overflow-wrap: anywhere; word-break: break-word; }
-/* 补充说明那一行：动作后面跟着的「为什么/顺带做什么」压成次要层级。
-   长句子一整行同一个字重，读者得自己找重点；分两层之后，第一眼只看动作。 */
-.next-steps__sub { margin-top: 2px; color: var(--text-dim); font-size: 11.5px; line-height: 1.4; display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 1; line-clamp: 1; overflow: hidden; overflow-wrap: anywhere; }
-/* 序号一列。**安静**：原来是填色的蓝药丸，眼睛先被序号吸走，而它是这里最不重要的信息
-   —— 真正要被看见的是那句动作。改成等宽数字 + 极淡底，只起「这是第几条」的索引作用。
-   字母选项（A/B）走同一套：它比数字重要，但也不该压过正文。 */
-.next-steps__badge { flex: none; display: inline-flex; align-items: center; justify-content: center; min-width: 17px; height: 17px; margin-top: 1px; padding: 0 4px; border-radius: 5px; background: var(--line, rgba(0,0,0,.06)); color: var(--text-dim); font-size: 10.5px; font-weight: 600; font-variant-numeric: tabular-nums; line-height: 1; }
-/* 建议里的 `命令` 渲染成真正的行内代码 —— 原来反引号是当字符显示的。 */
-.next-steps__code { padding: 1px 5px; border-radius: 5px; background: var(--line, rgba(0,0,0,.07)); font-family: var(--mono); font-size: 11.5px; overflow-wrap: anywhere; }
+/* 行内代码：换字体 + 换颜色，**不填底**。
+   填底的灰药丸在一张本来就是灰底的卡片上是盒中盒 —— 一行里出现两三个，整条建议就被
+   切成一段段，比不标记还难读。等宽字体本身已经足够把它和中文正文区分开。 */
+.next-steps__code { font-family: var(--mono); font-size: 12px; color: var(--accent, #0a84ff); overflow-wrap: anywhere; }
 /* 箭头回到栅格的第三列 —— 不用绝对定位了：栅格里它自己占一列，既不压正文，
    也不会把内容拽偏。top 对齐首行靠 align-items:start + margin-top 微调。 */
 .next-steps__chip .next-steps__arrow { width: 15px; height: 15px; flex: none; margin-top: 2px; color: var(--accent, #0a84ff); opacity: .45; transition: opacity .14s ease, transform .14s ease; }
