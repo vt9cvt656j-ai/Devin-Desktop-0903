@@ -158,3 +158,45 @@ test("「这次是失败还是零命中」用结构字段判，不用文案匹�
   assert.match(search, /knowledge: \{ hitCount: 0, domains: \[\] \}/, "零命中分支不再带 knowledge 字段");
   assert.match(search, /content: `\[失败\] 知识库查询 HTTP \$\{response\.status\}/, "HTTP 失败分支变了");
 });
+
+// ── ⑤ 被门拦下的写入必须留下痕迹 ────────────────────────────────────
+//
+// 实测（2026-08-23，用户的 AICode）：09:03:31 模型回复里写着「README.md 已更新」，
+// 而磁盘上那个文件直到 09:20:23 才第一次被真正写入——中间 17 分钟里它一个字节没变。
+// 那次编辑正是截图里被门拦下的那张卡。
+//
+// 拦下它是对的。**但拦下的写入必须仍然留下痕迹**，否则整条对账链没有输入：
+//   门拦 → it.rawResult = blocked → 那一遍 `for (const it of items)` 照样处理它
+//        → 写盘台账 {path, ok:false}
+//        → 模型侧：_deliveryFactsLine 说「这些文件此刻不在磁盘上，不要说它们已保存/已生成」
+//        → 用户侧：run._incompleteReason = writes_failed:N，结局卡片上看得到
+// 这条链断在任何一环，「已保存」那句话就没有任何机器事实与之矛盾。
+const deliveryLine = load("_deliveryFactsLine", {
+  _deliveryFacts: () => ({ code: [], tests: [], ran: [], verifiers: [] }),
+  _strayScratchFiles: () => [],
+  _projectStacks: new Map(),
+});
+
+test("台账里有落空的写入时，模型会被当面告知别说「已保存」", () => {
+  const said = deliveryLine({ _writeLedger: [{ path: "/p/README.md", ok: false }] });
+  assert.match(said, /没有落盘/);
+  assert.match(said, /不要说它们已保存\/已生成/,
+    "只报了数字没说清后果——模型照样会在总结里写「已更新」");
+  assert.match(said, /README\.md/, "没点名是哪个文件，模型无从对照");
+  assert.equal(deliveryLine({ _writeLedger: [] }), "",
+    "没有落空写入时也说话——纯问答的回合会被平白打扰");
+  assert.equal(deliveryLine({ _writeLedger: [{ path: "/p/a.ts", ok: true }] }), "",
+    "成功的写入被当成落空的报了");
+});
+
+test("门拦的写入不许把自己标成「没尝试过」（标了就从台账里消失）", () => {
+  const at = SRC.indexOf("const _planFirst = techIssue.startsWith");
+  assert.ok(at > 0, "门的分支不见了");
+  const gate = SRC.slice(at, at + 600);
+  assert.doesNotMatch(gate, /attempted:\s*false/,
+    "门拦把结果标成没尝试过——_toolExecutionAttempted 会把它从写盘台账里摘掉，"
+    + "于是「已保存」那句话再没有任何事实与之矛盾");
+  // 台账的第二个写入点（对所有 item 的那一遍）是门拦唯一能进账的路径
+  assert.match(SRC, /\(run\._writeLedger = run\._writeLedger \|\| \[\]\)\.push\(\{ path: it\.call\.path, ok: _ok \}\)/,
+    "那一遍的台账写入点没了——门拦的写入不会留下任何痕迹");
+});
