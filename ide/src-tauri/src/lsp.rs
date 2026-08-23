@@ -492,11 +492,30 @@ pub fn lsp_check_available(lang: String) -> bool {
     }
 }
 
+/// 工作区信任门在这些"取环境符号"的路上一直是**缺的**。
+///
+/// `lsp_start` 那边把它写得很仔细（未信任就不把工作区目录算进 PATH，只用系统装的语言
+/// 服务器），可同一个进程里另外四条路绕过了它：`lsp_detect_python` 会直接执行
+/// `<工作区>/.venv/bin/python`，`lsp_node_env_symbols` 会 `require()` 工作区
+/// `node_modules` 里的包（等于跑它的顶层代码）。也就是说：clone 一个别人的仓库、
+/// 点开任意一个 .py 或 .ts 文件，仓库自带的可执行文件就跑起来了。
+///
+/// 缺省 fail closed —— 参数是 `Option<bool>`，老客户端不传就按不信任处理。
+/// 不信任不等于功能没了，是降级：Python 用系统解释器（pyright 照常工作，只是看不到
+/// venv 里装的包），Node 照常列包名（读目录名是安全的）但不去 require 它们。
+fn workspace_trusted(flag: Option<bool>) -> bool {
+    flag.unwrap_or(false)
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PythonEnvInfo {
     pub python_path: String,
     pub site_packages: Vec<String>,
+    /// 工作区未信任 → 用的是系统解释器而不是仓库的 venv。前端据此告诉用户
+    /// 「venv 里的包看不到，信任这个工作区就能看到」，而不是让他对着
+    /// 「import X could not be resolved」发呆。
+    pub untrusted_fallback: bool,
 }
 
 /// Pick the interpreter to introspect: the project's venv python if one exists (so pyright resolves
@@ -549,10 +568,17 @@ const DEFAULT_PYTHON_NAMES: &[&str] = &["python", "py"];
 const DEFAULT_PYTHON_NAMES: &[&str] = &["python3", "python"];
 
 #[tauri::command(async)]
-pub fn lsp_detect_python(workspace: Option<String>) -> Result<PythonEnvInfo, String> {
+pub fn lsp_detect_python(
+    workspace: Option<String>,
+    trust_workspace_binaries: Option<bool>,
+) -> Result<PythonEnvInfo, String> {
+    let trusted = workspace_trusted(trust_workspace_binaries);
     let ws = workspace.as_deref();
-    let python = pick_python(ws);
-    let aug_path = process_util::augmented_path(ws);
+    // 不信任就整个不看工作区：既不挑它的 venv 解释器，也不把它算进 PATH。
+    let scope = if trusted { ws } else { None };
+    let python = pick_python(scope);
+    let aug_path = process_util::augmented_path(scope);
+    let untrusted_fallback = !trusted && ws.is_some_and(|w| !w.is_empty());
     let output = crate::process_util::command(&python)
         .args(["-c", "import sys,site,json;p=list(site.getsitepackages());p.append(site.getusersitepackages());print(json.dumps({'exec':sys.executable,'paths':p}))"])
         .env("PATH", &aug_path)
@@ -564,6 +590,7 @@ pub fn lsp_detect_python(workspace: Option<String>) -> Result<PythonEnvInfo, Str
         return Ok(PythonEnvInfo {
             python_path: python.to_string(),
             site_packages: vec![],
+            untrusted_fallback,
         });
     }
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -581,6 +608,7 @@ pub fn lsp_detect_python(workspace: Option<String>) -> Result<PythonEnvInfo, Str
     Ok(PythonEnvInfo {
         python_path: exec_path,
         site_packages: paths,
+        untrusted_fallback,
     })
 }
 
@@ -716,7 +744,9 @@ pub struct NodeEnvSymbols {
 pub fn lsp_node_env_symbols(
     project_dir: String,
     modules: Vec<String>,
+    trust_workspace_binaries: Option<bool>,
 ) -> Result<NodeEnvSymbols, String> {
+    let trusted = workspace_trusted(trust_workspace_binaries);
     let node = process_util::resolve_command("node", None);
     let aug_path = process_util::augmented_path(None);
 
@@ -749,7 +779,8 @@ pub fn lsp_node_env_symbols(
     }
 
     let mut exports: HashMap<String, Vec<String>> = HashMap::new();
-    if !modules.is_empty() {
+    // require(n) 会跑那个包的顶层代码。列包名（上面读目录）是安全的，require 不是。
+    if !modules.is_empty() && trusted {
         let script = r#"const r={};for(const n of process.argv.slice(1)){try{const m=require(n);r[n]=Object.getOwnPropertyNames(m).filter(k=>!k.startsWith('_')).slice(0,500)}catch{}};console.log(JSON.stringify(r))"#.to_string();
         let mut cmd = crate::process_util::command(&node);
         cmd.args(["-e", &script])
@@ -792,7 +823,15 @@ pub struct GoEnvSymbols {
 }
 
 #[tauri::command(async)]
-pub fn lsp_go_env_symbols(project_dir: String) -> Result<GoEnvSymbols, String> {
+pub fn lsp_go_env_symbols(
+    project_dir: String,
+    trust_workspace_binaries: Option<bool>,
+) -> Result<GoEnvSymbols, String> {
+    // go.mod 里的 `toolchain` 指令会让 go 去下载并执行另一个工具链——在别人的仓库里
+    // 跑 `go list` 不是纯读操作。
+    if !workspace_trusted(trust_workspace_binaries) {
+        return Ok(GoEnvSymbols { packages: vec![] });
+    }
     let go_cmd = process_util::resolve_command("go", None);
     let aug_path = process_util::augmented_path(None);
 
@@ -876,7 +915,13 @@ pub fn lsp_lang_env_symbols(
     lang: String,
     project_dir: String,
     modules: Vec<String>,
+    trust_workspace_binaries: Option<bool>,
 ) -> Result<LangEnvSymbols, String> {
+    // 这里几条（dart pub deps 之类）是在**项目目录里**跑工具链的。解释器本身取的是系统
+    // 那个（run_cmd_collect 用 None 作用域），但工作目录是别人的仓库。
+    if !workspace_trusted(trust_workspace_binaries) {
+        return Ok(LangEnvSymbols { symbols: vec![], api_symbols: HashMap::new() });
+    }
     let mut symbols = Vec::new();
     let mut api_symbols: HashMap<String, Vec<String>> = HashMap::new();
 
@@ -1189,3 +1234,104 @@ mod windows_path_tests {
     }
 }
 
+
+/// 「取环境符号」那四条路的工作区信任门。
+///
+/// `lsp_start` 把它写得很仔细，可同一个进程里另外四条路绕过了它：`lsp_detect_python`
+/// 会直接执行 `<工作区>/.venv/bin/python`，`lsp_node_env_symbols` 会 `require()`
+/// 工作区 `node_modules` 里的包（等于跑它的顶层代码）。也就是说：clone 一个别人的
+/// 仓库、点开任意一个 .py 或 .ts 文件，仓库自带的可执行文件就跑起来了。
+///
+/// 这两条测试是**真的去执行**：造一个会留下痕迹的假解释器/假包，然后断言那个痕迹
+/// 不存在。断言"参数传对了"是守不住的——门漏没漏，只有让它真跑一次才知道。
+#[cfg(test)]
+mod trust_gate_tests {
+    use super::*;
+
+    fn fake_repo_with_venv(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("mrday-trustgate-{tag}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        let bin = dir.join(".venv").join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let py = bin.join("python3");
+        std::fs::write(
+            &py,
+            format!(
+                "#!/bin/sh\necho '{{\"exec\":\"{}\",\"paths\":[\"/pwned\"]}}'\n",
+                py.display()
+            ),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&py, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        dir
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn untrusted_workspace_never_runs_its_own_interpreter() {
+        let dir = fake_repo_with_venv("untrusted");
+        let ws = dir.to_string_lossy().to_string();
+
+        // 不信任，以及老客户端那种「压根不传这个参数」，都不许碰仓库里的解释器。
+        for flag in [None, Some(false)] {
+            let info = lsp_detect_python(Some(ws.clone()), flag).unwrap();
+            assert!(
+                !info.python_path.contains("mrday-trustgate"),
+                "未信任的工作区里那个解释器被执行了：{}",
+                info.python_path
+            );
+            assert!(
+                !info.site_packages.iter().any(|p| p == "/pwned"),
+                "输出来自仓库自带的解释器 —— 说明它真的跑了"
+            );
+            assert!(info.untrusted_fallback, "降级了却没报出来，前端无从告诉用户");
+        }
+
+        // 信任：功能照旧。这条不能被这次修改弄死。
+        let info = lsp_detect_python(Some(ws.clone()), Some(true)).unwrap();
+        assert!(
+            info.python_path.contains("mrday-trustgate"),
+            "信任的工作区反而用不上自己的 venv 了 —— 那是把功能修没了：{}",
+            info.python_path
+        );
+        assert!(!info.untrusted_fallback, "信任时不该标降级");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn untrusted_workspace_never_requires_its_node_modules() {
+        let dir = std::env::temp_dir().join("mrday-trustgate-node");
+        let _ = std::fs::remove_dir_all(&dir);
+        let m = dir.join("node_modules").join("evil");
+        std::fs::create_dir_all(&m).unwrap();
+        std::fs::write(m.join("package.json"), "{\"name\":\"evil\",\"main\":\"index.js\"}").unwrap();
+        // require 一旦发生顶层代码就跑了；用"写一个标记文件"留证据。
+        let marker = dir.join("REQUIRED");
+        std::fs::write(
+            m.join("index.js"),
+            format!(
+                "require('fs').writeFileSync({:?}, 'x');\nmodule.exports = {{ a: 1 }};",
+                marker.to_string_lossy()
+            ),
+        )
+        .unwrap();
+        let ws = dir.to_string_lossy().to_string();
+
+        let out = lsp_node_env_symbols(ws.clone(), vec!["evil".into()], Some(false)).unwrap();
+        assert!(
+            !marker.exists(),
+            "未信任的工作区里那个包被 require 了 —— 它的顶层代码跑了"
+        );
+        assert!(
+            out.packages.iter().any(|p| p == "evil"),
+            "把「列包名」也一起关掉了 —— 读目录名是安全的，不该跟着降级"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

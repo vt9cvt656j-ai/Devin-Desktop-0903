@@ -748,6 +748,12 @@ export function createLspManager(options) {
         // Pass the workspace root so the backend prefers the project's .venv interpreter — pyright then
         // resolves the packages installed in the venv instead of flagging them "unresolved" on reopen.
         const info = await backend.lspDetectPython(manager.workspaceRoots?.()[0] || null);
+        // 未信任的工作区会退回系统解释器（后端不去执行仓库自带的 .venv/bin/python）。
+        // 说一句，否则用户对着满屏「import X could not be resolved」不知道为什么——
+        // 而那恰恰是一个他一键就能解决的问题。
+        if (info && info.untrustedFallback) {
+          showToast("这个工作区还没信任，Python 用的是系统解释器——venv 里装的包解析不到。信任这个工作区就能用它自己的 venv。");
+        }
         if (info && info.pythonPath) {
           manager._pythonSettings = {
             pythonPath: info.pythonPath,
