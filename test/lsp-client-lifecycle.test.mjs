@@ -10,6 +10,9 @@ const monaco = {
   MarkerSeverity: { Error: 8, Warning: 4, Info: 2, Hint: 1 },
   languages: {
     CompletionItemKind: new Proxy({}, { get: (_target, key) => key }),
+    // registerProviders 会调一大票 registerXxxProvider —— 全部记下选择器，
+    // 「.vue 用不用得上编辑器里的补全/跳转」就是靠这个选择器决定的。
+    _selectors: [],
   },
   Uri: {
     file: (path) => ({ toString: () => `file://${path}` }),
@@ -19,9 +22,21 @@ const monaco = {
     getModels: () => [],
     getModel: () => null,
     setModelMarkers: () => {},
+    registerCommand: () => ({ dispose() {} }),
   },
 };
 
+monaco.languages = new Proxy(monaco.languages, {
+  get(t, k) {
+    if (typeof k === "string" && /^register\w+Provider$/.test(k)) {
+      return (selector) => { t._selectors.push([k, selector]); return { dispose() {} }; };
+    }
+    if (k === "registerCompletionItemProvider") {
+      return (selector) => { t._selectors.push([k, selector]); return { dispose() {} }; };
+    }
+    return t[k];
+  },
+});
 const { createLspManager } = new Function("monaco", source + "\nreturn { createLspManager };")(monaco);
 
 function tick() {
@@ -271,4 +286,76 @@ test("换工作区时把在跑的语言服务器全停掉，并清掉 venv 探�
   assert.equal(detects, before + 1,
     "换项目后没重新探测 venv —— 新项目的 pyright 用的还是上一个项目的解释器");
   await manager.stop("python");
+});
+
+// ── .vue 整条链原来不可达 ────────────────────────────────────────────────
+//
+// 后端 KNOWN_SERVERS 里登记着 vue-language-server，但客户端把 .vue 的 Monaco languageId
+// 写死成 "html"，于是**没有任何 model 的 languageId 会等于 "vue"** —— 那条登记项从来
+// 没有机会被启动过。不改那个映射是有意的：改了，.vue 就失去 HTML 高亮和 html worker，
+// 没装 vue-language-server 的用户会倒退。所以只在 LSP 这一层按扩展名认它。
+test(".vue 按扩展名路由到 vue 服务器，真正的 .html 不受影响", async () => {
+  const started = [];
+  const backend = {
+    async lspStart(config, cb) { started.push(config.lang); this._cb = cb; },
+    async lspSend(_lang, raw) {
+      const m = JSON.parse(raw);
+      if (m.id === undefined) return;
+      queueMicrotask(() => this._cb({ kind: "message", data: JSON.stringify({ jsonrpc: "2.0", id: m.id, result: { capabilities: {} } }) }));
+    },
+    async lspStop() {}, async lspCheckAvailable() { return true; },
+  };
+  const manager = createLspManager({ backend, isWorkspaceTrusted: () => true });
+  assert.ok(await manager.startManual("vue"), "vue 服务器起不来");
+
+  const mk = (uri, text) => {
+    let v = text;
+    return { uri: { toString: () => uri }, getLanguageId: () => "html",
+      getValue: () => v, setValue: (x) => { v = x; }, getVersionId: () => 1, isAttachedToEditor: () => false };
+  };
+  // 观察「通知发给了谁」——lspSend 的第一个参数就是服务器那侧的 lang。
+  const sentTo = [];
+  const origSend = backend.lspSend.bind(backend);
+  backend.lspSend = async (lang, raw) => { sentTo.push([lang, raw]); return origSend(lang, raw); };
+
+  // .vue：Monaco 说它是 html，但 LSP 这一层要认成 vue。
+  monaco.editor.getModel = () => mk("file:///p/App.vue", "<template/>");
+  assert.equal(manager.syncFromDisk("/p/App.vue", "<template>x</template>"), true, ".vue 的 model 没被更新");
+  assert.ok(sentTo.some(([lang, raw]) => lang === "vue" && /App\.vue/.test(raw)),
+    ".vue 的改动没发给 vue 服务器 —— 那条链还是不可达（后端登记了 vue-language-server，"
+    + "但 Monaco 里根本不存在 \"vue\" 这个 languageId）");
+
+  // 真正的 .html 不许被路由到 vue 服务器，否则每个 html 文件都被喂给它。
+  sentTo.length = 0;
+  monaco.editor.getModel = () => mk("file:///p/index.html", "<html/>");
+  assert.equal(manager.syncFromDisk("/p/index.html", "<html>x</html>"), true, "普通 html 的 model 也该被更新");
+  assert.equal(sentTo.filter(([lang]) => lang === "vue").length, 0,
+    "普通 .html 被喂给了 vue 服务器");
+  monaco.editor.getModel = () => null;
+  await manager.stop("vue");
+});
+
+test("编辑器里的补全/跳转选择器要覆盖到 .vue 所在的那个 Monaco 语言", () => {
+  // provider 注册在 **Monaco 的 languageId** 上，而 .vue 的 languageId 是 "html"。
+  // 选择器里没有 "html"，编辑器里的补全/悬停/跳转对 .vue 一次都不会触发 ——
+  // 那样就只有智能体的 lsp_* 工具能用上 vue 服务器，用户自己敲代码时还是什么都没有。
+  monaco.languages._selectors.length = 0;
+  const manager = createLspManager({
+    backend: { async lspStart() {}, async lspSend() {}, async lspStop() {}, async lspCheckAvailable() { return true; } },
+    isWorkspaceTrusted: () => true,
+  });
+  manager.registerProviders();
+  assert.ok(monaco.languages._selectors.length > 10, `只注册了 ${monaco.languages._selectors.length} 个 provider，桩没接上`);
+  // registerWorkspaceSymbolProvider 是全局的，第一个参数就是 provider 本身，没有选择器。
+  const withSelector = monaco.languages._selectors.filter(([, sel]) => Array.isArray(sel));
+  assert.ok(withSelector.length > 10, `带选择器的 provider 只有 ${withSelector.length} 个`);
+  for (const [name, sel] of withSelector) {
+    assert.ok(sel.includes("vue"), `${name} 的选择器里没有 vue`);
+    assert.ok(sel.includes("html"),
+      `${name} 的选择器里没有 "html" —— .vue 的 Monaco languageId 就是 html，`
+      + "少了它，用户在 .vue 里敲代码时补全/跳转一次都不会触发");
+  }
+  // 反向：不该把选择器扩成「所有语言」。
+  const one = withSelector[0][1];
+  assert.ok(one.length < 40, "选择器被扩得太宽了");
 });
