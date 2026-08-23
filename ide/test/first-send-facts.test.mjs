@@ -55,10 +55,32 @@ test("第一发这条腿不许把写盘台账当输入（那时还没写过盘�
     "第一发就带上了写盘台账——这一刻还没有任何写入发生过");
 });
 
-test("判据一个字没放宽", () => {
+test("分界没动，动的是时效", () => {
+  // 原来这里钉的是 `hasWorkspace && snapshotReady && topLevel.length` 三条与，注释写着
+  // 「一个字没放宽」。改成「目录快照 **或** 已识别技术栈」是刻意的，理由是实测：
+  // 目录快照挂在 _agentContextCache 上，带 5 分钟 TTL，而这条腿存在的全部理由就是
+  // **会话第一发**——那一刻它必然是冷的。线上 2026-08-23 六小时 383 次装配，整条腿
+  // 只点亮 7 次（1.8%），其余全输给这道 TTL。
+  //
+  // 要守的分界一个字没变，而且是被**更强**的证据守住的：空目录既没有 topLevel，
+  // 也扫不出技术栈（_projectStacks 在没有栈事实时会显式 delete 掉这个根）。
   const body = topLevelFn("_executionFactSemanticFlags", { code: true });
-  assert.match(body, /hasWorkspace && evidence\?\.snapshotReady && \(evidence\.topLevel \|\| \[\]\)\.length/,
-    "三个条件被放宽了——空目录会被当成已有项目");
+  assert.match(body, /evidence\.snapshotReady && \(evidence\.topLevel \|\| \[\]\)\.length\) \|\| stackKnown/,
+    "「目录快照 或 已识别技术栈」这道判据不见了");
+  assert.match(body, /evidence\?\.hasWorkspace/, "hasWorkspace 这道前置闸没了——会凭空给无工作区的会话造旗标");
+  // engineering 只在**模型缺席**时由事实腿补。补成无条件就等于盖掉模型判的「这不是工程活」。
+  assert.match(body, /opts\?\.modelProfileMissing && evidence\?\.hasWorkspace\) facts\.projectEngineering/,
+    "事实腿点 engineering 时不再看「模型画像到没到」——那会盖掉模型自己的判断");
+});
+
+test("第一发把「模型画像到没到」当条件传进事实腿", () => {
+  // 不传这个条件，engineering 就只剩模型裁决一个来源。线上实测：免费线被上游限流 159 次、
+  // 83% 的装配画像全空，于是 13KB 架构纪律和 4.3MB 专业语料**同时**够不着模型
+  // （网关那边 engineering_intent 一面旗门着这两样）。
+  const at = send.indexOf("_executionFactSemanticFlags(");
+  const seg = send.slice(at, at + 240);
+  assert.match(seg, /modelProfileMissing: !_routeSource/,
+    "没把「这一轮两条腿都没回」传下去——分类器一挂，engineering 就永远补不上");
 });
 
 // ── 二、删掉零读者维度 ────────────────────────────────────────────────
