@@ -14751,8 +14751,25 @@ test("验证事实由真实命令/诊断提供，不由 IDE 收尾门强行代�
   // honestly; it must not be converted into an automatic tool call or a
   // synthetic blocked result.
   assert.match(loopWithoutComments, /_codeDeliveredUnverified/);
-  assert.doesNotMatch(loopWithoutComments, /_runApprovedVerification\(|await _detectVerifyCmd\(/,
-    "the loop must not secretly run an extra verifier after the model finishes");
+  // 2026-08-23 边界变了，**由产品负责人决定**：IDE 现在会兜底跑一次验证。禁令没有被
+  // 删掉，是被收窄了 —— 原禁令真正在防的是 secretly（模型不知道、用户看不见、结算另
+  // 开一套判据）。这四条把「不偷偷」逐条钉死，比一句"完全不许跑"守得更准：
+  //
+  //   ① 收尾腿仍然不代跑：_runApprovedVerification 一次都不许在循环里出现。
+  //   ② 兜底必须走 _executeToolStep —— 真实工具卡片 + 那道唯一的授权检查点。
+  //   ③ 模型先说了算：verifyNudges ≥ 1 才轮到 harness，且每个 run 只有一次。
+  //   ④ 结算复用模型自跑那一套（_evidenceCertifies），不另开判据 —— 否则"兜底跑绿了"
+  //      会变成一个绕过空跑检测的新后门。
+  assert.doesNotMatch(loopWithoutComments, /_runApprovedVerification\(/,
+    "① 收尾门又在代跑了：兜底只许发生在刚落盘那一批，不许在收尾腿");
+  const autoVerify = loopWithoutComments.slice(loopWithoutComments.indexOf("_autoVerifyRan"));
+  assert.ok(loopWithoutComments.includes("_autoVerifyRan"), "兜底自动验证不见了");
+  assert.match(autoVerify, /_executeToolStep\(\s*_avStep/,
+    "② 兜底必须走 _executeToolStep：绕过它就等于绕过工具卡片和授权检查点");
+  assert.match(loopWithoutComments, /!run\._autoVerifyRan && verifyNudges >= 1/,
+    "③ 兜底抢在模型前面了：必须先提醒过、且每 run 一次");
+  assert.match(autoVerify, /_evidenceCertifies\(_rec, _implOps\)/,
+    "④ 兜底另开了授信判据：必须和模型自跑走同一套证据结算");
   assert.doesNotMatch(loopWithoutComments, /\[BLOCKED\][^\n]*验证|codeVerifyNudges[^\n]*continue/);
 
   // When a verification command is explicitly run, failures carry the real
@@ -26783,19 +26800,23 @@ test("lsp-client 暴露真实就绪状态，而不是让调用方假设", () => 
 // 可达；run._checkPendingPaths / _testPendingPaths 两个账本只写不读。
 // 模型于是理性地把跑构建/测试外包给 IDE，改完就收尾。什么都没跑。用户拿到没编译过的代码。
 
-test("栈提示不得承诺自动验证——那套机器是死的", () => {
+test("栈提示要如实说：改完你自己跑，兜底只有一次", () => {
   const fn = extractFn("_formatStackHint");
   const code = fn.split("\n").filter((l) => !/^\s*(\/\/|\*|\/\*)/.test(l)).join("\n");
   // 断言语气的承诺必须消失
   assert.doesNotMatch(code, /agent 会每改几个文件自动跑/, "又在承诺一套不存在的自动验证了");
   assert.doesNotMatch(code, /agent 会自动注入失败报告/);
-  // 换成祈使句，并且明说没人替它跑
-  assert.match(code, /\*\*改完必须你自己跑这条\*\*，没有任何东西会替你自动跑/);
   // 「退出码就是结论」是半句真理，而 answer_quality.txt:7 写着 exit code 0 is not proof of
   // business success。改成有判据的说法：非 0 是结论，0 只说明这条检查过了。
   assert.match(code, /退出码非 0 就是结论/);
   assert.doesNotMatch(code, /退出码就是结论。/, "又变回「0 也算结论」了");
-  assert.match(code, /同样没人会替你跑/);
+  // 措辞 2026-08-23 改了：兜底自动验证上线后，"没人会替你跑"变成了假话，而一个会撒谎的
+  // harness 会让模型折价它说的每一句。守的是**语义**——仍然要求模型自己跑，且把兜底如实
+  // 说成兜底——不是原来那几个字。
+  assert.match(code, /\*\*改完必须你自己跑\*\*/, "不再要求模型自己跑了");
+  assert.match(code, /兜底/, "兜底机器已经活了，提示词却只字不提");
+  assert.doesNotMatch(code, /没有任何东西会替你自动跑|同样没人会替你跑/,
+    "机器已经会跑了，提示词还在说没人跑——harness 不许对模型撒谎");
 });
 
 test("那套自动验证机器要么接上、要么别承诺——现在是「别承诺」", () => {
@@ -30562,16 +30583,28 @@ test("跳转历史存在，且键位不许抢 macOS 的按词移动", () => {
     "恢复位置时没有抑制记录——会把后退动作本身当成一次新跳转");
 });
 
-test("不许告诉模型「收尾会自动跑验证」——那台机器是死的", () => {
-  // _runApprovedVerification 只有定义、零调用点，它包着的 _interleavedTest 也只被那个
-  // 死函数调用。而 _formatStackHint 已经改成了正确说法「没有任何东西会替你自动跑」。
-  // 两条关于同一台机器的陈述同时在一份上下文里，模型会理性地采信「有人替我跑」那条，
-  // 把编译/测试外包出去、改完直接收尾——这是"写出来的代码用不了"最直接的机器原因。
+test("收尾契约对「谁来跑验证」的说法，必须和真实机器一致", () => {
+  // 这条测试的**前提 2026-08-23 反过来了**，所以整条重写而不是放宽：
+  // 兜底自动验证已经接上（_runAgenticLoop 里的 _autoVerifyRan 那段），机器活了。
+  //
+  // 不变的是它守的那件事：**同一份上下文里不许出现两种互相矛盾的说法**。模型会理性
+  // 地采信对自己最省事的那一条，把编译/测试外包出去、改完直接收尾——这是"写出来的
+  // 代码用不了"最直接的机器原因。以前的矛盾是"死机器被说成活的"，现在反过来会是
+  // "活机器被说成死的"：同样会让模型折价 harness 说的每句话。
+  //
+  // 所以判据从"必须说没人跑"翻成"必须如实说成兜底"，两侧措辞仍然对齐。
   const frame = SRC.slice(RAW_SRC.indexOf("🏁 收尾验收契约"), RAW_SRC.indexOf("🏁 收尾验收契约") + 700);
-  assert.doesNotMatch(frame, /收尾会自动跑/,
-    "又在承诺一个不存在的能力：收尾并不会自动跑验证命令");
-  assert.match(frame, /没有任何东西会替你自动跑/,
-    "收尾契约必须明说没人替它跑，和 _formatStackHint 的说法保持一致");
+  assert.doesNotMatch(frame, /没有任何东西会替你自动跑/,
+    "机器已经会跑了，契约还在说没人跑——harness 不许对模型撒谎");
+  assert.match(frame, /兜底/, "契约里对兜底只字不提，模型无法预期那次代跑");
+  assert.match(frame, /收尾门本身不代跑、只记账/,
+    "必须把「兜底在改完那一批、不在收尾腿」说清楚，否则模型会以为收尾会兜");
+  assert.match(frame, /自己跑一遍/, "不再要求模型自己跑了");
+  // 两侧同源：栈提示和收尾契约必须用同一句描述兜底，别各说各的。
+  const hint = extractFn("_formatStackHint");
+  const SHARED = "IDE 只会在你被提醒之后仍然不跑时兜底跑一次，兜出来的红字同样算你的账";
+  assert.ok(frame.includes(SHARED) && hint.includes(SHARED),
+    "栈提示和收尾契约对兜底的说法漂了——两份说法会让模型采信更省事的那条");
 });
 
 test("侧栏「＋」建在你正在看的目录，不是永远建在项目根", () => {

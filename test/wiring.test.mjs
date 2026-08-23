@@ -1839,7 +1839,9 @@ const KNOWN_UNCALLED = new Set([
   //     _emptyExploreSkipMessage）——早先审计已判定为刻意保留的纯函数/备用件；
   //   · _ctxNativeCeiling、recommendToolsForIntent、renderLspTool——同上，留着备用的渲染/推荐件。
   // 新加的函数仍然一个都不许进这张表：它守的是"只减不增"。
-  "_ctxNativeCeiling", "_detectVerifyCmd", "_emptyExploreSkipMessage", "_emptyRootSkipMessage",
+  // _detectVerifyCmd 2026-08-23 接上了（_runAgenticLoop 的兜底自动验证），按这条棘轮的
+  // 规矩从名单里删掉——名单只许变短。
+  "_ctxNativeCeiling", "_emptyExploreSkipMessage", "_emptyRootSkipMessage",
   "_evidenceGradingHint", "_refreshEmptyRootBeforeSkip", "_runApprovedVerification",
   "recommendToolsForIntent", "renderLspTool",
   "_appendDeliveryFactsBar", "_appendRunRevertBar", "_adaptiveEnabled", "_agentAllowsExternalKind", "_agentAllowsRuntimeKind",
