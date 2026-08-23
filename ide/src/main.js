@@ -19956,9 +19956,13 @@ async function _truncateFromUserMessage(sess, wrap) {
 const _MSG_ACT_ICONS = {
   up: '<path d="M7 10v9H4a1 1 0 0 1-1-1v-7a1 1 0 0 1 1-1h3zm0 0 4.2-7.1a1 1 0 0 1 1.8.5V8h4.6a1.6 1.6 0 0 1 1.6 1.9l-1.3 7A1.6 1.6 0 0 1 16.3 18H7"/>',
   down: '<path d="M7 14V5H4a1 1 0 0 0-1 1v7a1 1 0 0 0 1 1h3zm0 0 4.2 7.1a1 1 0 0 0 1.8-.5V16h4.6a1.6 1.6 0 0 0 1.6-1.9l-1.3-7A1.6 1.6 0 0 0 16.3 6H7"/>',
-  copy: '<rect x="9" y="9" width="11" height="11" rx="2"/><path d="M6 15H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h8a2 2 0 0 1 2 2v1"/>',
-  stats: '<path d="M5 20V11m7 9V4m7 16v-6"/>',
-  more: '<circle cx="5.5" cy="12" r="1.4"/><circle cx="12" cy="12" r="1.4"/><circle cx="18.5" cy="12" r="1.4"/>',
+  // 复制：前面一张完整的圆角卡片，后面那张只画露出来的 L 形 —— 两张都画完整的话，
+  // 交叠区里会多出两条穿过去的线，放大看糊成一团（A/B/C 三版并排比过，这版最干净）。
+  copy: '<rect x="9" y="9" width="12" height="12" rx="2.5"/><path d="M6.5 15H5.5A2.5 2.5 0 0 1 3 12.5v-7A2.5 2.5 0 0 1 5.5 3h7A2.5 2.5 0 0 1 15 5.5v1"/>',
+  // 柱状图：同一条基线上三根**递增**的柱子。原来的高度是短-高-中，看着像随机波动，
+  // 不像一张图表；递增才读得出「这是统计」。圆头 + 略粗，16px 下才不虚。
+  stats: '<path stroke-width="2" d="M6 19v-4M12 19v-8M18 19v-12"/>',
+  more: '<circle cx="5.5" cy="12" r="1.35" fill="currentColor" stroke="none"/><circle cx="12" cy="12" r="1.35" fill="currentColor" stroke="none"/><circle cx="18.5" cy="12" r="1.35" fill="currentColor" stroke="none"/>',
 };
 function _msgActButton(act, label, on = false) {
   return `<button type="button" class="msg__act${on ? " is-on" : ""}" data-act="${act}"`

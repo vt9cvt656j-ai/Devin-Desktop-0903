@@ -28524,19 +28524,28 @@ test("每条回复底下的操作条：五个按钮，全部走委托", () => {
     "挂到 wrap 上了——那是 flex row，会跑到头像右边去，而不是正文底下");
 });
 
-test("操作条常显：看不见却点得到的按钮不许存在", () => {
-  // 一开始写的是 opacity:0 + hover 才现身。实测 opacity 为 0 的元素**照样接点击**，
-  // 于是每条消息底下都藏着一排看不见却点得到的按钮 —— 手滑就点了赞、甚至开了菜单。
-  // 触摸屏更糟：没有 hover，藏起来等于永远够不到。
-  const rule = APP_CSS_CODE.match(/\.msg__acts\s*\{([^}]*)\}/);
-  assert.ok(rule, ".msg__acts 规则不见了");
-  const op = rule[1].match(/opacity:\s*([\d.]+)/);
-  assert.ok(op, "操作条没有写 opacity——默认 1 也行，但那就该把这条断言改掉而不是删掉");
-  assert.ok(Number(op[1]) > 0,
-    `操作条常态 opacity 是 ${op[1]}：看不见，却仍然接点击`);
-  // 悬停要提到正常对比度，否则常态那档太淡会看不清。
-  assert.match(APP_CSS_CODE, /\.msg\.assistant:hover \.msg__acts[^{]*\{[^}]*opacity:\s*1/,
-    "悬停没有提亮");
+test("操作条：常显、看得清，强弱靠颜色不靠透明度", () => {
+  /*
+   * 两版都自己撞过：
+   *   一版 opacity:0 + hover 才现身 —— opacity 为 0 的元素**照样接点击**，等于每条消息
+   *   底下藏一排看不见却点得到的按钮；触摸屏没有 hover，更是永远够不到。
+   *   二版 opacity:.45 —— 把 #6e6e73 冲淡到对白底约 2:1，用户原话「浅色模式有点看不清」。
+   *
+   * 所以这里钉的是「不许再用透明度调强弱」：图标类控件的对比度下限是 3:1，
+   * --text-dim 原色对面板底约 4.66:1（浏览器实测），够用又不抢正文。
+   */
+  const bar = APP_CSS_CODE.match(/\.msg__acts\s*\{([^}]*)\}/);
+  assert.ok(bar, ".msg__acts 规则不见了");
+  const op = bar[1].match(/opacity:\s*([\d.]+)/);
+  assert.ok(!op || Number(op[1]) >= 1,
+    `操作条又用透明度压强弱了（${op && op[1]}）：淡到看不清，却仍然接点击`);
+
+  const btn = APP_CSS_CODE.match(/\.msg__act\s*\{([^}]*)\}/);
+  assert.ok(btn, ".msg__act 规则不见了");
+  assert.match(btn[1], /color:\s*var\(--text-dim\)/, "图标常态没有用正经的文字色");
+  // 悬停提到正文色，给出「这是可按的」反馈。
+  assert.match(APP_CSS_CODE, /\.msg\.assistant:hover \.msg__act\s*\{[^}]*color:\s*var\(--text\)/,
+    "鼠标移到这条消息上时图标没有提亮");
 });
 
 test("点赞/点踩：落到记录上、能持久化、且绝不上线", () => {
