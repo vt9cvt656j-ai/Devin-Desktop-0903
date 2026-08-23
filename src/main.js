@@ -24431,7 +24431,7 @@ function _domainKnowledgeResearchPlan(domain, task) {
  * 每段只取第一条够实的行：宁可让 6 个不同小节各露一句，也不要把一段原文整个贴进来——
  * 小抄要的是覆盖面，散文才要连贯。
  */
-function _domainKnowledgeBullets(content, maxBullets = 3, maxChars = 190) {
+function _domainKnowledgeBullets(content, maxBullets = 3, maxChars = 190, seen = null) {
   const blocks = String(content || "").split("\n\n———\n\n");
   const bullets = [];
   for (const block of blocks) {
@@ -24442,6 +24442,9 @@ function _domainKnowledgeBullets(content, maxBullets = 3, maxChars = 190) {
     let inFence = false;
     let prose = "";     // 首选：散文/表格数据行
     let fenced = "";    // 兜底：代码围栏里的第一行
+    // seen：跨 rubric 去重。命中已见的就往下取**同一段的下一条**，而不是把这一栏丢空——
+    // 四条 rubric 各查一次、共 16 个检索位，而多数域的小节数比这还少，重复是结构性的。
+    const _fresh = (t) => !seen || !seen.has(String(t).trim());
     for (let li = 0; li < rawLines.length && !prose; li++) {
       const line = rawLines[li];
       if (/^\s*(?:```|~~~)/.test(line)) { inFence = !inFence; continue; }
@@ -24471,11 +24474,13 @@ function _domainKnowledgeBullets(content, maxBullets = 3, maxChars = 190) {
       // 代码围栏里的行**留作兜底**，不直接选中。一条孤立的 import 行说不出这个小节想说
       // 什么；但整节只有代码时，给一行真代码仍然远好过给空。一刀砍掉整类会让产不出要点的
       // 小节从 13.6% 涨到 49.2%（实测）——那是把一半语料静默扔掉。
+      if (!_fresh(text)) continue;
       if (inFence) { if (!fenced) fenced = text; continue; }
       prose = text;
     }
     const picked = prose || fenced;
     if (!picked) continue;
+    if (seen) seen.add(String(picked).trim());
     const one = picked.length > maxChars ? `${picked.slice(0, maxChars)}…` : picked;
     bullets.push(section ? `${section} → ${one}` : one);
     if (bullets.length >= maxBullets) break;
@@ -24496,8 +24501,14 @@ function _domainKnowledgeBrief(domain, sections) {
 
 本轮「${domain}」没有返回任何可用命中。明确记录该领域语料不可用，基于用户约束与项目证据继续，不要编造该领域的规则。`;
   }
-  const body = filled
-    .map((s) => `【${s.heading}】\n${s.bullets.map((b) => `- ${b}`).join("\n")}`)
+  // 四栏是**问过的四个维度**，不是「有内容的那几栏」。空栏要如实说，不能整栏消失——
+  // 消失会让模型以为那个维度压根没被问过，而事实是「问了，这个域没有独立的答案」。
+  //（跨 rubric 去重之后这种情况会变多：同一小节对多条 rubric 都高分时，后面的栏
+  // 拿到的是同段的下一条，取不到就空。）
+  const body = sections
+    .map((s) => (s.bullets.length
+      ? `【${s.heading}】\n${s.bullets.map((b) => `- ${b}`).join("\n")}`
+      : `【${s.heading}】\n- （本域语料里这一栏没有独立内容；需要就自己调 knowledge_search(domain="${domain}") 细查，别当成"没有要求"。）`))
     .join("\n\n");
   const full = `${head}\n\n${body}`;
   if (full.length <= _DOMAIN_KNOWLEDGE_BRIEF_BUDGET) return full;
@@ -24533,21 +24544,40 @@ async function _runDomainKnowledgePreflight({ run, profile = "", body = null, is
           body.appendChild(step);
         }
         const result = await _searchKnowledgeBase(call);
-        const bullets = _toolExecutionSucceeded(call, result)
-          ? _domainKnowledgeBullets(String(result?.content || ""))
-          : [];
+        // 原文留着：跨 rubric 去重必须在 Promise.all **之后**按固定顺序重算一遍
+        //（共享集合塞进并发分支的话，「谁占到某小节」取决于网络返回顺序，同一查询两次结果不同）。
+        const _raw = _toolExecutionSucceeded(call, result) ? String(result?.content || "") : "";
+        const bullets = _raw ? _domainKnowledgeBullets(_raw) : [];
         if (step) {
           const viewport = step.querySelector?.(".atc-viewport");
           if (viewport) viewport.textContent = String(result?.content || "").slice(0, 6000);
           _settleToolStep(step, result, bullets.length ? `${bullets.length} 条 · ${plan.heading}` : "无可用命中");
         }
-        return { heading: plan.heading, bullets };
+        return { heading: plan.heading, bullets, raw: _raw };
       } catch (error) {
         const result = { type: "knowledge", path: plan.query, content: `[失败] ${domain} 预取异常: ${String(error?.message || error).slice(0, 180)}` };
         if (step) _settleToolStep(step, result, "预取失败");
         return { heading: plan.heading, bullets: [] };
       }
     }));
+    // 四条 rubric 之间**去重**，且必须在 Promise.all **之后**、按 plans 的固定顺序做。
+    //
+    // 四条腿各查一次、各取各的要点，之间没有任何共享集合——而多数域的小节总数比检索位
+    // 还少（16 个位：4 条 rubric × topK 4）。实测 21 个非设计域共 683 小节，其中 4 个域
+    // （systems-programming 9、healthcare 13、blockchain 14、ecommerce 15）少于 16 个位，
+    // 抽屉原理保证重复；其余域也会在同一小节对多条 rubric 都高分时重复。
+    // 后果是 2500 字符的小抄预算有相当一部分花在逐字重复上，挤掉的是别的上下文。
+    //
+    // **不能**把共享集合塞进上面那个 Promise.all 的并发分支：那样"谁占到某小节"取决于
+    // 网络返回顺序，同一次查询跑两遍结果不同。所以在这里按 plans 的顺序补一遍。
+    const _seenBullet = new Set();
+    for (const sec of sections) {
+      if (!sec.raw) continue;
+      // 重算而不是过滤：命中已见就往下取**同一段的下一条**，栏目仍有内容。
+      // 只过滤的话，四条 rubric 命中同一小节时后三栏会整栏变空——那比重复更糟。
+      sec.bullets = _domainKnowledgeBullets(sec.raw, 3, 190, _seenBullet);
+      delete sec.raw;
+    }
     return {
       domain,
       hitCount: sections.reduce((sum, s) => sum + s.bullets.length, 0),
