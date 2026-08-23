@@ -17080,6 +17080,7 @@ async function _renderMsgRange(session, from, to, options = {}) {
         // currentModel()，历史又会被当前选择重刷一遍。
         modelId: m.role === "assistant" ? String(m.model || "") : "",
         feedback: m.role === "assistant" ? String(m.feedback || "") : "",
+        settled: true,
       });
       if (body && m.role === "assistant" && m.reasoning && typeof m.reasoning === "string" && m.reasoning.trim()) {
         const card = document.createElement("div");
@@ -19437,6 +19438,8 @@ function _appendTurnStatsFooter(body, { elapsedMs = 0, settlement = null, timeli
     el.innerHTML = html;
     el.title = _turnStatsTitle({ elapsedMs, settlement, timeline });
     body.appendChild(el);
+    // 统计行已就位 —— 轮到操作条出场（它是 body 的兄弟，同在 .msg__main 里）。
+    _revealMsgActions(body.parentElement);
   } catch { /* stats must never break a reply */ }
 }
 
@@ -19970,9 +19973,19 @@ function _msgActButton(act, label, on = false) {
     + `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"`
     + ` stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${_MSG_ACT_ICONS[act]}</svg></button>`;
 }
-function _buildMsgActions(feedback = "") {
+/**
+ * @param pending 这一轮还没跑完 —— 操作条先不出场。
+ *
+ * 为什么要等：统计行（`18s 模型 4.2s …`）是这一轮**结算之后**才落下来的，而操作条一开始
+ * 就画好了。于是用户看到的是「按钮先出现，过一会儿统计行从它上面挤进来、把它顶下去」，
+ * 一次回复要抖两下。让操作条等统计行落定再出场，就只剩一次单向的生长。
+ *
+ * 藏用 `display:none`，**不用 opacity** —— opacity 为 0 的元素照样接点击，那是这排按钮
+ * 已经踩过的坑（藏起来却点得到）。
+ */
+function _buildMsgActions(feedback = "", pending = false) {
   const bar = document.createElement("div");
-  bar.className = "msg__acts";
+  bar.className = "msg__acts" + (pending ? " is-pending" : "");
   bar.innerHTML = `<div class="msg__acts-side">`
     + _msgActButton("up", "有帮助", feedback === "up")
     + _msgActButton("down", "没帮助", feedback === "down")
@@ -19983,6 +19996,20 @@ function _buildMsgActions(feedback = "") {
     + `</div>`;
   return bar;
 }
+/**
+ * 让这条消息的操作条出场。
+ *
+ * 两个触发点，缺一不可：
+ *   · `_appendTurnStatsFooter` —— 正常那条路，统计行刚落下就轮到它，顺序正好；
+ *   · `_setStreaming(sess,false)` —— 兜底。**有些助手消息根本不会有统计行**
+ *     （工作区未绑定的提示、运行出错的提示、生图结果），只挂在上面那条路上的话，
+ *     它们的按钮会永远藏着 —— 而且是那种「看起来只是没有按钮」的静默坏法。
+ */
+function _revealMsgActions(scope) {
+  try { scope?.querySelectorAll?.(".msg__acts.is-pending").forEach((el) => el.classList.remove("is-pending")); }
+  catch {}
+}
+
 function _sessionForNode(node) {
   try { return _chatSessions.find((s) => s && s.container && s.container.contains(node)) || null; }
   catch { return null; }
@@ -20207,7 +20234,9 @@ function addMessage(role, text, forSession, attachments = [], options = {}) {
     // 操作条挂在 .msg__main 里、正文**之后**：和文字左对齐（避开头像那一列），
     // 也就落在统计行下面。点赞状态从记录里带出来，重画历史时不会丢。
     wrap._feedback = String(options?.feedback || "");
-    main.appendChild(_buildMsgActions(wrap._feedback));
+    // 从历史重画的都是**已结算**的（统计行跟着一起画），直接出场；
+    // 实时那一轮先藏着，等统计行落定（见 _revealMsgActions 的两个触发点）。
+    main.appendChild(_buildMsgActions(wrap._feedback, options?.settled !== true));
     if (text) {
       const hasToolMarkers = /\[TOOL:(read_file|write_file|run_cmd|list_dir)\]|^📄\s|^📎\s/m.test(text);
       const hasMultiCodeBlocks = (text.match(/```/g) || []).length >= 4;
@@ -20640,7 +20669,13 @@ function _setStreaming(sess, on) {
     const c = sess.container;
     if (c && document.contains(c)) {
       c.classList.toggle("is-streaming", !!on);
-      if (!on) { _removeAllThinking(c); c.querySelectorAll(".md-caret").forEach((el) => { try { el.remove(); } catch {} }); }
+      if (!on) {
+        _removeAllThinking(c);
+        c.querySelectorAll(".md-caret").forEach((el) => { try { el.remove(); } catch {} });
+        // 没等到统计行的那些助手消息（未绑定工作区的提示、运行出错的提示、生图结果）
+        // 在这里出场。少了这一句，它们的操作条会永远藏着。
+        _revealMsgActions(c);
+      }
     }
   } catch {}
   if (wasStreaming && !on) {
@@ -27875,7 +27910,20 @@ async function sendPrompt(text, attachments = [], readyConfig = null, opts = {})
   // 这道等待就变成了每一轮都付一次完整窗口——纯聊天的会话会被这个数字拖成逐轮卡顿。
   // 真正的判据是"这个会话已经拿到过一次裁决了"，跟裁决点亮了几个 flag 无关。
   let _fastRouteProfile = null;
-  const _profileStillEmpty = !(sess._semanticProfileFlags || []).length;
+  // 判据是「本会话拿到过**模型来源**的画像吗」，不是「画像里有没有旗标」。
+  //
+  // 这两者原来是同一件事，直到执行事实腿被提到第一发之前（它按磁盘现状点亮
+  // existing_project，一个模型调用都不需要）。那之后每个「打开了已有项目」的会话，
+  // 第 1 发结束时 sess._semanticProfileFlags 至少是 ["existing_project"]，于是第 2 发起
+  // 这道判据恒为假——**快通道整条会话再也不发车**，等待窗口也再不付。
+  //
+  // 那正是本文件另一处注释记着「已经修好」的那个失效模式（画像连续 117 轮全空），
+  // 只是这次从另一个变量上回来了：一个网关一个字都不消费的纯磁盘事实旗标，
+  // 把「模型判过了吗」这道判据顶掉了。
+  //
+  // 执行事实腿照旧并进请求头（画像仍是单调并集，字节不变、前缀缓存不受影响），
+  // 只是不再冒充「模型判过了」。
+  const _profileStillEmpty = !sess._semanticProfileFromModel;
   // 快通道**只要画像还空就每轮发**，而且落定后无论早晚都并回会话画像。
   //
   // 原来它被关在「只等一次」那道账里：首轮赶不上窗口 → _intentWaitPaid 记账 → 整个块
@@ -27895,6 +27943,8 @@ async function sendPrompt(text, attachments = [], readyConfig = null, opts = {})
             // run 自己持有的那份 config 由循环边界的 _applyFastRouteProfileIfLanded 补写，
             // 所以本轮第二个模型回合起就带着旗标出门。
             if (_turnIntentState) _turnIntentState.fastProfile = p;
+            // 快通道落定＝模型判过了。这一位是上面 _profileStillEmpty 的唯一真源。
+            try { sess._semanticProfileFromModel = true; } catch {}
             try { config.ideSemanticProfile = _sessionStableSemanticProfile(sess, _ideSemanticProfile(p)); } catch {}
           }
           return p;
@@ -27969,6 +28019,8 @@ async function sendPrompt(text, attachments = [], readyConfig = null, opts = {})
   const _routeSource = _turnEngineeringResolved?.intentSource === "ai"
     ? _turnEngineeringResolved
     : (_fastRouteProfile || _turnEngineeringResolved);
+  // 完整裁决落定＝模型判过了。_routeSource 为空时不置：那是「两条腿都没回」。
+  if (_routeSource) { try { sess._semanticProfileFromModel = true; } catch {} }
   config.ideSemanticProfile = _sessionStableSemanticProfile(sess, _semanticProfileHeaderFor(_routeSource, text));
   // 执行事实这条腿也要在**第一发之前**并进来，而不是等到循环边界。
   //

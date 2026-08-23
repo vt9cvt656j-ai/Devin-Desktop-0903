@@ -28524,6 +28524,42 @@ test("每条回复底下的操作条：五个按钮，全部走委托", () => {
     "挂到 wrap 上了——那是 flex row，会跑到头像右边去，而不是正文底下");
 });
 
+test("操作条等统计行落定再出场，而且不会有消息永远等不到", () => {
+  /*
+   * 统计行（`17s 模型 4.2s …`）是这一轮**结算之后**才落下的，而操作条一开始就画好了。
+   * 于是用户看到「按钮先出现，统计行过一会儿从它上面挤进来、把它顶下去」，一次回复抖两下。
+   *
+   * 真正的风险在**兜底**：有些助手消息根本不会有统计行（工作区未绑定的提示、运行出错的
+   * 提示、生图结果）。只挂在统计行那条路上的话，它们的按钮会永远藏着 —— 而且是那种
+   * 「看起来只是没有按钮」的静默坏法，不报错、不留痕。所以必须有第二个触发点。
+   */
+  const src = stripJsComments(SRC);
+
+  // 藏：display:none，**不是** opacity —— opacity 为 0 照样接点击，这排按钮踩过。
+  const pend = APP_CSS_CODE.match(/\.msg__acts\.is-pending\s*\{([^}]*)\}/);
+  assert.ok(pend, "没有 is-pending 这个待出场状态");
+  assert.match(pend[1], /display:\s*none/, "待出场用的不是 display:none");
+  assert.ok(!/opacity/.test(pend[1]), "又用 opacity 藏了——藏起来却点得到");
+
+  // 触发点一：统计行刚落下。
+  assert.match(stripJsComments(extractFn("_appendTurnStatsFooter")),
+    /_revealMsgActions\(body\.parentElement\)/,
+    "统计行落定后没有让操作条出场");
+  // 触发点二：一轮结束的唯一真相处兜底。
+  assert.match(stripJsComments(extractFn("_setStreaming")), /_revealMsgActions\(c\)/,
+    "没有兜底——不产出统计行的那些助手消息，操作条会永远藏着");
+
+  // 从历史重画的都是已结算态，直接出场，不该再等一次。
+  assert.match(stripJsComments(extractFn("_renderMsgRange")), /settled: true/,
+    "重画历史时没标成已结算——整段历史的操作条都要等一个永远不会来的统计行");
+  const add = stripJsComments(extractFn("addMessage"));
+  assert.match(add, /_buildMsgActions\(wrap\._feedback, options\?\.settled !== true\)/,
+    "实时/历史两条路没有分开");
+
+  // 兜底只在**结束**时扫，开始时扫等于白等。
+  assert.ok(!/if \(on\)[^}]*_revealMsgActions/.test(src), "在开始时就揭示了，等于没等");
+});
+
 test("操作条：常显、看得清，强弱靠颜色不靠透明度", () => {
   /*
    * 两版都自己撞过：
