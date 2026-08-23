@@ -542,25 +542,51 @@ pub fn name_of(pid: i32) -> Option<String> {
 pub fn pid_of(title: &str) -> Option<i32> {
     use cocoa::base::{id, nil};
     use objc::{class, msg_send, sel, sel_impl};
+    // localizedName **是本地化的**：中文系统上 Finder 叫「访达」、Terminal 叫「终端」。
+    // 只比它的话，模型说 "Finder" 永远找不到——实测本机就是这样，而失败长得像
+    // 「这个应用没在跑」。所以三样都比：显示名、bundle id、以及 bundle id 的最后一段
+    // （com.apple.finder → finder，正好等于英文可执行名的小写）。
+    let want = title.trim();
+    if want.is_empty() {
+        return None;
+    }
+    let lw = want.to_lowercase();
     unsafe {
         let workspace: id = msg_send![class!(NSWorkspace), sharedWorkspace];
         let apps: id = msg_send![workspace, runningApplications];
         let count: usize = msg_send![apps, count];
+        let read = |obj: id| -> String {
+            if obj == nil {
+                return String::new();
+            }
+            let ptr: *const i8 = msg_send![obj, UTF8String];
+            if ptr.is_null() {
+                return String::new();
+            }
+            std::ffi::CStr::from_ptr(ptr).to_string_lossy().into_owned()
+        };
+        let mut fallback: Option<i32> = None;
         for i in 0..count {
             let app: id = msg_send![apps, objectAtIndex: i];
-            let name_obj: id = msg_send![app, localizedName];
-            if name_obj == nil {
+            let name = read(msg_send![app, localizedName]);
+            let bundle = read(msg_send![app, bundleIdentifier]);
+            let short = bundle.rsplit('.').next().unwrap_or("").to_string();
+            let pid: i32 = msg_send![app, processIdentifier];
+            if pid <= 0 {
                 continue;
             }
-            let ptr: *const i8 = msg_send![name_obj, UTF8String];
-            let name = std::ffi::CStr::from_ptr(ptr).to_string_lossy();
-            if name.contains(title) {
-                let pid: i32 = msg_send![app, processIdentifier];
-                return Some(pid);
+            if name == want || short.eq_ignore_ascii_case(want) {
+                return Some(pid); // 精确命中优先于子串命中
+            }
+            if fallback.is_none()
+                && (name.to_lowercase().contains(&lw)
+                    || bundle.to_lowercase().contains(&lw))
+            {
+                fallback = Some(pid);
             }
         }
+        fallback
     }
-    None
 }
 
 /// 最小化 / 还原某个应用的窗口。
