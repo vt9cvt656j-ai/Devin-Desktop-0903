@@ -23577,6 +23577,16 @@ function _ideSemanticProfile(profile) {
   //     design_review），拿它当条件会让一次界面走查被塞进内存安全和 SQL 注入清单。
   //   · 不用 p.bug：修一条具体报错不需要整张分类表，只会白烧上下文。
   add("defects", p.debugProject || (p.securityRisk && p.explicitReadOnly));
+  // 上面那道门刻意在**写代码**时不挂整张漏洞分类表，理由（就在它上面）是「写一个登录功能
+  // 会平白背上整张表」——那条反对意见是对的。但用户要的是「写的时候就知道有没有漏洞，
+  // 有的话别写出来」，而那张表里恰恰有一族是正则看不见的：**少写了什么**（这个接口忘了做
+  // 权限检查、这个金额没做幂等）。代码形状检测（_sinkRisksInWrite）只看得见写出来的东西。
+  //
+  // 所以按那条反对意见的道理解决，而不是推翻它：换一面旗，服务端给的是**切片**——
+  // 不可信输入→危险汇聚点 / 鉴权授权会话 / 业务滥用 / 并发与失败路径 / 密钥与暴露，
+  // 5,964 字符而不是 9,393；「深挖审计」的抬头、内存底层、和「确认漏洞之后怎么办」都去掉，
+  // 因为这一轮是在写不是在查。两条旗互斥：审计走 defects 拿全表，写码走这条拿五类。
+  add("defects_write", p.securityRisk && !p.explicitReadOnly);
   add("collaboration", p.orchestrationMode === "staged_roles" || p.orchestrationMode === "parallel_roles");
   add("collaboration_staged", p.orchestrationMode === "staged_roles");
   add("collaboration_parallel", p.orchestrationMode === "parallel_roles");

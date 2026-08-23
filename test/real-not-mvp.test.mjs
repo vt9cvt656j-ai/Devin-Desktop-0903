@@ -255,3 +255,41 @@ test("判据在本仓库自己的代码上只留下真发现", () => {
   assert.deepEqual(noisy.map((r) => `${r.line}: ${r.text}`), [],
     `除 SQL 外的判据在 main.js 上误报了 ${noisy.length} 处`);
 });
+
+// ── 八、写安全敏感面时，那族「少写了什么」的洞要够得着模型 ─────────────
+//
+// 代码形状检测（第七节）只看得见**写出来的东西**。而「这个接口忘了做权限检查」「这笔金额
+// 没做幂等」是**没写**的东西——正则永远看不见。那一族在 defect_hunting.txt 里，而那张表
+// 刻意只在只读审计时挂载，理由（写在 add("defects", …) 上面）是「写一个登录功能会平白背上
+// 整张表」。那条反对意见是对的，所以按它的道理解决：换一面旗，服务端给切片不给整表。
+const profileOf = load("_ideSemanticProfile", {});
+const flagsOf = (p) => profileOf(p).split(":")[1].split(",").filter(Boolean);
+
+test("写安全敏感面 → 切片旗；只读审计 → 整表旗；两者互斥", () => {
+  assert.ok(flagsOf({ securityRisk: true, implementation: true }).includes("defects_write"),
+    "写登录/支付时那族「少写了什么」的洞仍然够不着模型");
+  assert.ok(!flagsOf({ securityRisk: true, implementation: true }).includes("defects"),
+    "写码时把整张审计表也挂上了——那正是原来那条反对意见");
+  assert.ok(flagsOf({ securityRisk: true, explicitReadOnly: true }).includes("defects"),
+    "只看不改的审计拿不到整表了");
+  assert.ok(!flagsOf({ securityRisk: true, explicitReadOnly: true }).includes("defects_write"),
+    "审计回合还挂了写码切片——重复");
+  assert.ok(flagsOf({ debugProject: true }).includes("defects"), "排查 bug 拿不到整表了");
+});
+
+test("没有安全面的普通实现一个字都不加（反向断言）", () => {
+  // 只钉「敏感面会挂」是绿的摆设：把判据写成恒真它也绿，而那会让每一次写文件都背 6KB。
+  for (const p of [{ implementation: true }, { ui: true, uiProject: true }, { bug: true }]) {
+    assert.ok(!flagsOf(p).includes("defects_write"),
+      `${JSON.stringify(p)} 也挂上了切片——每轮白烧 6KB`);
+    assert.ok(!flagsOf(p).includes("defects"), `${JSON.stringify(p)} 挂上了整表`);
+  }
+});
+
+test("判据是模型自己声明的维度，不是从措辞猜的", () => {
+  const src = fnSource("_ideSemanticProfile", { code: true });
+  assert.match(src, /add\("defects_write", p\.securityRisk && !p\.explicitReadOnly\)/,
+    "判据变了——它必须只认模型声明的 securityRisk，且排除「只看不改」");
+  assert.doesNotMatch(src, /defects_write[^\n]*\b(?:test|match|includes)\(/,
+    "开始从文本里猜安全面了——那是词表猜意图，本仓库另有测试正面否决");
+});
