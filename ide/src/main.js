@@ -8560,7 +8560,20 @@ function _applyDiskContentToOpenFile(path, content) {
     // Agent write and report a false pass/failure.
     let model = null;
     try { if (projectModels.has(path)) model = monaco.editor.getModel(monaco.Uri.file(path)); } catch {}
-    if (!model) return { state: "closed" };
+    if (!model) {
+      /*
+       * 不在 projectModels 里，不代表语言服务器不认识这个文件。
+       *
+       * 跨文件诊断会给**没开标签页**的文件建一份惰性 model 并 didOpen 给服务器
+       * （pyright 报 src/models.py 的类型错误就是这么来的）。而 projectModels 只预载
+       * TS/JS/JSON，.py/.rs/.go 一个都不在里面。原来这里直接 return "closed"，didChange
+       * 一次都不发——服务器手里永远是旧文本，那条已经修好的错误会一直被推回来，进
+       * markers、进每轮喂给模型的「实时诊断」块。模型看到「没修上」，再改一遍同一行。
+       * 这正是「报错一直是旧版的、怎么改都不消失」，之前只在「开着标签页」那条腿上修过。
+       */
+      try { if (lspManager?.syncFromDisk?.(path, content)) return { state: "lsp-synced" }; } catch {}
+      return { state: "closed" };
+    }
     if (_setModelValueProgrammatically(model, content)) lspManager?.didChange(path, model);
     lspManager?.didSave(path, model);
     return { state: "project-model-updated" };
@@ -9673,6 +9686,19 @@ async function openFolder(path, owner = null) {
   path = _toPosix(path);
   if (!(await _closeOpenFilesOutsideRoot(path))) return;
   _workspaceRootEntryCounts.clear();
+  /*
+   * 换项目要把语言服务器一起换掉。
+   *
+   * rootUri / workspaceFolders 是 initialize 时一次性钉进去的，之后没有任何一处改过它。
+   * 打开 Rust 项目 A → rust-analyzer 按 A 的 Cargo workspace 起来；不重启应用直接切到
+   * 项目 B，那个进程还在按 A 工作。打开 B/src/main.rs → 它不属于 A 认识的任何 crate →
+   * 补全、跳转、诊断全部失效，而状态栏仍然显示「LSP: rust」一切正常。用户看到的是
+   * 「换了个项目，代码智能就没了」，唯一的恢复手段是重启应用。
+   *
+   * 这里只停不起：下一次 didOpen 会按新根重新 initialize。**要在 workspaceRoots 换掉
+   * 之前停**——lspStop 里清 markers 之类还按旧根算。
+   */
+  try { await lspManager?.resetForNewWorkspace?.(); } catch {}
   workspaceRoots = [path];
   setActiveWorkspaceRoot(path);
   // Opening a different project should immediately retag the active chat tab AND keep the
