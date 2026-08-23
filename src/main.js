@@ -50145,7 +50145,25 @@ function _agentDecisionFrameBlock(text, profile = _engineeringProfileWithAiInten
   if (p.authoritativeReferencesRequired) {
     lines.push("专业工程取证律：对架构、重构、数据库、依赖/API、容器或完整网站的关键决策，先结合本项目约束读取维护者仓库/官方讨论/Stack Overflow 或语言官方论坛的实际材料；计划中写清来源支持的选择、版本/兼容前提、采纳的模式、规避的已知坑，以及本项目验证命令。没有成功来源时必须如实标为未证实，不能借“全球权威”空口背书。");
   }
-  if (!p.requiresPlan && !p.substantial && !p.bug && !p.ui && !p.longRunningRuntime && !p.browserAutomation && !p.capture) {
+  // 裁决**还没到**的时候，绝不能推这一条。
+  //
+  // 这七个否定项判的是「模型声明了它不是大活」，可 _mergeAiIntentProfile 在 verdict 为
+  // null 时把全部维度**强制 false**——于是七项必然同时成立，条件恒真。后果不是"少说
+  // 几句"，是 harness 主动对模型下达**反向指令**：对「帮我做一个多人协作的待办应用」
+  // 这种话，第一发照样说「这是小任务，用最短证据链，别升级成长流程」。
+  //
+  // 实测（2026-08-23，跑真函数）：
+  //   pending 画像 → 决策框 906 字符，**含小任务律**，而交付规格/先读懂再动手/
+  //                  架构质量/变更半径/可维护升级 五条工程律**一条都没有**
+  //   ai 画像      → 3242 字符，五条全在，不含小任务律
+  // 而第一发恰恰必然是 pending（等待窗口 6 秒 vs 裁决 6.9~19.8 秒），也恰恰是决定技术栈
+  // 和目录结构的那一发。用户抱怨的「就喜欢写 MVP 不写正常的」，这里是字面成因。
+  //
+  // 判据用 intentSource 而不是新旗标：它是**裁决的到场状态**，不是模型声明的维度。
+  // 方向是「拿不准就少说一句」，不是夺能力，所以不需要 === "ai" 那种严格闸——
+  // 快通道落定同样算数。
+  if (p.intentSource !== "pending"
+      && !p.requiresPlan && !p.substantial && !p.bug && !p.ui && !p.longRunningRuntime && !p.browserAutomation && !p.capture) {
     lines.push("小任务律：直接用最短证据链完成；能一两个工具搞定就别升级成长流程，完成后给结果和真实验证/未验证边界。");
   }
   // 收尾验收契约前置（Anthropic《Effective harnesses for long-running agents》模式：
