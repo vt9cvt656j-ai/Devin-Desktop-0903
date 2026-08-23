@@ -24567,7 +24567,14 @@ async function _runDomainKnowledgePreflight({ run, profile = "", body = null, is
     const plans = _domainKnowledgeResearchPlan(domain, run._originalText || "");
     const sections = await Promise.all(plans.map(async (plan) => {
       if (!isLive()) return { heading: plan.heading, bullets: [] };
-      const call = { type: "knowledge", domain, query: plan.query, topK: 4, _domainKnowledgePreflight: true };
+      // 这四条 rubric 问的是「适用条件 / 硬性约束 / 常见坑 / 必须做的检查」，答案在 893 段
+      // 手写语料里，不在 295 万行 API 签名表里。带上语料腿的代价与回报实测（2026-08-23 生产库）：
+      // 12 个 OR 词匹配 124,042 行 → 每行两次 ts_rank + 全排序 → 单条 2.8~8.5 秒；而捞回来的
+      // 前六条是 metagit-cli「Pattern categories」、两条重复的 next-pwa「Tips」、
+      // selenium-devtools「Reference」，对「ui-ux 常见坑」一条都不沾边。
+      // 一轮 4 条 × 最多 2 个域 = 8 条这样的重查询，正是那三张红卡超时的成因。
+      // 模型自己调 knowledge_search 去核对真实 API 时不传这个开关，那条腿照旧。
+      const call = { type: "knowledge", domain, query: plan.query, topK: 4, corpus: false, _domainKnowledgePreflight: true };
       let step = null;
       try {
         if (body?.appendChild) {
@@ -59667,7 +59674,13 @@ async function _searchKnowledgeBase(call) {
     const response = await _fetchWithTimeout(`${baseUrl}/api/knowledge/search`, {
       method: "POST",
       headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey || ""}` },
-      body: JSON.stringify({ query: call.query, domain: call.domain || undefined, top_k: call.topK || 6 }),
+      // corpus:false 只在调用方明确说不要时才发出去；不传＝网关按原行为带上语料腿。
+      body: JSON.stringify({
+        query: call.query,
+        domain: call.domain || undefined,
+        top_k: call.topK || 6,
+        corpus: call.corpus === false ? false : undefined,
+      }),
     }, 30_000);
     if (!response.ok) {
       const text = await response.text().catch(() => "");
