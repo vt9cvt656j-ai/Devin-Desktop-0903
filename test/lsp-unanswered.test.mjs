@@ -206,3 +206,66 @@ test("前端把死因说给用户，也留给模型", () => {
     assert.match(seg, /\$\{_(?:lsp|fmt)DeadWhy\}/, `「${anchor}」这条回执没带死因，模型还是只知道「可能未装」`);
   }
 });
+
+// ── ⑤ 「取环境符号」那四条路一直没有工作区信任门 ────────────────────────────
+//
+// lsp_start 把它写得很仔细：未信任的工作区不把它的目录算进 PATH，只用系统装的语言
+// 服务器。可同一个进程里另外四条路绕过了它：
+//   · lsp_detect_python 直接执行 `<工作区>/.venv/bin/python`
+//   · lsp_node_env_symbols 用 require() 加载工作区 node_modules 里的包（跑它的顶层代码）
+//   · lsp_go_env_symbols 在别人的仓库里跑 go list（go.mod 的 toolchain 指令会下载并执行别的工具链）
+//   · lsp_lang_env_symbols 在别人的仓库目录里跑 dart pub 之类
+// 也就是说：clone 一个仓库、点开任意一个 .py 或 .ts 文件，仓库自带的可执行文件就跑起来了。
+test("四条取环境符号的路都要过工作区信任门，且缺省 fail closed", () => {
+  assert.match(RS, /fn workspace_trusted\(flag: Option<bool>\) -> bool \{\s*flag\.unwrap_or\(false\)/,
+    "缺省不是 false —— 老客户端不传这个参数时就等于门不存在");
+
+  const fnBody = (name) => {
+    const i = RS.indexOf(`pub fn ${name}(`);
+    assert.ok(i > 0, `${name} 不见了`);
+    const j = RS.indexOf("\n}\n", i);
+    return RS.slice(i, j);
+  };
+
+  // python：不信任就连工作区都不看（既不挑它的 venv，也不进 PATH）。
+  const py = fnBody("lsp_detect_python");
+  assert.match(py, /trust_workspace_binaries: Option<bool>/, "lsp_detect_python 没有信任参数");
+  assert.match(py, /let scope = if trusted \{ ws \} else \{ None \};/,
+    "不信任时还把工作区传给了 pick_python —— 那就会挑中仓库自带的 .venv/bin/python 并执行它");
+  assert.match(py, /pick_python\(scope\)/, "pick_python 没走 scope");
+  assert.match(py, /augmented_path\(scope\)/, "PATH 没走 scope");
+
+  // node：列包名（读目录）安全，require 不安全。
+  const nd = fnBody("lsp_node_env_symbols");
+  assert.match(nd, /trust_workspace_binaries: Option<bool>/, "lsp_node_env_symbols 没有信任参数");
+  assert.match(nd, /if !modules\.is_empty\(\) && trusted \{/,
+    "require() 那步没过门 —— 它会执行工作区里那个包的顶层代码");
+  assert.match(nd, /if let Ok\(entries\) = std::fs::read_dir\(&node_mods\)/,
+    "把列包名也一起关掉了 —— 读目录名是安全的，不该跟着降级");
+
+  for (const name of ["lsp_go_env_symbols", "lsp_lang_env_symbols"]) {
+    const b = fnBody(name);
+    assert.match(b, /trust_workspace_binaries: Option<bool>/, `${name} 没有信任参数`);
+    assert.match(b, /if !workspace_trusted\(trust_workspace_binaries\) \{\s*return Ok\(/,
+      `${name} 拿到参数却没用它挡住`);
+  }
+});
+
+test("信任状态在 backend 包装那一层带上，不是在每个调用点", () => {
+  // 调用点有六处，漏一处这道门就是虚的。
+  for (const w of ["lsp_detect_python", "lsp_node_env_symbols", "lsp_go_env_symbols", "lsp_lang_env_symbols"]) {
+    const i = MAIN.indexOf(`core.invoke("${w}"`);
+    assert.ok(i > 0, `${w} 的包装不见了`);
+    assert.match(MAIN.slice(i, i + 260), /trustWorkspaceBinaries: isWorkspaceTrusted\(\)/,
+      `${w} 的包装没带信任状态 —— 后端 fail closed，这个功能会对所有人静默失效`);
+  }
+});
+
+test("未信任导致的降级要说出来，不能让用户对着「无法解析」发呆", () => {
+  assert.match(RS, /pub untrusted_fallback: bool/, "后端没把降级这件事报上来");
+  const i = LSP.indexOf("await backend.lspDetectPython");
+  assert.ok(i > 0);
+  const seg = LSP.slice(i, i + 700);
+  assert.match(seg, /info\.untrustedFallback/, "前端没接这个标记");
+  assert.match(seg, /信任这个工作区/, "没告诉用户怎么解决 —— 这恰恰是他一键能解决的问题");
+});

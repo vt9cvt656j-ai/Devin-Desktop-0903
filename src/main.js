@@ -617,9 +617,18 @@ async function tauriBackend() {
     // cmd 没有那个内建，返回 9009，于是 Windows 上答案永远是没有。
     whichCommand: (name, workspace) => core.invoke("which_command", { name, workspace: workspace || null }),
     writeTmpFile: (name, content) => core.invoke("write_tmp_file", { name, content }),
-    lspDetectPython: (workspace) => core.invoke("lsp_detect_python", { workspace: workspace || null }),
+    /*
+     * 这四条「取环境符号」的路会**在工作区里执行东西**：detect_python 直接跑
+     * `<工作区>/.venv/bin/python`，node 那条 require() 工作区 node_modules 里的包
+     * （等于跑它的顶层代码）。lsp_start 早就按工作区信任分了，这四条一直没有——
+     * clone 一个别人的仓库、点开任意 .py/.ts 文件，仓库自带的可执行文件就跑起来了。
+     *
+     * 信任状态在**这一层**统一带上，不是在每个调用点：调用点有六处，漏一处这道门就是
+     * 虚的。后端缺省 fail closed，所以这里传错方向只会让功能降级，不会让门失效。
+     */
+    lspDetectPython: (workspace) => core.invoke("lsp_detect_python", { workspace: workspace || null, trustWorkspaceBinaries: isWorkspaceTrusted() }),
     lspPythonEnvSymbols: (modules) => core.invoke("lsp_python_env_symbols", { modules }),
-    lspNodeEnvSymbols: (projectDir, modules) => core.invoke("lsp_node_env_symbols", { projectDir, modules }),
+    lspNodeEnvSymbols: (projectDir, modules) => core.invoke("lsp_node_env_symbols", { projectDir, modules, trustWorkspaceBinaries: isWorkspaceTrusted() }),
     // 抓包 (MITM capture proxy, mitmproxy-backed)
     proxyAvailable: () => core.invoke("proxy_available"),
     proxyStatus: () => core.invoke("proxy_status"),
@@ -631,8 +640,8 @@ async function tauriBackend() {
     proxyStop: () => core.invoke("proxy_stop"),
     proxyCaPath: () => core.invoke("proxy_ca_path"),
     proxySetSystemProxy: (enable, port) => core.invoke("proxy_set_system_proxy", { enable, port }),
-    lspGoEnvSymbols: (projectDir) => core.invoke("lsp_go_env_symbols", { projectDir }),
-    lspLangEnvSymbols: (lang, projectDir, modules) => core.invoke("lsp_lang_env_symbols", { lang, projectDir, modules }),
+    lspGoEnvSymbols: (projectDir) => core.invoke("lsp_go_env_symbols", { projectDir, trustWorkspaceBinaries: isWorkspaceTrusted() }),
+    lspLangEnvSymbols: (lang, projectDir, modules) => core.invoke("lsp_lang_env_symbols", { lang, projectDir, modules, trustWorkspaceBinaries: isWorkspaceTrusted() }),
     dapList: () => core.invoke("dap_list"),
     dapStart: (config, onEvent) => {
       const channel = new core.Channel();
