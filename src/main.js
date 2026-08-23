@@ -72085,7 +72085,7 @@ function showAboutDialog() {
   const overlay = document.createElement("div");
   overlay.className = "about-dialog-overlay";
   overlay.innerHTML = `
-    <section class="about-dialog" role="dialog" aria-modal="true" aria-labelledby="aboutDialogTitle">
+    <section class="about-dialog" role="dialog" aria-modal="true" aria-labelledby="aboutDialogTitle" tabindex="-1">
       <button class="about-dialog__close" type="button" aria-label="${_escAttr(t("about.close"))}">
         <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M18 6L6 18M6 6l12 12"/></svg>
       </button>
@@ -72115,7 +72115,11 @@ function showAboutDialog() {
   overlay.querySelector(".about-dialog__close")?.addEventListener("click", close);
   window.addEventListener("keydown", onKey);
   document.body.appendChild(overlay);
-  requestAnimationFrame(() => overlay.querySelector(".about-dialog__close")?.focus());
+  // 焦点落在**对话框本体**，不落在关闭按钮上。焦点必须进弹窗（Esc、读屏都靠它），
+  // 但直接 focus 关闭按钮，用鼠标点开时也会在它外面甩出一圈蓝环——那圈环看着像
+  // 「这个按钮被卡住了」，而它当时确实点不动，两件事叠在一起更难判断。
+  // 本体带 tabindex="-1" 才接得住 focus()；Tab 一下照样到关闭按钮。
+  requestAnimationFrame(() => overlay.querySelector(".about-dialog")?.focus());
 }
 
 function getMenus() {

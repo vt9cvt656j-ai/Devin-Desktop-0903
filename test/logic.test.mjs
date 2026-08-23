@@ -28246,6 +28246,93 @@ test("模型菜单：free 徽标由网关下发的字段决定，不是客户端
     "自定义模型那组没用同一套结构，两组的对勾对不齐");
 });
 
+test("关于弹窗：关闭按钮必须压在内容层之上，否则点不动", () => {
+  // 这是「关闭按钮点不上」的真身，而且它是一个**看不出来**的 bug：按钮画得出来
+  // （盖住它的 .about-dialog__hero 背景透明），只是点击被吃掉。
+  // 弹窗里每一块内容都写 z-index:1 用来盖住 ::before 那层渐变；关闭按钮当初也写 1，
+  // 同级时 DOM 靠后者赢命中判定，而 hero 正好在按钮后面。
+  //
+  // 所以这里不钉「z-index 是不是等于 5」——那只是今天的数字。钉的是**关系**：
+  // 关闭按钮的层级必须严格大于每一个内容块。
+  const z = (sel) => {
+    const m = APP_CSS_CODE.match(
+      new RegExp(sel.replace(/[.\\]/g, "\\$&") + "\\s*\\{([^}]*)\\}"));
+    assert.ok(m, sel + " 这条规则不见了");
+    const zi = m[1].match(/z-index:\s*(-?\d+)/);
+    return zi ? Number(zi[1]) : 0;
+  };
+  const closeZ = z(".about-dialog__close");
+  for (const sel of [".about-dialog__hero", ".about-dialog__version",
+                     ".about-dialog__grid", ".about-dialog__desc", ".about-dialog__foot"]) {
+    assert.ok(closeZ > z(sel),
+      `关闭按钮 z-index=${closeZ} 没有高过 ${sel}(${z(sel)})——它会被盖住，点不动`);
+  }
+  // 常态就要有底色：一个「看不出能按」的按钮和一个「按不动」的按钮，用户感受是同一件事。
+  const rule = APP_CSS_CODE.match(/\.about-dialog__close\s*\{([^}]*)\}/)[1];
+  assert.ok(!/background:\s*transparent/.test(rule), "关闭按钮常态又变回全透明了");
+});
+
+test("关于弹窗：关闭按钮在暗色下也要有常态底色", () => {
+  // 浅色态的常态底是**深色**半透明；暗色主题原本只覆盖了字色，于是那层深底铺在
+  // #18181b 的卡片上等于隐形 —— 比改之前的全透明还糟，连 hover 前的存在感都没了。
+  const dark = APP_CSS_CODE.match(
+    /\[data-theme="dark"\] \.about-dialog__close,\s*\.dark \.about-dialog__close\s*\{([^}]*)\}/);
+  assert.ok(dark, "暗色下的关闭按钮规则不见了");
+  const bg = dark[1].match(/background:\s*rgba\(([^)]*)\)/);
+  assert.ok(bg, "暗色下没有给常态底色，会用到浅色态那层深色底");
+  const [r, g, b] = bg[1].split(",").map((n) => Number(n.trim()));
+  assert.ok(r > 200 && g > 200 && b > 200,
+    `暗色底色 rgb(${r},${g},${b}) 是深色——铺在深色卡片上看不见`);
+});
+
+test("关于弹窗：比窗口高的时候，顶端和关闭按钮仍然够得着", () => {
+  // align-items:center 在「内容比容器高」时会把顶端推出视口，而溢出的那一头**滚不到**。
+  // 窄窗口下文字换行会把弹窗撑高，于是关闭按钮直接出界（实测 y = -31px）。
+  const ov = APP_CSS_CODE.match(/\.about-dialog-overlay\s*\{([^}]*)\}/);
+  assert.ok(ov, "遮罩规则不见了");
+  assert.ok(!/align-items:\s*center/.test(ov[1]),
+    "遮罩又用回 align-items:center——弹窗一高，顶端就被推出视口且滚不回来");
+  assert.match(ov[1], /overflow:\s*auto/, "遮罩不可滚动，撑高后够不到底部");
+  const dlg = APP_CSS_CODE.match(/\.about-dialog\s*\{([^}]*)\}/);
+  assert.match(dlg[1], /margin:\s*auto/, "弹窗不是用 margin:auto 居中，顶端会被切掉");
+});
+
+test("关于弹窗：焦点落在对话框本体，不落在关闭按钮上", () => {
+  // 焦点要进弹窗（Esc 和读屏都靠它），但用鼠标点开时不该在关闭按钮外面甩出一圈蓝环。
+  const fn = extractFn("showAboutDialog", { code: true });
+  assert.match(fn, /querySelector\("\.about-dialog"\)\?\.focus\(\)/,
+    "焦点没有落在对话框本体上");
+  assert.ok(!/querySelector\("\.about-dialog__close"\)\?\.focus\(\)/.test(fn),
+    "又去 focus 关闭按钮了，鼠标点开会甩出蓝环");
+  assert.match(fn, /class="about-dialog"[^>]*tabindex="-1"/,
+    "对话框本体没有 tabindex=-1，focus() 落不上去");
+});
+
+test("消息之间要有呼吸，用户那条尤其要独立成块", () => {
+  // 原来是**贴着**的：.chat-session-container 没有 gap、.msg 也没有外边距，
+  // 实测任意两条之间都是 0px。于是用户名紧挨在上一条回答的最后一行下面、看起来
+  // 像那条回答的一部分。
+  const px = (sel) => {
+    const m = APP_CSS_CODE.match(
+      new RegExp(sel.replace(/[.+\\]/g, "\\$&").replace(/ /g, "\\s*") + "\\s*\\{([^}]*)\\}"));
+    assert.ok(m, sel + " 这条规则不见了");
+    const v = m[1].match(/margin-top:\s*(\d+)px/);
+    assert.ok(v, sel + " 没有 margin-top");
+    return Number(v[1]);
+  };
+  const between = px(".msg + .msg");
+  const aboveUser = px(".msg + .msg.user");
+  const belowUser = px(".msg.user + .msg");
+  assert.ok(between > 0, "相邻消息之间又贴回 0 了");
+  // 用户那条是「邮箱 + 蓝气泡」合起来的一小块，上下都要比普通间距更宽，才不像是
+  // 上一条回答的尾巴。
+  assert.ok(aboveUser > between, `用户消息上方 ${aboveUser}px 没有比普通间距 ${between}px 更宽`);
+  assert.ok(belowUser > between, `用户消息下方 ${belowUser}px 没有比普通间距 ${between}px 更宽`);
+  // 第一条要贴着顶端：用 .msg + .msg.user 而不是裸 .msg.user，否则整段对话平白矮一截。
+  assert.ok(!/(^|\})\s*\.msg\.user\s*\{[^}]*margin-top/.test(APP_CSS_CODE),
+    "裸 .msg.user 上加了 margin-top，第一条消息会平白多出一截空白");
+});
+
 test("free 徽标样式：靠右、与对勾列分开、不随选中态挪位", () => {
   assert.match(APP_CSS_CODE, /\.menu__item \.free-tag\s*\{[^}]{0,400}margin-left:\s*auto/,
     "徽标没有靠右——会紧跟在模型名后面，长短不一就对不齐");
