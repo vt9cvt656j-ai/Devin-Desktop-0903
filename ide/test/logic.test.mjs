@@ -24244,11 +24244,22 @@ test("a quiet turn is the model's completion decision except for real bounded wo
   // 用户重新定义了任务，之前的欠账账本作废——否则旧任务的提醒会继续推着模型跑。
   assert.match(quiet, /run\._quietResumePool = 3;/, "插话后要把全局预算恢复");
   // 预算 3 → 2：全局池只有 3，单门占 3 会把另外两道门饿死。
-  // 窗口 1200→2600：plan 门 continue 与最终 break 之间现在住着四道**只记账、不补回合**的
-  // 诚实门——last_action_failed、没读过还把一大半覆写没了（overwrote_unread）、
-  // 新引入的占位（stub_delivery），每加一道这段就长一截。守的属性一个字没变：
-  // plan 门有界续跑、最终诚实收尾。窗口只是这条断言的取景框，不是被守护的性质本身。
-  assert.match(quiet, /\(run\._planFinishNudges \|\| 0\) < 2[\s\S]{0,700}continue;[\s\S]{0,2600}break; \/\/ truly done/,
+  // （下面那条断言的取景框已改，见注释）
+  //
+  // 这条原来是个**字符数窗口**：`… < 2[\s\S]{0,700}continue;[\s\S]{0,2600}break;`。
+  // 它守的是**顺序**（plan 门 → 有界续跑 → 最终诚实收尾），却按字符数量数：于是 plan 门与
+  // 最终 break 之间每住进一道只记账的诚实门，窗口就得被撑大一次——上一次 1200→2600，
+  // 这一次又被一条注释挤爆（实测 2640 > 2600）。上面那句注释自己就写着「窗口只是取景框，
+  // 不是被守护的性质本身」——那正说明取景框的**取法**是错的。
+  // 本仓库另有记录：固定窗口切源码会**静默失效**（函数变长后不再守尾部却仍是绿的），
+  // 这次运气好是变红。改成直接比位置，和上面 steer 抽干那几条同一个写法。
+  const _planGateAt = quiet.indexOf("(run._planFinishNudges || 0) < 2");
+  assert.ok(_planGateAt > 0, "plan 门不见了");
+  const _afterPlanGate = quiet.slice(_planGateAt);
+  const _reenterAt = _afterPlanGate.indexOf("continue;");
+  const _trulyDoneAt = _afterPlanGate.indexOf("break; // truly done");
+  assert.ok(_reenterAt > 0, "plan 门之后没有 continue——计划没做完时不会有界续跑");
+  assert.ok(_trulyDoneAt > _reenterAt,
     "an open plan re-enters, boundedly, and then the run ends honestly");
   assert.match(quiet, /run\._incompleteReason \|\| `plan_steps_pending:/,
     "a run that gives up on its plan must not be recorded as a clean finish");
@@ -28544,6 +28555,32 @@ test("每条回复底下的操作条：五个按钮，全部走委托", () => {
   assert.match(add, /main\.appendChild\(_buildMsgActions\(/, "助手消息没挂上操作条");
   assert.ok(!/wrap\.appendChild\(_buildMsgActions\(/.test(add),
     "挂到 wrap 上了——那是 flex row，会跑到头像右边去，而不是正文底下");
+});
+
+test("抓取卡片展开后要能读：分段、正文字体、英文不从词中间断", () => {
+  /*
+   * 展开后是一堵墙，而且英文在**单词中间**断行（用户截图里的 `Claud/e`、`you/r`、
+   * `ou/tputs`）。两个原因叠在一起：
+   *   · 渲染用的是裸 `<pre>` —— 等宽字体读散文别扭，段落之间没有间距；
+   *   · `.chat-session-container p` 给的 `word-break: break-word` 在 WebKit 里等同
+   *     「见缝就切」，而裸 `.atc-web__p`（0,1,0）打不过它的 (0,1,1)。
+   */
+  const view = load("_webTextView", { _escHtml: (x) => String(x) });
+  const out = view("第一段。\n\n第二段。\n\n第三段。");
+  assert.equal((out.match(/atc-web__p/g) || []).length, 3, "没有按段落切开");
+  assert.ok(!/<pre/.test(out), "又回到 <pre> 了——等宽字体读散文别扭，段落也挤在一起");
+  // 超长时要说清楚只是预览，别让人以为模型也只看到这些。
+  assert.match(view("x".repeat(5000)), /只预览前 4000 字/, "截断没有留痕");
+
+  // 选择器必须够特指，否则被 .chat-session-container p 的 break-word 盖掉。
+  assert.match(APP_CSS_CODE, /\.atc-web \.atc-web__p\s*\{[^}]*word-break:\s*normal/,
+    "词中断没修好：裸 .atc-web__p 打不过 .chat-session-container p 的 (0,1,1)");
+  assert.match(APP_CSS_CODE, /\.atc-web \.atc-web__p\s*\{[^}]*overflow-wrap:\s*break-word/,
+    "超长标识符不换行会把卡片撑破");
+  const box = APP_CSS_CODE.match(/\.atc-web \{([^}]*)\}/);
+  assert.ok(box, ".atc-web 规则不见了");
+  assert.match(box[1], /font-family:\s*var\(--font\)/, "还在用等宽字体读散文");
+  assert.match(box[1], /max-height/, "没有高度上限，一页正文会把整个对话顶下去");
 });
 
 test("「接下来」卡片内部：一行一句话，不堆盒子", () => {
