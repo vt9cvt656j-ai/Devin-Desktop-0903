@@ -43454,13 +43454,10 @@ function _depPitfallNote(run, fp, oldText, newText) {
     const snap = run.checkpoint && typeof run.checkpoint.get === "function" ? run.checkpoint.get(fp) : null;
     const baseline = snap ? (snap.existed ? String(snap.content || "") : "") : String(oldText || "");
     let adds = _manifestDepAdditions(fp, baseline, newText);
-    if (adds.length) {
-      // 模型本 run 里自己写进 manifest 的依赖，登记成"项目已声明"。全新项目的那份 manifest
-      // 正是它刚写出来的，工作区扫描不可能知道——不登记的话，紧接着写的 import 会被当成
-      // 未声明依赖再报一遍。
-      const reg = (run._declaredDeps = run._declaredDeps instanceof Set ? run._declaredDeps : new Set());
-      for (const d of adds) { reg.add(`${d.kind}:`); reg.add(`${d.kind}:${d.name.toLowerCase()}`); }
-    } else {
+    // 这一次是不是 manifest 触发的。登记动作要等 fresh 算完才做（见下面那段），
+    // 所以这里只把分支记下来。
+    const fromManifest = adds.length > 0;
+    if (!fromManifest) {
       // manifest 没动 ⇒ 看这次是不是在源码里 import 了一个项目还没声明的第三方包。
       adds = _undeclaredImportAdditions(run, fp, baseline, newText);
     }
@@ -43480,6 +43477,21 @@ function _depPitfallNote(run, fp, oldText, newText) {
       run._depHintBudget--;
       noted.add(nameKey);
       fresh.push(d);
+    }
+    // 登记表只记**本轮真正说出口的那几个**，不记被预算饿死的。
+    //
+    // 原来在上面把 adds 全部登记（解析上限 6 个），而预算只让 2 个说出口。后果是第 3~6 位
+    // 两头落空：既没被提醒过，又因为"已声明"把 import 那条后备通道一起堵死了——而那几位
+    // 恰恰是最会因版本漂移写错 API 的新依赖（react/react-dom 这类头部框架反而排在前面
+    // 先被说掉）。第 7 位往后压根没被登记，反而能被 import 腿抓住，还带 package_source
+    // 的零网络真签名，质量更高。
+    //
+    // 这跟原注释的意图不冲突：那条要防的是「模型刚写进 manifest 的包紧接着被 import 腿
+    // 再报一遍」，而对**没说出口**的包，重复报正是想要的——这和下面「没说出口的不写跨 run
+    // 缓存」是同一条纪律，登记表原来恰好违反了它。
+    if (fromManifest && fresh.length) {
+      const reg = (run._declaredDeps = run._declaredDeps instanceof Set ? run._declaredDeps : new Set());
+      for (const d of fresh) { reg.add(`${d.kind}:`); reg.add(`${d.kind}:${d.name.toLowerCase()}`); }
     }
     if (!fresh.length) return "";
     const viaImport = fresh.every((d) => d.viaImport === true);
