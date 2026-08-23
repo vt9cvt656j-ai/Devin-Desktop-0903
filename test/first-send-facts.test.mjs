@@ -1,0 +1,102 @@
+// 会话第一发必然带着不完整的画像出门——那道等待窗口 6 秒，而完整裁决实测健康时
+// 6.9~7.6 秒、拥堵时 19.8 秒，快通道首响应头 8~18 秒：**两条腿都赢不了它**。
+//
+// 但执行事实那条腿不用等任何模型：它算的是这一刻磁盘上确实有什么，纯本地同步计算。
+// 把它并进第一发，就少一次整条对话的前缀缓存作废（本仓库另有实测：这类抖动把
+// 120k token 请求的缓存命中率打到 2%）。
+//
+// 另一半：73 个维度里有 12 个零读者，占着提示词的键名清单，也占着模型每一轮必须判定
+// 的面——而那正是「产不出大 JSON」的直接成因（同模型实测：40 条判定项 → 正文 0 字；
+// 20 条 → 完整产出。卡的是输入规模，不是预算）。
+import { test } from "node:test";
+import assert from "node:assert/strict";
+import { CODE as SRC, loadConst, fnSource as topLevelFn } from "./helpers/source.mjs";
+
+const DIMS = loadConst("_AI_INTENT_DIMENSIONS");
+
+// ── 一、执行事实并进第一发 ────────────────────────────────────────────
+const send = topLevelFn("sendPrompt", { code: true });
+
+test("第一发的画像后面紧跟着执行事实那条腿", () => {
+  const at = send.indexOf("config.ideSemanticProfile = _sessionStableSemanticProfile(sess, _semanticProfileHeaderFor");
+  assert.ok(at > 0, "第一发写画像那一行不见了");
+  const after = send.slice(at, at + 1600);
+  assert.match(after, /_executionFactSemanticFlags\(/,
+    "执行事实还是只在循环边界跑——第一发仍然带空画像出门");
+  assert.match(after, /_sessionStableSemanticProfile\(sess, _ideSemanticProfile\(_factFlags\)\)/,
+    "算出来了却没并进请求头");
+});
+
+test("零事实时一个字都不发（不许凭空造旗标）", () => {
+  const at = send.indexOf("_executionFactSemanticFlags(");
+  const seg = send.slice(at, at + 400);
+  assert.match(seg, /if \(Object\.keys\(_factFlags\)\.length\)/,
+    "没有事实也去写请求头——那会把空画像写成一次真实的旗标变化，白白作废一次前缀缓存");
+});
+
+test("用的是本地同步计算，不引入任何等待", () => {
+  const at = send.indexOf("_executionFactSemanticFlags(");
+  const seg = send.slice(at - 200, at + 400);
+  assert.doesNotMatch(seg, /await /, "这条腿加了 await——它的全部价值就是零延迟");
+});
+
+test("扫描失败不能把发送路径带崩", () => {
+  const at = send.indexOf("_executionFactSemanticFlags(");
+  const seg = send.slice(Math.max(0, at - 300), at + 500);
+  assert.match(seg, /try \{/, "没有兜住异常");
+  assert.match(seg, /catch \{\}/, "没有兜住异常");
+});
+
+test("第一发这条腿不许把写盘台账当输入（那时还没写过盘）", () => {
+  // run 还不存在。传一个假的 _writeLedger 会凭空点亮 implementation——那是猜，不是事实。
+  const at = send.indexOf("_executionFactSemanticFlags(");
+  const seg = send.slice(at, at + 200);
+  assert.match(seg, /_writeLedger: null/,
+    "第一发就带上了写盘台账——这一刻还没有任何写入发生过");
+});
+
+test("判据一个字没放宽", () => {
+  const body = topLevelFn("_executionFactSemanticFlags", { code: true });
+  assert.match(body, /hasWorkspace && evidence\?\.snapshotReady && \(evidence\.topLevel \|\| \[\]\)\.length/,
+    "三个条件被放宽了——空目录会被当成已有项目");
+});
+
+// ── 二、删掉零读者维度 ────────────────────────────────────────────────
+const DEAD = ["paletteHarmonyRequired", "cardLayoutRequired", "cardStylingRequired",
+  "semanticIconRequired", "gitHistory", "gitLocalMutation", "gitReviewMutation",
+  "nativeHtmlRequested", "darkThemeRequested", "gradientThemeRequested",
+  "monochromeThemeRequested", "categoryProductSurface"];
+
+test("12 个零读者维度已从模型必判清单里删掉", () => {
+  const back = DEAD.filter((k) => DIMS.includes(k));
+  assert.deepEqual(back, [],
+    `这些维度又回来了：${back.join(",")}——它们没有任何读者，只占着模型每一轮的判定面`);
+});
+
+test("它们确实没有读者（这是删它们的全部理由）", () => {
+  for (const k of DEAD) {
+    const hits = (SRC.match(new RegExp(`\\b${k}\\b`, "g")) || []).length;
+    assert.equal(hits, 0, `${k} 在源码里还有 ${hits} 处——删早了，先接上读者`);
+  }
+});
+
+test("有读者的维度一个都没被误删", () => {
+  // 反向断言。只断言"那 12 个没了"是绿的摆设——把整张表删空它也绿。
+  // 只列**确实在维度表里**的（projectEngineering / substantial / existingProject 是派生
+  // 字段，不在这张表里——照抄一份没核过的名单，反向断言就成了自己红自己）。
+  for (const k of ["implementation", "ui", "uiProject", "git", "debugProject",
+    "securityRisk", "fullWebsite", "database", "businessLogic", "needsOfficialResearch"]) {
+    assert.ok(DIMS.includes(k), `${k} 被误删了——它有真实读者`);
+  }
+  // 精确对数，不用下限。下限是绿的摆设：把维度表删掉 5 个它照样过（2026-08-23 变异实测）。
+  // 这个数变了要**刻意**改这里并说明为什么——和本仓库钉开局工具窗口大小同款。
+  assert.equal(DIMS.length, 61,
+    `维度数变成 ${DIMS.length} 了。加维度＝模型每轮多一项必判，删维度＝可能删掉有读者的；`
+    + "两种都该在这里留下痕迹");
+});
+
+test("键名清单确实变短了（这是收益本身）", () => {
+  // 模型每一轮都要读这份清单并逐项判定。它的长度就是「输入规模」的一部分。
+  assert.ok(DIMS.join(",").length <= 1000,
+    `键名清单 ${DIMS.join(",").length} 字符——删了 12 个还没降下来，说明删的不是它`);
+});
