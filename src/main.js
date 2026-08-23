@@ -19557,6 +19557,9 @@ function _wireInlineEditMenuTrigger(button, openMenu) {
 // blob: URL（进程一重启就失效），而 memory / SQLite 里那份是持久化过的原始附件。
 // 取不到就返回空数组——编辑一条没有图的消息本来就该是空的。
 function _messageAttachmentsFor(session, wrap) {
+  // 先读挂在节点上那份：刚发出去的消息只有这一份（它们的气泡没有 transcriptSequence，
+  // 全仓没有任何 addMessage 调用点传那个 options）。
+  if (Array.isArray(wrap?._attachments) && wrap._attachments.length) return wrap._attachments.slice();
   const seq = Number(wrap?.dataset?.transcriptSequence);
   if (!session?.memory || !Number.isFinite(seq) || seq < 0) return [];
   try {
@@ -19637,7 +19640,10 @@ function _beginEditResend(wrap, forSession) {
         editMedia.splice(i, 1);
         paintMedia();
       })));
-    mediaStrip.hidden = editMedia.length === 0;
+    // 不能用 `hidden`：.prompt-images 是 `display:flex`，会盖过 [hidden] 的
+    // `display:none`，空条照样占一大块（截图里那片空白就是它）。这个坑本文件里
+    // lightbox 那处已经踩过一次并写在注释里了。显式改 display。
+    mediaStrip.style.display = editMedia.length ? "" : "none";
   };
   paintMedia();
   box.append(mediaStrip, ta, bar);
@@ -19811,6 +19817,13 @@ function addMessage(role, text, forSession, attachments = [], options = {}) {
   if (Number.isFinite(options?.transcriptSequence)) {
     wrap.dataset.transcriptSequence = String(Math.max(0, Math.trunc(options.transcriptSequence)));
   }
+  // 把这条消息的附件挂在气泡上，供「双击编辑」取回。
+  //
+  // 原来是按 `dataset.transcriptSequence` 去 memory 里找，但**没有任何调用点传这个
+  // options**（全仓 grep 为 0）——只有从历史重画的那条路会补写它。于是刚发出去的消息
+  // 一双击进编辑，附件一律取不到，编辑框里空空如也。
+  // 挂在节点上是最短也最可靠的一条：addMessage 本来就收到了 attachments。
+  if (Array.isArray(attachments) && attachments.length) wrap._attachments = attachments;
   let body;
   // Render into the OWNING run's session container — so a background tab's agent
   // run keeps appending to its own tab even while you're looking at another.
