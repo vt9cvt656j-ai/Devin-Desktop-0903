@@ -27000,7 +27000,18 @@ async function _maybeSuggestNext(sess, messages, config) {
      * 举着问题等人回答时不算：_composerPrediction 对 awaiting_user 直接返回 null，
      * 算了也是白花钱。
      */
-    if (sess?._lastRunState?.outcome !== "awaiting_user") {
+    {
+      /*
+       * **awaiting_user 时也要预测**，这里原来是整档跳过。
+       *
+       * 那道闸的理由（写在 `_composerPrediction` 里）只对**环境档**成立：举着问题等人
+       * 回答时，环境档只会吐出「回答上面的问题」这种空话。但对读过对话的 ask 档，
+       * 这恰恰是准确率最高的一刻 —— 助手把 1/2/3 摆出来了，用户下一句几乎必然是编号。
+       * 两者共用同一道闸，于是最贵的那个场景被一起关掉了：用户看着「想先搞哪个？」，
+       * 输入框里却是「解释 src/types.ts」。
+       *
+       * 现在闸门收窄成「只挡环境档」，挡的位置挪到 `_composerPrediction` 里。
+       */
       try { void _predictNextAsk(sess); } catch {}
     }
     // 卡片行排在灰字**之前**。两处读的是同一份建议，而灰字的 "run" 档取的正是卡片行
@@ -27079,19 +27090,47 @@ function _predictionAlreadyUsed(sess, send) {
  */
 const _ASK_PREDICT_SYSTEM = [
   "你在预测用户接下来会在输入框里打的**那一句话**。",
-  "先看用户最近说了什么、他最初想要什么，再看助手刚回了什么。",
-  "预测**他会打什么**，不是你觉得接下来该做什么——后者是助手的活，不是这里要的。",
+  "下面给你一段对话：`用户：`开头的是用户说的，`助手：`开头的是助手说的。",
+  "只回答一件事——用户读完助手最后那段话，手指落回键盘会打出什么。",
+  "",
   "判据只有一条：他看到这句会不会想「我正要打这个」。",
+  "不是「接下来该做什么」（那是助手的活），是「他会怎么说」。",
   "",
-  "不确定就输出空字符串。以下情况一律输出空：",
-  "· 助手刚报错或明显误解了他 —— 让他自己判断，别替他决定下一步",
+  "## 硬性要求",
+  "· **30 字以内**（超过会被丢弃）。用户不会打一段话。",
+  "· 一句话。不要两句、不要换行、不要代码块。",
+  "· 用他自己的语言和说话方式：他说中文你就说中文，他简短你就简短。",
+  "· 第一人称对助手说话（「帮我…」「先做…」），不是助手口吻（「我来…」「让我…」）。",
+  "",
+  "## 拿不准就输出空字符串",
+  "空是**合法且正确**的答案，比一句放之四海皆准的话好得多。以下一律输出空：",
+  "· 助手刚报错、或明显误解了他 —— 让他自己判断，别替他决定",
   "· 对话刚开始、看不出他要往哪走",
-  "· 你只能想出一句放之四海皆准的话（「继续」「帮我优化一下」）",
+  "· 你只想得出「继续」「帮我优化一下」这种任何时候都成立的话",
+  "· 助手已经把事情做完了，没有明显的下一步",
   "",
-  "绝对不要输出：评价（「不错」「谢谢」）、反问用户的话、助手口吻（「我来…」「让我…」）、",
-  "他从没提过的新点子、超过一句话。",
+  "## 例子",
   "",
-  "格式：一句话，越短越好，用他自己的说话方式和语言。或者空。",
+  "助手列了 1–6 条改进建议，结尾问「想先搞哪个？」",
+  "→ 先搞 1 和 6",
+  "",
+  "助手说依赖没装、建议跑 npm install，结尾问「要我现在装好吗？」",
+  "→ 装好再跑一遍验证",
+  "",
+  "助手改完代码给了方案，用户之前一直在盯样式",
+  "→ 间距再大一点",
+  "",
+  "助手：「构建失败了，报错是 xxx，我需要更多信息」",
+  "→ （空）",
+  "",
+  "用户：「谢谢」 助手：「不客气」",
+  "→ （空）",
+  "",
+  "助手刚把一个功能完整做完并验证通过，没有留下未尽事项",
+  "→ （空）",
+  "",
+  "## 输出",
+  "只输出那一句话本身，不要引号、不要解释、不要括号说明。或者输出空。",
 ].join("\n");
 
 /// 丢弃不像"用户会打的话"的预测。理由和 Claude Code 那套过滤器一样：
@@ -27100,17 +27139,40 @@ const _ASK_PREDICT_SYSTEM = [
 function _rejectPredictedAsk(text) {
   const v = String(text || "").replace(/\s+/g, " ").trim();
   if (!v) return "empty";
-  // 32 个字。Claude Code 那套卡 12 个词 / 100 字符，那是英文；中文单字的信息密度是
+  // 40 个字。Claude Code 那套卡 12 个词 / 100 字符，那是英文；中文单字的信息密度是
   // 两三倍，照搬 100 会把「帮我把这个项目从头到尾重新梳理一遍，包括技术栈选型、目录
   // 结构、核心模块职责和数据流」这种整段指令放进来——那正是用户嫌它"像乱猜"的东西。
-  if (v.length > 32) return "too_long";
+  //
+  // 100 ÷ 2.5 ≈ 40，这一步的算术上面那段注释本来就写了，落地却写成 32，中间那 8 个字
+  // 没有依据。提示词现在明说「30 字以内」，闸门留 10 字缓冲给模型数不准的情况。
+  // 长度也不是唯一护栏：下面 multiple_sentences 和 has_formatting 已经独立挡住了
+  // 「整段指令」那个形状，长度只需要挡住单句里的啰嗦。
+  if (v.length > 40) return "too_long";
   // 多句话：用户不会一次打一段
   if (/[。！？!?][^」』）)\]】]*[。！？!?]/.test(v)) return "multiple_sentences";
   if (/```|\n/.test(v)) return "has_formatting";
-  // 助手口吻
-  if (/^(我来|让我|我将|我会|我先|接下来我|我可以帮)/.test(v)) return "assistant_voice";
-  // 反过来问用户
-  if (/^(你|您|要不要|需要我)/.test(v) && /[?？]$/.test(v)) return "question_to_user";
+  // 助手口吻。
+  //
+  // 原来把「我来 / 我先 / 我会」也算进去，可那三个是**用户第一人称**最常见的开头：
+  //   「我来试试你说的第二个方案」「我先跑一下测试」「我会不会漏了什么？」
+  // 三句都是用户在说自己要干什么、自己的疑虑，被当成助手口吻毙掉了。
+  // 真正的助手口吻是「替你做」那个语义：让我 / 我来帮 / 我可以帮 / 接下来我 / 我将为你。
+  //
+  // 英文也一起挡，别中英不对称（提示词明写「用他自己的语言」，英文用户此前一条都不挡）。
+  if (/^(让我|我来帮|我可以帮|接下来我|我将为你)/.test(v)) return "assistant_voice";
+  if (/^(let me|i'?ll |i will |i can help)/i.test(v)) return "assistant_voice";
+  // 反过来问用户。
+  //
+  // **这条的极性原来是反的。** 判据是 `/^(你|您|要不要|需要我)/` + 问号收尾 —— 可这一档
+  // 预测的是**用户**会打的话，用户嘴里的「你」指的正是助手。实测六句全被毙：
+  //   「你能把它改成 TypeScript 吗？」「你刚才说的第二点能展开讲讲吗？」
+  //   「你确定这样不会破坏缓存吗？」「你说的那个文件在哪？」
+  //   「要不要顺便把测试也加上？」「需要我提供完整报错吗？」
+  // 这些恰恰是一轮回复之后用户最常见的追问句式，也就是这个功能唯一有价值的场景。
+  //
+  // 真正要挡的是**模型忘了自己在扮演用户、反过来征询用户意见**，那种句子有固定形状：
+  // 「你想…？」「你希望…？」「你打算…？」——用户几乎不会这么对助手说话。收窄到这些。
+  if (/^(你|您)(想|希望|打算|要不要我|需不需要)/.test(v) && /[?？]$/.test(v)) return "question_to_user";
   // 评价 / 客套
   if (/^(不错|很好|挺好|可以|谢谢|多谢|辛苦|收到|明白|好的)[。！!~\s]*$/.test(v)) return "evaluative";
   // 模型在叙述自己保持沉默
@@ -27124,8 +27186,19 @@ function _rejectPredictedAsk(text) {
 /// 后台算一次"他下一句会打什么"，算完刷新输入框。失败/被拒都静默——
 /// 这一档的正确失败方式是**什么都不显示**，交给下面的环境档。
 async function _predictNextAsk(sess) {
+  /*
+   * 单飞闸必须在 try **外面**。
+   *
+   * 原来 `if (sess._askPredictInflight) return;` 落在 try 里，而 finally 无条件把标志
+   * 清成 false —— 被挡住的那一次 return 之后照样跑 finally，**把正在飞的那次的标志清了**。
+   * 时序：A 起飞(flag=true) → B 被挡、finally 清成 false → C 看到 false 也起飞，和 A 并发。
+   * 两条并发预测都会写 `sess._askPredict`，谁后落谁赢，赢的那个 turnKey 未必是新的，
+   * 还白烧一次上游调用。连排几条消息就能走到（_drainFollowups 就在发起预测的前一行）。
+   */
+  if (!sess || sess._askPredictInflight) return;
+  let _to = null;
+  let _timedOut = false;
   try {
-    if (!sess || sess._askPredictInflight) return;
     const recent = (sess.memory && Array.isArray(sess.memory.recent)) ? sess.memory.recent : [];
     // 至少要有一来一回才谈得上"接下来问什么"。
     if (recent.filter((m) => m && m.role === "assistant").length < 1) return;
@@ -27163,13 +27236,60 @@ async function _predictNextAsk(sess) {
 
     sess._askPredictInflight = true;
     const turnKey = recent.length;
+    /*
+     * 助手那条取**尾巴**，不是开头。
+     *
+     * agent 轮写进 recent 的是整轮叙事的拼接（summaryText 累积了这一轮每一段散文），
+     * 一轮跑二十步可以上万字。原来一律 `slice(0, 700)` 截头，喂给模型的是**这一轮刚开始
+     * 时**在做什么 —— 而用户要回应的是助手**最后**说的那句。截图里那句「想先搞哪个？
+     * 我直接帮你实现。」正好在结尾，一个字都没进去，模型当然猜不到用户要回编号。
+     *
+     * 用户那条仍取开头：用户消息本来就短，而且开头就是他的诉求。
+     */
     const convo = recent.slice(-6).map((m) => {
       const who = m.role === "assistant" ? "助手" : "用户";
-      return `${who}：${String(m.content || "").replace(/\s+/g, " ").slice(0, 700)}`;
+      const body = String(m.content || "").replace(/\s+/g, " ");
+      const clipped = body.length <= 700 ? body
+        : (who === "助手" ? "…" + body.slice(-700) : body.slice(0, 700) + "…");
+      return `${who}：${clipped}`;
     }).join("\n");
+    /*
+     * 一句「助手在等你拿主意」。这是整个预测里**信息量最大的一条**，而它此前完全没喂进去。
+     *
+     * 助手把 1/2/3 摆出来问「想先搞哪个」的时候，用户下一句几乎必然是个编号 —— 这一刻
+     * 预测能准得出奇。但模型只拿到一段扁平的 `用户：/助手：` 文本，得自己从里面读出
+     * 「这是在问我」，而它经常读不出来（尤其助手那段很长、问句在最后一行的时候）。
+     *
+     * 判据用**已有的两个**，不新造：`run.outcome === "awaiting_user"`（助手调了 ask_user，
+     * 这是确凿的执行事实）和 `_detectChoiceOptions`（助手把选项写在正文里、没调工具时的
+     * 保守检测，卡片行用的就是它）。两个都不命中就什么都不加 —— 宁可不提示，
+     * 也不要凭正则猜「这句是不是问句」然后误导模型。
+     */
+    let _cue = "";
+    try {
+      const _lastAssistant = [...recent].reverse().find((m) => m && m.role === "assistant");
+      const _opts = _lastAssistant ? _detectChoiceOptions(String(_lastAssistant.content || "")) : null;
+      if (_opts && _opts.length) {
+        _cue = "\n\n【助手把选项摆出来了，在等你挑】"
+          + _opts.map((o) => `${o.label}. ${o.text}`).join("；")
+          + "\n他下一句很可能就是挑其中一个（可以只说编号，也可以挑几个）。";
+      } else if (sess._lastRunState && sess._lastRunState.outcome === "awaiting_user") {
+        _cue = "\n\n【助手问了他一个问题，正在等回答】他下一句多半是直接回答那个问题。";
+      }
+    } catch {}
 
+    /*
+     * 期限必须**和预算一起抬**，只改一半等于把「顶满上限」换成「静默超时」。
+     *
+     * 原来是写死 12 秒。而记忆里实测 ox-alpha 光首字就要约 10 秒，本来就只剩 2 秒余量；
+     * 预算抬到 4256 之后推理型模型必然超过 12 秒，一律被 abort。abort 抛出的错被外层
+     * `catch { }` 吞掉，连 `_askPredictReject` 都不会写 —— tooltip 里连个原因都没有。
+     * 复用已有的分档助手，45 秒封顶：灰字迟到没关系（`_renderComposerGhost` 在 focus /
+     * input / 预测返回时都会重算，turnKey 那道守卫保证过期的不会显示）。
+     */
     const ctrl = typeof AbortController !== "undefined" ? new AbortController() : null;
-    const to = ctrl ? setTimeout(() => ctrl.abort(), 12000) : null;
+    const _deadlineMs = Math.min(_cognitiveLegDeadlineMs(_predictCfg) || 45_000, 45_000);
+    _to = ctrl ? setTimeout(() => { _timedOut = true; ctrl.abort(); }, _deadlineMs) : null;
     const _text = await _fetchCompletionText(_chatCompletionsUrl(_predictCfg.baseUrl), (() => {
         const h = { "Content-Type": "application/json", Authorization: "Bearer " + (_predictCfg.apiKey || "") };
         // 不带 request_id 的话，网关插 model_usage 时它是 NULL，而结算接口按 request_id 查——
@@ -27181,11 +27301,36 @@ async function _predictNextAsk(sess) {
         return h;
       })(), {
         model: _predictCfg.model,
-        messages: [{ role: "system", content: _ASK_PREDICT_SYSTEM }, { role: "user", content: convo }],
-        max_tokens: 60, temperature: 0.3
+        messages: [{ role: "system", content: _ASK_PREDICT_SYSTEM }, { role: "user", content: convo + _cue }],
+        max_tokens: _predictMaxTokens(_predictCfg.model),
+        // 0，不是 0.3。这是「最可能的下一句」这种单点预测，不是创作；同一个文件里其它
+        // 每一次有界辅助调用（_wrapUpCritic / _semanticToolOrchestrator）都是 0。
+        // 0.3 只贡献方差：同一段对话不同轮采到不同句子，下游还有七条硬闸门在筛，
+        // 采样偏一点就可能正好撞上 too_long，表现为「有时候有、有时候没有，看不出规律」。
+        temperature: 0,
+        /*
+         * **这一行是 Claude 那条路上「预测从来不出现」的真正解药。**
+         *
+         * 网关的 `thinking_effort_for(body)` 在客户端**什么思考字段都不发**时，结尾是
+         * `.or(Some("high"))` —— 于是这一发「猜一句话」被升级成 adaptive thinking、
+         * effort=high，而 `thinking_on` 一旦为真，max_tokens 会被抬到 **40000**
+         * （server/src/models.rs 的 `let floor = match effort { … Some("high") => 40000 }`）。
+         * 我们那个 60 根本没到上游，请求变成一次深思考大调用，然后被期限掐死。
+         * 生产数据正好对得上：claude-fable-5 三天 70 组请求，预测行 **0 条**。
+         *
+         * 只能用 `reasoning_effort: "off"` 这一种写法，**不能发 `thinking: {type:"disabled"}`**：
+         * 分叉前那道守卫判的是 `body.get("thinking").is_some()`（不看 type），
+         * 显式关闭照样把 max_tokens 抬到 32000 —— 关思考反而把预算放大 500 倍。
+         * 而 `reasoning_effort` 那一支明写着 `e != "off"`，"off" 是唯一被放行的值。
+         *
+         * 只对网关发：自定义端点的上游未知，塞一个它不认的枚举可能直接 400，
+         * 那会把这个功能对这批用户整个打死。他们靠上面抬高的 max_tokens 兜底。
+         */
+        ...(_predictCfg.viaGateway ? { reasoning_effort: "off" } : {}),
       }, ctrl ? ctrl.signal : undefined);
-    if (to) clearTimeout(to);
-    if (_text == null) return;
+    // 网络失败/非 200/解析失败都会走到这里。原来是直接 return，`_askPredictReject`
+    // 保持上一轮的旧值或空 —— 「为什么这儿没有预测」那句承诺在最常见的失败路径上是空的。
+    if (_text == null) { sess._askPredictReject = _timedOut ? "timeout" : "request_failed"; return; }
     const raw = String(_text || "").trim().replace(/^["「『]|["」』]$/g, "");
     const why = _rejectPredictedAsk(raw);
     // 记下被拒的原因而不是一走了之：「为什么这儿没有预测」要答得出来。
@@ -27194,16 +27339,27 @@ async function _predictNextAsk(sess) {
     if (_predictionAlreadyUsed(sess, raw)) { sess._askPredictReject = "already_sent"; return; }
     sess._askPredict = { text: raw, turnKey };
     try { _renderComposerGhost(); } catch {}
-  } catch { /* 预测失败就是没有预测 */ }
-  finally { try { sess._askPredictInflight = false; } catch {} }
+  } catch {
+    // abort 也从这儿出去。同样要留痕，否则超时这条路径在诊断上完全隐形。
+    try { sess._askPredictReject = sess._askPredictReject || "threw"; } catch {}
+  }
+  finally {
+    // clearTimeout 挪进 finally：原来只在成功返回后清，_fetchCompletionText 抛异常时
+    // 定时器留着，12 秒后对着一个早就结束的请求空放一次 abort。
+    try { if (_to) clearTimeout(_to); } catch {}
+    try { sess._askPredictInflight = false; } catch {} }
 }
 
 function _composerPrediction(sess) {
   if (!sess) return null;
   const run = sess._lastRunState || null;
-  // 举着问题等人回答时不给预测：Tab 出一句"回答上面的问题"再发出去毫无意义，
-  // 空输入框配原本的占位符才是对的提示。
-  if (run && run.outcome === "awaiting_user") return null;
+  // 举着问题等人回答时，**只有读过对话的 ask 档**有资格说话。
+  //
+  // 这里原来是无条件 `return null`，理由是「Tab 出一句『回答上面的问题』毫无意义」——
+  // 那个理由只对下面几个环境档成立（它们没看过对话，除了空话也给不出别的）。
+  // 而助手刚把 1/2/3 摆出来的那一刻，正是 ask 档最准的时候。所以不再一刀切：
+  // ask 档照常，环境档在下面被 `_envTiersAllowed` 挡住。
+  const _awaitingUser = !!(run && run.outcome === "awaiting_user");
 
   // 读过对话的那一档排在最前面。它一旦有话说，就一定比下面任何一档"环境暗示"更贴近
   // 用户此刻真正想打的字——后者根本没看过这段对话。
@@ -27213,6 +27369,24 @@ function _composerPrediction(sess) {
       && !_predictionAlreadyUsed(sess, ask.text)) {
     return { src: "ask", text: ask.text, send: ask.text };
   }
+
+  /*
+   * 环境档（run / plan / resume / ctx）什么时候**没有资格**说话。
+   *
+   * 这四档看的都是环境——报错数、git 脏不脏、开着哪个文件、目录空不空，
+   * **一个都没读过这段对话**。把它们当作 ask 档的降级替补是反的：
+   * 空输入框是中性的，一句不相干的预测是负分。用户报的正是这个形状 ——
+   * 聊了二十轮，输入框还在让他「解释 src/types.ts：整体职责、关键函数/类型…」，
+   * 而助手上一句在问「想先搞哪个？」。
+   *
+   * 判据是「这个会话里已经聊起来了没有」：一旦有过一来一回，用户此刻想打什么就该由
+   * 对话决定；ask 档给不出就**弃权**（什么都不显示），不拿环境档顶。
+   * 会话刚打开、还没说过话时环境档仍然有用 —— 那时它是唯一的线索，也正是同类产品
+   * （Claude Code 的「开场灰字」）唯一使用它的时机。
+   */
+  const _turns = ((sess.memory && sess.memory.recent) || []).length;
+  const _envTiersAllowed = !_awaitingUser && _turns < 2;
+  if (!_envTiersAllowed) return null;
 
   // 卡片行已经摆出来的那几条要跳过：两处读的是同一份建议，再说一遍就是同一屏里重复。
   const _onChips = (s) => (sess._chipSends instanceof Set) && sess._chipSends.has(s);
@@ -28120,7 +28294,7 @@ async function sendPrompt(text, attachments = [], readyConfig = null, opts = {})
   // 判据一个字不放宽：仍要 hasWorkspace + snapshotReady + 顶层非空，空目录（从零建）
   // 照旧不点 existing_project——那正是它和已有项目的分界。
   try {
-    const _factFlags = _executionFactSemanticFlags({ root: _curRoot, _writeLedger: null });
+    const _factFlags = _executionFactSemanticFlags({ root: _curRoot, _writeLedger: null }, { modelProfileMissing: !_routeSource });
     if (Object.keys(_factFlags).length) {
       config.ideSemanticProfile = _sessionStableSemanticProfile(sess, _ideSemanticProfile(_factFlags));
     }
@@ -51598,6 +51772,26 @@ function _cognitiveLegDeadlineMs(config) {
 // 这里必须单独写一份，是因为评审走的是自带 AbortController 的直接请求，
 // 不经过 _billableAiComplete —— 那条修复覆盖不到它（这一点我第一次就漏了）。
 // 超时不是约束：这条腿的截止时间是 stallMs，兜底 60 秒，够生成用。
+/*
+ * 「猜用户下一句」这一发要多少输出预算。
+ *
+ * 正文只要一句话（硬闸门卡 40 字 ≈ 70 token），可原来写死 `max_tokens: 60` ——
+ * 而**原生推理模型的推理内容和正文共用同一份输出预算**，推理先把 60 个全吃掉，
+ * 正文一个字都不剩。生产库 model_usage 近三天实测：
+ *   stealth/ox-alpha  265 次预测调用，188 次（71%）completion_tokens 顶满 60
+ *   glm-5.2           47 次，27 次（57%）顶满
+ *   glm-5.3 / opus-5  各约 23% 顶满
+ * 也就是说这个功能对原生推理的模型基本没工作过。
+ *
+ * 判据和 `_criticMaxTokens` / `_billableAiComplete` **同源**：看模型自己声明了不声明
+ * 推理档位，不看模型名单。余量共用 `_AUX_REASONING_HEADROOM_TOKENS`，不散新魔数。
+ * 抬预算不花钱：max_tokens 是**上限不是消费**，没生成的 token 不计费也不耗时。
+ */
+function _predictMaxTokens(model) {
+  const declaresReasoning = String(_thinkingProfileFor(model)?.kind || "none") !== "none";
+  return 160 + (declaresReasoning ? _AUX_REASONING_HEADROOM_TOKENS : 0);
+}
+
 function _criticMaxTokens(model) {
   const declaresReasoning = String(_thinkingProfileFor(model)?.kind || "none") !== "none";
   return 2000 + (declaresReasoning ? _AUX_REASONING_HEADROOM_TOKENS : 0);
@@ -52404,7 +52598,7 @@ function _applyFastRouteBehaviorIfLanded(run) {
 //   · 会话绑着的工作区根有 ready 的顶层快照 = 磁盘上确实有一个已有项目。
 //     对应 existingProject → 旗标 existing_project。
 // 画像是单调并集，所以这里给出的是**下限**：完整裁决/快通道随后照样把自己的旗标并进来。
-function _executionFactSemanticFlags(run) {
+function _executionFactSemanticFlags(run, opts = null) {
   const facts = {};
   if (!run || typeof run !== "object") return facts;
   if (Array.isArray(run._writeLedger) && run._writeLedger.length > 0) facts.implementation = true;
@@ -52420,22 +52614,47 @@ function _executionFactSemanticFlags(run) {
   // agent_engineering 挂载 0 次——那 13KB 的架构纪律与「优先用成熟主流方案」一次都没到过
   // 模型手里。所以这条兜底腿必须自己够得着自己的输入。
   //
-  // 判据一个字没放宽：仍然要 hasWorkspace + snapshotReady + 顶层非空。空目录（从零建）
-  // 照旧不点 existing_project——那正是它和已有项目的分界。
   let evidence = run._intentState?.context?.workspaceEvidence;
   if (!evidence && typeof _aiIntentWorkspaceEvidence === "function") {
     try { evidence = _aiIntentWorkspaceEvidence(run.root || ""); } catch { evidence = null; }
   }
-  if (evidence?.hasWorkspace && evidence?.snapshotReady && (evidence.topLevel || []).length) {
+  // 「已有项目」的两种证据**时效性完全不同**，原来两个都要，于是有效判据变成了时效短的那个：
+  //   · topLevel 是目录快照，_agentContextCache 带 5 分钟 TTL；
+  //   · stack 是 package.json / Cargo.toml 扫出来的技术栈，_projectStacks 是模块级 Map，
+  //     没有任何 TTL，且扫不出栈事实时会被显式 delete。
+  // 而这条腿存在的理由恰恰是**会话第一发**——那一刻目录快照必然是冷的。线上实测
+  // （2026-08-23，6 小时 383 次装配）：整条腿只点亮 7 次（1.8%），其余全输给了这道 TTL。
+  //
+  // 分界一个字没动：空目录（从零建）照旧不点。它既没有 topLevel，也扫不出栈——识别出的
+  // 技术栈比目录清单**更强**地证明这是个真项目，不是更弱。
+  const stackKnown = !!(evidence?.stack
+    && (evidence.stack.lang || evidence.stack.framework || evidence.stack.packageManager));
+  if (evidence?.hasWorkspace
+      && ((evidence.snapshotReady && (evidence.topLevel || []).length) || stackKnown)) {
     facts.existingProject = true;
   }
+  // engineering 这面旗也必须有**事实来源**，否则分类器一挂就等于纪律归零。
+  //
+  // 它在网关那边门着两样东西：agent_engineering（13KB 架构纪律 +「优先用成熟主流方案」）
+  // 和整个 4.3MB 专业语料的自动注入（engineering_intent 同时是 auto_knowledge 的判据）。
+  // 而它此前唯一的来源是模型裁决——线上同一窗口里免费线被上游限流 159 次，裁决拿不回来，
+  // 于是 317/383（83%）的装配跑在**零架构纪律、零语料**上；连那点亮的 7 次也只有
+  // existing_project 一面旗，照样够不着 engineering。这就是「写东西不用主流库」的机制成因。
+  //
+  // 判据不是猜意图，是两个**已经发生**的事实叠加：① 工作区里确实开着一个项目；
+  // ② 这一轮模型画像没到。模型到了就以模型为准——哪怕它判的是「这不是工程活」，
+  // 事实腿也绝不覆盖它；只在模型缺席时兜底。
+  //
+  // 忠实度有实测：同窗口模型判出画像的 66 次里，engineering 亮了 59 次（89.4%）。
+  // 模式闸在网关侧（mode == "agent" 才挂载），这里不重复判。
+  if (opts?.modelProfileMissing && evidence?.hasWorkspace) facts.projectEngineering = true;
   return facts;
 }
 
 // 把执行事实并进请求头。没有任何事实时一个字都不发（不许凭空造旗标）。
 function _applyExecutionFactProfile(run, config, session) {
   if (!run || !config) return false;
-  const facts = _executionFactSemanticFlags(run);
+  const facts = _executionFactSemanticFlags(run, { modelProfileMissing: !session?._semanticProfileFromModel });
   if (!Object.keys(facts).length) return false;
   const header = _ideSemanticProfile(facts);
   const flags = header.slice(header.indexOf(":") + 1).split(",").filter(Boolean);

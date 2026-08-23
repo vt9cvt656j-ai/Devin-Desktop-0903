@@ -15,7 +15,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 // 从 main.js（无导出的浏览器单文件）里按名字抠真源码：全仓唯一那份提取器。
-import { fnSource as grab } from "./helpers/source.mjs";
+import { fnSource as grab, CODE as SRC_CODE, load } from "./helpers/source.mjs";
 
 const SRC = fs.readFileSync("src/main.js", "utf8");
 
@@ -210,9 +210,14 @@ test("模型叙述自己在沉默也要拦——提示词说了它照样会漏",
   assert.equal(rej("无法预测用户意图"), "meta_text");
 });
 
-test("长度按中文卡 32 字，不是照搬英文那套 100 字符", () => {
+test("长度按中文卡 40 字，不是照搬英文那套 100 字符", () => {
   const rej = rejectAsk();
-  assert.equal(rej("帮我把这个项目从头到尾重新梳理一遍，包括技术栈选型、目录结构、核心模块职责和数据流"), "too_long");
+  // 夹具要留出真实余量。闸门从 32 放宽到 40 之后这条只剩 1 个字 —— 下次谁再动这个数，
+  // 撞红的会是这条看起来跟他无关的测试。加长到 52 字，余量 12。
+  assert.equal(rej("帮我把这个项目从头到尾重新梳理一遍，包括技术栈选型、目录结构、核心模块职责、数据流和各种边界情况"), "too_long");
+  // 下边界也要钉：40 字整刚好放行，41 字被拒。只钉上限的话，闸门被人调成 10 也照样绿。
+  assert.equal(rej("先把依赖装好再跑一遍类型检查确认全绿然后生成产物给我看一眼结果对不对呀"[0].repeat(40)), "");
+  assert.equal(rej("啊".repeat(41)), "too_long");
   assert.equal(rej("先把自动化框架发到 crates.io。然后再补文档。"), "multiple_sentences",
     "用户不会一次打两句");
 });
@@ -233,6 +238,233 @@ test("对话往前走了，旧预测就作废", () => {
 test("被拒的原因要记下来，「为什么这儿没有预测」得答得出来", () => {
   assert.match(SRC, /sess\._askPredictReject = why/);
   assert.match(SRC, /sess\._askPredictReject = "already_sent"/);
+});
+
+test("助手举着问题等回答时，ask 档必须照常工作——那是预测最准的一刻", () => {
+  /*
+   * 用户截图里助手结尾是「想先搞哪个？我直接帮你实现。」，输入框里却是
+   * 「解释 src/types.ts：整体职责、关键函数/类型、数据流…」。
+   *
+   * 原因是 awaiting_user 把**整档**关掉了：`_maybeSuggestNext` 不发起预测，
+   * `_composerPrediction` 开头直接 return null。那道闸的理由（举着问题时预测出
+   * 「回答上面的问题」毫无意义）只对**环境档**成立 —— 它们没读过对话，除了空话给不出
+   * 别的。而对读过对话的 ask 档，助手把 1/2/3 摆出来正是它最准的时候。
+   */
+  const src = SRC_CODE;
+  // 触发点不再按 awaiting_user 跳过。
+  const suggest = grab("_maybeSuggestNext", { code: true });
+  assert.ok(!/outcome !== "awaiting_user"[\s\S]{0,120}_predictNextAsk/.test(suggest),
+    "awaiting_user 时仍然不发起预测——最贵的那个场景还是黑的");
+  assert.match(suggest, /void _predictNextAsk\(sess\)/, "根本不发起预测了");
+
+  // 渲染侧：awaiting_user 时 ask 档可命中，环境档被挡。
+  const pick = grab("_composerPrediction", { code: true });
+  assert.ok(!/outcome === "awaiting_user"\) return null/.test(pick),
+    "还是一刀切 return null，ask 档一起被挡掉了");
+  assert.match(pick, /_awaitingUser/, "没有把闸门收窄成只挡环境档");
+
+  // 行为验证：awaiting_user + 有 ask 预测 → 出 ask；没有 ask 预测 → 弃权（不掉到环境档）。
+  const mk = (ask) => ({
+    id: "s", memory: { recent: [{ role: "user" }, { role: "assistant" }] },
+    _lastRunState: { outcome: "awaiting_user" },
+    _askPredict: ask ? { text: "先搞 1 和 6", turnKey: 2 } : null,
+    _recentSent: [], _planSteps: [],
+  });
+  const predict = load("_composerPrediction", {
+    _runStateNextActionSuggestions: () => [{ label: "环境档不该出现", send: "环境档不该出现" }],
+    _dynamicChatChips: () => [{ label: "解释 src/types.ts", send: "解释 src/types.ts" }],
+    _predictionAlreadyUsed: () => false,
+  });
+  assert.equal(predict(mk(true))?.src, "ask", "举着问题时 ask 档没出来");
+  assert.equal(predict(mk(false)), null, "ask 档没话说时掉到环境档了——该弃权");
+});
+
+test("聊起来之后，环境档不许顶替 ask 档——宁可空着也别给一句不相干的", () => {
+  /*
+   * 「解释 src/types.ts」来自 `ctx` 档（`_dynamicChatChips`），它只看**打开的文件**，
+   * 一个字的对话都没读过。把它当 ask 档的降级替补是反的：空输入框是中性的，
+   * 一句不相干的预测是负分 —— 用户聊了二十轮，输入框还在让他解释一个碰巧打开的文件。
+   *
+   * 会话刚打开、还没说过话时环境档仍然有用（那时它是唯一线索）。
+   */
+  const predict = load("_composerPrediction", {
+    _runStateNextActionSuggestions: () => [{ label: "跑一遍验证", send: "跑一遍验证" }],
+    _dynamicChatChips: () => [{ label: "解释 src/types.ts", send: "解释 src/types.ts" }],
+    _predictionAlreadyUsed: () => false,
+  });
+  const sess = (turns) => ({
+    id: "s", memory: { recent: Array.from({ length: turns }, () => ({ role: "user" })) },
+    _lastRunState: null, _askPredict: null, _recentSent: [], _planSteps: [],
+  });
+  assert.equal(predict(sess(0))?.src, "run", "会话刚打开时环境档该照常出——那是唯一线索");
+  assert.equal(predict(sess(6)), null, "聊起来之后环境档还在顶替 ask 档");
+  // 源码侧钉住判据本身，免得阈值被人悄悄调大回去。
+  const pick = grab("_composerPrediction", { code: true });
+  assert.match(pick, /_envTiersAllowed = !_awaitingUser && _turns < 2/, "环境档的准入判据被改了");
+  assert.match(pick, /if \(!_envTiersAllowed\) return null;/, "判据算了却没用来挡");
+});
+
+test("提示词要给出字数、给弃权出口、给例子——软要求和硬闸门必须对齐", () => {
+  const p = SRC_CODE.slice(SRC_CODE.indexOf("const _ASK_PREDICT_SYSTEM"),
+                           SRC_CODE.indexOf("const _ASK_PREDICT_SYSTEM") + 4000);
+  // 硬闸门卡 40 字，提示词必须写出一个数（此前只说「越短越好」，模型无从遵守）。
+  assert.match(p, /30 字以内/, "提示词没有给出字数上限——模型不知道会被 40 字硬毙");
+  // 弃权出口：没有它，模型必然硬编一句，然后被硬闸门拒掉，再触发兜底降级。
+  assert.match(p, /拿不准就输出空/, "没有给模型弃权出口");
+  assert.match(p, /空是\*\*合法且正确\*\*的答案/, "没有说清空是正确答案而不是失败");
+  // few-shot：这类任务例子比规则管用，而且必须覆盖「助手提问→选编号」这个最高价值场景。
+  assert.match(p, /## 例子/, "没有 few-shot");
+  assert.match(p, /先搞 1 和 6/, "缺「助手提问 → 用户回编号」这个最贵的例子");
+  assert.match(p, /→ （空）/, "缺「该弃权」的反例");
+  assert.match(p, /第一人称对助手说话/, "没有明确用户口吻");
+});
+
+test("「助手在等你拿主意」要喂给模型，而且判据只用已有的两个", () => {
+  /*
+   * 这是整个预测里信息量最大的一条，此前完全没喂。模型只拿到一段扁平的
+   * `用户：/助手：` 文本，得自己从里面读出「这是在问我」—— 助手那段一长就读不出来。
+   *
+   * 判据不新造：`run.outcome === "awaiting_user"`（调了 ask_user，确凿的执行事实）
+   * 和 `_detectChoiceOptions`（选项写在正文里时的保守检测，卡片行用的就是它）。
+   * 两个都不命中就什么都不加 —— 宁可不提示，也不要拿正则猜「这句是不是问句」。
+   */
+  const fn = grab("_predictNextAsk", { code: true });
+  assert.match(fn, /_detectChoiceOptions\(/, "没有复用已有的选项检测");
+  assert.match(fn, /outcome === "awaiting_user"/, "没有用 ask_user 这个执行事实");
+  assert.match(fn, /content: convo \+ _cue/, "线索算了却没喂进请求");
+  // 不许自己造问句正则——那正是这个仓库反复否掉的「拿预测代替事实」。
+  assert.ok(!/[？?]\s*\$\/|endsWith\("？"\)/.test(fn),
+    "自己拿正则猜问句了，该用已有的两个执行事实判据");
+});
+
+test("硬过滤的极性：用户对助手说「你…吗？」「我先…」是最常见的追问，不是要拦的东西", () => {
+  /*
+   * 这一档预测的是**用户**会打的话，用户嘴里的「你」指的正是助手。
+   * 两条规则原来的判据把这层关系搞反了，实测：
+   *   question_to_user  `/^(你|您|要不要|需要我)/` + 问号 → 六句自然追问 6/6 全杀
+   *   assistant_voice   含「我来/我先/我会」→「我先跑一下测试」这种用户第一人称也杀
+   * 而这恰恰是一轮回复之后最常见的两种句式，也就是这个功能唯一有价值的场景。
+   */
+  const rej = rejectAsk();
+  for (const ok of [
+    "你能把它改成 TypeScript 吗？", "你刚才说的第二点能展开讲讲吗？",
+    "你确定这样不会破坏缓存吗？", "你说的那个文件在哪？",
+    "要不要顺便把测试也加上？", "需要我提供完整报错吗？",
+    "我来试试你说的第二个方案", "我先跑一下测试", "我会不会漏了什么？",
+  ]) assert.equal(rej(ok), "", `这是用户真会打的话，不该拦：${ok}`);
+
+  // 真正的助手口吻仍要拦住——放宽不是拆掉。
+  for (const [bad, why] of [
+    ["让我看看", "assistant_voice"], ["我可以帮你重构一下", "assistant_voice"],
+    ["接下来我会先读一遍代码", "assistant_voice"],
+    ["Let me check that file", "assistant_voice"], ["I'll fix it now", "assistant_voice"],
+    ["你想先做哪个？", "question_to_user"], ["您希望我从哪里开始？", "question_to_user"],
+  ]) assert.equal(rej(bad), why, `这个该拦却放行了：${bad}`);
+});
+
+test("喂给模型的助手消息要取尾巴——收尾那句问话在结尾，截头等于没喂", () => {
+  /*
+   * agent 轮写进 recent 的是整轮叙事的拼接，一轮跑二十步可以上万字。
+   * 原来一律 slice(0, 700) 截头 —— 喂进去的是这一轮**刚开始**在做什么，
+   * 而用户要回应的是助手**最后**说的那句。截图里「想先搞哪个？我直接帮你实现。」
+   * 正好在结尾，一个字都没进去。
+   */
+  const fn = grab("_predictNextAsk", { code: true });
+  assert.match(fn, /who === "助手" \? "…" \+ body\.slice\(-700\)/,
+    "助手消息还是截头——收尾那句问话喂不进去");
+  assert.match(fn, /body\.slice\(0, 700\)/, "用户消息不该改成截尾，他的诉求在开头");
+  assert.ok(!/\.slice\(0, 700\)`/.test(fn), "还有一处无差别截头");
+});
+
+test("单飞闸不能自己把自己拆了", () => {
+  /*
+   * `if (inflight) return;` 原来落在 try 里，而 finally 无条件清标志 ——
+   * 被挡住的那次 return 之后照样跑 finally，把**正在飞的那次**的标志清成了 false，
+   * 第三次调用就和第一次并发。两条都写 _askPredict，谁后落谁赢。
+   */
+  const fn = grab("_predictNextAsk", { code: true });
+  const gateAt = fn.indexOf("_askPredictInflight) return;");
+  const tryAt = fn.indexOf("try {");
+  assert.ok(gateAt > 0 && tryAt > gateAt, "单飞闸还在 try 里面——finally 会把在飞的那次清掉");
+  // 定时器要在 finally 清，否则抛异常那条路上它会空放一次 abort。
+  assert.match(fn, /finally \{[\s\S]{0,200}clearTimeout\(_to\)/, "定时器没在 finally 里清");
+});
+
+test("预测的输出预算要按模型能力给，60 对原生推理模型等于零输出", () => {
+  /*
+   * 生产库 model_usage 近三天实测（预测调用靠和主轮共享 request_id 识别）：
+   *   stealth/ox-alpha  265 次，188 次（71%）completion_tokens 顶满 60
+   *   glm-5.2           47 次，27 次（57%）顶满
+   * 原生推理模型的推理和正文共用同一份输出预算，60 全被推理吃掉，正文一个字不剩。
+   */
+  // 读**剥掉注释**的源码。这几条断言禁的写法在注释里被逐字引用过（说明为什么不能那么写），
+  // 直接对原文断言会被自己的注释喂到 —— 这个仓库有前科，一律先剥注释。
+  const src = SRC_CODE.slice(SRC_CODE.indexOf("async function _predictNextAsk"));
+  assert.ok(!/max_tokens:\s*60\b/.test(src.slice(0, 6000)),
+    "又写死 max_tokens: 60 了——原生推理模型会零输出");
+  assert.match(src.slice(0, 6000), /max_tokens: _predictMaxTokens\(_predictCfg\.model\)/,
+    "预算没有按模型能力算");
+
+  // 判据必须是「模型自己声明了推理档位」，不是模型名单——和 _criticMaxTokens 同源。
+  // 取样必须**只**框住 _predictMaxTokens 的函数体。它后面紧挨着 _criticMaxTokens，
+  // 那个函数有一模一样的能力声明判据行 —— 固定长度的窗口会溢进去，把判据换成模型名单
+  // 也照样绿（变异实测漏网）。用 fnSource 按声明取。
+  const budget = grab("_predictMaxTokens", { code: true });
+  assert.match(budget, /_thinkingProfileFor\(model\)\?\.kind/,
+    "预算判据不是模型的能力声明——换成模型名单，新模型上来又是零输出");
+  assert.ok(!/\/[^/\n]*ox-alpha[^/\n]*\//.test(budget) && !/includes\(/.test(budget),
+    "又按模型名单判了");
+  assert.match(budget, /_AUX_REASONING_HEADROOM_TOKENS/,
+    "余量没有复用共享常量，又散了一个新魔数");
+
+  // temperature：这是单点预测不是创作，和同文件其它有界辅助调用一致取 0。
+  assert.ok(!/temperature:\s*0\.3/.test(src.slice(0, 6000)), "temperature 还是 0.3");
+  assert.match(src.slice(0, 6000), /temperature: 0,/, "temperature 不是 0");
+});
+
+test("预测必须显式关思考，否则网关把它升级成 effort=high + max_tokens 40000", () => {
+  /*
+   * 这是 Claude 那条路上「预测从来不出现」的真正原因，而且和 token 饥饿是**两回事**。
+   *
+   * 网关 `thinking_effort_for(body)` 在客户端什么思考字段都不发时，结尾是
+   * `.or(Some("high"))`；`thinking_on` 一旦为真，max_tokens 被抬到 40000。
+   * 于是一次「猜一句话」变成深思考大请求，然后被期限掐死。
+   * 生产数据对得上：claude-fable-5 三天 70 组请求，预测行 0 条。
+   */
+  const src = SRC_CODE.slice(SRC_CODE.indexOf("async function _predictNextAsk"), SRC_CODE.indexOf("async function _predictNextAsk") + 8000);
+  assert.match(src, /reasoning_effort: "off"/, "没有显式关思考——网关会补成 high");
+
+  // **只能**用 reasoning_effort:"off"。分叉前那道守卫判的是 `thinking` 键在不在
+  // （不看 type），发 {type:"disabled"} 会把 max_tokens 抬到 32000——关思考反而放大预算。
+  assert.ok(!/thinking:\s*\{\s*type:\s*"disabled"\s*\}/.test(src),
+    "发了 thinking:{type:disabled}——那会把 max_tokens 抬到 32000");
+
+  // 只对网关发：自定义端点的上游未知，塞一个不认的枚举会 400，把功能整个打死。
+  assert.match(src, /_predictCfg\.viaGateway \? \{ reasoning_effort: "off" \} : \{\}/,
+    "对自定义端点也发了这个枚举，可能 400");
+
+  // 网关那两条判据本身也钉一下，免得服务端改了这边毫不知情。
+  const gw = fs.readFileSync(new URL("../../server/src/models.rs", import.meta.url), "utf8");
+  assert.match(gw, /\.or\(Some\("high"\)\)/,
+    "网关的默认档变了——如果不再默认 high，这里的 off 就该重新评估");
+  assert.match(gw, /is_some_and\(\|e\| !e\.is_empty\(\) && e != "off"\)/,
+    "网关不再把 off 排除在 has_thinking 之外了——那 off 也会触发 32000 地板");
+});
+
+test("期限要和预算一起抬，只改一半是把顶满上限换成静默超时", () => {
+  const src = SRC_CODE.slice(SRC_CODE.indexOf("async function _predictNextAsk"), SRC_CODE.indexOf("async function _predictNextAsk") + 8000);
+  // 钉「算出来的期限**真的被用上**」，不是「算出来了」。只验前者的话，把 setTimeout 的
+  // 第二个参数改回 12000、让 _deadlineMs 变成死值，测试照样绿（变异实测漏网）。
+  assert.match(src, /_cognitiveLegDeadlineMs\(_predictCfg\)/, "没复用已有的分档期限助手");
+  assert.match(src, /ctrl\.abort\(\); \}, _deadlineMs\)/,
+    "算出来的期限没被 setTimeout 用上——还是写死的那个数");
+  assert.ok(!/\}, 12000\)/.test(src), "还是写死 12 秒——抬了预算之后必然全部超时");
+
+  // 失败路径要留痕，否则「为什么这儿没有预测」在最常见的两种失败上是空的。
+  assert.match(src, /_askPredictReject = _timedOut \? "timeout" : "request_failed"/,
+    "网络失败/非 200 没有记录原因");
+  assert.match(src, /_askPredictReject = sess\._askPredictReject \|\| "threw"/,
+    "抛异常（含 abort）没有记录原因");
 });
 
 test("预测不能卡住收尾——只后台跑，不 await", () => {
