@@ -2896,11 +2896,12 @@ function _sanitizeProviderMessages(messages) {
   const source = Array.isArray(messages) ? messages : [];
   return source.map((message) => {
     if (!message || typeof message !== "object" || Array.isArray(message)) return message;
-    // `model` 记的是「这条历史当初是哪个模型答的」，纯展示用的记账，不是消息协议的一部分。
-    // 这里是**排除法**不是白名单，未知字段会原样发给上游，所以必须显式摘掉 —— 和
-    // reasoning 同一个道理、同一个位置。两条请求路径（chat / agent）都过这个函数。
-    const { reasoning, _ideMeta, model: _uiModelTag, ...providerMessage } = message;
-    void _uiModelTag;
+    // `model`（这条历史当初是哪个模型答的）和 `feedback`（用户点的赞/踩）都是**展示用**
+    // 的记账，不是消息协议的一部分。这里是**排除法**不是白名单，未知字段会原样发给上游，
+    // 所以必须显式摘掉 —— 和 reasoning 同一个道理、同一个位置。
+    // 两条请求路径（chat / agent）都过这个函数，这里是它们共同的最后一道出线口。
+    const { reasoning, _ideMeta, model: _uiModelTag, feedback: _uiFeedback, ...providerMessage } = message;
+    void _uiModelTag; void _uiFeedback;
     if (message.role === "assistant" && typeof reasoning === "string") {
       providerMessage.content = _withoutLegacyReasoningSummary(message.content, reasoning);
     }
@@ -17078,6 +17079,7 @@ async function _renderMsgRange(session, from, to, options = {}) {
         // addMessage 区分「历史重画」和「实时那一轮」的唯一判据，漏了就退回
         // currentModel()，历史又会被当前选择重刷一遍。
         modelId: m.role === "assistant" ? String(m.model || "") : "",
+        feedback: m.role === "assistant" ? String(m.feedback || "") : "",
       });
       if (body && m.role === "assistant" && m.reasoning && typeof m.reasoning === "string" && m.reasoning.trim()) {
         const card = document.createElement("div");
@@ -19945,6 +19947,184 @@ async function _truncateFromUserMessage(sess, wrap) {
 }
 // 事件委托：整个文档监听一次 dblclick，命中任何用户气泡都能进入编辑——不依赖
 // 每个气泡单独绑定（任何渲染路径/任何时期创建的气泡都生效）。
+// ── 每条回复底下的操作条 ────────────────────────────────────────────────────
+//
+// 全部走**事件委托**，不给按钮单独绑监听。原因是 HTML 快照：会话恢复走的是
+// `container.innerHTML = session._htmlSnapshot`，节点回来了、监听器一个都不在。
+// 逐个绑定的话，重启之后这排按钮全是死的 —— 而它们看上去完全正常。
+// 页面上双击编辑那条早就是这么做的，这里沿用。
+const _MSG_ACT_ICONS = {
+  up: '<path d="M7 10v9H4a1 1 0 0 1-1-1v-7a1 1 0 0 1 1-1h3zm0 0 4.2-7.1a1 1 0 0 1 1.8.5V8h4.6a1.6 1.6 0 0 1 1.6 1.9l-1.3 7A1.6 1.6 0 0 1 16.3 18H7"/>',
+  down: '<path d="M7 14V5H4a1 1 0 0 0-1 1v7a1 1 0 0 0 1 1h3zm0 0 4.2 7.1a1 1 0 0 0 1.8-.5V16h4.6a1.6 1.6 0 0 0 1.6-1.9l-1.3-7A1.6 1.6 0 0 0 16.3 6H7"/>',
+  copy: '<rect x="9" y="9" width="11" height="11" rx="2"/><path d="M6 15H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h8a2 2 0 0 1 2 2v1"/>',
+  stats: '<path d="M5 20V11m7 9V4m7 16v-6"/>',
+  more: '<circle cx="5.5" cy="12" r="1.4"/><circle cx="12" cy="12" r="1.4"/><circle cx="18.5" cy="12" r="1.4"/>',
+};
+function _msgActButton(act, label, on = false) {
+  return `<button type="button" class="msg__act${on ? " is-on" : ""}" data-act="${act}"`
+    + ` title="${_escAttr(label)}" aria-label="${_escAttr(label)}"${on ? ' aria-pressed="true"' : ""}>`
+    + `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"`
+    + ` stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${_MSG_ACT_ICONS[act]}</svg></button>`;
+}
+function _buildMsgActions(feedback = "") {
+  const bar = document.createElement("div");
+  bar.className = "msg__acts";
+  bar.innerHTML = `<div class="msg__acts-side">`
+    + _msgActButton("up", "有帮助", feedback === "up")
+    + _msgActButton("down", "没帮助", feedback === "down")
+    + `</div><div class="msg__acts-side">`
+    + _msgActButton("copy", "复制回复")
+    + _msgActButton("stats", "用量与耗时详情")
+    + _msgActButton("more", "更多")
+    + `</div>`;
+  return bar;
+}
+function _sessionForNode(node) {
+  try { return _chatSessions.find((s) => s && s.container && s.container.contains(node)) || null; }
+  catch { return null; }
+}
+/** 这条气泡对应的那条 transcript 记录（可写）。没有 sequence 就没有可写的记录。 */
+function _msgRecordFor(session, wrap) {
+  const seq = Number(wrap?.dataset?.transcriptSequence);
+  if (!session?.memory || !Number.isFinite(seq) || seq < 0) return null;
+  try {
+    const offset = Math.max(0, Number(session.memory.transcriptOffset) || 0);
+    const entries = session.memory.transcriptEntries?.() || session.memory.recent || [];
+    const record = entries[seq - offset];
+    return record && typeof record === "object" ? { record, sequence: seq } : null;
+  } catch { return null; }
+}
+/**
+ * 点赞/点踩：落到消息记录上，和 `model` 走同一条持久化。
+ *
+ * 目前**只存在本地**——网关没有反馈接口（查过 server/src/main.rs，一条路由都没有）。
+ * 这里不假装它上报了：存下来、显示出来，仅此而已。日志那边同 sequence 重写即更新
+ * （Rust 侧 insert_event_tx 对已存在的 sequence 走 UPDATE），所以不需要新的变更类型。
+ */
+function _setMessageFeedback(wrap, kind) {
+  const session = _sessionForNode(wrap);
+  const found = _msgRecordFor(session, wrap);
+  const next = wrap._feedback === kind ? "" : kind;   // 再点一次 = 取消
+  wrap._feedback = next;
+  for (const act of ["up", "down"]) {
+    const btn = wrap.querySelector(`.msg__act[data-act="${act}"]`);
+    if (!btn) continue;
+    btn.classList.toggle("is-on", next === act);
+    if (next === act) btn.setAttribute("aria-pressed", "true"); else btn.removeAttribute("aria-pressed");
+  }
+  if (!found) return;                                  // 没落过盘的临时气泡：只改样子
+  if (next) found.record.feedback = next; else delete found.record.feedback;
+  try { _queueTranscriptMutation(session, { kind: "append", sequence: found.sequence, message: found.record }); } catch {}
+  try { saveChatHistory({ immediate: true }); } catch {}
+}
+/** 复制这条回复的原文。优先记录里的原始 markdown，其次退回渲染出来的可见文本。 */
+async function _copyMessageText(wrap) {
+  const session = _sessionForNode(wrap);
+  const found = _msgRecordFor(session, wrap);
+  let text = typeof found?.record?.content === "string" ? found.record.content : "";
+  if (!text) {
+    // 退路要**排除**操作条和统计行自己的文字，否则复制出来带上 "18s 模型 5.4s 复制"。
+    const body = wrap.querySelector(".msg__body");
+    const clone = body ? body.cloneNode(true) : null;
+    clone?.querySelectorAll(".turn-stats, .msg__acts, .msg__stats-detail").forEach((n) => n.remove());
+    text = (clone?.innerText || "").trim();
+  }
+  if (!text) { showToast("这条没有可复制的内容"); return; }
+  try { await navigator.clipboard.writeText(text); showToast("已复制"); }
+  catch { showToast("复制失败：系统剪贴板不可用"); }
+}
+/** 展开/收起用量与耗时详情。内容本来就算好了，此前只活在统计行的 title 里，鼠标不悬停就看不到。 */
+function _toggleMessageStatsDetail(wrap) {
+  const main = wrap.querySelector(".msg__main") || wrap;
+  const existing = main.querySelector(":scope > .msg__stats-detail");
+  if (existing) { existing.remove(); return; }
+  const stats = wrap.querySelector(".turn-stats");
+  const detail = String(stats?.title || "").trim();
+  const box = document.createElement("div");
+  box.className = "msg__stats-detail";
+  box.textContent = detail || "这一轮没有留下用量与耗时记录（多为从历史恢复的旧消息）。";
+  const bar = main.querySelector(":scope > .msg__acts");
+  if (bar) main.insertBefore(box, bar); else main.appendChild(box);
+}
+
+/**
+ * 「更多」菜单。只放**真的做得到**的两件事，都复用编辑重发那套截断机制：
+ *
+ *   重新生成 —— 回到产出这条回复的那条用户消息，原样再发一次（附件一起带回去，
+ *               `_truncateFromUserMessage` 的返回值里就有）。
+ *   删除这条及之后 —— 只截断，不重发。
+ *
+ * 两件事都会丢掉这条之后的对话，所以先说清再动手。
+ */
+function _openMsgMoreMenu(wrap, anchorBtn) {
+  document.querySelector(".msg__more-menu")?.remove();
+  const sess = _sessionForNode(wrap);
+  const prevUser = (() => {
+    for (let n = wrap.previousElementSibling; n; n = n.previousElementSibling) {
+      if (n.classList?.contains("msg") && n.classList.contains("user")) return n;
+    }
+    return null;
+  })();
+  const menu = document.createElement("div");
+  menu.className = "menu msg__more-menu";
+  const item = (act, label, hint) =>
+    `<div class="menu__item" data-more="${act}"><span class="name">${_escHtml(label)}</span>`
+    + (hint ? `<span class="meta">${_escHtml(hint)}</span>` : "") + `</div>`;
+  menu.innerHTML = item("regen", "重新生成", prevUser ? "" : "找不到对应的提问")
+    + item("delete", "删除这条及之后");
+  const r = anchorBtn.getBoundingClientRect();
+  menu.style.position = "fixed";
+  menu.style.zIndex = "10030";
+  menu.style.bottom = "auto";
+  menu.style.top = Math.round(r.bottom + 6) + "px";
+  menu.style.left = Math.round(Math.max(8, Math.min(r.right - 190, window.innerWidth - 198))) + "px";
+  menu.style.minWidth = "190px";
+  document.body.appendChild(menu);
+  const close = () => { menu.remove(); document.removeEventListener("mousedown", onAway, true); };
+  const onAway = (e) => { if (!menu.contains(e.target)) close(); };
+  setTimeout(() => document.addEventListener("mousedown", onAway, true), 0);
+  menu.addEventListener("click", async (e) => {
+    const row = e.target.closest?.("[data-more]");
+    if (!row) return;
+    const act = row.dataset.more;
+    close();
+    if (!sess) { showToast("找不到这条消息所属的会话"); return; }
+    if (sess.streaming) { showToast("正在运行中，先停止当前回复"); return; }
+    if (act === "regen") {
+      if (!prevUser) { showToast("找不到产出这条回复的提问，无法重新生成"); return; }
+      try {
+        const removed = await _truncateFromUserMessage(sess, prevUser);
+        const text = String(removed?.content ?? prevUser._rawText ?? "");
+        if (!text.trim()) { showToast("那条提问是空的，没法重发"); return; }
+        sendPrompt(text, Array.isArray(removed?.attachments) ? removed.attachments.slice() : []);
+      } catch (error) { showToast("重新生成失败：" + String(error?.message || error)); }
+      return;
+    }
+    if (act === "delete") {
+      // 截断的判据是「从**某条用户消息**开始丢」。删一条助手回复必然连带它的提问，
+      // 说清楚再做，别让用户以为只少了一条。
+      if (!prevUser) { showToast("这条之前没有提问，无法单独删除"); return; }
+      if (!confirm("将删除这条提问、这条回复，以及它们之后的全部对话。继续？")) return;
+      try { await _truncateFromUserMessage(sess, prevUser); }
+      catch (error) { showToast("删除失败：" + String(error?.message || error)); }
+    }
+  });
+}
+
+// 操作条的唯一监听器（委托，见 _buildMsgActions 上面那段：HTML 快照恢复不带监听器）。
+document.addEventListener("click", (e) => {
+  const btn = e.target?.closest?.(".msg__act");
+  if (!btn) return;
+  const wrap = btn.closest(".msg.assistant");
+  if (!wrap) return;
+  e.preventDefault();
+  const act = btn.dataset.act;
+  if (act === "up" || act === "down") _setMessageFeedback(wrap, act);
+  else if (act === "copy") void _copyMessageText(wrap);
+  else if (act === "stats") _toggleMessageStatsDetail(wrap);
+  else if (act === "more") _openMsgMoreMenu(wrap, btn);
+});
+
 document.addEventListener("dblclick", (e) => {
   const t = e.target;
   if (!t || !t.closest) return;
@@ -20020,6 +20200,10 @@ function addMessage(role, text, forSession, attachments = [], options = {}) {
     main.querySelector(".msg__who span").textContent = id ? modelLabel(id) : t("assistant.name");
     wrap.append(avatar, main);
     body = main.querySelector(".msg__body");
+    // 操作条挂在 .msg__main 里、正文**之后**：和文字左对齐（避开头像那一列），
+    // 也就落在统计行下面。点赞状态从记录里带出来，重画历史时不会丢。
+    wrap._feedback = String(options?.feedback || "");
+    main.appendChild(_buildMsgActions(wrap._feedback));
     if (text) {
       const hasToolMarkers = /\[TOOL:(read_file|write_file|run_cmd|list_dir)\]|^📄\s|^📎\s/m.test(text);
       const hasMultiCodeBlocks = (text.match(/```/g) || []).length >= 4;

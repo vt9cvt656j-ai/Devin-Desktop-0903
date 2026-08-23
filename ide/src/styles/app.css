@@ -5576,6 +5576,58 @@ img.settings-dropdown__avatar--filled { object-fit: cover; }
 /* The user's label is now their account email — the base .msg__who is small-caps (for the generic
    "你"), which was UPPER-CASING the email (…@qq.com → …@QQ.COM). Render it normal-case + readable. */
 .msg.user .msg__who { font-size: 12px; font-weight: 600; letter-spacing: 0; text-transform: none; }
+/* ── 每条回复底下的操作条 ─────────────────────────────────────────────
+   **常显**，只是常态压得很淡，鼠标移到这条消息上才提到正常对比度。
+   一开始写的是 opacity:0 + hover 才现身，实测有问题：opacity 为 0 的元素照样接点击，
+   于是每条消息底下都藏着一排**看不见却点得到**的按钮 —— 手滑就点了赞、甚至开了菜单。
+   常显还有两个好处：触摸屏没有 hover，藏起来等于永远够不到；用户也不必先猜它在哪。 */
+.msg__acts {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-top: 6px;
+  opacity: .45;
+  transition: opacity .14s ease;
+}
+.msg.assistant:hover .msg__acts,
+.msg__acts:focus-within { opacity: 1; }
+.msg__acts-side { display: flex; align-items: center; gap: 2px; }
+.msg__act {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 26px;
+  height: 26px;
+  padding: 0;
+  border: none;
+  border-radius: 7px;
+  background: transparent;
+  color: var(--text-dim);
+  cursor: pointer;
+  transition: background .12s ease, color .12s ease;
+}
+.msg__act svg { width: 15px; height: 15px; }
+.msg__act:hover { background: var(--line); color: var(--text); }
+.msg__act:active { background: var(--line-strong); }
+.msg__act.is-on { color: var(--accent); }
+.msg__act:focus { outline: none; }
+.msg__act:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+/* 用量与耗时详情：内容本来就算好了，此前只活在统计行的 title 里。 */
+.msg__stats-detail {
+  margin-top: 6px;
+  padding: 8px 10px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--panel-2);
+  color: var(--text-dim);
+  font-size: 11.5px;
+  line-height: 1.55;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.msg__more-menu .menu__item { justify-content: space-between; }
+
 .msg__body {
   font-size: 13.5px;
   line-height: 1.55;
@@ -14733,6 +14785,12 @@ body.tree-selecting, body.tree-selecting * { user-select: none !important; -webk
   border-color: rgba(255, 255, 255, 0.12);
   color: #d6d6d6;
 }
+/* 操作条：其余颜色都走主题变量，自己会翻；只有 hover 底色要单独给 ——
+   暗色下 --line 太淡，按下去几乎没有反馈。 */
+[data-theme="dark"] .msg__act:hover,
+.dark .msg__act:hover { background: rgba(255, 255, 255, 0.10); }
+[data-theme="dark"] .msg__act:active,
+.dark .msg__act:active { background: rgba(255, 255, 255, 0.16); }
 [data-theme="dark"] .about-dialog__close,
 .dark .about-dialog__close {
   /* 底色必须跟着翻。浅色态是深色半透明（rgba(60,64,67,.06)），照搬到 #18181b 的卡片上
