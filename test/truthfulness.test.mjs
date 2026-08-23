@@ -281,10 +281,22 @@ test("get_diagnostics 对没有语言服务的语言不能报「无错误或警�
   // 内置 worker 只覆盖 TS/JS/JSON/CSS/HTML。改完 Python/Rust 调它拿到全绿，
   // 然后向用户报告「已修复并验证通过」——而一条都没检查过。
   assert.match(SRC, /_BUILTIN_DIAG_LANGS/, "没有区分「有没有诊断提供方」");
-  assert.match(SRC, /没有语言服务在给它出诊断/);
-  assert.match(SRC, /不能当成「没有问题」/);
+  // 判据必须是「语言服务器**当前起没起来**」，不能是「这个语言不是内置的 + 没查出问题」——
+  // 后者把 pyright 真跑着、真把文件看干净的情形也算成「没人在检查」，于是
+  // Python/Rust/Go **永远拿不到一次绿灯**，模型只能每次都跑一遍完整构建。
+  assert.match(SRC, /const _diagReady[\s\S]{0,200}diagnosticsProviderReady/,
+    "「有没有人在给这个语言出诊断」失去了真判据");
+  assert.doesNotMatch(SRC, /当前 IDE \*\*没有语言服务在给它出诊断\*\*/,
+    "那条粗判据回来了 —— 它写在真判据前面，会把真判据整块挡成死代码");
+  assert.match(SRC, /\*\*这次一条都没检查。\*\*/, "服务没起来时没有明说「一条都没检查」");
+  assert.match(SRC, /不要把这个当成"没有问题"/, "没说清不能当成没问题");
   // 原来那句免责说「分析可能略有延迟」，暗示再等等就准了——而真相是等到天亮也是空的。
-  assert.match(SRC, /要验证它，跑项目自带的类型检查/, "没有给出真正能验证的替代路径");
+  assert.match(SRC, /要真验证它，跑项目自带的类型检查/, "没有给出真正能验证的替代路径");
+  // 另一半：服务真的起着的时候，那次绿灯必须给得出来。
+  // 这条的真跑验证在 test/diagnostics-greenlight.test.mjs（那边直接执行这段判断逻辑）。
+  const i = SRC.indexOf("const _diagReady");
+  assert.ok(SRC.indexOf("无错误或警告${note}", i) > i,
+    "服务起着也给不出绿灯 —— 那等于这个工具对非内置语言完全没用");
 });
 
 // ── 全量工具面的「假成功」清扫（31 条 high）──────────────────────────

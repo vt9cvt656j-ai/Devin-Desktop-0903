@@ -61897,15 +61897,24 @@ async function _executeToolStepInner(step, call, root, run) {
         } catch { return ""; }
       })();
       const _BUILTIN_DIAG_LANGS = new Set(["typescript", "javascript", "typescriptreact", "javascriptreact", "json", "jsonc", "css", "scss", "less", "html"]);
-      if (diagnosticPath && _diagLang && !_BUILTIN_DIAG_LANGS.has(_diagLang) && !probs.length) {
-        return {
-          type: "diag", path: call.path,
-          content: `该文件是 ${_diagLang} 语言，当前 IDE **没有语言服务在给它出诊断**`
-            + `（内置只覆盖 TS/JS/JSON/CSS/HTML，其它语言要装对应的 LSP 扩展）。`
-            + `所以这次**一条都没检查**，不能当成「没有问题」。`
-            + `要验证它，跑项目自带的类型检查 / 编译 / 测试命令（run_cmd 或 run_in_terminal），并看真实退出码。`,
-        };
-      }
+      /*
+       * 这里原来还有一条**更粗的**判据，写在下面那条真判据前面：
+       *
+       *   if (diagnosticPath && _diagLang && !内置语言 && !probs.length)
+       *       return "当前 IDE 没有语言服务在给它出诊断，这次一条都没检查"
+       *
+       * 它的意思是「非内置语言 + 没有诊断 = 一定没人在检查」。可这个推理是错的：
+       * pyright / rust-analyzer / gopls 真的跑着、真的把文件看干净了，也是这个形状。
+       * 于是 **Python / Rust / Go 文件永远拿不到一次绿灯**——模型改完调 get_diagnostics，
+       * 拿到的永远是「一条都没检查」，只能每次都去跑一遍完整构建。
+       *
+       * 更要命的是它把下面那条真判据（diagnosticsProviderReady——问语言服务器**当前
+       * 到底起没起来**）整块挡成了死代码：它只在 probs.length > 0 且服务没起来时才
+       * 够得到，而有诊断就说明有人在出诊断，那是个自相矛盾的条件。
+       *
+       * 删掉粗的那条。下面那条完全覆盖它（服务没起来 → 同样明确说「一条都没检查」，
+       * 而且能说出是没装还是崩了），并且在服务真的起着的时候放行那次绿灯。
+       */
       // "没有诊断"有两种截然不同的原因，必须分开说：
       //   ① 语言服务真的在跑、真的没查出问题 → 这是有效的绿灯
       //   ② 语言服务**根本没起来**（没装 pyright / rust-analyzer，或启动失败）→ 一行都没查
@@ -61916,9 +61925,14 @@ async function _executeToolStepInner(step, call, root, run) {
         try { return lspManager?.diagnosticsProviderReady?.(_diagLang) === true; } catch { return false; }
       })();
       if (_diagLang && !_BUILTIN_DIAG_LANGS.has(_diagLang) && !_diagReady) {
+        // 「没装」和「装了但崩了」是两件事，出路完全不同。崩掉的死因现在拿得到。
+        let _why = "";
+        try { _why = (lspManager?.lastStopReason ? lspManager.lastStopReason(_diagLang) : "") || ""; } catch {}
         return { type: "diag", path: call.path, content:
-          `**这次一条都没检查。** ${_diagLang} 的语言服务当前没有运行——多半是没装对应的 LSP`
-          + `（Python 要 pyright-langserver，Rust 要 rust-analyzer，Go 要 gopls），或者启动失败了。\n`
+          `**这次一条都没检查。** ${_diagLang} 的语言服务当前没有运行——`
+          + (_why
+            ? `它启动过但崩了：${_why}\n`
+            : `多半是没装对应的 LSP（Python 要 pyright-langserver，Rust 要 rust-analyzer，Go 要 gopls），或者启动失败了。\n`)
           + `不要把这个当成"没有问题"。要真验证它，跑项目自带的类型检查 / 编译 / 测试命令`
           + `（run_cmd，看真实退出码）——那是这个语言现在唯一可信的检查方式。` };
       }

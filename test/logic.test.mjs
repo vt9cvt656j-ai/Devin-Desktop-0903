@@ -15566,8 +15566,15 @@ test("all non-editor direct source writes use CAS and synchronize Monaco", () =>
   assert.match(extractFn("_directTextEdit"), /_commitDiskTextIfUnchanged\(file, content,/);
   assert.match(extractFn("_directStyleEdit"), /_commitDiskTextIfUnchanged\(file, content,/);
   assert.match(SRC, /writeFile: async \(path, content\)[\s\S]{0,500}_commitDiskTextIfUnchanged\(path, expected, content\)/);
-  assert.match(extractFn("_executeToolStepInner"), /_applyDiskContentToOpenFile\(fp, old\);[\s\S]{0,180}agentFormat/,
-    "formatting must refresh a stale project model from its disk baseline first");
+  // 守的是**顺序**（先用磁盘基线刷新陈旧的 project model，再格式化），不是「相隔不超过
+  // 180 字」——中间合法地多几行就假红，而且长度一超它还会静默不再守。
+  {
+    const fn = extractFn("_executeToolStepInner");
+    const iRefresh = fn.indexOf("_applyDiskContentToOpenFile(fp, old);");
+    const iFormat = fn.indexOf("agentFormat", iRefresh);
+    assert.ok(iRefresh > 0 && iFormat > iRefresh,
+      "formatting must refresh a stale project model from its disk baseline first");
+  }
 });
 
 test("remote filesystem routing cannot create locally, truncate existing files, or lose path identity", () => {
