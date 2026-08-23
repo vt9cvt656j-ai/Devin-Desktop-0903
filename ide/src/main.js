@@ -41249,13 +41249,92 @@ function _sinkRisksInWrite(text, before = null) {
   return [...byKind.values()].sort((a, b) => a.line - b.line);
 }
 
+/*
+ * 同一个函数里，null 既表示「没有」又表示「没查成」。
+ *
+ * 这是本仓库今天一天里连撞四处的那个病（agentLocate / agentHover / agentFormat /
+ * agentDocumentSymbols）：`catch { return null }` 和正常路径上的 `return null` 写在
+ * 同一个函数里，调用方拿到 null 分不出是哪一种，于是把「超时」说成「没有引用」，
+ * 模型据此把有调用方的函数删了。
+ *
+ * 它是「写完之后维护不动」最典型的一种：写的时候两条路都回 null 看着很自然，出事时
+ * 从调用方往回查，什么线索都没有——因为**信息在返回的那一刻就丢了**。
+ *
+ * 判据拿这个仓库自己的 27 万行真代码量过：命中 23 处，约每一万两千行一处，抽查 4 处
+ * 全是真的（其中 _readOwnMcpUserConfig 那处的后果是「用户停用过的 MCP 服务会悄悄复活」）。
+ * 同一轮里量过的另外三条判据都没过关，最接近的一条（会改变结果的操作被空 catch 吞掉）
+ * 收紧到 7 处之后逐个看仍有七成误报（那些空 catch 大多在别处补偿过），所以没有采用。
+ */
+function _ambiguousFailureInWrite(text, maxItems = 3) {
+  const lines = String(text || "").split("\n");
+  if (lines.length < 3) return [];
+  // 函数起点 + 缩进。没有 AST，用缩进划块——这里只需要"大致是同一个函数"，
+  // 划错一两行不会把结论变反：两种 return 必须都在同一块里才报。
+  const START = /^(\s*)(?:(?:export\s+)?(?:async\s+)?function\s+[\w$]+|(?:pub\s+)?(?:async\s+)?fn\s+\w+|(?:async\s+)?[\w$]+\s*\([^)]*\)\s*\{|[\w$]+:\s*(?:async\s*)?\([^)]*\)\s*=>|(?:const|let|var)\s+[\w$]+\s*=\s*(?:async\s*)?\([^)]*\)\s*=>)/;
+  const NULLISH = "(?:null|undefined|None)";
+  const CATCH_INLINE = new RegExp("\\bcatch\\s*(?:\\([^)]*\\))?\\s*\\{\\s*return\\s+" + NULLISH + "\\s*;?\\s*\\}");
+  const CATCH_OPEN = /\bcatch\s*(?:\([^)]*\))?\s*\{\s*$/;
+  const RET_NULL = new RegExp("^\\s*return\\s+" + NULLISH + "\\s*;?\\s*$");
+  const PLAIN_RET = new RegExp("^\\s*(?:if\\s*\\([^)]*\\)\\s*)?return\\s+" + NULLISH + "\\s*;?\\s*$");
+
+  const out = [];
+  let blockStart = -1, blockIndent = -1, blockName = "";
+  let failLine = -1, plainLine = -1;
+  const flush = () => {
+    if (failLine > 0 && plainLine > 0 && out.length < maxItems) {
+      out.push({ line: failLine, other: plainLine, name: blockName || "这个函数" });
+    }
+    failLine = -1; plainLine = -1;
+  };
+  for (let i = 0; i < lines.length; i++) {
+    const raw = lines[i];
+    const m = START.exec(raw);
+    if (m && (blockIndent < 0 || raw.search(/\S/) <= blockIndent)) {
+      flush();
+      blockStart = i; blockIndent = m[1].length;
+      blockName = (/(?:function|fn)\s+([\w$]+)|([\w$]+)\s*[:(=]/.exec(raw.trim()) || [])[1]
+        || (/(?:function|fn)\s+([\w$]+)|([\w$]+)\s*[:(=]/.exec(raw.trim()) || [])[2] || "";
+    }
+    if (blockStart < 0) continue;
+    // catch 里回 null —— 一行写完的，和 catch 换行写的，都要认。
+    if (CATCH_INLINE.test(raw)) { if (failLine < 0) failLine = i + 1; continue; }
+    if (CATCH_OPEN.test(raw)) {
+      for (let k = 1; k <= 2 && i + k < lines.length; k++) {
+        if (RET_NULL.test(lines[i + k])) { if (failLine < 0) failLine = i + k + 1; break; }
+        if (lines[i + k].trim() && !/^\s*\/\//.test(lines[i + k])) break;
+      }
+      continue;
+    }
+    if (PLAIN_RET.test(raw) && plainLine < 0) plainLine = i + 1;
+  }
+  flush();
+  return out;
+}
+
 // 把上面那些做成挂在**这一次写入**上的一段话。没有命中就一个字都不发。
 function _sinkRiskAdvice(call) {
-  const risks = _sinkRisksInWrite(String(call?.content ?? call?.new_string ?? ""));
-  if (!risks.length) return "";
+  // 名字是历史的：最早这里只有「危险汇聚点」。现在它是**这一次写入的质量提醒**的唯一
+  // 出口——多一个出口就多一处要手工保持同步的接线，而这个仓库已经因为"手工维护的清单"
+  // 栽过好几次。新增的检测器挂进来，不要另开调用点。
+  const body = String(call?.content ?? call?.new_string ?? "");
   const path = String(call?.path || "").split("/").slice(-2).join("/");
-  return "\n\n⚠ 这次写入碰到了危险汇聚点，趁还在这一步先堵上（下面每条都指到了行号和原文，不是泛泛提醒）：\n"
-    + risks.map((r) => `· ${path}:${r.line} ${r.kind} — \`${r.text}\`\n  ${r.ask}`).join("\n");
+  let out = "";
+
+  const risks = _sinkRisksInWrite(body);
+  if (risks.length) {
+    out += "\n\n⚠ 这次写入碰到了危险汇聚点，趁还在这一步先堵上（下面每条都指到了行号和原文，不是泛泛提醒）：\n"
+      + risks.map((r) => `· ${path}:${r.line} ${r.kind} — \`${r.text}\`\n  ${r.ask}`).join("\n");
+  }
+
+  const amb = _ambiguousFailureInWrite(body);
+  if (amb.length) {
+    out += "\n\n⚠ 这次写的代码里，失败和「没有」回的是同一个值——调用方分不出来：\n"
+      + amb.map((a) => `· ${path}:${a.line} \`${a.name}\` 在 catch 里回 null，第 ${a.other} 行的正常路径也回 null。`
+        + `\n  调用方拿到 null 只能猜。它会猜"没有"——于是把"超时"说成"查不到"、把"读失败"说成"是空的"，然后照着这个假结论往下做。`
+        + `\n  给失败一个**不同的形状**：抛出去，或者回 { ok: false, reason } 这类能带上原因的值；"没有"才回 null。`
+        + `\n  这不是洁癖：出事时从调用方往回查，什么线索都没有——信息在 return 的那一刻就丢了。`).join("\n");
+  }
+  return out;
 }
 
 function _stubDeliveryFindings(run, maxItems = 8) {
