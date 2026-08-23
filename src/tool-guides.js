@@ -644,14 +644,30 @@ export function compactToolExampleArgs(schema, depth = 0) {
   return out;
 }
 
-function compactScenario(description, maxChars) {
-  const cleaned = String(description || "需要该能力时使用")
+// 兜底文案是**数据**，不是常量。
+//
+// 发布构建会把 _buildAgentToolSchemas 里 141 条工具描述全部剥空（IP 保护，
+// build/strip-tool-ip.mjs；实测 dev 空描述 0 条、release **141 条**）。网关按名注回只补
+// body.tools，补不到**消息正文里的工具目录**——而那份目录正是编排模型用来决定「这轮装
+// 哪些工具」的唯一依据。于是线上跑的那个构建里，它看到的是 141 个光名字加同一句
+// 「需要该能力时使用」。
+//
+// TOOL_METADATA 在 src/tool-guides.js 里，**不在剥除范围内**（vite 只匹配 /src/main.js$，
+// 实测剥它 0 处改动），142 键、全部有 use_cases。用它兜底不新增一个字的人工文案。
+function scenarioFallback(name) {
+  const meta = TOOL_METADATA[String(name || "")];
+  const first = Array.isArray(meta?.use_cases) ? String(meta.use_cases[0] || "").trim() : "";
+  return first || "需要该能力时使用";
+}
+
+function compactScenario(description, maxChars, name = "") {
+  const cleaned = String(description || scenarioFallback(name))
     .replace(/<[^>]+>/g, " ")
     .replace(/[`*_#>|]/g, "")
     .replace(/[⚠️✅❌🔍🎨📦🚀]+/gu, "")
     .replace(/\s+/g, " ")
     .trim();
-  const first = (cleaned.split(/[。；\n]/)[0] || cleaned || "需要该能力时使用").trim();
+  const first = (cleaned.split(/[。；\n]/)[0] || cleaned || scenarioFallback(name)).trim();
   return first.length > maxChars ? `${first.slice(0, Math.max(1, maxChars - 1))}…` : first;
 }
 
@@ -660,7 +676,7 @@ export function compactToolGuide(schema, maxChars = 180) {
   const args = compactToolExampleArgs(schema);
   const invocation = `${name}(${JSON.stringify(args)})`;
   const fixed = `${name}｜场景:｜例:${invocation}`;
-  const scenario = compactScenario(schema?.function?.description, Math.max(12, maxChars - fixed.length));
+  const scenario = compactScenario(schema?.function?.description, Math.max(12, maxChars - fixed.length), name);
   // Never truncate JSON in the invocation. A future external tool with unusually
   // long required field names may exceed the target, but still gets a usable guide.
   return `${name}｜场景:${scenario}｜例:${invocation}`;
@@ -710,7 +726,9 @@ export function autoEnrichToolMetadata(entry) {
 export function enrichedCatalogLine(entry) {
   const inputs = Array.isArray(entry?.inputs) ? entry.inputs.join(",") : "";
   const required = Array.isArray(entry?.required) && entry.required.length ? ` required:${entry.required.join(",")}` : "";
-  let line = `${entry?.name}\t${entry?.description || "（无描述）"}\t${inputs}${required}`;
+  // 同上：发布构建里 entry.description 恒为空，兜底必须是数据不是常量，
+  // 否则编排模型看到的整列都是「（无描述）」。
+  let line = `${entry?.name}\t${entry?.description || scenarioFallback(entry?.name)}\t${inputs}${required}`;
 
   const meta = TOOL_METADATA[entry?.name] || autoEnrichToolMetadata(entry);
   if (!meta) return line;
