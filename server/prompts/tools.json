@@ -1196,7 +1196,7 @@
           },
           "domain": {
             "type": "string",
-            "description": "Optional; restrict to a domain. **michael-design** is the design blueprint corpus — 441 production-grade, Tailwind-native page and section blueprints with real palettes, layout composition patterns, motion recipes and component coverage. Pass it for ANY visible UI work (website, web app, desktop GUI, dashboard, landing page, a single component) and build from what it returns instead of inventing colours and spacing from memory. Other domains: web-frontend / backend-api / database / security / ui-ux / devops / reverse-engineering / penetration-testing"
+            "description": "Optional; restrict to a domain. **michael-design** is the design blueprint corpus — 441 production-grade, Tailwind-native page and section blueprints with real palettes, layout composition patterns, motion recipes and component coverage. Pass it for ANY visible UI work (website, web app, desktop GUI, dashboard, landing page, a single component) and build from what it returns instead of inventing colours and spacing from memory. Other domains, pass the one that matches the BUSINESS area (not the tech you happen to use — a hospital scheduling system is healthcare, not web-frontend): healthcare / finance / legal / security / penetration-testing / reverse-engineering / database / devops / gaming / data-ml / blockchain / iot-embedded / mobile / saas / ecommerce / education / marketing / backend-api / web-frontend / ui-ux / systems-programming. A wrong guess is safe: an unmatched domain falls back to searching everything rather than returning nothing."
           },
           "top_k": {
             "type": "integer",

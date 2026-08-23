@@ -19,7 +19,7 @@
 //      嚼成结构化小抄注入。有界预算、有上限的等待、每 run 每域一次、零关键词正则。
 //
 // 全离线：知识库回执用夹具，不发任何网络请求。
-import { readdirSync } from "node:fs";
+import { readdirSync, readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import { test } from "node:test";
@@ -510,4 +510,42 @@ test("设计已经在场时不再发 michael-design 域旗标——同一份语�
   const health = profile({ ui: true, domain: "healthcare", applies: true });
   assert.ok(health.includes("domain_healthcare"),
     "抑制只针对 michael-design，专业域和设计可以同时在场");
+});
+
+
+// 两份工具目录里 knowledge_search 的 domain 说明。取的是**真文件**，不是复述——
+// 复述一份就等于又造了第三处会漂的副本。
+function localDomainDescription() {
+  const m = /name: "knowledge_search"[\s\S]*?domain: \{ type: "string", description: "((?:[^"\\]|\\.)*)"/.exec(SRC);
+  assert.ok(m, "main.js 里 knowledge_search 的 domain 说明取不到——这两条断言失去落点");
+  // 比的是**字符串的值**，不是源码里的写法：main.js 里破折号写成 \u2014 转义，
+  // tools.json 里是字面量，两者语义相同。不解转义的话这条会一直红在一个假差异上。
+  return JSON.parse(`"${m[1]}"`);
+}
+function cloudDomainDescription() {
+  const raw = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "../../server/prompts/tools.json"), "utf8");
+  const list = JSON.parse(raw);
+  const tools = Array.isArray(list) ? list : (list.tools || []);
+  const hit = tools.map((t) => t.function || t).find((f) => f?.name === "knowledge_search");
+  assert.ok(hit, "网关目录里没有 knowledge_search");
+  return hit.parameters.properties.domain.description;
+}
+
+// 22 个域里，工具说明原来只列了 8 个。另外 13 个——healthcare / finance / legal / gaming /
+// data-ml / blockchain / iot-embedded / mobile / saas / ecommerce / education / marketing /
+// systems-programming——模型一个字都收不到，于是永远不会点名去查它们。
+//
+// 这不是一道墙（网关的 domain 过滤是松解析的：猜错了会回落成全库搜，而不是返回空），
+// 是一个**文档缺口**：模型不知道有这些域可以点名。而这里守的是它别再缺回去。
+test("工具说明里列的可选域，必须是语料域的全集", () => {
+  const desc = localDomainDescription();
+  const missing = [...DOMAINS].filter((d) => !desc.includes(d));
+  assert.deepEqual(missing, [],
+    `这些域模型一个字都收不到，于是永远不会点名去查：${missing.join(" / ")}`);
+});
+
+test("两份工具目录里那段域说明逐字一致——运行时以网关那份为准", () => {
+  // 只改 main.js 等于改了个不生效的副本，而且两份会静静地越漂越远。
+  assert.equal(localDomainDescription(), cloudDomainDescription(),
+    "本地副本和网关目录的域说明漂了——运行时生效的是网关那份");
 });
