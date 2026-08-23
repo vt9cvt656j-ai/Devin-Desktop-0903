@@ -28249,6 +28249,35 @@ test("模型菜单：free 徽标由网关下发的字段决定，不是客户端
     "自定义模型那组没用同一套结构，两组的对勾对不齐");
 });
 
+test("模型选择框有宽度上限，且截断不吞掉全名", () => {
+  // 原来写的是 max-width:180px，而目录里最长的 deepseek-v4-flash 整钮也才 165px
+  // （图标+箭头+内边距 54 + 文字 111）—— 那道上限从来没生效过，按钮爱多长多长。
+  // 现在 160px：deepseek-v4-flash 起开始截断，短名字照常。
+  const rule = APP_CSS_CODE.match(/\.model-picker__btn\s*\{([^}]*)\}/);
+  assert.ok(rule, ".model-picker__btn 规则不见了");
+  const cap = rule[1].match(/max-width:\s*(\d+)px/);
+  assert.ok(cap, "选择框没有宽度上限，长模型名会把它撑开");
+  // 判据不是「等于 160」——那只是今天的数字；是「必须真的咬得住目录里最长的名字」。
+  // 165 是 deepseek-v4-flash 实测的整钮宽；上限不低于它，这道门就又是摆设。
+  assert.ok(Number(cap[1]) < 165,
+    `上限 ${cap[1]}px 没有咬住最长的模型名（实测要 165px），等于没设`);
+
+  // 截断只有在**全名另有出处**时才安全：省略号 + 全名写进 label 自己的 title。
+  const label = APP_CSS_CODE.match(/\.model-picker__label\s*\{([^}]*)\}/);
+  assert.ok(label, ".model-picker__label 规则不见了");
+  assert.match(label[1], /text-overflow:\s*ellipsis/, "截断没有省略号，会硬切在半个字上");
+  assert.match(label[1], /overflow:\s*hidden/, "没有 overflow:hidden，省略号不会生效");
+  const sync = stripJsComments(extractFn("syncModelPicker"));
+  assert.match(sync, /modelPickerLabel\.title = label;/, "全名没写进 title，截断后就查不到了");
+  // 编辑条里的克隆 picker 也得镜像同一份，否则那边截断了却没处看全名。
+  assert.match(sync, /lab\.title = modelPickerLabel\.title/, "编辑条的克隆 picker 没镜像全名");
+  // title 挂在 label 这个 span 上而不是按钮上 —— 按钮带 data-i18n-title，
+  // i18n 的属性观察器下一帧就会把它刷回词条，全名当场丢失。
+  const shellSrc = readFileSync(join(HERE, "..", "src", "app", "Shell.jsx"), "utf8");
+  assert.doesNotMatch(shellSrc, /id="modelPickerLabel"[^>]*data-i18n-title/,
+    "全名的 title 挂到带 i18n 标记的元素上了，会被观察器刷掉");
+});
+
 test("模型菜单：比原来宽，且中线正对下面那个模型按钮", () => {
   // 两条要求互相拉扯：菜单一旦宽到占满输入框，就不可能再以按钮为中心 —— 按钮不在输入框
   // 正中，它左边还坐着模式选择器。所以宽度取「以按钮中线为心、两边都还装得下的最大值」。

@@ -8248,7 +8248,12 @@ button.agent-plan__fold--toggle:focus-visible { outline: 2px solid #1a73e8; outl
   align-items: center;
   gap: 5px;
   height: 26px;
-  max-width: 180px;
+  /* 再长的名字截断加省略号。原来写的是 180px，而目录里最长的 deepseek-v4-flash 整钮也才
+     165px（图标+箭头+内边距占 54px，文字 111px）—— 也就是说那道上限从来没生效过，
+     按钮爱多长多长，这才是「选择框被撑太长」的由来。
+     截断是安全的：.model-picker__label 有省略号，全名写在它自己的 title 上（那个 span
+     没挂 data-i18n-title，不会被 i18n 观察器刷掉），编辑条里的克隆 picker 也镜像了同一份。 */
+  max-width: 160px;
   padding: 0 7px;
   font-family: var(--font);
   font-size: 12px;
