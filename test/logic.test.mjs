@@ -28219,6 +28219,45 @@ test("耗时在内容结束时定格，不含结算等待", () => {
     "又回到用 Date.now() 减起点了");
 });
 
+// ── 免费模型要在菜单里标出来，且徽标和对勾各占一列 ─────────────────────────
+test("模型菜单：free 徽标由网关下发的字段决定，不是客户端猜的", () => {
+  const src = stripJsComments(SRC);
+
+  // 目录映射：老网关不下发这个字段时不能塌成 true。
+  assert.match(src, /free: it\.free === true,/,
+    "没有把网关下发的 free 映射进目录——徽标永远不会出现（第一版就漏了这一步）");
+  assert.doesNotMatch(src, /free: [^\n]*input_price|free: [^\n]*inputPrice/,
+    "客户端自己按价格列猜免费了——单模型覆盖能把三列全 0 的模型定成收费，会标错");
+
+  // 菜单项：徽标和对勾是**两列**，不是二选一。
+  const menu = stripJsComments(extractFn("buildModelMenu"));
+  assert.match(menu, /m\.free \? `<span class="free-tag">free<\/span>` : ""/,
+    "菜单项没有渲染 free 徽标");
+  assert.match(menu, /<span class="check-slot">/,
+    "对勾没有独立的列——没选中的行里徽标位置会往右漂，对不齐");
+  // 徽标必须排在对勾**之前**（用户明确要求的顺序）。
+  //
+  // 不能比 "freeTag" 和 "check-slot" 的首次出现位置：freeTag 在**声明处**就出现了、
+  // 远早于拼接处，把它从拼接里删掉那个比较照样成立（变异实测漏网）。钉拼接串本身。
+  assert.match(menu, /\+ freeTag\s*\n\s*\+ `<span class="check-slot">/,
+    "free 徽标没有紧排在对勾列之前");
+  // 两组菜单（网关模型 / 自定义模型）都要有对勾列，否则两组之间对不齐。
+  assert.equal((menu.match(/check-slot/g) || []).length, 2,
+    "自定义模型那组没用同一套结构，两组的对勾对不齐");
+});
+
+test("free 徽标样式：靠右、与对勾列分开、不随选中态挪位", () => {
+  assert.match(APP_CSS_CODE, /\.menu__item \.free-tag\s*\{[^}]{0,400}margin-left:\s*auto/,
+    "徽标没有靠右——会紧跟在模型名后面，长短不一就对不齐");
+  assert.match(APP_CSS_CODE, /\.menu__item \.check-slot\s*\{[^}]{0,400}width:\s*15px/,
+    "对勾列没有固定宽度——有勾/没勾两种行的徽标会差一个勾的宽度");
+  assert.match(APP_CSS_CODE, /\.menu__item \.check-slot\s*\{[^}]{0,400}flex:\s*none/,
+    "对勾列会被压缩，宽度就不固定了");
+  // meta 和 free 同时出现时只能有一个自动外边距，否则中间被均分开。
+  assert.match(APP_CSS_CODE, /\.menu__item \.meta \+ \.free-tag\s*\{[^}]{0,120}margin-left:\s*8px/,
+    "meta 和 free 同时出现时会被拉开");
+});
+
 // ── 历史消息的模型头像/名称不许被后来的选择改写 ─────────────────────────────
 //
 // selectModel 原来会把**整个会话**里所有助手头像刷成新模型，注释还写着「让图标跟随所选
