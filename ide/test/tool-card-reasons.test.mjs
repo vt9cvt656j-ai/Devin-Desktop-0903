@@ -399,3 +399,36 @@ test("晚到的域小抄仍有消费点（所以不必为它加长用户等待�
   assert.ok(hits >= 2,
     `循环里只有 ${hits} 个消费点：晚到的域小抄将被丢弃，那超时改大就只剩延迟没有收益`);
 });
+
+// ── ⑩ 域小抄不该把散文查询发给代码语料库 ───────────────────────────────
+//
+// 那四条 rubric 问的是「适用条件 / 硬性约束 / 常见坑 / 必须做的检查」，答案在 893 段手写
+// 语料里。带上语料腿的代价与回报实测（2026-08-23 生产库，295 万行 code_corpus）：
+//   · 12 个 OR 词 → 匹配 124,042 行 → 每行两次 ts_rank + 全排序 → 单条 2.8~8.5 秒
+//   · 捞回来的前六条：metagit-cli「Pattern categories」、两条重复的 next-pwa「Tips」、
+//     selenium-devtools「Reference」——对「ui-ux 常见坑」一条都不沾边
+//   · 对照：标识符查询 useEffect 匹配 353 行、28 毫秒
+// 一轮 4 条 × 最多 2 个域 = 8 条这样的重查询，正是那三张红卡超时的成因。
+//
+// 判别不能用超时：实测「zustand create store selector」这种**有用**的多词技术查询要 3.5 秒，
+// 比散文查询还慢，按时长切会误伤真内容。只有调用方知道自己问的是散文小抄还是 API 核对。
+test("域小抄预检声明不要代码语料腿", () => {
+  const pre = fnSource("_runDomainKnowledgePreflight", { code: true });
+  assert.match(pre, /corpus: false/,
+    "域小抄又把 rubric 散文查询发给 295 万行签名表了——一轮 8 条重查询，且回来的是噪声");
+  assert.match(pre, /topK: 4/, "topK 变了，代价估算要重算");
+});
+
+test("模型自己调 knowledge_search 时那条腿照旧（反向断言）", () => {
+  // 只钉「域小抄关掉了」是绿的摆设：把开关写死成恒 false 它也绿，
+  // 而那会把「写第三方调用之前核对真实 API」唯一够得着的事实源整个关掉。
+  const fn = fnSource("_searchKnowledgeBase", { code: true });
+  assert.match(fn, /corpus: call\.corpus === false \? false : undefined/,
+    "开关不是按调用方声明转发的——要么恒开要么恒关，两种都错");
+  assert.doesNotMatch(fn, /corpus: false[,\s]/,
+    "_searchKnowledgeBase 里写死了 corpus:false——所有 knowledge_search 都会丢掉语料腿");
+  // michael-design 预检不传这个开关（网关侧本来就对该域关着，客户端不必重复判）
+  const md = fnSource("_runMichaelDesignPreflight", { code: true });
+  assert.doesNotMatch(md, /corpus:/,
+    "michael-design 预检也去传这个开关了——那是两处判据，会漂");
+});
