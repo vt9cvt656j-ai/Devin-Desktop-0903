@@ -113,6 +113,7 @@ import appPackage from "../package.json";
 import {
   approvalTypes, blockedInReadOnlyMode, defineTool, fileEditTypes, hookedTypes, needsApprovalFor,
   isFileMutation, fileMutationTypes, workerScopeField, workerScopeTarget, workspaceMutatingTypes,
+  toolPolicy,
 } from "./agent/tool-policy.js";
 import {
   USER_TOOL_PREFIX, buildHttpCall, compileToolSchema, mergeCapabilities,
@@ -22834,7 +22835,7 @@ const _AI_INTENT_DIMENSIONS = [
   "motionChoreographyRequired", "browserAutomation", "capture", "interactiveWait", "longRunningRuntime",
   "explicitWorkspaceMutation", "explicitRuntimeAction", "explicitExternalAction", "explicitReadOnly",
   "git", "gitBranching", "gitCommit", "gitSync",
-  "gitPublish", "gitReview", "referenceWebsiteRequested", 
+  "gitPublish", "gitReview", 
   "qualityFloor", "allProjectsEngineering",
 ];
 const _AI_INTENT_RELATIONS = new Set(["new", "continue", "correct", "replace", "clarify"]);
@@ -23451,7 +23452,6 @@ function _mergeAiIntentProfile(base, intents, text, priorState = null) {
   m.fullWebsite = !!(m.fullWebsite || deliverySurface === "website" || deliverySurface === "web_app");
   m.referenceWebsiteUrls = Array.isArray(base?.referenceWebsiteUrls) ? [...base.referenceWebsiteUrls] : [];
   m.referenceWebsiteRequired = !!(m.ui && m.referenceWebsiteUrls.length);
-  m.referenceWebsiteRequested = !!(m.referenceWebsiteRequested || m.referenceWebsiteRequired);
   m.fromZeroUiProject = !!(m.uiProject && (projectState === "greenfield" || designMode === "michael_design_2_5_greenfield"));
   m.existingWebsite = !!(m.existingProject && m.uiProject && !m.fromZeroUiProject);
   // A repository containing UI is a fact, not a request for a design review. Michael Design
@@ -24431,7 +24431,7 @@ function _domainKnowledgeResearchPlan(domain, task) {
  * 每段只取第一条够实的行：宁可让 6 个不同小节各露一句，也不要把一段原文整个贴进来——
  * 小抄要的是覆盖面，散文才要连贯。
  */
-function _domainKnowledgeBullets(content, maxBullets = 3, maxChars = 190) {
+function _domainKnowledgeBullets(content, maxBullets = 3, maxChars = 190, seen = null) {
   const blocks = String(content || "").split("\n\n———\n\n");
   const bullets = [];
   for (const block of blocks) {
@@ -24442,6 +24442,9 @@ function _domainKnowledgeBullets(content, maxBullets = 3, maxChars = 190) {
     let inFence = false;
     let prose = "";     // 首选：散文/表格数据行
     let fenced = "";    // 兜底：代码围栏里的第一行
+    // seen：跨 rubric 去重。命中已见的就往下取**同一段的下一条**，而不是把这一栏丢空——
+    // 四条 rubric 各查一次、共 16 个检索位，而多数域的小节数比这还少，重复是结构性的。
+    const _fresh = (t) => !seen || !seen.has(String(t).trim());
     for (let li = 0; li < rawLines.length && !prose; li++) {
       const line = rawLines[li];
       if (/^\s*(?:```|~~~)/.test(line)) { inFence = !inFence; continue; }
@@ -24471,11 +24474,13 @@ function _domainKnowledgeBullets(content, maxBullets = 3, maxChars = 190) {
       // 代码围栏里的行**留作兜底**，不直接选中。一条孤立的 import 行说不出这个小节想说
       // 什么；但整节只有代码时，给一行真代码仍然远好过给空。一刀砍掉整类会让产不出要点的
       // 小节从 13.6% 涨到 49.2%（实测）——那是把一半语料静默扔掉。
+      if (!_fresh(text)) continue;
       if (inFence) { if (!fenced) fenced = text; continue; }
       prose = text;
     }
     const picked = prose || fenced;
     if (!picked) continue;
+    if (seen) seen.add(String(picked).trim());
     const one = picked.length > maxChars ? `${picked.slice(0, maxChars)}…` : picked;
     bullets.push(section ? `${section} → ${one}` : one);
     if (bullets.length >= maxBullets) break;
@@ -24496,8 +24501,14 @@ function _domainKnowledgeBrief(domain, sections) {
 
 本轮「${domain}」没有返回任何可用命中。明确记录该领域语料不可用，基于用户约束与项目证据继续，不要编造该领域的规则。`;
   }
-  const body = filled
-    .map((s) => `【${s.heading}】\n${s.bullets.map((b) => `- ${b}`).join("\n")}`)
+  // 四栏是**问过的四个维度**，不是「有内容的那几栏」。空栏要如实说，不能整栏消失——
+  // 消失会让模型以为那个维度压根没被问过，而事实是「问了，这个域没有独立的答案」。
+  //（跨 rubric 去重之后这种情况会变多：同一小节对多条 rubric 都高分时，后面的栏
+  // 拿到的是同段的下一条，取不到就空。）
+  const body = sections
+    .map((s) => (s.bullets.length
+      ? `【${s.heading}】\n${s.bullets.map((b) => `- ${b}`).join("\n")}`
+      : `【${s.heading}】\n- （本域语料里这一栏没有独立内容；需要就自己调 knowledge_search(domain="${domain}") 细查，别当成"没有要求"。）`))
     .join("\n\n");
   const full = `${head}\n\n${body}`;
   if (full.length <= _DOMAIN_KNOWLEDGE_BRIEF_BUDGET) return full;
@@ -24533,21 +24544,40 @@ async function _runDomainKnowledgePreflight({ run, profile = "", body = null, is
           body.appendChild(step);
         }
         const result = await _searchKnowledgeBase(call);
-        const bullets = _toolExecutionSucceeded(call, result)
-          ? _domainKnowledgeBullets(String(result?.content || ""))
-          : [];
+        // 原文留着：跨 rubric 去重必须在 Promise.all **之后**按固定顺序重算一遍
+        //（共享集合塞进并发分支的话，「谁占到某小节」取决于网络返回顺序，同一查询两次结果不同）。
+        const _raw = _toolExecutionSucceeded(call, result) ? String(result?.content || "") : "";
+        const bullets = _raw ? _domainKnowledgeBullets(_raw) : [];
         if (step) {
           const viewport = step.querySelector?.(".atc-viewport");
           if (viewport) viewport.textContent = String(result?.content || "").slice(0, 6000);
           _settleToolStep(step, result, bullets.length ? `${bullets.length} 条 · ${plan.heading}` : "无可用命中");
         }
-        return { heading: plan.heading, bullets };
+        return { heading: plan.heading, bullets, raw: _raw };
       } catch (error) {
         const result = { type: "knowledge", path: plan.query, content: `[失败] ${domain} 预取异常: ${String(error?.message || error).slice(0, 180)}` };
         if (step) _settleToolStep(step, result, "预取失败");
         return { heading: plan.heading, bullets: [] };
       }
     }));
+    // 四条 rubric 之间**去重**，且必须在 Promise.all **之后**、按 plans 的固定顺序做。
+    //
+    // 四条腿各查一次、各取各的要点，之间没有任何共享集合——而多数域的小节总数比检索位
+    // 还少（16 个位：4 条 rubric × topK 4）。实测 21 个非设计域共 683 小节，其中 4 个域
+    // （systems-programming 9、healthcare 13、blockchain 14、ecommerce 15）少于 16 个位，
+    // 抽屉原理保证重复；其余域也会在同一小节对多条 rubric 都高分时重复。
+    // 后果是 2500 字符的小抄预算有相当一部分花在逐字重复上，挤掉的是别的上下文。
+    //
+    // **不能**把共享集合塞进上面那个 Promise.all 的并发分支：那样"谁占到某小节"取决于
+    // 网络返回顺序，同一次查询跑两遍结果不同。所以在这里按 plans 的顺序补一遍。
+    const _seenBullet = new Set();
+    for (const sec of sections) {
+      if (!sec.raw) continue;
+      // 重算而不是过滤：命中已见就往下取**同一段的下一条**，栏目仍有内容。
+      // 只过滤的话，四条 rubric 命中同一小节时后三栏会整栏变空——那比重复更糟。
+      sec.bullets = _domainKnowledgeBullets(sec.raw, 3, 190, _seenBullet);
+      delete sec.raw;
+    }
     return {
       domain,
       hitCount: sections.reduce((sum, s) => sum + s.bullets.length, 0),
@@ -28141,7 +28171,16 @@ async function sendPrompt(text, attachments = [], readyConfig = null, opts = {})
     // 现在它有 create_project 了（位置固定在 ~/MrDayOne/<name>，名字过白名单，仍走
     // register_workspace_root 的全部守卫），所以告诉它自己开工，而不是让它去求用户。
     // 用户说「写个 telegram 机器人」时应该看到机器人，而不是一句"请先点这里"。
+    // 只读模式下**不能**说这句：create_project 的策略是 readOnlyModeBlocked，
+    // 执行时 100% 回 [BLOCKED]。指使模型去调一个必被拒的工具，比不说更糟——
+    // 它会照做、被拒、然后不知道该干什么。（同一批修改里，这三个必被拒的工具也已经
+    // 不再出现在只读模式的注册表里；这里是同一件事的另一半：harness 自己别去点名它。）
+    if (_readOnlyBlockedTool("create_project")
+        && ["explorer", "reviewer", "plan"].includes(String(effectiveMode || ""))) {
+      contextBlock += "\n(未打开工作区文件夹。当前是只读模式，开不了新项目——先回答用户能回答的部分，并说清「要真的建这个项目，请切到 Agent 模式或先打开一个文件夹」。)";
+    } else {
     contextBlock += "\n(未打开工作区文件夹。要创建/修改/运行项目文件时，先调 create_project 建一个目录（给个描述性名字，如 telegram-image-bot），它会立刻成为当前工作区；别停下来问用户，也别写相对路径——那会被沙箱拒绝。收尾时把返回的完整路径告诉用户。)";
+    }
     }
   }
   if (_activeForSession) {
@@ -35385,6 +35424,13 @@ async function _figRun(call) {
   return out.join("\n");
 }
 
+/** 只读模式下这个工具是不是「注册了也一定被拒」。严格布尔——策略表里有一族字段是函数。 */
+function _readOnlyBlockedTool(name) {
+  const n = String(name || "").replace(/_/g, "").toLowerCase();
+  if (!n) return false;
+  try { return toolPolicy(n)?.readOnlyModeBlocked === true; } catch { return false; }
+}
+
 function _buildAgentToolSchemas(includeWrite, mcpTools = []) {
   const tools = [
     { type: "function", function: { name: "read_file", description: "Read a file's contents. By default it reads the whole file from the start (up to 2000 lines) — **prefer omitting offset/limit and just reading the whole file**; use offset/limit only when the file is too large for one read (the result says it was truncated) to continue through the part you have not covered. You can issue several tool calls in parallel in one reply: **speculatively reading every possibly-useful file in one parallel batch is always better** than reading one at a time. When investigating, evaluating, or reviewing and you find further relevant files you have not read (modules the entry point imports, build scripts, config): **read them and then conclude — never stop to ask the user \"shall I keep reading?\". The unread list you just produced is your reading queue, not a question to hand back.** Do not re-read a whole file you already read and that has not changed; re-read a range only when you need character-exact text for an edit and the exact original has fallen out of context. Before modifying an existing file you must have its current real version. It can also read the text layer of .pdf/.docx/.pptx/.xlsx (image-only scans need OCR).", parameters: { type: "object", properties: { path: { type: "string", description: "Path relative to the workspace root, or an absolute path" }, offset: { type: "integer", description: "Starting line number (1-based). Provide only when the file is too large to read in one go" }, limit: { type: "integer", description: "How many lines to read. Provide only when the file is too large to read in one go; omit = read the whole file at once" } }, required: ["path"] } } },
@@ -35698,7 +35744,17 @@ function _buildAgentToolSchemas(includeWrite, mcpTools = []) {
   }
   // 角色枚举**必须**包在 _applyCloudToolDescs 外面：那一步整块替换 function.parameters，
   // 包在里面的话云端 tools.json 会把枚举原样盖回内置 11 个（见 _applyUserRoleEnums 注释）。
-  return _applyUserRoleEnums(_applyCloudToolDescs(_withoutDisabledTools(tools)));
+  // 只读模式下必被拒的工具，一开始就不发给模型。
+  //
+  // 和本函数上面那段「网页版别发桌面专属工具」是**同一个形状**，只是那一份修了、
+  // 这一份漏了：ui_click / create_project / save_skill 的策略是 readOnlyModeBlocked，
+  // 执行时 100% 回 [BLOCKED]，可它们照样待在只读模式的 87 条注册表里——search_tools
+  // 取得回、编排器选得中，选中一次就是一轮白烧，还占掉工具窗口的配额。
+  //
+  // 判据用**严格布尔** `=== true`：策略表里有一族 readOnly 相关字段是**函数**
+  // （按这一次调用判），真值判断会把那一族一并误杀。
+  const _visible = includeWrite ? tools : tools.filter((t) => !_readOnlyBlockedTool(t?.function?.name));
+  return _applyUserRoleEnums(_applyCloudToolDescs(_withoutDisabledTools(_visible)));
 }
 
 /**
