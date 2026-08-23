@@ -158,3 +158,100 @@ test("放宽命名之后不许开始误报（负向，本仓库实测 0.10/万�
     assert.deepEqual(one(`const ${nm} = 1;`), [], `${nm} 被误报成假数据了`);
   }
 });
+
+// ── 七、「边写边知道有没有洞」──────────────────────────────────────────
+//
+// 用户原话：「实时的知道到底有没有漏洞那些，有的话写的不要写出漏洞」。
+//
+// 为什么不是把 defect_hunting.txt（9.4KB 的漏洞分类表）挂上来：那张表**刻意**只在只读审计
+// 时挂载，server/src/prompts.rs 有一条测试正面钉着 `assemble("2.5:engineering")` 不许含它。
+// 那条契约是对的——写个登录功能不该平白背上整张表。所以走另一条路：不按「这轮是什么任务」
+// 挂整表，按**这一次写进去的代码碰到了什么**递对应的那几条，挂在 _mutationAdvice 上，
+// 跟着这一次写入的工具结果一起回给模型 —— 写的当下就知道，不是收尾时才知道。
+const risks = load("_sinkRisksInWrite");
+const sinkAdvice = load("_sinkRiskAdvice", { _sinkRisksInWrite: risks });
+
+test("六类危险汇聚点各自认得出，且指到行号和原文", () => {
+  const CASES = [
+    ["const q = `SELECT * FROM u WHERE id = ${req.query.id}`;", "SQL 拼接"],
+    ['cur.execute("SELECT * FROM t WHERE n = " + name)', "SQL 拼接"],
+    ["<div dangerouslySetInnerHTML={{__html: c}} />", "HTML 汇聚"],
+    ["eval(userCode)", "动态求值"],
+    ["execSync(`git clone ${repo}`)", "命令注入"],
+    ["data = yaml.load(f)", "不安全反序列化"],
+    ["const u = { ...req.body };", "批量赋值"],
+  ];
+  for (const [code, kind] of CASES) {
+    const got = risks(code);
+    assert.ok(got.length, `漏掉了：${code}`);
+    assert.equal(got[0].kind, kind, `认成了 ${got[0].kind}`);
+    assert.ok(got[0].ask && got[0].ask.length > 20,
+      "没给出可照做的处置——那就退化成一句「小心点」了");
+    assert.ok(got[0].text.includes(code.trim().slice(0, 20)), "原文对不上");
+  }
+});
+
+test("参数绑定和普通代码一个字都不发", () => {
+  for (const clean of [
+    'db.query("SELECT * FROM users WHERE id = ?", [id])',
+    'sqlx::query("SELECT * FROM t WHERE id = $1").bind(id)',
+    "export const add = (a, b) => a + b;",
+    "el.textContent = userName;",
+    "el.innerHTML = html;",            // 裸 innerHTML 刻意不报：本仓库 21.22/万行
+    "const msg = `asset not found: ${rel}`;",
+  ]) {
+    assert.deepEqual(risks(clean), [], `误报：${clean}`);
+  }
+  assert.equal(sinkAdvice({ path: "/p/a.ts", content: "export const add=(a,b)=>a+b;" }), "",
+    "干净代码也发了话——每次写文件都跳一条，模型和用户都会学会略过它");
+});
+
+test("同一段代码同时踩多类时，每类都要报到，且互不遮蔽", () => {
+  const code = [
+    "export async function getUser(req, res) {",
+    "  const q = `SELECT * FROM users WHERE id = ${req.query.id}`;",
+    "  const merged = { ...req.body };",
+    '  el.insertAdjacentHTML("beforeend", `<b>${merged.name}</b>`);',
+    "}",
+  ].join("\n");
+  const got = risks(code);
+  const kinds = got.map((r) => r.kind).sort();
+  assert.deepEqual(kinds, ["HTML 汇聚", "SQL 拼接", "批量赋值"],
+    `有类别被先命中的那条遮住了：${JSON.stringify(kinds)}`);
+  // 行号必须指准：3 行窗口的起点常常不是真正命中的那一行
+  assert.deepEqual(got.map((r) => r.line), [2, 3, 4], "行号没指准");
+});
+
+test("同一处不许被 3 行窗口重复报三次", () => {
+  const got = risks("a();\nconst q = `SELECT * FROM t WHERE id = ${x}`;\nb();");
+  assert.equal(got.length, 1, `同一处报了 ${got.length} 次——刷屏且全是同一条`);
+});
+
+test("话是挂在**这一次写入**上的，不是等收尾", () => {
+  // 这条钉住「实时」本身。两个挂载点（流式写入 + 批处理写入）都要接上，
+  // 漏一个就有一半的写入拿不到。
+  assert.match(SRC, /entry\._mutationAdvice = String\(_debugMutationBlockResult\(run, call, root\) \|\| ""\) \+ _sinkRiskAdvice\(call\)/,
+    "流式那条写入路径没接上");
+  assert.match(SRC, /it\._mutationAdvice = String\(_debugMutationBlockResult\(run, it\.call, root\) \|\| ""\) \+ _sinkRiskAdvice\(it\.call\)/,
+    "批处理那条写入路径没接上");
+  // 拼接必须防住 null——_debugMutationBlockResult 掉出尾部时是 undefined，
+  // 直接相加会给模型一句 "undefined⚠ 这次写入…"
+  assert.doesNotMatch(SRC, /_debugMutationBlockResult\(run, call, root\) \+ _sinkRiskAdvice/,
+    "没防住 null，模型会收到 `null⚠…`");
+});
+
+test("判据在本仓库自己的代码上只留下真发现", () => {
+  // 活校准。六类里五类在 207,820 行上是 0 命中；SQL 那条 0.10/万行、两处都是
+  // `format!(\"UPDATE {table} SET {col} = $1 …\")`——标识符插进 SQL，属真发现不是误报。
+  // 这条一旦涨起来，说明判据被放宽了。
+  // 判据自己的正则字面量会被自己认出来（本仓库踩过的老坑：断言自己被数进去）。
+  // 生产上它扫的是用户写进去的代码，不是自己的源码，所以对照语料要把这个函数剜掉。
+  const selfAt = SRC.indexOf("function _sinkRisksInWrite(");
+  const selfEnd = SRC.indexOf("function _sinkRiskAdvice(", selfAt);
+  assert.ok(selfAt > 0 && selfEnd > selfAt, "剜不出判据自己的函数体，这条校准就失真了");
+  const corpus = SRC.slice(0, selfAt) + SRC.slice(selfEnd);
+  const found = risks(corpus);
+  const noisy = found.filter((r) => r.kind !== "SQL 拼接");
+  assert.deepEqual(noisy.map((r) => `${r.line}: ${r.text}`), [],
+    `除 SQL 外的判据在 main.js 上误报了 ${noisy.length} 处`);
+});
