@@ -22410,10 +22410,10 @@ function _modeRuntimeGuidanceBlock(mode, text, profile = _engineeringProfileWith
     return "\n\n🧭 **Plan 模式纪律（只读，不执行）**：先取证再规划；能读项目就读取关键文件/目录/诊断/diff，不能只凭想象写方案。输出：目标与非目标、证据摘要、关键文件/接口/数据契约、按任务自然拆分的可执行计划（步数不设固定下限/上限，只要具体可核验）、验证命令、风险/未知、交给 Agent 执行的下一句话。禁止写文件、运行有副作用命令或声称已实现。" + uiLine;
   }
   if (mode === "explorer") {
-    return "\n\n🧭 **Explorer 模式纪律（只读侦察）**：用最短证据链摸清代码，不绕圈。目标已知直接 read_file；位置未知才 search/find_files；结构不明才 list_dir；符号/调用方优先 find_symbol/lsp_definition/lsp_references。输出像老手地图：一句结论、证据清单(path:line/命令/诊断)、架构/数据流/调用链、关键约定、风险边界、下一步建议。禁止修改/运行副作用命令。";
+    return "\n\n🧭 **Explorer 模式纪律（只读侦察）**：用最短证据链摸清代码，不绕圈。目标已知直接 read_file；位置未知才 search/find_files；结构不明才 list_dir；符号/调用方优先 find_symbol/lsp_definition/lsp_references。禁止修改/运行副作用命令。";
   }
   if (mode === "reviewer") {
-    return "\n\n🔎 **Reviewer 模式纪律（只读审查）**：先读真实代码、diff、诊断和调用方；只报有证据的问题。按 P0/P1/P2 输出，每条包含 path:line、问题、触发条件/证据、影响、最小修复建议、建议验证；不确定的放“需进一步确认”，不要为了显得全面报假问题。禁止修改/运行副作用命令。";
+    return "\n\n🔎 **Reviewer 模式纪律（只读审查）**：先读真实代码、diff、诊断和调用方；只报有证据的问题。不要为了显得全面报假问题。禁止修改/运行副作用命令。";
   }
   return "";
 }
@@ -25303,7 +25303,7 @@ function _formatStackHint(s) {
   // 这正是"写出来的代码很容易用不了"最直接的一条机器原因。
   //
   // 改成祈使句：验证是**模型自己的活**，而且说清"没人替你跑"。
-  if (s.checkCmd) lines.push(`✅ 快速校验: \`${s.checkCmd}\`（编译/类型检查）——**改完必须你自己跑这条**，没有任何东西会替你自动跑。退出码就是结论。${_unverified(s.checkCmd)}`);
+  if (s.checkCmd) lines.push(`✅ 快速校验: \`${s.checkCmd}\`（编译/类型检查）——**改完必须你自己跑这条**，没有任何东西会替你自动跑。退出码非 0 就是结论——这条没过；退出码 0 只说明这条检查通过了，不等于用户要的事做成了，还要看真实输出和目标后置状态。${_unverified(s.checkCmd)}`);
   if (s.testCmd) lines.push(`🧪 测试: \`${s.testCmd}\`——**改完必须你自己跑**，同样没人会替你跑，也不会有失败报告自动送到你面前。${_unverified(s.testCmd)}`);
   // 有套件就说清位置。只给命令不给位置，模型就会在根目录另起一个脚本——实测如此。
   if (s.testDir) {
@@ -27009,8 +27009,8 @@ function _runStateNextActionSuggestions(sess, { maxAgeMs = 5 * 60_000 } = {}) {
     picks.push({
       label: "运行验证改动",
       send: _cmds.length
-        ? `已经跑起来了(${effects})。现在验一遍改动:${_cmds.map((c) => `\n- \`${c}\``).join("")}\n退出码就是结论,把真实输出给我看。`
-        : `已经跑起来了(${effects})。现在跑一遍这个项目的验证命令(构建/类型检查/测试),把真实输出给我看——退出码就是结论。`,
+        ? `已经跑起来了(${effects})。现在验一遍改动:${_cmds.map((c) => `\n- \`${c}\``).join("")}\n退出码非 0 就是结论——这条没过；退出码 0 只说明这条检查通过了，不等于用户要的事做成了，还要看真实输出和目标后置状态。把真实输出给我看。`
+        : `已经跑起来了(${effects})。现在跑一遍这个项目的验证命令(构建/类型检查/测试),把真实输出给我看——退出码非 0 就是结论——这条没过；退出码 0 只说明这条检查通过了，不等于用户要的事做成了，还要看真实输出和目标后置状态。`,
     });
   }
 
@@ -29704,7 +29704,7 @@ async function _agentRunInTerminal(root, command, stepEl, explicitTimeoutSecs) {
   // 到点子进程被杀，模型收到 exit -1 加一句"长时间运行的命令请在终端里手动运行"——
   // 而它**没有任何办法**说"再给我 600 秒"：schema 里根本没有这个参数。于是它要么反复
   // 重跑反复被杀，要么听劝改用 run_in_terminal，而那条路长命令拿不到退出码，恰恰毁掉
-  // purpose:"verify" 承诺的"退出码就是结论"。
+  // purpose:"verify" 承诺的那条判据（非 0 是结论；0 只说明这条检查过了）。
   // 后端一直支持到 600 秒（tasks.rs 的 TASK_TIMEOUT_SECS），能力是现成的，只是没暴露。
   const _explicit = Number(explicitTimeoutSecs);
   const timeoutSecs = Number.isFinite(_explicit) && _explicit > 0
@@ -46879,6 +46879,21 @@ function _freshBuildFailure(run, implOps) {
     if (e.implementationVersion !== implOps) continue; // only the current artifact may drive another fix pass
     if (e.timedOut === true) continue;
     if (typeof e.exitCode !== "number") continue;
+    // 验证器**自己没起来**不是代码坏了的证据。
+    //
+    // agent_engineering.txt:32 逐字写着：「A verifier that cannot run is NOT evidence the code is
+    // broken, and is not a reason to wrap up. Exit 127/126 (command not found), a missing
+    // dependency, or a missing environment asserts nothing about the code」——而这道红构建门
+    // 照单把 127 当成「构建/测试没过，代码现在跑不起来」推给模型，逼它去修一个根本没被
+    // 检查过的代码。用户现场就撞过：`vhs demo.tape` 连着两次退出 127（工具没装），
+    // 而门给的指示是「先读真实错误、定位并修掉根因」——根因是没装 vhs，不在代码里。
+    //
+    // 判据用退出码 + 运行器级的「找不到」，不看代码里的报错文本：命令没找到是**执行事实**，
+    // 而正文里出现 "not found" 完全可能是被测代码自己打印的。
+    const _cannotRun = e.exitCode === 127 || e.exitCode === 126
+      || /^(?:[^\n]{0,80}?:\s*)?(?:command not found|not found|no such file or directory)\b/im
+        .test(String(e.output || e.tail || "").slice(0, 400));
+    if (_cannotRun) continue;
     // last-write-wins 是**按命令**算的，不是全局的。
     //
     // 全局版的原意没错：「跑一次红 → 改好 → 再跑同一条命令绿」之后，那条更早的红不该
@@ -51170,7 +51185,7 @@ function _agentDecisionFrameBlock(text, profile = _engineeringProfileWithAiInten
     //
     // 这是"写出来的代码用不了"最直接的一条机器原因。修法只有两条：把机器真接上，
     // 或者别再承诺它。先选后者——承诺一个不存在的能力，比没有这个能力糟得多。
-    lines.push(`🏁 收尾验收契约（harness 收尾**只机械核对两件事**：改过代码有没有真跑过验证、改过界面有没有浏览器验过；取证与运行/外部义务这几项没有任何门会核对、缺了也不会拦你，代价直接落在交付上。所以把它们当作任务的一部分提前做掉，别指望收尾有人提醒）：${_finishChecks.length ? _finishChecks.map((check, index) => `${index + 1}. ${check}`).join("；") + "；" : ""}改过代码就**自己跑一遍**本项目的构建/测试命令（没有任何东西会替你自动跑，也不会有失败报告自动送到你面前）——退出码就是结论。确实做不到的项，收尾如实写明未完成及原因。`);
+    lines.push(`🏁 收尾验收契约（harness 收尾**只机械核对两件事**：改过代码有没有真跑过验证、改过界面有没有浏览器验过；取证与运行/外部义务这几项没有任何门会核对、缺了也不会拦你，代价直接落在交付上。所以把它们当作任务的一部分提前做掉，别指望收尾有人提醒）：${_finishChecks.length ? _finishChecks.map((check, index) => `${index + 1}. ${check}`).join("；") + "；" : ""}改过代码就**自己跑一遍**本项目的构建/测试命令（没有任何东西会替你自动跑，也不会有失败报告自动送到你面前）——退出码非 0 就是结论——这条没过；退出码 0 只说明这条检查通过了，不等于用户要的事做成了，还要看真实输出和目标后置状态。确实做不到的项，收尾如实写明未完成及原因。`);
   }
   return lines.join("\n");
 }
@@ -54233,7 +54248,7 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
         if (_runtimeStateBlock) _parts.push(_runtimeStateBlock);
         if (_evidenceBlock) _parts.push(_evidenceBlock);
         if (_latestDiagBlock) _parts.push(_latestDiagBlock);
-        _parts.push("目标文件/终端/API/DB线索已经知道时直接用对应工具读取，不要再用 search/find/cd/ls 绕一圈；只有位置未知时才搜索一次定位。若实时诊断、终端、日志、HTTP 或数据库返回 error，先解释根因并修掉再收尾；不要带着红线/红日志声称完成。接着完成尚未完成的动作。");
+        _parts.push("目标文件/终端/API/DB线索已经知道时直接用对应工具读取，不要再用 search/find/cd/ls 绕一圈；只有位置未知时才搜索一次定位。若终端、日志、HTTP 或数据库返回 error，先解释根因并修掉再收尾（实时诊断按**新增**算：本轮引入的红线要清掉，动手之前就有的不算你的账，判据见诊断块自己那句）；不要带着红线/红日志声称完成。接着完成尚未完成的动作。");
         // 这一条是**每轮都在、而且总排在最后**的那块。最后一位是模型注意力最高的位置，
         // 用户真正的请求反而被顶到上面去了——实拍后果：模型在思考里逐条讨论这里的规则，
         // 最后写下"这一轮没有新的用户指令"，然后回了一段跟提问毫无关系的收尾话。
@@ -54829,7 +54844,7 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
               String(_buildFail.stdout || "").slice(-1600),
               String(_buildFail.stderr || "").slice(-1600),
             ].filter((part) => part.trim()).join("\n--- stderr ---\n");
-            _pushNudge("buildFix", `[BUILD_FAILED] 上次声明为验证的命令 \`${_buildFail.command}\` 退出码 ${_buildFail.exitCode}——构建/测试没过，代码现在跑不起来。这是交付前必须清零的硬事实（退出码即结论）。先读下面的真实错误、定位并修掉根因，再重新运行同一条验证命令确认退出 0；在拿到绿色之前不要收尾、不要转去做别的：\n\n${_tail}`);
+            _pushNudge("buildFix", `[BUILD_FAILED] 上次声明为验证的命令 \`${_buildFail.command}\` 退出码 ${_buildFail.exitCode}——构建/测试没过，代码现在跑不起来。这是交付前必须清零的硬事实。先读下面的真实错误、定位并修掉根因，再重新运行同一条验证命令确认退出 0；在拿到绿色之前不要收尾、不要转去做别的：\n\n${_tail}`);
             continue;
           }
           // 预算用完、或者续跑闸门本来就是关着的：两种情况都不再推提醒，但账一样要记。
@@ -55492,7 +55507,14 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
         // 而它刚被要求先规划——最省事的下一步就是再规划一次。真实执行记录里
         // 开局连发 4~5 次 update_plan 的轮次，65% 没跑成。
         const _firstOpen = planSteps.find((x) => x && x.status !== "completed" && x.status !== "cancelled");
-        const _goDo = planSteps.length && !completionIssue
+          // 「去做第一步」只对 agent 模式成立。那条实测（开局连发 4~5 次 update_plan、65% 跑不成）
+          // 也只发生在 agent 模式；plan 模式本来就不该有第二步动作，对它说这句等于让一句工具回执
+          // 推翻模式契约（plan.txt 三处写着 never modify files / never run commands）。
+          const _goDo = run.mode !== "agent"
+            ? (planSteps.length && !completionIssue
+              ? "\n计划已收下。把它连同取证、风险和验证命令写成最终方案交给用户——本模式不执行其中任何一步。"
+              : "")
+            : planSteps.length && !completionIssue
           ? `\n计划已收下，**现在去做第一步**${_firstOpen ? `：${_firstOpen.content}` : ""}。别再调 update_plan——只有在某一步真的做完、或路线要改时才更新它。`
           : "";
         const _planMsg = _planSummary(planSteps, it.call.rawSteps)
@@ -56211,8 +56233,13 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
         // 「你在第几步」，没有一句「那就别说完成」。于是 harness 明明记着 plan_steps_pending，
         // 模型正文照样写「已完成」——和「README.md 已更新」而文件没动是同一族：harness 知道，
         // 模型照说不误。要让「完成」这两个字当场撞上一条摆在面前的事实。
-        const _openSteps = (Array.isArray(run._planSteps) ? run._planSteps : [])
-          .filter((st) => st?.status === "pending" || st?.status === "in_progress");
+        // 只在 agent 模式说这句。plan 模式的契约是「只出方案、不动手」——plan.txt 里三处写着
+        // never modify files / never run commands——对它说「要么继续做」正是逼它违约。
+        // （同循环里 _facts 早就是 `run.mode === "agent" ? … : ""`，这里对齐它。）
+        const _openSteps = run.mode === "agent"
+          ? (Array.isArray(run._planSteps) ? run._planSteps : [])
+            .filter((st) => st?.status === "pending" || st?.status === "in_progress")
+          : [];
         const _openLine = _openSteps.length
           ? `\n还没做完的步骤有 ${_openSteps.length} 个：`
             + _openSteps.slice(0, 4).map((st) => String(st?.content || "").slice(0, 40)).join("、")
