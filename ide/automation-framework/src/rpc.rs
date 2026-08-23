@@ -683,25 +683,45 @@ impl RpcServer {
             // 实测真实窗口下 500 个元素要 95 秒，而读屏的上限是 6 秒——必然超时。
             // 这里是进程内 C 调用。
             #[cfg(all(feature = "system", target_os = "macos"))]
-            "screen.elements" => {
+            "screen.elements" | "screen.probe" => {
                 drop(agent);
                 let cap = params.get("cap").and_then(|v| v.as_u64()).unwrap_or(500) as usize;
-                // 不给 pid 就读**当前前台**——这是九成的用法，省一次 window.list 往返。
+                // probe = 只看一眼，**不换句柄表**。轮询式的屏幕检查（background_monitor
+                // 的 screen 类型）必须走这条：普通读屏每次都会 CFRelease 掉上一批句柄，
+                // 于是模型上一次 read_screen 拿到的 ref 会被后台轮询悄悄作废。
+                let probe = method == "screen.probe";
+                // 目标解析：pid 最准，app 是给调用方按名字指的（模型只知道名字）。
+                // 两者都没有才读前台——那是九成的用法，省一次 window.list 往返。
                 let pid = match params.get("pid").and_then(|v| v.as_i64()) {
                     Some(p) if p > 0 => p as i32,
-                    _ => crate::platform::macos_tree::frontmost_pid().ok_or_else(|| {
-                        Error::Other(anyhow::anyhow!("读不到当前前台应用；给 pid 参数指定目标"))
-                    })?,
+                    _ => match params.get("app").and_then(|v| v.as_str()).map(str::trim) {
+                        Some(a) if !a.is_empty() => crate::platform::macos_tree::pid_of(a)
+                            .ok_or_else(|| {
+                                // 名字对不上就**报错**，绝不"退回读前台"：那会让模型以为
+                                // 自己读的是 A，实际读的是别的应用，然后基于这份内容去点。
+                                Error::Other(anyhow::anyhow!(
+                                    "没有找到名字里含「{a}」的运行中应用；用 window.list 看准确名字，或直接给 pid"
+                                ))
+                            })?,
+                        _ => crate::platform::macos_tree::frontmost_pid().ok_or_else(|| {
+                            Error::Other(anyhow::anyhow!("读不到当前前台应用；给 app 或 pid 参数指定目标"))
+                        })?,
+                    },
                 };
                 let t0 = std::time::Instant::now();
-                let nodes = crate::platform::macos_tree::snapshot(pid, cap);
+                let nodes = if probe {
+                    crate::platform::macos_tree::snapshot_probe(pid, cap)
+                } else {
+                    crate::platform::macos_tree::snapshot(pid, cap)
+                };
                 // pid 和应用名要一起回：调用方（read_screen）拿它装 ref 表，
                 // 没有身份就没法在动作时校验「读的还是不是同一个 app」。
-                let app_name = crate::platform::get_window_controller()
-                    .enumerate_windows()
-                    .ok()
-                    .and_then(|ws| ws.into_iter().find(|w| w.is_frontmost).map(|w| w.title))
-                    .unwrap_or_default();
+                //
+                // 名字必须**按刚才真正读的那个 pid 反查**。原来这里取的是
+                // enumerate_windows() 里 is_frontmost 那一条的标题——只读前台时碰巧
+                // 总是对的，一旦支持指定目标就成了系统性的假话：读的是 A，回执说是 B，
+                // 而下游正是拿这个名字当身份去做「还是不是同一个 app」的校验。
+                let app_name = crate::platform::macos_tree::name_of(pid).unwrap_or_default();
                 Ok(serde_json::json!({
                     "elements": nodes,
                     "count": nodes.len(),
@@ -709,6 +729,8 @@ impl RpcServer {
                     "took_ms": t0.elapsed().as_millis() as u64,
                     "pid": pid,
                     "app": app_name,
+                    // 明说这次读有没有动过句柄表，调用方不用靠方法名去猜。
+                    "refs_installed": !probe,
                 }))
             }
             // 对上一次 screen.elements 里的某个 ref 执行 AX 动作。用的是**留下来的句柄**，

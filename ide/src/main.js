@@ -21045,6 +21045,9 @@ function _approvalKey(call, run = null) {
   if (call.type === "cmd" || call.type === "termtask") return `${scope}\0cmd:${String(call.command || "").trim().replace(/\s+/g, " ")}`;
   if (call.type === "automation") return `${scope}\0automation:${call.method || "?"}`;
   if (call.type === "uiclick") return `${scope}\0ui:${call.action || "?"}:${Number.isInteger(call.ref) ? call.ref : "?"}`;
+  // 读的是哪个 app 必须进指纹。不进的话「读 Chrome」和「读 Finder」会被当成同一次
+  // 读取重复调用而被拦掉，模型于是拿着上一个应用的元素去点下一个应用。
+  if (call.type === "readscreen") return `${scope}\0screen:${call.pid || call.app || "front"}:${call.ocr ? "ocr" : "ax"}`;
   if (call.type === "mcp") return `${scope}\0mcp:${call.mcpRoot || root}:${call.server || "?"}/${call.tool || call.mcpName || "?"}`;
   if (call.type === "git") {
     const args = call.op === "clone"
@@ -21172,7 +21175,7 @@ function _approvalLabel(call) {
     };
     case "format": return { title: "格式化文件？", detail: call.path || "" };
     case "automation": return { title: "桌面自动化？", detail: (call.method || "") + (call.params ? "  " + JSON.stringify(call.params).slice(0, 120) : "") };
-    case "uiclick": return { title: "操作前台应用？", detail: `${call.action || "press"} ref=${Number.isInteger(call.ref) ? call.ref : "?"}` };
+    case "uiclick": return { title: "操作应用界面？", detail: `${call.action || "press"} ref=${Number.isInteger(call.ref) ? call.ref : "?"}` };
     case "download": return { title: "下载文件到工作区？", detail: (call.url || "") + "  →  " + (call.dest || "") };
     case "db": return { title: `执行数据库操作（${call.driver || "db"}）？`, detail: (call.query || "").slice(0, 300) };
     case "gh": return {
@@ -35738,8 +35741,8 @@ function _buildAgentToolSchemas(includeWrite, mcpTools = []) {
     { type: "function", function: { name: "live_environment", description: "Query structured public environment and hazard sources that need no API key: Open-Meteo weather / air quality / marine, USGS earthquakes, NASA EONET natural events. Each call returns records, per-source success/empty/failed, data_as_of, retrieved_at and the applicable limits. Open-Meteo is a time-stamped gridded model estimate and must not be described as an on-site sensor measurement; an empty result likewise does not mean there is no risk. weather/air_quality/marine require coordinates the user gave explicitly or authorized you to obtain — never infer a location from IP address or timezone.", parameters: { type: "object", properties: { kind: { type: "string", enum: ["weather", "air_quality", "marine", "earthquakes", "natural_hazards"] }, latitude: { type: "number", minimum: -90, maximum: 90 }, longitude: { type: "number", minimum: -180, maximum: 180 }, radius_km: { type: "integer", minimum: 1, maximum: 20000, description: "Optional radius for earthquakes" }, window: { type: "string", enum: ["hour", "day", "week", "month"], description: "Time window for earthquakes" }, minimum_magnitude: { type: "number", minimum: -1, maximum: 10 }, category: { type: "string", description: "NASA EONET category id, e.g. wildfires" }, limit: { type: "integer", minimum: 1, maximum: 50 } }, required: ["kind"], anyOf: [{ properties: { kind: { enum: ["weather", "air_quality", "marine"] } }, required: ["latitude", "longitude"] }, { properties: { kind: { enum: ["earthquakes", "natural_hazards"] } } }] } } },
     { type: "function", function: { name: "performance_profile", description: "Analyse a front-end page's performance metrics and produce a report. It drives the browser to inject the Performance API for timing data and pairs that with screenshots to confirm the page's state. Good for tracking down slow loads and render jank. 【When to use】When a page stutters or loads slowly, run this first to get real timing data and locate the bottleneck — do not read the code and guess \"it is probably rendering\".", parameters: { type: "object", properties: { url: { type: "string", description: "Target page URL (must start with http://localhost or http://127.0.0.1)" }, metrics: { type: "string", enum: ["cpu", "memory", "both"], description: "What to monitor: cpu = CPU usage, memory = memory usage, both = both", default: "both" }, timeoutSeconds: { type: "number", description: "Timeout in seconds, default 30", default: 30 } }, required: ["url"] } } },
     { type: "function", function: { name: "openapi_parser", description: "Extract the list of usable endpoints from a Swagger/OpenAPI JSON specification. Accepts a local file path (starting with ./) or a public URL, and can output the endpoint list, the schema, JSON, or curl examples.", parameters: { type: "object", properties: { url: { type: "string", description: "File path or URL of the OpenAPI JSON specification (local paths start with ./, public ones with https/http)" }, outputFormat: { type: "string", enum: ["list", "schema", "client"], description: "Output format: list = one endpoint per line, schema = the full JSON as escaped text, client = a curl example template", default: "list" } }, required: ["url"] } } },
-    { type: "function", function: { name: "read_screen", description: "Read the accessibility elements the frontmost application actually exposes (role, name, value, whether it is enabled, and screen coordinates). **A browser is one of those applications, and its tree includes the rendered page** — links, buttons, form fields and text, each with real screen coordinates. That is how you operate the user's own already-running browser, the one CDP cannot attach to: bring it to the front, read it here, then act by ref with ui_click — page links, buttons, text fields and dropdowns all expose real AX actions, so the reliable path involves no coordinates at all. Fall back to coordinate clicking only for what exposes no action. When the result is empty, do not guess why — the tool names the cause (missing permission / the read did not complete / every window minimized / the app genuinely exposes nothing). Only the last one means a retry is pointless; the rest are fixable, usually by bringing the window to the front and reading again. ocr=true is a macOS on-screen text-recognition fallback; an OCR ref is not an actionable AX node.", parameters: { type: "object", properties: { ocr: { type: "boolean", description: "Set true only when the frontmost application has no accessibility tree; may require Screen Recording permission" } }, required: [] } } },
-    { type: "function", function: { name: "ui_click", description: "Perform press, set_value or focus on a real accessibility ref returned by read_screen. **This works on web page elements too** — a browser exposes its links, buttons, text fields and dropdowns as AX nodes that support a real press, so this is how you operate the user's own already-running browser (the one CDP cannot attach to) without touching a single coordinate. Only direct manipulation of macOS AX nodes is supported; re-run read_screen after the interface changes, and OCR refs may not be passed in.", parameters: { type: "object", properties: { ref: { type: "integer", minimum: 0, description: "The element ref returned by read_screen" }, action: { description: "press = click, set_value = set the value, focus = focus it, scroll_to = scroll the element into view (the AX tree only covers the visible screen, so anything below the fold must be scrolled in before it can be read or pressed; note that scrolling invalidates every ref from the previous read — read_screen again after it)", type: "string", enum: ["press", "set_value", "focus", "increment", "decrement", "show_menu", "confirm", "cancel", "pick", "scroll_to"] }, value: { type: "string", description: "For set_value: the text to enter" } }, required: ["ref"] } } },
+    { type: "function", function: { name: "read_screen", description: "Read the accessibility elements the frontmost application actually exposes (role, name, value, whether it is enabled, and screen coordinates). **A browser is one of those applications, and its tree includes the rendered page** — links, buttons, form fields and text, each with real screen coordinates. That is how you operate the user's own already-running browser, the one CDP cannot attach to: bring it to the front, read it here, then act by ref with ui_click — page links, buttons, text fields and dropdowns all expose real AX actions, so the reliable path involves no coordinates at all. Fall back to coordinate clicking only for what exposes no action. When the result is empty, do not guess why — the tool names the cause (missing permission / the read did not complete / every window minimized / the app genuinely exposes nothing). Only the last one means a retry is pointless; the rest are fixable, usually by bringing the window to the front and reading again. ocr=true is a macOS on-screen text-recognition fallback; an OCR ref is not an actionable AX node. **By default this reads the frontmost app — pass `app` (or `pid`) to read one that is NOT in front**, which is what you want whenever the front window is Mr. Day One itself, or when you must not steal focus from what the user is doing. ui_click then acts on that same app without bringing it forward.", parameters: { type: "object", properties: { ocr: { type: "boolean", description: "Set true only when the frontmost application has no accessibility tree; may require Screen Recording permission. Cannot be combined with app/pid — OCR photographs the screen, so it only ever covers the frontmost window." }, app: { type: "string", description: "Read THIS application instead of whichever one is in front. Match is exact-name-first, then case-insensitive substring (\"Chrome\" finds \"Google Chrome\"). If nothing matches you get an error naming the problem — it never silently falls back to the frontmost app. Use system window.list to see exact names." }, pid: { type: "integer", description: "Read the app with this process id. Wins over app when both are given." } }, required: [] } } },
+    { type: "function", function: { name: "ui_click", description: "Perform press, set_value or focus on a real accessibility ref returned by read_screen. **This works on web page elements too** — a browser exposes its links, buttons, text fields and dropdowns as AX nodes that support a real press, so this is how you operate the user's own already-running browser (the one CDP cannot attach to) without touching a single coordinate. **The ref carries its own target**: if read_screen was pointed at a specific app, ui_click acts on that same app — it does NOT need to be in front, and pressing does not bring it forward. Refs from one app are refused on another (pid + name are both checked), so a ref never lands on the wrong window. Only direct manipulation of macOS AX nodes is supported; re-run read_screen after the interface changes, and OCR refs may not be passed in.", parameters: { type: "object", properties: { ref: { type: "integer", minimum: 0, description: "The element ref returned by read_screen" }, action: { description: "press = click, set_value = set the value, focus = focus it, scroll_to = scroll the element into view (the AX tree only covers the visible screen, so anything below the fold must be scrolled in before it can be read or pressed; note that scrolling invalidates every ref from the previous read — read_screen again after it)", type: "string", enum: ["press", "set_value", "focus", "increment", "decrement", "show_menu", "confirm", "cancel", "pick", "scroll_to"] }, value: { type: "string", description: "For set_value: the text to enter" } }, required: ["ref"] } } },
     {
       type: "function",
       function: {
@@ -35915,7 +35918,7 @@ function _buildAgentToolSchemas(includeWrite, mcpTools = []) {
       { type: "function", function: { name: "design_board", description: "**Lay several design comps or images out for the user in a professional grid, and return their choice to you once they click \"take this direction\"** (interactive, like the multi-direction pickers in Midjourney/Lovable). When designing UI, first generate 2-6 comps in different directions with generate_image, then call design_board to arrange them into a clean comparison grid — **the tool pauses and waits for the user to choose**. The user can click to view an image full size, and once they pick a direction with the button, the return value tells you which one they chose (label + path + description), so **you do not need to ask them what they picked** — just continue from the result. It lays out 2-9 images intelligently: 2 = side by side, 3 = hero layout, 4 = 2×2, 5 = 3+2 staggered, 6 = 3×2, 9 = 3×3. **In a UI design workflow you must use this to present the comps once you have generated several — do not post them one at a time.**", parameters: { type: "object", properties: { title: { type: "string", description: "Board title, e.g. \"Landing page design directions\" or \"Dashboard layout options\"" }, variants: { type: "array", minItems: 2, maxItems: 9, items: { type: "object", properties: { label: { type: "string", description: "Option name, e.g. \"Minimal white\", \"Dark tech\", \"Warm and rounded\"" }, path: { type: "string", description: "Image path (where generate_image saved it earlier, relative to the workspace root)" }, description: { type: "string", description: "One sentence describing what characterizes this direction" } }, required: ["label", "path"] } } }, required: ["variants"] } } },
       { type: "function", function: { name: "db_query", description: "**Query and operate a database directly** — MySQL / PostgreSQL / SQLite (SQL) and Redis (commands) are supported. Work from real data instead of guessing: inspect a table's structure, read rows, check a single record, run a migration, look at cache keys. Results are echoed back to you as a **table**. SELECT/SHOW/DESCRIBE and friends return columns and rows; INSERT/UPDATE/DELETE return the affected row count; the timeout is 20s and at most 500 rows come back by default. ⚠️ The connection string, and whether writes are allowed, come from the user — never connect to an external database on your own initiative. Be careful with writes (changing or deleting data, migrations); when unsure, SELECT first and look. If a date, decimal, json or similar special type shows up as <typename>, CAST it to text in the SQL. 【When to use】To confirm a table's structure or the real data, query it directly (SHOW TABLES and so on) — more accurate than guessing the schema from migration files.", parameters: { type: "object", properties: { driver: { type: "string", enum: ["mysql", "mariadb", "postgres", "sqlite", "mssql", "mongodb", "redis", "clickhouse", "elastic"], description: "Database type" }, url: { type: "string", description: "Connection string: for MySQL/PostgreSQL pass DATABASE_URL; for SQLite use sqlite:///abs/path.db or sqlite://relative.db; for Redis use redis://host:6379/0" }, query: { type: "string", description: "The SQL statement, or a Redis command line (e.g. GET key, KEYS user:*, HGETALL h)" }, limit: { type: "integer", description: "Maximum rows to return (default 500, maximum 2000)" } }, required: ["driver", "url", "query"] } } },
       { type: "function", function: { name: "figma", description: "**Give you a Figma design file in structured form — read the real design data rather than copying a screenshot.** Use it when the user supplies a Figma link and wants \"build this / recreate this design / turn it into code / extract the palette, spacing and type scale\"; never copy pixels screen by screen with browser. It returns two things: (1) colour tokens — the colours used in Figma converted to OKLCH (a perceptually uniform colour space), mapped by hue band onto shadcn/ui semantic variables (brand colour → --primary, red → --destructive, green → --success, orange → --warning, and neutrals assigned by area to --background/--card/--muted/--border), with contrast-compliant -foreground pairings, ready to paste straight into globals.css (registered with @theme inline under Tailwind v4, and shadcn components read the CSS variables and pick it up with no change to component source); (2) structured layout — the hierarchy tree with Auto Layout (direction/spacing/padding/alignment), sizes, corner radii, real copy, font size and weight, and fill colours, enough to recreate it precisely in React + Tailwind + shadcn. Colour extraction has three fallback tiers: the Variables API first (named semantics, the most accurate) → named colour styles → clustering the real fills (most handoff and community files only have this tier, and it still yields a usable theme). Choose action: design (the default, theme + layout in one call, the common case) / tokens (just the shadcn colour theme) / inspect (just the layout; raise depth for more detail) / image (render a node to a PNG reference image, returning a temporary link you can persist with download_file) / variables (export the raw named tokens). **Works in both the desktop and web versions** (each over its own network channel; Figma allows CORS). First use requires a Figma personal access token in Settings (figma.com → Settings → Security → Personal access tokens, with File content read permission); without one the tool says so. Figma rate-limits by cost, and the tool already has session caching, a depth ceiling and graceful 429 backoff built in — do not repeatedly re-fetch everything in a short window.", parameters: { type: "object", properties: { url: { type: "string", description: "The Figma file / frame URL (of the form https://www.figma.com/design/<key>/name?node-id=1-2), or just the file key. To resolve one specific frame or component rather than the whole file: right-click that frame in Figma → Copy link to selection; the copied URL carries the node-id, which is both precise and easy on your quota." }, action: { type: "string", enum: ["design", "tokens", "inspect", "image", "variables"], description: "design = colour theme + structured layout in one call (default, the common case); tokens = just the shadcn/Tailwind colour theme; inspect = just the structured layout (pair with a larger depth to see deeper levels); image = render the given node to a PNG reference image; variables = export the raw named design tokens." }, node: { type: "string", description: "Optional; an explicit node id (overriding the node-id in the URL), of the form 123:456." }, depth: { type: "integer", description: "Optional; layout parsing depth, default 14. Deeper shows finer levels of the hierarchy but is slower and consumes more of the Figma quota. For overall structure only, use a small value (e.g. 4); to recreate details precisely, use a larger one." } }, required: ["url"] } } },
-      { type: "function", function: { name: "background_monitor", description: "**Whenever a step needs the user to do something by hand or depends on an external condition, you must call this tool: first tell the user what to do (paste the link, give the command, list the steps), then immediately park in the background and wait automatically, so that when the condition is met you resume and carry on without the user having to come back and say \"done\".** Typical cases: a verification code is needed → tell the user to enter it and monitor the result; something must be installed → give the install command and monitor `which xxx` returning 0; a service must be started → give the start command and monitor the port; the user must act in a browser → give the link and monitor the outcome with capture/url/file. Six check types are available; **prefer the ones that detect automatically (port/file/command/url/capture) — manual is the last resort.**", parameters: { type: "object", properties: { message: { type: "string", description: "Tell the user what is being waited on (shown in the chat)" }, check_type: { type: "string", enum: ["capture", "file", "manual", "command", "url", "port"], description: "manual = wait for the user to click continue; file = wait for a file to appear (with file_pattern, wait for its contents to match); capture = watch captured traffic for pattern; command = re-run a command until it exits 0; url = re-request a URL until it answers 2xx or 3xx (a redirect counts as reachable); port = wait for a port to be listening" }, pattern: { type: "string", description: "capture: keyword/regex to match; file: file path; command: shell command; url: full URL; port: port number such as 3000" }, file_pattern: { type: "string", description: "file type only: match on file content (keyword or regex); once set, it checks not just that the file exists but that its contents contain this pattern" }, timeout: { type: "integer", description: "Timeout in seconds, default 300" } }, required: ["check_type"] } } },
+      { type: "function", function: { name: "background_monitor", description: "**Whenever a step needs the user to do something by hand or depends on an external condition, you must call this tool: first tell the user what to do (paste the link, give the command, list the steps), then immediately park in the background and wait automatically, so that when the condition is met you resume and carry on without the user having to come back and say \"done\".** Typical cases: a verification code is needed → tell the user to enter it and monitor the result; something must be installed → give the install command and monitor `which xxx` returning 0; a service must be started → give the start command and monitor the port; the user must act in a browser → give the link and monitor the outcome with capture/url/file. **Prefer the check types that detect automatically (port/file/command/url/capture/screen) — manual is the last resort, because it makes the user come back and tell you they are done.** When what you asked for leaves no file, port or request behind — dismiss this dialog, finish this login, flip that switch — use `screen`: it watches the app's on-screen text and resumes the moment your pattern appears.", parameters: { type: "object", properties: { message: { type: "string", description: "Tell the user what is being waited on (shown in the chat)" }, check_type: { type: "string", enum: ["capture", "file", "manual", "command", "url", "port", "screen"], description: "manual = wait for the user to click continue; file = wait for a file to appear (with file_pattern, wait for its contents to match); capture = watch captured traffic for pattern; command = re-run a command until it exits 0; url = re-request a URL until it answers 2xx or 3xx (a redirect counts as reachable); port = wait for a port to be listening; screen = watch an application's on-screen UI text until `pattern` shows up (macOS accessibility tree). **screen is what you use when the thing you asked the user to do has no file, port or request behind it** — a dialog they must dismiss, a login they must finish, a switch they must flip, a progress bar reaching Done. Set `app` to the application to watch. It reads without stealing focus and WITHOUT invalidating any ref you got from read_screen." }, pattern: { type: "string", description: "capture: keyword/regex to match; file: file path; command: shell command; url: full URL; port: port number such as 3000" }, file_pattern: { type: "string", description: "file type only: match on file content (keyword or regex); once set, it checks not just that the file exists but that its contents contain this pattern" }, app: { type: "string", description: "screen type only: which application's UI to watch (name match, e.g. \"Safari\"). Omit to watch whichever app is in front, which is rarely what you want — while you wait, the front app is often Mr. Day One itself." }, timeout: { type: "integer", description: "Timeout in seconds, default 300" } }, required: ["check_type"] } } },
       { type: "function", function: { name: "start_demo", description: "Start recording the operations that follow as a **feature demonstration / real screen recording**. Once started, walk through the key flow of the feature you just built for real using browser / computer / screenshot (open the page → click the button → fill the form → see the result…), and **every action is automatically recorded as a real screenshot frame**. Use it when a feature is finished and you want to show the user what it looks like running.", parameters: { type: "object", properties: { title: { type: "string", description: "Title for this demonstration, e.g. Sign-in flow walkthrough" } } } } },
       { type: "function", function: { name: "stop_demo", description: "End the recording and **play the captured steps back to the user one step at a time** (a playable player appears directly in the chat), while saving the demonstration to the workspace as an HTML recording that can be double-clicked and played. Use it to close out each finished feature once you have walked the flow.", parameters: { type: "object", properties: { path: { type: "string", description: "Optional; where to save the HTML (relative to the workspace root); default .mrdayone-demos/demo-<timestamp>.html" } } } } },
       { type: "function", function: { name: "preview_choices", description: "**Show the user a live preview of several candidate approaches inside the chat.** Two modes are supported: (1) **front-end visual options** — genuinely rendered CSS animations/effects/components/palette cards (the animation actually moves, the shadow actually glows); (2) **back-end or architecture options** — explained as a comic storyboard (character dialogue + everyday analogy + frame-by-frame animation), so a user who does not read code still gets it at a glance. **A back-end option must use an everyday analogy**: JWT → a passport, Session → a hotel key card, Cache → a convenience-store shelf, DB → a warehouse, a shared table → an open-plan office, schema isolation → an apartment building, database isolation → a detached house. Build it from the system's built-in CSS classes .pv-scene (scene panel) + .pv-avatar (character portrait) + .pv-bubble (speech bubble) + .pv-verdict (pros/cons tag) + .pv-speed (speed comparison bar), and add a data-t attribute to control entry timing (the system fades the frames in, in time order, automatically). See the HTML structure template in the system prompt.", parameters: { type: "object", properties: { title: { type: "string", description: "Preview title, e.g. \"Choose a sign-in method\" or \"How should the data load faster\"" }, target: { type: "string", description: "Target element / scenario, e.g. \"user authentication\" or \"product list caching strategy\"" }, variants: { type: "array", minItems: 2, maxItems: 8, items: { type: "object", properties: { name: { type: "string", description: "Option name (use the analogy): \"Passport method (JWT)\", \"Hotel key card (Session)\", \"Convenience store (cache)\"" }, html: { type: "string", description: "Front-end: the demo HTML. Back-end: build a comic storyboard from the built-in classes pv-scene/pv-avatar/pv-bubble/pv-verdict/pv-speed (see the system prompt template), with data-t to control entry timing" }, css: { type: "string", description: "CSS for a front-end option (scoped automatically); the back-end comic mode usually needs no extra CSS (the built-in classes are enough)" }, code: { type: "string", description: "The final code written into the project once the user picks this option (React/Vue component code + Tailwind class names, not bare HTML/CSS)" }, description: { type: "string", description: "One sentence, using the everyday analogy: \"The user carries a passport; verification is very fast but losing it is trouble\"" } }, required: ["name", "html", "css"] } } }, required: ["variants"] } } },
@@ -37614,7 +37617,15 @@ function _mapToolCall(name, args, mcpToolMap = _mcpToolMap) {
     case "find_files": return { type: "find", path: args.pattern || "", pattern: args.pattern || "", limit: Number.isFinite(+args.limit) ? +args.limit : 0 };
     case "web_fetch": return { type: "web", path: args.url || "", url: args.url || "" };
     case "web_search": return { type: "websearch", path: String(args.query || ""), query: String(args.query || "") };
-    case "read_screen": return { type: "readscreen", ocr: !!args.ocr };
+    case "read_screen": {
+      const _rsPid = Number(args.pid ?? args.process_id ?? args.processId);
+      return {
+        type: "readscreen",
+        ocr: !!args.ocr,
+        app: String(args.app || args.app_name || args.appName || args.application || "").trim(),
+        pid: Number.isFinite(_rsPid) && _rsPid > 0 ? Math.floor(_rsPid) : 0,
+      };
+    }
     case "ui_click": {
       const ref = _finiteNumberArg(args.ref);
       return { type: "uiclick", ref: ref !== null && ref >= 0 ? Math.floor(ref) : null, action: String(args.action || "press"), value: args.value == null ? null : String(args.value) };
@@ -37891,6 +37902,7 @@ function _mapToolCall(name, args, mcpToolMap = _mcpToolMap) {
         checkType: String(args.check_type || args.checkType || args.check || "manual"),
         pattern: String(args.pattern || ""),
         filePattern: String(args.file_pattern || args.filePattern || ""),
+        app: String(args.app || args.app_name || args.appName || args.application || "").trim(),
         timeout,
       };
     }
@@ -38385,7 +38397,13 @@ function _planEvidenceKindsForTool(call, result) {
     if (runtimeKinds.includes("run")) kinds.add("execute");
     if (!kinds.size) kinds.add("execute");
   }
-  if (t === "browser" || t === "screenshot" || t === "http" || t === "capture_flows" || t === "capture_replay" || t === "background_monitor") kinds.add("verify");
+  // background_monitor 算验证类取证——但 screen 那一种不算。
+  //
+  // 它是**纯观察**：盯着某个应用的界面等一句话出现，什么都没检查、没跑、没请求。
+  // 记成验证证据的后果很具体：改完代码 → 起一个 screen 监视器等用户点个东西 →
+  // 收尾门看到"有验证证据"，于是那一版没编译过的代码被当成验过的交出去。
+  if (t === "browser" || t === "screenshot" || t === "http" || t === "capture_flows" || t === "capture_replay"
+      || (t === "background_monitor" && call?.checkType !== "screen")) kinds.add("verify");
   if (_externalEvidenceKinds(call, result).length) kinds.add("execute");
   return [...kinds];
 }
@@ -58926,7 +58944,7 @@ function _createToolStep(call) {
     : call.type === "automation"
     ? (call.method || "")
     : call.type === "readscreen"
-    ? (call.ocr ? "OCR" : "Accessibility")
+    ? `${call.ocr ? "OCR" : "Accessibility"}${call.pid ? ` · pid ${call.pid}` : call.app ? ` · ${call.app}` : ""}`
     : call.type === "uiclick"
     ? `${call.action || "press"} ref=${Number.isInteger(call.ref) ? call.ref : "?"}`
     : call.type === "mcp"
@@ -62737,14 +62755,19 @@ async function _executeToolStepInner(step, call, root, run) {
 
     } else if (call.type === "readscreen") {
       if (!inTauri) { res.className = "atc-result atc-result--err"; res.textContent = "桌面专用"; return { type: "readscreen", path: "", content: "[不可用] read_screen 需要 Mr. Day One 桌面后端。" }; }
-      res.className = "atc-result"; res.innerHTML = `<span class="atc-spin"></span> 读取前台应用元素…`;
+      const _rsWho = call.pid ? `pid ${call.pid}` : (call.app ? call.app : "前台应用");
+      res.className = "atc-result"; res.innerHTML = `<span class="atc-spin"></span> 读取${_escHtml(_rsWho)}的元素…`;
       try {
-        const output = await backend.invoke("read_screen", { ocr: !!call.ocr });
+        const output = await backend.invoke("read_screen", {
+          ocr: !!call.ocr,
+          app: call.app || null,
+          pid: call.pid || null,
+        });
         const elements = Array.isArray(output?.elements) ? output.elements : [];
         const limitations = Array.isArray(output?.limitations) ? output.limitations : [];
         const structured = JSON.stringify({ source: output?.source || "unknown", elements: elements.slice(0, 500), limitations }, null, 2);
         res.className = "atc-result " + (elements.length ? "atc-result--ok" : "atc-result--err");
-        res.textContent = elements.length ? `${elements.length} 个可访问元素` : "未读取到元素";
+        res.textContent = elements.length ? `${_rsWho} · ${elements.length} 个可访问元素` : `${_rsWho} · 未读取到元素`;
         if (vp) vp.innerHTML = `<pre style="white-space:pre-wrap">${_escHtml(structured.slice(0, 24000))}</pre>`;
         if (vp) step.classList.add("is-open");
         return { type: "readscreen", path: output?.source || "", content: `read_screen 真实结果：\n${structured}` };
@@ -64852,6 +64875,7 @@ return { type: call.type, path: call.query || "", content: `[失败] ${call.type
       const bmType = call.checkType || "manual";
       const bmPat = call.pattern || "";
       const bmFilePat = call.filePattern || "";
+      const bmApp = call.app || "";
       const bmTimeout = Math.max(10, Math.min(call.timeout || 300, 600));
       const bmCwd = root || (_detectOS() === "Windows" ? "." : "/tmp");
       // 轮询循环里每条分支都是 `bmType === "file" && bmPat` 这种精确匹配，**认不出来就一条都不进**，
@@ -64863,8 +64887,8 @@ return { type: call.type, path: call.query || "", content: `[失败] ${call.type
       // 不猜：把事实回给模型让它重发一次，别用 300 秒换一个假答案。
       // capture 和 manual 有意豁免：manual 不轮询；capture 空 pattern 匹配下一条新流量，
       // 是抓包恢复路径明说的用法（logic.test.mjs 那条 CONFIGURE_BACKGROUND_PROXY 钉着）。
-      const _BM_CHECKS = new Set(["manual", "capture", "file", "command", "url", "port"]);
-      const _BM_NEEDS_PATTERN = new Set(["file", "command", "url", "port"]);
+      const _BM_CHECKS = new Set(["manual", "capture", "file", "command", "url", "port", "screen"]);
+      const _BM_NEEDS_PATTERN = new Set(["file", "command", "url", "port", "screen"]);
       // 光判「空不空」不够。轮询里还有第二道**隐形**闸门：
       //   port  → `const port = bmPat.replace(/[^0-9]/g,""); if (port) { …lsof… }`
       //   url   → http_request(bmPat)，不是 http(s) 开头每次都抛、被 catch 吃掉
@@ -64874,6 +64898,12 @@ return { type: call.type, path: call.query || "", content: `[失败] ${call.type
       const _bmPatternIssue = !bmPat ? ""
         : bmType === "port" && !/\d/.test(bmPat) ? `port 的 pattern 要的是端口号，而「${bmPat.slice(0, 60)}」里一个数字都没有`
         : bmType === "url" && !/^https?:\/\//i.test(bmPat.trim()) ? `url 的 pattern 要的是完整地址（http:// 或 https:// 开头），而这次给的是「${bmPat.slice(0, 60)}」`
+        // screen 的 pattern 是要在**界面上原样出现**的字。模型最容易在这里塞一整句
+        // 描述（"等用户在设置里打开辅助功能开关"），那种句子界面上永远不会出现，
+        // 于是安静地空等到超时，回执还说得像"条件一直没满足"。判据取"像不像一句话"：
+        // 太长、或者带了句末标点/连接词，就是在描述而不是在给要匹配的字。
+        : bmType === "screen" && (bmPat.trim().length > 40 || /[。，；！？,;]|\s(的|了|然后|之后|until|after|then)\s/.test(bmPat))
+          ? `screen 的 pattern 要的是**界面上会原样出现的那几个字**（按钮名、标题、状态文字，支持正则），而「${bmPat.slice(0, 60)}」是一句描述——界面上不会出现这句话，只会空等到超时`
         : "";
       if (!_BM_CHECKS.has(bmType) || (_BM_NEEDS_PATTERN.has(bmType) && !bmPat) || _bmPatternIssue) {
         // 这里还没走到 _registerRunInteraction，没有东西要释放；_bmRelease 也还在 TDZ 里。
@@ -64883,7 +64913,7 @@ return { type: call.type, path: call.query || "", content: `[失败] ${call.type
           ? `check_type 收到的是「${String(bmType).slice(0, 120)}」，不是可检查的类型。`
             + `注意入参归一会把 condition / check / condition_type 都并进 check_type——`
             + `如果你写的是一整句自然语言，它就原样变成了这里的 check_type。`
-          : `check_type="${bmType}" 必须配一个 pattern（${bmType === "file" ? "文件路径" : bmType === "command" ? "要跑的命令" : bmType === "url" ? "要探的 URL" : "端口号"}），这次是空的。`;
+          : `check_type="${bmType}" 必须配一个 pattern（${bmType === "file" ? "文件路径" : bmType === "command" ? "要跑的命令" : bmType === "url" ? "要探的 URL" : bmType === "screen" ? "界面上要等的文字（支持正则）" : "端口号"}），这次是空的。`;
         return {
           type: "background_monitor",
           path: bmType,
@@ -64896,7 +64926,7 @@ return { type: call.type, path: call.query || "", content: `[失败] ${call.type
             + `把条件写成 pattern，把类型写成上面其中之一，重发一次。`,
         };
       }
-      const _bmTypeLabels = { manual: "等用户确认", capture: "监控抓包", file: bmFilePat ? "等文件内容匹配" : "等文件出现", command: "等命令成功", url: "等 URL 可达", port: "等端口监听" };
+      const _bmTypeLabels = { manual: "等用户确认", capture: "监控抓包", file: bmFilePat ? "等文件内容匹配" : "等文件出现", command: "等命令成功", url: "等 URL 可达", port: "等端口监听", screen: bmApp ? `盯着 ${bmApp} 的界面` : "盯着前台界面" };
       res.className = "atc-result atc-result--ok"; res.textContent = `⏳ ${bmMsg}`;
       let _bmIv = null, _bmDone = false, _bmChecks = 0;
       let _bmRelease = () => {};
@@ -64982,6 +65012,7 @@ return { type: call.type, path: call.query || "", content: `[失败] ${call.type
         const _bmSnap = _captureFlows.length;
         const _bmStart = Date.now();
         let _bmFileChecking = false;
+        let _bmScreenChecking = false, _bmScreenFails = 0;
         const _bmPoll = async () => {
           if (_bmDone) return;
           // 这一轮已经结束/被 Stop/标签页关了：立刻停表退场，别再轮询也别再排新 run。
@@ -65032,6 +65063,37 @@ return { type: call.type, path: call.query || "", content: `[失败] ${call.type
               const status = typeof r === "string" ? (r.match(/^(\d{3})\s/) || [])[1] : (r?.status || r?.statusCode);
               if (status && +status >= 200 && +status < 400) _bmFinish("done", `URL 可达 (${status})`, `[background_monitor 结果] URL「${bmPat}」返回 HTTP ${status}，可达。继续执行。`);
             } catch {}
+          } else if (bmType === "screen" && bmPat) {
+            // 盯屏幕：用户要做的那件事常常**没有文件、没有端口、没有请求**——
+            // 关掉一个弹窗、在网页上登完、把某个开关打开。这条之前不存在，
+            // 于是那类任务只能退回 manual（等用户回来点"已完成"），也就是用户说的
+            // 「明明完成了他也不知道」。
+            //
+            // 走的是 probe_screen，**不是** read_screen：后者每次都会清空 ref 表，
+            // 每两秒一次的轮询会把模型手里的 ref 持续作废。probe 那条不发 ref 也不
+            // 毁 ref（sidecar 侧释放句柄而不换表），对已有 ref 零副作用。
+            if (_bmScreenChecking) return void (_bmIv = setTimeout(_bmPoll, _bmDelay()));
+            _bmScreenChecking = true;
+            try {
+              const r = await backend.invoke("probe_screen", { app: bmApp || null, pid: null });
+              const lines = Array.isArray(r?.lines) ? r.lines : [];
+              const hay = lines.join("\n");
+              const sre = (() => { try { return new RegExp(bmPat, "i"); } catch { return null; } })();
+              const hit = sre ? sre.test(hay) : hay.toLowerCase().includes(bmPat.toLowerCase());
+              if (hit) {
+                const _which = lines.find((l) => (sre ? sre.test(l) : l.toLowerCase().includes(bmPat.toLowerCase()))) || "";
+                _bmFinish("done", "界面已出现", `[background_monitor 结果] 「${r?.app || bmApp || "前台应用"}」的界面上出现了「${bmPat}」（命中：${String(_which).slice(0, 160)}），说明那一步已经做完了。继续执行。`);
+              }
+            } catch (e) {
+              // 探查不可用（自动化子进程没起来 / 没给辅助功能权限）就**立刻退场**，
+              // 别用整个超时窗口换一个"条件一直没满足"的假答案——那正是这个工具
+              // 最容易骗人的失败形态。
+              _bmScreenFails++;
+              if (_bmScreenFails >= 3) {
+                _bmFinish("timeout", "屏幕探查不可用", `[background_monitor 失败] 盯屏幕这条走不通：${String(e?.message || e).slice(0, 200)}。这**不是**「条件没满足」——检查一次都没成功过。多半是没给辅助功能权限，或者目标应用名「${bmApp || "(未指定)"}」找不到。换 manual 让用户点确认，或者先用 system 的 window.list 确认应用名。`);
+                return;
+              }
+            } finally { _bmScreenChecking = false; }
           } else if (bmType === "port" && bmPat) {
             try {
               const port = bmPat.replace(/[^0-9]/g, "");

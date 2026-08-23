@@ -6600,11 +6600,96 @@ test("optional numeric tool arguments never coerce null into zero", () => {
 test("native screen tools are mapped to real Tauri commands", () => {
   assert.match(SRC, /name: "read_screen"/);
   assert.match(SRC, /name: "ui_click"/);
-  assert.match(SRC, /case "read_screen": return \{ type: "readscreen"/);
+  // 钉的是**接到了 readscreen 这个 type**，不是"必须写成一行 return"。
+  // 原来的正则连 `case "read_screen": return {` 这个书写形式一起钉住了，于是给
+  // read_screen 加目标参数（case 变成块）会红——而接线本身一点没坏。
+  assert.match(SRC, /case "read_screen": \{[\s\S]{0,400}type: "readscreen"/);
   assert.match(SRC, /case "ui_click"/);
   assert.match(SRC, /backend\.invoke\("read_screen"/);
   assert.match(SRC, /backend\.invoke\("ui_click"/);
   assert.match(SRC, /"ui_click".*_STRICT_MUTATING_TOOL_NAMES|"automation", "ui_click", "db_query"/);
+});
+
+test("读屏/点击能指定应用——而且这条链一路到得了后端", () => {
+  // 缺陷形状：read_screen 只读最前面那个应用。而智能体干活时前台往往就是
+  // Mr. Day One 自己，于是「读一下浏览器在显示什么」这种最普通的事做不了。
+  // 后端支持了但前端不透传，是这个仓库最常见的那种半截功能，而且全绿。
+  const schema = SRC.slice(SRC.indexOf('name: "read_screen"'), SRC.indexOf('name: "ui_click"'));
+  assert.match(schema, /app: \{ type: "string"/, "read_screen 的 schema 没有 app 参数");
+  assert.match(schema, /pid: \{ type: "integer"/, "read_screen 的 schema 没有 pid 参数");
+
+  // 归一化要真的收下这两个键（只加 schema 不加映射 = 模型传了被丢掉）
+  const map = load("_mapToolCall", {
+    _mcpToolMap: new Map(),
+    _normalizeArgKeys: (args) => args,
+    _STR_ARG_KEYS: new Set(),
+    _KNOWN_TOOLS: new Set(["read_screen"]),
+    _canonicalToolName: () => "",
+  });
+  const rs = map("read_screen", { app: "  Safari  ", pid: 4321 });
+  assert.equal(rs.type, "readscreen");
+  assert.equal(rs.app, "Safari", "app 没有被收下/没有去空白");
+  assert.equal(rs.pid, 4321, "pid 没有被收下");
+  assert.equal(map("read_screen", { pid: -3 }).pid, 0, "非法 pid 要归零，不能原样传下去");
+
+  // 执行分支要真的把它们发给后端（这一步漏了，前两步全对也等于没做）
+  // 用执行分支自己的锚（`} else if (…)`）：光用 `call.type === "readscreen"` 会先命中
+  // _approvalKey 里那一处，切出来的是空片段，于是这条断言恒真——正是它要防的那种假绿。
+  const _execAt = SRC.indexOf('} else if (call.type === "readscreen") {');
+  assert.ok(_execAt > 0, '找不到 readscreen 的执行分支');
+  const exec = SRC.slice(_execAt, SRC.indexOf('} else if (call.type === "uiclick") {', _execAt));
+  assert.ok(exec.length > 300, 'readscreen 执行分支切空了');
+  assert.match(exec, /backend\.invoke\("read_screen", \{[\s\S]{0,200}app: call\.app[\s\S]{0,120}pid: call\.pid/,
+    "读屏没有把 app/pid 发给后端——schema 加了也是死参数");
+
+  // 同一个会话里读两个不同应用，不能被去重当成"重复调用"拦掉
+  const key = load("_approvalKey", {});
+  const a = key({ type: "readscreen", app: "Safari" }, null);
+  const b = key({ type: "readscreen", app: "Finder" }, null);
+  assert.notEqual(a, b, "读不同应用算成了同一次调用——模型会拿上一个应用的元素去点下一个");
+});
+
+test("盯屏幕这条监视器不许毁掉模型手里的 ref", () => {
+  // 这是 screen 这个检查类型唯一的技术难点。read_screen 每次开头都
+  // clear_latest_ax_refs()，一个每几秒读一次的后台监视器会把模型上一次读屏拿到的
+  // ref **持续作废**——模型攥着一把废数字，ui_click 只回「ref 已过期」，
+  // 而它根本不知道是谁弄没的。所以轮询必须走那条不发 ref 也不毁 ref 的读法。
+  const bm = SRC.slice(SRC.indexOf('call.type === "background_monitor"'), SRC.indexOf('call.type === "designboard"'));
+  assert.ok(bm.length > 2000, "没切到 background_monitor 那段");
+  assert.match(bm, /bmType === "screen"/, "没有 screen 这个检查类型的轮询分支");
+  assert.match(bm, /backend\.invoke\("probe_screen"/, "screen 分支没走 probe_screen");
+  assert.doesNotMatch(bm, /backend\.invoke\("read_screen"/,
+    "监视器里出现了 read_screen——它会清空 ref 表，每轮都把模型手里的 ref 作废");
+
+  // 探查不可用要**立刻退场**，不能用整个超时窗口换一句"条件一直没满足"。
+  // 其余五条分支都是 catch {} 静默吞异常，照抄那个形状就会造出假等待。
+  //
+  // 钉的是**升级判据本身 + 它确实调到了 _bmFinish**，不是「出现过 _bmScreenFails
+  // 这个名字」：那个名字在上面的变量声明里也有，光钉名字的话把整个 if 改成
+  // `if (false)` 照样绿（实测本轮就是这么逃掉的）。
+  // 锚要用轮询分支自己的形状：光 `bmType === "port"` 会先命中上面 pattern 形状判据里
+  // 那一处，切出来是反向区间（空片段），断言就恒真了。
+  const _sAt = bm.indexOf('} else if (bmType === "screen" && bmPat) {');
+  assert.ok(_sAt > 0, 'screen 没有独立的轮询分支');
+  const screenBranch = bm.slice(_sAt, bm.indexOf('} else if (bmType === "port" && bmPat) {', _sAt));
+  assert.ok(screenBranch.length > 400, "切不到 screen 分支");
+  assert.match(screenBranch, /_bmScreenFails\+\+/, "探查失败没有计数");
+  assert.match(screenBranch, /if \(_bmScreenFails >= \d\) \{[\s\S]{0,400}_bmFinish\(/,
+    "连续探查失败没有真的退场——会用整个超时窗口换一句假的「条件没满足」");
+  assert.match(screenBranch, /这\*\*不是\*\*「条件没满足」/, "失败退场时没有把真实原因说清楚");
+});
+
+test("盯着界面等不算验证证据", () => {
+  // background_monitor 整体被算作验证类取证。screen 那一种是**纯观察**：
+  // 盯着某个应用的界面等一句话出现，什么都没检查、没跑、没请求。
+  // 记成验证证据的后果很具体：改完代码 → 起一个 screen 监视器等用户点个东西 →
+  // 收尾门看到"有验证证据"，那一版没编译过的代码就被当成验过的交出去。
+  const at = SRC.indexOf('if (t === "browser" || t === "screenshot" || t === "http"');
+  assert.ok(at > 0, "没找到那条把 background_monitor 记成 verify 的分类");
+  const line = [SRC.slice(at, SRC.indexOf('kinds.add("verify");', at) + 20)];
+  assert.match(line[0], /background_monitor/, "那条分类里没有 background_monitor 了");
+  assert.match(line[0], /checkType !== "screen"/,
+    "screen 类型的监视器仍然被记成验证证据——盯着界面等会顶替真正的验证");
 });
 
 test("automation schema requires state verification and recovery", () => {
@@ -33674,8 +33759,8 @@ test("background_monitor：检查不了的条件必须当场说，别用 300 秒
     }
   }
 
-  // 类型对但 pattern 空：file/command/url/port 四条分支都带 `&& bmPat`，同样一条都不进。
-  for (const t of ["file", "command", "url", "port"]) {
+  // 类型对但 pattern 空：file/command/url/port/screen 五条分支都带 `&& bmPat`，同样一条都不进。
+  for (const t of ["file", "command", "url", "port", "screen"]) {
     const r = check(call({ message: "等", check_type: t }));
     assert.ok(r, `check_type=${t} 没给 pattern，照样空等到超时`);
     assert.match(r.content, /pattern/);
@@ -33688,6 +33773,23 @@ test("background_monitor：检查不了的条件必须当场说，别用 300 秒
   assert.equal(check(call({ message: "等用户登录" })), null, "manual 被拦了");
   assert.equal(check(call({ message: "等端口", check_type: "port", pattern: "3000" })), null,
     "写全了还被拦");
+
+  // screen：pattern 是**界面上会原样出现的那几个字**。模型最容易在这里塞一整句描述，
+  // 那种句子界面上永远不会出现——于是安静空等到超时，回执还说得像"条件一直没满足"。
+  // 这正是这道门当初要根治的形状，从 screen 这个新入口复活了一次。
+  for (const bad of [
+    "等用户在系统设置里打开辅助功能开关，然后回来继续",
+    "用户登录完成之后，页面上会显示他的名字",
+    "wait until the download finishes, then continue",
+  ]) {
+    const r = check(call({ message: "等", check_type: "screen", pattern: bad }));
+    assert.ok(r, `screen 的 pattern 是一句描述（${bad.slice(0, 24)}…），却被放行去空等`);
+    assert.match(r.content, /界面上会原样出现/);
+  }
+  for (const good of ["已完成", "Continue", "Sign out", "上传成功", "^Done$"]) {
+    assert.equal(check(call({ message: "等", check_type: "screen", pattern: good })), null,
+      `screen 的 pattern 写对了却被拦（${good}）`);
+  }
 });
 
 // run_subagent 的 tasks 数组有三条静默丢弃路，隔壁 spawn_multiple_agents 早就把

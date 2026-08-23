@@ -3418,13 +3418,21 @@
     "type": "function",
     "function": {
       "name": "read_screen",
-      "description": "Read the accessibility elements the frontmost application actually exposes (role, name, value, whether it is enabled, and screen coordinates). **A browser is one of those applications, and its tree includes the rendered page** — links, buttons, form fields and text, each with real screen coordinates. That is how you operate the user's own already-running browser, the one CDP cannot attach to: bring it to the front, read it here, then act by ref with ui_click — page links, buttons, text fields and dropdowns all expose real AX actions, so the reliable path involves no coordinates at all. Fall back to coordinate clicking only for what exposes no action. When the result is empty, do not guess why — the tool names the cause (missing permission / the read did not complete / every window minimized / the app genuinely exposes nothing). Only the last one means a retry is pointless; the rest are fixable, usually by bringing the window to the front and reading again. ocr=true is a macOS on-screen text-recognition fallback; an OCR ref is not an actionable AX node.",
+      "description": "Read the accessibility elements the frontmost application actually exposes (role, name, value, whether it is enabled, and screen coordinates). **A browser is one of those applications, and its tree includes the rendered page** — links, buttons, form fields and text, each with real screen coordinates. That is how you operate the user's own already-running browser, the one CDP cannot attach to: bring it to the front, read it here, then act by ref with ui_click — page links, buttons, text fields and dropdowns all expose real AX actions, so the reliable path involves no coordinates at all. Fall back to coordinate clicking only for what exposes no action. When the result is empty, do not guess why — the tool names the cause (missing permission / the read did not complete / every window minimized / the app genuinely exposes nothing). Only the last one means a retry is pointless; the rest are fixable, usually by bringing the window to the front and reading again. ocr=true is a macOS on-screen text-recognition fallback; an OCR ref is not an actionable AX node. **By default this reads the frontmost app — pass `app` (or `pid`) to read one that is NOT in front**, which is what you want whenever the front window is Mr. Day One itself, or when you must not steal focus from what the user is doing. ui_click then acts on that same app without bringing it forward.",
       "parameters": {
         "type": "object",
         "properties": {
           "ocr": {
             "type": "boolean",
-            "description": "Set true only when the frontmost application has no accessibility tree; may require Screen Recording permission"
+            "description": "Set true only when the frontmost application has no accessibility tree; may require Screen Recording permission. Cannot be combined with app/pid — OCR photographs the screen, so it only ever covers the frontmost window."
+          },
+          "app": {
+            "type": "string",
+            "description": "Read THIS application instead of whichever one is in front. Match is exact-name-first, then case-insensitive substring (\"Chrome\" finds \"Google Chrome\"). If nothing matches you get an error naming the problem — it never silently falls back to the frontmost app. Use system window.list to see exact names."
+          },
+          "pid": {
+            "type": "integer",
+            "description": "Read the app with this process id. Wins over app when both are given."
           }
         },
         "required": []
@@ -3435,7 +3443,7 @@
     "type": "function",
     "function": {
       "name": "ui_click",
-      "description": "Perform press, set_value or focus on a real accessibility ref returned by read_screen. **This works on web page elements too** — a browser exposes its links, buttons, text fields and dropdowns as AX nodes that support a real press, so this is how you operate the user's own already-running browser (the one CDP cannot attach to) without touching a single coordinate. Only direct manipulation of macOS AX nodes is supported; re-run read_screen after the interface changes, and OCR refs may not be passed in.",
+      "description": "Perform press, set_value or focus on a real accessibility ref returned by read_screen. **This works on web page elements too** — a browser exposes its links, buttons, text fields and dropdowns as AX nodes that support a real press, so this is how you operate the user's own already-running browser (the one CDP cannot attach to) without touching a single coordinate. **The ref carries its own target**: if read_screen was pointed at a specific app, ui_click acts on that same app — it does NOT need to be in front, and pressing does not bring it forward. Refs from one app are refused on another (pid + name are both checked), so a ref never lands on the wrong window. Only direct manipulation of macOS AX nodes is supported; re-run read_screen after the interface changes, and OCR refs may not be passed in.",
       "parameters": {
         "type": "object",
         "properties": {
@@ -3962,7 +3970,7 @@
     "type": "function",
     "function": {
       "name": "background_monitor",
-      "description": "**Whenever a step needs the user to do something by hand or depends on an external condition, you must call this tool: first tell the user what to do (paste the link, give the command, list the steps), then immediately park in the background and wait automatically, so that when the condition is met you resume and carry on without the user having to come back and say \"done\".** Typical cases: a verification code is needed → tell the user to enter it and monitor the result; something must be installed → give the install command and monitor `which xxx` returning 0; a service must be started → give the start command and monitor the port; the user must act in a browser → give the link and monitor the outcome with capture/url/file. Six check types are available; **prefer the ones that detect automatically (port/file/command/url/capture) — manual is the last resort.**",
+      "description": "**Whenever a step needs the user to do something by hand or depends on an external condition, you must call this tool: first tell the user what to do (paste the link, give the command, list the steps), then immediately park in the background and wait automatically, so that when the condition is met you resume and carry on without the user having to come back and say \"done\".** Typical cases: a verification code is needed → tell the user to enter it and monitor the result; something must be installed → give the install command and monitor `which xxx` returning 0; a service must be started → give the start command and monitor the port; the user must act in a browser → give the link and monitor the outcome with capture/url/file. **Prefer the check types that detect automatically (port/file/command/url/capture/screen) — manual is the last resort, because it makes the user come back and tell you they are done.** When what you asked for leaves no file, port or request behind — dismiss this dialog, finish this login, flip that switch — use `screen`: it watches the app's on-screen text and resumes the moment your pattern appears.",
       "parameters": {
         "type": "object",
         "properties": {
@@ -3978,9 +3986,10 @@
               "manual",
               "command",
               "url",
-              "port"
+              "port",
+              "screen"
             ],
-            "description": "manual = wait for the user to click continue; file = wait for a file to appear (with file_pattern, wait for its contents to match); capture = watch captured traffic for pattern; command = re-run a command until it exits 0; url = re-request a URL until it answers 2xx or 3xx (a redirect counts as reachable); port = wait for a port to be listening"
+            "description": "manual = wait for the user to click continue; file = wait for a file to appear (with file_pattern, wait for its contents to match); capture = watch captured traffic for pattern; command = re-run a command until it exits 0; url = re-request a URL until it answers 2xx or 3xx (a redirect counts as reachable); port = wait for a port to be listening; screen = watch an application's on-screen UI text until `pattern` shows up (macOS accessibility tree). **screen is what you use when the thing you asked the user to do has no file, port or request behind it** — a dialog they must dismiss, a login they must finish, a switch they must flip, a progress bar reaching Done. Set `app` to the application to watch. It reads without stealing focus and WITHOUT invalidating any ref you got from read_screen."
           },
           "pattern": {
             "type": "string",
@@ -3989,6 +3998,10 @@
           "file_pattern": {
             "type": "string",
             "description": "file type only: match on file content (keyword or regex); once set, it checks not just that the file exists but that its contents contain this pattern"
+          },
+          "app": {
+            "type": "string",
+            "description": "screen type only: which application's UI to watch (name match, e.g. \"Safari\"). Omit to watch whichever app is in front, which is rarely what you want — while you wait, the front app is often Mr. Day One itself."
           },
           "timeout": {
             "type": "integer",
