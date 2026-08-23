@@ -15923,9 +15923,57 @@ async function selectModel(model, modelGroup) {
   _refreshContextMeterFromDraft({ force: true });
 }
 
+/**
+ * 停靠在输入条上的模型菜单：算好宽度和左缘，写进两个 CSS 变量。
+ *
+ * 两条要求同时满足：**更宽**，且**中线对齐下面那个模型按钮**。
+ *
+ * 这两条是互相拉扯的 —— 菜单一旦宽到占满输入框，就不可能再以按钮为中心（按钮不在输入框
+ * 正中，它左边还坐着模式选择器）。所以宽度取「以按钮中线为心、两边都还装得下的最大值」：
+ *
+ *     半宽 = min(按钮中线 - 输入框内左缘, 输入框内右缘 - 按钮中线)
+ *     宽   = 2 × 半宽，夹在 232–420px
+ *
+ * 这样左右两侧到输入框边缘的余量一样，菜单看上去正正地挂在按钮上方。
+ *   · 420 封顶 —— 面板拖得很宽时，一个列着 "GPT-5.5" 的下拉没必要跟着长到六百多；
+ *   · 232 兜底 —— 按钮贴边时半宽会很小，宁可放弃严格居中也不能比原来还窄；这时下面的
+ *     夹取会把它按回输入框里，至少不溢出。
+ *
+ * 每次打开都重量，不写死：模式选择器的宽度随语言变（Agent / 智能体），面板能拖动。
+ * 量不到就不动变量，CSS 用缺省值退回原来的样子。
+ */
+function _applyModelMenuGeometry() {
+  const box = (() => {
+    try { return modelPicker?.closest(".composer") || modelPicker?.closest(".composer__bar"); }
+    catch { return null; }
+  })();
+  if (!box) return;
+  const cs = getComputedStyle(box);
+  const r = box.getBoundingClientRect();
+  const innerLeft = r.left + (parseFloat(cs.paddingLeft) || 0);
+  const innerRight = r.right - (parseFloat(cs.paddingRight) || 0);
+
+  const p = modelPicker.getBoundingClientRect();
+  const centre = p.left + p.width / 2;
+  const half = Math.min(centre - innerLeft, innerRight - centre);
+  const width = Math.round(Math.min(420, Math.max(232, half * 2)));
+
+  // left 相对 .model-picker（它是定位父级），所以全程用「相对按钮左缘的偏移」。
+  const centred = (p.width - width) / 2;
+  const minOffset = innerLeft - p.left;          // 再往左就出了输入框
+  const maxOffset = innerRight - width - p.left; // 再往右就出了输入框
+  const offset = maxOffset >= minOffset
+    ? Math.min(Math.max(centred, minOffset), maxOffset)
+    : minOffset;
+
+  modelMenu.style.setProperty("--model-menu-width", width + "px");
+  modelMenu.style.setProperty("--model-menu-left", Math.round(offset) + "px");
+}
+
 function openModelMenu() {
   buildModelMenu();
   loadBackendModels(); // refresh from backend each open (newly-enabled models)
+  _applyModelMenuGeometry();
   modelMenu.hidden = false;
   modelPicker.classList.add("is-open");
   modelPickerBtn.setAttribute("aria-expanded", "true");
@@ -15943,6 +15991,11 @@ function openModelMenuFor(pickerEl) {
   buildModelMenu();
   loadBackendModels();
   const r = pickerEl.getBoundingClientRect();
+  // 浮动这条路自己算 left 和宽度（它挂在 body 上、按视口定位，旁边没有输入条可量）。
+  // 两个变量都要清掉：否则宽度还按上一次那条输入条算，而 left 是这里用内联样式写死的，
+  // 结果就是一个宽度对不上、位置也对不上的菜单。
+  modelMenu.style.removeProperty("--model-menu-width");
+  modelMenu.style.removeProperty("--model-menu-left");
   modelMenu.style.position = "fixed";
   modelMenu.style.bottom = "auto";
   modelMenu.style.zIndex = "10020";
@@ -24097,14 +24150,46 @@ function _domainKnowledgeBullets(content, maxBullets = 3, maxChars = 190) {
     const cut = block.indexOf("】");
     if (cut < 0) continue;
     const section = /·\s*([^｜】]+)】\s*$/.exec(block.slice(0, cut + 1))?.[1]?.trim() || "";
-    for (const line of block.slice(cut + 1).split("\n")) {
-      const text = line.replace(/^\s*(?:[-*•·]|\d+[.)]|#{1,6})\s*/, "").trim();
-      // 太短的行是小节标题、空行或"示例："这类粘合词，进了小抄只占预算不带信息。
+    const rawLines = block.slice(cut + 1).split("\n");
+    let inFence = false;
+    let prose = "";     // 首选：散文/表格数据行
+    let fenced = "";    // 兜底：代码围栏里的第一行
+    for (let li = 0; li < rawLines.length && !prose; li++) {
+      const line = rawLines[li];
+      if (/^\s*(?:```|~~~)/.test(line)) { inFence = !inFence; continue; }
+      // markdown 标题行要在**剥 # 之前**判掉。
+      //
+      // 网关的索引器把小节标题写回了正文第一行（knowledge.rs 里 `cur_buf = format!("## {}\\n", …)`），
+      // 而这里原来先剥 # 再按长度过滤——于是「Database Selection Decision Tree」这种 32 字符的
+      // 标题顺利活过 `< 24` 那道门，成为首条要点。
+      //
+      // 实测（2026-08-23，真语料 + 真函数）：非设计域 683 个小节里 **416 段（60.9%）的首条
+      // 要点就是它自己的小节标题**。而这份小抄的抬头对模型说的是「它是该领域的**既有事实**，
+      // 不是灵感：先按它判断可行性、约束和验收」——给的却是一份标题清单。被这样吞掉的正是
+      // 最该用上的那几条：服务拆分规则、数据库选型决策树、重构策略。
+      //
+      // 判据按**结构**不按字符串：跳所有 markdown 标题行，而不是拿正文和 section 名做前缀
+      // 比较——后者会把「小节名 Rate Limiting + 首句 Rate Limiting must be applied per-tenant…」
+      // 这种真事实一起误杀。
+      if (/^\s*#{1,6}\s/.test(line)) continue;
+      // 表格**不能**一刀切：这份语料里大量事实本身就是表（反模式清单、选型对照表都是），
+      // 砍掉整类会让产不出要点的小节从 13.6% 飙到 51.7%（实测）。只砍两种不带事实的行：
+      // 分隔行 `|---|---|`，以及紧跟着分隔行的那一行（那是表头）。
+      if (/^\s*\|[\s:|-]+\|?\s*$/.test(line)) continue;
+      if (/^\s*\|/.test(line) && /^\s*\|[\s:|-]+\|?\s*$/.test(rawLines[li + 1] || "")) continue;
+      const text = line.replace(/^\s*(?:[-*•·]|\d+[.)])\s*/, "").trim();
+      // 太短的行是空行或"示例："这类粘合词，进了小抄只占预算不带信息。
       if (text.length < 24) continue;
-      const one = text.length > maxChars ? `${text.slice(0, maxChars)}…` : text;
-      bullets.push(section ? `${section} → ${one}` : one);
-      break;
+      // 代码围栏里的行**留作兜底**，不直接选中。一条孤立的 import 行说不出这个小节想说
+      // 什么；但整节只有代码时，给一行真代码仍然远好过给空。一刀砍掉整类会让产不出要点的
+      // 小节从 13.6% 涨到 49.2%（实测）——那是把一半语料静默扔掉。
+      if (inFence) { if (!fenced) fenced = text; continue; }
+      prose = text;
     }
+    const picked = prose || fenced;
+    if (!picked) continue;
+    const one = picked.length > maxChars ? `${picked.slice(0, maxChars)}…` : picked;
+    bullets.push(section ? `${section} → ${one}` : one);
     if (bullets.length >= maxBullets) break;
   }
   return bullets;
