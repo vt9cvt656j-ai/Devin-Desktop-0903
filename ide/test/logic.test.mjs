@@ -28203,6 +28203,11 @@ test("相册样式：格子定尺寸、行等高、角标盖实", () => {
 test("编辑态的图用底部输入框那一套渲染，不是消息里的相册", () => {
   const src = stripJsComments(extractFn("_beginEditResend"));
 
+  // 空条不能用 hidden：.prompt-images 是 display:flex，会盖过 [hidden] 的 display:none，
+  // 空条照样占一大块（用户截图里那片空白）。本文件 lightbox 那处踩过同一个坑。
+  assert.match(src, /mediaStrip\.style\.display = editMedia\.length \? "" : "none"/,
+    "用 hidden 藏空条——display:flex 会盖过它，空条照样占位");
+  assert.doesNotMatch(src, /mediaStrip\.hidden =/, "又改回 hidden 了");
   assert.match(src, /mediaStrip\.className = "prompt-images"/,
     "没有用底部输入框那个容器类——样式就不可能一模一样");
   assert.match(src, /_createImagePreview\(attachment, i, \(\) =>/,
@@ -28227,8 +28232,26 @@ test("编辑态的图用底部输入框那一套渲染，不是消息里的相�
     "没有先塌回 auto 再量 scrollHeight——删字时高度只增不减");
 });
 
-test("附件从 memory 取，不从 DOM 捞", () => {
+// 附件取不到 = 编辑框空空如也。两条渲染路径都要能取到：
+//   · 刚发出去的消息 —— 只有挂在节点上那份。**全仓没有任何 addMessage 调用点传
+//     transcriptSequence**（grep 为 0），只有从历史重画那条会补写它。第一版只按
+//     sequence 去 memory 找，于是刚发的消息一双击进编辑，附件一律取不到（用户实测：
+//     「？？？这也没图片啊」）。
+//   · 从历史重画的消息 —— 两者都有（_renderMsgRange 同时传 attachments 和 sequence）。
+test("附件两条渲染路径都取得到，且不从 DOM 捞", () => {
   const pick = load("_messageAttachmentsFor");
+
+  // 刚发出去的消息：气泡上没有 sequence，只有节点上挂的那份。
+  const fresh = { _attachments: [{ kind: "image", name: "just-sent.png" }], dataset: {} };
+  assert.deepEqual(pick({ memory: null }, fresh), [{ kind: "image", name: "just-sent.png" }],
+    "刚发出去的消息取不到附件——编辑框会是空的");
+  // 也要是副本：编辑框点 × 会 splice 它。
+  pick({ memory: null }, fresh).length = 0;
+  assert.equal(fresh._attachments.length, 1, "返回的是挂在节点上那个原数组");
+
+  // addMessage 必须真的挂上去，否则上面那条无从谈起。
+  const add = stripJsComments(extractFn("addMessage"));
+  assert.match(add, /wrap\._attachments = attachments/, "渲染时没把附件挂到气泡上");
   const sess = { memory: { transcriptOffset: 0, transcriptEntries: () => [
     { role: "user", content: "没图" },
     { role: "user", content: "带图", attachments: [{ kind: "image", name: "p.png" }] },
