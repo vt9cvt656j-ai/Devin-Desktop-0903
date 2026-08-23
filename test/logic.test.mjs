@@ -28496,6 +28496,74 @@ test("切换模型不许改写历史消息的头像", () => {
   assert.match(add, /textContent = id \? modelLabel\(id\)/, "渲染时没有按这条消息的模型写名字");
 });
 
+test("每条回复底下的操作条：五个按钮，全部走委托", () => {
+  const src = stripJsComments(SRC);
+  const build = stripJsComments(extractFn("_buildMsgActions"));
+
+  // 五个动作齐全，且左右分成两组（赞/踩在左，复制/详情/更多在右）。
+  for (const act of ["up", "down", "copy", "stats", "more"]) {
+    assert.match(build, new RegExp(`_msgActButton\\("${act}"`), `操作条少了 ${act}`);
+  }
+  assert.equal((build.match(/msg__acts-side/g) || []).length, 2, "左右两组没有分开");
+
+  // **必须走事件委托。** 会话恢复是 `container.innerHTML = 快照`：节点回来了、
+  // 每个按钮身上绑的监听器一个都不在。逐个绑定的话，重启之后整排按钮全是死的 ——
+  // 而它们看上去完全正常，最难发现的那种坏法。
+  assert.ok(!/addEventListener/.test(build),
+    "操作条在构造时绑了监听器——HTML 快照恢复之后这些按钮会变成死的");
+  assert.match(src, /document\.addEventListener\("click", \(e\) => \{\s*const btn = e\.target\?\.closest\?\.\("\.msg__act"\)/,
+    "没有那个文档级的委托监听器，按钮点了没反应");
+  // 快照恢复这条路真的存在，别让上面那条理由变成空话。
+  assert.match(src, /container\.innerHTML = session\._htmlSnapshot/,
+    "快照恢复那条路没了？那委托的理由要重新写");
+
+  // 只挂在助手消息上：用户消息有双击编辑，不需要这排。
+  const add = stripJsComments(extractFn("addMessage"));
+  assert.match(add, /main\.appendChild\(_buildMsgActions\(/, "助手消息没挂上操作条");
+  assert.ok(!/wrap\.appendChild\(_buildMsgActions\(/.test(add),
+    "挂到 wrap 上了——那是 flex row，会跑到头像右边去，而不是正文底下");
+});
+
+test("操作条常显：看不见却点得到的按钮不许存在", () => {
+  // 一开始写的是 opacity:0 + hover 才现身。实测 opacity 为 0 的元素**照样接点击**，
+  // 于是每条消息底下都藏着一排看不见却点得到的按钮 —— 手滑就点了赞、甚至开了菜单。
+  // 触摸屏更糟：没有 hover，藏起来等于永远够不到。
+  const rule = APP_CSS_CODE.match(/\.msg__acts\s*\{([^}]*)\}/);
+  assert.ok(rule, ".msg__acts 规则不见了");
+  const op = rule[1].match(/opacity:\s*([\d.]+)/);
+  assert.ok(op, "操作条没有写 opacity——默认 1 也行，但那就该把这条断言改掉而不是删掉");
+  assert.ok(Number(op[1]) > 0,
+    `操作条常态 opacity 是 ${op[1]}：看不见，却仍然接点击`);
+  // 悬停要提到正常对比度，否则常态那档太淡会看不清。
+  assert.match(APP_CSS_CODE, /\.msg\.assistant:hover \.msg__acts[^{]*\{[^}]*opacity:\s*1/,
+    "悬停没有提亮");
+});
+
+test("点赞/点踩：落到记录上、能持久化、且绝不上线", () => {
+  const fn = stripJsComments(extractFn("_setMessageFeedback"));
+  // 再点一次取消，两个互斥。
+  assert.match(fn, /wrap\._feedback === kind \? "" : kind/, "再点一次不能取消");
+  assert.match(fn, /for \(const act of \["up", "down"\]\)/, "赞和踩没有互斥");
+  // 持久化：同 sequence 重新 append 即更新（Rust 侧 insert_event_tx 对已存在的
+  // sequence 走 UPDATE），所以不需要新增变更类型。
+  assert.match(fn, /_queueTranscriptMutation\(session, \{ kind: "append", sequence: found\.sequence/,
+    "没有写回日志——大会话从日志恢复时点赞会丢");
+  assert.match(fn, /saveChatHistory\(\{ immediate: true \}\)/, "没有落会话快照");
+  // 重画历史时要把状态带回来，否则翻一页就没了。
+  assert.match(stripJsComments(extractFn("_renderMsgRange")),
+    /feedback: m\.role === "assistant" \? String\(m\.feedback \|\| ""\) : ""/,
+    "重画历史时没有带回点赞状态");
+});
+
+test("复制这条回复：取原文，且不把统计行和按钮的文字一起复制走", () => {
+  const fn = stripJsComments(extractFn("_copyMessageText"));
+  assert.match(fn, /found\?\.record\?\.content/, "没有优先取记录里的原始 markdown");
+  // 退回可见文本那条路必须先摘掉附加物，否则复制出来带着「18s 模型 5.4s」和按钮文字。
+  assert.match(fn, /\.turn-stats, \.msg__acts, \.msg__stats-detail/,
+    "退回可见文本时没有摘掉统计行和操作条，复制内容会被污染");
+  assert.match(fn, /cloneNode\(true\)/, "在原节点上摘的——会把用户看到的内容删掉");
+});
+
 test("「这条是谁答的」要活着走完存盘→读回，且绝不上线", () => {
   // 记下来没用，得能**活着回来**。这条链上任何一环做字段白名单，模型就悄悄丢了，
   // 而现象和没修一模一样（重画后又变成当前模型）—— 所以走一遍真的往返，不靠推理。
@@ -28524,6 +28592,8 @@ test("「这条是谁答的」要活着走完存盘→读回，且绝不上线",
   });
   const wire = sanitize([roundTripped])[0];
   assert.ok(!("model" in wire), "展示用的 model 字段被当成协议字段发给上游了");
+  assert.ok(!("feedback" in sanitize([{ ...roundTripped, feedback: "up" }])[0]),
+    "点赞状态被当成协议字段发给上游了");
   assert.ok(!("reasoning" in wire), "reasoning 也该在这儿摘掉（一起守住，免得改坏）");
   assert.equal(wire.role, "assistant", "把该留的也摘了");
   assert.equal(wire.content, "答案", "内容被弄丢了");
