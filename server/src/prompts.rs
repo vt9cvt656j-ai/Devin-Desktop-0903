@@ -192,6 +192,50 @@ fn read_prompt(name: &str) -> Result<String, String> {
     })
 }
 
+/// 正在**写**安全敏感面时该给的那几类，不是整张审计表。
+///
+/// 用户要求：「实时的知道到底有没有漏洞那些，有的话写的不要写出漏洞」。
+///
+/// 为什么不整挂：`defects` 那道判据上面写着「写一个登录功能会平白背上整张漏洞分类表」——
+/// 那条反对意见是对的，所以按它的道理解决，而不是推翻它。写码时该给的和审计时该给的
+/// 本来就不是同一份：
+///   · 留（5,964 字符）：不可信输入→危险汇聚点 / 鉴权授权会话 / 业务滥用 /
+///     并发与失败路径 / 密钥与暴露。这五类说的是「你正在写的这段代码可能少做了什么」。
+///   · 去（3,429 字符）：「深挖审计」的抬头（它把任务框成一次排查，框错了）、
+///     内存与底层（C/C++/Rust unsafe 专属）、「确认漏洞之后怎么办」那节（审计的收尾）。
+///
+/// 契约没动：走**新旗标** `defects_write`，`assemble("2.5:engineering")` 里没有它，
+/// 所以那条「写码模式不许拿到审计表」的断言原样通过。两条路互不干扰。
+pub(crate) fn defect_classes_for_writing() -> Result<String, String> {
+    const WANTED: &[&str] = &[
+        "## Untrusted input reaching a powerful sink",
+        "## Authentication, authorization, and session",
+        "## Business abuse",
+        "## Concurrency, resources, and failure paths",
+        "## Secrets, crypto, and exposure",
+    ];
+    let full = read_prompt("defect_hunting")?;
+    let mut out = String::from(
+        "# Loaded because this turn is WRITING a security-sensitive surface\n\n\
+         These are the holes that get written in, not a checklist to audit afterwards. \
+         For the code you are about to write, decide for each class below whether it applies; \
+         where it does, handle it in the code you write now rather than noting it for later. \
+         Say plainly which ones you handled and which you judged not to apply.\n",
+    );
+    for section in full.split("\n## ") {
+        let head = format!("## {}", section.split('\n').next().unwrap_or(""));
+        if WANTED.iter().any(|w| head.starts_with(w)) {
+            out.push_str("\n## ");
+            out.push_str(section.trim_end());
+            out.push('\n');
+        }
+    }
+    if out.lines().filter(|l| l.starts_with("## ")).count() != WANTED.len() {
+        return Err("defect_hunting.txt 的小节标题变了，写码切片取不全".into());
+    }
+    Ok(out)
+}
+
 fn append_prompt_modules(
     names: &[String],
     sys: &mut String,
@@ -3483,6 +3527,7 @@ fn looks_like_ui_data_task(q: &str) -> bool {
 const IDE_SEMANTIC_PROFILE_FLAGS: &[&str] = &[
     "engineering",
     "defects",
+    "defects_write",
     "research",
     "official",
     "community",
@@ -3813,6 +3858,9 @@ pub fn assemble_into(headers: &HeaderMap, body: &mut serde_json::Value) -> Resul
     // main agent never did. Routed on its own flag rather than folded into `engineering`, because
     // it is a heavy block and most engineering turns are building something, not auditing it.
     let defects_intent = mode == "agent" && semantic("defects");
+    // 正在**写**安全敏感面（登录/支付/上传/权限/租户）时给的是切片，不是整表。
+    // 两条互斥：审计走 defects 拿全表，写码走 defects_write 拿其中那五类。
+    let defects_write_intent = mode == "agent" && !defects_intent && semantic("defects_write");
 
     if mode == "agent" {
         if engineering_intent {
@@ -3820,6 +3868,14 @@ pub fn assemble_into(headers: &HeaderMap, body: &mut serde_json::Value) -> Resul
         }
         if defects_intent {
             append_prompt_modules(&graph.agent.defects, &mut sys, &mut prompt_blocks)?;
+        }
+        if defects_write_intent {
+            let slice = defect_classes_for_writing()?;
+            if !sys.is_empty() {
+                sys.push_str("\n\n");
+            }
+            sys.push_str(&slice);
+            prompt_blocks.push("defect_classes_writing".to_string());
         }
         if collaboration_intent {
             append_prompt_modules(&graph.agent.collaboration, &mut sys, &mut prompt_blocks)?;
@@ -6373,6 +6429,79 @@ mod tests {
         let building = assemble("2.5:engineering");
         assert!(building.contains("# Loaded per task: engineering implementation"));
         assert!(!building.contains("# Loaded when the task is a deep defect hunt"));
+    }
+
+    /// 写安全敏感面时给的是**切片**，不是整张审计表。用户要求「写的时候就知道有没有漏洞」，
+    /// 而原来那条判据刻意在写码时不挂表，理由是「写个登录功能不该背上整张表」——那条反对
+    /// 意见是对的，所以按它的道理解决：切出「你正在写的这段可能少做了什么」那五类。
+    #[test]
+    fn writing_a_sensitive_surface_gets_the_slice_not_the_audit_table() {
+        let slice = defect_classes_for_writing().expect("切片取不出来");
+        // 该留的五类
+        for want in [
+            "Untrusted input reaching a powerful sink",
+            "Authentication, authorization, and session",
+            "Business abuse",
+            "Concurrency, resources, and failure paths",
+            "Secrets, crypto, and exposure",
+        ] {
+            assert!(slice.contains(want), "写码切片丢了一类: {want}");
+        }
+        // 该去的三块
+        assert!(
+            !slice.contains("# Loaded when the task is a deep defect hunt"),
+            "抬头没换——它把任务框成一次排查，而这一轮是在写"
+        );
+        assert!(
+            !slice.contains("## Memory and low-level"),
+            "内存与底层是 C/C++/Rust unsafe 专属，写 Web/应用面时是纯浪费"
+        );
+        assert!(
+            !slice.contains("A confirmed defect is the start of the work"),
+            "「确认漏洞之后怎么办」是审计的收尾，不是写码的事"
+        );
+        // 抬头要把「现在写进去」和「记下来以后修」分开——否则模型会写个 TODO 交差
+        assert!(slice.contains("handle it in the code you write now rather than noting it for later"));
+        // 切片必须**明显**比整表小，否则「不整挂」这条理由就不成立了
+        let full = read_prompt("defect_hunting").unwrap();
+        assert!(
+            slice.len() * 10 < full.len() * 8,
+            "切片 {} 字符 / 整表 {} 字符——没省下什么，那不如直接整挂",
+            slice.len(),
+            full.len()
+        );
+    }
+
+    /// 两条路互不干扰：审计拿整表，写码拿切片，写码模式**照旧**拿不到审计表。
+    #[test]
+    fn the_audit_contract_is_untouched_by_the_writing_slice() {
+        let assemble = |profile: &str| {
+            let mut headers = HeaderMap::new();
+            headers.insert("x-ide-mode", "agent".parse().unwrap());
+            headers.insert("x-ide-semantic-profile", profile.parse().unwrap());
+            let mut body = serde_json::json!({
+                "model": "claude-opus-5",
+                "messages": [{ "role": "user", "content": "给这个项目加一个登录接口" }]
+            });
+            assemble_into(&headers, &mut body);
+            body["messages"][0]["content"].as_str().unwrap().to_string()
+        };
+        let building = assemble("2.5:engineering,defects_write");
+        assert!(
+            !building.contains("# Loaded when the task is a deep defect hunt"),
+            "写码旗标把审计表也带进来了——那正是原来那条反对意见"
+        );
+        assert!(
+            building.contains("# Loaded because this turn is WRITING a security-sensitive surface"),
+            "写码旗标没挂上切片"
+        );
+        // 同时声明两个时以审计表为准，不重复挂
+        let both = assemble("2.5:engineering,defects,defects_write");
+        assert!(both.contains("# Loaded when the task is a deep defect hunt"));
+        assert!(
+            !both.contains("# Loaded because this turn is WRITING"),
+            "两张表同时挂上了——重复且互相打架"
+        );
     }
 
     /// Reviewer mode reports security as a first-class category, and reads the same catalogue
