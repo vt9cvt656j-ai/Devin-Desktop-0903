@@ -51747,7 +51747,24 @@ function _executionFactSemanticFlags(run) {
   const facts = {};
   if (!run || typeof run !== "object") return facts;
   if (Array.isArray(run._writeLedger) && run._writeLedger.length > 0) facts.implementation = true;
-  const evidence = run._intentState?.context?.workspaceEvidence;
+  // 工作区证据要**现算**，不能只从裁决的上下文对象里取。
+  //
+  // 这条腿存在的全部理由就是「分类器不可用时也要有旗标」，而它原来唯一的输入
+  // run._intentState?.context?.workspaceEvidence 恰恰是**分类器**那条链上的产物：
+  // 分类器没跑（或这一轮压根没建 intentState），兜底腿也跟着一起死——它在最需要它的
+  // 那种情况下必然为空。而 _aiIntentWorkspaceEvidence(root) 是纯 IDE 侧计算
+  // （读 _agentContextCache / _projectStacks），一个模型调用都不需要。
+  //
+  // 线上实测（2026-08-23，近 12 小时 144 次主回合装配）：画像 144 次全空、
+  // agent_engineering 挂载 0 次——那 13KB 的架构纪律与「优先用成熟主流方案」一次都没到过
+  // 模型手里。所以这条兜底腿必须自己够得着自己的输入。
+  //
+  // 判据一个字没放宽：仍然要 hasWorkspace + snapshotReady + 顶层非空。空目录（从零建）
+  // 照旧不点 existing_project——那正是它和已有项目的分界。
+  let evidence = run._intentState?.context?.workspaceEvidence;
+  if (!evidence && typeof _aiIntentWorkspaceEvidence === "function") {
+    try { evidence = _aiIntentWorkspaceEvidence(run.root || ""); } catch { evidence = null; }
+  }
   if (evidence?.hasWorkspace && evidence?.snapshotReady && (evidence.topLevel || []).length) {
     facts.existingProject = true;
   }
