@@ -11870,7 +11870,7 @@ test("external source tools stay real but load on demand", () => {
     "lazy loading must derive from the live registry instead of a second static tool table");
 });
 
-test("Agent 开局窗口 22 个：取外部资源那一族、自家语料、硬拒点名的、自己造能力的那两个、以及 think，都要在里面", () => {
+test("Agent 开局窗口 23 个：取外部资源那一族、读本机依赖真源码的、自家语料、硬拒点名的、自己造能力的那两个、以及 think，都要在里面", () => {
   // 用户 2026-08-18 点名："把初始化编排工具从 11 提升到 16，把那些加进来"（那五个取外部
   // 资源的）。后来又按同一条理由加了 run_in_terminal + read_logs：harness 自己有三处**硬拒**
   // 并点名要 run_in_terminal（timeout 包住的 dev server、前台长命令、需要真 TTY 的交互程序），
@@ -11882,7 +11882,16 @@ test("Agent 开局窗口 22 个：取外部资源那一族、自家语料、硬�
   const core = /agent: \["read_file"[\s\S]*?\],/.exec(SRC);
   assert.ok(core, "agent 核心表被改名或挪走了，这条断言失去落点");
   const names = [...core[0].matchAll(/"([a-z_]+)"/g)].map((m) => m[1]);
-  assert.equal(names.length + 1, 23, `开局窗口是 ${names.length + 1} 个（含 search_tools），不是 23`);
+  assert.equal(names.length + 1, 24, `开局窗口是 ${names.length + 1} 个（含 search_tools），不是 24`);
+  // 2026-08-22 再 +1：package_source。判据和下面 knowledge_search 那段**逐字同源**，证据更硬：
+  // 它零网络零成本（读的是本机 node_modules / site-packages 里装着的那一份源码，拿到的是
+  // 本项目真正锁住的那个版本的真实签名），却要先花一轮 search_tools 才够得着。
+  // 而 package_search 一直在窗口里、它不在——正是 github_search 曾经缺 github_repo 后手的
+  // 同一种缺口：注册表搜索回答"存不存在/什么版本"，一个签名都不给。
+  // 怎么证伪：如果扩窗后 package_source 的调用率没上去，说明瓶颈不在窗口，把它撤回去。
+  assert.ok(names.includes("package_source"),
+    "package_source 不在开局窗口——最便宜（零网络）、最硬（本机真源码）的那条核对路，"
+    + "偏偏是唯一要多花一轮 search_tools 的，模型于是改回凭记忆写签名");
   // 2026-08-22 +1：knowledge_search。判据是**对等**，不是"多多益善"——查外部的六个
   // （web_search / web_fetch / github_search / github_repo / developer_community_search /
   // package_search）全在窗口里，查自家语料的那一个不在，于是上面那条"模型走便宜的那条"
@@ -18488,8 +18497,15 @@ test("收尾验收契约开局告知，与收尾门禁同源而非突袭", () =>
   // Anthropic effective-harnesses 模式：完成标准开局交给模型自主奔着做。
   // 契约块必须从门禁同源字段（runtimeObligations/externalObligations/research/UI）合成，
   // 不得另建一套会漂移的判定。
-  assert.match(SRC, /收尾验收契约（harness 收尾时会逐项核对真实证据/,
-    "验收契约必须在决策帧里开局告知");
+  // 原来这里钉的是「harness 收尾时会逐项核对真实证据」——**那句话是假的**。收尾出口按
+  // 分类器预测贴 required_effect_missing: / research_evidence_missing: 那一段在阶段 2b 就
+  // 删了，此后收尾只认执行事实，真正会被机器核对的只有 code_delivered_unverified 和
+  // ui_verification_missing 两条。承诺一个不存在的能力比没有这个能力更糟（同文件另有一条
+  // 「不许告诉模型收尾会自动跑验证」守着同一条规矩），所以契约改成如实分档，这条跟着改。
+  assert.match(SRC, /收尾验收契约（harness 收尾\*\*只机械核对两件事\*\*/,
+    "验收契约必须在决策帧里开局告知，且必须如实说明哪几项真的会被核对");
+  assert.doesNotMatch(SRC, /收尾验收会逐项核对外部证据/,
+    "取证提醒又在承诺一道已经删掉的门：收尾不会核对取证账本");
   assert.match(SRC, /for \(const kind of p\.runtimeObligations \|\| \[\]\) _finishChecks\.push/,
     "契约的运行义务必须直接读门禁同源的 runtimeObligations");
   assert.match(SRC, /for \(const kind of p\.externalObligations \|\| \[\]\) _finishChecks\.push/,
@@ -30926,7 +30942,9 @@ test("researchMode 必须带判据，否则那道取证门永远不会触发", (
   assert.match(seg[1], /才填 none/, "没说清什么时候该填 none，普通任务会被无谓拖慢");
 
   // 开关到门的那条链要还在：researchMode → needs*Research → _missingResearchEvidence → 取证提醒。
-  assert.match(SRC, /m\.needsOfficialResearch = researchMode === "official" \|\| researchMode === "official_and_community";/,
+  // 或合并，不是覆盖——见 research-first.test.mjs 里那条正面钉住的用例（快通道声明的
+  // 调研需求不许被完整裁决之前的默认值抹掉）。这里只守「映射还在」。
+  assert.match(SRC, /m\.needsOfficialResearch = !!\(m\.needsOfficialResearch \|\| researchMode === "official" \|\| researchMode === "official_and_community"\);/,
     "researchMode 到取证开关的映射断了");
   const gate = extractFn("_missingResearchEvidence");
   assert.match(gate, /profile\?\.needsOfficialResearch/, "取证门不再读官方取证开关");
