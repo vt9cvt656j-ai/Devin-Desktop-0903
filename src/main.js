@@ -63220,8 +63220,23 @@ async function _executeToolStepInner(step, call, root, run) {
       // be formatted and then CAS-written over newer terminal/external changes.
       _applyDiskContentToOpenFile(fp, old);
       let formatted = null;
+      let _fmtUnanswered = "";
       try { formatted = await (lspManager && lspManager.agentFormat ? lspManager.agentFormat(fp) : null); } catch {}
+      // agentFormat 现在会用 { unanswered: true } 表示"没查成"（区别于"这语言没有格式化器"）。
+      // 这个分支不是可选的：不摘出来，这个对象会一路走到 writeTextFileIfUnchanged，
+      // 把用户的文件覆写成 "[object Object]"。
+      if (formatted && formatted.unanswered === true) {
+        _fmtUnanswered = { timeout: "语言服务超时（20s 没回应）", error: "语言服务器明确报错", transport: "请求没能送到语言服务器", null: "语言服务回了空应答（多半还在建索引）" }[formatted.reason] || "语言服务没答上来";
+        formatted = null;
+      }
       if (formatted == null) { try { formatted = await _tsWorkerFormat(fp); } catch {} }
+      if (formatted == null && _fmtUnanswered) {
+        res.className = "atc-result atc-result--err"; res.textContent = "没查成";
+        return { type: "format", path: rel, content:
+          `[未完成] ${rel} 这次**没有格式化成**——${_fmtUnanswered}。`
+          + `\n**这不等于这个语言没有格式化器**（那种情况会明确告诉你"无格式化服务"）。文件一个字节都没改。`
+          + `\n刚打开项目时语言服务还在建索引，过一会儿重试通常就好；不想等就用 run_cmd 跑 prettier / rustfmt / gofmt。` };
+      }
       if (formatted == null) {
         res.className = "atc-result atc-result--err"; res.textContent = "无格式化器";
         return { type: "format", path: rel, content: `[无格式化服务] ${rel} 没有可用的语言格式化器。改用 run_cmd 跑 prettier / rustfmt / gofmt 等。` };
@@ -63351,10 +63366,24 @@ async function _executeToolStepInner(step, call, root, run) {
           if (call.op === "hover") {
             // 悬停：一次往返拿到"这个符号在当前装的版本下到底是什么类型"。
             let hover = null;
+            let _hoverUnanswered = "";
             try { hover = await (lspManager && lspManager.agentHover ? lspManager.agentHover(fp, line, character) : null); } catch {}
+            // 没摘出来的话，这个对象会被 String() 成 "[object Object]" 当作符号类型贴给模型。
+            if (hover && hover.unanswered === true) {
+              _hoverUnanswered = { timeout: "语言服务超时（20s 没回应）", error: "语言服务器明确报错", transport: "请求没能送到语言服务器", null: "语言服务回了空应答（多半还在建索引）" }[hover.reason] || "语言服务没答上来";
+              hover = null;
+            }
             // TS worker 兜底——三个兄弟工具都有，只有 hover 漏了。
             // JS/TS/JSX/TSX 不在 lspManager 的 MANAGED_LANGS 里，没有这一条就是必然失败。
             if (!hover) { try { hover = await _tsWorkerHover(fp, line, character); } catch {} }
+            // 「没答上来」时那句"别再试第二次"是**反的**：重试恰恰是对的做法。
+            if (!hover && _hoverUnanswered) {
+              res.className = "atc-result atc-result--err"; res.textContent = "没查成";
+              return { type: "lsp", path: rel, content:
+                `[未完成] ${rel}:${line} 的「${sym}」这次**没有查成**——${_hoverUnanswered}。`
+                + `\n**这不是"查不到类型"，是这一次没问到。** 过一会儿重试一次是有意义的（刚打开项目时语言服务在建索引）。`
+                + `\n不想等就用 package_source(package="包名", symbol="${sym}") 或 lsp_definition 看真实声明。` };
+            }
             if (!hover) {
               res.className = "atc-result atc-result--err"; res.textContent = "无悬停信息";
               return { type: "lsp", path: rel, content:
@@ -63369,9 +63398,24 @@ async function _executeToolStepInner(step, call, root, run) {
               `「${sym}」在 ${rel}:${line} 处的类型（来自语言服务，即本项目当前实际解析到的那一份）：\n${String(hover).slice(0, 4000)}` };
           }
           let locs = null;
+          let _locUnanswered = "";
           try { locs = await (lspManager && lspManager.agentLocate ? lspManager.agentLocate(fp, line, character, call.op) : null); } catch {}
+          if (locs && locs.unanswered === true) {
+            _locUnanswered = { timeout: "语言服务超时（20s 没回应）", error: "语言服务器明确报错", transport: "请求没能送到语言服务器", null: "语言服务回了空应答（多半还在建索引）" }[locs.reason] || "语言服务没答上来";
+            locs = null;
+          }
           if (!locs) { try { locs = await _tsWorkerLocate(fp, line, character, call.op); } catch {} }
           const label = call.op === "references" ? "引用" : "定义";
+          // 这一条是四个里后果最重的：说成"没有引用"，模型就会去删它、或者改了签名不管调用点。
+          if (!locs && _locUnanswered) {
+            res.className = "atc-result atc-result--err"; res.textContent = "没查成";
+            return { type: "lsp", path: rel, content:
+              `[未完成] ${rel}:${line} 的「${sym || rel}」这次**没有查成**${label}——${_locUnanswered}。`
+              + (call.op === "references"
+                ? `\n**这不等于它没有引用。绝对不要据此删除它、改它的签名或改它的行为。**`
+                : `\n**这不等于它没有定义。**`)
+              + `\n刚打开项目时语言服务还在建索引，过一会儿重试一次通常就好；要现在就确定，用 search("${sym || ""}") 全文找一遍。` };
+          }
           if (!locs) {
             res.className = "atc-result atc-result--err"; res.textContent = "无 LSP";
             return { type: "lsp", path: rel, content: `[无 LSP] ${rel} 的语言没有可用的${label}服务。改用 search。` };
