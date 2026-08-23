@@ -449,6 +449,7 @@ pub fn run() {
             auth::db_marketplace_list,
             auth::db_marketplace_upsert,
             accessibility::read_screen,
+            accessibility::probe_screen,
             accessibility::ui_click,
             permissions::permission_status,
             permissions::request_accessibility,

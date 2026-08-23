@@ -181,14 +181,95 @@ pub struct ReadScreenResponse {
 /// 窗口下 500 个元素要 **95 秒**，而这里的上限是 6 秒——在任何真实应用上都必然超时，
 /// 用户看到的就是「读屏一直超时、智能体在发呆」。原生那条同一批 500 个元素 **184 毫秒**，
 /// 而且网页内容照样在（WebArea、按钮、正文都读得到）。
+/// 读屏 / 操作的目标应用。两个字段都不给就是「最前面那个」——九成的用法。
+///
+/// **为什么要有这个**：read_screen 和 ui_click 原来都硬绑前台应用。于是「一边看着
+/// 参考资料一边操作另一个窗口」这种最普通的桌面任务做不了，而且智能体自己干活时
+/// 前台往往就是 Mr. Day One，读回来的是自己。
+#[derive(Debug, Clone, Default)]
+pub struct AxTarget {
+    pub pid: Option<i64>,
+    pub app: Option<String>,
+}
+
+impl AxTarget {
+    fn is_explicit(&self) -> bool {
+        self.pid.map(|p| p > 0).unwrap_or(false)
+            || self.app.as_deref().map(|a| !a.trim().is_empty()).unwrap_or(false)
+    }
+    fn describe(&self) -> String {
+        match (self.pid, self.app.as_deref()) {
+            (Some(p), _) if p > 0 => format!("pid {p}"),
+            (_, Some(a)) if !a.trim().is_empty() => format!("名字含「{}」的应用", a.trim()),
+            _ => "最前面的应用".to_string(),
+        }
+    }
+}
+
+/// 把 app 名字解析成 pid，让下游只需要处理一种目标形态。
+///
+/// 名字→pid 有两个可能的解析者（sidecar 的 `pid_of` 用子串匹配，JXA 这条也用子串），
+/// **必须用同一条规则**：否则读屏解析到 A、动作解析到 B，签名校验会过（元素长得一样），
+/// 点中的却是另一个应用的同名按钮。所以这里统一在 Tauri 层解析一次，
+/// 往下一律只传 pid。
 #[cfg(target_os = "macos")]
-async fn native_snapshot_via_sidecar() -> Option<UiSnapshot> {
-    let out = crate::automation::automation_call(
-        "screen.elements".into(),
-        serde_json::json!({ "cap": 500 }),
-    )
-    .await
-    .ok()?;
+fn resolve_target_pid(target: &AxTarget) -> Result<Option<i64>, String> {
+    if let Some(p) = target.pid {
+        if p > 0 {
+            return Ok(Some(p));
+        }
+    }
+    let Some(name) = target.app.as_deref().map(str::trim).filter(|a| !a.is_empty()) else {
+        return Ok(None); // 前台
+    };
+    let script = format!(
+        r##"(function(){{
+  try {{
+    var want = {};
+    var se = Application('System Events');
+    var ps = se.applicationProcesses();
+    var exact = null, sub = null;
+    for (var i=0;i<ps.length;i++) {{
+      var n=''; try{{n=String(ps[i].name()||'');}}catch(e){{continue;}}
+      var pid=0; try{{pid=Number(ps[i].unixId());}}catch(e){{}}
+      if(!isFinite(pid)||pid<=0) continue;
+      if(n===want) {{ exact={{pid:pid,name:n}}; break; }}
+      if(!sub && n.toLowerCase().indexOf(want.toLowerCase())>=0) sub={{pid:pid,name:n}};
+    }}
+    var hit = exact || sub;
+    return JSON.stringify(hit ? {{ok:true,pid:hit.pid,name:hit.name}} : {{ok:false}});
+  }} catch(e) {{ return JSON.stringify({{ok:false,err:String(e)}}); }}
+}})()"##,
+        serde_json::to_string(name).unwrap_or_else(|_| "\"\"".into())
+    );
+    let out = run_osa(&script, 4000)
+        .ok_or_else(|| format!("解析应用名「{name}」超时或没有辅助功能权限"))?;
+    let v: serde_json::Value = serde_json::from_str(&out)
+        .map_err(|e| format!("解析应用名「{name}」时返回的不是合法 JSON: {e}"))?;
+    if v.get("ok").and_then(serde_json::Value::as_bool) == Some(true) {
+        return Ok(v.get("pid").and_then(serde_json::Value::as_i64).filter(|p| *p > 0));
+    }
+    // 找不到就**报错**，绝不悄悄退回读前台：那会让模型以为读的是 A，
+    // 实际读的是别的应用，然后基于这份内容去点。
+    Err(format!(
+        "没有找到名字里含「{name}」的运行中应用。用 system 的 window.list 看准确名字，或直接给 pid。"
+    ))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn resolve_target_pid(target: &AxTarget) -> Result<Option<i64>, String> {
+    Ok(target.pid.filter(|p| *p > 0))
+}
+
+#[cfg(target_os = "macos")]
+async fn native_snapshot_via_sidecar(pid: Option<i64>) -> Option<UiSnapshot> {
+    let mut args = serde_json::json!({ "cap": 500 });
+    if let Some(p) = pid.filter(|p| *p > 0) {
+        args["pid"] = serde_json::json!(p);
+    }
+    let out = crate::automation::automation_call("screen.elements".into(), args)
+        .await
+        .ok()?;
     let arr = out.get("elements")?.as_array()?;
     let pid = out.get("pid").and_then(|v| v.as_i64()).unwrap_or(0);
     if pid <= 0 {
@@ -224,13 +305,30 @@ async fn native_snapshot_via_sidecar() -> Option<UiSnapshot> {
 }
 
 #[cfg(not(target_os = "macos"))]
-async fn native_snapshot_via_sidecar() -> Option<UiSnapshot> {
+async fn native_snapshot_via_sidecar(_pid: Option<i64>) -> Option<UiSnapshot> {
     None
 }
 
 #[tauri::command]
-pub async fn read_screen(ocr: Option<bool>) -> Result<ReadScreenResponse, String> {
+pub async fn read_screen(
+    ocr: Option<bool>,
+    app: Option<String>,
+    pid: Option<i64>,
+) -> Result<ReadScreenResponse, String> {
     let use_ocr = ocr.unwrap_or(false);
+    let target = AxTarget { pid, app };
+    let target_explicit = target.is_explicit();
+    // 名字在这里就解析成 pid，往下一律只有 pid：读和点必须用**同一条**解析规则，
+    // 否则读屏解析到 A、动作解析到 B，签名校验还会过（同名按钮长得一样）。
+    let target_pid = resolve_target_pid(&target)?;
+    // OCR 拍的是屏幕像素，压根没有"目标应用"这个概念——它只能拍最前面那个。
+    // 静默忽略 app/pid 会让模型以为自己 OCR 了后台窗口，然后基于别的应用的文字往下做。
+    if use_ocr && target_explicit {
+        return Err(format!(
+            "ocr=true 读的是屏幕像素，只能覆盖最前面那个窗口，没法指定{}。要么去掉 app/pid 用 OCR 读前台，要么去掉 ocr 用可访问性树读指定应用。",
+            target.describe()
+        ));
+    }
     // Invalidate old refs before starting a new read. A failed or concurrent read
     // must never leave a ref from an older foreground process actionable.
     clear_latest_ax_refs()?;
@@ -247,7 +345,7 @@ pub async fn read_screen(ocr: Option<bool>) -> Result<ReadScreenResponse, String
     // 快路产出的是**同一个 UiSnapshot 结构**，然后走完全相同的下游：装 ref 表、
     // 拼限制说明。绝不能在这里提前 return——ui_click 靠 install_ax_snapshot 记下的
     // pid 和元素签名来定位，跳过它等于把「按 ref 操作」整条功能弄坏。
-    let fast = if use_ocr { None } else { native_snapshot_via_sidecar().await };
+    let fast = if use_ocr { None } else { native_snapshot_via_sidecar(target_pid).await };
     let mut snapshot = match fast {
         Some(s) if !s.elements.is_empty() => s,
         _ => tauri::async_runtime::spawn_blocking(move || {
@@ -259,12 +357,35 @@ pub async fn read_screen(ocr: Option<bool>) -> Result<ReadScreenResponse, String
                     read_error: None, // OCR 路径不经过 AX 读取，没有「读取没完成」这回事
                 }
             } else {
-                read_ui_snapshot()
+                read_ui_snapshot(target_pid)
             }
         })
         .await
         .map_err(|error| format!("screen reader task failed: {error}"))?,
     };
+    // 指定了目标，就必须**确认读回来的真是它**。
+    //
+    // 两条读取路径都有可能悄悄给回前台那个：sidecar 拿不到目标时会回落，JXA 的
+    // whose() 查不到就返回空 procs（于是 target 为 None）。任何一种情况下把结果照发，
+    // 模型都会以为自己读的是指定的那个应用，然后拿这些 ref 去点——点中的是别人。
+    // 身份对不上宁可报错。
+    if let Some(want) = target_pid {
+        match snapshot.target.as_ref() {
+            Some(t) if t.pid == want => {}
+            Some(t) => {
+                return Err(format!(
+                    "要读的是 pid {want}，实际读到的是「{}」(pid {})——没有按目标读，结果已丢弃。目标窗口可能已经退出，或那个应用不暴露可访问性树。",
+                    t.name, t.pid
+                ));
+            }
+            None if !snapshot.elements.is_empty() => {
+                return Err(format!(
+                    "读到了元素但认不出是哪个应用，无法确认就是 pid {want}——结果已丢弃，不给你可能点错对象的 ref。"
+                ));
+            }
+            None => {}
+        }
+    }
     install_ax_snapshot(&mut snapshot)?;
     let elements = snapshot.elements;
 
@@ -376,9 +497,68 @@ pub async fn read_screen(ocr: Option<bool>) -> Result<ReadScreenResponse, String
     })
 }
 
+/// 只看一眼屏幕上有什么文字/控件，**不发 ref、也不作废任何 ref**。
+///
+/// 这是 background_monitor 的 `screen` 检查类型专用的读法。为什么不能直接用
+/// read_screen 轮询：`read_screen` 每次开头都会 `clear_latest_ax_refs()`，sidecar 那侧
+/// `snapshot` 也会换掉整张句柄表并释放旧句柄。也就是说一个每几秒读一次屏的后台监视器，
+/// 会把模型上一次 read_screen 拿到的 ref **持续作废**——模型攥着一把废数字，
+/// ui_click 只会回「ref 已过期」，而它根本不知道是谁弄没的。
+///
+/// 这条路走 sidecar 的 `screen.probe`：同一套遍历，末尾把句柄放掉而不是存起来。
+/// 没有 ref 进出，所以对模型手里那批 ref 完全没有副作用。
+#[tauri::command]
+pub async fn probe_screen(
+    app: Option<String>,
+    pid: Option<i64>,
+) -> Result<serde_json::Value, String> {
+    let target = AxTarget { pid, app };
+    let target_pid = resolve_target_pid(&target)?;
+    let mut args = serde_json::json!({ "cap": 400 });
+    if let Some(p) = target_pid.filter(|p| *p > 0) {
+        args["pid"] = serde_json::json!(p);
+    }
+    // 这里**没有 JXA 兜底**，是刻意的：JXA 那条一次读要几十秒，做成每几秒一轮的
+    // 轮询等于把机器压死。sidecar 不可用时如实说不可用，让监视器报错退场，
+    // 而不是变成一个永远超时的假等待。
+    let out = crate::automation::automation_call("screen.probe".into(), args)
+        .await
+        .map_err(|e| format!("屏幕探查不可用（自动化子进程没起来？）：{e}"))?;
+    // sidecar 明说了这次读有没有动过句柄表。**必须真的查**：
+    // 这条路存在的全部理由就是「轮询不作废模型手里的 ref」，而一旦哪天 sidecar 那侧
+    // 把 screen.probe 的语义改了、或者有人图省事把它接回 screen.elements，句柄表被悄悄
+    // 换掉这件事在这里是唯一能被发现的地方。发现了就报错——宁可这条监视器不可用，
+    // 也不能让它在后台默默地把模型的 ref 一批批毁掉。
+    if out.get("refs_installed").and_then(|v| v.as_bool()) == Some(true) {
+        return Err(
+            "屏幕探查返回 refs_installed=true：这次读**动了句柄表**，会作废 read_screen 发出去的 ref。已中止，不做这次探查。".into(),
+        );
+    }
+    let elements = out.get("elements").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+    // 只交出匹配要用的东西：角色、文字、值。坐标和 ref 一概不给——给了就会有人
+    // 拿去点，而这条路的元素**没有对应的句柄**，点不了。
+    let text: Vec<String> = elements
+        .iter()
+        .filter_map(|e| {
+            let role = e.get("role").and_then(|v| v.as_str()).unwrap_or("");
+            let t = e.get("text").and_then(|v| v.as_str()).unwrap_or("");
+            let v = e.get("value").and_then(|v| v.as_str()).unwrap_or("");
+            let joined = format!("{role} {t} {v}").trim().to_string();
+            if joined.is_empty() { None } else { Some(joined) }
+        })
+        .collect();
+    Ok(serde_json::json!({
+        "app": out.get("app").and_then(|v| v.as_str()).unwrap_or_default(),
+        "pid": out.get("pid").and_then(|v| v.as_i64()).unwrap_or(0),
+        "count": text.len(),
+        "lines": text,
+    }))
+}
+
 /// Perform a real accessibility action against an opaque ref from the latest
-/// frontmost UI tree. The target PID and original node index are both resolved
-/// from that snapshot; callers must read again whenever the target UI changes.
+/// UI-tree read. The target PID and original node index are both resolved from
+/// that snapshot; callers must read again whenever the target UI changes.
+/// 目标**不必在前台**——身份由快照里记下的 pid + 应用名保证，不由「谁在最前面」保证。
 #[tauri::command]
 pub async fn ui_click(
     reference: u32,
@@ -450,8 +630,20 @@ var axMenuSignature = function(el,p,s){
   return {role:'MenuBarItem',text:String(t).slice(0,80),x:p[0],y:p[1],w:s[0],h:s[1],value:'',enabled:true};
 };"#;
 
+/// 选目标进程的那一小段 JXA。不给 pid 就是前台——保持原行为。
+///
+/// 用 `whose({unixId: N})` 而不是先枚举再逐个读属性：whose 是 System Events 侧的
+/// 查询，一次 Apple Event 就回来；在 JXA 里逐个读 unixId 是每个进程一次往返。
 #[cfg(target_os = "macos")]
-fn read_ui_snapshot() -> UiSnapshot {
+fn ax_target_pick_js(pid: Option<i64>) -> String {
+    match pid.filter(|p| *p > 0) {
+        Some(p) => format!("se.applicationProcesses.whose({{ unixId: {p} }})"),
+        None => "se.applicationProcesses.whose({ frontmost: true })".to_string(),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn read_ui_snapshot(pid: Option<i64>) -> UiSnapshot {
     use std::io::Read;
     use std::process::Stdio;
     use std::time::{Duration, Instant};
@@ -465,7 +657,7 @@ fn read_ui_snapshot() -> UiSnapshot {
   try {
     __SIGNATURE_BUILDERS__
     var se = Application('System Events');
-    var procs = se.applicationProcesses.whose({ frontmost: true });
+    var procs = __TARGET_PICK__;
     if (!procs.length) return JSON.stringify({target:null,elements:[]});
     var proc = procs[0];
     var pid=0,pname='';
@@ -533,7 +725,8 @@ fn read_ui_snapshot() -> UiSnapshot {
       read_error: allHidden ? '这个应用的窗口当前全部处于最小化（或尺寸为零）状态，屏幕上没有可点的元素。先把它切到前台或还原窗口再读一次即可——这不是权限问题，也不是它不暴露辅助功能树。' : undefined});
   }catch(e){return JSON.stringify({target:null,elements:[]});}
 })()"##
-        .replace("__SIGNATURE_BUILDERS__", AX_SIGNATURE_BUILDERS_JS);
+        .replace("__SIGNATURE_BUILDERS__", AX_SIGNATURE_BUILDERS_JS)
+        .replace("__TARGET_PICK__", &ax_target_pick_js(pid));
 
     let mut child = match crate::process_util::command("osascript")
         .args(["-l", "JavaScript", "-e", script.as_str()])
@@ -576,7 +769,7 @@ fn read_ui_snapshot() -> UiSnapshot {
 /// Windows 侧那个返回 (元素, 失败原因)，因为它三种失败原来全都静默变空。
 #[cfg(target_os = "macos")]
 pub fn read_ui_elements() -> Vec<UiElement> {
-    read_ui_snapshot().elements
+    read_ui_snapshot(None).elements
 }
 
 // Windows: the UI Automation twin of the macOS AX walk above — enumerate the foreground
@@ -705,7 +898,7 @@ pub fn read_ui_elements() -> (Vec<UiElement>, Option<AccessibilityTarget>, Optio
 }
 
 #[cfg(not(target_os = "macos"))]
-fn read_ui_snapshot() -> UiSnapshot {
+fn read_ui_snapshot(_pid: Option<i64>) -> UiSnapshot {
     // 上面那句注释以前说「这条路径没有独立的失败信号」——不对：起不来、超时、
     // 输出不是合法 JSON，三种失败都存在，只是原来全都静默返回了空。空结果因此和
     // 「这个应用真的没有可访问性树」长得一模一样，而下游对这两件事的处置完全相反
@@ -796,14 +989,23 @@ const AX_ACTION_JS: &str = r##"(function(){
       return false;
     };
     var se = Application('System Events');
-    var procs = se.applicationProcesses.whose({ frontmost: true });
-    if (!procs.length) return JSON.stringify({ok:false, err:'no frontmost app'});
+    // 按 **pid** 定位，不再要求目标在最前面。
+    //
+    // 原来这里是 whose({frontmost:true})：也就是说即便 read_screen 读到了一个后台
+    // 应用，动作也必然被这句拒掉（"frontmost app changed"）——读得到、点不了，
+    // 「指定目标」等于只做了半个。
+    //
+    // 那句 frontmost 检查真正在防的是「在 A 上读的 ref 被拿到 B 上执行」，而防住它的
+    // 是下面 pid + 应用名这两道身份校验，不是「必须在前台」。按 pid 定位之后这两道
+    // 照样跑，防护一点没少，只是不再顺带禁止操作后台窗口。
+    var procs = se.applicationProcesses.whose({ unixId: CTX.pid });
+    if (!procs.length) return JSON.stringify({ok:false, err:'target app (pid '+CTX.pid+') is gone; run read_screen again'});
     var proc = procs[0];
     var actualPid=0; try{actualPid=Number(proc.unixId());}catch(e){}
-    if(!isFinite(actualPid)||actualPid<=0) return JSON.stringify({ok:false, err:'could not identify frontmost process'});
-    if(actualPid!==CTX.pid) return JSON.stringify({ok:false, err:'frontmost app changed; run read_screen again', expectedPid:CTX.pid, actualPid:actualPid});
+    if(!isFinite(actualPid)||actualPid<=0) return JSON.stringify({ok:false, err:'could not identify target process'});
+    if(actualPid!==CTX.pid) return JSON.stringify({ok:false, err:'target app changed; run read_screen again', expectedPid:CTX.pid, actualPid:actualPid});
     var actualAppName=''; try{actualAppName=String(proc.name()||'').slice(0,120);}catch(e){}
-    if(actualAppName!==CTX.appName) return JSON.stringify({ok:false, err:'frontmost app identity changed; run read_screen again'});
+    if(actualAppName!==CTX.appName) return JSON.stringify({ok:false, err:'target app identity changed (pid reused); run read_screen again'});
     var CAP = 500;
     var T1 = { AXButton:1,AXTextField:1,AXTextArea:1,AXCheckBox:1,AXRadioButton:1,AXPopUpButton:1,AXMenuButton:1,AXComboBox:1,AXLink:1,AXSlider:1,AXDisclosureTriangle:1,AXSegmentedControl:1,AXTabGroup:1,AXSearchField:1,AXStepper:1,AXIncrementor:1,AXColorWell:1,AXMenuItem:1,AXTab:1,AXDateField:1,AXSecureTextField:1 };
     var T2 = { AXStaticText:1,AXHeading:1 };
@@ -1509,6 +1711,107 @@ return JSON.stringify({operated:operated,changed:changed});
             src.matches(&cap_check).count(),
             1,
             "截断说明要真的按元素数判断，不能写死"
+        );
+    }
+
+    /// 产品代码那一段（切掉 #[cfg(test)] 往后）。
+    ///
+    /// 必须切：`include_str!` 读的是整个文件，**包含这些测试自己**。于是
+    /// `src.contains("if let Some(want) = target_pid {")` 会被断言里的那个字面量喂饱——
+    /// 把实现整个删掉它还是绿的。这个仓库已经踩过好几次，实测本轮又逃掉两条。
+    fn prod_src() -> String {
+        let all = include_str!("accessibility.rs");
+        let end = all.find("#[cfg(test)]").unwrap_or(all.len());
+        all[..end]
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// 探查读法**不许**碰 ref 表。
+    ///
+    /// background_monitor 的 screen 检查每几秒读一次屏。read_screen 每次开头都
+    /// `clear_latest_ax_refs()`、结尾 `install_ax_snapshot()` 换掉整张表，所以只要
+    /// probe_screen 哪天图省事复用了那条路（或者有人把它接回 screen.elements），
+    /// 后台轮询就会把模型上一次读屏拿到的 ref 一批批作废——而模型只会看到
+    /// 「ref 已过期」，根本不知道是谁弄没的。这是这条功能唯一要防的事。
+    #[test]
+    fn probe_never_touches_the_ref_table() {
+        let src = prod_src();
+        let start = src
+            .find("pub async fn probe_screen(")
+            .expect("probe_screen 不见了");
+        let end = src[start..]
+            .find("\npub async fn ")
+            .map(|i| start + i)
+            .unwrap_or(src.len());
+        let body = &src[start..end];
+        assert!(
+            !body.contains("clear_latest_ax_refs"),
+            "probe_screen 清了 ref 表——每轮轮询都会作废模型手里的 ref"
+        );
+        assert!(
+            !body.contains("install_ax_snapshot"),
+            "probe_screen 装了新 ref 表——旧 ref 会被顶掉"
+        );
+        assert!(
+            body.contains("screen.probe"),
+            "probe_screen 没走 sidecar 的探查方法；screen.elements 会换掉句柄表"
+        );
+        // sidecar 特意回了 refs_installed 说明这次读动没动句柄表，这里必须真的**查**它。
+        // 钉的是那个判断表达式，不是这三个字母：错误文案里也有 refs_installed，
+        // 只钉字符串的话把 if 改成 `if false` 照样绿（实测逃掉过一次）。
+        let needle = format!("get(\"refs_{}\").and_then(|v| v.as_bool()) == Some(true)", "installed");
+        assert!(
+            body.contains(&needle),
+            "没有真的校验 sidecar 回的 refs_installed——对端语义变了这边发现不了"
+        );
+    }
+
+    /// 动作不再要求目标在最前面，但身份校验一道都不能少。
+    ///
+    /// 原来 JXA 动作脚本用 `whose({frontmost:true})`：于是即便 read_screen 读到了一个
+    /// 后台应用，动作也必然被拒——读得到、点不了。那句 frontmost 真正在防的是
+    /// 「在 A 上读的 ref 被拿到 B 上执行」，防住它的是 pid + 应用名两道校验。
+    #[test]
+    fn action_targets_by_pid_not_by_who_is_in_front() {
+        let src = prod_src();
+        let start = src.find("const AX_ACTION_JS").expect("动作脚本不见了");
+        let end = start + src[start..].find("})()").expect("动作脚本没结尾");
+        let js = &src[start..end];
+        assert!(
+            js.contains("whose({ unixId: CTX.pid })"),
+            "动作脚本没有按 pid 定位目标"
+        );
+        assert!(
+            !js.contains("whose({ frontmost: true })"),
+            "动作脚本又绑回前台了——指定目标读得到却点不了"
+        );
+        // 两道身份校验一道都不能少：pid 会被复用，名字单独也不够。
+        assert!(js.contains("actualPid!==CTX.pid"), "少了 pid 回读校验");
+        assert!(
+            js.contains("actualAppName!==CTX.appName"),
+            "少了应用名校验——pid 复用时会点到新进程上"
+        );
+    }
+
+    /// 目标读回来的必须**真是它**，对不上宁可报错。
+    #[test]
+    fn a_mismatched_target_is_an_error_not_a_silent_fallback() {
+        let src = prod_src();
+        assert!(
+            src.contains("if let Some(want) = target_pid {"),
+            "read_screen 没有校验读回来的是不是指定的那个应用"
+        );
+        assert!(
+            src.contains("结果已丢弃"),
+            "身份对不上时没有丢弃结果——模型会拿别的应用的 ref 去点"
+        );
+        // 名字解析不到也必须报错，不能悄悄退回读前台。
+        assert!(
+            src.contains("没有找到名字里含"),
+            "应用名找不到时没有报错——静默读前台是最坏的一种失败"
         );
     }
 

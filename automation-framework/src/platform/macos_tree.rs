@@ -224,6 +224,23 @@ pub fn frontmost_pid() -> Option<i32> {
 /// 只走用户真看得见、真点得到的窗口：跳过最小化的和尺寸退化的（浏览器会挂 1x1 的
 /// 隐藏工具窗），主窗口排最前——被 cap 截断时先留它。
 pub fn snapshot(pid: i32, cap: usize) -> Vec<AxNode> {
+    snapshot_inner(pid, cap, true)
+}
+
+/// 只看一眼，**不动句柄表**。
+///
+/// background_monitor 的 screen 检查要每隔几秒读一次屏，而 `snapshot` 每次都会
+/// `store_handles` 换掉整张表并 CFRelease 掉旧句柄 —— 也就是说轮询会把模型上一次
+/// read_screen 拿到的 ref **全部作废**。模型手里于是攥着一把废数字，`act` 只会回
+/// 「ref 不在最近一次读屏结果里」，而它根本不知道是谁弄没的。
+///
+/// 这条路走同一套遍历，末尾把 walk 里 retain 过的句柄逐个放掉（不放就是泄漏），
+/// 只交出可读文本。**它不产生 ref，也不销毁 ref。**
+pub fn snapshot_probe(pid: i32, cap: usize) -> Vec<AxNode> {
+    snapshot_inner(pid, cap, false)
+}
+
+fn snapshot_inner(pid: i32, cap: usize, keep_handles: bool) -> Vec<AxNode> {
     let mut out = Vec::new();
     let mut handles: Vec<(u32, AXUIElementRef, AxNode)> = Vec::new();
     unsafe {
@@ -295,7 +312,15 @@ pub fn snapshot(pid: i32, cap: usize) -> Vec<AxNode> {
         }
         CFRelease(app as CFTypeRef);
     }
-    store_handles(pid, handles);
+    if keep_handles {
+        store_handles(pid, handles);
+    } else {
+        // 探查路径：walk 里 retain 过的句柄这里全部放掉。既不换表也不泄漏，
+        // 上一次 read_screen 发出去的 ref 原封不动地继续有效。
+        for (_, el, _) in handles {
+            unsafe { CFRelease(el as CFTypeRef) };
+        }
+    }
     out
 }
 
@@ -483,6 +508,34 @@ unsafe fn walk_one(el: AXUIElementRef, out: &mut Vec<AxNode>) {
         h,
         enabled: attr_bool(el, "AXEnabled").unwrap_or(true),
     });
+}
+
+/// 按进程号反查应用名。
+///
+/// screen.elements 原来是拿 `enumerate_windows()` 里 `is_frontmost` 那一条的标题当
+/// 应用名回给调用方的 —— 只读前台时碰巧总是对的。一旦支持读**非前台**的应用，
+/// 这个名字就成了系统性的假话：读的是 A，回执说是 B。而 read_screen 正是拿这个名字
+/// 装进 ref 表当身份，ui_click 再用它校验「读的还是不是同一个 app」——错的身份会让
+/// 这道校验形同虚设。按 pid 反查是唯一诚实的读法。
+pub fn name_of(pid: i32) -> Option<String> {
+    use cocoa::base::{id, nil};
+    use objc::{class, msg_send, sel, sel_impl};
+    unsafe {
+        let cls = class!(NSRunningApplication);
+        let app: id = msg_send![cls, runningApplicationWithProcessIdentifier: pid];
+        if app == nil {
+            return None;
+        }
+        let name_obj: id = msg_send![app, localizedName];
+        if name_obj == nil {
+            return None;
+        }
+        let ptr: *const i8 = msg_send![name_obj, UTF8String];
+        if ptr.is_null() {
+            return None;
+        }
+        Some(std::ffi::CStr::from_ptr(ptr).to_string_lossy().into_owned())
+    }
 }
 
 /// 按应用名找进程号。window.restore 要用，和 macos.rs 里那个是同一件事。
