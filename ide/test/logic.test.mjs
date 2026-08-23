@@ -16691,7 +16691,12 @@ test("reply stats footer uses exact server settlements on both chat paths", () =
   // Both the plain-chat finalizer and the agent-run finalizer must append the footer.
   assert.match(SRC, /_appendTurnStatsFooter\(body, \{\s*\n\s*elapsedMs: Date\.now\(\) - _taskStartedAt/,
     "plain chat reports the whole user-visible task, not only the final physical attempt");
-  assert.match(SRC, /_appendTurnStatsFooter\(body, \{\s*\n\s*elapsedMs: Date\.now\(\) - run\._recStart/);
+  // agent 那条的耗时在**内容结束时定格**（`_contentDoneMs`，见「耗时在内容结束时定格」
+  // 那条测试）：收尾要 await 两次网络往返，用 Date.now() 会把对账也算进「回答花了多久」。
+  // 这里守的性质是「agent 收尾也要 append footer」，与耗时怎么算无关，只换锚点。
+  assert.match(SRC, /_appendTurnStatsFooter\(body, \{\s*\n\s*elapsedMs: _contentDoneMs,/);
+  assert.match(SRC, /const _contentDoneMs = Date\.now\(\) - run\._recStart;/,
+    "定格值本身没了");
   assert.match(SRC, /session\._runUsage = \{ in: 0, out: 0, cacheRead: 0, cacheCreation: 0, costCents: 0, turns: 0, settledTurns: 0, reportedTurns: 0, allSettled: true, allReported: true \}/);
   assert.match(SRC, /getSettlement: \(\) => _liveRunSettlement\(session\._runUsage\)/);
   assert.match(SRC, /if \(session\._liveRunStats\) session\._liveRunStats\.refresh\(\)/);
@@ -28187,6 +28192,49 @@ test("相册样式：格子定尺寸、行等高、角标盖实", () => {
     "+N 角标太透，底下的图会透出来");
   assert.match(APP_CSS, /\.msg__album-more[\s\S]{0,500}pointer-events:\s*none/,
     "角标挡住了点击——点 +N 进不了画廊");
+});
+
+// ── 耗时要在内容结束时定格，不能把事后对账也算进去 ─────────────────────────
+//
+// agent 收尾时有两个 await（等计费任务落定、向网关取结算），是网络往返，慢的时候十几秒。
+// 原来 live 计时器一直转到 finally 才停，最终那行又用 `Date.now() - run._recStart`，
+// 于是：回答早写完不动了，秒数还在一秒一跳，最后定格在一个**含结算等待**的数。
+// 实测同一条回复先显示 9.1s、后来变成 19s，而「模型 4.5s / 首显 4.5s」纹丝不动——
+// 差的十秒全是对账。用户读这个数的意思是「这次回答花了多久」。
+test("耗时在内容结束时定格，不含结算等待", () => {
+  const src = stripJsComments(SRC);
+
+  // 停表和取时点都必须在两个 await **之前**。
+  const freeze = src.indexOf("const _contentDoneMs = Date.now() - run._recStart;");
+  const stopAt = src.indexOf("_liveStats.stop();", freeze);
+  const awaitBillable = src.indexOf("await _awaitBillableAiTasks(run._reqId)");
+  assert.ok(freeze > 0, "没有在内容结束处取时点");
+  assert.ok(stopAt > freeze && stopAt < awaitBillable,
+    "计时器没有在进入结算等待之前停下——秒数会一直跳到对账结束");
+
+  // 最终那行用定格值，不是 Date.now()。
+  assert.match(src, /_appendTurnStatsFooter\(body, \{\s*elapsedMs: _contentDoneMs,/,
+    "最终统计仍在用 Date.now() 算总耗时——把结算等待算进去了");
+  assert.doesNotMatch(src, /elapsedMs: Date\.now\(\) - run\._recStart/,
+    "又回到用 Date.now() 减起点了");
+});
+
+// ── 历史消息的模型头像/名称不许被后来的选择改写 ─────────────────────────────
+//
+// selectModel 原来会把**整个会话**里所有助手头像刷成新模型，注释还写着「让图标跟随所选
+// 模型」。方向反了：一条回复是哪个模型答的，就该一直显示那个 —— 那是已经发生过的事实。
+// 而且它只改图标不改名字（名字在 addMessage 里按当时的 id 写死），于是切一次模型，
+// 历史消息就变成「名字是 grok-4.6、图标是 claude」的错配。
+test("切换模型不许改写历史消息的头像", () => {
+  const src = stripJsComments(extractFn("selectModel"));
+  assert.doesNotMatch(src, /querySelectorAll\("\.msg\.assistant \.msg__avatar--logo"\)/,
+    "又在切模型时批量重刷历史头像了——名字不会跟着变，会错配成「旧名字 + 新图标」");
+  assert.doesNotMatch(src, /_setModelAvatar/,
+    "selectModel 不该碰任何已渲染消息的头像");
+  // 渲染时按**当时**的 id 定头像和名字，这一条不能丢，否则新回复也没有正确图标。
+  const add = stripJsComments(extractFn("addMessage"));
+  assert.match(add, /_setModelAvatar\(avatar, id\)/, "新回复渲染时没有按当时的模型设头像");
+  assert.match(add, /textContent = id \? modelLabel\(id\)/, "新回复渲染时没有按当时的模型写名字");
 });
 
 // ── 本轮统计行必须钉在最底部，不许一上一下 ─────────────────────────────────

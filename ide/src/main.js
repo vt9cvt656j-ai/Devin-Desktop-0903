@@ -15861,11 +15861,15 @@ async function selectModel(model, modelGroup) {
     session.model = model;
     _renderChatTabs();
     saveChatHistory();
-    // Switched models → re-skin the assistant avatars IN THIS CONVERSATION so the in-chat
-    // icon follows the chosen model. (Only the message avatars — not the header/login icon.)
-    try {
-      session.container.querySelectorAll(".msg.assistant .msg__avatar--logo").forEach((a) => _setModelAvatar(a, model));
-    } catch {}
+    // **不要**在这里批量改历史消息的头像。
+    //
+    // 这里原来是 `querySelectorAll(".msg.assistant .msg__avatar--logo").forEach(...)`，
+    // 注释写着「让聊天里的图标跟随所选模型」。方向反了：一条回复是哪个模型答的，就该
+    // 一直显示那个模型 —— 那是**已经发生过的事实**，不是一个跟着当前选择走的偏好。
+    //
+    // 而且它只改图标、不改名字（名字在 addMessage 里按当时的 id 写死），于是切一次模型，
+    // 历史消息就变成「名字是 grok-4.6、图标是 claude」的错配 —— 用户报的就是这个。
+    // 新模型只对**之后**的回复生效，那些消息渲染时自然带上新图标和新名字。
   }
   _refreshContextMeterFromDraft({ force: true });
 }
@@ -56276,14 +56280,25 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
       growth.signal("run-complete", { verified: didVerify && verificationPassed && uiVerificationPassed });
     }
     saveChatHistory();
+    // 内容到此为止 —— **先停表**，再去等结算。
+    //
+    // 下面两个 await（等计费任务落定、向网关取结算）是网络往返，慢的时候好几秒甚至十几秒。
+    // 原来 live 计时器一直转到 finally 才停，而最终那行又用 `Date.now() - run._recStart`
+    // 算总耗时，于是：回答早就写完不动了，那个秒数还在一秒一跳，最后定格在一个**把结算
+    // 等待也算进去**的数（实测同一条回复先显示 9.1s、后来变成 19s，而「模型 4.5s / 首显
+    // 4.5s」纹丝不动 —— 差的十秒全是结算）。
+    //
+    // 用户读这个数的意思是「这次回答花了多久」，不是「包括事后对账在内的一切」。
+    // 所以在这里定格，结算回来只补 token 和金额。
+    const _contentDoneMs = Date.now() - run._recStart;
+    _liveStats.stop();
     try {
       const _ru = session._runUsage;
       await _awaitBillableAiTasks(run._reqId);
       const _scopeSettlement = await _fetchGatewaySettlement(config, run._reqId);
       if (_scopeSettlement) _addRunSettlement(_ru, _scopeSettlement);
-      _liveStats.refresh();
       _appendTurnStatsFooter(body, {
-        elapsedMs: Date.now() - run._recStart,
+        elapsedMs: _contentDoneMs,
         settlement: _finalRunSettlement(_ru),
         timeline: run.timeline,
       });
