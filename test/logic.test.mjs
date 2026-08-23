@@ -18856,7 +18856,7 @@ test("草稿保存不得在节流之上展平累计正文（长内容卡死/崩�
   const KEY = "k";
   const m = new Map();
   const ls = { getItem: (k) => (m.has(k) ? m.get(k) : null), setItem: (k, v) => m.set(k, String(v)), removeItem: (k) => m.delete(k) };
-  const save = load("_streamDraftSave", { _isSecondaryWindow: false, _STREAM_DRAFT_KEY: KEY, localStorage: ls, inTauri: false, _streamDraftMapRead: load("_streamDraftMapRead", { _STREAM_DRAFT_KEY: KEY, localStorage: ls, _streamDraftMapFrom: load("_streamDraftMapFrom", {}) }), _streamDraftMapWrite: load("_streamDraftMapWrite", { _STREAM_DRAFT_KEY: KEY, localStorage: ls }), _streamDraftMapFrom: load("_streamDraftMapFrom", {}), });
+  const save = load("_streamDraftSave", { _draftStepsMarkdown: load("_draftStepsMarkdown", { _DRAFT_STEPS_MAX: loadConst("_DRAFT_STEPS_MAX") }), _isSecondaryWindow: false, _STREAM_DRAFT_KEY: KEY, localStorage: ls, inTauri: false, _streamDraftMapRead: load("_streamDraftMapRead", { _STREAM_DRAFT_KEY: KEY, localStorage: ls, _streamDraftMapFrom: load("_streamDraftMapFrom", {}) }), _streamDraftMapWrite: load("_streamDraftMapWrite", { _STREAM_DRAFT_KEY: KEY, localStorage: ls }), _streamDraftMapFrom: load("_streamDraftMapFrom", {}), });
   save({ id: "s" }, "   \n  ", "");
   assert.equal(ls.getItem(KEY), null, "纯空白内容不得落盘（行为必须与修复前一致）");
   save({ id: "s2" }, "真实内容", "");
@@ -18908,7 +18908,7 @@ test("流式回复退出落盘：节流尾部常驻内存，退出 flush 同步�
   const KEY = "michael-stream-draft-v1";
   const mkLS = () => { const m = new Map(); return { getItem: (k) => (m.has(k) ? m.get(k) : null), setItem: (k, v) => m.set(k, String(v)), removeItem: (k) => m.delete(k) }; };
   const ls = mkLS();
-  const draftSave = load("_streamDraftSave", { _isSecondaryWindow: false, _STREAM_DRAFT_KEY: KEY, localStorage: ls, inTauri: false, _streamDraftMapRead: load("_streamDraftMapRead", { _STREAM_DRAFT_KEY: KEY, localStorage: ls, _streamDraftMapFrom: load("_streamDraftMapFrom", {}) }), _streamDraftMapWrite: load("_streamDraftMapWrite", { _STREAM_DRAFT_KEY: KEY, localStorage: ls }), _streamDraftMapFrom: load("_streamDraftMapFrom", {}), });
+  const draftSave = load("_streamDraftSave", { _draftStepsMarkdown: load("_draftStepsMarkdown", { _DRAFT_STEPS_MAX: loadConst("_DRAFT_STEPS_MAX") }), _isSecondaryWindow: false, _STREAM_DRAFT_KEY: KEY, localStorage: ls, inTauri: false, _streamDraftMapRead: load("_streamDraftMapRead", { _STREAM_DRAFT_KEY: KEY, localStorage: ls, _streamDraftMapFrom: load("_streamDraftMapFrom", {}) }), _streamDraftMapWrite: load("_streamDraftMapWrite", { _STREAM_DRAFT_KEY: KEY, localStorage: ls }), _streamDraftMapFrom: load("_streamDraftMapFrom", {}), });
   const sess = { id: "s1", streaming: true };
   draftSave(sess, "第一段", "思考1");
   draftSave(sess, "第一段+节流窗口内的后续内容", "思考2");
@@ -18917,7 +18917,7 @@ test("流式回复退出落盘：节流尾部常驻内存，退出 flush 同步�
   assert.equal(sess._streamDraftLatest.text, "第一段+节流窗口内的后续内容", "节流丢掉的尾部必须常驻内存，供退出 flush 补写");
 
   // 退出/隐藏同步 flush：绕过节流，把内存里的最新全量草稿同步写进 localStorage
-  const flushSync = load("_streamDraftFlushSync", { _isSecondaryWindow: false, _STREAM_DRAFT_KEY: KEY, localStorage: ls, _chatSessions: [sess], _streamDraftMapRead: load("_streamDraftMapRead", { _STREAM_DRAFT_KEY: KEY, localStorage: ls, _streamDraftMapFrom: load("_streamDraftMapFrom", {}) }), _streamDraftMapWrite: load("_streamDraftMapWrite", { _STREAM_DRAFT_KEY: KEY, localStorage: ls }), _streamDraftMapFrom: load("_streamDraftMapFrom", {}), });
+  const flushSync = load("_streamDraftFlushSync", { _draftStepsMarkdown: load("_draftStepsMarkdown", { _DRAFT_STEPS_MAX: loadConst("_DRAFT_STEPS_MAX") }), _isSecondaryWindow: false, _STREAM_DRAFT_KEY: KEY, localStorage: ls, _chatSessions: [sess], _streamDraftMapRead: load("_streamDraftMapRead", { _STREAM_DRAFT_KEY: KEY, localStorage: ls, _streamDraftMapFrom: load("_streamDraftMapFrom", {}) }), _streamDraftMapWrite: load("_streamDraftMapWrite", { _STREAM_DRAFT_KEY: KEY, localStorage: ls }), _streamDraftMapFrom: load("_streamDraftMapFrom", {}), });
   const flushed = flushSync();
   assert.equal(flushed.text, "第一段+节流窗口内的后续内容");
   {
@@ -18927,6 +18927,7 @@ test("流式回复退出落盘：节流尾部常驻内存，退出 flush 同步�
     const a = { id: "a", streaming: true, _streamDraftLatest: { text: "A 的在途回复", reasoning: "" } };
     const b = { id: "b", streaming: true, _streamDraftLatest: { text: "B 的在途回复", reasoning: "" } };
     const flushMulti = load("_streamDraftFlushSync", {
+      _draftStepsMarkdown: load("_draftStepsMarkdown", { _DRAFT_STEPS_MAX: loadConst("_DRAFT_STEPS_MAX") }),
       _isSecondaryWindow: false, _STREAM_DRAFT_KEY: KEY, localStorage: lsMulti, _chatSessions: [a, b],
       _streamDraftMapRead: load("_streamDraftMapRead", { _STREAM_DRAFT_KEY: KEY, localStorage: lsMulti,
         _streamDraftMapFrom: load("_streamDraftMapFrom", {}) }),
@@ -19019,8 +19020,13 @@ test("流式草稿恢复：双通道取较新者，两侧都消费后清槽", as
   // 恢复渲染完整性：草稿全文进 memory（push 不截断），并强制从持久历史重建可见窗口
   assert.ok(SRC.includes("for (const _draft of await _streamDraftTake())"),
     "恢复路径必须遍历所有会话的草稿，只取一份会丢掉并发标签页的整轮输出");
-  assert.ok(SRC.includes("此回复在生成途中因软件重启被打断，以下为已生成的部分）\\n\\n${_draft.text}") || /以下为已生成的部分）[\s\S]{0,40}_draft\.text/.test(SRC),
-    "中断恢复必须把草稿全文（_draft.text 不截断）补进历史");
+  // 原来两条分支都假定「横幅后面紧跟 _draft.text」。步骤清单现在插在中间（见
+  // 「被打断的 run 恢复出来要带上这一轮执行过的步骤」那条），旧锚点因此失效 ——
+  // 但它守的性质没变：进历史的必须是**全文**，不许在这里 slice。改成钉那个性质本身。
+  assert.ok(/以下为已生成的部分）[\s\S]{0,400}\+ _draft\.text/.test(SRC),
+    "中断恢复必须把草稿全文补进历史（横幅之后要接上 _draft.text）");
+  assert.doesNotMatch(SRC, /_draft\.text\.slice\(/,
+    "草稿正文在恢复处被截断了——那正是「显示一点点」的另一种写法");
 });
 
 // ---- 深度思考质量修复（方案 A+B+E） ----------------------------------------------
@@ -28042,6 +28048,64 @@ test("崩溃重开：补进上下文的必须是日志结尾那一段，不是 c
     "喂进去的必须是按 total 取的那一段，不能是第一窗");
   assert.doesNotMatch(src, /adoptJournalTail\?\.\(loaded\.messages/,
     "又把第一窗（按 checkpoint 猜的那一窗）当结尾喂进去了");
+});
+
+// ── 被打断的那一轮，要看得见「它做了什么」，不只是「它说到哪」 ─────────────
+//
+// agent 运行途中**一条消息都不进 session.memory**：整轮的叙述攒在 _runAgenticLoop 的
+// 局部变量 summaryText 里，收尾才 push 一次。所以运行中崩溃时，SQLite 里这一轮什么都没有，
+// 唯一的保险是流式草稿——而它此前**只存纯文本**。工具卡片（读文件/写文件/跑命令/子智能体）
+// 全部只活在 DOM 里，重启后一张都不剩。一个做了几十次工具调用的 run，恢复出来塌成两句话。
+// 用户原话：「这个即使中断的也要显示全部的内容，而不是显示这种」。
+test("被打断的 run 恢复出来要带上这一轮执行过的步骤", () => {
+  const render = load("_draftStepsMarkdown", { _DRAFT_STEPS_MAX: loadConst("_DRAFT_STEPS_MAX") });
+
+  const out = render({ _activeRun: { recording: [
+    { type: "read", label: "读取 package.json", ok: true },
+    { type: "write", label: "写入 src/index.ts", ok: true },
+    { type: "cmd", label: "运行  $ npm run build", ok: false, fail: "[ERROR] tsc: 3 errors" },
+  ] } });
+  assert.match(out, /写入 src\/index\.ts/, "做过的写入必须出现");
+  assert.match(out, /✗ 运行/, "失败的步骤要标出来，不能和成功的长一样");
+  assert.match(out, /tsc: 3 errors/, "失败原因要带上——不然只知道失败了、不知道为什么");
+  assert.match(out, /3 步/, "要给出总步数");
+
+  // 没有 run / run 里什么都没做 → 不许产出噪音（那会给每条被打断的消息加一个空标题）。
+  assert.equal(render({}), "");
+  assert.equal(render({ _activeRun: { recording: [] } }), "");
+
+  // 超量时取**最近**的，并如实说省略了多少——不写省略数就是另一种糊弄。
+  const many = Array.from({ length: 450 }, (_, i) => ({ type: "read", label: `读取 f${i}.ts`, ok: true }));
+  const big = render({ _activeRun: { recording: many } });
+  assert.match(big, /共 450 步/, "总数要如实说");
+  assert.match(big, /最近 400 步/, "省略了多少要写出来");
+  assert.ok(big.includes("f449.ts") && !big.includes("f0.ts"), "保留的必须是最近那一段");
+
+  // 接线：两个草稿写入点都要带上步骤，恢复处要把它拼进那条消息。
+  const save = stripJsComments(extractFn("_streamDraftSave"));
+  assert.match(save, /steps: _draftStepsMarkdown\(session\)/, "节流写入点没带步骤");
+  const flush = stripJsComments(extractFn("_streamDraftFlushSync"));
+  assert.match(flush, /steps: _draftStepsMarkdown\(sess\)/,
+    "退出同步兜底没带步骤——而那一次恰恰是最全的（绕过节流）");
+  const src = stripJsComments(SRC);
+  assert.match(src, /const _steps = String\(_draft\.steps \|\| ""\)\.trim\(\);/,
+    "恢复时没有从草稿里取出步骤");
+  // 只钉「取了值」是假断言：把下面那行拼接删掉、只留取值，它照样绿（变异实测漏网）。
+  // 必须钉住 content 里**真的把 _steps 接了进去**。
+  assert.match(src, /\+ \(_steps \? `\$\{_steps\}\\n\\n` : ""\)/,
+    "步骤取出来了却没拼进那条消息——恢复出来还是只有叙述");
+
+  // recording 必须够得着：run 创建时挂上 session._activeRun，收尾时解引用。
+  assert.match(src, /session\._activeRun = run;/, "run 没挂到 session 上，草稿读不到 recording");
+  assert.match(src, /if \(session\._activeRun === run\) session\._activeRun = null;/,
+    "run 收尾没解引用，session 会一直吊着整轮的 recording");
+
+  // 渲染必须在节流**之下**：每 token 遍历一遍 recording，长 run 上又是一条 O(n²)，
+  // 而这个文件里已经因为同类问题出过事故（0.9s→5s→24s→59s）。
+  const throttleAt = save.indexOf("_draftSaveAt = now");
+  const renderAt = save.indexOf("_draftStepsMarkdown");
+  assert.ok(throttleAt !== -1 && renderAt > throttleAt,
+    "步骤渲染跑到节流上面去了：每个 token 都会遍历整个 recording");
 });
 
 // ── 其它已打开的标签，历史也要读进来 ─────────────────────────────────────────
