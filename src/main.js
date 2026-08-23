@@ -43240,6 +43240,53 @@ function _depPitfallNote(run, fp, oldText, newText) {
 // 依赖资料查询候选的代填器：模型对 _depPitfallNote 预填的 context7 查询点头（对那个
 // 工具发一个空参数调用）时，把算好的查询参数填进去；候选一次性消费。模型自带参数则
 // 一个字不动、候选保留——它在查自己的问题，不是在点头。发起方永远是模型，IDE 不代跑。
+/**
+ * 写前取证门的查询串：从裁决声明的 researchTopics 取，没有才回落到用户原话。
+ *
+ * 必须是**英文技术词**：语料和社区源（Stack Overflow / HN / 各语言官方论坛）都是英文的，
+ * 中文 query 会命中错答案而且分数还高——knowledge_search 的工具说明里带着这条实测。
+ * 所以只保留 ASCII 技术标识符；一个都没有就返回空串，宁可不预填也不预填一个坏查询：
+ * 模型点头之后拿到一堆无关结果，比让它自己想查什么更糟。
+ */
+function _researchGateQuery(run) {
+  const topics = Array.isArray(run?.engineering?.researchTopics) ? run.engineering.researchTopics : [];
+  const raw = topics.length ? topics.join(" ") : String(run?._originalText || "");
+  const words = String(raw).match(/[A-Za-z][A-Za-z0-9._@/-]{1,39}/g) || [];
+  const seen = new Set();
+  const picked = [];
+  for (const w of words) {
+    const k = w.toLowerCase();
+    if (seen.has(k) || _RESEARCH_QUERY_STOP.has(k)) continue;
+    seen.add(k);
+    picked.push(w);
+    if (picked.length >= 6) break;
+  }
+  return picked.join(" ");
+}
+// 英文里没有信息量的词。留得少而准：这份表只用来把 query 里的噪音摘掉，摘过头会把
+// 真正的技术名词一起摘走——所以 "go" 这类既是停用词又是语言名的一律不收。
+const _RESEARCH_QUERY_STOP = new Set([
+  "the", "a", "an", "and", "or", "but", "for", "with", "without", "to", "of", "in", "on", "at",
+  "is", "are", "be", "been", "do", "does", "did", "can", "should", "would", "will", "please",
+  "help", "me", "my", "i", "you", "we", "it", "this", "that", "these", "those", "make", "made",
+  "use", "using", "used", "add", "adding", "write", "writing", "create", "creating", "build",
+  "building", "implement", "implementing", "need", "want", "like", "new", "some", "any", "all",
+]);
+
+/** 写前取证候选的「点头」入口：模型对那个工具发空参数调用即视为点头，这里代填。 */
+function _researchGateCandidateFill(run, call) {
+  if (!run || !call) return null;
+  const cand = run._researchGateCandidate;
+  if (!cand || String(call.type || "") !== String(cand.name || "")) return null;
+  const args = call.args && typeof call.args === "object" ? call.args : {};
+  for (const v of Object.values(args)) {
+    if (v != null && String(v).trim() !== "") return null;  // 模型自己带了参数就一个字不动
+  }
+  run._researchGateCandidate = null;  // 一次性消费
+  call.args = { ...cand.args };
+  return call.args;
+}
+
 function _depDocsCandidateFill(run, call) {
   if (!run || !call || call.type !== "mcp") return null;
   const cand = run._depDocsCandidate;
@@ -53999,6 +54046,21 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
               .map((name) => run._toolRegistry?.get(name))
               .filter(Boolean);
             if (gateSchemas.length) _applyToolPayloadWindow(toolSchemas, gateSchemas, run._toolCoreNames);
+              // 预填候选（机制，不是劝诫）：这道门原来做对了大半——判据是执行事实（取证台账为空）、
+              // 在第一次真写盘那一刻触发、并且当场把研究工具的 schema 装进本轮窗口。唯一缺的是
+              // **把查询参数替模型算好**那一步。少了它，模型手上多了几个工具、却还要自己想查什么词，
+              // 而它此刻正忙着写文件——最省事的出口就是不查。
+              //
+              // 与 _depDocsCandidate / _verifyCandidate 同款：代码算好参数挂在 run 上，模型对该工具
+              // 发空参数调用即点头。发起方永远是模型，IDE 绝不自己代跑。
+              const _gateQuery = _researchGateQuery(run);
+              if (_gateQuery) {
+                // 缺哪一栏就预填哪一口：官方那栏走注册表（package_search 是官方证据表里最便宜的
+                // 一档），社区那栏走开发者社区检索。两栏都缺时先补官方——版本/API 事实是社区经验的前提。
+                run._researchGateCandidate = _preWriteResearchMissing.includes("official")
+                  ? { name: "package_search", args: { query: _gateQuery } }
+                  : { name: "developer_community_search", args: { query: _gateQuery } };
+              }
             const gateTopics = Array.isArray(run.engineering?.researchTopics) && run.engineering.researchTopics.length
               ? run.engineering.researchTopics.join("；")
               : (run._originalText || "")  /* semanticGoal 无生产者，去掉这条永远 undefined 的腿 */.slice(0, 300);
@@ -64886,6 +64948,10 @@ async function _executeToolStep(step, call, root, run) {
   // 已把 context7 查询参数预填在 run 上；模型对那个工具发空参数调用即点头，这里代填。
   // 同样必须在授权检查之前——确认框里给用户看的得是真实查询参数。IDE 从不自己发起。
   if (typeof _depDocsCandidateFill === "function") _depDocsCandidateFill(run, call);
+    // 写前取证候选的「点头」入口（同上同款）：第一次真写盘时取证台账还是空的，那道门
+    // 已经把研究工具的 schema 装进了本轮窗口，这里补上它唯一缺的那一步——把查询参数
+    // 也替模型算好。同样必须在授权检查之前，确认框里给用户看的得是真实查询。
+    if (typeof _researchGateCandidateFill === "function") _researchGateCandidateFill(run, call);
   // ── 唯一权限检查点 ──────────────────────────────────────────────────────
   // 每个工具调用都必经此处（主循环批量调度、内联渲染、子智能体都走这个函数），
   // 所以授权判定只需要插在这一个地方。放在失败记忆之前：被拒绝是用户的决定，

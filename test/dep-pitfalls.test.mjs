@@ -340,6 +340,27 @@ test("点头入口接在 _executeToolStep 里，且在唯一授权检查点之�
     "代填要发生在授权检查之前，否则用户确认框里看到的是一条空查询");
 });
 
+test("所有点头入口都在授权检查之前，且这份名单是全的", () => {
+  // 这条守两件事。一是**位置**：任何一口落在授权检查之后，用户确认框里看到的就是
+  // 一条空参数调用。二是**清点**：原来只逐个断言已有的那几口，于是第五口可以悄悄
+  // 插在授权检查后面而没人发现。名单从源码现取再对数，漏跟一次当场红。
+  const wrapper = fnSource("_executeToolStep", { code: true });
+  const approveAt = wrapper.indexOf("_approveToolCall(call, run)");
+  assert.ok(approveAt > 0, "唯一授权检查点不见了，这条断言失去落点");
+  const mouths = [...wrapper.matchAll(/_(\w+CandidateFill)\(run, call\)/g)].map((m) => m[1]);
+  const uniq = [...new Set(mouths)];
+  assert.deepEqual(uniq.sort(), [
+    "browserVerifyCandidateFill",
+    "depDocsCandidateFill",
+    "researchGateCandidateFill",
+    "verifyCandidateFill",
+  ], "点头入口的数量变了——加口子要连这条一起改，否则新口子可以落在授权检查后面");
+  for (const name of uniq) {
+    assert.ok(wrapper.indexOf(`_${name}(run, call)`) < approveAt,
+      `${name} 落在授权检查之后了——确认框里给用户看的会是一条空参数调用`);
+  }
+});
+
 // ---- ⑤ 通道与红线：走写工具返回值；IDE 绝不自己发网络请求 ----
 
 test("三条写入路径都接了依赖事实：write/edit 一处、multiedit 一处", () => {
