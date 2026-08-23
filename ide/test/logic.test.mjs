@@ -2412,12 +2412,29 @@ test("the approval gate is real, reachable, and exposed in settings", () => {
   assert.doesNotMatch(SRC, /async function _approveToolCall\(call, run\) \{\s*return true;\s*\}/,
     "the gate must not regress to an unconditional `return true`");
 
-  // Exactly ONE checkpoint: the definition plus a single call from _executeToolStep, which
-  // every tool call in the product funnels through. More call sites means the policy is
-  // being re-decided in several places; fewer means it is dead again.
-  const gateRefs = (SRC.match(/_approveToolCall\(/g) || []).length;
-  assert.equal(gateRefs, 2,
-    `_approveToolCall 应该恰好有 1 处定义 + 1 处调用（找到 ${gateRefs} 处引用）`);
+  /*
+   * 检查点必须是**报得出名字的那几处**，不是随便几处。
+   *
+   * 主检查点在 _executeToolStep 顶上——产品里每一次工具调用都从那里过。多一处就意味着
+   * 策略在好几个地方各判一遍，少一处就意味着它又变回死代码。
+   *
+   * 唯一的例外是 generate_wiki 那次落盘：它发生在**主循环的结果处理里**，压根不经过
+   * 工具执行器（2026-08-23 审计查出来的——Explorer/Plan/Reviewer 下它照样把模型指定的
+   * 路径写进工作区，开着审批也一框不弹）。所以它必须自己调一次。
+   *
+   * 这条断言钉的是「有哪几处」而不是「有几处」：再多一处，就得有人在这里写清楚为什么。
+   */
+  const gateLines = SRC.split("\n")
+    .map((l, i) => [i + 1, l])
+    .filter(([, l]) => /_approveToolCall\(/.test(l));
+  const kinds = gateLines.map(([, l]) => {
+    if (/async function _approveToolCall\(/.test(l)) return "定义";
+    if (/if \(!\(await _approveToolCall\(call, run\)\)\)/.test(l)) return "主检查点";
+    if (/type: "subagent"/.test(l)) return "generate_wiki 落盘";
+    return "未登记：" + l.trim().slice(0, 70);
+  });
+  assert.deepEqual(kinds, ["定义", "generate_wiki 落盘", "主检查点"],
+    `_approveToolCall 的引用处变了：${kinds.join(" / ")}——多一处就得在这里写清楚为什么`);
   const wrapper = extractFn("_executeToolStep");
   assert.match(wrapper, /if \(!\(await _approveToolCall\(call, run\)\)\)[\s\S]{0,900}return denied;/,
     "the single checkpoint lives at the top of _executeToolStep");
