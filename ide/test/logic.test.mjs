@@ -8760,6 +8760,7 @@ const KNOWLEDGE_DOMAIN = load("_aiIntentKnowledgeDomain", { _AI_KNOWLEDGE_DOMAIN
 function aiIntentNormalizeDeps(dims, intentText, intentList) {
   return {
     _AI_INTENT_DIMENSIONS: dims,
+    _AI_ENGINEERING_FIELDS: loadConst("_AI_ENGINEERING_FIELDS"),
     _AI_INTENT_RELATIONS: new Set(["new", "continue", "correct", "replace", "clarify"]),
     _AI_PROJECT_STATES: new Set(["none", "existing", "greenfield", "unknown"]),
     _AI_DELIVERY_SURFACES: new Set(["answer", "code", "ui_component", "website", "web_app", "backend", "data", "cli", "desktop", "automation", "mixed"]),
@@ -28223,16 +28224,18 @@ test("耗时在内容结束时定格，不含结算等待", () => {
 test("模型菜单：free 徽标由网关下发的字段决定，不是客户端猜的", () => {
   const src = stripJsComments(SRC);
 
-  // 目录映射：老网关不下发这个字段时不能塌成 true。
-  assert.match(src, /free: it\.free === true,/,
-    "没有把网关下发的 free 映射进目录——徽标永远不会出现（第一版就漏了这一步）");
-  assert.doesNotMatch(src, /free: [^\n]*input_price|free: [^\n]*inputPrice/,
+  // 目录映射：老网关不下发这两个字段时不能塌成「免费」。
+  assert.match(src, /freeKind: typeof it\.free_kind === "string"/,
+    "没有把网关下发的 free_kind 映射进目录——徽标永远不会出现（第一版就漏了映射这一步）");
+  assert.match(src, /freeCallPoints: Number\(it\.free_call_points\) \|\| 0/,
+    "没有把「一次调用扣多少免费点」映射进来——额度够不够就无从判起");
+  assert.doesNotMatch(src, /free(Kind)?: [^\n]*input_price|free(Kind)?: [^\n]*inputPrice/,
     "客户端自己按价格列猜免费了——单模型覆盖能把三列全 0 的模型定成收费，会标错");
 
   // 菜单项：徽标和对勾是**两列**，不是二选一。
   const menu = stripJsComments(extractFn("buildModelMenu"));
-  assert.match(menu, /m\.free \? `<span class="free-tag">free<\/span>` : ""/,
-    "菜单项没有渲染 free 徽标");
+  assert.match(menu, /_modelIsFreeNow\(m\) \? `<span class="free-tag">free<\/span>` : ""/,
+    "菜单项没有按**当前额度**渲染 free 徽标");
   assert.match(menu, /<span class="check-slot">/,
     "对勾没有独立的列——没选中的行里徽标位置会往右漂，对不齐");
   // 徽标必须排在对勾**之前**（用户明确要求的顺序）。
@@ -28244,6 +28247,35 @@ test("模型菜单：free 徽标由网关下发的字段决定，不是客户端
   // 两组菜单（网关模型 / 自定义模型）都要有对勾列，否则两组之间对不齐。
   assert.equal((menu.match(/check-slot/g) || []).length, 2,
     "自定义模型那组没用同一套结构，两组的对勾对不齐");
+});
+
+test("free 徽标是「模型 × 当前额度」，额度用完就消失、回满又出现", () => {
+  // 免费分两种，塌成一个 bool 就错：
+  //   always —— 三列价格全 0，永远不花钱
+  //   pool   —— 网关声明的 mode:"free"，从每日免费点池扣，**池子空了就开始真扣钱**
+  // 上一版只认「三列价格为 0」，于是生产上四个真·免费模型（免费deepseek / 免费智普，
+  // 靠 model_billing 的 mode:"free" 声明、而价格列全 0 且 billing_mode="rate"）
+  // 一个都没标上，反倒标中了一个不走免费池的零价模型。
+  const withBalance = (free_points) =>
+    load("_modelIsFreeNow", { _michaelUser: free_points === undefined ? null : { free_points } });
+
+  const always = { freeKind: "always", freeCallPoints: 0 };
+  const pool = { freeKind: "pool", freeCallPoints: 0.001 };   // 网关的 1 毫点地板
+  const paid = { freeKind: "none", freeCallPoints: 0 };
+
+  // always 不看余额。
+  assert.equal(withBalance(0)(always), true, "永远免费的模型不该因为免费点用光而摘徽标");
+  // pool 看余额：够付这一次才算免费。
+  assert.equal(withBalance(12.5)(pool), true, "还有免费点，pool 模型应该标 free");
+  assert.equal(withBalance(0)(pool), false, "免费点用完了还标 free —— 点进去就开始扣钱");
+  assert.equal(withBalance(0.0005)(pool), false,
+    "余额不够付**这一次**就不能标 free（和网关准入门同一句判据，不是「还剩不剩一点」）");
+  assert.equal(withBalance(40)(pool), true, "第二天点数回满，徽标要回来");
+  // 收费的永远不标。
+  assert.equal(withBalance(999)(paid), false, "收费模型被标成 free");
+  // 余额未知 ≠ 用完了。
+  assert.equal(withBalance(undefined)(pool), true,
+    "没登录/接口还没回来就把徽标摘了——「不知道」不等于「用完了」");
 });
 
 test("关于弹窗：关闭按钮必须压在内容层之上，否则点不动", () => {
