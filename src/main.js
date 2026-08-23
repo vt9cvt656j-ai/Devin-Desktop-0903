@@ -23069,8 +23069,19 @@ async function _aiIntentProfile(text, config, session = null, context = null) {
       const _merged = (_semObj || _engObj) ? { ...(_semObj || {}), ...(_engObj || {}) } : null;
       const intents = _normalizeAiIntentVerdict(_merged, boundedContext);      // 每模型能力账本：拆问后每一半都是一次独立的大表回执（弱模型判定的事实源）。
       if (typeof _recordModelJsonOutcome === "function") {
-        _recordModelJsonOutcome(intentConfig.model, "big", !String(_outSem || "").trim() ? "empty" : _sem ? "ok" : "fail");
-        _recordModelJsonOutcome(intentConfig.model, "big", !String(_outEng || "").trim() ? "empty" : _eng ? "ok" : "fail");
+        // 判据是「这一半**被 normalize 接住了**」，不是「解析器抠到了东西」。
+        //
+        // 原来判的是 _safeJsonLoose 的真值，而它比 normalize 早一行。两种垃圾形状都会被记成
+        // ok：解析器回了数组（spread 之后必然归零）、抠到的字段落在顶层而工程半读不到（拍平
+        // 那条路）。结果这本账**系统性高估**模型能力——而它恰好是 _isWeakModel 的唯一事实源，
+        // 方向正好是「让产不出大表的模型显得能产」。
+        //
+        // 分桶从两个 "big" 拆成 big_sem / big_eng：同一个桶里记两半，结构上分不出是哪一半失败，
+        // 而这两半的失败原因和修法完全不同（弱模型最常见的形状恰恰是语义半到、工程半空）。
+        const _semOk = intents?._halves?.semantic === true;
+        const _engOk = intents?._halves?.engineering === true;
+        _recordModelJsonOutcome(intentConfig.model, "big_sem", !String(_outSem || "").trim() ? "empty" : _semOk ? "ok" : "fail");
+        _recordModelJsonOutcome(intentConfig.model, "big_eng", !String(_outEng || "").trim() ? "empty" : _engOk ? "ok" : "fail");
       }
       if (!intents) return null;
       // 缓存准入同判：半份裁决不缓存。缓存 15 分钟，缓存一份「语义到了、工程没到」的
@@ -51659,7 +51670,9 @@ function _modelCapSave(caps) { try { localStorage.setItem(_MODEL_CAP_KEY, JSON.s
 function _recordModelJsonOutcome(modelId, table, outcome) {
   const id = String(modelId || "").trim().toLowerCase();
   if (!id) return;
-  const bucket = table === "big" ? "big" : "small";
+  // 桶名白名单。big_sem / big_eng 是拆问之后的两半——同一个桶里记两半，结构上就分不出
+  // 是哪一半失败。旧的 "big" 保留：升级前写进去的记录仍要能读，读侧按新旧一起算。
+  const bucket = ["big", "big_sem", "big_eng", "small"].includes(table) ? table : "small";
   const o = outcome === "ok" ? "ok" : outcome === "empty" ? "empty" : "fail";
   const caps = _modelCapLoad();
   const m = caps[id] && typeof caps[id] === "object" ? caps[id] : {};
@@ -51678,7 +51691,14 @@ function _isWeakModel(modelId) {
   // 执行事实优先：最近 N 次大表 JSON 调用的失败率（fail+empty）≥ 50% ⇒ 弱；< 50% ⇒ 强。
   if (typeof _modelCapLoad === "function") {
     try {
-      const ring = _modelCapLoad()[id]?.big;
+      // 「这个模型产不产得出大表」的判据是**工程半**：它是 16 个枚举 + 4 个数组的那半，
+      // 也是弱模型实测最常出不来的那半；语义半是小的，产得出并不说明它扛得住大表。
+      // 旧记录写在 "big" 桶里，一起算进来——否则升级当天这本账会被清空，而空账会退回
+      // 名称初值，那个初值把 stealth/ox-alpha 判成**强**。
+      const caps = _modelCapLoad()[id] || {};
+      const ring = [...(Array.isArray(caps.big_eng) ? caps.big_eng : []),
+                    ...(Array.isArray(caps.big) ? caps.big : [])]
+        .sort((a, b) => (Number(a?.t) || 0) - (Number(b?.t) || 0));
       if (Array.isArray(ring) && ring.length >= _MODEL_CAP_MIN_SAMPLES) {
         const recent = ring.slice(-_MODEL_CAP_RING);
         const bad = recent.filter((e) => e && e.o !== "ok").length;
@@ -69990,10 +70010,16 @@ function applyPlatformShortcutLabels() {
   // 两个来源，两份都写死 ⌃`。
   setShortcutTitle("terminalBtn", "terminal.toggle", "ctrl+`", "切换终端");
 
-  const composerHint = document.querySelector(".composer__hint");
-  if (composerHint) composerHint.textContent = shortcutLabel("mod+enter");
-  const sendBtn = $("sendBtn");
-  if (sendBtn) sendBtn.title = `发送 (${shortcutLabel("mod+enter")})`;
+  // 输入框右下角原来还挂着一个写着 ⌘↩ 的小标签（.composer__hint），占地方，删了。
+  //
+  // 删之前得先把这条快捷键**搬个地方**，否则它就彻底没处可看了：发送按钮的 title 当时是
+  // 在这儿单独拼的一行，而按钮上挂着 data-i18n-title —— i18n 的属性观察器（attributeFilter
+  // 里有 title）下一帧就按词条把它刷回一个不带组合键的「发送」。也就是说那行 title 一直
+  // 是白写的，可见提示才是唯一的出处；只删提示等于把这条快捷键从界面上抹掉。
+  //
+  // 所以按这个文件里已有的那条规矩来：摘掉标记 + 走 setShortcutTitle，一个写者。
+  // 顺带修掉原来写死的中文「发送」——现在名字从词条取，语言切换跟着走。
+  setShortcutTitle("sendBtn", "assistant.send", "mod+enter", "发送");
 
   const tips = document.querySelectorAll("#welcome .kbd-tip");
   renderKbdCombo(tips[0], "mod+o");

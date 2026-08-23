@@ -58,6 +58,17 @@ test("模型能力账本：大表回执足量后覆盖名称初值，小表回�
   for (let i = 0; i < 50; i++) record("m2", "big", "ok");
   assert.equal(store["m2"].big.length, 20);
 
+  // 新桶名必须真的落进它自己的抽屉。写侧的桶名白名单漏一个，记录会静默掉进 small 桶，
+  // 读侧永远看不到——账本看着在记，判据却一直饿着（源码断言量不到这一层）。
+  for (let i = 0; i < 6; i++) record("m3", "big_eng", "fail");
+  record("m3", "big_sem", "ok");
+  assert.equal(store["m3"].big_eng?.length, 6, "big_eng 没落进自己的抽屉");
+  assert.equal(store["m3"].big_sem?.length, 1, "big_sem 没落进自己的抽屉");
+  assert.equal(isWeak("m3"), true, "工程半连续 fail，却没被判成弱模型");
+  // 反向：语义半再好也不改变结论——产得出小的不代表扛得住大表。
+  for (let i = 0; i < 20; i++) record("m3", "big_sem", "ok");
+  assert.equal(isWeak("m3"), true, "语义半的成绩把工程半的结论盖过去了");
+
   // 畸形输入不抛。
   record("", "big", "ok");
   record(null, "big", "ok");
@@ -70,8 +81,16 @@ test("账本的三个事实源都真的在记：意图裁决、快通道、收�
   assert.match(fast, /_recordModelJsonOutcome\(cfg\.model, "small"/,
     "快通道的回执没进账——账本会一直饿着");
   const intent = fnSource("_aiIntentProfile", { code: true });
-  assert.match(intent, /_recordModelJsonOutcome\(intentConfig\.model, "big"/,
-    "意图裁决（43 字段大表）的回执没进账");
+  // 桶名从一个 "big" 拆成 big_sem / big_eng：同一个桶里记两半，结构上就分不出是哪一半
+  // 失败——而弱模型最常见的形状恰恰是「语义半到、工程半空」，两半的修法完全不同。
+  assert.match(intent, /_recordModelJsonOutcome\(intentConfig\.model, "big_sem"/,
+    "意图裁决语义半的回执没进账");
+  assert.match(intent, /_recordModelJsonOutcome\(intentConfig\.model, "big_eng"/,
+    "意图裁决工程半（16 枚举 + 4 数组，弱模型最常出不来的那半）的回执没进账");
+  // 判据必须是「这一半被 normalize 接住了」，不是「解析器抠到了东西」——后者比 normalize
+  // 早一行，数组和落错层的字段都会被记成 ok，方向正好是高估模型能力。
+  assert.match(intent, /_halves\?\.semantic === true/, "语义半的判据没挪到 normalize 之后");
+  assert.match(intent, /_halves\?\.engineering === true/, "工程半的判据没挪到 normalize 之后");
   const critic = fnSource("_wrapUpCritic", { code: true });
   assert.match(critic, /_recordModelJsonOutcome\(reviewModel, "small"/,
     "评审核心半的回执没进账");
@@ -86,6 +105,11 @@ test("账本的三个事实源都真的在记：意图裁决、快通道、收�
   const weak = fnSource("_isWeakModel", { code: true });
   assert.match(weak, /_MODEL_CAP_MIN_SAMPLES/);
   assert.match(weak, /bad \* 2 >= recent\.length/, "失败率判据没了");
+  // 读侧必须指向**工程半**：那才是「产不产得出大表」的判据。语义半是小的，产得出并不
+  // 说明它扛得住大表。旧的 "big" 桶要一起算，否则升级当天账被清空，而空账退回名称初值
+  // ——那个初值把 stealth/ox-alpha 判成**强**。
+  assert.match(weak, /caps\.big_eng/, "读侧还在读旧桶——新记录进不了判据");
+  assert.match(weak, /caps\.big\b/, "旧记录被丢了：升级当天这本账会清空");
 });
 
 // ===========================================================================
