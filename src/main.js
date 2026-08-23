@@ -54815,12 +54815,7 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
         // 排在最后：更具体的原因（红构建、写入落空）靠 ||= 先占位。只记账不补回合。
         if (run.mode === "agent") {
           const _stubs = _stubDeliveryFindings(run);
-          // **空数组也要写回去。** 这两处原来都是 `if (…length) run._stubFindings = …`，
-          // 而全仓没有任何一处清零：模型第 3 轮写了 3 处占位 → 被告知 → 第 4 轮全改成真
-          // 实现 → 第 5 轮、第 6 轮…… _deliveryFactsLine **仍然**每轮注入「这一轮新写进去
-          // 3 处占位（a.ts:12 …）——这些地方现在是空的」。一条已经不成立的执行事实被反复
-          // 推给模型：它要么去修不存在的东西，要么学会不信这整块事实。
-          // 这本账的全部价值就是「跟着落盘内容走」，那它就必须**双向**跟。
+          // 空数组也写回去（理由见写时那处）：修好了就得从事实里消失。
           run._stubFindings = _stubs;
           if (_stubs.length) {
             run._incompleteReason = run._incompleteReason || `stub_delivery:${_stubs.length}`;
@@ -56517,7 +56512,14 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
         // ① 这次交付新写进去的占位/假数据（基线相减，只报有原文佐证的字面命中）。
         try {
           const _wfStubs = _stubDeliveryFindings(run);
-          // 同上：空数组也写回去——修好了就得从事实里消失。
+          // **空数组也要写回去。** 这两处原来都是 `if (…length) run._stubFindings = …`，
+          // 而全仓没有任何一处清零。后果：模型第 3 轮写了 3 处占位 → 被告知 → 第 4 轮全改成
+          // 真实现 → 第 5 轮、第 6 轮…… _deliveryFactsLine **仍然**每轮注入「这一轮新写进去
+          // 3 处占位（a.ts:12 …）——这些地方现在是空的」。一条已经不成立的执行事实被反复推给
+          // 模型：它要么去修不存在的东西，要么学会不信这整块事实——而那块事实里还有「有 N 次
+          // 写入没有落盘，不要说它们已保存」。这本账的全部价值就是跟着落盘内容走，那它必须
+          // **双向**跟。收尾那处同改，注释短一句是因为它落在 logic.test.mjs 那条固定窗口
+          // 断言的窗口里（本仓库记着这个坑：窗口一挤，守的就不是原来那段了）。
           run._stubFindings = _wfStubs;
           for (const s of _wfStubs) {
             const k = `stub:${s.path}:${s.line}`;
