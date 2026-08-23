@@ -16205,6 +16205,38 @@ function _streamDraftMapWrite(map) {
     else localStorage.setItem(_STREAM_DRAFT_KEY, JSON.stringify(map));
   } catch { /* 配额满等场景只是少个保险，不影响正常链路 */ }
 }
+// 把这一轮**已经做过的工具动作**渲染成 markdown，附进流式草稿。
+//
+// 为什么非要它：agent 运行途中**一条消息都不进 session.memory**（整轮的叙述攒在
+// `summaryText` 这个局部变量里，收尾才 push 一次，见 _runAgenticLoop 末尾）。所以运行
+// 中崩溃时，SQLite 里这一轮什么都没有，唯一的保险是这份草稿——而草稿此前**只存纯文本**。
+// 工具卡片（读文件 / 写文件 / 跑命令 / 子智能体）全部只活在 DOM 里，重启后一张都不剩。
+// 一个做了几十次工具调用的 run，恢复出来塌成几句叙述——用户原话「显示一点点糊弄人的」。
+//
+// 用 `run.recording` 而不是克隆 DOM：它本来就在攒（每次工具调用一条
+// `{type,label,ok,fail}`），是纯数据、零 DOM 代价。流式期间做 DOM 克隆正是这个文件里
+// 记录过的性能事故来源（0.9s→5s→24s→59s），不能为了这件事再走一遍。
+//
+// 上限 400 条：一轮真做到这个量级时，末尾那些才是用户关心的，所以超了取**最近**的，
+// 并如实标注省略了多少——不写省略数就是另一种「糊弄」。
+const _DRAFT_STEPS_MAX = 400;
+function _draftStepsMarkdown(session) {
+  const rec = Array.isArray(session?._activeRun?.recording) ? session._activeRun.recording : null;
+  if (!rec || !rec.length) return "";
+  const shown = rec.length > _DRAFT_STEPS_MAX ? rec.slice(-_DRAFT_STEPS_MAX) : rec;
+  const omitted = rec.length - shown.length;
+  const lines = shown.map((step) => {
+    const mark = step?.ok === false ? "✗" : "✓";
+    const label = String(step?.label || step?.type || "").slice(0, 160);
+    const why = step?.ok === false && step?.fail ? ` — ${String(step.fail).slice(0, 120)}` : "";
+    return `- ${mark} ${label}${why}`;
+  });
+  const head = omitted > 0
+    ? `**这一轮执行过的步骤**（共 ${rec.length} 步，下面是最近 ${shown.length} 步）`
+    : `**这一轮执行过的步骤**（${rec.length} 步）`;
+  return `${head}\n${lines.join("\n")}`;
+}
+
 function _streamDraftSave(session, text, reasoning) {
   // NOTE the ordering here — it is the whole point. `text` is the rope built by `acc += delta`,
   // so `.trim()` cannot run on it lazily: it forces a full String::Flatten, an O(n) memcpy of
@@ -16231,6 +16263,9 @@ function _streamDraftSave(session, text, reasoning) {
     sessionId: session.id,
     text: String(text || "").slice(0, 400_000),
     reasoning: String(reasoning || "").slice(0, 20_000),
+    // 这一轮做过的工具动作。渲染放在节流**之下**，和上面那个 flatten 同理：
+    // 每 token 跑一次会把 recording 整个遍历一遍，长 run 上又是一条 O(n²)。
+    steps: _draftStepsMarkdown(session).slice(0, 60_000),
     updatedAt: now,
   };
   const _map = _streamDraftMapRead();
@@ -16264,6 +16299,8 @@ function _streamDraftFlushSync() {
         sessionId: sess.id,
         text: String(sess._streamDraftLatest.text || "").slice(0, 400_000),
         reasoning: String(sess._streamDraftLatest.reasoning || "").slice(0, 20_000),
+        // 退出这条路上也要带：这里恰恰是**最全**的一次（绕过节流、拿的是最新的 recording）。
+        steps: _draftStepsMarkdown(sess).slice(0, 60_000),
         updatedAt: now,
       };
       map[sess.id] = draft;
@@ -18180,9 +18217,14 @@ async function restoreChatHistory() {
           const _tail = _draftSession?.memory?.recent?.slice(-6) || [];
           const _already = !_probe || _tail.some((m) => typeof m?.content === "string" && m.content.includes(_probe));
           if (_draftSession && !_already) {
+            // 步骤清单排在叙述**前面**：被打断的那一轮里，「它到底做了什么」比「它说到哪」
+            // 更要紧——用户看着满屏工具卡片消失、只剩两句话，正是这条修的现象。
+            const _steps = String(_draft.steps || "").trim();
             _draftSession.memory.push({
               role: "assistant",
-              content: `⚠️（此回复在生成途中因软件重启被打断，以下为已生成的部分）\n\n${_draft.text}`,
+              content: `⚠️（此回复在生成途中因软件重启被打断，以下为已生成的部分）\n\n`
+                + (_steps ? `${_steps}\n\n` : "")
+                + _draft.text,
             });
             _draftSession._htmlSnapshot = ""; // 快照里没有这条；强制从持久历史重建可见窗口
             _restored++;
@@ -20954,7 +20996,7 @@ async function _loadPermissionRules(root) {
 // `_userCaps` 是**同步可读**的快照，因为 `_buildAgentToolSchemas` 是同步的，而且在模块
 // 求值时就会被调用一次（`_KNOWN_TOOLS`）。那一次读到的是空快照，正好——`_KNOWN_TOOLS`
 // 要的就是静态全集，不该被用户的停用清单削掉。
-let _userCaps = { tools: [], commands: [], disabled: [], errors: [] };
+let _userCaps = { tools: [], commands: [], roles: [], disabled: [], stack: {}, officialDocsHosts: [], errors: [] };
 let _userCapsCache = { root: null, ts: 0 };
 
 /** 当前生效的用户声明（同步）。 */
@@ -20977,17 +21019,29 @@ async function _refreshUserCapabilities(root) {
   // 所以：加能力（tools / knowledge / roles / commands）只认用户自己的作用域；仓库里的
   // 声明只保留 disabled（关掉某个内置工具）——那是收紧，任何来源都该允许。
   // 仓库想共享一套工具，把它抄进 ~/.mrdayone/settings.json 即可，那是一次明确的采纳动作。
+  //
+  // `stack`（checkCmd/testCmd/testDir）和 `officialDocsHosts` 走**同一条线**，理由和上面
+  // 一模一样，不是保守：
+  //   · stack.testCmd 会原样进模型上下文（栈提示里那句「改完必须你自己跑这条」），并被
+  //     _isRecognizedVerifierCommand 认成项目自己声明的验证命令。仓库能写这一格，就等于
+  //     clone 一个仓库＝把一行任意 shell 递到模型面前，还带着「这是本项目的验证命令」的背书。
+  //     注意今天从 package.json 推出来的是 `npm test` 这种**固定字面量**，仓库内容从来没有
+  //     逐字变成过命令行——所以这不是"边界本来就开着"，是一道还没被开的门。
+  //   · officialDocsHosts 决定「这份网页算不算官方证据」。仓库自证官方，等于让被 clone 的
+  //     那个人替模型降低对某个站的怀疑度。
+  // 两者都只认用户自己的作用域；报错文案照旧告诉用户抄到哪里去。
   const absorb = (raw, source, { trusted }) => {
     let parsed = null;
     try { parsed = JSON.parse(raw || "{}"); } catch { return; }
     const one = normalizeCapabilities(parsed, source);
     if (trusted) { scopes.push(one); return; }
-    const dropped = one.tools.length + one.roles.length + one.commands.length;
+    const dropped = one.tools.length + one.roles.length + one.commands.length
+      + Object.keys(one.stack || {}).length + (one.officialDocsHosts || []).length;
     scopes.push({
-      tools: [], roles: [], commands: [],
+      tools: [], roles: [], commands: [], stack: {}, officialDocsHosts: [],
       disabled: one.disabled,
       errors: dropped
-        ? [...one.errors, `${source}：来自仓库的声明里有 ${dropped} 项能力（工具/知识库/角色/命令）**没有启用**——`
+        ? [...one.errors, `${source}：来自仓库的声明里有 ${dropped} 项能力（工具/知识库/角色/命令/项目栈覆盖/官方文档域名）**没有启用**——`
           + `跟着 git clone 下来的文件不能给自己加能力，否则打开一个别人的仓库就等于让它往外发数据。`
           + `确实要用的话，把那几段抄进你自己的 ~/.mrdayone/settings.json。（这里的 disabled 照常生效，关能力任何来源都允许。）`]
         : one.errors,
@@ -22713,8 +22767,21 @@ function _mergeAiIntentProfile(base, intents, text, priorState = null) {
   m.databaseDecisionRequired = !!(m.databaseDecisionRequired || unresolvedData || dataStrategy === "inspect_existing");
   m.databaseArchitecture = !!(m.dataModel || m.databaseOps || dataStrategy === "server" || unresolvedData);
 
-  m.needsOfficialResearch = researchMode === "official" || researchMode === "official_and_community";
-  m.needsCommunityResearch = researchMode === "community" || researchMode === "official_and_community";
+  // 或合并，不是直接赋值 —— 上下相邻的每一行都是 `x = !!(x || …)`，只有这两行曾是覆盖。
+  //
+  // 覆盖的后果只在快通道那条腿上暴露：`_applyFastRouteBehaviorIfLanded` 造的那份
+  // pseudo.engineering **没有 researchMode 字段**（它只搬 projectState/workspaceAction/
+  // designMode/orchestrationMode/changeScope/roleNeeds 六个），于是这里默认 "none"。
+  // 而 needsOfficialResearch / needsCommunityResearch 两个都在 _AI_INTENT_DIMENSIONS 里、
+  // 也都在 _FAST_ROUTING_KEYS 里——快通道模型明确声明「这件事要查官方/社区」时，那条声明
+  // 上面几十行刚被逐维搬进 m，紧接着就被这两行刷成 false。
+  //
+  // 完整裁决实测 19.8 秒才落地（那份 43 字段大 JSON，弱模型上更久甚至出不来），这段窗口里
+  // 发生的写入于是全部豁免取证——而快通道恰恰是弱模型上唯一一条已知跑得通的腿。
+  // 合并方向是安全的：它只会让「要不要取证」这道**加仪式**的门更容易成立，够不到任何
+  // 夺能力的门（那些一律精确比较 intentSource === "ai"，见 _applyFastRouteBehaviorIfLanded）。
+  m.needsOfficialResearch = !!(m.needsOfficialResearch || researchMode === "official" || researchMode === "official_and_community");
+  m.needsCommunityResearch = !!(m.needsCommunityResearch || researchMode === "community" || researchMode === "official_and_community");
   m.needsReferences = !!(m.needsReferences || m.needsOfficialResearch || m.needsCommunityResearch);
   m.authoritativeReferencesRequired = !!(m.authoritativeReferencesRequired || m.needsOfficialResearch);
   m.researchTopics = Array.isArray(engineering?.researchTopics) ? [...engineering.researchTopics] : [];
@@ -22901,7 +22968,11 @@ solo 时给空数组。这一项决定第一轮就能不能派对角色，别为
     if (profile.orchestrationMode && profile.orchestrationMode !== "solo" && Array.isArray(raw.roleNeeds)) {
       const roles = raw.roleNeeds
         .map((role) => String(role || "").trim().toLowerCase())
-        .filter((role) => _AI_AGENT_ROLES.has(role));
+        // 判据必须和完整裁决那侧**逐字一致**（见 `_AI_AGENT_ROLES.has(item) || _userRoleMap().has(item)`）：
+        // 这一层挡的是模型凭空编出来的角色名，不是"非内置的都挡掉"。快通道原来漏了用户
+        // 声明的那一半，于是同一个 `data` 角色在快通道被丢、在完整裁决里保留——第一轮
+        // （快通道唯一起作用的那一轮）恰恰是决定派谁的那一轮，用户的角色永远赶不上。
+        .filter((role) => _AI_AGENT_ROLES.has(role) || _userRoleMap().has(role));
       if (roles.length) profile.roleNeeds = [...new Set(roles)].slice(0, 5);
     }
     // 一个旗标都没点亮、枚举也全是默认值时返回 null：让调用方走原路，别把空画像当成"判过了"。
@@ -25027,6 +25098,11 @@ async function _gatherAgentContext(query, sessionRoot, boundaryRoot = "") {
     stack.testDir = _testDir.dir;
     stack.testSubs = _testDir.subs;
   }
+  // 已声明依赖清单：和 testDir 同理必须落在 _projectStacks.set **之前**（set 存的是浅拷贝）。
+  // 读者是依赖坑前置的 import 触发点——「这个包在不在项目依赖里」只能靠真读过的 manifest 回答，
+  // 答不上来就一个字都不说。放在这里而不是塞进 _extractStackHints：那个函数是"栈提示"的
+  // 纯格式化器，依赖名单和它要回答的问题（怎么跑测试）没关系。
+  stack.declaredDeps = _declaredDepsFromFileMap(fileMap);
   if (stack.lang) _projectStacks.set(root, { ...stack, root }); else _projectStacks.delete(root);
   const stackHint = _formatStackHint(stack);
   if (stackHint) {
@@ -34562,9 +34638,11 @@ function _buildAgentToolSchemas(includeWrite, mcpTools = []) {
   "codrops_search",
   "smashingmag_search",
   "awwwards_search"]);
-    return _applyCloudToolDescs(_withoutDisabledTools(tools.filter((t) => !desktopOnly.has(t.function.name))));
+    return _applyUserRoleEnums(_applyCloudToolDescs(_withoutDisabledTools(tools.filter((t) => !desktopOnly.has(t.function.name)))));
   }
-  return _applyCloudToolDescs(_withoutDisabledTools(tools));
+  // 角色枚举**必须**包在 _applyCloudToolDescs 外面：那一步整块替换 function.parameters，
+  // 包在里面的话云端 tools.json 会把枚举原样盖回内置 11 个（见 _applyUserRoleEnums 注释）。
+  return _applyUserRoleEnums(_applyCloudToolDescs(_withoutDisabledTools(tools)));
 }
 
 /**
@@ -34582,6 +34660,72 @@ function _withoutDisabledTools(tools) {
   if (!off.length) return tools;
   const drop = new Set(off);
   return tools.filter((t) => !drop.has(t?.function?.name));
+}
+
+/**
+ * 把用户自己声明的角色**补进派活工具的 `role` 枚举**。
+ *
+ * 配置那一侧早就通了：`_userRoleMap()` 有这个角色，`_roleCapabilities` 优先取它的工具矩阵，
+ * `_agentRoleBlock` 发它的提示词，分类器的枚举后缀也带上了它。唯独 run_subagent /
+ * spawn_multiple_agents / run_worker 三个 schema 里的 `role` 枚举写死着内置那 11 个——
+ * 而 schema 的枚举是**硬约束**：模型要么根本选不出这个角色，要么选了被结构化输出挡掉。
+ * 声明了等于没声明，而且失败得毫无声响。
+ *
+ * ## 为什么必须在 `_applyCloudToolDescs` **之后**
+ *
+ * 网关那份 `server/prompts/tools.json` 里这四处枚举和本文件里逐字相同，而
+ * `_applyCloudToolDescs` 是**整块换掉 `function.parameters`**（不是只换 description）。
+ * 所以在它之前改枚举，登录状态下会被云端那份原样盖回去——白改，而且只在联网时才错。
+ * 两个 return 分支都必须包在最外层。
+ *
+ * ## 为什么是「按结构找」而不是写死四条路径
+ *
+ * 路径写死就是第五份手抄：以后谁再加一个带 role 的工具，这里不会跟着长。这里走整棵
+ * schema，凡是属性名为 `role`、且带字符串 enum 的节点都补——枚举在哪一层都逃不掉。
+ *
+ * 只在真的声明了角色时才动 schema：没声明的用户（绝大多数）拿到的字节和以前完全一样，
+ * prompt cache 一点不受影响。
+ */
+function _applyUserRoleEnums(tools) {
+  // 名字取自 `_userCapabilities().roles`，**不能**走 `_userRoleMap()`：那个函数为了校验
+  // 工具名会回头调 `_buildAgentToolSchemas(true, [])`，而这里正在它的返回路径上——调过去
+  // 就是无限递归。两边的名字集合逐字相同（_userRoleMap 的 key 就是这些 name，
+  // normalizeRole 已统一小写），所以「两侧判据一致」这条没有被这次取值方式破坏。
+  let names = [];
+  try { names = (_userCapabilities().roles || []).map((r) => String(r?.name || "")).filter(Boolean); } catch { return tools; }
+  if (!names.length || !Array.isArray(tools)) return tools;
+  // 找到就地改**不行**：`_applyCloudToolDescs` 把 `function.parameters` 直接指向了
+  // `_remoteTools` 里那个对象，它跨调用长期存活。就地改会把角色名永久焊进云端缓存
+  // ——用户删掉一个角色之后它还在，换个工作区也还在。所以先扫、命中了再整块深拷贝。
+  const walk = (node, depth, mutate) => {
+    if (!node || typeof node !== "object" || depth > 12) return false;
+    if (Array.isArray(node)) {
+      let hit = false;
+      for (const child of node) if (walk(child, depth + 1, mutate)) hit = true;
+      return hit;
+    }
+    let hit = false;
+    const role = node.properties && typeof node.properties === "object" ? node.properties.role : null;
+    if (role && typeof role === "object" && Array.isArray(role.enum)) {
+      if (names.some((n) => !role.enum.includes(n))) hit = true;
+      if (mutate) role.enum = [...new Set([...role.enum, ...names])];
+    }
+    for (const key of Object.keys(node)) {
+      if (key === "enum") continue;
+      if (walk(node[key], depth + 1, mutate)) hit = true;
+    }
+    return hit;
+  };
+  for (const t of tools) {
+    const params = t?.function?.parameters;
+    if (!walk(params, 0, false)) continue;
+    let copy = null;
+    try { copy = JSON.parse(JSON.stringify(params)); } catch { copy = null; }
+    if (!copy) continue; // 拷不动就原样留着：宁可少一个角色，也不能把云端缓存改脏
+    walk(copy, 0, true);
+    t.function.parameters = copy;
+  }
+  return tools;
 }
 
 // ============================================================================
@@ -34756,6 +34900,19 @@ agent: ["read_file", "list_dir", "search", "find_files", "update_plan", "ask_use
             // 对照 web_search→web_fetch：那一对本来就是配齐的，这一对漏了后手。
             "web_search", "web_fetch", "github_search", "github_repo",
             "developer_community_search", "package_search",
+            // package_source 与上面这一族同源，判据逐字相同，而证据更硬：它**零网络零成本**——
+            // 读的是本机 node_modules / site-packages 里真正装着的那一份源码，拿到的是这个项目
+            // 实际锁住的那个版本的真实导出与签名。可它此前不在窗口里，于是「写第三方调用之前
+            // 先核对真实 API」这件事要先花一轮 search_tools 取 schema——就是上面那条机制：
+            // 两条路结果差不多时模型走便宜的那条，**弱模型最不肯付这个绕路成本**。
+            //
+            // 后果不是"晚一轮加载"，是模型改为凭训练记忆写签名，而记忆里的签名很可能属于
+            // 另一个大版本（package_source 自己的描述就写着这句）。而且 package_search 在
+            // 窗口里、package_source 不在，正是 github_search 曾经缺 github_repo 后手的同一种
+            // 缺口：注册表搜索回答"存不存在/什么版本"，一个签名都不给；真正能拿来照着写的
+            // 是这一个。_OFFICIAL_RESEARCH_EVIDENCE_TOOLS 把它列为最硬的一种官方证据，
+            // 却让它够不着，等于把最硬、最便宜的那条取证路堵在窗口外面。
+            "package_source",
             // knowledge_search 是这一族里**唯一**曾被漏在窗口外的：查外部的六个全在窗口里，
             // 查自家语料的那一个不在。后果不是"晚一轮加载"，是这条路结构性地永远不会被选中——
             // 上面那整段论证逐字适用：两条路结果差不多时模型走零成本的那条，而不在窗口里的
@@ -36834,6 +36991,18 @@ const _OFFICIAL_RESEARCH_EVIDENCE_TOOLS = new Set([
   "mdn_search", ]);
 const _COMMUNITY_RESEARCH_EVIDENCE_TOOLS = new Set([
   "developer_community_search", "stackoverflow_search", "hackernews_search", ]);
+// 通用兜底名单——**不再是唯一判据**。
+//
+// 它判错的不是边缘情况：tauri.app（本产品自己的框架）、tailwindcss.com、postgresql.org、
+// redis.io、vercel.com、supabase.com、stripe.com、djangoproject.com 一个都不在里面。
+// 后果是模型读到了**真正的官方文档**，`_researchEvidenceCategory` 判成不是 official →
+// 取证提醒照发让它回头再查、收尾契约继续列为未完成：白烧一轮，再给用户一行不实的「未验证」。
+//
+// 往这张表里再塞几个域名只是把表加长——生态每年都在长新域名，手写名单永远追不上。真正的
+// 判据换成了**执行事实**：本次会话里 package_search / package_source 取回的注册表记录里，
+// 那个包**自己声明**的 homepage / repository / documentation 主机（见
+// `_declaredDocsHostsFromResult`），加上用户在自己的配置里填的内部/企业文档站
+// （`officialDocsHosts`）。这张表留着，因为这 33 个确实是官方站，而且离线时它是唯一还在的那份。
 const _OFFICIAL_RESEARCH_HOSTS = new Set([
   "github.com", "raw.githubusercontent.com", "docs.github.com",
   "gitlab.com", "docs.gitlab.com", "gitee.com", "codeberg.org",
@@ -36845,14 +37014,70 @@ const _OFFICIAL_RESEARCH_HOSTS = new Set([
   "cloud.google.com", "docs.aws.amazon.com", "kubernetes.io", "docs.docker.com",
 ]);
 
-function _isOfficialResearchUrl(value) {
+function _isOfficialResearchUrl(value, extraHosts = null) {
   try {
     const host = new URL(String(value || "")).hostname.toLowerCase().replace(/^www\./, "");
     for (const official of _OFFICIAL_RESEARCH_HOSTS) {
       if (host === official || host.endsWith(`.${official}`)) return true;
     }
+    // 本次会话解析出来的「这个包自己声明的主页/仓库」+ 用户配置里的内部文档站。
+    // 同样按后缀匹配：包声明的是 `tauri.app`，模型读的常常是 `v2.tauri.app/start/`。
+    for (const official of (extraHosts || [])) {
+      if (!official) continue;
+      if (host === official || host.endsWith(`.${official}`)) return true;
+    }
   } catch {}
   return false;
+}
+
+/**
+ * 从一次包注册表查询的**返回正文**里，抠出这个包自己声明的主页 / 仓库 / 文档主机。
+ *
+ * 这是判定「官方」的执行事实来源：不是我们认为哪些站官方，而是**包自己在注册表记录里
+ * 写的那几个 URL**。npm 的 homepage/repository、PyPI 的 project_urls、crates.io 的
+ * homepage/documentation/repository、Homebrew 的 Homepage 都是这一类。
+ *
+ * 只认 `package_search` / `package_source` 两个工具的结果。放宽到 web_fetch 就等于让任何
+ * 一个被抓下来的页面自证官方——那是把判据交给被判定的对象。
+ *
+ * 抠法是「键名紧跟 URL」，不是"正文里所有 URL"：README 正文里随手一个链接不该获得官方身份。
+ */
+const _DECLARED_DOCS_KEY_RE = new RegExp(
+  "(?:^|[\\s,{\"'])(homepage|home_page|repository|repo|documentation|docs|project_url|project_urls)"
+  + "\"?\\s*[:=]\\s*[\"'{\\s]*(?:git\\+)?(https?://[^\\s\"'<>,)\\]}]+)", "gi");
+function _declaredDocsHostsFromResult(toolName, result) {
+  const name = String(toolName || "").trim().toLowerCase();
+  if (name !== "package_search" && name !== "package_source") return [];
+  const content = String(result?.content || "");
+  if (!content) return [];
+  const out = [];
+  const re = new RegExp(_DECLARED_DOCS_KEY_RE.source, "gi");
+  let m;
+  while ((m = re.exec(content)) && out.length < 12) {
+    let host = "";
+    try { host = new URL(m[2]).hostname.toLowerCase().replace(/^www\./, ""); } catch { continue; }
+    // 注册表站本身已经在兜底表里，重复登记只是噪音。
+    if (host && !out.includes(host)) out.push(host);
+  }
+  return out;
+}
+
+/** 本 run 当前生效的「额外官方主机」：用户声明 ∪ 本会话从注册表记录里解析出来的。 */
+function _officialDocsHosts(run) {
+  const set = new Set();
+  try { for (const h of _userCapabilities().officialDocsHosts || []) if (h) set.add(h); } catch {}
+  const harvested = run && run._declaredDocsHosts;
+  if (harvested instanceof Set) for (const h of harvested) set.add(h);
+  return set;
+}
+
+/** 把一次工具结果里解析出的包声明主机记进 run（上限 64，防一次巨大结果把表撑爆）。 */
+function _recordDeclaredDocsHosts(run, toolName, result) {
+  if (!run) return;
+  const hosts = _declaredDocsHostsFromResult(toolName, result);
+  if (!hosts.length) return;
+  const set = run._declaredDocsHosts instanceof Set ? run._declaredDocsHosts : (run._declaredDocsHosts = new Set());
+  for (const h of hosts) { if (set.size >= 64) break; set.add(h); }
 }
 
 function _researchResultHasEvidence(toolName, result) {
@@ -36874,14 +37099,16 @@ function _researchResultHasEvidence(toolName, result) {
   return content.length >= 40;
 }
 
-function _researchEvidenceCategory(toolName, call, result) {
+function _researchEvidenceCategory(toolName, call, result, extraHosts = null) {
   const name = String(toolName || "").trim().toLowerCase();
   if (!_researchResultHasEvidence(name, result)) return "";
   if (_OFFICIAL_RESEARCH_EVIDENCE_TOOLS.has(name)) return "official";
   if (_COMMUNITY_RESEARCH_EVIDENCE_TOOLS.has(name)) return "community";
   // Search result titles are discovery only. A direct fetch of a known official or
   // maintainer-owned host is the only generic web operation that counts as evidence.
-  if (name === "web_fetch" && _isOfficialResearchUrl(call?.url || call?.path)) return "official";
+  // `extraHosts` 是本会话的执行事实（包自己声明的主页/仓库）+ 用户配置的内部文档站；
+  // 「必须真的读到正文」这条不变式没有变——它由上面的 _researchResultHasEvidence 把着。
+  if (name === "web_fetch" && _isOfficialResearchUrl(call?.url || call?.path, extraHosts)) return "official";
   return "";
 }
 
@@ -42053,7 +42280,20 @@ function _duplicateSymbolNote(run, fp, oldText, newText) {
   } catch { return ""; }
 }
 
-// ── 依赖坑前置：manifest 落盘那一刻点名「这个依赖这个版本还没核对过资料」 ────────
+// ── 依赖坑前置：新依赖第一次出现在磁盘上那一刻，点名「它还没核对过真实 API」 ────────
+//
+// 触发点有两个，都是执行事实，都走同一条预填候选形状（下面 _depPitfallNote 是唯一出口）：
+//
+//   ① 写 manifest —— 见下面这一大段。这是原本唯一的触发点。
+//   ② 写源码里的 import —— 因为常态恰恰是**先写 import 再补依赖**：模型直接
+//      `import { z } from "zod"` 开写，package.json 是后面某一轮才补的（或者压根忘了补，
+//      于是跑起来才炸）。只盯 manifest 的话，"写用法代码之前"这个唯一有用的时机每次都
+//      正好被错过——而 ① 那段注释里"写 manifest 那一刻，正是写用法代码之前唯一确定存在
+//      的时机"这句话，前提就只在"先声明后使用"的顺序下成立。
+//      判据同样是新增行（checkpoint 基线相减，同一套手法）：新增行里出现 import/require/
+//      use 语句，引入的是**第三方包名**（不是相对路径、不是内置模块），且这个包不在项目
+//      已声明的依赖清单里。判不准就不说（宁可漏报，不许误报）——所以该生态的依赖清单
+//      本身必须是已知的（_projectDeclaredDepIndex 返回 null 语义时一个字都不说）。
 //
 // 触发是执行事实，不是猜测：写工具这次真的往 manifest（package.json / Cargo.toml /
 // requirements*.txt / pyproject.toml / go.mod）落了盘，且 checkpoint 基线相减的**新增行**
@@ -42230,6 +42470,208 @@ function _manifestDepAdditions(path, oldText, newText, maxItems = 6) {
   return out;
 }
 
+// ── 触发点 ②：源码新增行里的 import 引进了一个项目还没声明的第三方包 ──────────────
+//
+// 内置模块名单与相对路径判断覆盖 JS/TS、Python、Rust、Go 四种源码形态（第五种形态是
+// manifest 本身，走上面那条）。判不准就不说是硬纪律：这条提示的价值全在"你正要照记忆
+// 写一个没核对过的 API"，误报一次的代价是每次写业务代码都被念一遍，那比漏报糟得多。
+const _NODE_BUILTIN_MODULES = new Set([
+  "assert", "async_hooks", "buffer", "child_process", "cluster", "console", "constants", "crypto",
+  "dgram", "diagnostics_channel", "dns", "domain", "events", "fs", "http", "http2", "https",
+  "inspector", "module", "net", "os", "path", "perf_hooks", "process", "punycode", "querystring",
+  "readline", "repl", "stream", "string_decoder", "sys", "timers", "tls", "trace_events", "tty",
+  "url", "util", "v8", "vm", "wasi", "worker_threads", "zlib",
+]);
+// Python 标准库的顶层模块。只需要覆盖到"常见到会出现在 import 行里"的程度：没收进来的
+// 冷门标准库模块会被当成第三方误报一次——所以宁可多列。
+const _PY_STDLIB_MODULES = new Set([
+  "__future__", "abc", "argparse", "array", "ast", "asyncio", "base64", "binascii", "bisect",
+  "builtins", "bz2", "calendar", "cmath", "cmd", "collections", "colorsys", "concurrent",
+  "configparser", "contextlib", "contextvars", "copy", "copyreg", "csv", "ctypes", "curses",
+  "dataclasses", "datetime", "decimal", "difflib", "dis", "email", "encodings", "enum", "errno",
+  "faulthandler", "filecmp", "fileinput", "fnmatch", "fractions", "ftplib", "functools", "gc",
+  "getopt", "getpass", "gettext", "glob", "graphlib", "gzip", "hashlib", "heapq", "hmac", "html",
+  "http", "imaplib", "importlib", "inspect", "io", "ipaddress", "itertools", "json", "keyword",
+  "linecache", "locale", "logging", "lzma", "mailbox", "math", "mimetypes", "mmap", "multiprocessing",
+  "netrc", "numbers", "operator", "os", "pathlib", "pickle", "pickletools", "pkgutil", "platform",
+  "plistlib", "poplib", "posixpath", "pprint", "profile", "pstats", "pty", "pwd", "py_compile",
+  "queue", "quopri", "random", "re", "readline", "reprlib", "resource", "runpy", "sched", "secrets",
+  "select", "selectors", "shelve", "shlex", "shutil", "signal", "site", "smtplib", "socket",
+  "socketserver", "sqlite3", "ssl", "stat", "statistics", "string", "stringprep", "struct",
+  "subprocess", "symtable", "sys", "sysconfig", "tarfile", "tempfile", "termios", "textwrap",
+  "threading", "time", "timeit", "tkinter", "token", "tokenize", "tomllib", "trace", "traceback",
+  "tracemalloc", "tty", "types", "typing", "unicodedata", "unittest", "urllib", "uuid", "venv",
+  "warnings", "wave", "weakref", "webbrowser", "xml", "xmlrpc", "zipapp", "zipfile", "zipimport",
+  "zlib", "zoneinfo",
+]);
+// Rust：`use` 路径的首段只能是 extern crate 名、crate/self/super，或这几个内置 crate。
+const _RUST_BUILTIN_CRATES = new Set(["std", "core", "alloc", "crate", "self", "super", "proc_macro", "test"]);
+
+// 源码文件 → 生态。按扩展名判，认不出就返回空（调用方一个字都不说）。
+function _sourceImportKind(path) {
+  const base = String(path || "").split(/[\\/]/).pop() || "";
+  if (/\.(?:[mc]?[jt]sx?)$/i.test(base)) return "npm";
+  if (/\.pyi?$/i.test(base)) return "pypi";
+  if (/\.rs$/i.test(base)) return "crates";
+  if (/\.go$/i.test(base)) return "go";
+  return "";
+}
+
+// import 说明符 → npm 包名。相对路径、协议前缀、路径别名（@/、~/、#internal）、内置模块
+// 一律返回空。`@/components/Button` 这类别名会被包名正则挡掉：npm 的 scope 不能为空。
+function _npmPackageFromSpecifier(spec) {
+  const s = String(spec || "").trim();
+  if (!s || /^[./#~]/.test(s) || s.includes("://") || /^[A-Za-z]:[\\/]/.test(s)) return "";
+  if (/^[a-z][a-z0-9+.-]*:/i.test(s)) return ""; // node: / bun: / data: / file: …
+  const parts = s.split("/");
+  const name = s.startsWith("@") ? parts.slice(0, 2).join("/") : parts[0];
+  if (!/^(?:@[a-z0-9][\w.-]*\/)?[a-z0-9][\w.-]*$/i.test(name)) return "";
+  if (_NODE_BUILTIN_MODULES.has(name.toLowerCase())) return "";
+  return name;
+}
+
+// registry 直链只在**源码里的标识符就是 registry 上的标识符**时才给。
+//   · npm：包名逐字相同，给。
+//   · go：pkg.go.dev 认完整 import path，给。
+//   · pypi / crates：不给 —— `import yaml` 的发行名是 PyYAML、`use tokio_util` 的 crate 名
+//     是 tokio-util，从源码标识符推 registry 名不是确定性映射。拼一个大概率 404 的 URL 是
+//     "自信地给错答案"，正是"判不准就不说"要禁的那种。这两种改走工具路线（package_source
+//     按 import 名读本机装的那一份；package_search 按名字在注册表里搜）。
+function _importRegistryUrl(kind, name) {
+  if (kind === "npm" || kind === "go") return _depRegistryUrl(kind, name);
+  return "";
+}
+
+// 项目**已声明**的依赖索引：`${生态}:${小写名}`，外加每种已存在 manifest 的裸前缀
+// `${生态}:`（"这个生态的清单我们读到过"）。两个来源都是执行事实：
+//   · run.stack.declaredDeps —— 工作区扫描真读到的那几份 manifest（_declaredDepsFromFileMap）；
+//   · run._declaredDeps —— 本 run 里模型自己往 manifest 写进去的（全新项目那份就是它写的）。
+function _projectDeclaredDepIndex(run) {
+  const idx = new Set();
+  const add = (k) => {
+    const s = String(k || "").trim().toLowerCase();
+    if (s.includes(":")) idx.add(s);
+  };
+  const fromStack = run?.stack?.declaredDeps;
+  if (Array.isArray(fromStack)) for (const k of fromStack) add(k);
+  if (run?._declaredDeps instanceof Set) for (const k of run._declaredDeps) add(k);
+  return idx;
+}
+
+// 从工作区扫描读到的 manifest 原文里抽出已声明依赖。复用 _manifestDepAdditions（基线传空
+// ⇒ 每一条依赖行都算"新增"），不另写第二份解析器。
+function _declaredDepsFromFileMap(fileMap) {
+  const out = new Set();
+  if (!fileMap || typeof fileMap !== "object") return [];
+  for (const [name, text] of Object.entries(fileMap)) {
+    if (typeof text !== "string" || !text.trim() || text === "[present]") continue;
+    const kind = _manifestDepKind(name);
+    if (!kind) continue;
+    out.add(`${kind}:`);
+    for (const d of _manifestDepAdditions(name, "", text, 400)) out.add(`${kind}:${d.name.toLowerCase()}`);
+    // go.mod 的 module 行：本模块自己的 import path 前缀。没有它，`import "github.com/me/app/db"`
+    // （首段带点 ⇒ 看着像第三方）会被当成外部依赖误报。
+    if (kind === "go") {
+      const m = /^\s*module\s+(\S+)/m.exec(text);
+      if (m) out.add(`go:${m[1].toLowerCase()}`);
+    }
+  }
+  return [...out];
+}
+
+// 新增行里 import 进来、却不在已声明依赖清单里的第三方包。零网络：纯字符串判断。
+function _undeclaredImportAdditions(run, path, oldText, newText, maxItems = 6) {
+  const kind = _sourceImportKind(path);
+  if (!kind) return [];
+  const declared = _projectDeclaredDepIndex(run);
+  // 该生态的依赖清单没读到过 ⇒ "在不在依赖里"这个问题答不了 ⇒ 一个字都不说。
+  let kindKnown = false;
+  for (const key of declared) { if (key.startsWith(kind + ":")) { kindKnown = true; break; } }
+  if (!kindKnown) return [];
+  const norm = (l) => String(l).trim();
+  const before = new Set(String(oldText || "").split("\n").map(norm));
+  const out = [];
+  const seen = new Set();
+  const isDeclared = (name) => {
+    const lower = name.toLowerCase();
+    if (declared.has(`${kind}:${lower}`)) return true;
+    // go：import path 落在某个已声明 module path 之下就算已声明（本模块自己的包也走这条）。
+    if (kind !== "go") return false;
+    for (const key of declared) {
+      if (!key.startsWith("go:")) continue;
+      const mod = key.slice(3);
+      if (mod && (lower === mod || lower.startsWith(mod + "/"))) return true;
+    }
+    return false;
+  };
+  const push = (name) => {
+    name = String(name || "").trim();
+    const lower = name.toLowerCase();
+    if (!name || seen.has(lower) || out.length >= maxItems) return;
+    seen.add(lower);
+    if (isDeclared(name)) return;
+    out.push({ kind, name, version: "", major: "?", registry: _importRegistryUrl(kind, name), viaImport: true });
+  };
+
+  let goInImportBlock = false;
+  for (const raw of String(newText || "").split("\n")) {
+    const t = norm(raw);
+    if (!t) continue;
+    if (kind === "go") {
+      // import 块的边界要跟着走完整份文件，否则新增行落在块里也认不出来。
+      if (/^import\s*\($/.test(t)) { goInImportBlock = true; continue; }
+      if (goInImportBlock && t.startsWith(")")) { goInImportBlock = false; continue; }
+    }
+    if (before.has(t)) continue; // 不是这次新增的行
+    if (kind === "npm") {
+      if (/^\s*(?:\/\/|\/\*|\*)/.test(t)) continue;
+      const specs = [];
+      const bare = /^import\s+["'`]([^"'`]+)["'`]/.exec(t);
+      if (bare) specs.push(bare[1]);
+      for (const m of t.matchAll(/\b(?:import|export)\b[^;]*?\bfrom\s*["'`]([^"'`]+)["'`]/g)) specs.push(m[1]);
+      for (const m of t.matchAll(/\b(?:require|import)\s*\(\s*["'`]([^"'`]+)["'`]\s*\)/g)) specs.push(m[1]);
+      for (const spec of specs) {
+        const name = _npmPackageFromSpecifier(spec);
+        if (name) push(name);
+      }
+    } else if (kind === "pypi") {
+      if (t.startsWith("#")) continue;
+      const mf = /^from\s+([.\w]+)\s+import\b/.exec(t);
+      if (mf) {
+        if (mf[1].startsWith(".")) continue; // 相对导入
+        const top = mf[1].split(".")[0];
+        if (top && !_PY_STDLIB_MODULES.has(top.toLowerCase())) push(top);
+        continue;
+      }
+      const mi = /^import\s+(.+)$/.exec(t);
+      if (!mi) continue;
+      for (const piece of mi[1].split(",")) {
+        const mod = piece.trim().split(/\s+as\s+/)[0].trim();
+        if (!mod || mod.startsWith(".")) continue;
+        const top = mod.split(".")[0];
+        if (/^[A-Za-z_]\w*$/.test(top) && !_PY_STDLIB_MODULES.has(top.toLowerCase())) push(top);
+      }
+    } else if (kind === "crates") {
+      if (t.startsWith("//")) continue;
+      // Rust 2018 起，`use` 路径的首段只能是 extern crate 名（本 crate 的模块必须写
+      // crate::/self::/super::），所以裸首段就是外部 crate。2015 edition 的老代码里
+      // 裸首段也可能是本地模块——那种会误报，代价由下面"已声明依赖"那道过滤兜住。
+      const mu = /^(?:pub\s+)?use\s+([A-Za-z_]\w*)\s*(?:::|;|\s+as\b)/.exec(t);
+      const me = /^(?:pub\s+)?extern\s+crate\s+([A-Za-z_]\w*)/.exec(t);
+      const name = (mu && mu[1]) || (me && me[1]) || "";
+      if (name && !_RUST_BUILTIN_CRATES.has(name)) push(name);
+    } else if (kind === "go") {
+      if (t.startsWith("//")) continue;
+      const single = /^import\s+(?:[\w.]+\s+)?["`]([^"`]+)["`]/.exec(t);
+      const inBlock = goInImportBlock ? /^(?:[\w.]+\s+)?["`]([^"`]+)["`]/.exec(t) : null;
+      const spec = (single && single[1]) || (inBlock && inBlock[1]) || "";
+      // 标准库的 import path 首段不含点（fmt / net/http / encoding/json）；第三方一定含域名。
+      if (spec && spec.split("/")[0].includes(".")) push(spec);
+    }
+  }
+  return out;
+}
+
 // 跨 run 去重：同一 (生态,名字,主版本) 只提示一次。LRU 有界（64 条），键持久在
 // localStorage——「见过」是执行事实，随版本主号翻新自动失效（键里含主版本）。
 // 返回「之前是否已见过」，同时把这条刷成最新（touch）。
@@ -42257,18 +42699,41 @@ function _depPitfallNote(run, fp, oldText, newText) {
     if (!run || typeof run !== "object") return "";
     const snap = run.checkpoint && typeof run.checkpoint.get === "function" ? run.checkpoint.get(fp) : null;
     const baseline = snap ? (snap.existed ? String(snap.content || "") : "") : String(oldText || "");
-    const adds = _manifestDepAdditions(fp, baseline, newText);
+    let adds = _manifestDepAdditions(fp, baseline, newText);
+    if (adds.length) {
+      // 模型本 run 里自己写进 manifest 的依赖，登记成"项目已声明"。全新项目的那份 manifest
+      // 正是它刚写出来的，工作区扫描不可能知道——不登记的话，紧接着写的 import 会被当成
+      // 未声明依赖再报一遍。
+      const reg = (run._declaredDeps = run._declaredDeps instanceof Set ? run._declaredDeps : new Set());
+      for (const d of adds) { reg.add(`${d.kind}:`); reg.add(`${d.kind}:${d.name.toLowerCase()}`); }
+    } else {
+      // manifest 没动 ⇒ 看这次是不是在源码里 import 了一个项目还没声明的第三方包。
+      adds = _undeclaredImportAdditions(run, fp, baseline, newText);
+    }
     if (!adds.length) return "";
     if (!Number.isFinite(run._depHintBudget)) run._depHintBudget = 2;
+    // 同一个包一个 run 里最多说一次话，不管是 import 触发的还是 manifest 触发的：两条路
+    // 的跨 run 缓存键带着版本（import 那边没有版本，写 "?"），不合并的话「先 import 再补
+    // 依赖」这个正是本次要覆盖的顺序会连着触发两遍。
+    let noted = run._depNotedNames;
+    if (!(noted instanceof Set)) { noted = new Set(); run._depNotedNames = noted; }
     const fresh = [];
     for (const d of adds) {
       if (run._depHintBudget <= 0) break;
-      if (_depSeenTouch(`${d.kind}:${d.name.toLowerCase()}@${d.major}`)) continue;
+      const nameKey = `${d.kind}:${d.name.toLowerCase()}`;
+      if (noted.has(nameKey)) continue;
+      if (_depSeenTouch(`${nameKey}@${d.major}`)) continue;
       run._depHintBudget--;
+      noted.add(nameKey);
       fresh.push(d);
     }
     if (!fresh.length) return "";
-    const label = fresh.map((d) => `${d.name}@${d.version || "?"}（${d.kind}）`).join("、");
+    const viaImport = fresh.every((d) => d.viaImport === true);
+    const label = fresh.map((d) => `${d.name}${d.version ? "@" + d.version : ""}（${d.kind}）`).join("、");
+    const lead = viaImport
+      ? `\n📦 这次新增的 import 引进了项目依赖清单里没有的第三方包 ${label}：它既没被声明为依赖，也还没核对过真实 API。`
+        + `最便宜的一步是 package_source(package="${fresh[0].name}")——直接读本机装的那一份，零网络就能拿到真实导出与签名（本机没装会回落到平台语料库里该包已发布版本的真实签名）。`
+      : `\n📦 新依赖 ${label}：训练语料可能落后于这个版本，尚未核对资料。`;
     // 预填目标是 resolve-library-id 而不是 query-docs：后者的必填参数 libraryId 必须先由
     // 前者换取（读过 @upstash/context7-mcp 包内的 zod schema 实证），预填 query-docs 一点头
     // 就是一次缺参失败。点头 = 第一步换 ID，note 里写清第二步自己用 query-docs 查细节。
@@ -42283,10 +42748,15 @@ function _depPitfallNote(run, fp, oldText, newText) {
         mcpName: c7,
         args: { libraryName: fresh[0].name },
       };
-      return `\n📦 新依赖 ${label}：训练语料可能落后于这个版本，尚未核对资料。已把 ${c7} 预填为候选（libraryName=${fresh[0].name}）——空参数调用它即先换取 libraryId，拿到后用 mcp__context7__query-docs 查「${fresh.map((d) => d.name + (d.version ? "@" + d.version : "")).join(" ")} 快速上手与已知坑/破坏性变更」。`;
+      return `${lead}已把 ${c7} 预填为候选（libraryName=${fresh[0].name}）——空参数调用它即先换取 libraryId，拿到后用 mcp__context7__query-docs 查「${fresh.map((d) => d.name + (d.version ? "@" + d.version : "")).join(" ")} 快速上手与已知坑/破坏性变更」。${viaImport ? "确认用法之后别忘了把它写进项目依赖清单，否则装不上也跑不起来。" : ""}`;
     }
-    return `\n📦 新依赖 ${label}：训练语料可能落后于这个版本，尚未核对资料。写用法前可用 web_fetch 核对官方文档/README：`
-      + fresh.map((d) => `\n  - ${d.name}: ${d.registry}`).join("");
+    // 没有 context7：退为指路事实。registry 直链只在标识符逐字等于 registry 名时才有
+    // （_importRegistryUrl 的判据），没有直链的用 package_search 按名字搜。
+    const links = fresh.filter((d) => d.registry);
+    return `${lead}${viaImport ? "" : "写用法前可用 web_fetch 核对官方文档/README："}`
+      + (links.length ? (viaImport ? "官方资料入口：" : "") + links.map((d) => `\n  - ${d.name}: ${d.registry}`).join("") : "")
+      + (links.length < fresh.length ? `\n  - 其余用 package_search 按名字查注册表（源码里的标识符和发行名可能不一致）：${fresh.filter((d) => !d.registry).map((d) => d.name).join("、")}` : "")
+      + (viaImport ? "\n  确认用法之后别忘了把它写进项目依赖清单，否则装不上也跑不起来。" : "");
   } catch { return ""; }
 }
 
@@ -48986,9 +49456,19 @@ function _agentDecisionFrameBlock(text, profile = _engineeringProfileWithAiInten
   }
   // 收尾验收契约前置（Anthropic《Effective harnesses for long-running agents》模式：
   // 完成标准开局就交给模型自主奔着做，而不是收尾时用 nudge 突袭补课——突袭 =
-  // 多烧轮次 + 被动挨打）。与收尾门禁**同源**：run.engineering 就是这份 resolved
-  // profile，门禁（执行事实 + _missingResearchEvidence/UI 验证）只是本契约
-  // 的复核，永不出现模型没被告知过的新要求。门禁本身保留（零回退纪律）。
+  // 多烧轮次 + 被动挨打）。清单本身与 run.engineering **同源**，所以永不出现模型
+  // 没被告知过的新要求。
+  //
+  // 但「收尾会逐项核对」这句话曾经是**假的**，和下面那条已经修掉的「收尾会自动跑验证」
+  // 是同一种病：收尾出口按分类器预测贴 `required_effect_missing:` /
+  // `research_evidence_missing:` 那一段在阶段 2b 就删掉了（见 _runAgenticLoop 收尾处的
+  // 原注释），此后收尾只认执行事实，真正会被机器核对的只剩两条——
+  //   · `code_delivered_unverified`：改过代码而这一版没有 exit 0 的验证记录；
+  //   · `ui_verification_missing`：改过界面而这一版没有浏览器验收盖章。
+  // 运行/外部义务和外部取证这几项，收尾**没有任何一处会去看**。
+  // 仓库自己的判词就写在下面那段注释里：承诺一个不存在的能力，比没有这个能力糟得多——
+  // 模型会理性地把这几项外包给"反正收尾会查"，然后什么都不查。所以下面这句话如实分档。
+  // 这不是撤门（那两道真门原样保留），是把话说准。
   const _finishChecks = [];
   const _finishEffectLabels = {
     build: "编译/构建通过", run: "目标程序真实跑起来", test: "测试真实跑过", install: "依赖真实装好", package: "产物真实打包",
@@ -49013,7 +49493,7 @@ function _agentDecisionFrameBlock(text, profile = _engineeringProfileWithAiInten
     //
     // 这是"写出来的代码用不了"最直接的一条机器原因。修法只有两条：把机器真接上，
     // 或者别再承诺它。先选后者——承诺一个不存在的能力，比没有这个能力糟得多。
-    lines.push(`🏁 收尾验收契约（harness 收尾时会逐项核对真实证据；把它们当作任务的一部分提前做掉，而不是收尾被动补课）：${_finishChecks.length ? _finishChecks.map((check, index) => `${index + 1}. ${check}`).join("；") + "；" : ""}改过代码就**自己跑一遍**本项目的构建/测试命令（没有任何东西会替你自动跑，也不会有失败报告自动送到你面前）——退出码就是结论。确实做不到的项，收尾如实写明未完成及原因。`);
+    lines.push(`🏁 收尾验收契约（harness 收尾**只机械核对两件事**：改过代码有没有真跑过验证、改过界面有没有浏览器验过；取证与运行/外部义务这几项没有任何门会核对、缺了也不会拦你，代价直接落在交付上。所以把它们当作任务的一部分提前做掉，别指望收尾有人提醒）：${_finishChecks.length ? _finishChecks.map((check, index) => `${index + 1}. ${check}`).join("；") + "；" : ""}改过代码就**自己跑一遍**本项目的构建/测试命令（没有任何东西会替你自动跑，也不会有失败报告自动送到你面前）——退出码就是结论。确实做不到的项，收尾如实写明未完成及原因。`);
   }
   return lines.join("\n");
 }
@@ -50724,6 +51204,10 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
   // effective per-turn mode (resolved from Auto by the caller); fall back to the
   // global only if a caller didn't pass it.
   const run = { session, root, mode: mode || _currentAiMode, perm: _currentAiPerm, checkpoint: new Map(), recording: [], _recStart: Number.isFinite(taskStartedAt) ? taskStartedAt : (Date.now ? Date.now() : 0), _originalText: task || "" };
+  // 让流式草稿够得着这一轮的执行记录（见 _draftStepsMarkdown）。运行途中一条消息都不进
+  // session.memory，所以崩溃时 recording 是「这一轮做过什么」唯一还活着的结构化来源。
+  // 收尾时解引用（finally 里），免得一个跑完的 run 被 session 一直吊着不放。
+  session._activeRun = run;
   // Snapshot the session generation once. Interactive tools use this to retire
   // themselves when Stop or a replacement turn advances the session.
   run._sessionGen = session._runGen || 0;
@@ -51151,6 +51635,16 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
     // （referenceSite 故意**不**登记：参考站律每轮都在提示词里，模型收得到信号，
     //   那条只是兜底，按默认建议类处理就够。）
     "websiteContent",
+    // researchFirst 和上面那条 websiteContent 是**同一个判据的两半**：一个说"页面写了、
+    // 产品事实台账是空的"，一个说"这次工程语义要求外部参考、取证台账是空的"。两者都由
+    // _missingResearchEvidence / 取证台账按**执行事实**算出来（工具真调成功、正文够长才
+    // 记账，搜索标题一律不收），陈述的不是"建议你去查一下"，是"这一栏现在是零"。
+    // 它此前躺在默认的建议类里，而建议类同时只留 1 个名额 —— 任何一条更晚的建议
+    // （planNudge / midSummary / askBudget / implLoop…）都会当场把它挤掉。它偏偏又是在
+    // **第一次写入**那一刻推的（researchGateNudges < 1，整个 run 只有这一次机会），
+    // 挤掉就等于这一整个 run 再也不会有第二次提起。
+    // 而丢了它的后果正是事实类的判据：模型按「我大概知道这个库怎么用」的图景继续写下去。
+    "researchFirst",
   ]);
   const _nudgeRank = (cat) => (cat === "steer" ? 0 : _NUDGE_FACTS.has(cat) ? 1 : 2);
   // 本轮尾部区间的起点：每轮迭代开头置成当时的 messages.length。
@@ -52997,7 +53491,7 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
             const gateTopics = Array.isArray(run.engineering?.researchTopics) && run.engineering.researchTopics.length
               ? run.engineering.researchTopics.join("；")
               : (run._originalText || "")  /* semanticGoal 无生产者，去掉这条永远 undefined 的腿 */.slice(0, 300);
-            _pushNudge("researchFirst", `[取证提醒·不拦截] 这次工程语义要求${_preWriteResearchMissing.map((k) => ({ official: "官方/维护方", community: "开发者社区/同类现有实现" }[k])).join("和")}真实参考，你还没取证就开始写了。${gateNames.length ? `所需工具已装载（${gateNames.join("、")}），` : ""}尽快穿插取证：查同类项目真实实现与设计取舍（聚焦：${gateTopics}），读到仓库/帖子正文后把适配点落进实现；收尾验收会逐项核对外部证据，到时才补等于白写。`);
+            _pushNudge("researchFirst", `[取证提醒·不拦截] 这次工程语义要求${_preWriteResearchMissing.map((k) => ({ official: "官方/维护方", community: "开发者社区/同类现有实现" }[k])).join("和")}真实参考，你还没取证就开始写了。${gateNames.length ? `所需工具已装载（${gateNames.join("、")}），` : ""}尽快穿插取证：查同类项目真实实现与设计取舍（聚焦：${gateTopics}），读到仓库/帖子正文后把适配点落进实现。说清这条的分量：**没有任何门会因为你没取证而拦你或打回这次写入**，收尾也不会按取证账本判定完成与否；代价全部落在交付本身——凭训练记忆写出来的版本号、API 和用法常常属于另一个大版本，等跑起来才发现要返工。`);
           }
         }
         if (_MUTATING_FILE_TOOL_TYPES.has(call.type)) {
@@ -53974,7 +54468,10 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
         const _workspaceMutated = _ok && (it._wikiMutated || _toolMutatesWorkspace(it.call, it.rawResult));
         if (_ok) {
           if (!it._skipped) {
-            const category = _researchEvidenceCategory(it.tc.name, it.call, it.rawResult);
+            // 先登记「这个包自己声明的主页/仓库」，再分类：同一轮里模型常常是先
+            // package_search 拿到事实、下一轮才 web_fetch 去读那个站。
+            _recordDeclaredDocsHosts(run, it.tc.name, it.rawResult);
+            const category = _researchEvidenceCategory(it.tc.name, it.call, it.rawResult, _officialDocsHosts(run));
             if (category) _researchEvidence[category].add(it.tc.name);
           }
           if (it.tc.name !== "update_plan" && (it._planAdvanced || _advancePlanFromTool(run, it.call, it.rawResult))) planSteps = run._planSteps;
@@ -55036,6 +55533,8 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
     // FIFO ≤6 条），下轮动态前导注入，治"每轮从零重想"。全文不进历史，token 经济不受影响。
     try { _thinkLedgerPush(session, _extractThinkingConclusion(reasoningAll), session.memory?.totalTurns || 0); } catch { /* 沉淀失败不影响收尾 */ }
     _streamDraftClear(session); // 本次运行已持久化收尾，流式草稿不再需要（只清本会话的槽）
+    // run 已收尾：解引用，否则 session 会一直吊着整轮的 recording / checkpoint。
+    if (session._activeRun === run) session._activeRun = null;
     // 「部分完成」有四个并列成因，而它们要的修法互不相同：提前停止是编排问题，
     // 迭代上限是步数经济问题，改了没验证是取证问题。此前这四种在存档里长得一模一样，
     // 于是「这些部分完成到底卡在哪一环」在数据上**无从回答**——只能猜。
