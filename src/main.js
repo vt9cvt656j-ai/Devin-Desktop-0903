@@ -3314,7 +3314,11 @@ async function _loadEnvSymbols(langId) {
     _loadGoEnvSymbols(workspaceRoots[0]);
   }
 
-  const genericLangs = ["lua","ruby","php","dart","kotlin","java","swift","c","cpp","csharp"];
+  // 这张表必须和 lsp.rs 里 lsp_lang_env_symbols 的 match 分支**一一对应**。
+  // "c" / "cpp" 曾经列在这里，而 Rust 侧没有对应分支，直接落到 `_ => {}` —— 每打开一个
+  // C/C++ 文件就发一次注定拿不到东西的 IPC，界面上什么都没有，也没有任何迹象说明为什么。
+  // 摘掉它们（要支持就先去补 Rust 那边的分支，别让这张表先于实现存在）。
+  const genericLangs = ["lua","ruby","php","dart","kotlin","java","swift","csharp"];
   if (genericLangs.includes(langId)) {
     _loadGenericLangSymbols(langId, importedMods);
   }
@@ -10469,19 +10473,16 @@ function _restartJsTsLanguageService() {
 }
 
 function _refreshLspDocumentsForRoot(root) {
-  try {
-    if (lspManager?.refreshWorkspace) {
-      lspManager.refreshWorkspace(root);
-      return;
-    }
-    for (const [path, f] of openFiles) {
-      if (root && !_pathIsAtOrUnder(path, root)) continue;
-      if (f?.model && !f.isImage && !f.isVideo && !f.isPdf && !f.isInspection) {
-        lspManager?.didChange(path, f.model);
-        lspManager?.didSave(path, f.model);
-      }
-    }
-  } catch {}
+  /*
+   * 这里原来还有一段「refreshWorkspace 不可用时的降级同步」——遍历 openFiles 逐个
+   * didChange + didSave。它在**任何输入下都不产生任何效果**：lspManager 非 null 时
+   * 上一行就 return 了，循环永不执行；lspManager 为 null 时进得了循环，但循环体全是
+   * `lspManager?.` 可选链，一次调用都不会发生。
+   *
+   * 留着比删了更坏：它看起来像一条独立的兜底路径，会让人以为换工作区时开着的文件
+   * 另有保障，从而不去检查 refreshWorkspace 自己的过滤条件覆盖没覆盖到目标文件。
+   */
+  try { lspManager?.refreshWorkspace?.(root); } catch {}
 }
 
 async function refreshProjectCaches(root = rootPath, reason = "项目刷新") {
@@ -30494,8 +30495,17 @@ const _ATC_EXPAND_ICON = `<svg viewBox="0 0 12 12" width="12" height="12"><path 
 // 步数预算机制已整体拆除（用户决策：结束由 AI 自主判定，不设任何步数天花板/延展审批）。
 // 真正的限制器：做完→静默→finish gate 自然收尾；重复失败/同调用空转由 stuck-nudge
 // 诊断介入；烧钱由用户自设的 token 预算（michael-ide.token-budget）兜住。
-const _AGENT_MAX_REVIEWS = 3;      // evaluator-optimizer: max review→fix→re-review rounds before finishing
-const _AGENT_MAX_VERIFY = 2;       // one repair attempt after a failed final verification
+/*
+ * 这里原来有两个常量：
+ *   const _AGENT_MAX_REVIEWS = 3;   // review→fix→re-review 最多 3 轮
+ *   const _AGENT_MAX_VERIFY  = 2;   // 最终验证失败后只补修一次
+ *
+ * 全仓**零读者**——它们描述的那两条收敛规则在实现里根本不存在（`_runApprovedVerification`
+ * 那套机器是刻意没接的，同一文件里另外三处注释写明了理由）。更糟的是有一条名叫
+ * 「automatic verification converges」的测试正拿 `assert.match(SRC, /const _AGENT_MAX_VERIFY = 2/)`
+ * 当收敛的证据——**常量在、没人读、测试钉着字面量**，这个组合给的是假掩护。
+ * 删掉常量，那条测试改成只守它真正守得住的东西。
+ */
 
 function _agentMustUseWorkspaceTools(engineering, root = "", active = "") {
   const activeFile = active || (typeof activePath === "string" ? activePath : "");

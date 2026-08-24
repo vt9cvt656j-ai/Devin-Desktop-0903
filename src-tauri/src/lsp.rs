@@ -972,6 +972,41 @@ pub struct LangEnvSymbols {
     pub api_symbols: HashMap<String, Vec<String>>,
 }
 
+/// `dotnet list package` 的输出里挑出包名。
+///
+/// 抽成函数是为了能**不起进程地**测它：解析写在 match 分支里的话，唯一的验证方式就是
+/// 真的装个 .NET 项目跑一遍，于是实际上没人验，写错了也没人知道。
+/// 真实输出长这样（前面有缩进，中文/英文 SDK 的表头不同，但数据行一致）：
+///
+/// ```text
+/// 项目“probe”具有以下包引用
+///    [net8.0]:
+///    顶级包                    已请求      已解决
+///    > Newtonsoft.Json      13.0.3   13.0.3
+/// ```
+fn csharp_packages_from(lines: &[String]) -> Vec<String> {
+    let mut out = Vec::new();
+    for line in lines {
+        let Some(rest) = line.trim_start().strip_prefix("> ") else {
+            continue;
+        };
+        let Some(name) = rest.split_whitespace().next() else {
+            continue;
+        };
+        if !name.chars().next().is_some_and(|c| c.is_alphabetic()) {
+            continue;
+        }
+        out.push(name.to_string());
+        // 包名的最后一段也进补全：用 Newtonsoft.Json 的人打的是 Json。
+        if let Some(tail) = name.rsplit('.').next() {
+            if tail != name && tail.len() > 2 {
+                out.push(tail.to_string());
+            }
+        }
+    }
+    out
+}
+
 fn run_cmd_collect(cmd_name: &str, args: &[&str], cwd: Option<&str>) -> Vec<String> {
     let resolved = process_util::resolve_command(cmd_name, None);
     let aug_path = process_util::augmented_path(None);
@@ -1067,6 +1102,15 @@ for _,v in ipairs(r) do print(v) end"#;
             );
             symbols.extend(fns);
         }
+        // C# 的「环境符号」＝项目引用的 NuGet 包名。
+        //
+        // 客户端 genericLangs 里一直列着 "csharp" 并真的发过来，而这个 match 里**没有
+        // 对应分支**，直接落到 `_ => {}`，回去的是空 symbols —— 一次白跑的 IPC，
+        // 界面上什么都没有，也没有任何迹象说明为什么。形状和 dart 那条一样。
+        "csharp" => {
+            let pkgs = run_cmd_collect("dotnet", &["list", "package"], Some(&project_dir));
+            symbols.extend(csharp_packages_from(&pkgs));
+        }
         "dart" => {
             let deps = run_cmd_collect(
                 "dart",
@@ -1083,7 +1127,18 @@ for _,v in ipairs(r) do print(v) end"#;
         }
         "kotlin" | "java" => {
             let script = r#"import java.util.jar.*;import java.io.*;public class _Ls{public static void main(String[] a){for(String p:System.getProperty("java.class.path","").split(File.pathSeparator)){try{JarFile j=new JarFile(p);j.stream().filter(e->e.getName().endsWith(".class")).forEach(e->{String n=e.getName().replace('/','.');n=n.substring(0,n.length()-6);String s=n.contains(".")?n.substring(n.lastIndexOf('.')+1):n;if(!s.isEmpty()&&!s.startsWith("_"))System.out.println(s);});j.close();}catch(Exception ex){}}}}"#;
-            let _ = script;
+            /*
+             * 上面这段 JarFile 扫描脚本**从来没被执行过**——构造出来就 `let _ = script;`
+             * 丢掉，实际返回的永远是紧随其后那份 80 项硬编码 JDK 类名。也就是说
+             * 「按项目真实 classpath 取环境符号」这个能力的代码在文件里、编译得过、
+             * 永远不运行；项目自己的依赖（Gson、Retrofit、Jackson）一个符号都进不来。
+             *
+             * 要真跑它需要两样这台机器上验不了的东西：一个可用的 JRE（`java` 只有
+             * /usr/bin 那个壳，没装运行时），以及一条真实的 classpath（得先跑
+             * mvn dependency:build-classpath 或 gradle）。没验证过的实现不往上放，
+             * 所以这里先如实标注：**下面那份 common 是全部，不是兜底**。
+             */
+            let _ = script; // TODO(java-classpath): 需要 JRE + 真实 classpath 才能落地
             let common = vec![
                 "String",
                 "Integer",
@@ -1484,5 +1539,74 @@ mod reap_tests {
         let map: Arc<Mutex<HashMap<String, LspProcess>>> = Arc::new(Mutex::new(HashMap::new()));
         reap(&map, "nope"); // 不许 panic
         assert!(map.lock().unwrap().is_empty());
+    }
+}
+
+#[cfg(test)]
+mod csharp_env_tests {
+    use super::*;
+
+    #[test]
+    fn package_names_come_out_of_the_real_output_shape() {
+        let lines: Vec<String> = [
+            "项目“probe”具有以下包引用",
+            "   [net8.0]: ",
+            "   顶级包                    已请求      已解决   ",
+            "   > Newtonsoft.Json      13.0.3   13.0.3",
+            "   > Serilog              3.1.1    3.1.1",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let got = csharp_packages_from(&lines);
+        assert!(got.contains(&"Newtonsoft.Json".to_string()), "全名没进来：{got:?}");
+        assert!(got.contains(&"Json".to_string()), "最后一段没进来——用它的人打的是 Json");
+        assert!(got.contains(&"Serilog".to_string()));
+        // 表头和空行不许被当成包名。
+        assert!(!got.iter().any(|s| s.contains("顶级包") || s.contains("net8.0")), "表头混进来了：{got:?}");
+        // 单段包名不重复塞一遍。
+        assert_eq!(got.iter().filter(|s| *s == "Serilog").count(), 1);
+    }
+
+    #[test]
+    fn nothing_at_all_is_not_a_crash() {
+        assert!(csharp_packages_from(&[]).is_empty());
+        assert!(csharp_packages_from(&["没有任何包".to_string()]).is_empty());
+    }
+}
+
+/// 真的起一个 `dotnet` 跑一遍。默认 ignore（要网络 + 一次 restore），
+/// 需要时 `cargo test --lib csharp_probe -- --ignored --nocapture`。
+#[cfg(test)]
+mod csharp_probe {
+    use super::*;
+
+    #[test]
+    #[ignore]
+    fn dotnet_list_package_end_to_end() {
+        let dir = std::env::temp_dir().join("mrday-csharp-probe");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("probe.csproj"),
+            r#"<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup><OutputType>Exe</OutputType><TargetFramework>net8.0</TargetFramework></PropertyGroup>
+  <ItemGroup><PackageReference Include="Newtonsoft.Json" Version="13.0.3" /></ItemGroup>
+</Project>"#,
+        )
+        .unwrap();
+        let out = lsp_lang_env_symbols(
+            "csharp".into(),
+            dir.to_string_lossy().to_string(),
+            vec![],
+            Some(true),
+        )
+        .unwrap();
+        assert!(
+            out.symbols.contains(&"Newtonsoft.Json".to_string()),
+            "真跑 dotnet 也没拿到包名：{:?}",
+            out.symbols
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
