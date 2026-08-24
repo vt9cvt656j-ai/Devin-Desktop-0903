@@ -11,6 +11,7 @@ mod ai;
 mod auth;
 mod automation;
 mod browser;
+mod cleanup;
 mod capture;
 mod content_length_frame;
 mod conversation_store;
@@ -262,6 +263,8 @@ pub fn run() {
         .manage(proxy::ProxyState::default())
         .manage(watcher::WatcherState::default())
         .invoke_handler(tauri::generate_handler![
+            cleanup::cleanup_scan,
+            cleanup::cleanup_apply,
             files::register_workspace_root,
             files::create_project_dir,
             files::read_dir,
