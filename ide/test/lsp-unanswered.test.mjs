@@ -373,3 +373,44 @@ test("补全用的 Python 解释器要和 pyright 用的是同一个", () => {
     "脚本跑挂时那张空模块表被当成有效缓存钉住 300 秒 —— 这五分钟里补全一个模块名都给不出，"
     + "而且没有任何迹象说明为什么");
 });
+
+// ── ⑨ 客户端那张 genericLangs 必须和 Rust 的 match 分支一一对应 ──────────────
+//
+// "c" / "cpp" 曾经列在客户端表里，而 lsp_lang_env_symbols 的 match 没有对应分支，直接
+// 落到 `_ => {}` —— 每打开一个 C/C++ 文件就发一次注定拿不到东西的 IPC，界面上什么都
+// 没有，也没有任何迹象说明为什么。两张手工表分家，是这个仓库反复出事的形状。
+test("genericLangs 和 lsp_lang_env_symbols 的分支两边对得上", () => {
+  const m = /const genericLangs = \[([^\]]*)\]/.exec(MAIN);
+  assert.ok(m, "genericLangs 不见了");
+  const declared = new Set([...m[1].matchAll(/"([a-z+#]+)"/g)].map((x) => x[1]));
+
+  const body = RS.slice(RS.indexOf("pub fn lsp_lang_env_symbols("), RS.indexOf("pub struct LspInfo"));
+  const arms = new Set();
+  for (const line of body.split("\n")) {
+    const a = /^\s*((?:"[a-z+#]+"\s*\|\s*)*"[a-z+#]+")\s*=>/.exec(line);
+    if (a) for (const x of a[1].matchAll(/"([a-z+#]+)"/g)) arms.add(x[1]);
+  }
+  assert.ok(arms.size >= 5, `Rust 分支只解析出 ${arms.size} 个，解析写错了`);
+
+  const askedButUnimplemented = [...declared].filter((l) => !arms.has(l));
+  assert.deepEqual(askedButUnimplemented, [],
+    `客户端会为这些语言发 IPC，而 Rust 侧没有分支，回来的恒为空：${askedButUnimplemented.join(", ")}`);
+
+  const implementedButNeverAsked = [...arms].filter((l) => !declared.has(l));
+  assert.deepEqual(implementedButNeverAsked, [],
+    `Rust 侧实现了这些语言，客户端却从不问：${implementedButNeverAsked.join(", ")}`);
+});
+
+test("csharp 的解析抽成了函数，能不起进程地测", () => {
+  assert.match(RS, /fn csharp_packages_from\(lines: &\[String\]\) -> Vec<String>/,
+    "解析写回 match 分支里了 —— 那样唯一的验证方式就是真装个 .NET 项目跑一遍，于是实际上没人验");
+  assert.match(RS, /symbols\.extend\(csharp_packages_from\(&pkgs\)\)/, "分支里没用上那个函数");
+});
+
+test("java/kotlin 那段没跑的脚本要如实标注，不能看着像在工作", () => {
+  const seg = RS.slice(RS.indexOf('"kotlin" | "java" =>'), RS.indexOf('"swift" =>'));
+  assert.match(seg, /TODO\(java-classpath\)/,
+    "那段 JarFile 扫描脚本构造出来就被丢掉，实际返回的永远是硬编码的 80 项 JDK 类名 —— "
+    + "不标注的话，下一个人会以为「按项目 classpath 取符号」这件事已经在做了");
+  assert.match(seg, /下面那份 common 是全部，不是兜底/, "没说清现状");
+});

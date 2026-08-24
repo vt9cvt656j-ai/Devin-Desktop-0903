@@ -11911,13 +11911,23 @@ test("only a human can unpin the chat, and landing at the bottom always re-pins"
     "the observer is per-session so a background tab's growth cannot scroll the visible one");
 });
 
-test("automatic verification converges instead of repeating per edit batch", () => {
-  assert.match(SRC, /const _AGENT_MAX_VERIFY = 2/);
-  assert.match(SRC, /timeoutSecs: 60/);
+test("昂贵的编译/测试不许每批改动都跑一遍", () => {
+  /*
+   * 这条测试原来叫「automatic verification converges」，而它的第一条断言是
+   * `assert.match(SRC, /const _AGENT_MAX_VERIFY = 2/)` —— 钉的是一个**零读者**的常量的
+   * 字面量。那套「验证会收敛」的机器（_runApprovedVerification）是刻意没接的，源码里
+   * 三处注释写明了理由。于是这条测试的名字承诺了一件它根本没在检查的事，还给了假掩护。
+   *
+   * 常量已删。名字改成它真正守得住的那件事，两条 doesNotMatch 保留 —— 它们防的是
+   * 「每改一批就重跑一次编译/测试」这个真实回退，那才是这条用例的价值所在。
+   */
   assert.doesNotMatch(SRC, /run\.stack\?\.checkCmd && _checkPending\.size >= 2/,
     "expensive compile checks belong to the finish gate, not each edit batch");
   assert.doesNotMatch(SRC, /run\.stack\?\.testCmd && _pending\.size >= 3/,
     "tests must not be repeatedly restarted as a task edits files");
+  // 常量删干净了：留着「没人读的常量 + 钉它字面量的测试」正是本仓库反复出事的形状。
+  assert.doesNotMatch(SRC, /^const _AGENT_MAX_(?:REVIEWS|VERIFY) = /m,
+    "零读者的常量又回来了");
 });
 
 test("automatic verification runs directly without the old permission gate", async () => {
