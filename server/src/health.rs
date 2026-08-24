@@ -223,7 +223,12 @@ pub async fn status(
         // 带样本量门槛的判据都会退到更长的窗，而长窗里装的是故障**之前**的成功，
         // 只会把结论往好看的方向拉。
         let rh = crate::route_health::snapshot(&state, id).await;
-        let state_word = crate::route_health::classify(&rh, chrono::Utc::now().timestamp());
+        // 多路由之后「线路健康」是它所有出口的并集：健康按出口记（一个坏出口不该拖垮
+        // 同线路的好出口），而流量大多走最便宜那个出口，只看线路自带地址的记录，
+        // 最忙的线路反而会显示成「不知道」。见 route_endpoints::aggregate_live。
+        let state_word =
+            crate::route_endpoints::aggregate_live(&state, id, chrono::Utc::now().timestamp())
+                .await;
 
         cards.push(json!({
             "id": id,

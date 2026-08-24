@@ -20,6 +20,7 @@ mod game;
 mod handoff;
 mod health;
 mod shutdown;
+mod route_endpoints;
 mod route_health;
 mod integrations;
 mod code_corpus;
@@ -143,6 +144,11 @@ async fn main() -> anyhow::Result<()> {
     // 线路健康巡检：给没有真实流量的线路补一次最小真实请求，然后评估告警。
     // 单独一个任务，不挂在探针 tick 上——那个循环串行、每条 10 秒超时，一轮最坏 100 秒。
     route_health::spawn(state.clone());
+    // 多路由：定期确认每个出口还活着（只测真实流量最近没证明过的那些）。
+    route_endpoints::spawn(state.clone());
+    // 承接上一个进程学到的「哪些出口还在让位」。放在起服务之前：晚一步，第一批请求
+    // 就会按空表把流量铺回刚被打满的出口。
+    route_endpoints::restore_saturation(&state).await;
 
     // Catch payments the webhook never delivered. Every grant in this service hangs off a
     // single webhook call; without this, one missed delivery means a customer paid and got
@@ -434,6 +440,30 @@ async fn main() -> anyhow::Result<()> {
         // Display grouping: show one route's models under another's name. Changes only
         // the picker's heading — never where a request goes (see models.rs).
         .route("/api/admin/models/:id/group", post(models::admin_group))
+        // 多路由：一条线路挂多个上游出口。出口只带地址/密钥/进价，
+        // 价格和用量归属留在线路上 —— 换出口换不动账单。见 route_endpoints.rs。
+        .route(
+            "/api/admin/route-endpoints",
+            get(route_endpoints::admin_list).post(route_endpoints::admin_save),
+        )
+        .route(
+            "/api/admin/route-endpoints/:id",
+            delete(route_endpoints::admin_delete),
+        )
+        .route(
+            "/api/admin/route-endpoints/:id/probe",
+            post(route_endpoints::admin_probe),
+        )
+        // 问一个中转「你有哪些模型」。必须能在保存之前问 —— 出口的价值就在于
+        // 「这家有没有我要的那几个」，先存再看等于先把一个不知道行不行的出口放进候选池。
+        .route(
+            "/api/admin/route-endpoints/available",
+            post(route_endpoints::admin_available),
+        )
+        .route(
+            "/api/admin/routes/:id/probe",
+            post(route_endpoints::admin_probe_route),
+        )
         // 自动打款：推荐人自己去 Stripe 开户，之后提现不再需要人工确认。
         // 支付成功页：这一笔买到了什么。订单还没到账时会主动向 Stripe 核实并当场发放。
         .route("/api/billing/session/:id", get(stripe::session_result))

@@ -5,6 +5,8 @@ import { Overview } from "@/pages/Overview";
 import { Customers } from "@/pages/Customers";
 import { Billing } from "@/pages/Billing";
 import { Settings } from "@/pages/Settings";
+import { RouteEndpoints } from "@/pages/RouteEndpoints";
+import { VendorIcons } from "@/pages/VendorIcons";
 import { Routing, type RoutingView } from "@/pages/Routing";
 import { Pricing } from "@/pages/Pricing";
 import { Releases } from "@/pages/Releases";
@@ -79,7 +81,13 @@ export default function App() {
       {page === "billing" && <Billing />}
       {page === "settings" && <Settings />}
       {page.startsWith("mail") && <Mail view={page as MailView} />}
-      {page.startsWith("routing") && <Routing view={page as RoutingView} />}
+      {/* 多路由自成一屏：它不依赖 Routing 的那份连接数据，自己有接口。
+          必须排在 startsWith("routing") 之前判掉，否则两个会一起渲染。 */}
+      {page === "routing-endpoints" && <RouteEndpoints />}
+      {page === "routing-icons" && <VendorIcons />}
+      {page.startsWith("routing") && !["routing-endpoints", "routing-icons"].includes(page) && (
+        <Routing view={page as RoutingView} />
+      )}
       {page === "pricing" && <Pricing />}
       {page.startsWith("commission") && <Commission view={page as CommissionView} />}
       {page === "releases" && <Releases />}

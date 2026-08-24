@@ -332,32 +332,32 @@ pub fn spawn_stall_recovery(state: &AppState, m: crate::models::Model) {
     if !canary_enabled() {
         return;
     }
-    if !stall_recovery_admit(m.id) {
+    if !stall_recovery_admit(m.health_id()) {
         return;
     }
     let st = state.clone();
     tokio::spawn(async move {
-        let _slot = StallRecoverySlot(m.id);
+        let _slot = StallRecoverySlot(m.health_id());
         loop {
             tokio::time::sleep(STALL_RECOVERY_EVERY).await;
             // 记号没了 —— 要么真实流量已经拿到表头（clear_route_stall），要么兜底过期。
             // 两种都不该再花钱探。
-            if !crate::models::route_recently_stalled(m.id, Instant::now()) {
+            if !crate::models::route_recently_stalled(m.health_id(), Instant::now()) {
                 tracing::info!(route = %m.label, "卡死记号已撤，恢复探针退出");
                 return;
             }
             match canary_once(&m).await {
                 Some((true, status)) => {
-                    crate::models::clear_route_stall(m.id);
-                    crate::models::clear_route_cooldown(m.id);
-                    record_ok(&st, m.id).await;
+                    crate::models::clear_route_stall(m.health_id());
+                    crate::models::clear_route_cooldown(m.health_id());
+                    record_ok(&st, m.health_id()).await;
                     tracing::info!(route = %m.label, status, "卡死线路已由后台探针确认恢复，回到轮换");
                     return;
                 }
                 Some((false, status)) => {
                     // 还没好：把记号续上，让它在停机期间持续降权、持续短预算。
-                    crate::models::mark_route_stall(m.id);
-                    record_fail(&st, m.id, status).await;
+                    crate::models::mark_route_stall(m.health_id());
+                    record_fail(&st, m.health_id(), status).await;
                     tracing::warn!(route = %m.label, status, "卡死线路仍未恢复（后台探针）");
                 }
                 // 无从探起（没有任何可用模型 id）：什么都不记，退出。记号按 120 秒自然过期。
@@ -593,7 +593,7 @@ pub fn spawn(state: AppState) {
 
             let mut probed = 0usize;
             for m in &routes {
-                let mut h = snapshot(&state, m.id).await;
+                let h = snapshot(&state, m.id).await;
                 let fresh = h
                     .last_attempt_at
                     .is_some_and(|t| now_secs().saturating_sub(t) < CANARY_SKIP_IF_FRESH_SECS);
@@ -609,7 +609,8 @@ pub fn spawn(state: AppState) {
                                 record_fail(&state, m.id, status).await;
                             }
                             tracing::info!(route = %m.label, ok, status, "线路探活（最小真实请求）");
-                            h = snapshot(&state, m.id).await;
+                            // 探活的结果不用在这儿回读：下面的 best_word 会重新取一次
+                            // 快照（它还要同时看这条线路挂的多路由出口）。
                         }
                         // 无从探起（这条线路一个模型都没开）——什么都不记。
                         // 记成功就是伪造证据，记失败就是诬告一条没被用到的线路。
@@ -620,8 +621,21 @@ pub fn spawn(state: AppState) {
                     }
                 }
 
-                let word = classify(&h, now_secs());
-                evaluate_alarm(&state, m.id, &m.label, word, &h).await;
+                // 告警看的是「这条线路还能不能服务」，所以要把它挂的多路由出口一起算进来。
+                //
+                // 健康是按出口记的（一个坏出口不该拖垮同线路的好出口），而流量大多走最便宜
+                // 那个出口 —— 只看线路自带地址的记录，出口连败就永远进不了告警。那正是这次
+                // 事故的形状：面板全绿、监控一次没响、44 小时。
+                //
+                // 取所有出口里**最好**的结论：还有一个能服务就不该报警，全坏了才是真坏了。
+                let (word, which, h) =
+                    crate::route_endpoints::best_word(&state, m.id, now_secs()).await;
+                // 指名道姓：收到「线路 X 坏了」却发现直连是好的，下一次就没人看告警了。
+                let label = match which {
+                    Some(ep) => format!("{}（出口 {})", m.label, &ep.to_string()[..8]),
+                    None => m.label.clone(),
+                };
+                evaluate_alarm(&state, m.id, &label, word, &h).await;
             }
         }
     });
@@ -912,22 +926,22 @@ mod tests {
             .nth(1)
             .and_then(|s| s.split("\n}\n").next())
             .expect("spawn_stall_recovery 不见了");
-        let stalled_read = format!("{}(m.id, Instant::now())", "route_recently_stalled");
+        let stalled_read = format!("{}(m.health_id(), Instant::now())", "route_recently_stalled");
         assert!(
             body.contains(&format!("if !crate::models::{stalled_read}")),
             "任务没有在每轮前检查记号是否还在 —— 线路恢复后探针不会停",
         );
         assert!(
-            body.contains(&format!("{}(m.id)", "clear_route_stall"))
-                && body.contains(&format!("{}(m.id)", "clear_route_cooldown")),
+            body.contains(&format!("{}(m.health_id())", "clear_route_stall"))
+                && body.contains(&format!("{}(m.health_id())", "clear_route_cooldown")),
             "探通之后没有撤记号/撤冷却，线路回不到排头",
         );
         assert!(
-            body.contains(&format!("{}(m.id)", "mark_route_stall")),
+            body.contains(&format!("{}(m.health_id())", "mark_route_stall")),
             "失败没有续记号 —— 120 秒后记号过期，用户又成了探针",
         );
         assert!(body.contains("canary_enabled()"), "恢复探针花的是真钱，必须受 ROUTE_CANARY 约束");
-        assert!(body.contains("stall_recovery_admit(m.id)"), "没有并发上限");
+        assert!(body.contains("stall_recovery_admit(m.health_id())"), "没有并发上限");
         assert!(
             body.contains("None =>") && !body.contains("None => record_ok"),
             "「无从探起」必须什么都不记",
@@ -940,7 +954,7 @@ mod tests {
         // 派单路径必须真的起它 —— 写好了零调用点是这个仓库反复出现的失败模式。
         let models_src = include_str!("models.rs");
         let stall_site = models_src
-            .split(&format!("{}(candidate.id);", "mark_route_stall"))
+            .split(&format!("{}(candidate.health_id());", "mark_route_stall"))
             .nth(1)
             .expect("派单路径上的 mark_route_stall 不见了");
         let after = &stall_site[..stall_site.len().min(600)];

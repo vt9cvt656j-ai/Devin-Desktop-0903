@@ -27,6 +27,8 @@ export type NavKey =
   | "mail-log"
   | "routing"
   | "routing-groups"
+  | "routing-endpoints"
+  | "routing-icons"
   | "pricing"
   | "commission"
   | "commission-pending"
@@ -89,6 +91,12 @@ export const NAV: (Leaf | Group)[] = [
     children: [
       { key: "routing", label: "线路" },
       { key: "routing-groups", label: "分组" },
+      // 一条线路挂多个上游出口。和「线路」是两件事：那里改的是这条线路是什么、卖多少钱，
+      // 这里改的只是这一次请求从哪个门发出去 —— 换门换不动账单。
+      { key: "routing-endpoints", label: "多路由" },
+      // 后台认得出哪些厂商的一张对照表。放在这里是因为它回答的是线路那两屏上的问题：
+      // 某条线路的图标是灰的，到底是没这家的图，还是判定没认出来。
+      { key: "routing-icons", label: "模型图标" },
     ],
   },
   { key: "pricing", label: "定价试算", icon: Calculator },

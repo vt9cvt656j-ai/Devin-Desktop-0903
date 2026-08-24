@@ -594,6 +594,65 @@ static CHAT_UPSTREAM_ROUTE_COOLDOWNS: LazyLock<Mutex<HashMap<uuid::Uuid, Instant
 /// 等一分钟只换回一条错误。记下来之后同一条线路改用短探测预算：仍然每次都试
 /// （所以上游一恢复就自动恢复，不需要任何人去后台改配置），但失败得起，客户端
 /// 的重试预算还剩得下。
+/// 「这个出口**此刻**满了」——和「它坏了」是两回事，所以不共用冷却表。
+///
+/// # 为什么必须分开
+///
+/// 今天 429 和 502 一起走 `mark_route_cooldown`，同一个 20 秒。可上游在 429 的
+/// `Retry-After` 里明确说了要等多久，常见是 60~120 秒 —— 用 20 秒等于「等三分之一
+/// 就回去再撞一次」，撞回来又是 429，如此往复。而 502 是真的坏了，20 秒重探是对的。
+///
+/// 分开之后：限流的出口按上游说的时长让位，别的对话立刻走下一个出口；
+/// 到期自己回来，不需要任何人去清。
+///
+/// 键是 `health_id()`（出口粒度）——一条线路挂三个出口，只有被打满的那个该让位。
+static ENDPOINT_SATURATED_UNTIL: LazyLock<Mutex<HashMap<uuid::Uuid, Instant>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// 上游没给 `Retry-After` 时按多久算。
+const ENDPOINT_SATURATION_FALLBACK: Duration = Duration::from_secs(30);
+/// 上游说得再长也只信这么久 —— 见过回 3600 的，那会让一个出口消失一小时。
+const ENDPOINT_SATURATION_MAX: Duration = Duration::from_secs(300);
+/// 到期后错峰返回的最大抖动。
+///
+/// 不加这个，T 时刻所有被挤出去的对话会**同时**涌回最便宜那个出口，当场把它再打满，
+/// 然后所有人再一起被挤出去 —— 一个自激振荡。抖动只往后加，绝不提前。
+const ENDPOINT_SATURATION_JITTER: Duration = Duration::from_secs(15);
+
+/// 记一次「满了」。只延长不缩短：两个并发请求先后拿到 90 秒和 30 秒，
+/// 结果必须是 90 秒，否则后到的那个会把让位窗口悄悄缩短。
+pub(crate) fn mark_endpoint_saturated(id: uuid::Uuid, how_long: Duration) {
+    let until = Instant::now() + how_long.min(ENDPOINT_SATURATION_MAX);
+    if let Ok(mut guard) = ENDPOINT_SATURATED_UNTIL.lock() {
+        let e = guard.entry(id).or_insert(until);
+        if until > *e {
+            *e = until;
+        }
+    }
+}
+
+/// 这个出口现在还在让位吗。`jitter` 由调用方按粘性键算，让不同对话错峰回来。
+pub(crate) fn endpoint_saturated(id: uuid::Uuid, now: Instant, jitter: Duration) -> bool {
+    let Ok(mut guard) = ENDPOINT_SATURATED_UNTIL.lock() else {
+        return false;
+    };
+    match guard.get(&id).copied() {
+        Some(until) if now < until + jitter => true,
+        Some(_) => {
+            guard.remove(&id);
+            false
+        }
+        None => false,
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn clear_endpoint_saturation(id: uuid::Uuid) {
+    if let Ok(mut guard) = ENDPOINT_SATURATED_UNTIL.lock() {
+        guard.remove(&id);
+    }
+}
+
 static CHAT_UPSTREAM_ROUTE_STALLS: LazyLock<Mutex<HashMap<uuid::Uuid, Instant>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
@@ -1453,6 +1512,81 @@ pub struct Model {
     /// 这条线路是不是「Claude 强力版」承载线路。IDE 打开强力版开关的那一轮，
     /// 路由只在勾了这个标记的线路里挑。
     pub power_route: bool,
+    /// 这一份是「哪个出口」的克隆。`None` = 线路自带的地址。
+    ///
+    /// 不是数据库列（`#[sqlx(default)]` 取默认值），是 `route_endpoints::expand` 在内存里
+    /// 填的：多路由把一条线路展开成多份，每份只换 `base_url` / `api_key`，其余全部照抄。
+    ///
+    /// **`id` 故意不换。** 它是线路的身份，用量归属（`model_usage.model_id` 有外键指向
+    /// `models`）、计费取价、日志归并全靠它。要换出口的身份的是健康和冷却 —— 那些走
+    /// `health_id()`。
+    #[sqlx(default)]
+    pub endpoint_id: Option<uuid::Uuid>,
+    /// 出口的备注，只进日志，方便一眼看出这一轮走的是哪家转卖。
+    #[sqlx(default)]
+    pub endpoint_label: String,
+    /// 这个出口的进价折扣（0.3 = 三折）。线路自带的地址是 1.0。
+    ///
+    /// **只参与「首选被限流时挑哪个替补」的权重**，一分钱都不进用户账单 ——
+    /// 账单字段全在线路上，见 route_endpoints.rs 开头。
+    #[sqlx(default)]
+    pub endpoint_cost: Option<f64>,
+    /// 这个出口能扛多少（相对值）。None = 运维没填，取池内已填的最小值兜底。
+    #[sqlx(default)]
+    pub endpoint_capacity: Option<f64>,
+}
+
+impl Model {
+    /// 冷却、静音、卡顿、健康记录该记在谁头上。
+    ///
+    /// 必须是**出口**粒度，不是线路粒度：一条线路挂三个上游，其中一个的密钥过期了，
+    /// 记到线路头上会让另外两个好的也跟着被冷却、被排到后面 —— 一个坏出口拖垮整条线路，
+    /// 正好是多路由要解决的问题的反面。
+    ///
+    /// 没有出口时退回线路自己的 id，所以没配多路由的线路行为和以前完全一致。
+    pub fn health_id(&self) -> uuid::Uuid {
+        self.endpoint_id.unwrap_or(self.id)
+    }
+
+    /// 测试用的空线路。只有 `#[cfg(test)]` 编得出来，不会进生产二进制。
+    #[cfg(test)]
+    pub(crate) fn blank() -> Model {
+        Model {
+            id: uuid::Uuid::new_v4(),
+            label: String::new(),
+            provider: String::new(),
+            base_url: String::new(),
+            model_id: None,
+            api_key: String::new(),
+            price_cents: 0,
+            rate: 1.0,
+            input_price: 0.0,
+            output_price: 0.0,
+            cache_read_price: 0.0,
+            cache_create_price: 0.0,
+            cache_disabled: false,
+            description: String::new(),
+            active: true,
+            sort: 0,
+            created_at: chrono::Utc::now(),
+            enabled_models: Vec::new(),
+            group_into: None,
+            billing_mode: "rate".into(),
+            per_call_cents: 0,
+            per_call_micro_usd: 0,
+            model_names: serde_json::json!({}),
+            model_prices: serde_json::json!({}),
+            model_caps: serde_json::json!({}),
+            model_billing: serde_json::json!({}),
+            protocol: "anthropic".into(),
+            effort_passthrough: false,
+            power_route: false,
+            endpoint_id: None,
+            endpoint_label: String::new(),
+            endpoint_cost: None,
+            endpoint_capacity: None,
+        }
+    }
 }
 
 /// 后台按模型手填的能力兜底（contexts 升序去重、最多 5 档；max_output）。
@@ -1688,7 +1822,7 @@ fn ide_request_id(headers: &HeaderMap) -> ApiResult<Option<String>> {
 }
 
 /// 落库加密的 context（= 列身份，绑进 AAD）。见 field_crypto.rs。
-const MODEL_KEY_CTX: &str = "models.api_key";
+pub(crate) const MODEL_KEY_CTX: &str = "models.api_key";
 
 /// 取出一条线路的上游 api_key 明文。存的是密文（`fc1:...`）或遗留明文，这里统一解开。
 ///
@@ -3131,6 +3265,13 @@ pub async fn list_for_client(State(state): State<AppState>) -> ApiResult<Json<se
                 // 写死意味着每换一次默认都要发一版桌面端。
                 "default": !default_model_id.is_empty() && mid == default_model_id,
                 "provider": m.provider,
+                // 这一款是哪家的，给 IDE 挑品牌图标用。
+                //
+                // 判定放服务端而不是让客户端按模型名猜：客户端那份 `brandOf` 是十条硬编码
+                // 正则，加一家就要发一版桌面端，而这里加一行第二天就生效。
+                // 只回一个短标识（"anthropic" / "deepseek"），**不含 base_url** ——
+                // 它只是被读来做判断，一个字符都不会出现在响应里。
+                "vendor": crate::route_endpoints::vendor_of(&m.provider, &[mid.clone()], &m.base_url),
                 "model_id": mid.clone(),
                 "name": name,
                 "price_cents": m.price_cents,
@@ -8090,6 +8231,21 @@ pub async fn chat_completions(
     // 就会自动改走其它线路" —— 那些线路他一条都够不着：重发会原样再收窄一次，结果一模一样。
     // 给一个结构上不可能成立的建议，比不给建议更糟，用户会一直重发。
     // route_goes_to_the_back 里 `route_count > 1`（只剩一条时谁都不往后排）同理。
+    // 多路由：把每条线路展开成它实际可以走的几个出口（线路自带的地址 + 运维挂的转卖），
+    // 便宜且测过能用的排前面。见 route_endpoints.rs。
+    //
+    // 就地展开而不是另起一个列表，是为了让下游每一处都自动按出口计：往后排的判据
+    // （`route_goes_to_the_back`）、失败提示里那句「同模型另有 N 条没试过」、以及日志。
+    // 没配多路由的线路展开成一份、就是它自己，所以这一行对现有配置是恒等变换。
+    //
+    // 位置在免费池收窄**之后**：先决定用哪些线路，再决定每条线路走哪个门。
+    let endpoint_map =
+        crate::route_endpoints::load_for_routes(&state.db, &candidates.iter().map(|c| c.id).collect::<Vec<_>>())
+            .await;
+    if !endpoint_map.is_empty() {
+        candidates = crate::route_endpoints::expand(&candidates, &endpoint_map, &model_id);
+    }
+
     let route_count = candidates.len();
 
     // The gate above only proves the balance is positive, not that it covers this
@@ -8368,6 +8524,79 @@ pub async fn chat_completions(
         // a thinking model.
         let route_budget = route_budget_for_headers(&headers, deep_thinking);
         let route_deadline = now + route_budget;
+        // ── 谁先试：最便宜的优先，除非它此刻被限流 ──────────────────────────
+        //
+        // 默认路径**一字不变**：没有出口在让位时，头一个仍然是 expand 排出来的那个
+        // （能用的在前、便宜的在前）。这是刻意的 —— 主动分散在成本上从不占优：
+        // 429 不消耗 token，而进价折扣是每一次调用都复现的真金。
+        //
+        // 只有首选**正在让位**（刚吃过 429，还在上游给的 Retry-After 窗口里）时，
+        // 这一段对话才需要挑一个替补。挑法是按粘性键做加权 rendezvous：
+        //   · 同一个用户每次挑到同一个替补 → 上游那份提示词缓存不会每轮重来；
+        //   · 不同用户挑到不同替补 → 替补不会立刻变成下一个热点。
+        //
+        // 让位的出口不是被排除，只是排到后面：全都在让位时照样发第一个，
+        // 绝不因为「都满了」就不发请求。
+        let sticky = crate::route_endpoints::sticky_key(
+            &uid,
+            &[
+                headers.get("x-ide-run-id").and_then(|v| v.to_str().ok()),
+            ],
+            state.cfg.jwt_secret.as_bytes(),
+        );
+        // 错峰只往后加：到期时刻一到就全体涌回最便宜那个，会当场把它再打满。
+        let jitter_for = |id: uuid::Uuid| -> Duration {
+            let mut h = <sha2::Sha256 as sha2::Digest>::new();
+            sha2::Digest::update(&mut h, sticky);
+            sha2::Digest::update(&mut h, id.as_bytes());
+            let d: [u8; 32] = sha2::Digest::finalize(h).into();
+            let ms = u64::from_be_bytes(d[..8].try_into().unwrap())
+                % (ENDPOINT_SATURATION_JITTER.as_millis() as u64).max(1);
+            Duration::from_millis(ms)
+        };
+        let free: Vec<&Model> = candidates
+            .iter()
+            .filter(|c| !endpoint_saturated(c.health_id(), now, jitter_for(c.health_id())))
+            .collect();
+        let held: Vec<&Model> = candidates
+            .iter()
+            .filter(|c| endpoint_saturated(c.health_id(), now, jitter_for(c.health_id())))
+            .collect();
+        let candidates: Vec<Model> = if free.is_empty() {
+            // 全部在让位：保持原序照常发。真正的等待交给 429 排队那一支。
+            candidates.clone()
+        } else if std::ptr::eq(free[0], &candidates[0]) {
+            // 首选没让位 → 今天的行为，逐字不变。
+            candidates.clone()
+        } else {
+            // 没填容量的按池内已填的最小值兜底 —— 不补的话，「填了 600」和「没填按 1」
+            // 会差六百倍，等于运维只是没填就把那个出口关掉了。
+            let caps = crate::route_endpoints::fill_capacities(
+                &free.iter().map(|c| c.endpoint_capacity).collect::<Vec<_>>(),
+            );
+            let pool: Vec<(uuid::Uuid, f64, f64)> = free
+                .iter()
+                .zip(caps)
+                .map(|(c, cap)| (c.health_id(), c.endpoint_cost.unwrap_or(1.0), cap))
+                .collect();
+            let pick = crate::route_endpoints::hrw_pick(&sticky, &pool).unwrap_or(0);
+            tracing::info!(
+                model = %model_id,
+                picked = %free[pick].health_id(),
+                free = free.len(),
+                held = held.len(),
+                "首选出口正在让位（上游限流），本段对话改走替补"
+            );
+            std::iter::once(free[pick].clone())
+                .chain(free.iter().enumerate().filter(|(i, _)| *i != pick).map(|(_, c)| (*c).clone()))
+                .chain(held.iter().map(|c| (*c).clone()))
+                .collect()
+        };
+        // 这一次请求里，除了当前这条之外还有没有没在让位的出口。
+        // 一个都没有时，429 才该退回「按 Retry-After 原地排队」——否则那条分支
+        // 在挂了第二个出口之后**结构上永远不触发**（旧判据是 route_count <= 1）。
+        let no_unsaturated_alternative = free.len() <= 1;
+
         let mut ordered_candidates: Vec<&Model> = Vec::with_capacity(candidates.len());
         let mut cooled_candidates: Vec<&Model> = Vec::new();
         // 这一轮到底要不要思考。只有要思考时，「会吞思考的线路」才算缺点——
@@ -8378,12 +8607,12 @@ pub async fn chat_completions(
             .and_then(|t| t.as_str())
             .is_some_and(|t| t != "disabled");
         for candidate in &candidates {
-            let cooled = route_cooldown_remaining(candidate.id, now).is_some();
+            let cooled = route_cooldown_remaining(candidate.health_id(), now).is_some();
             // 要了思考却一个字都不回的线路：有别的同模型线路可走时排到后面。
             // 和冷却一样只是**重排**，不是排除——到期自动再探，上游恢复了就自己回来。
             let mutes = wants_thinking && route_mutes_thinking(candidate.id, now);
             // 最近卡满过表头预算的线路同理：停机期间别让每条消息都先在它上面垫 25 秒。
-            let stalled = route_recently_stalled(candidate.id, now);
+            let stalled = route_recently_stalled(candidate.health_id(), now);
             if route_goes_to_the_back(route_count, cooled, mutes, stalled) {
                 if stalled {
                     tracing::info!(
@@ -8656,7 +8885,7 @@ pub async fn chat_completions(
                                     "upstream response headers received"
                                 );
                                 // 这条线路又能回话了 —— 撤掉短探测预算，下一次拿回完整耐心。
-                                clear_route_stall(candidate.id);
+                                clear_route_stall(candidate.health_id());
                             }
                             Err(error) => tracing::warn!(
                                 request_id = request_id.as_deref().unwrap_or(""),
@@ -8689,10 +8918,10 @@ pub async fn chat_completions(
                             gateway_request_elapsed_ms = gateway_request_started_at.elapsed().as_millis(),
                             "upstream stalled before response headers"
                         );
-                        mark_route_stall(candidate.id);
+                        mark_route_stall(candidate.health_id());
                         // 卡满整段预算才失败，是最该被面板看见的一种坏 —— 这次事故那条线
                         // 44 小时全是这个形状。
-                        route_health::spawn_fail(&state, candidate.id, 504);
+                        route_health::spawn_fail(&state, candidate.health_id(), 504);
                         // 恢复判定交给后台 1-token 探针，不再由下一个用户的真实请求付费。
                         route_health::spawn_stall_recovery(&state, candidate.clone());
                         route_failed_transient = true;
@@ -8704,7 +8933,7 @@ pub async fn chat_completions(
                         // 真实流量的健康信号。口径是「接得通、认得凭据、开始回话」，
                         // 不是「这一轮流式完整结束」—— 流中途断掉在 agentic IDE 里多半是
                         // 用户按了停止，算成线路故障会把好线路刷红、然后告警被静音。
-                        route_health::spawn_ok(&state, candidate.id);
+                        route_health::spawn_ok(&state, candidate.health_id());
                         success = Some(r);
                         selected_conn = Some(candidate.clone());
                         break 'routes;
@@ -8722,7 +8951,24 @@ pub async fn chat_completions(
                                     .map(str::to_owned)
                             })
                             .flatten();
-                        route_health::spawn_fail(&state, candidate.id, err_status);
+                        route_health::spawn_fail(&state, candidate.health_id(), err_status);
+                        if err_status == 429 {
+                            // 上游自己说了要等多久，就等多久 —— 别再拿一个拍脑袋的
+                            // 20 秒去猜。记在**出口**上：一条线路挂三个出口，
+                            // 只有被打满的那个该让位。
+                            let d = retry_after_header
+                                .as_deref()
+                                .and_then(|v| parse_retry_after(v, chrono::Utc::now()))
+                                .unwrap_or(ENDPOINT_SATURATION_FALLBACK);
+                            mark_endpoint_saturated(candidate.health_id(), d);
+                            // 再落一份到 Redis：发版后新进程要能承接，否则它会把流量
+                            // 直接铺回一个还在限流窗口里的出口。火后不管，不阻塞本请求。
+                            crate::route_endpoints::persist_saturation(
+                                &state,
+                                candidate.health_id(),
+                                d.min(ENDPOINT_SATURATION_MAX),
+                            );
+                        }
                         let error_body_wait = route_deadline
                             .saturating_duration_since(Instant::now())
                             .min(MAX_ERROR_BODY_WAIT);
@@ -8794,7 +9040,7 @@ pub async fn chat_completions(
                         // 卡死 / 发送出错（上游可能已收下 body、可能在跑）仍然一次都不重发，
                         // 那两道闸在超时分支和 Err 分支里，原样没动。
                         if err_status == 429
-                            && route_count <= 1
+                            && no_unsaturated_alternative
                             && rate_limit_retries < RATE_LIMIT_QUEUE_MAX_RETRIES
                         {
                             let parsed = retry_after_header
@@ -8845,7 +9091,7 @@ pub async fn chat_completions(
                     Err(e) => {
                         err_status = 502;
                         err_low = e.to_string().to_lowercase();
-                        route_health::spawn_fail(&state, candidate.id, 502);
+                        route_health::spawn_fail(&state, candidate.health_id(), 502);
                         if attempt + 1 >= candidate_max_attempts {
                             route_failed_transient = true;
                             break;
@@ -8865,7 +9111,7 @@ pub async fn chat_completions(
             if route_failed_persistent {
                 // 坏 key 不会在 20 秒内变好，冷却时间要长得多，避免它反复回到轮换里
                 // 又反复 401。到期后会被再探一次；一旦运维在后台把 key 修好，它自然回归。
-                mark_route_cooldown_auth(candidate.id);
+                mark_route_cooldown_auth(candidate.health_id());
                 tracing::warn!(
                     model = %model_name,
                     provider = %candidate.provider,
@@ -8873,8 +9119,11 @@ pub async fn chat_completions(
                     "上游鉴权失败（key 无效/未授权），已冷却这条线路，后续请求改走其它同模型线路"
                 );
             }
-            if route_failed_transient {
-                mark_route_cooldown(candidate.id);
+            // 429 不进冷却。「此刻满了」已经按上游给的 Retry-After 记在饱和表里了，
+            // 再叠一个 20 秒冷却只会让两套时长互相打架：冷却先到期，流量回去，
+            // 撞上还没结束的限流窗口，再吃一个 429。
+            if route_failed_transient && err_status != 429 {
+                mark_route_cooldown(candidate.health_id());
                 tracing::warn!(
                     model = %model_name,
                     provider = %candidate.provider,
@@ -10409,19 +10658,30 @@ mod billing_tests {
         let at = prod
             .find("rate_limit_queue_delay(parsed")
             .expect("429 排队分支没了");
-        // 按字符往回取窗口（不许按字节切中文源码），窗口给足以覆盖整段分支头。
-        let head: String = prod[..at].chars().rev().take(1500).collect::<Vec<_>>().iter().rev().collect();
+        // 按**分支边界**切，不用固定字符窗口：窗口是定长的，在分支里加几行代码就会把
+        // 判据挤出窗外——那时断言变绿而不是变红，这仓库踩过这个坑。
+        let head_at = prod[..at]
+            .rfind("if err_status == 429")
+            .expect("排队只许发生在完整的 429 响应上：找不到那道判据");
+        let head = &prod[head_at..at];
         assert!(
-            head.contains("err_status == 429"),
-            "排队只许发生在完整的 429 响应上"
-        );
-        assert!(
-            head.contains("route_count <= 1"),
-            "多线路必须走既有换线逻辑，不许排队"
+            head.contains("no_unsaturated_alternative"),
+            "排队的前提被改了。它必须是「这一次请求里再没有别的没在让位的出口」——\
+             旧判据 route_count <= 1 在挂了第二个出口之后**结构上永远不成立**，\
+             等于把「按 Retry-After 排队」这条能力悄悄关掉了"
         );
         assert!(
             head.contains("rate_limit_retries < RATE_LIMIT_QUEUE_MAX_RETRIES"),
             "重试次数上限被拆掉了"
+        );
+        // 还有别的出口能用时绝不排队 —— 换一个出口比干等快得多。
+        let decl = prod
+            .find("let no_unsaturated_alternative")
+            .expect("no_unsaturated_alternative 不见了");
+        let decl_line: String = prod[decl..].lines().next().unwrap_or("").to_string();
+        assert!(
+            decl_line.contains("free.len() <= 1"),
+            "「还有没有别的可用出口」的算法被改了：{decl_line}"
         );
     }
 
@@ -16306,7 +16566,12 @@ mod stall_routing_tests {
     #[test]
     fn dispatch_ordering_reads_the_stall_mark() {
         let src = include_str!("models.rs");
-        let read = format!("let stalled = {}(candidate.id, now);", "route_recently_stalled");
+        // 出口粒度：一条线路挂多个上游时，卡死记号记在**那个出口**头上 ——
+        // 记到线路头上，一个卡死的转卖会把同线路其它好出口一起降权。
+        let read = format!(
+            "let stalled = {}(candidate.health_id(), now);",
+            "route_recently_stalled"
+        );
         assert!(src.contains(&read), "排序没有读卡死记号 —— 记了也白记，用户照样先撞死线路");
         let judge = format!("if {}(route_count, cooled, mutes, stalled) {{", "route_goes_to_the_back");
         assert!(src.contains(&judge), "排序没有把卡死记号喂进判据");
@@ -17285,6 +17550,85 @@ mod audit_20260822_tests {
     /// 订阅额度一分没动，等于为套餐内的用量再付一次现金。
     ///
     /// 断的是连接：付费分支里有没有统一准入，以及 use_quota 有没有跟着 quota_ok 走。
+    /// 公开模型表带得出「这是哪家的」，但一个字节的连接信息都不能出去。
+    ///
+    /// `vendor_of` 会**读** base_url 来判断厂商（openrouter.ai → openrouter），所以这一处
+    /// 最容易顺手把 base_url 也塞进响应里 —— 而 `/api/models` 是匿名可读的，漏出去的是
+    /// 上游中转商是谁，以及一条可以直接拿去撞密钥的地址。
+    /// 没有出口在让位时，选路必须**逐字**回到今天的行为。
+    ///
+    /// 这是防「不小心开始分散」的主闸。主动分散在成本上从不占优：429 不消耗 token，
+    /// 而进价折扣是每次调用都复现的真金 —— 在最便宜的出口还有余量时把流量送给贵的，
+    /// 是纯亏。分散只该是**被限流逼出来的**，不是默认策略。
+    #[test]
+    fn 没人限流时头一个仍然是最便宜的那个() {
+        let body = fn_body(&gateway_code(), "pub async fn chat_completions(");
+        assert!(
+            body.contains("} else if std::ptr::eq(free[0], &candidates[0]) {"),
+            "「首选没让位就原样走」这一支不见了 —— 会开始无条件分散"
+        );
+        // 全部让位时也必须照发，绝不能因为「都满了」就不发请求。
+        assert!(
+            body.contains("if free.is_empty() {"),
+            "全部让位时没有兜底分支：请求会被打死，而正确行为是照发第一个、由排队分支等"
+        );
+    }
+
+    /// 「此刻满了」和「它坏了」必须是两套状态。
+    ///
+    /// 合成一套的代价是实打实的：上游在 Retry-After 里说等 120 秒，冷却却只有 20 秒，
+    /// 流量 20 秒后回去再吃一个 429，如此往复 —— 而每一次往复用户都多等一个来回。
+    #[test]
+    fn 限流写饱和而不是冷却() {
+        let body = fn_body(&gateway_code(), "pub async fn chat_completions(");
+        assert!(
+            body.contains("mark_endpoint_saturated(candidate.health_id(), d)"),
+            "429 不再按上游给的 Retry-After 记让位时长了"
+        );
+        assert!(
+            body.contains("parse_retry_after(v, chrono::Utc::now())"),
+            "不再读上游的 Retry-After —— 又回到拿一个拍脑袋的时长去猜"
+        );
+        assert!(
+            body.contains("if route_failed_transient && err_status != 429 {"),
+            "429 又落进 20 秒冷却了：两套时长会互相打架，冷却先到期把流量放回限流窗口里"
+        );
+    }
+
+    /// 让位是出口粒度的。
+    ///
+    /// 记到线路头上，一条线路挂三个出口时，其中一个被打满会让另外两个好的一起让位 ——
+    /// 正好是多路由要解决的问题的反面。
+    #[test]
+    fn 让位记在出口上而不是线路上() {
+        let body = fn_body(&gateway_code(), "pub async fn chat_completions(");
+        for call in [
+            "mark_endpoint_saturated(candidate.health_id()",
+            "endpoint_saturated(c.health_id()",
+        ] {
+            assert!(body.contains(call), "{call} 不再按出口记");
+        }
+        assert!(
+            !body.contains("mark_endpoint_saturated(candidate.id"),
+            "让位记到线路 id 上了：一个出口被打满会拖累同线路其它好出口"
+        );
+    }
+
+    #[test]
+    fn 公开模型表带厂商但不带连接信息() {
+        let body = fn_body(&gateway_code(), "pub async fn list_for_client(");
+        assert!(
+            body.contains("\"vendor\": crate::route_endpoints::vendor_of("),
+            "不再下发厂商了 —— IDE 会退回它自己那十条硬编码正则，加一家就得发一版桌面端"
+        );
+        for leak in ["\"base_url\"", "\"api_key\"", "\"apiKey\""] {
+            assert!(
+                !body.contains(leak),
+                "公开模型表里出现了 {leak} —— 这条接口没有任何鉴权"
+            );
+        }
+    }
+
     #[test]
     fn 旧chat接口的付费分支必须走统一准入并按放行池结算() {
         let body = fn_body(&gateway_code(), "pub async fn chat(");
@@ -17655,6 +17999,84 @@ mod audit_20260822_tests {
             count > narrow,
             "route_count 又取在收窄之前了：只有免费池能付的用户会被告知「另有线路没试过，\
              重发就会换线」，而那条线路他结构上够不着",
+        );
+    }
+
+    /// 多路由：出口粒度的记号，**读和写必须用同一个身份**。
+    ///
+    /// 这是加多路由时最容易静默坏掉的地方，而且坏了不报错。
+    ///
+    /// 冷却、卡顿、健康问的是「这个出口好不好」，所以读写两端都走
+    /// `candidate.health_id()`。思考静音和思考钳位不一样：它们的写入点在流式任务里，
+    /// 用的是 `cid` —— 而 `cid` 同时是计费归属（`bill(..., cid, ...)`，`model_usage.model_id`
+    /// 有外键指向 `models`），所以它只能是线路 id，读取端也就必须留在 `candidate.id`。
+    ///
+    /// 任一侧单独改掉，代码照样编译、面板照样正常，只是那个记号**永远读不到自己写的值**：
+    /// 冷却形同虚设、卡顿不再降权。没有别的测试会发现。
+    #[test]
+    fn 出口粒度的记号读写必须成对() {
+        let body = fn_body(&gateway_code(), "pub async fn chat_completions(");
+        for call in [
+            "route_cooldown_remaining(candidate.health_id()",
+            "route_recently_stalled(candidate.health_id()",
+            "mark_route_stall(candidate.health_id())",
+            "clear_route_stall(candidate.health_id())",
+            "mark_route_cooldown(candidate.health_id())",
+            "mark_route_cooldown_auth(candidate.health_id())",
+        ] {
+            assert!(
+                body.contains(call),
+                "{call} 不再按出口记：一个坏出口会把同一条线路上其它好出口一起冷却/降权，\
+                 正好是多路由要解决的问题的反面",
+            );
+        }
+        assert!(
+            !body.contains("spawn_fail(&state, candidate.id")
+                && !body.contains("spawn_ok(&state, candidate.id"),
+            "健康又按线路记了：后台自动探测靠「这个出口最近成功过没有」跳过探测，\
+             记到线路头上会让它对所有出口一起跳过",
+        );
+        assert!(
+            body.contains("route_mutes_thinking(candidate.id, now)")
+                && body.contains("thinking_clip_active(candidate.id)"),
+            "思考静音/钳位的读取端改成出口了，而写入端是 cid（线路 id，因为它同时是计费归属）\
+             —— 读写不成对，这两个降权从此永远不生效",
+        );
+        assert!(
+            body.contains("mark_thinking_mute(cid)") && body.contains("mark_thinking_clip(cid)"),
+            "写入端不再是 cid 了，上面那条配对判断的前提没了",
+        );
+    }
+
+    /// 展开出口要在**数条数之前**。
+    ///
+    /// `route_count` 喂两处：往后排的判据，以及失败时那句「同模型另有 N 条没试过，
+    /// 重发一次就会换线」。数在展开之前，挂了五个出口也会报 1，于是那句正确的建议
+    /// 不会出现 —— 用户被告知没有别的路可走，而实际上有四条。
+    #[test]
+    fn 多路由展开在数条数之前() {
+        let body = fn_body(&gateway_code(), "pub async fn chat_completions(");
+        let expand = body
+            .find("route_endpoints::expand(")
+            .expect("多路由展开不见了");
+        let count = body
+            .find("let route_count = candidates.len();")
+            .expect("route_count 不见了");
+        assert!(expand < count, "出口展开跑到数条数后面去了");
+    }
+
+    /// 换出口换不动账单。
+    ///
+    /// 用量归属绑的是线路 id。要是有人图省事把 `cid` 改成出口 id，
+    /// `model_usage.model_id` 就会写进一个 `models` 里不存在的值 —— 那一列走的是子查询，
+    /// 不会撞外键报错，只会**静默记成 NULL**：这个用户的这笔用量从此不属于任何线路，
+    /// 毛利、排行、对账全部少一块，而没有任何地方会报错。
+    #[test]
+    fn 计费归属不跟着出口走() {
+        let body = fn_body(&gateway_code(), "pub async fn chat_completions(");
+        assert!(
+            body.contains("let cid = conn.id;"),
+            "计费归属改成出口了 —— 用量会静默记成 NULL",
         );
     }
 
