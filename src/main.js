@@ -41462,6 +41462,112 @@ function _ambiguousFailureInWrite(text, maxItems = 3, path = "") {
   return out;
 }
 
+/*
+ * 「这里得说一句为什么」——写代码时当场点名，不是事后念叨。
+ *
+ * 用户说的是「AI 写代码不怎么写注释」。但「注释不够」这个笼统判据**量下来不成立**：
+ * 拿这个仓库 21.2 万行真代码跑，「长函数零注释」每 437 行一处、「空 catch 无注释」每
+ * 230 行一处、「魔法数字无注释」每 495 行一处——那种提醒每写一个文件就跳七八次，
+ * 三天之后没人会再看它。大量零注释的短函数本来就是对的。
+ *
+ * 真正该有注释的是**读的人会问「为什么」的那几个点**。收紧成四条，逐条量过：
+ *   · 会改变结果的操作被空 catch 吞掉、且一个字都没解释   每 15,158 行一处
+ *   · 抑制类指令（@ts-ignore / #[allow] / eslint-disable）没写理由  每 26,527 行一处
+ *   · 具名的上限/超时常量没解释（REQUEST_TIMEOUT_MS = 20000 —— 为什么是 20 秒？）
+ *                                                          每 3,723 行一处
+ *   · 文件超过 60 行、全文一条注释都没有   **146 个文件里 0 处** —— 这条就是这个仓库
+ *     的标准本身，它只会在别人破坏这个标准时才响。
+ * 被否掉的几条也记在这儿，免得下次有人再想一遍：长函数零注释 / 裸魔法数字 / 裸空 catch
+ * / 正则无注释 / 导出函数无说明，密度 230–1829 行一处，全部不合格。
+ *
+ * 措辞一律要「为什么」而不是「是什么」——`// 把 i 加一` 这种注释比没有更糟。
+ */
+function _missingWhyInWrite(text, path = "", maxItems = 4) {
+  const src = String(text || "");
+  if (!src) return [];
+  const { code, comments } = _splitCodeAndComments(src, path);
+  const lines = src.split("\n");
+  const out = [];
+  // `self` = 这一行自己的注释算不算解释。抑制类指令本身就写在注释里
+  // （// @ts-ignore），它自己当然不能算成"已经解释过了"。
+  const hasNote = (i, self = true) => {
+    if (self && comments[i] && comments[i].trim()) return true;
+    // 往上找三行：空行跳过，紧邻的注释才算解释。
+    for (let k = 1; k <= 3 && i - k >= 0; k++) {
+      if (!lines[i - k].trim()) continue;
+      if (comments[i - k] && comments[i - k].trim()) return true;
+      if (k > 1) break;
+    }
+    return false;
+  };
+
+  // ── ① 整份文件一条注释都没有 ──────────────────────────────────────
+  const codeLineCount = code.filter((l) => l.trim()).length;
+  if (codeLineCount > 60 && !comments.some((c) => c && c.trim())) {
+    out.push({
+      line: 1, kind: "整份文件零注释",
+      text: (lines.find((l) => l.trim()) || "").trim().slice(0, 80),
+      ask: "在开头写两三行：这个文件解决什么问题、它在整体里是哪一环、有什么不显然的取舍。"
+        + "**146 个真实文件里没有一个超过 60 行还一条注释都没有的**——这不是风格偏好，是接手的人能不能上手的分界线。",
+    });
+  }
+
+  const EFFECTFUL = /\b(?:await\s+)?(?:[\w.]*\.)?(?:writeFile|writeTextFile|writeFileSync|writeTextFileIfUnchanged|appendFile|copyFile|rename|unlink|fetch|axios|got|execSync|execFile|spawnSync|commit|rollback)\s*\(/;
+  const SUPPRESS = /@ts-ignore|@ts-expect-error|eslint-disable|#\[allow\(|# noqa|# type:\s*ignore|@SuppressWarnings/;
+  const NAMED_LIMIT = /(?:const|let|static|pub const|final)\s+([A-Za-z_$][\w$]*(?:MS|_MS|Ms|LIMIT|CAP|MAX|TIMEOUT|RETRIES|RETRY|THRESHOLD|BUDGET|INTERVAL|DELAY|SIZE|BYTES)[\w$]*)\s*(?::[^=]+)?=\s*(\d{2,})/;
+
+  for (let i = 0; i < code.length && out.length < maxItems; i++) {
+    const c = code[i];
+    // 纯注释行也要过一遍：抑制类指令（// @ts-ignore）住在注释里。
+    if (!c.trim() && !SUPPRESS.test(comments[i] || "")) continue;
+
+    // ── ② 会改变结果的操作被完全吞掉，而没有一个字说为什么可以吞 ──
+    if (/\bcatch\s*(?:\([^)]*\))?\s*\{\s*\}/.test(c) || /\bexcept[^:]*:\s*pass\s*$/.test(c)) {
+      const win = code.slice(Math.max(0, i - 3), i + 1).join("\n");
+      if (EFFECTFUL.test(win) && !hasNote(i)) {
+        out.push({
+          line: i + 1, kind: "静默吞掉一次真实操作", text: lines[i].trim().slice(0, 80),
+          ask: "这里被吞掉的是一次真实的写入/请求/进程调用——失败了就意味着**该发生的事没发生**，"
+            + "而调用方什么都不知道。要么把失败往上报，要么用一句话写清楚为什么这里可以吞"
+            + "（是幂等的？别处补偿过？失败无所谓？）。半年后出事时，这一句就是唯一的线索。",
+        });
+        continue;
+      }
+    }
+
+    // ── ③ 抑制类指令没写理由 ──
+    //
+    // 这一条要**同时看注释和代码**：JS/TS 的 `// @ts-ignore`、`// eslint-disable-next-line`
+    // 本身就是注释（底座会把它剥进 comments），Rust 的 `#[allow(...)]` 才是代码。
+    // 只看代码的话这条规则对 JS 永远不触发——第一版就是这么写的，测试当场抓到。
+    const directive = SUPPRESS.exec(comments[i] || "") || SUPPRESS.exec(c);
+    if (directive) {
+      // 同一行写了理由也算解释：`eslint-disable-next-line no-x -- 上游类型定义漏了`。
+      const rest = String(comments[i] || c).slice(directive.index + directive[0].length);
+      const sameLineReason = /[^\s)\],;:]{4,}/.test(rest.replace(/^[\s)\],;:-]+/, ""));
+      if (!sameLineReason && !hasNote(i, false)) {
+        out.push({
+          line: i + 1, kind: "抑制了检查却没说为什么", text: lines[i].trim().slice(0, 80),
+          ask: "抑制一条检查等于把一个已知风险按下不表。写清楚为什么这里是安全的、以及什么条件下"
+            + "这条抑制该被撤掉——不写的话，下一个人只能在「删了会不会炸」和「留着会不会掩盖 bug」之间猜。",
+        });
+      }
+      continue;
+    }
+
+    // ── ④ 具名的上限/超时常量没解释 ──
+    const m = NAMED_LIMIT.exec(c);
+    if (m && !hasNote(i)) {
+      out.push({
+        line: i + 1, kind: "这个数字是怎么定的", text: `${m[1]} = ${m[2]}`,
+        ask: `${m[1]} 为什么是 ${m[2]}？是实测出来的、上游的硬限制、还是先拍一个？`
+          + "不写的话它就变成一个没人敢动的数——出问题时不知道能不能调，不出问题时也不知道还有没有余量。",
+      });
+    }
+  }
+  return out;
+}
+
 // 把上面那些做成挂在**这一次写入**上的一段话。没有命中就一个字都不发。
 function _sinkRiskAdvice(call) {
   // 名字是历史的：最早这里只有「危险汇聚点」。现在它是**这一次写入的质量提醒**的唯一
@@ -41475,6 +41581,12 @@ function _sinkRiskAdvice(call) {
   if (risks.length) {
     out += "\n\n⚠ 这次写入碰到了危险汇聚点，趁还在这一步先堵上（下面每条都指到了行号和原文，不是泛泛提醒）：\n"
       + risks.map((r) => `· ${path}:${r.line} ${r.kind} — \`${r.text}\`\n  ${r.ask}`).join("\n");
+  }
+
+  const why = _missingWhyInWrite(body, call?.path || "");
+  if (why.length) {
+    out += "\n\n✍ 这几处半年后没人看得懂为什么，趁现在补一句（要写**为什么**，不是写代码在干嘛）：\n"
+      + why.map((w) => `· ${path}:${w.line} ${w.kind} — \`${w.text}\`\n  ${w.ask}`).join("\n");
   }
 
   const amb = _ambiguousFailureInWrite(body, 3, call?.path || "");
@@ -41608,6 +41720,101 @@ function _stubDeliveryFindings(run, maxItems = 8) {
 // 这里给的是判据不是劝告：file:line + 那一行原文，命中 .env 里已有的 key 名时把
 // 配置项名字一并点出（envKey 由 _envKeysByRoot 提供，只有名字、值从不缓存）。
 const _envKeysByRoot = new Map(); // root -> [".env 里的 key 名"]（值绝不入内存缓存）
+/*
+ * 旧注释：紧邻的代码改了，这句话还写着旧的。
+ *
+ * 用户的原话：「有的还会用旧注释让 IDE 发现不了问题。」在这个仓库里做了一轮专门取样，
+ * 复核站得住 20 条。最典型的一条：常量从 128 抬到 256，四行之外那句「仍远低于
+ * 128 / 512 KiB 的总窗口」没跟着改——而同一文件另一处写的是 256，两处自相矛盾。
+ * 照旧的那句去理解，会回头排查一道早已不存在的闸。
+ *
+ * 判据必须是**局部**的。第一版按「这个记号从整份文件的代码里消失了」判，拿那次真实提交
+ * （7690ef5，128→256 就是它干的）一跑：0 命中。原因很直白——`128` 在一个 5 MB 的文件里
+ * 别处当然还有。所以改成看**注释周围那十几行**：这句话旁边的代码里，它提到的那个值/名字
+ * 变了，而它一个字没动。
+ *
+ * 四个必要条件，缺一不可（每一条都是标定时逼出来的）：
+ *   ① 形态够像代码：下划线开头、全大写常量名、或 ≥2 位数字。普通 CamelCase 英文词不认——
+ *      第一版认，于是 `Notification` / `Response` / `Items` 这些散文词全成了误报。
+ *   ② 在改前那段局部代码里是**被声明或被赋值**出来的，不是路过一次的字面量。
+ *   ③ 改后同一段局部代码里**没有**它了。
+ *   ④ 这条注释本身一个字没动（改前也是原样）；讲历史的（「原来 / 曾经 / was」）豁免——
+ *      这个仓库大量注释是事故复盘，记录旧值正是它们的用途。
+ *
+ * 标定：最近 60 个提交里的 134 次真实代码改动，误报 0；同时抓得住 7690ef5 那次真实漂移。
+ */
+function _staleCommentFindings(run, maxItems = 4) {
+  const cp = run?.checkpoint;
+  if (!cp || typeof cp.forEach !== "function") return [];
+  const HISTORY = /原来|以前|曾经|旧的|旧值|改成|之前是|历史|was\s|used\s+to|previously|formerly|no\s+longer|不再/i;
+  const NEAR = 12;
+  const TOK = /(?:\b\d[\d_]{1,}\b)|(?:\b[A-Za-z_$][\w$]{3,}\b)/g;
+  const CODEY = (t) => /^_/.test(t) || /^[A-Z][A-Z0-9_]{3,}$/.test(t) || /^\d[\d_]+$/.test(t);
+  const tokensOf = (text) => {
+    const set = new Set();
+    for (const m of String(text).matchAll(TOK)) set.add(m[0]);
+    return set;
+  };
+  const out = [];
+  cp.forEach((snap, absPath) => {
+    if (out.length >= maxItems) return;
+    const before = String(snap?.content || "");
+    const after = String(snap?.current || "");
+    if (!before || !after || before === after) return;
+    if (!_CODE_FILE_RE.test(String(absPath))) return;
+
+    const b = _splitCodeAndComments(before, String(absPath));
+    const a = _splitCodeAndComments(after, String(absPath));
+
+    // 改前的注释原文 → 它在改前的行号（用来把局部窗口对齐到改动之前的位置）。
+    const beforeAt = new Map();
+    for (let j = 0; j < b.comments.length; j++) {
+      const t = (b.comments[j] || "").trim();
+      if (t && !beforeAt.has(t)) beforeAt.set(t, j);
+    }
+    // 这一轮真正改动过的行（按行做集合差就够，只是用来划「附近」）。
+    const beforeCodeLines = new Set(b.code.map((l) => l.trim()).filter(Boolean));
+    const touched = [];
+    for (let i = 0; i < a.code.length; i++) {
+      const t = a.code[i].trim();
+      if (t && !beforeCodeLines.has(t)) touched.push(i);
+    }
+    if (!touched.length) return;
+    const touchedSet = new Set(touched);
+    const nearTouched = (i) => {
+      for (let k = -NEAR; k <= NEAR; k++) if (touchedSet.has(i + k)) return true;
+      return false;
+    };
+
+    for (let i = 0; i < a.comments.length && out.length < maxItems; i++) {
+      const note = (a.comments[i] || "").trim();
+      if (!note || note.length < 6) continue;
+      if (HISTORY.test(note)) continue;
+      const j = beforeAt.get(note);
+      if (j === undefined) continue;         // 这一轮新写/改过的注释不算
+      if (!nearTouched(i)) continue;
+
+      const beforeWin = b.code.slice(Math.max(0, j - NEAR), j + NEAR + 1).join("\n");
+      const afterWin = a.code.slice(Math.max(0, i - NEAR), i + NEAR + 1).join("\n");
+      const afterTokens = tokensOf(afterWin);
+      // 局部窗口里被声明/被赋值出来的记号才算数。
+      const localDecl = new Set();
+      for (const m of beforeWin.matchAll(/(?:const|let|var|static|class|function|fn|struct|enum|type)\s+([A-Za-z_$][\w$]*)/g)) localDecl.add(m[1]);
+      for (const m of beforeWin.matchAll(/[A-Za-z_$][\w$]*\s*[:=]\s*(\d[\d_]+)\b/g)) localDecl.add(m[1]);
+
+      for (const t of tokensOf(note)) {
+        if (!CODEY(t) || afterTokens.has(t) || !localDecl.has(t)) continue;
+        out.push({
+          path: String(absPath).split("/").slice(-2).join("/"),
+          line: i + 1, token: t, text: note.slice(0, 90),
+        });
+        break;
+      }
+    }
+  });
+  return out;
+}
+
 function _hardcodedDeliveryFindings(run, envKeys, maxItems = 6) {
   const cp = run?.checkpoint;
   if (!cp || typeof cp.forEach !== "function") return [];
@@ -57168,6 +57375,20 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
               : `硬编码：${h.path}:${h.line}（${h.kind}）「${h.text}」`);
           }
         } catch {}
+        // ④′ 这一轮改掉的值/名字，注释还写着旧的。
+        //
+        // 「用旧注释让人发现不了问题」是用户点名的一种：代码改了、注释没跟上，下一个人
+        // （包括下一轮的模型自己）照着那句话去理解，会得出一个已经不成立的结论。判据取
+        // 最精确的那种形态——改前代码里有、改后全文找不到，而提到它的那条注释一个字没动。
+        try {
+          for (const c of _staleCommentFindings(run)) {
+            const k = `stale:${c.path}:${c.line}`;
+            if (_wfSaid.has(k)) continue;
+            _wfSaid.add(k);
+            _wfLines.push(`旧注释：${c.path}:${c.line}「${c.text}」——这一轮 \`${c.token}\` 已经从代码里改掉了，`
+              + `这句话还写着它。照它理解会得出一个已经不成立的结论，顺手把注释也改对`);
+          }
+        } catch {}
         // ⑤ 触及的导出符号做一次真实引用查询（进程内只读：JS/TS 走 TS worker，
         //    其它语言只在语言服务器在跑时查；查不成就一个字不下结论）。
         try {
@@ -68150,14 +68371,18 @@ function _showInstallProgress(cmd, name, langId = "") {
   }, 90000);
 }
 
-// ---- auto-detect missing tools ----
-const TOOL_REQUIREMENTS = {
-  python: { cmd: "pyright", install: "npm install -g pyright", name: "Pyright (Python LSP)" },
-  rust: { cmd: "rust-analyzer", install: "brew install rust-analyzer", name: "rust-analyzer" },
-  go: { cmd: "gopls", install: "go install golang.org/x/tools/gopls@latest", name: "gopls (Go LSP)" },
-};
-
-const _checkedLangs = new Set();
+/*
+ * 这里原来有一节 `// ---- auto-detect missing tools ----`，底下是一张
+ * python/rust/go 三件套的表（cmd / install / name）和一个 `_checkedLangs` 集合。
+ *
+ * 读起来就是一套已经接好的「缺失工具探测」。实际上那张表和那个集合**全文件只出现在
+ * 定义处，一个使用点都没有**——章节标题底下根本没有探测器。真正在弹安装提示的是
+ * createLspManager 里那条 showNotification 通道（按平台分的命令表在 lsp-client.js），
+ * 这张表是被它取代之后留下的。
+ *
+ * 留着的代价不是那几行代码，是那句章节注释：它让人（和 AI）以为这件事已经有人在做，
+ * 从而不去查真正的那条路。这正是用户说的「用旧注释让 IDE 发现不了问题」。
+ */
 // ---- advanced feature panels (settings / growth / shortcuts) ----
 // ===== 抓包 (system-wide MITM capture, mitmproxy-backed; HttpCanary/小黄鸟-style) =====
 let _captureFlows = [];      // ring buffer of captured flows (untrusted data → render via textContent)

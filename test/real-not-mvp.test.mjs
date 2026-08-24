@@ -193,6 +193,7 @@ const ambiguous = load("_ambiguousFailureInWrite", { _splitCodeAndComments: spli
 const sinkAdvice = load("_sinkRiskAdvice", {
   _sinkRisksInWrite: risks,
   _ambiguousFailureInWrite: ambiguous,
+  _missingWhyInWrite: load("_missingWhyInWrite", { _splitCodeAndComments: splitCC }),
 });
 
 test("六类危险汇聚点各自认得出，且指到行号和原文", () => {
