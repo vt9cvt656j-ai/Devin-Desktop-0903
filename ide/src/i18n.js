@@ -2096,7 +2096,10 @@ function saveAdhocCache(locale) {
 }
 
 function adhocPendingKey(tag, text) {
-  return `${tag} ${text}`;
+  // 分隔符写成转义而不是裸字节：文件里一个真 NUL 会让 grep/ripgrep/ugrep 把整份文件
+  // 判成二进制并静默跳过，于是搜这个文件永远是「没有」——实测过，找不到任何一条 i18n key。
+  // 运行时字符串完全一样。
+  return `${tag}\u0000${text}`;
 }
 
 function scheduleAdhocFlush(delay) {
