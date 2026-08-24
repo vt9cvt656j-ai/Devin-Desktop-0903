@@ -27,6 +27,11 @@ test("地址栏认得人真会敲的几种写法", () => {
   assert.equal(normalize("5174/__icon-check.html"), "http://localhost:5174/__icon-check.html");
   assert.equal(normalize("3000/about?x=1"), "http://localhost:3000/about?x=1");
   assert.ok(!normalize("5174/x.html").includes("0.0.20.54"));
+  // 0.0.0.0 是绑定地址不是目标地址：Windows 上连它无效。规范化时统一改写成 127.0.0.1，
+  // 这样终端刮取 / 地址栏手敲 / agent 传入三条路一次覆盖。
+  assert.equal(normalize("http://0.0.0.0:8000/x"), "http://127.0.0.1:8000/x");
+  assert.equal(normalize("0.0.0.0:5173"), "http://127.0.0.1:5173/");
+  assert.equal(normalize("http://localhost:5173"), "http://localhost:5173/");
   assert.equal(normalize("localhost:5173"), "http://localhost:5173/");
   assert.equal(normalize("127.0.0.1:8080"), "http://127.0.0.1:8080/");
   // 光一条路径 = 接在当前站点上
@@ -369,17 +374,36 @@ test("桌面壳的 CSP 必须放行实时预览真正要嵌的来源", () => {
   // 实时引擎用 iframe 直嵌本机 dev server。三种回环写法都要放行——
   // vite 默认打印 localhost，python 的 http.server 打印 127.0.0.1，IPv6 环境是 [::1]。
   const frame = directive("frame-src");
-  for (const src of ["http://localhost:*", "http://127.0.0.1:*", "http://[::1]:*"]) {
-    assert.ok(frame.includes(src), `frame-src 少了 ${src}：桌面端的实时预览会白屏，而且不报任何错`);
+  // 判据不是「凭感觉列几个」，而是 **_previewIsLocalUrl 认哪些主机名，CSP 就必须放行哪些**。
+  // 漏掉的那个会变成最恶劣的一种：IDE 自己从终端里扫出候选、推荐给用户点，点了必然白屏。
+  // 0.0.0.0 尤其要有——`vite --host` / `python manage.py runserver 0.0.0.0:8000` /
+  // `rails s -b 0.0.0.0` / docker-compose 打印的都是它。
+  // HOSTS 不是手写的：直接从 _previewIsLocalUrl 的源码里把那张主机名表抠出来。
+  // 手写白名单的话，以后有人往本机判定里加一个主机名（比如 host.docker.internal），
+  // 这条用例照样绿，而 CSP 没跟上——那正是这个 bug 的原始形态。
+  const localSrc = fnSource("_previewIsLocalUrl", { code: true });
+  const alt = localSrc.match(/\/\^\(([^)]+)\)\$\/i/);
+  assert.ok(alt, "抠不出 _previewIsLocalUrl 的主机名表——这条用例的判据坏了，等于没跑");
+  const HOSTS = alt[1].split("|").map((h) => h.replace(/\\/g, ""))
+    .filter((h) => h !== "::1");   // 裸 ::1 不是合法的 URL 主机写法，CSP 里对应的是 [::1]
+  assert.ok(HOSTS.length >= 4, `只抠出 ${HOSTS.length} 个主机名，判据可疑`);
+  const isLocalSrc = load("_previewIsLocalUrl");
+  for (const h of HOSTS) {
+    assert.equal(isLocalSrc(`http://${h}:8000`), true, `_previewIsLocalUrl 不再认 ${h}，这条用例的判据需要重写`);
+    assert.ok(frame.includes(`http://${h}:*`),
+      `frame-src 少了 http://${h}:* —— _previewIsLocalUrl 把它当本机、会塞进 iframe，CSP 却挡住，结果是白屏且不报错`);
   }
   // 但**不许**放行整个 https:——给桌面应用开放"任意站点都能嵌"是实打实的攻击面，
   // 外部站点走 CDP 那条引擎（见 _previewNavigate 里的自动切换）。
   assert.ok(!frame.includes("https:"), "frame-src 放开了整个 https: —— 外部站点该走「浏览器」引擎，不该嵌进应用窗口");
 
   // 失败信号要能从应用这一层探到本机服务，否则"连不上"和"不让被嵌"分不开。
+  // 探针要能到达 iframe 能到达的每一个来源，否则「连不上」这个结论对某些主机名恒为真——
+  // 那比白屏更坏：界面会理直气壮地叫用户去查一个根本没问题的 dev server。
   const connect = directive("connect-src");
-  for (const src of ["http://localhost:*", "http://127.0.0.1:*"]) {
-    assert.ok(connect.includes(src), `connect-src 少了 ${src}：预览分不清「服务没跑」和「页面不让被嵌」`);
+  for (const h of HOSTS) {
+    assert.ok(connect.includes(`http://${h}:*`),
+      `connect-src 少了 http://${h}:* —— 探针被挡住，预览会对着一个活着的服务说「连不上」`);
   }
 });
 
