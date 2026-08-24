@@ -6,6 +6,7 @@
 // Real functions are pulled out of src/main.js with acorn, following model-resume.test.mjs: a
 // reimplementation here would only prove the copy is self-consistent.
 import assert from "node:assert/strict";
+import { MONO_BRANDS, hasBrandMark } from "../src/brand-sprite.js";
 import test from "node:test";
 import fs from "node:fs";
 // 按名字取真源码 + 拼依赖闭包跑起来，只有一份实现：test/helpers/source.mjs。
@@ -556,10 +557,31 @@ test("the @ menu is exempt from the runtime translator", () => {
 
 test("each model in the @ menu wears its own vendor mark", () => {
   // Every row shared one generic glyph, so a list of Claude and GPT models looked identical.
-  const brandOf = new Function(`${SRC.match(/function brandOf[\s\S]*?\n}/)[0]}; return brandOf;`)();
+  // brandOf 现在先看网关下发的厂商（MODEL_VENDORS），认不出才走名字兜底。这里传空表，
+  // 测的正是兜底那一支；MONO_BRANDS / hasBrandMark 用真的 sprite 数据，
+  // 顺带验到「它指的符号确实存在」。
+  const brandOf = new Function(
+    "MODEL_VENDORS",
+    "MONO_BRANDS",
+    "hasBrandMark",
+    `${SRC.match(/function _brandMark[\s\S]*?\n}/)[0]}
+     ${SRC.match(/function brandOf[\s\S]*?\n}/)[0]}
+     return brandOf;`,
+  )({}, MONO_BRANDS, hasBrandMark);
   assert.equal(brandOf("claude-opus-5").sym, "i-brand-anthropic");
   assert.equal(brandOf("gpt-5.5").sym, "i-brand-openai");
   assert.equal(brandOf("deepseek-v3").sym, "i-brand-deepseek");
+  // 网关说了是谁家的，就用网关的 —— 判据只有一份，在服务端。
+  const withGateway = new Function(
+    "MODEL_VENDORS",
+    "MONO_BRANDS",
+    "hasBrandMark",
+    `${SRC.match(/function _brandMark[\s\S]*?\n}/)[0]}
+     ${SRC.match(/function brandOf[\s\S]*?\n}/)[0]}
+     return brandOf;`,
+  )({ "stealth/ox-alpha": "openrouter" }, MONO_BRANDS, hasBrandMark);
+  assert.equal(withGateway("stealth/ox-alpha").sym, "i-brand-openrouter",
+    "网关认出来的厂商没被用上——那些名字看不出来源的模型会全掉进通用图标");
 
   // It must be brandOf, not a second map: the picker already uses it, and a local copy would
   // drift the first time a vendor is added — one glyph in the picker, another in the menu.

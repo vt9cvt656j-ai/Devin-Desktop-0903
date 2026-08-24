@@ -27,6 +27,7 @@ window.addEventListener("unhandledrejection", (e) => {
   try { showToast?.(`Unhandled: ${e.reason?.message || e.reason}`, 5000); } catch { /* too early */ }
 });
 
+import { installBrandSprite, hasBrandMark, MONO_BRANDS } from "./brand-sprite.js";
 import * as monaco from "monaco-editor";
 import editorWorker from "monaco-editor/esm/vs/editor/editor.worker?worker";
 import jsonWorker from "monaco-editor/esm/vs/language/json/json.worker?worker";
@@ -90,6 +91,12 @@ import { createDapManager } from "./dap-client.js";
 import * as growth from "./growth.js";
 import { ConversationMemory, extractExplicitCorrection, serializeMessagesForPersistence } from "./conversation-memory.js";
 import { compactToolGuide, enrichedCatalogLine, autoEnrichToolMetadata, toolCapabilityIndex, TOOL_METADATA } from "./tool-guides.js";
+
+// 品牌 sprite 得在任何 <use href="#i-brand-x"> 渲染之前进 DOM，否则那些引用会指向
+// 一个还不存在的 symbol —— 表现是图标位置空一块，而且**不会补画**（浏览器不会因为
+// symbol 后来出现就重渲染已有的 <use>）。main.js 是在 React 首屏 commit 之后才加载的
+// （见 boot.jsx），所以这里 document.body 一定已经在了。
+installBrandSprite();
 
 /**
  * 工具描述的兜底文案——**数据，不是常量**。
@@ -14175,19 +14182,30 @@ const modelPickerBtnIcon = modelPickerBtn.querySelector("use");
 const modelPickerLabel = $("modelPickerLabel");
 const modelMenu = $("modelMenu");
 
-/** Map a brand key to its logo symbol + colour class. */
+/** 后台 `provider` 列里可能填的字样 → 厂商标识（就是 brand-sprite 里的 symbol 名）。
+ *
+ *  符号名统一用网关那套厂商标识（zhipu / google / moonshot / xai），不再用
+ *  glm / gemini / kimi / grok —— 两套名字并存过一次，代价是每加一家都要在两边对一遍。 */
 const BRAND_SYM = {
-  openai: "i-brand-openai", gpt: "i-brand-openai",
-  anthropic: "i-brand-anthropic", claude: "i-brand-anthropic",
-  deepseek: "i-brand-deepseek",
-  gemini: "i-brand-gemini", google: "i-brand-gemini",
-  minimax: "i-brand-minimax",
-  glm: "i-brand-glm", zhipu: "i-brand-glm",
-  meta: "i-brand-meta", llama: "i-brand-meta",
-  qwen: "i-brand-qwen",
-  kimi: "i-brand-kimi", moonshot: "i-brand-kimi",
-  grok: "i-brand-grok", xai: "i-brand-grok",
+  openai: "openai", gpt: "openai",
+  anthropic: "anthropic", claude: "anthropic",
+  deepseek: "deepseek",
+  gemini: "google", google: "google",
+  minimax: "minimax",
+  glm: "zhipu", zhipu: "zhipu",
+  meta: "meta", llama: "meta",
+  qwen: "qwen",
+  kimi: "moonshot", moonshot: "moonshot",
+  grok: "xai", xai: "xai",
 };
+
+/** 厂商标识 → {sym, cls}。彩色官方标不跟 CSS 品牌色走，单色标才跟。 */
+function _brandMark(vendor) {
+  return {
+    sym: "i-brand-" + vendor,
+    cls: MONO_BRANDS.has(vendor) ? "brand--" + vendor : "",
+  };
+}
 
 /** Map a model id to its provider brand logo + brand colour. */
 function brandOf(id = "") {
@@ -14197,16 +14215,25 @@ function brandOf(id = "") {
   }
   const s = id.toLowerCase();
   if (s === "devin") return { sym: "i-sparkle", cls: "" };
-  if (/^(gpt|o\d|chatgpt|text-|davinci)/.test(s)) return { sym: "i-brand-openai", cls: "brand--openai" };
-  if (s.includes("claude")) return { sym: "i-brand-anthropic", cls: "brand--anthropic" };
-  if (s.includes("deepseek")) return { sym: "i-brand-deepseek", cls: "brand--deepseek" };
-  if (s.includes("gemini")) return { sym: "i-brand-gemini", cls: "brand--gemini" };
-  if (s.includes("minimax")) return { sym: "i-brand-minimax", cls: "brand--minimax" };
-  if (s.includes("glm")) return { sym: "i-brand-glm", cls: "brand--glm" };
-  if (s.includes("llama")) return { sym: "i-brand-meta", cls: "brand--meta" };
-  if (s.includes("qwen")) return { sym: "i-brand-qwen", cls: "brand--qwen" };
-  if (s.includes("kimi") || s.includes("moonshot")) return { sym: "i-brand-kimi", cls: "brand--kimi" };
-  if (s.includes("grok") || s.includes("xai")) return { sym: "i-brand-grok", cls: "brand--grok" };
+  // 网关下发的厂商优先。它的判据比下面这十条正则宽得多（认得出一百多家，还会看线路
+  // 地址的域名），而且加一家不用发版。查不到才退回这些正则 —— 离线、网关旧版、
+  // 或者一个还没进目录的自定义模型，都还是老行为。
+  const fromGateway = MODEL_VENDORS[id] || "";
+  // 彩色标自带官方配色，`brand--x` 那条染色规则对它们无效也不该有效；
+  // 只有官方标本身就是单色的那几家（OpenAI、Grok…）才跟着品牌色走。见 _brandMark。
+  if (fromGateway && hasBrandMark(fromGateway)) return _brandMark(fromGateway);
+  // 网关认不出来时的兜底。这十条覆盖不了什么，真正的判定在服务端 —— 它们只在
+  // 离线、网关是旧版、或者模型还没进目录时才轮到。
+  if (/^(gpt|o\d|chatgpt|text-|davinci)/.test(s)) return _brandMark("openai");
+  if (s.includes("claude")) return _brandMark("anthropic");
+  if (s.includes("deepseek")) return _brandMark("deepseek");
+  if (s.includes("gemini")) return _brandMark("google");
+  if (s.includes("minimax")) return _brandMark("minimax");
+  if (s.includes("glm")) return _brandMark("zhipu");
+  if (s.includes("llama")) return _brandMark("meta");
+  if (s.includes("qwen")) return _brandMark("qwen");
+  if (s.includes("kimi") || s.includes("moonshot")) return _brandMark("moonshot");
+  if (s.includes("grok") || s.includes("xai")) return _brandMark("xai");
   return { sym: "i-cpu", cls: "" };
 }
 
@@ -14236,14 +14263,19 @@ function brandFor(m) {
   const byId = brandOf((m && m.id) || "");
   if (byId.sym !== "i-cpu") return byId;
   const key = (m && m.brand ? m.brand : "").toLowerCase();
-  if (BRAND_SYM[key]) return { sym: BRAND_SYM[key], cls: "brand--" + key };
+  if (BRAND_SYM[key] && hasBrandMark(BRAND_SYM[key])) return _brandMark(BRAND_SYM[key]);
   return byId;
 }
 
 /** Friendly display name for a model id (falls back to the raw id). */
 let MODEL_NAMES = {};
+/** 模型 id → 网关判定的厂商。brandOf 只拿到一个 id 时靠它查真值。 */
+let MODEL_VENDORS = {};
 function rebuildModelNames() {
   MODEL_NAMES = Object.fromEntries(MODEL_GROUPS.flatMap((g) => g.models.map((m) => [m.id, m.name])));
+  MODEL_VENDORS = Object.fromEntries(
+    MODEL_GROUPS.flatMap((g) => g.models.map((m) => [m.id, m.vendor || ""])).filter(([, v]) => v),
+  );
 }
 rebuildModelNames();
 function modelLabel(id = "") {
@@ -14622,6 +14654,10 @@ async function loadBackendModels() {
         : [];
       (byGroup[label] ||= []).push({
         id: it.model_id, name: it.name || it.model_id, brand: it.provider, meta: "",
+        // 网关判定的厂商（"anthropic" / "deepseek" / …）。判据在服务端：先看模型 id，
+        // 认不出再看线路地址的域名。放服务端是因为客户端那份是硬编码正则，
+        // 加一家就要发一版桌面端，而服务端加一行第二天就生效。空 = 网关也认不出来。
+        vendor: String(it.vendor || ""),
         // pricing + blurb for the hover info card (input/output = USD per 1M tokens)
         inPrice: pricing.inPrice, outPrice: pricing.outPrice, flatPrice: pricing.flatPrice, rate: pricing.rate,
         contextLimit, contextWindows,
