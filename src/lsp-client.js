@@ -953,10 +953,20 @@ export function createLspManager(options) {
     if (!isManaged(langId)) return;
     const uri = model.uri.toString();
     const docLang = DOC_LANGUAGE_ID[langId] || langId;
-    const version = model.getVersionId();
-    const text = model.getValue();
+    /*
+     * 取样必须放在 await 之后，不能在这一行。
+     *
+     * ensureServer 里那次 initialize 对 gopls / pyright 是**几十秒**级别的（超时特意
+     * 放宽到 120s）。原来 version/text 在这里同步取一次，然后等 initialize 完成才发出去
+     * ——发的是「打开那一刻」的内容。而这几十秒里用户敲的每一个字，didChange 都在
+     * `!client.initialized` 上早退（既不排队也不缓存）。于是 initialize 完成时，服务器
+     * 拿到的是几十秒前的旧文本：红线整体偏移十几行，报的是已经不存在的问题，而且只有
+     * 再敲一个字符才会自愈——用户停下来看错误列表的那一刻，看到的全是错的。
+     */
     ensureServer(langId).then((client) => {
-      if (client) client.didOpen(uri, docLang, version, text);
+      if (!client) return;
+      const live = monaco.editor.getModel(model.uri) || model;
+      client.didOpen(uri, docLang, live.getVersionId(), live.getValue());
     });
   }
 
@@ -965,15 +975,27 @@ export function createLspManager(options) {
     const langId = lspLangOf(model, path);
     if (!isManaged(langId)) return;
     const client = clients.get(langId);
-    if (!client || !client.initialized) return;
+    // 没有 client 才早退。**还没 initialized 不算没有**——原来这里一并早退，冷启动那
+    // 几十秒里的编辑就此消失（既不排队也不缓存）。现在照常排进防抖队列：真要发的时候
+    // 现取 live model 的最新全文，服务器那时也已经 initialize 完了。
+    if (!client) return;
     const uri = model.uri.toString();
     const existing = changeTimers.get(uri);
     if (existing) clearTimeout(existing.timer);
-    const timer = setTimeout(() => {
+    const timer = setTimeout(async () => {
       changeTimers.delete(uri);
+      // 还在握手就等它落定再发；等不到（超时/失败）就不发，didOpen 那边会带上最新全文。
+      if (!client.initialized && client.initPromise) {
+        try { await client.initPromise; } catch { return; }
+      }
+      if (!client.initialized) return;
       const live = monaco.editor.getModel(model.uri);
       if (!live) return;
-      client.didChange(uri, live.getVersionId(), live.getValue());
+      // 服务器还没 didOpen 过这个文档时，didChange 在协议上就是空操作（LspClient 里也
+      // 照着挡了）。重启窗口正是这种情况：client 在、文档句柄没了。这时要发的是
+      // didOpen，否则这段编辑仍然落不到服务器手里，只是换了个地方丢。
+      if (client.openDocs.has(uri)) client.didChange(uri, live.getVersionId(), live.getValue());
+      else client.didOpen(uri, DOC_LANGUAGE_ID[langId] || langId, live.getVersionId(), live.getValue());
     }, 180);
     changeTimers.set(uri, { timer, langId, modelUri: model.uri });
   }
