@@ -204,8 +204,13 @@ test("用户按停必须产出可续跑的结局，否则整套交接是死的",
   const loop = extractFn("_runAgenticLoop");
   assert.match(loop, /const _stoppedEarly = !_live\(\);/,
     "没有捕捉「这一轮是被停掉的」这个事实");
-  assert.match(loop, /_stoppedEarly \|\| run\._incompleteReason \|\| hitCap/,
-    "结局判定没有把「被停掉」算进去，按停后仍会被判成 success");
+  // 那串 || 后来拆成了具名成因链（为了让「部分完成」在存档里能分辨成因，见 logic 那条测试）。
+  // 被守的性质一个字没变：「被停掉」必须进入结局判定，而且必须排在**第一位**——
+  // 排在后面就会被别的分支抢先命中，存档里记下的成因就不是真正促成它的那一个。
+  assert.match(loop, /const _partialCause = _stoppedEarly \? "stopped_early"/,
+    "结局判定没有把「被停掉」算进去（且它必须是成因链的第一分支），按停后仍会被判成 success");
+  assert.match(loop, /: _partialCause \? "partial" : "success";/,
+    "结局必须由成因派生——另起一份平行判定迟早和成因漂开");
   assert.match(loop, /run\._incompleteReason = run\._incompleteReason \|\| "user_stopped"/,
     "没有记下中断原因，交接块就说不出「中断在哪」");
 
